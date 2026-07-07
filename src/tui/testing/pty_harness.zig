@@ -6,8 +6,11 @@ pub const max_output_default: usize = 256 * 1024;
 
 pub const Action = struct {
     after_ms: u64,
-    bytes: []const u8,
+    bytes: []const u8 = "",
+    resize: ?Resize = null,
 };
+
+pub const Resize = struct { rows: u16, cols: u16 };
 
 pub const RunOptions = struct {
     argv: []const []const u8,
@@ -72,7 +75,12 @@ pub fn runScripted(allocator: std.mem.Allocator, options: RunOptions, actions: [
     while (true) {
         const elapsed_ms = elapsedMs(started);
         while (next_action < actions.len and elapsed_ms >= actions[next_action].after_ms) : (next_action += 1) {
-            try writeAll(master, actions[next_action].bytes);
+            const action = actions[next_action];
+            if (action.resize) |size| try resizePty(master, child, size);
+            if (action.bytes.len > 0) writeAll(master, action.bytes) catch {
+                child_done = true;
+                break;
+            };
         }
 
         drainReadable(master, allocator, &output, options.max_output_bytes) catch |err| switch (err) {
@@ -177,6 +185,18 @@ fn writeAll(fd: c_int, bytes: []const u8) !void {
     }
 }
 
+fn resizePty(fd: c_int, child: std.c.pid_t, size: Resize) !void {
+    var winsize: std.posix.winsize = .{
+        .row = size.rows,
+        .col = size.cols,
+        .xpixel = 0,
+        .ypixel = 0,
+    };
+    const request: c_int = comptime if (builtin.os.tag == .macos) @bitCast(@as(u32, 0x80087467)) else @intCast(std.c.T.IOCSWINSZ);
+    if (std.posix.system.ioctl(fd, request, @intFromPtr(&winsize)) != 0) return error.ResizeFailed;
+    _ = std.c.kill(child, std.c.SIG.WINCH);
+}
+
 fn drainReadable(fd: c_int, allocator: std.mem.Allocator, output: *std.ArrayList(u8), max_output_bytes: usize) !void {
     var fds = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 }};
     while (true) {
@@ -252,6 +272,37 @@ fn appendFloodTyping(actions: *std.ArrayList(Action), allocator: std.mem.Allocat
     var elapsed_ms: u64 = 0;
     while (elapsed_ms < duration_ms) : (elapsed_ms += 33) {
         try actions.append(allocator, .{ .after_ms = start_ms + elapsed_ms, .bytes = "a" });
+    }
+}
+
+fn appendResizeStorm(actions: *std.ArrayList(Action), allocator: std.mem.Allocator, start_ms: u64, duration_ms: u64) !void {
+    var elapsed_ms: u64 = 0;
+    var wide = false;
+    while (elapsed_ms < duration_ms) : (elapsed_ms += 50) {
+        wide = !wide;
+        try actions.append(allocator, .{
+            .after_ms = start_ms + elapsed_ms,
+            .resize = if (wide) .{ .rows = 28, .cols = 120 } else .{ .rows = 24, .cols = 100 },
+        });
+    }
+}
+
+fn expectP3EvictionResizeTrace(report: []const u8) !void {
+    const evictions = try metricValue(report, "transcript_evictions ", "count=");
+    const dropped = try metricValue(report, "dropped_input_bytes ", "count=");
+    if (evictions < 1000 or dropped != 0) {
+        std.debug.print("P3 eviction/resize trace gate failed\n{s}\n", .{report});
+        return error.TestUnexpectedResult;
+    }
+}
+
+fn expectP3ToolRebuildTrace(report: []const u8) !void {
+    const rebuild_count = try metricValue(report, "rebuilds ", "count=");
+    const rebuild_max_ns = try metricValue(report, "rebuilds ", "max_ns=");
+    const dropped = try metricValue(report, "dropped_input_bytes ", "count=");
+    if (rebuild_count == 0 or rebuild_max_ns >= 50 * std.time.ns_per_ms or dropped != 0) {
+        std.debug.print("P3 tool rebuild trace gate failed\n{s}\n", .{report});
+        return error.TestUnexpectedResult;
     }
 }
 
@@ -422,7 +473,10 @@ test "pty e2e: synthetic flood trace meets P2 gate three times" {
             std.debug.print("pty flood e2e timed out on run {d}\n--- output ---\n{s}\n--- end output ---\n", .{ run_index, result.output });
             return error.TestUnexpectedResult;
         }
-        try std.testing.expect(exitedZero(result.status));
+        if (!exitedZero(result.status)) {
+            std.debug.print("pty flood e2e exited nonzero on run {d}, status={d}\n--- output ---\n{s}\n--- end output ---\n", .{ run_index, result.status, result.output });
+            return error.TestUnexpectedResult;
+        }
         try std.testing.expect(result.termios_restored != false);
 
         const report = try readTrace(std.testing.allocator, trace_abs);
@@ -430,6 +484,107 @@ test "pty e2e: synthetic flood trace meets P2 gate three times" {
         try expectP2FloodTrace(report);
     }
 }
+
+test "pty e2e: P3 viewport rebuild and resize storm" {
+    if (!supportsForkPty()) return error.SkipZigTest;
+    const zi_bin = envValue("ZI_PTY_E2E_BIN") orelse return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "repo/.zi");
+    try tmp.dir.createDirPath(std.testing.io, "home");
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+
+    const repo_abs = try tmpAbsPath(std.testing.allocator, &tmp, "repo");
+    defer std.testing.allocator.free(repo_abs);
+    const home_abs = try tmpAbsPath(std.testing.allocator, &tmp, "home");
+    defer std.testing.allocator.free(home_abs);
+    const agent_abs = try tmpAbsPath(std.testing.allocator, &tmp, "agent");
+    defer std.testing.allocator.free(agent_abs);
+    const resize_trace_abs = try tmpAbsPath(std.testing.allocator, &tmp, "p3-resize-trace.log");
+    defer std.testing.allocator.free(resize_trace_abs);
+    const tools_trace_abs = try tmpAbsPath(std.testing.allocator, &tmp, "p3-tools-trace.log");
+    defer std.testing.allocator.free(tools_trace_abs);
+
+    const home_env = try std.fmt.allocPrint(std.testing.allocator, "HOME={s}", .{home_abs});
+    defer std.testing.allocator.free(home_env);
+    const agent_env = try std.fmt.allocPrint(std.testing.allocator, "ZI_CODING_AGENT_DIR={s}", .{agent_abs});
+    defer std.testing.allocator.free(agent_env);
+    const resize_trace_env = try std.fmt.allocPrint(std.testing.allocator, "ZI_TUI_TRACE_FILE={s}", .{resize_trace_abs});
+    defer std.testing.allocator.free(resize_trace_env);
+    const tools_trace_env = try std.fmt.allocPrint(std.testing.allocator, "ZI_TUI_TRACE_FILE={s}", .{tools_trace_abs});
+    defer std.testing.allocator.free(tools_trace_env);
+
+    const resize_env = [_][]const u8{
+        "TERM=xterm-256color",
+        "NO_COLOR=1",
+        "ZI_TUI_SYNTHETIC_ITEMS=3000",
+        home_env,
+        agent_env,
+        resize_trace_env,
+    };
+    var resize_actions = std.ArrayList(Action).empty;
+    defer resize_actions.deinit(std.testing.allocator);
+    try resize_actions.append(std.testing.allocator, .{ .after_ms = 500, .bytes = "\x1b[5~" });
+    try appendResizeStorm(&resize_actions, std.testing.allocator, 800, 5_000);
+    try resize_actions.append(std.testing.allocator, .{ .after_ms = 6_100, .bytes = "\x03" });
+    try resize_actions.append(std.testing.allocator, .{ .after_ms = 6_300, .bytes = "\x03" });
+
+    var resize_result = try runScripted(std.testing.allocator, .{
+        .argv = &.{zi_bin},
+        .env = &resize_env,
+        .cwd = repo_abs,
+        .rows = 24,
+        .cols = 100,
+        .timeout_ms = 10_000,
+        .max_output_bytes = 512 * 1024,
+    }, resize_actions.items);
+    defer resize_result.deinit(std.testing.allocator);
+    if (resize_result.timed_out) {
+        std.debug.print("pty P3 resize e2e timed out\n--- output ---\n{s}\n--- end output ---\n", .{resize_result.output});
+        return error.TestUnexpectedResult;
+    }
+    try std.testing.expect(exitedZero(resize_result.status));
+    try std.testing.expect(resize_result.termios_restored != false);
+    const resize_report = try readTrace(std.testing.allocator, resize_trace_abs);
+    defer std.testing.allocator.free(resize_report);
+    try expectP3EvictionResizeTrace(resize_report);
+
+    const tools_env = [_][]const u8{
+        "TERM=xterm-256color",
+        "NO_COLOR=1",
+        "ZI_TUI_SYNTHETIC_TOOLS=500",
+        home_env,
+        agent_env,
+        tools_trace_env,
+    };
+    const tools_actions = [_]Action{
+        .{ .after_ms = 500, .bytes = "\x0f" },
+        .{ .after_ms = 1_500, .bytes = "\x03" },
+        .{ .after_ms = 1_700, .bytes = "\x03" },
+    };
+    var tools_result = try runScripted(std.testing.allocator, .{
+        .argv = &.{zi_bin},
+        .env = &tools_env,
+        .cwd = repo_abs,
+        .rows = 24,
+        .cols = 100,
+        .timeout_ms = 5_000,
+        .max_output_bytes = 512 * 1024,
+    }, &tools_actions);
+    defer tools_result.deinit(std.testing.allocator);
+    if (tools_result.timed_out) {
+        std.debug.print("pty P3 tools e2e timed out\n--- output ---\n{s}\n--- end output ---\n", .{tools_result.output});
+        return error.TestUnexpectedResult;
+    }
+    try std.testing.expect(exitedZero(tools_result.status));
+    try std.testing.expect(tools_result.termios_restored != false);
+    try expectContains(tools_result.output, "[done] bash");
+    const tools_report = try readTrace(std.testing.allocator, tools_trace_abs);
+    defer std.testing.allocator.free(tools_report);
+    try expectP3ToolRebuildTrace(tools_report);
+}
+
 test "pty harness runs a simple child and captures output" {
     if (!supportsForkPty()) return error.SkipZigTest;
     var result = try runScripted(std.testing.allocator, .{

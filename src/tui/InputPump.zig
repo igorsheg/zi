@@ -1,5 +1,6 @@
 const std = @import("std");
 const runtime = @import("../runtime/root.zig");
+const vaxis = @import("vaxis");
 const Terminal = @import("Terminal.zig");
 
 pub const byte_capacity = 32 * 1024;
@@ -107,6 +108,15 @@ pub const InputPump = struct {
             .source_context = terminal,
             .read_fn = terminalRead,
         });
+        if (@hasDecl(vaxis.Tty, "notifyWinsize")) {
+            try vaxis.Tty.notifyWinsize(.{ .context = self, .callback = resizeCallback });
+        }
+    }
+
+    fn resizeCallback(context: *anyopaque) void {
+        const self: *InputPump = @ptrCast(@alignCast(context));
+        self.resize_seen.store(true, .release);
+        if (self.wake) |wake| wake.set(self.io);
     }
 
     pub fn requestStop(self: *InputPump) void {

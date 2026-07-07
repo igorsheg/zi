@@ -19,6 +19,7 @@ pub fn wrapMarkdown(
 ) ![]Line {
     var out = std.ArrayList(Line).empty;
     errdefer out.deinit(allocator);
+    try out.ensureTotalCapacity(allocator, estimatedLineCapacity(text, width));
     var md_state: markdown.MdState = .{};
     var start: usize = 0;
     while (start <= text.len) {
@@ -36,10 +37,11 @@ pub fn wrapMarkdown(
 pub fn wrapPlain(allocator: std.mem.Allocator, text: []const u8, width: u16, style: screen.Style) ![]Line {
     var out = std.ArrayList(Line).empty;
     errdefer out.deinit(allocator);
+    try out.ensureTotalCapacity(allocator, estimatedLineCapacity(text, width));
     var start: usize = 0;
     while (start <= text.len) {
         const end = std.mem.indexOfScalarPos(u8, text, start, '\n') orelse text.len;
-        try wrapPhysicalPlainLine(allocator, &out, text[start..end], width, style);
+        try appendPlainLine(allocator, &out, text[start..end], width, style);
         if (end == text.len) break;
         start = end + 1;
     }
@@ -58,6 +60,7 @@ fn wrapPhysicalMarkdownLine(
         try out.append(allocator, .{});
         return;
     }
+    if (!hasMarkdownSyntax(text)) return appendPlainLine(allocator, out, text, width, base);
     var start: usize = 0;
     while (start < text.len) {
         const end = sliceEndForWidth(text, start, width);
@@ -68,7 +71,20 @@ fn wrapPhysicalMarkdownLine(
     }
 }
 
-fn wrapPhysicalPlainLine(
+fn hasMarkdownSyntax(text: []const u8) bool {
+    for (text) |byte| switch (byte) {
+        '#', '`', '>', '-', '*', '_', '[', ']', '(', ')', '!' => return true,
+        else => {},
+    };
+    return false;
+}
+
+fn estimatedLineCapacity(text: []const u8, width: u16) usize {
+    if (text.len == 0) return 1;
+    const effective_width: usize = @max(@as(usize, 1), width);
+    return @max(@as(usize, 1), text.len / effective_width + 2);
+}
+pub fn appendPlainLine(
     allocator: std.mem.Allocator,
     out: *std.ArrayList(Line),
     text: []const u8,
@@ -92,6 +108,7 @@ fn wrapPhysicalPlainLine(
 pub fn sliceEndForWidth(text: []const u8, start: usize, width: u16) usize {
     if (start >= text.len) return text.len;
     if (width == 0) return nextUtf8ScalarEnd(text, start);
+    if (asciiSliceEndForWidth(text, start, width)) |end| return end;
     var iter = vaxis.unicode.graphemeIterator(text[start..]);
     var used: u16 = 0;
     var last_break: usize = start;
@@ -106,6 +123,16 @@ pub fn sliceEndForWidth(text: []const u8, start: usize, width: u16) usize {
     }
     if (last_break == start) return nextUtf8ScalarEnd(text, start);
     return last_break;
+}
+
+fn asciiSliceEndForWidth(text: []const u8, start: usize, width: u16) ?usize {
+    var index = start;
+    var used: u16 = 0;
+    while (index < text.len and used < width) : (index += 1) {
+        if (text[index] >= 0x80) return null;
+        used += 1;
+    }
+    return index;
 }
 
 fn nextUtf8ScalarEnd(text: []const u8, start: usize) usize {

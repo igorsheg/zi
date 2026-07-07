@@ -99,8 +99,13 @@ pub const Runner = struct {
         self.collectConsumedInputStamps(pump);
         if (len > 0) {
             self.loop.recordInputBytes(len);
-            try self.feedInputBytes(batch[0..len]);
-            try self.drainInputActionsAt(now_ns);
+            self.feedInputBytes(batch[0..len]) catch |err| switch (err) {
+                error.DecoderFull, error.ActionTextTooLong => return self.dropOversizeInput(len),
+            };
+            self.drainInputActionsAt(now_ns) catch |err| switch (err) {
+                error.DecoderFull, error.ActionTextTooLong => return self.dropOversizeInput(len),
+                else => return err,
+            };
         }
         self.updateLoneEscapeDeadline(now_ns);
     }
@@ -117,10 +122,21 @@ pub const Runner = struct {
         self.collectConsumedInputStamps(pump);
         if (len > 0) {
             self.loop.recordInputBytes(len);
-            try self.feedInputBytes(batch[0..len]);
-            try self.drainInputActionsWithTerminal(terminal, now_ns);
+            self.feedInputBytes(batch[0..len]) catch |err| switch (err) {
+                error.DecoderFull, error.ActionTextTooLong => return self.dropOversizeInput(len),
+            };
+            self.drainInputActionsWithTerminal(terminal, now_ns) catch |err| switch (err) {
+                error.DecoderFull, error.ActionTextTooLong => return self.dropOversizeInput(len),
+                else => return err,
+            };
         }
         self.updateLoneEscapeDeadline(now_ns);
+    }
+
+    fn dropOversizeInput(self: *Runner, count: usize) !void {
+        self.decoder.reset();
+        self.loop.trace.addDroppedInputBytes(count);
+        try self.loop.notice(.warn, "input too large");
     }
 
     fn updateLoneEscapeDeadline(self: *Runner, now_ns: u64) void {
@@ -186,10 +202,19 @@ pub const Runner = struct {
         try self.loop.pumpDriver(now_ns);
         try self.loop.tick(now_ns);
         const had_input = self.loop.trace.input_actions != input_actions_before;
-        const resized = if (pump.takeResize()) self.applyResize(width, height) else false;
+        var render_width = width;
+        var render_height = height;
+        var resized = false;
+        if (pump.takeResize()) {
+            try terminal.resizeFromTty();
+            const resized_winsize = try terminal.winsize();
+            render_width = resized_winsize.cols;
+            render_height = resized_winsize.rows;
+            resized = self.applyResize(render_width, render_height);
+        }
         if (!had_input and !resized and !self.loop.shouldRender(now_ns)) return false;
         const start_ns = FrameLoop.nowNs(terminal.io);
-        const frame = try self.loop.composeFrame(width, height);
+        const frame = try self.loop.composeFrame(render_width, render_height);
         try terminal.paint(frame);
         const flush_complete_ns = FrameLoop.nowNs(terminal.io);
         self.recordPendingInputLatencies(flush_complete_ns);
@@ -221,6 +246,14 @@ pub fn run(process: runtime.Process, options: Options) !void {
     var runner = try Runner.init(process.gpa, options);
     defer runner.deinit();
     _ = try session.agent.subscribe(.{ .context = &runner.loop.transcript, .call_fn = Transcript.applyListener });
+    if (process.env("ZI_TUI_SYNTHETIC_ITEMS")) |value| {
+        const count = std.fmt.parseInt(usize, value, 10) catch 0;
+        try runner.loop.seedSyntheticItems(count);
+    }
+    if (process.env("ZI_TUI_SYNTHETIC_TOOLS")) |value| {
+        const count = std.fmt.parseInt(usize, value, 10) catch 0;
+        try runner.loop.seedSyntheticTools(services.io, count);
+    }
     if (process.env("ZI_TUI_SYNTHETIC_FLOOD") != null) runner.loop.enableSyntheticFlood(FrameLoop.nowNs(services.io));
     defer writeTraceIfRequested(process, &runner.loop.trace) catch {};
 
@@ -442,6 +475,33 @@ test "runner decodes enter into a local submitted prompt" {
 
     try std.testing.expectEqualStrings("hello", runner.loop.submittedPrompt().?);
     try std.testing.expectEqualStrings("", runner.loop.editor.text());
+}
+
+test "runner degrades oversized bracketed paste without exiting" {
+    var runner = try Runner.init(std.testing.allocator, .{
+        .initial_prompt = null,
+        .open = .{ .create = .{ .session_id = "tui-test", .timestamp = "2026-07-06T00:00:00Z" } },
+        .resume_picker = false,
+    });
+    defer runner.deinit();
+    var pump: InputPump = .{};
+
+    var paste: [4300]u8 = undefined;
+    const start = "\x1b[200~";
+    const end = "\x1b[201~";
+    @memcpy(paste[0..start.len], start);
+    @memset(paste[start.len .. paste.len - end.len], 'x');
+    @memcpy(paste[paste.len - end.len ..], end);
+    try std.testing.expect(pump.pushBatch(&paste, 1));
+
+    try runner.drainInputPump(&pump);
+    try runner.drainInputPump(&pump);
+
+    try std.testing.expect(!runner.loop.exit_requested);
+    try std.testing.expect(runner.loop.trace.dropped_input_bytes > 0);
+    try std.testing.expectEqual(@as(usize, 1), runner.loop.transcript.items.items.len);
+    try std.testing.expect(runner.loop.transcript.items.items[0].kind == .notice);
+    try std.testing.expectEqualStrings("input too large", runner.loop.transcript.items.items[0].kind.notice.text);
 }
 
 test "runner drains input pump bytes into loop and records dropped bytes" {

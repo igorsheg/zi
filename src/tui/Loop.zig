@@ -41,7 +41,7 @@ const synthetic_flood_rate_bytes_per_second: u64 = 1024 * 1024;
 pub const synthetic_flood_duration_ns: u64 = 30 * std.time.ns_per_s;
 pub const synthetic_flood_tool_body_bytes: usize = 4 * 1024 * 1024;
 const synthetic_flood_tool_emit_ns: u64 = synthetic_flood_duration_ns / 2;
-const transcript_line_buffer_count = 128;
+const viewport_hint_buffer_len = 64;
 
 pub const Scratch = struct {
     buffer: [scratch_capacity]u8 = undefined,
@@ -77,6 +77,22 @@ pub const SyntheticFlood = struct {
     message_started: bool = false,
     tool_emitted: bool = false,
     completed: bool = false,
+};
+
+pub const Viewport = union(enum) {
+    follow,
+    anchored: Anchor,
+
+    pub const Anchor = struct {
+        item_seq: u64,
+        line_in_item: u32,
+        lines_below_seen: u32,
+    };
+};
+
+const LineRef = struct {
+    item_index: usize,
+    line_in_item: usize,
 };
 
 pub const RunDriver = struct {
@@ -378,7 +394,16 @@ pub const Loop = struct {
     session: ?*coding_agent.AgentSession = null,
     io: std.Io = undefined,
     wake: ?*runtime.WakeEvent = null,
-    transcript_line_buffer: [transcript_line_buffer_count]screen.Line = undefined,
+    viewport: Viewport = .follow,
+    pending_scroll_lines: i32 = 0,
+    last_transcript_rows: usize = 0,
+    line_prefix: [Transcript.transcript_items_max + 1]usize = undefined,
+    line_item_count: usize = 0,
+    transcript_line_buffer: [screen.row_capacity]screen.Line = undefined,
+    viewport_hint_buffer: [viewport_hint_buffer_len]u8 = undefined,
+    viewport_hint: []const u8 = "",
+    pending_rebuild_revision: ?u64 = null,
+    trace_io_ready: bool = false,
     queue_buffers: [4][256]u8 = undefined,
     queue_lines: [4][]const u8 = undefined,
     status_buffer: [256]u8 = undefined,
@@ -402,10 +427,36 @@ pub const Loop = struct {
         self.session = session;
         self.io = io;
         self.wake = wake;
+        self.trace_io_ready = true;
     }
 
     pub fn enableSyntheticFlood(self: *Loop, start_ns: u64) void {
         self.synthetic_flood = .{ .enabled = true, .start_ns = start_ns, .emitted_bytes = 0 };
+        self.dirty = true;
+    }
+
+    pub fn seedSyntheticItems(self: *Loop, count: usize) !void {
+        for (0..count) |index| {
+            var buffer: [64]u8 = undefined;
+            const text = try std.fmt.bufPrint(&buffer, "seed item {d}", .{index});
+            try self.transcript.appendNotice(.info, text);
+        }
+        self.dirty = true;
+    }
+
+    pub fn seedSyntheticTools(self: *Loop, io: std.Io, count: usize) !void {
+        const body = "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\n";
+        const content = [_]ai.ToolResultContent{.{ .text = .{ .text = body } }};
+        for (0..count) |index| {
+            var id_buffer: [64]u8 = undefined;
+            const call_id = try std.fmt.bufPrint(&id_buffer, "seed-tool-{d}", .{index});
+            try self.transcript.apply(io, .{ .tool_execution_end = .{
+                .tool_call_id = call_id,
+                .tool_name = "bash",
+                .result = .{ .content = &content },
+                .is_error = false,
+            } });
+        }
         self.dirty = true;
     }
 
@@ -445,12 +496,12 @@ pub const Loop = struct {
             .newline => try self.editor.insertNewline(),
             .dequeue_all => try self.dequeueAll(),
             .clear_or_quit => self.handleClearOrQuit(now_ns),
-            .expand_toggle => {
-                _ = self.layout_epoch.setExpanded(!self.layout_epoch.expanded);
-                self.dirty = true;
-            },
+            .expand_toggle => self.toggleExpanded(),
             .force_redraw => self.dirty = true,
-            .scroll, .page_up, .page_down, .none => {},
+            .scroll => |delta| self.queueViewportScroll(delta),
+            .page_up => self.queueViewportPage(-1),
+            .page_down => self.queueViewportPage(1),
+            .none => {},
         }
     }
 
@@ -461,13 +512,24 @@ pub const Loop = struct {
 
     pub fn composeFrame(self: *Loop, width: u16, height: u16) anyerror!screen.Frame {
         self.noteResize(width, height);
-        const transcript_lines = try self.collectTranscriptLines(width);
+        const rebuilt = try self.rebuildLineIndex(width);
+        if (rebuilt) self.clampViewportAfterRebuild();
+
         const queue_lines = self.collectQueueLines();
+        self.updateViewportHint();
+        var transcript_rows = chrome.transcriptRowCapacity(&self.editor, queue_lines.len, self.viewport_hint.len, width, height);
+        self.applyPendingViewportMotion(transcript_rows);
+        self.updateViewportHint();
+        transcript_rows = chrome.transcriptRowCapacity(&self.editor, queue_lines.len, self.viewport_hint.len, width, height);
+        const transcript_lines = self.collectTranscriptLines(transcript_rows);
+        self.last_transcript_rows = transcript_rows;
+
         return chrome.compose(.{
             .status = self.statusText(),
             .scratch_text = self.scratch.text(),
             .transcript_lines = transcript_lines,
             .queue_lines = queue_lines,
+            .viewport_hint = self.viewport_hint,
             .editor = &self.editor,
             .editor_border_style = self.editorBorderStyle(),
         }, width, height);
@@ -499,16 +561,19 @@ pub const Loop = struct {
 
     pub fn noteResize(self: *Loop, width: u16, height: u16) void {
         if (self.last_width == width and self.last_height == height) return;
-        if (self.last_width != 0 and self.last_width != width) self.trace.recordRebuild(0);
-        _ = self.layout_epoch.resize(width, height);
+        const had_width = self.last_width != 0;
+        const old_revision = self.layout_epoch.revision;
+        const changed = self.layout_epoch.resize(width, height);
         self.last_width = width;
         self.last_height = height;
+        if (had_width and changed and self.layout_epoch.revision != old_revision) self.markLayoutRebuild();
         self.dirty = true;
     }
 
     pub fn markRendered(self: *Loop, now_ns: u64, render_cost_ns: u64) void {
         self.last_flush_ns = now_ns;
         self.trace.recordRender(render_cost_ns);
+        self.trace.recordTranscriptEvictions(self.transcript.evicted_seqs);
         self.trace.recordFrame(.{
             .wake_ns = now_ns,
             .input_bytes = self.frame_input_bytes,
@@ -556,20 +621,213 @@ pub const Loop = struct {
         try self.notice(level, text);
     }
 
-    fn collectTranscriptLines(self: *Loop, width: u16) ![]const screen.Line {
-        var count: usize = 0;
-        for (self.transcript.items.items) |item| {
+    fn rebuildLineIndex(self: *Loop, width: u16) !bool {
+        const rebuild_pending = self.pending_rebuild_revision != null;
+        const start_ns = if (rebuild_pending) traceNowNs() else 0;
+        var total: usize = 0;
+        self.line_prefix[0] = 0;
+        self.line_item_count = self.transcript.items.items.len;
+        for (self.transcript.items.items, 0..) |item, index| {
             const lines = try self.transcript.itemLines(item, width, self.layout_epoch);
-            for (lines) |line| {
-                if (count == self.transcript_line_buffer.len) {
-                    std.mem.copyForwards(screen.Line, self.transcript_line_buffer[0 .. count - 1], self.transcript_line_buffer[1..count]);
-                    count -= 1;
-                }
-                self.transcript_line_buffer[count] = line;
-                count += 1;
-            }
+            total += lines.len;
+            self.line_prefix[index + 1] = total;
+        }
+        if (rebuild_pending) {
+            const elapsed_ns = traceNowNs() -| start_ns;
+            self.trace.recordRebuild(elapsed_ns);
+            self.pending_rebuild_revision = null;
+        }
+        return rebuild_pending;
+    }
+
+    fn collectTranscriptLines(self: *Loop, rows: usize) []const screen.Line {
+        const visible_rows = @min(rows, self.transcript_line_buffer.len);
+        if (visible_rows == 0 or self.totalTranscriptLines() == 0) return &.{};
+
+        var absolute = self.viewportStart(visible_rows);
+        var count: usize = 0;
+        while (count < visible_rows and absolute < self.totalTranscriptLines()) : (absolute += 1) {
+            const ref = self.lineRefAt(absolute) orelse break;
+            const item = self.transcript.items.items[ref.item_index];
+            self.transcript_line_buffer[count] = item.lines[ref.line_in_item];
+            count += 1;
         }
         return self.transcript_line_buffer[0..count];
+    }
+
+    fn totalTranscriptLines(self: *const Loop) usize {
+        return if (self.line_item_count == 0) 0 else self.line_prefix[self.line_item_count];
+    }
+
+    fn itemLineCount(self: *const Loop, item_index: usize) usize {
+        return self.line_prefix[item_index + 1] - self.line_prefix[item_index];
+    }
+
+    fn lineRefAt(self: *const Loop, absolute: usize) ?LineRef {
+        if (absolute >= self.totalTranscriptLines()) return null;
+        var index: usize = 0;
+        while (index < self.line_item_count) : (index += 1) {
+            if (absolute < self.line_prefix[index + 1]) {
+                return .{ .item_index = index, .line_in_item = absolute - self.line_prefix[index] };
+            }
+        }
+        return null;
+    }
+
+    fn viewportStart(self: *const Loop, rows: usize) usize {
+        const total = self.totalTranscriptLines();
+        if (total == 0) return 0;
+        const visible_rows = @max(@as(usize, 1), @min(rows, total));
+        const max_start = total - visible_rows;
+        return switch (self.viewport) {
+            .follow => max_start,
+            .anchored => |anchor| if (self.anchorAbsolute(anchor)) |absolute| @min(absolute, max_start) else 0,
+        };
+    }
+
+    fn anchorAbsolute(self: *const Loop, anchor: Viewport.Anchor) ?usize {
+        for (self.transcript.items.items[0..self.line_item_count], 0..) |item, index| {
+            if (item.seq != anchor.item_seq) continue;
+            const line_count = self.itemLineCount(index);
+            if (line_count == 0) return self.line_prefix[index];
+            return self.line_prefix[index] + @min(@as(usize, anchor.line_in_item), line_count - 1);
+        }
+        return null;
+    }
+
+    fn linesBelow(self: *const Loop, absolute: usize) u32 {
+        const total = self.totalTranscriptLines();
+        const below = total -| @min(total, absolute +| 1);
+        return @intCast(@min(below, @as(usize, std.math.maxInt(u32))));
+    }
+
+    fn clampViewportAfterRebuild(self: *Loop) void {
+        self.normalizeAnchoredViewport(true);
+    }
+
+    fn normalizeAnchoredViewport(self: *Loop, reset_seen: bool) void {
+        switch (self.viewport) {
+            .follow => return,
+            .anchored => |*anchor| {
+                for (self.transcript.items.items[0..self.line_item_count], 0..) |item, index| {
+                    if (item.seq != anchor.item_seq) continue;
+                    const line_count = self.itemLineCount(index);
+                    if (line_count == 0) {
+                        anchor.line_in_item = 0;
+                        anchor.lines_below_seen = 0;
+                        return;
+                    }
+                    const clamped_line = @min(@as(usize, anchor.line_in_item), line_count - 1);
+                    const changed = clamped_line != @as(usize, anchor.line_in_item);
+                    anchor.line_in_item = @intCast(clamped_line);
+                    if (reset_seen or changed) anchor.lines_below_seen = self.linesBelow(self.line_prefix[index] + clamped_line);
+                    return;
+                }
+                self.anchorOldestLiveLine();
+            },
+        }
+    }
+
+    fn anchorOldestLiveLine(self: *Loop) void {
+        if (self.line_item_count == 0 or self.totalTranscriptLines() == 0) {
+            self.viewport = .follow;
+            return;
+        }
+        const item = self.transcript.items.items[0];
+        self.viewport = .{ .anchored = .{
+            .item_seq = item.seq,
+            .line_in_item = 0,
+            .lines_below_seen = self.linesBelow(0),
+        } };
+    }
+
+    fn setAnchorAtAbsolute(self: *Loop, absolute: usize) void {
+        const ref = self.lineRefAt(absolute) orelse {
+            self.viewport = .follow;
+            return;
+        };
+        const item = self.transcript.items.items[ref.item_index];
+        self.viewport = .{ .anchored = .{
+            .item_seq = item.seq,
+            .line_in_item = @intCast(ref.line_in_item),
+            .lines_below_seen = self.linesBelow(absolute),
+        } };
+    }
+
+    fn updateViewportHint(self: *Loop) void {
+        self.viewport_hint = "";
+        self.normalizeAnchoredViewport(false);
+        switch (self.viewport) {
+            .follow => {},
+            .anchored => |anchor| {
+                const absolute = self.anchorAbsolute(anchor) orelse return;
+                const new_lines = self.linesBelow(absolute) -| anchor.lines_below_seen;
+                if (new_lines > 0) {
+                    self.viewport_hint = std.fmt.bufPrint(&self.viewport_hint_buffer, "↓ {d} new lines", .{new_lines}) catch "";
+                }
+            },
+        }
+    }
+
+    fn applyPendingViewportMotion(self: *Loop, rows: usize) void {
+        const delta = self.pending_scroll_lines;
+        self.pending_scroll_lines = 0;
+        if (delta == 0 or rows == 0) return;
+        const total = self.totalTranscriptLines();
+        if (total == 0) {
+            self.viewport = .follow;
+            return;
+        }
+        const visible_rows = @max(@as(usize, 1), @min(rows, total));
+        const max_start = total - visible_rows;
+        if (delta > 0) {
+            switch (self.viewport) {
+                .follow => return,
+                .anchored => {},
+            }
+        }
+
+        const start = self.viewportStart(visible_rows);
+        const target_signed = @as(i64, @intCast(start)) + @as(i64, delta);
+        const target = if (target_signed <= 0) 0 else @min(@as(usize, @intCast(target_signed)), max_start);
+        if (delta > 0 and target >= max_start) {
+            self.viewport = .follow;
+        } else {
+            self.setAnchorAtAbsolute(target);
+        }
+    }
+
+    fn queueViewportScroll(self: *Loop, delta: i32) void {
+        const next = @as(i64, self.pending_scroll_lines) + @as(i64, delta);
+        self.pending_scroll_lines = @intCast(std.math.clamp(next, -100_000, 100_000));
+        self.dirty = true;
+    }
+
+    fn queueViewportPage(self: *Loop, direction: i32) void {
+        const page_rows = if (self.last_transcript_rows > 2) self.last_transcript_rows - 2 else 1;
+        self.queueViewportScroll(direction * @as(i32, @intCast(page_rows)));
+    }
+
+    fn repinViewport(self: *Loop) void {
+        self.viewport = .follow;
+        self.pending_scroll_lines = 0;
+        self.viewport_hint = "";
+    }
+
+    fn toggleExpanded(self: *Loop) void {
+        if (self.layout_epoch.setExpanded(!self.layout_epoch.expanded)) self.markLayoutRebuild();
+        self.dirty = true;
+    }
+
+    fn setHideThinking(self: *Loop, hidden: bool) void {
+        if (self.layout_epoch.setHideThinking(hidden)) self.markLayoutRebuild();
+        self.dirty = true;
+    }
+
+    fn markLayoutRebuild(self: *Loop) void {
+        self.transcript.markAllDirty();
+        self.pending_rebuild_revision = self.layout_epoch.revision;
+        self.dirty = true;
     }
 
     fn collectQueueLines(self: *Loop) []const []const u8 {
@@ -719,6 +977,7 @@ pub const Loop = struct {
         }
         const text = self.editor.text();
         if (text.len == 0) return;
+        self.repinViewport();
         if (try self.dispatchSlashIfNeeded(text)) {
             self.editor.clear();
             return;
@@ -773,8 +1032,7 @@ pub const Loop = struct {
             .hide_thinking => |hidden| {
                 const session = self.session orelse return true;
                 try session.setHideThinking(hidden);
-                _ = self.layout_epoch.setHideThinking(hidden);
-                self.dirty = true;
+                self.setHideThinking(hidden);
             },
             .unknown => |name| {
                 var available: [160]u8 = undefined;
@@ -830,6 +1088,14 @@ pub const Loop = struct {
 fn nowNs(io: std.Io) u64 {
     const raw = std.Io.Timestamp.now(io, .awake).toNanoseconds();
     return if (raw <= 0) 0 else @intCast(raw);
+}
+
+fn traceNowNs() u64 {
+    var ts: std.c.timespec = undefined;
+    if (std.c.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
+    const sec: u64 = if (ts.sec <= 0) 0 else @intCast(ts.sec);
+    const nsec: u64 = if (ts.nsec <= 0) 0 else @intCast(ts.nsec);
+    return sec * std.time.ns_per_s + nsec;
 }
 
 test "loop dispatch edits text through editor actions" {
@@ -898,6 +1164,153 @@ test "loop composes frame and clears dirty only after render success" {
     loop.markRendered(1, 2);
     try std.testing.expect(!loop.dirty);
     try std.testing.expectEqual(@as(usize, 1), loop.trace.renders.count);
+}
+
+test "loop viewport anchors while appended lines arrive" {
+    var loop = try Loop.init(std.testing.allocator, null);
+    defer loop.deinit();
+    try loop.seedSyntheticItems(10);
+
+    var frame = try loop.composeFrame(80, 8);
+    var buffer: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("seed item 6", frame.rows()[1].copyText(&buffer));
+
+    try loop.dispatch(.{ .scroll = -3 });
+    frame = try loop.composeFrame(80, 8);
+    try std.testing.expectEqualStrings("seed item 3", frame.rows()[1].copyText(&buffer));
+
+    try loop.transcript.appendNotice(.info, "new item");
+    frame = try loop.composeFrame(80, 8);
+    try std.testing.expectEqualStrings("seed item 3", frame.rows()[1].copyText(&buffer));
+    try std.testing.expectEqualStrings("↓ 1 new lines", frame.rows()[4].copyText(&buffer));
+}
+
+test "loop viewport clamps to oldest live item after eviction" {
+    var loop = try Loop.init(std.testing.allocator, null);
+    defer loop.deinit();
+    try loop.seedSyntheticItems(Transcript.transcript_items_max);
+    _ = try loop.composeFrame(80, 8);
+
+    try loop.dispatch(.{ .scroll = -100_000 });
+    _ = try loop.composeFrame(80, 8);
+    for (0..10) |index| {
+        var text: [32]u8 = undefined;
+        try loop.transcript.appendNotice(.info, try std.fmt.bufPrint(&text, "extra {d}", .{index}));
+    }
+
+    const frame = try loop.composeFrame(80, 8);
+    var buffer: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("seed item 10", frame.rows()[1].copyText(&buffer));
+}
+
+test "loop viewport clamps line within anchored item on width rebuild" {
+    var loop = try Loop.init(std.testing.allocator, null);
+    defer loop.deinit();
+    try loop.transcript.appendNotice(.info, "abcdefghijklmnopqrstuvwxyz");
+    _ = try loop.composeFrame(10, 6);
+    loop.setAnchorAtAbsolute(2);
+    const anchored_seq = loop.viewport.anchored.item_seq;
+
+    _ = try loop.composeFrame(80, 6);
+    try std.testing.expect(loop.viewport == .anchored);
+    try std.testing.expectEqual(anchored_seq, loop.viewport.anchored.item_seq);
+    try std.testing.expectEqual(@as(u32, 0), loop.viewport.anchored.line_in_item);
+}
+
+test "loop submit repins viewport to follow" {
+    var loop = try Loop.init(std.testing.allocator, null);
+    defer loop.deinit();
+    try loop.seedSyntheticItems(10);
+    _ = try loop.composeFrame(80, 8);
+    try loop.dispatch(.{ .scroll = -3 });
+    _ = try loop.composeFrame(80, 8);
+    try std.testing.expect(loop.viewport == .anchored);
+
+    try loop.dispatch(.{ .insert = "hello" });
+    try loop.dispatch(.submit);
+    try std.testing.expect(loop.viewport == .follow);
+}
+
+test "loop omits blank assistant rows for tool-call-only turns" {
+    var loop = try Loop.init(std.testing.allocator, null);
+    defer loop.deinit();
+
+    try loop.transcript.apply(std.testing.io, .{ .message_start = .{ .message = .{ .user = .{ .content = .{ .string = "Run tools" }, .timestamp = 0 } } } });
+
+    var args_object: std.json.ObjectMap = .empty;
+    defer args_object.deinit(std.testing.allocator);
+    try args_object.put(std.testing.allocator, "command", .{ .string = "pwd" });
+    const call = ai.ToolCall{ .id = "call-1", .name = "bash", .arguments = .{ .object = args_object } };
+    const tool_content = [_]ai.AssistantContent{.{ .tool_call = call }};
+    const tool_assistant = Loop.syntheticAssistantMessage(&tool_content);
+    try loop.transcript.apply(std.testing.io, .{ .message_start = .{ .message = .{ .assistant = tool_assistant } } });
+    try loop.transcript.apply(std.testing.io, .{ .message_update = .{ .assistant_message_event = .{ .toolcall_start = .{
+        .content_index = 0,
+        .partial = tool_assistant,
+    } } } });
+    const result_content = [_]ai.ToolResultContent{.{ .text = .{ .text = "/tmp/repo" } }};
+    try loop.transcript.apply(std.testing.io, .{ .tool_execution_end = .{
+        .tool_call_id = "call-1",
+        .tool_name = "bash",
+        .result = .{ .content = &result_content },
+        .is_error = false,
+    } });
+    try loop.transcript.apply(std.testing.io, .{ .message_end = .{ .message = .{ .assistant = tool_assistant } } });
+
+    const final_content = [_]ai.AssistantContent{.{ .text = .{ .text = "Done" } }};
+    const final_assistant = Loop.syntheticAssistantMessage(&final_content);
+    try loop.transcript.apply(std.testing.io, .{ .message_start = .{ .message = .{ .assistant = final_assistant } } });
+    try loop.transcript.apply(std.testing.io, .{ .message_end = .{ .message = .{ .assistant = final_assistant } } });
+
+    const frame = try loop.composeFrame(80, 12);
+    var buffer: [128]u8 = undefined;
+    try std.testing.expectEqualStrings("Run tools", frame.rows()[1].copyText(&buffer));
+    try std.testing.expectEqualStrings("[done] $ pwd", frame.rows()[2].copyText(&buffer));
+    try std.testing.expectEqualStrings("/tmp/repo", frame.rows()[3].copyText(&buffer));
+    try std.testing.expectEqualStrings("Done", frame.rows()[4].copyText(&buffer));
+}
+
+test "loop thinking relayout preserves anchored item" {
+    var loop = try Loop.init(std.testing.allocator, null);
+    defer loop.deinit();
+    try loop.seedSyntheticItems(5);
+
+    const thinking_content = [_]ai.AssistantContent{.{ .thinking = .{ .thinking = "one two three four five six seven eight nine ten" } }};
+    const thinking_assistant = Loop.syntheticAssistantMessage(&thinking_content);
+    try loop.transcript.apply(std.testing.io, .{ .message_start = .{ .message = .{ .assistant = thinking_assistant } } });
+    try loop.transcript.apply(std.testing.io, .{ .message_end = .{ .message = .{ .assistant = thinking_assistant } } });
+
+    for (0..8) |index| {
+        var text: [32]u8 = undefined;
+        try loop.transcript.appendNotice(.info, try std.fmt.bufPrint(&text, "after {d}", .{index}));
+    }
+    const anchor_item = loop.transcript.items.items[8];
+    loop.viewport = .{ .anchored = .{ .item_seq = anchor_item.seq, .line_in_item = 0, .lines_below_seen = 0 } };
+
+    var frame = try loop.composeFrame(10, 8);
+    var buffer: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("after 2", frame.rows()[1].copyText(&buffer));
+
+    loop.setHideThinking(false);
+    frame = try loop.composeFrame(10, 8);
+    try std.testing.expectEqualStrings("after 2", frame.rows()[1].copyText(&buffer));
+}
+
+test "loop collapsed tool body ending newline has no blank before marker" {
+    var loop = try Loop.init(std.testing.allocator, null);
+    defer loop.deinit();
+    const result_content = [_]ai.ToolResultContent{.{ .text = .{ .text = "one\ntwo\nthree\nfour\nfive\nsix\n" } }};
+    try loop.transcript.apply(std.testing.io, .{ .tool_execution_end = .{
+        .tool_call_id = "tool-1",
+        .tool_name = "bash",
+        .result = .{ .content = &result_content },
+        .is_error = false,
+    } });
+
+    const frame = try loop.composeFrame(80, 12);
+    var buffer: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("five", frame.rows()[6].copyText(&buffer));
+    try std.testing.expectEqualStrings("… 1 more lines (ctrl+o)", frame.rows()[7].copyText(&buffer));
 }
 
 test "loop render timing honors dirty policy" {

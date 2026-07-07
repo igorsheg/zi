@@ -142,6 +142,7 @@ pub fn appendNotice(self: *Transcript, level: NoticeLevel, text: []const u8) !vo
     item.kind.notice.text = try item.allocator().dupe(u8, text);
     self.total_bytes += item.kind.notice.text.len;
     try self.appendItem(item);
+    try self.enforceCaps();
 }
 
 pub fn appendCompaction(self: *Transcript, summary: []const u8, tokens_before: u64) !void {
@@ -153,6 +154,7 @@ pub fn appendCompaction(self: *Transcript, summary: []const u8, tokens_before: u
     item.kind.compaction.summary_first_line = try item.allocator().dupe(u8, first);
     self.total_bytes += item.kind.compaction.summary_first_line.len;
     try self.appendItem(item);
+    try self.enforceCaps();
 }
 
 pub fn markRunningToolsDirty(self: *Transcript) bool {
@@ -166,11 +168,15 @@ pub fn markRunningToolsDirty(self: *Transcript) bool {
     return changed;
 }
 
+pub fn markAllDirty(self: *Transcript) void {
+    for (self.items.items) |item| item.dirty = true;
+}
+
 pub fn itemLines(self: *Transcript, item: *Item, width: u16, epoch: theme.LayoutEpoch) ![]const layout.Line {
+    _ = self;
     const epoch_value = epoch.revision;
     if (!item.dirty and item.cached_width == width and item.cached_epoch == epoch_value) return item.lines;
-    item.layout_arena.deinit();
-    item.layout_arena = std.heap.ArenaAllocator.init(self.gpa);
+    _ = item.layout_arena.reset(.retain_capacity);
     item.lines = &.{};
     const allocator = item.layoutAllocator();
     item.lines = switch (item.kind) {
@@ -194,12 +200,16 @@ pub fn itemLines(self: *Transcript, item: *Item, width: u16, epoch: theme.Layout
 fn layoutAssistant(allocator: std.mem.Allocator, assistant: anytype, width: u16, epoch: theme.LayoutEpoch) ![]layout.Line {
     var text: std.Io.Writer.Allocating = .init(allocator);
     errdefer text.deinit();
+    var hidden_thinking_shown = false;
     for (assistant.parts.items) |part| {
         switch (part) {
             .text => |value| try text.writer.writeAll(value.items),
             .thinking => |value| {
                 if (epoch.hide_thinking) {
-                    if (value.items.len > 0) try text.writer.writeAll("Thinking…\n");
+                    if (assistant.streaming and value.items.len > 0 and !hidden_thinking_shown) {
+                        try text.writer.writeAll("Thinking…\n");
+                        hidden_thinking_shown = true;
+                    }
                 } else {
                     try text.writer.writeAll(value.items);
                 }
@@ -211,39 +221,58 @@ fn layoutAssistant(allocator: std.mem.Allocator, assistant: anytype, width: u16,
         try text.writer.writeAll("\nerror: ");
         if (assistant.error_text) |err| try text.writer.writeAll(err);
     }
+    if (text.written().len == 0) return &.{};
     const style = if (assistant.stop == .ok) screen.styles.normal else screen.styles.error_;
     var wrap_state: layout.WrapState = .{};
     return layout.wrapMarkdown(allocator, text.written(), width, style, &wrap_state);
 }
 
 fn layoutTool(allocator: std.mem.Allocator, tool: anytype, width: u16, expanded: bool) ![]layout.Line {
-    var writer: std.Io.Writer.Allocating = .init(allocator);
-    errdefer writer.deinit();
-    try writer.writer.print("[{s}] {s}", .{ blocks.statusText(tool.status), tool.title });
-    if (tool.status == .running) {
-        try writer.writer.writeAll(" — ");
-        try writer.writer.writeAll(elapsedText(allocator, tool, true));
-    } else if (tool.duration_ms) |_| {
-        try writer.writer.writeAll(" — ");
-        try writer.writer.writeAll(elapsedText(allocator, tool, false));
-    }
+    const style = blocks.statusStyle(tool.status);
+    var out = std.ArrayList(layout.Line).empty;
+    errdefer out.deinit(allocator);
+    try out.ensureTotalCapacity(allocator, 8);
+
+    const title = try toolTitleLine(allocator, tool);
+    try layout.appendPlainLine(allocator, &out, title, width, style);
+
     if (tool.status == .running and !tool.tail.isEmpty()) {
-        for (0..tool.tail.count) |index| {
-            try writer.writer.writeByte('\n');
-            try writer.writer.writeAll(tool.tail.line(index));
-        }
+        for (0..tool.tail.count) |index| try layout.appendPlainLine(allocator, &out, tool.tail.line(index), width, style);
     } else if (tool.body.items.len > 0) {
-        try writer.writer.writeByte('\n');
         if (expanded) {
-            try writer.writer.writeAll(tool.body.items);
+            try appendToolBodyLines(allocator, &out, tool.body.items, width, style);
         } else {
             const preview = collapsedBodyPreview(tool.body.items);
-            try writer.writer.writeAll(preview.text);
-            if (preview.more_lines > 0) try writer.writer.print("\n… {d} more lines (ctrl+o)", .{preview.more_lines});
+            try appendToolBodyLines(allocator, &out, preview.text, width, style);
+            if (preview.more_lines > 0) {
+                const marker = try std.fmt.allocPrint(allocator, "… {d} more lines (ctrl+o)", .{preview.more_lines});
+                try layout.appendPlainLine(allocator, &out, marker, width, style);
+            }
         }
-        if (tool.body_truncated) try writer.writer.writeAll("\n" ++ output_truncated_text);
+        if (tool.body_truncated) try layout.appendPlainLine(allocator, &out, output_truncated_text, width, style);
     }
-    return layout.wrapPlain(allocator, writer.written(), width, blocks.statusStyle(tool.status));
+    return out.toOwnedSlice(allocator);
+}
+
+fn toolTitleLine(allocator: std.mem.Allocator, tool: anytype) ![]const u8 {
+    if (tool.status == .running) {
+        return std.fmt.allocPrint(allocator, "[{s}] {s} — {s}", .{ blocks.statusText(tool.status), tool.title, elapsedText(allocator, tool, true) });
+    }
+    if (tool.duration_ms) |_| {
+        return std.fmt.allocPrint(allocator, "[{s}] {s} — {s}", .{ blocks.statusText(tool.status), tool.title, elapsedText(allocator, tool, false) });
+    }
+    return std.fmt.allocPrint(allocator, "[{s}] {s}", .{ blocks.statusText(tool.status), tool.title });
+}
+
+fn appendToolBodyLines(allocator: std.mem.Allocator, out: *std.ArrayList(layout.Line), text: []const u8, width: u16, style: screen.Style) !void {
+    var start: usize = 0;
+    if (text.len == 0) return;
+    while (start < text.len) {
+        const end = std.mem.indexOfScalarPos(u8, text, start, '\n') orelse text.len;
+        try layout.appendPlainLine(allocator, out, text[start..end], width, style);
+        if (end == text.len) break;
+        start = end + 1;
+    }
 }
 
 const BodyPreview = struct { text: []const u8, more_lines: usize };
@@ -263,9 +292,10 @@ fn collapsedBodyPreview(text: []const u8) BodyPreview {
     }
     const end = agent_mod.utf8Prefix(text, @min(index, text.len)).len;
     if (end >= text.len) return .{ .text = text, .more_lines = 0 };
-    var more_lines: usize = 1;
-    for (text[end..]) |byte| {
-        if (byte == '\n') more_lines += 1;
+    const remaining = text[end..];
+    var more_lines: usize = if (remaining.len == 0) 0 else 1;
+    for (remaining, 0..) |byte, offset| {
+        if (byte == '\n' and offset + 1 < remaining.len) more_lines += 1;
     }
     return .{ .text = text[0..end], .more_lines = more_lines };
 }
@@ -508,8 +538,16 @@ fn replaceFinalPart(self: *Transcript, item: *Item, part: *Part, text: []const u
     try self.appendListBounded(item, part.list(), text, per_item_text_bytes_max, &assistant.truncated, true);
 }
 
+fn findToolItem(self: *Transcript, call_id: []const u8) ?*Item {
+    for (self.items.items) |item| {
+        if (item.kind != .tool) continue;
+        if (std.mem.eql(u8, item.kind.tool.call_id, call_id)) return item;
+    }
+    return null;
+}
 fn ensureToolItem(self: *Transcript, call_id: []const u8, name: []const u8, args: std.json.Value) !*Item {
     if (self.live_tools.get(call_id)) |item| return item;
+    if (self.findToolItem(call_id)) |item| return item;
     const item = try self.createToolItem(call_id, name, args);
     try self.appendItem(item);
     try self.live_tools.put(self.gpa, item.kind.tool.call_id, item);

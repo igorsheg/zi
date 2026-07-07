@@ -11,6 +11,7 @@ pub const Snapshot = struct {
     scratch_text: []const u8 = "",
     transcript_lines: []const screen.Line = &.{},
     queue_lines: []const []const u8 = &.{},
+    viewport_hint: []const u8 = "",
     editor: *const Editor,
     editor_border_style: screen.Style = screen.styles.muted,
 };
@@ -25,9 +26,8 @@ pub fn compose(snapshot: Snapshot, width: u16, height: u16) error{ FrameFull, Li
 
     try frame.appendLine(screen.singleSpanLine(snapshot.status, screen.styles.muted));
     const editor_rows = editorRows(snapshot.editor, height, width);
-    const queue_rows = @min(snapshot.queue_lines.len, @as(usize, 4));
-    const fixed_rows = 1 + editor_rows + queue_rows;
-    const transcript_rows: usize = if (height > fixed_rows) height - fixed_rows else 0;
+    const queue_rows = queueRowCount(snapshot.queue_lines.len, snapshot.viewport_hint.len);
+    const transcript_rows = transcriptRowCapacity(snapshot.editor, snapshot.queue_lines.len, snapshot.viewport_hint.len, width, height);
 
     appendTranscriptTail(&frame, snapshot.transcript_lines, transcript_rows) catch |err| return err;
     if (snapshot.scratch_text.len > 0 and frame.rows().len + queue_rows + editor_rows < height) {
@@ -35,9 +35,27 @@ pub fn compose(snapshot: Snapshot, width: u16, height: u16) error{ FrameFull, Li
     }
     while (frame.rows().len + queue_rows + editor_rows < height) try frame.appendLine(.{});
 
-    for (snapshot.queue_lines[0..queue_rows]) |line| try frame.appendLine(screen.singleSpanLine(line, screen.styles.muted));
+    var remaining_queue_rows = queue_rows;
+    if (snapshot.viewport_hint.len > 0 and remaining_queue_rows > 0) {
+        try frame.appendLine(screen.singleSpanLine(snapshot.viewport_hint, screen.styles.muted));
+        remaining_queue_rows -= 1;
+    }
+    for (snapshot.queue_lines[0..@min(snapshot.queue_lines.len, remaining_queue_rows)]) |line| try frame.appendLine(screen.singleSpanLine(line, screen.styles.muted));
     appendEditor(&frame, snapshot.editor, @intCast(height - editor_rows), editor_rows, width, snapshot.editor_border_style, useBorder(height, width)) catch |err| return err;
     return frame;
+}
+
+pub fn transcriptRowCapacity(editor: *const Editor, queue_line_count: usize, viewport_hint_len: usize, width: u16, height: u16) usize {
+    if (height <= 1) return 0;
+    const editor_rows = editorRows(editor, height, width);
+    const queue_rows = queueRowCount(queue_line_count, viewport_hint_len);
+    const fixed_rows = 1 + editor_rows + queue_rows;
+    return if (height > fixed_rows) height - fixed_rows else 0;
+}
+
+fn queueRowCount(queue_line_count: usize, viewport_hint_len: usize) usize {
+    const hint_rows: usize = if (viewport_hint_len > 0) 1 else 0;
+    return @min(queue_line_count + hint_rows, @as(usize, 4));
 }
 
 fn appendTranscriptTail(frame: *screen.Frame, lines: []const screen.Line, rows: usize) error{FrameFull}!void {

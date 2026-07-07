@@ -16,10 +16,12 @@ pub const LayoutEpoch = struct {
     revision: u64 = 0,
 
     pub fn resize(self: *LayoutEpoch, width: u16, height: u16) bool {
-        if (self.width == width and self.height == height) return false;
+        const width_changed = self.width != width;
+        const height_changed = self.height != height;
+        if (!width_changed and !height_changed) return false;
         self.width = width;
         self.height = height;
-        self.revision +%= 1;
+        if (width_changed) self.revision +%= 1;
         return true;
     }
 
@@ -75,5 +77,7 @@ test "layout epoch increments only on visible changes" {
     try std.testing.expect(epoch.resize(100, 30));
     try std.testing.expectEqual(@as(u64, 1), epoch.revision);
     try std.testing.expect(epoch.setHideThinking(false));
+    try std.testing.expectEqual(@as(u64, 2), epoch.revision);
+    try std.testing.expect(epoch.resize(100, 40));
     try std.testing.expectEqual(@as(u64, 2), epoch.revision);
 }

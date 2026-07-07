@@ -32,6 +32,13 @@ pub fn pendingBytes(self: *const InputDecoder) usize {
     return self.len;
 }
 
+pub fn reset(self: *InputDecoder) void {
+    self.parser = .{};
+    self.len = 0;
+    self.paste_len = 0;
+    self.paste_active = false;
+}
+
 pub fn nextAction(self: *InputDecoder) !?input.Action {
     return self.nextActionWithTerminal(null);
 }

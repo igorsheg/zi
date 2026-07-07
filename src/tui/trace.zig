@@ -129,6 +129,7 @@ pub const Stats = struct {
     input_latency_timing: TimingStats = .{},
     input_actions: usize = 0,
     dropped_input_bytes: usize = 0,
+    transcript_evictions: u64 = 0,
 
     pub fn recordIteration(self: *Stats, ns: u64) void {
         self.iterations.record(ns);
@@ -160,6 +161,10 @@ pub const Stats = struct {
         self.dropped_input_bytes += count;
     }
 
+    pub fn recordTranscriptEvictions(self: *Stats, count: u64) void {
+        self.transcript_evictions = count;
+    }
+
     pub fn writeReport(self: *const Stats, writer: *std.Io.Writer) !void {
         try writer.print(
             "zi tui trace\n" ++
@@ -169,6 +174,7 @@ pub const Stats = struct {
                 "rebuilds count={d} avg_ns={d} max_ns={d}\n" ++
                 "input_actions count={d}\n" ++
                 "dropped_input_bytes count={d}\n" ++
+                "transcript_evictions count={d}\n" ++
                 "input_latency count={d} p50_ns={d} p90_ns={d} p99_ns={d} max_ns={d}\n" ++
                 "input_latency buckets_1ms_to_1024ms_plus=",
             .{
@@ -192,6 +198,7 @@ pub const Stats = struct {
                 self.rebuilds.max_ns,
                 self.input_actions,
                 self.dropped_input_bytes,
+                self.transcript_evictions,
                 self.input_latency_timing.count,
                 self.input_latency_timing.percentileNs(50),
                 self.input_latency_timing.percentileNs(90),
