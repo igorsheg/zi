@@ -20,11 +20,11 @@ The struct or loop allowed to mutate a piece of state and responsible for its
 shutdown/deinit.
 _Avoid_: manager (unless the code already uses that name)
 
-**Mailbox**:
-A bounded command boundary owned by `Engine`. Frontends submit commands; they do
-not mutate sessions directly. UI reads presentation through ViewModel sampling,
-not event replay.
-_Avoid_: callback API, observer bus
+**TUI Loop**:
+The terminal owner loop in `src/tui`: input decoding, run driving,
+transcript folding, viewport, chrome, and rendering cadence. It owns visible
+terminal state and samples session facts directly through `AgentSession`.
+_Avoid_: mailbox, ViewModel
 
 **Runtime mechanism**:
 `src/runtime`: `std.Io`-first process/runtime support, bounded queues, wakes,
@@ -32,25 +32,20 @@ cancel tokens, event pipes, process running, byte/json ownership. Vendored `zio`
 is a private backend adapter.
 _Avoid_: app runtime, product layer
 
-**Engine**:
-The stable mailbox host and ViewModel writer. It owns its thread, the session
-runtime mechanism, and exactly one live session slot. Session replacement builds
-the next slot first, then swaps through the engine owner path.
-_Avoid_: session service, session manager (unless referring to existing code)
-
-**ViewModel**:
-Bounded, versioned, engine-owned presentation state sampled by frontends at frame
-rate. It contains renderable facts, not a replay protocol.
-_Avoid_: event stream, client ledger
+**Print frontend**:
+The headless prompt runner in `src/frontends/print`. It drives an
+`AgentSession.RunHandle`, writes assistant deltas or JSON events, and exits
+with a process-ready status code.
+_Avoid_: stub frontend
 
 **RuntimeServices**:
-Cwd-scoped services replaceable with a session: cwd, agent dir, settings, auth,
-provider registry, and provider instances. They borrow the host runtime.
+Cwd-scoped services shared by concrete frontends: cwd, agent dir, settings,
+auth, provider registry, provider instances, and the host task runtime.
 
 **AgentSession**:
 One session's policy spine: prompt resources, system prompt, builtin tools,
-durable history, long-lived `agent.Agent`, public events, lifecycle, retry, and
-compaction.
+durable history, long-lived `agent.Agent`, lifecycle, retry, compaction, and
+session event state.
 
 **agent.Agent**:
 The product-agnostic transcript/tool/stream loop. It owns runtime transcript
@@ -62,22 +57,19 @@ session facts such as model/thinking changes. In-memory history is a bounded
 view; the agent transcript is runtime context.
 _Avoid_: transcript as source of truth
 
-**ClientEvent**:
-Legacy/future wire protocol fact retained in `client_protocol.zig`; the in-process
-TUI no longer consumes it. RPC will rebuild a wire stream from the ViewModel.
+**AgentEvent**:
+The in-process run event stream emitted by `agent.Agent`. TUI folds it into a
+bounded `Transcript`; print JSON writes it line-by-line; session events persist
+durable message ends.
 
-**Sample**:
-Owned ViewModel state copied out for a frontend reader. Samples are bounded by a
-per-frame byte cap; reader cursors own diff progress.
+**Transcript**:
+The bounded render fold owned by TUI. It is presentation state rebuilt from live
+events or restored session entries; durable jsonl remains the source of truth.
 
-**Frontend adapter**:
-Concrete bridge in `src/frontends/*`. The TUI adapter may import both
-`coding_agent` and `tui`; neither core package imports the adapter.
-
-**TUI product**:
-`src/tui`: agent-agnostic terminal state and commands. It knows transcript,
-composer, statuses, tools as UI concepts; it does not know providers, sessions,
-or agent events.
+**Concrete frontend**:
+Code that bridges CLI/runtime resources to product behavior. `src/tui` owns the
+interactive terminal frontend; `src/frontends/print` owns non-interactive text
+and JSON output.
 
 **Vaxis**:
 Vendored terminal mechanism: raw tty, parser, screen/window primitives, borders,
@@ -97,14 +89,15 @@ All `.zi`, settings, auth, skills, and prompt-resource path policy belongs in
   policy.
 - `cli/` parses mode and dispatches to concrete frontends: TUI frame loop,
   print/text, json, parked rpc, or auth.
-- `coding_agent` owns Engine, ViewModel, sessions, resources, settings, tools,
-  persistence, and mailbox commands.
+- `coding_agent` owns sessions, resources, settings, tools, persistence, and
+  session bootstrapping.
 - `agent` owns the generic turn loop and tool execution protocol.
 - `ai` owns provider protocol, model catalog, provider registry, wire adapters,
   and streams.
 - `runtime` owns mechanism only; product policy lives above it.
-- `tui` owns terminal product state only; concrete session mapping lives in a
-  frontend adapter.
+- `tui` owns the interactive terminal frontend and may bridge concrete
+  `AgentSession` facts into terminal presentation.
+- `frontends/print` owns the non-interactive prompt frontend.
 
 ## Import shape
 
@@ -112,9 +105,9 @@ All `.zi`, settings, auth, skills, and prompt-resource path policy belongs in
 ai            -> std (+ runtime I/O mechanism)
 agent         -> std, ai, runtime
 runtime       -> std (zio private behind adapters)
-tui           -> std, vaxis
-coding_agent  -> std, ai, agent, runtime (Engine/ViewModel)
-frontends     -> bridge concrete packages (frame_loop samples ViewModel)
+coding_agent  -> std, ai, agent, runtime
+tui           -> std, vaxis, ai, agent, coding_agent, runtime
+frontends     -> std, ai/agent/coding_agent/runtime as concrete adapters need
 ```
 
 Lower layers do not import higher layers.
@@ -123,11 +116,11 @@ Lower layers do not import higher layers.
 
 - **Session history vs transcript**: session jsonl is durable truth; transcript
   is runtime/UI context.
-- **Wake vs sample**: a wake only says "inspect owned state"; it carries no
-  authority or payload. The UI samples the ViewModel after wake/deadline.
+- **Wake vs state**: a wake only says "inspect owned state"; it carries no
+  authority or payload. The frontend polls/drains the owner after wake/deadline.
 - **Cancellation request vs completion**: requesting cancel is intent; the owner
   must still observe the terminal outcome and drain/join before deinit.
-- **TUI vs TUI frontend**: `src/tui` is agent-agnostic product state;
-  `src/frontends/tui` translates `coding_agent` facts into TUI commands.
+- **TUI package vs generic TUI toolkit**: `src/tui` is now Zi's concrete
+  interactive frontend, not a reusable agent-agnostic toolkit.
 - **Bounded external totals**: long sessions and long responses are allowed when
   spilled durably or exposed through bounded in-flight work.

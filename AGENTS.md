@@ -19,9 +19,9 @@ main.zig       process/runtime setup, then cli.main
 ai             provider protocol, models, registry, wire adapters, streams
 agent          generic transcript/tool/stream loop
 runtime        std.Io-first mechanism; zio private behind adapters
-coding_agent   Engine, ViewModel, sessions, resources, settings, tools, persistence, commands
-tui            agent-agnostic terminal product on vaxis
-frontends      concrete adapters between clients and coding_agent/tui
+coding_agent   sessions, resources, settings, tools, persistence, bootstrap
+tui            concrete interactive terminal frontend on vaxis
+frontends      non-interactive/concrete adapters such as print mode
 ```
 
 Import rules:
@@ -29,9 +29,9 @@ Import rules:
 - `ai`: std plus runtime I/O mechanism only.
 - `agent`: std, ai, runtime. Never coding_agent or tui.
 - `runtime`: std only publicly; zio stays private. No product policy.
-- `tui`: std plus vendored vaxis only.
+- `tui`: std, vaxis, ai, agent, coding_agent, runtime. Never imported by coding_agent.
 - `coding_agent`: std, ai, agent, runtime. Never tui or concrete frontends.
-- Frontends may bridge concrete packages.
+- Frontends may bridge concrete packages and own process-facing policy.
 
 ## runtime changes
 
@@ -51,50 +51,58 @@ When touching `src/runtime` or code that uses it:
 
 ## coding_agent changes
 
-- `Engine` is the mailbox host, owns its thread, writes the ViewModel, and owns
-  one live session slot.
-- Session replacement must build the next slot completely before swapping.
-- Frontends submit commands and sample the ViewModel; they do not mutate sessions
-  directly.
 - `AgentSession` owns one long-lived `agent.Agent` plus resources, tools,
-  persistence, retry, compaction, and private session event state.
-- `EngineDrain` is the only writer of message-derived ViewModel state.
-- Drain order is:
+  persistence, retry, compaction, lifecycle, and private session event state.
+- Concrete frontends own waiting/driving. They start `AgentSession.RunHandle`s,
+  set wake handles, poll until terminal completion, then settle and deinit the
+  handle before shutdown.
+- Session replacement must build the next slot completely before swapping.
+- Durable session facts are persisted before mutating mailbox-owned live agent
+  facts such as model or thinking level.
+- Registered listeners handle each event in subscription order: frontend
+  fold/output and session persistence both run during `agent.emitEvent`; terminal
+  retry/compaction policy runs after the handle settles.
 
 ```text
-agent event -> ViewModel mutation -> jsonl persistence on message_end
-            -> terminal policy
+agent event -> registered listeners -> agent state reduce -> handle settle
+            -> terminal retry/compaction policy
 ```
-
-- Persist durable session facts before mutating the live agent when mailbox-owned
-  facts change.
 - Option resolution is explicit -> project -> global -> default. Provider/model
   are scope-atomic; reject mixed-scope pairs and record a diagnostic.
 
 ## tui changes
 
-- `tui.App` owns TUI product state. Mutate through `App.apply(Command)` only.
-- `apply` must handle operational input without tearing down the owner loop:
-  oversize, invalid UTF-8, unknown IDs, and slot-full inputs degrade before
-  mutation. Only `OutOfMemory` propagates.
-- Time enters through `Command.tick`; App does not read clocks.
-- Keep `src/tui` agent-agnostic. Translate sampled ViewModel state in a frontend adapter.
+- `tui.Runner`/`Loop` own interactive terminal state. Mutate through
+  `Loop.dispatch`, `Loop.tick`, `Loop.pumpDriver`, and `Transcript.apply` only.
+- Operational input must not tear down the owner loop: oversize, invalid UTF-8,
+  unknown parser events, and full bounded buffers degrade before mutation. Only
+  `OutOfMemory` propagates intentionally.
+- Time enters through runner/frame-loop deadlines; TUI state does not read wall
+  clocks directly except through explicit `std.Io` timestamps at the owner edge.
 - Use Vaxis for terminal mechanism: raw tty, parsing, cells, windows, borders,
   diff/render, colors/styles, and width.
 - Rendering is draw -> synchronous flush -> clear dirty only after success.
-- The frame loop blocks only in `std.posix.poll` over input/engine/worker wake fds
-  with a deadline.
+- The frame loop blocks only in `std.posix.poll` over input/worker wake fds with
+  a deadline.
 - Rendering uses one `render_due` rule: 16ms floor and 3x last render cost
   backoff; typed input and resize render immediately.
 - The debug watchdog budget is 33ms until ratcheted; no exemption enum.
 - The owner loop performs no filesystem read of unbounded size, no subprocess wait, and no blocking network I/O.
-- Treat typed input as foreground work; ViewModel sampling is background work and
-  bounded by the 64KiB sample cap.
+- Treat typed input as foreground work; transcript/layout rebuild work is bounded
+  by documented caps.
 - Coalesce stream fragments before layout/render when ordering allows.
 - Do not introduce local ANSI encoders, raw-mode managers, cell buffers, diff
   renderers, style/color encodings, or width engines without a proven bounded
   Vaxis gap.
 - Owners storing Vaxis/Tty state must be pinned after initialization.
+
+## print frontend changes
+
+- `src/frontends/print` is the non-interactive prompt owner. It drives one
+  `AgentSession.RunHandle` at a time, writes bounded text/JSON output directly to
+  the supplied writer, honors retry sleeps and compaction verdicts, and returns a
+  process-ready status code.
+- Print mode does not mutate TUI state and does not import `tui`.
 
 ## tool changes
 
@@ -132,9 +140,10 @@ For code changes, run:
 
 ```sh
 zig build test
+zig build pty-test
 zig build
 zig fmt --check src
+zig fmt --check build.zig
 ```
-
 For focused behavior, run the narrow command that exercises the changed path.
 Report any gate you did not run.

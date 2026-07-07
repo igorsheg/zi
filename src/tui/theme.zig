@@ -47,6 +47,19 @@ pub fn terminalInfo(colorterm: ?[]const u8, term: ?[]const u8, force_light: bool
     };
 }
 
+pub fn terminalInfoFromEnv(env_map: *const std.process.Environ.Map) TerminalInfo {
+    return terminalInfo(env_map.get("COLORTERM"), env_map.get("TERM"), envFlag(env_map.get("ZI_THEME_LIGHT")));
+}
+
+fn envFlag(value: ?[]const u8) bool {
+    const raw = value orelse return false;
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) return false;
+    return !std.ascii.eqlIgnoreCase(trimmed, "0") and
+        !std.ascii.eqlIgnoreCase(trimmed, "false") and
+        !std.ascii.eqlIgnoreCase(trimmed, "no");
+}
+
 pub fn detectColorLevel(colorterm: ?[]const u8, term: ?[]const u8) ColorLevel {
     if (colorterm) |value| {
         if (containsIgnoreCase(value, "truecolor") or containsIgnoreCase(value, "24bit")) return .truecolor;
@@ -68,6 +81,21 @@ test "detect color level from terminal environment" {
     try std.testing.expectEqual(ColorLevel.ansi256, detectColorLevel(null, "screen-256color"));
     try std.testing.expectEqual(ColorLevel.ansi16, detectColorLevel(null, "xterm"));
     try std.testing.expectEqual(ColorLevel.unknown, detectColorLevel(null, null));
+}
+
+test "terminal info resolves light theme from environment" {
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("TERM", "xterm-256color");
+    try env.put("COLORTERM", "truecolor");
+    try env.put("ZI_THEME_LIGHT", "1");
+
+    const info = terminalInfoFromEnv(&env);
+    try std.testing.expectEqual(Scheme.light, info.scheme);
+    try std.testing.expectEqual(ColorLevel.truecolor, info.color_level);
+
+    try env.put("ZI_THEME_LIGHT", "false");
+    try std.testing.expectEqual(Scheme.dark, terminalInfoFromEnv(&env).scheme);
 }
 
 test "layout epoch increments only on visible changes" {

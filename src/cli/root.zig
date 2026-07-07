@@ -8,6 +8,7 @@ const session_listing = coding_agent.session_listing;
 const session_manager = coding_agent.session_manager;
 const paths_mod = @import("../coding_agent/paths.zig");
 const tui = @import("../tui/root.zig");
+const print_mode = @import("../frontends/print/print_mode.zig");
 const args_mod = @import("args.zig");
 
 const CliError = error{
@@ -15,6 +16,7 @@ const CliError = error{
     NoResumableSession,
     OutputClosed,
     UnsupportedCliFeature,
+    PromptFailed,
 };
 
 const stdout_buffer_size_bytes = 4096;
@@ -54,6 +56,10 @@ pub fn main(process: runtime.Process, args_source: std.process.Args) !void {
 
     run(process, &args, cli_io.stdout(), cli_io.stderr()) catch |err| switch (err) {
         error.OutputClosed => return,
+        error.PromptFailed => {
+            try cli_io.flush();
+            std.process.exit(1);
+        },
         error.InvalidCliUsage, error.NoResumableSession, error.UnsupportedCliFeature => {
             try cli_io.flush();
             std.process.exit(2);
@@ -72,8 +78,10 @@ fn run(
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
 ) !void {
+    const cwd = try std.process.currentPathAlloc(process.io, process.gpa);
+    defer process.gpa.free(cwd);
     return runWithOptions(process, args, stdout, stderr, .{
-        .cwd = ".",
+        .cwd = cwd,
         .agent_dir_override = null,
         .environ = process.environ,
     });
@@ -160,6 +168,7 @@ fn runTui(
     options: auth_mode.Options,
     panic_test: bool,
 ) !void {
+    if (isDumbTerminal(process)) return unsupportedTerminal(stderr);
     const stamp = session_manager.SessionStamp.now(process.io);
     var session_id_buffer: [48]u8 = undefined;
     const session_id = std.fmt.bufPrint(&session_id_buffer, "tui-{d}", .{stamp.nanoseconds}) catch unreachable;
@@ -212,13 +221,51 @@ fn runPrompt(
     app_args: anytype,
     options: auth_mode.Options,
 ) !void {
-    _ = process;
-    _ = stdout;
-    _ = prompt;
-    _ = json_output;
-    _ = app_args;
-    _ = options;
-    return frontendStub(stderr);
+    var task_runtime = try runtime.Runtime.init(process.gpa, .{});
+    defer task_runtime.deinit();
+
+    const cwd = try process.gpa.dupe(u8, options.cwd);
+    defer process.gpa.free(cwd);
+
+    const agent_dir = if (options.agent_dir_override) |override|
+        override
+    else
+        try paths_mod.resolveGlobalAgentDirFromEnv(process.gpa, options.environ);
+    defer if (options.agent_dir_override == null) process.gpa.free(agent_dir);
+
+    var services = try coding_agent.runtime_services.RuntimeServices.init(process.gpa, .{
+        .cwd = cwd,
+        .agent_dir = agent_dir,
+        .dir = options.dir,
+        .environ = options.environ,
+        .task_runtime = task_runtime,
+    });
+    defer services.deinit();
+
+    const selected_session_file = try selectResumeSession(process, stderr, app_args, .{
+        .cwd = cwd,
+        .agent_dir_override = agent_dir,
+        .dir = options.dir,
+        .environ = options.environ,
+    });
+    defer if (selected_session_file) |session_file| process.gpa.free(session_file);
+
+    const stamp = session_manager.SessionStamp.now(services.io);
+    var session_id_buffer: [48]u8 = undefined;
+    const session_id = std.fmt.bufPrint(&session_id_buffer, "print-{d}", .{stamp.nanoseconds}) catch unreachable;
+    const open: coding_agent.session_bootstrap.OpenSpec = if (selected_session_file) |session_file|
+        .{ .resume_existing = .{ .session_file_name = session_file } }
+    else
+        .{ .create = .{ .session_id = session_id, .timestamp = stamp.timestamp() } };
+
+    var session = try coding_agent.session_bootstrap.openSession(process.gpa, &services, stamp.date(), open, .{});
+    defer shutdownPromptSession(&session, services.io);
+
+    const status = try print_mode.run(process.gpa, &services, &session, services.io, stdout, stderr, .{
+        .prompt = prompt,
+        .output = if (json_output) .json else .text,
+    });
+    if (status != 0) return error.PromptFailed;
 }
 
 fn runRpc(
@@ -238,6 +285,32 @@ fn runRpc(
 fn frontendStub(stderr: *std.Io.Writer) !void {
     try stderr.writeAll("this frontend is being rebuilt; try a newer build\n");
     return error.UnsupportedCliFeature;
+}
+
+fn unsupportedTerminal(stderr: *std.Io.Writer) !void {
+    try stderr.writeAll("interactive terminal unsupported for TERM=dumb; use --print or --mode text\n");
+    return error.UnsupportedCliFeature;
+}
+
+fn isDumbTerminal(process: runtime.Process) bool {
+    const term = process.env("TERM") orelse return false;
+    return std.mem.eql(u8, std.mem.trim(u8, term, " \t\r\n"), "dumb");
+}
+
+const prompt_shutdown_bound_ns: u64 = 5 * std.time.ns_per_s;
+
+fn shutdownPromptSession(session: *coding_agent.AgentSession, io: std.Io) void {
+    session.requestShutdown();
+    const start = nowNs(io);
+    while (!session.shutdownComplete() and nowNs(io) -| start < prompt_shutdown_bound_ns) {
+        runtime.sleep(io, .fromMilliseconds(100)) catch break;
+    }
+    session.deinit();
+}
+
+fn nowNs(io: std.Io) u64 {
+    const raw = std.Io.Timestamp.now(io, .awake).toNanoseconds();
+    return if (raw <= 0) 0 else @intCast(raw);
 }
 
 fn selectResumeSession(
@@ -483,7 +556,52 @@ test "cli accepts hidden panic test flag only for TUI dispatch" {
     try std.testing.expectEqualStrings("not-real", firstUnknownFlagName(unknown).?);
 }
 
-test "cli text json and rpc frontends remain stubs" {
+test "cli text and json print frontends run through faux provider" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try createCliTestDirs(tmp.dir);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "script.md", .data = "cli print ok\n" });
+
+    var environ = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ.deinit();
+    try environ.put("ZI_ENABLE_FAUX_PROVIDER", "1");
+    try environ.put("ZI_FAUX_DELAY_MS", "0");
+    try environ.put("ZI_FAUX_SCRIPT", "script.md");
+    const process = testProcess(&environ);
+
+    var output_buffer: [4096]u8 = undefined;
+    var output = std.Io.Writer.fixed(&output_buffer);
+    var stderr_buffer: [1024]u8 = undefined;
+    var stderr = std.Io.Writer.fixed(&stderr_buffer);
+    var text_argv = [_:null]?[*:0]const u8{ "zi", "--mode", "text", "hi" };
+    var text_args = try std.process.Args.Iterator.initAllocator(.{ .vector = @ptrCast(&text_argv) }, std.testing.allocator);
+    defer text_args.deinit();
+    try runWithOptions(process, &text_args, &output, &stderr, .{
+        .cwd = "repo",
+        .agent_dir_override = "agent",
+        .dir = tmp.dir,
+        .environ = process.environ,
+    });
+    try std.testing.expectEqualStrings("cli print ok\n", output.buffered());
+    try std.testing.expectEqualStrings("", stderr.buffered());
+
+    output = std.Io.Writer.fixed(&output_buffer);
+    stderr = std.Io.Writer.fixed(&stderr_buffer);
+    var json_argv = [_:null]?[*:0]const u8{ "zi", "--mode", "json", "hi" };
+    var json_args = try std.process.Args.Iterator.initAllocator(.{ .vector = @ptrCast(&json_argv) }, std.testing.allocator);
+    defer json_args.deinit();
+    try runWithOptions(process, &json_args, &output, &stderr, .{
+        .cwd = "repo",
+        .agent_dir_override = "agent",
+        .dir = tmp.dir,
+        .environ = process.environ,
+    });
+    try std.testing.expect(std.mem.indexOf(u8, output.buffered(), "\"type\":\"agent_start\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.buffered(), "cli print ok") != null);
+    try std.testing.expectEqualStrings("", stderr.buffered());
+}
+
+test "cli rpc frontend remains stubbed" {
     var environ = std.process.Environ.Map.init(std.testing.allocator);
     defer environ.deinit();
     const process = testProcess(&environ);
@@ -492,36 +610,6 @@ test "cli text json and rpc frontends remain stubs" {
     var output = std.Io.Writer.fixed(&output_buffer);
     var stderr_buffer: [256]u8 = undefined;
     var stderr = std.Io.Writer.fixed(&stderr_buffer);
-    const text_app = (try args_mod.parse(&.{ "--mode", "text", "hi" })).app;
-    try std.testing.expectError(error.UnsupportedCliFeature, runPrompt(
-        process,
-        &output,
-        &stderr,
-        "hi",
-        false,
-        text_app,
-        .{ .cwd = ".", .agent_dir_override = null, .environ = process.environ },
-    ));
-    try std.testing.expectEqualStrings("", output.buffered());
-    try std.testing.expectEqualStrings("this frontend is being rebuilt; try a newer build\n", stderr.buffered());
-
-    output = std.Io.Writer.fixed(&output_buffer);
-    stderr = std.Io.Writer.fixed(&stderr_buffer);
-    const json_app = (try args_mod.parse(&.{ "--mode", "json", "hi" })).app;
-    try std.testing.expectError(error.UnsupportedCliFeature, runPrompt(
-        process,
-        &output,
-        &stderr,
-        "hi",
-        true,
-        json_app,
-        .{ .cwd = ".", .agent_dir_override = null, .environ = process.environ },
-    ));
-    try std.testing.expectEqualStrings("", output.buffered());
-    try std.testing.expectEqualStrings("this frontend is being rebuilt; try a newer build\n", stderr.buffered());
-
-    output = std.Io.Writer.fixed(&output_buffer);
-    stderr = std.Io.Writer.fixed(&stderr_buffer);
     const rpc_app = (try args_mod.parse(&.{ "--mode", "rpc" })).app;
     try std.testing.expectError(error.UnsupportedCliFeature, runRpc(
         process,
@@ -532,6 +620,29 @@ test "cli text json and rpc frontends remain stubs" {
     ));
     try std.testing.expectEqualStrings("", output.buffered());
     try std.testing.expectEqualStrings("this frontend is being rebuilt; try a newer build\n", stderr.buffered());
+}
+
+test "cli refuses TUI on dumb terminal with print hint" {
+    var environ = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ.deinit();
+    try environ.put("TERM", "dumb");
+    const process = testProcess(&environ);
+
+    var output_buffer: [128]u8 = undefined;
+    var output = std.Io.Writer.fixed(&output_buffer);
+    var stderr_buffer: [128]u8 = undefined;
+    var stderr = std.Io.Writer.fixed(&stderr_buffer);
+    var argv = [_:null]?[*:0]const u8{"zi"};
+    var args = try std.process.Args.Iterator.initAllocator(.{ .vector = @ptrCast(&argv) }, std.testing.allocator);
+    defer args.deinit();
+
+    try std.testing.expectError(error.UnsupportedCliFeature, runWithOptions(process, &args, &output, &stderr, .{
+        .cwd = ".",
+        .agent_dir_override = null,
+        .environ = process.environ,
+    }));
+    try std.testing.expectEqualStrings("", output.buffered());
+    try std.testing.expectEqualStrings("interactive terminal unsupported for TERM=dumb; use --print or --mode text\n", stderr.buffered());
 }
 
 fn testProcess(environ: *std.process.Environ.Map) runtime.Process {
@@ -545,7 +656,7 @@ fn testProcess(environ: *std.process.Environ.Map) runtime.Process {
 
 fn createCliTestDirs(dir: std.Io.Dir) !void {
     try dir.createDirPath(std.testing.io, "agent");
-    try dir.createDirPath(std.testing.io, "repo");
+    try dir.createDirPath(std.testing.io, "repo/.zi");
 }
 
 fn createCliStoredSession(dir: std.Io.Dir, session_id: []const u8, timestamp: []const u8) !void {

@@ -1,6 +1,5 @@
 const std = @import("std");
 const runtime = @import("../runtime/root.zig");
-const vaxis = @import("vaxis");
 const Terminal = @import("Terminal.zig");
 
 pub const byte_capacity = 32 * 1024;
@@ -76,47 +75,33 @@ pub const InputPump = struct {
     ring: SpscRing(u8, byte_capacity) = .{},
     stamps: SpscRing(BatchStamp, stamp_capacity) = .{},
     stop: std.atomic.Value(bool) = .init(false),
-    resize_seen: std.atomic.Value(bool) = .init(false),
     dropped_bytes: std.atomic.Value(usize) = .init(0),
     dropped_stamps: std.atomic.Value(usize) = .init(0),
     thread: ?std.Thread = null,
     io: std.Io = undefined,
-    wake: ?*runtime.WakeEvent = null,
     source_context: ?*anyopaque = null,
     read_fn: ?ReadFn = null,
 
     pub const StartOptions = struct {
         io: std.Io,
-        wake: *runtime.WakeEvent,
         source_context: *anyopaque,
         read_fn: ReadFn,
     };
 
     pub fn start(self: *InputPump, options: StartOptions) !void {
         self.io = options.io;
-        self.wake = options.wake;
         self.source_context = options.source_context;
         self.read_fn = options.read_fn;
         self.stop.store(false, .release);
         self.thread = try std.Thread.spawn(.{}, run, .{self});
     }
 
-    pub fn startTerminal(self: *InputPump, io: std.Io, terminal: *Terminal, wake: *runtime.WakeEvent) !void {
+    pub fn startTerminal(self: *InputPump, io: std.Io, terminal: *Terminal) !void {
         try self.start(.{
             .io = io,
-            .wake = wake,
             .source_context = terminal,
             .read_fn = terminalRead,
         });
-        if (@hasDecl(vaxis.Tty, "notifyWinsize")) {
-            try vaxis.Tty.notifyWinsize(.{ .context = self, .callback = resizeCallback });
-        }
-    }
-
-    fn resizeCallback(context: *anyopaque) void {
-        const self: *InputPump = @ptrCast(@alignCast(context));
-        self.resize_seen.store(true, .release);
-        if (self.wake) |wake| wake.set(self.io);
     }
 
     pub fn requestStop(self: *InputPump) void {
@@ -133,14 +118,19 @@ pub const InputPump = struct {
     fn run(self: *InputPump) void {
         const read_fn = self.read_fn orelse return;
         const source_context = self.source_context orelse return;
-        const wake = self.wake orelse return;
         var buffer: [read_buffer_capacity]u8 = undefined;
         while (!self.stop.load(.acquire)) {
-            const count = read_fn(source_context, &buffer) catch break;
+            const count = read_fn(source_context, &buffer) catch |err| {
+                if (isTransientReadError(err)) continue;
+                break;
+            };
             if (count == 0) continue;
             _ = self.pushBatch(buffer[0..count], nowNs(self.io));
-            wake.set(self.io);
         }
+    }
+
+    fn isTransientReadError(err: anyerror) bool {
+        return err == error.WouldBlock or err == error.SignalInterrupt or err == error.Interrupted;
     }
 
     fn terminalRead(context: *anyopaque, out: []u8) !usize {
@@ -200,12 +190,8 @@ pub const InputPump = struct {
         return self.dropped_bytes.load(.acquire);
     }
 
-    pub fn markResize(self: *InputPump) void {
-        self.resize_seen.store(true, .release);
-    }
-
-    pub fn takeResize(self: *InputPump) bool {
-        return self.resize_seen.swap(false, .acquire);
+    pub fn pendingByteCount(self: *const InputPump) usize {
+        return self.ring.count();
     }
 };
 
@@ -242,7 +228,7 @@ test "spsc ring pops bounded slices" {
     try std.testing.expectEqual(@as(?u8, 'c'), ring.pop());
 }
 
-test "input pump drops whole byte batch on overflow and tracks resize" {
+test "input pump drops whole byte batch on overflow" {
     var pump: InputPump = .{};
     var bytes: [byte_capacity]u8 = undefined;
     @memset(&bytes, 'x');
@@ -254,10 +240,6 @@ test "input pump drops whole byte batch on overflow and tracks resize" {
     const stamp = pump.popStamp().?;
     try std.testing.expectEqual(@as(u64, 10), stamp.read_ns);
     try std.testing.expectEqual(@as(usize, byte_capacity), stamp.byte_count);
-
-    pump.markResize();
-    try std.testing.expect(pump.takeResize());
-    try std.testing.expect(!pump.takeResize());
 }
 
 test "input pump drainBytes is capped per owner iteration" {
@@ -289,7 +271,7 @@ test "input pump exposes stamps only after batch bytes are drained" {
     try std.testing.expectEqual(@as(usize, 3), stamps[0].byte_count);
 }
 
-test "input pump thread reads source into ring and wakes owner" {
+test "input pump thread reads source into ring" {
     const FakeSource = struct {
         bytes: []const u8,
         emitted: bool = false,
@@ -309,20 +291,19 @@ test "input pump thread reads source into ring and wakes owner" {
 
     var source: FakeSource = .{ .bytes = "abc" };
     var pump: InputPump = .{};
-    var wake: runtime.WakeEvent = .init;
     try pump.start(.{
         .io = io,
-        .wake = &wake,
         .source_context = &source,
         .read_fn = FakeSource.read,
     });
     defer pump.join();
 
-    try wake.waitTimeout(io, .{ .duration = .{
-        .raw = .fromMilliseconds(1000),
-        .clock = .awake,
-    } });
+    const wait_start_ns = InputPump.nowNs(io);
+    while (pump.pendingByteCount() == 0 and InputPump.nowNs(io) -| wait_start_ns < std.time.ns_per_s) {
+        runtime.sleep(io, .fromMilliseconds(1)) catch break;
+    }
     pump.requestStop();
+    try std.testing.expect(pump.pendingByteCount() > 0);
 
     var out: [3]u8 = undefined;
     try std.testing.expectEqual(@as(usize, 3), pump.drainBytes(&out));

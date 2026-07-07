@@ -232,3 +232,31 @@ test "decoder applies winsize parser event through terminal" {
     try std.testing.expectEqual(@as(u16, 100), terminal.vx.?.screen.width);
     try std.testing.expectEqual(@as(u16, 24), terminal.vx.?.screen.height);
 }
+
+test "decoder fuzz random byte streams stay bounded" {
+    var prng = std.Random.DefaultPrng.init(0xdec0de);
+    const random = prng.random();
+    var decoder: InputDecoder = .{};
+
+    var bytes: [257]u8 = undefined;
+    for (0..512) |_| {
+        const len = random.intRangeAtMost(usize, 0, bytes.len);
+        random.bytes(bytes[0..len]);
+        decoder.feed(bytes[0..len]) catch {
+            decoder.reset();
+            continue;
+        };
+        while (true) {
+            const action = decoder.nextAction() catch {
+                decoder.reset();
+                break;
+            };
+            if (action == null) break;
+            if (action.? == .insert) {
+                try std.testing.expect(action.?.insert.len <= text_capacity);
+                try std.testing.expect(std.unicode.utf8ValidateSlice(action.?.insert));
+            }
+        }
+        try std.testing.expect(decoder.pendingBytes() <= buffer_capacity);
+    }
+}

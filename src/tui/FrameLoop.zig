@@ -118,7 +118,11 @@ fn nextTimeout(runner: anytype, io: std.Io) std.Io.Timeout {
     if (timer_deadline) |timer_deadline_ns| {
         deadline_ns = if (deadline_ns) |current| @min(current, timer_deadline_ns) else timer_deadline_ns;
     }
-    const due_ns = deadline_ns orelse return .none;
+    // InputPump is a raw thread and does not call WakeEvent.set; cap every wait
+    // below the frame floor so input/resize are observed before UI timers expire.
+    const input_poll_ns = @max(@as(u64, 1), loop_mod.frame_floor_ns / 2);
+    const idle_due_ns = now_ns +| input_poll_ns;
+    const due_ns = if (deadline_ns) |deadline| @min(deadline, idle_due_ns) else idle_due_ns;
     return .{ .duration = .{
         .raw = .fromNanoseconds(@intCast(due_ns -| now_ns)),
         .clock = .awake,

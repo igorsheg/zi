@@ -670,7 +670,7 @@ test "process runner kills child when output allocation fails" {
     defer task_runtime.deinit();
     var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{
         .fail_index = 0,
-        .resize_fail_index = std.math.maxInt(usize),
+        .resize_fail_index = 0,
     });
     const argv = [_][]const u8{
         "/bin/sh",

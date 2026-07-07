@@ -202,19 +202,11 @@ pub const Runner = struct {
         try self.loop.tick(now_ns);
         if (self.loop.takePendingTitleUpdate()) try terminal.setTitle(self.loop.terminalTitle());
         const had_input = self.loop.trace.input_actions != input_actions_before;
-        var render_width = width;
-        var render_height = height;
-        var resized = false;
-        if (pump.takeResize()) {
-            try terminal.resizeFromTty();
-            const resized_winsize = try terminal.winsize();
-            render_width = resized_winsize.cols;
-            render_height = resized_winsize.rows;
-            resized = self.applyResize(render_width, render_height);
-        }
+        const resized = self.applyResize(width, height);
+        if (resized) try terminal.resizeFromTty();
         if (!had_input and !resized and !self.loop.shouldRender(now_ns)) return false;
         const start_ns = FrameLoop.nowNs(terminal.io);
-        const frame = try self.loop.composeFrame(render_width, render_height);
+        const frame = try self.loop.composeFrame(width, height);
         try terminal.paint(frame);
         const flush_complete_ns = FrameLoop.nowNs(terminal.io);
         self.recordPendingInputLatencies(flush_complete_ns);
@@ -270,13 +262,12 @@ pub fn run(process: runtime.Process, options: Options) !void {
 
     var terminal: Terminal = undefined;
     try terminal.init(process.gpa, services.io, process.environ);
-    errdefer terminal.deinit();
+    defer terminal.deinit();
     try terminal.setup();
     try terminal.setTitle(runner.loop.terminalTitle());
 
     var pump: InputPump = .{};
-    defer terminal.deinit();
-    try pump.startTerminal(services.io, &terminal, &wake);
+    try pump.startTerminal(services.io, &terminal);
     defer pump.join();
     defer pump.requestStop();
 
@@ -381,21 +372,19 @@ fn runBoundedWithWorkerForTest(
 
     var runner = try Runner.init(allocator, options);
     var pump: InputPump = .{};
-    var wake: runtime.WakeEvent = .init;
     try pump.start(.{
         .io = io,
-        .wake = &wake,
         .source_context = source_context,
         .read_fn = read_fn,
     });
     defer pump.join();
     defer pump.requestStop();
 
-    try wake.waitTimeout(io, .{ .duration = .{
-        .raw = .fromMilliseconds(1000),
-        .clock = .awake,
-    } });
-    wake.reset();
+    const wait_start_ns = FrameLoop.nowNs(io);
+    while (pump.pendingByteCount() == 0 and FrameLoop.nowNs(io) -| wait_start_ns < std.time.ns_per_s) {
+        runtime.sleep(io, .fromMilliseconds(1)) catch break;
+    }
+    if (pump.pendingByteCount() == 0) return error.Timeout;
 
     const result = try FrameLoop.runBounded(&runner, &terminal, &pump, .{
         .now_ns = loop.frame_floor_ns,
@@ -573,6 +562,7 @@ test "runner tick skips paint before render deadline" {
         .resume_picker = false,
     });
     var pump: InputPump = .{};
+    _ = runner.applyResize(80, 2);
 
     try std.testing.expect(!try runner.tick(&terminal, &pump, loop.frame_floor_ns - 1, 80, 2));
     try std.testing.expect(runner.loop.dirty);
@@ -593,7 +583,6 @@ test "runner tick renders immediately on resize" {
         .resume_picker = false,
     });
     var pump: InputPump = .{};
-    pump.markResize();
 
     try std.testing.expect(try runner.tick(&terminal, &pump, 0, 80, 2));
     try std.testing.expectEqual(@as(u64, 1), runner.layout.revision);
