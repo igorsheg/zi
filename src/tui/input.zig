@@ -4,11 +4,21 @@ const vaxis = @import("vaxis");
 pub const EditorOp = enum {
     move_left,
     move_right,
+    move_word_left,
+    move_word_right,
+    move_up_history,
+    move_down_history,
     backspace,
     delete_forward,
     home,
     end,
     clear,
+    kill_to_end,
+    kill_to_start,
+    kill_word_back,
+    yank,
+    undo,
+    tab,
 };
 
 pub const Action = union(enum) {
@@ -35,10 +45,15 @@ pub fn fromKey(key: vaxis.Key) Action {
     if (key.matches(vaxis.Key.enter, .{ .alt = true }) or key.matches(vaxis.Key.kp_enter, .{ .alt = true })) return .follow_up_submit;
     if (key.matches(vaxis.Key.enter, .{ .shift = true }) or key.matches(vaxis.Key.kp_enter, .{ .shift = true })) return .newline;
     if (key.matches(vaxis.Key.enter, .{}) or key.matches(vaxis.Key.kp_enter, .{})) return .submit;
+    if (key.matches(vaxis.Key.tab, .{})) return .{ .key_editor = .tab };
     if (key.matches(vaxis.Key.backspace, .{})) return .{ .key_editor = .backspace };
     if (key.matches(vaxis.Key.delete, .{})) return .{ .key_editor = .delete_forward };
+    if (key.matches(vaxis.Key.left, .{ .alt = true })) return .{ .key_editor = .move_word_left };
+    if (key.matches(vaxis.Key.right, .{ .alt = true })) return .{ .key_editor = .move_word_right };
     if (key.matches(vaxis.Key.left, .{})) return .{ .key_editor = .move_left };
     if (key.matches(vaxis.Key.right, .{})) return .{ .key_editor = .move_right };
+    if (key.matches(vaxis.Key.up, .{})) return .{ .key_editor = .move_up_history };
+    if (key.matches(vaxis.Key.down, .{})) return .{ .key_editor = .move_down_history };
     if (key.matches(vaxis.Key.home, .{})) return .{ .key_editor = .home };
     if (key.matches(vaxis.Key.end, .{})) return .{ .key_editor = .end };
     if (key.matches(vaxis.Key.page_up, .{})) return .page_up;
@@ -46,12 +61,22 @@ pub fn fromKey(key: vaxis.Key) Action {
 
     if (key.codepoint == 0x03) return .clear_or_quit;
     if (key.codepoint == 0x04) return .quit_eof;
-    if (key.codepoint == 0x15) return .{ .key_editor = .clear };
+    if (key.codepoint == 0x15) return .{ .key_editor = .kill_to_start };
+    if (key.codepoint == 0x0b) return .{ .key_editor = .kill_to_end };
+    if (key.codepoint == 0x17) return .{ .key_editor = .kill_word_back };
+    if (key.codepoint == 0x19) return .{ .key_editor = .yank };
+    if (key.codepoint == 0x1f) return .{ .key_editor = .undo };
     if (key.matches('c', .{ .ctrl = true })) return .clear_or_quit;
     if (key.matches('d', .{ .ctrl = true })) return .quit_eof;
     if (key.matches('a', .{ .ctrl = true })) return .{ .key_editor = .home };
     if (key.matches('e', .{ .ctrl = true })) return .{ .key_editor = .end };
-    if (key.matches('u', .{ .ctrl = true })) return .{ .key_editor = .clear };
+    if (key.matches('u', .{ .ctrl = true })) return .{ .key_editor = .kill_to_start };
+    if (key.matches('k', .{ .ctrl = true })) return .{ .key_editor = .kill_to_end };
+    if (key.matches('w', .{ .ctrl = true })) return .{ .key_editor = .kill_word_back };
+    if (key.matches('y', .{ .ctrl = true })) return .{ .key_editor = .yank };
+    if (key.matches('z', .{ .ctrl = true })) return .{ .key_editor = .undo };
+    if (key.matches('b', .{ .alt = true })) return .{ .key_editor = .move_word_left };
+    if (key.matches('f', .{ .alt = true })) return .{ .key_editor = .move_word_right };
     if (key.matches('o', .{ .ctrl = true })) return .expand_toggle;
     if (key.matches('q', .{ .alt = true })) return .dequeue_all;
     if (key.matches('l', .{ .ctrl = true })) return .force_redraw;
@@ -94,7 +119,15 @@ test "key mapping handles editor/navigation/control keys" {
     try std.testing.expect(fromKey(.{ .codepoint = 'd', .mods = .{ .ctrl = true } }) == .quit_eof);
 }
 
-test "key mapping handles P1 chrome bindings" {
+test "key mapping handles P2 editor bindings" {
+    try std.testing.expectEqual(EditorOp.kill_to_end, fromKey(.{ .codepoint = 'k', .mods = .{ .ctrl = true } }).key_editor);
+    try std.testing.expectEqual(EditorOp.kill_word_back, fromKey(.{ .codepoint = 'w', .mods = .{ .ctrl = true } }).key_editor);
+    try std.testing.expectEqual(EditorOp.yank, fromKey(.{ .codepoint = 'y', .mods = .{ .ctrl = true } }).key_editor);
+    try std.testing.expectEqual(EditorOp.undo, fromKey(.{ .codepoint = 0x1f }).key_editor);
+    try std.testing.expectEqual(EditorOp.move_word_left, fromKey(.{ .codepoint = 'b', .mods = .{ .alt = true } }).key_editor);
+}
+
+test "key mapping handles chrome bindings" {
     try std.testing.expect(fromKey(.{ .codepoint = vaxis.Key.enter, .mods = .{ .alt = true } }) == .follow_up_submit);
     try std.testing.expect(fromKey(.{ .codepoint = vaxis.Key.enter, .mods = .{ .shift = true } }) == .newline);
     try std.testing.expect(fromKey(.{ .codepoint = 'o', .mods = .{ .ctrl = true } }) == .expand_toggle);

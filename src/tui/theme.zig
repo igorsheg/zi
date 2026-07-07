@@ -11,12 +11,28 @@ pub const TerminalInfo = struct {
 pub const LayoutEpoch = struct {
     width: u16,
     height: u16,
+    expanded: bool = false,
+    hide_thinking: bool = true,
     revision: u64 = 0,
 
     pub fn resize(self: *LayoutEpoch, width: u16, height: u16) bool {
         if (self.width == width and self.height == height) return false;
         self.width = width;
         self.height = height;
+        self.revision +%= 1;
+        return true;
+    }
+
+    pub fn setExpanded(self: *LayoutEpoch, expanded: bool) bool {
+        if (self.expanded == expanded) return false;
+        self.expanded = expanded;
+        self.revision +%= 1;
+        return true;
+    }
+
+    pub fn setHideThinking(self: *LayoutEpoch, hidden: bool) bool {
+        if (self.hide_thinking == hidden) return false;
+        self.hide_thinking = hidden;
         self.revision +%= 1;
         return true;
     }
@@ -52,10 +68,12 @@ test "detect color level from terminal environment" {
     try std.testing.expectEqual(ColorLevel.unknown, detectColorLevel(null, null));
 }
 
-test "layout epoch increments only on size changes" {
+test "layout epoch increments only on visible changes" {
     var epoch: LayoutEpoch = .{ .width = 80, .height = 24 };
     try std.testing.expect(!epoch.resize(80, 24));
     try std.testing.expectEqual(@as(u64, 0), epoch.revision);
     try std.testing.expect(epoch.resize(100, 30));
     try std.testing.expectEqual(@as(u64, 1), epoch.revision);
+    try std.testing.expect(epoch.setHideThinking(false));
+    try std.testing.expectEqual(@as(u64, 2), epoch.revision);
 }

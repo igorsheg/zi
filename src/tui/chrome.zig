@@ -3,32 +3,47 @@ const Editor = @import("Editor.zig");
 const screen = @import("screen.zig");
 
 pub const prompt = "> ";
+const border_fill = "-" ** 512;
+const border_spaces = " " ** 512;
 
 pub const Snapshot = struct {
     status: []const u8 = "zi",
     scratch_text: []const u8 = "",
+    transcript_lines: []const screen.Line = &.{},
+    queue_lines: []const []const u8 = &.{},
     editor: *const Editor,
+    editor_border_style: screen.Style = screen.styles.muted,
 };
 
 pub fn compose(snapshot: Snapshot, width: u16, height: u16) error{ FrameFull, LineFull }!screen.Frame {
     var frame: screen.Frame = .{};
     if (height == 0) return frame;
     if (height == 1) {
-        try appendEditorLine(&frame, snapshot.editor, 0, width);
+        try appendEditorLine(&frame, snapshot.editor, 0, 0, width, snapshot.editor_border_style, false);
         return frame;
     }
 
     try frame.appendLine(screen.singleSpanLine(snapshot.status, screen.styles.muted));
-    var row: u16 = 1;
-    if (snapshot.scratch_text.len > 0 and row + 1 < height) {
+    const editor_rows = editorRows(snapshot.editor, height, width);
+    const queue_rows = @min(snapshot.queue_lines.len, @as(usize, 4));
+    const fixed_rows = 1 + editor_rows + queue_rows;
+    const transcript_rows: usize = if (height > fixed_rows) height - fixed_rows else 0;
+
+    appendTranscriptTail(&frame, snapshot.transcript_lines, transcript_rows) catch |err| return err;
+    if (snapshot.scratch_text.len > 0 and frame.rows().len + queue_rows + editor_rows < height) {
         try frame.appendLine(screen.singleSpanLine(tailLine(snapshot.scratch_text), screen.styles.normal));
-        row += 1;
     }
-    while (row + 1 < height) : (row += 1) {
-        try frame.appendLine(.{});
-    }
-    try appendEditorLine(&frame, snapshot.editor, height - 1, width);
+    while (frame.rows().len + queue_rows + editor_rows < height) try frame.appendLine(.{});
+
+    for (snapshot.queue_lines[0..queue_rows]) |line| try frame.appendLine(screen.singleSpanLine(line, screen.styles.muted));
+    appendEditor(&frame, snapshot.editor, @intCast(height - editor_rows), editor_rows, width, snapshot.editor_border_style, useBorder(height, width)) catch |err| return err;
     return frame;
+}
+
+fn appendTranscriptTail(frame: *screen.Frame, lines: []const screen.Line, rows: usize) error{FrameFull}!void {
+    if (rows == 0) return;
+    const start = lines.len - @min(lines.len, rows);
+    for (lines[start..]) |line| try frame.appendLine(line);
 }
 
 fn tailLine(text: []const u8) []const u8 {
@@ -36,15 +51,64 @@ fn tailLine(text: []const u8) []const u8 {
     return text[text.len - 80 ..];
 }
 
-fn appendEditorLine(frame: *screen.Frame, editor: *const Editor, row: u16, width: u16) error{ FrameFull, LineFull }!void {
+fn editorRows(editor: *const Editor, height: u16, width: u16) usize {
+    const content_rows = editorContentRows(editor, height);
+    return content_rows + if (useBorder(height, width)) @as(usize, 2) else 0;
+}
+
+fn editorContentRows(editor: *const Editor, height: u16) usize {
+    const content_rows = editor.lineCount();
+    const max_rows = @max(@as(usize, 1), @min(@as(usize, 5), (@as(usize, height) * 3) / 10));
+    return @min(@max(@as(usize, 1), content_rows), max_rows);
+}
+
+fn useBorder(height: u16, width: u16) bool {
+    return height >= 6 and width >= 4;
+}
+
+fn appendEditor(frame: *screen.Frame, editor: *const Editor, start_row: u16, rows: usize, width: u16, border_style: screen.Style, bordered: bool) error{ FrameFull, LineFull }!void {
+    const content_rows = rows - if (bordered) @as(usize, 2) else 0;
+    const line_count = editor.lineCount();
+    const first_line = if (line_count > content_rows) line_count - content_rows else 0;
+    var row: u16 = start_row;
+    if (bordered) {
+        try frame.appendLine(borderLine(width, border_style));
+        row += 1;
+    }
+    for (0..content_rows) |row_offset| {
+        try appendEditorLine(frame, editor, row + @as(u16, @intCast(row_offset)), first_line + row_offset, width, border_style, bordered);
+    }
+    if (bordered) try frame.appendLine(borderLine(width, border_style));
+}
+
+fn appendEditorLine(frame: *screen.Frame, editor: *const Editor, row: u16, editor_line_index: usize, width: u16, border_style: screen.Style, bordered: bool) error{ FrameFull, LineFull }!void {
     var line: screen.Line = .{};
-    try line.append(.{ .text = prompt, .style = screen.styles.accent });
-    try line.append(.{ .text = editor.text() });
+    const prefix = if (editor_line_index == 0) prompt else "  ";
+    if (bordered) try line.append(.{ .text = "|", .style = border_style });
+    try line.append(.{ .text = prefix, .style = screen.styles.accent });
+    const text = editor.lineSlice(editor_line_index);
+    try line.append(.{ .text = text });
+    if (bordered) {
+        const used = 1 + prefix.len + text.len;
+        if (width > used + 1) try line.append(.{ .text = border_spaces[0..@min(border_spaces.len, width - used - 1)] });
+        try line.append(.{ .text = "|", .style = border_style });
+    }
     try frame.appendLine(line);
 
-    const raw_col = prompt.len + editor.cursorByte();
-    const max_col: usize = if (width == 0) 0 else width - 1;
-    frame.cursor = .{ .col = @intCast(@min(raw_col, max_col)), .row = row };
+    const cursor = editor.cursorLineCol();
+    if (cursor.line == editor_line_index) {
+        const raw_col = (if (bordered) @as(usize, 1) else 0) + prefix.len + cursor.col;
+        const max_col: usize = if (width == 0) 0 else width - 1;
+        frame.cursor = .{ .col = @intCast(@min(raw_col, max_col)), .row = row };
+    }
+}
+
+fn borderLine(width: u16, style: screen.Style) screen.Line {
+    var line: screen.Line = .{};
+    line.append(.{ .text = "+", .style = style }) catch unreachable;
+    if (width > 2) line.append(.{ .text = border_fill[0..@min(border_fill.len, width - 2)], .style = style }) catch unreachable;
+    if (width > 1) line.append(.{ .text = "+", .style = style }) catch unreachable;
+    return line;
 }
 
 test "chrome composes status and editor rows" {
@@ -60,15 +124,18 @@ test "chrome composes status and editor rows" {
     try std.testing.expectEqual(@as(u16, 2), frame.cursor.?.row);
 }
 
-test "chrome renders scratch flood tail above editor" {
+test "chrome renders transcript and queue lines above editor" {
     var editor: Editor = .{};
     try editor.insert("draft");
-    const frame = try compose(.{ .status = "ready", .scratch_text = "streaming", .editor = &editor }, 80, 4);
+    const transcript = [_]screen.Line{screen.singleSpanLine("streaming", screen.styles.normal)};
+    const queues = [_][]const u8{"steering: next"};
+    const frame = try compose(.{ .status = "ready", .transcript_lines = &transcript, .queue_lines = &queues, .editor = &editor }, 80, 5);
 
     var buffer: [32]u8 = undefined;
     try std.testing.expectEqualStrings("ready", frame.rows()[0].copyText(&buffer));
     try std.testing.expectEqualStrings("streaming", frame.rows()[1].copyText(&buffer));
-    try std.testing.expectEqualStrings("> draft", frame.rows()[3].copyText(&buffer));
+    try std.testing.expectEqualStrings("steering: next", frame.rows()[3].copyText(&buffer));
+    try std.testing.expectEqualStrings("> draft", frame.rows()[4].copyText(&buffer));
 }
 
 test "chrome clamps cursor to frame width" {
@@ -78,4 +145,16 @@ test "chrome clamps cursor to frame width" {
 
     try std.testing.expectEqual(@as(u16, 3), frame.cursor.?.col);
     try std.testing.expectEqual(@as(u16, 0), frame.cursor.?.row);
+}
+
+test "chrome renders bordered editor with supplied border style" {
+    var editor: Editor = .{};
+    try editor.insert("draft");
+    const frame = try compose(.{ .editor = &editor, .editor_border_style = screen.styles.error_ }, 20, 6);
+
+    var buffer: [32]u8 = undefined;
+    try std.testing.expectEqualStrings("+------------------+", frame.rows()[3].copyText(&buffer));
+    try std.testing.expectEqualStrings("|> draft           |", frame.rows()[4].copyText(&buffer));
+    try std.testing.expectEqual(@as(u16, 8), frame.cursor.?.col);
+    try std.testing.expect(std.meta.eql(frame.rows()[3].spans()[0].style.fg, screen.styles.error_.fg));
 }

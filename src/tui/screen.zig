@@ -2,15 +2,17 @@ const std = @import("std");
 const vaxis = @import("vaxis");
 
 pub const row_capacity = 512;
-pub const span_capacity = 8;
+pub const span_capacity = 12;
 
 pub const Style = vaxis.Style;
 
 pub const styles = struct {
     pub const normal: Style = .{};
     pub const muted: Style = .{ .dim = true };
-    pub const accent: Style = .{ .bold = true };
-    pub const error_: Style = .{ .fg = .{ .index = 1 } };
+    pub const accent: Style = .{ .bold = true, .fg = .{ .index = 111 } };
+    pub const ok: Style = .{ .fg = .{ .index = 149 } };
+    pub const warn: Style = .{ .fg = .{ .index = 179 } };
+    pub const error_: Style = .{ .fg = .{ .index = 210 } };
 };
 
 pub const Span = struct {

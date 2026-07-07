@@ -11,13 +11,18 @@ pub const FrameLoop = @import("FrameLoop.zig");
 pub const InputDecoder = @import("InputDecoder.zig");
 pub const InputPump = InputPumpMod.InputPump;
 pub const Terminal = @import("Terminal.zig");
+pub const blocks = @import("blocks.zig");
 pub const chrome = @import("chrome.zig");
 pub const input = @import("input.zig");
+pub const layout = @import("layout.zig");
+pub const markdown = @import("markdown.zig");
 pub const loop = @import("Loop.zig");
 pub const render_policy = @import("render_policy.zig");
 pub const screen = @import("screen.zig");
 pub const theme = @import("theme.zig");
 pub const trace = @import("trace.zig");
+pub const testing = @import("testing/pty_harness.zig");
+pub const Transcript = @import("Transcript.zig");
 pub const Loop = loop.Loop;
 
 pub const Options = struct {
@@ -37,15 +42,19 @@ pub const Runner = struct {
     pending_input_read_len: usize = 0,
 
     lone_escape_deadline_ns: ?u64 = null,
-    pub fn init(options: Options) Editor.Error!Runner {
+    pub fn init(allocator: std.mem.Allocator, options: Options) !Runner {
         return .{
-            .loop = try Loop.init(options.initial_prompt),
+            .loop = try Loop.init(allocator, options.initial_prompt),
             .open = options.open,
             .resume_picker = options.resume_picker,
         };
     }
 
-    pub fn composeInitialFrame(self: *Runner, width: u16, height: u16) error{ FrameFull, LineFull }!screen.Frame {
+    pub fn deinit(self: *Runner) void {
+        self.loop.deinit();
+    }
+
+    pub fn composeInitialFrame(self: *Runner, width: u16, height: u16) anyerror!screen.Frame {
         return self.loop.composeFrame(width, height);
     }
 
@@ -171,11 +180,14 @@ pub const Runner = struct {
         width: u16,
         height: u16,
     ) !bool {
+        const input_actions_before = self.loop.trace.input_actions;
         try self.drainInputPumpForTick(pump, terminal, now_ns);
         try self.expireLoneEscapeIfDue(now_ns);
-        self.loop.tick(now_ns);
+        try self.loop.pumpDriver(now_ns);
+        try self.loop.tick(now_ns);
+        const had_input = self.loop.trace.input_actions != input_actions_before;
         const resized = if (pump.takeResize()) self.applyResize(width, height) else false;
-        if (!resized and !self.loop.shouldRender(now_ns)) return false;
+        if (!had_input and !resized and !self.loop.shouldRender(now_ns)) return false;
         const start_ns = FrameLoop.nowNs(terminal.io);
         const frame = try self.loop.composeFrame(width, height);
         try terminal.paint(frame);
@@ -205,20 +217,24 @@ pub fn run(process: runtime.Process, options: Options) !void {
 
     const stamp = coding_agent.session_manager.SessionStamp.now(services.io);
     var session = try coding_agent.session_bootstrap.openSession(process.gpa, &services, stamp.date(), options.open, .{});
-    defer shutdownSession(&session);
 
-    var runner = try Runner.init(options);
+    var runner = try Runner.init(process.gpa, options);
+    defer runner.deinit();
+    _ = try session.agent.subscribe(.{ .context = &runner.loop.transcript, .call_fn = Transcript.applyListener });
     if (process.env("ZI_TUI_SYNTHETIC_FLOOD") != null) runner.loop.enableSyntheticFlood(FrameLoop.nowNs(services.io));
     defer writeTraceIfRequested(process, &runner.loop.trace) catch {};
 
     var terminal: Terminal = undefined;
     try terminal.init(process.gpa, services.io, process.environ);
-    defer terminal.deinit();
+    errdefer terminal.deinit();
     try terminal.setup();
     try terminal.setTitle("zi - " ++ app_info.version);
 
     var pump: InputPump = .{};
     var wake: runtime.WakeEvent = .init;
+    runner.loop.bindSession(&session, services.io, &wake);
+    defer shutdownSession(&session, &runner.loop, services.io, &wake);
+    defer terminal.deinit();
     try pump.startTerminal(services.io, &terminal, &wake);
     defer pump.join();
     defer pump.requestStop();
@@ -231,19 +247,28 @@ pub fn run(process: runtime.Process, options: Options) !void {
     _ = try FrameLoop.run(&runner, &terminal, &pump, &wake, services.io);
 }
 
-fn shutdownSession(session: *coding_agent.AgentSession) void {
+fn shutdownSession(session: *coding_agent.AgentSession, owner_loop: *Loop, io: std.Io, wake: *runtime.WakeEvent) void {
+    owner_loop.shutdownDriver();
     session.requestShutdown();
+    const start = FrameLoop.nowNs(io);
+    while (!session.shutdownComplete() and FrameLoop.nowNs(io) -| start < loop.shutdown_cancel_bound_ns) {
+        wake.waitTimeout(io, .{ .duration = .{ .raw = .fromMilliseconds(100), .clock = .awake } }) catch {};
+        wake.reset();
+    }
     session.deinit();
 }
 
 fn writeTraceIfRequested(process: runtime.Process, stats: *const trace.Stats) !void {
-    _ = process.env("ZI_TUI_TRACE") orelse return;
-    const tmp_dir = process.env("TMPDIR") orelse "/tmp";
-    const stamp = coding_agent.session_manager.SessionStamp.now(process.io);
-    const file_name = try std.fmt.allocPrint(process.gpa, "zi-tui-trace-{d}.log", .{stamp.nanoseconds});
-    defer process.gpa.free(file_name);
-    const path = try std.fs.path.join(process.gpa, &.{ tmp_dir, file_name });
-    defer process.gpa.free(path);
+    const explicit_path = process.env("ZI_TUI_TRACE_FILE");
+    if (explicit_path == null and process.env("ZI_TUI_TRACE") == null) return;
+    const path = if (explicit_path) |value| value else blk: {
+        const tmp_dir = process.env("TMPDIR") orelse "/tmp";
+        const stamp = coding_agent.session_manager.SessionStamp.now(process.io);
+        const file_name = try std.fmt.allocPrint(process.gpa, "zi-tui-trace-{d}.log", .{stamp.nanoseconds});
+        defer process.gpa.free(file_name);
+        break :blk try std.fs.path.join(process.gpa, &.{ tmp_dir, file_name });
+    };
+    defer if (explicit_path == null) process.gpa.free(path);
 
     var buffer: [4096]u8 = undefined;
     var writer = std.Io.Writer.fixed(&buffer);
@@ -287,7 +312,7 @@ fn runBoundedForTest(
     try terminal.init(allocator, io, env);
     defer terminal.deinit();
 
-    var runner = try Runner.init(options);
+    var runner = try Runner.init(allocator, options);
     var pump: InputPump = .{};
     if (input_bytes.len > 0 and !pump.pushBatch(input_bytes, 0)) return error.InputTooLarge;
 
@@ -313,7 +338,7 @@ fn runBoundedWithWorkerForTest(
     try terminal.init(allocator, io, env);
     defer terminal.deinit();
 
-    var runner = try Runner.init(options);
+    var runner = try Runner.init(allocator, options);
     var pump: InputPump = .{};
     var wake: runtime.WakeEvent = .init;
     try pump.start(.{
@@ -357,7 +382,7 @@ test "run exposes the P1 TUI owner boundary" {
 }
 
 test "runner seeds initial prompt and composes first frame" {
-    var runner = try Runner.init(.{
+    var runner = try Runner.init(std.testing.allocator, .{
         .initial_prompt = "draft",
         .open = .{ .create = .{ .session_id = "tui-test", .timestamp = "2026-07-06T00:00:00Z" } },
         .resume_picker = false,
@@ -377,7 +402,7 @@ test "runner paints initial frame through terminal" {
     try terminal.init(std.testing.allocator, std.testing.io, &env);
     defer terminal.deinit();
 
-    var runner = try Runner.init(.{
+    var runner = try Runner.init(std.testing.allocator, .{
         .initial_prompt = "draft",
         .open = .{ .create = .{ .session_id = "tui-test", .timestamp = "2026-07-06T00:00:00Z" } },
         .resume_picker = false,
@@ -392,7 +417,7 @@ test "runner paints initial frame through terminal" {
 }
 
 test "runner drains decoded input bytes into loop" {
-    var runner = try Runner.init(.{
+    var runner = try Runner.init(std.testing.allocator, .{
         .initial_prompt = null,
         .open = .{ .create = .{ .session_id = "tui-test", .timestamp = "2026-07-06T00:00:00Z" } },
         .resume_picker = false,
@@ -406,7 +431,7 @@ test "runner drains decoded input bytes into loop" {
 }
 
 test "runner decodes enter into a local submitted prompt" {
-    var runner = try Runner.init(.{
+    var runner = try Runner.init(std.testing.allocator, .{
         .initial_prompt = null,
         .open = .{ .create = .{ .session_id = "tui-test", .timestamp = "2026-07-06T00:00:00Z" } },
         .resume_picker = false,
@@ -420,7 +445,7 @@ test "runner decodes enter into a local submitted prompt" {
 }
 
 test "runner drains input pump bytes into loop and records dropped bytes" {
-    var runner = try Runner.init(.{
+    var runner = try Runner.init(std.testing.allocator, .{
         .initial_prompt = null,
         .open = .{ .create = .{ .session_id = "tui-test", .timestamp = "2026-07-06T00:00:00Z" } },
         .resume_picker = false,
@@ -449,7 +474,7 @@ test "runner tick drains input and paints when due" {
     try terminal.init(std.testing.allocator, std.testing.io, &env);
     defer terminal.deinit();
 
-    var runner = try Runner.init(.{
+    var runner = try Runner.init(std.testing.allocator, .{
         .initial_prompt = null,
         .open = .{ .create = .{ .session_id = "tui-test", .timestamp = "2026-07-06T00:00:00Z" } },
         .resume_picker = false,
@@ -474,7 +499,7 @@ test "runner tick skips paint before render deadline" {
     try terminal.init(std.testing.allocator, std.testing.io, &env);
     defer terminal.deinit();
 
-    var runner = try Runner.init(.{
+    var runner = try Runner.init(std.testing.allocator, .{
         .initial_prompt = "draft",
         .open = .{ .create = .{ .session_id = "tui-test", .timestamp = "2026-07-06T00:00:00Z" } },
         .resume_picker = false,
@@ -494,7 +519,7 @@ test "runner tick renders immediately on resize" {
     try terminal.init(std.testing.allocator, std.testing.io, &env);
     defer terminal.deinit();
 
-    var runner = try Runner.init(.{
+    var runner = try Runner.init(std.testing.allocator, .{
         .initial_prompt = "draft",
         .open = .{ .create = .{ .session_id = "tui-test", .timestamp = "2026-07-06T00:00:00Z" } },
         .resume_picker = false,
@@ -515,7 +540,7 @@ test "frame loop step exits through pumped ctrl-d input" {
     try terminal.init(std.testing.allocator, std.testing.io, &env);
     defer terminal.deinit();
 
-    var runner = try Runner.init(.{
+    var runner = try Runner.init(std.testing.allocator, .{
         .initial_prompt = null,
         .open = .{ .create = .{ .session_id = "tui-test", .timestamp = "2026-07-06T00:00:00Z" } },
         .resume_picker = false,

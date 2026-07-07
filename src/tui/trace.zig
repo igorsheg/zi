@@ -126,6 +126,7 @@ pub const Stats = struct {
     rebuilds: TimingStats = .{},
     frames: FrameRecords = .{},
     input_latency: InputLatencyHistogram = .{},
+    input_latency_timing: TimingStats = .{},
     input_actions: usize = 0,
     dropped_input_bytes: usize = 0,
 
@@ -142,7 +143,9 @@ pub const Stats = struct {
     }
 
     pub fn recordInputLatency(self: *Stats, read_ns: u64, flush_complete_ns: u64) void {
-        self.input_latency.recordLatencyNs(flush_complete_ns -| read_ns);
+        const latency_ns = flush_complete_ns -| read_ns;
+        self.input_latency.recordLatencyNs(latency_ns);
+        self.input_latency_timing.record(latency_ns);
     }
 
     pub fn recordRebuild(self: *Stats, ns: u64) void {
@@ -166,6 +169,7 @@ pub const Stats = struct {
                 "rebuilds count={d} avg_ns={d} max_ns={d}\n" ++
                 "input_actions count={d}\n" ++
                 "dropped_input_bytes count={d}\n" ++
+                "input_latency count={d} p50_ns={d} p90_ns={d} p99_ns={d} max_ns={d}\n" ++
                 "input_latency buckets_1ms_to_1024ms_plus=",
             .{
                 self.iterations.count,
@@ -188,6 +192,11 @@ pub const Stats = struct {
                 self.rebuilds.max_ns,
                 self.input_actions,
                 self.dropped_input_bytes,
+                self.input_latency_timing.count,
+                self.input_latency_timing.percentileNs(50),
+                self.input_latency_timing.percentileNs(90),
+                self.input_latency_timing.percentileNs(99),
+                self.input_latency_timing.max_ns,
             },
         );
         for (self.input_latency.buckets, 0..) |count, index| {

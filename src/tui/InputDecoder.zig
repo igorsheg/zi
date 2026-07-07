@@ -11,7 +11,10 @@ const text_capacity = 4096;
 
 parser: vaxis.Parser = .{},
 buffer: [buffer_capacity]u8 = undefined,
+parser_paste_buffer: [text_capacity]u8 = undefined,
 paste_buffer: [text_capacity]u8 = undefined,
+paste_len: usize = 0,
+paste_active: bool = false,
 len: usize = 0,
 last_text: [text_capacity]u8 = undefined,
 
@@ -35,7 +38,7 @@ pub fn nextAction(self: *InputDecoder) !?input.Action {
 
 pub fn nextActionWithTerminal(self: *InputDecoder, terminal: ?*Terminal) !?input.Action {
     while (self.len > 0) {
-        var paste_fba = std.heap.FixedBufferAllocator.init(&self.paste_buffer);
+        var paste_fba = std.heap.FixedBufferAllocator.init(&self.parser_paste_buffer);
         const result = try self.parser.parse(self.buffer[0..self.len], paste_fba.allocator());
         if (result.n == 0) return null;
         defer self.discard(result.n);
@@ -59,9 +62,14 @@ pub fn expireLoneEscape(self: *InputDecoder) input.Action {
 }
 
 fn actionFromEvent(self: *InputDecoder, event: vaxis.Event, terminal: ?*Terminal) !?input.Action {
-    _ = self;
     switch (event) {
-        .key_press => |key| return input.fromKey(key),
+        .key_press => |key| {
+            if (self.paste_active) {
+                try self.appendPasteKey(key);
+                return .none;
+            }
+            return input.fromKey(key);
+        },
         .key_release => return null,
         .mouse => |mouse| {
             const action = input.fromMouse(if (terminal) |term| term.vx.?.translateMouse(mouse) else mouse);
@@ -69,6 +77,15 @@ fn actionFromEvent(self: *InputDecoder, event: vaxis.Event, terminal: ?*Terminal
             return action;
         },
         .paste => |text| return .{ .insert = text },
+        .paste_start => {
+            self.paste_active = true;
+            self.paste_len = 0;
+            return .none;
+        },
+        .paste_end => {
+            self.paste_active = false;
+            return .{ .insert = self.paste_buffer[0..self.paste_len] };
+        },
         .winsize, .color_report, .color_scheme, .cap_kitty_keyboard, .cap_kitty_graphics, .cap_rgb, .cap_sgr_pixels, .cap_unicode, .cap_da1, .cap_color_scheme_updates, .cap_multi_cursor => {
             if (terminal) |term| {
                 return switch (try term.applyParserEvent(event)) {
@@ -78,8 +95,21 @@ fn actionFromEvent(self: *InputDecoder, event: vaxis.Event, terminal: ?*Terminal
             }
             return null;
         },
-        .paste_start, .paste_end, .mouse_leave, .focus_in, .focus_out => return null,
+        .mouse_leave, .focus_in, .focus_out => return null,
     }
+}
+
+fn appendPasteKey(self: *InputDecoder, key: vaxis.Key) Error!void {
+    if (key.text) |text| return self.appendPasteBytes(text);
+    if (key.codepoint == vaxis.Key.tab) return self.appendPasteBytes("\t");
+    if (key.codepoint == 'j' and key.mods.ctrl) return self.appendPasteBytes("\n");
+    if (key.codepoint == vaxis.Key.enter) return self.appendPasteBytes("\r");
+}
+
+fn appendPasteBytes(self: *InputDecoder, bytes: []const u8) Error!void {
+    if (bytes.len > text_capacity - self.paste_len) return error.ActionTextTooLong;
+    @memcpy(self.paste_buffer[self.paste_len..][0..bytes.len], bytes);
+    self.paste_len += bytes.len;
 }
 
 fn ownAction(self: *InputDecoder, action: input.Action) Error!input.Action {
@@ -159,6 +189,17 @@ test "decoder copies osc paste into insert action" {
     const paste = (try decoder.nextAction()).?;
     try std.testing.expect(paste == .insert);
     try std.testing.expectEqualStrings("hi", paste.insert);
+}
+
+test "decoder aggregates bracketed paste into one insert action" {
+    var decoder: InputDecoder = .{};
+    try decoder.feed("\x1b[200~hello\n");
+    try std.testing.expectEqual(@as(?input.Action, null), try decoder.nextAction());
+    try decoder.feed("world\x1b[201~");
+    const paste = (try decoder.nextAction()).?;
+    try std.testing.expect(paste == .insert);
+    try std.testing.expectEqualStrings("hello\nworld", paste.insert);
+    try std.testing.expectEqual(@as(?input.Action, null), try decoder.nextAction());
 }
 
 test "decoder exposes lone escape deadline and expiry" {
