@@ -293,6 +293,18 @@ pub fn currentToken(self: *const Editor) ?Token {
     return .{ .start = start, .end = end, .text = self.buffer[start..end] };
 }
 
+pub fn replaceToken(self: *Editor, token: Token, replacement: []const u8) Error!void {
+    if (!std.unicode.utf8ValidateSlice(replacement)) return error.InvalidUtf8;
+    if (token.start > token.end or token.end > self.len) return error.InvalidUtf8;
+    if (self.len - (token.end - token.start) + replacement.len > capacity) return error.EditorFull;
+    try self.recordUndo();
+    self.deleteRange(token.start, token.end);
+    self.cursor = token.start;
+    try self.insertRaw(replacement);
+    self.history_index = null;
+    self.last_was_kill = false;
+}
+
 pub fn endsWithBackslash(self: *const Editor) bool {
     return self.len > 0 and self.buffer[self.len - 1] == '\\';
 }
@@ -559,4 +571,15 @@ test "editor exposes lines and cursor position" {
     const cursor = editor.cursorLineCol();
     try std.testing.expectEqual(@as(usize, 1), cursor.line);
     try std.testing.expectEqual(@as(usize, 3), cursor.col);
+}
+
+test "editor replaces current token for completion" {
+    var editor: Editor = .{};
+    try editor.insert("run @sr now");
+    _ = editor.moveWordLeft();
+    _ = editor.moveWordLeft();
+    const token = editor.currentToken().?;
+    try std.testing.expectEqualStrings("@sr", token.text);
+    try editor.replaceToken(token, "@src/main.zig");
+    try std.testing.expectEqualStrings("run @src/main.zig now", editor.text());
 }

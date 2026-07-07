@@ -111,6 +111,17 @@ pub fn deinit(self: *Transcript) void {
     self.* = undefined;
 }
 
+pub fn clear(self: *Transcript) void {
+    for (self.items.items) |item| self.destroyItem(item);
+    self.items.clearRetainingCapacity();
+    self.live_tools.clearRetainingCapacity();
+    self.streaming_item = null;
+    self.total_bytes = 0;
+    self.next_seq = 0;
+    self.evicted_seqs = 0;
+    self.run_active = false;
+}
+
 pub fn applyListener(io: std.Io, context: ?*anyopaque, event: agent_mod.AgentEvent, _: runtime.CancelToken) anyerror!void {
     const self: *Transcript = @ptrCast(@alignCast(context.?));
     try self.apply(io, event);

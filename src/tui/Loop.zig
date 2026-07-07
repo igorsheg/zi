@@ -42,6 +42,15 @@ pub const synthetic_flood_duration_ns: u64 = 30 * std.time.ns_per_s;
 pub const synthetic_flood_tool_body_bytes: usize = 4 * 1024 * 1024;
 const synthetic_flood_tool_emit_ns: u64 = synthetic_flood_duration_ns / 2;
 const viewport_hint_buffer_len = 64;
+const completion_popup_rows_max: usize = 8;
+const completion_candidates_max: usize = 64;
+const completion_text_bytes_max: usize = 256;
+const picker_rows_max: usize = 128;
+const picker_filter_bytes_max: usize = 128;
+const picker_visible_rows_max: usize = 8;
+const title_buffer_len: usize = 256;
+const footer_buffer_len: usize = 256;
+const header_buffer_len: usize = 256;
 
 pub const Scratch = struct {
     buffer: [scratch_capacity]u8 = undefined,
@@ -372,6 +381,168 @@ pub const RunDriver = struct {
     }
 };
 
+const CompletionMode = enum { slash, file };
+
+const CompletionCandidate = struct {
+    label: [completion_text_bytes_max]u8 = undefined,
+    label_len: u16 = 0,
+    insert: [completion_text_bytes_max]u8 = undefined,
+    insert_len: u16 = 0,
+    detail: [completion_text_bytes_max]u8 = undefined,
+    detail_len: u16 = 0,
+    selectable: bool = true,
+
+    fn set(self: *CompletionCandidate, label: []const u8, insert: []const u8, detail: []const u8, selectable: bool) void {
+        self.label_len = copyBounded(self.label[0..], label);
+        self.insert_len = copyBounded(self.insert[0..], insert);
+        self.detail_len = copyBounded(self.detail[0..], detail);
+        self.selectable = selectable;
+    }
+
+    fn labelSlice(self: *const CompletionCandidate) []const u8 {
+        return self.label[0..self.label_len];
+    }
+
+    fn insertSlice(self: *const CompletionCandidate) []const u8 {
+        return self.insert[0..self.insert_len];
+    }
+
+    fn detailSlice(self: *const CompletionCandidate) []const u8 {
+        return self.detail[0..self.detail_len];
+    }
+};
+
+const CompletionPopup = struct {
+    active: bool = false,
+    mode: CompletionMode = .slash,
+    candidates: [completion_candidates_max]CompletionCandidate = undefined,
+    candidate_len: usize = 0,
+    selected: usize = 0,
+
+    fn clear(self: *CompletionPopup) void {
+        self.active = false;
+        self.candidate_len = 0;
+        self.selected = 0;
+    }
+
+    fn reset(self: *CompletionPopup, mode: CompletionMode) void {
+        self.active = true;
+        self.mode = mode;
+        self.candidate_len = 0;
+        self.selected = 0;
+    }
+
+    fn append(self: *CompletionPopup, label: []const u8, insert: []const u8, detail: []const u8, selectable: bool) void {
+        if (self.candidate_len == self.candidates.len) return;
+        self.candidates[self.candidate_len].set(label, insert, detail, selectable);
+        self.candidate_len += 1;
+    }
+
+    fn selectedCandidate(self: *const CompletionPopup) ?*const CompletionCandidate {
+        if (!self.active or self.candidate_len == 0) return null;
+        return &self.candidates[@min(self.selected, self.candidate_len - 1)];
+    }
+
+    fn move(self: *CompletionPopup, delta: i32) void {
+        if (!self.active or self.candidate_len == 0) return;
+        const len: i32 = @intCast(self.candidate_len);
+        var next: i32 = @intCast(self.selected);
+        next = @mod(next + delta, len);
+        self.selected = @intCast(next);
+    }
+};
+
+const PickerKind = enum { model, session };
+
+const PickerRow = struct {
+    id: [completion_text_bytes_max]u8 = undefined,
+    id_len: u16 = 0,
+    label: [completion_text_bytes_max]u8 = undefined,
+    label_len: u16 = 0,
+    detail: [completion_text_bytes_max]u8 = undefined,
+    detail_len: u16 = 0,
+    meta: [completion_text_bytes_max]u8 = undefined,
+    meta_len: u16 = 0,
+    model: ?ai.Model = null,
+    authed: bool = true,
+
+    fn set(self: *PickerRow, id: []const u8, label: []const u8, detail: []const u8, meta: []const u8, model: ?ai.Model, authed: bool) void {
+        self.id_len = copyBounded(self.id[0..], id);
+        self.label_len = copyBounded(self.label[0..], label);
+        self.detail_len = copyBounded(self.detail[0..], detail);
+        self.meta_len = copyBounded(self.meta[0..], meta);
+        self.model = model;
+        self.authed = authed;
+    }
+
+    fn idSlice(self: *const PickerRow) []const u8 {
+        return self.id[0..self.id_len];
+    }
+
+    fn labelSlice(self: *const PickerRow) []const u8 {
+        return self.label[0..self.label_len];
+    }
+
+    fn detailSlice(self: *const PickerRow) []const u8 {
+        return self.detail[0..self.detail_len];
+    }
+
+    fn metaSlice(self: *const PickerRow) []const u8 {
+        return self.meta[0..self.meta_len];
+    }
+};
+
+const Picker = struct {
+    active: bool = false,
+    kind: PickerKind = .model,
+    title: [64]u8 = undefined,
+    title_len: u8 = 0,
+    filter: [picker_filter_bytes_max]u8 = undefined,
+    filter_len: u8 = 0,
+    rows: [picker_rows_max]PickerRow = undefined,
+    row_len: usize = 0,
+    selected_row: ?usize = null,
+    saved_editor: [Editor.capacity]u8 = undefined,
+    saved_editor_len: usize = 0,
+
+    fn reset(self: *Picker, kind: PickerKind, title: []const u8, saved_editor: []const u8) void {
+        self.active = true;
+        self.kind = kind;
+        self.title_len = @intCast(copyBounded(self.title[0..], title));
+        self.filter_len = 0;
+        self.row_len = 0;
+        self.selected_row = null;
+        self.saved_editor_len = copyBounded(self.saved_editor[0..], saved_editor);
+    }
+
+    fn clear(self: *Picker) void {
+        self.active = false;
+        self.filter_len = 0;
+        self.row_len = 0;
+        self.selected_row = null;
+        self.saved_editor_len = 0;
+    }
+
+    fn savedEditorSlice(self: *const Picker) []const u8 {
+        return self.saved_editor[0..self.saved_editor_len];
+    }
+
+    fn titleSlice(self: *const Picker) []const u8 {
+        return self.title[0..self.title_len];
+    }
+
+    fn filterSlice(self: *const Picker) []const u8 {
+        return self.filter[0..self.filter_len];
+    }
+
+    fn appendRow(self: *Picker, id: []const u8, label: []const u8, detail: []const u8, meta: []const u8, model: ?ai.Model, authed: bool) void {
+        if (self.row_len == self.rows.len) return;
+        self.rows[self.row_len].set(id, label, detail, meta, model, authed);
+        if (self.selected_row == null) self.selected_row = self.row_len;
+        self.row_len += 1;
+    }
+};
+
 pub const Loop = struct {
     gpa: std.mem.Allocator,
     editor: Editor = .{},
@@ -407,6 +578,23 @@ pub const Loop = struct {
     queue_buffers: [4][256]u8 = undefined,
     queue_lines: [4][]const u8 = undefined,
     status_buffer: [256]u8 = undefined,
+    header_buffer: [header_buffer_len]u8 = undefined,
+    footer_left_buffer: [footer_buffer_len]u8 = undefined,
+    footer_right_buffer: [footer_buffer_len]u8 = undefined,
+    terminal_title_buffer: [title_buffer_len]u8 = undefined,
+    pending_title_update: bool = false,
+    services: ?*coding_agent.runtime_services.RuntimeServices = null,
+    completion: CompletionPopup = .{},
+    picker: Picker = .{},
+    completion_lines: [completion_popup_rows_max]screen.Line = undefined,
+    picker_lines: [picker_visible_rows_max]screen.Line = undefined,
+    file_index: ?coding_agent.file_completion.Index = null,
+    file_index_task: ?runtime.Task(anyerror!coding_agent.file_completion.Index) = null,
+    file_index_failed: bool = false,
+    token_cache_entry_count: usize = 0,
+    token_input_total: u64 = 0,
+    token_output_total: u64 = 0,
+    compaction_count: usize = 0,
 
     pub fn init(gpa: std.mem.Allocator, initial_prompt: ?[]const u8) !Loop {
         var self: Loop = .{ .gpa = gpa, .transcript = Transcript.init(gpa) };
@@ -419,15 +607,60 @@ pub const Loop = struct {
     }
 
     pub fn deinit(self: *Loop) void {
+        if (self.file_index_task) |*task| {
+            if (!task.hasResult()) task.cancel();
+            var result = task.getResult() catch null;
+            if (result) |*index| index.deinit(self.gpa);
+        }
+        if (self.file_index) |*index| index.deinit(self.gpa);
         self.transcript.deinit();
         self.* = undefined;
     }
-
     pub fn bindSession(self: *Loop, session: *coding_agent.AgentSession, io: std.Io, wake: *runtime.WakeEvent) void {
         self.session = session;
         self.io = io;
         self.wake = wake;
         self.trace_io_ready = true;
+    }
+
+    pub fn bindServices(self: *Loop, services: *coding_agent.runtime_services.RuntimeServices) !void {
+        self.services = services;
+        if (self.file_index == null and self.file_index_task == null and !self.file_index_failed) {
+            self.file_index_task = try services.task_runtime.spawnBlocking(buildFileIndex, .{ self.gpa, services.dir });
+        }
+    }
+
+    pub fn restoreSessionFold(self: *Loop) !void {
+        const session = self.session orelse return;
+        self.transcript.clear();
+        self.editor.history_len = 0;
+        self.editor.history_index = null;
+        self.token_cache_entry_count = std.math.maxInt(usize);
+        self.token_input_total = 0;
+        self.token_output_total = 0;
+        for (session.manager.entries.items) |entry| switch (entry) {
+            .message => |message_entry| try self.restoreMessage(message_entry.message),
+            .compaction => |compaction| try self.transcript.appendCompaction(compaction.summary, compaction.tokens_before),
+            .model_change => |model_change| try self.noticeFmt(.info, "model: {s}/{s}", .{ model_change.provider, model_change.model_id }),
+            .thinking_level_change => |change| try self.noticeFmt(.info, "thinking: {s}", .{change.thinking_level}),
+        };
+        self.refreshTokenCache();
+        self.repinViewport();
+        self.markLayoutRebuild();
+        self.pending_title_update = true;
+    }
+
+    pub fn takePendingTitleUpdate(self: *Loop) bool {
+        const pending = self.pending_title_update;
+        self.pending_title_update = false;
+        return pending;
+    }
+
+    pub fn terminalTitle(self: *Loop) []const u8 {
+        const title = self.sessionTitle();
+        const cwd = if (self.session) |session| session.manager.header.cwd else ".";
+        const base = std.fs.path.basename(cwd);
+        return std.fmt.bufPrint(&self.terminal_title_buffer, "zi - {s} - {s}", .{ title, base }) catch "zi";
     }
 
     pub fn enableSyntheticFlood(self: *Loop, start_ns: u64) void {
@@ -472,14 +705,18 @@ pub const Loop = struct {
         self.trace.recordInputAction();
         self.frame_events_applied += 1;
         self.dirty = true;
+        if (try self.handlePickerAction(action)) return;
+        if (try self.handleCompletionAction(action)) return;
         switch (action) {
             .insert => |text| {
                 self.clearExitHint();
                 try self.editor.insert(text);
+                try self.refreshCompletion(.auto);
             },
             .key_editor => |op| {
                 self.clearExitHint();
                 self.applyEditorOp(op);
+                try self.refreshCompletion(.auto);
             },
             .cancel => self.handleCancel(),
             .quit_eof => {
@@ -512,26 +749,36 @@ pub const Loop = struct {
 
     pub fn composeFrame(self: *Loop, width: u16, height: u16) anyerror!screen.Frame {
         self.noteResize(width, height);
+        self.refreshTokenCache();
         const rebuilt = try self.rebuildLineIndex(width);
         if (rebuilt) self.clampViewportAfterRebuild();
 
         const queue_lines = self.collectQueueLines();
+        const popup_view = self.popupView();
+        const picker_view = self.pickerView();
+        const popup_rows = if (popup_view) |popup| popup.rows.len else 0;
         self.updateViewportHint();
-        var transcript_rows = chrome.transcriptRowCapacity(&self.editor, queue_lines.len, self.viewport_hint.len, width, height);
+        var transcript_rows = chrome.transcriptRowCapacityWithChrome(&self.editor, picker_view != null, queue_lines.len, self.viewport_hint.len, popup_rows, width, height);
         self.applyPendingViewportMotion(transcript_rows);
         self.updateViewportHint();
-        transcript_rows = chrome.transcriptRowCapacity(&self.editor, queue_lines.len, self.viewport_hint.len, width, height);
+        transcript_rows = chrome.transcriptRowCapacityWithChrome(&self.editor, picker_view != null, queue_lines.len, self.viewport_hint.len, popup_rows, width, height);
         const transcript_lines = self.collectTranscriptLines(transcript_rows);
         self.last_transcript_rows = transcript_rows;
 
         return chrome.compose(.{
+            .header = self.headerText(),
             .status = self.statusText(),
+            .footer_left = self.footerLeftText(),
+            .footer_right = self.footerRightText(),
+            .footer_right_style = self.footerRightStyle(),
             .scratch_text = self.scratch.text(),
             .transcript_lines = transcript_lines,
             .queue_lines = queue_lines,
             .viewport_hint = self.viewport_hint,
             .editor = &self.editor,
             .editor_border_style = self.editorBorderStyle(),
+            .popup = popup_view,
+            .picker = picker_view,
         }, width, height);
     }
 
@@ -584,8 +831,9 @@ pub const Loop = struct {
         self.frame_events_applied = 0;
         self.dirty = false;
     }
-
     pub fn tick(self: *Loop, now_ns: u64) !void {
+        const file_index_changed = try self.pollFileIndexTask();
+        if (file_index_changed and self.completion.active and self.completion.mode == .file) try self.refreshCompletion(.force_file);
         try self.pumpSyntheticFlood(now_ns);
         if (self.ctrl_c_deadline_ns) |deadline| {
             if (now_ns > deadline) {
@@ -862,7 +1110,7 @@ pub const Loop = struct {
             else => {},
         }
         if (self.transcript.run_active or self.driver.state == .running) return "Working…";
-        return "ready";
+        return "";
     }
 
     fn editorBorderStyle(self: *const Loop) screen.Style {
@@ -873,6 +1121,179 @@ pub const Loop = struct {
             .medium => screen.styles.warn,
             .high, .xhigh => screen.styles.error_,
         };
+    }
+
+    fn headerText(self: *Loop) []const u8 {
+        const session = self.session orelse return "zi";
+        const title = self.sessionTitle();
+        if (self.compaction_count > 0) {
+            return std.fmt.bufPrint(
+                &self.header_buffer,
+                "zi · {s} · {s} · thinking:{s} · compacted {d} times",
+                .{ title, session.agent.state.model.id, @tagName(session.agent.state.thinking_level), self.compaction_count },
+            ) catch "zi";
+        }
+        return std.fmt.bufPrint(
+            &self.header_buffer,
+            "zi · {s} · {s} · thinking:{s}",
+            .{ title, session.agent.state.model.id, @tagName(session.agent.state.thinking_level) },
+        ) catch "zi";
+    }
+
+    fn footerLeftText(self: *Loop) []const u8 {
+        const cwd = if (self.session) |session| session.manager.header.cwd else ".";
+        const home = if (self.services) |services| blk: {
+            const environ = services.environ orelse break :blk null;
+            break :blk environ.get("HOME") orelse environ.get("USERPROFILE");
+        } else null;
+        if (home) |home_dir| {
+            if (home_dir.len != 0 and std.mem.eql(u8, cwd, home_dir)) return "~";
+            if (home_dir.len != 0 and cwd.len > home_dir.len and std.mem.startsWith(u8, cwd, home_dir) and std.fs.path.isSep(cwd[home_dir.len])) {
+                return std.fmt.bufPrint(&self.footer_left_buffer, "~{s}", .{cwd[home_dir.len..]}) catch cwd;
+            }
+        }
+        return std.fmt.bufPrint(&self.footer_left_buffer, "{s}", .{cwd}) catch cwd;
+    }
+
+    fn footerRightText(self: *Loop) []const u8 {
+        const session = self.session orelse return "";
+        const usage = session.contextUsage();
+        if (usage.percent_tenths) |tenths| {
+            return std.fmt.bufPrint(
+                &self.footer_right_buffer,
+                "ctx {d}.{d}% ↑{d} ↓{d} tokens",
+                .{ tenths / 10, tenths % 10, self.token_input_total, self.token_output_total },
+            ) catch "ctx";
+        }
+        return std.fmt.bufPrint(
+            &self.footer_right_buffer,
+            "ctx -- ↑{d} ↓{d} tokens",
+            .{ self.token_input_total, self.token_output_total },
+        ) catch "ctx";
+    }
+
+    fn footerRightStyle(self: *Loop) screen.Style {
+        const session = self.session orelse return screen.styles.muted;
+        const tenths = session.contextUsage().percent_tenths orelse return screen.styles.muted;
+        if (tenths > 900) return screen.styles.error_;
+        if (tenths >= 700) return screen.styles.warn;
+        return screen.styles.ok;
+    }
+
+    fn sessionTitle(self: *Loop) []const u8 {
+        const session = self.session orelse return "session";
+        for (session.manager.entries.items) |entry| {
+            if (entry != .message or entry.message.message != .user) continue;
+            const text = restoredUserText(entry.message.message.user);
+            if (text.len == 0) continue;
+            return text[0..@min(text.len, @as(usize, 64))];
+        }
+        if (session.manager.header.id.len != 0) return session.manager.header.id;
+        return "session";
+    }
+
+    fn refreshTokenCache(self: *Loop) void {
+        const session = self.session orelse return;
+        if (self.token_cache_entry_count == session.manager.entries.items.len) return;
+        self.token_cache_entry_count = session.manager.entries.items.len;
+        self.token_input_total = 0;
+        self.token_output_total = 0;
+        self.compaction_count = 0;
+        for (session.manager.entries.items) |entry| switch (entry) {
+            .message => |message| {
+                if (message.message != .assistant) continue;
+                const usage = message.message.assistant.usage;
+                self.token_input_total +|= usage.input +| usage.cache_read +| usage.cache_write;
+                self.token_output_total +|= usage.output;
+            },
+            .compaction => self.compaction_count += 1,
+            .model_change, .thinking_level_change => {},
+        };
+    }
+
+    fn popupView(self: *Loop) ?chrome.PopupView {
+        if (!self.completion.active or self.completion.candidate_len == 0 or self.picker.active) return null;
+        const count = @min(self.completion.candidate_len, self.completion_lines.len);
+        for (self.completion.candidates[0..count], 0..) |candidate, index| {
+            var line: screen.Line = .{};
+            line.append(.{ .text = candidate.labelSlice(), .style = if (index == self.completion.selected) screen.styles.accent else screen.styles.normal }) catch {};
+            if (candidate.detailSlice().len > 0) {
+                line.append(.{ .text = "  ", .style = screen.styles.muted }) catch {};
+                line.append(.{ .text = candidate.detailSlice(), .style = screen.styles.muted }) catch {};
+            }
+            self.completion_lines[index] = line;
+        }
+        return .{ .rows = self.completion_lines[0..count], .selected = self.completion.selected };
+    }
+
+    fn pickerView(self: *Loop) ?chrome.PickerView {
+        if (!self.picker.active) return null;
+        var visible: [picker_rows_max]usize = undefined;
+        const rows = self.filteredPickerRows(&visible);
+        const offset = self.pickerVisibleOffset(rows);
+        const count = @min(rows.len -| offset, self.picker_lines.len);
+        for (rows[offset..][0..count], 0..) |row_index, visible_index| {
+            const row = &self.picker.rows[row_index];
+            var line: screen.Line = .{};
+            line.append(.{ .text = row.labelSlice(), .style = if (self.picker.selected_row == row_index) screen.styles.accent else screen.styles.normal }) catch {};
+            if (row.detailSlice().len > 0) {
+                line.append(.{ .text = "  ", .style = screen.styles.muted }) catch {};
+                line.append(.{ .text = row.detailSlice(), .style = screen.styles.muted }) catch {};
+            }
+            if (row.metaSlice().len > 0) {
+                line.append(.{ .text = "  ", .style = screen.styles.muted }) catch {};
+                line.append(.{ .text = row.metaSlice(), .style = screen.styles.muted }) catch {};
+            }
+            self.picker_lines[visible_index] = line;
+        }
+        return .{ .title = self.picker.titleSlice(), .filter = self.picker.filterSlice(), .rows = self.picker_lines[0..count], .selected = self.pickerSelectedVisibleIndex(rows, offset) };
+    }
+
+    fn pickerVisibleOffset(self: *Loop, rows: []const usize) usize {
+        const selected = self.picker.selected_row orelse return 0;
+        var selected_visible: usize = 0;
+        for (rows, 0..) |row_index, index| if (row_index == selected) {
+            selected_visible = index;
+            break;
+        };
+        if (selected_visible >= picker_visible_rows_max) return selected_visible - picker_visible_rows_max + 1;
+        return 0;
+    }
+
+    fn pickerSelectedVisibleIndex(self: *Loop, rows: []const usize, offset: usize) usize {
+        const selected = self.picker.selected_row orelse return 0;
+        for (rows[offset..@min(rows.len, offset + picker_visible_rows_max)], 0..) |row_index, index| {
+            if (row_index == selected) return index;
+        }
+        return 0;
+    }
+
+    fn filteredPickerRows(self: *Loop, out: *[picker_rows_max]usize) []const usize {
+        var count: usize = 0;
+        const filter = self.picker.filterSlice();
+        for (self.picker.rows[0..self.picker.row_len], 0..) |row, index| {
+            if (filter.len != 0 and !fuzzyMatch(row.labelSlice(), filter) and !fuzzyMatch(row.detailSlice(), filter) and !fuzzyMatch(row.metaSlice(), filter)) continue;
+            out[count] = index;
+            count += 1;
+        }
+        return out[0..count];
+    }
+
+    fn pollFileIndexTask(self: *Loop) !bool {
+        if (self.file_index_task) |*task| {
+            if (!task.hasResult()) return false;
+            const index = task.getResult() catch |err| {
+                self.file_index_failed = true;
+                self.file_index_task = null;
+                try self.noticeFmt(.warn, "file index unavailable: {s}", .{@errorName(err)});
+                return true;
+            };
+            self.file_index = index;
+            self.file_index_task = null;
+            self.dirty = true;
+            return true;
+        }
+        return false;
     }
 
     fn pumpSyntheticFlood(self: *Loop, now_ns: u64) !void {
@@ -969,6 +1390,219 @@ pub const Loop = struct {
         }
     }
 
+    const CompletionRefresh = enum { auto, force_file };
+
+    fn handlePickerAction(self: *Loop, action: input.Action) !bool {
+        if (!self.picker.active) return false;
+        switch (action) {
+            .cancel => {
+                try self.cancelPicker();
+                return true;
+            },
+            .insert => |text| {
+                if (self.picker.filter_len + text.len <= self.picker.filter.len and std.unicode.utf8ValidateSlice(text)) {
+                    @memcpy(self.picker.filter[self.picker.filter_len..][0..text.len], text);
+                    self.picker.filter_len += @intCast(text.len);
+                    self.selectFirstVisiblePickerRow();
+                }
+                return true;
+            },
+            .key_editor => |op| {
+                switch (op) {
+                    .move_up_history => self.movePickerSelection(-1),
+                    .move_down_history => self.movePickerSelection(1),
+                    .backspace => self.pickerBackspace(),
+                    .clear => {
+                        self.picker.filter_len = 0;
+                        self.selectFirstVisiblePickerRow();
+                    },
+                    else => {},
+                }
+                return true;
+            },
+            .submit => {
+                try self.acceptPickerSelection();
+                return true;
+            },
+            else => return true,
+        }
+    }
+
+    fn handleCompletionAction(self: *Loop, action: input.Action) !bool {
+        switch (action) {
+            .cancel => if (self.completion.active) {
+                self.completion.clear();
+                self.dirty = true;
+                return true;
+            },
+            .insert => |text| if (std.mem.eql(u8, text, "\t")) {
+                if (self.completion.active) {
+                    try self.acceptCompletion();
+                } else {
+                    try self.refreshCompletion(.force_file);
+                }
+                return true;
+            },
+            .key_editor => |op| switch (op) {
+                .tab => {
+                    if (self.completion.active) {
+                        try self.acceptCompletion();
+                    } else {
+                        try self.refreshCompletion(.force_file);
+                    }
+                    return true;
+                },
+                .move_up_history => if (self.completion.active) {
+                    self.completion.move(-1);
+                    return true;
+                },
+                .move_down_history => if (self.completion.active) {
+                    self.completion.move(1);
+                    return true;
+                },
+                else => {},
+            },
+            .submit => if (self.completion.active) {
+                if (self.completion.mode == .slash and slash_commands.dispatch(self.editor.text()) != null) return false;
+                try self.acceptCompletion();
+                return true;
+            },
+            else => {},
+        }
+        return false;
+    }
+
+    fn refreshCompletion(self: *Loop, mode: CompletionRefresh) !void {
+        if (self.picker.active) return;
+        const token = self.editor.currentToken() orelse blk: {
+            if (mode != .force_file) {
+                self.completion.clear();
+                return;
+            }
+            const cursor = self.editor.cursorByte();
+            break :blk Editor.Token{ .start = cursor, .end = cursor, .text = self.editor.text()[cursor..cursor] };
+        };
+        if (mode == .force_file) return self.refreshFileCompletion(token, true);
+        if (std.mem.startsWith(u8, token.text, "/")) return self.refreshSlashCompletion(token.text);
+        if (std.mem.startsWith(u8, token.text, "@")) return self.refreshFileCompletion(token, false);
+        if (std.mem.startsWith(u8, self.editor.text(), "/settings ") and std.mem.startsWith(u8, token.text, "thinking:")) return self.refreshSettingsCompletion(token.text);
+        self.completion.clear();
+    }
+
+    fn refreshSlashCompletion(self: *Loop, token_text: []const u8) !void {
+        self.completion.reset(.slash);
+        for (slash_commands.builtins) |command| {
+            var label_buffer: [64]u8 = undefined;
+            const label = std.fmt.bufPrint(&label_buffer, "/{s}", .{command.name}) catch continue;
+            if (!startsWithIgnoreCase(label, token_text)) continue;
+            var insert_buffer: [80]u8 = undefined;
+            const insert = std.fmt.bufPrint(&insert_buffer, "/{s} ", .{command.name}) catch label;
+            self.completion.append(label, insert, command.summary, true);
+        }
+        if (self.completion.candidate_len == 0) self.completion.clear();
+    }
+
+    fn refreshSettingsCompletion(self: *Loop, token_text: []const u8) !void {
+        self.completion.reset(.slash);
+        const values = [_][]const u8{ "off", "minimal", "low", "medium", "high", "xhigh", "shown", "hidden" };
+        for (values) |value| {
+            var label_buffer: [64]u8 = undefined;
+            const label = std.fmt.bufPrint(&label_buffer, "thinking:{s}", .{value}) catch continue;
+            if (!startsWithIgnoreCase(label, token_text)) continue;
+            self.completion.append(label, label, "", true);
+        }
+        if (self.completion.candidate_len == 0) self.completion.clear();
+    }
+
+    fn refreshFileCompletion(self: *Loop, token: Editor.Token, forced: bool) !void {
+        self.completion.reset(.file);
+        _ = try self.pollFileIndexTask();
+        if (self.file_index == null) {
+            self.completion.append(if (self.file_index_failed) "file index unavailable" else "indexing files…", "", "", false);
+            return;
+        }
+        const raw = if (std.mem.startsWith(u8, token.text, "@")) token.text[1..] else token.text;
+        if (!forced and token.text.len == 0) {
+            self.completion.clear();
+            return;
+        }
+        var result = try self.file_index.?.query(self.gpa, raw);
+        defer result.destroy(self.gpa);
+        var sources_buffer: [coding_agent.file_completion.item_count_max]coding_agent.file_completion.Source = undefined;
+        const sources = result.sources(&sources_buffer);
+        for (sources) |source| {
+            var insert_buffer: [completion_text_bytes_max]u8 = undefined;
+            const insert = std.fmt.bufPrint(&insert_buffer, "@{s}", .{source.id}) catch continue;
+            self.completion.append(source.label, insert, source.detail, true);
+        }
+        if (self.completion.candidate_len == 0) self.completion.clear();
+    }
+
+    fn acceptCompletion(self: *Loop) !void {
+        const candidate = self.completion.selectedCandidate() orelse return;
+        if (!candidate.selectable) return;
+        const token = self.editor.currentToken() orelse blk: {
+            const cursor = self.editor.cursorByte();
+            break :blk Editor.Token{ .start = cursor, .end = cursor, .text = self.editor.text()[cursor..cursor] };
+        };
+        try self.editor.replaceToken(token, candidate.insertSlice());
+        self.completion.clear();
+        self.dirty = true;
+    }
+
+    fn selectFirstVisiblePickerRow(self: *Loop) void {
+        var visible: [picker_rows_max]usize = undefined;
+        const rows = self.filteredPickerRows(&visible);
+        self.picker.selected_row = if (rows.len == 0) null else rows[0];
+        self.dirty = true;
+    }
+
+    fn movePickerSelection(self: *Loop, delta: i32) void {
+        var visible: [picker_rows_max]usize = undefined;
+        const rows = self.filteredPickerRows(&visible);
+        if (rows.len == 0) {
+            self.picker.selected_row = null;
+            return;
+        }
+        var current: usize = 0;
+        if (self.picker.selected_row) |selected| for (rows, 0..) |row_index, index| {
+            if (row_index == selected) {
+                current = index;
+                break;
+            }
+        };
+        const len: i32 = @intCast(rows.len);
+        const next = @mod(@as(i32, @intCast(current)) + delta, len);
+        self.picker.selected_row = rows[@intCast(next)];
+        self.dirty = true;
+    }
+
+    fn pickerBackspace(self: *Loop) void {
+        if (self.picker.filter_len == 0) return;
+        self.picker.filter_len -= 1;
+        while (self.picker.filter_len > 0 and (self.picker.filter[self.picker.filter_len] & 0xc0) == 0x80) self.picker.filter_len -= 1;
+        self.selectFirstVisiblePickerRow();
+    }
+
+    fn cancelPicker(self: *Loop) !void {
+        const saved = self.picker.savedEditorSlice();
+        self.editor.clear();
+        try self.editor.insert(saved);
+        self.picker.clear();
+        self.dirty = true;
+    }
+
+    fn acceptPickerSelection(self: *Loop) !void {
+        const selected = self.picker.selected_row orelse return;
+        const row = self.picker.rows[selected];
+        const kind = self.picker.kind;
+        self.picker.clear();
+        switch (kind) {
+            .model => if (row.model) |model| try self.applyModelSelection(model, row.authed),
+            .session => try self.switchSession(.{ .resume_existing = .{ .session_file_name = row.idSlice() } }, "resumed session"),
+        }
+    }
+
     fn submitPrompt(self: *Loop, action: input.Action) !void {
         if (self.editor.endsWithBackslash() and action == .submit) {
             _ = self.editor.removeTrailingBackslash();
@@ -1011,10 +1645,27 @@ pub const Loop = struct {
                 var buffer: [160]u8 = undefined;
                 try self.notice(.info, slash_commands.formatAvailable(&buffer));
             },
-            .session => try self.notice(.info, "session"),
-            .model => |model| try self.noticeFmt(.warn, "unknown or unauthenticated model: {s}", .{model}),
-            .resume_session => try self.notice(.info, "resumed session"),
-            .new_session => try self.notice(.info, "started new session"),
+            .session => try self.showSessionNotice(),
+            .model => |model| {
+                if (model.len == 0) {
+                    try self.openModelPicker();
+                } else {
+                    try self.setModelByName(model);
+                }
+            },
+            .resume_session => |selector| {
+                if (selector.len == 0) {
+                    try self.openSessionPicker();
+                } else {
+                    try self.switchSession(.{ .resume_existing = .{ .session_file_name = selector } }, "resumed session");
+                }
+            },
+            .new_session => {
+                var id_buffer: [64]u8 = undefined;
+                const stamp = coding_agent.session_manager.SessionStamp.now(self.io);
+                const id = std.fmt.bufPrint(&id_buffer, "tui-{d}", .{stamp.nanoseconds}) catch "tui";
+                try self.switchSession(.{ .create = .{ .session_id = id, .timestamp = stamp.timestamp() } }, "started new session");
+            },
             .compact => {
                 const session = self.session orelse {
                     try self.notice(.info, "nothing to compact");
@@ -1027,10 +1678,13 @@ pub const Loop = struct {
             .thinking_level => |level| {
                 const session = self.session orelse return true;
                 try session.setThinkingLevel(level);
+                self.pending_title_update = true;
                 self.dirty = true;
             },
             .hide_thinking => |hidden| {
                 const session = self.session orelse return true;
+                const services = self.services orelse return error.NoServices;
+                try services.settings_manager.setHideThinkingBlock(self.io, services.dir, hidden);
                 try session.setHideThinking(hidden);
                 self.setHideThinking(hidden);
             },
@@ -1041,6 +1695,175 @@ pub const Loop = struct {
             },
         }
         return true;
+    }
+
+    fn showSessionNotice(self: *Loop) !void {
+        const session = self.session orelse return;
+        const usage = session.contextUsage();
+        const file_name = if (session.store) |store| std.fs.path.basename(store.file_name) else session.manager.header.id;
+        const tokens_text = if (usage.tokens) |tokens| tokens else 0;
+        const percent_text = if (usage.percent_tenths) |tenths| tenths else 0;
+        var buffer: [1024]u8 = undefined;
+        const text = std.fmt.bufPrint(
+            &buffer,
+            "session: {s}\ntitle: {s}\ncwd: {s}\nmodel: {s}/{s}\nthinking: {s}\ncontext: {d}/{d} ({d}.{d}%)\nentries: {d}",
+            .{
+                file_name,
+                self.sessionTitle(),
+                session.manager.header.cwd,
+                session.agent.state.model.provider,
+                session.agent.state.model.id,
+                @tagName(session.agent.state.thinking_level),
+                tokens_text,
+                usage.window,
+                percent_text / 10,
+                percent_text % 10,
+                session.manager.entries.items.len,
+            },
+        ) catch "session";
+        try self.notice(.info, text);
+    }
+
+    fn openModelPicker(self: *Loop) !void {
+        const services = self.services orelse return error.NoServices;
+        self.picker.reset(.model, "Select model", self.editor.text());
+        inline for (.{ true, false }) |want_authed| {
+            for (ai.getProviders()) |provider_name| {
+                for (ai.getModels(provider_name)) |model| {
+                    if (services.provider_registry.get(model.api) == null) continue;
+                    const authed = services.auth_manager.hasAuth(model.provider);
+                    if (authed != want_authed) continue;
+                    var label_buffer: [completion_text_bytes_max]u8 = undefined;
+                    const label = std.fmt.bufPrint(&label_buffer, "{s}/{s}", .{ model.provider, model.id }) catch model.id;
+                    self.picker.appendRow(label, label, model.name, if (authed) "" else "not authenticated", model, authed);
+                }
+            }
+        }
+        self.selectFirstVisiblePickerRow();
+        self.completion.clear();
+    }
+
+    fn openSessionPicker(self: *Loop) !void {
+        const services = self.services orelse return error.NoServices;
+        var summaries = try coding_agent.session_listing.listRuntimeSessionSummaries(self.gpa, self.io, .{
+            .cwd = services.cwd,
+            .agent_dir_override = services.agent_dir,
+            .dir = services.dir,
+            .environ = services.environ,
+        });
+        defer summaries.deinit(self.gpa);
+        self.picker.reset(.session, "Resume session", self.editor.text());
+        for (summaries.items) |summary| {
+            var meta_buffer: [completion_text_bytes_max]u8 = undefined;
+            const meta = std.fmt.bufPrint(&meta_buffer, "{s} {s}", .{ summary.meta, summary.aux }) catch summary.meta;
+            self.picker.appendRow(summary.file_name, summary.title, summary.detail, meta, null, true);
+        }
+        self.selectFirstVisiblePickerRow();
+        self.completion.clear();
+    }
+
+    fn setModelByName(self: *Loop, name: []const u8) !void {
+        const model = self.resolveModelName(name) orelse {
+            try self.noticeFmt(.warn, "unknown or unauthenticated model: {s}", .{name});
+            return;
+        };
+        try self.applyModelSelection(model, true);
+    }
+
+    fn resolveModelName(self: *Loop, name: []const u8) ?ai.Model {
+        const services = self.services orelse return null;
+        if (std.mem.indexOfScalar(u8, name, '/')) |slash| {
+            const provider = name[0..slash];
+            const model_id = name[slash + 1 ..];
+            const model = ai.getModel(provider, model_id) orelse return null;
+            if (services.provider_registry.get(model.api) == null or !services.auth_manager.hasAuth(model.provider)) return null;
+            return model;
+        }
+        for (ai.getProviders()) |provider_name| {
+            for (ai.getModels(provider_name)) |model| {
+                if (!std.mem.eql(u8, model.id, name)) continue;
+                if (services.provider_registry.get(model.api) == null or !services.auth_manager.hasAuth(model.provider)) continue;
+                return model;
+            }
+        }
+        return null;
+    }
+
+    fn applyModelSelection(self: *Loop, model: ai.Model, authed: bool) !void {
+        if (!authed) {
+            try self.noticeFmt(.warn, "unknown or unauthenticated model: {s}", .{model.id});
+            return;
+        }
+        const services = self.services orelse return error.NoServices;
+        const session = self.session orelse return;
+        try session.setModel(model, coding_agent.session_bootstrap.streamFor(services, model));
+        self.pending_title_update = true;
+        try self.noticeFmt(.info, "model: {s}/{s}", .{ model.provider, model.id });
+    }
+
+    fn switchSession(self: *Loop, spec: coding_agent.session_bootstrap.OpenSpec, notice_text: []const u8) !void {
+        if (self.driver.state != .idle) {
+            try self.notice(.warn, "finish or cancel the current run first");
+            return;
+        }
+        const services = self.services orelse return error.NoServices;
+        const current = self.session orelse return;
+        const wake = self.wake orelse return error.NoWake;
+        const stamp = coding_agent.session_manager.SessionStamp.now(self.io);
+        var next = coding_agent.session_bootstrap.openSession(self.gpa, services, stamp.date(), spec, .{
+            .model = current.agent.state.model,
+            .thinking_level = current.agent.state.thinking_level,
+            .stream = coding_agent.session_bootstrap.streamFor(services, current.agent.state.model),
+        }) catch |err| {
+            try self.noticeFmt(.err, "error: {s}", .{@errorName(err)});
+            return;
+        };
+        var committed = false;
+        errdefer if (!committed) {
+            next.requestShutdown();
+            next.deinit();
+        };
+        _ = try next.agent.subscribe(.{ .context = &self.transcript, .call_fn = Transcript.applyListener });
+        self.shutdownSessionForSwitch(current, wake);
+        current.* = next;
+        committed = true;
+        self.bindSession(current, self.io, wake);
+        try self.restoreSessionFold();
+        try self.notice(.info, notice_text);
+        self.pending_title_update = true;
+        self.dirty = true;
+    }
+
+    fn shutdownSessionForSwitch(self: *Loop, session: *coding_agent.AgentSession, wake: *runtime.WakeEvent) void {
+        session.requestShutdown();
+        const start = nowNs(self.io);
+        while (!session.shutdownComplete() and nowNs(self.io) -| start < shutdown_cancel_bound_ns) {
+            wake.waitTimeout(self.io, .{ .duration = .{ .raw = .fromMilliseconds(100), .clock = .awake } }) catch {};
+            wake.reset();
+        }
+        session.deinit();
+    }
+
+    fn restoreMessage(self: *Loop, message: agent_mod.AgentMessage) !void {
+        switch (message) {
+            .user => |user| {
+                try self.transcript.apply(self.io, .{ .message_start = .{ .message = .{ .user = user } } });
+                self.editor.pushHistory(restoredUserText(user));
+            },
+            .assistant => |assistant| {
+                try self.transcript.apply(self.io, .{ .message_start = .{ .message = .{ .assistant = assistant } } });
+                try self.transcript.apply(self.io, .{ .message_end = .{ .message = .{ .assistant = assistant } } });
+            },
+            .tool_result => |tool_result| {
+                try self.transcript.apply(self.io, .{ .tool_execution_end = .{
+                    .tool_call_id = tool_result.tool_call_id,
+                    .tool_name = tool_result.tool_name,
+                    .result = .{ .content = tool_result.content, .details = tool_result.details, .terminate = false },
+                    .is_error = tool_result.is_error,
+                } });
+            },
+            .custom => {},
+        }
     }
 
     fn dequeueAll(self: *Loop) !void {
@@ -1096,6 +1919,43 @@ fn traceNowNs() u64 {
     const sec: u64 = if (ts.sec <= 0) 0 else @intCast(ts.sec);
     const nsec: u64 = if (ts.nsec <= 0) 0 else @intCast(ts.nsec);
     return sec * std.time.ns_per_s + nsec;
+}
+
+fn buildFileIndex(allocator: std.mem.Allocator, dir: std.Io.Dir) anyerror!coding_agent.file_completion.Index {
+    return coding_agent.file_completion.Index.build(allocator, dir);
+}
+
+fn copyBounded(dest: []u8, source: []const u8) u16 {
+    const len = @min(dest.len, source.len);
+    @memcpy(dest[0..len], source[0..len]);
+    return @intCast(len);
+}
+
+fn restoredUserText(user: ai.UserMessage) []const u8 {
+    return switch (user.content) {
+        .string => |text| text,
+        .blocks => |blocks| blk: {
+            for (blocks) |block| if (block == .text) break :blk block.text.text;
+            break :blk "";
+        },
+    };
+}
+
+fn startsWithIgnoreCase(haystack: []const u8, prefix: []const u8) bool {
+    if (prefix.len > haystack.len) return false;
+    return std.ascii.eqlIgnoreCase(haystack[0..prefix.len], prefix);
+}
+
+fn fuzzyMatch(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    var hay_index: usize = 0;
+    for (needle) |needle_byte| {
+        const lower = std.ascii.toLower(needle_byte);
+        while (hay_index < haystack.len and std.ascii.toLower(haystack[hay_index]) != lower) hay_index += 1;
+        if (hay_index == haystack.len) return false;
+        hay_index += 1;
+    }
+    return true;
 }
 
 test "loop dispatch edits text through editor actions" {
@@ -1171,16 +2031,16 @@ test "loop viewport anchors while appended lines arrive" {
     defer loop.deinit();
     try loop.seedSyntheticItems(10);
 
-    var frame = try loop.composeFrame(80, 8);
+    var frame = try loop.composeFrame(80, 10);
     var buffer: [64]u8 = undefined;
     try std.testing.expectEqualStrings("seed item 6", frame.rows()[1].copyText(&buffer));
 
     try loop.dispatch(.{ .scroll = -3 });
-    frame = try loop.composeFrame(80, 8);
+    frame = try loop.composeFrame(80, 10);
     try std.testing.expectEqualStrings("seed item 3", frame.rows()[1].copyText(&buffer));
 
     try loop.transcript.appendNotice(.info, "new item");
-    frame = try loop.composeFrame(80, 8);
+    frame = try loop.composeFrame(80, 10);
     try std.testing.expectEqualStrings("seed item 3", frame.rows()[1].copyText(&buffer));
     try std.testing.expectEqualStrings("↓ 1 new lines", frame.rows()[4].copyText(&buffer));
 }
@@ -1309,8 +2169,8 @@ test "loop collapsed tool body ending newline has no blank before marker" {
 
     const frame = try loop.composeFrame(80, 12);
     var buffer: [64]u8 = undefined;
-    try std.testing.expectEqualStrings("five", frame.rows()[6].copyText(&buffer));
-    try std.testing.expectEqualStrings("… 1 more lines (ctrl+o)", frame.rows()[7].copyText(&buffer));
+    try std.testing.expectEqualStrings("five", frame.rows()[5].copyText(&buffer));
+    try std.testing.expectEqualStrings("… 1 more lines (ctrl+o)", frame.rows()[6].copyText(&buffer));
 }
 
 test "loop render timing honors dirty policy" {
@@ -1391,6 +2251,170 @@ test "loop slash help appends a notice" {
     try loop.dispatch(.submit);
     try std.testing.expectEqual(@as(usize, 1), loop.transcript.items.items.len);
     try std.testing.expect(loop.transcript.items.items[0].kind == .notice);
+}
+
+test "loop P4 header footer cache assistant usage" {
+    var fixture = try DriverTestFixture.init("done");
+    defer fixture.deinit();
+
+    const content = [_]ai.AssistantContent{ai.faux.text("usage-bearing reply")};
+    var assistant = ai.faux.assistantMessage(&content, .{});
+    assistant.usage.input = 70;
+    assistant.usage.output = 30;
+    assistant.usage.total_tokens = 100;
+    const entry = try fixture.session.manager.prepareMessageEntry(.{ .assistant = assistant }, "2026-07-07T00:00:00Z");
+    _ = fixture.session.manager.commitPreparedEntry(entry);
+
+    const frame = try fixture.owner_loop.composeFrame(80, 6);
+    var buffer: [160]u8 = undefined;
+    const header = frame.rows()[0].copyText(&buffer);
+    try std.testing.expect(std.mem.indexOf(u8, header, "driver-test") != null);
+    const footer = frame.rows()[frame.rows().len - 1].copyText(&buffer);
+    try std.testing.expect(std.mem.indexOf(u8, footer, "ctx 0.0%") != null);
+    try std.testing.expect(std.mem.indexOf(u8, footer, "↑70 ↓30 tokens") != null);
+}
+
+test "loop P4 header shows compaction count" {
+    var fixture = try DriverTestFixture.init("done");
+    defer fixture.deinit();
+
+    const user_entry = try fixture.session.manager.prepareMessageEntry(.{ .user = .{ .content = .{ .string = "hello" }, .timestamp = 0 } }, "2026-07-07T00:00:00Z");
+    const first_kept_entry_id = fixture.session.manager.commitPreparedEntry(user_entry);
+    const compaction_entry = try fixture.session.manager.prepareCompactionEntry("summary", first_kept_entry_id, 100, "2026-07-07T00:00:01Z");
+    _ = fixture.session.manager.commitPreparedEntry(compaction_entry);
+
+    const frame = try fixture.owner_loop.composeFrame(80, 6);
+    var buffer: [160]u8 = undefined;
+    const header = frame.rows()[0].copyText(&buffer);
+    try std.testing.expect(std.mem.indexOf(u8, header, "compacted 1 times") != null);
+}
+
+test "loop P4 restore fold renders durable user tool and assistant transcript" {
+    var fixture = try DriverTestFixture.init("done");
+    defer fixture.deinit();
+
+    const user_entry = try fixture.session.manager.prepareMessageEntry(.{ .user = .{ .content = .{ .string = "Run pwd" }, .timestamp = 0 } }, "2026-07-07T00:00:00Z");
+    _ = fixture.session.manager.commitPreparedEntry(user_entry);
+
+    var args_object: std.json.ObjectMap = .empty;
+    defer args_object.deinit(std.testing.allocator);
+    try args_object.put(std.testing.allocator, "command", .{ .string = "pwd" });
+    const call = ai.ToolCall{ .id = "restore-call", .name = "bash", .arguments = .{ .object = args_object } };
+    const tool_content = [_]ai.AssistantContent{.{ .tool_call = call }};
+    const assistant = Loop.syntheticAssistantMessage(&tool_content);
+    const assistant_entry = try fixture.session.manager.prepareMessageEntry(.{ .assistant = assistant }, "2026-07-07T00:00:01Z");
+    _ = fixture.session.manager.commitPreparedEntry(assistant_entry);
+
+    const result_content = [_]ai.ToolResultContent{.{ .text = .{ .text = "/tmp/repo" } }};
+    const tool_entry = try fixture.session.manager.prepareMessageEntry(.{ .tool_result = .{
+        .tool_call_id = "restore-call",
+        .tool_name = "bash",
+        .content = &result_content,
+        .is_error = false,
+        .timestamp = 0,
+    } }, "2026-07-07T00:00:02Z");
+    _ = fixture.session.manager.commitPreparedEntry(tool_entry);
+
+    try fixture.owner_loop.restoreSessionFold();
+    const frame = try fixture.owner_loop.composeFrame(80, 12);
+    var buffer: [128]u8 = undefined;
+    try std.testing.expectEqualStrings("Run pwd", frame.rows()[1].copyText(&buffer));
+    try std.testing.expectEqualStrings("[done] $ pwd", frame.rows()[2].copyText(&buffer));
+    try std.testing.expectEqualStrings("/tmp/repo", frame.rows()[3].copyText(&buffer));
+}
+
+test "loop P4 file completion popup accepts selected candidate" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "main.zig", .data = "" });
+
+    var loop = try Loop.init(std.testing.allocator, null);
+    defer loop.deinit();
+    loop.file_index = try coding_agent.file_completion.Index.build(std.testing.allocator, tmp.dir);
+
+    try loop.dispatch(.{ .insert = "@ma" });
+    try std.testing.expect(loop.completion.active);
+    try loop.dispatch(.{ .key_editor = .tab });
+    try std.testing.expectEqualStrings("@main.zig", loop.editor.text());
+}
+
+test "loop P4 model picker applies faux model through services" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo/.zi");
+    var environ = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ.deinit();
+    try environ.put("ZI_ENABLE_FAUX_PROVIDER", "1");
+
+    var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
+    var services = try coding_agent.runtime_services.RuntimeServices.init(std.testing.allocator, .{
+        .cwd = "repo",
+        .agent_dir = "agent",
+        .dir = tmp.dir,
+        .environ = &environ,
+        .task_runtime = task_runtime,
+    });
+    defer services.deinit();
+
+    const stamp = coding_agent.session_manager.SessionStamp.now(services.io);
+    var session = try coding_agent.session_bootstrap.openSession(std.testing.allocator, &services, stamp.date(), .{ .create = .{ .session_id = "picker-test", .timestamp = stamp.timestamp() } }, .{});
+    defer {
+        session.requestShutdown();
+        session.deinit();
+    }
+    var wake: runtime.WakeEvent = .init;
+    var loop = try Loop.init(std.testing.allocator, null);
+    defer loop.deinit();
+    try loop.bindServices(&services);
+    loop.bindSession(&session, services.io, &wake);
+
+    try loop.dispatch(.{ .insert = "/model" });
+    try loop.dispatch(.submit);
+    try std.testing.expect(loop.picker.active);
+    try std.testing.expectEqual(PickerKind.model, loop.picker.kind);
+    try loop.dispatch(.cancel);
+    try std.testing.expect(!loop.picker.active);
+    try std.testing.expectEqualStrings("/model", loop.editor.text());
+    try loop.dispatch(.submit);
+    try std.testing.expect(loop.picker.active);
+    try loop.dispatch(.submit);
+    try std.testing.expectEqualStrings(ai.faux.default_model_id, session.agent.state.model.id);
+}
+
+test "loop P4 settings thinking visibility persists through services" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo/.zi");
+    var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
+    var services = try coding_agent.runtime_services.RuntimeServices.init(std.testing.allocator, .{
+        .cwd = "repo",
+        .agent_dir = "agent",
+        .dir = tmp.dir,
+        .task_runtime = task_runtime,
+    });
+    defer services.deinit();
+
+    const stamp = coding_agent.session_manager.SessionStamp.now(services.io);
+    var session = try coding_agent.session_bootstrap.openSession(std.testing.allocator, &services, stamp.date(), .{ .create = .{ .session_id = "settings-test", .timestamp = stamp.timestamp() } }, .{});
+    defer {
+        session.requestShutdown();
+        session.deinit();
+    }
+    var wake: runtime.WakeEvent = .init;
+    var loop = try Loop.init(std.testing.allocator, null);
+    defer loop.deinit();
+    try loop.bindServices(&services);
+    loop.bindSession(&session, services.io, &wake);
+
+    try loop.dispatch(.{ .insert = "/settings thinking:shown" });
+    try loop.dispatch(.submit);
+    try std.testing.expect(!session.hide_thinking);
+    try std.testing.expect(!loop.layout_epoch.hide_thinking);
+    try std.testing.expectEqual(false, services.settings_manager.current().global.loaded.value.hide_thinking_block.?);
 }
 
 const DriverTestFixture = struct {

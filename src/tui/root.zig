@@ -1,6 +1,5 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const app_info = @import("../app_info.zig");
 const coding_agent = @import("../coding_agent/root.zig");
 const paths_mod = @import("../coding_agent/paths.zig");
 const runtime = @import("../runtime/root.zig");
@@ -201,6 +200,7 @@ pub const Runner = struct {
         try self.expireLoneEscapeIfDue(now_ns);
         try self.loop.pumpDriver(now_ns);
         try self.loop.tick(now_ns);
+        if (self.loop.takePendingTitleUpdate()) try terminal.setTitle(self.loop.terminalTitle());
         const had_input = self.loop.trace.input_actions != input_actions_before;
         var render_width = width;
         var render_height = height;
@@ -232,20 +232,31 @@ pub fn run(process: runtime.Process, options: Options) !void {
     const agent_dir = try paths_mod.resolveGlobalAgentDirFromEnv(process.gpa, process.environ);
     defer process.gpa.free(agent_dir);
 
+    const cwd = try std.process.currentPathAlloc(process.io, process.gpa);
+    defer process.gpa.free(cwd);
+
     var services = try coding_agent.runtime_services.RuntimeServices.init(process.gpa, .{
-        .cwd = ".",
+        .cwd = cwd,
         .agent_dir = agent_dir,
         .environ = process.environ,
         .task_runtime = task_runtime,
     });
     defer services.deinit();
-
     const stamp = coding_agent.session_manager.SessionStamp.now(services.io);
     var session = try coding_agent.session_bootstrap.openSession(process.gpa, &services, stamp.date(), options.open, .{});
 
     var runner = try Runner.init(process.gpa, options);
     defer runner.deinit();
+    try runner.loop.bindServices(&services);
+    var wake: runtime.WakeEvent = .init;
+    runner.loop.bindSession(&session, services.io, &wake);
+    defer shutdownSession(&session, &runner.loop, services.io, &wake);
     _ = try session.agent.subscribe(.{ .context = &runner.loop.transcript, .call_fn = Transcript.applyListener });
+    try runner.loop.restoreSessionFold();
+    if (options.resume_picker) {
+        try runner.loop.dispatch(.{ .insert = "/resume" });
+        try runner.loop.dispatch(.submit);
+    }
     if (process.env("ZI_TUI_SYNTHETIC_ITEMS")) |value| {
         const count = std.fmt.parseInt(usize, value, 10) catch 0;
         try runner.loop.seedSyntheticItems(count);
@@ -261,12 +272,9 @@ pub fn run(process: runtime.Process, options: Options) !void {
     try terminal.init(process.gpa, services.io, process.environ);
     errdefer terminal.deinit();
     try terminal.setup();
-    try terminal.setTitle("zi - " ++ app_info.version);
+    try terminal.setTitle(runner.loop.terminalTitle());
 
     var pump: InputPump = .{};
-    var wake: runtime.WakeEvent = .init;
-    runner.loop.bindSession(&session, services.io, &wake);
-    defer shutdownSession(&session, &runner.loop, services.io, &wake);
     defer terminal.deinit();
     try pump.startTerminal(services.io, &terminal, &wake);
     defer pump.join();

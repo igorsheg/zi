@@ -598,11 +598,19 @@ fn runtimeSessionsDir(
         try paths_mod.resolveGlobalAgentDirFromEnv(allocator, options.environ);
     defer if (options.agent_dir_override == null) allocator.free(resolved_agent_dir);
 
-    const resolved_cwd = if (std.mem.eql(u8, options.cwd, "."))
-        try options.dir.realPathFileAlloc(io, options.cwd, allocator)
-    else
-        try allocator.dupe(u8, options.cwd);
-    defer allocator.free(resolved_cwd);
+    var resolved_cwd_z: ?[:0]u8 = null;
+    var resolved_cwd_owned: ?[]u8 = null;
+    const resolved_cwd = if (std.mem.eql(u8, options.cwd, ".")) blk: {
+        const cwd = try options.dir.realPathFileAlloc(io, options.cwd, allocator);
+        resolved_cwd_z = cwd;
+        break :blk cwd[0..cwd.len];
+    } else blk: {
+        const cwd = try allocator.dupe(u8, options.cwd);
+        resolved_cwd_owned = cwd;
+        break :blk cwd;
+    };
+    defer if (resolved_cwd_z) |cwd| allocator.free(cwd);
+    defer if (resolved_cwd_owned) |cwd| allocator.free(cwd);
 
     const paths: paths_mod.PersistencePaths = .{
         .global_dir = resolved_agent_dir,

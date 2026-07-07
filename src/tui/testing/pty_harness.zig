@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const Loop = @import("../Loop.zig");
+const session_listing = @import("../../coding_agent/session_listing.zig");
 
 pub const max_output_default: usize = 256 * 1024;
 
@@ -583,6 +584,114 @@ test "pty e2e: P3 viewport rebuild and resize storm" {
     const tools_report = try readTrace(std.testing.allocator, tools_trace_abs);
     defer std.testing.allocator.free(tools_report);
     try expectP3ToolRebuildTrace(tools_report);
+}
+
+test "pty e2e: P4 completion model picker resume and new session" {
+    if (!supportsForkPty()) return error.SkipZigTest;
+    const zi_bin = envValue("ZI_PTY_E2E_BIN") orelse return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "repo/.zi");
+    try tmp.dir.createDirPath(std.testing.io, "home");
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "script.md", .data = "p4 faux stream marker\n" });
+
+    const repo_abs = try tmpAbsPath(std.testing.allocator, &tmp, "repo");
+    defer std.testing.allocator.free(repo_abs);
+    const home_abs = try tmpAbsPath(std.testing.allocator, &tmp, "home");
+    defer std.testing.allocator.free(home_abs);
+    const agent_abs = try tmpAbsPath(std.testing.allocator, &tmp, "agent");
+    defer std.testing.allocator.free(agent_abs);
+    const script_abs = try tmpAbsPath(std.testing.allocator, &tmp, "script.md");
+    defer std.testing.allocator.free(script_abs);
+
+    const home_env = try std.fmt.allocPrint(std.testing.allocator, "HOME={s}", .{home_abs});
+    defer std.testing.allocator.free(home_env);
+    const agent_env = try std.fmt.allocPrint(std.testing.allocator, "ZI_CODING_AGENT_DIR={s}", .{agent_abs});
+    defer std.testing.allocator.free(agent_env);
+    const script_env = try std.fmt.allocPrint(std.testing.allocator, "ZI_FAUX_SCRIPT={s}", .{script_abs});
+    defer std.testing.allocator.free(script_env);
+
+    const env = [_][]const u8{
+        "TERM=xterm-256color",
+        "NO_COLOR=1",
+        "ZI_ENABLE_FAUX_PROVIDER=1",
+        "ZI_FAUX_DELAY_MS=0",
+        home_env,
+        agent_env,
+        script_env,
+    };
+
+    var first = try runScripted(std.testing.allocator, .{
+        .argv = &.{ zi_bin, "first prompt" },
+        .env = &env,
+        .cwd = repo_abs,
+        .rows = 24,
+        .cols = 100,
+        .timeout_ms = 8_000,
+        .max_output_bytes = 512 * 1024,
+    }, &.{
+        .{ .after_ms = 500, .bytes = "\r" },
+        .{ .after_ms = 1_800, .bytes = "\x03" },
+        .{ .after_ms = 2_000, .bytes = "\x03" },
+    });
+    defer first.deinit(std.testing.allocator);
+    if (first.timed_out) {
+        std.debug.print("pty P4 first run timed out\n--- output ---\n{s}\n--- end output ---\n", .{first.output});
+        return error.TestUnexpectedResult;
+    }
+    try std.testing.expect(exitedZero(first.status));
+    try expectContains(first.output, "marker");
+
+    var sessions = try session_listing.listRuntimeSessions(std.testing.allocator, std.testing.io, .{
+        .cwd = repo_abs,
+        .agent_dir_override = agent_abs,
+        .dir = .cwd(),
+    });
+    defer sessions.deinit(std.testing.allocator);
+    try std.testing.expect(sessions.file_names.len > 0);
+    const resume_command = try std.fmt.allocPrint(std.testing.allocator, "/resume {s}\r", .{sessions.file_names[0]});
+    defer std.testing.allocator.free(resume_command);
+    var second = try runScripted(std.testing.allocator, .{
+        .argv = &.{zi_bin},
+        .env = &env,
+        .cwd = repo_abs,
+        .rows = 24,
+        .cols = 100,
+        .timeout_ms = 12_000,
+        .max_output_bytes = 512 * 1024,
+    }, &.{
+        .{ .after_ms = 500, .bytes = "/help\r" },
+        .{ .after_ms = 1_300, .bytes = "/model\r" },
+        .{ .after_ms = 1_800, .bytes = "\r" },
+        .{ .after_ms = 2_300, .bytes = resume_command },
+        .{ .after_ms = 3_300, .bytes = "/new\r" },
+        .{ .after_ms = 4_100, .bytes = "new session prompt\r" },
+        .{ .after_ms = 6_000, .bytes = "\x03" },
+        .{ .after_ms = 6_200, .bytes = "\x03" },
+    });
+    defer second.deinit(std.testing.allocator);
+    if (second.timed_out) {
+        std.debug.print("pty P4 second run timed out\n--- output ---\n{s}\n--- end output ---\n", .{second.output});
+        return error.TestUnexpectedResult;
+    }
+    try std.testing.expect(exitedZero(second.status));
+    try std.testing.expect(second.termios_restored != false);
+    var summaries_after = try session_listing.listRuntimeSessionSummaries(std.testing.allocator, std.testing.io, .{
+        .cwd = repo_abs,
+        .agent_dir_override = agent_abs,
+        .dir = .cwd(),
+    });
+    defer summaries_after.deinit(std.testing.allocator);
+    var found_new_prompt = false;
+    for (summaries_after.items) |summary| {
+        if (std.mem.indexOf(u8, summary.title, "new session prompt") != null) {
+            found_new_prompt = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_new_prompt);
 }
 
 test "pty harness runs a simple child and captures output" {

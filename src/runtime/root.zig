@@ -3,6 +3,7 @@ const async_runtime = @import("Runtime.zig");
 
 pub const Process = @import("Process.zig").Process;
 pub const Runtime = async_runtime.Runtime;
+pub const Task = async_runtime.Task;
 pub const Mutex = async_runtime.Mutex;
 pub const Duration = async_runtime.Duration;
 pub const Cancelable = async_runtime.Cancelable;

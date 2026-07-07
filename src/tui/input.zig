@@ -60,6 +60,7 @@ pub fn fromKey(key: vaxis.Key) Action {
     if (key.matches(vaxis.Key.page_down, .{})) return .page_down;
 
     if (key.codepoint == 0x03) return .clear_or_quit;
+    if (key.codepoint == 0x09) return .{ .key_editor = .tab };
     if (key.codepoint == 0x04) return .quit_eof;
     if (key.codepoint == 0x15) return .{ .key_editor = .kill_to_start };
     if (key.codepoint == 0x0b) return .{ .key_editor = .kill_to_end };
