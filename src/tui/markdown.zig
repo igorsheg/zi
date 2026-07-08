@@ -164,7 +164,7 @@ test "markdown keeps text when inline spans exceed line capacity" {
     try renderInline(&line, "a **b** c **d** e **f** g **h** i **j** k **l** m", screen.styles.normal);
     try std.testing.expect(line.spans().len <= screen.span_capacity);
     var buffer: [128]u8 = undefined;
-    try std.testing.expectEqualStrings("a b c d e f g h i j k **l** m", line.copyText(&buffer));
+    try std.testing.expectEqualStrings("a b c d e f g h i j k l m", line.copyText(&buffer));
 }
 test {
     std.testing.refAllDecls(@This());

@@ -101,11 +101,21 @@ pub fn runScripted(allocator: std.mem.Allocator, options: RunOptions, actions: [
     }
 
     if (timed_out) {
-        const kill_started = nowNs();
-        while (elapsedMs(kill_started) < 500) {
+        const term_started = nowNs();
+        while (elapsedMs(term_started) < 500) {
             const waited = std.c.waitpid(child, &status, std.c.W.NOHANG);
-            if (waited == child) break;
+            if (waited == child) {
+                child_done = true;
+                break;
+            }
             sleepMs(10);
+        }
+        if (!child_done) {
+            _ = std.c.kill(child, std.c.SIG.KILL);
+            while (true) {
+                const waited = std.c.waitpid(child, &status, 0);
+                if (waited == child or waited < 0) break;
+            }
         }
     }
 
@@ -580,10 +590,64 @@ test "pty e2e: P3 viewport rebuild and resize storm" {
     }
     try std.testing.expect(exitedZero(tools_result.status));
     try std.testing.expect(tools_result.termios_restored != false);
-    try expectContains(tools_result.output, "[done] bash");
+    try expectContains(tools_result.output, "$");
+    try expectContains(tools_result.output, "╭───");
+    try expectContains(tools_result.output, "line 6");
     const tools_report = try readTrace(std.testing.allocator, tools_trace_abs);
     defer std.testing.allocator.free(tools_report);
     try expectP3ToolRebuildTrace(tools_report);
+}
+
+test "pty e2e: streamed write args render before result" {
+    if (!supportsForkPty()) return error.SkipZigTest;
+    const zi_bin = envValue("ZI_PTY_E2E_BIN") orelse return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "repo/.zi");
+    try tmp.dir.createDirPath(std.testing.io, "home");
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+
+    const repo_abs = try tmpAbsPath(std.testing.allocator, &tmp, "repo");
+    defer std.testing.allocator.free(repo_abs);
+    const home_abs = try tmpAbsPath(std.testing.allocator, &tmp, "home");
+    defer std.testing.allocator.free(home_abs);
+    const agent_abs = try tmpAbsPath(std.testing.allocator, &tmp, "agent");
+    defer std.testing.allocator.free(agent_abs);
+
+    const home_env = try std.fmt.allocPrint(std.testing.allocator, "HOME={s}", .{home_abs});
+    defer std.testing.allocator.free(home_env);
+    const agent_env = try std.fmt.allocPrint(std.testing.allocator, "ZI_CODING_AGENT_DIR={s}", .{agent_abs});
+    defer std.testing.allocator.free(agent_env);
+    const env = [_][]const u8{
+        "TERM=xterm-256color",
+        "NO_COLOR=1",
+        "ZI_TUI_SYNTHETIC_WRITE_ARGS=1",
+        home_env,
+        agent_env,
+    };
+
+    var result = try runScripted(std.testing.allocator, .{
+        .argv = &.{zi_bin},
+        .env = &env,
+        .cwd = repo_abs,
+        .rows = 20,
+        .cols = 100,
+        .timeout_ms = 5_000,
+        .max_output_bytes = 256 * 1024,
+    }, &.{
+        .{ .after_ms = 500, .bytes = "\x03" },
+        .{ .after_ms = 700, .bytes = "\x03" },
+    });
+    defer result.deinit(std.testing.allocator);
+    if (result.timed_out) {
+        std.debug.print("pty streamed write args e2e timed out\n--- output ---\n{s}\n--- end output ---\n", .{result.output});
+        return error.TestUnexpectedResult;
+    }
+    try std.testing.expect(exitedZero(result.status));
+    try std.testing.expect(result.termios_restored != false);
+    try expectContains(result.output, "src/synthetic-write.zig");
+    try expectContains(result.output, "streamed arg line 2");
 }
 
 test "pty e2e: P4 completion model picker resume and new session" {
@@ -643,6 +707,7 @@ test "pty e2e: P4 completion model picker resume and new session" {
     }
     try std.testing.expect(exitedZero(first.status));
     try expectContains(first.output, "marker");
+    try expectContains(first.output, "ctx");
 
     var sessions = try session_listing.listRuntimeSessions(std.testing.allocator, std.testing.io, .{
         .cwd = repo_abs,
@@ -678,6 +743,7 @@ test "pty e2e: P4 completion model picker resume and new session" {
     }
     try std.testing.expect(exitedZero(second.status));
     try std.testing.expect(second.termios_restored != false);
+    try expectContains(second.output, "› ");
     var summaries_after = try session_listing.listRuntimeSessionSummaries(std.testing.allocator, std.testing.io, .{
         .cwd = repo_abs,
         .agent_dir_override = agent_abs,

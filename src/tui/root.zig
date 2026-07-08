@@ -12,6 +12,7 @@ pub const InputPump = InputPumpMod.InputPump;
 pub const Terminal = @import("Terminal.zig");
 pub const blocks = @import("blocks.zig");
 pub const chrome = @import("chrome.zig");
+pub const glyphs = @import("glyphs.zig");
 pub const input = @import("input.zig");
 pub const layout = @import("layout.zig");
 pub const markdown = @import("markdown.zig");
@@ -257,6 +258,7 @@ pub fn run(process: runtime.Process, options: Options) !void {
         const count = std.fmt.parseInt(usize, value, 10) catch 0;
         try runner.loop.seedSyntheticTools(services.io, count);
     }
+    if (process.env("ZI_TUI_SYNTHETIC_WRITE_ARGS") != null) try runner.loop.seedSyntheticWriteArgs(services.io);
     if (process.env("ZI_TUI_SYNTHETIC_FLOOD") != null) runner.loop.enableSyntheticFlood(FrameLoop.nowNs(services.io));
     defer writeTraceIfRequested(process, &runner.loop.trace) catch {};
 

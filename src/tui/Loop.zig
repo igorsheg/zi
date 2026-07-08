@@ -13,6 +13,7 @@ const screen = @import("screen.zig");
 const theme = @import("theme.zig");
 const trace_mod = @import("trace.zig");
 const Transcript = @import("Transcript.zig");
+const tui_blocks = @import("blocks.zig");
 
 pub const SubmittedPrompt = struct {
     buffer: [Editor.capacity]u8 = undefined,
@@ -42,15 +43,14 @@ pub const synthetic_flood_duration_ns: u64 = 30 * std.time.ns_per_s;
 pub const synthetic_flood_tool_body_bytes: usize = 4 * 1024 * 1024;
 const synthetic_flood_tool_emit_ns: u64 = synthetic_flood_duration_ns / 2;
 const viewport_hint_buffer_len = 64;
-const completion_popup_rows_max: usize = 8;
+const completion_popup_rows_max: usize = chrome.popup_rows_max;
 const completion_candidates_max: usize = 64;
 const completion_text_bytes_max: usize = 256;
 const picker_rows_max: usize = 128;
 const picker_filter_bytes_max: usize = 128;
 const picker_visible_rows_max: usize = 8;
 const title_buffer_len: usize = 256;
-const footer_buffer_len: usize = 256;
-const header_buffer_len: usize = 256;
+const composer_label_buffer_len: usize = 256;
 
 pub const Scratch = struct {
     buffer: [scratch_capacity]u8 = undefined,
@@ -578,9 +578,8 @@ pub const Loop = struct {
     queue_buffers: [4][256]u8 = undefined,
     queue_lines: [4][]const u8 = undefined,
     status_buffer: [256]u8 = undefined,
-    header_buffer: [header_buffer_len]u8 = undefined,
-    footer_left_buffer: [footer_buffer_len]u8 = undefined,
-    footer_right_buffer: [footer_buffer_len]u8 = undefined,
+    composer_left_buffer: [composer_label_buffer_len]u8 = undefined,
+    composer_right_buffer: [composer_label_buffer_len]u8 = undefined,
     terminal_title_buffer: [title_buffer_len]u8 = undefined,
     pending_title_update: bool = false,
     services: ?*coding_agent.runtime_services.RuntimeServices = null,
@@ -597,13 +596,13 @@ pub const Loop = struct {
     compaction_count: usize = 0,
 
     pub fn init(gpa: std.mem.Allocator, initial_prompt: ?[]const u8) !Loop {
-        var self: Loop = .{ .gpa = gpa, .transcript = Transcript.init(gpa) };
+        var self: Loop = .{ .gpa = gpa, .transcript = Transcript.initWithToolResolver(gpa, .{ .call_fn = resolveCodingAgentToolUi, .result_fn = resolveCodingAgentToolResultUi }) };
         if (initial_prompt) |prompt| try self.editor.insert(prompt);
         return self;
     }
 
     pub fn dummyForShutdown(gpa: std.mem.Allocator) Loop {
-        return .{ .gpa = gpa, .transcript = Transcript.init(gpa) };
+        return .{ .gpa = gpa, .transcript = Transcript.initWithToolResolver(gpa, .{ .call_fn = resolveCodingAgentToolUi, .result_fn = resolveCodingAgentToolResultUi }) };
     }
 
     pub fn deinit(self: *Loop) void {
@@ -693,6 +692,30 @@ pub const Loop = struct {
         self.dirty = true;
     }
 
+    pub fn seedSyntheticWriteArgs(self: *Loop, io: std.Io) !void {
+        try self.transcript.apply(io, .{ .message_start = .{ .message = .{ .assistant = syntheticAssistantMessage(&.{}) } } });
+
+        const args_object: std.json.ObjectMap = .empty;
+        const call = ai.ToolCall{ .id = "seed-write-args", .name = "write", .arguments = .{ .object = args_object } };
+        const content = [_]ai.AssistantContent{.{ .tool_call = call }};
+        const partial = syntheticAssistantMessage(&content);
+        try self.transcript.apply(io, .{ .message_update = .{ .assistant_message_event = .{ .toolcall_start = .{
+            .content_index = 0,
+            .partial = partial,
+        } } } });
+        try self.transcript.apply(io, .{ .message_update = .{ .assistant_message_event = .{ .toolcall_delta = .{
+            .content_index = 0,
+            .delta = "{\"path\":\"src/synthetic-write.zig\",\"content\":\"streamed arg line 1\\n",
+            .partial = partial,
+        } } } });
+        try self.transcript.apply(io, .{ .message_update = .{ .assistant_message_event = .{ .toolcall_delta = .{
+            .content_index = 0,
+            .delta = "streamed arg line 2",
+            .partial = partial,
+        } } } });
+        self.dirty = true;
+    }
+
     pub fn recordInputBytes(self: *Loop, count: usize) void {
         self.frame_input_bytes += count;
     }
@@ -754,23 +777,25 @@ pub const Loop = struct {
         if (rebuilt) self.clampViewportAfterRebuild();
 
         const queue_lines = self.collectQueueLines();
-        const popup_view = self.popupView();
-        const picker_view = self.pickerView();
-        const popup_rows = if (popup_view) |popup| popup.rows.len else 0;
+        const status = self.statusText();
         self.updateViewportHint();
-        var transcript_rows = chrome.transcriptRowCapacityWithChrome(&self.editor, picker_view != null, queue_lines.len, self.viewport_hint.len, popup_rows, width, height);
+        const picker_view = self.pickerView(height);
+        var popup_view = self.popupView(if (picker_view == null) chrome.popupCandidateCapacity(&self.editor, queue_lines.len, self.viewport_hint.len, status.len > 0, width, height) else 0);
+        var popup_rows = if (popup_view) |popup| popup.rows.len else 0;
+        var transcript_rows = chrome.transcriptRowCapacityWithChrome(&self.editor, picker_view != null, queue_lines.len, self.viewport_hint.len, popup_rows, status.len > 0, width, height);
         self.applyPendingViewportMotion(transcript_rows);
         self.updateViewportHint();
-        transcript_rows = chrome.transcriptRowCapacityWithChrome(&self.editor, picker_view != null, queue_lines.len, self.viewport_hint.len, popup_rows, width, height);
+        popup_view = self.popupView(if (picker_view == null) chrome.popupCandidateCapacity(&self.editor, queue_lines.len, self.viewport_hint.len, status.len > 0, width, height) else 0);
+        popup_rows = if (popup_view) |popup| popup.rows.len else 0;
+        transcript_rows = chrome.transcriptRowCapacityWithChrome(&self.editor, picker_view != null, queue_lines.len, self.viewport_hint.len, popup_rows, status.len > 0, width, height);
         const transcript_lines = self.collectTranscriptLines(transcript_rows);
         self.last_transcript_rows = transcript_rows;
 
         return chrome.compose(.{
-            .header = self.headerText(),
-            .status = self.statusText(),
-            .footer_left = self.footerLeftText(),
-            .footer_right = self.footerRightText(),
-            .footer_right_style = self.footerRightStyle(),
+            .status = status,
+            .composer_top_left = self.composerLeftText(),
+            .composer_top_right = self.composerRightText(),
+            .composer_top_right_style = self.composerRightStyle(),
             .scratch_text = self.scratch.text(),
             .transcript_lines = transcript_lines,
             .queue_lines = queue_lines,
@@ -844,7 +869,7 @@ pub const Loop = struct {
                 }
             }
         }
-        if (self.transcript.markRunningToolsDirty()) self.dirty = true;
+        if (self.transcript.markRunningToolsDirty(now_ns)) self.dirty = true;
     }
 
     pub fn pumpDriver(self: *Loop, now_ns: u64) !void {
@@ -892,7 +917,7 @@ pub const Loop = struct {
         const visible_rows = @min(rows, self.transcript_line_buffer.len);
         if (visible_rows == 0 or self.totalTranscriptLines() == 0) return &.{};
 
-        var absolute = self.viewportStart(visible_rows);
+        var absolute = self.skipLeadingSeparator(self.viewportStart(visible_rows), visible_rows);
         var count: usize = 0;
         while (count < visible_rows and absolute < self.totalTranscriptLines()) : (absolute += 1) {
             const ref = self.lineRefAt(absolute) orelse break;
@@ -901,6 +926,19 @@ pub const Loop = struct {
             count += 1;
         }
         return self.transcript_line_buffer[0..count];
+    }
+
+    fn skipLeadingSeparator(self: *const Loop, start: usize, _: usize) usize {
+        var absolute = start;
+        const total = self.totalTranscriptLines();
+        while (absolute + 1 < total) {
+            const ref = self.lineRefAt(absolute) orelse break;
+            const item = self.transcript.items.items[ref.item_index];
+            const line = item.lines[ref.line_in_item];
+            if (!isSeparatorLine(line)) break;
+            absolute += 1;
+        }
+        return absolute;
     }
 
     fn totalTranscriptLines(self: *const Loop) usize {
@@ -938,7 +976,7 @@ pub const Loop = struct {
             if (item.seq != anchor.item_seq) continue;
             const line_count = self.itemLineCount(index);
             if (line_count == 0) return self.line_prefix[index];
-            return self.line_prefix[index] + @min(@as(usize, anchor.line_in_item), line_count - 1);
+            return self.line_prefix[index] + self.clampedContentLine(index, @as(usize, anchor.line_in_item));
         }
         return null;
     }
@@ -965,7 +1003,7 @@ pub const Loop = struct {
                         anchor.lines_below_seen = 0;
                         return;
                     }
-                    const clamped_line = @min(@as(usize, anchor.line_in_item), line_count - 1);
+                    const clamped_line = self.clampedContentLine(index, @as(usize, anchor.line_in_item));
                     const changed = clamped_line != @as(usize, anchor.line_in_item);
                     anchor.line_in_item = @intCast(clamped_line);
                     if (reset_seen or changed) anchor.lines_below_seen = self.linesBelow(self.line_prefix[index] + clamped_line);
@@ -974,6 +1012,19 @@ pub const Loop = struct {
                 self.anchorOldestLiveLine();
             },
         }
+    }
+
+    fn clampedContentLine(self: *const Loop, item_index: usize, preferred: usize) usize {
+        const line_count = self.itemLineCount(item_index);
+        if (line_count == 0) return 0;
+        var line_index = @min(preferred, line_count - 1);
+        const item = self.transcript.items.items[item_index];
+        while (line_index > 0 and isSeparatorLine(item.lines[line_index])) line_index -= 1;
+        return line_index;
+    }
+
+    fn isSeparatorLine(line: screen.Line) bool {
+        return line.spans().len == 0 and screen.Style.eql(line.row_style, screen.styles.normal);
     }
 
     fn anchorOldestLiveLine(self: *Loop) void {
@@ -1123,24 +1174,24 @@ pub const Loop = struct {
         };
     }
 
-    fn headerText(self: *Loop) []const u8 {
-        const session = self.session orelse return "zi";
-        const title = self.sessionTitle();
-        if (self.compaction_count > 0) {
+    fn composerRightText(self: *Loop) []const u8 {
+        const session = self.session orelse return "";
+        const usage = session.contextUsage();
+        if (usage.percent_tenths) |tenths| {
             return std.fmt.bufPrint(
-                &self.header_buffer,
-                "zi · {s} · {s} · thinking:{s} · compacted {d} times",
-                .{ title, session.agent.state.model.id, @tagName(session.agent.state.thinking_level), self.compaction_count },
-            ) catch "zi";
+                &self.composer_right_buffer,
+                "ctx {d}.{d}% ↑{d} ↓{d} tokens · {s} · thinking:{s}",
+                .{ tenths / 10, tenths % 10, self.token_input_total, self.token_output_total, session.agent.state.model.id, @tagName(session.agent.state.thinking_level) },
+            ) catch "ctx";
         }
         return std.fmt.bufPrint(
-            &self.header_buffer,
-            "zi · {s} · {s} · thinking:{s}",
-            .{ title, session.agent.state.model.id, @tagName(session.agent.state.thinking_level) },
-        ) catch "zi";
+            &self.composer_right_buffer,
+            "ctx -- ↑{d} ↓{d} tokens · {s} · thinking:{s}",
+            .{ self.token_input_total, self.token_output_total, session.agent.state.model.id, @tagName(session.agent.state.thinking_level) },
+        ) catch "ctx";
     }
 
-    fn footerLeftText(self: *Loop) []const u8 {
+    fn composerLeftText(self: *Loop) []const u8 {
         const cwd = if (self.session) |session| session.manager.header.cwd else ".";
         const home = if (self.services) |services| blk: {
             const environ = services.environ orelse break :blk null;
@@ -1149,32 +1200,15 @@ pub const Loop = struct {
         if (home) |home_dir| {
             if (home_dir.len != 0 and std.mem.eql(u8, cwd, home_dir)) return "~";
             if (home_dir.len != 0 and cwd.len > home_dir.len and std.mem.startsWith(u8, cwd, home_dir) and std.fs.path.isSep(cwd[home_dir.len])) {
-                return std.fmt.bufPrint(&self.footer_left_buffer, "~{s}", .{cwd[home_dir.len..]}) catch cwd;
+                return std.fmt.bufPrint(&self.composer_left_buffer, "~{s}", .{cwd[home_dir.len..]}) catch cwd;
             }
         }
-        return std.fmt.bufPrint(&self.footer_left_buffer, "{s}", .{cwd}) catch cwd;
+        return std.fmt.bufPrint(&self.composer_left_buffer, "{s}", .{cwd}) catch cwd;
     }
 
-    fn footerRightText(self: *Loop) []const u8 {
-        const session = self.session orelse return "";
-        const usage = session.contextUsage();
-        if (usage.percent_tenths) |tenths| {
-            return std.fmt.bufPrint(
-                &self.footer_right_buffer,
-                "ctx {d}.{d}% ↑{d} ↓{d} tokens",
-                .{ tenths / 10, tenths % 10, self.token_input_total, self.token_output_total },
-            ) catch "ctx";
-        }
-        return std.fmt.bufPrint(
-            &self.footer_right_buffer,
-            "ctx -- ↑{d} ↓{d} tokens",
-            .{ self.token_input_total, self.token_output_total },
-        ) catch "ctx";
-    }
-
-    fn footerRightStyle(self: *Loop) screen.Style {
-        const session = self.session orelse return screen.styles.muted;
-        const tenths = session.contextUsage().percent_tenths orelse return screen.styles.muted;
+    fn composerRightStyle(self: *Loop) screen.Style {
+        const session = self.session orelse return screen.styles.composer_slot;
+        const tenths = session.contextUsage().percent_tenths orelse return screen.styles.composer_slot;
         if (tenths > 900) return screen.styles.error_;
         if (tenths >= 700) return screen.styles.warn;
         return screen.styles.ok;
@@ -1211,27 +1245,38 @@ pub const Loop = struct {
         };
     }
 
-    fn popupView(self: *Loop) ?chrome.PopupView {
+    fn popupView(self: *Loop, capacity: usize) ?chrome.PopupView {
         if (!self.completion.active or self.completion.candidate_len == 0 or self.picker.active) return null;
-        const count = @min(self.completion.candidate_len, self.completion_lines.len);
-        for (self.completion.candidates[0..count], 0..) |candidate, index| {
+        const visible_capacity = @min(capacity, self.completion_lines.len);
+        if (visible_capacity == 0) return null;
+        const selected = @min(self.completion.selected, self.completion.candidate_len - 1);
+        const offset = popupVisibleOffset(self.completion.candidate_len, visible_capacity, selected);
+        const count = @min(self.completion.candidate_len - offset, visible_capacity);
+        for (self.completion.candidates[offset..][0..count], 0..) |*candidate, visible_index| {
+            const absolute_index = offset + visible_index;
             var line: screen.Line = .{};
-            line.append(.{ .text = candidate.labelSlice(), .style = if (index == self.completion.selected) screen.styles.accent else screen.styles.normal }) catch {};
+            line.append(.{ .text = candidate.labelSlice(), .style = if (absolute_index == selected) screen.styles.accent else screen.styles.normal }) catch {};
             if (candidate.detailSlice().len > 0) {
                 line.append(.{ .text = "  ", .style = screen.styles.muted }) catch {};
                 line.append(.{ .text = candidate.detailSlice(), .style = screen.styles.muted }) catch {};
             }
-            self.completion_lines[index] = line;
+            self.completion_lines[visible_index] = line;
         }
-        return .{ .rows = self.completion_lines[0..count], .selected = self.completion.selected };
+        return .{ .rows = self.completion_lines[0..count], .selected = selected - offset };
     }
 
-    fn pickerView(self: *Loop) ?chrome.PickerView {
+    fn popupVisibleOffset(total: usize, capacity: usize, selected: usize) usize {
+        if (capacity == 0 or selected < capacity) return 0;
+        return @min(selected - capacity + 1, total -| capacity);
+    }
+
+    fn pickerView(self: *Loop, height: u16) ?chrome.PickerView {
         if (!self.picker.active) return null;
         var visible: [picker_rows_max]usize = undefined;
         const rows = self.filteredPickerRows(&visible);
-        const offset = self.pickerVisibleOffset(rows);
-        const count = @min(rows.len -| offset, self.picker_lines.len);
+        const capacity = @min(chrome.pickerCandidateCapacity(height), self.picker_lines.len);
+        const offset = self.pickerVisibleOffset(rows, capacity);
+        const count = @min(rows.len -| offset, capacity);
         for (rows[offset..][0..count], 0..) |row_index, visible_index| {
             const row = &self.picker.rows[row_index];
             var line: screen.Line = .{};
@@ -1246,23 +1291,24 @@ pub const Loop = struct {
             }
             self.picker_lines[visible_index] = line;
         }
-        return .{ .title = self.picker.titleSlice(), .filter = self.picker.filterSlice(), .rows = self.picker_lines[0..count], .selected = self.pickerSelectedVisibleIndex(rows, offset) };
+        return .{ .title = self.picker.titleSlice(), .filter = self.picker.filterSlice(), .rows = self.picker_lines[0..count], .selected = self.pickerSelectedVisibleIndex(rows, offset, capacity) };
     }
 
-    fn pickerVisibleOffset(self: *Loop, rows: []const usize) usize {
+    fn pickerVisibleOffset(self: *Loop, rows: []const usize, capacity: usize) usize {
+        if (capacity == 0) return 0;
         const selected = self.picker.selected_row orelse return 0;
         var selected_visible: usize = 0;
         for (rows, 0..) |row_index, index| if (row_index == selected) {
             selected_visible = index;
             break;
         };
-        if (selected_visible >= picker_visible_rows_max) return selected_visible - picker_visible_rows_max + 1;
+        if (selected_visible >= capacity) return selected_visible - capacity + 1;
         return 0;
     }
 
-    fn pickerSelectedVisibleIndex(self: *Loop, rows: []const usize, offset: usize) usize {
+    fn pickerSelectedVisibleIndex(self: *Loop, rows: []const usize, offset: usize, capacity: usize) usize {
         const selected = self.picker.selected_row orelse return 0;
-        for (rows[offset..@min(rows.len, offset + picker_visible_rows_max)], 0..) |row_index, index| {
+        for (rows[offset..@min(rows.len, offset + capacity)], 0..) |row_index, index| {
             if (row_index == selected) return index;
         }
         return 0;
@@ -1862,7 +1908,7 @@ pub const Loop = struct {
                     .is_error = tool_result.is_error,
                 } });
             },
-            .custom => {},
+            .custom => |custom| try self.transcript.apply(self.io, .{ .message_start = .{ .message = .{ .custom = custom } } }),
         }
     }
 
@@ -1958,6 +2004,85 @@ fn fuzzyMatch(haystack: []const u8, needle: []const u8) bool {
     return true;
 }
 
+fn resolveCodingAgentToolUi(_: ?*anyopaque, allocator: std.mem.Allocator, name: []const u8, args: Transcript.ToolArgs) anyerror!Transcript.ToolUi {
+    const view = switch (args) {
+        .value => |value| try coding_agent.tool_metadata.callViewForValue(allocator, name, value),
+        .json_prefix => |prefix| try coding_agent.tool_metadata.partialCallView(allocator, name, prefix),
+    };
+    return .{
+        .title = view.title,
+        .compact_title = view.compact_title,
+        .display = mapToolDisplay(view.display),
+        .body_update = mapToolBodyUpdate(view.body_update),
+    };
+}
+
+fn resolveCodingAgentToolResultUi(_: ?*anyopaque, allocator: std.mem.Allocator, name: []const u8, is_error: bool, content: []const ai.ToolResultContent, details: ?std.json.Value) anyerror!Transcript.ToolResultUi {
+    const view = try coding_agent.tool_metadata.resultView(allocator, name, is_error, content, details);
+    return .{ .body = view.output, .footer = view.footer };
+}
+
+fn mapToolDisplay(display: coding_agent.tool_metadata.Display) tui_blocks.ToolDisplay {
+    return .{
+        .presentation = switch (display.presentation) {
+            .generic => .generic,
+            .command => .command,
+            .file => .file,
+            .patch => .patch,
+            .symbols => .symbols,
+        },
+        .body_mode = switch (display.body_mode) {
+            .visible => .visible,
+            .hidden_on_success => .hidden_on_success,
+            .summary_only => .summary_only,
+        },
+        .collapse = .{
+            .mode = switch (display.collapse.mode) {
+                .head => .head,
+                .tail => .tail,
+            },
+            .lines_max = display.collapse.lines_max,
+        },
+        .shows_duration = display.shows_duration,
+        .live_updates = switch (display.live_updates) {
+            .show_tail => .show_tail,
+            .suppress => .suppress,
+        },
+    };
+}
+
+fn mapToolBodyUpdate(update: coding_agent.tool_metadata.BodyUpdate) Transcript.ToolBodyUpdate {
+    return switch (update) {
+        .unchanged => .unchanged,
+        .clear => .clear,
+        .replace => |replace| .{ .replace = .{ .body = replace.body, .footer = replace.footer } },
+    };
+}
+
+fn frameRowContaining(frame: *const screen.Frame, needle: []const u8) ?usize {
+    var buffer: [512]u8 = undefined;
+    for (frame.rows(), 0..) |line, index| {
+        if (std.mem.indexOf(u8, line.copyText(&buffer), needle) != null) return index;
+    }
+    return null;
+}
+
+fn expectFrameContains(frame: *const screen.Frame, needle: []const u8) !void {
+    try std.testing.expect(frameRowContaining(frame, needle) != null);
+}
+
+fn expectFrameNotContains(frame: *const screen.Frame, needle: []const u8) !void {
+    try std.testing.expect(frameRowContaining(frame, needle) == null);
+}
+
+fn expectFrameOrder(frame: *const screen.Frame, first: []const u8, second: []const u8) !void {
+    const first_row = frameRowContaining(frame, first);
+    try std.testing.expect(first_row != null);
+    const second_row = frameRowContaining(frame, second);
+    try std.testing.expect(second_row != null);
+    try std.testing.expect(second_row.? > first_row.?);
+}
+
 test "loop dispatch edits text through editor actions" {
     var loop = try Loop.init(std.testing.allocator, null);
     defer loop.deinit();
@@ -2033,16 +2158,16 @@ test "loop viewport anchors while appended lines arrive" {
 
     var frame = try loop.composeFrame(80, 10);
     var buffer: [64]u8 = undefined;
-    try std.testing.expectEqualStrings("seed item 6", frame.rows()[1].copyText(&buffer));
+    try std.testing.expectEqualStrings(" seed item 7", frame.rows()[0].copyText(&buffer));
 
     try loop.dispatch(.{ .scroll = -3 });
     frame = try loop.composeFrame(80, 10);
-    try std.testing.expectEqualStrings("seed item 3", frame.rows()[1].copyText(&buffer));
+    try std.testing.expectEqualStrings(" seed item 5", frame.rows()[0].copyText(&buffer));
 
     try loop.transcript.appendNotice(.info, "new item");
     frame = try loop.composeFrame(80, 10);
-    try std.testing.expectEqualStrings("seed item 3", frame.rows()[1].copyText(&buffer));
-    try std.testing.expectEqualStrings("↓ 1 new lines", frame.rows()[4].copyText(&buffer));
+    try std.testing.expectEqualStrings(" seed item 5", frame.rows()[0].copyText(&buffer));
+    try expectFrameContains(&frame, "↓ 2 new lines");
 }
 
 test "loop viewport clamps to oldest live item after eviction" {
@@ -2060,7 +2185,7 @@ test "loop viewport clamps to oldest live item after eviction" {
 
     const frame = try loop.composeFrame(80, 8);
     var buffer: [64]u8 = undefined;
-    try std.testing.expectEqualStrings("seed item 10", frame.rows()[1].copyText(&buffer));
+    try std.testing.expectEqualStrings(" seed item 10", frame.rows()[0].copyText(&buffer));
 }
 
 test "loop viewport clamps line within anchored item on width rebuild" {
@@ -2122,12 +2247,18 @@ test "loop omits blank assistant rows for tool-call-only turns" {
     try loop.transcript.apply(std.testing.io, .{ .message_start = .{ .message = .{ .assistant = final_assistant } } });
     try loop.transcript.apply(std.testing.io, .{ .message_end = .{ .message = .{ .assistant = final_assistant } } });
 
-    const frame = try loop.composeFrame(80, 12);
+    const frame = try loop.composeFrame(80, 16);
     var buffer: [128]u8 = undefined;
-    try std.testing.expectEqualStrings("Run tools", frame.rows()[1].copyText(&buffer));
-    try std.testing.expectEqualStrings("[done] $ pwd", frame.rows()[2].copyText(&buffer));
-    try std.testing.expectEqualStrings("/tmp/repo", frame.rows()[3].copyText(&buffer));
-    try std.testing.expectEqualStrings("Done", frame.rows()[4].copyText(&buffer));
+    try std.testing.expectEqualStrings("", frame.rows()[0].copyText(&buffer));
+    try std.testing.expect(std.meta.eql(frame.rows()[0].row_style.bg, screen.styles.panel.bg));
+    try std.testing.expectEqualStrings(" Run tools", frame.rows()[1].copyText(&buffer));
+    try expectFrameContains(&frame, " $ pwd");
+    try expectFrameContains(&frame, " ╭───");
+    try expectFrameContains(&frame, " │ /tmp/repo");
+    try expectFrameContains(&frame, " ╰───");
+    try expectFrameContains(&frame, " Done");
+    try expectFrameOrder(&frame, " Run tools", " $ pwd");
+    try expectFrameOrder(&frame, " $ pwd", " Done");
 }
 
 test "loop thinking relayout preserves anchored item" {
@@ -2149,11 +2280,11 @@ test "loop thinking relayout preserves anchored item" {
 
     var frame = try loop.composeFrame(10, 8);
     var buffer: [64]u8 = undefined;
-    try std.testing.expectEqualStrings("after 2", frame.rows()[1].copyText(&buffer));
+    try std.testing.expectEqualStrings(" after 2", frame.rows()[0].copyText(&buffer));
 
     loop.setHideThinking(false);
     frame = try loop.composeFrame(10, 8);
-    try std.testing.expectEqualStrings("after 2", frame.rows()[1].copyText(&buffer));
+    try std.testing.expectEqualStrings(" after 2", frame.rows()[0].copyText(&buffer));
 }
 
 test "loop collapsed tool body ending newline has no blank before marker" {
@@ -2167,10 +2298,210 @@ test "loop collapsed tool body ending newline has no blank before marker" {
         .is_error = false,
     } });
 
+    const frame = try loop.composeFrame(80, 14);
+    const marker_row = frameRowContaining(&frame, "│ ... (1 earlier lines, ctrl+o to expand)");
+    try std.testing.expect(marker_row != null);
+    try std.testing.expect(marker_row.? + 1 < frame.rows().len);
+    var buffer: [128]u8 = undefined;
+    try std.testing.expectEqualStrings(" │ two", frame.rows()[marker_row.? + 1].copyText(&buffer));
+}
+
+test "loop tool UX shows bash live tail" {
+    var loop = try Loop.init(std.testing.allocator, null);
+    defer loop.deinit();
+
+    var args_object: std.json.ObjectMap = .empty;
+    defer args_object.deinit(std.testing.allocator);
+    try args_object.put(std.testing.allocator, "command", .{ .string = "zig build test" });
+    const args = std.json.Value{ .object = args_object };
+    try loop.transcript.apply(std.testing.io, .{ .tool_execution_start = .{ .tool_call_id = "bash-1", .tool_name = "bash", .args = args } });
+    const update_content = [_]ai.ToolResultContent{.{ .text = .{ .text = "compile\npass" } }};
+    try loop.transcript.apply(std.testing.io, .{ .tool_execution_update = .{ .tool_call_id = "bash-1", .tool_name = "bash", .args = args, .partial_result = .{ .content = &update_content } } });
+
     const frame = try loop.composeFrame(80, 12);
-    var buffer: [64]u8 = undefined;
-    try std.testing.expectEqualStrings("five", frame.rows()[5].copyText(&buffer));
-    try std.testing.expectEqualStrings("… 1 more lines (ctrl+o)", frame.rows()[6].copyText(&buffer));
+    try expectFrameContains(&frame, "$ zig build test");
+    try expectFrameContains(&frame, "│ pass");
+}
+
+test "loop tool UX hides successful read body" {
+    var loop = try Loop.init(std.testing.allocator, null);
+    defer loop.deinit();
+
+    var args_object: std.json.ObjectMap = .empty;
+    defer args_object.deinit(std.testing.allocator);
+    try args_object.put(std.testing.allocator, "path", .{ .string = "src/main.zig" });
+    const args = std.json.Value{ .object = args_object };
+    try loop.transcript.apply(std.testing.io, .{ .tool_execution_start = .{ .tool_call_id = "read-1", .tool_name = "read", .args = args } });
+    const result_content = [_]ai.ToolResultContent{.{ .text = .{ .text = "secret file body" } }};
+    try loop.transcript.apply(std.testing.io, .{ .tool_execution_end = .{ .tool_call_id = "read-1", .tool_name = "read", .result = .{ .content = &result_content }, .is_error = false } });
+
+    const frame = try loop.composeFrame(80, 10);
+    try expectFrameContains(&frame, "read src/main.zig");
+    try expectFrameNotContains(&frame, "secret file body");
+}
+
+test "loop tool UX shows successful read body when expanded" {
+    var loop = try Loop.init(std.testing.allocator, null);
+    defer loop.deinit();
+
+    var args_object: std.json.ObjectMap = .empty;
+    defer args_object.deinit(std.testing.allocator);
+    try args_object.put(std.testing.allocator, "path", .{ .string = "src/main.zig" });
+    const args = std.json.Value{ .object = args_object };
+    try loop.transcript.apply(std.testing.io, .{ .tool_execution_start = .{ .tool_call_id = "read-2", .tool_name = "read", .args = args } });
+
+    var details_object: std.json.ObjectMap = .empty;
+    defer details_object.deinit(std.testing.allocator);
+    try details_object.put(std.testing.allocator, "nextOffset", .{ .integer = 51 });
+    const result_content = [_]ai.ToolResultContent{.{ .text = .{ .text = "[Showing lines 1-50 of 200. Use offset=51 to continue.]" } }};
+    try loop.transcript.apply(std.testing.io, .{ .tool_execution_end = .{
+        .tool_call_id = "read-2",
+        .tool_name = "read",
+        .result = .{ .content = &result_content, .details = .{ .object = details_object } },
+        .is_error = false,
+    } });
+
+    loop.toggleExpanded();
+    const frame = try loop.composeFrame(80, 12);
+    try expectFrameContains(&frame, "read src/main.zig");
+    try expectFrameContains(&frame, "│ [Showing lines 1-50");
+}
+
+test "loop tool UX shows write content preview and preserves it on success" {
+    var loop = try Loop.init(std.testing.allocator, null);
+    defer loop.deinit();
+
+    var args_object: std.json.ObjectMap = .empty;
+    defer args_object.deinit(std.testing.allocator);
+    try args_object.put(std.testing.allocator, "path", .{ .string = "src/tui/glyphs.zig" });
+    try args_object.put(std.testing.allocator, "content", .{ .string = "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\neleven\ntwelve\n" });
+    const args = std.json.Value{ .object = args_object };
+    try loop.transcript.apply(std.testing.io, .{ .tool_execution_start = .{ .tool_call_id = "write-1", .tool_name = "write", .args = args } });
+    const update_content = [_]ai.ToolResultContent{.{ .text = .{ .text = "PRIVATE FILE CONTENT" } }};
+    try loop.transcript.apply(std.testing.io, .{ .tool_execution_update = .{ .tool_call_id = "write-1", .tool_name = "write", .args = args, .partial_result = .{ .content = &update_content } } });
+
+    var frame = try loop.composeFrame(80, 24);
+    try expectFrameContains(&frame, "write src/tui/glyphs.zig");
+    try expectFrameContains(&frame, "│ one");
+    try expectFrameContains(&frame, "│ ten");
+    try expectFrameContains(&frame, "... (2 more lines, ctrl+o to expand)");
+    try expectFrameNotContains(&frame, "eleven");
+    try expectFrameNotContains(&frame, "PRIVATE FILE CONTENT");
+
+    loop.toggleExpanded();
+    frame = try loop.composeFrame(80, 24);
+    try expectFrameContains(&frame, "│ eleven");
+
+    var details_object: std.json.ObjectMap = .empty;
+    defer details_object.deinit(std.testing.allocator);
+    try details_object.put(std.testing.allocator, "bytesWritten", .{ .integer = 20 });
+    const result_content = [_]ai.ToolResultContent{.{ .text = .{ .text = "Successfully wrote 20 bytes to src/tui/glyphs.zig" } }};
+    try loop.transcript.apply(std.testing.io, .{ .tool_execution_end = .{ .tool_call_id = "write-1", .tool_name = "write", .result = .{ .content = &result_content, .details = .{ .object = details_object } }, .is_error = false } });
+    frame = try loop.composeFrame(80, 24);
+    try expectFrameContains(&frame, "│ one");
+    try expectFrameNotContains(&frame, "Successfully wrote 20 bytes");
+}
+
+test "loop tool UX streams write args before execution result" {
+    var loop = try Loop.init(std.testing.allocator, null);
+    defer loop.deinit();
+
+    try loop.transcript.apply(std.testing.io, .{ .message_start = .{ .message = .{ .assistant = Loop.syntheticAssistantMessage(&.{}) } } });
+
+    var args_object: std.json.ObjectMap = .empty;
+    defer args_object.deinit(std.testing.allocator);
+    const call = ai.ToolCall{ .id = "write-stream", .name = "write", .arguments = .{ .object = args_object } };
+    const content = [_]ai.AssistantContent{.{ .tool_call = call }};
+    const partial = Loop.syntheticAssistantMessage(&content);
+    try loop.transcript.apply(std.testing.io, .{ .message_update = .{ .assistant_message_event = .{ .toolcall_start = .{
+        .content_index = 0,
+        .partial = partial,
+    } } } });
+
+    try loop.transcript.apply(std.testing.io, .{ .message_update = .{ .assistant_message_event = .{ .toolcall_delta = .{
+        .content_index = 0,
+        .delta = "{\"path\":\"src/stream.zig\",\"content\":\"one\\n",
+        .partial = partial,
+    } } } });
+    var frame = try loop.composeFrame(80, 16);
+    try expectFrameContains(&frame, "write src/stream.zig");
+    try expectFrameContains(&frame, "│ one");
+    try expectFrameNotContains(&frame, "Successfully wrote");
+
+    try loop.transcript.apply(std.testing.io, .{ .message_update = .{ .assistant_message_event = .{ .toolcall_delta = .{
+        .content_index = 0,
+        .delta = "two",
+        .partial = partial,
+    } } } });
+    frame = try loop.composeFrame(80, 16);
+    try expectFrameContains(&frame, "│ two");
+}
+
+test "loop tool UX suppresses write result content when bytes written is known" {
+    var loop = try Loop.init(std.testing.allocator, null);
+    defer loop.deinit();
+
+    var args_object: std.json.ObjectMap = .empty;
+    defer args_object.deinit(std.testing.allocator);
+    try args_object.put(std.testing.allocator, "path", .{ .string = "src/tui/glyphs.zig" });
+    try args_object.put(std.testing.allocator, "content", .{ .string = "preview" });
+    const args = std.json.Value{ .object = args_object };
+    try loop.transcript.apply(std.testing.io, .{ .tool_execution_start = .{ .tool_call_id = "write-2", .tool_name = "write", .args = args } });
+
+    var details_object: std.json.ObjectMap = .empty;
+    defer details_object.deinit(std.testing.allocator);
+    try details_object.put(std.testing.allocator, "bytesWritten", .{ .integer = 20 });
+    const result_content = [_]ai.ToolResultContent{.{ .text = .{ .text = "PRIVATE FINAL CONTENT" } }};
+    try loop.transcript.apply(std.testing.io, .{ .tool_execution_end = .{
+        .tool_call_id = "write-2",
+        .tool_name = "write",
+        .result = .{ .content = &result_content, .details = .{ .object = details_object } },
+        .is_error = false,
+    } });
+
+    const frame = try loop.composeFrame(80, 12);
+    try expectFrameContains(&frame, "write src/tui/glyphs.zig");
+    try expectFrameContains(&frame, "│ preview");
+    try expectFrameNotContains(&frame, "PRIVATE FINAL CONTENT");
+}
+
+test "loop tool UX renders symbols result visibly" {
+    var loop = try Loop.init(std.testing.allocator, null);
+    defer loop.deinit();
+
+    var args_object: std.json.ObjectMap = .empty;
+    defer args_object.deinit(std.testing.allocator);
+    try args_object.put(std.testing.allocator, "path", .{ .string = "src/tui/Loop.zig" });
+    const args = std.json.Value{ .object = args_object };
+    try loop.transcript.apply(std.testing.io, .{ .tool_execution_start = .{ .tool_call_id = "symbols-1", .tool_name = "symbols", .args = args } });
+    const result_content = [_]ai.ToolResultContent{.{ .text = .{ .text = "750\tfn\tcomposeFrame\n1214\tfn\tpopupView" } }};
+    try loop.transcript.apply(std.testing.io, .{ .tool_execution_end = .{ .tool_call_id = "symbols-1", .tool_name = "symbols", .result = .{ .content = &result_content }, .is_error = false } });
+
+    const frame = try loop.composeFrame(80, 14);
+    try expectFrameContains(&frame, "symbols src/tui/Loop.zig");
+    try expectFrameContains(&frame, "│ 750\tfn\tcomposeFrame");
+}
+
+test "loop tool UX renders edit patch with diff styles" {
+    var loop = try Loop.init(std.testing.allocator, null);
+    defer loop.deinit();
+
+    var args_object: std.json.ObjectMap = .empty;
+    defer args_object.deinit(std.testing.allocator);
+    try args_object.put(std.testing.allocator, "path", .{ .string = "src/tui/chrome.zig" });
+    const args = std.json.Value{ .object = args_object };
+    try loop.transcript.apply(std.testing.io, .{ .tool_execution_start = .{ .tool_call_id = "edit-1", .tool_name = "edit", .args = args } });
+    var details_object: std.json.ObjectMap = .empty;
+    defer details_object.deinit(std.testing.allocator);
+    try details_object.put(std.testing.allocator, "diff", .{ .string = "@@ line 10\n-old\n+new" });
+    const result_content = [_]ai.ToolResultContent{.{ .text = .{ .text = "edited" } }};
+    try loop.transcript.apply(std.testing.io, .{ .tool_execution_end = .{ .tool_call_id = "edit-1", .tool_name = "edit", .result = .{ .content = &result_content, .details = .{ .object = details_object } }, .is_error = false } });
+
+    const frame = try loop.composeFrame(80, 14);
+    try expectFrameContains(&frame, "edit src/tui/chrome.zig");
+    const added_row = frameRowContaining(&frame, "│ +new");
+    try std.testing.expect(added_row != null);
+    try std.testing.expect(std.meta.eql(frame.rows()[added_row.?].spans()[0].style.fg, screen.styles.diff_add.fg));
 }
 
 test "loop render timing honors dirty policy" {
@@ -2253,7 +2584,24 @@ test "loop slash help appends a notice" {
     try std.testing.expect(loop.transcript.items.items[0].kind == .notice);
 }
 
-test "loop P4 header footer cache assistant usage" {
+test "loop picker window follows chrome candidate capacity" {
+    var loop = try Loop.init(std.testing.allocator, null);
+    defer loop.deinit();
+
+    loop.picker.reset(.model, "model", "");
+    loop.picker.appendRow("0", "item0", "", "", null, true);
+    loop.picker.appendRow("1", "item1", "", "", null, true);
+    loop.picker.appendRow("2", "item2", "", "", null, true);
+    loop.picker.appendRow("3", "item3", "", "", null, true);
+    loop.picker.appendRow("4", "item4", "", "", null, true);
+    loop.picker.appendRow("5", "item5", "", "", null, true);
+    loop.picker.selected_row = 5;
+
+    const frame = try loop.composeFrame(80, 10);
+    try expectFrameContains(&frame, "› item5");
+}
+
+test "loop P4 composer chrome caches assistant usage" {
     var fixture = try DriverTestFixture.init("done");
     defer fixture.deinit();
 
@@ -2266,15 +2614,11 @@ test "loop P4 header footer cache assistant usage" {
     _ = fixture.session.manager.commitPreparedEntry(entry);
 
     const frame = try fixture.owner_loop.composeFrame(80, 6);
-    var buffer: [160]u8 = undefined;
-    const header = frame.rows()[0].copyText(&buffer);
-    try std.testing.expect(std.mem.indexOf(u8, header, "driver-test") != null);
-    const footer = frame.rows()[frame.rows().len - 1].copyText(&buffer);
-    try std.testing.expect(std.mem.indexOf(u8, footer, "ctx 0.0%") != null);
-    try std.testing.expect(std.mem.indexOf(u8, footer, "↑70 ↓30 tokens") != null);
+    try expectFrameContains(&frame, "ctx 0.0% ↑70 ↓30 tokens");
+    try expectFrameContains(&frame, fixture.session.agent.state.model.id);
 }
 
-test "loop P4 header shows compaction count" {
+test "loop P4 restore renders compaction summary" {
     var fixture = try DriverTestFixture.init("done");
     defer fixture.deinit();
 
@@ -2283,10 +2627,9 @@ test "loop P4 header shows compaction count" {
     const compaction_entry = try fixture.session.manager.prepareCompactionEntry("summary", first_kept_entry_id, 100, "2026-07-07T00:00:01Z");
     _ = fixture.session.manager.commitPreparedEntry(compaction_entry);
 
+    try fixture.owner_loop.restoreSessionFold();
     const frame = try fixture.owner_loop.composeFrame(80, 6);
-    var buffer: [160]u8 = undefined;
-    const header = frame.rows()[0].copyText(&buffer);
-    try std.testing.expect(std.mem.indexOf(u8, header, "compacted 1 times") != null);
+    try expectFrameContains(&frame, "context compacted: summary");
 }
 
 test "loop P4 restore fold renders durable user tool and assistant transcript" {
@@ -2316,11 +2659,15 @@ test "loop P4 restore fold renders durable user tool and assistant transcript" {
     _ = fixture.session.manager.commitPreparedEntry(tool_entry);
 
     try fixture.owner_loop.restoreSessionFold();
-    const frame = try fixture.owner_loop.composeFrame(80, 12);
+    const frame = try fixture.owner_loop.composeFrame(80, 16);
     var buffer: [128]u8 = undefined;
-    try std.testing.expectEqualStrings("Run pwd", frame.rows()[1].copyText(&buffer));
-    try std.testing.expectEqualStrings("[done] $ pwd", frame.rows()[2].copyText(&buffer));
-    try std.testing.expectEqualStrings("/tmp/repo", frame.rows()[3].copyText(&buffer));
+    try std.testing.expectEqualStrings("", frame.rows()[0].copyText(&buffer));
+    try std.testing.expect(std.meta.eql(frame.rows()[0].row_style.bg, screen.styles.panel.bg));
+    try std.testing.expectEqualStrings(" Run pwd", frame.rows()[1].copyText(&buffer));
+    try expectFrameContains(&frame, " $ pwd");
+    try expectFrameContains(&frame, " ╭───");
+    try expectFrameContains(&frame, " │ /tmp/repo");
+    try expectFrameOrder(&frame, " $ pwd", " │ /tmp/repo");
 }
 
 test "loop P4 file completion popup accepts selected candidate" {
@@ -2336,6 +2683,20 @@ test "loop P4 file completion popup accepts selected candidate" {
     try std.testing.expect(loop.completion.active);
     try loop.dispatch(.{ .key_editor = .tab });
     try std.testing.expectEqualStrings("@main.zig", loop.editor.text());
+}
+
+test "loop completion popup windows selected candidate" {
+    var loop = try Loop.init(std.testing.allocator, null);
+    defer loop.deinit();
+
+    loop.completion.reset(.file);
+    const labels = [_][]const u8{ "item0", "item1", "item2", "item3", "item4", "item5", "item6", "item7", "item8", "item9" };
+    for (labels) |label| loop.completion.append(label, label, "", true);
+    loop.completion.selected = 9;
+
+    const frame = try loop.composeFrame(80, 30);
+    try expectFrameContains(&frame, "› item9");
+    try expectFrameNotContains(&frame, "item0");
 }
 
 test "loop P4 model picker applies faux model through services" {

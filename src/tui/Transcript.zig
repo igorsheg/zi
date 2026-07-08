@@ -3,6 +3,7 @@ const agent_mod = @import("../agent/root.zig");
 const ai = @import("../ai/root.zig");
 const runtime = @import("../runtime/root.zig");
 const blocks = @import("blocks.zig");
+const glyphs = @import("glyphs.zig");
 const layout = @import("layout.zig");
 const screen = @import("screen.zig");
 const theme = @import("theme.zig");
@@ -12,6 +13,10 @@ pub const per_item_text_bytes_max: usize = 256 * 1024;
 pub const transcript_items_max: usize = 2000;
 pub const transcript_bytes_max: usize = 8 * 1024 * 1024;
 const output_truncated_text = "[output truncated]";
+const transcript_padding_x: usize = 1;
+const user_padding_y: usize = 1;
+const item_margin_bottom: usize = 1;
+const padding_spaces = " " ** 16;
 
 pub const Transcript = @This();
 
@@ -23,6 +28,47 @@ total_bytes: usize = 0,
 next_seq: u64 = 0,
 evicted_seqs: u64 = 0,
 run_active: bool = false,
+tool_resolver: ToolResolver = .{},
+
+pub const ToolArgs = union(enum) {
+    value: std.json.Value,
+    json_prefix: []const u8,
+};
+
+pub const ToolBodyUpdate = union(enum) {
+    unchanged,
+    clear,
+    replace: struct {
+        body: []const u8,
+        footer: []const u8 = "",
+    },
+};
+
+pub const ToolUi = struct {
+    title: ?[]const u8 = null,
+    compact_title: ?[]const u8 = null,
+    display: blocks.ToolDisplay = blocks.default_tool_display,
+    body_update: ToolBodyUpdate = .unchanged,
+};
+
+pub const ToolResultUi = struct {
+    body: ?[]const u8 = null,
+    footer: ?[]const u8 = null,
+};
+
+pub const ToolResolver = struct {
+    context: ?*anyopaque = null,
+    call_fn: *const fn (?*anyopaque, std.mem.Allocator, []const u8, ToolArgs) anyerror!ToolUi = defaultToolResolver,
+    result_fn: *const fn (?*anyopaque, std.mem.Allocator, []const u8, bool, []const ai.ToolResultContent, ?std.json.Value) anyerror!ToolResultUi = defaultToolResultResolver,
+
+    fn resolve(self: ToolResolver, allocator: std.mem.Allocator, name: []const u8, args: ToolArgs) !ToolUi {
+        return self.call_fn(self.context, allocator, name, args);
+    }
+
+    fn resolveResult(self: ToolResolver, allocator: std.mem.Allocator, name: []const u8, is_error: bool, content: []const ai.ToolResultContent, details: ?std.json.Value) !ToolResultUi {
+        return self.result_fn(self.context, allocator, name, is_error, content, details);
+    }
+};
 
 pub const PartTag = enum { text, thinking };
 
@@ -79,16 +125,23 @@ pub const Item = struct {
             call_id: []const u8,
             name: []const u8,
             title: []const u8,
+            compact_title: []const u8,
+            display: blocks.ToolDisplay,
             args_preview: std.ArrayList(u8),
+            args_truncated: bool = false,
             status: blocks.Status,
             started_ns: ?u64 = null,
+            elapsed_ms: ?u64 = null,
             duration_ms: ?u64 = null,
             tail: blocks.TailBuffer = .{},
             body: std.ArrayList(u8),
             body_truncated: bool = false,
+            details_present: bool = false,
+            footer: []const u8,
         },
         notice: struct { level: NoticeLevel, text: []const u8 },
         compaction: struct { summary_first_line: []const u8, tokens_before: u64 },
+        custom: struct { title: []const u8, text: []const u8 },
     };
 
     fn allocator(self: *Item) std.mem.Allocator {
@@ -102,6 +155,10 @@ pub const Item = struct {
 
 pub fn init(gpa: std.mem.Allocator) Transcript {
     return .{ .gpa = gpa };
+}
+
+pub fn initWithToolResolver(gpa: std.mem.Allocator, tool_resolver: ToolResolver) Transcript {
+    return .{ .gpa = gpa, .tool_resolver = tool_resolver };
 }
 
 pub fn deinit(self: *Transcript) void {
@@ -168,10 +225,11 @@ pub fn appendCompaction(self: *Transcript, summary: []const u8, tokens_before: u
     try self.enforceCaps();
 }
 
-pub fn markRunningToolsDirty(self: *Transcript) bool {
+pub fn markRunningToolsDirty(self: *Transcript, now_ns: u64) bool {
     var changed = false;
     for (self.live_tools.values()) |item| {
         if (item.kind == .tool and item.kind.tool.status == .running) {
+            if (item.kind.tool.started_ns) |started| item.kind.tool.elapsed_ms = (now_ns -| started) / std.time.ns_per_ms;
             item.dirty = true;
             changed = true;
         }
@@ -190,18 +248,24 @@ pub fn itemLines(self: *Transcript, item: *Item, width: u16, epoch: theme.Layout
     _ = item.layout_arena.reset(.retain_capacity);
     item.lines = &.{};
     const allocator = item.layoutAllocator();
-    item.lines = switch (item.kind) {
-        .user => |*user| try layout.wrapPlain(allocator, user.text.items, width, screen.styles.normal),
-        .assistant => |*assistant| try layoutAssistant(allocator, assistant, width, epoch),
-        .tool => |*tool| try layoutTool(allocator, tool, width, epoch.expanded),
-        .notice => |notice| try layout.wrapPlain(allocator, notice.text, width, noticeStyle(notice.level)),
+    const content_lines = switch (item.kind) {
+        .user => |*user| blk: {
+            const lines = try layout.wrapPlain(allocator, user.text.items, transcriptInnerWidth(width), screen.styles.panel);
+            for (lines) |*line| line.row_style = screen.styles.panel;
+            break :blk lines;
+        },
+        .assistant => |*assistant| try layoutAssistant(allocator, assistant, transcriptInnerWidth(width), epoch),
+        .tool => |*tool| try blocks.layoutTool(allocator, tool, transcriptInnerWidth(width), epoch.expanded),
+        .notice => |notice| try layout.wrapPlain(allocator, notice.text, transcriptInnerWidth(width), noticeStyle(notice.level)),
         .compaction => |compaction| blk: {
             var buffer: [256]u8 = undefined;
             const text = std.fmt.bufPrint(&buffer, "context compacted: {s}", .{compaction.summary_first_line}) catch "context compacted";
             const owned = try allocator.dupe(u8, text);
-            break :blk try layout.wrapPlain(allocator, owned, width, screen.styles.muted);
+            break :blk try layout.wrapPlain(allocator, owned, transcriptInnerWidth(width), screen.styles.muted);
         },
+        .custom => |custom| try layoutCustom(allocator, custom, transcriptInnerWidth(width)),
     };
+    item.lines = try applyItemRhythm(allocator, item.kind, content_lines);
     item.cached_width = width;
     item.cached_epoch = epoch_value;
     item.dirty = false;
@@ -212,17 +276,26 @@ fn layoutAssistant(allocator: std.mem.Allocator, assistant: anytype, width: u16,
     var text: std.Io.Writer.Allocating = .init(allocator);
     errdefer text.deinit();
     var hidden_thinking_shown = false;
+    var wrote_text = false;
+    var wrote_thinking = false;
     for (assistant.parts.items) |part| {
         switch (part) {
-            .text => |value| try text.writer.writeAll(value.items),
+            .text => |value| {
+                if (value.items.len > 0 and hidden_thinking_shown and text.written().len > 0 and text.written()[text.written().len - 1] != '\n') try text.writer.writeAll("\n");
+                if (value.items.len > 0) wrote_text = true;
+                try text.writer.writeAll(value.items);
+            },
             .thinking => |value| {
                 if (epoch.hide_thinking) {
                     if (assistant.streaming and value.items.len > 0 and !hidden_thinking_shown) {
-                        try text.writer.writeAll("Thinking…\n");
+                        try text.writer.writeAll("Thinking...");
                         hidden_thinking_shown = true;
+                        wrote_thinking = true;
                     }
                 } else {
-                    try text.writer.writeAll(value.items);
+                    const visible = trimTrailingNewlines(value.items);
+                    if (visible.len > 0) wrote_thinking = true;
+                    try text.writer.writeAll(visible);
                 }
             },
         }
@@ -233,87 +306,15 @@ fn layoutAssistant(allocator: std.mem.Allocator, assistant: anytype, width: u16,
         if (assistant.error_text) |err| try text.writer.writeAll(err);
     }
     if (text.written().len == 0) return &.{};
-    const style = if (assistant.stop == .ok) screen.styles.normal else screen.styles.error_;
+    const style = if (assistant.stop != .ok) screen.styles.error_ else if (!wrote_text and wrote_thinking) thinkingStyle() else screen.styles.normal;
     var wrap_state: layout.WrapState = .{};
     return layout.wrapMarkdown(allocator, text.written(), width, style, &wrap_state);
 }
 
-fn layoutTool(allocator: std.mem.Allocator, tool: anytype, width: u16, expanded: bool) ![]layout.Line {
-    const style = blocks.statusStyle(tool.status);
-    var out = std.ArrayList(layout.Line).empty;
-    errdefer out.deinit(allocator);
-    try out.ensureTotalCapacity(allocator, 8);
-
-    const title = try toolTitleLine(allocator, tool);
-    try layout.appendPlainLine(allocator, &out, title, width, style);
-
-    if (tool.status == .running and !tool.tail.isEmpty()) {
-        for (0..tool.tail.count) |index| try layout.appendPlainLine(allocator, &out, tool.tail.line(index), width, style);
-    } else if (tool.body.items.len > 0) {
-        if (expanded) {
-            try appendToolBodyLines(allocator, &out, tool.body.items, width, style);
-        } else {
-            const preview = collapsedBodyPreview(tool.body.items);
-            try appendToolBodyLines(allocator, &out, preview.text, width, style);
-            if (preview.more_lines > 0) {
-                const marker = try std.fmt.allocPrint(allocator, "… {d} more lines (ctrl+o)", .{preview.more_lines});
-                try layout.appendPlainLine(allocator, &out, marker, width, style);
-            }
-        }
-        if (tool.body_truncated) try layout.appendPlainLine(allocator, &out, output_truncated_text, width, style);
-    }
-    return out.toOwnedSlice(allocator);
-}
-
-fn toolTitleLine(allocator: std.mem.Allocator, tool: anytype) ![]const u8 {
-    if (tool.status == .running) {
-        return std.fmt.allocPrint(allocator, "[{s}] {s} — {s}", .{ blocks.statusText(tool.status), tool.title, elapsedText(allocator, tool, true) });
-    }
-    if (tool.duration_ms) |_| {
-        return std.fmt.allocPrint(allocator, "[{s}] {s} — {s}", .{ blocks.statusText(tool.status), tool.title, elapsedText(allocator, tool, false) });
-    }
-    return std.fmt.allocPrint(allocator, "[{s}] {s}", .{ blocks.statusText(tool.status), tool.title });
-}
-
-fn appendToolBodyLines(allocator: std.mem.Allocator, out: *std.ArrayList(layout.Line), text: []const u8, width: u16, style: screen.Style) !void {
-    var start: usize = 0;
-    if (text.len == 0) return;
-    while (start < text.len) {
-        const end = std.mem.indexOfScalarPos(u8, text, start, '\n') orelse text.len;
-        try layout.appendPlainLine(allocator, out, text[start..end], width, style);
-        if (end == text.len) break;
-        start = end + 1;
-    }
-}
-
-const BodyPreview = struct { text: []const u8, more_lines: usize };
-
-fn collapsedBodyPreview(text: []const u8) BodyPreview {
-    const byte_limit = blocks.tail_line_count * blocks.tail_line_bytes_max;
-    var lines: usize = 0;
-    var index: usize = 0;
-    while (index < text.len and index < byte_limit) : (index += 1) {
-        if (text[index] == '\n') {
-            lines += 1;
-            if (lines == blocks.tail_line_count) {
-                index += 1;
-                break;
-            }
-        }
-    }
-    const end = agent_mod.utf8Prefix(text, @min(index, text.len)).len;
-    if (end >= text.len) return .{ .text = text, .more_lines = 0 };
-    const remaining = text[end..];
-    var more_lines: usize = if (remaining.len == 0) 0 else 1;
-    for (remaining, 0..) |byte, offset| {
-        if (byte == '\n' and offset + 1 < remaining.len) more_lines += 1;
-    }
-    return .{ .text = text[0..end], .more_lines = more_lines };
-}
-
-fn elapsedText(allocator: std.mem.Allocator, tool: anytype, running: bool) []const u8 {
-    const seconds: u64 = if (tool.duration_ms) |ms| ms / 1000 else 0;
-    return std.fmt.allocPrint(allocator, "{s} {d}s", .{ if (running) "Elapsed" else "Took", seconds }) catch if (running) "Elapsed 0s" else "Took 0s";
+fn thinkingStyle() screen.Style {
+    var style = screen.styles.muted;
+    style.italic = true;
+    return style;
 }
 
 fn noticeStyle(level: NoticeLevel) screen.Style {
@@ -335,7 +336,8 @@ fn applyMessageStart(self: *Transcript, message: agent_mod.AgentMessage) !void {
             self.streaming_item = item;
             try self.appendItem(item);
         },
-        .tool_result, .custom => {},
+        .custom => |custom| try self.appendCustom(custom),
+        .tool_result => {},
     }
 }
 
@@ -361,15 +363,16 @@ fn applyMessageUpdate(self: *Transcript, event: ai.AssistantMessageEvent) !void 
             try self.replaceAssistantPart(part, payload.content);
         },
         .toolcall_start => |payload| {
-            if (toolCallAt(payload.partial, payload.content_index)) |call| _ = try self.ensureToolItem(call.id, call.name, call.arguments);
+            if (toolCallAt(payload.partial, payload.content_index)) |call| _ = try self.ensureToolItem(call.id, call.name, call.arguments, true);
         },
         .toolcall_delta => |payload| {
             const call = toolCallAt(payload.partial, payload.content_index) orelse return;
-            const item = try self.ensureToolItem(call.id, call.name, call.arguments);
+            const item = try self.ensureToolItem(call.id, call.name, call.arguments, true);
             try self.appendToolArgs(item, payload.delta);
+            try self.applyToolArgsPreview(item, call.arguments);
         },
         .toolcall_end => |payload| {
-            const item = try self.ensureToolItem(payload.tool_call.id, payload.tool_call.name, payload.tool_call.arguments);
+            const item = try self.ensureToolItem(payload.tool_call.id, payload.tool_call.name, payload.tool_call.arguments, true);
             try self.setToolTitleFromValue(item, payload.tool_call.arguments);
         },
     }
@@ -394,7 +397,12 @@ fn applyMessageEnd(self: *Transcript, message: agent_mod.AgentMessage) !void {
                 },
                 .error_ => {
                     item.kind.assistant.stop = .errored;
-                    item.kind.assistant.error_text = if (assistant.error_message) |err| try item.allocator().dupe(u8, err) else null;
+                    if (assistant.error_message) |err| {
+                        item.kind.assistant.error_text = try item.allocator().dupe(u8, err);
+                        self.total_bytes += item.kind.assistant.error_text.?.len;
+                    } else {
+                        item.kind.assistant.error_text = null;
+                    }
                     try self.abortLiveTools();
                 },
                 else => item.kind.assistant.stop = .ok,
@@ -406,30 +414,36 @@ fn applyMessageEnd(self: *Transcript, message: agent_mod.AgentMessage) !void {
 }
 
 fn applyToolStart(self: *Transcript, io: std.Io, payload: agent_mod.AgentEvent.ToolExecutionStart) !void {
-    const item = try self.ensureToolItem(payload.tool_call_id, payload.tool_name, payload.args);
+    const item = try self.ensureToolItem(payload.tool_call_id, payload.tool_name, payload.args, true);
     std.debug.assert(item.kind == .tool);
-    item.kind.tool.status = .running;
+    item.kind.tool.status = mergeToolStatus(item.kind.tool.status, .running);
     item.kind.tool.started_ns = nowNs(io);
+    item.kind.tool.elapsed_ms = 0;
     item.dirty = true;
 }
 
 fn applyToolUpdate(self: *Transcript, payload: agent_mod.AgentEvent.ToolExecutionUpdate) !void {
-    const item = try self.ensureToolItem(payload.tool_call_id, payload.tool_name, payload.args);
+    const item = try self.ensureToolItem(payload.tool_call_id, payload.tool_name, payload.args, false);
     std.debug.assert(item.kind == .tool);
     for (payload.partial_result.content) |content| switch (content) {
-        .text => |text| item.kind.tool.tail.update(text.text),
+        .text => |text| if (item.kind.tool.display.live_updates == .show_tail) item.kind.tool.tail.update(text.text),
         .image => {},
     };
     item.dirty = true;
 }
 
 fn applyToolEnd(self: *Transcript, io: std.Io, payload: agent_mod.AgentEvent.ToolExecutionEnd) !void {
-    const item = try self.ensureToolItem(payload.tool_call_id, payload.tool_name, .null);
+    const item = try self.ensureToolItem(payload.tool_call_id, payload.tool_name, .null, false);
     std.debug.assert(item.kind == .tool);
     const tool = &item.kind.tool;
-    tool.status = if (payload.is_error) .failed else .done;
+    const result_status: blocks.Status = if (payload.is_error) .failed else .done;
+    tool.status = mergeToolStatus(tool.status, result_status);
     if (tool.started_ns) |started| tool.duration_ms = (nowNs(io) -| started) / std.time.ns_per_ms;
-    try self.replaceToolBody(item, payload.result.content);
+    tool.elapsed_ms = null;
+    tool.details_present = payload.result.details != null;
+    const result_ui = try self.tool_resolver.resolveResult(item.allocator(), payload.tool_name, payload.is_error, payload.result.content, payload.result.details);
+    if (result_ui.body) |body| try self.replaceToolBody(item, body);
+    if (result_ui.footer) |footer| try self.replaceToolFooter(item, footer);
     _ = self.live_tools.orderedRemove(tool.call_id);
     item.dirty = true;
 }
@@ -479,31 +493,72 @@ fn replaceAssistantPart(self: *Transcript, part: *Part, text: []const u8) !void 
 fn appendToolArgs(self: *Transcript, item: *Item, delta: []const u8) !void {
     std.debug.assert(item.kind == .tool);
     const tool = &item.kind.tool;
-    var truncated = false;
-    try self.appendListBounded(item, &tool.args_preview, delta, blocks.args_preview_bytes_max, &truncated, false);
-    tool.title = try blocks.titleFor(item.allocator(), tool.name, tool.args_preview.items);
-    item.dirty = true;
+    const preview_len = tool.args_preview.items.len;
+    const was_truncated = tool.args_truncated;
+    try self.appendListBounded(item, &tool.args_preview, delta, blocks.args_preview_bytes_max, &tool.args_truncated, false);
+    if (tool.args_preview.items.len == preview_len and tool.args_truncated == was_truncated) return;
+    const ui = try self.tool_resolver.resolve(item.allocator(), tool.name, .{ .json_prefix = tool.args_preview.items });
+    try self.applyToolUi(item, ui);
+}
+
+fn applyToolArgsPreview(self: *Transcript, item: *Item, value: std.json.Value) !void {
+    if (!hasToolArgsPreview(value)) return;
+    try self.setToolTitleFromValue(item, value);
+}
+
+fn hasToolArgsPreview(value: std.json.Value) bool {
+    if (value != .object) return false;
+    return value.object.count() != 0;
 }
 
 fn setToolTitleFromValue(self: *Transcript, item: *Item, value: std.json.Value) !void {
-    _ = self;
     std.debug.assert(item.kind == .tool);
     const tool = &item.kind.tool;
-    tool.title = try blocks.titleForValue(item.allocator(), tool.name, value);
+    const ui = try self.tool_resolver.resolve(item.allocator(), tool.name, .{ .value = value });
+    try self.applyToolUi(item, ui);
+}
+
+fn applyToolUi(self: *Transcript, item: *Item, ui: ToolUi) !void {
+    std.debug.assert(item.kind == .tool);
+    const tool = &item.kind.tool;
+    if (ui.title) |title| tool.title = title;
+    if (ui.compact_title) |compact_title| tool.compact_title = compact_title;
+    tool.display = ui.display;
+    try self.applyToolBodyUpdate(item, ui.body_update);
     item.dirty = true;
 }
 
-fn replaceToolBody(self: *Transcript, item: *Item, content: []const ai.ToolResultContent) !void {
+fn applyToolBodyUpdate(self: *Transcript, item: *Item, update: ToolBodyUpdate) !void {
+    switch (update) {
+        .unchanged => {},
+        .clear => {
+            try self.replaceToolBody(item, "");
+            try self.replaceToolFooter(item, "");
+        },
+        .replace => |replace| {
+            try self.replaceToolBody(item, replace.body);
+            try self.replaceToolFooter(item, replace.footer);
+        },
+    }
+}
+
+fn replaceToolBody(self: *Transcript, item: *Item, body: ?[]const u8) !void {
     std.debug.assert(item.kind == .tool);
     const tool = &item.kind.tool;
     self.total_bytes -|= tool.body.items.len;
     tool.body.clearRetainingCapacity();
-    var writer = std.Io.Writer.Allocating.init(item.allocator());
-    errdefer writer.deinit();
-    var truncated = false;
-    try blocks.appendTextContent(&writer, content, blocks.tool_body_bytes_max, &truncated);
-    try self.appendListBounded(item, &tool.body, writer.written(), blocks.tool_body_bytes_max, &tool.body_truncated, true);
-    tool.body_truncated = tool.body_truncated or truncated;
+    tool.body_truncated = false;
+    const text = body orelse {
+        item.dirty = true;
+        return;
+    };
+    try self.appendListBounded(item, &tool.body, text, blocks.tool_body_bytes_max, &tool.body_truncated, true);
+}
+
+fn replaceToolFooter(_: *Transcript, item: *Item, footer: ?[]const u8) !void {
+    std.debug.assert(item.kind == .tool);
+    item.kind.tool.footer = if (footer) |value| value else "";
+    item.dirty = true;
 }
 
 fn reconcileAssistant(self: *Transcript, item: *Item, assistant_message: ai.AssistantMessage) !void {
@@ -518,10 +573,12 @@ fn reconcileAssistant(self: *Transcript, item: *Item, assistant_message: ai.Assi
             try self.replaceFinalPart(item, part, thinking.thinking);
         },
         .tool_call => |call| {
-            const tool = try self.ensureToolItem(call.id, call.name, call.arguments);
+            self.clearFinalPart(item, index);
+            const tool = try self.ensureToolItem(call.id, call.name, call.arguments, true);
             try self.setToolTitleFromValue(tool, call.arguments);
         },
     };
+    self.truncateFinalParts(item, assistant_message.content.len);
 }
 
 fn ensureFinalPart(self: *Transcript, item: *Item, index: usize, tag: PartTag) !*Part {
@@ -541,6 +598,26 @@ fn ensureFinalPart(self: *Transcript, item: *Item, index: usize, tag: PartTag) !
     return part;
 }
 
+fn clearFinalPart(self: *Transcript, item: *Item, index: usize) void {
+    std.debug.assert(item.kind == .assistant);
+    const assistant = &item.kind.assistant;
+    if (index >= assistant.parts.items.len) return;
+    const part = &assistant.parts.items[index];
+    self.total_bytes -|= part.bytes().len;
+    part.list().clearRetainingCapacity();
+    part.* = .{ .text = .empty };
+    item.dirty = true;
+}
+
+fn truncateFinalParts(self: *Transcript, item: *Item, len: usize) void {
+    std.debug.assert(item.kind == .assistant);
+    const assistant = &item.kind.assistant;
+    if (assistant.parts.items.len <= len) return;
+    for (assistant.parts.items[len..]) |part| self.total_bytes -|= part.bytes().len;
+    assistant.parts.items.len = len;
+    item.dirty = true;
+}
+
 fn replaceFinalPart(self: *Transcript, item: *Item, part: *Part, text: []const u8) !void {
     if (std.mem.eql(u8, part.bytes(), text)) return;
     const assistant = &item.kind.assistant;
@@ -550,19 +627,46 @@ fn replaceFinalPart(self: *Transcript, item: *Item, part: *Part, text: []const u
 }
 
 fn findToolItem(self: *Transcript, call_id: []const u8) ?*Item {
-    for (self.items.items) |item| {
+    var index = self.items.items.len;
+    while (index > 0) {
+        index -= 1;
+        const item = self.items.items[index];
         if (item.kind != .tool) continue;
         if (std.mem.eql(u8, item.kind.tool.call_id, call_id)) return item;
     }
     return null;
 }
-fn ensureToolItem(self: *Transcript, call_id: []const u8, name: []const u8, args: std.json.Value) !*Item {
+
+fn ensureToolItem(self: *Transcript, call_id: []const u8, name: []const u8, args: std.json.Value, create_new_if_terminal: bool) !*Item {
     if (self.live_tools.get(call_id)) |item| return item;
-    if (self.findToolItem(call_id)) |item| return item;
+    if (self.findToolItem(call_id)) |item| {
+        if (!create_new_if_terminal or !isTerminalToolStatus(item.kind.tool.status)) return item;
+    }
     const item = try self.createToolItem(call_id, name, args);
     try self.appendItem(item);
     try self.live_tools.put(self.gpa, item.kind.tool.call_id, item);
     return item;
+}
+
+fn isTerminalToolStatus(status: blocks.Status) bool {
+    return switch (status) {
+        .done, .failed, .aborted => true,
+        .pending, .running => false,
+    };
+}
+
+fn mergeToolStatus(old: blocks.Status, new: blocks.Status) blocks.Status {
+    return switch (old) {
+        .aborted => .aborted,
+        .done, .failed => if (new == .running or new == .pending) old else new,
+        .pending, .running => new,
+    };
+}
+
+fn appendCustom(self: *Transcript, custom: agent_mod.CustomAgentMessage) !void {
+    const item = try self.createCustomItem(custom);
+    try self.appendItem(item);
+    try self.enforceCaps();
 }
 
 fn createUserItem(self: *Transcript, text: []const u8) !*Item {
@@ -575,19 +679,35 @@ fn createAssistantItem(self: *Transcript, streaming: bool) !*Item {
     return self.createItem(.{ .assistant = .{ .parts = .empty, .streaming = streaming } });
 }
 
+fn createCustomItem(self: *Transcript, custom: agent_mod.CustomAgentMessage) !*Item {
+    const item = try self.createItem(.{ .custom = .{ .title = undefined, .text = undefined } });
+    const allocator = item.allocator();
+    item.kind.custom.title = try allocator.dupe(u8, custom.kind);
+    item.kind.custom.text = try jsonValueString(allocator, custom.payload);
+    self.total_bytes += item.kind.custom.title.len + item.kind.custom.text.len;
+    return item;
+}
+
 fn createToolItem(self: *Transcript, call_id: []const u8, name: []const u8, args: std.json.Value) !*Item {
     const item = try self.createItem(.{ .tool = .{
         .call_id = undefined,
         .name = undefined,
         .title = undefined,
+        .compact_title = undefined,
+        .display = blocks.default_tool_display,
         .args_preview = .empty,
-        .status = .pending,
         .body = .empty,
+        .status = .pending,
+        .footer = "",
     } });
     const allocator = item.allocator();
     item.kind.tool.call_id = try allocator.dupe(u8, call_id);
     item.kind.tool.name = try allocator.dupe(u8, name);
-    item.kind.tool.title = try blocks.titleForValue(allocator, name, args);
+    const ui = try self.tool_resolver.resolve(allocator, name, .{ .value = args });
+    item.kind.tool.title = ui.title orelse try allocator.dupe(u8, name);
+    item.kind.tool.compact_title = ui.compact_title orelse "";
+    item.kind.tool.display = ui.display;
+    try self.applyToolBodyUpdate(item, ui.body_update);
     return item;
 }
 
@@ -620,35 +740,42 @@ fn appendListBounded(
     var remaining = text;
     while (remaining.len > 0) {
         if (list.items.len >= max_bytes) {
-            try self.appendTruncationMarker(item, list, truncated, count_total);
+            try self.appendTruncationMarker(item, list, max_bytes, truncated, count_total);
             return;
         }
         const room = max_bytes - list.items.len;
         const chunk_len = @min(room, append_chunk_bytes_max, remaining.len);
         const chunk = agent_mod.utf8Prefix(remaining, chunk_len);
-        if (chunk.len == 0) return;
+        if (chunk.len == 0) {
+            try self.appendTruncationMarker(item, list, max_bytes, truncated, count_total);
+            return;
+        }
         try list.appendSlice(item.allocator(), chunk);
         if (count_total) self.total_bytes += chunk.len;
         remaining = remaining[chunk.len..];
-        if (chunk.len < chunk_len or chunk_len == room) {
-            if (remaining.len > 0) try self.appendTruncationMarker(item, list, truncated, count_total);
+        if (remaining.len == 0) {
+            item.dirty = true;
+            return;
+        }
+        if (chunk_len == room) {
+            try self.appendTruncationMarker(item, list, max_bytes, truncated, count_total);
             return;
         }
     }
     item.dirty = true;
 }
 
-fn appendTruncationMarker(self: *Transcript, item: *Item, list: *std.ArrayList(u8), truncated: *bool, count_total: bool) !void {
+fn appendTruncationMarker(self: *Transcript, item: *Item, list: *std.ArrayList(u8), max_bytes: usize, truncated: *bool, count_total: bool) !void {
     if (truncated.*) return;
     truncated.* = true;
-    const room = per_item_text_bytes_max -| list.items.len;
+    const room = max_bytes -| list.items.len;
     if (list.items.len != 0 and list.items[list.items.len - 1] != '\n' and room > 0) {
         try list.append(item.allocator(), '\n');
         if (count_total) self.total_bytes += 1;
     }
-    const remaining_room = per_item_text_bytes_max -| list.items.len;
+    const remaining_room = max_bytes -| list.items.len;
     item.dirty = true;
-    const chunk = agent_mod.utf8Prefix(output_truncated_text, remaining_room);
+    const chunk = agent_mod.utf8Prefix(blocks.output_truncated_text, remaining_room);
     try list.appendSlice(item.allocator(), chunk);
     if (count_total) self.total_bytes += chunk.len;
 }
@@ -693,9 +820,10 @@ fn itemBytes(item: *const Item) usize {
             if (assistant.error_text) |err| total += err.len;
             break :blk total;
         },
-        .tool => |tool| tool.args_preview.items.len + tool.body.items.len + tool.title.len + tool.call_id.len + tool.name.len,
+        .tool => |tool| tool.body.items.len,
         .notice => |notice| notice.text.len,
         .compaction => |compaction| compaction.summary_first_line.len,
+        .custom => |custom| custom.title.len + custom.text.len,
     };
 }
 
@@ -709,12 +837,145 @@ fn userText(user: ai.UserMessage) []const u8 {
     };
 }
 
+test "transcript user block has panel padding and item margin" {
+    var transcript = Transcript.init(std.testing.allocator);
+    defer transcript.deinit();
+
+    try transcript.apply(std.testing.io, .{ .message_start = .{ .message = .{ .user = .{ .content = .{ .string = "hello" }, .timestamp = 0 } } } });
+    const epoch = theme.LayoutEpoch{ .width = 40, .height = 10 };
+    const lines = try transcript.itemLines(transcript.items.items[0], 40, epoch);
+
+    var buffer: [64]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 4), lines.len);
+    try std.testing.expectEqualStrings("", lines[0].copyText(&buffer));
+    try std.testing.expect(std.meta.eql(lines[0].row_style.bg, screen.styles.panel.bg));
+    try std.testing.expectEqualStrings(" hello", lines[1].copyText(&buffer));
+    try std.testing.expect(std.meta.eql(lines[1].row_style.bg, screen.styles.panel.bg));
+    try std.testing.expectEqualStrings("", lines[2].copyText(&buffer));
+    try std.testing.expect(std.meta.eql(lines[2].row_style.bg, screen.styles.panel.bg));
+    try std.testing.expectEqualStrings("", lines[3].copyText(&buffer));
+    try std.testing.expect(screen.Style.eql(lines[3].row_style, screen.styles.normal));
+}
+
+test "transcript visible thinking trims trailing blank rows" {
+    var transcript = Transcript.init(std.testing.allocator);
+    defer transcript.deinit();
+
+    const content = [_]ai.AssistantContent{.{ .thinking = .{ .thinking = "**plan** first\n\n" } }};
+    const assistant = emptyAssistantMessage(&content, .stop);
+    try transcript.apply(std.testing.io, .{ .message_start = .{ .message = .{ .assistant = assistant } } });
+    try transcript.apply(std.testing.io, .{ .message_end = .{ .message = .{ .assistant = assistant } } });
+    const epoch = theme.LayoutEpoch{ .width = 60, .height = 10, .hide_thinking = false };
+    const lines = try transcript.itemLines(transcript.items.items[0], 60, epoch);
+
+    var buffer: [64]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 2), lines.len);
+    try std.testing.expectEqualStrings(" plan first", lines[0].copyText(&buffer));
+    try std.testing.expect(lines[0].spans()[1].style.italic);
+    try std.testing.expectEqualStrings("", lines[1].copyText(&buffer));
+}
+
+test "transcript custom message renders title body and margin" {
+    var transcript = Transcript.init(std.testing.allocator);
+    defer transcript.deinit();
+
+    try transcript.apply(std.testing.io, .{ .message_start = .{ .message = .{ .custom = .{ .kind = "Session Info", .payload = .{ .string = "ok" }, .timestamp = 0 } } } });
+    const epoch = theme.LayoutEpoch{ .width = 40, .height = 10 };
+    const lines = try transcript.itemLines(transcript.items.items[0], 40, epoch);
+
+    var buffer: [64]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 4), lines.len);
+    try std.testing.expectEqualStrings(" Session Info", lines[0].copyText(&buffer));
+    try std.testing.expectEqualStrings("", lines[1].copyText(&buffer));
+    try std.testing.expectEqualStrings(" \"ok\"", lines[2].copyText(&buffer));
+    try std.testing.expectEqualStrings("", lines[3].copyText(&buffer));
+}
+
 fn toolCallAt(message: ai.AssistantMessage, index: usize) ?ai.ToolCall {
     if (index >= message.content.len) return null;
     return switch (message.content[index]) {
         .tool_call => |call| call,
         else => null,
     };
+}
+
+fn transcriptInnerWidth(width: u16) u16 {
+    const padding = transcript_padding_x * 2;
+    return if (width <= padding) 0 else @intCast(@as(usize, width) - padding);
+}
+
+fn applyItemRhythm(allocator: std.mem.Allocator, kind: Item.Kind, content: []layout.Line) ![]layout.Line {
+    if (content.len == 0) return &.{};
+    var out = std.ArrayList(layout.Line).empty;
+    errdefer out.deinit(allocator);
+    const style = itemStyle(kind);
+    const padding_y = itemPaddingY(kind);
+    try out.ensureTotalCapacity(allocator, content.len + padding_y * 2 + item_margin_bottom);
+
+    for (0..padding_y) |_| try out.append(allocator, .{ .row_style = style });
+    for (content) |source| {
+        var line = source;
+        if (line.spans().len > 0) try insetTranscriptLine(&line, lineInsetStyle(kind, line));
+        try out.append(allocator, line);
+    }
+    for (0..padding_y) |_| try out.append(allocator, .{ .row_style = style });
+    for (0..item_margin_bottom) |_| try out.append(allocator, .{});
+    return out.toOwnedSlice(allocator);
+}
+
+fn itemPaddingY(kind: Item.Kind) usize {
+    return switch (kind) {
+        .user => user_padding_y,
+        else => 0,
+    };
+}
+
+fn itemStyle(kind: Item.Kind) screen.Style {
+    return switch (kind) {
+        .user => screen.styles.panel,
+        .assistant => screen.styles.normal,
+        .tool => screen.styles.muted,
+        .notice => |notice| noticeStyle(notice.level),
+        .compaction => screen.styles.muted,
+        .custom => screen.styles.normal,
+    };
+}
+
+fn lineInsetStyle(kind: Item.Kind, line: layout.Line) screen.Style {
+    if (line.spans().len > 0) return line.spans()[0].style;
+    return itemStyle(kind);
+}
+
+fn insetTranscriptLine(line: *layout.Line, style: screen.Style) error{LineFull}!void {
+    if (transcript_padding_x == 0) return;
+    try line.prepend(.{ .text = padding_spaces[0..transcript_padding_x], .style = style });
+}
+
+fn layoutCustom(allocator: std.mem.Allocator, custom: anytype, width: u16) ![]layout.Line {
+    var out = std.ArrayList(layout.Line).empty;
+    errdefer out.deinit(allocator);
+    if (custom.title.len > 0) {
+        try layout.appendPlainLine(allocator, &out, custom.title, width, screen.styles.accent);
+        try out.append(allocator, .{});
+    }
+    var state: layout.WrapState = .{};
+    const body = try layout.wrapMarkdown(allocator, custom.text, width, screen.styles.normal, &state);
+    try out.appendSlice(allocator, body);
+    return out.toOwnedSlice(allocator);
+}
+
+fn trimTrailingNewlines(text: []const u8) []const u8 {
+    var end = text.len;
+    while (end > 0 and (text[end - 1] == '\n' or text[end - 1] == '\r')) : (end -= 1) {}
+    return text[0..end];
+}
+
+fn jsonValueString(allocator: std.mem.Allocator, value: std.json.Value) ![]const u8 {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+    var stringify: std.json.Stringify = .{ .writer = &writer.writer };
+    try stringify.write(value);
+    return writer.toOwnedSlice();
 }
 
 fn firstLine(text: []const u8) []const u8 {
@@ -725,6 +986,18 @@ fn firstLine(text: []const u8) []const u8 {
 fn nowNs(io: std.Io) u64 {
     const raw = std.Io.Timestamp.now(io, .awake).toNanoseconds();
     return if (raw <= 0) 0 else @intCast(raw);
+}
+
+fn defaultToolResolver(_: ?*anyopaque, allocator: std.mem.Allocator, name: []const u8, _: ToolArgs) anyerror!ToolUi {
+    return .{ .title = try allocator.dupe(u8, name), .display = blocks.default_tool_display };
+}
+
+fn defaultToolResultResolver(_: ?*anyopaque, allocator: std.mem.Allocator, _: []const u8, _: bool, content: []const ai.ToolResultContent, _: ?std.json.Value) anyerror!ToolResultUi {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+    var truncated = false;
+    try blocks.appendTextContent(&writer, content, blocks.tool_body_bytes_max, &truncated);
+    return .{ .body = try writer.toOwnedSlice() };
 }
 
 fn emptyAssistantMessage(content: []const ai.AssistantContent, stop_reason: ai.StopReason) ai.AssistantMessage {
@@ -761,6 +1034,66 @@ test "transcript applies streamed assistant text by delta" {
     try std.testing.expect(!item.kind.assistant.streaming);
 }
 
+test "transcript final assistant message removes stale streamed parts" {
+    var transcript = Transcript.init(std.testing.allocator);
+    defer transcript.deinit();
+
+    try transcript.apply(std.testing.io, .{ .message_start = .{ .message = .{ .assistant = emptyAssistantMessage(&.{}, .stop) } } });
+    try transcript.apply(std.testing.io, .{ .message_update = .{ .assistant_message_event = .{ .text_delta = .{
+        .content_index = 0,
+        .delta = "hello",
+        .partial = emptyAssistantMessage(&.{}, .stop),
+    } } } });
+    try transcript.apply(std.testing.io, .{ .message_update = .{ .assistant_message_event = .{ .text_delta = .{
+        .content_index = 1,
+        .delta = "stale",
+        .partial = emptyAssistantMessage(&.{}, .stop),
+    } } } });
+    const content = [_]ai.AssistantContent{.{ .text = .{ .text = "hello" } }};
+    try transcript.apply(std.testing.io, .{ .message_end = .{ .message = .{ .assistant = emptyAssistantMessage(&content, .stop) } } });
+
+    const assistant = &transcript.items.items[0].kind.assistant;
+    try std.testing.expectEqual(@as(usize, 1), assistant.parts.items.len);
+    try std.testing.expectEqualStrings("hello", assistant.parts.items[0].text.items);
+}
+
+test "transcript bounds streamed tool args preview once" {
+    var transcript = Transcript.init(std.testing.allocator);
+    defer transcript.deinit();
+
+    try transcript.apply(std.testing.io, .{ .tool_execution_start = .{ .tool_call_id = "args-1", .tool_name = "bash", .args = .null } });
+    const item = transcript.items.items[0];
+    const delta = try std.testing.allocator.alloc(u8, blocks.args_preview_bytes_max + 100);
+    defer std.testing.allocator.free(delta);
+    @memset(delta, 'a');
+
+    try transcript.appendToolArgs(item, delta);
+    try std.testing.expect(item.kind.tool.args_truncated);
+    try std.testing.expect(item.kind.tool.args_preview.items.len <= blocks.args_preview_bytes_max);
+    const len_after_truncation = item.kind.tool.args_preview.items.len;
+    try transcript.appendToolArgs(item, "extra");
+    try std.testing.expectEqual(len_after_truncation, item.kind.tool.args_preview.items.len);
+}
+
+test "transcript bounded append continues across UTF-8 chunk boundary" {
+    var transcript = Transcript.init(std.testing.allocator);
+    defer transcript.deinit();
+
+    const text = try std.testing.allocator.alloc(u8, append_chunk_bytes_max + 2);
+    defer std.testing.allocator.free(text);
+    @memset(text[0 .. append_chunk_bytes_max - 1], 'a');
+    text[append_chunk_bytes_max - 1] = 0xc3;
+    text[append_chunk_bytes_max] = 0xa9;
+    text[append_chunk_bytes_max + 1] = 'b';
+
+    try transcript.apply(std.testing.io, .{ .message_start = .{ .message = .{ .user = .{ .content = .{ .string = text }, .timestamp = 0 } } } });
+
+    const user = transcript.items.items[0].kind.user;
+    try std.testing.expect(!user.truncated);
+    try std.testing.expectEqualStrings(text, user.text.items);
+    try std.testing.expect(std.mem.indexOf(u8, user.text.items, output_truncated_text) == null);
+}
+
 test "transcript creates tool before execution and records output" {
     var transcript = Transcript.init(std.testing.allocator);
     defer transcript.deinit();
@@ -778,7 +1111,7 @@ test "transcript creates tool before execution and records output" {
     } } } });
     try std.testing.expectEqual(@as(usize, 2), transcript.items.items.len);
     const tool = transcript.items.items[1];
-    try std.testing.expectEqualStrings("read src/main.zig", tool.kind.tool.title);
+    try std.testing.expectEqualStrings("read", tool.kind.tool.title);
 
     try transcript.apply(std.testing.io, .{ .tool_execution_start = .{ .tool_call_id = "call-1", .tool_name = "read", .args = .null } });
     const result_content = [_]ai.ToolResultContent{.{ .text = .{ .text = "file body" } }};
@@ -799,6 +1132,21 @@ test "transcript aborts running tools on aborted assistant end" {
     try transcript.apply(std.testing.io, .{ .message_end = .{ .message = .{ .assistant = emptyAssistantMessage(&.{}, .aborted) } } });
 
     try std.testing.expectEqual(blocks.Status.aborted, transcript.items.items[0].kind.tool.status);
+}
+
+test "transcript reused terminal tool id starts a new live item" {
+    var transcript = Transcript.init(std.testing.allocator);
+    defer transcript.deinit();
+
+    try transcript.apply(std.testing.io, .{ .tool_execution_start = .{ .tool_call_id = "call-1", .tool_name = "bash", .args = .null } });
+    const result_content = [_]ai.ToolResultContent{.{ .text = .{ .text = "done" } }};
+    try transcript.apply(std.testing.io, .{ .tool_execution_end = .{ .tool_call_id = "call-1", .tool_name = "bash", .result = .{ .content = &result_content }, .is_error = false } });
+    try transcript.apply(std.testing.io, .{ .tool_execution_start = .{ .tool_call_id = "call-1", .tool_name = "bash", .args = .null } });
+
+    try std.testing.expectEqual(@as(usize, 2), transcript.items.items.len);
+    try std.testing.expectEqual(blocks.Status.done, transcript.items.items[0].kind.tool.status);
+    try std.testing.expectEqual(blocks.Status.running, transcript.items.items[1].kind.tool.status);
+    try std.testing.expect(transcript.live_tools.get("call-1").? == transcript.items.items[1]);
 }
 
 test "transcript evicts oldest items past item cap" {
