@@ -46,6 +46,7 @@ pub const Runner = struct {
     layout: theme.LayoutEpoch = .{ .width = 0, .height = 0 },
     open: coding_agent.session_bootstrap.OpenSpec,
     resume_picker: bool,
+    initial_prompt_pending: bool,
     observed_dropped_input_bytes: usize = 0,
     pending_input_read_ns: [InputPumpMod.stamp_capacity]u64 = undefined,
     pending_input_read_len: usize = 0,
@@ -59,7 +60,14 @@ pub const Runner = struct {
             }),
             .open = options.open,
             .resume_picker = options.resume_picker,
+            .initial_prompt_pending = options.initial_prompt != null,
         };
+    }
+
+    pub fn submitInitialPromptIfPresent(self: *Runner) !void {
+        if (!self.initial_prompt_pending) return;
+        self.initial_prompt_pending = false;
+        try self.loop.dispatch(.submit);
     }
 
     pub fn deinit(self: *Runner) void {
@@ -258,6 +266,7 @@ pub fn run(process: runtime.Process, options: Options) !void {
     defer shutdownSession(&session, &runner.loop, services.io, &wake);
     _ = try session.agent.subscribe(.{ .context = &runner.loop.transcript, .call_fn = Transcript.applyListener });
     try runner.loop.restoreSessionFold();
+    try runner.submitInitialPromptIfPresent();
     if (options.resume_picker) {
         try runner.loop.dispatch(.{ .insert = "/resume" });
         try runner.loop.dispatch(.submit);
@@ -436,6 +445,25 @@ test "runner seeds initial prompt and composes first frame" {
     var buffer: [32]u8 = undefined;
     try std.testing.expectEqualStrings("> draft", frame.rows()[1].copyText(&buffer));
     try std.testing.expectEqual(@as(usize, 0), runner.decoder.pendingBytes());
+}
+
+test "runner submits initial prompt once through the owner loop" {
+    var runner = try Runner.init(std.testing.allocator, .{
+        .initial_prompt = "hello",
+        .open = .{ .create = .{ .session_id = "tui-test", .timestamp = "2026-07-06T00:00:00Z" } },
+        .resume_picker = false,
+    });
+    defer runner.deinit();
+
+    try runner.submitInitialPromptIfPresent();
+
+    try std.testing.expectEqualStrings("hello", runner.loop.submittedPrompt().?);
+    try std.testing.expectEqualStrings("", runner.loop.editor.text());
+
+    try runner.loop.dispatch(.{ .insert = "typed" });
+    try runner.submitInitialPromptIfPresent();
+
+    try std.testing.expectEqualStrings("typed", runner.loop.editor.text());
 }
 
 test "runner derives no-session persistence from open spec" {
