@@ -218,7 +218,7 @@ pub const RunDriver = struct {
             .running => |*handle| {
                 handle.cancelRequest(session);
                 if (owner.editor.text().len == 0) owner.restoreQueuedText(session) catch {};
-                owner.notice(.info, "aborted") catch {};
+                // The canceled run emits the terminal assistant "aborted" message.
             },
             .retry_wait => {
                 session.cancelRetryWait();
@@ -3441,6 +3441,30 @@ test "run driver queues steering and dequeue-all restores queued text" {
     try fixture.owner_loop.dispatch(.dequeue_all);
     try std.testing.expectEqualStrings("steer", fixture.owner_loop.editor.text());
     try std.testing.expectEqual(@as(usize, 0), fixture.session.queuedEchoes().len);
+}
+
+test "run cancel does not duplicate aborted notice" {
+    var fixture = try DriverTestFixture.init("done");
+    defer fixture.deinit();
+
+    try fixture.owner_loop.dispatch(.{ .insert = "first" });
+    try fixture.owner_loop.dispatch(.submit);
+    try fixture.owner_loop.dispatch(.cancel);
+    try driveDriverUntilIdle(fixture.owner_loop, 10_000);
+
+    var aborted_assistants: usize = 0;
+    var aborted_notices: usize = 0;
+    for (fixture.owner_loop.transcript.items.items) |item| switch (item.kind) {
+        .assistant => |assistant| {
+            if (assistant.stop == .aborted) aborted_assistants += 1;
+        },
+        .notice => |notice| {
+            if (std.mem.eql(u8, notice.text, "aborted")) aborted_notices += 1;
+        },
+        else => {},
+    };
+    try std.testing.expectEqual(@as(usize, 1), aborted_assistants);
+    try std.testing.expectEqual(@as(usize, 0), aborted_notices);
 }
 
 test "run cancel restores queued text into empty editor" {
