@@ -603,7 +603,7 @@ pub const PendingMessageQueue = struct {
 };
 
 const llm_tool_result_text_bytes_max: usize = 8 * 1024;
-const llm_tool_result_truncated_note = "\n[tool result truncated for model context]";
+const llm_tool_result_truncated_note = "\n[tool result truncated for model context]\n";
 
 fn defaultConvertToLlm(
     allocator: std.mem.Allocator,
@@ -655,11 +655,23 @@ fn compactToolResultForLlm(
 
 fn compactToolResultTextForLlm(allocator: std.mem.Allocator, text: []const u8) std.mem.Allocator.Error![]const u8 {
     if (text.len <= llm_tool_result_text_bytes_max) return allocator.dupe(u8, text);
-    const prefix = agent.utf8Prefix(text, llm_tool_result_text_bytes_max - llm_tool_result_truncated_note.len);
-    const out = try allocator.alloc(u8, prefix.len + llm_tool_result_truncated_note.len);
-    @memcpy(out[0..prefix.len], prefix);
-    @memcpy(out[prefix.len..], llm_tool_result_truncated_note);
+    const content_budget = llm_tool_result_text_bytes_max - llm_tool_result_truncated_note.len;
+    const head_budget = content_budget / 2;
+    const tail_budget = content_budget - head_budget;
+    const head = agent.utf8Prefix(text, head_budget);
+    const tail = utf8Suffix(text, tail_budget);
+    const out = try allocator.alloc(u8, head.len + llm_tool_result_truncated_note.len + tail.len);
+    @memcpy(out[0..head.len], head);
+    @memcpy(out[head.len..][0..llm_tool_result_truncated_note.len], llm_tool_result_truncated_note);
+    @memcpy(out[head.len + llm_tool_result_truncated_note.len ..], tail);
     return out;
+}
+
+fn utf8Suffix(text: []const u8, max_bytes: usize) []const u8 {
+    if (text.len <= max_bytes) return text;
+    var start = text.len - max_bytes;
+    while (start < text.len and !std.unicode.utf8ValidateSlice(text[start..])) start += 1;
+    return text[start..];
 }
 
 test "default llm conversion bounds tool result text" {
@@ -681,8 +693,32 @@ test "default llm conversion bounds tool result text" {
     try std.testing.expect(converted[0] == .tool_result);
     const text = converted[0].tool_result.content[0].text.text;
     try std.testing.expect(text.len <= llm_tool_result_text_bytes_max);
-    try std.testing.expect(std.mem.endsWith(u8, text, llm_tool_result_truncated_note));
+    try std.testing.expect(std.mem.indexOf(u8, text, llm_tool_result_truncated_note) != null);
     try std.testing.expect(converted[0].tool_result.details == null);
+}
+
+test "default llm conversion preserves tail hints in large tool result text" {
+    var source_text_writer = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer source_text_writer.deinit();
+    try source_text_writer.writer.splatByteAll('x', llm_tool_result_text_bytes_max + 100);
+    try source_text_writer.writer.writeAll("\nFull output: /tmp/zi-bash-test.log");
+    const content = [_]ai.ToolResultContent{.{ .text = .{ .text = source_text_writer.written() } }};
+    const source = [_]agent.AgentMessage{.{ .tool_result = .{
+        .tool_call_id = "call-1",
+        .tool_name = "bash",
+        .content = &content,
+        .is_error = false,
+        .timestamp = 0,
+    } }};
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const converted = try defaultConvertToLlm(arena.allocator(), null, &source);
+
+    const text = converted[0].tool_result.content[0].text.text;
+    try std.testing.expect(text.len <= llm_tool_result_text_bytes_max);
+    try std.testing.expect(std.mem.indexOf(u8, text, llm_tool_result_truncated_note) != null);
+    try std.testing.expect(std.mem.endsWith(u8, text, "Full output: /tmp/zi-bash-test.log"));
 }
 
 fn defaultStream(_: ?*anyopaque, request: ai.StreamRequest) ai.AssistantMessageEventStream {
@@ -1092,7 +1128,7 @@ fn compactedToolResultProbeStream(context: ?*anyopaque, request: ai.StreamReques
         const text = message.tool_result.content[0].text.text;
         if (text.len > llm_tool_result_text_bytes_max) probe.saw_raw_large_tool_result = true;
         if (text.len <= llm_tool_result_text_bytes_max and
-            std.mem.endsWith(u8, text, llm_tool_result_truncated_note))
+            std.mem.indexOf(u8, text, llm_tool_result_truncated_note) != null)
         {
             probe.saw_bounded_tool_result = true;
         }

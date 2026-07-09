@@ -3,7 +3,7 @@ const ai = @import("../ai/root.zig");
 const partial_json = @import("../ai/utils/partial_json.zig");
 
 pub const title_bytes_max: usize = 160;
-pub const metadata_bytes_max: usize = 192;
+pub const metadata_bytes_max: usize = 512;
 
 pub const Presentation = enum { generic, command, file, patch, symbols };
 pub const BodyMode = enum { visible, hidden_on_success, summary_only };
@@ -408,6 +408,10 @@ fn bashMetadata(buffer: []u8, object: std.json.ObjectMap) ?[]const u8 {
         writeByteSize(&writer, max_bytes) catch return null;
         writer.writeAll(" limit)") catch return null;
     }
+    if (jsonString(object, "fullOutputPath")) |path| {
+        writer.writeAll(" • Full output: ") catch return writer.buffered();
+        writer.writeAll(path) catch return writer.buffered();
+    }
     return writer.buffered();
 }
 
@@ -743,6 +747,27 @@ test "tool result view uses edit diff details and write suppression" {
     const write_content = [_]ai.ToolResultContent{.{ .text = .{ .text = "PRIVATE" } }};
     const write_view = try resultView(std.testing.allocator, "write", false, &write_content, .{ .object = write_details });
     try std.testing.expect(write_view.output == null);
+}
+
+test "bash truncation metadata includes full output path" {
+    var truncation: std.json.ObjectMap = .empty;
+    defer truncation.deinit(std.testing.allocator);
+    try truncation.put(std.testing.allocator, "truncated", .{ .bool = true });
+    try truncation.put(std.testing.allocator, "truncatedBy", .{ .string = "lines" });
+    try truncation.put(std.testing.allocator, "outputLines", .{ .integer = 2000 });
+    try truncation.put(std.testing.allocator, "totalLines", .{ .integer = 2002 });
+
+    var details: std.json.ObjectMap = .empty;
+    defer details.deinit(std.testing.allocator);
+    try details.put(std.testing.allocator, "truncation", .{ .object = truncation });
+    try details.put(std.testing.allocator, "fullOutputPath", .{ .string = "/tmp/zi-bash-test.log" });
+
+    var buffer: [metadata_bytes_max]u8 = undefined;
+    const metadata = metadataForDetails(&buffer, "bash", .{ .object = details });
+    try std.testing.expectEqualStrings(
+        "Truncated: showing 2000 of 2002 lines • Full output: /tmp/zi-bash-test.log",
+        metadata,
+    );
 }
 
 test "read truncation metadata becomes footer" {

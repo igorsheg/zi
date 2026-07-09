@@ -650,6 +650,58 @@ test "pty e2e: streamed write args render before result" {
     try expectContains(result.output, "streamed arg line 2");
 }
 
+test "pty e2e: bash spill footer renders full output path" {
+    if (!supportsForkPty()) return error.SkipZigTest;
+    const zi_bin = envValue("ZI_PTY_E2E_BIN") orelse return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "repo/.zi");
+    try tmp.dir.createDirPath(std.testing.io, "home");
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+
+    const repo_abs = try tmpAbsPath(std.testing.allocator, &tmp, "repo");
+    defer std.testing.allocator.free(repo_abs);
+    const home_abs = try tmpAbsPath(std.testing.allocator, &tmp, "home");
+    defer std.testing.allocator.free(home_abs);
+    const agent_abs = try tmpAbsPath(std.testing.allocator, &tmp, "agent");
+    defer std.testing.allocator.free(agent_abs);
+
+    const home_env = try std.fmt.allocPrint(std.testing.allocator, "HOME={s}", .{home_abs});
+    defer std.testing.allocator.free(home_env);
+    const agent_env = try std.fmt.allocPrint(std.testing.allocator, "ZI_CODING_AGENT_DIR={s}", .{agent_abs});
+    defer std.testing.allocator.free(agent_env);
+    const env = [_][]const u8{
+        "TERM=xterm-256color",
+        "NO_COLOR=1",
+        "ZI_TUI_SYNTHETIC_BASH_SPILL=1",
+        home_env,
+        agent_env,
+    };
+
+    var result = try runScripted(std.testing.allocator, .{
+        .argv = &.{zi_bin},
+        .env = &env,
+        .cwd = repo_abs,
+        .rows = 20,
+        .cols = 120,
+        .timeout_ms = 5_000,
+        .max_output_bytes = 256 * 1024,
+    }, &.{
+        .{ .after_ms = 500, .bytes = "\x03" },
+        .{ .after_ms = 700, .bytes = "\x03" },
+    });
+    defer result.deinit(std.testing.allocator);
+    if (result.timed_out) {
+        std.debug.print("pty bash spill e2e timed out\n--- output ---\n{s}\n--- end output ---\n", .{result.output});
+        return error.TestUnexpectedResult;
+    }
+    try std.testing.expect(exitedZero(result.status));
+    try std.testing.expect(result.termios_restored != false);
+    try expectContains(result.output, "Truncated: showing 2000 of 2002 lines");
+    try expectContains(result.output, "Full output: /tmp/zi-bash-test.log");
+}
+
 test "pty e2e: P4 completion model picker resume and new session" {
     if (!supportsForkPty()) return error.SkipZigTest;
     const zi_bin = envValue("ZI_PTY_E2E_BIN") orelse return error.SkipZigTest;

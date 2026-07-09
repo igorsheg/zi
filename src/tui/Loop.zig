@@ -749,6 +749,37 @@ pub const Loop = struct {
         self.dirty = true;
     }
 
+    pub fn seedSyntheticBashSpill(self: *Loop, io: std.Io) !void {
+        const body = "line 2001\nline 2002\n\n[Showing lines 3-2002 of 2002 (50KB limit). Full output: /tmp/zi-bash-test.log]";
+        const content = [_]ai.ToolResultContent{.{ .text = .{ .text = body } }};
+
+        var truncation: std.json.ObjectMap = .empty;
+        defer truncation.deinit(self.gpa);
+        try truncation.put(self.gpa, "truncated", .{ .bool = true });
+        try truncation.put(self.gpa, "truncatedBy", .{ .string = "lines" });
+        try truncation.put(self.gpa, "totalLines", .{ .integer = 2002 });
+        try truncation.put(self.gpa, "totalBytes", .{ .integer = 18_000 });
+        try truncation.put(self.gpa, "outputLines", .{ .integer = 2000 });
+        try truncation.put(self.gpa, "outputBytes", .{ .integer = 10 });
+        try truncation.put(self.gpa, "lastLinePartial", .{ .bool = false });
+        try truncation.put(self.gpa, "firstLineExceedsLimit", .{ .bool = false });
+        try truncation.put(self.gpa, "maxLines", .{ .integer = 2000 });
+        try truncation.put(self.gpa, "maxBytes", .{ .integer = 50 * 1024 });
+
+        var details: std.json.ObjectMap = .empty;
+        defer details.deinit(self.gpa);
+        try details.put(self.gpa, "truncation", .{ .object = truncation });
+        try details.put(self.gpa, "fullOutputPath", .{ .string = "/tmp/zi-bash-test.log" });
+
+        try self.transcript.apply(io, .{ .tool_execution_end = .{
+            .tool_call_id = "seed-bash-spill",
+            .tool_name = "bash",
+            .result = .{ .content = &content, .details = .{ .object = details } },
+            .is_error = false,
+        } });
+        self.dirty = true;
+    }
+
     pub fn seedSyntheticWriteArgs(self: *Loop, io: std.Io) !void {
         try self.transcript.apply(io, .{ .message_start = .{ .message = .{ .assistant = syntheticAssistantMessage(&.{}) } } });
 
