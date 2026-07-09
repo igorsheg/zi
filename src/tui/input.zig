@@ -33,6 +33,7 @@ pub const Action = union(enum) {
     quit_eof,
     expand_toggle,
     dequeue_all,
+    paste_image,
     scroll: i32,
     page_up,
     page_down,
@@ -80,6 +81,7 @@ pub fn fromKey(key: vaxis.Key) Action {
     if (key.matches('f', .{ .alt = true })) return .{ .key_editor = .move_word_right };
     if (key.matches('o', .{ .ctrl = true })) return .expand_toggle;
     if (key.matches('q', .{ .alt = true })) return .dequeue_all;
+    if (key.matches('v', .{ .alt = true })) return .paste_image;
     if (key.matches('l', .{ .ctrl = true })) return .force_redraw;
 
     if (key.text) |text| {
@@ -133,6 +135,7 @@ test "key mapping handles chrome bindings" {
     try std.testing.expect(fromKey(.{ .codepoint = vaxis.Key.enter, .mods = .{ .shift = true } }) == .newline);
     try std.testing.expect(fromKey(.{ .codepoint = 'o', .mods = .{ .ctrl = true } }) == .expand_toggle);
     try std.testing.expect(fromKey(.{ .codepoint = 'q', .mods = .{ .alt = true } }) == .dequeue_all);
+    try std.testing.expect(fromKey(.{ .codepoint = 'v', .mods = .{ .alt = true } }) == .paste_image);
     try std.testing.expect(fromKey(.{ .codepoint = 'l', .mods = .{ .ctrl = true } }) == .force_redraw);
 }
 

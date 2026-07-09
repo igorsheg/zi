@@ -12,6 +12,7 @@ pub const InputPump = InputPumpMod.InputPump;
 pub const Terminal = @import("Terminal.zig");
 pub const blocks = @import("blocks.zig");
 pub const chrome = @import("chrome.zig");
+pub const clipboard_image = @import("clipboard_image.zig");
 pub const glyphs = @import("glyphs.zig");
 pub const input = @import("input.zig");
 pub const layout = @import("layout.zig");
@@ -285,13 +286,13 @@ pub fn run(process: runtime.Process, options: Options) !void {
     defer writeTraceIfRequested(process, &runner.loop.trace) catch {};
 
     var terminal: Terminal = undefined;
-    try terminal.init(process.gpa, services.io, process.environ);
+    try terminal.init(process.gpa, process.io, process.environ);
     defer terminal.deinit();
     try terminal.setup();
     try terminal.setTitle(runner.loop.terminalTitle());
 
     var pump: InputPump = .{};
-    try pump.startTerminal(services.io, &terminal);
+    try pump.startTerminal(process.io, &terminal);
     defer pump.join();
     defer pump.requestStop();
 

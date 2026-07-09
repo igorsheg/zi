@@ -328,7 +328,7 @@ fn noticeStyle(level: NoticeLevel) screen.Style {
 fn applyMessageStart(self: *Transcript, message: agent_mod.AgentMessage) !void {
     switch (message) {
         .user => |user| {
-            const item = try self.createUserItem(userText(user));
+            const item = try self.createUserMessageItem(user);
             try self.appendItem(item);
         },
         .assistant => {
@@ -671,8 +671,31 @@ fn appendCustom(self: *Transcript, custom: agent_mod.CustomAgentMessage) !void {
 
 fn createUserItem(self: *Transcript, text: []const u8) !*Item {
     const item = try self.createItem(.{ .user = .{ .text = .empty } });
-    try self.appendListBounded(item, &item.kind.user.text, text, per_item_text_bytes_max, &item.kind.user.truncated, true);
+    try self.appendUserText(item, text);
     return item;
+}
+
+fn createUserMessageItem(self: *Transcript, user: ai.UserMessage) !*Item {
+    const item = try self.createItem(.{ .user = .{ .text = .empty } });
+    switch (user.content) {
+        .string => |text| try self.appendUserText(item, text),
+        .blocks => |blocks_slice| for (blocks_slice) |block| switch (block) {
+            .text => |text| try self.appendUserText(item, text.text),
+            .image => |image| try self.appendUserImage(item, image.mime_type),
+        },
+    }
+    return item;
+}
+
+fn appendUserText(self: *Transcript, item: *Item, text: []const u8) !void {
+    try self.appendListBounded(item, &item.kind.user.text, text, per_item_text_bytes_max, &item.kind.user.truncated, true);
+}
+
+fn appendUserImage(self: *Transcript, item: *Item, mime_type: []const u8) !void {
+    if (item.kind.user.text.items.len != 0 and item.kind.user.text.items[item.kind.user.text.items.len - 1] != '\n') {
+        try self.appendUserText(item, "\n");
+    }
+    try self.appendUserText(item, imageFallbackText(mime_type));
 }
 
 fn createAssistantItem(self: *Transcript, streaming: bool) !*Item {
@@ -827,6 +850,15 @@ fn itemBytes(item: *const Item) usize {
     };
 }
 
+fn imageFallbackText(mime_type: []const u8) []const u8 {
+    if (mime_type.len == 0) return "[Image]";
+    if (std.mem.eql(u8, mime_type, "image/png")) return "[Image: image/png]";
+    if (std.mem.eql(u8, mime_type, "image/jpeg")) return "[Image: image/jpeg]";
+    if (std.mem.eql(u8, mime_type, "image/gif")) return "[Image: image/gif]";
+    if (std.mem.eql(u8, mime_type, "image/webp")) return "[Image: image/webp]";
+    return "[Image]";
+}
+
 fn userText(user: ai.UserMessage) []const u8 {
     return switch (user.content) {
         .string => |text| text,
@@ -855,6 +887,23 @@ test "transcript user block has panel padding and item margin" {
     try std.testing.expect(std.meta.eql(lines[2].row_style.bg, screen.surface.user_message.bg));
     try std.testing.expectEqualStrings("", lines[3].copyText(&buffer));
     try std.testing.expect(screen.Style.eql(lines[3].row_style, screen.surface.transparent));
+}
+
+test "transcript user block renders image placeholders" {
+    var transcript = Transcript.init(std.testing.allocator);
+    defer transcript.deinit();
+
+    const content = [_]ai.UserContent{
+        .{ .text = .{ .text = "look" } },
+        .{ .image = .{ .data = "abc", .mime_type = "image/png" } },
+    };
+    try transcript.apply(std.testing.io, .{ .message_start = .{ .message = .{ .user = .{ .content = .{ .blocks = &content }, .timestamp = 0 } } } });
+    const epoch = theme.LayoutEpoch{ .width = 40, .height = 10 };
+    const lines = try transcript.itemLines(transcript.items.items[0], 40, epoch);
+
+    var buffer: [64]u8 = undefined;
+    try std.testing.expectEqualStrings(" look", lines[1].copyText(&buffer));
+    try std.testing.expectEqualStrings(" [Image: image/png]", lines[2].copyText(&buffer));
 }
 
 test "transcript visible thinking trims trailing blank rows" {

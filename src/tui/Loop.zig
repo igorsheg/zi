@@ -6,6 +6,7 @@ const coding_agent = @import("../coding_agent/root.zig");
 const slash_commands = @import("../coding_agent/slash_commands.zig");
 const runtime = @import("../runtime/root.zig");
 const chrome = @import("chrome.zig");
+const clipboard_image = @import("clipboard_image.zig");
 const Editor = @import("Editor.zig");
 const input = @import("input.zig");
 const render_policy = @import("render_policy.zig");
@@ -104,9 +105,101 @@ const LineRef = struct {
     line_in_item: usize,
 };
 
+const prompt_image_count_max: usize = 4;
+const prompt_image_data_bytes_max: usize = 80 * 1024 * 1024;
+const prompt_image_mime_bytes_max: usize = 64;
+const clipboard_temp_path_count_max: usize = prompt_image_count_max;
+
+const ClipboardImagePaste = struct {
+    path: []u8,
+    mime_type: []u8,
+    byte_len: usize,
+
+    fn deinit(self: *ClipboardImagePaste, allocator: std.mem.Allocator) void {
+        if (self.path.len > 0) allocator.free(self.path);
+        allocator.free(self.mime_type);
+        self.* = undefined;
+    }
+};
+
+const PromptImageAttachments = struct {
+    items: [prompt_image_count_max]ai.ImageContent = undefined,
+    len: usize = 0,
+
+    fn images(self: *const PromptImageAttachments) []const ai.ImageContent {
+        return self.items[0..self.len];
+    }
+
+    fn appendOwned(self: *PromptImageAttachments, image: ai.ImageContent) !void {
+        if (self.len == self.items.len) return error.TooManyImages;
+        self.items[self.len] = image;
+        self.len += 1;
+    }
+
+    fn deinit(self: *PromptImageAttachments, allocator: std.mem.Allocator) void {
+        for (self.items[0..self.len]) |image| {
+            allocator.free(image.data);
+            allocator.free(image.mime_type);
+        }
+        self.len = 0;
+    }
+};
+
+const PromptImages = struct {
+    items: []ai.ImageContent = &.{},
+
+    fn copy(allocator: std.mem.Allocator, source: []const ai.ImageContent) !PromptImages {
+        if (source.len == 0) return .{};
+        if (source.len > prompt_image_count_max) return error.TooManyImages;
+        const items = try allocator.alloc(ai.ImageContent, source.len);
+        errdefer allocator.free(items);
+        var copied: usize = 0;
+        errdefer freeItems(allocator, items[0..copied]);
+        for (source, 0..) |image, index| {
+            if (image.data.len > prompt_image_data_bytes_max) return error.ImageTooLarge;
+            if (image.mime_type.len > prompt_image_mime_bytes_max) return error.ImageMimeTooLong;
+            const data = try allocator.dupe(u8, image.data);
+            errdefer allocator.free(data);
+            const mime_type = try allocator.dupe(u8, image.mime_type);
+            items[index] = .{ .data = data, .mime_type = mime_type };
+            copied += 1;
+        }
+        return .{ .items = items };
+    }
+
+    fn deinit(self: *PromptImages, allocator: std.mem.Allocator) void {
+        freeItems(allocator, self.items);
+        self.* = .{};
+    }
+
+    fn freeItems(allocator: std.mem.Allocator, items: []const ai.ImageContent) void {
+        for (items) |image| {
+            allocator.free(image.data);
+            allocator.free(image.mime_type);
+        }
+        if (items.len > 0) allocator.free(items);
+    }
+};
+
+const SavedPrompt = struct {
+    text: SubmittedPrompt = .{},
+    images: PromptImages = .{},
+
+    fn set(self: *SavedPrompt, allocator: std.mem.Allocator, text: []const u8, images: []const ai.ImageContent) !void {
+        self.deinit(allocator);
+        self.text.set(text);
+        self.images = try PromptImages.copy(allocator, images);
+    }
+
+    fn deinit(self: *SavedPrompt, allocator: std.mem.Allocator) void {
+        self.images.deinit(allocator);
+        self.text.len = 0;
+    }
+};
+
 pub const RunDriver = struct {
     state: State = .idle,
-    saved_prompt: ?SubmittedPrompt = null,
+    saved_prompt: ?SavedPrompt = null,
     overflow_count_before: usize = 0,
     overflow_retry_used: bool = false,
     retry: ?RetryDisplay = null,
@@ -123,6 +216,16 @@ pub const RunDriver = struct {
         return self.state != .idle;
     }
 
+    pub fn deinit(self: *RunDriver, allocator: std.mem.Allocator) void {
+        self.clearSavedPrompt(allocator);
+        self.* = .{};
+    }
+
+    fn clearSavedPrompt(self: *RunDriver, allocator: std.mem.Allocator) void {
+        if (self.saved_prompt) |*saved| saved.deinit(allocator);
+        self.saved_prompt = null;
+    }
+
     pub fn submitPrompt(
         self: *RunDriver,
         owner: *Loop,
@@ -130,11 +233,12 @@ pub const RunDriver = struct {
         io: std.Io,
         wake: *runtime.WakeEvent,
         text: []const u8,
+        images: []const ai.ImageContent,
     ) !void {
         if (text.len > Editor.capacity) return error.EditorFull;
         switch (self.state) {
             .idle => {},
-            .running => return self.queuePrompt(owner, session, text, .steer),
+            .running => return self.queuePrompt(owner, session, text, images, .steer),
             .retry_wait => {
                 try owner.notice(.warn, "busy: waiting to retry — esc to cancel");
                 return;
@@ -144,11 +248,14 @@ pub const RunDriver = struct {
                 return;
             },
         }
-        self.saved_prompt = .{};
-        self.saved_prompt.?.set(text);
+        self.clearSavedPrompt(owner.gpa);
+        var saved: SavedPrompt = .{};
+        errdefer saved.deinit(owner.gpa);
+        try saved.set(owner.gpa, text, images);
+        self.saved_prompt = saved;
         self.overflow_count_before = session.contextOverflowCount();
         self.overflow_retry_used = false;
-        var handle = try session.startPromptHandle(text, &.{});
+        var handle = try session.startPromptHandle(text, images);
         handle.setWake(io, wake);
         self.state = .{ .running = handle };
         owner.dirty = true;
@@ -159,10 +266,11 @@ pub const RunDriver = struct {
         owner: *Loop,
         session: *coding_agent.AgentSession,
         text: []const u8,
+        images: []const ai.ImageContent,
         kind: coding_agent.AgentSession.QueuePromptKind,
     ) !void {
         _ = self;
-        session.queuePrompt(text, &.{}, kind) catch |err| switch (err) {
+        session.queuePrompt(text, images, kind) catch |err| switch (err) {
             error.QueueFull => try owner.noticeFmt(.warn, "queue is full ({d} queued)", .{session.queuedEchoes().len}),
             error.SessionNotRunning => std.debug.assert(false),
             else => return err,
@@ -224,6 +332,7 @@ pub const RunDriver = struct {
                 session.cancelRetryWait();
                 self.state = .idle;
                 self.retry = null;
+                self.clearSavedPrompt(owner.gpa);
                 owner.notice(.info, "aborted") catch {};
             },
             .compacting => |*state| {
@@ -317,6 +426,7 @@ pub const RunDriver = struct {
                 },
                 .retry, .compact => {},
             }
+            self.clearSavedPrompt(owner.gpa);
             owner.dirty = true;
             return;
         }
@@ -334,6 +444,7 @@ pub const RunDriver = struct {
     ) !void {
         switch (verdict) {
             .completed => {
+                self.clearSavedPrompt(owner.gpa);
                 if (session.shouldRunThresholdCompaction()) {
                     var maybe = try session.startCompactionHandle(.threshold, false, null);
                     if (maybe) |*handle| {
@@ -343,6 +454,7 @@ pub const RunDriver = struct {
                 }
             },
             .failed => {
+                self.clearSavedPrompt(owner.gpa);
                 if (session.latestFailureView()) |view| try owner.failureNotice(view);
             },
             .retry => |retry| try self.armRetry(session, now_ns, retry),
@@ -378,7 +490,7 @@ pub const RunDriver = struct {
             .resubmit_prompt => blk: {
                 const saved = self.saved_prompt orelse return error.NoSavedPrompt;
                 self.overflow_retry_used = true;
-                break :blk try session.startPromptHandle(saved.text(), &.{});
+                break :blk try session.startPromptHandle(saved.text.text(), saved.images.items);
             },
         };
         handle.setWake(io, wake);
@@ -634,6 +746,10 @@ pub const Loop = struct {
     file_index: ?coding_agent.file_completion.Index = null,
     file_index_task: ?runtime.Task(anyerror!coding_agent.file_completion.Index) = null,
     file_index_failed: bool = false,
+    clipboard_image_task: ?runtime.Task(anyerror!ClipboardImagePaste) = null,
+    clipboard_image_serial: u64 = 0,
+    clipboard_temp_paths: [clipboard_temp_path_count_max]?[]u8 = @splat(null),
+    clipboard_temp_path_count: usize = 0,
     token_cache_entry_count: usize = 0,
     token_input_total: u64 = 0,
     token_output_total: u64 = 0,
@@ -663,6 +779,16 @@ pub const Loop = struct {
     }
 
     pub fn deinit(self: *Loop) void {
+        if (self.clipboard_image_task) |*task| {
+            if (!task.hasResult()) task.cancel();
+            var result = task.getResult() catch null;
+            if (result) |*paste| {
+                deleteClipboardTempPath(self.io, paste.path);
+                paste.deinit(self.gpa);
+            }
+        }
+        self.clearClipboardTempFiles();
+        self.driver.deinit(self.gpa);
         if (self.file_index_task) |*task| {
             if (!task.hasResult()) task.cancel();
             var result = task.getResult() catch null;
@@ -681,6 +807,7 @@ pub const Loop = struct {
 
     pub fn bindServices(self: *Loop, services: *coding_agent.runtime_services.RuntimeServices) !void {
         self.services = services;
+        self.io = services.io;
         if (self.file_index == null and self.file_index_task == null and !self.file_index_failed) {
             self.file_index_task = try services.task_runtime.spawnBlocking(buildFileIndex, .{ self.gpa, services.dir });
         }
@@ -843,6 +970,7 @@ pub const Loop = struct {
             .follow_up_submit => try self.submitPrompt(.follow_up_submit),
             .newline => try self.editor.insertNewline(),
             .dequeue_all => try self.dequeueAll(),
+            .paste_image => try self.startClipboardImagePaste(),
             .clear_or_quit => self.handleClearOrQuit(now_ns),
             .expand_toggle => self.toggleExpanded(),
             .force_redraw => self.dirty = true,
@@ -969,6 +1097,7 @@ pub const Loop = struct {
         self.dirty = false;
     }
     pub fn tick(self: *Loop, now_ns: u64) !void {
+        try self.pollClipboardImageTask();
         const file_index_changed = try self.pollFileIndexTask();
         if (file_index_changed and self.completion.active and self.completion.mode == .file) try self.refreshCompletion(.force_file);
         try self.pumpSyntheticFlood(now_ns);
@@ -1268,6 +1397,7 @@ pub const Loop = struct {
     fn statusView(self: *Loop, now_ns: u64) chrome.StatusView {
         if (self.exit_requested) return .{ .text = "exiting" };
         if (self.exit_hint_visible) return .{ .text = exit_hint_text };
+        if (self.clipboard_image_task != null) return .{ .text = "Reading clipboard image…" };
         switch (self.driver.state) {
             .retry_wait => if (self.driver.retry) |retry| {
                 const remaining_ns = retry.deadline_ns -| now_ns;
@@ -1467,6 +1597,85 @@ pub const Loop = struct {
         return query.text;
     }
 
+    fn startClipboardImagePaste(self: *Loop) !void {
+        if (self.clipboard_image_task != null) {
+            try self.notice(.warn, "clipboard image paste already in progress");
+            return;
+        }
+        const services = self.services orelse {
+            try self.notice(.warn, "clipboard image paste unavailable");
+            return;
+        };
+        if (self.clipboard_temp_path_count == self.clipboard_temp_paths.len) {
+            try self.notice(.warn, "too many pasted images");
+            return;
+        }
+        self.clipboard_image_serial +%= 1;
+        if (self.clipboard_image_serial == 0) self.clipboard_image_serial = 1;
+        const tmp_dir = tmpDirFromEnv(services.environ);
+        // This worker uses std.Io/process_runner; keep it on an executor, not the blocking pool.
+        self.clipboard_image_task = try services.task_runtime.spawn(readClipboardImageToTempFile, .{
+            self.gpa,
+            self.io,
+            services.task_runtime,
+            services.environ,
+            tmp_dir,
+            self.clipboard_image_serial,
+        });
+        self.dirty = true;
+    }
+
+    fn pollClipboardImageTask(self: *Loop) !void {
+        if (self.clipboard_image_task) |*task| {
+            if (!task.hasResult()) return;
+            var result = task.getResult() catch |err| {
+                self.clipboard_image_task = null;
+                try self.notice(.warn, clipboardImageErrorText(err));
+                return;
+            };
+            self.clipboard_image_task = null;
+            errdefer result.deinit(self.gpa);
+            errdefer deleteClipboardTempPath(self.io, result.path);
+            try self.insertClipboardImageMarker(&result);
+            try self.retainClipboardTempPath(result.path);
+            result.path = &.{};
+            result.deinit(self.gpa);
+            self.dirty = true;
+        }
+    }
+
+    fn insertClipboardImageMarker(self: *Loop, paste: *const ClipboardImagePaste) !void {
+        var marker_buffer: [64]u8 = undefined;
+        const marker = clipboardImageMarker(&marker_buffer, self.clipboard_image_serial, paste.mime_type, paste.byte_len);
+        const expansion = try std.fmt.allocPrint(self.gpa, "@{s}", .{paste.path});
+        defer self.gpa.free(expansion);
+        try self.editor.insertMarker(marker, expansion);
+    }
+
+    fn retainClipboardTempPath(self: *Loop, path: []u8) !void {
+        if (self.clipboard_temp_path_count == self.clipboard_temp_paths.len) return error.EditorFull;
+        self.clipboard_temp_paths[self.clipboard_temp_path_count] = path;
+        self.clipboard_temp_path_count += 1;
+    }
+
+    fn clearClipboardTempFiles(self: *Loop) void {
+        for (self.clipboard_temp_paths[0..self.clipboard_temp_path_count]) |maybe_path| {
+            const path = maybe_path orelse continue;
+            deleteClipboardTempPath(self.io, path);
+            self.gpa.free(path);
+        }
+        @memset(&self.clipboard_temp_paths, null);
+        self.clipboard_temp_path_count = 0;
+    }
+
+    fn isTrackedClipboardTempPath(self: *const Loop, path: []const u8) bool {
+        for (self.clipboard_temp_paths[0..self.clipboard_temp_path_count]) |maybe_path| {
+            const tracked = maybe_path orelse continue;
+            if (std.mem.eql(u8, tracked, path)) return true;
+        }
+        return false;
+    }
+
     fn pollFileIndexTask(self: *Loop) !bool {
         if (self.file_index_task) |*task| {
             if (!task.hasResult()) return false;
@@ -1568,7 +1777,10 @@ pub const Loop = struct {
             .delete_forward => _ = self.editor.deleteForward(),
             .home => self.editor.moveHome(),
             .end => self.editor.moveEnd(),
-            .clear => self.editor.clear(),
+            .clear => {
+                self.editor.clear();
+                self.clearClipboardTempFiles();
+            },
             .kill_to_end => _ = self.editor.killToEnd(),
             .kill_to_start => _ = self.editor.killToStart(),
             .kill_word_back => _ = self.editor.killWordBack(),
@@ -1914,6 +2126,45 @@ pub const Loop = struct {
         self.dirty = true;
     }
 
+    fn clipboardImageAttachmentsFromPrompt(self: *Loop, prompt: []const u8) !PromptImageAttachments {
+        var attachments: PromptImageAttachments = .{};
+        errdefer attachments.deinit(self.gpa);
+        var index: usize = 0;
+        while (index < prompt.len and attachments.len < prompt_image_count_max) {
+            const at = std.mem.indexOfScalarPos(u8, prompt, index, '@') orelse break;
+            index = at + 1;
+            const path_start = index;
+            while (index < prompt.len and isPromptPathByte(prompt[index])) : (index += 1) {}
+            if (index == path_start) continue;
+            const path = prompt[path_start..index];
+            if (!self.isTrackedClipboardTempPath(path)) continue;
+            try attachments.appendOwned(try self.readPromptImageAttachment(path));
+        }
+        return attachments;
+    }
+
+    fn readPromptImageAttachment(self: *Loop, path: []const u8) !ai.ImageContent {
+        const mime_type = mimeTypeForImagePath(path) orelse return error.UnsupportedFormat;
+        var file = try std.Io.Dir.openFileAbsolute(self.io, path, .{});
+        defer file.close(self.io);
+        const file_len = try file.length(self.io);
+        if (file_len == 0) return error.NoImage;
+        const raw_len: usize = @intCast(file_len);
+        const encoded_len = std.base64.standard.Encoder.calcSize(raw_len);
+        if (encoded_len > prompt_image_data_bytes_max) return error.ImageTooLarge;
+        const raw = try self.gpa.alloc(u8, raw_len);
+        defer self.gpa.free(raw);
+        const read_len = try file.readPositionalAll(self.io, raw, 0);
+        if (read_len != raw.len) return error.ShortRead;
+
+        const encoded = try self.gpa.alloc(u8, encoded_len);
+        errdefer self.gpa.free(encoded);
+        _ = std.base64.standard.Encoder.encode(encoded, raw);
+        const mime = try self.gpa.dupe(u8, mime_type);
+        errdefer self.gpa.free(mime);
+        return .{ .data = encoded, .mime_type = mime };
+    }
+
     fn submitPrompt(self: *Loop, action: input.Action) !void {
         if (self.editor.endsWithBackslash() and action == .submit) {
             _ = self.editor.removeTrailingBackslash();
@@ -1927,30 +2178,35 @@ pub const Loop = struct {
             .not_slash => {},
             .handled_clear_editor => {
                 self.editor.clear();
+                self.clearClipboardTempFiles();
                 return;
             },
             .opened_picker_keep_editor => return,
         }
         var expanded_buffer: [Editor.capacity]u8 = undefined;
         const expanded = try self.editor.expandedText(&expanded_buffer);
+        var images = try self.clipboardImageAttachmentsFromPrompt(expanded);
+        defer images.deinit(self.gpa);
         const session = self.session orelse {
             self.submitted_prompt = .{};
             self.submitted_prompt.?.set(expanded);
             self.editor.pushHistory(expanded);
             self.editor.clear();
+            self.clearClipboardTempFiles();
             return;
         };
         const wake = self.wake orelse return error.NoWake;
         switch (action) {
-            .follow_up_submit => try self.driver.queuePrompt(self, session, expanded, .follow_up),
-            .steer_submit => try self.driver.queuePrompt(self, session, expanded, .steer),
+            .follow_up_submit => try self.driver.queuePrompt(self, session, expanded, images.images(), .follow_up),
+            .steer_submit => try self.driver.queuePrompt(self, session, expanded, images.images(), .steer),
             else => if (self.driver.state == .running)
-                try self.driver.queuePrompt(self, session, expanded, .steer)
+                try self.driver.queuePrompt(self, session, expanded, images.images(), .steer)
             else
-                try self.driver.submitPrompt(self, session, self.io, wake, expanded),
+                try self.driver.submitPrompt(self, session, self.io, wake, expanded, images.images()),
         }
         self.editor.pushHistory(expanded);
         self.editor.clear();
+        self.clearClipboardTempFiles();
     }
 
     fn dispatchSlashIfNeeded(self: *Loop, text: []const u8) !SlashDispatchResult {
@@ -2299,7 +2555,10 @@ pub const Loop = struct {
                 return;
             }
         }
-        if (self.editor.text().len != 0) self.editor.clear();
+        if (self.editor.text().len != 0) {
+            self.editor.clear();
+            self.clearClipboardTempFiles();
+        }
         self.exit_hint_visible = true;
         self.ctrl_c_deadline_ns = now_ns +| double_key_window_ns;
     }
@@ -2309,6 +2568,120 @@ pub const Loop = struct {
         self.exit_hint_visible = false;
     }
 };
+
+fn isPromptPathByte(byte: u8) bool {
+    return switch (byte) {
+        0...32, '"', '\'', '<', '>' => false,
+        else => true,
+    };
+}
+
+fn mimeTypeForImagePath(path: []const u8) ?[]const u8 {
+    const ext = std.fs.path.extension(path);
+    if (std.ascii.eqlIgnoreCase(ext, ".png")) return "image/png";
+    if (std.ascii.eqlIgnoreCase(ext, ".jpg") or std.ascii.eqlIgnoreCase(ext, ".jpeg")) return "image/jpeg";
+    if (std.ascii.eqlIgnoreCase(ext, ".webp")) return "image/webp";
+    if (std.ascii.eqlIgnoreCase(ext, ".gif")) return "image/gif";
+    return null;
+}
+
+fn nonEmptyEnv(environ: ?*const std.process.Environ.Map, name: []const u8) ?[]const u8 {
+    const env = environ orelse return null;
+    const value = env.get(name) orelse return null;
+    return if (std.mem.trim(u8, value, " \t\r\n").len == 0) null else value;
+}
+
+fn tmpDirFromEnv(environ: ?*const std.process.Environ.Map) []const u8 {
+    return nonEmptyEnv(environ, "TMPDIR") orelse
+        nonEmptyEnv(environ, "TEMP") orelse
+        nonEmptyEnv(environ, "TMP") orelse
+        "/tmp";
+}
+
+fn readClipboardImageToTempFile(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    task_runtime: *runtime.Runtime,
+    environ: ?*const std.process.Environ.Map,
+    tmp_dir: []const u8,
+    serial: u64,
+) anyerror!ClipboardImagePaste {
+    var image = try clipboard_image.read(allocator, io, task_runtime, environ);
+    defer image.deinit(allocator);
+
+    const path = try createClipboardImageTempFile(allocator, io, tmp_dir, serial, &image);
+    errdefer {
+        deleteClipboardTempPath(io, path);
+        allocator.free(path);
+    }
+    const mime_type = try allocator.dupe(u8, image.mime_type);
+    errdefer allocator.free(mime_type);
+    return .{ .path = path, .mime_type = mime_type, .byte_len = image.bytes.len };
+}
+
+fn createClipboardImageTempFile(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    tmp_dir: []const u8,
+    serial: u64,
+    image: *const clipboard_image.ClipboardImage,
+) ![]u8 {
+    const ext = clipboard_image.extensionForMimeType(image.mime_type) orelse return error.UnsupportedFormat;
+    var attempts: usize = 0;
+    while (attempts < 16) : (attempts += 1) {
+        const stamp = std.Io.Clock.awake.now(io).nanoseconds;
+        var name_buffer: [96]u8 = undefined;
+        const name = std.fmt.bufPrint(&name_buffer, "zi-clipboard-{d}-{d}-{d}.{s}", .{ stamp, serial, attempts, ext }) catch unreachable;
+        const path = try std.fs.path.join(allocator, &.{ tmp_dir, name });
+        errdefer allocator.free(path);
+
+        var file = std.Io.Dir.createFileAbsolute(io, path, .{
+            .read = true,
+            .exclusive = true,
+            .permissions = std.Io.File.Permissions.fromMode(0o600),
+        }) catch |err| switch (err) {
+            error.PathAlreadyExists => {
+                allocator.free(path);
+                continue;
+            },
+            else => return err,
+        };
+        defer file.close(io);
+
+        var write_buffer: [4096]u8 = undefined;
+        var writer = file.writer(io, &write_buffer);
+        try writer.interface.writeAll(image.bytes);
+        try writer.flush();
+        return path;
+    }
+    return error.PathAlreadyExists;
+}
+
+fn deleteClipboardTempPath(io: std.Io, path: []const u8) void {
+    std.Io.Dir.deleteFileAbsolute(io, path) catch {};
+}
+
+fn clipboardImageErrorText(err: anyerror) []const u8 {
+    return switch (err) {
+        error.NoImage => "clipboard has no image",
+        error.UnsupportedFormat => "clipboard image format unsupported",
+        error.ToolUnavailable => "clipboard image tool unavailable",
+        error.ImageTooLarge => "clipboard image too large",
+        error.Timeout => "clipboard image paste timed out",
+        error.EditorFull => "composer is full",
+        else => "could not paste clipboard image",
+    };
+}
+
+fn clipboardImageMarker(buffer: []u8, serial: u64, mime_type: []const u8, byte_len: usize) []const u8 {
+    const ext = clipboard_image.extensionForMimeType(mime_type) orelse "img";
+    const kib = (byte_len + 1023) / 1024;
+    if (kib < 1024) {
+        return std.fmt.bufPrint(buffer, "[image #{d} {s} {d} KiB]", .{ serial, ext, kib }) catch "[image]";
+    }
+    const tenths = (kib * 10 + 512) / 1024;
+    return std.fmt.bufPrint(buffer, "[image #{d} {s} {d}.{d} MiB]", .{ serial, ext, tenths / 10, tenths % 10 }) catch "[image]";
+}
 
 fn compactionFailureName(run: *const coding_agent.AgentSession.CompactionRun) ?[]const u8 {
     return switch (run.outcome) {
@@ -2492,6 +2865,32 @@ test "loop submit snapshots editor and clears input" {
     try std.testing.expectEqualStrings("hello", loop.submittedPrompt().?);
     try std.testing.expectEqualStrings("", loop.editor.text());
     try std.testing.expect(loop.dirty);
+}
+
+test "loop extracts tracked clipboard image attachments from expanded prompt" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "zi-clipboard-test.png", .data = "png-bytes" });
+
+    const cwd = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
+    defer std.testing.allocator.free(cwd);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "zi-clipboard-test.png" });
+    defer std.testing.allocator.free(path);
+
+    var loop = try Loop.init(std.testing.allocator, null);
+    defer loop.deinit();
+    loop.io = std.testing.io;
+    loop.clipboard_temp_paths[0] = try std.testing.allocator.dupe(u8, path);
+    loop.clipboard_temp_path_count = 1;
+
+    const prompt = try std.fmt.allocPrint(std.testing.allocator, "look @{s}", .{path});
+    defer std.testing.allocator.free(prompt);
+    var attachments = try loop.clipboardImageAttachmentsFromPrompt(prompt);
+    defer attachments.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), attachments.images().len);
+    try std.testing.expectEqualStrings("image/png", attachments.images()[0].mime_type);
+    try std.testing.expectEqualStrings("cG5nLWJ5dGVz", attachments.images()[0].data);
 }
 
 test "loop dispatches mapped key actions end-to-end" {

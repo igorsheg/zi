@@ -318,16 +318,23 @@ pub fn removeTrailingBackslash(self: *Editor) bool {
     return true;
 }
 
-fn insertPasteMarker(self: *Editor, bytes: []const u8) Error!void {
-    if (self.paste_marker_len == paste_marker_capacity) return error.EditorFull;
+pub fn insertPasteMarker(self: *Editor, bytes: []const u8) Error!void {
     var marker_text: [64]u8 = undefined;
     const line_count = countLines(bytes);
     const marker = std.fmt.bufPrint(&marker_text, "[paste #{d} +{d} lines]", .{ self.next_paste_id, line_count }) catch return error.EditorFull;
+    try self.insertMarker(marker, bytes);
+}
+
+pub fn insertMarker(self: *Editor, marker: []const u8, expansion: []const u8) Error!void {
+    if (!std.unicode.utf8ValidateSlice(marker)) return error.InvalidUtf8;
+    if (!std.unicode.utf8ValidateSlice(expansion)) return error.InvalidUtf8;
+    if (marker.len == 0) return;
+    if (self.paste_marker_len == paste_marker_capacity) return error.EditorFull;
     try self.recordUndo();
     const slot = &self.paste_markers[self.paste_marker_len];
     slot.id = self.next_paste_id;
     try slot.marker.set(marker, marker.len);
-    try slot.text.set(bytes, bytes.len);
+    try slot.text.set(expansion, expansion.len);
     self.paste_marker_len += 1;
     self.next_paste_id +%= 1;
     try self.insertRaw(marker);
@@ -535,6 +542,15 @@ test "editor collapses and expands large paste markers" {
     var out: [capacity]u8 = undefined;
     const expanded = try editor.expandedText(&out);
     try std.testing.expectEqualStrings(paste, expanded);
+}
+
+test "editor inserts forced marker with hidden expansion" {
+    var editor: Editor = .{};
+    try editor.insertMarker("[image #1 png 1 KiB]", "@/tmp/zi-clipboard-test.png");
+    try std.testing.expectEqualStrings("[image #1 png 1 KiB]", editor.text());
+    var out: [capacity]u8 = undefined;
+    const expanded = try editor.expandedText(&out);
+    try std.testing.expectEqualStrings("@/tmp/zi-clipboard-test.png", expanded);
 }
 
 test "editor treats paste marker as one cursor unit" {
