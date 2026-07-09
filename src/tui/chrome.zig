@@ -15,10 +15,8 @@ pub const PopupView = struct {
 };
 
 pub const PickerView = struct {
-    title: []const u8,
-    filter: []const u8,
     rows: []const screen.Line = &.{},
-    selected: usize = 0,
+    selected: ?usize = null,
 };
 
 pub const Snapshot = struct {
@@ -83,8 +81,8 @@ pub fn compose(snapshot: Snapshot, width: u16, height: u16) error{ FrameFull, Li
     for (snapshot.queue_lines[0..@min(snapshot.queue_lines.len, remaining_queue_rows)]) |line| try frame.appendLine(screen.singleSpanLine(line, screen.styles.muted));
     if (top_chrome.status_rows > 0) try frame.appendLine(screen.singleSpanLine(snapshot.status, screen.styles.muted));
     if (plan.editor_rows > 0) appendEditor(&frame, snapshot, @intCast(frame.rows().len), plan.editor_rows, width, useBorder(height, width) and plan.editor_rows >= 3) catch |err| return err;
+    if (snapshot.picker) |picker| try appendPicker(&frame, picker, plan.picker_rows);
     if (snapshot.popup) |popup| try appendPopup(&frame, popup, plan.popup_rows);
-    if (snapshot.picker) |picker| try appendPicker(&frame, picker, plan.picker_rows, width);
     return frame;
 }
 
@@ -101,6 +99,11 @@ pub fn transcriptRowCapacityWithChrome(editor: *const Editor, picker_open: bool,
 pub fn popupCandidateCapacity(editor: *const Editor, queue_line_count: usize, viewport_hint_len: usize, status_open: bool, width: u16, height: u16) usize {
     const top_chrome = clampedTopChromeRows(queueRowCount(queue_line_count, viewport_hint_len), if (status_open) 1 else 0, height);
     return rowPlan(editor, false, top_chrome.queue_rows, top_chrome.status_rows, popup_rows_max, width, height).popup_rows;
+}
+
+pub fn pickerPanelCapacity(editor: *const Editor, queue_line_count: usize, viewport_hint_len: usize, status_open: bool, width: u16, height: u16) usize {
+    const top_chrome = clampedTopChromeRows(queueRowCount(queue_line_count, viewport_hint_len), if (status_open) 1 else 0, height);
+    return rowPlan(editor, true, top_chrome.queue_rows, top_chrome.status_rows, 0, width, height).picker_rows;
 }
 
 fn transcriptRowCapacityFor(editor: *const Editor, picker_open: bool, queue_rows: usize, status_rows: usize, popup_rows: usize, width: u16, height: u16) usize {
@@ -160,14 +163,8 @@ fn popupRowCount(snapshot: Snapshot) usize {
     return if (snapshot.popup) |popup| @min(popup.rows.len, popup_rows_max) else 0;
 }
 
-fn pickerRows(height: u16) usize {
-    if (height <= 5) return 1;
-    const candidate_rows = @min(@as(usize, 8), @max(@as(usize, 2), (@as(usize, height) * 3) / 10));
-    return 1 + candidate_rows;
-}
-
-pub fn pickerCandidateCapacity(height: u16) usize {
-    return pickerRows(height) -| 1;
+fn pickerRows(_: u16) usize {
+    return popup_rows_max;
 }
 
 fn appendPopup(frame: *screen.Frame, popup: PopupView, rows: usize) error{ FrameFull, LineFull }!void {
@@ -176,26 +173,12 @@ fn appendPopup(frame: *screen.Frame, popup: PopupView, rows: usize) error{ Frame
     }
 }
 
-fn appendPicker(frame: *screen.Frame, picker: PickerView, rows: usize, width: u16) error{ FrameFull, LineFull }!void {
+fn appendPicker(frame: *screen.Frame, picker: PickerView, rows: usize) error{ FrameFull, LineFull }!void {
     if (rows == 0) return;
     const start_len = frame.rows().len;
-    var filter_line: screen.Line = .{};
-    try filter_line.append(.{ .text = picker.title, .style = screen.styles.accent });
-    if (picker.filter.len > 0) {
-        try filter_line.append(.{ .text = "  ", .style = screen.styles.muted });
-        try filter_line.append(.{ .text = picker.filter, .style = screen.styles.normal });
-    }
-    try frame.appendLine(filter_line);
-    const cursor_cols = screen.displayWidth(picker.title) + if (picker.filter.len > 0) 2 + screen.displayWidth(picker.filter) else 0;
-    frame.cursor = .{ .col = @intCast(@min(cursor_cols, if (width == 0) 0 else width - 1)), .row = @intCast(frame.rows().len - 1) };
-    if (rows == 1) return;
-    const visible_rows = rows - 1;
-    if (picker.rows.len == 0 and visible_rows > 0) {
-        try frame.appendLine(screen.singleSpanLine("  no matches", screen.styles.picker_detail));
-    } else {
-        for (picker.rows[0..@min(visible_rows, picker.rows.len)], 0..) |source, index| {
-            try appendSelectableLine(frame, source, index == picker.selected);
-        }
+    for (picker.rows[0..@min(rows, picker.rows.len)], 0..) |source, index| {
+        const selected = if (picker.selected) |selected_index| index == selected_index else false;
+        try appendSelectableLine(frame, source, selected);
     }
     while (frame.rows().len - start_len < rows) try frame.appendLine(.{});
 }
@@ -424,15 +407,14 @@ test "chrome renders picker with main selection marker" {
     const frame = try compose(.{
         .status = "ready",
         .editor = &editor,
-        .picker = .{ .title = "model", .filter = "gpt", .rows = &rows, .selected = 1 },
+        .picker = .{ .rows = &rows, .selected = 1 },
     }, 80, 10);
 
     var buffer: [128]u8 = undefined;
-    try std.testing.expect(std.mem.startsWith(u8, frame.rows()[4].copyText(&buffer), "│> "));
-    try std.testing.expectEqualStrings("model  gpt", frame.rows()[6].copyText(&buffer));
-    try std.testing.expectEqualStrings("  alpha", frame.rows()[7].copyText(&buffer));
-    try std.testing.expectEqualStrings("› beta", frame.rows()[8].copyText(&buffer));
-    try std.testing.expect(std.meta.eql(frame.rows()[8].row_style.bg, screen.styles.picker_selected_row.bg));
+    try std.testing.expectEqualStrings("  alpha", frame.rows()[4].copyText(&buffer));
+    try std.testing.expectEqualStrings("› beta", frame.rows()[5].copyText(&buffer));
+    try std.testing.expect(std.mem.startsWith(u8, frame.rows()[2].copyText(&buffer), "│> "));
+    try std.testing.expect(std.meta.eql(frame.rows()[5].row_style.bg, screen.styles.picker_selected_row.bg));
 }
 
 test "chrome renders completion popup with main selection marker" {
@@ -483,7 +465,7 @@ test "chrome picker keeps eighth visible candidate" {
     };
     const frame = try compose(.{
         .editor = &editor,
-        .picker = .{ .title = "model", .filter = "", .rows = &rows, .selected = 7 },
+        .picker = .{ .rows = &rows, .selected = 7 },
     }, 80, 30);
 
     var buffer: [128]u8 = undefined;

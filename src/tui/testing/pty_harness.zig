@@ -724,17 +724,22 @@ test "pty e2e: P4 completion model picker resume and new session" {
         .cwd = repo_abs,
         .rows = 24,
         .cols = 100,
-        .timeout_ms = 12_000,
+        .timeout_ms = 16_000,
         .max_output_bytes = 512 * 1024,
     }, &.{
         .{ .after_ms = 500, .bytes = "/help\r" },
-        .{ .after_ms = 1_300, .bytes = "/model\r" },
-        .{ .after_ms = 1_800, .bytes = "\r" },
-        .{ .after_ms = 2_300, .bytes = resume_command },
-        .{ .after_ms = 3_300, .bytes = "/new\r" },
-        .{ .after_ms = 4_100, .bytes = "new session prompt\r" },
-        .{ .after_ms = 6_000, .bytes = "\x03" },
-        .{ .after_ms = 6_200, .bytes = "\x03" },
+        .{ .after_ms = 1_100, .bytes = "/settings\r" },
+        .{ .after_ms = 1_500, .bytes = "\t" },
+        .{ .after_ms = 1_900, .bytes = "high" },
+        .{ .after_ms = 2_200, .bytes = "\t" },
+        .{ .after_ms = 2_800, .bytes = "/session\r" },
+        .{ .after_ms = 3_600, .bytes = "/model\r" },
+        .{ .after_ms = 4_100, .bytes = "\r" },
+        .{ .after_ms = 4_800, .bytes = resume_command },
+        .{ .after_ms = 5_900, .bytes = "/new\r" },
+        .{ .after_ms = 6_900, .bytes = "new session prompt\r" },
+        .{ .after_ms = 9_000, .bytes = "\x03" },
+        .{ .after_ms = 9_200, .bytes = "\x03" },
     });
     defer second.deinit(std.testing.allocator);
     if (second.timed_out) {
@@ -743,6 +748,8 @@ test "pty e2e: P4 completion model picker resume and new session" {
     }
     try std.testing.expect(exitedZero(second.status));
     try std.testing.expect(second.termios_restored != false);
+    try expectContains(second.output, "Thinking effort");
+    try expectContains(second.output, "thinking: high");
     try expectContains(second.output, "› ");
     var summaries_after = try session_listing.listRuntimeSessionSummaries(std.testing.allocator, std.testing.io, .{
         .cwd = repo_abs,

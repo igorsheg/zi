@@ -156,7 +156,7 @@ Numbered; P-column = phase that delivers it.
 | B12 | P3 | Virtual scrollback: wheel (3 lines/tick), PgUp/PgDn (viewport−2 lines). Scrolled-up view is anchored — streaming appends below do not move it; chrome shows "↓ N new lines"; PgDn at bottom (or any submit) re-pins to follow-tail. |
 | B13 | P2 | Enter on `/command` input dispatches slash commands (§9.4): /help /session /model /resume /new /compact /settings. Unknown → notice with the catalog. |
 | B14 | P4 | Slash-command autocomplete popup when the editor starts with `/`; `@`-token file completion via `file_completion.Index` (Tab forces). Popup replaces nothing — it overlays above the editor inside the chrome region. |
-| B15 | P4 | Pickers (model, session) replace the editor in place; typed filter, Up/Down, Enter selects, ESC restores editor + focus. |
+| B15 | P4 | Pickers (model, session, settings) render in a fixed-height panel below the composer, pushing the composer upward. The composer remains the focused omni input and supplies filter text; picker rows overflow inside the panel by selection-windowing. Up/Down moves selection, Enter/Tab selects or pushes a child frame, ESC pops a child frame or hides the root without changing editor text. |
 | B16 | P4 | Session restore renders the full transcript (user/assistant/tools matched to results by call_id/compaction summaries) through the same `Transcript.apply` fold as live events; user messages seed editor history; header shows "compacted N times" when applicable. |
 | B17 | P2 | Compaction: cancellable status spinner "Compacting context… (esc to cancel)"; on success a compaction-summary block is appended and the run resubmits when `will_retry`. Threshold compaction auto-runs after a completed run when `shouldRunThresholdCompaction()` (`AgentSession.zig:973-982`). |
 | B18 | P2 | Auto-retry: status line "Retrying (n/max) in Ns… (esc to cancel)" with a live countdown ticking from the loop clock; error notice only on final failure. |
@@ -919,14 +919,23 @@ not in AgentSession).
 
 ### 9.3 Pickers (B15)
 
-`Focus = union(enum){ editor, picker: *Picker }`. A `Picker` = title + filter line
-+ `[]Row{ id, label, detail, meta }` + selection; fuzzy filter = case-insensitive
-subsequence match, stable order. Model picker rows: `ai.models` filtered to
-`provider_registry.get(model.api) != null`, authed providers
-(`auth_manager.hasAuth`) sorted first, label = `provider/model_id`. Session picker
-rows: `session_listing.listRuntimeSessionSummaries` (`session_listing.zig:133`,
-fields title/detail/meta/aux/file_name, 36-51). Selection → typed callback in
-Loop; ESC → restore editor focus. The picker replaces the editor region.
+Picker/listbox state is a bounded stack of typed frames. Stack entries carry
+frame kind + selected row metadata; Loop owns the bounded row buffer for the
+active top frame. The picker does **not** own text input or focus. The composer
+is the omni input: the current slash-argument token supplies filter text,
+printable keys edit the composer, Up/Down moves the top frame selection,
+Enter/Tab selects the row, and ESC pops one child frame or hides the root frame
+without restoring or rewriting editor text. Chrome renders the active frame in a
+fixed-height panel below the composer; row overflow is handled by Loop windowing
+around the selected row.
+Model picker rows: `ai.models` filtered to `provider_registry.get(model.api) !=
+null`, authed providers (`auth_manager.hasAuth`) sorted first, label =
+`provider/model_id`. Session picker rows:
+`session_listing.listRuntimeSessionSummaries` (`session_listing.zig:133`, fields
+title/detail/meta/aux/file_name, 36-51). Settings root rows push child frames such
+as thinking effort and thinking visibility; child selections emit direct typed
+setting actions in Loop. Selection → typed callback in Loop. The picker never
+replaces the editor region.
 
 ### 9.4 Slash-command effects (owner: `Loop.dispatchSlash`, catalog:
 `slash_commands.zig:39-129`)
@@ -941,7 +950,7 @@ Loop; ESC → restore editor focus. The picker replaces the editor region.
 | `.resume_session` (args) | switch §9.6 with `.resume_existing{ .session_file_name = args }` |
 | `.new_session` | switch §9.6 with `.create` (fresh SessionStamp id `tui-<ns>`) |
 | `.compact` | manual compaction per §7.5 |
-| `.settings` bare | Appendix C settings-usage notice |
+| `.settings` bare | open settings root frame with `/settings ` kept in the composer; category rows can push child frames such as thinking effort/visibility |
 | `.thinking_level` | `session.setThinkingLevel(level)` (753-762) + notice |
 | `.hide_thinking` | `session.setHideThinking(v)` (766-768) + `services.settings_manager.setHideThinkingBlock(v)` (`settings.zig:131`) + epoch bump (B2) |
 | `.unknown` | Appendix C unknown-command notice |

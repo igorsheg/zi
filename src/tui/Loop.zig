@@ -47,7 +47,6 @@ const completion_popup_rows_max: usize = chrome.popup_rows_max;
 const completion_candidates_max: usize = 64;
 const completion_text_bytes_max: usize = 256;
 const picker_rows_max: usize = 128;
-const picker_filter_bytes_max: usize = 128;
 const picker_visible_rows_max: usize = 8;
 const title_buffer_len: usize = 256;
 const composer_label_buffer_len: usize = 256;
@@ -452,7 +451,18 @@ const CompletionPopup = struct {
     }
 };
 
-const PickerKind = enum { model, session };
+const picker_stack_depth_max: usize = 4;
+
+const PickerKind = enum { model, session, settings_root, settings_thinking_effort, settings_thinking_visibility };
+
+const PickerAction = union(enum) {
+    none,
+    apply_model,
+    resume_session,
+    push: PickerKind,
+    thinking_level: agent_mod.ThinkingLevel,
+    hide_thinking: bool,
+};
 
 const PickerRow = struct {
     id: [completion_text_bytes_max]u8 = undefined,
@@ -465,14 +475,16 @@ const PickerRow = struct {
     meta_len: u16 = 0,
     model: ?ai.Model = null,
     authed: bool = true,
+    action: PickerAction = .none,
 
-    fn set(self: *PickerRow, id: []const u8, label: []const u8, detail: []const u8, meta: []const u8, model: ?ai.Model, authed: bool) void {
+    fn set(self: *PickerRow, id: []const u8, label: []const u8, detail: []const u8, meta: []const u8, model: ?ai.Model, authed: bool, action: PickerAction) void {
         self.id_len = copyBounded(self.id[0..], id);
         self.label_len = copyBounded(self.label[0..], label);
         self.detail_len = copyBounded(self.detail[0..], detail);
         self.meta_len = copyBounded(self.meta[0..], meta);
         self.model = model;
         self.authed = authed;
+        self.action = action;
     }
 
     fn idSlice(self: *const PickerRow) []const u8 {
@@ -492,52 +504,72 @@ const PickerRow = struct {
     }
 };
 
+const PickerFrame = struct {
+    kind: PickerKind = .model,
+    selected_row: ?usize = null,
+};
+
 const Picker = struct {
     active: bool = false,
     kind: PickerKind = .model,
-    title: [64]u8 = undefined,
-    title_len: u8 = 0,
-    filter: [picker_filter_bytes_max]u8 = undefined,
-    filter_len: u8 = 0,
     rows: [picker_rows_max]PickerRow = undefined,
     row_len: usize = 0,
     selected_row: ?usize = null,
-    saved_editor: [Editor.capacity]u8 = undefined,
-    saved_editor_len: usize = 0,
+    stack: [picker_stack_depth_max]PickerFrame = undefined,
+    depth: usize = 0,
 
-    fn reset(self: *Picker, kind: PickerKind, title: []const u8, saved_editor: []const u8) void {
+    fn reset(self: *Picker, next_kind: PickerKind) void {
         self.active = true;
-        self.kind = kind;
-        self.title_len = @intCast(copyBounded(self.title[0..], title));
-        self.filter_len = 0;
+        self.kind = next_kind;
         self.row_len = 0;
         self.selected_row = null;
-        self.saved_editor_len = copyBounded(self.saved_editor[0..], saved_editor);
+        self.depth = 1;
+    }
+
+    fn push(self: *Picker, next_kind: PickerKind) bool {
+        if (!self.active or self.depth == self.stack.len) return false;
+        self.stack[self.depth - 1] = .{ .kind = self.kind, .selected_row = self.selected_row };
+        self.kind = next_kind;
+        self.row_len = 0;
+        self.selected_row = null;
+        self.depth += 1;
+        return true;
+    }
+
+    fn pop(self: *Picker) bool {
+        if (!self.active or self.depth <= 1) return false;
+        self.depth -= 1;
+        const frame = self.stack[self.depth - 1];
+        self.kind = frame.kind;
+        self.row_len = 0;
+        self.selected_row = frame.selected_row;
+        return true;
     }
 
     fn clear(self: *Picker) void {
         self.active = false;
-        self.filter_len = 0;
         self.row_len = 0;
         self.selected_row = null;
-        self.saved_editor_len = 0;
+        self.depth = 0;
     }
 
-    fn savedEditorSlice(self: *const Picker) []const u8 {
-        return self.saved_editor[0..self.saved_editor_len];
+    fn top(self: *Picker) *Picker {
+        std.debug.assert(self.active and self.depth > 0);
+        return self;
     }
 
-    fn titleSlice(self: *const Picker) []const u8 {
-        return self.title[0..self.title_len];
+    fn topConst(self: *const Picker) *const Picker {
+        std.debug.assert(self.active and self.depth > 0);
+        return self;
     }
 
-    fn filterSlice(self: *const Picker) []const u8 {
-        return self.filter[0..self.filter_len];
+    fn currentKind(self: *const Picker) PickerKind {
+        return self.kind;
     }
 
-    fn appendRow(self: *Picker, id: []const u8, label: []const u8, detail: []const u8, meta: []const u8, model: ?ai.Model, authed: bool) void {
+    fn appendRow(self: *Picker, id: []const u8, label: []const u8, detail: []const u8, meta: []const u8, model: ?ai.Model, authed: bool, action: PickerAction) void {
         if (self.row_len == self.rows.len) return;
-        self.rows[self.row_len].set(id, label, detail, meta, model, authed);
+        self.rows[self.row_len].set(id, label, detail, meta, model, authed, action);
         if (self.selected_row == null) self.selected_row = self.row_len;
         self.row_len += 1;
     }
@@ -585,6 +617,9 @@ pub const Loop = struct {
     services: ?*coding_agent.runtime_services.RuntimeServices = null,
     completion: CompletionPopup = .{},
     picker: Picker = .{},
+    dismissed_picker_kind: ?PickerKind = null,
+    dismissed_picker_text: [Editor.capacity]u8 = undefined,
+    dismissed_picker_text_len: usize = 0,
     completion_lines: [completion_popup_rows_max]screen.Line = undefined,
     picker_lines: [picker_visible_rows_max]screen.Line = undefined,
     file_index: ?coding_agent.file_completion.Index = null,
@@ -779,12 +814,15 @@ pub const Loop = struct {
         const queue_lines = self.collectQueueLines();
         const status = self.statusText();
         self.updateViewportHint();
-        const picker_view = self.pickerView(height);
+        var picker_capacity = chrome.pickerPanelCapacity(&self.editor, queue_lines.len, self.viewport_hint.len, status.len > 0, width, height);
+        var picker_view = self.pickerView(picker_capacity);
         var popup_view = self.popupView(if (picker_view == null) chrome.popupCandidateCapacity(&self.editor, queue_lines.len, self.viewport_hint.len, status.len > 0, width, height) else 0);
         var popup_rows = if (popup_view) |popup| popup.rows.len else 0;
         var transcript_rows = chrome.transcriptRowCapacityWithChrome(&self.editor, picker_view != null, queue_lines.len, self.viewport_hint.len, popup_rows, status.len > 0, width, height);
         self.applyPendingViewportMotion(transcript_rows);
         self.updateViewportHint();
+        picker_capacity = chrome.pickerPanelCapacity(&self.editor, queue_lines.len, self.viewport_hint.len, status.len > 0, width, height);
+        picker_view = self.pickerView(picker_capacity);
         popup_view = self.popupView(if (picker_view == null) chrome.popupCandidateCapacity(&self.editor, queue_lines.len, self.viewport_hint.len, status.len > 0, width, height) else 0);
         popup_rows = if (popup_view) |popup| popup.rows.len else 0;
         transcript_rows = chrome.transcriptRowCapacityWithChrome(&self.editor, picker_view != null, queue_lines.len, self.viewport_hint.len, popup_rows, status.len > 0, width, height);
@@ -1270,17 +1308,23 @@ pub const Loop = struct {
         return @min(selected - capacity + 1, total -| capacity);
     }
 
-    fn pickerView(self: *Loop, height: u16) ?chrome.PickerView {
+    fn pickerView(self: *Loop, capacity: usize) ?chrome.PickerView {
         if (!self.picker.active) return null;
+        const visible_capacity = @min(capacity, self.picker_lines.len);
+        if (visible_capacity == 0) return null;
+        const frame = self.picker.topConst();
         var visible: [picker_rows_max]usize = undefined;
         const rows = self.filteredPickerRows(&visible);
-        const capacity = @min(chrome.pickerCandidateCapacity(height), self.picker_lines.len);
-        const offset = self.pickerVisibleOffset(rows, capacity);
-        const count = @min(rows.len -| offset, capacity);
+        const offset = self.pickerVisibleOffset(rows, visible_capacity);
+        const count = @min(rows.len -| offset, visible_capacity);
+        if (count == 0) {
+            self.picker_lines[0] = screen.singleSpanLine("  no matches", screen.styles.picker_detail);
+            return .{ .rows = self.picker_lines[0..1], .selected = null };
+        }
         for (rows[offset..][0..count], 0..) |row_index, visible_index| {
-            const row = &self.picker.rows[row_index];
+            const row = &frame.rows[row_index];
             var line: screen.Line = .{};
-            line.append(.{ .text = row.labelSlice(), .style = if (self.picker.selected_row == row_index) screen.styles.accent else screen.styles.normal }) catch {};
+            line.append(.{ .text = row.labelSlice(), .style = if (frame.selected_row == row_index) screen.styles.accent else screen.styles.normal }) catch {};
             if (row.detailSlice().len > 0) {
                 line.append(.{ .text = "  ", .style = screen.styles.muted }) catch {};
                 line.append(.{ .text = row.detailSlice(), .style = screen.styles.muted }) catch {};
@@ -1291,12 +1335,12 @@ pub const Loop = struct {
             }
             self.picker_lines[visible_index] = line;
         }
-        return .{ .title = self.picker.titleSlice(), .filter = self.picker.filterSlice(), .rows = self.picker_lines[0..count], .selected = self.pickerSelectedVisibleIndex(rows, offset, capacity) };
+        return .{ .rows = self.picker_lines[0..count], .selected = self.pickerSelectedVisibleIndex(rows, offset, visible_capacity) };
     }
 
     fn pickerVisibleOffset(self: *Loop, rows: []const usize, capacity: usize) usize {
         if (capacity == 0) return 0;
-        const selected = self.picker.selected_row orelse return 0;
+        const selected = self.picker.topConst().selected_row orelse return 0;
         var selected_visible: usize = 0;
         for (rows, 0..) |row_index, index| if (row_index == selected) {
             selected_visible = index;
@@ -1307,22 +1351,33 @@ pub const Loop = struct {
     }
 
     fn pickerSelectedVisibleIndex(self: *Loop, rows: []const usize, offset: usize, capacity: usize) usize {
-        const selected = self.picker.selected_row orelse return 0;
+        const selected = self.picker.topConst().selected_row orelse return 0;
         for (rows[offset..@min(rows.len, offset + capacity)], 0..) |row_index, index| {
             if (row_index == selected) return index;
         }
         return 0;
     }
 
-    fn filteredPickerRows(self: *Loop, out: *[picker_rows_max]usize) []const usize {
+    fn filteredPickerRows(self: *const Loop, out: *[picker_rows_max]usize) []const usize {
+        const frame = self.picker.topConst();
         var count: usize = 0;
-        const filter = self.picker.filterSlice();
-        for (self.picker.rows[0..self.picker.row_len], 0..) |row, index| {
-            if (filter.len != 0 and !fuzzyMatch(row.labelSlice(), filter) and !fuzzyMatch(row.detailSlice(), filter) and !fuzzyMatch(row.metaSlice(), filter)) continue;
+        const filter = self.pickerFilterText(frame.kind);
+        for (frame.rows[0..frame.row_len], 0..) |row, index| {
+            if (filter.len != 0 and !fuzzyMatch(row.labelSlice(), filter) and !fuzzyMatch(row.detailSlice(), filter) and !fuzzyMatch(row.metaSlice(), filter) and !fuzzyMatch(row.idSlice(), filter)) continue;
             out[count] = index;
             count += 1;
         }
         return out[0..count];
+    }
+
+    fn pickerFilterText(self: *const Loop, kind: PickerKind) []const u8 {
+        const query = self.slashArgQuery() orelse return "";
+        if (!pickerKindAcceptsQuery(kind, query.kind)) return "";
+        if (pickerKindIsSettingsChild(kind)) {
+            const prefix = "thinking:";
+            if (std.mem.startsWith(u8, query.text, prefix)) return query.text[prefix.len..];
+        }
+        return query.text;
     }
 
     fn pollFileIndexTask(self: *Loop) !bool {
@@ -1437,40 +1492,41 @@ pub const Loop = struct {
     }
 
     const CompletionRefresh = enum { auto, force_file };
+    const SlashDispatchResult = enum { not_slash, handled_clear_editor, opened_picker_keep_editor };
+
+    const SlashArgQuery = struct {
+        kind: PickerKind,
+        text: []const u8,
+    };
 
     fn handlePickerAction(self: *Loop, action: input.Action) !bool {
         if (!self.picker.active) return false;
         switch (action) {
             .cancel => {
-                try self.cancelPicker();
+                try self.backPicker();
                 return true;
             },
-            .insert => |text| {
-                if (self.picker.filter_len + text.len <= self.picker.filter.len and std.unicode.utf8ValidateSlice(text)) {
-                    @memcpy(self.picker.filter[self.picker.filter_len..][0..text.len], text);
-                    self.picker.filter_len += @intCast(text.len);
-                    self.selectFirstVisiblePickerRow();
-                }
-                return true;
-            },
-            .key_editor => |op| {
-                switch (op) {
-                    .move_up_history => self.movePickerSelection(-1),
-                    .move_down_history => self.movePickerSelection(1),
-                    .backspace => self.pickerBackspace(),
-                    .clear => {
-                        self.picker.filter_len = 0;
-                        self.selectFirstVisiblePickerRow();
-                    },
-                    else => {},
-                }
-                return true;
+            .key_editor => |op| switch (op) {
+                .move_up_history => {
+                    self.movePickerSelection(-1);
+                    return true;
+                },
+                .move_down_history => {
+                    self.movePickerSelection(1);
+                    return true;
+                },
+                .tab => {
+                    try self.acceptPickerSelection();
+                    return true;
+                },
+                else => return false,
             },
             .submit => {
+                if (self.picker.topConst().selected_row == null) return true;
                 try self.acceptPickerSelection();
                 return true;
             },
-            else => return true,
+            else => return false,
         }
     }
 
@@ -1519,7 +1575,13 @@ pub const Loop = struct {
     }
 
     fn refreshCompletion(self: *Loop, mode: CompletionRefresh) !void {
-        if (self.picker.active) return;
+        if (mode == .auto) {
+            if (try self.syncSlashArgPicker()) {
+                self.completion.clear();
+                return;
+            }
+            if (self.picker.active) self.picker.clear();
+        }
         const token = self.editor.currentToken() orelse blk: {
             if (mode != .force_file) {
                 self.completion.clear();
@@ -1531,7 +1593,6 @@ pub const Loop = struct {
         if (mode == .force_file) return self.refreshFileCompletion(token, true);
         if (std.mem.startsWith(u8, token.text, "/")) return self.refreshSlashCompletion(token.text);
         if (std.mem.startsWith(u8, token.text, "@")) return self.refreshFileCompletion(token, false);
-        if (std.mem.startsWith(u8, self.editor.text(), "/settings ") and std.mem.startsWith(u8, token.text, "thinking:")) return self.refreshSettingsCompletion(token.text);
         self.completion.clear();
     }
 
@@ -1544,18 +1605,6 @@ pub const Loop = struct {
             var insert_buffer: [80]u8 = undefined;
             const insert = std.fmt.bufPrint(&insert_buffer, "/{s} ", .{command.name}) catch label;
             self.completion.append(label, insert, command.summary, true);
-        }
-        if (self.completion.candidate_len == 0) self.completion.clear();
-    }
-
-    fn refreshSettingsCompletion(self: *Loop, token_text: []const u8) !void {
-        self.completion.reset(.slash);
-        const values = [_][]const u8{ "off", "minimal", "low", "medium", "high", "xhigh", "shown", "hidden" };
-        for (values) |value| {
-            var label_buffer: [64]u8 = undefined;
-            const label = std.fmt.bufPrint(&label_buffer, "thinking:{s}", .{value}) catch continue;
-            if (!startsWithIgnoreCase(label, token_text)) continue;
-            self.completion.append(label, label, "", true);
         }
         if (self.completion.candidate_len == 0) self.completion.clear();
     }
@@ -1587,31 +1636,127 @@ pub const Loop = struct {
     fn acceptCompletion(self: *Loop) !void {
         const candidate = self.completion.selectedCandidate() orelse return;
         if (!candidate.selectable) return;
+        const mode = self.completion.mode;
         const token = self.editor.currentToken() orelse blk: {
             const cursor = self.editor.cursorByte();
             break :blk Editor.Token{ .start = cursor, .end = cursor, .text = self.editor.text()[cursor..cursor] };
         };
         try self.editor.replaceToken(token, candidate.insertSlice());
         self.completion.clear();
+        if (mode == .slash) try self.refreshCompletion(.auto);
+        self.dirty = true;
+    }
+    fn syncSlashArgPicker(self: *Loop) !bool {
+        const query = self.slashArgQuery() orelse return false;
+        if (self.isPickerDismissed(query.kind)) return false;
+        if (self.picker.active and pickerKindIsSettingsChild(self.picker.currentKind()) and query.kind == .settings_root and !std.mem.startsWith(u8, query.text, "thinking:")) {
+            self.openSettingsRootPicker();
+        } else if (!self.picker.active or !pickerKindAcceptsQuery(self.picker.currentKind(), query.kind)) {
+            try self.openPicker(query.kind);
+        }
+        self.syncPickerSelection();
+        return self.picker.active;
+    }
+
+    fn slashArgQuery(self: *const Loop) ?SlashArgQuery {
+        const text = self.editor.text();
+        const cursor = self.editor.cursorByte();
+        if (cursor > text.len or text.len < 2 or text[0] != '/') return null;
+        var name_end: usize = 1;
+        while (name_end < text.len and !std.ascii.isWhitespace(text[name_end])) name_end += 1;
+        if (name_end == 1 or name_end >= text.len or !std.ascii.isWhitespace(text[name_end])) return null;
+        const kind = pickerKindForSlashName(text[1..name_end]) orelse return null;
+        var args_start = name_end;
+        while (args_start < text.len and std.ascii.isWhitespace(text[args_start])) args_start += 1;
+        if (cursor < args_start) return null;
+        var token_start = cursor;
+        while (token_start > args_start and !std.ascii.isWhitespace(text[token_start - 1])) token_start -= 1;
+        return .{ .kind = kind, .text = text[token_start..cursor] };
+    }
+
+    fn pickerKindForSlashName(name: []const u8) ?PickerKind {
+        if (std.mem.eql(u8, name, "model")) return .model;
+        if (std.mem.eql(u8, name, "resume")) return .session;
+        if (std.mem.eql(u8, name, "settings")) return .settings_root;
+        return null;
+    }
+
+    fn pickerKindIsSettings(kind: PickerKind) bool {
+        return switch (kind) {
+            .settings_root, .settings_thinking_effort, .settings_thinking_visibility => true,
+            .model, .session => false,
+        };
+    }
+
+    fn pickerKindIsSettingsChild(kind: PickerKind) bool {
+        return switch (kind) {
+            .settings_thinking_effort, .settings_thinking_visibility => true,
+            .model, .session, .settings_root => false,
+        };
+    }
+
+    fn pickerKindAcceptsQuery(kind: PickerKind, query_kind: PickerKind) bool {
+        if (query_kind == .settings_root) return pickerKindIsSettings(kind);
+        return kind == query_kind;
+    }
+
+    fn openPicker(self: *Loop, kind: PickerKind) !void {
+        self.clearPickerDismissal();
+        switch (kind) {
+            .model => try self.openModelPicker(),
+            .session => try self.openSessionPicker(),
+            .settings_root => self.openSettingsRootPicker(),
+            .settings_thinking_effort, .settings_thinking_visibility => {
+                self.openSettingsRootPicker();
+                try self.pushPickerFrame(kind);
+            },
+        }
+    }
+
+    fn pushPickerFrame(self: *Loop, kind: PickerKind) !void {
+        if (!self.picker.push(kind)) return error.PickerStackFull;
+        self.populatePickerRowsForKind(kind);
+        try self.normalizeComposerForPickerKind(kind);
+        self.syncPickerSelection();
+        self.completion.clear();
         self.dirty = true;
     }
 
-    fn selectFirstVisiblePickerRow(self: *Loop) void {
+    fn normalizeComposerForPickerKind(self: *Loop, kind: PickerKind) !void {
+        switch (kind) {
+            .settings_root => try self.setComposerText("/settings "),
+            .settings_thinking_effort, .settings_thinking_visibility => try self.setComposerText("/settings thinking:"),
+            .model, .session => {},
+        }
+    }
+
+    fn setComposerText(self: *Loop, text: []const u8) !void {
+        if (std.mem.eql(u8, self.editor.text(), text)) return;
+        self.editor.clear();
+        try self.editor.insert(text);
+    }
+
+    fn syncPickerSelection(self: *Loop) void {
+        const frame = self.picker.top();
         var visible: [picker_rows_max]usize = undefined;
         const rows = self.filteredPickerRows(&visible);
-        self.picker.selected_row = if (rows.len == 0) null else rows[0];
+        if (frame.selected_row) |selected| {
+            for (rows) |row_index| if (row_index == selected) return;
+        }
+        frame.selected_row = if (rows.len == 0) null else rows[0];
         self.dirty = true;
     }
 
     fn movePickerSelection(self: *Loop, delta: i32) void {
+        const frame = self.picker.top();
         var visible: [picker_rows_max]usize = undefined;
         const rows = self.filteredPickerRows(&visible);
         if (rows.len == 0) {
-            self.picker.selected_row = null;
+            frame.selected_row = null;
             return;
         }
         var current: usize = 0;
-        if (self.picker.selected_row) |selected| for (rows, 0..) |row_index, index| {
+        if (frame.selected_row) |selected| for (rows, 0..) |row_index, index| {
             if (row_index == selected) {
                 current = index;
                 break;
@@ -1619,34 +1764,61 @@ pub const Loop = struct {
         };
         const len: i32 = @intCast(rows.len);
         const next = @mod(@as(i32, @intCast(current)) + delta, len);
-        self.picker.selected_row = rows[@intCast(next)];
+        frame.selected_row = rows[@intCast(next)];
         self.dirty = true;
     }
 
-    fn pickerBackspace(self: *Loop) void {
-        if (self.picker.filter_len == 0) return;
-        self.picker.filter_len -= 1;
-        while (self.picker.filter_len > 0 and (self.picker.filter[self.picker.filter_len] & 0xc0) == 0x80) self.picker.filter_len -= 1;
-        self.selectFirstVisiblePickerRow();
+    fn backPicker(self: *Loop) !void {
+        if (self.picker.pop()) {
+            self.populatePickerRowsForKind(self.picker.currentKind());
+            try self.normalizeComposerForPickerKind(self.picker.currentKind());
+            self.syncPickerSelection();
+            self.dirty = true;
+            return;
+        }
+        self.dismissPicker();
     }
 
-    fn cancelPicker(self: *Loop) !void {
-        const saved = self.picker.savedEditorSlice();
-        self.editor.clear();
-        try self.editor.insert(saved);
+    fn dismissPicker(self: *Loop) void {
+        self.dismissed_picker_kind = self.picker.currentKind();
+        self.dismissed_picker_text_len = copyBounded(self.dismissed_picker_text[0..], self.editor.text());
         self.picker.clear();
         self.dirty = true;
+    }
+
+    fn clearPickerDismissal(self: *Loop) void {
+        self.dismissed_picker_kind = null;
+        self.dismissed_picker_text_len = 0;
+    }
+
+    fn isPickerDismissed(self: *Loop, kind: PickerKind) bool {
+        const dismissed = self.dismissed_picker_kind orelse return false;
+        const text = self.editor.text();
+        if (dismissed == kind and std.mem.eql(u8, text, self.dismissed_picker_text[0..self.dismissed_picker_text_len])) return true;
+        self.clearPickerDismissal();
+        return false;
     }
 
     fn acceptPickerSelection(self: *Loop) !void {
-        const selected = self.picker.selected_row orelse return;
-        const row = self.picker.rows[selected];
-        const kind = self.picker.kind;
-        self.picker.clear();
-        switch (kind) {
-            .model => if (row.model) |model| try self.applyModelSelection(model, row.authed),
-            .session => try self.switchSession(.{ .resume_existing = .{ .session_file_name = row.idSlice() } }, "resumed session"),
+        const frame = self.picker.top();
+        const selected = frame.selected_row orelse return;
+        const row = frame.rows[selected];
+        switch (row.action) {
+            .none => return,
+            .push => |kind| {
+                try self.pushPickerFrame(kind);
+                return;
+            },
+            .apply_model => if (row.model) |model| try self.applyModelSelection(model, row.authed),
+            .resume_session => try self.switchSession(.{ .resume_existing = .{ .session_file_name = row.idSlice() } }, "resumed session"),
+            .thinking_level => |level| try self.applyThinkingLevelSetting(level),
+            .hide_thinking => |hidden| try self.applyHideThinkingSetting(hidden),
         }
+        self.picker.clear();
+        self.clearPickerDismissal();
+        self.editor.clear();
+        self.completion.clear();
+        self.dirty = true;
     }
 
     fn submitPrompt(self: *Loop, action: input.Action) !void {
@@ -1658,9 +1830,13 @@ pub const Loop = struct {
         const text = self.editor.text();
         if (text.len == 0) return;
         self.repinViewport();
-        if (try self.dispatchSlashIfNeeded(text)) {
-            self.editor.clear();
-            return;
+        switch (try self.dispatchSlashIfNeeded(text)) {
+            .not_slash => {},
+            .handled_clear_editor => {
+                self.editor.clear();
+                return;
+            },
+            .opened_picker_keep_editor => return,
         }
         var expanded_buffer: [Editor.capacity]u8 = undefined;
         const expanded = try self.editor.expandedText(&expanded_buffer);
@@ -1684,8 +1860,8 @@ pub const Loop = struct {
         self.editor.clear();
     }
 
-    fn dispatchSlashIfNeeded(self: *Loop, text: []const u8) !bool {
-        const action = slash_commands.dispatch(text) orelse return false;
+    fn dispatchSlashIfNeeded(self: *Loop, text: []const u8) !SlashDispatchResult {
+        const action = slash_commands.dispatch(text) orelse return .not_slash;
         switch (action) {
             .help => {
                 var buffer: [160]u8 = undefined;
@@ -1694,14 +1870,18 @@ pub const Loop = struct {
             .session => try self.showSessionNotice(),
             .model => |model| {
                 if (model.len == 0) {
-                    try self.openModelPicker();
+                    try self.ensureSlashArgSpace("model");
+                    try self.openPicker(.model);
+                    return .opened_picker_keep_editor;
                 } else {
                     try self.setModelByName(model);
                 }
             },
             .resume_session => |selector| {
                 if (selector.len == 0) {
-                    try self.openSessionPicker();
+                    try self.ensureSlashArgSpace("resume");
+                    try self.openPicker(.session);
+                    return .opened_picker_keep_editor;
                 } else {
                     try self.switchSession(.{ .resume_existing = .{ .session_file_name = selector } }, "resumed session");
                 }
@@ -1715,32 +1895,25 @@ pub const Loop = struct {
             .compact => {
                 const session = self.session orelse {
                     try self.notice(.info, "nothing to compact");
-                    return true;
+                    return .handled_clear_editor;
                 };
                 const wake = self.wake orelse return error.NoWake;
                 try self.driver.startManualCompaction(self, session, self.io, wake);
             },
-            .settings => try self.notice(.warn, "usage: /settings thinking:<off|minimal|low|medium|high|xhigh|shown|hidden>"),
-            .thinking_level => |level| {
-                const session = self.session orelse return true;
-                try session.setThinkingLevel(level);
-                self.pending_title_update = true;
-                self.dirty = true;
+            .settings => {
+                try self.ensureSlashArgSpace("settings");
+                try self.openPicker(.settings_root);
+                return .opened_picker_keep_editor;
             },
-            .hide_thinking => |hidden| {
-                const session = self.session orelse return true;
-                const services = self.services orelse return error.NoServices;
-                try services.settings_manager.setHideThinkingBlock(self.io, services.dir, hidden);
-                try session.setHideThinking(hidden);
-                self.setHideThinking(hidden);
-            },
+            .thinking_level => |level| try self.applyThinkingLevelSetting(level),
+            .hide_thinking => |hidden| try self.applyHideThinkingSetting(hidden),
             .unknown => |name| {
                 var available: [160]u8 = undefined;
                 const catalog = slash_commands.formatAvailable(&available);
                 try self.noticeFmt(.warn, "unknown command /{s} — {s}", .{ name, catalog });
             },
         }
-        return true;
+        return .handled_clear_editor;
     }
 
     fn showSessionNotice(self: *Loop) !void {
@@ -1770,9 +1943,26 @@ pub const Loop = struct {
         try self.notice(.info, text);
     }
 
+    fn ensureSlashArgSpace(self: *Loop, name: []const u8) !void {
+        var prefix_buffer: [slash_commands.name_bytes_max + 2]u8 = undefined;
+        const prefix = std.fmt.bufPrint(&prefix_buffer, "/{s}", .{name}) catch return error.EditorFull;
+        const text = self.editor.text();
+        if (std.mem.eql(u8, text, prefix)) {
+            try self.editor.insert(" ");
+            return;
+        }
+        if (!std.mem.startsWith(u8, text, prefix)) return;
+        for (text[prefix.len..]) |byte| if (!std.ascii.isWhitespace(byte)) return;
+        var desired_buffer: [slash_commands.name_bytes_max + 3]u8 = undefined;
+        const desired = std.fmt.bufPrint(&desired_buffer, "/{s} ", .{name}) catch return error.EditorFull;
+        if (std.mem.eql(u8, text, desired)) return;
+        self.editor.clear();
+        try self.editor.insert(desired);
+    }
+
     fn openModelPicker(self: *Loop) !void {
         const services = self.services orelse return error.NoServices;
-        self.picker.reset(.model, "Select model", self.editor.text());
+        self.picker.reset(.model);
         inline for (.{ true, false }) |want_authed| {
             for (ai.getProviders()) |provider_name| {
                 for (ai.getModels(provider_name)) |model| {
@@ -1781,11 +1971,11 @@ pub const Loop = struct {
                     if (authed != want_authed) continue;
                     var label_buffer: [completion_text_bytes_max]u8 = undefined;
                     const label = std.fmt.bufPrint(&label_buffer, "{s}/{s}", .{ model.provider, model.id }) catch model.id;
-                    self.picker.appendRow(label, label, model.name, if (authed) "" else "not authenticated", model, authed);
+                    self.picker.appendRow(label, label, model.name, if (authed) "" else "not authenticated", model, authed, .apply_model);
                 }
             }
         }
-        self.selectFirstVisiblePickerRow();
+        self.syncPickerSelection();
         self.completion.clear();
     }
 
@@ -1798,14 +1988,64 @@ pub const Loop = struct {
             .environ = services.environ,
         });
         defer summaries.deinit(self.gpa);
-        self.picker.reset(.session, "Resume session", self.editor.text());
+        self.picker.reset(.session);
         for (summaries.items) |summary| {
             var meta_buffer: [completion_text_bytes_max]u8 = undefined;
             const meta = std.fmt.bufPrint(&meta_buffer, "{s} {s}", .{ summary.meta, summary.aux }) catch summary.meta;
-            self.picker.appendRow(summary.file_name, summary.title, summary.detail, meta, null, true);
+            self.picker.appendRow(summary.file_name, summary.title, summary.detail, meta, null, true, .resume_session);
         }
-        self.selectFirstVisiblePickerRow();
+        self.syncPickerSelection();
         self.completion.clear();
+    }
+
+    fn openSettingsRootPicker(self: *Loop) void {
+        self.picker.reset(.settings_root);
+        self.populateSettingsRootPicker();
+        self.syncPickerSelection();
+        self.completion.clear();
+    }
+
+    fn populatePickerRowsForKind(self: *Loop, kind: PickerKind) void {
+        switch (kind) {
+            .settings_root => self.populateSettingsRootPicker(),
+            .settings_thinking_effort => self.populateThinkingEffortPicker(),
+            .settings_thinking_visibility => self.populateThinkingVisibilityPicker(),
+            .model, .session => {},
+        }
+    }
+
+    fn populateSettingsRootPicker(self: *Loop) void {
+        self.picker.appendRow("thinking-effort", "Thinking effort", "set reasoning level", "", null, true, .{ .push = .settings_thinking_effort });
+        self.picker.appendRow("thinking-visibility", "Thinking visibility", "show or hide thinking blocks", "", null, true, .{ .push = .settings_thinking_visibility });
+    }
+
+    fn populateThinkingEffortPicker(self: *Loop) void {
+        self.picker.appendRow("thinking:off", "off", "disable reasoning", "", null, true, .{ .thinking_level = .off });
+        self.picker.appendRow("thinking:minimal", "minimal", "minimal reasoning", "", null, true, .{ .thinking_level = .minimal });
+        self.picker.appendRow("thinking:low", "low", "low reasoning", "", null, true, .{ .thinking_level = .low });
+        self.picker.appendRow("thinking:medium", "medium", "balanced reasoning", "", null, true, .{ .thinking_level = .medium });
+        self.picker.appendRow("thinking:high", "high", "deep reasoning", "", null, true, .{ .thinking_level = .high });
+        self.picker.appendRow("thinking:xhigh", "xhigh", "maximum reasoning", "", null, true, .{ .thinking_level = .xhigh });
+    }
+
+    fn populateThinkingVisibilityPicker(self: *Loop) void {
+        self.picker.appendRow("thinking:shown", "shown", "show thinking blocks", "", null, true, .{ .hide_thinking = false });
+        self.picker.appendRow("thinking:hidden", "hidden", "hide thinking blocks", "", null, true, .{ .hide_thinking = true });
+    }
+
+    fn applyThinkingLevelSetting(self: *Loop, level: agent_mod.ThinkingLevel) !void {
+        const session = self.session orelse return;
+        try session.setThinkingLevel(level);
+        self.pending_title_update = true;
+        self.dirty = true;
+    }
+
+    fn applyHideThinkingSetting(self: *Loop, hidden: bool) !void {
+        const session = self.session orelse return;
+        const services = self.services orelse return error.NoServices;
+        try services.settings_manager.setHideThinkingBlock(self.io, services.dir, hidden);
+        try session.setHideThinking(hidden);
+        self.setHideThinking(hidden);
     }
 
     fn setModelByName(self: *Loop, name: []const u8) !void {
@@ -2588,14 +2828,14 @@ test "loop picker window follows chrome candidate capacity" {
     var loop = try Loop.init(std.testing.allocator, null);
     defer loop.deinit();
 
-    loop.picker.reset(.model, "model", "");
-    loop.picker.appendRow("0", "item0", "", "", null, true);
-    loop.picker.appendRow("1", "item1", "", "", null, true);
-    loop.picker.appendRow("2", "item2", "", "", null, true);
-    loop.picker.appendRow("3", "item3", "", "", null, true);
-    loop.picker.appendRow("4", "item4", "", "", null, true);
-    loop.picker.appendRow("5", "item5", "", "", null, true);
-    loop.picker.selected_row = 5;
+    loop.picker.reset(.model);
+    loop.picker.appendRow("0", "item0", "", "", null, true, .none);
+    loop.picker.appendRow("1", "item1", "", "", null, true, .none);
+    loop.picker.appendRow("2", "item2", "", "", null, true, .none);
+    loop.picker.appendRow("3", "item3", "", "", null, true, .none);
+    loop.picker.appendRow("4", "item4", "", "", null, true, .none);
+    loop.picker.appendRow("5", "item5", "", "", null, true, .none);
+    loop.picker.top().selected_row = 5;
 
     const frame = try loop.composeFrame(80, 10);
     try expectFrameContains(&frame, "› item5");
@@ -2731,13 +2971,35 @@ test "loop P4 model picker applies faux model through services" {
     try loop.bindServices(&services);
     loop.bindSession(&session, services.io, &wake);
 
+    try loop.dispatch(.{ .insert = "/resume" });
+    try loop.dispatch(.submit);
+    try std.testing.expect(loop.picker.active);
+    try std.testing.expectEqual(PickerKind.session, loop.picker.currentKind());
+    try std.testing.expectEqualStrings("/resume ", loop.editor.text());
+    try loop.dispatch(.cancel);
+    loop.editor.clear();
+
     try loop.dispatch(.{ .insert = "/model" });
     try loop.dispatch(.submit);
     try std.testing.expect(loop.picker.active);
-    try std.testing.expectEqual(PickerKind.model, loop.picker.kind);
+    try std.testing.expectEqual(PickerKind.model, loop.picker.currentKind());
     try loop.dispatch(.cancel);
     try std.testing.expect(!loop.picker.active);
-    try std.testing.expectEqualStrings("/model", loop.editor.text());
+    try std.testing.expectEqualStrings("/model ", loop.editor.text());
+    try loop.dispatch(.submit);
+    try std.testing.expect(loop.picker.active);
+    try loop.dispatch(.{ .insert = "zzzz-no-match" });
+    try std.testing.expect(loop.picker.active);
+    try std.testing.expect(loop.picker.topConst().selected_row == null);
+    var no_match_frame = try loop.composeFrame(80, 12);
+    try expectFrameContains(&no_match_frame, "  no matches");
+    try loop.dispatch(.submit);
+    try std.testing.expect(loop.picker.active);
+    try std.testing.expectEqualStrings("/model zzzz-no-match", loop.editor.text());
+    try loop.dispatch(.cancel);
+    loop.editor.clear();
+
+    try loop.dispatch(.{ .insert = "/model" });
     try loop.dispatch(.submit);
     try std.testing.expect(loop.picker.active);
     try loop.dispatch(.submit);
@@ -2771,8 +3033,46 @@ test "loop P4 settings thinking visibility persists through services" {
     try loop.bindServices(&services);
     loop.bindSession(&session, services.io, &wake);
 
-    try loop.dispatch(.{ .insert = "/settings thinking:shown" });
+    try loop.dispatch(.{ .insert = "/settings" });
     try loop.dispatch(.submit);
+    try std.testing.expect(loop.picker.active);
+    try std.testing.expectEqual(PickerKind.settings_root, loop.picker.currentKind());
+    try std.testing.expectEqualStrings("/settings ", loop.editor.text());
+
+    try loop.dispatch(.{ .key_editor = .tab });
+    try std.testing.expectEqual(PickerKind.settings_thinking_effort, loop.picker.currentKind());
+    try std.testing.expectEqualStrings("/settings thinking:", loop.editor.text());
+    var frame = try loop.composeFrame(80, 12);
+    try expectFrameContains(&frame, "› off");
+    try loop.dispatch(.cancel);
+    try std.testing.expectEqual(PickerKind.settings_root, loop.picker.currentKind());
+    try std.testing.expectEqualStrings("/settings ", loop.editor.text());
+
+    try loop.dispatch(.{ .key_editor = .tab });
+    try std.testing.expectEqual(PickerKind.settings_thinking_effort, loop.picker.currentKind());
+    try loop.dispatch(.{ .insert = "high" });
+    frame = try loop.composeFrame(80, 12);
+    try expectFrameContains(&frame, "› high");
+    try loop.dispatch(.{ .key_editor = .tab });
+    try std.testing.expect(!loop.picker.active);
+    try std.testing.expectEqualStrings("", loop.editor.text());
+    try std.testing.expectEqual(agent_mod.ThinkingLevel.high, session.agent.state.thinking_level);
+
+    try loop.dispatch(.{ .insert = "/settings" });
+    try loop.dispatch(.submit);
+    try std.testing.expectEqual(PickerKind.settings_root, loop.picker.currentKind());
+
+    try loop.dispatch(.{ .key_editor = .move_down_history });
+    try loop.dispatch(.{ .key_editor = .tab });
+    try std.testing.expectEqual(PickerKind.settings_thinking_visibility, loop.picker.currentKind());
+    try std.testing.expectEqualStrings("/settings thinking:", loop.editor.text());
+    try loop.dispatch(.{ .insert = "shown" });
+    frame = try loop.composeFrame(80, 12);
+    try expectFrameContains(&frame, "› shown");
+    try expectFrameOrder(&frame, "│> /settings thinking:shown", "› shown");
+    try loop.dispatch(.{ .key_editor = .tab });
+    try std.testing.expect(!loop.picker.active);
+    try std.testing.expectEqualStrings("", loop.editor.text());
     try std.testing.expect(!session.hide_thinking);
     try std.testing.expect(!loop.layout_epoch.hide_thinking);
     try std.testing.expectEqual(false, services.settings_manager.current().global.loaded.value.hide_thinking_block.?);
