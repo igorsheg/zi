@@ -303,6 +303,14 @@ pub fn sliceEndForColumns(bytes: []const u8, max_cols: usize) usize {
     return last;
 }
 
+pub fn firstGraphemeEnd(bytes: []const u8) usize {
+    if (bytes.len == 0) return 0;
+    if (bytes[0] < 0x80) return 1;
+    var iter = vaxis.unicode.graphemeIterator(bytes);
+    const grapheme = iter.next() orelse return 1;
+    return grapheme.start + grapheme.len;
+}
+
 fn asciiDisplayWidth(bytes: []const u8) ?usize {
     var width: usize = 0;
     for (bytes) |byte| {

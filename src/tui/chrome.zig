@@ -51,7 +51,7 @@ pub fn compose(snapshot: Snapshot, width: u16, height: u16) error{ FrameFull, Li
     var frame: screen.Frame = .{};
     if (height == 0) return frame;
     if (height == 1) {
-        try appendEditorLine(&frame, snapshot.editor, 0, 0, width, snapshot.editor_border_style, false);
+        try appendEditor(&frame, snapshot, 0, 1, width, snapshot.editor_border_style, false);
         return frame;
     }
     if (height == 2) {
@@ -67,7 +67,7 @@ pub fn compose(snapshot: Snapshot, width: u16, height: u16) error{ FrameFull, Li
         } else {
             try frame.appendLine(.{});
         }
-        try appendEditorLine(&frame, snapshot.editor, 1, 0, width, snapshot.editor_border_style, false);
+        try appendEditor(&frame, snapshot, 1, 1, width, snapshot.editor_border_style, false);
         return frame;
     }
 
@@ -90,7 +90,7 @@ pub fn compose(snapshot: Snapshot, width: u16, height: u16) error{ FrameFull, Li
     }
     for (snapshot.queue_lines[0..@min(snapshot.queue_lines.len, remaining_queue_rows)]) |line| try frame.appendLine(screen.singleSpanLine(line, screen.text.muted));
     if (top_chrome.status_rows > 0) try appendStatusLine(&frame, snapshot.status);
-    if (plan.editor_rows > 0) appendEditor(&frame, snapshot, @intCast(frame.rows().len), plan.editor_rows, width, useBorder(height, width) and plan.editor_rows >= 3) catch |err| return err;
+    if (plan.editor_rows > 0) appendEditor(&frame, snapshot, @intCast(frame.rows().len), plan.editor_rows, width, snapshot.editor_border_style, useBorder(height, width) and plan.editor_rows >= 3) catch |err| return err;
     if (snapshot.picker) |picker| try appendPicker(&frame, picker, plan.picker_rows);
     if (snapshot.popup) |popup| try appendPopup(&frame, popup, plan.popup_rows);
     return frame;
@@ -221,12 +221,13 @@ fn tailLine(text: []const u8) []const u8 {
 }
 
 fn editorRows(editor: *const Editor, height: u16, width: u16) usize {
-    const content_rows = editorContentRows(editor, height);
-    return content_rows + if (useBorder(height, width)) @as(usize, 2) else 0;
+    const bordered = useBorder(height, width);
+    const content_rows = editorContentRows(editor, height, width, bordered);
+    return content_rows + if (bordered) @as(usize, 2) else 0;
 }
 
-fn editorContentRows(editor: *const Editor, height: u16) usize {
-    const content_rows = editor.lineCount();
+fn editorContentRows(editor: *const Editor, height: u16, width: u16, bordered: bool) usize {
+    const content_rows = visualEditorLineCount(editor, composerTextColumns(width, bordered));
     const max_rows = @max(@as(usize, 1), @min(@as(usize, 5), (@as(usize, height) * 3) / 10));
     return @min(@max(@as(usize, 1), content_rows), max_rows);
 }
@@ -234,48 +235,203 @@ fn editorContentRows(editor: *const Editor, height: u16) usize {
 fn useBorder(height: u16, width: u16) bool {
     return height >= 6 and width >= 4;
 }
-fn appendEditor(frame: *screen.Frame, snapshot: Snapshot, start_row: u16, rows: usize, width: u16, bordered: bool) error{ FrameFull, LineFull }!void {
+
+const VisualEditorLine = struct {
+    editor_line_index: usize,
+    wrap_index: usize,
+    cursor_start: usize,
+    start: usize,
+    end: usize,
+    line: []const u8,
+};
+
+fn composerTextColumns(width: u16, bordered: bool) usize {
+    const content_width: usize = if (bordered) @as(usize, width) -| 2 else width;
+    return content_width -| @min(screen.displayWidth(prompt), content_width);
+}
+
+fn visualEditorLineCount(editor: *const Editor, text_cols: usize) usize {
+    var count: usize = 0;
+    for (0..editor.lineCount()) |line_index| count += wrappedLineCount(editor.lineSlice(line_index), text_cols);
+    return @max(@as(usize, 1), count);
+}
+
+fn wrappedLineCount(line: []const u8, text_cols: usize) usize {
+    if (line.len == 0 or text_cols == 0) return 1;
+    var count: usize = 0;
+    var start: usize = 0;
+    while (start < line.len) {
+        const row_start = wrappedLineStart(line, start);
+        if (row_start >= line.len) {
+            count += 1;
+            break;
+        }
+        start = wrappedLineEndProgress(line, row_start, text_cols);
+        count += 1;
+    }
+    return @max(@as(usize, 1), count);
+}
+
+fn cursorVisualLineIndex(editor: *const Editor, text_cols: usize) usize {
+    const cursor = editor.cursorLineCol();
+    var absolute: usize = 0;
+    for (0..editor.lineCount()) |line_index| {
+        const line = editor.lineSlice(line_index);
+        if (line_index == cursor.line) return absolute + wrappedLineIndexForCursor(line, text_cols, cursor.col);
+        absolute += wrappedLineCount(line, text_cols);
+    }
+    return if (absolute == 0) 0 else absolute - 1;
+}
+
+fn wrappedLineIndexForCursor(line: []const u8, text_cols: usize, cursor_offset: usize) usize {
+    if (line.len == 0 or text_cols == 0) return 0;
+    var start: usize = 0;
+    var index: usize = 0;
+    while (start < line.len) {
+        const row_start = wrappedLineStart(line, start);
+        if (row_start >= line.len) {
+            if (cursor_offset >= start) return index;
+            break;
+        }
+        const end = wrappedLineEndProgress(line, row_start, text_cols);
+        if ((cursor_offset >= start and cursor_offset < row_start) or
+            cursor_offset < end or
+            (cursor_offset == end and end == line.len)) return index;
+        start = end;
+        index += 1;
+    }
+    return if (index == 0) 0 else index - 1;
+}
+
+fn firstVisibleVisualLine(total: usize, cursor: usize, rows: usize) usize {
+    if (rows == 0 or total <= rows) return 0;
+    const clamped_cursor = @min(cursor, total - 1);
+    if (clamped_cursor < rows) return 0;
+    return @min(clamped_cursor - rows + 1, total - rows);
+}
+
+fn visualEditorLineAt(editor: *const Editor, text_cols: usize, target: usize) ?VisualEditorLine {
+    var absolute: usize = 0;
+    for (0..editor.lineCount()) |line_index| {
+        const line = editor.lineSlice(line_index);
+        if (line.len == 0 or text_cols == 0) {
+            if (absolute == target) return .{ .editor_line_index = line_index, .wrap_index = 0, .cursor_start = 0, .start = 0, .end = line.len, .line = line };
+            absolute += 1;
+            continue;
+        }
+        var start: usize = 0;
+        var wrap_index: usize = 0;
+        while (start < line.len) {
+            const row_start = wrappedLineStart(line, start);
+            if (row_start >= line.len) {
+                if (absolute == target) return .{ .editor_line_index = line_index, .wrap_index = wrap_index, .cursor_start = start, .start = line.len, .end = line.len, .line = line };
+                absolute += 1;
+                break;
+            }
+            const end = wrappedLineEndProgress(line, row_start, text_cols);
+            if (absolute == target) return .{ .editor_line_index = line_index, .wrap_index = wrap_index, .cursor_start = start, .start = row_start, .end = end, .line = line };
+            start = end;
+            wrap_index += 1;
+            absolute += 1;
+        }
+    }
+    return null;
+}
+
+fn wrappedLineStart(line: []const u8, start: usize) usize {
+    if (start == 0) return start;
+    var index = start;
+    while (index < line.len and isSoftWrapWhitespace(line[index])) : (index += 1) {}
+    return index;
+}
+
+fn wrappedLineEndProgress(line: []const u8, start: usize, text_cols: usize) usize {
+    const end = wrappedLineEnd(line, start, text_cols);
+    if (end > start) return @min(end, line.len);
+    return @min(line.len, start + screen.firstGraphemeEnd(line[start..]));
+}
+
+fn wrappedLineEnd(line: []const u8, start: usize, text_cols: usize) usize {
+    if (start >= line.len) return line.len;
+    if (text_cols == 0) return line.len;
+    const hard_end = start + screen.sliceEndForColumns(line[start..], text_cols);
+    if (hard_end == start or hard_end >= line.len) return hard_end;
+    return softWrapEnd(line, start, hard_end) orelse hard_end;
+}
+
+fn softWrapEnd(line: []const u8, start: usize, hard_end: usize) ?usize {
+    var last: ?usize = null;
+    var index = start;
+    while (index < hard_end) : (index += 1) {
+        if (isSoftWrapBreakByte(line[index])) last = index + 1;
+    }
+    return last;
+}
+
+fn isSoftWrapWhitespace(byte: u8) bool {
+    return byte == ' ' or byte == '\t';
+}
+
+fn isSoftWrapBreakByte(byte: u8) bool {
+    return switch (byte) {
+        ' ', '\t', '-', '/', '\\', '.', ',', ';', ':', '!', '?', '(', ')', '[', ']', '{', '}' => true,
+        else => false,
+    };
+}
+
+fn appendEditor(frame: *screen.Frame, snapshot: Snapshot, start_row: u16, rows: usize, width: u16, border_style: screen.Style, bordered: bool) error{ FrameFull, LineFull }!void {
     const content_rows = rows - if (bordered) @as(usize, 2) else 0;
-    const line_count = snapshot.editor.lineCount();
-    const first_line = if (line_count > content_rows) line_count - content_rows else 0;
+    const text_cols = composerTextColumns(width, bordered);
+    const total_visual = visualEditorLineCount(snapshot.editor, text_cols);
+    const cursor_visual = cursorVisualLineIndex(snapshot.editor, text_cols);
+    const first_visual = firstVisibleVisualLine(total_visual, cursor_visual, content_rows);
     var row: u16 = start_row;
-    const border_style = snapshot.editor_border_style;
     if (bordered) {
         try frame.appendLine(borderLine(width, border_style, true, snapshot.composer_top_left, snapshot.composer_top_right, snapshot.composer_top_right_style));
         row += 1;
     }
     for (0..content_rows) |row_offset| {
-        try appendEditorLine(frame, snapshot.editor, row + @as(u16, @intCast(row_offset)), first_line + row_offset, width, border_style, bordered);
+        const visual = visualEditorLineAt(snapshot.editor, text_cols, first_visual + row_offset);
+        try appendEditorVisualLine(frame, snapshot.editor, visual, row + @as(u16, @intCast(row_offset)), width, border_style, bordered);
     }
     if (bordered) try frame.appendLine(borderLine(width, border_style, false, snapshot.composer_bottom_left, snapshot.composer_bottom_right, snapshot.composer_bottom_right_style));
 }
 
-fn appendEditorLine(frame: *screen.Frame, editor: *const Editor, row: u16, editor_line_index: usize, width: u16, border_style: screen.Style, bordered: bool) error{ FrameFull, LineFull }!void {
+fn appendEditorVisualLine(frame: *screen.Frame, editor: *const Editor, maybe_visual: ?VisualEditorLine, row: u16, width: u16, border_style: screen.Style, bordered: bool) error{ FrameFull, LineFull }!void {
     var builder = screen.LineBuilder.init(if (bordered) screen.surface.composer else screen.surface.transparent);
-    const prefix = if (editor_line_index == 0) prompt else "  ";
-    const text = editor.lineSlice(editor_line_index);
-    const content_width: usize = if (bordered) width -| 2 else width;
+    const visual = maybe_visual orelse VisualEditorLine{ .editor_line_index = 0, .wrap_index = 0, .cursor_start = 0, .start = 0, .end = 0, .line = "" };
+    const prefix = if (visual.editor_line_index == 0 and visual.wrap_index == 0) prompt else "  ";
+    const text = visual.line[visual.start..visual.end];
+    const content_width: usize = if (bordered) @as(usize, width) -| 2 else width;
     var remaining = content_width;
 
     if (bordered) _ = try builder.appendText(glyphs.composer_vertical, border_style);
-    const prefix_cols = try builder.appendClipped(prefix, remaining, if (bordered) screen.text.accent else screen.text.accent);
+    const prefix_cols = try builder.appendClipped(prefix, remaining, screen.text.accent);
     remaining -|= prefix_cols;
-    const text_cols = try builder.appendClipped(text, remaining, screen.text.normal);
-    remaining -|= text_cols;
+    const text_width = try builder.appendClipped(text, remaining, screen.text.normal);
+    remaining -|= text_width;
     if (bordered) {
         _ = try builder.appendFill(spaceFill(remaining), remaining, screen.text.normal);
         _ = try builder.appendText(glyphs.composer_vertical, border_style);
     }
     try frame.appendLine(builder.finish());
 
-    const cursor = editor.cursorLineCol();
-    if (cursor.line == editor_line_index) {
-        const cursor_text = text[0..@min(cursor.col, text.len)];
-        const content_cursor_col = @min(prefix_cols + screen.displayWidth(cursor_text), content_width);
-        const raw_col = (if (bordered) @as(usize, 1) else 0) + content_cursor_col;
-        const max_col: usize = if (width == 0) 0 else width - 1;
-        frame.cursor = .{ .col = @intCast(@min(raw_col, max_col)), .row = row };
+    if (maybe_visual) |visible| {
+        const cursor = editor.cursorLineCol();
+        if (cursor.line == visible.editor_line_index and cursorInVisualLine(visible, cursor.col)) {
+            const cursor_end = @min(cursor.col, visible.end);
+            const cursor_text = if (cursor_end > visible.start) visible.line[visible.start..cursor_end] else "";
+            const content_cursor_col = @min(prefix_cols + screen.displayWidth(cursor_text), content_width);
+            const raw_col = (if (bordered) @as(usize, 1) else 0) + content_cursor_col;
+            const max_col: usize = if (width == 0) 0 else width - 1;
+            frame.cursor = .{ .col = @intCast(@min(raw_col, max_col)), .row = row };
+        }
     }
+}
+
+fn cursorInVisualLine(visual: VisualEditorLine, cursor_offset: usize) bool {
+    if (cursor_offset < visual.cursor_start or cursor_offset > visual.end) return false;
+    return cursor_offset < visual.end or visual.end == visual.line.len;
 }
 
 fn borderLine(width: u16, border_style: screen.Style, top: bool, left_label: []const u8, right_label: []const u8, right_style: screen.Style) screen.Line {
@@ -421,6 +577,42 @@ test "chrome bordered editor uses display columns for fill and cursor" {
     try std.testing.expect(std.mem.startsWith(u8, row, "│> λ🙂"));
     try std.testing.expect(std.mem.endsWith(u8, row, "│"));
     try std.testing.expectEqual(@as(u16, 6), frame.cursor.?.col);
+}
+
+test "chrome wraps composer input by display columns" {
+    var editor: Editor = .{};
+    try editor.insert("hello my good friend");
+    const frame = try compose(.{ .editor = &editor }, 20, 10);
+
+    var buffer: [128]u8 = undefined;
+    try std.testing.expectEqualStrings("│> hello my good   │", frame.rows()[7].copyText(&buffer));
+    try std.testing.expectEqualStrings("│  friend          │", frame.rows()[8].copyText(&buffer));
+    try std.testing.expectEqual(@as(u16, 9), frame.cursor.?.col);
+    try std.testing.expectEqual(@as(u16, 8), frame.cursor.?.row);
+}
+
+test "chrome keeps wrapped composer cursor visible" {
+    var editor: Editor = .{};
+    try editor.insert("abcdefgh ijklmnop qrstuvwx yz");
+    editor.moveBufferStart();
+    const frame = try compose(.{ .editor = &editor }, 12, 20);
+
+    var buffer: [128]u8 = undefined;
+    try std.testing.expectEqualStrings("│> abcdefgh│", frame.rows()[15].copyText(&buffer));
+    try std.testing.expectEqual(@as(u16, 3), frame.cursor.?.col);
+    try std.testing.expectEqual(@as(u16, 15), frame.cursor.?.row);
+}
+
+test "chrome wraps composer input by unicode cell width" {
+    var editor: Editor = .{};
+    try editor.insert("λ🙂abcdef");
+    const frame = try compose(.{ .editor = &editor }, 10, 10);
+
+    var buffer: [128]u8 = undefined;
+    try std.testing.expectEqualStrings("│> λ🙂abc│", frame.rows()[7].copyText(&buffer));
+    try std.testing.expectEqualStrings("│  def   │", frame.rows()[8].copyText(&buffer));
+    try std.testing.expectEqual(@as(u16, 6), frame.cursor.?.col);
+    try std.testing.expectEqual(@as(u16, 8), frame.cursor.?.row);
 }
 
 test "chrome renders picker with main selection marker" {
