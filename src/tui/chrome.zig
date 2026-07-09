@@ -2,6 +2,7 @@ const std = @import("std");
 const Editor = @import("Editor.zig");
 const glyphs = @import("glyphs.zig");
 const screen = @import("screen.zig");
+const text_shimmer = @import("text_shimmer.zig");
 
 pub const prompt = "> ";
 pub const popup_rows_max: usize = 8;
@@ -19,8 +20,17 @@ pub const PickerView = struct {
     selected: ?usize = null,
 };
 
+pub const StatusEffect = enum { none, shimmer };
+
+pub const StatusView = struct {
+    text: []const u8 = "",
+    style: screen.Style = screen.text.muted,
+    effect: StatusEffect = .none,
+    now_ns: u64 = 0,
+};
+
 pub const Snapshot = struct {
-    status: []const u8 = "",
+    status: StatusView = .{},
     composer_top_left: []const u8 = "",
     composer_top_right: []const u8 = "",
     composer_top_right_style: screen.Style = screen.text.muted,
@@ -45,8 +55,8 @@ pub fn compose(snapshot: Snapshot, width: u16, height: u16) error{ FrameFull, Li
         return frame;
     }
     if (height == 2) {
-        if (snapshot.status.len > 0) {
-            try frame.appendLine(screen.singleSpanLine(snapshot.status, screen.text.muted));
+        if (snapshot.status.text.len > 0) {
+            try appendStatusLine(&frame, snapshot.status);
         } else if (snapshot.queue_lines.len > 0 or snapshot.viewport_hint.len > 0) {
             const line = if (snapshot.viewport_hint.len > 0) snapshot.viewport_hint else snapshot.queue_lines[0];
             try frame.appendLine(screen.singleSpanLine(line, screen.text.muted));
@@ -62,7 +72,7 @@ pub fn compose(snapshot: Snapshot, width: u16, height: u16) error{ FrameFull, Li
     }
 
     const requested_queue_rows = queueRowCount(snapshot.queue_lines.len, snapshot.viewport_hint.len);
-    const requested_status_rows: usize = if (snapshot.status.len > 0) 1 else 0;
+    const requested_status_rows: usize = if (snapshot.status.text.len > 0) 1 else 0;
     const top_chrome = clampedTopChromeRows(requested_queue_rows, requested_status_rows, height);
     const plan = rowPlan(snapshot.editor, snapshot.picker != null, top_chrome.queue_rows, top_chrome.status_rows, popupRowCount(snapshot), width, height);
     const bottom_rows = top_chrome.status_rows + plan.popup_rows + plan.editor_rows + plan.picker_rows;
@@ -79,11 +89,20 @@ pub fn compose(snapshot: Snapshot, width: u16, height: u16) error{ FrameFull, Li
         remaining_queue_rows -= 1;
     }
     for (snapshot.queue_lines[0..@min(snapshot.queue_lines.len, remaining_queue_rows)]) |line| try frame.appendLine(screen.singleSpanLine(line, screen.text.muted));
-    if (top_chrome.status_rows > 0) try frame.appendLine(screen.singleSpanLine(snapshot.status, screen.text.muted));
+    if (top_chrome.status_rows > 0) try appendStatusLine(&frame, snapshot.status);
     if (plan.editor_rows > 0) appendEditor(&frame, snapshot, @intCast(frame.rows().len), plan.editor_rows, width, useBorder(height, width) and plan.editor_rows >= 3) catch |err| return err;
     if (snapshot.picker) |picker| try appendPicker(&frame, picker, plan.picker_rows);
     if (snapshot.popup) |popup| try appendPopup(&frame, popup, plan.popup_rows);
     return frame;
+}
+
+fn appendStatusLine(frame: *screen.Frame, status: StatusView) error{ FrameFull, LineFull }!void {
+    var line: screen.Line = .{};
+    switch (status.effect) {
+        .none => try line.append(.{ .text = status.text, .style = status.style }),
+        .shimmer => try text_shimmer.append(&line, status.text, status.now_ns, .{ .base_style = status.style }),
+    }
+    try frame.appendLine(line);
 }
 
 pub fn transcriptRowCapacity(editor: *const Editor, queue_line_count: usize, viewport_hint_len: usize, width: u16, height: u16) usize {
@@ -305,7 +324,7 @@ fn spaceFill(cols: usize) []const u8 {
 test "chrome composes status and editor rows" {
     var editor: Editor = .{};
     try editor.insert("hello");
-    var frame = try compose(.{ .status = "ready", .editor = &editor }, 80, 3);
+    var frame = try compose(.{ .status = .{ .text = "ready" }, .editor = &editor }, 80, 3);
 
     try std.testing.expectEqual(@as(usize, 3), frame.rows().len);
     var buffer: [32]u8 = undefined;
@@ -314,6 +333,18 @@ test "chrome composes status and editor rows" {
     try std.testing.expectEqualStrings("> hello", frame.rows()[2].copyText(&buffer));
     try std.testing.expectEqual(@as(u16, 7), frame.cursor.?.col);
     try std.testing.expectEqual(@as(u16, 2), frame.cursor.?.row);
+}
+
+test "chrome composes shimmer status as bounded spans" {
+    var editor: Editor = .{};
+    const frame = try compose(.{
+        .status = .{ .text = "Working…", .style = screen.shimmer.base, .effect = .shimmer, .now_ns = 6 * 32 * std.time.ns_per_ms },
+        .editor = &editor,
+    }, 80, 3);
+
+    var buffer: [32]u8 = undefined;
+    try std.testing.expectEqualStrings("Working…", frame.rows()[1].copyText(&buffer));
+    try std.testing.expect(frame.rows()[1].spans().len > 1);
 }
 
 test "chrome uses two-row spare row for transcript when no status" {
@@ -334,7 +365,7 @@ test "chrome renders transcript and queue lines above editor" {
     try editor.insert("draft");
     const transcript = [_]screen.Line{screen.singleSpanLine("streaming", screen.text.normal)};
     const queues = [_][]const u8{"steering: next"};
-    const frame = try compose(.{ .status = "ready", .transcript_lines = &transcript, .queue_lines = &queues, .editor = &editor }, 80, 8);
+    const frame = try compose(.{ .status = .{ .text = "ready" }, .transcript_lines = &transcript, .queue_lines = &queues, .editor = &editor }, 80, 8);
 
     var buffer: [128]u8 = undefined;
     try std.testing.expectEqualStrings("streaming", frame.rows()[0].copyText(&buffer));
@@ -399,7 +430,7 @@ test "chrome renders picker with main selection marker" {
         screen.singleSpanLine("beta", screen.text.normal),
     };
     const frame = try compose(.{
-        .status = "ready",
+        .status = .{ .text = "ready" },
         .editor = &editor,
         .picker = .{ .rows = &rows, .selected = 1 },
     }, 80, 10);
@@ -419,7 +450,7 @@ test "chrome renders completion popup with main selection marker" {
         screen.singleSpanLine("module.zig", screen.text.normal),
     };
     const frame = try compose(.{
-        .status = "ready",
+        .status = .{ .text = "ready" },
         .editor = &editor,
         .popup = .{ .rows = &rows, .selected = 1 },
     }, 80, 9);
@@ -435,7 +466,7 @@ test "chrome protects composer under small queued/status chrome" {
     var editor: Editor = .{};
     try editor.insert("draft");
     const queues = [_][]const u8{ "steering: one", "follow-up: two", "follow-up: three" };
-    const frame = try compose(.{ .status = "Working…", .queue_lines = &queues, .editor = &editor }, 40, 3);
+    const frame = try compose(.{ .status = .{ .text = "Working…" }, .queue_lines = &queues, .editor = &editor }, 40, 3);
 
     var buffer: [128]u8 = undefined;
     try std.testing.expectEqualStrings("steering: one", frame.rows()[0].copyText(&buffer));

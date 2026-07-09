@@ -35,6 +35,7 @@ pub const watchdog_budget_ns: u64 = 33 * std.time.ns_per_ms;
 pub const double_key_window_ns: u64 = 500 * std.time.ns_per_ms;
 pub const spinner_interval_ns: u64 = 80 * std.time.ns_per_ms;
 pub const elapsed_tick_ns: u64 = std.time.ns_per_s;
+const retry_status_tick_ns: u64 = std.time.ns_per_s;
 pub const shutdown_cancel_bound_ns: u64 = 5 * std.time.ns_per_s;
 const exit_hint_text = "press ctrl+c again to exit";
 const scratch_capacity = 8192;
@@ -304,11 +305,18 @@ pub const RunDriver = struct {
         const compaction_run = handle.run.compaction;
         const had_summary = compaction_run.outcome == .summary;
         const verdict = try handle.settle(session, .{ .overflow_count_before = self.overflow_count_before, .overflow_retry_used = self.overflow_retry_used });
+        const failure_name = compactionFailureName(compaction_run);
         if (had_summary) try owner.transcript.appendCompaction(compaction_run.outcome.summary, compaction_run.input.tokens_before);
         handle.deinitAfterSettled(session);
         self.state = .idle;
         if (!will_retry) {
-            if (had_summary) try owner.notice(.info, "context compacted");
+            switch (verdict) {
+                .completed => if (had_summary) try owner.notice(.info, "context compacted"),
+                .failed => if (failure_name) |name| {
+                    if (!isCancelErrorName(name)) try owner.failureNotice(coding_agent.failure_display.fromCompactionError(name));
+                },
+                .retry, .compact => {},
+            }
             owner.dirty = true;
             return;
         }
@@ -335,7 +343,7 @@ pub const RunDriver = struct {
                 }
             },
             .failed => {
-                if (session.latestAssistantError()) |err| try owner.noticeFmt(.err, "error: {s}", .{err});
+                if (session.latestFailureView()) |view| try owner.failureNotice(view);
             },
             .retry => |retry| try self.armRetry(session, now_ns, retry),
             .compact => |run| {
@@ -820,26 +828,31 @@ pub const Loop = struct {
     }
 
     pub fn composeFrame(self: *Loop, width: u16, height: u16) anyerror!screen.Frame {
+        return self.composeFrameAt(width, height, 0);
+    }
+
+    pub fn composeFrameAt(self: *Loop, width: u16, height: u16, now_ns: u64) anyerror!screen.Frame {
         self.noteResize(width, height);
         self.refreshTokenCache();
         const rebuilt = try self.rebuildLineIndex(width);
         if (rebuilt) self.clampViewportAfterRebuild();
 
         const queue_lines = self.collectQueueLines();
-        const status = self.statusText();
+        const status = self.statusView(now_ns);
+        const status_visible = status.text.len > 0;
         self.updateViewportHint();
-        var picker_capacity = chrome.pickerPanelCapacity(&self.editor, queue_lines.len, self.viewport_hint.len, status.len > 0, width, height);
+        var picker_capacity = chrome.pickerPanelCapacity(&self.editor, queue_lines.len, self.viewport_hint.len, status_visible, width, height);
         var picker_view = self.pickerView(picker_capacity);
-        var popup_view = self.popupView(if (picker_view == null) chrome.popupCandidateCapacity(&self.editor, queue_lines.len, self.viewport_hint.len, status.len > 0, width, height) else 0);
+        var popup_view = self.popupView(if (picker_view == null) chrome.popupCandidateCapacity(&self.editor, queue_lines.len, self.viewport_hint.len, status_visible, width, height) else 0);
         var popup_rows = if (popup_view) |popup| popup.rows.len else 0;
-        var transcript_rows = chrome.transcriptRowCapacityWithChrome(&self.editor, picker_view != null, queue_lines.len, self.viewport_hint.len, popup_rows, status.len > 0, width, height);
+        var transcript_rows = chrome.transcriptRowCapacityWithChrome(&self.editor, picker_view != null, queue_lines.len, self.viewport_hint.len, popup_rows, status_visible, width, height);
         self.applyPendingViewportMotion(transcript_rows);
         self.updateViewportHint();
-        picker_capacity = chrome.pickerPanelCapacity(&self.editor, queue_lines.len, self.viewport_hint.len, status.len > 0, width, height);
+        picker_capacity = chrome.pickerPanelCapacity(&self.editor, queue_lines.len, self.viewport_hint.len, status_visible, width, height);
         picker_view = self.pickerView(picker_capacity);
-        popup_view = self.popupView(if (picker_view == null) chrome.popupCandidateCapacity(&self.editor, queue_lines.len, self.viewport_hint.len, status.len > 0, width, height) else 0);
+        popup_view = self.popupView(if (picker_view == null) chrome.popupCandidateCapacity(&self.editor, queue_lines.len, self.viewport_hint.len, status_visible, width, height) else 0);
         popup_rows = if (popup_view) |popup| popup.rows.len else 0;
-        transcript_rows = chrome.transcriptRowCapacityWithChrome(&self.editor, picker_view != null, queue_lines.len, self.viewport_hint.len, popup_rows, status.len > 0, width, height);
+        transcript_rows = chrome.transcriptRowCapacityWithChrome(&self.editor, picker_view != null, queue_lines.len, self.viewport_hint.len, popup_rows, status_visible, width, height);
         const transcript_lines = self.collectTranscriptLines(transcript_rows);
         self.last_transcript_rows = transcript_rows;
 
@@ -860,6 +873,7 @@ pub const Loop = struct {
     }
 
     pub fn shouldRender(self: *const Loop, now_ns: u64) bool {
+        if (self.statusAnimationDue(now_ns)) return true;
         return render_policy.shouldRenderWithFloor(
             self.dirty,
             now_ns,
@@ -869,12 +883,29 @@ pub const Loop = struct {
         );
     }
 
+    fn statusAnimationDue(self: *const Loop, now_ns: u64) bool {
+        if (self.statusAnimated()) {
+            return render_policy.shouldRenderWithFloor(
+                true,
+                now_ns,
+                self.last_flush_ns,
+                self.trace.renders.max_ns,
+                frame_floor_ns,
+            );
+        }
+        if (self.driver.state == .retry_wait) return now_ns -| self.last_flush_ns >= retry_status_tick_ns;
+        return false;
+    }
+
     pub fn nextTimerDeadlineNs(self: *const Loop) ?u64 {
         var deadline = self.ctrl_c_deadline_ns;
         if (self.driver.retry) |retry| deadline = if (deadline) |current| @min(current, retry.deadline_ns) else retry.deadline_ns;
-        if (self.transcript.run_active or self.driver.state == .compacting) {
-            const spinner_due = self.last_flush_ns +| spinner_interval_ns;
-            deadline = if (deadline) |current| @min(current, spinner_due) else spinner_due;
+        if (self.statusAnimated()) {
+            const animation_due = render_policy.nextRenderDueNsWithFloor(self.last_flush_ns, self.trace.renders.max_ns, frame_floor_ns);
+            deadline = if (deadline) |current| @min(current, animation_due) else animation_due;
+        } else if (self.driver.state == .retry_wait) {
+            const retry_status_due = self.last_flush_ns +| retry_status_tick_ns;
+            deadline = if (deadline) |current| @min(current, retry_status_due) else retry_status_due;
         }
         if (self.synthetic_flood.enabled and !self.synthetic_flood.completed) {
             const flood_due = self.last_flush_ns +| frame_floor_ns;
@@ -944,6 +975,12 @@ pub const Loop = struct {
     pub fn noticeFmt(self: *Loop, level: Transcript.NoticeLevel, comptime fmt: []const u8, args: anytype) !void {
         const text = try std.fmt.bufPrint(&self.status_buffer, fmt, args);
         try self.notice(level, text);
+    }
+
+    pub fn failureNotice(self: *Loop, view: coding_agent.failure_display.View) !void {
+        var buffer: [coding_agent.failure_display.notice_bytes_max]u8 = undefined;
+        const text = coding_agent.failure_display.formatNotice(&buffer, view);
+        try self.notice(failureNoticeLevel(view.tone), text);
     }
 
     fn rebuildLineIndex(self: *Loop, width: u16) !bool {
@@ -1199,21 +1236,25 @@ pub const Loop = struct {
         return self.queue_lines[0..count];
     }
 
-    fn statusText(self: *Loop) []const u8 {
-        if (self.exit_requested) return "exiting";
-        if (self.exit_hint_visible) return exit_hint_text;
+    fn statusView(self: *Loop, now_ns: u64) chrome.StatusView {
+        if (self.exit_requested) return .{ .text = "exiting" };
+        if (self.exit_hint_visible) return .{ .text = exit_hint_text };
         switch (self.driver.state) {
             .retry_wait => if (self.driver.retry) |retry| {
-                const now = if (self.session) |session| nowNs(session.io) else 0;
-                const remaining_ns = retry.deadline_ns -| now;
+                const remaining_ns = retry.deadline_ns -| now_ns;
                 const remaining_s = (remaining_ns + std.time.ns_per_s - 1) / std.time.ns_per_s;
-                return std.fmt.bufPrint(&self.status_buffer, "Retrying ({d}/{d}) in {d}s… (esc to cancel)", .{ retry.attempt, retry.max, remaining_s }) catch "Retrying";
+                const text = std.fmt.bufPrint(&self.status_buffer, "Retrying ({d}/{d}) in {d}s… (esc to cancel)", .{ retry.attempt, retry.max, remaining_s }) catch "Retrying";
+                return .{ .text = text };
             },
-            .compacting => return "Compacting context… (esc to cancel)",
+            .compacting => return .{ .text = "Compacting context… (esc to cancel)", .style = screen.shimmer.base, .effect = .shimmer, .now_ns = now_ns },
             else => {},
         }
-        if (self.transcript.run_active or self.driver.state == .running) return "Working…";
-        return "";
+        if (self.transcript.run_active or self.driver.state == .running) return .{ .text = "Working…", .style = screen.shimmer.base, .effect = .shimmer, .now_ns = now_ns };
+        return .{};
+    }
+
+    fn statusAnimated(self: *const Loop) bool {
+        return self.transcript.run_active or self.driver.state == .running or self.driver.state == .compacting;
     }
 
     fn editorBorderStyle(self: *const Loop) screen.Style {
@@ -2143,7 +2184,7 @@ pub const Loop = struct {
             .thinking_level = current.agent.state.thinking_level,
             .stream = coding_agent.session_bootstrap.streamFor(services, current.agent.state.model),
         }) catch |err| {
-            try self.noticeFmt(.err, "error: {s}", .{@errorName(err)});
+            try self.failureNotice(coding_agent.failure_display.fromSessionOpenError(@errorName(err)));
             return;
         };
         var committed = false;
@@ -2235,6 +2276,26 @@ pub const Loop = struct {
         self.exit_hint_visible = false;
     }
 };
+
+fn compactionFailureName(run: *const coding_agent.AgentSession.CompactionRun) ?[]const u8 {
+    return switch (run.outcome) {
+        .failure => |err| @errorName(err),
+        .pending => "MissingCompactionSummary",
+        .summary => null,
+    };
+}
+
+fn isCancelErrorName(name: []const u8) bool {
+    return std.mem.eql(u8, name, "OperationCancelled") or std.mem.eql(u8, name, "Canceled");
+}
+
+fn failureNoticeLevel(tone: coding_agent.failure_display.Tone) Transcript.NoticeLevel {
+    return switch (tone) {
+        .info => .info,
+        .warn => .warn,
+        .err => .err,
+    };
+}
 
 fn nowNs(io: std.Io) u64 {
     const raw = std.Io.Timestamp.now(io, .awake).toNanoseconds();
@@ -2786,6 +2847,43 @@ test "loop tool UX renders edit patch with diff styles" {
     try std.testing.expect(std.meta.eql(frame.rows()[added_row.?].spans()[2].style.fg, screen.diff.added.fg));
 }
 
+test "loop working status uses shimmer effect" {
+    var loop = try Loop.init(std.testing.allocator, null);
+    defer loop.deinit();
+    loop.transcript.run_active = true;
+
+    const frame = try loop.composeFrameAt(80, 3, 6 * 32 * std.time.ns_per_ms);
+    var buffer: [32]u8 = undefined;
+    try std.testing.expectEqualStrings("Working…", frame.rows()[1].copyText(&buffer));
+    try std.testing.expect(frame.rows()[1].spans().len > 1);
+}
+
+test "loop shimmer status renders on animation cadence without dirty" {
+    var loop = try Loop.init(std.testing.allocator, null);
+    defer loop.deinit();
+    loop.transcript.run_active = true;
+    loop.markRendered(frame_floor_ns, 10 * std.time.ns_per_ms);
+    loop.dirty = false;
+
+    const due = frame_floor_ns + 30 * std.time.ns_per_ms;
+    try std.testing.expectEqual(@as(?u64, due), loop.nextTimerDeadlineNs());
+    try std.testing.expect(!loop.shouldRender(due - 1));
+    try std.testing.expect(loop.shouldRender(due));
+}
+
+test "loop retry status redraws on countdown cadence without dirty" {
+    var loop = try Loop.init(std.testing.allocator, null);
+    defer loop.deinit();
+    loop.driver.state = .{ .retry_wait = .{ .kind = .continue_run, .delay_ms = 5_000 } };
+    loop.driver.retry = .{ .deadline_ns = 5 * std.time.ns_per_s, .attempt = 1, .max = 3 };
+    loop.markRendered(0, 1 * std.time.ns_per_ms);
+    loop.dirty = false;
+
+    try std.testing.expectEqual(@as(?u64, retry_status_tick_ns), loop.nextTimerDeadlineNs());
+    try std.testing.expect(!loop.shouldRender(retry_status_tick_ns - 1));
+    try std.testing.expect(loop.shouldRender(retry_status_tick_ns));
+}
+
 test "loop render timing honors dirty policy" {
     var loop = try Loop.init(std.testing.allocator, null);
     defer loop.deinit();
@@ -3182,6 +3280,12 @@ const DriverTestFixture = struct {
     wake: *runtime.WakeEvent,
 
     fn init(response_text: []const u8) !DriverTestFixture {
+        const content = [_]ai.AssistantContent{ai.faux.text(response_text)};
+        const response = ai.faux.assistantMessage(&content, .{});
+        return initWithResponse(response);
+    }
+
+    fn initWithResponse(response: ai.AssistantMessage) !DriverTestFixture {
         var tmp = std.testing.tmpDir(.{});
         errdefer tmp.cleanup();
         var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
@@ -3190,8 +3294,6 @@ const DriverTestFixture = struct {
         errdefer std.testing.allocator.destroy(provider);
         provider.* = try ai.FauxProvider.init(std.testing.allocator, .{});
         errdefer provider.deinit();
-        const content = [_]ai.AssistantContent{ai.faux.text(response_text)};
-        const response = ai.faux.assistantMessage(&content, .{});
         try provider.setResponses(&.{response});
         try tmp.dir.createDirPath(std.testing.io, "agent");
         try tmp.dir.createDirPath(std.testing.io, "repo");
@@ -3271,6 +3373,56 @@ test "run driver streams a faux session into transcript" {
     try std.testing.expect(assistant.parts.items.len > 0);
     try std.testing.expectEqualStrings("# hello\nstreamed markdown", assistant.parts.items[0].text.items);
     try std.testing.expect(!fixture.owner_loop.transcript.run_active);
+}
+
+test "run driver renders actionable failure notice" {
+    const failure: ai.OperationalFailure = .{
+        .category = .auth_missing,
+        .message = "Missing provider API key",
+        .retryable = .no,
+        .provider = "openai",
+        .model = "gpt-5",
+    };
+    const response = ai.faux.assistantMessage(&.{}, .{
+        .stop_reason = .error_,
+        .error_message = "MissingApiKey",
+        .operational_failure = failure,
+    });
+    var fixture = try DriverTestFixture.initWithResponse(response);
+    defer fixture.deinit();
+
+    try fixture.owner_loop.dispatch(.{ .insert = "hi" });
+    try fixture.owner_loop.dispatch(.submit);
+    try driveDriverUntilIdle(fixture.owner_loop, 10_000);
+
+    const frame = try fixture.owner_loop.composeFrame(100, 16);
+    try expectFrameContains(&frame, "error: MissingApiKey");
+    try expectFrameContains(&frame, "Authentication required: Missing provider API key");
+    try expectFrameContains(&frame, "source: openai/gpt-5");
+    try expectFrameContains(&frame, "Set the provider API key");
+}
+
+test "manual compaction failure renders notice" {
+    const response = ai.faux.assistantMessage(&.{}, .{
+        .stop_reason = .error_,
+        .error_message = "summary failed",
+    });
+    var fixture = try DriverTestFixture.initWithResponse(response);
+    defer fixture.deinit();
+    fixture.session.compaction_settings.keep_recent_tokens = 1;
+
+    const older = try fixture.session.manager.prepareMessageEntry(.{ .user = .{ .content = .{ .string = "aaaaaaaa" }, .timestamp = 0 } }, "2026-07-07T00:00:00Z");
+    _ = fixture.session.manager.commitPreparedEntry(older);
+    const newer = try fixture.session.manager.prepareMessageEntry(.{ .user = .{ .content = .{ .string = "bbbbbbbb" }, .timestamp = 0 } }, "2026-07-07T00:00:01Z");
+    _ = fixture.session.manager.commitPreparedEntry(newer);
+
+    try fixture.owner_loop.dispatch(.{ .insert = "/compact" });
+    try fixture.owner_loop.dispatch(.submit);
+    try driveDriverUntilIdle(fixture.owner_loop, 10_000);
+
+    const frame = try fixture.owner_loop.composeFrame(100, 14);
+    try expectFrameContains(&frame, "Compaction failed: CompactionSummaryGenerationFailed");
+    try expectFrameContains(&frame, "retry /compact");
 }
 
 test "run driver queues steering and dequeue-all restores queued text" {

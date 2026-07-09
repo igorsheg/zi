@@ -75,6 +75,11 @@ pub const text = struct {
     pub const bash_mode: Style = .{ .fg = colors.yellow };
 };
 
+pub const shimmer = struct {
+    pub const base: Style = .{ .fg = colors.tier6 };
+    pub const peak: Style = .{ .fg = colors.tier1, .bold = true };
+};
+
 pub const surface = struct {
     pub const transparent: Style = .{};
     pub const app: Style = .{ .bg = colors.bg };

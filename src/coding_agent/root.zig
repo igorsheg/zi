@@ -6,6 +6,7 @@ const std = @import("std");
 pub const AgentSession = @import("AgentSession.zig");
 pub const auth_mode = @import("auth_mode.zig");
 pub const file_completion = @import("file_completion.zig");
+pub const failure_display = @import("failure_display.zig");
 pub const runtime_services = @import("runtime_services.zig");
 pub const session_bootstrap = @import("session_bootstrap.zig");
 pub const session_listing = @import("session_listing.zig");
@@ -29,6 +30,7 @@ test {
     std.testing.refAllDecls(@This());
     _ = AgentSession;
     _ = auth;
+    _ = failure_display;
     _ = file_completion;
     _ = message_policy;
     _ = paths;

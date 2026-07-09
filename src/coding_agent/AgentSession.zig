@@ -10,6 +10,7 @@ const agent_mod = @import("../agent/root.zig");
 const ai = @import("../ai/root.zig");
 const runtime = @import("../runtime/root.zig");
 const bash_tool = @import("tools/bash.zig");
+const failure_display = @import("failure_display.zig");
 const message_policy = @import("message_policy.zig");
 const resources = @import("resources.zig");
 const session_manager = @import("session_manager.zig");
@@ -1241,6 +1242,13 @@ pub fn latestOperationalFailure(self: *const AgentSession) ?ai.OperationalFailur
     if (last != .assistant) return null;
     if (last.assistant.stop_reason != .error_ and last.assistant.stop_reason != .aborted) return null;
     return last.assistant.operational_failure;
+}
+
+pub fn latestFailureView(self: *const AgentSession) ?failure_display.View {
+    if (self.agent.state.messages.len == 0) return null;
+    const last = self.agent.state.messages[self.agent.state.messages.len - 1];
+    if (last != .assistant) return null;
+    return failure_display.fromAssistant(last.assistant);
 }
 
 pub fn latestAssistantError(self: *const AgentSession) ?[]const u8 {

@@ -20,6 +20,7 @@ pub const loop = @import("Loop.zig");
 pub const render_policy = @import("render_policy.zig");
 pub const screen = @import("screen.zig");
 pub const theme = @import("theme.zig");
+pub const text_shimmer = @import("text_shimmer.zig");
 pub const trace = @import("trace.zig");
 pub const testing = @import("testing/pty_harness.zig");
 pub const Transcript = @import("Transcript.zig");
@@ -218,7 +219,7 @@ pub const Runner = struct {
         if (resized) try terminal.resizeFromTty();
         if (!had_input and !resized and !self.loop.shouldRender(now_ns)) return false;
         const start_ns = FrameLoop.nowNs(terminal.io);
-        const frame = try self.loop.composeFrame(width, height);
+        const frame = try self.loop.composeFrameAt(width, height, now_ns);
         try terminal.paint(frame);
         const flush_complete_ns = FrameLoop.nowNs(terminal.io);
         self.recordPendingInputLatencies(flush_complete_ns);
