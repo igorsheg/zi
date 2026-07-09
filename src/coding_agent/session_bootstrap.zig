@@ -42,7 +42,7 @@ pub fn openSession(
         .session_id = "",
         .timestamp = "",
         .model = model,
-        .thinking_level = overrides.thinking_level orelse .off,
+        .thinking_level = overrides.thinking_level orelse resolveThinkingLevel(project, global),
         .hide_thinking = project.hide_thinking_block orelse global.hide_thinking_block orelse true,
         .stream = overrides.stream orelse streamFor(services, model),
         .get_api_key = services.auth_manager.hook(),
@@ -125,6 +125,11 @@ fn resolveModel(
     return agent_mod.Agent.defaultModel();
 }
 
+fn resolveThinkingLevel(project: settings_mod.Settings, global: settings_mod.Settings) agent_mod.ThinkingLevel {
+    const level = project.default_thinking_level orelse global.default_thinking_level orelse return .off;
+    return std.meta.stringToEnum(agent_mod.ThinkingLevel, level) orelse .off;
+}
+
 fn retrySettings(project: settings_mod.Settings, global: settings_mod.Settings) AgentSession.RetrySettings {
     var out: AgentSession.RetrySettings = .{};
     const retry = project.retry orelse global.retry orelse return out;
@@ -155,13 +160,19 @@ fn settingsValue(file: settings_mod.SettingsFile) settings_mod.Settings {
 
 test "settings mappers prefer project over global" {
     const global: settings_mod.Settings = .{
+        .default_thinking_level = "low",
         .retry = .{ .enabled = true, .max_retries = 9, .base_delay_ms = 10 },
         .compaction = .{ .keep_recent_tokens = 1, .reserve_tokens = 2, .enabled = false },
     };
     const project: settings_mod.Settings = .{
+        .default_thinking_level = "high",
         .retry = .{ .enabled = false, .max_retries = 3, .base_delay_ms = 20 },
         .compaction = .{ .keep_recent_tokens = 4, .reserve_tokens = 5, .enabled = true },
     };
+
+    try std.testing.expectEqual(agent_mod.ThinkingLevel.high, resolveThinkingLevel(project, global));
+    try std.testing.expectEqual(agent_mod.ThinkingLevel.low, resolveThinkingLevel(.{}, global));
+    try std.testing.expectEqual(agent_mod.ThinkingLevel.off, resolveThinkingLevel(.{ .default_thinking_level = "bogus" }, global));
 
     const retry = retrySettings(project, global);
     try std.testing.expect(!retry.enabled);

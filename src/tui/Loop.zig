@@ -2118,6 +2118,8 @@ pub const Loop = struct {
 
     fn applyThinkingLevelSetting(self: *Loop, level: agent_mod.ThinkingLevel) !void {
         const session = self.session orelse return;
+        const services = self.services orelse return error.NoServices;
+        try services.settings_manager.setDefaultThinkingLevel(self.io, services.dir, @tagName(level));
         try session.setThinkingLevel(level);
         self.pending_title_update = true;
         self.dirty = true;
@@ -2165,6 +2167,7 @@ pub const Loop = struct {
         }
         const services = self.services orelse return error.NoServices;
         const session = self.session orelse return;
+        try services.settings_manager.setDefaultModel(self.io, services.dir, model.provider, model.id);
         try session.setModel(model, coding_agent.session_bootstrap.streamFor(services, model));
         self.pending_title_update = true;
         try self.noticeFmt(.info, "model: {s}/{s}", .{ model.provider, model.id });
@@ -3144,6 +3147,9 @@ test "loop P4 model picker applies faux model through services" {
     try std.testing.expect(loop.picker.active);
     try loop.dispatch(.submit);
     try std.testing.expectEqualStrings(ai.faux.default_model_id, session.agent.state.model.id);
+    const global_settings = services.settings_manager.current().global.loaded.value;
+    try std.testing.expectEqualStrings(session.agent.state.model.provider, global_settings.default_provider.?);
+    try std.testing.expectEqualStrings(session.agent.state.model.id, global_settings.default_model.?);
 }
 
 test "loop no-session disables resume and keeps new sessions ephemeral" {
@@ -3250,6 +3256,8 @@ test "loop P4 settings thinking visibility persists through services" {
     try std.testing.expect(!loop.picker.active);
     try std.testing.expectEqualStrings("", loop.editor.text());
     try std.testing.expectEqual(agent_mod.ThinkingLevel.high, session.agent.state.thinking_level);
+    const global_settings = services.settings_manager.current().global.loaded.value;
+    try std.testing.expectEqualStrings("high", global_settings.default_thinking_level.?);
 
     try loop.dispatch(.{ .insert = "/settings" });
     try loop.dispatch(.submit);
