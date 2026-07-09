@@ -123,15 +123,6 @@ pub const syntax = struct {
     pub const punctuation: Style = .{ .fg = colors.scaffold };
 };
 
-pub const thinking_border = struct {
-    pub const off: Style = .{ .fg = colors.tier7 };
-    pub const minimal: Style = .{ .fg = colors.tier6 };
-    pub const low: Style = .{ .fg = colors.tier5 };
-    pub const medium: Style = .{ .fg = colors.teal };
-    pub const high: Style = .{ .fg = colors.purple };
-    pub const xhigh: Style = .{ .fg = colors.blue };
-};
-
 pub const Span = struct {
     text: []const u8,
     style: Style = text.normal,

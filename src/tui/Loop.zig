@@ -860,13 +860,11 @@ pub const Loop = struct {
             .status = status,
             .composer_top_left = self.composerLeftText(),
             .composer_top_right = self.composerRightText(),
-            .composer_top_right_style = self.composerRightStyle(),
             .scratch_text = self.scratch.text(),
             .transcript_lines = transcript_lines,
             .queue_lines = queue_lines,
             .viewport_hint = self.viewport_hint,
             .editor = &self.editor,
-            .editor_border_style = self.editorBorderStyle(),
             .popup = popup_view,
             .picker = picker_view,
         }, width, height);
@@ -1257,33 +1255,42 @@ pub const Loop = struct {
         return self.transcript.run_active or self.driver.state == .running or self.driver.state == .compacting;
     }
 
-    fn editorBorderStyle(self: *const Loop) screen.Style {
-        const session = self.session orelse return screen.thinking_border.off;
-        return switch (session.agent.state.thinking_level) {
-            .off => screen.thinking_border.off,
-            .minimal => screen.thinking_border.minimal,
-            .low => screen.thinking_border.low,
-            .medium => screen.thinking_border.medium,
-            .high => screen.thinking_border.high,
-            .xhigh => screen.thinking_border.xhigh,
-        };
-    }
-
     fn composerRightText(self: *Loop) []const u8 {
         const session = self.session orelse return "";
         const usage = session.contextUsage();
-        if (usage.percent_tenths) |tenths| {
+        var percent_buffer: [16]u8 = undefined;
+        var window_buffer: [16]u8 = undefined;
+        const percent_text = contextPercentText(&percent_buffer, usage.percent_tenths);
+        const window_text = contextWindowText(&window_buffer, usage.window);
+        const thinking_level = session.agent.state.thinking_level;
+        if (thinking_level == .off) {
             return std.fmt.bufPrint(
                 &self.composer_right_buffer,
-                "ctx {d}.{d}% ↑{d} ↓{d} tokens · {s} · thinking:{s}",
-                .{ tenths / 10, tenths % 10, self.token_input_total, self.token_output_total, session.agent.state.model.id, @tagName(session.agent.state.thinking_level) },
+                "ctx {s}/{s} • {s}",
+                .{ percent_text, window_text, session.agent.state.model.id },
             ) catch "ctx";
         }
         return std.fmt.bufPrint(
             &self.composer_right_buffer,
-            "ctx -- ↑{d} ↓{d} tokens · {s} · thinking:{s}",
-            .{ self.token_input_total, self.token_output_total, session.agent.state.model.id, @tagName(session.agent.state.thinking_level) },
+            "ctx {s}/{s} • {s} ({s})",
+            .{ percent_text, window_text, session.agent.state.model.id, @tagName(thinking_level) },
         ) catch "ctx";
+    }
+
+    fn contextPercentText(buffer: []u8, percent_tenths: ?u32) []const u8 {
+        const tenths = percent_tenths orelse return "--";
+        return std.fmt.bufPrint(buffer, "{d}%", .{(tenths + 5) / 10}) catch "--";
+    }
+
+    fn contextWindowText(buffer: []u8, window: u64) []const u8 {
+        if (window == 0) return "--";
+        if (window >= 1_000_000) {
+            const tenths = (window + 50_000) / 100_000;
+            if (tenths % 10 == 0) return std.fmt.bufPrint(buffer, "{d}m", .{tenths / 10}) catch "--";
+            return std.fmt.bufPrint(buffer, "{d}.{d}m", .{ tenths / 10, tenths % 10 }) catch "--";
+        }
+        if (window >= 1_000) return std.fmt.bufPrint(buffer, "{d}k", .{(window + 500) / 1_000}) catch "--";
+        return std.fmt.bufPrint(buffer, "{d}", .{window}) catch "--";
     }
 
     fn composerLeftText(self: *Loop) []const u8 {
@@ -1299,14 +1306,6 @@ pub const Loop = struct {
             }
         }
         return std.fmt.bufPrint(&self.composer_left_buffer, "{s}", .{cwd}) catch cwd;
-    }
-
-    fn composerRightStyle(self: *Loop) screen.Style {
-        const session = self.session orelse return screen.text.muted;
-        const tenths = session.contextUsage().percent_tenths orelse return screen.text.muted;
-        if (tenths > 900) return screen.text.error_;
-        if (tenths >= 700) return screen.text.warning;
-        return screen.text.success;
     }
 
     fn sessionTitle(self: *Loop) []const u8 {
@@ -2489,8 +2488,8 @@ test "loop composes frame and clears dirty only after render success" {
 
     const frame = try loop.composeFrame(80, 2);
     var buffer: [32]u8 = undefined;
-    try std.testing.expectEqualStrings("> draft!", frame.rows()[1].copyText(&buffer));
-    try std.testing.expectEqual(@as(u16, 8), frame.cursor.?.col);
+    try std.testing.expectEqualStrings("draft!", frame.rows()[1].copyText(&buffer));
+    try std.testing.expectEqual(@as(u16, 6), frame.cursor.?.col);
     try std.testing.expect(loop.dirty);
     loop.markRendered(1, 2);
     try std.testing.expect(!loop.dirty);
@@ -2997,8 +2996,22 @@ test "loop P4 composer chrome caches assistant usage" {
     _ = fixture.session.manager.commitPreparedEntry(entry);
 
     const frame = try fixture.owner_loop.composeFrame(80, 6);
-    try expectFrameContains(&frame, "ctx 0.0% ↑70 ↓30 tokens");
-    try expectFrameContains(&frame, fixture.session.agent.state.model.id);
+    try expectFrameContains(&frame, "ctx 0%/128k • faux-default");
+    try std.testing.expect(frameRowContaining(&frame, "(off)") == null);
+    const row_index = frameRowContaining(&frame, "ctx 0%/128k") orelse return error.MissingComposerContext;
+    const top_row = frame.rows()[row_index];
+    try std.testing.expect(std.meta.eql(top_row.spans()[0].style.fg, screen.text.border.fg));
+    var saw_muted_ctx = false;
+    for (top_row.spans()) |span| {
+        if (std.mem.indexOf(u8, span.text, "ctx 0%/128k") != null) {
+            saw_muted_ctx = std.meta.eql(span.style.fg, screen.text.muted.fg);
+        }
+    }
+    try std.testing.expect(saw_muted_ctx);
+
+    fixture.session.agent.setThinkingLevel(.low);
+    const thinking_frame = try fixture.owner_loop.composeFrame(80, 6);
+    try expectFrameContains(&thinking_frame, "ctx 0%/128k • faux-default (low)");
 }
 
 test "loop P4 restore renders compaction summary" {
@@ -3270,7 +3283,7 @@ test "loop P4 settings thinking visibility persists through services" {
     try loop.dispatch(.{ .insert = "shown" });
     frame = try loop.composeFrame(80, 12);
     try expectFrameContains(&frame, "› shown");
-    try expectFrameOrder(&frame, "│> /settings thinking:shown", "› shown");
+    try expectFrameOrder(&frame, "│/settings thinking:shown", "› shown");
     try loop.dispatch(.{ .key_editor = .tab });
     try std.testing.expect(!loop.picker.active);
     try std.testing.expectEqualStrings("", loop.editor.text());

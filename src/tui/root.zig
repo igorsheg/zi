@@ -443,7 +443,7 @@ test "runner seeds initial prompt and composes first frame" {
     const frame = try runner.composeInitialFrame(80, 2);
 
     var buffer: [32]u8 = undefined;
-    try std.testing.expectEqualStrings("> draft", frame.rows()[1].copyText(&buffer));
+    try std.testing.expectEqualStrings("draft", frame.rows()[1].copyText(&buffer));
     try std.testing.expectEqual(@as(usize, 0), runner.decoder.pendingBytes());
 }
 
@@ -497,8 +497,8 @@ test "runner paints initial frame through terminal" {
     try runner.paintInitialFrame(&terminal, 80, 2);
 
     const vx = &terminal.vx.?;
-    try std.testing.expectEqualStrings(">", vx.screen.readCell(0, 1).?.char.grapheme);
-    try std.testing.expectEqualStrings("d", vx.screen.readCell(2, 1).?.char.grapheme);
+    try std.testing.expectEqualStrings("d", vx.screen.readCell(0, 1).?.char.grapheme);
+    try std.testing.expectEqualStrings("a", vx.screen.readCell(2, 1).?.char.grapheme);
     try std.testing.expect(!runner.loop.dirty);
     try std.testing.expect(runner.loop.trace.renders.count >= 1);
 }
@@ -602,7 +602,7 @@ test "runner tick drains input and paints when due" {
     var latency_count: usize = 0;
     for (runner.loop.trace.input_latency.buckets) |count| latency_count += count;
     try std.testing.expectEqual(@as(usize, 1), latency_count);
-    try std.testing.expectEqualStrings("h", terminal.vx.?.screen.readCell(2, 1).?.char.grapheme);
+    try std.testing.expectEqualStrings("h", terminal.vx.?.screen.readCell(0, 1).?.char.grapheme);
 }
 
 test "runner tick skips paint before render deadline" {

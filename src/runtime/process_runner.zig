@@ -99,6 +99,7 @@ fn ResultSlot(comptime Result: type) type {
 const ProcessWaitSlot = ResultSlot(ProcessWaitResult);
 const TimeoutSlot = ResultSlot(TimeoutResult);
 const CancelSlot = ResultSlot(CancelWaitResult);
+const ReaderSlot = ResultSlot(void);
 const OutputChunkQueue = std.Io.Queue(OutputChunk);
 
 fn publishProcessWait(slot: *ProcessWaitSlot, io: std.Io, child: *std.process.Child) void {
@@ -160,7 +161,9 @@ pub fn run(
     };
     defer stderr_buffer.deinit();
 
+    var stdout_slot: ReaderSlot = .{ .io = io, .wake = &owner_wake };
     var stdout_reader = try std.Io.concurrent(io, readPipeToBuffer, .{
+        &stdout_slot,
         io,
         stdout_file,
         &stdout_buffer,
@@ -169,7 +172,9 @@ pub fn run(
         &owner_wake,
     });
     defer stdout_reader.cancel(io);
+    var stderr_slot: ReaderSlot = .{ .io = io, .wake = &owner_wake };
     var stderr_reader = try std.Io.concurrent(io, readPipeToBuffer, .{
+        &stderr_slot,
         io,
         stderr_file,
         &stderr_buffer,
@@ -216,7 +221,16 @@ pub fn run(
 
         if (process_slot.isReady()) {
             process_wait.await(io);
-            break try completeProcessWait(process_slot.result, &process_wait_state);
+            const completed_term = try completeProcessWait(process_slot.result, &process_wait_state);
+            try drainReadersAfterProcessExit(
+                io,
+                options.on_output,
+                &output_chunks,
+                &owner_wake,
+                &stdout_slot,
+                &stderr_slot,
+            );
+            break completed_term;
         }
 
         if (timeout_slot.isReady()) {
@@ -339,6 +353,26 @@ fn drainOutputChunks(io: std.Io, observer: ?OutputObserver, output_chunks: *Outp
     }
 }
 
+fn drainReadersAfterProcessExit(
+    io: std.Io,
+    observer: ?OutputObserver,
+    output_chunks: *OutputChunkQueue,
+    wake: *WakeEvent,
+    stdout_slot: *const ReaderSlot,
+    stderr_slot: *const ReaderSlot,
+) !void {
+    while (true) {
+        try drainOutputChunks(io, observer, output_chunks);
+        if (stdout_slot.isReady() and stderr_slot.isReady()) return;
+
+        wake.reset();
+        try drainOutputChunks(io, observer, output_chunks);
+        if (stdout_slot.isReady() and stderr_slot.isReady()) return;
+
+        try wake.wait(io);
+    }
+}
+
 fn terminateAndDrainProcess(
     io: std.Io,
     child: *std.process.Child,
@@ -389,6 +423,7 @@ fn requestChildTermination(process_id: ?std.process.Child.Id, mode: TerminationM
 }
 
 fn readPipeToBuffer(
+    done: *ReaderSlot,
     io: std.Io,
     file: std.Io.File,
     output: *OutputBuffer,
@@ -396,6 +431,7 @@ fn readPipeToBuffer(
     chunks: *OutputChunkQueue,
     wake: *WakeEvent,
 ) void {
+    defer done.complete({});
     var owned_file = file;
     defer owned_file.close(io);
     var buffer: [4096]u8 = undefined;

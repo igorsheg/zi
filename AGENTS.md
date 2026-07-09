@@ -99,6 +99,8 @@ resource paths.
 
 When touching `src/runtime` or code that uses it:
 
+- Read `docs/runtime-zio-capabilities.md` before changing zio-backed behavior or
+  evaluating a zio replacement.
 - Pass `std.Io` explicitly. Do not add ambient I/O or globals.
 - Wakes are coalesced and payload-free; after waking, inspect owned state.
 - Cancellation is request -> observe completion, not request -> assume stopped.

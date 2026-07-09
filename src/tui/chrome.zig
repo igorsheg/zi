@@ -4,7 +4,7 @@ const glyphs = @import("glyphs.zig");
 const screen = @import("screen.zig");
 const text_shimmer = @import("text_shimmer.zig");
 
-pub const prompt = "> ";
+pub const prompt = "";
 pub const popup_rows_max: usize = 8;
 const fill_capacity = 4096;
 const border_fill = glyphs.composer_horizontal ** fill_capacity;
@@ -400,7 +400,7 @@ fn appendEditor(frame: *screen.Frame, snapshot: Snapshot, start_row: u16, rows: 
 fn appendEditorVisualLine(frame: *screen.Frame, editor: *const Editor, maybe_visual: ?VisualEditorLine, row: u16, width: u16, border_style: screen.Style, bordered: bool) error{ FrameFull, LineFull }!void {
     var builder = screen.LineBuilder.init(if (bordered) screen.surface.composer else screen.surface.transparent);
     const visual = maybe_visual orelse VisualEditorLine{ .editor_line_index = 0, .wrap_index = 0, .cursor_start = 0, .start = 0, .end = 0, .line = "" };
-    const prefix = if (visual.editor_line_index == 0 and visual.wrap_index == 0) prompt else "  ";
+    const prefix = if (visual.editor_line_index == 0 and visual.wrap_index == 0) prompt else "";
     const text = visual.line[visual.start..visual.end];
     const content_width: usize = if (bordered) @as(usize, width) -| 2 else width;
     var remaining = content_width;
@@ -486,8 +486,8 @@ test "chrome composes status and editor rows" {
     var buffer: [32]u8 = undefined;
     try std.testing.expectEqualStrings("", frame.rows()[0].copyText(&buffer));
     try std.testing.expectEqualStrings("ready", frame.rows()[1].copyText(&buffer));
-    try std.testing.expectEqualStrings("> hello", frame.rows()[2].copyText(&buffer));
-    try std.testing.expectEqual(@as(u16, 7), frame.cursor.?.col);
+    try std.testing.expectEqualStrings("hello", frame.rows()[2].copyText(&buffer));
+    try std.testing.expectEqual(@as(u16, 5), frame.cursor.?.col);
     try std.testing.expectEqual(@as(u16, 2), frame.cursor.?.row);
 }
 
@@ -511,8 +511,8 @@ test "chrome uses two-row spare row for transcript when no status" {
 
     var buffer: [128]u8 = undefined;
     try std.testing.expectEqualStrings("streaming", frame.rows()[0].copyText(&buffer));
-    try std.testing.expectEqualStrings("> draft", frame.rows()[1].copyText(&buffer));
-    try std.testing.expectEqual(@as(u16, 7), frame.cursor.?.col);
+    try std.testing.expectEqualStrings("draft", frame.rows()[1].copyText(&buffer));
+    try std.testing.expectEqual(@as(u16, 5), frame.cursor.?.col);
     try std.testing.expectEqual(@as(u16, 1), frame.cursor.?.row);
 }
 
@@ -527,7 +527,7 @@ test "chrome renders transcript and queue lines above editor" {
     try std.testing.expectEqualStrings("streaming", frame.rows()[0].copyText(&buffer));
     try std.testing.expectEqualStrings("steering: next", frame.rows()[3].copyText(&buffer));
     try std.testing.expectEqualStrings("ready", frame.rows()[4].copyText(&buffer));
-    try std.testing.expect(std.mem.startsWith(u8, frame.rows()[6].copyText(&buffer), "│> draft"));
+    try std.testing.expect(std.mem.startsWith(u8, frame.rows()[6].copyText(&buffer), "│draft"));
 }
 
 test "chrome clamps cursor to frame width" {
@@ -535,7 +535,7 @@ test "chrome clamps cursor to frame width" {
     try editor.insert("hello");
     const frame = try compose(.{ .editor = &editor }, 4, 2);
 
-    try std.testing.expectEqual(@as(u16, 3), frame.cursor.?.col);
+    try std.testing.expectEqual(@as(u16, 1), frame.cursor.?.col);
     try std.testing.expectEqual(@as(u16, 1), frame.cursor.?.row);
 }
 
@@ -546,8 +546,8 @@ test "chrome renders bordered editor with supplied border style" {
 
     var buffer: [128]u8 = undefined;
     try std.testing.expectEqualStrings("╭──────────────────╮", frame.rows()[3].copyText(&buffer));
-    try std.testing.expectEqualStrings("│> draft           │", frame.rows()[4].copyText(&buffer));
-    try std.testing.expectEqual(@as(u16, 8), frame.cursor.?.col);
+    try std.testing.expectEqualStrings("│draft             │", frame.rows()[4].copyText(&buffer));
+    try std.testing.expectEqual(@as(u16, 6), frame.cursor.?.col);
     try std.testing.expect(std.meta.eql(frame.rows()[3].spans()[0].style.fg, screen.text.error_.fg));
 }
 
@@ -556,7 +556,7 @@ test "chrome composer border labels are display-column aligned" {
     const frame = try compose(.{
         .editor = &editor,
         .composer_top_left = "~/workspace/dev/personal/zi",
-        .composer_top_right = "ctx 0.0% ↑0 ↓0 tokens · gpt-5.5 · thinking:off",
+        .composer_top_right = "ctx 10%/259k • gpt-5.5 (low)",
     }, 100, 6);
 
     var buffer: [256]u8 = undefined;
@@ -574,9 +574,9 @@ test "chrome bordered editor uses display columns for fill and cursor" {
     var buffer: [128]u8 = undefined;
     const row = frame.rows()[4].copyText(&buffer);
     try std.testing.expectEqual(@as(usize, 20), frame.rows()[4].cellWidth());
-    try std.testing.expect(std.mem.startsWith(u8, row, "│> λ🙂"));
+    try std.testing.expect(std.mem.startsWith(u8, row, "│λ🙂"));
     try std.testing.expect(std.mem.endsWith(u8, row, "│"));
-    try std.testing.expectEqual(@as(u16, 6), frame.cursor.?.col);
+    try std.testing.expectEqual(@as(u16, 4), frame.cursor.?.col);
 }
 
 test "chrome wraps composer input by display columns" {
@@ -585,9 +585,9 @@ test "chrome wraps composer input by display columns" {
     const frame = try compose(.{ .editor = &editor }, 20, 10);
 
     var buffer: [128]u8 = undefined;
-    try std.testing.expectEqualStrings("│> hello my good   │", frame.rows()[7].copyText(&buffer));
-    try std.testing.expectEqualStrings("│  friend          │", frame.rows()[8].copyText(&buffer));
-    try std.testing.expectEqual(@as(u16, 9), frame.cursor.?.col);
+    try std.testing.expectEqualStrings("│hello my good     │", frame.rows()[7].copyText(&buffer));
+    try std.testing.expectEqualStrings("│friend            │", frame.rows()[8].copyText(&buffer));
+    try std.testing.expectEqual(@as(u16, 7), frame.cursor.?.col);
     try std.testing.expectEqual(@as(u16, 8), frame.cursor.?.row);
 }
 
@@ -598,8 +598,8 @@ test "chrome keeps wrapped composer cursor visible" {
     const frame = try compose(.{ .editor = &editor }, 12, 20);
 
     var buffer: [128]u8 = undefined;
-    try std.testing.expectEqualStrings("│> abcdefgh│", frame.rows()[15].copyText(&buffer));
-    try std.testing.expectEqual(@as(u16, 3), frame.cursor.?.col);
+    try std.testing.expectEqualStrings("│abcdefgh  │", frame.rows()[15].copyText(&buffer));
+    try std.testing.expectEqual(@as(u16, 1), frame.cursor.?.col);
     try std.testing.expectEqual(@as(u16, 15), frame.cursor.?.row);
 }
 
@@ -609,9 +609,9 @@ test "chrome wraps composer input by unicode cell width" {
     const frame = try compose(.{ .editor = &editor }, 10, 10);
 
     var buffer: [128]u8 = undefined;
-    try std.testing.expectEqualStrings("│> λ🙂abc│", frame.rows()[7].copyText(&buffer));
-    try std.testing.expectEqualStrings("│  def   │", frame.rows()[8].copyText(&buffer));
-    try std.testing.expectEqual(@as(u16, 6), frame.cursor.?.col);
+    try std.testing.expectEqualStrings("│λ🙂abcde│", frame.rows()[7].copyText(&buffer));
+    try std.testing.expectEqualStrings("│f       │", frame.rows()[8].copyText(&buffer));
+    try std.testing.expectEqual(@as(u16, 2), frame.cursor.?.col);
     try std.testing.expectEqual(@as(u16, 8), frame.cursor.?.row);
 }
 
@@ -630,7 +630,7 @@ test "chrome renders picker with main selection marker" {
     var buffer: [128]u8 = undefined;
     try std.testing.expectEqualStrings("  alpha", frame.rows()[4].copyText(&buffer));
     try std.testing.expectEqualStrings("› beta", frame.rows()[5].copyText(&buffer));
-    try std.testing.expect(std.mem.startsWith(u8, frame.rows()[2].copyText(&buffer), "│> "));
+    try std.testing.expect(std.mem.startsWith(u8, frame.rows()[2].copyText(&buffer), "│"));
     try std.testing.expect(std.meta.eql(frame.rows()[5].row_style.bg, screen.surface.selected.bg));
 }
 
@@ -648,7 +648,7 @@ test "chrome renders completion popup with main selection marker" {
     }, 80, 9);
 
     var buffer: [128]u8 = undefined;
-    try std.testing.expect(std.mem.startsWith(u8, frame.rows()[5].copyText(&buffer), "│> @m"));
+    try std.testing.expect(std.mem.startsWith(u8, frame.rows()[5].copyText(&buffer), "│@m"));
     try std.testing.expectEqualStrings("  main.zig", frame.rows()[7].copyText(&buffer));
     try std.testing.expectEqualStrings("› module.zig", frame.rows()[8].copyText(&buffer));
     try std.testing.expect(std.meta.eql(frame.rows()[8].row_style.bg, screen.surface.selected.bg));
@@ -663,8 +663,8 @@ test "chrome protects composer under small queued/status chrome" {
     var buffer: [128]u8 = undefined;
     try std.testing.expectEqualStrings("steering: one", frame.rows()[0].copyText(&buffer));
     try std.testing.expectEqualStrings("Working…", frame.rows()[1].copyText(&buffer));
-    try std.testing.expectEqualStrings("> draft", frame.rows()[2].copyText(&buffer));
-    try std.testing.expectEqual(@as(u16, 7), frame.cursor.?.col);
+    try std.testing.expectEqualStrings("draft", frame.rows()[2].copyText(&buffer));
+    try std.testing.expectEqual(@as(u16, 5), frame.cursor.?.col);
     try std.testing.expectEqual(@as(u16, 2), frame.cursor.?.row);
 }
 

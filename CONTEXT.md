@@ -18,6 +18,9 @@ review vocabulary.
 protocol/view-model layers between the agent and the screen. Use it to reject
 new translation corridors.
 
+**`docs/runtime-zio-capabilities.md`** inventories the zio surface Zi actually
+uses. Use it before changing `src/runtime` or evaluating a zio replacement.
+
 ## Architecture in one sentence
 
 `cli` selects a concrete frontend; the frontend owns the driving loop; the loop

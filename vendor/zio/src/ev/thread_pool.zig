@@ -156,6 +156,15 @@ pub const ThreadPool = struct {
         }
 
         self.queue_mutex.lock();
+        if (self.shutdown) {
+            self.queue_mutex.unlock();
+            work.c.setError(error.Canceled);
+            work.state.store(.canceled, .release);
+            if (work.completion_fn) |completion_fn| {
+                completion_fn(work.completion_context, work);
+            }
+            return;
+        }
         self.queue.push(&work.c);
         self.queue_size += 1;
         const queued = self.queue_size;
@@ -210,8 +219,9 @@ pub const ThreadPool = struct {
         self.queue_mutex.lock();
         defer self.queue_mutex.unlock();
 
-        while (!self.shutdown) {
+        while (true) {
             const c = self.queue.pop() orelse {
+                if (self.shutdown) return true;
                 _ = self.idle_threads.fetchAdd(1, .monotonic);
                 defer _ = self.idle_threads.fetchSub(1, .monotonic);
 
@@ -250,3 +260,50 @@ pub const ThreadPool = struct {
         return true;
     }
 };
+
+test "ThreadPool: shutdown drains queued work before join" {
+    const Context = struct {
+        started: os.ResetEvent = .init(),
+        release: os.ResetEvent = .init(),
+        queued_ran: std.atomic.Value(bool) = .init(false),
+        completions: std.atomic.Value(u32) = .init(0),
+
+        fn blockingWork(work: *Work) void {
+            const self: *@This() = @ptrCast(@alignCast(work.userdata.?));
+            self.started.set();
+            self.release.wait();
+        }
+
+        fn queuedWork(work: *Work) void {
+            const self: *@This() = @ptrCast(@alignCast(work.userdata.?));
+            self.queued_ran.store(true, .release);
+        }
+
+        fn completed(ctx: ?*anyopaque, _: *Work) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            _ = self.completions.fetchAdd(1, .acq_rel);
+        }
+    };
+
+    var pool: ThreadPool = undefined;
+    try pool.init(std.testing.allocator, .{ .min_threads = 1, .max_threads = 1 });
+
+    var context: Context = .{};
+    var blocking = Work.init(Context.blockingWork, &context);
+    blocking.completion_fn = Context.completed;
+    blocking.completion_context = &context;
+    var queued = Work.init(Context.queuedWork, &context);
+    queued.completion_fn = Context.completed;
+    queued.completion_context = &context;
+
+    pool.submit(&blocking);
+    context.started.wait();
+    pool.submit(&queued);
+
+    pool.stop();
+    context.release.set();
+    pool.deinit();
+
+    try std.testing.expect(context.queued_ran.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 2), context.completions.load(.acquire));
+}
