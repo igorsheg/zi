@@ -12,31 +12,32 @@ pub fn renderLine(state: *MdState, out: *screen.Line, text: []const u8, base: sc
     const trimmed = std.mem.trimStart(u8, trimmed_right, " \t");
 
     if (state.fence != null) {
+        const style = if (isFence(trimmed)) screen.markdown_styles.code_block_border else screen.markdown_styles.code_block;
         if (isFence(trimmed)) state.fence = null;
-        try out.append(.{ .text = trimmed_right, .style = mergeStyle(base, .{ .dim = true }) });
+        try out.append(.{ .text = trimmed_right, .style = mergeStyle(base, style) });
         return;
     }
 
     if (isFence(trimmed)) {
         state.fence = .{};
-        try out.append(.{ .text = trimmed_right, .style = mergeStyle(base, .{ .dim = true }) });
+        try out.append(.{ .text = trimmed_right, .style = mergeStyle(base, screen.markdown_styles.code_block_border) });
         return;
     }
 
     if (headingText(trimmed)) |heading| {
-        try out.append(.{ .text = heading, .style = mergeStyle(base, .{ .bold = true }) });
+        try out.append(.{ .text = heading, .style = screen.withBold(mergeStyle(base, screen.markdown_styles.heading)) });
         return;
     }
 
     if (std.mem.eql(u8, trimmed, "---")) {
-        try out.append(.{ .text = "--------", .style = mergeStyle(base, .{ .dim = true }) });
+        try out.append(.{ .text = "--------", .style = mergeStyle(base, screen.markdown_styles.hr) });
         return;
     }
 
     if (std.mem.startsWith(u8, trimmed, ">")) {
         var quote = trimmed[1..];
         if (quote.len > 0 and quote[0] == ' ') quote = quote[1..];
-        try renderInline(out, quote, mergeStyle(base, .{ .dim = true, .italic = true }));
+        try renderInline(out, quote, mergeStyle(base, screen.markdown_styles.quote));
         return;
     }
 
@@ -53,7 +54,7 @@ pub fn renderInline(out: *screen.Line, text: []const u8, base: screen.Style) err
         if (std.mem.startsWith(u8, text[index..], "**")) {
             if (std.mem.indexOf(u8, text[index + 2 ..], "**")) |end_rel| {
                 const inner = text[index + 2 .. index + 2 + end_rel];
-                try out.append(.{ .text = inner, .style = mergeStyle(base, .{ .bold = true }) });
+                try out.append(.{ .text = inner, .style = screen.withBold(base) });
                 index += 2 + end_rel + 2;
                 continue;
             }
@@ -61,7 +62,7 @@ pub fn renderInline(out: *screen.Line, text: []const u8, base: screen.Style) err
         if (text[index] == '`') {
             if (std.mem.indexOfScalar(u8, text[index + 1 ..], '`')) |end_rel| {
                 const inner = text[index + 1 .. index + 1 + end_rel];
-                try out.append(.{ .text = inner, .style = mergeStyle(base, .{ .dim = true }) });
+                try out.append(.{ .text = inner, .style = mergeStyle(base, screen.markdown_styles.code) });
                 index += 1 + end_rel + 1;
                 continue;
             }
@@ -69,7 +70,7 @@ pub fn renderInline(out: *screen.Line, text: []const u8, base: screen.Style) err
         if (text[index] == '*') {
             if (std.mem.indexOfScalar(u8, text[index + 1 ..], '*')) |end_rel| {
                 const inner = text[index + 1 .. index + 1 + end_rel];
-                try out.append(.{ .text = inner, .style = mergeStyle(base, .{ .italic = true }) });
+                try out.append(.{ .text = inner, .style = screen.withItalic(base) });
                 index += 1 + end_rel + 1;
                 continue;
             }
@@ -79,7 +80,7 @@ pub fn renderInline(out: *screen.Line, text: []const u8, base: screen.Style) err
                 const url_start = index + mid_rel + 2;
                 if (std.mem.indexOfScalar(u8, text[url_start..], ')')) |url_end_rel| {
                     const label = text[index + 1 .. index + mid_rel];
-                    try out.append(.{ .text = label, .style = mergeStyle(base, .{ .ul_style = .single }) });
+                    try out.append(.{ .text = label, .style = mergeStyle(base, screen.markdown_styles.link) });
                     index = url_start + url_end_rel + 1;
                     continue;
                 }
@@ -133,15 +134,15 @@ pub fn mergeStyle(base: screen.Style, overlay: screen.Style) screen.Style {
 test "markdown renders basic inline styles" {
     var state: MdState = .{};
     var line: screen.Line = .{};
-    try renderLine(&state, &line, "# hello **world**", screen.styles.normal);
+    try renderLine(&state, &line, "# hello **world**", screen.text.normal);
     try std.testing.expectEqual(@as(usize, 1), line.spans().len);
     try std.testing.expect(line.spans()[0].style.bold);
     try std.testing.expectEqualStrings("hello **world**", line.spans()[0].text);
 
     var inline_line: screen.Line = .{};
-    try renderInline(&inline_line, "a **b** `c` *d* [e](url)", screen.styles.normal);
+    try renderInline(&inline_line, "a **b** `c` *d* [e](url)", screen.text.normal);
     try std.testing.expect(inline_line.spans()[1].style.bold);
-    try std.testing.expect(inline_line.spans()[3].style.dim);
+    try std.testing.expect(std.meta.eql(inline_line.spans()[3].style.fg, screen.markdown_styles.code.fg));
     try std.testing.expect(inline_line.spans()[5].style.italic);
     try std.testing.expect(inline_line.spans()[7].style.ul_style == .single);
 }
@@ -149,19 +150,19 @@ test "markdown renders basic inline styles" {
 test "markdown carries fence state" {
     var state: MdState = .{};
     var open: screen.Line = .{};
-    try renderLine(&state, &open, "```zig", screen.styles.normal);
+    try renderLine(&state, &open, "```zig", screen.text.normal);
     try std.testing.expect(state.fence != null);
     var body: screen.Line = .{};
-    try renderLine(&state, &body, "const x = 1;", screen.styles.normal);
-    try std.testing.expect(body.spans()[0].style.dim);
+    try renderLine(&state, &body, "const x = 1;", screen.text.normal);
+    try std.testing.expect(std.meta.eql(body.spans()[0].style.fg, screen.markdown_styles.code_block.fg));
     var close: screen.Line = .{};
-    try renderLine(&state, &close, "```", screen.styles.normal);
+    try renderLine(&state, &close, "```", screen.text.normal);
     try std.testing.expect(state.fence == null);
 }
 
 test "markdown keeps text when inline spans exceed line capacity" {
     var line: screen.Line = .{};
-    try renderInline(&line, "a **b** c **d** e **f** g **h** i **j** k **l** m", screen.styles.normal);
+    try renderInline(&line, "a **b** c **d** e **f** g **h** i **j** k **l** m", screen.text.normal);
     try std.testing.expect(line.spans().len <= screen.span_capacity);
     var buffer: [128]u8 = undefined;
     try std.testing.expectEqualStrings("a b c d e f g h i j k l m", line.copyText(&buffer));

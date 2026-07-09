@@ -1062,7 +1062,7 @@ pub const Loop = struct {
     }
 
     fn isSeparatorLine(line: screen.Line) bool {
-        return line.spans().len == 0 and screen.Style.eql(line.row_style, screen.styles.normal);
+        return line.spans().len == 0 and screen.Style.eql(line.row_style, screen.surface.transparent);
     }
 
     fn anchorOldestLiveLine(self: *Loop) void {
@@ -1203,12 +1203,14 @@ pub const Loop = struct {
     }
 
     fn editorBorderStyle(self: *const Loop) screen.Style {
-        const session = self.session orelse return screen.styles.muted;
+        const session = self.session orelse return screen.thinking_border.off;
         return switch (session.agent.state.thinking_level) {
-            .off => screen.styles.muted,
-            .minimal, .low => screen.styles.accent,
-            .medium => screen.styles.warn,
-            .high, .xhigh => screen.styles.error_,
+            .off => screen.thinking_border.off,
+            .minimal => screen.thinking_border.minimal,
+            .low => screen.thinking_border.low,
+            .medium => screen.thinking_border.medium,
+            .high => screen.thinking_border.high,
+            .xhigh => screen.thinking_border.xhigh,
         };
     }
 
@@ -1245,11 +1247,11 @@ pub const Loop = struct {
     }
 
     fn composerRightStyle(self: *Loop) screen.Style {
-        const session = self.session orelse return screen.styles.composer_slot;
-        const tenths = session.contextUsage().percent_tenths orelse return screen.styles.composer_slot;
-        if (tenths > 900) return screen.styles.error_;
-        if (tenths >= 700) return screen.styles.warn;
-        return screen.styles.ok;
+        const session = self.session orelse return screen.text.muted;
+        const tenths = session.contextUsage().percent_tenths orelse return screen.text.muted;
+        if (tenths > 900) return screen.text.error_;
+        if (tenths >= 700) return screen.text.warning;
+        return screen.text.success;
     }
 
     fn sessionTitle(self: *Loop) []const u8 {
@@ -1293,10 +1295,10 @@ pub const Loop = struct {
         for (self.completion.candidates[offset..][0..count], 0..) |*candidate, visible_index| {
             const absolute_index = offset + visible_index;
             var line: screen.Line = .{};
-            line.append(.{ .text = candidate.labelSlice(), .style = if (absolute_index == selected) screen.styles.accent else screen.styles.normal }) catch {};
+            line.append(.{ .text = candidate.labelSlice(), .style = if (absolute_index == selected) screen.text.accent else screen.text.normal }) catch {};
             if (candidate.detailSlice().len > 0) {
-                line.append(.{ .text = "  ", .style = screen.styles.muted }) catch {};
-                line.append(.{ .text = candidate.detailSlice(), .style = screen.styles.muted }) catch {};
+                line.append(.{ .text = "  ", .style = screen.text.muted }) catch {};
+                line.append(.{ .text = candidate.detailSlice(), .style = screen.text.muted }) catch {};
             }
             self.completion_lines[visible_index] = line;
         }
@@ -1318,20 +1320,20 @@ pub const Loop = struct {
         const offset = self.pickerVisibleOffset(rows, visible_capacity);
         const count = @min(rows.len -| offset, visible_capacity);
         if (count == 0) {
-            self.picker_lines[0] = screen.singleSpanLine("  no matches", screen.styles.picker_detail);
+            self.picker_lines[0] = screen.singleSpanLine("  no matches", screen.text.muted);
             return .{ .rows = self.picker_lines[0..1], .selected = null };
         }
         for (rows[offset..][0..count], 0..) |row_index, visible_index| {
             const row = &frame.rows[row_index];
             var line: screen.Line = .{};
-            line.append(.{ .text = row.labelSlice(), .style = if (frame.selected_row == row_index) screen.styles.accent else screen.styles.normal }) catch {};
+            line.append(.{ .text = row.labelSlice(), .style = if (frame.selected_row == row_index) screen.text.accent else screen.text.normal }) catch {};
             if (row.detailSlice().len > 0) {
-                line.append(.{ .text = "  ", .style = screen.styles.muted }) catch {};
-                line.append(.{ .text = row.detailSlice(), .style = screen.styles.muted }) catch {};
+                line.append(.{ .text = "  ", .style = screen.text.muted }) catch {};
+                line.append(.{ .text = row.detailSlice(), .style = screen.text.muted }) catch {};
             }
             if (row.metaSlice().len > 0) {
-                line.append(.{ .text = "  ", .style = screen.styles.muted }) catch {};
-                line.append(.{ .text = row.metaSlice(), .style = screen.styles.muted }) catch {};
+                line.append(.{ .text = "  ", .style = screen.text.muted }) catch {};
+                line.append(.{ .text = row.metaSlice(), .style = screen.text.muted }) catch {};
             }
             self.picker_lines[visible_index] = line;
         }
@@ -2490,7 +2492,7 @@ test "loop omits blank assistant rows for tool-call-only turns" {
     const frame = try loop.composeFrame(80, 16);
     var buffer: [128]u8 = undefined;
     try std.testing.expectEqualStrings("", frame.rows()[0].copyText(&buffer));
-    try std.testing.expect(std.meta.eql(frame.rows()[0].row_style.bg, screen.styles.panel.bg));
+    try std.testing.expect(std.meta.eql(frame.rows()[0].row_style.bg, screen.surface.user_message.bg));
     try std.testing.expectEqualStrings(" Run tools", frame.rows()[1].copyText(&buffer));
     try expectFrameContains(&frame, " $ pwd");
     try expectFrameContains(&frame, " ╭───");
@@ -2741,7 +2743,7 @@ test "loop tool UX renders edit patch with diff styles" {
     try expectFrameContains(&frame, "edit src/tui/chrome.zig");
     const added_row = frameRowContaining(&frame, "│ +new");
     try std.testing.expect(added_row != null);
-    try std.testing.expect(std.meta.eql(frame.rows()[added_row.?].spans()[0].style.fg, screen.styles.diff_add.fg));
+    try std.testing.expect(std.meta.eql(frame.rows()[added_row.?].spans()[2].style.fg, screen.diff.added.fg));
 }
 
 test "loop render timing honors dirty policy" {
@@ -2902,7 +2904,7 @@ test "loop P4 restore fold renders durable user tool and assistant transcript" {
     const frame = try fixture.owner_loop.composeFrame(80, 16);
     var buffer: [128]u8 = undefined;
     try std.testing.expectEqualStrings("", frame.rows()[0].copyText(&buffer));
-    try std.testing.expect(std.meta.eql(frame.rows()[0].row_style.bg, screen.styles.panel.bg));
+    try std.testing.expect(std.meta.eql(frame.rows()[0].row_style.bg, screen.surface.user_message.bg));
     try std.testing.expectEqualStrings(" Run pwd", frame.rows()[1].copyText(&buffer));
     try expectFrameContains(&frame, " $ pwd");
     try expectFrameContains(&frame, " ╭───");

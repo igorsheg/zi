@@ -23,16 +23,16 @@ pub const Snapshot = struct {
     status: []const u8 = "",
     composer_top_left: []const u8 = "",
     composer_top_right: []const u8 = "",
-    composer_top_right_style: screen.Style = screen.styles.composer_slot,
+    composer_top_right_style: screen.Style = screen.text.muted,
     composer_bottom_left: []const u8 = "",
     composer_bottom_right: []const u8 = "",
-    composer_bottom_right_style: screen.Style = screen.styles.composer_slot,
+    composer_bottom_right_style: screen.Style = screen.text.muted,
     scratch_text: []const u8 = "",
     transcript_lines: []const screen.Line = &.{},
     queue_lines: []const []const u8 = &.{},
     viewport_hint: []const u8 = "",
     editor: *const Editor,
-    editor_border_style: screen.Style = screen.styles.muted,
+    editor_border_style: screen.Style = screen.text.border,
     popup: ?PopupView = null,
     picker: ?PickerView = null,
 };
@@ -46,14 +46,14 @@ pub fn compose(snapshot: Snapshot, width: u16, height: u16) error{ FrameFull, Li
     }
     if (height == 2) {
         if (snapshot.status.len > 0) {
-            try frame.appendLine(screen.singleSpanLine(snapshot.status, screen.styles.muted));
+            try frame.appendLine(screen.singleSpanLine(snapshot.status, screen.text.muted));
         } else if (snapshot.queue_lines.len > 0 or snapshot.viewport_hint.len > 0) {
             const line = if (snapshot.viewport_hint.len > 0) snapshot.viewport_hint else snapshot.queue_lines[0];
-            try frame.appendLine(screen.singleSpanLine(line, screen.styles.muted));
+            try frame.appendLine(screen.singleSpanLine(line, screen.text.muted));
         } else if (snapshot.transcript_lines.len > 0) {
             try appendTranscriptTail(&frame, snapshot.transcript_lines, 1);
         } else if (snapshot.scratch_text.len > 0) {
-            try frame.appendLine(screen.singleSpanLine(tailLine(snapshot.scratch_text), screen.styles.normal));
+            try frame.appendLine(screen.singleSpanLine(tailLine(snapshot.scratch_text), screen.text.normal));
         } else {
             try frame.appendLine(.{});
         }
@@ -69,17 +69,17 @@ pub fn compose(snapshot: Snapshot, width: u16, height: u16) error{ FrameFull, Li
 
     appendTranscriptTail(&frame, snapshot.transcript_lines, plan.transcript_rows) catch |err| return err;
     if (snapshot.scratch_text.len > 0 and frame.rows().len + top_chrome.queue_rows + bottom_rows < height) {
-        try frame.appendLine(screen.singleSpanLine(tailLine(snapshot.scratch_text), screen.styles.normal));
+        try frame.appendLine(screen.singleSpanLine(tailLine(snapshot.scratch_text), screen.text.normal));
     }
     while (frame.rows().len + top_chrome.queue_rows + bottom_rows < height) try frame.appendLine(.{});
 
     var remaining_queue_rows = top_chrome.queue_rows;
     if (snapshot.viewport_hint.len > 0 and remaining_queue_rows > 0) {
-        try frame.appendLine(screen.singleSpanLine(snapshot.viewport_hint, screen.styles.muted));
+        try frame.appendLine(screen.singleSpanLine(snapshot.viewport_hint, screen.text.muted));
         remaining_queue_rows -= 1;
     }
-    for (snapshot.queue_lines[0..@min(snapshot.queue_lines.len, remaining_queue_rows)]) |line| try frame.appendLine(screen.singleSpanLine(line, screen.styles.muted));
-    if (top_chrome.status_rows > 0) try frame.appendLine(screen.singleSpanLine(snapshot.status, screen.styles.muted));
+    for (snapshot.queue_lines[0..@min(snapshot.queue_lines.len, remaining_queue_rows)]) |line| try frame.appendLine(screen.singleSpanLine(line, screen.text.muted));
+    if (top_chrome.status_rows > 0) try frame.appendLine(screen.singleSpanLine(snapshot.status, screen.text.muted));
     if (plan.editor_rows > 0) appendEditor(&frame, snapshot, @intCast(frame.rows().len), plan.editor_rows, width, useBorder(height, width) and plan.editor_rows >= 3) catch |err| return err;
     if (snapshot.picker) |picker| try appendPicker(&frame, picker, plan.picker_rows);
     if (snapshot.popup) |popup| try appendPopup(&frame, popup, plan.popup_rows);
@@ -184,8 +184,8 @@ fn appendPicker(frame: *screen.Frame, picker: PickerView, rows: usize) error{ Fr
 }
 
 fn appendSelectableLine(frame: *screen.Frame, source: screen.Line, selected: bool) error{ FrameFull, LineFull }!void {
-    var line: screen.Line = .{ .row_style = if (selected) screen.styles.picker_selected_row else screen.styles.picker_row };
-    try line.append(.{ .text = if (selected) glyphs.picker_selected else glyphs.picker_unselected, .style = if (selected) screen.styles.accent else screen.styles.muted });
+    var line: screen.Line = .{ .row_style = if (selected) screen.surface.selected else screen.surface.composer };
+    try line.append(.{ .text = if (selected) glyphs.picker_selected else glyphs.picker_unselected, .style = if (selected) screen.text.accent else screen.text.muted });
     for (source.spans()) |span| try line.append(span);
     try frame.appendLine(line);
 }
@@ -220,7 +220,7 @@ fn appendEditor(frame: *screen.Frame, snapshot: Snapshot, start_row: u16, rows: 
     const line_count = snapshot.editor.lineCount();
     const first_line = if (line_count > content_rows) line_count - content_rows else 0;
     var row: u16 = start_row;
-    const border_style = panelize(snapshot.editor_border_style);
+    const border_style = snapshot.editor_border_style;
     if (bordered) {
         try frame.appendLine(borderLine(width, border_style, true, snapshot.composer_top_left, snapshot.composer_top_right, snapshot.composer_top_right_style));
         row += 1;
@@ -232,19 +232,19 @@ fn appendEditor(frame: *screen.Frame, snapshot: Snapshot, start_row: u16, rows: 
 }
 
 fn appendEditorLine(frame: *screen.Frame, editor: *const Editor, row: u16, editor_line_index: usize, width: u16, border_style: screen.Style, bordered: bool) error{ FrameFull, LineFull }!void {
-    var builder = screen.LineBuilder.init(if (bordered) screen.styles.composer_text else screen.styles.normal);
+    var builder = screen.LineBuilder.init(if (bordered) screen.surface.composer else screen.surface.transparent);
     const prefix = if (editor_line_index == 0) prompt else "  ";
     const text = editor.lineSlice(editor_line_index);
     const content_width: usize = if (bordered) width -| 2 else width;
     var remaining = content_width;
 
     if (bordered) _ = try builder.appendText(glyphs.composer_vertical, border_style);
-    const prefix_cols = try builder.appendClipped(prefix, remaining, if (bordered) screen.styles.composer_prompt else screen.styles.accent);
+    const prefix_cols = try builder.appendClipped(prefix, remaining, if (bordered) screen.text.accent else screen.text.accent);
     remaining -|= prefix_cols;
-    const text_cols = try builder.appendClipped(text, remaining, if (bordered) screen.styles.composer_text else screen.styles.normal);
+    const text_cols = try builder.appendClipped(text, remaining, screen.text.normal);
     remaining -|= text_cols;
     if (bordered) {
-        _ = try builder.appendFill(spaceFill(remaining), remaining, screen.styles.composer_text);
+        _ = try builder.appendFill(spaceFill(remaining), remaining, screen.text.normal);
         _ = try builder.appendText(glyphs.composer_vertical, border_style);
     }
     try frame.appendLine(builder.finish());
@@ -260,7 +260,7 @@ fn appendEditorLine(frame: *screen.Frame, editor: *const Editor, row: u16, edito
 }
 
 fn borderLine(width: u16, border_style: screen.Style, top: bool, left_label: []const u8, right_label: []const u8, right_style: screen.Style) screen.Line {
-    var builder = screen.LineBuilder.init(screen.styles.composer_text);
+    var builder = screen.LineBuilder.init(screen.surface.composer);
     if (width == 0) return builder.finish();
     const left_corner = if (top) glyphs.composer_top_left else glyphs.composer_bottom_left;
     const right_corner = if (top) glyphs.composer_top_right else glyphs.composer_bottom_right;
@@ -279,7 +279,7 @@ fn borderLine(width: u16, border_style: screen.Style, top: bool, left_label: []c
 
     if (left_budget > 0) {
         _ = builder.appendText(" ", border_style) catch unreachable;
-        _ = builder.appendClipped(left_label, left_budget, screen.styles.composer_slot) catch unreachable;
+        _ = builder.appendClipped(left_label, left_budget, screen.text.muted) catch unreachable;
         _ = builder.appendText(" ", border_style) catch unreachable;
     }
     const fill_cols = inner -| left_total -| right_total;
@@ -291,12 +291,6 @@ fn borderLine(width: u16, border_style: screen.Style, top: bool, left_label: []c
     }
     _ = builder.appendText(right_corner, border_style) catch unreachable;
     return builder.finish();
-}
-
-fn panelize(style: screen.Style) screen.Style {
-    var out = style;
-    out.bg = screen.styles.composer_text.bg;
-    return out;
 }
 
 fn horizontalFill(cols: usize) []const u8 {
@@ -325,7 +319,7 @@ test "chrome composes status and editor rows" {
 test "chrome uses two-row spare row for transcript when no status" {
     var editor: Editor = .{};
     try editor.insert("draft");
-    const transcript = [_]screen.Line{screen.singleSpanLine("streaming", screen.styles.normal)};
+    const transcript = [_]screen.Line{screen.singleSpanLine("streaming", screen.text.normal)};
     const frame = try compose(.{ .transcript_lines = &transcript, .editor = &editor }, 80, 2);
 
     var buffer: [128]u8 = undefined;
@@ -338,7 +332,7 @@ test "chrome uses two-row spare row for transcript when no status" {
 test "chrome renders transcript and queue lines above editor" {
     var editor: Editor = .{};
     try editor.insert("draft");
-    const transcript = [_]screen.Line{screen.singleSpanLine("streaming", screen.styles.normal)};
+    const transcript = [_]screen.Line{screen.singleSpanLine("streaming", screen.text.normal)};
     const queues = [_][]const u8{"steering: next"};
     const frame = try compose(.{ .status = "ready", .transcript_lines = &transcript, .queue_lines = &queues, .editor = &editor }, 80, 8);
 
@@ -361,13 +355,13 @@ test "chrome clamps cursor to frame width" {
 test "chrome renders bordered editor with supplied border style" {
     var editor: Editor = .{};
     try editor.insert("draft");
-    const frame = try compose(.{ .editor = &editor, .editor_border_style = screen.styles.error_ }, 20, 6);
+    const frame = try compose(.{ .editor = &editor, .editor_border_style = screen.text.error_ }, 20, 6);
 
     var buffer: [128]u8 = undefined;
     try std.testing.expectEqualStrings("╭──────────────────╮", frame.rows()[3].copyText(&buffer));
     try std.testing.expectEqualStrings("│> draft           │", frame.rows()[4].copyText(&buffer));
     try std.testing.expectEqual(@as(u16, 8), frame.cursor.?.col);
-    try std.testing.expect(std.meta.eql(frame.rows()[3].spans()[0].style.fg, screen.styles.error_.fg));
+    try std.testing.expect(std.meta.eql(frame.rows()[3].spans()[0].style.fg, screen.text.error_.fg));
 }
 
 test "chrome composer border labels are display-column aligned" {
@@ -401,8 +395,8 @@ test "chrome bordered editor uses display columns for fill and cursor" {
 test "chrome renders picker with main selection marker" {
     var editor: Editor = .{};
     const rows = [_]screen.Line{
-        screen.singleSpanLine("alpha", screen.styles.normal),
-        screen.singleSpanLine("beta", screen.styles.normal),
+        screen.singleSpanLine("alpha", screen.text.normal),
+        screen.singleSpanLine("beta", screen.text.normal),
     };
     const frame = try compose(.{
         .status = "ready",
@@ -414,15 +408,15 @@ test "chrome renders picker with main selection marker" {
     try std.testing.expectEqualStrings("  alpha", frame.rows()[4].copyText(&buffer));
     try std.testing.expectEqualStrings("› beta", frame.rows()[5].copyText(&buffer));
     try std.testing.expect(std.mem.startsWith(u8, frame.rows()[2].copyText(&buffer), "│> "));
-    try std.testing.expect(std.meta.eql(frame.rows()[5].row_style.bg, screen.styles.picker_selected_row.bg));
+    try std.testing.expect(std.meta.eql(frame.rows()[5].row_style.bg, screen.surface.selected.bg));
 }
 
 test "chrome renders completion popup with main selection marker" {
     var editor: Editor = .{};
     try editor.insert("@m");
     const rows = [_]screen.Line{
-        screen.singleSpanLine("main.zig", screen.styles.normal),
-        screen.singleSpanLine("module.zig", screen.styles.normal),
+        screen.singleSpanLine("main.zig", screen.text.normal),
+        screen.singleSpanLine("module.zig", screen.text.normal),
     };
     const frame = try compose(.{
         .status = "ready",
@@ -434,7 +428,7 @@ test "chrome renders completion popup with main selection marker" {
     try std.testing.expect(std.mem.startsWith(u8, frame.rows()[5].copyText(&buffer), "│> @m"));
     try std.testing.expectEqualStrings("  main.zig", frame.rows()[7].copyText(&buffer));
     try std.testing.expectEqualStrings("› module.zig", frame.rows()[8].copyText(&buffer));
-    try std.testing.expect(std.meta.eql(frame.rows()[8].row_style.bg, screen.styles.picker_selected_row.bg));
+    try std.testing.expect(std.meta.eql(frame.rows()[8].row_style.bg, screen.surface.selected.bg));
 }
 
 test "chrome protects composer under small queued/status chrome" {
@@ -454,14 +448,14 @@ test "chrome protects composer under small queued/status chrome" {
 test "chrome picker keeps eighth visible candidate" {
     var editor: Editor = .{};
     const rows = [_]screen.Line{
-        screen.singleSpanLine("item0", screen.styles.normal),
-        screen.singleSpanLine("item1", screen.styles.normal),
-        screen.singleSpanLine("item2", screen.styles.normal),
-        screen.singleSpanLine("item3", screen.styles.normal),
-        screen.singleSpanLine("item4", screen.styles.normal),
-        screen.singleSpanLine("item5", screen.styles.normal),
-        screen.singleSpanLine("item6", screen.styles.normal),
-        screen.singleSpanLine("item7", screen.styles.normal),
+        screen.singleSpanLine("item0", screen.text.normal),
+        screen.singleSpanLine("item1", screen.text.normal),
+        screen.singleSpanLine("item2", screen.text.normal),
+        screen.singleSpanLine("item3", screen.text.normal),
+        screen.singleSpanLine("item4", screen.text.normal),
+        screen.singleSpanLine("item5", screen.text.normal),
+        screen.singleSpanLine("item6", screen.text.normal),
+        screen.singleSpanLine("item7", screen.text.normal),
     };
     const frame = try compose(.{
         .editor = &editor,
@@ -470,5 +464,5 @@ test "chrome picker keeps eighth visible candidate" {
 
     var buffer: [128]u8 = undefined;
     try std.testing.expectEqualStrings("› item7", frame.rows()[29].copyText(&buffer));
-    try std.testing.expect(std.meta.eql(frame.rows()[29].row_style.bg, screen.styles.picker_selected_row.bg));
+    try std.testing.expect(std.meta.eql(frame.rows()[29].row_style.bg, screen.surface.selected.bg));
 }

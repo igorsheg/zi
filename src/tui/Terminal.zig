@@ -207,7 +207,7 @@ test "terminal wrapper paints a frame into vaxis screen" {
     defer terminal.deinit();
 
     var frame: screen_mod.Frame = .{};
-    try frame.appendLine(screen_mod.singleSpanLine("hi", screen_mod.styles.normal));
+    try frame.appendLine(screen_mod.singleSpanLine("hi", screen_mod.text.normal));
     frame.cursor = .{ .col = 1, .row = 0 };
     try terminal.paint(frame);
 

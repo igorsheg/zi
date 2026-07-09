@@ -5,49 +5,137 @@ pub const row_capacity = 512;
 pub const span_capacity = 16;
 
 pub const Style = vaxis.Style;
+pub const Color = vaxis.Color;
 
-pub const styles = struct {
-    const bg0 = vaxis.Color{ .rgb = .{ 0x09, 0x0e, 0x13 } };
-    const bg1 = vaxis.Color{ .rgb = .{ 0x1c, 0x1e, 0x25 } };
-    const bg3 = vaxis.Color{ .rgb = .{ 0x39, 0x3b, 0x44 } };
-    const fg_text = vaxis.Color{ .rgb = .{ 0xc5, 0xc9, 0xc7 } };
-    const fg_bright = vaxis.Color{ .rgb = .{ 0xf2, 0xf1, 0xef } };
-    const muted_fg = vaxis.Color{ .rgb = .{ 0x90, 0x93, 0x98 } };
-    const muted2_fg = vaxis.Color{ .rgb = .{ 0x5c, 0x60, 0x66 } };
-    const blue_fg = vaxis.Color{ .rgb = .{ 0x7f, 0xb4, 0xca } };
-    const red = vaxis.Color{ .rgb = .{ 0xc3, 0x40, 0x43 } };
-    const yellow = vaxis.Color{ .rgb = .{ 0xdc, 0xa5, 0x61 } };
-    const green = vaxis.Color{ .rgb = .{ 0x98, 0xbb, 0x6c } };
-    const diff_add_bg = vaxis.Color{ .rgb = .{ 0x2b, 0x33, 0x28 } };
-    const diff_del_bg = vaxis.Color{ .rgb = .{ 0x43, 0x24, 0x2b } };
+fn rgb(value: u24) Color {
+    return Color.rgbFromUint(value);
+}
 
-    pub const normal: Style = .{ .fg = fg_text };
-    pub const muted: Style = .{ .fg = muted_fg, .dim = true };
-    pub const accent: Style = .{ .bold = true, .fg = blue_fg };
-    pub const ok: Style = .{ .fg = green };
-    pub const warn: Style = .{ .fg = yellow };
-    pub const error_: Style = .{ .fg = red };
-    pub const panel: Style = .{ .fg = fg_bright, .bg = bg1 };
-    pub const composer_chrome: Style = .{ .fg = muted2_fg, .bg = bg0 };
-    pub const composer_slot: Style = .{ .fg = muted_fg, .bg = bg0 };
-    pub const composer_text: Style = .{ .fg = fg_text, .bg = bg0 };
-    pub const composer_prompt: Style = .{ .bold = true, .fg = blue_fg, .bg = bg0 };
-    pub const picker_row: Style = .{ .fg = fg_text, .bg = bg0 };
-    pub const picker_selected_row: Style = .{ .fg = fg_bright, .bg = bg3 };
-    pub const picker_detail: Style = .{ .fg = muted_fg, .bg = bg0, .dim = true };
-    pub const diff_add: Style = .{ .fg = green, .bg = diff_add_bg };
-    pub const diff_del: Style = .{ .fg = red, .bg = diff_del_bg };
+pub const colors = struct {
+    pub const bg = rgb(0x090E13);
+    pub const fg = rgb(0xC5C9C7);
+    pub const tier1 = rgb(0xBEC2C0);
+    pub const tier2 = rgb(0xB2B6B4);
+    pub const tier3 = rgb(0xA5A9A7);
+    pub const tier4 = rgb(0x9B9690);
+    pub const tier5 = rgb(0x7F8381);
+    pub const tier6 = rgb(0x6A6E6C);
+    pub const tier7 = rgb(0x535755);
+    pub const scaffold = rgb(0x626664);
+    pub const selection = rgb(0x393B44);
+    pub const red = rgb(0xE46876);
+    pub const green = rgb(0x87A987);
+    pub const yellow = rgb(0xE6C384);
+    pub const blue = rgb(0x7FB4CA);
+    pub const purple = rgb(0x938AA9);
+    pub const teal = rgb(0x7AA89F);
+    pub const panel_bg = rgb(0x0D1218);
+    pub const panel_bg_light = rgb(0x111820);
+    pub const panel_bg_green = rgb(0x0F1A14);
+    pub const panel_bg_red = rgb(0x1A0F12);
+};
+
+pub fn onSurface(style: Style, row_surface: Style) Style {
+    var out = style;
+    const resolved_surface = if (row_surface.bg == .default) surface.app else row_surface;
+    if (out.bg == .default) out.bg = resolved_surface.bg;
+    return out;
+}
+
+pub fn withBold(style: Style) Style {
+    var out = style;
+    out.bold = true;
+    return out;
+}
+
+pub fn withItalic(style: Style) Style {
+    var out = style;
+    out.italic = true;
+    return out;
+}
+
+pub const text = struct {
+    pub const normal: Style = .{};
+    pub const muted: Style = .{ .fg = colors.tier5 };
+    pub const dim: Style = .{ .fg = colors.tier6 };
+    pub const scaffold: Style = .{ .fg = colors.scaffold };
+    pub const accent: Style = .{ .fg = colors.teal };
+    pub const border: Style = .{ .fg = colors.tier6 };
+    pub const border_accent: Style = .{ .fg = colors.blue };
+    pub const border_muted: Style = .{ .fg = colors.tier7 };
+    pub const success: Style = .{ .fg = colors.green };
+    pub const error_: Style = .{ .fg = colors.red };
+    pub const warning: Style = .{ .fg = colors.yellow };
+    pub const thinking: Style = .{ .fg = colors.tier5 };
+    pub const user_message: Style = .{};
+    pub const custom_message: Style = .{};
+    pub const custom_message_label: Style = .{ .fg = colors.purple };
+    pub const tool_title: Style = .{};
+    pub const tool_output: Style = .{ .fg = colors.tier5 };
+    pub const bash_mode: Style = .{ .fg = colors.yellow };
+};
+
+pub const surface = struct {
+    pub const transparent: Style = .{};
+    pub const app: Style = .{ .bg = colors.bg };
+    pub const composer: Style = .{ .bg = colors.bg };
+    pub const selected: Style = .{ .bg = colors.selection };
+    pub const user_message: Style = .{ .bg = colors.panel_bg };
+    pub const custom_message: Style = .{ .bg = colors.panel_bg_light };
+    pub const tool_pending: Style = .{ .bg = colors.panel_bg };
+    pub const tool_success: Style = .{};
+    pub const tool_error: Style = .{ .bg = colors.panel_bg_red };
+};
+
+pub const markdown_styles = struct {
+    pub const heading: Style = .{ .fg = colors.yellow };
+    pub const link: Style = .{ .fg = colors.blue, .ul_style = .single };
+    pub const link_url: Style = .{ .fg = colors.tier6 };
+    pub const code: Style = .{ .fg = colors.teal };
+    pub const code_block: Style = .{ .fg = colors.tier3 };
+    pub const code_block_border: Style = .{ .fg = colors.tier7 };
+    pub const quote: Style = .{ .fg = colors.tier5, .italic = true };
+    pub const quote_border: Style = .{ .fg = colors.tier7 };
+    pub const hr: Style = .{ .fg = colors.tier7 };
+    pub const list_bullet: Style = .{ .fg = colors.teal };
+};
+
+pub const diff = struct {
+    pub const added: Style = .{ .fg = rgb(0x98BB6C) };
+    pub const removed: Style = .{ .fg = colors.red };
+    pub const context: Style = .{ .fg = colors.tier7 };
+};
+
+pub const syntax = struct {
+    pub const comment: Style = .{ .fg = colors.tier7 };
+    pub const keyword: Style = .{ .fg = colors.tier1 };
+    pub const function: Style = .{ .fg = colors.tier2 };
+    pub const variable: Style = .{ .fg = colors.tier3 };
+    pub const string: Style = .{ .fg = colors.tier4 };
+    pub const number: Style = .{ .fg = colors.tier4 };
+    pub const type_name: Style = .{ .fg = colors.tier5 };
+    pub const operator: Style = .{ .fg = colors.tier6 };
+    pub const punctuation: Style = .{ .fg = colors.scaffold };
+};
+
+pub const thinking_border = struct {
+    pub const off: Style = .{ .fg = colors.tier7 };
+    pub const minimal: Style = .{ .fg = colors.tier6 };
+    pub const low: Style = .{ .fg = colors.tier5 };
+    pub const medium: Style = .{ .fg = colors.teal };
+    pub const high: Style = .{ .fg = colors.purple };
+    pub const xhigh: Style = .{ .fg = colors.blue };
 };
 
 pub const Span = struct {
     text: []const u8,
-    style: Style = styles.normal,
+    style: Style = text.normal,
 };
 
 pub const Line = struct {
     spans_buffer: [span_capacity]Span = undefined,
     span_len: usize = 0,
-    row_style: Style = styles.normal,
+    row_style: Style = surface.transparent,
 
     pub fn spans(self: *const Line) []const Span {
         return self.spans_buffer[0..self.span_len];
@@ -117,16 +205,16 @@ pub const LineBuilder = struct {
         return .{ .line = .{ .row_style = row_style } };
     }
 
-    pub fn appendText(self: *LineBuilder, text: []const u8, style: Style) error{LineFull}!usize {
-        if (text.len == 0) return 0;
-        try self.line.append(.{ .text = text, .style = style });
-        const width = displayWidth(text);
+    pub fn appendText(self: *LineBuilder, bytes: []const u8, style: Style) error{LineFull}!usize {
+        if (bytes.len == 0) return 0;
+        try self.line.append(.{ .text = bytes, .style = style });
+        const width = displayWidth(bytes);
         self.col += width;
         return width;
     }
 
-    pub fn appendClipped(self: *LineBuilder, text: []const u8, max_cols: usize, style: Style) error{LineFull}!usize {
-        return self.appendText(sliceForColumns(text, max_cols), style);
+    pub fn appendClipped(self: *LineBuilder, bytes: []const u8, max_cols: usize, style: Style) error{LineFull}!usize {
+        return self.appendText(sliceForColumns(bytes, max_cols), style);
     }
 
     pub fn appendFill(self: *LineBuilder, repeated_text: []const u8, cols: usize, style: Style) error{LineFull}!usize {
@@ -143,7 +231,7 @@ pub const Screen = struct {
         const win = vx.window();
         win.clear();
         for (frame.rows(), 0..) |line, row| {
-            if (!Style.eql(line.row_style, styles.normal)) {
+            if (!Style.eql(line.row_style, surface.transparent)) {
                 var fill_col: u16 = 0;
                 while (fill_col < vx.screen.width) : (fill_col += 1) {
                     win.writeCell(fill_col, @intCast(row), .{ .style = line.row_style });
@@ -153,7 +241,7 @@ pub const Screen = struct {
             for (line.spans()) |span| {
                 const result = win.printSegment(.{
                     .text = span.text,
-                    .style = span.style,
+                    .style = onSurface(span.style, line.row_style),
                 }, .{
                     .row_offset = @intCast(row),
                     .col_offset = col,
@@ -171,38 +259,38 @@ pub const Screen = struct {
     }
 };
 
-pub fn singleSpanLine(text: []const u8, style: Style) Line {
+pub fn singleSpanLine(bytes: []const u8, style: Style) Line {
     var line: Line = .{};
-    line.append(.{ .text = text, .style = style }) catch unreachable;
+    line.append(.{ .text = bytes, .style = style }) catch unreachable;
     return line;
 }
 
-pub fn displayWidth(text: []const u8) usize {
-    if (asciiDisplayWidth(text)) |width| return width;
-    var iter = vaxis.unicode.graphemeIterator(text);
+pub fn displayWidth(bytes: []const u8) usize {
+    if (asciiDisplayWidth(bytes)) |width| return width;
+    var iter = vaxis.unicode.graphemeIterator(bytes);
     var width: usize = 0;
     while (iter.next()) |grapheme| {
-        const bytes = grapheme.bytes(text);
-        if (std.mem.eql(u8, bytes, "\n")) break;
-        width += @intCast(vaxis.gwidth.gwidth(bytes, .unicode));
+        const grapheme_bytes = grapheme.bytes(bytes);
+        if (std.mem.eql(u8, grapheme_bytes, "\n")) break;
+        width += @intCast(vaxis.gwidth.gwidth(grapheme_bytes, .unicode));
     }
     return width;
 }
 
-pub fn sliceForColumns(text: []const u8, max_cols: usize) []const u8 {
-    return text[0..sliceEndForColumns(text, max_cols)];
+pub fn sliceForColumns(bytes: []const u8, max_cols: usize) []const u8 {
+    return bytes[0..sliceEndForColumns(bytes, max_cols)];
 }
 
-pub fn sliceEndForColumns(text: []const u8, max_cols: usize) usize {
-    if (text.len == 0 or max_cols == 0) return 0;
-    if (asciiSliceEndForColumns(text, max_cols)) |end| return end;
-    var iter = vaxis.unicode.graphemeIterator(text);
+pub fn sliceEndForColumns(bytes: []const u8, max_cols: usize) usize {
+    if (bytes.len == 0 or max_cols == 0) return 0;
+    if (asciiSliceEndForColumns(bytes, max_cols)) |end| return end;
+    var iter = vaxis.unicode.graphemeIterator(bytes);
     var used: usize = 0;
     var last: usize = 0;
     while (iter.next()) |grapheme| {
-        const bytes = grapheme.bytes(text);
-        if (std.mem.eql(u8, bytes, "\n")) break;
-        const width: usize = @intCast(vaxis.gwidth.gwidth(bytes, .unicode));
+        const grapheme_bytes = grapheme.bytes(bytes);
+        if (std.mem.eql(u8, grapheme_bytes, "\n")) break;
+        const width: usize = @intCast(vaxis.gwidth.gwidth(grapheme_bytes, .unicode));
         if (width != 0 and used + width > max_cols) break;
         used += width;
         last = grapheme.start + grapheme.len;
@@ -210,9 +298,9 @@ pub fn sliceEndForColumns(text: []const u8, max_cols: usize) usize {
     return last;
 }
 
-fn asciiDisplayWidth(text: []const u8) ?usize {
+fn asciiDisplayWidth(bytes: []const u8) ?usize {
     var width: usize = 0;
-    for (text) |byte| {
+    for (bytes) |byte| {
         if (byte == '\n') break;
         if (byte < 0x20 or byte >= 0x80) return null;
         width += 1;
@@ -220,11 +308,11 @@ fn asciiDisplayWidth(text: []const u8) ?usize {
     return width;
 }
 
-fn asciiSliceEndForColumns(text: []const u8, max_cols: usize) ?usize {
+fn asciiSliceEndForColumns(bytes: []const u8, max_cols: usize) ?usize {
     var index: usize = 0;
     var used: usize = 0;
-    while (index < text.len and used < max_cols) : (index += 1) {
-        const byte = text[index];
+    while (index < bytes.len and used < max_cols) : (index += 1) {
+        const byte = bytes[index];
         if (byte < 0x20 or byte >= 0x80) return null;
         used += 1;
     }
@@ -233,11 +321,11 @@ fn asciiSliceEndForColumns(text: []const u8, max_cols: usize) ?usize {
 
 test "frame stores fixed rows and spans" {
     var frame: Frame = .{};
-    try frame.appendLine(singleSpanLine("hello", styles.accent));
+    try frame.appendLine(singleSpanLine("hello", text.accent));
 
     var line: Line = .{};
     try line.append(.{ .text = "a" });
-    try line.append(.{ .text = "b", .style = styles.muted });
+    try line.append(.{ .text = "b", .style = text.muted });
     try frame.appendLine(line);
 
     try std.testing.expectEqual(@as(usize, 2), frame.rows().len);
@@ -270,11 +358,24 @@ test "screen measures and clips by display columns" {
     try std.testing.expectEqualStrings("", sliceForColumns("🙂", 1));
 }
 
+test "transparent span inherits row or app surface" {
+    const selected = onSurface(text.normal, surface.selected);
+    try std.testing.expect(std.meta.eql(selected.bg, surface.selected.bg));
+
+    const app = onSurface(text.normal, surface.transparent);
+    try std.testing.expect(std.meta.eql(app.bg, surface.app.bg));
+
+    var explicit = text.normal;
+    explicit.bg = colors.panel_bg_red;
+    const preserved = onSurface(explicit, surface.selected);
+    try std.testing.expect(std.meta.eql(preserved.bg, explicit.bg));
+}
+
 test "line builder tracks display columns" {
-    var builder = LineBuilder.init(styles.normal);
-    _ = try builder.appendText("a", styles.normal);
-    _ = try builder.appendClipped("🙂b", 2, styles.accent);
-    _ = try builder.appendText("c", styles.normal);
+    var builder = LineBuilder.init(surface.transparent);
+    _ = try builder.appendText("a", text.normal);
+    _ = try builder.appendClipped("🙂b", 2, text.accent);
+    _ = try builder.appendText("c", text.normal);
     const line = builder.finish();
 
     try std.testing.expectEqual(@as(usize, 4), line.cellWidth());

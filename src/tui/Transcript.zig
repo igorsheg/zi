@@ -250,8 +250,8 @@ pub fn itemLines(self: *Transcript, item: *Item, width: u16, epoch: theme.Layout
     const allocator = item.layoutAllocator();
     const content_lines = switch (item.kind) {
         .user => |*user| blk: {
-            const lines = try layout.wrapPlain(allocator, user.text.items, transcriptInnerWidth(width), screen.styles.panel);
-            for (lines) |*line| line.row_style = screen.styles.panel;
+            const lines = try layout.wrapPlain(allocator, user.text.items, transcriptInnerWidth(width), screen.text.user_message);
+            for (lines) |*line| line.row_style = screen.surface.user_message;
             break :blk lines;
         },
         .assistant => |*assistant| try layoutAssistant(allocator, assistant, transcriptInnerWidth(width), epoch),
@@ -261,7 +261,7 @@ pub fn itemLines(self: *Transcript, item: *Item, width: u16, epoch: theme.Layout
             var buffer: [256]u8 = undefined;
             const text = std.fmt.bufPrint(&buffer, "context compacted: {s}", .{compaction.summary_first_line}) catch "context compacted";
             const owned = try allocator.dupe(u8, text);
-            break :blk try layout.wrapPlain(allocator, owned, transcriptInnerWidth(width), screen.styles.muted);
+            break :blk try layout.wrapPlain(allocator, owned, transcriptInnerWidth(width), screen.text.muted);
         },
         .custom => |custom| try layoutCustom(allocator, custom, transcriptInnerWidth(width)),
     };
@@ -306,22 +306,22 @@ fn layoutAssistant(allocator: std.mem.Allocator, assistant: anytype, width: u16,
         if (assistant.error_text) |err| try text.writer.writeAll(err);
     }
     if (text.written().len == 0) return &.{};
-    const style = if (assistant.stop != .ok) screen.styles.error_ else if (!wrote_text and wrote_thinking) thinkingStyle() else screen.styles.normal;
+    const style = if (assistant.stop != .ok) screen.text.error_ else if (!wrote_text and wrote_thinking) thinkingStyle() else screen.text.normal;
     var wrap_state: layout.WrapState = .{};
     return layout.wrapMarkdown(allocator, text.written(), width, style, &wrap_state);
 }
 
 fn thinkingStyle() screen.Style {
-    var style = screen.styles.muted;
+    var style = screen.text.thinking;
     style.italic = true;
     return style;
 }
 
 fn noticeStyle(level: NoticeLevel) screen.Style {
     return switch (level) {
-        .info => screen.styles.muted,
-        .warn => screen.styles.warn,
-        .err => screen.styles.error_,
+        .info => screen.text.muted,
+        .warn => screen.text.warning,
+        .err => screen.text.error_,
     };
 }
 
@@ -848,13 +848,13 @@ test "transcript user block has panel padding and item margin" {
     var buffer: [64]u8 = undefined;
     try std.testing.expectEqual(@as(usize, 4), lines.len);
     try std.testing.expectEqualStrings("", lines[0].copyText(&buffer));
-    try std.testing.expect(std.meta.eql(lines[0].row_style.bg, screen.styles.panel.bg));
+    try std.testing.expect(std.meta.eql(lines[0].row_style.bg, screen.surface.user_message.bg));
     try std.testing.expectEqualStrings(" hello", lines[1].copyText(&buffer));
-    try std.testing.expect(std.meta.eql(lines[1].row_style.bg, screen.styles.panel.bg));
+    try std.testing.expect(std.meta.eql(lines[1].row_style.bg, screen.surface.user_message.bg));
     try std.testing.expectEqualStrings("", lines[2].copyText(&buffer));
-    try std.testing.expect(std.meta.eql(lines[2].row_style.bg, screen.styles.panel.bg));
+    try std.testing.expect(std.meta.eql(lines[2].row_style.bg, screen.surface.user_message.bg));
     try std.testing.expectEqualStrings("", lines[3].copyText(&buffer));
-    try std.testing.expect(screen.Style.eql(lines[3].row_style, screen.styles.normal));
+    try std.testing.expect(screen.Style.eql(lines[3].row_style, screen.surface.transparent));
 }
 
 test "transcript visible thinking trims trailing blank rows" {
@@ -915,6 +915,7 @@ fn applyItemRhythm(allocator: std.mem.Allocator, kind: Item.Kind, content: []lay
     for (0..padding_y) |_| try out.append(allocator, .{ .row_style = style });
     for (content) |source| {
         var line = source;
+        if (screen.Style.eql(line.row_style, screen.surface.transparent) and !screen.Style.eql(style, screen.surface.transparent)) line.row_style = style;
         if (line.spans().len > 0) try insetTranscriptLine(&line, lineInsetStyle(kind, line));
         try out.append(allocator, line);
     }
@@ -932,12 +933,9 @@ fn itemPaddingY(kind: Item.Kind) usize {
 
 fn itemStyle(kind: Item.Kind) screen.Style {
     return switch (kind) {
-        .user => screen.styles.panel,
-        .assistant => screen.styles.normal,
-        .tool => screen.styles.muted,
-        .notice => |notice| noticeStyle(notice.level),
-        .compaction => screen.styles.muted,
-        .custom => screen.styles.normal,
+        .user => screen.surface.user_message,
+        .custom => screen.surface.custom_message,
+        else => screen.surface.transparent,
     };
 }
 
@@ -955,11 +953,11 @@ fn layoutCustom(allocator: std.mem.Allocator, custom: anytype, width: u16) ![]la
     var out = std.ArrayList(layout.Line).empty;
     errdefer out.deinit(allocator);
     if (custom.title.len > 0) {
-        try layout.appendPlainLine(allocator, &out, custom.title, width, screen.styles.accent);
+        try layout.appendPlainLine(allocator, &out, custom.title, width, screen.text.custom_message_label);
         try out.append(allocator, .{});
     }
     var state: layout.WrapState = .{};
-    const body = try layout.wrapMarkdown(allocator, custom.text, width, screen.styles.normal, &state);
+    const body = try layout.wrapMarkdown(allocator, custom.text, width, screen.text.custom_message, &state);
     try out.appendSlice(allocator, body);
     return out.toOwnedSlice(allocator);
 }

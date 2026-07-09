@@ -141,7 +141,7 @@ fn nextUtf8ScalarEnd(text: []const u8, start: usize) usize {
 }
 
 test "plain wrap respects grapheme width" {
-    const lines = try wrapPlain(std.testing.allocator, "abcd", 2, screen.styles.normal);
+    const lines = try wrapPlain(std.testing.allocator, "abcd", 2, screen.text.normal);
     defer std.testing.allocator.free(lines);
     try std.testing.expectEqual(@as(usize, 2), lines.len);
     var buffer: [8]u8 = undefined;
@@ -151,7 +151,7 @@ test "plain wrap respects grapheme width" {
 
 test "markdown wrap applies block style" {
     var state: WrapState = .{};
-    const lines = try wrapMarkdown(std.testing.allocator, "# title", 80, screen.styles.normal, &state);
+    const lines = try wrapMarkdown(std.testing.allocator, "# title", 80, screen.text.normal, &state);
     defer std.testing.allocator.free(lines);
     try std.testing.expect(lines[0].spans()[0].style.bold);
     try std.testing.expectEqual(@as(usize, "# title".len), state.committed_bytes);
