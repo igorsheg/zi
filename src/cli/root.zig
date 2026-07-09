@@ -161,6 +161,10 @@ fn runApp(
     };
 }
 
+fn shouldPersistSession(app_args: anytype) bool {
+    return !app_args.no_session;
+}
+
 fn runTui(
     process: runtime.Process,
     stderr: *std.Io.Writer,
@@ -176,7 +180,11 @@ fn runTui(
     defer if (selected_session_file) |session_file| process.gpa.free(session_file);
     const open: coding_agent.session_bootstrap.OpenSpec = if (selected_session_file) |session_file| blk: {
         break :blk .{ .resume_existing = .{ .session_file_name = session_file } };
-    } else .{ .create = .{ .session_id = session_id, .timestamp = stamp.timestamp() } };
+    } else .{ .create = .{
+        .session_id = session_id,
+        .timestamp = stamp.timestamp(),
+        .persist = shouldPersistSession(app_args),
+    } };
 
     if (builtin.is_test) {
         tui.run(process, .{
@@ -256,7 +264,11 @@ fn runPrompt(
     const open: coding_agent.session_bootstrap.OpenSpec = if (selected_session_file) |session_file|
         .{ .resume_existing = .{ .session_file_name = session_file } }
     else
-        .{ .create = .{ .session_id = session_id, .timestamp = stamp.timestamp() } };
+        .{ .create = .{
+            .session_id = session_id,
+            .timestamp = stamp.timestamp(),
+            .persist = shouldPersistSession(app_args),
+        } };
 
     var session = try coding_agent.session_bootstrap.openSession(process.gpa, &services, stamp.date(), open, .{});
     defer shutdownPromptSession(&session, services.io);
@@ -599,6 +611,46 @@ test "cli text and json print frontends run through faux provider" {
     try std.testing.expect(std.mem.indexOf(u8, output.buffered(), "\"type\":\"agent_start\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.buffered(), "cli print ok") != null);
     try std.testing.expectEqualStrings("", stderr.buffered());
+}
+
+test "cli no-session print does not create a session file" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try createCliTestDirs(tmp.dir);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "script.md", .data = "ephemeral ok\n" });
+
+    var environ = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ.deinit();
+    try environ.put("ZI_ENABLE_FAUX_PROVIDER", "1");
+    try environ.put("ZI_FAUX_DELAY_MS", "0");
+    try environ.put("ZI_FAUX_SCRIPT", "script.md");
+    const process = testProcess(&environ);
+
+    var output_buffer: [4096]u8 = undefined;
+    var output = std.Io.Writer.fixed(&output_buffer);
+    var stderr_buffer: [1024]u8 = undefined;
+    var stderr = std.Io.Writer.fixed(&stderr_buffer);
+    var argv = [_:null]?[*:0]const u8{ "zi", "-p", "--no-session", "hi" };
+    var args = try std.process.Args.Iterator.initAllocator(.{ .vector = @ptrCast(&argv) }, std.testing.allocator);
+    defer args.deinit();
+
+    try runWithOptions(process, &args, &output, &stderr, .{
+        .cwd = "repo",
+        .agent_dir_override = "agent",
+        .dir = tmp.dir,
+        .environ = process.environ,
+    });
+    try std.testing.expectEqualStrings("ephemeral ok\n", output.buffered());
+    try std.testing.expectEqualStrings("", stderr.buffered());
+
+    var sessions = try session_listing.listRuntimeSessions(std.testing.allocator, std.testing.io, .{
+        .cwd = "repo",
+        .agent_dir_override = "agent",
+        .dir = tmp.dir,
+        .environ = process.environ,
+    });
+    defer sessions.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), sessions.file_names.len);
 }
 
 test "cli rpc frontend remains stubbed" {

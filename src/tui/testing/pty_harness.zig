@@ -767,6 +767,75 @@ test "pty e2e: P4 completion model picker resume and new session" {
     try std.testing.expect(found_new_prompt);
 }
 
+test "pty e2e: no-session keeps interactive runs ephemeral" {
+    if (!supportsForkPty()) return error.SkipZigTest;
+    const zi_bin = envValue("ZI_PTY_E2E_BIN") orelse return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "repo/.zi");
+    try tmp.dir.createDirPath(std.testing.io, "home");
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "script.md", .data = "ephemeral pty marker\n" });
+
+    const repo_abs = try tmpAbsPath(std.testing.allocator, &tmp, "repo");
+    defer std.testing.allocator.free(repo_abs);
+    const home_abs = try tmpAbsPath(std.testing.allocator, &tmp, "home");
+    defer std.testing.allocator.free(home_abs);
+    const agent_abs = try tmpAbsPath(std.testing.allocator, &tmp, "agent");
+    defer std.testing.allocator.free(agent_abs);
+    const script_abs = try tmpAbsPath(std.testing.allocator, &tmp, "script.md");
+    defer std.testing.allocator.free(script_abs);
+
+    const home_env = try std.fmt.allocPrint(std.testing.allocator, "HOME={s}", .{home_abs});
+    defer std.testing.allocator.free(home_env);
+    const agent_env = try std.fmt.allocPrint(std.testing.allocator, "ZI_CODING_AGENT_DIR={s}", .{agent_abs});
+    defer std.testing.allocator.free(agent_env);
+    const script_env = try std.fmt.allocPrint(std.testing.allocator, "ZI_FAUX_SCRIPT={s}", .{script_abs});
+    defer std.testing.allocator.free(script_env);
+
+    const env = [_][]const u8{
+        "TERM=xterm-256color",
+        "NO_COLOR=1",
+        "ZI_ENABLE_FAUX_PROVIDER=1",
+        "ZI_FAUX_DELAY_MS=0",
+        home_env,
+        agent_env,
+        script_env,
+    };
+    var result = try runScripted(std.testing.allocator, .{
+        .argv = &.{ zi_bin, "--no-session" },
+        .env = &env,
+        .cwd = repo_abs,
+        .rows = 24,
+        .cols = 100,
+        .timeout_ms = 10_000,
+        .max_output_bytes = 512 * 1024,
+    }, &.{
+        .{ .after_ms = 500, .bytes = "/resume\r" },
+        .{ .after_ms = 1_200, .bytes = "/new\r" },
+        .{ .after_ms = 1_900, .bytes = "ephemeral prompt\r" },
+        .{ .after_ms = 4_000, .bytes = "\x03" },
+        .{ .after_ms = 4_200, .bytes = "\x03" },
+    });
+    defer result.deinit(std.testing.allocator);
+    if (result.timed_out) {
+        std.debug.print("pty no-session e2e timed out\n--- output ---\n{s}\n--- end output ---\n", .{result.output});
+        return error.TestUnexpectedResult;
+    }
+    try std.testing.expect(exitedZero(result.status));
+    try expectContains(result.output, "no-session mode: resume is disabled");
+    try expectContains(result.output, "ephemeral pty marker");
+
+    var sessions = try session_listing.listRuntimeSessions(std.testing.allocator, std.testing.io, .{
+        .cwd = repo_abs,
+        .agent_dir_override = agent_abs,
+        .dir = .cwd(),
+    });
+    defer sessions.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), sessions.file_names.len);
+}
+
 test "pty e2e: P5 print json faux provider" {
     if (!supportsForkPty()) return error.SkipZigTest;
     const zi_bin = envValue("ZI_PTY_E2E_BIN") orelse return error.SkipZigTest;

@@ -31,6 +31,14 @@ pub const Options = struct {
     resume_picker: bool,
     panic_test: bool = false,
 };
+
+fn persistNewSessionsForOpen(open: coding_agent.session_bootstrap.OpenSpec) bool {
+    return switch (open) {
+        .create => |create| create.persist,
+        .resume_existing => true,
+    };
+}
+
 pub const Runner = struct {
     loop: Loop,
     decoder: InputDecoder = .{},
@@ -44,7 +52,10 @@ pub const Runner = struct {
     lone_escape_deadline_ns: ?u64 = null,
     pub fn init(allocator: std.mem.Allocator, options: Options) !Runner {
         return .{
-            .loop = try Loop.init(allocator, options.initial_prompt),
+            .loop = try Loop.initWithOptions(allocator, .{
+                .initial_prompt = options.initial_prompt,
+                .persist_new_sessions = persistNewSessionsForOpen(options.open),
+            }),
             .open = options.open,
             .resume_picker = options.resume_picker,
         };
@@ -424,6 +435,21 @@ test "runner seeds initial prompt and composes first frame" {
     var buffer: [32]u8 = undefined;
     try std.testing.expectEqualStrings("> draft", frame.rows()[1].copyText(&buffer));
     try std.testing.expectEqual(@as(usize, 0), runner.decoder.pendingBytes());
+}
+
+test "runner derives no-session persistence from open spec" {
+    var runner = try Runner.init(std.testing.allocator, .{
+        .initial_prompt = null,
+        .open = .{ .create = .{
+            .session_id = "tui-test",
+            .timestamp = "2026-07-06T00:00:00Z",
+            .persist = false,
+        } },
+        .resume_picker = false,
+    });
+    defer runner.deinit();
+
+    try std.testing.expect(!runner.loop.persist_new_sessions);
 }
 
 test "runner paints initial frame through terminal" {

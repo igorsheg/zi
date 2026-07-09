@@ -9,7 +9,11 @@ const session_manager = @import("session_manager.zig");
 const settings_mod = @import("settings.zig");
 
 pub const OpenSpec = union(enum) {
-    create: struct { session_id: []const u8, timestamp: []const u8 },
+    create: struct {
+        session_id: []const u8,
+        timestamp: []const u8,
+        persist: bool = true,
+    },
     resume_existing: struct { session_file_name: []const u8 },
 };
 
@@ -26,10 +30,6 @@ pub fn openSession(
     spec: OpenSpec,
     overrides: Overrides,
 ) !AgentSession {
-    const paths: paths_mod.PersistencePaths = .{ .global_dir = services.agent_dir, .cwd = services.cwd };
-    const sessions_dir = try paths.sessionsDirForCwd(allocator);
-    defer allocator.free(sessions_dir);
-
     const snapshot = services.settings_manager.current();
     const project = settingsValue(snapshot.project);
     const global = settingsValue(snapshot.global);
@@ -55,16 +55,21 @@ pub fn openSession(
 
     switch (spec) {
         .create => |create| {
-            var store = try session_manager.SessionStore.createDeferred(allocator, services.io, services.dir, .{
-                .sessions_dir = sessions_dir,
-                .cwd = services.cwd,
-                .session_id = create.session_id,
-                .timestamp = create.timestamp,
-            });
-            errdefer store.deinit();
             options.session_id = create.session_id;
             options.timestamp = create.timestamp;
-            options.store = .{ .create = store };
+            if (create.persist) {
+                const paths: paths_mod.PersistencePaths = .{ .global_dir = services.agent_dir, .cwd = services.cwd };
+                const sessions_dir = try paths.sessionsDirForCwd(allocator);
+                defer allocator.free(sessions_dir);
+                var store = try session_manager.SessionStore.createDeferred(allocator, services.io, services.dir, .{
+                    .sessions_dir = sessions_dir,
+                    .cwd = services.cwd,
+                    .session_id = create.session_id,
+                    .timestamp = create.timestamp,
+                });
+                errdefer store.deinit();
+                options.store = .{ .create = store };
+            }
             return AgentSession.init(allocator, services.io, options);
         },
         .resume_existing => |existing| {
@@ -77,6 +82,9 @@ pub fn openSession(
             }) orelse return error.SessionNotFound;
             defer allocator.free(selected);
 
+            const paths: paths_mod.PersistencePaths = .{ .global_dir = services.agent_dir, .cwd = services.cwd };
+            const sessions_dir = try paths.sessionsDirForCwd(allocator);
+            defer allocator.free(sessions_dir);
             const file_name = try std.fs.path.join(allocator, &.{ sessions_dir, selected });
             errdefer allocator.free(file_name);
             options.store = .{ .restore = .{

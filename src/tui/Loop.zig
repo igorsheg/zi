@@ -595,6 +595,7 @@ pub const Loop = struct {
     last_height: u16 = 0,
     driver: RunDriver = .{},
     session: ?*coding_agent.AgentSession = null,
+    persist_new_sessions: bool = true,
     io: std.Io = undefined,
     wake: ?*runtime.WakeEvent = null,
     viewport: Viewport = .follow,
@@ -630,9 +631,22 @@ pub const Loop = struct {
     token_output_total: u64 = 0,
     compaction_count: usize = 0,
 
+    pub const InitOptions = struct {
+        initial_prompt: ?[]const u8 = null,
+        persist_new_sessions: bool = true,
+    };
+
     pub fn init(gpa: std.mem.Allocator, initial_prompt: ?[]const u8) !Loop {
-        var self: Loop = .{ .gpa = gpa, .transcript = Transcript.initWithToolResolver(gpa, .{ .call_fn = resolveCodingAgentToolUi, .result_fn = resolveCodingAgentToolResultUi }) };
-        if (initial_prompt) |prompt| try self.editor.insert(prompt);
+        return initWithOptions(gpa, .{ .initial_prompt = initial_prompt });
+    }
+
+    pub fn initWithOptions(gpa: std.mem.Allocator, options: InitOptions) !Loop {
+        var self: Loop = .{
+            .gpa = gpa,
+            .persist_new_sessions = options.persist_new_sessions,
+            .transcript = Transcript.initWithToolResolver(gpa, .{ .call_fn = resolveCodingAgentToolUi, .result_fn = resolveCodingAgentToolResultUi }),
+        };
+        if (options.initial_prompt) |prompt| try self.editor.insert(prompt);
         return self;
     }
 
@@ -1812,7 +1826,13 @@ pub const Loop = struct {
                 return;
             },
             .apply_model => if (row.model) |model| try self.applyModelSelection(model, row.authed),
-            .resume_session => try self.switchSession(.{ .resume_existing = .{ .session_file_name = row.idSlice() } }, "resumed session"),
+            .resume_session => {
+                if (self.noSessionMode()) {
+                    try self.notice(.warn, "no-session mode: resume is disabled");
+                    return;
+                }
+                try self.switchSession(.{ .resume_existing = .{ .session_file_name = row.idSlice() } }, "resumed session");
+            },
             .thinking_level => |level| try self.applyThinkingLevelSetting(level),
             .hide_thinking => |hidden| try self.applyHideThinkingSetting(hidden),
         }
@@ -1880,6 +1900,10 @@ pub const Loop = struct {
                 }
             },
             .resume_session => |selector| {
+                if (self.noSessionMode()) {
+                    try self.notice(.warn, "no-session mode: resume is disabled");
+                    return .handled_clear_editor;
+                }
                 if (selector.len == 0) {
                     try self.ensureSlashArgSpace("resume");
                     try self.openPicker(.session);
@@ -1892,7 +1916,11 @@ pub const Loop = struct {
                 var id_buffer: [64]u8 = undefined;
                 const stamp = coding_agent.session_manager.SessionStamp.now(self.io);
                 const id = std.fmt.bufPrint(&id_buffer, "tui-{d}", .{stamp.nanoseconds}) catch "tui";
-                try self.switchSession(.{ .create = .{ .session_id = id, .timestamp = stamp.timestamp() } }, "started new session");
+                try self.switchSession(.{ .create = .{
+                    .session_id = id,
+                    .timestamp = stamp.timestamp(),
+                    .persist = self.shouldPersistNewSession(),
+                } }, "started new session");
             },
             .compact => {
                 const session = self.session orelse {
@@ -1916,6 +1944,14 @@ pub const Loop = struct {
             },
         }
         return .handled_clear_editor;
+    }
+
+    fn noSessionMode(self: *Loop) bool {
+        return !self.persist_new_sessions;
+    }
+
+    fn shouldPersistNewSession(self: *Loop) bool {
+        return self.persist_new_sessions;
     }
 
     fn showSessionNotice(self: *Loop) !void {
@@ -1982,6 +2018,10 @@ pub const Loop = struct {
     }
 
     fn openSessionPicker(self: *Loop) !void {
+        if (self.noSessionMode()) {
+            try self.notice(.warn, "no-session mode: resume is disabled");
+            return;
+        }
         const services = self.services orelse return error.NoServices;
         var summaries = try coding_agent.session_listing.listRuntimeSessionSummaries(self.gpa, self.io, .{
             .cwd = services.cwd,
@@ -3008,6 +3048,59 @@ test "loop P4 model picker applies faux model through services" {
     try std.testing.expectEqualStrings(ai.faux.default_model_id, session.agent.state.model.id);
 }
 
+test "loop no-session disables resume and keeps new sessions ephemeral" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo/.zi");
+
+    var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
+    var services = try coding_agent.runtime_services.RuntimeServices.init(std.testing.allocator, .{
+        .cwd = "repo",
+        .agent_dir = "agent",
+        .dir = tmp.dir,
+        .task_runtime = task_runtime,
+    });
+    defer services.deinit();
+
+    const stamp = coding_agent.session_manager.SessionStamp.now(services.io);
+    var session = try coding_agent.session_bootstrap.openSession(std.testing.allocator, &services, stamp.date(), .{ .create = .{
+        .session_id = "ephemeral-test",
+        .timestamp = stamp.timestamp(),
+        .persist = false,
+    } }, .{});
+    defer {
+        session.requestShutdown();
+        session.deinit();
+    }
+
+    var wake: runtime.WakeEvent = .init;
+    var loop = try Loop.initWithOptions(std.testing.allocator, .{ .persist_new_sessions = false });
+    defer loop.deinit();
+    try loop.bindServices(&services);
+    loop.bindSession(&session, services.io, &wake);
+
+    try loop.dispatch(.{ .insert = "/resume" });
+    try loop.dispatch(.submit);
+    try std.testing.expect(!loop.picker.active);
+    try std.testing.expectEqualStrings("", loop.editor.text());
+    var frame = try loop.composeFrame(80, 12);
+    try expectFrameContains(&frame, "no-session mode: resume is disabled");
+
+    try loop.dispatch(.{ .insert = "/new" });
+    try loop.dispatch(.submit);
+    try std.testing.expect(session.store == null);
+    try std.testing.expect(!loop.shouldPersistNewSession());
+
+    var sessions = try coding_agent.session_listing.listRuntimeSessions(std.testing.allocator, std.testing.io, .{
+        .cwd = "repo",
+        .agent_dir_override = "agent",
+        .dir = tmp.dir,
+    });
+    defer sessions.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), sessions.file_names.len);
+}
 test "loop P4 settings thinking visibility persists through services" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
