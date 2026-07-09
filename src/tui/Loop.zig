@@ -1838,7 +1838,9 @@ pub const Loop = struct {
             },
             .insert => |text| if (std.mem.eql(u8, text, "\t")) {
                 if (self.completion.active) {
-                    try self.acceptCompletion();
+                    if (try self.acceptCompletion()) |mode| {
+                        if (mode == .slash) try self.refreshCompletion(.auto);
+                    }
                 } else {
                     try self.refreshCompletion(.force_file);
                 }
@@ -1847,7 +1849,9 @@ pub const Loop = struct {
             .key_editor => |op| switch (op) {
                 .tab => {
                     if (self.completion.active) {
-                        try self.acceptCompletion();
+                        if (try self.acceptCompletion()) |mode| {
+                            if (mode == .slash) try self.refreshCompletion(.auto);
+                        }
                     } else {
                         try self.refreshCompletion(.force_file);
                     }
@@ -1864,8 +1868,15 @@ pub const Loop = struct {
                 else => {},
             },
             .submit => if (self.completion.active) {
-                if (self.completion.mode == .slash and slash_commands.dispatch(self.editor.text()) != null) return false;
-                try self.acceptCompletion();
+                if (self.completion.mode == .slash) {
+                    if (slash_commands.lookupInvocation(self.editor.text()) != null) {
+                        self.completion.clear();
+                    } else if ((try self.acceptCompletion()) == null) {
+                        return true;
+                    }
+                    return false;
+                }
+                _ = try self.acceptCompletion();
                 return true;
             },
             else => {},
@@ -1890,7 +1901,9 @@ pub const Loop = struct {
             break :blk Editor.Token{ .start = cursor, .end = cursor, .text = self.editor.text()[cursor..cursor] };
         };
         if (mode == .force_file) return self.refreshFileCompletion(token, true);
-        if (std.mem.startsWith(u8, token.text, "/")) return self.refreshSlashCompletion(token.text);
+        if (token.start == 0 and std.mem.startsWith(u8, token.text, "/")) {
+            return self.refreshSlashCompletion(token.text);
+        }
         if (std.mem.startsWith(u8, token.text, "@")) return self.refreshFileCompletion(token, false);
         self.completion.clear();
     }
@@ -1932,9 +1945,9 @@ pub const Loop = struct {
         if (self.completion.candidate_len == 0) self.completion.clear();
     }
 
-    fn acceptCompletion(self: *Loop) !void {
-        const candidate = self.completion.selectedCandidate() orelse return;
-        if (!candidate.selectable) return;
+    fn acceptCompletion(self: *Loop) !?CompletionMode {
+        const candidate = self.completion.selectedCandidate() orelse return null;
+        if (!candidate.selectable) return null;
         const mode = self.completion.mode;
         const token = self.editor.currentToken() orelse blk: {
             const cursor = self.editor.cursorByte();
@@ -1942,8 +1955,8 @@ pub const Loop = struct {
         };
         try self.editor.replaceToken(token, candidate.insertSlice());
         self.completion.clear();
-        if (mode == .slash) try self.refreshCompletion(.auto);
         self.dirty = true;
+        return mode;
     }
     fn syncSlashArgPicker(self: *Loop) !bool {
         const query = self.slashArgQuery() orelse return false;
@@ -1974,10 +1987,13 @@ pub const Loop = struct {
     }
 
     fn pickerKindForSlashName(name: []const u8) ?PickerKind {
-        if (std.mem.eql(u8, name, "model")) return .model;
-        if (std.mem.eql(u8, name, "resume")) return .session;
-        if (std.mem.eql(u8, name, "settings")) return .settings_root;
-        return null;
+        const command = slash_commands.lookup(name) orelse return null;
+        return switch (command.picker) {
+            .none => null,
+            .model => .model,
+            .session => .session,
+            .settings => .settings_root,
+        };
     }
 
     fn pickerKindIsSettings(kind: PickerKind) bool {
@@ -3394,6 +3410,62 @@ test "loop slash help appends a notice" {
     try loop.dispatch(.submit);
     try std.testing.expectEqual(@as(usize, 1), loop.transcript.items.items.len);
     try std.testing.expect(loop.transcript.items.items[0].kind == .notice);
+    try std.testing.expect(!loop.completion.active);
+}
+
+test "loop enter accepts and submits selected slash completion" {
+    var loop = try Loop.init(std.testing.allocator, null);
+    defer loop.deinit();
+
+    try loop.dispatch(.{ .insert = "/he" });
+    try std.testing.expect(loop.completion.active);
+    try loop.dispatch(.submit);
+
+    try std.testing.expectEqualStrings("", loop.editor.text());
+    try std.testing.expectEqual(@as(usize, 1), loop.transcript.items.items.len);
+    const notice = loop.transcript.items.items[0].kind.notice;
+    try std.testing.expect(std.mem.startsWith(u8, notice.text, "available commands:"));
+}
+
+test "loop enter opens picker for selected picker-backed slash completion" {
+    var loop = try Loop.init(std.testing.allocator, null);
+    defer loop.deinit();
+
+    try loop.dispatch(.{ .insert = "/sett" });
+    try std.testing.expect(loop.completion.active);
+    try loop.dispatch(.submit);
+
+    try std.testing.expect(loop.picker.active);
+    try std.testing.expectEqual(PickerKind.settings_root, loop.picker.currentKind());
+    try std.testing.expectEqualStrings("/settings ", loop.editor.text());
+}
+
+test "loop tab accepts slash completion without submitting" {
+    var loop = try Loop.init(std.testing.allocator, null);
+    defer loop.deinit();
+
+    try loop.dispatch(.{ .insert = "/he" });
+    try std.testing.expect(loop.completion.active);
+    try loop.dispatch(.{ .key_editor = .tab });
+
+    try std.testing.expectEqualStrings("/help ", loop.editor.text());
+    try std.testing.expectEqual(@as(usize, 0), loop.transcript.items.items.len);
+}
+
+test "loop slash completion only activates for command token at input start" {
+    var loop = try Loop.init(std.testing.allocator, null);
+    defer loop.deinit();
+
+    try loop.dispatch(.{ .insert = "explain /sett" });
+    try std.testing.expect(!loop.completion.active);
+
+    loop.editor.clear();
+    try loop.dispatch(.{ .insert = "/help /sett" });
+    try std.testing.expect(!loop.completion.active);
+
+    loop.editor.clear();
+    try loop.dispatch(.{ .insert = " /sett" });
+    try std.testing.expect(!loop.completion.active);
 }
 
 test "loop picker window follows chrome candidate capacity" {
@@ -3496,7 +3568,7 @@ test "loop P4 restore fold renders durable user tool and assistant transcript" {
     try expectFrameOrder(&frame, " $ pwd", " │ /tmp/repo");
 }
 
-test "loop P4 file completion popup accepts selected candidate" {
+test "loop P4 file completion accepts inline selected candidate" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "main.zig", .data = "" });
@@ -3505,10 +3577,10 @@ test "loop P4 file completion popup accepts selected candidate" {
     defer loop.deinit();
     loop.file_index = try coding_agent.file_completion.Index.build(std.testing.allocator, tmp.dir);
 
-    try loop.dispatch(.{ .insert = "@ma" });
+    try loop.dispatch(.{ .insert = "see @ma" });
     try std.testing.expect(loop.completion.active);
     try loop.dispatch(.{ .key_editor = .tab });
-    try std.testing.expectEqualStrings("@main.zig", loop.editor.text());
+    try std.testing.expectEqualStrings("see @main.zig", loop.editor.text());
 }
 
 test "loop completion popup windows selected candidate" {

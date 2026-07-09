@@ -780,7 +780,7 @@ test "pty e2e: P4 completion model picker resume and new session" {
         .max_output_bytes = 512 * 1024,
     }, &.{
         .{ .after_ms = 500, .bytes = "/help\r" },
-        .{ .after_ms = 1_100, .bytes = "/settings\r" },
+        .{ .after_ms = 1_100, .bytes = "/sett\r" },
         .{ .after_ms = 1_500, .bytes = "\t" },
         .{ .after_ms = 1_900, .bytes = "high" },
         .{ .after_ms = 2_200, .bytes = "\t" },
