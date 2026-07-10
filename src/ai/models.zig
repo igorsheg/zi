@@ -97,6 +97,7 @@ pub fn supportsXhigh(model: protocol.Model) bool {
         std.mem.indexOf(u8, model.id, "gpt-5.3") != null or
         std.mem.indexOf(u8, model.id, "gpt-5.4") != null or
         std.mem.indexOf(u8, model.id, "gpt-5.5") != null or
+        std.mem.indexOf(u8, model.id, "gpt-5.6") != null or
         std.mem.indexOf(u8, model.id, "deepseek-v4-pro") != null or
         std.mem.indexOf(u8, model.id, "opus-4-6") != null or
         std.mem.indexOf(u8, model.id, "opus-4.6") != null or
@@ -165,6 +166,18 @@ test "get models returns contiguous provider slice" {
         try std.testing.expectEqualStrings(protocol.KnownProvider.openai_codex, model.provider);
     }
     try std.testing.expect(getModel(protocol.KnownProvider.openai_codex, "gpt-5.1-codex-max") != null);
+}
+
+test "gpt 5.6 models are available in direct and codex catalogs" {
+    const direct = getModel(protocol.KnownProvider.openai, "gpt-5.6-luna").?;
+    const codex = getModel(protocol.KnownProvider.openai_codex, "gpt-5.6-luna").?;
+
+    try std.testing.expectEqual(@as(u64, 272_000), direct.context_window);
+    try std.testing.expectEqual(@as(u64, 372_000), codex.context_window);
+    try std.testing.expectEqual(@as(f64, 1.25), direct.cost.cache_write);
+    try std.testing.expectEqual(@as(f64, 1.25), codex.cost.cache_write);
+    try std.testing.expect(supportsXhigh(direct));
+    try std.testing.expect(supportsXhigh(codex));
 }
 
 test "calculate cost mutates usage cost in dollars" {
