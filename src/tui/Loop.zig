@@ -1173,16 +1173,20 @@ pub const Loop = struct {
         const visible_rows = @min(rows, self.transcript_line_buffer.len);
         if (visible_rows == 0 or self.totalTranscriptLines() == 0) return &.{};
 
-        const absolute = self.skipLeadingSeparator(self.viewportStart(visible_rows), visible_rows);
+        var absolute = self.viewportStart(visible_rows);
+        if (visible_rows == 1 and self.viewport == .follow and absolute > 0 and
+            self.transcript.isItemMarginAt(absolute))
+        {
+            absolute -= 1;
+        }
+        absolute = self.skipLeadingMargin(absolute);
         return self.transcript.collectVisible(absolute, self.transcript_line_buffer[0..visible_rows]);
     }
 
-    fn skipLeadingSeparator(self: *const Loop, start: usize, _: usize) usize {
+    fn skipLeadingMargin(self: *const Loop, start: usize) usize {
         var absolute = start;
         const total = self.totalTranscriptLines();
-        while (absolute + 1 < total) {
-            const line = self.transcript.lineAt(absolute) orelse break;
-            if (!isSeparatorLine(line)) break;
+        while (absolute + 1 < total and self.transcript.isItemMarginAt(absolute)) {
             absolute += 1;
         }
         return absolute;
@@ -1237,10 +1241,6 @@ pub const Loop = struct {
                 if (reset_seen or changed) anchor.lines_below_seen = self.linesBelow(resolved.absolute);
             },
         }
-    }
-
-    fn isSeparatorLine(line: screen.Line) bool {
-        return line.spans().len == 0 and screen.Style.eql(line.row_style, screen.surface.transparent);
     }
 
     fn anchorOldestLiveLine(self: *Loop) void {
@@ -2903,6 +2903,16 @@ test "loop composes frame and clears dirty only after render success" {
     try std.testing.expectEqual(@as(usize, 1), loop.trace.renders.count);
 }
 
+test "loop one-row transcript gives content priority over tail margin" {
+    var loop = try Loop.init(std.testing.allocator, null);
+    defer loop.deinit();
+    try loop.transcript.appendNotice(.info, "visible");
+
+    const frame = try loop.composeFrame(80, 2);
+    var buffer: [32]u8 = undefined;
+    try std.testing.expectEqualStrings(" visible", frame.rows()[0].copyText(&buffer));
+}
+
 test "loop keeps input foreground while transcript relayout is pending" {
     var loop = try Loop.init(std.testing.allocator, null);
     defer loop.deinit();
@@ -3532,8 +3542,9 @@ test "loop P4 restore renders compaction summary" {
     _ = fixture.session.manager.commitPreparedEntry(compaction_entry);
 
     try fixture.owner_loop.restoreSessionFold();
-    const frame = try fixture.owner_loop.composeFrame(80, 6);
-    try expectFrameContains(&frame, "context compacted: summary");
+    const frame = try fixture.owner_loop.composeFrame(80, 14);
+    try expectFrameContains(&frame, "[compaction]");
+    try expectFrameContains(&frame, "Compacted from 100 tokens");
 }
 
 test "loop P4 restore fold renders durable user tool and assistant transcript" {

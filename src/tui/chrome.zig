@@ -203,7 +203,7 @@ fn appendPicker(frame: *screen.Frame, picker: PickerView, rows: usize) error{ Fr
 }
 
 fn appendSelectableLine(frame: *screen.Frame, source: screen.Line, selected: bool) error{ FrameFull, LineFull }!void {
-    var line: screen.Line = .{ .row_style = if (selected) screen.surface.selected else screen.surface.composer };
+    var line: screen.Line = .{ .row_style = screen.surface.composer };
     try line.append(.{ .text = if (selected) glyphs.picker_selected else glyphs.picker_unselected, .style = if (selected) screen.text.accent else screen.text.muted });
     for (source.spans()) |span| try line.append(span);
     try frame.appendLine(line);
@@ -530,6 +530,59 @@ test "chrome renders transcript and queue lines above editor" {
     try std.testing.expect(std.mem.startsWith(u8, frame.rows()[6].copyText(&buffer), "│draft"));
 }
 
+test "chrome golden matrix protects transcript and composer across lower chrome" {
+    var editor: Editor = .{};
+    try editor.insert("draft");
+    const transcript = [_]screen.Line{screen.singleSpanLine("transcript", screen.text.normal)};
+    const queues = [_][]const u8{"steering: next"};
+    const popup_rows = [_]screen.Line{screen.singleSpanLine("completion", screen.text.normal)};
+    const picker_rows = [_]screen.Line{screen.singleSpanLine("picker", screen.text.normal)};
+    const cases = [_]struct {
+        height: u16,
+        queue_lines: []const []const u8 = &.{},
+        status: StatusView = .{},
+        viewport_hint: []const u8 = "",
+        popup: ?PopupView = null,
+        picker: ?PickerView = null,
+    }{
+        .{ .height = 2 },
+        .{ .height = 6, .status = .{ .text = "working" } },
+        .{ .height = 8, .queue_lines = &queues },
+        .{ .height = 8, .viewport_hint = "↓ 2 new lines" },
+        .{ .height = 10, .popup = .{ .rows = &popup_rows } },
+        .{ .height = 14, .picker = .{ .rows = &picker_rows } },
+        .{
+            .height = 16,
+            .queue_lines = &queues,
+            .status = .{ .text = "working" },
+            .viewport_hint = "↓ 2 new lines",
+            .popup = .{ .rows = &popup_rows },
+        },
+    };
+
+    for (cases) |case| {
+        const frame = try compose(.{
+            .transcript_lines = &transcript,
+            .queue_lines = case.queue_lines,
+            .status = case.status,
+            .viewport_hint = case.viewport_hint,
+            .editor = &editor,
+            .popup = case.popup,
+            .picker = case.picker,
+        }, 40, case.height);
+        try std.testing.expectEqual(@as(usize, case.height), frame.rows().len);
+        try std.testing.expect(frame.cursor != null);
+        try std.testing.expect(frame.cursor.?.row < case.height);
+        var buffer: [128]u8 = undefined;
+        try std.testing.expectEqualStrings("transcript", frame.rows()[0].copyText(&buffer));
+        var found_editor = false;
+        for (frame.rows()) |row| {
+            if (std.mem.indexOf(u8, row.copyText(&buffer), "draft") != null) found_editor = true;
+        }
+        try std.testing.expect(found_editor);
+    }
+}
+
 test "chrome clamps cursor to frame width" {
     var editor: Editor = .{};
     try editor.insert("hello");
@@ -631,7 +684,7 @@ test "chrome renders picker with main selection marker" {
     try std.testing.expectEqualStrings("  alpha", frame.rows()[4].copyText(&buffer));
     try std.testing.expectEqualStrings("› beta", frame.rows()[5].copyText(&buffer));
     try std.testing.expect(std.mem.startsWith(u8, frame.rows()[2].copyText(&buffer), "│"));
-    try std.testing.expect(std.meta.eql(frame.rows()[5].row_style.bg, screen.surface.selected.bg));
+    try std.testing.expect(std.meta.eql(frame.rows()[5].row_style.bg, screen.surface.composer.bg));
 }
 
 test "chrome renders completion popup with main selection marker" {
@@ -651,7 +704,7 @@ test "chrome renders completion popup with main selection marker" {
     try std.testing.expect(std.mem.startsWith(u8, frame.rows()[5].copyText(&buffer), "│@m"));
     try std.testing.expectEqualStrings("  main.zig", frame.rows()[7].copyText(&buffer));
     try std.testing.expectEqualStrings("› module.zig", frame.rows()[8].copyText(&buffer));
-    try std.testing.expect(std.meta.eql(frame.rows()[8].row_style.bg, screen.surface.selected.bg));
+    try std.testing.expect(std.meta.eql(frame.rows()[8].row_style.bg, screen.surface.composer.bg));
 }
 
 test "chrome protects composer under small queued/status chrome" {
@@ -687,5 +740,5 @@ test "chrome picker keeps eighth visible candidate" {
 
     var buffer: [128]u8 = undefined;
     try std.testing.expectEqualStrings("› item7", frame.rows()[29].copyText(&buffer));
-    try std.testing.expect(std.meta.eql(frame.rows()[29].row_style.bg, screen.surface.selected.bg));
+    try std.testing.expect(std.meta.eql(frame.rows()[29].row_style.bg, screen.surface.composer.bg));
 }

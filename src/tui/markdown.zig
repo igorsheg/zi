@@ -47,7 +47,9 @@ pub fn renderLine(state: *MdState, out: *screen.Line, text: []const u8, base: sc
 pub fn renderInline(out: *screen.Line, text: []const u8, base: screen.Style) error{LineFull}!void {
     var index: usize = 0;
     while (index < text.len) {
-        if (out.span_len >= screen.span_capacity - 1) {
+        // Keep one span available for the transcript's outer inset. Folding the
+        // remaining inline source into the base style is the bounded fallback.
+        if (out.span_len >= screen.span_capacity - 2) {
             try out.append(.{ .text = text[index..], .style = base });
             return;
         }

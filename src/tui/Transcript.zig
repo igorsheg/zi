@@ -16,6 +16,7 @@ pub const relayout_source_bytes_per_prepare: usize = 256 * 1024;
 const output_truncated_text = "[output truncated]";
 const transcript_padding_x: usize = 1;
 const user_padding_y: usize = 1;
+const custom_padding_y: usize = 1;
 const item_margin_bottom: usize = 1;
 const padding_spaces = " " ** 16;
 
@@ -134,12 +135,21 @@ pub const LayoutWork = struct {
     }
 };
 
+const RowRole = enum {
+    content,
+    semantic_blank,
+    panel_padding,
+    item_margin,
+};
+
 const CachedLayout = struct {
     arena: std.heap.ArenaAllocator,
     key: ?LayoutKey = null,
     content_generation: u64 = 0,
     lines: []layout.Line = &.{},
+    roles: []RowRole = &.{},
     incremental_lines: std.ArrayList(layout.Line) = .empty,
+    incremental_roles: std.ArrayList(RowRole) = .empty,
     incremental_part_index: ?usize = null,
     incremental_source_len: usize = 0,
     wrap: layout.WrapState = .{},
@@ -217,7 +227,11 @@ const Item = struct {
             footer: []const u8,
         },
         notice: struct { level: NoticeLevel, text: []const u8 },
-        compaction: struct { summary_first_line: []const u8, tokens_before: u64 },
+        compaction: struct {
+            summary: std.ArrayList(u8),
+            truncated: bool = false,
+            tokens_before: u64,
+        },
         custom: struct { title: []const u8, text: []const u8 },
     };
 
@@ -268,7 +282,7 @@ pub fn apply(self: *Transcript, io: std.Io, event: agent_mod.AgentEvent) !void {
         .turn_start, .turn_end => {},
         .message_start => |payload| try self.applyMessageStart(payload.message),
         .message_update => |payload| try self.applyMessageUpdate(payload.assistant_message_event),
-        .message_end => |payload| try self.applyMessageEnd(payload.message),
+        .message_end => |payload| try self.applyMessageEnd(io, payload.message),
         .tool_execution_start => |payload| try self.applyToolStart(io, payload),
         .tool_execution_update => |payload| try self.applyToolUpdate(payload),
         .tool_execution_end => |payload| try self.applyToolEnd(io, payload),
@@ -288,14 +302,22 @@ pub fn appendNotice(self: *Transcript, level: NoticeLevel, text: []const u8) !vo
 }
 
 pub fn appendCompaction(self: *Transcript, summary: []const u8, tokens_before: u64) !void {
-    const first = firstLine(summary);
     const item = try self.createItem(.{ .compaction = .{
-        .summary_first_line = undefined,
+        .summary = .empty,
         .tokens_before = tokens_before,
     } });
-    item.kind.compaction.summary_first_line = try item.allocator().dupe(u8, first);
-    self.total_bytes += item.kind.compaction.summary_first_line.len;
+    var item_owned = true;
+    errdefer if (item_owned) self.destroyItem(item);
+    try self.appendListBounded(
+        item,
+        &item.kind.compaction.summary,
+        summary,
+        per_item_text_bytes_max,
+        &item.kind.compaction.truncated,
+        true,
+    );
     try self.appendItem(item);
+    item_owned = false;
     try self.enforceCaps();
 }
 
@@ -487,6 +509,15 @@ pub fn lineAt(self: *const Transcript, absolute: usize) ?layout.Line {
     return self.items.items[ref.item_index].layout_cache.active.lines[ref.line_in_item];
 }
 
+pub fn isItemMarginAt(self: *const Transcript, absolute: usize) bool {
+    return self.rowRoleAt(absolute) == .item_margin;
+}
+
+fn rowRoleAt(self: *const Transcript, absolute: usize) ?RowRole {
+    const ref = self.lineRefAt(absolute) orelse return null;
+    return self.items.items[ref.item_index].layout_cache.active.roles[ref.line_in_item];
+}
+
 pub fn positionAtLine(self: *const Transcript, absolute: usize) ?ResolvedPosition {
     const ref = self.lineRefAt(absolute) orelse return null;
     return .{
@@ -506,8 +537,8 @@ pub fn resolvePosition(self: *const Transcript, position: Position) ?ResolvedPos
         .absolute = self.derived.line_prefix[item_index],
     };
     var line_index = @min(@as(usize, position.line_in_item), line_count - 1);
-    const lines = self.items.items[item_index].layout_cache.active.lines;
-    while (line_index > 0 and isSeparatorLine(lines[line_index])) line_index -= 1;
+    const roles = self.items.items[item_index].layout_cache.active.roles;
+    while (line_index > 0 and roles[line_index] == .item_margin) line_index -= 1;
     return .{
         .position = .{ .item_seq = position.item_seq, .line_in_item = @intCast(line_index) },
         .absolute = self.derived.line_prefix[item_index] + line_index,
@@ -567,10 +598,6 @@ fn itemIndexForSeq(self: *const Transcript, seq: u64) ?usize {
     return low;
 }
 
-fn isSeparatorLine(line: layout.Line) bool {
-    return line.spans().len == 0 and screen.Style.eql(line.row_style, screen.surface.transparent);
-}
-
 fn layoutActiveItem(self: *Transcript, item: *Item, key: LayoutKey) ![]const layout.Line {
     const cache = &item.layout_cache.active;
     if (item.layout_cache.invalidation == .clean and
@@ -601,17 +628,19 @@ fn layoutItemFull(self: *Transcript, item: *Item, cache: *CachedLayout, key: Lay
     self.derived.work.items_laid_out += 1;
     self.derived.work.source_bytes += itemBytes(item);
     cache.incremental_lines.clearRetainingCapacity();
+    cache.incremental_roles.clearRetainingCapacity();
     cache.incremental_part_index = null;
     cache.incremental_source_len = 0;
     cache.wrap = .{};
     _ = cache.arena.reset(.retain_capacity);
     cache.lines = &.{};
+    cache.roles = &.{};
     const allocator = cache.arena.allocator();
     const content_lines = switch (item.kind) {
         .user => |*user| blk: {
-            const lines = try layout.wrapPlain(
+            const lines = try layout.wrapProse(
                 allocator,
-                user.text.items,
+                trimTrailingNewlines(user.text.items),
                 transcriptInnerWidth(key.width),
                 screen.text.user_message,
             );
@@ -630,30 +659,24 @@ fn layoutItemFull(self: *Transcript, item: *Item, cache: *CachedLayout, key: Lay
             transcriptInnerWidth(key.width),
             key.expanded,
         ),
-        .notice => |notice| try layout.wrapPlain(
+        .notice => |notice| try layout.wrapProse(
             allocator,
-            notice.text,
+            trimTrailingNewlines(notice.text),
             transcriptInnerWidth(key.width),
             noticeStyle(notice.level),
         ),
-        .compaction => |compaction| blk: {
-            var buffer: [256]u8 = undefined;
-            const text = std.fmt.bufPrint(
-                &buffer,
-                "context compacted: {s}",
-                .{compaction.summary_first_line},
-            ) catch "context compacted";
-            const owned = try allocator.dupe(u8, text);
-            break :blk try layout.wrapPlain(
-                allocator,
-                owned,
-                transcriptInnerWidth(key.width),
-                screen.text.muted,
-            );
-        },
+        .compaction => |*compaction| try layoutCompaction(
+            allocator,
+            compaction,
+            transcriptInnerWidth(key.width),
+            key.expanded,
+        ),
         .custom => |custom| try layoutCustom(allocator, custom, transcriptInnerWidth(key.width)),
     };
-    cache.lines = try applyItemRhythm(allocator, item.kind, content_lines);
+    const rhythmed = try applyItemRhythm(allocator, item.kind, content_lines);
+    cache.lines = rhythmed.lines;
+    cache.roles = rhythmed.roles;
+    std.debug.assert(cache.lines.len == cache.roles.len);
     cache.key = key;
     cache.content_generation = item.content_generation;
 }
@@ -662,6 +685,7 @@ const AssistantIncrementalSource = struct {
     part_index: usize,
     text: []const u8,
     prefix: []const u8 = "",
+    prefix_style: screen.Style = screen.text.normal,
 };
 
 fn assistantIncrementalSource(assistant: anytype, hide_thinking: bool) ?AssistantIncrementalSource {
@@ -682,7 +706,8 @@ fn assistantIncrementalSource(assistant: anytype, hide_thinking: bool) ?Assistan
         if (thinking.len > 0 and text.len > 0) return .{
             .part_index = 1,
             .text = text,
-            .prefix = "Thinking...\n",
+            .prefix = "Thinking...\n\n",
+            .prefix_style = thinkingStyle(),
         };
     }
     return null;
@@ -702,11 +727,13 @@ fn layoutIncrementalAssistant(
     if (can_append) {
         self.derived.work.source_bytes += source.text.len -| cache.wrap.committed_bytes;
         cache.incremental_lines.items.len = cache.wrap.committed_lines;
+        cache.incremental_roles.items.len = cache.wrap.committed_lines;
         new_line_start = cache.incremental_lines.items.len;
     } else {
         self.derived.work.source_bytes += source.prefix.len + source.text.len;
         _ = cache.arena.reset(.retain_capacity);
         cache.incremental_lines.clearRetainingCapacity();
+        cache.incremental_roles.clearRetainingCapacity();
         cache.wrap = .{};
         new_line_start = 0;
         if (source.prefix.len > 0) {
@@ -715,10 +742,13 @@ fn layoutIncrementalAssistant(
                 &cache.incremental_lines,
                 source.prefix,
                 inner_width,
-                screen.text.normal,
+                source.prefix_style,
                 &cache.wrap,
             );
             cache.incremental_lines.items.len = cache.wrap.committed_lines;
+            for (cache.incremental_lines.items) |line| {
+                try cache.incremental_roles.append(self.gpa, contentRowRole(line));
+            }
             cache.wrap.committed_bytes = 0;
         }
     }
@@ -731,12 +761,20 @@ fn layoutIncrementalAssistant(
         screen.text.normal,
         &cache.wrap,
     );
+    for (cache.incremental_lines.items[cache.incremental_roles.items.len..]) |line| {
+        try cache.incremental_roles.append(self.gpa, contentRowRole(line));
+    }
     for (cache.incremental_lines.items[new_line_start..]) |*line| {
         if (line.spans().len > 0) try insetTranscriptLine(line, lineInsetStyle(item.kind, line.*));
     }
-    for (0..item_margin_bottom) |_| try cache.incremental_lines.append(self.gpa, .{});
+    for (0..item_margin_bottom) |_| {
+        try cache.incremental_lines.append(self.gpa, .{});
+        try cache.incremental_roles.append(self.gpa, .item_margin);
+    }
 
     cache.lines = cache.incremental_lines.items;
+    cache.roles = cache.incremental_roles.items;
+    std.debug.assert(cache.lines.len == cache.roles.len);
     cache.incremental_part_index = source.part_index;
     cache.incremental_source_len = source.text.len;
     cache.key = key;
@@ -749,42 +787,64 @@ fn layoutAssistant(
     width: u16,
     hide_thinking: bool,
 ) ![]layout.Line {
-    var text: std.Io.Writer.Allocating = .init(allocator);
-    errdefer text.deinit();
+    var out = std.ArrayList(layout.Line).empty;
+    errdefer out.deinit(allocator);
     var hidden_thinking_shown = false;
-    var wrote_text = false;
-    var wrote_thinking = false;
+    var previous_visible_part_was_thinking = false;
+
     for (assistant.parts.items) |part| {
         switch (part) {
             .text => |value| {
-                if (value.items.len > 0 and hidden_thinking_shown and text.written().len > 0 and text.written()[text.written().len - 1] != '\n') try text.writer.writeAll("\n");
-                if (value.items.len > 0) wrote_text = true;
-                try text.writer.writeAll(value.items);
+                const visible = trimTrailingNewlines(value.items);
+                if (visible.len == 0) continue;
+                if (previous_visible_part_was_thinking) try out.append(allocator, .{});
+                try appendMarkdownBlock(allocator, &out, visible, width, screen.text.normal);
+                previous_visible_part_was_thinking = false;
             },
             .thinking => |value| {
+                const visible = trimTrailingNewlines(value.items);
+                if (visible.len == 0) continue;
                 if (hide_thinking) {
-                    if (assistant.streaming and value.items.len > 0 and !hidden_thinking_shown) {
-                        try text.writer.writeAll("Thinking...");
-                        hidden_thinking_shown = true;
-                        wrote_thinking = true;
-                    }
+                    if (!assistant.streaming or hidden_thinking_shown) continue;
+                    if (previous_visible_part_was_thinking) try out.append(allocator, .{});
+                    try appendMarkdownBlock(allocator, &out, "Thinking...", width, thinkingStyle());
+                    hidden_thinking_shown = true;
                 } else {
-                    const visible = trimTrailingNewlines(value.items);
-                    if (visible.len > 0) wrote_thinking = true;
-                    try text.writer.writeAll(visible);
+                    if (previous_visible_part_was_thinking) try out.append(allocator, .{});
+                    try appendMarkdownBlock(allocator, &out, visible, width, thinkingStyle());
                 }
+                previous_visible_part_was_thinking = true;
             },
         }
     }
-    if (assistant.stop == .aborted) try text.writer.writeAll("\naborted");
-    if (assistant.stop == .errored) {
-        try text.writer.writeAll("\nerror: ");
-        if (assistant.error_text) |err| try text.writer.writeAll(err);
+
+    if (assistant.stop != .ok) {
+        if (out.items.len > 0) try out.append(allocator, .{});
+        const status_text = switch (assistant.stop) {
+            .ok => unreachable,
+            .aborted => "aborted",
+            .errored => if (assistant.error_text) |err|
+                try std.fmt.allocPrint(allocator, "error: {s}", .{err})
+            else
+                "error",
+        };
+        const status_lines = try layout.wrapPlain(allocator, status_text, width, screen.text.error_);
+        try out.appendSlice(allocator, status_lines);
     }
-    if (text.written().len == 0) return &.{};
-    const style = if (assistant.stop != .ok) screen.text.error_ else if (!wrote_text and wrote_thinking) thinkingStyle() else screen.text.normal;
+
+    return out.toOwnedSlice(allocator);
+}
+
+fn appendMarkdownBlock(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayList(layout.Line),
+    text: []const u8,
+    width: u16,
+    style: screen.Style,
+) !void {
     var wrap_state: layout.WrapState = .{};
-    return layout.wrapMarkdown(allocator, text.written(), width, style, &wrap_state);
+    const lines = try layout.wrapMarkdown(allocator, text, width, style, &wrap_state);
+    try out.appendSlice(allocator, lines);
 }
 
 fn thinkingStyle() screen.Style {
@@ -854,7 +914,7 @@ fn applyMessageUpdate(self: *Transcript, event: ai.AssistantMessageEvent) !void 
     }
 }
 
-fn applyMessageEnd(self: *Transcript, message: agent_mod.AgentMessage) !void {
+fn applyMessageEnd(self: *Transcript, io: std.Io, message: agent_mod.AgentMessage) !void {
     switch (message) {
         .assistant => |assistant| {
             const item = self.streaming_item orelse blk: {
@@ -869,7 +929,7 @@ fn applyMessageEnd(self: *Transcript, message: agent_mod.AgentMessage) !void {
             switch (assistant.stop_reason) {
                 .aborted => {
                     item.kind.assistant.stop = .aborted;
-                    try self.abortLiveTools();
+                    try self.abortLiveTools(io);
                 },
                 .error_ => {
                     item.kind.assistant.stop = .errored;
@@ -879,7 +939,7 @@ fn applyMessageEnd(self: *Transcript, message: agent_mod.AgentMessage) !void {
                     } else {
                         item.kind.assistant.error_text = null;
                     }
-                    try self.abortLiveTools();
+                    try self.abortLiveTools(io);
                 },
                 else => item.kind.assistant.stop = .ok,
             }
@@ -1315,12 +1375,15 @@ fn appendTruncationMarker(self: *Transcript, item: *Item, list: *std.ArrayList(u
     if (count_total) self.total_bytes += chunk.len;
 }
 
-fn abortLiveTools(self: *Transcript) !void {
+fn abortLiveTools(self: *Transcript, io: std.Io) !void {
     for (self.live_tools.values()) |item| {
         if (item.kind != .tool) continue;
         switch (item.kind.tool.status) {
             .pending, .running => {
-                item.kind.tool.status = .aborted;
+                const tool = &item.kind.tool;
+                if (tool.started_ns) |started| tool.duration_ms = (nowNs(io) -| started) / std.time.ns_per_ms;
+                tool.elapsed_ms = null;
+                tool.status = .aborted;
                 self.invalidateItem(item, .rebuild);
             },
             else => {},
@@ -1345,6 +1408,7 @@ fn enforceCaps(self: *Transcript) !void {
 
 fn deinitCachedLayout(self: *Transcript, cache: *CachedLayout) void {
     cache.incremental_lines.deinit(self.gpa);
+    cache.incremental_roles.deinit(self.gpa);
     cache.arena.deinit();
     cache.* = undefined;
 }
@@ -1370,7 +1434,7 @@ fn itemBytes(item: *const Item) usize {
         },
         .tool => |tool| tool.body.items.len,
         .notice => |notice| notice.text.len,
-        .compaction => |compaction| compaction.summary_first_line.len,
+        .compaction => |compaction| compaction.summary.items.len,
         .custom => |custom| custom.title.len + custom.text.len,
     };
 }
@@ -1453,7 +1517,7 @@ test "transcript visible thinking trims trailing blank rows" {
     try std.testing.expectEqualStrings("", lines[1].copyText(&buffer));
 }
 
-test "transcript custom message renders title body and margin" {
+test "transcript custom message renders padded title body and margin" {
     var transcript = Transcript.init(std.testing.allocator);
     defer transcript.deinit();
 
@@ -1463,11 +1527,158 @@ test "transcript custom message renders title body and margin" {
     const lines = transcript.items.items[0].layout_cache.active.lines;
 
     var buffer: [64]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 6), lines.len);
+    try std.testing.expectEqualStrings("", lines[0].copyText(&buffer));
+    try std.testing.expectEqualStrings(" Session Info", lines[1].copyText(&buffer));
+    try std.testing.expectEqualStrings("", lines[2].copyText(&buffer));
+    try std.testing.expectEqualStrings(" \"ok\"", lines[3].copyText(&buffer));
+    try std.testing.expectEqualStrings("", lines[4].copyText(&buffer));
+    try std.testing.expect(std.meta.eql(lines[4].row_style.bg, screen.surface.custom_message.bg));
+    try std.testing.expectEqualStrings("", lines[5].copyText(&buffer));
+    try std.testing.expect(screen.Style.eql(lines[5].row_style, screen.surface.transparent));
+}
+
+test "transcript separates and styles visible thinking before answer" {
+    var transcript = Transcript.init(std.testing.allocator);
+    defer transcript.deinit();
+
+    const content = [_]ai.AssistantContent{
+        .{ .thinking = .{ .thinking = "plan" } },
+        .{ .text = .{ .text = "answer" } },
+    };
+    const assistant = emptyAssistantMessage(&content, .stop);
+    try transcript.apply(std.testing.io, .{ .message_start = .{ .message = .{ .assistant = assistant } } });
+    try transcript.apply(std.testing.io, .{ .message_end = .{ .message = .{ .assistant = assistant } } });
+    const state: theme.LayoutState = .{ .width = 40, .height = 10, .hide_thinking = false };
+    _ = try transcript.prepareLayout(state);
+    const lines = transcript.items.items[0].layout_cache.active.lines;
+
+    var buffer: [64]u8 = undefined;
     try std.testing.expectEqual(@as(usize, 4), lines.len);
-    try std.testing.expectEqualStrings(" Session Info", lines[0].copyText(&buffer));
+    try std.testing.expectEqualStrings(" plan", lines[0].copyText(&buffer));
+    try std.testing.expect(lines[0].spans()[1].style.italic);
     try std.testing.expectEqualStrings("", lines[1].copyText(&buffer));
-    try std.testing.expectEqualStrings(" \"ok\"", lines[2].copyText(&buffer));
+    try std.testing.expectEqualStrings(" answer", lines[2].copyText(&buffer));
+    try std.testing.expect(!lines[2].spans()[1].style.italic);
     try std.testing.expectEqualStrings("", lines[3].copyText(&buffer));
+}
+
+test "transcript hidden thinking is styled and separated while answer streams" {
+    var transcript = Transcript.init(std.testing.allocator);
+    defer transcript.deinit();
+
+    try transcript.apply(std.testing.io, .{ .message_start = .{
+        .message = .{ .assistant = emptyAssistantMessage(&.{}, .stop) },
+    } });
+    try transcript.apply(std.testing.io, .{ .message_update = .{ .assistant_message_event = .{ .thinking_delta = .{
+        .content_index = 0,
+        .delta = "plan",
+        .partial = emptyAssistantMessage(&.{}, .stop),
+    } } } });
+    try transcript.apply(std.testing.io, .{ .message_update = .{ .assistant_message_event = .{ .text_delta = .{
+        .content_index = 1,
+        .delta = "answer",
+        .partial = emptyAssistantMessage(&.{}, .stop),
+    } } } });
+    const state: theme.LayoutState = .{ .width = 40, .height = 10, .hide_thinking = true };
+    _ = try transcript.prepareLayout(state);
+    const lines = transcript.items.items[0].layout_cache.active.lines;
+
+    var buffer: [64]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 4), lines.len);
+    try std.testing.expectEqualStrings(" Thinking...", lines[0].copyText(&buffer));
+    try std.testing.expect(lines[0].spans()[1].style.italic);
+    try std.testing.expectEqualStrings("", lines[1].copyText(&buffer));
+    try std.testing.expectEqualStrings(" answer", lines[2].copyText(&buffer));
+    try std.testing.expect(!lines[2].spans()[1].style.italic);
+}
+
+test "transcript assistant error is a distinct row without leading blank" {
+    var transcript = Transcript.init(std.testing.allocator);
+    defer transcript.deinit();
+
+    var assistant = emptyAssistantMessage(&.{}, .error_);
+    assistant.error_message = "boom";
+    try transcript.apply(std.testing.io, .{ .message_start = .{ .message = .{ .assistant = assistant } } });
+    try transcript.apply(std.testing.io, .{ .message_end = .{ .message = .{ .assistant = assistant } } });
+    const state: theme.LayoutState = .{ .width = 40, .height = 10 };
+    _ = try transcript.prepareLayout(state);
+    const lines = transcript.items.items[0].layout_cache.active.lines;
+
+    var buffer: [64]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 2), lines.len);
+    try std.testing.expectEqualStrings(" error: boom", lines[0].copyText(&buffer));
+    try std.testing.expect(std.meta.eql(lines[0].spans()[1].style.fg, screen.text.error_.fg));
+    try std.testing.expectEqualStrings("", lines[1].copyText(&buffer));
+}
+
+test "transcript compaction is a padded collapsed and expanded summary block" {
+    var transcript = Transcript.init(std.testing.allocator);
+    defer transcript.deinit();
+
+    try transcript.appendCompaction("first\n\nsecond", 1234);
+    const collapsed_state: theme.LayoutState = .{ .width = 60, .height = 10 };
+    _ = try transcript.prepareLayout(collapsed_state);
+    var lines = transcript.items.items[0].layout_cache.active.lines;
+
+    var buffer: [96]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 6), lines.len);
+    try std.testing.expectEqualStrings("", lines[0].copyText(&buffer));
+    try std.testing.expectEqualStrings(" [compaction]", lines[1].copyText(&buffer));
+    try std.testing.expectEqualStrings("", lines[2].copyText(&buffer));
+    try std.testing.expectEqualStrings(" Compacted from 1234 tokens (ctrl+o to expand)", lines[3].copyText(&buffer));
+    try std.testing.expectEqualStrings("", lines[4].copyText(&buffer));
+    try std.testing.expect(std.meta.eql(lines[4].row_style.bg, screen.surface.custom_message.bg));
+    try std.testing.expectEqualStrings("", lines[5].copyText(&buffer));
+
+    const expanded_state: theme.LayoutState = .{ .width = 60, .height = 10, .expanded = true };
+    _ = try transcript.prepareLayout(expanded_state);
+    lines = transcript.items.items[0].layout_cache.active.lines;
+    try std.testing.expectEqual(@as(usize, 10), lines.len);
+    try std.testing.expectEqualStrings(" Compacted from 1234 tokens", lines[3].copyText(&buffer));
+    try std.testing.expectEqualStrings("", lines[4].copyText(&buffer));
+    try std.testing.expectEqualStrings(" first", lines[5].copyText(&buffer));
+    try std.testing.expectEqualStrings("", lines[6].copyText(&buffer));
+    try std.testing.expectEqualStrings(" second", lines[7].copyText(&buffer));
+    try std.testing.expectEqualStrings("", lines[8].copyText(&buffer));
+    try std.testing.expect(std.meta.eql(lines[8].row_style.bg, screen.surface.custom_message.bg));
+    try std.testing.expectEqualStrings("", lines[9].copyText(&buffer));
+}
+
+test "transcript markdown reserves a span for outer inset" {
+    var transcript = Transcript.init(std.testing.allocator);
+    defer transcript.deinit();
+
+    const text = "a **b** c **d** e **f** g **h** i **j** k **l** m **n** o **p** q";
+    const content = [_]ai.AssistantContent{.{ .text = .{ .text = text } }};
+    const assistant = emptyAssistantMessage(&content, .stop);
+    try transcript.apply(std.testing.io, .{ .message_start = .{ .message = .{ .assistant = assistant } } });
+    try transcript.apply(std.testing.io, .{ .message_end = .{ .message = .{ .assistant = assistant } } });
+    const state: theme.LayoutState = .{ .width = 100, .height = 10 };
+    _ = try transcript.prepareLayout(state);
+    const line = transcript.items.items[0].layout_cache.active.lines[0];
+
+    var buffer: [128]u8 = undefined;
+    try std.testing.expectEqualStrings(" a b c d e f g h i j k l m n o **p** q", line.copyText(&buffer));
+    try std.testing.expectEqual(@as(usize, screen.span_capacity), line.spans().len);
+}
+
+test "transcript settled assistant trims trailing blank rows" {
+    var transcript = Transcript.init(std.testing.allocator);
+    defer transcript.deinit();
+
+    const content = [_]ai.AssistantContent{.{ .text = .{ .text = "answer\n\n" } }};
+    const assistant = emptyAssistantMessage(&content, .stop);
+    try transcript.apply(std.testing.io, .{ .message_start = .{ .message = .{ .assistant = assistant } } });
+    try transcript.apply(std.testing.io, .{ .message_end = .{ .message = .{ .assistant = assistant } } });
+    const state: theme.LayoutState = .{ .width = 40, .height = 10 };
+    _ = try transcript.prepareLayout(state);
+    const lines = transcript.items.items[0].layout_cache.active.lines;
+
+    var buffer: [64]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 2), lines.len);
+    try std.testing.expectEqualStrings(" answer", lines[0].copyText(&buffer));
+    try std.testing.expectEqualStrings("", lines[1].copyText(&buffer));
 }
 
 fn toolCallAt(message: ai.AssistantMessage, index: usize) ?ai.ToolCall {
@@ -1483,29 +1694,57 @@ fn transcriptInnerWidth(width: u16) u16 {
     return if (width <= padding) 0 else @intCast(@as(usize, width) - padding);
 }
 
-fn applyItemRhythm(allocator: std.mem.Allocator, kind: Item.Kind, content: []layout.Line) ![]layout.Line {
-    if (content.len == 0) return &.{};
-    var out = std.ArrayList(layout.Line).empty;
-    errdefer out.deinit(allocator);
+const RhythmedLayout = struct {
+    lines: []layout.Line,
+    roles: []RowRole,
+};
+
+fn applyItemRhythm(allocator: std.mem.Allocator, kind: Item.Kind, content: []layout.Line) !RhythmedLayout {
+    if (content.len == 0) return .{ .lines = &.{}, .roles = &.{} };
+    var lines = std.ArrayList(layout.Line).empty;
+    errdefer lines.deinit(allocator);
+    var roles = std.ArrayList(RowRole).empty;
+    errdefer roles.deinit(allocator);
     const style = itemStyle(kind);
     const padding_y = itemPaddingY(kind);
-    try out.ensureTotalCapacity(allocator, content.len + padding_y * 2 + item_margin_bottom);
+    const total = content.len + padding_y * 2 + item_margin_bottom;
+    try lines.ensureTotalCapacity(allocator, total);
+    try roles.ensureTotalCapacity(allocator, total);
 
-    for (0..padding_y) |_| try out.append(allocator, .{ .row_style = style });
+    for (0..padding_y) |_| {
+        try lines.append(allocator, .{ .row_style = style });
+        try roles.append(allocator, .panel_padding);
+    }
     for (content) |source| {
+        const role = contentRowRole(source);
         var line = source;
         if (screen.Style.eql(line.row_style, screen.surface.transparent) and !screen.Style.eql(style, screen.surface.transparent)) line.row_style = style;
         if (line.spans().len > 0) try insetTranscriptLine(&line, lineInsetStyle(kind, line));
-        try out.append(allocator, line);
+        try lines.append(allocator, line);
+        try roles.append(allocator, role);
     }
-    for (0..padding_y) |_| try out.append(allocator, .{ .row_style = style });
-    for (0..item_margin_bottom) |_| try out.append(allocator, .{});
-    return out.toOwnedSlice(allocator);
+    for (0..padding_y) |_| {
+        try lines.append(allocator, .{ .row_style = style });
+        try roles.append(allocator, .panel_padding);
+    }
+    for (0..item_margin_bottom) |_| {
+        try lines.append(allocator, .{});
+        try roles.append(allocator, .item_margin);
+    }
+    const owned_lines = try lines.toOwnedSlice(allocator);
+    errdefer allocator.free(owned_lines);
+    const owned_roles = try roles.toOwnedSlice(allocator);
+    return .{ .lines = owned_lines, .roles = owned_roles };
+}
+
+fn contentRowRole(line: layout.Line) RowRole {
+    return if (line.spans().len == 0) .semantic_blank else .content;
 }
 
 fn itemPaddingY(kind: Item.Kind) usize {
     return switch (kind) {
         .user => user_padding_y,
+        .compaction, .custom => custom_padding_y,
         else => 0,
     };
 }
@@ -1513,7 +1752,7 @@ fn itemPaddingY(kind: Item.Kind) usize {
 fn itemStyle(kind: Item.Kind) screen.Style {
     return switch (kind) {
         .user => screen.surface.user_message,
-        .custom => screen.surface.custom_message,
+        .compaction, .custom => screen.surface.custom_message,
         else => screen.surface.transparent,
     };
 }
@@ -1528,6 +1767,65 @@ fn insetTranscriptLine(line: *layout.Line, style: screen.Style) error{LineFull}!
     try line.prepend(.{ .text = padding_spaces[0..transcript_padding_x], .style = style });
 }
 
+fn layoutCompaction(
+    allocator: std.mem.Allocator,
+    compaction: anytype,
+    width: u16,
+    expanded: bool,
+) ![]layout.Line {
+    var out = std.ArrayList(layout.Line).empty;
+    errdefer out.deinit(allocator);
+    try layout.appendPlainLine(
+        allocator,
+        &out,
+        "[compaction]",
+        width,
+        screen.withBold(screen.text.custom_message_label),
+    );
+    try out.append(allocator, .{});
+
+    const token_text = try std.fmt.allocPrint(
+        allocator,
+        "Compacted from {d} tokens",
+        .{compaction.tokens_before},
+    );
+    if (!expanded) {
+        const summary = try std.fmt.allocPrint(
+            allocator,
+            "{s} (ctrl+o to expand)",
+            .{token_text},
+        );
+        try layout.appendProseLine(
+            allocator,
+            &out,
+            summary,
+            width,
+            screen.text.custom_message,
+        );
+        return out.toOwnedSlice(allocator);
+    }
+
+    try layout.appendProseLine(
+        allocator,
+        &out,
+        token_text,
+        width,
+        screen.withBold(screen.text.custom_message),
+    );
+    const summary = trimTrailingNewlines(compaction.summary.items);
+    if (summary.len > 0) {
+        try out.append(allocator, .{});
+        try appendMarkdownBlock(
+            allocator,
+            &out,
+            summary,
+            width,
+            screen.text.custom_message,
+        );
+    }
+    return out.toOwnedSlice(allocator);
+}
+
 fn layoutCustom(allocator: std.mem.Allocator, custom: anytype, width: u16) ![]layout.Line {
     var out = std.ArrayList(layout.Line).empty;
     errdefer out.deinit(allocator);
@@ -1536,7 +1834,13 @@ fn layoutCustom(allocator: std.mem.Allocator, custom: anytype, width: u16) ![]la
         try out.append(allocator, .{});
     }
     var state: layout.WrapState = .{};
-    const body = try layout.wrapMarkdown(allocator, custom.text, width, screen.text.custom_message, &state);
+    const body = try layout.wrapMarkdown(
+        allocator,
+        trimTrailingNewlines(custom.text),
+        width,
+        screen.text.custom_message,
+        &state,
+    );
     try out.appendSlice(allocator, body);
     return out.toOwnedSlice(allocator);
 }
@@ -1553,11 +1857,6 @@ fn jsonValueString(allocator: std.mem.Allocator, value: std.json.Value) ![]const
     var stringify: std.json.Stringify = .{ .writer = &writer.writer };
     try stringify.write(value);
     return writer.toOwnedSlice();
-}
-
-fn firstLine(text: []const u8) []const u8 {
-    const end = std.mem.indexOfAny(u8, text, "\r\n") orelse text.len;
-    return text[0..end];
 }
 
 fn nowNs(io: std.Io) u64 {
@@ -1587,6 +1886,46 @@ fn emptyAssistantMessage(content: []const ai.AssistantContent, stop_reason: ai.S
         .stop_reason = stop_reason,
         .timestamp = 0,
     };
+}
+
+const RhythmFixtureKind = enum {
+    user,
+    assistant,
+    tool,
+    notice,
+    compaction,
+    custom,
+};
+
+fn appendRhythmFixture(transcript: *Transcript, kind: RhythmFixtureKind) !void {
+    switch (kind) {
+        .user => try transcript.apply(std.testing.io, .{ .message_start = .{ .message = .{ .user = .{
+            .content = .{ .string = "user words" },
+            .timestamp = 0,
+        } } } }),
+        .assistant => {
+            const content = [_]ai.AssistantContent{.{ .text = .{ .text = "assistant words" } }};
+            const assistant = emptyAssistantMessage(&content, .stop);
+            try transcript.apply(std.testing.io, .{ .message_start = .{ .message = .{ .assistant = assistant } } });
+            try transcript.apply(std.testing.io, .{ .message_end = .{ .message = .{ .assistant = assistant } } });
+        },
+        .tool => {
+            var id_buffer: [32]u8 = undefined;
+            const call_id = try std.fmt.bufPrint(&id_buffer, "fixture-tool-{d}", .{transcript.next_seq});
+            try transcript.apply(std.testing.io, .{ .tool_execution_start = .{
+                .tool_call_id = call_id,
+                .tool_name = "fixture",
+                .args = .null,
+            } });
+        },
+        .notice => try transcript.appendNotice(.info, "notice words"),
+        .compaction => try transcript.appendCompaction("summary words", 100),
+        .custom => try transcript.apply(std.testing.io, .{ .message_start = .{ .message = .{ .custom = .{
+            .kind = "Fixture",
+            .payload = .{ .string = "custom words" },
+            .timestamp = 0,
+        } } } }),
+    }
 }
 
 test "transcript applies streamed assistant text by delta" {
@@ -1831,6 +2170,81 @@ test "transcript invalidation has one dominance order" {
     try std.testing.expectEqual(LayoutInvalidation.rebuild, item.layout_cache.invalidation);
 }
 
+test "transcript distinguishes semantic blanks panel padding and item margins" {
+    var transcript = Transcript.init(std.testing.allocator);
+    defer transcript.deinit();
+
+    try transcript.apply(std.testing.io, .{ .message_start = .{ .message = .{ .user = .{
+        .content = .{ .string = "alpha\n\nbeta" },
+        .timestamp = 0,
+    } } } });
+    const state: theme.LayoutState = .{ .width = 40, .height = 10 };
+    _ = try transcript.prepareLayout(state);
+    const cache = transcript.items.items[0].layout_cache.active;
+
+    try std.testing.expectEqual(cache.lines.len, cache.roles.len);
+    try std.testing.expectEqualSlices(RowRole, &.{
+        .panel_padding,
+        .content,
+        .semantic_blank,
+        .content,
+        .panel_padding,
+        .item_margin,
+    }, cache.roles);
+    const semantic = transcript.resolvePosition(.{ .item_seq = 0, .line_in_item = 2 }).?;
+    try std.testing.expectEqual(@as(u32, 2), semantic.position.line_in_item);
+    const margin = transcript.resolvePosition(.{ .item_seq = 0, .line_in_item = 5 }).?;
+    try std.testing.expectEqual(@as(u32, 4), margin.position.line_in_item);
+}
+
+test "transcript golden rhythm covers every item adjacency" {
+    const kinds = std.enums.values(RhythmFixtureKind);
+    var transcript = Transcript.init(std.testing.allocator);
+    defer transcript.deinit();
+
+    for (kinds) |first| for (kinds) |second| {
+        transcript.clear();
+        try appendRhythmFixture(&transcript, first);
+        try appendRhythmFixture(&transcript, second);
+        const state: theme.LayoutState = .{ .width = 40, .height = 20 };
+        _ = try transcript.prepareLayout(state);
+
+        try std.testing.expectEqual(@as(usize, 2), transcript.items.items.len);
+        const first_cache = transcript.items.items[0].layout_cache.active;
+        const second_cache = transcript.items.items[1].layout_cache.active;
+        try std.testing.expect(first_cache.roles.len > 0);
+        try std.testing.expect(second_cache.roles.len > 0);
+        try std.testing.expectEqual(RowRole.item_margin, first_cache.roles[first_cache.roles.len - 1]);
+        try std.testing.expect(second_cache.roles[0] != .item_margin);
+        try std.testing.expectEqual(RowRole.item_margin, second_cache.roles[second_cache.roles.len - 1]);
+
+        var margins: usize = 0;
+        for (0..transcript.totalLines()) |absolute| {
+            if (transcript.rowRoleAt(absolute) == .item_margin) margins += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 2), margins);
+    };
+}
+
+test "transcript golden rhythm remains valid at pathological widths" {
+    const widths = [_]u16{ 0, 1, 2, 3, 4, 8, 40 };
+    var transcript = Transcript.init(std.testing.allocator);
+    defer transcript.deinit();
+    for (std.enums.values(RhythmFixtureKind)) |kind| try appendRhythmFixture(&transcript, kind);
+
+    for (widths) |width| {
+        const state: theme.LayoutState = .{ .width = width, .height = 20 };
+        while (try transcript.prepareLayout(state) == .pending) {}
+        try std.testing.expect(transcript.totalLines() > 0);
+        for (transcript.items.items) |item| {
+            const cache = item.layout_cache.active;
+            try std.testing.expectEqual(cache.lines.len, cache.roles.len);
+            try std.testing.expect(cache.roles.len > 0);
+            try std.testing.expectEqual(RowRole.item_margin, cache.roles[cache.roles.len - 1]);
+        }
+    }
+}
+
 test "transcript owns line positions and visible collection" {
     var transcript = Transcript.init(std.testing.allocator);
     defer transcript.deinit();
@@ -1964,7 +2378,10 @@ test "transcript aborts running tools on aborted assistant end" {
     try transcript.apply(std.testing.io, .{ .message_start = .{ .message = .{ .assistant = emptyAssistantMessage(&.{}, .aborted) } } });
     try transcript.apply(std.testing.io, .{ .message_end = .{ .message = .{ .assistant = emptyAssistantMessage(&.{}, .aborted) } } });
 
-    try std.testing.expectEqual(blocks.Status.aborted, transcript.items.items[0].kind.tool.status);
+    const tool = transcript.items.items[0].kind.tool;
+    try std.testing.expectEqual(blocks.Status.aborted, tool.status);
+    try std.testing.expectEqual(@as(?u64, null), tool.elapsed_ms);
+    try std.testing.expect(tool.duration_ms != null);
 }
 
 test "transcript reused terminal tool id starts a new live item" {

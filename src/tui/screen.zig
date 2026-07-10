@@ -22,7 +22,6 @@ pub const colors = struct {
     pub const tier6 = rgb(0x6A6E6C);
     pub const tier7 = rgb(0x535755);
     pub const scaffold = rgb(0x626664);
-    pub const selection = rgb(0x393B44);
     pub const red = rgb(0xE46876);
     pub const green = rgb(0x87A987);
     pub const yellow = rgb(0xE6C384);
@@ -84,7 +83,6 @@ pub const surface = struct {
     pub const transparent: Style = .{};
     pub const app: Style = .{ .bg = colors.bg };
     pub const composer: Style = .{ .bg = colors.bg };
-    pub const selected: Style = .{ .bg = colors.selection };
     pub const user_message: Style = .{ .bg = colors.panel_bg };
     pub const custom_message: Style = .{ .bg = colors.panel_bg_light };
     pub const tool_pending: Style = .{ .bg = colors.panel_bg };
@@ -362,15 +360,15 @@ test "screen measures and clips by display columns" {
 }
 
 test "transparent span inherits row or app surface" {
-    const selected = onSurface(text.normal, surface.selected);
-    try std.testing.expect(std.meta.eql(selected.bg, surface.selected.bg));
+    const user_message = onSurface(text.normal, surface.user_message);
+    try std.testing.expect(std.meta.eql(user_message.bg, surface.user_message.bg));
 
     const app = onSurface(text.normal, surface.transparent);
     try std.testing.expect(std.meta.eql(app.bg, surface.app.bg));
 
     var explicit = text.normal;
     explicit.bg = colors.panel_bg_red;
-    const preserved = onSurface(explicit, surface.selected);
+    const preserved = onSurface(explicit, surface.user_message);
     try std.testing.expect(std.meta.eql(preserved.bg, explicit.bg));
 }
 

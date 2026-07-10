@@ -56,11 +56,14 @@ pub fn appendMarkdown(
 
     var tail_start: usize = 0;
     while (tail_start < tail.len) {
-        const tail_end = sliceEndForWidth(tail, tail_start, width);
+        const slice = if (tail_state.fence != null)
+            hardWrapSlice(tail, tail_start, width)
+        else
+            proseWrapSlice(tail, tail_start, width);
         var line: Line = .{};
-        try markdown.renderLine(&tail_state, &line, tail[tail_start..tail_end], base);
+        try markdown.renderLine(&tail_state, &line, tail[tail_start..slice.end], base);
         try out.append(allocator, line);
-        tail_start = tail_end;
+        tail_start = slice.next;
         if (tail_start < tail.len) {
             state.committed_bytes = start + tail_start;
             state.committed_lines = out.items.len;
@@ -69,13 +72,31 @@ pub fn appendMarkdown(
 }
 
 pub fn wrapPlain(allocator: std.mem.Allocator, text: []const u8, width: u16, style: screen.Style) ![]Line {
+    return wrapText(allocator, text, width, style, false);
+}
+
+pub fn wrapProse(allocator: std.mem.Allocator, text: []const u8, width: u16, style: screen.Style) ![]Line {
+    return wrapText(allocator, text, width, style, true);
+}
+
+fn wrapText(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    width: u16,
+    style: screen.Style,
+    prose: bool,
+) ![]Line {
     var out = std.ArrayList(Line).empty;
     errdefer out.deinit(allocator);
     try out.ensureTotalCapacity(allocator, estimatedLineCapacity(text, width));
     var start: usize = 0;
     while (start <= text.len) {
         const end = std.mem.indexOfScalarPos(u8, text, start, '\n') orelse text.len;
-        try appendPlainLine(allocator, &out, text[start..end], width, style);
+        if (prose) {
+            try appendProseLine(allocator, &out, text[start..end], width, style);
+        } else {
+            try appendPlainLine(allocator, &out, text[start..end], width, style);
+        }
         if (end == text.len) break;
         start = end + 1;
     }
@@ -94,14 +115,17 @@ fn wrapPhysicalMarkdownLine(
         try out.append(allocator, .{});
         return;
     }
-    if (state.fence == null and !hasMarkdownSyntax(text)) return appendPlainLine(allocator, out, text, width, base);
+    if (state.fence == null and !hasMarkdownSyntax(text)) return appendProseLine(allocator, out, text, width, base);
     var start: usize = 0;
     while (start < text.len) {
-        const end = sliceEndForWidth(text, start, width);
+        const slice = if (state.fence != null)
+            hardWrapSlice(text, start, width)
+        else
+            proseWrapSlice(text, start, width);
         var line: Line = .{};
-        try markdown.renderLine(state, &line, text[start..end], base);
+        try markdown.renderLine(state, &line, text[start..slice.end], base);
         try out.append(allocator, line);
-        start = end;
+        start = slice.next;
     }
 }
 
@@ -125,18 +149,92 @@ pub fn appendPlainLine(
     width: u16,
     style: screen.Style,
 ) !void {
+    return appendTextLine(allocator, out, text, width, style, false);
+}
+
+pub fn appendProseLine(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayList(Line),
+    text: []const u8,
+    width: u16,
+    style: screen.Style,
+) !void {
+    return appendTextLine(allocator, out, text, width, style, true);
+}
+
+fn appendTextLine(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayList(Line),
+    text: []const u8,
+    width: u16,
+    style: screen.Style,
+    prose: bool,
+) !void {
     if (text.len == 0) {
         try out.append(allocator, .{});
         return;
     }
     var start: usize = 0;
     while (start < text.len) {
-        const end = sliceEndForWidth(text, start, width);
+        const slice = if (prose)
+            proseWrapSlice(text, start, width)
+        else
+            hardWrapSlice(text, start, width);
         var line: Line = .{};
-        try line.append(.{ .text = text[start..end], .style = style });
+        try line.append(.{ .text = text[start..slice.end], .style = style });
         try out.append(allocator, line);
-        start = end;
+        start = slice.next;
     }
+}
+
+const WrapSlice = struct {
+    end: usize,
+    next: usize,
+};
+
+fn hardWrapSlice(text: []const u8, start: usize, width: u16) WrapSlice {
+    const end = sliceEndForWidth(text, start, width);
+    return .{ .end = end, .next = end };
+}
+
+fn proseWrapSlice(text: []const u8, start: usize, width: u16) WrapSlice {
+    const hard_end = sliceEndForWidth(text, start, width);
+    if (hard_end == text.len) return .{ .end = hard_end, .next = hard_end };
+    if (isWrapWhitespace(text[hard_end])) {
+        var next = hard_end;
+        while (next < text.len and isWrapWhitespace(text[next])) next += 1;
+        return .{ .end = hard_end, .next = next };
+    }
+
+    var whitespace_break: ?usize = null;
+    var punctuation_break: ?usize = null;
+    for (text[start..hard_end], start..) |byte, index| {
+        if (index > start and isWrapWhitespace(byte)) {
+            whitespace_break = index;
+        } else if (isWrapPunctuation(byte)) {
+            punctuation_break = index + 1;
+        }
+    }
+
+    const end = if (whitespace_break) |whitespace|
+        if (punctuation_break) |punctuation| @max(whitespace, punctuation) else whitespace
+    else
+        punctuation_break orelse hard_end;
+    var next = end;
+    while (next < text.len and isWrapWhitespace(text[next])) next += 1;
+    if (end == start) return .{ .end = hard_end, .next = hard_end };
+    return .{ .end = end, .next = next };
+}
+
+fn isWrapWhitespace(byte: u8) bool {
+    return byte == ' ' or byte == '\t';
+}
+
+fn isWrapPunctuation(byte: u8) bool {
+    return switch (byte) {
+        '-', '/', '\\', '.', ',', ';', ':', '!', '?', ')', ']', '}' => true,
+        else => false,
+    };
 }
 
 pub fn sliceEndForWidth(text: []const u8, start: usize, width: u16) usize {
@@ -183,6 +281,24 @@ test "plain wrap respects grapheme width" {
     try std.testing.expectEqualStrings("cd", lines[1].copyText(&buffer));
 }
 
+test "prose wrap prefers words and skips wrap-only whitespace" {
+    const lines = try wrapProse(std.testing.allocator, "alpha beta gamma", 10, screen.text.normal);
+    defer std.testing.allocator.free(lines);
+    try std.testing.expectEqual(@as(usize, 2), lines.len);
+    var buffer: [32]u8 = undefined;
+    try std.testing.expectEqualStrings("alpha beta", lines[0].copyText(&buffer));
+    try std.testing.expectEqualStrings("gamma", lines[1].copyText(&buffer));
+}
+
+test "prose wrap falls back for long unicode tokens" {
+    const lines = try wrapProse(std.testing.allocator, "界界界界", 4, screen.text.normal);
+    defer std.testing.allocator.free(lines);
+    try std.testing.expectEqual(@as(usize, 2), lines.len);
+    var buffer: [32]u8 = undefined;
+    try std.testing.expectEqualStrings("界界", lines[0].copyText(&buffer));
+    try std.testing.expectEqualStrings("界界", lines[1].copyText(&buffer));
+}
+
 test "markdown wrap applies block style" {
     var state: WrapState = .{};
     const lines = try wrapMarkdown(std.testing.allocator, "# title", 80, screen.text.normal, &state);
@@ -202,6 +318,21 @@ test "markdown wrapping preserves fenced code style on plain body lines" {
     );
     defer std.testing.allocator.free(lines);
     try std.testing.expect(std.meta.eql(lines[1].spans()[0].style.fg, screen.markdown_styles.code_block.fg));
+}
+
+test "markdown prose wraps by words while fenced code hard wraps" {
+    var prose_state: WrapState = .{};
+    const prose = try wrapMarkdown(std.testing.allocator, "alpha beta gamma", 10, screen.text.normal, &prose_state);
+    defer std.testing.allocator.free(prose);
+    var buffer: [32]u8 = undefined;
+    try std.testing.expectEqualStrings("alpha beta", prose[0].copyText(&buffer));
+    try std.testing.expectEqualStrings("gamma", prose[1].copyText(&buffer));
+
+    var fence_state: WrapState = .{};
+    const fenced = try wrapMarkdown(std.testing.allocator, "```\nalpha beta\n```", 6, screen.text.normal, &fence_state);
+    defer std.testing.allocator.free(fenced);
+    try std.testing.expectEqualStrings("alpha ", fenced[1].copyText(&buffer));
+    try std.testing.expectEqualStrings("beta", fenced[2].copyText(&buffer));
 }
 
 test "incremental markdown keeps committed physical lines and plain wraps" {

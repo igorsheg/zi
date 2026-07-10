@@ -419,6 +419,7 @@ fn durationText(buffer: []u8, tool: anytype) []const u8 {
     switch (tool.status) {
         .running => if (tool.elapsed_ms) |elapsed_ms| return durationChip(buffer, "Elapsed", elapsed_ms),
         .done, .failed => if (tool.duration_ms) |duration_ms| return durationChip(buffer, "Took", duration_ms),
+        .aborted => if (tool.duration_ms) |duration_ms| return durationChip(buffer, "Ran", duration_ms),
         else => {},
     }
     return "";
@@ -529,6 +530,64 @@ test "successful hidden tool body appears when expanded" {
     try std.testing.expectEqualStrings("│ secret", expanded[2].copyText(&buffer));
 }
 
+test "tool golden rhythm covers every status transition" {
+    const TestTool = struct {
+        name: []const u8,
+        title: []const u8,
+        compact_title: []const u8,
+        display: ToolDisplay,
+        status: Status,
+        elapsed_ms: ?u64,
+        duration_ms: ?u64,
+        tail: TailBuffer,
+        body: std.ArrayList(u8),
+        body_truncated: bool,
+        footer: []const u8,
+    };
+    const cases = [_]struct {
+        status: Status,
+        title: []const u8,
+        footer: ?[]const u8,
+    }{
+        .{ .status = .pending, .title = "$ echo hi", .footer = null },
+        .{ .status = .running, .title = "$ echo hi", .footer = "[Elapsed 1.2s]" },
+        .{ .status = .done, .title = "$ echo hi", .footer = "[Took 1.2s]" },
+        .{ .status = .failed, .title = "$ echo hi (error)", .footer = "[Took 1.2s]" },
+        .{ .status = .aborted, .title = "$ echo hi (aborted)", .footer = "[Ran 1.2s]" },
+    };
+
+    for (cases) |case| {
+        var body: std.ArrayList(u8) = .empty;
+        defer body.deinit(std.testing.allocator);
+        try body.appendSlice(std.testing.allocator, "output");
+        const terminal = case.status == .done or case.status == .failed or case.status == .aborted;
+        const tool: TestTool = .{
+            .name = "bash",
+            .title = "$ echo hi",
+            .compact_title = "",
+            .display = ToolDisplay{ .shows_duration = true },
+            .status = case.status,
+            .elapsed_ms = if (case.status == .running) @as(?u64, 1234) else null,
+            .duration_ms = if (terminal) @as(?u64, 1234) else null,
+            .tail = TailBuffer{},
+            .body = body,
+            .body_truncated = false,
+            .footer = "",
+        };
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const lines = try layoutTool(arena.allocator(), tool, 80, true);
+        try std.testing.expectEqual(@as(usize, if (case.footer == null) 4 else 5), lines.len);
+        try std.testing.expect(std.meta.eql(lines[0].row_style.bg, statusSurface(case.status).bg));
+        var buffer: [96]u8 = undefined;
+        try std.testing.expectEqualStrings(case.title, lines[0].copyText(&buffer));
+        try std.testing.expectEqualStrings(glyphs.tool_top_line, lines[1].copyText(&buffer));
+        try std.testing.expectEqualStrings("│ output", lines[2].copyText(&buffer));
+        try std.testing.expectEqualStrings(glyphs.tool_bottom_line, lines[3].copyText(&buffer));
+        if (case.footer) |footer| try std.testing.expectEqualStrings(footer, lines[4].copyText(&buffer));
+    }
+}
+
 test "duration footer renders outside tool rail" {
     var body: std.ArrayList(u8) = .empty;
     defer body.deinit(std.testing.allocator);
@@ -550,6 +609,29 @@ test "duration footer renders outside tool rail" {
     const lines = try layoutTool(arena.allocator(), tool, 80, true);
     var buffer: [128]u8 = undefined;
     try std.testing.expectEqualStrings("[Truncated: x • Took 1.2s]", lines[1].copyText(&buffer));
+}
+
+test "aborted duration uses ran label" {
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(std.testing.allocator);
+    const tool = .{
+        .name = "bash",
+        .title = "$ sleep 10",
+        .compact_title = "",
+        .display = ToolDisplay{ .shows_duration = true },
+        .status = Status.aborted,
+        .elapsed_ms = @as(?u64, null),
+        .duration_ms = @as(?u64, 3400),
+        .tail = TailBuffer{},
+        .body = body,
+        .body_truncated = false,
+        .footer = "",
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const lines = try layoutTool(arena.allocator(), tool, 80, true);
+    var buffer: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("[Ran 3.4s]", lines[1].copyText(&buffer));
 }
 
 test {
