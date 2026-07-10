@@ -10,6 +10,7 @@ pub const tool_body_bytes_max: usize = 64 * 1024;
 pub const tail_line_count: usize = 5;
 pub const tail_line_bytes_max: usize = 200;
 pub const output_truncated_text = "[output truncated]";
+pub const duration_tick_ms: u64 = 100;
 
 const title_bytes_max: usize = 160;
 const footer_bytes_max: usize = 256;
@@ -427,7 +428,7 @@ fn durationChip(buffer: []u8, label: []const u8, elapsed_ms: u64) []const u8 {
     return std.fmt.bufPrint(buffer, "{s} {d}.{d}s", .{
         label,
         elapsed_ms / std.time.ms_per_s,
-        (elapsed_ms % std.time.ms_per_s) / 100,
+        (elapsed_ms % std.time.ms_per_s) / duration_tick_ms,
     }) catch "";
 }
 

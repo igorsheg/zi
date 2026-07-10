@@ -3,6 +3,20 @@
 Read `CONTEXT.md` first for vocabulary and ownership. This file is the working
 checklist for changing Zi without drifting from the completed gen-3 architecture.
 
+## Primary design rule
+
+**Prefer one bounded, explicit, somewhat complex owner over several
+simple-looking modules connected by synchronization contracts.** Local
+implementation complexity is a good trade when it lowers system complexity and
+makes scaling predictable.
+
+Complexity must be essential and contained: the owner mutates the state, its
+public API stays small and direct, every accumulation and unit of work is
+bounded, state transitions are explicit, callers do not mirror internals, and
+deterministic tests protect the invariants. Do not split an owner merely to make
+individual files look cleaner; distributed coordination is the more dangerous
+complexity.
+
 The default review question for any change is: **does this make the direct
 frontend -> AgentSession -> agent -> Transcript/screen path clearer, smaller, or
 more bounded?** If not, redesign before editing.
@@ -133,7 +147,10 @@ Rules:
 ### Transcript and tool UI
 
 `src/tui/Transcript.zig` owns the bounded fold from live/restored events to render
-items. `src/tui/blocks.zig` owns transcript block rendering and tool-call UX.
+items plus all derived transcript layout caches and line-index state. `Loop` owns
+viewport policy but only asks `Transcript` for positions and visible lines.
+`src/tui/blocks.zig` owns transcript block rendering and tool-call UX. Follow
+`docs/tui-performance.md` when changing this path.
 
 Rules:
 
@@ -143,6 +160,8 @@ Rules:
 - Write/read/bash/edit/symbols presentation should be tested as user-visible UX,
   including streaming args and capped bodies.
 - Coalesce stream fragments before layout/render when ordering allows.
+- Content mutations classify layout invalidation inside `Transcript`; callers do
+  not mutate cache fields or maintain another prefix/line index.
 - Transcript retention is bounded by item/byte caps; eviction must preserve valid
   viewport anchors.
 

@@ -96,6 +96,7 @@ retry, timeout, faux streaming, or cancellation waits.
 **Current users:**
 
 - TUI and print run handles register one wake on `AgentEventStream`.
+- `InputPump` publishes terminal bytes to its bounded SPSC ring, then sets the same TUI owner wake from its raw thread.
 - `EventPipe` wakes owners after emit/end/abort.
 - `CancelSource` wakes cancellation waiters.
 - `process_runner` wakes its owner when process, timeout, cancel, reader, or

@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const Loop = @import("../Loop.zig");
+const Transcript = @import("../Transcript.zig");
 const session_listing = @import("../../coding_agent/session_listing.zig");
 
 pub const max_output_default: usize = 256 * 1024;
@@ -301,7 +302,11 @@ fn appendResizeStorm(actions: *std.ArrayList(Action), allocator: std.mem.Allocat
 fn expectP3EvictionResizeTrace(report: []const u8) !void {
     const evictions = try metricValue(report, "transcript_evictions ", "count=");
     const dropped = try metricValue(report, "dropped_input_bytes ", "count=");
-    if (evictions < 1000 or dropped != 0) {
+    const max_layout_items = try metricValue(report, "layout_work ", "max_items_per_frame=");
+    if (evictions < 1000 or
+        dropped != 0 or
+        max_layout_items > Transcript.relayout_items_per_prepare)
+    {
         std.debug.print("P3 eviction/resize trace gate failed\n{s}\n", .{report});
         return error.TestUnexpectedResult;
     }
@@ -311,7 +316,12 @@ fn expectP3ToolRebuildTrace(report: []const u8) !void {
     const rebuild_count = try metricValue(report, "rebuilds ", "count=");
     const rebuild_max_ns = try metricValue(report, "rebuilds ", "max_ns=");
     const dropped = try metricValue(report, "dropped_input_bytes ", "count=");
-    if (rebuild_count == 0 or rebuild_max_ns >= 50 * std.time.ns_per_ms or dropped != 0) {
+    const max_layout_items = try metricValue(report, "layout_work ", "max_items_per_frame=");
+    if (rebuild_count == 0 or
+        rebuild_max_ns >= 50 * std.time.ns_per_ms or
+        dropped != 0 or
+        max_layout_items > Transcript.relayout_items_per_prepare)
+    {
         std.debug.print("P3 tool rebuild trace gate failed\n{s}\n", .{report});
         return error.TestUnexpectedResult;
     }
@@ -324,6 +334,21 @@ fn expectP2FloodTrace(report: []const u8) !void {
     const dropped = try metricValue(report, "dropped_input_bytes ", "count=");
     if (input_count < 100 or input_p99_ns >= Loop.frame_floor_ns or max_frame_us > Loop.watchdog_budget_ns / std.time.ns_per_us or dropped != 0) {
         std.debug.print("P2 flood trace gate failed\n{s}\n", .{report});
+        return error.TestUnexpectedResult;
+    }
+}
+
+fn expectAutonomousCadenceTrace(report: []const u8) !void {
+    const gap_count = try metricValue(report, "animated_frame_gaps ", "count=");
+    const gap_p90_ns = try metricValue(report, "animated_frame_gaps ", "p90_ns=");
+    const deadline_misses = try metricValue(report, "animated_frame_gaps ", "deadline_misses=");
+    const max_layout_us = try metricValue(report, "frames ", "max_layout_us=");
+    const cadence_failed = gap_count < 60 or
+        gap_p90_ns >= Loop.frame_floor_ns * 2 or
+        deadline_misses > gap_count / 10 or
+        max_layout_us == 0;
+    if (cadence_failed) {
+        std.debug.print("autonomous cadence trace gate failed\n{s}\n", .{report});
         return error.TestUnexpectedResult;
     }
 }
@@ -494,6 +519,68 @@ test "pty e2e: synthetic flood trace meets P2 gate three times" {
         defer std.testing.allocator.free(report);
         try expectP2FloodTrace(report);
     }
+}
+
+test "pty e2e: autonomous stream cadence recovers after history rebuild" {
+    if (!supportsForkPty()) return error.SkipZigTest;
+    const zi_bin = envValue("ZI_PTY_E2E_BIN") orelse return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "repo/.zi");
+    try tmp.dir.createDirPath(std.testing.io, "home");
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+
+    const repo_abs = try tmpAbsPath(std.testing.allocator, &tmp, "repo");
+    defer std.testing.allocator.free(repo_abs);
+    const home_abs = try tmpAbsPath(std.testing.allocator, &tmp, "home");
+    defer std.testing.allocator.free(home_abs);
+    const agent_abs = try tmpAbsPath(std.testing.allocator, &tmp, "agent");
+    defer std.testing.allocator.free(agent_abs);
+    const trace_abs = try tmpAbsPath(std.testing.allocator, &tmp, "cadence-trace.log");
+    defer std.testing.allocator.free(trace_abs);
+
+    const home_env = try std.fmt.allocPrint(std.testing.allocator, "HOME={s}", .{home_abs});
+    defer std.testing.allocator.free(home_env);
+    const agent_env = try std.fmt.allocPrint(std.testing.allocator, "ZI_CODING_AGENT_DIR={s}", .{agent_abs});
+    defer std.testing.allocator.free(agent_env);
+    const trace_env = try std.fmt.allocPrint(std.testing.allocator, "ZI_TUI_TRACE_FILE={s}", .{trace_abs});
+    defer std.testing.allocator.free(trace_env);
+
+    const env = [_][]const u8{
+        "TERM=xterm-256color",
+        "NO_COLOR=1",
+        "ZI_TUI_SYNTHETIC_ITEMS=500",
+        "ZI_TUI_SYNTHETIC_FLOOD=1",
+        home_env,
+        agent_env,
+        trace_env,
+    };
+    const actions = [_]Action{
+        .{ .after_ms = 2_500, .bytes = "\x03" },
+        .{ .after_ms = 2_700, .bytes = "\x03" },
+    };
+    var result = try runScripted(std.testing.allocator, .{
+        .argv = &.{zi_bin},
+        .env = &env,
+        .cwd = repo_abs,
+        .rows = 24,
+        .cols = 100,
+        .timeout_ms = 6_000,
+        .max_output_bytes = 512 * 1024,
+    }, &actions);
+    defer result.deinit(std.testing.allocator);
+
+    if (result.timed_out or !exitedZero(result.status)) {
+        std.debug.print(
+            "autonomous cadence e2e failed, status={d}\n--- output ---\n{s}\n--- end output ---\n",
+            .{ result.status, result.output },
+        );
+        return error.TestUnexpectedResult;
+    }
+    const report = try readTrace(std.testing.allocator, trace_abs);
+    defer std.testing.allocator.free(report);
+    try expectAutonomousCadenceTrace(report);
 }
 
 test "pty e2e: P3 viewport rebuild and resize storm" {

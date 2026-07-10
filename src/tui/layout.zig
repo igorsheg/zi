@@ -20,18 +20,52 @@ pub fn wrapMarkdown(
     var out = std.ArrayList(Line).empty;
     errdefer out.deinit(allocator);
     try out.ensureTotalCapacity(allocator, estimatedLineCapacity(text, width));
-    var md_state: markdown.MdState = .{};
-    var start: usize = 0;
-    while (start <= text.len) {
-        const end = std.mem.indexOfScalarPos(u8, text, start, '\n') orelse text.len;
-        try wrapPhysicalMarkdownLine(allocator, &out, text[start..end], width, base, &md_state);
-        if (end == text.len) break;
-        start = end + 1;
-    }
-    state.committed_bytes = text.len;
-    state.committed_lines = out.items.len;
-    state.md = md_state;
+    try appendMarkdown(allocator, &out, text, width, base, state);
     return out.toOwnedSlice(allocator);
+}
+
+pub fn appendMarkdown(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayList(Line),
+    text: []const u8,
+    width: u16,
+    base: screen.Style,
+    state: *WrapState,
+) !void {
+    std.debug.assert(state.committed_bytes <= text.len);
+    std.debug.assert(out.items.len == state.committed_lines);
+
+    var start = state.committed_bytes;
+    while (std.mem.indexOfScalarPos(u8, text, start, '\n')) |end| {
+        try wrapPhysicalMarkdownLine(allocator, out, text[start..end], width, base, &state.md);
+        start = end + 1;
+        state.committed_bytes = start;
+        state.committed_lines = out.items.len;
+    }
+
+    var tail_state = state.md;
+    const tail = text[start..];
+    if (tail.len == 0) {
+        try out.append(allocator, .{});
+        return;
+    }
+    if (hasMarkdownSyntax(tail)) {
+        try wrapPhysicalMarkdownLine(allocator, out, tail, width, base, &tail_state);
+        return;
+    }
+
+    var tail_start: usize = 0;
+    while (tail_start < tail.len) {
+        const tail_end = sliceEndForWidth(tail, tail_start, width);
+        var line: Line = .{};
+        try markdown.renderLine(&tail_state, &line, tail[tail_start..tail_end], base);
+        try out.append(allocator, line);
+        tail_start = tail_end;
+        if (tail_start < tail.len) {
+            state.committed_bytes = start + tail_start;
+            state.committed_lines = out.items.len;
+        }
+    }
 }
 
 pub fn wrapPlain(allocator: std.mem.Allocator, text: []const u8, width: u16, style: screen.Style) ![]Line {
@@ -60,7 +94,7 @@ fn wrapPhysicalMarkdownLine(
         try out.append(allocator, .{});
         return;
     }
-    if (!hasMarkdownSyntax(text)) return appendPlainLine(allocator, out, text, width, base);
+    if (state.fence == null and !hasMarkdownSyntax(text)) return appendPlainLine(allocator, out, text, width, base);
     var start: usize = 0;
     while (start < text.len) {
         const end = sliceEndForWidth(text, start, width);
@@ -154,7 +188,35 @@ test "markdown wrap applies block style" {
     const lines = try wrapMarkdown(std.testing.allocator, "# title", 80, screen.text.normal, &state);
     defer std.testing.allocator.free(lines);
     try std.testing.expect(lines[0].spans()[0].style.bold);
-    try std.testing.expectEqual(@as(usize, "# title".len), state.committed_bytes);
+    try std.testing.expectEqual(@as(usize, 0), state.committed_bytes);
+}
+
+test "markdown wrapping preserves fenced code style on plain body lines" {
+    var state: WrapState = .{};
+    const lines = try wrapMarkdown(
+        std.testing.allocator,
+        "```zig\nconst value = 1;\n```",
+        80,
+        screen.text.normal,
+        &state,
+    );
+    defer std.testing.allocator.free(lines);
+    try std.testing.expect(std.meta.eql(lines[1].spans()[0].style.fg, screen.markdown_styles.code_block.fg));
+}
+
+test "incremental markdown keeps committed physical lines and plain wraps" {
+    var lines = std.ArrayList(Line).empty;
+    defer lines.deinit(std.testing.allocator);
+    var state: WrapState = .{};
+
+    try appendMarkdown(std.testing.allocator, &lines, "one\nabcdefghij", 4, screen.text.normal, &state);
+    try std.testing.expectEqual(@as(usize, "one\nabcdefgh".len), state.committed_bytes);
+    try std.testing.expectEqual(@as(usize, 3), state.committed_lines);
+    lines.items.len = state.committed_lines;
+
+    try appendMarkdown(std.testing.allocator, &lines, "one\nabcdefghijkl", 4, screen.text.normal, &state);
+    var buffer: [8]u8 = undefined;
+    try std.testing.expectEqualStrings("ijkl", lines.items[3].copyText(&buffer));
 }
 
 test {

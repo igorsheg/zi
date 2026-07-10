@@ -192,10 +192,20 @@ pub fn setTitle(self: *Terminal, title: []const u8) !void {
     try vx.setTitle(tty.writer(), title);
 }
 
-pub fn paint(self: *Terminal, frame: screen_mod.Frame) !void {
+pub fn paintCells(self: *Terminal, frame: screen_mod.Frame) !void {
+    const vx = if (self.vx) |*vx| vx else return error.TerminalNotInitialized;
+    self.screen.paint(vx, frame);
+}
+
+pub fn flush(self: *Terminal) !void {
     const tty = if (self.tty) |*tty| tty else return error.TerminalNotInitialized;
     const vx = if (self.vx) |*vx| vx else return error.TerminalNotInitialized;
-    try self.screen.paint(vx, tty.writer(), frame);
+    try vx.render(tty.writer());
+}
+
+pub fn paint(self: *Terminal, frame: screen_mod.Frame) !void {
+    try self.paintCells(frame);
+    try self.flush();
 }
 
 test "terminal wrapper paints a frame into vaxis screen" {

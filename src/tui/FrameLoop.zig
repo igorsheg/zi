@@ -108,7 +108,7 @@ fn nextTimeout(runner: anytype, io: std.Io) std.Io.Timeout {
     const now_ns = nowNs(io);
     var deadline_ns: ?u64 = null;
     if (runner.loop.dirty) {
-        deadline_ns = render_policy.nextRenderDueNsWithFloor(runner.loop.last_flush_ns, runner.loop.trace.renders.max_ns, loop_mod.frame_floor_ns);
+        deadline_ns = render_policy.nextRenderDueNsWithFloor(runner.loop.last_frame_start_ns, loop_mod.frame_floor_ns);
     }
     const RunnerType = @TypeOf(runner.*);
     const timer_deadline = if (@hasDecl(RunnerType, "nextTimerDeadlineNs"))
@@ -118,10 +118,10 @@ fn nextTimeout(runner: anytype, io: std.Io) std.Io.Timeout {
     if (timer_deadline) |timer_deadline_ns| {
         deadline_ns = if (deadline_ns) |current| @min(current, timer_deadline_ns) else timer_deadline_ns;
     }
-    // InputPump is a raw thread and does not call WakeEvent.set; cap every wait
-    // below the frame floor so input/resize are observed before UI timers expire.
-    const input_poll_ns = @max(@as(u64, 1), loop_mod.frame_floor_ns / 2);
-    const idle_due_ns = now_ns +| input_poll_ns;
+    // InputPump wakes this owner after publishing bytes. Keep one bounded poll
+    // for out-of-band terminal resizes that do not arrive through the input pipe.
+    const resize_poll_ns = loop_mod.frame_floor_ns * 2;
+    const idle_due_ns = now_ns +| resize_poll_ns;
     const due_ns = if (deadline_ns) |deadline| @min(deadline, idle_due_ns) else idle_due_ns;
     return .{ .duration = .{
         .raw = .fromNanoseconds(@intCast(due_ns -| now_ns)),

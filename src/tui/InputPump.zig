@@ -81,26 +81,30 @@ pub const InputPump = struct {
     io: std.Io = undefined,
     source_context: ?*anyopaque = null,
     read_fn: ?ReadFn = null,
+    wake: ?*runtime.WakeEvent = null,
 
     pub const StartOptions = struct {
         io: std.Io,
         source_context: *anyopaque,
         read_fn: ReadFn,
+        wake: ?*runtime.WakeEvent = null,
     };
 
     pub fn start(self: *InputPump, options: StartOptions) !void {
         self.io = options.io;
         self.source_context = options.source_context;
         self.read_fn = options.read_fn;
+        self.wake = options.wake;
         self.stop.store(false, .release);
         self.thread = try std.Thread.spawn(.{}, run, .{self});
     }
 
-    pub fn startTerminal(self: *InputPump, io: std.Io, terminal: *Terminal) !void {
+    pub fn startTerminal(self: *InputPump, io: std.Io, terminal: *Terminal, wake: *runtime.WakeEvent) !void {
         try self.start(.{
             .io = io,
             .source_context = terminal,
             .read_fn = terminalRead,
+            .wake = wake,
         });
     }
 
@@ -153,6 +157,7 @@ pub const InputPump = struct {
     pub fn pushBatch(self: *InputPump, bytes: []const u8, read_ns: u64) bool {
         if (bytes.len > self.ring.available()) {
             _ = self.dropped_bytes.fetchAdd(bytes.len, .monotonic);
+            if (self.wake) |wake| wake.set(self.io);
             return false;
         }
         const batch_start = self.ring.tail.load(.monotonic);
@@ -160,6 +165,7 @@ pub const InputPump = struct {
         self.stamps.push(.{ .ring_pos = batch_start, .read_ns = read_ns, .byte_count = bytes.len }) catch {
             _ = self.dropped_stamps.fetchAdd(1, .monotonic);
         };
+        if (self.wake) |wake| wake.set(self.io);
         return true;
     }
 
@@ -290,18 +296,18 @@ test "input pump thread reads source into ring" {
     const io = threaded.io();
 
     var source: FakeSource = .{ .bytes = "abc" };
+    var wake: runtime.WakeEvent = .init;
     var pump: InputPump = .{};
     try pump.start(.{
         .io = io,
         .source_context = &source,
         .read_fn = FakeSource.read,
+        .wake = &wake,
     });
     defer pump.join();
 
-    const wait_start_ns = InputPump.nowNs(io);
-    while (pump.pendingByteCount() == 0 and InputPump.nowNs(io) -| wait_start_ns < std.time.ns_per_s) {
-        runtime.sleep(io, .fromMilliseconds(1)) catch break;
-    }
+    try wake.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(1), .clock = .awake } });
+    wake.reset();
     pump.requestStop();
     try std.testing.expect(pump.pendingByteCount() > 0);
 

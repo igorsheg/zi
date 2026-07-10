@@ -388,7 +388,7 @@ pub fn render(self: *Vaxis, tty: *std.Io.Writer) !void {
         (self.screen.cursor.row != self.state.cursor.row or
             self.screen.cursor.col != self.state.cursor.col);
     const cursor_secondary_changed = self.screen.cursor_vis and
-        std.meta.eql(self.screen.cursor_secondary, self.state.cursor_secondary);
+        !std.meta.eql(self.screen.cursor_secondary, self.state.cursor_secondary);
     const needs_render = self.refresh or
         cursor_vis_changed or
         cursor_shape_changed or
@@ -1505,6 +1505,26 @@ pub fn setTerminalWorkingDirectory(_: *Vaxis, tty: *std.Io.Writer, path: []const
     };
     try tty.print(ctlseqs.osc7, .{uri.fmt(.{ .scheme = true, .authority = true, .path = true })});
     try tty.flush();
+}
+
+test "render: visible cursor emits no output when unchanged" {
+    const io = std.testing.io;
+    var env_map = try std.testing.environ.createMap(std.testing.allocator);
+    defer env_map.deinit();
+    var vx = try Vaxis.init(io, std.testing.allocator, &env_map, .{});
+    var deinit_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer deinit_writer.deinit();
+    defer vx.deinit(std.testing.allocator, &deinit_writer.writer);
+
+    vx.screen.cursor_vis = true;
+    var first_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer first_writer.deinit();
+    try vx.render(&first_writer.writer);
+
+    var unchanged_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer unchanged_writer.deinit();
+    try vx.render(&unchanged_writer.writer);
+    try std.testing.expectEqual(@as(usize, 0), unchanged_writer.written().len);
 }
 
 test "render: no output when no changes" {

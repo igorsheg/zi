@@ -35,7 +35,6 @@ pub const frame_floor_ns: u64 = 16 * std.time.ns_per_ms;
 pub const watchdog_budget_ns: u64 = 33 * std.time.ns_per_ms;
 pub const double_key_window_ns: u64 = 500 * std.time.ns_per_ms;
 pub const spinner_interval_ns: u64 = 80 * std.time.ns_per_ms;
-pub const elapsed_tick_ns: u64 = std.time.ns_per_s;
 const retry_status_tick_ns: u64 = std.time.ns_per_s;
 pub const shutdown_cancel_bound_ns: u64 = 5 * std.time.ns_per_s;
 const exit_hint_text = "press ctrl+c again to exit";
@@ -98,11 +97,6 @@ pub const Viewport = union(enum) {
         line_in_item: u32,
         lines_below_seen: u32,
     };
-};
-
-const LineRef = struct {
-    item_index: usize,
-    line_in_item: usize,
 };
 
 const prompt_image_count_max: usize = 4;
@@ -703,16 +697,15 @@ pub const Loop = struct {
     submitted_prompt: ?SubmittedPrompt = null,
     exit_requested: bool = false,
     dirty: bool = true,
-    last_flush_ns: u64 = 0,
+    last_frame_start_ns: u64 = 0,
+    last_animated_frame_start_ns: ?u64 = null,
     ctrl_c_deadline_ns: ?u64 = null,
     exit_hint_visible: bool = false,
     scratch: Scratch = .{},
     synthetic_flood: SyntheticFlood = .{},
     frame_input_bytes: usize = 0,
     frame_events_applied: usize = 0,
-    layout_epoch: theme.LayoutEpoch = .{ .width = 0, .height = 0 },
-    last_width: u16 = 0,
-    last_height: u16 = 0,
+    layout_state: theme.LayoutState = .{ .width = 0, .height = 0 },
     driver: RunDriver = .{},
     session: ?*coding_agent.AgentSession = null,
     persist_new_sessions: bool = true,
@@ -721,12 +714,9 @@ pub const Loop = struct {
     viewport: Viewport = .follow,
     pending_scroll_lines: i32 = 0,
     last_transcript_rows: usize = 0,
-    line_prefix: [Transcript.transcript_items_max + 1]usize = undefined,
-    line_item_count: usize = 0,
     transcript_line_buffer: [screen.row_capacity]screen.Line = undefined,
     viewport_hint_buffer: [viewport_hint_buffer_len]u8 = undefined,
     viewport_hint: []const u8 = "",
-    pending_rebuild_revision: ?u64 = null,
     trace_io_ready: bool = false,
     queue_buffers: [4][256]u8 = undefined,
     queue_lines: [4][]const u8 = undefined,
@@ -829,7 +819,7 @@ pub const Loop = struct {
         };
         self.refreshTokenCache();
         self.repinViewport();
-        self.markLayoutRebuild();
+        self.dirty = true;
         self.pending_title_update = true;
     }
 
@@ -991,10 +981,14 @@ pub const Loop = struct {
     }
 
     pub fn composeFrameAt(self: *Loop, width: u16, height: u16, now_ns: u64) anyerror!screen.Frame {
-        self.noteResize(width, height);
+        _ = self.noteResize(width, height);
         self.refreshTokenCache();
-        const rebuilt = try self.rebuildLineIndex(width);
-        if (rebuilt) self.clampViewportAfterRebuild();
+        const rebuild_start_ns = traceNowNs();
+        const layout_result = try self.transcript.prepareLayout(self.layout_state);
+        if (layout_result == .published) {
+            self.trace.recordRebuild(traceNowNs() -| rebuild_start_ns);
+            self.clampViewportAfterRebuild();
+        }
 
         const queue_lines = self.collectQueueLines();
         const status = self.statusView(now_ns);
@@ -1014,6 +1008,13 @@ pub const Loop = struct {
         transcript_rows = chrome.transcriptRowCapacityWithChrome(&self.editor, picker_view != null, queue_lines.len, self.viewport_hint.len, popup_rows, status_visible, width, height);
         const transcript_lines = self.collectTranscriptLines(transcript_rows);
         self.last_transcript_rows = transcript_rows;
+        const layout_work = self.transcript.lastLayoutWork();
+        self.trace.recordLayoutWork(
+            layout_work.items_laid_out,
+            layout_work.source_bytes,
+            layout_work.index_entries_repaired,
+            layout_work.lines_materialized,
+        );
 
         return chrome.compose(.{
             .status = status,
@@ -1034,63 +1035,90 @@ pub const Loop = struct {
         return render_policy.shouldRenderWithFloor(
             self.dirty,
             now_ns,
-            self.last_flush_ns,
-            self.trace.renders.max_ns,
+            self.last_frame_start_ns,
             frame_floor_ns,
         );
     }
 
     fn statusAnimationDue(self: *const Loop, now_ns: u64) bool {
+        if (self.transcript.hasPendingRelayout()) {
+            return render_policy.shouldRenderWithFloor(
+                true,
+                now_ns,
+                self.last_frame_start_ns,
+                frame_floor_ns,
+            );
+        }
         if (self.statusAnimated()) {
             return render_policy.shouldRenderWithFloor(
                 true,
                 now_ns,
-                self.last_flush_ns,
-                self.trace.renders.max_ns,
+                self.last_frame_start_ns,
                 frame_floor_ns,
             );
         }
-        if (self.driver.state == .retry_wait) return now_ns -| self.last_flush_ns >= retry_status_tick_ns;
+        if (self.driver.state == .retry_wait) return now_ns -| self.last_frame_start_ns >= retry_status_tick_ns;
         return false;
     }
 
     pub fn nextTimerDeadlineNs(self: *const Loop) ?u64 {
         var deadline = self.ctrl_c_deadline_ns;
         if (self.driver.retry) |retry| deadline = if (deadline) |current| @min(current, retry.deadline_ns) else retry.deadline_ns;
-        if (self.statusAnimated()) {
-            const animation_due = render_policy.nextRenderDueNsWithFloor(self.last_flush_ns, self.trace.renders.max_ns, frame_floor_ns);
+        if (self.statusAnimated() or self.transcript.hasPendingRelayout()) {
+            const animation_due = render_policy.nextRenderDueNsWithFloor(self.last_frame_start_ns, frame_floor_ns);
             deadline = if (deadline) |current| @min(current, animation_due) else animation_due;
         } else if (self.driver.state == .retry_wait) {
-            const retry_status_due = self.last_flush_ns +| retry_status_tick_ns;
+            const retry_status_due = self.last_frame_start_ns +| retry_status_tick_ns;
             deadline = if (deadline) |current| @min(current, retry_status_due) else retry_status_due;
         }
         if (self.synthetic_flood.enabled and !self.synthetic_flood.completed) {
-            const flood_due = self.last_flush_ns +| frame_floor_ns;
+            const flood_due = self.last_frame_start_ns +| frame_floor_ns;
             deadline = if (deadline) |current| @min(current, flood_due) else flood_due;
         }
         return deadline;
     }
 
-    pub fn noteResize(self: *Loop, width: u16, height: u16) void {
-        if (self.last_width == width and self.last_height == height) return;
-        const had_width = self.last_width != 0;
-        const old_revision = self.layout_epoch.revision;
-        const changed = self.layout_epoch.resize(width, height);
-        self.last_width = width;
-        self.last_height = height;
-        if (had_width and changed and self.layout_epoch.revision != old_revision) self.markLayoutRebuild();
+    pub fn noteResize(self: *Loop, width: u16, height: u16) bool {
+        if (!self.layout_state.resize(width, height)) return false;
         self.dirty = true;
+        return true;
     }
 
-    pub fn markRendered(self: *Loop, now_ns: u64, render_cost_ns: u64) void {
-        self.last_flush_ns = now_ns;
-        self.trace.recordRender(render_cost_ns);
+    pub const RenderTimings = struct {
+        apply_ns: u64 = 0,
+        layout_ns: u64 = 0,
+        paint_ns: u64 = 0,
+        flush_ns: u64 = 0,
+
+        fn renderNs(self: RenderTimings) u64 {
+            return self.layout_ns +| self.paint_ns +| self.flush_ns;
+        }
+    };
+
+    pub fn markRendered(self: *Loop, frame_start_ns: u64, render_cost_ns: u64) void {
+        self.markRenderedWithTimings(frame_start_ns, .{ .paint_ns = render_cost_ns });
+    }
+
+    pub fn markRenderedWithTimings(self: *Loop, frame_start_ns: u64, timings: RenderTimings) void {
+        if (self.statusAnimated()) {
+            if (self.last_animated_frame_start_ns) |previous| {
+                self.trace.recordAnimatedFrameGap(frame_start_ns -| previous, frame_floor_ns);
+            }
+            self.last_animated_frame_start_ns = frame_start_ns;
+        } else {
+            self.last_animated_frame_start_ns = null;
+        }
+        self.last_frame_start_ns = frame_start_ns;
+        self.trace.recordRender(timings.renderNs());
         self.trace.recordTranscriptEvictions(self.transcript.evicted_seqs);
         self.trace.recordFrame(.{
-            .wake_ns = now_ns,
+            .wake_ns = frame_start_ns,
             .input_bytes = self.frame_input_bytes,
             .events_applied = self.frame_events_applied,
-            .paint_us = nsToUs(render_cost_ns),
+            .apply_us = nsToUs(timings.apply_ns),
+            .layout_us = nsToUs(timings.layout_ns),
+            .paint_us = nsToUs(timings.paint_ns),
+            .flush_us = nsToUs(timings.flush_ns),
         });
         self.frame_input_bytes = 0;
         self.frame_events_applied = 0;
@@ -1141,47 +1169,19 @@ pub const Loop = struct {
         try self.notice(failureNoticeLevel(view.tone), text);
     }
 
-    fn rebuildLineIndex(self: *Loop, width: u16) !bool {
-        const rebuild_pending = self.pending_rebuild_revision != null;
-        const start_ns = if (rebuild_pending) traceNowNs() else 0;
-        var total: usize = 0;
-        self.line_prefix[0] = 0;
-        self.line_item_count = self.transcript.items.items.len;
-        for (self.transcript.items.items, 0..) |item, index| {
-            const lines = try self.transcript.itemLines(item, width, self.layout_epoch);
-            total += lines.len;
-            self.line_prefix[index + 1] = total;
-        }
-        if (rebuild_pending) {
-            const elapsed_ns = traceNowNs() -| start_ns;
-            self.trace.recordRebuild(elapsed_ns);
-            self.pending_rebuild_revision = null;
-        }
-        return rebuild_pending;
-    }
-
     fn collectTranscriptLines(self: *Loop, rows: usize) []const screen.Line {
         const visible_rows = @min(rows, self.transcript_line_buffer.len);
         if (visible_rows == 0 or self.totalTranscriptLines() == 0) return &.{};
 
-        var absolute = self.skipLeadingSeparator(self.viewportStart(visible_rows), visible_rows);
-        var count: usize = 0;
-        while (count < visible_rows and absolute < self.totalTranscriptLines()) : (absolute += 1) {
-            const ref = self.lineRefAt(absolute) orelse break;
-            const item = self.transcript.items.items[ref.item_index];
-            self.transcript_line_buffer[count] = item.lines[ref.line_in_item];
-            count += 1;
-        }
-        return self.transcript_line_buffer[0..count];
+        const absolute = self.skipLeadingSeparator(self.viewportStart(visible_rows), visible_rows);
+        return self.transcript.collectVisible(absolute, self.transcript_line_buffer[0..visible_rows]);
     }
 
     fn skipLeadingSeparator(self: *const Loop, start: usize, _: usize) usize {
         var absolute = start;
         const total = self.totalTranscriptLines();
         while (absolute + 1 < total) {
-            const ref = self.lineRefAt(absolute) orelse break;
-            const item = self.transcript.items.items[ref.item_index];
-            const line = item.lines[ref.line_in_item];
+            const line = self.transcript.lineAt(absolute) orelse break;
             if (!isSeparatorLine(line)) break;
             absolute += 1;
         }
@@ -1189,22 +1189,7 @@ pub const Loop = struct {
     }
 
     fn totalTranscriptLines(self: *const Loop) usize {
-        return if (self.line_item_count == 0) 0 else self.line_prefix[self.line_item_count];
-    }
-
-    fn itemLineCount(self: *const Loop, item_index: usize) usize {
-        return self.line_prefix[item_index + 1] - self.line_prefix[item_index];
-    }
-
-    fn lineRefAt(self: *const Loop, absolute: usize) ?LineRef {
-        if (absolute >= self.totalTranscriptLines()) return null;
-        var index: usize = 0;
-        while (index < self.line_item_count) : (index += 1) {
-            if (absolute < self.line_prefix[index + 1]) {
-                return .{ .item_index = index, .line_in_item = absolute - self.line_prefix[index] };
-            }
-        }
-        return null;
+        return self.transcript.totalLines();
     }
 
     fn viewportStart(self: *const Loop, rows: usize) usize {
@@ -1219,13 +1204,11 @@ pub const Loop = struct {
     }
 
     fn anchorAbsolute(self: *const Loop, anchor: Viewport.Anchor) ?usize {
-        for (self.transcript.items.items[0..self.line_item_count], 0..) |item, index| {
-            if (item.seq != anchor.item_seq) continue;
-            const line_count = self.itemLineCount(index);
-            if (line_count == 0) return self.line_prefix[index];
-            return self.line_prefix[index] + self.clampedContentLine(index, @as(usize, anchor.line_in_item));
-        }
-        return null;
+        const resolved = self.transcript.resolvePosition(.{
+            .item_seq = anchor.item_seq,
+            .line_in_item = anchor.line_in_item,
+        }) orelse return null;
+        return resolved.absolute;
     }
 
     fn linesBelow(self: *const Loop, absolute: usize) u32 {
@@ -1242,32 +1225,18 @@ pub const Loop = struct {
         switch (self.viewport) {
             .follow => return,
             .anchored => |*anchor| {
-                for (self.transcript.items.items[0..self.line_item_count], 0..) |item, index| {
-                    if (item.seq != anchor.item_seq) continue;
-                    const line_count = self.itemLineCount(index);
-                    if (line_count == 0) {
-                        anchor.line_in_item = 0;
-                        anchor.lines_below_seen = 0;
-                        return;
-                    }
-                    const clamped_line = self.clampedContentLine(index, @as(usize, anchor.line_in_item));
-                    const changed = clamped_line != @as(usize, anchor.line_in_item);
-                    anchor.line_in_item = @intCast(clamped_line);
-                    if (reset_seen or changed) anchor.lines_below_seen = self.linesBelow(self.line_prefix[index] + clamped_line);
+                const resolved = self.transcript.resolvePosition(.{
+                    .item_seq = anchor.item_seq,
+                    .line_in_item = anchor.line_in_item,
+                }) orelse {
+                    self.anchorOldestLiveLine();
                     return;
-                }
-                self.anchorOldestLiveLine();
+                };
+                const changed = resolved.position.line_in_item != anchor.line_in_item;
+                anchor.line_in_item = resolved.position.line_in_item;
+                if (reset_seen or changed) anchor.lines_below_seen = self.linesBelow(resolved.absolute);
             },
         }
-    }
-
-    fn clampedContentLine(self: *const Loop, item_index: usize, preferred: usize) usize {
-        const line_count = self.itemLineCount(item_index);
-        if (line_count == 0) return 0;
-        var line_index = @min(preferred, line_count - 1);
-        const item = self.transcript.items.items[item_index];
-        while (line_index > 0 and isSeparatorLine(item.lines[line_index])) line_index -= 1;
-        return line_index;
     }
 
     fn isSeparatorLine(line: screen.Line) bool {
@@ -1275,28 +1244,26 @@ pub const Loop = struct {
     }
 
     fn anchorOldestLiveLine(self: *Loop) void {
-        if (self.line_item_count == 0 or self.totalTranscriptLines() == 0) {
+        const oldest = self.transcript.oldestPosition() orelse {
             self.viewport = .follow;
             return;
-        }
-        const item = self.transcript.items.items[0];
+        };
         self.viewport = .{ .anchored = .{
-            .item_seq = item.seq,
-            .line_in_item = 0,
-            .lines_below_seen = self.linesBelow(0),
+            .item_seq = oldest.position.item_seq,
+            .line_in_item = oldest.position.line_in_item,
+            .lines_below_seen = self.linesBelow(oldest.absolute),
         } };
     }
 
     fn setAnchorAtAbsolute(self: *Loop, absolute: usize) void {
-        const ref = self.lineRefAt(absolute) orelse {
+        const resolved = self.transcript.positionAtLine(absolute) orelse {
             self.viewport = .follow;
             return;
         };
-        const item = self.transcript.items.items[ref.item_index];
         self.viewport = .{ .anchored = .{
-            .item_seq = item.seq,
-            .line_in_item = @intCast(ref.line_in_item),
-            .lines_below_seen = self.linesBelow(absolute),
+            .item_seq = resolved.position.item_seq,
+            .line_in_item = resolved.position.line_in_item,
+            .lines_below_seen = self.linesBelow(resolved.absolute),
         } };
     }
 
@@ -1361,18 +1328,12 @@ pub const Loop = struct {
     }
 
     fn toggleExpanded(self: *Loop) void {
-        if (self.layout_epoch.setExpanded(!self.layout_epoch.expanded)) self.markLayoutRebuild();
+        _ = self.layout_state.setExpanded(!self.layout_state.expanded);
         self.dirty = true;
     }
 
     fn setHideThinking(self: *Loop, hidden: bool) void {
-        if (self.layout_epoch.setHideThinking(hidden)) self.markLayoutRebuild();
-        self.dirty = true;
-    }
-
-    fn markLayoutRebuild(self: *Loop) void {
-        self.transcript.markAllDirty();
-        self.pending_rebuild_revision = self.layout_epoch.revision;
+        _ = self.layout_state.setHideThinking(hidden);
         self.dirty = true;
     }
 
@@ -2942,6 +2903,24 @@ test "loop composes frame and clears dirty only after render success" {
     try std.testing.expectEqual(@as(usize, 1), loop.trace.renders.count);
 }
 
+test "loop keeps input foreground while transcript relayout is pending" {
+    var loop = try Loop.init(std.testing.allocator, null);
+    defer loop.deinit();
+    try loop.seedSyntheticItems(Transcript.transcript_items_max);
+
+    _ = try loop.composeFrame(80, 10);
+    try std.testing.expect(loop.transcript.hasPendingRelayout());
+    try std.testing.expect(
+        loop.transcript.lastLayoutWork().items_laid_out <= Transcript.relayout_items_per_prepare,
+    );
+
+    try loop.dispatch(.{ .insert = "x" });
+    const frame = try loop.composeFrame(80, 10);
+    try std.testing.expectEqualStrings("x", loop.editor.text());
+    try expectFrameContains(&frame, "x");
+    try std.testing.expect(loop.transcript.hasPendingRelayout());
+}
+
 test "loop viewport anchors while appended lines arrive" {
     var loop = try Loop.init(std.testing.allocator, null);
     defer loop.deinit();
@@ -2965,7 +2944,11 @@ test "loop viewport clamps to oldest live item after eviction" {
     var loop = try Loop.init(std.testing.allocator, null);
     defer loop.deinit();
     try loop.seedSyntheticItems(Transcript.transcript_items_max);
-    _ = try loop.composeFrame(80, 8);
+    for (0..Transcript.transcript_items_max / Transcript.relayout_items_per_prepare + 1) |_| {
+        _ = try loop.composeFrame(80, 8);
+        if (!loop.transcript.hasPendingRelayout()) break;
+    }
+    try std.testing.expect(!loop.transcript.hasPendingRelayout());
 
     try loop.dispatch(.{ .scroll = -100_000 });
     _ = try loop.composeFrame(80, 8);
@@ -3306,14 +3289,14 @@ test "loop working status uses shimmer effect" {
     try std.testing.expect(frame.rows()[1].spans().len > 1);
 }
 
-test "loop shimmer status renders on animation cadence without dirty" {
+test "loop shimmer cadence recovers immediately after a slow frame" {
     var loop = try Loop.init(std.testing.allocator, null);
     defer loop.deinit();
     loop.transcript.run_active = true;
-    loop.markRendered(frame_floor_ns, 10 * std.time.ns_per_ms);
+    loop.markRendered(frame_floor_ns, 50 * std.time.ns_per_ms);
     loop.dirty = false;
 
-    const due = frame_floor_ns + 30 * std.time.ns_per_ms;
+    const due = frame_floor_ns * 2;
     try std.testing.expectEqual(@as(?u64, due), loop.nextTimerDeadlineNs());
     try std.testing.expect(!loop.shouldRender(due - 1));
     try std.testing.expect(loop.shouldRender(due));
@@ -3332,16 +3315,17 @@ test "loop retry status redraws on countdown cadence without dirty" {
     try std.testing.expect(loop.shouldRender(retry_status_tick_ns));
 }
 
-test "loop render timing honors dirty policy" {
+test "loop dirty cadence is independent of historical render cost" {
     var loop = try Loop.init(std.testing.allocator, null);
     defer loop.deinit();
     try std.testing.expect(!loop.shouldRender(frame_floor_ns - 1));
     try std.testing.expect(loop.shouldRender(frame_floor_ns));
 
-    loop.markRendered(frame_floor_ns, 10 * std.time.ns_per_ms);
+    loop.markRendered(frame_floor_ns, 50 * std.time.ns_per_ms);
     loop.dirty = true;
-    try std.testing.expect(!loop.shouldRender(frame_floor_ns + 29 * std.time.ns_per_ms));
-    try std.testing.expect(loop.shouldRender(frame_floor_ns + 30 * std.time.ns_per_ms));
+    try std.testing.expect(!loop.shouldRender(frame_floor_ns * 2 - 1));
+    try std.testing.expect(loop.shouldRender(frame_floor_ns * 2));
+    try std.testing.expectEqual(@as(u64, 50 * std.time.ns_per_ms), loop.trace.renders.max_ns);
 }
 
 test "loop ctrl-c hint expires on timer tick" {
@@ -3362,12 +3346,34 @@ test "loop records frame input and event counts on render" {
     defer loop.deinit();
     loop.recordInputBytes(3);
     try loop.dispatch(.{ .insert = "abc" });
-    loop.markRendered(frame_floor_ns, 2 * std.time.ns_per_us);
+    loop.markRenderedWithTimings(frame_floor_ns, .{
+        .apply_ns = std.time.ns_per_us,
+        .layout_ns = 2 * std.time.ns_per_us,
+        .paint_ns = 3 * std.time.ns_per_us,
+        .flush_ns = 4 * std.time.ns_per_us,
+    });
 
     const record = loop.trace.frames.newest().?;
     try std.testing.expectEqual(@as(usize, 3), record.input_bytes);
     try std.testing.expectEqual(@as(usize, 1), record.events_applied);
-    try std.testing.expectEqual(@as(u64, 2), record.paint_us);
+    try std.testing.expectEqual(@as(u64, 1), record.apply_us);
+    try std.testing.expectEqual(@as(u64, 2), record.layout_us);
+    try std.testing.expectEqual(@as(u64, 3), record.paint_us);
+    try std.testing.expectEqual(@as(u64, 4), record.flush_us);
+    try std.testing.expectEqual(@as(u64, 9 * std.time.ns_per_us), loop.trace.renders.max_ns);
+}
+
+test "loop traces animated frame gaps and full-target misses" {
+    var loop = try Loop.init(std.testing.allocator, null);
+    defer loop.deinit();
+    loop.transcript.run_active = true;
+
+    loop.markRendered(frame_floor_ns, 0);
+    loop.markRendered(frame_floor_ns * 2, 0);
+    loop.markRendered(frame_floor_ns * 5, 0);
+
+    try std.testing.expectEqual(@as(usize, 2), loop.trace.animated_frame_gaps.count);
+    try std.testing.expectEqual(@as(usize, 1), loop.trace.animated_deadline_misses);
 }
 
 test "loop synthetic flood feeds real transcript events at one megabyte per second" {
@@ -3790,7 +3796,7 @@ test "loop P4 settings thinking visibility persists through services" {
     try std.testing.expect(!loop.picker.active);
     try std.testing.expectEqualStrings("", loop.editor.text());
     try std.testing.expect(!session.hide_thinking);
-    try std.testing.expect(!loop.layout_epoch.hide_thinking);
+    try std.testing.expect(!loop.layout_state.hide_thinking);
     try std.testing.expectEqual(false, services.settings_manager.current().global.loaded.value.hide_thinking_block.?);
 }
 

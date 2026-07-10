@@ -3,7 +3,6 @@ const agent_mod = @import("../agent/root.zig");
 const ai = @import("../ai/root.zig");
 const runtime = @import("../runtime/root.zig");
 const blocks = @import("blocks.zig");
-const glyphs = @import("glyphs.zig");
 const layout = @import("layout.zig");
 const screen = @import("screen.zig");
 const theme = @import("theme.zig");
@@ -12,6 +11,8 @@ pub const append_chunk_bytes_max: usize = 8 * 1024;
 pub const per_item_text_bytes_max: usize = 256 * 1024;
 pub const transcript_items_max: usize = 2000;
 pub const transcript_bytes_max: usize = 8 * 1024 * 1024;
+pub const relayout_items_per_prepare: usize = 128;
+pub const relayout_source_bytes_per_prepare: usize = 256 * 1024;
 const output_truncated_text = "[output truncated]";
 const transcript_padding_x: usize = 1;
 const user_padding_y: usize = 1;
@@ -29,6 +30,7 @@ next_seq: u64 = 0,
 evicted_seqs: u64 = 0,
 run_active: bool = false,
 tool_resolver: ToolResolver = .{},
+derived: DerivedLayout = .{},
 
 pub const ToolArgs = union(enum) {
     value: std.json.Value,
@@ -70,9 +72,9 @@ pub const ToolResolver = struct {
     }
 };
 
-pub const PartTag = enum { text, thinking };
+const PartTag = enum { text, thinking };
 
-pub const Part = union(PartTag) {
+const Part = union(PartTag) {
     text: std.ArrayList(u8),
     thinking: std.ArrayList(u8),
 
@@ -98,18 +100,93 @@ pub const Part = union(PartTag) {
     }
 };
 
-pub const Stop = enum { ok, aborted, errored };
+const Stop = enum { ok, aborted, errored };
 pub const NoticeLevel = enum { info, warn, err };
 
-pub const Item = struct {
+const LayoutKey = struct {
+    width: u16,
+    expanded: bool,
+    hide_thinking: bool,
+
+    fn from(state: theme.LayoutState) LayoutKey {
+        return .{
+            .width = state.width,
+            .expanded = state.expanded,
+            .hide_thinking = state.hide_thinking,
+        };
+    }
+};
+
+const LayoutInvalidation = enum {
+    clean,
+    source_appended,
+    rebuild,
+};
+
+pub const LayoutWork = struct {
+    items_laid_out: usize = 0,
+    source_bytes: usize = 0,
+    index_entries_repaired: usize = 0,
+    lines_materialized: usize = 0,
+
+    fn reset(self: *LayoutWork) void {
+        self.* = .{};
+    }
+};
+
+const CachedLayout = struct {
     arena: std.heap.ArenaAllocator,
-    layout_arena: std.heap.ArenaAllocator,
-    seq: u64,
-    dirty: bool = true,
-    cached_width: u16 = 0,
-    cached_epoch: u64 = 0,
+    key: ?LayoutKey = null,
+    content_generation: u64 = 0,
     lines: []layout.Line = &.{},
+    incremental_lines: std.ArrayList(layout.Line) = .empty,
+    incremental_part_index: ?usize = null,
+    incremental_source_len: usize = 0,
     wrap: layout.WrapState = .{},
+};
+
+const ItemLayout = struct {
+    invalidation: LayoutInvalidation = .rebuild,
+    active: CachedLayout,
+    pending: ?*CachedLayout = null,
+};
+
+pub const Position = struct {
+    item_seq: u64,
+    line_in_item: u32,
+};
+
+pub const ResolvedPosition = struct {
+    position: Position,
+    absolute: usize,
+};
+
+pub const PrepareResult = enum {
+    ready,
+    published,
+    pending,
+};
+
+const RelayoutJob = struct {
+    key: LayoutKey,
+    next_item: usize = 0,
+};
+
+const DerivedLayout = struct {
+    key: ?LayoutKey = null,
+    first_invalid_item: ?usize = null,
+    line_prefix: [transcript_items_max + 1]usize = undefined,
+    item_count: usize = 0,
+    work: LayoutWork = .{},
+    relayout: ?RelayoutJob = null,
+};
+
+const Item = struct {
+    arena: std.heap.ArenaAllocator,
+    seq: u64,
+    index: usize = std.math.maxInt(usize),
+    content_generation: u64 = 0,
+    layout_cache: ItemLayout,
     kind: Kind,
 
     pub const Kind = union(enum) {
@@ -147,10 +224,6 @@ pub const Item = struct {
     fn allocator(self: *Item) std.mem.Allocator {
         return self.arena.allocator();
     }
-
-    fn layoutAllocator(self: *Item) std.mem.Allocator {
-        return self.layout_arena.allocator();
-    }
 };
 
 pub fn init(gpa: std.mem.Allocator) Transcript {
@@ -177,6 +250,7 @@ pub fn clear(self: *Transcript) void {
     self.next_seq = 0;
     self.evicted_seqs = 0;
     self.run_active = false;
+    self.derived = .{};
 }
 
 pub fn applyListener(io: std.Io, context: ?*anyopaque, event: agent_mod.AgentEvent, _: runtime.CancelToken) anyerror!void {
@@ -228,51 +302,453 @@ pub fn appendCompaction(self: *Transcript, summary: []const u8, tokens_before: u
 pub fn markRunningToolsDirty(self: *Transcript, now_ns: u64) bool {
     var changed = false;
     for (self.live_tools.values()) |item| {
-        if (item.kind == .tool and item.kind.tool.status == .running) {
-            if (item.kind.tool.started_ns) |started| item.kind.tool.elapsed_ms = (now_ns -| started) / std.time.ns_per_ms;
-            item.dirty = true;
-            changed = true;
-        }
+        if (item.kind != .tool or item.kind.tool.status != .running or !item.kind.tool.display.shows_duration) continue;
+        const started = item.kind.tool.started_ns orelse continue;
+        const elapsed_ms = (now_ns -| started) / std.time.ns_per_ms;
+        const previous_ms = item.kind.tool.elapsed_ms orelse 0;
+        item.kind.tool.elapsed_ms = elapsed_ms;
+        if (elapsed_ms / blocks.duration_tick_ms == previous_ms / blocks.duration_tick_ms) continue;
+        self.invalidateItem(item, .rebuild);
+        changed = true;
     }
     return changed;
 }
 
-pub fn markAllDirty(self: *Transcript) void {
-    for (self.items.items) |item| item.dirty = true;
+pub fn prepareLayout(self: *Transcript, state: theme.LayoutState) !PrepareResult {
+    self.derived.work.reset();
+    const requested_key = LayoutKey.from(state);
+    if (self.derived.key) |active_key| {
+        if (std.meta.eql(active_key, requested_key)) {
+            self.cancelRelayout();
+            try self.repairActiveLayout(active_key);
+            return .ready;
+        }
+        try self.repairActiveLayout(active_key);
+    }
+
+    if (self.derived.relayout == null or !std.meta.eql(self.derived.relayout.?.key, requested_key)) {
+        self.startRelayout(requested_key);
+    }
+    if (try self.advanceRelayout()) return .published;
+    return .pending;
 }
 
-pub fn itemLines(self: *Transcript, item: *Item, width: u16, epoch: theme.LayoutEpoch) ![]const layout.Line {
-    _ = self;
-    const epoch_value = epoch.revision;
-    if (!item.dirty and item.cached_width == width and item.cached_epoch == epoch_value) return item.lines;
-    _ = item.layout_arena.reset(.retain_capacity);
-    item.lines = &.{};
-    const allocator = item.layoutAllocator();
+pub fn hasPendingRelayout(self: *const Transcript) bool {
+    return self.derived.relayout != null;
+}
+
+fn repairActiveLayout(self: *Transcript, key: LayoutKey) !void {
+    const item_count = self.items.items.len;
+    const dirty_from = if (self.derived.first_invalid_item) |index|
+        @min(index, item_count)
+    else if (item_count != self.derived.item_count)
+        @min(item_count, self.derived.item_count)
+    else
+        return;
+
+    var total = if (dirty_from == 0) @as(usize, 0) else self.derived.line_prefix[dirty_from];
+    self.derived.line_prefix[0] = 0;
+    for (self.items.items[dirty_from..], dirty_from..) |item, index| {
+        const lines = try self.layoutActiveItem(item, key);
+        total += lines.len;
+        self.derived.line_prefix[index + 1] = total;
+        self.derived.work.index_entries_repaired += 1;
+    }
+    self.derived.item_count = item_count;
+    self.derived.first_invalid_item = null;
+}
+
+fn startRelayout(self: *Transcript, key: LayoutKey) void {
+    self.discardPendingLayouts();
+    self.derived.relayout = .{ .key = key };
+}
+
+fn cancelRelayout(self: *Transcript) void {
+    if (self.derived.relayout == null) return;
+    self.discardPendingLayouts();
+    self.derived.relayout = null;
+}
+
+fn advanceRelayout(self: *Transcript) !bool {
+    const job = if (self.derived.relayout) |*pending| pending else return false;
+    const bytes_before = self.derived.work.source_bytes;
+    var processed: usize = 0;
+    while (job.next_item < self.items.items.len) {
+        if (processed >= relayout_items_per_prepare) break;
+        if (processed > 0 and
+            self.derived.work.source_bytes -| bytes_before >= relayout_source_bytes_per_prepare)
+        {
+            break;
+        }
+        const item = self.items.items[job.next_item];
+        try self.preparePendingItem(item, job.key);
+        job.next_item += 1;
+        processed += 1;
+    }
+    if (job.next_item < self.items.items.len) return false;
+
+    for (self.items.items) |item| {
+        const pending = item.layout_cache.pending orelse return false;
+        if (pending.content_generation != item.content_generation or !std.meta.eql(pending.key.?, job.key)) {
+            job.next_item = @min(job.next_item, item.index);
+            return false;
+        }
+    }
+    self.publishPendingLayouts(job.key);
+    return true;
+}
+
+fn preparePendingItem(self: *Transcript, item: *Item, key: LayoutKey) !void {
+    if (item.layout_cache.pending) |pending| {
+        if (pending.content_generation == item.content_generation and
+            pending.key != null and
+            std.meta.eql(pending.key.?, key))
+        {
+            return;
+        }
+        self.deinitCachedLayout(pending);
+        self.gpa.destroy(pending);
+        item.layout_cache.pending = null;
+    }
+
+    const pending = try self.gpa.create(CachedLayout);
+    errdefer self.gpa.destroy(pending);
+    pending.* = .{ .arena = std.heap.ArenaAllocator.init(self.gpa) };
+    errdefer self.deinitCachedLayout(pending);
+    if (item.kind == .assistant) {
+        if (assistantIncrementalSource(&item.kind.assistant, key.hide_thinking)) |source| {
+            self.derived.work.items_laid_out += 1;
+            try self.layoutIncrementalAssistant(item, pending, source, key, false);
+        } else {
+            try self.layoutItemFull(item, pending, key);
+        }
+    } else {
+        try self.layoutItemFull(item, pending, key);
+    }
+    pending.content_generation = item.content_generation;
+    item.layout_cache.pending = pending;
+}
+
+fn publishPendingLayouts(self: *Transcript, key: LayoutKey) void {
+    var total: usize = 0;
+    self.derived.line_prefix[0] = 0;
+    for (self.items.items, 0..) |item, index| {
+        const pending = item.layout_cache.pending.?;
+        self.deinitCachedLayout(&item.layout_cache.active);
+        item.layout_cache.active = pending.*;
+        self.gpa.destroy(pending);
+        item.layout_cache.pending = null;
+        item.layout_cache.invalidation = .clean;
+        total += item.layout_cache.active.lines.len;
+        self.derived.line_prefix[index + 1] = total;
+        self.derived.work.index_entries_repaired += 1;
+    }
+    self.derived.item_count = self.items.items.len;
+    self.derived.first_invalid_item = null;
+    self.derived.key = key;
+    self.derived.relayout = null;
+}
+
+fn discardPendingLayouts(self: *Transcript) void {
+    for (self.items.items) |item| {
+        const pending = item.layout_cache.pending orelse continue;
+        self.deinitCachedLayout(pending);
+        self.gpa.destroy(pending);
+        item.layout_cache.pending = null;
+    }
+}
+
+pub fn totalLines(self: *const Transcript) usize {
+    return if (self.derived.item_count == 0) 0 else self.derived.line_prefix[self.derived.item_count];
+}
+
+pub fn collectVisible(self: *Transcript, start: usize, out: []layout.Line) []const layout.Line {
+    if (out.len == 0) return &.{};
+    var ref = self.lineRefAt(start) orelse return &.{};
+    var count: usize = 0;
+    while (count < out.len and ref.item_index < self.derived.item_count) {
+        const lines = self.items.items[ref.item_index].layout_cache.active.lines;
+        if (ref.line_in_item < lines.len) {
+            out[count] = lines[ref.line_in_item];
+            count += 1;
+            ref.line_in_item += 1;
+        }
+        if (ref.line_in_item >= lines.len) {
+            ref.item_index += 1;
+            ref.line_in_item = 0;
+        }
+    }
+    self.derived.work.lines_materialized += count;
+    return out[0..count];
+}
+
+pub fn lineAt(self: *const Transcript, absolute: usize) ?layout.Line {
+    const ref = self.lineRefAt(absolute) orelse return null;
+    return self.items.items[ref.item_index].layout_cache.active.lines[ref.line_in_item];
+}
+
+pub fn positionAtLine(self: *const Transcript, absolute: usize) ?ResolvedPosition {
+    const ref = self.lineRefAt(absolute) orelse return null;
+    return .{
+        .position = .{
+            .item_seq = self.items.items[ref.item_index].seq,
+            .line_in_item = @intCast(ref.line_in_item),
+        },
+        .absolute = absolute,
+    };
+}
+
+pub fn resolvePosition(self: *const Transcript, position: Position) ?ResolvedPosition {
+    const item_index = self.itemIndexForSeq(position.item_seq) orelse return null;
+    const line_count = self.itemLineCount(item_index);
+    if (line_count == 0) return .{
+        .position = .{ .item_seq = position.item_seq, .line_in_item = 0 },
+        .absolute = self.derived.line_prefix[item_index],
+    };
+    var line_index = @min(@as(usize, position.line_in_item), line_count - 1);
+    const lines = self.items.items[item_index].layout_cache.active.lines;
+    while (line_index > 0 and isSeparatorLine(lines[line_index])) line_index -= 1;
+    return .{
+        .position = .{ .item_seq = position.item_seq, .line_in_item = @intCast(line_index) },
+        .absolute = self.derived.line_prefix[item_index] + line_index,
+    };
+}
+
+pub fn oldestPosition(self: *const Transcript) ?ResolvedPosition {
+    if (self.derived.item_count == 0 or self.totalLines() == 0) return null;
+    return .{
+        .position = .{ .item_seq = self.items.items[0].seq, .line_in_item = 0 },
+        .absolute = 0,
+    };
+}
+
+pub fn lastLayoutWork(self: *const Transcript) LayoutWork {
+    return self.derived.work;
+}
+
+const LineRef = struct {
+    item_index: usize,
+    line_in_item: usize,
+};
+
+fn lineRefAt(self: *const Transcript, absolute: usize) ?LineRef {
+    if (absolute >= self.totalLines()) return null;
+    var low: usize = 0;
+    var high = self.derived.item_count;
+    while (low < high) {
+        const mid = low + (high - low) / 2;
+        if (absolute < self.derived.line_prefix[mid + 1]) {
+            high = mid;
+        } else {
+            low = mid + 1;
+        }
+    }
+    if (low == self.derived.item_count) return null;
+    return .{ .item_index = low, .line_in_item = absolute - self.derived.line_prefix[low] };
+}
+
+fn itemLineCount(self: *const Transcript, item_index: usize) usize {
+    return self.derived.line_prefix[item_index + 1] - self.derived.line_prefix[item_index];
+}
+
+fn itemIndexForSeq(self: *const Transcript, seq: u64) ?usize {
+    var low: usize = 0;
+    var high = self.derived.item_count;
+    while (low < high) {
+        const mid = low + (high - low) / 2;
+        const item_seq = self.items.items[mid].seq;
+        if (item_seq < seq) {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+    if (low == self.derived.item_count or self.items.items[low].seq != seq) return null;
+    return low;
+}
+
+fn isSeparatorLine(line: layout.Line) bool {
+    return line.spans().len == 0 and screen.Style.eql(line.row_style, screen.surface.transparent);
+}
+
+fn layoutActiveItem(self: *Transcript, item: *Item, key: LayoutKey) ![]const layout.Line {
+    const cache = &item.layout_cache.active;
+    if (item.layout_cache.invalidation == .clean and
+        cache.key != null and
+        std.meta.eql(cache.key.?, key))
+    {
+        return cache.lines;
+    }
+    if (item.kind == .assistant) {
+        if (assistantIncrementalSource(&item.kind.assistant, key.hide_thinking)) |source| {
+            self.derived.work.items_laid_out += 1;
+            const can_append = item.layout_cache.invalidation == .source_appended and
+                cache.key != null and
+                std.meta.eql(cache.key.?, key) and
+                cache.incremental_part_index == source.part_index and
+                cache.incremental_source_len <= source.text.len;
+            try self.layoutIncrementalAssistant(item, cache, source, key, can_append);
+            item.layout_cache.invalidation = .clean;
+            return cache.lines;
+        }
+    }
+    try self.layoutItemFull(item, cache, key);
+    item.layout_cache.invalidation = .clean;
+    return cache.lines;
+}
+
+fn layoutItemFull(self: *Transcript, item: *Item, cache: *CachedLayout, key: LayoutKey) !void {
+    self.derived.work.items_laid_out += 1;
+    self.derived.work.source_bytes += itemBytes(item);
+    cache.incremental_lines.clearRetainingCapacity();
+    cache.incremental_part_index = null;
+    cache.incremental_source_len = 0;
+    cache.wrap = .{};
+    _ = cache.arena.reset(.retain_capacity);
+    cache.lines = &.{};
+    const allocator = cache.arena.allocator();
     const content_lines = switch (item.kind) {
         .user => |*user| blk: {
-            const lines = try layout.wrapPlain(allocator, user.text.items, transcriptInnerWidth(width), screen.text.user_message);
+            const lines = try layout.wrapPlain(
+                allocator,
+                user.text.items,
+                transcriptInnerWidth(key.width),
+                screen.text.user_message,
+            );
             for (lines) |*line| line.row_style = screen.surface.user_message;
             break :blk lines;
         },
-        .assistant => |*assistant| try layoutAssistant(allocator, assistant, transcriptInnerWidth(width), epoch),
-        .tool => |*tool| try blocks.layoutTool(allocator, tool, transcriptInnerWidth(width), epoch.expanded),
-        .notice => |notice| try layout.wrapPlain(allocator, notice.text, transcriptInnerWidth(width), noticeStyle(notice.level)),
+        .assistant => |*assistant| try layoutAssistant(
+            allocator,
+            assistant,
+            transcriptInnerWidth(key.width),
+            key.hide_thinking,
+        ),
+        .tool => |*tool| try blocks.layoutTool(
+            allocator,
+            tool,
+            transcriptInnerWidth(key.width),
+            key.expanded,
+        ),
+        .notice => |notice| try layout.wrapPlain(
+            allocator,
+            notice.text,
+            transcriptInnerWidth(key.width),
+            noticeStyle(notice.level),
+        ),
         .compaction => |compaction| blk: {
             var buffer: [256]u8 = undefined;
-            const text = std.fmt.bufPrint(&buffer, "context compacted: {s}", .{compaction.summary_first_line}) catch "context compacted";
+            const text = std.fmt.bufPrint(
+                &buffer,
+                "context compacted: {s}",
+                .{compaction.summary_first_line},
+            ) catch "context compacted";
             const owned = try allocator.dupe(u8, text);
-            break :blk try layout.wrapPlain(allocator, owned, transcriptInnerWidth(width), screen.text.muted);
+            break :blk try layout.wrapPlain(
+                allocator,
+                owned,
+                transcriptInnerWidth(key.width),
+                screen.text.muted,
+            );
         },
-        .custom => |custom| try layoutCustom(allocator, custom, transcriptInnerWidth(width)),
+        .custom => |custom| try layoutCustom(allocator, custom, transcriptInnerWidth(key.width)),
     };
-    item.lines = try applyItemRhythm(allocator, item.kind, content_lines);
-    item.cached_width = width;
-    item.cached_epoch = epoch_value;
-    item.dirty = false;
-    return item.lines;
+    cache.lines = try applyItemRhythm(allocator, item.kind, content_lines);
+    cache.key = key;
+    cache.content_generation = item.content_generation;
 }
 
-fn layoutAssistant(allocator: std.mem.Allocator, assistant: anytype, width: u16, epoch: theme.LayoutEpoch) ![]layout.Line {
+const AssistantIncrementalSource = struct {
+    part_index: usize,
+    text: []const u8,
+    prefix: []const u8 = "",
+};
+
+fn assistantIncrementalSource(assistant: anytype, hide_thinking: bool) ?AssistantIncrementalSource {
+    if (!assistant.streaming or assistant.stop != .ok) return null;
+    if (assistant.parts.items.len == 1) return switch (assistant.parts.items[0]) {
+        .text => |text| if (text.items.len == 0) null else .{ .part_index = 0, .text = text.items },
+        .thinking => null,
+    };
+    if (hide_thinking and assistant.parts.items.len == 2) {
+        const thinking = switch (assistant.parts.items[0]) {
+            .thinking => |thinking| thinking.items,
+            .text => return null,
+        };
+        const text = switch (assistant.parts.items[1]) {
+            .text => |text| text.items,
+            .thinking => return null,
+        };
+        if (thinking.len > 0 and text.len > 0) return .{
+            .part_index = 1,
+            .text = text,
+            .prefix = "Thinking...\n",
+        };
+    }
+    return null;
+}
+
+fn layoutIncrementalAssistant(
+    self: *Transcript,
+    item: *Item,
+    cache: *CachedLayout,
+    source: AssistantIncrementalSource,
+    key: LayoutKey,
+    can_append: bool,
+) !void {
+    const inner_width = transcriptInnerWidth(key.width);
+
+    var new_line_start: usize = undefined;
+    if (can_append) {
+        self.derived.work.source_bytes += source.text.len -| cache.wrap.committed_bytes;
+        cache.incremental_lines.items.len = cache.wrap.committed_lines;
+        new_line_start = cache.incremental_lines.items.len;
+    } else {
+        self.derived.work.source_bytes += source.prefix.len + source.text.len;
+        _ = cache.arena.reset(.retain_capacity);
+        cache.incremental_lines.clearRetainingCapacity();
+        cache.wrap = .{};
+        new_line_start = 0;
+        if (source.prefix.len > 0) {
+            try layout.appendMarkdown(
+                self.gpa,
+                &cache.incremental_lines,
+                source.prefix,
+                inner_width,
+                screen.text.normal,
+                &cache.wrap,
+            );
+            cache.incremental_lines.items.len = cache.wrap.committed_lines;
+            cache.wrap.committed_bytes = 0;
+        }
+    }
+
+    try layout.appendMarkdown(
+        self.gpa,
+        &cache.incremental_lines,
+        source.text,
+        inner_width,
+        screen.text.normal,
+        &cache.wrap,
+    );
+    for (cache.incremental_lines.items[new_line_start..]) |*line| {
+        if (line.spans().len > 0) try insetTranscriptLine(line, lineInsetStyle(item.kind, line.*));
+    }
+    for (0..item_margin_bottom) |_| try cache.incremental_lines.append(self.gpa, .{});
+
+    cache.lines = cache.incremental_lines.items;
+    cache.incremental_part_index = source.part_index;
+    cache.incremental_source_len = source.text.len;
+    cache.key = key;
+    cache.content_generation = item.content_generation;
+}
+
+fn layoutAssistant(
+    allocator: std.mem.Allocator,
+    assistant: anytype,
+    width: u16,
+    hide_thinking: bool,
+) ![]layout.Line {
     var text: std.Io.Writer.Allocating = .init(allocator);
     errdefer text.deinit();
     var hidden_thinking_shown = false;
@@ -286,7 +762,7 @@ fn layoutAssistant(allocator: std.mem.Allocator, assistant: anytype, width: u16,
                 try text.writer.writeAll(value.items);
             },
             .thinking => |value| {
-                if (epoch.hide_thinking) {
+                if (hide_thinking) {
                     if (assistant.streaming and value.items.len > 0 and !hidden_thinking_shown) {
                         try text.writer.writeAll("Thinking...");
                         hidden_thinking_shown = true;
@@ -407,7 +883,7 @@ fn applyMessageEnd(self: *Transcript, message: agent_mod.AgentMessage) !void {
                 },
                 else => item.kind.assistant.stop = .ok,
             }
-            item.dirty = true;
+            self.invalidateItem(item, .rebuild);
         },
         .user, .tool_result, .custom => {},
     }
@@ -419,17 +895,21 @@ fn applyToolStart(self: *Transcript, io: std.Io, payload: agent_mod.AgentEvent.T
     item.kind.tool.status = mergeToolStatus(item.kind.tool.status, .running);
     item.kind.tool.started_ns = nowNs(io);
     item.kind.tool.elapsed_ms = 0;
-    item.dirty = true;
+    self.invalidateItem(item, .rebuild);
 }
 
 fn applyToolUpdate(self: *Transcript, payload: agent_mod.AgentEvent.ToolExecutionUpdate) !void {
     const item = try self.ensureToolItem(payload.tool_call_id, payload.tool_name, payload.args, false);
     std.debug.assert(item.kind == .tool);
+    var changed = false;
     for (payload.partial_result.content) |content| switch (content) {
-        .text => |text| if (item.kind.tool.display.live_updates == .show_tail) item.kind.tool.tail.update(text.text),
+        .text => |text| if (item.kind.tool.display.live_updates == .show_tail and text.text.len > 0) {
+            item.kind.tool.tail.update(text.text);
+            changed = true;
+        },
         .image => {},
     };
-    item.dirty = true;
+    if (changed) self.invalidateItem(item, .rebuild);
 }
 
 fn applyToolEnd(self: *Transcript, io: std.Io, payload: agent_mod.AgentEvent.ToolExecutionEnd) !void {
@@ -445,7 +925,7 @@ fn applyToolEnd(self: *Transcript, io: std.Io, payload: agent_mod.AgentEvent.Too
     if (result_ui.body) |body| try self.replaceToolBody(item, body);
     if (result_ui.footer) |footer| try self.replaceToolFooter(item, footer);
     _ = self.live_tools.orderedRemove(tool.call_id);
-    item.dirty = true;
+    self.invalidateItem(item, .rebuild);
 }
 
 fn ensurePart(self: *Transcript, index: usize, tag: PartTag) !*Part {
@@ -471,14 +951,19 @@ fn ensurePart(self: *Transcript, index: usize, tag: PartTag) !*Part {
         };
         changed = true;
     }
-    if (changed) item.dirty = true;
+    if (changed) self.invalidateItem(item, .rebuild);
     return part;
 }
 
 fn appendAssistantPart(self: *Transcript, part: *Part, text: []const u8) !void {
     const item = self.streaming_item.?;
     const assistant = &item.kind.assistant;
+    const old_len = part.bytes().len;
+    const old_truncated = assistant.truncated;
     try self.appendListBounded(item, part.list(), text, per_item_text_bytes_max, &assistant.truncated, true);
+    if (part.bytes().len != old_len or assistant.truncated != old_truncated) {
+        self.invalidateItem(item, .source_appended);
+    }
 }
 
 fn replaceAssistantPart(self: *Transcript, part: *Part, text: []const u8) !void {
@@ -488,6 +973,7 @@ fn replaceAssistantPart(self: *Transcript, part: *Part, text: []const u8) !void 
     self.total_bytes -|= part.bytes().len;
     part.list().clearRetainingCapacity();
     try self.appendListBounded(item, part.list(), text, per_item_text_bytes_max, &assistant.truncated, true);
+    self.invalidateItem(item, .rebuild);
 }
 
 fn appendToolArgs(self: *Transcript, item: *Item, delta: []const u8) !void {
@@ -525,7 +1011,7 @@ fn applyToolUi(self: *Transcript, item: *Item, ui: ToolUi) !void {
     if (ui.compact_title) |compact_title| tool.compact_title = compact_title;
     tool.display = ui.display;
     try self.applyToolBodyUpdate(item, ui.body_update);
-    item.dirty = true;
+    self.invalidateItem(item, .rebuild);
 }
 
 fn applyToolBodyUpdate(self: *Transcript, item: *Item, update: ToolBodyUpdate) !void {
@@ -549,16 +1035,17 @@ fn replaceToolBody(self: *Transcript, item: *Item, body: ?[]const u8) !void {
     tool.body.clearRetainingCapacity();
     tool.body_truncated = false;
     const text = body orelse {
-        item.dirty = true;
+        self.invalidateItem(item, .rebuild);
         return;
     };
     try self.appendListBounded(item, &tool.body, text, blocks.tool_body_bytes_max, &tool.body_truncated, true);
+    self.invalidateItem(item, .rebuild);
 }
 
-fn replaceToolFooter(_: *Transcript, item: *Item, footer: ?[]const u8) !void {
+fn replaceToolFooter(self: *Transcript, item: *Item, footer: ?[]const u8) !void {
     std.debug.assert(item.kind == .tool);
     item.kind.tool.footer = if (footer) |value| value else "";
-    item.dirty = true;
+    self.invalidateItem(item, .rebuild);
 }
 
 fn reconcileAssistant(self: *Transcript, item: *Item, assistant_message: ai.AssistantMessage) !void {
@@ -606,7 +1093,7 @@ fn clearFinalPart(self: *Transcript, item: *Item, index: usize) void {
     self.total_bytes -|= part.bytes().len;
     part.list().clearRetainingCapacity();
     part.* = .{ .text = .empty };
-    item.dirty = true;
+    self.invalidateItem(item, .rebuild);
 }
 
 fn truncateFinalParts(self: *Transcript, item: *Item, len: usize) void {
@@ -615,7 +1102,7 @@ fn truncateFinalParts(self: *Transcript, item: *Item, len: usize) void {
     if (assistant.parts.items.len <= len) return;
     for (assistant.parts.items[len..]) |part| self.total_bytes -|= part.bytes().len;
     assistant.parts.items.len = len;
-    item.dirty = true;
+    self.invalidateItem(item, .rebuild);
 }
 
 fn replaceFinalPart(self: *Transcript, item: *Item, part: *Part, text: []const u8) !void {
@@ -624,6 +1111,7 @@ fn replaceFinalPart(self: *Transcript, item: *Item, part: *Part, text: []const u
     self.total_bytes -|= part.bytes().len;
     part.list().clearRetainingCapacity();
     try self.appendListBounded(item, part.list(), text, per_item_text_bytes_max, &assistant.truncated, true);
+    self.invalidateItem(item, .rebuild);
 }
 
 fn findToolItem(self: *Transcript, call_id: []const u8) ?*Item {
@@ -688,7 +1176,12 @@ fn createUserMessageItem(self: *Transcript, user: ai.UserMessage) !*Item {
 }
 
 fn appendUserText(self: *Transcript, item: *Item, text: []const u8) !void {
+    const old_len = item.kind.user.text.items.len;
+    const old_truncated = item.kind.user.truncated;
     try self.appendListBounded(item, &item.kind.user.text, text, per_item_text_bytes_max, &item.kind.user.truncated, true);
+    if (item.kind.user.text.items.len != old_len or item.kind.user.truncated != old_truncated) {
+        self.invalidateItem(item, .rebuild);
+    }
 }
 
 fn appendUserImage(self: *Transcript, item: *Item, mime_type: []const u8) !void {
@@ -739,8 +1232,8 @@ fn createItem(self: *Transcript, kind: Item.Kind) !*Item {
     errdefer self.gpa.destroy(item);
     item.* = .{
         .arena = std.heap.ArenaAllocator.init(self.gpa),
-        .layout_arena = std.heap.ArenaAllocator.init(self.gpa),
         .seq = self.next_seq,
+        .layout_cache = .{ .active = .{ .arena = std.heap.ArenaAllocator.init(self.gpa) } },
         .kind = kind,
     };
     self.next_seq +%= 1;
@@ -748,7 +1241,31 @@ fn createItem(self: *Transcript, kind: Item.Kind) !*Item {
 }
 
 fn appendItem(self: *Transcript, item: *Item) !void {
+    item.index = self.items.items.len;
     try self.items.append(self.gpa, item);
+    self.noteInvalidItem(item.index);
+}
+
+fn invalidateItem(self: *Transcript, item: *Item, invalidation: LayoutInvalidation) void {
+    item.content_generation +%= 1;
+    item.layout_cache.invalidation = switch (item.layout_cache.invalidation) {
+        .rebuild => .rebuild,
+        .source_appended => if (invalidation == .rebuild) .rebuild else .source_appended,
+        .clean => invalidation,
+    };
+    if (item.layout_cache.pending) |pending| {
+        self.deinitCachedLayout(pending);
+        self.gpa.destroy(pending);
+        item.layout_cache.pending = null;
+        if (self.derived.relayout) |*job| job.next_item = @min(job.next_item, item.index);
+    }
+    if (item.index < self.items.items.len and self.items.items[item.index] == item) {
+        self.noteInvalidItem(item.index);
+    }
+}
+
+fn noteInvalidItem(self: *Transcript, index: usize) void {
+    self.derived.first_invalid_item = if (self.derived.first_invalid_item) |current| @min(current, index) else index;
 }
 
 fn appendListBounded(
@@ -776,16 +1293,12 @@ fn appendListBounded(
         try list.appendSlice(item.allocator(), chunk);
         if (count_total) self.total_bytes += chunk.len;
         remaining = remaining[chunk.len..];
-        if (remaining.len == 0) {
-            item.dirty = true;
-            return;
-        }
+        if (remaining.len == 0) return;
         if (chunk_len == room) {
             try self.appendTruncationMarker(item, list, max_bytes, truncated, count_total);
             return;
         }
     }
-    item.dirty = true;
 }
 
 fn appendTruncationMarker(self: *Transcript, item: *Item, list: *std.ArrayList(u8), max_bytes: usize, truncated: *bool, count_total: bool) !void {
@@ -797,7 +1310,6 @@ fn appendTruncationMarker(self: *Transcript, item: *Item, list: *std.ArrayList(u
         if (count_total) self.total_bytes += 1;
     }
     const remaining_room = max_bytes -| list.items.len;
-    item.dirty = true;
     const chunk = agent_mod.utf8Prefix(blocks.output_truncated_text, remaining_room);
     try list.appendSlice(item.allocator(), chunk);
     if (count_total) self.total_bytes += chunk.len;
@@ -809,7 +1321,7 @@ fn abortLiveTools(self: *Transcript) !void {
         switch (item.kind.tool.status) {
             .pending, .running => {
                 item.kind.tool.status = .aborted;
-                item.dirty = true;
+                self.invalidateItem(item, .rebuild);
             },
             else => {},
         }
@@ -825,11 +1337,24 @@ fn enforceCaps(self: *Transcript) !void {
         self.total_bytes -|= itemBytes(item);
         self.evicted_seqs += 1;
         self.destroyItem(item);
+        for (self.items.items, 0..) |remaining, index| remaining.index = index;
+        self.derived.first_invalid_item = 0;
+        if (self.derived.relayout) |*job| job.next_item = 0;
     }
 }
 
+fn deinitCachedLayout(self: *Transcript, cache: *CachedLayout) void {
+    cache.incremental_lines.deinit(self.gpa);
+    cache.arena.deinit();
+    cache.* = undefined;
+}
+
 fn destroyItem(self: *Transcript, item: *Item) void {
-    item.layout_arena.deinit();
+    if (item.layout_cache.pending) |pending| {
+        self.deinitCachedLayout(pending);
+        self.gpa.destroy(pending);
+    }
+    self.deinitCachedLayout(&item.layout_cache.active);
     item.arena.deinit();
     self.gpa.destroy(item);
 }
@@ -874,8 +1399,10 @@ test "transcript user block has panel padding and item margin" {
     defer transcript.deinit();
 
     try transcript.apply(std.testing.io, .{ .message_start = .{ .message = .{ .user = .{ .content = .{ .string = "hello" }, .timestamp = 0 } } } });
-    const epoch = theme.LayoutEpoch{ .width = 40, .height = 10 };
-    const lines = try transcript.itemLines(transcript.items.items[0], 40, epoch);
+    const state: theme.LayoutState = .{ .width = 40, .height = 10 };
+    const prepared = try transcript.prepareLayout(state);
+    try std.testing.expectEqual(PrepareResult.published, prepared);
+    const lines = transcript.items.items[0].layout_cache.active.lines;
 
     var buffer: [64]u8 = undefined;
     try std.testing.expectEqual(@as(usize, 4), lines.len);
@@ -898,8 +1425,9 @@ test "transcript user block renders image placeholders" {
         .{ .image = .{ .data = "abc", .mime_type = "image/png" } },
     };
     try transcript.apply(std.testing.io, .{ .message_start = .{ .message = .{ .user = .{ .content = .{ .blocks = &content }, .timestamp = 0 } } } });
-    const epoch = theme.LayoutEpoch{ .width = 40, .height = 10 };
-    const lines = try transcript.itemLines(transcript.items.items[0], 40, epoch);
+    const state: theme.LayoutState = .{ .width = 40, .height = 10 };
+    _ = try transcript.prepareLayout(state);
+    const lines = transcript.items.items[0].layout_cache.active.lines;
 
     var buffer: [64]u8 = undefined;
     try std.testing.expectEqualStrings(" look", lines[1].copyText(&buffer));
@@ -914,8 +1442,9 @@ test "transcript visible thinking trims trailing blank rows" {
     const assistant = emptyAssistantMessage(&content, .stop);
     try transcript.apply(std.testing.io, .{ .message_start = .{ .message = .{ .assistant = assistant } } });
     try transcript.apply(std.testing.io, .{ .message_end = .{ .message = .{ .assistant = assistant } } });
-    const epoch = theme.LayoutEpoch{ .width = 60, .height = 10, .hide_thinking = false };
-    const lines = try transcript.itemLines(transcript.items.items[0], 60, epoch);
+    const state: theme.LayoutState = .{ .width = 60, .height = 10, .hide_thinking = false };
+    _ = try transcript.prepareLayout(state);
+    const lines = transcript.items.items[0].layout_cache.active.lines;
 
     var buffer: [64]u8 = undefined;
     try std.testing.expectEqual(@as(usize, 2), lines.len);
@@ -929,8 +1458,9 @@ test "transcript custom message renders title body and margin" {
     defer transcript.deinit();
 
     try transcript.apply(std.testing.io, .{ .message_start = .{ .message = .{ .custom = .{ .kind = "Session Info", .payload = .{ .string = "ok" }, .timestamp = 0 } } } });
-    const epoch = theme.LayoutEpoch{ .width = 40, .height = 10 };
-    const lines = try transcript.itemLines(transcript.items.items[0], 40, epoch);
+    const state: theme.LayoutState = .{ .width = 40, .height = 10 };
+    _ = try transcript.prepareLayout(state);
+    const lines = transcript.items.items[0].layout_cache.active.lines;
 
     var buffer: [64]u8 = undefined;
     try std.testing.expectEqual(@as(usize, 4), lines.len);
@@ -1081,6 +1611,74 @@ test "transcript applies streamed assistant text by delta" {
     try std.testing.expect(!item.kind.assistant.streaming);
 }
 
+test "transcript incrementally relayouts only the unstable streamed suffix" {
+    var transcript = Transcript.init(std.testing.allocator);
+    defer transcript.deinit();
+
+    try transcript.apply(std.testing.io, .{ .message_start = .{
+        .message = .{ .assistant = emptyAssistantMessage(&.{}, .stop) },
+    } });
+    try transcript.apply(std.testing.io, .{ .message_update = .{ .assistant_message_event = .{ .text_delta = .{
+        .content_index = 0,
+        .delta = "one\nabcdefghij",
+        .partial = emptyAssistantMessage(&.{}, .stop),
+    } } } });
+    const item = transcript.items.items[0];
+    const state: theme.LayoutState = .{ .width = 6, .height = 10 };
+    _ = try transcript.prepareLayout(state);
+    var lines = item.layout_cache.active.lines;
+
+    try std.testing.expectEqual(
+        @as(usize, "one\nabcdefgh".len),
+        item.layout_cache.active.wrap.committed_bytes,
+    );
+    try std.testing.expectEqual(@as(usize, 3), item.layout_cache.active.wrap.committed_lines);
+    const stable_text_ptr = lines[0].spans()[1].text.ptr;
+
+    try transcript.apply(std.testing.io, .{ .message_update = .{ .assistant_message_event = .{ .text_delta = .{
+        .content_index = 0,
+        .delta = "kl",
+        .partial = emptyAssistantMessage(&.{}, .stop),
+    } } } });
+    try std.testing.expectEqual(LayoutInvalidation.source_appended, item.layout_cache.invalidation);
+
+    _ = try transcript.prepareLayout(state);
+    lines = item.layout_cache.active.lines;
+    var buffer: [16]u8 = undefined;
+    try std.testing.expectEqualStrings(" one", lines[0].copyText(&buffer));
+    try std.testing.expectEqualStrings(" ijkl", lines[3].copyText(&buffer));
+    try std.testing.expectEqual(stable_text_ptr, lines[0].spans()[1].text.ptr);
+}
+
+test "transcript tracks the first item needing line index repair" {
+    var transcript = Transcript.init(std.testing.allocator);
+    defer transcript.deinit();
+
+    try transcript.apply(std.testing.io, .{ .message_start = .{
+        .message = .{ .user = .{ .content = .{ .string = "prompt" }, .timestamp = 0 } },
+    } });
+    try transcript.apply(std.testing.io, .{ .message_start = .{
+        .message = .{ .assistant = emptyAssistantMessage(&.{}, .stop) },
+    } });
+    try transcript.apply(std.testing.io, .{ .message_update = .{ .assistant_message_event = .{ .text_delta = .{
+        .content_index = 0,
+        .delta = "first",
+        .partial = emptyAssistantMessage(&.{}, .stop),
+    } } } });
+    const state: theme.LayoutState = .{ .width = 40, .height = 10 };
+    _ = try transcript.prepareLayout(state);
+
+    try transcript.apply(std.testing.io, .{ .message_update = .{ .assistant_message_event = .{ .text_delta = .{
+        .content_index = 0,
+        .delta = " second",
+        .partial = emptyAssistantMessage(&.{}, .stop),
+    } } } });
+    _ = try transcript.prepareLayout(state);
+    const work = transcript.lastLayoutWork();
+    try std.testing.expectEqual(@as(usize, 1), work.items_laid_out);
+    try std.testing.expectEqual(@as(usize, 1), work.index_entries_repaired);
+}
+
 test "transcript final assistant message removes stale streamed parts" {
     var transcript = Transcript.init(std.testing.allocator);
     defer transcript.deinit();
@@ -1168,6 +1766,194 @@ test "transcript creates tool before execution and records output" {
     try std.testing.expectEqual(blocks.Status.done, tool.kind.tool.status);
     try std.testing.expectEqualStrings("file body", tool.kind.tool.body.items);
     try std.testing.expect(transcript.live_tools.get("call-1") == null);
+}
+
+test "transcript suppresses invisible live tool updates without relayout" {
+    var transcript = Transcript.init(std.testing.allocator);
+    defer transcript.deinit();
+
+    try transcript.apply(std.testing.io, .{ .tool_execution_start = .{
+        .tool_call_id = "call-1",
+        .tool_name = "read",
+        .args = .null,
+    } });
+    const item = transcript.items.items[0];
+    const state: theme.LayoutState = .{ .width = 40, .height = 10 };
+    _ = try transcript.prepareLayout(state);
+
+    const content = [_]ai.ToolResultContent{.{ .text = .{ .text = "hidden progress" } }};
+    try transcript.apply(std.testing.io, .{ .tool_execution_update = .{
+        .tool_call_id = "call-1",
+        .tool_name = "read",
+        .args = .null,
+        .partial_result = .{ .content = &content },
+    } });
+    try std.testing.expectEqual(LayoutInvalidation.clean, item.layout_cache.invalidation);
+    _ = try transcript.prepareLayout(state);
+    try std.testing.expectEqual(@as(usize, 0), transcript.lastLayoutWork().items_laid_out);
+}
+
+test "transcript relayouts running duration only when its visible tick changes" {
+    var transcript = Transcript.init(std.testing.allocator);
+    defer transcript.deinit();
+
+    try transcript.apply(std.testing.io, .{ .tool_execution_start = .{
+        .tool_call_id = "call-1",
+        .tool_name = "bash",
+        .args = .null,
+    } });
+    const item = transcript.items.items[0];
+    item.kind.tool.display.shows_duration = true;
+    item.kind.tool.started_ns = 0;
+    item.kind.tool.elapsed_ms = 0;
+    const state: theme.LayoutState = .{ .width = 40, .height = 10 };
+    _ = try transcript.prepareLayout(state);
+
+    try std.testing.expect(!transcript.markRunningToolsDirty(99 * std.time.ns_per_ms));
+    try std.testing.expectEqual(LayoutInvalidation.clean, item.layout_cache.invalidation);
+    try std.testing.expect(transcript.markRunningToolsDirty(100 * std.time.ns_per_ms));
+    try std.testing.expectEqual(LayoutInvalidation.rebuild, item.layout_cache.invalidation);
+}
+
+test "transcript invalidation has one dominance order" {
+    var transcript = Transcript.init(std.testing.allocator);
+    defer transcript.deinit();
+
+    const item = try transcript.createAssistantItem(true);
+    try transcript.appendItem(item);
+    transcript.invalidateItem(item, .source_appended);
+    try std.testing.expectEqual(LayoutInvalidation.rebuild, item.layout_cache.invalidation);
+
+    item.layout_cache.invalidation = .clean;
+    transcript.invalidateItem(item, .source_appended);
+    try std.testing.expectEqual(LayoutInvalidation.source_appended, item.layout_cache.invalidation);
+    transcript.invalidateItem(item, .rebuild);
+    try std.testing.expectEqual(LayoutInvalidation.rebuild, item.layout_cache.invalidation);
+}
+
+test "transcript owns line positions and visible collection" {
+    var transcript = Transcript.init(std.testing.allocator);
+    defer transcript.deinit();
+
+    try transcript.appendNotice(.info, "alpha");
+    try transcript.appendNotice(.info, "beta");
+    const state: theme.LayoutState = .{ .width = 40, .height = 10 };
+    const prepared = try transcript.prepareLayout(state);
+    try std.testing.expectEqual(PrepareResult.published, prepared);
+    try std.testing.expectEqual(@as(usize, 4), transcript.totalLines());
+
+    const second = transcript.positionAtLine(2).?;
+    try std.testing.expectEqual(transcript.items.items[1].seq, second.position.item_seq);
+    try std.testing.expectEqual(@as(u32, 0), second.position.line_in_item);
+    const resolved = transcript.resolvePosition(.{
+        .item_seq = second.position.item_seq,
+        .line_in_item = std.math.maxInt(u32),
+    }).?;
+    try std.testing.expectEqual(@as(usize, 2), resolved.absolute);
+
+    var visible: [2]layout.Line = undefined;
+    const lines = transcript.collectVisible(2, &visible);
+    var buffer: [16]u8 = undefined;
+    try std.testing.expectEqualStrings(" beta", lines[0].copyText(&buffer));
+    try std.testing.expectEqualStrings("", lines[1].copyText(&buffer));
+    try std.testing.expectEqual(@as(usize, 2), transcript.lastLayoutWork().lines_materialized);
+}
+
+test "transcript complete relayout is bounded and published atomically" {
+    var transcript = Transcript.init(std.testing.allocator);
+    defer transcript.deinit();
+
+    for (0..relayout_items_per_prepare + 1) |index| {
+        var buffer: [32]u8 = undefined;
+        try transcript.appendNotice(.info, try std.fmt.bufPrint(&buffer, "item {d}", .{index}));
+    }
+    const state: theme.LayoutState = .{ .width = 40, .height = 10 };
+    const first = try transcript.prepareLayout(state);
+    try std.testing.expectEqual(PrepareResult.pending, first);
+    try std.testing.expectEqual(relayout_items_per_prepare, transcript.lastLayoutWork().items_laid_out);
+    try std.testing.expectEqual(@as(usize, 0), transcript.totalLines());
+
+    const second = try transcript.prepareLayout(state);
+    try std.testing.expectEqual(PrepareResult.published, second);
+    try std.testing.expectEqual(@as(usize, 1), transcript.lastLayoutWork().items_laid_out);
+    try std.testing.expectEqual((relayout_items_per_prepare + 1) * 2, transcript.totalLines());
+}
+
+test "transcript cancels stale relayout when layout key returns to active" {
+    var transcript = Transcript.init(std.testing.allocator);
+    defer transcript.deinit();
+
+    for (0..relayout_items_per_prepare + 1) |index| {
+        var buffer: [32]u8 = undefined;
+        try transcript.appendNotice(.info, try std.fmt.bufPrint(&buffer, "item {d}", .{index}));
+    }
+    const narrow: theme.LayoutState = .{ .width = 40, .height = 10 };
+    while ((try transcript.prepareLayout(narrow)) == .pending) {}
+    const old_total = transcript.totalLines();
+
+    const wide: theme.LayoutState = .{ .width = 80, .height = 10 };
+    const pending = try transcript.prepareLayout(wide);
+    try std.testing.expectEqual(PrepareResult.pending, pending);
+    try std.testing.expectEqual(old_total, transcript.totalLines());
+
+    const reverted = try transcript.prepareLayout(narrow);
+    try std.testing.expectEqual(PrepareResult.ready, reverted);
+    try std.testing.expectEqual(old_total, transcript.totalLines());
+}
+
+test "transcript relayout incorporates mutations without restarting unrelated work" {
+    var transcript = Transcript.init(std.testing.allocator);
+    defer transcript.deinit();
+
+    try transcript.apply(std.testing.io, .{ .message_start = .{
+        .message = .{ .assistant = emptyAssistantMessage(&.{}, .stop) },
+    } });
+    try transcript.apply(std.testing.io, .{ .message_update = .{ .assistant_message_event = .{ .text_delta = .{
+        .content_index = 0,
+        .delta = "hello",
+        .partial = emptyAssistantMessage(&.{}, .stop),
+    } } } });
+    for (0..relayout_items_per_prepare) |index| {
+        var buffer: [32]u8 = undefined;
+        try transcript.appendNotice(.info, try std.fmt.bufPrint(&buffer, "item {d}", .{index}));
+    }
+    const narrow: theme.LayoutState = .{ .width = 40, .height = 10 };
+    while ((try transcript.prepareLayout(narrow)) == .pending) {}
+
+    const wide: theme.LayoutState = .{ .width = 80, .height = 10 };
+    try std.testing.expectEqual(PrepareResult.pending, try transcript.prepareLayout(wide));
+    try transcript.apply(std.testing.io, .{ .message_update = .{ .assistant_message_event = .{ .text_delta = .{
+        .content_index = 0,
+        .delta = " world",
+        .partial = emptyAssistantMessage(&.{}, .stop),
+    } } } });
+    while ((try transcript.prepareLayout(wide)) == .pending) {}
+
+    const first = transcript.lineAt(0).?;
+    var text: [32]u8 = undefined;
+    try std.testing.expectEqualStrings(" hello world", first.copyText(&text));
+}
+
+test "transcript layout key ignores height and rebuilds on width" {
+    var transcript = Transcript.init(std.testing.allocator);
+    defer transcript.deinit();
+
+    try transcript.appendNotice(.info, "alpha");
+    try transcript.appendNotice(.info, "beta");
+    const first: theme.LayoutState = .{ .width = 40, .height = 10 };
+    const prepared = try transcript.prepareLayout(first);
+    try std.testing.expectEqual(PrepareResult.published, prepared);
+    try std.testing.expectEqual(@as(usize, 2), transcript.lastLayoutWork().items_laid_out);
+
+    const height_only: theme.LayoutState = .{ .width = 40, .height = 20 };
+    const same_key = try transcript.prepareLayout(height_only);
+    try std.testing.expectEqual(PrepareResult.ready, same_key);
+    try std.testing.expectEqual(@as(usize, 0), transcript.lastLayoutWork().items_laid_out);
+
+    const wider: theme.LayoutState = .{ .width = 60, .height = 20 };
+    const rebuilt = try transcript.prepareLayout(wider);
+    try std.testing.expectEqual(PrepareResult.published, rebuilt);
+    try std.testing.expectEqual(@as(usize, 2), transcript.lastLayoutWork().items_laid_out);
 }
 
 test "transcript aborts running tools on aborted assistant end" {

@@ -98,6 +98,14 @@ pub const FrameRecords = struct {
         if (self.count == 0) return null;
         return self.records[(self.start + self.count - 1) % frame_record_capacity];
     }
+
+    pub fn maxPhaseUs(self: *const FrameRecords, comptime field: []const u8) u64 {
+        var max_us: u64 = 0;
+        for (0..self.count) |offset| {
+            max_us = @max(max_us, @field(self.records[(self.start + offset) % frame_record_capacity], field));
+        }
+        return max_us;
+    }
 };
 
 pub const InputLatencyHistogram = struct {
@@ -120,6 +128,30 @@ pub const InputLatencyHistogram = struct {
     }
 };
 
+pub const LayoutWorkStats = struct {
+    items_laid_out: usize = 0,
+    source_bytes: usize = 0,
+    index_entries_repaired: usize = 0,
+    lines_materialized: usize = 0,
+    max_items_per_frame: usize = 0,
+    max_source_bytes_per_frame: usize = 0,
+
+    pub fn record(
+        self: *LayoutWorkStats,
+        items_laid_out: usize,
+        source_bytes: usize,
+        index_entries_repaired: usize,
+        lines_materialized: usize,
+    ) void {
+        self.items_laid_out += items_laid_out;
+        self.source_bytes += source_bytes;
+        self.index_entries_repaired += index_entries_repaired;
+        self.lines_materialized += lines_materialized;
+        self.max_items_per_frame = @max(self.max_items_per_frame, items_laid_out);
+        self.max_source_bytes_per_frame = @max(self.max_source_bytes_per_frame, source_bytes);
+    }
+};
+
 pub const Stats = struct {
     iterations: TimingStats = .{},
     renders: TimingStats = .{},
@@ -130,6 +162,9 @@ pub const Stats = struct {
     input_actions: usize = 0,
     dropped_input_bytes: usize = 0,
     transcript_evictions: u64 = 0,
+    animated_frame_gaps: TimingStats = .{},
+    animated_deadline_misses: usize = 0,
+    layout_work: LayoutWorkStats = .{},
 
     pub fn recordIteration(self: *Stats, ns: u64) void {
         self.iterations.record(ns);
@@ -153,6 +188,21 @@ pub const Stats = struct {
         self.rebuilds.record(ns);
     }
 
+    pub fn recordLayoutWork(
+        self: *Stats,
+        items_laid_out: usize,
+        source_bytes: usize,
+        index_entries_repaired: usize,
+        lines_materialized: usize,
+    ) void {
+        self.layout_work.record(
+            items_laid_out,
+            source_bytes,
+            index_entries_repaired,
+            lines_materialized,
+        );
+    }
+
     pub fn recordInputAction(self: *Stats) void {
         self.input_actions += 1;
     }
@@ -165,18 +215,18 @@ pub const Stats = struct {
         self.transcript_evictions = count;
     }
 
+    pub fn recordAnimatedFrameGap(self: *Stats, gap_ns: u64, frame_floor_ns: u64) void {
+        self.animated_frame_gaps.record(gap_ns);
+        if (gap_ns > frame_floor_ns *| 2) self.animated_deadline_misses += 1;
+    }
+
     pub fn writeReport(self: *const Stats, writer: *std.Io.Writer) !void {
         try writer.print(
             "zi tui trace\n" ++
                 "iterations count={d} avg_ns={d} p50_ns={d} p90_ns={d} p99_ns={d} max_ns={d}\n" ++
                 "renders count={d} avg_ns={d} p50_ns={d} p90_ns={d} p99_ns={d} max_ns={d}\n" ++
-                "frames count={d} evictions={d} max_total_us={d}\n" ++
-                "rebuilds count={d} avg_ns={d} max_ns={d}\n" ++
-                "input_actions count={d}\n" ++
-                "dropped_input_bytes count={d}\n" ++
-                "transcript_evictions count={d}\n" ++
-                "input_latency count={d} p50_ns={d} p90_ns={d} p99_ns={d} max_ns={d}\n" ++
-                "input_latency buckets_1ms_to_1024ms_plus=",
+                "frames count={d} evictions={d} max_total_us={d} max_apply_us={d}" ++
+                " max_layout_us={d} max_paint_us={d} max_flush_us={d}\n",
             .{
                 self.iterations.count,
                 self.iterations.averageNs(),
@@ -193,9 +243,38 @@ pub const Stats = struct {
                 self.frames.count,
                 self.frames.evictions,
                 self.maxFrameTotalUs(),
+                self.frames.maxPhaseUs("apply_us"),
+                self.frames.maxPhaseUs("layout_us"),
+                self.frames.maxPhaseUs("paint_us"),
+                self.frames.maxPhaseUs("flush_us"),
+            },
+        );
+        try writer.print(
+            "animated_frame_gaps count={d} avg_ns={d} p90_ns={d} p99_ns={d} max_ns={d} deadline_misses={d}\n" ++
+                "rebuilds count={d} avg_ns={d} max_ns={d}\n" ++
+                "layout_work items={d} source_bytes={d} index_entries={d} materialized_lines={d}" ++
+                " max_items_per_frame={d} max_source_bytes_per_frame={d}\n" ++
+                "input_actions count={d}\n" ++
+                "dropped_input_bytes count={d}\n" ++
+                "transcript_evictions count={d}\n" ++
+                "input_latency count={d} p50_ns={d} p90_ns={d} p99_ns={d} max_ns={d}\n" ++
+                "input_latency buckets_1ms_to_1024ms_plus=",
+            .{
+                self.animated_frame_gaps.count,
+                self.animated_frame_gaps.averageNs(),
+                self.animated_frame_gaps.percentileNs(90),
+                self.animated_frame_gaps.percentileNs(99),
+                self.animated_frame_gaps.max_ns,
+                self.animated_deadline_misses,
                 self.rebuilds.count,
                 self.rebuilds.averageNs(),
                 self.rebuilds.max_ns,
+                self.layout_work.items_laid_out,
+                self.layout_work.source_bytes,
+                self.layout_work.index_entries_repaired,
+                self.layout_work.lines_materialized,
+                self.layout_work.max_items_per_frame,
+                self.layout_work.max_source_bytes_per_frame,
                 self.input_actions,
                 self.dropped_input_bytes,
                 self.transcript_evictions,
@@ -273,14 +352,24 @@ test "frame records are bounded and overwrite oldest" {
 test "stats record frame latency histogram and rebuild timings" {
     var stats: Stats = .{};
     stats.recordFrame(.{ .apply_us = 1, .layout_us = 2, .paint_us = 3, .flush_us = 4 });
+    stats.recordAnimatedFrameGap(16 * std.time.ns_per_ms, 16 * std.time.ns_per_ms);
+    stats.recordAnimatedFrameGap(33 * std.time.ns_per_ms, 16 * std.time.ns_per_ms);
     stats.recordInputLatency(10, 10 + std.time.ns_per_ms);
     stats.recordInputLatency(10, 10 + 2000 * std.time.ns_per_ms);
     stats.recordRebuild(99);
+    stats.recordLayoutWork(2, 100, 3, 4);
+    stats.recordLayoutWork(1, 20, 1, 2);
 
     try std.testing.expectEqual(@as(usize, 1), stats.frames.count);
     try std.testing.expectEqual(@as(usize, 1), stats.input_latency.buckets[0]);
     try std.testing.expectEqual(@as(usize, 1), stats.input_latency.buckets[input_latency_bucket_count - 1]);
     try std.testing.expectEqual(@as(usize, 1), stats.rebuilds.count);
+    try std.testing.expectEqual(@as(usize, 2), stats.animated_frame_gaps.count);
+    try std.testing.expectEqual(@as(usize, 1), stats.animated_deadline_misses);
+    try std.testing.expectEqual(@as(u64, 4), stats.frames.maxPhaseUs("flush_us"));
+    try std.testing.expectEqual(@as(usize, 3), stats.layout_work.items_laid_out);
+    try std.testing.expectEqual(@as(usize, 120), stats.layout_work.source_bytes);
+    try std.testing.expectEqual(@as(usize, 2), stats.layout_work.max_items_per_frame);
 }
 
 test "stats write report includes render and input metrics" {
@@ -289,14 +378,17 @@ test "stats write report includes render and input metrics" {
     stats.recordRender(20);
     stats.recordInputAction();
     stats.addDroppedInputBytes(4);
+    stats.recordLayoutWork(2, 100, 3, 4);
 
-    var out: [512]u8 = undefined;
+    var out: [1024]u8 = undefined;
     var writer = std.Io.Writer.fixed(&out);
     try stats.writeReport(&writer);
     const text = writer.buffered();
 
     try std.testing.expect(std.mem.indexOf(u8, text, "zi tui trace") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "renders count=1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "animated_frame_gaps") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "layout_work items=2") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "input_actions count=1") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "dropped_input_bytes count=4") != null);
 }

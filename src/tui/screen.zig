@@ -223,7 +223,7 @@ pub const LineBuilder = struct {
 };
 
 pub const Screen = struct {
-    pub fn paint(_: *Screen, vx: *vaxis.Vaxis, tty_writer: *std.Io.Writer, frame: Frame) !void {
+    pub fn paint(_: *Screen, vx: *vaxis.Vaxis, frame: Frame) void {
         const win = vx.window();
         win.clear();
         for (frame.rows(), 0..) |line, row| {
@@ -251,7 +251,6 @@ pub const Screen = struct {
         } else {
             win.hideCursor();
         }
-        try vx.render(tty_writer);
     }
 };
 

@@ -44,7 +44,6 @@ fn persistNewSessionsForOpen(open: coding_agent.session_bootstrap.OpenSpec) bool
 pub const Runner = struct {
     loop: Loop,
     decoder: InputDecoder = .{},
-    layout: theme.LayoutEpoch = .{ .width = 0, .height = 0 },
     open: coding_agent.session_bootstrap.OpenSpec,
     resume_picker: bool,
     initial_prompt_pending: bool,
@@ -198,9 +197,7 @@ pub const Runner = struct {
     }
 
     pub fn applyResize(self: *Runner, width: u16, height: u16) bool {
-        const changed = self.layout.resize(width, height);
-        if (changed) self.loop.dirty = true;
-        return changed;
+        return self.loop.noteResize(width, height);
     }
 
     pub fn paintInitialFrame(self: *Runner, terminal: *Terminal, width: u16, height: u16) !void {
@@ -217,6 +214,7 @@ pub const Runner = struct {
         width: u16,
         height: u16,
     ) !bool {
+        const apply_start_ns = FrameLoop.nowNs(terminal.io);
         const input_actions_before = self.loop.trace.input_actions;
         try self.drainInputPumpForTick(pump, terminal, now_ns);
         try self.expireLoneEscapeIfDue(now_ns);
@@ -226,13 +224,22 @@ pub const Runner = struct {
         const had_input = self.loop.trace.input_actions != input_actions_before;
         const resized = self.applyResize(width, height);
         if (resized) try terminal.resizeFromTty();
+        const apply_complete_ns = FrameLoop.nowNs(terminal.io);
         if (!had_input and !resized and !self.loop.shouldRender(now_ns)) return false;
-        const start_ns = FrameLoop.nowNs(terminal.io);
+
         const frame = try self.loop.composeFrameAt(width, height, now_ns);
-        try terminal.paint(frame);
+        const layout_complete_ns = FrameLoop.nowNs(terminal.io);
+        try terminal.paintCells(frame);
+        const paint_complete_ns = FrameLoop.nowNs(terminal.io);
+        try terminal.flush();
         const flush_complete_ns = FrameLoop.nowNs(terminal.io);
         self.recordPendingInputLatencies(flush_complete_ns);
-        self.loop.markRendered(now_ns, flush_complete_ns -| start_ns);
+        self.loop.markRenderedWithTimings(now_ns, .{
+            .apply_ns = apply_complete_ns -| apply_start_ns,
+            .layout_ns = layout_complete_ns -| apply_complete_ns,
+            .paint_ns = paint_complete_ns -| layout_complete_ns,
+            .flush_ns = flush_complete_ns -| paint_complete_ns,
+        });
         return true;
     }
 };
@@ -292,7 +299,7 @@ pub fn run(process: runtime.Process, options: Options) !void {
     try terminal.setTitle(runner.loop.terminalTitle());
 
     var pump: InputPump = .{};
-    try pump.startTerminal(process.io, &terminal);
+    try pump.startTerminal(services.io, &terminal, &wake);
     defer pump.join();
     defer pump.requestStop();
 
@@ -644,7 +651,8 @@ test "runner tick renders immediately on resize" {
     var pump: InputPump = .{};
 
     try std.testing.expect(try runner.tick(&terminal, &pump, 0, 80, 2));
-    try std.testing.expectEqual(@as(u64, 1), runner.layout.revision);
+    try std.testing.expectEqual(@as(u16, 80), runner.loop.layout_state.width);
+    try std.testing.expectEqual(@as(u16, 2), runner.loop.layout_state.height);
     try std.testing.expect(!runner.loop.dirty);
 }
 

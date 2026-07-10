@@ -164,9 +164,9 @@ Cut-over baseline: `46b6276~1`. Sources audited only: old `interactive.zig`, old
 
 | Status | Count |
 |---|---:|
-| RESTORED | 94 |
+| RESTORED | 95 |
 | MISSING | 0 |
-| CHANGED | 18 |
+| CHANGED | 17 |
 | OBSOLETE | 2 |
 | TOTAL | 114 |
 
@@ -174,6 +174,6 @@ Cut-over baseline: `46b6276~1`. Sources audited only: old `interactive.zig`, old
 
 1. Recovery/replay notices are changed with the in-process ViewModel architecture; RPC will rebuild them later.
 2. Old presentation queue cadence/coalescing rows are changed by design: sampling is the reveal cadence.
-3. Row 114 remains backlog: unbroken single-line wrap cache for Debug worst-cases.
+3. Row 114 is restored: streamed plain rows retain committed wraps and only reflow the unstable suffix.
 
-| 114 | Unbroken single-line items re-wrap O(len) per append in App apply-side scroll math; 64KiB single line costs ~84ms in Debug. Pre-existing (parity with old architecture) but should gain an incremental wrap path. | render/Transcript layout | CHANGED | tui layout cache |
+| 114 | Unbroken single-line items retain committed soft wraps while streaming, so appends only reflow the unstable suffix. Markdown-sensitive rows reflow until their syntax becomes stable. | `Transcript`/layout cache | RESTORED | `layout.appendMarkdown` plus per-item `WrapState` |

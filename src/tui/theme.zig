@@ -8,34 +8,30 @@ pub const TerminalInfo = struct {
     color_level: ColorLevel = .unknown,
 };
 
-pub const LayoutEpoch = struct {
+pub const LayoutState = struct {
     width: u16,
     height: u16,
     expanded: bool = false,
     hide_thinking: bool = true,
-    revision: u64 = 0,
 
-    pub fn resize(self: *LayoutEpoch, width: u16, height: u16) bool {
+    pub fn resize(self: *LayoutState, width: u16, height: u16) bool {
         const width_changed = self.width != width;
         const height_changed = self.height != height;
         if (!width_changed and !height_changed) return false;
         self.width = width;
         self.height = height;
-        if (width_changed) self.revision +%= 1;
         return true;
     }
 
-    pub fn setExpanded(self: *LayoutEpoch, expanded: bool) bool {
+    pub fn setExpanded(self: *LayoutState, expanded: bool) bool {
         if (self.expanded == expanded) return false;
         self.expanded = expanded;
-        self.revision +%= 1;
         return true;
     }
 
-    pub fn setHideThinking(self: *LayoutEpoch, hidden: bool) bool {
+    pub fn setHideThinking(self: *LayoutState, hidden: bool) bool {
         if (self.hide_thinking == hidden) return false;
         self.hide_thinking = hidden;
-        self.revision +%= 1;
         return true;
     }
 };
@@ -98,14 +94,11 @@ test "terminal info resolves light theme from environment" {
     try std.testing.expectEqual(Scheme.dark, terminalInfoFromEnv(&env).scheme);
 }
 
-test "layout epoch increments only on visible changes" {
-    var epoch: LayoutEpoch = .{ .width = 80, .height = 24 };
-    try std.testing.expect(!epoch.resize(80, 24));
-    try std.testing.expectEqual(@as(u64, 0), epoch.revision);
-    try std.testing.expect(epoch.resize(100, 30));
-    try std.testing.expectEqual(@as(u64, 1), epoch.revision);
-    try std.testing.expect(epoch.setHideThinking(false));
-    try std.testing.expectEqual(@as(u64, 2), epoch.revision);
-    try std.testing.expect(epoch.resize(100, 40));
-    try std.testing.expectEqual(@as(u64, 2), epoch.revision);
+test "layout state reports only visible changes" {
+    var state: LayoutState = .{ .width = 80, .height = 24 };
+    try std.testing.expect(!state.resize(80, 24));
+    try std.testing.expect(state.resize(100, 30));
+    try std.testing.expect(state.setHideThinking(false));
+    try std.testing.expect(state.resize(100, 40));
+    try std.testing.expect(!state.setHideThinking(false));
 }

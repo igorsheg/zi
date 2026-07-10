@@ -21,6 +21,9 @@ new translation corridors.
 **`docs/runtime-zio-capabilities.md`** inventories the zio surface Zi actually
 uses. Use it before changing `src/runtime` or evaluating a zio replacement.
 
+**`docs/tui-performance.md`** defines transcript layout ownership, invalidation,
+work bounds, and the performance tests required for TUI changes.
+
 ## Architecture in one sentence
 
 `cli` selects a concrete frontend; the frontend owns the driving loop; the loop
@@ -90,6 +93,7 @@ transcript.
 **Transcript**
 The bounded TUI render fold owned by `src/tui/Transcript.zig`. It is rebuilt from
 live `AgentEvent`s or restored session entries and exists to render the screen.
+It owns all derived transcript layout caches and the transcript line index.
 It is presentation state, not durable truth.
 
 **Loop**
@@ -162,8 +166,9 @@ policy. `vaxis` imports stay inside `src/tui`.
    protocols.
 2. **One owner per visible fact.** If a fact is displayed, the owner that knows
    its cause should compose the user-facing copy or display contract.
-3. **One transcript representation.** TUI has one bounded `Transcript` plus dirty
-   derived layout/cache state. Do not add mirrors with revision taxonomies.
+3. **One transcript representation.** TUI has one bounded `Transcript`, which
+   also owns its ephemeral derived layout/cache and line-index state. Do not add
+   mirrors with revision taxonomies.
 4. **One wait point.** The frame loop waits on input/runtime wake sources with a
    deadline. Producers wake; owners inspect state.
 5. **Streaming-first.** Assistant text, thinking, tool calls, and tool output are
