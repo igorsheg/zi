@@ -32,11 +32,17 @@ pub const SubmittedPrompt = struct {
 };
 
 pub const frame_floor_ns: u64 = 16 * std.time.ns_per_ms;
+pub const agent_events_per_iteration_max: usize = 8;
 pub const watchdog_budget_ns: u64 = 33 * std.time.ns_per_ms;
 pub const double_key_window_ns: u64 = 500 * std.time.ns_per_ms;
 pub const spinner_interval_ns: u64 = 80 * std.time.ns_per_ms;
 const retry_status_tick_ns: u64 = std.time.ns_per_s;
 pub const shutdown_cancel_bound_ns: u64 = 5 * std.time.ns_per_s;
+const session_listing_deadline_ns: u64 = 5 * std.time.ns_per_s;
+const session_opening_deadline_ns: u64 = 30 * std.time.ns_per_s;
+const prompt_image_deadline_ns: u64 = 10 * std.time.ns_per_s;
+const restore_entries_per_iteration_max: usize = 16;
+const restore_work_bytes_per_iteration_target: usize = 256 * 1024;
 const exit_hint_text = "press ctrl+c again to exit";
 const scratch_capacity = 8192;
 const synthetic_flood_rate_bytes_per_second: u64 = 1024 * 1024;
@@ -100,7 +106,7 @@ pub const Viewport = union(enum) {
 };
 
 const prompt_image_count_max: usize = 4;
-const prompt_image_data_bytes_max: usize = 80 * 1024 * 1024;
+const prompt_image_encoded_bytes_total_max: usize = 768 * 1024;
 const prompt_image_mime_bytes_max: usize = 64;
 const clipboard_temp_path_count_max: usize = prompt_image_count_max;
 
@@ -150,7 +156,7 @@ const PromptImages = struct {
         var copied: usize = 0;
         errdefer freeItems(allocator, items[0..copied]);
         for (source, 0..) |image, index| {
-            if (image.data.len > prompt_image_data_bytes_max) return error.ImageTooLarge;
+            if (image.data.len > prompt_image_encoded_bytes_total_max) return error.ImageTooLarge;
             if (image.mime_type.len > prompt_image_mime_bytes_max) return error.ImageMimeTooLong;
             const data = try allocator.dupe(u8, image.data);
             errdefer allocator.free(data);
@@ -158,6 +164,17 @@ const PromptImages = struct {
             items[index] = .{ .data = data, .mime_type = mime_type };
             copied += 1;
         }
+        return .{ .items = items };
+    }
+
+    fn takeAttachments(
+        allocator: std.mem.Allocator,
+        attachments: *PromptImageAttachments,
+    ) !PromptImages {
+        if (attachments.len == 0) return .{};
+        const items = try allocator.alloc(ai.ImageContent, attachments.len);
+        @memcpy(items, attachments.items[0..attachments.len]);
+        attachments.len = 0;
         return .{ .items = items };
     }
 
@@ -197,6 +214,9 @@ pub const RunDriver = struct {
     overflow_count_before: usize = 0,
     overflow_retry_used: bool = false,
     retry: ?RetryDisplay = null,
+    progress_pending: bool = false,
+    awaiting_render: bool = false,
+    next_batch_deadline_ns: ?u64 = null,
 
     pub const RetryDisplay = struct { deadline_ns: u64, attempt: u8, max: u8 };
     pub const State = union(enum) {
@@ -208,6 +228,14 @@ pub const RunDriver = struct {
 
     pub fn busy(self: *const RunDriver) bool {
         return self.state != .idle;
+    }
+
+    pub fn cancellationOutstanding(self: *const RunDriver) bool {
+        return switch (self.state) {
+            .running => |*handle| handle.cancellationOutstanding(),
+            .compacting => |*state| state.handle.cancellationOutstanding(),
+            .idle, .retry_wait => false,
+        };
     }
 
     pub fn deinit(self: *RunDriver, allocator: std.mem.Allocator) void {
@@ -250,6 +278,35 @@ pub const RunDriver = struct {
         self.overflow_count_before = session.contextOverflowCount();
         self.overflow_retry_used = false;
         var handle = try session.startPromptHandle(text, images);
+        handle.setWake(io, wake);
+        self.state = .{ .running = handle };
+        owner.dirty = true;
+    }
+
+    pub fn submitPreparedPrompt(
+        self: *RunDriver,
+        owner: *Loop,
+        session: *coding_agent.AgentSession,
+        io: std.Io,
+        wake: *runtime.WakeEvent,
+        text: []const u8,
+        attachments: *PromptImageAttachments,
+    ) !void {
+        std.debug.assert(self.state == .idle);
+        self.clearSavedPrompt(owner.gpa);
+        var saved: SavedPrompt = .{};
+        saved.text.set(text);
+        saved.images = try PromptImages.takeAttachments(owner.gpa, attachments);
+        errdefer saved.deinit(owner.gpa);
+        var copied_bytes: usize = 0;
+        for (saved.images.items) |image| copied_bytes +|= image.data.len;
+        self.saved_prompt = saved;
+        saved = .{};
+        errdefer self.clearSavedPrompt(owner.gpa);
+        self.overflow_count_before = session.contextOverflowCount();
+        self.overflow_retry_used = false;
+        var handle = try session.startPromptHandle(text, self.saved_prompt.?.images.items);
+        owner.trace.recordPromptImageCompletionCopy(copied_bytes);
         handle.setWake(io, wake);
         self.state = .{ .running = handle };
         owner.dirty = true;
@@ -301,6 +358,14 @@ pub const RunDriver = struct {
         wake: *runtime.WakeEvent,
         now_ns: u64,
     ) !void {
+        if (self.progress_pending) {
+            if (self.awaiting_render or now_ns < self.next_batch_deadline_ns.?) {
+                owner.trace.recordGatedDriverPollSkip();
+                return;
+            }
+            self.progress_pending = false;
+            self.next_batch_deadline_ns = null;
+        }
         switch (self.state) {
             .idle => {},
             .running => |*handle| try self.pumpPromptHandle(owner, session, io, wake, now_ns, handle),
@@ -314,11 +379,31 @@ pub const RunDriver = struct {
         }
     }
 
+    pub fn markRendered(self: *RunDriver, frame_start_ns: u64) void {
+        if (!self.awaiting_render) return;
+        std.debug.assert(self.progress_pending);
+        self.awaiting_render = false;
+        self.next_batch_deadline_ns = frame_start_ns +| frame_floor_ns;
+    }
+
+    fn exhaustEventBudget(self: *RunDriver, owner: *Loop) void {
+        self.progress_pending = true;
+        self.awaiting_render = true;
+        self.next_batch_deadline_ns = null;
+        owner.trace.recordAgentEventBudgetExhaustion();
+    }
+
+    fn clearProgressGate(self: *RunDriver) void {
+        self.progress_pending = false;
+        self.awaiting_render = false;
+        self.next_batch_deadline_ns = null;
+    }
+
     pub fn cancel(self: *RunDriver, owner: *Loop, session: *coding_agent.AgentSession) void {
         switch (self.state) {
             .idle => {},
             .running => |*handle| {
-                handle.cancelRequest(session);
+                _ = handle.cancelRequest(session);
                 if (owner.editor.text().len == 0) owner.restoreQueuedText(session) catch {};
                 // The canceled run emits the terminal assistant "aborted" message.
             },
@@ -330,11 +415,18 @@ pub const RunDriver = struct {
                 owner.notice(.info, "aborted") catch {};
             },
             .compacting => |*state| {
-                state.handle.cancelRequest(session);
-                owner.notice(.info, "aborted") catch {};
+                _ = state.handle.cancelRequest(session);
             },
         }
         owner.dirty = true;
+    }
+
+    pub fn requestShutdown(self: *RunDriver, session: *coding_agent.AgentSession) void {
+        self.cancelNoNotice(session);
+    }
+
+    pub fn shutdownComplete(self: *const RunDriver) bool {
+        return self.state == .idle;
     }
 
     pub fn forceCancelAndDrain(self: *RunDriver, session: *coding_agent.AgentSession, io: std.Io, wake: *runtime.WakeEvent) void {
@@ -343,6 +435,7 @@ pub const RunDriver = struct {
         while (self.state != .idle and nowNs(io) -| start < shutdown_cancel_bound_ns) {
             var dummy = Loop.dummyForShutdown(session.allocator);
             defer dummy.deinit();
+            self.clearProgressGate();
             self.pump(&dummy, session, io, wake, nowNs(io)) catch break;
             if (self.state == .idle) break;
             wake.waitTimeout(io, .{ .duration = .{ .raw = .fromMilliseconds(100), .clock = .awake } }) catch {};
@@ -353,13 +446,13 @@ pub const RunDriver = struct {
     fn cancelNoNotice(self: *RunDriver, session: *coding_agent.AgentSession) void {
         switch (self.state) {
             .idle => {},
-            .running => |*handle| handle.cancelRequest(session),
+            .running => |*handle| _ = handle.cancelRequest(session),
             .retry_wait => {
                 session.cancelRetryWait();
                 self.state = .idle;
                 self.retry = null;
             },
-            .compacting => |*state| state.handle.cancelRequest(session),
+            .compacting => |*state| _ = state.handle.cancelRequest(session),
         }
     }
 
@@ -372,13 +465,23 @@ pub const RunDriver = struct {
         now_ns: u64,
         handle: *coding_agent.AgentSession.RunHandle,
     ) !void {
-        while (true) {
+        var applied: usize = 0;
+        defer owner.trace.recordAgentEventsApplied(applied);
+        while (applied < agent_events_per_iteration_max) {
             switch (try handle.poll(session)) {
-                .live => owner.dirty = true,
+                .live => {
+                    applied += 1;
+                    owner.frame_events_applied += 1;
+                    owner.dirty = true;
+                },
                 .empty => return,
                 .settled => break,
             }
+        } else {
+            self.exhaustEventBudget(owner);
+            return;
         }
+        self.clearProgressGate();
         const verdict = try handle.settle(session, .{
             .overflow_count_before = self.overflow_count_before,
             .overflow_retry_used = self.overflow_retry_used,
@@ -399,13 +502,23 @@ pub const RunDriver = struct {
         handle: *coding_agent.AgentSession.RunHandle,
         will_retry: bool,
     ) !void {
-        while (true) {
+        var applied: usize = 0;
+        defer owner.trace.recordAgentEventsApplied(applied);
+        while (applied < agent_events_per_iteration_max) {
             switch (try handle.poll(session)) {
-                .live => owner.dirty = true,
+                .live => {
+                    applied += 1;
+                    owner.frame_events_applied += 1;
+                    owner.dirty = true;
+                },
                 .empty => return,
                 .settled => break,
             }
+        } else {
+            self.exhaustEventBudget(owner);
+            return;
         }
+        self.clearProgressGate();
         const compaction_run = handle.run.compaction;
         const had_summary = compaction_run.outcome == .summary;
         const verdict = try handle.settle(session, .{ .overflow_count_before = self.overflow_count_before, .overflow_retry_used = self.overflow_retry_used });
@@ -723,9 +836,78 @@ const Picker = struct {
     }
 };
 
+const OperationNotice = struct {
+    buffer: [64]u8 = undefined,
+    len: u8 = 0,
+
+    fn init(value: []const u8) OperationNotice {
+        var out: OperationNotice = .{};
+        out.len = @intCast(copyBounded(&out.buffer, value));
+        return out;
+    }
+
+    fn text(self: *const OperationNotice) []const u8 {
+        return self.buffer[0..self.len];
+    }
+};
+
+const PromptImagePreparation = union(enum) {
+    idle,
+    preparing: Preparing,
+
+    const Preparing = struct {
+        task: runtime.Task(anyerror!PromptImageAttachments),
+        cancel: *runtime.CancelSource,
+        deadline_ns: u64,
+        apply_result: bool = true,
+        timed_out: bool = false,
+        prompt: SubmittedPrompt,
+        pinned_paths: [prompt_image_count_max]?[]u8 = @splat(null),
+        pinned_path_count: usize = 0,
+    };
+};
+
+const SessionOperation = union(enum) {
+    idle,
+    listing: Listing,
+    opening: Opening,
+    discarding_opened: *coding_agent.AgentSession,
+    draining_previous: DrainingPrevious,
+    restoring: Restoring,
+
+    const Listing = struct {
+        task: runtime.Task(anyerror!coding_agent.session_listing.SessionSummaryList),
+        cancel: *runtime.CancelSource,
+        deadline_ns: u64,
+        apply_result: bool = true,
+    };
+
+    const Opening = struct {
+        task: runtime.Task(anyerror!*coding_agent.AgentSession),
+        cancel: *runtime.CancelSource,
+        deadline_ns: u64,
+        apply_result: bool = true,
+        success_notice: OperationNotice,
+    };
+
+    const DrainingPrevious = struct {
+        next_session: *coding_agent.AgentSession,
+        deadline_ns: u64,
+        success_notice: OperationNotice,
+    };
+
+    const Restoring = struct {
+        next_entry_index: usize = 0,
+        success_notice: OperationNotice,
+        awaiting_render: bool = false,
+        next_step_deadline_ns: ?u64 = null,
+    };
+};
+
 pub const Loop = struct {
     gpa: std.mem.Allocator,
     editor: Editor = .{},
+    preferred_editor_column_cells: ?usize = null,
     transcript: Transcript = undefined,
     trace: trace_mod.Stats = .{},
     submitted_prompt: ?SubmittedPrompt = null,
@@ -762,6 +944,8 @@ pub const Loop = struct {
     services: ?*coding_agent.runtime_services.RuntimeServices = null,
     completion: CompletionPopup = .{},
     picker: Picker = .{},
+    session_operation: SessionOperation = .idle,
+    prompt_image_preparation: PromptImagePreparation = .idle,
     dismissed_picker_kind: ?PickerKind = null,
     dismissed_picker_text: [Editor.capacity]u8 = undefined,
     dismissed_picker_text_len: usize = 0,
@@ -782,6 +966,7 @@ pub const Loop = struct {
     token_input_total: u64 = 0,
     token_output_total: u64 = 0,
     compaction_count: usize = 0,
+    shutdown_requested: bool = false,
 
     pub const InitOptions = struct {
         initial_prompt: ?[]const u8 = null,
@@ -807,6 +992,8 @@ pub const Loop = struct {
     }
 
     pub fn deinit(self: *Loop) void {
+        self.drainPromptImagePreparation();
+        self.drainSessionOperation();
         if (self.clipboard_image_task) |*task| {
             if (!task.hasResult()) task.cancel();
             var result = task.getResult() catch null;
@@ -842,6 +1029,15 @@ pub const Loop = struct {
         }
     }
 
+    pub fn startNonCooperativeShutdownTaskForTest(self: *Loop) !void {
+        const services = self.services orelse return error.NoRuntimeServices;
+        std.debug.assert(self.clipboard_image_task == null);
+        self.clipboard_image_task = try services.task_runtime.spawnBlocking(
+            nonCooperativeShutdownWorker,
+            .{self.io},
+        );
+    }
+
     pub fn restoreSessionFold(self: *Loop) !void {
         const session = self.session orelse return;
         self.transcript.clear();
@@ -850,12 +1046,10 @@ pub const Loop = struct {
         self.token_cache_entry_count = std.math.maxInt(usize);
         self.token_input_total = 0;
         self.token_output_total = 0;
-        for (session.manager.entries.items) |entry| switch (entry) {
-            .message => |message_entry| try self.restoreMessage(message_entry.message),
-            .compaction => |compaction| try self.transcript.appendCompaction(compaction.summary, compaction.tokens_before),
-            .model_change => |model_change| try self.noticeFmt(.info, "model: {s}/{s}", .{ model_change.provider, model_change.model_id }),
-            .thinking_level_change => |change| try self.noticeFmt(.info, "thinking: {s}", .{change.thinking_level}),
-        };
+        var entry_index: usize = 0;
+        while (entry_index < session.manager.entries.items.len) {
+            entry_index = try self.restoreEntriesStep(entry_index);
+        }
         self.refreshTokenCache();
         self.repinViewport();
         self.dirty = true;
@@ -972,6 +1166,11 @@ pub const Loop = struct {
         self.trace.recordInputAction();
         self.frame_events_applied += 1;
         self.dirty = true;
+        const editor_vertical = switch (action) {
+            .key_editor => |op| !self.picker.active and !self.completion.active and (op == .move_up or op == .move_down),
+            else => false,
+        };
+        if (!editor_vertical) self.preferred_editor_column_cells = null;
         if (try self.handlePickerAction(action)) return;
         if (try self.handleCompletionAction(action)) return;
         switch (action) {
@@ -1102,6 +1301,22 @@ pub const Loop = struct {
 
     pub fn nextTimerDeadlineNs(self: *const Loop) ?u64 {
         var deadline = self.ctrl_c_deadline_ns;
+        switch (self.session_operation) {
+            .listing => |listing| deadline = if (deadline) |current| @min(current, listing.deadline_ns) else listing.deadline_ns,
+            .opening => |opening| deadline = if (deadline) |current| @min(current, opening.deadline_ns) else opening.deadline_ns,
+            .draining_previous => |draining| deadline = if (deadline) |current| @min(current, draining.deadline_ns) else draining.deadline_ns,
+            .restoring => |restoring| if (restoring.next_step_deadline_ns) |restore_deadline| {
+                deadline = if (deadline) |current| @min(current, restore_deadline) else restore_deadline;
+            },
+            .discarding_opened, .idle => {},
+        }
+        if (self.driver.next_batch_deadline_ns) |batch_deadline| {
+            deadline = if (deadline) |current| @min(current, batch_deadline) else batch_deadline;
+        }
+        switch (self.prompt_image_preparation) {
+            .preparing => |preparing| deadline = if (deadline) |current| @min(current, preparing.deadline_ns) else preparing.deadline_ns,
+            .idle => {},
+        }
         if (self.driver.retry) |retry| deadline = if (deadline) |current| @min(current, retry.deadline_ns) else retry.deadline_ns;
         if (self.statusAnimated() or self.transcript.hasPendingRelayout()) {
             const animation_due = render_policy.nextRenderDueNsWithFloor(self.last_frame_start_ns, frame_floor_ns);
@@ -1118,7 +1333,9 @@ pub const Loop = struct {
     }
 
     pub fn noteResize(self: *Loop, width: u16, height: u16) bool {
+        const width_changed = self.layout_state.width != width;
         if (!self.layout_state.resize(width, height)) return false;
+        if (width_changed) self.preferred_editor_column_cells = null;
         self.dirty = true;
         return true;
     }
@@ -1139,6 +1356,14 @@ pub const Loop = struct {
     }
 
     pub fn markRenderedWithTimings(self: *Loop, frame_start_ns: u64, timings: RenderTimings) void {
+        self.driver.markRendered(frame_start_ns);
+        switch (self.session_operation) {
+            .restoring => |*restoring| if (restoring.awaiting_render) {
+                restoring.awaiting_render = false;
+                restoring.next_step_deadline_ns = frame_start_ns +| frame_floor_ns;
+            },
+            else => {},
+        }
         if (self.statusAnimated()) {
             if (self.last_animated_frame_start_ns) |previous| {
                 self.trace.recordAnimatedFrameGap(frame_start_ns -| previous, frame_floor_ns);
@@ -1164,6 +1389,8 @@ pub const Loop = struct {
         self.dirty = false;
     }
     pub fn tick(self: *Loop, now_ns: u64) !void {
+        try self.pollSessionOperation(now_ns);
+        try self.pollPromptImagePreparation(now_ns);
         try self.pollClipboardImageTask();
         const file_index_changed = try self.pollFileIndexTask();
         const scoped_query_ready = if (self.scoped_file_query_task) |*task| task.hasResult() else false;
@@ -1195,6 +1422,153 @@ pub const Loop = struct {
         const session = self.session orelse return;
         const wake = self.wake orelse return;
         self.driver.forceCancelAndDrain(session, self.io, wake);
+    }
+
+    pub fn requestShutdown(self: *Loop) void {
+        if (self.shutdown_requested) return;
+        self.shutdown_requested = true;
+        if (self.session) |session| {
+            self.driver.requestShutdown(session);
+            session.requestShutdown();
+        }
+        switch (self.session_operation) {
+            .listing => |*listing| {
+                listing.apply_result = false;
+                listing.cancel.request();
+            },
+            .opening => |*opening| {
+                opening.apply_result = false;
+                opening.cancel.request();
+            },
+            .discarding_opened => |next| next.requestShutdown(),
+            .draining_previous => |draining| draining.next_session.requestShutdown(),
+            .restoring, .idle => {},
+        }
+        switch (self.prompt_image_preparation) {
+            .preparing => |*preparing| {
+                preparing.apply_result = false;
+                preparing.cancel.request();
+            },
+            .idle => {},
+        }
+    }
+
+    pub fn pollShutdown(self: *Loop) bool {
+        std.debug.assert(self.shutdown_requested);
+        const session = self.session orelse return false;
+        if (!self.driver.shutdownComplete()) {
+            self.driver.requestShutdown(session);
+            self.driver.clearProgressGate();
+            const wake = self.wake orelse return false;
+            self.driver.pump(self, session, self.io, wake, nowNs(self.io)) catch return false;
+        }
+        self.pollPromptImageShutdown();
+        self.pollSessionOperationShutdown();
+        self.pollClipboardImageShutdown();
+        self.pollFileIndexShutdown();
+        self.pollScopedFileQueryShutdown();
+        session.requestShutdown();
+        return self.driver.shutdownComplete() and
+            self.prompt_image_preparation == .idle and
+            self.session_operation == .idle and
+            self.clipboard_image_task == null and
+            self.file_index_task == null and
+            self.scoped_file_query_task == null and
+            session.shutdownComplete();
+    }
+
+    fn pollPromptImageShutdown(self: *Loop) void {
+        switch (self.prompt_image_preparation) {
+            .idle => {},
+            .preparing => |*preparing| {
+                if (!preparing.task.hasResult()) return;
+                var result = preparing.task.getResult() catch null;
+                if (result) |*images| images.deinit(self.gpa);
+                const pinned = preparing.pinned_paths;
+                const pinned_count = preparing.pinned_path_count;
+                const cancel = preparing.cancel;
+                cancel.deinit();
+                self.gpa.destroy(cancel);
+                self.prompt_image_preparation = .idle;
+                self.returnPinnedPromptImagePaths(pinned, pinned_count);
+            },
+        }
+    }
+
+    fn pollSessionOperationShutdown(self: *Loop) void {
+        switch (self.session_operation) {
+            .idle => {},
+            .listing => |*listing| {
+                if (!listing.task.hasResult()) return;
+                var result = listing.task.getResult() catch null;
+                if (result) |*summaries| summaries.deinit(self.gpa);
+                const cancel = listing.cancel;
+                cancel.deinit();
+                self.gpa.destroy(cancel);
+                self.session_operation = .idle;
+            },
+            .opening => |*opening| {
+                if (!opening.task.hasResult()) return;
+                const result = opening.task.getResult() catch null;
+                const cancel = opening.cancel;
+                cancel.deinit();
+                self.gpa.destroy(cancel);
+                if (result) |next| {
+                    next.requestShutdown();
+                    self.session_operation = .{ .discarding_opened = next };
+                } else {
+                    self.session_operation = .idle;
+                }
+            },
+            .discarding_opened => |next| {
+                next.requestShutdown();
+                if (!next.shutdownComplete()) return;
+                next.deinit();
+                self.gpa.destroy(next);
+                self.session_operation = .idle;
+            },
+            .draining_previous => |draining| {
+                const current = self.session orelse return;
+                current.requestShutdown();
+                draining.next_session.requestShutdown();
+                if (!current.shutdownComplete() or !draining.next_session.shutdownComplete()) return;
+                draining.next_session.deinit();
+                self.gpa.destroy(draining.next_session);
+                self.session_operation = .idle;
+            },
+            .restoring => self.session_operation = .idle,
+        }
+    }
+
+    fn pollClipboardImageShutdown(self: *Loop) void {
+        if (self.clipboard_image_task) |*task| {
+            if (!task.hasResult()) return;
+            var result = task.getResult() catch null;
+            if (result) |*paste| {
+                deleteClipboardTempPath(self.io, paste.path);
+                paste.deinit(self.gpa);
+            }
+            self.clipboard_image_task = null;
+        }
+    }
+
+    fn pollFileIndexShutdown(self: *Loop) void {
+        if (self.file_index_task) |*task| {
+            if (!task.hasResult()) return;
+            var result = task.getResult() catch null;
+            if (result) |*index| index.deinit(self.gpa);
+            self.file_index_task = null;
+        }
+    }
+
+    fn pollScopedFileQueryShutdown(self: *Loop) void {
+        if (self.scoped_file_query_task) |*task| {
+            if (!task.hasResult()) return;
+            const result = task.getResult() catch null;
+            if (result) |value| value.destroy(self.gpa);
+            self.scoped_file_query_task = null;
+            self.scoped_file_query_len = 0;
+        }
     }
 
     pub fn notice(self: *Loop, level: Transcript.NoticeLevel, text: []const u8) !void {
@@ -1402,7 +1776,20 @@ pub const Loop = struct {
     fn statusView(self: *Loop, now_ns: u64) chrome.StatusView {
         if (self.exit_requested) return .{ .text = "exiting" };
         if (self.exit_hint_visible) return .{ .text = exit_hint_text };
+        switch (self.session_operation) {
+            .listing => |listing| return .{ .text = if (listing.apply_result) "Loading sessions… (esc to cancel)" else "Canceling…" },
+            .opening => |opening| return .{ .text = if (opening.apply_result) "Opening session… (esc to cancel)" else "Canceling…" },
+            .discarding_opened => return .{ .text = "Canceling…" },
+            .draining_previous => return .{ .text = "Switching session…" },
+            .restoring => return .{ .text = "Restoring session…" },
+            .idle => {},
+        }
+        switch (self.prompt_image_preparation) {
+            .preparing => |preparing| return .{ .text = if (preparing.apply_result) "Preparing images… (esc to cancel)" else "Canceling image preparation…" },
+            .idle => {},
+        }
         if (self.clipboard_image_task != null) return .{ .text = "Reading clipboard image…" };
+        if (self.driver.cancellationOutstanding()) return .{ .text = "Canceling…" };
         switch (self.driver.state) {
             .retry_wait => if (self.driver.retry) |retry| {
                 const remaining_ns = retry.deadline_ns -| now_ns;
@@ -1603,6 +1990,14 @@ pub const Loop = struct {
     }
 
     fn startClipboardImagePaste(self: *Loop) !void {
+        if (self.session_operation != .idle) {
+            try self.notice(.warn, "busy: session operation in progress — esc to cancel");
+            return;
+        }
+        if (self.prompt_image_preparation != .idle) {
+            try self.notice(.warn, "busy: preparing images — esc to cancel");
+            return;
+        }
         if (self.clipboard_image_task != null) {
             try self.notice(.warn, "clipboard image paste already in progress");
             return;
@@ -1853,8 +2248,8 @@ pub const Loop = struct {
             .move_right => _ = self.editor.moveRight(),
             .move_word_left => _ = self.editor.moveWordLeft(),
             .move_word_right => _ = self.editor.moveWordRight(),
-            .move_up_history => _ = self.editor.historyPrev(),
-            .move_down_history => _ = self.editor.historyNext(),
+            .move_up => self.moveEditorVertical(.up),
+            .move_down => self.moveEditorVertical(.down),
             .backspace => _ = self.editor.backspace(),
             .delete_forward => _ = self.editor.deleteForward(),
             .home => self.editor.moveHome(),
@@ -1872,6 +2267,31 @@ pub const Loop = struct {
         }
     }
 
+    fn moveEditorVertical(self: *Loop, direction: chrome.VerticalDirection) void {
+        switch (chrome.verticalCursorTarget(
+            &self.editor,
+            self.layout_state.width,
+            self.layout_state.height,
+            direction,
+            self.preferred_editor_column_cells,
+        )) {
+            .cursor => |target| {
+                if (self.editor.moveCursorTo(target.byte)) {
+                    self.preferred_editor_column_cells = target.preferred_column_cells;
+                } else {
+                    self.preferred_editor_column_cells = null;
+                }
+            },
+            .history => {
+                _ = switch (direction) {
+                    .up => self.editor.historyPrev(),
+                    .down => self.editor.historyNext(),
+                };
+                self.preferred_editor_column_cells = null;
+            },
+        }
+    }
+
     const CompletionRefresh = enum { auto, force_file };
     const SlashDispatchResult = enum { not_slash, handled_clear_editor, opened_picker_keep_editor };
 
@@ -1884,15 +2304,16 @@ pub const Loop = struct {
         if (!self.picker.active) return false;
         switch (action) {
             .cancel => {
+                if (self.picker.currentKind() == .session) self.cancelSessionListing();
                 try self.backPicker();
                 return true;
             },
             .key_editor => |op| switch (op) {
-                .move_up_history => {
+                .move_up => {
                     self.movePickerSelection(-1);
                     return true;
                 },
-                .move_down_history => {
+                .move_down => {
                     self.movePickerSelection(1);
                     return true;
                 },
@@ -1939,11 +2360,11 @@ pub const Loop = struct {
                     }
                     return true;
                 },
-                .move_up_history => if (self.completion.active) {
+                .move_up => if (self.completion.active) {
                     self.completion.move(-1);
                     return true;
                 },
-                .move_down_history => if (self.completion.active) {
+                .move_down => if (self.completion.active) {
                     self.completion.move(1);
                     return true;
                 },
@@ -2255,6 +2676,208 @@ pub const Loop = struct {
         self.dirty = true;
     }
 
+    fn collectTrackedPromptImagePaths(
+        self: *Loop,
+        prompt: []const u8,
+        out: *[prompt_image_count_max]?[]u8,
+    ) usize {
+        var count: usize = 0;
+        var index: usize = 0;
+        while (index < prompt.len and count < out.len) {
+            const at = std.mem.indexOfScalarPos(u8, prompt, index, '@') orelse break;
+            index = at + 1;
+            const path_start = index;
+            while (index < prompt.len and isPromptPathByte(prompt[index])) : (index += 1) {}
+            if (index == path_start) continue;
+            const path = prompt[path_start..index];
+            for (self.clipboard_temp_paths[0..self.clipboard_temp_path_count]) |maybe_tracked| {
+                const tracked = maybe_tracked orelse continue;
+                if (!std.mem.eql(u8, tracked, path)) continue;
+                for (out[0..count]) |existing| {
+                    if (std.mem.eql(u8, existing.?, tracked)) break;
+                } else {
+                    out[count] = tracked;
+                    count += 1;
+                }
+                break;
+            }
+        }
+        return count;
+    }
+
+    fn startPromptImagePreparation(
+        self: *Loop,
+        prompt: []const u8,
+        paths: [prompt_image_count_max]?[]u8,
+        path_count: usize,
+    ) !void {
+        if (self.session_operation != .idle or self.clipboard_image_task != null) {
+            try self.notice(.warn, "finish or cancel the current operation first");
+            return;
+        }
+        const services = self.services orelse return error.NoServices;
+        _ = self.session orelse return error.NoSession;
+
+        var pinned: [prompt_image_count_max]?[]u8 = @splat(null);
+        var pinned_count: usize = 0;
+        errdefer self.returnPinnedPromptImagePaths(pinned, pinned_count);
+        for (paths[0..path_count]) |maybe_path| {
+            const path = maybe_path.?;
+            pinned[pinned_count] = self.takeClipboardTempPath(path) orelse return error.ImagePathNotTracked;
+            pinned_count += 1;
+        }
+
+        const cancel = try self.gpa.create(runtime.CancelSource);
+        errdefer self.gpa.destroy(cancel);
+        cancel.* = try runtime.CancelSource.init(self.gpa, self.io);
+        errdefer cancel.deinit();
+        const task = try services.task_runtime.spawn(preparePromptImagesWorker, .{
+            self.gpa,
+            self.io,
+            pinned,
+            pinned_count,
+            cancel.token(),
+        });
+        var captured: SubmittedPrompt = .{};
+        captured.set(prompt);
+        self.prompt_image_preparation = .{ .preparing = .{
+            .task = task,
+            .cancel = cancel,
+            .deadline_ns = nowNs(self.io) +| prompt_image_deadline_ns,
+            .prompt = captured,
+            .pinned_paths = pinned,
+            .pinned_path_count = pinned_count,
+        } };
+        self.editor.pushHistory(prompt);
+        self.editor.clear();
+        self.dirty = true;
+    }
+
+    fn pollPromptImagePreparation(self: *Loop, now_ns: u64) !void {
+        switch (self.prompt_image_preparation) {
+            .idle => {},
+            .preparing => |*preparing| {
+                if (preparing.apply_result and now_ns >= preparing.deadline_ns) {
+                    preparing.apply_result = false;
+                    preparing.timed_out = true;
+                    preparing.cancel.request();
+                    try self.notice(.warn, "image preparation timed out — press up to recover the prompt");
+                }
+                if (!preparing.task.hasResult()) return;
+                var result = preparing.task.getResult() catch |err| {
+                    const apply_result = preparing.apply_result;
+                    const timed_out = preparing.timed_out;
+                    const pinned = preparing.pinned_paths;
+                    const pinned_count = preparing.pinned_path_count;
+                    self.finishPromptImagePreparation();
+                    self.returnPinnedPromptImagePaths(pinned, pinned_count);
+                    if (apply_result and err != error.OperationCancelled) {
+                        try self.notice(.warn, "image preparation failed — press up to recover the prompt");
+                    } else if (!apply_result and !timed_out) {
+                        try self.notice(.info, "image preparation canceled — press up to recover the prompt");
+                    }
+                    return;
+                };
+                const apply_result = preparing.apply_result;
+                const prompt = preparing.prompt;
+                const pinned = preparing.pinned_paths;
+                const pinned_count = preparing.pinned_path_count;
+                self.finishPromptImagePreparation();
+                defer result.deinit(self.gpa);
+                if (!apply_result) {
+                    self.returnPinnedPromptImagePaths(pinned, pinned_count);
+                    try self.notice(.info, "image preparation canceled — press up to recover the prompt");
+                    return;
+                }
+                const session = self.session orelse {
+                    self.returnPinnedPromptImagePaths(pinned, pinned_count);
+                    return error.NoSession;
+                };
+                const wake = self.wake orelse return error.NoWake;
+                self.driver.submitPreparedPrompt(self, session, self.io, wake, prompt.text(), &result) catch {
+                    self.returnPinnedPromptImagePaths(pinned, pinned_count);
+                    try self.notice(.warn, "image preparation failed — press up to recover the prompt");
+                    return;
+                };
+                self.deletePinnedPromptImagePaths(pinned, pinned_count);
+            },
+        }
+    }
+
+    fn cancelPromptImagePreparation(self: *Loop) bool {
+        switch (self.prompt_image_preparation) {
+            .preparing => |*preparing| if (preparing.apply_result) {
+                preparing.apply_result = false;
+                preparing.cancel.request();
+                self.dirty = true;
+                return true;
+            },
+            .idle => {},
+        }
+        return false;
+    }
+
+    fn finishPromptImagePreparation(self: *Loop) void {
+        const cancel = self.prompt_image_preparation.preparing.cancel;
+        cancel.deinit();
+        self.gpa.destroy(cancel);
+        self.prompt_image_preparation = .idle;
+        self.dirty = true;
+    }
+
+    fn drainPromptImagePreparation(self: *Loop) void {
+        switch (self.prompt_image_preparation) {
+            .idle => {},
+            .preparing => |*preparing| {
+                preparing.apply_result = false;
+                preparing.cancel.request();
+                if (!preparing.task.hasResult()) preparing.task.cancel();
+                var result = preparing.task.getResult() catch null;
+                if (result) |*images| images.deinit(self.gpa);
+                const pinned = preparing.pinned_paths;
+                const pinned_count = preparing.pinned_path_count;
+                const cancel = preparing.cancel;
+                cancel.deinit();
+                self.gpa.destroy(cancel);
+                self.prompt_image_preparation = .idle;
+                self.returnPinnedPromptImagePaths(pinned, pinned_count);
+            },
+        }
+    }
+
+    fn takeClipboardTempPath(self: *Loop, path: []const u8) ?[]u8 {
+        for (self.clipboard_temp_paths[0..self.clipboard_temp_path_count], 0..) |maybe_path, index| {
+            const tracked = maybe_path orelse continue;
+            if (!std.mem.eql(u8, tracked, path)) continue;
+            const last = self.clipboard_temp_path_count - 1;
+            self.clipboard_temp_paths[index] = self.clipboard_temp_paths[last];
+            self.clipboard_temp_paths[last] = null;
+            self.clipboard_temp_path_count -= 1;
+            return tracked;
+        }
+        return null;
+    }
+
+    fn returnPinnedPromptImagePaths(
+        self: *Loop,
+        paths: [prompt_image_count_max]?[]u8,
+        count: usize,
+    ) void {
+        for (paths[0..count]) |maybe_path| self.retainClipboardTempPath(maybe_path.?) catch unreachable;
+    }
+
+    fn deletePinnedPromptImagePaths(
+        self: *Loop,
+        paths: [prompt_image_count_max]?[]u8,
+        count: usize,
+    ) void {
+        for (paths[0..count]) |maybe_path| {
+            const path = maybe_path.?;
+            deleteClipboardTempPath(self.io, path);
+            self.gpa.free(path);
+        }
+    }
+
     fn clipboardImageAttachmentsFromPrompt(self: *Loop, prompt: []const u8) !PromptImageAttachments {
         var attachments: PromptImageAttachments = .{};
         errdefer attachments.deinit(self.gpa);
@@ -2280,7 +2903,7 @@ pub const Loop = struct {
         if (file_len == 0) return error.NoImage;
         const raw_len: usize = @intCast(file_len);
         const encoded_len = std.base64.standard.Encoder.calcSize(raw_len);
-        if (encoded_len > prompt_image_data_bytes_max) return error.ImageTooLarge;
+        if (encoded_len > prompt_image_encoded_bytes_total_max) return error.ImageTooLarge;
         const raw = try self.gpa.alloc(u8, raw_len);
         defer self.gpa.free(raw);
         const read_len = try file.readPositionalAll(self.io, raw, 0);
@@ -2302,6 +2925,14 @@ pub const Loop = struct {
         }
         const text = self.editor.text();
         if (text.len == 0) return;
+        if (self.sessionOperationBlocksSubmit()) {
+            try self.notice(.warn, switch (self.session_operation) {
+                .opening, .listing => "busy: session operation in progress — esc to cancel",
+                .discarding_opened, .draining_previous, .restoring => "busy: switching sessions",
+                .idle => unreachable,
+            });
+            return;
+        }
         self.repinViewport();
         switch (try self.dispatchSlashIfNeeded(text)) {
             .not_slash => {},
@@ -2314,8 +2945,20 @@ pub const Loop = struct {
         }
         var expanded_buffer: [Editor.capacity]u8 = undefined;
         const expanded = try self.editor.expandedText(&expanded_buffer);
-        var images = try self.clipboardImageAttachmentsFromPrompt(expanded);
-        defer images.deinit(self.gpa);
+        if (self.prompt_image_preparation != .idle) {
+            try self.notice(.warn, "busy: preparing images — esc to cancel");
+            return;
+        }
+        var image_paths: [prompt_image_count_max]?[]u8 = @splat(null);
+        const image_path_count = self.collectTrackedPromptImagePaths(expanded, &image_paths);
+        if (image_path_count > 0) {
+            if (self.driver.state != .idle) {
+                try self.notice(.warn, "wait for the current run before sending images");
+                return;
+            }
+            try self.startPromptImagePreparation(expanded, image_paths, image_path_count);
+            return;
+        }
         const session = self.session orelse {
             self.submitted_prompt = .{};
             self.submitted_prompt.?.set(expanded);
@@ -2326,12 +2969,12 @@ pub const Loop = struct {
         };
         const wake = self.wake orelse return error.NoWake;
         switch (action) {
-            .follow_up_submit => try self.driver.queuePrompt(self, session, expanded, images.images(), .follow_up),
-            .steer_submit => try self.driver.queuePrompt(self, session, expanded, images.images(), .steer),
+            .follow_up_submit => try self.driver.queuePrompt(self, session, expanded, &.{}, .follow_up),
+            .steer_submit => try self.driver.queuePrompt(self, session, expanded, &.{}, .steer),
             else => if (self.driver.state == .running)
-                try self.driver.queuePrompt(self, session, expanded, images.images(), .steer)
+                try self.driver.queuePrompt(self, session, expanded, &.{}, .steer)
             else
-                try self.driver.submitPrompt(self, session, self.io, wake, expanded, images.images()),
+                try self.driver.submitPrompt(self, session, self.io, wake, expanded, &.{}),
         }
         self.editor.pushHistory(expanded);
         self.editor.clear();
@@ -2400,6 +3043,14 @@ pub const Loop = struct {
             },
         }
         return .handled_clear_editor;
+    }
+
+    fn sessionOperationBlocksSubmit(self: *const Loop) bool {
+        return switch (self.session_operation) {
+            .idle => false,
+            .listing => |listing| listing.apply_result,
+            .opening, .discarding_opened, .draining_previous, .restoring => true,
+        };
     }
 
     fn noSessionMode(self: *Loop) bool {
@@ -2478,22 +3129,266 @@ pub const Loop = struct {
             try self.notice(.warn, "no-session mode: resume is disabled");
             return;
         }
+        if (self.driver.state != .idle or self.clipboard_image_task != null or self.prompt_image_preparation != .idle) {
+            try self.notice(.warn, "finish or cancel the current operation first");
+            return;
+        }
+        if (self.session_operation != .idle) {
+            try self.notice(.warn, "busy: session operation in progress — esc to cancel");
+            return;
+        }
         const services = self.services orelse return error.NoServices;
-        var summaries = try coding_agent.session_listing.listRuntimeSessionSummaries(self.gpa, self.io, .{
-            .cwd = services.cwd,
-            .agent_dir_override = services.agent_dir,
-            .dir = services.dir,
-            .environ = services.environ,
-        });
-        defer summaries.deinit(self.gpa);
         self.picker.reset(.session);
+        self.completion.clear();
+
+        const cancel = try self.gpa.create(runtime.CancelSource);
+        errdefer self.gpa.destroy(cancel);
+        cancel.* = try runtime.CancelSource.init(self.gpa, self.io);
+        errdefer cancel.deinit();
+        const task = try services.task_runtime.spawn(listSessionSummariesWorker, .{
+            self.gpa,
+            self.io,
+            services.cwd,
+            services.agent_dir,
+            services.dir,
+            services.environ,
+            cancel.token(),
+        });
+        self.session_operation = .{ .listing = .{
+            .task = task,
+            .cancel = cancel,
+            .deadline_ns = nowNs(self.io) +| session_listing_deadline_ns,
+        } };
+        self.dirty = true;
+    }
+
+    fn pollSessionOperation(self: *Loop, now_ns: u64) !void {
+        switch (self.session_operation) {
+            .idle => {},
+            .listing => |*listing| try self.pollSessionListing(listing, now_ns),
+            .opening => |*opening| try self.pollSessionOpening(opening, now_ns),
+            .discarding_opened => {},
+            .draining_previous => |*draining| try self.pollPreviousSessionDrain(draining, now_ns),
+            .restoring => |*restoring| try self.pollSessionRestore(restoring, now_ns),
+        }
+    }
+
+    fn pollSessionListing(self: *Loop, listing: *SessionOperation.Listing, now_ns: u64) !void {
+        if (listing.apply_result and now_ns >= listing.deadline_ns) {
+            listing.apply_result = false;
+            listing.cancel.request();
+            if (self.picker.active and self.picker.currentKind() == .session) self.picker.clear();
+            try self.notice(.warn, "session listing timed out");
+        }
+        if (!listing.task.hasResult()) return;
+        var summaries = listing.task.getResult() catch |err| {
+            const apply_result = listing.apply_result;
+            self.finishSessionListing();
+            if (apply_result and err != error.OperationCancelled) {
+                try self.noticeFmt(.warn, "session listing failed: {s}", .{@errorName(err)});
+            }
+            return;
+        };
+        const apply_result = listing.apply_result and self.picker.active and self.picker.currentKind() == .session;
+        self.finishSessionListing();
+        defer summaries.deinit(self.gpa);
+        if (!apply_result) return;
         for (summaries.items) |summary| {
             var meta_buffer: [completion_text_bytes_max]u8 = undefined;
             const meta = std.fmt.bufPrint(&meta_buffer, "{s} {s}", .{ summary.meta, summary.aux }) catch summary.meta;
             self.picker.appendRow(summary.file_name, summary.title, summary.detail, meta, null, true, .resume_session);
         }
         self.syncPickerSelection();
-        self.completion.clear();
+        self.dirty = true;
+    }
+
+    fn pollSessionOpening(self: *Loop, opening: *SessionOperation.Opening, now_ns: u64) !void {
+        if (opening.apply_result and now_ns >= opening.deadline_ns) {
+            opening.apply_result = false;
+            opening.cancel.request();
+            try self.notice(.warn, "session opening timed out");
+        }
+        if (!opening.task.hasResult()) return;
+        const next = opening.task.getResult() catch |err| {
+            const apply_result = opening.apply_result;
+            self.finishSessionOpening();
+            if (apply_result and err != error.OperationCancelled) {
+                try self.failureNotice(coding_agent.failure_display.fromSessionOpenError(@errorName(err)));
+            }
+            return;
+        };
+        const apply_result = opening.apply_result;
+        const success_notice = opening.success_notice;
+        self.finishSessionOpening();
+        if (!apply_result) {
+            destroyOpenedSession(self.gpa, next);
+            return;
+        }
+        _ = next.agent.subscribe(.{ .context = &self.transcript, .call_fn = Transcript.applyListener }) catch |err| {
+            destroyOpenedSession(self.gpa, next);
+            try self.failureNotice(coding_agent.failure_display.fromSessionOpenError(@errorName(err)));
+            return;
+        };
+        const current = self.session orelse {
+            destroyOpenedSession(self.gpa, next);
+            return error.NoSession;
+        };
+        current.requestShutdown();
+        self.session_operation = .{ .draining_previous = .{
+            .next_session = next,
+            .deadline_ns = now_ns +| shutdown_cancel_bound_ns,
+            .success_notice = success_notice,
+        } };
+        self.dirty = true;
+    }
+
+    fn pollPreviousSessionDrain(self: *Loop, draining: *SessionOperation.DrainingPrevious, now_ns: u64) !void {
+        const current = self.session orelse return error.NoSession;
+        if (!current.shutdownComplete()) {
+            if (now_ns >= draining.deadline_ns) return error.SessionShutdownTimedOut;
+            return;
+        }
+        const next = draining.next_session;
+        const success_notice = draining.success_notice;
+        current.deinit();
+        current.* = next.*;
+        self.gpa.destroy(next);
+        const wake = self.wake orelse return error.NoWake;
+        self.bindSession(current, self.io, wake);
+        self.beginInteractiveRestore(success_notice);
+    }
+
+    fn beginInteractiveRestore(self: *Loop, success_notice: OperationNotice) void {
+        self.transcript.clear();
+        self.editor.history_len = 0;
+        self.editor.history_index = null;
+        self.token_cache_entry_count = std.math.maxInt(usize);
+        self.token_input_total = 0;
+        self.token_output_total = 0;
+        self.session_operation = .{ .restoring = .{ .success_notice = success_notice } };
+        self.repinViewport();
+        self.dirty = true;
+    }
+
+    fn pollSessionRestore(self: *Loop, restoring: *SessionOperation.Restoring, now_ns: u64) !void {
+        if (restoring.awaiting_render) return;
+        if (restoring.next_step_deadline_ns) |deadline| {
+            if (now_ns < deadline) return;
+            restoring.next_step_deadline_ns = null;
+        }
+        const session = self.session orelse return error.NoSession;
+        restoring.next_entry_index = try self.restoreEntriesStep(restoring.next_entry_index);
+        if (restoring.next_entry_index < session.manager.entries.items.len) {
+            restoring.awaiting_render = true;
+            self.dirty = true;
+            return;
+        }
+        const success_notice = restoring.success_notice;
+        self.session_operation = .idle;
+        self.refreshTokenCache();
+        self.repinViewport();
+        self.pending_title_update = true;
+        try self.notice(.info, success_notice.text());
+        self.dirty = true;
+    }
+
+    fn restoreEntriesStep(self: *Loop, start_index: usize) !usize {
+        const session = self.session orelse return error.NoSession;
+        var index = start_index;
+        var count: usize = 0;
+        var work_bytes: usize = 0;
+        while (index < session.manager.entries.items.len and count < restore_entries_per_iteration_max) {
+            const entry = session.manager.entries.items[index];
+            const entry_bytes = restoreEntryWorkBytes(entry);
+            if (count > 0 and entry_bytes > restore_work_bytes_per_iteration_target -| work_bytes) break;
+            switch (entry) {
+                .message => |message_entry| try self.restoreMessage(message_entry.message),
+                .compaction => |compaction| try self.transcript.appendCompaction(compaction.summary, compaction.tokens_before),
+                .model_change => |model_change| try self.noticeFmt(.info, "model: {s}/{s}", .{ model_change.provider, model_change.model_id }),
+                .thinking_level_change => |change| try self.noticeFmt(.info, "thinking: {s}", .{change.thinking_level}),
+            }
+            index += 1;
+            count += 1;
+            work_bytes +|= entry_bytes;
+        }
+        self.trace.recordRestoreWork(count, work_bytes);
+        return index;
+    }
+
+    fn cancelSessionListing(self: *Loop) void {
+        switch (self.session_operation) {
+            .listing => |*listing| if (listing.apply_result) {
+                listing.apply_result = false;
+                listing.cancel.request();
+                self.dirty = true;
+            },
+            else => {},
+        }
+    }
+
+    fn cancelSessionOpening(self: *Loop) bool {
+        switch (self.session_operation) {
+            .opening => |*opening| if (opening.apply_result) {
+                opening.apply_result = false;
+                opening.cancel.request();
+                self.dirty = true;
+                return true;
+            },
+            else => {},
+        }
+        return false;
+    }
+
+    fn finishSessionListing(self: *Loop) void {
+        const cancel = self.session_operation.listing.cancel;
+        cancel.deinit();
+        self.gpa.destroy(cancel);
+        self.session_operation = .idle;
+        self.dirty = true;
+    }
+
+    fn finishSessionOpening(self: *Loop) void {
+        const cancel = self.session_operation.opening.cancel;
+        cancel.deinit();
+        self.gpa.destroy(cancel);
+        self.session_operation = .idle;
+        self.dirty = true;
+    }
+
+    fn drainSessionOperation(self: *Loop) void {
+        switch (self.session_operation) {
+            .listing => |*listing| {
+                listing.apply_result = false;
+                listing.cancel.request();
+                if (!listing.task.hasResult()) listing.task.cancel();
+                var result = listing.task.getResult() catch null;
+                if (result) |*summaries| summaries.deinit(self.gpa);
+                const cancel = listing.cancel;
+                cancel.deinit();
+                self.gpa.destroy(cancel);
+                self.session_operation = .idle;
+            },
+            .opening => |*opening| {
+                opening.apply_result = false;
+                opening.cancel.request();
+                if (!opening.task.hasResult()) opening.task.cancel();
+                const result = opening.task.getResult() catch null;
+                if (result) |next| destroyOpenedSession(self.gpa, next);
+                const cancel = opening.cancel;
+                cancel.deinit();
+                self.gpa.destroy(cancel);
+                self.session_operation = .idle;
+            },
+            .discarding_opened => |next| {
+                destroyOpenedSession(self.gpa, next);
+                self.session_operation = .idle;
+            },
+            .draining_previous => |draining| {
+                destroyOpenedSession(self.gpa, draining.next_session);
+                self.session_operation = .idle;
+            },
+            .restoring, .idle => self.session_operation = .idle,
+        }
     }
 
     fn openSettingsRootPicker(self: *Loop) void {
@@ -2589,46 +3484,36 @@ pub const Loop = struct {
     }
 
     fn switchSession(self: *Loop, spec: coding_agent.session_bootstrap.OpenSpec, notice_text: []const u8) !void {
-        if (self.driver.state != .idle) {
-            try self.notice(.warn, "finish or cancel the current run first");
+        if (self.driver.state != .idle or self.clipboard_image_task != null or self.prompt_image_preparation != .idle) {
+            try self.notice(.warn, "finish or cancel the current operation first");
+            return;
+        }
+        if (self.session_operation != .idle) {
+            try self.notice(.warn, "busy: session operation in progress — esc to cancel");
             return;
         }
         const services = self.services orelse return error.NoServices;
         const current = self.session orelse return;
-        const wake = self.wake orelse return error.NoWake;
         const stamp = coding_agent.session_manager.SessionStamp.now(self.io);
-        var next = coding_agent.session_bootstrap.openSession(self.gpa, services, stamp.date(), spec, .{
-            .model = current.agent.state.model,
-            .thinking_level = current.agent.state.thinking_level,
-            .stream = coding_agent.session_bootstrap.streamFor(services, current.agent.state.model),
-        }) catch |err| {
-            try self.failureNotice(coding_agent.failure_display.fromSessionOpenError(@errorName(err)));
-            return;
-        };
-        var committed = false;
-        errdefer if (!committed) {
-            next.requestShutdown();
-            next.deinit();
-        };
-        _ = try next.agent.subscribe(.{ .context = &self.transcript, .call_fn = Transcript.applyListener });
-        self.shutdownSessionForSwitch(current, wake);
-        current.* = next;
-        committed = true;
-        self.bindSession(current, self.io, wake);
-        try self.restoreSessionFold();
-        try self.notice(.info, notice_text);
-        self.pending_title_update = true;
+        const request = try SessionOpenRequest.init(self.gpa, services, stamp.date(), spec, current.agent.state.model, current.agent.state.thinking_level);
+        errdefer request.destroy();
+        const cancel = try self.gpa.create(runtime.CancelSource);
+        errdefer self.gpa.destroy(cancel);
+        cancel.* = try runtime.CancelSource.init(self.gpa, self.io);
+        errdefer cancel.deinit();
+        request.cancel_token = cancel.token();
+        const task = try services.task_runtime.spawn(openSessionWorker, .{request});
+        self.session_operation = .{ .opening = .{
+            .task = task,
+            .cancel = cancel,
+            .deadline_ns = nowNs(self.io) +| session_opening_deadline_ns,
+            .success_notice = OperationNotice.init(notice_text),
+        } };
+        self.picker.clear();
+        self.clearPickerDismissal();
+        self.completion.clear();
+        self.editor.clear();
         self.dirty = true;
-    }
-
-    fn shutdownSessionForSwitch(self: *Loop, session: *coding_agent.AgentSession, wake: *runtime.WakeEvent) void {
-        session.requestShutdown();
-        const start = nowNs(self.io);
-        while (!session.shutdownComplete() and nowNs(self.io) -| start < shutdown_cancel_bound_ns) {
-            wake.waitTimeout(self.io, .{ .duration = .{ .raw = .fromMilliseconds(100), .clock = .awake } }) catch {};
-            wake.reset();
-        }
-        session.deinit();
     }
 
     fn restoreMessage(self: *Loop, message: agent_mod.AgentMessage) !void {
@@ -2671,6 +3556,8 @@ pub const Loop = struct {
 
     fn handleCancel(self: *Loop) void {
         self.clearExitHint();
+        if (self.cancelSessionOpening()) return;
+        if (self.cancelPromptImagePreparation()) return;
         if (self.driver.state != .idle) {
             const session = self.session orelse return;
             self.driver.cancel(self, session);
@@ -2697,6 +3584,233 @@ pub const Loop = struct {
         self.exit_hint_visible = false;
     }
 };
+
+const SessionOpenRequest = struct {
+    allocator: std.mem.Allocator,
+    services: *coding_agent.runtime_services.RuntimeServices,
+    current_date: []u8,
+    spec: coding_agent.session_bootstrap.OpenSpec,
+    model: ai.Model,
+    thinking_level: agent_mod.ThinkingLevel,
+    cancel_token: runtime.CancelToken = undefined,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        services: *coding_agent.runtime_services.RuntimeServices,
+        current_date: []const u8,
+        spec: coding_agent.session_bootstrap.OpenSpec,
+        model: ai.Model,
+        thinking_level: agent_mod.ThinkingLevel,
+    ) !*SessionOpenRequest {
+        const self = try allocator.create(SessionOpenRequest);
+        errdefer allocator.destroy(self);
+        const date = try allocator.dupe(u8, current_date);
+        errdefer allocator.free(date);
+        const owned_spec: coding_agent.session_bootstrap.OpenSpec = switch (spec) {
+            .create => |create| blk: {
+                const session_id = try allocator.dupe(u8, create.session_id);
+                errdefer allocator.free(session_id);
+                const timestamp = try allocator.dupe(u8, create.timestamp);
+                break :blk .{ .create = .{
+                    .session_id = session_id,
+                    .timestamp = timestamp,
+                    .persist = create.persist,
+                } };
+            },
+            .resume_existing => |existing| .{ .resume_existing = .{
+                .session_file_name = try allocator.dupe(u8, existing.session_file_name),
+            } },
+        };
+        self.* = .{
+            .allocator = allocator,
+            .services = services,
+            .current_date = date,
+            .spec = owned_spec,
+            .model = model,
+            .thinking_level = thinking_level,
+        };
+        return self;
+    }
+
+    fn destroy(self: *SessionOpenRequest) void {
+        const allocator = self.allocator;
+        allocator.free(self.current_date);
+        switch (self.spec) {
+            .create => |create| {
+                allocator.free(create.session_id);
+                allocator.free(create.timestamp);
+            },
+            .resume_existing => |existing| allocator.free(existing.session_file_name),
+        }
+        self.* = undefined;
+        allocator.destroy(self);
+    }
+};
+
+fn openSessionWorker(request: *SessionOpenRequest) anyerror!*coding_agent.AgentSession {
+    defer request.destroy();
+    try request.cancel_token.throwIfRequested();
+    const next = try request.allocator.create(coding_agent.AgentSession);
+    errdefer request.allocator.destroy(next);
+    next.* = try coding_agent.session_bootstrap.openSession(
+        request.allocator,
+        request.services,
+        request.current_date,
+        request.spec,
+        .{
+            .model = request.model,
+            .thinking_level = request.thinking_level,
+            .stream = coding_agent.session_bootstrap.streamFor(request.services, request.model),
+            .cancel_token = request.cancel_token,
+        },
+    );
+    errdefer {
+        next.requestShutdown();
+        next.deinit();
+    }
+    try request.cancel_token.throwIfRequested();
+    return next;
+}
+
+fn destroyOpenedSession(allocator: std.mem.Allocator, session: *coding_agent.AgentSession) void {
+    session.requestShutdown();
+    std.debug.assert(session.shutdownComplete());
+    session.deinit();
+    allocator.destroy(session);
+}
+
+fn listSessionSummariesWorker(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cwd: []const u8,
+    agent_dir: []const u8,
+    dir: std.Io.Dir,
+    environ: ?*const std.process.Environ.Map,
+    cancel_token: runtime.CancelToken,
+) anyerror!coding_agent.session_listing.SessionSummaryList {
+    try cancel_token.throwIfRequested();
+    return coding_agent.session_listing.listRuntimeSessionSummaries(allocator, io, .{
+        .cwd = cwd,
+        .agent_dir_override = agent_dir,
+        .dir = dir,
+        .environ = environ,
+        .cancel_token = cancel_token,
+    });
+}
+
+fn preparePromptImagesWorker(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    paths: [prompt_image_count_max]?[]u8,
+    path_count: usize,
+    cancel_token: runtime.CancelToken,
+) anyerror!PromptImageAttachments {
+    var attachments: PromptImageAttachments = .{};
+    errdefer attachments.deinit(allocator);
+    var encoded_total: usize = 0;
+    for (paths[0..path_count]) |maybe_path| {
+        try cancel_token.throwIfRequested();
+        const path = maybe_path.?;
+        const mime_type = mimeTypeForImagePath(path) orelse return error.UnsupportedFormat;
+        var file = try std.Io.Dir.openFileAbsolute(io, path, .{});
+        defer file.close(io);
+        const file_len = try file.length(io);
+        if (file_len == 0) return error.NoImage;
+        const raw_len = std.math.cast(usize, file_len) orelse return error.ImageTooLarge;
+        const encoded_len = std.base64.standard.Encoder.calcSize(raw_len);
+        if (encoded_len > prompt_image_encoded_bytes_total_max -| encoded_total) return error.ImageTooLarge;
+        const raw = try allocator.alloc(u8, raw_len);
+        defer allocator.free(raw);
+        var offset: usize = 0;
+        while (offset < raw.len) {
+            try cancel_token.throwIfRequested();
+            const end = @min(offset + 256 * 1024, raw.len);
+            const read_len = try file.readPositionalAll(io, raw[offset..end], offset);
+            if (read_len != end - offset) return error.ShortRead;
+            offset = end;
+            try runtime.yield();
+        }
+        const encoded = try allocator.alloc(u8, encoded_len);
+        errdefer allocator.free(encoded);
+        _ = std.base64.standard.Encoder.encode(encoded, raw);
+        const mime = try allocator.dupe(u8, mime_type);
+        errdefer allocator.free(mime);
+        try attachments.appendOwned(.{ .data = encoded, .mime_type = mime });
+        encoded_total += encoded_len;
+    }
+    try cancel_token.throwIfRequested();
+    return attachments;
+}
+
+fn restoreEntryWorkBytes(entry: coding_agent.session_manager.SessionEntry) usize {
+    var total: usize = 64;
+    total +|= entry.id().len;
+    switch (entry) {
+        .message => |message| total +|= restoreMessageWorkBytes(message.message),
+        .compaction => |compaction| total +|= compaction.summary.len +| compaction.first_kept_entry_id.len,
+        .model_change => |change| total +|= change.provider.len +| change.model_id.len,
+        .thinking_level_change => |change| total +|= change.thinking_level.len,
+    }
+    return @min(total, coding_agent.session_manager.max_session_line_bytes);
+}
+
+fn restoreMessageWorkBytes(message: agent_mod.AgentMessage) usize {
+    var total: usize = 64;
+    switch (message) {
+        .user => |user| switch (user.content) {
+            .string => |text| total +|= text.len,
+            .blocks => |blocks| for (blocks) |block| {
+                total +|= 64;
+                total +|= switch (block) {
+                    .text => |text| text.text.len +| if (text.text_signature) |signature| signature.len else 0,
+                    .image => |image| image.data.len +| image.mime_type.len,
+                };
+            },
+        },
+        .assistant => |assistant| {
+            total +|= assistant.api.len +| assistant.provider.len +| assistant.model.len;
+            if (assistant.response_id) |value| total +|= value.len;
+            if (assistant.error_message) |value| total +|= value.len;
+            for (assistant.content) |content| {
+                total +|= 64;
+                total +|= switch (content) {
+                    .text => |text| text.text.len +| if (text.text_signature) |signature| signature.len else 0,
+                    .thinking => |thinking| thinking.thinking.len +| if (thinking.thinking_signature) |signature| signature.len else 0,
+                    .tool_call => |call| call.id.len +| call.name.len +| jsonWorkBytes(call.arguments),
+                };
+            }
+        },
+        .tool_result => |result| {
+            total +|= result.tool_call_id.len +| result.tool_name.len;
+            for (result.content) |content| {
+                total +|= 64;
+                total +|= switch (content) {
+                    .text => |text| text.text.len +| if (text.text_signature) |signature| signature.len else 0,
+                    .image => |image| image.data.len +| image.mime_type.len,
+                };
+            }
+            if (result.details) |details| total +|= jsonWorkBytes(details);
+        },
+        .custom => |custom| total +|= custom.kind.len +| jsonWorkBytes(custom.payload),
+    }
+    return total;
+}
+
+fn jsonWorkBytes(value: std.json.Value) usize {
+    var total: usize = 64;
+    switch (value) {
+        .string => |text| total +|= text.len,
+        .array => |array| {
+            for (array.items) |item| total +|= jsonWorkBytes(item);
+        },
+        .object => |object| {
+            var iterator = object.iterator();
+            while (iterator.next()) |entry| total +|= entry.key_ptr.*.len +| jsonWorkBytes(entry.value_ptr.*);
+        },
+        else => {},
+    }
+    return total;
+}
 
 fn isPromptPathByte(byte: u8) bool {
     return switch (byte) {
@@ -2725,6 +3839,11 @@ fn tmpDirFromEnv(environ: ?*const std.process.Environ.Map) []const u8 {
         nonEmptyEnv(environ, "TEMP") orelse
         nonEmptyEnv(environ, "TMP") orelse
         "/tmp";
+}
+
+fn nonCooperativeShutdownWorker(io: std.Io) anyerror!ClipboardImagePaste {
+    io.sleep(.fromSeconds(30), .awake) catch {};
+    return error.OperationCancelled;
 }
 
 fn readClipboardImageToTempFile(
@@ -2971,6 +4090,31 @@ fn expectFrameOrder(frame: *const screen.Frame, first: []const u8, second: []con
     try std.testing.expect(second_row.? > first_row.?);
 }
 
+test "loop vertical editor actions traverse visual rows before history" {
+    var loop = try Loop.init(std.testing.allocator, null);
+    defer loop.deinit();
+    _ = loop.noteResize(6, 10);
+    loop.editor.pushHistory("older");
+    try loop.editor.insert("abcdefghij");
+
+    try loop.dispatch(.{ .key_editor = .move_up });
+    try std.testing.expectEqual(@as(usize, 6), loop.editor.cursorByte());
+    try std.testing.expectEqual(@as(?usize, 2), loop.preferred_editor_column_cells);
+    try loop.dispatch(.{ .key_editor = .move_up });
+    try std.testing.expectEqual(@as(usize, 2), loop.editor.cursorByte());
+    try loop.dispatch(.{ .key_editor = .move_up });
+    try std.testing.expectEqualStrings("older", loop.editor.text());
+    try std.testing.expectEqual(@as(?usize, null), loop.preferred_editor_column_cells);
+
+    try loop.dispatch(.{ .key_editor = .move_down });
+    try std.testing.expectEqualStrings("abcdefghij", loop.editor.text());
+    loop.editor.moveBufferEnd();
+    try loop.dispatch(.{ .key_editor = .move_up });
+    try std.testing.expect(loop.preferred_editor_column_cells != null);
+    try loop.dispatch(.{ .key_editor = .move_left });
+    try std.testing.expectEqual(@as(?usize, null), loop.preferred_editor_column_cells);
+}
+
 test "loop dispatch edits text through editor actions" {
     var loop = try Loop.init(std.testing.allocator, null);
     defer loop.deinit();
@@ -3004,6 +4148,45 @@ test "loop submit snapshots editor and clears input" {
     try std.testing.expectEqualStrings("hello", loop.submittedPrompt().?);
     try std.testing.expectEqualStrings("", loop.editor.text());
     try std.testing.expect(loop.dirty);
+}
+
+test "prompt image worker enforces aggregate encoded cap and cancellation" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const accepted_raw = try std.testing.allocator.alloc(u8, 64);
+    defer std.testing.allocator.free(accepted_raw);
+    @memset(accepted_raw, 0x5a);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "accepted.png", .data = accepted_raw });
+    const oversized_raw = try std.testing.allocator.alloc(u8, 590 * 1024);
+    defer std.testing.allocator.free(oversized_raw);
+    @memset(oversized_raw, 0x6b);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "oversized.png", .data = oversized_raw });
+
+    var accepted_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const accepted_len = try tmp.dir.realPathFile(std.testing.io, "accepted.png", &accepted_buffer);
+    var oversized_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const oversized_len = try tmp.dir.realPathFile(std.testing.io, "oversized.png", &oversized_buffer);
+
+    var cancel = try runtime.CancelSource.init(std.testing.allocator, std.testing.io);
+    defer cancel.deinit();
+    var paths: [prompt_image_count_max]?[]u8 = @splat(null);
+    paths[0] = accepted_buffer[0..accepted_len];
+    var images = try preparePromptImagesWorker(std.testing.allocator, std.testing.io, paths, 1, cancel.token());
+    defer images.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), images.len);
+    try std.testing.expect(images.items[0].data.len <= prompt_image_encoded_bytes_total_max);
+
+    paths[0] = oversized_buffer[0..oversized_len];
+    try std.testing.expectError(
+        error.ImageTooLarge,
+        preparePromptImagesWorker(std.testing.allocator, std.testing.io, paths, 1, cancel.token()),
+    );
+    cancel.request();
+    paths[0] = accepted_buffer[0..accepted_len];
+    try std.testing.expectError(
+        error.OperationCancelled,
+        preparePromptImagesWorker(std.testing.allocator, std.testing.io, paths, 1, cancel.token()),
+    );
 }
 
 test "loop extracts tracked clipboard image attachments from expanded prompt" {
@@ -3941,7 +5124,9 @@ test "loop no-session disables resume and keeps new sessions ephemeral" {
 
     try loop.dispatch(.{ .insert = "/new" });
     try loop.dispatch(.submit);
+    try driveSessionOperationUntilIdle(&loop, 10_000);
     try std.testing.expect(session.store == null);
+    try std.testing.expect(!std.mem.eql(u8, session.manager.header.id, "ephemeral-test"));
     try std.testing.expect(!loop.shouldPersistNewSession());
 
     var sessions = try coding_agent.session_listing.listRuntimeSessions(std.testing.allocator, std.testing.io, .{
@@ -4010,7 +5195,7 @@ test "loop P4 settings thinking visibility persists through services" {
     try loop.dispatch(.submit);
     try std.testing.expectEqual(PickerKind.settings_root, loop.picker.currentKind());
 
-    try loop.dispatch(.{ .key_editor = .move_down_history });
+    try loop.dispatch(.{ .key_editor = .move_down });
     try loop.dispatch(.{ .key_editor = .tab });
     try std.testing.expectEqual(PickerKind.settings_thinking_visibility, loop.picker.currentKind());
     try std.testing.expectEqualStrings("/settings thinking:", loop.editor.text());
@@ -4104,13 +5289,81 @@ const DriverTestFixture = struct {
     }
 };
 
-fn driveDriverUntilIdle(owner_loop: *Loop, max_iterations: usize) !void {
+fn driveSessionOperationUntilIdle(owner_loop: *Loop, max_iterations: usize) !void {
+    var now_ns = frame_floor_ns;
     for (0..max_iterations) |_| {
-        try owner_loop.pumpDriver(nowNs(owner_loop.io));
+        try owner_loop.tick(now_ns);
+        if (owner_loop.dirty) owner_loop.markRendered(now_ns, 0);
+        if (owner_loop.session_operation == .idle) return;
+        now_ns +|= frame_floor_ns;
+        try runtime.yield();
+    }
+    return error.SessionOperationDidNotSettle;
+}
+
+fn driveDriverUntilIdle(owner_loop: *Loop, max_iterations: usize) !void {
+    var now_ns = frame_floor_ns;
+    for (0..max_iterations) |_| {
+        try owner_loop.pumpDriver(now_ns);
+        if (owner_loop.dirty) owner_loop.markRendered(now_ns, 0);
         if (!owner_loop.driver.busy()) return;
+        now_ns +|= frame_floor_ns;
         try runtime.yield();
     }
     return error.DriverDidNotSettle;
+}
+
+test "run driver applies agent events in rendered deadline-gated batches" {
+    const response = try std.testing.allocator.alloc(u8, 4096);
+    defer std.testing.allocator.free(response);
+    @memset(response, 'x');
+
+    var fixture = try DriverTestFixture.init(response);
+    defer fixture.deinit();
+
+    try fixture.owner_loop.dispatch(.{ .insert = "prompt" });
+    try fixture.owner_loop.dispatch(.submit);
+
+    var now_ns = frame_floor_ns;
+    var observed_gate = false;
+    for (0..20_000) |_| {
+        const exhaustion_before = fixture.owner_loop.trace.agent_event_budget_exhaustion_count;
+        try fixture.owner_loop.pumpDriver(now_ns);
+        try std.testing.expect(fixture.owner_loop.trace.agent_events_applied_per_iteration_max <= agent_events_per_iteration_max);
+
+        if (fixture.owner_loop.trace.agent_event_budget_exhaustion_count > exhaustion_before) {
+            if (!observed_gate) {
+                observed_gate = true;
+                const events_before = fixture.owner_loop.frame_events_applied;
+                const skips_before = fixture.owner_loop.trace.gated_driver_poll_skip_count;
+                try fixture.owner_loop.dispatch(.{ .insert = "typed" });
+                try fixture.owner_loop.pumpDriver(now_ns);
+                try std.testing.expectEqual(skips_before + 1, fixture.owner_loop.trace.gated_driver_poll_skip_count);
+                try std.testing.expectEqual(events_before + 1, fixture.owner_loop.frame_events_applied);
+                try std.testing.expectEqualStrings("typed", fixture.owner_loop.editor.text());
+
+                fixture.owner_loop.markRendered(now_ns, 0);
+                try fixture.owner_loop.pumpDriver(now_ns + frame_floor_ns - 1);
+                try std.testing.expectEqual(skips_before + 2, fixture.owner_loop.trace.gated_driver_poll_skip_count);
+                now_ns +|= frame_floor_ns;
+                continue;
+            }
+            fixture.owner_loop.markRendered(now_ns, 0);
+        } else if (fixture.owner_loop.dirty) {
+            fixture.owner_loop.markRendered(now_ns, 0);
+        }
+
+        if (!fixture.owner_loop.driver.busy()) break;
+        now_ns +|= frame_floor_ns;
+        try runtime.yield();
+    }
+
+    try std.testing.expect(!fixture.owner_loop.driver.busy());
+    try std.testing.expect(observed_gate);
+    try std.testing.expect(fixture.owner_loop.trace.agent_event_budget_exhaustion_count > 3);
+    try std.testing.expectEqual(agent_events_per_iteration_max, fixture.owner_loop.trace.agent_events_applied_per_iteration_max);
+    const assistant = fixture.owner_loop.transcript.items.items[1].kind.assistant;
+    try std.testing.expectEqualStrings(response, assistant.parts.items[0].text.items);
 }
 
 test "run driver streams a faux session into transcript" {

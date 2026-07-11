@@ -247,14 +247,15 @@ pub const Runner = struct {
 pub fn run(process: runtime.Process, options: Options) !void {
     if (builtin.is_test) return error.UnsupportedCliFeature;
 
+    var abandon_cleanup = false;
     var task_runtime = try runtime.Runtime.init(process.gpa, .{});
-    defer task_runtime.deinit();
+    defer if (!abandon_cleanup) task_runtime.deinit();
 
     const agent_dir = try paths_mod.resolveGlobalAgentDirFromEnv(process.gpa, process.environ);
-    defer process.gpa.free(agent_dir);
+    defer if (!abandon_cleanup) process.gpa.free(agent_dir);
 
     const cwd = try std.process.currentPathAlloc(process.io, process.gpa);
-    defer process.gpa.free(cwd);
+    defer if (!abandon_cleanup) process.gpa.free(cwd);
 
     var services = try coding_agent.runtime_services.RuntimeServices.init(process.gpa, .{
         .cwd = cwd,
@@ -262,16 +263,69 @@ pub fn run(process: runtime.Process, options: Options) !void {
         .environ = process.environ,
         .task_runtime = task_runtime,
     });
-    defer services.deinit();
+    defer if (!abandon_cleanup) services.deinit();
     const stamp = coding_agent.session_manager.SessionStamp.now(services.io);
     var session = try coding_agent.session_bootstrap.openSession(process.gpa, &services, stamp.date(), options.open, .{});
 
     var runner = try Runner.init(process.gpa, options);
-    defer runner.deinit();
-    try runner.loop.bindServices(&services);
+    defer if (!abandon_cleanup) runner.deinit();
+    defer if (!abandon_cleanup) {
+        session.requestShutdown();
+        std.debug.assert(session.shutdownComplete());
+        session.deinit();
+    };
+
+    var terminal: Terminal = undefined;
+    try terminal.init(process.gpa, process.io, process.environ);
+    defer if (!abandon_cleanup) terminal.deinit();
+    try terminal.setup();
+
     var wake: runtime.WakeEvent = .init;
     runner.loop.bindSession(&session, services.io, &wake);
-    defer shutdownSession(&session, &runner.loop, services.io, &wake);
+    try terminal.setTitle(runner.loop.terminalTitle());
+
+    var pump: InputPump = .{};
+    try pump.startTerminal(services.io, &terminal, &wake);
+    defer if (!abandon_cleanup) pump.join();
+    defer if (!abandon_cleanup) pump.requestStop();
+    defer if (!abandon_cleanup) writeTraceIfRequested(process, &runner.loop.trace) catch {};
+    try runner.loop.bindServices(&services);
+
+    var frontend_error: ?anyerror = null;
+    runInteractive(process, options, &runner, &terminal, &pump, &wake, &session, &services) catch |err| {
+        frontend_error = err;
+    };
+    const session_shutdown_timed_out = if (frontend_error) |err|
+        err == error.SessionShutdownTimedOut
+    else
+        false;
+    if (session_shutdown_timed_out) {
+        pump.requestStop();
+        runner.loop.requestShutdown();
+        terminal.restoreForFatalExit();
+        writeUndrainedDiagnostic(process.io);
+        abandon_cleanup = true;
+        return error.UndrainedShutdown;
+    }
+    if (!drainFrontend(&runner.loop, &pump, &wake, services.io)) {
+        terminal.restoreForFatalExit();
+        writeUndrainedDiagnostic(process.io);
+        abandon_cleanup = true;
+        return error.UndrainedShutdown;
+    }
+    if (frontend_error) |err| return err;
+}
+
+fn runInteractive(
+    process: runtime.Process,
+    options: Options,
+    runner: *Runner,
+    terminal: *Terminal,
+    pump: *InputPump,
+    wake: *runtime.WakeEvent,
+    session: *coding_agent.AgentSession,
+    services: *coding_agent.runtime_services.RuntimeServices,
+) !void {
     _ = try session.agent.subscribe(.{ .context = &runner.loop.transcript, .call_fn = Transcript.applyListener });
     try runner.loop.restoreSessionFold();
     try runner.submitInitialPromptIfPresent();
@@ -290,36 +344,39 @@ pub fn run(process: runtime.Process, options: Options) !void {
     if (process.env("ZI_TUI_SYNTHETIC_BASH_SPILL") != null) try runner.loop.seedSyntheticBashSpill(services.io);
     if (process.env("ZI_TUI_SYNTHETIC_WRITE_ARGS") != null) try runner.loop.seedSyntheticWriteArgs(services.io);
     if (process.env("ZI_TUI_SYNTHETIC_FLOOD") != null) runner.loop.enableSyntheticFlood(FrameLoop.nowNs(services.io));
-    defer writeTraceIfRequested(process, &runner.loop.trace) catch {};
-
-    var terminal: Terminal = undefined;
-    try terminal.init(process.gpa, process.io, process.environ);
-    defer terminal.deinit();
-    try terminal.setup();
-    try terminal.setTitle(runner.loop.terminalTitle());
-
-    var pump: InputPump = .{};
-    try pump.startTerminal(services.io, &terminal, &wake);
-    defer pump.join();
-    defer pump.requestStop();
+    if (process.env("ZI_TUI_NONCOOPERATIVE_TASK") != null) try runner.loop.startNonCooperativeShutdownTaskForTest();
 
     if (options.panic_test) {
         try runtime.sleep(services.io, .fromSeconds(1));
         @panic("zi --panic-test");
     }
 
-    _ = try FrameLoop.run(&runner, &terminal, &pump, &wake, services.io);
+    _ = try FrameLoop.run(runner, terminal, pump, wake, services.io);
 }
 
-fn shutdownSession(session: *coding_agent.AgentSession, owner_loop: *Loop, io: std.Io, wake: *runtime.WakeEvent) void {
-    owner_loop.shutdownDriver();
-    session.requestShutdown();
+fn drainFrontend(owner_loop: *Loop, pump: *InputPump, wake: *runtime.WakeEvent, io: std.Io) bool {
+    pump.requestStop();
+    owner_loop.requestShutdown();
     const start = FrameLoop.nowNs(io);
-    while (!session.shutdownComplete() and FrameLoop.nowNs(io) -| start < loop.shutdown_cancel_bound_ns) {
-        wake.waitTimeout(io, .{ .duration = .{ .raw = .fromMilliseconds(100), .clock = .awake } }) catch {};
+    while (FrameLoop.nowNs(io) -| start < loop.shutdown_cancel_bound_ns) {
+        if (owner_loop.pollShutdown() and pump.hasStopped()) return true;
+        wake.waitTimeout(io, .{ .duration = .{ .raw = .fromMilliseconds(100), .clock = .awake } }) catch |err| {
+            const ignored_shutdown_wait_error = @errorName(err);
+            _ = ignored_shutdown_wait_error;
+        };
         wake.reset();
     }
-    session.deinit();
+    return owner_loop.pollShutdown() and pump.hasStopped();
+}
+
+fn writeUndrainedDiagnostic(io: std.Io) void {
+    std.Io.File.stderr().writeStreamingAll(
+        io,
+        "zi: fatal: shutdown deadline expired with undrained work; terminal restored\n",
+    ) catch |err| {
+        const ignored_fatal_diagnostic_error = @errorName(err);
+        _ = ignored_fatal_diagnostic_error;
+    };
 }
 
 fn writeTraceIfRequested(process: runtime.Process, stats: *const trace.Stats) !void {
@@ -732,5 +789,6 @@ test "bounded worker runner exits on worker-fed ctrl-d" {
 }
 
 test {
+    _ = @import("testing/semantic_snapshot.zig");
     std.testing.refAllDecls(@This());
 }

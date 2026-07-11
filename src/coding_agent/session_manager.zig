@@ -995,9 +995,16 @@ pub const SessionStore = struct {
     }
 
     pub fn load(self: SessionStore, io: std.Io) !SessionManager {
-        const data = try self.dir.readFileAlloc(io, self.file_name, self.allocator, .limited(max_session_file_bytes));
+        return self.loadCancelable(io, null);
+    }
+
+    pub fn loadCancelable(self: SessionStore, io: std.Io, cancel_token: ?runtime.CancelToken) !SessionManager {
+        const data = if (cancel_token) |token|
+            try readSessionFileCancelable(self, io, token)
+        else
+            try self.dir.readFileAlloc(io, self.file_name, self.allocator, .limited(max_session_file_bytes));
         defer self.allocator.free(data);
-        var parsed = try parseSession(self.allocator, data);
+        var parsed = try parseSessionCancelable(self.allocator, data, cancel_token);
         if (parsed.repair_length) |length| {
             // The dropped torn line is still on disk. Truncate it away now,
             // or the next append glues onto the fragment and corrupts both
@@ -1028,6 +1035,30 @@ pub const SessionStore = struct {
         if (header.parent_session) |parent_session| self.allocator.free(parent_session);
     }
 };
+
+fn readSessionFileCancelable(
+    store: SessionStore,
+    io: std.Io,
+    cancel_token: runtime.CancelToken,
+) ![]u8 {
+    var file = try store.dir.openFile(io, store.file_name, .{});
+    defer file.close(io);
+    const file_len = try file.length(io);
+    if (file_len > max_session_file_bytes) return error.StreamTooLong;
+    const data = try store.allocator.alloc(u8, @intCast(file_len));
+    errdefer store.allocator.free(data);
+    var offset: usize = 0;
+    while (offset < data.len) {
+        try cancel_token.throwIfRequested();
+        const end = @min(offset + 256 * 1024, data.len);
+        const read_len = try file.readPositionalAll(io, data[offset..end], offset);
+        if (read_len != end - offset) return error.UnexpectedEndOfFile;
+        offset = end;
+        try runtime.yield();
+    }
+    try cancel_token.throwIfRequested();
+    return data;
+}
 
 fn writeFileAtomic(
     allocator: std.mem.Allocator,
@@ -1154,6 +1185,14 @@ const ParsedSession = struct {
 };
 
 fn parseSession(allocator: std.mem.Allocator, data: []const u8) !ParsedSession {
+    return parseSessionCancelable(allocator, data, null);
+}
+
+fn parseSessionCancelable(
+    allocator: std.mem.Allocator,
+    data: []const u8,
+    cancel_token: ?runtime.CancelToken,
+) !ParsedSession {
     var lines = std.mem.splitScalar(u8, data, '\n');
     const header_line = lines.next() orelse return error.MissingHeader;
     var parsed_header = try runtime.JsonOwned(std.json.Value).parseJson(allocator, header_line, .{});
@@ -1177,6 +1216,7 @@ fn parseSession(allocator: std.mem.Allocator, data: []const u8) !ParsedSession {
 
     var good_length: usize = @min(header_line.len + 1, data.len);
     while (lines.next()) |line| {
+        if (cancel_token) |token| try token.throwIfRequested();
         const line_end = (@intFromPtr(line.ptr) - @intFromPtr(data.ptr)) + line.len;
         if (std.mem.trim(u8, line, " \t\r").len == 0) {
             good_length = @min(line_end + 1, data.len);

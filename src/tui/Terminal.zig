@@ -83,6 +83,16 @@ pub fn shutdown(self: *Terminal) !void {
     self.setup_done = false;
 }
 
+/// Restore terminal state without releasing memory that undrained work may
+/// still observe. The caller must terminate the process immediately afterward.
+pub fn restoreForFatalExit(self: *Terminal) void {
+    self.shutdown() catch |err| {
+        const ignored_terminal_shutdown_error = @errorName(err);
+        _ = ignored_terminal_shutdown_error;
+    };
+    if (self.tty) |tty| tty.deinit();
+}
+
 pub fn resizeFromTty(self: *Terminal) !void {
     const tty = if (self.tty) |*tty| tty else return error.TerminalNotInitialized;
     const vx = if (self.vx) |*vx| vx else return error.TerminalNotInitialized;

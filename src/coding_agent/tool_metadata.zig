@@ -47,6 +47,15 @@ pub const ResultView = struct {
 };
 const ToolKind = enum { bash, read, symbols, edit, write, custom };
 
+pub const explicit_builtin_names = [_][]const u8{ "bash", "read", "symbols", "edit", "write" };
+
+pub fn hasExplicitBuiltinPolicy(name: []const u8) bool {
+    inline for (explicit_builtin_names) |builtin_name| {
+        if (std.mem.eql(u8, name, builtin_name)) return true;
+    }
+    return false;
+}
+
 fn kind(name: []const u8) ToolKind {
     if (std.mem.eql(u8, name, "bash")) return .bash;
     if (std.mem.eql(u8, name, "read")) return .read;
@@ -673,6 +682,64 @@ test "builtin display metadata covers tool chrome" {
 
     const unknown = displayForTool("custom");
     try std.testing.expectEqual(Presentation.generic, unknown.presentation);
+}
+
+test "every builtin policy covers complete partial success and failure views" {
+    const cases = [_]struct {
+        name: []const u8,
+        presentation: Presentation,
+        body_mode: BodyMode,
+        collapse: CollapseMode,
+        live_updates: LiveUpdates,
+    }{
+        .{ .name = "bash", .presentation = .command, .body_mode = .visible, .collapse = .tail, .live_updates = .show_tail },
+        .{ .name = "read", .presentation = .file, .body_mode = .hidden_on_success, .collapse = .head, .live_updates = .suppress },
+        .{ .name = "symbols", .presentation = .symbols, .body_mode = .visible, .collapse = .head, .live_updates = .suppress },
+        .{ .name = "edit", .presentation = .patch, .body_mode = .visible, .collapse = .head, .live_updates = .suppress },
+        .{ .name = "write", .presentation = .file, .body_mode = .summary_only, .collapse = .head, .live_updates = .suppress },
+    };
+    const args_json = "{\"command\":\"echo hi\",\"path\":\"src/file.zig\",\"content\":\"body\"}";
+    const content = [_]ai.ToolResultContent{.{ .text = .{ .text = "result" } }};
+
+    for (cases) |case| {
+        try std.testing.expect(hasExplicitBuiltinPolicy(case.name));
+        const display = displayForTool(case.name);
+        try std.testing.expectEqual(case.presentation, display.presentation);
+        try std.testing.expectEqual(case.body_mode, display.body_mode);
+        try std.testing.expectEqual(case.collapse, display.collapse.mode);
+        try std.testing.expectEqual(case.live_updates, display.live_updates);
+
+        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, args_json, .{});
+        defer parsed.deinit();
+        const complete = try callViewForValue(std.testing.allocator, case.name, parsed.value);
+        defer if (complete.title) |title| std.testing.allocator.free(title);
+        defer if (complete.compact_title) |title| std.testing.allocator.free(title);
+        defer switch (complete.body_update) {
+            .replace => |replacement| std.testing.allocator.free(replacement.body),
+            else => {},
+        };
+        try std.testing.expect(complete.title != null);
+
+        const partial = try partialCallView(std.testing.allocator, case.name, args_json[0 .. args_json.len - 1]);
+        defer if (partial.title) |title| std.testing.allocator.free(title);
+        defer switch (partial.body_update) {
+            .replace => |replacement| std.testing.allocator.free(replacement.body),
+            else => {},
+        };
+        try std.testing.expect(partial.title != null);
+
+        const success = try resultView(std.testing.allocator, case.name, false, &content, null);
+        defer if (success.output) |output| std.testing.allocator.free(output);
+        defer if (success.footer) |footer| std.testing.allocator.free(footer);
+        try std.testing.expect(success.output != null);
+        const failure = try resultView(std.testing.allocator, case.name, true, &content, null);
+        defer if (failure.output) |output| std.testing.allocator.free(output);
+        defer if (failure.footer) |footer| std.testing.allocator.free(footer);
+        try std.testing.expect(failure.output != null);
+    }
+
+    try std.testing.expect(!hasExplicitBuiltinPolicy("external"));
+    try std.testing.expectEqual(Presentation.generic, displayForTool("external").presentation);
 }
 
 test "tool titles use tolerant partial json" {

@@ -4,6 +4,12 @@ const Loop = @import("../Loop.zig");
 const Transcript = @import("../Transcript.zig");
 const session_listing = @import("../../coding_agent/session_listing.zig");
 
+var timing_gate_mutex: std.atomic.Mutex = .unlocked;
+
+fn lockTimingGate() void {
+    while (!timing_gate_mutex.tryLock()) std.Thread.yield() catch {};
+}
+
 pub const max_output_default: usize = 256 * 1024;
 
 pub const Action = struct {
@@ -256,6 +262,12 @@ fn exitedZero(status: i32) bool {
     return std.c.W.IFEXITED(raw) and std.c.W.EXITSTATUS(raw) == 0;
 }
 
+fn exitedWith(status: i32, expected: u8) bool {
+    if (status < 0) return false;
+    const raw: u32 = @intCast(status);
+    return std.c.W.IFEXITED(raw) and std.c.W.EXITSTATUS(raw) == expected;
+}
+
 fn expectContains(haystack: []const u8, needle: []const u8) !void {
     if (std.mem.indexOf(u8, haystack, needle) != null) return;
     std.debug.print("missing pty output marker: {s}\n--- output ---\n{s}\n--- end output ---\n", .{ needle, haystack });
@@ -334,6 +346,23 @@ fn expectP2FloodTrace(report: []const u8) !void {
     const dropped = try metricValue(report, "dropped_input_bytes ", "count=");
     if (input_count < 100 or input_p99_ns >= Loop.frame_floor_ns or max_frame_us > Loop.watchdog_budget_ns / std.time.ns_per_us or dropped != 0) {
         std.debug.print("P2 flood trace gate failed\n{s}\n", .{report});
+        return error.TestUnexpectedResult;
+    }
+}
+
+fn expectRealPipeFloodTrace(report: []const u8) !void {
+    const input_count = try metricValue(report, "input_latency ", "count=");
+    const input_p99_ns = try metricValue(report, "input_latency ", "p99_ns=");
+    const dropped = try metricValue(report, "dropped_input_bytes ", "count=");
+    const max_applied = try metricValue(report, "agent_event_fairness ", "max_applied_per_iteration=");
+    const exhaustions = try metricValue(report, "agent_event_fairness ", "budget_exhaustions=");
+    if (input_count < 100 or
+        input_p99_ns >= Loop.frame_floor_ns or
+        dropped != 0 or
+        max_applied > Loop.agent_events_per_iteration_max or
+        exhaustions == 0)
+    {
+        std.debug.print("real-pipe flood trace gate failed\n{s}\n", .{report});
         return error.TestUnexpectedResult;
     }
 }
@@ -452,6 +481,8 @@ test "pty e2e: streamed markdown renders, escape aborts, and ctrl-c exits" {
 
 test "pty e2e: synthetic flood trace meets P2 gate three times" {
     if (!supportsForkPty()) return error.SkipZigTest;
+    lockTimingGate();
+    defer timing_gate_mutex.unlock();
     const zi_bin = envValue("ZI_PTY_E2E_BIN") orelse return error.SkipZigTest;
 
     var tmp = std.testing.tmpDir(.{});
@@ -518,6 +549,78 @@ test "pty e2e: synthetic flood trace meets P2 gate three times" {
         const report = try readTrace(std.testing.allocator, trace_abs);
         defer std.testing.allocator.free(report);
         try expectP2FloodTrace(report);
+    }
+}
+
+test "pty e2e: real event pipe flood stays responsive three times" {
+    if (!supportsForkPty()) return error.SkipZigTest;
+    lockTimingGate();
+    defer timing_gate_mutex.unlock();
+    const zi_bin = envValue("ZI_PTY_E2E_BIN") orelse return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "repo/.zi");
+    try tmp.dir.createDirPath(std.testing.io, "home");
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "flood.txt", .data = "F" ** (252 * 64) });
+
+    const repo_abs = try tmpAbsPath(std.testing.allocator, &tmp, "repo");
+    defer std.testing.allocator.free(repo_abs);
+    const home_abs = try tmpAbsPath(std.testing.allocator, &tmp, "home");
+    defer std.testing.allocator.free(home_abs);
+    const agent_abs = try tmpAbsPath(std.testing.allocator, &tmp, "agent");
+    defer std.testing.allocator.free(agent_abs);
+    const script_abs = try tmpAbsPath(std.testing.allocator, &tmp, "flood.txt");
+    defer std.testing.allocator.free(script_abs);
+    const home_env = try std.fmt.allocPrint(std.testing.allocator, "HOME={s}", .{home_abs});
+    defer std.testing.allocator.free(home_env);
+    const agent_env = try std.fmt.allocPrint(std.testing.allocator, "ZI_CODING_AGENT_DIR={s}", .{agent_abs});
+    defer std.testing.allocator.free(agent_env);
+    const script_env = try std.fmt.allocPrint(std.testing.allocator, "ZI_FAUX_SCRIPT={s}", .{script_abs});
+    defer std.testing.allocator.free(script_env);
+
+    for (0..3) |run_index| {
+        var trace_name_buffer: [40]u8 = undefined;
+        const trace_name = try std.fmt.bufPrint(&trace_name_buffer, "real-pipe-trace-{d}.log", .{run_index});
+        const trace_abs = try tmpAbsPath(std.testing.allocator, &tmp, trace_name);
+        defer std.testing.allocator.free(trace_abs);
+        const trace_env = try std.fmt.allocPrint(std.testing.allocator, "ZI_TUI_TRACE_FILE={s}", .{trace_abs});
+        defer std.testing.allocator.free(trace_env);
+        const env = [_][]const u8{
+            "TERM=xterm-256color",
+            "NO_COLOR=1",
+            "ZI_ENABLE_FAUX_PROVIDER=1",
+            "ZI_FAUX_DELAY_MS=0",
+            home_env,
+            agent_env,
+            script_env,
+            trace_env,
+        };
+        var actions = std.ArrayList(Action).empty;
+        defer actions.deinit(std.testing.allocator);
+        try appendFloodTyping(&actions, std.testing.allocator, 500, 10_000);
+        try actions.append(std.testing.allocator, .{ .after_ms = 12_000, .bytes = "\x03" });
+        try actions.append(std.testing.allocator, .{ .after_ms = 12_200, .bytes = "\x03" });
+
+        var result = try runScripted(std.testing.allocator, .{
+            .argv = &.{ zi_bin, "flood prompt" },
+            .env = &env,
+            .cwd = repo_abs,
+            .rows = 24,
+            .cols = 100,
+            .timeout_ms = 18_000,
+            .max_output_bytes = 512 * 1024,
+        }, actions.items);
+        defer result.deinit(std.testing.allocator);
+        if (result.timed_out or !exitedZero(result.status)) {
+            std.debug.print("real-pipe flood failed on run {d}\n{s}\n", .{ run_index, result.output });
+            return error.TestUnexpectedResult;
+        }
+        try std.testing.expect(result.termios_restored != false);
+        const report = try readTrace(std.testing.allocator, trace_abs);
+        defer std.testing.allocator.free(report);
+        try expectRealPipeFloodTrace(report);
     }
 }
 
@@ -910,8 +1013,6 @@ test "pty e2e: P4 completion model picker resume and new session" {
     });
     defer sessions.deinit(std.testing.allocator);
     try std.testing.expect(sessions.file_names.len > 0);
-    const resume_command = try std.fmt.allocPrint(std.testing.allocator, "/resume {s}\r", .{sessions.file_names[0]});
-    defer std.testing.allocator.free(resume_command);
     var second = try runScripted(std.testing.allocator, .{
         .argv = &.{zi_bin},
         .env = &env,
@@ -929,11 +1030,12 @@ test "pty e2e: P4 completion model picker resume and new session" {
         .{ .after_ms = 2_800, .bytes = "/session\r" },
         .{ .after_ms = 3_600, .bytes = "/model\r" },
         .{ .after_ms = 4_100, .bytes = "\r" },
-        .{ .after_ms = 4_800, .bytes = resume_command },
-        .{ .after_ms = 5_900, .bytes = "/new\r" },
-        .{ .after_ms = 6_900, .bytes = "new session prompt\r" },
-        .{ .after_ms = 9_000, .bytes = "\x03" },
-        .{ .after_ms = 9_200, .bytes = "\x03" },
+        .{ .after_ms = 4_800, .bytes = "/resume\r" },
+        .{ .after_ms = 5_600, .bytes = "\r" },
+        .{ .after_ms = 6_600, .bytes = "/new\r" },
+        .{ .after_ms = 7_600, .bytes = "new session prompt\r" },
+        .{ .after_ms = 10_500, .bytes = "\x03" },
+        .{ .after_ms = 10_700, .bytes = "\x03" },
     });
     defer second.deinit(std.testing.allocator);
     if (second.timed_out) {
@@ -958,7 +1060,11 @@ test "pty e2e: P4 completion model picker resume and new session" {
             break;
         }
     }
-    try std.testing.expect(found_new_prompt);
+    if (!found_new_prompt) {
+        std.debug.print("new-session prompt missing\n--- output ---\n{s}\n--- summaries ---\n", .{second.output});
+        for (summaries_after.items) |summary| std.debug.print("{s}: {s}\n", .{ summary.file_name, summary.title });
+        return error.TestUnexpectedResult;
+    }
 }
 
 test "pty e2e: no-session keeps interactive runs ephemeral" {
@@ -1028,6 +1134,51 @@ test "pty e2e: no-session keeps interactive runs ephemeral" {
     });
     defer sessions.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 0), sessions.file_names.len);
+}
+
+test "pty e2e: undrained shutdown restores terminal and exits failure" {
+    if (!supportsForkPty()) return error.SkipZigTest;
+    const zi_bin = envValue("ZI_PTY_E2E_BIN") orelse return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "repo/.zi");
+    try tmp.dir.createDirPath(std.testing.io, "home");
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    const repo_abs = try tmpAbsPath(std.testing.allocator, &tmp, "repo");
+    defer std.testing.allocator.free(repo_abs);
+    const home_abs = try tmpAbsPath(std.testing.allocator, &tmp, "home");
+    defer std.testing.allocator.free(home_abs);
+    const agent_abs = try tmpAbsPath(std.testing.allocator, &tmp, "agent");
+    defer std.testing.allocator.free(agent_abs);
+    const home_env = try std.fmt.allocPrint(std.testing.allocator, "HOME={s}", .{home_abs});
+    defer std.testing.allocator.free(home_env);
+    const agent_env = try std.fmt.allocPrint(std.testing.allocator, "ZI_CODING_AGENT_DIR={s}", .{agent_abs});
+    defer std.testing.allocator.free(agent_env);
+    const env = [_][]const u8{
+        "TERM=xterm-256color",
+        "NO_COLOR=1",
+        "ZI_ENABLE_FAUX_PROVIDER=1",
+        "ZI_TUI_NONCOOPERATIVE_TASK=1",
+        home_env,
+        agent_env,
+    };
+
+    const started = nowNs();
+    var result = try runScripted(std.testing.allocator, .{
+        .argv = &.{zi_bin},
+        .env = &env,
+        .cwd = repo_abs,
+        .timeout_ms = 9_000,
+    }, &.{.{ .after_ms = 500, .bytes = "\x04" }});
+    defer result.deinit(std.testing.allocator);
+
+    const duration_ms = elapsedMs(started);
+    try std.testing.expect(!result.timed_out);
+    try std.testing.expect(duration_ms >= 5_000 and duration_ms < 8_000);
+    try std.testing.expect(exitedWith(result.status, 1));
+    try std.testing.expect(result.termios_restored != false);
+    try expectContains(result.output, "fatal: shutdown deadline expired with undrained work; terminal restored");
 }
 
 test "pty e2e: P5 print json faux provider" {

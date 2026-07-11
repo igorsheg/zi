@@ -201,6 +201,7 @@ fn runTui(
             .panic_test = panic_test,
         }) catch |err| switch (err) {
             error.UnsupportedCliFeature => return frontendStub(stderr),
+            error.UndrainedShutdown => std.process.exit(1),
             else => return err,
         };
     }

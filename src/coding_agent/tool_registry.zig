@@ -5,10 +5,31 @@ const edit_tool = @import("tools/edit.zig");
 const file_mutation_queue = @import("tools/file_mutation_queue.zig");
 const read_tool = @import("tools/read.zig");
 const symbols_tool = @import("tools/symbols.zig");
+const tool_metadata = @import("tool_metadata.zig");
 const write_tool = @import("tools/write.zig");
 
-pub const default_active_tool_names: []const []const u8 = &.{ "read", "bash", "edit", "write", "symbols" };
+pub const default_active_tool_names = [_][]const u8{ "read", "bash", "edit", "write", "symbols" };
 const max_tools = default_active_tool_names.len;
+
+comptime {
+    for (default_active_tool_names) |name| {
+        if (!tool_metadata.hasExplicitBuiltinPolicy(name)) {
+            @compileError(std.fmt.comptimePrint("builtin tool '{s}' has no explicit display policy", .{name}));
+        }
+    }
+    for (tool_metadata.explicit_builtin_names) |name| {
+        if (!containsBuiltinName(name)) {
+            @compileError(std.fmt.comptimePrint("display policy names unregistered builtin tool '{s}'", .{name}));
+        }
+    }
+}
+
+fn containsBuiltinName(name: []const u8) bool {
+    inline for (default_active_tool_names) |builtin_name| {
+        if (std.mem.eql(u8, name, builtin_name)) return true;
+    }
+    return false;
+}
 
 /// Bounded set of executable tools plus the per-tool system prompt snippet.
 /// The agent core receives the borrowed `agent.AgentTool` views; the snippet

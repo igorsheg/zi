@@ -60,8 +60,26 @@ do not set cache fields.
   item. Pending caches are published together, so frames never observe a mixed
   line index.
 - Visible materialization: at most `screen.row_capacity` rows.
+- Live agent application: at most 8 `.live` `RunHandle` results per owner
+  iteration. A full batch must be flushed, then waits for the next normal 16 ms
+  frame deadline before another batch.
+- Interactive restore: at most 16 durable entries and a 256 KiB measured-work
+  target per step. One first entry may exceed the target, bounded by the 1 MiB
+  session-line cap. Restore continuation uses the same frame deadline gate.
+- Prompt images: at most 4 images and 768 KiB of base64 data in aggregate.
+  Reads and encoding run in one concrete background task and check cancellation
+  between 256 KiB chunks.
+- Session work: one concrete listing/opening/switch/restore operation. Listing
+  and opening run off-loop with 5-second and 30-second deadlines; the old
+  session remains current until the replacement is complete and its shutdown
+  has been observed.
 - Terminal frame cadence: fixed 16 ms start-to-start floor. Timing statistics
   never control scheduling.
+- Process shutdown: `Loop` requests each concrete cancellation source and polls
+  owned tasks, the run driver, and sessions for at most five seconds. Normal
+  deinitialization runs only after every worker-visible owner is terminal. An
+  undrained deadline restores the terminal and returns a typed condition to the
+  CLI, which exits immediately without running memory-releasing defers.
 
 While a complete relayout is pending, the active layout remains renderable and
 input remains owner-loop foreground work. Initial layout has no active history,
@@ -96,9 +114,11 @@ Trace output separates apply, layout, paint, and flush time and records:
 - maximum items and source bytes processed by one frame.
 
 Tests should prefer these deterministic work counters over wall-clock
-thresholds. PTY tests additionally gate autonomous frame cadence, input latency,
-resize storms, transcript eviction, and synthetic streaming without periodic
-input.
+thresholds. Trace output also records maximum agent events per iteration,
+event-budget exhaustion, gated polls, and maximum restored entries/work bytes
+per step. PTY tests additionally gate autonomous frame cadence, input latency,
+resize storms, transcript eviction, synthetic streaming, and a real faux-provider
+`RunHandle`/`EventPipe` flood without periodic input.
 
 A new transcript feature must prove:
 

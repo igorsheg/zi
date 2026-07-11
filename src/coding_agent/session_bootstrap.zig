@@ -1,4 +1,5 @@
 const std = @import("std");
+const runtime = @import("../runtime/root.zig");
 const agent_mod = @import("../agent/root.zig");
 const ai = @import("../ai/root.zig");
 const paths_mod = @import("paths.zig");
@@ -21,6 +22,7 @@ pub const Overrides = struct {
     model: ?ai.Model = null,
     thinking_level: ?agent_mod.ThinkingLevel = null,
     stream: ?ai.StreamFunction = null,
+    cancel_token: ?runtime.CancelToken = null,
 };
 
 pub fn openSession(
@@ -51,6 +53,7 @@ pub fn openSession(
         .retry_settings = retrySettings(project, global),
         .compaction_settings = compactionSettings(project, global),
         .task_runtime = services.task_runtime,
+        .cancel_token = overrides.cancel_token,
     };
 
     switch (spec) {
@@ -79,6 +82,7 @@ pub fn openSession(
                 .dir = services.dir,
                 .environ = services.environ,
                 .selector = existing.session_file_name,
+                .cancel_token = overrides.cancel_token,
             }) orelse return error.SessionNotFound;
             defer allocator.free(selected);
 

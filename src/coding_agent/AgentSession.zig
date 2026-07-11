@@ -155,6 +155,7 @@ pub const Options = struct {
     environ: ?*const std.process.Environ.Map = null,
     allow_paths_outside_cwd: bool = true,
     store: ?StoreOptions = null,
+    cancel_token: ?runtime.CancelToken = null,
     task_runtime: *runtime.Runtime,
 };
 
@@ -208,7 +209,7 @@ pub const SettleContext = struct {
 /// run (no tools, no queue hooks, empty context) under its own cancel
 /// source. The producer streams; the owner polls; settle applies the result.
 pub const CompactionRun = struct {
-    state: enum { producing, settled } = .producing,
+    state: enum { producing, cancel_requested, settled } = .producing,
     stream: agent_mod.loop.AgentEventStream = undefined,
     buffer: [live_prompt_event_capacity_count]agent_mod.loop.StreamEvent = undefined,
     prompts: [1]agent_mod.AgentMessage = undefined,
@@ -249,15 +250,18 @@ pub const PromptRun = struct {
         return self.terminalToken() != null;
     }
 
-    fn markCancelRequested(self: *PromptRun) ?runtime.CancelToken {
+    fn requestCancel(self: *PromptRun) bool {
         return switch (self.state) {
-            .running => |token| {
+            .running => |token| blk: {
                 self.state = .{ .cancel_requested = token };
-                return token;
+                break :blk true;
             },
-            .cancel_requested => |token| token,
-            .settled => null,
+            .cancel_requested, .settled => false,
         };
+    }
+
+    fn cancellationOutstanding(self: *const PromptRun) bool {
+        return self.state == .cancel_requested;
     }
 
     fn markSettled(self: *PromptRun) void {
@@ -273,6 +277,7 @@ pub const RunHandle = struct {
 
     pub const Kind = enum { prompt, compaction };
     pub const PollResult = enum { live, empty, settled };
+    pub const CancelRequestResult = enum { requested, already_requested, settled };
 
     const Run = union(enum) {
         prompt: *PromptRun,
@@ -319,11 +324,19 @@ pub const RunHandle = struct {
         };
     }
 
-    pub fn cancelRequest(self: *RunHandle, session: *AgentSession) void {
-        switch (self.run) {
-            .prompt => |run| session.cancelPromptRun(run) catch {},
+    pub fn cancelRequest(self: *RunHandle, session: *AgentSession) CancelRequestResult {
+        return switch (self.run) {
+            .prompt => |run| session.cancelPromptRun(run),
             .compaction => |run| session.cancelCompactionRun(run),
-        }
+        };
+    }
+
+    pub fn cancellationOutstanding(self: *const RunHandle) bool {
+        if (self.settled) return false;
+        return switch (self.run) {
+            .prompt => |run| run.cancellationOutstanding(),
+            .compaction => |run| run.state == .cancel_requested,
+        };
     }
 
     pub fn deinitAfterSettled(self: *RunHandle, session: *AgentSession) void {
@@ -344,6 +357,7 @@ const Lifecycle = enum {
 
 pub fn init(allocator: std.mem.Allocator, io: std.Io, options: Options) !AgentSession {
     const task_runtime = options.task_runtime;
+    if (options.cancel_token) |token| try token.throwIfRequested();
 
     var prompt_resources = try resources.PromptResources.load(allocator, io, .{
         .dir = options.dir,
@@ -352,6 +366,7 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, options: Options) !AgentSe
     });
     defer prompt_resources.deinit();
 
+    if (options.cancel_token) |token| try token.throwIfRequested();
     const builtin_tools = try tool_registry.BuiltinTools.init(allocator, .{
         .cwd = options.cwd,
         .environ = options.environ,
@@ -370,10 +385,11 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, options: Options) !AgentSe
     );
     errdefer allocator.free(system_prompt_text);
 
+    if (options.cancel_token) |token| try token.throwIfRequested();
     const manager = try allocator.create(session_manager.SessionManager);
     errdefer allocator.destroy(manager);
     manager.* = if (options.store != null and options.store.? == .restore)
-        try options.store.?.restore.load(io)
+        try options.store.?.restore.loadCancelable(io, options.cancel_token)
     else
         try session_manager.SessionManager.init(
             allocator,
@@ -535,6 +551,11 @@ pub fn applyPromptRunProgress(
     var event = progress orelse {
         // Stream is done: settle the run as completed or failed.
         const token = run.terminalToken().?;
+        if (run.cancellationOutstanding()) {
+            _ = run.stream.awaitProducer() catch {};
+            try self.settlePromptRunFailure(run, token, "aborted");
+            return false;
+        }
         run.stream.awaitProducer() catch |err| {
             try self.settlePromptRunFailure(run, token, @errorName(err));
             return false;
@@ -544,21 +565,25 @@ pub fn applyPromptRunProgress(
         return false;
     };
     defer event.deinit();
+    if (run.cancellationOutstanding()) return true;
     try self.agent.emitEvent(event.event);
     return true;
 }
 
-pub fn cancelPromptRun(self: *AgentSession, run: *PromptRun) !void {
-    const token = run.markCancelRequested() orelse return;
+pub fn cancelPromptRun(self: *AgentSession, run: *PromptRun) RunHandle.CancelRequestResult {
+    if (run.cancellationOutstanding()) return .already_requested;
+    const token = run.terminalToken() orelse return .settled;
+    if (!run.requestCancel()) return .settled;
     self.agent.abort();
     run.stream.cancelProducer() catch |err| switch (err) {
         error.Canceled => {},
         else => {
-            try self.settlePromptRunFailure(run, token, @errorName(err));
-            return err;
+            self.settlePromptRunFailure(run, token, @errorName(err)) catch {};
+            return .requested;
         },
     };
-    try self.settlePromptRunFailure(run, token, "aborted");
+    self.settlePromptRunFailure(run, token, "aborted") catch {};
+    return .requested;
 }
 
 fn settlePromptRunFailure(
@@ -575,7 +600,7 @@ fn settlePromptRunFailure(
 
 pub fn destroyPromptRun(self: *AgentSession, run: *PromptRun) void {
     if (run.isActive()) {
-        _ = run.markCancelRequested();
+        _ = run.requestCancel();
         run.stream.cancelProducer() catch |err| {
             const ignored_cleanup_error = @errorName(err);
             _ = ignored_cleanup_error;
@@ -1106,14 +1131,21 @@ pub fn applyCompactionRunProgress(
 ) !bool {
     if (run.state == .settled) return false;
     var event = progress orelse {
-        run.stream.awaitProducer() catch |err| {
+        if (run.state == .cancel_requested) {
+            _ = run.stream.awaitProducer() catch {};
             if (run.outcome == .summary) self.allocator.free(run.outcome.summary);
-            run.outcome = .{ .failure = err };
-        };
+            run.outcome = .{ .failure = error.OperationCancelled };
+        } else {
+            run.stream.awaitProducer() catch |err| {
+                if (run.outcome == .summary) self.allocator.free(run.outcome.summary);
+                run.outcome = .{ .failure = err };
+            };
+        }
         run.state = .settled;
         return false;
     };
     defer event.deinit();
+    if (run.state == .cancel_requested) return true;
     switch (event.event) {
         .message_end => |payload| switch (payload.message) {
             .assistant => |assistant| {
@@ -1186,16 +1218,22 @@ pub fn settleCompactionRun(self: *AgentSession, run: *CompactionRun) !SettleVerd
     return .{ .retry = .{ .kind = .resubmit_prompt, .delay_ms = 0 } };
 }
 
-/// Cancel an in-flight compaction. The caller still destroys the run.
-pub fn cancelCompactionRun(self: *AgentSession, run: *CompactionRun) void {
-    run.cancel.request();
-    run.stream.cancelProducer() catch |err| {
-        const ignored_cancel_error = @errorName(err);
-        _ = ignored_cancel_error;
+/// Cancel an in-flight compaction and leave the settled handle for the owner
+/// to observe and destroy.
+pub fn cancelCompactionRun(self: *AgentSession, run: *CompactionRun) RunHandle.CancelRequestResult {
+    return switch (run.state) {
+        .producing => blk: {
+            run.state = .cancel_requested;
+            run.cancel.request();
+            run.stream.cancelProducer() catch {};
+            if (run.outcome == .summary) self.allocator.free(run.outcome.summary);
+            run.outcome = .{ .failure = error.OperationCancelled };
+            run.state = .settled;
+            break :blk .requested;
+        },
+        .cancel_requested => .already_requested,
+        .settled => .settled,
     };
-    if (run.outcome == .summary) self.allocator.free(run.outcome.summary);
-    run.outcome = .{ .failure = error.OperationCancelled };
-    run.state = .settled;
 }
 
 pub fn destroyCompactionRun(self: *AgentSession, run: *CompactionRun) void {
@@ -2029,7 +2067,8 @@ test "cancel compaction run leaves history unchanged" {
     try appendTwoCompactableMessages(&session);
 
     const run = (try session.startCompactionRun(.threshold, false, null)).?;
-    session.cancelCompactionRun(run);
+    try std.testing.expectEqual(RunHandle.CancelRequestResult.requested, session.cancelCompactionRun(run));
+    try driveCompactionRun(&session, run);
     _ = try session.settleCompactionRun(run);
     session.destroyCompactionRun(run);
     try std.testing.expectEqual(@as(usize, 2), session.manager.entries.items.len);

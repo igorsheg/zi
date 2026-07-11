@@ -62,6 +62,20 @@ pub fn cursorByte(self: *const Editor) usize {
     return self.cursor;
 }
 
+pub fn moveCursorTo(self: *Editor, byte: usize) bool {
+    if (byte > self.len or !std.unicode.utf8ValidateSlice(self.buffer[0..byte])) return false;
+    for (self.paste_markers[0..self.paste_marker_len]) |*marker| {
+        var start: usize = 0;
+        while (std.mem.indexOfPos(u8, self.text(), start, marker.marker.text())) |found| {
+            const end = found + marker.marker.len;
+            if (byte > found and byte < end) return false;
+            start = end;
+        }
+    }
+    self.cursor = byte;
+    return true;
+}
+
 pub fn insert(self: *Editor, bytes: []const u8) Error!void {
     if (!std.unicode.utf8ValidateSlice(bytes)) return error.InvalidUtf8;
     if (shouldCollapsePaste(bytes)) return self.insertPasteMarker(bytes);
@@ -259,6 +273,16 @@ pub fn lineCount(self: *const Editor) usize {
     return count;
 }
 
+pub fn lineByteOffset(self: *const Editor, line_index: usize) usize {
+    var current: usize = 0;
+    var start: usize = 0;
+    while (current < line_index) : (current += 1) {
+        const next = std.mem.indexOfScalarPos(u8, self.text(), start, '\n') orelse return self.len;
+        start = next + 1;
+    }
+    return start;
+}
+
 pub fn lineSlice(self: *const Editor, line_index: usize) []const u8 {
     var current: usize = 0;
     var start: usize = 0;
@@ -328,6 +352,12 @@ pub fn removeTrailingBackslash(self: *Editor) bool {
     if (self.cursor > self.len) self.cursor = self.len;
     self.last_was_kill = false;
     return true;
+}
+
+pub fn cursorUnitEnd(self: *const Editor, byte: usize) usize {
+    if (byte >= self.len) return self.len;
+    if (self.markerAt(byte)) |marker| return byte + marker.marker.len;
+    return self.nextGraphemeEnd(byte);
 }
 
 pub fn insertPasteMarker(self: *Editor, bytes: []const u8) Error!void {

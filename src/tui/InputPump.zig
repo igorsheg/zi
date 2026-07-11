@@ -75,6 +75,7 @@ pub const InputPump = struct {
     ring: SpscRing(u8, byte_capacity) = .{},
     stamps: SpscRing(BatchStamp, stamp_capacity) = .{},
     stop: std.atomic.Value(bool) = .init(false),
+    stopped: std.atomic.Value(bool) = .init(true),
     dropped_bytes: std.atomic.Value(usize) = .init(0),
     dropped_stamps: std.atomic.Value(usize) = .init(0),
     thread: ?std.Thread = null,
@@ -96,7 +97,11 @@ pub const InputPump = struct {
         self.read_fn = options.read_fn;
         self.wake = options.wake;
         self.stop.store(false, .release);
-        self.thread = try std.Thread.spawn(.{}, run, .{self});
+        self.stopped.store(false, .release);
+        self.thread = std.Thread.spawn(.{}, run, .{self}) catch |err| {
+            self.stopped.store(true, .release);
+            return err;
+        };
     }
 
     pub fn startTerminal(self: *InputPump, io: std.Io, terminal: *Terminal, wake: *runtime.WakeEvent) !void {
@@ -119,7 +124,12 @@ pub const InputPump = struct {
         }
     }
 
+    pub fn hasStopped(self: *const InputPump) bool {
+        return self.thread == null or self.stopped.load(.acquire);
+    }
+
     fn run(self: *InputPump) void {
+        defer self.stopped.store(true, .release);
         const read_fn = self.read_fn orelse return;
         const source_context = self.source_context orelse return;
         var buffer: [read_buffer_capacity]u8 = undefined;

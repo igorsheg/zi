@@ -114,7 +114,7 @@ const Driver = struct {
     ) !coding_agent.AgentSession.SettleVerdict {
         var handle_consumed = false;
         errdefer if (!handle_consumed) {
-            handle.cancelRequest(session);
+            _ = handle.cancelRequest(session);
             handle.deinitAfterSettled(session);
         };
         while (true) {

@@ -6,8 +6,8 @@ pub const EditorOp = enum {
     move_right,
     move_word_left,
     move_word_right,
-    move_up_history,
-    move_down_history,
+    move_up,
+    move_down,
     backspace,
     delete_forward,
     home,
@@ -53,8 +53,8 @@ pub fn fromKey(key: vaxis.Key) Action {
     if (key.matches(vaxis.Key.right, .{ .alt = true })) return .{ .key_editor = .move_word_right };
     if (key.matches(vaxis.Key.left, .{})) return .{ .key_editor = .move_left };
     if (key.matches(vaxis.Key.right, .{})) return .{ .key_editor = .move_right };
-    if (key.matches(vaxis.Key.up, .{})) return .{ .key_editor = .move_up_history };
-    if (key.matches(vaxis.Key.down, .{})) return .{ .key_editor = .move_down_history };
+    if (key.matches(vaxis.Key.up, .{})) return .{ .key_editor = .move_up };
+    if (key.matches(vaxis.Key.down, .{})) return .{ .key_editor = .move_down };
     if (key.matches(vaxis.Key.home, .{})) return .{ .key_editor = .home };
     if (key.matches(vaxis.Key.end, .{})) return .{ .key_editor = .end };
     if (key.matches(vaxis.Key.page_up, .{})) return .page_up;

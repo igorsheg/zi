@@ -245,6 +245,80 @@ const VisualEditorLine = struct {
     line: []const u8,
 };
 
+pub const VerticalDirection = enum { up, down };
+
+pub const VerticalCursorTarget = union(enum) {
+    cursor: struct { byte: usize, preferred_column_cells: usize },
+    history,
+};
+
+pub fn verticalCursorTarget(
+    editor: *const Editor,
+    width: u16,
+    height: u16,
+    direction: VerticalDirection,
+    preferred_column_cells: ?usize,
+) VerticalCursorTarget {
+    const text_cols = composerTextColumns(width, useBorder(height, width));
+    const total = visualEditorLineCount(editor, text_cols);
+    const current_index = cursorVisualLineIndex(editor, text_cols);
+    const current = visualEditorLineAt(editor, text_cols, current_index) orelse return .history;
+    const cursor = editor.cursorLineCol();
+    const current_end = @min(cursor.col, current.end);
+    const current_column = if (current_end > current.start)
+        screen.displayWidth(current.line[current.start..current_end])
+    else
+        0;
+    const preferred = preferred_column_cells orelse current_column;
+    const target_index = switch (direction) {
+        .up => if (current_index == 0) return .history else current_index - 1,
+        .down => if (current_index + 1 >= total) return .history else current_index + 1,
+    };
+    const target = visualEditorLineAt(editor, text_cols, target_index) orelse return .history;
+    const line_offset = editor.lineByteOffset(target.editor_line_index);
+    const byte = cursorByteAtDisplayColumn(editor, line_offset, target, preferred);
+    return .{ .cursor = .{ .byte = byte, .preferred_column_cells = preferred } };
+}
+
+fn cursorByteAtDisplayColumn(
+    editor: *const Editor,
+    line_offset: usize,
+    visual: VisualEditorLine,
+    preferred_column_cells: usize,
+) usize {
+    var relative = visual.start;
+    var column: usize = 0;
+    while (relative < visual.end) {
+        const absolute = line_offset + relative;
+        const unit_end_absolute = @min(editor.cursorUnitEnd(absolute), line_offset + visual.end);
+        const unit_end = unit_end_absolute - line_offset;
+        if (unit_end <= relative) break;
+        const next_column = column + screen.displayWidth(visual.line[relative..unit_end]);
+        if (preferred_column_cells < next_column) {
+            const before_distance = preferred_column_cells -| column;
+            const after_distance = next_column - preferred_column_cells;
+            return line_offset + if (before_distance <= after_distance) relative else unit_end;
+        }
+        if (preferred_column_cells == next_column) {
+            if (unit_end == visual.end and visual.end < visual.line.len) return line_offset + relative;
+            return line_offset + unit_end;
+        }
+        relative = unit_end;
+        column = next_column;
+    }
+    if (visual.end < visual.line.len and visual.end > visual.start) {
+        var previous = visual.start;
+        var next = previous;
+        while (next < visual.end) {
+            previous = next;
+            next = @min(editor.cursorUnitEnd(line_offset + next) - line_offset, visual.end);
+            if (next <= previous) break;
+        }
+        return line_offset + previous;
+    }
+    return line_offset + visual.end;
+}
+
 fn composerTextColumns(width: u16, bordered: bool) usize {
     const content_width: usize = if (bordered) @as(usize, width) -| 2 else width;
     return content_width -| @min(screen.displayWidth(prompt), content_width);
@@ -475,6 +549,48 @@ fn horizontalFill(cols: usize) []const u8 {
 
 fn spaceFill(cols: usize) []const u8 {
     return border_spaces[0..@min(border_spaces.len, cols)];
+}
+
+test "vertical cursor targets hard lines and preserves preferred display column" {
+    var editor: Editor = .{};
+    try editor.insert("abcdef\nxy\n123456");
+
+    const first_up = verticalCursorTarget(&editor, 40, 10, .up, null).cursor;
+    try std.testing.expectEqual(@as(usize, 9), first_up.byte);
+    try std.testing.expectEqual(@as(usize, 6), first_up.preferred_column_cells);
+    try std.testing.expect(editor.moveCursorTo(first_up.byte));
+
+    const second_up = verticalCursorTarget(&editor, 40, 10, .up, first_up.preferred_column_cells).cursor;
+    try std.testing.expectEqual(@as(usize, 6), second_up.byte);
+    try std.testing.expect(editor.moveCursorTo(second_up.byte));
+    try std.testing.expect(verticalCursorTarget(&editor, 40, 10, .up, second_up.preferred_column_cells) == .history);
+}
+
+test "vertical cursor targets soft wraps with wide and combining graphemes" {
+    var editor: Editor = .{};
+    try editor.insert("a界b界c界d");
+
+    const up = verticalCursorTarget(&editor, 6, 10, .up, null).cursor;
+    try std.testing.expectEqual(@as(usize, 8), up.byte);
+    try std.testing.expectEqual(@as(usize, 3), up.preferred_column_cells);
+    try std.testing.expect(editor.moveCursorTo(up.byte));
+    const up_again = verticalCursorTarget(&editor, 6, 10, .up, up.preferred_column_cells).cursor;
+    try std.testing.expectEqual(@as(usize, 4), up_again.byte);
+
+    editor.clear();
+    try editor.insert("e\u{301}xye\u{301}xy");
+    const combining_up = verticalCursorTarget(&editor, 6, 10, .up, null).cursor;
+    try std.testing.expect(std.unicode.utf8ValidateSlice(editor.text()[0..combining_up.byte]));
+}
+
+test "vertical cursor keeps paste markers atomic" {
+    var editor: Editor = .{};
+    try editor.insertMarker("[paste #1 +20 lines]", "expanded");
+    try editor.insert("\nend");
+    const up = verticalCursorTarget(&editor, 40, 10, .up, null).cursor;
+    try std.testing.expectEqual(@as(usize, 0), up.byte);
+    try std.testing.expect(editor.moveCursorTo(up.byte));
+    try std.testing.expect(!editor.moveCursorTo(2));
 }
 
 test "chrome composes status and editor rows" {

@@ -165,6 +165,12 @@ pub const Stats = struct {
     animated_frame_gaps: TimingStats = .{},
     animated_deadline_misses: usize = 0,
     layout_work: LayoutWorkStats = .{},
+    agent_events_applied_per_iteration_max: usize = 0,
+    agent_event_budget_exhaustion_count: usize = 0,
+    gated_driver_poll_skip_count: usize = 0,
+    restore_entries_per_iteration_max: usize = 0,
+    restore_work_bytes_per_iteration_max: usize = 0,
+    prompt_image_completion_copy_bytes: usize = 0,
 
     pub fn recordIteration(self: *Stats, ns: u64) void {
         self.iterations.record(ns);
@@ -220,6 +226,27 @@ pub const Stats = struct {
         if (gap_ns > frame_floor_ns *| 2) self.animated_deadline_misses += 1;
     }
 
+    pub fn recordAgentEventsApplied(self: *Stats, count: usize) void {
+        self.agent_events_applied_per_iteration_max = @max(self.agent_events_applied_per_iteration_max, count);
+    }
+
+    pub fn recordAgentEventBudgetExhaustion(self: *Stats) void {
+        self.agent_event_budget_exhaustion_count += 1;
+    }
+
+    pub fn recordGatedDriverPollSkip(self: *Stats) void {
+        self.gated_driver_poll_skip_count += 1;
+    }
+
+    pub fn recordRestoreWork(self: *Stats, entries: usize, work_bytes: usize) void {
+        self.restore_entries_per_iteration_max = @max(self.restore_entries_per_iteration_max, entries);
+        self.restore_work_bytes_per_iteration_max = @max(self.restore_work_bytes_per_iteration_max, work_bytes);
+    }
+
+    pub fn recordPromptImageCompletionCopy(self: *Stats, bytes: usize) void {
+        self.prompt_image_completion_copy_bytes +|= bytes;
+    }
+
     pub fn writeReport(self: *const Stats, writer: *std.Io.Writer) !void {
         try writer.print(
             "zi tui trace\n" ++
@@ -256,6 +283,9 @@ pub const Stats = struct {
                 " max_items_per_frame={d} max_source_bytes_per_frame={d}\n" ++
                 "input_actions count={d}\n" ++
                 "dropped_input_bytes count={d}\n" ++
+                "agent_event_fairness max_applied_per_iteration={d} budget_exhaustions={d} gated_poll_skips={d}\n" ++
+                "restore_work max_entries_per_iteration={d} max_bytes_per_iteration={d}\n" ++
+                "prompt_image_completion_copy_bytes count={d}\n" ++
                 "transcript_evictions count={d}\n" ++
                 "input_latency count={d} p50_ns={d} p90_ns={d} p99_ns={d} max_ns={d}\n" ++
                 "input_latency buckets_1ms_to_1024ms_plus=",
@@ -277,6 +307,12 @@ pub const Stats = struct {
                 self.layout_work.max_source_bytes_per_frame,
                 self.input_actions,
                 self.dropped_input_bytes,
+                self.agent_events_applied_per_iteration_max,
+                self.agent_event_budget_exhaustion_count,
+                self.gated_driver_poll_skip_count,
+                self.restore_entries_per_iteration_max,
+                self.restore_work_bytes_per_iteration_max,
+                self.prompt_image_completion_copy_bytes,
                 self.transcript_evictions,
                 self.input_latency_timing.count,
                 self.input_latency_timing.percentileNs(50),
@@ -379,6 +415,9 @@ test "stats write report includes render and input metrics" {
     stats.recordInputAction();
     stats.addDroppedInputBytes(4);
     stats.recordLayoutWork(2, 100, 3, 4);
+    stats.recordAgentEventsApplied(8);
+    stats.recordAgentEventBudgetExhaustion();
+    stats.recordGatedDriverPollSkip();
 
     var out: [1024]u8 = undefined;
     var writer = std.Io.Writer.fixed(&out);
@@ -391,4 +430,5 @@ test "stats write report includes render and input metrics" {
     try std.testing.expect(std.mem.indexOf(u8, text, "layout_work items=2") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "input_actions count=1") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "dropped_input_bytes count=4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "agent_event_fairness max_applied_per_iteration=8 budget_exhaustions=1 gated_poll_skips=1") != null);
 }
