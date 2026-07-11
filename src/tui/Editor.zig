@@ -294,13 +294,25 @@ pub fn currentToken(self: *const Editor) ?Token {
 }
 
 pub fn replaceToken(self: *Editor, token: Token, replacement: []const u8) Error!void {
+    return self.replaceRange(token.start, token.end, replacement, replacement.len);
+}
+
+pub fn replaceRange(
+    self: *Editor,
+    start: usize,
+    end: usize,
+    replacement: []const u8,
+    cursor_offset: usize,
+) Error!void {
     if (!std.unicode.utf8ValidateSlice(replacement)) return error.InvalidUtf8;
-    if (token.start > token.end or token.end > self.len) return error.InvalidUtf8;
-    if (self.len - (token.end - token.start) + replacement.len > capacity) return error.EditorFull;
+    if (start > end or end > self.len or cursor_offset > replacement.len) return error.InvalidUtf8;
+    if (!std.unicode.utf8ValidateSlice(replacement[0..cursor_offset])) return error.InvalidUtf8;
+    if (self.len - (end - start) + replacement.len > capacity) return error.EditorFull;
     try self.recordUndo();
-    self.deleteRange(token.start, token.end);
-    self.cursor = token.start;
+    self.deleteRange(start, end);
+    self.cursor = start;
     try self.insertRaw(replacement);
+    self.cursor = start + cursor_offset;
     self.history_index = null;
     self.last_was_kill = false;
 }
@@ -598,4 +610,12 @@ test "editor replaces current token for completion" {
     try std.testing.expectEqualStrings("@sr", token.text);
     try editor.replaceToken(token, "@src/main.zig");
     try std.testing.expectEqualStrings("run @src/main.zig now", editor.text());
+}
+
+test "editor range replacement sets cursor inside quoted completion" {
+    var editor: Editor = .{};
+    try editor.insert("see @my later");
+    try editor.replaceRange(4, 7, "@\"my folder/\"", 12);
+    try std.testing.expectEqualStrings("see @\"my folder/\" later", editor.text());
+    try std.testing.expectEqual(@as(usize, 16), editor.cursorByte());
 }

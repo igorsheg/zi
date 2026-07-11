@@ -385,6 +385,7 @@ pub const RunDriver = struct {
         });
         handle.deinitAfterSettled(session);
         self.state = .idle;
+        try owner.requestFileIndexRebuild();
         try self.afterPromptVerdict(owner, session, io, wake, now_ns, verdict);
     }
 
@@ -499,17 +500,39 @@ const CompletionMode = enum { slash, file };
 const CompletionCandidate = struct {
     label: [completion_text_bytes_max]u8 = undefined,
     label_len: u16 = 0,
-    insert: [completion_text_bytes_max]u8 = undefined,
+    insert: [coding_agent.file_completion.completion_edit_bytes_max]u8 = undefined,
     insert_len: u16 = 0,
     detail: [completion_text_bytes_max]u8 = undefined,
     detail_len: u16 = 0,
+    replace_start: u16 = 0,
+    replace_end: u16 = 0,
+    cursor_offset: u16 = 0,
     selectable: bool = true,
+    continue_completion: bool = false,
 
     fn set(self: *CompletionCandidate, label: []const u8, insert: []const u8, detail: []const u8, selectable: bool) void {
         self.label_len = copyBounded(self.label[0..], label);
         self.insert_len = copyBounded(self.insert[0..], insert);
         self.detail_len = copyBounded(self.detail[0..], detail);
+        self.cursor_offset = self.insert_len;
         self.selectable = selectable;
+        self.continue_completion = false;
+    }
+
+    fn setFile(
+        self: *CompletionCandidate,
+        label: []const u8,
+        detail: []const u8,
+        edit: coding_agent.file_completion.Edit,
+    ) void {
+        self.label_len = copyBounded(self.label[0..], label);
+        self.insert_len = copyBounded(self.insert[0..], edit.replacementSlice());
+        self.detail_len = copyBounded(self.detail[0..], detail);
+        self.replace_start = @intCast(edit.replace_start);
+        self.replace_end = @intCast(edit.replace_end);
+        self.cursor_offset = @min(edit.cursor_offset, self.insert_len);
+        self.selectable = true;
+        self.continue_completion = edit.continue_completion;
     }
 
     fn labelSlice(self: *const CompletionCandidate) []const u8 {
@@ -548,6 +571,17 @@ const CompletionPopup = struct {
     fn append(self: *CompletionPopup, label: []const u8, insert: []const u8, detail: []const u8, selectable: bool) void {
         if (self.candidate_len == self.candidates.len) return;
         self.candidates[self.candidate_len].set(label, insert, detail, selectable);
+        self.candidate_len += 1;
+    }
+
+    fn appendFile(
+        self: *CompletionPopup,
+        label: []const u8,
+        detail: []const u8,
+        edit: coding_agent.file_completion.Edit,
+    ) void {
+        if (self.candidate_len == self.candidates.len) return;
+        self.candidates[self.candidate_len].setFile(label, detail, edit);
         self.candidate_len += 1;
     }
 
@@ -735,7 +769,11 @@ pub const Loop = struct {
     picker_lines: [picker_visible_rows_max]screen.Line = undefined,
     file_index: ?coding_agent.file_completion.Index = null,
     file_index_task: ?runtime.Task(anyerror!coding_agent.file_completion.Index) = null,
+    file_index_stale: bool = false,
     file_index_failed: bool = false,
+    scoped_file_query_task: ?runtime.Task(anyerror!*coding_agent.file_completion.Result) = null,
+    scoped_file_query: [coding_agent.file_completion.file_completion_query_bytes_max]u8 = undefined,
+    scoped_file_query_len: u16 = 0,
     clipboard_image_task: ?runtime.Task(anyerror!ClipboardImagePaste) = null,
     clipboard_image_serial: u64 = 0,
     clipboard_temp_paths: [clipboard_temp_path_count_max]?[]u8 = @splat(null),
@@ -784,6 +822,7 @@ pub const Loop = struct {
             var result = task.getResult() catch null;
             if (result) |*index| index.deinit(self.gpa);
         }
+        self.cancelScopedFileQuery();
         if (self.file_index) |*index| index.deinit(self.gpa);
         self.transcript.deinit();
         self.* = undefined;
@@ -799,7 +838,7 @@ pub const Loop = struct {
         self.services = services;
         self.io = services.io;
         if (self.file_index == null and self.file_index_task == null and !self.file_index_failed) {
-            self.file_index_task = try services.task_runtime.spawnBlocking(buildFileIndex, .{ self.gpa, services.dir });
+            try self.requestFileIndexRebuild();
         }
     }
 
@@ -1127,7 +1166,12 @@ pub const Loop = struct {
     pub fn tick(self: *Loop, now_ns: u64) !void {
         try self.pollClipboardImageTask();
         const file_index_changed = try self.pollFileIndexTask();
-        if (file_index_changed and self.completion.active and self.completion.mode == .file) try self.refreshCompletion(.force_file);
+        const scoped_query_ready = if (self.scoped_file_query_task) |*task| task.hasResult() else false;
+        if ((file_index_changed or scoped_query_ready) and self.completion.active and self.completion.mode == .file) {
+            try self.refreshCompletion(.force_file);
+        } else if (scoped_query_ready) {
+            self.discardCompletedScopedFileQuery();
+        }
         try self.pumpSyntheticFlood(now_ns);
         if (self.ctrl_c_deadline_ns) |deadline| {
             if (now_ns > deadline) {
@@ -1637,21 +1681,98 @@ pub const Loop = struct {
         return false;
     }
 
+    fn requestFileIndexRebuild(self: *Loop) !void {
+        const services = self.services orelse return;
+        if (self.file_index_task != null) {
+            self.file_index_stale = true;
+            return;
+        }
+        self.file_index_stale = false;
+        self.file_index_failed = false;
+        self.file_index_task = try services.task_runtime.spawnBlocking(
+            buildFileIndex,
+            .{ self.gpa, services.dir, services.cwd },
+        );
+    }
+
     fn pollFileIndexTask(self: *Loop) !bool {
         if (self.file_index_task) |*task| {
             if (!task.hasResult()) return false;
+            const rebuild_again = self.file_index_stale;
             const index = task.getResult() catch |err| {
-                self.file_index_failed = true;
+                self.file_index_failed = self.file_index == null;
                 self.file_index_task = null;
+                self.file_index_stale = false;
                 try self.noticeFmt(.warn, "file index unavailable: {s}", .{@errorName(err)});
                 return true;
             };
+            if (self.file_index) |*old| old.deinit(self.gpa);
             self.file_index = index;
             self.file_index_task = null;
+            self.file_index_stale = false;
+            if (rebuild_again) try self.requestFileIndexRebuild();
             self.dirty = true;
             return true;
         }
         return false;
+    }
+
+    fn scopedFileQueryResult(
+        self: *Loop,
+        context: coding_agent.file_completion.Context,
+    ) !?*coding_agent.file_completion.Result {
+        const services = self.services orelse return null;
+        const query = context.raw_query;
+        if (self.scoped_file_query_task) |*task| {
+            if (std.mem.eql(u8, self.scoped_file_query[0..self.scoped_file_query_len], query)) {
+                if (!task.hasResult()) return null;
+                const result = task.getResult() catch {
+                    self.scoped_file_query_task = null;
+                    self.scoped_file_query_len = 0;
+                    const empty = try self.gpa.create(coding_agent.file_completion.Result);
+                    empty.* = .{};
+                    return empty;
+                };
+                self.scoped_file_query_task = null;
+                self.scoped_file_query_len = 0;
+                return result;
+            }
+            if (!task.hasResult()) return null;
+            self.discardCompletedScopedFileQuery();
+        }
+
+        const owned_query = try self.gpa.dupe(u8, query);
+        errdefer self.gpa.free(owned_query);
+        self.scoped_file_query_len = copyBounded(self.scoped_file_query[0..], query);
+        const home = if (services.environ) |env|
+            env.get("HOME") orelse env.get("USERPROFILE")
+        else
+            null;
+        self.scoped_file_query_task = try services.task_runtime.spawnBlocking(
+            coding_agent.file_completion.queryScoped,
+            .{ self.gpa, services.dir, services.cwd, home, owned_query },
+        );
+        return null;
+    }
+
+    fn discardCompletedScopedFileQuery(self: *Loop) void {
+        if (self.scoped_file_query_task) |*task| {
+            if (!task.hasResult()) return;
+            const result = task.getResult() catch null;
+            if (result) |value| value.destroy(self.gpa);
+        }
+        self.scoped_file_query_task = null;
+        self.scoped_file_query_len = 0;
+    }
+
+    fn cancelScopedFileQuery(self: *Loop) void {
+        if (self.scoped_file_query_task) |*task| {
+            if (!task.hasResult()) task.cancel();
+            const result = task.getResult() catch null;
+            if (result) |value| value.destroy(self.gpa);
+        }
+        self.scoped_file_query_task = null;
+        self.scoped_file_query_len = 0;
     }
 
     fn pumpSyntheticFlood(self: *Loop, now_ns: u64) !void {
@@ -1853,20 +1974,15 @@ pub const Loop = struct {
             }
             if (self.picker.active) self.picker.clear();
         }
-        const token = self.editor.currentToken() orelse blk: {
-            if (mode != .force_file) {
-                self.completion.clear();
-                return;
-            }
-            const cursor = self.editor.cursorByte();
-            break :blk Editor.Token{ .start = cursor, .end = cursor, .text = self.editor.text()[cursor..cursor] };
+        if (mode == .force_file) return self.refreshFileCompletion(.explicit);
+        const token = self.editor.currentToken() orelse {
+            self.completion.clear();
+            return;
         };
-        if (mode == .force_file) return self.refreshFileCompletion(token, true);
         if (token.start == 0 and std.mem.startsWith(u8, token.text, "/")) {
             return self.refreshSlashCompletion(token.text);
         }
-        if (std.mem.startsWith(u8, token.text, "@")) return self.refreshFileCompletion(token, false);
-        self.completion.clear();
+        return self.refreshFileCompletion(.automatic);
     }
 
     fn refreshSlashCompletion(self: *Loop, token_text: []const u8) !void {
@@ -1882,26 +1998,48 @@ pub const Loop = struct {
         if (self.completion.candidate_len == 0) self.completion.clear();
     }
 
-    fn refreshFileCompletion(self: *Loop, token: Editor.Token, forced: bool) !void {
+    fn refreshFileCompletion(self: *Loop, trigger: coding_agent.file_completion.Trigger) !void {
+        const context = coding_agent.file_completion.Context.parse(
+            self.editor.text(),
+            self.editor.cursorByte(),
+            trigger,
+        ) orelse {
+            self.completion.clear();
+            return;
+        };
+        if (context.raw_query.len > coding_agent.file_completion.file_completion_query_bytes_max) {
+            self.completion.clear();
+            return;
+        }
+        if (trigger == .explicit and context.kind == .path and context.raw_query.len > 0 and
+            context.raw_query[0] == '/' and context.replace_start == 0 and
+            std.mem.indexOfScalar(u8, context.raw_query[1..], '/') == null)
+        {
+            self.completion.clear();
+            return;
+        }
+
         self.completion.reset(.file);
         _ = try self.pollFileIndexTask();
         if (self.file_index == null) {
             self.completion.append(if (self.file_index_failed) "file index unavailable" else "indexing files…", "", "", false);
             return;
         }
-        const raw = if (std.mem.startsWith(u8, token.text, "@")) token.text[1..] else token.text;
-        if (!forced and token.text.len == 0) {
-            self.completion.clear();
-            return;
-        }
-        var result = try self.file_index.?.query(self.gpa, raw);
+        var result = if (context.needsScopedQuery()) blk: {
+            break :blk (try self.scopedFileQueryResult(context)) orelse {
+                self.completion.append("searching files…", "", "", false);
+                return;
+            };
+        } else blk: {
+            self.discardCompletedScopedFileQuery();
+            break :blk try self.file_index.?.query(self.gpa, context.indexQuery());
+        };
         defer result.destroy(self.gpa);
         var sources_buffer: [coding_agent.file_completion.item_count_max]coding_agent.file_completion.Source = undefined;
         const sources = result.sources(&sources_buffer);
         for (sources) |source| {
-            var insert_buffer: [completion_text_bytes_max]u8 = undefined;
-            const insert = std.fmt.bufPrint(&insert_buffer, "@{s}", .{source.id}) catch continue;
-            self.completion.append(source.label, insert, source.detail, true);
+            const edit = context.edit(source, self.editor.text()) orelse continue;
+            self.completion.appendFile(source.label, source.detail, edit);
         }
         if (self.completion.candidate_len == 0) self.completion.clear();
     }
@@ -1910,12 +2048,26 @@ pub const Loop = struct {
         const candidate = self.completion.selectedCandidate() orelse return null;
         if (!candidate.selectable) return null;
         const mode = self.completion.mode;
-        const token = self.editor.currentToken() orelse blk: {
-            const cursor = self.editor.cursorByte();
-            break :blk Editor.Token{ .start = cursor, .end = cursor, .text = self.editor.text()[cursor..cursor] };
-        };
-        try self.editor.replaceToken(token, candidate.insertSlice());
+        const continue_completion = candidate.continue_completion;
+        const candidate_insert = candidate.insertSlice();
+        const continuation_trigger: coding_agent.file_completion.Trigger =
+            if (candidate_insert.len > 0 and candidate_insert[0] == '@') .automatic else .explicit;
+        if (mode == .file) {
+            try self.editor.replaceRange(
+                candidate.replace_start,
+                candidate.replace_end,
+                candidate.insertSlice(),
+                candidate.cursor_offset,
+            );
+        } else {
+            const token = self.editor.currentToken() orelse blk: {
+                const cursor = self.editor.cursorByte();
+                break :blk Editor.Token{ .start = cursor, .end = cursor, .text = self.editor.text()[cursor..cursor] };
+            };
+            try self.editor.replaceToken(token, candidate.insertSlice());
+        }
         self.completion.clear();
+        if (continue_completion) try self.refreshFileCompletion(continuation_trigger);
         self.dirty = true;
         return mode;
     }
@@ -2693,8 +2845,18 @@ fn traceNowNs() u64 {
     return sec * std.time.ns_per_s + nsec;
 }
 
-fn buildFileIndex(allocator: std.mem.Allocator, dir: std.Io.Dir) anyerror!coding_agent.file_completion.Index {
-    return coding_agent.file_completion.Index.build(allocator, dir);
+fn buildFileIndex(
+    allocator: std.mem.Allocator,
+    base_dir: std.Io.Dir,
+    cwd: []const u8,
+) anyerror!coding_agent.file_completion.Index {
+    const fd = try std.posix.openat(base_dir.handle, cwd, .{
+        .ACCMODE = .RDONLY,
+        .DIRECTORY = true,
+        .CLOEXEC = true,
+    }, 0);
+    defer _ = std.c.close(fd);
+    return coding_agent.file_completion.Index.build(allocator, .{ .handle = fd });
 }
 
 fn copyBounded(dest: []u8, source: []const u8) u16 {
@@ -3585,6 +3747,21 @@ test "loop P4 restore fold renders durable user tool and assistant transcript" {
     try expectFrameOrder(&frame, " $ pwd", " │ /tmp/repo");
 }
 
+test "file index worker scopes paths to the service cwd" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "repo/src");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "repo/src/main.zig", .data = "" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "outside.txt", .data = "" });
+
+    var index = try buildFileIndex(std.testing.allocator, tmp.dir, "repo");
+    defer index.deinit(std.testing.allocator);
+    var result = try index.query(std.testing.allocator, "main");
+    defer result.destroy(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 1), result.item_len);
+    try std.testing.expectEqualStrings("src/main.zig", result.items[0].idSlice());
+}
+
 test "loop P4 file completion accepts inline selected candidate" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3597,7 +3774,45 @@ test "loop P4 file completion accepts inline selected candidate" {
     try loop.dispatch(.{ .insert = "see @ma" });
     try std.testing.expect(loop.completion.active);
     try loop.dispatch(.{ .key_editor = .tab });
-    try std.testing.expectEqualStrings("see @main.zig", loop.editor.text());
+    try std.testing.expectEqualStrings("see @main.zig ", loop.editor.text());
+}
+
+test "loop file completion quotes spaces and continues inside directory" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "my folder");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "my folder/test.txt", .data = "" });
+
+    var loop = try Loop.init(std.testing.allocator, null);
+    defer loop.deinit();
+    loop.file_index = try coding_agent.file_completion.Index.build(std.testing.allocator, tmp.dir);
+
+    try loop.dispatch(.{ .insert = "@my" });
+    try loop.dispatch(.{ .key_editor = .tab });
+    try std.testing.expectEqualStrings("@\"my folder/\"", loop.editor.text());
+    try std.testing.expectEqual(loop.editor.text().len - 1, loop.editor.cursorByte());
+    try std.testing.expect(loop.completion.active);
+
+    try loop.dispatch(.{ .insert = "te" });
+    try loop.dispatch(.{ .key_editor = .tab });
+    try std.testing.expectEqualStrings("@\"my folder/test.txt\" ", loop.editor.text());
+}
+
+test "loop explicit tab completes ordinary dot slash path" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "src");
+
+    var loop = try Loop.init(std.testing.allocator, null);
+    defer loop.deinit();
+    loop.file_index = try coding_agent.file_completion.Index.build(std.testing.allocator, tmp.dir);
+
+    try loop.dispatch(.{ .insert = "open ./sr" });
+    try std.testing.expect(!loop.completion.active);
+    try loop.dispatch(.{ .key_editor = .tab });
+    try std.testing.expect(loop.completion.active);
+    try loop.dispatch(.{ .key_editor = .tab });
+    try std.testing.expectEqualStrings("open ./src/", loop.editor.text());
 }
 
 test "loop completion popup windows selected candidate" {
