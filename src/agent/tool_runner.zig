@@ -136,7 +136,11 @@ fn executeToolCallsSequential(
         finalized_count += 1;
         if (finalized.result.result.terminate) terminate_count += 1;
 
-        emitFinalizedToolCall(
+        emitToolExecutionEnd(emit, prepared.toolCall(), finalized) catch |err| {
+            finalized.result.deinit();
+            return err;
+        };
+        appendToolResultMessage(
             allocator,
             result_allocator,
             emit,
@@ -332,6 +336,7 @@ fn executeToolCallsParallel(
     var executed_owned: [agent.max_tool_calls_per_turn]bool = @splat(false);
     errdefer deinitOwnedExecutedToolCalls(&executed, &executed_owned);
 
+    var completion_order: [agent.max_tool_calls_per_turn]usize = undefined;
     var completed_count: usize = 0;
     while (completed_count < prepared_count) {
         const event = try channel.getOne(io);
@@ -346,12 +351,16 @@ fn executeToolCallsParallel(
                 } });
             },
             .complete => |complete| {
-                executed[complete.prepared.index()] = complete;
-                executed_owned[complete.prepared.index()] = true;
+                const source_index = complete.prepared.index();
+                completion_order[completed_count] = source_index;
+                executed[source_index] = complete;
+                executed_owned[source_index] = true;
                 completed_count += 1;
             },
             .failed => |failed| {
-                executed[failed.prepared.index()] = .{
+                const source_index = failed.prepared.index();
+                completion_order[completed_count] = source_index;
+                executed[source_index] = .{
                     .prepared = failed.prepared,
                     .result = try createErrorToolResultFmt(
                         allocator,
@@ -360,7 +369,7 @@ fn executeToolCallsParallel(
                     ),
                     .is_error = true,
                 };
-                executed_owned[failed.prepared.index()] = true;
+                executed_owned[source_index] = true;
                 completed_count += 1;
             },
         }
@@ -368,26 +377,35 @@ fn executeToolCallsParallel(
 
     try group.await();
 
-    var messages = std.ArrayList(ai.ToolResultMessage).empty;
-    errdefer deinitToolResultMessages(result_allocator, allocator, messages.items, &messages);
+    var finalized: [agent.max_tool_calls_per_turn]FinalizedToolCall = undefined;
+    var finalized_owned: [agent.max_tool_calls_per_turn]bool = @splat(false);
+    errdefer deinitOwnedFinalizedToolCalls(&finalized, &finalized_owned);
     var terminate_count: usize = 0;
 
-    for (executed[0..prepared_count]) |item| {
-        executed_owned[item.prepared.index()] = false;
-        var finalized = try finalizeExecutedToolCall(allocator, context, assistant, config, token, item);
-        if (finalized.result.result.terminate) terminate_count += 1;
-        emitFinalizedToolCall(
+    // Pi exposes execution completion order, independent of assistant source order.
+    for (completion_order[0..completed_count]) |source_index| {
+        const item = executed[source_index];
+        executed_owned[source_index] = false;
+        finalized[source_index] = try finalizeExecutedToolCall(allocator, context, assistant, config, token, item);
+        finalized_owned[source_index] = true;
+        if (finalized[source_index].result.result.terminate) terminate_count += 1;
+        try emitToolExecutionEnd(emit, item.prepared.toolCall(), finalized[source_index]);
+    }
+
+    var messages = std.ArrayList(ai.ToolResultMessage).empty;
+    errdefer deinitToolResultMessages(result_allocator, allocator, messages.items, &messages);
+    // Durable tool-result messages remain in assistant source order.
+    for (executed[0..prepared_count], 0..) |item, source_index| {
+        try appendToolResultMessage(
             allocator,
             result_allocator,
             emit,
             item.prepared.toolCall(),
-            finalized,
+            finalized[source_index],
             &messages,
-        ) catch |err| {
-            finalized.result.deinit();
-            return err;
-        };
-        finalized.result.deinit();
+        );
+        finalized[source_index].result.deinit();
+        finalized_owned[source_index] = false;
     }
 
     return .{
@@ -430,6 +448,15 @@ fn deinitOwnedExecutedToolCalls(
 ) void {
     for (owned, 0..) |is_owned, index| {
         if (is_owned) executed[index].result.deinit();
+    }
+}
+
+fn deinitOwnedFinalizedToolCalls(
+    finalized: *[agent.max_tool_calls_per_turn]FinalizedToolCall,
+    owned: *[agent.max_tool_calls_per_turn]bool,
+) void {
+    for (owned, 0..) |is_owned, index| {
+        if (is_owned) finalized[index].result.deinit();
     }
 }
 
@@ -629,13 +656,10 @@ fn finalizeExecutedToolCall(
     return .{ .result = result, .is_error = is_error };
 }
 
-fn emitFinalizedToolCall(
-    allocator: std.mem.Allocator,
-    result_allocator: std.mem.Allocator,
+fn emitToolExecutionEnd(
     emit: agent.EventSink,
     tool_call: ai.ToolCall,
     finalized: FinalizedToolCall,
-    messages: *std.ArrayList(ai.ToolResultMessage),
 ) !void {
     try emit.emit(.{ .tool_execution_end = .{
         .tool_call_id = tool_call.id,
@@ -643,7 +667,16 @@ fn emitFinalizedToolCall(
         .result = finalized.result.view(),
         .is_error = finalized.is_error,
     } });
+}
 
+fn appendToolResultMessage(
+    allocator: std.mem.Allocator,
+    result_allocator: std.mem.Allocator,
+    emit: agent.EventSink,
+    tool_call: ai.ToolCall,
+    finalized: FinalizedToolCall,
+    messages: *std.ArrayList(ai.ToolResultMessage),
+) !void {
     // Durable message content lives in result_allocator; the list container
     // and the append below use the scratch allocator.
     const message = try createToolResultMessage(
@@ -653,6 +686,7 @@ fn emitFinalizedToolCall(
         finalized.is_error,
     );
     errdefer agent.deinitToolResultMessage(result_allocator, message);
+    try emit.emit(.{ .message_start = .{ .message = .{ .tool_result = message } } });
     try emit.emit(.{ .message_end = .{ .message = .{ .tool_result = message } } });
     try messages.append(allocator, message);
 }

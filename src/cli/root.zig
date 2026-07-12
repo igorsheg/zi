@@ -274,10 +274,17 @@ fn runPrompt(
     var session = try coding_agent.session_bootstrap.openSession(process.gpa, &services, stamp.date(), open, .{});
     defer shutdownPromptSession(&session, services.io);
 
-    const status = try print_mode.run(process.gpa, &services, &session, services.io, stdout, stderr, .{
+    const status = print_mode.run(process.gpa, &services, &session, services.io, stdout, stderr, .{
         .prompt = prompt,
         .output = if (json_output) .json else .text,
-    });
+    }) catch |err| switch (err) {
+        error.OutputClosed => return error.OutputClosed,
+        else => {
+            try stderr.print("{s}\n", .{@errorName(err)});
+            try stderr.flush();
+            return error.PromptFailed;
+        },
+    };
     if (status != 0) return error.PromptFailed;
 }
 
@@ -582,7 +589,7 @@ test "cli text and json print frontends run through faux provider" {
     try environ.put("ZI_FAUX_SCRIPT", "script.md");
     const process = testProcess(&environ);
 
-    var output_buffer: [4096]u8 = undefined;
+    var output_buffer: [16 * 1024]u8 = undefined;
     var output = std.Io.Writer.fixed(&output_buffer);
     var stderr_buffer: [1024]u8 = undefined;
     var stderr = std.Io.Writer.fixed(&stderr_buffer);
@@ -600,7 +607,7 @@ test "cli text and json print frontends run through faux provider" {
 
     output = std.Io.Writer.fixed(&output_buffer);
     stderr = std.Io.Writer.fixed(&stderr_buffer);
-    var json_argv = [_:null]?[*:0]const u8{ "zi", "--mode", "json", "hi" };
+    var json_argv = [_:null]?[*:0]const u8{ "zi", "--mode", "json", "--continue", "hi" };
     var json_args = try std.process.Args.Iterator.initAllocator(.{ .vector = @ptrCast(&json_argv) }, std.testing.allocator);
     defer json_args.deinit();
     try runWithOptions(process, &json_args, &output, &stderr, .{
@@ -609,9 +616,112 @@ test "cli text and json print frontends run through faux provider" {
         .dir = tmp.dir,
         .environ = process.environ,
     });
-    try std.testing.expect(std.mem.indexOf(u8, output.buffered(), "\"type\":\"agent_start\"") != null);
+    var json_lines = std.mem.splitScalar(u8, output.buffered(), '\n');
+    var header = try runtime.JsonOwned(std.json.Value).parseJson(std.testing.allocator, json_lines.next().?, .{});
+    defer header.deinit();
+    try std.testing.expectEqualStrings("session", header.value.object.get("type").?.string);
+    try std.testing.expectEqual(@as(i64, 3), header.value.object.get("version").?.integer);
+    var agent_start = try runtime.JsonOwned(std.json.Value).parseJson(std.testing.allocator, json_lines.next().?, .{});
+    defer agent_start.deinit();
+    try std.testing.expectEqualStrings("agent_start", agent_start.value.object.get("type").?.string);
+    try std.testing.expect(std.mem.endsWith(u8, output.buffered(), "{\"type\":\"agent_settled\"}\n"));
     try std.testing.expect(std.mem.indexOf(u8, output.buffered(), "cli print ok") != null);
     try std.testing.expectEqualStrings("", stderr.buffered());
+}
+
+test "cli json assistant failure stays zero-status while text fails" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try createCliTestDirs(tmp.dir);
+
+    var environ = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ.deinit();
+    try environ.put("ZI_ENABLE_FAUX_PROVIDER", "1");
+    try environ.put("ZI_FAUX_DELAY_MS", "0");
+    try environ.put("ZI_FAUX_ERROR_MESSAGE", "provider failure");
+    const process = testProcess(&environ);
+
+    var output_buffer: [16 * 1024]u8 = undefined;
+    var output = std.Io.Writer.fixed(&output_buffer);
+    var stderr_buffer: [1024]u8 = undefined;
+    var stderr = std.Io.Writer.fixed(&stderr_buffer);
+    var json_argv = [_:null]?[*:0]const u8{ "zi", "--mode", "json", "--no-session", "hi" };
+    var json_args = try std.process.Args.Iterator.initAllocator(
+        .{ .vector = @ptrCast(&json_argv) },
+        std.testing.allocator,
+    );
+    defer json_args.deinit();
+    try runWithOptions(process, &json_args, &output, &stderr, .{
+        .cwd = "repo",
+        .agent_dir_override = "agent",
+        .dir = tmp.dir,
+        .environ = process.environ,
+    });
+    try std.testing.expect(std.mem.indexOf(u8, output.buffered(), "\"stopReason\":\"error\"") != null);
+    try std.testing.expect(std.mem.endsWith(u8, output.buffered(), "{\"type\":\"agent_settled\"}\n"));
+    try std.testing.expectEqualStrings("", stderr.buffered());
+
+    output = std.Io.Writer.fixed(&output_buffer);
+    stderr = std.Io.Writer.fixed(&stderr_buffer);
+    var text_argv = [_:null]?[*:0]const u8{ "zi", "--mode", "text", "--no-session", "hi" };
+    var text_args = try std.process.Args.Iterator.initAllocator(
+        .{ .vector = @ptrCast(&text_argv) },
+        std.testing.allocator,
+    );
+    defer text_args.deinit();
+    try std.testing.expectError(error.PromptFailed, runWithOptions(process, &text_args, &output, &stderr, .{
+        .cwd = "repo",
+        .agent_dir_override = "agent",
+        .dir = tmp.dir,
+        .environ = process.environ,
+    }));
+    try std.testing.expectEqualStrings("", output.buffered());
+    try std.testing.expectEqualStrings("error: provider failure\n", stderr.buffered());
+}
+
+test "cli json no-session emits in-memory header and creates no file" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try createCliTestDirs(tmp.dir);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "script.md", .data = "ephemeral json\n" });
+
+    var environ = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ.deinit();
+    try environ.put("ZI_ENABLE_FAUX_PROVIDER", "1");
+    try environ.put("ZI_FAUX_DELAY_MS", "0");
+    try environ.put("ZI_FAUX_SCRIPT", "script.md");
+    const process = testProcess(&environ);
+
+    var output_buffer: [16 * 1024]u8 = undefined;
+    var output = std.Io.Writer.fixed(&output_buffer);
+    var stderr_buffer: [1024]u8 = undefined;
+    var stderr = std.Io.Writer.fixed(&stderr_buffer);
+    var argv = [_:null]?[*:0]const u8{ "zi", "--mode", "json", "--no-session", "hi" };
+    var args = try std.process.Args.Iterator.initAllocator(.{ .vector = @ptrCast(&argv) }, std.testing.allocator);
+    defer args.deinit();
+
+    try runWithOptions(process, &args, &output, &stderr, .{
+        .cwd = "repo",
+        .agent_dir_override = "agent",
+        .dir = tmp.dir,
+        .environ = process.environ,
+    });
+    var lines = std.mem.splitScalar(u8, output.buffered(), '\n');
+    var header = try runtime.JsonOwned(std.json.Value).parseJson(std.testing.allocator, lines.next().?, .{});
+    defer header.deinit();
+    try std.testing.expectEqualStrings("session", header.value.object.get("type").?.string);
+    try std.testing.expectEqualStrings("repo", header.value.object.get("cwd").?.string);
+    try std.testing.expect(std.mem.endsWith(u8, output.buffered(), "{\"type\":\"agent_settled\"}\n"));
+    try std.testing.expectEqualStrings("", stderr.buffered());
+
+    var sessions = try session_listing.listRuntimeSessions(std.testing.allocator, std.testing.io, .{
+        .cwd = "repo",
+        .agent_dir_override = "agent",
+        .dir = tmp.dir,
+        .environ = process.environ,
+    });
+    defer sessions.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), sessions.file_names.len);
 }
 
 test "cli no-session print does not create a session file" {

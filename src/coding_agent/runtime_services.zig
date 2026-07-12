@@ -136,7 +136,18 @@ fn initFauxProvider(
     const script = try loadFauxScript(allocator, io, dir, environ);
     defer allocator.free(script);
     const content = [_]ai.AssistantContent{ai.faux.text(script)};
-    const message = ai.faux.assistantMessage(&content, .{});
+    const message = if (fauxErrorMessage(environ)) |error_message|
+        ai.faux.assistantMessage(&.{}, .{
+            .stop_reason = .error_,
+            .error_message = error_message,
+            .operational_failure = .{
+                .category = .provider_unavailable,
+                .message = error_message,
+                .retryable = .no,
+            },
+        })
+    else
+        ai.faux.assistantMessage(&content, .{});
     try provider.setResponses(&.{message});
     try provider.register(registry);
     return provider;
@@ -146,6 +157,14 @@ fn fauxDelayMs(environ: ?*const std.process.Environ.Map) u32 {
     const env = environ orelse return 0;
     const text = env.get("ZI_FAUX_DELAY_MS") orelse return 0;
     return std.fmt.parseInt(u32, text, 10) catch 0;
+}
+
+fn fauxErrorMessage(environ: ?*const std.process.Environ.Map) ?[]const u8 {
+    const env = environ orelse return null;
+    const message = env.get("ZI_FAUX_ERROR_MESSAGE") orelse return null;
+    if (message.len == 0 or message.len > ai.OperationalFailure.message_bytes_max) return null;
+    if (!std.unicode.utf8ValidateSlice(message)) return null;
+    return message;
 }
 
 fn loadFauxScript(

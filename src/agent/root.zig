@@ -573,32 +573,66 @@ pub fn copyAgentEvent(allocator: std.mem.Allocator, event: AgentEvent) !AgentEve
         .message_start => |payload| .{ .message_start = .{
             .message = try copyAgentMessage(allocator, payload.message),
         } },
-        .message_update => |payload| .{ .message_update = .{
-            .assistant_message_event = try ai.owned.copyAssistantMessageEvent(
-                allocator,
-                payload.assistant_message_event,
-            ),
-        } },
+        .message_update => |payload| blk: {
+            const message = try copyAgentMessage(allocator, payload.message);
+            errdefer deinitAgentMessage(allocator, message);
+            break :blk .{ .message_update = .{
+                .message = message,
+                .assistant_message_event = try ai.owned.copyAssistantMessageEvent(
+                    allocator,
+                    payload.assistant_message_event,
+                ),
+            } };
+        },
         .message_end => |payload| .{ .message_end = .{ .message = try copyAgentMessage(allocator, payload.message) } },
-        .turn_end => .turn_end,
-        .agent_end => .agent_end,
-        .tool_execution_start => |payload| .{ .tool_execution_start = .{
-            .tool_call_id = try allocator.dupe(u8, payload.tool_call_id),
-            .tool_name = try allocator.dupe(u8, payload.tool_name),
-            .args = try runtime.cloneJsonValue(allocator, payload.args),
+        .turn_end => |payload| blk: {
+            const message = try copyAgentMessage(allocator, payload.message);
+            errdefer deinitAgentMessage(allocator, message);
+            break :blk .{ .turn_end = .{
+                .message = message,
+                .tool_results = try copyToolResultMessages(allocator, payload.tool_results),
+            } };
+        },
+        .agent_end => |payload| .{ .agent_end = .{
+            .messages = try copyAgentMessages(allocator, payload.messages),
         } },
-        .tool_execution_update => |payload| .{ .tool_execution_update = .{
-            .tool_call_id = try allocator.dupe(u8, payload.tool_call_id),
-            .tool_name = try allocator.dupe(u8, payload.tool_name),
-            .args = try runtime.cloneJsonValue(allocator, payload.args),
-            .partial_result = try copyAgentToolResult(allocator, payload.partial_result),
-        } },
-        .tool_execution_end => |payload| .{ .tool_execution_end = .{
-            .tool_call_id = try allocator.dupe(u8, payload.tool_call_id),
-            .tool_name = try allocator.dupe(u8, payload.tool_name),
-            .result = try copyAgentToolResult(allocator, payload.result),
-            .is_error = payload.is_error,
-        } },
+        .tool_execution_start => |payload| blk: {
+            const tool_call_id = try allocator.dupe(u8, payload.tool_call_id);
+            errdefer allocator.free(tool_call_id);
+            const tool_name = try allocator.dupe(u8, payload.tool_name);
+            errdefer allocator.free(tool_name);
+            break :blk .{ .tool_execution_start = .{
+                .tool_call_id = tool_call_id,
+                .tool_name = tool_name,
+                .args = try runtime.cloneJsonValue(allocator, payload.args),
+            } };
+        },
+        .tool_execution_update => |payload| blk: {
+            const tool_call_id = try allocator.dupe(u8, payload.tool_call_id);
+            errdefer allocator.free(tool_call_id);
+            const tool_name = try allocator.dupe(u8, payload.tool_name);
+            errdefer allocator.free(tool_name);
+            const args = try runtime.cloneJsonValue(allocator, payload.args);
+            errdefer runtime.freeJsonValue(allocator, args);
+            break :blk .{ .tool_execution_update = .{
+                .tool_call_id = tool_call_id,
+                .tool_name = tool_name,
+                .args = args,
+                .partial_result = try copyAgentToolResult(allocator, payload.partial_result),
+            } };
+        },
+        .tool_execution_end => |payload| blk: {
+            const tool_call_id = try allocator.dupe(u8, payload.tool_call_id);
+            errdefer allocator.free(tool_call_id);
+            const tool_name = try allocator.dupe(u8, payload.tool_name);
+            errdefer allocator.free(tool_name);
+            break :blk .{ .tool_execution_end = .{
+                .tool_call_id = tool_call_id,
+                .tool_name = tool_name,
+                .result = try copyAgentToolResult(allocator, payload.result),
+                .is_error = payload.is_error,
+            } };
+        },
         .agent_start, .turn_start => event,
     };
 }
@@ -607,11 +641,19 @@ pub fn deinitAgentEvent(allocator: std.mem.Allocator, event: AgentEvent) void {
     switch (event) {
         .message_start => |payload| deinitAgentMessage(allocator, payload.message),
         .message_update => |payload| {
+            deinitAgentMessage(allocator, payload.message);
             ai.owned.deinitAssistantMessageEvent(allocator, payload.assistant_message_event);
         },
         .message_end => |payload| deinitAgentMessage(allocator, payload.message),
-        .turn_end => {},
-        .agent_end => {},
+        .turn_end => |payload| {
+            deinitAgentMessage(allocator, payload.message);
+            for (payload.tool_results) |message| deinitToolResultMessage(allocator, message);
+            allocator.free(payload.tool_results);
+        },
+        .agent_end => |payload| {
+            for (payload.messages) |message| deinitAgentMessage(allocator, message);
+            allocator.free(payload.messages);
+        },
         .tool_execution_start => |payload| {
             allocator.free(payload.tool_call_id);
             allocator.free(payload.tool_name);
@@ -634,9 +676,9 @@ pub fn deinitAgentEvent(allocator: std.mem.Allocator, event: AgentEvent) void {
 
 pub const AgentEvent = union(enum) {
     agent_start,
-    agent_end,
+    agent_end: AgentEnd,
     turn_start,
-    turn_end,
+    turn_end: TurnEnd,
     message_start: MessageEvent,
     message_update: MessageUpdate,
     message_end: MessageEvent,
@@ -644,11 +686,21 @@ pub const AgentEvent = union(enum) {
     tool_execution_update: ToolExecutionUpdate,
     tool_execution_end: ToolExecutionEnd,
 
+    pub const AgentEnd = struct {
+        messages: []const AgentMessage,
+    };
+
+    pub const TurnEnd = struct {
+        message: AgentMessage,
+        tool_results: []const ai.ToolResultMessage,
+    };
+
     pub const MessageEvent = struct {
         message: AgentMessage,
     };
 
     pub const MessageUpdate = struct {
+        message: AgentMessage,
         assistant_message_event: ai.AssistantMessageEvent,
     };
 
@@ -676,15 +728,23 @@ pub const AgentEvent = union(enum) {
         try stringify.beginObject();
         switch (self) {
             .agent_start => try writeJsonField("type", stringify, "agent_start"),
-            .agent_end => try writeJsonField("type", stringify, "agent_end"),
+            .agent_end => |payload| {
+                try writeJsonField("type", stringify, "agent_end");
+                try writeJsonField("messages", stringify, payload.messages);
+            },
             .turn_start => try writeJsonField("type", stringify, "turn_start"),
-            .turn_end => try writeJsonField("type", stringify, "turn_end"),
+            .turn_end => |payload| {
+                try writeJsonField("type", stringify, "turn_end");
+                try writeJsonField("message", stringify, payload.message);
+                try writeJsonField("toolResults", stringify, payload.tool_results);
+            },
             .message_start => |payload| {
                 try writeJsonField("type", stringify, "message_start");
                 try writeJsonField("message", stringify, payload.message);
             },
             .message_update => |payload| {
                 try writeJsonField("type", stringify, "message_update");
+                try writeJsonField("message", stringify, payload.message);
                 try writeJsonField("assistantMessageEvent", stringify, payload.assistant_message_event);
             },
             .message_end => |payload| {
@@ -820,11 +880,69 @@ fn emptyModel() ai.Model {
     };
 }
 
-test "agent end is lifecycle marker without transcript payload" {
+test "agent end serializes run messages" {
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
 
-    const event: AgentEvent = .agent_end;
+    const event: AgentEvent = .{ .agent_end = .{ .messages = &.{} } };
     try std.json.Stringify.value(event, .{}, &output.writer);
-    try std.testing.expectEqualStrings("{\"type\":\"agent_end\"}", output.written());
+    try std.testing.expectEqualStrings("{\"type\":\"agent_end\",\"messages\":[]}", output.written());
+}
+
+test "base events serialize exact pi key sets" {
+    const assistant: ai.AssistantMessage = .{
+        .content = &.{},
+        .api = "api",
+        .provider = "provider",
+        .model = "model",
+        .usage = ai.protocol.emptyUsage(),
+        .stop_reason = .stop,
+        .timestamp = 0,
+    };
+    const message: AgentMessage = .{ .assistant = assistant };
+    const result: AgentToolResult = .{ .content = &.{} };
+    const events = [_]struct { AgentEvent, []const []const u8 }{
+        .{ .agent_start, &.{"type"} },
+        .{ .{ .agent_end = .{ .messages = &.{message} } }, &.{ "type", "messages" } },
+        .{ .turn_start, &.{"type"} },
+        .{ .{ .turn_end = .{ .message = message, .tool_results = &.{} } }, &.{ "type", "message", "toolResults" } },
+        .{ .{ .message_start = .{ .message = message } }, &.{ "type", "message" } },
+        .{ .{ .message_update = .{
+            .message = message,
+            .assistant_message_event = .{ .text_delta = .{
+                .content_index = 0,
+                .delta = "x",
+                .partial = assistant,
+            } },
+        } }, &.{ "type", "message", "assistantMessageEvent" } },
+        .{ .{ .message_end = .{ .message = message } }, &.{ "type", "message" } },
+        .{ .{ .tool_execution_start = .{
+            .tool_call_id = "call",
+            .tool_name = "read",
+            .args = .null,
+        } }, &.{ "type", "toolCallId", "toolName", "args" } },
+        .{ .{ .tool_execution_update = .{
+            .tool_call_id = "call",
+            .tool_name = "read",
+            .args = .null,
+            .partial_result = result,
+        } }, &.{ "type", "toolCallId", "toolName", "args", "partialResult" } },
+        .{ .{ .tool_execution_end = .{
+            .tool_call_id = "call",
+            .tool_name = "read",
+            .result = result,
+            .is_error = false,
+        } }, &.{ "type", "toolCallId", "toolName", "result", "isError" } },
+    };
+
+    for (events) |fixture| {
+        var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer output.deinit();
+        try std.json.Stringify.value(fixture[0], .{}, &output.writer);
+        var parsed = try runtime.JsonOwned(std.json.Value).parseJson(std.testing.allocator, output.written(), .{});
+        defer parsed.deinit();
+        const object = parsed.value.object;
+        try std.testing.expectEqual(fixture[1].len, object.count());
+        for (fixture[1]) |key| try std.testing.expect(object.contains(key));
+    }
 }

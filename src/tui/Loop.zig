@@ -793,7 +793,8 @@ pub const Loop = struct {
                 // The canceled run emits the terminal assistant "aborted" message.
             },
             .retry_wait => {
-                session.cancelRetryWait();
+                session.cancelRetryWait() catch {};
+                session.emitAgentSettled() catch {};
                 self.run_state.state = .idle;
                 self.run_state.retry = null;
                 self.clearRunSavedPrompt(self.gpa);
@@ -831,7 +832,8 @@ pub const Loop = struct {
             .idle => {},
             .running => |*handle| _ = handle.cancelRequest(session),
             .retry_wait => {
-                session.cancelRetryWait();
+                session.cancelRetryWait() catch {};
+                session.emitAgentSettled() catch {};
                 self.run_state.state = .idle;
                 self.run_state.retry = null;
             },
@@ -901,6 +903,7 @@ pub const Loop = struct {
         }
         self.clearRunProgressGate();
         const compaction_run = handle.run.compaction;
+        const compaction_reason = compaction_run.reason;
         const had_summary = compaction_run.outcome == .summary;
         const verdict = try handle.settle(session, .{ .overflow_count_before = self.run_state.overflow_count_before, .overflow_retry_used = self.run_state.overflow_retry_used });
         const failure_name = compactionFailureName(compaction_run);
@@ -916,6 +919,7 @@ pub const Loop = struct {
                 .retry, .compact => {},
             }
             self.clearRunSavedPrompt(self.gpa);
+            if (compaction_reason == .threshold) try session.emitAgentSettled();
             self.dirty = true;
             return;
         }
@@ -938,12 +942,13 @@ pub const Loop = struct {
                     if (maybe) |*handle| {
                         handle.setWake(io, wake);
                         self.run_state.state = .{ .compacting = .{ .handle = handle.*, .will_retry = false } };
-                    }
-                }
+                    } else try session.emitAgentSettled();
+                } else try session.emitAgentSettled();
             },
             .failed => {
                 self.clearRunSavedPrompt(self.gpa);
                 if (session.latestFailureView()) |view| try self.failureNotice(view);
+                try session.emitAgentSettled();
             },
             .retry => |retry| try self.armRetry(session, now_ns, retry),
             .compact => |compaction| {
@@ -960,7 +965,7 @@ pub const Loop = struct {
         self.run_state.retry = .{
             .deadline_ns = now_ns +| delay_ns,
             .attempt = session.retryAttempt(),
-            .max = session.retry_settings.max_attempts,
+            .max = session.retryMaxAttempts(),
         };
         self.run_state.state = .{ .retry_wait = retry };
     }
@@ -972,14 +977,8 @@ pub const Loop = struct {
         wake: *runtime.WakeEvent,
         retry: coding_agent.AgentSession.SettleVerdict.Retry,
     ) !void {
-        var handle = switch (retry.kind) {
-            .continue_run => try session.startContinueHandle(),
-            .resubmit_prompt => blk: {
-                const saved = self.run_state.saved_prompt orelse return error.NoSavedPrompt;
-                self.run_state.overflow_retry_used = true;
-                break :blk try session.startPromptHandle(saved.text.text(), saved.images.items);
-            },
-        };
+        if (retry.overflow) self.run_state.overflow_retry_used = true;
+        var handle = try session.startContinueHandle();
         handle.setWake(io, wake);
         self.run_state.retry = null;
         self.run_state.state = .{ .running = handle };
@@ -1273,16 +1272,16 @@ pub const Loop = struct {
         const call = ai.ToolCall{ .id = "seed-write-args", .name = "write", .arguments = .{ .object = args_object } };
         const content = [_]ai.AssistantContent{.{ .tool_call = call }};
         const partial = syntheticAssistantMessage(&content);
-        try self.transcript.apply(io, .{ .message_update = .{ .assistant_message_event = .{ .toolcall_start = .{
+        try self.transcript.apply(io, .{ .message_update = .{ .message = .{ .assistant = partial }, .assistant_message_event = .{ .toolcall_start = .{
             .content_index = 0,
             .partial = partial,
         } } } });
-        try self.transcript.apply(io, .{ .message_update = .{ .assistant_message_event = .{ .toolcall_delta = .{
+        try self.transcript.apply(io, .{ .message_update = .{ .message = .{ .assistant = partial }, .assistant_message_event = .{ .toolcall_delta = .{
             .content_index = 0,
             .delta = "{\"path\":\"src/synthetic-write.zig\",\"content\":\"streamed arg line 1\\n",
             .partial = partial,
         } } } });
-        try self.transcript.apply(io, .{ .message_update = .{ .assistant_message_event = .{ .toolcall_delta = .{
+        try self.transcript.apply(io, .{ .message_update = .{ .message = .{ .assistant = partial }, .assistant_message_event = .{ .toolcall_delta = .{
             .content_index = 0,
             .delta = "streamed arg line 2",
             .partial = partial,
@@ -2433,7 +2432,7 @@ pub const Loop = struct {
         @memset(&delta_buffer, 'x');
         while (self.synthetic_flood.emitted_bytes < target_bytes) {
             const remaining: usize = @intCast(@min(@as(u64, delta_buffer.len), target_bytes - self.synthetic_flood.emitted_bytes));
-            try self.applySyntheticEvent(.{ .message_update = .{ .assistant_message_event = .{ .text_delta = .{
+            try self.applySyntheticEvent(.{ .message_update = .{ .message = .{ .assistant = syntheticAssistantMessage(&.{}) }, .assistant_message_event = .{ .text_delta = .{
                 .content_index = 0,
                 .delta = delta_buffer[0..remaining],
                 .partial = syntheticAssistantMessage(&.{}),
@@ -2443,7 +2442,7 @@ pub const Loop = struct {
 
         if (elapsed_ns >= synthetic_flood_duration_ns) {
             self.synthetic_flood.completed = true;
-            try self.applySyntheticEvent(.agent_end);
+            try self.applySyntheticEvent(.{ .agent_end = .{ .messages = &.{} } });
         }
     }
 
@@ -2451,7 +2450,7 @@ pub const Loop = struct {
         self.synthetic_flood.message_started = true;
         try self.applySyntheticEvent(.agent_start);
         try self.applySyntheticEvent(.{ .message_start = .{ .message = .{ .assistant = syntheticAssistantMessage(&.{}) } } });
-        try self.applySyntheticEvent(.{ .message_update = .{ .assistant_message_event = .{ .text_start = .{
+        try self.applySyntheticEvent(.{ .message_update = .{ .message = .{ .assistant = syntheticAssistantMessage(&.{}) }, .assistant_message_event = .{ .text_start = .{
             .content_index = 0,
             .partial = syntheticAssistantMessage(&.{}),
         } } } });
@@ -3770,7 +3769,7 @@ pub const Loop = struct {
             if (index > 0) try self.composer.editor.insert("\n");
             try self.composer.editor.insert(echo.text);
         }
-        session.clearQueue();
+        try session.clearQueue();
         self.dirty = true;
     }
 
@@ -4660,7 +4659,7 @@ test "loop omits blank assistant rows for tool-call-only turns" {
     const tool_content = [_]ai.AssistantContent{.{ .tool_call = call }};
     const tool_assistant = Loop.syntheticAssistantMessage(&tool_content);
     try loop.transcript.apply(std.testing.io, .{ .message_start = .{ .message = .{ .assistant = tool_assistant } } });
-    try loop.transcript.apply(std.testing.io, .{ .message_update = .{ .assistant_message_event = .{ .toolcall_start = .{
+    try loop.transcript.apply(std.testing.io, .{ .message_update = .{ .message = .{ .assistant = tool_assistant }, .assistant_message_event = .{ .toolcall_start = .{
         .content_index = 0,
         .partial = tool_assistant,
     } } } });
@@ -4844,12 +4843,12 @@ test "loop tool UX streams write args before execution result" {
     const call = ai.ToolCall{ .id = "write-stream", .name = "write", .arguments = .{ .object = args_object } };
     const content = [_]ai.AssistantContent{.{ .tool_call = call }};
     const partial = Loop.syntheticAssistantMessage(&content);
-    try loop.transcript.apply(std.testing.io, .{ .message_update = .{ .assistant_message_event = .{ .toolcall_start = .{
+    try loop.transcript.apply(std.testing.io, .{ .message_update = .{ .message = .{ .assistant = partial }, .assistant_message_event = .{ .toolcall_start = .{
         .content_index = 0,
         .partial = partial,
     } } } });
 
-    try loop.transcript.apply(std.testing.io, .{ .message_update = .{ .assistant_message_event = .{ .toolcall_delta = .{
+    try loop.transcript.apply(std.testing.io, .{ .message_update = .{ .message = .{ .assistant = partial }, .assistant_message_event = .{ .toolcall_delta = .{
         .content_index = 0,
         .delta = "{\"path\":\"src/stream.zig\",\"content\":\"one\\n",
         .partial = partial,
@@ -4859,7 +4858,7 @@ test "loop tool UX streams write args before execution result" {
     try expectFrameContains(&frame, "│ one");
     try expectFrameNotContains(&frame, "Successfully wrote");
 
-    try loop.transcript.apply(std.testing.io, .{ .message_update = .{ .assistant_message_event = .{ .toolcall_delta = .{
+    try loop.transcript.apply(std.testing.io, .{ .message_update = .{ .message = .{ .assistant = partial }, .assistant_message_event = .{ .toolcall_delta = .{
         .content_index = 0,
         .delta = "two",
         .partial = partial,
@@ -4962,7 +4961,7 @@ test "loop shimmer cadence recovers immediately after a slow frame" {
 test "loop retry status redraws on countdown cadence without dirty" {
     var loop = try Loop.initTest(std.testing.allocator, null);
     defer loop.deinit();
-    loop.run_state.state = .{ .retry_wait = .{ .kind = .continue_run, .delay_ms = 5_000 } };
+    loop.run_state.state = .{ .retry_wait = .{ .delay_ms = 5_000 } };
     loop.run_state.retry = .{ .deadline_ns = 5 * std.time.ns_per_s, .attempt = 1, .max = 3 };
     loop.markRendered(0, 1 * std.time.ns_per_ms);
     loop.dirty = false;

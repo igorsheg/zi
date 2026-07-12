@@ -30,6 +30,7 @@ listeners: std.ArrayList(?Listener) = .empty,
 operations: runtime.OperationIdAllocator = .{},
 cancel_source: runtime.CancelSource,
 active_run: ?runtime.OperationId = null,
+active_run_message_start: usize = 0,
 
 pub const QueueMode = enum {
     all,
@@ -235,6 +236,7 @@ pub fn beginRun(self: *Agent) error{AlreadyRunning}!runtime.CancelToken {
     if (self.active_run != null) return error.AlreadyRunning;
     self.cancel_source.resetAfterDrain();
     self.active_run = self.operations.reserve();
+    self.active_run_message_start = self.state.messages.len;
     self.state.status = .{ .running = .{} };
     return self.cancel_source.token();
 }
@@ -345,23 +347,7 @@ pub fn applyEvent(self: *Agent, event: agent.AgentEvent) !void {
     switch (event) {
         .agent_start, .turn_start => {},
         .message_start => |message_event| try self.setStreamingMessage(message_event.message),
-        .message_update => |message_update| {
-            const partial = switch (message_update.assistant_message_event) {
-                .start => |payload| payload.partial,
-                .text_start => |payload| payload.partial,
-                .text_delta => |payload| payload.partial,
-                .text_end => |payload| payload.partial,
-                .thinking_start => |payload| payload.partial,
-                .thinking_delta => |payload| payload.partial,
-                .thinking_end => |payload| payload.partial,
-                .toolcall_start => |payload| payload.partial,
-                .toolcall_delta => |payload| payload.partial,
-                .toolcall_end => |payload| payload.partial,
-                .done => |payload| payload.message,
-                .@"error" => |payload| payload.@"error",
-            };
-            try self.setStreamingMessage(.{ .assistant = partial });
-        },
+        .message_update => |message_update| try self.setStreamingMessage(message_update.message),
         .message_end => |message_event| {
             self.clearStreamingMessage();
             try self.appendMessage(message_event.message);
@@ -390,8 +376,9 @@ fn recordRunFailure(self: *Agent, token: runtime.CancelToken, message: []const u
     const terminal_message: agent.AgentMessage = .{ .assistant = assistant };
     try self.emitEvent(.{ .message_start = .{ .message = terminal_message } });
     try self.emitEvent(.{ .message_end = .{ .message = terminal_message } });
-    try self.emitEvent(.turn_end);
-    try self.emitEvent(.agent_end);
+    const stored = self.state.messages[self.state.messages.len - 1];
+    try self.emitEvent(.{ .turn_end = .{ .message = stored, .tool_results = &.{} } });
+    try self.emitEvent(.{ .agent_end = .{ .messages = self.state.messages[self.active_run_message_start..] } });
 }
 
 fn terminalAssistantMessage(model: ai.Model, reason: ai.StopReason, error_message: ?[]const u8) ai.AssistantMessage {
@@ -975,7 +962,7 @@ test "agent end enters settling until finish run" {
     const self = &fixture.agent;
     _ = try self.beginRun();
 
-    try self.emitEvent(.agent_end);
+    try self.emitEvent(.{ .agent_end = .{ .messages = &.{} } });
 
     try std.testing.expect(self.state.isStreaming());
     try std.testing.expect(!self.waitForIdle());

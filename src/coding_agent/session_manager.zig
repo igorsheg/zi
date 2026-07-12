@@ -77,6 +77,25 @@ pub const SessionHeader = struct {
     timestamp: []const u8,
     cwd: []const u8,
     parent_session: ?[]const u8 = null,
+
+    pub fn jsonStringify(self: SessionHeader, stringify: *std.json.Stringify) !void {
+        try stringify.beginObject();
+        try stringify.objectField("type");
+        try stringify.write("session");
+        try stringify.objectField("version");
+        try stringify.write(self.version);
+        try stringify.objectField("id");
+        try stringify.write(self.id);
+        try stringify.objectField("timestamp");
+        try stringify.write(self.timestamp);
+        try stringify.objectField("cwd");
+        try stringify.write(self.cwd);
+        if (self.parent_session) |parent_session| {
+            try stringify.objectField("parentSession");
+            try stringify.write(parent_session);
+        }
+        try stringify.endObject();
+    }
 };
 
 pub const CompactionSettings = struct {
@@ -1930,6 +1949,31 @@ fn assistantTextMessage(content: []const ai.AssistantContent) agent.AgentMessage
         .stop_reason = .stop,
         .timestamp = 0,
     } };
+}
+
+test "session header json uses pi names and omits absent parent" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    const header: SessionHeader = .{
+        .id = "session",
+        .timestamp = "time",
+        .cwd = "/repo",
+    };
+    try std.json.Stringify.value(header, .{}, &output.writer);
+    try std.testing.expectEqualStrings(
+        "{\"type\":\"session\",\"version\":3,\"id\":\"session\",\"timestamp\":\"time\",\"cwd\":\"/repo\"}",
+        output.written(),
+    );
+
+    output.writer.end = 0;
+    const child: SessionHeader = .{
+        .id = "child",
+        .timestamp = "time",
+        .cwd = "/repo",
+        .parent_session = "parent",
+    };
+    try std.json.Stringify.value(child, .{}, &output.writer);
+    try std.testing.expect(std.mem.endsWith(u8, output.written(), "\"parentSession\":\"parent\"}"));
 }
 
 test "new session stores header metadata" {

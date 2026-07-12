@@ -1690,7 +1690,7 @@ test "transcript streams visible thinking without a synthetic label" {
     try transcript.apply(std.testing.io, .{ .message_start = .{
         .message = .{ .assistant = emptyAssistantMessage(&.{}, .stop) },
     } });
-    try transcript.apply(std.testing.io, .{ .message_update = .{ .assistant_message_event = .{ .thinking_delta = .{
+    try transcript.apply(std.testing.io, .{ .message_update = .{ .message = .{ .assistant = emptyAssistantMessage(&.{}, .stop) }, .assistant_message_event = .{ .thinking_delta = .{
         .content_index = 0,
         .delta = "plan",
         .partial = emptyAssistantMessage(&.{}, .stop),
@@ -1739,12 +1739,12 @@ test "transcript hidden thinking label persists after answer completes" {
     try transcript.apply(std.testing.io, .{ .message_start = .{
         .message = .{ .assistant = emptyAssistantMessage(&.{}, .stop) },
     } });
-    try transcript.apply(std.testing.io, .{ .message_update = .{ .assistant_message_event = .{ .thinking_delta = .{
+    try transcript.apply(std.testing.io, .{ .message_update = .{ .message = .{ .assistant = emptyAssistantMessage(&.{}, .stop) }, .assistant_message_event = .{ .thinking_delta = .{
         .content_index = 0,
         .delta = "plan",
         .partial = emptyAssistantMessage(&.{}, .stop),
     } } } });
-    try transcript.apply(std.testing.io, .{ .message_update = .{ .assistant_message_event = .{ .text_delta = .{
+    try transcript.apply(std.testing.io, .{ .message_update = .{ .message = .{ .assistant = emptyAssistantMessage(&.{}, .stop) }, .assistant_message_event = .{ .text_delta = .{
         .content_index = 1,
         .delta = "answer",
         .partial = emptyAssistantMessage(&.{}, .stop),
@@ -2115,14 +2115,14 @@ test "transcript applies streamed assistant text by delta" {
 
     try transcript.apply(std.testing.io, .agent_start);
     try transcript.apply(std.testing.io, .{ .message_start = .{ .message = .{ .assistant = emptyAssistantMessage(&.{}, .stop) } } });
-    try transcript.apply(std.testing.io, .{ .message_update = .{ .assistant_message_event = .{ .text_delta = .{
+    try transcript.apply(std.testing.io, .{ .message_update = .{ .message = .{ .assistant = emptyAssistantMessage(&.{}, .stop) }, .assistant_message_event = .{ .text_delta = .{
         .content_index = 0,
         .delta = "hello",
         .partial = emptyAssistantMessage(&.{}, .stop),
     } } } });
     const content = [_]ai.AssistantContent{.{ .text = .{ .text = "hello" } }};
     try transcript.apply(std.testing.io, .{ .message_end = .{ .message = .{ .assistant = emptyAssistantMessage(&content, .stop) } } });
-    try transcript.apply(std.testing.io, .agent_end);
+    try transcript.apply(std.testing.io, .{ .agent_end = .{ .messages = &.{} } });
 
     try std.testing.expectEqual(@as(usize, 1), transcript.items.items.len);
     try std.testing.expect(!transcript.run_active);
@@ -2141,7 +2141,7 @@ test "transcript keeps streamed assistant text valid across UTF-8 delta boundari
         try transcript.apply(std.testing.io, .{ .message_start = .{
             .message = .{ .assistant = emptyAssistantMessage(&.{}, .stop) },
         } });
-        try transcript.apply(std.testing.io, .{ .message_update = .{ .assistant_message_event = .{ .text_delta = .{
+        try transcript.apply(std.testing.io, .{ .message_update = .{ .message = .{ .assistant = emptyAssistantMessage(&.{}, .stop) }, .assistant_message_event = .{ .text_delta = .{
             .content_index = 0,
             .delta = source[0..split],
             .partial = emptyAssistantMessage(&.{}, .stop),
@@ -2155,7 +2155,7 @@ test "transcript keeps streamed assistant text valid across UTF-8 delta boundari
             for (line.spans()) |span| try std.testing.expect(std.unicode.utf8ValidateSlice(span.text));
         }
 
-        try transcript.apply(std.testing.io, .{ .message_update = .{ .assistant_message_event = .{ .text_delta = .{
+        try transcript.apply(std.testing.io, .{ .message_update = .{ .message = .{ .assistant = emptyAssistantMessage(&.{}, .stop) }, .assistant_message_event = .{ .text_delta = .{
             .content_index = 0,
             .delta = source[split..],
             .partial = emptyAssistantMessage(&.{}, .stop),
@@ -2176,7 +2176,7 @@ test "transcript replaces malformed streamed assistant UTF-8" {
     try transcript.apply(std.testing.io, .{ .message_start = .{
         .message = .{ .assistant = emptyAssistantMessage(&.{}, .stop) },
     } });
-    try transcript.apply(std.testing.io, .{ .message_update = .{ .assistant_message_event = .{ .text_delta = .{
+    try transcript.apply(std.testing.io, .{ .message_update = .{ .message = .{ .assistant = emptyAssistantMessage(&.{}, .stop) }, .assistant_message_event = .{ .text_delta = .{
         .content_index = 0,
         .delta = "ok\xffdone",
         .partial = emptyAssistantMessage(&.{}, .stop),
@@ -2194,7 +2194,7 @@ test "transcript incrementally relayouts only the unstable streamed suffix" {
     try transcript.apply(std.testing.io, .{ .message_start = .{
         .message = .{ .assistant = emptyAssistantMessage(&.{}, .stop) },
     } });
-    try transcript.apply(std.testing.io, .{ .message_update = .{ .assistant_message_event = .{ .text_delta = .{
+    try transcript.apply(std.testing.io, .{ .message_update = .{ .message = .{ .assistant = emptyAssistantMessage(&.{}, .stop) }, .assistant_message_event = .{ .text_delta = .{
         .content_index = 0,
         .delta = "one\nabcdefghij",
         .partial = emptyAssistantMessage(&.{}, .stop),
@@ -2211,7 +2211,7 @@ test "transcript incrementally relayouts only the unstable streamed suffix" {
     try std.testing.expectEqual(@as(usize, 3), item.layout_cache.active.wrap.committed_lines);
     const stable_text_ptr = lines[0].spans()[1].text.ptr;
 
-    try transcript.apply(std.testing.io, .{ .message_update = .{ .assistant_message_event = .{ .text_delta = .{
+    try transcript.apply(std.testing.io, .{ .message_update = .{ .message = .{ .assistant = emptyAssistantMessage(&.{}, .stop) }, .assistant_message_event = .{ .text_delta = .{
         .content_index = 0,
         .delta = "kl",
         .partial = emptyAssistantMessage(&.{}, .stop),
@@ -2236,7 +2236,7 @@ test "transcript tracks the first item needing line index repair" {
     try transcript.apply(std.testing.io, .{ .message_start = .{
         .message = .{ .assistant = emptyAssistantMessage(&.{}, .stop) },
     } });
-    try transcript.apply(std.testing.io, .{ .message_update = .{ .assistant_message_event = .{ .text_delta = .{
+    try transcript.apply(std.testing.io, .{ .message_update = .{ .message = .{ .assistant = emptyAssistantMessage(&.{}, .stop) }, .assistant_message_event = .{ .text_delta = .{
         .content_index = 0,
         .delta = "first",
         .partial = emptyAssistantMessage(&.{}, .stop),
@@ -2244,7 +2244,7 @@ test "transcript tracks the first item needing line index repair" {
     const state: theme.LayoutState = .{ .width = 40, .height = 10 };
     _ = try transcript.prepareLayout(state);
 
-    try transcript.apply(std.testing.io, .{ .message_update = .{ .assistant_message_event = .{ .text_delta = .{
+    try transcript.apply(std.testing.io, .{ .message_update = .{ .message = .{ .assistant = emptyAssistantMessage(&.{}, .stop) }, .assistant_message_event = .{ .text_delta = .{
         .content_index = 0,
         .delta = " second",
         .partial = emptyAssistantMessage(&.{}, .stop),
@@ -2260,12 +2260,12 @@ test "transcript final assistant message removes stale streamed parts" {
     defer transcript.deinit();
 
     try transcript.apply(std.testing.io, .{ .message_start = .{ .message = .{ .assistant = emptyAssistantMessage(&.{}, .stop) } } });
-    try transcript.apply(std.testing.io, .{ .message_update = .{ .assistant_message_event = .{ .text_delta = .{
+    try transcript.apply(std.testing.io, .{ .message_update = .{ .message = .{ .assistant = emptyAssistantMessage(&.{}, .stop) }, .assistant_message_event = .{ .text_delta = .{
         .content_index = 0,
         .delta = "hello",
         .partial = emptyAssistantMessage(&.{}, .stop),
     } } } });
-    try transcript.apply(std.testing.io, .{ .message_update = .{ .assistant_message_event = .{ .text_delta = .{
+    try transcript.apply(std.testing.io, .{ .message_update = .{ .message = .{ .assistant = emptyAssistantMessage(&.{}, .stop) }, .assistant_message_event = .{ .text_delta = .{
         .content_index = 1,
         .delta = "stale",
         .partial = emptyAssistantMessage(&.{}, .stop),
@@ -2326,7 +2326,7 @@ test "transcript creates tool before execution and records output" {
     const content = [_]ai.AssistantContent{.{ .tool_call = call }};
     const partial = emptyAssistantMessage(&content, .tool_use);
     try transcript.apply(std.testing.io, .{ .message_start = .{ .message = .{ .assistant = emptyAssistantMessage(&.{}, .tool_use) } } });
-    try transcript.apply(std.testing.io, .{ .message_update = .{ .assistant_message_event = .{ .toolcall_start = .{
+    try transcript.apply(std.testing.io, .{ .message_update = .{ .message = .{ .assistant = partial }, .assistant_message_event = .{ .toolcall_start = .{
         .content_index = 0,
         .partial = partial,
     } } } });
@@ -2559,7 +2559,7 @@ test "transcript relayout incorporates mutations without restarting unrelated wo
     try transcript.apply(std.testing.io, .{ .message_start = .{
         .message = .{ .assistant = emptyAssistantMessage(&.{}, .stop) },
     } });
-    try transcript.apply(std.testing.io, .{ .message_update = .{ .assistant_message_event = .{ .text_delta = .{
+    try transcript.apply(std.testing.io, .{ .message_update = .{ .message = .{ .assistant = emptyAssistantMessage(&.{}, .stop) }, .assistant_message_event = .{ .text_delta = .{
         .content_index = 0,
         .delta = "hello",
         .partial = emptyAssistantMessage(&.{}, .stop),
@@ -2573,7 +2573,7 @@ test "transcript relayout incorporates mutations without restarting unrelated wo
 
     const wide: theme.LayoutState = .{ .width = 80, .height = 10 };
     try std.testing.expectEqual(PrepareResult.pending, try transcript.prepareLayout(wide));
-    try transcript.apply(std.testing.io, .{ .message_update = .{ .assistant_message_event = .{ .text_delta = .{
+    try transcript.apply(std.testing.io, .{ .message_update = .{ .message = .{ .assistant = emptyAssistantMessage(&.{}, .stop) }, .assistant_message_event = .{ .text_delta = .{
         .content_index = 0,
         .delta = " world",
         .partial = emptyAssistantMessage(&.{}, .stop),

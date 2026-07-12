@@ -49,9 +49,14 @@ Use it for shell workflows where progress events would be noise.
 zi --mode json "inspect this repo"
 ```
 
-JSON mode emits public events as lines. Use it when another program wants to see starts, updates, tool calls, finishes, and errors.
+JSON mode emits UTF-8 NDJSON. The first line is the session header; subsequent
+lines are Pi-compatible `AgentSessionEvent` records for Zi-supported behavior.
+Use it when another program wants to see starts, updates, tool calls, retries,
+compaction, settlement, and errors.
 
-It is not terminal output with braces. It is the public event stream.
+It is not terminal output with braces. Each line is independently valid JSON
+and ends with LF. See [JSON event stream](./20-json-events.md) for the exact
+record inventory, ordering, stderr, and exit behavior.
 
 ## RPC: when you are building a frontend
 

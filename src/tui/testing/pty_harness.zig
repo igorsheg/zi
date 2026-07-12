@@ -1230,7 +1230,11 @@ test "pty e2e: P5 print json faux provider" {
         return error.TestUnexpectedResult;
     }
     try std.testing.expect(exitedZero(result.status));
+    try expectContains(result.output, "\"type\":\"session\",\"version\":3");
     try expectContains(result.output, "\"type\":\"agent_start\"");
+    try expectContains(result.output, "\"type\":\"agent_end\"");
+    try expectContains(result.output, "\"willRetry\":false");
+    try expectContains(result.output, "\"type\":\"agent_settled\"");
     try expectContains(result.output, "p5 print json marker");
 }
 
