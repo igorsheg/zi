@@ -76,8 +76,9 @@ do not set cache fields.
 - Terminal frame cadence: fixed 16 ms start-to-start floor. Timing statistics
   never control scheduling.
 - Process shutdown: `Loop` requests each concrete cancellation source and polls
-  owned tasks, the run driver, and sessions for at most five seconds. Normal
-  deinitialization runs only after every worker-visible owner is terminal. An
+  its foreground operation, agent-run state, and sessions for at most five
+  seconds. Normal deinitialization runs only after every worker-visible owner is
+  terminal. An
   undrained deadline restores the terminal and returns a typed condition to the
   CLI, which exits immediately without running memory-releasing defers.
 

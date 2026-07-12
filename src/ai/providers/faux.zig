@@ -607,7 +607,7 @@ fn emitTextDeltas(
     while (index < value.len) {
         try waitBeforeDelta(request, delay_per_delta_ms);
         const char_size = @max(@as(usize, 1), nextTokenSize(min_token_size, max_token_size) * 4);
-        const end = @min(value.len, index + char_size);
+        const end = utf8SafeChunkEnd(value, index, @min(value.len, index + char_size));
         const delta = value[index..end];
         switch (kind) {
             .text => {
@@ -661,7 +661,7 @@ fn emitToolCallDeltas(
     while (index < value.len) {
         try waitBeforeDelta(request, delay_per_delta_ms);
         const char_size = @max(@as(usize, 1), nextTokenSize(min_token_size, max_token_size) * 4);
-        const end = @min(value.len, index + char_size);
+        const end = utf8SafeChunkEnd(value, index, @min(value.len, index + char_size));
         const delta = value[index..end];
         try partial.appendToolArguments(delta);
         try sink.emit(io, .{ .toolcall_delta = .{
@@ -671,6 +671,15 @@ fn emitToolCallDeltas(
         } });
         index = end;
     }
+}
+
+fn utf8SafeChunkEnd(value: []const u8, start: usize, candidate: usize) usize {
+    if (candidate == value.len) return candidate;
+    var end = candidate;
+    while (end > start and value[end] & 0xc0 == 0x80) end -= 1;
+    // Faux text is validated at its process boundary. Keep progress defensive
+    // for direct SDK callers that provide malformed bytes.
+    return if (end == start) candidate else end;
 }
 
 fn waitBeforeDelta(
@@ -1205,6 +1214,23 @@ test "faux provider streams exact event order for fixed-size chunks" {
     };
     for (expected) |tag| try std.testing.expectEqual(tag, std.meta.activeTag((try stream.next(std.Io.failing)).?));
     try std.testing.expectEqual(@as(?protocol.AssistantMessageEvent, null), try stream.next(std.Io.failing));
+}
+
+test "faux provider text deltas preserve UTF-8 scalar boundaries" {
+    var provider = try Provider.init(std.testing.allocator, .{ .min_token_size = 1, .max_token_size = 1 });
+    defer provider.deinit();
+    try provider.setResponses(&.{assistantMessage(&.{text("abc😀é中xyz")}, .{})});
+    var stream = provider.apiProvider().stream.call(testRequest(provider.getModel()));
+
+    var delta_count: usize = 0;
+    while (try stream.next(std.Io.failing)) |event| switch (event) {
+        .text_delta => |delta| {
+            delta_count += 1;
+            try std.testing.expect(std.unicode.utf8ValidateSlice(delta.delta));
+        },
+        else => {},
+    };
+    try std.testing.expect(delta_count > 1);
 }
 
 test "faux provider streams multiple tool calls in one message" {

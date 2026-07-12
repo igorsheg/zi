@@ -47,50 +47,84 @@ pub const Snapshot = struct {
     picker: ?PickerView = null,
 };
 
-pub fn compose(snapshot: Snapshot, width: u16, height: u16) error{ FrameFull, LineFull }!screen.Frame {
+pub const PlanInput = struct {
+    editor: *const Editor,
+    picker_open: bool = false,
+    popup_row_count: usize = 0,
+    queue_line_count: usize = 0,
+    viewport_hint_len: usize = 0,
+    status_open: bool = false,
+};
+
+pub const RowPlan = struct {
+    transcript_rows: usize = 0,
+    queue_rows: usize = 0,
+    status_rows: usize = 0,
+    popup_rows: usize = 0,
+    picker_rows: usize = 0,
+    composer_rows: usize = 0,
+
+    pub fn totalRows(self: RowPlan) usize {
+        return self.transcript_rows + self.queue_rows + self.status_rows +
+            self.popup_rows + self.picker_rows + self.composer_rows;
+    }
+};
+
+pub fn planRows(input: PlanInput, width: u16, height: u16) RowPlan {
+    if (height == 0) return .{};
+    if (height == 1) return .{ .composer_rows = 1 };
+    if (height == 2) {
+        const status_rows: usize = if (input.status_open) 1 else 0;
+        const queue_rows: usize = if (!input.status_open and
+            (input.queue_line_count > 0 or input.viewport_hint_len > 0)) 1 else 0;
+        return .{
+            .transcript_rows = if (status_rows == 0 and queue_rows == 0) 1 else 0,
+            .queue_rows = queue_rows,
+            .status_rows = status_rows,
+            .composer_rows = 1,
+        };
+    }
+
+    const top_chrome = clampedTopChromeRows(
+        queueRowCount(input.queue_line_count, input.viewport_hint_len),
+        if (input.status_open) 1 else 0,
+        height,
+    );
+    return rowPlan(
+        input.editor,
+        input.picker_open,
+        top_chrome.queue_rows,
+        top_chrome.status_rows,
+        @min(input.popup_row_count, popup_rows_max),
+        width,
+        height,
+    );
+}
+
+pub fn compose(snapshot: Snapshot, plan: RowPlan, width: u16, height: u16) error{ FrameFull, LineFull }!screen.Frame {
+    std.debug.assert(plan.totalRows() <= height);
+    std.debug.assert(snapshot.transcript_lines.len <= plan.transcript_rows);
+    if (snapshot.popup) |popup| std.debug.assert(popup.rows.len <= plan.popup_rows);
+    if (snapshot.picker) |picker| std.debug.assert(picker.rows.len <= plan.picker_rows);
+
     var frame: screen.Frame = .{};
     if (height == 0) return frame;
-    if (height == 1) {
-        try appendEditor(&frame, snapshot, 0, 1, width, snapshot.editor_border_style, false);
-        return frame;
-    }
-    if (height == 2) {
-        if (snapshot.status.text.len > 0) {
-            try appendStatusLine(&frame, snapshot.status);
-        } else if (snapshot.queue_lines.len > 0 or snapshot.viewport_hint.len > 0) {
-            const line = if (snapshot.viewport_hint.len > 0) snapshot.viewport_hint else snapshot.queue_lines[0];
-            try frame.appendLine(screen.singleSpanLine(line, screen.text.muted));
-        } else if (snapshot.transcript_lines.len > 0) {
-            try appendTranscriptTail(&frame, snapshot.transcript_lines, 1);
-        } else if (snapshot.scratch_text.len > 0) {
-            try frame.appendLine(screen.singleSpanLine(tailLine(snapshot.scratch_text), screen.text.normal));
-        } else {
-            try frame.appendLine(.{});
-        }
-        try appendEditor(&frame, snapshot, 1, 1, width, snapshot.editor_border_style, false);
-        return frame;
-    }
-
-    const requested_queue_rows = queueRowCount(snapshot.queue_lines.len, snapshot.viewport_hint.len);
-    const requested_status_rows: usize = if (snapshot.status.text.len > 0) 1 else 0;
-    const top_chrome = clampedTopChromeRows(requested_queue_rows, requested_status_rows, height);
-    const plan = rowPlan(snapshot.editor, snapshot.picker != null, top_chrome.queue_rows, top_chrome.status_rows, popupRowCount(snapshot), width, height);
-    const bottom_rows = top_chrome.status_rows + plan.popup_rows + plan.editor_rows + plan.picker_rows;
+    const bottom_rows = plan.status_rows + plan.popup_rows + plan.composer_rows + plan.picker_rows;
 
     appendTranscriptTail(&frame, snapshot.transcript_lines, plan.transcript_rows) catch |err| return err;
-    if (snapshot.scratch_text.len > 0 and frame.rows().len + top_chrome.queue_rows + bottom_rows < height) {
+    if (snapshot.scratch_text.len > 0 and frame.rows().len + plan.queue_rows + bottom_rows < height) {
         try frame.appendLine(screen.singleSpanLine(tailLine(snapshot.scratch_text), screen.text.normal));
     }
-    while (frame.rows().len + top_chrome.queue_rows + bottom_rows < height) try frame.appendLine(.{});
+    while (frame.rows().len + plan.queue_rows + bottom_rows < height) try frame.appendLine(.{});
 
-    var remaining_queue_rows = top_chrome.queue_rows;
+    var remaining_queue_rows = plan.queue_rows;
     if (snapshot.viewport_hint.len > 0 and remaining_queue_rows > 0) {
         try frame.appendLine(screen.singleSpanLine(snapshot.viewport_hint, screen.text.muted));
         remaining_queue_rows -= 1;
     }
     for (snapshot.queue_lines[0..@min(snapshot.queue_lines.len, remaining_queue_rows)]) |line| try frame.appendLine(screen.singleSpanLine(line, screen.text.muted));
-    if (top_chrome.status_rows > 0) try appendStatusLine(&frame, snapshot.status);
-    if (plan.editor_rows > 0) appendEditor(&frame, snapshot, @intCast(frame.rows().len), plan.editor_rows, width, snapshot.editor_border_style, useBorder(height, width) and plan.editor_rows >= 3) catch |err| return err;
+    if (plan.status_rows > 0) try appendStatusLine(&frame, snapshot.status);
+    if (plan.composer_rows > 0) appendEditor(&frame, snapshot, @intCast(frame.rows().len), plan.composer_rows, width, snapshot.editor_border_style, useBorder(height, width) and plan.composer_rows >= 3) catch |err| return err;
     if (snapshot.picker) |picker| try appendPicker(&frame, picker, plan.picker_rows);
     if (snapshot.popup) |popup| try appendPopup(&frame, popup, plan.popup_rows);
     return frame;
@@ -105,31 +139,6 @@ fn appendStatusLine(frame: *screen.Frame, status: StatusView) error{ FrameFull, 
     try frame.appendLine(line);
 }
 
-pub fn transcriptRowCapacity(editor: *const Editor, queue_line_count: usize, viewport_hint_len: usize, width: u16, height: u16) usize {
-    const top_chrome = clampedTopChromeRows(queueRowCount(queue_line_count, viewport_hint_len), 0, height);
-    return transcriptRowCapacityFor(editor, false, top_chrome.queue_rows, 0, 0, width, height);
-}
-
-pub fn transcriptRowCapacityWithChrome(editor: *const Editor, picker_open: bool, queue_line_count: usize, viewport_hint_len: usize, popup_line_count: usize, status_open: bool, width: u16, height: u16) usize {
-    const top_chrome = clampedTopChromeRows(queueRowCount(queue_line_count, viewport_hint_len), if (status_open) 1 else 0, height);
-    return transcriptRowCapacityFor(editor, picker_open, top_chrome.queue_rows, top_chrome.status_rows, @min(popup_line_count, popup_rows_max), width, height);
-}
-
-pub fn popupCandidateCapacity(editor: *const Editor, queue_line_count: usize, viewport_hint_len: usize, status_open: bool, width: u16, height: u16) usize {
-    const top_chrome = clampedTopChromeRows(queueRowCount(queue_line_count, viewport_hint_len), if (status_open) 1 else 0, height);
-    return rowPlan(editor, false, top_chrome.queue_rows, top_chrome.status_rows, popup_rows_max, width, height).popup_rows;
-}
-
-pub fn pickerPanelCapacity(editor: *const Editor, queue_line_count: usize, viewport_hint_len: usize, status_open: bool, width: u16, height: u16) usize {
-    const top_chrome = clampedTopChromeRows(queueRowCount(queue_line_count, viewport_hint_len), if (status_open) 1 else 0, height);
-    return rowPlan(editor, true, top_chrome.queue_rows, top_chrome.status_rows, 0, width, height).picker_rows;
-}
-
-fn transcriptRowCapacityFor(editor: *const Editor, picker_open: bool, queue_rows: usize, status_rows: usize, popup_rows: usize, width: u16, height: u16) usize {
-    if (height <= 1) return 0;
-    return rowPlan(editor, picker_open, queue_rows, status_rows, popup_rows, width, height).transcript_rows;
-}
-
 const TopChromeRows = struct { queue_rows: usize, status_rows: usize };
 
 fn clampedTopChromeRows(queue_rows: usize, status_rows: usize, height: u16) TopChromeRows {
@@ -138,13 +147,6 @@ fn clampedTopChromeRows(queue_rows: usize, status_rows: usize, height: u16) TopC
     const queue = @min(queue_rows, max_non_editor - status);
     return .{ .queue_rows = queue, .status_rows = status };
 }
-
-const RowPlan = struct {
-    transcript_rows: usize,
-    editor_rows: usize,
-    popup_rows: usize,
-    picker_rows: usize,
-};
 
 fn rowPlan(editor: *const Editor, picker_open: bool, queue_rows: usize, status_rows: usize, popup_rows: usize, width: u16, height: u16) RowPlan {
     var editor_rows_value = editorRows(editor, height, width);
@@ -167,7 +169,9 @@ fn rowPlan(editor: *const Editor, picker_open: bool, queue_rows: usize, status_r
     const fixed_rows = fixed_without_bottom + editor_rows_value + popup_rows_value + picker_rows_value;
     return .{
         .transcript_rows = if (height > fixed_rows) height - fixed_rows else 0,
-        .editor_rows = editor_rows_value,
+        .queue_rows = queue_rows,
+        .status_rows = status_rows,
+        .composer_rows = editor_rows_value,
         .popup_rows = popup_rows_value,
         .picker_rows = picker_rows_value,
     };
@@ -551,6 +555,18 @@ fn spaceFill(cols: usize) []const u8 {
     return border_spaces[0..@min(border_spaces.len, cols)];
 }
 
+fn composeForTest(snapshot: Snapshot, width: u16, height: u16) error{ FrameFull, LineFull }!screen.Frame {
+    const plan = planRows(.{
+        .editor = snapshot.editor,
+        .picker_open = snapshot.picker != null,
+        .popup_row_count = popupRowCount(snapshot),
+        .queue_line_count = snapshot.queue_lines.len,
+        .viewport_hint_len = snapshot.viewport_hint.len,
+        .status_open = snapshot.status.text.len > 0,
+    }, width, height);
+    return compose(snapshot, plan, width, height);
+}
+
 test "vertical cursor targets hard lines and preserves preferred display column" {
     var editor: Editor = .{};
     try editor.insert("abcdef\nxy\n123456");
@@ -593,10 +609,34 @@ test "vertical cursor keeps paste markers atomic" {
     try std.testing.expect(!editor.moveCursorTo(2));
 }
 
+test "chrome row plan is authoritative across pathological dimensions" {
+    var editor: Editor = .{};
+    try editor.insert("one\ntwo\nthree");
+    const widths = [_]u16{ 0, 1, 2, 3, 10, 80 };
+    const heights = [_]u16{ 0, 1, 2, 3, 6, 12, screen.row_capacity };
+    for (widths) |width| {
+        for (heights) |height| {
+            inline for (.{ false, true }) |picker_open| {
+                const plan = planRows(.{
+                    .editor = &editor,
+                    .picker_open = picker_open,
+                    .popup_row_count = if (picker_open) 0 else popup_rows_max,
+                    .queue_line_count = 4,
+                    .viewport_hint_len = 8,
+                    .status_open = true,
+                }, width, height);
+                try std.testing.expect(plan.totalRows() <= height);
+                if (height > 0) try std.testing.expectEqual(@as(usize, height), plan.totalRows());
+                if (picker_open) try std.testing.expectEqual(@as(usize, 0), plan.popup_rows);
+            }
+        }
+    }
+}
+
 test "chrome composes status and editor rows" {
     var editor: Editor = .{};
     try editor.insert("hello");
-    var frame = try compose(.{ .status = .{ .text = "ready" }, .editor = &editor }, 80, 3);
+    var frame = try composeForTest(.{ .status = .{ .text = "ready" }, .editor = &editor }, 80, 3);
 
     try std.testing.expectEqual(@as(usize, 3), frame.rows().len);
     var buffer: [32]u8 = undefined;
@@ -609,7 +649,7 @@ test "chrome composes status and editor rows" {
 
 test "chrome composes shimmer status as bounded spans" {
     var editor: Editor = .{};
-    const frame = try compose(.{
+    const frame = try composeForTest(.{
         .status = .{ .text = "Working…", .style = screen.shimmer.base, .effect = .shimmer, .now_ns = 6 * 32 * std.time.ns_per_ms },
         .editor = &editor,
     }, 80, 3);
@@ -623,7 +663,7 @@ test "chrome uses two-row spare row for transcript when no status" {
     var editor: Editor = .{};
     try editor.insert("draft");
     const transcript = [_]screen.Line{screen.singleSpanLine("streaming", screen.text.normal)};
-    const frame = try compose(.{ .transcript_lines = &transcript, .editor = &editor }, 80, 2);
+    const frame = try composeForTest(.{ .transcript_lines = &transcript, .editor = &editor }, 80, 2);
 
     var buffer: [128]u8 = undefined;
     try std.testing.expectEqualStrings("streaming", frame.rows()[0].copyText(&buffer));
@@ -637,7 +677,7 @@ test "chrome renders transcript and queue lines above editor" {
     try editor.insert("draft");
     const transcript = [_]screen.Line{screen.singleSpanLine("streaming", screen.text.normal)};
     const queues = [_][]const u8{"steering: next"};
-    const frame = try compose(.{ .status = .{ .text = "ready" }, .transcript_lines = &transcript, .queue_lines = &queues, .editor = &editor }, 80, 8);
+    const frame = try composeForTest(.{ .status = .{ .text = "ready" }, .transcript_lines = &transcript, .queue_lines = &queues, .editor = &editor }, 80, 8);
 
     var buffer: [128]u8 = undefined;
     try std.testing.expectEqualStrings("streaming", frame.rows()[0].copyText(&buffer));
@@ -677,7 +717,7 @@ test "chrome golden matrix protects transcript and composer across lower chrome"
     };
 
     for (cases) |case| {
-        const frame = try compose(.{
+        const frame = try composeForTest(.{
             .transcript_lines = &transcript,
             .queue_lines = case.queue_lines,
             .status = case.status,
@@ -702,7 +742,7 @@ test "chrome golden matrix protects transcript and composer across lower chrome"
 test "chrome clamps cursor to frame width" {
     var editor: Editor = .{};
     try editor.insert("hello");
-    const frame = try compose(.{ .editor = &editor }, 4, 2);
+    const frame = try composeForTest(.{ .editor = &editor }, 4, 2);
 
     try std.testing.expectEqual(@as(u16, 1), frame.cursor.?.col);
     try std.testing.expectEqual(@as(u16, 1), frame.cursor.?.row);
@@ -711,7 +751,7 @@ test "chrome clamps cursor to frame width" {
 test "chrome renders bordered editor with supplied border style" {
     var editor: Editor = .{};
     try editor.insert("draft");
-    const frame = try compose(.{ .editor = &editor, .editor_border_style = screen.text.error_ }, 20, 6);
+    const frame = try composeForTest(.{ .editor = &editor, .editor_border_style = screen.text.error_ }, 20, 6);
 
     var buffer: [128]u8 = undefined;
     try std.testing.expectEqualStrings("╭──────────────────╮", frame.rows()[3].copyText(&buffer));
@@ -722,7 +762,7 @@ test "chrome renders bordered editor with supplied border style" {
 
 test "chrome composer border labels are display-column aligned" {
     var editor: Editor = .{};
-    const frame = try compose(.{
+    const frame = try composeForTest(.{
         .editor = &editor,
         .composer_top_left = "~/workspace/dev/personal/zi",
         .composer_top_right = "ctx 10%/259k • gpt-5.5 (low)",
@@ -738,7 +778,7 @@ test "chrome composer border labels are display-column aligned" {
 test "chrome bordered editor uses display columns for fill and cursor" {
     var editor: Editor = .{};
     try editor.insert("λ🙂");
-    const frame = try compose(.{ .editor = &editor }, 20, 6);
+    const frame = try composeForTest(.{ .editor = &editor }, 20, 6);
 
     var buffer: [128]u8 = undefined;
     const row = frame.rows()[4].copyText(&buffer);
@@ -751,7 +791,7 @@ test "chrome bordered editor uses display columns for fill and cursor" {
 test "chrome wraps composer input by display columns" {
     var editor: Editor = .{};
     try editor.insert("hello my good friend");
-    const frame = try compose(.{ .editor = &editor }, 20, 10);
+    const frame = try composeForTest(.{ .editor = &editor }, 20, 10);
 
     var buffer: [128]u8 = undefined;
     try std.testing.expectEqualStrings("│hello my good     │", frame.rows()[7].copyText(&buffer));
@@ -764,7 +804,7 @@ test "chrome keeps wrapped composer cursor visible" {
     var editor: Editor = .{};
     try editor.insert("abcdefgh ijklmnop qrstuvwx yz");
     editor.moveBufferStart();
-    const frame = try compose(.{ .editor = &editor }, 12, 20);
+    const frame = try composeForTest(.{ .editor = &editor }, 12, 20);
 
     var buffer: [128]u8 = undefined;
     try std.testing.expectEqualStrings("│abcdefgh  │", frame.rows()[15].copyText(&buffer));
@@ -775,7 +815,7 @@ test "chrome keeps wrapped composer cursor visible" {
 test "chrome wraps composer input by unicode cell width" {
     var editor: Editor = .{};
     try editor.insert("λ🙂abcdef");
-    const frame = try compose(.{ .editor = &editor }, 10, 10);
+    const frame = try composeForTest(.{ .editor = &editor }, 10, 10);
 
     var buffer: [128]u8 = undefined;
     try std.testing.expectEqualStrings("│λ🙂abcde│", frame.rows()[7].copyText(&buffer));
@@ -790,7 +830,7 @@ test "chrome renders picker with main selection marker" {
         screen.singleSpanLine("alpha", screen.text.normal),
         screen.singleSpanLine("beta", screen.text.normal),
     };
-    const frame = try compose(.{
+    const frame = try composeForTest(.{
         .status = .{ .text = "ready" },
         .editor = &editor,
         .picker = .{ .rows = &rows, .selected = 1 },
@@ -810,7 +850,7 @@ test "chrome renders completion popup with main selection marker" {
         screen.singleSpanLine("main.zig", screen.text.normal),
         screen.singleSpanLine("module.zig", screen.text.normal),
     };
-    const frame = try compose(.{
+    const frame = try composeForTest(.{
         .status = .{ .text = "ready" },
         .editor = &editor,
         .popup = .{ .rows = &rows, .selected = 1 },
@@ -827,7 +867,7 @@ test "chrome protects composer under small queued/status chrome" {
     var editor: Editor = .{};
     try editor.insert("draft");
     const queues = [_][]const u8{ "steering: one", "follow-up: two", "follow-up: three" };
-    const frame = try compose(.{ .status = .{ .text = "Working…" }, .queue_lines = &queues, .editor = &editor }, 40, 3);
+    const frame = try composeForTest(.{ .status = .{ .text = "Working…" }, .queue_lines = &queues, .editor = &editor }, 40, 3);
 
     var buffer: [128]u8 = undefined;
     try std.testing.expectEqualStrings("steering: one", frame.rows()[0].copyText(&buffer));
@@ -849,7 +889,7 @@ test "chrome picker keeps eighth visible candidate" {
         screen.singleSpanLine("item6", screen.text.normal),
         screen.singleSpanLine("item7", screen.text.normal),
     };
-    const frame = try compose(.{
+    const frame = try composeForTest(.{
         .editor = &editor,
         .picker = .{ .rows = &rows, .selected = 7 },
     }, 80, 30);

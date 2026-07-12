@@ -169,8 +169,8 @@ policy. `vaxis` imports stay inside `src/tui`.
 3. **One transcript representation.** TUI has one bounded `Transcript`, which
    also owns its ephemeral derived layout/cache and line-index state. Do not add
    mirrors with revision taxonomies.
-4. **One wait point.** The frame loop waits on input/runtime wake sources with a
-   deadline. Producers wake; owners inspect state.
+4. **One wait point.** `Loop.run` waits on input/runtime wake sources with its
+   nearest owned deadline. Producers wake; the owner inspects state.
 5. **Streaming-first.** Assistant text, thinking, tool calls, and tool output are
    folded live. Backpressure belongs to bounded runtime pipes, not UI throttles.
 6. **Alt-screen is intentional.** Terminal scrollback is not the product history;

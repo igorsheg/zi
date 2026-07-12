@@ -125,9 +125,9 @@ When touching `src/runtime` or code that uses it:
 
 ### TUI owner loop
 
-`src/tui/Loop.zig` owns interactive product state: editor, picker stack,
-completion, viewport, run driver, notices, trace counters, and frame composition.
-Mutate it through `Loop.dispatch`, `Loop.tick`, driver polling, and explicit owner
+`src/tui/Loop.zig` owns interactive product state: composer, viewport, agent-run
+state, foreground operations, notices, trace counters, and frame composition.
+Mutate it through `Loop.run`, `Loop.step`, `Loop.dispatch`, and explicit owner
 methods.
 
 Rules:
@@ -136,11 +136,12 @@ Rules:
   listbox frames; they do not take focus through nested modal text fields.
 - ESC cascade stays centralized in the loop.
 - Typed input is foreground work and must remain responsive while streaming.
-- Time enters through frame-loop/runner deadlines and `std.Io` timestamps at owner
-  edges; do not scatter wall-clock reads.
+- Time enters through the `Loop` iteration deadline and `std.Io` timestamps at
+  owner edges; do not scatter wall-clock reads.
 - Rendering is compose -> paint -> synchronous flush -> clear dirty only after
   success.
-- Frame loop wait is over input/runtime wake sources with a deadline.
+- `Loop.run` waits over input/runtime wake sources with the nearest owned
+  deadline.
 - The debug watchdog budget is meaningful; do not add exemptions to hide owner
   loop stalls.
 

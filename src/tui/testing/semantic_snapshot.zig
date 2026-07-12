@@ -163,7 +163,9 @@ fn writeBaseline(path: []const u8, actual: []const u8) !void {
 
 test "semantic frame golden startup idle" {
     var editor: Editor = .{};
-    const frame = try chrome.compose(.{ .editor = &editor }, 80, 24);
+    const snapshot: chrome.Snapshot = .{ .editor = &editor };
+    const plan = chrome.planRows(.{ .editor = &editor }, 80, 24);
+    const frame = try chrome.compose(snapshot, plan, 80, 24);
     const actual = try serialize(std.testing.allocator, &frame, 80, 24);
     defer std.testing.allocator.free(actual);
     try expectBaseline("startup-idle-80x24", actual);
@@ -172,14 +174,19 @@ test "semantic frame golden startup idle" {
 test "semantic frame golden multiline unicode" {
     var editor: Editor = .{};
     try editor.insert("wide 界界\ncombining e\u{301} and wrapped text");
-    const frame = try chrome.compose(.{ .status = .{ .text = "Preparing images… (esc to cancel)" }, .editor = &editor }, 40, 10);
+    const snapshot: chrome.Snapshot = .{
+        .status = .{ .text = "Preparing images… (esc to cancel)" },
+        .editor = &editor,
+    };
+    const plan = chrome.planRows(.{ .editor = &editor, .status_open = true }, 40, 10);
+    const frame = try chrome.compose(snapshot, plan, 40, 10);
     const actual = try serialize(std.testing.allocator, &frame, 40, 10);
     defer std.testing.allocator.free(actual);
     try expectBaseline("multiline-unicode-40x10", actual);
 }
 
 test "typed semantic scenario is bounded and drives concrete owner actions" {
-    var owner = try Loop.init(std.testing.allocator, null);
+    var owner = try Loop.initTest(std.testing.allocator, null);
     defer owner.deinit();
     owner.io = std.testing.io;
     var scenario: Scenario = .{};
@@ -187,7 +194,7 @@ test "typed semantic scenario is bounded and drives concrete owner actions" {
     try scenario.append(.{ .dispatch = .{ .insert = "typed" } });
     try scenario.append(.{ .tick = 1 });
     try scenario.run(&owner);
-    try std.testing.expectEqualStrings("typed", owner.editor.text());
+    try std.testing.expectEqualStrings("typed", owner.composerText());
 
     var full: Scenario = .{};
     for (0..scenario_steps_max) |_| try full.append(.{ .tick = 0 });

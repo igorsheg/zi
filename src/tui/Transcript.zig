@@ -101,6 +101,13 @@ const Part = union(PartTag) {
     }
 };
 
+const PendingUtf8 = struct {
+    // Four bytes of storage lets the next delta complete a scalar in place;
+    // len is never retained above three between deltas.
+    bytes: [4]u8 = undefined,
+    len: u8 = 0,
+};
+
 const Stop = enum { ok, aborted, errored };
 pub const NoticeLevel = enum { info, warn, err };
 
@@ -203,6 +210,7 @@ const Item = struct {
         user: struct { text: std.ArrayList(u8), truncated: bool = false },
         assistant: struct {
             parts: std.ArrayList(Part),
+            pending_utf8: std.ArrayList(PendingUtf8) = .empty,
             streaming: bool,
             stop: Stop = .ok,
             error_text: ?[]const u8 = null,
@@ -722,6 +730,7 @@ fn layoutIncrementalAssistant(
     can_append: bool,
 ) !void {
     const inner_width = transcriptInnerWidth(key.width);
+    std.debug.assert(std.unicode.utf8ValidateSlice(source.text));
 
     var new_line_start: usize = undefined;
     if (can_append) {
@@ -796,6 +805,7 @@ fn layoutAssistant(
         switch (part) {
             .text => |value| {
                 const visible = trimTrailingNewlines(value.items);
+                std.debug.assert(std.unicode.utf8ValidateSlice(visible));
                 if (visible.len == 0) continue;
                 if (previous_visible_part_was_thinking) try out.append(allocator, .{});
                 try appendMarkdownBlock(allocator, &out, visible, width, screen.text.normal);
@@ -803,9 +813,10 @@ fn layoutAssistant(
             },
             .thinking => |value| {
                 const visible = trimTrailingNewlines(value.items);
+                std.debug.assert(std.unicode.utf8ValidateSlice(visible));
                 if (visible.len == 0) continue;
                 if (hide_thinking) {
-                    if (!assistant.streaming or hidden_thinking_shown) continue;
+                    if (hidden_thinking_shown) continue;
                     if (previous_visible_part_was_thinking) try out.append(allocator, .{});
                     try appendMarkdownBlock(allocator, &out, "Thinking...", width, thinkingStyle());
                     hidden_thinking_shown = true;
@@ -884,19 +895,19 @@ fn applyMessageUpdate(self: *Transcript, event: ai.AssistantMessageEvent) !void 
         .thinking_start => |payload| _ = try self.ensurePart(payload.content_index, .thinking),
         .text_delta => |payload| {
             const part = try self.ensurePart(payload.content_index, .text);
-            try self.appendAssistantPart(part, payload.delta);
+            try self.appendAssistantPart(payload.content_index, part, payload.delta);
         },
         .thinking_delta => |payload| {
             const part = try self.ensurePart(payload.content_index, .thinking);
-            try self.appendAssistantPart(part, payload.delta);
+            try self.appendAssistantPart(payload.content_index, part, payload.delta);
         },
         .text_end => |payload| {
             const part = try self.ensurePart(payload.content_index, .text);
-            try self.replaceAssistantPart(part, payload.content);
+            try self.replaceAssistantPart(payload.content_index, part, payload.content);
         },
         .thinking_end => |payload| {
             const part = try self.ensurePart(payload.content_index, .thinking);
-            try self.replaceAssistantPart(part, payload.content);
+            try self.replaceAssistantPart(payload.content_index, part, payload.content);
         },
         .toolcall_start => |payload| {
             if (toolCallAt(payload.partial, payload.content_index)) |call| _ = try self.ensureToolItem(call.id, call.name, call.arguments, true);
@@ -998,10 +1009,17 @@ fn ensurePart(self: *Transcript, index: usize, tag: PartTag) !*Part {
     std.debug.assert(item.kind == .assistant);
     const assistant = &item.kind.assistant;
     var changed = false;
-    while (assistant.parts.items.len <= index) {
-        try assistant.parts.append(item.allocator(), .{ .text = .empty });
+    if (assistant.parts.items.len <= index) {
+        const additional = index + 1 - assistant.parts.items.len;
+        try assistant.parts.ensureUnusedCapacity(item.allocator(), additional);
+        try assistant.pending_utf8.ensureUnusedCapacity(item.allocator(), additional);
+        for (0..additional) |_| {
+            assistant.parts.appendAssumeCapacity(.{ .text = .empty });
+            assistant.pending_utf8.appendAssumeCapacity(.{});
+        }
         changed = true;
     }
+    std.debug.assert(assistant.parts.items.len == assistant.pending_utf8.items.len);
     const part = &assistant.parts.items[index];
     if (part.tag() != tag) {
         self.total_bytes -|= part.bytes().len;
@@ -1009,31 +1027,145 @@ fn ensurePart(self: *Transcript, index: usize, tag: PartTag) !*Part {
             .text => .{ .text = .empty },
             .thinking => .{ .thinking = .empty },
         };
+        assistant.pending_utf8.items[index].len = 0;
         changed = true;
     }
     if (changed) self.invalidateItem(item, .rebuild);
     return part;
 }
 
-fn appendAssistantPart(self: *Transcript, part: *Part, text: []const u8) !void {
+fn appendAssistantPart(self: *Transcript, index: usize, part: *Part, text: []const u8) !void {
     const item = self.streaming_item.?;
     const assistant = &item.kind.assistant;
     const old_len = part.bytes().len;
     const old_truncated = assistant.truncated;
-    try self.appendListBounded(item, part.list(), text, per_item_text_bytes_max, &assistant.truncated, true);
+    try self.appendAssistantUtf8(
+        item,
+        part.list(),
+        &assistant.pending_utf8.items[index],
+        text,
+        &assistant.truncated,
+    );
     if (part.bytes().len != old_len or assistant.truncated != old_truncated) {
         self.invalidateItem(item, .source_appended);
     }
 }
 
-fn replaceAssistantPart(self: *Transcript, part: *Part, text: []const u8) !void {
-    if (std.mem.eql(u8, part.bytes(), text)) return;
+fn replaceAssistantPart(self: *Transcript, index: usize, part: *Part, text: []const u8) !void {
     const item = self.streaming_item.?;
     const assistant = &item.kind.assistant;
+    const pending = &assistant.pending_utf8.items[index];
+    if (pending.len == 0 and std.mem.eql(u8, part.bytes(), text)) return;
     self.total_bytes -|= part.bytes().len;
     part.list().clearRetainingCapacity();
-    try self.appendListBounded(item, part.list(), text, per_item_text_bytes_max, &assistant.truncated, true);
+    pending.len = 0;
+    try self.appendAssistantUtf8(item, part.list(), pending, text, &assistant.truncated);
+    try self.finishAssistantUtf8(item, part.list(), pending, &assistant.truncated);
     self.invalidateItem(item, .rebuild);
+}
+
+const replacement_character = "\xef\xbf\xbd";
+
+fn appendAssistantUtf8(
+    self: *Transcript,
+    item: *Item,
+    list: *std.ArrayList(u8),
+    pending_utf8: *PendingUtf8,
+    text: []const u8,
+    truncated: *bool,
+) !void {
+    var consumed: usize = 0;
+
+    if (pending_utf8.len > 0) {
+        const expected = std.unicode.utf8ByteSequenceLength(pending_utf8.bytes[0]) catch unreachable;
+        while (pending_utf8.len < expected and consumed < text.len) {
+            const byte = text[consumed];
+            if (byte & 0xc0 != 0x80) {
+                try self.appendAssistantUtf8Run(item, list, replacement_character, truncated);
+                pending_utf8.len = 0;
+                break;
+            }
+            pending_utf8.bytes[pending_utf8.len] = byte;
+            pending_utf8.len += 1;
+            consumed += 1;
+        }
+        if (pending_utf8.len > 0) {
+            if (pending_utf8.len < expected) return;
+            const pending = pending_utf8.bytes[0..pending_utf8.len];
+            if (std.unicode.utf8Decode(pending)) |_| {
+                try self.appendAssistantUtf8Run(item, list, pending, truncated);
+            } else |_| {
+                try self.appendAssistantUtf8Run(item, list, replacement_character, truncated);
+            }
+            pending_utf8.len = 0;
+        }
+    }
+
+    var index = consumed;
+    var valid_start = index;
+    while (index < text.len) {
+        const byte = text[index];
+        if (byte < 0x80) {
+            index += 1;
+            continue;
+        }
+        const sequence_len = std.unicode.utf8ByteSequenceLength(byte) catch {
+            try self.appendAssistantUtf8Run(item, list, text[valid_start..index], truncated);
+            try self.appendAssistantUtf8Run(item, list, replacement_character, truncated);
+            index += 1;
+            valid_start = index;
+            continue;
+        };
+        if (text.len - index < sequence_len) {
+            var potential_prefix = true;
+            for (text[index + 1 ..]) |continuation| {
+                if (continuation & 0xc0 != 0x80) {
+                    potential_prefix = false;
+                    break;
+                }
+            }
+            if (potential_prefix) {
+                try self.appendAssistantUtf8Run(item, list, text[valid_start..index], truncated);
+                const suffix = text[index..];
+                std.debug.assert(suffix.len < pending_utf8.bytes.len);
+                @memcpy(pending_utf8.bytes[0..suffix.len], suffix);
+                pending_utf8.len = @intCast(suffix.len);
+                return;
+            }
+        } else if (std.unicode.utf8Decode(text[index .. index + sequence_len])) |_| {
+            index += sequence_len;
+            continue;
+        } else |_| {}
+
+        try self.appendAssistantUtf8Run(item, list, text[valid_start..index], truncated);
+        try self.appendAssistantUtf8Run(item, list, replacement_character, truncated);
+        index += 1;
+        valid_start = index;
+    }
+    try self.appendAssistantUtf8Run(item, list, text[valid_start..], truncated);
+}
+
+fn appendAssistantUtf8Run(
+    self: *Transcript,
+    item: *Item,
+    list: *std.ArrayList(u8),
+    text: []const u8,
+    truncated: *bool,
+) !void {
+    if (text.len == 0) return;
+    try self.appendListBounded(item, list, text, per_item_text_bytes_max, truncated, true);
+}
+
+fn finishAssistantUtf8(
+    self: *Transcript,
+    item: *Item,
+    list: *std.ArrayList(u8),
+    pending_utf8: *PendingUtf8,
+    truncated: *bool,
+) !void {
+    if (pending_utf8.len == 0) return;
+    pending_utf8.len = 0;
+    try self.appendAssistantUtf8Run(item, list, replacement_character, truncated);
 }
 
 fn appendToolArgs(self: *Transcript, item: *Item, delta: []const u8) !void {
@@ -1113,11 +1245,11 @@ fn reconcileAssistant(self: *Transcript, item: *Item, assistant_message: ai.Assi
     for (assistant_message.content, 0..) |content, index| switch (content) {
         .text => |text| {
             const part = try self.ensureFinalPart(item, index, .text);
-            try self.replaceFinalPart(item, part, text.text);
+            try self.replaceFinalPart(item, index, part, text.text);
         },
         .thinking => |thinking| {
             const part = try self.ensureFinalPart(item, index, .thinking);
-            try self.replaceFinalPart(item, part, thinking.thinking);
+            try self.replaceFinalPart(item, index, part, thinking.thinking);
         },
         .tool_call => |call| {
             self.clearFinalPart(item, index);
@@ -1131,9 +1263,16 @@ fn reconcileAssistant(self: *Transcript, item: *Item, assistant_message: ai.Assi
 fn ensureFinalPart(self: *Transcript, item: *Item, index: usize, tag: PartTag) !*Part {
     std.debug.assert(item.kind == .assistant);
     const assistant = &item.kind.assistant;
-    while (assistant.parts.items.len <= index) {
-        try assistant.parts.append(item.allocator(), .{ .text = .empty });
+    if (assistant.parts.items.len <= index) {
+        const additional = index + 1 - assistant.parts.items.len;
+        try assistant.parts.ensureUnusedCapacity(item.allocator(), additional);
+        try assistant.pending_utf8.ensureUnusedCapacity(item.allocator(), additional);
+        for (0..additional) |_| {
+            assistant.parts.appendAssumeCapacity(.{ .text = .empty });
+            assistant.pending_utf8.appendAssumeCapacity(.{});
+        }
     }
+    std.debug.assert(assistant.parts.items.len == assistant.pending_utf8.items.len);
     const part = &assistant.parts.items[index];
     if (part.tag() != tag) {
         self.total_bytes -|= part.bytes().len;
@@ -1141,6 +1280,7 @@ fn ensureFinalPart(self: *Transcript, item: *Item, index: usize, tag: PartTag) !
             .text => .{ .text = .empty },
             .thinking => .{ .thinking = .empty },
         };
+        assistant.pending_utf8.items[index].len = 0;
     }
     return part;
 }
@@ -1153,6 +1293,7 @@ fn clearFinalPart(self: *Transcript, item: *Item, index: usize) void {
     self.total_bytes -|= part.bytes().len;
     part.list().clearRetainingCapacity();
     part.* = .{ .text = .empty };
+    item.kind.assistant.pending_utf8.items[index].len = 0;
     self.invalidateItem(item, .rebuild);
 }
 
@@ -1162,15 +1303,19 @@ fn truncateFinalParts(self: *Transcript, item: *Item, len: usize) void {
     if (assistant.parts.items.len <= len) return;
     for (assistant.parts.items[len..]) |part| self.total_bytes -|= part.bytes().len;
     assistant.parts.items.len = len;
+    assistant.pending_utf8.items.len = len;
     self.invalidateItem(item, .rebuild);
 }
 
-fn replaceFinalPart(self: *Transcript, item: *Item, part: *Part, text: []const u8) !void {
-    if (std.mem.eql(u8, part.bytes(), text)) return;
+fn replaceFinalPart(self: *Transcript, item: *Item, index: usize, part: *Part, text: []const u8) !void {
     const assistant = &item.kind.assistant;
+    const pending = &assistant.pending_utf8.items[index];
+    if (pending.len == 0 and std.mem.eql(u8, part.bytes(), text)) return;
     self.total_bytes -|= part.bytes().len;
     part.list().clearRetainingCapacity();
-    try self.appendListBounded(item, part.list(), text, per_item_text_bytes_max, &assistant.truncated, true);
+    pending.len = 0;
+    try self.appendAssistantUtf8(item, part.list(), pending, text, &assistant.truncated);
+    try self.finishAssistantUtf8(item, part.list(), pending, &assistant.truncated);
     self.invalidateItem(item, .rebuild);
 }
 
@@ -1538,6 +1683,30 @@ test "transcript custom message renders padded title body and margin" {
     try std.testing.expect(screen.Style.eql(lines[5].row_style, screen.surface.transparent));
 }
 
+test "transcript streams visible thinking without a synthetic label" {
+    var transcript = Transcript.init(std.testing.allocator);
+    defer transcript.deinit();
+
+    try transcript.apply(std.testing.io, .{ .message_start = .{
+        .message = .{ .assistant = emptyAssistantMessage(&.{}, .stop) },
+    } });
+    try transcript.apply(std.testing.io, .{ .message_update = .{ .assistant_message_event = .{ .thinking_delta = .{
+        .content_index = 0,
+        .delta = "plan",
+        .partial = emptyAssistantMessage(&.{}, .stop),
+    } } } });
+
+    const state: theme.LayoutState = .{ .width = 40, .height = 10, .hide_thinking = false };
+    _ = try transcript.prepareLayout(state);
+    const lines = transcript.items.items[0].layout_cache.active.lines;
+
+    var buffer: [64]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 2), lines.len);
+    try std.testing.expectEqualStrings(" plan", lines[0].copyText(&buffer));
+    try std.testing.expect(lines[0].spans()[1].style.italic);
+    try std.testing.expectEqualStrings("", lines[1].copyText(&buffer));
+}
+
 test "transcript separates and styles visible thinking before answer" {
     var transcript = Transcript.init(std.testing.allocator);
     defer transcript.deinit();
@@ -1563,7 +1732,7 @@ test "transcript separates and styles visible thinking before answer" {
     try std.testing.expectEqualStrings("", lines[3].copyText(&buffer));
 }
 
-test "transcript hidden thinking is styled and separated while answer streams" {
+test "transcript hidden thinking label persists after answer completes" {
     var transcript = Transcript.init(std.testing.allocator);
     defer transcript.deinit();
 
@@ -1580,11 +1749,23 @@ test "transcript hidden thinking is styled and separated while answer streams" {
         .delta = "answer",
         .partial = emptyAssistantMessage(&.{}, .stop),
     } } } });
+
     const state: theme.LayoutState = .{ .width = 40, .height = 10, .hide_thinking = true };
     _ = try transcript.prepareLayout(state);
-    const lines = transcript.items.items[0].layout_cache.active.lines;
-
+    var lines = transcript.items.items[0].layout_cache.active.lines;
     var buffer: [64]u8 = undefined;
+    try std.testing.expectEqualStrings(" Thinking...", lines[0].copyText(&buffer));
+
+    const content = [_]ai.AssistantContent{
+        .{ .thinking = .{ .thinking = "plan" } },
+        .{ .text = .{ .text = "answer" } },
+    };
+    try transcript.apply(std.testing.io, .{ .message_end = .{
+        .message = .{ .assistant = emptyAssistantMessage(&content, .stop) },
+    } });
+    _ = try transcript.prepareLayout(state);
+    lines = transcript.items.items[0].layout_cache.active.lines;
+
     try std.testing.expectEqual(@as(usize, 4), lines.len);
     try std.testing.expectEqualStrings(" Thinking...", lines[0].copyText(&buffer));
     try std.testing.expect(lines[0].spans()[1].style.italic);
@@ -1948,6 +2129,62 @@ test "transcript applies streamed assistant text by delta" {
     const item = transcript.items.items[0];
     try std.testing.expectEqualStrings("hello", item.kind.assistant.parts.items[0].text.items);
     try std.testing.expect(!item.kind.assistant.streaming);
+}
+
+test "transcript keeps streamed assistant text valid across UTF-8 delta boundaries" {
+    const source = "Aé中😀Z";
+
+    for (1..source.len) |split| {
+        var transcript = Transcript.init(std.testing.allocator);
+        defer transcript.deinit();
+
+        try transcript.apply(std.testing.io, .{ .message_start = .{
+            .message = .{ .assistant = emptyAssistantMessage(&.{}, .stop) },
+        } });
+        try transcript.apply(std.testing.io, .{ .message_update = .{ .assistant_message_event = .{ .text_delta = .{
+            .content_index = 0,
+            .delta = source[0..split],
+            .partial = emptyAssistantMessage(&.{}, .stop),
+        } } } });
+
+        const item = transcript.items.items[0];
+        const first = item.kind.assistant.parts.items[0].text.items;
+        try std.testing.expect(std.unicode.utf8ValidateSlice(first));
+        _ = try transcript.prepareLayout(.{ .width = 20, .height = 10 });
+        for (item.layout_cache.active.lines) |line| {
+            for (line.spans()) |span| try std.testing.expect(std.unicode.utf8ValidateSlice(span.text));
+        }
+
+        try transcript.apply(std.testing.io, .{ .message_update = .{ .assistant_message_event = .{ .text_delta = .{
+            .content_index = 0,
+            .delta = source[split..],
+            .partial = emptyAssistantMessage(&.{}, .stop),
+        } } } });
+        try std.testing.expectEqualStrings(source, item.kind.assistant.parts.items[0].text.items);
+        try std.testing.expectEqual(@as(u8, 0), item.kind.assistant.pending_utf8.items[0].len);
+        _ = try transcript.prepareLayout(.{ .width = 20, .height = 10 });
+        for (item.layout_cache.active.lines) |line| {
+            for (line.spans()) |span| try std.testing.expect(std.unicode.utf8ValidateSlice(span.text));
+        }
+    }
+}
+
+test "transcript replaces malformed streamed assistant UTF-8" {
+    var transcript = Transcript.init(std.testing.allocator);
+    defer transcript.deinit();
+
+    try transcript.apply(std.testing.io, .{ .message_start = .{
+        .message = .{ .assistant = emptyAssistantMessage(&.{}, .stop) },
+    } });
+    try transcript.apply(std.testing.io, .{ .message_update = .{ .assistant_message_event = .{ .text_delta = .{
+        .content_index = 0,
+        .delta = "ok\xffdone",
+        .partial = emptyAssistantMessage(&.{}, .stop),
+    } } } });
+
+    const text = transcript.items.items[0].kind.assistant.parts.items[0].text.items;
+    try std.testing.expectEqualStrings("ok�done", text);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(text));
 }
 
 test "transcript incrementally relayouts only the unstable streamed suffix" {
