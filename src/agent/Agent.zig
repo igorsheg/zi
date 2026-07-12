@@ -30,6 +30,7 @@ listeners: std.ArrayList(?Listener) = .empty,
 operations: runtime.OperationIdAllocator = .{},
 cancel_source: runtime.CancelSource,
 active_run: ?runtime.OperationId = null,
+active_run_message_start: usize = 0,
 
 pub const QueueMode = enum {
     all,
@@ -235,6 +236,7 @@ pub fn beginRun(self: *Agent) error{AlreadyRunning}!runtime.CancelToken {
     if (self.active_run != null) return error.AlreadyRunning;
     self.cancel_source.resetAfterDrain();
     self.active_run = self.operations.reserve();
+    self.active_run_message_start = self.state.messages.len;
     self.state.status = .{ .running = .{} };
     return self.cancel_source.token();
 }
@@ -345,23 +347,7 @@ pub fn applyEvent(self: *Agent, event: agent.AgentEvent) !void {
     switch (event) {
         .agent_start, .turn_start => {},
         .message_start => |message_event| try self.setStreamingMessage(message_event.message),
-        .message_update => |message_update| {
-            const partial = switch (message_update.assistant_message_event) {
-                .start => |payload| payload.partial,
-                .text_start => |payload| payload.partial,
-                .text_delta => |payload| payload.partial,
-                .text_end => |payload| payload.partial,
-                .thinking_start => |payload| payload.partial,
-                .thinking_delta => |payload| payload.partial,
-                .thinking_end => |payload| payload.partial,
-                .toolcall_start => |payload| payload.partial,
-                .toolcall_delta => |payload| payload.partial,
-                .toolcall_end => |payload| payload.partial,
-                .done => |payload| payload.message,
-                .@"error" => |payload| payload.@"error",
-            };
-            try self.setStreamingMessage(.{ .assistant = partial });
-        },
+        .message_update => |message_update| try self.setStreamingMessage(message_update.message),
         .message_end => |message_event| {
             self.clearStreamingMessage();
             try self.appendMessage(message_event.message);
@@ -390,8 +376,9 @@ fn recordRunFailure(self: *Agent, token: runtime.CancelToken, message: []const u
     const terminal_message: agent.AgentMessage = .{ .assistant = assistant };
     try self.emitEvent(.{ .message_start = .{ .message = terminal_message } });
     try self.emitEvent(.{ .message_end = .{ .message = terminal_message } });
-    try self.emitEvent(.turn_end);
-    try self.emitEvent(.agent_end);
+    const stored = self.state.messages[self.state.messages.len - 1];
+    try self.emitEvent(.{ .turn_end = .{ .message = stored, .tool_results = &.{} } });
+    try self.emitEvent(.{ .agent_end = .{ .messages = self.state.messages[self.active_run_message_start..] } });
 }
 
 fn terminalAssistantMessage(model: ai.Model, reason: ai.StopReason, error_message: ?[]const u8) ai.AssistantMessage {
@@ -471,7 +458,7 @@ fn emitFromLoop(context: ?*anyopaque, event: agent.AgentEvent) anyerror!void {
     // retain it (applyEvent re-copies what it keeps into the durable or
     // streaming arena). Resetting here drops the previous event's copy.
     _ = self.event_scratch_arena.reset(.retain_capacity);
-    try self.emitEvent(try agent.copyAgentEvent(self.event_scratch_arena.allocator(), event));
+    try self.emitEvent(try agent.loop.copyStreamEvent(self.event_scratch_arena.allocator(), event));
 }
 
 pub fn userMessageFromText(self: *Agent, text: []const u8, images: []const ai.ImageContent) !agent.AgentMessage {
@@ -603,7 +590,7 @@ pub const PendingMessageQueue = struct {
 };
 
 const llm_tool_result_text_bytes_max: usize = 8 * 1024;
-const llm_tool_result_truncated_note = "\n[tool result truncated for model context]";
+const llm_tool_result_truncated_note = "\n[tool result truncated for model context]\n";
 
 fn defaultConvertToLlm(
     allocator: std.mem.Allocator,
@@ -655,11 +642,23 @@ fn compactToolResultForLlm(
 
 fn compactToolResultTextForLlm(allocator: std.mem.Allocator, text: []const u8) std.mem.Allocator.Error![]const u8 {
     if (text.len <= llm_tool_result_text_bytes_max) return allocator.dupe(u8, text);
-    const prefix = agent.utf8Prefix(text, llm_tool_result_text_bytes_max - llm_tool_result_truncated_note.len);
-    const out = try allocator.alloc(u8, prefix.len + llm_tool_result_truncated_note.len);
-    @memcpy(out[0..prefix.len], prefix);
-    @memcpy(out[prefix.len..], llm_tool_result_truncated_note);
+    const content_budget = llm_tool_result_text_bytes_max - llm_tool_result_truncated_note.len;
+    const head_budget = content_budget / 2;
+    const tail_budget = content_budget - head_budget;
+    const head = agent.utf8Prefix(text, head_budget);
+    const tail = utf8Suffix(text, tail_budget);
+    const out = try allocator.alloc(u8, head.len + llm_tool_result_truncated_note.len + tail.len);
+    @memcpy(out[0..head.len], head);
+    @memcpy(out[head.len..][0..llm_tool_result_truncated_note.len], llm_tool_result_truncated_note);
+    @memcpy(out[head.len + llm_tool_result_truncated_note.len ..], tail);
     return out;
+}
+
+fn utf8Suffix(text: []const u8, max_bytes: usize) []const u8 {
+    if (text.len <= max_bytes) return text;
+    var start = text.len - max_bytes;
+    while (start < text.len and !std.unicode.utf8ValidateSlice(text[start..])) start += 1;
+    return text[start..];
 }
 
 test "default llm conversion bounds tool result text" {
@@ -681,8 +680,32 @@ test "default llm conversion bounds tool result text" {
     try std.testing.expect(converted[0] == .tool_result);
     const text = converted[0].tool_result.content[0].text.text;
     try std.testing.expect(text.len <= llm_tool_result_text_bytes_max);
-    try std.testing.expect(std.mem.endsWith(u8, text, llm_tool_result_truncated_note));
+    try std.testing.expect(std.mem.indexOf(u8, text, llm_tool_result_truncated_note) != null);
     try std.testing.expect(converted[0].tool_result.details == null);
+}
+
+test "default llm conversion preserves tail hints in large tool result text" {
+    var source_text_writer = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer source_text_writer.deinit();
+    try source_text_writer.writer.splatByteAll('x', llm_tool_result_text_bytes_max + 100);
+    try source_text_writer.writer.writeAll("\nFull output: /tmp/zi-bash-test.log");
+    const content = [_]ai.ToolResultContent{.{ .text = .{ .text = source_text_writer.written() } }};
+    const source = [_]agent.AgentMessage{.{ .tool_result = .{
+        .tool_call_id = "call-1",
+        .tool_name = "bash",
+        .content = &content,
+        .is_error = false,
+        .timestamp = 0,
+    } }};
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const converted = try defaultConvertToLlm(arena.allocator(), null, &source);
+
+    const text = converted[0].tool_result.content[0].text.text;
+    try std.testing.expect(text.len <= llm_tool_result_text_bytes_max);
+    try std.testing.expect(std.mem.indexOf(u8, text, llm_tool_result_truncated_note) != null);
+    try std.testing.expect(std.mem.endsWith(u8, text, "Full output: /tmp/zi-bash-test.log"));
 }
 
 fn defaultStream(_: ?*anyopaque, request: ai.StreamRequest) ai.AssistantMessageEventStream {
@@ -939,7 +962,7 @@ test "agent end enters settling until finish run" {
     const self = &fixture.agent;
     _ = try self.beginRun();
 
-    try self.emitEvent(.agent_end);
+    try self.emitEvent(.{ .agent_end = .{ .messages = &.{} } });
 
     try std.testing.expect(self.state.isStreaming());
     try std.testing.expect(!self.waitForIdle());
@@ -1092,7 +1115,7 @@ fn compactedToolResultProbeStream(context: ?*anyopaque, request: ai.StreamReques
         const text = message.tool_result.content[0].text.text;
         if (text.len > llm_tool_result_text_bytes_max) probe.saw_raw_large_tool_result = true;
         if (text.len <= llm_tool_result_text_bytes_max and
-            std.mem.endsWith(u8, text, llm_tool_result_truncated_note))
+            std.mem.indexOf(u8, text, llm_tool_result_truncated_note) != null)
         {
             probe.saw_bounded_tool_result = true;
         }

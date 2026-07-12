@@ -271,6 +271,7 @@ pub const Loop = struct {
     }
 
     pub fn deinit(self: *Loop) void {
+        self.state.initialized = false;
         self.backend.deinit();
     }
 
@@ -293,6 +294,7 @@ pub const Loop = struct {
 
     /// Wake up the loop from another thread (thread-safe)
     pub fn wake(self: *Loop) void {
+        if (in_safe_mode and !self.state.initialized) @panic("wake on deinitialized loop");
         // If we're the first to request a wake since the last poll, do the syscall.
         // Subsequent wakers see true and skip - the syscall is already pending.
         if (self.state.wake_requested.fetchOr(LoopState.wake_loop, .acq_rel) == 0) {
@@ -643,21 +645,23 @@ pub const Loop = struct {
 
     /// Linked work context for file operations
     pub const LinkedWorkContext = struct {
-        loop: *Loop,
         linked: *Completion,
+        op_name: []const u8,
     };
 
     /// Completion callback for internal file ops with linked completion
     pub fn loopLinkedWorkComplete(ctx: ?*anyopaque, work: *Work) void {
         const context: *LinkedWorkContext = @ptrCast(@alignCast(ctx));
-        // Propagate cancel error from work to linked completion
+        const linked = context.linked;
+        const loop = linked.loop orelse std.debug.panic("linked {s} work completed without owning loop", .{context.op_name});
+        // Propagate cancel error from work to linked completion.
         if (work.c.err) |err| {
-            if (!context.linked.has_result) {
-                context.linked.setError(err);
+            if (!linked.has_result) {
+                linked.setError(err);
             }
         }
-        context.loop.state.work_completions.push(context.linked);
-        context.loop.wake();
+        loop.state.work_completions.push(linked);
+        loop.wake();
     }
 
     pub fn processAsyncHandles(self: *Loop) void {
@@ -767,8 +771,8 @@ pub const Loop = struct {
                     op_data.internal.allocator = self.allocator;
                 }
                 op_data.internal.linked_context = .{
-                    .loop = self,
                     .linked = completion,
+                    .op_name = @tagName(op),
                 };
                 op_data.internal.work = Work.init(op_func, null);
                 op_data.internal.work.completion_fn = loopLinkedWorkComplete;

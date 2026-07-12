@@ -43,7 +43,15 @@ Use this when the answer is the artifact.
 zi --mode json "inspect this repo"
 ```
 
-JSON mode emits public events as lines.
+JSON mode writes one session header followed by Pi-compatible
+`AgentSessionEvent` objects as NDJSON. It observes the complete session policy
+stream, so automatic retries and compaction can contain multiple agent
+lifecycles before one final `agent_settled` record.
+
+Assistant failures remain JSON events and do not by themselves produce a
+non-zero JSON-mode exit. Operational frontend failures use stderr and a
+non-zero exit. See [JSON event stream](./20-json-events.md) for fields and
+unsupported Pi-only event sources.
 
 Use this when another tool wants progress, not just the final text.
 

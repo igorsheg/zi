@@ -14,8 +14,8 @@ pub const max_timeout_ms = 120_000;
 pub const max_command_bytes = 16 * 1024;
 pub const max_output_preview_bytes = tool_output_policy.default_max_bytes;
 pub const max_output_preview_lines = tool_output_policy.default_max_lines;
-pub const max_stdout_bytes = max_output_preview_bytes * 2;
-pub const max_stderr_bytes = max_output_preview_bytes * 2;
+pub const max_stdout_bytes = 16 * 1024 * 1024;
+pub const max_stderr_bytes = 16 * 1024 * 1024;
 
 const parameters_schema =
     \\{
@@ -66,15 +66,19 @@ pub const BashTool = struct {
         max_timeout_ms: u64 = max_timeout_ms,
         max_stdout_bytes: usize = max_stdout_bytes,
         max_stderr_bytes: usize = max_stderr_bytes,
+        temp_dir: ?[]const u8 = null,
     };
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !BashTool {
         try validateConfig(config);
         const cwd = try allocator.dupe(u8, config.cwd);
         errdefer allocator.free(cwd);
+        const temp_dir = if (config.temp_dir) |path| try allocator.dupe(u8, path) else null;
+        errdefer if (temp_dir) |path| allocator.free(path);
         const parsed_parameters = try runtime.JsonOwned(std.json.Value).parseJson(allocator, parameters_schema, .{});
         var owned_config = config;
         owned_config.cwd = cwd;
+        owned_config.temp_dir = temp_dir;
         return .{
             .allocator = allocator,
             .config = owned_config,
@@ -84,6 +88,7 @@ pub const BashTool = struct {
 
     pub fn deinit(self: *BashTool) void {
         self.allocator.free(self.config.cwd);
+        if (self.config.temp_dir) |path| self.allocator.free(path);
         self.parsed_parameters.deinit();
         self.* = undefined;
     }
@@ -93,7 +98,7 @@ pub const BashTool = struct {
             .name = "bash",
             .description = "Execute a bash command via bash -c in the current working directory. " ++
                 "Falls back to sh only when bash is unavailable on Unix. Returns stdout and stderr. " ++
-                "Output is truncated to last 2000 lines or 50KB.",
+                "Output is truncated to last 2000 lines or 50KB; if truncated, full output is saved to a temp file.",
             .parameters = self.parsed_parameters.value,
             .label = "bash",
             .execution_mode = .sequential,
@@ -109,6 +114,7 @@ fn validateConfig(config: BashTool.Config) !void {
     if (config.timeout_ms > config.max_timeout_ms) return error.InvalidToolConfig;
     if (config.max_stdout_bytes == 0) return error.InvalidToolConfig;
     if (config.max_stderr_bytes == 0) return error.InvalidToolConfig;
+    if (config.temp_dir) |path| if (path.len == 0) return error.InvalidToolConfig;
 }
 
 const Args = struct {
@@ -133,9 +139,11 @@ fn execute(
     var update_context: BashUpdateContext = .{
         .allocator = allocator,
         .on_update = on_update,
-        .output = output_accumulator.OutputAccumulator.init(allocator, .{
+        .output = output_accumulator.OutputAccumulator.init(allocator, io, .{
             .max_bytes = max_output_preview_bytes,
             .max_lines = max_output_preview_lines,
+            .temp_dir = outputTempDir(self.config),
+            .temp_file_prefix = "zi-bash",
         }),
     };
     defer update_context.deinit();
@@ -151,18 +159,18 @@ fn execute(
         error.Timeout => {
             const status = try timeoutStatus(allocator, args.timeout_ms);
             defer allocator.free(status);
-            return resultFromObservedOutput(allocator, update_context.output.snapshot(), status, null, .timeout);
+            return resultFromObservedOutput(allocator, update_context.finalSnapshot(), status, null, .timeout);
         },
         error.OperationCancelled => return resultFromObservedOutput(
             allocator,
-            update_context.output.snapshot(),
+            update_context.finalSnapshot(),
             "Command aborted",
             null,
             .canceled,
         ),
         error.StreamTooLong => return resultFromObservedOutput(
             allocator,
-            update_context.output.snapshot(),
+            update_context.finalSnapshot(),
             "bash output limit exceeded",
             null,
             .output_limit,
@@ -170,8 +178,9 @@ fn execute(
         else => |unexpected| return unexpected,
     };
     defer freeRunResult(allocator, run_result);
+    update_context.output.finish();
     try token.throwIfRequested();
-    return resultFromRun(allocator, run_result, update_context.output.snapshot());
+    return resultFromObservedOutput(allocator, update_context.output.snapshot(), null, run_result.term, null);
 }
 
 fn runProcess(
@@ -191,6 +200,7 @@ fn runProcess(
         .timeout_ms = args.timeout_ms,
         .max_stdout_bytes = config.max_stdout_bytes,
         .max_stderr_bytes = config.max_stderr_bytes,
+        .capture_output = false,
         .cancel_token = token,
         .on_output = .{ .context = update_context, .call_fn = emitBashOutputUpdate },
     }) catch |err| switch (err) {
@@ -202,6 +212,7 @@ fn runProcess(
                 .timeout_ms = args.timeout_ms,
                 .max_stdout_bytes = config.max_stdout_bytes,
                 .max_stderr_bytes = config.max_stderr_bytes,
+                .capture_output = false,
                 .cancel_token = token,
                 .on_output = .{ .context = update_context, .call_fn = emitBashOutputUpdate },
             })
@@ -220,6 +231,11 @@ const BashUpdateContext = struct {
 
     fn append(self: *BashUpdateContext, bytes: []const u8) !void {
         try self.output.append(bytes);
+    }
+
+    fn finalSnapshot(self: *BashUpdateContext) output_accumulator.Snapshot {
+        self.output.finish();
+        return self.output.snapshot();
     }
 
     fn deinit(self: *BashUpdateContext) void {
@@ -242,6 +258,16 @@ fn emitBashOutputUpdate(
     defer self.allocator.free(content);
     content[0] = .{ .text = .{ .text = text } };
     try on_update.call(.{ .content = content });
+}
+
+fn outputTempDir(config: BashTool.Config) []const u8 {
+    if (config.temp_dir) |path| return path;
+    if (config.environ) |environ| {
+        if (environ.get("TMPDIR")) |path| if (std.fs.path.isAbsolute(path)) return path;
+        if (environ.get("TEMP")) |path| if (std.fs.path.isAbsolute(path)) return path;
+        if (environ.get("TMP")) |path| if (std.fs.path.isAbsolute(path)) return path;
+    }
+    return if (builtin.os.tag == .windows) config.cwd else "/tmp";
 }
 
 fn freeRunResult(allocator: std.mem.Allocator, run_result: std.process.RunResult) void {
@@ -309,26 +335,6 @@ const FailureKind = enum {
     canceled,
 };
 
-fn resultFromRun(
-    allocator: std.mem.Allocator,
-    run_result: std.process.RunResult,
-    observed_output: output_accumulator.Snapshot,
-) !agent.ToolExecutionResult {
-    const run_output_bytes = run_result.stdout.len + run_result.stderr.len;
-    if (observed_output.total_bytes > 0 and observed_output.total_bytes == run_output_bytes) {
-        return resultFromObservedOutput(allocator, observed_output, null, run_result.term, null);
-    }
-
-    var writer: std.Io.Writer.Allocating = .init(allocator);
-    defer writer.deinit();
-    if (run_result.stdout.len > 0) try writer.writer.writeAll(run_result.stdout);
-    if (run_result.stderr.len > 0) {
-        if (writer.written().len > 0) try writer.writer.writeByte('\n');
-        try writer.writer.writeAll(run_result.stderr);
-    }
-    return resultFromOutputWithTotals(allocator, writer.written(), null, run_result.term, null, null);
-}
-
 fn resultFromObservedOutput(
     allocator: std.mem.Allocator,
     observed_output: output_accumulator.Snapshot,
@@ -341,6 +347,7 @@ fn resultFromObservedOutput(
         .total_bytes = observed_output.total_bytes,
         .truncated = observed_output.truncated,
         .last_line_partial = observed_output.last_line_partial,
+        .full_output_path = observed_output.full_output_path,
     });
 }
 
@@ -349,6 +356,7 @@ const OutputTotals = struct {
     total_bytes: usize,
     truncated: bool,
     last_line_partial: bool,
+    full_output_path: ?[]const u8 = null,
 };
 
 const OutputFacts = struct {
@@ -358,6 +366,7 @@ const OutputFacts = struct {
     output_lines: usize,
     output_bytes: usize,
     last_line_partial: bool,
+    full_output_path: ?[]const u8 = null,
 };
 
 fn resultFromOutputWithTotals(
@@ -380,6 +389,7 @@ fn resultFromOutputWithTotals(
         .total_bytes = output.len,
         .truncated = preview_truncated,
         .last_line_partial = preview.last_line_partial,
+        .full_output_path = null,
     };
     const facts: OutputFacts = .{
         .truncated = totals.truncated or preview_truncated,
@@ -388,6 +398,7 @@ fn resultFromOutputWithTotals(
         .output_lines = countOutputLines(preview.bytes),
         .output_bytes = preview.bytes.len,
         .last_line_partial = totals.last_line_partial or preview.last_line_partial,
+        .full_output_path = totals.full_output_path,
     };
     const exit_status = if (status) |text|
         try allocator.dupe(u8, text)
@@ -449,15 +460,17 @@ fn appendTruncationFooter(writer: *std.Io.Writer, facts: OutputFacts) !void {
         facts.total_lines - facts.output_lines + 1;
     if (facts.last_line_partial) {
         try writer.print(
-            "\n\n[Showing last {d}KB of line {d} ({d}KB limit)]",
+            "\n\n[Showing last {d}KB of line {d} ({d}KB limit)",
             .{ facts.output_bytes / 1024, facts.total_lines, max_output_preview_bytes / 1024 },
         );
     } else {
         try writer.print(
-            "\n\n[Showing lines {d}-{d} of {d} ({d}KB limit)]",
+            "\n\n[Showing lines {d}-{d} of {d} ({d}KB limit)",
             .{ start_line, facts.total_lines, facts.total_lines, max_output_preview_bytes / 1024 },
         );
     }
+    if (facts.full_output_path) |path| try writer.print(". Full output: {s}", .{path});
+    try writer.writeByte(']');
 }
 
 fn countOutputLines(bytes: []const u8) usize {
@@ -518,6 +531,7 @@ fn resultDetails(
         .stopped = stopped,
         .unknown = unknown,
         .truncation = truncation,
+        .fullOutputPath = facts.full_output_path,
     });
 }
 
@@ -712,7 +726,7 @@ test "bash execute path preserves tail truncation totals" {
 
     var fixture = try test_support.Fixture.init("repo");
     defer fixture.deinit();
-    var tool = try BashTool.init(std.testing.allocator, .{ .cwd = fixture.cwd() });
+    var tool = try BashTool.init(std.testing.allocator, .{ .cwd = fixture.cwd(), .temp_dir = fixture.cwd() });
     defer tool.deinit();
 
     const args = try std.fmt.allocPrint(
@@ -732,6 +746,17 @@ test "bash execute path preserves tail truncation totals" {
     try std.testing.expectEqualStrings("lines", truncation.get("truncatedBy").?.string);
     try std.testing.expectEqual(@as(i64, max_output_preview_lines + 2), truncation.get("totalLines").?.integer);
     try std.testing.expectEqual(@as(i64, max_output_preview_lines), truncation.get("outputLines").?.integer);
+    const full_output_path = result.result.details.?.object.get("fullOutputPath").?.string;
+    try std.testing.expect(std.fs.path.isAbsolute(full_output_path));
+    try std.testing.expect(std.mem.indexOf(u8, result.result.content[0].text.text, "Full output: ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.result.content[0].text.text, full_output_path) != null);
+
+    var file = try std.Io.Dir.openFileAbsolute(std.testing.io, full_output_path, .{});
+    defer file.close(std.testing.io);
+    var prefix: [14]u8 = undefined;
+    const prefix_len = try file.readPositionalAll(std.testing.io, &prefix, 0);
+    try std.testing.expectEqual(@as(usize, prefix.len), prefix_len);
+    try std.testing.expectEqualStrings("line 1\nline 2\n", prefix[0..prefix_len]);
 }
 
 test "bash tool accepts timeout seconds" {

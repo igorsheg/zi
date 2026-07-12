@@ -1,29 +1,15 @@
-//! Small TUI glyph arsenal. Centralizing visible symbols keeps the product
-//! consistent and makes future tweaks one-line changes.
+//! Small TUI glyph vocabulary. Visual policy imports these symbols instead of
+//! scattering Unicode constants through layout and chrome code.
 
-/// Selected picker/list row marker.
 pub const picker_selected = "› ";
-
-/// Unselected picker/list row marker (two spaces, same width as selected).
 pub const picker_unselected = "  ";
-
-/// Separator between status-line contributions.
-pub const status_separator = " · ";
-
-/// Left border of a tool body panel.
 pub const tool_body_prefix = "│ ";
-
-/// Top decorative rail of a tool body panel.
 pub const tool_top_line = "╭───";
-
-/// Bottom decorative rail of a tool body panel.
 pub const tool_bottom_line = "╰───";
 
-/// Left border of a markdown quote block.
-pub const quote_prefix = "│ ";
-
-/// Horizontal rule rendered for markdown `---` / `***` / `___`.
-pub const horizontal_rule = "────────────────" ++
-    "────────────────" ++
-    "────────────────" ++
-    "────────────────";
+pub const composer_top_left = "╭";
+pub const composer_top_right = "╮";
+pub const composer_bottom_left = "╰";
+pub const composer_bottom_right = "╯";
+pub const composer_horizontal = "─";
+pub const composer_vertical = "│";

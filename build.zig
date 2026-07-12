@@ -76,8 +76,21 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&zio_import_check.step);
-    test_step.dependOn(&b.addRunArtifact(lib_tests).step);
-    test_step.dependOn(&b.addRunArtifact(exe_tests).step);
+    // Serialized: the suites contain wall-clock frame-budget tests that flake
+    // when a sibling test binary saturates the machine concurrently.
+    const lib_tests_run = b.addRunArtifact(lib_tests);
+    const exe_tests_run = b.addRunArtifact(exe_tests);
+    exe_tests_run.step.dependOn(&lib_tests_run.step);
+    test_step.dependOn(&exe_tests_run.step);
 
-    _ = b.step("pty-test", "PTY harness removed with TUI reset");
+    const pty_tests = b.addTest(.{
+        .name = "pty-e2e-test",
+        .root_module = zi,
+        .filters = &.{"pty e2e"},
+    });
+    const pty_tests_run = b.addRunArtifact(pty_tests);
+    pty_tests_run.step.dependOn(&zio_import_check.step);
+    pty_tests_run.step.dependOn(b.getInstallStep());
+    pty_tests_run.setEnvironmentVariable("ZI_PTY_E2E_BIN", b.getInstallPath(.bin, "zi"));
+    b.step("pty-test", "Run TUI pty end-to-end tests").dependOn(&pty_tests_run.step);
 }

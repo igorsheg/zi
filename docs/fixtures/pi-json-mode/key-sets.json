@@ -1,0 +1,21 @@
+{
+  "session": ["type", "version", "id", "timestamp", "cwd", "parentSession?"],
+  "agent_start": ["type"],
+  "agent_end": ["type", "messages", "willRetry"],
+  "agent_settled": ["type"],
+  "turn_start": ["type"],
+  "turn_end": ["type", "message", "toolResults"],
+  "message_start": ["type", "message"],
+  "message_update": ["type", "message", "assistantMessageEvent"],
+  "message_end": ["type", "message"],
+  "tool_execution_start": ["type", "toolCallId", "toolName", "args"],
+  "tool_execution_update": ["type", "toolCallId", "toolName", "args", "partialResult"],
+  "tool_execution_end": ["type", "toolCallId", "toolName", "result", "isError"],
+  "queue_update": ["type", "steering", "followUp"],
+  "compaction_start": ["type", "reason"],
+  "compaction_end": ["type", "reason", "result?", "aborted", "willRetry", "errorMessage?"],
+  "compaction_result": ["summary", "firstKeptEntryId", "tokensBefore", "estimatedTokensAfter?", "details?"],
+  "auto_retry_start": ["type", "attempt", "maxAttempts", "delayMs", "errorMessage"],
+  "auto_retry_end": ["type", "success", "attempt", "finalError?"],
+  "thinking_level_changed": ["type", "level"]
+}

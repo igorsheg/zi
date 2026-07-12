@@ -231,7 +231,7 @@ pub fn handleFileSetTimestamps(c: *Completion) void {
 pub fn fileOpenWork(work: *Work) void {
     const internal: *@FieldType(FileOpen, "internal") = @fieldParentPtr("work", work);
     const file_open: *FileOpen = @fieldParentPtr("internal", internal);
-    const loop = internal.linked_context.loop;
+    const loop = file_open.c.loop orelse @panic("file open work without owning loop");
 
     if (@TypeOf(loop.backend).capabilities.supportsNonBlockingFileIo()) {
         file_open.flags.nonblocking = true;
@@ -257,7 +257,7 @@ pub fn fileOpenWork(work: *Work) void {
 pub fn fileCreateWork(work: *Work) void {
     const internal: *@FieldType(FileCreate, "internal") = @fieldParentPtr("work", work);
     const file_create: *FileCreate = @fieldParentPtr("internal", internal);
-    const loop = internal.linked_context.loop;
+    const loop = file_create.c.loop orelse @panic("file create work without owning loop");
 
     if (@TypeOf(loop.backend).capabilities.supportsNonBlockingFileIo()) {
         file_create.flags.nonblocking = true;

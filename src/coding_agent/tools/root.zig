@@ -7,7 +7,6 @@ const output_accumulator = @import("output_accumulator.zig");
 const output_tail = @import("output_tail.zig");
 const path_utils = @import("path_utils.zig");
 const read = @import("read.zig");
-const symbols = @import("symbols.zig");
 const write = @import("write.zig");
 
 test {
@@ -20,6 +19,5 @@ test {
     _ = output_tail;
     _ = path_utils;
     _ = read;
-    _ = symbols;
     _ = write;
 }

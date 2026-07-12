@@ -30,6 +30,7 @@ pub const AppArgs = struct {
     help: bool = false,
     version: bool = false,
     print: bool = false,
+    no_session: bool = false,
     mode: ?OutputMode = null,
     session_selector: ?[]const u8 = null,
     continue_latest: bool = false,
@@ -95,6 +96,7 @@ const AppFlagTarget = enum {
     help,
     version,
     print,
+    no_session,
     mode,
     resume_picker,
     session,
@@ -116,6 +118,11 @@ const app_flags = [_]AppFlagSpec{
         .short = "p",
         .target = .print,
         .help = "Non-interactive mode: process prompt and exit",
+    },
+    .{
+        .long = "no-session",
+        .target = .no_session,
+        .help = "Do not save session history",
     },
     .{
         .long = "mode",
@@ -288,25 +295,33 @@ fn hasResumePolicy(result: AppArgs) bool {
     return result.session_selector != null or result.continue_latest or result.resume_picker;
 }
 
+fn hasSessionConflict(result: AppArgs) bool {
+    return result.no_session or hasResumePolicy(result);
+}
+
 fn applyAppFlag(result: *AppArgs, spec: AppFlagSpec, value: ?[]const u8) ParseError!void {
     switch (spec.target) {
         .help => result.help = true,
         .version => result.version = true,
         .print => result.print = true,
+        .no_session => {
+            if (hasResumePolicy(result.*)) return error.InvalidOptionValue;
+            result.no_session = true;
+        },
         .mode => result.mode = std.meta.stringToEnum(OutputMode, value orelse return error.MissingOptionValue) orelse
             return error.InvalidOptionValue,
         .resume_picker => {
-            if (hasResumePolicy(result.*)) return error.InvalidOptionValue;
+            if (hasSessionConflict(result.*)) return error.InvalidOptionValue;
             result.resume_picker = true;
         },
         .session => {
-            if (hasResumePolicy(result.*)) return error.InvalidOptionValue;
+            if (hasSessionConflict(result.*)) return error.InvalidOptionValue;
             const session = value orelse return error.MissingOptionValue;
             if (session.len == 0) return error.InvalidOptionValue;
             result.session_selector = session;
         },
         .continue_latest => {
-            if (hasResumePolicy(result.*)) return error.InvalidOptionValue;
+            if (hasSessionConflict(result.*)) return error.InvalidOptionValue;
             result.continue_latest = true;
         },
     }
@@ -442,6 +457,11 @@ test "parses continue latest" {
     try std.testing.expect(!app.resume_picker);
 }
 
+test "parses no-session" {
+    const app = (try parse(&.{"--no-session"})).app;
+    try std.testing.expect(app.no_session);
+}
+
 test "parses resume and continue short flags" {
     try std.testing.expect((try parse(&.{"-r"})).app.resume_picker);
     try std.testing.expect((try parse(&.{"-c"})).app.continue_latest);
@@ -454,6 +474,13 @@ test "rejects duplicate resume policy" {
     try std.testing.expectError(error.InvalidOptionValue, parse(&.{ "--continue", "--continue" }));
     try std.testing.expectError(error.InvalidOptionValue, parse(&.{ "--resume", "--continue" }));
     try std.testing.expectError(error.InvalidOptionValue, parse(&.{ "--resume", "--session", "a.jsonl" }));
+}
+
+test "rejects no-session with resume policy" {
+    try std.testing.expectError(error.InvalidOptionValue, parse(&.{ "--no-session", "--session", "a.jsonl" }));
+    try std.testing.expectError(error.InvalidOptionValue, parse(&.{ "--session", "a.jsonl", "--no-session" }));
+    try std.testing.expectError(error.InvalidOptionValue, parse(&.{ "--no-session", "--continue" }));
+    try std.testing.expectError(error.InvalidOptionValue, parse(&.{ "--resume", "--no-session" }));
 }
 
 test "usage includes session forms" {
@@ -519,6 +546,7 @@ test "writes generated help from specs" {
     const output = writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, output, "zi [options] [prompt]") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "--print") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "--no-session") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "zi auth status openai-codex") != null);
 }
 

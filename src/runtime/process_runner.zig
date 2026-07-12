@@ -14,6 +14,7 @@ pub const RunOptions = struct {
     termination_grace_ms: u64 = 100,
     max_stdout_bytes: usize,
     max_stderr_bytes: usize,
+    capture_output: bool = true,
     cancel_token: ?cancel.CancelToken = null,
     on_output: ?OutputObserver = null,
 };
@@ -53,8 +54,17 @@ const OutputBuffer = struct {
     bytes: ByteBuilder,
     io: std.Io,
     wake: *WakeEvent,
+    max_bytes: usize,
+    capture_output: bool,
+    total_bytes: usize = 0,
     limit_exceeded: bool = false,
     err: ?anyerror = null,
+
+    fn append(self: *OutputBuffer, bytes: []const u8) !void {
+        self.total_bytes += bytes.len;
+        if (self.total_bytes > self.max_bytes) return error.CapacityExceeded;
+        if (self.capture_output) try self.bytes.append(bytes);
+    }
 
     fn fault(self: *OutputBuffer) void {
         self.wake.set(self.io);
@@ -99,6 +109,7 @@ fn ResultSlot(comptime Result: type) type {
 const ProcessWaitSlot = ResultSlot(ProcessWaitResult);
 const TimeoutSlot = ResultSlot(TimeoutResult);
 const CancelSlot = ResultSlot(CancelWaitResult);
+const ReaderSlot = ResultSlot(void);
 const OutputChunkQueue = std.Io.Queue(OutputChunk);
 
 fn publishProcessWait(slot: *ProcessWaitSlot, io: std.Io, child: *std.process.Child) void {
@@ -151,16 +162,22 @@ pub fn run(
         .bytes = ByteBuilder.initBounded(allocator, options.max_stdout_bytes),
         .io = io,
         .wake = &owner_wake,
+        .max_bytes = options.max_stdout_bytes,
+        .capture_output = options.capture_output,
     };
     defer stdout_buffer.deinit();
     var stderr_buffer: OutputBuffer = .{
         .bytes = ByteBuilder.initBounded(allocator, options.max_stderr_bytes),
         .io = io,
         .wake = &owner_wake,
+        .max_bytes = options.max_stderr_bytes,
+        .capture_output = options.capture_output,
     };
     defer stderr_buffer.deinit();
 
+    var stdout_slot: ReaderSlot = .{ .io = io, .wake = &owner_wake };
     var stdout_reader = try std.Io.concurrent(io, readPipeToBuffer, .{
+        &stdout_slot,
         io,
         stdout_file,
         &stdout_buffer,
@@ -169,7 +186,9 @@ pub fn run(
         &owner_wake,
     });
     defer stdout_reader.cancel(io);
+    var stderr_slot: ReaderSlot = .{ .io = io, .wake = &owner_wake };
     var stderr_reader = try std.Io.concurrent(io, readPipeToBuffer, .{
+        &stderr_slot,
         io,
         stderr_file,
         &stderr_buffer,
@@ -216,7 +235,16 @@ pub fn run(
 
         if (process_slot.isReady()) {
             process_wait.await(io);
-            break try completeProcessWait(process_slot.result, &process_wait_state);
+            const completed_term = try completeProcessWait(process_slot.result, &process_wait_state);
+            try drainReadersAfterProcessExit(
+                io,
+                options.on_output,
+                &output_chunks,
+                &owner_wake,
+                &stdout_slot,
+                &stderr_slot,
+            );
+            break completed_term;
         }
 
         if (timeout_slot.isReady()) {
@@ -339,6 +367,26 @@ fn drainOutputChunks(io: std.Io, observer: ?OutputObserver, output_chunks: *Outp
     }
 }
 
+fn drainReadersAfterProcessExit(
+    io: std.Io,
+    observer: ?OutputObserver,
+    output_chunks: *OutputChunkQueue,
+    wake: *WakeEvent,
+    stdout_slot: *const ReaderSlot,
+    stderr_slot: *const ReaderSlot,
+) !void {
+    while (true) {
+        try drainOutputChunks(io, observer, output_chunks);
+        if (stdout_slot.isReady() and stderr_slot.isReady()) return;
+
+        wake.reset();
+        try drainOutputChunks(io, observer, output_chunks);
+        if (stdout_slot.isReady() and stderr_slot.isReady()) return;
+
+        try wake.wait(io);
+    }
+}
+
 fn terminateAndDrainProcess(
     io: std.Io,
     child: *std.process.Child,
@@ -389,6 +437,7 @@ fn requestChildTermination(process_id: ?std.process.Child.Id, mode: TerminationM
 }
 
 fn readPipeToBuffer(
+    done: *ReaderSlot,
     io: std.Io,
     file: std.Io.File,
     output: *OutputBuffer,
@@ -396,6 +445,7 @@ fn readPipeToBuffer(
     chunks: *OutputChunkQueue,
     wake: *WakeEvent,
 ) void {
+    defer done.complete({});
     var owned_file = file;
     defer owned_file.close(io);
     var buffer: [4096]u8 = undefined;
@@ -412,7 +462,7 @@ fn readPipeToBuffer(
                 return;
             },
         };
-        output.bytes.append(buffer[0..count]) catch |err| switch (err) {
+        output.append(buffer[0..count]) catch |err| switch (err) {
             error.CapacityExceeded => {
                 output.limit_exceeded = true;
                 output.fault();
@@ -619,6 +669,31 @@ test "process runner drains queued output to observer after fast process exit" {
     try std.testing.expectEqual(@as(usize, 512 * 16), capture.stderr.written().len);
 }
 
+test "process runner can stream output without retaining stdout or stderr" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var task_runtime = try Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
+    var capture = OutputObserverCapture.init(std.testing.allocator);
+    defer capture.deinit();
+    const argv = [_][]const u8{ "/bin/sh", "-c", "printf stdout; printf stderr >&2" };
+
+    const result = try run(std.testing.allocator, task_runtime.io(), task_runtime, .{
+        .argv = &argv,
+        .timeout_ms = 1_000,
+        .max_stdout_bytes = 1024,
+        .max_stderr_bytes = 1024,
+        .capture_output = false,
+        .on_output = .{ .context = &capture, .call_fn = captureProcessOutput },
+    });
+    defer freeRunResult(std.testing.allocator, result);
+
+    try std.testing.expectEqualStrings("", result.stdout);
+    try std.testing.expectEqualStrings("", result.stderr);
+    try std.testing.expectEqualStrings("stdout", capture.stdout.written());
+    try std.testing.expectEqualStrings("stderr", capture.stderr.written());
+}
+
 test "process runner kills child when stdout bound is exceeded" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
 
@@ -670,7 +745,7 @@ test "process runner kills child when output allocation fails" {
     defer task_runtime.deinit();
     var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{
         .fail_index = 0,
-        .resize_fail_index = std.math.maxInt(usize),
+        .resize_fail_index = 0,
     });
     const argv = [_][]const u8{
         "/bin/sh",

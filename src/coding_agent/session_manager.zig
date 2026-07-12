@@ -23,7 +23,7 @@ pub const max_thinking_level_bytes = 32;
 pub const max_compaction_keep_recent_tokens = 1_000_000;
 pub const max_compaction_reserve_tokens = 1_000_000;
 pub const max_compaction_serialized_input_bytes = 512 * 1024;
-pub const max_compaction_tool_result_chars = 16 * 1024;
+pub const max_compaction_tool_result_chars = 2_000;
 pub const timestamp_bytes_len: usize = 20;
 
 pub fn timestampFromNanoseconds(nanoseconds: i96) [timestamp_bytes_len]u8 {
@@ -50,12 +50,52 @@ pub fn timestampNow(io: std.Io) [timestamp_bytes_len]u8 {
     return timestampFromNanoseconds(std.Io.Timestamp.now(io, .real).nanoseconds);
 }
 
+pub const SessionStamp = struct {
+    text: [timestamp_bytes_len]u8,
+    nanoseconds: i96,
+
+    pub fn now(io: std.Io) SessionStamp {
+        const nanoseconds = std.Io.Timestamp.now(io, .real).nanoseconds;
+        return .{
+            .text = timestampFromNanoseconds(nanoseconds),
+            .nanoseconds = nanoseconds,
+        };
+    }
+
+    pub fn date(self: *const SessionStamp) []const u8 {
+        return self.text[0..10];
+    }
+
+    pub fn timestamp(self: *const SessionStamp) []const u8 {
+        return &self.text;
+    }
+};
+
 pub const SessionHeader = struct {
     version: u32 = current_session_version,
     id: []const u8,
     timestamp: []const u8,
     cwd: []const u8,
     parent_session: ?[]const u8 = null,
+
+    pub fn jsonStringify(self: SessionHeader, stringify: *std.json.Stringify) !void {
+        try stringify.beginObject();
+        try stringify.objectField("type");
+        try stringify.write("session");
+        try stringify.objectField("version");
+        try stringify.write(self.version);
+        try stringify.objectField("id");
+        try stringify.write(self.id);
+        try stringify.objectField("timestamp");
+        try stringify.write(self.timestamp);
+        try stringify.objectField("cwd");
+        try stringify.write(self.cwd);
+        if (self.parent_session) |parent_session| {
+            try stringify.objectField("parentSession");
+            try stringify.write(parent_session);
+        }
+        try stringify.endObject();
+    }
 };
 
 pub const CompactionSettings = struct {
@@ -164,74 +204,151 @@ pub const CompactionSummaryInput = struct {
     pub fn serializeTurnPrefix(self: CompactionSummaryInput, allocator: std.mem.Allocator) SerializeError![]const u8 {
         var writer: std.Io.Writer.Allocating = .init(allocator);
         errdefer writer.deinit();
-        try appendBounded(&writer, "<turn-prefix>\n");
+        try appendBounded(&writer, "<conversation>\n");
         try serializeMessages(&writer, self.turn_prefix_messages);
-        try appendBounded(&writer, "\n</turn-prefix>\n");
+        try appendBounded(&writer, "\n</conversation>\n");
         return writer.toOwnedSlice();
     }
 
     fn serializeMessages(writer: *std.Io.Writer.Allocating, messages: []const agent.AgentMessage) SerializeError!void {
-        for (messages, 0..) |message, index| {
-            if (index > 0) try appendBounded(writer, "\n\n");
-            try serializeMessage(writer, message);
-        }
+        var part_count: usize = 0;
+        for (messages) |message| try serializeMessage(writer, message, &part_count);
     }
 
-    fn serializeMessage(writer: *std.Io.Writer.Allocating, message: agent.AgentMessage) SerializeError!void {
+    fn beginPart(writer: *std.Io.Writer.Allocating, part_count: *usize, label: []const u8) SerializeError!void {
+        if (part_count.* > 0) try appendBounded(writer, "\n\n");
+        try appendBounded(writer, label);
+        part_count.* += 1;
+    }
+
+    fn serializeMessage(
+        writer: *std.Io.Writer.Allocating,
+        message: agent.AgentMessage,
+        part_count: *usize,
+    ) SerializeError!void {
         switch (message) {
-            .user => |user| {
-                try appendBounded(writer, "[User]: ");
-                switch (user.content) {
-                    .string => |text| try appendBounded(writer, text),
-                    .blocks => |blocks| for (blocks) |block| switch (block) {
-                        .text => |text| try appendBounded(writer, text.text),
-                        .image => try appendBounded(writer, "[image]"),
-                    },
-                }
+            .user => |user| switch (user.content) {
+                .string => |text| if (text.len > 0) {
+                    try beginPart(writer, part_count, "[User]: ");
+                    try appendBounded(writer, text);
+                },
+                .blocks => |blocks| {
+                    var has_text = false;
+                    for (blocks) |block| if (block == .text and block.text.text.len > 0) {
+                        has_text = true;
+                        break;
+                    };
+                    if (has_text) {
+                        try beginPart(writer, part_count, "[User]: ");
+                        for (blocks) |block| if (block == .text) try appendBounded(writer, block.text.text);
+                    }
+                },
             },
             .assistant => |assistant| {
-                var wrote_any = false;
-                for (assistant.content) |block| {
-                    if (wrote_any) try appendBounded(writer, "\n");
-                    switch (block) {
-                        .thinking => |thinking| {
-                            try appendBounded(writer, "[Assistant thinking]: ");
-                            try appendBounded(writer, thinking.thinking);
-                        },
-                        .text => |text| {
-                            try appendBounded(writer, "[Assistant]: ");
-                            try appendBounded(writer, text.text);
-                        },
-                        .tool_call => |tool_call| {
-                            try appendBounded(writer, "[Assistant tool call]: ");
-                            try appendBounded(writer, tool_call.name);
-                        },
-                    }
-                    wrote_any = true;
+                var has_thinking = false;
+                var has_text = false;
+                var has_tool_calls = false;
+                for (assistant.content) |block| switch (block) {
+                    .thinking => |thinking| has_thinking = has_thinking or thinking.thinking.len > 0,
+                    .text => |text| has_text = has_text or text.text.len > 0,
+                    .tool_call => has_tool_calls = true,
+                };
+                if (has_thinking) {
+                    try beginPart(writer, part_count, "[Assistant thinking]: ");
+                    var wrote_block = false;
+                    for (assistant.content) |block| if (block == .thinking and block.thinking.thinking.len > 0) {
+                        if (wrote_block) try appendBounded(writer, "\n");
+                        try appendBounded(writer, block.thinking.thinking);
+                        wrote_block = true;
+                    };
+                }
+                if (has_text) {
+                    try beginPart(writer, part_count, "[Assistant]: ");
+                    var wrote_block = false;
+                    for (assistant.content) |block| if (block == .text and block.text.text.len > 0) {
+                        if (wrote_block) try appendBounded(writer, "\n");
+                        try appendBounded(writer, block.text.text);
+                        wrote_block = true;
+                    };
+                }
+                if (has_tool_calls) {
+                    try beginPart(writer, part_count, "[Assistant tool calls]: ");
+                    var wrote_call = false;
+                    for (assistant.content) |block| if (block == .tool_call) {
+                        if (wrote_call) try appendBounded(writer, "; ");
+                        try serializeToolCall(writer, block.tool_call);
+                        wrote_call = true;
+                    };
                 }
             },
             .tool_result => |tool_result| {
-                try appendBounded(writer, "[Tool result]: ");
-                var remaining: usize = max_compaction_tool_result_chars;
-                for (tool_result.content) |block| switch (block) {
-                    .text => |text| {
-                        const len = @min(remaining, text.text.len);
-                        try appendBounded(writer, text.text[0..len]);
-                        remaining -= len;
-                        if (remaining == 0) {
-                            try appendBounded(writer, "\n[truncated]");
-                            return;
-                        }
-                    },
-                    .image => try appendBounded(writer, "[image]"),
+                var content_chars: usize = 0;
+                for (tool_result.content) |block| if (block == .text) {
+                    content_chars +|= std.unicode.utf8CountCodepoints(block.text.text) catch block.text.text.len;
                 };
+                if (content_chars == 0) return;
+                try beginPart(writer, part_count, "[Tool result]: ");
+                var remaining: usize = max_compaction_tool_result_chars;
+                for (tool_result.content) |block| {
+                    if (block != .text or remaining == 0) continue;
+                    const prefix = utf8CodepointPrefix(block.text.text, remaining);
+                    try appendBounded(writer, prefix);
+                    remaining -= std.unicode.utf8CountCodepoints(prefix) catch prefix.len;
+                }
+                if (content_chars > max_compaction_tool_result_chars) {
+                    var marker_buffer: [96]u8 = undefined;
+                    const marker = std.fmt.bufPrint(
+                        &marker_buffer,
+                        "\n\n[... {d} more characters truncated]",
+                        .{content_chars - max_compaction_tool_result_chars},
+                    ) catch unreachable;
+                    try appendBounded(writer, marker);
+                }
             },
             .custom => |custom| {
-                try appendBounded(writer, "[Custom ");
+                try beginPart(writer, part_count, "[Custom ");
                 try appendBounded(writer, custom.kind);
                 try appendBounded(writer, "]");
             },
         }
+    }
+
+    fn utf8CodepointPrefix(text: []const u8, max_codepoints: usize) []const u8 {
+        const view = std.unicode.Utf8View.init(text) catch return text[0..@min(text.len, max_codepoints)];
+        var iterator = view.iterator();
+        var count: usize = 0;
+        while (count < max_codepoints) : (count += 1) {
+            if (iterator.nextCodepointSlice() == null) break;
+        }
+        return text[0..iterator.i];
+    }
+
+    fn serializeToolCall(writer: *std.Io.Writer.Allocating, tool_call: ai.ToolCall) SerializeError!void {
+        try appendBounded(writer, tool_call.name);
+        try appendBounded(writer, "(");
+        if (tool_call.arguments == .object) {
+            var iterator = tool_call.arguments.object.iterator();
+            var wrote_argument = false;
+            while (iterator.next()) |entry| {
+                if (wrote_argument) try appendBounded(writer, ", ");
+                try appendBounded(writer, entry.key_ptr.*);
+                try appendBounded(writer, "=");
+                var counting: std.Io.Writer.Discarding = .init(&.{});
+                try std.json.Stringify.value(entry.value_ptr.*, .{}, &counting.writer);
+                const value_bytes = counting.fullCount();
+                if (value_bytes > max_compaction_serialized_input_bytes or
+                    writer.written().len > max_compaction_serialized_input_bytes - @as(usize, @intCast(value_bytes)))
+                {
+                    return error.CompactionSerializedInputTooLarge;
+                }
+                var value_writer: std.Io.Writer.Allocating = .init(writer.allocator);
+                defer value_writer.deinit();
+                try std.json.Stringify.value(entry.value_ptr.*, .{}, &value_writer.writer);
+                try appendBounded(writer, value_writer.written());
+                wrote_argument = true;
+            }
+        }
+        try appendBounded(writer, ")");
     }
 
     fn appendBounded(writer: *std.Io.Writer.Allocating, text: []const u8) SerializeError!void {
@@ -260,6 +377,7 @@ pub const SessionManager = struct {
         CompactionFirstKeptEntryIdTooLarge,
         CompactionFirstKeptEntryNotFound,
         CompactionSettingsOutOfBounds,
+        CompactionSerializedInputTooLarge,
     } || std.mem.Allocator.Error;
 
     pub const SessionPreferences = struct {
@@ -523,6 +641,54 @@ pub const SessionManager = struct {
         self.next_id = @max(self.next_id, numeric_id +| 1);
     }
 
+    pub const ProjectedSessionIterator = struct {
+        manager: *const SessionManager,
+        next_index: usize,
+        compaction_index: ?usize,
+        emitted_summary: bool = false,
+
+        fn init(manager: *const SessionManager) ProjectedSessionIterator {
+            var latest_compaction_index: ?usize = null;
+            for (manager.entries.items, 0..) |entry, index| {
+                if (entry == .compaction) latest_compaction_index = index;
+            }
+            var start: usize = 0;
+            if (latest_compaction_index) |index| {
+                const compaction = manager.entries.items[index].compaction;
+                start = manager.findEntryIndex(compaction.first_kept_entry_id) orelse index + 1;
+            }
+            return .{ .manager = manager, .next_index = start, .compaction_index = latest_compaction_index };
+        }
+
+        pub fn next(self: *ProjectedSessionIterator) ?ReconstructedSessionItem {
+            if (!self.emitted_summary) {
+                self.emitted_summary = true;
+                if (self.compaction_index) |index| {
+                    const compaction = self.manager.entries.items[index].compaction;
+                    return .{
+                        .entry_id = compaction.base.id,
+                        .timestamp = compaction.base.timestamp,
+                        .content = .{ .compaction_summary = .{
+                            .summary = compaction.summary,
+                            .tokens_before = compaction.tokens_before,
+                        } },
+                    };
+                }
+            }
+            while (self.next_index < self.manager.entries.items.len) : (self.next_index += 1) {
+                const entry = self.manager.entries.items[self.next_index];
+                if (entry != .message) continue;
+                self.next_index += 1;
+                return .{
+                    .entry_id = entry.message.base.id,
+                    .timestamp = entry.message.base.timestamp,
+                    .content = .{ .message = entry.message.message },
+                };
+            }
+            return null;
+        }
+    };
+
     /// Project the entries into the agent's runtime context: the latest
     /// compaction summary (if any), the kept tail before it, then everything
     /// after it. The caller owns the returned messages.
@@ -530,9 +696,8 @@ pub const SessionManager = struct {
         var messages = std.ArrayList(agent.AgentMessage).empty;
         errdefer freeContextMessages(allocator, &messages);
 
-        const items = try self.reconstructSession(allocator);
-        defer allocator.free(items);
-        for (items) |item| switch (item.content) {
+        var projection = self.projectSession();
+        while (projection.next()) |item| switch (item.content) {
             .compaction_summary => |summary| {
                 const summary_text = try std.fmt.allocPrint(
                     allocator,
@@ -555,6 +720,10 @@ pub const SessionManager = struct {
         return messages.toOwnedSlice(allocator);
     }
 
+    pub fn projectSession(self: *const SessionManager) ProjectedSessionIterator {
+        return ProjectedSessionIterator.init(self);
+    }
+
     /// Rebuild the durable session transcript view. The returned slice is owned
     /// by the caller; item payloads borrow from this manager.
     pub fn reconstructSession(
@@ -563,35 +732,8 @@ pub const SessionManager = struct {
     ) Error![]ReconstructedSessionItem {
         var items = std.ArrayList(ReconstructedSessionItem).empty;
         errdefer items.deinit(allocator);
-
-        const entries = self.entries.items;
-        var latest_compaction_index: ?usize = null;
-        for (entries, 0..) |entry, index| {
-            if (entry == .compaction) latest_compaction_index = index;
-        }
-
-        var start: usize = 0;
-        if (latest_compaction_index) |compaction_index| {
-            const compaction = entries[compaction_index].compaction;
-            try items.append(allocator, .{
-                .entry_id = compaction.base.id,
-                .timestamp = compaction.base.timestamp,
-                .content = .{ .compaction_summary = .{
-                    .summary = compaction.summary,
-                    .tokens_before = compaction.tokens_before,
-                } },
-            });
-            start = self.findEntryIndex(compaction.first_kept_entry_id) orelse compaction_index + 1;
-        }
-
-        for (entries[start..]) |entry| {
-            if (entry != .message) continue;
-            try items.append(allocator, .{
-                .entry_id = entry.message.base.id,
-                .timestamp = entry.message.base.timestamp,
-                .content = .{ .message = entry.message.message },
-            });
-        }
+        var projection = self.projectSession();
+        while (projection.next()) |item| try items.append(allocator, item);
         return items.toOwnedSlice(allocator);
     }
 
@@ -621,7 +763,10 @@ pub const SessionManager = struct {
     }
 
     /// Choose a compaction cut and gather the messages to summarize.
-    /// Errors with NothingToCompact / AlreadyCompacted when there is no work.
+    /// The Pi-compatible token cut is adjusted toward the previous boundary
+    /// when needed so both summary requests remain within Zi's byte cap.
+    /// Errors with NothingToCompact / AlreadyCompacted when there is no work;
+    /// SerializedInputTooLarge means no non-tool-result cut can fit.
     pub fn buildCompactionSummaryInput(
         self: *const SessionManager,
         allocator: std.mem.Allocator,
@@ -651,9 +796,18 @@ pub const SessionManager = struct {
             }
         }
 
-        // Cut so the kept suffix holds at least keep_recent_tokens. Only a
-        // non-tool-result message is a valid cut point.
-        const cut_point = findCompactionCutPoint(entries, boundary_start, entries.len, settings.keep_recent_tokens);
+        // Start with Pi's token-based cut. Zi additionally keeps the request
+        // bounded: if that prefix does not serialize within the cap, retain
+        // more history at the nearest earlier valid cut point until it does.
+        const token_cut = findCompactionCutPoint(entries, boundary_start, entries.len, settings.keep_recent_tokens);
+        if (token_cut.first_kept_index <= boundary_start) return error.NothingToCompact;
+        const cut_point = try fitCompactionCutPoint(
+            allocator,
+            entries,
+            boundary_start,
+            token_cut,
+            previous_summary_text,
+        );
         const cut_index = cut_point.first_kept_index;
         if (cut_index <= boundary_start) return error.NothingToCompact;
 
@@ -684,8 +838,7 @@ pub const SessionManager = struct {
         const previous_summary = if (previous_summary_text) |text| try allocator.dupe(u8, text) else null;
         errdefer if (previous_summary) |summary| allocator.free(summary);
 
-        var tokens_before: u64 = 0;
-        for (entries) |entry| tokens_before +|= estimateEntryTokens(entry);
+        const tokens_before = self.estimateContextTokens();
 
         return .{
             .allocator = allocator,
@@ -700,9 +853,200 @@ pub const SessionManager = struct {
 
     const CompactionCutPoint = struct {
         first_kept_index: usize,
+        cut_message_index: usize,
         turn_start_index: ?usize = null,
         is_split_turn: bool = false,
     };
+
+    const SerializedStats = struct {
+        bytes: u64 = 0,
+        parts: u64 = 0,
+
+        fn add(lhs: SerializedStats, rhs: SerializedStats) SerializedStats {
+            return .{
+                .bytes = lhs.bytes +| rhs.bytes,
+                .parts = lhs.parts +| rhs.parts,
+            };
+        }
+
+        fn subtract(end: SerializedStats, start: SerializedStats) SerializedStats {
+            return .{
+                .bytes = end.bytes - start.bytes,
+                .parts = end.parts - start.parts,
+            };
+        }
+    };
+
+    fn fitCompactionCutPoint(
+        allocator: std.mem.Allocator,
+        entries: []const SessionEntry,
+        start_index: usize,
+        token_cut: CompactionCutPoint,
+        previous_summary: ?[]const u8,
+    ) Error!CompactionCutPoint {
+        const prefixes = try allocator.alloc(SerializedStats, entries.len + 1);
+        defer allocator.free(prefixes);
+        prefixes[0] = .{};
+        for (entries, 0..) |entry, index| {
+            const stats = if (entry == .message)
+                serializedMessageStats(entry.message.message)
+            else
+                SerializedStats{};
+            prefixes[index + 1] = prefixes[index].add(stats);
+        }
+
+        var candidate = token_cut;
+        while (candidate.first_kept_index > start_index) {
+            if (compactionCutFits(prefixes, start_index, candidate, previous_summary)) return candidate;
+
+            var previous_index = candidate.cut_message_index;
+            while (previous_index > start_index) {
+                previous_index -= 1;
+                if (isValidCompactionCut(entries[previous_index])) break;
+            }
+            if (previous_index <= start_index or !isValidCompactionCut(entries[previous_index])) break;
+            candidate = compactionCutPointAt(entries, start_index, previous_index);
+        }
+        return error.CompactionSerializedInputTooLarge;
+    }
+
+    fn compactionCutFits(
+        prefixes: []const SerializedStats,
+        start_index: usize,
+        cut: CompactionCutPoint,
+        previous_summary: ?[]const u8,
+    ) bool {
+        const history_end = if (cut.is_split_turn) cut.turn_start_index.? else cut.first_kept_index;
+        var history_bytes = serializedConversationBytes(prefixes, start_index, history_end);
+        if (previous_summary) |summary| {
+            history_bytes +|= "\n<previous-summary>\n".len +|
+                summary.len +|
+                "\n</previous-summary>\n".len;
+        }
+        if (history_bytes > max_compaction_serialized_input_bytes) return false;
+        if (!cut.is_split_turn) return true;
+        return serializedConversationBytes(
+            prefixes,
+            cut.turn_start_index.?,
+            cut.first_kept_index,
+        ) <= max_compaction_serialized_input_bytes;
+    }
+
+    fn serializedConversationBytes(
+        prefixes: []const SerializedStats,
+        start_index: usize,
+        end_index: usize,
+    ) u64 {
+        const stats = prefixes[end_index].subtract(prefixes[start_index]);
+        const separators = if (stats.parts > 0) (stats.parts - 1) * 2 else 0;
+        return "<conversation>\n".len +| stats.bytes +| separators +| "\n</conversation>\n".len;
+    }
+
+    fn serializedMessageStats(message: agent.AgentMessage) SerializedStats {
+        var stats: SerializedStats = .{};
+        switch (message) {
+            .user => |user| switch (user.content) {
+                .string => |text| {
+                    if (text.len > 0) stats = .{ .bytes = "[User]: ".len + text.len, .parts = 1 };
+                },
+                .blocks => |blocks| {
+                    var text_bytes: u64 = 0;
+                    for (blocks) |block| {
+                        if (block == .text) text_bytes +|= block.text.text.len;
+                    }
+                    if (text_bytes > 0) stats = .{ .bytes = "[User]: ".len +| text_bytes, .parts = 1 };
+                },
+            },
+            .assistant => |assistant| {
+                var thinking_bytes: u64 = 0;
+                var thinking_count: u64 = 0;
+                var text_bytes: u64 = 0;
+                var text_count: u64 = 0;
+                var tool_call_bytes: u64 = 0;
+                var tool_call_count: u64 = 0;
+                for (assistant.content) |block| switch (block) {
+                    .thinking => |thinking| {
+                        if (thinking.thinking.len > 0) {
+                            thinking_bytes +|= thinking.thinking.len;
+                            thinking_count += 1;
+                        }
+                    },
+                    .text => |text| {
+                        if (text.text.len > 0) {
+                            text_bytes +|= text.text.len;
+                            text_count += 1;
+                        }
+                    },
+                    .tool_call => |tool_call| {
+                        tool_call_bytes +|= serializedToolCallBytes(tool_call);
+                        tool_call_count += 1;
+                    },
+                };
+                if (thinking_count > 0) stats = stats.add(.{
+                    .bytes = "[Assistant thinking]: ".len +| thinking_bytes +| thinking_count - 1,
+                    .parts = 1,
+                });
+                if (text_count > 0) stats = stats.add(.{
+                    .bytes = "[Assistant]: ".len +| text_bytes +| text_count - 1,
+                    .parts = 1,
+                });
+                if (tool_call_count > 0) stats = stats.add(.{
+                    .bytes = "[Assistant tool calls]: ".len +| tool_call_bytes +| (tool_call_count - 1) * 2,
+                    .parts = 1,
+                });
+            },
+            .tool_result => |tool_result| {
+                var content_chars: u64 = 0;
+                var retained_bytes: u64 = 0;
+                var remaining: usize = max_compaction_tool_result_chars;
+                for (tool_result.content) |block| {
+                    if (block != .text) continue;
+                    const chars = std.unicode.utf8CountCodepoints(block.text.text) catch block.text.text.len;
+                    content_chars +|= chars;
+                    if (remaining == 0) continue;
+                    const prefix = CompactionSummaryInput.utf8CodepointPrefix(block.text.text, remaining);
+                    retained_bytes +|= prefix.len;
+                    remaining -= std.unicode.utf8CountCodepoints(prefix) catch prefix.len;
+                }
+                if (content_chars > 0) {
+                    var bytes: u64 = "[Tool result]: ".len +| retained_bytes;
+                    if (content_chars > max_compaction_tool_result_chars) {
+                        bytes +|= "\n\n[... ".len +|
+                            decimalDigitCount(content_chars - max_compaction_tool_result_chars) +|
+                            " more characters truncated]".len;
+                    }
+                    stats = .{ .bytes = bytes, .parts = 1 };
+                }
+            },
+            .custom => |custom| stats = .{
+                .bytes = "[Custom ".len + custom.kind.len + "]".len,
+                .parts = 1,
+            },
+        }
+        return stats;
+    }
+
+    fn serializedToolCallBytes(tool_call: ai.ToolCall) u64 {
+        var bytes: u64 = tool_call.name.len + 2;
+        if (tool_call.arguments != .object) return bytes;
+        var iterator = tool_call.arguments.object.iterator();
+        var argument_count: u64 = 0;
+        while (iterator.next()) |entry| {
+            var counting: std.Io.Writer.Discarding = .init(&.{});
+            std.json.Stringify.value(entry.value_ptr.*, .{}, &counting.writer) catch unreachable;
+            bytes +|= entry.key_ptr.*.len +| 1 +| counting.fullCount();
+            argument_count += 1;
+        }
+        if (argument_count > 0) bytes +|= (argument_count - 1) * 2;
+        return bytes;
+    }
+
+    fn decimalDigitCount(value: u64) u64 {
+        var remaining = value;
+        var count: u64 = 1;
+        while (remaining >= 10) : (count += 1) remaining /= 10;
+        return count;
+    }
 
     fn findCompactionCutPoint(
         entries: []const SessionEntry,
@@ -714,7 +1058,10 @@ pub const SessionManager = struct {
         while (first_valid_cut < end_index and !isValidCompactionCut(entries[first_valid_cut])) {
             first_valid_cut += 1;
         }
-        if (first_valid_cut == end_index) return .{ .first_kept_index = start_index };
+        if (first_valid_cut == end_index) return .{
+            .first_kept_index = start_index,
+            .cut_message_index = start_index,
+        };
 
         var cut_index = first_valid_cut;
         var accumulated_tokens: u64 = 0;
@@ -735,18 +1082,41 @@ pub const SessionManager = struct {
             }
         }
 
-        while (cut_index > start_index) {
-            const previous = entries[cut_index - 1];
-            if (previous == .compaction) break;
-            if (previous == .message) break;
-            cut_index -= 1;
+        return compactionCutPointAt(entries, start_index, cut_index);
+    }
+
+    fn compactionCutPointAt(
+        entries: []const SessionEntry,
+        start_index: usize,
+        cut_message_index: usize,
+    ) CompactionCutPoint {
+        var first_kept_index = cut_message_index;
+        while (first_kept_index > start_index) {
+            const previous = entries[first_kept_index - 1];
+            if (previous == .compaction or previous == .message) break;
+            first_kept_index -= 1;
         }
 
-        const is_user_message = entries[cut_index] == .message and entries[cut_index].message.message == .user;
-        if (is_user_message) return .{ .first_kept_index = cut_index };
-        const turn_start_index = findCompactionTurnStartIndex(entries, cut_index, start_index) orelse
-            return .{ .first_kept_index = cut_index };
-        return .{ .first_kept_index = cut_index, .turn_start_index = turn_start_index, .is_split_turn = true };
+        const starts_turn = entries[first_kept_index] == .message and
+            entries[first_kept_index].message.message == .user;
+        if (starts_turn) return .{
+            .first_kept_index = first_kept_index,
+            .cut_message_index = cut_message_index,
+        };
+        const turn_start_index = findCompactionTurnStartIndex(
+            entries,
+            first_kept_index,
+            start_index,
+        ) orelse return .{
+            .first_kept_index = first_kept_index,
+            .cut_message_index = cut_message_index,
+        };
+        return .{
+            .first_kept_index = first_kept_index,
+            .cut_message_index = cut_message_index,
+            .turn_start_index = turn_start_index,
+            .is_split_turn = true,
+        };
     }
 
     fn findCompactionTurnStartIndex(entries: []const SessionEntry, entry_index: usize, start_index: usize) ?usize {
@@ -775,43 +1145,90 @@ pub const SessionManager = struct {
         };
     }
 
+    pub fn estimateContextTokens(self: *const SessionManager) u64 {
+        var tokens: u64 = 0;
+        var projection = self.projectSession();
+        while (projection.next()) |item| switch (item.content) {
+            .compaction_summary => |summary| tokens +|= estimateCharsTokens(summary.summary.len),
+            .message => |message| {
+                if (assistantUsageTokens(message)) |usage_tokens| {
+                    tokens = usage_tokens;
+                } else {
+                    tokens +|= estimateMessageTokens(message);
+                }
+            },
+        };
+        return tokens;
+    }
+
+    fn assistantUsageTokens(message: agent.AgentMessage) ?u64 {
+        if (message != .assistant) return null;
+        const assistant = message.assistant;
+        if (assistant.stop_reason == .aborted or assistant.stop_reason == .error_) return null;
+        const tokens = if (assistant.usage.total_tokens != 0)
+            assistant.usage.total_tokens
+        else
+            assistant.usage.input +|
+                assistant.usage.output +|
+                assistant.usage.cache_read +|
+                assistant.usage.cache_write;
+        return if (tokens > 0) tokens else null;
+    }
+
     pub fn estimateEntryTokens(entry: SessionEntry) u64 {
-        const chars: u64 = switch (entry) {
+        return switch (entry) {
             .model_change, .thinking_level_change => 0,
-            .compaction => |compaction| compaction.summary.len,
-            .message => |message_entry| switch (message_entry.message) {
-                .user => |user| switch (user.content) {
-                    .string => |text| text.len,
-                    .blocks => |blocks| blk: {
-                        var count: u64 = 0;
-                        for (blocks) |block| switch (block) {
-                            .text => |text| count +|= text.text.len,
-                            .image => count +|= 4800,
-                        };
-                        break :blk count;
-                    },
-                },
-                .assistant => |assistant| blk: {
+            .compaction => |compaction| estimateCharsTokens(compaction.summary.len),
+            .message => |message_entry| estimateMessageTokens(message_entry.message),
+        };
+    }
+
+    fn estimateMessageTokens(message: agent.AgentMessage) u64 {
+        const chars: u64 = switch (message) {
+            .user => |user| switch (user.content) {
+                .string => |text| text.len,
+                .blocks => |blocks| blk: {
                     var count: u64 = 0;
-                    for (assistant.content) |block| switch (block) {
-                        .text => |text| count +|= text.text.len,
-                        .thinking => |thinking| count +|= thinking.thinking.len,
-                        .tool_call => |tool_call| count +|= tool_call.name.len,
-                    };
-                    break :blk count;
-                },
-                .tool_result => |tool_result| blk: {
-                    var count: u64 = tool_result.tool_name.len;
-                    for (tool_result.content) |block| switch (block) {
+                    for (blocks) |block| switch (block) {
                         .text => |text| count +|= text.text.len,
                         .image => count +|= 4800,
                     };
                     break :blk count;
                 },
-                .custom => |custom| custom.kind.len,
             },
+            .assistant => |assistant| blk: {
+                var count: u64 = 0;
+                for (assistant.content) |block| switch (block) {
+                    .text => |text| count +|= text.text.len,
+                    .thinking => |thinking| count +|= thinking.thinking.len,
+                    .tool_call => |tool_call| {
+                        count +|= tool_call.name.len;
+                        var counting: std.Io.Writer.Discarding = .init(&.{});
+                        std.json.Stringify.value(tool_call.arguments, .{}, &counting.writer) catch {
+                            count +|= tool_call.name.len;
+                            continue;
+                        };
+                        count +|= counting.fullCount();
+                    },
+                };
+                break :blk count;
+            },
+            .tool_result => |tool_result| blk: {
+                var count: u64 = 0;
+                for (tool_result.content) |block| switch (block) {
+                    .text => |text| count +|= text.text.len,
+                    .image => count +|= 4800,
+                };
+                break :blk count;
+            },
+            .custom => |custom| custom.kind.len,
         };
-        return (chars + 3) / 4;
+        return estimateCharsTokens(chars);
+    }
+
+    fn estimateCharsTokens(chars: anytype) u64 {
+        const count: u64 = @intCast(chars);
+        return (count + 3) / 4;
     }
 
     fn findEntryIndex(self: *const SessionManager, entry_id: []const u8) ?usize {
@@ -950,9 +1367,16 @@ pub const SessionStore = struct {
     }
 
     pub fn load(self: SessionStore, io: std.Io) !SessionManager {
-        const data = try self.dir.readFileAlloc(io, self.file_name, self.allocator, .limited(max_session_file_bytes));
+        return self.loadCancelable(io, null);
+    }
+
+    pub fn loadCancelable(self: SessionStore, io: std.Io, cancel_token: ?runtime.CancelToken) !SessionManager {
+        const data = if (cancel_token) |token|
+            try readSessionFileCancelable(self, io, token)
+        else
+            try self.dir.readFileAlloc(io, self.file_name, self.allocator, .limited(max_session_file_bytes));
         defer self.allocator.free(data);
-        var parsed = try parseSession(self.allocator, data);
+        var parsed = try parseSessionCancelable(self.allocator, data, cancel_token);
         if (parsed.repair_length) |length| {
             // The dropped torn line is still on disk. Truncate it away now,
             // or the next append glues onto the fragment and corrupts both
@@ -983,6 +1407,30 @@ pub const SessionStore = struct {
         if (header.parent_session) |parent_session| self.allocator.free(parent_session);
     }
 };
+
+fn readSessionFileCancelable(
+    store: SessionStore,
+    io: std.Io,
+    cancel_token: runtime.CancelToken,
+) ![]u8 {
+    var file = try store.dir.openFile(io, store.file_name, .{});
+    defer file.close(io);
+    const file_len = try file.length(io);
+    if (file_len > max_session_file_bytes) return error.StreamTooLong;
+    const data = try store.allocator.alloc(u8, @intCast(file_len));
+    errdefer store.allocator.free(data);
+    var offset: usize = 0;
+    while (offset < data.len) {
+        try cancel_token.throwIfRequested();
+        const end = @min(offset + 256 * 1024, data.len);
+        const read_len = try file.readPositionalAll(io, data[offset..end], offset);
+        if (read_len != end - offset) return error.UnexpectedEndOfFile;
+        offset = end;
+        try runtime.yield();
+    }
+    try cancel_token.throwIfRequested();
+    return data;
+}
 
 fn writeFileAtomic(
     allocator: std.mem.Allocator,
@@ -1109,6 +1557,14 @@ const ParsedSession = struct {
 };
 
 fn parseSession(allocator: std.mem.Allocator, data: []const u8) !ParsedSession {
+    return parseSessionCancelable(allocator, data, null);
+}
+
+fn parseSessionCancelable(
+    allocator: std.mem.Allocator,
+    data: []const u8,
+    cancel_token: ?runtime.CancelToken,
+) !ParsedSession {
     var lines = std.mem.splitScalar(u8, data, '\n');
     const header_line = lines.next() orelse return error.MissingHeader;
     var parsed_header = try runtime.JsonOwned(std.json.Value).parseJson(allocator, header_line, .{});
@@ -1132,6 +1588,7 @@ fn parseSession(allocator: std.mem.Allocator, data: []const u8) !ParsedSession {
 
     var good_length: usize = @min(header_line.len + 1, data.len);
     while (lines.next()) |line| {
+        if (cancel_token) |token| try token.throwIfRequested();
         const line_end = (@intFromPtr(line.ptr) - @intFromPtr(data.ptr)) + line.len;
         if (std.mem.trim(u8, line, " \t\r").len == 0) {
             good_length = @min(line_end + 1, data.len);
@@ -1494,6 +1951,31 @@ fn assistantTextMessage(content: []const ai.AssistantContent) agent.AgentMessage
     } };
 }
 
+test "session header json uses pi names and omits absent parent" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    const header: SessionHeader = .{
+        .id = "session",
+        .timestamp = "time",
+        .cwd = "/repo",
+    };
+    try std.json.Stringify.value(header, .{}, &output.writer);
+    try std.testing.expectEqualStrings(
+        "{\"type\":\"session\",\"version\":3,\"id\":\"session\",\"timestamp\":\"time\",\"cwd\":\"/repo\"}",
+        output.written(),
+    );
+
+    output.writer.end = 0;
+    const child: SessionHeader = .{
+        .id = "child",
+        .timestamp = "time",
+        .cwd = "/repo",
+        .parent_session = "parent",
+    };
+    try std.json.Stringify.value(child, .{}, &output.writer);
+    try std.testing.expect(std.mem.endsWith(u8, output.written(), "\"parentSession\":\"parent\"}"));
+}
+
 test "new session stores header metadata" {
     var manager = try SessionManager.init(std.testing.allocator, "/repo", "session-1", "2026-01-01T00:00:00Z");
     defer manager.deinit();
@@ -1652,6 +2134,88 @@ test "compaction summary input splits oversized turn prefix" {
     try std.testing.expectEqualStrings(kept, input.first_kept_entry_id);
 }
 
+test "compaction summary input retains more history when token cut exceeds serialized cap" {
+    var manager = try SessionManager.init(std.testing.allocator, "/repo", "session-1", "t0");
+    defer manager.deinit();
+
+    _ = try manager.appendMessage(userMessage("large turn"), "t1");
+    const argument_text = "a" ** (8 * 1024);
+    var arguments: std.json.ObjectMap = .empty;
+    defer arguments.deinit(std.testing.allocator);
+    try arguments.put(std.testing.allocator, "content", .{ .string = argument_text });
+    const blocks = [_]ai.AssistantContent{.{ .tool_call = .{
+        .id = "call-1",
+        .name = "write",
+        .arguments = .{ .object = arguments },
+    } }};
+    const assistant: agent.AgentMessage = .{ .assistant = .{
+        .content = &blocks,
+        .api = ai.KnownApi.openai_responses,
+        .provider = "openai",
+        .model = "gpt",
+        .usage = ai.protocol.emptyUsage(),
+        .stop_reason = .tool_use,
+        .timestamp = 0,
+    } };
+    for (0..100) |index| {
+        var timestamp_buffer: [32]u8 = undefined;
+        const timestamp = std.fmt.bufPrint(&timestamp_buffer, "t{d}", .{index + 2}) catch unreachable;
+        _ = try manager.appendMessage(assistant, timestamp);
+    }
+
+    var input = try manager.buildCompactionSummaryInput(std.testing.allocator, .{ .keep_recent_tokens = 20_000 });
+    defer input.deinit();
+    try std.testing.expect(input.is_split_turn);
+    try std.testing.expect(input.turn_prefix_messages.len < 80);
+    const prefix = try input.serializeTurnPrefix(std.testing.allocator);
+    defer std.testing.allocator.free(prefix);
+    try std.testing.expect(prefix.len <= max_compaction_serialized_input_bytes);
+}
+
+test "compaction summary input retains an earlier whole turn when history exceeds serialized cap" {
+    var manager = try SessionManager.init(std.testing.allocator, "/repo", "session-1", "t0");
+    defer manager.deinit();
+
+    const argument_text = "a" ** (8 * 1024);
+    var arguments: std.json.ObjectMap = .empty;
+    defer arguments.deinit(std.testing.allocator);
+    try arguments.put(std.testing.allocator, "content", .{ .string = argument_text });
+    const blocks = [_]ai.AssistantContent{.{ .tool_call = .{
+        .id = "call-1",
+        .name = "write",
+        .arguments = .{ .object = arguments },
+    } }};
+    const assistant: agent.AgentMessage = .{ .assistant = .{
+        .content = &blocks,
+        .api = ai.KnownApi.openai_responses,
+        .provider = "openai",
+        .model = "gpt",
+        .usage = ai.protocol.emptyUsage(),
+        .stop_reason = .tool_use,
+        .timestamp = 0,
+    } };
+    var serial: usize = 0;
+    for (0..3) |turn| {
+        var user_buffer: [16]u8 = undefined;
+        const user = std.fmt.bufPrint(&user_buffer, "turn-{d}", .{turn}) catch unreachable;
+        _ = try manager.appendMessage(userMessage(user), "t");
+        for (0..40) |_| {
+            serial += 1;
+            var timestamp_buffer: [32]u8 = undefined;
+            const timestamp = std.fmt.bufPrint(&timestamp_buffer, "t{d}", .{serial}) catch unreachable;
+            _ = try manager.appendMessage(assistant, timestamp);
+        }
+    }
+
+    var input = try manager.buildCompactionSummaryInput(std.testing.allocator, .{ .keep_recent_tokens = 20_000 });
+    defer input.deinit();
+    try std.testing.expectEqualStrings("turn-0", input.messages[0].user.content.string);
+    try std.testing.expect(input.messages.len < 50);
+    const history = try input.serialize(std.testing.allocator);
+    defer std.testing.allocator.free(history);
+    try std.testing.expect(history.len <= max_compaction_serialized_input_bytes);
+}
+
 test "compaction summary input reuses previous first kept boundary and summary" {
     var manager = try SessionManager.init(std.testing.allocator, "/repo", "session-1", "t0");
     defer manager.deinit();
@@ -1671,11 +2235,14 @@ test "compaction summary input reuses previous first kept boundary and summary" 
     try std.testing.expectEqualStrings("prior", input.previous_summary.?);
 }
 
-test "serialize compaction summary input writes deterministic bounded text" {
+test "serialize compaction summary input matches pi role grouping and tool arguments" {
+    var arguments: std.json.ObjectMap = .empty;
+    defer arguments.deinit(std.testing.allocator);
+    try arguments.put(std.testing.allocator, "path", .{ .string = "src/main.zig" });
     const assistant_blocks = [_]ai.AssistantContent{
         .{ .thinking = .{ .thinking = "thought" } },
         .{ .text = .{ .text = "answer" } },
-        .{ .tool_call = .{ .id = "call-1", .name = "read", .arguments = .null } },
+        .{ .tool_call = .{ .id = "call-1", .name = "read", .arguments = .{ .object = arguments } } },
     };
     const tool_blocks = [_]ai.ToolResultContent{.{ .text = .{ .text = "tool output" } }};
     const source_messages = [_]agent.AgentMessage{
@@ -1707,13 +2274,19 @@ test "serialize compaction summary input writes deterministic bounded text" {
     };
     const serialized = try input.serialize(std.testing.allocator);
     defer std.testing.allocator.free(serialized);
+    var stats: SessionManager.SerializedStats = .{};
+    for (source_messages) |message| stats = stats.add(SessionManager.serializedMessageStats(message));
+    const separators = if (stats.parts > 0) (stats.parts - 1) * 2 else 0;
+    const predicted_bytes = "<conversation>\n".len + stats.bytes + separators + "\n</conversation>\n".len +
+        "\n<previous-summary>\n".len + "prior summary".len + "\n</previous-summary>\n".len;
+    try std.testing.expectEqual(predicted_bytes, serialized.len);
 
     try std.testing.expectEqualStrings(
         "<conversation>\n" ++
             "[User]: question\n\n" ++
-            "[Assistant thinking]: thought\n" ++
-            "[Assistant]: answer\n" ++
-            "[Assistant tool call]: read\n\n" ++
+            "[Assistant thinking]: thought\n\n" ++
+            "[Assistant]: answer\n\n" ++
+            "[Assistant tool calls]: read(path=\"src/main.zig\")\n\n" ++
             "[Tool result]: tool output\n" ++
             "</conversation>\n" ++
             "\n<previous-summary>\n" ++
@@ -1744,7 +2317,7 @@ test "serialize compaction summary input truncates tool results and bounds outpu
     };
     const serialized = try input.serialize(std.testing.allocator);
     defer std.testing.allocator.free(serialized);
-    try std.testing.expect(std.mem.indexOf(u8, serialized, "\n[truncated]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, serialized, "[... 1 more characters truncated]") != null);
 
     const oversized = try std.testing.allocator.alloc(u8, max_compaction_serialized_input_bytes + 1);
     defer std.testing.allocator.free(oversized);
@@ -1760,6 +2333,33 @@ test "serialize compaction summary input truncates tool results and bounds outpu
         error.CompactionSerializedInputTooLarge,
         oversized_input.serialize(std.testing.allocator),
     );
+}
+
+test "serialize compaction summary input bounds many medium tool results" {
+    const tool_text = try std.testing.allocator.alloc(u8, 16 * 1024);
+    defer std.testing.allocator.free(tool_text);
+    @memset(tool_text, 't');
+    const tool_blocks = [_]ai.ToolResultContent{.{ .text = .{ .text = tool_text } }};
+    var messages: [83]agent.AgentMessage = undefined;
+    for (&messages, 0..) |*message, index| message.* = .{ .tool_result = .{
+        .tool_call_id = if (index % 2 == 0) "call-a" else "call-b",
+        .tool_name = "read",
+        .content = &tool_blocks,
+        .is_error = false,
+        .timestamp = 0,
+    } };
+
+    const input: CompactionSummaryInput = .{
+        .allocator = std.testing.allocator,
+        .messages = &messages,
+        .first_kept_entry_id = "00000054",
+        .tokens_before = 42,
+    };
+    const serialized = try input.serialize(std.testing.allocator);
+    defer std.testing.allocator.free(serialized);
+
+    try std.testing.expect(serialized.len < max_compaction_serialized_input_bytes);
+    try std.testing.expectEqual(@as(usize, 83), std.mem.count(u8, serialized, "more characters truncated"));
 }
 
 test "loaded entries preserve ids and continue id generation" {

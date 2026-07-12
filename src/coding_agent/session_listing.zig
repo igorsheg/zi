@@ -1,5 +1,6 @@
 const std = @import("std");
 
+const runtime = @import("../runtime/root.zig");
 const paths_mod = @import("paths.zig");
 const session_manager = @import("session_manager.zig");
 
@@ -10,6 +11,7 @@ pub const SessionListOptions = struct {
     environ: ?*const std.process.Environ.Map = null,
     max_sessions: usize = 128,
     max_directory_entries: usize = 512,
+    cancel_token: ?runtime.CancelToken = null,
 };
 
 pub const SessionSelectionOptions = struct {
@@ -20,6 +22,7 @@ pub const SessionSelectionOptions = struct {
     selector: ?[]const u8 = null,
     max_sessions: usize = 128,
     max_directory_entries: usize = 512,
+    cancel_token: ?runtime.CancelToken = null,
 };
 
 pub const SessionList = struct {
@@ -93,6 +96,7 @@ pub fn listRuntimeSessions(
     var directory_entries_seen: usize = 0;
     var truncated = false;
     while (try iterator.next(io)) |entry| {
+        if (options.cancel_token) |token| try token.throwIfRequested();
         if (directory_entries_seen == options.max_directory_entries) {
             truncated = true;
             break;
@@ -153,6 +157,7 @@ pub fn listRuntimeSessionSummaries(
     }
     try summaries.ensureTotalCapacity(allocator, list.file_names.len);
     for (list.file_names) |file_name| {
+        if (options.cancel_token) |token| try token.throwIfRequested();
         const summary = loadRuntimeSessionSummary(allocator, io, options.dir, sessions_dir, file_name) catch
             try fallbackRuntimeSessionSummary(allocator, file_name);
         summaries.appendAssumeCapacity(summary);
@@ -165,6 +170,7 @@ pub fn selectRuntimeSession(
     io: std.Io,
     options: SessionSelectionOptions,
 ) !?[]const u8 {
+    if (options.cancel_token) |token| try token.throwIfRequested();
     if (options.selector) |selector| {
         if (paths_mod.isSessionFileLeafName(selector)) return selectExistingLeaf(allocator, io, options, selector);
         if (!isSessionIdSelector(selector)) return error.InvalidSessionFileName;
@@ -178,6 +184,7 @@ pub fn selectRuntimeSession(
         .environ = options.environ,
         .max_sessions = options.max_sessions,
         .max_directory_entries = options.max_directory_entries,
+        .cancel_token = options.cancel_token,
     });
     defer list.deinit(allocator);
 
@@ -240,6 +247,7 @@ fn selectBySessionIdPrefix(
     var iterator = dir.iterate();
     var directory_entries_seen: usize = 0;
     while (try iterator.next(io)) |entry| {
+        if (options.cancel_token) |token| try token.throwIfRequested();
         if (directory_entries_seen == selector_scan_entries_max) return error.SessionListTruncated;
         directory_entries_seen += 1;
         if (entry.kind != .file) continue;
@@ -598,11 +606,19 @@ fn runtimeSessionsDir(
         try paths_mod.resolveGlobalAgentDirFromEnv(allocator, options.environ);
     defer if (options.agent_dir_override == null) allocator.free(resolved_agent_dir);
 
-    const resolved_cwd = if (std.mem.eql(u8, options.cwd, "."))
-        try options.dir.realPathFileAlloc(io, options.cwd, allocator)
-    else
-        try allocator.dupe(u8, options.cwd);
-    defer allocator.free(resolved_cwd);
+    var resolved_cwd_z: ?[:0]u8 = null;
+    var resolved_cwd_owned: ?[]u8 = null;
+    const resolved_cwd = if (std.mem.eql(u8, options.cwd, ".")) blk: {
+        const cwd = try options.dir.realPathFileAlloc(io, options.cwd, allocator);
+        resolved_cwd_z = cwd;
+        break :blk cwd[0..cwd.len];
+    } else blk: {
+        const cwd = try allocator.dupe(u8, options.cwd);
+        resolved_cwd_owned = cwd;
+        break :blk cwd;
+    };
+    defer if (resolved_cwd_z) |cwd| allocator.free(cwd);
+    defer if (resolved_cwd_owned) |cwd| allocator.free(cwd);
 
     const paths: paths_mod.PersistencePaths = .{
         .global_dir = resolved_agent_dir,

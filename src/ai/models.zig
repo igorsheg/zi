@@ -5,8 +5,53 @@ const generated = @import("models.generated.zig");
 pub const models = generated.models;
 pub const providers = generated.providers;
 
+pub const faux_provider_env = "ZI_ENABLE_FAUX_PROVIDER";
+
+var faux_provider_count: std.atomic.Value(usize) = .init(0);
+
+const providers_with_faux = generated.providers ++ [_]protocol.Provider{protocol.KnownProvider.faux};
+const faux_models = [_]protocol.Model{.{
+    .id = "faux-default",
+    .name = "Faux Model",
+    .api = protocol.KnownApi.faux,
+    .provider = protocol.KnownProvider.faux,
+    .base_url = "http://localhost:0",
+    .reasoning = false,
+    .input = &.{.text},
+    .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+    .context_window = 128_000,
+    .max_tokens = 16_384,
+}};
+
+pub fn fauxProviderEnabledFromEnviron(environ: ?*const std.process.Environ.Map) bool {
+    const env = environ orelse return false;
+    const value = env.get(faux_provider_env) orelse return false;
+    return std.mem.eql(u8, value, "1");
+}
+
+pub fn retainFauxProviderGateFromEnviron(environ: ?*const std.process.Environ.Map) bool {
+    if (!fauxProviderEnabledFromEnviron(environ)) return false;
+    _ = faux_provider_count.fetchAdd(1, .monotonic);
+    return true;
+}
+
+pub fn releaseFauxProviderGate() void {
+    const previous = faux_provider_count.fetchSub(1, .monotonic);
+    std.debug.assert(previous > 0);
+}
+
+fn fauxProviderGateEnabled() bool {
+    return faux_provider_count.load(.monotonic) > 0;
+}
+
 // TODO: Replace static catalog lookups with an owned ModelRegistry when runtime providers can register models.
 pub fn getModel(provider: protocol.Provider, model_id: []const u8) ?protocol.Model {
+    if (fauxProviderGateEnabled() and std.mem.eql(u8, provider, protocol.KnownProvider.faux)) {
+        for (faux_models) |model| {
+            if (std.mem.eql(u8, model.id, model_id)) return model;
+        }
+        return null;
+    }
     for (models) |model| {
         if (std.mem.eql(u8, model.provider, provider) and std.mem.eql(u8, model.id, model_id)) {
             return model;
@@ -16,10 +61,12 @@ pub fn getModel(provider: protocol.Provider, model_id: []const u8) ?protocol.Mod
 }
 
 pub fn getProviders() []const protocol.Provider {
-    return &providers;
+    return if (fauxProviderGateEnabled()) &providers_with_faux else &providers;
 }
 
 pub fn getModels(provider: protocol.Provider) []const protocol.Model {
+    if (fauxProviderGateEnabled() and std.mem.eql(u8, provider, protocol.KnownProvider.faux)) return &faux_models;
+
     var start: ?usize = null;
     var end: usize = 0;
 
@@ -50,6 +97,7 @@ pub fn supportsXhigh(model: protocol.Model) bool {
         std.mem.indexOf(u8, model.id, "gpt-5.3") != null or
         std.mem.indexOf(u8, model.id, "gpt-5.4") != null or
         std.mem.indexOf(u8, model.id, "gpt-5.5") != null or
+        std.mem.indexOf(u8, model.id, "gpt-5.6") != null or
         std.mem.indexOf(u8, model.id, "deepseek-v4-pro") != null or
         std.mem.indexOf(u8, model.id, "opus-4-6") != null or
         std.mem.indexOf(u8, model.id, "opus-4.6") != null or
@@ -91,6 +139,23 @@ test "get providers returns generated providers" {
     try std.testing.expect(found.len >= 2);
     try std.testing.expect(containsProvider(found, protocol.KnownProvider.openai));
     try std.testing.expect(containsProvider(found, protocol.KnownProvider.openai_codex));
+    try std.testing.expect(!containsProvider(found, protocol.KnownProvider.faux));
+}
+
+// faux catalog entries are only visible while RuntimeServices has retained the env gate.
+test "faux model catalog is gated" {
+    var environ = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ.deinit();
+    try environ.put(faux_provider_env, "1");
+
+    try std.testing.expect(retainFauxProviderGateFromEnviron(&environ));
+    defer releaseFauxProviderGate();
+
+    try std.testing.expect(containsProvider(getProviders(), protocol.KnownProvider.faux));
+    const model = getModel(protocol.KnownProvider.faux, "faux-default").?;
+    try std.testing.expectEqualStrings(protocol.KnownApi.faux, model.api);
+    try std.testing.expectEqualStrings(protocol.KnownProvider.faux, model.provider);
+    try std.testing.expectEqual(@as(usize, 1), getModels(protocol.KnownProvider.faux).len);
 }
 
 test "get models returns contiguous provider slice" {
@@ -101,6 +166,18 @@ test "get models returns contiguous provider slice" {
         try std.testing.expectEqualStrings(protocol.KnownProvider.openai_codex, model.provider);
     }
     try std.testing.expect(getModel(protocol.KnownProvider.openai_codex, "gpt-5.1-codex-max") != null);
+}
+
+test "gpt 5.6 models are available in direct and codex catalogs" {
+    const direct = getModel(protocol.KnownProvider.openai, "gpt-5.6-luna").?;
+    const codex = getModel(protocol.KnownProvider.openai_codex, "gpt-5.6-luna").?;
+
+    try std.testing.expectEqual(@as(u64, 272_000), direct.context_window);
+    try std.testing.expectEqual(@as(u64, 372_000), codex.context_window);
+    try std.testing.expectEqual(@as(f64, 1.25), direct.cost.cache_write);
+    try std.testing.expectEqual(@as(f64, 1.25), codex.cost.cache_write);
+    try std.testing.expect(supportsXhigh(direct));
+    try std.testing.expect(supportsXhigh(codex));
 }
 
 test "calculate cost mutates usage cost in dollars" {

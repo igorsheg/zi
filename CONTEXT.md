@@ -1,127 +1,204 @@
 # zi context
 
-Zi is a Zig coding agent. It keeps the product feel of `.references/pi-mono/`
-while using Zi-owned, bounded Zig mechanisms instead of porting that codebase.
+Zi is a Zig coding agent built around the completed gen-3 architecture: one
+interactive owner loop, one runtime, direct function calls between product owners,
+and bounded presentation state. Future work should deepen that shape, not create
+new translation tiers around it.
 
-## Language
+`docs/gen3-tui-plan.md` is the architecture record and trap list for the frontend
+migration. Its phase checklist is historical now; its constraints remain useful
+review vocabulary.
 
-**Behavioral reference**:
-`.references/pi-mono/`. Use it to understand product behavior. Do not copy its
-architecture by default.
-_Avoid_: upstream, source of truth
+## Product references
 
-**Bounded policy**:
-The named behavior at an accumulation point: reject, evict, backpressure, spill,
-or deadline/cancel.
-_Avoid_: "normally small", "should not grow"
+**`.references/pi-mono/`** is a behavioral and visual reference. Use it to answer
+"what should this feel like?" Do not copy its layering or framework choices.
 
-**Owner**:
+**`docs/gen3-tui-plan.md`** records why gen-1/gen-2 failed: too many in-process
+protocol/view-model layers between the agent and the screen. Use it to reject
+new translation corridors.
+
+**`docs/runtime-zio-capabilities.md`** inventories the zio surface Zi actually
+uses. Use it before changing `src/runtime` or evaluating a zio replacement.
+
+**`docs/tui-performance.md`** defines transcript layout ownership, invalidation,
+work bounds, and the performance tests required for TUI changes.
+
+## Architecture in one sentence
+
+`cli` selects a concrete frontend; the frontend owns the driving loop; the loop
+calls `AgentSession` directly; `agent.Agent` emits events; subscribers fold those
+events into durable session state and bounded presentation state; Vaxis paints
+the final cells.
+
+```text
+main.zig
+  -> cli/root.zig
+      -> tui/root.zig + tui/Loop.zig             interactive alt-screen frontend
+      -> frontends/print/print_mode.zig         text/json prompt frontend
+      -> coding_agent/auth_mode.zig             auth commands
+
+coding_agent/session_bootstrap.zig
+  -> AgentSession.zig
+      -> agent.Agent                            provider/tool turn loop
+      -> session_manager.zig                    durable jsonl session log
+      -> tool_registry.zig + tools/*            builtin tools
+      -> settings/auth/resources/path owners
+
+runtime/*                                      std.Io-first mechanism only
+ai/*                                           provider protocol and models
+tui/*                                          Vaxis terminal product
+```
+
+## Ownership language
+
+Use these terms consistently in design notes, reviews, and comments.
+
+**Owner**
 The struct or loop allowed to mutate a piece of state and responsible for its
-shutdown/deinit.
-_Avoid_: manager (unless the code already uses that name)
+shutdown/deinit. If you add mutable state, name the owner first.
 
-**Mailbox**:
-A bounded command/event boundary owned by `SessionRuntime`. Frontends submit
-commands and drain events; they do not mutate sessions directly.
-_Avoid_: callback API, observer bus
+**Bounded policy**
+The explicit behavior at an accumulation point: reject, evict, backpressure,
+spill, or deadline/cancel. "Should stay small" is not a policy.
 
-**Runtime mechanism**:
-`src/runtime`: `std.Io`-first process/runtime support, bounded queues, wakes,
-cancel tokens, event pipes, process running, byte/json ownership. Vendored `zio`
-is a private backend adapter.
-_Avoid_: app runtime, product layer
+**Concrete frontend**
+A process-facing adapter that owns a user-visible driving loop. Today:
+`src/tui` for interactive alt-screen and `src/frontends/print` for text/json.
+Concrete frontends may bridge `coding_agent`, `agent`, `ai`, and `runtime`.
 
-**SessionRuntime**:
-The stable mailbox host. It owns or borrows the task runtime for its lifetime and
-owns exactly one live session slot. Session replacement builds the next slot
-first, then swaps through the mailbox owner path.
-_Avoid_: session service, session manager (unless referring to existing code)
+**RuntimeServices**
+Cwd-scoped service bundle shared by concrete frontends: cwd, agent dir, settings,
+auth, provider registry, providers, and the host task runtime.
 
-**RuntimeServices**:
-Cwd-scoped services replaceable with a session: cwd, agent dir, settings, auth,
-provider registry, and provider instances. They borrow the host runtime.
-
-**AgentSession**:
+**AgentSession**
 One session's policy spine: prompt resources, system prompt, builtin tools,
-durable history, long-lived `agent.Agent`, public events, lifecycle, retry, and
-compaction.
+durable history, long-lived `agent.Agent`, lifecycle, retry, compaction,
+settings-facing mutations, and private session event state.
 
-**agent.Agent**:
-The product-agnostic transcript/tool/stream loop. It owns runtime transcript
-context, provider streaming, tool execution, and steering/follow-up queues.
+**agent.Agent**
+Product-agnostic turn loop. It owns provider streaming, runtime transcript
+context, tool execution, and steering/follow-up queues. It does not know TUI,
+print mode, settings files, or session jsonl.
 
-**Durable session log**:
-Append-only jsonl session truth: header, one line per `message_end`, plus durable
-session facts such as model/thinking changes. In-memory history is a bounded
-view; the agent transcript is runtime context.
-_Avoid_: transcript as source of truth
+**AgentEvent**
+The in-process event stream from `agent.Agent`. Events are consumed directly by
+subscribers; they are not converted into a second protocol for in-process use.
 
-**ClientEvent**:
-A public event fact emitted by `coding_agent` for frontends. It is bounded and
-sequenced; overflow is itself reported as an event.
+**Durable session log**
+Append-only jsonl session truth: header, message entries, compaction entries,
+and durable session facts such as model/thinking changes. It is not the screen
+transcript.
 
-**Snapshot**:
-Owned state copied out for a client, for example resume transcript state. Events
-are facts; snapshots are state.
+**Transcript**
+The bounded TUI render fold owned by `src/tui/Transcript.zig`. It is rebuilt from
+live `AgentEvent`s or restored session entries and exists to render the screen.
+It owns all derived transcript layout caches and the transcript line index.
+It is presentation state, not durable truth.
 
-**Frontend adapter**:
-Concrete bridge in `src/frontends/*`. The TUI adapter may import both
-`coding_agent` and `tui`; neither core package imports the adapter.
+**Loop**
+The interactive TUI owner in `src/tui/Loop.zig`: input actions, editor, picker
+stack, viewport, run driving, notices, trace counters, and frame composition.
+It calls `AgentSession` directly.
 
-**TUI product**:
-`src/tui`: agent-agnostic terminal state and commands. It knows transcript,
-composer, statuses, tools as UI concepts; it does not know providers, sessions,
-or agent events.
+**Screen**
+`src/tui/screen.zig`: cell/line/frame primitives, the Kanso color tokens, and the
+Vaxis paint adapter. It holds no product state.
 
-**Vaxis**:
+**Text shimmer**
+`src/tui/text_shimmer.zig`: the only permitted ad-hoc/interpolated RGB color
+exception. It exists solely for the working-status gradient; other UI colors use
+semantic tokens from `screen.zig`.
+
+**Chrome**
+`src/tui/chrome.zig`: composer, picker/completion listbox, status/footer, and
+viewport chrome. It composes already-owned state; it does not drive sessions.
+
+**Blocks**
+`src/tui/blocks.zig`: transcript block rendering, especially tool-call UX. Tool
+visual policy belongs here, with neutral display data coming from `Transcript`.
+
+**Vaxis**
 Vendored terminal mechanism: raw tty, parser, screen/window primitives, borders,
-diff/render, Unicode width. Zi should not duplicate these mechanisms locally.
+diff/render, styles, color, and Unicode width. Zi should not duplicate these
+mechanisms locally unless a bounded Vaxis gap is demonstrated.
 
-**Tool view**:
-Borrowed `agent.AgentTool` metadata/schema/execute hook supplied by
-`coding_agent`. The model sees the stripped schema-only `ai.Tool`.
+**Resource path policy**
+All `.zi`, settings, auth, skills, prompt-resource, session, and agent-dir path
+policy belongs in `src/coding_agent/paths.zig`. `ZI_CODING_AGENT_DIR` overrides
+the agent dir.
 
-**Resource path policy**:
-All `.zi`, settings, auth, skills, and prompt-resource path policy belongs in
-`src/coding_agent/paths.zig`.
+## Binding relationships
 
-## Relationships
-
-- `main.zig` builds process/runtime and calls `cli.main`; it owns no product
-  policy.
-- `cli/` parses mode and dispatches to concrete frontends: TUI, print/text,
-  json, rpc, or auth.
-- `coding_agent` owns sessions, resources, settings, tools, persistence, and the
-  public client protocol.
-- `agent` owns the generic turn loop and tool execution protocol.
-- `ai` owns provider protocol, model catalog, provider registry, wire adapters,
-  and streams.
-- `runtime` owns mechanism only; product policy lives above it.
-- `tui` owns terminal product state only; concrete session mapping lives in a
-  frontend adapter.
+- `main.zig` owns process/runtime setup only, then calls `cli.main`.
+- `cli/` parses flags/modes and dispatches to a concrete frontend or auth.
+- `frontends/print` owns non-interactive prompt execution and process output.
+- `tui` owns the interactive terminal product and may sample concrete
+  `AgentSession` facts directly.
+- `coding_agent` owns product policy shared by frontends: sessions, resources,
+  settings, tools, auth, persistence, file completion, slash-command catalog, and
+  bootstrap.
+- `agent` owns the generic provider/tool turn protocol.
+- `ai` owns provider APIs, model catalog, wire adapters, and stream shapes.
+- `runtime` owns mechanism only: tasks, wakes, event pipes, process I/O, and zio
+  adaptation.
 
 ## Import shape
 
 ```text
-ai            -> std (+ runtime I/O mechanism)
+ai            -> std (+ runtime I/O mechanism where needed)
 agent         -> std, ai, runtime
-runtime       -> std (zio private behind adapters)
-tui           -> std, vaxis
+runtime       -> std publicly; zio private behind src/runtime/zio_backend.zig
 coding_agent  -> std, ai, agent, runtime
-frontends     -> bridge concrete packages
+tui           -> std, vaxis, ai, agent, coding_agent, runtime
+frontends     -> std, ai/agent/coding_agent/runtime as concrete adapters need
+cli           -> concrete frontend selection and process policy
 ```
 
-Lower layers do not import higher layers.
+Lower layers do not import higher layers. `coding_agent` never imports `tui` or
+`frontends`. `agent` never imports `coding_agent`. `runtime` never imports product
+policy. `vaxis` imports stay inside `src/tui`.
 
-## Flagged ambiguities
+## Gen-3 invariants
 
-- **Session history vs transcript**: session jsonl is durable truth; transcript
-  is runtime/UI context.
-- **Wake vs event**: a wake only says "inspect owned state"; it carries no
-  authority or payload.
-- **Cancellation request vs completion**: requesting cancel is intent; the owner
-  must still observe the terminal outcome and drain/join before deinit.
-- **TUI vs TUI frontend**: `src/tui` is agent-agnostic product state;
-  `src/frontends/tui` translates `coding_agent` facts into TUI commands.
-- **Bounded external totals**: long sessions and long responses are allowed when
-  spilled durably or exposed through bounded in-flight work.
+1. **No in-process protocol corridor.** Agent-to-screen is a function call and
+   subscriber dispatch, not envelopes, view models, wire protocols, or client
+   protocols.
+2. **One owner per visible fact.** If a fact is displayed, the owner that knows
+   its cause should compose the user-facing copy or display contract.
+3. **One transcript representation.** TUI has one bounded `Transcript`, which
+   also owns its ephemeral derived layout/cache and line-index state. Do not add
+   mirrors with revision taxonomies.
+4. **One wait point.** `Loop.run` waits on input/runtime wake sources with its
+   nearest owned deadline. Producers wake; the owner inspects state.
+5. **Streaming-first.** Assistant text, thinking, tool calls, and tool output are
+   folded live. Backpressure belongs to bounded runtime pipes, not UI throttles.
+6. **Alt-screen is intentional.** Terminal scrollback is not the product history;
+   Zi owns virtual scrollback and export/copy features explicitly.
+7. **Vaxis owns terminal mechanics.** Zi owns product layout and semantics, not
+   ANSI encoders, raw-mode stacks, cell buffers, diff renderers, or width engines.
+8. **Persistence precedes live mutation for durable facts.** Model/thinking/session
+   facts are stored before the live agent state changes.
+9. **Ephemeral sessions are explicit policy.** `--no-session` is a frontend/session
+   bootstrap policy, not an inference from nullable internals.
+10. **Tests use real frontend paths.** E2E tests drive provider resolution through
+    `ZI_ENABLE_FAUX_PROVIDER=1`; do not inject stream callbacks to bypass runtime
+    services.
+
+## Common ambiguities to resolve this way
+
+- **Session history vs transcript**: jsonl is durable truth; `Transcript` is UI
+  presentation state.
+- **Wake vs payload**: a wake carries no data and grants no mutation authority.
+  After waking, inspect the owned state.
+- **Cancel request vs completion**: cancel is intent; owners still drain/settle and
+  observe the terminal outcome before deinit.
+- **Settings vs session facts**: global/project settings are owned by
+  `SettingsManager`; durable per-session facts are owned by `SessionManager` and
+  `AgentSession`.
+- **Picker focus**: the composer is the omni input. Pickers are listbox frames
+  filtered by composer text, not nested modal inputs.
+- **Tool display vs tool execution**: execution belongs to `agent`/tool runners;
+  display policy belongs to TUI `Transcript`/`blocks`.
+- **Behavior reference vs architecture reference**: pi-mono can answer UX parity
+  questions; gen-3 answers ownership and dataflow questions.

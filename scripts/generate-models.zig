@@ -117,8 +117,11 @@ const MODELS_DEV_SOURCES = [_]ModelsDevSource{
     },
 };
 
+const OPENAI_SHORT_CONTEXT_CTX: u64 = 272_000;
+
 const CODEX_BASE_URL = "https://chatgpt.com/backend-api";
 const CODEX_CTX: u64 = 272_000;
+const CODEX_GPT56_CTX: u64 = 372_000;
 const CODEX_MAX: u64 = 128_000;
 
 const CODEX_MODELS = [_]ManualModel{
@@ -131,15 +134,21 @@ const CODEX_MODELS = [_]ManualModel{
     .{ .id = "gpt-5.4", .name = "GPT-5.4", .reasoning = true, .has_image = true, .ci = 2.5, .co = 15, .cr = 0.25, .cw = 0, .ctx = CODEX_CTX, .max_tok = CODEX_MAX },
     .{ .id = "gpt-5.5", .name = "GPT-5.5", .reasoning = true, .has_image = true, .ci = 5, .co = 30, .cr = 0.5, .cw = 0, .ctx = CODEX_CTX, .max_tok = CODEX_MAX },
     .{ .id = "gpt-5.4-mini", .name = "GPT-5.4 Mini", .reasoning = true, .has_image = true, .ci = 0.75, .co = 4.5, .cr = 0.075, .cw = 0, .ctx = CODEX_CTX, .max_tok = CODEX_MAX },
-    .{ .id = "gpt-5.3-codex-spark", .name = "GPT-5.3 Codex Spark", .reasoning = true, .has_image = false, .ci = 0, .co = 0, .cr = 0, .cw = 0, .ctx = 128_000, .max_tok = CODEX_MAX },
+    .{ .id = "gpt-5.3-codex-spark", .name = "GPT-5.3 Codex Spark", .reasoning = true, .has_image = false, .ci = 1.75, .co = 14, .cr = 0.175, .cw = 0, .ctx = 128_000, .max_tok = CODEX_MAX },
+    .{ .id = "gpt-5.6-luna", .name = "GPT-5.6 Luna", .reasoning = true, .has_image = true, .ci = 1, .co = 6, .cr = 0.1, .cw = 1.25, .ctx = CODEX_GPT56_CTX, .max_tok = CODEX_MAX },
+    .{ .id = "gpt-5.6-sol", .name = "GPT-5.6 Sol", .reasoning = true, .has_image = true, .ci = 5, .co = 30, .cr = 0.5, .cw = 6.25, .ctx = CODEX_GPT56_CTX, .max_tok = CODEX_MAX },
+    .{ .id = "gpt-5.6-terra", .name = "GPT-5.6 Terra", .reasoning = true, .has_image = true, .ci = 2.5, .co = 15, .cr = 0.25, .cw = 3.125, .ctx = CODEX_GPT56_CTX, .max_tok = CODEX_MAX },
 };
 
 const OPENAI_PATCHES = [_]ManualModel{
     .{ .id = "gpt-5-chat-latest", .name = "GPT-5 Chat Latest", .reasoning = false, .has_image = true, .ci = 1.25, .co = 10, .cr = 0.125, .cw = 0, .ctx = 128_000, .max_tok = 16_384 },
-    .{ .id = "gpt-5.1-codex", .name = "GPT-5.1 Codex", .reasoning = true, .has_image = true, .ci = 1.25, .co = 5, .cr = 0.125, .cw = 1.25, .ctx = 400_000, .max_tok = 128_000 },
+    .{ .id = "gpt-5.1-codex", .name = "GPT-5.1 Codex", .reasoning = true, .has_image = true, .ci = 1.25, .co = 10, .cr = 0.125, .cw = 0, .ctx = 400_000, .max_tok = 128_000 },
     .{ .id = "gpt-5.1-codex-max", .name = "GPT-5.1 Codex Max", .reasoning = true, .has_image = true, .ci = 1.25, .co = 10, .cr = 0.125, .cw = 0, .ctx = 400_000, .max_tok = 128_000 },
-    .{ .id = "gpt-5.3-codex-spark", .name = "GPT-5.3 Codex Spark", .reasoning = true, .has_image = false, .ci = 0, .co = 0, .cr = 0, .cw = 0, .ctx = 128_000, .max_tok = 16_384 },
-    .{ .id = "gpt-5.4", .name = "GPT-5.4", .reasoning = true, .has_image = true, .ci = 2.5, .co = 15, .cr = 0.25, .cw = 0, .ctx = 272_000, .max_tok = 128_000 },
+    .{ .id = "gpt-5.3-codex-spark", .name = "GPT-5.3 Codex Spark", .reasoning = true, .has_image = true, .ci = 1.75, .co = 14, .cr = 0.175, .cw = 0, .ctx = 128_000, .max_tok = 32_000 },
+    .{ .id = "gpt-5.4", .name = "GPT-5.4", .reasoning = true, .has_image = true, .ci = 2.5, .co = 15, .cr = 0.25, .cw = 0, .ctx = OPENAI_SHORT_CONTEXT_CTX, .max_tok = 128_000 },
+    .{ .id = "gpt-5.6-luna", .name = "GPT-5.6 Luna", .reasoning = true, .has_image = true, .ci = 1, .co = 6, .cr = 0.1, .cw = 1.25, .ctx = OPENAI_SHORT_CONTEXT_CTX, .max_tok = 128_000 },
+    .{ .id = "gpt-5.6-sol", .name = "GPT-5.6 Sol", .reasoning = true, .has_image = true, .ci = 5, .co = 30, .cr = 0.5, .cw = 6.25, .ctx = OPENAI_SHORT_CONTEXT_CTX, .max_tok = 128_000 },
+    .{ .id = "gpt-5.6-terra", .name = "GPT-5.6 Terra", .reasoning = true, .has_image = true, .ci = 2.5, .co = 15, .cr = 0.25, .cw = 3.125, .ctx = OPENAI_SHORT_CONTEXT_CTX, .max_tok = 128_000 },
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -216,6 +225,7 @@ fn collectModelsDev(allocator: std.mem.Allocator, root: std.json.Value, all: *Mo
         while (it.next()) |entry| {
             const model_id = entry.key_ptr.*;
             const model = entry.value_ptr.*;
+            if (std.mem.eql(u8, src.provider, "openai") and std.mem.eql(u8, model_id, "gpt-5.6")) continue;
             if (!boolField(model, "tool_call")) continue;
 
             try all.append(allocator, .{
@@ -299,8 +309,8 @@ fn applyPatches(allocator: std.mem.Allocator, all: *ModelList) !void {
         {
             model.context_window = 1_000_000;
         }
-        if (std.mem.eql(u8, model.provider, "openai") and std.mem.eql(u8, model.id, "gpt-5.4")) {
-            model.context_window = 272_000;
+        if (std.mem.eql(u8, model.provider, "openai") and isOpenAiShortContextCappedModel(model.id)) {
+            model.context_window = OPENAI_SHORT_CONTEXT_CTX;
             model.max_tokens = 128_000;
         }
         if (std.mem.eql(u8, model.provider, "openrouter") and std.mem.eql(u8, model.id, "moonshotai/kimi-k2.5")) {
@@ -360,6 +370,14 @@ fn applyPatches(allocator: std.mem.Allocator, all: *ModelList) !void {
     }
 }
 
+fn isOpenAiShortContextCappedModel(id: []const u8) bool {
+    return std.mem.eql(u8, id, "gpt-5.4") or
+        std.mem.eql(u8, id, "gpt-5.5") or
+        std.mem.eql(u8, id, "gpt-5.6-luna") or
+        std.mem.eql(u8, id, "gpt-5.6-sol") or
+        std.mem.eql(u8, id, "gpt-5.6-terra");
+}
+
 fn printCounts(allocator: std.mem.Allocator, models: []const Model) !void {
     var providers: std.ArrayList([]const u8) = .empty;
     defer providers.deinit(allocator);
@@ -405,7 +423,7 @@ fn writeOutput(io: std.Io, output_path: []const u8, models: []const Model) !void
         if (model.has_image) {
             try w.writeAll("        .input = &.{ .text, .image },\n");
         } else {
-            try w.writeAll("        .input = &.{ .text },\n");
+            try w.writeAll("        .input = &.{.text},\n");
         }
         try w.writeAll("        .cost = .{ .input = ");
         try writeNumber(w, model.cost_input);

@@ -1,0 +1,37 @@
+{
+  "behavioralAuthority": {
+    "repository": ".references/pi",
+    "commit": "81de5702c6816538ea97d05d9060fe435b80bf35"
+  },
+  "sources": [
+    "packages/coding-agent/src/modes/print-mode.ts",
+    "packages/coding-agent/src/core/agent-session.ts",
+    "packages/agent/src/types.ts",
+    "packages/agent/src/agent-loop.ts",
+    "packages/coding-agent/test/print-mode.test.ts",
+    "packages/coding-agent/test/suite/agent-session-retry-events.test.ts",
+    "packages/coding-agent/test/suite/agent-session-compaction.test.ts",
+    "packages/coding-agent/test/suite/regressions/6363-agent-settled-event.test.ts"
+  ],
+  "normalization": [
+    "session.id",
+    "session.timestamp",
+    "session.cwd",
+    "provider response ids",
+    "generated temporary paths"
+  ],
+  "scenarios": [
+    "simple_text",
+    "thinking_and_text",
+    "tool_then_answer",
+    "assistant_error_without_retry",
+    "retry_success",
+    "retry_exhaustion",
+    "overflow_compaction",
+    "threshold_compaction",
+    "cancellation",
+    "fresh_session",
+    "resumed_session",
+    "in_memory_session"
+  ]
+}

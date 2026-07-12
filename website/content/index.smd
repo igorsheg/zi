@@ -7,7 +7,7 @@
 ---
 Zi is a coding agent you can build with.
 
-It runs in your repo. It keeps the work visible. It gives the model a small set of tools: read, bash, edit, write, and symbols.
+It runs in your repo. It keeps the work visible. It gives the model a small set of tools: read, bash, edit, and write.
 
 Start with a prompt. Resume the thread later. Change the rules when your project needs different habits.
 

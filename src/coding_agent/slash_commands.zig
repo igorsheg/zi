@@ -1,7 +1,8 @@
 //! Small slash-command catalog and parser. This is deliberately metadata +
-//! typed ids, not a callback registry: SessionRuntime remains the owner that
-//! applies command effects.
+//! typed ids, not a callback registry: the concrete frontend applies command
+//! effects directly.
 const std = @import("std");
+const agent = @import("../agent/root.zig");
 
 pub const command_count_max: usize = 32;
 pub const name_bytes_max: usize = 32;
@@ -21,6 +22,7 @@ pub const PickerKind = enum {
     none,
     model,
     session,
+    settings,
 };
 
 pub const Command = struct {
@@ -33,6 +35,19 @@ pub const Command = struct {
 pub const Invocation = struct {
     name: []const u8,
     args: []const u8,
+};
+
+pub const Action = union(enum) {
+    help,
+    session,
+    model: []const u8,
+    resume_session: []const u8,
+    new_session,
+    compact: []const u8,
+    settings,
+    thinking_level: agent.ThinkingLevel,
+    hide_thinking: bool,
+    unknown: []const u8,
 };
 
 pub const builtins = [_]Command{
@@ -52,7 +67,12 @@ pub const builtins = [_]Command{
     },
     .{ .id = .new_session, .name = "new", .summary = "Start a new session" },
     .{ .id = .compact, .name = "compact", .summary = "Compact session context" },
-    .{ .id = .settings, .name = "settings", .summary = "Open settings" },
+    .{
+        .id = .settings,
+        .name = "settings",
+        .summary = "Open settings",
+        .picker = .settings,
+    },
 };
 
 comptime {
@@ -85,6 +105,38 @@ pub fn parseInvocation(text: []const u8) ?Invocation {
 pub fn parseName(text: []const u8) ?[]const u8 {
     const invocation = parseInvocation(text) orelse return null;
     return invocation.name;
+}
+
+pub fn lookupInvocation(text: []const u8) ?Command {
+    const invocation = parseInvocation(text) orelse return null;
+    return lookup(invocation.name);
+}
+
+pub fn dispatch(text: []const u8) ?Action {
+    const invocation = parseInvocation(text) orelse return null;
+    const command = lookup(invocation.name) orelse return .{ .unknown = invocation.name };
+    return switch (command.id) {
+        .help => .help,
+        .session => .session,
+        .model => .{ .model = invocation.args },
+        .resume_session => .{ .resume_session = invocation.args },
+        .new_session => .new_session,
+        .compact => .{ .compact = invocation.args },
+        .settings => settingsAction(invocation.args),
+    };
+}
+
+fn settingsAction(args: []const u8) Action {
+    if (std.mem.eql(u8, args, "thinking:shown")) return .{ .hide_thinking = false };
+    if (std.mem.eql(u8, args, "thinking:hidden")) return .{ .hide_thinking = true };
+    const prefix = "thinking:";
+    if (std.mem.startsWith(u8, args, prefix)) {
+        const name = args[prefix.len..];
+        inline for (@typeInfo(agent.ThinkingLevel).@"enum".fields) |field| {
+            if (std.mem.eql(u8, name, field.name)) return .{ .thinking_level = @enumFromInt(field.value) };
+        }
+    }
+    return .settings;
 }
 
 pub fn formatAvailable(buffer: []u8) []const u8 {
@@ -120,5 +172,15 @@ test "slash command catalog formats help from builtin source" {
         formatAvailable(&buffer),
     );
     try std.testing.expectEqual(Id.model, lookup("model").?.id);
+    try std.testing.expectEqual(PickerKind.settings, lookup("settings").?.picker);
+    try std.testing.expectEqual(Id.settings, lookupInvocation("/settings").?.id);
+    try std.testing.expect(lookupInvocation("/sett") == null);
     try std.testing.expect(lookup("missing") == null);
+}
+
+test "slash dispatch maps settings actions" {
+    try std.testing.expectEqual(agent.ThinkingLevel.high, dispatch("/settings thinking:high").?.thinking_level);
+    try std.testing.expectEqual(false, dispatch("/settings thinking:shown").?.hide_thinking);
+    try std.testing.expectEqualStrings("focus on files", dispatch("/compact focus on files").?.compact);
+    try std.testing.expectEqualStrings("wat", dispatch("/wat").?.unknown);
 }

@@ -13,3 +13,4 @@ scripts/standup.ts
 
 autoresearch*.jsonl
 autoresearch*.sh
+tmp/

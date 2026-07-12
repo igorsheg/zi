@@ -1,20 +1,22 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const app_info = @import("../app_info.zig");
 const runtime = @import("../runtime/root.zig");
 const coding_agent = @import("../coding_agent/root.zig");
 const auth_mode = coding_agent.auth_mode;
-const session_runtime = coding_agent.session_runtime;
 const session_listing = coding_agent.session_listing;
-const args_mod = @import("args.zig");
+const session_manager = coding_agent.session_manager;
+const paths_mod = @import("../coding_agent/paths.zig");
+const tui = @import("../tui/root.zig");
 const print_mode = @import("../frontends/print/print_mode.zig");
-const rpc_mode = @import("../frontends/rpc/stdio.zig");
-const interactive = @import("../frontends/tui/interactive.zig");
+const args_mod = @import("args.zig");
 
 const CliError = error{
     InvalidCliUsage,
     NoResumableSession,
     OutputClosed,
     UnsupportedCliFeature,
+    PromptFailed,
 };
 
 const stdout_buffer_size_bytes = 4096;
@@ -54,6 +56,10 @@ pub fn main(process: runtime.Process, args_source: std.process.Args) !void {
 
     run(process, &args, cli_io.stdout(), cli_io.stderr()) catch |err| switch (err) {
         error.OutputClosed => return,
+        error.PromptFailed => {
+            try cli_io.flush();
+            std.process.exit(1);
+        },
         error.InvalidCliUsage, error.NoResumableSession, error.UnsupportedCliFeature => {
             try cli_io.flush();
             std.process.exit(2);
@@ -72,8 +78,10 @@ fn run(
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
 ) !void {
+    const cwd = try std.process.currentPathAlloc(process.io, process.gpa);
+    defer process.gpa.free(cwd);
     return runWithOptions(process, args, stdout, stderr, .{
-        .cwd = ".",
+        .cwd = cwd,
         .agent_dir_override = null,
         .environ = process.environ,
     });
@@ -128,7 +136,9 @@ fn runApp(
 ) !void {
     if (app.version) return stdout.print("zi {s}\n", .{app_info.version});
     if (app.help) return args_mod.writeHelp(stdout);
-    if (app.unknown_flags.count > 0) return unknownFlag(stderr, app.unknown_flags.slice()[0].name);
+    const panic_test = panicTestEnabled(app);
+    if (firstUnknownFlagName(app)) |name| return unknownFlag(stderr, name);
+    if (!app.print and app.mode == null and app.messages.count == 0) return runTui(process, stderr, app, options, panic_test);
 
     const stdin_is_tty = try std.Io.File.stdin().isTty(process.io);
     return switch (args_mod.resolveAppMode(app, stdin_is_tty)) {
@@ -146,19 +156,69 @@ fn runApp(
         },
         .interactive => {
             if (app.messages.count > 1 or (app.resume_picker and app.messages.count > 0)) return usage(stderr);
-            return interactive.run(process, stdout, stderr, .{
-                .cwd = options.cwd,
-                .agent_dir_override = options.agent_dir_override,
-                .dir = options.dir,
-                .environ = options.environ,
-                .session_selector = app.session_selector,
-                .continue_latest = app.continue_latest,
-                .startup_action = if (app.resume_picker) .resume_picker else .none,
-                .initial_prompt = if (app.messages.count == 1) app.messages.slice()[0] else null,
-                .version = app_info.version,
-            });
+            return runTui(process, stderr, app, options, panic_test);
         },
     };
+}
+
+fn shouldPersistSession(app_args: anytype) bool {
+    return !app_args.no_session;
+}
+
+fn runTui(
+    process: runtime.Process,
+    stderr: *std.Io.Writer,
+    app_args: anytype,
+    options: auth_mode.Options,
+    panic_test: bool,
+) !void {
+    if (isDumbTerminal(process)) return unsupportedTerminal(stderr);
+    const stamp = session_manager.SessionStamp.now(process.io);
+    var session_id_buffer: [48]u8 = undefined;
+    const session_id = std.fmt.bufPrint(&session_id_buffer, "tui-{d}", .{stamp.nanoseconds}) catch unreachable;
+    const selected_session_file = try selectResumeSession(process, stderr, app_args, options);
+    defer if (selected_session_file) |session_file| process.gpa.free(session_file);
+    const open: coding_agent.session_bootstrap.OpenSpec = if (selected_session_file) |session_file| blk: {
+        break :blk .{ .resume_existing = .{ .session_file_name = session_file } };
+    } else .{ .create = .{
+        .session_id = session_id,
+        .timestamp = stamp.timestamp(),
+        .persist = shouldPersistSession(app_args),
+    } };
+
+    if (builtin.is_test) {
+        tui.run(process, .{
+            .initial_prompt = if (app_args.messages.count == 1) app_args.messages.slice()[0] else null,
+            .open = open,
+            .resume_picker = app_args.resume_picker,
+            .panic_test = panic_test,
+        }) catch return frontendStub(stderr);
+    } else {
+        tui.run(process, .{
+            .initial_prompt = if (app_args.messages.count == 1) app_args.messages.slice()[0] else null,
+            .open = open,
+            .resume_picker = app_args.resume_picker,
+            .panic_test = panic_test,
+        }) catch |err| switch (err) {
+            error.UnsupportedCliFeature => return frontendStub(stderr),
+            error.UndrainedShutdown => std.process.exit(1),
+            else => return err,
+        };
+    }
+}
+
+fn panicTestEnabled(app: anytype) bool {
+    for (app.unknown_flags.slice()) |flag| {
+        if (std.mem.eql(u8, flag.name, "panic-test")) return true;
+    }
+    return false;
+}
+
+fn firstUnknownFlagName(app: anytype) ?[]const u8 {
+    for (app.unknown_flags.slice()) |flag| {
+        if (!std.mem.eql(u8, flag.name, "panic-test")) return flag.name;
+    }
+    return null;
 }
 
 fn runPrompt(
@@ -170,13 +230,62 @@ fn runPrompt(
     app_args: anytype,
     options: auth_mode.Options,
 ) !void {
-    var app = try openCliRuntime("cli", process, stderr, app_args, options);
-    defer app.deinit();
+    var task_runtime = try runtime.Runtime.init(process.gpa, .{});
+    defer task_runtime.deinit();
 
-    try print_mode.run(&app, stdout, stderr, .{
+    const cwd = try process.gpa.dupe(u8, options.cwd);
+    defer process.gpa.free(cwd);
+
+    const agent_dir = if (options.agent_dir_override) |override|
+        override
+    else
+        try paths_mod.resolveGlobalAgentDirFromEnv(process.gpa, options.environ);
+    defer if (options.agent_dir_override == null) process.gpa.free(agent_dir);
+
+    var services = try coding_agent.runtime_services.RuntimeServices.init(process.gpa, .{
+        .cwd = cwd,
+        .agent_dir = agent_dir,
+        .dir = options.dir,
+        .environ = options.environ,
+        .task_runtime = task_runtime,
+    });
+    defer services.deinit();
+
+    const selected_session_file = try selectResumeSession(process, stderr, app_args, .{
+        .cwd = cwd,
+        .agent_dir_override = agent_dir,
+        .dir = options.dir,
+        .environ = options.environ,
+    });
+    defer if (selected_session_file) |session_file| process.gpa.free(session_file);
+
+    const stamp = session_manager.SessionStamp.now(services.io);
+    var session_id_buffer: [48]u8 = undefined;
+    const session_id = std.fmt.bufPrint(&session_id_buffer, "print-{d}", .{stamp.nanoseconds}) catch unreachable;
+    const open: coding_agent.session_bootstrap.OpenSpec = if (selected_session_file) |session_file|
+        .{ .resume_existing = .{ .session_file_name = session_file } }
+    else
+        .{ .create = .{
+            .session_id = session_id,
+            .timestamp = stamp.timestamp(),
+            .persist = shouldPersistSession(app_args),
+        } };
+
+    var session = try coding_agent.session_bootstrap.openSession(process.gpa, &services, stamp.date(), open, .{});
+    defer shutdownPromptSession(&session, services.io);
+
+    const status = print_mode.run(process.gpa, &services, &session, services.io, stdout, stderr, .{
         .prompt = prompt,
         .output = if (json_output) .json else .text,
-    });
+    }) catch |err| switch (err) {
+        error.OutputClosed => return error.OutputClosed,
+        else => {
+            try stderr.print("{s}\n", .{@errorName(err)});
+            try stderr.flush();
+            return error.PromptFailed;
+        },
+    };
+    if (status != 0) return error.PromptFailed;
 }
 
 fn runRpc(
@@ -186,46 +295,42 @@ fn runRpc(
     app_args: anytype,
     options: auth_mode.Options,
 ) !void {
-    var app = try openCliRuntime("rpc", process, stderr, app_args, options);
-    defer app.deinit();
-
-    if (app_args.messages.count == 1) {
-        try rpc_mode.runPrompt(&app, stdout, app_args.messages.slice()[0]);
-        return;
-    }
-    try rpc_mode.runFd(&app, std.posix.STDIN_FILENO, stdout, stderr);
+    _ = process;
+    _ = stdout;
+    _ = app_args;
+    _ = options;
+    return frontendStub(stderr);
 }
 
-fn openCliRuntime(
-    comptime id_prefix: []const u8,
-    process: runtime.Process,
-    stderr: *std.Io.Writer,
-    app_args: anytype,
-    options: auth_mode.Options,
-) !session_runtime.SessionRuntime {
-    const stamp = session_runtime.SessionStamp.now(process.io);
-    if (try selectResumeSession(process, stderr, app_args, options)) |session_file| {
-        defer process.gpa.free(session_file);
-        return session_runtime.openSessionRuntime(process.gpa, .{
-            .cwd = options.cwd,
-            .agent_dir_override = options.agent_dir_override,
-            .current_date = stamp.date(),
-            .open = .{ .resume_existing = .{ .session_file_name = session_file } },
-            .dir = options.dir,
-            .environ = options.environ,
-        });
+fn frontendStub(stderr: *std.Io.Writer) !void {
+    try stderr.writeAll("this frontend is being rebuilt; try a newer build\n");
+    return error.UnsupportedCliFeature;
+}
+
+fn unsupportedTerminal(stderr: *std.Io.Writer) !void {
+    try stderr.writeAll("interactive terminal unsupported for TERM=dumb; use --print or --mode text\n");
+    return error.UnsupportedCliFeature;
+}
+
+fn isDumbTerminal(process: runtime.Process) bool {
+    const term = process.env("TERM") orelse return false;
+    return std.mem.eql(u8, std.mem.trim(u8, term, " \t\r\n"), "dumb");
+}
+
+const prompt_shutdown_bound_ns: u64 = 5 * std.time.ns_per_s;
+
+fn shutdownPromptSession(session: *coding_agent.AgentSession, io: std.Io) void {
+    session.requestShutdown();
+    const start = nowNs(io);
+    while (!session.shutdownComplete() and nowNs(io) -| start < prompt_shutdown_bound_ns) {
+        runtime.sleep(io, .fromMilliseconds(100)) catch break;
     }
-    var session_id_buffer: [48]u8 = undefined;
-    const session_id = std.fmt.bufPrint(&session_id_buffer, id_prefix ++ "-{d}", .{stamp.nanoseconds}) catch
-        unreachable;
-    return session_runtime.openSessionRuntime(process.gpa, .{
-        .cwd = options.cwd,
-        .agent_dir_override = options.agent_dir_override,
-        .current_date = stamp.date(),
-        .open = .{ .create = .{ .session_id = session_id, .timestamp = stamp.timestamp() } },
-        .dir = options.dir,
-        .environ = options.environ,
-    });
+    session.deinit();
+}
+
+fn nowNs(io: std.Io) u64 {
+    const raw = std.Io.Timestamp.now(io, .awake).toNanoseconds();
+    return if (raw <= 0) 0 else @intCast(raw);
 }
 
 fn selectResumeSession(
@@ -261,12 +366,6 @@ fn selectResumeSession(
         return error.NoResumableSession;
     }
     return selected;
-}
-
-fn unsupported(stderr: *std.Io.Writer, message: []const u8) !void {
-    try stderr.print("unsupported: {s}\n", .{message});
-    try stderr.flush();
-    return error.UnsupportedCliFeature;
 }
 
 fn unknownFlag(stderr: *std.Io.Writer, name: []const u8) !void {
@@ -467,21 +566,246 @@ test "cli reports invalid explicit session selector" {
     try std.testing.expectEqualStrings("invalid session selector\n", stderr.buffered());
 }
 
-test "cli usage returns an error instead of exiting" {
+test "cli accepts hidden panic test flag only for TUI dispatch" {
+    const app = (try args_mod.parse(&.{"--panic-test"})).app;
+    try std.testing.expect(panicTestEnabled(app));
+    try std.testing.expect(firstUnknownFlagName(app) == null);
+
+    const unknown = (try args_mod.parse(&.{"--not-real"})).app;
+    try std.testing.expect(!panicTestEnabled(unknown));
+    try std.testing.expectEqualStrings("not-real", firstUnknownFlagName(unknown).?);
+}
+
+test "cli text and json print frontends run through faux provider" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try createCliTestDirs(tmp.dir);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "script.md", .data = "cli print ok\n" });
+
+    var environ = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ.deinit();
+    try environ.put("ZI_ENABLE_FAUX_PROVIDER", "1");
+    try environ.put("ZI_FAUX_DELAY_MS", "0");
+    try environ.put("ZI_FAUX_SCRIPT", "script.md");
+    const process = testProcess(&environ);
+
+    var output_buffer: [16 * 1024]u8 = undefined;
+    var output = std.Io.Writer.fixed(&output_buffer);
+    var stderr_buffer: [1024]u8 = undefined;
+    var stderr = std.Io.Writer.fixed(&stderr_buffer);
+    var text_argv = [_:null]?[*:0]const u8{ "zi", "--mode", "text", "hi" };
+    var text_args = try std.process.Args.Iterator.initAllocator(.{ .vector = @ptrCast(&text_argv) }, std.testing.allocator);
+    defer text_args.deinit();
+    try runWithOptions(process, &text_args, &output, &stderr, .{
+        .cwd = "repo",
+        .agent_dir_override = "agent",
+        .dir = tmp.dir,
+        .environ = process.environ,
+    });
+    try std.testing.expectEqualStrings("cli print ok\n", output.buffered());
+    try std.testing.expectEqualStrings("", stderr.buffered());
+
+    output = std.Io.Writer.fixed(&output_buffer);
+    stderr = std.Io.Writer.fixed(&stderr_buffer);
+    var json_argv = [_:null]?[*:0]const u8{ "zi", "--mode", "json", "--continue", "hi" };
+    var json_args = try std.process.Args.Iterator.initAllocator(.{ .vector = @ptrCast(&json_argv) }, std.testing.allocator);
+    defer json_args.deinit();
+    try runWithOptions(process, &json_args, &output, &stderr, .{
+        .cwd = "repo",
+        .agent_dir_override = "agent",
+        .dir = tmp.dir,
+        .environ = process.environ,
+    });
+    var json_lines = std.mem.splitScalar(u8, output.buffered(), '\n');
+    var header = try runtime.JsonOwned(std.json.Value).parseJson(std.testing.allocator, json_lines.next().?, .{});
+    defer header.deinit();
+    try std.testing.expectEqualStrings("session", header.value.object.get("type").?.string);
+    try std.testing.expectEqual(@as(i64, 3), header.value.object.get("version").?.integer);
+    var agent_start = try runtime.JsonOwned(std.json.Value).parseJson(std.testing.allocator, json_lines.next().?, .{});
+    defer agent_start.deinit();
+    try std.testing.expectEqualStrings("agent_start", agent_start.value.object.get("type").?.string);
+    try std.testing.expect(std.mem.endsWith(u8, output.buffered(), "{\"type\":\"agent_settled\"}\n"));
+    try std.testing.expect(std.mem.indexOf(u8, output.buffered(), "cli print ok") != null);
+    try std.testing.expectEqualStrings("", stderr.buffered());
+}
+
+test "cli json assistant failure stays zero-status while text fails" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try createCliTestDirs(tmp.dir);
+
+    var environ = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ.deinit();
+    try environ.put("ZI_ENABLE_FAUX_PROVIDER", "1");
+    try environ.put("ZI_FAUX_DELAY_MS", "0");
+    try environ.put("ZI_FAUX_ERROR_MESSAGE", "provider failure");
+    const process = testProcess(&environ);
+
+    var output_buffer: [16 * 1024]u8 = undefined;
+    var output = std.Io.Writer.fixed(&output_buffer);
+    var stderr_buffer: [1024]u8 = undefined;
+    var stderr = std.Io.Writer.fixed(&stderr_buffer);
+    var json_argv = [_:null]?[*:0]const u8{ "zi", "--mode", "json", "--no-session", "hi" };
+    var json_args = try std.process.Args.Iterator.initAllocator(
+        .{ .vector = @ptrCast(&json_argv) },
+        std.testing.allocator,
+    );
+    defer json_args.deinit();
+    try runWithOptions(process, &json_args, &output, &stderr, .{
+        .cwd = "repo",
+        .agent_dir_override = "agent",
+        .dir = tmp.dir,
+        .environ = process.environ,
+    });
+    try std.testing.expect(std.mem.indexOf(u8, output.buffered(), "\"stopReason\":\"error\"") != null);
+    try std.testing.expect(std.mem.endsWith(u8, output.buffered(), "{\"type\":\"agent_settled\"}\n"));
+    try std.testing.expectEqualStrings("", stderr.buffered());
+
+    output = std.Io.Writer.fixed(&output_buffer);
+    stderr = std.Io.Writer.fixed(&stderr_buffer);
+    var text_argv = [_:null]?[*:0]const u8{ "zi", "--mode", "text", "--no-session", "hi" };
+    var text_args = try std.process.Args.Iterator.initAllocator(
+        .{ .vector = @ptrCast(&text_argv) },
+        std.testing.allocator,
+    );
+    defer text_args.deinit();
+    try std.testing.expectError(error.PromptFailed, runWithOptions(process, &text_args, &output, &stderr, .{
+        .cwd = "repo",
+        .agent_dir_override = "agent",
+        .dir = tmp.dir,
+        .environ = process.environ,
+    }));
+    try std.testing.expectEqualStrings("", output.buffered());
+    try std.testing.expectEqualStrings("error: provider failure\n", stderr.buffered());
+}
+
+test "cli json no-session emits in-memory header and creates no file" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try createCliTestDirs(tmp.dir);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "script.md", .data = "ephemeral json\n" });
+
+    var environ = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ.deinit();
+    try environ.put("ZI_ENABLE_FAUX_PROVIDER", "1");
+    try environ.put("ZI_FAUX_DELAY_MS", "0");
+    try environ.put("ZI_FAUX_SCRIPT", "script.md");
+    const process = testProcess(&environ);
+
+    var output_buffer: [16 * 1024]u8 = undefined;
+    var output = std.Io.Writer.fixed(&output_buffer);
+    var stderr_buffer: [1024]u8 = undefined;
+    var stderr = std.Io.Writer.fixed(&stderr_buffer);
+    var argv = [_:null]?[*:0]const u8{ "zi", "--mode", "json", "--no-session", "hi" };
+    var args = try std.process.Args.Iterator.initAllocator(.{ .vector = @ptrCast(&argv) }, std.testing.allocator);
+    defer args.deinit();
+
+    try runWithOptions(process, &args, &output, &stderr, .{
+        .cwd = "repo",
+        .agent_dir_override = "agent",
+        .dir = tmp.dir,
+        .environ = process.environ,
+    });
+    var lines = std.mem.splitScalar(u8, output.buffered(), '\n');
+    var header = try runtime.JsonOwned(std.json.Value).parseJson(std.testing.allocator, lines.next().?, .{});
+    defer header.deinit();
+    try std.testing.expectEqualStrings("session", header.value.object.get("type").?.string);
+    try std.testing.expectEqualStrings("repo", header.value.object.get("cwd").?.string);
+    try std.testing.expect(std.mem.endsWith(u8, output.buffered(), "{\"type\":\"agent_settled\"}\n"));
+    try std.testing.expectEqualStrings("", stderr.buffered());
+
+    var sessions = try session_listing.listRuntimeSessions(std.testing.allocator, std.testing.io, .{
+        .cwd = "repo",
+        .agent_dir_override = "agent",
+        .dir = tmp.dir,
+        .environ = process.environ,
+    });
+    defer sessions.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), sessions.file_names.len);
+}
+
+test "cli no-session print does not create a session file" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try createCliTestDirs(tmp.dir);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "script.md", .data = "ephemeral ok\n" });
+
+    var environ = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ.deinit();
+    try environ.put("ZI_ENABLE_FAUX_PROVIDER", "1");
+    try environ.put("ZI_FAUX_DELAY_MS", "0");
+    try environ.put("ZI_FAUX_SCRIPT", "script.md");
+    const process = testProcess(&environ);
+
+    var output_buffer: [4096]u8 = undefined;
+    var output = std.Io.Writer.fixed(&output_buffer);
+    var stderr_buffer: [1024]u8 = undefined;
+    var stderr = std.Io.Writer.fixed(&stderr_buffer);
+    var argv = [_:null]?[*:0]const u8{ "zi", "-p", "--no-session", "hi" };
+    var args = try std.process.Args.Iterator.initAllocator(.{ .vector = @ptrCast(&argv) }, std.testing.allocator);
+    defer args.deinit();
+
+    try runWithOptions(process, &args, &output, &stderr, .{
+        .cwd = "repo",
+        .agent_dir_override = "agent",
+        .dir = tmp.dir,
+        .environ = process.environ,
+    });
+    try std.testing.expectEqualStrings("ephemeral ok\n", output.buffered());
+    try std.testing.expectEqualStrings("", stderr.buffered());
+
+    var sessions = try session_listing.listRuntimeSessions(std.testing.allocator, std.testing.io, .{
+        .cwd = "repo",
+        .agent_dir_override = "agent",
+        .dir = tmp.dir,
+        .environ = process.environ,
+    });
+    defer sessions.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), sessions.file_names.len);
+}
+
+test "cli rpc frontend remains stubbed" {
     var environ = std.process.Environ.Map.init(std.testing.allocator);
     defer environ.deinit();
     const process = testProcess(&environ);
+
     var output_buffer: [128]u8 = undefined;
     var output = std.Io.Writer.fixed(&output_buffer);
     var stderr_buffer: [256]u8 = undefined;
+    var stderr = std.Io.Writer.fixed(&stderr_buffer);
+    const rpc_app = (try args_mod.parse(&.{ "--mode", "rpc" })).app;
+    try std.testing.expectError(error.UnsupportedCliFeature, runRpc(
+        process,
+        &output,
+        &stderr,
+        rpc_app,
+        .{ .cwd = ".", .agent_dir_override = null, .environ = process.environ },
+    ));
+    try std.testing.expectEqualStrings("", output.buffered());
+    try std.testing.expectEqualStrings("this frontend is being rebuilt; try a newer build\n", stderr.buffered());
+}
+
+test "cli refuses TUI on dumb terminal with print hint" {
+    var environ = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ.deinit();
+    try environ.put("TERM", "dumb");
+    const process = testProcess(&environ);
+
+    var output_buffer: [128]u8 = undefined;
+    var output = std.Io.Writer.fixed(&output_buffer);
+    var stderr_buffer: [128]u8 = undefined;
     var stderr = std.Io.Writer.fixed(&stderr_buffer);
     var argv = [_:null]?[*:0]const u8{"zi"};
     var args = try std.process.Args.Iterator.initAllocator(.{ .vector = @ptrCast(&argv) }, std.testing.allocator);
     defer args.deinit();
 
-    try std.testing.expectError(error.InvalidCliUsage, run(process, &args, &output, &stderr));
+    try std.testing.expectError(error.UnsupportedCliFeature, runWithOptions(process, &args, &output, &stderr, .{
+        .cwd = ".",
+        .agent_dir_override = null,
+        .environ = process.environ,
+    }));
     try std.testing.expectEqualStrings("", output.buffered());
-    try std.testing.expect(std.mem.startsWith(u8, stderr.buffered(), "usage: zi [options] [prompt]"));
+    try std.testing.expectEqualStrings("interactive terminal unsupported for TERM=dumb; use --print or --mode text\n", stderr.buffered());
 }
 
 fn testProcess(environ: *std.process.Environ.Map) runtime.Process {
@@ -495,16 +819,17 @@ fn testProcess(environ: *std.process.Environ.Map) runtime.Process {
 
 fn createCliTestDirs(dir: std.Io.Dir) !void {
     try dir.createDirPath(std.testing.io, "agent");
-    try dir.createDirPath(std.testing.io, "repo");
+    try dir.createDirPath(std.testing.io, "repo/.zi");
 }
 
 fn createCliStoredSession(dir: std.Io.Dir, session_id: []const u8, timestamp: []const u8) !void {
-    var app_runtime = try session_runtime.openSessionRuntime(std.testing.allocator, .{
+    const sessions_dir = try (paths_mod.PersistencePaths{ .global_dir = "agent", .cwd = "repo" }).sessionsDirForCwd(std.testing.allocator);
+    defer std.testing.allocator.free(sessions_dir);
+    var store = try session_manager.SessionStore.create(std.testing.allocator, std.testing.io, dir, .{
+        .sessions_dir = sessions_dir,
         .cwd = "repo",
-        .agent_dir_override = "agent",
-        .current_date = "2026-05-27",
-        .open = .{ .create = .{ .session_id = session_id, .timestamp = timestamp } },
-        .dir = dir,
+        .session_id = session_id,
+        .timestamp = timestamp,
     });
-    defer app_runtime.deinit();
+    defer store.deinit();
 }

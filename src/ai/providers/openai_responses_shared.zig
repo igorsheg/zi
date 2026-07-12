@@ -14,6 +14,7 @@ pub const ProcessError = error{
 const max_stream_text_block_bytes = 4 * 1024 * 1024;
 const max_stream_thinking_block_bytes = 4 * 1024 * 1024;
 const max_stream_tool_arguments_bytes = 1024 * 1024;
+const max_stream_signature_bytes = 1024 * 1024;
 const max_stream_content_blocks = 256;
 
 pub fn outOfMemoryStream() protocol.AssistantMessageEventStream {
@@ -312,7 +313,10 @@ pub fn SsePullStream(comptime Owner: type, comptime options: PullStreamOptions) 
                     error.EndOfStream => {
                         self.finish() catch |finish_err| switch (finish_err) {
                             error.OutOfMemory => return error.OutOfMemory,
-                            error.ErrorEmitted => return self.popPending(),
+                            error.ErrorEmitted => {
+                                self.done = true;
+                                return self.popPending();
+                            },
                             else => return self.completeOperationalError(finish_err),
                         };
                         return self.popPending();
@@ -323,7 +327,10 @@ pub fn SsePullStream(comptime Owner: type, comptime options: PullStreamOptions) 
                 var sink = self.reducerSink();
                 self.parser.feed(self.chunk[0..n], &sink) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
-                    error.ErrorEmitted => return self.popPending(),
+                    error.ErrorEmitted => {
+                        self.done = true;
+                        return self.popPending();
+                    },
                     else => return self.completeOperationalError(err),
                 };
                 if (self.popPending()) |event| return event;
@@ -432,6 +439,7 @@ pub const ResponseStreamReducer = struct {
     const ToolCallState = struct {
         content_index: usize,
         partial_json: mem.ByteBuilder,
+        streaming_parse_arena: std.heap.ArenaAllocator,
     };
 
     pub fn init(
@@ -605,6 +613,7 @@ pub const ResponseStreamReducer = struct {
                     self.backing_allocator,
                     max_stream_tool_arguments_bytes,
                 ),
+                .streaming_parse_arena = std.heap.ArenaAllocator.init(self.backing_allocator),
             } };
             if (jsonString(item.get("arguments"))) |arguments| {
                 try self.current.tool_call.partial_json.append(arguments);
@@ -639,7 +648,10 @@ pub const ResponseStreamReducer = struct {
                 } });
             },
             .tool_call => |*state| {
-                errdefer state.partial_json.deinit();
+                errdefer {
+                    state.partial_json.deinit();
+                    state.streaming_parse_arena.deinit();
+                }
                 try self.parseToolArguments(state);
                 try sink.emit(io, .{ .toolcall_end = .{
                     .content_index = state.content_index,
@@ -647,6 +659,7 @@ pub const ResponseStreamReducer = struct {
                     .partial = try self.partial(),
                 } });
                 state.partial_json.deinit();
+                state.streaming_parse_arena.deinit();
             },
         }
         self.current = .none;
@@ -655,7 +668,10 @@ pub const ResponseStreamReducer = struct {
     fn discardCurrentBlock(self: *ResponseStreamReducer) void {
         switch (self.current) {
             .thinking, .text => {},
-            .tool_call => |*state| state.partial_json.deinit(),
+            .tool_call => |*state| {
+                state.partial_json.deinit();
+                state.streaming_parse_arena.deinit();
+            },
             .none => {},
         }
         self.current = .none;
@@ -774,7 +790,8 @@ pub const ResponseStreamReducer = struct {
     }
 
     fn parseStreamingToolArguments(self: *ResponseStreamReducer, state: *ToolCallState) !void {
-        const parsed = try json_parse.parseStreamingJson(self.arena.allocator(), state.partial_json.items());
+        _ = state.streaming_parse_arena.reset(.retain_capacity);
+        const parsed = try json_parse.parseStreamingJson(state.streaming_parse_arena.allocator(), state.partial_json.items());
         self.content.items[state.content_index].tool_call.arguments = parsed.value();
     }
 
@@ -786,15 +803,15 @@ pub const ResponseStreamReducer = struct {
     fn textParts(self: *ResponseStreamReducer, value: ?std.json.Value) !?[]const u8 {
         const resolved = value orelse return null;
         if (resolved != .array) return null;
-        var out = std.Io.Writer.Allocating.init(self.arena.allocator());
+        var out = mem.ByteBuilder.initBounded(self.arena.allocator(), max_stream_thinking_block_bytes);
         errdefer out.deinit();
         var wrote = false;
         for (resolved.array.items) |part| {
             if (part != .object) continue;
             const text = jsonString(part.object.get("text")) orelse continue;
             if (text.len == 0) continue;
-            if (wrote) try out.writer.writeAll("\n\n");
-            try out.writer.writeAll(text);
+            if (wrote) try out.append("\n\n");
+            try out.append(text);
             wrote = true;
         }
         if (!wrote) {
@@ -805,9 +822,18 @@ pub const ResponseStreamReducer = struct {
     }
 
     fn encodeItemSignature(self: *ResponseStreamReducer, item: std.json.ObjectMap) ![]const u8 {
-        var out = std.Io.Writer.Allocating.init(self.arena.allocator());
+        var out = mem.ByteBuilder.initBounded(self.arena.allocator(), max_stream_signature_bytes);
         errdefer out.deinit();
-        try std.json.Stringify.value(std.json.Value{ .object = item }, .{}, &out.writer);
+        try out.append("{\"v\":1");
+        if (jsonString(item.get("id"))) |id| {
+            try out.append(",\"id\":");
+            try appendJsonStringBounded(&out, id);
+        }
+        if (jsonString(item.get("encrypted_content"))) |encrypted| {
+            try out.append(",\"encrypted_content\":");
+            try appendJsonStringBounded(&out, encrypted);
+        }
+        try out.appendByte('}');
         return out.toOwnedSlice();
     }
 
@@ -935,12 +961,30 @@ fn parseJsonValueLeaky(allocator: std.mem.Allocator, json: []const u8) !std.json
 }
 
 fn encodeTextSignature(allocator: std.mem.Allocator, id: []const u8) ![]const u8 {
-    var value = std.Io.Writer.Allocating.init(allocator);
-    errdefer value.deinit();
-    try value.writer.writeAll("{\"v\":1,\"id\":");
-    try std.json.Stringify.value(id, .{}, &value.writer);
-    try value.writer.writeByte('}');
-    return value.toOwnedSlice();
+    var out = mem.ByteBuilder.initBounded(allocator, max_stream_signature_bytes);
+    errdefer out.deinit();
+    try out.append("{\"v\":1,\"id\":");
+    try appendJsonStringBounded(&out, id);
+    try out.appendByte('}');
+    return out.toOwnedSlice();
+}
+
+fn appendJsonStringBounded(out: *mem.ByteBuilder, value: []const u8) mem.ByteBuilder.Error!void {
+    try out.appendByte('"');
+    for (value) |byte| switch (byte) {
+        '"' => try out.append("\\\""),
+        '\\' => try out.append("\\\\"),
+        '\n' => try out.append("\\n"),
+        '\r' => try out.append("\\r"),
+        '\t' => try out.append("\\t"),
+        0...8, 11...12, 14...0x1f => {
+            var escaped: [6]u8 = undefined;
+            const text = std.fmt.bufPrint(&escaped, "\\u{x:0>4}", .{byte}) catch unreachable;
+            try out.append(text);
+        },
+        else => try out.appendByte(byte),
+    };
+    try out.appendByte('"');
 }
 
 fn concat(allocator: std.mem.Allocator, left: []const u8, right: []const u8) ![]const u8 {
