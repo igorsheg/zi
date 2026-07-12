@@ -5,7 +5,7 @@ const partial_json = @import("../ai/utils/partial_json.zig");
 pub const title_bytes_max: usize = 160;
 pub const metadata_bytes_max: usize = 512;
 
-pub const Presentation = enum { generic, command, file, patch, symbols };
+pub const Presentation = enum { generic, command, file, patch };
 pub const BodyMode = enum { visible, hidden_on_success, summary_only };
 pub const CollapseMode = enum { head, tail };
 pub const LiveUpdates = enum { show_tail, suppress };
@@ -45,9 +45,9 @@ pub const ResultView = struct {
     output: ?[]u8 = null,
     footer: ?[]u8 = null,
 };
-const ToolKind = enum { bash, read, symbols, edit, write, custom };
+const ToolKind = enum { bash, read, edit, write, custom };
 
-pub const explicit_builtin_names = [_][]const u8{ "bash", "read", "symbols", "edit", "write" };
+pub const explicit_builtin_names = [_][]const u8{ "bash", "read", "edit", "write" };
 
 pub fn hasExplicitBuiltinPolicy(name: []const u8) bool {
     inline for (explicit_builtin_names) |builtin_name| {
@@ -59,7 +59,6 @@ pub fn hasExplicitBuiltinPolicy(name: []const u8) bool {
 fn kind(name: []const u8) ToolKind {
     if (std.mem.eql(u8, name, "bash")) return .bash;
     if (std.mem.eql(u8, name, "read")) return .read;
-    if (std.mem.eql(u8, name, "symbols")) return .symbols;
     if (std.mem.eql(u8, name, "edit")) return .edit;
     if (std.mem.eql(u8, name, "write")) return .write;
     return .custom;
@@ -76,10 +75,6 @@ pub fn displayForTool(name: []const u8) Display {
         .read => .{
             .presentation = .file,
             .body_mode = .hidden_on_success,
-            .collapse = .{ .mode = .head, .lines_max = 10 },
-        },
-        .symbols => .{
-            .presentation = .symbols,
             .collapse = .{ .mode = .head, .lines_max = 10 },
         },
         .edit => .{
@@ -190,7 +185,7 @@ pub fn formatCallTitle(buffer: []u8, tool_name: []const u8, args_value: std.json
             title.add(argString(args_value, "file_path") orelse argStringOrEllipsis(args_value, "path"));
             addReadLineRange(&title, args_value);
         },
-        .symbols, .edit, .write => {
+        .edit, .write => {
             title.add(tool_name);
             title.add(" ");
             title.add(argString(args_value, "file_path") orelse argStringOrEllipsis(args_value, "path"));
@@ -316,7 +311,7 @@ fn resultBodyFromDetails(allocator: std.mem.Allocator, tool_name: []const u8, de
     return switch (kind(tool_name)) {
         .bash => bashBodyFromDetails(allocator, value.object, text),
         .read => readBodyFromDetails(allocator, value.object, text),
-        .symbols, .edit, .write, .custom => null,
+        .edit, .write, .custom => null,
     };
 }
 
@@ -397,7 +392,7 @@ pub fn metadataForDetails(buffer: []u8, tool_name: []const u8, details: ?std.jso
     return switch (kind(tool_name)) {
         .bash => bashMetadata(buffer, value.object) orelse "",
         .read => readMetadata(buffer, value.object) orelse "",
-        .symbols, .edit, .write, .custom => "",
+        .edit, .write, .custom => "",
     };
 }
 
@@ -487,7 +482,7 @@ fn shouldTrimResult(name: []const u8, is_error: bool) bool {
     if (is_error) return false;
     return switch (kind(name)) {
         .bash, .read, .write => true,
-        .symbols, .edit, .custom => false,
+        .edit, .custom => false,
     };
 }
 
@@ -517,7 +512,7 @@ fn imageFallbackText(mime_type: []const u8) []const u8 {
 
 fn isPathTool(name: []const u8) bool {
     return switch (kind(name)) {
-        .read, .symbols, .write, .edit => true,
+        .read, .write, .edit => true,
         .bash, .custom => false,
     };
 }
@@ -668,9 +663,6 @@ test "builtin display metadata covers tool chrome" {
     try std.testing.expectEqual(CollapseMode.head, read.collapse.mode);
     try std.testing.expectEqual(@as(u8, 10), read.collapse.lines_max);
 
-    const symbols = displayForTool("symbols");
-    try std.testing.expectEqual(Presentation.symbols, symbols.presentation);
-
     const edit = displayForTool("edit");
     try std.testing.expectEqual(Presentation.patch, edit.presentation);
 
@@ -694,7 +686,6 @@ test "every builtin policy covers complete partial success and failure views" {
     }{
         .{ .name = "bash", .presentation = .command, .body_mode = .visible, .collapse = .tail, .live_updates = .show_tail },
         .{ .name = "read", .presentation = .file, .body_mode = .hidden_on_success, .collapse = .head, .live_updates = .suppress },
-        .{ .name = "symbols", .presentation = .symbols, .body_mode = .visible, .collapse = .head, .live_updates = .suppress },
         .{ .name = "edit", .presentation = .patch, .body_mode = .visible, .collapse = .head, .live_updates = .suppress },
         .{ .name = "write", .presentation = .file, .body_mode = .summary_only, .collapse = .head, .live_updates = .suppress },
     };
@@ -746,10 +737,6 @@ test "tool titles use tolerant partial json" {
     const title = try titleFor(std.testing.allocator, "bash", "{\"command\":\"zig build\nnext");
     defer std.testing.allocator.free(title);
     try std.testing.expectEqualStrings("$ zig build next", title);
-
-    const path_title = try titleFor(std.testing.allocator, "symbols", "{\"path\":\"src/main.zig\"}");
-    defer std.testing.allocator.free(path_title);
-    try std.testing.expectEqualStrings("symbols src/main.zig", path_title);
 }
 
 test "tool titles include ranges and compact read classes" {

@@ -28,10 +28,7 @@ pub const colors = struct {
     pub const blue = rgb(0x7FB4CA);
     pub const purple = rgb(0x938AA9);
     pub const teal = rgb(0x7AA89F);
-    pub const panel_bg = rgb(0x0D1218);
-    pub const panel_bg_light = rgb(0x111820);
-    pub const panel_bg_green = rgb(0x0F1A14);
-    pub const panel_bg_red = rgb(0x1A0F12);
+    pub const user_message_bg = rgb(0x0D1218);
 };
 
 pub fn onSurface(style: Style, row_surface: Style) Style {
@@ -83,11 +80,7 @@ pub const surface = struct {
     pub const transparent: Style = .{};
     pub const app: Style = .{ .bg = colors.bg };
     pub const composer: Style = .{ .bg = colors.bg };
-    pub const user_message: Style = .{ .bg = colors.panel_bg };
-    pub const custom_message: Style = .{ .bg = colors.panel_bg_light };
-    pub const tool_pending: Style = .{ .bg = colors.panel_bg };
-    pub const tool_success: Style = .{};
-    pub const tool_error: Style = .{ .bg = colors.panel_bg_red };
+    pub const user_message: Style = .{ .bg = colors.user_message_bg };
 };
 
 pub const markdown_styles = struct {
@@ -367,7 +360,7 @@ test "transparent span inherits row or app surface" {
     try std.testing.expect(std.meta.eql(app.bg, surface.app.bg));
 
     var explicit = text.normal;
-    explicit.bg = colors.panel_bg_red;
+    explicit.bg = colors.bg;
     const preserved = onSurface(explicit, surface.user_message);
     try std.testing.expect(std.meta.eql(preserved.bg, explicit.bg));
 }

@@ -17,7 +17,7 @@ const footer_bytes_max: usize = 256;
 
 pub const Status = enum { pending, running, done, failed, aborted };
 
-pub const Presentation = enum { generic, command, file, patch, symbols };
+pub const Presentation = enum { generic, command, file, patch };
 pub const BodyMode = enum { visible, hidden_on_success, summary_only };
 pub const CollapseMode = enum { head, tail };
 pub const LiveUpdates = enum { show_tail, suppress };
@@ -43,14 +43,6 @@ pub fn statusStyle(status: Status) screen.Style {
         .running => screen.text.accent,
         .done => screen.text.success,
         .failed, .aborted => screen.text.error_,
-    };
-}
-
-fn statusSurface(status: Status) screen.Style {
-    return switch (status) {
-        .pending, .running => screen.surface.tool_pending,
-        .done => screen.surface.tool_success,
-        .failed, .aborted => screen.surface.tool_error,
     };
 }
 
@@ -144,40 +136,39 @@ pub const TailBuffer = struct {
 
 pub fn layoutTool(allocator: std.mem.Allocator, tool: anytype, width: u16, expanded: bool) ![]layout.Line {
     const rail = statusStyle(tool.status);
-    const surface = statusSurface(tool.status);
     var out = std.ArrayList(layout.Line).empty;
     errdefer out.deinit(allocator);
     try out.ensureTotalCapacity(allocator, 10);
 
-    try appendTitleLine(allocator, &out, tool, width, expanded, surface);
+    try appendTitleLine(allocator, &out, tool, width, expanded);
 
     const visible_body = toolBodyVisible(tool, expanded);
-    if (visible_body) try appendToolPlainLine(allocator, &out, glyphs.tool_top_line, width, rail, surface);
+    if (visible_body) try appendToolPlainLine(allocator, &out, glyphs.tool_top_line, width, rail);
     if (visible_body) {
         if (tool.status == .running and !tool.tail.isEmpty()) {
-            for (0..tool.tail.count) |index| try appendToolBodyText(allocator, &out, tool.tail.line(index), width, tool.display.presentation, rail, surface);
+            for (0..tool.tail.count) |index| try appendToolBodyText(allocator, &out, tool.tail.line(index), width, tool.display.presentation, rail);
         } else if (tool.body.items.len > 0) {
             if (expanded) {
-                try appendToolBodyText(allocator, &out, tool.body.items, width, tool.display.presentation, rail, surface);
+                try appendToolBodyText(allocator, &out, tool.body.items, width, tool.display.presentation, rail);
             } else {
                 const preview = collapsedBodyPreview(tool.body.items, tool.display.collapse);
                 if (preview.omitted_lines > 0 and preview.omitted_before) {
                     const marker = try collapseHint(allocator, tool.display.collapse.mode, preview.omitted_lines);
-                    try appendToolBodyTextStyled(allocator, &out, marker, width, tool.display.presentation, rail, screen.text.muted, surface);
+                    try appendToolBodyTextStyled(allocator, &out, marker, width, tool.display.presentation, rail, screen.text.muted);
                 }
-                try appendToolBodyText(allocator, &out, preview.text, width, tool.display.presentation, rail, surface);
+                try appendToolBodyText(allocator, &out, preview.text, width, tool.display.presentation, rail);
                 if (preview.omitted_lines > 0 and !preview.omitted_before) {
                     const marker = try collapseHint(allocator, tool.display.collapse.mode, preview.omitted_lines);
-                    try appendToolBodyTextStyled(allocator, &out, marker, width, tool.display.presentation, rail, screen.text.muted, surface);
+                    try appendToolBodyTextStyled(allocator, &out, marker, width, tool.display.presentation, rail, screen.text.muted);
                 }
             }
         } else if (tool.body_truncated) {
-            try appendToolBodyTextStyled(allocator, &out, output_truncated_text, width, tool.display.presentation, rail, screen.text.muted, surface);
+            try appendToolBodyTextStyled(allocator, &out, output_truncated_text, width, tool.display.presentation, rail, screen.text.muted);
         }
-        try appendToolPlainLine(allocator, &out, glyphs.tool_bottom_line, width, rail, surface);
+        try appendToolPlainLine(allocator, &out, glyphs.tool_bottom_line, width, rail);
     }
 
-    if (try toolFooterLine(allocator, tool)) |footer| try appendToolPlainLine(allocator, &out, footer, width, screen.text.muted, surface);
+    if (try toolFooterLine(allocator, tool)) |footer| try appendToolPlainLine(allocator, &out, footer, width, screen.text.muted);
     return out.toOwnedSlice(allocator);
 }
 
@@ -202,10 +193,10 @@ pub fn appendBounded(writer: *std.Io.Writer.Allocating, text: []const u8, max_by
     truncated.* = true;
 }
 
-fn appendTitleLine(allocator: std.mem.Allocator, out: *std.ArrayList(layout.Line), tool: anytype, width: u16, expanded: bool, surface: screen.Style) !void {
+fn appendTitleLine(allocator: std.mem.Allocator, out: *std.ArrayList(layout.Line), tool: anytype, width: u16, expanded: bool) !void {
     const title = try toolTitleLine(allocator, tool, expanded);
     const clipped = screen.sliceForColumns(title, width);
-    var line: layout.Line = .{ .row_style = surface };
+    var line: layout.Line = .{};
     try appendTitleSegments(&line, clipped, tool.display.presentation);
     try out.append(allocator, line);
 }
@@ -232,7 +223,7 @@ fn appendTitleSegments(line: *layout.Line, title: []const u8, presentation: Pres
     if (std.mem.endsWith(u8, title, " (ctrl+o to expand)")) {
         try addHintedTitleRest(line, rest);
     } else switch (presentation) {
-        .file, .patch, .symbols => try addFileTitleRest(line, rest),
+        .file, .patch => try addFileTitleRest(line, rest),
         .command => try addCommandTitleRest(line, rest),
         .generic => try addTitleSegment(line, rest, screen.text.tool_title),
     }
@@ -287,33 +278,31 @@ fn toolBodyVisible(tool: anytype, expanded: bool) bool {
     };
 }
 
-fn appendToolPlainLine(allocator: std.mem.Allocator, out: *std.ArrayList(layout.Line), text: []const u8, width: u16, style: screen.Style, surface: screen.Style) !void {
-    const start = out.items.len;
+fn appendToolPlainLine(allocator: std.mem.Allocator, out: *std.ArrayList(layout.Line), text: []const u8, width: u16, style: screen.Style) !void {
     try layout.appendPlainLine(allocator, out, text, width, style);
-    for (out.items[start..]) |*line| line.row_style = surface;
 }
 
-fn appendToolBodyText(allocator: std.mem.Allocator, out: *std.ArrayList(layout.Line), text: []const u8, width: u16, presentation: Presentation, rail: screen.Style, surface: screen.Style) !void {
-    try appendToolBodyTextStyled(allocator, out, text, width, presentation, rail, screen.text.tool_output, surface);
+fn appendToolBodyText(allocator: std.mem.Allocator, out: *std.ArrayList(layout.Line), text: []const u8, width: u16, presentation: Presentation, rail: screen.Style) !void {
+    try appendToolBodyTextStyled(allocator, out, text, width, presentation, rail, screen.text.tool_output);
 }
 
-fn appendToolBodyTextStyled(allocator: std.mem.Allocator, out: *std.ArrayList(layout.Line), text: []const u8, width: u16, presentation: Presentation, rail: screen.Style, base_style: screen.Style, surface: screen.Style) !void {
+fn appendToolBodyTextStyled(allocator: std.mem.Allocator, out: *std.ArrayList(layout.Line), text: []const u8, width: u16, presentation: Presentation, rail: screen.Style, base_style: screen.Style) !void {
     if (text.len == 0) return;
     var start: usize = 0;
     while (start < text.len) {
         const end = std.mem.indexOfScalarPos(u8, text, start, '\n') orelse text.len;
-        try appendToolBodyPhysicalLine(allocator, out, text[start..end], width, presentation, rail, base_style, surface);
+        try appendToolBodyPhysicalLine(allocator, out, text[start..end], width, presentation, rail, base_style);
         if (end == text.len) break;
         start = end + 1;
     }
 }
 
-fn appendToolBodyPhysicalLine(allocator: std.mem.Allocator, out: *std.ArrayList(layout.Line), text: []const u8, width: u16, presentation: Presentation, rail: screen.Style, base_style: screen.Style, surface: screen.Style) !void {
+fn appendToolBodyPhysicalLine(allocator: std.mem.Allocator, out: *std.ArrayList(layout.Line), text: []const u8, width: u16, presentation: Presentation, rail: screen.Style, base_style: screen.Style) !void {
     const line_style = toolBodyLineStyle(presentation, text, base_style);
     const prefix_width = screen.displayWidth(glyphs.tool_body_prefix);
     const body_width: u16 = if (width <= prefix_width) 0 else @intCast(@as(usize, width) - prefix_width);
     if (text.len == 0 or body_width == 0) {
-        var line: layout.Line = .{ .row_style = surface };
+        var line: layout.Line = .{};
         try line.append(.{ .text = screen.sliceForColumns(glyphs.tool_body_prefix, width), .style = rail });
         try out.append(allocator, line);
         return;
@@ -321,7 +310,7 @@ fn appendToolBodyPhysicalLine(allocator: std.mem.Allocator, out: *std.ArrayList(
     var start: usize = 0;
     while (start < text.len) {
         const end = layout.sliceEndForWidth(text, start, body_width);
-        var line: layout.Line = .{ .row_style = surface };
+        var line: layout.Line = .{};
         try line.append(.{ .text = glyphs.tool_body_prefix, .style = rail });
         try line.append(.{ .text = text[start..end], .style = line_style });
         try out.append(allocator, line);
@@ -578,7 +567,7 @@ test "tool golden rhythm covers every status transition" {
         defer arena.deinit();
         const lines = try layoutTool(arena.allocator(), tool, 80, true);
         try std.testing.expectEqual(@as(usize, if (case.footer == null) 4 else 5), lines.len);
-        try std.testing.expect(std.meta.eql(lines[0].row_style.bg, statusSurface(case.status).bg));
+        for (lines) |line| try std.testing.expect(screen.Style.eql(line.row_style, screen.surface.transparent));
         var buffer: [96]u8 = undefined;
         try std.testing.expectEqualStrings(case.title, lines[0].copyText(&buffer));
         try std.testing.expectEqualStrings(glyphs.tool_top_line, lines[1].copyText(&buffer));

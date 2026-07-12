@@ -363,7 +363,6 @@ A footer is rendered as:
 |---|---|---|---|---|---|
 | `bash` | command | visible | last 5 lines | last 5 lines | yes |
 | `read` | file | hidden on success | first 10 lines | suppressed | no |
-| `symbols` | symbols | visible | first 10 lines | suppressed | no |
 | `edit` | patch | visible | first 10 lines | suppressed | no |
 | `write` | file | summary only | first 10 lines | suppressed | no |
 | unknown/custom | generic | visible | last 5 lines | suppressed | no |
@@ -377,7 +376,6 @@ Additional vertical behavior:
 - `write` can show a source-content preview from streamed arguments before
   execution. Result metadata can preserve that preview while suppressing raw
   final result content.
-- `symbols` rows are plain tool body rows.
 - `edit` diff rows share the same rhythm as generic body rows; only color varies.
 
 ## Notice item
@@ -607,7 +605,7 @@ Covered directly:
 - widths 0, 1, 2, 3, 4, 8, and normal with line/role invariants;
 - queue, status, viewport-hint, picker, popup, and combined chrome allocation;
 - word-aware ASCII/Unicode prose wrapping and hard-wrapped fenced code;
-- built-in bash/read/write/symbols/edit presentation paths.
+- built-in bash/read/write/edit presentation paths.
 
 Remaining focused coverage opportunities:
 

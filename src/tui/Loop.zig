@@ -4277,7 +4277,6 @@ fn mapToolDisplay(display: coding_agent.tool_metadata.Display) tui_blocks.ToolDi
             .command => .command,
             .file => .file,
             .patch => .patch,
-            .symbols => .symbols,
         },
         .body_mode = switch (display.body_mode) {
             .visible => .visible,
@@ -4893,23 +4892,6 @@ test "loop tool UX suppresses write result content when bytes written is known" 
     try expectFrameContains(&frame, "write src/tui/glyphs.zig");
     try expectFrameContains(&frame, "│ preview");
     try expectFrameNotContains(&frame, "PRIVATE FINAL CONTENT");
-}
-
-test "loop tool UX renders symbols result visibly" {
-    var loop = try Loop.initTest(std.testing.allocator, null);
-    defer loop.deinit();
-
-    var args_object: std.json.ObjectMap = .empty;
-    defer args_object.deinit(std.testing.allocator);
-    try args_object.put(std.testing.allocator, "path", .{ .string = "src/tui/Loop.zig" });
-    const args = std.json.Value{ .object = args_object };
-    try loop.transcript.apply(std.testing.io, .{ .tool_execution_start = .{ .tool_call_id = "symbols-1", .tool_name = "symbols", .args = args } });
-    const result_content = [_]ai.ToolResultContent{.{ .text = .{ .text = "750\tfn\tcomposeFrame\n1214\tfn\tpopupView" } }};
-    try loop.transcript.apply(std.testing.io, .{ .tool_execution_end = .{ .tool_call_id = "symbols-1", .tool_name = "symbols", .result = .{ .content = &result_content }, .is_error = false } });
-
-    const frame = try loop.composeFrame(80, 14);
-    try expectFrameContains(&frame, "symbols src/tui/Loop.zig");
-    try expectFrameContains(&frame, "│ 750\tfn\tcomposeFrame");
 }
 
 test "loop tool UX renders edit patch with diff styles" {

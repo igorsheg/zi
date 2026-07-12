@@ -158,7 +158,7 @@ Rules:
 - Tool execution details are converted into neutral display data before rendering.
 - Tool-specific visuals belong in `blocks.zig`, not `screen.zig`, `chrome.zig`, or
   session persistence.
-- Write/read/bash/edit/symbols presentation should be tested as user-visible UX,
+- Write/read/bash/edit presentation should be tested as user-visible UX,
   including streaming args and capped bodies.
 - Coalesce stream fragments before layout/render when ordering allows.
 - Content mutations classify layout invalidation inside `Transcript`; callers do

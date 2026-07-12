@@ -145,7 +145,7 @@ pub const LayoutWork = struct {
 const RowRole = enum {
     content,
     semantic_blank,
-    panel_padding,
+    item_padding,
     item_margin,
 };
 
@@ -1678,7 +1678,7 @@ test "transcript custom message renders padded title body and margin" {
     try std.testing.expectEqualStrings("", lines[2].copyText(&buffer));
     try std.testing.expectEqualStrings(" \"ok\"", lines[3].copyText(&buffer));
     try std.testing.expectEqualStrings("", lines[4].copyText(&buffer));
-    try std.testing.expect(std.meta.eql(lines[4].row_style.bg, screen.surface.custom_message.bg));
+    try std.testing.expect(screen.Style.eql(lines[4].row_style, screen.surface.transparent));
     try std.testing.expectEqualStrings("", lines[5].copyText(&buffer));
     try std.testing.expect(screen.Style.eql(lines[5].row_style, screen.surface.transparent));
 }
@@ -1809,7 +1809,7 @@ test "transcript compaction is a padded collapsed and expanded summary block" {
     try std.testing.expectEqualStrings("", lines[2].copyText(&buffer));
     try std.testing.expectEqualStrings(" Compacted from 1234 tokens (ctrl+o to expand)", lines[3].copyText(&buffer));
     try std.testing.expectEqualStrings("", lines[4].copyText(&buffer));
-    try std.testing.expect(std.meta.eql(lines[4].row_style.bg, screen.surface.custom_message.bg));
+    try std.testing.expect(screen.Style.eql(lines[4].row_style, screen.surface.transparent));
     try std.testing.expectEqualStrings("", lines[5].copyText(&buffer));
 
     const expanded_state: theme.LayoutState = .{ .width = 60, .height = 10, .expanded = true };
@@ -1822,7 +1822,7 @@ test "transcript compaction is a padded collapsed and expanded summary block" {
     try std.testing.expectEqualStrings("", lines[6].copyText(&buffer));
     try std.testing.expectEqualStrings(" second", lines[7].copyText(&buffer));
     try std.testing.expectEqualStrings("", lines[8].copyText(&buffer));
-    try std.testing.expect(std.meta.eql(lines[8].row_style.bg, screen.surface.custom_message.bg));
+    try std.testing.expect(screen.Style.eql(lines[8].row_style, screen.surface.transparent));
     try std.testing.expectEqualStrings("", lines[9].copyText(&buffer));
 }
 
@@ -1894,7 +1894,7 @@ fn applyItemRhythm(allocator: std.mem.Allocator, kind: Item.Kind, content: []lay
 
     for (0..padding_y) |_| {
         try lines.append(allocator, .{ .row_style = style });
-        try roles.append(allocator, .panel_padding);
+        try roles.append(allocator, .item_padding);
     }
     for (content) |source| {
         const role = contentRowRole(source);
@@ -1906,7 +1906,7 @@ fn applyItemRhythm(allocator: std.mem.Allocator, kind: Item.Kind, content: []lay
     }
     for (0..padding_y) |_| {
         try lines.append(allocator, .{ .row_style = style });
-        try roles.append(allocator, .panel_padding);
+        try roles.append(allocator, .item_padding);
     }
     for (0..item_margin_bottom) |_| {
         try lines.append(allocator, .{});
@@ -1933,7 +1933,6 @@ fn itemPaddingY(kind: Item.Kind) usize {
 fn itemStyle(kind: Item.Kind) screen.Style {
     return switch (kind) {
         .user => screen.surface.user_message,
-        .compaction, .custom => screen.surface.custom_message,
         else => screen.surface.transparent,
     };
 }
@@ -2407,7 +2406,7 @@ test "transcript invalidation has one dominance order" {
     try std.testing.expectEqual(LayoutInvalidation.rebuild, item.layout_cache.invalidation);
 }
 
-test "transcript distinguishes semantic blanks panel padding and item margins" {
+test "transcript distinguishes semantic blanks item padding and item margins" {
     var transcript = Transcript.init(std.testing.allocator);
     defer transcript.deinit();
 
@@ -2421,11 +2420,11 @@ test "transcript distinguishes semantic blanks panel padding and item margins" {
 
     try std.testing.expectEqual(cache.lines.len, cache.roles.len);
     try std.testing.expectEqualSlices(RowRole, &.{
-        .panel_padding,
+        .item_padding,
         .content,
         .semantic_blank,
         .content,
-        .panel_padding,
+        .item_padding,
         .item_margin,
     }, cache.roles);
     const semantic = transcript.resolvePosition(.{ .item_seq = 0, .line_in_item = 2 }).?;
@@ -2451,6 +2450,14 @@ test "transcript golden rhythm covers every item adjacency" {
         const second_cache = transcript.items.items[1].layout_cache.active;
         try std.testing.expect(first_cache.roles.len > 0);
         try std.testing.expect(second_cache.roles.len > 0);
+        const expected_first_style = if (first == .user) screen.surface.user_message else screen.surface.transparent;
+        const expected_second_style = if (second == .user) screen.surface.user_message else screen.surface.transparent;
+        for (first_cache.lines[0 .. first_cache.lines.len - 1]) |line| {
+            try std.testing.expect(screen.Style.eql(line.row_style, expected_first_style));
+        }
+        for (second_cache.lines[0 .. second_cache.lines.len - 1]) |line| {
+            try std.testing.expect(screen.Style.eql(line.row_style, expected_second_style));
+        }
         try std.testing.expectEqual(RowRole.item_margin, first_cache.roles[first_cache.roles.len - 1]);
         try std.testing.expect(second_cache.roles[0] != .item_margin);
         try std.testing.expectEqual(RowRole.item_margin, second_cache.roles[second_cache.roles.len - 1]);

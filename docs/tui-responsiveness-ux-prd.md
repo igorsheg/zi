@@ -797,7 +797,7 @@ The compiler error must name the missing or orphaned tool.
 
 - Adding a temporary builtin name without metadata fails compilation.
 - Adding temporary orphaned metadata fails compilation.
-- Existing read/bash/edit/write/symbols presentation fixtures remain green.
+- Existing read/bash/edit/write presentation fixtures remain green.
 - Unknown custom tools still render safely with the generic policy.
 
 ## 12. Persistence and frontend scope
