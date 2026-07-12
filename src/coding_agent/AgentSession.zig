@@ -26,7 +26,7 @@ const max_compaction_summary_prompt_bytes = session_manager.max_compaction_seria
 const live_prompt_event_capacity_count = 64;
 
 const summarization_system_prompt =
-    \\You are a context summarization assistant. Your task is to read a conversation between a user and an AI coding assistant, then produce a structured summary following the exact format specified.
+    \\You are a context summarization assistant. Your task is to read a conversation between a user and an AI assistant, then produce a structured summary following the exact format specified.
     \\
     \\Do NOT continue the conversation. Do NOT respond to any questions in the conversation. ONLY output the structured summary.
 ;
@@ -210,6 +210,7 @@ pub const SettleContext = struct {
 /// source. The producer streams; the owner polls; settle applies the result.
 pub const CompactionRun = struct {
     state: enum { producing, cancel_requested, settled } = .producing,
+    phase: Phase,
     stream: agent_mod.loop.AgentEventStream = undefined,
     buffer: [live_prompt_event_capacity_count]agent_mod.loop.StreamEvent = undefined,
     prompts: [1]agent_mod.AgentMessage = undefined,
@@ -217,8 +218,14 @@ pub const CompactionRun = struct {
     reason: CompactionReason,
     will_retry: bool,
     input: session_manager.CompactionSummaryInput,
-    summary_prompt: []const u8,
+    history_prompt: []const u8,
+    turn_prefix_prompt: ?[]const u8,
+    history_summary: ?[]const u8 = null,
     outcome: Outcome = .pending,
+    wake_io: ?std.Io = null,
+    wake: ?*runtime.WakeEvent = null,
+
+    const Phase = enum { history, turn_prefix };
 
     const Outcome = union(enum) {
         pending,
@@ -295,7 +302,11 @@ pub const RunHandle = struct {
     pub fn setWake(self: *RunHandle, io: std.Io, wake: *runtime.WakeEvent) void {
         switch (self.run) {
             .prompt => |run| run.stream.setWake(io, wake),
-            .compaction => |run| run.stream.setWake(io, wake),
+            .compaction => |run| {
+                run.wake_io = io;
+                run.wake = wake;
+                run.stream.setWake(io, wake);
+            },
         }
     }
 
@@ -763,11 +774,15 @@ pub fn queuePrompt(
 pub fn settlePromptRun(self: *AgentSession, context: SettleContext) !SettleVerdict {
     // Context overflow: start one summary run per operation; the owner
     // drives it as the compacting phase and resubmits on success.
-    if (!context.overflow_retry_used and
-        self.events.context_overflow_count > context.overflow_count_before)
-    {
-        if (try self.startCompactionRun(.overflow, true, null)) |compaction_run| {
-            return .{ .compact = compaction_run };
+    if (self.events.context_overflow_count > context.overflow_count_before) {
+        const will_retry = if (self.agent.state.messages.len > 0) retry: {
+            const last = self.agent.state.messages[self.agent.state.messages.len - 1];
+            break :retry last == .assistant and last.assistant.stop_reason != .stop;
+        } else true;
+        if (!will_retry or !context.overflow_retry_used) {
+            if (try self.startCompactionRun(.overflow, will_retry, null)) |compaction_run| {
+                return .{ .compact = compaction_run };
+            }
         }
     }
 
@@ -922,37 +937,90 @@ pub fn startCompactionRun(
 
     const serialized_input = try input.serialize(self.allocator);
     defer self.allocator.free(serialized_input);
-    const turn_prefix_input = if (input.is_split_turn)
-        try input.serializeTurnPrefix(self.allocator)
-    else
-        null;
-    defer if (turn_prefix_input) |text| self.allocator.free(text);
-    const summary_prompt = try self.buildCompactionSummaryPrompt(
+    const history_prompt = try self.buildCompactionHistoryPrompt(
         serialized_input,
-        turn_prefix_input,
         input.previous_summary != null,
         custom_instructions,
     );
-    errdefer self.allocator.free(summary_prompt);
+    errdefer self.allocator.free(history_prompt);
+
+    const turn_prefix_prompt = if (input.is_split_turn) blk: {
+        const serialized_prefix = try input.serializeTurnPrefix(self.allocator);
+        defer self.allocator.free(serialized_prefix);
+        break :blk try self.buildCompactionTurnPrefixPrompt(serialized_prefix);
+    } else null;
+    errdefer if (turn_prefix_prompt) |prompt| self.allocator.free(prompt);
 
     const run = try self.allocator.create(CompactionRun);
     errdefer self.allocator.destroy(run);
+    const skip_empty_history = turn_prefix_prompt != null and input.messages.len == 0;
+    const history_summary = if (skip_empty_history) try self.allocator.dupe(u8, "No prior history.") else null;
+    errdefer if (history_summary) |summary| self.allocator.free(summary);
+    const cancel = try runtime.CancelSource.init(self.allocator, self.io);
+    errdefer cancel.deinit();
     run.* = .{
-        .cancel = try runtime.CancelSource.init(self.allocator, self.io),
+        .phase = if (skip_empty_history) .turn_prefix else .history,
+        .cancel = cancel,
         .reason = reason,
         .will_retry = will_retry,
         .input = input,
-        .summary_prompt = summary_prompt,
+        .history_prompt = history_prompt,
+        .turn_prefix_prompt = turn_prefix_prompt,
+        .history_summary = history_summary,
+    };
+    self.startCompactionPhase(run);
+    return run;
+}
+
+fn buildCompactionHistoryPrompt(
+    self: *AgentSession,
+    serialized_input: []const u8,
+    has_previous_summary: bool,
+    custom_instructions: ?[]const u8,
+) ![]const u8 {
+    var writer: std.Io.Writer.Allocating = .init(self.allocator);
+    errdefer writer.deinit();
+    try appendCompactionPromptBounded(&writer, serialized_input);
+    try appendCompactionPromptBounded(&writer, "\n\n");
+    try appendCompactionPromptBounded(
+        &writer,
+        if (has_previous_summary) update_summarization_prompt else summarization_prompt,
+    );
+    if (custom_instructions) |instructions| {
+        try appendCompactionPromptBounded(&writer, "\n\nAdditional focus: ");
+        try appendCompactionPromptBounded(&writer, instructions);
+    }
+    return writer.toOwnedSlice();
+}
+
+fn buildCompactionTurnPrefixPrompt(self: *AgentSession, serialized_input: []const u8) ![]const u8 {
+    var writer: std.Io.Writer.Allocating = .init(self.allocator);
+    errdefer writer.deinit();
+    try appendCompactionPromptBounded(&writer, serialized_input);
+    try appendCompactionPromptBounded(&writer, "\n\n");
+    try appendCompactionPromptBounded(&writer, turn_prefix_summarization_prompt);
+    return writer.toOwnedSlice();
+}
+
+fn startCompactionPhase(self: *AgentSession, run: *CompactionRun) void {
+    const prompt = switch (run.phase) {
+        .history => run.history_prompt,
+        .turn_prefix => run.turn_prefix_prompt.?,
     };
     run.prompts[0] = .{ .user = .{
-        .content = .{ .string = run.summary_prompt },
+        .content = .{ .string = prompt },
         .timestamp = 0,
     } };
 
-    // The summary call is a bare one-shot loop run: empty context, no tools,
-    // no queue or tool hooks. The loop owns provider auth and streaming.
+    // Each summary call is a bare one-shot loop run: empty context, no tools,
+    // no queue hooks. Split turns run history first, then the turn prefix,
+    // matching Pi while retaining one owner-visible CompactionRun.
     var config = self.agent.loopConfig();
-    config.options.stream.max_tokens = compactionSummaryMaxTokens(self.agent.state.model, self.compaction_settings.reserve_tokens);
+    config.options.stream.max_tokens = compactionSummaryMaxTokens(
+        self.agent.state.model,
+        self.compaction_settings.reserve_tokens,
+        if (run.phase == .history) 8 else 5,
+    );
     config.get_steering_messages = null;
     config.get_follow_up_messages = null;
     config.before_tool_call = null;
@@ -968,37 +1036,7 @@ pub fn startCompactionRun(
         run.cancel.token(),
         &run.buffer,
     );
-    return run;
-}
-
-fn buildCompactionSummaryPrompt(
-    self: *AgentSession,
-    serialized_input: []const u8,
-    turn_prefix_input: ?[]const u8,
-    has_previous_summary: bool,
-    custom_instructions: ?[]const u8,
-) ![]const u8 {
-    var writer: std.Io.Writer.Allocating = .init(self.allocator);
-    errdefer writer.deinit();
-    try appendCompactionPromptBounded(&writer, serialized_input);
-    try appendCompactionPromptBounded(&writer, "\n\n");
-    try appendCompactionPromptBounded(&writer, if (has_previous_summary) update_summarization_prompt else summarization_prompt);
-    if (custom_instructions) |instructions| {
-        try appendCompactionPromptBounded(&writer, "\n\nAdditional focus: ");
-        try appendCompactionPromptBounded(&writer, instructions);
-    }
-    if (turn_prefix_input) |prefix_input| {
-        try appendCompactionPromptBounded(&writer, "\n\n---\n\n");
-        try appendCompactionPromptBounded(&writer, prefix_input);
-        try appendCompactionPromptBounded(&writer, "\n\n");
-        try appendCompactionPromptBounded(&writer, turn_prefix_summarization_prompt);
-        try appendCompactionPromptBounded(
-            &writer,
-            "\n\nAppend the result after the main summary under this heading exactly:\n\n" ++
-                "---\n\n**Turn Context (split turn):**\n\n",
-        );
-    }
-    return writer.toOwnedSlice();
+    if (run.wake_io) |io| run.stream.setWake(io, run.wake.?);
 }
 
 fn appendCompactionPromptBounded(writer: *std.Io.Writer.Allocating, text: []const u8) !void {
@@ -1010,8 +1048,8 @@ fn appendCompactionPromptBounded(writer: *std.Io.Writer.Allocating, text: []cons
     try writer.writer.writeAll(text);
 }
 
-fn compactionSummaryMaxTokens(model: ai.Model, reserve_tokens: u64) ?u32 {
-    const reserve_output = (reserve_tokens * 8) / 10;
+fn compactionSummaryMaxTokens(model: ai.Model, reserve_tokens: u64, tenths: u64) ?u32 {
+    const reserve_output = (reserve_tokens * tenths) / 10;
     const model_limit = if (model.max_tokens > 0) model.max_tokens else std.math.maxInt(u32);
     const raw = @min(reserve_output, model_limit, std.math.maxInt(u32));
     if (raw == 0) return 1;
@@ -1028,6 +1066,22 @@ fn compactionSummaryWithFileOperations(
     var modified_files = std.ArrayList([]const u8).empty;
     defer modified_files.deinit(self.allocator);
 
+    if (input.previous_summary) |previous_summary| {
+        try collectTaggedFileOperations(
+            self.allocator,
+            previous_summary,
+            "<read-files>",
+            "</read-files>",
+            &read_files,
+        );
+        try collectTaggedFileOperations(
+            self.allocator,
+            previous_summary,
+            "<modified-files>",
+            "</modified-files>",
+            &modified_files,
+        );
+    }
     try collectCompactionFileOperations(self.allocator, input.messages, &read_files, &modified_files);
     try collectCompactionFileOperations(self.allocator, input.turn_prefix_messages, &read_files, &modified_files);
     removeModifiedFilesFromReadFiles(&read_files, modified_files.items);
@@ -1056,6 +1110,23 @@ fn compactionSummaryWithFileOperations(
         try appendCompactionSummaryBounded(&writer, "</modified-files>");
     }
     return writer.toOwnedSlice();
+}
+
+fn collectTaggedFileOperations(
+    allocator: std.mem.Allocator,
+    summary: []const u8,
+    open: []const u8,
+    close: []const u8,
+    files: *std.ArrayList([]const u8),
+) !void {
+    const start = std.mem.lastIndexOf(u8, summary, open) orelse return;
+    const body_start = start + open.len;
+    const relative_end = std.mem.indexOf(u8, summary[body_start..], close) orelse return;
+    var lines = std.mem.splitScalar(u8, summary[body_start .. body_start + relative_end], '\n');
+    while (lines.next()) |line| {
+        const path = std.mem.trim(u8, line, " \t\r");
+        if (path.len > 0) try appendUniqueString(allocator, files, path);
+    }
 }
 
 fn collectCompactionFileOperations(
@@ -1133,13 +1204,37 @@ pub fn applyCompactionRunProgress(
     var event = progress orelse {
         if (run.state == .cancel_requested) {
             _ = run.stream.awaitProducer() catch {};
-            if (run.outcome == .summary) self.allocator.free(run.outcome.summary);
-            run.outcome = .{ .failure = error.OperationCancelled };
-        } else {
-            run.stream.awaitProducer() catch |err| {
-                if (run.outcome == .summary) self.allocator.free(run.outcome.summary);
-                run.outcome = .{ .failure = err };
+            replaceCompactionOutcomeWithFailure(self.allocator, run, error.OperationCancelled);
+            run.state = .settled;
+            return false;
+        }
+        run.stream.awaitProducer() catch |err| {
+            replaceCompactionOutcomeWithFailure(self.allocator, run, err);
+        };
+        if (run.outcome != .summary) {
+            run.state = .settled;
+            return false;
+        }
+        if (run.phase == .history and run.turn_prefix_prompt != null) {
+            run.history_summary = run.outcome.summary;
+            run.outcome = .pending;
+            run.stream.deinit();
+            run.phase = .turn_prefix;
+            self.startCompactionPhase(run);
+            return true;
+        }
+        if (run.phase == .turn_prefix) {
+            const combined = combineSplitCompactionSummaries(
+                self.allocator,
+                run.history_summary.?,
+                run.outcome.summary,
+            ) catch |err| {
+                replaceCompactionOutcomeWithFailure(self.allocator, run, err);
+                run.state = .settled;
+                return false;
             };
+            self.allocator.free(run.outcome.summary);
+            run.outcome = .{ .summary = combined };
         }
         run.state = .settled;
         return false;
@@ -1150,7 +1245,7 @@ pub fn applyCompactionRunProgress(
         .message_end => |payload| switch (payload.message) {
             .assistant => |assistant| {
                 const summary = extractCompactionSummary(self.allocator, assistant) catch |err| {
-                    run.outcome = .{ .failure = err };
+                    replaceCompactionOutcomeWithFailure(self.allocator, run, err);
                     return true;
                 };
                 if (run.outcome == .summary) self.allocator.free(run.outcome.summary);
@@ -1161,6 +1256,28 @@ pub fn applyCompactionRunProgress(
         else => {},
     }
     return true;
+}
+
+fn replaceCompactionOutcomeWithFailure(
+    allocator: std.mem.Allocator,
+    run: *CompactionRun,
+    err: anyerror,
+) void {
+    if (run.outcome == .summary) allocator.free(run.outcome.summary);
+    run.outcome = .{ .failure = err };
+}
+
+fn combineSplitCompactionSummaries(
+    allocator: std.mem.Allocator,
+    history_summary: []const u8,
+    turn_prefix_summary: []const u8,
+) ![]const u8 {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+    try appendCompactionSummaryBounded(&writer, history_summary);
+    try appendCompactionSummaryBounded(&writer, "\n\n---\n\n**Turn Context (split turn):**\n\n");
+    try appendCompactionSummaryBounded(&writer, turn_prefix_summary);
+    return writer.toOwnedSlice();
 }
 
 /// Terminal compaction policy. On success: persist the compaction entry,
@@ -1177,12 +1294,8 @@ pub fn settleCompactionRun(self: *AgentSession, run: *CompactionRun) !SettleVerd
                 .failure => |failure| failure,
                 else => error.MissingCompactionSummary,
             };
-            if (run.will_retry) {
-                self.events.failRetry(@errorName(err), null);
-                return .failed;
-            }
-            if (run.reason == .manual) return .failed;
-            return .{ .retry = .{ .kind = .resubmit_prompt, .delay_ms = 0 } };
+            if (run.will_retry) self.events.failRetry(@errorName(err), null);
+            return .failed;
         },
     };
 
@@ -1209,12 +1322,15 @@ pub fn settleCompactionRun(self: *AgentSession, run: *CompactionRun) !SettleVerd
     defer session_manager.SessionManager.deinitContextMessages(self.allocator, messages);
     try self.agent.replaceMessages(messages);
 
-    if (run.will_retry) {
-        const attempt = self.events.beginRetryAttempt();
-        _ = attempt;
-        return .{ .retry = .{ .kind = .resubmit_prompt, .delay_ms = 0 } };
+    if (!run.will_retry) return .completed;
+    if (self.agent.state.messages.len > 0) {
+        const last = self.agent.state.messages[self.agent.state.messages.len - 1];
+        if (last == .assistant and last.assistant.stop_reason == .error_) {
+            try self.removeLastAssistantRuntimeMessage();
+        }
     }
-    if (run.reason == .manual) return .completed;
+    const attempt = self.events.beginRetryAttempt();
+    _ = attempt;
     return .{ .retry = .{ .kind = .resubmit_prompt, .delay_ms = 0 } };
 }
 
@@ -1226,8 +1342,7 @@ pub fn cancelCompactionRun(self: *AgentSession, run: *CompactionRun) RunHandle.C
             run.state = .cancel_requested;
             run.cancel.request();
             run.stream.cancelProducer() catch {};
-            if (run.outcome == .summary) self.allocator.free(run.outcome.summary);
-            run.outcome = .{ .failure = error.OperationCancelled };
+            replaceCompactionOutcomeWithFailure(self.allocator, run, error.OperationCancelled);
             run.state = .settled;
             break :blk .requested;
         },
@@ -1245,7 +1360,9 @@ pub fn destroyCompactionRun(self: *AgentSession, run: *CompactionRun) void {
     run.stream.deinit();
     run.cancel.deinit();
     if (run.outcome == .summary) self.allocator.free(run.outcome.summary);
-    self.allocator.free(run.summary_prompt);
+    if (run.history_summary) |summary| self.allocator.free(summary);
+    self.allocator.free(run.history_prompt);
+    if (run.turn_prefix_prompt) |prompt| self.allocator.free(prompt);
     run.input.deinit();
     self.allocator.destroy(run);
 }
@@ -1472,6 +1589,24 @@ test "tool result details can request error classification" {
     try object.put(std.testing.allocator, "isError", .{ .bool = true });
     try std.testing.expect(toolResultRequestsError(.{ .object = object }));
     try std.testing.expect(!toolResultRequestsError(null));
+}
+
+test "compaction summary carries forward pi-generated file operation tags" {
+    const input: session_manager.CompactionSummaryInput = .{
+        .allocator = std.testing.allocator,
+        .messages = &.{},
+        .previous_summary = "prior\n\n<read-files>\nREADME.md\nsrc/main.zig\n</read-files>" ++
+            "\n\n<modified-files>\nsrc/main.zig\n</modified-files>",
+        .first_kept_entry_id = "00000002",
+        .tokens_before = 1,
+    };
+    var session: AgentSession = undefined;
+    session.allocator = std.testing.allocator;
+    const summary = try session.compactionSummaryWithFileOperations("updated summary", input);
+    defer std.testing.allocator.free(summary);
+
+    try std.testing.expect(std.mem.indexOf(u8, summary, "<read-files>\nREADME.md\n</read-files>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, summary, "<modified-files>\nsrc/main.zig\n</modified-files>") != null);
 }
 
 test "compaction summary appends file operation tags" {
@@ -1907,8 +2042,7 @@ test "agent session auto compaction summarizes persists and replaces context" {
     try driveCompactionRun(&session, run);
     const verdict = try session.settleCompactionRun(run);
     session.destroyCompactionRun(run);
-    const expected: SettleVerdict = .{ .retry = .{ .kind = .resubmit_prompt, .delay_ms = 0 } };
-    try std.testing.expectEqual(expected, verdict);
+    try std.testing.expectEqual(SettleVerdict.completed, verdict);
 
     try std.testing.expectEqual(@as(usize, 1), provider.call_count);
     try std.testing.expectEqualStrings("generated summary", session.manager.entries.items[2].compaction.summary);
@@ -1924,6 +2058,52 @@ test "agent session auto compaction summarizes persists and replaces context" {
     defer loaded.deinit();
     try std.testing.expect(loaded.entries.items[2] == .compaction);
     try std.testing.expectEqualStrings("generated summary", loaded.entries.items[2].compaction.summary);
+}
+
+test "agent session split-turn compaction runs sequential history and prefix summaries" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var provider = try ai.FauxProvider.init(std.testing.allocator, .{});
+    defer provider.deinit();
+    const history_content = [_]ai.AssistantContent{ai.faux.text("history summary")};
+    const prefix_content = [_]ai.AssistantContent{ai.faux.text("prefix summary")};
+    const summaries = [_]ai.AssistantMessage{
+        ai.faux.assistantMessage(&history_content, .{ .stop_reason = .stop }),
+        ai.faux.assistantMessage(&prefix_content, .{ .stop_reason = .stop }),
+    };
+    try provider.setResponses(&summaries);
+    var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
+
+    var session = try initCompactionTestSession(task_runtime, tmp.dir, &provider, null);
+    defer shutdownAndDeinit(&session);
+    session.compaction_settings.keep_recent_tokens = 1;
+    _ = try appendTestMessage(&session, .{ .user = .{
+        .content = .{ .string = "old history" },
+        .timestamp = 0,
+    } }, "t1");
+    _ = try appendTestMessage(&session, .{ .user = .{
+        .content = .{ .string = "large turn request" },
+        .timestamp = 0,
+    } }, "t2");
+    const kept_blocks = [_]ai.AssistantContent{ai.faux.text("kept suffix")};
+    _ = try appendTestMessage(&session, .{ .assistant = ai.faux.assistantMessage(
+        &kept_blocks,
+        .{ .stop_reason = .stop },
+    ) }, "t3");
+
+    const run = (try session.startCompactionRun(.manual, false, "focus")).?;
+    try std.testing.expect(run.input.is_split_turn);
+    try std.testing.expect(std.mem.indexOf(u8, run.history_prompt, "Additional focus: focus") != null);
+    try driveCompactionRun(&session, run);
+    try std.testing.expectEqual(@as(usize, 2), provider.call_count);
+    try std.testing.expectEqualStrings(
+        "history summary\n\n---\n\n**Turn Context (split turn):**\n\nprefix summary",
+        run.outcome.summary,
+    );
+    try std.testing.expectEqual(SettleVerdict.completed, try session.settleCompactionRun(run));
+    session.destroyCompactionRun(run);
 }
 
 test "agent session auto compaction failure does not mutate history" {
@@ -1944,9 +2124,9 @@ test "agent session auto compaction failure does not mutate history" {
     try driveCompactionRun(&session, run);
     const verdict = try session.settleCompactionRun(run);
     session.destroyCompactionRun(run);
-    // A failed threshold compaction degrades: the prompt still proceeds.
-    const expected: SettleVerdict = .{ .retry = .{ .kind = .resubmit_prompt, .delay_ms = 0 } };
-    try std.testing.expectEqual(expected, verdict);
+    // A failed threshold compaction is failed maintenance; callers keep the
+    // already-completed prompt result and do not resubmit it.
+    try std.testing.expectEqual(SettleVerdict.failed, verdict);
     try std.testing.expectEqual(@as(usize, 2), session.manager.entries.items.len);
     try std.testing.expectEqual(@as(usize, 0), session.agent.state.messages.len);
 }
@@ -1982,7 +2162,7 @@ test "agent session auto compaction oversized summary does not mutate history" {
     try std.testing.expectEqual(error.CompactionSummaryTooLarge, run.outcome.failure);
     const verdict = try session.settleCompactionRun(run);
     session.destroyCompactionRun(run);
-    try std.testing.expect(verdict == .retry);
+    try std.testing.expectEqual(SettleVerdict.failed, verdict);
     try std.testing.expectEqual(@as(usize, 2), session.manager.entries.items.len);
     drainAllPublicEvents(&session);
 }
@@ -2024,10 +2204,56 @@ test "overflow settle starts compaction and arms the resubmit retry" {
     try std.testing.expect(session.manager.entries.items[3] == .compaction);
     try std.testing.expectEqual(@as(u8, 1), session.retryAttempt());
 
-    // The overflow budget is one compaction per operation.
-    const second = try session.settlePromptRun(.{ .overflow_count_before = 0, .overflow_retry_used = true });
+    // A second overflow after the compact-and-retry attempt is terminal.
+    _ = try session.agent.beginRun();
+    try emitAssistantError(&session, "maximum context length exceeded again");
+    session.agent.finishRun();
+    const second = try session.settlePromptRun(.{ .overflow_count_before = 1, .overflow_retry_used = true });
     try std.testing.expect(second == .failed);
     drainAllPublicEvents(&session);
+}
+
+test "successful over-window response compacts without retry" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var provider = try ai.FauxProvider.init(std.testing.allocator, .{});
+    defer provider.deinit();
+    const summary_content = [_]ai.AssistantContent{ai.faux.text("successful overflow summary")};
+    const summaries = [_]ai.AssistantMessage{
+        ai.faux.assistantMessage(&summary_content, .{ .stop_reason = .stop }),
+        ai.faux.assistantMessage(&summary_content, .{ .stop_reason = .stop }),
+    };
+    try provider.setResponses(&summaries);
+    var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
+
+    var session = try initCompactionTestSession(task_runtime, tmp.dir, &provider, null);
+    defer shutdownAndDeinit(&session);
+    _ = try session.agent.beginRun();
+    try emitUserMessageEnd(&session, "aaaaaaaa");
+    try emitUserMessageEnd(&session, "bbbbbbbb");
+    const answer_content = [_]ai.AssistantContent{ai.faux.text("completed answer")};
+    const answer = ai.faux.assistantMessage(&answer_content, .{ .stop_reason = .stop });
+    try session.agent.emitEvent(.{ .message_end = .{ .message = .{ .assistant = answer } } });
+    session.events.context_overflow_count = 1;
+    session.agent.finishRun();
+    drainAllPublicEvents(&session);
+
+    const verdict = try session.settlePromptRun(.{ .overflow_count_before = 0, .overflow_retry_used = false });
+    try std.testing.expect(verdict == .compact);
+    const run = verdict.compact;
+    var run_destroyed = false;
+    defer if (!run_destroyed) {
+        _ = session.cancelCompactionRun(run);
+        session.destroyCompactionRun(run);
+    };
+    try std.testing.expect(!run.will_retry);
+    try driveCompactionRun(&session, run);
+    try std.testing.expectEqual(SettleVerdict.completed, try session.settleCompactionRun(run));
+    session.destroyCompactionRun(run);
+    run_destroyed = true;
+    try std.testing.expectEqual(@as(u8, 0), session.retryAttempt());
 }
 
 test "start compaction run returns null when disabled or nothing to compact" {

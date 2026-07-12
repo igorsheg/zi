@@ -43,7 +43,7 @@ pub const Action = union(enum) {
     model: []const u8,
     resume_session: []const u8,
     new_session,
-    compact,
+    compact: []const u8,
     settings,
     thinking_level: agent.ThinkingLevel,
     hide_thinking: bool,
@@ -121,7 +121,7 @@ pub fn dispatch(text: []const u8) ?Action {
         .model => .{ .model = invocation.args },
         .resume_session => .{ .resume_session = invocation.args },
         .new_session => .new_session,
-        .compact => .compact,
+        .compact => .{ .compact = invocation.args },
         .settings => settingsAction(invocation.args),
     };
 }
@@ -181,5 +181,6 @@ test "slash command catalog formats help from builtin source" {
 test "slash dispatch maps settings actions" {
     try std.testing.expectEqual(agent.ThinkingLevel.high, dispatch("/settings thinking:high").?.thinking_level);
     try std.testing.expectEqual(false, dispatch("/settings thinking:shown").?.hide_thinking);
+    try std.testing.expectEqualStrings("focus on files", dispatch("/compact focus on files").?.compact);
     try std.testing.expectEqualStrings("wat", dispatch("/wat").?.unknown);
 }

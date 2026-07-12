@@ -720,12 +720,13 @@ pub const Loop = struct {
         session: *coding_agent.AgentSession,
         io: std.Io,
         wake: *runtime.WakeEvent,
+        custom_instructions: ?[]const u8,
     ) !void {
         if (self.run_state.state != .idle) {
             try self.notice(.warn, "busy: compacting — esc to cancel");
             return;
         }
-        const maybe = try session.startCompactionHandle(.manual, false, null);
+        const maybe = try session.startCompactionHandle(.manual, false, custom_instructions);
         var handle = maybe orelse {
             try self.notice(.info, "nothing to compact");
             return;
@@ -3236,13 +3237,18 @@ pub const Loop = struct {
                     .persist = self.shouldPersistNewSession(),
                 } }, "started new session");
             },
-            .compact => {
+            .compact => |instructions| {
                 const session = self.session orelse {
                     try self.notice(.info, "nothing to compact");
                     return .handled_clear_editor;
                 };
                 const wake = self.wake orelse return error.NoWake;
-                try self.startManualCompactionRun(session, self.io, wake);
+                try self.startManualCompactionRun(
+                    session,
+                    self.io,
+                    wake,
+                    if (instructions.len > 0) instructions else null,
+                );
             },
             .settings => {
                 try self.ensureSlashArgSpace("settings");
