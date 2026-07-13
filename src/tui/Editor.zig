@@ -2,6 +2,7 @@ const std = @import("std");
 const vaxis = @import("vaxis");
 
 pub const capacity = 4096;
+pub const expanded_capacity = 128 * 1024;
 pub const history_capacity = 100;
 pub const undo_capacity = 32;
 pub const kill_ring_capacity = 8;
@@ -9,6 +10,7 @@ pub const paste_marker_capacity = 16;
 pub const paste_marker_threshold_chars = 1000;
 pub const paste_marker_threshold_lines = 10;
 
+allocator: ?std.mem.Allocator = null,
 buffer: [capacity]u8 = undefined,
 len: usize = 0,
 cursor: usize = 0,
@@ -27,7 +29,7 @@ last_was_kill: bool = false,
 
 const Editor = @This();
 
-pub const Error = error{ EditorFull, InvalidUtf8 };
+pub const Error = error{ EditorFull, InvalidUtf8, PasteTooLarge, OutOfMemory };
 
 const Snapshot = struct {
     buffer: [capacity]u8 = undefined,
@@ -51,10 +53,43 @@ pub const MarkerId = u32;
 const PasteMarker = struct {
     id: MarkerId = 0,
     marker: Snapshot = .{},
-    text: Snapshot = .{},
+    inline_text: Snapshot = .{},
+    owned_text: ?[]u8 = null,
+
+    fn text(self: *const PasteMarker) []const u8 {
+        if (self.owned_text) |text_value| return text_value;
+        return self.inline_text.text();
+    }
+
+    fn setText(self: *PasteMarker, allocator: ?std.mem.Allocator, value: []const u8) Error!void {
+        if (value.len <= capacity) {
+            try self.inline_text.set(value, value.len);
+            return;
+        }
+        const gpa = allocator orelse return error.PasteTooLarge;
+        self.owned_text = try gpa.dupe(u8, value);
+    }
+
+    fn deinit(self: *PasteMarker, allocator: ?std.mem.Allocator) void {
+        if (self.owned_text) |text_value| allocator.?.free(text_value);
+        self.* = .{};
+    }
 };
 
 pub const Token = struct { start: usize, end: usize, text: []const u8 };
+
+pub fn init(self: *Editor, allocator: std.mem.Allocator) void {
+    std.debug.assert(self.allocator == null);
+    self.allocator = allocator;
+}
+
+pub fn deinit(self: *Editor) void {
+    while (self.paste_marker_len > 0) {
+        self.paste_marker_len -= 1;
+        self.paste_markers[self.paste_marker_len].deinit(self.allocator);
+    }
+    self.* = undefined;
+}
 
 pub fn text(self: *const Editor) []const u8 {
     return self.buffer[0..self.len];
@@ -80,11 +115,17 @@ pub fn moveCursorTo(self: *Editor, byte: usize) bool {
 
 pub fn insert(self: *Editor, bytes: []const u8) Error!void {
     if (!std.unicode.utf8ValidateSlice(bytes)) return error.InvalidUtf8;
-    if (shouldCollapsePaste(bytes)) return self.insertPasteMarker(bytes);
+    if (bytes.len > capacity - self.len) return error.EditorFull;
     try self.recordUndo();
     try self.insertRaw(bytes);
     self.history_index = null;
     self.last_was_kill = false;
+}
+
+pub fn insertPaste(self: *Editor, bytes: []const u8) Error!void {
+    if (!std.unicode.utf8ValidateSlice(bytes)) return error.InvalidUtf8;
+    if (shouldCollapsePaste(bytes)) return self.insertPasteMarker(bytes);
+    return self.insert(bytes);
 }
 
 pub fn insertNewline(self: *Editor) Error!void {
@@ -254,10 +295,45 @@ pub fn forgetMarker(self: *Editor, marker_id: MarkerId) void {
     const marker_index = self.markerIndexById(marker_id) orelse return;
     self.discardMarkerReplay(marker_id);
     const last = self.paste_marker_len - 1;
-    self.paste_markers[marker_index] = self.paste_markers[last];
+    var removed = self.paste_markers[marker_index];
+    if (marker_index != last) self.paste_markers[marker_index] = self.paste_markers[last];
     self.paste_marker_len -= 1;
+    removed.deinit(self.allocator);
     self.history_index = null;
     self.last_was_kill = false;
+}
+
+pub fn commitSubmission(self: *Editor) void {
+    self.len = 0;
+    self.cursor = 0;
+    self.undo_len = 0;
+    self.draft.len = 0;
+    self.history_index = null;
+    self.last_was_kill = false;
+    self.collectUnusedMarkers();
+}
+
+pub fn expandedTextLength(self: *const Editor) usize {
+    var written: usize = 0;
+    var index: usize = 0;
+    while (index < self.len) {
+        if (self.markerAt(index)) |marker| {
+            written += marker.text().len;
+            index += marker.marker.len;
+        } else {
+            written += 1;
+            index += 1;
+        }
+    }
+    return written;
+}
+
+pub fn allocExpandedText(self: *const Editor, allocator: std.mem.Allocator) ![]u8 {
+    const out = try allocator.alloc(u8, self.expandedTextLength());
+    errdefer allocator.free(out);
+    const expanded = try self.expandedText(out);
+    std.debug.assert(expanded.len == out.len);
+    return out;
 }
 
 pub fn expandedText(self: *const Editor, out: []u8) Error![]const u8 {
@@ -265,9 +341,10 @@ pub fn expandedText(self: *const Editor, out: []u8) Error![]const u8 {
     var index: usize = 0;
     while (index < self.len) {
         if (self.markerAt(index)) |marker| {
-            if (marker.text.len > out.len - written) return error.EditorFull;
-            @memcpy(out[written..][0..marker.text.len], marker.text.text());
-            written += marker.text.len;
+            const expansion = marker.text();
+            if (expansion.len > out.len - written) return error.EditorFull;
+            @memcpy(out[written..][0..expansion.len], expansion);
+            written += expansion.len;
             index += marker.marker.len;
             continue;
         }
@@ -282,12 +359,17 @@ pub fn expandedText(self: *const Editor, out: []u8) Error![]const u8 {
 pub fn pushHistory(self: *Editor, text_value: []const u8) void {
     if (text_value.len == 0) return;
     if (self.history_len > 0 and std.mem.eql(u8, self.history[self.history_len - 1].text(), text_value)) return;
-    if (self.history_len == history_capacity) {
-        std.mem.copyForwards(Snapshot, self.history[0 .. history_capacity - 1], self.history[1..history_capacity]);
-        self.history_len -= 1;
-    }
+    if (self.history_len == history_capacity) self.evictOldestHistory();
     self.history[self.history_len].set(text_value, text_value.len) catch return;
     self.history_len += 1;
+    self.collectUnusedMarkers();
+}
+
+pub fn clearHistory(self: *Editor) void {
+    self.history_len = 0;
+    self.history_index = null;
+    self.draft.len = 0;
+    self.collectUnusedMarkers();
 }
 
 pub fn historyPrev(self: *Editor) bool {
@@ -413,7 +495,10 @@ pub fn cursorUnitEnd(self: *const Editor, byte: usize) usize {
 pub fn insertPasteMarker(self: *Editor, bytes: []const u8) Error!void {
     var marker_text: [64]u8 = undefined;
     const line_count = countLines(bytes);
-    const marker = std.fmt.bufPrint(&marker_text, "[paste #{d} +{d} lines]", .{ self.next_paste_id, line_count }) catch return error.EditorFull;
+    const marker = if (line_count > paste_marker_threshold_lines)
+        std.fmt.bufPrint(&marker_text, "[paste #{d} +{d} lines]", .{ self.next_paste_id, line_count }) catch return error.EditorFull
+    else
+        std.fmt.bufPrint(&marker_text, "[paste #{d} {d} chars]", .{ self.next_paste_id, countCodepoints(bytes) }) catch return error.EditorFull;
     _ = try self.insertMarker(marker, bytes);
 }
 
@@ -421,16 +506,23 @@ pub fn insertMarker(self: *Editor, marker: []const u8, expansion: []const u8) Er
     if (!std.unicode.utf8ValidateSlice(marker)) return error.InvalidUtf8;
     if (!std.unicode.utf8ValidateSlice(expansion)) return error.InvalidUtf8;
     if (marker.len == 0) return error.InvalidUtf8;
+    self.collectUnusedMarkers();
+    while (self.paste_marker_len == paste_marker_capacity and self.history_len > 0) self.evictOldestHistory();
     if (self.paste_marker_len == paste_marker_capacity or marker.len > capacity - self.len) return error.EditorFull;
-    try self.recordUndo();
+    const current_expanded_len = self.expandedTextLength();
+    if (expansion.len > expanded_capacity -| current_expanded_len) return error.PasteTooLarge;
+
     const marker_id = self.next_paste_id;
     const slot = &self.paste_markers[self.paste_marker_len];
-    slot.id = marker_id;
+    slot.* = .{ .id = marker_id };
+    errdefer slot.deinit(self.allocator);
     try slot.marker.set(marker, marker.len);
-    try slot.text.set(expansion, expansion.len);
+    try slot.setText(self.allocator, expansion);
+    try self.recordUndo();
+    try self.insertRaw(marker);
     self.paste_marker_len += 1;
     self.next_paste_id +%= 1;
-    try self.insertRaw(marker);
+    self.history_index = null;
     self.last_was_kill = false;
     return marker_id;
 }
@@ -483,8 +575,11 @@ fn removeAll(buffer: []u8, len: *usize, cursor: *usize, needle: []const u8) void
 }
 
 fn shouldCollapsePaste(bytes: []const u8) bool {
-    if (bytes.len <= paste_marker_threshold_chars and countLines(bytes) <= paste_marker_threshold_lines) return false;
-    return std.mem.indexOfScalar(u8, bytes, '\n') != null;
+    return bytes.len > paste_marker_threshold_chars or countLines(bytes) > paste_marker_threshold_lines;
+}
+
+fn countCodepoints(bytes: []const u8) usize {
+    return std.unicode.utf8CountCodepoints(bytes) catch bytes.len;
 }
 
 fn countLines(bytes: []const u8) usize {
@@ -537,6 +632,30 @@ fn pushKill(self: *Editor, killed: []const u8) void {
     }
     self.kill_ring[self.kill_len].set(killed, killed.len) catch return;
     self.kill_len += 1;
+}
+
+fn evictOldestHistory(self: *Editor) void {
+    std.debug.assert(self.history_len > 0);
+    std.mem.copyForwards(Snapshot, self.history[0 .. self.history_len - 1], self.history[1..self.history_len]);
+    self.history_len -= 1;
+    self.history_index = null;
+    self.collectUnusedMarkers();
+}
+
+fn collectUnusedMarkers(self: *Editor) void {
+    var index: usize = 0;
+    while (index < self.paste_marker_len) {
+        const marker_id = self.paste_markers[index].id;
+        if (self.containsMarkerInReplay(marker_id)) {
+            index += 1;
+            continue;
+        }
+        const last = self.paste_marker_len - 1;
+        var removed = self.paste_markers[index];
+        if (index != last) self.paste_markers[index] = self.paste_markers[last];
+        self.paste_marker_len -= 1;
+        removed.deinit(self.allocator);
+    }
 }
 
 fn recordUndo(self: *Editor) Error!void {
@@ -662,11 +781,47 @@ test "editor supports multiline kill yank undo and history" {
 test "editor collapses and expands large paste markers" {
     var editor: Editor = .{};
     const paste = "line\n" ** 12;
-    try editor.insert(paste);
+    try editor.insertPaste(paste);
     try std.testing.expect(std.mem.startsWith(u8, editor.text(), "[paste #1 +13 lines]"));
     var out: [capacity]u8 = undefined;
     const expanded = try editor.expandedText(&out);
     try std.testing.expectEqualStrings(paste, expanded);
+}
+
+test "editor owns and expands paste larger than visible capacity" {
+    var editor: Editor = .{};
+    editor.init(std.testing.allocator);
+    defer editor.deinit();
+
+    const paste = try std.testing.allocator.alloc(u8, 17 * 1024);
+    defer std.testing.allocator.free(paste);
+    @memset(paste, 'x');
+    try editor.insertPaste(paste);
+    try std.testing.expect(std.mem.startsWith(u8, editor.text(), "[paste #1 17408 chars]"));
+
+    const expanded = try editor.allocExpandedText(std.testing.allocator);
+    defer std.testing.allocator.free(expanded);
+    try std.testing.expectEqualSlices(u8, paste, expanded);
+
+    editor.pushHistory(editor.text());
+    editor.commitSubmission();
+    try std.testing.expect(editor.historyPrev());
+    const recalled = try editor.allocExpandedText(std.testing.allocator);
+    defer std.testing.allocator.free(recalled);
+    try std.testing.expectEqualSlices(u8, paste, recalled);
+}
+
+test "editor rejects paste beyond expanded bound transactionally" {
+    var editor: Editor = .{};
+    editor.init(std.testing.allocator);
+    defer editor.deinit();
+    try editor.insert("draft");
+
+    const paste = try std.testing.allocator.alloc(u8, expanded_capacity + 1);
+    defer std.testing.allocator.free(paste);
+    @memset(paste, 'x');
+    try std.testing.expectError(error.PasteTooLarge, editor.insertPaste(paste));
+    try std.testing.expectEqualStrings("draft", editor.text());
 }
 
 test "editor inserts forced marker with neutral expansion" {
@@ -700,7 +855,7 @@ test "editor forgets a semantic marker from replay state" {
 test "editor treats paste marker as one cursor unit" {
     var editor: Editor = .{};
     const paste = "line\n" ** 12;
-    try editor.insert(paste);
+    try editor.insertPaste(paste);
     const marker_len = editor.text().len;
     try std.testing.expect(editor.moveLeft());
     try std.testing.expectEqual(@as(usize, 0), editor.cursorByte());

@@ -8,13 +8,15 @@ pub const carry_capacity = 64;
 pub const buffer_capacity = drain_capacity + carry_capacity;
 pub const lone_escape_timeout_ns: u64 = 10 * std.time.ns_per_ms;
 const text_capacity = 4096;
+const paste_buffer_capacity = text_capacity * 2;
 
 parser: vaxis.Parser = .{},
 buffer: [buffer_capacity]u8 = undefined,
 parser_paste_buffer: [text_capacity]u8 = undefined,
-paste_buffer: [text_capacity]u8 = undefined,
+paste_buffer: [paste_buffer_capacity]u8 = undefined,
 paste_len: usize = 0,
 paste_active: bool = false,
+pending_paste_end: bool = false,
 len: usize = 0,
 last_text: [text_capacity]u8 = undefined,
 
@@ -37,6 +39,7 @@ pub fn reset(self: *InputDecoder) void {
     self.len = 0;
     self.paste_len = 0;
     self.paste_active = false;
+    self.pending_paste_end = false;
 }
 
 pub fn nextAction(self: *InputDecoder) !?input.Action {
@@ -44,6 +47,10 @@ pub fn nextAction(self: *InputDecoder) !?input.Action {
 }
 
 pub fn nextActionWithTerminal(self: *InputDecoder, terminal: ?*Terminal) !?input.Action {
+    if (self.pending_paste_end) {
+        self.pending_paste_end = false;
+        return .paste_end;
+    }
     while (self.len > 0) {
         var paste_fba = std.heap.FixedBufferAllocator.init(&self.parser_paste_buffer);
         const result = try self.parser.parse(self.buffer[0..self.len], paste_fba.allocator());
@@ -71,10 +78,7 @@ pub fn expireLoneEscape(self: *InputDecoder) input.Action {
 fn actionFromEvent(self: *InputDecoder, event: vaxis.Event, terminal: ?*Terminal) !?input.Action {
     switch (event) {
         .key_press => |key| {
-            if (self.paste_active) {
-                try self.appendPasteKey(key);
-                return .none;
-            }
+            if (self.paste_active) return try self.appendPasteKey(key);
             return input.fromKey(key);
         },
         .key_release => return null,
@@ -83,15 +87,18 @@ fn actionFromEvent(self: *InputDecoder, event: vaxis.Event, terminal: ?*Terminal
             if (action == .none) return null;
             return action;
         },
-        .paste => |text| return .{ .insert = text },
+        .paste => |text| return .{ .paste = text },
         .paste_start => {
             self.paste_active = true;
             self.paste_len = 0;
-            return .none;
+            return .paste_begin;
         },
         .paste_end => {
             self.paste_active = false;
-            return .{ .insert = self.paste_buffer[0..self.paste_len] };
+            if (self.paste_len == 0) return .paste_end;
+            const chunk = self.takePasteChunk(self.paste_len);
+            self.pending_paste_end = true;
+            return .{ .paste_chunk = chunk };
         },
         .winsize, .color_report, .color_scheme, .cap_kitty_keyboard, .cap_kitty_graphics, .cap_rgb, .cap_sgr_pixels, .cap_unicode, .cap_da1, .cap_color_scheme_updates, .cap_multi_cursor => {
             if (terminal) |term| {
@@ -106,28 +113,44 @@ fn actionFromEvent(self: *InputDecoder, event: vaxis.Event, terminal: ?*Terminal
     }
 }
 
-fn appendPasteKey(self: *InputDecoder, key: vaxis.Key) Error!void {
+fn appendPasteKey(self: *InputDecoder, key: vaxis.Key) Error!?input.Action {
     if (key.text) |text| return self.appendPasteBytes(text);
     if (key.codepoint == vaxis.Key.tab) return self.appendPasteBytes("\t");
     if (key.codepoint == 'j' and key.mods.ctrl) return self.appendPasteBytes("\n");
     if (key.codepoint == vaxis.Key.enter) return self.appendPasteBytes("\r");
+    return null;
 }
 
-fn appendPasteBytes(self: *InputDecoder, bytes: []const u8) Error!void {
-    if (bytes.len > text_capacity - self.paste_len) return error.ActionTextTooLong;
+fn appendPasteBytes(self: *InputDecoder, bytes: []const u8) Error!?input.Action {
+    if (bytes.len > paste_buffer_capacity - self.paste_len) return error.ActionTextTooLong;
     @memcpy(self.paste_buffer[self.paste_len..][0..bytes.len], bytes);
     self.paste_len += bytes.len;
+    if (self.paste_len < text_capacity) return null;
+    return .{ .paste_chunk = self.takePasteChunk(text_capacity) };
+}
+
+fn takePasteChunk(self: *InputDecoder, count: usize) []const u8 {
+    std.debug.assert(count <= self.paste_len);
+    std.debug.assert(count <= self.last_text.len);
+    @memcpy(self.last_text[0..count], self.paste_buffer[0..count]);
+    std.mem.copyForwards(u8, self.paste_buffer[0 .. self.paste_len - count], self.paste_buffer[count..self.paste_len]);
+    self.paste_len -= count;
+    return self.last_text[0..count];
 }
 
 fn ownAction(self: *InputDecoder, action: input.Action) Error!input.Action {
     return switch (action) {
-        .insert => |text| blk: {
-            if (text.len > text_capacity) return error.ActionTextTooLong;
-            @memcpy(self.last_text[0..text.len], text);
-            break :blk .{ .insert = self.last_text[0..text.len] };
-        },
+        .insert => |text| .{ .insert = try self.ownText(text) },
+        .paste => |text| .{ .paste = try self.ownText(text) },
+        .paste_chunk => action,
         else => action,
     };
+}
+
+fn ownText(self: *InputDecoder, text: []const u8) Error![]const u8 {
+    if (text.len > text_capacity) return error.ActionTextTooLong;
+    @memcpy(self.last_text[0..text.len], text);
+    return self.last_text[0..text.len];
 }
 
 fn discard(self: *InputDecoder, count: usize) void {
@@ -190,23 +213,42 @@ test "decoder maps mouse wheel and drops non-wheel mouse" {
     try std.testing.expectEqual(@as(?input.Action, null), try decoder.nextAction());
 }
 
-test "decoder copies osc paste into insert action" {
+test "decoder copies osc paste into paste action" {
     var decoder: InputDecoder = .{};
     try decoder.feed("\x1b]52;c;aGk=\x07");
     const paste = (try decoder.nextAction()).?;
-    try std.testing.expect(paste == .insert);
-    try std.testing.expectEqualStrings("hi", paste.insert);
+    try std.testing.expect(paste == .paste);
+    try std.testing.expectEqualStrings("hi", paste.paste);
 }
 
-test "decoder aggregates bracketed paste into one insert action" {
+test "decoder streams bracketed paste as bounded actions" {
     var decoder: InputDecoder = .{};
     try decoder.feed("\x1b[200~hello\n");
+    try std.testing.expect((try decoder.nextAction()).? == .paste_begin);
     try std.testing.expectEqual(@as(?input.Action, null), try decoder.nextAction());
+
     try decoder.feed("world\x1b[201~");
-    const paste = (try decoder.nextAction()).?;
-    try std.testing.expect(paste == .insert);
-    try std.testing.expectEqualStrings("hello\nworld", paste.insert);
+    try expectPasteChunk(&decoder, "hello\nworld");
+    try std.testing.expect((try decoder.nextAction()).? == .paste_end);
     try std.testing.expectEqual(@as(?input.Action, null), try decoder.nextAction());
+}
+
+test "decoder chunks paste larger than one action" {
+    var decoder: InputDecoder = .{};
+    try decoder.feed("\x1b[200~");
+    try std.testing.expect((try decoder.nextAction()).? == .paste_begin);
+    var text: [text_capacity]u8 = @splat('x');
+    try decoder.feed(&text);
+    try expectPasteChunk(&decoder, &text);
+    try decoder.feed("y\x1b[201~");
+    try expectPasteChunk(&decoder, "y");
+    try std.testing.expect((try decoder.nextAction()).? == .paste_end);
+}
+
+fn expectPasteChunk(decoder: *InputDecoder, expected: []const u8) !void {
+    const action = (try decoder.nextAction()).?;
+    try std.testing.expect(action == .paste_chunk);
+    try std.testing.expectEqualStrings(expected, action.paste_chunk);
 }
 
 test "decoder exposes lone escape deadline and expiry" {
@@ -252,9 +294,13 @@ test "decoder fuzz random byte streams stay bounded" {
                 break;
             };
             if (action == null) break;
-            if (action.? == .insert) {
-                try std.testing.expect(action.?.insert.len <= text_capacity);
-                try std.testing.expect(std.unicode.utf8ValidateSlice(action.?.insert));
+            switch (action.?) {
+                .insert => |text| {
+                    try std.testing.expect(text.len <= text_capacity);
+                    try std.testing.expect(std.unicode.utf8ValidateSlice(text));
+                },
+                .paste, .paste_chunk => |text| try std.testing.expect(text.len <= text_capacity),
+                else => {},
             }
         }
         try std.testing.expect(decoder.pendingBytes() <= buffer_capacity);

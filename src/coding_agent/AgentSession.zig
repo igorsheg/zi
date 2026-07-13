@@ -166,6 +166,10 @@ pub const StoreOptions = union(enum) {
     restore: session_manager.SessionStore,
 };
 
+/// Raw text cap. A second check includes images and worst-case JSON escaping
+/// so accepted prompts fit the durable session-line bound without truncation.
+pub const prompt_text_bytes_max: usize = 128 * 1024;
+const prompt_line_overhead_reserve: usize = 4096;
 pub const QueuePromptKind = enum { steer, follow_up };
 
 pub const RetrySettings = struct {
@@ -687,6 +691,7 @@ pub fn startPromptRun(
     text: []const u8,
     images: []const ai.ImageContent,
 ) !*PromptRun {
+    if (!promptFitsDurableLine(text, images)) return error.PromptTooLarge;
     const run = try self.createPromptRun();
     errdefer if (run.isActive()) self.destroyPromptRun(run) else self.allocator.destroy(run);
     run.prompts[0] = try self.agent.userMessageFromText(text, images);
@@ -926,6 +931,7 @@ pub fn queuePrompt(
     images: []const ai.ImageContent,
     kind: QueuePromptKind,
 ) !void {
+    if (!promptFitsDurableLine(text, images)) return error.PromptTooLarge;
     if (!self.agent.state.isStreaming()) return error.SessionNotRunning;
     switch (kind) {
         .steer => if (!self.agent.steering_queue.hasCapacity()) return error.QueueFull,
@@ -988,6 +994,30 @@ pub fn settlePromptRun(self: *AgentSession, context: SettleContext) !SettleVerdi
 /// Settle an in-flight retry that will not run (cancel or shutdown).
 pub fn cancelRetryWait(self: *AgentSession) !void {
     try self.events.failRetry("Retry cancelled");
+}
+
+pub fn promptFitsDurableLine(text: []const u8, images: []const ai.ImageContent) bool {
+    if (text.len > prompt_text_bytes_max) return false;
+    var encoded_bytes = prompt_line_overhead_reserve +| worstCaseJsonStringBytes(text);
+    for (images) |image| {
+        encoded_bytes +|= 128;
+        encoded_bytes +|= worstCaseJsonStringBytes(image.data);
+        encoded_bytes +|= worstCaseJsonStringBytes(image.mime_type);
+    }
+    return encoded_bytes <= session_manager.max_session_line_bytes;
+}
+
+fn worstCaseJsonStringBytes(text: []const u8) usize {
+    var encoded_bytes: usize = 0;
+    for (text) |byte| {
+        encoded_bytes +|= if (byte < 0x20)
+            6
+        else if (byte == '"' or byte == '\\')
+            2
+        else
+            1;
+    }
+    return encoded_bytes;
 }
 
 fn retryBackoffMs(settings: RetrySettings, attempt: u8) u64 {
@@ -2393,6 +2423,45 @@ test "agent session initializes policy spine with definition-first builtin tools
     try std.testing.expectEqualStrings("bash", session.agent.state.tools[1].name);
     try std.testing.expectEqual(agent_mod.ToolExecutionMode.sequential, session.agent.state.tools[1].execution_mode.?);
     try std.testing.expect(std.mem.indexOf(u8, session.system_prompt_text, "global") != null);
+}
+
+test "agent session prompt bound accounts for durable JSON encoding" {
+    const ascii = try std.testing.allocator.alloc(u8, prompt_text_bytes_max);
+    defer std.testing.allocator.free(ascii);
+    @memset(ascii, 'x');
+    try std.testing.expect(promptFitsDurableLine(ascii, &.{}));
+
+    const controls = try std.testing.allocator.alloc(u8, prompt_text_bytes_max);
+    defer std.testing.allocator.free(controls);
+    @memset(controls, 0x01);
+    try std.testing.expect(promptFitsDurableLine(controls, &.{}));
+
+    const image_data = try std.testing.allocator.alloc(u8, 768 * 1024);
+    defer std.testing.allocator.free(image_data);
+    @memset(image_data, 'A');
+    const images = [_]ai.ImageContent{.{ .data = image_data, .mime_type = "image/png" }};
+    try std.testing.expect(!promptFitsDurableLine(controls, &images));
+}
+
+test "agent session rejects prompt text beyond shared byte bound" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
+    var session = try initTestSession(task_runtime, tmp.dir, .{});
+    defer shutdownAndDeinit(&session);
+
+    const oversized = try std.testing.allocator.alloc(u8, prompt_text_bytes_max + 1);
+    defer std.testing.allocator.free(oversized);
+    @memset(oversized, 'x');
+    try std.testing.expectError(error.PromptTooLarge, session.startPromptRun(oversized, &.{}));
+    try std.testing.expectError(error.PromptTooLarge, session.queuePrompt(oversized, &.{}, .steer));
+
+    const oversized_image_data = try std.testing.allocator.alloc(u8, session_manager.max_session_line_bytes);
+    defer std.testing.allocator.free(oversized_image_data);
+    @memset(oversized_image_data, 'A');
+    const images = [_]ai.ImageContent{.{ .data = oversized_image_data, .mime_type = "image/png" }};
+    try std.testing.expectError(error.PromptTooLarge, session.startPromptRun("prompt", &images));
 }
 
 test "live prompt run uses explicit bounded event buffer" {

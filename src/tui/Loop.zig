@@ -21,18 +21,26 @@ const trace_mod = @import("trace.zig");
 const Transcript = @import("Transcript.zig");
 const tui_blocks = @import("blocks.zig");
 
-pub const SubmittedPrompt = struct {
-    buffer: [Editor.capacity]u8 = undefined,
-    len: usize = 0,
+comptime {
+    std.debug.assert(Editor.expanded_capacity == coding_agent.AgentSession.prompt_text_bytes_max);
+}
 
-    pub fn set(self: *SubmittedPrompt, value: []const u8) void {
-        std.debug.assert(value.len <= self.buffer.len);
-        @memcpy(self.buffer[0..value.len], value);
-        self.len = value.len;
+pub const SubmittedPrompt = struct {
+    bytes: []u8 = &.{},
+
+    fn set(self: *SubmittedPrompt, allocator: std.mem.Allocator, value: []const u8) !void {
+        if (value.len > coding_agent.AgentSession.prompt_text_bytes_max) return error.PromptTooLarge;
+        self.deinit(allocator);
+        self.bytes = try allocator.dupe(u8, value);
     }
 
     pub fn text(self: *const SubmittedPrompt) []const u8 {
-        return self.buffer[0..self.len];
+        return self.bytes;
+    }
+
+    fn deinit(self: *SubmittedPrompt, allocator: std.mem.Allocator) void {
+        if (self.bytes.len > 0) allocator.free(self.bytes);
+        self.* = .{};
     }
 };
 
@@ -259,13 +267,14 @@ const SavedPrompt = struct {
 
     fn set(self: *SavedPrompt, allocator: std.mem.Allocator, text: []const u8, images: []const ai.ImageContent) !void {
         self.deinit(allocator);
-        self.text.set(text);
+        try self.text.set(allocator, text);
+        errdefer self.text.deinit(allocator);
         self.images = try PromptImages.copy(allocator, images);
     }
 
     fn deinit(self: *SavedPrompt, allocator: std.mem.Allocator) void {
         self.images.deinit(allocator);
-        self.text.len = 0;
+        self.text.deinit(allocator);
     }
 };
 
@@ -516,8 +525,39 @@ const Picker = struct {
     }
 };
 
+const PasteCapture = struct {
+    bytes: std.ArrayList(u8) = .empty,
+    rejecting: bool = false,
+
+    fn begin(self: *PasteCapture) void {
+        self.bytes.clearRetainingCapacity();
+        self.rejecting = false;
+    }
+
+    fn append(self: *PasteCapture, allocator: std.mem.Allocator, bytes: []const u8) !void {
+        if (self.rejecting) return;
+        if (bytes.len > Editor.expanded_capacity -| self.bytes.items.len) {
+            self.rejecting = true;
+            self.bytes.clearRetainingCapacity();
+            return;
+        }
+        try self.bytes.appendSlice(allocator, bytes);
+    }
+
+    fn reset(self: *PasteCapture) void {
+        self.bytes.clearRetainingCapacity();
+        self.rejecting = false;
+    }
+
+    fn deinit(self: *PasteCapture, allocator: std.mem.Allocator) void {
+        self.bytes.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
 const Composer = struct {
     editor: Editor = .{},
+    paste: PasteCapture = .{},
     preferred_column_cells: ?usize = null,
     completion: CompletionPopup = .{},
     picker: Picker = .{},
@@ -710,7 +750,7 @@ pub const Loop = struct {
         text: []const u8,
         images: []const ai.ImageContent,
     ) !void {
-        if (text.len > Editor.capacity) return error.EditorFull;
+        if (text.len > Editor.expanded_capacity) return error.PasteTooLarge;
         switch (self.run_state.state) {
             .idle => {},
             .running => return self.queuePromptRun(session, text, images, .steer),
@@ -728,6 +768,8 @@ pub const Loop = struct {
         errdefer saved.deinit(self.gpa);
         try saved.set(self.gpa, text, images);
         self.run_state.saved_prompt = saved;
+        saved = .{};
+        errdefer self.clearRunSavedPrompt(self.gpa);
         self.run_state.overflow_count_before = session.contextOverflowCount();
         self.run_state.overflow_retry_used = false;
         var handle = try session.startPromptHandle(text, images);
@@ -747,9 +789,9 @@ pub const Loop = struct {
         std.debug.assert(self.run_state.state == .idle);
         self.clearRunSavedPrompt(self.gpa);
         var saved: SavedPrompt = .{};
-        saved.text.set(text);
-        saved.images = try PromptImages.takeAttachments(self.gpa, attachments);
         errdefer saved.deinit(self.gpa);
+        try saved.text.set(self.gpa, text);
+        saved.images = try PromptImages.takeAttachments(self.gpa, attachments);
         var copied_bytes: usize = 0;
         for (saved.images.items) |image| copied_bytes +|= image.data.len;
         self.run_state.saved_prompt = saved;
@@ -771,8 +813,10 @@ pub const Loop = struct {
         images: []const ai.ImageContent,
         kind: coding_agent.AgentSession.QueuePromptKind,
     ) !void {
+        if (text.len > Editor.expanded_capacity) return error.PasteTooLarge;
         session.queuePrompt(text, images, kind) catch |err| switch (err) {
             error.QueueFull => try self.noticeFmt(.warn, "queue is full ({d} queued)", .{session.queuedEchoes().len}),
+            error.PromptTooLarge => try self.notice(.warn, "prompt is too large"),
             error.SessionNotRunning => std.debug.assert(false),
             else => return err,
         };
@@ -1085,7 +1129,8 @@ pub const Loop = struct {
             .persist_new_sessions = options.persist_new_sessions,
             .transcript = Transcript.initWithToolResolver(gpa, .{ .call_fn = resolveCodingAgentToolUi, .result_fn = resolveCodingAgentToolResultUi }),
         };
-        if (options.initial_prompt) |prompt| try self.composer.editor.insert(prompt);
+        self.composer.editor.init(gpa);
+        if (options.initial_prompt) |prompt| try self.composer.editor.insertPaste(prompt);
         return self;
     }
 
@@ -1093,6 +1138,7 @@ pub const Loop = struct {
         self.drainForegroundOperation();
         self.clearDraftImages();
         self.deinitRunState(self.gpa);
+        if (self.submitted_prompt) |*prompt| prompt.deinit(self.gpa);
         if (self.composer.file_index_task) |*task| {
             if (!task.hasResult()) task.cancel();
             var result = task.getResult() catch null;
@@ -1100,6 +1146,8 @@ pub const Loop = struct {
         }
         self.cancelScopedFileQuery();
         if (self.composer.file_index) |*index| index.deinit(self.gpa);
+        self.composer.paste.deinit(self.gpa);
+        self.composer.editor.deinit();
         self.transcript.deinit();
         self.* = undefined;
     }
@@ -1236,8 +1284,7 @@ pub const Loop = struct {
     fn restoreSessionFold(self: *Loop) !void {
         const session = self.session orelse return;
         self.transcript.clear();
-        self.composer.editor.history_len = 0;
-        self.composer.editor.history_index = null;
+        self.composer.editor.clearHistory();
         self.token_cache_entry_count = std.math.maxInt(usize);
         self.token_input_total = 0;
         self.token_output_total = 0;
@@ -1388,6 +1435,7 @@ pub const Loop = struct {
 
     fn dropOversizeInput(self: *Loop, count: usize) !void {
         self.decoder.reset();
+        self.composer.paste.reset();
         self.trace.addDroppedInputBytes(count);
         try self.notice(.warn, "input too large");
     }
@@ -1455,6 +1503,13 @@ pub const Loop = struct {
                 self.clearExitHint();
                 try self.insertComposerText(text);
             },
+            .paste => |text| {
+                self.clearExitHint();
+                try self.insertComposerPaste(text);
+            },
+            .paste_begin => self.composer.paste.begin(),
+            .paste_chunk => |text| try self.composer.paste.append(self.gpa, text),
+            .paste_end => try self.finishComposerPaste(),
             .key_editor => |op| {
                 self.clearExitHint();
                 try self.applyComposerEditorOp(op);
@@ -1472,10 +1527,7 @@ pub const Loop = struct {
             .submit => try self.submitPrompt(.submit),
             .steer_submit => try self.submitPrompt(.steer_submit),
             .follow_up_submit => try self.submitPrompt(.follow_up_submit),
-            .newline => {
-                try self.composer.editor.insertNewline();
-                try self.afterComposerTextMutation();
-            },
+            .newline => try self.insertComposerText("\n"),
             .dequeue_all => try self.dequeueAll(),
             .paste_image => try self.startClipboardImagePaste(),
             .clear_or_quit => try self.handleClearOrQuit(now_ns),
@@ -1489,8 +1541,29 @@ pub const Loop = struct {
     }
 
     fn insertComposerText(self: *Loop, text: []const u8) !void {
-        try self.composer.editor.insert(text);
+        self.composer.editor.insert(text) catch |err| switch (err) {
+            error.EditorFull => return self.notice(.warn, "composer is full"),
+            error.InvalidUtf8 => return self.notice(.warn, "input is not valid UTF-8"),
+            else => return err,
+        };
         try self.afterComposerTextMutation();
+    }
+
+    fn insertComposerPaste(self: *Loop, text: []const u8) !void {
+        self.composer.editor.insertPaste(text) catch |err| switch (err) {
+            error.EditorFull => return self.notice(.warn, "composer is full"),
+            error.PasteTooLarge => return self.notice(.warn, "paste is too large"),
+            error.InvalidUtf8 => return self.notice(.warn, "paste is not valid UTF-8"),
+            else => return err,
+        };
+        try self.afterComposerTextMutation();
+    }
+
+    fn finishComposerPaste(self: *Loop) !void {
+        defer self.composer.paste.reset();
+        if (self.composer.paste.rejecting) return self.notice(.warn, "paste is too large");
+        if (self.composer.paste.bytes.items.len == 0) return;
+        try self.insertComposerPaste(self.composer.paste.bytes.items);
     }
 
     fn applyComposerEditorOp(self: *Loop, op: input.EditorOp) !void {
@@ -1872,11 +1945,15 @@ pub const Loop = struct {
                 if (!preparing.task.hasResult()) return;
                 var result = preparing.task.getResult() catch null;
                 if (result) |*images| images.deinit(self.gpa);
+                var prompt = preparing.prompt;
+                var recovery_prompt = preparing.recovery_prompt;
                 var pinned_images = preparing.pinned_images;
                 const cancel = preparing.cancel;
                 cancel.deinit();
                 self.gpa.destroy(cancel);
                 self.foreground_operation = .idle;
+                prompt.deinit(self.gpa);
+                recovery_prompt.deinit(self.gpa);
                 self.returnPinnedPromptImages(&pinned_images);
             },
             .reading_clipboard => |*reading| {
@@ -1891,8 +1968,10 @@ pub const Loop = struct {
             .extension_prompt => |*operation| {
                 const services = self.services orelse return;
                 if (services.pollExtensionPromptCommand(&operation.handle) == .pending) return;
+                var invocation = operation.invocation;
                 services.deinitExtensionPromptCommand(&operation.handle);
                 self.foreground_operation = .idle;
+                invocation.deinit(self.gpa);
             },
         }
     }
@@ -3070,6 +3149,13 @@ pub const Loop = struct {
             paths[index] = attachment.path;
         }
 
+        var captured: SubmittedPrompt = .{};
+        errdefer captured.deinit(self.gpa);
+        try captured.set(self.gpa, prompt);
+        var captured_recovery: SubmittedPrompt = .{};
+        errdefer captured_recovery.deinit(self.gpa);
+        try captured_recovery.set(self.gpa, recovery_prompt);
+
         const cancel = try self.gpa.create(runtime.CancelSource);
         errdefer self.gpa.destroy(cancel);
         cancel.* = try runtime.CancelSource.init(self.gpa, self.io);
@@ -3081,10 +3167,6 @@ pub const Loop = struct {
             pinned_images.len,
             cancel.token(),
         });
-        var captured: SubmittedPrompt = .{};
-        captured.set(prompt);
-        var captured_recovery: SubmittedPrompt = .{};
-        captured_recovery.set(recovery_prompt);
         self.foreground_operation = .{ .preparing_images = .{
             .task = task,
             .cancel = cancel,
@@ -3093,6 +3175,8 @@ pub const Loop = struct {
             .recovery_prompt = captured_recovery,
             .pinned_images = pinned_images,
         } };
+        captured = .{};
+        captured_recovery = .{};
         for (pinned_images.items[0..pinned_images.len]) |attachment| {
             self.composer.editor.discardMarkerReplay(attachment.marker_id);
         }
@@ -3113,7 +3197,10 @@ pub const Loop = struct {
                 var result = preparing.task.getResult() catch |err| {
                     const apply_result = preparing.apply_result;
                     const timed_out = preparing.timed_out;
-                    const recovery_prompt = preparing.recovery_prompt;
+                    var prompt = preparing.prompt;
+                    defer prompt.deinit(self.gpa);
+                    var recovery_prompt = preparing.recovery_prompt;
+                    defer recovery_prompt.deinit(self.gpa);
                     var pinned_images = preparing.pinned_images;
                     self.finishPromptImagePreparation();
                     self.composer.editor.pushHistory(recovery_prompt.text());
@@ -3126,8 +3213,10 @@ pub const Loop = struct {
                     return;
                 };
                 const apply_result = preparing.apply_result;
-                const prompt = preparing.prompt;
-                const recovery_prompt = preparing.recovery_prompt;
+                var prompt = preparing.prompt;
+                defer prompt.deinit(self.gpa);
+                var recovery_prompt = preparing.recovery_prompt;
+                defer recovery_prompt.deinit(self.gpa);
                 var pinned_images = preparing.pinned_images;
                 self.finishPromptImagePreparation();
                 defer result.deinit(self.gpa);
@@ -3135,6 +3224,12 @@ pub const Loop = struct {
                     self.composer.editor.pushHistory(recovery_prompt.text());
                     self.returnPinnedPromptImages(&pinned_images);
                     try self.notice(.info, "image preparation canceled — press up to recover the prompt");
+                    return;
+                }
+                if (!coding_agent.AgentSession.promptFitsDurableLine(prompt.text(), result.images())) {
+                    self.composer.editor.pushHistory(recovery_prompt.text());
+                    self.returnPinnedPromptImages(&pinned_images);
+                    try self.notice(.warn, "prompt and images are too large");
                     return;
                 }
                 const session = self.session orelse {
@@ -3153,7 +3248,7 @@ pub const Loop = struct {
                     try self.notice(.warn, "image preparation failed — press up to recover the prompt");
                     return;
                 };
-                self.composer.editor.pushHistory(prompt.text());
+                self.composer.editor.pushHistory(recovery_prompt.text());
                 self.releasePinnedPromptImages(&pinned_images);
             },
             else => {},
@@ -3214,8 +3309,8 @@ pub const Loop = struct {
             },
             .handled_keep_editor, .opened_picker_keep_editor => return,
         }
-        var expanded_buffer: [Editor.capacity]u8 = undefined;
-        const expanded = try self.composer.editor.expandedText(&expanded_buffer);
+        const expanded = try self.composer.editor.allocExpandedText(self.gpa);
+        defer self.gpa.free(expanded);
         var image_serial_buffer: [prompt_image_count_max]u64 = undefined;
         const image_serials = self.draft_images.activeSerials(&self.composer.editor, &image_serial_buffer);
         if (image_serials.len > 0) {
@@ -3234,11 +3329,16 @@ pub const Loop = struct {
             try self.startPromptImagePreparation(expanded, text, image_serials);
             return;
         }
+        if (!coding_agent.AgentSession.promptFitsDurableLine(expanded, &.{})) {
+            try self.notice(.warn, "prompt is too large");
+            return;
+        }
         const session = self.session orelse {
+            if (self.submitted_prompt) |*previous| previous.deinit(self.gpa);
             self.submitted_prompt = .{};
-            self.submitted_prompt.?.set(expanded);
-            self.composer.editor.pushHistory(expanded);
-            self.composer.editor.clear();
+            try self.submitted_prompt.?.set(self.gpa, expanded);
+            self.composer.editor.pushHistory(text);
+            self.composer.editor.commitSubmission();
             self.clearDraftImages();
             return;
         };
@@ -3251,8 +3351,8 @@ pub const Loop = struct {
             else
                 try self.startPromptRun(session, self.io, wake, expanded, &.{}),
         }
-        self.composer.editor.pushHistory(expanded);
-        self.composer.editor.clear();
+        self.composer.editor.pushHistory(text);
+        self.composer.editor.commitSubmission();
         self.clearDraftImages();
     }
 
@@ -3331,13 +3431,14 @@ pub const Loop = struct {
                         return .handled_keep_editor;
                     }
                     var original: SubmittedPrompt = .{};
-                    original.set(text);
+                    try original.set(self.gpa, text);
                     const deadline_ns = nowNs(self.io) +| extension_prompt_command_deadline_ns;
                     const handle = services.?.startExtensionPromptCommand(
                         name,
                         invocation.args,
                         deadline_ns,
                     ) catch |err| {
+                        original.deinit(self.gpa);
                         try self.noticeFmt(.warn, "extension command failed: {s}", .{@errorName(err)});
                         return .handled_keep_editor;
                     };
@@ -3501,7 +3602,8 @@ pub const Loop = struct {
             .pending => return,
             .success => {
                 const prompt = services.takeExtensionPromptCommand(&operation.handle) catch |err| {
-                    const invocation = operation.invocation;
+                    var invocation = operation.invocation;
+                    defer invocation.deinit(self.gpa);
                     services.deinitExtensionPromptCommand(&operation.handle);
                     self.foreground_operation = .idle;
                     try self.restoreExtensionInvocation(&invocation);
@@ -3509,7 +3611,8 @@ pub const Loop = struct {
                     return;
                 };
                 defer services.freeExtensionPrompt(prompt);
-                const invocation = operation.invocation;
+                var invocation = operation.invocation;
+                defer invocation.deinit(self.gpa);
                 const apply_result = operation.apply_result;
                 services.deinitExtensionPromptCommand(&operation.handle);
                 self.foreground_operation = .idle;
@@ -3521,7 +3624,8 @@ pub const Loop = struct {
                 try self.submitGeneratedPrompt(prompt, invocation.text());
             },
             .failure => |failure| {
-                const invocation = operation.invocation;
+                var invocation = operation.invocation;
+                defer invocation.deinit(self.gpa);
                 const apply_result = operation.apply_result;
                 services.deinitExtensionPromptCommand(&operation.handle);
                 self.foreground_operation = .idle;
@@ -3544,8 +3648,9 @@ pub const Loop = struct {
 
     fn submitGeneratedPrompt(self: *Loop, prompt: []const u8, invocation: []const u8) !void {
         const session = self.session orelse {
+            if (self.submitted_prompt) |*previous| previous.deinit(self.gpa);
             self.submitted_prompt = .{};
-            self.submitted_prompt.?.set(prompt);
+            try self.submitted_prompt.?.set(self.gpa, prompt);
             self.composer.editor.pushHistory(invocation);
             return;
         };
@@ -3641,8 +3746,7 @@ pub const Loop = struct {
 
     fn beginInteractiveRestore(self: *Loop, success_notice: OperationNotice) void {
         self.transcript.clear();
-        self.composer.editor.history_len = 0;
-        self.composer.editor.history_index = null;
+        self.composer.editor.clearHistory();
         self.token_cache_entry_count = std.math.maxInt(usize);
         self.token_input_total = 0;
         self.token_output_total = 0;
@@ -3760,10 +3864,14 @@ pub const Loop = struct {
                 if (!preparing.task.hasResult()) preparing.task.cancel();
                 var result = preparing.task.getResult() catch null;
                 if (result) |*images| images.deinit(self.gpa);
+                var prompt = preparing.prompt;
+                var recovery_prompt = preparing.recovery_prompt;
                 var pinned_images = preparing.pinned_images;
                 preparing.cancel.deinit();
                 self.gpa.destroy(preparing.cancel);
                 self.foreground_operation = .idle;
+                prompt.deinit(self.gpa);
+                recovery_prompt.deinit(self.gpa);
                 self.returnPinnedPromptImages(&pinned_images);
             },
             .reading_clipboard => |*reading| {
@@ -3778,8 +3886,10 @@ pub const Loop = struct {
             .extension_prompt => |*operation| {
                 const services = self.services orelse return;
                 std.debug.assert(services.pollExtensionPromptCommand(&operation.handle) != .pending);
+                var invocation = operation.invocation;
                 services.deinitExtensionPromptCommand(&operation.handle);
                 self.foreground_operation = .idle;
+                invocation.deinit(self.gpa);
             },
         }
     }
@@ -3935,11 +4045,27 @@ pub const Loop = struct {
     fn restoreQueuedText(self: *Loop, session: *coding_agent.AgentSession) !void {
         if (self.composer.editor.text().len != 0) return;
         const echoes = session.queuedEchoes();
-        for (echoes, 0..) |echo, index| {
-            if (index > 0) try self.composer.editor.insert("\n");
-            try self.composer.editor.insert(echo.text);
+        var total_bytes: usize = if (echoes.len > 0) echoes.len - 1 else 0;
+        for (echoes) |echo| total_bytes +|= echo.text.len;
+        if (total_bytes > Editor.expanded_capacity) {
+            try self.notice(.warn, "queued prompts are too large to edit together");
+            return;
         }
+
+        var combined = try std.ArrayList(u8).initCapacity(self.gpa, total_bytes);
+        defer combined.deinit(self.gpa);
+        for (echoes, 0..) |echo, index| {
+            if (index > 0) combined.appendAssumeCapacity('\n');
+            combined.appendSliceAssumeCapacity(echo.text);
+        }
+        self.composer.editor.insertPaste(combined.items) catch |err| switch (err) {
+            error.EditorFull => return self.notice(.warn, "composer is full"),
+            error.PasteTooLarge => return self.notice(.warn, "queued prompts are too large to edit together"),
+            error.InvalidUtf8 => return self.notice(.warn, "queued prompts are not valid UTF-8"),
+            else => return err,
+        };
         try session.clearQueue();
+        try self.afterComposerTextMutation();
         self.dirty = true;
     }
 
@@ -4695,6 +4821,46 @@ test "loop submit snapshots editor and clears input" {
     try std.testing.expectEqualStrings("hello", loop.submittedPrompt().?);
     try std.testing.expectEqualStrings("", loop.composer.editor.text());
     try std.testing.expect(loop.dirty);
+}
+
+test "loop decoder streams large paste and submits literal content" {
+    var loop = try Loop.initTest(std.testing.allocator, null);
+    defer loop.deinit();
+
+    const paste = try std.testing.allocator.alloc(u8, 17 * 1024);
+    defer std.testing.allocator.free(paste);
+    for (paste, 0..) |*byte, index| byte.* = if (index % 79 == 78) '\n' else 'x';
+
+    try loop.feedInputBytes("\x1b[200~");
+    try loop.drainInputActions(null, 0);
+    var offset: usize = 0;
+    while (offset < paste.len) {
+        const end = @min(offset + InputDecoder.drain_capacity, paste.len);
+        try loop.feedInputBytes(paste[offset..end]);
+        try loop.drainInputActions(null, 0);
+        offset = end;
+    }
+    try loop.feedInputBytes("\x1b[201~");
+    try loop.drainInputActions(null, 0);
+    try std.testing.expect(std.mem.startsWith(u8, loop.composerText(), "[paste #1 +"));
+
+    try loop.dispatch(.submit);
+    try std.testing.expectEqualSlices(u8, paste, loop.submittedPrompt().?);
+    try std.testing.expectEqualStrings("", loop.composerText());
+}
+
+test "loop rejects oversized paste without changing draft" {
+    var loop = try Loop.initTest(std.testing.allocator, null);
+    defer loop.deinit();
+    try loop.dispatch(.{ .insert = "draft" });
+
+    var chunk: [InputDecoder.drain_capacity]u8 = @splat('x');
+    try loop.dispatch(.paste_begin);
+    for (0..Editor.expanded_capacity / chunk.len + 1) |_| {
+        try loop.dispatch(.{ .paste_chunk = &chunk });
+    }
+    try loop.dispatch(.paste_end);
+    try std.testing.expectEqualStrings("draft", loop.composerText());
 }
 
 test "loop owner step drains input before compose paint flush commit" {

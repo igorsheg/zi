@@ -23,6 +23,10 @@ pub const EditorOp = enum {
 
 pub const Action = union(enum) {
     insert: []const u8,
+    paste: []const u8,
+    paste_begin,
+    paste_chunk: []const u8,
+    paste_end,
     key_editor: EditorOp,
     submit,
     newline,

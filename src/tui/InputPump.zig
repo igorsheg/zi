@@ -83,6 +83,8 @@ pub const InputPump = struct {
     source_context: ?*anyopaque = null,
     read_fn: ?ReadFn = null,
     wake: ?*runtime.WakeEvent = null,
+    space_mutex: std.Io.Mutex = .init,
+    space_available: std.Io.Condition = .init,
 
     pub const StartOptions = struct {
         io: std.Io,
@@ -114,7 +116,14 @@ pub const InputPump = struct {
     }
 
     pub fn requestStop(self: *InputPump) void {
+        if (self.thread == null) {
+            self.stop.store(true, .release);
+            return;
+        }
+        self.space_mutex.lockUncancelable(self.io);
+        defer self.space_mutex.unlock(self.io);
         self.stop.store(true, .release);
+        self.space_available.broadcast(self.io);
     }
 
     pub fn join(self: *InputPump) void {
@@ -139,7 +148,7 @@ pub const InputPump = struct {
                 break;
             };
             if (count == 0) continue;
-            _ = self.pushBatch(buffer[0..count], nowNs(self.io));
+            if (!self.pushBatchBlocking(buffer[0..count], nowNs(self.io))) break;
         }
     }
 
@@ -170,17 +179,38 @@ pub const InputPump = struct {
             if (self.wake) |wake| wake.set(self.io);
             return false;
         }
+        self.pushAvailableBatch(bytes, read_ns);
+        return true;
+    }
+
+    fn pushBatchBlocking(self: *InputPump, bytes: []const u8, read_ns: u64) bool {
+        std.debug.assert(bytes.len <= byte_capacity);
+        self.space_mutex.lockUncancelable(self.io);
+        defer self.space_mutex.unlock(self.io);
+        while (bytes.len > self.ring.available()) {
+            if (self.stop.load(.acquire)) return false;
+            self.space_available.waitUncancelable(self.io, &self.space_mutex);
+        }
+        self.pushAvailableBatch(bytes, read_ns);
+        return true;
+    }
+
+    fn pushAvailableBatch(self: *InputPump, bytes: []const u8, read_ns: u64) void {
         const batch_start = self.ring.tail.load(.monotonic);
         for (bytes) |byte| self.ring.push(byte) catch unreachable;
         self.stamps.push(.{ .ring_pos = batch_start, .read_ns = read_ns, .byte_count = bytes.len }) catch {
             _ = self.dropped_stamps.fetchAdd(1, .monotonic);
         };
         if (self.wake) |wake| wake.set(self.io);
-        return true;
     }
 
     pub fn drainBytes(self: *InputPump, out: []u8) usize {
-        return self.ring.popSlice(out[0..@min(out.len, drain_cap)]);
+        if (self.thread == null) return self.ring.popSlice(out[0..@min(out.len, drain_cap)]);
+        self.space_mutex.lockUncancelable(self.io);
+        defer self.space_mutex.unlock(self.io);
+        const len = self.ring.popSlice(out[0..@min(out.len, drain_cap)]);
+        if (len > 0) self.space_available.signal(self.io);
+        return len;
     }
 
     pub fn popByte(self: *InputPump) ?u8 {
@@ -285,6 +315,58 @@ test "input pump exposes stamps only after batch bytes are drained" {
     try std.testing.expectEqual(@as(usize, 1), pump.drainConsumedStamps(&stamps));
     try std.testing.expectEqual(@as(u64, 10), stamps[0].read_ns);
     try std.testing.expectEqual(@as(usize, 3), stamps[0].byte_count);
+}
+
+test "input pump thread backpressures without dropping large input" {
+    const FakeSource = struct {
+        bytes: []const u8,
+        offset: usize = 0,
+
+        fn read(context: *anyopaque, out: []u8) !usize {
+            const Self = @This();
+            const self: *Self = @ptrCast(@alignCast(context));
+            if (self.offset == self.bytes.len) return error.EndOfStream;
+            const count = @min(out.len, self.bytes.len - self.offset);
+            @memcpy(out[0..count], self.bytes[self.offset..][0..count]);
+            self.offset += count;
+            return count;
+        }
+    };
+
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const input = try std.testing.allocator.alloc(u8, 40 * 1024);
+    defer std.testing.allocator.free(input);
+    for (input, 0..) |*byte, index| byte.* = @intCast(index % 251);
+    const output = try std.testing.allocator.alloc(u8, input.len);
+    defer std.testing.allocator.free(output);
+
+    var source: FakeSource = .{ .bytes = input };
+    var wake: runtime.WakeEvent = .init;
+    var pump: InputPump = .{};
+    try pump.start(.{
+        .io = io,
+        .source_context = &source,
+        .read_fn = FakeSource.read,
+        .wake = &wake,
+    });
+    defer pump.join();
+    defer pump.requestStop();
+
+    var written: usize = 0;
+    while (written < output.len) {
+        const count = pump.drainBytes(output[written..]);
+        written += count;
+        if (count > 0) continue;
+        if (pump.hasStopped()) break;
+        wake.waitTimeout(io, .{ .duration = .{ .raw = .fromMilliseconds(100), .clock = .awake } }) catch {};
+        wake.reset();
+    }
+
+    try std.testing.expectEqual(input.len, written);
+    try std.testing.expectEqualSlices(u8, input, output);
+    try std.testing.expectEqual(@as(usize, 0), pump.droppedByteCount());
 }
 
 test "input pump thread reads source into ring" {

@@ -382,6 +382,73 @@ fn expectAutonomousCadenceTrace(report: []const u8) !void {
     }
 }
 
+test "pty e2e: large bracketed paste submits without dropped input" {
+    if (!supportsForkPty()) return error.SkipZigTest;
+    const zi_bin = envValue("ZI_PTY_E2E_BIN") orelse return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "repo/.zi");
+    try tmp.dir.createDirPath(std.testing.io, "home");
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "agent/settings.json",
+        .data = "{\"defaultProvider\":\"faux\",\"defaultModel\":\"faux-default\"}\n",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "script.md", .data = "large paste accepted\n" });
+
+    const repo_abs = try tmpAbsPath(std.testing.allocator, &tmp, "repo");
+    defer std.testing.allocator.free(repo_abs);
+    const home_abs = try tmpAbsPath(std.testing.allocator, &tmp, "home");
+    defer std.testing.allocator.free(home_abs);
+    const agent_abs = try tmpAbsPath(std.testing.allocator, &tmp, "agent");
+    defer std.testing.allocator.free(agent_abs);
+    const script_abs = try tmpAbsPath(std.testing.allocator, &tmp, "script.md");
+    defer std.testing.allocator.free(script_abs);
+
+    const home_env = try std.fmt.allocPrint(std.testing.allocator, "HOME={s}", .{home_abs});
+    defer std.testing.allocator.free(home_env);
+    const agent_env = try std.fmt.allocPrint(std.testing.allocator, "ZI_CODING_AGENT_DIR={s}", .{agent_abs});
+    defer std.testing.allocator.free(agent_env);
+    const script_env = try std.fmt.allocPrint(std.testing.allocator, "ZI_FAUX_SCRIPT={s}", .{script_abs});
+    defer std.testing.allocator.free(script_env);
+
+    const paste_body = try std.testing.allocator.alloc(u8, 40 * 1024);
+    defer std.testing.allocator.free(paste_body);
+    for (paste_body, 0..) |*byte, index| byte.* = if (index % 79 == 78) '\n' else 'p';
+    const paste = try std.fmt.allocPrint(std.testing.allocator, "\x1b[200~{s}\x1b[201~", .{paste_body});
+    defer std.testing.allocator.free(paste);
+
+    const env = [_][]const u8{
+        "TERM=xterm-256color",
+        "NO_COLOR=1",
+        "ZI_ENABLE_FAUX_PROVIDER=1",
+        "ZI_FAUX_DELAY_MS=0",
+        home_env,
+        agent_env,
+        script_env,
+    };
+    var result = try runScripted(std.testing.allocator, .{
+        .argv = &.{zi_bin},
+        .env = &env,
+        .cwd = repo_abs,
+        .timeout_ms = 10_000,
+    }, &.{
+        .{ .after_ms = 1_000, .bytes = paste },
+        .{ .after_ms = 1_500, .bytes = "\r" },
+        .{ .after_ms = 4_000, .bytes = "\x03" },
+        .{ .after_ms = 4_200, .bytes = "\x03" },
+    });
+    defer result.deinit(std.testing.allocator);
+    if (result.timed_out) {
+        std.debug.print("pty large paste e2e timed out\n--- output ---\n{s}\n--- end output ---\n", .{result.output});
+        return error.TestUnexpectedResult;
+    }
+    try std.testing.expect(exitedZero(result.status));
+    try std.testing.expect(result.termios_restored != false);
+    try expectContains(result.output, "large paste accepted");
+}
+
 test "pty e2e: streamed markdown renders, escape aborts, and ctrl-c exits" {
     if (!supportsForkPty()) return error.SkipZigTest;
     const zi_bin = envValue("ZI_PTY_E2E_BIN") orelse return error.SkipZigTest;
