@@ -18,6 +18,7 @@ pub fn yield() Cancelable!void {
 
 const bounded_queue = @import("bounded_queue.zig");
 const cancel = @import("cancel.zig");
+const duplex_child = @import("duplex_child.zig");
 const event_pipe = @import("event_pipe.zig");
 const fd_readiness = @import("fd_readiness.zig");
 const json_owned = @import("json_owned.zig");
@@ -30,6 +31,10 @@ pub const BoundedQueue = bounded_queue.BoundedQueue;
 pub const ByteBuilder = @import("byte_builder.zig").ByteBuilder;
 pub const CancelSource = cancel.CancelSource;
 pub const CancelToken = cancel.CancelToken;
+pub const DuplexChild = duplex_child.DuplexChild;
+pub const DuplexChildChunk = duplex_child.Chunk;
+pub const DuplexChildFault = duplex_child.Fault;
+pub const DuplexChildStream = duplex_child.Stream;
 pub const EventPipe = event_pipe.EventPipe;
 pub const PollReadableFdError = fd_readiness.PollReadableFdError;
 pub const SharedMutex = shared_mutex.SharedMutex;
@@ -53,6 +58,7 @@ test {
     _ = @import("bounded_queue.zig");
     _ = @import("byte_builder.zig");
     _ = @import("cancel.zig");
+    _ = @import("duplex_child.zig");
     _ = @import("event_pipe.zig");
     _ = @import("fd_readiness.zig");
     _ = @import("json_owned.zig");

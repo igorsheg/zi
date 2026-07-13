@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const build_options = @import("build_options");
 const app_info = @import("../app_info.zig");
 const runtime = @import("../runtime/root.zig");
 const coding_agent = @import("../coding_agent/root.zig");
@@ -176,6 +177,37 @@ fn runTui(
     const stamp = session_manager.SessionStamp.now(process.io);
     var session_id_buffer: [48]u8 = undefined;
     const session_id = std.fmt.bufPrint(&session_id_buffer, "tui-{d}", .{stamp.nanoseconds}) catch unreachable;
+    const agent_dir = if (options.agent_dir_override) |override|
+        override
+    else
+        try paths_mod.resolveGlobalAgentDirFromEnv(process.gpa, options.environ);
+    defer if (options.agent_dir_override == null) process.gpa.free(agent_dir);
+    const discovery_paths: paths_mod.PersistencePaths = .{ .global_dir = agent_dir, .cwd = options.cwd };
+    const project_trusted = if (!app_args.extensions_enabled)
+        false
+    else
+        app_args.project_trust orelse trust: {
+            if (!try coding_agent.extension_discovery.hasProjectExtensions(
+                process.gpa,
+                process.io,
+                discovery_paths,
+                options.dir,
+            )) break :trust false;
+            break :trust try promptProjectTrust(process.io, stderr, options.cwd);
+        };
+    var extension_plan = if (app_args.extensions_enabled)
+        try buildExtensionLoadPlan(
+            process.gpa,
+            process.io,
+            options.dir,
+            agent_dir,
+            options.cwd,
+            project_trusted,
+            app_args.extensions.slice(),
+        )
+    else
+        null;
+    defer if (extension_plan) |*plan| plan.deinit();
     const selected_session_file = try selectResumeSession(process, stderr, app_args, options);
     defer if (selected_session_file) |session_file| process.gpa.free(session_file);
     const open: coding_agent.session_bootstrap.OpenSpec = if (selected_session_file) |session_file| blk: {
@@ -192,6 +224,7 @@ fn runTui(
             .open = open,
             .resume_picker = app_args.resume_picker,
             .panic_test = panic_test,
+            .extension_load_plan = if (extension_plan) |*plan| plan else null,
         }) catch return frontendStub(stderr);
     } else {
         tui.run(process, .{
@@ -199,8 +232,10 @@ fn runTui(
             .open = open,
             .resume_picker = app_args.resume_picker,
             .panic_test = panic_test,
+            .extension_load_plan = if (extension_plan) |*plan| plan else null,
         }) catch |err| switch (err) {
             error.UnsupportedCliFeature => return frontendStub(stderr),
+            error.ExtensionHostUnavailable => return error.PromptFailed,
             error.UndrainedShutdown => std.process.exit(1),
             else => return err,
         };
@@ -242,14 +277,37 @@ fn runPrompt(
         try paths_mod.resolveGlobalAgentDirFromEnv(process.gpa, options.environ);
     defer if (options.agent_dir_override == null) process.gpa.free(agent_dir);
 
+    var extension_plan = if (app_args.extensions_enabled)
+        try buildExtensionLoadPlan(
+            process.gpa,
+            process.io,
+            options.dir,
+            agent_dir,
+            cwd,
+            app_args.project_trust orelse false,
+            app_args.extensions.slice(),
+        )
+    else
+        null;
+    defer if (extension_plan) |*plan| plan.deinit();
+
     var services = try coding_agent.runtime_services.RuntimeServices.init(process.gpa, .{
         .cwd = cwd,
         .agent_dir = agent_dir,
         .dir = options.dir,
         .environ = options.environ,
         .task_runtime = task_runtime,
+        .extension_load_plan = if (extension_plan) |*plan| plan else null,
     });
     defer services.deinit();
+    if (extension_plan != null and services.extensionAvailability() != .active) {
+        if (services.extensionDiagnostic()) |diagnostic| switch (diagnostic) {
+            .startup => |name| try stderr.print("extension host unavailable: {s}\n", .{name}),
+            .host => |host| try stderr.print("extension host unavailable: {s}\n", .{@tagName(host.failure)}),
+        };
+        try stderr.flush();
+        return error.PromptFailed;
+    }
 
     const selected_session_file = try selectResumeSession(process, stderr, app_args, .{
         .cwd = cwd,
@@ -274,7 +332,7 @@ fn runPrompt(
     var session = try coding_agent.session_bootstrap.openSession(process.gpa, &services, stamp.date(), open, .{});
     defer shutdownPromptSession(&session, services.io);
 
-    const status = print_mode.run(process.gpa, &services, &session, services.io, stdout, stderr, .{
+    const status = print_mode.run(process.gpa, services.io, &services, &session, stdout, stderr, .{
         .prompt = prompt,
         .output = if (json_output) .json else .text,
     }) catch |err| switch (err) {
@@ -286,6 +344,40 @@ fn runPrompt(
         },
     };
     if (status != 0) return error.PromptFailed;
+}
+
+fn buildExtensionLoadPlan(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    agent_dir: []const u8,
+    cwd: []const u8,
+    project_trusted: bool,
+    explicit_paths: []const []const u8,
+) !?coding_agent.ExtensionHost.ExtensionLoadPlan {
+    return coding_agent.extension_discovery.discover(allocator, io, .{
+        .paths = .{ .global_dir = agent_dir, .cwd = cwd },
+        .dir = dir,
+        .project_trusted = project_trusted,
+        .explicit_paths = explicit_paths,
+    });
+}
+
+fn promptProjectTrust(io: std.Io, stderr: *std.Io.Writer, cwd: []const u8) !bool {
+    try stderr.print(
+        "Project-local extensions can execute arbitrary code. Trust extensions in {s}/{s}/{s}? [y/N] ",
+        .{ cwd, paths_mod.project_config_dir_name, paths_mod.extensions_dir_name },
+    );
+    try stderr.flush();
+    var input_buffer: [32]u8 = undefined;
+    var file_reader = std.Io.File.stdin().readerStreaming(io, &input_buffer);
+    const line = (file_reader.interface.takeDelimiter('\n') catch return false) orelse return false;
+    return projectTrustAnswer(line);
+}
+
+fn projectTrustAnswer(line: []const u8) bool {
+    const answer = std.mem.trim(u8, line, " \t\r\n");
+    return std.ascii.eqlIgnoreCase(answer, "y") or std.ascii.eqlIgnoreCase(answer, "yes");
 }
 
 fn runRpc(
@@ -377,6 +469,34 @@ fn unknownFlag(stderr: *std.Io.Writer, name: []const u8) !void {
 fn usage(stderr: *std.Io.Writer) !void {
     try args_mod.writeUsage(stderr);
     return error.InvalidCliUsage;
+}
+
+test "project trust prompt accepts only explicit yes answers" {
+    try std.testing.expect(projectTrustAnswer("y\n"));
+    try std.testing.expect(projectTrustAnswer(" YES \r\n"));
+    try std.testing.expect(!projectTrustAnswer("no\n"));
+    try std.testing.expect(!projectTrustAnswer("\n"));
+}
+
+test "extension load plan canonicalizes and owns CLI paths" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "extension.ts",
+        .data = "export default function () {}\n",
+    });
+    var plan = (try buildExtensionLoadPlan(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        "missing-agent",
+        "missing-repo",
+        false,
+        &.{"extension.ts"},
+    )).?;
+    defer plan.deinit();
+    try std.testing.expectEqual(@as(usize, 1), plan.entries.len);
+    try std.testing.expect(std.fs.path.isAbsolute(plan.entries[0].canonical_path));
 }
 
 test "cli auth logout dispatches to auth mode" {
@@ -627,6 +747,64 @@ test "cli text and json print frontends run through faux provider" {
     try std.testing.expect(std.mem.endsWith(u8, output.buffered(), "{\"type\":\"agent_settled\"}\n"));
     try std.testing.expect(std.mem.indexOf(u8, output.buffered(), "cli print ok") != null);
     try std.testing.expectEqualStrings("", stderr.buffered());
+}
+
+test "CLI auto-discovers global extensions and honors the kill switch" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try createCliTestDirs(tmp.dir);
+    try tmp.dir.createDirPath(std.testing.io, "agent/extensions");
+
+    const failing_extension =
+        \\export default function activate(zi) {
+        \\  zi.commands.registerPrompt({
+        \\    name: "COMMAND_NAME",
+        \\    description: "Fail for discovery testing",
+        \\    run: () => { throw new Error("discovered"); },
+        \\  });
+        \\}
+    ;
+    const global_source = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        failing_extension,
+        "COMMAND_NAME",
+        "global-fail",
+    );
+    defer std.testing.allocator.free(global_source);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "agent/extensions/global.ts", .data = global_source });
+
+    var environ = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ.deinit();
+    try environ.put("ZI_ENABLE_FAUX_PROVIDER", "1");
+    try environ.put("ZI_FAUX_DELAY_MS", "0");
+    try environ.put("ZI_NODE", build_options.node_executable);
+    const process = testProcess(&environ);
+
+    var output_buffer: [16 * 1024]u8 = undefined;
+    var stderr_buffer: [1024]u8 = undefined;
+    const cases = [_]struct {
+        argv: []const []const u8,
+        fails: bool,
+    }{
+        .{ .argv = &.{ "zi", "--print", "--no-session", "/global-fail" }, .fails = true },
+        .{ .argv = &.{ "zi", "--print", "--no-session", "--no-extensions", "/global-fail" }, .fails = false },
+    };
+    for (cases) |case| {
+        var output = std.Io.Writer.fixed(&output_buffer);
+        var stderr = std.Io.Writer.fixed(&stderr_buffer);
+        const app = (try args_mod.parse(case.argv[1..])).app;
+        const result = runApp(process, &output, &stderr, app, .{
+            .cwd = "repo",
+            .agent_dir_override = "agent",
+            .dir = tmp.dir,
+            .environ = process.environ,
+        });
+        if (case.fails)
+            try std.testing.expectError(error.PromptFailed, result)
+        else
+            try result;
+    }
 }
 
 test "cli json assistant failure stays zero-status while text fails" {

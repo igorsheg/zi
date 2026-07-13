@@ -8,6 +8,32 @@ pub fn build(b: *std.Build) void {
 
     const app_options = b.addOptions();
     app_options.addOption([]const u8, "version", version);
+    app_options.addOption([]const u8, "node_executable", b.findProgram(&.{"node"}, &.{}) catch "node");
+
+    const host_sources = [_][]const u8{
+        "extensions/api/index.d.ts",
+        "extensions/api/package.json",
+        "extensions/host/package.json",
+        "extensions/host/package-lock.json",
+        "extensions/host/tsconfig.json",
+        "extensions/host/scripts/build.mjs",
+        "extensions/host/scripts/typecheck.mjs",
+        "extensions/host/src/api.ts",
+        "extensions/host/src/framing.ts",
+        "extensions/host/src/loader.ts",
+        "extensions/host/src/main.ts",
+        "extensions/host/src/protocol.ts",
+        "extensions/host/src/transport.ts",
+    };
+    const host_typecheck = b.addSystemCommand(&.{ "node", "extensions/host/scripts/typecheck.mjs" });
+    const host_bundle = b.addSystemCommand(&.{ "node", "extensions/host/scripts/build.mjs" });
+    for (host_sources) |source| {
+        host_typecheck.addFileInput(b.path(source));
+        host_bundle.addFileInput(b.path(source));
+    }
+    host_bundle.step.dependOn(&host_typecheck.step);
+    const host_bundle_path = host_bundle.addOutputFileArg("extension-host.mjs");
+    const host_digest_path = host_bundle.addOutputFileArg("extension-host-digest.zig");
 
     const zi = b.addModule("zi", .{
         .root_source_file = b.path("src/root.zig"),
@@ -16,6 +42,8 @@ pub fn build(b: *std.Build) void {
         .strip = strip,
     });
     zi.addOptions("build_options", app_options);
+    zi.addAnonymousImport("extension_host_bundle", .{ .root_source_file = host_bundle_path });
+    zi.addAnonymousImport("extension_host_digest", .{ .root_source_file = host_digest_path });
     const zio_dep = b.dependency("zio", .{
         .target = target,
         .optimize = optimize,
@@ -39,6 +67,8 @@ pub fn build(b: *std.Build) void {
         },
     });
     exe_module.addOptions("build_options", app_options);
+    exe_module.addAnonymousImport("extension_host_bundle", .{ .root_source_file = host_bundle_path });
+    exe_module.addAnonymousImport("extension_host_digest", .{ .root_source_file = host_digest_path });
     const exe = b.addExecutable(.{
         .name = "zi",
         .root_module = exe_module,
@@ -71,11 +101,38 @@ pub fn build(b: *std.Build) void {
         "-c",
         "if grep -R '@import(\"zio\")\\|\\bzio\\.' -n src | grep -v 'src/runtime/zio_backend.zig'; then exit 1; fi",
     });
-    const zio_import_check_step = b.step("check-zio-imports", "Ensure zio is only imported by the private runtime backend");
+    const zio_import_check_step = b.step(
+        "check-zio-imports",
+        "Ensure zio is only imported by the private runtime backend",
+    );
     zio_import_check_step.dependOn(&zio_import_check.step);
+
+    const host_tests = b.addSystemCommand(&.{ "npm", "--prefix", "extensions/host", "test" });
+    host_tests.addFileInput(b.path("extensions/api/index.d.ts"));
+    host_tests.addFileInput(b.path("extensions/api/package.json"));
+    host_tests.addFileInput(b.path("extensions/host/package.json"));
+    host_tests.addFileInput(b.path("extensions/host/package-lock.json"));
+    host_tests.addFileInput(b.path("extensions/host/tsconfig.json"));
+    host_tests.addFileInput(b.path("extensions/host/src/api.ts"));
+    host_tests.addFileInput(b.path("extensions/host/src/framing.ts"));
+    host_tests.addFileInput(b.path("extensions/host/src/loader.ts"));
+    host_tests.addFileInput(b.path("extensions/host/src/main.ts"));
+    host_tests.addFileInput(b.path("extensions/host/src/protocol.ts"));
+    host_tests.addFileInput(b.path("extensions/host/src/transport.ts"));
+    host_tests.addFileInput(b.path("extensions/host/test/api.test.ts"));
+    host_tests.addFileInput(b.path("extensions/host/test/framing.test.ts"));
+    host_tests.addFileInput(b.path("extensions/host/test/loader.test.ts"));
+    host_tests.addFileInput(b.path("extensions/host/test/protocol.test.ts"));
+    host_tests.addFileInput(b.path("extensions/host/test/transport.test.ts"));
+    host_tests.addFileInput(b.path("extensions/host/test/fixtures/extension.ts"));
+    host_tests.addFileInput(b.path("extensions/host/test/fixtures/fixture-package/index.d.ts"));
+    host_tests.addFileInput(b.path("extensions/host/test/fixtures/fixture-package/index.js"));
+    host_tests.addFileInput(b.path("extensions/host/test/fixtures/fixture-package/package.json"));
+    b.step("host-test", "Run extension host tests").dependOn(&host_tests.step);
 
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&zio_import_check.step);
+    test_step.dependOn(&host_tests.step);
     // Serialized: the suites contain wall-clock frame-budget tests that flake
     // when a sibling test binary saturates the machine concurrently.
     const lib_tests_run = b.addRunArtifact(lib_tests);

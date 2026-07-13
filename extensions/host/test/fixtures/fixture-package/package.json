@@ -1,0 +1,10 @@
+{
+  "name": "fixture-package",
+  "version": "1.0.0",
+  "type": "module",
+  "types": "./index.d.ts",
+  "exports": {
+    "types": "./index.d.ts",
+    "default": "./index.js"
+  }
+}

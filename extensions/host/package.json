@@ -1,0 +1,22 @@
+{
+  "name": "@zi/extension-host",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs dist/extension-host.mjs dist/extension-host-digest.zig",
+    "check": "node scripts/typecheck.mjs",
+    "test": "node --test test/*.test.ts"
+  },
+  "dependencies": {
+    "jiti": "2.7.0"
+  },
+  "devDependencies": {
+    "@types/node": "22.19.19",
+    "esbuild": "0.28.1",
+    "typescript": "5.9.3"
+  }
+}

@@ -1,4 +1,5 @@
 const std = @import("std");
+const build_options = @import("build_options");
 const vaxis = @import("vaxis");
 const ai = @import("../ai/root.zig");
 const agent_mod = @import("../agent/root.zig");
@@ -45,6 +46,7 @@ pub const shutdown_cancel_bound_ns: u64 = 5 * std.time.ns_per_s;
 const session_listing_deadline_ns: u64 = 5 * std.time.ns_per_s;
 const session_opening_deadline_ns: u64 = 30 * std.time.ns_per_s;
 const prompt_image_deadline_ns: u64 = 10 * std.time.ns_per_s;
+const extension_prompt_command_deadline_ns: u64 = 30 * std.time.ns_per_s;
 const restore_entries_per_iteration_max: usize = 16;
 const restore_work_bytes_per_iteration_target: usize = 256 * 1024;
 const exit_hint_text = "press ctrl+c again to exit";
@@ -502,6 +504,7 @@ const ForegroundOperation = union(enum) {
     restoring: Restoring,
     preparing_images: PreparingImages,
     reading_clipboard: ReadingClipboard,
+    extension_prompt: ExtensionPrompt,
 
     const Listing = struct {
         task: runtime.Task(anyerror!coding_agent.session_listing.SessionSummaryList),
@@ -536,6 +539,13 @@ const ForegroundOperation = union(enum) {
         deadline_ns: u64,
         apply_result: bool = true,
         timed_out: bool = false,
+    };
+
+    const ExtensionPrompt = struct {
+        handle: coding_agent.ExtensionHost.PromptCommandHandle,
+        invocation: SubmittedPrompt,
+        deadline_ns: u64,
+        apply_result: bool = true,
     };
 
     const PreparingImages = struct {
@@ -1573,11 +1583,19 @@ pub const Loop = struct {
             .reading_clipboard => |reading| if (reading.apply_result) {
                 deadline = if (deadline) |current| @min(current, reading.deadline_ns) else reading.deadline_ns;
             },
+            .extension_prompt => |operation| if (operation.apply_result) {
+                deadline = if (deadline) |current| @min(current, operation.deadline_ns) else operation.deadline_ns;
+            },
         }
         if (self.run_state.next_batch_deadline_ns) |batch_deadline| {
             deadline = if (deadline) |current| @min(current, batch_deadline) else batch_deadline;
         }
         if (self.run_state.retry) |retry| deadline = if (deadline) |current| @min(current, retry.deadline_ns) else retry.deadline_ns;
+        if (self.services) |services| {
+            if (services.extensionHostDeadline()) |extension_deadline| {
+                deadline = if (deadline) |current| @min(current, extension_deadline) else extension_deadline;
+            }
+        }
         if (self.statusAnimated() or self.transcript.hasPendingRelayout()) {
             const animation_due = render_policy.nextRenderDueNsWithFloor(self.last_frame_start_ns, frame_floor_ns);
             deadline = if (deadline) |current| @min(current, animation_due) else animation_due;
@@ -1649,6 +1667,7 @@ pub const Loop = struct {
         self.dirty = false;
     }
     pub fn tick(self: *Loop, now_ns: u64) !void {
+        if (self.services) |services| services.pollExtensionHost(now_ns);
         try self.pollForegroundOperation(now_ns);
         const file_index_changed = try self.pollFileIndexTask();
         const scoped_query_ready = if (self.composer.scoped_file_query_task) |*task| task.hasResult() else false;
@@ -1706,7 +1725,12 @@ pub const Loop = struct {
                 preparing.cancel.request();
             },
             .reading_clipboard => |*reading| reading.apply_result = false,
+            .extension_prompt => |*operation| {
+                operation.apply_result = false;
+                if (self.services) |services| services.cancelExtensionPromptCommand(&operation.handle);
+            },
         }
+        if (self.services) |services| services.requestExtensionShutdown(nowNs(self.io));
     }
 
     pub fn pollShutdown(self: *Loop) bool {
@@ -1722,11 +1746,16 @@ pub const Loop = struct {
         self.pollFileIndexShutdown();
         self.pollScopedFileQueryShutdown();
         session.requestShutdown();
+        const extensions_complete = if (self.services) |services| complete: {
+            services.pollExtensionHost(nowNs(self.io));
+            break :complete services.extensionShutdownComplete();
+        } else true;
         return self.runShutdownComplete() and
             self.foreground_operation == .idle and
             self.composer.file_index_task == null and
             self.composer.scoped_file_query_task == null and
-            session.shutdownComplete();
+            session.shutdownComplete() and
+            extensions_complete;
     }
 
     fn pollForegroundOperationShutdown(self: *Loop) void {
@@ -1790,6 +1819,12 @@ pub const Loop = struct {
                     deleteClipboardTempPath(self.io, paste.path);
                     paste.deinit(self.gpa);
                 }
+                self.foreground_operation = .idle;
+            },
+            .extension_prompt => |*operation| {
+                const services = self.services orelse return;
+                if (services.pollExtensionPromptCommand(&operation.handle) == .pending) return;
+                services.deinitExtensionPromptCommand(&operation.handle);
                 self.foreground_operation = .idle;
             },
         }
@@ -2028,6 +2063,12 @@ pub const Loop = struct {
             .restoring => return .{ .text = "Restoring session…" },
             .preparing_images => |preparing| return .{ .text = if (preparing.apply_result) "Preparing images… (esc to cancel)" else "Canceling image preparation…" },
             .reading_clipboard => |reading| return .{ .text = if (reading.apply_result) "Reading clipboard image… (esc to cancel)" else "Canceling…" },
+            .extension_prompt => |operation| return .{
+                .text = if (operation.apply_result)
+                    "Running extension command… (esc to cancel)"
+                else
+                    "Canceling…",
+            },
         }
         if (self.runCancellationOutstanding()) return .{ .text = "Canceling…" };
         switch (self.run_state.state) {
@@ -2543,7 +2584,12 @@ pub const Loop = struct {
     }
 
     const CompletionRefresh = enum { auto, force_file };
-    const SlashDispatchResult = enum { not_slash, handled_clear_editor, opened_picker_keep_editor };
+    const SlashDispatchResult = enum {
+        not_slash,
+        handled_clear_editor,
+        handled_keep_editor,
+        opened_picker_keep_editor,
+    };
 
     const SlashArgQuery = struct {
         kind: PickerKind,
@@ -2666,6 +2712,14 @@ pub const Loop = struct {
             const insert = std.fmt.bufPrint(&insert_buffer, "/{s} ", .{command.name}) catch label;
             self.composer.completion.append(label, insert, command.summary, true);
         }
+        if (self.services) |services| for (services.extensionPromptCommands()) |command| {
+            var label_buffer: [64]u8 = undefined;
+            const label = std.fmt.bufPrint(&label_buffer, "/{s}", .{command.name()}) catch continue;
+            if (!startsWithIgnoreCase(label, token_text)) continue;
+            var insert_buffer: [80]u8 = undefined;
+            const insert = std.fmt.bufPrint(&insert_buffer, "/{s} ", .{command.name()}) catch label;
+            self.composer.completion.append(label, insert, command.description(), true);
+        };
         if (self.composer.completion.candidate_len == 0) self.composer.completion.clear();
     }
 
@@ -3148,6 +3202,7 @@ pub const Loop = struct {
                 .discarding_opened, .draining_previous, .restoring => "busy: switching sessions",
                 .preparing_images => "busy: preparing images — esc to cancel",
                 .reading_clipboard => "busy: reading clipboard image — esc to cancel",
+                .extension_prompt => "busy: extension command in progress — esc to cancel",
                 .idle => unreachable,
             });
             return;
@@ -3160,7 +3215,7 @@ pub const Loop = struct {
                 self.clearClipboardTempFiles();
                 return;
             },
-            .opened_picker_keep_editor => return,
+            .handled_keep_editor, .opened_picker_keep_editor => return,
         }
         var expanded_buffer: [Editor.capacity]u8 = undefined;
         const expanded = try self.composer.editor.expandedText(&expanded_buffer);
@@ -3200,8 +3255,14 @@ pub const Loop = struct {
         const action = slash_commands.dispatch(text) orelse return .not_slash;
         switch (action) {
             .help => {
-                var buffer: [160]u8 = undefined;
-                try self.notice(.info, slash_commands.formatAvailable(&buffer));
+                var buffer: [1024]u8 = undefined;
+                var writer = std.Io.Writer.fixed(&buffer);
+                var builtins_buffer: [160]u8 = undefined;
+                try writer.writeAll(slash_commands.formatAvailable(&builtins_buffer));
+                if (self.services) |services| for (services.extensionPromptCommands()) |command| {
+                    writer.print(", /{s}", .{command.name()}) catch break;
+                };
+                try self.notice(.info, writer.buffered());
             },
             .session => try self.showSessionNotice(),
             .model => |model| {
@@ -3257,9 +3318,35 @@ pub const Loop = struct {
             .thinking_level => |level| try self.applyThinkingLevelSetting(level),
             .hide_thinking => |hidden| try self.applyHideThinkingSetting(hidden),
             .unknown => |name| {
-                var available: [160]u8 = undefined;
-                const catalog = slash_commands.formatAvailable(&available);
-                try self.noticeFmt(.warn, "unknown command /{s} — {s}", .{ name, catalog });
+                const services = self.services;
+                const invocation = slash_commands.parseInvocation(text).?;
+                if (services != null and services.?.findExtensionPromptCommand(name) != null) {
+                    if (self.run_state.state != .idle) {
+                        try self.notice(.warn, "wait for the current run before invoking an extension command");
+                        return .handled_keep_editor;
+                    }
+                    var original: SubmittedPrompt = .{};
+                    original.set(text);
+                    const deadline_ns = nowNs(self.io) +| extension_prompt_command_deadline_ns;
+                    const handle = services.?.startExtensionPromptCommand(
+                        name,
+                        invocation.args,
+                        deadline_ns,
+                    ) catch |err| {
+                        try self.noticeFmt(.warn, "extension command failed: {s}", .{@errorName(err)});
+                        return .handled_keep_editor;
+                    };
+                    self.foreground_operation = .{ .extension_prompt = .{
+                        .handle = handle,
+                        .invocation = original,
+                        .deadline_ns = deadline_ns,
+                    } };
+                    self.dirty = true;
+                } else {
+                    var available: [160]u8 = undefined;
+                    const catalog = slash_commands.formatAvailable(&available);
+                    try self.noticeFmt(.warn, "unknown command /{s} — {s}", .{ name, catalog });
+                }
             },
         }
         return .handled_clear_editor;
@@ -3269,7 +3356,14 @@ pub const Loop = struct {
         return switch (self.foreground_operation) {
             .idle => false,
             .listing => |listing| listing.apply_result,
-            .opening, .discarding_opened, .draining_previous, .restoring, .preparing_images, .reading_clipboard => true,
+            .opening,
+            .discarding_opened,
+            .draining_previous,
+            .restoring,
+            .preparing_images,
+            .reading_clipboard,
+            .extension_prompt,
+            => true,
         };
     }
 
@@ -3387,7 +3481,73 @@ pub const Loop = struct {
             .restoring => |*restoring| try self.pollSessionRestore(restoring, now_ns),
             .preparing_images => try self.pollPromptImagePreparation(now_ns),
             .reading_clipboard => try self.pollClipboardImageTask(now_ns),
+            .extension_prompt => try self.pollExtensionPromptCommand(now_ns),
         }
+    }
+
+    fn pollExtensionPromptCommand(self: *Loop, now_ns: u64) !void {
+        const services = self.services orelse return error.NoRuntimeServices;
+        const operation = &self.foreground_operation.extension_prompt;
+        if (operation.apply_result and now_ns >= operation.deadline_ns) {
+            operation.apply_result = false;
+            services.cancelExtensionPromptCommand(&operation.handle);
+        }
+        switch (services.pollExtensionPromptCommand(&operation.handle)) {
+            .pending => return,
+            .success => {
+                const prompt = services.takeExtensionPromptCommand(&operation.handle) catch |err| {
+                    const invocation = operation.invocation;
+                    services.deinitExtensionPromptCommand(&operation.handle);
+                    self.foreground_operation = .idle;
+                    try self.restoreExtensionInvocation(&invocation);
+                    try self.noticeFmt(.warn, "extension command failed: {s}", .{@errorName(err)});
+                    return;
+                };
+                defer services.freeExtensionPrompt(prompt);
+                const invocation = operation.invocation;
+                const apply_result = operation.apply_result;
+                services.deinitExtensionPromptCommand(&operation.handle);
+                self.foreground_operation = .idle;
+                if (!apply_result) {
+                    try self.restoreExtensionInvocation(&invocation);
+                    try self.notice(.info, "extension command canceled");
+                    return;
+                }
+                try self.submitGeneratedPrompt(prompt, invocation.text());
+            },
+            .failure => |failure| {
+                const invocation = operation.invocation;
+                const apply_result = operation.apply_result;
+                services.deinitExtensionPromptCommand(&operation.handle);
+                self.foreground_operation = .idle;
+                if (apply_result) {
+                    try self.restoreExtensionInvocation(&invocation);
+                    try self.noticeFmt(.warn, "extension command failed: {s}", .{@tagName(failure)});
+                } else {
+                    try self.restoreExtensionInvocation(&invocation);
+                    try self.notice(.info, "extension command canceled");
+                }
+            },
+        }
+    }
+
+    fn restoreExtensionInvocation(self: *Loop, invocation: *const SubmittedPrompt) !void {
+        if (self.composer.editor.text().len != 0) return;
+        try self.composer.editor.insert(invocation.text());
+        self.dirty = true;
+    }
+
+    fn submitGeneratedPrompt(self: *Loop, prompt: []const u8, invocation: []const u8) !void {
+        const session = self.session orelse {
+            self.submitted_prompt = .{};
+            self.submitted_prompt.?.set(prompt);
+            self.composer.editor.pushHistory(invocation);
+            return;
+        };
+        const wake = self.wake orelse return error.NoWake;
+        std.debug.assert(self.run_state.state == .idle);
+        try self.startPromptRun(session, self.io, wake, prompt, &.{});
+        self.composer.editor.pushHistory(invocation);
     }
 
     fn pollSessionListing(self: *Loop, listing: *ForegroundOperation.Listing, now_ns: u64) !void {
@@ -3611,6 +3771,12 @@ pub const Loop = struct {
                 }
                 self.foreground_operation = .idle;
             },
+            .extension_prompt => |*operation| {
+                const services = self.services orelse return;
+                std.debug.assert(services.pollExtensionPromptCommand(&operation.handle) != .pending);
+                services.deinitExtensionPromptCommand(&operation.handle);
+                self.foreground_operation = .idle;
+            },
         }
     }
 
@@ -3798,6 +3964,10 @@ pub const Loop = struct {
                 preparing.cancel.request();
             },
             .reading_clipboard => |*reading| reading.apply_result = false,
+            .extension_prompt => |*operation| if (operation.apply_result) {
+                operation.apply_result = false;
+                if (self.services) |services| services.cancelExtensionPromptCommand(&operation.handle);
+            },
             .discarding_opened, .draining_previous, .restoring => {},
         }
         self.dirty = true;
@@ -4328,6 +4498,137 @@ fn expectFrameOrder(frame: *const screen.Frame, first: []const u8, second: []con
     const second_row = frameRowContaining(frame, second);
     try std.testing.expect(second_row != null);
     try std.testing.expect(second_row.? > first_row.?);
+}
+
+test "extension host infinite loop does not block owner input or composition" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPathFile(std.testing.io, ".", &root_buffer);
+    const root_path = root_buffer[0..root_len];
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "extension.ts",
+        .data =
+        \\export default function activate(zi) {
+        \\  zi.commands.registerPrompt({
+        \\    name: "fixture-review",
+        \\    description: "Review a fixture",
+        \\    run: ({ args }) => ({ prompt: `Review ${args}` }),
+        \\  });
+        \\}
+        ,
+    });
+    const extension_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "extension.ts" });
+    defer std.testing.allocator.free(extension_path);
+    const agent_dir = try std.fs.path.join(std.testing.allocator, &.{ root_path, "agent" });
+    defer std.testing.allocator.free(agent_dir);
+
+    var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
+    var environ = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ.deinit();
+    try environ.put("ZI_EXTENSION_HOST_TEST", "1");
+    try environ.put("ZI_ENABLE_FAUX_PROVIDER", "1");
+    var plan = try coding_agent.ExtensionHost.ExtensionLoadPlan.init(std.testing.allocator, &.{.{
+        .canonical_path = extension_path,
+        .provenance = .explicit,
+    }});
+    defer plan.deinit();
+    var services = try coding_agent.runtime_services.RuntimeServices.init(std.testing.allocator, .{
+        .task_runtime = task_runtime,
+        .cwd = root_path,
+        .agent_dir = agent_dir,
+        .environ = &environ,
+        .extension_load_plan = &plan,
+        .node_executable = build_options.node_executable,
+    });
+    defer services.deinit();
+    try std.testing.expectEqual(
+        coding_agent.runtime_services.RuntimeServices.ExtensionAvailability.active,
+        services.extensionAvailability(),
+    );
+    const stamp = coding_agent.session_manager.SessionStamp.now(services.io);
+    var session = try coding_agent.session_bootstrap.openSession(
+        std.testing.allocator,
+        &services,
+        stamp.date(),
+        .{ .create = .{
+            .session_id = "extension-loop-test",
+            .timestamp = stamp.timestamp(),
+            .persist = false,
+        } },
+        .{},
+    );
+    defer {
+        session.requestShutdown();
+        session.deinit();
+    }
+    var wake: runtime.WakeEvent = .init;
+    services.setExtensionWake(&wake);
+    var loop: Loop = undefined;
+    try loop.init(std.testing.allocator, .{
+        .session = &session,
+        .services = &services,
+        .wake = &wake,
+        .initial_prompt = null,
+        .persist_new_sessions = false,
+        .resume_picker = false,
+    });
+    defer loop.deinit();
+
+    try loop.refreshSlashCompletion("/fixture");
+    try std.testing.expect(loop.composer.completion.active);
+    try std.testing.expectEqualStrings("/fixture-review", loop.composer.completion.candidates[0].labelSlice());
+    loop.composer.completion.clear();
+    try loop.dispatch(.{ .insert = "/fixture-review tui" });
+    try loop.dispatch(.submit);
+    try std.testing.expect(loop.foreground_operation == .extension_prompt);
+
+    var now: u64 = 0;
+    var command_attempts: usize = 0;
+    while (loop.foreground_operation != .idle and command_attempts < 10_000) : (command_attempts += 1) {
+        now +|= std.time.ns_per_ms;
+        try loop.tick(now);
+        task_runtime.sleep(.fromMilliseconds(1)) catch return error.Canceled;
+    }
+    try std.testing.expectEqual(ForegroundOperation.idle, loop.foreground_operation);
+    try std.testing.expect(loop.run_state.state == .running);
+    try std.testing.expectEqualStrings("Review tui", loop.run_state.saved_prompt.?.text.text());
+    loop.forceCancelAndDrainRun(&session, services.io, &wake);
+    try std.testing.expectEqual(RunState.State.idle, loop.run_state.state);
+
+    const host = services.extensionHost().?;
+    var operation = try host.startTestSpin(now + 20 * std.time.ns_per_ms);
+    defer if (!operation.released) {
+        if (host.pollPing(&operation) != .pending) host.deinitPing(&operation);
+    };
+    var iterations: usize = 0;
+    while (host.pollPing(&operation) == .pending) : (now += std.time.ns_per_ms) {
+        try loop.dispatch(.{ .insert = "x" });
+        try loop.tick(now);
+        const frame = try loop.composeFrameAt(80, 24, now);
+        try expectFrameContains(&frame, "x");
+        iterations += 1;
+        task_runtime.sleep(.fromMilliseconds(1)) catch return error.Canceled;
+    }
+    try std.testing.expect(iterations > 1);
+    try std.testing.expectEqual(iterations, loop.composer.editor.text().len);
+    for (loop.composer.editor.text()) |char| try std.testing.expectEqual(@as(u8, 'x'), char);
+    const result = host.pollPing(&operation);
+    switch (result) {
+        .failure => |failure| try std.testing.expectEqual(coding_agent.ExtensionHost.Failure.deadline, failure),
+        else => return error.UnexpectedExtensionResult,
+    }
+    host.deinitPing(&operation);
+
+    loop.requestShutdown();
+    var shutdown_attempts: usize = 0;
+    while (!loop.pollShutdown() and shutdown_attempts < 10_000) : (shutdown_attempts += 1) {
+        task_runtime.sleep(.fromMilliseconds(1)) catch return error.Canceled;
+    }
+    try std.testing.expect(loop.pollShutdown());
+    try std.testing.expect(services.extensionShutdownComplete());
+    services.clearExtensionWake();
 }
 
 test "loop vertical editor actions traverse visual rows before history" {

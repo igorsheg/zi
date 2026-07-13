@@ -10,11 +10,19 @@ pub const settings_file_name = "settings.json";
 pub const auth_file_name = "auth.json";
 pub const sessions_dir_name = "sessions";
 pub const skills_dir_name = "skills";
+pub const extensions_dir_name = "extensions";
+pub const extension_file_suffix = ".ts";
+pub const extension_declaration_file_suffix = ".d.ts";
+pub const extension_entry_file_name = "index" ++ extension_file_suffix;
 pub const skill_file_name = "SKILL.md";
 pub const context_file_name = "AGENTS.md";
 pub const claude_context_file_name = "CLAUDE.md";
 pub const system_prompt_file_name = "SYSTEM.md";
 pub const append_system_prompt_file_name = "APPEND_SYSTEM.md";
+pub const cache_dir_name = "cache";
+pub const extension_host_cache_dir_name = "extension-host";
+pub const extension_host_bundle_file_name = "extension-host.mjs";
+pub const extension_host_lease_file_suffix = ".lock";
 
 /// Tool operand path policy owner. Tools pass user-supplied operands here and
 /// receive an owned absolute path after normalization, optional home expansion,
@@ -412,6 +420,55 @@ pub const PersistencePaths = struct {
         return std.fs.path.join(allocator, &.{ self.global_dir, settings_file_name });
     }
 
+    pub fn extensionHostCacheDir(self: PersistencePaths, allocator: std.mem.Allocator) ![]const u8 {
+        return std.fs.path.join(allocator, &.{ self.global_dir, cache_dir_name, extension_host_cache_dir_name });
+    }
+
+    pub fn extensionHostVersionDir(
+        self: PersistencePaths,
+        allocator: std.mem.Allocator,
+        digest_hex: []const u8,
+    ) ![]const u8 {
+        try validateExtensionHostDigest(digest_hex);
+        return std.fs.path.join(allocator, &.{
+            self.global_dir,
+            cache_dir_name,
+            extension_host_cache_dir_name,
+            digest_hex,
+        });
+    }
+
+    pub fn extensionHostBundlePath(
+        self: PersistencePaths,
+        allocator: std.mem.Allocator,
+        digest_hex: []const u8,
+    ) ![]const u8 {
+        try validateExtensionHostDigest(digest_hex);
+        return std.fs.path.join(allocator, &.{
+            self.global_dir,
+            cache_dir_name,
+            extension_host_cache_dir_name,
+            digest_hex,
+            extension_host_bundle_file_name,
+        });
+    }
+
+    pub fn extensionHostLeasePath(
+        self: PersistencePaths,
+        allocator: std.mem.Allocator,
+        digest_hex: []const u8,
+    ) ![]const u8 {
+        try validateExtensionHostDigest(digest_hex);
+        const leaf = try std.fmt.allocPrint(allocator, "{s}{s}", .{ digest_hex, extension_host_lease_file_suffix });
+        defer allocator.free(leaf);
+        return std.fs.path.join(allocator, &.{
+            self.global_dir,
+            cache_dir_name,
+            extension_host_cache_dir_name,
+            leaf,
+        });
+    }
+
     pub fn authPath(self: PersistencePaths, allocator: std.mem.Allocator) ![]const u8 {
         return std.fs.path.join(allocator, &.{ self.global_dir, auth_file_name });
     }
@@ -428,10 +485,23 @@ pub const PersistencePaths = struct {
         return std.fs.path.join(allocator, &.{ self.global_dir, skills_dir_name });
     }
 
+    pub fn globalExtensionsDir(self: PersistencePaths, allocator: std.mem.Allocator) ![]const u8 {
+        return std.fs.path.join(allocator, &.{ self.global_dir, extensions_dir_name });
+    }
+
+    pub fn projectExtensionsDir(self: PersistencePaths, allocator: std.mem.Allocator) ![]const u8 {
+        return std.fs.path.join(allocator, &.{ self.cwd, project_config_dir_name, extensions_dir_name });
+    }
+
     pub fn projectSkillsDir(self: PersistencePaths, allocator: std.mem.Allocator) ![]const u8 {
         return std.fs.path.join(allocator, &.{ self.cwd, project_config_dir_name, skills_dir_name });
     }
 };
+
+fn validateExtensionHostDigest(digest_hex: []const u8) !void {
+    if (digest_hex.len != std.crypto.hash.sha2.Sha256.digest_length * 2) return error.InvalidExtensionHostDigest;
+    for (digest_hex) |char| if (!std.ascii.isHex(char)) return error.InvalidExtensionHostDigest;
+}
 
 /// One source of truth for the session file naming scheme:
 /// `<timestamp>_<session-id>.jsonl`. The store formats it; listing and
@@ -464,6 +534,31 @@ pub fn encodeCwd(allocator: std.mem.Allocator, cwd: []const u8) ![]const u8 {
     }
     try out.append("--");
     return out.toOwnedSlice();
+}
+
+test "extension host cache paths stay under the agent directory" {
+    const paths: PersistencePaths = .{ .global_dir = "/home/me/.zi/agent", .cwd = "/repo" };
+    const cache = try paths.extensionHostCacheDir(std.testing.allocator);
+    defer std.testing.allocator.free(cache);
+    const digest_hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const bundle = try paths.extensionHostBundlePath(std.testing.allocator, digest_hex);
+    defer std.testing.allocator.free(bundle);
+    const lease = try paths.extensionHostLeasePath(std.testing.allocator, digest_hex);
+    defer std.testing.allocator.free(lease);
+
+    try std.testing.expectEqualStrings("/home/me/.zi/agent/cache/extension-host", cache);
+    try std.testing.expectEqualStrings(
+        "/home/me/.zi/agent/cache/extension-host/" ++ digest_hex ++ "/extension-host.mjs",
+        bundle,
+    );
+    try std.testing.expectEqualStrings(
+        "/home/me/.zi/agent/cache/extension-host/" ++ digest_hex ++ ".lock",
+        lease,
+    );
+    try std.testing.expectError(
+        error.InvalidExtensionHostDigest,
+        paths.extensionHostBundlePath(std.testing.allocator, "../outside"),
+    );
 }
 
 test "global agent dir defaults under home zi agent" {
@@ -523,6 +618,10 @@ test "persistence paths owns user and project zi resource paths" {
     defer std.testing.allocator.free(global_skills);
     const project_skills = try paths.projectSkillsDir(std.testing.allocator);
     defer std.testing.allocator.free(project_skills);
+    const global_extensions = try paths.globalExtensionsDir(std.testing.allocator);
+    defer std.testing.allocator.free(global_extensions);
+    const project_extensions = try paths.projectExtensionsDir(std.testing.allocator);
+    defer std.testing.allocator.free(project_extensions);
 
     try std.testing.expectEqualStrings(".zi", global_config_dir_name);
     try std.testing.expectEqualStrings("agent/settings.json", global_settings);
@@ -531,6 +630,8 @@ test "persistence paths owns user and project zi resource paths" {
     try std.testing.expectEqualStrings("repo/.zi/settings.json", project_settings);
     try std.testing.expectEqualStrings("agent/skills", global_skills);
     try std.testing.expectEqualStrings("repo/.zi/skills", project_skills);
+    try std.testing.expectEqualStrings("agent/extensions", global_extensions);
+    try std.testing.expectEqualStrings("repo/.zi/extensions", project_extensions);
 }
 
 test "existing path resolution tries common macOS filename variants" {

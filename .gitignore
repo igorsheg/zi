@@ -6,6 +6,7 @@ zig-pkg/
 .tmp/
 .wrangler/
 node_modules/
+extensions/host/dist/
 .zi/hf-sessions/
 .zi/specs
 .standup/
