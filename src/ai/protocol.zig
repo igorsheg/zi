@@ -125,6 +125,21 @@ pub const OperationalFailure = struct {
     }
 };
 
+pub const TextVerbosity = enum {
+    low,
+    medium,
+    high,
+};
+
+pub const OpenAiCodexServiceTier = enum {
+    priority,
+};
+
+pub const OpenAiCodexOptions = struct {
+    service_tier: ?OpenAiCodexServiceTier = null,
+    verbosity: TextVerbosity = .low,
+};
+
 pub const StreamOptions = struct {
     temperature: ?f64 = null,
     max_tokens: ?u32 = null,
@@ -139,6 +154,7 @@ pub const StreamOptions = struct {
     max_retries: ?u32 = null,
     max_retry_delay_ms: ?u64 = null,
     metadata: ?std.json.Value = null,
+    openai_codex: OpenAiCodexOptions = .{},
 };
 
 pub const ThinkingBudgets = struct {

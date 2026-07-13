@@ -46,6 +46,7 @@ pub fn openSession(
         .model = model,
         .thinking_level = overrides.thinking_level orelse resolveThinkingLevel(project, global),
         .hide_thinking = project.hide_thinking_block orelse global.hide_thinking_block orelse true,
+        .openai_codex = resolveCodexOptions(project, global),
         .stream = overrides.stream orelse streamFor(services, model),
         .get_api_key = services.auth_manager.hook(),
         .dir = services.dir,
@@ -134,6 +135,19 @@ fn resolveThinkingLevel(project: settings_mod.Settings, global: settings_mod.Set
     return std.meta.stringToEnum(agent_mod.ThinkingLevel, level) orelse .off;
 }
 
+fn resolveCodexOptions(
+    project: settings_mod.Settings,
+    global: settings_mod.Settings,
+) ai.OpenAiCodexOptions {
+    const project_codex = project.codex orelse settings_mod.Settings.Codex{};
+    const global_codex = global.codex orelse settings_mod.Settings.Codex{};
+    const fast_mode = project_codex.fast_mode orelse global_codex.fast_mode orelse false;
+    return .{
+        .service_tier = if (fast_mode) .priority else null,
+        .verbosity = project_codex.verbosity orelse global_codex.verbosity orelse .low,
+    };
+}
+
 fn retrySettings(project: settings_mod.Settings, global: settings_mod.Settings) AgentSession.RetrySettings {
     var out: AgentSession.RetrySettings = .{};
     const retry = project.retry orelse global.retry orelse return out;
@@ -162,6 +176,41 @@ fn settingsValue(file: settings_mod.SettingsFile) settings_mod.Settings {
     };
 }
 
+test "session bootstrap applies codex settings to agent run configuration" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo/.zi");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "agent/settings.json",
+        .data = "{\"codex\":{\"fastMode\":true,\"verbosity\":\"high\"}}",
+    });
+    var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
+    var services = try RuntimeServices.init(std.testing.allocator, .{
+        .cwd = "repo",
+        .agent_dir = "agent",
+        .dir = tmp.dir,
+        .task_runtime = task_runtime,
+    });
+    defer services.deinit();
+
+    const stamp = session_manager.SessionStamp.now(services.io);
+    var session = try openSession(std.testing.allocator, &services, stamp.date(), .{ .create = .{
+        .session_id = "codex-settings",
+        .timestamp = stamp.timestamp(),
+        .persist = false,
+    } }, .{});
+    defer {
+        session.requestShutdown();
+        session.deinit();
+    }
+
+    const options = session.openAiCodexOptions();
+    try std.testing.expectEqual(ai.OpenAiCodexServiceTier.priority, options.service_tier.?);
+    try std.testing.expectEqual(ai.TextVerbosity.high, options.verbosity);
+}
+
 test "settings mappers prefer project over global" {
     const global: settings_mod.Settings = .{
         .default_thinking_level = "low",
@@ -177,6 +226,19 @@ test "settings mappers prefer project over global" {
     try std.testing.expectEqual(agent_mod.ThinkingLevel.high, resolveThinkingLevel(project, global));
     try std.testing.expectEqual(agent_mod.ThinkingLevel.low, resolveThinkingLevel(.{}, global));
     try std.testing.expectEqual(agent_mod.ThinkingLevel.off, resolveThinkingLevel(.{ .default_thinking_level = "bogus" }, global));
+
+    const codex = resolveCodexOptions(project, global);
+    try std.testing.expect(codex.service_tier == null);
+    try std.testing.expectEqual(ai.TextVerbosity.low, codex.verbosity);
+    const inherited_codex = resolveCodexOptions(
+        .{ .codex = .{ .verbosity = .high } },
+        .{ .codex = .{ .fast_mode = true, .verbosity = .medium } },
+    );
+    try std.testing.expectEqual(
+        ai.OpenAiCodexServiceTier.priority,
+        inherited_codex.service_tier.?,
+    );
+    try std.testing.expectEqual(ai.TextVerbosity.high, inherited_codex.verbosity);
 
     const retry = retrySettings(project, global);
     try std.testing.expect(!retry.enabled);

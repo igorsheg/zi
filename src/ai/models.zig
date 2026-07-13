@@ -105,6 +105,11 @@ pub fn supportsXhigh(model: protocol.Model) bool {
         std.mem.indexOf(u8, model.id, "opus-4.7") != null;
 }
 
+pub fn supportsCodexPriorityService(model: protocol.Model) bool {
+    if (!std.mem.eql(u8, model.provider, protocol.KnownProvider.openai_codex)) return false;
+    return std.mem.eql(u8, model.id, "gpt-5.4") or std.mem.eql(u8, model.id, "gpt-5.5");
+}
+
 pub fn modelsAreEqual(a: ?protocol.Model, b: ?protocol.Model) bool {
     const left = a orelse return false;
     const right = b orelse return false;
@@ -214,6 +219,21 @@ test "supports xhigh follows pi model id policy" {
 
     try std.testing.expect(supportsXhigh(xhigh));
     try std.testing.expect(!supportsXhigh(normal));
+}
+
+test "codex priority service is limited to advertised models" {
+    try std.testing.expect(supportsCodexPriorityService(
+        getModel(protocol.KnownProvider.openai_codex, "gpt-5.4").?,
+    ));
+    try std.testing.expect(supportsCodexPriorityService(
+        getModel(protocol.KnownProvider.openai_codex, "gpt-5.5").?,
+    ));
+    try std.testing.expect(!supportsCodexPriorityService(
+        getModel(protocol.KnownProvider.openai_codex, "gpt-5.4-mini").?,
+    ));
+    try std.testing.expect(!supportsCodexPriorityService(
+        getModel(protocol.KnownProvider.openai, "gpt-5.4").?,
+    ));
 }
 
 test "models are equal by id and provider" {

@@ -3,6 +3,7 @@
 //! effects directly.
 const std = @import("std");
 const agent = @import("../agent/root.zig");
+const ai = @import("../ai/root.zig");
 
 pub const command_count_max: usize = 32;
 pub const name_bytes_max: usize = 32;
@@ -47,6 +48,8 @@ pub const Action = union(enum) {
     settings,
     thinking_level: agent.ThinkingLevel,
     hide_thinking: bool,
+    codex_fast_mode: bool,
+    codex_verbosity: ai.TextVerbosity,
     unknown: []const u8,
 };
 
@@ -129,11 +132,20 @@ pub fn dispatch(text: []const u8) ?Action {
 fn settingsAction(args: []const u8) Action {
     if (std.mem.eql(u8, args, "thinking:shown")) return .{ .hide_thinking = false };
     if (std.mem.eql(u8, args, "thinking:hidden")) return .{ .hide_thinking = true };
-    const prefix = "thinking:";
-    if (std.mem.startsWith(u8, args, prefix)) {
-        const name = args[prefix.len..];
+    const thinking_prefix = "thinking:";
+    if (std.mem.startsWith(u8, args, thinking_prefix)) {
+        const name = args[thinking_prefix.len..];
         inline for (@typeInfo(agent.ThinkingLevel).@"enum".fields) |field| {
             if (std.mem.eql(u8, name, field.name)) return .{ .thinking_level = @enumFromInt(field.value) };
+        }
+    }
+    if (std.mem.eql(u8, args, "codex:fast:on")) return .{ .codex_fast_mode = true };
+    if (std.mem.eql(u8, args, "codex:fast:off")) return .{ .codex_fast_mode = false };
+    const verbosity_prefix = "codex:verbosity:";
+    if (std.mem.startsWith(u8, args, verbosity_prefix)) {
+        const name = args[verbosity_prefix.len..];
+        inline for (@typeInfo(ai.TextVerbosity).@"enum".fields) |field| {
+            if (std.mem.eql(u8, name, field.name)) return .{ .codex_verbosity = @enumFromInt(field.value) };
         }
     }
     return .settings;
@@ -181,6 +193,11 @@ test "slash command catalog formats help from builtin source" {
 test "slash dispatch maps settings actions" {
     try std.testing.expectEqual(agent.ThinkingLevel.high, dispatch("/settings thinking:high").?.thinking_level);
     try std.testing.expectEqual(false, dispatch("/settings thinking:shown").?.hide_thinking);
+    try std.testing.expect(dispatch("/settings codex:fast:on").?.codex_fast_mode);
+    try std.testing.expectEqual(
+        ai.TextVerbosity.medium,
+        dispatch("/settings codex:verbosity:medium").?.codex_verbosity,
+    );
     try std.testing.expectEqualStrings("focus on files", dispatch("/compact focus on files").?.compact);
     try std.testing.expectEqualStrings("wat", dispatch("/wat").?.unknown);
 }

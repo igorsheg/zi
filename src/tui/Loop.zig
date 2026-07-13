@@ -403,7 +403,16 @@ const CompletionPopup = struct {
 
 const picker_stack_depth_max: usize = 4;
 
-const PickerKind = enum { model, session, settings_root, settings_thinking_effort, settings_thinking_visibility };
+const PickerKind = enum {
+    model,
+    session,
+    settings_root,
+    settings_thinking_effort,
+    settings_thinking_visibility,
+    settings_codex,
+    settings_codex_fast_mode,
+    settings_codex_verbosity,
+};
 
 const PickerAction = union(enum) {
     none,
@@ -412,6 +421,8 @@ const PickerAction = union(enum) {
     push: PickerKind,
     thinking_level: agent_mod.ThinkingLevel,
     hide_thinking: bool,
+    codex_fast_mode: bool,
+    codex_verbosity: ai.TextVerbosity,
 };
 
 const PickerRow = struct {
@@ -2409,8 +2420,7 @@ pub const Loop = struct {
     fn pickerFilterText(self: *const Loop, kind: PickerKind) []const u8 {
         const query = self.slashArgQuery() orelse return "";
         if (!pickerKindAcceptsQuery(kind, query.kind)) return "";
-        if (pickerKindIsSettingsChild(kind)) {
-            const prefix = "thinking:";
+        if (settingsQueryPrefix(kind)) |prefix| {
             if (std.mem.startsWith(u8, query.text, prefix)) return query.text[prefix.len..];
         }
         return query.text;
@@ -2946,7 +2956,11 @@ pub const Loop = struct {
     fn syncSlashArgPicker(self: *Loop) !bool {
         const query = self.slashArgQuery() orelse return false;
         if (self.isPickerDismissed(query.kind)) return false;
-        if (self.composer.picker.active and pickerKindIsSettingsChild(self.composer.picker.currentKind()) and query.kind == .settings_root and !std.mem.startsWith(u8, query.text, "thinking:")) {
+        if (self.composer.picker.active and
+            pickerKindIsSettingsChild(self.composer.picker.currentKind()) and
+            query.kind == .settings_root and
+            !pickerKindOwnsSettingsQuery(self.composer.picker.currentKind(), query.text))
+        {
             self.openSettingsRootPicker();
         } else if (!self.composer.picker.active or !pickerKindAcceptsQuery(self.composer.picker.currentKind(), query.kind)) {
             try self.openPicker(query.kind);
@@ -2983,16 +2997,42 @@ pub const Loop = struct {
 
     fn pickerKindIsSettings(kind: PickerKind) bool {
         return switch (kind) {
-            .settings_root, .settings_thinking_effort, .settings_thinking_visibility => true,
+            .settings_root,
+            .settings_thinking_effort,
+            .settings_thinking_visibility,
+            .settings_codex,
+            .settings_codex_fast_mode,
+            .settings_codex_verbosity,
+            => true,
             .model, .session => false,
         };
     }
 
     fn pickerKindIsSettingsChild(kind: PickerKind) bool {
         return switch (kind) {
-            .settings_thinking_effort, .settings_thinking_visibility => true,
+            .settings_thinking_effort,
+            .settings_thinking_visibility,
+            .settings_codex,
+            .settings_codex_fast_mode,
+            .settings_codex_verbosity,
+            => true,
             .model, .session, .settings_root => false,
         };
+    }
+
+    fn settingsQueryPrefix(kind: PickerKind) ?[]const u8 {
+        return switch (kind) {
+            .settings_thinking_effort, .settings_thinking_visibility => "thinking:",
+            .settings_codex => "codex:",
+            .settings_codex_fast_mode => "codex:fast:",
+            .settings_codex_verbosity => "codex:verbosity:",
+            .model, .session, .settings_root => null,
+        };
+    }
+
+    fn pickerKindOwnsSettingsQuery(kind: PickerKind, query: []const u8) bool {
+        const prefix = settingsQueryPrefix(kind) orelse return false;
+        return std.mem.startsWith(u8, query, prefix);
     }
 
     fn pickerKindAcceptsQuery(kind: PickerKind, query_kind: PickerKind) bool {
@@ -3006,8 +3046,13 @@ pub const Loop = struct {
             .model => try self.openModelPicker(),
             .session => try self.openSessionPicker(),
             .settings_root => self.openSettingsRootPicker(),
-            .settings_thinking_effort, .settings_thinking_visibility => {
+            .settings_thinking_effort, .settings_thinking_visibility, .settings_codex => {
                 self.openSettingsRootPicker();
+                try self.pushPickerFrame(kind);
+            },
+            .settings_codex_fast_mode, .settings_codex_verbosity => {
+                self.openSettingsRootPicker();
+                try self.pushPickerFrame(.settings_codex);
                 try self.pushPickerFrame(kind);
             },
         }
@@ -3025,7 +3070,12 @@ pub const Loop = struct {
     fn normalizeComposerForPickerKind(self: *Loop, kind: PickerKind) !void {
         switch (kind) {
             .settings_root => try self.setComposerText("/settings "),
-            .settings_thinking_effort, .settings_thinking_visibility => try self.setComposerText("/settings thinking:"),
+            .settings_thinking_effort, .settings_thinking_visibility => {
+                try self.setComposerText("/settings thinking:");
+            },
+            .settings_codex => try self.setComposerText("/settings codex:"),
+            .settings_codex_fast_mode => try self.setComposerText("/settings codex:fast:"),
+            .settings_codex_verbosity => try self.setComposerText("/settings codex:verbosity:"),
             .model, .session => {},
         }
     }
@@ -3119,6 +3169,8 @@ pub const Loop = struct {
             },
             .thinking_level => |level| try self.applyThinkingLevelSetting(level),
             .hide_thinking => |hidden| try self.applyHideThinkingSetting(hidden),
+            .codex_fast_mode => |enabled| try self.applyCodexFastModeSetting(enabled),
+            .codex_verbosity => |verbosity| try self.applyCodexVerbositySetting(verbosity),
         }
         self.composer.picker.clear();
         self.clearPickerDismissal();
@@ -3422,6 +3474,8 @@ pub const Loop = struct {
             },
             .thinking_level => |level| try self.applyThinkingLevelSetting(level),
             .hide_thinking => |hidden| try self.applyHideThinkingSetting(hidden),
+            .codex_fast_mode => |enabled| try self.applyCodexFastModeSetting(enabled),
+            .codex_verbosity => |verbosity| try self.applyCodexVerbositySetting(verbosity),
             .unknown => |name| {
                 const services = self.services;
                 const invocation = slash_commands.parseInvocation(text).?;
@@ -3906,6 +3960,9 @@ pub const Loop = struct {
             .settings_root => self.populateSettingsRootPicker(),
             .settings_thinking_effort => self.populateThinkingEffortPicker(),
             .settings_thinking_visibility => self.populateThinkingVisibilityPicker(),
+            .settings_codex => self.populateCodexFeaturesPicker(),
+            .settings_codex_fast_mode => self.populateCodexFastModePicker(),
+            .settings_codex_verbosity => self.populateCodexVerbosityPicker(),
             .model, .session => {},
         }
     }
@@ -3913,6 +3970,7 @@ pub const Loop = struct {
     fn populateSettingsRootPicker(self: *Loop) void {
         self.composer.picker.appendRow("thinking-effort", "Thinking effort", "set reasoning level", "", null, true, .{ .push = .settings_thinking_effort });
         self.composer.picker.appendRow("thinking-visibility", "Thinking visibility", "show or hide thinking blocks", "", null, true, .{ .push = .settings_thinking_visibility });
+        self.composer.picker.appendRow("codex", "Codex features", "configure Codex request behavior", "", null, true, .{ .push = .settings_codex });
     }
 
     fn populateThinkingEffortPicker(self: *Loop) void {
@@ -3927,6 +3985,46 @@ pub const Loop = struct {
     fn populateThinkingVisibilityPicker(self: *Loop) void {
         self.composer.picker.appendRow("thinking:shown", "shown", "show thinking blocks", "", null, true, .{ .hide_thinking = false });
         self.composer.picker.appendRow("thinking:hidden", "hidden", "hide thinking blocks", "", null, true, .{ .hide_thinking = true });
+    }
+
+    fn populateCodexFeaturesPicker(self: *Loop) void {
+        const options = if (self.session) |session| session.openAiCodexOptions() else ai.OpenAiCodexOptions{};
+        self.composer.picker.appendRow(
+            "codex:fast",
+            "Fast mode",
+            "1.5x speed, increased usage",
+            if (options.service_tier == .priority) "on" else "off",
+            null,
+            true,
+            .{ .push = .settings_codex_fast_mode },
+        );
+        self.composer.picker.appendRow(
+            "codex:verbosity",
+            "Verbosity",
+            "set response detail",
+            @tagName(options.verbosity),
+            null,
+            true,
+            .{ .push = .settings_codex_verbosity },
+        );
+    }
+
+    fn populateCodexFastModePicker(self: *Loop) void {
+        self.composer.picker.appendRow("codex:fast:off", "off", "use the standard service tier", "", null, true, .{ .codex_fast_mode = false });
+        self.composer.picker.appendRow("codex:fast:on", "on", "use priority service for supported models", "", null, true, .{ .codex_fast_mode = true });
+        const enabled = if (self.session) |session|
+            session.openAiCodexOptions().service_tier == .priority
+        else
+            false;
+        self.composer.picker.selected_row = if (enabled) 1 else 0;
+    }
+
+    fn populateCodexVerbosityPicker(self: *Loop) void {
+        self.composer.picker.appendRow("codex:verbosity:low", "low", "concise responses", "", null, true, .{ .codex_verbosity = .low });
+        self.composer.picker.appendRow("codex:verbosity:medium", "medium", "balanced response detail", "", null, true, .{ .codex_verbosity = .medium });
+        self.composer.picker.appendRow("codex:verbosity:high", "high", "detailed responses", "", null, true, .{ .codex_verbosity = .high });
+        const verbosity = if (self.session) |session| session.openAiCodexOptions().verbosity else .low;
+        self.composer.picker.selected_row = @intFromEnum(verbosity);
     }
 
     fn applyThinkingLevelSetting(self: *Loop, level: agent_mod.ThinkingLevel) !void {
@@ -3944,6 +4042,26 @@ pub const Loop = struct {
         try services.settings_manager.setHideThinkingBlock(self.io, services.dir, hidden);
         try session.setHideThinking(hidden);
         self.setHideThinking(hidden);
+    }
+
+    fn applyCodexFastModeSetting(self: *Loop, enabled: bool) !void {
+        const session = self.session orelse return;
+        const services = self.services orelse return error.NoServices;
+        try services.settings_manager.setCodexFastMode(self.io, services.dir, enabled);
+        var options = session.openAiCodexOptions();
+        options.service_tier = if (enabled) .priority else null;
+        session.setOpenAiCodexOptions(options);
+        self.dirty = true;
+    }
+
+    fn applyCodexVerbositySetting(self: *Loop, verbosity: ai.TextVerbosity) !void {
+        const session = self.session orelse return;
+        const services = self.services orelse return error.NoServices;
+        try services.settings_manager.setCodexVerbosity(self.io, services.dir, verbosity);
+        var options = session.openAiCodexOptions();
+        options.verbosity = verbosity;
+        session.setOpenAiCodexOptions(options);
+        self.dirty = true;
     }
 
     fn setModelByName(self: *Loop, name: []const u8) !void {
@@ -5981,6 +6099,88 @@ test "loop P4 settings thinking visibility persists through services" {
     try std.testing.expect(!session.hide_thinking);
     try std.testing.expect(!loop.layout_state.hide_thinking);
     try std.testing.expectEqual(false, services.settings_manager.current().global.loaded.value.hide_thinking_block.?);
+}
+
+test "loop settings codex features persist and update the live session" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo/.zi");
+    var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
+    var services = try coding_agent.runtime_services.RuntimeServices.init(std.testing.allocator, .{
+        .cwd = "repo",
+        .agent_dir = "agent",
+        .dir = tmp.dir,
+        .task_runtime = task_runtime,
+    });
+    defer services.deinit();
+
+    const stamp = coding_agent.session_manager.SessionStamp.now(services.io);
+    var session = try coding_agent.session_bootstrap.openSession(std.testing.allocator, &services, stamp.date(), .{ .create = .{
+        .session_id = "codex-settings-test",
+        .timestamp = stamp.timestamp(),
+    } }, .{});
+    defer {
+        session.requestShutdown();
+        session.deinit();
+    }
+    var wake: runtime.WakeEvent = .init;
+    var loop = try Loop.initTest(std.testing.allocator, null);
+    defer loop.deinit();
+    loop.services = &services;
+    loop.session = &session;
+    loop.io = services.io;
+    loop.wake = &wake;
+    loop.trace_io_ready = true;
+    try loop.requestFileIndexRebuild();
+
+    try loop.dispatch(.{ .insert = "/settings" });
+    try loop.dispatch(.submit);
+    try loop.dispatch(.{ .key_editor = .move_down });
+    try loop.dispatch(.{ .key_editor = .move_down });
+    try loop.dispatch(.{ .key_editor = .tab });
+    try std.testing.expectEqual(PickerKind.settings_codex, loop.composer.picker.currentKind());
+    try std.testing.expectEqualStrings("/settings codex:", loop.composer.editor.text());
+    var frame = try loop.composeFrame(80, 12);
+    try expectFrameContains(&frame, "Fast mode");
+    try expectFrameContains(&frame, "Verbosity");
+
+    try loop.dispatch(.{ .key_editor = .tab });
+    try std.testing.expectEqual(PickerKind.settings_codex_fast_mode, loop.composer.picker.currentKind());
+    try std.testing.expectEqualStrings("/settings codex:fast:", loop.composer.editor.text());
+    try loop.dispatch(.{ .insert = "on" });
+    frame = try loop.composeFrame(80, 12);
+    try expectFrameContains(&frame, "› on");
+    try loop.dispatch(.{ .key_editor = .tab });
+    try std.testing.expect(!loop.composer.picker.active);
+    try std.testing.expectEqual(
+        ai.OpenAiCodexServiceTier.priority,
+        session.openAiCodexOptions().service_tier.?,
+    );
+    try std.testing.expect(services.settings_manager.current().global.loaded.value.codex.?.fast_mode.?);
+
+    try loop.dispatch(.{ .insert = "/settings" });
+    try loop.dispatch(.submit);
+    try loop.dispatch(.{ .key_editor = .move_down });
+    try loop.dispatch(.{ .key_editor = .move_down });
+    try loop.dispatch(.{ .key_editor = .tab });
+    try loop.dispatch(.{ .key_editor = .move_down });
+    try loop.dispatch(.{ .key_editor = .tab });
+    try std.testing.expectEqual(PickerKind.settings_codex_verbosity, loop.composer.picker.currentKind());
+    try std.testing.expectEqualStrings("/settings codex:verbosity:", loop.composer.editor.text());
+    try loop.dispatch(.{ .insert = "high" });
+    frame = try loop.composeFrame(80, 12);
+    try expectFrameContains(&frame, "› high");
+    try loop.dispatch(.{ .key_editor = .tab });
+    try std.testing.expectEqual(
+        ai.TextVerbosity.high,
+        session.openAiCodexOptions().verbosity,
+    );
+    try std.testing.expectEqual(
+        ai.TextVerbosity.high,
+        services.settings_manager.current().global.loaded.value.codex.?.verbosity.?,
+    );
 }
 
 const RunTestFixture = struct {

@@ -46,6 +46,7 @@ pub const Options = struct {
     steering_mode: QueueMode = .one_at_a_time,
     follow_up_mode: QueueMode = .one_at_a_time,
     stream: ai.StreamFunction = .{ .call_fn = defaultStream },
+    stream_options: ai.StreamOptions = .{},
     convert_to_llm: agent.ConvertToLlmHook = .{ .call_fn = defaultConvertToLlm },
     get_api_key: ?agent.GetApiKeyHook = null,
     before_tool_call: ?agent.BeforeToolCallHook = null,
@@ -87,7 +88,10 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, options: Options) !Agent {
         .follow_up_queue = .{ .mode = options.follow_up_mode },
         .loop_config = .{
             .model = options.model,
-            .options = .{ .reasoning = agent.toAiThinkingLevel(options.thinking_level) },
+            .options = .{
+                .stream = options.stream_options,
+                .reasoning = agent.toAiThinkingLevel(options.thinking_level),
+            },
             .stream = options.stream,
             .convert_to_llm = options.convert_to_llm,
             .get_api_key = options.get_api_key,
@@ -136,6 +140,14 @@ pub fn setStream(self: *Agent, stream: ai.StreamFunction) void {
 pub fn setThinkingLevel(self: *Agent, thinking_level: agent.ThinkingLevel) void {
     self.state.thinking_level = thinking_level;
     self.loop_config.options.reasoning = agent.toAiThinkingLevel(thinking_level);
+}
+
+pub fn streamOptions(self: *const Agent) ai.StreamOptions {
+    return self.loop_config.options.stream;
+}
+
+pub fn setStreamOptions(self: *Agent, options: ai.StreamOptions) void {
+    self.loop_config.options.stream = options;
 }
 
 pub fn setTools(self: *Agent, tools: []const agent.AgentTool) !void {

@@ -2,6 +2,10 @@
 
 Status: initial public capability.
 
+See `docs/typescript-extension-api-north-star-prd.md` for the intended mature
+capability model. This document remains the contract for the currently
+implemented prompt-command tranche.
+
 Zi borrows Pi's pleasant activation-function ergonomics, but not its in-process
 service-locator or event-bus architecture. Extensions execute in the supervised
 Node host. Zig owns registration publication, invocation deadlines, frontend

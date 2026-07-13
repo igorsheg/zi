@@ -273,7 +273,15 @@ fn buildRequestBody(allocator: std.mem.Allocator, request: protocol.StreamReques
     try writer.writeAll(",\"input\":[");
     try writeInputMessages(allocator, writer, transformed_context);
     try writer.writeByte(']');
-    try writer.writeAll(",\"text\":{\"verbosity\":\"low\"}");
+    try writer.writeAll(",\"text\":{\"verbosity\":");
+    try std.json.Stringify.value(@tagName(request.options.openai_codex.verbosity), .{}, writer);
+    try writer.writeByte('}');
+    if (request.options.openai_codex.service_tier) |service_tier| {
+        if (models_api.supportsCodexPriorityService(request.model)) {
+            try writer.writeAll(",\"service_tier\":");
+            try std.json.Stringify.value(@tagName(service_tier), .{}, writer);
+        }
+    }
     if (codexReasoningEffort(request)) |effort| {
         try writer.writeAll(",\"reasoning\":{\"effort\":");
         try std.json.Stringify.value(effort, .{}, writer);
@@ -480,6 +488,37 @@ test "endpoint url appends codex responses path" {
     defer std.testing.allocator.free(url);
 
     try std.testing.expectEqualStrings("https://chatgpt.com/backend-api/codex/responses", url);
+}
+
+test "request body serializes configured codex verbosity" {
+    var request = testRequest();
+    request.options.openai_codex.verbosity = .high;
+
+    const body = try buildRequestBody(std.testing.allocator, request);
+    defer std.testing.allocator.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"text\":{\"verbosity\":\"high\"}") != null);
+}
+
+test "request body emits priority tier only for fast-supported codex models" {
+    var request = testRequest();
+    request.options.openai_codex.service_tier = .priority;
+    request.model.id = "gpt-5.4";
+
+    const supported = try buildRequestBody(std.testing.allocator, request);
+    defer std.testing.allocator.free(supported);
+    try std.testing.expect(std.mem.indexOf(u8, supported, "\"service_tier\":\"priority\"") != null);
+
+    request.model.id = "gpt-5.4-mini";
+    const unsupported = try buildRequestBody(std.testing.allocator, request);
+    defer std.testing.allocator.free(unsupported);
+    try std.testing.expect(std.mem.indexOf(u8, unsupported, "\"service_tier\"") == null);
+
+    request.options.openai_codex.service_tier = null;
+    request.model.id = "gpt-5.5";
+    const disabled = try buildRequestBody(std.testing.allocator, request);
+    defer std.testing.allocator.free(disabled);
+    try std.testing.expect(std.mem.indexOf(u8, disabled, "\"service_tier\"") == null);
 }
 
 test "request body includes codex reasoning summary when requested" {

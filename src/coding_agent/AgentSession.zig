@@ -149,6 +149,7 @@ pub const Options = struct {
     compaction_settings: session_manager.CompactionSettings = .{},
     retry_settings: RetrySettings = .{},
     hide_thinking: bool = true,
+    openai_codex: ai.OpenAiCodexOptions = .{},
     stream: ?ai.StreamFunction = null,
     get_api_key: ?agent_mod.GetApiKeyHook = null,
     dir: std.Io.Dir = .cwd(),
@@ -595,6 +596,7 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, options: Options) !AgentSe
         .thinking_level = options.thinking_level,
         .tools = tools.activeAgentTools(),
         .messages = context_messages,
+        .stream_options = .{ .openai_codex = options.openai_codex },
         .task_runtime = task_runtime,
         .after_tool_call = .{ .call_fn = classifyToolResultAfterCall },
     };
@@ -923,6 +925,18 @@ pub fn setThinkingLevel(self: *AgentSession, level: agent_mod.ThinkingLevel) !vo
 /// persists it through the settings owner before this mutation.
 pub fn setHideThinking(self: *AgentSession, hidden: bool) !void {
     self.hide_thinking = hidden;
+}
+
+/// Codex features are settings facts. The caller persists them through
+/// SettingsManager before changing the live session's next-run configuration.
+pub fn openAiCodexOptions(self: *const AgentSession) ai.OpenAiCodexOptions {
+    return self.agent.streamOptions().openai_codex;
+}
+
+pub fn setOpenAiCodexOptions(self: *AgentSession, options: ai.OpenAiCodexOptions) void {
+    var stream_options = self.agent.streamOptions();
+    stream_options.openai_codex = options;
+    self.agent.setStreamOptions(stream_options);
 }
 
 pub fn queuePrompt(

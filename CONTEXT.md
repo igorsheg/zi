@@ -95,6 +95,23 @@ constructing the plan.
 One initialized extension-host process and its generation-scoped operations.
 Replacement prepares a complete next generation before making it active.
 
+**Extension capability**
+One bounded kind of contribution an extension may declare, such as a command,
+tool, setting, workflow interaction, lifecycle observer, or AI adapter. Each
+capability names the Zi owner that validates and applies its requests.
+
+**Extension operation**
+One generation-bound invocation of extension code with typed input, bounded
+output, cancellation, a deadline, and one terminal result.
+
+**Extension setting**
+A declared, namespaced global or project preference persisted by Zi's settings
+owner. It is distinct from extension-owned files and durable session facts.
+
+**Extension session fact**
+A declared, namespaced fact persisted in one session through `AgentSession`. It
+is distinct from global/project settings and ephemeral host-generation state.
+
 **Prompt command**
 A generation-bound extension registration that transforms one slash invocation
 into a bounded user prompt. Zi, not the extension, submits and persists the

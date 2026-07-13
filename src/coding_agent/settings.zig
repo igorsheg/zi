@@ -1,4 +1,5 @@
 const std = @import("std");
+const ai = @import("../ai/root.zig");
 const paths_mod = @import("paths.zig");
 
 pub const max_settings_file_bytes = 64 * 1024;
@@ -9,8 +10,14 @@ pub const Settings = struct {
     default_model: ?[]const u8 = null,
     default_thinking_level: ?[]const u8 = null,
     hide_thinking_block: ?bool = null,
+    codex: ?Codex = null,
     compaction: ?Compaction = null,
     retry: ?Retry = null,
+
+    pub const Codex = struct {
+        fast_mode: ?bool = null,
+        verbosity: ?ai.TextVerbosity = null,
+    };
 
     pub const Compaction = struct {
         keep_recent_tokens: ?u64 = null,
@@ -139,6 +146,32 @@ pub const SettingsManager = struct {
         try self.replaceGlobalSettings(io, dir, global);
     }
 
+    pub fn setCodexFastMode(
+        self: *SettingsManager,
+        io: std.Io,
+        dir: std.Io.Dir,
+        enabled: bool,
+    ) !void {
+        var global = fileSettings(self.snapshot.global);
+        var codex = global.codex orelse Settings.Codex{};
+        codex.fast_mode = enabled;
+        global.codex = codex;
+        try self.replaceGlobalSettings(io, dir, global);
+    }
+
+    pub fn setCodexVerbosity(
+        self: *SettingsManager,
+        io: std.Io,
+        dir: std.Io.Dir,
+        verbosity: ai.TextVerbosity,
+    ) !void {
+        var global = fileSettings(self.snapshot.global);
+        var codex = global.codex orelse Settings.Codex{};
+        codex.verbosity = verbosity;
+        global.codex = codex;
+        try self.replaceGlobalSettings(io, dir, global);
+    }
+
     fn replaceGlobalSettings(self: *SettingsManager, io: std.Io, dir: std.Io.Dir, global: Settings) !void {
         try writeGlobalSettings(self.allocator, io, dir, self.global_dir, global);
         var next = try loadedSettingsFromValue(self.allocator, global);
@@ -161,6 +194,7 @@ fn loadedSettingsFromValue(allocator: std.mem.Allocator, value: Settings) !Loade
         .default_model = if (value.default_model) |text| try allocator.dupe(u8, text) else null,
         .default_thinking_level = if (value.default_thinking_level) |text| try allocator.dupe(u8, text) else null,
         .hide_thinking_block = value.hide_thinking_block,
+        .codex = value.codex,
         .compaction = value.compaction,
         .retry = value.retry,
     } };
@@ -205,6 +239,22 @@ fn writeGlobalSettings(
     }
     if (value.hide_thinking_block) |hidden| {
         try parsed.value.object.put(json_allocator, "hideThinkingBlock", .{ .bool = hidden });
+    }
+    if (value.codex) |codex| {
+        var object: std.json.ObjectMap = if (parsed.value.object.get("codex")) |existing_codex|
+            switch (existing_codex) {
+                .object => |existing_object| existing_object,
+                else => .empty,
+            }
+        else
+            .empty;
+        if (codex.fast_mode) |enabled| {
+            try object.put(json_allocator, "fastMode", .{ .bool = enabled });
+        }
+        if (codex.verbosity) |verbosity| {
+            try object.put(json_allocator, "verbosity", .{ .string = @tagName(verbosity) });
+        }
+        try parsed.value.object.put(json_allocator, "codex", .{ .object = object });
     }
 
     var bytes: std.Io.Writer.Allocating = .init(allocator);
@@ -271,9 +321,20 @@ fn parseSettings(allocator: std.mem.Allocator, bytes: []const u8) !LoadedSetting
     value.default_model = try optionalString(allocator, parsed.value.object.get("defaultModel"));
     value.default_thinking_level = try optionalString(allocator, parsed.value.object.get("defaultThinkingLevel"));
     value.hide_thinking_block = try optionalBool(parsed.value.object.get("hideThinkingBlock"));
+    value.codex = try optionalCodex(parsed.value.object.get("codex"));
     value.compaction = try optionalCompaction(parsed.value.object.get("compaction"));
     value.retry = try optionalRetry(parsed.value.object.get("retry"));
     return .{ .allocator = allocator, .value = value };
+}
+
+fn optionalCodex(value: ?std.json.Value) !?Settings.Codex {
+    const resolved = value orelse return null;
+    if (resolved == .null) return null;
+    if (resolved != .object) return error.InvalidSettings;
+    return .{
+        .fast_mode = try optionalBool(resolved.object.get("fastMode")),
+        .verbosity = try optionalEnum(ai.TextVerbosity, resolved.object.get("verbosity")),
+    };
 }
 
 fn optionalCompaction(value: ?std.json.Value) !?Settings.Compaction {
@@ -308,6 +369,13 @@ fn optionalString(allocator: std.mem.Allocator, value: ?std.json.Value) !?[]cons
         },
         else => error.InvalidSettings,
     };
+}
+
+fn optionalEnum(comptime T: type, value: ?std.json.Value) !?T {
+    const resolved = value orelse return null;
+    if (resolved == .null) return null;
+    if (resolved != .string) return error.InvalidSettings;
+    return std.meta.stringToEnum(T, resolved.string) orelse error.InvalidSettings;
 }
 
 fn optionalNonNegativeInteger(value: ?std.json.Value) !?u64 {
@@ -387,6 +455,49 @@ test "settings manager loads global and project default model settings" {
     try std.testing.expectEqualStrings("openai", manager.current().global.loaded.value.default_provider.?);
     try std.testing.expectEqualStrings("gpt", manager.current().global.loaded.value.default_model.?);
     try std.testing.expectEqualStrings("high", manager.current().project.loaded.value.default_thinking_level.?);
+}
+
+test "settings manager persists codex settings and preserves sibling keys" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo/.zi");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "agent/settings.json",
+        .data =
+        \\{"unrelated":{"keep":true},"codex":{"fastMode":false,"verbosity":"medium","keep":"value"}}
+        ,
+    });
+
+    var manager = try SettingsManager.init(std.testing.allocator, std.testing.io, .{
+        .paths = .{ .global_dir = "agent", .cwd = "repo" },
+        .dir = tmp.dir,
+    });
+    defer manager.deinit();
+
+    const loaded = manager.current().global.loaded.value.codex.?;
+    try std.testing.expectEqual(false, loaded.fast_mode.?);
+    try std.testing.expectEqual(ai.TextVerbosity.medium, loaded.verbosity.?);
+
+    try manager.setCodexFastMode(std.testing.io, tmp.dir, true);
+    try manager.setCodexVerbosity(std.testing.io, tmp.dir, .high);
+    const current = manager.current().global.loaded.value.codex.?;
+    try std.testing.expect(current.fast_mode.?);
+    try std.testing.expectEqual(ai.TextVerbosity.high, current.verbosity.?);
+
+    const bytes = try std.Io.Dir.readFileAlloc(
+        tmp.dir,
+        std.testing.io,
+        "agent/settings.json",
+        std.testing.allocator,
+        .limited(max_settings_file_bytes),
+    );
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\"fastMode\": true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\"verbosity\": \"high\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\"keep\": \"value\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\"unrelated\"") != null);
 }
 
 test "settings manager loads compaction and retry settings" {
