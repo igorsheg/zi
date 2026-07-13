@@ -31,6 +31,7 @@ pub const Options = struct {
     open: coding_agent.session_bootstrap.OpenSpec,
     resume_picker: bool,
     panic_test: bool = false,
+    extension_load_plan: ?*const coding_agent.ExtensionHost.ExtensionLoadPlan = null,
 };
 
 fn nowNs(io: std.Io) u64 {
@@ -63,8 +64,15 @@ pub fn run(process: runtime.Process, options: Options) !void {
         .agent_dir = agent_dir,
         .environ = process.environ,
         .task_runtime = task_runtime,
+        .extension_load_plan = options.extension_load_plan,
     });
     defer if (!abandon_cleanup) services.deinit();
+    if (options.extension_load_plan != null and
+        services.extensionAvailability() != .active)
+    {
+        writeExtensionHostDiagnostic(process.io, &services);
+        return error.ExtensionHostUnavailable;
+    }
     const stamp = coding_agent.session_manager.SessionStamp.now(services.io);
     var session = try coding_agent.session_bootstrap.openSession(process.gpa, &services, stamp.date(), options.open, .{});
     defer if (!abandon_cleanup) {
@@ -167,6 +175,26 @@ fn drainFrontend(owner_loop: *Loop, pump: *InputPump, wake: *runtime.WakeEvent, 
         wake.reset();
     }
     return owner_loop.pollShutdown() and pump.hasStopped();
+}
+
+fn writeExtensionHostDiagnostic(
+    io: std.Io,
+    services: *const coding_agent.runtime_services.RuntimeServices,
+) void {
+    var buffer: [256]u8 = undefined;
+    const text = if (services.extensionDiagnostic()) |diagnostic| switch (diagnostic) {
+        .startup => |name| std.fmt.bufPrint(&buffer, "zi: extension host unavailable: {s}\n", .{name}) catch
+            "zi: extension host unavailable\n",
+        .host => |host| std.fmt.bufPrint(
+            &buffer,
+            "zi: extension host unavailable: {s}\n",
+            .{@tagName(host.failure)},
+        ) catch "zi: extension host unavailable\n",
+    } else "zi: extension host unavailable\n";
+    std.Io.File.stderr().writeStreamingAll(io, text) catch |err| {
+        const ignored_diagnostic_error = @errorName(err);
+        _ = ignored_diagnostic_error;
+    };
 }
 
 fn writeUndrainedDiagnostic(io: std.Io) void {

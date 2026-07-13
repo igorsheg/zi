@@ -2,6 +2,11 @@ import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  activateExtension,
+  runPromptCommand,
+  type RegisteredPromptCommand,
+} from "./api.ts";
 import { FrameDecoder } from "./framing.ts";
 import { createExtensionLoader } from "./loader.ts";
 import { decodeEnvelope, PROTOCOL_MAJOR, PROTOCOL_MINOR, type Envelope, type RequestEnvelope } from "./protocol.ts";
@@ -13,6 +18,7 @@ const loadExtension = createExtensionLoader();
 const MAX_ACTIVE_DISPATCHES = 32;
 const MAX_DIAGNOSTIC_BYTES = 16 * 1024 * 1024;
 const MAX_EXTENSIONS = 128;
+const MAX_ACTIVE_PROMPT_COMMANDS = 8;
 const MAX_EXTENSION_PATH_BYTES = 16 * 1024;
 const HOST_VERSION = "1.0.0";
 const runtimeHostSha = createHash("sha256").update(await readFile(fileURLToPath(import.meta.url))).digest("hex");
@@ -24,6 +30,9 @@ let modulesLoaded = false;
 let hostPublished = false;
 let shuttingDown = false;
 let failed = false;
+let activePromptCommands = 0;
+let runtimeCwd = "";
+const promptCommands = new Map<string, RegisteredPromptCommand>();
 const pendingNodeRequests = new Map<string, {
   readonly resolve: (value: unknown) => void;
   readonly reject: (error: Error) => void;
@@ -124,15 +133,36 @@ async function dispatchRequest(request: RequestEnvelope, signal: AbortSignal): P
     case "host/loadExtensions": {
       if (!handshakeComplete || modulesLoaded) throw new Error("invalid extension initialization state");
       const paths = decodeExtensionPaths(request.params);
-      for (const path of paths) await loadExtension(path);
+      for (const path of paths) {
+        const loaded = await loadExtension(path);
+        await activateExtension(loaded, path, promptCommands);
+      }
       modulesLoaded = true;
-      await respond(request.id, { initialized: true });
+      await respond(request.id, {
+        initialized: true,
+        promptCommands: [...promptCommands.values()].map(({ name, description }) => ({ name, description })),
+      });
       return;
     }
     case "host/ping":
       requirePublishedHost();
       await respond(request.id, { pong: true });
       return;
+    case "host/runPromptCommand": {
+      requirePublishedHost();
+      const params = asRecord(request.params);
+      const command = typeof params.name === "string" ? promptCommands.get(params.name) : undefined;
+      if (command === undefined) throw new Error("unknown prompt command");
+      if (activePromptCommands === MAX_ACTIVE_PROMPT_COMMANDS) throw new Error("prompt command capacity exceeded");
+      activePromptCommands += 1;
+      try {
+        const result = await runPromptCommand(command, params.args, runtimeCwd, signal);
+        await respond(request.id, result);
+      } finally {
+        activePromptCommands -= 1;
+      }
+      return;
+    }
     case "host/testNested": {
       requireTestProbe();
       requirePublishedHost();
@@ -200,6 +230,7 @@ function decodeInitializeParams(value: unknown): { readonly generationNonce: str
     throw new Error("invalid Zi version");
   }
   if (typeof params.cwd !== "string" || params.cwd.length === 0) throw new Error("invalid cwd");
+  runtimeCwd = params.cwd;
   if (typeof params.generationNonce !== "string" || !/^[0-9a-f]{32}$/.test(params.generationNonce)) {
     throw new Error("invalid generation nonce");
   }

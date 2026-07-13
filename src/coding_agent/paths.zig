@@ -10,6 +10,10 @@ pub const settings_file_name = "settings.json";
 pub const auth_file_name = "auth.json";
 pub const sessions_dir_name = "sessions";
 pub const skills_dir_name = "skills";
+pub const extensions_dir_name = "extensions";
+pub const extension_file_suffix = ".ts";
+pub const extension_declaration_file_suffix = ".d.ts";
+pub const extension_entry_file_name = "index" ++ extension_file_suffix;
 pub const skill_file_name = "SKILL.md";
 pub const context_file_name = "AGENTS.md";
 pub const claude_context_file_name = "CLAUDE.md";
@@ -481,6 +485,14 @@ pub const PersistencePaths = struct {
         return std.fs.path.join(allocator, &.{ self.global_dir, skills_dir_name });
     }
 
+    pub fn globalExtensionsDir(self: PersistencePaths, allocator: std.mem.Allocator) ![]const u8 {
+        return std.fs.path.join(allocator, &.{ self.global_dir, extensions_dir_name });
+    }
+
+    pub fn projectExtensionsDir(self: PersistencePaths, allocator: std.mem.Allocator) ![]const u8 {
+        return std.fs.path.join(allocator, &.{ self.cwd, project_config_dir_name, extensions_dir_name });
+    }
+
     pub fn projectSkillsDir(self: PersistencePaths, allocator: std.mem.Allocator) ![]const u8 {
         return std.fs.path.join(allocator, &.{ self.cwd, project_config_dir_name, skills_dir_name });
     }
@@ -606,6 +618,10 @@ test "persistence paths owns user and project zi resource paths" {
     defer std.testing.allocator.free(global_skills);
     const project_skills = try paths.projectSkillsDir(std.testing.allocator);
     defer std.testing.allocator.free(project_skills);
+    const global_extensions = try paths.globalExtensionsDir(std.testing.allocator);
+    defer std.testing.allocator.free(global_extensions);
+    const project_extensions = try paths.projectExtensionsDir(std.testing.allocator);
+    defer std.testing.allocator.free(project_extensions);
 
     try std.testing.expectEqualStrings(".zi", global_config_dir_name);
     try std.testing.expectEqualStrings("agent/settings.json", global_settings);
@@ -614,6 +630,8 @@ test "persistence paths owns user and project zi resource paths" {
     try std.testing.expectEqualStrings("repo/.zi/settings.json", project_settings);
     try std.testing.expectEqualStrings("agent/skills", global_skills);
     try std.testing.expectEqualStrings("repo/.zi/skills", project_skills);
+    try std.testing.expectEqualStrings("agent/extensions", global_extensions);
+    try std.testing.expectEqualStrings("repo/.zi/extensions", project_extensions);
 }
 
 test "existing path resolution tries common macOS filename variants" {

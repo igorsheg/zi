@@ -13,6 +13,7 @@
     "types": ["node"],
     "baseUrl": ".",
     "paths": {
+      "@zi/extension-api": ["../api/index.d.ts"],
       "fixture-package": ["test/fixtures/fixture-package/index.d.ts"]
     }
   },

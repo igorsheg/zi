@@ -5,6 +5,7 @@ const std = @import("std");
 
 pub const AgentSession = @import("AgentSession.zig");
 pub const ExtensionHost = @import("ExtensionHost.zig");
+pub const extension_discovery = @import("extension_discovery.zig");
 pub const auth_mode = @import("auth_mode.zig");
 pub const file_completion = @import("file_completion.zig");
 pub const failure_display = @import("failure_display.zig");
@@ -37,6 +38,7 @@ test {
     _ = ExtensionHost;
     _ = auth;
     _ = extension_host_asset;
+    _ = extension_discovery;
     _ = failure_display;
     _ = file_completion;
     _ = message_policy;

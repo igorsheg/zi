@@ -11,11 +11,14 @@ pub fn build(b: *std.Build) void {
     app_options.addOption([]const u8, "node_executable", b.findProgram(&.{"node"}, &.{}) catch "node");
 
     const host_sources = [_][]const u8{
+        "extensions/api/index.d.ts",
+        "extensions/api/package.json",
         "extensions/host/package.json",
         "extensions/host/package-lock.json",
         "extensions/host/tsconfig.json",
         "extensions/host/scripts/build.mjs",
         "extensions/host/scripts/typecheck.mjs",
+        "extensions/host/src/api.ts",
         "extensions/host/src/framing.ts",
         "extensions/host/src/loader.ts",
         "extensions/host/src/main.ts",
@@ -105,14 +108,18 @@ pub fn build(b: *std.Build) void {
     zio_import_check_step.dependOn(&zio_import_check.step);
 
     const host_tests = b.addSystemCommand(&.{ "npm", "--prefix", "extensions/host", "test" });
+    host_tests.addFileInput(b.path("extensions/api/index.d.ts"));
+    host_tests.addFileInput(b.path("extensions/api/package.json"));
     host_tests.addFileInput(b.path("extensions/host/package.json"));
     host_tests.addFileInput(b.path("extensions/host/package-lock.json"));
     host_tests.addFileInput(b.path("extensions/host/tsconfig.json"));
+    host_tests.addFileInput(b.path("extensions/host/src/api.ts"));
     host_tests.addFileInput(b.path("extensions/host/src/framing.ts"));
     host_tests.addFileInput(b.path("extensions/host/src/loader.ts"));
     host_tests.addFileInput(b.path("extensions/host/src/main.ts"));
     host_tests.addFileInput(b.path("extensions/host/src/protocol.ts"));
     host_tests.addFileInput(b.path("extensions/host/src/transport.ts"));
+    host_tests.addFileInput(b.path("extensions/host/test/api.test.ts"));
     host_tests.addFileInput(b.path("extensions/host/test/framing.test.ts"));
     host_tests.addFileInput(b.path("extensions/host/test/loader.test.ts"));
     host_tests.addFileInput(b.path("extensions/host/test/protocol.test.ts"));

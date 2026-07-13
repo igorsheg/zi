@@ -113,7 +113,7 @@ pub const DuplexChild = struct {
             .argv = options.argv,
             .cwd = if (options.cwd) |cwd| .{ .path = cwd } else .inherit,
             .environ_map = options.environ,
-            .expand_arg0 = .expand,
+            .expand_arg0 = .no_expand,
             .stdin = .pipe,
             .stdout = .pipe,
             .stderr = .pipe,

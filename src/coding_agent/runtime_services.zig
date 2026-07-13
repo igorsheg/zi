@@ -186,6 +186,67 @@ pub const RuntimeServices = struct {
         host.deinitReplacement(handle);
     }
 
+    pub fn extensionPromptCommands(self: *const RuntimeServices) []const ExtensionHost.PromptCommand {
+        const host = self.extension_host orelse return &.{};
+        return host.promptCommands();
+    }
+
+    pub fn findExtensionPromptCommand(
+        self: *const RuntimeServices,
+        name: []const u8,
+    ) ?*const ExtensionHost.PromptCommand {
+        const host = self.extension_host orelse return null;
+        return host.findPromptCommand(name);
+    }
+
+    pub fn startExtensionPromptCommand(
+        self: *RuntimeServices,
+        name: []const u8,
+        args: []const u8,
+        deadline_ns: u64,
+    ) !ExtensionHost.PromptCommandHandle {
+        const host = self.extension_host orelse return error.HostUnavailable;
+        return host.startPromptCommand(name, args, deadline_ns);
+    }
+
+    pub fn pollExtensionPromptCommand(
+        self: *RuntimeServices,
+        handle: *const ExtensionHost.PromptCommandHandle,
+    ) ExtensionHost.PromptCommandPoll {
+        const host = self.extension_host orelse return .{ .failure = .generation_failed };
+        return host.pollPromptCommand(handle);
+    }
+
+    pub fn cancelExtensionPromptCommand(
+        self: *RuntimeServices,
+        handle: *const ExtensionHost.PromptCommandHandle,
+    ) void {
+        if (self.extension_host) |host| host.cancel(handle);
+    }
+
+    pub fn takeExtensionPromptCommand(
+        self: *RuntimeServices,
+        handle: *const ExtensionHost.PromptCommandHandle,
+    ) ![]u8 {
+        const host = self.extension_host orelse return error.HostUnavailable;
+        return host.takePromptCommand(handle);
+    }
+
+    pub fn freeExtensionPrompt(self: *RuntimeServices, prompt: []u8) void {
+        self.allocator.free(prompt);
+    }
+
+    pub fn deinitExtensionPromptCommand(
+        self: *RuntimeServices,
+        handle: *ExtensionHost.PromptCommandHandle,
+    ) void {
+        const host = self.extension_host orelse {
+            handle.released = true;
+            return;
+        };
+        host.deinitPromptCommand(handle);
+    }
+
     pub fn extensionAvailability(self: *const RuntimeServices) ExtensionAvailability {
         if (self.extension_host) |host| {
             return if (host.available()) .active else .failed;
@@ -454,7 +515,15 @@ test "runtime services owns an explicitly enabled extension host through drain" 
     const root_path = root_buffer[0..root_len];
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "extension.ts",
-        .data = "export const fixture = 'loaded';\n",
+        .data =
+        \\export default function activate(zi) {
+        \\  zi.commands.registerPrompt({
+        \\    name: "fixture-review",
+        \\    description: "Review a fixture",
+        \\    run: ({ args }) => ({ prompt: `Review ${args}` }),
+        \\  });
+        \\}
+        ,
     });
     const extension_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "extension.ts" });
     defer std.testing.allocator.free(extension_path);
@@ -506,7 +575,15 @@ test "runtime services retains a typed extension startup diagnostic" {
     const root_path = root_buffer[0..root_len];
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "extension.ts",
-        .data = "export const fixture = 'loaded';\n",
+        .data =
+        \\export default function activate(zi) {
+        \\  zi.commands.registerPrompt({
+        \\    name: "fixture-review",
+        \\    description: "Review a fixture",
+        \\    run: ({ args }) => ({ prompt: `Review ${args}` }),
+        \\  });
+        \\}
+        ,
     });
     const extension_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "extension.ts" });
     defer std.testing.allocator.free(extension_path);

@@ -8,6 +8,9 @@ const ExtensionHost = @This();
 
 pub const load_plan_entries_max = Generation.load_plan_entries_max;
 pub const module_path_bytes_max = Generation.module_path_bytes_max;
+pub const prompt_commands_max = Generation.prompt_commands_max;
+pub const prompt_command_args_bytes_max = Generation.prompt_command_args_bytes_max;
+pub const generated_prompt_bytes_max = Generation.generated_prompt_bytes_max;
 pub const node_version_minimum = Generation.node_version_minimum;
 pub const Provenance = Generation.Provenance;
 pub const ExtensionSpec = Generation.ExtensionSpec;
@@ -17,6 +20,9 @@ pub const NodeVersion = Generation.NodeVersion;
 pub const Failure = Generation.Failure;
 pub const PingHandle = Generation.PingHandle;
 pub const PingPoll = Generation.PingPoll;
+pub const PromptCommand = Generation.PromptCommand;
+pub const PromptCommandHandle = Generation.PromptCommandHandle;
+pub const PromptCommandPoll = Generation.PromptCommandPoll;
 pub const Diagnostic = Generation.Diagnostic;
 
 pub const Options = struct {
@@ -206,6 +212,44 @@ pub fn nextDeadline(self: *const ExtensionHost) ?u64 {
 
 pub fn startPing(self: *ExtensionHost, deadline_ns: u64) !PingHandle {
     return self.active.startPing(deadline_ns);
+}
+
+pub fn promptCommands(self: *const ExtensionHost) []const PromptCommand {
+    if (!self.available()) return &.{};
+    return self.active.promptCommands();
+}
+
+pub fn findPromptCommand(self: *const ExtensionHost, name: []const u8) ?*const PromptCommand {
+    if (!self.available()) return null;
+    return self.active.findPromptCommand(name);
+}
+
+pub fn startPromptCommand(
+    self: *ExtensionHost,
+    name: []const u8,
+    args: []const u8,
+    deadline_ns: u64,
+) !PromptCommandHandle {
+    return self.active.startPromptCommand(name, args, deadline_ns);
+}
+
+pub fn pollPromptCommand(
+    self: *ExtensionHost,
+    handle: *const PromptCommandHandle,
+) PromptCommandPoll {
+    return self.pollPing(handle);
+}
+
+pub fn takePromptCommand(self: *ExtensionHost, handle: *const PromptCommandHandle) ![]u8 {
+    if (handle.generation == self.active.generationId()) return self.active.takePromptCommand(handle);
+    if (self.secondary) |secondary| {
+        if (handle.generation == secondary.generationId()) return secondary.takePromptCommand(handle);
+    }
+    return error.InvalidPromptCommandHandle;
+}
+
+pub fn deinitPromptCommand(self: *ExtensionHost, handle: *PromptCommandHandle) void {
+    self.deinitPing(handle);
 }
 
 pub fn startTestWait(self: *ExtensionHost, deadline_ns: u64) !PingHandle {
@@ -579,7 +623,15 @@ const ReplacementFixture = struct {
         errdefer std.testing.allocator.free(root_path);
         try tmp.dir.writeFile(std.testing.io, .{
             .sub_path = "extension.ts",
-            .data = "export const fixture = 'loaded';\n",
+            .data =
+            \\export default function activate(zi) {
+            \\  zi.commands.registerPrompt({
+            \\    name: "fixture-review",
+            \\    description: "Review a fixture",
+            \\    run: ({ args }) => ({ prompt: `Review ${args}` }),
+            \\  });
+            \\}
+            ,
         });
         const extension_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "extension.ts" });
         errdefer std.testing.allocator.free(extension_path);

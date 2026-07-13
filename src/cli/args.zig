@@ -1,13 +1,15 @@
 const std = @import("std");
 
-const argument_count_max = 16;
+const argument_count_max = 32;
 const message_count_max = 4;
 const unknown_flag_count_max = 8;
+pub const extension_count_max = 8;
 
 pub const ParseError = error{
     TooManyArguments,
     TooManyMessages,
     TooManyUnknownFlags,
+    TooManyExtensions,
     MissingOptionValue,
     UnknownOption,
     InvalidOptionValue,
@@ -36,6 +38,9 @@ pub const AppArgs = struct {
     continue_latest: bool = false,
     resume_picker: bool = false,
     messages: MessageList = .{},
+    extensions: ExtensionList = .{},
+    extensions_enabled: bool = true,
+    project_trust: ?bool = null,
     unknown_flags: UnknownFlagList = .{},
 };
 
@@ -66,6 +71,7 @@ const UnknownFlag = struct {
 };
 
 const MessageList = BoundedList([]const u8, message_count_max, ParseError.TooManyMessages);
+const ExtensionList = BoundedList([]const u8, extension_count_max, ParseError.TooManyExtensions);
 const UnknownFlagList = BoundedList(UnknownFlag, unknown_flag_count_max, ParseError.TooManyUnknownFlags);
 
 fn BoundedList(comptime T: type, comptime capacity: usize, comptime full_error: ParseError) type {
@@ -101,6 +107,10 @@ const AppFlagTarget = enum {
     resume_picker,
     session,
     continue_latest,
+    extension,
+    approve_project,
+    deny_project,
+    no_extensions,
 };
 
 const AppFlagSpec = struct {
@@ -149,6 +159,31 @@ const app_flags = [_]AppFlagSpec{
         .short = "c",
         .target = .continue_latest,
         .help = "Continue the newest session for this cwd",
+    },
+    .{
+        .long = "no-extensions",
+        .target = .no_extensions,
+        .help = "Disable extension discovery and loading",
+    },
+    .{
+        .long = "approve",
+        .short = "a",
+        .target = .approve_project,
+        .help = "Trust project-local extensions for this run",
+    },
+    .{
+        .long = "no-approve",
+        .short = "na",
+        .target = .deny_project,
+        .help = "Ignore project-local extensions for this run",
+    },
+    .{
+        .long = "extension",
+        .short = "e",
+        .value = .required,
+        .target = .extension,
+        .value_name = "path",
+        .help = "Load a trusted TypeScript extension (repeatable)",
     },
     .{
         .long = "version",
@@ -324,6 +359,24 @@ fn applyAppFlag(result: *AppArgs, spec: AppFlagSpec, value: ?[]const u8) ParseEr
             if (hasSessionConflict(result.*)) return error.InvalidOptionValue;
             result.continue_latest = true;
         },
+        .extension => {
+            if (!result.extensions_enabled) return error.InvalidOptionValue;
+            const path = value orelse return error.MissingOptionValue;
+            if (path.len == 0) return error.InvalidOptionValue;
+            try result.extensions.append(path);
+        },
+        .approve_project => {
+            if (result.project_trust != null) return error.InvalidOptionValue;
+            result.project_trust = true;
+        },
+        .deny_project => {
+            if (result.project_trust != null) return error.InvalidOptionValue;
+            result.project_trust = false;
+        },
+        .no_extensions => {
+            if (result.extensions.count != 0 or !result.extensions_enabled) return error.InvalidOptionValue;
+            result.extensions_enabled = false;
+        },
     }
 }
 
@@ -492,6 +545,35 @@ test "usage includes session forms" {
     try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "zi --resume") != null);
     try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "zi --session <session> [prompt]") != null);
     try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "zi --continue [prompt]") != null);
+}
+
+test "parses bounded repeatable extension paths" {
+    const app = (try parse(&.{ "--extension", "one.ts", "--extension=two.ts", "-e", "three.ts" })).app;
+    try std.testing.expectEqual(@as(usize, 3), app.extensions.count);
+    try std.testing.expectEqualStrings("one.ts", app.extensions.slice()[0]);
+    try std.testing.expectEqualStrings("two.ts", app.extensions.slice()[1]);
+    try std.testing.expectEqualStrings("three.ts", app.extensions.slice()[2]);
+
+    var too_many: [extension_count_max * 2 + 2][]const u8 = undefined;
+    for (0..extension_count_max + 1) |index| {
+        too_many[index * 2] = "--extension";
+        too_many[index * 2 + 1] = "extension.ts";
+    }
+    try std.testing.expectError(error.TooManyExtensions, parse(&too_many));
+}
+
+test "no-extensions disables all loading and conflicts with explicit paths" {
+    try std.testing.expect(!(try parse(&.{"--no-extensions"})).app.extensions_enabled);
+    try std.testing.expectError(error.InvalidOptionValue, parse(&.{ "--no-extensions", "--extension", "one.ts" }));
+    try std.testing.expectError(error.InvalidOptionValue, parse(&.{ "--extension", "one.ts", "--no-extensions" }));
+}
+
+test "parses one-run project trust overrides" {
+    try std.testing.expectEqual(true, (try parse(&.{"--approve"})).app.project_trust.?);
+    try std.testing.expectEqual(true, (try parse(&.{"-a"})).app.project_trust.?);
+    try std.testing.expectEqual(false, (try parse(&.{"--no-approve"})).app.project_trust.?);
+    try std.testing.expectEqual(false, (try parse(&.{"-na"})).app.project_trust.?);
+    try std.testing.expectError(error.InvalidOptionValue, parse(&.{ "--approve", "--no-approve" }));
 }
 
 test "parses help" {

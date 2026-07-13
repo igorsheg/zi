@@ -81,14 +81,24 @@ The optional, supervised Node runtime that executes trusted TypeScript
 extensions and requests actions from Zi owners. It owns no agent, session,
 transcript, settings, or TUI state.
 
+**Extension discovery**
+The bounded selection of global, project-local, and explicit extension modules.
+Global modules are trusted user resources; project modules require the current
+run's project trust decision.
+
 **Extension load plan**
 The bounded, immutable set of trusted extension modules selected for one host
-startup or replacement. A project-local module may enter the plan only after the
-project trust decision.
+startup or replacement. Discovery canonicalizes and deduplicates modules before
+constructing the plan.
 
 **Host generation**
 One initialized extension-host process and its generation-scoped operations.
 Replacement prepares a complete next generation before making it active.
+
+**Prompt command**
+A generation-bound extension registration that transforms one slash invocation
+into a bounded user prompt. Zi, not the extension, submits and persists the
+result through the normal session path.
 
 **agent.Agent**
 Product-agnostic turn loop. It owns provider streaming, runtime transcript

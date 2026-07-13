@@ -4,11 +4,17 @@ const build_options = @import("build_options");
 const runtime = @import("../runtime/root.zig");
 const asset = @import("extension_host_asset.zig");
 const paths_mod = @import("paths.zig");
+const slash_commands = @import("slash_commands.zig");
 
 const ExtensionHostGeneration = @This();
 
 pub const load_plan_entries_max: usize = 128;
 pub const module_path_bytes_max: usize = 16 * 1024;
+pub const prompt_commands_max: usize = 32;
+pub const prompt_command_name_bytes_max: usize = 32;
+pub const prompt_command_description_bytes_max: usize = 96;
+pub const prompt_command_args_bytes_max: usize = 4 * 1024;
+pub const generated_prompt_bytes_max: usize = 4 * 1024;
 pub const node_version_minimum: NodeVersion = .{ .major = 22, .minor = 19, .patch = 0 };
 
 const protocol_major: u32 = 1;
@@ -120,6 +126,7 @@ pub const Failure = enum {
     canceled,
     deadline,
     generation_failed,
+    extension_error,
     replaced,
     protocol,
     unsupported_node,
@@ -137,6 +144,24 @@ pub const PingPoll = union(enum) {
     success,
     failure: Failure,
 };
+
+pub const PromptCommand = struct {
+    name_buffer: [prompt_command_name_bytes_max]u8 = undefined,
+    name_len: u8 = 0,
+    description_buffer: [prompt_command_description_bytes_max]u8 = undefined,
+    description_len: u8 = 0,
+
+    pub fn name(self: *const PromptCommand) []const u8 {
+        return self.name_buffer[0..self.name_len];
+    }
+
+    pub fn description(self: *const PromptCommand) []const u8 {
+        return self.description_buffer[0..self.description_len];
+    }
+};
+
+pub const PromptCommandHandle = PingHandle;
+pub const PromptCommandPoll = PingPoll;
 
 pub const Diagnostic = struct {
     failure: Failure,
@@ -167,6 +192,7 @@ const Lifecycle = enum {
 
 const OperationKind = enum {
     ping,
+    prompt_command,
     test_nested,
     test_spin,
 };
@@ -185,6 +211,7 @@ const Pending = struct {
     kind: OperationKind = .ping,
     deadline_ns: u64 = 0,
     state: OperationState = .pending,
+    prompt: ?[]u8 = null,
 };
 
 const IdOrigin = enum { zig, node };
@@ -197,6 +224,9 @@ const DecodedEnvelope = struct {
     method_len: usize = 0,
     result: Result = .none,
     rpc_error: bool = false,
+    prompt: ?[]u8 = null,
+    commands: [prompt_commands_max]PromptCommand = undefined,
+    command_len: u8 = 0,
 
     const Result = union(enum) {
         none,
@@ -204,6 +234,7 @@ const DecodedEnvelope = struct {
         stopped,
         initialize: Initialize,
         loaded,
+        prompt,
         nested,
         other,
     };
@@ -224,6 +255,7 @@ const DecodedEnvelope = struct {
     }
 
     fn deinit(self: *DecodedEnvelope, allocator: std.mem.Allocator) void {
+        if (self.prompt) |prompt| allocator.free(prompt);
         allocator.free(self.body);
         self.* = undefined;
     }
@@ -368,6 +400,8 @@ stderr_tail: [stderr_tail_bytes_max]u8 = undefined,
 stderr_tail_len: usize = 0,
 stderr_total: usize = 0,
 last_term: ?std.process.Child.Term = null,
+prompt_commands: [prompt_commands_max]PromptCommand = undefined,
+prompt_command_len: u8 = 0,
 
 pub fn init(
     allocator: std.mem.Allocator,
@@ -381,7 +415,12 @@ pub fn init(
     const node = try NodeCommand.resolve(options.environ, options.node_executable);
     var generation_nonce: [16]u8 = undefined;
     options.task_runtime.io().random(&generation_nonce);
-    const node_executable = try allocator.dupe(u8, node.executable);
+    const node_executable = try resolveNodeExecutable(
+        allocator,
+        options.task_runtime.io(),
+        options.environ,
+        node.executable,
+    );
     errdefer allocator.free(node_executable);
     const owned_plan = try ExtensionLoadPlan.init(allocator, load_plan.entries);
     errdefer {
@@ -528,6 +567,62 @@ pub fn startPing(self: *ExtensionHostGeneration, deadline_ns: u64) !PingHandle {
     return self.startOperation(.ping, "host/ping", "{}", deadline_ns);
 }
 
+pub fn promptCommands(self: *const ExtensionHostGeneration) []const PromptCommand {
+    return self.prompt_commands[0..self.prompt_command_len];
+}
+
+pub fn findPromptCommand(self: *const ExtensionHostGeneration, name: []const u8) ?*const PromptCommand {
+    for (self.promptCommands()) |*command| {
+        if (std.mem.eql(u8, command.name(), name)) return command;
+    }
+    return null;
+}
+
+pub fn startPromptCommand(
+    self: *ExtensionHostGeneration,
+    name: []const u8,
+    args: []const u8,
+    deadline_ns: u64,
+) !PromptCommandHandle {
+    if (self.findPromptCommand(name) == null) return error.UnknownPromptCommand;
+    if (args.len > prompt_command_args_bytes_max or !std.unicode.utf8ValidateSlice(args)) {
+        return error.InvalidPromptCommandArguments;
+    }
+    var params: std.Io.Writer.Allocating = .init(self.allocator);
+    defer params.deinit();
+    try params.writer.writeAll("{\"name\":");
+    try std.json.Stringify.value(name, .{}, &params.writer);
+    try params.writer.writeAll(",\"args\":");
+    try std.json.Stringify.value(args, .{}, &params.writer);
+    try params.writer.writeByte('}');
+    return self.startOperation(
+        .prompt_command,
+        "host/runPromptCommand",
+        params.written(),
+        deadline_ns,
+    );
+}
+
+pub fn pollPromptCommand(
+    self: *ExtensionHostGeneration,
+    handle: *const PromptCommandHandle,
+) PromptCommandPoll {
+    return self.pollPing(handle);
+}
+
+pub fn takePromptCommand(self: *ExtensionHostGeneration, handle: *const PromptCommandHandle) ![]u8 {
+    if (handle.released or handle.generation != self.generation) return error.InvalidPromptCommandHandle;
+    const pending = self.findPending(handle.id) orelse return error.InvalidPromptCommandHandle;
+    if (pending.kind != .prompt_command or pending.state != .success) return error.PromptCommandNotReady;
+    const prompt = pending.prompt orelse return error.PromptCommandNotReady;
+    pending.prompt = null;
+    return prompt;
+}
+
+pub fn deinitPromptCommand(self: *ExtensionHostGeneration, handle: *PromptCommandHandle) void {
+    self.deinitPing(handle);
+}
+
 fn startTestNested(self: *ExtensionHostGeneration, deadline_ns: u64) !PingHandle {
     return self.startOperation(.test_nested, "host/testNested", "{\"value\":1}", deadline_ns);
 }
@@ -582,6 +677,7 @@ pub fn deinitPing(self: *ExtensionHostGeneration, handle: *PingHandle) void {
                 .pending, .cancel_requested => false,
                 else => true,
             });
+            if (operation.prompt) |prompt| self.allocator.free(prompt);
             operation.* = .{};
         }
     }
@@ -659,7 +755,10 @@ pub fn deinit(self: *ExtensionHostGeneration) void {
     }
     if (self.child) |child| child.deinit();
     if (self.asset_lease) |*lease| lease.deinit();
-    for (&self.pending) |*pending| pending.* = .{};
+    for (&self.pending) |*pending| {
+        if (pending.prompt) |prompt| self.allocator.free(prompt);
+        pending.* = .{};
+    }
     self.load_plan.deinit();
     self.allocator.free(self.node_executable);
     self.allocator.free(self.agent_dir);
@@ -690,7 +789,7 @@ fn startOperation(
     return .{ .generation = self.generation, .id = id };
 }
 
-fn applyEnvelope(self: *ExtensionHostGeneration, envelope: *const DecodedEnvelope, now_ns: u64) void {
+fn applyEnvelope(self: *ExtensionHostGeneration, envelope: *DecodedEnvelope, now_ns: u64) void {
     if (envelope.method_len != 0) {
         if (envelope.origin != .node or envelope.id == null) {
             self.failGeneration(.protocol, now_ns);
@@ -768,6 +867,8 @@ fn applyEnvelope(self: *ExtensionHostGeneration, envelope: *const DecodedEnvelop
             return;
         }
         self.startup_load_id = null;
+        self.prompt_command_len = envelope.command_len;
+        @memcpy(self.prompt_commands[0..envelope.command_len], envelope.commands[0..envelope.command_len]);
         const initialized = encodeNotification(self.allocator, "host/initialized", "{}") catch {
             self.failGeneration(.generation_failed, now_ns);
             return;
@@ -811,11 +912,17 @@ fn applyEnvelope(self: *ExtensionHostGeneration, envelope: *const DecodedEnvelop
         return;
     }
     if (envelope.rpc_error) {
-        pending.state = .{ .failure = .generation_failed };
+        pending.state = .{ .failure = .extension_error };
         return;
     }
     pending.state = switch (pending.kind) {
         .ping => if (envelope.result == .pong) .success else .{ .failure = .protocol },
+        .prompt_command => success: {
+            if (envelope.result != .prompt or envelope.prompt == null) break :success .{ .failure = .protocol };
+            pending.prompt = envelope.prompt;
+            envelope.prompt = null;
+            break :success .success;
+        },
         .test_nested => if (envelope.result == .nested) .success else .{ .failure = .protocol },
         .test_spin => .{ .failure = .protocol },
     };
@@ -1113,6 +1220,11 @@ const WireEnvelope = struct {
     @"error": ?WireError = null,
 };
 
+const WirePromptCommand = struct {
+    name: []const u8,
+    description: []const u8,
+};
+
 const WireResult = struct {
     pong: ?bool = null,
     stopped: ?bool = null,
@@ -1124,6 +1236,8 @@ const WireResult = struct {
     hostVersion: ?[]const u8 = null,
     hostSha: ?[]const u8 = null,
     generationNonce: ?[]const u8 = null,
+    promptCommands: ?[]const WirePromptCommand = null,
+    prompt: ?[]const u8 = null,
 };
 
 const WireError = struct {
@@ -1160,7 +1274,7 @@ fn decodeEnvelope(allocator: std.mem.Allocator, body: []u8) !DecodedEnvelope {
         if (wire.result != null and wire.@"error" != null) return error.InvalidJson;
     }
     result.rpc_error = wire.@"error" != null;
-    if (wire.result) |result_value| result.result = try decodeResult(result_value);
+    if (wire.result) |result_value| try decodeResult(allocator, result_value, &result);
     return result;
 }
 
@@ -1177,17 +1291,79 @@ fn validateJson(allocator: std.mem.Allocator, body: []const u8) !void {
     }
 }
 
-fn decodeResult(value: WireResult) !DecodedEnvelope.Result {
-    if (value.pong orelse false) return .pong;
-    if (value.stopped orelse false) return .stopped;
-    if (value.initialized orelse false) return .loaded;
-    if (value.nested != null) return .nested;
-    const protocol = value.protocol orelse return .other;
-    const node_version = value.nodeVersion orelse return .other;
-    const host_sha = value.hostSha orelse return .other;
-    const runtime_name = value.runtimeName orelse return .other;
-    const host_version = value.hostVersion orelse return .other;
-    const generation_nonce = value.generationNonce orelse return .other;
+fn decodeResult(
+    allocator: std.mem.Allocator,
+    value: WireResult,
+    envelope: *DecodedEnvelope,
+) !void {
+    if (value.pong orelse false) {
+        envelope.result = .pong;
+        return;
+    }
+    if (value.stopped orelse false) {
+        envelope.result = .stopped;
+        return;
+    }
+    if (value.initialized orelse false) {
+        const commands = value.promptCommands orelse return error.InvalidJson;
+        if (commands.len > prompt_commands_max) return error.InvalidJson;
+        for (commands, 0..) |command, index| {
+            if (!validPromptCommandName(command.name) or
+                command.description.len == 0 or
+                command.description.len > prompt_command_description_bytes_max or
+                !std.unicode.utf8ValidateSlice(command.description) or
+                slash_commands.lookup(command.name) != null)
+            {
+                return error.InvalidJson;
+            }
+            for (envelope.commands[0..index]) |previous| {
+                if (std.mem.eql(u8, previous.name(), command.name)) return error.InvalidJson;
+            }
+            envelope.commands[index].name_len = @intCast(command.name.len);
+            @memcpy(envelope.commands[index].name_buffer[0..command.name.len], command.name);
+            envelope.commands[index].description_len = @intCast(command.description.len);
+            @memcpy(envelope.commands[index].description_buffer[0..command.description.len], command.description);
+        }
+        envelope.command_len = @intCast(commands.len);
+        envelope.result = .loaded;
+        return;
+    }
+    if (value.prompt) |prompt| {
+        if (prompt.len == 0 or prompt.len > generated_prompt_bytes_max or !std.unicode.utf8ValidateSlice(prompt)) {
+            return error.InvalidJson;
+        }
+        envelope.prompt = try allocator.dupe(u8, prompt);
+        envelope.result = .prompt;
+        return;
+    }
+    if (value.nested != null) {
+        envelope.result = .nested;
+        return;
+    }
+    const protocol = value.protocol orelse {
+        envelope.result = .other;
+        return;
+    };
+    const node_version = value.nodeVersion orelse {
+        envelope.result = .other;
+        return;
+    };
+    const host_sha = value.hostSha orelse {
+        envelope.result = .other;
+        return;
+    };
+    const runtime_name = value.runtimeName orelse {
+        envelope.result = .other;
+        return;
+    };
+    const host_version = value.hostVersion orelse {
+        envelope.result = .other;
+        return;
+    };
+    const generation_nonce = value.generationNonce orelse {
+        envelope.result = .other;
+        return;
+    };
     if (node_version.len > 32 or host_sha.len != asset.digest.len * 2 or generation_nonce.len != 32) {
         return error.InvalidJson;
     }
@@ -1204,7 +1380,7 @@ fn decodeResult(value: WireResult) !DecodedEnvelope.Result {
     @memcpy(initialize.node_version[0..node_version.len], node_version);
     @memcpy(&initialize.host_sha, host_sha);
     @memcpy(&initialize.generation_nonce, generation_nonce);
-    return .{ .initialize = initialize };
+    envelope.result = .{ .initialize = initialize };
 }
 
 fn parseWireId(id: []const u8) !struct { origin: IdOrigin, value: u64 } {
@@ -1338,6 +1514,31 @@ fn minDeadline(current: ?u64, candidate: ?u64) ?u64 {
     return if (current) |existing| @min(existing, value) else value;
 }
 
+fn resolveNodeExecutable(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    environ: ?*const std.process.Environ.Map,
+    executable: []const u8,
+) ![]u8 {
+    if (std.fs.path.isAbsolute(executable) or std.mem.findScalar(u8, executable, std.fs.path.sep) != null) {
+        return allocator.dupe(u8, executable);
+    }
+    const path_value = if (environ) |env| env.get("PATH") else null;
+    if (path_value) |path| {
+        var entries = std.mem.splitScalar(u8, path, std.fs.path.delimiter);
+        while (entries.next()) |entry| {
+            if (entry.len == 0) continue;
+            const candidate = try std.fs.path.join(allocator, &.{ entry, executable });
+            std.Io.Dir.accessAbsolute(io, candidate, .{ .execute = true }) catch {
+                allocator.free(candidate);
+                continue;
+            };
+            return candidate;
+        }
+    }
+    return allocator.dupe(u8, executable);
+}
+
 fn currentNowNs(io: std.Io) u64 {
     const raw = std.Io.Timestamp.now(io, .awake).toNanoseconds();
     if (raw <= 0) return 0;
@@ -1348,6 +1549,14 @@ fn parseVersionPart(text: []const u8) !u32 {
     if (text.len == 0) return error.InvalidNodeVersion;
     for (text) |char| if (!std.ascii.isDigit(char)) return error.InvalidNodeVersion;
     return std.fmt.parseInt(u32, text, 10) catch error.InvalidNodeVersion;
+}
+
+fn validPromptCommandName(name: []const u8) bool {
+    if (name.len == 0 or name.len > prompt_command_name_bytes_max or !std.ascii.isLower(name[0])) return false;
+    for (name[1..]) |char| {
+        if (!std.ascii.isLower(char) and !std.ascii.isDigit(char) and char != '-') return false;
+    }
+    return true;
 }
 
 fn validateCanonicalPath(path: []const u8) !void {
@@ -1379,7 +1588,18 @@ fn testHostFixture() !struct {
     defer std.testing.allocator.free(agent_dir);
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "extension.ts",
-        .data = "export const fixture = 'loaded';\n",
+        .data =
+        \\export default function activate(zi) {
+        \\  zi.commands.registerPrompt({
+        \\    name: "fixture-review",
+        \\    description: "Review a fixture",
+        \\    run: ({ args }) => {
+        \\      if (args === "fail") throw new Error("fixture failure");
+        \\      return { prompt: `Review ${args}` };
+        \\    },
+        \\  });
+        \\}
+        ,
     });
     const extension_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "extension.ts" });
     defer std.testing.allocator.free(extension_path);
@@ -1505,6 +1725,30 @@ test "real ExtensionHostGeneration handshakes pings wakes and shuts down" {
     }
     try std.testing.expect(host.available());
     try std.testing.expect(wake.isSet());
+    try std.testing.expectEqual(@as(usize, 1), host.promptCommands().len);
+    try std.testing.expectEqualStrings("fixture-review", host.promptCommands()[0].name());
+    try std.testing.expectEqualStrings("Review a fixture", host.promptCommands()[0].description());
+
+    var command = try host.startPromptCommand("fixture-review", "concurrency", now + std.time.ns_per_s);
+    while (host.pollPromptCommand(&command) == .pending) : (now += std.time.ns_per_ms) {
+        host.poll(now);
+        fixture.task_runtime.sleep(.fromMilliseconds(1)) catch return error.Canceled;
+    }
+    try std.testing.expect(host.pollPromptCommand(&command) == .success);
+    const generated_prompt = try host.takePromptCommand(&command);
+    defer std.testing.allocator.free(generated_prompt);
+    try std.testing.expectEqualStrings("Review concurrency", generated_prompt);
+    host.deinitPromptCommand(&command);
+
+    var failed_command = try host.startPromptCommand("fixture-review", "fail", now + std.time.ns_per_s);
+    while (host.pollPromptCommand(&failed_command) == .pending) : (now += std.time.ns_per_ms) {
+        host.poll(now);
+        fixture.task_runtime.sleep(.fromMilliseconds(1)) catch return error.Canceled;
+    }
+    const extension_error: PromptCommandPoll = .{ .failure = .extension_error };
+    try std.testing.expectEqual(extension_error, host.pollPromptCommand(&failed_command));
+    host.deinitPromptCommand(&failed_command);
+    try std.testing.expect(host.available());
 
     var ping = try host.startPing(now + std.time.ns_per_s);
     while (host.pollPing(&ping) == .pending) : (now += std.time.ns_per_ms) {

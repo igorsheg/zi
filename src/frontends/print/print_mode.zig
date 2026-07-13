@@ -12,6 +12,8 @@ pub const Options = struct {
     output: OutputMode = .text,
 };
 
+const extension_prompt_command_deadline_ns: u64 = 30 * std.time.ns_per_s;
+
 const OutputSink = struct {
     writer: *std.Io.Writer,
     mode: OutputMode,
@@ -165,6 +167,9 @@ pub fn run(
     var wake: runtime.WakeEvent = .init;
     services.setExtensionWake(&wake);
     defer drainExtensions(io, services, &wake);
+    const extension_prompt = try resolveExtensionPrompt(io, services, &wake, opts.prompt);
+    defer if (extension_prompt) |prompt| services.freeExtensionPrompt(prompt);
+    const prompt = if (extension_prompt) |generated| generated else opts.prompt;
     if (opts.output == .json) {
         try std.json.Stringify.value(session.sessionHeader(), .{}, stdout);
         try stdout.writeByte('\n');
@@ -176,7 +181,7 @@ pub fn run(
     defer session.unsubscribe(listener);
 
     var driver: Driver = .{
-        .prompt = opts.prompt,
+        .prompt = prompt,
         .overflow_count_before = session.contextOverflowCount(),
     };
     errdefer session.emitAgentSettled() catch {};
@@ -188,6 +193,35 @@ pub fn run(
         try stderr.flush();
     }
     return if (success or opts.output == .json) 0 else 1;
+}
+
+fn resolveExtensionPrompt(
+    io: std.Io,
+    services: *coding_agent.runtime_services.RuntimeServices,
+    wake: *runtime.WakeEvent,
+    input: []const u8,
+) !?[]u8 {
+    const invocation = coding_agent.slash_commands.parseInvocation(input) orelse return null;
+    if (services.findExtensionPromptCommand(invocation.name) == null) return null;
+    var handle = try services.startExtensionPromptCommand(
+        invocation.name,
+        invocation.args,
+        nowNs(io) +| extension_prompt_command_deadline_ns,
+    );
+    defer services.deinitExtensionPromptCommand(&handle);
+    while (true) {
+        services.pollExtensionHost(nowNs(io));
+        switch (services.pollExtensionPromptCommand(&handle)) {
+            .pending => waitForFrontendWake(io, services, wake),
+            .success => return try services.takeExtensionPromptCommand(&handle),
+            .failure => |failure| return switch (failure) {
+                .canceled => error.ExtensionCommandCanceled,
+                .deadline => error.ExtensionCommandDeadline,
+                .extension_error => error.ExtensionCommandFailed,
+                else => error.ExtensionHostFailed,
+            },
+        }
+    }
 }
 
 fn waitForFrontendWake(
@@ -418,7 +452,15 @@ test "print frontend starts and drains an explicit extension host" {
     const root_path = root_buffer[0..root_len];
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "extension.ts",
-        .data = "export const fixture = 'loaded';\n",
+        .data =
+        \\export default function activate(zi) {
+        \\  zi.commands.registerPrompt({
+        \\    name: "fixture-review",
+        \\    description: "Review a fixture",
+        \\    run: ({ args }) => ({ prompt: `Review ${args}` }),
+        \\  });
+        \\}
+        ,
     });
     const extension_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "extension.ts" });
     defer std.testing.allocator.free(extension_path);
@@ -476,10 +518,15 @@ test "print frontend starts and drains an explicit extension host" {
         &session,
         &output.writer,
         &err_output.writer,
-        .{ .prompt = "hi" },
+        .{ .prompt = "/fixture-review concurrency" },
     );
     try std.testing.expectEqual(@as(u8, 0), status);
     try std.testing.expect(services.extensionShutdownComplete());
+    try std.testing.expect(session.agent.state.messages.len > 0);
+    try std.testing.expectEqualStrings(
+        "Review concurrency",
+        session.agent.state.messages[0].user.content.string,
+    );
 }
 
 test "print mode writes json events" {
