@@ -1,4 +1,5 @@
 const std = @import("std");
+const build_options = @import("build_options");
 const vaxis = @import("vaxis");
 const ai = @import("../ai/root.zig");
 const agent_mod = @import("../agent/root.zig");
@@ -1578,6 +1579,11 @@ pub const Loop = struct {
             deadline = if (deadline) |current| @min(current, batch_deadline) else batch_deadline;
         }
         if (self.run_state.retry) |retry| deadline = if (deadline) |current| @min(current, retry.deadline_ns) else retry.deadline_ns;
+        if (self.services) |services| {
+            if (services.extensionHostDeadline()) |extension_deadline| {
+                deadline = if (deadline) |current| @min(current, extension_deadline) else extension_deadline;
+            }
+        }
         if (self.statusAnimated() or self.transcript.hasPendingRelayout()) {
             const animation_due = render_policy.nextRenderDueNsWithFloor(self.last_frame_start_ns, frame_floor_ns);
             deadline = if (deadline) |current| @min(current, animation_due) else animation_due;
@@ -1649,6 +1655,7 @@ pub const Loop = struct {
         self.dirty = false;
     }
     pub fn tick(self: *Loop, now_ns: u64) !void {
+        if (self.services) |services| services.pollExtensionHost(now_ns);
         try self.pollForegroundOperation(now_ns);
         const file_index_changed = try self.pollFileIndexTask();
         const scoped_query_ready = if (self.composer.scoped_file_query_task) |*task| task.hasResult() else false;
@@ -1689,6 +1696,7 @@ pub const Loop = struct {
             self.requestRunShutdown(session);
             session.requestShutdown();
         }
+        if (self.services) |services| services.requestExtensionShutdown(nowNs(self.io));
         switch (self.foreground_operation) {
             .idle, .restoring => {},
             .listing => |*listing| {
@@ -1722,11 +1730,16 @@ pub const Loop = struct {
         self.pollFileIndexShutdown();
         self.pollScopedFileQueryShutdown();
         session.requestShutdown();
+        const extensions_complete = if (self.services) |services| complete: {
+            services.pollExtensionHost(nowNs(self.io));
+            break :complete services.extensionShutdownComplete();
+        } else true;
         return self.runShutdownComplete() and
             self.foreground_operation == .idle and
             self.composer.file_index_task == null and
             self.composer.scoped_file_query_task == null and
-            session.shutdownComplete();
+            session.shutdownComplete() and
+            extensions_complete;
     }
 
     fn pollForegroundOperationShutdown(self: *Loop) void {
@@ -4328,6 +4341,108 @@ fn expectFrameOrder(frame: *const screen.Frame, first: []const u8, second: []con
     const second_row = frameRowContaining(frame, second);
     try std.testing.expect(second_row != null);
     try std.testing.expect(second_row.? > first_row.?);
+}
+
+test "extension host infinite loop does not block owner input or composition" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPathFile(std.testing.io, ".", &root_buffer);
+    const root_path = root_buffer[0..root_len];
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "extension.ts",
+        .data = "export const fixture = 'loaded';\n",
+    });
+    const extension_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "extension.ts" });
+    defer std.testing.allocator.free(extension_path);
+    const agent_dir = try std.fs.path.join(std.testing.allocator, &.{ root_path, "agent" });
+    defer std.testing.allocator.free(agent_dir);
+
+    var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
+    var environ = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ.deinit();
+    try environ.put("ZI_EXTENSION_HOST_TEST", "1");
+    var plan = try coding_agent.ExtensionHost.ExtensionLoadPlan.init(std.testing.allocator, &.{.{
+        .canonical_path = extension_path,
+        .provenance = .explicit,
+    }});
+    defer plan.deinit();
+    var services = try coding_agent.runtime_services.RuntimeServices.init(std.testing.allocator, .{
+        .task_runtime = task_runtime,
+        .cwd = root_path,
+        .agent_dir = agent_dir,
+        .environ = &environ,
+        .extension_load_plan = &plan,
+        .node_executable = build_options.node_executable,
+    });
+    defer services.deinit();
+    try std.testing.expectEqual(
+        coding_agent.runtime_services.RuntimeServices.ExtensionAvailability.active,
+        services.extensionAvailability(),
+    );
+    const stamp = coding_agent.session_manager.SessionStamp.now(services.io);
+    var session = try coding_agent.session_bootstrap.openSession(
+        std.testing.allocator,
+        &services,
+        stamp.date(),
+        .{ .create = .{
+            .session_id = "extension-loop-test",
+            .timestamp = stamp.timestamp(),
+            .persist = false,
+        } },
+        .{},
+    );
+    defer {
+        session.requestShutdown();
+        session.deinit();
+    }
+    var wake: runtime.WakeEvent = .init;
+    services.setExtensionWake(&wake);
+    var loop: Loop = undefined;
+    try loop.init(std.testing.allocator, .{
+        .session = &session,
+        .services = &services,
+        .wake = &wake,
+        .initial_prompt = null,
+        .persist_new_sessions = false,
+        .resume_picker = false,
+    });
+    defer loop.deinit();
+
+    var now: u64 = 0;
+    const host = services.extensionHost().?;
+    var operation = try host.startTestSpin(now + 20 * std.time.ns_per_ms);
+    defer if (!operation.released) {
+        if (host.pollPing(&operation) != .pending) host.deinitPing(&operation);
+    };
+    var iterations: usize = 0;
+    while (host.pollPing(&operation) == .pending) : (now += std.time.ns_per_ms) {
+        try loop.dispatch(.{ .insert = "x" });
+        try loop.tick(now);
+        const frame = try loop.composeFrameAt(80, 24, now);
+        try expectFrameContains(&frame, "x");
+        iterations += 1;
+        task_runtime.sleep(.fromMilliseconds(1)) catch return error.Canceled;
+    }
+    try std.testing.expect(iterations > 1);
+    try std.testing.expectEqual(iterations, loop.composer.editor.text().len);
+    for (loop.composer.editor.text()) |char| try std.testing.expectEqual(@as(u8, 'x'), char);
+    const result = host.pollPing(&operation);
+    switch (result) {
+        .failure => |failure| try std.testing.expectEqual(coding_agent.ExtensionHost.Failure.deadline, failure),
+        else => return error.UnexpectedExtensionResult,
+    }
+    host.deinitPing(&operation);
+
+    loop.requestShutdown();
+    var shutdown_attempts: usize = 0;
+    while (!loop.pollShutdown() and shutdown_attempts < 10_000) : (shutdown_attempts += 1) {
+        task_runtime.sleep(.fromMilliseconds(1)) catch return error.Canceled;
+    }
+    try std.testing.expect(loop.pollShutdown());
+    try std.testing.expect(services.extensionShutdownComplete());
+    services.clearExtensionWake();
 }
 
 test "loop vertical editor actions traverse visual rows before history" {

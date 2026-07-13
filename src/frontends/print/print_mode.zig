@@ -1,4 +1,5 @@
 const std = @import("std");
+const build_options = @import("build_options");
 
 const ai = @import("../../ai/root.zig");
 const coding_agent = @import("../../coding_agent/root.zig");
@@ -64,21 +65,22 @@ const Driver = struct {
 
     fn run(
         self: *Driver,
-        session: *coding_agent.AgentSession,
         io: std.Io,
+        services: *coding_agent.runtime_services.RuntimeServices,
+        session: *coding_agent.AgentSession,
         wake: *runtime.WakeEvent,
     ) !bool {
         var handle = try session.startPromptHandle(self.prompt, &.{});
         handle.setWake(io, wake);
         while (true) {
-            const verdict = try self.driveHandle(session, io, wake, &handle);
+            const verdict = try self.driveHandle(io, services, session, wake, &handle);
             switch (verdict) {
                 .completed => {
-                    try self.runThresholdCompaction(session, io, wake);
+                    try self.runThresholdCompaction(io, services, session, wake);
                     return true;
                 },
                 .failed => return false,
-                .retry => |retry| handle = try self.startRetry(session, io, wake, retry),
+                .retry => |retry| handle = try self.startRetry(io, session, wake, retry),
                 .compact => |compaction_run| {
                     handle = coding_agent.AgentSession.RunHandle.compaction(compaction_run);
                     handle.setWake(io, wake);
@@ -89,8 +91,9 @@ const Driver = struct {
 
     fn runThresholdCompaction(
         self: *Driver,
-        session: *coding_agent.AgentSession,
         io: std.Io,
+        services: *coding_agent.runtime_services.RuntimeServices,
+        session: *coding_agent.AgentSession,
         wake: *runtime.WakeEvent,
     ) !void {
         if (!session.shouldRunThresholdCompaction()) return;
@@ -100,14 +103,15 @@ const Driver = struct {
         var maybe = try session.startCompactionHandle(.threshold, false, null);
         if (maybe) |*handle| {
             handle.setWake(io, wake);
-            _ = try self.driveHandle(session, io, wake, handle);
+            _ = try self.driveHandle(io, services, session, wake, handle);
         }
     }
 
     fn driveHandle(
         self: *Driver,
-        session: *coding_agent.AgentSession,
         io: std.Io,
+        services: *coding_agent.runtime_services.RuntimeServices,
+        session: *coding_agent.AgentSession,
         wake: *runtime.WakeEvent,
         handle: *coding_agent.AgentSession.RunHandle,
     ) !coding_agent.AgentSession.SettleVerdict {
@@ -117,12 +121,10 @@ const Driver = struct {
             handle.deinitAfterSettled(session);
         };
         while (true) {
+            services.pollExtensionHost(nowNs(io));
             switch (try handle.poll(session)) {
                 .live => {},
-                .empty => {
-                    try wake.wait(io);
-                    wake.reset();
-                },
+                .empty => waitForFrontendWake(io, services, wake),
                 .settled => break,
             }
         }
@@ -137,8 +139,8 @@ const Driver = struct {
 
     fn startRetry(
         self: *Driver,
-        session: *coding_agent.AgentSession,
         io: std.Io,
+        session: *coding_agent.AgentSession,
         wake: *runtime.WakeEvent,
         retry: coding_agent.AgentSession.SettleVerdict.Retry,
     ) !coding_agent.AgentSession.RunHandle {
@@ -152,14 +154,17 @@ const Driver = struct {
 
 pub fn run(
     gpa: std.mem.Allocator,
-    _: *coding_agent.runtime_services.RuntimeServices,
-    session: *coding_agent.AgentSession,
     io: std.Io,
+    services: *coding_agent.runtime_services.RuntimeServices,
+    session: *coding_agent.AgentSession,
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
     opts: Options,
 ) !u8 {
     _ = gpa;
+    var wake: runtime.WakeEvent = .init;
+    services.setExtensionWake(&wake);
+    defer drainExtensions(io, services, &wake);
     if (opts.output == .json) {
         try std.json.Stringify.value(session.sessionHeader(), .{}, stdout);
         try stdout.writeByte('\n');
@@ -170,13 +175,12 @@ pub fn run(
     const listener = try session.subscribe(.{ .context = &sink, .call_fn = OutputSink.listener });
     defer session.unsubscribe(listener);
 
-    var wake: runtime.WakeEvent = .init;
     var driver: Driver = .{
         .prompt = opts.prompt,
         .overflow_count_before = session.contextOverflowCount(),
     };
     errdefer session.emitAgentSettled() catch {};
-    const success = try driver.run(session, io, &wake);
+    const success = try driver.run(io, services, session, &wake);
     try session.emitAgentSettled();
     try stdout.flush();
     if (!success and opts.output == .text) {
@@ -184,6 +188,50 @@ pub fn run(
         try stderr.flush();
     }
     return if (success or opts.output == .json) 0 else 1;
+}
+
+fn waitForFrontendWake(
+    io: std.Io,
+    services: *coding_agent.runtime_services.RuntimeServices,
+    wake: *runtime.WakeEvent,
+) void {
+    const now = nowNs(io);
+    if (services.extensionHostDeadline()) |deadline| {
+        wake.waitTimeout(io, .{ .duration = .{
+            .raw = .fromNanoseconds(@intCast(deadline -| now)),
+            .clock = .awake,
+        } }) catch |err| {
+            const ignored_wait_error = @errorName(err);
+            _ = ignored_wait_error;
+        };
+    } else {
+        wake.wait(io) catch |err| {
+            const ignored_wait_error = @errorName(err);
+            _ = ignored_wait_error;
+        };
+    }
+    wake.reset();
+}
+
+fn drainExtensions(
+    io: std.Io,
+    services: *coding_agent.runtime_services.RuntimeServices,
+    wake: *runtime.WakeEvent,
+) void {
+    var now = nowNs(io);
+    services.requestExtensionShutdown(now);
+    while (!services.extensionShutdownComplete()) {
+        services.pollExtensionHost(now);
+        if (services.extensionShutdownComplete()) break;
+        waitForFrontendWake(io, services, wake);
+        now = nowNs(io);
+    }
+    services.clearExtensionWake();
+}
+
+fn nowNs(io: std.Io) u64 {
+    const raw = std.Io.Timestamp.now(io, .awake).toNanoseconds();
+    return if (raw <= 0) 0 else @intCast(raw);
 }
 
 fn textContent(value: []const u8) ai.AssistantContent {
@@ -233,9 +281,9 @@ test "print mode streams text deltas" {
     defer err_output.deinit();
     const status = try run(
         std.testing.allocator,
+        services.io,
         &services,
         &session,
-        services.io,
         &output.writer,
         &err_output.writer,
         .{ .prompt = "hi" },
@@ -294,9 +342,9 @@ test "print mode json assistant failure remains a successful process stream" {
     defer err_output.deinit();
     const status = try run(
         std.testing.allocator,
+        services.io,
         &services,
         &session,
-        services.io,
         &output.writer,
         &err_output.writer,
         .{ .prompt = "hi", .output = .json },
@@ -349,9 +397,9 @@ test "print mode writer failure drains the active run" {
     var failed = false;
     _ = run(
         std.testing.allocator,
+        services.io,
         &services,
         &session,
-        services.io,
         &output,
         &err_output.writer,
         .{ .prompt = "hi", .output = .json },
@@ -360,6 +408,78 @@ test "print mode writer failure drains the active run" {
     };
     try std.testing.expect(failed);
     try std.testing.expect(session.agent.waitForIdle());
+}
+
+test "print frontend starts and drains an explicit extension host" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPathFile(std.testing.io, ".", &root_buffer);
+    const root_path = root_buffer[0..root_len];
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "extension.ts",
+        .data = "export const fixture = 'loaded';\n",
+    });
+    const extension_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "extension.ts" });
+    defer std.testing.allocator.free(extension_path);
+    const agent_dir = try std.fs.path.join(std.testing.allocator, &.{ root_path, "agent" });
+    defer std.testing.allocator.free(agent_dir);
+
+    var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
+    var environ = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ.deinit();
+    try environ.put("ZI_ENABLE_FAUX_PROVIDER", "1");
+    var plan = try coding_agent.ExtensionHost.ExtensionLoadPlan.init(std.testing.allocator, &.{.{
+        .canonical_path = extension_path,
+        .provenance = .explicit,
+    }});
+    defer plan.deinit();
+    var services = try coding_agent.runtime_services.RuntimeServices.init(std.testing.allocator, .{
+        .cwd = root_path,
+        .agent_dir = agent_dir,
+        .environ = &environ,
+        .task_runtime = task_runtime,
+        .extension_load_plan = &plan,
+        .node_executable = build_options.node_executable,
+    });
+    defer services.deinit();
+
+    const content = [_]ai.AssistantContent{textContent("extensions drained\n")};
+    const message = ai.faux.assistantMessage(&content, .{});
+    try services.faux_provider.?.setResponses(&.{message});
+    const stamp = coding_agent.session_manager.SessionStamp.now(services.io);
+    var session = try coding_agent.session_bootstrap.openSession(
+        std.testing.allocator,
+        &services,
+        stamp.date(),
+        .{ .create = .{
+            .session_id = "extension-print-test",
+            .timestamp = stamp.timestamp(),
+            .persist = false,
+        } },
+        .{},
+    );
+    defer {
+        session.requestShutdown();
+        session.deinit();
+    }
+
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var err_output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer err_output.deinit();
+    const status = try run(
+        std.testing.allocator,
+        services.io,
+        &services,
+        &session,
+        &output.writer,
+        &err_output.writer,
+        .{ .prompt = "hi" },
+    );
+    try std.testing.expectEqual(@as(u8, 0), status);
+    try std.testing.expect(services.extensionShutdownComplete());
 }
 
 test "print mode writes json events" {
@@ -405,9 +525,9 @@ test "print mode writes json events" {
     defer err_output.deinit();
     const status = try run(
         std.testing.allocator,
+        services.io,
         &services,
         &session,
-        services.io,
         &output.writer,
         &err_output.writer,
         .{ .prompt = "hi", .output = .json },

@@ -274,7 +274,7 @@ fn runPrompt(
     var session = try coding_agent.session_bootstrap.openSession(process.gpa, &services, stamp.date(), open, .{});
     defer shutdownPromptSession(&session, services.io);
 
-    const status = print_mode.run(process.gpa, &services, &session, services.io, stdout, stderr, .{
+    const status = print_mode.run(process.gpa, services.io, &services, &session, stdout, stderr, .{
         .prompt = prompt,
         .output = if (json_output) .json else .text,
     }) catch |err| switch (err) {

@@ -79,6 +79,8 @@ pub fn run(process: runtime.Process, options: Options) !void {
     try terminal.setup();
 
     var wake: runtime.WakeEvent = .init;
+    services.setExtensionWake(&wake);
+    defer if (!abandon_cleanup) services.clearExtensionWake();
     var owner_loop: Loop = undefined;
     try owner_loop.init(process.gpa, .{
         .session = &session,

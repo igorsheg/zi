@@ -76,6 +76,20 @@ One session's policy spine: prompt resources, system prompt, builtin tools,
 durable history, long-lived `agent.Agent`, lifecycle, retry, compaction,
 settings-facing mutations, and private session event state.
 
+**Extension host**
+The optional, supervised Node runtime that executes trusted TypeScript
+extensions and requests actions from Zi owners. It owns no agent, session,
+transcript, settings, or TUI state.
+
+**Extension load plan**
+The bounded, immutable set of trusted extension modules selected for one host
+startup or replacement. A project-local module may enter the plan only after the
+project trust decision.
+
+**Host generation**
+One initialized extension-host process and its generation-scoped operations.
+Replacement prepares a complete next generation before making it active.
+
 **agent.Agent**
 Product-agnostic turn loop. It owns provider streaming, runtime transcript
 context, tool execution, and steering/follow-up queues. It does not know TUI,
@@ -136,8 +150,8 @@ the agent dir.
 - `tui` owns the interactive terminal product and may sample concrete
   `AgentSession` facts directly.
 - `coding_agent` owns product policy shared by frontends: sessions, resources,
-  settings, tools, auth, persistence, file completion, slash-command catalog, and
-  bootstrap.
+  settings, tools, auth, persistence, extension-host supervision, file
+  completion, slash-command catalog, and bootstrap.
 - `agent` owns the generic provider/tool turn protocol.
 - `ai` owns provider APIs, model catalog, wire adapters, and stream shapes.
 - `runtime` owns mechanism only: tasks, wakes, event pipes, process I/O, and zio

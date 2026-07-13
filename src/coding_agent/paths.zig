@@ -15,6 +15,10 @@ pub const context_file_name = "AGENTS.md";
 pub const claude_context_file_name = "CLAUDE.md";
 pub const system_prompt_file_name = "SYSTEM.md";
 pub const append_system_prompt_file_name = "APPEND_SYSTEM.md";
+pub const cache_dir_name = "cache";
+pub const extension_host_cache_dir_name = "extension-host";
+pub const extension_host_bundle_file_name = "extension-host.mjs";
+pub const extension_host_lease_file_suffix = ".lock";
 
 /// Tool operand path policy owner. Tools pass user-supplied operands here and
 /// receive an owned absolute path after normalization, optional home expansion,
@@ -412,6 +416,55 @@ pub const PersistencePaths = struct {
         return std.fs.path.join(allocator, &.{ self.global_dir, settings_file_name });
     }
 
+    pub fn extensionHostCacheDir(self: PersistencePaths, allocator: std.mem.Allocator) ![]const u8 {
+        return std.fs.path.join(allocator, &.{ self.global_dir, cache_dir_name, extension_host_cache_dir_name });
+    }
+
+    pub fn extensionHostVersionDir(
+        self: PersistencePaths,
+        allocator: std.mem.Allocator,
+        digest_hex: []const u8,
+    ) ![]const u8 {
+        try validateExtensionHostDigest(digest_hex);
+        return std.fs.path.join(allocator, &.{
+            self.global_dir,
+            cache_dir_name,
+            extension_host_cache_dir_name,
+            digest_hex,
+        });
+    }
+
+    pub fn extensionHostBundlePath(
+        self: PersistencePaths,
+        allocator: std.mem.Allocator,
+        digest_hex: []const u8,
+    ) ![]const u8 {
+        try validateExtensionHostDigest(digest_hex);
+        return std.fs.path.join(allocator, &.{
+            self.global_dir,
+            cache_dir_name,
+            extension_host_cache_dir_name,
+            digest_hex,
+            extension_host_bundle_file_name,
+        });
+    }
+
+    pub fn extensionHostLeasePath(
+        self: PersistencePaths,
+        allocator: std.mem.Allocator,
+        digest_hex: []const u8,
+    ) ![]const u8 {
+        try validateExtensionHostDigest(digest_hex);
+        const leaf = try std.fmt.allocPrint(allocator, "{s}{s}", .{ digest_hex, extension_host_lease_file_suffix });
+        defer allocator.free(leaf);
+        return std.fs.path.join(allocator, &.{
+            self.global_dir,
+            cache_dir_name,
+            extension_host_cache_dir_name,
+            leaf,
+        });
+    }
+
     pub fn authPath(self: PersistencePaths, allocator: std.mem.Allocator) ![]const u8 {
         return std.fs.path.join(allocator, &.{ self.global_dir, auth_file_name });
     }
@@ -432,6 +485,11 @@ pub const PersistencePaths = struct {
         return std.fs.path.join(allocator, &.{ self.cwd, project_config_dir_name, skills_dir_name });
     }
 };
+
+fn validateExtensionHostDigest(digest_hex: []const u8) !void {
+    if (digest_hex.len != std.crypto.hash.sha2.Sha256.digest_length * 2) return error.InvalidExtensionHostDigest;
+    for (digest_hex) |char| if (!std.ascii.isHex(char)) return error.InvalidExtensionHostDigest;
+}
 
 /// One source of truth for the session file naming scheme:
 /// `<timestamp>_<session-id>.jsonl`. The store formats it; listing and
@@ -464,6 +522,31 @@ pub fn encodeCwd(allocator: std.mem.Allocator, cwd: []const u8) ![]const u8 {
     }
     try out.append("--");
     return out.toOwnedSlice();
+}
+
+test "extension host cache paths stay under the agent directory" {
+    const paths: PersistencePaths = .{ .global_dir = "/home/me/.zi/agent", .cwd = "/repo" };
+    const cache = try paths.extensionHostCacheDir(std.testing.allocator);
+    defer std.testing.allocator.free(cache);
+    const digest_hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const bundle = try paths.extensionHostBundlePath(std.testing.allocator, digest_hex);
+    defer std.testing.allocator.free(bundle);
+    const lease = try paths.extensionHostLeasePath(std.testing.allocator, digest_hex);
+    defer std.testing.allocator.free(lease);
+
+    try std.testing.expectEqualStrings("/home/me/.zi/agent/cache/extension-host", cache);
+    try std.testing.expectEqualStrings(
+        "/home/me/.zi/agent/cache/extension-host/" ++ digest_hex ++ "/extension-host.mjs",
+        bundle,
+    );
+    try std.testing.expectEqualStrings(
+        "/home/me/.zi/agent/cache/extension-host/" ++ digest_hex ++ ".lock",
+        lease,
+    );
+    try std.testing.expectError(
+        error.InvalidExtensionHostDigest,
+        paths.extensionHostBundlePath(std.testing.allocator, "../outside"),
+    );
 }
 
 test "global agent dir defaults under home zi agent" {
