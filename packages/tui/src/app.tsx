@@ -14,7 +14,7 @@ export function App(props: AppProps) {
   return (
     <box width={dimensions.width} height={dimensions.height} flexDirection="column" backgroundColor="#000000">
       {props.session ? (
-        <SessionProvider session={props.session}>
+        <SessionProvider key={props.session.sessionId} session={props.session}>
           <SessionScreen />
         </SessionProvider>
       ) : (

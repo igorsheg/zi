@@ -1,5 +1,5 @@
-import { Agent, type AgentTool } from "@earendil-works/pi-agent-core"
-import type { Api, Model } from "@earendil-works/pi-ai"
+import { Agent, type AgentTool, type ThinkingLevel } from "@earendil-works/pi-agent-core"
+import { clampThinkingLevel, type Api, type Model } from "@earendil-works/pi-ai"
 import { AgentSession } from "./agent-session.js"
 import type { ModelRegistry } from "./model-registry.js"
 import type { ResourceLoader } from "./resource-loader.js"
@@ -25,13 +25,15 @@ export async function createAgentSession(options: CreateAgentSessionOptions): Pr
   const { services, sessionManager, model } = options
   await services.resourceLoader.reload()
   const settings = services.settingsManager.get()
+  const thinkingLevel = clampThinkingLevel(model, settings.thinkingLevel) as ThinkingLevel
   const existing = sessionManager.entries().length > 0
+  services.settingsManager.update({ thinkingLevel })
 
   const agent = new Agent({
     initialState: {
       systemPrompt: buildSystemPrompt(services.cwd, services.resourceLoader.get()),
       model,
-      thinkingLevel: settings.thinkingLevel,
+      thinkingLevel,
       tools: [...options.tools],
       messages: sessionManager.messages(),
     },
@@ -45,7 +47,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions): Pr
 
   if (!existing) {
     sessionManager.appendModelChange(model.provider, model.id)
-    sessionManager.appendThinkingLevelChange(settings.thinkingLevel)
+    sessionManager.appendThinkingLevelChange(thinkingLevel)
   }
 
   return new AgentSession({ agent, sessionManager, settingsManager: services.settingsManager })

@@ -1,10 +1,11 @@
 import { useKeyboard } from "@opentui/react"
 import { MessageView } from "./message.js"
 import { Prompt } from "./prompt.js"
-import { useSession } from "./session-context.js"
+import { useSessionView } from "./session-context.js"
+import { ToolExecutionView } from "./tool-execution.js"
 
 export function SessionScreen() {
-  const session = useSession()
+  const { session, tools } = useSessionView()
   const state = session.state
   const messages = state.streamingMessage ? [...state.messages, state.streamingMessage] : state.messages
 
@@ -24,6 +25,9 @@ export function SessionScreen() {
       >
         {messages.map((message, index) => (
           <MessageView key={`${message.timestamp}-${index}`} message={message} />
+        ))}
+        {tools.map((tool) => (
+          <ToolExecutionView key={tool.id} tool={tool} />
         ))}
       </scrollbox>
       <Prompt />

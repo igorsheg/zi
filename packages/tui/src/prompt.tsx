@@ -1,19 +1,19 @@
 import type { TextareaRenderable } from "@opentui/core"
-import { useState } from "react"
+import { useRef, useState } from "react"
 import { useSession } from "./session-context.js"
 
 export function Prompt() {
   const session = useSession()
-  const [input, setInput] = useState<TextareaRenderable>()
+  const input = useRef<TextareaRenderable>(null)
   const [error, setError] = useState<string>()
 
   const submit = () => {
-    if (!input) return
-    const text = input.plainText.trim()
+    if (!input.current) return
+    const text = input.current.plainText.trim()
     if (!text) return
 
     setError(undefined)
-    input.setText("")
+    input.current.setText("")
     void session.prompt(text, session.isStreaming ? { streamingBehavior: "steer" } : {}).catch((cause) => {
       setError(cause instanceof Error ? cause.message : String(cause))
     })
@@ -40,7 +40,8 @@ export function Prompt() {
         bottomTitle={`${session.model.provider}/${session.model.id} · ${session.thinkingLevel}`}
       >
         <textarea
-          ref={(value) => setInput(value ?? undefined)}
+          id="prompt-input"
+          ref={input}
           focused
           minHeight={1}
           maxHeight={8}

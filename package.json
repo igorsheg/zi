@@ -17,8 +17,8 @@
     }
   },
   "scripts": {
-    "dev": "bun --cwd packages/cli dev",
-    "start": "bun --cwd packages/cli start",
+    "dev": "bun --hot packages/cli/src/main.ts",
+    "start": "bun packages/cli/src/main.ts",
     "typecheck": "bun run --filter '*' typecheck",
     "test": "bun run --filter '*' test",
     "check:boundaries": "bun scripts/check-boundaries.ts",

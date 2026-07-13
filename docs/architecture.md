@@ -136,13 +136,15 @@ The codebase optimizes for legibility and local reasoning:
 
 ## First vertical slice
 
-1. Explicitly register a small provider set with `pi-ai`.
-2. Resolve one configured model with useful no-model diagnostics.
-3. Implement `read`, `bash`, `edit`, and `write` with Pi-compatible behavior and bounds.
-4. Create or resume a `SessionManager` JSONL session.
-5. Build `AgentSession` through services.
-6. Stream user, assistant, thinking, tool-call, and tool-result state directly into React/OpenTUI components.
-7. Cancel and settle before terminal teardown.
-8. Verify with Pi faux-provider tests, OpenTUI character-frame tests, and one PTY lifecycle test.
+The first complete turn now:
 
-Only then expand parity one vertical capability at a time.
+1. registers built-in providers through `pi-ai`;
+2. resolves an authenticated model with explicit diagnostics;
+3. runs `read`, `bash`, `edit`, and `write` with bounded output and cancellation;
+4. creates or resumes an append-only JSONL session;
+5. builds `AgentSession` through services;
+6. streams assistant, thinking, and tool state directly into React/OpenTUI components;
+7. settles the session before terminal teardown;
+8. verifies the headless and OpenTUI prompt paths with Pi's faux provider.
+
+Parity continues one vertical capability at a time from this working path.

@@ -1,13 +1,29 @@
 import type { PromptResources } from "./resource-loader.js"
 
 export function buildSystemPrompt(cwd: string, resources: PromptResources): string {
-  if (resources.systemPrompt) return resources.systemPrompt
+  const prompt = resources.systemPrompt ?? `You are an expert coding assistant operating inside OpenZi.
 
-  const sections = [
-    "You are a coding agent. Use the available tools to complete the user's request.",
-    `Working directory: ${cwd}`,
-  ]
-  if (resources.contextFiles.length > 0) sections.push(resources.contextFiles.join("\n\n"))
+Available tools:
+- read: Read file contents
+- bash: Execute shell commands
+- edit: Make exact text replacements
+- write: Create or overwrite files
+
+Guidelines:
+- Use read to inspect files instead of shelling out to cat or sed
+- Use edit for precise changes and write for new files or complete rewrites
+- Be concise
+- Show file paths clearly`
+
+  const sections = [prompt]
   if (resources.appendSystemPrompt.length > 0) sections.push(resources.appendSystemPrompt.join("\n\n"))
+  if (resources.contextFiles.length > 0) {
+    sections.push(
+      `<project_context>\n${resources.contextFiles
+        .map((file) => `<project_instructions path="${file.path}">\n${file.content}\n</project_instructions>`)
+        .join("\n\n")}\n</project_context>`,
+    )
+  }
+  sections.push(`Current date: ${new Date().toISOString().slice(0, 10)}\nCurrent working directory: ${cwd}`)
   return sections.join("\n\n")
 }

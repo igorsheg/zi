@@ -8,8 +8,10 @@ export interface RunTuiOptions {
   session?: AgentSession
 }
 
+const shutdownTimeoutMs = 5_000
+
 export async function runTui(options: RunTuiOptions): Promise<void> {
-  const renderer = await createCliRenderer({ targetFps: 60, exitOnCtrlC: false, autoFocus: false })
+  const renderer = await createCliRenderer({ targetFps: 60, exitOnCtrlC: false, exitSignals: [], autoFocus: false })
   const root = createRoot(renderer)
   const signals: NodeJS.Signals[] = ["SIGHUP", "SIGINT", "SIGTERM"]
   let closing: Promise<void> | undefined
@@ -17,7 +19,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
   const close = () => {
     closing ??= (async () => {
       try {
-        await options.session?.abort()
+        if (options.session) await settle(options.session.abort(), shutdownTimeoutMs)
       } finally {
         options.session?.dispose()
         root.unmount()
@@ -40,8 +42,20 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
   renderer.keyInput.off("keypress", onKey)
   for (const signal of signals) process.off(signal, onSignal)
 
-  if (!closing && options.session) {
-    await options.session.abort()
+  if (closing) {
+    await closing.catch(() => {})
+  } else if (options.session) {
+    await settle(options.session.abort(), shutdownTimeoutMs)
     options.session.dispose()
   }
+}
+
+function settle(operation: Promise<void>, timeoutMs: number): Promise<void> {
+  let timeout: ReturnType<typeof setTimeout>
+  return Promise.race([
+    operation,
+    new Promise<void>((_, reject) => {
+      timeout = setTimeout(() => reject(new Error("Session shutdown timed out")), timeoutMs)
+    }),
+  ]).finally(() => clearTimeout(timeout))
 }

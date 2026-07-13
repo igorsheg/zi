@@ -43,9 +43,10 @@ export function MessageView({ message }: { message: AgentMessage }) {
     case "bashExecution":
       return (
         <box paddingLeft={1} flexShrink={0}>
-          <text fg={message.exitCode === 0 ? "#7D8590" : "#F85149"}>
-            {message.command}\n{message.output}
-          </text>
+          <text
+            fg={message.exitCode === 0 ? "#7D8590" : "#F85149"}
+            content={`${message.command}\n${message.output}`}
+          />
         </box>
       )
     case "custom":

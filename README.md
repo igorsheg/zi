@@ -28,4 +28,4 @@ bun run check
 bun run start
 ```
 
-The current executable renders the initial OpenTUI shell. Provider and tool wiring is the next vertical slice.
+The interactive path now resolves configured Pi providers, runs `read`/`bash`/`edit`/`write` through `AgentSession`, streams into OpenTUI React, and persists resumable JSONL sessions. Zi visual parity and the remaining Pi coding-agent capabilities are tracked in `docs/parity-roadmap.md`.

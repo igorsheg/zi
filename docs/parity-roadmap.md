@@ -4,16 +4,22 @@ The target is behavioral and coding-agent architecture parity, without source id
 
 ## P0 — one dependable turn
 
-- [ ] Explicit provider registration and environment/API-key auth
-- [ ] Model resolution and clear no-model diagnostics
-- [ ] System prompt with cwd and project instructions
-- [ ] `read`, `bash`, `edit`, and `write`
-- [ ] Streaming assistant text and thinking
-- [ ] Streaming tool lifecycle and bounded output
-- [ ] Cancellation and settled shutdown
-- [ ] Append-only JSONL session with restore
+- [x] Explicit provider registration and environment/API-key auth
+- [x] Model resolution and clear no-model diagnostics
+- [x] System prompt with cwd and project instructions
+- [x] `read`, `bash`, `edit`, and `write`
+- [x] Streaming assistant text and thinking
+- [x] Streaming tool lifecycle and bounded output
+- [x] Cancellation and settled shutdown
+- [x] Append-only JSONL session with restore
 - [ ] Zi-matched session screen and prompt appearance
-- [ ] Faux-provider integration and OpenTUI frame snapshots
+- [x] Faux-provider integration and OpenTUI frame snapshots
+
+### P0 evidence
+
+- `packages/coding-agent/test/complete-turn.test.ts` drives the real Pi agent loop through `write`, `read`, `edit`, and `bash`, then restores JSONL.
+- `packages/tui/test/complete-turn.test.tsx` submits through OpenTUI's `TextareaRenderable` and captures the resulting frame.
+- Tool semantics are ported from `pi/packages/coding-agent/src/core/tools/` at the commit pinned in `docs/reference-pins.md`.
 
 ## P1 — daily-driver session behavior
 

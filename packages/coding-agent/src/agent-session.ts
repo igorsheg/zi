@@ -61,7 +61,7 @@ export class AgentSession {
   }
 
   get isStreaming(): boolean {
-    return this.#run !== undefined
+    return this.#run !== undefined || this.agent.state.isStreaming
   }
 
   get sessionId(): string {
@@ -184,7 +184,7 @@ export class AgentSession {
 
   #assertIdle(action: string): void {
     this.#assertOpen()
-    if (this.#run) throw new Error(`Cannot ${action} while the agent is running`)
+    if (this.isStreaming) throw new Error(`Cannot ${action} while the agent is running`)
   }
 }
 

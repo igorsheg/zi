@@ -1,5 +1,5 @@
-import { appendFileSync, mkdirSync, writeFileSync } from "node:fs"
-import { join } from "node:path"
+import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
+import { dirname, join } from "node:path"
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core"
 
 export interface SessionHeader {
@@ -52,6 +52,21 @@ export class SessionManager {
     writeFileSync(this.#file, `${JSON.stringify(this.header)}\n`, { flag: "wx" })
   }
 
+  static open(file: string): SessionManager {
+    const lines = readFileSync(file, "utf8").split("\n").filter(Boolean)
+    const header = JSON.parse(lines.shift() ?? "null") as SessionHeader
+    if (header?.type !== "session" || header.version !== 1 || typeof header.id !== "string" || typeof header.cwd !== "string") {
+      throw new Error(`Invalid session header: ${file}`)
+    }
+
+    const manager = new SessionManager({ cwd: header.cwd, sessionDir: dirname(file), sessionId: header.id, persist: false })
+    manager.#file = file
+    manager.#entries.push(...lines.map((line) => parseEntry(line, file)))
+    manager.#leafId = manager.#entries.at(-1)?.id ?? null
+    Object.assign(manager.header, header)
+    return manager
+  }
+
   appendMessage(message: AgentMessage): string {
     return this.#append({ type: "message", message })
   }
@@ -92,4 +107,19 @@ export class SessionManager {
     if (this.#file) appendFileSync(this.#file, `${JSON.stringify(next)}\n`)
     return next.id
   }
+}
+
+function parseEntry(line: string, file: string): SessionEntry {
+  const entry = JSON.parse(line) as SessionEntry
+  const base =
+    entry &&
+    typeof entry.id === "string" &&
+    (entry.parentId === null || typeof entry.parentId === "string") &&
+    typeof entry.timestamp === "string"
+  const data =
+    (entry?.type === "message" && typeof entry.message?.role === "string") ||
+    (entry?.type === "model_change" && typeof entry.provider === "string" && typeof entry.modelId === "string") ||
+    (entry?.type === "thinking_level_change" && typeof entry.thinkingLevel === "string")
+  if (!base || !data) throw new Error(`Invalid session entry: ${file}`)
+  return entry
 }
