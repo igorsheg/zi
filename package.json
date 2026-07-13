@@ -1,0 +1,31 @@
+{
+  "name": "openzi-workspace",
+  "private": true,
+  "type": "module",
+  "packageManager": "bun@1.3.5",
+  "workspaces": {
+    "packages": ["packages/*"],
+    "catalog": {
+      "@earendil-works/pi-agent-core": "0.80.6",
+      "@earendil-works/pi-ai": "0.80.6",
+      "@opentui/core": "0.4.3",
+      "@opentui/react": "0.4.3",
+      "@types/bun": "1.3.14",
+      "@types/react": "19.2.17",
+      "react": "19.2.7",
+      "typescript": "5.9.3"
+    }
+  },
+  "scripts": {
+    "dev": "bun --cwd packages/cli dev",
+    "start": "bun --cwd packages/cli start",
+    "typecheck": "bun run --filter '*' typecheck",
+    "test": "bun run --filter '*' test",
+    "check:boundaries": "bun scripts/check-boundaries.ts",
+    "check": "bun run check:boundaries && bun run typecheck && bun run test"
+  },
+  "devDependencies": {
+    "@types/bun": "catalog:",
+    "typescript": "catalog:"
+  }
+}

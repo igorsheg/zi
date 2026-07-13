@@ -1,0 +1,148 @@
+# Architecture
+
+## Fixed references
+
+| Source | Role |
+| --- | --- |
+| `pi-ai` and `pi-agent-core` | Runtime dependencies |
+| `pi-coding-agent` | Coding-agent behavior and architecture reference |
+| OpenTUI React | Frontend architecture and terminal implementation |
+| OpenCode | Proven OpenTUI application patterns worth evaluating |
+| Zi | Visual and interaction acceptance reference |
+
+OpenZi recreates `pi-coding-agent`; it does not depend on it. Parity includes the recognizable upper-layer architecture—`AgentSession`, session/services construction, settings, model and resource owners, tools, extensions, and interactive/print/RPC modes—not only a checklist of visible features.
+
+Zi does not dictate state types or modules. A screenshot or key interaction may become an OpenZi acceptance fixture; a Zi implementation detail does not become an OpenZi abstraction by default.
+
+OpenCode demonstrates useful frontend patterns: route-level screens, scoped providers, direct domain rendering, deep prompt ownership, OpenTUI scroll containers, overlays, and scoped renderer cleanup. OpenZi uses those ideas with React and an in-process session rather than copying Solid or an unnecessary SDK/HTTP synchronization layer.
+
+## Workspaces
+
+```text
+packages/
+  coding-agent/   Pi coding-agent parity and product policy
+  tui/            OpenTUI React frontend
+  cli/            process entrypoint and mode composition
+```
+
+Dependency direction is one-way:
+
+```text
+cli -> tui -> coding-agent -> pi-agent-core + pi-ai
+  \-----------------------> coding-agent
+```
+
+- `coding-agent` never imports a frontend.
+- `tui` uses only `coding-agent`'s public API; Pi types needed by frontends are re-exported there.
+- `cli` composes concrete modes and owns process exit behavior.
+- There is no `shared`, `common`, `utils`, generic UI model, event bus, or internal RPC package.
+- A fourth package needs an independently meaningful lifecycle or public use case. Reuse alone is insufficient.
+
+## Coding-agent architecture
+
+The target shape follows Pi:
+
+```text
+createAgentSession(services, session options)
+  -> AgentSession
+      -> pi-agent-core Agent
+      -> SessionManager
+      -> SettingsManager
+      -> ModelRegistry
+      -> ResourceLoader
+      -> tool definitions
+      -> later: compaction, retry, extensions
+```
+
+### `AgentSession`
+
+`AgentSession` is the policy spine shared by all modes. It owns:
+
+- one Pi `Agent`;
+- persistence of completed messages;
+- model and thinking-level changes;
+- steering and follow-up queues;
+- active-run admission, cancellation, and settlement;
+- later, retry, compaction, branch, bash, and extension policy.
+
+It exposes Pi agent events plus session-level events. Frontends subscribe; they do not control the provider loop or persist messages themselves.
+
+### Managers and services
+
+- `SessionManager` owns one append-only JSONL session tree and its leaf.
+- `SettingsManager` owns resolved settings and eventually global/project layering.
+- `ModelRegistry` wraps `pi-ai` model discovery and authentication.
+- `ResourceLoader` owns context files, prompts, skills, and later extensions/themes.
+- `createAgentSession` wires these owners to a Pi `Agent`.
+
+These are concrete product owners, not generic dependency-injection interfaces. Introduce an interface only when there are two real implementations or a consumer-owned testing boundary.
+
+### Tools
+
+Tools belong in `coding-agent`. Each tool owns the resources of one invocation and must make cancellation, timeout, output limits, and cleanup visible. Initial parity order is `read`, `bash`, `edit`, `write`, then `grep`, `find`, and `ls`.
+
+## Frontend architecture
+
+The React tree starts from product concepts rather than a universal view model:
+
+```text
+App
+  -> route screen
+      -> SessionProvider
+          -> SessionScreen
+              -> OpenTUI scrollbox
+                  -> message/part/tool components
+              -> Prompt
+      -> overlays (later: dialog, toast, permission, question)
+```
+
+`SessionProvider` subscribes React to `AgentSession`. `SessionScreen` reads session messages directly and renders message parts. There is no duplicate transcript store, `TuiSnapshot`, or event-to-view-model corridor.
+
+`Prompt` is intentionally deep. It may own textarea state, autocomplete, history, attachments, shell mode, command dispatch, and picker anchoring because those behaviors share one editor and focus model. Splitting it into pass-through components would make it harder to reason about.
+
+When multiple sessions and partial hydration arrive, a normalized cache keyed by session/message/part may become justified. It should be introduced by that requirement, not in anticipation of it.
+
+OpenTUI owns terminal mode, rendering, focus, width, scrolling mechanics, selection, and input decoding. React owns component composition and scoped frontend state. `AgentSession` owns coding-agent policy.
+
+## Resource shutdown
+
+Shutdown order is explicit:
+
+1. stop accepting frontend actions;
+2. abort active session work;
+3. await session settlement;
+4. dispose session subscriptions/resources;
+5. unmount React and destroy OpenTUI;
+6. let the CLI print any epilogue and exit.
+
+Renderer destruction must restore the terminal on normal exit, signal, and error paths. A bounded shutdown deadline will be added with the first real agent run.
+
+## Code shape
+
+The codebase optimizes for legibility and local reasoning:
+
+- concrete modules before frameworks;
+- narrow public exports;
+- one owner for each mutable state family;
+- direct calls before commands, buses, adapters, or protocols;
+- exhaustive types instead of defensive impossible-state branches;
+- validation at external, persisted, provider, and process boundaries;
+- comments only for invariants, trade-offs, and upstream provenance;
+- no JSDoc that restates a name or type;
+- no speculative configuration or extension points;
+- no package or file split whose only justification is line count.
+
+“Scalable” means a future feature has an obvious owner and path through the system, not that every operation passes through an abstraction. More code is not more robust: avoid verbose AI-generated ceremony, redundant guards, narrated comments, and catch-and-rethrow layers that add no decision.
+
+## First vertical slice
+
+1. Explicitly register a small provider set with `pi-ai`.
+2. Resolve one configured model with useful no-model diagnostics.
+3. Implement `read`, `bash`, `edit`, and `write` with Pi-compatible behavior and bounds.
+4. Create or resume a `SessionManager` JSONL session.
+5. Build `AgentSession` through services.
+6. Stream user, assistant, thinking, tool-call, and tool-result state directly into React/OpenTUI components.
+7. Cancel and settle before terminal teardown.
+8. Verify with Pi faux-provider tests, OpenTUI character-frame tests, and one PTY lifecycle test.
+
+Only then expand parity one vertical capability at a time.
