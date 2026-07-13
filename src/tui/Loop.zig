@@ -114,7 +114,6 @@ pub const Viewport = union(enum) {
 const prompt_image_count_max: usize = 4;
 const prompt_image_encoded_bytes_total_max: usize = 768 * 1024;
 const prompt_image_mime_bytes_max: usize = 64;
-const clipboard_temp_path_count_max: usize = prompt_image_count_max;
 
 const ClipboardImagePaste = struct {
     path: []u8,
@@ -125,6 +124,62 @@ const ClipboardImagePaste = struct {
         if (self.path.len > 0) allocator.free(self.path);
         allocator.free(self.mime_type);
         self.* = undefined;
+    }
+};
+
+const DraftImageAttachment = struct {
+    serial: u64,
+    path: []u8,
+    marker_id: Editor.MarkerId,
+
+    fn deinit(self: *DraftImageAttachment, allocator: std.mem.Allocator, io: std.Io) void {
+        deleteClipboardTempPath(io, self.path);
+        allocator.free(self.path);
+        self.* = undefined;
+    }
+};
+
+const DraftImageAttachments = struct {
+    items: [prompt_image_count_max]DraftImageAttachment = undefined,
+    len: usize = 0,
+
+    fn appendOwned(self: *DraftImageAttachments, attachment: DraftImageAttachment) !void {
+        if (self.len == self.items.len) return error.TooManyImages;
+        self.items[self.len] = attachment;
+        self.len += 1;
+    }
+
+    fn activeSerials(
+        self: *const DraftImageAttachments,
+        editor: *const Editor,
+        out: *[prompt_image_count_max]u64,
+    ) []const u64 {
+        const Positioned = struct { serial: u64, position: usize };
+        var positioned: [prompt_image_count_max]Positioned = undefined;
+        var count: usize = 0;
+        for (self.items[0..self.len]) |attachment| {
+            const position = editor.markerPosition(attachment.marker_id) orelse continue;
+            var insert_at = count;
+            while (insert_at > 0 and positioned[insert_at - 1].position > position) : (insert_at -= 1) {
+                positioned[insert_at] = positioned[insert_at - 1];
+            }
+            positioned[insert_at] = .{ .serial = attachment.serial, .position = position };
+            count += 1;
+        }
+        for (positioned[0..count], 0..) |entry, index| out[index] = entry.serial;
+        return out[0..count];
+    }
+
+    fn take(self: *DraftImageAttachments, serial: u64) ?DraftImageAttachment {
+        for (self.items[0..self.len], 0..) |attachment, index| {
+            if (attachment.serial != serial) continue;
+            const result = attachment;
+            const last = self.len - 1;
+            self.items[index] = self.items[last];
+            self.len -= 1;
+            return result;
+        }
+        return null;
     }
 };
 
@@ -555,8 +610,8 @@ const ForegroundOperation = union(enum) {
         apply_result: bool = true,
         timed_out: bool = false,
         prompt: SubmittedPrompt,
-        pinned_paths: [prompt_image_count_max]?[]u8 = @splat(null),
-        pinned_path_count: usize = 0,
+        recovery_prompt: SubmittedPrompt,
+        pinned_images: DraftImageAttachments = .{},
     };
 };
 
@@ -604,8 +659,7 @@ pub const Loop = struct {
     services: ?*coding_agent.runtime_services.RuntimeServices = null,
     foreground_operation: ForegroundOperation = .idle,
     clipboard_image_serial: u64 = 0,
-    clipboard_temp_paths: [clipboard_temp_path_count_max]?[]u8 = @splat(null),
-    clipboard_temp_path_count: usize = 0,
+    draft_images: DraftImageAttachments = .{},
     token_cache_entry_count: usize = 0,
     token_input_total: u64 = 0,
     token_output_total: u64 = 0,
@@ -1037,7 +1091,7 @@ pub const Loop = struct {
 
     pub fn deinit(self: *Loop) void {
         self.drainForegroundOperation();
-        self.clearClipboardTempFiles();
+        self.clearDraftImages();
         self.deinitRunState(self.gpa);
         if (self.composer.file_index_task) |*task| {
             if (!task.hasResult()) task.cancel();
@@ -1445,7 +1499,21 @@ pub const Loop = struct {
     }
 
     fn afterComposerTextMutation(self: *Loop) !void {
+        self.pruneDraftImages();
         try self.refreshCompletion(.auto);
+    }
+
+    fn pruneDraftImages(self: *Loop) void {
+        var index: usize = 0;
+        while (index < self.draft_images.len) {
+            const attachment = &self.draft_images.items[index];
+            if (self.composer.editor.containsMarkerInReplay(attachment.marker_id)) {
+                index += 1;
+                continue;
+            }
+            var removed = self.draft_images.take(attachment.serial).?;
+            removed.deinit(self.gpa, self.io);
+        }
     }
 
     pub fn composerText(self: *const Loop) []const u8 {
@@ -1804,13 +1872,12 @@ pub const Loop = struct {
                 if (!preparing.task.hasResult()) return;
                 var result = preparing.task.getResult() catch null;
                 if (result) |*images| images.deinit(self.gpa);
-                const pinned = preparing.pinned_paths;
-                const pinned_count = preparing.pinned_path_count;
+                var pinned_images = preparing.pinned_images;
                 const cancel = preparing.cancel;
                 cancel.deinit();
                 self.gpa.destroy(cancel);
                 self.foreground_operation = .idle;
-                self.returnPinnedPromptImagePaths(pinned, pinned_count);
+                self.returnPinnedPromptImages(&pinned_images);
             },
             .reading_clipboard => |*reading| {
                 if (!reading.task.hasResult()) return;
@@ -2279,7 +2346,7 @@ pub const Loop = struct {
             try self.notice(.warn, "clipboard image paste unavailable");
             return;
         };
-        if (self.clipboard_temp_path_count == self.clipboard_temp_paths.len) {
+        if (!self.ensureDraftImageCapacity()) {
             try self.notice(.warn, "too many pasted images");
             return;
         }
@@ -2326,7 +2393,6 @@ pub const Loop = struct {
                 errdefer result.deinit(self.gpa);
                 errdefer deleteClipboardTempPath(self.io, result.path);
                 try self.insertClipboardImageMarker(&result);
-                try self.retainClipboardTempPath(result.path);
                 result.path = &.{};
                 result.deinit(self.gpa);
                 self.dirty = true;
@@ -2335,36 +2401,38 @@ pub const Loop = struct {
         }
     }
 
-    fn insertClipboardImageMarker(self: *Loop, paste: *const ClipboardImagePaste) !void {
-        var marker_buffer: [64]u8 = undefined;
-        const marker = clipboardImageMarker(&marker_buffer, self.clipboard_image_serial, paste.mime_type, paste.byte_len);
-        const expansion = try std.fmt.allocPrint(self.gpa, "@{s}", .{paste.path});
-        defer self.gpa.free(expansion);
-        try self.composer.editor.insertMarker(marker, expansion);
-    }
-
-    fn retainClipboardTempPath(self: *Loop, path: []u8) !void {
-        if (self.clipboard_temp_path_count == self.clipboard_temp_paths.len) return error.EditorFull;
-        self.clipboard_temp_paths[self.clipboard_temp_path_count] = path;
-        self.clipboard_temp_path_count += 1;
-    }
-
-    fn clearClipboardTempFiles(self: *Loop) void {
-        for (self.clipboard_temp_paths[0..self.clipboard_temp_path_count]) |maybe_path| {
-            const path = maybe_path orelse continue;
-            deleteClipboardTempPath(self.io, path);
-            self.gpa.free(path);
-        }
-        @memset(&self.clipboard_temp_paths, null);
-        self.clipboard_temp_path_count = 0;
-    }
-
-    fn isTrackedClipboardTempPath(self: *const Loop, path: []const u8) bool {
-        for (self.clipboard_temp_paths[0..self.clipboard_temp_path_count]) |maybe_path| {
-            const tracked = maybe_path orelse continue;
-            if (std.mem.eql(u8, tracked, path)) return true;
+    fn ensureDraftImageCapacity(self: *Loop) bool {
+        if (self.draft_images.len < prompt_image_count_max) return true;
+        for (self.draft_images.items[0..self.draft_images.len]) |attachment| {
+            if (self.composer.editor.markerPosition(attachment.marker_id) != null) continue;
+            var evicted = self.draft_images.take(attachment.serial).?;
+            self.composer.editor.forgetMarker(evicted.marker_id);
+            evicted.deinit(self.gpa, self.io);
+            return true;
         }
         return false;
+    }
+
+    fn insertClipboardImageMarker(self: *Loop, paste: *const ClipboardImagePaste) !void {
+        if (self.draft_images.len == prompt_image_count_max) return error.TooManyImages;
+        var marker_buffer: [64]u8 = undefined;
+        const marker = clipboardImageMarker(&marker_buffer, self.clipboard_image_serial, paste.mime_type, paste.byte_len);
+        var semantic_buffer: [32]u8 = undefined;
+        const semantic_marker = semanticImageMarker(&semantic_buffer, self.clipboard_image_serial);
+        const marker_id = try self.composer.editor.insertMarker(marker, semantic_marker);
+        self.draft_images.appendOwned(.{
+            .serial = self.clipboard_image_serial,
+            .path = paste.path,
+            .marker_id = marker_id,
+        }) catch unreachable;
+    }
+
+    fn clearDraftImages(self: *Loop) void {
+        for (self.draft_images.items[0..self.draft_images.len]) |*attachment| {
+            self.composer.editor.forgetMarker(attachment.marker_id);
+            attachment.deinit(self.gpa, self.io);
+        }
+        self.draft_images.len = 0;
     }
 
     fn requestFileIndexRebuild(self: *Loop) !void {
@@ -2547,7 +2615,7 @@ pub const Loop = struct {
             .end => self.composer.editor.moveEnd(),
             .clear => {
                 self.composer.editor.clear();
-                self.clearClipboardTempFiles();
+                self.clearDraftImages();
             },
             .kill_to_end => _ = self.composer.editor.killToEnd(),
             .kill_to_start => _ = self.composer.editor.killToStart(),
@@ -2980,40 +3048,11 @@ pub const Loop = struct {
         self.dirty = true;
     }
 
-    fn collectTrackedPromptImagePaths(
-        self: *Loop,
-        prompt: []const u8,
-        out: *[prompt_image_count_max]?[]u8,
-    ) usize {
-        var count: usize = 0;
-        var index: usize = 0;
-        while (index < prompt.len and count < out.len) {
-            const at = std.mem.indexOfScalarPos(u8, prompt, index, '@') orelse break;
-            index = at + 1;
-            const path_start = index;
-            while (index < prompt.len and isPromptPathByte(prompt[index])) : (index += 1) {}
-            if (index == path_start) continue;
-            const path = prompt[path_start..index];
-            for (self.clipboard_temp_paths[0..self.clipboard_temp_path_count]) |maybe_tracked| {
-                const tracked = maybe_tracked orelse continue;
-                if (!std.mem.eql(u8, tracked, path)) continue;
-                for (out[0..count]) |existing| {
-                    if (std.mem.eql(u8, existing.?, tracked)) break;
-                } else {
-                    out[count] = tracked;
-                    count += 1;
-                }
-                break;
-            }
-        }
-        return count;
-    }
-
     fn startPromptImagePreparation(
         self: *Loop,
         prompt: []const u8,
-        paths: [prompt_image_count_max]?[]u8,
-        path_count: usize,
+        recovery_prompt: []const u8,
+        serials: []const u64,
     ) !void {
         if (self.foreground_operation != .idle) {
             try self.notice(.warn, "finish or cancel the current operation first");
@@ -3022,13 +3061,13 @@ pub const Loop = struct {
         const services = self.services orelse return error.NoServices;
         _ = self.session orelse return error.NoSession;
 
-        var pinned: [prompt_image_count_max]?[]u8 = @splat(null);
-        var pinned_count: usize = 0;
-        errdefer self.returnPinnedPromptImagePaths(pinned, pinned_count);
-        for (paths[0..path_count]) |maybe_path| {
-            const path = maybe_path.?;
-            pinned[pinned_count] = self.takeClipboardTempPath(path) orelse return error.ImagePathNotTracked;
-            pinned_count += 1;
+        var pinned_images: DraftImageAttachments = .{};
+        errdefer self.returnPinnedPromptImages(&pinned_images);
+        var paths: [prompt_image_count_max]?[]u8 = @splat(null);
+        for (serials, 0..) |serial, index| {
+            const attachment = self.draft_images.take(serial) orelse return error.ImageNotTracked;
+            pinned_images.appendOwned(attachment) catch unreachable;
+            paths[index] = attachment.path;
         }
 
         const cancel = try self.gpa.create(runtime.CancelSource);
@@ -3038,21 +3077,25 @@ pub const Loop = struct {
         const task = try services.task_runtime.spawn(preparePromptImagesWorker, .{
             self.gpa,
             self.io,
-            pinned,
-            pinned_count,
+            paths,
+            pinned_images.len,
             cancel.token(),
         });
         var captured: SubmittedPrompt = .{};
         captured.set(prompt);
+        var captured_recovery: SubmittedPrompt = .{};
+        captured_recovery.set(recovery_prompt);
         self.foreground_operation = .{ .preparing_images = .{
             .task = task,
             .cancel = cancel,
             .deadline_ns = nowNs(self.io) +| prompt_image_deadline_ns,
             .prompt = captured,
-            .pinned_paths = pinned,
-            .pinned_path_count = pinned_count,
+            .recovery_prompt = captured_recovery,
+            .pinned_images = pinned_images,
         } };
-        self.composer.editor.pushHistory(prompt);
+        for (pinned_images.items[0..pinned_images.len]) |attachment| {
+            self.composer.editor.discardMarkerReplay(attachment.marker_id);
+        }
         self.composer.editor.clear();
         self.dirty = true;
     }
@@ -3070,10 +3113,11 @@ pub const Loop = struct {
                 var result = preparing.task.getResult() catch |err| {
                     const apply_result = preparing.apply_result;
                     const timed_out = preparing.timed_out;
-                    const pinned = preparing.pinned_paths;
-                    const pinned_count = preparing.pinned_path_count;
+                    const recovery_prompt = preparing.recovery_prompt;
+                    var pinned_images = preparing.pinned_images;
                     self.finishPromptImagePreparation();
-                    self.returnPinnedPromptImagePaths(pinned, pinned_count);
+                    self.composer.editor.pushHistory(recovery_prompt.text());
+                    self.returnPinnedPromptImages(&pinned_images);
                     if (apply_result and err != error.OperationCancelled) {
                         try self.notice(.warn, "image preparation failed — press up to recover the prompt");
                     } else if (!apply_result and !timed_out) {
@@ -3083,26 +3127,34 @@ pub const Loop = struct {
                 };
                 const apply_result = preparing.apply_result;
                 const prompt = preparing.prompt;
-                const pinned = preparing.pinned_paths;
-                const pinned_count = preparing.pinned_path_count;
+                const recovery_prompt = preparing.recovery_prompt;
+                var pinned_images = preparing.pinned_images;
                 self.finishPromptImagePreparation();
                 defer result.deinit(self.gpa);
                 if (!apply_result) {
-                    self.returnPinnedPromptImagePaths(pinned, pinned_count);
+                    self.composer.editor.pushHistory(recovery_prompt.text());
+                    self.returnPinnedPromptImages(&pinned_images);
                     try self.notice(.info, "image preparation canceled — press up to recover the prompt");
                     return;
                 }
                 const session = self.session orelse {
-                    self.returnPinnedPromptImagePaths(pinned, pinned_count);
+                    self.composer.editor.pushHistory(recovery_prompt.text());
+                    self.returnPinnedPromptImages(&pinned_images);
                     return error.NoSession;
                 };
-                const wake = self.wake orelse return error.NoWake;
+                const wake = self.wake orelse {
+                    self.composer.editor.pushHistory(recovery_prompt.text());
+                    self.returnPinnedPromptImages(&pinned_images);
+                    return error.NoWake;
+                };
                 self.startPreparedPromptRun(session, self.io, wake, prompt.text(), &result) catch {
-                    self.returnPinnedPromptImagePaths(pinned, pinned_count);
+                    self.composer.editor.pushHistory(recovery_prompt.text());
+                    self.returnPinnedPromptImages(&pinned_images);
                     try self.notice(.warn, "image preparation failed — press up to recover the prompt");
                     return;
                 };
-                self.deletePinnedPromptImagePaths(pinned, pinned_count);
+                self.composer.editor.pushHistory(prompt.text());
+                self.releasePinnedPromptImages(&pinned_images);
             },
             else => {},
         }
@@ -3116,76 +3168,21 @@ pub const Loop = struct {
         self.dirty = true;
     }
 
-    fn takeClipboardTempPath(self: *Loop, path: []const u8) ?[]u8 {
-        for (self.clipboard_temp_paths[0..self.clipboard_temp_path_count], 0..) |maybe_path, index| {
-            const tracked = maybe_path orelse continue;
-            if (!std.mem.eql(u8, tracked, path)) continue;
-            const last = self.clipboard_temp_path_count - 1;
-            self.clipboard_temp_paths[index] = self.clipboard_temp_paths[last];
-            self.clipboard_temp_paths[last] = null;
-            self.clipboard_temp_path_count -= 1;
-            return tracked;
-        }
-        return null;
-    }
-
-    fn returnPinnedPromptImagePaths(
-        self: *Loop,
-        paths: [prompt_image_count_max]?[]u8,
-        count: usize,
-    ) void {
-        for (paths[0..count]) |maybe_path| self.retainClipboardTempPath(maybe_path.?) catch unreachable;
-    }
-
-    fn deletePinnedPromptImagePaths(
-        self: *Loop,
-        paths: [prompt_image_count_max]?[]u8,
-        count: usize,
-    ) void {
-        for (paths[0..count]) |maybe_path| {
-            const path = maybe_path.?;
-            deleteClipboardTempPath(self.io, path);
-            self.gpa.free(path);
+    fn returnPinnedPromptImages(self: *Loop, pinned: *DraftImageAttachments) void {
+        while (pinned.len > 0) {
+            pinned.len -= 1;
+            self.draft_images.appendOwned(pinned.items[pinned.len]) catch unreachable;
         }
     }
 
-    fn clipboardImageAttachmentsFromPrompt(self: *Loop, prompt: []const u8) !PromptImageAttachments {
-        var attachments: PromptImageAttachments = .{};
-        errdefer attachments.deinit(self.gpa);
-        var index: usize = 0;
-        while (index < prompt.len and attachments.len < prompt_image_count_max) {
-            const at = std.mem.indexOfScalarPos(u8, prompt, index, '@') orelse break;
-            index = at + 1;
-            const path_start = index;
-            while (index < prompt.len and isPromptPathByte(prompt[index])) : (index += 1) {}
-            if (index == path_start) continue;
-            const path = prompt[path_start..index];
-            if (!self.isTrackedClipboardTempPath(path)) continue;
-            try attachments.appendOwned(try self.readPromptImageAttachment(path));
+    fn releasePinnedPromptImages(self: *Loop, pinned: *DraftImageAttachments) void {
+        for (pinned.items[0..pinned.len]) |*attachment| {
+            // Submitted history keeps the neutral marker as text, but no editor
+            // replay surface may retain the resource-bearing visible marker.
+            self.composer.editor.forgetMarker(attachment.marker_id);
+            attachment.deinit(self.gpa, self.io);
         }
-        return attachments;
-    }
-
-    fn readPromptImageAttachment(self: *Loop, path: []const u8) !ai.ImageContent {
-        const mime_type = mimeTypeForImagePath(path) orelse return error.UnsupportedFormat;
-        var file = try std.Io.Dir.openFileAbsolute(self.io, path, .{});
-        defer file.close(self.io);
-        const file_len = try file.length(self.io);
-        if (file_len == 0) return error.NoImage;
-        const raw_len: usize = @intCast(file_len);
-        const encoded_len = std.base64.standard.Encoder.calcSize(raw_len);
-        if (encoded_len > prompt_image_encoded_bytes_total_max) return error.ImageTooLarge;
-        const raw = try self.gpa.alloc(u8, raw_len);
-        defer self.gpa.free(raw);
-        const read_len = try file.readPositionalAll(self.io, raw, 0);
-        if (read_len != raw.len) return error.ShortRead;
-
-        const encoded = try self.gpa.alloc(u8, encoded_len);
-        errdefer self.gpa.free(encoded);
-        _ = std.base64.standard.Encoder.encode(encoded, raw);
-        const mime = try self.gpa.dupe(u8, mime_type);
-        errdefer self.gpa.free(mime);
-        return .{ .data = encoded, .mime_type = mime };
+        pinned.len = 0;
     }
 
     fn submitPrompt(self: *Loop, action: input.Action) !void {
@@ -3212,21 +3209,29 @@ pub const Loop = struct {
             .not_slash => {},
             .handled_clear_editor => {
                 self.composer.editor.clear();
-                self.clearClipboardTempFiles();
+                self.clearDraftImages();
                 return;
             },
             .handled_keep_editor, .opened_picker_keep_editor => return,
         }
         var expanded_buffer: [Editor.capacity]u8 = undefined;
         const expanded = try self.composer.editor.expandedText(&expanded_buffer);
-        var image_paths: [prompt_image_count_max]?[]u8 = @splat(null);
-        const image_path_count = self.collectTrackedPromptImagePaths(expanded, &image_paths);
-        if (image_path_count > 0) {
+        var image_serial_buffer: [prompt_image_count_max]u64 = undefined;
+        const image_serials = self.draft_images.activeSerials(&self.composer.editor, &image_serial_buffer);
+        if (image_serials.len > 0) {
+            const session = self.session orelse {
+                try self.notice(.warn, "image attachments require an active session");
+                return;
+            };
+            if (!modelSupportsImages(session.agent.state.model)) {
+                try self.notice(.warn, "selected model does not support image input");
+                return;
+            }
             if (self.run_state.state != .idle) {
                 try self.notice(.warn, "wait for the current run before sending images");
                 return;
             }
-            try self.startPromptImagePreparation(expanded, image_paths, image_path_count);
+            try self.startPromptImagePreparation(expanded, text, image_serials);
             return;
         }
         const session = self.session orelse {
@@ -3234,7 +3239,7 @@ pub const Loop = struct {
             self.submitted_prompt.?.set(expanded);
             self.composer.editor.pushHistory(expanded);
             self.composer.editor.clear();
-            self.clearClipboardTempFiles();
+            self.clearDraftImages();
             return;
         };
         const wake = self.wake orelse return error.NoWake;
@@ -3248,7 +3253,7 @@ pub const Loop = struct {
         }
         self.composer.editor.pushHistory(expanded);
         self.composer.editor.clear();
-        self.clearClipboardTempFiles();
+        self.clearDraftImages();
     }
 
     fn dispatchSlashIfNeeded(self: *Loop, text: []const u8) !SlashDispatchResult {
@@ -3755,12 +3760,11 @@ pub const Loop = struct {
                 if (!preparing.task.hasResult()) preparing.task.cancel();
                 var result = preparing.task.getResult() catch null;
                 if (result) |*images| images.deinit(self.gpa);
-                const pinned = preparing.pinned_paths;
-                const pinned_count = preparing.pinned_path_count;
+                var pinned_images = preparing.pinned_images;
                 preparing.cancel.deinit();
                 self.gpa.destroy(preparing.cancel);
                 self.foreground_operation = .idle;
-                self.returnPinnedPromptImagePaths(pinned, pinned_count);
+                self.returnPinnedPromptImages(&pinned_images);
             },
             .reading_clipboard => |*reading| {
                 if (!reading.task.hasResult()) reading.task.cancel();
@@ -3983,7 +3987,7 @@ pub const Loop = struct {
         }
         if (self.composer.editor.text().len != 0) {
             self.composer.editor.clear();
-            self.clearClipboardTempFiles();
+            self.clearDraftImages();
             try self.afterComposerTextMutation();
         }
         self.exit_hint_visible = true;
@@ -4223,11 +4227,9 @@ fn jsonWorkBytes(value: std.json.Value) usize {
     return total;
 }
 
-fn isPromptPathByte(byte: u8) bool {
-    return switch (byte) {
-        0...32, '"', '\'', '<', '>' => false,
-        else => true,
-    };
+fn modelSupportsImages(model: ai.Model) bool {
+    for (model.input) |input_kind| if (input_kind == .image) return true;
+    return false;
 }
 
 fn mimeTypeForImagePath(path: []const u8) ?[]const u8 {
@@ -4330,6 +4332,10 @@ fn clipboardImageErrorText(err: anyerror) []const u8 {
         error.EditorFull => "composer is full",
         else => "could not paste clipboard image",
     };
+}
+
+fn semanticImageMarker(buffer: []u8, serial: u64) []const u8 {
+    return std.fmt.bufPrint(buffer, "[Image #{d}]", .{serial}) catch "[Image]";
 }
 
 fn clipboardImageMarker(buffer: []u8, serial: u64, mime_type: []const u8, byte_len: usize) []const u8 {
@@ -4790,30 +4796,35 @@ test "prompt image worker enforces aggregate encoded cap and cancellation" {
     );
 }
 
-test "loop extracts tracked clipboard image attachments from expanded prompt" {
+test "loop image marker expands to semantic text without exposing staging path" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "zi-clipboard-test.png", .data = "png-bytes" });
 
-    const cwd = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
-    defer std.testing.allocator.free(cwd);
-    const path = try std.fs.path.join(std.testing.allocator, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "zi-clipboard-test.png" });
-    defer std.testing.allocator.free(path);
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPathFile(std.testing.io, "zi-clipboard-test.png", &path_buffer);
 
     var loop = try Loop.initTest(std.testing.allocator, null);
     defer loop.deinit();
     loop.io = std.testing.io;
-    loop.clipboard_temp_paths[0] = try std.testing.allocator.dupe(u8, path);
-    loop.clipboard_temp_path_count = 1;
+    loop.clipboard_image_serial = 1;
+    const path = try std.testing.allocator.dupe(u8, path_buffer[0..path_len]);
+    var paste: ClipboardImagePaste = .{
+        .path = path,
+        .mime_type = try std.testing.allocator.dupe(u8, "image/png"),
+        .byte_len = 9,
+    };
+    try loop.insertClipboardImageMarker(&paste);
+    paste.path = &.{};
+    paste.deinit(std.testing.allocator);
 
-    const prompt = try std.fmt.allocPrint(std.testing.allocator, "look @{s}", .{path});
-    defer std.testing.allocator.free(prompt);
-    var attachments = try loop.clipboardImageAttachmentsFromPrompt(prompt);
-    defer attachments.deinit(std.testing.allocator);
-
-    try std.testing.expectEqual(@as(usize, 1), attachments.images().len);
-    try std.testing.expectEqualStrings("image/png", attachments.images()[0].mime_type);
-    try std.testing.expectEqualStrings("cG5nLWJ5dGVz", attachments.images()[0].data);
+    var expanded_buffer: [Editor.capacity]u8 = undefined;
+    const expanded = try loop.composer.editor.expandedText(&expanded_buffer);
+    try std.testing.expectEqualStrings("[Image #1]", expanded);
+    try std.testing.expect(std.mem.indexOf(u8, expanded, path_buffer[0..path_len]) == null);
+    var serial_buffer: [prompt_image_count_max]u64 = undefined;
+    const serials = loop.draft_images.activeSerials(&loop.composer.editor, &serial_buffer);
+    try std.testing.expectEqualSlices(u64, &.{1}, serials);
 }
 
 test "loop dispatches mapped key actions end-to-end" {
@@ -5809,6 +5820,7 @@ test "loop P4 settings thinking visibility persists through services" {
 const RunTestFixture = struct {
     tmp: std.testing.TmpDir,
     task_runtime: *runtime.Runtime,
+    services: *coding_agent.runtime_services.RuntimeServices,
     provider: *ai.FauxProvider,
     session: *coding_agent.AgentSession,
     owner_loop: *Loop,
@@ -5832,6 +5844,15 @@ const RunTestFixture = struct {
         try provider.setResponses(&.{response});
         try tmp.dir.createDirPath(std.testing.io, "agent");
         try tmp.dir.createDirPath(std.testing.io, "repo");
+        const services = try std.testing.allocator.create(coding_agent.runtime_services.RuntimeServices);
+        errdefer std.testing.allocator.destroy(services);
+        services.* = try coding_agent.runtime_services.RuntimeServices.init(std.testing.allocator, .{
+            .cwd = "repo",
+            .agent_dir = "agent",
+            .dir = tmp.dir,
+            .task_runtime = task_runtime,
+        });
+        errdefer services.deinit();
         const session = try std.testing.allocator.create(coding_agent.AgentSession);
         errdefer std.testing.allocator.destroy(session);
         session.* = try coding_agent.AgentSession.init(std.testing.allocator, std.testing.io, .{
@@ -5860,11 +5881,13 @@ const RunTestFixture = struct {
         const fixture: RunTestFixture = .{
             .tmp = tmp,
             .task_runtime = task_runtime,
+            .services = services,
             .provider = provider,
             .session = session,
             .owner_loop = owner_loop,
             .wake = wake,
         };
+        owner_loop.services = services;
         owner_loop.session = session;
         owner_loop.io = session.io;
         owner_loop.wake = wake;
@@ -5881,6 +5904,8 @@ const RunTestFixture = struct {
         std.testing.allocator.destroy(self.owner_loop);
         self.provider.deinit();
         std.testing.allocator.destroy(self.provider);
+        self.services.deinit();
+        std.testing.allocator.destroy(self.services);
         std.testing.allocator.destroy(self.wake);
         self.task_runtime.deinit();
         self.tmp.cleanup();
@@ -5909,6 +5934,84 @@ fn driveAgentRunUntilIdle(owner_loop: *Loop, max_iterations: usize) !void {
         try runtime.yield();
     }
     return error.AgentRunDidNotSettle;
+}
+
+test "text-only model keeps clipboard image draft and staging file" {
+    var fixture = try RunTestFixture.init("done");
+    defer fixture.deinit();
+    try fixture.tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "clipboard.png",
+        .data = "png-bytes",
+    });
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try fixture.tmp.dir.realPathFile(std.testing.io, "clipboard.png", &path_buffer);
+
+    var text_only_model = fixture.session.agent.state.model;
+    text_only_model.input = &.{.text};
+    fixture.session.agent.setModel(text_only_model);
+    try fixture.owner_loop.dispatch(.{ .insert = "inspect " });
+    fixture.owner_loop.clipboard_image_serial = 1;
+    var paste: ClipboardImagePaste = .{
+        .path = try std.testing.allocator.dupe(u8, path_buffer[0..path_len]),
+        .mime_type = try std.testing.allocator.dupe(u8, "image/png"),
+        .byte_len = 9,
+    };
+    try fixture.owner_loop.insertClipboardImageMarker(&paste);
+    paste.path = &.{};
+    paste.deinit(std.testing.allocator);
+
+    try fixture.owner_loop.dispatch(.submit);
+    try std.testing.expect(fixture.owner_loop.run_state.state == .idle);
+    try std.testing.expectEqual(@as(usize, 1), fixture.owner_loop.draft_images.len);
+    try std.testing.expectEqualStrings("inspect [image #1 png 1 KiB]", fixture.owner_loop.composer.editor.text());
+    var file = try std.Io.Dir.openFileAbsolute(std.testing.io, path_buffer[0..path_len], .{});
+    file.close(std.testing.io);
+    var frame = try fixture.owner_loop.composeFrame(80, 12);
+    try expectFrameContains(&frame, "selected model does not support image input");
+}
+
+test "accepted clipboard image submits bytes and deletes only staging file" {
+    var fixture = try RunTestFixture.init("done");
+    defer fixture.deinit();
+    try fixture.tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "clipboard.png",
+        .data = "png-bytes",
+    });
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try fixture.tmp.dir.realPathFile(std.testing.io, "clipboard.png", &path_buffer);
+
+    try fixture.owner_loop.dispatch(.{ .insert = "inspect " });
+    fixture.owner_loop.clipboard_image_serial = 1;
+    var paste: ClipboardImagePaste = .{
+        .path = try std.testing.allocator.dupe(u8, path_buffer[0..path_len]),
+        .mime_type = try std.testing.allocator.dupe(u8, "image/png"),
+        .byte_len = 9,
+    };
+    try fixture.owner_loop.insertClipboardImageMarker(&paste);
+    paste.path = &.{};
+    paste.deinit(std.testing.allocator);
+
+    try fixture.owner_loop.dispatch(.submit);
+    try fixture.owner_loop.dispatch(.{ .insert = "next draft" });
+    try driveForegroundOperationUntilIdle(fixture.owner_loop, 10_000);
+
+    try std.testing.expectEqualStrings("next draft", fixture.owner_loop.composer.editor.text());
+    try std.testing.expectError(
+        error.FileNotFound,
+        std.Io.Dir.openFileAbsolute(std.testing.io, path_buffer[0..path_len], .{}),
+    );
+    const saved = &fixture.owner_loop.run_state.saved_prompt.?;
+    try std.testing.expectEqualStrings("inspect [Image #1]", saved.text.text());
+    try std.testing.expectEqual(@as(usize, 1), saved.images.items.len);
+    try std.testing.expectEqualStrings("image/png", saved.images.items[0].mime_type);
+    try std.testing.expectEqualStrings("cG5nLWJ5dGVz", saved.images.items[0].data);
+    try std.testing.expect(std.mem.indexOf(u8, saved.text.text(), "/clipboard.png") == null);
+
+    try driveAgentRunUntilIdle(fixture.owner_loop, 10_000);
+    try std.testing.expectEqualStrings(
+        "inspect [Image #1]",
+        fixture.owner_loop.transcript.items.items[0].kind.user.text.items,
+    );
 }
 
 test "agent run applies agent events in rendered deadline-gated batches" {

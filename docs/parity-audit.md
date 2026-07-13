@@ -156,7 +156,7 @@ Cut-over baseline: `46b6276~1`. Sources audited only: old `interactive.zig`, old
 | 108 | compaction end error message is a warning status and working status returns/clears based on retry/active operation. | `applyCompactionEnd` | RESTORED | `engine_drain.compactionEnd`, `Engine.stepActive` status restore |
 | 109 | operation finish clears working status for completed/failed/canceled. | `applyOperationFinished` | RESTORED | `engine_drain.operationIdle`, `view_diff.emitOperation` |
 | 110 | canceled operation marks pending tools canceled. | `applyOperationFinished` | RESTORED | `engine_drain.cancelStreaming`, `view_diff.diffExistingItem` |
-| 111 | clipboard image paste inserts composer marker `@{path}`. | `finishReadyFrontendTask` | RESTORED | `frame_loop.drainOneWorkerResult` |
+| 111 | clipboard image paste inserts a neutral semantic marker backed by a bounded typed attachment; staging paths never enter prompt text. | `finishReadyFrontendTask` | CHANGED | `Loop.insertClipboardImageMarker`, `Editor.MarkerId` |
 | 112 | OSC52 fallback copy path reports `selection copied via terminal clipboard`. | `finishReadyFrontendTask` | RESTORED | `frame_loop.drainOneWorkerResult` |
 | 113 | custom transcript appends are bounded and can carry caller-provided title/markdown format. | `appendCustom` | RESTORED | `vm.Item.title/markdown`, `view_diff.customAppend` |
 
@@ -164,9 +164,9 @@ Cut-over baseline: `46b6276~1`. Sources audited only: old `interactive.zig`, old
 
 | Status | Count |
 |---|---:|
-| RESTORED | 95 |
+| RESTORED | 94 |
 | MISSING | 0 |
-| CHANGED | 17 |
+| CHANGED | 18 |
 | OBSOLETE | 2 |
 | TOTAL | 114 |
 

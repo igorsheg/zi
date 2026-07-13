@@ -22,7 +22,7 @@ kill_ring: [kill_ring_capacity]Snapshot = undefined,
 kill_len: usize = 0,
 paste_markers: [paste_marker_capacity]PasteMarker = undefined,
 paste_marker_len: usize = 0,
-next_paste_id: u32 = 1,
+next_paste_id: MarkerId = 1,
 last_was_kill: bool = false,
 
 const Editor = @This();
@@ -46,8 +46,10 @@ const Snapshot = struct {
     }
 };
 
+pub const MarkerId = u32;
+
 const PasteMarker = struct {
-    id: u32 = 0,
+    id: MarkerId = 0,
     marker: Snapshot = .{},
     text: Snapshot = .{},
 };
@@ -210,6 +212,54 @@ pub fn clear(self: *Editor) void {
     self.last_was_kill = false;
 }
 
+pub fn markerPosition(self: *const Editor, marker_id: MarkerId) ?usize {
+    const marker = self.markerById(marker_id) orelse return null;
+    return std.mem.indexOf(u8, self.text(), marker.marker.text());
+}
+
+/// Search all bounded editor replay surfaces for an owned marker.
+pub fn containsMarkerInReplay(self: *const Editor, marker_id: MarkerId) bool {
+    const marker = self.markerById(marker_id) orelse return false;
+    const marker_text = marker.marker.text();
+    if (std.mem.indexOf(u8, self.text(), marker_text) != null) return true;
+    for (self.undo[0..self.undo_len]) |snapshot| {
+        if (std.mem.indexOf(u8, snapshot.text(), marker_text) != null) return true;
+    }
+    for (self.history[0..self.history_len]) |snapshot| {
+        if (std.mem.indexOf(u8, snapshot.text(), marker_text) != null) return true;
+    }
+    if (std.mem.indexOf(u8, self.draft.text(), marker_text) != null) return true;
+    for (self.kill_ring[0..self.kill_len]) |snapshot| {
+        if (std.mem.indexOf(u8, snapshot.text(), marker_text) != null) return true;
+    }
+    return false;
+}
+
+/// Remove an owned marker from every bounded replay surface while retaining
+/// its definition so an external owner can later restore a captured draft.
+pub fn discardMarkerReplay(self: *Editor, marker_id: MarkerId) void {
+    const marker = self.markerById(marker_id) orelse return;
+    const marker_text = marker.marker.text();
+    removeAll(self.buffer[0..], &self.len, &self.cursor, marker_text);
+    for (self.undo[0..self.undo_len]) |*snapshot| removeAllFromSnapshot(snapshot, marker_text);
+    for (self.history[0..self.history_len]) |*snapshot| removeAllFromSnapshot(snapshot, marker_text);
+    removeAllFromSnapshot(&self.draft, marker_text);
+    for (self.kill_ring[0..self.kill_len]) |*snapshot| removeAllFromSnapshot(snapshot, marker_text);
+    self.history_index = null;
+    self.last_was_kill = false;
+}
+
+/// Remove an owned marker from replay state and release its definition.
+pub fn forgetMarker(self: *Editor, marker_id: MarkerId) void {
+    const marker_index = self.markerIndexById(marker_id) orelse return;
+    self.discardMarkerReplay(marker_id);
+    const last = self.paste_marker_len - 1;
+    self.paste_markers[marker_index] = self.paste_markers[last];
+    self.paste_marker_len -= 1;
+    self.history_index = null;
+    self.last_was_kill = false;
+}
+
 pub fn expandedText(self: *const Editor, out: []u8) Error![]const u8 {
     var written: usize = 0;
     var index: usize = 0;
@@ -364,23 +414,37 @@ pub fn insertPasteMarker(self: *Editor, bytes: []const u8) Error!void {
     var marker_text: [64]u8 = undefined;
     const line_count = countLines(bytes);
     const marker = std.fmt.bufPrint(&marker_text, "[paste #{d} +{d} lines]", .{ self.next_paste_id, line_count }) catch return error.EditorFull;
-    try self.insertMarker(marker, bytes);
+    _ = try self.insertMarker(marker, bytes);
 }
 
-pub fn insertMarker(self: *Editor, marker: []const u8, expansion: []const u8) Error!void {
+pub fn insertMarker(self: *Editor, marker: []const u8, expansion: []const u8) Error!MarkerId {
     if (!std.unicode.utf8ValidateSlice(marker)) return error.InvalidUtf8;
     if (!std.unicode.utf8ValidateSlice(expansion)) return error.InvalidUtf8;
-    if (marker.len == 0) return;
-    if (self.paste_marker_len == paste_marker_capacity) return error.EditorFull;
+    if (marker.len == 0) return error.InvalidUtf8;
+    if (self.paste_marker_len == paste_marker_capacity or marker.len > capacity - self.len) return error.EditorFull;
     try self.recordUndo();
+    const marker_id = self.next_paste_id;
     const slot = &self.paste_markers[self.paste_marker_len];
-    slot.id = self.next_paste_id;
+    slot.id = marker_id;
     try slot.marker.set(marker, marker.len);
     try slot.text.set(expansion, expansion.len);
     self.paste_marker_len += 1;
     self.next_paste_id +%= 1;
     try self.insertRaw(marker);
     self.last_was_kill = false;
+    return marker_id;
+}
+
+fn markerIndexById(self: *const Editor, marker_id: MarkerId) ?usize {
+    for (self.paste_markers[0..self.paste_marker_len], 0..) |marker, index| {
+        if (marker.id == marker_id) return index;
+    }
+    return null;
+}
+
+fn markerById(self: *const Editor, marker_id: MarkerId) ?*const PasteMarker {
+    const index = self.markerIndexById(marker_id) orelse return null;
+    return &self.paste_markers[index];
 }
 
 fn markerAt(self: *const Editor, index: usize) ?*const PasteMarker {
@@ -397,6 +461,25 @@ fn markerStartEndingAt(self: *const Editor, index: usize) ?usize {
         if (std.mem.eql(u8, self.buffer[start..index], marker.marker.text())) return start;
     }
     return null;
+}
+
+fn removeAllFromSnapshot(snapshot: *Snapshot, needle: []const u8) void {
+    removeAll(snapshot.buffer[0..], &snapshot.len, &snapshot.cursor, needle);
+}
+
+fn removeAll(buffer: []u8, len: *usize, cursor: *usize, needle: []const u8) void {
+    var search_from: usize = 0;
+    while (std.mem.findPos(u8, buffer[0..len.*], search_from, needle)) |start| {
+        const end = start + needle.len;
+        @memmove(buffer[start .. len.* - needle.len], buffer[end..len.*]);
+        len.* -= needle.len;
+        if (cursor.* >= end) {
+            cursor.* -= needle.len;
+        } else if (cursor.* > start) {
+            cursor.* = start;
+        }
+        search_from = start;
+    }
 }
 
 fn shouldCollapsePaste(bytes: []const u8) bool {
@@ -586,13 +669,32 @@ test "editor collapses and expands large paste markers" {
     try std.testing.expectEqualStrings(paste, expanded);
 }
 
-test "editor inserts forced marker with hidden expansion" {
+test "editor inserts forced marker with neutral expansion" {
     var editor: Editor = .{};
-    try editor.insertMarker("[image #1 png 1 KiB]", "@/tmp/zi-clipboard-test.png");
-    try std.testing.expectEqualStrings("[image #1 png 1 KiB]", editor.text());
+    _ = try editor.insertMarker("[Image #1]", "[Image #1]");
+    try std.testing.expectEqualStrings("[Image #1]", editor.text());
     var out: [capacity]u8 = undefined;
     const expanded = try editor.expandedText(&out);
-    try std.testing.expectEqualStrings("@/tmp/zi-clipboard-test.png", expanded);
+    try std.testing.expectEqualStrings("[Image #1]", expanded);
+}
+
+test "editor forgets a semantic marker from replay state" {
+    var editor: Editor = .{};
+    try editor.insert("before ");
+    const marker_id = try editor.insertMarker("[Image #1]", "[Image #1]");
+    editor.pushHistory(editor.text());
+    try std.testing.expect(editor.backspace());
+    try std.testing.expect(editor.undoLast());
+
+    editor.discardMarkerReplay(marker_id);
+    try std.testing.expectEqualStrings("before ", editor.text());
+    editor.pushHistory("[Image #1]");
+    try std.testing.expect(editor.historyPrev());
+    try std.testing.expectEqualStrings("[Image #1]", editor.text());
+
+    editor.forgetMarker(marker_id);
+    try std.testing.expectEqualStrings("", editor.text());
+    while (editor.undoLast()) try std.testing.expect(std.mem.indexOf(u8, editor.text(), "[Image #1]") == null);
 }
 
 test "editor treats paste marker as one cursor unit" {

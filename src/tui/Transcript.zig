@@ -1372,9 +1372,20 @@ fn createUserMessageItem(self: *Transcript, user: ai.UserMessage) !*Item {
     const item = try self.createItem(.{ .user = .{ .text = .empty } });
     switch (user.content) {
         .string => |text| try self.appendUserText(item, text),
-        .blocks => |blocks_slice| for (blocks_slice) |block| switch (block) {
-            .text => |text| try self.appendUserText(item, text.text),
-            .image => |image| try self.appendUserImage(item, image.mime_type),
+        .blocks => |blocks_slice| {
+            var represented_image_count: usize = 0;
+            for (blocks_slice) |block| switch (block) {
+                .text => |text| represented_image_count +|= semanticImageMarkerCount(text.text),
+                .image => {},
+            };
+            var image_index: usize = 0;
+            for (blocks_slice) |block| switch (block) {
+                .text => |text| try self.appendUserText(item, text.text),
+                .image => |image| {
+                    if (image_index >= represented_image_count) try self.appendUserImage(item, image.mime_type);
+                    image_index +|= 1;
+                },
+            };
         },
     }
     return item;
@@ -1584,6 +1595,20 @@ fn itemBytes(item: *const Item) usize {
     };
 }
 
+fn semanticImageMarkerCount(text: []const u8) usize {
+    const prefix = "[Image #";
+    var count: usize = 0;
+    var search_from: usize = 0;
+    while (std.mem.findPos(u8, text, search_from, prefix)) |start| {
+        var end = start + prefix.len;
+        const digits_start = end;
+        while (end < text.len and std.ascii.isDigit(text[end])) : (end += 1) {}
+        if (end > digits_start and end < text.len and text[end] == ']') count +|= 1;
+        search_from = start + prefix.len;
+    }
+    return count;
+}
+
 fn imageFallbackText(mime_type: []const u8) []const u8 {
     if (mime_type.len == 0) return "[Image]";
     if (std.mem.eql(u8, mime_type, "image/png")) return "[Image: image/png]";
@@ -1641,6 +1666,24 @@ test "transcript user block renders image placeholders" {
     var buffer: [64]u8 = undefined;
     try std.testing.expectEqualStrings(" look", lines[1].copyText(&buffer));
     try std.testing.expectEqualStrings(" [Image: image/png]", lines[2].copyText(&buffer));
+}
+
+test "transcript does not duplicate semantic image markers" {
+    var transcript = Transcript.init(std.testing.allocator);
+    defer transcript.deinit();
+
+    const content = [_]ai.UserContent{
+        .{ .text = .{ .text = "[Image #1] What do you see?" } },
+        .{ .image = .{ .data = "abc", .mime_type = "image/png" } },
+    };
+    try transcript.apply(std.testing.io, .{ .message_start = .{ .message = .{ .user = .{ .content = .{ .blocks = &content }, .timestamp = 0 } } } });
+    const state: theme.LayoutState = .{ .width = 40, .height = 10 };
+    _ = try transcript.prepareLayout(state);
+    const lines = transcript.items.items[0].layout_cache.active.lines;
+
+    var buffer: [64]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 4), lines.len);
+    try std.testing.expectEqualStrings(" [Image #1] What do you see?", lines[1].copyText(&buffer));
 }
 
 test "transcript visible thinking trims trailing blank rows" {

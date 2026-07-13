@@ -281,8 +281,8 @@ Add one concrete `PromptImagePreparation` slot owned by `Loop`:
 
 ```text
 task
-expanded_prompt_snapshot (<= Editor.capacity)
-referenced temp paths (<= 4)
+semantic_prompt_snapshot (<= Editor.capacity)
+pinned draft-image attachments (<= 4)
 apply_result
 ```
 
@@ -477,10 +477,13 @@ rejected without clearing the editor. Text-only steer/follow-up behavior remains
 unchanged. This removes a race in which prepared images could outlive the run
 they were intended to steer.
 
-For a prompt containing tracked clipboard-image paths:
+For a prompt containing tracked clipboard-image markers:
 
-1. Scanning the at-most-`Editor.capacity` prompt and copying at most four paths
-   may remain owner-loop work. File reads and base64 encoding may not.
+1. `Editor` owns each marker and returns a typed `MarkerId`; `Loop` owns the
+   bounded `{ MarkerId, staging_path }` attachment. Resolving at most four active
+   markers in the at-most-`Editor.capacity` prompt may remain owner-loop work.
+   File reads and base64 encoding may not. Staging paths never enter semantic
+   prompt text or durable session history.
 2. Replace the current image-data limit with the explicit TUI constants
    `prompt_image_count_max = 4` and
    `prompt_image_encoded_bytes_total_max = 768 * 1024`. The worker checks
@@ -491,10 +494,13 @@ For a prompt containing tracked clipboard-image paths:
    serialized user-message fixture must prove that 768 KiB of image data plus
    maximum escaped prompt/MIME/JSON overhead remains below
    `session_manager.max_session_line_bytes`.
-3. Snapshot the expanded prompt, push it into history, pin the referenced temp
-   paths to the operation, then clear the submitted text from the composer. The
-   user may immediately type the next draft. This is the only history/clear
-   commit point for the captured submission.
+3. Snapshot the semantic prompt and visible recovery draft, pin the referenced
+   typed attachments to the operation, scrub their markers from bounded editor
+   replay state, then clear the submitted text from the composer. The captured
+   recovery snapshot remains operation-owned, so the user may immediately type
+   the next draft. Success records the
+   semantic prompt in history; failure/cancellation records the visible recovery
+   draft so Up can restore the marker/attachment association.
 4. Process images sequentially in the worker. Peak worker memory is one bounded
    raw image plus at most 768 KiB of accumulated encoded output.
 5. The status row reads `Preparing images… (esc to cancel)`.
@@ -513,10 +519,11 @@ For a prompt containing tracked clipboard-image paths:
    editor. Release the captured temp files exactly once only after
    `startPromptHandle` succeeds.
 10. Failure or cancellation never overwrites the current draft. Keep the
-    captured prompt in history and return its still-valid temp paths to Loop's
-    bounded tracked-path set so Up can recover and retry it. Show one notice that
-    names history recovery. Successful submission deletes the pinned temp files
-    only after the existing agent path has copied their data.
+    visible recovery draft in history and return its still-valid attachments to
+    Loop's bounded draft-image set so Up can recover and retry it. Show one
+    notice that names history recovery. Successful submission forgets the owned
+    editor markers and deletes staging files only after the existing agent path
+    has copied their data.
 11. A second submit while preparation is in flight is rejected without clearing
     its text. New clipboard-image paste and every session listing/open request
     are rejected until the prompt-image slot is fully idle.
@@ -526,15 +533,16 @@ For a prompt containing tracked clipboard-image paths:
     captured prompt remains the most recent recoverable history entry.
 13. Owner-side start failure after successful preparation is recoverable: clear
     any partially installed `SavedPrompt`, free encoded buffers, return pinned
-    paths to Loop's tracked set, keep the history/current draft untouched, and
-    show one failure notice. No temp path is deleted before the start commit.
+    attachments to Loop's draft-image set, keep the history/current draft
+    untouched, and show one failure notice. No staging file is deleted before
+    the start commit.
 
 The worker result owns all encoded image and MIME buffers. Ownership transfers
 to `SavedPrompt`/`AgentSession` only during accepted completion; all canceled
-and failed paths free it in the completion branch. Temp-path ownership is
-equally explicit: paths are pinned by the operation while the worker can read
-them, then deleted on success or returned to Loop's bounded tracked set on
-failure/cancellation.
+and failed paths free it in the completion branch. Staging-file ownership is
+equally explicit: typed attachments are pinned by the operation while the
+worker can read them, then deleted on success or returned to Loop's bounded
+draft-image set on failure/cancellation.
 
 ### 8.5 Status and ESC priority
 
@@ -589,18 +597,20 @@ New user-facing copy is fixed for this work:
 | Text-only submit | Existing `RunDriver` rules; also while a canceled listing merely drains | Reject during any session opening/switch/restore, accepted listing, or any occupied prompt-image slot; keep text |
 | Start session listing/opening | Driver idle, prompt slot fully idle, no clipboard task, session slot idle | Reject without changing picker/editor/session |
 | Start prompt-image preparation | Driver idle, session slot idle, clipboard task idle, prompt slot idle | Reject without clearing editor/history |
-| Start clipboard-image paste | Session slot idle, prompt slot fully idle, tracked paths below four | Reject with existing bounded notice; active agent run alone is allowed |
+| Start clipboard-image paste | Session slot idle, prompt slot fully idle, active draft attachments below four | Reject with existing bounded notice; active agent run alone is allowed |
 | New session/image operation while an old canceled task drains | Session work requires both session and prompt slots idle; image work requires both slots idle | Reject the conflicting operation; only the explicitly allowed text-only work may continue |
 | File-index/query completion | Any non-shutdown phase | Existing stale/cancel policy remains independent |
 | Process shutdown | No new operation | Request every concrete cancel source, drain up to five seconds, then use the exceptional terminal-restored failure exit from §8.1 |
 
-Temp paths have exactly one owner. Ordinary pasted paths belong to Loop's
-tracked set. Starting prompt preparation moves the referenced paths into its
-pinned set, so editor clear and clipboard cleanup cannot delete worker-visible
-files. Success deletes them after the agent copy. Failure/cancellation moves
-them back to Loop; the prohibition on new paste/session work while the prompt
-slot is occupied guarantees the original four-path capacity remains available.
-Loop deinit never deletes a pinned path before the task drains.
+Each staging path has exactly one owner. Draft-image attachments belong to
+Loop's bounded set and are selected through typed `Editor.MarkerId` values, not
+path parsing. Starting prompt preparation moves the referenced attachments into
+its pinned set, so editor clear and clipboard cleanup cannot delete
+worker-visible files. Success deletes them after the agent copy.
+Failure/cancellation moves them back to Loop; the prohibition on new
+paste/session work while the prompt slot is occupied guarantees the original
+four-attachment capacity remains available. Loop deinit never deletes a pinned
+path before the task drains.
 
 `draining_previous` and `restoring` are non-cancelable commit phases. ESC during
 them does not roll back or emit a cancel hint; it continues down the centralized
@@ -628,7 +638,8 @@ driver.
 - Image-bearing submission while the driver is not idle is rejected without
   clearing the draft; text-only steering/follow-up remains unchanged.
 - Edited, canceled, failed, and successful image preparations preserve or clear
-  captured history, the current draft, and temp files according to §8.4.
+  captured history, typed marker associations, the current draft, and staging
+  files according to §8.4; semantic prompts never contain staging paths.
 - Owner-side prompt-start failure after preparation returns path ownership and
   leaks neither `SavedPrompt` nor encoded image buffers.
 - Loop shutdown drains every new task result and passes allocator leak checks.

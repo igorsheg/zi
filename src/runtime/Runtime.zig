@@ -41,7 +41,8 @@ pub fn Task(comptime T: type) type {
 
         pub fn getResult(self: *Self) T {
             if (!self.settled) {
-                self.result = self.handle.getResult();
+                std.debug.assert(self.handle.hasResult());
+                self.result = self.handle.join();
                 self.settled = true;
             }
             return self.result;
@@ -103,4 +104,17 @@ pub fn sleep(io: std.Io, duration: Duration) Cancelable!void {
 
 pub fn yield() Cancelable!void {
     return zio_backend.yield();
+}
+
+fn testTaskResult() usize {
+    return 42;
+}
+
+test "getResult consumes a completed task handle" {
+    var task_runtime = try Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
+    var task = try task_runtime.spawn(testTaskResult, .{});
+    while (!task.hasResult()) try yield();
+    try std.testing.expectEqual(@as(usize, 42), task.getResult());
+    try std.testing.expectEqual(@as(usize, 42), task.getResult());
 }

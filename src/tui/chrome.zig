@@ -601,7 +601,7 @@ test "vertical cursor targets soft wraps with wide and combining graphemes" {
 
 test "vertical cursor keeps paste markers atomic" {
     var editor: Editor = .{};
-    try editor.insertMarker("[paste #1 +20 lines]", "expanded");
+    _ = try editor.insertMarker("[paste #1 +20 lines]", "expanded");
     try editor.insert("\nend");
     const up = verticalCursorTarget(&editor, 40, 10, .up, null).cursor;
     try std.testing.expectEqual(@as(usize, 0), up.byte);
