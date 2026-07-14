@@ -2,13 +2,13 @@
 
 ## Fixed references
 
-| Source | Role |
-| --- | --- |
-| `pi-ai` and `pi-agent-core` | Runtime dependencies |
-| `pi-coding-agent` | Coding-agent behavior and architecture reference |
-| OpenTUI React | Frontend architecture and terminal implementation |
-| OpenCode | Proven OpenTUI application patterns worth evaluating |
-| Zi | Visual and interaction acceptance reference |
+| Source                      | Role                                                 |
+| --------------------------- | ---------------------------------------------------- |
+| `pi-ai` and `pi-agent-core` | Runtime dependencies                                 |
+| `pi-coding-agent`           | Coding-agent behavior and architecture reference     |
+| OpenTUI React               | Frontend architecture and terminal implementation    |
+| OpenCode                    | Proven OpenTUI application patterns worth evaluating |
+| Zi                          | Visual and interaction acceptance reference          |
 
 OpenZi recreates `pi-coding-agent`; it does not depend on it. Parity includes the recognizable upper-layer architecture—`AgentSession`, session/services construction, settings, model and resource owners, tools, extensions, and interactive/print/RPC modes—not only a checklist of visible features.
 

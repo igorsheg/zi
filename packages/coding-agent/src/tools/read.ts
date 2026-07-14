@@ -1,13 +1,15 @@
 import { readFile } from "node:fs/promises"
+
 import type { AgentTool } from "@earendil-works/pi-agent-core"
 import { Type } from "@earendil-works/pi-ai"
+
 import { resolveToolPath } from "./path.js"
 import { DEFAULT_MAX_BYTES, truncateHead, type TruncationResult } from "./truncate.js"
 
 const parameters = Type.Object({
   path: Type.String({ description: "Path to the file to read (relative or absolute)" }),
   offset: Type.Optional(Type.Integer({ minimum: 1, description: "Line number to start reading from (1-indexed)" })),
-  limit: Type.Optional(Type.Integer({ minimum: 1, description: "Maximum number of lines to read" })),
+  limit: Type.Optional(Type.Integer({ minimum: 1, description: "Maximum number of lines to read" }))
 })
 
 export interface ReadToolDetails {
@@ -29,7 +31,8 @@ export function createReadTool(cwd: string): AgentTool<typeof parameters, ReadTo
 
       const lines = content.split("\n")
       const start = (input.offset ?? 1) - 1
-      if (start >= lines.length) throw new Error(`Offset ${input.offset} is beyond end of file (${lines.length} lines total)`)
+      if (start >= lines.length)
+        throw new Error(`Offset ${input.offset} is beyond end of file (${lines.length} lines total)`)
       const selected = lines.slice(start, input.limit === undefined ? undefined : start + input.limit).join("\n")
       const truncation = truncateHead(selected)
 
@@ -39,10 +42,10 @@ export function createReadTool(cwd: string): AgentTool<typeof parameters, ReadTo
           content: [
             {
               type: "text",
-              text: `[Line ${line} exceeds the ${DEFAULT_MAX_BYTES} byte limit. Use bash to inspect a bounded byte range.]`,
-            },
+              text: `[Line ${line} exceeds the ${DEFAULT_MAX_BYTES} byte limit. Use bash to inspect a bounded byte range.]`
+            }
           ],
-          details: { truncation },
+          details: { truncation }
         }
       }
 
@@ -53,7 +56,7 @@ export function createReadTool(cwd: string): AgentTool<typeof parameters, ReadTo
         text += `\n\n[Showing lines ${first}-${last} of ${lines.length}. Use offset=${last + 1} to continue.]`
       }
       return { content: [{ type: "text", text }], details: truncation.truncated ? { truncation } : undefined }
-    },
+    }
   }
 }
 

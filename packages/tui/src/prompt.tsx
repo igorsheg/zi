@@ -1,5 +1,6 @@
 import type { TextareaRenderable } from "@opentui/core"
 import { useRef, useState } from "react"
+
 import { useSession } from "./session-context.js"
 
 export function Prompt() {
@@ -14,7 +15,7 @@ export function Prompt() {
 
     setError(undefined)
     input.current.setText("")
-    void session.prompt(text, session.isStreaming ? { streamingBehavior: "steer" } : {}).catch((cause) => {
+    void session.prompt(text, session.isStreaming ? { streamingBehavior: "steer" } : {}).catch(cause => {
       setError(cause instanceof Error ? cause.message : String(cause))
     })
   }
@@ -37,8 +38,7 @@ export function Prompt() {
         borderColor="#6E7681"
         backgroundColor="#090E13"
         title={session.sessionManager.header.cwd}
-        bottomTitle={`${session.model.provider}/${session.model.id} · ${session.thinkingLevel}`}
-      >
+        bottomTitle={`${session.model.provider}/${session.model.id} · ${session.thinkingLevel}`}>
         <textarea
           id="prompt-input"
           ref={input}
@@ -51,7 +51,7 @@ export function Prompt() {
           placeholder="Ask anything"
           keyBindings={[
             { name: "return", action: "submit" },
-            { name: "return", shift: true, action: "newline" },
+            { name: "return", shift: true, action: "newline" }
           ]}
           onSubmit={submit}
         />

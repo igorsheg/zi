@@ -29,7 +29,7 @@ export function parseArgs(argv: string[]): Args {
     cwd,
     noSession,
     ...(model === undefined ? {} : { model }),
-    ...(sessionFile === undefined ? {} : { sessionFile }),
+    ...(sessionFile === undefined ? {} : { sessionFile })
   }
 }
 

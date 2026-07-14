@@ -6,6 +6,8 @@ export function getAgentDir(): string {
 }
 
 export function getSessionDir(cwd: string, agentDir = getAgentDir()): string {
-  const safe = `--${resolve(cwd).replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`
+  const safe = `--${resolve(cwd)
+    .replace(/^[/\\]/, "")
+    .replace(/[/\\:]/g, "-")}--`
   return join(agentDir, "sessions", safe)
 }

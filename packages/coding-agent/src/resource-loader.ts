@@ -56,7 +56,7 @@ export class DefaultResourceLoader implements ResourceLoader {
     return {
       appendSystemPrompt: this.#options.appendSystemPrompt ?? [],
       contextFiles: this.#contextFiles,
-      ...(this.#options.systemPrompt === undefined ? {} : { systemPrompt: this.#options.systemPrompt }),
+      ...(this.#options.systemPrompt === undefined ? {} : { systemPrompt: this.#options.systemPrompt })
     }
   }
 }
@@ -66,4 +66,5 @@ function findContextFile(directory: string): ContextFile | undefined {
     const path = join(directory, name)
     if (existsSync(path)) return { path, content: readFileSync(path, "utf8") }
   }
+  return undefined
 }

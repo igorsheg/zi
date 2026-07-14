@@ -2,17 +2,13 @@ import { expect, test } from "bun:test"
 import { mkdtemp, readFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { createAgentRuntime } from "@openzi/coding-agent"
-import {
-  createModels,
-  fauxAssistantMessage,
-  fauxProvider,
-  fauxText,
-  fauxToolCall,
-} from "@openzi/coding-agent/testing"
-import { type TextareaRenderable } from "@opentui/core"
+
+import { TextareaRenderable } from "@opentui/core"
 import { testRender } from "@opentui/react/test-utils"
+import { createAgentRuntime } from "@openzi/coding-agent"
+import { createModels, fauxAssistantMessage, fauxProvider, fauxText, fauxToolCall } from "@openzi/coding-agent/testing"
 import { act } from "react"
+
 import { App } from "../src/app.js"
 
 test("the OpenTUI prompt drives a complete tool turn", async () => {
@@ -22,21 +18,17 @@ test("the OpenTUI prompt drives a complete tool turn", async () => {
   models.setProvider(faux.provider)
   faux.setResponses([
     fauxAssistantMessage(fauxToolCall("write", { path: "answer.txt", content: "42\n" }, { id: "write-1" }), {
-      stopReason: "toolUse",
+      stopReason: "toolUse"
     }),
-    fauxAssistantMessage([fauxText("Wrote answer.txt with 42.")]),
+    fauxAssistantMessage([fauxText("Wrote answer.txt with 42.")])
   ])
-  const { session } = await createAgentRuntime({
-    cwd,
-    model: "faux/faux-1",
-    models,
-    sessionDir: join(cwd, "sessions"),
-  })
+  const { session } = await createAgentRuntime({ cwd, model: "faux/faux-1", models, sessionDir: join(cwd, "sessions") })
   const setup = await testRender(<App cwd={cwd} session={session} />, { width: 80, height: 24 })
 
   try {
     await setup.renderOnce()
-    const input = setup.renderer.root.findDescendantById("prompt-input") as TextareaRenderable
+    const input = setup.renderer.root.findDescendantById("prompt-input")
+    if (!(input instanceof TextareaRenderable)) throw new Error("Prompt textarea not found")
     await act(async () => {
       input.setText("Write 42 to answer.txt")
       input.submit()

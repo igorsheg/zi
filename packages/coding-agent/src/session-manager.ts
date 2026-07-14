@@ -1,5 +1,6 @@
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
 import { dirname, join } from "node:path"
+
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core"
 
 export interface SessionHeader {
@@ -38,13 +39,7 @@ export class SessionManager {
 
   constructor(options: SessionManagerOptions) {
     const id = options.sessionId ?? crypto.randomUUID()
-    this.header = {
-      type: "session",
-      version: 1,
-      id,
-      timestamp: new Date().toISOString(),
-      cwd: options.cwd,
-    }
+    this.header = { type: "session", version: 1, id, timestamp: new Date().toISOString(), cwd: options.cwd }
 
     if (options.persist === false) return
     mkdirSync(options.sessionDir, { recursive: true })
@@ -54,14 +49,16 @@ export class SessionManager {
 
   static open(file: string): SessionManager {
     const lines = readFileSync(file, "utf8").split("\n").filter(Boolean)
-    const header = JSON.parse(lines.shift() ?? "null") as SessionHeader
-    if (header?.type !== "session" || header.version !== 1 || typeof header.id !== "string" || typeof header.cwd !== "string") {
-      throw new Error(`Invalid session header: ${file}`)
-    }
+    const header = parseHeader(lines.shift() ?? "null", file)
 
-    const manager = new SessionManager({ cwd: header.cwd, sessionDir: dirname(file), sessionId: header.id, persist: false })
+    const manager = new SessionManager({
+      cwd: header.cwd,
+      sessionDir: dirname(file),
+      sessionId: header.id,
+      persist: false
+    })
     manager.#file = file
-    manager.#entries.push(...lines.map((line) => parseEntry(line, file)))
+    manager.#entries.push(...lines.map(line => parseEntry(line, file)))
     manager.#leafId = manager.#entries.at(-1)?.id ?? null
     Object.assign(manager.header, header)
     return manager
@@ -80,7 +77,7 @@ export class SessionManager {
   }
 
   messages(): AgentMessage[] {
-    return this.#entries.flatMap((entry) => (entry.type === "message" ? [entry.message] : []))
+    return this.#entries.flatMap(entry => (entry.type === "message" ? [entry.message] : []))
   }
 
   entries(): readonly SessionEntry[] {
@@ -100,7 +97,7 @@ export class SessionManager {
       ...entry,
       id: crypto.randomUUID(),
       parentId: this.#leafId,
-      timestamp: new Date().toISOString(),
+      timestamp: new Date().toISOString()
     } as SessionEntry
     this.#entries.push(next)
     this.#leafId = next.id
@@ -109,17 +106,138 @@ export class SessionManager {
   }
 }
 
+function parseHeader(line: string, file: string): SessionHeader {
+  const value: unknown = JSON.parse(line)
+  if (
+    !isRecord(value) ||
+    value.type !== "session" ||
+    value.version !== 1 ||
+    typeof value.id !== "string" ||
+    typeof value.timestamp !== "string" ||
+    typeof value.cwd !== "string"
+  ) {
+    throw new Error(`Invalid session header: ${file}`)
+  }
+  return { type: value.type, version: value.version, id: value.id, timestamp: value.timestamp, cwd: value.cwd }
+}
+
 function parseEntry(line: string, file: string): SessionEntry {
-  const entry = JSON.parse(line) as SessionEntry
-  const base =
-    entry &&
-    typeof entry.id === "string" &&
-    (entry.parentId === null || typeof entry.parentId === "string") &&
-    typeof entry.timestamp === "string"
-  const data =
-    (entry?.type === "message" && typeof entry.message?.role === "string") ||
-    (entry?.type === "model_change" && typeof entry.provider === "string" && typeof entry.modelId === "string") ||
-    (entry?.type === "thinking_level_change" && typeof entry.thinkingLevel === "string")
-  if (!base || !data) throw new Error(`Invalid session entry: ${file}`)
-  return entry
+  const value: unknown = JSON.parse(line)
+  if (
+    !isRecord(value) ||
+    typeof value.id !== "string" ||
+    (value.parentId !== null && typeof value.parentId !== "string") ||
+    typeof value.timestamp !== "string"
+  ) {
+    throw new Error(`Invalid session entry: ${file}`)
+  }
+
+  const base = { id: value.id, parentId: value.parentId, timestamp: value.timestamp }
+  if (value.type === "message" && isAgentMessage(value.message)) {
+    return { ...base, type: value.type, message: value.message }
+  }
+  if (value.type === "model_change" && typeof value.provider === "string" && typeof value.modelId === "string") {
+    return { ...base, type: value.type, provider: value.provider, modelId: value.modelId }
+  }
+  if (value.type === "thinking_level_change" && isThinkingLevel(value.thinkingLevel)) {
+    return { ...base, type: value.type, thinkingLevel: value.thinkingLevel }
+  }
+  throw new Error(`Invalid session entry: ${file}`)
+}
+
+function isAgentMessage(value: unknown): value is AgentMessage {
+  if (!isRecord(value) || typeof value.timestamp !== "number") return false
+  switch (value.role) {
+    case "user":
+      return typeof value.content === "string" || isContentArray(value.content)
+    case "assistant":
+      return (
+        isContentArray(value.content) &&
+        typeof value.api === "string" &&
+        typeof value.provider === "string" &&
+        typeof value.model === "string" &&
+        isUsage(value.usage) &&
+        isStopReason(value.stopReason)
+      )
+    case "toolResult":
+      return (
+        typeof value.toolCallId === "string" &&
+        typeof value.toolName === "string" &&
+        isContentArray(value.content) &&
+        typeof value.isError === "boolean"
+      )
+    case "bashExecution":
+      return (
+        typeof value.command === "string" &&
+        typeof value.output === "string" &&
+        (value.exitCode === undefined || typeof value.exitCode === "number") &&
+        typeof value.cancelled === "boolean" &&
+        typeof value.truncated === "boolean"
+      )
+    case "custom":
+      return (
+        typeof value.customType === "string" &&
+        (typeof value.content === "string" || isContentArray(value.content)) &&
+        typeof value.display === "boolean"
+      )
+    case "branchSummary":
+      return typeof value.summary === "string" && typeof value.fromId === "string"
+    case "compactionSummary":
+      return typeof value.summary === "string" && typeof value.tokensBefore === "number"
+    default:
+      return false
+  }
+}
+
+function isContentArray(value: unknown): boolean {
+  return Array.isArray(value) && value.every(isContent)
+}
+
+function isContent(value: unknown): boolean {
+  if (!isRecord(value)) return false
+  if (value.type === "text") return typeof value.text === "string"
+  if (value.type === "thinking") return typeof value.thinking === "string"
+  if (value.type === "image") return typeof value.data === "string" && typeof value.mimeType === "string"
+  return (
+    value.type === "toolCall" &&
+    typeof value.id === "string" &&
+    typeof value.name === "string" &&
+    isRecord(value.arguments)
+  )
+}
+
+function isUsage(value: unknown): boolean {
+  if (!isRecord(value) || !isRecord(value.cost)) return false
+  return [
+    value.input,
+    value.output,
+    value.cacheRead,
+    value.cacheWrite,
+    value.totalTokens,
+    value.cost.input,
+    value.cost.output,
+    value.cost.cacheRead,
+    value.cost.cacheWrite,
+    value.cost.total
+  ].every(item => typeof item === "number")
+}
+
+function isStopReason(value: unknown): boolean {
+  return value === "stop" || value === "length" || value === "toolUse" || value === "error" || value === "aborted"
+}
+
+function isThinkingLevel(value: unknown): value is ThinkingLevel {
+  return (
+    value === "off" ||
+    value === "minimal" ||
+    value === "low" ||
+    value === "medium" ||
+    value === "high" ||
+    value === "xhigh" ||
+    value === "max"
+  )
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
 }

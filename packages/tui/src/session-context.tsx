@@ -40,23 +40,14 @@ export function useSession(): AgentSession {
 function reduce(state: ViewState, event: AgentSessionEvent): ViewState {
   const tools = new Map(state.tools)
   if (event.type === "tool_execution_start") {
-    tools.set(event.toolCallId, {
-      id: event.toolCallId,
-      name: event.toolName,
-      args: event.args,
-      status: "running",
-    })
+    tools.set(event.toolCallId, { id: event.toolCallId, name: event.toolName, args: event.args, status: "running" })
   } else if (event.type === "tool_execution_update") {
     const tool = tools.get(event.toolCallId)
     if (tool) tools.set(event.toolCallId, { ...tool, result: event.partialResult })
   } else if (event.type === "tool_execution_end") {
     const tool = tools.get(event.toolCallId)
     if (tool) {
-      tools.set(event.toolCallId, {
-        ...tool,
-        result: event.result,
-        status: event.isError ? "failed" : "done",
-      })
+      tools.set(event.toolCallId, { ...tool, result: event.result, status: event.isError ? "failed" : "done" })
     }
   } else if (event.type === "message_end" && event.message.role === "toolResult") {
     tools.delete(event.message.toolCallId)

@@ -1,7 +1,9 @@
 import type { PromptResources } from "./resource-loader.js"
 
 export function buildSystemPrompt(cwd: string, resources: PromptResources): string {
-  const prompt = resources.systemPrompt ?? `You are an expert coding assistant operating inside OpenZi.
+  const prompt =
+    resources.systemPrompt ??
+    `You are an expert coding assistant operating inside OpenZi.
 
 Available tools:
 - read: Read file contents
@@ -20,8 +22,8 @@ Guidelines:
   if (resources.contextFiles.length > 0) {
     sections.push(
       `<project_context>\n${resources.contextFiles
-        .map((file) => `<project_instructions path="${file.path}">\n${file.content}\n</project_instructions>`)
-        .join("\n\n")}\n</project_context>`,
+        .map(file => `<project_instructions path="${file.path}">\n${file.content}\n</project_instructions>`)
+        .join("\n\n")}\n</project_context>`
     )
   }
   sections.push(`Current date: ${new Date().toISOString().slice(0, 10)}\nCurrent working directory: ${cwd}`)

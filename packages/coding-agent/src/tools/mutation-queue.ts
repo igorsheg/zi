@@ -9,14 +9,14 @@ export async function withFileMutation<T>(path: string, mutate: () => Promise<T>
     const key = await realpath(path).catch(() => resolve(path))
     const current = queues.get(key) ?? Promise.resolve()
     let release!: () => void
-    const next = new Promise<void>((done) => (release = done))
+    const next = new Promise<void>(done => (release = done))
     const tail = current.then(() => next)
     queues.set(key, tail)
     return { key, current, tail, release }
   })
   registration = registered.then(
     () => undefined,
-    () => undefined,
+    () => undefined
   )
 
   const item = await registered

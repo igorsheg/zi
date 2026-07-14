@@ -10,7 +10,7 @@ export function ToolExecutionView({ tool }: { tool: ToolExecution }) {
       <text fg={color}>
         {icon} {tool.name} {detail(tool.args)}
       </text>
-      {output ? <text fg="#7D8590">  {output}</text> : null}
+      {output ? <text fg="#7D8590"> {output}</text> : null}
     </box>
   )
 }
@@ -19,17 +19,27 @@ function resultText(result: unknown): string {
   if (!result || typeof result !== "object" || !("content" in result) || !Array.isArray(result.content)) return ""
   return result.content
     .map((part: unknown) =>
-      part && typeof part === "object" && "type" in part && part.type === "text" && "text" in part
-        ? String(part.text)
-        : "",
+      part &&
+      typeof part === "object" &&
+      "type" in part &&
+      part.type === "text" &&
+      "text" in part &&
+      typeof part.text === "string"
+        ? part.text
+        : ""
     )
     .filter(Boolean)
     .join("\n")
 }
 
 function detail(args: unknown): string {
-  if (!args || typeof args !== "object") return ""
-  const values = args as Record<string, unknown>
-  const value = values.path ?? values.command
-  return value === undefined ? "" : String(value)
+  if (!isRecord(args)) return ""
+  const value = args.path ?? args.command
+  if (typeof value === "string") return value
+  if (typeof value === "number" || typeof value === "boolean") return String(value)
+  return ""
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
 }

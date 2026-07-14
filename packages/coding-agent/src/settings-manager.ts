@@ -10,7 +10,7 @@ export interface AgentSettings {
 const defaults: AgentSettings = {
   thinkingLevel: "medium",
   steeringMode: "one-at-a-time",
-  followUpMode: "one-at-a-time",
+  followUpMode: "one-at-a-time"
 }
 
 export class SettingsManager {

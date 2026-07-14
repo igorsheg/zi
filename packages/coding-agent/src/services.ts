@@ -1,5 +1,6 @@
-import { Agent, type AgentTool, type ThinkingLevel } from "@earendil-works/pi-agent-core"
+import { Agent, type AgentTool } from "@earendil-works/pi-agent-core"
 import { clampThinkingLevel, type Api, type Model } from "@earendil-works/pi-ai"
+
 import { AgentSession } from "./agent-session.js"
 import type { ModelRegistry } from "./model-registry.js"
 import type { ResourceLoader } from "./resource-loader.js"
@@ -25,7 +26,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions): Pr
   const { services, sessionManager, model } = options
   await services.resourceLoader.reload()
   const settings = services.settingsManager.get()
-  const thinkingLevel = clampThinkingLevel(model, settings.thinkingLevel) as ThinkingLevel
+  const thinkingLevel = clampThinkingLevel(model, settings.thinkingLevel)
   const existing = sessionManager.entries().length > 0
   services.settingsManager.update({ thinkingLevel })
 
@@ -35,14 +36,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions): Pr
       model,
       thinkingLevel,
       tools: [...options.tools],
-      messages: sessionManager.messages(),
+      messages: sessionManager.messages()
     },
     sessionId: sessionManager.sessionId,
     streamFn: (requestedModel, context, streamOptions) =>
       services.modelRegistry.models.streamSimple(requestedModel, context, streamOptions),
     steeringMode: settings.steeringMode,
     followUpMode: settings.followUpMode,
-    toolExecution: "parallel",
+    toolExecution: "parallel"
   })
 
   if (!existing) {

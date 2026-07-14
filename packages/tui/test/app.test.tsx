@@ -1,6 +1,8 @@
 import { expect, test } from "bun:test"
+
 import { testRender } from "@opentui/react/test-utils"
 import { act } from "react"
+
 import { App } from "../src/app.js"
 
 test("empty shell protects the prompt area", async () => {

@@ -1,9 +1,11 @@
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process"
 import { createWriteStream, mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process"
+
 import type { AgentTool } from "@earendil-works/pi-agent-core"
 import { Type } from "@earendil-works/pi-ai"
+
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncateTail, type TruncationResult } from "./truncate.js"
 
 const DEFAULT_TIMEOUT_SECONDS = 120
@@ -12,7 +14,7 @@ const UPDATE_INTERVAL_MS = 100
 
 const parameters = Type.Object({
   command: Type.String({ description: "Bash command to execute" }),
-  timeout: Type.Optional(Type.Number({ exclusiveMinimum: 0, description: "Timeout in seconds" })),
+  timeout: Type.Optional(Type.Number({ exclusiveMinimum: 0, description: "Timeout in seconds" }))
 })
 
 export interface BashToolDetails {
@@ -35,7 +37,7 @@ export function createBashTool(cwd: string): AgentTool<typeof parameters, BashTo
       }
 
       const capture = new OutputCapture()
-      const child = start(input.command, cwd)
+      const child = spawnShell(input.command, cwd)
       let lastUpdate = 0
       let timer: ReturnType<typeof setTimeout> | undefined
 
@@ -70,10 +72,12 @@ export function createBashTool(cwd: string): AgentTool<typeof parameters, BashTo
 
       const result = capture.result(true)
       if (outcome === "aborted") throw new Error(withStatus(result.content[0]?.text ?? "", "Command aborted"))
-      if (outcome === "timeout") throw new Error(withStatus(result.content[0]?.text ?? "", `Command timed out after ${timeout} seconds`))
-      if (outcome !== 0) throw new Error(withStatus(result.content[0]?.text ?? "", `Command exited with code ${outcome}`))
+      if (outcome === "timeout")
+        throw new Error(withStatus(result.content[0]?.text ?? "", `Command timed out after ${timeout} seconds`))
+      if (outcome !== 0)
+        throw new Error(withStatus(result.content[0]?.text ?? "", `Command exited with code ${outcome}`))
       return result
-    },
+    }
   }
 }
 
@@ -88,7 +92,7 @@ class OutputCapture {
   #error: Error | undefined
 
   constructor() {
-    this.#file.on("error", (error) => (this.#error = error))
+    this.#file.on("error", error => (this.#error = error))
   }
 
   pipe(source: NodeJS.ReadableStream, changed: () => void): void {
@@ -98,9 +102,9 @@ class OutputCapture {
       this.#endsWithNewline = chunk.at(-1) === 10
       this.#tail = Buffer.concat([this.#tail, chunk])
       if (this.#tail.length > DEFAULT_MAX_BYTES * 2) {
-        let start = this.#tail.length - DEFAULT_MAX_BYTES * 2
-        while (start < this.#tail.length && (this.#tail[start]! & 0xc0) === 0x80) start++
-        this.#tail = this.#tail.subarray(start)
+        let tailStart = this.#tail.length - DEFAULT_MAX_BYTES * 2
+        while (tailStart < this.#tail.length && (this.#tail[tailStart]! & 0xc0) === 0x80) tailStart++
+        this.#tail = this.#tail.subarray(tailStart)
       }
       if (!this.#file.write(chunk)) {
         source.pause()
@@ -117,7 +121,7 @@ class OutputCapture {
     const details = truncated
       ? {
           truncation: { ...truncation, truncated: true, totalBytes: this.#bytes, totalLines },
-          fullOutputPath: this.#path,
+          fullOutputPath: this.#path
         }
       : undefined
     let text = truncation.content || "(no output)"
@@ -128,12 +132,18 @@ class OutputCapture {
 
   finish(): Promise<void> {
     return new Promise((resolve, reject) => {
-      this.#file.end(() => (this.#error ? reject(this.#error) : resolve()))
+      this.#file.end(() => {
+        if (this.#error) {
+          reject(this.#error)
+          return
+        }
+        resolve()
+      })
     })
   }
 }
 
-function start(command: string, cwd: string): ChildProcessWithoutNullStreams {
+function spawnShell(command: string, cwd: string): ChildProcessWithoutNullStreams {
   if (process.platform === "win32") {
     return spawn(process.env.ComSpec ?? "cmd.exe", ["/d", "/s", "/c", command], { cwd, windowsHide: true })
   }
@@ -157,11 +167,11 @@ function wait(child: ChildProcessWithoutNullStreams, signal: AbortSignal | undef
       signal?.removeEventListener("abort", abort)
     }
     signal?.addEventListener("abort", abort, { once: true })
-    child.once("error", (error) => {
+    child.once("error", error => {
       cleanup()
       reject(error)
     })
-    child.once("close", (code) => {
+    child.once("close", code => {
       cleanup()
       resolve(reason ?? code ?? 1)
     })

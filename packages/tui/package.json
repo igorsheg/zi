@@ -7,13 +7,19 @@
     ".": "./src/index.ts"
   },
   "scripts": {
-    "typecheck": "tsc --noEmit",
-    "test": "bun test"
+    "check": "bun run format:check && bun run lint && bun run typecheck && bun run test",
+    "fix": "bun run lint:fix && bun run format",
+    "format": "oxfmt --write .",
+    "format:check": "oxfmt --check .",
+    "lint": "oxlint .",
+    "lint:fix": "oxlint --fix .",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@openzi/coding-agent": "workspace:*",
     "@opentui/core": "catalog:",
     "@opentui/react": "catalog:",
+    "@openzi/coding-agent": "workspace:*",
     "react": "catalog:"
   },
   "devDependencies": {

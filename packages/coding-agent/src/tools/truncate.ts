@@ -16,7 +16,7 @@ export interface TruncationResult {
 export function truncateHead(
   content: string,
   maxLines = DEFAULT_MAX_LINES,
-  maxBytes = DEFAULT_MAX_BYTES,
+  maxBytes = DEFAULT_MAX_BYTES
 ): TruncationResult {
   const lines = content.split("\n")
   const totalBytes = Buffer.byteLength(content)
@@ -36,16 +36,13 @@ export function truncateHead(
   }
 
   const text = output.join("\n")
-  return {
-    ...result(text, true, truncatedBy, lines.length, totalBytes),
-    firstLineExceedsLimit: output.length === 0,
-  }
+  return { ...result(text, true, truncatedBy, lines.length, totalBytes), firstLineExceedsLimit: output.length === 0 }
 }
 
 export function truncateTail(
   content: string,
   maxLines = DEFAULT_MAX_LINES,
-  maxBytes = DEFAULT_MAX_BYTES,
+  maxBytes = DEFAULT_MAX_BYTES
 ): TruncationResult {
   const lines = content.split("\n")
   const totalBytes = Buffer.byteLength(content)
@@ -70,10 +67,7 @@ export function truncateTail(
     bytes += lineBytes
   }
 
-  return {
-    ...result(output.join("\n"), true, truncatedBy, lines.length, totalBytes),
-    lastLinePartial,
-  }
+  return { ...result(output.join("\n"), true, truncatedBy, lines.length, totalBytes), lastLinePartial }
 }
 
 function result(
@@ -81,7 +75,7 @@ function result(
   truncated: boolean,
   truncatedBy: TruncationResult["truncatedBy"],
   totalLines: number,
-  totalBytes: number,
+  totalBytes: number
 ): TruncationResult {
   return {
     content,
@@ -92,7 +86,7 @@ function result(
     outputLines: content.length === 0 ? 0 : content.split("\n").length,
     outputBytes: Buffer.byteLength(content),
     firstLineExceedsLimit: false,
-    lastLinePartial: false,
+    lastLinePartial: false
   }
 }
 

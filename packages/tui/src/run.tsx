@@ -1,6 +1,7 @@
-import type { AgentSession } from "@openzi/coding-agent"
 import { CliRenderEvents, createCliRenderer, type KeyEvent } from "@opentui/core"
 import { createRoot } from "@opentui/react"
+import type { AgentSession } from "@openzi/coding-agent"
+
 import { App } from "./app.js"
 
 export interface RunTuiOptions {
@@ -26,7 +27,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         if (!renderer.isDestroyed) renderer.destroy()
       }
     })()
-    void closing.catch((error) => process.stderr.write(`${String(error)}\n`))
+    void closing.catch(error => process.stderr.write(`${String(error)}\n`))
   }
   const onKey = (key: KeyEvent) => {
     if (key.ctrl && key.name === "c") close()
@@ -38,7 +39,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
   renderer.setTerminalTitle("openzi")
   root.render(<App {...options} />)
 
-  await new Promise<void>((resolve) => renderer.once(CliRenderEvents.DESTROY, resolve))
+  await new Promise<void>(resolve => renderer.once(CliRenderEvents.DESTROY, resolve))
   renderer.keyInput.off("keypress", onKey)
   for (const signal of signals) process.off(signal, onSignal)
 
@@ -56,6 +57,6 @@ function settle(operation: Promise<void>, timeoutMs: number): Promise<void> {
     operation,
     new Promise<void>((_, reject) => {
       timeout = setTimeout(() => reject(new Error("Session shutdown timed out")), timeoutMs)
-    }),
+    })
   ]).finally(() => clearTimeout(timeout))
 }

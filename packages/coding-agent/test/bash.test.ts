@@ -3,13 +3,16 @@ import { existsSync, rmSync } from "node:fs"
 import { mkdtemp } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
+
 import { createBashTool } from "../src/tools/bash.js"
 import { DEFAULT_MAX_BYTES } from "../src/tools/truncate.js"
 
 test("bash bounds model output and preserves the full stream", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "openzi-bash-"))
   const tool = createBashTool(cwd)
-  const result = await tool.execute("bash-1", { command: `node -e "process.stdout.write('x'.repeat(${DEFAULT_MAX_BYTES + 4096}))"` })
+  const result = await tool.execute("bash-1", {
+    command: `node -e "process.stdout.write('x'.repeat(${DEFAULT_MAX_BYTES + 4096}))"`
+  })
 
   const output = result.content[0]
   expect(output?.type).toBe("text")

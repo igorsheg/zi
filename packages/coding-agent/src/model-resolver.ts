@@ -1,11 +1,12 @@
 import type { Api, Model } from "@earendil-works/pi-ai"
+
 import type { ModelRegistry } from "./model-registry.js"
 
 const preferred = [
   ["anthropic", "claude-opus-4-8"],
   ["openai", "gpt-5.5"],
   ["google", "gemini-3.1-pro-preview"],
-  ["openrouter", "moonshotai/kimi-k2.6"],
+  ["openrouter", "moonshotai/kimi-k2.6"]
 ] as const
 
 export class NoModelAvailableError extends Error {}
@@ -20,16 +21,18 @@ export async function resolveInitialModel(registry: ModelRegistry, reference?: s
 
   for (const [provider, id] of preferred) {
     const model = registry.get(provider, id)
-    if (model && (await registry.isConfigured(model))) return model
+    // Provider priority is ordered and credential lookup stops at the first configured model.
+    if (model && (await registry.isConfigured(model))) return model // oxlint-disable-line no-await-in-loop
   }
   const checkedProviders = new Set<string>()
   for (const model of registry.list()) {
     if (checkedProviders.has(model.provider)) continue
     checkedProviders.add(model.provider)
-    if (await registry.isConfigured(model)) return model
+    // Preserve registry order while avoiding redundant credential lookup per provider.
+    if (await registry.isConfigured(model)) return model // oxlint-disable-line no-await-in-loop
   }
 
   throw new NoModelAvailableError(
-    "No configured model found. Set ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, or OPENROUTER_API_KEY, then pass --model provider/model-id if needed.",
+    "No configured model found. Set ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, or OPENROUTER_API_KEY, then pass --model provider/model-id if needed."
   )
 }

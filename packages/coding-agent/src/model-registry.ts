@@ -10,7 +10,7 @@ export class ModelRegistry {
   find(reference: string): Model<Api> | undefined {
     const slash = reference.indexOf("/")
     if (slash > 0) return this.get(reference.slice(0, slash), reference.slice(slash + 1))
-    const matches = this.list().filter((model) => model.id === reference)
+    const matches = this.list().filter(model => model.id === reference)
     return matches.length === 1 ? matches[0] : undefined
   }
 

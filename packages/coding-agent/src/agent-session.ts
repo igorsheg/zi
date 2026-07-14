@@ -4,9 +4,10 @@ import {
   type AgentMessage,
   type AgentState,
   type AgentTool,
-  type ThinkingLevel,
+  type ThinkingLevel
 } from "@earendil-works/pi-agent-core"
 import { cleanupSessionResources, type Api, type ImageContent, type Model } from "@earendil-works/pi-ai"
+
 import type { SessionEntry, SessionManager } from "./session-manager.js"
 import type { SettingsManager } from "./settings-manager.js"
 
@@ -45,7 +46,7 @@ export class AgentSession {
     this.agent = config.agent
     this.sessionManager = config.sessionManager
     this.settingsManager = config.settingsManager
-    this.#unsubscribeAgent = this.agent.subscribe((event) => this.#handleAgentEvent(event))
+    this.#unsubscribeAgent = this.agent.subscribe(event => this.#handleAgentEvent(event))
   }
 
   get state(): AgentState {
@@ -154,7 +155,7 @@ export class AgentSession {
   async #handleAgentEvent(event: AgentEvent): Promise<void> {
     if (event.type === "message_end") {
       const id = this.sessionManager.appendMessage(event.message)
-      const entry = this.sessionManager.entries().find((candidate) => candidate.id === id)
+      const entry = this.sessionManager.entries().find(candidate => candidate.id === id)
       if (entry) this.#emit({ type: "entry_appended", entry })
     }
     if (event.type === "message_start" && event.message.role === "user") this.#removeDelivered(event.message)
@@ -189,18 +190,14 @@ export class AgentSession {
 }
 
 function userMessage(text: string, images: ImageContent[] = []): AgentMessage {
-  return {
-    role: "user",
-    content: [{ type: "text", text }, ...images],
-    timestamp: Date.now(),
-  }
+  return { role: "user", content: [{ type: "text", text }, ...images], timestamp: Date.now() }
 }
 
 function messageText(message: AgentMessage): string {
   if (message.role !== "user") return ""
   if (typeof message.content === "string") return message.content
   return message.content
-    .filter((part) => part.type === "text")
-    .map((part) => part.text)
+    .filter(part => part.type === "text")
+    .map(part => part.text)
     .join("\n")
 }

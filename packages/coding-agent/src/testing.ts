@@ -5,5 +5,5 @@ export {
   fauxText,
   fauxThinking,
   fauxToolCall,
-  type FauxResponseStep,
+  type FauxResponseStep
 } from "@earendil-works/pi-ai"

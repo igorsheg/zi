@@ -2,6 +2,7 @@
 
 import { createAgentRuntime, NoModelAvailableError } from "@openzi/coding-agent"
 import { runTui } from "@openzi/tui"
+
 import { parseArgs } from "./args.js"
 
 try {
@@ -10,7 +11,7 @@ try {
     cwd: args.cwd,
     persist: !args.noSession,
     ...(args.model === undefined ? {} : { model: args.model }),
-    ...(args.sessionFile === undefined ? {} : { sessionFile: args.sessionFile }),
+    ...(args.sessionFile === undefined ? {} : { sessionFile: args.sessionFile })
   })
   await runTui({ cwd: session.sessionManager.header.cwd, session })
 } catch (error) {
