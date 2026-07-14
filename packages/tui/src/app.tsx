@@ -3,28 +3,32 @@ import type { AgentSession } from "@openzi/coding-agent"
 
 import { SessionProvider } from "./session-context.js"
 import { SessionScreen } from "./session-screen.js"
+import { ThemeProvider, useTheme, ziTheme } from "./theme.js"
 
 export interface AppProps {
-  session?: AgentSession
-  cwd: string
+  session: AgentSession
+  onExit: () => void
 }
 
-export function App(props: AppProps) {
-  const dimensions = useTerminalDimensions()
+export function App({ session, onExit }: AppProps) {
+  return (
+    <ThemeProvider theme={ziTheme}>
+      <AppSurface>
+        <SessionProvider key={session.sessionId} session={session}>
+          <SessionScreen onExit={onExit} />
+        </SessionProvider>
+      </AppSurface>
+    </ThemeProvider>
+  )
+}
+
+function AppSurface({ children }: { children: React.ReactNode }) {
+  const { width, height } = useTerminalDimensions()
+  const theme = useTheme()
 
   return (
-    <box width={dimensions.width} height={dimensions.height} flexDirection="column" backgroundColor="#000000">
-      {props.session ? (
-        <SessionProvider key={props.session.sessionId} session={props.session}>
-          <SessionScreen />
-        </SessionProvider>
-      ) : (
-        <box flexGrow={1} justifyContent="flex-end" flexDirection="column">
-          <box border borderStyle="rounded" borderColor="#6E7681" backgroundColor="#090E13" title={props.cwd}>
-            <text fg="#7D8590">No model configured. The coding-agent bootstrap is the next vertical slice.</text>
-          </box>
-        </box>
-      )}
+    <box width={width} height={height} flexDirection="column" backgroundColor={theme.surface.app}>
+      {children}
     </box>
   )
 }

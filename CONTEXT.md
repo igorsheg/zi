@@ -19,3 +19,11 @@ _Avoid_: Globals, app context
 **Coding-agent parity**:
 Behavioral and architectural compatibility with `pi-coding-agent`, verified capability by capability while keeping the recreated layer owned by OpenZi.
 _Avoid_: Source identity, dependency parity
+
+**Interactive-mode parity**:
+Behavioral compatibility with the interactive mode inside `pi-coding-agent`, including editor actions, keybindings, queues, commands, selectors, session flows, and visible lifecycle semantics. It does not include `pi-tui`, Pi's screen architecture, or Pi's visual design.
+_Avoid_: Pi TUI parity, `pi-tui` parity
+
+**Zi visual target**:
+The default palette, glyphs, spacing, and overall terminal appearance. Zi does not define OpenZi interaction behavior or frontend architecture.
+_Avoid_: Zi behavior parity, Zi architecture parity

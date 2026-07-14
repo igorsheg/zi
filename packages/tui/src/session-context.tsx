@@ -1,7 +1,7 @@
 import type { AgentSession, AgentSessionEvent } from "@openzi/coding-agent"
-import { createContext, type ReactNode, use, useEffect, useMemo, useReducer } from "react"
+import { createContext, type ReactNode, use, useLayoutEffect, useMemo, useReducer } from "react"
 
-export interface ToolExecution {
+export interface ActiveTool {
   id: string
   name: string
   args: unknown
@@ -11,20 +11,30 @@ export interface ToolExecution {
 
 interface SessionView {
   session: AgentSession
-  tools: readonly ToolExecution[]
+  activeTools: readonly ActiveTool[]
 }
 
-interface ViewState {
-  tools: Map<string, ToolExecution>
+interface SessionContextValue extends SessionView {
+  renderRevision: number
 }
 
-const SessionContext = createContext<SessionView | undefined>(undefined)
+interface SessionRenderState {
+  revision: number
+  tools: Map<string, ActiveTool>
+}
 
-export function SessionProvider(props: { session: AgentSession; children: ReactNode }) {
-  const [state, dispatch] = useReducer(reduce, { tools: new Map() })
-  useEffect(() => props.session.subscribe(dispatch), [props.session])
-  const value = useMemo(() => ({ session: props.session, tools: [...state.tools.values()] }), [props.session, state])
-  return <SessionContext value={value}>{props.children}</SessionContext>
+const SessionContext = createContext<SessionContextValue | undefined>(undefined)
+const maxActiveTools = 64
+
+export function SessionProvider({ session, children }: { session: AgentSession; children: ReactNode }) {
+  const [state, dispatch] = useReducer(reduceSessionEvent, { revision: 0, tools: new Map() })
+  useLayoutEffect(() => session.subscribe(dispatch), [session])
+
+  const value = useMemo(
+    () => ({ session, activeTools: [...state.tools.values()], renderRevision: state.revision }),
+    [session, state]
+  )
+  return <SessionContext value={value}>{children}</SessionContext>
 }
 
 export function useSessionView(): SessionView {
@@ -37,20 +47,36 @@ export function useSession(): AgentSession {
   return useSessionView().session
 }
 
-function reduce(state: ViewState, event: AgentSessionEvent): ViewState {
-  const tools = new Map(state.tools)
+function reduceSessionEvent(state: SessionRenderState, event: AgentSessionEvent): SessionRenderState {
+  let tools = state.tools
+
   if (event.type === "tool_execution_start") {
+    tools = new Map(tools)
+    if (!tools.has(event.toolCallId) && tools.size === maxActiveTools) {
+      const oldest = tools.keys().next().value
+      if (oldest !== undefined) tools.delete(oldest)
+    }
     tools.set(event.toolCallId, { id: event.toolCallId, name: event.toolName, args: event.args, status: "running" })
   } else if (event.type === "tool_execution_update") {
     const tool = tools.get(event.toolCallId)
-    if (tool) tools.set(event.toolCallId, { ...tool, result: event.partialResult })
+    if (tool) {
+      tools = new Map(tools)
+      tools.set(event.toolCallId, { ...tool, result: event.partialResult })
+    }
   } else if (event.type === "tool_execution_end") {
     const tool = tools.get(event.toolCallId)
     if (tool) {
+      tools = new Map(tools)
       tools.set(event.toolCallId, { ...tool, result: event.result, status: event.isError ? "failed" : "done" })
     }
-  } else if (event.type === "message_end" && event.message.role === "toolResult") {
+  } else if (
+    event.type === "message_end" &&
+    event.message.role === "toolResult" &&
+    tools.has(event.message.toolCallId)
+  ) {
+    tools = new Map(tools)
     tools.delete(event.message.toolCallId)
   }
-  return { tools }
+
+  return { revision: state.revision + 1, tools }
 }

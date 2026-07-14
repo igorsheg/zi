@@ -2,10 +2,10 @@
 
 ## Product references
 
-- `pi-coding-agent` is the coding-agent behavior **and architecture** reference.
+- `pi-coding-agent` is the coding-agent behavior **and architecture** reference, and its interactive mode is the TUI product-behavior reference.
 - `pi-ai` and `pi-agent-core` are dependencies; `pi-coding-agent` and `pi-tui` are not.
-- OpenTUI React is the frontend architecture.
-- Zi is the visual and interaction reference, not a source architecture.
+- OpenTUI React is the frontend architecture; Pi's TUI implementation is not.
+- Zi is the visual styling reference only.
 - OpenCode is a source of proven OpenTUI application patterns, not a template to copy wholesale.
 
 ## Code quality

@@ -1,18 +1,30 @@
-import { CliRenderEvents, createCliRenderer, type KeyEvent } from "@opentui/core"
+import { CliRenderEvents, createCliRenderer } from "@opentui/core"
 import { createRoot } from "@opentui/react"
 import type { AgentSession } from "@openzi/coding-agent"
 
 import { App } from "./app.js"
+import { ziTheme } from "./theme.js"
 
 export interface RunTuiOptions {
-  cwd: string
-  session?: AgentSession
+  session: AgentSession
 }
 
 const shutdownTimeoutMs = 5_000
 
-export async function runTui(options: RunTuiOptions): Promise<void> {
-  const renderer = await createCliRenderer({ targetFps: 60, exitOnCtrlC: false, exitSignals: [], autoFocus: false })
+export async function runTui({ session }: RunTuiOptions): Promise<void> {
+  const renderer = await createCliRenderer({
+    targetFps: 60,
+    gatherStats: false,
+    exitOnCtrlC: false,
+    exitSignals: [],
+    autoFocus: false,
+    screenMode: "alternate-screen",
+    externalOutputMode: "passthrough",
+    useKittyKeyboard: {},
+    useMouse: true,
+    openConsoleOnError: false,
+    backgroundColor: ziTheme.surface.app
+  })
   const root = createRoot(renderer)
   const signals: NodeJS.Signals[] = ["SIGHUP", "SIGINT", "SIGTERM"]
   let closing: Promise<void> | undefined
@@ -20,43 +32,38 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
   const close = () => {
     closing ??= (async () => {
       try {
-        if (options.session) await settle(options.session.abort(), shutdownTimeoutMs)
+        await settle(session.abort(), shutdownTimeoutMs)
       } finally {
-        options.session?.dispose()
+        session.dispose()
         root.unmount()
+        renderer.setTerminalTitle("")
         if (!renderer.isDestroyed) renderer.destroy()
       }
     })()
-    void closing.catch(error => process.stderr.write(`${String(error)}\n`))
+    return closing
   }
-  const onKey = (key: KeyEvent) => {
-    if (key.ctrl && key.name === "c") close()
-  }
-  const onSignal = () => close()
+  const requestClose = () => void close().catch(() => {})
+  const destroyed = new Promise<void>(resolve => renderer.once(CliRenderEvents.DESTROY, resolve))
+  for (const signal of signals) process.on(signal, requestClose)
 
-  renderer.keyInput.on("keypress", onKey)
-  for (const signal of signals) process.on(signal, onSignal)
-  renderer.setTerminalTitle("openzi")
-  root.render(<App {...options} />)
-
-  await new Promise<void>(resolve => renderer.once(CliRenderEvents.DESTROY, resolve))
-  renderer.keyInput.off("keypress", onKey)
-  for (const signal of signals) process.off(signal, onSignal)
-
-  if (closing) {
-    await closing.catch(() => {})
-  } else if (options.session) {
-    await settle(options.session.abort(), shutdownTimeoutMs)
-    options.session.dispose()
+  try {
+    renderer.setTerminalTitle("openzi")
+    root.render(<App session={session} onExit={requestClose} />)
+    await destroyed
+  } finally {
+    for (const signal of signals) process.off(signal, requestClose)
+    await close()
   }
 }
 
 function settle(operation: Promise<void>, timeoutMs: number): Promise<void> {
-  let timeout: ReturnType<typeof setTimeout>
+  let timeout: ReturnType<typeof setTimeout> | undefined
   return Promise.race([
     operation,
     new Promise<void>((_, reject) => {
       timeout = setTimeout(() => reject(new Error("Session shutdown timed out")), timeoutMs)
     })
-  ]).finally(() => clearTimeout(timeout))
+  ]).finally(() => {
+    if (timeout) clearTimeout(timeout)
+  })
 }

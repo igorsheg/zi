@@ -13,7 +13,7 @@ try {
     ...(args.model === undefined ? {} : { model: args.model }),
     ...(args.sessionFile === undefined ? {} : { sessionFile: args.sessionFile })
   })
-  await runTui({ cwd: session.sessionManager.header.cwd, session })
+  await runTui({ session })
 } catch (error) {
   const message = error instanceof Error ? error.message : String(error)
   process.stderr.write(`${message}\n`)

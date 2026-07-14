@@ -1,6 +1,6 @@
 # Pi coding-agent parity roadmap
 
-The target is behavioral and coding-agent architecture parity, without source identity. Each item is complete only with an OpenZi-owned acceptance test.
+The target is coding-agent architecture parity and observable product-behavior parity, including Pi's interactive mode, without source identity. Each item is complete only with an OpenZi-owned acceptance test.
 
 ## P0 — one dependable turn
 
@@ -62,13 +62,14 @@ For each capability:
 1. locate the behavior and tests in the pinned `pi-coding-agent` source;
 2. write a black-box OpenZi characterization test;
 3. port the minimum policy behind the owning OpenZi interface;
-4. adapt presentation to the Zi/OpenTUI contract;
+4. render the behavior through OpenTUI using OpenZi's visual contract;
 5. record intentional deviations in this document;
 6. keep the upstream commit/path near the fixture when provenance matters.
 
 ## Deliberate non-parity
 
-- Pi's TUI implementation and `@earendil-works/pi-tui` are never a target.
+- The behavior of `pi-coding-agent` interactive mode is a target; Pi's screen architecture and `@earendil-works/pi-tui` are not.
 - Pi's coding-agent owner boundaries are the reference; incidental helpers and framework-specific mechanics are not copied blindly.
+- Zi is not a behavior reference. It supplies visual styling only.
 - Unbounded queues, output, subprocesses, logs, or retries are rejected even if an upstream path currently permits them.
 - A Pi extension API is not promised until OpenZi has a stable owner boundary to expose.

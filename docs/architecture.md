@@ -2,19 +2,20 @@
 
 ## Fixed references
 
-| Source                      | Role                                                 |
-| --------------------------- | ---------------------------------------------------- |
-| `pi-ai` and `pi-agent-core` | Runtime dependencies                                 |
-| `pi-coding-agent`           | Coding-agent behavior and architecture reference     |
-| OpenTUI React               | Frontend architecture and terminal implementation    |
-| OpenCode                    | Proven OpenTUI application patterns worth evaluating |
-| Zi                          | Visual and interaction acceptance reference          |
+| Source                      | Role                                                     |
+| --------------------------- | -------------------------------------------------------- |
+| `pi-ai` and `pi-agent-core` | Runtime dependencies                                     |
+| `pi-coding-agent`           | Coding-agent architecture and product-behavior reference |
+| Pi interactive mode         | TUI behavior reference                                   |
+| OpenTUI React               | Frontend architecture and terminal implementation        |
+| OpenCode                    | Proven OpenTUI application patterns worth evaluating     |
+| Zi                          | Visual styling reference                                 |
 
-OpenZi recreates `pi-coding-agent`; it does not depend on it. Parity includes the recognizable upper-layer architecture—`AgentSession`, session/services construction, settings, model and resource owners, tools, extensions, and interactive/print/RPC modes—not only a checklist of visible features.
+OpenZi recreates `pi-coding-agent`; it does not depend on it. Parity includes the recognizable upper-layer architecture—`AgentSession`, session/services construction, settings, model and resource owners, tools, extensions, and interactive/print/RPC modes—not only a checklist of visible features. Pi's interactive mode defines observable TUI behavior, while its imperative component implementation and `pi-tui` do not define OpenZi's frontend architecture.
 
-Zi does not dictate state types or modules. A screenshot or key interaction may become an OpenZi acceptance fixture; a Zi implementation detail does not become an OpenZi abstraction by default.
+Zi supplies the default visual direction. It does not dictate input semantics, state types, components, or modules.
 
-OpenCode demonstrates useful frontend patterns: route-level screens, scoped providers, direct domain rendering, deep prompt ownership, OpenTUI scroll containers, overlays, and scoped renderer cleanup. OpenZi uses those ideas with React and an in-process session rather than copying Solid or an unnecessary SDK/HTTP synchronization layer.
+OpenCode demonstrates useful frontend patterns: route-level screens, scoped providers, direct domain rendering, deep prompt ownership, OpenTUI scroll containers, overlays, and scoped renderer cleanup. OpenZi uses those ideas with React and an in-process session rather than copying Solid or an unnecessary SDK/HTTP synchronization layer. The concrete frontend owners, component rules, and semantic styling contract are defined in [`tui-architecture.md`](tui-architecture.md).
 
 ## Workspaces
 
@@ -86,17 +87,19 @@ Tools belong in `coding-agent`. Each tool owns the resources of one invocation a
 The React tree starts from product concepts rather than a universal view model:
 
 ```text
-App
-  -> route screen
-      -> SessionProvider
-          -> SessionScreen
-              -> OpenTUI scrollbox
-                  -> message/part/tool components
-              -> Prompt
-      -> overlays (later: dialog, toast, permission, question)
+runTui
+  -> OpenTUI alternate-screen renderer
+      -> App
+          -> ThemeProvider
+              -> SessionProvider
+                  -> SessionScreen
+                      -> Transcript scrollbox
+                          -> message/part/tool components
+                      -> Prompt
+          -> overlays (later: dialog, toast, permission, question)
 ```
 
-`SessionProvider` subscribes React to `AgentSession`. `SessionScreen` reads session messages directly and renders message parts. There is no duplicate transcript store, `TuiSnapshot`, or event-to-view-model corridor.
+P0 `App` requires one already-created `AgentSession`; model resolution and diagnostics happen before the renderer starts. `SessionProvider` subscribes React to that session and retains only bounded transient tool presentation. `Transcript` reads durable and streaming messages directly from `AgentSession`. There is no duplicate transcript store, `TuiSnapshot`, or event-to-view-model corridor.
 
 `Prompt` is intentionally deep. It may own textarea state, autocomplete, history, attachments, shell mode, command dispatch, and picker anchoring because those behaviors share one editor and focus model. Splitting it into pass-through components would make it harder to reason about.
 
@@ -115,7 +118,7 @@ Shutdown order is explicit:
 5. unmount React and destroy OpenTUI;
 6. let the CLI print any epilogue and exit.
 
-Renderer destruction must restore the terminal on normal exit, signal, and error paths. A bounded shutdown deadline will be added with the first real agent run.
+Renderer destruction restores the title and terminal on normal exit, signal, and error paths. Session settlement has a bounded shutdown deadline.
 
 ## Code shape
 
