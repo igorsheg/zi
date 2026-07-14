@@ -39,6 +39,21 @@ cli -> tui -> coding-agent -> pi-agent-core + pi-ai
 - There is no `shared`, `common`, `utils`, generic UI model, event bus, or internal RPC package.
 - A fourth package needs an independently meaningful lifecycle or public use case. Reuse alone is insufficient.
 
+## State and transition architecture
+
+Stateful behavior follows [ADR 0004](adr/0004-explicit-state-and-transitions.md): one owner holds concrete data and resources, admits operations from the current state, and applies explicit transitions. The same discipline applies inside an `AgentSession`, React component, reducer, tool invocation, or process lifecycle; it does not require one universal mechanism.
+
+Mutually exclusive modes use direct discriminated unions with domain fields:
+
+```ts
+type PickerState =
+  { type: "closed" } | { type: "model"; query: string } | { type: "thinking-level"; selected: ThinkingLevel }
+```
+
+Do not replace this with coordinated flags, a generic `{ type, payload }` builder, or optional fields that permit impossible combinations. Independent binary facts may remain booleans. Closed state and event unions are handled exhaustively; persisted, provider, process, and other open input is validated before an owner transitions on it.
+
+The owner also owns temporal correctness. It records admission before starting an effect, bounds the effect, and applies completion only to the operation that started it. Cancellation, failure, settlement, queue limits, and stale results are states or transitions to model and test, not incidental branches distributed among consumers. React renders owner state and requests operations; it does not mirror the machine in a view model or encode its rules across effects.
+
 ## Coding-agent architecture
 
 The target shape follows Pi:
@@ -128,7 +143,8 @@ The codebase optimizes for legibility and local reasoning:
 - narrow public exports;
 - one owner for each mutable state family;
 - direct calls before commands, buses, adapters, or protocols;
-- exhaustive types instead of defensive impossible-state branches;
+- explicit domain states and owned transitions instead of flag combinations;
+- exhaustive closed unions instead of defensive impossible-state branches;
 - validation at external, persisted, provider, and process boundaries;
 - comments only for invariants, trade-offs, and upstream provenance;
 - no JSDoc that restates a name or type;

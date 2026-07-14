@@ -27,3 +27,15 @@ _Avoid_: Pi TUI parity, `pi-tui` parity
 **Zi visual target**:
 The default palette, glyphs, spacing, and overall terminal appearance. Zi does not define OpenZi interaction behavior or frontend architecture.
 _Avoid_: Zi behavior parity, Zi architecture parity
+
+**State owner**:
+The module, class, reducer, or cohesive component that holds one mutable state family, owns any resources tied to it, and admits all changes to it.
+_Avoid_: Shared state, mirrored state
+
+**Explicit state machine**:
+Concrete domain states and allowed transitions represented directly in data and owned operations. This describes every stateful behavior at its appropriate scale; it does not imply a statechart library, event bus, or generic tagged-union helper.
+_Avoid_: Flag soup, generic payload protocol
+
+**Transition**:
+An allowed change from one explicit state to another, decided by the state owner separately from the bounded side effect it may start or complete.
+_Avoid_: Setter, incidental effect

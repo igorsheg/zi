@@ -31,4 +31,6 @@ bun run check         # formatting, linting, TypeScript, and tests
 
 The workspace uses TypeScript 7, type-aware Oxlint, and Oxfmt. Lefthook formats and lints staged files before commits and runs the complete check before pushes.
 
-The interactive path now resolves configured Pi providers, runs `read`/`bash`/`edit`/`write` through `AgentSession`, streams into OpenTUI React, and persists resumable JSONL sessions. Zi visual parity and the remaining Pi coding-agent capabilities are tracked in `docs/parity-roadmap.md`.
+Stateful behavior is designed as explicit domain data with one owner and explicit transitions; see [`docs/architecture.md`](docs/architecture.md) and [ADR 0004](docs/adr/0004-explicit-state-and-transitions.md).
+
+The interactive path now resolves configured Pi providers, runs `read`/`bash`/`edit`/`write` through `AgentSession`, streams into OpenTUI React, and persists resumable JSONL sessions. P0 visual acceptance and the remaining Pi coding-agent capabilities are tracked in `docs/parity-roadmap.md`.

@@ -27,6 +27,22 @@ Legibility, local reasoning, and ease of change are the top priorities. Do not e
 - Keep React components cohesive. A deep prompt component is preferable to many pass-through wrappers.
 - Do not introduce a frontend-wide projection schema until multiple screens need it.
 
+## State and transition design
+
+Explicit-state, data-oriented design is mandatory for stateful behavior.
+
+- Name the state owner, the concrete states, and the allowed transitions before distributing behavior across methods, hooks, or components.
+- Represent mutually exclusive states as explicit discriminated unions with domain-named fields. Make invalid combinations unrepresentable instead of coordinating boolean flags and optional properties.
+- Write unions directly. Do not hide domain states behind generic tagged-union builders, payload envelopes, class hierarchies, or a state-machine framework.
+- Keep transition rules with the state owner. UI components render state and request operations; effects synchronize owned resources but do not become a second transition system.
+- Separate transition decisions from side effects. Admit an operation from the current state, record the new state, run the bounded effect, then apply its success, failure, or cancellation transition.
+- Handle closed unions exhaustively and use `never` checks. Validate open or external events before they enter the machine.
+- Test transitions and forbidden transitions as behavior. Include races, cancellation, stale completion, and bounds where the owner crosses asynchronous or process boundaries.
+- A boolean is acceptable only for a truly independent binary fact. When combinations acquire meaning, replace the flags with explicit states.
+- Keep one source of truth. Derived render values are not additional state, and mutable state is never mirrored between owners.
+
+See `docs/adr/0004-explicit-state-and-transitions.md` for the project decision.
+
 ## Workspace ownership
 
 - `packages/coding-agent`: coding-agent policy and Pi parity.

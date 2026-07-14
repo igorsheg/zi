@@ -53,6 +53,12 @@ Ownership follows mutable state and resource lifetime, not visual rectangles. A 
 
 `SessionProvider` does not copy session messages. Pi tool lifecycle events include transient progress that is not a durable message, so the provider retains only a bounded collection of active tool presentation. Session messages remain direct reads from `AgentSession`.
 
+## Frontend states and transitions
+
+The project-wide explicit-state rules in [ADR 0004](adr/0004-explicit-state-and-transitions.md) apply inside React. A component with mutually exclusive modes owns a concrete union and the operations that transition it. Keyboard handlers request those operations; render branches display the resulting state; effects attach or synchronize owned OpenTUI resources. These paths may not each maintain their own interpretation of the mode.
+
+Prompt modes, transcript follow-tail behavior, overlay focus, and session routing must therefore enter as explicit state machines in their concrete owners. For example, an overlay is not `isOpen` plus optional picker, error, and focus fields. Its closed, active-picker, and failure states carry exactly the data each state requires. This remains local component or reducer state until more than one real consumer requires a provider.
+
 ## Component taxonomy
 
 ### Screens
@@ -133,7 +139,7 @@ OpenTUI may provide its native wrapping, clipping, selection, and layout behavio
 
 ## Growth rules
 
-- Add one capability through its concrete owner and visible acceptance test.
+- Add one capability through its concrete owner, explicit states and transitions, and visible acceptance test.
 - Add an overlay host with the first picker or dialog, not before.
 - Keep transcript rendering direct until multiple sessions with partial hydration create real pressure for a normalized cache.
 - Keep frontend collections bounded. Active tools, completion candidates, queue echoes, toasts, and overlay depth require explicit policies when introduced.
@@ -152,4 +158,4 @@ The P0 TUI architecture is established when:
 - concrete message, Markdown, and tool presentation use semantic styling;
 - normal and constrained terminal fixtures exercise the real OpenTUI path.
 
-Finishing P0 then means porting the remaining Pi interactive behavior in scope and iterating on the rendered visual fixtures. Neither requires another architecture layer.
+P0 is fixed by `packages/tui/test/visual-parity.test.tsx` at normal and constrained sizes, alongside the streamed complete-turn fixture. Later capabilities extend these fixtures through their concrete owners; they do not require another architecture layer.

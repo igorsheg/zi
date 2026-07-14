@@ -12,13 +12,14 @@ The target is coding-agent architecture parity and observable product-behavior p
 - [x] Streaming tool lifecycle and bounded output
 - [x] Cancellation and settled shutdown
 - [x] Append-only JSONL session with restore
-- [ ] Zi-matched session screen and prompt appearance
+- [x] Zi-matched session screen and prompt appearance
 - [x] Faux-provider integration and OpenTUI frame snapshots
 
 ### P0 evidence
 
 - `packages/coding-agent/test/complete-turn.test.ts` drives the real Pi agent loop through `write`, `read`, `edit`, and `bash`, then restores JSONL.
 - `packages/tui/test/complete-turn.test.tsx` submits through OpenTUI's `TextareaRenderable` and captures the resulting frame.
+- `packages/tui/test/visual-parity.test.tsx` fixes representative normal and constrained character frames plus semantic color spans for user, thinking, Markdown, tool, and prompt presentation.
 - Tool semantics are ported from `pi/packages/coding-agent/src/core/tools/` at the commit pinned in `docs/reference-pins.md`.
 
 ## P1 — daily-driver session behavior

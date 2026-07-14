@@ -72,15 +72,15 @@ export const ziTheme: Theme = {
     listBullet: "#7AA89F"
   },
   syntax: {
-    comment: "#727169",
-    keyword: "#957FB8",
-    function: "#7E9CD8",
-    variable: "#DCA561",
-    string: "#98BB6C",
-    number: "#D27E99",
-    type: "#7AA89F",
-    operator: "#C5C9C7",
-    punctuation: "#7F8381"
+    comment: "#535755",
+    keyword: "#BEC2C0",
+    function: "#B2B6B4",
+    variable: "#A5A9A7",
+    string: "#9B9690",
+    number: "#9B9690",
+    type: "#7F8381",
+    operator: "#6A6E6C",
+    punctuation: "#626664"
   },
   diff: { added: "#98BB6C", removed: "#E46876", context: "#535755" }
 }

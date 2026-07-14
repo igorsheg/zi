@@ -1,11 +1,27 @@
 import { glyphs } from "./glyphs.js"
 import type { ActiveTool } from "./session-context.js"
-import { useTheme } from "./theme.js"
+import { type Theme, useTheme } from "./theme.js"
 
 // Tool output lines are ordered text and have no stable IDs.
 /* oxlint-disable react/no-array-index-key */
 
 export type ToolStatus = "pending" | "running" | "done" | "failed" | "aborted"
+
+const toolRailTone = {
+  pending: "muted",
+  running: "accent",
+  done: "success",
+  failed: "error",
+  aborted: "error"
+} as const satisfies Record<ToolStatus, keyof Theme["text"]>
+
+const toolSuffix = {
+  pending: "",
+  running: "",
+  done: "",
+  failed: " (error)",
+  aborted: " (aborted)"
+} as const satisfies Record<ToolStatus, string>
 
 export interface ToolBlockProps {
   title: string
@@ -21,14 +37,21 @@ export function CommandToolBlock(props: ToolBlockProps) {
   return <ToolFrame {...props} lines={tailPreview(props.output, 5)} titleTone="shell" />
 }
 
+export function ReadToolBlock(props: ToolBlockProps) {
+  const lines = props.status === "done" ? [] : headPreview(props.output, 10)
+  return <ToolFrame {...props} lines={lines} titleTone="default" />
+}
+
 export function ActiveToolView({ tool }: { tool: ActiveTool }) {
   const props = {
-    title: toolTitle(tool.name, tool.args),
+    title: formatToolTitle(tool.name, tool.args),
     output: resultText(tool.result),
     status: tool.status
   } as const
 
-  return tool.name === "bash" ? <CommandToolBlock {...props} /> : <ToolBlock {...props} />
+  if (tool.name === "bash") return <CommandToolBlock {...props} />
+  if (tool.name === "read") return <ReadToolBlock {...props} />
+  return <ToolBlock {...props} />
 }
 
 function ToolFrame({
@@ -38,15 +61,8 @@ function ToolFrame({
   titleTone
 }: ToolBlockProps & { lines: readonly string[]; titleTone: "default" | "shell" }) {
   const theme = useTheme()
-  const rail =
-    status === "done"
-      ? theme.text.success
-      : status === "failed" || status === "aborted"
-        ? theme.text.error
-        : status === "running"
-          ? theme.text.accent
-          : theme.text.muted
-  const suffix = status === "failed" ? " (error)" : status === "aborted" ? " (aborted)" : ""
+  const rail = theme.text[toolRailTone[status]]
+  const suffix = toolSuffix[status]
   const titleColor = titleTone === "shell" ? theme.text.shell : theme.text.primary
 
   return (
@@ -87,7 +103,7 @@ function outputLines(output: string | undefined): string[] {
   return output ? output.replace(/[\r\n]+$/, "").split(/\r?\n/) : []
 }
 
-function toolTitle(name: string, args: unknown): string {
+export function formatToolTitle(name: string, args: unknown): string {
   if (!isRecord(args)) return name
   const detail = displayValue(args.path ?? args.command)
   if (name === "bash") return detail ? `$ ${detail}` : "$"

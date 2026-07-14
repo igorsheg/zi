@@ -60,7 +60,9 @@ export function Prompt({ onExit }: { onExit: () => void }) {
         backgroundColor={theme.surface.composer}
         title={session.sessionManager.header.cwd}
         titleColor={theme.text.muted}
-        bottomTitle={`${session.model.provider}/${session.model.id} · ${session.thinkingLevel}`}
+        bottomTitle={
+          session.thinkingLevel === "off" ? session.model.id : `${session.model.id} (${session.thinkingLevel})`
+        }
         bottomTitleAlignment="right">
         <textarea
           id="prompt-input"
@@ -71,11 +73,9 @@ export function Prompt({ onExit }: { onExit: () => void }) {
           wrapMode="word"
           textColor={theme.text.primary}
           focusedTextColor={theme.text.primary}
-          placeholderColor={theme.text.muted}
           cursorColor={theme.text.primary}
           backgroundColor={theme.surface.composer}
           focusedBackgroundColor={theme.surface.composer}
-          placeholder="Ask anything"
           keyBindings={[
             { name: "return", action: "submit" },
             { name: "return", shift: true, action: "newline" }
@@ -90,9 +90,8 @@ export function Prompt({ onExit }: { onExit: () => void }) {
 function WorkingStatus() {
   const theme = useTheme()
   return (
-    <box paddingLeft={1} paddingRight={1} flexDirection="row" gap={1} flexShrink={0}>
-      <text fg={theme.text.accent}>Working…</text>
-      <text fg={theme.text.muted}>esc to interrupt</text>
+    <box flexDirection="row" flexShrink={0}>
+      <text fg={theme.text.muted}>Working…</text>
     </box>
   )
 }

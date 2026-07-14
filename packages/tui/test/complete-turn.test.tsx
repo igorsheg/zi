@@ -62,9 +62,12 @@ test("the OpenTUI prompt drives a complete tool turn", async () => {
     expect(spans.find(span => span.text === "42")?.fg.toInts()).toEqual([122, 168, 159, 255])
     expect(session.sessionManager.file).toBeDefined()
 
-    act(() => setup.resize(40, 3))
+    act(() => {
+      input.setText("next question")
+      setup.resize(40, 3)
+    })
     await setup.renderOnce()
-    expect(setup.captureCharFrame()).toContain("Ask anything")
+    expect(setup.captureCharFrame()).toContain("next question")
   } finally {
     session.dispose()
     act(() => setup.renderer.destroy())

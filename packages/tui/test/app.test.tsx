@@ -20,13 +20,10 @@ test("the session app fills the terminal and protects the prompt", async () => {
     await setup.renderOnce()
     const frame = setup.captureCharFrame()
     expect(frame).toContain("/work")
-    expect(frame).toContain("Ask anything")
-    expect(frame).toContain("faux/faux-1 · off")
+    expect(frame).toContain("faux-1")
 
     const spans = setup.captureSpans()
     expect(spans.lines[0]?.spans[0]?.bg.toInts()).toEqual([9, 14, 19, 255])
-    const placeholder = spans.lines.flatMap(line => line.spans).find(span => span.text === "Ask anything")
-    expect(placeholder?.fg.toInts()).toEqual([127, 131, 129, 255])
 
     const input = setup.renderer.root.findDescendantById("prompt-input")
     if (!(input instanceof TextareaRenderable)) throw new Error("Prompt textarea not found")
