@@ -49,7 +49,7 @@ test("one turn can write, read, edit, execute, stream, and persist", async () =>
 
   expect(await readFile(join(root, "result.txt"), "utf8")).toBe("beta\n")
   expect(faux.state.callCount).toBe(5)
-  expect(session.state.messages.filter(message => message.role === "toolResult")).toHaveLength(4)
+  expect(session.messages.filter(message => message.role === "toolResult")).toHaveLength(4)
   expect(events).toContain("message_update")
   expect(events.filter(event => event === "tool_execution_end")).toHaveLength(4)
   expect(session.sessionManager.file).toBeDefined()
@@ -59,11 +59,11 @@ test("one turn can write, read, edit, execute, stream, and persist", async () =>
     .trim()
     .split("\n")
     .map(line => JSON.parse(line))
-  expect(records.filter(record => record.type === "message")).toHaveLength(session.state.messages.length)
+  expect(records.filter(record => record.type === "message")).toHaveLength(session.messages.length)
   expect(journal).toContain("Finished with beta.")
 
   const restored = (await import("../src/session-manager.js")).SessionManager.open(session.sessionManager.file!)
-  expect(restored.messages()).toEqual(session.state.messages)
+  expect(restored.messages()).toEqual([...session.messages])
   const resumed = await createAgentRuntime({
     cwd: "/ignored-on-resume",
     sessionFile: session.sessionManager.file!,
@@ -71,7 +71,7 @@ test("one turn can write, read, edit, execute, stream, and persist", async () =>
     persist: true
   })
   expect(resumed.services.cwd).toBe(root)
-  expect(resumed.session.state.messages).toEqual(session.state.messages)
+  expect([...resumed.session.messages]).toEqual([...session.messages])
 
   resumed.session.dispose()
   session.dispose()

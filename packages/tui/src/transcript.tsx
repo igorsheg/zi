@@ -9,8 +9,7 @@ import { ActiveToolView } from "./tool-block.js"
 
 export function Transcript() {
   const { session, activeTools } = useSessionView()
-  const { messages, streamingMessage } = session.state
-  const toolCalls = collectToolCalls(messages, streamingMessage)
+  const toolCalls = collectToolCalls(session.messages, session.streamingMessage)
 
   return (
     <scrollbox
@@ -20,14 +19,14 @@ export function Transcript() {
       stickyStart="bottom"
       viewportCulling
       scrollbarOptions={{ visible: false }}>
-      {messages.map((message, index) => (
+      {session.messages.map((message, index) => (
         <TranscriptMessage
           key={`${message.role}-${message.timestamp}-${index}`}
           message={message}
           toolCalls={toolCalls}
         />
       ))}
-      {streamingMessage ? <MessageView message={streamingMessage} /> : null}
+      {session.streamingMessage ? <MessageView message={session.streamingMessage} /> : null}
       {activeTools.map(tool => (
         <ActiveToolView key={tool.id} tool={tool} />
       ))}

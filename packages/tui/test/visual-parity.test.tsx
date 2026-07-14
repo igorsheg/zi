@@ -2,7 +2,7 @@ import { expect, test } from "bun:test"
 
 import { TextAttributes } from "@opentui/core"
 import { testRender } from "@opentui/react/test-utils"
-import { createAgentRuntime, type AgentMessage } from "@openzi/coding-agent"
+import { createAgentRuntime, createAgentSession, type AgentMessage, SessionManager } from "@openzi/coding-agent"
 import {
   createModels,
   fauxAssistantMessage,
@@ -19,8 +19,12 @@ test("representative session keeps Zi's visual hierarchy at normal and constrain
   const models = createModels()
   const faux = fauxProvider()
   models.setProvider(faux.provider)
-  const { session } = await createAgentRuntime({ cwd: "/workspace/openzi", models, persist: false })
-  session.agent.state.messages = representativeMessages()
+  const bootstrap = await createAgentRuntime({ cwd: "/workspace/openzi", models, persist: false })
+  const model = bootstrap.session.model
+  bootstrap.session.dispose()
+  const sessionManager = new SessionManager({ cwd: "/workspace/openzi", sessionDir: "/unused", persist: false })
+  for (const message of representativeMessages()) sessionManager.appendMessage(message)
+  const session = await createAgentSession({ services: bootstrap.services, sessionManager, model, tools: [] })
   const setup = await testRender(<App session={session} onExit={() => {}} />, { width: 80, height: 30 })
 
   try {

@@ -26,7 +26,7 @@ The target is coding-agent architecture parity and observable product-behavior p
 
 - [ ] Model and thinking-level picker
 - [ ] Session create/resume/list/switch
-- [ ] Steering and follow-up with bounded queues
+- [x] Steering and follow-up with bounded queues
 - [ ] Retry policy and visible countdown
 - [ ] Context usage and automatic/manual compaction
 - [ ] Slash commands and file completion
@@ -34,6 +34,13 @@ The target is coding-agent architecture parity and observable product-behavior p
 - [ ] `grep`, `find`, and `ls`
 - [ ] Settings: global and project scope
 - [ ] Print and JSON modes sharing the same `AgentSession`
+
+### P1 steering and follow-up evidence
+
+- `packages/coding-agent/test/agent-session-queue.test.ts` covers delivery priority, queue modes, tool-batch timing, identity, bounds, dequeue, cancellation, continuation, and activity transitions through `AgentSession`.
+- `packages/tui/test/prompt-queue.test.tsx` drives Return, Alt+Enter, Alt+Up, Escape, and Ctrl+C through real OpenTUI input and asserts queue rows, restoration, overflow, and cell-aware truncation.
+- Behavior is characterized from `packages/agent/src/agent.ts`, `packages/agent/src/agent-loop.ts`, `packages/coding-agent/src/core/agent-session.ts`, and `packages/coding-agent/src/modes/interactive/interactive-mode.ts` at the Pi commit pinned in `docs/reference-pins.md`.
+- Non-aborting dequeue prevents delivery while an entry remains in the core queue. `pi-agent-core` exposes no claim callback, so an entry already drained by the core before its `message_start` may still arrive; acceptance tests fix both clear-before-commit and commit-before-clear behavior at that dependency boundary.
 
 ## P2 — resource and provider parity
 
@@ -72,5 +79,6 @@ For each capability:
 - The behavior of `pi-coding-agent` interactive mode is a target; Pi's screen architecture and `@earendil-works/pi-tui` are not.
 - Pi's coding-agent owner boundaries are the reference; incidental helpers and framework-specific mechanics are not copied blindly.
 - Zi is not a behavior reference. It supplies visual styling only.
-- Unbounded queues, output, subprocesses, logs, or retries are rejected even if an upstream path currently permits them.
+- Steering and follow-up queues deliberately diverge from Pi's unbounded queues: OpenZi admits at most 32 pending entries and 8 MiB of aggregate retained UTF-8 payload, with no eviction or deduplication.
+- Unbounded output, subprocesses, logs, or retries are rejected even if an upstream path currently permits them.
 - A Pi extension API is not promised until OpenZi has a stable owner boundary to expose.

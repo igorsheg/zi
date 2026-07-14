@@ -20,7 +20,7 @@ test("abort settles the active session", async () => {
   await session.abort()
   await run
 
-  const last = session.state.messages.at(-1)
+  const last = session.messages.at(-1)
   expect(session.isStreaming).toBe(false)
   expect(last?.role).toBe("assistant")
   if (last?.role === "assistant") expect(last.stopReason).toBe("aborted")
