@@ -82,6 +82,10 @@ test("representative session keeps Zi's visual hierarchy at normal and constrain
       "│                                      │",
       "╰───────────────────────────────faux-1─╯"
     ])
+
+    act(() => setup.resize(20, 4))
+    await setup.renderOnce()
+    expect(setup.captureCharFrame()).toContain("prompt.")
   } finally {
     session.dispose()
     act(() => setup.renderer.destroy())

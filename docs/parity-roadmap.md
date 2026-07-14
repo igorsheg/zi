@@ -30,7 +30,7 @@ The target is coding-agent architecture parity and observable product-behavior p
 - [ ] Retry policy and visible countdown
 - [ ] Context usage and automatic/manual compaction
 - [ ] Slash commands and file completion
-- [ ] Conversation scrolling, follow-tail, unseen-line hint, selection/copy
+- [x] Conversation scrolling, follow-tail, unseen-line hint, selection/copy
 - [ ] `grep`, `find`, and `ls`
 - [ ] Settings: global and project scope
 - [ ] Print and JSON modes sharing the same `AgentSession`
@@ -41,6 +41,13 @@ The target is coding-agent architecture parity and observable product-behavior p
 - `packages/tui/test/prompt-queue.test.tsx` drives Return, Alt+Enter, Alt+Up, Escape, and Ctrl+C through real OpenTUI input and asserts queue rows, restoration, overflow, and cell-aware truncation.
 - Behavior is characterized from `packages/agent/src/agent.ts`, `packages/agent/src/agent-loop.ts`, `packages/coding-agent/src/core/agent-session.ts`, and `packages/coding-agent/src/modes/interactive/interactive-mode.ts` at the Pi commit pinned in `docs/reference-pins.md`.
 - Non-aborting dequeue prevents delivery while an entry remains in the core queue. `pi-agent-core` exposes no claim callback, so an entry already drained by the core before its `message_start` may still arrive; acceptance tests fix both clear-before-commit and commit-before-clear behavior at that dependency boundary.
+
+### P1 conversation navigation evidence
+
+- `packages/tui/test/transcript-navigation.test.ts` fixes the closed follow/detached/unseen transition policy, including forbidden resize and output effects.
+- `packages/tui/test/transcript.test.tsx` drives native line, page, wheel, resize, selection, streamed tool output, tail jumps, and stale session callbacks through a real OpenTUI renderer and `AgentSession`.
+- `packages/tui/test/prompt-queue.test.tsx` proves native selected text takes precedence over draft clearing and is cleared only after successful OSC 52 copy.
+- Native mechanics are characterized from OpenTUI `5d57e27e`; direct scrollbox, sticky-tail, focus-aware key, and selection patterns are characterized from OpenCode `cb8be9ba1`, as pinned in `docs/reference-pins.md`.
 
 ## P2 — resource and provider parity
 

@@ -1,5 +1,5 @@
 import type { TextareaRenderable } from "@opentui/core"
-import { useKeyboard, useTerminalDimensions } from "@opentui/react"
+import { useKeyboard, useRenderer, useTerminalDimensions } from "@opentui/react"
 import type { ImageContent, QueuedInputs } from "@openzi/coding-agent"
 import { useRef, useState } from "react"
 
@@ -12,6 +12,7 @@ const graphemes = new Intl.Segmenter(undefined, { granularity: "grapheme" })
 
 export function Prompt({ onExit }: { onExit: () => void }) {
   const session = useSession()
+  const renderer = useRenderer()
   const input = useRef<TextareaRenderable>(null)
   const [feedback, setFeedback] = useState<PromptFeedback>({ type: "none" })
   const [draftImages, setDraftImages] = useState<readonly ImageContent[]>([])
@@ -126,6 +127,17 @@ export function Prompt({ onExit }: { onExit: () => void }) {
     if (key.name === "c") {
       key.preventDefault()
       key.stopPropagation()
+      const selectedText = renderer.getSelection()?.getSelectedText()
+      if (selectedText) {
+        let copied = false
+        try {
+          copied = renderer.copyToClipboardOSC52(selectedText)
+        } catch {
+          return
+        }
+        if (copied) renderer.clearSelection()
+        return
+      }
       editor.setText("")
       setDraftImages([])
       setFeedback({ type: "none" })

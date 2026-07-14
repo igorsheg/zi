@@ -3,7 +3,7 @@ import { expect, test } from "bun:test"
 import { TextareaRenderable } from "@opentui/core"
 import { testRender } from "@opentui/react/test-utils"
 import { createAgentRuntime } from "@openzi/coding-agent"
-import { createModels, fauxAssistantMessage, fauxProvider } from "@openzi/coding-agent/testing"
+import { createModels, fauxAssistantMessage, fauxProvider, fauxThinking } from "@openzi/coding-agent/testing"
 import { act } from "react"
 
 import { App } from "../src/app.js"
@@ -288,6 +288,71 @@ test("restored queued images remain attached when the draft is resubmitted", asy
       await session.waitForIdle()
     })
   } finally {
+    session.dispose()
+    act(() => setup.renderer.destroy())
+  }
+})
+
+test("Ctrl+C copies native transcript selection before preserving the exact prompt draft", async () => {
+  const models = createModels()
+  const faux = fauxProvider()
+  models.setProvider(faux.provider)
+  faux.setResponses([fauxAssistantMessage(fauxThinking("assistant response"))])
+  const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
+  await session.prompt("copy target")
+  const setup = await testRender(<App session={session} onExit={() => {}} />, {
+    width: 48,
+    height: 16,
+    kittyKeyboard: true
+  })
+  const originalCopy = setup.renderer.copyToClipboardOSC52.bind(setup.renderer)
+
+  try {
+    await setup.renderOnce()
+    const input = setup.renderer.root.findDescendantById("prompt-input")
+    if (!(input instanceof TextareaRenderable)) throw new Error("Prompt textarea not found")
+    const row = setup
+      .captureCharFrame()
+      .split("\n")
+      .findIndex(line => line.includes("copy target"))
+    expect(row).toBeGreaterThanOrEqual(0)
+
+    await act(async () => {
+      await setup.mockMouse.drag(1, row, 12, row)
+    })
+    const selected = setup.renderer.getSelection()?.getSelectedText()
+    expect(selected).toBe("copy target")
+
+    const failedSelection = setup.renderer.getSelection()
+    let rejectedCopy: string | undefined
+    setup.renderer.copyToClipboardOSC52 = text => {
+      rejectedCopy = text
+      return false
+    }
+    act(() => {
+      input.setText("preserve on unsupported copy")
+      setup.mockInput.pressCtrlC()
+    })
+
+    expect(rejectedCopy).toBe(selected)
+    expect(input.plainText).toBe("preserve on unsupported copy")
+    expect(setup.renderer.getSelection()).toBe(failedSelection)
+
+    let copied: string | undefined
+    setup.renderer.copyToClipboardOSC52 = text => {
+      copied = text
+      return true
+    }
+    act(() => {
+      input.setText("keep this exact draft")
+      setup.mockInput.pressCtrlC()
+    })
+
+    expect(copied).toBe(selected)
+    expect(input.plainText).toBe("keep this exact draft")
+    expect(setup.renderer.getSelection()).toBeNull()
+  } finally {
+    setup.renderer.copyToClipboardOSC52 = originalCopy
     session.dispose()
     act(() => setup.renderer.destroy())
   }

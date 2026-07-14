@@ -15,6 +15,7 @@ export type ActiveTool =
 interface SessionView {
   session: AgentSession
   activeTools: readonly ActiveTool[]
+  transcriptRevision: number
 }
 
 interface SessionContextValue extends SessionView {
@@ -23,6 +24,7 @@ interface SessionContextValue extends SessionView {
 
 interface SessionRenderState {
   revision: number
+  transcriptRevision: number
   tools: Map<string, ActiveTool>
 }
 
@@ -30,11 +32,16 @@ const SessionContext = createContext<SessionContextValue | undefined>(undefined)
 const maxActiveTools = 64
 
 export function SessionProvider({ session, children }: { session: AgentSession; children: ReactNode }) {
-  const [state, dispatch] = useReducer(reduceSessionEvent, { revision: 0, tools: new Map() })
+  const [state, dispatch] = useReducer(reduceSessionEvent, { revision: 0, transcriptRevision: 0, tools: new Map() })
   useLayoutEffect(() => session.subscribe(dispatch), [session])
 
   const value = useMemo(
-    () => ({ session, activeTools: [...state.tools.values()], renderRevision: state.revision }),
+    () => ({
+      session,
+      activeTools: [...state.tools.values()],
+      renderRevision: state.revision,
+      transcriptRevision: state.transcriptRevision
+    }),
     [session, state]
   )
   return <SessionContext value={value}>{children}</SessionContext>
@@ -52,9 +59,11 @@ export function useSession(): AgentSession {
 
 function reduceSessionEvent(state: SessionRenderState, event: AgentSessionEvent): SessionRenderState {
   let tools = state.tools
+  let transcriptRevision = state.transcriptRevision
 
   switch (event.type) {
     case "tool_execution_start": {
+      transcriptRevision++
       if (tools.has(event.toolCallId)) break
       tools = new Map(tools)
       if (tools.size === maxActiveTools) {
@@ -65,6 +74,7 @@ function reduceSessionEvent(state: SessionRenderState, event: AgentSessionEvent)
       break
     }
     case "tool_execution_update": {
+      transcriptRevision++
       const tool = tools.get(event.toolCallId)
       if (tool?.status !== "running") break
       tools = new Map(tools)
@@ -72,6 +82,7 @@ function reduceSessionEvent(state: SessionRenderState, event: AgentSessionEvent)
       break
     }
     case "tool_execution_end": {
+      transcriptRevision++
       const tool = tools.get(event.toolCallId)
       if (tool?.status !== "running") break
       tools = new Map(tools)
@@ -79,17 +90,20 @@ function reduceSessionEvent(state: SessionRenderState, event: AgentSessionEvent)
       break
     }
     case "message_end":
+      transcriptRevision++
       if (event.message.role === "toolResult" && tools.has(event.message.toolCallId)) {
         tools = new Map(tools)
         tools.delete(event.message.toolCallId)
       }
       break
+    case "message_start":
+    case "message_update":
+      transcriptRevision++
+      break
     case "agent_start":
     case "agent_end":
     case "turn_start":
     case "turn_end":
-    case "message_start":
-    case "message_update":
     case "agent_settled":
     case "queue_update":
     case "entry_appended":
@@ -100,7 +114,7 @@ function reduceSessionEvent(state: SessionRenderState, event: AgentSessionEvent)
       assertNever(event)
   }
 
-  return { revision: state.revision + 1, tools }
+  return { revision: state.revision + 1, transcriptRevision, tools }
 }
 
 function assertNever(value: never): never {
