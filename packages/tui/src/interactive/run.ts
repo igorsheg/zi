@@ -1,12 +1,11 @@
 import { CliRenderEvents, createCliRenderer } from "@opentui/core"
-import { createRoot } from "@opentui/react"
 import type { AgentSession } from "@openzi/coding-agent"
 
-import { App } from "./app.js"
-import { ziTheme } from "./theme.js"
+import { defaultTheme } from "../theme.js"
+import { InteractiveMode } from "./interactive-mode.js"
 
 export interface RunTuiOptions {
-  session: AgentSession
+  readonly session: AgentSession
 }
 
 const shutdownTimeoutMs = 5_000
@@ -23,19 +22,19 @@ export async function runTui({ session }: RunTuiOptions): Promise<void> {
     useKittyKeyboard: {},
     useMouse: true,
     openConsoleOnError: false,
-    backgroundColor: ziTheme.surface.app
+    backgroundColor: defaultTheme.surface.app
   })
-  const root = createRoot(renderer)
+  let mode: InteractiveMode | undefined
   const signals: NodeJS.Signals[] = ["SIGHUP", "SIGINT", "SIGTERM"]
   let closing: Promise<void> | undefined
 
   const close = () => {
     closing ??= (async () => {
+      mode?.dispose()
+      mode = undefined
       try {
         await settle(session.abort(), shutdownTimeoutMs)
       } finally {
-        session.dispose()
-        root.unmount()
         renderer.setTerminalTitle("")
         if (!renderer.isDestroyed) renderer.destroy()
       }
@@ -48,7 +47,7 @@ export async function runTui({ session }: RunTuiOptions): Promise<void> {
 
   try {
     renderer.setTerminalTitle("openzi")
-    root.render(<App session={session} onExit={requestClose} />)
+    mode = new InteractiveMode({ renderer, session, onExit: requestClose })
     await destroyed
   } finally {
     for (const signal of signals) process.off(signal, requestClose)

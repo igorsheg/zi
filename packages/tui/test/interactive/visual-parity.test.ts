@@ -1,7 +1,6 @@
 import { expect, test } from "bun:test"
 
 import { TextAttributes } from "@opentui/core"
-import { testRender } from "@opentui/react/test-utils"
 import { createAgentRuntime, createAgentSession, type AgentMessage, SessionManager } from "@openzi/coding-agent"
 import {
   createModels,
@@ -11,11 +10,10 @@ import {
   fauxThinking,
   fauxToolCall
 } from "@openzi/coding-agent/testing"
-import { act } from "react"
 
-import { App } from "../src/app.js"
+import { createInteractiveTest } from "./harness.js"
 
-test("representative session keeps Zi's visual hierarchy at normal and constrained sizes", async () => {
+test("representative session keeps the accepted visual hierarchy at normal and constrained sizes", async () => {
   const models = createModels()
   const faux = fauxProvider()
   models.setProvider(faux.provider)
@@ -25,7 +23,7 @@ test("representative session keeps Zi's visual hierarchy at normal and constrain
   const sessionManager = new SessionManager({ cwd: "/workspace/openzi", sessionDir: "/unused", persist: false })
   for (const message of representativeMessages()) sessionManager.appendMessage(message)
   const session = await createAgentSession({ services: bootstrap.services, sessionManager, model, tools: [] })
-  const setup = await testRender(<App session={session} onExit={() => {}} />, { width: 80, height: 30 })
+  const setup = await createInteractiveTest(session, { width: 80, height: 30 })
 
   try {
     await setup.renderOnce()
@@ -70,7 +68,7 @@ test("representative session keeps Zi's visual hierarchy at normal and constrain
     expect(span(spans, "code").fg.toInts()).toEqual([122, 168, 159, 255])
     expect(span(spans, "╭───").fg.toInts()).toEqual([228, 104, 118, 255])
 
-    act(() => setup.resize(40, 8))
+    setup.resize(40, 8)
     await setup.renderOnce()
     expect(frameRows(setup.captureCharFrame(), 8)).toEqual([
       " ╰───",
@@ -83,12 +81,12 @@ test("representative session keeps Zi's visual hierarchy at normal and constrain
       "╰───────────────────────────────faux-1─╯"
     ])
 
-    act(() => setup.resize(20, 4))
+    setup.resize(20, 4)
     await setup.renderOnce()
     expect(setup.captureCharFrame()).toContain("prompt.")
   } finally {
     session.dispose()
-    act(() => setup.renderer.destroy())
+    setup.destroy()
   }
 })
 

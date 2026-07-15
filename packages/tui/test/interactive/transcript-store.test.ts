@@ -1,17 +1,25 @@
 import { describe, expect, test } from "bun:test"
 
 import {
+  createTranscriptStore,
   initialTranscriptNavigation,
   transitionTranscriptNavigation,
   type TranscriptNavigation,
   type TranscriptNavigationEvent
-} from "../src/transcript-navigation.js"
+} from "../../src/interactive/stores/transcript.js"
 
 const following: TranscriptNavigation = { type: "following" }
 const detachedSeen: TranscriptNavigation = { type: "detached", unseenOutput: false }
 const detachedUnseen: TranscriptNavigation = { type: "detached", unseenOutput: true }
 
 describe("transcript navigation", () => {
+  test("store owns navigation outside the renderer", () => {
+    const store = createTranscriptStore()
+    expect(store.$navigation.get()).toEqual(following)
+    store.dispatch({ type: "MANUAL_POSITION_CHANGED", atTail: false })
+    expect(store.$navigation.get()).toEqual(detachedSeen)
+  })
+
   test("starts by following the tail", () => {
     expect(initialTranscriptNavigation).toEqual(following)
   })

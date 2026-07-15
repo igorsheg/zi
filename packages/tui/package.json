@@ -18,13 +18,11 @@
   },
   "dependencies": {
     "@opentui/core": "catalog:",
-    "@opentui/react": "catalog:",
     "@openzi/coding-agent": "workspace:*",
-    "react": "catalog:"
+    "nanostores": "catalog:"
   },
   "devDependencies": {
     "@types/bun": "catalog:",
-    "@types/react": "catalog:",
     "typescript": "catalog:"
   }
 }

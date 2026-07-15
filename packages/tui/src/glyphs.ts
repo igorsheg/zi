@@ -1,8 +1,7 @@
-// Structural glyphs are visual policy, not ad-hoc decoration. This vocabulary
-// follows Zi's pinned src/tui/glyphs.zig acceptance reference.
 export const glyphs = {
   listSelected: "› ",
   listUnselected: "  ",
+  check: "✓",
   toolBody: "│ ",
   toolTop: "╭───",
   toolBottom: "╰───"

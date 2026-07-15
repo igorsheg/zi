@@ -1,20 +1,19 @@
 # OpenZi
 
-A coding agent built from Pi's lower-level AI/agent packages with an OpenTUI React frontend.
+A coding agent built from Pi's lower-level AI/agent packages with an imperative OpenTUI frontend.
 
 ## Direction
 
 - [`pi-coding-agent`](https://github.com/earendil-works/pi/tree/main/packages/coding-agent) is the **behavior and coding-agent architecture** parity target; its interactive mode defines TUI product behavior.
 - OpenZi uses `@earendil-works/pi-ai` and `@earendil-works/pi-agent-core`, not `pi-coding-agent` or `pi-tui`.
-- [OpenTUI React](https://github.com/anomalyco/opentui) is the frontend architecture.
-- [Zi](https://github.com/igorsheg/zi) is the visual styling reference only.
+- [`@opentui/core`](https://github.com/anomalyco/opentui) renderables are the terminal architecture; React is not part of the runtime.
 - [OpenCode](https://github.com/anomalyco/opencode) is a source of proven OpenTUI organization patterns.
 
 ## Workspaces
 
-- `packages/coding-agent` — session policy, managers, resources, tools, and Pi parity
-- `packages/tui` — OpenTUI React screens, prompt, message rendering, and overlays
-- `packages/cli` — entrypoint and future interactive/print/RPC mode composition
+- `packages/coding-agent` — `AgentSession`, managers, tools, non-terminal modes, and Pi parity
+- `packages/tui` — the terminal-specific interactive mode and imperative OpenTUI components
+- `packages/cli` — argument parsing, dynamic mode selection, and exit reporting
 
 See [`docs/architecture.md`](docs/architecture.md), [`docs/tui-architecture.md`](docs/tui-architecture.md), [`docs/parity-roadmap.md`](docs/parity-roadmap.md), and [`AGENTS.md`](AGENTS.md).
 
@@ -31,6 +30,6 @@ bun run check         # formatting, linting, TypeScript, and tests
 
 The workspace uses TypeScript 7, type-aware Oxlint, and Oxfmt. Lefthook formats and lints staged files before commits and runs the complete check before pushes.
 
-Stateful behavior is designed as explicit domain data with one owner and explicit transitions; see [`docs/architecture.md`](docs/architecture.md) and [ADR 0004](docs/adr/0004-explicit-state-and-transitions.md).
+Stateful behavior is designed as explicit domain data with one owner and explicit transitions. TUI presentation state uses instance-scoped Nano Store owners rather than module globals or mirrored session state; see [`docs/architecture.md`](docs/architecture.md), [ADR 0004](docs/adr/0004-explicit-state-and-transitions.md), and [ADR 0006](docs/adr/0006-instance-scoped-nano-stores-own-tui-state.md).
 
-The interactive path now resolves configured Pi providers, runs `read`/`bash`/`edit`/`write` through `AgentSession`, streams into OpenTUI React, and persists resumable JSONL sessions. P0 visual acceptance and the remaining Pi coding-agent capabilities are tracked in `docs/parity-roadmap.md`.
+The interactive path now resolves configured Pi providers, runs `read`/`bash`/`edit`/`write` through `AgentSession`, streams into imperative OpenTUI renderables, and persists resumable JSONL sessions. P0 visual acceptance and the remaining Pi coding-agent capabilities are tracked in `docs/parity-roadmap.md`.

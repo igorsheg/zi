@@ -1,12 +1,10 @@
 import { expect, test } from "bun:test"
 
 import { TextareaRenderable } from "@opentui/core"
-import { testRender } from "@opentui/react/test-utils"
 import { createAgentRuntime } from "@openzi/coding-agent"
 import { createModels, fauxProvider } from "@openzi/coding-agent/testing"
-import { act } from "react"
 
-import { App } from "../src/app.js"
+import { createInteractiveTest } from "./harness.js"
 
 test("the session app fills the terminal and protects the prompt", async () => {
   const models = createModels()
@@ -14,7 +12,7 @@ test("the session app fills the terminal and protects the prompt", async () => {
   models.setProvider(faux.provider)
   const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
   let exits = 0
-  const setup = await testRender(<App session={session} onExit={() => exits++} />, { width: 40, height: 8 })
+  const setup = await createInteractiveTest(session, { width: 40, height: 8 }, () => exits++)
 
   try {
     await setup.renderOnce()
@@ -27,17 +25,15 @@ test("the session app fills the terminal and protects the prompt", async () => {
 
     const input = setup.renderer.root.findDescendantById("prompt-input")
     if (!(input instanceof TextareaRenderable)) throw new Error("Prompt textarea not found")
-    act(() => {
-      input.setText("discard me")
-      setup.mockInput.pressCtrlC()
-    })
+    input.setText("discard me")
+    setup.mockInput.pressCtrlC()
     expect(input.plainText).toBe("")
     expect(exits).toBe(0)
 
-    act(() => setup.mockInput.pressKey("d", { ctrl: true }))
+    setup.mockInput.pressKey("d", { ctrl: true })
     expect(exits).toBe(1)
   } finally {
     session.dispose()
-    act(() => setup.renderer.destroy())
+    setup.destroy()
   }
 })

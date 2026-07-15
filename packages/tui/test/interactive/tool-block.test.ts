@@ -1,20 +1,22 @@
 import { expect, test } from "bun:test"
 
-import { testRender } from "@opentui/react/test-utils"
-import { act } from "react"
+import { BoxRenderable } from "@opentui/core"
+import { createTestRenderer } from "@opentui/core/testing"
 
-import { ThemeProvider, ziTheme } from "../src/theme.js"
-import { CommandToolBlock, ToolBlock } from "../src/tool-block.js"
+import { createCommandToolBlock, createToolBlock } from "../../src/interactive/components/tool-block.js"
+import { defaultTheme } from "../../src/theme.js"
 
-test("tool block owns Zi's title, rail, and body styling", async () => {
-  const setup = await testRender(
-    <ThemeProvider theme={ziTheme}>
-      <box width="100%" height="100%" backgroundColor={ziTheme.surface.app}>
-        <CommandToolBlock title="$ echo hi" output={"hi\nthere\n"} status="running" />
-      </box>
-    </ThemeProvider>,
-    { width: 30, height: 8 }
+test("tool block owns title, rail, and body styling", async () => {
+  const setup = await createTestRenderer({ width: 30, height: 8, useThread: false })
+  const root = appRoot(setup.renderer)
+  root.add(
+    createCommandToolBlock(
+      setup.renderer,
+      { title: "$ echo hi", output: "hi\nthere\n", status: "running" },
+      defaultTheme
+    )
   )
+  setup.renderer.root.add(root)
 
   try {
     await setup.renderOnce()
@@ -30,17 +32,19 @@ test("tool block owns Zi's title, rail, and body styling", async () => {
     expect(spans.find(span => span.text === "╭───")?.fg.toInts()).toEqual([122, 168, 159, 255])
     expect(spans.find(span => span.text === "hi")?.fg.toInts()).toEqual([127, 131, 129, 255])
   } finally {
-    act(() => setup.renderer.destroy())
+    root.destroyRecursively()
+    setup.renderer.destroy()
   }
 })
 
 test("failed tool block uses the error rail and terminal suffix", async () => {
-  const setup = await testRender(
-    <ThemeProvider theme={ziTheme}>
-      <ToolBlock title="edit source.ts" output="No match found" status="failed" />
-    </ThemeProvider>,
-    { width: 40, height: 8 }
+  const setup = await createTestRenderer({ width: 40, height: 8, useThread: false })
+  const block = createToolBlock(
+    setup.renderer,
+    { title: "edit source.ts", output: "No match found", status: "failed" },
+    defaultTheme
   )
+  setup.renderer.root.add(block)
 
   try {
     await setup.renderOnce()
@@ -51,18 +55,16 @@ test("failed tool block uses the error rail and terminal suffix", async () => {
       .find(span => span.text === "╭───")
     expect(rail?.fg.toInts()).toEqual([228, 104, 118, 255])
   } finally {
-    act(() => setup.renderer.destroy())
+    block.destroyRecursively()
+    setup.renderer.destroy()
   }
 })
 
 test("generic tool blocks keep the head of bounded output", async () => {
   const output = Array.from({ length: 14 }, (_, index) => `line ${index}`).join("\n")
-  const setup = await testRender(
-    <ThemeProvider theme={ziTheme}>
-      <ToolBlock title="read file" output={output} status="done" />
-    </ThemeProvider>,
-    { width: 40, height: 16 }
-  )
+  const setup = await createTestRenderer({ width: 40, height: 16, useThread: false })
+  const block = createToolBlock(setup.renderer, { title: "read file", output, status: "done" }, defaultTheme)
+  setup.renderer.root.add(block)
 
   try {
     await setup.renderOnce()
@@ -72,18 +74,16 @@ test("generic tool blocks keep the head of bounded output", async () => {
     expect(frame).not.toContain("line 10")
     expect(frame).toContain("... (4 more lines)")
   } finally {
-    act(() => setup.renderer.destroy())
+    block.destroyRecursively()
+    setup.renderer.destroy()
   }
 })
 
 test("command tool blocks keep the tail of bounded output", async () => {
   const output = Array.from({ length: 12 }, (_, index) => `line ${index}`).join("\n")
-  const setup = await testRender(
-    <ThemeProvider theme={ziTheme}>
-      <CommandToolBlock title="$ command" output={output} status="done" />
-    </ThemeProvider>,
-    { width: 40, height: 12 }
-  )
+  const setup = await createTestRenderer({ width: 40, height: 12, useThread: false })
+  const block = createCommandToolBlock(setup.renderer, { title: "$ command", output, status: "done" }, defaultTheme)
+  setup.renderer.root.add(block)
 
   try {
     await setup.renderOnce()
@@ -93,6 +93,11 @@ test("command tool blocks keep the tail of bounded output", async () => {
     expect(frame).toContain("line 7")
     expect(frame).toContain("line 11")
   } finally {
-    act(() => setup.renderer.destroy())
+    block.destroyRecursively()
+    setup.renderer.destroy()
   }
 })
+
+function appRoot(renderer: ConstructorParameters<typeof BoxRenderable>[0]): BoxRenderable {
+  return new BoxRenderable(renderer, { width: "100%", height: "100%", backgroundColor: defaultTheme.surface.app })
+}

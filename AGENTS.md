@@ -4,8 +4,7 @@
 
 - `pi-coding-agent` is the coding-agent behavior **and architecture** reference, and its interactive mode is the TUI product-behavior reference.
 - `pi-ai` and `pi-agent-core` are dependencies; `pi-coding-agent` and `pi-tui` are not.
-- OpenTUI React is the frontend architecture; Pi's TUI implementation is not.
-- Zi is the visual styling reference only.
+- Imperative `@opentui/core` renderables are the terminal architecture; `@opentui/react` and Pi's TUI implementation are not.
 - OpenCode is a source of proven OpenTUI application patterns, not a template to copy wholesale.
 
 ## Code quality
@@ -24,7 +23,8 @@ Legibility, local reasoning, and ease of change are the top priorities. Do not e
 - Comments explain invariants, trade-offs, and provenance. They do not narrate syntax or restate types.
 - Avoid boilerplate JSDoc on self-explanatory symbols.
 - Port one Pi capability at a time with its behavior tests and upstream provenance.
-- Keep React components cohesive. A deep prompt component is preferable to many pass-through wrappers.
+- For capabilities spanning `coding-agent` and a client, preserve owner decomposition: coding-agent owners expose authoritative domain data and operations; the client mode composes those owners and translates client input into closed typed intents; stores own admitted transient workflows; components only render state and report native interaction—never hard-code domain catalogs, parse domain syntax, or dispatch business operations.
+- Keep imperative components cohesive. A deep prompt owner is preferable to many pass-through wrappers.
 - Do not introduce a frontend-wide projection schema until multiple screens need it.
 
 ## State and transition design
@@ -40,13 +40,18 @@ Explicit-state, data-oriented design is mandatory for stateful behavior.
 - Test transitions and forbidden transitions as behavior. Include races, cancellation, stale completion, and bounds where the owner crosses asynchronous or process boundaries.
 - A boolean is acceptable only for a truly independent binary fact. When combinations acquire meaning, replace the flags with explicit states.
 - Keep one source of truth. Derived render values are not additional state, and mutable state is never mirrored between owners.
+- `AgentSession` is the shared client-independent business boundary. The terminal-specific `InteractiveMode`, OpenTUI renderables, and presentation stores live under `packages/tui/src/interactive/`.
+- Stores are instance-scoped and created by factories. Never export a mutable module-global application store or collect unrelated capabilities into one root state blob.
+- Store writable atoms are private implementation details. Components subscribe and request domain-named operations; they do not call `.set()`.
+- TUI stores may retain an `AgentSession` reference for subscription identity but may not copy messages, model, queues, or other authoritative state. Native textarea and scroll state remain OpenTUI-owned.
+- Coding-agent owners do not depend on frontend state libraries. TUI stores use explicit binding and disposal; use Nano Stores `onMount()` only when a terminal resource lifetime genuinely follows observation.
 
-See `docs/adr/0004-explicit-state-and-transitions.md` for the project decision.
+See `docs/adr/0004-explicit-state-and-transitions.md` and `docs/adr/0006-instance-scoped-nano-stores-own-tui-state.md` for the project decisions.
 
 ## Workspace ownership
 
-- `packages/coding-agent`: coding-agent policy and Pi parity.
-- `packages/tui`: OpenTUI React frontend only.
-- `packages/cli`: process entrypoint and mode composition only.
+- `packages/coding-agent`: `AgentSession`, coding-agent policy, managers, tools, and non-terminal modes such as print/RPC.
+- `packages/tui`: the terminal-specific interactive mode, Nano Stores, and imperative OpenTUI composition.
+- `packages/cli`: argument parsing, mode selection, and process exit reporting only.
 
-Dependencies point `cli -> tui -> coding-agent`. `coding-agent` never imports a frontend.
+Dependencies point `cli -> tui -> coding-agent`, with `cli -> coding-agent` for shared runtime construction and future non-terminal modes. `coding-agent` never imports a frontend. The TUI entrypoint is loaded dynamically so print/JSON modes need not load OpenTUI.

@@ -1,12 +1,10 @@
 import { expect, test } from "bun:test"
 
 import { TextareaRenderable } from "@opentui/core"
-import { testRender } from "@opentui/react/test-utils"
 import { createAgentRuntime } from "@openzi/coding-agent"
 import { createModels, fauxAssistantMessage, fauxProvider, fauxThinking } from "@openzi/coding-agent/testing"
-import { act } from "react"
 
-import { App } from "../src/app.js"
+import { createInteractiveTest } from "./harness.js"
 
 test("real prompt keys admit, present, and restore steering and follow-up queues", async () => {
   const models = createModels()
@@ -22,50 +20,36 @@ test("real prompt keys admit, present, and restore steering and follow-up queues
     }
   ])
   const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
-  const setup = await testRender(<App session={session} onExit={() => {}} />, {
-    width: 48,
-    height: 14,
-    kittyKeyboard: true
-  })
+  const setup = await createInteractiveTest(session, { width: 48, height: 14, kittyKeyboard: true })
 
   try {
     await setup.renderOnce()
     const input = setup.renderer.root.findDescendantById("prompt-input")
     if (!(input instanceof TextareaRenderable)) throw new Error("Prompt textarea not found")
 
-    await act(async () => {
-      input.setText("start")
-      setup.mockInput.pressKey("RETURN", { meta: true })
-      await providerStarted.promise
-    })
+    input.setText("start")
+    setup.mockInput.pressKey("RETURN", { meta: true })
+    await providerStarted.promise
     expect(session.isStreaming).toBe(true)
 
-    act(() => {
-      input.setText("line")
-      setup.mockInput.pressEnter({ shift: true })
-    })
+    input.setText("line")
+    setup.mockInput.pressEnter({ shift: true })
     expect(input.plainText).toContain("line")
     expect(input.plainText).toContain("\n")
     expect(session.queuedInputs.steering).toHaveLength(0)
 
-    act(() => {
-      input.setText("blocked super")
-      setup.mockInput.pressEnter({ super: true })
-      setup.mockInput.pressEnter({ meta: true, super: true })
-      setup.mockInput.pressEnter({ hyper: true })
-    })
+    input.setText("blocked super")
+    setup.mockInput.pressEnter({ super: true })
+    setup.mockInput.pressEnter({ meta: true, super: true })
+    setup.mockInput.pressEnter({ hyper: true })
     expect(input.plainText).toBe("blocked super")
     expect(session.queuedInputs.steering).toHaveLength(0)
     expect(session.queuedInputs.followUp).toHaveLength(0)
 
-    act(() => {
-      input.setText("steering first line\nsecond line")
-      setup.mockInput.pressEnter()
-    })
-    act(() => {
-      input.setText("follow-up")
-      setup.mockInput.pressKey("RETURN", { meta: true })
-    })
+    input.setText("steering first line\nsecond line")
+    setup.mockInput.pressEnter()
+    input.setText("follow-up")
+    setup.mockInput.pressKey("RETURN", { meta: true })
     await setup.renderOnce()
 
     expect(session.queuedInputs.steering.map(entry => entry.text)).toEqual(["steering first line\nsecond line"])
@@ -76,37 +60,29 @@ test("real prompt keys admit, present, and restore steering and follow-up queues
     expect(queuedFrame).toContain("Follow-up: follow-up")
     expect(queuedFrame).toContain("↳ Alt+Up to edit all queued messages")
 
-    act(() => {
-      input.setText("draft")
-      setup.mockInput.pressArrow("up")
-      setup.mockInput.pressArrow("up", { meta: true, shift: true })
-    })
+    input.setText("draft")
+    setup.mockInput.pressArrow("up")
+    setup.mockInput.pressArrow("up", { meta: true, shift: true })
     expect(input.plainText).toBe("draft")
     expect(session.queuedInputs.steering).toHaveLength(1)
     expect(session.queuedInputs.followUp).toHaveLength(1)
 
-    act(() => {
-      setup.mockInput.pressArrow("up", { meta: true })
-    })
+    setup.mockInput.pressArrow("up", { meta: true })
     await setup.renderOnce()
     expect(input.plainText).toBe("steering first line\nsecond line\n\nfollow-up\n\ndraft")
     expect(session.queuedInputs.steering).toHaveLength(0)
     expect(setup.captureCharFrame()).toContain("Restored 2 queued messages to editor")
 
-    act(() => {
-      setup.mockInput.pressArrow("up", { meta: true })
-    })
+    setup.mockInput.pressArrow("up", { meta: true })
     await setup.renderOnce()
     expect(input.plainText).toBe("steering first line\nsecond line\n\nfollow-up\n\ndraft")
     expect(setup.captureCharFrame()).toContain("No queued messages to restore")
 
-    await act(async () => {
-      release.resolve()
-      await session.waitForIdle()
-    })
+    release.resolve()
+    await session.waitForIdle()
   } finally {
     session.dispose()
-    act(() => setup.renderer.destroy())
+    setup.destroy()
   }
 })
 
@@ -124,26 +100,18 @@ test("a maximum queue preserves the constrained composer and Ctrl+C leaves pendi
     }
   ])
   const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
-  const setup = await testRender(<App session={session} onExit={() => {}} />, {
-    width: 42,
-    height: 8,
-    kittyKeyboard: true
-  })
+  const setup = await createInteractiveTest(session, { width: 42, height: 8, kittyKeyboard: true })
 
   try {
     await setup.renderOnce()
     const input = setup.renderer.root.findDescendantById("prompt-input")
     if (!(input instanceof TextareaRenderable)) throw new Error("Prompt textarea not found")
-    await act(async () => {
-      input.setText("start")
-      setup.mockInput.pressEnter()
-      await providerStarted.promise
-    })
-    act(() => {
-      for (let index = 0; index < 32; index++) session.steer(`queued-${index}`)
-      input.setText("keep this exact draft")
-      setup.mockInput.pressEnter()
-    })
+    input.setText("start")
+    setup.mockInput.pressEnter()
+    await providerStarted.promise
+    for (let index = 0; index < 32; index++) session.steer(`queued-${index}`)
+    input.setText("keep this exact draft")
+    setup.mockInput.pressEnter()
     await setup.renderOnce()
 
     expect(input.plainText).toBe("keep this exact draft")
@@ -157,22 +125,18 @@ test("a maximum queue preserves the constrained composer and Ctrl+C leaves pendi
       session.messages.some(message => message.role === "user" && messageText(message) === "keep this exact draft")
     ).toBe(false)
 
-    act(() => setup.mockInput.pressCtrlC())
+    setup.mockInput.pressCtrlC()
     expect(input.plainText).toBe("")
     expect(session.queuedInputs.steering).toHaveLength(32)
     await setup.renderOnce()
     expect(setup.captureCharFrame()).toContain("Steering: queued-0")
 
-    act(() => {
-      session.takeQueuedInputs()
-    })
-    await act(async () => {
-      release.resolve()
-      await session.waitForIdle()
-    })
+    session.takeQueuedInputs()
+    release.resolve()
+    await session.waitForIdle()
   } finally {
     session.dispose()
-    act(() => setup.renderer.destroy())
+    setup.destroy()
   }
 })
 
@@ -190,27 +154,19 @@ test("Escape restores grouped duplicates immediately and queue rows truncate as 
     }
   ])
   const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
-  const setup = await testRender(<App session={session} onExit={() => {}} />, {
-    width: 30,
-    height: 14,
-    kittyKeyboard: true
-  })
+  const setup = await createInteractiveTest(session, { width: 30, height: 14, kittyKeyboard: true })
 
   try {
     await setup.renderOnce()
     const input = setup.renderer.root.findDescendantById("prompt-input")
     if (!(input instanceof TextareaRenderable)) throw new Error("Prompt textarea not found")
-    await act(async () => {
-      input.setText("start")
-      setup.mockInput.pressEnter()
-      await providerStarted.promise
-    })
-    act(() => {
-      session.followUp("duplicate")
-      session.steer("界界界界界界界界界界界界\nhidden")
-      session.steer("duplicate")
-      input.setText("existing draft")
-    })
+    input.setText("start")
+    setup.mockInput.pressEnter()
+    await providerStarted.promise
+    session.followUp("duplicate")
+    session.steer("界界界界界界界界界界界界\nhidden")
+    session.steer("duplicate")
+    input.setText("existing draft")
     await setup.renderOnce()
 
     const queuedFrame = setup.captureCharFrame()
@@ -219,22 +175,20 @@ test("Escape restores grouped duplicates immediately and queue rows truncate as 
     const queueSpans = setup.captureSpans().lines.flatMap(line => line.spans)
     expect(queueSpans.find(span => span.text.includes("Steering:"))?.fg.toInts()).toEqual([106, 110, 108, 255])
 
-    act(() => setup.mockInput.pressEscape())
+    setup.mockInput.pressEscape()
     expect(input.plainText).toBe("界界界界界界界界界界界界\nhidden\n\nduplicate\n\nduplicate\n\nexisting draft")
     expect(session.queuedInputs.steering).toHaveLength(0)
     expect(session.isAborting).toBe(true)
     const restored = input.plainText
-    act(() => setup.mockInput.pressEscape())
+    setup.mockInput.pressEscape()
     expect(input.plainText).toBe(restored)
 
-    await act(async () => {
-      release.resolve()
-      await session.waitForIdle()
-    })
+    release.resolve()
+    await session.waitForIdle()
     expect(session.isStreaming).toBe(false)
   } finally {
     session.dispose()
-    act(() => setup.renderer.destroy())
+    setup.destroy()
   }
 })
 
@@ -252,44 +206,32 @@ test("restored queued images remain attached when the draft is resubmitted", asy
     }
   ])
   const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
-  const setup = await testRender(<App session={session} onExit={() => {}} />, {
-    width: 48,
-    height: 14,
-    kittyKeyboard: true
-  })
+  const setup = await createInteractiveTest(session, { width: 48, height: 14, kittyKeyboard: true })
   const image = { type: "image" as const, mimeType: "image/png", data: "AAAA" }
 
   try {
     await setup.renderOnce()
     const input = setup.renderer.root.findDescendantById("prompt-input")
     if (!(input instanceof TextareaRenderable)) throw new Error("Prompt textarea not found")
-    await act(async () => {
-      input.setText("start")
-      setup.mockInput.pressEnter()
-      await providerStarted.promise
-    })
-    act(() => {
-      session.followUp("with image", [image])
-      setup.mockInput.pressArrow("up", { meta: true })
-    })
+    input.setText("start")
+    setup.mockInput.pressEnter()
+    await providerStarted.promise
+    session.followUp("with image", [image])
+    setup.mockInput.pressArrow("up", { meta: true })
     await setup.renderOnce()
 
     expect(input.plainText).toBe("with image")
     expect(setup.captureCharFrame()).toContain("Restored 1 queued message")
-    act(() => setup.mockInput.pressEnter({ meta: true }))
+    setup.mockInput.pressEnter({ meta: true })
 
     expect(session.queuedInputs.followUp[0]?.text).toBe("with image")
     expect(session.queuedInputs.followUp[0]?.images).toEqual([image])
-    act(() => {
-      session.takeQueuedInputs()
-    })
-    await act(async () => {
-      release.resolve()
-      await session.waitForIdle()
-    })
+    session.takeQueuedInputs()
+    release.resolve()
+    await session.waitForIdle()
   } finally {
     session.dispose()
-    act(() => setup.renderer.destroy())
+    setup.destroy()
   }
 })
 
@@ -300,11 +242,7 @@ test("Ctrl+C copies native transcript selection before preserving the exact prom
   faux.setResponses([fauxAssistantMessage(fauxThinking("assistant response"))])
   const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
   await session.prompt("copy target")
-  const setup = await testRender(<App session={session} onExit={() => {}} />, {
-    width: 48,
-    height: 16,
-    kittyKeyboard: true
-  })
+  const setup = await createInteractiveTest(session, { width: 48, height: 16, kittyKeyboard: true })
   const originalCopy = setup.renderer.copyToClipboardOSC52.bind(setup.renderer)
 
   try {
@@ -317,9 +255,7 @@ test("Ctrl+C copies native transcript selection before preserving the exact prom
       .findIndex(line => line.includes("copy target"))
     expect(row).toBeGreaterThanOrEqual(0)
 
-    await act(async () => {
-      await setup.mockMouse.drag(1, row, 12, row)
-    })
+    await setup.mockMouse.drag(1, row, 12, row)
     const selected = setup.renderer.getSelection()?.getSelectedText()
     expect(selected).toBe("copy target")
 
@@ -329,10 +265,8 @@ test("Ctrl+C copies native transcript selection before preserving the exact prom
       rejectedCopy = text
       return false
     }
-    act(() => {
-      input.setText("preserve on unsupported copy")
-      setup.mockInput.pressCtrlC()
-    })
+    input.setText("preserve on unsupported copy")
+    setup.mockInput.pressCtrlC()
 
     expect(rejectedCopy).toBe(selected)
     expect(input.plainText).toBe("preserve on unsupported copy")
@@ -343,10 +277,8 @@ test("Ctrl+C copies native transcript selection before preserving the exact prom
       copied = text
       return true
     }
-    act(() => {
-      input.setText("keep this exact draft")
-      setup.mockInput.pressCtrlC()
-    })
+    input.setText("keep this exact draft")
+    setup.mockInput.pressCtrlC()
 
     expect(copied).toBe(selected)
     expect(input.plainText).toBe("keep this exact draft")
@@ -354,7 +286,7 @@ test("Ctrl+C copies native transcript selection before preserving the exact prom
   } finally {
     setup.renderer.copyToClipboardOSC52 = originalCopy
     session.dispose()
-    act(() => setup.renderer.destroy())
+    setup.destroy()
   }
 })
 

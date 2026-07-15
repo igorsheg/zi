@@ -5,8 +5,16 @@ import {
   type AgentTool,
   type ThinkingLevel
 } from "@earendil-works/pi-agent-core"
-import { cleanupSessionResources, type Api, type ImageContent, type Model } from "@earendil-works/pi-ai"
+import {
+  clampThinkingLevel,
+  cleanupSessionResources,
+  getSupportedThinkingLevels,
+  type Api,
+  type ImageContent,
+  type Model
+} from "@earendil-works/pi-ai"
 
+import type { ModelRegistry } from "./model-registry.js"
 import type { SessionEntry, SessionManager } from "./session-manager.js"
 import type { SettingsManager } from "./settings-manager.js"
 
@@ -40,6 +48,11 @@ export type AgentSessionEvent =
   | { type: "model_changed"; model: Model<Api> }
   | { type: "thinking_level_changed"; level: ThinkingLevel }
 
+export interface ModelChoice {
+  readonly model: Model<Api>
+  readonly configured: boolean
+}
+
 export interface PromptOptions {
   images?: ImageContent[]
   streamingBehavior?: PendingInputDelivery
@@ -49,6 +62,7 @@ export interface AgentSessionConfig {
   agent: Agent
   sessionManager: SessionManager
   settingsManager: SettingsManager
+  modelRegistry: ModelRegistry
 }
 
 export class QueueCapacityError extends Error {
@@ -64,6 +78,8 @@ type Activity =
   | { type: "aborting"; runId: number; settled: Promise<void> }
   | { type: "failed"; runId: number; cause: unknown }
   | { type: "disposed"; settled: Promise<void> }
+
+type ModelMutationState = { type: "none" } | { type: "validating"; operationId: number }
 
 interface PendingInput {
   readonly id: number
@@ -88,6 +104,7 @@ export class AgentSession {
   readonly settingsManager: SettingsManager
 
   readonly #agent: Agent
+  readonly #modelRegistry: ModelRegistry
   readonly #listeners = new Set<(event: AgentSessionEvent) => void>()
   readonly #unsubscribeAgent: () => void
   #activity: Activity = { type: "idle" }
@@ -95,9 +112,13 @@ export class AgentSession {
   #pendingBytes = 0
   #nextRunId = 0
   #nextEntryId = 0
+  #nextModelOperationId = 0
+  #modelMutation: ModelMutationState = { type: "none" }
+  #modelChoicesPromise: Promise<readonly ModelChoice[]> | undefined
 
   constructor(config: AgentSessionConfig) {
     this.#agent = config.agent
+    this.#modelRegistry = config.modelRegistry
     this.sessionManager = config.sessionManager
     this.settingsManager = config.settingsManager
     this.#unsubscribeAgent = this.#agent.subscribe(event => this.#handleAgentEvent(event))
@@ -135,6 +156,24 @@ export class AgentSession {
     return this.sessionManager.sessionId
   }
 
+  listModelChoices(): Promise<readonly ModelChoice[]> {
+    this.#assertOpen()
+    if (this.#modelChoicesPromise) return this.#modelChoicesPromise
+
+    const models = [...this.#modelRegistry.list()]
+    const load = this.#modelRegistry
+      .resolveConfiguration(models)
+      .then(configured =>
+        Object.freeze(models.map((model, index) => Object.freeze({ model, configured: configured[index] ?? false })))
+      )
+    this.#modelChoicesPromise = load
+    void load.then(
+      () => this.#clearModelChoices(load),
+      () => this.#clearModelChoices(load)
+    )
+    return load
+  }
+
   subscribe(listener: (event: AgentSessionEvent) => void): () => void {
     this.#listeners.add(listener)
     return () => this.#listeners.delete(listener)
@@ -143,6 +182,7 @@ export class AgentSession {
   prompt(text: string, options: PromptOptions = {}): Promise<void> {
     switch (this.#activity.type) {
       case "idle": {
+        this.#modelMutation = { type: "none" }
         const runId = ++this.#nextRunId
         const settlement = createSettlement()
         this.#activity = { type: "running", runId, settled: settlement.promise }
@@ -244,15 +284,45 @@ export class AgentSession {
     }
   }
 
-  async setModel(model: Model<Api>): Promise<void> {
-    this.#assertIdle("change model")
-    this.sessionManager.appendModelChange(model.provider, model.id)
-    this.#agent.state.model = model
-    this.#emit({ type: "model_changed", model })
+  getSupportedThinkingLevels(): readonly ThinkingLevel[] {
+    return getSupportedThinkingLevels(this.model)
   }
 
-  setThinkingLevel(level: ThinkingLevel): void {
+  async setModel(model: Model<Api>): Promise<void> {
+    this.#assertIdle("change model")
+    const operationId = ++this.#nextModelOperationId
+    this.#modelMutation = { type: "validating", operationId }
+
+    try {
+      const configured = await this.#modelRegistry.isConfigured(model)
+      if (this.#modelMutation.type !== "validating" || this.#modelMutation.operationId !== operationId) {
+        throw new Error("Model change was superseded")
+      }
+      this.#assertIdle("change model")
+      if (!configured) throw new Error(`Model ${model.provider}/${model.id} is not authenticated`)
+
+      const effectiveThinking = clampThinkingLevel(model, this.thinkingLevel)
+      const thinkingChanged = effectiveThinking !== this.thinkingLevel
+      this.sessionManager.appendModelChange(model.provider, model.id)
+      if (thinkingChanged) this.sessionManager.appendThinkingLevelChange(effectiveThinking)
+      this.settingsManager.update({ model: `${model.provider}/${model.id}`, thinkingLevel: effectiveThinking })
+      this.#agent.state.model = model
+      this.#agent.state.thinkingLevel = effectiveThinking
+      const events: AgentSessionEvent[] = []
+      if (thinkingChanged) events.push({ type: "thinking_level_changed", level: effectiveThinking })
+      events.push({ type: "model_changed", model })
+      this.#emitAll(events)
+    } finally {
+      if (this.#modelMutation.type === "validating" && this.#modelMutation.operationId === operationId) {
+        this.#modelMutation = { type: "none" }
+      }
+    }
+  }
+
+  setThinkingLevel(requested: ThinkingLevel): void {
     this.#assertIdle("change thinking level")
+    const level = clampThinkingLevel(this.model, requested)
+    if (level === this.thinkingLevel) return
     this.sessionManager.appendThinkingLevelChange(level)
     this.settingsManager.update({ thinkingLevel: level })
     this.#agent.state.thinkingLevel = level
@@ -266,6 +336,7 @@ export class AgentSession {
 
   dispose(): void {
     if (this.#activity.type === "disposed") return
+    this.#modelMutation = { type: "none" }
     const settled =
       this.#activity.type === "running" || this.#activity.type === "aborting"
         ? this.#activity.settled
@@ -406,6 +477,10 @@ export class AgentSession {
     return Object.freeze({ steering: Object.freeze(steering), followUp: Object.freeze(followUp) })
   }
 
+  #clearModelChoices(load: Promise<readonly ModelChoice[]>): void {
+    if (this.#modelChoicesPromise === load) this.#modelChoicesPromise = undefined
+  }
+
   #emitQueue(): void {
     this.#emit({ type: "queue_update", ...this.#queueSnapshot() })
   }
@@ -420,6 +495,16 @@ export class AgentSession {
       }
     }
     if (failure) throw failure.cause
+  }
+
+  #emitAll(events: readonly AgentSessionEvent[]): void {
+    for (const event of events) {
+      try {
+        this.#emit(event)
+      } catch {
+        // The model transaction is already durable; one observer cannot turn a committed change into a failed operation.
+      }
+    }
   }
 
   #assertOpen(): void {

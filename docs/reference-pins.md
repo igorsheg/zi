@@ -8,6 +8,5 @@ Inspected on 2026-07-14:
 | `withastro/flue`     | `dbc9b05c`             | example of direct `pi-ai`/`pi-agent-core` integration |
 | `anomalyco/opentui`  | `5d57e27e` (`v0.4.3`)  | terminal implementation                               |
 | `anomalyco/opencode` | `cb8be9ba1`            | production OpenTUI application patterns               |
-| `igorsheg/zi`        | `5a8d750`              | visual styling target                                 |
 
 Refresh these pins deliberately when dependency versions change. They document what was inspected; package versions in `package.json` are the build inputs.

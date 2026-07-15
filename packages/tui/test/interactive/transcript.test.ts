@@ -1,7 +1,6 @@
 import { expect, test } from "bun:test"
 
 import { BoxRenderable, ScrollBoxRenderable, TextareaRenderable } from "@opentui/core"
-import { testRender } from "@opentui/react/test-utils"
 import {
   createAgentRuntime,
   createAgentSession,
@@ -16,19 +15,14 @@ import {
   fauxThinking,
   fauxToolCall
 } from "@openzi/coding-agent/testing"
-import { act, useState } from "react"
 
-import { App } from "../src/app.js"
+import { createInteractiveTest, type InteractiveTestSetup, renderSettled } from "./harness.js"
 
 /* oxlint-disable no-await-in-loop */
 
 test("manual page and line navigation detaches, coalesces unseen output, and returns to follow", async () => {
   const session = await createTranscriptSession(4)
-  const setup = await testRender(<App session={session} onExit={() => {}} />, {
-    width: 48,
-    height: 12,
-    kittyKeyboard: true
-  })
+  const setup = await createInteractiveTest(session, { width: 48, height: 12, kittyKeyboard: true })
 
   try {
     await renderSettled(setup)
@@ -38,20 +32,20 @@ test("manual page and line navigation detaches, coalesces unseen output, and ret
     expect(initialMaximum).toBeGreaterThan(0)
     expect(scroll.scrollTop).toBe(initialMaximum)
     expect(scroll.stickyScroll).toBe(true)
-    expect(setup.renderer.currentFocusedRenderable).toBe(input)
+    expect(setup.renderer.currentFocusedRenderable === input).toBe(true)
 
     const pageStart = scroll.scrollTop
     await pressRaw(setup, "\x1b[5~")
     expect(scroll.scrollTop).toBe(Math.max(0, Math.round(pageStart - scroll.viewport.height / 2)))
     expect(scroll.stickyScroll).toBe(false)
-    expect(setup.renderer.currentFocusedRenderable).toBe(input)
+    expect(setup.renderer.currentFocusedRenderable === input).toBe(true)
 
     await pressModifiedArrow(setup, "up")
     expect(scroll.scrollTop).toBe(Math.max(0, Math.round(pageStart - scroll.viewport.height / 2) - 1))
 
     const detachedTop = scroll.scrollTop
     const detachedViewportHeight = scroll.viewport.height
-    act(() => session.setThinkingLevel("low"))
+    session.setThinkingLevel("low")
     await renderSettled(setup)
     expect(scroll.scrollTop).toBe(detachedTop)
     expect(setup.captureCharFrame()).not.toContain("New output · Ctrl+End to jump")
@@ -82,17 +76,13 @@ test("manual page and line navigation detaches, coalesces unseen output, and ret
     expect(scroll.stickyScroll).toBe(true)
   } finally {
     session.dispose()
-    act(() => setup.renderer.destroy())
+    setup.destroy()
   }
 })
 
 test("one line above the tail stays detached when output commits", async () => {
   const session = await createTranscriptSession(1)
-  const setup = await testRender(<App session={session} onExit={() => {}} />, {
-    width: 48,
-    height: 12,
-    kittyKeyboard: true
-  })
+  const setup = await createInteractiveTest(session, { width: 48, height: 12, kittyKeyboard: true })
 
   try {
     await renderSettled(setup)
@@ -112,17 +102,13 @@ test("one line above the tail stays detached when output commits", async () => {
     expect(setup.captureCharFrame()).toContain("New output · Ctrl+End to jump")
   } finally {
     session.dispose()
-    act(() => setup.renderer.destroy())
+    setup.destroy()
   }
 })
 
 test("unseen status yields to a one-row transcript viewport", async () => {
   const session = await createTranscriptSession(1)
-  const setup = await testRender(<App session={session} onExit={() => {}} />, {
-    width: 20,
-    height: 4,
-    kittyKeyboard: true
-  })
+  const setup = await createInteractiveTest(session, { width: 20, height: 4, kittyKeyboard: true })
 
   try {
     await renderSettled(setup)
@@ -141,23 +127,19 @@ test("unseen status yields to a one-row transcript viewport", async () => {
     expect((setup.captureCharFrame().split("\n")[0] ?? "").trimEnd()).toBe(visibleRow)
     expect(setup.captureCharFrame()).not.toContain("New output · Ctrl+End to jump")
 
-    act(() => setup.resize(48, 12))
+    setup.resize(48, 12)
     await renderSettled(setup)
     expect(scroll.stickyScroll).toBe(false)
     expect(setup.captureCharFrame()).toContain("New output · Ctrl+End to jump")
   } finally {
     session.dispose()
-    act(() => setup.renderer.destroy())
+    setup.destroy()
   }
 })
 
 test("Ctrl+End jumps to the tail and a later manual operation cancels a queued jump", async () => {
   const session = await createTranscriptSession(2)
-  const setup = await testRender(<App session={session} onExit={() => {}} />, {
-    width: 48,
-    height: 12,
-    kittyKeyboard: true
-  })
+  const setup = await createInteractiveTest(session, { width: 48, height: 12, kittyKeyboard: true })
 
   try {
     await renderSettled(setup)
@@ -185,11 +167,9 @@ test("Ctrl+End jumps to the tail and a later manual operation cancels a queued j
 
     await pressRaw(setup, "\x1b[5~")
     const detachedTop = scroll.scrollTop
-    await act(async () => {
-      setup.mockInput.pressKey("END", { ctrl: true })
-      setup.mockInput.pressArrow("up", { ctrl: true, meta: true })
-      await Promise.resolve()
-    })
+    setup.mockInput.pressKey("END", { ctrl: true })
+    setup.mockInput.pressArrow("up", { ctrl: true, meta: true })
+    await Promise.resolve()
     await renderSettled(setup)
 
     expect(scroll.scrollTop).toBe(detachedTop - 1)
@@ -197,55 +177,45 @@ test("Ctrl+End jumps to the tail and a later manual operation cancels a queued j
     expect(scroll.stickyScroll).toBe(false)
   } finally {
     session.dispose()
-    act(() => setup.renderer.destroy())
+    setup.destroy()
   }
 })
 
 test("native wheel and resize mechanics preserve detached intent until all content fits", async () => {
   const session = await createTranscriptSession(2)
-  const setup = await testRender(<App session={session} onExit={() => {}} />, {
-    width: 48,
-    height: 12,
-    kittyKeyboard: true
-  })
+  const setup = await createInteractiveTest(session, { width: 48, height: 12, kittyKeyboard: true })
 
   try {
     await renderSettled(setup)
     const scroll = transcriptScroll(setup.renderer)
 
-    act(() => setup.resize(48, 9))
+    setup.resize(48, 9)
     await renderSettled(setup)
     expect(scroll.scrollTop).toBe(maximumScroll(scroll))
-    act(() => setup.resize(48, 14))
+    setup.resize(48, 14)
     await renderSettled(setup)
     expect(scroll.scrollTop).toBe(maximumScroll(scroll))
     const initialTail = scroll.scrollTop
 
     for (let index = 0; index < 3 && scroll.stickyScroll; index++) {
-      await act(async () => {
-        await setup.mockMouse.scroll(2, 2, "up")
-        await Promise.resolve()
-      })
+      await setup.mockMouse.scroll(2, 2, "up")
+      await Promise.resolve()
       await renderSettled(setup)
     }
     expect(scroll.scrollTop).toBeLessThan(initialTail)
     expect(scroll.stickyScroll).toBe(false)
 
     for (let index = 0; index < 20 && !scroll.stickyScroll; index++) {
-      await act(async () => {
-        await setup.mockMouse.scroll(2, 2, "down")
-        await Promise.resolve()
-      })
+      await setup.mockMouse.scroll(2, 2, "down")
+      await Promise.resolve()
       await renderSettled(setup)
     }
     expect(scroll.scrollTop).toBe(maximumScroll(scroll))
     expect(scroll.stickyScroll).toBe(true)
 
     for (let index = 0; index < 3 && scroll.stickyScroll; index++) {
-      await act(async () => {
-        await setup.mockMouse.scroll(2, 2, "up")
-        await Promise.resolve()
-      })
+      await setup.mockMouse.scroll(2, 2, "up")
+      await Promise.resolve()
       await renderSettled(setup)
     }
     expect(scroll.stickyScroll).toBe(false)
@@ -255,47 +225,41 @@ test("native wheel and resize mechanics preserve detached intent until all conte
 
     const status = transcriptStatus(setup.renderer)
     const beforeHintWheel = scroll.scrollTop
-    await act(async () => {
-      await setup.mockMouse.scroll(status.x + 1, status.y, "down")
-      await Promise.resolve()
-    })
+    await setup.mockMouse.scroll(status.x + 1, status.y, "down")
+    await Promise.resolve()
     await renderSettled(setup)
     expect(scroll.scrollTop).toBeGreaterThan(beforeHintWheel)
     expect(scroll.stickyScroll).toBe(false)
 
-    act(() => setup.resize(36, 9))
+    setup.resize(36, 9)
     await renderSettled(setup)
     expect(scroll.stickyScroll).toBe(false)
     expect(setup.captureCharFrame()).toContain("New output · Ctrl+End to jump")
 
-    act(() => setup.resize(52, 14))
+    setup.resize(52, 14)
     await renderSettled(setup)
     expect(scroll.stickyScroll).toBe(false)
     expect(setup.captureCharFrame()).toContain("New output · Ctrl+End to jump")
 
-    act(() => setup.resize(52, 80))
+    setup.resize(52, 80)
     await renderSettled(setup)
     expect(scroll.scrollHeight).toBeLessThanOrEqual(scroll.viewport.height)
     expect(scroll.stickyScroll).toBe(true)
     expect(setup.captureCharFrame()).not.toContain("New output · Ctrl+End to jump")
 
-    act(() => setup.resize(48, 10))
+    setup.resize(48, 10)
     await renderSettled(setup)
     expect(scroll.scrollTop).toBe(maximumScroll(scroll))
     expect(scroll.stickyScroll).toBe(true)
   } finally {
     session.dispose()
-    act(() => setup.renderer.destroy())
+    setup.destroy()
   }
 })
 
 test("native selection mouse-down detaches before its first drag event", async () => {
   const session = await createTranscriptSession(1)
-  const setup = await testRender(<App session={session} onExit={() => {}} />, {
-    width: 48,
-    height: 12,
-    kittyKeyboard: true
-  })
+  const setup = await createInteractiveTest(session, { width: 48, height: 12, kittyKeyboard: true })
 
   try {
     await renderSettled(setup)
@@ -308,10 +272,8 @@ test("native selection mouse-down detaches before its first drag event", async (
     expect(x).toBe(1)
     expect(y).toBeGreaterThanOrEqual(0)
 
-    await act(async () => {
-      await setup.mockMouse.pressDown(x, y)
-      await Promise.resolve()
-    })
+    await setup.mockMouse.pressDown(x, y)
+    await Promise.resolve()
     await renderSettled(setup)
 
     expect(setup.renderer.getSelection()?.isDragging).toBe(true)
@@ -323,30 +285,24 @@ test("native selection mouse-down detaches before its first drag event", async (
     expect(scroll.scrollTop).toBeLessThan(maximumScroll(scroll))
     expect(setup.captureCharFrame()).toContain("New output · Ctrl+End to jump")
 
-    await act(async () => {
-      await setup.mockMouse.moveTo(x + "history".length, y)
-      await setup.mockMouse.release(x + "history".length, y)
-      await Promise.resolve()
-    })
+    await setup.mockMouse.moveTo(x + "history".length, y)
+    await setup.mockMouse.release(x + "history".length, y)
+    await Promise.resolve()
     await renderSettled(setup)
 
     const selection = setup.renderer.getSelection()
     expect(selection?.isDragging).toBe(false)
     expect(selection?.getSelectedText()).toBe("history")
-    expect(setup.renderer.currentFocusedRenderable).toBe(input)
+    expect(setup.renderer.currentFocusedRenderable === input).toBe(true)
   } finally {
     session.dispose()
-    act(() => setup.renderer.destroy())
+    setup.destroy()
   }
 })
 
 test("native selection edge-scrolls in visual order and detaches before streamed output", async () => {
   const session = await createTranscriptSession(1)
-  const setup = await testRender(<App session={session} onExit={() => {}} />, {
-    width: 48,
-    height: 12,
-    kittyKeyboard: true
-  })
+  const setup = await createInteractiveTest(session, { width: 48, height: 12, kittyKeyboard: true })
 
   try {
     await renderSettled(setup)
@@ -358,11 +314,9 @@ test("native selection edge-scrolls in visual order and detaches before streamed
       .findIndex(row => row.includes("history row"))
     expect(startY).toBeGreaterThanOrEqual(0)
 
-    await act(async () => {
-      await setup.mockMouse.pressDown(1, startY)
-      await setup.mockMouse.moveTo(13, startY)
-      await Promise.resolve()
-    })
+    await setup.mockMouse.pressDown(1, startY)
+    await setup.mockMouse.moveTo(13, startY)
+    await Promise.resolve()
     await renderSettled(setup)
 
     expect(setup.renderer.getSelection()?.isDragging).toBe(true)
@@ -374,10 +328,8 @@ test("native selection edge-scrolls in visual order and detaches before streamed
     expect(scroll.scrollTop).toBeLessThan(maximumScroll(scroll))
     expect(setup.captureCharFrame()).toContain("New output · Ctrl+End to jump")
 
-    await act(async () => {
-      await setup.mockMouse.release(13, startY)
-      await Promise.resolve()
-    })
+    await setup.mockMouse.release(13, startY)
+    await Promise.resolve()
     await renderSettled(setup)
 
     const selection = setup.renderer.getSelection()
@@ -385,10 +337,10 @@ test("native selection edge-scrolls in visual order and detaches before streamed
     expect(selection?.getSelectedText()).toBe(
       "history row 2\nhistory row 3\nhistory row 4\nhistory row 5\nhistory row 6"
     )
-    expect(setup.renderer.currentFocusedRenderable).toBe(input)
+    expect(setup.renderer.currentFocusedRenderable === input).toBe(true)
   } finally {
     session.dispose()
-    act(() => setup.renderer.destroy())
+    setup.destroy()
   }
 })
 
@@ -411,28 +363,20 @@ test("streamed tool execution leaves a detached native viewport anchored", async
   ])
   const { session } = await createAgentRuntime({ cwd: process.cwd(), models, persist: false })
   await session.prompt("seed history")
-  const setup = await testRender(<App session={session} onExit={() => {}} />, {
-    width: 48,
-    height: 12,
-    kittyKeyboard: true
-  })
+  const setup = await createInteractiveTest(session, { width: 48, height: 12, kittyKeyboard: true })
 
   try {
     await renderSettled(setup)
     const scroll = transcriptScroll(setup.renderer)
     let operation!: Promise<void>
-    await act(async () => {
-      operation = session.prompt("run the tool")
-      await providerStarted.promise
-    })
+    operation = session.prompt("run the tool")
+    await providerStarted.promise
     await renderSettled(setup)
     await pressRaw(setup, "\x1b[5~")
     const detachedTop = scroll.scrollTop
 
-    await act(async () => {
-      releaseToolCall.resolve()
-      await operation
-    })
+    releaseToolCall.resolve()
+    await operation
     await renderSettled(setup)
 
     expect(session.messages.some(message => message.role === "toolResult" && message.toolCallId === "nav-bash")).toBe(
@@ -443,22 +387,14 @@ test("streamed tool execution leaves a detached native viewport anchored", async
     expect(occurrences(setup.captureCharFrame(), "New output · Ctrl+End to jump")).toBe(1)
   } finally {
     session.dispose()
-    act(() => setup.renderer.destroy())
+    setup.destroy()
   }
 })
 
 test("queued native callbacks cannot leak across a session replacement", async () => {
   const first = await createTranscriptSession(1)
   const second = await createTranscriptSession(1)
-  let replaceSession!: (session: AgentSession) => void
-
-  function SwitchingApp() {
-    const [session, setSession] = useState(first)
-    replaceSession = setSession
-    return <App session={session} onExit={() => {}} />
-  }
-
-  const setup = await testRender(<SwitchingApp />, { width: 48, height: 12, kittyKeyboard: true })
+  const setup = await createInteractiveTest(first, { width: 48, height: 12, kittyKeyboard: true })
 
   try {
     await renderSettled(setup)
@@ -466,25 +402,23 @@ test("queued native callbacks cannot leak across a session replacement", async (
     await pressRaw(setup, "\x1b[5~")
     expect(oldScroll.stickyScroll).toBe(false)
 
-    await act(async () => {
-      oldScroll.onSizeChange?.()
-      setup.mockInput.pressKey("END", { ctrl: true })
-      const wheel = setup.mockMouse.scroll(2, 2, "up")
-      replaceSession(second)
-      await wheel
-    })
+    oldScroll.onSizeChange?.()
+    setup.mockInput.pressKey("END", { ctrl: true })
+    const wheel = setup.mockMouse.scroll(2, 2, "up")
+    setup.mode.replaceSession(second)
+    await wheel
     await renderSettled(setup)
 
     const newScroll = transcriptScroll(setup.renderer)
     expect(oldScroll.isDestroyed).toBe(true)
-    expect(newScroll).not.toBe(oldScroll)
+    expect(newScroll === oldScroll).toBe(false)
     expect(newScroll.scrollTop).toBe(maximumScroll(newScroll))
     expect(newScroll.stickyScroll).toBe(true)
     expect(setup.captureCharFrame()).not.toContain("New output · Ctrl+End to jump")
   } finally {
     first.dispose()
     second.dispose()
-    act(() => setup.renderer.destroy())
+    setup.destroy()
   }
 })
 
@@ -514,61 +448,42 @@ function transcriptMessages(): AgentMessage[] {
   }))
 }
 
-type Setup = Awaited<ReturnType<typeof testRender>>
-
-async function renderSettled(setup: Setup): Promise<void> {
-  await act(async () => {
-    await setup.flush()
-  })
-  await act(async () => {
-    await setup.flush()
-  })
-}
-
-async function pressRaw(setup: Setup, sequence: string): Promise<void> {
-  await act(async () => {
-    setup.renderer.stdin.emit("data", Buffer.from(sequence))
-    await Promise.resolve()
-  })
+async function pressRaw(setup: InteractiveTestSetup, sequence: string): Promise<void> {
+  setup.renderer.stdin.emit("data", Buffer.from(sequence))
+  await Promise.resolve()
   await renderSettled(setup)
 }
 
-async function pressModifiedArrow(setup: Setup, direction: "up" | "down"): Promise<void> {
-  await act(async () => {
-    setup.mockInput.pressArrow(direction, { ctrl: true, meta: true })
-    await Promise.resolve()
-  })
+async function pressModifiedArrow(setup: InteractiveTestSetup, direction: "up" | "down"): Promise<void> {
+  setup.mockInput.pressArrow(direction, { ctrl: true, meta: true })
+  await Promise.resolve()
   await renderSettled(setup)
 }
 
-async function pressKey(setup: Setup, key: "END", modifiers: { ctrl: boolean }): Promise<void> {
-  await act(async () => {
-    setup.mockInput.pressKey(key, modifiers)
-    await Promise.resolve()
-  })
+async function pressKey(setup: InteractiveTestSetup, key: "END", modifiers: { ctrl: boolean }): Promise<void> {
+  setup.mockInput.pressKey(key, modifiers)
+  await Promise.resolve()
   await renderSettled(setup)
 }
 
-async function promptAndRender(session: AgentSession, setup: Setup, text: string): Promise<void> {
-  await act(async () => {
-    await session.prompt(text)
-  })
+async function promptAndRender(session: AgentSession, setup: InteractiveTestSetup, text: string): Promise<void> {
+  await session.prompt(text)
   await renderSettled(setup)
 }
 
-function transcriptScroll(renderer: Setup["renderer"]): ScrollBoxRenderable {
+function transcriptScroll(renderer: InteractiveTestSetup["renderer"]): ScrollBoxRenderable {
   const scroll = renderer.root.findDescendantById("transcript-scroll")
   if (!(scroll instanceof ScrollBoxRenderable)) throw new Error("Transcript scrollbox not found")
   return scroll
 }
 
-function promptInput(renderer: Setup["renderer"]): TextareaRenderable {
+function promptInput(renderer: InteractiveTestSetup["renderer"]): TextareaRenderable {
   const input = renderer.root.findDescendantById("prompt-input")
   if (!(input instanceof TextareaRenderable)) throw new Error("Prompt textarea not found")
   return input
 }
 
-function transcriptStatus(renderer: Setup["renderer"]): BoxRenderable {
+function transcriptStatus(renderer: InteractiveTestSetup["renderer"]): BoxRenderable {
   const status = renderer.root.findDescendantById("transcript-status")
   if (!(status instanceof BoxRenderable)) throw new Error("Transcript status not found")
   return status

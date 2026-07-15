@@ -1,3 +1,5 @@
+import { atom, type ReadableAtom } from "nanostores"
+
 export type TranscriptNavigation = { type: "following" } | { type: "detached"; unseenOutput: false | true }
 
 export type TranscriptNavigationEvent =
@@ -7,7 +9,24 @@ export type TranscriptNavigationEvent =
   | { type: "JUMP_TO_TAIL" }
   | { type: "RESIZE_SETTLED"; contentFits: boolean }
 
+export interface TranscriptStore {
+  readonly $navigation: ReadableAtom<TranscriptNavigation>
+  dispatch(event: TranscriptNavigationEvent): void
+}
+
 export const initialTranscriptNavigation: TranscriptNavigation = { type: "following" }
+
+export function createTranscriptStore(): TranscriptStore {
+  const $navigation = atom(initialTranscriptNavigation)
+  return {
+    $navigation,
+    dispatch(event) {
+      const current = $navigation.get()
+      const next = transitionTranscriptNavigation(current, event)
+      if (next !== current) $navigation.set(next)
+    }
+  }
+}
 
 export function transitionTranscriptNavigation(
   state: TranscriptNavigation,

@@ -51,5 +51,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions): Pr
     sessionManager.appendThinkingLevelChange(thinkingLevel)
   }
 
-  return new AgentSession({ agent, sessionManager, settingsManager: services.settingsManager })
+  return new AgentSession({
+    agent,
+    sessionManager,
+    settingsManager: services.settingsManager,
+    modelRegistry: services.modelRegistry
+  })
 }

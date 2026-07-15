@@ -3,7 +3,8 @@ import { expect, mock, test } from "bun:test"
 import { createTestRenderer } from "@opentui/core/testing"
 import { createAgentRuntime } from "@openzi/coding-agent"
 import { createModels, fauxProvider } from "@openzi/coding-agent/testing"
-test("renderer destruction tears down the session and terminal title once", async () => {
+
+test("renderer destruction tears down terminal resources without taking session ownership", async () => {
   const setup = await createTestRenderer({ width: 40, height: 8, useThread: false })
   const core = await import("@opentui/core")
   await mock.module("@opentui/core", () => ({ ...core, createCliRenderer: async () => setup.renderer }))
@@ -26,15 +27,16 @@ test("renderer destruction tears down the session and terminal title once", asyn
   }
 
   try {
-    const { runTui } = await import("../src/run.js")
+    const { runTui } = await import("../../src/interactive/run.js")
     const running = runTui({ session })
     await setup.renderOnce()
     setup.renderer.destroy()
     await running
 
-    expect(disposals).toBe(1)
+    expect(disposals).toBe(0)
     expect(titles).toEqual(["openzi", ""])
   } finally {
+    session.dispose()
     if (!setup.renderer.isDestroyed) setup.renderer.destroy()
     mock.restore()
   }

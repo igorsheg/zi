@@ -1,161 +1,182 @@
-# TUI architecture
+# Terminal interactive-mode architecture
 
-OpenZi's TUI is a direct OpenTUI React frontend for `AgentSession`. Its architecture follows the owners and lifetimes in this codebase and delegates terminal mechanics to OpenTUI. Pi interactive mode defines product behavior; Zi supplies the default visual direction.
+OpenZi's `InteractiveMode` is a terminal-specific application over the reusable `AgentSession` business boundary.
 
-## Reference roles
+## Pi ownership model
 
-| Reference                  | Role                                                                                                                                  |
-| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
-| OpenTUI React              | Renderer, layout, focus, input, selection, dimensions, and scrolling                                                                  |
-| React                      | Component composition and scoped frontend state                                                                                       |
-| Pi interactive mode        | Editor, keybinding, queue, command, selector, session-flow, and lifecycle behavior                                                    |
-| OpenCode                   | Proven OpenTUI patterns worth evaluating, especially direct rendering, deep prompts, scoped providers, overlays, and renderer cleanup |
-| Zi                         | Default palette, glyphs, spacing, and overall visual appearance                                                                       |
-| React composition patterns | API review guidance after concrete reuse appears                                                                                      |
+Pi's `packages/coding-agent/src/modes/interactive/interactive-mode.ts` imports `pi-tui`, constructs the TUI/editor, and directly uses terminal message, tool, selector, footer, and dialog components. Its print and RPC modes are separate adapters over the session/runtime boundary.
 
-OpenZi ports Pi interactive behavior capability by capability without recreating Pi's imperative TUI component system. It also does not copy OpenCode's Solid context graph, SDK/HTTP synchronization layer, command framework, or plugin slots. Zi defines neither behavior nor architecture.
+The architectural lesson is that `AgentSession` is reusable; terminal interaction state is not. OpenZi keeps the terminal code in `packages/tui` because it has a dedicated frontend workspace, but preserves Pi's ownership boundary.
 
-## Stack-native render path
+## Dependency boundary
 
 ```text
-runTui
-  -> OpenTUI renderer
-  -> React root
-      -> App
-          -> ThemeProvider
-          -> SessionProvider
-              -> SessionScreen
-                  -> Transcript
-                      -> message and tool presentation
-                  -> Prompt
-                      -> working/error status and textarea
-          -> overlays (when the first overlay feature arrives)
+packages/coding-agent
+  AgentSession, managers, tools, shared policy
+       ^
+       |
+packages/tui
+  terminal InteractiveMode, Nano Stores, imperative OpenTUI
+       ^
+       |
+packages/cli
+  runtime construction and mode selection
 ```
 
-- OpenTUI owns terminal mode, cell rendering, flex layout, clipping, focus, selection, input decoding, scroll mechanics, and terminal dimensions.
-- React owns component composition and ephemeral state scoped to a component lifetime.
-- `AgentSession` owns session policy, durable messages, active work, queues, cancellation, persistence, model, and thinking level.
-- Components render these owners directly. There is no frame model, row plan, frontend transcript, event bus, view-model layer, or generic widget tree.
+- `coding-agent` imports neither `@openzi/tui` nor `@opentui/core`.
+- `tui` consumes coding-agent public APIs and `@opentui/core`.
+- Future print/RPC modes consume `AgentSession` without loading OpenTUI.
+- A future web client receives its own application owner rather than terminal state.
 
-## Owners and lifetimes
+## Owner graph
 
-| Owner               | Mutable responsibility                                                                    | Lifetime                 |
-| ------------------- | ----------------------------------------------------------------------------------------- | ------------------------ |
-| `runTui`            | OpenTUI renderer, React root, process signals, terminal title, and ordered teardown       | Interactive process mode |
-| `App`               | One pre-created session and terminal-sized application composition                        | Mounted React root       |
-| `ThemeProvider`     | Active immutable semantic theme and native Markdown syntax style                          | App                      |
-| `SessionProvider`   | One `AgentSession` subscription and bounded transient tool-execution presentation         | Mounted session          |
-| `Transcript`        | Session scrollbox and later follow-tail, viewport position, and unseen-output interaction | Session screen           |
-| `Prompt`            | Textarea, focus, submission, local errors, and working status                             | Session screen           |
-| Future overlay host | Overlay stack and focus restoration                                                       | App                      |
+```text
+AgentSession
+  -> InteractiveMode
+      -> InteractiveCommands
+      -> InteractiveStore
+      -> SessionScreen
+          -> TranscriptView + TranscriptStore
+              -> message and tool renderables
+          -> PromptView + PromptStore
+              -> Composer + slash completion
+              -> ModelSelectorView + PickerList
+```
 
-Ownership follows mutable state and resource lifetime, not visual rectangles. A component that only renders props is not described as an owner.
+| Owner                 | Lifetime             | State and resources                                                                                    |
+| --------------------- | -------------------- | ------------------------------------------------------------------------------------------------------ |
+| `runTui`              | one terminal run     | renderer, signals, terminal title, abort deadline                                                      |
+| `InteractiveMode`     | one terminal mode    | root subtree, syntax style, current screen, focus, replacement, command aggregate, disposal            |
+| `InteractiveCommands` | one terminal mode    | descriptor aggregation, completion policy, invocation parsing into closed built-in intents             |
+| `InteractiveStore`    | one terminal mode    | session binding/generation, stale-event rejection, bounded active tools, prompt/queue/abort delegation |
+| `PromptStore`         | one prompt component | feedback, images, active completion, selector transitions, bounded async operation identity            |
+| `TranscriptStore`     | one transcript       | following versus detached navigation and unseen-output state                                           |
+| imperative component  | one renderable tree  | native children, subscriptions, input/mouse handlers, explicit destruction                             |
 
-`SessionProvider` does not copy session messages. Pi tool lifecycle events include transient progress that is not a durable message, so the provider retains only a bounded collection of active tool presentation. Session messages remain direct reads from `AgentSession`.
+The mode is cohesive, not monolithic: stores split mutable families by invariant and lifetime, while `InteractiveMode` owns their composition.
 
-## Frontend states and transitions
+## Source layout
 
-The project-wide explicit-state rules in [ADR 0004](adr/0004-explicit-state-and-transitions.md) apply inside React. A component with mutually exclusive modes owns a concrete union and the operations that transition it. Keyboard handlers request those operations; render branches display the resulting state; effects attach or synchronize owned OpenTUI resources. These paths may not each maintain their own interpretation of the mode.
+```text
+packages/tui/src/
+  interactive/
+    interactive-mode.ts
+    interactive-commands.ts
+    model-selector.ts
+    run.ts
+    stores/
+      interactive.ts
+      prompt.ts
+      transcript.ts
+    components/
+      session-screen.ts
+      prompt.ts
+      model-selector.ts
+      transcript.ts
+      message.ts
+      tool-block.ts
+  components/
+    composer.ts
+    picker-list.ts
+  glyphs.ts
+  theme.ts
+```
 
-Prompt modes, transcript follow-tail behavior, overlay focus, and session routing must therefore enter as explicit state machines in their concrete owners. For example, an overlay is not `isOpen` plus optional picker, error, and focus fields. Its closed, active-picker, and failure states carry exactly the data each state requires. This remains local component or reducer state until more than one real consumer requires a provider.
+Root `components/` contains domain-free terminal mechanics. `interactive/components/` may render coding-agent types but does not own coding-agent policy.
 
-## Component taxonomy
+Do not add a global store registry, generic action bus, universal frontend mode, or view-model corridor.
 
-### Screens
+## Interactive store
 
-A screen composes one product mode and owns its top-level layout. `SessionScreen` currently arranges the scrollable transcript and prompt. P0 constructs exactly one session before mounting `App`; add routing only when a second independently navigable screen exists.
+`InteractiveStore` is the mode's application-state owner:
 
-### Stateful product components
+```ts
+interface InteractiveStore {
+  readonly $state: ReadableAtom<InteractiveState>
+  readonly $generation: ReadableAtom<number>
+  readonly $promptRevision: ReadableAtom<number>
+  readonly $transcriptRevision: ReadableAtom<number>
+  readonly $activeTools: ReadableAtom<ReadonlyMap<string, ActiveTool>>
+  getSession(): AgentSession
+  replaceSession(session: AgentSession): void
+  submit(submission: PromptSubmission): Promise<void>
+  restoreQueuedInputs(): QueuedInputs
+  abortAndRestoreQueuedInputs(): AbortedQueuedInputs
+  abort(): Promise<void>
+  dispose(): void
+}
+```
 
-A stateful product component owns a cohesive interaction:
+It retains a current session reference for identity and replacement but does not copy messages, model, queues, or persistence state. Session events update only terminal revisions and bounded transient tool presentation. Events from a replaced session are rejected.
 
-- `Transcript` owns scrolling behavior because scroll position, follow-tail, unseen output, selection, and the scrollbox reference evolve together.
-- `Prompt` owns editing behavior because draft text, history, completion, attachments, shell mode, submission, and focus share one textarea.
+`InteractiveCommands` consumes command descriptors from coding-agent owners, supplies terminal completion candidates, and parses invocation strings into a closed built-in intent union. `PromptStore` never contains command syntax or descriptor metadata. It delegates session operations through `InteractiveStore` and owns feedback, retained images, active completion selection, and the closed composer/loading-models/model-selector/selecting-model workflow. Each async model operation captures its operation identity and session; cancellation, disposal, supersession, and session replacement reject stale completion. Live composer and model-search text remain native OpenTUI state and are passed into store operations rather than mirrored. `TranscriptStore` owns the closed following/detached/unseen union; native scroll offsets and selection remain in OpenTUI.
 
-These components should be deep. Splitting their behavior across pass-through wrappers would distribute one state machine without reducing complexity.
+Writable atoms are private. One coherent atom owns one invariant family; “small stores” does not mean an atom per field.
 
-### Presentation components
+## Imperative component contract
 
-Message variants and tool blocks turn concrete domain values into OpenTUI elements. Prefer explicit variants such as user, assistant, command tool, generic tool, and compaction presentation over boolean prop combinations. Assistant text uses OpenTUI's native Markdown renderable rather than a frontend parser or ANSI cache.
+An imperative component owns one renderable subtree:
 
-Presentation components may own bounded formatting policy, such as a tool output preview. They do not subscribe to sessions, schedule work, or mutate coding-agent state.
+```ts
+interface Composer {
+  readonly root: BoxRenderable
+  readonly input: TextareaRenderable
+  update(geometry: ComposerGeometry, title: string, bottomTitle: string): void
+  destroy(): void
+}
+```
 
-### UI infrastructure
+The owner:
 
-Infrastructure exists only for repeated cross-screen mechanism with a real lifetime:
+1. constructs children once where identity matters;
+2. subscribes to the narrow state it renders;
+3. mutates only its own renderables;
+4. installs native handlers explicitly;
+5. removes handlers and subscriptions before destroying its subtree.
 
-- theme resolution;
-- later, overlay focus restoration;
-- later, toast timeout ownership;
-- later, clipboard integration.
+Durable transcript messages are appended without rebuilding existing renderables. Streaming and active-tool tails are replaced independently, preserving native selection and detached scroll anchors.
 
-Do not create wrappers around `<box>` or `<text>` that merely forward styling props. There is no `Widget`, `Region`, `Surface`, generic provider contract, or component registry.
+## State placement
 
-## Theme and styling
+| State                                                              | Owner                         |
+| ------------------------------------------------------------------ | ----------------------------- |
+| Messages, model, thinking level, queues, persistence, run activity | `AgentSession`                |
+| Current session binding and generation                             | `InteractiveStore`            |
+| Transient tools and terminal render revisions                      | `InteractiveStore`            |
+| Prompt feedback, slash completion, model-selector workflow         | `PromptStore`                 |
+| Follow/detached/unseen transcript navigation                       | `TranscriptStore`             |
+| Textarea text, cursor, focus, paste, undo                          | OpenTUI `TextareaRenderable`  |
+| Scroll offset, viewport, selection                                 | OpenTUI renderables           |
+| Pending native callback generations                                | component owning the resource |
+| Renderer, signals, terminal title, shutdown deadline               | `runTui`                      |
+| Syntax style and root renderable                                   | `InteractiveMode`             |
 
-`Theme` contains semantic terminal color roles. The initial `ziTheme` implements the accepted Zi palette. Components consume it through `useTheme()`; application colors are not scattered through component files.
+There is no module-global mutable application state.
 
-Styling has three layers:
+## Input and lifecycle
 
-1. **Semantic theme roles** — application and content surfaces, text hierarchy, statuses, borders, Markdown, and diffs.
-2. **Glyph vocabulary** — shared structural symbols such as tool rails and selection markers.
-3. **Component geometry** — padding, margins, borders, wrapping, and visible-output caps remain with the component whose UI contract they express.
+Global key handlers prevent default before editor handling when terminal product semantics override native behavior. The prompt remains focused during transcript selection. Transcript navigation preserves detached intent across output and resize. Queued native callbacks validate their target before applying.
 
-Geometry is intentionally not hidden behind a global spacing scale. Terminal layout is cell-based and local values such as transcript rhythm or prompt expansion are easier to understand beside the responsible component.
+`InteractiveMode.dispose()` releases stores, subscriptions, handlers, syntax resources, and renderables. `runTui` owns renderer and signal resources, aborts the session during shutdown, and leaves final session disposal to the CLI that created it.
 
-P0 has one immutable built-in theme. Theme discovery, persistence, terminal-palette derivation, and a theme picker require their own later capabilities; the current context does not imply those systems already exist.
+## Commands and selectors
 
-## React composition policy
+Pi does not have one universal command registry. Built-in descriptors live in coding-agent's slash-command catalog, extension registrations live in `ExtensionRunner`, and prompt/skill commands live with session resources. Terminal `InteractiveMode` assembles those sources for completion and parses/dispatches terminal built-ins. Editor code owns completion mechanics only.
 
-Use React composition to keep concrete owners cohesive, not to turn the TUI into a component library.
+OpenZi mirrors this ownership. Coding-agent owns `builtinSlashCommands`. Mode-owned `InteractiveCommands` assembles completion candidates and parses built-in text into closed intents. `PromptStore` owns active completion and selector transitions after receiving an intent. For `/model`, `AgentSession` owns catalog configuration and model mutation; `ModelSelectorView` owns the native search input and selector renderables. `PromptView`, `Composer`, and `PickerList` know neither command names nor invocation syntax. Async selector effects record operation identity and admit completion only when identity, session, and active surface still match.
 
-- Keep providers specific: `ThemeProvider`, `SessionProvider`, and later an overlay provider.
-- Do not introduce a generic `{ state, actions, meta }` context while there is one session and one prompt implementation.
-- Do not make `Prompt` a compound component until at least two real prompt compositions need shared pieces.
-- Use children for structural composition, as `AppSurface` does; use explicit components such as `CommandToolBlock` when behavior differs.
-- Prefer children when a component genuinely accepts content composition; do not add `renderX` callbacks speculatively.
-- Add explicit variants when one component starts accumulating incompatible mode booleans.
-- Use React 19 `use()` and ref props; do not add `forwardRef` compatibility layers.
+## Testing
 
-The composition-patterns guidance is a review lens, not the source architecture.
-
-## Interactive-mode parity
-
-The behavior of `pi-coding-agent` interactive mode is characterized at the user-observable boundary. Fixtures may specify:
-
-- initial session and settings state;
-- an input or key sequence;
-- resulting session actions and state transitions;
-- focus, editor contents, queue contents, or selector state;
-- visible lifecycle semantics such as working, retry, compaction, cancellation, and errors.
-
-The source behavior lives under the pinned `pi-coding-agent/src/modes/interactive/` implementation and its tests. OpenZi reproduces that behavior through React and OpenTUI; a fixture may not require Pi component classes, `render(width): string[]`, manual invalidation, or `pi-tui` containers.
-
-## Zi visual target
-
-Zi-derived fixtures cover the default palette, glyphs, spacing, and representative terminal frames. They do not define keybindings, queue semantics, focus transitions, commands, or selector behavior.
-
-OpenTUI may provide its native wrapping, clipping, selection, and layout behavior unless a visual acceptance fixture demonstrates a mismatch.
+- Coding-agent behavior is tested at `AgentSession` boundaries.
+- Store transitions run without a renderer.
+- TUI fixtures instantiate `InteractiveMode` over `@opentui/core/testing`.
+- Fixtures drive real input, focus, resize, native selection, session replacement, and rendering.
 
 ## Growth rules
 
-- Add one capability through its concrete owner, explicit states and transitions, and visible acceptance test.
-- Add an overlay host with the first picker or dialog, not before.
-- Keep transcript rendering direct until multiple sessions with partial hydration create real pressure for a normalized cache.
-- Keep frontend collections bounded. Active tools, completion candidates, queue echoes, toasts, and overlay depth require explicit policies when introduced.
-- Extract a module when it contains cohesive mechanism behind a narrower interface, not to reduce file length.
-- If a proposed abstraction mirrors `AgentSession`, OpenTUI layout, or React state, delete it and render the owner directly.
-
-## P0 acceptance scope
-
-The P0 TUI architecture is established when:
-
-- renderer and shutdown ownership are explicit;
-- theme values and glyphs are centralized;
-- `SessionProvider` is the only session subscription boundary;
-- `Transcript` owns the scrollbox;
-- `Prompt` owns textarea interaction;
-- concrete message, Markdown, and tool presentation use semantic styling;
-- normal and constrained terminal fixtures exercise the real OpenTUI path.
-
-P0 is fixed by `packages/tui/test/visual-parity.test.tsx` at normal and constrained sizes, alongside the streamed complete-turn fixture. Later capabilities extend these fixtures through their concrete owners; they do not require another architecture layer.
+1. Determine whether behavior is coding-agent policy or terminal behavior.
+2. Put reusable coding-agent policy in `AgentSession` or a concrete manager.
+3. Put terminal-only state and resources in the TUI owner with the matching lifetime.
+4. Keep explicit states, bounds, stale-operation checks, and disposal with their owner.
+5. Move a primitive to root `components/` only when it is domain-free.
+6. Extract shared policy only after another real mode or client duplicates it.

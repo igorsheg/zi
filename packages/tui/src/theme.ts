@@ -1,7 +1,6 @@
 import { SyntaxStyle } from "@opentui/core"
-import { createContext, type ReactNode, use, useEffect, useMemo } from "react"
 
-type Color = `#${string}`
+export type Color = `#${string}`
 
 export interface Theme {
   surface: { app: Color; panel: Color; userMessage: Color; composer: Color }
@@ -43,9 +42,7 @@ export interface Theme {
   diff: { added: Color; removed: Color; context: Color }
 }
 
-// Zi is the P0 visual acceptance reference. Keep this palette synchronized with
-// igorsheg/zi src/tui/screen.zig at the commit pinned in docs/reference-pins.md.
-export const ziTheme: Theme = {
+export const defaultTheme: Theme = {
   surface: { app: "#090E13", panel: "#0D1218", userMessage: "#0D1218", composer: "#090E13" },
   text: {
     primary: "#C5C9C7",
@@ -85,37 +82,7 @@ export const ziTheme: Theme = {
   diff: { added: "#98BB6C", removed: "#E46876", context: "#535755" }
 }
 
-interface ThemeContextValue {
-  theme: Theme
-  syntaxStyle: SyntaxStyle
-}
-
-const ThemeContext = createContext<ThemeContextValue | undefined>(undefined)
-
-export function ThemeProvider({ theme, children }: { theme: Theme; children: ReactNode }) {
-  const syntaxStyle = useMemo(() => createSyntaxStyle(theme), [theme])
-  const value = useMemo(() => ({ theme, syntaxStyle }), [theme, syntaxStyle])
-
-  useEffect(() => () => syntaxStyle.destroy(), [syntaxStyle])
-
-  return <ThemeContext value={value}>{children}</ThemeContext>
-}
-
-export function useTheme(): Theme {
-  return useThemeContext().theme
-}
-
-export function useSyntaxStyle(): SyntaxStyle {
-  return useThemeContext().syntaxStyle
-}
-
-function useThemeContext(): ThemeContextValue {
-  const value = use(ThemeContext)
-  if (!value) throw new Error("Theme hooks must be used inside ThemeProvider")
-  return value
-}
-
-function createSyntaxStyle(theme: Theme): SyntaxStyle {
+export function createSyntaxStyle(theme: Theme): SyntaxStyle {
   return SyntaxStyle.fromStyles({
     default: { fg: theme.text.primary },
     comment: { fg: theme.syntax.comment, italic: true },
