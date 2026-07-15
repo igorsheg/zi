@@ -1,6 +1,9 @@
 import { builtinSlashCommands, type BuiltinSlashCommand, type BuiltinSlashCommandName } from "@openzi/coding-agent"
 
-export type InteractiveCommand = { readonly type: "model"; readonly search: string }
+export type InteractiveCommand =
+  | { readonly type: "model"; readonly search: string }
+  | { readonly type: "login"; readonly provider: string }
+  | { readonly type: "logout" }
 
 export interface InteractiveCommands {
   suggestions(text: string, cursorOffset: number): readonly BuiltinSlashCommand[]
@@ -25,6 +28,10 @@ export function createInteractiveCommands(): InteractiveCommands {
       switch (command.name) {
         case "model":
           return { type: "model", search: text === "/model" ? "" : text.slice(7).trim() }
+        case "login":
+          return { type: "login", provider: text === "/login" ? "" : text.slice(7).trim() }
+        case "logout":
+          return { type: "logout" }
         default:
           return assertNever(command.name)
       }

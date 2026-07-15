@@ -1,6 +1,7 @@
 import { createTestRenderer, type TestRendererOptions, type TestRendererSetup } from "@opentui/core/testing"
 import type { AgentSession } from "@openzi/coding-agent"
 
+import type { BrowserOpener } from "../../src/interactive/browser-opener.js"
 import type { InteractiveKeybindingOverrides } from "../../src/interactive/interactive-keybindings.js"
 import { InteractiveMode } from "../../src/interactive/interactive-mode.js"
 
@@ -13,13 +14,15 @@ export async function createInteractiveTest(
   session: AgentSession,
   options: TestRendererOptions,
   onExit: () => void = () => {},
-  keybindingOverrides?: InteractiveKeybindingOverrides
+  keybindingOverrides?: InteractiveKeybindingOverrides,
+  browserOpener: BrowserOpener = { open: async () => {}, dispose() {} }
 ): Promise<InteractiveTestSetup> {
   const setup = await createTestRenderer({ ...options, useThread: false })
   const mode = new InteractiveMode({
     renderer: setup.renderer,
     session,
     onExit,
+    browserOpener,
     ...(keybindingOverrides ? { keybindingOverrides } : {})
   })
   return {

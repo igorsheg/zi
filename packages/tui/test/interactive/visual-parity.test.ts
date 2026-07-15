@@ -1,9 +1,10 @@
 import { expect, test } from "bun:test"
 
 import { TextAttributes } from "@opentui/core"
-import { createAgentRuntime, createAgentSession, type AgentMessage, SessionManager } from "@openzi/coding-agent"
+import { createAgentSession, type AgentMessage, SessionManager } from "@openzi/coding-agent"
 import {
   createModels,
+  createTestAgentRuntime as createAgentRuntime,
   fauxAssistantMessage,
   fauxProvider,
   fauxText,

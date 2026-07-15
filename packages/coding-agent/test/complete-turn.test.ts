@@ -12,7 +12,7 @@ import {
   fauxToolCall
 } from "@earendil-works/pi-ai"
 
-import { createAgentRuntime } from "../src/runtime.js"
+import { createTestAgentRuntime as createAgentRuntime } from "../src/testing.js"
 
 test("one turn can write, read, edit, execute, stream, and persist", async () => {
   const root = await mkdtemp(join(tmpdir(), "openzi-turn-"))

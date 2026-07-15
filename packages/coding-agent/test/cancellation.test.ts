@@ -5,7 +5,7 @@ import { join } from "node:path"
 
 import { createModels, fauxAssistantMessage, fauxProvider } from "@earendil-works/pi-ai"
 
-import { createAgentRuntime } from "../src/runtime.js"
+import { createTestAgentRuntime as createAgentRuntime } from "../src/testing.js"
 
 test("abort settles the active session", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "openzi-abort-"))

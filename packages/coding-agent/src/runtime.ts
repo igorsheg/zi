@@ -1,4 +1,4 @@
-import type { Models } from "@earendil-works/pi-ai"
+import type { CredentialStore, Models } from "@earendil-works/pi-ai"
 import { builtinModels } from "@earendil-works/pi-ai/providers/all"
 
 import { FileCredentialStore } from "./credential-store.js"
@@ -18,7 +18,8 @@ export interface AgentRuntimeServices extends AgentSessionServices {
 export interface CreateAgentRuntimeOptions {
   cwd: string
   model?: string
-  models?: Models
+  apiKey?: string
+  modelFactory?: (credentials: CredentialStore) => Models
   agentDir?: string
   sessionDir?: string
   sessionFile?: string
@@ -44,12 +45,31 @@ export async function createAgentRuntime(options: CreateAgentRuntimeOptions) {
 
   const settingsManager = SettingsManager.create(paths, runtimeSettings)
   const credentialStore = new FileCredentialStore(paths)
-  const modelRegistry = new ModelRegistry(options.models ?? builtinModels({ credentials: credentialStore }))
+  const models = options.modelFactory?.(credentialStore) ?? builtinModels({ credentials: credentialStore })
+  const modelRegistry = new ModelRegistry(models)
   const resourceLoader = new DefaultResourceLoader({ paths })
   const services: AgentRuntimeServices = { paths, settingsManager, credentialStore, modelRegistry, resourceLoader }
-  const model = await resolveInitialModel(modelRegistry, settingsManager.get().model)
+  const modelReference = settingsManager.get().model
+  if (options.apiKey !== undefined && options.apiKey.length === 0) {
+    throw new Error("--api-key requires a non-empty value")
+  }
+  if (options.apiKey !== undefined && modelReference === undefined) {
+    throw new Error("--api-key requires a model so its provider can be determined")
+  }
+  const model = await resolveInitialModel(
+    modelRegistry,
+    modelReference,
+    options.model !== undefined || options.settings?.model !== undefined || options.apiKey !== undefined,
+    options.apiKey !== undefined
+  )
   const sessionManager =
     resumed ?? SessionManager.create(paths, options.persist === undefined ? {} : { persist: options.persist })
-  const session = await createAgentSession({ services, sessionManager, model, tools: createCodingTools(paths.cwd) })
+  const session = await createAgentSession({
+    services,
+    sessionManager,
+    ...(model ? { model } : {}),
+    ...(options.apiKey ? { apiKey: options.apiKey } : {}),
+    tools: createCodingTools(paths.cwd)
+  })
   return { session, services }
 }

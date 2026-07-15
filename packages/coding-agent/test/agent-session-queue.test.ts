@@ -8,8 +8,13 @@ import {
   maxPendingInputCount,
   QueueCapacityError
 } from "../src/agent-session.js"
-import { createAgentRuntime } from "../src/runtime.js"
-import { createModels, fauxAssistantMessage, fauxProvider, fauxToolCall } from "../src/testing.js"
+import {
+  createModels,
+  createTestAgentRuntime as createAgentRuntime,
+  fauxAssistantMessage,
+  fauxProvider,
+  fauxToolCall
+} from "../src/testing.js"
 
 const noParameters = Type.Object({})
 

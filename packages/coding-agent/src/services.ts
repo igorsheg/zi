@@ -2,6 +2,8 @@ import { Agent, type AgentTool } from "@earendil-works/pi-agent-core"
 import { clampThinkingLevel, type Api, type Model } from "@earendil-works/pi-ai"
 
 import { AgentSession } from "./agent-session.js"
+import { Authentication } from "./authentication.js"
+import type { FileCredentialStore } from "./credential-store.js"
 import type { ModelRegistry } from "./model-registry.js"
 import type { OpenZiPaths } from "./paths.js"
 import type { ResourceLoader } from "./resource-loader.js"
@@ -12,6 +14,7 @@ import { buildSystemPrompt } from "./system-prompt.js"
 export interface AgentSessionServices {
   paths: OpenZiPaths
   settingsManager: SettingsManager
+  credentialStore: FileCredentialStore
   modelRegistry: ModelRegistry
   resourceLoader: ResourceLoader
 }
@@ -19,7 +22,8 @@ export interface AgentSessionServices {
 export interface CreateAgentSessionOptions {
   services: AgentSessionServices
   sessionManager: SessionManager
-  model: Model<Api>
+  model?: Model<Api>
+  apiKey?: string
   tools: readonly AgentTool[]
 }
 
@@ -27,28 +31,33 @@ export async function createAgentSession(options: CreateAgentSessionOptions): Pr
   const { services, sessionManager, model } = options
   await services.resourceLoader.reload()
   const settings = services.settingsManager.get()
-  const thinkingLevel = clampThinkingLevel(model, settings.thinkingLevel)
+  const thinkingLevel = model ? clampThinkingLevel(model, settings.thinkingLevel) : "off"
   const existing = sessionManager.entries().length > 0
   services.settingsManager.applyRuntime({ thinkingLevel })
 
   const agent = new Agent({
     initialState: {
       systemPrompt: buildSystemPrompt(services.paths.cwd, services.resourceLoader.get()),
-      model,
+      ...(model ? { model } : {}),
       thinkingLevel,
       tools: [...options.tools],
       messages: sessionManager.messages()
     },
     sessionId: sessionManager.sessionId,
-    streamFn: (requestedModel, context, streamOptions) =>
-      services.modelRegistry.models.streamSimple(requestedModel, context, streamOptions),
+    streamFn: (requestedModel, context, streamOptions) => {
+      const apiKey = requestedModel.provider === model?.provider ? options.apiKey : undefined
+      return services.modelRegistry.models.streamSimple(requestedModel, context, {
+        ...streamOptions,
+        ...(apiKey ? { apiKey } : {})
+      })
+    },
     steeringMode: settings.steeringMode,
     followUpMode: settings.followUpMode,
     toolExecution: "parallel"
   })
 
   if (!existing) {
-    sessionManager.appendModelChange(model.provider, model.id)
+    if (model) sessionManager.appendModelChange(model.provider, model.id)
     sessionManager.appendThinkingLevelChange(thinkingLevel)
   }
 
@@ -56,6 +65,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions): Pr
     agent,
     sessionManager,
     settingsManager: services.settingsManager,
-    modelRegistry: services.modelRegistry
+    authentication: new Authentication(services.modelRegistry.models, services.credentialStore),
+    modelRegistry: services.modelRegistry,
+    ...(model ? { model } : {}),
+    ...(options.apiKey && model ? { apiKeyProvider: model.provider } : {})
   })
 }

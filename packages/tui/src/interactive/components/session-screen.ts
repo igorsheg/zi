@@ -1,10 +1,12 @@
 import { BoxRenderable, type CliRenderer, type SyntaxStyle } from "@opentui/core"
 
 import type { Theme } from "../../theme.js"
+import type { BrowserOpener } from "../browser-opener.js"
+import type { ExitGestureController } from "../exit-gesture.js"
 import type { InteractiveCommands } from "../interactive-commands.js"
 import type { InteractiveKeybindings } from "../interactive-keybindings.js"
 import type { InteractiveStore } from "../stores/interactive.js"
-import { PromptView, type ExitGestureAction } from "./prompt.js"
+import { PromptView } from "./prompt.js"
 import { TranscriptView } from "./transcript.js"
 
 export class SessionScreen {
@@ -17,15 +19,14 @@ export class SessionScreen {
     mode: InteractiveStore,
     commands: InteractiveCommands,
     keybindings: InteractiveKeybindings,
-    onClear: () => ExitGestureAction,
-    onExitGestureConsumed: () => void,
-    onExit: () => void,
+    exitGestures: ExitGestureController,
+    browserOpener: BrowserOpener,
     theme: Theme,
     syntaxStyle: SyntaxStyle
   ) {
     this.root = new BoxRenderable(renderer, { flexDirection: "column", flexGrow: 1, minHeight: 0 })
     this.transcript = new TranscriptView(renderer, mode, keybindings, theme, syntaxStyle)
-    this.prompt = new PromptView(renderer, mode, commands, keybindings, onClear, onExitGestureConsumed, onExit, theme)
+    this.prompt = new PromptView(renderer, mode, commands, keybindings, exitGestures, browserOpener, theme)
     this.root.add(this.transcript.root)
     this.root.add(this.prompt.root)
   }

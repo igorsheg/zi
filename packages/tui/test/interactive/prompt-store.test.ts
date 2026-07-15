@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test"
 
-import { createAgentRuntime, type AgentSession } from "@openzi/coding-agent"
-import { createModels, fauxProvider } from "@openzi/coding-agent/testing"
+import type { AgentSession } from "@openzi/coding-agent"
+import { createModels, createTestAgentRuntime as createAgentRuntime, fauxProvider } from "@openzi/coding-agent/testing"
 
 import { createInteractiveCommands } from "../../src/interactive/interactive-commands.js"
 import { createInteractiveStore } from "../../src/interactive/stores/interactive.js"
@@ -21,6 +21,7 @@ test("prompt store restores queued text, images, and status without a renderer",
       feedback: { type: "status", message: "Restored 1 queued message to editor with 1 image" },
       images: [{ type: "image", data: "aW1hZ2U=", mimeType: "image/png" }],
       workflow: { type: "idle" },
+      inputMode: "draft",
       inputEdit: { revision: 0, text: "" }
     })
     expect(session.queuedInputs.steering).toHaveLength(0)

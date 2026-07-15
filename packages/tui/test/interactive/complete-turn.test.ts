@@ -4,9 +4,9 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 
 import { TextareaRenderable } from "@opentui/core"
-import { createAgentRuntime } from "@openzi/coding-agent"
 import {
   createModels,
+  createTestAgentRuntime as createAgentRuntime,
   fauxAssistantMessage,
   fauxProvider,
   fauxText,

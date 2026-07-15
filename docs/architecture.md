@@ -57,7 +57,7 @@ The owner also owns temporal correctness. It records admission before starting a
 ```text
 createAgentRuntime(options)
   -> OpenZiPaths (global directory + effective cwd policy)
-  -> SettingsManager + FileCredentialStore + ModelRegistry + ResourceLoader
+  -> SettingsManager + FileCredentialStore + ModelRegistry + Authentication + ResourceLoader
   -> SessionManager
   -> createAgentSession(services, session options)
       -> AgentSession
@@ -72,20 +72,24 @@ createAgentRuntime(options)
 
 - one Pi `Agent`;
 - persistence of completed messages;
-- model and thinking-level changes;
+- explicit `unselected | selected` model state, including login-first startup, model and thinking-level changes;
 - steering and follow-up queues;
 - active-run admission, interruption, queue disposition, cancellation, and settlement;
 - later, retry, compaction, branch, bash, and extension policy.
 
-It exposes Pi agent events plus session-level events. Application modes subscribe; they do not control the provider loop or persist messages themselves.
+It exposes Pi agent events plus session-level events. Application modes subscribe; they do not control the provider loop or persist messages themselves. Runtime creation may produce an unselected session when no provider is authenticated; the terminal still starts, while prompt admission gives `/login` then `/model` guidance until `setModel()` commits the selected transition.
 
 ### Paths, managers, and services
 
 `OpenZiPaths` is the immutable path-policy owner for one effective cwd. It resolves the global `$HOME/.openzi` directory, exact `<cwd>/.openzi` project directory, settings, authentication, resources, and cwd-partitioned sessions. Runtime construction opens an explicit session first, then creates cwd-bound paths and services from the header cwd. See [ADR 0011](adr/0011-openzi-path-policy.md).
 
 - `SessionManager` owns one append-only JSONL session tree and its leaf; persistent creation receives `OpenZiPaths`.
-- `SettingsManager` owns defaults < global < project < runtime layering and scoped locked persistence.
-- `FileCredentialStore` owns global `auth.json` serialization for Pi AI model authentication.
+- `SettingsManager` owns defaults < valid global < valid project < runtime layering, explicit missing/loaded/invalid scopes, bounded locked persistence, reload, and non-fatal diagnostics.
+- `FileCredentialStore` owns bounded global `auth.json` serialization, redacted credential inspection, and the Pi AI `CredentialStore` contract.
+- Runtime model factories receive that credential owner, ensuring `ModelRegistry`, provider requests, OAuth refresh, and login operations cannot use shadow stores. The raw-model test adapter is isolated under `@openzi/coding-agent/testing`.
+- `Authentication` derives login methods from Pi AI providers, forwards bounded generic prompt/event contracts, owns login/logout operation identity and cancellation, and commits returned credentials through `FileCredentialStore`. It never reimplements provider protocols or OAuth refresh.
+- `--api-key` is a runtime-only provider override admitted only with an explicit or settings-inferred model. It marks only that provider available and is passed as Pi AI's explicit request option, ahead of stored and ambient auth, without entering settings, credentials, events, diagnostics, or journals.
+- `AgentSession` gates authentication against provider runs and model mutations, joins cancellation during interruption/shutdown, emits credential-free change events, and selects a provider's first known model after login when the session is unselected.
 - `ModelRegistry` wraps `pi-ai` model discovery and configured-provider checks.
 - `ResourceLoader` owns context and system-prompt discovery from the shared path policy, and later prompts, skills, extensions, and themes.
 - `createAgentSession` wires these owners to a Pi `Agent`.
@@ -113,26 +117,29 @@ AgentSession
   -> InteractiveMode
       -> InteractiveCommands
       -> InteractiveKeybindings
+      -> ExitGestureController
       -> InteractiveStore
       -> SessionScreen
           -> TranscriptView + TranscriptStore
           -> PromptView + PromptStore
+              -> PromptFeedbackView -> BrowserOpener
+              -> QueuedInputsView
               -> Composer
               -> PickerStack + PickerStackView
                   -> PickerList
 ```
 
-`InteractiveMode` owns the root renderable subtree, current session binding, session replacement, syntax-style lifetime, prompt-focus preservation, terminal disposal, `InteractiveCommands`, and one immutable `InteractiveKeybindings`. Coding-agent owners supply command descriptors; `InteractiveCommands` assembles terminal completion and parses built-in invocations into closed intents. `InteractiveKeybindings` resolves terminal-native events into closed semantic prompt/transcript actions and exposes effective hints and conflict metadata without containing action callbacks.
+`InteractiveMode` owns the root renderable subtree, current session binding, session replacement, syntax-style lifetime, prompt-focus preservation, terminal disposal, `InteractiveCommands`, one immutable `InteractiveKeybindings`, and one `ExitGestureController`. Coding-agent owners supply command descriptors; `InteractiveCommands` assembles terminal completion and parses built-in invocations into closed intents. `InteractiveKeybindings` resolves terminal-native events into closed semantic prompt/transcript actions and exposes effective hints and conflict metadata without containing action callbacks. Exit arming, expiry, consumption, and requests stay behind the concrete gesture owner rather than three lifecycle callbacks. Internal prompt coordination remains direct and typed; Pi's string-channel event bus is an extension-to-extension API, not an internal UI decomposition mechanism.
 
-`InteractiveStore` owns the session subscription, generation, bounded transient tools, submissions, and Escape cancellation with queue restoration. `PromptStore` owns terminal feedback, retained images, typed command/model workflows, and one-shot composer edit requests. `PickerStack` owns nested frames, selection, suspended parent filters, and filtering of only the active frame. `PickerStackView` renders that frame below the always-mounted composer and owns no input. `TranscriptStore` owns follow/detached/unseen navigation. Durable messages, model, queues, persistence, and activity remain direct `AgentSession` reads.
+`InteractiveStore` owns the session subscription, generation, bounded transient tools, submissions, and Escape cancellation with queue restoration. `PromptStore` owns terminal feedback, retained images, typed command/model/authentication workflows, pending provider-prompt settlement, stale-session rejection, and one-shot composer edit requests. `PickerStack` owns nested model, provider, method, provider-option, and logout frames plus selection, suspended parent filters, and filtering of only the active frame. `PickerStackView` renders that frame below the always-mounted composer and owns no input. `TranscriptStore` owns follow/detached/unseen navigation. Durable messages, model, queues, credentials, persistence, and activity remain direct `AgentSession` reads.
 
-Imperative components subscribe to readable Nano Stores and update only their owned renderables. Durable transcript message renderables are appended rather than rebuilt, preserving native selection and detached scrolling. The composer textarea is the sole prompt/filter input and remains focused while picker frames change. Product chords are resolved by the mode-owned semantic keybindings; components apply closed actions to concrete native resources and stores. Textarea contents, cursor, focus, viewport, selection, and ordinary editing remain OpenTUI-owned.
+Imperative components subscribe to readable Nano Stores and update only their owned renderables. `PromptView` coordinates the focused native input and semantic key precedence; `PromptFeedbackView` owns status/link renderables and one-shot browser requests; `QueuedInputsView` owns bounded queue layout. Durable transcript message renderables are appended rather than rebuilt, preserving native selection and detached scrolling. The composer textarea is the sole prompt/filter/authentication input and remains focused while picker frames change. Secret prompts switch that native textarea to `TextAttributes.HIDDEN`, disable selection, and clear it before provider continuation; secret values never enter Nano Store state, session events, or transcripts. Authentication URLs are bounded in coding-agent, rendered as styled OSC 8 links, and admitted to the mode-owned browser opener, which limits concurrent subprocesses, bounds settlement, and kills retained processes on disposal. Product chords are resolved by the mode-owned semantic keybindings; components apply closed actions to concrete native resources and stores. Textarea contents, cursor, focus, viewport, selection, and ordinary editing remain OpenTUI-owned.
 
 ## Resource shutdown
 
 1. the first interactive exit, signal, or renderer-destroy request admits one `runTui` close transition;
 2. the terminal mode stops accepting input and disposes subscriptions and renderables;
-3. `runTui` asks `AgentSession` to discard queued work and abort the active run;
+3. `runTui` asks `AgentSession` to discard queued work and abort the active provider run and authentication operation;
 4. `runTui` clears the title and destroys OpenTUI immediately;
 5. outside the alternate screen, `runTui` awaits run settlement with a deadline;
 6. the CLI reports any shutdown failure and disposes the `AgentSession` it created.

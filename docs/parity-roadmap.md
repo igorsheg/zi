@@ -5,7 +5,7 @@ The target is coding-agent architecture parity and observable product-behavior p
 ## P0 — one dependable turn
 
 - [x] Explicit provider registration and environment/API-key auth
-- [x] Model resolution and clear no-model diagnostics
+- [x] Model resolution, explicit unselected startup, and clear no-model diagnostics
 - [x] System prompt with cwd and project instructions
 - [x] `read`, `bash`, `edit`, and `write`
 - [x] Streaming assistant text and thinking
@@ -48,15 +48,24 @@ The target is coding-agent architecture parity and observable product-behavior p
 - [ ] `grep`, `find`, and `ls`
 - [x] Settings: global and project scope
 - [ ] Print and JSON modes sharing the same `AgentSession`
+- [x] Authentication commands and composer-owned provider flows
 
 ### P1 model-selection evidence
 
 - `packages/coding-agent/test/model-selection.test.ts` covers registry-order choices, provider-scoped authentication, bounded catalog work, canonical thinking capabilities, coherent persistence/events, admission, and model-validation races.
+- `packages/coding-agent/test/model-onboarding.test.ts` fixes explicit unselected startup, prompt guidance, first authenticated selection, settings/session persistence, and unavailable-model resume without history mutation. `packages/tui/test/interactive/model-onboarding.test.ts` proves the real terminal renders that state before `/login` exists.
 - `packages/tui/test/interactive/model-selector.test.ts` drives slash completion, exact and fuzzy `/model` paths, configured-provider filtering, Pi ordering, wrapped navigation, cancellation, mutation failure, stale completion, session replacement, persistent composer focus, and nested parent-filter restoration through real OpenTUI input and `AgentSession`.
 - `packages/tui/test/interactive/picker-stack.test.ts` fixes top-frame filtering, wrapped selection, nested push/pop, and suspended parent-filter restoration without an input renderable.
 - `packages/coding-agent/test/slash-commands.test.ts` fixes coding-agent ownership of supported built-in command descriptors.
 - Mode-owned `InteractiveCommands` assembles completion and parses invocation text into closed intents. Mode-owned `InteractiveKeybindings` resolves effective terminal actions without containing callbacks. `PromptStore` owns typed workflows and operation identity. `PickerStack` owns nested choice mechanics, while `PickerStackView` renders below the composer without creating another input. `PromptView`, `Composer`, `PickerStackView`, and `PickerList` contain no supported command names, argument rules, or dispatch policy.
 - Command catalog composition, terminal parsing, exact reference matching, fuzzy search, sorting, and selector keys are characterized from Pi's `interactive-mode.ts`, `model-selector.ts`, `model-search.ts`, `model-resolver.ts`, and `pi-tui` fuzzy/editor implementation at the pinned commit.
+
+### P1 authentication evidence
+
+- `packages/coding-agent/test/authentication.test.ts` fixes provider-derived API-key/OAuth methods, generic text/secret/select/manual-code prompts, browser/device events, interaction bounds, locked persistence, Pi AI-owned refresh, ambient auth after logout, stale completion rejection, and session-level cancellation/model gating.
+- `packages/coding-agent/test/runtime-api-key.test.ts` and `packages/cli/test/args.test.ts` fix `--api-key` parsing, required model-provider inference, request-option precedence, model availability, unchanged stored credentials, no auth-file creation, and loss of the override in a fresh runtime.
+- `Authentication` invokes the installed Pi AI provider contracts and persists through the runtime credential owner; provider protocols and OAuth refresh remain below that boundary. `AgentSession` gates this owner against runs and model mutations and chooses the provider's first known model after login when currently unselected.
+- `packages/tui/test/interactive/authentication.test.ts` drives slash completion, exact provider routing, nested provider/method filters, multi-prompt hidden API-key entry, OAuth URL/device/select/manual-code/progress presentation, OSC 8-safe links, Escape cancellation, stale session replacement, first-model title updates, and stored-only logout through real OpenTUI input.
 
 ### P1 steering and follow-up evidence
 
@@ -68,9 +77,9 @@ The target is coding-agent architecture parity and observable product-behavior p
 ### P1 path and settings evidence
 
 - `packages/coding-agent/test/paths.test.ts` fixes the `$HOME/.openzi` global root, exact `<cwd>/.openzi` project root, resource paths, canonical cwd session partition, and cwd-relative custom session directories.
-- `packages/coding-agent/test/settings-manager.test.ts` fixes defaults < global < project < runtime precedence plus scoped locked writes that preserve unknown fields.
-- `packages/coding-agent/test/credential-store.test.ts` fixes global-only credential persistence and proves the default Pi AI model registry consumes the same path-owned `auth.json`.
-- `packages/coding-agent/test/runtime-paths.test.ts` proves settings and default sessions share the effective cwd, including when an explicit session header replaces the invocation cwd.
+- `packages/coding-agent/test/settings-manager.test.ts` fixes defaults < valid global < valid project < runtime precedence, explicit malformed-scope diagnostics and recovery, write refusal for invalid data, bounded input/output, shared-file handling, and scoped locked writes that preserve unknown fields.
+- `packages/coding-agent/test/credential-store.test.ts` fixes global-only credential persistence, redacted listing, bounded input/output and provider count, no-overwrite failures, and proves the default Pi AI model registry consumes the same path-owned `auth.json`.
+- `packages/coding-agent/test/runtime-paths.test.ts` proves settings and default sessions share the effective cwd, including when an explicit session header replaces the invocation cwd, and proves runtime model factories consume the exact credential owner exposed by services.
 - The policy is characterized from Pi's `config.ts`, path utilities, settings manager, auth storage, resource loader, session manager, and session-service construction at the pinned commit. OpenZi deliberately maps the global root directly to `$HOME/.openzi` rather than retaining Pi's additional `agent/` segment; see ADR 0011.
 
 ### P1 conversation navigation evidence
@@ -86,7 +95,7 @@ The target is coding-agent architecture parity and observable product-behavior p
 - [ ] Skills
 - [ ] Prompt templates
 - [ ] Images and clipboard input
-- [ ] OAuth provider flows
+- [x] OAuth provider flows
 - [ ] Custom models/providers
 - [ ] Session tree/branch navigation and summaries
 - [ ] Export

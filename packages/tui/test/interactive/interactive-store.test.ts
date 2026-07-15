@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test"
 
-import { createAgentRuntime, type AgentSession, type AgentSessionEvent } from "@openzi/coding-agent"
-import { createModels, fauxProvider } from "@openzi/coding-agent/testing"
+import type { AgentSession, AgentSessionEvent } from "@openzi/coding-agent"
+import { createModels, createTestAgentRuntime as createAgentRuntime, fauxProvider } from "@openzi/coding-agent/testing"
 
 import {
   createInteractiveStore,

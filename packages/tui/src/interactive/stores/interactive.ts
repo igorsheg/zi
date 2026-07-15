@@ -179,6 +179,7 @@ export function transitionInteractiveState(state: InteractiveState, event: Agent
     case "agent_end":
     case "agent_settled":
     case "queue_update":
+    case "authentication_changed":
     case "model_changed":
     case "thinking_level_changed":
       promptRevision++

@@ -2,14 +2,12 @@ import { BoxRenderable, CliRenderEvents, type CliRenderer, type SyntaxStyle } fr
 import type { AgentSession } from "@openzi/coding-agent"
 
 import { createSyntaxStyle, defaultTheme, type Theme } from "../theme.js"
+import { type BrowserOpener, SystemBrowserOpener } from "./browser-opener.js"
 import { SessionScreen } from "./components/session-screen.js"
+import { ExitGestureController } from "./exit-gesture.js"
 import { createInteractiveCommands, type InteractiveCommands } from "./interactive-commands.js"
 import { InteractiveKeybindings, type InteractiveKeybindingOverrides } from "./interactive-keybindings.js"
 import { createInteractiveStore, type InteractiveStore } from "./stores/interactive.js"
-
-const exitGestureWindowMs = 500
-
-type ExitGestureState = { readonly type: "ready" } | { readonly type: "armed"; readonly pressedAt: number }
 
 export interface InteractiveModeOptions {
   readonly renderer: CliRenderer
@@ -17,6 +15,7 @@ export interface InteractiveModeOptions {
   readonly onExit: () => void
   readonly keybindingOverrides?: InteractiveKeybindingOverrides
   readonly theme?: Theme
+  readonly browserOpener?: BrowserOpener
 }
 
 export class InteractiveMode {
@@ -24,20 +23,28 @@ export class InteractiveMode {
   readonly store: InteractiveStore
 
   readonly #renderer: CliRenderer
-  readonly #onExit: () => void
+  readonly #browserOpener: BrowserOpener
+  readonly #exitGestures: ExitGestureController
   readonly #theme: Theme
   readonly #syntaxStyle: SyntaxStyle
   readonly #commands: InteractiveCommands
   readonly #keybindings: InteractiveKeybindings
   #screen: SessionScreen
   #releaseGeneration: () => void
-  #exitGesture: ExitGestureState = { type: "ready" }
   #disposed = false
 
-  constructor({ renderer, session, onExit, keybindingOverrides, theme = defaultTheme }: InteractiveModeOptions) {
+  constructor({
+    renderer,
+    session,
+    onExit,
+    keybindingOverrides,
+    theme = defaultTheme,
+    browserOpener = new SystemBrowserOpener()
+  }: InteractiveModeOptions) {
     this.#renderer = renderer
+    this.#browserOpener = browserOpener
+    this.#exitGestures = new ExitGestureController(onExit)
     this.store = createInteractiveStore(session)
-    this.#onExit = onExit
     this.#theme = theme
     this.#syntaxStyle = createSyntaxStyle(theme)
     this.#commands = createInteractiveCommands()
@@ -68,6 +75,7 @@ export class InteractiveMode {
     this.#releaseGeneration()
     this.#renderer.off(CliRenderEvents.SELECTION, this.#preservePromptFocus)
     this.#screen.destroy()
+    this.#browserOpener.dispose()
     this.root.destroyRecursively()
     this.#syntaxStyle.destroy()
     this.store.dispose()
@@ -84,30 +92,14 @@ export class InteractiveMode {
     this.#screen.prompt.focus()
   }
 
-  #handleClear = (): "armed" | "exit" => {
-    const now = Date.now()
-    if (this.#exitGesture.type === "armed" && now - this.#exitGesture.pressedAt < exitGestureWindowMs) {
-      this.#exitGesture = { type: "ready" }
-      this.#onExit()
-      return "exit"
-    }
-    this.#exitGesture = { type: "armed", pressedAt: now }
-    return "armed"
-  }
-
-  #resetExitGesture = (): void => {
-    this.#exitGesture = { type: "ready" }
-  }
-
   #createScreen(): SessionScreen {
     return new SessionScreen(
       this.#renderer,
       this.store,
       this.#commands,
       this.#keybindings,
-      this.#handleClear,
-      this.#resetExitGesture,
-      this.#onExit,
+      this.#exitGestures,
+      this.#browserOpener,
       this.#theme,
       this.#syntaxStyle
     )

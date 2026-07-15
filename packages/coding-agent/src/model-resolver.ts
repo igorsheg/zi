@@ -9,14 +9,20 @@ const preferred = [
   ["openrouter", "moonshotai/kimi-k2.6"]
 ] as const
 
-export class NoModelAvailableError extends Error {}
-
-export async function resolveInitialModel(registry: ModelRegistry, reference?: string): Promise<Model<Api>> {
+export async function resolveInitialModel(
+  registry: ModelRegistry,
+  reference?: string,
+  strictReference = false,
+  assumeConfigured = false
+): Promise<Model<Api> | undefined> {
   if (reference) {
     const model = registry.find(reference)
-    if (!model) throw new Error(`Unknown model: ${reference}. Use provider/model-id.`)
-    if (!(await registry.isConfigured(model))) throw new Error(`No authentication configured for ${model.provider}`)
-    return model
+    if (!model) {
+      if (strictReference) throw new Error(`Unknown model: ${reference}. Use provider/model-id.`)
+      return undefined
+    }
+    if (assumeConfigured) return model
+    return (await registry.isConfigured(model)) ? model : undefined
   }
 
   for (const [provider, id] of preferred) {
@@ -32,7 +38,5 @@ export async function resolveInitialModel(registry: ModelRegistry, reference?: s
     if (await registry.isConfigured(model)) return model // oxlint-disable-line no-await-in-loop
   }
 
-  throw new NoModelAvailableError(
-    "No configured model found. Set ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, or OPENROUTER_API_KEY, then pass --model provider/model-id if needed."
-  )
+  return undefined
 }

@@ -2,8 +2,12 @@ import { expect, mock, test } from "bun:test"
 
 import { TextareaRenderable } from "@opentui/core"
 import { createTestRenderer } from "@opentui/core/testing"
-import { createAgentRuntime } from "@openzi/coding-agent"
-import { createModels, fauxAssistantMessage, fauxProvider } from "@openzi/coding-agent/testing"
+import {
+  createModels,
+  createTestAgentRuntime as createAgentRuntime,
+  fauxAssistantMessage,
+  fauxProvider
+} from "@openzi/coding-agent/testing"
 
 test("interactive exit restores the terminal before settlement and discards queued work", async () => {
   const priorSighupListeners = new Set(process.listeners("SIGHUP"))
@@ -66,6 +70,53 @@ test("interactive exit restores the terminal before settlement and discards queu
     expect(process.listeners("SIGHUP").filter(listener => !priorSighupListeners.has(listener))).toHaveLength(0)
   } finally {
     session.dispose()
+    if (!setup.renderer.isDestroyed) setup.renderer.destroy()
+    mock.restore()
+  }
+})
+
+test("interactive shutdown restores the terminal before joining authentication cancellation", async () => {
+  const setup = await createTestRenderer({ width: 40, height: 8, useThread: false })
+  const core = await import("@opentui/core")
+  await mock.module("@opentui/core", () => ({ ...core, createCliRenderer: async () => setup.renderer }))
+
+  const models = createModels()
+  const faux = fauxProvider({ provider: "shutdown-auth", models: [{ id: "model" }] })
+  const started = deferred<void>()
+  const release = deferred<void>()
+  models.setProvider({
+    ...faux.provider,
+    auth: {
+      apiKey: {
+        name: "Shutdown key",
+        async login() {
+          started.resolve()
+          await release.promise
+          return { type: "api_key" as const, key: "must-not-persist" }
+        },
+        resolve: async () => ({ auth: { apiKey: "ambient" } })
+      }
+    }
+  })
+  const runtime = await createAgentRuntime({ cwd: "/work", models, persist: false })
+  const loginFailure = rejection(
+    runtime.session.login("shutdown-auth", "api_key", { prompt: async () => "", notify() {} })
+  )
+  await started.promise
+
+  try {
+    const { runTui } = await import("../../src/interactive/run.js")
+    const running = runTui({ session: runtime.session })
+    await setup.renderOnce()
+    setup.mockInput.pressKey("d", { ctrl: true })
+
+    expect(setup.renderer.isDestroyed).toBe(true)
+    release.resolve()
+    expect((await loginFailure).message).toContain("cancelled")
+    await running
+    expect(await runtime.services.credentialStore.read("shutdown-auth")).toBeUndefined()
+  } finally {
+    runtime.session.dispose()
     if (!setup.renderer.isDestroyed) setup.renderer.destroy()
     mock.restore()
   }

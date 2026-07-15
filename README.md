@@ -28,6 +28,8 @@ $HOME/.openzi/{settings.json,auth.json,sessions/,AGENTS.md,SYSTEM.md,...}
 
 Global settings are overlaid by project settings and then runtime overrides. Authentication and default sessions remain global; sessions are partitioned by canonical cwd. Resuming a session rebuilds cwd-bound services from the cwd stored in its header. See [ADR 0011](docs/adr/0011-openzi-path-policy.md).
 
+A fresh terminal can start without credentials; use `/login`, then `/model` if needed. `/logout` removes only stored credentials, not environment or external provider configuration. For a one-process override, use `openzi --model provider/model-id --api-key "$KEY"`; the key is applied in memory and is never written to settings or `auth.json`.
+
 ## Development
 
 Requires Bun 1.3.5. Installing dependencies also installs the Lefthook Git hooks.

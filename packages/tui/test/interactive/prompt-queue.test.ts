@@ -1,8 +1,13 @@
 import { expect, test } from "bun:test"
 
 import { TextareaRenderable } from "@opentui/core"
-import { createAgentRuntime } from "@openzi/coding-agent"
-import { createModels, fauxAssistantMessage, fauxProvider, fauxThinking } from "@openzi/coding-agent/testing"
+import {
+  createModels,
+  createTestAgentRuntime as createAgentRuntime,
+  fauxAssistantMessage,
+  fauxProvider,
+  fauxThinking
+} from "@openzi/coding-agent/testing"
 
 import { createInteractiveTest } from "./harness.js"
 

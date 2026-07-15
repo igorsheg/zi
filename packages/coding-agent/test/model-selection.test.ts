@@ -2,8 +2,12 @@ import { expect, test } from "bun:test"
 
 import { getSupportedThinkingLevels, type AuthResult } from "@earendil-works/pi-ai"
 
-import { createAgentRuntime } from "../src/runtime.js"
-import { createModels, fauxAssistantMessage, fauxProvider } from "../src/testing.js"
+import {
+  createModels,
+  createTestAgentRuntime as createAgentRuntime,
+  fauxAssistantMessage,
+  fauxProvider
+} from "../src/testing.js"
 
 test("model choices preserve registry identity and resolve provider configuration once per bounded catalog", async () => {
   const models = createModels()

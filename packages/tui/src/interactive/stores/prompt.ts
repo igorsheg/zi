@@ -1,28 +1,75 @@
 import type {
+  AuthenticationEvent,
+  AuthenticationMethod,
+  AuthenticationPrompt,
   BuiltinSlashCommand,
   ImageContent,
   ModelChoice,
   PendingInputDelivery,
-  QueuedInputs
+  QueuedInputs,
+  StoredCredential
 } from "@openzi/coding-agent"
 import { atom, type ReadableAtom } from "nanostores"
 
-import { glyphs } from "../../glyphs.js"
 import type { InteractiveCommands } from "../interactive-commands.js"
-import { configuredModelChoices, exactModelChoice, sameModel } from "../model-selector.js"
+import { configuredModelChoices, exactModelChoice } from "../model-selector.js"
+import {
+  authenticationMethodId,
+  authMethodFrame,
+  authOptionFrame,
+  authProviderFrame,
+  commandFrame,
+  logoutFrame,
+  modelChoiceId,
+  modelFrame,
+  promptPickerFrameIds
+} from "../prompt-picker-frames.js"
 import type { InteractiveStore } from "./interactive.js"
-import { createPickerStack, type PickerFrame, type PickerStack } from "./picker-stack.js"
+import { createPickerStack, type PickerStack } from "./picker-stack.js"
 
 export type PromptFeedback =
   | { readonly type: "none" }
   | { readonly type: "status"; readonly message: string }
   | { readonly type: "error"; readonly message: string }
+  | { readonly type: "auth_link"; readonly requestId: number; readonly message: string; readonly url: string }
 
 export type PromptWorkflow =
   | { readonly type: "idle" }
   | { readonly type: "loading_models"; readonly operationId: number }
   | { readonly type: "choosing_model"; readonly operationId: number; readonly choices: readonly ModelChoice[] }
   | { readonly type: "selecting_model"; readonly operationId: number }
+  | {
+      readonly type: "choosing_auth_provider"
+      readonly operationId: number
+      readonly methods: readonly AuthenticationMethod[]
+    }
+  | {
+      readonly type: "choosing_auth_method"
+      readonly operationId: number
+      readonly methods: readonly AuthenticationMethod[]
+    }
+  | { readonly type: "authenticating"; readonly operationId: number; readonly providerId: string }
+  | {
+      readonly type: "auth_prompt"
+      readonly operationId: number
+      readonly providerId: string
+      readonly promptType: "text" | "secret" | "manual_code"
+    }
+  | {
+      readonly type: "choosing_auth_option"
+      readonly operationId: number
+      readonly providerId: string
+      readonly options: readonly { readonly id: string; readonly label: string; readonly description?: string }[]
+    }
+  | { readonly type: "loading_logout"; readonly operationId: number }
+  | {
+      readonly type: "choosing_logout"
+      readonly operationId: number
+      readonly credentials: readonly StoredCredential[]
+    }
+  | { readonly type: "logging_out"; readonly operationId: number; readonly providerId: string }
+
+export type PromptInputMode = "draft" | "auth_text" | "auth_secret"
 
 export interface PromptInputEdit {
   readonly revision: number
@@ -33,6 +80,7 @@ export interface PromptState {
   readonly feedback: PromptFeedback
   readonly images: readonly ImageContent[]
   readonly workflow: PromptWorkflow
+  readonly inputMode: PromptInputMode
   readonly inputEdit: PromptInputEdit
 }
 
@@ -55,17 +103,25 @@ const initialPromptState: PromptState = {
   feedback: { type: "none" },
   images: [],
   workflow: { type: "idle" },
+  inputMode: "draft",
   inputEdit: { revision: 0, text: "" }
 }
-
-const commandFrameId = "commands"
-const modelFrameId = "models"
 
 export function createPromptStore(mode: InteractiveStore, commands: InteractiveCommands): PromptStore {
   const $state = atom(initialPromptState)
   const picker = createPickerStack()
   let disposed = false
   let nextOperationId = 0
+  let nextBrowserRequestId = 0
+  let activeAuthenticationSession: ReturnType<InteractiveStore["getSession"]> | undefined
+  let pendingAuthPrompt:
+    | {
+        readonly operationId: number
+        readonly resolve: (answer: string) => void
+        readonly reject: (cause: unknown) => void
+        readonly cleanup: () => void
+      }
+    | undefined
 
   const requestInput = (text: string) => {
     const state = $state.get()
@@ -75,6 +131,42 @@ export function createPromptStore(mode: InteractiveStore, commands: InteractiveC
   const showError = (cause: unknown) => {
     if (disposed) return
     $state.set({ ...$state.get(), feedback: { type: "error", message: errorMessage(cause) } })
+  }
+
+  const finishAuthentication = (feedback: PromptFeedback) => {
+    if (disposed) return
+    pendingAuthPrompt?.cleanup()
+    pendingAuthPrompt = undefined
+    activeAuthenticationSession = undefined
+    picker.close()
+    const state = $state.get()
+    $state.set({ ...state, feedback, workflow: { type: "idle" }, inputMode: "draft" })
+    requestInput("")
+  }
+
+  const cancelAuthentication = () => {
+    const workflow = $state.get().workflow
+    if (
+      workflow.type !== "authenticating" &&
+      workflow.type !== "auth_prompt" &&
+      workflow.type !== "choosing_auth_option"
+    ) {
+      return false
+    }
+    pendingAuthPrompt?.cleanup()
+    pendingAuthPrompt?.reject(new Error("Authentication cancelled"))
+    pendingAuthPrompt = undefined
+    const session = activeAuthenticationSession ?? mode.getSession()
+    activeAuthenticationSession = undefined
+    const state = $state.get()
+    $state.set({ ...state, feedback: { type: "none" }, workflow: { type: "idle" }, inputMode: "draft" })
+    requestInput("")
+    try {
+      void session.abort().catch(showError)
+    } catch (cause) {
+      if (!disposed) showError(cause)
+    }
+    return true
   }
 
   const closeModelPicker = (feedback: PromptFeedback) => {
@@ -149,7 +241,8 @@ export function createPromptStore(mode: InteractiveStore, commands: InteractiveC
     const operationId = ++nextOperationId
     const state = $state.get()
     $state.set({ ...state, feedback: { type: "none" }, workflow: { type: "loading_models", operationId } })
-    const loading = modelFrame([], session.model, "Loading models…")
+    const current = session.modelState.type === "selected" ? session.modelState.model : undefined
+    const loading = modelFrame([], current, "Loading models…")
     if (parentFilter === undefined) picker.open(loading)
     else picker.push(loading, parentFilter)
     requestInput(initialSearch)
@@ -166,14 +259,207 @@ export function createPromptStore(mode: InteractiveStore, commands: InteractiveC
       }
 
       if (!accepts(operationId, session)) return
-      const choices = configuredModelChoices(loaded, session.model)
+      const choices = configuredModelChoices(loaded, current)
       const exact = initialSearch ? exactModelChoice(initialSearch, choices) : undefined
       if (exact) {
         selectModel(operationId, session, exact)
         return
       }
-      picker.replaceTop(modelFrame(choices, session.model), initialSearch)
+      picker.replaceTop(modelFrame(choices, current), initialSearch)
       $state.set({ ...$state.get(), workflow: { type: "choosing_model", operationId, choices } })
+    }
+    void load()
+  }
+
+  const startAuthentication = (method: AuthenticationMethod) => {
+    const session = mode.getSession()
+    activeAuthenticationSession = session
+    const operationId = ++nextOperationId
+    picker.close()
+    const state = $state.get()
+    $state.set({
+      ...state,
+      feedback: { type: "status", message: `Starting ${method.name}…` },
+      workflow: { type: "authenticating", operationId, providerId: method.providerId },
+      inputMode: "draft"
+    })
+    requestInput("")
+
+    const prompt = (authPrompt: AuthenticationPrompt): Promise<string> => {
+      if (!accepts(operationId, session)) return Promise.reject(new Error("Authentication cancelled"))
+      return new Promise((resolve, reject) => {
+        const onAbort = () => {
+          if (pendingAuthPrompt?.operationId !== operationId) return
+          pendingAuthPrompt = undefined
+          picker.close()
+          const current = $state.get()
+          $state.set({
+            ...current,
+            workflow: { type: "authenticating", operationId, providerId: method.providerId },
+            inputMode: "draft"
+          })
+          requestInput("")
+          reject(new Error("Authentication prompt cancelled"))
+        }
+        authPrompt.signal?.addEventListener("abort", onAbort, { once: true })
+        pendingAuthPrompt = {
+          operationId,
+          resolve,
+          reject,
+          cleanup: () => authPrompt.signal?.removeEventListener("abort", onAbort)
+        }
+        const next = $state.get()
+        if (authPrompt.type === "select") {
+          picker.open(authOptionFrame(authPrompt.options))
+          $state.set({
+            ...next,
+            feedback: { type: "status", message: authPrompt.message },
+            workflow: {
+              type: "choosing_auth_option",
+              operationId,
+              providerId: method.providerId,
+              options: authPrompt.options
+            },
+            inputMode: "draft"
+          })
+        } else {
+          $state.set({
+            ...next,
+            feedback: { type: "status", message: authPrompt.message },
+            workflow: { type: "auth_prompt", operationId, providerId: method.providerId, promptType: authPrompt.type },
+            inputMode: authPrompt.type === "secret" ? "auth_secret" : "auth_text"
+          })
+        }
+        requestInput("")
+      })
+    }
+
+    const authenticate = async () => {
+      try {
+        await session.login(method.providerId, method.type, {
+          prompt,
+          notify(event) {
+            if (!accepts(operationId, session)) return
+            const next = $state.get()
+            $state.set({ ...next, feedback: authenticationEventFeedback(event, ++nextBrowserRequestId) })
+          }
+        })
+      } catch (cause) {
+        if (accepts(operationId, session)) finishAuthentication({ type: "error", message: errorMessage(cause) })
+        return
+      }
+      if (!accepts(operationId, session)) return
+      finishAuthentication({ type: "status", message: `Logged in to ${method.providerName}` })
+    }
+    void authenticate()
+  }
+
+  const openLogin = (provider: string, parentFilter?: string) => {
+    const methods = mode.getSession().authenticationMethods()
+    if (methods.length === 0) {
+      showError("No providers support interactive login")
+      return
+    }
+    const operationId = ++nextOperationId
+    const normalized = provider.trim().toLowerCase()
+    const exact = normalized ? methods.filter(method => method.providerId.toLowerCase() === normalized) : []
+    if (exact.length === 1) {
+      startAuthentication(exact[0]!)
+      return
+    }
+    if (exact.length > 1) {
+      const frame = authMethodFrame(exact)
+      if (parentFilter === undefined) picker.open(frame)
+      else picker.push(frame, parentFilter)
+      const state = $state.get()
+      $state.set({
+        ...state,
+        feedback: { type: "none" },
+        workflow: { type: "choosing_auth_method", operationId, methods: exact },
+        inputMode: "draft"
+      })
+      requestInput("")
+      return
+    }
+
+    const frame = authProviderFrame(methods)
+    if (parentFilter === undefined) picker.open(frame)
+    else picker.push(frame, parentFilter)
+    const state = $state.get()
+    $state.set({
+      ...state,
+      feedback: { type: "none" },
+      workflow: { type: "choosing_auth_provider", operationId, methods },
+      inputMode: "draft"
+    })
+    requestInput(provider)
+  }
+
+  const logoutProvider = (
+    operationId: number,
+    session: ReturnType<InteractiveStore["getSession"]>,
+    providerId: string
+  ) => {
+    picker.close()
+    const state = $state.get()
+    $state.set({
+      ...state,
+      feedback: { type: "status", message: `Removing stored credentials for ${providerId}…` },
+      workflow: { type: "logging_out", operationId, providerId },
+      inputMode: "draft"
+    })
+    requestInput("")
+    const apply = async () => {
+      try {
+        await session.logout(providerId)
+      } catch (cause) {
+        if (accepts(operationId, session)) finishAuthentication({ type: "error", message: errorMessage(cause) })
+        return
+      }
+      if (!accepts(operationId, session)) return
+      finishAuthentication({
+        type: "status",
+        message: `Logged out of ${providerId}; environment and external configuration remain available`
+      })
+    }
+    void apply()
+  }
+
+  const logout = () => {
+    const session = mode.getSession()
+    const operationId = ++nextOperationId
+    const state = $state.get()
+    $state.set({
+      ...state,
+      feedback: { type: "status", message: "Loading stored credentials…" },
+      workflow: { type: "loading_logout", operationId },
+      inputMode: "draft"
+    })
+    requestInput("")
+    const load = async () => {
+      let stored: readonly StoredCredential[]
+      try {
+        stored = await session.storedCredentials()
+      } catch (cause) {
+        if (accepts(operationId, session)) finishAuthentication({ type: "error", message: errorMessage(cause) })
+        return
+      }
+      if (!accepts(operationId, session)) return
+      if (stored.length === 0) {
+        finishAuthentication({ type: "status", message: "No stored credentials to remove" })
+        return
+      }
+      if (stored.length === 1) {
+        logoutProvider(operationId, session, stored[0]!.providerId)
+        return
+      }
+      picker.open(logoutFrame(stored))
+      const next = $state.get()
+      $state.set({
+        ...next,
+        feedback: { type: "none" },
+        workflow: { type: "choosing_logout", operationId, credentials: stored }
+      })
     }
     void load()
   }
@@ -184,6 +470,12 @@ export function createPromptStore(mode: InteractiveStore, commands: InteractiveC
     switch (commandType) {
       case "model":
         openModels(command.search, parentFilter)
+        return true
+      case "login":
+        openLogin(command.provider, parentFilter)
+        return true
+      case "logout":
+        logout()
         return true
       default:
         return assertNever(commandType)
@@ -197,8 +489,25 @@ export function createPromptStore(mode: InteractiveStore, commands: InteractiveC
     $state,
     picker,
     submit(text, delivery) {
+      const workflow = $state.get().workflow
+      if (workflow.type === "auth_prompt") {
+        if (!text || pendingAuthPrompt?.operationId !== workflow.operationId) return false
+        const pending = pendingAuthPrompt
+        pending.cleanup()
+        pendingAuthPrompt = undefined
+        const state = $state.get()
+        $state.set({
+          ...state,
+          workflow: { type: "authenticating", operationId: workflow.operationId, providerId: workflow.providerId },
+          inputMode: "draft"
+        })
+        requestInput("")
+        pending.resolve(text)
+        return true
+      }
+
       const trimmed = text.trim()
-      if (!trimmed || $state.get().workflow.type !== "idle") return false
+      if (!trimmed || workflow.type !== "idle") return false
 
       const command = commands.parse(trimmed)
       if (dispatchCommand(command)) return true
@@ -217,6 +526,7 @@ export function createPromptStore(mode: InteractiveStore, commands: InteractiveC
     },
     draftChanged(text, cursorOffset) {
       const workflow = $state.get().workflow
+      if (workflow.type === "auth_prompt" || workflow.type === "authenticating") return
       if (workflow.type !== "idle") {
         picker.queryChanged(text)
         return
@@ -224,16 +534,16 @@ export function createPromptStore(mode: InteractiveStore, commands: InteractiveC
 
       const suggestions = commands.suggestions(text, cursorOffset)
       if (suggestions.length === 0) {
-        if (picker.presentation(text)?.frame.id === commandFrameId) picker.close()
+        if (picker.presentation(text)?.frame.id === promptPickerFrameIds.commands) picker.close()
         return
       }
       const frame = commandFrame(suggestions)
-      if (picker.presentation(text)?.frame.id === commandFrameId) picker.replaceTop(frame, text)
+      if (picker.presentation(text)?.frame.id === promptPickerFrameIds.commands) picker.replaceTop(frame, text)
       else picker.open(frame)
     },
     completePicker(text, cursorOffset) {
       const presentation = picker.presentation(text)
-      if (presentation?.frame.id !== commandFrameId || !presentation.selectedId) return false
+      if (presentation?.frame.id !== promptPickerFrameIds.commands || !presentation.selectedId) return false
       const command = commandFor(text, cursorOffset, presentation.selectedId)
       if (!command) return false
       picker.close()
@@ -244,18 +554,74 @@ export function createPromptStore(mode: InteractiveStore, commands: InteractiveC
       const presentation = picker.presentation(text)
       if (!presentation?.selectedId) return false
 
-      if (presentation.frame.id === commandFrameId) {
+      if (presentation.frame.id === promptPickerFrameIds.commands) {
         const command = commandFor(text, cursorOffset, presentation.selectedId)
         if (!command) return false
         return dispatchCommand(commands.parse(commands.completion(command).trim()), text)
       }
 
-      if (presentation.frame.id === modelFrameId) {
+      if (presentation.frame.id === promptPickerFrameIds.models) {
         const workflow = $state.get().workflow
         if (workflow.type !== "choosing_model") return false
-        const choice = workflow.choices.find(candidate => modelId(candidate) === presentation.selectedId)
+        const choice = workflow.choices.find(candidate => modelChoiceId(candidate) === presentation.selectedId)
         if (!choice) return false
         selectModel(workflow.operationId, mode.getSession(), choice)
+        return true
+      }
+
+      if (presentation.frame.id === promptPickerFrameIds.authProviders) {
+        const workflow = $state.get().workflow
+        if (workflow.type !== "choosing_auth_provider") return false
+        const methods = workflow.methods.filter(method => method.providerId === presentation.selectedId)
+        if (methods.length === 1) {
+          startAuthentication(methods[0]!)
+          return true
+        }
+        if (methods.length === 0) return false
+        picker.push(authMethodFrame(methods), text || presentation.selectedId)
+        const state = $state.get()
+        $state.set({ ...state, workflow: { type: "choosing_auth_method", operationId: workflow.operationId, methods } })
+        requestInput("")
+        return true
+      }
+
+      if (presentation.frame.id === promptPickerFrameIds.authMethods) {
+        const workflow = $state.get().workflow
+        if (workflow.type !== "choosing_auth_method") return false
+        const method = workflow.methods.find(candidate => authenticationMethodId(candidate) === presentation.selectedId)
+        if (!method) return false
+        startAuthentication(method)
+        return true
+      }
+
+      if (presentation.frame.id === promptPickerFrameIds.authOptions) {
+        const workflow = $state.get().workflow
+        if (workflow.type !== "choosing_auth_option" || pendingAuthPrompt?.operationId !== workflow.operationId) {
+          return false
+        }
+        const option = workflow.options.find(candidate => candidate.id === presentation.selectedId)
+        if (!option) return false
+        const pending = pendingAuthPrompt
+        pending.cleanup()
+        pendingAuthPrompt = undefined
+        picker.close()
+        const state = $state.get()
+        $state.set({
+          ...state,
+          workflow: { type: "authenticating", operationId: workflow.operationId, providerId: workflow.providerId },
+          inputMode: "draft"
+        })
+        requestInput("")
+        pending.resolve(option.id)
+        return true
+      }
+
+      if (presentation.frame.id === promptPickerFrameIds.logoutProviders) {
+        const workflow = $state.get().workflow
+        if (workflow.type !== "choosing_logout") return false
+        const credential = workflow.credentials.find(candidate => candidate.providerId === presentation.selectedId)
+        if (!credential) return false
+        logoutProvider(workflow.operationId, mode.getSession(), credential.providerId)
         return true
       }
 
@@ -267,14 +633,29 @@ export function createPromptStore(mode: InteractiveStore, commands: InteractiveC
     backPicker() {
       const presentation = picker.presentation("")
       if (!presentation) return false
-      if (presentation.frame.id === commandFrameId) {
+      if (presentation.frame.id === promptPickerFrameIds.commands) {
         picker.close()
         return true
       }
+      if (presentation.frame.id === promptPickerFrameIds.authOptions) return cancelAuthentication()
 
       const result = picker.back()
       const state = $state.get()
-      $state.set({ ...state, workflow: { type: "idle" } })
+      if (presentation.frame.id === promptPickerFrameIds.authMethods && result.type === "revealed") {
+        const operationId =
+          state.workflow.type === "choosing_auth_method" ? state.workflow.operationId : ++nextOperationId
+        const allMethods = mode.getSession().authenticationMethods()
+        const revealedProviderFrame =
+          picker.presentation(result.filter)?.frame.id === promptPickerFrameIds.authProviders
+        $state.set({
+          ...state,
+          workflow: revealedProviderFrame
+            ? { type: "choosing_auth_provider", operationId, methods: allMethods }
+            : { type: "idle" }
+        })
+      } else {
+        $state.set({ ...state, workflow: { type: "idle" } })
+      }
       if (result.type === "revealed") requestInput(result.filter)
       else requestInput("")
       return true
@@ -288,6 +669,7 @@ export function createPromptStore(mode: InteractiveStore, commands: InteractiveC
       }
     },
     abortAndRestoreQueuedInputs(currentText) {
+      if (cancelAuthentication()) return ""
       try {
         const aborted = mode.abortAndRestoreQueuedInputs()
         const text = mergeQueue(aborted, currentText, false)
@@ -299,66 +681,31 @@ export function createPromptStore(mode: InteractiveStore, commands: InteractiveC
       }
     },
     clear() {
+      if (cancelAuthentication()) return
       picker.close()
       const state = $state.get()
       $state.set({ ...initialPromptState, inputEdit: { revision: state.inputEdit.revision + 1, text: "" } })
     },
     dispose() {
       if (disposed) return
+      cancelAuthentication()
       disposed = true
       picker.dispose()
     }
   }
 }
 
-function commandFrame(commands: readonly BuiltinSlashCommand[]): PickerFrame {
-  return {
-    id: commandFrameId,
-    title: "",
-    filter: "none",
-    rows: commands.map(command => ({
-      id: command.name,
-      label: `/${command.name}`,
-      ...(command.argumentHint ? { detail: command.argumentHint } : {}),
-      metadata: command.description,
-      searchText: `${command.name} ${command.description} ${command.argumentHint ?? ""}`
-    }))
+function authenticationEventFeedback(event: AuthenticationEvent, requestId: number): PromptFeedback {
+  switch (event.type) {
+    case "auth_url":
+      return { type: "auth_link", requestId, message: event.instructions ?? "Open", url: event.url }
+    case "device_code":
+      return { type: "auth_link", requestId, message: `Enter ${event.userCode} at`, url: event.verificationUri }
+    case "progress":
+      return { type: "status", message: event.message }
+    default:
+      return assertNever(event)
   }
-}
-
-function modelFrame(
-  choices: readonly ModelChoice[],
-  current: ModelChoice["model"],
-  emptyText = "No matching models"
-): PickerFrame {
-  return {
-    id: modelFrameId,
-    title: "Models",
-    hint: "Only showing models from configured providers. Use /login to add providers.",
-    filter: "fuzzy",
-    emptyText,
-    rows: choices.map(choice => ({
-      id: modelId(choice),
-      label: choice.model.id,
-      detail: `[${choice.model.provider}]`,
-      ...(sameModel(choice.model, current) ? { metadata: glyphs.check } : {}),
-      searchText: modelSearchText(choice)
-    })),
-    ...(choices.some(choice => sameModel(choice.model, current)) ? { selectedId: modelIdFor(current) } : {})
-  }
-}
-
-function modelSearchText(choice: ModelChoice): string {
-  const { id, name, provider } = choice.model
-  return `${provider} ${provider}/${id} ${provider} ${id}${name ? ` ${name}` : ""}`
-}
-
-function modelId(choice: ModelChoice): string {
-  return modelIdFor(choice.model)
-}
-
-function modelIdFor(model: ModelChoice["model"]): string {
-  return `${model.provider}/${model.id}`
 }
 
 function errorMessage(cause: unknown): string {
@@ -366,5 +713,5 @@ function errorMessage(cause: unknown): string {
 }
 
 function assertNever(value: never): never {
-  throw new Error(`Unexpected interactive command: ${String(value)}`)
+  throw new Error(`Unexpected closed value: ${String(value)}`)
 }

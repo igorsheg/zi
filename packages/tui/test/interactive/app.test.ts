@@ -1,8 +1,7 @@
 import { expect, spyOn, test } from "bun:test"
 
 import { TextareaRenderable } from "@opentui/core"
-import { createAgentRuntime } from "@openzi/coding-agent"
-import { createModels, fauxProvider } from "@openzi/coding-agent/testing"
+import { createModels, createTestAgentRuntime as createAgentRuntime, fauxProvider } from "@openzi/coding-agent/testing"
 
 import { createInteractiveTest, renderSettled } from "./harness.js"
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 
-import { createAgentRuntime, NoModelAvailableError } from "@openzi/coding-agent"
+import { createAgentRuntime } from "@openzi/coding-agent"
 
 import { parseArgs } from "./args.js"
 
@@ -10,6 +10,7 @@ try {
     cwd: args.cwd,
     persist: !args.noSession,
     ...(args.model === undefined ? {} : { model: args.model }),
+    ...(args.apiKey === undefined ? {} : { apiKey: args.apiKey }),
     ...(args.sessionFile === undefined ? {} : { sessionFile: args.sessionFile })
   })
   try {
@@ -21,5 +22,5 @@ try {
 } catch (error) {
   const message = error instanceof Error ? error.message : String(error)
   process.stderr.write(`${message}\n`)
-  process.exitCode = error instanceof NoModelAvailableError ? 2 : 1
+  process.exitCode = 1
 }

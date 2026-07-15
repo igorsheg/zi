@@ -2,7 +2,7 @@ import type { ModelChoice } from "@openzi/coding-agent"
 
 export function configuredModelChoices(
   choices: readonly ModelChoice[],
-  current: ModelChoice["model"]
+  current: ModelChoice["model"] | undefined
 ): readonly ModelChoice[] {
   return choices
     .filter(choice => choice.configured)
@@ -42,6 +42,6 @@ export function exactModelChoice(reference: string, choices: readonly ModelChoic
   return byId.length === 1 ? byId[0] : undefined
 }
 
-export function sameModel(left: ModelChoice["model"], right: ModelChoice["model"]): boolean {
-  return left.provider === right.provider && left.id === right.id
+export function sameModel(left: ModelChoice["model"], right: ModelChoice["model"] | undefined): boolean {
+  return Boolean(right && left.provider === right.provider && left.id === right.id)
 }

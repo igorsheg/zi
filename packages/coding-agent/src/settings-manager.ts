@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs"
+import { closeSync, existsSync, mkdirSync, openSync, readSync, renameSync, unlinkSync, writeFileSync } from "node:fs"
 import { basename, dirname, join } from "node:path"
 
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core"
@@ -13,33 +13,54 @@ export interface AgentSettings {
   followUpMode: "all" | "one-at-a-time"
 }
 
+export const maxSettingsFileBytes = 1024 * 1024
+
 const defaults: AgentSettings = {
   thinkingLevel: "medium",
   steeringMode: "one-at-a-time",
   followUpMode: "one-at-a-time"
 }
 
+export type SettingsScope = "global" | "project"
+
+export interface SettingsError {
+  readonly scope: SettingsScope
+  readonly path: string
+  readonly error: Error
+}
+
+type SettingsScopeState =
+  | { readonly type: "missing"; readonly path: string }
+  | { readonly type: "loaded"; readonly path: string; readonly settings: Partial<AgentSettings> }
+  | { readonly type: "invalid"; readonly path: string; readonly error: Error }
+
 export class SettingsManager {
-  #global: Partial<AgentSettings>
-  #project: Partial<AgentSettings> = {}
+  #global: SettingsScopeState
+  #project: SettingsScopeState
   #runtime: Partial<AgentSettings> = {}
   #settings: Readonly<AgentSettings>
   #paths: OpenZiPaths | undefined
   #sharedSettingsFile = false
+  #errors: SettingsError[] = []
 
   constructor(settings: Partial<AgentSettings> = {}) {
-    this.#global = { ...settings }
-    this.#settings = mergeSettings(this.#global)
+    this.#global = { type: "loaded", path: "<memory>", settings: { ...settings } }
+    this.#project = { type: "missing", path: "<memory>" }
+    this.#settings = mergeSettings(settings)
   }
 
   static create(paths: OpenZiPaths, runtime: Partial<AgentSettings> = {}): SettingsManager {
     const manager = new SettingsManager()
     manager.#paths = paths
     manager.#sharedSettingsFile = paths.globalSettingsFile === paths.projectSettingsFile
-    manager.#global = loadSettings(paths.globalSettingsFile)
-    manager.#project = manager.#sharedSettingsFile ? {} : loadSettings(paths.projectSettingsFile)
+    manager.#global = loadScope(paths.globalSettingsFile)
+    manager.#project = manager.#sharedSettingsFile
+      ? { type: "missing", path: paths.projectSettingsFile }
+      : loadScope(paths.projectSettingsFile)
     manager.#runtime = { ...runtime }
-    manager.#settings = mergeSettings(manager.#global, manager.#project, manager.#runtime)
+    manager.#recordLoadError("global", manager.#global)
+    manager.#recordLoadError("project", manager.#project)
+    manager.#recompute()
     return manager
   }
 
@@ -48,35 +69,80 @@ export class SettingsManager {
   }
 
   getGlobal(): Readonly<Partial<AgentSettings>> {
-    return Object.freeze({ ...this.#global })
+    return Object.freeze({ ...scopeSettings(this.#global) })
   }
 
   getProject(): Readonly<Partial<AgentSettings>> {
-    return Object.freeze({ ...this.#project })
+    return Object.freeze({ ...scopeSettings(this.#project) })
   }
 
-  update(patch: Partial<AgentSettings>): void {
-    if (this.#paths) persistSettings(this.#paths.globalSettingsFile, patch)
-    this.#global = { ...this.#global, ...patch }
+  updateGlobal(patch: Partial<AgentSettings>): void {
+    this.#global = this.#updateScope("global", this.#global, patch)
     clearRuntimeOverrides(this.#runtime, patch)
-    this.#settings = mergeSettings(this.#global, this.#project, this.#runtime)
+    this.#recompute()
   }
 
   updateProject(patch: Partial<AgentSettings>): void {
     if (this.#sharedSettingsFile) {
-      this.update(patch)
+      this.updateGlobal(patch)
       return
     }
-    if (this.#paths) persistSettings(this.#paths.projectSettingsFile, patch)
-    this.#project = { ...this.#project, ...patch }
+    this.#project = this.#updateScope("project", this.#project, patch)
     clearRuntimeOverrides(this.#runtime, patch)
-    this.#settings = mergeSettings(this.#global, this.#project, this.#runtime)
+    this.#recompute()
   }
 
   applyRuntime(patch: Partial<AgentSettings>): void {
     this.#runtime = { ...this.#runtime, ...patch }
-    this.#settings = mergeSettings(this.#global, this.#project, this.#runtime)
+    this.#recompute()
   }
+
+  reload(): void {
+    if (!this.#paths) return
+    this.#global = loadScope(this.#paths.globalSettingsFile)
+    this.#project = this.#sharedSettingsFile
+      ? { type: "missing", path: this.#paths.projectSettingsFile }
+      : loadScope(this.#paths.projectSettingsFile)
+    this.#recordLoadError("global", this.#global)
+    this.#recordLoadError("project", this.#project)
+    this.#recompute()
+  }
+
+  drainErrors(): SettingsError[] {
+    const errors = this.#errors
+    this.#errors = []
+    return errors
+  }
+
+  #updateScope(scope: SettingsScope, state: SettingsScopeState, patch: Partial<AgentSettings>): SettingsScopeState {
+    if (state.type === "invalid") {
+      throw new Error(`Cannot update invalid ${scope} settings: ${state.path}`, { cause: state.error })
+    }
+    if (this.#paths) persistSettings(state.path, patch)
+    return { type: "loaded", path: state.path, settings: { ...scopeSettings(state), ...patch } }
+  }
+
+  #recordLoadError(scope: SettingsScope, state: SettingsScopeState): void {
+    if (state.type === "invalid") this.#errors.push({ scope, path: state.path, error: state.error })
+  }
+
+  #recompute(): void {
+    this.#settings = mergeSettings(scopeSettings(this.#global), scopeSettings(this.#project), this.#runtime)
+  }
+}
+
+function loadScope(path: string): SettingsScopeState {
+  if (!existsSync(path)) return { type: "missing", path }
+  try {
+    return { type: "loaded", path, settings: loadSettings(path) }
+  } catch (cause) {
+    const error = cause instanceof Error ? cause : new Error(String(cause))
+    return { type: "invalid", path, error }
+  }
+}
+
+function scopeSettings(state: SettingsScopeState): Partial<AgentSettings> {
+  return state.type === "loaded" ? state.settings : {}
 }
 
 function mergeSettings(...layers: readonly Partial<AgentSettings>[]): Readonly<AgentSettings> {
@@ -103,9 +169,13 @@ function persistSettings(path: string, patch: Partial<AgentSettings>): void {
   const release = acquireLock(path)
   const temporary = join(dirname(path), `.${basename(path)}.${process.pid}.tmp`)
   try {
-    const current: unknown = JSON.parse(readFileSync(path, "utf8"))
+    const current: unknown = JSON.parse(readSettingsFile(path))
     if (!isRecord(current)) throw new Error(`Invalid settings object: ${path}`)
-    writeFileSync(temporary, `${JSON.stringify({ ...current, ...patch }, null, 2)}\n`)
+    const serialized = `${JSON.stringify({ ...current, ...patch }, null, 2)}\n`
+    if (Buffer.byteLength(serialized) > maxSettingsFileBytes) {
+      throw new Error(`Settings files cannot exceed ${maxSettingsFileBytes} bytes: ${path}`)
+    }
+    writeFileSync(temporary, serialized)
     renameSync(temporary, path)
   } finally {
     try {
@@ -133,9 +203,10 @@ function loadSettings(path: string): Partial<AgentSettings> {
 
   let value: unknown
   try {
-    value = JSON.parse(readFileSync(path, "utf8"))
+    value = JSON.parse(readSettingsFile(path))
   } catch (error) {
-    throw new Error(`Could not read settings ${path}`, { cause: error })
+    const detail = error instanceof Error ? `: ${error.message}` : ""
+    throw new Error(`Could not read settings ${path}${detail}`, { cause: error })
   }
   if (!isRecord(value)) throw new Error(`Invalid settings object: ${path}`)
 
@@ -157,6 +228,25 @@ function loadSettings(path: string): Partial<AgentSettings> {
     settings.followUpMode = value.followUpMode
   }
   return settings
+}
+
+function readSettingsFile(path: string): string {
+  const file = openSync(path, "r")
+  try {
+    const buffer = Buffer.allocUnsafe(maxSettingsFileBytes + 1)
+    let bytesRead = 0
+    while (bytesRead < buffer.length) {
+      const read = readSync(file, buffer, bytesRead, buffer.length - bytesRead, null)
+      if (read === 0) break
+      bytesRead += read
+    }
+    if (bytesRead > maxSettingsFileBytes) {
+      throw new Error(`Settings files cannot exceed ${maxSettingsFileBytes} bytes: ${path}`)
+    }
+    return buffer.toString("utf8", 0, bytesRead)
+  } finally {
+    closeSync(file)
+  }
 }
 
 function invalidSetting(path: string, field: keyof AgentSettings): Error {

@@ -1,15 +1,10 @@
 import { expect, test } from "bun:test"
 
 import { BoxRenderable, ScrollBoxRenderable, TextareaRenderable } from "@opentui/core"
-import {
-  createAgentRuntime,
-  createAgentSession,
-  type AgentMessage,
-  type AgentSession,
-  SessionManager
-} from "@openzi/coding-agent"
+import { createAgentSession, type AgentMessage, type AgentSession, SessionManager } from "@openzi/coding-agent"
 import {
   createModels,
+  createTestAgentRuntime as createAgentRuntime,
   fauxAssistantMessage,
   fauxProvider,
   fauxThinking,
