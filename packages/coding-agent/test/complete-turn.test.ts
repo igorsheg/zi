@@ -70,7 +70,8 @@ test("one turn can write, read, edit, execute, stream, and persist", async () =>
     models,
     persist: true
   })
-  expect(resumed.services.cwd).toBe(root)
+  expect(resumed.services.paths.cwd).toBe(root)
+  expect(resumed.services.paths.sessionDir).toBe(sessions)
   expect([...resumed.session.messages]).toEqual([...session.messages])
 
   resumed.session.dispose()

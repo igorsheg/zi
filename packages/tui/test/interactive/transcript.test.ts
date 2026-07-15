@@ -461,7 +461,7 @@ async function createTranscriptSession(responseCount: number): Promise<AgentSess
   const model = bootstrap.session.model
   bootstrap.session.dispose()
 
-  const sessionManager = new SessionManager({ cwd: "/work", sessionDir: "/unused", persist: false })
+  const sessionManager = SessionManager.inMemory("/work")
   for (const message of transcriptMessages()) sessionManager.appendMessage(message)
   return createAgentSession({ services: bootstrap.services, sessionManager, model, tools: [] })
 }

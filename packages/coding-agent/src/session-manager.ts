@@ -3,6 +3,8 @@ import { dirname, join } from "node:path"
 
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core"
 
+import { type OpenZiPaths, resolveOpenZiPath } from "./paths.js"
+
 export interface SessionHeader {
   type: "session"
   version: 1
@@ -24,9 +26,7 @@ type SessionEntryData =
 
 export type SessionEntry = SessionEntryBase & SessionEntryData
 
-export interface SessionManagerOptions {
-  cwd: string
-  sessionDir: string
+export interface NewSessionOptions {
   sessionId?: string
   persist?: boolean
 }
@@ -37,30 +37,33 @@ export class SessionManager {
   readonly #entries: SessionEntry[] = []
   #leafId: string | null = null
 
-  constructor(options: SessionManagerOptions) {
-    const id = options.sessionId ?? crypto.randomUUID()
-    this.header = { type: "session", version: 1, id, timestamp: new Date().toISOString(), cwd: options.cwd }
+  private constructor(cwd: string, sessionDir: string, sessionId?: string, persist = true) {
+    const id = sessionId ?? crypto.randomUUID()
+    this.header = { type: "session", version: 1, id, timestamp: new Date().toISOString(), cwd }
 
-    if (options.persist === false) return
-    mkdirSync(options.sessionDir, { recursive: true })
-    this.#file = join(options.sessionDir, `${id}.jsonl`)
+    if (!persist) return
+    mkdirSync(sessionDir, { recursive: true })
+    this.#file = join(sessionDir, `${id}.jsonl`)
     writeFileSync(this.#file, `${JSON.stringify(this.header)}\n`, { flag: "wx" })
   }
 
-  static open(file: string): SessionManager {
-    const lines = readFileSync(file, "utf8").split("\n").filter(Boolean)
-    const header = parseHeader(lines.shift() ?? "null", file)
+  static create(paths: OpenZiPaths, options: NewSessionOptions = {}): SessionManager {
+    return new SessionManager(paths.cwd, paths.sessionDir, options.sessionId, options.persist)
+  }
 
-    const manager = new SessionManager({
-      cwd: header.cwd,
-      sessionDir: dirname(file),
-      sessionId: header.id,
-      persist: false
-    })
-    manager.#file = file
-    manager.#entries.push(...lines.map(line => parseEntry(line, file)))
+  static inMemory(cwd = process.cwd(), sessionId?: string): SessionManager {
+    return new SessionManager(resolveOpenZiPath(cwd), "", sessionId, false)
+  }
+
+  static open(file: string): SessionManager {
+    const resolvedFile = resolveOpenZiPath(file)
+    const lines = readFileSync(resolvedFile, "utf8").split("\n").filter(Boolean)
+    const header = parseHeader(lines.shift() ?? "null", resolvedFile)
+    const manager = new SessionManager(resolveOpenZiPath(header.cwd), dirname(resolvedFile), header.id, false)
+    manager.#file = resolvedFile
+    manager.#entries.push(...lines.map(line => parseEntry(line, resolvedFile)))
     manager.#leafId = manager.#entries.at(-1)?.id ?? null
-    Object.assign(manager.header, header)
+    Object.assign(manager.header, header, { cwd: resolveOpenZiPath(header.cwd) })
     return manager
   }
 
@@ -90,6 +93,10 @@ export class SessionManager {
 
   get file(): string | undefined {
     return this.#file
+  }
+
+  get sessionDir(): string {
+    return this.#file ? dirname(this.#file) : ""
   }
 
   #append(entry: SessionEntryData): string {

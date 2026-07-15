@@ -55,15 +55,15 @@ The owner also owns temporal correctness. It records admission before starting a
 ## Coding-agent architecture
 
 ```text
-createAgentSession(services, session options)
-  -> AgentSession
-      -> pi-agent-core Agent
-      -> SessionManager
-      -> SettingsManager
-      -> ModelRegistry
-      -> ResourceLoader
-      -> tool definitions
-      -> later: compaction, retry, extensions
+createAgentRuntime(options)
+  -> OpenZiPaths (global directory + effective cwd policy)
+  -> SettingsManager + FileCredentialStore + ModelRegistry + ResourceLoader
+  -> SessionManager
+  -> createAgentSession(services, session options)
+      -> AgentSession
+          -> pi-agent-core Agent
+          -> tool definitions
+          -> later: compaction, retry, extensions
 ```
 
 ### `AgentSession`
@@ -79,15 +79,18 @@ createAgentSession(services, session options)
 
 It exposes Pi agent events plus session-level events. Application modes subscribe; they do not control the provider loop or persist messages themselves.
 
-### Managers and services
+### Paths, managers, and services
 
-- `SessionManager` owns one append-only JSONL session tree and its leaf.
-- `SettingsManager` owns resolved settings and eventually global/project layering.
-- `ModelRegistry` wraps `pi-ai` model discovery and authentication.
-- `ResourceLoader` owns context files, prompts, skills, and later extensions/themes.
+`OpenZiPaths` is the immutable path-policy owner for one effective cwd. It resolves the global `$HOME/.openzi` directory, exact `<cwd>/.openzi` project directory, settings, authentication, resources, and cwd-partitioned sessions. Runtime construction opens an explicit session first, then creates cwd-bound paths and services from the header cwd. See [ADR 0011](adr/0011-openzi-path-policy.md).
+
+- `SessionManager` owns one append-only JSONL session tree and its leaf; persistent creation receives `OpenZiPaths`.
+- `SettingsManager` owns defaults < global < project < runtime layering and scoped locked persistence.
+- `FileCredentialStore` owns global `auth.json` serialization for Pi AI model authentication.
+- `ModelRegistry` wraps `pi-ai` model discovery and configured-provider checks.
+- `ResourceLoader` owns context and system-prompt discovery from the shared path policy, and later prompts, skills, extensions, and themes.
 - `createAgentSession` wires these owners to a Pi `Agent`.
 
-These are concrete owners, not speculative dependency-injection interfaces.
+These are concrete owners, not speculative dependency-injection interfaces. No manager derives `.openzi` paths independently or reads cwd from mutable process state after construction.
 
 ### Tools
 

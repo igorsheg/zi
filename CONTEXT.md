@@ -24,6 +24,10 @@ _Avoid_: Abort, component unmount, session disposal
 The process-scoped capabilities from which agent sessions are constructed, including models, credentials, settings, filesystem/process access, and persistence.
 _Avoid_: Globals, app context
 
+**OpenZi paths**:
+The immutable coding-agent policy value for one effective cwd. It resolves global `$HOME/.openzi`, exact project `<cwd>/.openzi`, credentials, scoped settings/resources, and cwd-partitioned sessions. A resumed session's stored cwd is admitted before this value and its cwd-bound services are constructed.
+_Avoid_: Path registry, config singleton, ambient cwd
+
 **Coding-agent parity**:
 Behavioral and architectural compatibility with `pi-coding-agent`, verified capability by capability while keeping the recreated layer owned by OpenZi.
 _Avoid_: Source identity, dependency parity

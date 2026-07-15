@@ -20,7 +20,7 @@ test("representative session keeps the accepted visual hierarchy at normal and c
   const bootstrap = await createAgentRuntime({ cwd: "/workspace/openzi", models, persist: false })
   const model = bootstrap.session.model
   bootstrap.session.dispose()
-  const sessionManager = new SessionManager({ cwd: "/workspace/openzi", sessionDir: "/unused", persist: false })
+  const sessionManager = SessionManager.inMemory("/workspace/openzi")
   for (const message of representativeMessages()) sessionManager.appendMessage(message)
   const session = await createAgentSession({ services: bootstrap.services, sessionManager, model, tools: [] })
   const setup = await createInteractiveTest(session, { width: 80, height: 30 })

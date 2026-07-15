@@ -46,7 +46,7 @@ The target is coding-agent architecture parity and observable product-behavior p
 - [ ] Slash commands and file completion
 - [x] Conversation scrolling, follow-tail, unseen-line hint, selection/copy
 - [ ] `grep`, `find`, and `ls`
-- [ ] Settings: global and project scope
+- [x] Settings: global and project scope
 - [ ] Print and JSON modes sharing the same `AgentSession`
 
 ### P1 model-selection evidence
@@ -65,6 +65,14 @@ The target is coding-agent architecture parity and observable product-behavior p
 - Behavior is characterized from `packages/agent/src/agent.ts`, `packages/agent/src/agent-loop.ts`, `packages/coding-agent/src/core/agent-session.ts`, and `packages/coding-agent/src/modes/interactive/interactive-mode.ts` at the Pi commit pinned in `docs/reference-pins.md`.
 - Non-aborting dequeue prevents delivery while an entry remains in the core queue. `pi-agent-core` exposes no claim callback, so an entry already drained by the core before its `message_start` may still arrive; acceptance tests fix both clear-before-commit and commit-before-clear behavior at that dependency boundary.
 
+### P1 path and settings evidence
+
+- `packages/coding-agent/test/paths.test.ts` fixes the `$HOME/.openzi` global root, exact `<cwd>/.openzi` project root, resource paths, canonical cwd session partition, and cwd-relative custom session directories.
+- `packages/coding-agent/test/settings-manager.test.ts` fixes defaults < global < project < runtime precedence plus scoped locked writes that preserve unknown fields.
+- `packages/coding-agent/test/credential-store.test.ts` fixes global-only credential persistence and proves the default Pi AI model registry consumes the same path-owned `auth.json`.
+- `packages/coding-agent/test/runtime-paths.test.ts` proves settings and default sessions share the effective cwd, including when an explicit session header replaces the invocation cwd.
+- The policy is characterized from Pi's `config.ts`, path utilities, settings manager, auth storage, resource loader, session manager, and session-service construction at the pinned commit. OpenZi deliberately maps the global root directly to `$HOME/.openzi` rather than retaining Pi's additional `agent/` segment; see ADR 0011.
+
 ### P1 conversation navigation evidence
 
 - `packages/tui/test/interactive/transcript-store.test.ts` fixes the Nano Store-owned follow/detached/unseen transition policy, including forbidden resize and output effects.
@@ -74,7 +82,7 @@ The target is coding-agent architecture parity and observable product-behavior p
 
 ## P2 — resource and provider parity
 
-- [ ] `AGENTS.md`/instruction discovery
+- [x] `AGENTS.md`/instruction discovery
 - [ ] Skills
 - [ ] Prompt templates
 - [ ] Images and clipboard input
@@ -83,6 +91,11 @@ The target is coding-agent architecture parity and observable product-behavior p
 - [ ] Session tree/branch navigation and summaries
 - [ ] Export
 - [ ] Shell aliases and platform-specific behavior
+
+### P2 instruction-discovery evidence
+
+- `packages/coding-agent/test/resource-loader.test.ts` fixes global instructions followed by root-to-cwd `AGENTS.md`/`CLAUDE.md`, plus project `.openzi/SYSTEM.md` and `.openzi/APPEND_SYSTEM.md` precedence over global files.
+- Project `.openzi` resolution is exact to the effective cwd; ancestor traversal applies only to instruction files, matching Pi's distinction between project configuration and contextual instructions.
 
 ## P3 — extension platform
 
