@@ -80,6 +80,32 @@ test("manual page and line navigation detaches, coalesces unseen output, and ret
   }
 })
 
+test("transcript navigation follows mode-owned keybinding overrides", async () => {
+  const session = await createTranscriptSession(4)
+  const setup = await createInteractiveTest(session, { width: 48, height: 12, kittyKeyboard: true }, undefined, {
+    "app.transcript.pageUp": ["ctrl+b"],
+    "app.transcript.tail": ["ctrl+t"]
+  })
+
+  try {
+    await renderSettled(setup)
+    const scroll = transcriptScroll(setup.renderer)
+    const tail = scroll.scrollTop
+    await pressRaw(setup, "\x1b[5~")
+    expect(scroll.scrollTop).toBe(tail)
+
+    setup.mockInput.pressKey("b", { ctrl: true })
+    await renderSettled(setup)
+    expect(scroll.scrollTop).toBe(Math.max(0, Math.round(tail - scroll.viewport.height / 2)))
+    expect(scroll.stickyScroll).toBe(false)
+    await promptAndRender(session, setup, "remapped tail hint")
+    expect(setup.captureCharFrame()).toContain("Ctrl+T to jump")
+  } finally {
+    session.dispose()
+    setup.destroy()
+  }
+})
+
 test("one line above the tail stays detached when output commits", async () => {
   const session = await createTranscriptSession(1)
   const setup = await createInteractiveTest(session, { width: 48, height: 12, kittyKeyboard: true })

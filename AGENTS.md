@@ -20,6 +20,8 @@ Legibility, local reasoning, and ease of change are the top priorities. Do not e
 - Do not add defensive branches for states made impossible by the types or owner.
 - Do validate external input, persisted data, provider data, and process boundaries.
 - Bound queues, output, retries, subprocesses, retained UI data, and shutdown waits.
+- Treat interruption, cancellation, shutdown, and disposal as distinct owner transitions. Restore terminal resources before bounded settlement waits; only the layer that created a session disposes it.
+- Bind terminal product behavior through the instance-scoped semantic keybinding owner. Components may handle native mechanics but do not hard-code product chords; future extension shortcuts join through mode-owned conflict resolution, not mutable global registration.
 - Comments explain invariants, trade-offs, and provenance. They do not narrate syntax or restate types.
 - Avoid boilerplate JSDoc on self-explanatory symbols.
 - Port one Pi capability at a time with its behavior tests and upstream provenance.
@@ -47,7 +49,7 @@ Explicit-state, data-oriented design is mandatory for stateful behavior.
 - Below-composer choice flows use the instance-scoped `PickerStack`: `Composer` remains the only input and focus owner; the stack owns frames, selection, suspended parent filters, and top-frame filtering; picker views render only the active frame and never create or edit an input.
 - Coding-agent owners do not depend on frontend state libraries. TUI stores use explicit binding and disposal; use Nano Stores `onMount()` only when a terminal resource lifetime genuinely follows observation.
 
-See `docs/adr/0004-explicit-state-and-transitions.md`, `docs/adr/0006-instance-scoped-nano-stores-own-tui-state.md`, and `docs/adr/0008-composer-owned-picker-stack.md` for the project decisions.
+See `docs/adr/0004-explicit-state-and-transitions.md`, `docs/adr/0006-instance-scoped-nano-stores-own-tui-state.md`, `docs/adr/0008-composer-owned-picker-stack.md`, `docs/adr/0009-interruption-and-terminal-shutdown.md`, and `docs/adr/0010-interactive-mode-owns-keybindings.md` for the project decisions.
 
 ## Workspace ownership
 

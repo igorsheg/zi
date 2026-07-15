@@ -452,6 +452,38 @@ test("public abort preserves queued work and continues it after the aborted core
   session.dispose()
 })
 
+test("shutdown abort discards queued work before cancelling the active run", async () => {
+  const models = createModels()
+  const faux = fauxProvider()
+  models.setProvider(faux.provider)
+  const providerStarted = deferred<void>()
+  faux.setResponses([
+    async (_context, options) => {
+      providerStarted.resolve()
+      await new Promise<void>(resolve => {
+        if (options?.signal?.aborted) resolve()
+        else options?.signal?.addEventListener("abort", () => resolve(), { once: true })
+      })
+      return fauxAssistantMessage("aborted", { stopReason: "aborted" })
+    },
+    fauxAssistantMessage("must not continue")
+  ])
+  const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
+  const run = session.prompt("start")
+  await providerStarted.promise
+  session.followUp("discard me")
+
+  const stopped = session.abortAndDiscardQueuedInputs()
+  expect(session.queuedInputs.followUp).toHaveLength(0)
+  expect(session.isAborting).toBe(true)
+  await stopped
+  await run
+
+  expect(faux.state.callCount).toBe(1)
+  expect(userTextsFromMessages(session.messages)).toEqual(["start"])
+  session.dispose()
+})
+
 test("subscriber failures reject their operation without stranding session settlement", async () => {
   const models = createModels()
   const faux = fauxProvider()

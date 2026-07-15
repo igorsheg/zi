@@ -12,6 +12,14 @@ _Avoid_: Pi coding agent, runtime
 One coding conversation and its policy: active model, prompt resources, tools, durable history, queueing, compaction, retries, and lifecycle.
 _Avoid_: Chat, agent core
 
+**Run interruption**:
+A request to stop active provider/tool work while keeping the `AgentSession` reusable. Escape cancellation returns pending queued input to the composer; lower-level interruption may preserve admitted queue work. Neither operation owns terminal teardown.
+_Avoid_: Quit, shutdown, dispose
+
+**Terminal shutdown**:
+The terminal-run transition that stops input, discards queued work, signals active cancellation, restores OpenTUI immediately, and then awaits bounded settlement. The CLI remains responsible for final session disposal and exit reporting.
+_Avoid_: Abort, component unmount, session disposal
+
 **Runtime services**:
 The process-scoped capabilities from which agent sessions are constructed, including models, credentials, settings, filesystem/process access, and persistence.
 _Avoid_: Globals, app context
@@ -35,6 +43,10 @@ _Avoid_: CLI branch, universal frontend mode
 **Interactive store**:
 The instance-scoped Nano Store owner created by one terminal `InteractiveMode`. It binds the current `AgentSession`, rejects stale events, and owns only terminal state such as transient tool blocks and render revisions. It does not mirror durable session state.
 _Avoid_: Global store, frontend database, coding-agent policy
+
+**Interactive keybindings**:
+The instance-scoped terminal owner of semantic action IDs, effective key overrides, matching, hints, and conflict metadata. It translates OpenTUI key events into closed prompt/transcript actions but contains no callbacks or session operations.
+_Avoid_: Global keymap, raw product chords in components, command bus
 
 **Imperative TUI component**:
 An owner of one OpenTUI renderable subtree and its direct updates. It exposes concrete renderables and explicit disposal; it may compose product presentation but does not decide coding-agent policy.

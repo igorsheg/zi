@@ -74,7 +74,7 @@ createAgentSession(services, session options)
 - persistence of completed messages;
 - model and thinking-level changes;
 - steering and follow-up queues;
-- active-run admission, cancellation, and settlement;
+- active-run admission, interruption, queue disposition, cancellation, and settlement;
 - later, retry, compaction, branch, bash, and extension policy.
 
 It exposes Pi agent events plus session-level events. Application modes subscribe; they do not control the provider loop or persist messages themselves.
@@ -109,6 +109,7 @@ If terminal and web clients later duplicate concrete command or session-flow pol
 AgentSession
   -> InteractiveMode
       -> InteractiveCommands
+      -> InteractiveKeybindings
       -> InteractiveStore
       -> SessionScreen
           -> TranscriptView + TranscriptStore
@@ -118,20 +119,22 @@ AgentSession
                   -> PickerList
 ```
 
-`InteractiveMode` owns the root renderable subtree, current session binding, session replacement, syntax-style lifetime, prompt-focus preservation, terminal disposal, and `InteractiveCommands`. Coding-agent owners supply command descriptors; `InteractiveCommands` assembles terminal completion and parses built-in invocations into closed intents.
+`InteractiveMode` owns the root renderable subtree, current session binding, session replacement, syntax-style lifetime, prompt-focus preservation, terminal disposal, `InteractiveCommands`, and one immutable `InteractiveKeybindings`. Coding-agent owners supply command descriptors; `InteractiveCommands` assembles terminal completion and parses built-in invocations into closed intents. `InteractiveKeybindings` resolves terminal-native events into closed semantic prompt/transcript actions and exposes effective hints and conflict metadata without containing action callbacks.
 
-`InteractiveStore` owns the session subscription, generation, bounded transient tools, submissions, queue restoration, and abort delegation. `PromptStore` owns terminal feedback, retained images, typed command/model workflows, and one-shot composer edit requests. `PickerStack` owns nested frames, selection, suspended parent filters, and filtering of only the active frame. `PickerStackView` renders that frame below the always-mounted composer and owns no input. `TranscriptStore` owns follow/detached/unseen navigation. Durable messages, model, queues, persistence, and activity remain direct `AgentSession` reads.
+`InteractiveStore` owns the session subscription, generation, bounded transient tools, submissions, and Escape cancellation with queue restoration. `PromptStore` owns terminal feedback, retained images, typed command/model workflows, and one-shot composer edit requests. `PickerStack` owns nested frames, selection, suspended parent filters, and filtering of only the active frame. `PickerStackView` renders that frame below the always-mounted composer and owns no input. `TranscriptStore` owns follow/detached/unseen navigation. Durable messages, model, queues, persistence, and activity remain direct `AgentSession` reads.
 
-Imperative components subscribe to readable Nano Stores and update only their owned renderables. Durable transcript message renderables are appended rather than rebuilt, preserving native selection and detached scrolling. The composer textarea is the sole prompt/filter input and remains focused while picker frames change. Textarea contents, cursor, focus, viewport, and selection remain OpenTUI-owned.
+Imperative components subscribe to readable Nano Stores and update only their owned renderables. Durable transcript message renderables are appended rather than rebuilt, preserving native selection and detached scrolling. The composer textarea is the sole prompt/filter input and remains focused while picker frames change. Product chords are resolved by the mode-owned semantic keybindings; components apply closed actions to concrete native resources and stores. Textarea contents, cursor, focus, viewport, selection, and ordinary editing remain OpenTUI-owned.
 
 ## Resource shutdown
 
-1. the terminal mode stops accepting input and disposes subscriptions/renderables;
-2. `runTui` aborts and awaits the `AgentSession` with a deadline;
-3. `runTui` clears the title and destroys OpenTUI;
-4. the CLI disposes the `AgentSession` it created.
+1. the first interactive exit, signal, or renderer-destroy request admits one `runTui` close transition;
+2. the terminal mode stops accepting input and disposes subscriptions and renderables;
+3. `runTui` asks `AgentSession` to discard queued work and abort the active run;
+4. `runTui` clears the title and destroys OpenTUI immediately;
+5. outside the alternate screen, `runTui` awaits run settlement with a deadline;
+6. the CLI reports any shutdown failure and disposes the `AgentSession` it created.
 
-Each step is idempotent and bounded where it waits.
+Concurrent close requests share one completion. Terminal teardown does not call the lower-level queue-preserving `AgentSession.abort()` path, and the TUI never disposes its caller-owned session.
 
 ## Code shape
 

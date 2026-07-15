@@ -36,6 +36,38 @@ test("slash completion admits /model through the prompt workflow", async () => {
   }
 })
 
+test("picker navigation follows mode-owned keybinding overrides", async () => {
+  const { session } = await createModelSession()
+  const setup = await createInteractiveTest(session, { width: 52, height: 16, kittyKeyboard: true }, undefined, {
+    "tui.select.down": ["ctrl+n"]
+  })
+
+  try {
+    const prompt = promptInput(setup)
+    prompt.setText("/model")
+    prompt.gotoBufferEnd()
+    setup.mockInput.pressEnter()
+    await renderSettled(setup)
+
+    setup.mockInput.pressArrow("down")
+    setup.mockInput.pressEnter()
+    await renderSettled(setup)
+    expect(session.model.id).toBe("current")
+
+    prompt.setText("/model")
+    prompt.gotoBufferEnd()
+    setup.mockInput.pressEnter()
+    await renderSettled(setup)
+    setup.mockInput.pressKey("n", { ctrl: true })
+    setup.mockInput.pressEnter()
+    await renderSettled(setup)
+    expect(session.model.id).toBe("target")
+  } finally {
+    session.dispose()
+    setup.destroy()
+  }
+})
+
 test("picker selection pushes a frame and Escape restores the parent filter", async () => {
   const { session, setup } = await createModelFixture()
 

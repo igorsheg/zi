@@ -4,12 +4,18 @@ import type { AgentSession } from "@openzi/coding-agent"
 import { createSyntaxStyle, defaultTheme, type Theme } from "../theme.js"
 import { SessionScreen } from "./components/session-screen.js"
 import { createInteractiveCommands, type InteractiveCommands } from "./interactive-commands.js"
+import { InteractiveKeybindings, type InteractiveKeybindingOverrides } from "./interactive-keybindings.js"
 import { createInteractiveStore, type InteractiveStore } from "./stores/interactive.js"
+
+const exitGestureWindowMs = 500
+
+type ExitGestureState = { readonly type: "ready" } | { readonly type: "armed"; readonly pressedAt: number }
 
 export interface InteractiveModeOptions {
   readonly renderer: CliRenderer
   readonly session: AgentSession
   readonly onExit: () => void
+  readonly keybindingOverrides?: InteractiveKeybindingOverrides
   readonly theme?: Theme
 }
 
@@ -22,17 +28,20 @@ export class InteractiveMode {
   readonly #theme: Theme
   readonly #syntaxStyle: SyntaxStyle
   readonly #commands: InteractiveCommands
+  readonly #keybindings: InteractiveKeybindings
   #screen: SessionScreen
   #releaseGeneration: () => void
+  #exitGesture: ExitGestureState = { type: "ready" }
   #disposed = false
 
-  constructor({ renderer, session, onExit, theme = defaultTheme }: InteractiveModeOptions) {
+  constructor({ renderer, session, onExit, keybindingOverrides, theme = defaultTheme }: InteractiveModeOptions) {
     this.#renderer = renderer
     this.store = createInteractiveStore(session)
     this.#onExit = onExit
     this.#theme = theme
     this.#syntaxStyle = createSyntaxStyle(theme)
     this.#commands = createInteractiveCommands()
+    this.#keybindings = new InteractiveKeybindings(keybindingOverrides)
     this.root = new BoxRenderable(renderer, {
       id: "interactive-mode",
       width: "100%",
@@ -51,10 +60,6 @@ export class InteractiveMode {
 
   replaceSession(session: AgentSession): void {
     this.store.replaceSession(session)
-  }
-
-  abort(): Promise<void> {
-    return this.store.abort()
   }
 
   dispose(): void {
@@ -79,7 +84,32 @@ export class InteractiveMode {
     this.#screen.prompt.focus()
   }
 
+  #handleClear = (): "armed" | "exit" => {
+    const now = Date.now()
+    if (this.#exitGesture.type === "armed" && now - this.#exitGesture.pressedAt < exitGestureWindowMs) {
+      this.#exitGesture = { type: "ready" }
+      this.#onExit()
+      return "exit"
+    }
+    this.#exitGesture = { type: "armed", pressedAt: now }
+    return "armed"
+  }
+
+  #resetExitGesture = (): void => {
+    this.#exitGesture = { type: "ready" }
+  }
+
   #createScreen(): SessionScreen {
-    return new SessionScreen(this.#renderer, this.store, this.#commands, this.#onExit, this.#theme, this.#syntaxStyle)
+    return new SessionScreen(
+      this.#renderer,
+      this.store,
+      this.#commands,
+      this.#keybindings,
+      this.#handleClear,
+      this.#resetExitGesture,
+      this.#onExit,
+      this.#theme,
+      this.#syntaxStyle
+    )
   }
 }

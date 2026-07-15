@@ -4,11 +4,14 @@ import type { QueuedInputs } from "@openzi/coding-agent"
 import { composerGeometry, createComposer, type Composer } from "../../components/composer.js"
 import type { Theme } from "../../theme.js"
 import type { InteractiveCommands } from "../interactive-commands.js"
+import type { InteractiveKeybindings, PromptKeyAction } from "../interactive-keybindings.js"
 import type { InteractiveStore } from "../stores/interactive.js"
 import { createPromptStore, type PromptStore } from "../stores/prompt.js"
 import { PickerStackView } from "./picker-stack.js"
 
 const graphemes = new Intl.Segmenter(undefined, { granularity: "grapheme" })
+
+export type ExitGestureAction = "armed" | "exit"
 
 export class PromptView {
   readonly root: BoxRenderable
@@ -16,6 +19,9 @@ export class PromptView {
 
   readonly #renderer: CliRenderer
   readonly #mode: InteractiveStore
+  readonly #keybindings: InteractiveKeybindings
+  readonly #onClear: () => ExitGestureAction
+  readonly #onExitGestureConsumed: () => void
   readonly #onExit: () => void
   readonly #theme: Theme
   readonly #store: PromptStore
@@ -32,11 +38,17 @@ export class PromptView {
     renderer: CliRenderer,
     mode: InteractiveStore,
     commands: InteractiveCommands,
+    keybindings: InteractiveKeybindings,
+    onClear: () => ExitGestureAction,
+    onExitGestureConsumed: () => void,
     onExit: () => void,
     theme: Theme
   ) {
     this.#renderer = renderer
     this.#mode = mode
+    this.#keybindings = keybindings
+    this.#onClear = onClear
+    this.#onExitGestureConsumed = onExitGestureConsumed
     this.#onExit = onExit
     this.#theme = theme
     this.#store = createPromptStore(mode, commands)
@@ -126,12 +138,13 @@ export class PromptView {
     ]
     const overflow = rows.length + 1 - maxRows
     const visibleRows = overflow > 0 ? rows.slice(0, Math.max(0, maxRows - 2)) : rows
+    const dequeueHint = this.#keybindings.getHint("app.message.dequeue")
     const footerRows =
       maxRows === 1
-        ? [`${rows.length} queued · Alt+Up to edit all`]
+        ? [`${rows.length} queued${dequeueHint ? ` · ${dequeueHint} to edit all` : ""}`]
         : [
             ...(overflow > 0 ? [`… ${rows.length - visibleRows.length} more queued`] : []),
-            "↳ Alt+Up to edit all queued messages"
+            ...(dequeueHint ? [`↳ ${dequeueHint} to edit all queued messages`] : [])
           ]
 
     for (const row of visibleRows) this.#queue.add(this.#queueRow(row.id, row.text, width))
@@ -174,80 +187,11 @@ export class PromptView {
   }
 
   #onKeyPress = (key: KeyEvent): void => {
-    const bare = !key.shift && !key.ctrl && !key.meta && !key.super && !key.hyper
-    const picker = this.#store.picker.presentation(this.input.plainText)
-    if (picker) {
-      if (key.name === "return") {
-        key.preventDefault()
-        key.stopPropagation()
-        if (bare) this.#store.activatePicker(this.input.plainText, this.input.cursorOffset)
-        return
-      }
-      if (key.name === "tab") {
-        key.preventDefault()
-        key.stopPropagation()
-        if (bare) this.#store.completePicker(this.input.plainText, this.input.cursorOffset)
-        return
-      }
-      if (bare && key.name === "escape") {
-        key.preventDefault()
-        key.stopPropagation()
-        this.#store.backPicker()
-        return
-      }
-      if (key.name === "up" || key.name === "down") {
-        key.preventDefault()
-        key.stopPropagation()
-        if (bare) this.#store.movePicker(this.input.plainText, key.name === "up" ? -1 : 1)
-        return
-      }
-    }
-
-    if (key.name === "return") {
-      const withoutExtraModifiers = !key.shift && !key.ctrl && !key.super && !key.hyper
-      if (withoutExtraModifiers) {
-        key.preventDefault()
-        key.stopPropagation()
-        this.#submit(key.meta ? "followUp" : "steer")
-        return
-      }
-      const newline = key.shift && !key.ctrl && !key.meta && !key.super && !key.hyper
-      if (!newline) {
-        key.preventDefault()
-        key.stopPropagation()
-      }
-      return
-    }
-
-    if (key.name === "up" && key.meta && !key.shift && !key.ctrl && !key.super && !key.hyper) {
-      key.preventDefault()
-      key.stopPropagation()
-      this.#restore(false)
-      return
-    }
-
-    const session = this.#mode.getSession()
-    if (
-      key.name === "escape" &&
-      !key.shift &&
-      !key.ctrl &&
-      !key.meta &&
-      !key.super &&
-      !key.hyper &&
-      session.isStreaming
-    ) {
-      key.preventDefault()
-      key.stopPropagation()
-      this.#restore(true)
-      return
-    }
-
-    if (!key.ctrl) return
-    if (key.name === "c") {
-      key.preventDefault()
-      key.stopPropagation()
+    if (this.#keybindings.matches(key, "tui.input.copy")) {
       const selectedText = this.#renderer.getSelection()?.getSelectedText()
       if (selectedText) {
+        consume(key)
+        this.#onExitGestureConsumed()
         let copied = false
         try {
           copied = this.#renderer.copyToClipboardOSC52(selectedText)
@@ -257,14 +201,85 @@ export class PromptView {
         if (copied) this.#renderer.clearSelection()
         return
       }
-      if (this.#store.backPicker()) return
-      this.#store.clear()
-    } else if (key.name === "d" && this.input.plainText.length === 0) {
-      key.preventDefault()
-      key.stopPropagation()
-      this.#onExit()
+    }
+
+    const session = this.#mode.getSession()
+    const action = this.#keybindings.promptAction(key, {
+      pickerOpen: Boolean(this.#store.picker.presentation(this.input.plainText)),
+      editorEmpty: this.input.plainText.length === 0,
+      streaming: session.isStreaming
+    })
+    if (!action) return
+    this.#handleKeyAction(key, action)
+  }
+
+  #handleKeyAction(key: KeyEvent, action: PromptKeyAction): void {
+    switch (action) {
+      case "picker_confirm":
+        consume(key)
+        this.#store.activatePicker(this.input.plainText, this.input.cursorOffset)
+        return
+      case "picker_complete":
+        consume(key)
+        this.#store.completePicker(this.input.plainText, this.input.cursorOffset)
+        return
+      case "picker_cancel":
+        consume(key)
+        this.#store.backPicker()
+        if (this.#keybindings.matches(key, "app.clear")) this.#onExitGestureConsumed()
+        return
+      case "picker_up":
+        consume(key)
+        this.#store.movePicker(this.input.plainText, -1)
+        return
+      case "picker_down":
+        consume(key)
+        this.#store.movePicker(this.input.plainText, 1)
+        return
+      case "submit":
+        consume(key)
+        this.#submit("steer")
+        return
+      case "follow_up":
+        consume(key)
+        this.#submit("followUp")
+        return
+      case "new_line":
+        consume(key)
+        this.input.newLine()
+        return
+      case "restore_queue":
+        consume(key)
+        this.#restore(false)
+        return
+      case "interrupt":
+        consume(key)
+        this.#restore(true)
+        return
+      case "clear":
+        consume(key)
+        if (this.#onClear() === "armed") this.#store.clear()
+        return
+      case "exit":
+        consume(key)
+        this.#onExit()
+        return
+      case "consume":
+        consume(key)
+        return
+      default:
+        return assertNever(action)
     }
   }
+}
+
+function consume(key: KeyEvent): void {
+  key.preventDefault()
+  key.stopPropagation()
+}
+
+function assertNever(value: never): never {
+  throw new Error(`Unhandled prompt key action: ${String(value)}`)
 }
 
 function modelTitle(session: ReturnType<InteractiveStore["getSession"]>): string {

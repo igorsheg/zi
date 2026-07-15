@@ -30,6 +30,6 @@ bun run check         # formatting, linting, TypeScript, and tests
 
 The workspace uses TypeScript 7, type-aware Oxlint, and Oxfmt. Lefthook formats and lints staged files before commits and runs the complete check before pushes.
 
-Stateful behavior is designed as explicit domain data with one owner and explicit transitions. TUI presentation state uses instance-scoped Nano Store owners rather than module globals or mirrored session state; see [`docs/architecture.md`](docs/architecture.md), [ADR 0004](docs/adr/0004-explicit-state-and-transitions.md), and [ADR 0006](docs/adr/0006-instance-scoped-nano-stores-own-tui-state.md).
+Stateful behavior is designed as explicit domain data with one owner and explicit transitions. TUI presentation state uses instance-scoped Nano Store owners rather than module globals or mirrored session state. Interruption, terminal shutdown, and caller-owned disposal are separate transitions; see [`docs/architecture.md`](docs/architecture.md), [ADR 0004](docs/adr/0004-explicit-state-and-transitions.md), [ADR 0006](docs/adr/0006-instance-scoped-nano-stores-own-tui-state.md), and [ADR 0009](docs/adr/0009-interruption-and-terminal-shutdown.md), and [ADR 0010](docs/adr/0010-interactive-mode-owns-keybindings.md).
 
 The interactive path now resolves configured Pi providers, runs `read`/`bash`/`edit`/`write` through `AgentSession`, streams into imperative OpenTUI renderables, and persists resumable JSONL sessions. P0 visual acceptance and the remaining Pi coding-agent capabilities are tracked in `docs/parity-roadmap.md`.

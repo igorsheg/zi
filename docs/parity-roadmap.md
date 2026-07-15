@@ -10,7 +10,8 @@ The target is coding-agent architecture parity and observable product-behavior p
 - [x] `read`, `bash`, `edit`, and `write`
 - [x] Streaming assistant text and thinking
 - [x] Streaming tool lifecycle and bounded output
-- [x] Cancellation and settled shutdown
+- [x] Escape cancellation with queue restoration and settled run ownership
+- [x] Double-Ctrl+C/Ctrl+D exit and bounded terminal shutdown
 - [x] Append-only JSONL session with restore
 - [x] Accepted default session screen and prompt appearance
 - [x] Faux-provider integration and OpenTUI frame snapshots
@@ -21,6 +22,18 @@ The target is coding-agent architecture parity and observable product-behavior p
 - `packages/tui/test/interactive/complete-turn.test.ts` submits through OpenTUI's `TextareaRenderable` and captures the resulting frame.
 - `packages/tui/test/interactive/visual-parity.test.ts` fixes representative normal and constrained character frames plus semantic color spans for user, thinking, Markdown, tool, and prompt presentation.
 - Tool semantics are ported from `pi/packages/coding-agent/src/core/tools/` at the commit pinned in `docs/reference-pins.md`.
+
+### P0 lifecycle evidence
+
+- `packages/coding-agent/test/agent-session-queue.test.ts` distinguishes queue-preserving interruption, Escape cancellation that returns pending input, and shutdown cancellation that discards pending input before aborting. `packages/coding-agent/test/bash.test.ts` proves abort terminates the subprocess group and settles with bounded captured output. All paths prevent discarded work from continuing.
+- `packages/tui/test/interactive/app.test.ts`, `prompt-queue.test.ts`, and `run.test.ts` drive native-selection and picker precedence, Pi's 500 ms double-Ctrl+C window, Ctrl+D, Escape restoration, provider errors, concurrent SIGHUP/renderer teardown, immediate terminal restoration, queued-work disposal, shutdown failure propagation, and caller-owned session lifetime.
+- Double-Ctrl+C and Ctrl+D behavior comes from Pi's `interactive-mode.ts` at the pinned commit. Renderer-destroy completion and scoped SIGHUP cleanup are characterized from OpenCode's OpenTUI application at its pinned commit. OpenZi deliberately restores OpenTUI before awaiting its bounded provider settlement.
+
+### Interactive keybinding evidence
+
+- `packages/tui/test/interactive/interactive-keybindings.test.ts` fixes semantic prompt/transcript action resolution, normalized overrides, explicit disablement, descriptions, effective hints, conflict reporting, and reserved-versus-overridable extension metadata.
+- Real OpenTUI fixtures prove prompt clear/exit/newline, picker navigation, transcript navigation, and visible transcript hints follow one per-mode binding instance while default lifecycle and selection precedence remain unchanged.
+- The owner split is characterized from Pi's `core/keybindings.ts`, `CustomEditor`, `InteractiveMode`, and `ExtensionRunner.getShortcuts()` at the pinned commit. OpenZi keeps the owner in `packages/tui`, makes it immutable and instance-scoped, and does not copy Pi TUI's mutable global manager.
 
 ## P1 — daily-driver session behavior
 
@@ -42,7 +55,7 @@ The target is coding-agent architecture parity and observable product-behavior p
 - `packages/tui/test/interactive/model-selector.test.ts` drives slash completion, exact and fuzzy `/model` paths, configured-provider filtering, Pi ordering, wrapped navigation, cancellation, mutation failure, stale completion, session replacement, persistent composer focus, and nested parent-filter restoration through real OpenTUI input and `AgentSession`.
 - `packages/tui/test/interactive/picker-stack.test.ts` fixes top-frame filtering, wrapped selection, nested push/pop, and suspended parent-filter restoration without an input renderable.
 - `packages/coding-agent/test/slash-commands.test.ts` fixes coding-agent ownership of supported built-in command descriptors.
-- Mode-owned `InteractiveCommands` assembles completion and parses invocation text into closed intents. `PromptStore` owns typed workflows and operation identity. `PickerStack` owns nested choice mechanics, while `PickerStackView` renders below the composer without creating another input. `PromptView`, `Composer`, `PickerStackView`, and `PickerList` contain no supported command names, argument rules, or dispatch policy.
+- Mode-owned `InteractiveCommands` assembles completion and parses invocation text into closed intents. Mode-owned `InteractiveKeybindings` resolves effective terminal actions without containing callbacks. `PromptStore` owns typed workflows and operation identity. `PickerStack` owns nested choice mechanics, while `PickerStackView` renders below the composer without creating another input. `PromptView`, `Composer`, `PickerStackView`, and `PickerList` contain no supported command names, argument rules, or dispatch policy.
 - Command catalog composition, terminal parsing, exact reference matching, fuzzy search, sorting, and selector keys are characterized from Pi's `interactive-mode.ts`, `model-selector.ts`, `model-search.ts`, `model-resolver.ts`, and `pi-tui` fuzzy/editor implementation at the pinned commit.
 
 ### P1 steering and follow-up evidence

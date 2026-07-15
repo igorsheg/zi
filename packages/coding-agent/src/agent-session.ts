@@ -232,8 +232,11 @@ export class AgentSession {
         const { runId, settled } = this.#activity
         const queued = this.#detachQueuedInputs()
         this.#activity = { type: "aborting", runId, settled }
-        this.#emitQueue()
-        this.#agent.abort()
+        try {
+          this.#emitQueue()
+        } finally {
+          this.#agent.abort()
+        }
         return { ...queued, settled }
       }
       case "aborting":
@@ -248,6 +251,16 @@ export class AgentSession {
         throw new Error("AgentSession is disposed")
       default:
         return assertNever(this.#activity)
+    }
+  }
+
+  abortAndDiscardQueuedInputs(): Promise<void> {
+    try {
+      return this.takeQueuedInputsAndAbort().settled
+    } catch (cause) {
+      return this.waitForIdle().then(() => {
+        throw cause
+      })
     }
   }
 

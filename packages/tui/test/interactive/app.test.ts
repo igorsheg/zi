@@ -1,10 +1,10 @@
-import { expect, test } from "bun:test"
+import { expect, spyOn, test } from "bun:test"
 
 import { TextareaRenderable } from "@opentui/core"
 import { createAgentRuntime } from "@openzi/coding-agent"
 import { createModels, fauxProvider } from "@openzi/coding-agent/testing"
 
-import { createInteractiveTest } from "./harness.js"
+import { createInteractiveTest, renderSettled } from "./harness.js"
 
 test("the session app fills the terminal and protects the prompt", async () => {
   const models = createModels()
@@ -33,6 +33,140 @@ test("the session app fills the terminal and protects the prompt", async () => {
     setup.mockInput.pressKey("d", { ctrl: true })
     expect(exits).toBe(1)
   } finally {
+    session.dispose()
+    setup.destroy()
+  }
+})
+
+test("a second Ctrl+C within Pi's window exits the interactive mode", async () => {
+  const models = createModels()
+  const faux = fauxProvider()
+  models.setProvider(faux.provider)
+  const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
+  let exits = 0
+  const setup = await createInteractiveTest(session, { width: 40, height: 8 }, () => exits++)
+
+  try {
+    setup.mockInput.pressCtrlC()
+    expect(exits).toBe(0)
+    setup.mockInput.pressCtrlC()
+    expect(exits).toBe(1)
+  } finally {
+    session.dispose()
+    setup.destroy()
+  }
+})
+
+test("a picker-consumed Ctrl+C resets an armed exit gesture", async () => {
+  const models = createModels()
+  const faux = fauxProvider()
+  models.setProvider(faux.provider)
+  const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
+  let exits = 0
+  const setup = await createInteractiveTest(session, { width: 40, height: 8 }, () => exits++)
+
+  try {
+    const input = setup.renderer.root.findDescendantById("prompt-input")
+    if (!(input instanceof TextareaRenderable)) throw new Error("Prompt textarea not found")
+    setup.mockInput.pressCtrlC()
+    await setup.mockInput.typeText("/m")
+    setup.mockInput.pressCtrlC()
+    setup.mockInput.pressCtrlC()
+    expect(exits).toBe(0)
+    setup.mockInput.pressCtrlC()
+    expect(exits).toBe(1)
+  } finally {
+    session.dispose()
+    setup.destroy()
+  }
+})
+
+test("interactive keybinding overrides drive clear and exit through semantic actions", async () => {
+  const models = createModels()
+  const faux = fauxProvider()
+  models.setProvider(faux.provider)
+  const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
+  let exits = 0
+  const setup = await createInteractiveTest(session, { width: 40, height: 8, kittyKeyboard: true }, () => exits++, {
+    "app.clear": ["ctrl+x"],
+    "app.exit": ["ctrl+q"],
+    "tui.input.newLine": ["ctrl+j"]
+  })
+
+  try {
+    const input = setup.renderer.root.findDescendantById("prompt-input")
+    if (!(input instanceof TextareaRenderable)) throw new Error("Prompt textarea not found")
+    input.setText("keep")
+    setup.mockInput.pressCtrlC()
+    expect(input.plainText).toBe("keep")
+    setup.mockInput.pressKey("x", { ctrl: true })
+    expect(input.plainText).toBe("")
+
+    input.setText("line")
+    input.gotoBufferEnd()
+    setup.mockInput.pressEnter({ shift: true })
+    expect(input.plainText).toBe("line")
+    setup.mockInput.pressKey("j", { ctrl: true })
+    expect(input.plainText).toBe("line\n")
+    input.setText("")
+
+    setup.mockInput.pressKey("d", { ctrl: true })
+    expect(exits).toBe(0)
+    setup.mockInput.pressKey("q", { ctrl: true })
+    expect(exits).toBe(1)
+  } finally {
+    session.dispose()
+    setup.destroy()
+  }
+})
+
+test("provider failures surface in the focused prompt after settlement", async () => {
+  const models = createModels()
+  const faux = fauxProvider()
+  faux.setResponses([
+    async () => {
+      throw new Error("provider failed")
+    }
+  ])
+  models.setProvider(faux.provider)
+  const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
+  const setup = await createInteractiveTest(session, { width: 40, height: 8 })
+
+  try {
+    const input = setup.renderer.root.findDescendantById("prompt-input")
+    if (!(input instanceof TextareaRenderable)) throw new Error("Prompt textarea not found")
+    input.setText("fail")
+    setup.mockInput.pressEnter()
+    await session.waitForIdle()
+    await renderSettled(setup)
+
+    expect(setup.captureCharFrame()).toContain("provider failed")
+    expect(input.focused).toBe(true)
+  } finally {
+    session.dispose()
+    setup.destroy()
+  }
+})
+
+test("an expired Ctrl+C arm starts a new exit window", async () => {
+  const models = createModels()
+  const faux = fauxProvider()
+  models.setProvider(faux.provider)
+  const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
+  let exits = 0
+  const setup = await createInteractiveTest(session, { width: 40, height: 8 }, () => exits++)
+  const now = spyOn(Date, "now").mockReturnValue(1_000)
+
+  try {
+    setup.mockInput.pressCtrlC()
+    now.mockReturnValue(1_500)
+    setup.mockInput.pressCtrlC()
+    expect(exits).toBe(0)
+    now.mockReturnValue(1_501)
+    setup.mockInput.pressCtrlC()
+    expect(exits).toBe(1)
+  } finally {
+    now.mockRestore()
     session.dispose()
     setup.destroy()
   }

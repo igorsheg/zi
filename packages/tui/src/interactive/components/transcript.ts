@@ -11,6 +11,7 @@ import {
 import type { AgentMessage, AgentSession } from "@openzi/coding-agent"
 
 import type { Theme } from "../../theme.js"
+import type { InteractiveKeybindings, TranscriptKeyAction } from "../interactive-keybindings.js"
 import type { InteractiveStore } from "../stores/interactive.js"
 import { createTranscriptStore, type TranscriptStore } from "../stores/transcript.js"
 import { createMessageView, type ToolCallPresentation } from "./message.js"
@@ -22,14 +23,13 @@ interface PendingNativeRead {
   resize: boolean
 }
 
-const unseenHint = "New output · Ctrl+End to jump"
-
 export class TranscriptView {
   readonly root: BoxRenderable
   readonly scroll: ScrollBoxRenderable
 
   readonly #renderer: CliRenderer
   readonly #mode: InteractiveStore
+  readonly #keybindings: InteractiveKeybindings
   readonly #theme: Theme
   readonly #syntaxStyle: SyntaxStyle
   readonly #navigation: TranscriptStore
@@ -43,9 +43,16 @@ export class TranscriptView {
   #pendingNativeRead: PendingNativeRead | undefined
   #transcriptRevision: number
 
-  constructor(renderer: CliRenderer, mode: InteractiveStore, theme: Theme, syntaxStyle: SyntaxStyle) {
+  constructor(
+    renderer: CliRenderer,
+    mode: InteractiveStore,
+    keybindings: InteractiveKeybindings,
+    theme: Theme,
+    syntaxStyle: SyntaxStyle
+  ) {
     this.#renderer = renderer
     this.#mode = mode
+    this.#keybindings = keybindings
     this.#theme = theme
     this.#syntaxStyle = syntaxStyle
     this.#session = mode.getSession()
@@ -88,7 +95,7 @@ export class TranscriptView {
         fg: theme.text.accent,
         bg: theme.surface.app,
         wrapMode: "none",
-        content: unseenHint
+        content: transcriptHint(keybindings)
       })
     )
     this.root.add(this.scroll)
@@ -274,40 +281,43 @@ export class TranscriptView {
   }
 
   #onKeyPress = (key: KeyEvent): void => {
-    const noModifiers = !key.shift && !key.ctrl && !key.meta && !key.super && !key.hyper
-    if (key.name === "pageup" && noModifiers) {
-      key.preventDefault()
-      key.stopPropagation()
-      this.#manualScroll(-0.5, "viewport")
-      return
-    }
-    if (key.name === "pagedown" && noModifiers) {
-      key.preventDefault()
-      key.stopPropagation()
-      this.#manualScroll(0.5, "viewport")
-      return
-    }
+    const action = this.#keybindings.transcriptAction(key)
+    if (!action) return
+    key.preventDefault()
+    key.stopPropagation()
+    this.#handleKeyAction(action)
+  }
 
-    const lineCommand = key.ctrl && key.meta && !key.shift && !key.super && !key.hyper
-    if (key.name === "up" && lineCommand) {
-      key.preventDefault()
-      key.stopPropagation()
-      this.#manualScroll(-1, "absolute")
-      return
-    }
-    if (key.name === "down" && lineCommand) {
-      key.preventDefault()
-      key.stopPropagation()
-      this.#manualScroll(1, "absolute")
-      return
-    }
-
-    if (key.name === "end" && key.ctrl && !key.meta && !key.shift && !key.super && !key.hyper) {
-      key.preventDefault()
-      key.stopPropagation()
-      this.#jumpToTail()
+  #handleKeyAction(action: TranscriptKeyAction): void {
+    switch (action) {
+      case "page_up":
+        this.#manualScroll(-0.5, "viewport")
+        return
+      case "page_down":
+        this.#manualScroll(0.5, "viewport")
+        return
+      case "line_up":
+        this.#manualScroll(-1, "absolute")
+        return
+      case "line_down":
+        this.#manualScroll(1, "absolute")
+        return
+      case "tail":
+        this.#jumpToTail()
+        return
+      default:
+        return assertNever(action)
     }
   }
+}
+
+function transcriptHint(keybindings: InteractiveKeybindings): string {
+  const tailHint = keybindings.getHint("app.transcript.tail")
+  return `New output${tailHint ? ` · ${tailHint} to jump` : ""}`
+}
+
+function assertNever(value: never): never {
+  throw new Error(`Unhandled transcript key action: ${String(value)}`)
 }
 
 function isAtTail(scroll: ScrollBoxRenderable): boolean {

@@ -34,6 +34,7 @@ packages/cli
 AgentSession
   -> InteractiveMode
       -> InteractiveCommands
+      -> InteractiveKeybindings
       -> InteractiveStore
       -> SessionScreen
           -> TranscriptView + TranscriptStore
@@ -44,16 +45,17 @@ AgentSession
                   -> PickerList
 ```
 
-| Owner                 | Lifetime             | State and resources                                                                                    |
-| --------------------- | -------------------- | ------------------------------------------------------------------------------------------------------ |
-| `runTui`              | one terminal run     | renderer, signals, terminal title, abort deadline                                                      |
-| `InteractiveMode`     | one terminal mode    | root subtree, syntax style, current screen, focus, replacement, command aggregate, disposal            |
-| `InteractiveCommands` | one terminal mode    | descriptor aggregation, completion policy, invocation parsing into closed built-in intents             |
-| `InteractiveStore`    | one terminal mode    | session binding/generation, stale-event rejection, bounded active tools, prompt/queue/abort delegation |
-| `PromptStore`         | one prompt component | feedback, images, typed workflows, input-edit requests, bounded async operation identity               |
-| `PickerStack`         | one prompt component | nested frames, top-frame selection/filtering, suspended parent filters, push/pop transitions           |
-| `TranscriptStore`     | one transcript       | following versus detached navigation and unseen-output state                                           |
-| imperative component  | one renderable tree  | native children, subscriptions, input/mouse handlers, explicit destruction                             |
+| Owner                    | Lifetime             | State and resources                                                                                    |
+| ------------------------ | -------------------- | ------------------------------------------------------------------------------------------------------ |
+| `runTui`                 | one terminal run     | close state, renderer, signals, terminal title, settlement deadline                                    |
+| `InteractiveMode`        | one terminal mode    | root subtree, syntax style, current screen, focus, replacement, clear/exit gesture, commands, disposal |
+| `InteractiveCommands`    | one terminal mode    | descriptor aggregation, completion policy, invocation parsing into closed built-in intents             |
+| `InteractiveKeybindings` | one terminal mode    | semantic IDs, effective overrides, matching, hints, conflicts, closed prompt/transcript actions        |
+| `InteractiveStore`       | one terminal mode    | session binding/generation, stale-event rejection, bounded active tools, prompt and Escape delegation  |
+| `PromptStore`            | one prompt component | feedback, images, typed workflows, input-edit requests, bounded async operation identity               |
+| `PickerStack`            | one prompt component | nested frames, top-frame selection/filtering, suspended parent filters, push/pop transitions           |
+| `TranscriptStore`        | one transcript       | following versus detached navigation and unseen-output state                                           |
+| imperative component     | one renderable tree  | native children, subscriptions, input/mouse handlers, explicit destruction                             |
 
 The mode is cohesive, not monolithic: stores split mutable families by invariant and lifetime, while `InteractiveMode` owns their composition.
 
@@ -64,6 +66,7 @@ packages/tui/src/
   interactive/
     interactive-mode.ts
     interactive-commands.ts
+    interactive-keybindings.ts
     model-selector.ts
     run.ts
     stores/
@@ -105,14 +108,13 @@ interface InteractiveStore {
   submit(submission: PromptSubmission): Promise<void>
   restoreQueuedInputs(): QueuedInputs
   abortAndRestoreQueuedInputs(): AbortedQueuedInputs
-  abort(): Promise<void>
   dispose(): void
 }
 ```
 
 It retains a current session reference for identity and replacement but does not copy messages, model, queues, or persistence state. Session events update only terminal revisions and bounded transient tool presentation. Events from a replaced session are rejected.
 
-`InteractiveCommands` consumes command descriptors from coding-agent owners, supplies terminal completion candidates, and parses invocation strings into a closed built-in intent union. `PromptStore` never contains command syntax or descriptor metadata. It delegates session operations through `InteractiveStore` and owns feedback, retained images, typed command/model workflows, bounded operation identity, and revisioned one-shot composer edit requests. Each async model operation captures its operation identity and session; cancellation, disposal, supersession, and session replacement reject stale completion.
+`InteractiveCommands` consumes command descriptors from coding-agent owners, supplies terminal completion candidates, and parses invocation strings into a closed built-in intent union. `InteractiveKeybindings` owns the closed terminal action catalog, default and effective keys, descriptions, override conflicts, display hints, and OpenTUI-event translation. It is immutable and contains no handlers. `PromptStore` never contains command syntax, descriptor metadata, or physical key policy. It delegates session operations through `InteractiveStore` and owns feedback, retained images, typed command/model workflows, bounded operation identity, and revisioned one-shot composer edit requests. Each async model operation captures its operation identity and session; cancellation, disposal, supersession, and session replacement reject stale completion.
 
 `PickerStack` owns open/closed state, ordered frames, selected rows, suspended parent filters, and filtering of only the top frame. The active filter is always passed from the native composer; it is not copied into the stack. Pushing captures the parent filter on the child frame, and popping returns it for restoration. `PickerStackView` renders only the top frame beneath the composer and owns no input. `TranscriptStore` owns the closed following/detached/unseen union; native scroll offsets and selection remain in OpenTUI.
 
@@ -143,27 +145,28 @@ Durable transcript messages are appended without rebuilding existing renderables
 
 ## State placement
 
-| State                                                              | Owner                         |
-| ------------------------------------------------------------------ | ----------------------------- |
-| Messages, model, thinking level, queues, persistence, run activity | `AgentSession`                |
-| Current session binding and generation                             | `InteractiveStore`            |
-| Transient tools and terminal render revisions                      | `InteractiveStore`            |
-| Prompt feedback, typed workflow, one-shot input edits              | `PromptStore`                 |
-| Picker frames, selection, suspended parent filters                 | `PickerStack`                 |
-| Active picker filter text, cursor, focus, paste, undo              | composer `TextareaRenderable` |
-| Follow/detached/unseen transcript navigation                       | `TranscriptStore`             |
-| Scroll offset, viewport, selection                                 | OpenTUI renderables           |
-| Pending native callback generations                                | component owning the resource |
-| Renderer, signals, terminal title, shutdown deadline               | `runTui`                      |
-| Syntax style and root renderable                                   | `InteractiveMode`             |
+| State                                                               | Owner                         |
+| ------------------------------------------------------------------- | ----------------------------- |
+| Messages, model, thinking level, queues, persistence, run activity  | `AgentSession`                |
+| Current session binding and generation                              | `InteractiveStore`            |
+| Semantic terminal bindings, resolved keys, hints, conflicts         | `InteractiveKeybindings`      |
+| Transient tools and terminal render revisions                       | `InteractiveStore`            |
+| Prompt feedback, typed workflow, one-shot input edits               | `PromptStore`                 |
+| Picker frames, selection, suspended parent filters                  | `PickerStack`                 |
+| Active picker filter text, cursor, focus, paste, undo               | composer `TextareaRenderable` |
+| Follow/detached/unseen transcript navigation                        | `TranscriptStore`             |
+| Scroll offset, viewport, selection                                  | OpenTUI renderables           |
+| Pending native callback generations                                 | component owning the resource |
+| Renderer, signals, terminal title, close state, settlement deadline | `runTui`                      |
+| Semantic clear/exit gesture, syntax style, root renderable          | `InteractiveMode`             |
 
 There is no module-global mutable application state.
 
 ## Input and lifecycle
 
-Global key handlers prevent default before editor handling when terminal product semantics override native behavior. The composer remains mounted and focused during command completion, nested picker navigation, model selection, and transcript selection. Programmatic input edits always move the native cursor to the end. Transcript navigation preserves detached intent across output and resize. Queued native callbacks validate their target before applying.
+Global key handlers ask `InteractiveKeybindings` for a closed semantic action and prevent default before editor handling when terminal product semantics override native behavior. Native selection copy and picker back take precedence over the exit gesture and reset any earlier arm. Otherwise `InteractiveMode` owns `ready | armed { pressedAt }`: the first effective `app.clear` action—Ctrl+C by default—clears the composer and arms Pi's 500 ms window, while the second requests exit. Ctrl+D requests exit only from an empty composer; Escape cancels an active run and restores detached queued input. The composer remains mounted and focused during command completion, nested picker navigation, model selection, and transcript selection. Programmatic input edits always move the native cursor to the end. Transcript navigation preserves detached intent across output and resize. Queued native callbacks validate their target before applying.
 
-`InteractiveMode.dispose()` releases stores, subscriptions, handlers, syntax resources, and renderables. `runTui` owns renderer and signal resources, aborts the session during shutdown, and leaves final session disposal to the CLI that created it.
+`InteractiveMode.dispose()` releases stores, subscriptions, handlers, syntax resources, and renderables. `runTui` owns a `running | closing | closed` transition, renderer and signal resources, terminal title, and settlement deadline. The first close request disposes terminal input, asks `AgentSession` to discard queued work and abort, and restores the terminal immediately. Settlement is awaited afterward with a deadline. Concurrent interactive, signal, and renderer-destroy requests share that completion. Shutdown errors propagate after terminal restoration, and only the CLI disposes the session it created.
 
 ## Commands and selectors
 
@@ -176,7 +179,9 @@ OpenZi mirrors this ownership. Coding-agent owns `builtinSlashCommands`. Mode-ow
 - Coding-agent behavior is tested at `AgentSession` boundaries.
 - Store transitions run without a renderer; picker-stack tests fix top-only filtering, wrapped selection, nested push/pop, and parent-filter restoration.
 - TUI fixtures instantiate `InteractiveMode` over `@opentui/core/testing`.
+- Keybinding fixtures fix default semantic resolution, normalized overrides, disablement, metadata, hints, conflicts, and real prompt/picker/transcript remapping.
 - Fixtures drive real input, focus, resize, native selection, session replacement, and rendering.
+- Lifecycle fixtures drive double Ctrl+C, Ctrl+D, Escape, concurrent SIGHUP/renderer destruction, queued-work disposal, settlement, failure propagation, title cleanup, and session-ownership boundaries.
 
 ## Growth rules
 

@@ -44,7 +44,6 @@ export interface InteractiveStore {
   submit(submission: PromptSubmission): Promise<void>
   restoreQueuedInputs(): QueuedInputs
   abortAndRestoreQueuedInputs(): AbortedQueuedInputs
-  abort(): Promise<void>
   dispose(): void
 }
 
@@ -109,9 +108,6 @@ export function createInteractiveStore(session: AgentSession): InteractiveStore 
     },
     abortAndRestoreQueuedInputs() {
       return currentSession().takeQueuedInputsAndAbort()
-    },
-    abort() {
-      return currentSession().abort()
     },
     dispose() {
       if (disposed) return
