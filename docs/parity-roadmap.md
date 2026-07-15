@@ -39,9 +39,10 @@ The target is coding-agent architecture parity and observable product-behavior p
 ### P1 model-selection evidence
 
 - `packages/coding-agent/test/model-selection.test.ts` covers registry-order choices, provider-scoped authentication, bounded catalog work, canonical thinking capabilities, coherent persistence/events, admission, and model-validation races.
-- `packages/tui/test/interactive/model-selector.test.ts` drives slash completion, exact and fuzzy `/model` paths, configured-provider filtering, Pi ordering, wrapped navigation, cancellation, mutation failure, stale completion, and session replacement through real OpenTUI input and `AgentSession`.
+- `packages/tui/test/interactive/model-selector.test.ts` drives slash completion, exact and fuzzy `/model` paths, configured-provider filtering, Pi ordering, wrapped navigation, cancellation, mutation failure, stale completion, session replacement, persistent composer focus, and nested parent-filter restoration through real OpenTUI input and `AgentSession`.
+- `packages/tui/test/interactive/picker-stack.test.ts` fixes top-frame filtering, wrapped selection, nested push/pop, and suspended parent-filter restoration without an input renderable.
 - `packages/coding-agent/test/slash-commands.test.ts` fixes coding-agent ownership of supported built-in command descriptors.
-- Mode-owned `InteractiveCommands` assembles completion and parses invocation text into closed intents. `PromptStore` owns the resulting composer/loading/selector/selecting workflow and operation identity. `ModelSelectorView` owns the native search textarea and renderable subtree. `PromptView`, `Composer`, and `PickerList` contain no supported command names, argument rules, or dispatch policy.
+- Mode-owned `InteractiveCommands` assembles completion and parses invocation text into closed intents. `PromptStore` owns typed workflows and operation identity. `PickerStack` owns nested choice mechanics, while `PickerStackView` renders below the composer without creating another input. `PromptView`, `Composer`, `PickerStackView`, and `PickerList` contain no supported command names, argument rules, or dispatch policy.
 - Command catalog composition, terminal parsing, exact reference matching, fuzzy search, sorting, and selector keys are characterized from Pi's `interactive-mode.ts`, `model-selector.ts`, `model-search.ts`, `model-resolver.ts`, and `pi-tui` fuzzy/editor implementation at the pinned commit.
 
 ### P1 steering and follow-up evidence
@@ -94,6 +95,7 @@ For each capability:
 
 - The behavior of `pi-coding-agent` interactive mode is a target; Pi's screen architecture and `@earendil-works/pi-tui` are not.
 - Pi's coding-agent owner boundaries are the reference; incidental helpers and framework-specific mechanics are not copied blindly.
+- Below-composer selectors keep OpenZi's composer mounted as the sole focused input and render a nested picker stack beneath it; Pi's selectors may create their own search input.
 - Steering and follow-up queues deliberately diverge from Pi's unbounded queues: OpenZi admits at most 32 pending entries and 8 MiB of aggregate retained UTF-8 payload, with no eviction or deduplication.
 - Unbounded output, subprocesses, logs, or retries are rejected even if an upstream path currently permits them.
 - A Pi extension API is not promised until OpenZi has a stable owner boundary to expose.

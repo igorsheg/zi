@@ -20,7 +20,8 @@ test("prompt store restores queued text, images, and status without a renderer",
     expect(prompt.$state.get()).toEqual({
       feedback: { type: "status", message: "Restored 1 queued message to editor with 1 image" },
       images: [{ type: "image", data: "aW1hZ2U=", mimeType: "image/png" }],
-      surface: { type: "composer", completion: { type: "none" } }
+      workflow: { type: "idle" },
+      inputEdit: { revision: 0, text: "" }
     })
     expect(session.queuedInputs.steering).toHaveLength(0)
   } finally {

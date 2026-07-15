@@ -1,6 +1,6 @@
 # Terminal interactive mode owns frontend orchestration
 
-> Amended by [ADR 0007](0007-terminal-interactive-mode-over-agent-session.md): `AgentSession` is the shared core and `InteractiveMode` is terminal-specific.
+> Amended by [ADR 0007](0007-terminal-interactive-mode-over-agent-session.md) and [ADR 0008](0008-composer-owned-picker-stack.md): `AgentSession` is the shared core, `InteractiveMode` is terminal-specific, and nested choice presentation uses the composer-owned picker stack.
 
 Pi's `interactive-mode.ts` combines terminal product behavior with terminal rendering while delegating coding-agent policy to `AgentSession`. OpenZi keeps the same owner boundary using imperative OpenTUI:
 
@@ -19,4 +19,4 @@ Pi splits slash commands by responsibility. Coding-agent owners expose command d
 
 OpenZi follows that split. `packages/coding-agent/src/slash-commands.ts` owns descriptors for supported built-ins. The terminal `InteractiveMode` owns `InteractiveCommands`, which assembles completion candidates and parses invocations into closed command intents. `PromptStore` receives those typed intents and owns the resulting prompt/selector workflow. `PromptView`, `Composer`, and `PickerList` contain no command names, argument syntax, descriptions, or dispatch policy.
 
-The first `/model` slice calls existing `AgentSession` catalog and mutation operations and rejects async completion after cancellation, supersession, disposal, or session replacement. Extension/template/skill catalogs will remain with their concrete coding-agent owners and join the terminal aggregate only when those capabilities exist. OpenZi will not introduce an application-wide command bus or generic state-machine framework.
+The first `/model` slice calls existing `AgentSession` catalog and mutation operations, expresses choice presentation as `PickerStack` frames beneath the always-focused composer, and rejects async completion after cancellation, supersession, disposal, or session replacement. Extension/template/skill catalogs will remain with their concrete coding-agent owners and join the terminal aggregate only when those capabilities exist. OpenZi will not introduce an application-wide command bus or generic state-machine framework.

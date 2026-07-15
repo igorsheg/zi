@@ -7,81 +7,82 @@ import type {
 } from "@openzi/coding-agent"
 import { atom, type ReadableAtom } from "nanostores"
 
+import { glyphs } from "../../glyphs.js"
 import type { InteractiveCommands } from "../interactive-commands.js"
-import { configuredModelChoices, exactModelChoice, filterModelChoices } from "../model-selector.js"
+import { configuredModelChoices, exactModelChoice, sameModel } from "../model-selector.js"
 import type { InteractiveStore } from "./interactive.js"
+import { createPickerStack, type PickerFrame, type PickerStack } from "./picker-stack.js"
 
 export type PromptFeedback =
   | { readonly type: "none" }
   | { readonly type: "status"; readonly message: string }
   | { readonly type: "error"; readonly message: string }
 
-export type SlashCommandCompletion =
-  | { readonly type: "none" }
-  | { readonly type: "command"; readonly command: BuiltinSlashCommand }
+export type PromptWorkflow =
+  | { readonly type: "idle" }
+  | { readonly type: "loading_models"; readonly operationId: number }
+  | { readonly type: "choosing_model"; readonly operationId: number; readonly choices: readonly ModelChoice[] }
+  | { readonly type: "selecting_model"; readonly operationId: number }
 
-export type PromptSurface =
-  | { readonly type: "composer"; readonly completion: SlashCommandCompletion }
-  | { readonly type: "loading_models"; readonly operationId: number; readonly initialSearch: string }
-  | {
-      readonly type: "model_selector"
-      readonly operationId: number
-      readonly initialSearch: string
-      readonly choices: readonly ModelChoice[]
-      readonly selectedIndex: number
-      readonly error?: string
-    }
-  | {
-      readonly type: "selecting_model"
-      readonly operationId: number
-      readonly initialSearch: string
-      readonly choices: readonly ModelChoice[]
-      readonly selectedIndex: number
-    }
+export interface PromptInputEdit {
+  readonly revision: number
+  readonly text: string
+}
 
 export interface PromptState {
   readonly feedback: PromptFeedback
   readonly images: readonly ImageContent[]
-  readonly surface: PromptSurface
+  readonly workflow: PromptWorkflow
+  readonly inputEdit: PromptInputEdit
 }
 
 export interface PromptStore {
   readonly $state: ReadableAtom<PromptState>
+  readonly picker: PickerStack
   submit(text: string, delivery: PendingInputDelivery): boolean
   draftChanged(text: string, cursorOffset: number): void
-  completeSlashCommand(): string | undefined
-  dismissSlashCommand(): void
-  modelQueryChanged(query: string): void
-  moveModelSelection(query: string, direction: -1 | 1): void
-  selectModel(query: string): boolean
-  cancelModelSelector(): boolean
+  completePicker(text: string, cursorOffset: number): boolean
+  activatePicker(text: string, cursorOffset: number): boolean
+  movePicker(filter: string, direction: -1 | 1): void
+  backPicker(): boolean
   restoreQueuedInputs(currentText: string): string
   abortAndRestoreQueuedInputs(currentText: string): string
   clear(): void
   dispose(): void
 }
 
-const composerSurface = (): PromptSurface => ({ type: "composer", completion: { type: "none" } })
+const initialPromptState: PromptState = {
+  feedback: { type: "none" },
+  images: [],
+  workflow: { type: "idle" },
+  inputEdit: { revision: 0, text: "" }
+}
 
-const initialPromptState: PromptState = { feedback: { type: "none" }, images: [], surface: composerSurface() }
+const commandFrameId = "commands"
+const modelFrameId = "models"
 
 export function createPromptStore(mode: InteractiveStore, commands: InteractiveCommands): PromptStore {
   const $state = atom(initialPromptState)
+  const picker = createPickerStack()
   let disposed = false
   let nextOperationId = 0
+
+  const requestInput = (text: string) => {
+    const state = $state.get()
+    $state.set({ ...state, inputEdit: { revision: state.inputEdit.revision + 1, text } })
+  }
 
   const showError = (cause: unknown) => {
     if (disposed) return
     $state.set({ ...$state.get(), feedback: { type: "error", message: errorMessage(cause) } })
   }
 
-  const closeWithError = (cause: unknown) => {
+  const closeModelPicker = (feedback: PromptFeedback) => {
     if (disposed) return
-    $state.set({
-      ...$state.get(),
-      feedback: { type: "error", message: errorMessage(cause) },
-      surface: composerSurface()
-    })
+    picker.close()
+    const state = $state.get()
+    $state.set({ ...state, feedback, workflow: { type: "idle" } })
+    requestInput("")
   }
 
   const mergeQueue = (queue: QueuedInputs, currentText: string, showStatus: boolean): string => {
@@ -90,6 +91,7 @@ export function createPromptStore(mode: InteractiveStore, commands: InteractiveC
     const images = entries.flatMap(entry => entry.images)
     const state = $state.get()
     $state.set({
+      ...state,
       feedback: showStatus
         ? {
             type: "status",
@@ -101,54 +103,56 @@ export function createPromptStore(mode: InteractiveStore, commands: InteractiveC
                   }`
           }
         : { type: "none" },
-      images: images.length === 0 ? state.images : [...images, ...state.images],
-      surface: state.surface
+      images: images.length === 0 ? state.images : [...images, ...state.images]
     })
     return [...texts, currentText].filter(text => text.length > 0).join("\n\n")
   }
 
   const accepts = (operationId: number, session: ReturnType<InteractiveStore["getSession"]>): boolean => {
     if (disposed || mode.getSession() !== session) return false
-    const surface = $state.get().surface
-    return surface.type !== "composer" && surface.operationId === operationId
+    const workflow = $state.get().workflow
+    return workflow.type !== "idle" && workflow.operationId === operationId
   }
 
-  const select = (
+  const selectModel = (
     operationId: number,
     session: ReturnType<InteractiveStore["getSession"]>,
-    choices: readonly ModelChoice[],
-    selectedIndex: number,
-    initialSearch: string
+    choice: ModelChoice
   ) => {
-    const choice = choices[selectedIndex]
-    if (!choice || !accepts(operationId, session)) return
+    if (!accepts(operationId, session)) return
     const state = $state.get()
-    $state.set({ ...state, surface: { type: "selecting_model", operationId, initialSearch, choices, selectedIndex } })
+    $state.set({ ...state, workflow: { type: "selecting_model", operationId } })
+    const presentation = picker.presentation("")
+    if (presentation) {
+      picker.replaceTop(
+        { ...presentation.frame, emptyText: "Selecting model…", footer: `Selecting ${choice.model.id}…` },
+        ""
+      )
+    }
+    requestInput("")
+
     const apply = async () => {
       try {
         await session.setModel(choice.model)
       } catch (cause) {
-        if (accepts(operationId, session)) closeWithError(cause)
+        if (accepts(operationId, session)) closeModelPicker({ type: "error", message: errorMessage(cause) })
         return
       }
       if (!accepts(operationId, session)) return
-      $state.set({
-        ...$state.get(),
-        feedback: { type: "status", message: `Model: ${choice.model.id}` },
-        surface: composerSurface()
-      })
+      closeModelPicker({ type: "status", message: `Model: ${choice.model.id}` })
     }
     void apply()
   }
 
-  const openModels = (initialSearch: string) => {
+  const openModels = (initialSearch: string, parentFilter?: string) => {
     const session = mode.getSession()
     const operationId = ++nextOperationId
-    $state.set({
-      ...$state.get(),
-      feedback: { type: "none" },
-      surface: { type: "loading_models", operationId, initialSearch }
-    })
+    const state = $state.get()
+    $state.set({ ...state, feedback: { type: "none" }, workflow: { type: "loading_models", operationId } })
+    const loading = modelFrame([], session.model, "Loading models…")
+    if (parentFilter === undefined) picker.open(loading)
+    else picker.push(loading, parentFilter)
+    requestInput(initialSearch)
 
     const load = async () => {
       let loaded: readonly ModelChoice[]
@@ -156,17 +160,8 @@ export function createPromptStore(mode: InteractiveStore, commands: InteractiveC
         loaded = await session.listModelChoices()
       } catch (cause) {
         if (!accepts(operationId, session)) return
-        $state.set({
-          ...$state.get(),
-          surface: {
-            type: "model_selector",
-            operationId,
-            initialSearch,
-            choices: [],
-            selectedIndex: 0,
-            error: errorMessage(cause)
-          }
-        })
+        picker.replaceTop({ ...loading, emptyText: errorMessage(cause) }, initialSearch)
+        $state.set({ ...$state.get(), workflow: { type: "choosing_model", operationId, choices: [] } })
         return
       }
 
@@ -174,45 +169,45 @@ export function createPromptStore(mode: InteractiveStore, commands: InteractiveC
       const choices = configuredModelChoices(loaded, session.model)
       const exact = initialSearch ? exactModelChoice(initialSearch, choices) : undefined
       if (exact) {
-        const selectedIndex = choices.indexOf(exact)
-        select(operationId, session, choices, selectedIndex, initialSearch)
+        selectModel(operationId, session, exact)
         return
       }
-      $state.set({
-        ...$state.get(),
-        surface: {
-          type: "model_selector",
-          operationId,
-          initialSearch,
-          choices,
-          selectedIndex: currentModelIndex(choices, session.model)
-        }
-      })
+      picker.replaceTop(modelFrame(choices, session.model), initialSearch)
+      $state.set({ ...$state.get(), workflow: { type: "choosing_model", operationId, choices } })
     }
     void load()
   }
 
+  const dispatchCommand = (command: ReturnType<InteractiveCommands["parse"]>, parentFilter?: string): boolean => {
+    if (!command) return false
+    const commandType = command.type
+    switch (commandType) {
+      case "model":
+        openModels(command.search, parentFilter)
+        return true
+      default:
+        return assertNever(commandType)
+    }
+  }
+
+  const commandFor = (text: string, cursorOffset: number, selectedId: string): BuiltinSlashCommand | undefined =>
+    commands.suggestions(text, cursorOffset).find(command => command.name === selectedId)
+
   return {
     $state,
+    picker,
     submit(text, delivery) {
       const trimmed = text.trim()
-      if (!trimmed || $state.get().surface.type !== "composer") return false
+      if (!trimmed || $state.get().workflow.type !== "idle") return false
 
       const command = commands.parse(trimmed)
-      if (command) {
-        const commandType = command.type
-        switch (commandType) {
-          case "model":
-            openModels(command.search)
-            return true
-          default:
-            return assertNever(commandType)
-        }
-      }
+      if (dispatchCommand(command)) return true
 
       try {
         const settled = mode.submit({ text: trimmed, images: $state.get().images, delivery })
-        $state.set(initialPromptState)
+        picker.close()
+        const state = $state.get()
+        $state.set({ ...initialPromptState, inputEdit: { revision: state.inputEdit.revision + 1, text: "" } })
         void settled.catch(showError)
         return true
       } catch (cause) {
@@ -221,60 +216,67 @@ export function createPromptStore(mode: InteractiveStore, commands: InteractiveC
       }
     },
     draftChanged(text, cursorOffset) {
-      const state = $state.get()
-      if (state.surface.type !== "composer") return
-      const command = commands.suggestions(text, cursorOffset)[0]
-      const completion: SlashCommandCompletion = command ? { type: "command", command } : { type: "none" }
-      if (sameCompletion(completion, state.surface.completion)) return
-      $state.set({ ...state, surface: { type: "composer", completion } })
+      const workflow = $state.get().workflow
+      if (workflow.type !== "idle") {
+        picker.queryChanged(text)
+        return
+      }
+
+      const suggestions = commands.suggestions(text, cursorOffset)
+      if (suggestions.length === 0) {
+        if (picker.presentation(text)?.frame.id === commandFrameId) picker.close()
+        return
+      }
+      const frame = commandFrame(suggestions)
+      if (picker.presentation(text)?.frame.id === commandFrameId) picker.replaceTop(frame, text)
+      else picker.open(frame)
     },
-    completeSlashCommand() {
-      const state = $state.get()
-      if (state.surface.type !== "composer" || state.surface.completion.type !== "command") return undefined
-      $state.set({ ...state, surface: composerSurface() })
-      return commands.completion(state.surface.completion.command)
-    },
-    dismissSlashCommand() {
-      const state = $state.get()
-      if (state.surface.type !== "composer" || state.surface.completion.type === "none") return
-      $state.set({ ...state, surface: composerSurface() })
-    },
-    modelQueryChanged(query) {
-      const state = $state.get()
-      if (state.surface.type !== "model_selector") return
-      const choices = filterModelChoices(state.surface.choices, query)
-      const selectedIndex = Math.min(state.surface.selectedIndex, Math.max(0, choices.length - 1))
-      if (selectedIndex === state.surface.selectedIndex) return
-      $state.set({ ...state, surface: { ...state.surface, selectedIndex } })
-    },
-    moveModelSelection(query, direction) {
-      const state = $state.get()
-      if (state.surface.type !== "model_selector") return
-      const choices = filterModelChoices(state.surface.choices, query)
-      if (choices.length === 0) return
-      const selectedIndex =
-        direction === -1
-          ? state.surface.selectedIndex === 0
-            ? choices.length - 1
-            : state.surface.selectedIndex - 1
-          : state.surface.selectedIndex === choices.length - 1
-            ? 0
-            : state.surface.selectedIndex + 1
-      $state.set({ ...state, surface: { ...state.surface, selectedIndex } })
-    },
-    selectModel(query) {
-      const state = $state.get()
-      if (state.surface.type !== "model_selector") return false
-      const choices = filterModelChoices(state.surface.choices, query)
-      const selectedIndex = Math.min(state.surface.selectedIndex, Math.max(0, choices.length - 1))
-      if (!choices[selectedIndex]) return false
-      select(state.surface.operationId, mode.getSession(), choices, selectedIndex, state.surface.initialSearch)
+    completePicker(text, cursorOffset) {
+      const presentation = picker.presentation(text)
+      if (presentation?.frame.id !== commandFrameId || !presentation.selectedId) return false
+      const command = commandFor(text, cursorOffset, presentation.selectedId)
+      if (!command) return false
+      picker.close()
+      requestInput(commands.completion(command))
       return true
     },
-    cancelModelSelector() {
+    activatePicker(text, cursorOffset) {
+      const presentation = picker.presentation(text)
+      if (!presentation?.selectedId) return false
+
+      if (presentation.frame.id === commandFrameId) {
+        const command = commandFor(text, cursorOffset, presentation.selectedId)
+        if (!command) return false
+        return dispatchCommand(commands.parse(commands.completion(command).trim()), text)
+      }
+
+      if (presentation.frame.id === modelFrameId) {
+        const workflow = $state.get().workflow
+        if (workflow.type !== "choosing_model") return false
+        const choice = workflow.choices.find(candidate => modelId(candidate) === presentation.selectedId)
+        if (!choice) return false
+        selectModel(workflow.operationId, mode.getSession(), choice)
+        return true
+      }
+
+      return false
+    },
+    movePicker(filter, direction) {
+      picker.move(filter, direction)
+    },
+    backPicker() {
+      const presentation = picker.presentation("")
+      if (!presentation) return false
+      if (presentation.frame.id === commandFrameId) {
+        picker.close()
+        return true
+      }
+
+      const result = picker.back()
       const state = $state.get()
-      if (state.surface.type === "composer") return false
-      $state.set({ ...state, surface: composerSurface() })
+      $state.set({ ...state, workflow: { type: "idle" } })
+      if (result.type === "revealed") requestInput(result.filter)
+      else requestInput("")
       return true
     },
     restoreQueuedInputs(currentText) {
@@ -297,24 +299,66 @@ export function createPromptStore(mode: InteractiveStore, commands: InteractiveC
       }
     },
     clear() {
-      $state.set(initialPromptState)
+      picker.close()
+      const state = $state.get()
+      $state.set({ ...initialPromptState, inputEdit: { revision: state.inputEdit.revision + 1, text: "" } })
     },
     dispose() {
+      if (disposed) return
       disposed = true
+      picker.dispose()
     }
   }
 }
 
-function sameCompletion(left: SlashCommandCompletion, right: SlashCommandCompletion): boolean {
-  if (left.type === "none" || right.type === "none") return left.type === right.type
-  return left.command.name === right.command.name
+function commandFrame(commands: readonly BuiltinSlashCommand[]): PickerFrame {
+  return {
+    id: commandFrameId,
+    title: "",
+    filter: "none",
+    rows: commands.map(command => ({
+      id: command.name,
+      label: `/${command.name}`,
+      ...(command.argumentHint ? { detail: command.argumentHint } : {}),
+      metadata: command.description,
+      searchText: `${command.name} ${command.description} ${command.argumentHint ?? ""}`
+    }))
+  }
 }
 
-function currentModelIndex(choices: readonly ModelChoice[], current: ModelChoice["model"]): number {
-  const index = choices.findIndex(
-    choice => choice.model.provider === current.provider && choice.model.id === current.id
-  )
-  return index < 0 ? 0 : index
+function modelFrame(
+  choices: readonly ModelChoice[],
+  current: ModelChoice["model"],
+  emptyText = "No matching models"
+): PickerFrame {
+  return {
+    id: modelFrameId,
+    title: "Models",
+    hint: "Only showing models from configured providers. Use /login to add providers.",
+    filter: "fuzzy",
+    emptyText,
+    rows: choices.map(choice => ({
+      id: modelId(choice),
+      label: choice.model.id,
+      detail: `[${choice.model.provider}]`,
+      ...(sameModel(choice.model, current) ? { metadata: glyphs.check } : {}),
+      searchText: modelSearchText(choice)
+    })),
+    ...(choices.some(choice => sameModel(choice.model, current)) ? { selectedId: modelIdFor(current) } : {})
+  }
+}
+
+function modelSearchText(choice: ModelChoice): string {
+  const { id, name, provider } = choice.model
+  return `${provider} ${provider}/${id} ${provider} ${id}${name ? ` ${name}` : ""}`
+}
+
+function modelId(choice: ModelChoice): string {
+  return modelIdFor(choice.model)
+}
+
+function modelIdFor(model: ModelChoice["model"]): string {
+  return `${model.provider}/${model.id}`
 }
 
 function errorMessage(cause: unknown): string {

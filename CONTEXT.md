@@ -40,6 +40,10 @@ _Avoid_: Global store, frontend database, coding-agent policy
 An owner of one OpenTUI renderable subtree and its direct updates. It exposes concrete renderables and explicit disposal; it may compose product presentation but does not decide coding-agent policy.
 _Avoid_: React component, virtual DOM adapter, generic widget framework
 
+**Picker stack**:
+The instance-scoped owner of below-composer choice frames, top-frame selection/filtering, and suspended parent filters. It receives filter text from the always-focused composer and never owns an input renderable or domain action callbacks.
+_Avoid_: Selector screen, picker input, dialog stack
+
 **Explicit state machine**:
 Concrete domain states and allowed transitions represented directly in data and owned operations. This describes every stateful behavior at its appropriate scale; it does not imply a statechart library, event bus, or generic tagged-union helper.
 _Avoid_: Flag soup, generic payload protocol

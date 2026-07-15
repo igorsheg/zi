@@ -21,13 +21,83 @@ test("slash completion admits /model through the prompt workflow", async () => {
 
     setup.mockInput.pressTab()
     expect(prompt.plainText).toBe("/model ")
+    expect(prompt.cursorOffset).toBe(prompt.plainText.length)
     expect(setup.renderer.root.findDescendantById("model-search-input")).toBeUndefined()
 
     setup.mockInput.pressEnter()
     await renderSettled(setup)
 
     expect(prompt.plainText).toBe("")
-    expect(setup.renderer.root.findDescendantById("model-search-input")).toBeDefined()
+    expect(prompt.focused).toBe(true)
+    expect(setup.captureCharFrame()).toContain("current  [select]  ✓")
+  } finally {
+    session.dispose()
+    setup.destroy()
+  }
+})
+
+test("picker selection pushes a frame and Escape restores the parent filter", async () => {
+  const { session, setup } = await createModelFixture()
+
+  try {
+    const prompt = promptInput(setup)
+    await setup.mockInput.typeText("/m", 0)
+    setup.mockInput.pressEnter()
+    await renderSettled(setup)
+
+    expect(prompt.plainText).toBe("")
+    expect(prompt.focused).toBe(true)
+    expect(setup.captureCharFrame()).toContain("Models · 2")
+
+    setup.mockInput.pressEscape()
+    await setup.renderOnce()
+    expect(prompt.plainText).toBe("/m")
+    expect(prompt.cursorOffset).toBe(prompt.plainText.length)
+    expect(setup.captureCharFrame()).toContain("/model  <provider/model>")
+
+    setup.mockInput.pressEscape()
+    await setup.renderOnce()
+    expect(prompt.plainText).toBe("/m")
+    expect(setup.captureCharFrame()).not.toContain("/model  <provider/model>")
+  } finally {
+    session.dispose()
+    setup.destroy()
+  }
+})
+
+test("composer remains the focused filter while the model frame changes below it", async () => {
+  const { session, setup } = await createModelFixture()
+
+  try {
+    const prompt = promptInput(setup)
+    prompt.setText("/model")
+    prompt.gotoBufferEnd()
+    setup.mockInput.pressEnter()
+    await renderSettled(setup)
+
+    expect(prompt.focused).toBe(true)
+    expect(setup.renderer.root.findDescendantById("model-search-input")).toBeUndefined()
+    expect(promptInput(setup) === prompt).toBe(true)
+    expect(setup.captureCharFrame()).toContain("current  [select]  ✓")
+
+    await setup.mockInput.typeText("targ", 0)
+    await setup.renderOnce()
+    expect(prompt.plainText).toBe("targ")
+    expect(setup.captureCharFrame()).toContain("target  [select]")
+    expect(setup.captureCharFrame()).not.toContain("current  [select]")
+
+    setup.mockInput.pressEnter({ shift: true })
+    expect(prompt.plainText).toBe("targ")
+    session.steer("queued")
+    setup.mockInput.pressArrow("up", { meta: true })
+    expect(prompt.plainText).toBe("targ")
+    expect(session.queuedInputs.steering).toHaveLength(1)
+
+    setup.mockInput.pressEnter()
+    await renderSettled(setup)
+    expect(session.model.id).toBe("target")
+    expect(prompt.plainText).toBe("")
+    expect(prompt.focused).toBe(true)
   } finally {
     session.dispose()
     setup.destroy()
@@ -70,9 +140,8 @@ test("/model with an unmatched term opens a prefiltered selector and Escape canc
     setup.mockInput.pressEnter()
     await renderSettled(setup)
 
-    const search = setup.renderer.root.findDescendantById("model-search-input")
-    if (!(search instanceof TextareaRenderable)) throw new Error("Model search textarea not found")
-    expect(search.plainText).toBe("targ")
+    expect(prompt.plainText).toBe("targ")
+    expect(prompt.focused).toBe(true)
     expect(setup.captureCharFrame()).toContain("target  [select]")
     expect(setup.captureCharFrame()).not.toContain("current  [select]")
 
@@ -123,16 +192,16 @@ test("cancelled model selection rejects stale completion", async () => {
 
   try {
     expect(prompt.submit("/model", "steer")).toBe(true)
-    await waitFor(() => prompt.$state.get().surface.type === "model_selector")
-    expect(prompt.$state.get().surface.type).toBe("model_selector")
+    await waitFor(() => prompt.$state.get().workflow.type === "choosing_model")
+    expect(prompt.$state.get().workflow.type).toBe("choosing_model")
     expect(prompt.submit("/model", "steer")).toBe(false)
-    expect(prompt.selectModel("")).toBe(true)
-    expect(prompt.cancelModelSelector()).toBe(true)
+    expect(prompt.activatePicker("", 0)).toBe(true)
+    expect(prompt.backPicker()).toBe(true)
 
     selection.reject(new Error("stale selection failed"))
     await settle()
 
-    expect(prompt.$state.get()).toMatchObject({ feedback: { type: "none" }, surface: { type: "composer" } })
+    expect(prompt.$state.get()).toMatchObject({ feedback: { type: "none" }, workflow: { type: "idle" } })
   } finally {
     prompt.dispose()
     interactive.dispose()
@@ -151,14 +220,15 @@ test("model loading completion cannot cross a session replacement", async () => 
     const prompt = promptInput(setup)
     prompt.setText("/model")
     setup.mockInput.pressEnter()
-    expect(setup.renderer.root.findDescendantById("model-search-input")).toBeDefined()
+    await setup.renderOnce()
+    expect(setup.captureCharFrame()).toContain("Loading models")
 
     setup.mode.replaceSession(second)
     load.resolve([])
     await renderSettled(setup)
 
     expect(setup.mode.store.getSession() === second).toBe(true)
-    expect(setup.renderer.root.findDescendantById("model-search-input")).toBeUndefined()
+    expect(setup.captureCharFrame()).not.toContain("Loading models")
     expect(promptInput(setup).focused).toBe(true)
   } finally {
     first.dispose()
@@ -217,9 +287,7 @@ test("/model opens configured models and selects through the terminal picker", a
     await renderSettled(setup)
 
     expect(prompt.plainText).toBe("")
-    const search = setup.renderer.root.findDescendantById("model-search-input")
-    if (!(search instanceof TextareaRenderable)) throw new Error("Model search textarea not found")
-    expect(search.focused).toBe(true)
+    expect(prompt.focused).toBe(true)
     expect(setup.captureCharFrame()).toContain("current  [select]  ✓")
     expect(setup.captureCharFrame()).toContain("target  [select]")
 

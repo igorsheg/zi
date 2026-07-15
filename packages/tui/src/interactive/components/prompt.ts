@@ -2,12 +2,11 @@ import { BoxRenderable, CliRenderEvents, type CliRenderer, type KeyEvent, TextRe
 import type { QueuedInputs } from "@openzi/coding-agent"
 
 import { composerGeometry, createComposer, type Composer } from "../../components/composer.js"
-import { createPickerList, type PickerList } from "../../components/picker-list.js"
 import type { Theme } from "../../theme.js"
 import type { InteractiveCommands } from "../interactive-commands.js"
 import type { InteractiveStore } from "../stores/interactive.js"
 import { createPromptStore, type PromptStore } from "../stores/prompt.js"
-import { ModelSelectorView } from "./model-selector.js"
+import { PickerStackView } from "./picker-stack.js"
 
 const graphemes = new Intl.Segmenter(undefined, { granularity: "grapheme" })
 
@@ -25,9 +24,9 @@ export class PromptView {
   readonly #feedbackText: TextRenderable
   readonly #queue: BoxRenderable
   readonly #composer: Composer
-  readonly #commandPicker: PickerList
+  readonly #pickerStack: PickerStackView
   readonly #release: Array<() => void> = []
-  #modelSelector: ModelSelectorView | undefined
+  #appliedInputRevision = 0
 
   constructor(
     renderer: CliRenderer,
@@ -61,13 +60,13 @@ export class PromptView {
       onContentChange: () => this.#store.draftChanged(this.input.plainText, this.input.cursorOffset)
     })
     this.input = this.#composer.input
-    this.#commandPicker = createPickerList(renderer, { rows: [], height: 0, theme })
+    this.#pickerStack = new PickerStackView(renderer, this.#store.picker, theme, () => this.input.plainText)
 
     this.root.add(this.#working)
     this.root.add(this.#feedback)
     this.root.add(this.#queue)
     this.root.add(this.#composer.root)
-    this.root.add(this.#commandPicker.root)
+    this.root.add(this.#pickerStack.root)
 
     const update = () => this.#update()
     this.#release.push(this.#store.$state.subscribe(update), mode.$promptRevision.subscribe(update))
@@ -79,14 +78,12 @@ export class PromptView {
   }
 
   focus(): void {
-    if (this.#modelSelector) this.#modelSelector.focus()
-    else this.input.focus()
+    this.input.focus()
   }
 
   destroy(): void {
     for (const release of this.#release.splice(0)) release()
-    this.#modelSelector?.destroy()
-    this.#modelSelector = undefined
+    this.#pickerStack.destroy()
     this.#store.dispose()
     this.root.destroyRecursively()
   }
@@ -95,55 +92,24 @@ export class PromptView {
     const session = this.#mode.getSession()
     const prompt = this.#store.$state.get()
     const geometry = composerGeometry(this.#renderer.width, this.#renderer.height)
-    const composerVisible = prompt.surface.type === "composer"
-    const completion = composerVisible ? prompt.surface.completion : { type: "none" as const }
-    const completionVisible = completion.type === "command"
-    const feedbackVisible = composerVisible && prompt.feedback.type !== "none"
-    const fixedRows =
-      geometry.protectedRows + (session.isStreaming ? 1 : 0) + (feedbackVisible ? 1 : 0) + (completionVisible ? 1 : 0)
-
-    if (composerVisible && this.#modelSelector) {
-      this.root.remove(this.#modelSelector.root)
-      this.#modelSelector.destroy()
-      this.#modelSelector = undefined
-      this.input.focus()
-    } else if (!composerVisible && !this.#modelSelector) {
-      this.#modelSelector = new ModelSelectorView(
-        this.#renderer,
-        this.#store,
-        this.#theme,
-        session.model,
-        prompt.surface.initialSearch
-      )
-      this.root.add(this.#modelSelector.root)
+    if (prompt.inputEdit.revision > this.#appliedInputRevision) {
+      this.#appliedInputRevision = prompt.inputEdit.revision
+      this.#replaceInput(prompt.inputEdit.text)
     }
+    const pickerVisible = Boolean(this.#store.picker.presentation(this.input.plainText))
+    const feedbackVisible = prompt.feedback.type !== "none"
+    const fixedRows = geometry.protectedRows + (session.isStreaming ? 1 : 0) + (feedbackVisible ? 1 : 0)
 
-    this.#working.visible = composerVisible && session.isStreaming
+    this.#working.visible = session.isStreaming
     this.#feedback.visible = feedbackVisible
     this.#feedbackText.content = feedbackVisible
       ? truncateToCells(prompt.feedback.message, Math.max(0, this.#renderer.width - 2))
       : ""
     this.#feedbackText.fg = prompt.feedback.type === "error" ? this.#theme.text.error : this.#theme.text.muted
-    if (composerVisible) this.#renderQueue(session.queuedInputs, Math.max(0, this.#renderer.height - fixedRows))
-    else this.#queue.visible = false
-    this.#composer.root.visible = composerVisible
-    this.#commandPicker.update({
-      rows:
-        completion.type === "command"
-          ? [
-              {
-                id: completion.command.name,
-                label: `/${completion.command.name}`,
-                ...(completion.command.argumentHint ? { detail: completion.command.argumentHint } : {}),
-                metadata: completion.command.description
-              }
-            ]
-          : [],
-      ...(completion.type === "command" ? { selectedId: completion.command.name } : {}),
-      height: completionVisible ? 1 : 0,
-      theme: this.#theme
-    })
+    if (pickerVisible) this.#queue.visible = false
+    else this.#renderQueue(session.queuedInputs, Math.max(0, this.#renderer.height - fixedRows))
     this.#composer.update(geometry, session.sessionManager.header.cwd, modelTitle(session))
+    this.#pickerStack.update(Math.max(1, this.#renderer.height - fixedRows))
   }
 
   #renderQueue(queue: QueuedInputs, maxRows: number): void {
@@ -191,48 +157,48 @@ export class PromptView {
   }
 
   #submit(delivery: "steer" | "followUp"): void {
-    if (this.#store.submit(this.input.plainText, delivery)) this.input.setText("")
+    this.#store.submit(this.input.plainText, delivery)
+  }
+
+  #replaceInput(text: string): void {
+    this.input.setText(text)
+    this.input.gotoBufferEnd()
+    this.input.focus()
   }
 
   #restore(abort: boolean): void {
     const text = abort
       ? this.#store.abortAndRestoreQueuedInputs(this.input.plainText)
       : this.#store.restoreQueuedInputs(this.input.plainText)
-    if (text !== this.input.plainText) this.input.setText(text)
+    if (text !== this.input.plainText) this.#replaceInput(text)
   }
 
   #onKeyPress = (key: KeyEvent): void => {
-    const surface = this.#store.$state.get().surface
-    if (surface.type !== "composer") return
-
     const bare = !key.shift && !key.ctrl && !key.meta && !key.super && !key.hyper
-    if (surface.completion.type === "command") {
-      if (bare && key.name === "return") {
+    const picker = this.#store.picker.presentation(this.input.plainText)
+    if (picker) {
+      if (key.name === "return") {
         key.preventDefault()
         key.stopPropagation()
-        const completion = this.#store.completeSlashCommand()
-        if (completion) {
-          this.input.setText(completion)
-          this.#submit("steer")
-        }
+        if (bare) this.#store.activatePicker(this.input.plainText, this.input.cursorOffset)
         return
       }
-      if (bare && key.name === "tab") {
+      if (key.name === "tab") {
         key.preventDefault()
         key.stopPropagation()
-        const completion = this.#store.completeSlashCommand()
-        if (completion) this.input.setText(completion)
+        if (bare) this.#store.completePicker(this.input.plainText, this.input.cursorOffset)
         return
       }
       if (bare && key.name === "escape") {
         key.preventDefault()
         key.stopPropagation()
-        this.#store.dismissSlashCommand()
+        this.#store.backPicker()
         return
       }
-      if (bare && (key.name === "up" || key.name === "down")) {
+      if (key.name === "up" || key.name === "down") {
         key.preventDefault()
         key.stopPropagation()
+        if (bare) this.#store.movePicker(this.input.plainText, key.name === "up" ? -1 : 1)
         return
       }
     }
@@ -291,7 +257,7 @@ export class PromptView {
         if (copied) this.#renderer.clearSelection()
         return
       }
-      this.input.setText("")
+      if (this.#store.backPicker()) return
       this.#store.clear()
     } else if (key.name === "d" && this.input.plainText.length === 0) {
       key.preventDefault()

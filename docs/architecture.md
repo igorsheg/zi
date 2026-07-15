@@ -114,14 +114,15 @@ AgentSession
           -> TranscriptView + TranscriptStore
           -> PromptView + PromptStore
               -> Composer
-              -> ModelSelectorView + PickerList
+              -> PickerStack + PickerStackView
+                  -> PickerList
 ```
 
 `InteractiveMode` owns the root renderable subtree, current session binding, session replacement, syntax-style lifetime, prompt-focus preservation, terminal disposal, and `InteractiveCommands`. Coding-agent owners supply command descriptors; `InteractiveCommands` assembles terminal completion and parses built-in invocations into closed intents.
 
-`InteractiveStore` owns the session subscription, generation, bounded transient tools, submissions, queue restoration, and abort delegation. `PromptStore` owns terminal feedback, retained images, active completion selection, and the closed model-selector workflow. It receives typed command intents rather than parsing command strings. `ModelSelectorView` keeps search text native to OpenTUI and renders choices supplied by `AgentSession`. `TranscriptStore` owns follow/detached/unseen navigation. Durable messages, model, queues, persistence, and activity remain direct `AgentSession` reads.
+`InteractiveStore` owns the session subscription, generation, bounded transient tools, submissions, queue restoration, and abort delegation. `PromptStore` owns terminal feedback, retained images, typed command/model workflows, and one-shot composer edit requests. `PickerStack` owns nested frames, selection, suspended parent filters, and filtering of only the active frame. `PickerStackView` renders that frame below the always-mounted composer and owns no input. `TranscriptStore` owns follow/detached/unseen navigation. Durable messages, model, queues, persistence, and activity remain direct `AgentSession` reads.
 
-Imperative components subscribe to readable Nano Stores and update only their owned renderables. Durable transcript message renderables are appended rather than rebuilt, preserving native selection and detached scrolling. Textarea contents, cursor, focus, viewport, and selection remain OpenTUI-owned.
+Imperative components subscribe to readable Nano Stores and update only their owned renderables. Durable transcript message renderables are appended rather than rebuilt, preserving native selection and detached scrolling. The composer textarea is the sole prompt/filter input and remains focused while picker frames change. Textarea contents, cursor, focus, viewport, and selection remain OpenTUI-owned.
 
 ## Resource shutdown
 

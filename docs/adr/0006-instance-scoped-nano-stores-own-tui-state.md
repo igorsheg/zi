@@ -1,6 +1,6 @@
 # Instance-scoped Nano Stores own TUI state
 
-> Amended by [ADR 0007](0007-terminal-interactive-mode-over-agent-session.md): Nano Stores belong only to the terminal mode.
+> Amended by [ADR 0007](0007-terminal-interactive-mode-over-agent-session.md) and [ADR 0008](0008-composer-owned-picker-stack.md): Nano Stores belong only to the terminal mode, and below-composer choice state has a dedicated stack owner.
 
 OpenZi uses Nano Stores for mutable terminal application and presentation state. Stores are concrete instances created by one `InteractiveMode`, not module-global singletons.
 
@@ -9,11 +9,13 @@ The terminal client creates:
 ```ts
 createInteractiveStore(session)
 createPromptStore(interactive)
+createPickerStack()
 createTranscriptStore()
 ```
 
 - `InteractiveStore` owns the current session subscription and generation, rejects stale events, bounds transient tool presentation, and exposes narrow prompt/transcript revision streams.
-- `PromptStore` owns feedback, retained images, active completion selection, and closed selector workflows. It receives typed command intents from the mode-owned `InteractiveCommands` and delegates prompt, queue, catalog, and mutation operations through `InteractiveStore` to `AgentSession`. Live textarea contents remain OpenTUI-owned.
+- `PromptStore` owns feedback, retained images, typed command/model workflows, and one-shot composer edit requests. It receives typed command intents from the mode-owned `InteractiveCommands` and delegates prompt, queue, catalog, and mutation operations through `InteractiveStore` to `AgentSession`.
+- `PickerStack` owns nested picker frames, selected rows, suspended parent filters, and top-frame filtering. It receives the active composer filter as an operation argument and owns no input.
 - `TranscriptStore` owns follow/detached/unseen terminal navigation.
 
 `AgentSession` remains authoritative for messages, model, thinking level, queues, persistence, provider work, and run lifecycle. TUI stores may retain a session reference for identity but may not mirror durable state.

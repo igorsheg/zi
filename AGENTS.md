@@ -44,9 +44,10 @@ Explicit-state, data-oriented design is mandatory for stateful behavior.
 - Stores are instance-scoped and created by factories. Never export a mutable module-global application store or collect unrelated capabilities into one root state blob.
 - Store writable atoms are private implementation details. Components subscribe and request domain-named operations; they do not call `.set()`.
 - TUI stores may retain an `AgentSession` reference for subscription identity but may not copy messages, model, queues, or other authoritative state. Native textarea and scroll state remain OpenTUI-owned.
+- Below-composer choice flows use the instance-scoped `PickerStack`: `Composer` remains the only input and focus owner; the stack owns frames, selection, suspended parent filters, and top-frame filtering; picker views render only the active frame and never create or edit an input.
 - Coding-agent owners do not depend on frontend state libraries. TUI stores use explicit binding and disposal; use Nano Stores `onMount()` only when a terminal resource lifetime genuinely follows observation.
 
-See `docs/adr/0004-explicit-state-and-transitions.md` and `docs/adr/0006-instance-scoped-nano-stores-own-tui-state.md` for the project decisions.
+See `docs/adr/0004-explicit-state-and-transitions.md`, `docs/adr/0006-instance-scoped-nano-stores-own-tui-state.md`, and `docs/adr/0008-composer-owned-picker-stack.md` for the project decisions.
 
 ## Workspace ownership
 
