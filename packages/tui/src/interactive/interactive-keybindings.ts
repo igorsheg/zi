@@ -13,6 +13,7 @@ export type PromptKeyAction =
   | "picker_down"
   | "submit"
   | "follow_up"
+  | "background_task"
   | "new_line"
   | "restore_queue"
   | "interrupt"
@@ -26,6 +27,7 @@ export interface PromptKeyContext {
   readonly pickerOpen: boolean
   readonly editorEmpty: boolean
   readonly streaming: boolean
+  readonly foregroundShellTask: boolean
 }
 
 interface ParsedKey {
@@ -43,6 +45,7 @@ const defaultBindingEntries = [
   ["app.exit", ["ctrl+d"], "Exit when the editor is empty", "reserved"],
   ["app.message.followUp", ["alt+return"], "Queue a follow-up message", "reserved"],
   ["app.message.dequeue", ["alt+up"], "Restore queued messages", "overridable"],
+  ["app.task.background", ["ctrl+g"], "Move the foreground shell task to the background", "overridable"],
   ["tui.input.submit", ["return"], "Submit input", "reserved"],
   ["tui.input.newLine", ["shift+return"], "Insert a newline", "overridable"],
   ["tui.input.tab", ["tab"], "Complete the active input", "overridable"],
@@ -141,6 +144,7 @@ export class InteractiveKeybindings {
       if (isNativeKey(event, "return", "tab", "up", "down")) return "consume"
     }
 
+    if (context.foregroundShellTask && this.matches(event, "app.task.background")) return "background_task"
     if (context.streaming && this.matches(event, "app.interrupt")) return "interrupt"
     if (this.matches(event, "app.clear")) return "clear"
     if (context.editorEmpty && this.matches(event, "app.exit")) return "exit"

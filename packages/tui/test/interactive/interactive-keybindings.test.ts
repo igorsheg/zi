@@ -13,6 +13,10 @@ test("interactive keybindings resolve semantic prompt and transcript actions", (
   expect(keybindings.promptAction(key("return", { meta: true }), context())).toBe("follow_up")
   expect(keybindings.promptAction(key("return", { ctrl: true }), context())).toBe("consume")
   expect(keybindings.promptAction(key("escape"), context())).toBe("interrupt")
+  expect(keybindings.promptAction(key("g", { ctrl: true }), context())).toBe("background_task")
+  expect(
+    keybindings.promptAction(key("g", { ctrl: true }), { ...context(), foregroundShellTask: false })
+  ).toBeUndefined()
   expect(keybindings.promptAction(key("c", { ctrl: true }), context())).toBe("clear")
   expect(keybindings.promptAction(key("d", { ctrl: true }), { ...context(), editorEmpty: false })).toBeUndefined()
   expect(keybindings.promptAction(key("escape"), { ...context(), streaming: false })).toBeUndefined()
@@ -73,7 +77,7 @@ test("interactive keybinding overrides reject unknown actions and unbounded key 
 })
 
 function context(pickerOpen = false) {
-  return { pickerOpen, editorEmpty: true, streaming: true }
+  return { pickerOpen, editorEmpty: true, streaming: true, foregroundShellTask: true }
 }
 
 function key(

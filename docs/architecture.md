@@ -59,12 +59,14 @@ createAgentRuntime(options)
   -> OpenZiPaths (global directory + effective cwd policy)
   -> SettingsManager + FileCredentialStore + ModelRegistry + Authentication + ResourceLoader
   -> SessionManager
+  -> SessionShell (session-scoped task/process/output owner)
   -> createAgentSession(services, session options)
       -> ResourceLoader.load() -> immutable SessionResources
       -> AgentSession
           -> pi-agent-core Agent
           -> admitted session resources
-          -> tool definitions
+          -> SessionShell-backed bash and task tools
+          -> other tool definitions
           -> later: compaction, retry, extensions
 ```
 
@@ -75,6 +77,7 @@ createAgentRuntime(options)
 `AgentSession` is the policy spine shared by application modes. It owns:
 
 - one Pi `Agent`;
+- one optional session-scoped `SessionShell`, including foreground/background task identity, process groups, bounded output retention, completion, and final disposal;
 - persistence of completed messages;
 - explicit `unselected | selected` model state, including login-first startup, model and thinking-level changes;
 - one immutable `SessionResources` snapshot, system-prompt composition, resource diagnostics, prompt-template expansion, and bounded explicit skill invocation;
@@ -107,7 +110,9 @@ These are concrete owners, not speculative dependency-injection interfaces. No m
 
 ### Tools
 
-Tools belong in `coding-agent`. Each invocation owns cancellation, timeout, output limits, and cleanup. Initial parity order is `read`, `bash`, `edit`, `write`, then `grep`, `find`, and `ls`.
+Tools belong in `coding-agent`. Stateless file tools own their invocation bounds directly. The concrete `SessionShell` owns every shell task and its process group, foreground/background transition, shared settlement, output preview and capped spill file, completed tombstone, TTL, and session disposal. `bash`, `task_output`, and `kill_task` are thin adapters over that owner; the TUI reaches shell operations only through `AgentSession` and never copies a task registry. Run interruption remains queue/provider-owned and stops only foreground shell work through the tool signal. Final `AgentSession.dispose()` admits termination of every surviving task, while its disposed settlement remains available through `waitForIdle()` for the creator to await after terminal restoration.
+
+Initial file-tool parity order is `read`, `bash`, `edit`, `write`, then `grep`, `find`, and `ls`.
 
 ## Application modes
 

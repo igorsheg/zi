@@ -67,3 +67,53 @@ test("the OpenTUI prompt drives a complete tool turn", async () => {
     setup.destroy()
   }
 })
+
+test("Ctrl+G demotes the session-owned foreground shell task", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "openzi-tui-background-"))
+  const models = createModels()
+  const faux = fauxProvider({ tokensPerSecond: 10_000 })
+  models.setProvider(faux.provider)
+  faux.setResponses([
+    fauxAssistantMessage(
+      fauxToolCall(
+        "bash",
+        { command: `node -e "console.log('started'); setTimeout(() => console.log('done'), 200)"` },
+        { id: "bash-background" }
+      ),
+      { stopReason: "toolUse" }
+    ),
+    fauxAssistantMessage("The task is running in the background.")
+  ])
+  const { session } = await createAgentRuntime({ cwd, model: "faux/faux-1", models, persist: false })
+  const setup = await createInteractiveTest(session, { width: 80, height: 24 })
+
+  try {
+    await setup.renderOnce()
+    const input = setup.renderer.root.findDescendantById("prompt-input")
+    if (!(input instanceof TextareaRenderable)) throw new Error("Prompt textarea not found")
+    input.setText("Start the command.")
+    input.submit()
+    await waitUntil(() => session.shellTasks.some(task => task.type === "foreground"))
+
+    setup.mockInput.pressKey("g", { ctrl: true })
+    await waitUntil(() => session.shellTasks.some(task => task.type === "background"))
+    await session.waitForIdle()
+    await waitUntil(() => session.shellTasks.some(task => task.type === "completed"))
+
+    expect(session.shellTasks).toHaveLength(1)
+    expect(session.shellTasks[0]).toMatchObject({ type: "completed", outcome: { type: "exited", exitCode: 0 } })
+  } finally {
+    session.dispose()
+    setup.destroy()
+  }
+})
+
+async function waitUntil(condition: () => boolean): Promise<void> {
+  for (let attempt = 0; attempt < 200; attempt++) {
+    if (condition()) return
+    // Polling delays are sequential by definition.
+    // oxlint-disable-next-line no-await-in-loop
+    await Bun.sleep(10)
+  }
+  throw new Error("Condition was not reached")
+}

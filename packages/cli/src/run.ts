@@ -99,6 +99,7 @@ export async function runCli(argv: readonly string[], host: CliHost): Promise<nu
     return 1
   }
 
+  let exitCode: number
   try {
     for (const diagnostic of runtime.services.settingsManager.drainErrors()) {
       // Keep scoped diagnostics ordered on the single stderr writer.
@@ -107,15 +108,23 @@ export async function runCli(argv: readonly string[], host: CliHost): Promise<nu
     }
     if (mode === "interactive") {
       await host.runInteractive(runtime.session, prompts)
-      return 0
+      exitCode = 0
+    } else {
+      exitCode = await runHeadless(runtime.session, mode, prompts, host)
     }
-    return await runHeadless(runtime.session, mode, prompts, host)
+  } catch (cause) {
+    await host.writeStderr(`${errorMessage(cause)}\n`)
+    exitCode = 1
+  }
+
+  runtime.session.dispose()
+  try {
+    await settle(runtime.session.waitForIdle(), cliShutdownTimeoutMs)
   } catch (cause) {
     await host.writeStderr(`${errorMessage(cause)}\n`)
     return 1
-  } finally {
-    runtime.session.dispose()
   }
+  return exitCode
 }
 
 function runtimeOptions(args: Args): CreateAgentRuntimeOptions {
@@ -186,7 +195,7 @@ function settle<T>(operation: Promise<T>, timeoutMs: number): Promise<T> {
   return Promise.race([
     operation,
     new Promise<T>((_, reject) => {
-      timeout = setTimeout(() => reject(new Error("Headless shutdown timed out")), timeoutMs)
+      timeout = setTimeout(() => reject(new Error("Session disposal timed out")), timeoutMs)
     })
   ]).finally(() => {
     if (timeout) clearTimeout(timeout)

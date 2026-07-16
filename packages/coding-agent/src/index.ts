@@ -20,6 +20,7 @@ export * from "./resource-loader.js"
 export * from "./runtime.js"
 export * from "./services.js"
 export * from "./session-manager.js"
+export * from "./session-shell.js"
 export * from "./settings-manager.js"
 export {
   maxSkillCount,

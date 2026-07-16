@@ -160,7 +160,8 @@ export class PromptView {
     const action = this.#keybindings.promptAction(key, {
       pickerOpen: Boolean(this.#store.picker.presentation(this.input.plainText)),
       editorEmpty: this.input.plainText.length === 0,
-      streaming: session.isStreaming || authenticationActive(this.#store.$state.get().workflow)
+      streaming: session.isStreaming || authenticationActive(this.#store.$state.get().workflow),
+      foregroundShellTask: session.shellTasks.some(task => task.type === "foreground")
     })
     if (!action) return
     this.#handleKeyAction(key, action)
@@ -196,6 +197,10 @@ export class PromptView {
       case "follow_up":
         consume(key)
         this.#submit("followUp")
+        return
+      case "background_task":
+        consume(key)
+        this.#interactive.backgroundForegroundShellTask()
         return
       case "new_line":
         consume(key)

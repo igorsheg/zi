@@ -44,6 +44,7 @@ export interface InteractiveStore {
   submit(submission: PromptSubmission): Promise<void>
   restoreQueuedInputs(): QueuedInputs
   abortAndRestoreQueuedInputs(): AbortedQueuedInputs
+  backgroundForegroundShellTask(): void
   dispose(): void
 }
 
@@ -108,6 +109,9 @@ export function createInteractiveStore(session: AgentSession): InteractiveStore 
     },
     abortAndRestoreQueuedInputs() {
       return currentSession().takeQueuedInputsAndAbort()
+    },
+    backgroundForegroundShellTask() {
+      currentSession().demoteForegroundShellTask()
     },
     dispose() {
       if (disposed) return
@@ -184,6 +188,7 @@ export function transitionInteractiveState(state: InteractiveState, event: Agent
     case "thinking_level_changed":
     case "steering_mode_changed":
     case "follow_up_mode_changed":
+    case "shell_task_changed":
       promptRevision++
       break
     case "turn_start":

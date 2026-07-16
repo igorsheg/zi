@@ -150,26 +150,26 @@ Durable transcript messages are appended without rebuilding existing renderables
 
 ## State placement
 
-| State                                                               | Owner                         |
-| ------------------------------------------------------------------- | ----------------------------- |
-| Messages, model, thinking level, queues, persistence, run activity  | `AgentSession`                |
-| Current session binding and generation                              | `InteractiveStore`            |
-| Semantic terminal bindings, resolved keys, hints, conflicts         | `InteractiveKeybindings`      |
-| Transient tools and terminal render revisions                       | `InteractiveStore`            |
-| Prompt feedback, typed workflow, one-shot input edits               | `PromptStore`                 |
-| Picker frames, selection, suspended parent filters                  | `PickerStack`                 |
-| Active picker filter text, cursor, focus, paste, undo               | composer `TextareaRenderable` |
-| Follow/detached/unseen transcript navigation                        | `TranscriptStore`             |
-| Scroll offset, viewport, selection                                  | OpenTUI renderables           |
-| Pending native callback generations                                 | component owning the resource |
-| Renderer, signals, terminal title, close state, settlement deadline | `runTui`                      |
-| Semantic clear/exit gesture, syntax style, root renderable          | `InteractiveMode`             |
+| State                                                                           | Owner                         |
+| ------------------------------------------------------------------------------- | ----------------------------- |
+| Messages, model, thinking level, queues, shell tasks, persistence, run activity | `AgentSession`                |
+| Current session binding and generation                                          | `InteractiveStore`            |
+| Semantic terminal bindings, resolved keys, hints, conflicts                     | `InteractiveKeybindings`      |
+| Transient tools and terminal render revisions                                   | `InteractiveStore`            |
+| Prompt feedback, typed workflow, one-shot input edits                           | `PromptStore`                 |
+| Picker frames, selection, suspended parent filters                              | `PickerStack`                 |
+| Active picker filter text, cursor, focus, paste, undo                           | composer `TextareaRenderable` |
+| Follow/detached/unseen transcript navigation                                    | `TranscriptStore`             |
+| Scroll offset, viewport, selection                                              | OpenTUI renderables           |
+| Pending native callback generations                                             | component owning the resource |
+| Renderer, signals, terminal title, close state, settlement deadline             | `runTui`                      |
+| Semantic clear/exit gesture, syntax style, root renderable                      | `InteractiveMode`             |
 
 There is no module-global mutable application state.
 
 ## Input and lifecycle
 
-Global key handlers ask `InteractiveKeybindings` for a closed semantic action and prevent default before editor handling when terminal product semantics override native behavior. Native selection copy and picker back take precedence over the exit gesture and reset any earlier arm. Otherwise `InteractiveMode` owns `ready | armed { pressedAt }`: the first effective `app.clear` action—Ctrl+C by default—clears the composer and arms Pi's 500 ms window, while the second requests exit. Ctrl+D requests exit only from an empty composer; Escape cancels an active run and restores detached queued input. The composer remains mounted and focused during command completion, nested picker navigation, model selection, and transcript selection. Programmatic input edits always move the native cursor to the end. Transcript navigation preserves detached intent across output and resize. Queued native callbacks validate their target before applying.
+Global key handlers ask `InteractiveKeybindings` for a closed semantic action and prevent default before editor handling when terminal product semantics override native behavior. Native selection copy and picker back take precedence over the exit gesture and reset any earlier arm. Otherwise `InteractiveMode` owns `ready | armed { pressedAt }`: the first effective `app.clear` action—Ctrl+C by default—clears the composer and arms Pi's 500 ms window, while the second requests exit. Ctrl+D requests exit only from an empty composer; Escape cancels an active run and restores detached queued input. Ctrl+G's semantic task-background action requests the `AgentSession` foreground-to-background transition; the TUI never reaches a child process or copies the shell task registry. The composer remains mounted and focused during command completion, nested picker navigation, model selection, and transcript selection. Programmatic input edits always move the native cursor to the end. Transcript navigation preserves detached intent across output and resize. Queued native callbacks validate their target before applying.
 
 `InteractiveMode.dispose()` releases stores, subscriptions, handlers, syntax resources, and renderables. `runTui` owns a `running | closing | closed` transition, renderer and signal resources, terminal title, and settlement deadline. The first close request disposes terminal input, asks `AgentSession` to discard queued work and abort, and restores the terminal immediately. Settlement is awaited afterward with a deadline. Concurrent interactive, signal, and renderer-destroy requests share that completion. Shutdown errors propagate after terminal restoration, and only the CLI disposes the session it created.
 

@@ -27,6 +27,7 @@ import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.js
 import type { ResourceDiagnostic } from "./resource-diagnostics.js"
 import type { SessionResources } from "./resource-loader.js"
 import type { SessionEntry, SessionManager } from "./session-manager.js"
+import type { SessionShell, ShellDemotionResult, ShellKillResult, ShellTaskSnapshot } from "./session-shell.js"
 import type { SettingsManager, SettingsScope } from "./settings-manager.js"
 import { expandSkillCommand, type Skill } from "./skills.js"
 import type { SlashCommand } from "./slash-commands.js"
@@ -63,6 +64,7 @@ export type AgentSessionEvent =
   | { type: "thinking_level_changed"; level: ThinkingLevel }
   | { type: "steering_mode_changed"; mode: QueueMode }
   | { type: "follow_up_mode_changed"; mode: QueueMode }
+  | { type: "shell_task_changed"; taskId: string }
   | {
       type: "authentication_changed"
       status: "logged_in" | "logged_out"
@@ -109,6 +111,7 @@ export interface AgentSessionConfig {
   authentication: Authentication
   modelRegistry: ModelRegistry
   resources: SessionResources
+  shell?: SessionShell
   model?: Model<Api>
   apiKeyProvider?: string
 }
@@ -164,9 +167,11 @@ export class AgentSession {
   readonly #authentication: Authentication
   readonly #modelRegistry: ModelRegistry
   readonly #resources: SessionResources
+  readonly #shell: SessionShell | undefined
   readonly #apiKeyProvider: string | undefined
   readonly #listeners = new Set<(event: AgentSessionEvent) => void>()
   readonly #unsubscribeAgent: () => void
+  readonly #unsubscribeShell: (() => void) | undefined
   #activity: Activity = { type: "idle" }
   #pending: PendingInput[] = []
   #pendingBytes = 0
@@ -183,11 +188,19 @@ export class AgentSession {
     this.#authentication = config.authentication
     this.#modelRegistry = config.modelRegistry
     this.#resources = config.resources
+    this.#shell = config.shell
     this.#apiKeyProvider = config.apiKeyProvider
     this.sessionManager = config.sessionManager
     this.settingsManager = config.settingsManager
     this.#modelState = config.model ? { type: "selected", model: config.model } : { type: "unselected" }
     this.#unsubscribeAgent = this.#agent.subscribe(event => this.#handleAgentEvent(event))
+    this.#unsubscribeShell = this.#shell?.subscribe(taskId => {
+      try {
+        this.#emit({ type: "shell_task_changed", taskId })
+      } catch {
+        // Process ownership cannot cross into an observer.
+      }
+    })
   }
 
   get messages(): readonly AgentMessage[] {
@@ -229,6 +242,20 @@ export class AgentSession {
 
   get queuedInputs(): QueuedInputs {
     return this.#queueSnapshot()
+  }
+
+  get shellTasks(): readonly ShellTaskSnapshot[] {
+    return this.#shell?.snapshots() ?? []
+  }
+
+  demoteForegroundShellTask(): ShellDemotionResult {
+    this.#assertOpen()
+    return this.#shell?.demoteForeground() ?? { type: "none" }
+  }
+
+  killShellTask(taskId: string): Promise<ShellKillResult> {
+    this.#assertOpen()
+    return this.#shell?.kill(taskId) ?? Promise.resolve({ type: "not_found" })
   }
 
   get memoryDiagnostics(): AgentSessionMemoryDiagnostics {
@@ -561,19 +588,25 @@ export class AgentSession {
   dispose(): void {
     if (this.#activity.type === "disposed") return
     this.#modelMutation = { type: "none" }
-    const settled =
+    const activeSettled =
       this.#activity.type === "running" || this.#activity.type === "aborting"
         ? this.#activity.settled
         : Promise.resolve()
     this.#pending = []
     this.#pendingBytes = 0
     this.#agent.clearAllQueues()
-    this.#activity = { type: "disposed", settled }
     this.#agent.abort()
-    void this.#authentication.dispose()
+    const settled = settleAll([
+      activeSettled,
+      this.#authentication.dispose(),
+      this.#shell?.dispose() ?? Promise.resolve()
+    ])
+    this.#activity = { type: "disposed", settled }
     this.#unsubscribeAgent()
+    this.#unsubscribeShell?.()
     this.#listeners.clear()
     cleanupSessionResources(this.sessionId)
+    void settled.catch(() => {})
   }
 
   async #drive(runId: number, text: string, images: ImageContent[] | undefined, settlement: Settlement): Promise<void> {
@@ -768,6 +801,12 @@ export class AgentSession {
 
 async function settleTogether(first: Promise<void>, second: Promise<void>): Promise<void> {
   await Promise.all([first, second])
+}
+
+async function settleAll(operations: readonly Promise<void>[]): Promise<void> {
+  const outcomes = await Promise.allSettled(operations)
+  const failure = outcomes.find((outcome): outcome is PromiseRejectedResult => outcome.status === "rejected")
+  if (failure) throw failure.reason
 }
 
 function createSettlement(): Settlement {

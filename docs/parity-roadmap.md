@@ -41,6 +41,7 @@ The target is coding-agent architecture parity and observable product-behavior p
 - [x] Thinking-level picker
 - [ ] Session create/resume/list/switch
 - [x] Steering and follow-up with bounded queues
+- [x] Session-owned foreground/background shell tasks and interactive demotion
 - [ ] Retry policy and visible countdown
 - [ ] Context usage and automatic/manual compaction
 - [ ] Slash commands and file completion
@@ -73,6 +74,12 @@ The target is coding-agent architecture parity and observable product-behavior p
 - `packages/tui/test/interactive/prompt-queue.test.ts` drives Return, Alt+Enter, Alt+Up, Escape, and Ctrl+C through real OpenTUI input and asserts queue rows, restoration, overflow, and cell-aware truncation.
 - Behavior is characterized from `packages/agent/src/agent.ts`, `packages/agent/src/agent-loop.ts`, `packages/coding-agent/src/core/agent-session.ts`, and `packages/coding-agent/src/modes/interactive/interactive-mode.ts` at the Pi commit pinned in `docs/reference-pins.md`.
 - Non-aborting dequeue prevents delivery while an entry remains in the core queue. `pi-agent-core` exposes no claim callback, so an entry already drained by the core before its `message_start` may still arrive; acceptance tests fix both clear-before-commit and commit-before-clear behavior at that dependency boundary.
+
+### P1 shell-task evidence
+
+- `packages/coding-agent/test/bash.test.ts` fixes foreground cancellation, process-group teardown, explicit background execution, foreground demotion, turn-signal detachment, output-file and aggregate retention limits, bounded completed tombstones, and final disposal cleanup.
+- `SessionShell` is one concrete owner per `AgentSession`; `bash`, `task_output`, and `kill_task` adapt it, while session events expose task invalidation without a second TUI registry.
+- `packages/tui/test/interactive/complete-turn.test.ts` drives Ctrl+G through real OpenTUI input and proves the foreground task becomes session-owned background work before completing.
 
 ### P1 path and settings evidence
 

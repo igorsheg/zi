@@ -9,6 +9,7 @@ import { getAgentDir, OpenZiPaths } from "./paths.js"
 import { ResourceLoader } from "./resource-loader.js"
 import { createAgentSession, type AgentSessionServices } from "./services.js"
 import { SessionManager } from "./session-manager.js"
+import { SessionShell } from "./session-shell.js"
 import { SettingsManager, type AgentSettings } from "./settings-manager.js"
 import { createCodingTools } from "./tools/index.js"
 
@@ -75,12 +76,14 @@ export async function createAgentRuntime(options: CreateAgentRuntimeOptions): Pr
   )
   const sessionManager =
     resumed ?? SessionManager.create(paths, options.persist === undefined ? {} : { persist: options.persist })
+  const shell = new SessionShell({ cwd: paths.cwd, sessionId: sessionManager.sessionId })
   const session = await createAgentSession({
     services,
     sessionManager,
+    shell,
     ...(model ? { model } : {}),
     ...(options.apiKey ? { apiKey: options.apiKey } : {}),
-    tools: createCodingTools(paths.cwd)
+    tools: createCodingTools({ cwd: paths.cwd, shell })
   })
   return Object.freeze({ session, services })
 }
