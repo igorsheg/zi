@@ -29,6 +29,19 @@ test("CLI parses print modes and ordered positional prompts", () => {
   })
 })
 
+test("CLI distinguishes strict resume from continue-recent", () => {
+  expect(parseArgs(["--resume", "session.jsonl"])).toMatchObject({ sessionFile: "session.jsonl" })
+  expect(parseArgs(["-r", "short.jsonl"])).toMatchObject({ sessionFile: "short.jsonl" })
+  expect(parseArgs(["-c"])).toMatchObject({ continueRecent: true })
+  expect(() => parseArgs(["--session", "session.jsonl"])).toThrow("Unknown argument: --session")
+  expect(() => parseArgs(["--continue", "--resume", "session.jsonl"])).toThrow(
+    "--resume and --continue cannot be used together"
+  )
+  expect(() => parseArgs(["--continue", "--no-session"])).toThrow(
+    "--resume/--continue and --no-session cannot be used together"
+  )
+})
+
 test("CLI parses the version flag without admitting a prompt", () => {
   expect(parseArgs(["-V"])).toMatchObject({ version: true, messages: [] })
 })

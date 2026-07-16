@@ -1,8 +1,13 @@
 #!/usr/bin/env bun
 
-import type { AgentSession } from "@openzi/coding-agent"
-
-import { defaultRuntimeFactory, maxCliStdinBytes, runCli, type CliHost, type CliSignal } from "./run.js"
+import {
+  defaultRuntimeFactory,
+  defaultSessionRuntimeFactory,
+  maxCliStdinBytes,
+  runCli,
+  type CliHost,
+  type CliSignal
+} from "./run.js"
 
 export async function main(argv: readonly string[] = process.argv.slice(2)): Promise<number> {
   return runCli(argv, processHost())
@@ -16,9 +21,10 @@ function processHost(): CliHost {
     writeStdout: chunk => writeOutput(process.stdout, chunk),
     writeStderr: chunk => writeOutput(process.stderr, chunk),
     createRuntime: defaultRuntimeFactory,
-    async runInteractive(session: AgentSession, initialMessages: readonly string[]) {
+    createSessionRuntime: defaultSessionRuntimeFactory,
+    async runInteractive(sessionRuntime, initialMessages) {
       const { runTui } = await import("@openzi/tui")
-      await runTui({ session, initialMessages })
+      await runTui({ sessionRuntime, initialMessages })
     },
     onSignal(listener) {
       const signals: CliSignal[] = ["SIGHUP", "SIGINT", "SIGTERM"]

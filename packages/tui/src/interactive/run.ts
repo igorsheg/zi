@@ -1,5 +1,5 @@
 import { CliRenderEvents, createCliRenderer, DebugOverlayCorner, type CliRenderer } from "@opentui/core"
-import type { AgentSession } from "@openzi/coding-agent"
+import type { AgentSession, AgentSessionRuntime } from "@openzi/coding-agent"
 
 import { defaultTheme } from "../theme.js"
 import type { TuiDiagnosticFlags } from "./diagnostics.js"
@@ -7,7 +7,8 @@ import type { InteractiveKeybindingOverrides } from "./interactive-keybindings.j
 import { InteractiveMode } from "./interactive-mode.js"
 
 export interface RunTuiOptions {
-  readonly session: AgentSession
+  readonly session?: AgentSession
+  readonly sessionRuntime?: AgentSessionRuntime
   readonly initialMessages?: readonly string[]
   readonly keybindingOverrides?: InteractiveKeybindingOverrides
 }
@@ -22,7 +23,10 @@ type RunState =
 
 const shutdownTimeoutMs = 5_000
 
-export async function runTui({ session, initialMessages = [], keybindingOverrides }: RunTuiOptions): Promise<void> {
+export async function runTui(options: RunTuiOptions): Promise<void> {
+  const { initialMessages = [], keybindingOverrides, sessionRuntime } = options
+  const session = sessionRuntime?.session ?? options.session
+  if (!session) throw new Error("runTui requires a session or session runtime")
   const diagnostics = readDiagnosticFlags(process.env)
   const renderer = await createCliRenderer({
     targetFps: 60,
@@ -75,7 +79,7 @@ export async function runTui({ session, initialMessages = [], keybindingOverride
         return undefined
       }
     )
-    void shutdown(renderer, mode, session).then(complete, reject)
+    void shutdown(renderer, mode, session, sessionRuntime).then(complete, reject)
     return completion
   }
 
@@ -92,6 +96,7 @@ export async function runTui({ session, initialMessages = [], keybindingOverride
     mode = new InteractiveMode({
       renderer,
       session,
+      ...(sessionRuntime ? { sessionRuntime } : {}),
       onExit: () => void requestClose("interactive"),
       diagnostics,
       ...(keybindingOverrides ? { keybindingOverrides } : {})
@@ -117,7 +122,8 @@ function readDiagnosticFlags(env: NodeJS.ProcessEnv): TuiDiagnosticFlags {
 async function shutdown(
   renderer: CliRenderer,
   mode: InteractiveMode | undefined,
-  session: AgentSession
+  initialSession: AgentSession,
+  sessionRuntime: AgentSessionRuntime | undefined
 ): Promise<void> {
   let failure: { cause: unknown } | undefined
   let settlement: Promise<void> | undefined
@@ -130,10 +136,16 @@ async function shutdown(
   } catch (cause) {
     capture(cause)
   }
+  const replacement = sessionRuntime?.cancelReplacement()
+  const session = sessionRuntime?.session ?? initialSession
   try {
-    settlement = session.abortAndDiscardQueuedInputs()
+    const sessionSettlement = session.abortAndDiscardQueuedInputs()
+    settlement = replacement
+      ? Promise.all([sessionSettlement, replacement.settled]).then(() => undefined)
+      : sessionSettlement
   } catch (cause) {
     capture(cause)
+    settlement = replacement?.settled
   }
   try {
     renderer.setTerminalTitle("")

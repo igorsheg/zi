@@ -1,8 +1,10 @@
 import {
   createAgentRuntime,
+  createAgentSessionRuntime,
   runPrintMode,
   type AgentRuntime,
   type AgentSession,
+  type AgentSessionRuntime,
   type CreateAgentRuntimeOptions,
   type PrintModeResult
 } from "@openzi/coding-agent"
@@ -23,7 +25,8 @@ export interface CliHost {
   writeStdout(chunk: string): Promise<void>
   writeStderr(chunk: string): Promise<void>
   createRuntime(options: CreateAgentRuntimeOptions): Promise<AgentRuntime>
-  runInteractive(session: AgentSession, initialMessages: readonly string[]): Promise<void>
+  createSessionRuntime(options: CreateAgentRuntimeOptions): Promise<AgentSessionRuntime>
+  runInteractive(runtime: AgentSessionRuntime, initialMessages: readonly string[]): Promise<void>
   onSignal(listener: (signal: CliSignal) => void): () => void
 }
 
@@ -36,7 +39,8 @@ Options:
       --cwd path              Set the effective working directory
       --model provider/model  Select a model
       --api-key key           Use a memory-only provider API key
-      --session file          Resume a session file
+  -r, --resume file          Resume a session file
+  -c, --continue             Continue the most recent session
       --no-session            Do not persist the session
   -h, --help                  Show this help
   -V, --version               Show the OpenZi version
@@ -92,8 +96,14 @@ export async function runCli(argv: readonly string[], host: CliHost): Promise<nu
   }
 
   let runtime: AgentRuntime
+  let sessionRuntime: AgentSessionRuntime | undefined
   try {
-    runtime = await host.createRuntime(runtimeOptions(args))
+    if (mode === "interactive") {
+      sessionRuntime = await host.createSessionRuntime(runtimeOptions(args))
+      runtime = sessionRuntime
+    } else {
+      runtime = await host.createRuntime(runtimeOptions(args))
+    }
   } catch (cause) {
     await host.writeStderr(`${errorMessage(cause)}\n`)
     return 1
@@ -107,7 +117,8 @@ export async function runCli(argv: readonly string[], host: CliHost): Promise<nu
       await host.writeStderr(`Warning: (${diagnostic.scope} settings) ${diagnostic.error.message}\n`)
     }
     if (mode === "interactive") {
-      await host.runInteractive(runtime.session, prompts)
+      if (!sessionRuntime) throw new Error("Interactive session runtime was not created")
+      await host.runInteractive(sessionRuntime, prompts)
       exitCode = 0
     } else {
       exitCode = await runHeadless(runtime.session, mode, prompts, host)
@@ -117,9 +128,10 @@ export async function runCli(argv: readonly string[], host: CliHost): Promise<nu
     exitCode = 1
   }
 
-  runtime.session.dispose()
+  if (sessionRuntime) sessionRuntime.dispose()
+  else runtime.session.dispose()
   try {
-    await settle(runtime.session.waitForIdle(), cliShutdownTimeoutMs)
+    await settle(sessionRuntime ? sessionRuntime.waitForIdle() : runtime.session.waitForIdle(), cliShutdownTimeoutMs)
   } catch (cause) {
     await host.writeStderr(`${errorMessage(cause)}\n`)
     return 1
@@ -133,7 +145,8 @@ function runtimeOptions(args: Args): CreateAgentRuntimeOptions {
     persist: !args.noSession,
     ...(args.model === undefined ? {} : { model: args.model }),
     ...(args.apiKey === undefined ? {} : { apiKey: args.apiKey }),
-    ...(args.sessionFile === undefined ? {} : { sessionFile: args.sessionFile })
+    ...(args.sessionFile === undefined ? {} : { sessionFile: args.sessionFile }),
+    ...(args.continueRecent ? { continueRecent: true } : {})
   }
 }
 
@@ -211,3 +224,4 @@ function deferred<T>() {
 }
 
 export const defaultRuntimeFactory = createAgentRuntime
+export const defaultSessionRuntimeFactory = createAgentSessionRuntime

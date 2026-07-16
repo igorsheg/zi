@@ -1,5 +1,5 @@
 import { BoxRenderable, CliRenderEvents, type CliRenderer, type SyntaxStyle } from "@opentui/core"
-import type { AgentSession } from "@openzi/coding-agent"
+import type { AgentSession, AgentSessionRuntime } from "@openzi/coding-agent"
 
 import { createSyntaxStyle, defaultTheme, type Theme } from "../theme.js"
 import { type BrowserOpener, SystemBrowserOpener } from "./browser-opener.js"
@@ -13,12 +13,14 @@ import { ExitGestureController } from "./exit-gesture.js"
 import { createInteractiveCommands, type InteractiveCommands } from "./interactive-commands.js"
 import { InteractiveKeybindings, type InteractiveKeybindingOverrides } from "./interactive-keybindings.js"
 import { createInteractiveStore, type InteractiveStore } from "./interactive-store.js"
+import type { PromptSessionActions } from "./prompt/store.js"
 import { SessionScreen } from "./screen.js"
 import type { TranscriptDiagnostics } from "./transcript/view.js"
 
 export interface InteractiveModeOptions {
   readonly renderer: CliRenderer
   readonly session: AgentSession
+  readonly sessionRuntime?: AgentSessionRuntime
   readonly onExit: () => void
   readonly keybindingOverrides?: InteractiveKeybindingOverrides
   readonly theme?: Theme
@@ -31,6 +33,8 @@ export class InteractiveMode {
   readonly store: InteractiveStore
 
   readonly #renderer: CliRenderer
+  readonly #sessionRuntime: AgentSessionRuntime | undefined
+  readonly #sessionActions: PromptSessionActions | undefined
   readonly #browserOpener: BrowserOpener
   readonly #exitGestures: ExitGestureController
   readonly #theme: Theme
@@ -46,13 +50,32 @@ export class InteractiveMode {
   constructor({
     renderer,
     session,
+    sessionRuntime,
     onExit,
     keybindingOverrides,
     theme = defaultTheme,
     browserOpener = new SystemBrowserOpener(),
     diagnostics = { showTimeToFirstDraw: false, showStats: false, showMemory: false }
   }: InteractiveModeOptions) {
+    if (sessionRuntime && sessionRuntime.session !== session) {
+      throw new Error("InteractiveMode session must be the session runtime current session")
+    }
     this.#renderer = renderer
+    this.#sessionRuntime = sessionRuntime
+    this.#sessionActions = sessionRuntime
+      ? {
+          listSessions: () => sessionRuntime.listSessions(),
+          startNewSession: async () => {
+            const next = await sessionRuntime.newSession()
+            if (!this.#disposed) this.replaceSession(next.session)
+          },
+          resumeSession: async path => {
+            const next = await sessionRuntime.switchSession(path)
+            if (!this.#disposed) this.replaceSession(next.session)
+          },
+          cancelReplacement: () => sessionRuntime.cancelReplacement()
+        }
+      : undefined
     this.#browserOpener = browserOpener
     this.#exitGestures = new ExitGestureController(onExit)
     this.store = createInteractiveStore(session)
@@ -89,6 +112,9 @@ export class InteractiveMode {
   }
 
   replaceSession(session: AgentSession): void {
+    if (this.#sessionRuntime && this.#sessionRuntime.session !== session) {
+      throw new Error("InteractiveMode can only bind the current session runtime session")
+    }
     this.store.replaceSession(session)
   }
 
@@ -134,7 +160,8 @@ export class InteractiveMode {
       this.#browserOpener,
       this.#theme,
       this.#syntaxStyle,
-      this.#diagnosticFlags.showTimeToFirstDraw || this.#diagnosticFlags.showStats || this.#diagnosticFlags.showMemory
+      this.#diagnosticFlags.showTimeToFirstDraw || this.#diagnosticFlags.showStats || this.#diagnosticFlags.showMemory,
+      this.#sessionActions
     )
   }
 }

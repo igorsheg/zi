@@ -41,6 +41,33 @@ test("runtime settings and sessions share the resumed session cwd path policy", 
   }
 })
 
+test("runtime continueRecent reuses the newest current-cwd journal", async () => {
+  const root = await mkdtemp(join(tmpdir(), "openzi-runtime-continue-"))
+  const cwd = join(root, "project")
+  const agentDir = join(root, "global")
+  const models = createModels()
+  models.setProvider(fauxProvider({ provider: "continue", models: [{ id: "model" }] }).provider)
+  const created = await createTestAgentRuntime({ cwd, agentDir, model: "continue/model", models })
+  const sessionId = created.session.sessionManager.sessionId
+  created.session.sessionManager.appendMessage({ role: "user", content: "continued", timestamp: 1 })
+  created.session.dispose()
+  await created.session.waitForIdle()
+
+  const continued = await createTestAgentRuntime({
+    cwd,
+    agentDir,
+    model: "continue/model",
+    continueRecent: true,
+    models
+  })
+  try {
+    expect(continued.session.sessionManager.sessionId).toBe(sessionId)
+    expect(continued.session.messages).toContainEqual({ role: "user", content: "continued", timestamp: 1 })
+  } finally {
+    continued.session.dispose()
+  }
+})
+
 test("the model factory receives the runtime-owned credential store", async () => {
   const root = await mkdtemp(join(tmpdir(), "openzi-runtime-models-"))
   const faux = fauxProvider({ provider: "factory", models: [{ id: "model" }] })

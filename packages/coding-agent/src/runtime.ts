@@ -28,16 +28,27 @@ export interface CreateAgentRuntimeOptions {
   readonly agentDir?: string
   readonly sessionDir?: string
   readonly sessionFile?: string
+  readonly continueRecent?: boolean
   readonly persist?: boolean
   readonly settings?: Readonly<Partial<AgentSettings>>
 }
 
 /** Assemble cwd-bound production services and a session. The caller owns `session.dispose()`. */
 export async function createAgentRuntime(options: CreateAgentRuntimeOptions): Promise<AgentRuntime> {
-  const resumed = options.sessionFile ? SessionManager.open(options.sessionFile) : undefined
+  if (options.sessionFile && options.continueRecent)
+    throw new Error("sessionFile and continueRecent cannot be combined")
+  if (options.continueRecent && options.persist === false)
+    throw new Error("continueRecent requires session persistence")
+  const agentDir = options.agentDir ?? getAgentDir()
+  const requestedPaths = new OpenZiPaths(options.cwd, agentDir, options.sessionDir)
+  const resumed = options.sessionFile
+    ? SessionManager.open(options.sessionFile)
+    : options.continueRecent
+      ? await SessionManager.continueRecent(requestedPaths)
+      : undefined
   const cwd = resumed?.header.cwd ?? options.cwd
   const sessionDir = options.sessionDir ?? resumed?.sessionDir
-  const paths = new OpenZiPaths(cwd, options.agentDir ?? getAgentDir(), sessionDir)
+  const paths = new OpenZiPaths(cwd, agentDir, sessionDir)
   const savedModel = resumed?.entries().findLast(entry => entry.type === "model_change")
   const savedThinking = resumed?.entries().findLast(entry => entry.type === "thinking_level_change")
   const runtimeSettings: Partial<AgentSettings> = { ...options.settings }

@@ -2,7 +2,9 @@ const definitions = [
   { name: "model", description: "Select model (opens selector UI)", argumentHint: "<provider/model>" },
   { name: "login", description: "Authenticate a provider", argumentHint: "<provider>" },
   { name: "logout", description: "Remove stored provider credentials" },
-  { name: "settings", description: "Open settings menu" }
+  { name: "settings", description: "Open settings menu" },
+  { name: "new", description: "Start a new session" },
+  { name: "resume", description: "Browse and resume saved sessions" }
 ] as const
 
 export type BuiltinSlashCommandName = (typeof definitions)[number]["name"]

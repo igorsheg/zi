@@ -5,7 +5,7 @@ import { createModels, createTestAgentRuntime as createAgentRuntime, fauxProvide
 
 import { createInteractiveCommands } from "../../src/interactive/interactive-commands.js"
 import { createInteractiveStore } from "../../src/interactive/interactive-store.js"
-import { createPromptStore } from "../../src/interactive/prompt/store.js"
+import { createPromptStore, type PromptSessionActions } from "../../src/interactive/prompt/store.js"
 
 test("prompt store restores queued text, images, and status without a renderer", async () => {
   const session = await createSession("restore")
@@ -96,6 +96,56 @@ test("settings workflow cannot cross a session replacement", async () => {
   }
 })
 
+test("session replacement cancellation remains explicit until runtime settlement", async () => {
+  const session = await createSession("session-cancellation")
+  const mode = createInteractiveStore(session)
+  const resume = rejectable<void>()
+  const cancellation = deferred<void>()
+  const actions: PromptSessionActions = {
+    listSessions: async () => ({
+      sessions: [
+        {
+          path: "/sessions/target.jsonl",
+          id: "target",
+          cwd: "/work",
+          createdAt: "2026-01-01T00:00:00.000Z",
+          modifiedAt: "2026-01-01T00:00:00.000Z",
+          firstMessage: "target session"
+        }
+      ],
+      invalid: 0,
+      omitted: 0
+    }),
+    startNewSession: async () => {},
+    resumeSession: () => resume.promise,
+    cancelReplacement: () => ({ type: "cancelled", settled: cancellation.promise })
+  }
+  const prompt = createPromptStore(mode, createInteractiveCommands(), actions)
+
+  try {
+    expect(prompt.submit("/resume", "steer")).toBe(true)
+    await Bun.sleep(0)
+    expect(prompt.activatePicker("", 0)).toBe(true)
+    expect(prompt.$state.get().workflow.type).toBe("resuming_session")
+
+    expect(prompt.abortAndRestoreQueuedInputs("")).toBe("")
+    expect(prompt.$state.get()).toMatchObject({
+      feedback: { type: "status", message: "Cancelling session change…" },
+      workflow: { type: "cancelling_session" }
+    })
+
+    resume.reject(new Error("Session replacement was cancelled"))
+    cancellation.resolve()
+    await Bun.sleep(0)
+    expect(prompt.$state.get()).toMatchObject({ feedback: { type: "none" }, workflow: { type: "idle" } })
+  } finally {
+    cancellation.resolve()
+    prompt.dispose()
+    mode.dispose()
+    session.dispose()
+  }
+})
+
 test("prompt store retains rejected input and exposes the admission error", async () => {
   const session = await createSession("disposed")
   const mode = createInteractiveStore(session)
@@ -107,6 +157,22 @@ test("prompt store retains rejected input and exposes the admission error", asyn
 
   mode.dispose()
 })
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void
+  const promise = new Promise<T>(resolvePromise => {
+    resolve = resolvePromise
+  })
+  return { promise, resolve }
+}
+
+function rejectable<T>() {
+  let reject!: (cause: unknown) => void
+  const promise = new Promise<T>((_resolve, rejectPromise) => {
+    reject = rejectPromise
+  })
+  return { promise, reject }
+}
 
 async function createSession(provider: string): Promise<AgentSession> {
   const models = createModels()

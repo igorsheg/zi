@@ -1,5 +1,5 @@
 import { createTestRenderer, type TestRendererOptions, type TestRendererSetup } from "@opentui/core/testing"
-import type { AgentSession } from "@openzi/coding-agent"
+import type { AgentSession, AgentSessionRuntime } from "@openzi/coding-agent"
 
 import type { BrowserOpener } from "../../src/interactive/browser-opener.js"
 import type { InteractiveKeybindingOverrides } from "../../src/interactive/interactive-keybindings.js"
@@ -15,12 +15,14 @@ export async function createInteractiveTest(
   options: TestRendererOptions,
   onExit: () => void = () => {},
   keybindingOverrides?: InteractiveKeybindingOverrides,
-  browserOpener: BrowserOpener = { open: async () => {}, dispose() {} }
+  browserOpener: BrowserOpener = { open: async () => {}, dispose() {} },
+  sessionRuntime?: AgentSessionRuntime
 ): Promise<InteractiveTestSetup> {
   const setup = await createTestRenderer({ ...options, useThread: false })
   const mode = new InteractiveMode({
     renderer: setup.renderer,
     session,
+    ...(sessionRuntime ? { sessionRuntime } : {}),
     onExit,
     browserOpener,
     ...(keybindingOverrides ? { keybindingOverrides } : {})
@@ -33,6 +35,16 @@ export async function createInteractiveTest(
       if (!setup.renderer.isDestroyed) setup.renderer.destroy()
     }
   }
+}
+
+export function createInteractiveRuntimeTest(
+  runtime: AgentSessionRuntime,
+  options: TestRendererOptions,
+  onExit: () => void = () => {},
+  keybindingOverrides?: InteractiveKeybindingOverrides,
+  browserOpener: BrowserOpener = { open: async () => {}, dispose() {} }
+): Promise<InteractiveTestSetup> {
+  return createInteractiveTest(runtime.session, options, onExit, keybindingOverrides, browserOpener, runtime)
 }
 
 export async function renderSettled(setup: TestRendererSetup): Promise<void> {

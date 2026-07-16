@@ -39,7 +39,7 @@ The target is coding-agent architecture parity and observable product-behavior p
 
 - [x] Model picker
 - [x] Thinking-level picker
-- [ ] Session create/resume/list/switch
+- [x] Session create/resume/list/switch
 - [x] Steering and follow-up with bounded queues
 - [x] Session-owned foreground/background shell tasks and interactive demotion
 - [ ] Retry policy and visible countdown
@@ -50,6 +50,12 @@ The target is coding-agent architecture parity and observable product-behavior p
 - [x] Settings: global and project scope
 - [x] Print and JSON modes sharing the same `AgentSession`
 - [x] Authentication commands and composer-owned provider flows
+
+### P1 session-lifecycle evidence
+
+- `packages/coding-agent/test/agent-session-runtime.test.ts` fixes globally serialized runtime-keyed listing, current-session no-op, new-session replacement, cross-cwd service reconstruction, pre-commit race rejection, failed-construction preservation, cancellation, and creator-owned disposal. `packages/coding-agent/test/session-manager.test.ts` fixes recent ordering, invalid-journal isolation, bounded files and previews, continue-recent, and full-load/catalog torn-tail recovery.
+- `packages/tui/test/interactive/session-selector.test.ts` drives `/resume` and `/new` through the real composer-owned picker, verifies whole-session rebinding, read-only browsing during a run, replacement refusal until idle, current-session no-op, transcript replacement, focus preservation, invalid counts, and old-session disposal. `packages/tui/test/interactive/prompt-store.test.ts` keeps cancellation explicit until runtime settlement. `packages/cli/test/args.test.ts` distinguishes strict `--resume` from `--continue` and rejects the removed `--session` spelling.
+- `AgentSessionRuntime` follows Pi's replacement boundary in `core/agent-session-runtime.ts`, while target-before-invalidation and bounded listing deliberately preserve OpenZi's failure and resource policy. Grok Build's pinned session startup, storage, and picker code supplies secondary torn-write, stale-load, cross-cwd, and catalog-scale failure cases; see ADR 0012.
 
 ### P1 model-selection evidence
 

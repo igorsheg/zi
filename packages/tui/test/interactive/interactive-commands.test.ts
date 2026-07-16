@@ -17,12 +17,16 @@ test("interactive commands own built-in and current-session resource aggregation
     "login",
     "logout",
     "settings",
+    "new",
+    "resume",
     "review",
     "skill:pdf"
   ])
   expect(commands.suggestions("/skill:", 7)).toEqual([{ name: "skill:pdf", description: "Work with PDFs" }])
   expect(commands.completion(commands.suggestions("/rev", 4)[0]!)).toBe("/review ")
   expect(commands.parse("/review path")).toBeUndefined()
+  expect(commands.parse("/new")).toEqual({ type: "new_session" })
+  expect(commands.parse("/resume")).toEqual({ type: "resume_session" })
 
   resources = [{ name: "deploy", description: "Deploy current project" }]
   expect(commands.suggestions("/d", 2)).toEqual([{ name: "deploy", description: "Deploy current project" }])

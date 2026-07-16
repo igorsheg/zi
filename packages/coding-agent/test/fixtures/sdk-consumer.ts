@@ -1,6 +1,7 @@
 import {
   createAgentRuntime,
   createAgentSession,
+  createAgentSessionRuntime,
   type AgentRuntime,
   type AgentSessionServices,
   type CreateAgentRuntimeOptions,
@@ -20,6 +21,19 @@ export async function useHighLevelRuntime(options: CreateAgentRuntimeOptions): P
   } finally {
     unsubscribe()
     runtime.session.dispose()
+  }
+}
+
+export async function useReplaceableRuntime(options: CreateAgentRuntimeOptions): Promise<string> {
+  const runtime = await createAgentSessionRuntime(options)
+  try {
+    const previous = runtime.session.sessionManager.sessionId
+    await runtime.newSession()
+    if (runtime.session.sessionManager.sessionId === previous) throw new Error("Session was not replaced")
+    return runtime.session.sessionManager.sessionId
+  } finally {
+    runtime.dispose()
+    await runtime.waitForIdle()
   }
 }
 

@@ -28,7 +28,7 @@ $HOME/.openzi/agent/{settings.json,auth.json,sessions/,AGENTS.md,SYSTEM.md,...}
 
 Global settings are overlaid by project settings and then runtime overrides. Authentication and default sessions remain global; sessions are partitioned by canonical cwd. Resuming a session rebuilds cwd-bound services from the cwd stored in its header. See [ADR 0011](docs/adr/0011-openzi-path-policy.md).
 
-A fresh terminal can start without credentials; use `/login`, then `/model` if needed. `/logout` removes only stored credentials, not environment or external provider configuration. `/settings` edits thinking, steering, and follow-up behavior with an explicit global or project scope. For a one-process override, use `openzi --model provider/model-id --api-key "$KEY"`; the key is applied in memory and is never written to settings or `auth.json`.
+A fresh terminal can start without credentials; use `/login`, then `/model` if needed. `/logout` removes only stored credentials, not environment or external provider configuration. `/settings` edits thinking, steering, and follow-up behavior with an explicit global or project scope. `/new` starts a fresh session and `/resume` opens the bounded current-project session picker. For a one-process override, use `openzi --model provider/model-id --api-key "$KEY"`; the key is applied in memory and is never written to settings or `auth.json`.
 
 ## CLI modes
 
@@ -40,7 +40,7 @@ printf 'Summarize stdin' | openzi            # non-TTY input selects text mode
 openzi --mode json "Inspect the project"    # strict JSONL events
 ```
 
-Piped stdin is the first prompt and positional prompts follow in argument order. Text diagnostics use stderr; JSON stdout contains only JSONL records. `--model`, memory-only `--api-key`, `--session`, and `--no-session` apply to interactive and headless modes. RPC is deliberately not available yet.
+Piped stdin is the first prompt and positional prompts follow in argument order. Text diagnostics use stderr; JSON stdout contains only JSONL records. `--resume <file>` strictly opens an existing journal, while `--continue` reuses the newest current-cwd journal or creates one. `--model`, memory-only `--api-key`, and `--no-session` apply to interactive and headless modes. RPC is deliberately not available yet.
 
 ## SDK
 
@@ -78,6 +78,8 @@ const runtime = await createAgentRuntime({
 })
 ```
 
+For a client that supports whole-session `/new` and `/resume`, use `createAgentSessionRuntime(options)`. It exposes the current session and services, reconstructs every cwd-bound owner when switching, and owns disposal of replaced sessions. Its creator owns final `runtime.dispose()` followed by `runtime.waitForIdle()`.
+
 For full assembly control, `createAgentSession({ services, sessionManager, model, tools })` is the lower-level constructor. It consumes caller-owned `OpenZiPaths`, `SettingsManager`, `FileCredentialStore`, `ModelRegistry`, `ResourceLoader`, and `SessionManager`; it does not construct or dispose them. Raw `Models` injection is test-only under `@openzi/coding-agent/testing`.
 
 Text batch execution reuses the same caller-owned session and does not access process streams or signals:
@@ -114,6 +116,6 @@ bun run check         # formatting, linting, TypeScript, and tests
 
 The workspace uses TypeScript 7, type-aware Oxlint, and Oxfmt. Lefthook formats and lints staged files before commits and runs the complete check before pushes.
 
-Stateful behavior is designed as explicit domain data with one owner and explicit transitions. TUI presentation state uses instance-scoped Nano Store owners rather than module globals or mirrored session state. Interruption, terminal shutdown, and caller-owned disposal are separate transitions; see [`docs/architecture.md`](docs/architecture.md), [ADR 0004](docs/adr/0004-explicit-state-and-transitions.md), [ADR 0006](docs/adr/0006-instance-scoped-nano-stores-own-tui-state.md), [ADR 0009](docs/adr/0009-interruption-and-terminal-shutdown.md), [ADR 0010](docs/adr/0010-interactive-mode-owns-keybindings.md), and [ADR 0011](docs/adr/0011-openzi-path-policy.md).
+Stateful behavior is designed as explicit domain data with one owner and explicit transitions. TUI presentation state uses instance-scoped Nano Store owners rather than module globals or mirrored session state. Interruption, terminal shutdown, and caller-owned disposal are separate transitions; see [`docs/architecture.md`](docs/architecture.md), [ADR 0004](docs/adr/0004-explicit-state-and-transitions.md), [ADR 0006](docs/adr/0006-instance-scoped-nano-stores-own-tui-state.md), [ADR 0009](docs/adr/0009-interruption-and-terminal-shutdown.md), [ADR 0010](docs/adr/0010-interactive-mode-owns-keybindings.md), [ADR 0011](docs/adr/0011-openzi-path-policy.md), and [ADR 0012](docs/adr/0012-agent-session-runtime-owns-replacement.md).
 
 The interactive path now resolves configured Pi providers, runs `read`/`bash`/`edit`/`write` through `AgentSession`, owns bounded foreground and background shell tasks for the session, streams into imperative OpenTUI renderables, and persists resumable JSONL sessions. Bash can start background work explicitly, `task_output` and `kill_task` operate on the same task owner, and Ctrl+G demotes the active foreground shell task. P0 visual acceptance and the remaining Pi coding-agent capabilities are tracked in `docs/parity-roadmap.md`.

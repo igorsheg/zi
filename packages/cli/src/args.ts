@@ -5,6 +5,7 @@ export interface Args {
   readonly model?: string
   readonly apiKey?: string
   readonly sessionFile?: string
+  readonly continueRecent?: boolean
   readonly noSession: boolean
   readonly print: boolean
   readonly mode?: CliOutputMode
@@ -18,6 +19,7 @@ export function parseArgs(argv: readonly string[]): Args {
   let model: string | undefined
   let apiKey: string | undefined
   let sessionFile: string | undefined
+  let continueRecent = false
   let noSession = false
   let print = false
   let mode: CliOutputMode | undefined
@@ -34,7 +36,9 @@ export function parseArgs(argv: readonly string[]): Args {
     if (arg === "--cwd") cwd = required(argv[++index], "--cwd")
     else if (arg === "--model") model = required(argv[++index], "--model")
     else if (arg === "--api-key") apiKey = required(argv[++index], "--api-key")
-    else if (arg === "--session") sessionFile = required(argv[++index], "--session")
+    else if (arg === "--resume" || arg === "-r") {
+      sessionFile = required(argv[++index], arg)
+    } else if (arg === "--continue" || arg === "-c") continueRecent = true
     else if (arg === "--no-session") noSession = true
     else if (arg === "--print" || arg === "-p") print = true
     else if (arg === "--mode") mode = parseMode(required(argv[++index], "--mode"))
@@ -44,7 +48,10 @@ export function parseArgs(argv: readonly string[]): Args {
     else if (arg !== undefined) messages.push(arg)
   }
 
-  if (sessionFile && noSession) throw new Error("--session and --no-session cannot be used together")
+  if (sessionFile && continueRecent) throw new Error("--resume and --continue cannot be used together")
+  if ((sessionFile || continueRecent) && noSession) {
+    throw new Error("--resume/--continue and --no-session cannot be used together")
+  }
 
   return Object.freeze({
     cwd,
@@ -56,6 +63,7 @@ export function parseArgs(argv: readonly string[]): Args {
     ...(model === undefined ? {} : { model }),
     ...(apiKey === undefined ? {} : { apiKey }),
     ...(sessionFile === undefined ? {} : { sessionFile }),
+    ...(continueRecent ? { continueRecent: true } : {}),
     ...(mode === undefined ? {} : { mode })
   })
 }

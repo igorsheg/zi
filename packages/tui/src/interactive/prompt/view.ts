@@ -18,7 +18,7 @@ import { PromptFeedbackView } from "./feedback-view.js"
 import { PickerStackView } from "./picker-view.js"
 import { QueuedInputsView } from "./queue-view.js"
 import { promptInputIsSecret, type PromptWorkflow } from "./state.js"
-import { createPromptStore, type PromptStore } from "./store.js"
+import { createPromptStore, type PromptSessionActions, type PromptStore } from "./store.js"
 
 export class PromptView {
   readonly root: BoxRenderable
@@ -44,13 +44,14 @@ export class PromptView {
     keybindings: InteractiveKeybindings,
     exitGestures: ExitGestureController,
     browserOpener: BrowserOpener,
-    theme: Theme
+    theme: Theme,
+    sessionActions?: PromptSessionActions
   ) {
     this.#renderer = renderer
     this.#interactive = interactive
     this.#keybindings = keybindings
     this.#exitGestures = exitGestures
-    this.#store = createPromptStore(interactive, commands)
+    this.#store = createPromptStore(interactive, commands, sessionActions)
     this.root = new BoxRenderable(renderer, { flexDirection: "column", flexShrink: 0 })
 
     this.#working = new BoxRenderable(renderer, { flexDirection: "row", flexShrink: 0 })

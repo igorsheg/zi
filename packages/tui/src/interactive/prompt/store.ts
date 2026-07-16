@@ -8,6 +8,8 @@ import type {
   QueueMode,
   QueuedInputs,
   SettingsScope,
+  SessionListResult,
+  SessionReplacementCancellation,
   SlashCommand,
   StoredCredential,
   ThinkingLevel
@@ -26,6 +28,7 @@ import {
   modelChoiceId,
   modelFrame,
   promptPickerFrameIds,
+  sessionFrame,
   settingLabel,
   settingsFrame,
   settingsScopeFrame,
@@ -64,8 +67,19 @@ interface PendingAuthPrompt {
   readonly cleanup: () => void
 }
 
-export function createPromptStore(interactive: InteractiveStore, commands: InteractiveCommands): PromptStore {
-  return new PromptController(interactive, commands)
+export interface PromptSessionActions {
+  listSessions(): Promise<SessionListResult>
+  startNewSession(): Promise<void>
+  resumeSession(path: string): Promise<void>
+  cancelReplacement(): SessionReplacementCancellation
+}
+
+export function createPromptStore(
+  interactive: InteractiveStore,
+  commands: InteractiveCommands,
+  sessionActions?: PromptSessionActions
+): PromptStore {
+  return new PromptController(interactive, commands, sessionActions)
 }
 
 class PromptController implements PromptStore {
@@ -74,14 +88,16 @@ class PromptController implements PromptStore {
 
   readonly #interactive: InteractiveStore
   readonly #commands: InteractiveCommands
+  readonly #sessionActions: PromptSessionActions | undefined
   #disposed = false
   #nextOperationId = 0
   #nextBrowserRequestId = 0
   #pendingAuthPrompt: PendingAuthPrompt | undefined
 
-  constructor(interactive: InteractiveStore, commands: InteractiveCommands) {
+  constructor(interactive: InteractiveStore, commands: InteractiveCommands, sessionActions?: PromptSessionActions) {
     this.#interactive = interactive
     this.#commands = commands
+    this.#sessionActions = sessionActions
   }
 
   submit(text: string, delivery: PendingInputDelivery): boolean {
@@ -159,12 +175,18 @@ class PromptController implements PromptStore {
         return this.#activateAuthOption(workflow, presentation)
       case "choosing_logout":
         return this.#activateLogout(workflow, presentation)
+      case "choosing_session":
+        return this.#activateSession(workflow, presentation)
       case "loading_models":
       case "selecting_model":
       case "authenticating":
       case "auth_prompt":
       case "loading_logout":
       case "logging_out":
+      case "starting_session":
+      case "loading_sessions":
+      case "resuming_session":
+      case "cancelling_session":
         return false
       default:
         return assertNever(workflow)
@@ -180,6 +202,9 @@ class PromptController implements PromptStore {
     if (!presentation) return false
 
     const workflow = this.$state.get().workflow
+    if (workflow.type === "resuming_session" || workflow.type === "cancelling_session") {
+      return this.#cancelSessionReplacement()
+    }
     if (workflow.type === "idle" && presentation.frame.id === promptPickerFrameIds.commands) {
       this.picker.close()
       return true
@@ -240,6 +265,9 @@ class PromptController implements PromptStore {
       case "loading_logout":
       case "choosing_logout":
       case "logging_out":
+      case "starting_session":
+      case "loading_sessions":
+      case "choosing_session":
       case "choosing_settings_scope":
         this.#setIdle()
         break
@@ -261,7 +289,7 @@ class PromptController implements PromptStore {
   }
 
   abortAndRestoreQueuedInputs(currentText: string): string {
-    if (this.#cancelAuthentication()) return ""
+    if (this.#cancelAuthentication() || this.#cancelSessionReplacement()) return ""
     try {
       const aborted = this.#interactive.abortAndRestoreQueuedInputs()
       const text = this.#mergeQueue(aborted, currentText, false)
@@ -274,7 +302,7 @@ class PromptController implements PromptStore {
   }
 
   clear(): void {
-    if (this.#cancelAuthentication()) return
+    if (this.#cancelAuthentication() || this.#cancelSessionReplacement()) return
     this.picker.close()
     const state = this.$state.get()
     this.$state.set({ ...initialPromptState, inputEdit: { revision: state.inputEdit.revision + 1, text: "" } })
@@ -283,6 +311,7 @@ class PromptController implements PromptStore {
   dispose(): void {
     if (this.#disposed) return
     this.#cancelAuthentication()
+    this.#cancelSessionReplacement()
     this.#disposed = true
     this.picker.dispose()
   }
@@ -433,6 +462,56 @@ class PromptController implements PromptStore {
     return true
   }
 
+  #activateSession(
+    workflow: Extract<PromptWorkflow, { type: "choosing_session" }>,
+    presentation: PickerPresentation
+  ): boolean {
+    if (presentation.frame.id !== promptPickerFrameIds.sessions || !presentation.selectedId) return false
+    if (!this.#accepts(workflow.operationId, workflow.session)) return false
+    const selected = workflow.sessions.find(session => session.path === presentation.selectedId)
+    if (!selected) return false
+    if (selected.path === workflow.session.sessionManager.file) {
+      this.picker.close()
+      this.$state.set({
+        ...this.$state.get(),
+        feedback: { type: "status", message: "Session already active" },
+        workflow: { type: "idle" }
+      })
+      this.#requestInput("")
+      return true
+    }
+    const actions = this.#sessionActions
+    if (!actions) {
+      this.#showError("Session runtime is unavailable")
+      return false
+    }
+
+    this.$state.set({
+      ...this.$state.get(),
+      feedback: { type: "status", message: "Resuming session…" },
+      workflow: { type: "resuming_session", operationId: workflow.operationId, session: workflow.session }
+    })
+    this.picker.replaceTop({ ...presentation.frame, footer: "Resuming session…" }, "")
+    this.#requestInput("")
+
+    const resume = async () => {
+      try {
+        await actions.resumeSession(selected.path)
+      } catch (cause) {
+        if (!this.#accepts(workflow.operationId, workflow.session)) return
+        this.picker.replaceTop(sessionFrame(workflow.sessions, workflow.session.sessionManager.file), "")
+        this.$state.set({ ...this.$state.get(), feedback: { type: "error", message: errorMessage(cause) }, workflow })
+        return
+      }
+      if (!this.#accepts(workflow.operationId, workflow.session)) return
+      this.picker.close()
+      this.$state.set({ ...this.$state.get(), feedback: { type: "none" }, workflow: { type: "idle" } })
+      this.#requestInput("")
+    }
+    void resume()
+    return true
+  }
+
   #dispatchCommand(command: ReturnType<InteractiveCommands["parse"]>, parentFilter?: string): boolean {
     if (!command) return false
     switch (command.type) {
@@ -448,9 +527,98 @@ class PromptController implements PromptStore {
       case "settings":
         this.#openSettings(parentFilter)
         return true
+      case "new_session":
+        this.#startNewSession()
+        return true
+      case "resume_session":
+        this.#openSessions(parentFilter)
+        return true
       default:
         return assertNever(command)
     }
+  }
+
+  #startNewSession(): void {
+    const actions = this.#sessionActions
+    if (!actions) {
+      this.#showError("Session runtime is unavailable")
+      return
+    }
+    const session = this.#interactive.getSession()
+    const operationId = ++this.#nextOperationId
+    this.picker.close()
+    this.$state.set({
+      ...this.$state.get(),
+      feedback: { type: "status", message: "Starting new session…" },
+      workflow: { type: "starting_session", operationId, session }
+    })
+    this.#requestInput("")
+
+    const start = async () => {
+      try {
+        await actions.startNewSession()
+      } catch (cause) {
+        if (this.#accepts(operationId, session)) {
+          this.$state.set({
+            ...this.$state.get(),
+            feedback: { type: "error", message: errorMessage(cause) },
+            workflow: { type: "idle" }
+          })
+        }
+        return
+      }
+      if (!this.#accepts(operationId, session)) return
+      this.$state.set({ ...this.$state.get(), feedback: { type: "none" }, workflow: { type: "idle" } })
+      this.#requestInput("")
+    }
+    void start()
+  }
+
+  #openSessions(parentFilter?: string): void {
+    const actions = this.#sessionActions
+    if (!actions) {
+      this.#showError("Session runtime is unavailable")
+      return
+    }
+    const session = this.#interactive.getSession()
+    const operationId = ++this.#nextOperationId
+    const loading = sessionFrame([], session.sessionManager.file, { emptyText: "Loading sessions…" })
+    if (parentFilter === undefined) this.picker.open(loading)
+    else this.picker.push(loading, parentFilter)
+    this.$state.set({
+      ...this.$state.get(),
+      feedback: { type: "none" },
+      workflow: { type: "loading_sessions", operationId, session }
+    })
+    this.#requestInput("")
+
+    const load = async () => {
+      let listed: SessionListResult
+      try {
+        listed = await actions.listSessions()
+      } catch (cause) {
+        if (!this.#accepts(operationId, session)) return
+        this.picker.replaceTop(sessionFrame([], session.sessionManager.file, { emptyText: errorMessage(cause) }), "")
+        this.$state.set({
+          ...this.$state.get(),
+          workflow: { type: "choosing_session", operationId, session, sessions: [] }
+        })
+        return
+      }
+      if (!this.#accepts(operationId, session)) return
+      this.picker.replaceTop(
+        sessionFrame(listed.sessions, session.sessionManager.file, {
+          invalid: listed.invalid,
+          omitted: listed.omitted
+        }),
+        ""
+      )
+      this.$state.set({
+        ...this.$state.get(),
+        workflow: { type: "choosing_session", operationId, session, sessions: listed.sessions }
+      })
+    }
+    void load()
   }
 
   #openModels(initialSearch: string, parentFilter?: string): void {
@@ -693,6 +861,35 @@ class PromptController implements PromptStore {
     } catch (cause) {
       this.#showError(cause)
     }
+    return true
+  }
+
+  #cancelSessionReplacement(): boolean {
+    const workflow = this.$state.get().workflow
+    if (workflow.type === "cancelling_session") return true
+    if (workflow.type !== "starting_session" && workflow.type !== "resuming_session") return false
+    const cancellation = this.#sessionActions?.cancelReplacement()
+    if (!cancellation || cancellation.type !== "cancelled") return true
+
+    const operationId = ++this.#nextOperationId
+    this.picker.close()
+    this.$state.set({
+      ...this.$state.get(),
+      feedback: { type: "status", message: "Cancelling session change…" },
+      workflow: { type: "cancelling_session", operationId, session: workflow.session }
+    })
+    this.#requestInput("")
+    const settleCancellation = async () => {
+      try {
+        await cancellation.settled
+      } catch (cause) {
+        if (this.#accepts(operationId, workflow.session)) this.#showError(cause)
+        return
+      }
+      if (!this.#accepts(operationId, workflow.session)) return
+      this.$state.set({ ...this.$state.get(), feedback: { type: "none" }, workflow: { type: "idle" } })
+    }
+    void settleCancellation()
     return true
   }
 

@@ -10,6 +10,8 @@ export type InteractiveCommand =
   | { readonly type: "login"; readonly provider: string }
   | { readonly type: "logout" }
   | { readonly type: "settings" }
+  | { readonly type: "new_session" }
+  | { readonly type: "resume_session" }
 
 export interface InteractiveCommands {
   suggestions(text: string, cursorOffset: number): readonly SlashCommand[]
@@ -51,6 +53,10 @@ export function createInteractiveCommands(
           return { type: "logout" }
         case "settings":
           return { type: "settings" }
+        case "new":
+          return { type: "new_session" }
+        case "resume":
+          return { type: "resume_session" }
         default:
           return assertNever(command.name)
       }

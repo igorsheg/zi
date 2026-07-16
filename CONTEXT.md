@@ -32,6 +32,10 @@ _Avoid_: Abort, component unmount, session disposal
 The process-scoped capabilities from which agent sessions are constructed, including models, credentials, settings, filesystem/process access, and persistence.
 _Avoid_: Globals, app context
 
+**Agent session runtime**:
+The optional coding-agent owner of one replaceable current `AgentRuntime`. It performs bounded session listing and whole-runtime new/resume transitions, rebuilding cwd-bound services and disposing replaced sessions. Single-session SDK callers do not need it.
+_Avoid_: Session manager, root store, TUI session controller
+
 **OpenZi paths**:
 The immutable coding-agent policy value for one effective cwd. It resolves global `$HOME/.openzi/agent`, exact project `<cwd>/.openzi`, credentials, scoped settings/resources, and cwd-partitioned sessions. A resumed session's stored cwd is admitted before this value and its cwd-bound services are constructed.
 _Avoid_: Path registry, config singleton, ambient cwd

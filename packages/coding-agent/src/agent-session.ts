@@ -482,6 +482,13 @@ export class AgentSession {
     }
   }
 
+  assertReplaceable(): void {
+    this.#assertIdle("replace the session")
+    if (this.#modelMutation.type !== "none")
+      throw new Error("Cannot replace the session while a model change is active")
+    if (this.#pending.length > 0) throw new Error("Cannot replace the session while queued input is pending")
+  }
+
   waitForIdle(): Promise<void> {
     switch (this.#activity.type) {
       case "running":

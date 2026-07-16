@@ -2,6 +2,7 @@ export type { AgentMessage, AgentTool, QueueMode, ThinkingLevel } from "@earendi
 export type { Api, ImageContent, Model } from "@earendil-works/pi-ai"
 
 export * from "./agent-session.js"
+export * from "./agent-session-runtime.js"
 export * from "./authentication.js"
 export * from "./credential-store.js"
 export * from "./model-registry.js"

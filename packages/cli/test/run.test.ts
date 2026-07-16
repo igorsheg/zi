@@ -1,8 +1,14 @@
 import { expect, test } from "bun:test"
 import { join } from "node:path"
 
-import type { AgentMessage, AgentRuntime, CreateAgentRuntimeOptions } from "@openzi/coding-agent"
-import { createModels, createTestAgentRuntime, fauxAssistantMessage, fauxProvider } from "@openzi/coding-agent/testing"
+import type { AgentMessage, AgentRuntime, AgentSessionRuntime, CreateAgentRuntimeOptions } from "@openzi/coding-agent"
+import {
+  createModels,
+  createTestAgentRuntime,
+  createTestAgentSessionRuntime,
+  fauxAssistantMessage,
+  fauxProvider
+} from "@openzi/coding-agent/testing"
 
 import {
   helpText,
@@ -30,6 +36,7 @@ test("spawned help stays stdout-clean and never initializes a terminal", async (
   expect(stdout).toBe(helpText)
   expect(stderr).toBe("")
   expect(stdout).not.toContain("\u001b")
+  expect(stdout).not.toContain("      --session file")
 })
 
 test("spawned version stays stdout-clean and never initializes a terminal", async () => {
@@ -157,6 +164,36 @@ test("piped stdin becomes the first prompt before positional messages", async ()
   ])
 })
 
+test("continue-recent reaches runtime construction as a distinct headless intent", async () => {
+  const models = createModels()
+  const faux = fauxProvider()
+  models.setProvider(faux.provider)
+  faux.setResponses([fauxAssistantMessage("continued")])
+  let receivedOptions: CreateAgentRuntimeOptions | undefined
+  const output: string[] = []
+  const errors: string[] = []
+  const host = testHost({
+    output,
+    errors,
+    async createRuntime(options) {
+      receivedOptions = options
+      const testOptions = { ...options }
+      delete testOptions.continueRecent
+      return createTestAgentRuntime({ ...testOptions, persist: false, models })
+    }
+  })
+
+  const exitCode = await runCli(
+    ["-p", "--continue", "--model", `${faux.getModel().provider}/${faux.getModel().id}`, "continue"],
+    host
+  )
+
+  expect(exitCode).toBe(0)
+  expect(receivedOptions?.continueRecent).toBe(true)
+  expect(output).toEqual(["continued\n"])
+  expect(errors).toEqual([])
+})
+
 test("TTY mode delegates positional prompts only to the dynamic interactive loader", async () => {
   const models = createModels()
   const faux = fauxProvider()
@@ -164,11 +201,16 @@ test("TTY mode delegates positional prompts only to the dynamic interactive load
   const output: string[] = []
   const errors: string[] = []
   let initialMessages: readonly string[] = []
+  let sessionRuntime: AgentSessionRuntime | undefined
   const host = testHost({
     output,
     errors,
     createRuntime: options => createTestAgentRuntime({ ...options, models }),
-    async runInteractive(_session, messages) {
+    async createSessionRuntime(options) {
+      sessionRuntime = await createTestAgentSessionRuntime({ ...options, models })
+      return sessionRuntime
+    },
+    async runInteractive(_runtime, messages) {
       initialMessages = messages
     }
   })
@@ -179,6 +221,7 @@ test("TTY mode delegates positional prompts only to the dynamic interactive load
   )
   expect(exitCode).toBe(0)
   expect(initialMessages).toEqual(["interactive prompt"])
+  expect(() => sessionRuntime?.session).toThrow("AgentSessionRuntime is disposed")
   expect(output).toEqual([])
   expect(errors).toEqual([])
 })
@@ -329,6 +372,7 @@ interface TestHostOptions {
   readonly output: string[]
   readonly errors: string[]
   readonly createRuntime: CliHost["createRuntime"]
+  readonly createSessionRuntime?: CliHost["createSessionRuntime"]
   readonly runInteractive?: CliHost["runInteractive"]
   readonly stdin?: string
   readonly stdinIsTTY?: boolean
@@ -362,6 +406,11 @@ function testHost(options: TestHostOptions): CliHost {
       options.errors.push(chunk)
     },
     createRuntime: options.createRuntime,
+    createSessionRuntime:
+      options.createSessionRuntime ??
+      (async () => {
+        throw new Error("unexpected interactive runtime")
+      }),
     runInteractive: options.runInteractive ?? (async () => {}),
     onSignal(listener: (signal: CliSignal) => void) {
       if (options.signals) options.signals.listener = listener

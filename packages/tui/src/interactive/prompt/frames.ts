@@ -2,6 +2,7 @@ import type {
   AgentSession,
   AuthenticationMethod,
   ModelChoice,
+  SessionInfo,
   SlashCommand,
   SettingsScope,
   StoredCredential
@@ -21,7 +22,8 @@ export const promptPickerFrameIds = {
   logoutProviders: "logout-providers",
   settingsScopes: "settings-scopes",
   settings: "settings",
-  settingValues: "setting-values"
+  settingValues: "setting-values",
+  sessions: "sessions"
 } as const
 
 export function commandFrame(commands: readonly SlashCommand[]): PickerFrame {
@@ -104,6 +106,33 @@ export function logoutFrame(credentials: readonly StoredCredential[]): PickerFra
       detail: credential.type === "oauth" ? "[subscription]" : "[API key]",
       searchText: credential.providerId
     }))
+  }
+}
+
+export function sessionFrame(
+  sessions: readonly SessionInfo[],
+  currentPath: string | undefined,
+  options: { readonly emptyText?: string; readonly invalid?: number; readonly omitted?: number } = {}
+): PickerFrame {
+  const selected = currentPath && sessions.some(session => session.path === currentPath) ? currentPath : undefined
+  const notices = [
+    options.invalid ? `${options.invalid} invalid` : "",
+    options.omitted ? `${options.omitted} older omitted` : ""
+  ].filter(Boolean)
+  return {
+    id: promptPickerFrameIds.sessions,
+    title: "Resume session",
+    filter: "fuzzy",
+    emptyText: options.emptyText ?? "No saved sessions",
+    rows: sessions.map(session => ({
+      id: session.path,
+      label: session.firstMessage || "Empty session",
+      detail: `[${sessionDate(session.modifiedAt)}]`,
+      ...(session.path === currentPath ? { metadata: glyphs.check } : {}),
+      searchText: `${session.id} ${session.cwd} ${session.firstMessage}`
+    })),
+    ...(selected ? { selectedId: selected } : {}),
+    ...(notices.length > 0 ? { footer: notices.join(" · ") } : {})
   }
 }
 
@@ -244,6 +273,10 @@ function effectiveSetting(session: AgentSession, setting: EditableSetting): Edit
     default:
       return assertNever(setting)
   }
+}
+
+function sessionDate(timestamp: string): string {
+  return timestamp.slice(0, 16).replace("T", " ")
 }
 
 function scopeLabel(scope: SettingsScope): string {

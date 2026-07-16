@@ -5,6 +5,7 @@ import type {
   ModelChoice,
   QueueMode,
   SettingsScope,
+  SessionInfo,
   StoredCredential,
   ThinkingLevel
 } from "@openzi/coding-agent"
@@ -73,6 +74,16 @@ export type PromptWorkflow =
       readonly session: AgentSession
       readonly providerId: string
     }
+  | { readonly type: "starting_session"; readonly operationId: number; readonly session: AgentSession }
+  | { readonly type: "loading_sessions"; readonly operationId: number; readonly session: AgentSession }
+  | {
+      readonly type: "choosing_session"
+      readonly operationId: number
+      readonly session: AgentSession
+      readonly sessions: readonly SessionInfo[]
+    }
+  | { readonly type: "resuming_session"; readonly operationId: number; readonly session: AgentSession }
+  | { readonly type: "cancelling_session"; readonly operationId: number; readonly session: AgentSession }
   | { readonly type: "choosing_settings_scope"; readonly operationId: number; readonly session: AgentSession }
   | {
       readonly type: "choosing_setting"
