@@ -28,7 +28,77 @@ $HOME/.openzi/{settings.json,auth.json,sessions/,AGENTS.md,SYSTEM.md,...}
 
 Global settings are overlaid by project settings and then runtime overrides. Authentication and default sessions remain global; sessions are partitioned by canonical cwd. Resuming a session rebuilds cwd-bound services from the cwd stored in its header. See [ADR 0011](docs/adr/0011-openzi-path-policy.md).
 
-A fresh terminal can start without credentials; use `/login`, then `/model` if needed. `/logout` removes only stored credentials, not environment or external provider configuration. For a one-process override, use `openzi --model provider/model-id --api-key "$KEY"`; the key is applied in memory and is never written to settings or `auth.json`.
+A fresh terminal can start without credentials; use `/login`, then `/model` if needed. `/logout` removes only stored credentials, not environment or external provider configuration. `/settings` edits thinking, steering, and follow-up behavior with an explicit global or project scope. For a one-process override, use `openzi --model provider/model-id --api-key "$KEY"`; the key is applied in memory and is never written to settings or `auth.json`.
+
+## CLI modes
+
+```sh
+openzi                                      # interactive TUI on a TTY
+openzi -p "Summarize this project"          # final assistant text
+openzi --mode text "First" "Then summarize"
+printf 'Summarize stdin' | openzi            # non-TTY input selects text mode
+openzi --mode json "Inspect the project"    # strict JSONL events
+```
+
+Piped stdin is the first prompt and positional prompts follow in argument order. Text diagnostics use stderr; JSON stdout contains only JSONL records. `--model`, memory-only `--api-key`, `--session`, and `--no-session` apply to interactive and headless modes. RPC is deliberately not available yet.
+
+## SDK
+
+`@openzi/coding-agent` can run without the CLI or TUI. `createAgentRuntime()` is the high-level constructor: it resolves one cwd, assembles path-owned services, and returns a frozen `{ session, services }` shell. The caller that creates the runtime always owns final session disposal.
+
+```ts
+import { createAgentRuntime } from "@openzi/coding-agent"
+
+const runtime = await createAgentRuntime({ cwd: process.cwd() }) // persistent session by default
+try {
+  if (runtime.session.modelState.type === "unselected") throw new Error("Select an authenticated model first")
+  await runtime.session.prompt("Summarize this project")
+  await runtime.session.waitForIdle()
+} finally {
+  runtime.session.dispose()
+}
+```
+
+Set `persist: false` for an in-memory transcript. Supplying `agentDir` makes global configuration ownership explicit instead of deriving it from `$HOME`:
+
+```ts
+const runtime = await createAgentRuntime({
+  cwd: "/workspace/project",
+  agentDir: "/workspace/openzi-config",
+  persist: false
+})
+```
+
+Production custom providers enter through the credential-aware model factory, so provider requests, OAuth refresh, login, and logout retain one credential owner:
+
+```ts
+const runtime = await createAgentRuntime({
+  cwd: process.cwd(),
+  modelFactory: credentials => createMyModels({ credentials })
+})
+```
+
+For full assembly control, `createAgentSession({ services, sessionManager, model, tools })` is the lower-level constructor. It consumes caller-owned `OpenZiPaths`, `SettingsManager`, `FileCredentialStore`, `ModelRegistry`, `ResourceLoader`, and `SessionManager`; it does not construct or dispose them. Raw `Models` injection is test-only under `@openzi/coding-agent/testing`.
+
+Text batch execution reuses the same caller-owned session and does not access process streams or signals:
+
+```ts
+import { runPrintMode } from "@openzi/coding-agent"
+
+const result = await runPrintMode(runtime.session, {
+  output: "text",
+  prompts: ["Inspect the project", "Summarize the result"],
+  writer: { write: chunk => process.stdout.write(chunk) }
+})
+```
+
+The writer is awaited for backpressure. Set `output: "json"` to emit a header-first, source-ordered JSONL event stream instead of final text. JSON records, pending bytes, and pending writes are bounded. The caller maps the closed result to stderr/exit policy and still owns `runtime.session.dispose()`.
+
+## Shipping
+
+End-user releases are native standalone executables built with the pinned Bun version on each target platform. Pull requests and `main` run the complete check; SemVer `v*.*.*` tags build, smoke-test, checksum, attest, and publish macOS arm64/x64, Linux arm64/x64, and Windows x64 archives. See [`docs/shipping.md`](docs/shipping.md).
+
+The embeddable packages remain a separate distribution boundary and will publish as transpiled ESM plus declarations rather than executable bundles.
 
 ## Development
 
@@ -36,7 +106,8 @@ Requires Bun 1.3.5. Installing dependencies also installs the Lefthook Git hooks
 
 ```sh
 bun install
-bun run start         # run OpenZi
+bun run start         # run OpenZi directly from TypeScript
+bun run build         # compile the local production executable to dist/openzi
 bun run fix           # apply Oxlint fixes, then format with Oxfmt
 bun run check         # formatting, linting, TypeScript, and tests
 ```

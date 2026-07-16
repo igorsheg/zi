@@ -38,7 +38,7 @@ The target is coding-agent architecture parity and observable product-behavior p
 ## P1 — daily-driver session behavior
 
 - [x] Model picker
-- [ ] Thinking-level picker
+- [x] Thinking-level picker
 - [ ] Session create/resume/list/switch
 - [x] Steering and follow-up with bounded queues
 - [ ] Retry policy and visible countdown
@@ -47,7 +47,7 @@ The target is coding-agent architecture parity and observable product-behavior p
 - [x] Conversation scrolling, follow-tail, unseen-line hint, selection/copy
 - [ ] `grep`, `find`, and `ls`
 - [x] Settings: global and project scope
-- [ ] Print and JSON modes sharing the same `AgentSession`
+- [x] Print and JSON modes sharing the same `AgentSession`
 - [x] Authentication commands and composer-owned provider flows
 
 ### P1 model-selection evidence
@@ -69,7 +69,7 @@ The target is coding-agent architecture parity and observable product-behavior p
 
 ### P1 steering and follow-up evidence
 
-- `packages/coding-agent/test/agent-session-queue.test.ts` covers delivery priority, queue modes, tool-batch timing, identity, bounds, dequeue, cancellation, continuation, and activity transitions through `AgentSession`.
+- `packages/coding-agent/test/agent-session-queue.test.ts` covers delivery priority, queue modes, tool-batch timing, identity, bounds, dequeue, cancellation, continuation, and activity transitions through `AgentSession`. It also fixes global/project queue-mode mutations as one durable-to-live transition, including shadowed global values, invalid-scope and persistence refusal, effective-only events, active-run drain boundaries, and runtime restoration.
 - `packages/tui/test/interactive/prompt-queue.test.ts` drives Return, Alt+Enter, Alt+Up, Escape, and Ctrl+C through real OpenTUI input and asserts queue rows, restoration, overflow, and cell-aware truncation.
 - Behavior is characterized from `packages/agent/src/agent.ts`, `packages/agent/src/agent-loop.ts`, `packages/coding-agent/src/core/agent-session.ts`, and `packages/coding-agent/src/modes/interactive/interactive-mode.ts` at the Pi commit pinned in `docs/reference-pins.md`.
 - Non-aborting dequeue prevents delivery while an entry remains in the core queue. `pi-agent-core` exposes no claim callback, so an entry already drained by the core before its `message_start` may still arrive; acceptance tests fix both clear-before-commit and commit-before-clear behavior at that dependency boundary.
@@ -78,9 +78,16 @@ The target is coding-agent architecture parity and observable product-behavior p
 
 - `packages/coding-agent/test/paths.test.ts` fixes the `$HOME/.openzi` global root, exact `<cwd>/.openzi` project root, resource paths, canonical cwd session partition, and cwd-relative custom session directories.
 - `packages/coding-agent/test/settings-manager.test.ts` fixes defaults < valid global < valid project < runtime precedence, explicit malformed-scope diagnostics and recovery, write refusal for invalid data, bounded input/output, shared-file handling, and scoped locked writes that preserve unknown fields.
+- `packages/tui/test/interactive/settings.test.ts` drives `/settings` completion, explicit scope selection, inherited/shadowed values, model-supported thinking levels, queue-mode persistence, nested Escape restoration, and invalid-file refusal through real OpenTUI. `packages/tui/test/interactive/prompt-store.test.ts` fixes operation/session identity independently of rendering.
 - `packages/coding-agent/test/credential-store.test.ts` fixes global-only credential persistence, redacted listing, bounded input/output and provider count, no-overwrite failures, and proves the default Pi AI model registry consumes the same path-owned `auth.json`.
 - `packages/coding-agent/test/runtime-paths.test.ts` proves settings and default sessions share the effective cwd, including when an explicit session header replaces the invocation cwd, and proves runtime model factories consume the exact credential owner exposed by services.
 - The policy is characterized from Pi's `config.ts`, path utilities, settings manager, auth storage, resource loader, session manager, and session-service construction at the pinned commit. OpenZi deliberately maps the global root directly to `$HOME/.openzi` rather than retaining Pi's additional `agent/` segment; see ADR 0011.
+
+### P1 headless-mode evidence
+
+- `packages/coding-agent/test/print-mode.test.ts` fixes bounded sequential prompts, final-text-only output, tool/thinking omission, missing-model/provider/abort results, caller cancellation, and caller-owned session reuse without process or terminal dependencies. It also fixes header-first/source-ordered JSONL, multi-prompt continuity, Unicode framing, credential exclusion, serialization failure, and bounded writer backpressure.
+- Behavior is characterized from Pi's `modes/print-mode.ts`, strict RPC JSONL helper, `test/print-mode.test.ts`, and `test/rpc-jsonl.test.ts` at the pinned commit. OpenZi deliberately injects the writer, aborts on bounded JSON output failure, and leaves signals and final disposal with the caller.
+- `packages/cli/test/run.test.ts` fixes explicit/TTY mode resolution, bounded stdin-first prompt ordering, text/JSON stdout cleanliness, missing-model diagnostics, runtime/API-key/session option forwarding, dynamic TUI isolation, signal exit codes, listener cleanup, and creator-owned disposal. `packages/tui/test/interactive/run.test.ts` proves positional TTY prompts start only after terminal ownership.
 
 ### P1 conversation navigation evidence
 

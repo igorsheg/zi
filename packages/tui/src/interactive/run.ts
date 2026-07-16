@@ -7,6 +7,7 @@ import { InteractiveMode } from "./interactive-mode.js"
 
 export interface RunTuiOptions {
   readonly session: AgentSession
+  readonly initialMessages?: readonly string[]
   readonly keybindingOverrides?: InteractiveKeybindingOverrides
 }
 
@@ -20,7 +21,7 @@ type RunState =
 
 const shutdownTimeoutMs = 5_000
 
-export async function runTui({ session, keybindingOverrides }: RunTuiOptions): Promise<void> {
+export async function runTui({ session, initialMessages = [], keybindingOverrides }: RunTuiOptions): Promise<void> {
   const renderer = await createCliRenderer({
     targetFps: 60,
     gatherStats: false,
@@ -88,6 +89,9 @@ export async function runTui({ session, keybindingOverrides }: RunTuiOptions): P
       onExit: () => void requestClose("interactive"),
       ...(keybindingOverrides ? { keybindingOverrides } : {})
     })
+    // Initial prompts share the interactive transcript and run after terminal ownership is established.
+    // oxlint-disable-next-line no-await-in-loop
+    for (const message of initialMessages) await session.prompt(message)
     await finished
   } finally {
     for (const { signal, handler } of signalHandlers) process.off(signal, handler)

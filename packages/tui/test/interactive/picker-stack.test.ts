@@ -65,6 +65,25 @@ test("picker stack filters only its top frame and restores suspended parent filt
   }
 })
 
+test("picker resolutions give callsites explicit stack and composer effects", () => {
+  const stack = createPickerStack()
+
+  try {
+    stack.open(boundedFrame("root"))
+    expect(stack.resolve({ type: "push", frame: boundedFrame("child"), parentFilter: "root filter" })).toEqual({
+      type: "replace_input",
+      text: ""
+    })
+    expect(stack.presentation("")?.frame.id).toBe("child")
+    expect(stack.resolve({ type: "back" })).toEqual({ type: "replace_input", text: "root filter" })
+    expect(stack.presentation("root filter")?.frame.id).toBe("root")
+    expect(stack.resolve({ type: "close" })).toEqual({ type: "replace_input", text: "" })
+    expect(stack.presentation("")).toBeUndefined()
+  } finally {
+    stack.dispose()
+  }
+})
+
 test("picker stack rejects unbounded and forbidden transitions", () => {
   const stack = createPickerStack()
 

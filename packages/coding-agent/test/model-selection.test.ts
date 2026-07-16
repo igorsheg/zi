@@ -1,4 +1,7 @@
 import { expect, test } from "bun:test"
+import { mkdir, mkdtemp, writeFile } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 
 import { getSupportedThinkingLevels, type AuthResult } from "@earendil-works/pi-ai"
 
@@ -60,6 +63,9 @@ test("model choices preserve registry identity and resolve provider configuratio
 })
 
 test("model and thinking selections persist a coherent canonical transition", async () => {
+  const root = await mkdtemp(join(tmpdir(), "openzi-thinking-selection-"))
+  const cwd = join(root, "project")
+  await mkdir(cwd, { recursive: true })
   const models = createModels()
   const faux = fauxProvider({
     provider: "select",
@@ -73,7 +79,7 @@ test("model and thinking selections persist a coherent canonical transition", as
   const plain = faux.getModel("plain")
   if (!reasoning || !plain) throw new Error("Selection models not found")
   const { session } = await createAgentRuntime({
-    cwd: "/work",
+    cwd,
     model: "select/reasoning",
     models,
     persist: false,
@@ -139,6 +145,46 @@ test("model and thinking selections persist a coherent canonical transition", as
         .map(entry => entry.type)
     ).toEqual(["thinking_level_change"])
     expect(events).toEqual(["thinking_level_changed"])
+
+    expect(session.setThinkingLevel("low", "project")).toEqual({ scope: "project", requested: "low", effective: "low" })
+    expect(session.thinkingLevel).toBe("low")
+    expect(session.settingsManager.getProject().thinkingLevel).toBe("low")
+  } finally {
+    session.dispose()
+  }
+})
+
+test("thinking mutations report an effective project override without false events", async () => {
+  const root = await mkdtemp(join(tmpdir(), "openzi-thinking-shadow-"))
+  const cwd = join(root, "project")
+  const agentDir = join(root, "global")
+  await mkdir(join(cwd, ".openzi"), { recursive: true })
+  await mkdir(agentDir, { recursive: true })
+  await writeFile(join(agentDir, "settings.json"), JSON.stringify({ thinkingLevel: "medium" }))
+  await writeFile(join(cwd, ".openzi", "settings.json"), JSON.stringify({ thinkingLevel: "high" }))
+  const models = createModels()
+  const faux = fauxProvider({ provider: "thinking-shadow", models: [{ id: "model", reasoning: true }] })
+  models.setProvider(faux.provider)
+  const { session } = await createAgentRuntime({
+    cwd,
+    agentDir,
+    model: "thinking-shadow/model",
+    models,
+    persist: false
+  })
+  const events: string[] = []
+  session.subscribe(event => {
+    if (event.type === "thinking_level_changed") events.push(event.type)
+  })
+
+  try {
+    const entries = session.sessionManager.entries().length
+    expect(session.setThinkingLevel("low", "global")).toEqual({ scope: "global", requested: "low", effective: "high" })
+    expect(session.thinkingLevel).toBe("high")
+    expect(session.settingsManager.get().thinkingLevel).toBe("high")
+    expect(session.settingsManager.getGlobal().thinkingLevel).toBe("low")
+    expect(session.sessionManager.entries()).toHaveLength(entries)
+    expect(events).toEqual([])
   } finally {
     session.dispose()
   }

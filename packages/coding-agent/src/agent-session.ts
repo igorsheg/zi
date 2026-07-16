@@ -3,6 +3,7 @@ import {
   type AgentEvent,
   type AgentMessage,
   type AgentTool,
+  type QueueMode,
   type ThinkingLevel
 } from "@earendil-works/pi-agent-core"
 import {
@@ -23,7 +24,7 @@ import type {
 import type { StoredCredential } from "./credential-store.js"
 import type { ModelRegistry } from "./model-registry.js"
 import type { SessionEntry, SessionManager } from "./session-manager.js"
-import type { SettingsManager } from "./settings-manager.js"
+import type { SettingsManager, SettingsScope } from "./settings-manager.js"
 
 export const maxPendingInputCount = 32
 export const maxPendingInputBytes = 8 * 1024 * 1024
@@ -54,6 +55,8 @@ export type AgentSessionEvent =
   | { type: "entry_appended"; entry: SessionEntry }
   | { type: "model_changed"; model: Model<Api> }
   | { type: "thinking_level_changed"; level: ThinkingLevel }
+  | { type: "steering_mode_changed"; mode: QueueMode }
+  | { type: "follow_up_mode_changed"; mode: QueueMode }
   | {
       type: "authentication_changed"
       status: "logged_in" | "logged_out"
@@ -69,6 +72,18 @@ export interface ModelChoice {
 export interface PromptOptions {
   images?: ImageContent[]
   streamingBehavior?: PendingInputDelivery
+}
+
+export interface QueueModeMutation {
+  readonly scope: SettingsScope
+  readonly requested: QueueMode
+  readonly effective: QueueMode
+}
+
+export interface ThinkingLevelMutation {
+  readonly scope: SettingsScope
+  readonly requested: ThinkingLevel
+  readonly effective: ThinkingLevel
 }
 
 export interface AgentSessionConfig {
@@ -169,6 +184,14 @@ export class AgentSession {
 
   get thinkingLevel(): ThinkingLevel {
     return this.#agent.state.thinkingLevel
+  }
+
+  get steeringMode(): QueueMode {
+    return this.#agent.steeringMode
+  }
+
+  get followUpMode(): QueueMode {
+    return this.#agent.followUpMode
   }
 
   get isStreaming(): boolean {
@@ -414,14 +437,49 @@ export class AgentSession {
     }
   }
 
-  setThinkingLevel(requested: ThinkingLevel): void {
+  setSteeringMode(requested: QueueMode, scope: SettingsScope): QueueModeMutation {
+    this.#assertOpen()
+    assertQueueMode(requested)
+    assertSettingsScope(scope)
+    if (scope === "global") this.settingsManager.updateGlobal({ steeringMode: requested })
+    else this.settingsManager.updateProject({ steeringMode: requested })
+    const effective = this.settingsManager.get().steeringMode
+    if (effective !== this.#agent.steeringMode) {
+      this.#agent.steeringMode = effective
+      this.#emitAll([{ type: "steering_mode_changed", mode: effective }])
+    }
+    return Object.freeze({ scope, requested, effective })
+  }
+
+  setFollowUpMode(requested: QueueMode, scope: SettingsScope): QueueModeMutation {
+    this.#assertOpen()
+    assertQueueMode(requested)
+    assertSettingsScope(scope)
+    if (scope === "global") this.settingsManager.updateGlobal({ followUpMode: requested })
+    else this.settingsManager.updateProject({ followUpMode: requested })
+    const effective = this.settingsManager.get().followUpMode
+    if (effective !== this.#agent.followUpMode) {
+      this.#agent.followUpMode = effective
+      this.#emitAll([{ type: "follow_up_mode_changed", mode: effective }])
+    }
+    return Object.freeze({ scope, requested, effective })
+  }
+
+  setThinkingLevel(requested: ThinkingLevel, scope: SettingsScope = "global"): ThinkingLevelMutation {
     this.#assertIdle("change thinking level")
-    const level = clampThinkingLevel(this.model, requested)
-    if (level === this.thinkingLevel) return
-    this.sessionManager.appendThinkingLevelChange(level)
-    this.settingsManager.updateGlobal({ thinkingLevel: level })
-    this.#agent.state.thinkingLevel = level
-    this.#emit({ type: "thinking_level_changed", level })
+    assertThinkingLevel(requested)
+    assertSettingsScope(scope)
+    const persisted = clampThinkingLevel(this.model, requested)
+    if (scope === "global") this.settingsManager.updateGlobal({ thinkingLevel: persisted })
+    else this.settingsManager.updateProject({ thinkingLevel: persisted })
+    const effective = clampThinkingLevel(this.model, this.settingsManager.get().thinkingLevel)
+    this.settingsManager.applyRuntime({ thinkingLevel: effective })
+    if (effective !== this.thinkingLevel) {
+      this.sessionManager.appendThinkingLevelChange(effective)
+      this.#agent.state.thinkingLevel = effective
+      this.#emitAll([{ type: "thinking_level_changed", level: effective }])
+    }
+    return Object.freeze({ scope, requested, effective })
   }
 
   setActiveTools(tools: readonly AgentTool[]): void {
@@ -646,6 +704,28 @@ function retainedBytes(text: string, images: readonly ImageContent[]): number {
   let bytes = Buffer.byteLength(text)
   for (const image of images) bytes += Buffer.byteLength(image.mimeType) + Buffer.byteLength(image.data)
   return bytes
+}
+
+function assertQueueMode(value: unknown): asserts value is QueueMode {
+  if (value !== "all" && value !== "one-at-a-time") throw new Error(`Invalid queue mode: ${String(value)}`)
+}
+
+function assertThinkingLevel(value: unknown): asserts value is ThinkingLevel {
+  if (
+    value !== "off" &&
+    value !== "minimal" &&
+    value !== "low" &&
+    value !== "medium" &&
+    value !== "high" &&
+    value !== "xhigh" &&
+    value !== "max"
+  ) {
+    throw new Error(`Invalid thinking level: ${String(value)}`)
+  }
+}
+
+function assertSettingsScope(value: unknown): asserts value is SettingsScope {
+  if (value !== "global" && value !== "project") throw new Error(`Invalid settings scope: ${String(value)}`)
 }
 
 function assertNever(value: never): never {

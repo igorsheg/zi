@@ -1,4 +1,7 @@
 import { expect, test } from "bun:test"
+import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 
 import { Type, type Context, type ImageContent } from "@earendil-works/pi-ai"
 
@@ -131,6 +134,208 @@ test("all queue modes batch each selected queue while preserving steering priori
   session.steer("steer-1")
   session.followUp("follow-2")
   session.steer("steer-2")
+  hold.release.resolve()
+  await run
+
+  expect(requests).toHaveLength(2)
+  expect(requests[0]?.slice(-2)).toEqual(["steer-1", "steer-2"])
+  expect(requests[1]?.slice(-2)).toEqual(["follow-1", "follow-2"])
+  session.dispose()
+})
+
+test("steering mode mutation persists globally and updates live behavior", async () => {
+  const root = await mkdtemp(join(tmpdir(), "openzi-steering-mode-"))
+  const cwd = join(root, "project")
+  const agentDir = join(root, "global")
+  await mkdir(cwd, { recursive: true })
+  await mkdir(agentDir, { recursive: true })
+  await writeFile(
+    join(agentDir, "settings.json"),
+    JSON.stringify({ steeringMode: "one-at-a-time", future: { enabled: true } })
+  )
+
+  const models = createModels()
+  models.setProvider(fauxProvider().provider)
+  const { session } = await createAgentRuntime({ cwd, agentDir, models, persist: false })
+
+  expect(session.steeringMode).toBe("one-at-a-time")
+  const entriesBefore = session.sessionManager.entries()
+  expect(session.setSteeringMode("all", "global")).toEqual({ scope: "global", requested: "all", effective: "all" })
+  expect(session.steeringMode).toBe("all")
+  expect(JSON.parse(await readFile(join(agentDir, "settings.json"), "utf8"))).toEqual({
+    steeringMode: "all",
+    future: { enabled: true }
+  })
+  expect(session.sessionManager.entries()).toEqual(entriesBefore)
+  session.dispose()
+})
+
+test("follow-up mode mutation persists project scope and updates live behavior", async () => {
+  const root = await mkdtemp(join(tmpdir(), "openzi-follow-up-mode-"))
+  const cwd = join(root, "project")
+  const agentDir = join(root, "global")
+  const projectDir = join(cwd, ".openzi")
+  await mkdir(projectDir, { recursive: true })
+  await mkdir(agentDir, { recursive: true })
+  await writeFile(join(projectDir, "settings.json"), JSON.stringify({ futureProject: 1 }))
+
+  const models = createModels()
+  models.setProvider(fauxProvider().provider)
+  const { session } = await createAgentRuntime({ cwd, agentDir, models, persist: false })
+
+  expect(session.followUpMode).toBe("one-at-a-time")
+  expect(session.setFollowUpMode("all", "project")).toEqual({ scope: "project", requested: "all", effective: "all" })
+  expect(session.followUpMode).toBe("all")
+  expect(JSON.parse(await readFile(join(projectDir, "settings.json"), "utf8"))).toEqual({
+    futureProject: 1,
+    followUpMode: "all"
+  })
+  session.dispose()
+})
+
+test("queue mode events publish only effective layered changes", async () => {
+  const root = await mkdtemp(join(tmpdir(), "openzi-shadowed-mode-"))
+  const cwd = join(root, "project")
+  const agentDir = join(root, "global")
+  const projectDir = join(cwd, ".openzi")
+  await mkdir(projectDir, { recursive: true })
+  await mkdir(agentDir, { recursive: true })
+  await writeFile(join(agentDir, "settings.json"), JSON.stringify({ steeringMode: "one-at-a-time" }))
+  await writeFile(join(projectDir, "settings.json"), JSON.stringify({ steeringMode: "all" }))
+
+  const models = createModels()
+  models.setProvider(fauxProvider().provider)
+  const { session } = await createAgentRuntime({ cwd, agentDir, models, persist: false })
+  const changes: string[] = []
+  session.subscribe(event => {
+    if (event.type === "steering_mode_changed") changes.push(event.mode)
+  })
+
+  expect(session.setSteeringMode("all", "global")).toEqual({ scope: "global", requested: "all", effective: "all" })
+  expect(changes).toEqual([])
+  expect(session.setSteeringMode("one-at-a-time", "project").effective).toBe("one-at-a-time")
+  expect(session.steeringMode).toBe("one-at-a-time")
+  expect(changes).toEqual(["one-at-a-time"])
+  session.dispose()
+})
+
+test("subscriber failure cannot roll back a committed follow-up mode change", async () => {
+  const models = createModels()
+  models.setProvider(fauxProvider().provider)
+  const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
+  let calls = 0
+  session.subscribe(event => {
+    if (event.type !== "follow_up_mode_changed") return
+    calls++
+    throw new Error("observer failed")
+  })
+
+  expect(() => session.setFollowUpMode("all", "global")).not.toThrow()
+  expect(calls).toBe(1)
+  expect(session.followUpMode).toBe("all")
+  expect(session.settingsManager.get().followUpMode).toBe("all")
+  session.dispose()
+})
+
+test("queue mode mutations reject unknown scopes without changing live state", async () => {
+  const models = createModels()
+  models.setProvider(fauxProvider().provider)
+  const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
+
+  // oxlint-disable-next-line typescript/unbound-method -- Reflect models an untyped JavaScript SDK caller.
+  expect(() => Reflect.apply(session.setSteeringMode, session, ["all", "workspace"])).toThrow(
+    "Invalid settings scope: workspace"
+  )
+  expect(session.steeringMode).toBe("one-at-a-time")
+  expect(session.settingsManager.get().steeringMode).toBe("one-at-a-time")
+  session.dispose()
+})
+
+test("queue mode mutations reject unknown modes without changing settings", async () => {
+  const models = createModels()
+  models.setProvider(fauxProvider().provider)
+  const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
+
+  // oxlint-disable-next-line typescript/unbound-method -- Reflect models an untyped JavaScript SDK caller.
+  expect(() => Reflect.apply(session.setFollowUpMode, session, ["grouped", "global"])).toThrow(
+    "Invalid queue mode: grouped"
+  )
+  expect(session.followUpMode).toBe("one-at-a-time")
+  expect(session.settingsManager.get().followUpMode).toBe("one-at-a-time")
+  session.dispose()
+})
+
+test("settings persistence failure leaves live queue modes unchanged", async () => {
+  const root = await mkdtemp(join(tmpdir(), "openzi-invalid-queue-mode-"))
+  const cwd = join(root, "project")
+  const agentDir = join(root, "global")
+  const projectDir = join(cwd, ".openzi")
+  await mkdir(projectDir, { recursive: true })
+  await writeFile(join(projectDir, "settings.json"), JSON.stringify({ followUpMode: "grouped" }))
+
+  const models = createModels()
+  models.setProvider(fauxProvider().provider)
+  const { session } = await createAgentRuntime({ cwd, agentDir, models, persist: false })
+  let changes = 0
+  session.subscribe(event => {
+    if (event.type === "follow_up_mode_changed") changes++
+  })
+
+  expect(() => session.setFollowUpMode("all", "project")).toThrow("Cannot update invalid project settings")
+  expect(session.followUpMode).toBe("one-at-a-time")
+  expect(session.settingsManager.get().followUpMode).toBe("one-at-a-time")
+  expect(changes).toBe(0)
+  session.dispose()
+})
+
+test("recreated runtimes restore persisted queue modes", async () => {
+  const root = await mkdtemp(join(tmpdir(), "openzi-restored-queue-mode-"))
+  const cwd = join(root, "project")
+  const agentDir = join(root, "global")
+  await mkdir(cwd, { recursive: true })
+
+  const firstModels = createModels()
+  firstModels.setProvider(fauxProvider().provider)
+  const first = await createAgentRuntime({ cwd, agentDir, models: firstModels, persist: false })
+  first.session.setSteeringMode("all", "global")
+  first.session.setFollowUpMode("all", "project")
+  first.session.dispose()
+
+  const secondModels = createModels()
+  secondModels.setProvider(fauxProvider().provider)
+  const second = await createAgentRuntime({ cwd, agentDir, models: secondModels, persist: false })
+  expect(second.session.steeringMode).toBe("all")
+  expect(second.session.followUpMode).toBe("all")
+  second.session.dispose()
+})
+
+test("queue mode mutations during a run control the next eligible drains", async () => {
+  const models = createModels()
+  const faux = fauxProvider()
+  models.setProvider(faux.provider)
+  const requests: string[][] = []
+  faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("hold", {}, { id: "hold-mode-change" }), { stopReason: "toolUse" }),
+    (context: Context) => {
+      requests.push(userTexts(context))
+      return fauxAssistantMessage("steering batch")
+    },
+    (context: Context) => {
+      requests.push(userTexts(context))
+      return fauxAssistantMessage("follow-up batch")
+    }
+  ])
+
+  const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
+  const hold = installHoldingTool(session)
+  const run = session.prompt("start")
+  await hold.started.promise
+  session.steer("steer-1")
+  session.steer("steer-2")
+  session.followUp("follow-1")
+  session.followUp("follow-2")
+  session.setSteeringMode("all", "global")
+  session.setFollowUpMode("all", "global")
   hold.release.resolve()
   await run
 
@@ -280,6 +485,8 @@ test("queue operations enforce activity transitions and Escape abort shares sett
   session.dispose()
   expect(() => session.prompt("disposed")).toThrow("AgentSession is disposed")
   expect(() => session.takeQueuedInputs()).toThrow("AgentSession is disposed")
+  expect(() => session.setSteeringMode("all", "global")).toThrow("AgentSession is disposed")
+  expect(() => session.setFollowUpMode("all", "project")).toThrow("AgentSession is disposed")
 })
 
 test("queue detachment is published before abort reaches the active provider", async () => {

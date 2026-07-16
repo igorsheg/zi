@@ -41,6 +41,17 @@ export interface PickerPresentation {
 
 export type PickerBack = { readonly type: "closed" } | { readonly type: "revealed"; readonly filter: string }
 
+export type PickerResolution =
+  | { readonly type: "stay" }
+  | { readonly type: "close"; readonly text?: string }
+  | { readonly type: "back" }
+  | { readonly type: "push"; readonly frame: PickerFrame; readonly parentFilter: string; readonly text?: string }
+  | { readonly type: "replace"; readonly frame: PickerFrame; readonly filter: string }
+
+export type PickerResolutionEffect =
+  | { readonly type: "unchanged" }
+  | { readonly type: "replace_input"; readonly text: string }
+
 export interface PickerStack {
   readonly $state: ReadableAtom<PickerStackState>
   open(frame: PickerFrame): void
@@ -50,6 +61,8 @@ export interface PickerStack {
   move(filter: string, direction: -1 | 1): void
   selected(filter: string): PickerStackRow | undefined
   presentation(filter: string): PickerPresentation | undefined
+  /** Apply the stack/composer effect chosen by a callsite after its domain action succeeds. */
+  resolve(resolution: PickerResolution): PickerResolutionEffect
   back(): PickerBack
   close(): void
   dispose(): void
@@ -88,6 +101,38 @@ export function createPickerStack(): PickerStack {
     }
   }
 
+  const pushFrame = (frame: PickerFrame, parentFilter: string): void => {
+    const state = current()
+    if (state.type === "closed") throw new Error("Cannot push a picker frame onto a closed stack")
+    if (state.frames.length === maxPickerDepth) {
+      throw new Error(`Picker stack cannot exceed ${maxPickerDepth} frames`)
+    }
+    if (parentFilter.length > maxSuspendedFilterLength) {
+      throw new Error(`Suspended picker filters cannot exceed ${maxSuspendedFilterLength} characters`)
+    }
+    validateFrame(frame)
+    $state.set({ type: "open", frames: [...state.frames, activate(frame, parentFilter)] })
+  }
+
+  const replaceFrame = (frame: PickerFrame, filter: string): void => {
+    current()
+    validateFrame(frame)
+    updateTop(currentFrame => activate(frame, currentFrame.parentFilter, filter))
+  }
+
+  const goBack = (): PickerBack => {
+    const state = current()
+    if (state.type === "closed") return { type: "closed" }
+    const top = state.frames.at(-1)!
+    if (state.frames.length === 1) {
+      $state.set({ type: "closed" })
+      return { type: "closed" }
+    }
+    const remaining = state.frames.slice(0, -1)
+    $state.set({ type: "open", frames: [remaining[0]!, ...remaining.slice(1)] })
+    return { type: "revealed", filter: top.parentFilter ?? "" }
+  }
+
   return {
     $state,
     open(frame) {
@@ -95,23 +140,11 @@ export function createPickerStack(): PickerStack {
       validateFrame(frame)
       $state.set({ type: "open", frames: [activate(frame)] })
     },
-    push(frame, parentFilter) {
-      const state = current()
-      if (state.type === "closed") throw new Error("Cannot push a picker frame onto a closed stack")
-      if (state.frames.length === maxPickerDepth) {
-        throw new Error(`Picker stack cannot exceed ${maxPickerDepth} frames`)
-      }
-      if (parentFilter.length > maxSuspendedFilterLength) {
-        throw new Error(`Suspended picker filters cannot exceed ${maxSuspendedFilterLength} characters`)
-      }
-      validateFrame(frame)
-      $state.set({ type: "open", frames: [...state.frames, activate(frame, parentFilter)] })
-    },
+    push: pushFrame,
     replaceTop(frame, filter) {
       const state = current()
       if (state.type === "closed") throw new Error("Cannot replace a picker frame on a closed stack")
-      validateFrame(frame)
-      updateTop(currentFrame => activate(frame, currentFrame.parentFilter, filter))
+      replaceFrame(frame, filter)
     },
     queryChanged(filter) {
       updateTop(frame => {
@@ -136,18 +169,30 @@ export function createPickerStack(): PickerStack {
       return currentPresentation.rows.find(row => row.id === currentPresentation.selectedId)
     },
     presentation,
-    back() {
-      const state = current()
-      if (state.type === "closed") return { type: "closed" }
-      const top = state.frames.at(-1)!
-      if (state.frames.length === 1) {
-        $state.set({ type: "closed" })
-        return { type: "closed" }
+    resolve(resolution) {
+      switch (resolution.type) {
+        case "stay":
+          current()
+          return { type: "unchanged" }
+        case "close":
+          current()
+          $state.set({ type: "closed" })
+          return { type: "replace_input", text: resolution.text ?? "" }
+        case "back": {
+          const result = goBack()
+          return { type: "replace_input", text: result.type === "revealed" ? result.filter : "" }
+        }
+        case "push":
+          pushFrame(resolution.frame, resolution.parentFilter)
+          return { type: "replace_input", text: resolution.text ?? "" }
+        case "replace":
+          replaceFrame(resolution.frame, resolution.filter)
+          return { type: "replace_input", text: resolution.filter }
+        default:
+          return assertNever(resolution)
       }
-      const remaining = state.frames.slice(0, -1)
-      $state.set({ type: "open", frames: [remaining[0]!, ...remaining.slice(1)] })
-      return { type: "revealed", filter: top.parentFilter ?? "" }
     },
+    back: goBack,
     close() {
       current()
       $state.set({ type: "closed" })
@@ -219,6 +264,10 @@ function filteredRows(frame: PickerFrame, query: string): readonly PickerStackRo
 }
 
 // Ported from pi-tui fuzzy matching at the repository pin in docs/reference-pins.md.
+function assertNever(value: never): never {
+  throw new Error(`Unexpected picker resolution: ${String(value)}`)
+}
+
 function fuzzyMatch(query: string, text: string): { matches: boolean; score: number } {
   const queryLower = query.toLowerCase()
   const textLower = text.toLowerCase()

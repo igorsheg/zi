@@ -4,6 +4,7 @@ export type InteractiveCommand =
   | { readonly type: "model"; readonly search: string }
   | { readonly type: "login"; readonly provider: string }
   | { readonly type: "logout" }
+  | { readonly type: "settings" }
 
 export interface InteractiveCommands {
   suggestions(text: string, cursorOffset: number): readonly BuiltinSlashCommand[]
@@ -32,6 +33,8 @@ export function createInteractiveCommands(): InteractiveCommands {
           return { type: "login", provider: text === "/login" ? "" : text.slice(7).trim() }
         case "logout":
           return { type: "logout" }
+        case "settings":
+          return { type: "settings" }
         default:
           return assertNever(command.name)
       }

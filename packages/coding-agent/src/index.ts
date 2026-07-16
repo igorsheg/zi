@@ -1,4 +1,4 @@
-export type { AgentMessage, AgentTool, ThinkingLevel } from "@earendil-works/pi-agent-core"
+export type { AgentMessage, AgentTool, QueueMode, ThinkingLevel } from "@earendil-works/pi-agent-core"
 export type { Api, ImageContent, Model } from "@earendil-works/pi-ai"
 
 export * from "./agent-session.js"
@@ -7,6 +7,7 @@ export * from "./credential-store.js"
 export * from "./model-registry.js"
 export * from "./model-resolver.js"
 export * from "./paths.js"
+export * from "./print-mode.js"
 export * from "./resource-loader.js"
 export * from "./runtime.js"
 export * from "./services.js"

@@ -31,6 +31,53 @@ test("prompt store restores queued text, images, and status without a renderer",
   }
 })
 
+test("settings workflow restores suspended filters until a value closes the stack", async () => {
+  const session = await createSession("settings-store")
+  const mode = createInteractiveStore(session)
+  const prompt = createPromptStore(mode, createInteractiveCommands())
+
+  try {
+    expect(prompt.submit("/settings", "steer")).toBe(true)
+    prompt.draftChanged("glob", 4)
+    expect(prompt.activatePicker("glob", 4)).toBe(true)
+    prompt.draftChanged("steer", 5)
+    expect(prompt.activatePicker("steer", 5)).toBe(true)
+    prompt.movePicker("", 1)
+    expect(prompt.backPicker()).toBe(true)
+    expect(prompt.$state.get().inputEdit.text).toBe("steer")
+    expect(prompt.picker.presentation("steer")?.frame.id).toBe("settings")
+    expect(prompt.activatePicker("steer", 5)).toBe(true)
+    prompt.movePicker("", 1)
+    expect(prompt.activatePicker("", 0)).toBe(true)
+    expect(session.steeringMode).toBe("all")
+    expect(prompt.$state.get().inputEdit.text).toBe("")
+    expect(prompt.picker.presentation("")).toBeUndefined()
+  } finally {
+    mode.dispose()
+    session.dispose()
+  }
+})
+
+test("settings workflow cannot cross a session replacement", async () => {
+  const first = await createSession("settings-first")
+  const second = await createSession("settings-second")
+  const mode = createInteractiveStore(first)
+  const prompt = createPromptStore(mode, createInteractiveCommands())
+
+  try {
+    expect(prompt.submit("/settings", "steer")).toBe(true)
+    mode.replaceSession(second)
+    expect(prompt.activatePicker("", 0)).toBe(false)
+    expect(first.steeringMode).toBe("one-at-a-time")
+    expect(second.steeringMode).toBe("one-at-a-time")
+  } finally {
+    prompt.dispose()
+    mode.dispose()
+    first.dispose()
+    second.dispose()
+  }
+})
+
 test("prompt store retains rejected input and exposes the admission error", async () => {
   const session = await createSession("disposed")
   const mode = createInteractiveStore(session)

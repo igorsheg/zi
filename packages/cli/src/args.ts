@@ -1,42 +1,69 @@
+export type CliOutputMode = "text" | "json"
+
 export interface Args {
-  cwd: string
-  model?: string
-  apiKey?: string
-  sessionFile?: string
-  noSession: boolean
+  readonly cwd: string
+  readonly model?: string
+  readonly apiKey?: string
+  readonly sessionFile?: string
+  readonly noSession: boolean
+  readonly print: boolean
+  readonly mode?: CliOutputMode
+  readonly messages: readonly string[]
+  readonly help: boolean
+  readonly version: boolean
 }
 
-export function parseArgs(argv: string[]): Args {
+export function parseArgs(argv: readonly string[]): Args {
   let cwd = process.cwd()
   let model: string | undefined
   let apiKey: string | undefined
   let sessionFile: string | undefined
   let noSession = false
+  let print = false
+  let mode: CliOutputMode | undefined
+  let help = false
+  let version = false
+  const messages: string[] = []
 
   for (let index = 0; index < argv.length; index++) {
     const arg = argv[index]
+    if (arg === "--") {
+      messages.push(...argv.slice(index + 1))
+      break
+    }
     if (arg === "--cwd") cwd = required(argv[++index], "--cwd")
     else if (arg === "--model") model = required(argv[++index], "--model")
     else if (arg === "--api-key") apiKey = required(argv[++index], "--api-key")
     else if (arg === "--session") sessionFile = required(argv[++index], "--session")
     else if (arg === "--no-session") noSession = true
-    else if (arg === "--help" || arg === "-h") {
-      process.stdout.write(
-        "Usage: openzi [--cwd path] [--model provider/model-id] [--api-key key] [--session file] [--no-session]\n"
-      )
-      process.exit(0)
-    } else throw new Error(`Unknown argument: ${arg}`)
+    else if (arg === "--print" || arg === "-p") print = true
+    else if (arg === "--mode") mode = parseMode(required(argv[++index], "--mode"))
+    else if (arg === "--help" || arg === "-h") help = true
+    else if (arg === "--version" || arg === "-V") version = true
+    else if (arg?.startsWith("-")) throw new Error(`Unknown argument: ${arg}`)
+    else if (arg !== undefined) messages.push(arg)
   }
 
   if (sessionFile && noSession) throw new Error("--session and --no-session cannot be used together")
 
-  return {
+  return Object.freeze({
     cwd,
     noSession,
+    print,
+    messages: Object.freeze(messages),
+    help,
+    version,
     ...(model === undefined ? {} : { model }),
     ...(apiKey === undefined ? {} : { apiKey }),
-    ...(sessionFile === undefined ? {} : { sessionFile })
-  }
+    ...(sessionFile === undefined ? {} : { sessionFile }),
+    ...(mode === undefined ? {} : { mode })
+  })
+}
+
+function parseMode(value: string): CliOutputMode {
+  if (value === "text" || value === "json") return value
+  if (value === "rpc") throw new Error("RPC mode is not available yet")
+  throw new Error(`Invalid --mode value: ${value} (expected text or json)`)
 }
 
 function required(value: string | undefined, flag: string): string {

@@ -6,8 +6,11 @@ import type {
   ImageContent,
   ModelChoice,
   PendingInputDelivery,
+  QueueMode,
   QueuedInputs,
-  StoredCredential
+  SettingsScope,
+  StoredCredential,
+  ThinkingLevel
 } from "@openzi/coding-agent"
 import { atom, type ReadableAtom } from "nanostores"
 
@@ -22,10 +25,16 @@ import {
   logoutFrame,
   modelChoiceId,
   modelFrame,
-  promptPickerFrameIds
+  promptPickerFrameIds,
+  settingLabel,
+  settingsFrame,
+  settingsScopeFrame,
+  settingValuesFrame,
+  type EditableSetting,
+  type EditableSettingValue
 } from "../prompt-picker-frames.js"
 import type { InteractiveStore } from "./interactive.js"
-import { createPickerStack, type PickerStack } from "./picker-stack.js"
+import { createPickerStack, type PickerResolution, type PickerStack } from "./picker-stack.js"
 
 export type PromptFeedback =
   | { readonly type: "none" }
@@ -68,6 +77,14 @@ export type PromptWorkflow =
       readonly credentials: readonly StoredCredential[]
     }
   | { readonly type: "logging_out"; readonly operationId: number; readonly providerId: string }
+  | { readonly type: "choosing_settings_scope"; readonly operationId: number }
+  | { readonly type: "choosing_setting"; readonly operationId: number; readonly scope: SettingsScope }
+  | {
+      readonly type: "choosing_setting_value"
+      readonly operationId: number
+      readonly scope: SettingsScope
+      readonly setting: EditableSetting
+    }
 
 export type PromptInputMode = "draft" | "auth_text" | "auth_secret"
 
@@ -114,6 +131,7 @@ export function createPromptStore(mode: InteractiveStore, commands: InteractiveC
   let nextOperationId = 0
   let nextBrowserRequestId = 0
   let activeAuthenticationSession: ReturnType<InteractiveStore["getSession"]> | undefined
+  let activeSettingsSession: ReturnType<InteractiveStore["getSession"]> | undefined
   let pendingAuthPrompt:
     | {
         readonly operationId: number
@@ -126,6 +144,11 @@ export function createPromptStore(mode: InteractiveStore, commands: InteractiveC
   const requestInput = (text: string) => {
     const state = $state.get()
     $state.set({ ...state, inputEdit: { revision: state.inputEdit.revision + 1, text } })
+  }
+
+  const resolvePicker = (resolution: PickerResolution) => {
+    const effect = picker.resolve(resolution)
+    if (effect.type === "replace_input") requestInput(effect.text)
   }
 
   const showError = (cause: unknown) => {
@@ -464,6 +487,71 @@ export function createPromptStore(mode: InteractiveStore, commands: InteractiveC
     void load()
   }
 
+  const openSettings = (parentFilter?: string) => {
+    activeSettingsSession = mode.getSession()
+    const operationId = ++nextOperationId
+    const frame = settingsScopeFrame()
+    if (parentFilter === undefined) picker.open(frame)
+    else picker.push(frame, parentFilter)
+    const state = $state.get()
+    $state.set({
+      ...state,
+      feedback: { type: "none" },
+      workflow: { type: "choosing_settings_scope", operationId },
+      inputMode: "draft"
+    })
+    requestInput("")
+  }
+
+  const applySetting = (
+    operationId: number,
+    session: ReturnType<InteractiveStore["getSession"]>,
+    scope: SettingsScope,
+    setting: EditableSetting,
+    value: string
+  ): boolean => {
+    if (!accepts(operationId, session)) return false
+    let mutation: { readonly requested: EditableSettingValue; readonly effective: EditableSettingValue }
+    try {
+      switch (setting) {
+        case "thinkingLevel":
+          if (!isThinkingLevel(value)) return false
+          mutation = session.setThinkingLevel(value, scope)
+          break
+        case "steeringMode":
+          if (!isQueueMode(value)) return false
+          mutation = session.setSteeringMode(value, scope)
+          break
+        case "followUpMode":
+          if (!isQueueMode(value)) return false
+          mutation = session.setFollowUpMode(value, scope)
+          break
+        default:
+          return assertNever(setting)
+      }
+    } catch (cause) {
+      showError(cause)
+      return false
+    }
+    if (!accepts(operationId, session)) return false
+
+    activeSettingsSession = undefined
+    resolvePicker({ type: "close" })
+    const state = $state.get()
+    const shadowed = mutation.requested !== mutation.effective
+    $state.set({
+      ...state,
+      feedback: {
+        type: "status",
+        message: shadowed
+          ? `${settingLabel(setting)} saved as ${mutation.requested}; project override keeps ${mutation.effective} effective`
+          : `${settingLabel(setting)}: ${mutation.effective} (${scope})`
+      },
+      workflow: { type: "idle" }
+    })
+    return true
+  }
+
   const dispatchCommand = (command: ReturnType<InteractiveCommands["parse"]>, parentFilter?: string): boolean => {
     if (!command) return false
     const commandType = command.type
@@ -476,6 +564,9 @@ export function createPromptStore(mode: InteractiveStore, commands: InteractiveC
         return true
       case "logout":
         logout()
+        return true
+      case "settings":
+        openSettings(parentFilter)
         return true
       default:
         return assertNever(commandType)
@@ -560,6 +651,54 @@ export function createPromptStore(mode: InteractiveStore, commands: InteractiveC
         return dispatchCommand(commands.parse(commands.completion(command).trim()), text)
       }
 
+      if (presentation.frame.id === promptPickerFrameIds.settingsScopes) {
+        const workflow = $state.get().workflow
+        if (workflow.type !== "choosing_settings_scope") return false
+        const scope = settingsScope(presentation.selectedId)
+        const session = activeSettingsSession
+        if (!scope || !session || session !== mode.getSession()) return false
+        resolvePicker({
+          type: "push",
+          frame: settingsFrame(session, scope),
+          parentFilter: text || presentation.selectedId
+        })
+        const state = $state.get()
+        $state.set({ ...state, workflow: { type: "choosing_setting", operationId: workflow.operationId, scope } })
+        return true
+      }
+
+      if (presentation.frame.id === promptPickerFrameIds.settings) {
+        const workflow = $state.get().workflow
+        if (workflow.type !== "choosing_setting") return false
+        const setting = editableSetting(presentation.selectedId)
+        const session = activeSettingsSession
+        if (!setting || !session || session !== mode.getSession()) return false
+        resolvePicker({
+          type: "push",
+          frame: settingValuesFrame(session, workflow.scope, setting),
+          parentFilter: text || presentation.selectedId
+        })
+        const state = $state.get()
+        $state.set({
+          ...state,
+          workflow: {
+            type: "choosing_setting_value",
+            operationId: workflow.operationId,
+            scope: workflow.scope,
+            setting
+          }
+        })
+        return true
+      }
+
+      if (presentation.frame.id === promptPickerFrameIds.settingValues) {
+        const workflow = $state.get().workflow
+        if (workflow.type !== "choosing_setting_value") return false
+        const session = activeSettingsSession
+        if (!session || session !== mode.getSession()) return false
+        return applySetting(workflow.operationId, session, workflow.scope, workflow.setting, presentation.selectedId)
+      }
+
       if (presentation.frame.id === promptPickerFrameIds.models) {
         const workflow = $state.get().workflow
         if (workflow.type !== "choosing_model") return false
@@ -638,10 +777,26 @@ export function createPromptStore(mode: InteractiveStore, commands: InteractiveC
         return true
       }
       if (presentation.frame.id === promptPickerFrameIds.authOptions) return cancelAuthentication()
+      if (presentation.frame.id === promptPickerFrameIds.settingsScopes) activeSettingsSession = undefined
 
       const result = picker.back()
       const state = $state.get()
-      if (presentation.frame.id === promptPickerFrameIds.authMethods && result.type === "revealed") {
+      if (
+        presentation.frame.id === promptPickerFrameIds.settingValues &&
+        state.workflow.type === "choosing_setting_value" &&
+        result.type === "revealed"
+      ) {
+        $state.set({
+          ...state,
+          workflow: { type: "choosing_setting", operationId: state.workflow.operationId, scope: state.workflow.scope }
+        })
+      } else if (
+        presentation.frame.id === promptPickerFrameIds.settings &&
+        state.workflow.type === "choosing_setting" &&
+        result.type === "revealed"
+      ) {
+        $state.set({ ...state, workflow: { type: "choosing_settings_scope", operationId: state.workflow.operationId } })
+      } else if (presentation.frame.id === promptPickerFrameIds.authMethods && result.type === "revealed") {
         const operationId =
           state.workflow.type === "choosing_auth_method" ? state.workflow.operationId : ++nextOperationId
         const allMethods = mode.getSession().authenticationMethods()
@@ -682,6 +837,7 @@ export function createPromptStore(mode: InteractiveStore, commands: InteractiveC
     },
     clear() {
       if (cancelAuthentication()) return
+      activeSettingsSession = undefined
       picker.close()
       const state = $state.get()
       $state.set({ ...initialPromptState, inputEdit: { revision: state.inputEdit.revision + 1, text: "" } })
@@ -689,6 +845,7 @@ export function createPromptStore(mode: InteractiveStore, commands: InteractiveC
     dispose() {
       if (disposed) return
       cancelAuthentication()
+      activeSettingsSession = undefined
       disposed = true
       picker.dispose()
     }
@@ -706,6 +863,30 @@ function authenticationEventFeedback(event: AuthenticationEvent, requestId: numb
     default:
       return assertNever(event)
   }
+}
+
+function settingsScope(value: string): SettingsScope | undefined {
+  return value === "global" || value === "project" ? value : undefined
+}
+
+function editableSetting(value: string): EditableSetting | undefined {
+  return value === "thinkingLevel" || value === "steeringMode" || value === "followUpMode" ? value : undefined
+}
+
+function isQueueMode(value: string): value is QueueMode {
+  return value === "all" || value === "one-at-a-time"
+}
+
+function isThinkingLevel(value: string): value is ThinkingLevel {
+  return (
+    value === "off" ||
+    value === "minimal" ||
+    value === "low" ||
+    value === "medium" ||
+    value === "high" ||
+    value === "xhigh" ||
+    value === "max"
+  )
 }
 
 function errorMessage(cause: unknown): string {

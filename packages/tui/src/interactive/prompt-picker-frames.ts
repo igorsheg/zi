@@ -1,8 +1,17 @@
-import type { AuthenticationMethod, BuiltinSlashCommand, ModelChoice, StoredCredential } from "@openzi/coding-agent"
+import type {
+  AgentSession,
+  AuthenticationMethod,
+  BuiltinSlashCommand,
+  ModelChoice,
+  QueueMode,
+  SettingsScope,
+  StoredCredential,
+  ThinkingLevel
+} from "@openzi/coding-agent"
 
 import { glyphs } from "../glyphs.js"
 import { sameModel } from "./model-selector.js"
-import type { PickerFrame } from "./stores/picker-stack.js"
+import type { PickerFrame, PickerStackRow } from "./stores/picker-stack.js"
 
 export const promptPickerFrameIds = {
   commands: "commands",
@@ -10,7 +19,10 @@ export const promptPickerFrameIds = {
   authProviders: "auth-providers",
   authMethods: "auth-methods",
   authOptions: "auth-options",
-  logoutProviders: "logout-providers"
+  logoutProviders: "logout-providers",
+  settingsScopes: "settings-scopes",
+  settings: "settings",
+  settingValues: "setting-values"
 } as const
 
 export function commandFrame(commands: readonly BuiltinSlashCommand[]): PickerFrame {
@@ -96,6 +108,77 @@ export function logoutFrame(credentials: readonly StoredCredential[]): PickerFra
   }
 }
 
+export type EditableSetting = "thinkingLevel" | "steeringMode" | "followUpMode"
+export type EditableSettingValue = ThinkingLevel | QueueMode
+
+export function settingsScopeFrame(): PickerFrame {
+  return {
+    id: promptPickerFrameIds.settingsScopes,
+    title: "Settings scope",
+    filter: "fuzzy",
+    rows: [
+      {
+        id: "global",
+        label: "Global",
+        metadata: "Applies across projects unless a project value overrides it",
+        searchText: "global all projects"
+      },
+      {
+        id: "project",
+        label: "Project",
+        metadata: "Applies only to the current working directory",
+        searchText: "project current working directory"
+      }
+    ]
+  }
+}
+
+export function settingsFrame(session: AgentSession, scope: SettingsScope): PickerFrame {
+  const scoped = scope === "global" ? session.settingsManager.getGlobal() : session.settingsManager.getProject()
+  return {
+    id: promptPickerFrameIds.settings,
+    title: `Settings · ${scopeLabel(scope)}`,
+    filter: "fuzzy",
+    rows: [
+      settingRow(session, scope, "thinkingLevel", "Thinking level", scoped.thinkingLevel),
+      settingRow(session, scope, "steeringMode", "Steering mode", scoped.steeringMode),
+      settingRow(session, scope, "followUpMode", "Follow-up mode", scoped.followUpMode)
+    ]
+  }
+}
+
+export function settingValuesFrame(session: AgentSession, scope: SettingsScope, setting: EditableSetting): PickerFrame {
+  const scoped = scope === "global" ? session.settingsManager.getGlobal() : session.settingsManager.getProject()
+  const saved = scoped[setting]
+  const effective = effectiveSetting(session, setting)
+  const values =
+    setting === "thinkingLevel" ? session.getSupportedThinkingLevels() : (["one-at-a-time", "all"] as const)
+  const selectedId = values.find(value => value === saved) ?? effective
+  return {
+    id: promptPickerFrameIds.settingValues,
+    title: `${settingLabel(setting)} · ${scopeLabel(scope)}`,
+    filter: "fuzzy",
+    rows: values.map(value => settingValueRow(value, saved, effective)),
+    selectedId,
+    ...(scope === "global" && session.settingsManager.getProject()[setting] !== undefined
+      ? { hint: `Project override keeps the effective value at ${effective}.` }
+      : {})
+  }
+}
+
+export function settingLabel(setting: EditableSetting): string {
+  switch (setting) {
+    case "thinkingLevel":
+      return "Thinking level"
+    case "steeringMode":
+      return "Steering mode"
+    case "followUpMode":
+      return "Follow-up mode"
+    default:
+      return assertNever(setting)
+  }
+}
+
 export function modelFrame(
   choices: readonly ModelChoice[],
   current: ModelChoice["model"] | undefined,
@@ -122,6 +205,80 @@ export function modelChoiceId(choice: ModelChoice): string {
   return modelId(choice.model)
 }
 
+function settingValueRow(
+  value: EditableSettingValue,
+  saved: EditableSettingValue | undefined,
+  effective: EditableSettingValue
+): PickerStackRow {
+  return {
+    id: value,
+    label: value,
+    ...(value === saved ? { detail: "[saved]" } : {}),
+    ...(value === effective ? { metadata: glyphs.check } : {}),
+    searchText: `${value} ${thinkingDescription(value)}`
+  }
+}
+
+function settingRow(
+  session: AgentSession,
+  scope: SettingsScope,
+  setting: EditableSetting,
+  label: string,
+  saved: EditableSettingValue | undefined
+): PickerStackRow {
+  const effective = effectiveSetting(session, setting)
+  const shadowed = scope === "global" && session.settingsManager.getProject()[setting] !== undefined
+  return {
+    id: setting,
+    label,
+    detail: `[${saved ?? "inherited"}]`,
+    metadata: shadowed ? `Effective: ${effective} (project override)` : `Effective: ${effective}`,
+    searchText: `${label} ${setting} ${saved ?? "inherited"} ${effective}`
+  }
+}
+
+function effectiveSetting(session: AgentSession, setting: EditableSetting): EditableSettingValue {
+  switch (setting) {
+    case "thinkingLevel":
+      return session.thinkingLevel
+    case "steeringMode":
+      return session.steeringMode
+    case "followUpMode":
+      return session.followUpMode
+    default:
+      return assertNever(setting)
+  }
+}
+
+function scopeLabel(scope: SettingsScope): string {
+  return scope === "global" ? "Global" : "Project"
+}
+
+function thinkingDescription(value: EditableSettingValue): string {
+  switch (value) {
+    case "off":
+      return "no reasoning"
+    case "minimal":
+      return "minimal reasoning"
+    case "low":
+      return "low reasoning"
+    case "medium":
+      return "medium reasoning"
+    case "high":
+      return "high reasoning"
+    case "xhigh":
+      return "extra high reasoning"
+    case "max":
+      return "maximum reasoning"
+    case "all":
+      return "batch all queued messages"
+    case "one-at-a-time":
+      return "deliver one queued message at a time"
+    default:
+      return assertNever(value)
+  }
+}
+
 function modelSearchText(choice: ModelChoice): string {
   const { id, name, provider } = choice.model
   return `${provider} ${provider}/${id} ${provider} ${id}${name ? ` ${name}` : ""}`
@@ -129,4 +286,8 @@ function modelSearchText(choice: ModelChoice): string {
 
 function modelId(model: ModelChoice["model"]): string {
   return `${model.provider}/${model.id}`
+}
+
+function assertNever(value: never): never {
+  throw new Error(`Unexpected settings value: ${String(value)}`)
 }

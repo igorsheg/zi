@@ -1,6 +1,7 @@
 import type { CredentialStore, Models } from "@earendil-works/pi-ai"
 import { builtinModels } from "@earendil-works/pi-ai/providers/all"
 
+import type { AgentSession } from "./agent-session.js"
 import { FileCredentialStore } from "./credential-store.js"
 import { ModelRegistry } from "./model-registry.js"
 import { resolveInitialModel } from "./model-resolver.js"
@@ -11,23 +12,27 @@ import { SessionManager } from "./session-manager.js"
 import { SettingsManager, type AgentSettings } from "./settings-manager.js"
 import { createCodingTools } from "./tools/index.js"
 
-export interface AgentRuntimeServices extends AgentSessionServices {
-  credentialStore: FileCredentialStore
+export type AgentRuntimeServices = AgentSessionServices
+
+export interface AgentRuntime {
+  readonly session: AgentSession
+  readonly services: AgentRuntimeServices
 }
 
 export interface CreateAgentRuntimeOptions {
-  cwd: string
-  model?: string
-  apiKey?: string
-  modelFactory?: (credentials: CredentialStore) => Models
-  agentDir?: string
-  sessionDir?: string
-  sessionFile?: string
-  persist?: boolean
-  settings?: Partial<AgentSettings>
+  readonly cwd: string
+  readonly model?: string
+  readonly apiKey?: string
+  readonly modelFactory?: (credentials: CredentialStore) => Models
+  readonly agentDir?: string
+  readonly sessionDir?: string
+  readonly sessionFile?: string
+  readonly persist?: boolean
+  readonly settings?: Readonly<Partial<AgentSettings>>
 }
 
-export async function createAgentRuntime(options: CreateAgentRuntimeOptions) {
+/** Assemble cwd-bound production services and a session. The caller owns `session.dispose()`. */
+export async function createAgentRuntime(options: CreateAgentRuntimeOptions): Promise<AgentRuntime> {
   const resumed = options.sessionFile ? SessionManager.open(options.sessionFile) : undefined
   const cwd = resumed?.header.cwd ?? options.cwd
   const sessionDir = options.sessionDir ?? resumed?.sessionDir
@@ -48,7 +53,13 @@ export async function createAgentRuntime(options: CreateAgentRuntimeOptions) {
   const models = options.modelFactory?.(credentialStore) ?? builtinModels({ credentials: credentialStore })
   const modelRegistry = new ModelRegistry(models)
   const resourceLoader = new DefaultResourceLoader({ paths })
-  const services: AgentRuntimeServices = { paths, settingsManager, credentialStore, modelRegistry, resourceLoader }
+  const services: AgentRuntimeServices = Object.freeze({
+    paths,
+    settingsManager,
+    credentialStore,
+    modelRegistry,
+    resourceLoader
+  })
   const modelReference = settingsManager.get().model
   if (options.apiKey !== undefined && options.apiKey.length === 0) {
     throw new Error("--api-key requires a non-empty value")
@@ -71,5 +82,5 @@ export async function createAgentRuntime(options: CreateAgentRuntimeOptions) {
     ...(options.apiKey ? { apiKey: options.apiKey } : {}),
     tools: createCodingTools(paths.cwd)
   })
-  return { session, services }
+  return Object.freeze({ session, services })
 }

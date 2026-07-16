@@ -1,7 +1,7 @@
 import { closeSync, existsSync, mkdirSync, openSync, readSync, renameSync, unlinkSync, writeFileSync } from "node:fs"
 import { basename, dirname, join } from "node:path"
 
-import type { ThinkingLevel } from "@earendil-works/pi-agent-core"
+import type { QueueMode, ThinkingLevel } from "@earendil-works/pi-agent-core"
 import lockfile from "proper-lockfile"
 
 import type { OpenZiPaths } from "./paths.js"
@@ -9,8 +9,8 @@ import type { OpenZiPaths } from "./paths.js"
 export interface AgentSettings {
   model?: string
   thinkingLevel: ThinkingLevel
-  steeringMode: "all" | "one-at-a-time"
-  followUpMode: "all" | "one-at-a-time"
+  steeringMode: QueueMode
+  followUpMode: QueueMode
 }
 
 export const maxSettingsFileBytes = 1024 * 1024

@@ -1,0 +1,383 @@
+import { expect, test } from "bun:test"
+import { join } from "node:path"
+
+import type { AgentMessage, AgentRuntime, CreateAgentRuntimeOptions } from "@openzi/coding-agent"
+import { createModels, createTestAgentRuntime, fauxAssistantMessage, fauxProvider } from "@openzi/coding-agent/testing"
+
+import {
+  helpText,
+  maxCliStdinBytes,
+  resolveAppMode,
+  runCli,
+  versionText,
+  type CliHost,
+  type CliSignal
+} from "../src/run.js"
+
+test("spawned help stays stdout-clean and never initializes a terminal", async () => {
+  const child = Bun.spawn([process.execPath, join(import.meta.dir, "../src/main.ts"), "--help"], {
+    stdin: "ignore",
+    stdout: "pipe",
+    stderr: "pipe"
+  })
+  const [exitCode, stdout, stderr] = await Promise.all([
+    child.exited,
+    new Response(child.stdout).text(),
+    new Response(child.stderr).text()
+  ])
+
+  expect(exitCode).toBe(0)
+  expect(stdout).toBe(helpText)
+  expect(stderr).toBe("")
+  expect(stdout).not.toContain("\u001b")
+})
+
+test("spawned version stays stdout-clean and never initializes a terminal", async () => {
+  const child = Bun.spawn([process.execPath, join(import.meta.dir, "../src/main.ts"), "--version"], {
+    stdin: "ignore",
+    stdout: "pipe",
+    stderr: "pipe"
+  })
+  const [exitCode, stdout, stderr] = await Promise.all([
+    child.exited,
+    new Response(child.stdout).text(),
+    new Response(child.stderr).text()
+  ])
+
+  expect({ exitCode, stdout, stderr }).toEqual({ exitCode: 0, stdout: versionText, stderr: "" })
+})
+
+test("CLI mode resolution gives explicit JSON priority and otherwise follows TTY facts", () => {
+  const base = { cwd: "/work", noSession: false, print: false, messages: [], help: false, version: false } as const
+
+  expect(resolveAppMode({ ...base, mode: "json" }, true, true)).toBe("json")
+  expect(resolveAppMode({ ...base, mode: "text" }, true, true)).toBe("text")
+  expect(resolveAppMode({ ...base, print: true }, true, true)).toBe("text")
+  expect(resolveAppMode(base, false, true)).toBe("text")
+  expect(resolveAppMode(base, true, false)).toBe("text")
+  expect(resolveAppMode(base, true, true)).toBe("interactive")
+})
+
+test("text mode writes final output without loading the TUI and disposes its runtime", async () => {
+  const models = createModels()
+  const faux = fauxProvider()
+  models.setProvider(faux.provider)
+  faux.setResponses([fauxAssistantMessage("done")])
+  let runtime: AgentRuntime | undefined
+  let receivedOptions: CreateAgentRuntimeOptions | undefined
+  let interactiveLoads = 0
+  const output: string[] = []
+  const errors: string[] = []
+  const host = testHost({
+    output,
+    errors,
+    async createRuntime(options) {
+      receivedOptions = options
+      runtime = await createTestAgentRuntime({ ...options, models })
+      return runtime
+    },
+    async runInteractive() {
+      interactiveLoads++
+    }
+  })
+
+  const exitCode = await runCli(
+    [
+      "-p",
+      "--no-session",
+      "--api-key",
+      "cli-secret",
+      "--model",
+      `${faux.getModel().provider}/${faux.getModel().id}`,
+      "start"
+    ],
+    host
+  )
+  expect({ exitCode, output, errors }).toEqual({ exitCode: 0, output: ["done\n"], errors: [] })
+  expect(receivedOptions).toMatchObject({ persist: false, apiKey: "cli-secret" })
+  expect(output.join("")).not.toContain("cli-secret")
+  expect(interactiveLoads).toBe(0)
+  expect(() => runtime?.session.prompt("disposed")).toThrow("AgentSession is disposed")
+})
+
+test("JSON mode emits only parseable JSONL without loading the TUI", async () => {
+  const models = createModels()
+  const faux = fauxProvider()
+  models.setProvider(faux.provider)
+  faux.setResponses([fauxAssistantMessage("done")])
+  const output: string[] = []
+  const errors: string[] = []
+  let interactiveLoads = 0
+  const host = testHost({
+    output,
+    errors,
+    createRuntime: options => createTestAgentRuntime({ ...options, models }),
+    async runInteractive() {
+      interactiveLoads++
+    }
+  })
+
+  const exitCode = await runCli(
+    ["--mode", "json", "--model", `${faux.getModel().provider}/${faux.getModel().id}`, "start"],
+    host
+  )
+  expect(exitCode).toBe(0)
+  expect(errors).toEqual([])
+  expect(interactiveLoads).toBe(0)
+  expect(output.length).toBeGreaterThan(1)
+  expect(output.every(line => line.endsWith("\n") && JSON.parse(line) !== undefined)).toBe(true)
+})
+
+test("piped stdin becomes the first prompt before positional messages", async () => {
+  const models = createModels()
+  const faux = fauxProvider()
+  models.setProvider(faux.provider)
+  faux.setResponses([fauxAssistantMessage("first"), fauxAssistantMessage("final")])
+  let runtime: AgentRuntime | undefined
+  const output: string[] = []
+  const errors: string[] = []
+  const host = testHost({
+    output,
+    errors,
+    stdin: "piped",
+    stdinIsTTY: false,
+    async createRuntime(options) {
+      runtime = await createTestAgentRuntime({ ...options, models })
+      return runtime
+    }
+  })
+
+  const exitCode = await runCli(["--model", `${faux.getModel().provider}/${faux.getModel().id}`, "argument"], host)
+  expect(exitCode).toBe(0)
+  expect(output).toEqual(["final\n"])
+  expect(errors).toEqual([])
+  expect(runtime?.session.messages.filter(message => message.role === "user").map(userText)).toEqual([
+    "piped",
+    "argument"
+  ])
+})
+
+test("TTY mode delegates positional prompts only to the dynamic interactive loader", async () => {
+  const models = createModels()
+  const faux = fauxProvider()
+  models.setProvider(faux.provider)
+  const output: string[] = []
+  const errors: string[] = []
+  let initialMessages: readonly string[] = []
+  const host = testHost({
+    output,
+    errors,
+    createRuntime: options => createTestAgentRuntime({ ...options, models }),
+    async runInteractive(_session, messages) {
+      initialMessages = messages
+    }
+  })
+
+  const exitCode = await runCli(
+    ["--model", `${faux.getModel().provider}/${faux.getModel().id}`, "interactive prompt"],
+    host
+  )
+  expect(exitCode).toBe(0)
+  expect(initialMessages).toEqual(["interactive prompt"])
+  expect(output).toEqual([])
+  expect(errors).toEqual([])
+})
+
+test("missing models fail on stderr without contaminating stdout", async () => {
+  const models = createModels()
+  const output: string[] = []
+  const errors: string[] = []
+  let interactiveLoads = 0
+  const host = testHost({
+    output,
+    errors,
+    createRuntime: options => createTestAgentRuntime({ ...options, models }),
+    async runInteractive() {
+      interactiveLoads++
+    }
+  })
+
+  expect(await runCli(["-p", "start"], host)).toBe(1)
+  expect(output).toEqual([])
+  expect(errors).toEqual(["No model selected. Use /login, then /model.\n"])
+  expect(interactiveLoads).toBe(0)
+})
+
+test("help exits without reading stdin, creating a runtime, or loading the TUI", async () => {
+  let reads = 0
+  let runtimeCreates = 0
+  let interactiveLoads = 0
+  const output: string[] = []
+  const errors: string[] = []
+  const host = testHost({
+    output,
+    errors,
+    onReadStdin() {
+      reads++
+    },
+    async createRuntime() {
+      runtimeCreates++
+      throw new Error("unexpected runtime")
+    },
+    async runInteractive() {
+      interactiveLoads++
+    }
+  })
+
+  expect(await runCli(["--help"], host)).toBe(0)
+  expect(output).toEqual([helpText])
+  expect(errors).toEqual([])
+  expect(reads).toBe(0)
+  expect(runtimeCreates).toBe(0)
+  expect(interactiveLoads).toBe(0)
+})
+
+test("oversized piped stdin is rejected before runtime creation", async () => {
+  let runtimeCreates = 0
+  const output: string[] = []
+  const errors: string[] = []
+  const host = testHost({
+    output,
+    errors,
+    stdin: "x".repeat(maxCliStdinBytes + 1),
+    stdinIsTTY: false,
+    async createRuntime() {
+      runtimeCreates++
+      throw new Error("unexpected runtime")
+    }
+  })
+
+  expect(await runCli([], host)).toBe(1)
+  expect(runtimeCreates).toBe(0)
+  expect(output).toEqual([])
+  expect(errors).toEqual([`Piped stdin cannot exceed ${maxCliStdinBytes} bytes\n`])
+})
+
+test("headless admission failures do not create a runtime or load the TUI", async () => {
+  let runtimeCreates = 0
+  let interactiveLoads = 0
+  const output: string[] = []
+  const errors: string[] = []
+  const host = testHost({
+    output,
+    errors,
+    async createRuntime() {
+      runtimeCreates++
+      throw new Error("unexpected runtime")
+    },
+    async runInteractive() {
+      interactiveLoads++
+    }
+  })
+
+  expect(await runCli(["-p"], host)).toBe(1)
+  expect(runtimeCreates).toBe(0)
+  expect(interactiveLoads).toBe(0)
+  expect(output).toEqual([])
+  expect(errors).toEqual(["Headless mode requires a prompt or piped stdin\n"])
+})
+
+for (const [signal, exitCode] of [
+  ["SIGHUP", 129],
+  ["SIGTERM", 143]
+] as const) {
+  test(`${signal} aborts headless work, removes listeners, and disposes the session`, async () => {
+    const models = createModels()
+    const faux = fauxProvider()
+    models.setProvider(faux.provider)
+    const started = deferred<void>()
+    faux.setResponses([
+      async (_context, request) => {
+        started.resolve()
+        await new Promise<void>(resolve => request?.signal?.addEventListener("abort", () => resolve(), { once: true }))
+        return fauxAssistantMessage("partial", { stopReason: "aborted" })
+      }
+    ])
+    let runtime: AgentRuntime | undefined
+    const signals: TestSignalControl = { listener: undefined, removes: 0 }
+    const output: string[] = []
+    const errors: string[] = []
+    const host = testHost({
+      output,
+      errors,
+      signals,
+      async createRuntime(options) {
+        runtime = await createTestAgentRuntime({ ...options, models })
+        return runtime
+      }
+    })
+
+    const running = runCli(["-p", "--model", `${faux.getModel().provider}/${faux.getModel().id}`, "start"], host)
+    await started.promise
+    signals.listener?.(signal)
+
+    expect(await running).toBe(exitCode)
+    expect(output).toEqual([])
+    expect(errors).toEqual(["Request was aborted\n"])
+    expect(signals.listener).toBeUndefined()
+    expect(signals.removes).toBe(1)
+    expect(() => runtime?.session.prompt("disposed")).toThrow("AgentSession is disposed")
+  })
+}
+
+interface TestSignalControl {
+  listener: ((signal: CliSignal) => void) | undefined
+  removes: number
+}
+
+interface TestHostOptions {
+  readonly output: string[]
+  readonly errors: string[]
+  readonly createRuntime: CliHost["createRuntime"]
+  readonly runInteractive?: CliHost["runInteractive"]
+  readonly stdin?: string
+  readonly stdinIsTTY?: boolean
+  readonly stdoutIsTTY?: boolean
+  readonly signals?: TestSignalControl
+  readonly onReadStdin?: () => void
+}
+
+function userText(message: AgentMessage): string {
+  if (message.role !== "user") throw new Error("Expected user message")
+  return typeof message.content === "string"
+    ? message.content
+    : message.content
+        .filter(content => content.type === "text")
+        .map(content => content.text)
+        .join("")
+}
+
+function testHost(options: TestHostOptions): CliHost {
+  return {
+    stdinIsTTY: options.stdinIsTTY ?? true,
+    stdoutIsTTY: options.stdoutIsTTY ?? true,
+    async readStdin() {
+      options.onReadStdin?.()
+      return options.stdin
+    },
+    async writeStdout(chunk) {
+      options.output.push(chunk)
+    },
+    async writeStderr(chunk) {
+      options.errors.push(chunk)
+    },
+    createRuntime: options.createRuntime,
+    runInteractive: options.runInteractive ?? (async () => {}),
+    onSignal(listener: (signal: CliSignal) => void) {
+      if (options.signals) options.signals.listener = listener
+      return () => {
+        if (!options.signals) return
+        if (options.signals.listener === listener) options.signals.listener = undefined
+        options.signals.removes++
+      }
+    }
+  }
+}
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void
+  const promise = new Promise<T>(resolvePromise => {
+    resolve = resolvePromise
+  })
+  return { promise, resolve }
+}

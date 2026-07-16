@@ -12,21 +12,22 @@ import type { SettingsManager } from "./settings-manager.js"
 import { buildSystemPrompt } from "./system-prompt.js"
 
 export interface AgentSessionServices {
-  paths: OpenZiPaths
-  settingsManager: SettingsManager
-  credentialStore: FileCredentialStore
-  modelRegistry: ModelRegistry
-  resourceLoader: ResourceLoader
+  readonly paths: OpenZiPaths
+  readonly settingsManager: SettingsManager
+  readonly credentialStore: FileCredentialStore
+  readonly modelRegistry: ModelRegistry
+  readonly resourceLoader: ResourceLoader
 }
 
 export interface CreateAgentSessionOptions {
-  services: AgentSessionServices
-  sessionManager: SessionManager
-  model?: Model<Api>
-  apiKey?: string
-  tools: readonly AgentTool[]
+  readonly services: AgentSessionServices
+  readonly sessionManager: SessionManager
+  readonly model?: Model<Api>
+  readonly apiKey?: string
+  readonly tools: readonly AgentTool[]
 }
 
+/** Build one session from caller-owned services. The caller owns the returned session's disposal. */
 export async function createAgentSession(options: CreateAgentSessionOptions): Promise<AgentSession> {
   const { services, sessionManager, model } = options
   await services.resourceLoader.reload()

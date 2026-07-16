@@ -9,6 +9,32 @@ import {
   fauxProvider
 } from "@openzi/coding-agent/testing"
 
+test("initial CLI prompts run after interactive terminal ownership is established", async () => {
+  const setup = await createTestRenderer({ width: 40, height: 8, useThread: false })
+  const core = await import("@opentui/core")
+  await mock.module("@opentui/core", () => ({ ...core, createCliRenderer: async () => setup.renderer }))
+
+  const models = createModels()
+  const faux = fauxProvider()
+  models.setProvider(faux.provider)
+  faux.setResponses([fauxAssistantMessage("done")])
+  const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
+
+  try {
+    const { runTui } = await import("../../src/interactive/run.js")
+    const running = runTui({ session, initialMessages: ["start"] })
+    await waitUntil(() => faux.state.callCount === 1)
+    await session.waitForIdle()
+    expect(session.messages.filter(message => message.role === "user")).toHaveLength(1)
+    setup.mockInput.pressKey("d", { ctrl: true })
+    await running
+  } finally {
+    session.dispose()
+    if (!setup.renderer.isDestroyed) setup.renderer.destroy()
+    mock.restore()
+  }
+})
+
 test("interactive exit restores the terminal before settlement and discards queued work", async () => {
   const priorSighupListeners = new Set(process.listeners("SIGHUP"))
   const setup = await createTestRenderer({ width: 40, height: 8, useThread: false })
@@ -192,6 +218,15 @@ test("shutdown failure surfaces only after terminal resources are restored", asy
     mock.restore()
   }
 })
+
+async function waitUntil(predicate: () => boolean): Promise<void> {
+  for (let attempt = 0; attempt < 20; attempt++) {
+    if (predicate()) return
+    // oxlint-disable-next-line no-await-in-loop
+    await Promise.resolve()
+  }
+  throw new Error("Condition was not met")
+}
 
 async function rejection(promise: Promise<unknown>): Promise<Error> {
   try {

@@ -182,6 +182,8 @@ export function transitionInteractiveState(state: InteractiveState, event: Agent
     case "authentication_changed":
     case "model_changed":
     case "thinking_level_changed":
+    case "steering_mode_changed":
+    case "follow_up_mode_changed":
       promptRevision++
       break
     case "turn_start":

@@ -32,7 +32,7 @@ cli -> coding-agent
 
 - `coding-agent` never imports a frontend.
 - `tui` consumes coding-agent public APIs and owns terminal behavior and native interaction state.
-- `cli` dynamically loads the selected mode and reports its result.
+- `cli` owns argument/TTY mode resolution, bounded stdin, process output backpressure, signals, exit status, and final session disposal. It dynamically imports `tui` only after selecting interactive mode.
 - Future web clients consume `AgentSession`, concrete managers, or RPC; they do not inherit terminal interaction state.
 - There is no `shared`, `common`, universal mode facade, generic UI model, or event bus.
 - A new package requires an independently meaningful lifecycle or public use case.
@@ -66,7 +66,9 @@ createAgentRuntime(options)
           -> later: compaction, retry, extensions
 ```
 
-### `AgentSession`
+### `AgentRuntime` and `AgentSession`
+
+`createAgentRuntime()` is the high-level SDK constructor. It returns a readonly, frozen shell containing one `AgentSession` and its concrete path-owned services. `createAgentSession()` is the lower-level constructor for callers that already own those services and a `SessionManager`; it performs no global service discovery. In both cases, the creator owns final `session.dispose()`. Application modes consume caller-owned sessions and must not dispose them.
 
 `AgentSession` is the policy spine shared by application modes. It owns:
 
@@ -78,6 +80,8 @@ createAgentRuntime(options)
 - later, retry, compaction, branch, bash, and extension policy.
 
 It exposes Pi agent events plus session-level events. Application modes subscribe; they do not control the provider loop or persist messages themselves. Runtime creation may produce an unselected session when no provider is authenticated; the terminal still starts, while prompt admission gives `/login` then `/model` guidance until `setModel()` commits the selected transition.
+
+Queue-mode and thinking-level changes cross live and durable state through `AgentSession`, never through a frontend settings write. A mutation validates its global/project scope, persists it, derives the effective layered value, updates the Pi agent, and then publishes a change event. Failed persistence leaves live behavior unchanged; a project override can intentionally shadow a global write, which is reported by the requested/effective mutation result. Queue-mode changes remain admissible during a run and take effect at Pi's next queue-drain boundary; thinking changes retain the session's idle-only admission and model capability clamp.
 
 ### Paths, managers, and services
 
@@ -105,8 +109,8 @@ Tools belong in `coding-agent`. Each invocation owns cancellation, timeout, outp
 Modes are adapters over `AgentSession`, not one universal abstraction.
 
 - Terminal `InteractiveMode` lives in `packages/tui` because it owns OpenTUI resources and terminal semantics.
-- Future print mode belongs in `packages/coding-agent` and owns one-shot output policy.
-- Future JSON/RPC mode belongs in `packages/coding-agent` and owns its protocol.
+- Print mode lives in `packages/coding-agent`; it sequences bounded prompts over a caller-owned session and returns closed success/failure results without owning process or session lifetime. Text output writes only final assistant text. JSON output writes the session header and source-ordered session events as strict JSONL through a bounded single-writer queue.
+- Future RPC mode belongs in `packages/coding-agent` and owns its protocol.
 
 If terminal and web clients later duplicate concrete command or session-flow policy, that policy moves into `AgentSession` or a dedicated coding-agent owner. OpenZi does not anticipate that reuse with a forwarding facade.
 
@@ -131,7 +135,7 @@ AgentSession
 
 `InteractiveMode` owns the root renderable subtree, current session binding, session replacement, syntax-style lifetime, prompt-focus preservation, terminal disposal, `InteractiveCommands`, one immutable `InteractiveKeybindings`, and one `ExitGestureController`. Coding-agent owners supply command descriptors; `InteractiveCommands` assembles terminal completion and parses built-in invocations into closed intents. `InteractiveKeybindings` resolves terminal-native events into closed semantic prompt/transcript actions and exposes effective hints and conflict metadata without containing action callbacks. Exit arming, expiry, consumption, and requests stay behind the concrete gesture owner rather than three lifecycle callbacks. Internal prompt coordination remains direct and typed; Pi's string-channel event bus is an extension-to-extension API, not an internal UI decomposition mechanism.
 
-`InteractiveStore` owns the session subscription, generation, bounded transient tools, submissions, and Escape cancellation with queue restoration. `PromptStore` owns terminal feedback, retained images, typed command/model/authentication workflows, pending provider-prompt settlement, stale-session rejection, and one-shot composer edit requests. `PickerStack` owns nested model, provider, method, provider-option, and logout frames plus selection, suspended parent filters, and filtering of only the active frame. `PickerStackView` renders that frame below the always-mounted composer and owns no input. `TranscriptStore` owns follow/detached/unseen navigation. Durable messages, model, queues, credentials, persistence, and activity remain direct `AgentSession` reads.
+`InteractiveStore` owns the session subscription, generation, bounded transient tools, submissions, and Escape cancellation with queue restoration. `PromptStore` owns terminal feedback, retained images, typed command/model/authentication/settings workflows, pending provider-prompt settlement, stale-session rejection, and one-shot composer edit requests. `PickerStack` owns nested model, provider, method, provider-option, logout, settings-scope, setting, and value frames plus selection, suspended parent filters, and filtering of only the active frame. After a callsite's domain action succeeds, it applies a closed `stay | close | back | push | replace` picker resolution; the stack performs its transition and returns any composer edit instead of making callsites coordinate both resources manually. `PickerStackView` renders the active frame below the always-mounted composer and owns no input. `TranscriptStore` owns follow/detached/unseen navigation. Durable messages, model, queues, credentials, persistence, and activity remain direct `AgentSession` reads.
 
 Imperative components subscribe to readable Nano Stores and update only their owned renderables. `PromptView` coordinates the focused native input and semantic key precedence; `PromptFeedbackView` owns status/link renderables and one-shot browser requests; `QueuedInputsView` owns bounded queue layout. Durable transcript message renderables are appended rather than rebuilt, preserving native selection and detached scrolling. The composer textarea is the sole prompt/filter/authentication input and remains focused while picker frames change. Secret prompts switch that native textarea to `TextAttributes.HIDDEN`, disable selection, and clear it before provider continuation; secret values never enter Nano Store state, session events, or transcripts. Authentication URLs are bounded in coding-agent, rendered as styled OSC 8 links, and admitted to the mode-owned browser opener, which limits concurrent subprocesses, bounds settlement, and kills retained processes on disposal. Product chords are resolved by the mode-owned semantic keybindings; components apply closed actions to concrete native resources and stores. Textarea contents, cursor, focus, viewport, selection, and ordinary editing remain OpenTUI-owned.
 
