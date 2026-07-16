@@ -6,7 +6,7 @@ import { Authentication } from "./authentication.js"
 import type { FileCredentialStore } from "./credential-store.js"
 import type { ModelRegistry } from "./model-registry.js"
 import type { OpenZiPaths } from "./paths.js"
-import type { ResourceLoader } from "./resource-loader.js"
+import { createSessionResources, type ResourceLoader, type SessionResources } from "./resource-loader.js"
 import type { SessionManager } from "./session-manager.js"
 import type { SettingsManager } from "./settings-manager.js"
 import { buildSystemPrompt } from "./system-prompt.js"
@@ -25,12 +25,13 @@ export interface CreateAgentSessionOptions {
   readonly model?: Model<Api>
   readonly apiKey?: string
   readonly tools: readonly AgentTool[]
+  readonly resources?: SessionResources
 }
 
 /** Build one session from caller-owned services. The caller owns the returned session's disposal. */
 export async function createAgentSession(options: CreateAgentSessionOptions): Promise<AgentSession> {
   const { services, sessionManager, model } = options
-  await services.resourceLoader.reload()
+  const resources = options.resources ? createSessionResources(options.resources) : await services.resourceLoader.load()
   const settings = services.settingsManager.get()
   const thinkingLevel = model ? clampThinkingLevel(model, settings.thinkingLevel) : "off"
   const existing = sessionManager.entries().length > 0
@@ -38,7 +39,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions): Pr
 
   const agent = new Agent({
     initialState: {
-      systemPrompt: buildSystemPrompt(services.paths.cwd, services.resourceLoader.get()),
+      systemPrompt: buildSystemPrompt(sessionManager.header.cwd, resources, options.tools),
       ...(model ? { model } : {}),
       thinkingLevel,
       tools: [...options.tools],
@@ -68,6 +69,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions): Pr
     settingsManager: services.settingsManager,
     authentication: new Authentication(services.modelRegistry.models, services.credentialStore),
     modelRegistry: services.modelRegistry,
+    resources,
     ...(model ? { model } : {}),
     ...(options.apiKey && model ? { apiKeyProvider: model.provider } : {})
   })

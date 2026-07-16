@@ -5,7 +5,7 @@ import {
   maxPickerDepth,
   maxPickerRows,
   maxSuspendedFilterLength
-} from "../../src/interactive/stores/picker-stack.js"
+} from "../../src/interactive/prompt/picker.js"
 
 test("picker stack filters only its top frame and restores suspended parent filters", () => {
   const stack = createPickerStack()
@@ -65,25 +65,6 @@ test("picker stack filters only its top frame and restores suspended parent filt
   }
 })
 
-test("picker resolutions give callsites explicit stack and composer effects", () => {
-  const stack = createPickerStack()
-
-  try {
-    stack.open(boundedFrame("root"))
-    expect(stack.resolve({ type: "push", frame: boundedFrame("child"), parentFilter: "root filter" })).toEqual({
-      type: "replace_input",
-      text: ""
-    })
-    expect(stack.presentation("")?.frame.id).toBe("child")
-    expect(stack.resolve({ type: "back" })).toEqual({ type: "replace_input", text: "root filter" })
-    expect(stack.presentation("root filter")?.frame.id).toBe("root")
-    expect(stack.resolve({ type: "close" })).toEqual({ type: "replace_input", text: "" })
-    expect(stack.presentation("")).toBeUndefined()
-  } finally {
-    stack.dispose()
-  }
-})
-
 test("picker stack rejects unbounded and forbidden transitions", () => {
   const stack = createPickerStack()
 
@@ -120,9 +101,9 @@ test("picker stack wraps top-frame selection without owning the filter input", (
       ]
     })
     stack.move("", -1)
-    expect(stack.selected("")?.id).toBe("target")
+    expect(stack.presentation("")?.selectedId).toBe("target")
     stack.queryChanged("curr")
-    expect(stack.selected("curr")?.id).toBe("current")
+    expect(stack.presentation("curr")?.selectedId).toBe("current")
   } finally {
     stack.dispose()
   }

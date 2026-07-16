@@ -3,7 +3,7 @@ import { expect, test } from "bun:test"
 import { BoxRenderable } from "@opentui/core"
 import { createTestRenderer } from "@opentui/core/testing"
 
-import { createCommandToolBlock, createToolBlock } from "../../src/interactive/components/tool-block.js"
+import { createCommandToolBlock, createToolBlock } from "../../src/interactive/transcript/tool-view.js"
 import { defaultTheme } from "../../src/theme.js"
 
 test("tool block owns title, rail, and body styling", async () => {

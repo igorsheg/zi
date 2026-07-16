@@ -23,8 +23,14 @@ import type {
 } from "./authentication.js"
 import type { StoredCredential } from "./credential-store.js"
 import type { ModelRegistry } from "./model-registry.js"
+import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.js"
+import type { ResourceDiagnostic } from "./resource-diagnostics.js"
+import type { SessionResources } from "./resource-loader.js"
 import type { SessionEntry, SessionManager } from "./session-manager.js"
 import type { SettingsManager, SettingsScope } from "./settings-manager.js"
+import { expandSkillCommand, type Skill } from "./skills.js"
+import type { SlashCommand } from "./slash-commands.js"
+import { buildSystemPrompt } from "./system-prompt.js"
 
 export const maxPendingInputCount = 32
 export const maxPendingInputBytes = 8 * 1024 * 1024
@@ -74,6 +80,16 @@ export interface PromptOptions {
   streamingBehavior?: PendingInputDelivery
 }
 
+/** Message byte counts are UTF-8 JSON sizes, not estimates of engine heap allocation. */
+export interface AgentSessionMemoryDiagnostics {
+  readonly committedMessages: number
+  readonly committedMessageBytes: number
+  readonly streamingMessageBytes: number
+  readonly queuedInputs: number
+  readonly queuedInputBytes: number
+  readonly subscribers: number
+}
+
 export interface QueueModeMutation {
   readonly scope: SettingsScope
   readonly requested: QueueMode
@@ -92,6 +108,7 @@ export interface AgentSessionConfig {
   settingsManager: SettingsManager
   authentication: Authentication
   modelRegistry: ModelRegistry
+  resources: SessionResources
   model?: Model<Api>
   apiKeyProvider?: string
 }
@@ -126,6 +143,11 @@ interface PendingInput {
   readonly message: AgentMessage
 }
 
+interface CommittedMessageMemory {
+  readonly count: number
+  readonly bytes: number
+}
+
 interface Settlement {
   readonly promise: Promise<void>
   resolve(): void
@@ -141,6 +163,7 @@ export class AgentSession {
   readonly #agent: Agent
   readonly #authentication: Authentication
   readonly #modelRegistry: ModelRegistry
+  readonly #resources: SessionResources
   readonly #apiKeyProvider: string | undefined
   readonly #listeners = new Set<(event: AgentSessionEvent) => void>()
   readonly #unsubscribeAgent: () => void
@@ -153,11 +176,13 @@ export class AgentSession {
   #modelMutation: ModelMutationState = { type: "none" }
   #modelState: SessionModelState
   #modelChoicesPromise: Promise<readonly ModelChoice[]> | undefined
+  #committedMessageMemory: CommittedMessageMemory | undefined
 
   constructor(config: AgentSessionConfig) {
     this.#agent = config.agent
     this.#authentication = config.authentication
     this.#modelRegistry = config.modelRegistry
+    this.#resources = config.resources
     this.#apiKeyProvider = config.apiKeyProvider
     this.sessionManager = config.sessionManager
     this.settingsManager = config.settingsManager
@@ -206,8 +231,50 @@ export class AgentSession {
     return this.#queueSnapshot()
   }
 
+  get memoryDiagnostics(): AgentSessionMemoryDiagnostics {
+    const messages = this.#agent.state.messages
+    if (!this.#committedMessageMemory || this.#committedMessageMemory.count !== messages.length) {
+      this.#committedMessageMemory = measureCommittedMessages(messages)
+    }
+    return {
+      committedMessages: this.#committedMessageMemory.count,
+      committedMessageBytes: this.#committedMessageMemory.bytes,
+      streamingMessageBytes: this.streamingMessage ? serializedMessageBytes(this.streamingMessage) : 0,
+      queuedInputs: this.#pending.length,
+      queuedInputBytes: this.#pendingBytes,
+      subscribers: this.#listeners.size
+    }
+  }
+
   get sessionId(): string {
     return this.sessionManager.sessionId
+  }
+
+  get resources(): SessionResources {
+    return this.#resources
+  }
+
+  get skills(): readonly Skill[] {
+    return this.#resources.skills
+  }
+
+  get promptTemplates(): readonly PromptTemplate[] {
+    return this.#resources.promptTemplates
+  }
+
+  get resourceDiagnostics(): readonly ResourceDiagnostic[] {
+    return this.#resources.diagnostics
+  }
+
+  listResourceCommands(): readonly SlashCommand[] {
+    return [
+      ...this.#resources.promptTemplates.map(template => ({
+        name: template.name,
+        description: template.description,
+        ...(template.argumentHint ? { argumentHint: template.argumentHint } : {})
+      })),
+      ...this.#resources.skills.map(skill => ({ name: `skill:${skill.name}`, description: skill.description }))
+    ]
   }
 
   listModelChoices(): Promise<readonly ModelChoice[]> {
@@ -277,11 +344,12 @@ export class AgentSession {
     if (!this.#authentication.isIdle) throw new Error("Cannot prompt while authentication is active")
     switch (this.#activity.type) {
       case "idle": {
+        const expandedText = this.#expandResourceInput(text)
         this.#modelMutation = { type: "none" }
         const runId = ++this.#nextRunId
         const settlement = createSettlement()
         this.#activity = { type: "running", runId, settled: settlement.promise }
-        void this.#drive(runId, text, options.images, settlement)
+        void this.#drive(runId, expandedText, options.images, settlement)
         return settlement.promise
       }
       case "running":
@@ -484,7 +552,10 @@ export class AgentSession {
 
   setActiveTools(tools: readonly AgentTool[]): void {
     this.#assertIdle("change tools")
-    this.#agent.state.tools = [...tools]
+    const activeTools = [...tools]
+    const systemPrompt = buildSystemPrompt(this.sessionManager.header.cwd, this.#resources, activeTools)
+    this.#agent.state.tools = activeTools
+    this.#agent.state.systemPrompt = systemPrompt
   }
 
   dispose(): void {
@@ -544,18 +615,19 @@ export class AgentSession {
 
   #enqueue(delivery: PendingInputDelivery, text: string, images: ImageContent[] | undefined): void {
     const runId = this.#queueRunId()
+    const expandedText = this.#expandResourceInput(text)
     const retainedImages = (images ?? []).map(cloneImage)
-    const bytes = retainedBytes(text, retainedImages)
+    const bytes = retainedBytes(expandedText, retainedImages)
     if (this.#pending.length === maxPendingInputCount || this.#pendingBytes + bytes > maxPendingInputBytes) {
       throw new QueueCapacityError()
     }
 
-    const message = userMessage(text, retainedImages)
+    const message = userMessage(expandedText, retainedImages)
     const entry: PendingInput = {
       id: ++this.#nextEntryId,
       runId,
       delivery,
-      text,
+      text: expandedText,
       images: retainedImages,
       bytes,
       message
@@ -565,6 +637,10 @@ export class AgentSession {
     if (delivery === "steer") this.#agent.steer(message)
     else this.#agent.followUp(message)
     this.#emitQueue()
+  }
+
+  #expandResourceInput(text: string): string {
+    return expandPromptTemplate(expandSkillCommand(text, this.#resources.skills), this.#resources.promptTemplates)
   }
 
   #queueRunId(): number {
@@ -588,11 +664,23 @@ export class AgentSession {
   async #handleAgentEvent(event: AgentEvent): Promise<void> {
     if (event.type === "message_start" && event.message.role === "user") this.#removeDelivered(event.message)
     if (event.type === "message_end") {
+      this.#recordCommittedMessage(event.message)
       const id = this.sessionManager.appendMessage(event.message)
       const entry = this.sessionManager.entries().find(candidate => candidate.id === id)
       if (entry) this.#emit({ type: "entry_appended", entry })
     }
     this.#emit(event)
+  }
+
+  #recordCommittedMessage(message: AgentMessage): void {
+    const memory = this.#committedMessageMemory
+    if (!memory) return
+    const messages = this.#agent.state.messages
+    if (messages.length !== memory.count + 1 || messages.at(-1) !== message) {
+      this.#committedMessageMemory = undefined
+      return
+    }
+    this.#committedMessageMemory = { count: messages.length, bytes: memory.bytes + serializedMessageBytes(message) }
   }
 
   #removeDelivered(message: AgentMessage): void {
@@ -698,6 +786,16 @@ function userMessage(text: string, images: readonly ImageContent[]): AgentMessag
 
 function cloneImage(image: ImageContent): ImageContent {
   return { type: "image", data: image.data, mimeType: image.mimeType }
+}
+
+function measureCommittedMessages(messages: readonly AgentMessage[]): CommittedMessageMemory {
+  let bytes = 0
+  for (const message of messages) bytes += serializedMessageBytes(message)
+  return { count: messages.length, bytes }
+}
+
+function serializedMessageBytes(message: AgentMessage): number {
+  return Buffer.byteLength(JSON.stringify(message))
 }
 
 function retainedBytes(text: string, images: readonly ImageContent[]): number {

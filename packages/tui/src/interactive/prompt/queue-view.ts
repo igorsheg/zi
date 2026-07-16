@@ -1,9 +1,9 @@
 import { BoxRenderable, type CliRenderer, TextRenderable } from "@opentui/core"
 import type { QueuedInputs } from "@openzi/coding-agent"
 
+import { truncateToCells } from "../../components/cell-text.js"
 import type { Theme } from "../../theme.js"
 import type { InteractiveKeybindings } from "../interactive-keybindings.js"
-import { truncateToCells } from "./cell-text.js"
 
 export class QueuedInputsView {
   readonly root: BoxRenderable

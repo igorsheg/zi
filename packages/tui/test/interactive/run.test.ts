@@ -1,6 +1,6 @@
 import { expect, mock, test } from "bun:test"
 
-import { TextareaRenderable } from "@opentui/core"
+import { type CliRendererConfig, TextareaRenderable } from "@opentui/core"
 import { createTestRenderer } from "@opentui/core/testing"
 import {
   createModels,
@@ -180,6 +180,57 @@ test("external renderer destruction joins normal terminal cleanup", async () => 
     expect(titles).toEqual(["openzi", ""])
     expect(disposals).toBe(0)
   } finally {
+    session.dispose()
+    if (!setup.renderer.isDestroyed) setup.renderer.destroy()
+    mock.restore()
+  }
+})
+
+test("development diagnostics are admitted from runtime flags", async () => {
+  const previousTtfd = process.env.OPENZI_SHOW_TTFD
+  const previousStats = process.env.OPENZI_TUI_STATS
+  const previousMemory = process.env.OPENZI_TUI_MEMORY
+  process.env.OPENZI_SHOW_TTFD = "1"
+  process.env.OPENZI_TUI_STATS = "1"
+  process.env.OPENZI_TUI_MEMORY = "1"
+
+  const setup = await createTestRenderer({ width: 52, height: 10, useThread: false })
+  const core = await import("@opentui/core")
+  let config: CliRendererConfig | undefined
+  await mock.module("@opentui/core", () => ({
+    ...core,
+    createCliRenderer: async (options?: CliRendererConfig) => {
+      config = options
+      setup.renderer.setGatherStats(options?.gatherStats ?? false)
+      return setup.renderer
+    }
+  }))
+
+  const models = createModels()
+  const faux = fauxProvider()
+  models.setProvider(faux.provider)
+  const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
+
+  try {
+    const { runTui } = await import("../../src/interactive/run.js")
+    const running = runTui({ session })
+    await setup.renderOnce()
+
+    expect(config).toMatchObject({ gatherStats: true, maxStatSamples: 300 })
+    expect(setup.renderer.debugOverlay.enabled).toBe(true)
+    expect(setup.renderer.root.findDescendantById("tui-time-to-first-draw")).toBeDefined()
+    expect(setup.renderer.root.findDescendantById("tui-performance-stats")).toBeDefined()
+    expect(setup.renderer.root.findDescendantById("tui-memory-stats")).toBeDefined()
+
+    setup.mockInput.pressKey("d", { ctrl: true })
+    await running
+  } finally {
+    if (previousTtfd === undefined) delete process.env.OPENZI_SHOW_TTFD
+    else process.env.OPENZI_SHOW_TTFD = previousTtfd
+    if (previousStats === undefined) delete process.env.OPENZI_TUI_STATS
+    else process.env.OPENZI_TUI_STATS = previousStats
+    if (previousMemory === undefined) delete process.env.OPENZI_TUI_MEMORY
+    else process.env.OPENZI_TUI_MEMORY = previousMemory
     session.dispose()
     if (!setup.renderer.isDestroyed) setup.renderer.destroy()
     mock.restore()

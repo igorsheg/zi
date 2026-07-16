@@ -6,15 +6,16 @@ import { join } from "node:path"
 
 import {
   createAgentSession,
+  createSessionResources,
   FileCredentialStore,
   ModelRegistry,
   OpenZiPaths,
+  ResourceLoader,
   SessionManager,
   SettingsManager,
   type AgentRuntime,
   type AgentSession,
-  type AgentSessionServices,
-  type ResourceLoader
+  type AgentSessionServices
 } from "../src/index.js"
 import { createModels, createTestAgentRuntime, fauxAssistantMessage, fauxProvider } from "../src/testing.js"
 
@@ -44,6 +45,51 @@ test("the high-level runtime is a frozen caller-owned SDK shell", async () => {
   expect(() => runtime.session.prompt("disposed")).toThrow("AgentSession is disposed")
 })
 
+test("session memory diagnostics account for owned messages, queues, and subscribers", async () => {
+  const models = createModels()
+  const faux = fauxProvider()
+  models.setProvider(faux.provider)
+  faux.setResponses([fauxAssistantMessage("measured response")])
+  const { session } = await createTestAgentRuntime({ cwd: "/work", models, persist: false })
+
+  try {
+    expect(session.memoryDiagnostics).toEqual({
+      committedMessages: 0,
+      committedMessageBytes: 0,
+      streamingMessageBytes: 0,
+      queuedInputs: 0,
+      queuedInputBytes: 0,
+      subscribers: 0
+    })
+
+    const unsubscribe = session.subscribe(() => {})
+    session.followUp("queued input")
+    expect(session.memoryDiagnostics).toMatchObject({
+      queuedInputs: 1,
+      queuedInputBytes: Buffer.byteLength("queued input"),
+      subscribers: 1
+    })
+    session.takeQueuedInputs()
+    unsubscribe()
+
+    await session.prompt("measure this")
+    const expectedBytes = session.messages.reduce(
+      (bytes, message) => bytes + Buffer.byteLength(JSON.stringify(message)),
+      0
+    )
+    expect(session.memoryDiagnostics).toEqual({
+      committedMessages: 2,
+      committedMessageBytes: expectedBytes,
+      streamingMessageBytes: 0,
+      queuedInputs: 0,
+      queuedInputBytes: 0,
+      subscribers: 0
+    })
+  } finally {
+    session.dispose()
+  }
+})
+
 test("a consumer can return without disposing its caller-owned session", async () => {
   const models = createModels()
   const faux = fauxProvider()
@@ -70,22 +116,19 @@ test("caller-supplied services keep a low-level session in memory", async () => 
   const faux = fauxProvider()
   models.setProvider(faux.provider)
   faux.setResponses([fauxAssistantMessage("memory only")])
-  const resourceLoader: ResourceLoader = {
-    async reload() {},
-    get: () => ({ appendSystemPrompt: [], contextFiles: [] })
-  }
   const services: AgentSessionServices = Object.freeze({
     paths,
     settingsManager: new SettingsManager(),
     credentialStore: new FileCredentialStore(paths),
     modelRegistry: new ModelRegistry(models),
-    resourceLoader
+    resourceLoader: new ResourceLoader({ paths })
   })
   const session = await createAgentSession({
     services,
     sessionManager: SessionManager.inMemory(cwd),
     model: faux.getModel(),
-    tools: []
+    tools: [],
+    resources: createSessionResources()
   })
 
   try {

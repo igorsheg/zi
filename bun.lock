@@ -34,7 +34,9 @@
       "dependencies": {
         "@earendil-works/pi-agent-core": "catalog:",
         "@earendil-works/pi-ai": "catalog:",
+        "ignore": "7.0.5",
         "proper-lockfile": "4.1.2",
+        "yaml": "2.9.0",
       },
       "devDependencies": {
         "@types/bun": "catalog:",

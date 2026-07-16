@@ -76,12 +76,12 @@ The target is coding-agent architecture parity and observable product-behavior p
 
 ### P1 path and settings evidence
 
-- `packages/coding-agent/test/paths.test.ts` fixes the `$HOME/.openzi` global root, exact `<cwd>/.openzi` project root, resource paths, canonical cwd session partition, and cwd-relative custom session directories.
+- `packages/coding-agent/test/paths.test.ts` fixes the `$HOME/.openzi/agent` global root, exact `<cwd>/.openzi` project root, resource paths, canonical cwd session partition, and cwd-relative custom session directories.
 - `packages/coding-agent/test/settings-manager.test.ts` fixes defaults < valid global < valid project < runtime precedence, explicit malformed-scope diagnostics and recovery, write refusal for invalid data, bounded input/output, shared-file handling, and scoped locked writes that preserve unknown fields.
 - `packages/tui/test/interactive/settings.test.ts` drives `/settings` completion, explicit scope selection, inherited/shadowed values, model-supported thinking levels, queue-mode persistence, nested Escape restoration, and invalid-file refusal through real OpenTUI. `packages/tui/test/interactive/prompt-store.test.ts` fixes operation/session identity independently of rendering.
 - `packages/coding-agent/test/credential-store.test.ts` fixes global-only credential persistence, redacted listing, bounded input/output and provider count, no-overwrite failures, and proves the default Pi AI model registry consumes the same path-owned `auth.json`.
 - `packages/coding-agent/test/runtime-paths.test.ts` proves settings and default sessions share the effective cwd, including when an explicit session header replaces the invocation cwd, and proves runtime model factories consume the exact credential owner exposed by services.
-- The policy is characterized from Pi's `config.ts`, path utilities, settings manager, auth storage, resource loader, session manager, and session-service construction at the pinned commit. OpenZi deliberately maps the global root directly to `$HOME/.openzi` rather than retaining Pi's additional `agent/` segment; see ADR 0011.
+- The policy is characterized from Pi's `config.ts`, path utilities, settings manager, auth storage, resource loader, session manager, and session-service construction at the pinned commit. OpenZi retains Pi's user-wide product/agent boundary at `$HOME/.openzi/agent`; see ADR 0011.
 
 ### P1 headless-mode evidence
 
@@ -99,8 +99,8 @@ The target is coding-agent architecture parity and observable product-behavior p
 ## P2 — resource and provider parity
 
 - [x] `AGENTS.md`/instruction discovery
-- [ ] Skills
-- [ ] Prompt templates
+- [x] Skills (core global/project resources)
+- [x] Prompt templates (core global/project resources)
 - [ ] Images and clipboard input
 - [x] OAuth provider flows
 - [ ] Custom models/providers
@@ -108,9 +108,12 @@ The target is coding-agent architecture parity and observable product-behavior p
 - [ ] Export
 - [ ] Shell aliases and platform-specific behavior
 
-### P2 instruction-discovery evidence
+### P2 session-resource evidence
 
-- `packages/coding-agent/test/resource-loader.test.ts` fixes global instructions followed by root-to-cwd `AGENTS.md`/`CLAUDE.md`, plus project `.openzi/SYSTEM.md` and `.openzi/APPEND_SYSTEM.md` precedence over global files.
+- Behavior is characterized from Pi `0e6909f0` in `core/resource-loader.ts`, `core/skills.ts`, `core/prompt-templates.ts`, `core/system-prompt.ts`, and `core/agent-session.ts`.
+- `packages/coding-agent/test/resource-loader.test.ts` fixes global instructions followed by root-to-cwd `AGENTS.md`/`CLAUDE.md`, project system-prompt precedence, project-over-global skill/template collisions, canonical deduplication, recursive `SKILL.md` discovery, root skill files, skill and prompt ignore rules, non-recursive prompt discovery, invalid-resource fallback, diagnostics, and bounds.
+- `packages/coding-agent/test/skills.test.ts`, `prompt-templates.test.ts`, and `session-resources.test.ts` fix progressive skill disclosure, fresh bounded explicit invocation, Pi-compatible template arguments, immutable snapshot ownership, system-prompt composition, and expansion before session admission.
+- `packages/tui/test/interactive/interactive-commands.test.ts` fixes mode-owned aggregation of built-ins with the current session's prompt and skill commands, including built-in precedence and session replacement.
 - Project `.openzi` resolution is exact to the effective cwd; ancestor traversal applies only to instruction files, matching Pi's distinction between project configuration and contextual instructions.
 
 ## P3 — extension platform
@@ -139,5 +142,7 @@ For each capability:
 - Pi's coding-agent owner boundaries are the reference; incidental helpers and framework-specific mechanics are not copied blindly.
 - Below-composer selectors keep OpenZi's composer mounted as the sole focused input and render a nested picker stack beneath it; Pi's selectors may create their own search input.
 - Steering and follow-up queues deliberately diverge from Pi's unbounded queues: OpenZi admits at most 32 pending entries and 8 MiB of aggregate retained UTF-8 payload, with no eviction or deduplication.
-- Unbounded output, subprocesses, logs, or retries are rejected even if an upstream path currently permits them.
+- Unbounded output, subprocesses, logs, retries, or resource discovery are rejected even if an upstream path currently permits them.
+- Core skill and prompt discovery currently covers `$HOME/.openzi/agent` and exact `<cwd>/.openzi` roots. Pi package resources, settings/CLI resource paths, `.agents/skills`, and project trust arrive with their owning capabilities rather than being partially recreated inside the core loader.
+- A known skill that disappears or becomes unreadable at explicit invocation rejects admission; OpenZi does not pass the stale `/skill:name` text through to the model as Pi currently does.
 - A Pi extension API is not promised until OpenZi has a stable owner boundary to expose.

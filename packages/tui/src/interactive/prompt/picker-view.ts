@@ -2,7 +2,7 @@ import { BoxRenderable, type CliRenderer, TextRenderable } from "@opentui/core"
 
 import { createPickerList, type PickerList } from "../../components/picker-list.js"
 import type { Theme } from "../../theme.js"
-import type { PickerStack } from "../stores/picker-stack.js"
+import type { PickerStack } from "./picker.js"
 
 export class PickerStackView {
   readonly root: BoxRenderable

@@ -22,7 +22,6 @@ interface PickerStack {
   replaceTop(frame: PickerFrame, filter: string): void
   queryChanged(filter: string): void
   move(filter: string, direction: -1 | 1): void
-  selected(filter: string): PickerStackRow | undefined
   presentation(filter: string): PickerPresentation | undefined
   back(): { type: "closed" } | { type: "revealed"; filter: string }
   close(): void

@@ -7,7 +7,7 @@ import {
   createInteractiveStore,
   initialInteractiveState,
   transitionInteractiveState
-} from "../../src/interactive/stores/interactive.js"
+} from "../../src/interactive/interactive-store.js"
 
 test("interactive store owns bounded transient tools", async () => {
   const session = await createSession("tools")
@@ -25,6 +25,16 @@ test("interactive store owns bounded transient tools", async () => {
     expect(state.promptRevision).toBe(0)
 
     state = transitionInteractiveState(state, {
+      type: "tool_execution_update",
+      toolCallId: "tool-64",
+      toolName: "bash",
+      args: { command: "pwd" },
+      partialResult: { content: [{ type: "text", text: "running" }] }
+    })
+    expect(state.tools.get("tool-64")).toMatchObject({ status: "running", result: { content: [{ text: "running" }] } })
+    expect(state.transcriptRevision).toBe(66)
+
+    state = transitionInteractiveState(state, {
       type: "tool_execution_end",
       toolCallId: "tool-64",
       toolName: "bash",
@@ -32,6 +42,7 @@ test("interactive store owns bounded transient tools", async () => {
       isError: true
     })
     expect(state.tools.get("tool-64")).toMatchObject({ status: "failed" })
+    expect(state.transcriptRevision).toBe(67)
 
     state = transitionInteractiveState(state, { type: "queue_update", steering: [], followUp: [] })
     expect(state.promptRevision).toBe(1)

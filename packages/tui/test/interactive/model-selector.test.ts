@@ -4,8 +4,8 @@ import { TextareaRenderable } from "@opentui/core"
 import { createModels, createTestAgentRuntime as createAgentRuntime, fauxProvider } from "@openzi/coding-agent/testing"
 
 import { createInteractiveCommands } from "../../src/interactive/interactive-commands.js"
-import { createInteractiveStore } from "../../src/interactive/stores/interactive.js"
-import { createPromptStore } from "../../src/interactive/stores/prompt.js"
+import { createInteractiveStore } from "../../src/interactive/interactive-store.js"
+import { createPromptStore } from "../../src/interactive/prompt/store.js"
 import { createInteractiveTest, renderSettled } from "./harness.js"
 
 test("slash completion admits /model through the prompt workflow", async () => {

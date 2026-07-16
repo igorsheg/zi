@@ -19,10 +19,10 @@ See [`docs/architecture.md`](docs/architecture.md), [`docs/tui-architecture.md`]
 
 ## Configuration paths
 
-OpenZi keeps global state directly in `$HOME/.openzi` and project-scoped configuration in the effective working directory's `.openzi/`:
+OpenZi keeps coding-agent global state in `$HOME/.openzi/agent` and project-scoped configuration in the effective working directory's `.openzi/`:
 
 ```text
-$HOME/.openzi/{settings.json,auth.json,sessions/,AGENTS.md,SYSTEM.md,...}
+$HOME/.openzi/agent/{settings.json,auth.json,sessions/,AGENTS.md,SYSTEM.md,...}
 <cwd>/.openzi/{settings.json,SYSTEM.md,APPEND_SYSTEM.md,...}
 ```
 

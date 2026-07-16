@@ -1,9 +1,9 @@
 import { BoxRenderable, type CliRenderer, link, t, TextRenderable } from "@opentui/core"
 
+import { truncateToCells } from "../../components/cell-text.js"
 import type { Theme } from "../../theme.js"
 import type { BrowserOpener } from "../browser-opener.js"
-import type { PromptFeedback } from "../stores/prompt.js"
-import { truncateToCells } from "./cell-text.js"
+import type { PromptFeedback } from "./state.js"
 
 export class PromptFeedbackView {
   readonly root: BoxRenderable

@@ -65,30 +65,35 @@ The mode is cohesive, not monolithic: stores split mutable families by invariant
 packages/tui/src/
   interactive/
     interactive-mode.ts
+    interactive-store.ts
     interactive-commands.ts
     interactive-keybindings.ts
-    model-selector.ts
+    screen.ts
     run.ts
-    stores/
-      interactive.ts
-      picker-stack.ts
-      prompt.ts
-      transcript.ts
-    components/
-      session-screen.ts
-      prompt.ts
-      picker-stack.ts
-      transcript.ts
-      message.ts
-      tool-block.ts
+    prompt/
+      state.ts
+      store.ts
+      view.ts
+      frames.ts
+      model-choices.ts
+      picker.ts
+      picker-view.ts
+      feedback-view.ts
+      queue-view.ts
+    transcript/
+      navigation.ts
+      view.ts
+      message-view.ts
+      tool-view.ts
   components/
+    cell-text.ts
     composer.ts
     picker-list.ts
   glyphs.ts
   theme.ts
 ```
 
-Root `components/` contains domain-free terminal mechanics. `interactive/components/` may render coding-agent types but does not own coding-agent policy.
+The `prompt/` and `transcript/` directories keep each terminal feature's state owner, renderables, and pure presentation builders together. Root `components/` contains mechanics with no coding-agent policy.
 
 Do not add a global store registry, generic action bus, universal frontend mode, or view-model corridor.
 
@@ -114,7 +119,7 @@ interface InteractiveStore {
 
 It retains a current session reference for identity and replacement but does not copy messages, model, queues, or persistence state. Session events update only terminal revisions and bounded transient tool presentation. Events from a replaced session are rejected.
 
-`InteractiveCommands` consumes command descriptors from coding-agent owners, supplies terminal completion candidates, and parses invocation strings into a closed built-in intent union. `InteractiveKeybindings` owns the closed terminal action catalog, default and effective keys, descriptions, override conflicts, display hints, and OpenTUI-event translation. It is immutable and contains no handlers. `PromptStore` never contains command syntax, descriptor metadata, or physical key policy. It delegates session operations through `InteractiveStore` and owns feedback, retained images, typed command/model workflows, bounded operation identity, and revisioned one-shot composer edit requests. Each async model operation captures its operation identity and session; cancellation, disposal, supersession, and session replacement reject stale completion.
+`InteractiveCommands` consumes command descriptors from coding-agent owners, supplies terminal completion candidates, and parses invocation strings into a closed built-in intent union. `InteractiveKeybindings` owns the closed terminal action catalog, default and effective keys, descriptions, override conflicts, display hints, and OpenTUI-event translation. It is immutable and contains no handlers. `PromptStore` never contains command syntax, descriptor metadata, or physical key policy. Its private controller keeps mutable resources as explicit fields, delegates session operations through `InteractiveStore`, and owns feedback, retained images, typed command/model/authentication/settings workflows, bounded operation identity, and revisioned one-shot composer edit requests. Active workflows carry the admitted session identity; input secrecy is derived from the authentication state rather than mirrored beside it. Cancellation, disposal, supersession, and session replacement reject stale completion.
 
 `PickerStack` owns open/closed state, ordered frames, selected rows, suspended parent filters, and filtering of only the top frame. The active filter is always passed from the native composer; it is not copied into the stack. Pushing captures the parent filter on the child frame, and popping returns it for restoration. `PickerStackView` renders only the top frame beneath the composer and owns no input. `TranscriptStore` owns the closed following/detached/unseen union; native scroll offsets and selection remain in OpenTUI.
 
@@ -141,7 +146,7 @@ The owner:
 4. installs native handlers explicitly;
 5. removes handlers and subscriptions before destroying its subtree.
 
-Durable transcript messages are appended without rebuilding existing renderables. Streaming and active-tool tails are replaced independently, preserving native selection and detached scroll anchors.
+Durable transcript messages are appended without rebuilding existing renderables. Streaming and active-tool tails are transient and reconcile independently of committed roots. The planned stable-tail reconciliation and bounded presentation window are specified in [TUI hot-path and scaling implementation spec](tui-performance-implementation-spec.md), together with performance evidence, the OpenTUI keymap adoption trigger, owner-driven loading rules, and the custom-renderable threshold.
 
 ## State placement
 
@@ -172,7 +177,7 @@ Global key handlers ask `InteractiveKeybindings` for a closed semantic action an
 
 Pi does not have one universal command registry. Built-in descriptors live in coding-agent's slash-command catalog, extension registrations live in `ExtensionRunner`, and prompt/skill commands live with session resources. Terminal `InteractiveMode` assembles those sources for completion and parses/dispatches terminal built-ins. Editor code owns completion mechanics only.
 
-OpenZi mirrors this ownership. Coding-agent owns `builtinSlashCommands`. Mode-owned `InteractiveCommands` assembles completion candidates and parses built-in text into closed intents. `PromptStore` turns those intents into picker frames and interprets selected row IDs. For `/model`, `AgentSession` owns catalog configuration and model mutation. `PickerStack` owns nested navigation and top-frame filtering; `PickerStackView` owns selector renderables; the composer remains the only input. `PromptView`, `Composer`, `PickerStackView`, and `PickerList` know neither command names nor invocation syntax. Async selector effects record operation identity and admit completion only when identity, session, and active workflow still match.
+OpenZi mirrors this ownership. Coding-agent owns `builtinSlashCommands`, while the current `AgentSession` derives prompt-template and `skill:<name>` descriptors from its immutable resources. Mode-owned `InteractiveCommands` reads that current session on demand, gives built-ins deterministic precedence, assembles completion candidates, and parses only built-in text into closed intents. Resource invocations remain raw until `AgentSession` expands them before admission. `PromptStore` turns built-in intents into picker frames and interprets selected row IDs; selecting a resource command edits the composer instead of dispatching domain work in the TUI. For `/model`, `AgentSession` owns catalog configuration and model mutation. `PickerStack` owns nested navigation and top-frame filtering; `PickerStackView` owns selector renderables; the composer remains the only input. `PromptView`, `Composer`, `PickerStackView`, and `PickerList` know neither command names nor invocation syntax. Async selector effects record operation identity and admit completion only when identity, session, and active workflow still match.
 
 ## Testing
 

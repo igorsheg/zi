@@ -41,17 +41,6 @@ export interface PickerPresentation {
 
 export type PickerBack = { readonly type: "closed" } | { readonly type: "revealed"; readonly filter: string }
 
-export type PickerResolution =
-  | { readonly type: "stay" }
-  | { readonly type: "close"; readonly text?: string }
-  | { readonly type: "back" }
-  | { readonly type: "push"; readonly frame: PickerFrame; readonly parentFilter: string; readonly text?: string }
-  | { readonly type: "replace"; readonly frame: PickerFrame; readonly filter: string }
-
-export type PickerResolutionEffect =
-  | { readonly type: "unchanged" }
-  | { readonly type: "replace_input"; readonly text: string }
-
 export interface PickerStack {
   readonly $state: ReadableAtom<PickerStackState>
   open(frame: PickerFrame): void
@@ -59,10 +48,7 @@ export interface PickerStack {
   replaceTop(frame: PickerFrame, filter: string): void
   queryChanged(filter: string): void
   move(filter: string, direction: -1 | 1): void
-  selected(filter: string): PickerStackRow | undefined
   presentation(filter: string): PickerPresentation | undefined
-  /** Apply the stack/composer effect chosen by a callsite after its domain action succeeds. */
-  resolve(resolution: PickerResolution): PickerResolutionEffect
   back(): PickerBack
   close(): void
   dispose(): void
@@ -163,35 +149,7 @@ export function createPickerStack(): PickerStack {
         return { ...frame, selectedIndex }
       })
     },
-    selected(filter) {
-      const currentPresentation = presentation(filter)
-      if (!currentPresentation) return undefined
-      return currentPresentation.rows.find(row => row.id === currentPresentation.selectedId)
-    },
     presentation,
-    resolve(resolution) {
-      switch (resolution.type) {
-        case "stay":
-          current()
-          return { type: "unchanged" }
-        case "close":
-          current()
-          $state.set({ type: "closed" })
-          return { type: "replace_input", text: resolution.text ?? "" }
-        case "back": {
-          const result = goBack()
-          return { type: "replace_input", text: result.type === "revealed" ? result.filter : "" }
-        }
-        case "push":
-          pushFrame(resolution.frame, resolution.parentFilter)
-          return { type: "replace_input", text: resolution.text ?? "" }
-        case "replace":
-          replaceFrame(resolution.frame, resolution.filter)
-          return { type: "replace_input", text: resolution.filter }
-        default:
-          return assertNever(resolution)
-      }
-    },
     back: goBack,
     close() {
       current()
@@ -264,10 +222,6 @@ function filteredRows(frame: PickerFrame, query: string): readonly PickerStackRo
 }
 
 // Ported from pi-tui fuzzy matching at the repository pin in docs/reference-pins.md.
-function assertNever(value: never): never {
-  throw new Error(`Unexpected picker resolution: ${String(value)}`)
-}
-
 function fuzzyMatch(query: string, text: string): { matches: boolean; score: number } {
   const queryLower = query.toLowerCase()
   const textLower = text.toLowerCase()

@@ -1,6 +1,9 @@
-import type { PromptResources } from "./resource-loader.js"
+import type { AgentTool } from "@earendil-works/pi-agent-core"
 
-export function buildSystemPrompt(cwd: string, resources: PromptResources): string {
+import type { SessionResources } from "./resource-loader.js"
+import { formatSkillsForPrompt } from "./skills.js"
+
+export function buildSystemPrompt(cwd: string, resources: SessionResources, tools: readonly AgentTool[]): string {
   const prompt =
     resources.systemPrompt ??
     `You are an expert coding assistant operating inside OpenZi.
@@ -25,6 +28,10 @@ Guidelines:
         .map(file => `<project_instructions path="${file.path}">\n${file.content}\n</project_instructions>`)
         .join("\n\n")}\n</project_context>`
     )
+  }
+  if (tools.some(tool => tool.name === "read")) {
+    const skills = formatSkillsForPrompt(resources.skills)
+    if (skills.length > 0) sections.push(skills)
   }
   sections.push(`Current date: ${new Date().toISOString().slice(0, 10)}\nCurrent working directory: ${cwd}`)
   return sections.join("\n\n")

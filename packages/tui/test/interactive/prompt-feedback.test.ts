@@ -2,7 +2,7 @@ import { expect, test } from "bun:test"
 
 import { createTestRenderer } from "@opentui/core/testing"
 
-import { PromptFeedbackView } from "../../src/interactive/components/prompt-feedback.js"
+import { PromptFeedbackView } from "../../src/interactive/prompt/feedback-view.js"
 import { defaultTheme } from "../../src/theme.js"
 
 test("prompt feedback opens each browser request once even when a later request repeats the URL", async () => {

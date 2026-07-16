@@ -7,10 +7,14 @@ const definitions = [
 
 export type BuiltinSlashCommandName = (typeof definitions)[number]["name"]
 
-export interface BuiltinSlashCommand {
-  readonly name: BuiltinSlashCommandName
+export interface SlashCommand {
+  readonly name: string
   readonly description: string
   readonly argumentHint?: string
+}
+
+export interface BuiltinSlashCommand extends SlashCommand {
+  readonly name: BuiltinSlashCommandName
 }
 
 export const builtinSlashCommands: readonly BuiltinSlashCommand[] = definitions

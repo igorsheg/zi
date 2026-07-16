@@ -3,8 +3,8 @@ import { join } from "node:path"
 
 import { getDefaultAgentDir, OpenZiPaths, resolveOpenZiPath } from "../src/paths.js"
 
-test("the default global directory is $HOME/.openzi", () => {
-  expect(getDefaultAgentDir("/home/alice")).toBe("/home/alice/.openzi")
+test("the default global directory is $HOME/.openzi/agent", () => {
+  expect(getDefaultAgentDir("/home/alice")).toBe("/home/alice/.openzi/agent")
 })
 
 test("path inputs expand home and resolve relative to their admitting owner", () => {
@@ -13,20 +13,20 @@ test("path inputs expand home and resolve relative to their admitting owner", ()
 })
 
 test("one cwd-bound policy resolves global, project, auth, resource, and session paths", () => {
-  const home = "/home/alice/.openzi"
+  const agentDir = "/home/alice/.openzi/agent"
   const cwd = "/work/project"
-  const paths = new OpenZiPaths(cwd, home)
+  const paths = new OpenZiPaths(cwd, agentDir)
 
   expect(paths.cwd).toBe(cwd)
-  expect(paths.globalDir).toBe(home)
+  expect(paths.globalDir).toBe(agentDir)
   expect(paths.projectDir).toBe(join(cwd, ".openzi"))
-  expect(paths.globalSettingsFile).toBe(join(home, "settings.json"))
+  expect(paths.globalSettingsFile).toBe(join(agentDir, "settings.json"))
   expect(paths.projectSettingsFile).toBe(join(cwd, ".openzi", "settings.json"))
-  expect(paths.authFile).toBe(join(home, "auth.json"))
-  expect(paths.globalSystemPromptFile).toBe(join(home, "SYSTEM.md"))
+  expect(paths.authFile).toBe(join(agentDir, "auth.json"))
+  expect(paths.globalSystemPromptFile).toBe(join(agentDir, "SYSTEM.md"))
   expect(paths.projectSystemPromptFile).toBe(join(cwd, ".openzi", "SYSTEM.md"))
-  expect(paths.globalResourceDir("skills")).toBe(join(home, "skills"))
+  expect(paths.globalResourceDir("skills")).toBe(join(agentDir, "skills"))
   expect(paths.projectResourceDir("skills")).toBe(join(cwd, ".openzi", "skills"))
-  expect(paths.sessionDir).toBe(join(home, "sessions", "--work-project--"))
-  expect(new OpenZiPaths(cwd, home, "local-sessions").sessionDir).toBe(join(cwd, "local-sessions"))
+  expect(paths.sessionDir).toBe(join(agentDir, "sessions", "--work-project--"))
+  expect(new OpenZiPaths(cwd, agentDir, "local-sessions").sessionDir).toBe(join(cwd, "local-sessions"))
 })

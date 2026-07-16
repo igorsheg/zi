@@ -6,7 +6,7 @@ import {
   transitionTranscriptNavigation,
   type TranscriptNavigation,
   type TranscriptNavigationEvent
-} from "../../src/interactive/stores/transcript.js"
+} from "../../src/interactive/transcript/navigation.js"
 
 const following: TranscriptNavigation = { type: "following" }
 const detachedSeen: TranscriptNavigation = { type: "detached", unseenOutput: false }

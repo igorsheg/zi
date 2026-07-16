@@ -1,17 +1,16 @@
 import type {
   AgentSession,
   AuthenticationMethod,
-  BuiltinSlashCommand,
   ModelChoice,
-  QueueMode,
+  SlashCommand,
   SettingsScope,
-  StoredCredential,
-  ThinkingLevel
+  StoredCredential
 } from "@openzi/coding-agent"
 
-import { glyphs } from "../glyphs.js"
-import { sameModel } from "./model-selector.js"
-import type { PickerFrame, PickerStackRow } from "./stores/picker-stack.js"
+import { glyphs } from "../../glyphs.js"
+import { sameModel } from "./model-choices.js"
+import type { PickerFrame, PickerStackRow } from "./picker.js"
+import type { EditableSetting, EditableSettingValue } from "./state.js"
 
 export const promptPickerFrameIds = {
   commands: "commands",
@@ -25,7 +24,7 @@ export const promptPickerFrameIds = {
   settingValues: "setting-values"
 } as const
 
-export function commandFrame(commands: readonly BuiltinSlashCommand[]): PickerFrame {
+export function commandFrame(commands: readonly SlashCommand[]): PickerFrame {
   return {
     id: promptPickerFrameIds.commands,
     title: "",
@@ -107,9 +106,6 @@ export function logoutFrame(credentials: readonly StoredCredential[]): PickerFra
     }))
   }
 }
-
-export type EditableSetting = "thinkingLevel" | "steeringMode" | "followUpMode"
-export type EditableSettingValue = ThinkingLevel | QueueMode
 
 export function settingsScopeFrame(): PickerFrame {
   return {

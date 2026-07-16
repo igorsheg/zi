@@ -37,6 +37,31 @@ test("the session app fills the terminal and protects the prompt", async () => {
   }
 })
 
+test("interactive memory diagnostics compose process, session, renderer, and listener ownership", async () => {
+  const models = createModels()
+  const faux = fauxProvider()
+  models.setProvider(faux.provider)
+  const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
+  const setup = await createInteractiveTest(session, { width: 40, height: 8 })
+
+  try {
+    await renderSettled(setup)
+    expect(setup.renderer.root.findDescendantById("tui-memory-stats")).toBeUndefined()
+    const snapshot = setup.mode.captureMemoryDiagnostics()
+    expect(snapshot.process.rssBytes).toBeGreaterThan(0)
+    expect(snapshot.process.heapUsedBytes).toBeGreaterThan(0)
+    expect(snapshot.session).toMatchObject({ committedMessages: 0, committedMessageBytes: 0, subscribers: 1 })
+    expect(snapshot.renderer.reachableRenderables).toBeGreaterThan(snapshot.renderer.transcriptRoots)
+    expect(snapshot.renderer.registeredRenderables).toBeGreaterThanOrEqual(snapshot.renderer.reachableRenderables)
+    expect(snapshot.renderer.bufferBytes).toBeGreaterThan(0)
+    expect(snapshot.listeners.renderer).toBeGreaterThan(0)
+    expect(snapshot.listeners.keyInput).toBeGreaterThan(0)
+  } finally {
+    session.dispose()
+    setup.destroy()
+  }
+})
+
 test("a second Ctrl+C within Pi's window exits the interactive mode", async () => {
   const models = createModels()
   const faux = fauxProvider()

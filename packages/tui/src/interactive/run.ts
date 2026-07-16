@@ -1,7 +1,8 @@
-import { CliRenderEvents, createCliRenderer, type CliRenderer } from "@opentui/core"
+import { CliRenderEvents, createCliRenderer, DebugOverlayCorner, type CliRenderer } from "@opentui/core"
 import type { AgentSession } from "@openzi/coding-agent"
 
 import { defaultTheme } from "../theme.js"
+import type { TuiDiagnosticFlags } from "./diagnostics.js"
 import type { InteractiveKeybindingOverrides } from "./interactive-keybindings.js"
 import { InteractiveMode } from "./interactive-mode.js"
 
@@ -22,9 +23,11 @@ type RunState =
 const shutdownTimeoutMs = 5_000
 
 export async function runTui({ session, initialMessages = [], keybindingOverrides }: RunTuiOptions): Promise<void> {
+  const diagnostics = readDiagnosticFlags(process.env)
   const renderer = await createCliRenderer({
     targetFps: 60,
-    gatherStats: false,
+    gatherStats: diagnostics.showStats,
+    maxStatSamples: 300,
     exitOnCtrlC: false,
     exitSignals: [],
     autoFocus: false,
@@ -35,6 +38,9 @@ export async function runTui({ session, initialMessages = [], keybindingOverride
     openConsoleOnError: false,
     backgroundColor: defaultTheme.surface.app
   })
+  if (diagnostics.showStats) {
+    renderer.configureDebugOverlay({ enabled: true, corner: DebugOverlayCorner.bottomRight })
+  }
   let mode: InteractiveMode | undefined
   let state: RunState = { type: "running" }
   let finish!: () => void
@@ -87,6 +93,7 @@ export async function runTui({ session, initialMessages = [], keybindingOverride
       renderer,
       session,
       onExit: () => void requestClose("interactive"),
+      diagnostics,
       ...(keybindingOverrides ? { keybindingOverrides } : {})
     })
     // Initial prompts share the interactive transcript and run after terminal ownership is established.
@@ -96,6 +103,14 @@ export async function runTui({ session, initialMessages = [], keybindingOverride
   } finally {
     for (const { signal, handler } of signalHandlers) process.off(signal, handler)
     await requestClose(mode ? "renderer" : "startup")
+  }
+}
+
+function readDiagnosticFlags(env: NodeJS.ProcessEnv): TuiDiagnosticFlags {
+  return {
+    showTimeToFirstDraw: env.OPENZI_SHOW_TTFD === "1",
+    showStats: env.OPENZI_TUI_STATS === "1",
+    showMemory: env.OPENZI_TUI_MEMORY === "1"
   }
 }
 

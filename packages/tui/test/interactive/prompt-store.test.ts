@@ -4,8 +4,8 @@ import type { AgentSession } from "@openzi/coding-agent"
 import { createModels, createTestAgentRuntime as createAgentRuntime, fauxProvider } from "@openzi/coding-agent/testing"
 
 import { createInteractiveCommands } from "../../src/interactive/interactive-commands.js"
-import { createInteractiveStore } from "../../src/interactive/stores/interactive.js"
-import { createPromptStore } from "../../src/interactive/stores/prompt.js"
+import { createInteractiveStore } from "../../src/interactive/interactive-store.js"
+import { createPromptStore } from "../../src/interactive/prompt/store.js"
 
 test("prompt store restores queued text, images, and status without a renderer", async () => {
   const session = await createSession("restore")
@@ -21,10 +21,28 @@ test("prompt store restores queued text, images, and status without a renderer",
       feedback: { type: "status", message: "Restored 1 queued message to editor with 1 image" },
       images: [{ type: "image", data: "aW1hZ2U=", mimeType: "image/png" }],
       workflow: { type: "idle" },
-      inputMode: "draft",
       inputEdit: { revision: 0, text: "" }
     })
     expect(session.queuedInputs.steering).toHaveLength(0)
+  } finally {
+    mode.dispose()
+    session.dispose()
+  }
+})
+
+test("resource command selection edits the composer without dispatching TUI domain work", async () => {
+  const session = await createSession("resource-command")
+  const mode = createInteractiveStore(session)
+  const commands = createInteractiveCommands(() => ({
+    listResourceCommands: () => [{ name: "review", description: "Review code", argumentHint: "<path>" }]
+  }))
+  const prompt = createPromptStore(mode, commands)
+
+  try {
+    prompt.draftChanged("/rev", 4)
+    expect(prompt.activatePicker("/rev", 4)).toBe(true)
+    expect(prompt.$state.get().inputEdit.text).toBe("/review ")
+    expect(session.messages).toEqual([])
   } finally {
     mode.dispose()
     session.dispose()

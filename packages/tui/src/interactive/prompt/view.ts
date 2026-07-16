@@ -13,18 +13,19 @@ import type { BrowserOpener } from "../browser-opener.js"
 import type { ExitGestureController } from "../exit-gesture.js"
 import type { InteractiveCommands } from "../interactive-commands.js"
 import type { InteractiveKeybindings, PromptKeyAction } from "../interactive-keybindings.js"
-import type { InteractiveStore } from "../stores/interactive.js"
-import { createPromptStore, type PromptStore, type PromptWorkflow } from "../stores/prompt.js"
-import { PickerStackView } from "./picker-stack.js"
-import { PromptFeedbackView } from "./prompt-feedback.js"
-import { QueuedInputsView } from "./queued-inputs.js"
+import type { InteractiveStore } from "../interactive-store.js"
+import { PromptFeedbackView } from "./feedback-view.js"
+import { PickerStackView } from "./picker-view.js"
+import { QueuedInputsView } from "./queue-view.js"
+import { promptInputIsSecret, type PromptWorkflow } from "./state.js"
+import { createPromptStore, type PromptStore } from "./store.js"
 
 export class PromptView {
   readonly root: BoxRenderable
   readonly input: Composer["input"]
 
   readonly #renderer: CliRenderer
-  readonly #mode: InteractiveStore
+  readonly #interactive: InteractiveStore
   readonly #keybindings: InteractiveKeybindings
   readonly #exitGestures: ExitGestureController
   readonly #store: PromptStore
@@ -38,7 +39,7 @@ export class PromptView {
 
   constructor(
     renderer: CliRenderer,
-    mode: InteractiveStore,
+    interactive: InteractiveStore,
     commands: InteractiveCommands,
     keybindings: InteractiveKeybindings,
     exitGestures: ExitGestureController,
@@ -46,10 +47,10 @@ export class PromptView {
     theme: Theme
   ) {
     this.#renderer = renderer
-    this.#mode = mode
+    this.#interactive = interactive
     this.#keybindings = keybindings
     this.#exitGestures = exitGestures
-    this.#store = createPromptStore(mode, commands)
+    this.#store = createPromptStore(interactive, commands)
     this.root = new BoxRenderable(renderer, { flexDirection: "column", flexShrink: 0 })
 
     this.#working = new BoxRenderable(renderer, { flexDirection: "row", flexShrink: 0 })
@@ -57,7 +58,7 @@ export class PromptView {
     this.#feedback = new PromptFeedbackView(renderer, browserOpener, theme)
     this.#queue = new QueuedInputsView(renderer, keybindings, theme)
 
-    const session = mode.getSession()
+    const session = interactive.getSession()
     const geometry = composerGeometry(renderer.width, renderer.height)
     this.#composer = createComposer(renderer, {
       geometry,
@@ -77,7 +78,7 @@ export class PromptView {
     this.root.add(this.#pickerStack.root)
 
     const update = () => this.#update()
-    this.#release.push(this.#store.$state.subscribe(update), mode.$promptRevision.subscribe(update))
+    this.#release.push(this.#store.$state.subscribe(update), interactive.$promptRevision.subscribe(update))
     renderer.keyInput.on("keypress", this.#onKeyPress)
     renderer.on(CliRenderEvents.RESIZE, update)
     this.#release.push(() => renderer.keyInput.off("keypress", this.#onKeyPress))
@@ -99,14 +100,14 @@ export class PromptView {
   }
 
   #update = (): void => {
-    const session = this.#mode.getSession()
+    const session = this.#interactive.getSession()
     const prompt = this.#store.$state.get()
     const geometry = composerGeometry(this.#renderer.width, this.#renderer.height)
     if (prompt.inputEdit.revision > this.#appliedInputRevision) {
       this.#appliedInputRevision = prompt.inputEdit.revision
       this.#replaceInput(prompt.inputEdit.text)
     }
-    const secretInput = prompt.inputMode === "auth_secret"
+    const secretInput = promptInputIsSecret(prompt.workflow)
     this.input.attributes = secretInput ? TextAttributes.HIDDEN : 0
     this.input.selectable = !secretInput
     if (secretInput) this.#renderer.clearSelection()
@@ -155,7 +156,7 @@ export class PromptView {
       }
     }
 
-    const session = this.#mode.getSession()
+    const session = this.#interactive.getSession()
     const action = this.#keybindings.promptAction(key, {
       pickerOpen: Boolean(this.#store.picker.presentation(this.input.plainText)),
       editorEmpty: this.input.plainText.length === 0,

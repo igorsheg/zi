@@ -1,4 +1,9 @@
-import { builtinSlashCommands, type BuiltinSlashCommand, type BuiltinSlashCommandName } from "@openzi/coding-agent"
+import {
+  builtinSlashCommands,
+  type AgentSession,
+  type BuiltinSlashCommandName,
+  type SlashCommand
+} from "@openzi/coding-agent"
 
 export type InteractiveCommand =
   | { readonly type: "model"; readonly search: string }
@@ -7,17 +12,28 @@ export type InteractiveCommand =
   | { readonly type: "settings" }
 
 export interface InteractiveCommands {
-  suggestions(text: string, cursorOffset: number): readonly BuiltinSlashCommand[]
-  completion(command: BuiltinSlashCommand): string
+  suggestions(text: string, cursorOffset: number): readonly SlashCommand[]
+  completion(command: SlashCommand): string
   parse(text: string): InteractiveCommand | undefined
 }
 
-export function createInteractiveCommands(): InteractiveCommands {
+export function createInteractiveCommands(
+  getSession?: () => Pick<AgentSession, "listResourceCommands">
+): InteractiveCommands {
+  const commands = (): readonly SlashCommand[] => {
+    const byName = new Map<string, SlashCommand>()
+    for (const command of builtinSlashCommands) byName.set(command.name, command)
+    for (const command of getSession?.().listResourceCommands() ?? []) {
+      if (!byName.has(command.name)) byName.set(command.name, command)
+    }
+    return [...byName.values()]
+  }
+
   return {
     suggestions(text, cursorOffset) {
       const query = slashCommandQuery(text, cursorOffset)
       if (query === undefined) return []
-      return builtinSlashCommands.filter(command => command.name.startsWith(query))
+      return commands().filter(command => command.name.startsWith(query))
     },
     completion(command) {
       return `/${command.name} `

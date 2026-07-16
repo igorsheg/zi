@@ -6,7 +6,7 @@ import { FileCredentialStore } from "./credential-store.js"
 import { ModelRegistry } from "./model-registry.js"
 import { resolveInitialModel } from "./model-resolver.js"
 import { getAgentDir, OpenZiPaths } from "./paths.js"
-import { DefaultResourceLoader } from "./resource-loader.js"
+import { ResourceLoader } from "./resource-loader.js"
 import { createAgentSession, type AgentSessionServices } from "./services.js"
 import { SessionManager } from "./session-manager.js"
 import { SettingsManager, type AgentSettings } from "./settings-manager.js"
@@ -52,7 +52,7 @@ export async function createAgentRuntime(options: CreateAgentRuntimeOptions): Pr
   const credentialStore = new FileCredentialStore(paths)
   const models = options.modelFactory?.(credentialStore) ?? builtinModels({ credentials: credentialStore })
   const modelRegistry = new ModelRegistry(models)
-  const resourceLoader = new DefaultResourceLoader({ paths })
+  const resourceLoader = new ResourceLoader({ paths })
   const services: AgentRuntimeServices = Object.freeze({
     paths,
     settingsManager,

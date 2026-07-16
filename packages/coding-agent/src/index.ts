@@ -8,11 +8,26 @@ export * from "./model-registry.js"
 export * from "./model-resolver.js"
 export * from "./paths.js"
 export * from "./print-mode.js"
+export { maxPromptTemplateCount, type PromptTemplate } from "./prompt-templates.js"
+export {
+  maxResourceDiagnostics,
+  type ResourceDiagnostic,
+  type ResourceKind,
+  type ResourceScope
+} from "./resource-diagnostics.js"
+export { maxResourceDirectoryEntries, maxResourceFileBytes } from "./resource-files.js"
 export * from "./resource-loader.js"
 export * from "./runtime.js"
 export * from "./services.js"
 export * from "./session-manager.js"
 export * from "./settings-manager.js"
+export {
+  maxSkillCount,
+  maxSkillDescriptionLength,
+  maxSkillDirectoryCount,
+  maxSkillNameLength,
+  type Skill
+} from "./skills.js"
 export * from "./slash-commands.js"
 export * from "./system-prompt.js"
 export * from "./tools/index.js"

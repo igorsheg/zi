@@ -9,8 +9,12 @@ The lower-level Pi agent loop that streams model output and executes tools. It i
 _Avoid_: Pi coding agent, runtime
 
 **Agent session**:
-One coding conversation and its policy: active model, prompt resources, tools, durable history, queueing, compaction, retries, and lifecycle.
+One coding conversation and its policy: active model, session resources, tools, durable history, queueing, compaction, retries, and lifecycle.
 _Avoid_: Chat, agent core
+
+**Session resources**:
+The cwd-bound prompt inputs active for one agent session: base and appended system prompts, contextual instruction files, skill descriptors, and prompt templates. Resource discovery finds candidates; the agent session owns the coherent catalog used by its conversation. Terminal themes and extension/package loading are separate capabilities.
+_Avoid_: Core resources, resource registry, frontend resources
 
 **Run interruption**:
 A request to stop active provider/tool work while keeping the `AgentSession` reusable. Escape cancellation returns pending queued input to the composer; lower-level interruption may preserve admitted queue work. Neither operation owns terminal teardown.
@@ -25,7 +29,7 @@ The process-scoped capabilities from which agent sessions are constructed, inclu
 _Avoid_: Globals, app context
 
 **OpenZi paths**:
-The immutable coding-agent policy value for one effective cwd. It resolves global `$HOME/.openzi`, exact project `<cwd>/.openzi`, credentials, scoped settings/resources, and cwd-partitioned sessions. A resumed session's stored cwd is admitted before this value and its cwd-bound services are constructed.
+The immutable coding-agent policy value for one effective cwd. It resolves global `$HOME/.openzi/agent`, exact project `<cwd>/.openzi`, credentials, scoped settings/resources, and cwd-partitioned sessions. A resumed session's stored cwd is admitted before this value and its cwd-bound services are constructed.
 _Avoid_: Path registry, config singleton, ambient cwd
 
 **Coding-agent parity**:

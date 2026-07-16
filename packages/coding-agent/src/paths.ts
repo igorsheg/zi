@@ -2,6 +2,7 @@ import { homedir } from "node:os"
 import { join, resolve } from "node:path"
 
 export const projectConfigDirName = ".openzi"
+export const globalAgentDirName = "agent"
 
 export type ResourceDirectory = "extensions" | "prompts" | "skills" | "themes"
 
@@ -52,7 +53,7 @@ export function resolveOpenZiPath(input: string, baseDir = process.cwd(), home =
 }
 
 export function getDefaultAgentDir(home = homedir()): string {
-  return resolveOpenZiPath(projectConfigDirName, home, home)
+  return resolveOpenZiPath(join(projectConfigDirName, globalAgentDirName), home, home)
 }
 
 export function getAgentDir(): string {
