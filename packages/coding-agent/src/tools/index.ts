@@ -1,6 +1,7 @@
 export * from "./bash.js"
 export * from "./edit.js"
 export * from "./read.js"
+export * from "./presentation.js"
 export * from "./shell-tasks.js"
 export * from "./truncate.js"
 export * from "./write.js"

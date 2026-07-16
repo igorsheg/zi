@@ -1,9 +1,9 @@
 import { expect, test } from "bun:test"
 
-import { BoxRenderable } from "@opentui/core"
+import { BoxRenderable, TextRenderable } from "@opentui/core"
 import { createTestRenderer } from "@opentui/core/testing"
 
-import { createCommandToolBlock, createToolBlock } from "../../src/interactive/transcript/tool-view.js"
+import { createCommandToolBlock, createToolBlock, ToolCallView } from "../../src/interactive/transcript/tool-view.js"
 import { defaultTheme } from "../../src/theme.js"
 
 test("tool block owns title, rail, and body styling", async () => {
@@ -75,6 +75,112 @@ test("generic tool blocks keep the head of bounded output", async () => {
     expect(frame).toContain("... (4 more lines)")
   } finally {
     block.destroyRecursively()
+    setup.renderer.destroy()
+  }
+})
+
+test("streamed write arguments truncate after visual wrapping and expand in place", async () => {
+  const setup = await createTestRenderer({ width: 24, height: 18, useThread: false })
+  const view = new ToolCallView(
+    setup.renderer,
+    {
+      id: "write-stream",
+      name: "write",
+      args: { path: "notes.txt", content: "x".repeat(10_000) },
+      status: "preparing"
+    },
+    defaultTheme,
+    "Ctrl+O"
+  )
+  setup.renderer.root.add(view.root)
+
+  try {
+    await setup.flush()
+    expect(setup.captureCharFrame()).toContain("… Ctrl+O to expand")
+    const root = view.root
+
+    expect(view.setExpanded(true)).toBe(true)
+    await setup.renderOnce()
+    expect(view.root).toBe(root)
+    expect(view.root.getChildrenCount()).toBeLessThanOrEqual(204)
+    expect(setup.captureCharFrame()).not.toContain("… Ctrl+O to expand")
+  } finally {
+    view.destroy()
+    setup.renderer.destroy()
+  }
+})
+
+test("collapsing a tool clears selection before destroying preview rows", async () => {
+  const setup = await createTestRenderer({ width: 24, height: 18, useThread: false })
+  const view = new ToolCallView(
+    setup.renderer,
+    {
+      id: "selected-preview",
+      name: "write",
+      args: { path: "notes.txt", content: "x".repeat(10_000) },
+      status: "preparing"
+    },
+    defaultTheme,
+    "Ctrl+O"
+  )
+  setup.renderer.root.add(view.root)
+
+  try {
+    view.setExpanded(true)
+    await setup.renderOnce()
+    const selected = view.root.getChildren().at(-2)
+    if (!(selected instanceof TextRenderable)) throw new Error("Expanded preview row not found")
+    setup.renderer.startSelection(selected, selected.x, selected.y)
+    expect(setup.renderer.hasSelection).toBe(true)
+
+    view.setExpanded(false)
+    expect(setup.renderer.hasSelection).toBe(false)
+  } finally {
+    view.destroy()
+    setup.renderer.destroy()
+  }
+})
+
+test("bash results render structured truncation and full-output notices once", async () => {
+  const setup = await createTestRenderer({ width: 60, height: 14, useThread: false })
+  const fullOutputPath = "/tmp/openzi/bash-output.log"
+  const view = new ToolCallView(
+    setup.renderer,
+    {
+      id: "bash-truncated",
+      name: "bash",
+      args: { command: "generate-output" },
+      status: "done",
+      result: {
+        content: [{ type: "text", text: `last line\n\n[Output truncated. Full output: ${fullOutputPath}]` }],
+        details: {
+          fullOutputPath,
+          truncation: {
+            content: "last line",
+            truncated: true,
+            truncatedBy: "lines",
+            totalLines: 2500,
+            totalBytes: 100000,
+            outputLines: 2000,
+            outputBytes: 50000,
+            firstLineExceedsLimit: false,
+            lastLinePartial: false
+          }
+        }
+      }
+    },
+    defaultTheme
+  )
+  setup.renderer.root.add(view.root)
+
+  try {
+    await setup.renderOnce()
+    const frame = setup.captureCharFrame()
+    expect(frame).toContain(`Full output: ${fullOutputPath}`)
+    expect(frame).toContain("showing the last 2000 of 2500 lines")
+    expect(frame.split(fullOutputPath)).toHaveLength(2)
+  } finally {
+    view.destroy()
     setup.renderer.destroy()
   }
 })

@@ -18,7 +18,7 @@ test("representative session keeps the accepted visual hierarchy at normal and c
   const models = createModels()
   const faux = fauxProvider()
   models.setProvider(faux.provider)
-  const bootstrap = await createAgentRuntime({ cwd: "/workspace/openzi", models, persist: false })
+  const bootstrap = await createAgentRuntime({ cwd: "/workspace/openzi", model: "faux/faux-1", models, persist: false })
   const model = bootstrap.session.model
   bootstrap.session.dispose()
   const sessionManager = SessionManager.inMemory("/workspace/openzi")

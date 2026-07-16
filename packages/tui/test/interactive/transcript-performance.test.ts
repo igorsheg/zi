@@ -1,9 +1,9 @@
-import { expect, test } from "bun:test"
+import { expect, spyOn, test } from "bun:test"
 
 import { CliRenderEvents, MarkdownRenderable, type Renderable, TextRenderable } from "@opentui/core"
 import { createTestRenderer, type TestRendererSetup } from "@opentui/core/testing"
 import type { AgentMessage } from "@openzi/coding-agent"
-import { fauxAssistantMessage } from "@openzi/coding-agent/testing"
+import { fauxAssistantMessage, fauxText, fauxToolCall } from "@openzi/coding-agent/testing"
 import { atom, type WritableAtom } from "nanostores"
 
 import { TuiDiagnosticsOverlay } from "../../src/interactive/diagnostics.js"
@@ -45,6 +45,25 @@ test("transcript notifications coalesce at one renderer lifecycle pass and destr
   }
 })
 
+test("a started user message promotes its native root when committed", async () => {
+  const message: AgentMessage = { role: "user", content: [{ type: "text", text: "Keep this root." }], timestamp: 1 }
+  const harness = await createTranscriptHarness([], { streamingMessage: message })
+  try {
+    await harness.setup.flush()
+    const root = harness.view.scroll.getChildren()[0]
+    if (!root) throw new Error("Streaming user root not found")
+
+    harness.state.messages.push(message)
+    harness.state.streamingMessage = undefined
+    harness.revision.set(1)
+    await harness.setup.flush()
+
+    expect(harness.view.scroll.getChildren()[0]).toBe(root)
+  } finally {
+    harness.destroy()
+  }
+})
+
 test("streaming assistant and markdown roots keep identity across deltas", async () => {
   const harness = await createTranscriptHarness([], { streamingMessage: fauxAssistantMessage("first") })
   try {
@@ -62,6 +81,227 @@ test("streaming assistant and markdown roots keep identity across deltas", async
     expect(markdown.content).toBe("first and second")
     expect(markdown.streaming).toBe(true)
     expect(harness.view.diagnostics).toMatchObject({ streamingCreates: 1, streamingUpdates: 1 })
+  } finally {
+    harness.destroy()
+  }
+})
+
+test("a streamed tool root keeps identity through argument, execution, and committed result phases", async () => {
+  const assistant = fauxAssistantMessage(
+    [
+      fauxText("Before the tool."),
+      fauxToolCall("bash", { command: "printf hello" }, { id: "bash-life" }),
+      fauxText("After the tool.")
+    ],
+    { stopReason: "toolUse" }
+  )
+  const preparing: ActiveTool = { id: "bash-life", name: "bash", args: { command: "printf hel" }, status: "preparing" }
+  const harness = await createTranscriptHarness([], {
+    streamingMessage: assistant,
+    tools: new Map([[preparing.id, preparing]])
+  })
+  try {
+    await harness.setup.flush()
+    const root = requiredRenderable(harness, "active-tool:bash-life")
+    const frame = harness.setup.captureCharFrame()
+    expect(frame.indexOf("Before the tool.")).toBeLessThan(frame.indexOf("$ printf hel"))
+    expect(frame.indexOf("$ printf hel")).toBeLessThan(frame.indexOf("After the tool."))
+
+    const ready: ActiveTool = { ...preparing, args: { command: "printf hello" }, status: "ready" }
+    harness.state.messages.push(assistant)
+    harness.state.streamingMessage = undefined
+    harness.tools.set(new Map([[ready.id, ready]]))
+    harness.revision.set(1)
+    await harness.setup.flush()
+    expect(requiredRenderable(harness, "active-tool:bash-life")).toBe(root)
+
+    const running: ActiveTool = { ...ready, status: "running", result: { content: [{ type: "text", text: "hel" }] } }
+    harness.tools.set(new Map([[running.id, running]]))
+    harness.revision.set(2)
+    await harness.setup.flush()
+    expect(requiredRenderable(harness, "active-tool:bash-life")).toBe(root)
+    expect(harness.setup.captureCharFrame()).toContain("hel")
+
+    harness.state.messages.push({
+      role: "toolResult",
+      toolCallId: "bash-life",
+      toolName: "bash",
+      content: [{ type: "text", text: "hello" }],
+      details: undefined,
+      isError: false,
+      timestamp: 2
+    })
+    harness.tools.set(new Map())
+    harness.revision.set(3)
+    await harness.setup.flush()
+
+    expect(requiredRenderable(harness, "active-tool:bash-life")).toBe(root)
+    expect(harness.setup.captureCharFrame()).toContain("hello")
+    expect(harness.view.diagnostics.activeToolDestroys).toBe(0)
+  } finally {
+    harness.destroy()
+  }
+})
+
+test("live eviction promotes a still-retained tool result out of its assistant root", async () => {
+  const assistant = fauxAssistantMessage(fauxToolCall("bash", { command: "printf kept" }, { id: "boundary" }), {
+    stopReason: "toolUse"
+  })
+  const result: AgentMessage = {
+    role: "toolResult",
+    toolCallId: "boundary",
+    toolName: "bash",
+    content: [{ type: "text", text: "kept result" }],
+    isError: false,
+    timestamp: 1
+  }
+  const messages = [assistant, result, ...userMessages(198, 2)]
+  const harness = await createTranscriptHarness(messages)
+  try {
+    await harness.setup.flush()
+    const root = requiredRenderable(harness, "active-tool:boundary")
+
+    harness.state.messages.push(...userMessages(1, 200))
+    harness.revision.set(1)
+    await harness.setup.flush()
+
+    expect(requiredRenderable(harness, "active-tool:boundary")).toBe(root)
+    expect(root.isDestroyed).toBe(false)
+    harness.view.scroll.scrollTo(0)
+    await harness.setup.renderOnce()
+    expect(harness.setup.captureCharFrame()).toContain("kept result")
+    expect(harness.view.diagnostics).toMatchObject({ projectedMessages: 200, omittedMessages: 1 })
+  } finally {
+    harness.destroy()
+  }
+})
+
+test("embedded tool views share one hard transcript projection bound", async () => {
+  const calls = Array.from({ length: 65 }, (_, index) =>
+    fauxToolCall("bash", { command: `echo ${index}` }, { id: `bounded-${index}` })
+  )
+  const assistant = fauxAssistantMessage(calls, { stopReason: "toolUse" })
+  const harness = await createTranscriptHarness([assistant], { height: 100 })
+  try {
+    await harness.setup.flush()
+
+    expect(harness.view.retainedToolCount).toBe(64)
+    expect(harness.setup.renderer.root.findDescendantById("active-tool:bounded-0")).toBeUndefined()
+    expect(requiredRenderable(harness, "active-tool:bounded-64")).toBeDefined()
+    harness.view.scroll.scrollTo(0)
+    await harness.setup.renderOnce()
+    expect(harness.setup.captureCharFrame()).toContain("1 tool invocation not rendered")
+  } finally {
+    harness.destroy()
+  }
+})
+
+test("visible running tools refresh elapsed time from the renderer lifecycle", async () => {
+  let now = 1_000
+  const nowSpy = spyOn(performance, "now").mockImplementation(() => now)
+  const tool: ActiveTool = { id: "elapsed", name: "bash", args: { command: "sleep 30" }, status: "running" }
+  const harness = await createTranscriptHarness([], { tools: new Map([[tool.id, tool]]) })
+  try {
+    await harness.setup.flush()
+    expect(harness.setup.captureCharFrame()).toContain("Elapsed 0.0s")
+
+    now = 2_300
+    await harness.setup.renderOnce()
+    expect(harness.setup.captureCharFrame()).toContain("Elapsed 1.3s")
+    expect(harness.setup.renderer.liveRequestCount).toBeGreaterThan(0)
+
+    const done: ActiveTool = { ...tool, status: "done", result: { content: [{ type: "text", text: "finished" }] } }
+    harness.tools.set(new Map([[done.id, done]]))
+    harness.revision.set(1)
+    await harness.setup.flush()
+    expect(harness.setup.captureCharFrame()).toContain("Took 1.3s")
+    expect(harness.setup.renderer.liveRequestCount).toBe(0)
+  } finally {
+    harness.destroy()
+    nowSpy.mockRestore()
+  }
+})
+
+test("transcript destruction releases a running elapsed live request", async () => {
+  const tool: ActiveTool = { id: "elapsed-dispose", name: "bash", args: { command: "sleep 30" }, status: "running" }
+  const harness = await createTranscriptHarness([], { tools: new Map([[tool.id, tool]]) })
+  try {
+    await harness.setup.flush()
+    expect(harness.setup.renderer.liveRequestCount).toBeGreaterThan(0)
+    harness.view.destroy()
+    expect(harness.setup.renderer.liveRequestCount).toBe(0)
+  } finally {
+    harness.destroy()
+  }
+})
+
+test("a coalesced agent end renders skipped sequential calls as aborted", async () => {
+  const assistant = fauxAssistantMessage(
+    [
+      fauxToolCall("bash", { command: "sleep 10" }, { id: "finished-first" }),
+      fauxToolCall("read", { path: "never-read.txt" }, { id: "skipped-second" })
+    ],
+    { stopReason: "toolUse" }
+  )
+  const result: AgentMessage = {
+    role: "toolResult",
+    toolCallId: "finished-first",
+    toolName: "bash",
+    content: [{ type: "text", text: "Operation aborted" }],
+    isError: true,
+    timestamp: 2
+  }
+  const skipped: ActiveTool = {
+    id: "skipped-second",
+    name: "read",
+    args: { path: "never-read.txt" },
+    status: "aborted",
+    result: { content: [{ type: "text", text: "Operation aborted" }] }
+  }
+  const harness = await createTranscriptHarness([assistant, result], { tools: new Map([[skipped.id, skipped]]) })
+  try {
+    await harness.setup.flush()
+    const frame = harness.setup.captureCharFrame()
+    expect(frame).toContain("read never-read.txt (aborted)")
+    expect(frame).not.toContain("read never-read.txt (preparing)")
+  } finally {
+    harness.destroy()
+  }
+})
+
+test("an aborted committed tool call remains terminal after transient state clears", async () => {
+  const message = fauxAssistantMessage(fauxToolCall("bash", { command: "sleep 10" }, { id: "bash-aborted" }), {
+    stopReason: "aborted"
+  })
+  const harness = await createTranscriptHarness([message])
+  try {
+    await harness.setup.flush()
+    const frame = harness.setup.captureCharFrame()
+    expect(frame).toContain("$ sleep 10 (aborted)")
+    expect(frame).toContain("Operation aborted")
+    expect(frame).not.toContain("preparing")
+  } finally {
+    harness.destroy()
+  }
+})
+
+test("the semantic tool binding expands bounded previews without replacing roots", async () => {
+  const tool: ActiveTool = {
+    id: "write-expand",
+    name: "write",
+    args: { path: "large.txt", content: "x".repeat(800) },
+    status: "preparing"
+  }
+  const harness = await createTranscriptHarness([], { width: 30, height: 20, tools: new Map([[tool.id, tool]]) })
+  try {
+    await harness.setup.flush()
+    const root = requiredRenderable(harness, "active-tool:write-expand")
+    expect(harness.setup.captureCharFrame()).toContain("Ctrl+O to expand")
+
+    harness.setup.mockInput.pressKey("o", { ctrl: true })
+    await harness.setup.flush()
+    expect(requiredRenderable(harness, "active-tool:write-expand")).toBe(root)
+    expect(harness.setup.captureCharFrame()).not.toContain("Ctrl+O to expand")
   } finally {
     harness.destroy()
   }

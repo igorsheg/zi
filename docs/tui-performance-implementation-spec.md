@@ -1,6 +1,6 @@
 # TUI hot-path and scaling implementation spec
 
-Status: proposed implementation plan
+Status: implemented baseline and active constraints
 
 This specification governs the next performance and scaling work in `packages/tui`. It applies the useful framework-independent patterns inspected in OpenCode's `v2` branch at `4678bd104` while preserving OpenZi's imperative `@opentui/core` architecture, Pi-compatible terminal behavior, and existing owner boundaries.
 
@@ -61,9 +61,9 @@ A transcript projection may retain message indexes, tool-call IDs, renderable re
 
 # 1. Transcript hot path
 
-## Current path
+## Replaced path
 
-Today the hot path is:
+The original hot path was:
 
 ```text
 AgentSession message/tool event
@@ -94,7 +94,8 @@ class TranscriptView {
   #committed: CommittedMessageView[]
   #pendingToolCalls: Map<string, ToolCallPresentation>
   #streaming: StreamingAssistantView | undefined
-  #activeTools: Map<string, ActiveToolView>
+  #toolViews: Map<string, ToolCallView>
+  #standaloneTools: Map<string, ToolCallView>
   #dirty: boolean
 }
 ```
@@ -105,9 +106,9 @@ The native child order remains:
 
 ```text
 optional omitted-history marker
-committed message roots
-optional streaming assistant root
-active tool roots in InteractiveStore order
+committed message roots, with source-ordered embedded tool roots
+optional streaming assistant root, with source-ordered embedded tool roots
+standalone fallback tool roots in InteractiveStore order
 ```
 
 ## Frame admission
@@ -163,32 +164,32 @@ Its `update(message)` operation:
 - updates or removes the error row independently;
 - never reconstructs the root merely because text grew.
 
-Tool-call parts remain invisible in the assistant message body and continue through active-tool presentation.
+Tool-call parts create keyed `ToolCallView` children at their source positions. The same child receives partial parsed arguments, ready/running state, partial output, and the committed tool result. A streaming assistant root is promoted only at the message index where that stream began, preventing a coalesced later stream from being attached to an earlier committed assistant message.
 
-When streaming ends, the transient view may be destroyed and the committed message may be built once. Promotion of the same root into committed content is optional and must not rely on undocumented object identity from `pi-agent-core`.
+When streaming ends, `TranscriptView` promotes the same root only when its recorded starting message index matches the committed assistant index. A coalesced newer stream can therefore never attach to an earlier message, and promotion does not depend on undocumented message object identity from `pi-agent-core`.
 
 If a future stream presents a non-assistant message, `TranscriptView` uses the existing static message builder and replaces that one transient root only when its role changes.
 
 ## Active tools
 
-Replace `createActiveToolView()`'s root-only result with a concrete handle:
+`ToolCallView` is the concrete keyed handle:
 
 ```ts
-interface ActiveToolView {
+interface ToolCallView {
   readonly root: BoxRenderable
-  update(tool: ActiveTool): void
+  readonly isRunning: boolean
+  update(tool: ActiveTool): boolean
+  refreshElapsed(): boolean
+  setExpanded(expanded: boolean): boolean
   destroy(): void
 }
 ```
 
-Reconciliation is keyed by `tool.id`:
+`InteractiveStore` owns bounded `preparing | ready | running | done | failed | aborted` transitions. `message_update` uses `assistantMessageEvent.contentIndex` to update only the changed tool-call arguments. `message_end` marks complete arguments ready, `tool_execution_update` applies partial results, and the later tool-result commit removes transient state. `agent_end` converts every remaining nonterminal invocation to aborted so sequential calls skipped after interruption cannot remain waiting.
 
-- create missing handles;
-- call `update()` only for retained IDs whose presentation changed;
-- destroy IDs absent from the current bounded active-tool map;
-- reorder roots only when map order changed.
+`StreamingAssistantView` embeds handles by tool-call ID. `TranscriptView` admits at most 64 projected tool IDs across all placements, indexes those non-owning handles, updates them from the transient map, and applies a committed tool result in place. Excess calls receive bounded omission rows. If no originating assistant tool view is retained, it creates one standalone fallback; that fallback is promoted rather than recreated when its result commits. If message eviction removes an assistant while its result remains retained, the embedded root is detached and promoted to the result position before its parent is destroyed. Only standalone roots are reordered.
 
-The handle retains title and preview renderables. It may rebuild preview-line children when the bounded line shape changes, but its root must remain stable across progress updates. It compares title, status, and preview text before assigning native properties.
+The handle retains title and preview renderables. It reconciles bounded preview-line children, clears native selection before destroying selectable rows, truncates after cell-aware wrapping, and compares title, status, and preview text before assigning native properties. Collapsed previews retain at most 12 rows by kind and expanded previews at most 200 visual rows. The mode-owned `app.tools.expand` binding updates retained handles without replacing roots. One transcript-owned renderer live request refreshes elapsed labels only while a running tool intersects the viewport; views own no timers.
 
 ## One notification stream
 
@@ -204,6 +205,7 @@ The first implementation uses:
 
 ```ts
 const maxProjectedMessages = 200
+const maxProjectedToolViews = 64
 const maxPendingToolCalls = 64
 ```
 
@@ -212,7 +214,7 @@ The retained transcript is therefore bounded by:
 - at most 200 committed message roots;
 - one omitted-history marker;
 - one streaming root;
-- at most 64 active-tool roots;
+- at most 64 transient invocation states and at most 64 projected tool roots across embedded, standalone, and committed placements;
 - the existing status overlay.
 
 The 200-message limit follows the current OpenCode `v2` hydration bound and is large enough for normal terminal context while preventing unbounded native trees. It limits presentation only; `AgentSession.messages` and persistence are untouched.
@@ -240,10 +242,11 @@ After appending a committed view beyond the limit:
 1. choose the oldest committed view;
 2. if there is native selection, clear it before destroying selected-capable nodes;
 3. when navigation is detached, record the first retained root and its pre-removal `y` position;
-4. remove and destroy the oldest root;
-5. increment and update the omission marker;
-6. after OpenTUI settles layout, adjust scroll by the retained anchor's `y` delta;
-7. validate operation generation, target scrollbox identity, and destruction state before applying the adjustment.
+4. detach and promote any embedded tool whose result remains inside the projection window;
+5. remove and destroy the oldest root;
+6. increment and update the omission marker;
+7. after OpenTUI settles layout, adjust scroll by the retained anchor's `y` delta;
+8. validate operation generation, target scrollbox identity, and destruction state before applying the adjustment.
 
 When following the tail, sticky scroll owns the resulting position and no manual anchor correction runs.
 
@@ -493,17 +496,17 @@ Apply the loading rules in the feature introducing each concrete asynchronous ca
 
 The complete transcript work is accepted when:
 
-- [ ] committed message renderables are created once and retained until bounded eviction or reset;
-- [ ] streaming text updates through a stable Markdown renderable;
-- [ ] active-tool siblings retain identity when one tool changes;
-- [ ] transcript reconciliation runs at most once per OpenTUI frame;
-- [ ] `collectToolCalls()` no longer scans the complete session on every delta;
-- [ ] `TranscriptView` has one interactive-store subscription for content changes;
-- [ ] retained committed message roots never exceed 200;
-- [ ] omitted history is visible and authoritative history remains untouched;
-- [ ] detached scrolling remains detached across append and eviction;
-- [ ] stale scheduled callbacks cannot mutate a replaced or destroyed screen;
-- [ ] visual parity tests pass at normal and constrained dimensions;
-- [ ] TTFD, native renderer statistics, and memory diagnostics can be enabled without changing normal behavior;
-- [ ] full workspace formatting, linting, typechecking, and tests pass;
-- [ ] no generic cache, event bus, custom painter, or framework layer was introduced by the transcript slices.
+- [x] committed message renderables are created once and retained until bounded eviction or reset;
+- [x] streaming text updates through a stable Markdown renderable;
+- [x] tool siblings retain identity when one tool changes;
+- [x] transcript reconciliation runs at most once per OpenTUI frame;
+- [x] `collectToolCalls()` no longer scans the complete session on every delta;
+- [x] `TranscriptView` has one interactive-store subscription for content changes;
+- [x] retained committed message roots never exceed 200;
+- [x] omitted history is visible and authoritative history remains untouched;
+- [x] detached scrolling remains detached across append and eviction;
+- [x] stale scheduled callbacks cannot mutate a replaced or destroyed screen;
+- [x] visual parity tests pass at normal and constrained dimensions;
+- [x] TTFD, native renderer statistics, and memory diagnostics can be enabled without changing normal behavior;
+- [x] full workspace formatting, linting, typechecking, and tests pass;
+- [x] no generic cache, event bus, custom painter, or framework layer was introduced by the transcript slices.

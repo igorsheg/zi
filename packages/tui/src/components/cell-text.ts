@@ -17,7 +17,28 @@ export function truncateToCells(text: string, maxWidth: number): string {
   return `${result}...`
 }
 
-function textWidth(text: string): number {
+export function wrapToCells(text: string, maxWidth: number): string[] {
+  if (maxWidth <= 0) return []
+  if (text.length === 0) return [""]
+
+  const lines: string[] = []
+  let line = ""
+  let width = 0
+  for (const { segment } of graphemes.segment(text)) {
+    const segmentWidth = graphemeWidth(segment)
+    if (width > 0 && width + segmentWidth > maxWidth) {
+      lines.push(line)
+      line = ""
+      width = 0
+    }
+    line += segment
+    width += segmentWidth
+  }
+  lines.push(line)
+  return lines
+}
+
+export function textWidth(text: string): number {
   let width = 0
   for (const { segment } of graphemes.segment(text)) width += graphemeWidth(segment)
   return width

@@ -55,7 +55,7 @@ test("the OpenTUI prompt drives a complete tool turn", async () => {
     expect(frame).toContain("Wrote answer.txt with 42.")
     expect(frame).not.toContain("## Done")
     const spans = setup.captureSpans().lines.flatMap(line => line.spans)
-    expect(spans.find(span => span.text === "42")?.fg.toInts()).toEqual([122, 168, 159, 255])
+    expect(spans.filter(span => span.text === "42").map(span => span.fg.toInts())).toContainEqual([122, 168, 159, 255])
     expect(session.sessionManager.file).toBeDefined()
 
     input.setText("next question")

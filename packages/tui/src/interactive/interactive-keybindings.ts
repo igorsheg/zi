@@ -21,7 +21,7 @@ export type PromptKeyAction =
   | "exit"
   | "consume"
 
-export type TranscriptKeyAction = "page_up" | "page_down" | "line_up" | "line_down" | "tail"
+export type TranscriptKeyAction = "page_up" | "page_down" | "line_up" | "line_down" | "tail" | "toggle_tools"
 
 export interface PromptKeyContext {
   readonly pickerOpen: boolean
@@ -54,6 +54,7 @@ const defaultBindingEntries = [
   ["tui.select.down", ["down"], "Move selection down", "overridable"],
   ["tui.select.confirm", ["return"], "Confirm selection", "reserved"],
   ["tui.select.cancel", ["escape", "ctrl+c"], "Cancel selection", "reserved"],
+  ["app.tools.expand", ["ctrl+o"], "Expand or collapse tool details", "overridable"],
   ["app.transcript.pageUp", ["pageup"], "Scroll transcript up half a page", "overridable"],
   ["app.transcript.pageDown", ["pagedown"], "Scroll transcript down half a page", "overridable"],
   ["app.transcript.lineUp", ["ctrl+alt+up"], "Scroll transcript up one line", "overridable"],
@@ -157,6 +158,7 @@ export class InteractiveKeybindings {
   }
 
   transcriptAction(event: InteractiveKeyEvent): TranscriptKeyAction | undefined {
+    if (this.matches(event, "app.tools.expand")) return "toggle_tools"
     if (this.matches(event, "app.transcript.pageUp")) return "page_up"
     if (this.matches(event, "app.transcript.pageDown")) return "page_down"
     if (this.matches(event, "app.transcript.lineUp")) return "line_up"

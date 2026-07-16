@@ -15,9 +15,12 @@ interface ActiveToolIdentity {
 }
 
 export type ActiveTool =
+  | (ActiveToolIdentity & { readonly status: "preparing" })
+  | (ActiveToolIdentity & { readonly status: "ready" })
   | (ActiveToolIdentity & { readonly status: "running"; readonly result?: unknown })
   | (ActiveToolIdentity & { readonly status: "done"; readonly result: unknown })
   | (ActiveToolIdentity & { readonly status: "failed"; readonly result: unknown })
+  | (ActiveToolIdentity & { readonly status: "aborted"; readonly result: unknown })
 
 export interface PromptSubmission {
   readonly text: string
@@ -134,18 +137,10 @@ export function transitionInteractiveState(state: InteractiveState, event: Agent
   switch (event.type) {
     case "tool_execution_start": {
       transcriptRevision++
-      if (tools.has(event.toolCallId)) break
+      const tool = tools.get(event.toolCallId)
+      if (tool?.status === "running") break
       const nextTools = new Map(tools)
-      if (nextTools.size === maxActiveTools) {
-        const oldest = nextTools.keys().next().value
-        if (oldest !== undefined) nextTools.delete(oldest)
-      }
-      nextTools.set(event.toolCallId, {
-        id: event.toolCallId,
-        name: event.toolName,
-        args: event.args,
-        status: "running"
-      })
+      admitTool(nextTools, { id: event.toolCallId, name: event.toolName, args: event.args, status: "running" })
       tools = nextTools
       break
     }
@@ -167,20 +162,40 @@ export function transitionInteractiveState(state: InteractiveState, event: Agent
       tools = nextTools
       break
     }
+    case "message_update":
+      transcriptRevision++
+      tools = updatePreparingTool(tools, event)
+      break
     case "message_end":
       transcriptRevision++
-      if (event.message.role === "toolResult" && tools.has(event.message.toolCallId)) {
+      if (event.message.role === "assistant") {
+        tools = completeToolArguments(tools, event.message)
+      } else if (event.message.role === "toolResult" && tools.has(event.message.toolCallId)) {
         const nextTools = new Map(tools)
         nextTools.delete(event.message.toolCallId)
         tools = nextTools
       }
       break
     case "message_start":
-    case "message_update":
       transcriptRevision++
       break
-    case "agent_start":
     case "agent_end":
+      promptRevision++
+      if ([...tools.values()].some(tool => !isTerminalTool(tool))) {
+        const nextTools = new Map(tools)
+        for (const [id, tool] of nextTools) {
+          if (isTerminalTool(tool)) continue
+          nextTools.set(id, {
+            ...tool,
+            status: "aborted",
+            result: { content: [{ type: "text", text: "Operation aborted" }] }
+          })
+        }
+        tools = nextTools
+        transcriptRevision++
+      }
+      break
+    case "agent_start":
     case "agent_settled":
     case "queue_update":
     case "authentication_changed":
@@ -200,6 +215,66 @@ export function transitionInteractiveState(state: InteractiveState, event: Agent
   }
 
   return { session: state.session, generation: state.generation, promptRevision, transcriptRevision, tools }
+}
+
+function updatePreparingTool(
+  tools: ReadonlyMap<string, ActiveTool>,
+  event: Extract<AgentSessionEvent, { type: "message_update" }>
+): ReadonlyMap<string, ActiveTool> {
+  const update = event.assistantMessageEvent
+  if (update.type !== "toolcall_start" && update.type !== "toolcall_delta" && update.type !== "toolcall_end") {
+    return tools
+  }
+  if (event.message.role !== "assistant") return tools
+  const call = event.message.content[update.contentIndex]
+  if (call?.type !== "toolCall" || !call.id) return tools
+
+  const current = tools.get(call.id)
+  if (current && current.status !== "preparing" && current.status !== "ready") return tools
+  const nextTools = new Map(tools)
+  admitTool(nextTools, { id: call.id, name: call.name, args: call.arguments, status: "preparing" })
+  return nextTools
+}
+
+function completeToolArguments(
+  tools: ReadonlyMap<string, ActiveTool>,
+  message: Extract<AgentSessionEvent, { type: "message_end" }>["message"] & { role: "assistant" }
+): ReadonlyMap<string, ActiveTool> {
+  const calls = message.content.filter(part => part.type === "toolCall")
+  if (calls.length === 0) return tools
+
+  const nextTools = new Map(tools)
+  const failed = message.stopReason === "error" || message.stopReason === "aborted"
+  for (const call of calls) {
+    if (!call.id) continue
+    const current = nextTools.get(call.id)
+    if (current && current.status !== "preparing" && current.status !== "ready") continue
+    if (failed) {
+      const text = message.stopReason === "aborted" ? "Operation aborted" : message.errorMessage || "Error"
+      admitTool(nextTools, {
+        id: call.id,
+        name: call.name,
+        args: call.arguments,
+        status: message.stopReason === "aborted" ? "aborted" : "failed",
+        result: { content: [{ type: "text", text }] }
+      })
+    } else {
+      admitTool(nextTools, { id: call.id, name: call.name, args: call.arguments, status: "ready" })
+    }
+  }
+  return nextTools
+}
+
+function admitTool(tools: Map<string, ActiveTool>, tool: ActiveTool): void {
+  if (!tools.has(tool.id) && tools.size === maxActiveTools) {
+    const oldest = tools.keys().next().value
+    if (oldest !== undefined) tools.delete(oldest)
+  }
+  tools.set(tool.id, tool)
+}
+
+function isTerminalTool(tool: ActiveTool): boolean {
+  return tool.status === "done" || tool.status === "failed" || tool.status === "aborted"
 }
 
 function assertNever(value: never): never {

@@ -43,14 +43,33 @@ test("one turn can write, read, edit, execute, stream, and persist", async () =>
     settings: { thinkingLevel: "low" }
   })
   const events: string[] = []
-  session.subscribe(event => events.push(event.type))
+  const streamedWriteArguments: unknown[] = []
+  session.subscribe(event => {
+    events.push(event.type)
+    if (event.type !== "message_update" || event.assistantMessageEvent.type !== "toolcall_delta") return
+    if (event.message.role !== "assistant") return
+    const part = event.message.content[event.assistantMessageEvent.contentIndex]
+    if (part?.type === "toolCall" && part.name === "write") streamedWriteArguments.push(part.arguments)
+  })
 
   await session.prompt("Create result.txt, inspect it, change alpha to beta, then verify it with bash.")
 
   expect(await readFile(join(root, "result.txt"), "utf8")).toBe("beta\n")
   expect(faux.state.callCount).toBe(5)
   expect(session.messages.filter(message => message.role === "toolResult")).toHaveLength(4)
+  const editResult = session.messages.find(message => message.role === "toolResult" && message.toolCallId === "edit-1")
+  if (editResult?.role !== "toolResult") throw new Error("Missing edit result")
+  expect(editResult.details).toMatchObject({
+    replacements: 1,
+    diff: expect.stringContaining("@@ -1,1 +1,1 @@\n-alpha\n+beta")
+  })
   expect(events).toContain("message_update")
+  expect(streamedWriteArguments.length).toBeGreaterThan(0)
+  expect(
+    streamedWriteArguments.some(
+      args => JSON.stringify(args) !== JSON.stringify({ path: "result.txt", content: "alpha\n" })
+    )
+  ).toBe(true)
   expect(events.filter(event => event === "tool_execution_end")).toHaveLength(4)
   expect(session.sessionManager.file).toBeDefined()
 

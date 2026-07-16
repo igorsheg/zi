@@ -57,6 +57,7 @@ test("interactive keybindings expose resolved metadata for help and future short
     extension: "overridable"
   })
   expect(keybindings.list().map(binding => binding.id)).toContain("app.transcript.tail")
+  expect(keybindings.getHint("app.tools.expand")).toBe("Ctrl+O")
   expect(keybindings.getHint("app.transcript.tail")).toBe("Ctrl+End")
   expect(keybindings.getHint("tui.select.confirm")).toBe("Enter")
 })

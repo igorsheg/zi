@@ -5,6 +5,7 @@ import { Type, type Static } from "@earendil-works/pi-ai"
 
 import { withFileMutation } from "./mutation-queue.js"
 import { resolveToolPath } from "./path.js"
+import { truncateHead } from "./truncate.js"
 
 const replacement = Type.Object({
   oldText: Type.String({ description: "Exact, unique text to replace in the original file" }),
@@ -18,6 +19,8 @@ const parameters = Type.Object({
 
 export interface EditToolDetails {
   replacements: number
+  diff: string
+  diffTruncated?: boolean
 }
 
 export function createEditTool(cwd: string): AgentTool<typeof parameters, EditToolDetails> {
@@ -41,7 +44,12 @@ export function createEditTool(cwd: string): AgentTool<typeof parameters, EditTo
         const edits = input.edits.map(edit => ({ oldText: normalize(edit.oldText), newText: normalize(edit.newText) }))
         const matches = edits.map((edit, index) => match(source, edit.oldText, input.path, index, edits.length))
         const ordered = matches
-          .map((item, index) => ({ start: item.start, end: item.end, newText: edits[index]!.newText }))
+          .map((item, index) => ({
+            start: item.start,
+            end: item.end,
+            oldText: edits[index]!.oldText,
+            newText: edits[index]!.newText
+          }))
           .toSorted((a, b) => a.start - b.start)
 
         for (let index = 1; index < ordered.length; index++) {
@@ -55,13 +63,18 @@ export function createEditTool(cwd: string): AgentTool<typeof parameters, EditTo
           output = output.slice(0, edit.start) + edit.newText + output.slice(edit.end)
         }
         if (output === source) throw new Error(`Edit produced no change in ${input.path}`)
+        const diff = truncateHead(renderEditDiff(source, ordered, input.path))
 
         const lineEnding = raw.includes("\r\n") ? "\r\n" : "\n"
         await writeFile(path, bom + (lineEnding === "\r\n" ? output.replace(/\n/g, "\r\n") : output), "utf8")
         throwIfAborted(signal)
         return {
           content: [{ type: "text", text: `Successfully replaced ${edits.length} block(s) in ${input.path}` }],
-          details: { replacements: edits.length }
+          details: {
+            replacements: edits.length,
+            diff: diff.content,
+            ...(diff.truncated ? { diffTruncated: true } : {})
+          }
         }
       })
     }
@@ -103,6 +116,35 @@ function match(source: string, text: string, path: string, index: number, count:
 
 function normalize(text: string): string {
   return text.replace(/\r\n?/g, "\n")
+}
+
+function renderEditDiff(
+  source: string,
+  edits: readonly { start: number; oldText: string; newText: string }[],
+  path: string
+): string {
+  const hunks: string[] = [`--- a/${path}`, `+++ b/${path}`]
+  let sourceOffset = 0
+  let sourceLine = 1
+  let lineShift = 0
+  for (const edit of edits) {
+    for (let index = sourceOffset; index < edit.start; index++) {
+      if (source.charCodeAt(index) === 10) sourceLine++
+    }
+    sourceOffset = edit.start
+    const oldStart = sourceLine
+    const oldLines = diffLines(edit.oldText)
+    const newLines = diffLines(edit.newText)
+    const newStart = oldStart + lineShift
+    hunks.push(`@@ -${oldStart},${oldLines.length} +${newStart},${newLines.length} @@`)
+    hunks.push(...oldLines.map(line => `-${line}`), ...newLines.map(line => `+${line}`))
+    lineShift += newLines.length - oldLines.length
+  }
+  return hunks.join("\n")
+}
+
+function diffLines(text: string): string[] {
+  return text ? text.split("\n") : []
 }
 
 function throwIfAborted(signal?: AbortSignal): void {

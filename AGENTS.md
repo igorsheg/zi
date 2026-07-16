@@ -69,7 +69,7 @@ Terminal performance is an ownership and data-flow property, not a late renderin
 
 Before adding a new retained row or transient workflow, identify its authoritative source, stable key, invalidation boundary, retention bound, disposal path, and structural tests.
 
-See `docs/tui-performance-implementation-spec.md` for the current transcript limits, diagnostics, and migration sequence.
+See `docs/tui-performance-implementation-spec.md` and `docs/adr/0013-tool-invocations-keep-one-transcript-identity.md` for the current transcript limits, tool lifecycle, diagnostics, and migration sequence.
 
 ## Workspace ownership
 
