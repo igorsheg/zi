@@ -3,93 +3,88 @@ import { expect, test } from "bun:test"
 import { BoxRenderable, TextRenderable } from "@opentui/core"
 import { createTestRenderer } from "@opentui/core/testing"
 
-import { createCommandToolBlock, createToolBlock, ToolCallView } from "../../src/interactive/transcript/tool-view.js"
+import { ToolCallView, type ToolViewFrame } from "../../src/interactive/transcript/tool-view.js"
 import { defaultTheme } from "../../src/theme.js"
 
-test("tool block owns title, rail, and body styling", async () => {
-  const setup = await createTestRenderer({ width: 30, height: 8, useThread: false })
+test("terminal body owns action, rail, and output styling", async () => {
+  const setup = await createTestRenderer({ width: 36, height: 10, useThread: false })
   const root = appRoot(setup.renderer)
-  root.add(
-    createCommandToolBlock(
-      setup.renderer,
-      { title: "$ echo hi", output: "hi\nthere\n", status: "running" },
-      defaultTheme
-    )
+  const view = new ToolCallView(
+    setup.renderer,
+    "bash-running",
+    frame("running", {
+      header: { label: "Bash", subject: { type: "command", text: "echo hi" }, details: [] },
+      body: { type: "terminal", text: "hi\nthere" },
+      notices: [],
+      preview: { type: "tail", rows: 5 }
+    }),
+    defaultTheme,
+    "/work"
   )
+  root.add(view.root)
   setup.renderer.root.add(root)
 
   try {
     await setup.renderOnce()
-    const frame = setup.captureCharFrame()
-    expect(frame).toContain(" $ echo hi")
-    expect(frame).toContain(" ╭───")
-    expect(frame).toContain(" │ hi")
-    expect(frame).toContain(" │ there")
-    expect(frame).toContain(" ╰───")
+    const rendered = setup.captureCharFrame()
+    expect(rendered).toContain("Bash $ echo hi")
+    expect(rendered).toContain("╭───")
+    expect(rendered).toContain("│ hi")
+    expect(rendered).toContain("│ there")
+    expect(rendered).toContain("╰───")
 
     const spans = setup.captureSpans().lines.flatMap(line => line.spans)
     expect(spans.find(span => span.text === "$ echo hi")?.fg.toInts()).toEqual([230, 195, 132, 255])
     expect(spans.find(span => span.text === "╭───")?.fg.toInts()).toEqual([122, 168, 159, 255])
-    expect(spans.find(span => span.text === "hi")?.fg.toInts()).toEqual([127, 131, 129, 255])
   } finally {
-    root.destroyRecursively()
+    view.destroy()
     setup.renderer.destroy()
   }
 })
 
-test("failed tool block uses the error rail and terminal suffix", async () => {
+test("failed semantic frame uses error lifecycle chrome", async () => {
   const setup = await createTestRenderer({ width: 40, height: 8, useThread: false })
-  const block = createToolBlock(
+  const view = new ToolCallView(
     setup.renderer,
-    { title: "edit source.ts", output: "No match found", status: "failed" },
-    defaultTheme
+    "edit-failed",
+    frame("failed", {
+      header: { label: "Edit", subject: { type: "path", path: "source.ts" }, details: [] },
+      body: { type: "text", text: "No match found", tone: "error" },
+      notices: [],
+      preview: { type: "head", rows: 10 }
+    }),
+    defaultTheme,
+    "/work"
   )
-  setup.renderer.root.add(block)
+  setup.renderer.root.add(view.root)
 
   try {
     await setup.renderOnce()
-    expect(setup.captureCharFrame()).toContain("edit source.ts (error)")
+    expect(setup.captureCharFrame()).toContain("Edit source.ts (error)")
     const rail = setup
       .captureSpans()
       .lines.flatMap(line => line.spans)
       .find(span => span.text === "╭───")
     expect(rail?.fg.toInts()).toEqual([228, 104, 118, 255])
   } finally {
-    block.destroyRecursively()
+    view.destroy()
     setup.renderer.destroy()
   }
 })
 
-test("generic tool blocks keep the head of bounded output", async () => {
-  const output = Array.from({ length: 14 }, (_, index) => `line ${index}`).join("\n")
-  const setup = await createTestRenderer({ width: 40, height: 16, useThread: false })
-  const block = createToolBlock(setup.renderer, { title: "read file", output, status: "done" }, defaultTheme)
-  setup.renderer.root.add(block)
-
-  try {
-    await setup.renderOnce()
-    const frame = setup.captureCharFrame()
-    expect(frame).toContain("line 0")
-    expect(frame).toContain("line 9")
-    expect(frame).not.toContain("line 10")
-    expect(frame).toContain("... (4 more lines)")
-  } finally {
-    block.destroyRecursively()
-    setup.renderer.destroy()
-  }
-})
-
-test("streamed write arguments truncate after visual wrapping and expand in place", async () => {
+test("compact previews truncate after cell wrapping and expand without replacing roots", async () => {
   const setup = await createTestRenderer({ width: 24, height: 18, useThread: false })
   const view = new ToolCallView(
     setup.renderer,
-    {
-      id: "write-stream",
-      name: "write",
-      args: { path: "notes.txt", content: "x".repeat(10_000) },
-      status: "preparing"
-    },
+    "write-stream",
+    frame("preparing", {
+      header: { label: "Write", subject: { type: "path", path: "notes.txt" }, details: [] },
+      body: { type: "source", text: "x".repeat(10_000), path: "notes.txt" },
+      notices: [],
+      preview: { type: "head", rows: 10 }
+    }),
     defaultTheme,
+    "/work",
     "Ctrl+O"
   )
   setup.renderer.root.add(view.root)
@@ -102,7 +97,9 @@ test("streamed write arguments truncate after visual wrapping and expand in plac
     expect(view.setExpanded(true)).toBe(true)
     await setup.renderOnce()
     expect(view.root).toBe(root)
-    expect(view.root.getChildrenCount()).toBeLessThanOrEqual(204)
+    const body = view.root.getChildren()[1]
+    if (!(body instanceof BoxRenderable)) throw new Error("Body not found")
+    expect(body.getChildrenCount()).toBeLessThanOrEqual(202)
     expect(setup.captureCharFrame()).not.toContain("… Ctrl+O to expand")
   } finally {
     view.destroy()
@@ -110,17 +107,20 @@ test("streamed write arguments truncate after visual wrapping and expand in plac
   }
 })
 
-test("collapsing a tool clears selection before destroying preview rows", async () => {
-  const setup = await createTestRenderer({ width: 24, height: 18, useThread: false })
+test("expanded tail previews retain newest output without an expand hint", async () => {
+  const setup = await createTestRenderer({ width: 40, height: 210, useThread: false })
+  const output = Array.from({ length: 250 }, (_, index) => `line ${index + 1}`).join("\n")
   const view = new ToolCallView(
     setup.renderer,
-    {
-      id: "selected-preview",
-      name: "write",
-      args: { path: "notes.txt", content: "x".repeat(10_000) },
-      status: "preparing"
-    },
+    "bash-tail-expand",
+    frame("done", {
+      header: { label: "Bash", subject: { type: "command", text: "many-lines" }, details: [] },
+      body: { type: "terminal", text: output },
+      notices: [],
+      preview: { type: "tail", rows: 5 }
+    }),
     defaultTheme,
+    "/work",
     "Ctrl+O"
   )
   setup.renderer.root.add(view.root)
@@ -128,7 +128,40 @@ test("collapsing a tool clears selection before destroying preview rows", async 
   try {
     view.setExpanded(true)
     await setup.renderOnce()
-    const selected = view.root.getChildren().at(-2)
+    const rendered = setup.captureCharFrame()
+    expect(rendered).toContain("line 250")
+    expect(rendered).not.toContain("line 1\n")
+    expect(rendered).not.toContain("Ctrl+O to expand")
+    expect(rendered).toContain("earlier output")
+  } finally {
+    view.destroy()
+    setup.renderer.destroy()
+  }
+})
+
+test("collapsing a body clears native selection before removing preview rows", async () => {
+  const setup = await createTestRenderer({ width: 24, height: 18, useThread: false })
+  const view = new ToolCallView(
+    setup.renderer,
+    "selected-preview",
+    frame("preparing", {
+      header: { label: "Write", subject: { type: "path", path: "notes.txt" }, details: [] },
+      body: { type: "text", text: "x".repeat(10_000), tone: "normal" },
+      notices: [],
+      preview: { type: "head", rows: 10 }
+    }),
+    defaultTheme,
+    "/work",
+    "Ctrl+O"
+  )
+  setup.renderer.root.add(view.root)
+
+  try {
+    view.setExpanded(true)
+    await setup.renderOnce()
+    const body = view.root.getChildren()[1]
+    if (!(body instanceof BoxRenderable)) throw new Error("Body not found")
+    const selected = body.getChildren().at(-2)
     if (!(selected instanceof TextRenderable)) throw new Error("Expanded preview row not found")
     setup.renderer.startSelection(selected, selected.x, selected.y)
     expect(setup.renderer.hasSelection).toBe(true)
@@ -141,68 +174,100 @@ test("collapsing a tool clears selection before destroying preview rows", async 
   }
 })
 
-test("bash results render structured truncation and full-output notices once", async () => {
-  const setup = await createTestRenderer({ width: 60, height: 14, useThread: false })
-  const fullOutputPath = "/tmp/openzi/bash-output.log"
-  const view = new ToolCallView(
-    setup.renderer,
-    {
-      id: "bash-truncated",
-      name: "bash",
-      args: { command: "generate-output" },
-      status: "done",
-      result: {
-        content: [{ type: "text", text: `last line\n\n[Output truncated. Full output: ${fullOutputPath}]` }],
-        details: {
-          fullOutputPath,
-          truncation: {
-            content: "last line",
-            truncated: true,
-            truncatedBy: "lines",
-            totalLines: 2500,
-            totalBytes: 100000,
-            outputLines: 2000,
-            outputBytes: 50000,
-            firstLineExceedsLimit: false,
-            lastLinePartial: false
-          }
-        }
-      }
-    },
-    defaultTheme
-  )
+test("body-kind replacement clears selection and preserves the tool root", async () => {
+  const setup = await createTestRenderer({ width: 40, height: 12, useThread: false })
+  const initial = frame("running", {
+    header: { label: "Edit", subject: { type: "path", path: "file.ts" }, details: [] },
+    body: { type: "text", text: "- before\n+ after", tone: "normal" },
+    notices: [],
+    preview: { type: "head", rows: 12 }
+  })
+  const view = new ToolCallView(setup.renderer, "edit-replace", initial, defaultTheme, "/work")
   setup.renderer.root.add(view.root)
 
   try {
     await setup.renderOnce()
-    const frame = setup.captureCharFrame()
-    expect(frame).toContain(`Full output: ${fullOutputPath}`)
-    expect(frame).toContain("showing the last 2000 of 2500 lines")
-    expect(frame.split(fullOutputPath)).toHaveLength(2)
+    const root = view.root
+    const body = root.getChildren()[1]
+    if (!(body instanceof BoxRenderable)) throw new Error("Body not found")
+    const selected = body.getChildren().at(-2)
+    if (!(selected instanceof TextRenderable)) throw new Error("Preview row not found")
+    setup.renderer.startSelection(selected, selected.x, selected.y)
+
+    expect(
+      view.update(
+        frame("done", {
+          ...initial.presentation,
+          body: { type: "diff", text: "--- a/file.ts\n+++ b/file.ts\n-before\n+after", path: "file.ts" }
+        })
+      )
+    ).toBe(true)
+    expect(view.root).toBe(root)
+    expect(setup.renderer.hasSelection).toBe(false)
   } finally {
     view.destroy()
     setup.renderer.destroy()
   }
 })
 
-test("command tool blocks keep the tail of bounded output", async () => {
-  const output = Array.from({ length: 12 }, (_, index) => `line ${index}`).join("\n")
-  const setup = await createTestRenderer({ width: 40, height: 12, useThread: false })
-  const block = createCommandToolBlock(setup.renderer, { title: "$ command", output, status: "done" }, defaultTheme)
-  setup.renderer.root.add(block)
+test("notices remain visible outside hidden body previews", async () => {
+  const setup = await createTestRenderer({ width: 60, height: 12, useThread: false })
+  const path = "/tmp/openzi/full-output.log"
+  const view = new ToolCallView(
+    setup.renderer,
+    "read-hidden",
+    frame("done", {
+      header: { label: "Read", subject: { type: "path", path: "large.ts" }, details: ["1-10"] },
+      body: { type: "source", text: "hidden source", path: "large.ts", startLine: 1 },
+      notices: [{ type: "path", tone: "warning", label: "Full output", path }],
+      preview: { type: "hidden" }
+    }),
+    defaultTheme,
+    "/work"
+  )
+  setup.renderer.root.add(view.root)
 
   try {
     await setup.renderOnce()
-    const frame = setup.captureCharFrame()
-    expect(frame).toContain("... (7 earlier lines)")
-    expect(frame).not.toContain("line 6")
-    expect(frame).toContain("line 7")
-    expect(frame).toContain("line 11")
+    const rendered = setup.captureCharFrame()
+    expect(rendered).not.toContain("hidden source")
+    expect(rendered).toContain(`Full output: ${path}`)
   } finally {
-    block.destroyRecursively()
+    view.destroy()
     setup.renderer.destroy()
   }
 })
+
+test("source bodies render semantic starting line numbers", async () => {
+  const setup = await createTestRenderer({ width: 40, height: 10, useThread: false })
+  const view = new ToolCallView(
+    setup.renderer,
+    "read-lines",
+    frame("failed", {
+      header: { label: "Read", subject: { type: "path", path: "file.ts" }, details: [] },
+      body: { type: "source", text: "first\nsecond", path: "file.ts", startLine: 41 },
+      notices: [],
+      preview: { type: "head", rows: 10 }
+    }),
+    defaultTheme,
+    "/work"
+  )
+  setup.renderer.root.add(view.root)
+
+  try {
+    await setup.renderOnce()
+    const rendered = setup.captureCharFrame()
+    expect(rendered).toContain("41 │ first")
+    expect(rendered).toContain("42 │ second")
+  } finally {
+    view.destroy()
+    setup.renderer.destroy()
+  }
+})
+
+function frame(status: ToolViewFrame["status"], presentation: ToolViewFrame["presentation"]): ToolViewFrame {
+  return { status, presentation }
+}
 
 function appRoot(renderer: ConstructorParameters<typeof BoxRenderable>[0]): BoxRenderable {
   return new BoxRenderable(renderer, { width: "100%", height: "100%", backgroundColor: defaultTheme.surface.app })

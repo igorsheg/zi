@@ -23,8 +23,41 @@ test("bash bounds model output and preserves the full stream for the session lif
     expect(output?.type).toBe("text")
     if (output?.type !== "text") throw new Error("Expected text output")
     expect(Buffer.byteLength(output.text)).toBeLessThan(DEFAULT_MAX_BYTES + 512)
-    expect(result.details.truncation?.truncated).toBe(true)
-    expect(result.details.fullOutputPath && existsSync(result.details.fullOutputPath)).toBe(true)
+    if (result.details.state === "rejected") throw new Error("Expected admitted Bash execution")
+    expect(result.details.output.truncation.truncated).toBe(true)
+    const fullOutput = result.details.output.fullOutput
+    expect(fullOutput.type === "available" && existsSync(fullOutput.path)).toBe(true)
+  } finally {
+    await shell.dispose()
+    rmSync(cwd, { recursive: true, force: true })
+  }
+})
+
+test("bash returns typed errors for reachable admission failures", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "openzi-bash-admission-"))
+  const shell = createShell(cwd, { maxBackgroundTasks: 1, maxRuntimeMs: 1_000 })
+  const tool = createBashTool(shell)
+
+  try {
+    const timeout = await tool.execute("bash-timeout-rejected", { command: "printf no", timeout: 2 })
+    expect(timeout.details).toMatchObject({
+      outcome: "error",
+      state: "rejected",
+      timeoutSeconds: 2,
+      error: expect.stringContaining("session limit")
+    })
+
+    const first = await tool.execute("bash-capacity-one", {
+      command: `node -e "setInterval(() => {}, 1000)"`,
+      background: true
+    })
+    if (first.details.state === "rejected") throw new Error("Expected first background task")
+    const capacity = await tool.execute("bash-capacity-two", { command: "printf no", background: true })
+    expect(capacity.details).toMatchObject({
+      outcome: "error",
+      state: "rejected",
+      error: expect.stringContaining("capacity exceeded")
+    })
   } finally {
     await shell.dispose()
     rmSync(cwd, { recursive: true, force: true })
@@ -159,17 +192,23 @@ test("bash, task_output, and kill_task adapt one session task owner", async () =
       command: `node -e "setTimeout(() => console.log('complete'), 100)"`,
       background: true
     })
-    expect(started.details.status).toBe("backgrounded")
+    expect(started.details).toMatchObject({ outcome: "success", state: "background" })
+    if (started.details.state === "rejected") throw new Error("Expected background task")
     const completed = await output.execute("task-output", { taskId: started.details.taskId, timeout: 2 })
-    expect(completed.details).toMatchObject({ type: "completed", outcome: { type: "exited", exitCode: 0 } })
+    expect(completed.details).toMatchObject({
+      outcome: "success",
+      state: "completed",
+      finalOutcome: { type: "exited", exitCode: 0 }
+    })
     expect(completed.content[0]).toMatchObject({ type: "text", text: expect.stringContaining("complete") })
 
     const longRunning = await bash.execute("bash-tool-kill", {
       command: `node -e "setInterval(() => {}, 1000)"`,
       background: true
     })
+    if (longRunning.details.state === "rejected") throw new Error("Expected background task")
     const killed = await kill.execute("kill-task", { taskId: longRunning.details.taskId })
-    expect(killed.details).toMatchObject({ type: "stopping", reason: "killed" })
+    expect(killed.details).toMatchObject({ outcome: "success", stop: "stopping" })
   } finally {
     await shell.dispose()
     rmSync(cwd, { recursive: true, force: true })

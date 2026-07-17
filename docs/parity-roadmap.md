@@ -21,8 +21,8 @@ The target is coding-agent architecture parity and observable product-behavior p
 - `packages/coding-agent/test/complete-turn.test.ts` drives the real Pi agent loop through `write`, `read`, `edit`, and `bash`, then restores JSONL.
 - `packages/tui/test/interactive/complete-turn.test.ts` submits through OpenTUI's `TextareaRenderable` and captures the resulting frame.
 - `packages/tui/test/interactive/visual-parity.test.ts` fixes representative normal and constrained character frames plus semantic color spans for user, thinking, Markdown, tool, and prompt presentation.
-- Tool semantics are ported from `pi/packages/coding-agent/src/core/tools/` at the commit pinned in `docs/reference-pins.md`. Framework-neutral display projection keeps partial args, structured truncation/continuation notices, write previews, and edit diffs in coding-agent.
-- `packages/tui/test/interactive/interactive-store.test.ts` fixes `message_update` argument streaming through preparing/ready/running/terminal states. `transcript-performance.test.ts` proves source ordering and one native tool root through argument, execution, partial-result, and committed-result phases; `tool-block.test.ts` fixes post-wrap bounds, structured bash notices, and in-place expansion. See ADR 0013.
+- Tool semantics are ported from `pi/packages/coding-agent/src/core/tools/` at the commit pinned in `docs/reference-pins.md`. The current display union keeps partial arguments, truncation/continuation notices, write previews, and edit diffs in coding-agent; [ADR 0014](adr/0014-tool-presentation-is-semantic-data.md) and `docs/tool-presentation-implementation-spec.md` define its accepted replacement with typed result details and semantic body primitives.
+- `packages/tui/test/interactive/interactive-store.test.ts` fixes `message_update` argument streaming through preparing/ready/running/terminal states. `transcript-performance.test.ts` proves source ordering and one native tool root through argument, execution, partial-result, and committed-result phases; `tool-block.test.ts` fixes post-wrap bounds, structured bash notices, and in-place expansion. These identity and bound properties remain required through the presentation cutover; see ADR 0013.
 
 ### P0 lifecycle evidence
 
@@ -47,10 +47,12 @@ The target is coding-agent architecture parity and observable product-behavior p
 - [ ] Context usage and automatic/manual compaction
 - [ ] Slash commands and file completion
 - [x] Conversation scrolling, follow-tail, unseen-line hint, selection/copy
-- [ ] `grep`, `find`, and `ls`
+- [ ] Typed tool-result and semantic-presentation cutover, then vertical polish of all six active built-ins
 - [x] Settings: global and project scope
 - [x] Print and JSON modes sharing the same `AgentSession`
 - [x] Authentication commands and composer-owned provider flows
+
+Pi's optional `grep`, `find`, and `ls` implementations are deliberately deferred: its vanilla session does not enable them, and Bash already supplies their default capability. They are not part of the current built-in UX scope.
 
 ### P1 session-lifecycle evidence
 

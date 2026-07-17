@@ -262,8 +262,9 @@ test("a coalesced agent end renders skipped sequential calls as aborted", async 
   try {
     await harness.setup.flush()
     const frame = harness.setup.captureCharFrame()
-    expect(frame).toContain("read never-read.txt (aborted)")
-    expect(frame).not.toContain("read never-read.txt (preparing)")
+    expect(frame).toContain("Tool read (aborted)")
+    expect(frame).toContain("never-read.txt")
+    expect(frame).not.toContain("preparing")
   } finally {
     harness.destroy()
   }
@@ -277,7 +278,8 @@ test("an aborted committed tool call remains terminal after transient state clea
   try {
     await harness.setup.flush()
     const frame = harness.setup.captureCharFrame()
-    expect(frame).toContain("$ sleep 10 (aborted)")
+    expect(frame).toContain("Tool bash (aborted)")
+    expect(frame).toContain("sleep 10")
     expect(frame).toContain("Operation aborted")
     expect(frame).not.toContain("preparing")
   } finally {
@@ -302,6 +304,37 @@ test("the semantic tool binding expands bounded previews without replacing roots
     await harness.setup.flush()
     expect(requiredRenderable(harness, "active-tool:write-expand")).toBe(root)
     expect(harness.setup.captureCharFrame()).not.toContain("Ctrl+O to expand")
+  } finally {
+    harness.destroy()
+  }
+})
+
+test("streaming text updates do not reproject unchanged tool invocations", async () => {
+  const first = activeTool("cached-first", "one")
+  const second = activeTool("cached-second", "two")
+  const streaming = (text: string) =>
+    fauxAssistantMessage([
+      fauxToolCall("bash", { command: "echo cached-first" }, { id: first.id }),
+      fauxToolCall("bash", { command: "echo cached-second" }, { id: second.id }),
+      fauxText(text)
+    ])
+  const harness = await createTranscriptHarness([], {
+    streamingMessage: streaming("before"),
+    tools: new Map([
+      [first.id, first],
+      [second.id, second]
+    ])
+  })
+  try {
+    await harness.setup.flush()
+    const projections = harness.view.diagnostics.toolProjections
+
+    harness.state.streamingMessage = streaming("after")
+    harness.revision.set(1)
+    await harness.setup.flush()
+
+    expect(harness.setup.captureCharFrame()).toContain("after")
+    expect(harness.view.diagnostics.toolProjections).toBe(projections)
   } finally {
     harness.destroy()
   }

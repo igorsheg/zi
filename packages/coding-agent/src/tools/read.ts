@@ -1,22 +1,40 @@
-import { readFile } from "node:fs/promises"
+import { readFile, stat } from "node:fs/promises"
 
 import type { AgentTool } from "@earendil-works/pi-agent-core"
 import { Type } from "@earendil-works/pi-ai"
 
 import { resolveToolPath } from "./path.js"
-import { DEFAULT_MAX_BYTES, truncateHead, type TruncationResult } from "./truncate.js"
+import { boundToolText, isBoundedToolText } from "./text.js"
+import {
+  DEFAULT_MAX_BYTES,
+  isTruncationDetails,
+  truncateHead,
+  truncationDetails,
+  type TruncationDetails
+} from "./truncate.js"
+
+const maxPathLength = 4_096
+const maxReadFileBytes = 16 * 1024 * 1024
 
 const parameters = Type.Object({
-  path: Type.String({ description: "Path to the file to read (relative or absolute)" }),
+  path: Type.String({ maxLength: maxPathLength, description: "Path to the file to read (relative or absolute)" }),
   offset: Type.Optional(Type.Integer({ minimum: 1, description: "Line number to start reading from (1-indexed)" })),
   limit: Type.Optional(Type.Integer({ minimum: 1, description: "Maximum number of lines to read" }))
 })
 
-export interface ReadToolDetails {
-  truncation?: TruncationResult
-}
+export type ReadToolDetails =
+  | {
+      readonly outcome: "success"
+      readonly startLine: number
+      readonly endLine: number
+      readonly totalLines: number
+      readonly nextOffset?: number
+      readonly remainingLines?: number
+      readonly truncation: TruncationDetails
+    }
+  | { readonly outcome: "error"; readonly error: string }
 
-export function createReadTool(cwd: string): AgentTool<typeof parameters, ReadToolDetails | undefined> {
+export function createReadTool(cwd: string): AgentTool<typeof parameters, ReadToolDetails> {
   return {
     name: "read",
     label: "read",
@@ -26,40 +44,114 @@ export function createReadTool(cwd: string): AgentTool<typeof parameters, ReadTo
     async execute(_id, input, signal) {
       throwIfAborted(signal)
       const path = resolveToolPath(input.path, cwd)
-      const content = await readFile(path, "utf8")
+      let content: string
+      try {
+        const file = await stat(path)
+        if (file.size > maxReadFileBytes) return failure(`File exceeds the ${maxReadFileBytes} byte read limit`)
+        content = await readFile(path, "utf8")
+      } catch (cause) {
+        if (signal?.aborted) throw cause
+        return failure(errorMessage(cause))
+      }
       throwIfAborted(signal)
 
       const lines = content.split("\n")
       const start = (input.offset ?? 1) - 1
-      if (start >= lines.length)
-        throw new Error(`Offset ${input.offset} is beyond end of file (${lines.length} lines total)`)
-      const selected = lines.slice(start, input.limit === undefined ? undefined : start + input.limit).join("\n")
+      if (start >= lines.length) {
+        return failure(`Offset ${input.offset} is beyond end of file (${lines.length} lines total)`)
+      }
+
+      const requestedEnd = input.limit === undefined ? lines.length : Math.min(lines.length, start + input.limit)
+      const selected = lines.slice(start, requestedEnd).join("\n")
       const truncation = truncateHead(selected)
+      const startLine = start + 1
+      const endLine = Math.max(startLine, startLine + truncation.outputLines - 1)
+      const nextOffset = truncation.firstLineExceedsLimit
+        ? undefined
+        : truncation.truncated
+          ? endLine + 1
+          : requestedEnd < lines.length
+            ? requestedEnd + 1
+            : undefined
+      const details: ReadToolDetails = {
+        outcome: "success",
+        startLine,
+        endLine,
+        totalLines: lines.length,
+        ...(nextOffset === undefined ? {} : { nextOffset, remainingLines: Math.max(0, lines.length - nextOffset + 1) }),
+        truncation: truncationDetails(truncation)
+      }
 
       if (truncation.firstLineExceedsLimit) {
-        const line = start + 1
         return {
           content: [
             {
               type: "text",
-              text: `[Line ${line} exceeds the ${DEFAULT_MAX_BYTES} byte limit. Use bash to inspect a bounded byte range.]`
+              text: `[Line ${startLine} exceeds the ${DEFAULT_MAX_BYTES} byte limit. Use bash to inspect a bounded byte range.]`
             }
           ],
-          details: { truncation }
+          details
         }
       }
 
       let text = truncation.content
-      if (truncation.truncated) {
-        const first = start + 1
-        const last = first + truncation.outputLines - 1
-        text += `\n\n[Showing lines ${first}-${last} of ${lines.length}. Use offset=${last + 1} to continue.]`
+      if (nextOffset !== undefined) {
+        text += `\n\n[Showing lines ${startLine}-${endLine} of ${lines.length}. Use offset=${nextOffset} to continue.]`
       }
-      return { content: [{ type: "text", text }], details: truncation.truncated ? { truncation } : undefined }
+      return { content: [{ type: "text", text }], details }
     }
   }
 }
 
+export function isReadToolDetails(value: unknown): value is ReadToolDetails {
+  if (!isRecord(value)) return false
+  if (value.outcome === "error") return isBoundedString(value.error)
+  if (
+    value.outcome !== "success" ||
+    !isPositiveInteger(value.startLine) ||
+    !isPositiveInteger(value.endLine) ||
+    value.endLine < value.startLine ||
+    !isPositiveInteger(value.totalLines) ||
+    value.endLine > value.totalLines ||
+    !isTruncationDetails(value.truncation)
+  ) {
+    return false
+  }
+  const selectedLines = Math.max(1, value.truncation.outputLines)
+  if (value.endLine !== value.startLine + selectedLines - 1) return false
+  const continuationExpected = !value.truncation.firstLineExceedsLimit && value.endLine < value.totalLines
+  if (value.nextOffset === undefined && value.remainingLines === undefined) return !continuationExpected
+  if (!continuationExpected) return false
+  return (
+    isPositiveInteger(value.nextOffset) &&
+    isPositiveInteger(value.remainingLines) &&
+    value.nextOffset === value.endLine + 1 &&
+    value.nextOffset <= value.totalLines &&
+    value.remainingLines === value.totalLines - value.endLine
+  )
+}
+
+function failure(message: string) {
+  const error = boundToolText(message)
+  return { content: [{ type: "text" as const, text: error }], details: { outcome: "error" as const, error } }
+}
+
+function errorMessage(cause: unknown): string {
+  return cause instanceof Error ? cause.message : String(cause)
+}
+
 function throwIfAborted(signal?: AbortSignal): void {
   if (signal?.aborted) throw new Error("Operation aborted")
+}
+
+function isPositiveInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0
+}
+
+function isBoundedString(value: unknown): value is string {
+  return isBoundedToolText(value)
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
 }

@@ -16,6 +16,14 @@ _Avoid_: Chat, agent core
 The session-scoped coding-agent owner of shell task identity, foreground/background transitions, subprocess groups, bounded output files and previews, completion, retention, and disposal. Its Bash and task tools are adapters over the same task state. Run interruption stops foreground work; demoted or explicitly backgrounded work survives until completion, explicit kill, timeout, output bounds, or final session disposal.
 _Avoid_: Global process manager, TUI task registry, detached Bash process
 
+**Tool result details**:
+The bounded, typed, client-neutral facts a built-in tool returns separately from model-facing content. They describe progress or outcome without requiring a client to parse explanatory prose.
+_Avoid_: UI metadata, rendered result, tool payload
+
+**Tool presentation**:
+A bounded, framework-neutral display value derived from one tool invocation's arguments, lifecycle phase, content, and result details. It is never persisted or authoritative; terminal layout and native resources remain TUI-owned.
+_Avoid_: Tool view model, render callback, tool component
+
 **Session resources**:
 The cwd-bound prompt inputs active for one agent session: base and appended system prompts, contextual instruction files, skill descriptors, and prompt templates. Resource discovery finds candidates; the agent session owns the coherent catalog used by its conversation. Terminal themes and extension/package loading are separate capabilities.
 _Avoid_: Core resources, resource registry, frontend resources

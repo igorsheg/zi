@@ -14,6 +14,48 @@ import {
 
 import { createTestAgentRuntime as createAgentRuntime } from "../src/testing.js"
 
+test("built-in expected failures keep typed details and are finalized as Pi errors once", async () => {
+  const root = await mkdtemp(join(tmpdir(), "openzi-tool-errors-"))
+  const models = createModels()
+  const faux = fauxProvider({ tokensPerSecond: 10_000 })
+  models.setProvider(faux.provider)
+  faux.setResponses([
+    fauxAssistantMessage(
+      [
+        fauxToolCall("bash", { command: "exit 7" }, { id: "bash-error" }),
+        fauxToolCall("read", { path: "missing.txt" }, { id: "read-error" }),
+        fauxToolCall("write", { path: ".", content: "cannot replace a directory" }, { id: "write-error" }),
+        fauxToolCall(
+          "edit",
+          { path: "missing-edit.txt", edits: [{ oldText: "before", newText: "after" }] },
+          { id: "edit-error" }
+        ),
+        fauxToolCall("task_output", { taskId: "missing-task" }, { id: "output-error" }),
+        fauxToolCall("kill_task", { taskId: "missing-task" }, { id: "kill-error" })
+      ],
+      { stopReason: "toolUse" }
+    ),
+    fauxAssistantMessage(fauxText("Failures observed."))
+  ])
+
+  const { session } = await createAgentRuntime({ cwd: root, model: "faux/faux-1", models, persist: false })
+  try {
+    await session.prompt("Exercise expected tool failures.")
+    const results = session.messages.filter(message => message.role === "toolResult")
+    expect(results).toHaveLength(6)
+    for (const result of results) {
+      expect(result.isError).toBe(true)
+      expect(result.details).toMatchObject({ outcome: "error" })
+    }
+    expect(JSON.stringify(results.find(result => result.toolCallId === "bash-error")?.details)).not.toContain('"text"')
+    expect(JSON.stringify(results.find(result => result.toolCallId === "output-error")?.details)).not.toContain(
+      '"text"'
+    )
+  } finally {
+    session.dispose()
+  }
+})
+
 test("one turn can write, read, edit, execute, stream, and persist", async () => {
   const root = await mkdtemp(join(tmpdir(), "openzi-turn-"))
   const sessions = join(root, "sessions")

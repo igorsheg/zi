@@ -11,6 +11,7 @@ import type { SessionManager } from "./session-manager.js"
 import type { SessionShell } from "./session-shell.js"
 import type { SettingsManager } from "./settings-manager.js"
 import { buildSystemPrompt } from "./system-prompt.js"
+import { isBuiltInToolError } from "./tools/index.js"
 
 export interface AgentSessionServices {
   readonly paths: OpenZiPaths
@@ -57,7 +58,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions): Pr
     },
     steeringMode: settings.steeringMode,
     followUpMode: settings.followUpMode,
-    toolExecution: "parallel"
+    toolExecution: "parallel",
+    afterToolCall: async ({ toolCall, result, isError }) =>
+      !isError && isBuiltInToolError(toolCall.name, result.details) ? { isError: true } : undefined
   })
 
   if (!existing) {

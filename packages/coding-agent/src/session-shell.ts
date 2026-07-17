@@ -102,6 +102,15 @@ export type ShellRunResult =
   | { readonly type: "completed"; readonly task: Extract<ShellTaskSnapshot, { type: "completed" }> }
   | { readonly type: "backgrounded"; readonly task: Extract<ShellTaskSnapshot, { type: "background" }> }
 
+export class ShellRunAdmissionError extends Error {
+  constructor(
+    readonly reason: "invalid-command" | "invalid-timeout" | "foreground-busy" | "background-capacity",
+    message: string
+  ) {
+    super(message)
+  }
+}
+
 export type ShellDemotionResult =
   | { readonly type: "none" }
   | { readonly type: "capacity_exceeded" }
@@ -225,9 +234,14 @@ export class SessionShell {
     this.#evictExpired()
     assertRunRequest(request, this.limits)
     if (signal?.aborted) throw new Error("Command aborted")
-    if (!request.background && this.#foregroundTask()) throw new Error("Another foreground shell command is running")
+    if (!request.background && this.#foregroundTask()) {
+      throw new ShellRunAdmissionError("foreground-busy", "Another foreground shell command is running")
+    }
     if (request.background && this.#backgroundCount() >= this.limits.maxBackgroundTasks) {
-      throw new Error(`Background task capacity exceeded (maximum ${this.limits.maxBackgroundTasks})`)
+      throw new ShellRunAdmissionError(
+        "background-capacity",
+        `Background task capacity exceeded (maximum ${this.limits.maxBackgroundTasks})`
+      )
     }
 
     const taskId = crypto.randomUUID()
@@ -886,9 +900,12 @@ async function settleWithin(operation: Promise<void>, timeoutMs: number): Promis
 }
 
 function assertRunRequest(request: ShellRunRequest, limits: ShellLimits): void {
-  if (!request.command) throw new Error("Command cannot be empty")
+  if (!request.command) throw new ShellRunAdmissionError("invalid-command", "Command cannot be empty")
   if (!Number.isFinite(request.timeoutMs) || request.timeoutMs <= 0 || request.timeoutMs > limits.maxRuntimeMs) {
-    throw new Error(`Command timeout must be between 0 and ${limits.maxRuntimeMs} milliseconds`)
+    throw new ShellRunAdmissionError(
+      "invalid-timeout",
+      `Command timeout must be between 0 and ${limits.maxRuntimeMs} milliseconds`
+    )
   }
 }
 

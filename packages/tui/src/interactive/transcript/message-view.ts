@@ -10,18 +10,11 @@ import {
   TextRenderable,
   type RenderContext
 } from "@opentui/core"
-import type { AgentMessage } from "@openzi/coding-agent"
+import { projectToolPresentation, type AgentMessage } from "@openzi/coding-agent"
 
 import type { Theme } from "../../theme.js"
 import type { ActiveTool } from "../interactive-store.js"
-import {
-  createCommandToolBlock,
-  createReadToolBlock,
-  createToolBlock,
-  formatToolTitle,
-  preparingTool,
-  ToolCallView
-} from "./tool-view.js"
+import { ToolCallView, type ToolViewFrame } from "./tool-view.js"
 
 // OpenTUI 0.4.3 drops the trailing block when streaming is false; pinned OpenCode also keeps it enabled.
 const markdownStreamingWorkaround = true
@@ -46,6 +39,7 @@ export interface MessageRenderOptions {
   readonly theme: Theme
   readonly syntaxStyle: SyntaxStyle
   readonly toolCall?: ToolCallPresentation
+  readonly cwd?: string
 }
 
 export interface ToolCallPresentation {
@@ -62,15 +56,11 @@ export function createMessageView(
     case "user":
       return createUserMessage(ctx, textContent(message.content), options.theme)
     case "assistant":
-      return new StreamingAssistantView(ctx, message, options.theme, options.syntaxStyle).root
+      return new StreamingAssistantView(ctx, message, options.theme, options.syntaxStyle, undefined, options.cwd).root
     case "toolResult":
-      return createToolResultView(ctx, message, options.toolCall, options.theme)
+      return createToolResultView(ctx, message, options.toolCall, options.theme, options.cwd ?? "")
     case "bashExecution":
-      return createCommandToolBlock(
-        ctx,
-        { title: `$ ${message.command}`, output: message.output, status: message.exitCode === 0 ? "done" : "failed" },
-        options.theme
-      )
+      return createBashExecutionView(ctx, message, options.theme, options.cwd ?? "")
     case "custom":
       return message.display
         ? createPanelMessage(ctx, textContent(message.content), options.theme.text.custom, options.theme)
@@ -124,7 +114,8 @@ type StreamingPartView =
 
 export interface AssistantToolViewOwner {
   includes(id: string): boolean
-  create(owner: StreamingAssistantView, id: string, name: string, args: unknown): ToolCallView
+  create(owner: StreamingAssistantView, tool: ActiveTool): ToolCallView
+  update(view: ToolCallView, tool: ActiveTool): boolean
   release(owner: StreamingAssistantView, id: string, view: ToolCallView): void
 }
 
@@ -135,6 +126,7 @@ export class StreamingAssistantView {
   readonly #theme: Theme
   readonly #syntaxStyle: SyntaxStyle
   readonly #toolViews: AssistantToolViewOwner | undefined
+  readonly #cwd: string
   readonly #parts: StreamingPartView[] = []
   #error: TextRenderable | undefined
   #errorValue: string | undefined
@@ -145,12 +137,14 @@ export class StreamingAssistantView {
     message: AssistantMessage,
     theme: Theme,
     syntaxStyle: SyntaxStyle,
-    toolViews?: AssistantToolViewOwner
+    toolViews?: AssistantToolViewOwner,
+    cwd = ""
   ) {
     this.#ctx = ctx
     this.#theme = theme
     this.#syntaxStyle = syntaxStyle
     this.#toolViews = toolViews
+    this.#cwd = cwd
     this.root = new BoxRenderable(ctx, {
       id: "streaming-assistant",
       paddingLeft: 1,
@@ -230,7 +224,7 @@ export class StreamingAssistantView {
       if (!part || !view) continue
       if (part.kind === "tool" && view.kind === "tool") {
         if (part.tool !== view.tool) {
-          if (view.view.update(part.tool)) changed = true
+          if (this.#toolViews?.update(view.view, part.tool) ?? view.view.update(toolFrame(part.tool))) changed = true
           view.tool = part.tool
         }
         continue
@@ -338,9 +332,9 @@ export class StreamingAssistantView {
 
     const tool = part.tool
     const view =
-      this.#toolViews?.create(this, tool.id, tool.name, tool.args) ??
-      new ToolCallView(this.#ctx, preparingTool(tool.id, tool.name, tool.args), this.#theme)
-    view.update(tool)
+      this.#toolViews?.create(this, tool) ??
+      new ToolCallView(this.#ctx, tool.id, toolFrame(tool), this.#theme, this.#cwd)
+    if (this.#toolViews) this.#toolViews.update(view, tool)
     view.root.marginTop = this.#parts.at(-1)?.kind === "tool" || this.#parts.length === 0 ? 0 : 1
     return { kind: "tool", root: view.root, id: tool.id, view, tool }
   }
@@ -432,7 +426,7 @@ function toolFromMessage(
       result: { content: [{ type: "text", text: message.errorMessage || "Error" }] }
     }
   }
-  return preparingTool(part.id, part.name, part.arguments)
+  return { id: part.id, name: part.name, args: part.arguments, status: "preparing" }
 }
 
 function omittedToolsText(count: number): string {
@@ -453,18 +447,49 @@ function createToolResultView(
   ctx: RenderContext,
   message: ToolResultMessage,
   call: ToolCallPresentation | undefined,
-  theme: Theme
+  theme: Theme,
+  cwd: string
 ): BoxRenderable {
-  const name = call?.name ?? message.toolName
-  const options = {
-    title: formatToolTitle(name, call?.args),
-    output: textContent(message.content),
-    status: message.isError ? ("failed" as const) : ("done" as const)
+  const source: ActiveTool = {
+    id: message.toolCallId,
+    name: call?.name ?? message.toolName,
+    args: call?.args,
+    result: { content: message.content, details: message.details },
+    status: message.isError ? "failed" : "done"
   }
+  return new ToolCallView(ctx, source.id, toolFrame(source), theme, cwd).root
+}
 
-  if (name === "bash") return createCommandToolBlock(ctx, options, theme)
-  if (name === "read") return createReadToolBlock(ctx, options, theme)
-  return createToolBlock(ctx, options, theme)
+function createBashExecutionView(
+  ctx: RenderContext,
+  message: Extract<AgentMessage, { role: "bashExecution" }>,
+  theme: Theme,
+  cwd: string
+): BoxRenderable {
+  const status = message.exitCode === 0 ? ("done" as const) : ("failed" as const)
+  return new ToolCallView(
+    ctx,
+    `bash-execution:${message.timestamp}`,
+    {
+      status,
+      presentation: {
+        header: {
+          label: "Bash",
+          subject: { type: "command", text: message.command },
+          details: [`exit ${message.exitCode}`]
+        },
+        body: { type: "terminal", text: message.output },
+        notices: [],
+        preview: { type: "tail", rows: 5 }
+      }
+    },
+    theme,
+    cwd
+  ).root
+}
+
+function toolFrame(tool: ActiveTool): ToolViewFrame {
+  return { status: tool.status, presentation: projectToolPresentation(tool) }
 }
 
 function createPanelMessage(ctx: RenderContext, content: string, color: string, theme: Theme): BoxRenderable {

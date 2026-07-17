@@ -1,5 +1,7 @@
 # ADR 0013: Tool invocations keep one transcript identity
 
+> Amended by [ADR 0014](0014-tool-presentation-is-semantic-data.md): invocation identity and placement remain unchanged, while the former per-tool `ToolDisplay` union is replaced by typed result details and semantic presentation primitives.
+
 ## Status
 
 Accepted.
@@ -30,9 +32,9 @@ The store consumes only the changed tool-call part identified by `assistantMessa
 
 `StreamingAssistantView` projects tool-call parts at their actual content positions beside thinking and prose. `TranscriptView` admits at most 64 projected tool IDs across embedded, standalone, and committed placement, replacing older projected invocations with bounded omission rows. It indexes each admitted `ToolCallView` by tool-call ID. One stable native root receives partial arguments, ready/running transitions, partial output, and the final tool-result payload. When the assistant message commits, its streaming root is promoted only at the message index where streaming began. When the tool result commits, an embedded tool view is updated in place; a standalone fallback is promoted rather than rebuilt. If live message eviction removes an assistant while its result remains inside the 200-message window, the same tool root is detached and promoted to that result position before the assistant is destroyed. Live and restored projections therefore agree.
 
-Built-in tool semantics remain in `packages/coding-agent`. The pure `projectToolDisplay()` boundary validates unknown args/results and produces a closed, framework-neutral display value for bash, read, write, edit, or generic tools. Output, full-output paths, notice count, and each notice are bounded before wrapping. The OpenTUI view owns width, wrapping, rail styling, expansion, native identity, and selection mechanics; it clears native selection before destroying selectable preview rows and does not parse built-in result details by tool name.
+Built-in tool semantics remain in `packages/coding-agent`. Each tool returns bounded typed result details separately from model-facing content. A pure projector validates the current invocation and produces one shallow, framework-neutral `ToolPresentation`: semantic header, optional `terminal | source | diff | text` body, structured notices, and compact preview policy. Unknown tools and obsolete or malformed persisted details use the ordinary bounded generic projection. There are no legacy tool-specific compatibility parsers.
 
-Tool previews are bounded before entering the TUI and again after cell-aware visual wrapping. Collapsed tools retain at most 12 preview rows by kind; expansion retains at most 200 visual rows. Bash keeps a five-row tail and exposes structured truncation/full-output notices. Read is compact on success and reveals bounded output on expansion or failure. Write streams a bounded content head. Edit streams bounded replacements and replaces them with the executed diff. Generic arguments and output remain bounded. The mode-owned `app.tools.expand` binding toggles detail without replacing roots. One transcript-owned live request refreshes elapsed text for visible running tools through the renderer lifecycle; individual tool views never create timers or frame schedulers.
+The OpenTUI view receives lifecycle status plus `ToolPresentation`; it never switches on built-in names or parses their arguments and result details. It owns width, path display and links, syntax highlighting, cell-aware wrapping, rail styling, expansion, native identity, selection, and renderable disposal. Tool previews are bounded before entering the TUI and again after visual wrapping. Compact bodies retain at most 12 rows and expanded bodies at most 200. The mode-owned `app.tools.expand` binding toggles detail without replacing roots. One transcript-owned live request refreshes elapsed text for visible running tools without reprojecting tool data; individual tool views never create timers or frame schedulers. See `docs/tool-presentation-implementation-spec.md`.
 
 ## Consequences
 
@@ -40,5 +42,5 @@ Tool previews are bounded before entering the TUI and again after cell-aware vis
 - Sequential calls distinguish complete-but-waiting arguments from running execution.
 - Tool rows remain source ordered and keep native identity through final commit and projection-boundary promotion.
 - Transcript reconciliation still uses one frame-coalesced notification stream and updates only changed retained handles.
-- Tool-specific hints and structured result details can evolve beside their coding-agent tools without importing OpenTUI into `packages/coding-agent`.
+- Tool-specific hints and typed result details evolve in coding-agent projectors without importing OpenTUI or adding tool dispatch to `packages/tui`.
 - Expansion currently applies to all projected tool rows, matching Pi's simple global interaction. Per-row focus or folding requires a separate navigation owner rather than booleans on renderables.

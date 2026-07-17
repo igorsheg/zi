@@ -40,15 +40,15 @@ test("representative session keeps the accepted visual hierarchy at normal and c
       "",
       " The layout keeps content readable and highlights code.",
       "",
-      " read src/app.tsx",
+      " Read src/app.tsx · 1-1 of 1",
       "",
-      " $ bun test (error)",
+      " Bash $ bun test · task task-1 (error)",
       " ╭───",
       " │ 1 test failed",
       " ╰───",
+      " [Command exited with code 1]",
       "",
       " The failed command remains visible without overwhelming the prompt.",
-      "",
       "",
       "",
       "",
@@ -72,7 +72,7 @@ test("representative session keeps the accepted visual hierarchy at normal and c
     setup.resize(40, 8)
     await setup.renderOnce()
     expect(frameRows(setup.captureCharFrame(), 8)).toEqual([
-      " ╰───",
+      " [Command exited with code 1]",
       "",
       " The failed command remains visible",
       " without overwhelming the prompt.",
@@ -108,6 +108,22 @@ function representativeMessages(): AgentMessage[] {
       toolCallId: "read-1",
       toolName: "read",
       content: [{ type: "text", text: "export function App() {}" }],
+      details: {
+        outcome: "success",
+        startLine: 1,
+        endLine: 1,
+        totalLines: 1,
+        truncation: {
+          truncated: false,
+          truncatedBy: null,
+          totalLines: 1,
+          totalBytes: 24,
+          outputLines: 1,
+          outputBytes: 24,
+          firstLineExceedsLimit: false,
+          lastLinePartial: false
+        }
+      },
       isError: false,
       timestamp: 3
     },
@@ -117,6 +133,27 @@ function representativeMessages(): AgentMessage[] {
       toolCallId: "bash-1",
       toolName: "bash",
       content: [{ type: "text", text: "1 test failed" }],
+      details: {
+        outcome: "error",
+        taskId: "task-1",
+        state: "completed",
+        timeoutSeconds: 120,
+        finalOutcome: { type: "exited", exitCode: 1 },
+        error: "Command exited with code 1",
+        output: {
+          truncation: {
+            truncated: false,
+            truncatedBy: null,
+            totalLines: 1,
+            totalBytes: 13,
+            outputLines: 1,
+            outputBytes: 13,
+            firstLineExceedsLimit: false,
+            lastLinePartial: false
+          },
+          fullOutput: { type: "available", path: "/tmp/task-1.log", bytes: 13, truncated: false }
+        }
+      },
       isError: true,
       timestamp: 5
     },

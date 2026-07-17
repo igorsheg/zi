@@ -8,7 +8,7 @@ import {
   type SyntaxStyle,
   TextRenderable
 } from "@opentui/core"
-import type { AgentMessage } from "@openzi/coding-agent"
+import { projectToolPresentation, type AgentMessage } from "@openzi/coding-agent"
 import type { ReadableAtom } from "nanostores"
 
 import type { Theme } from "../../theme.js"
@@ -21,11 +21,12 @@ import {
   type ToolCallPresentation
 } from "./message-view.js"
 import { createTranscriptStore, type TranscriptStore } from "./navigation.js"
-import { completedTool, createActiveToolView, preparingTool, type ToolCallView } from "./tool-view.js"
+import { ToolCallView, type ToolViewFrame } from "./tool-view.js"
 
 interface TranscriptSession {
   readonly messages: readonly AgentMessage[]
   readonly streamingMessage: AgentMessage | undefined
+  readonly sessionManager?: { readonly header: { readonly cwd: string } }
 }
 
 interface TranscriptSource {
@@ -49,6 +50,7 @@ interface CommittedMessageView {
 
 interface IndexedToolView {
   readonly view: ToolCallView
+  source: ActiveTool
   placement: "embedded" | "standalone" | "committed"
   owner: StreamingAssistantView | undefined
 }
@@ -77,6 +79,7 @@ export interface TranscriptDiagnostics {
   readonly activeToolCreates: number
   readonly activeToolUpdates: number
   readonly activeToolDestroys: number
+  readonly toolProjections: number
 }
 
 export interface TranscriptViewOptions {
@@ -109,31 +112,39 @@ export class TranscriptView {
   readonly #activeToolViews = new Map<string, ToolCallView>()
   readonly #assistantToolViews: AssistantToolViewOwner = {
     includes: id => this.#projectedToolIds.has(id),
-    create: (owner, id, name, args) => {
-      const retained = this.#toolViews.get(id)
+    create: (owner, fallback) => {
+      const tool = this.#authoritativeTool(fallback)
+      const retained = this.#toolViews.get(tool.id)
       if (retained) {
         if (retained.placement === "standalone") {
           this.scroll.remove(retained.view.root)
-          this.#activeToolViews.delete(id)
-          this.#activeToolOrder = this.#activeToolOrder.filter(candidate => candidate !== id)
+          this.#activeToolViews.delete(tool.id)
+          this.#activeToolOrder = this.#activeToolOrder.filter(candidate => candidate !== tool.id)
           retained.placement = "embedded"
         }
         retained.owner = owner
         retained.view.setEmbedded(true)
-        retained.view.update(preparingTool(id, name, args))
+        this.#updateToolView(retained, tool)
         return retained.view
       }
-      const view = createActiveToolView(
+      const view = new ToolCallView(
         this.#renderer,
-        preparingTool(id, name, args),
+        tool.id,
+        this.#projectTool(tool),
         this.#theme,
+        sessionCwd(this.#session),
         this.#keybindings.getHint("app.tools.expand")
       )
       view.setExpanded(this.#toolsExpanded)
       view.setEmbedded(true)
-      this.#toolViews.set(id, { view, placement: "embedded", owner })
+      this.#toolViews.set(tool.id, { view, source: tool, placement: "embedded", owner })
       this.#diagnostics.activeToolCreates++
       return view
+    },
+    update: (view, fallback) => {
+      const tool = this.#authoritativeTool(fallback)
+      const retained = this.#toolViews.get(tool.id)
+      return retained?.view === view ? this.#updateToolView(retained, tool) : view.update(this.#projectTool(tool))
     },
     release: (owner, id, view) => {
       const retained = this.#toolViews.get(id)
@@ -154,7 +165,8 @@ export class TranscriptView {
     streamingUpdates: 0,
     activeToolCreates: 0,
     activeToolUpdates: 0,
-    activeToolDestroys: 0
+    activeToolDestroys: 0,
+    toolProjections: 0
   }
   #session: TranscriptSession
   #hasProjection = false
@@ -380,7 +392,11 @@ export class TranscriptView {
             : undefined
         const root =
           promoted?.root ??
-          createMessageView(this.#renderer, message, { theme: this.#theme, syntaxStyle: this.#syntaxStyle })
+          createMessageView(this.#renderer, message, {
+            theme: this.#theme,
+            syntaxStyle: this.#syntaxStyle,
+            cwd: sessionCwd(this.#session)
+          })
         if (promoted) this.#streaming = undefined
         if (root) {
           if (!promoted) this.#insertBeforeTransient(root)
@@ -404,7 +420,8 @@ export class TranscriptView {
         message,
         this.#theme,
         this.#syntaxStyle,
-        this.#assistantToolViews
+        this.#assistantToolViews,
+        sessionCwd(this.#session)
       )
       this.#insertBeforeTransient(view.root)
       this.#diagnostics.streamingCreates++
@@ -418,11 +435,11 @@ export class TranscriptView {
     const name = call?.name ?? message.toolName
     const args = call?.args
     const result = { content: message.content, details: message.details }
-    const tool = completedTool(message.toolCallId, name, args, result, message.isError)
+    const tool: ActiveTool = { id: message.toolCallId, name, args, result, status: message.isError ? "failed" : "done" }
     const retained = this.#toolViews.get(message.toolCallId)
 
     if (retained) {
-      if (retained.view.update(tool)) this.#diagnostics.activeToolUpdates++
+      if (this.#updateToolView(retained, tool)) this.#diagnostics.activeToolUpdates++
       if (retained.placement === "standalone") {
         this.scroll.remove(retained.view.root)
         this.#activeToolViews.delete(message.toolCallId)
@@ -434,14 +451,16 @@ export class TranscriptView {
         this.#committed.push({ messageIndex, root: undefined, toolCallIds: [message.toolCallId] })
       }
     } else if (this.#projectedToolIds.has(message.toolCallId)) {
-      const view = createActiveToolView(
+      const view = new ToolCallView(
         this.#renderer,
-        tool,
+        tool.id,
+        this.#projectTool(tool),
         this.#theme,
+        sessionCwd(this.#session),
         this.#keybindings.getHint("app.tools.expand")
       )
       view.setExpanded(this.#toolsExpanded)
-      this.#toolViews.set(message.toolCallId, { view, placement: "committed", owner: undefined })
+      this.#toolViews.set(message.toolCallId, { view, source: tool, placement: "committed", owner: undefined })
       this.#insertBeforeTransient(view.root)
       this.#committed.push({ messageIndex, root: view.root, toolCallIds: [message.toolCallId] })
       this.#diagnostics.activeToolCreates++
@@ -677,7 +696,8 @@ export class TranscriptView {
         message,
         this.#theme,
         this.#syntaxStyle,
-        this.#assistantToolViews
+        this.#assistantToolViews,
+        sessionCwd(this.#session)
       )
       this.#streaming = { type: "assistant", messageIndex: this.#nextMessageIndex, view }
       this.#insertBeforeActiveTools(view.root)
@@ -687,7 +707,11 @@ export class TranscriptView {
 
     if (this.#streaming?.type === "static" && this.#streaming.role === message.role) return
     this.#destroyStreaming()
-    const root = createMessageView(this.#renderer, message, { theme: this.#theme, syntaxStyle: this.#syntaxStyle })
+    const root = createMessageView(this.#renderer, message, {
+      theme: this.#theme,
+      syntaxStyle: this.#syntaxStyle,
+      cwd: sessionCwd(this.#session)
+    })
     this.#streaming = { type: "static", messageIndex: this.#nextMessageIndex, role: message.role, root }
     if (root) this.#insertBeforeActiveTools(root)
     this.#diagnostics.streamingCreates++
@@ -717,18 +741,20 @@ export class TranscriptView {
       if (!this.#projectedToolIds.has(id)) continue
       const indexed = this.#toolViews.get(id)
       if (indexed) {
-        if (indexed.view.update(tool)) this.#diagnostics.activeToolUpdates++
+        if (this.#updateToolView(indexed, tool)) this.#diagnostics.activeToolUpdates++
         continue
       }
-      const view = createActiveToolView(
+      const view = new ToolCallView(
         this.#renderer,
-        tool,
+        tool.id,
+        this.#projectTool(tool),
         this.#theme,
+        sessionCwd(this.#session),
         this.#keybindings.getHint("app.tools.expand")
       )
       view.setExpanded(this.#toolsExpanded)
       this.scroll.add(view.root)
-      this.#toolViews.set(id, { view, placement: "standalone", owner: undefined })
+      this.#toolViews.set(id, { view, source: tool, placement: "standalone", owner: undefined })
       this.#activeToolViews.set(id, view)
       this.#diagnostics.activeToolCreates++
     }
@@ -739,6 +765,21 @@ export class TranscriptView {
       for (const id of order) this.scroll.add(this.#activeToolViews.get(id)!.root)
       this.#activeToolOrder = order
     }
+  }
+
+  #authoritativeTool(fallback: ActiveTool): ActiveTool {
+    return this.#interactive.$activeTools.get().get(fallback.id) ?? fallback
+  }
+
+  #projectTool(source: ActiveTool): ToolViewFrame {
+    this.#diagnostics.toolProjections++
+    return { status: source.status, presentation: projectToolPresentation(source) }
+  }
+
+  #updateToolView(indexed: IndexedToolView, source: ActiveTool): boolean {
+    if (indexed.source === source) return false
+    indexed.source = source
+    return indexed.view.update(this.#projectTool(source))
   }
 
   #refreshElapsedTools(): void {
@@ -914,6 +955,10 @@ export class TranscriptView {
         return assertNever(action)
     }
   }
+}
+
+function sessionCwd(session: TranscriptSession): string {
+  return session.sessionManager?.header.cwd ?? ""
 }
 
 function streamingRoot(streaming: StreamingMessageView): Renderable | undefined {

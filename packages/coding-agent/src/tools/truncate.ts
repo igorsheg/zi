@@ -13,6 +13,48 @@ export interface TruncationResult {
   lastLinePartial: boolean
 }
 
+export type TruncationDetails = Omit<TruncationResult, "content">
+
+export function truncationDetails(truncation: TruncationResult): TruncationDetails {
+  const { content: _content, ...details } = truncation
+  return details
+}
+
+export function isTruncationDetails(value: unknown): value is TruncationDetails {
+  if (
+    !isRecord(value) ||
+    typeof value.truncated !== "boolean" ||
+    (value.truncatedBy !== "lines" && value.truncatedBy !== "bytes" && value.truncatedBy !== null) ||
+    !isNonNegativeInteger(value.totalLines) ||
+    !isNonNegativeInteger(value.totalBytes) ||
+    !isNonNegativeInteger(value.outputLines) ||
+    !isNonNegativeInteger(value.outputBytes) ||
+    value.outputLines > value.totalLines ||
+    value.outputBytes > value.totalBytes ||
+    typeof value.firstLineExceedsLimit !== "boolean" ||
+    typeof value.lastLinePartial !== "boolean" ||
+    (value.firstLineExceedsLimit && value.lastLinePartial)
+  ) {
+    return false
+  }
+
+  if (!value.truncated) {
+    return (
+      value.truncatedBy === null &&
+      !value.firstLineExceedsLimit &&
+      !value.lastLinePartial &&
+      value.outputBytes === value.totalBytes &&
+      (value.totalBytes === 0 ? value.outputLines === 0 : value.outputLines === value.totalLines)
+    )
+  }
+  if (value.truncatedBy === null) return false
+  if (value.firstLineExceedsLimit) {
+    return value.truncatedBy === "bytes" && value.outputLines === 0 && value.outputBytes === 0
+  }
+  if (value.lastLinePartial) return value.truncatedBy === "bytes" && value.outputLines === 1
+  return value.outputLines < value.totalLines || value.outputBytes < value.totalBytes
+}
+
 export function truncateHead(
   content: string,
   maxLines = DEFAULT_MAX_LINES,
@@ -95,4 +137,12 @@ function tailBytes(text: string, maxBytes: number): string {
   let start = Math.max(0, buffer.length - maxBytes)
   while (start < buffer.length && (buffer[start]! & 0xc0) === 0x80) start++
   return buffer.subarray(start).toString()
+}
+
+function isNonNegativeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
 }
