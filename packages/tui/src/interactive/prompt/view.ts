@@ -1,13 +1,7 @@
-import {
-  BoxRenderable,
-  CliRenderEvents,
-  type CliRenderer,
-  type KeyEvent,
-  TextAttributes,
-  TextRenderable
-} from "@opentui/core"
+import { BoxRenderable, CliRenderEvents, type CliRenderer, type KeyEvent, TextAttributes } from "@opentui/core"
 
 import { composerGeometry, createComposer, type Composer } from "../../components/composer.js"
+import { ShimmerTextView } from "../../components/shimmer-text.js"
 import type { Theme } from "../../theme.js"
 import type { BrowserOpener } from "../browser-opener.js"
 import type { ExitGestureController } from "../exit-gesture.js"
@@ -29,7 +23,7 @@ export class PromptView {
   readonly #keybindings: InteractiveKeybindings
   readonly #exitGestures: ExitGestureController
   readonly #store: PromptStore
-  readonly #working: BoxRenderable
+  readonly #working: ShimmerTextView
   readonly #feedback: PromptFeedbackView
   readonly #queue: QueuedInputsView
   readonly #composer: Composer
@@ -54,8 +48,7 @@ export class PromptView {
     this.#store = createPromptStore(interactive, slash, sessionActions)
     this.root = new BoxRenderable(renderer, { flexDirection: "column", flexShrink: 0 })
 
-    this.#working = new BoxRenderable(renderer, { flexDirection: "row", flexShrink: 0 })
-    this.#working.add(new TextRenderable(renderer, { fg: theme.text.muted, content: "Working…" }))
+    this.#working = new ShimmerTextView(renderer, "Working…", theme.text.muted, theme.text.primary)
     this.#feedback = new PromptFeedbackView(renderer, browserOpener, theme)
     this.#queue = new QueuedInputsView(renderer, keybindings, theme)
 
@@ -72,7 +65,7 @@ export class PromptView {
     this.input = this.#composer.input
     this.#pickerStack = new PickerStackView(renderer, this.#store.picker, theme, () => this.input.plainText)
 
-    this.root.add(this.#working)
+    this.root.add(this.#working.root)
     this.root.add(this.#feedback.root)
     this.root.add(this.#queue.root)
     this.root.add(this.#composer.root)
@@ -97,6 +90,7 @@ export class PromptView {
 
   destroy(): void {
     for (const release of this.#release.splice(0)) release()
+    this.#working.destroy()
     this.#pickerStack.destroy()
     this.#feedback.destroy()
     this.#queue.destroy()
@@ -120,7 +114,7 @@ export class PromptView {
     const fixedRows = geometry.protectedRows + (session.isStreaming ? 1 : 0) + (feedbackVisible ? 1 : 0)
     const pickerVisible = this.#pickerStack.update(Math.max(0, this.#renderer.height - fixedRows))
 
-    this.#working.visible = session.isStreaming
+    this.#working.setActive(session.isStreaming)
     if (pickerVisible) this.#queue.hide()
     else this.#queue.update(session.queuedInputs, Math.max(0, this.#renderer.height - fixedRows))
     this.#composer.update(geometry, session.sessionManager.header.cwd, modelTitle(session))

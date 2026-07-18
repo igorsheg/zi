@@ -41,8 +41,10 @@ test("the OpenTUI prompt drives a complete tool turn", async () => {
     expect(session.isStreaming).toBe(true)
     await setup.renderOnce()
     expect(setup.captureCharFrame()).toContain("Working…")
+    expect(setup.renderer.liveRequestCount).toBeGreaterThan(0)
     await session.waitForIdle()
     await setup.renderOnce()
+    expect(setup.renderer.liveRequestCount).toBe(0)
 
     expect(await readFile(join(cwd, "answer.txt"), "utf8")).toBe("42\n")
     const frame = setup.captureCharFrame()

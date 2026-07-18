@@ -392,7 +392,7 @@ test("streamed tool execution leaves a detached native viewport anchored", async
     let operation!: Promise<void>
     operation = session.prompt("run the tool")
     await providerStarted.promise
-    await renderSettled(setup)
+    await setup.renderOnce()
     await pressRaw(setup, "\x1b[5~")
     const detachedTop = scroll.scrollTop
 
