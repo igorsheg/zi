@@ -306,8 +306,9 @@ export class SessionShell {
 
     if (running.type === "background") {
       toolSettled.resolve({ type: "backgrounded", task: this.#snapshot(running) })
-    } else if (signal?.aborted) {
-      this.#stop(taskId, "abort")
+    } else {
+      running.onUpdate?.(this.#snapshot(running))
+      if (signal?.aborted) this.#stop(taskId, "abort")
     }
     this.#emit(taskId)
     return toolSettled.promise
@@ -722,7 +723,7 @@ class TaskOutput {
     const listener = (chunk: Buffer) => {
       this.#totalBytes += chunk.length
       this.#newlines += countByte(chunk, 10)
-      this.#endsWithNewline = chunk.at(-1) === 10
+      if (chunk.length > 0) this.#endsWithNewline = chunk[chunk.length - 1] === 10
       this.#tail = Buffer.concat([this.#tail, chunk])
       if (this.#tail.length > DEFAULT_MAX_BYTES * 2) {
         let tailStart = this.#tail.length - DEFAULT_MAX_BYTES * 2
@@ -750,7 +751,7 @@ class TaskOutput {
   }
 
   snapshot(): ShellTaskOutputSnapshot {
-    const totalLines = this.#newlines + (this.#totalBytes > 0 && !this.#endsWithNewline ? 1 : 0)
+    const totalLines = this.#totalBytes === 0 ? 0 : this.#newlines + (this.#endsWithNewline ? 0 : 1)
     const base = truncateTail(this.#tail.toString(), DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES)
     const truncated = this.#totalBytes > DEFAULT_MAX_BYTES || totalLines > DEFAULT_MAX_LINES
     const truncation: TruncationResult = {

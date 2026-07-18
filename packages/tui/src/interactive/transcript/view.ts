@@ -6,7 +6,8 @@ import {
   type Renderable,
   ScrollBoxRenderable,
   type SyntaxStyle,
-  TextRenderable
+  TextRenderable,
+  type TreeSitterClient
 } from "@opentui/core"
 import { projectToolPresentation, type AgentMessage } from "@openzi/coding-agent"
 import type { ReadableAtom } from "nanostores"
@@ -14,6 +15,7 @@ import type { ReadableAtom } from "nanostores"
 import type { Theme } from "../../theme.js"
 import type { InteractiveKeybindings, TranscriptKeyAction } from "../interactive-keybindings.js"
 import type { ActiveTool } from "../interactive-store.js"
+import { createMarkdownTreeSitterClient } from "./markdown-highlighting.js"
 import {
   createMessageView,
   StreamingAssistantView,
@@ -27,6 +29,7 @@ interface TranscriptSession {
   readonly messages: readonly AgentMessage[]
   readonly streamingMessage: AgentMessage | undefined
   readonly sessionManager?: { readonly header: { readonly cwd: string } }
+  readonly shellTasks?: readonly { readonly type: string; readonly toolCallId: string }[]
 }
 
 interface TranscriptSource {
@@ -84,6 +87,7 @@ export interface TranscriptDiagnostics {
 
 export interface TranscriptViewOptions {
   readonly measureSync?: boolean
+  readonly treeSitterClient?: TreeSitterClient
 }
 
 const maxProjectedMessages = 200
@@ -101,6 +105,7 @@ export class TranscriptView {
   readonly #syntaxStyle: SyntaxStyle
   readonly #navigation: TranscriptStore
   readonly #status: BoxRenderable
+  readonly #treeSitterClient: TreeSitterClient | undefined
   readonly #measureSync: boolean
   readonly #requestFrame: typeof requestAnimationFrame
   readonly #cancelFrame: typeof cancelAnimationFrame
@@ -197,6 +202,7 @@ export class TranscriptView {
     this.#keybindings = keybindings
     this.#theme = theme
     this.#syntaxStyle = syntaxStyle
+    this.#treeSitterClient = options.treeSitterClient ?? createMarkdownTreeSitterClient()
     this.#measureSync = options.measureSync ?? false
     this.#requestFrame = globalThis.requestAnimationFrame.bind(globalThis)
     this.#cancelFrame = globalThis.cancelAnimationFrame.bind(globalThis)
@@ -344,6 +350,7 @@ export class TranscriptView {
       }
       this.#syncStreaming(session.streamingMessage)
       this.#syncActiveTools(activeTools)
+      this.#syncToolActions(session)
       this.#diagnostics.projectedMessages = this.#committed.length
       this.#diagnostics.omittedMessages = this.#omittedMessageCount
 
@@ -395,7 +402,8 @@ export class TranscriptView {
           createMessageView(this.#renderer, message, {
             theme: this.#theme,
             syntaxStyle: this.#syntaxStyle,
-            cwd: sessionCwd(this.#session)
+            cwd: sessionCwd(this.#session),
+            ...(this.#treeSitterClient ? { treeSitterClient: this.#treeSitterClient } : {})
           })
         if (promoted) this.#streaming = undefined
         if (root) {
@@ -421,7 +429,8 @@ export class TranscriptView {
         this.#theme,
         this.#syntaxStyle,
         this.#assistantToolViews,
-        sessionCwd(this.#session)
+        sessionCwd(this.#session),
+        this.#treeSitterClient
       )
       this.#insertBeforeTransient(view.root)
       this.#diagnostics.streamingCreates++
@@ -697,7 +706,8 @@ export class TranscriptView {
         this.#theme,
         this.#syntaxStyle,
         this.#assistantToolViews,
-        sessionCwd(this.#session)
+        sessionCwd(this.#session),
+        this.#treeSitterClient
       )
       this.#streaming = { type: "assistant", messageIndex: this.#nextMessageIndex, view }
       this.#insertBeforeActiveTools(view.root)
@@ -710,7 +720,8 @@ export class TranscriptView {
     const root = createMessageView(this.#renderer, message, {
       theme: this.#theme,
       syntaxStyle: this.#syntaxStyle,
-      cwd: sessionCwd(this.#session)
+      cwd: sessionCwd(this.#session),
+      ...(this.#treeSitterClient ? { treeSitterClient: this.#treeSitterClient } : {})
     })
     this.#streaming = { type: "static", messageIndex: this.#nextMessageIndex, role: message.role, root }
     if (root) this.#insertBeforeActiveTools(root)
@@ -780,6 +791,16 @@ export class TranscriptView {
     if (indexed.source === source) return false
     indexed.source = source
     return indexed.view.update(this.#projectTool(source))
+  }
+
+  #syncToolActions(session: TranscriptSession): void {
+    const foreground = session.shellTasks?.find(task => task.type === "foreground")
+    const action = foreground
+      ? `${this.#keybindings.getHint("app.task.background")} background · ${this.#keybindings.getHint("app.interrupt")} interrupt`
+      : undefined
+    for (const [id, { view }] of this.#toolViews) {
+      view.setActionHint(id === foreground?.toolCallId ? action : undefined)
+    }
   }
 
   #refreshElapsedTools(): void {

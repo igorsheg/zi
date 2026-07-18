@@ -6,14 +6,12 @@ import {
   type ShellOutputDetails,
   type TaskOutputToolDetails
 } from "../shell-tasks.js"
-import type { ToolNotice, ToolPresentation, ToolPresentationSource } from "./types.js"
+import { maxExpandedToolRows, type ToolNotice, type ToolPresentation, type ToolPresentationSource } from "./types.js"
 import {
   boundHead,
   boundInline,
   boundTail,
   formatBytes,
-  isPartialSource,
-  isTerminalSource,
   matchesToolOutcome,
   recordValue,
   resultDetails,
@@ -22,22 +20,18 @@ import {
   utf8Prefix
 } from "./values.js"
 
-export function projectTaskOutput(source: ToolPresentationSource): ToolPresentation | undefined {
+export function projectTaskOutput(source: ToolPresentationSource): ToolPresentation {
   const args = recordValue(source.args)
   const taskId = stringValue(args?.taskId)
-  if (!isPartialSource(source) && !taskId) return undefined
 
   let details: TaskOutputToolDetails | undefined
   if ("result" in source && source.result !== undefined) {
     const value = resultDetails(source.result)
-    if (!isTaskOutputToolDetails(value) || !matchesToolOutcome(source, value.outcome)) return undefined
-    details = value
-  } else if (isTerminalSource(source)) {
-    return undefined
+    if (isTaskOutputToolDetails(value) && matchesToolOutcome(source, value.outcome)) details = value
   }
 
   const text = "result" in source ? (resultText(source.result) ?? "") : ""
-  const error = details?.outcome === "error"
+  const error = details?.outcome === "error" || source.status === "failed"
   const bodyText = details && details.outcome !== "error" ? shellBodyText(text, details.output) : text
   return {
     header: {
@@ -54,38 +48,48 @@ export function projectTaskOutput(source: ToolPresentationSource): ToolPresentat
       : {}),
     notices:
       details?.outcome === "error"
-        ? [{ type: "message", tone: "error", text: boundInline(details.error) }]
+        ? [{ type: "message", tone: "error", visibility: "always", text: boundInline(details.error) }]
         : details
           ? shellOutputNotices(details.output)
           : [],
-    preview: { type: "tail", rows: 5 }
+    preview: { compact: { type: "tail", rows: 5 }, detailed: { type: "tail", rows: maxExpandedToolRows } },
+    timing: "duration"
   }
 }
 
-export function projectKillTask(source: ToolPresentationSource): ToolPresentation | undefined {
+export function projectKillTask(source: ToolPresentationSource): ToolPresentation {
   const args = recordValue(source.args)
   const taskId = stringValue(args?.taskId)
-  if (!isPartialSource(source) && !taskId) return undefined
 
   let details: KillTaskToolDetails | undefined
   if ("result" in source && source.result !== undefined) {
     const value = resultDetails(source.result)
-    if (!isKillTaskToolDetails(value) || !matchesToolOutcome(source, value.outcome)) return undefined
-    details = value
-  } else if (isTerminalSource(source)) {
-    return undefined
+    if (isKillTaskToolDetails(value) && matchesToolOutcome(source, value.outcome)) details = value
   }
 
   const text = "result" in source ? (resultText(source.result) ?? "") : ""
-  if (details?.outcome === "error") {
+  if (details?.outcome === "error" || (source.status === "failed" && !details)) {
     return {
-      header: { label: "Kill task", subject: { type: "task", id: boundInline(taskId ?? details.taskId) }, details: [] },
-      body: { type: "text", text: boundHead(text || details.error), tone: "error" },
-      notices: [{ type: "message", tone: "error", text: boundInline(details.error) }],
-      preview: { type: "head", rows: 8 }
+      header: {
+        label: "Kill task",
+        subject: { type: "task", id: boundInline(taskId ?? (details?.outcome === "error" ? details.taskId : "…")) },
+        details: []
+      },
+      body: {
+        type: "text",
+        text: boundHead(text || (details?.outcome === "error" ? details.error : "Could not stop task")),
+        tone: "error"
+      },
+      notices:
+        details?.outcome === "error"
+          ? [{ type: "message", tone: "error", visibility: "always", text: boundInline(details.error) }]
+          : [],
+      preview: { compact: { type: "head", rows: 8 }, detailed: { type: "head", rows: maxExpandedToolRows } },
+      timing: "duration"
     }
   }
 
+  const degradedText = details ? "" : text
   return {
     header: {
       label: "Kill task",
@@ -97,8 +101,13 @@ export function projectKillTask(source: ToolPresentationSource): ToolPresentatio
           ]
         : []
     },
+    ...(degradedText ? { body: { type: "text" as const, text: boundHead(degradedText), tone: "muted" as const } } : {}),
     notices: [],
-    preview: { type: "hidden" }
+    preview: {
+      compact: { type: "hidden" },
+      detailed: degradedText ? { type: "head", rows: maxExpandedToolRows } : { type: "hidden" }
+    },
+    timing: "duration"
   }
 }
 
@@ -123,20 +132,33 @@ function shellOutputNotices(output: ShellOutputDetails): ToolNotice[] {
     {
       type: "message",
       tone: "warning",
+      visibility: "always",
       text: `Output truncated to ${output.truncation.outputLines} lines (${formatBytes(output.truncation.outputBytes)})`
     }
   ]
   if (output.fullOutput.type === "available") {
-    notices.push({ type: "path", tone: "warning", label: "Full output", path: boundInline(output.fullOutput.path) })
+    notices.push({
+      type: "path",
+      tone: "warning",
+      visibility: "always",
+      label: "Full output",
+      path: boundInline(output.fullOutput.path)
+    })
   } else {
     notices.push({
       type: "message",
       tone: "warning",
+      visibility: "always",
       text: `Full output is no longer retained (${formatBytes(output.fullOutput.bytes)})`
     })
   }
   if (output.fullOutput.truncated) {
-    notices.push({ type: "message", tone: "warning", text: "Full output reached its retention limit" })
+    notices.push({
+      type: "message",
+      tone: "warning",
+      visibility: "always",
+      text: "Full output reached its retention limit"
+    })
   }
   return notices
 }

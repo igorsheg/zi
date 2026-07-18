@@ -17,25 +17,70 @@ export function truncateToCells(text: string, maxWidth: number): string {
   return `${result}...`
 }
 
+export interface CellLineWindow {
+  readonly lines: readonly string[]
+  readonly hasMore: boolean
+}
+
 export function wrapToCells(text: string, maxWidth: number): string[] {
-  if (maxWidth <= 0) return []
-  if (text.length === 0) return [""]
+  return [...wrappedCellLines(text, maxWidth)]
+}
+
+export function wrapHeadToCells(text: string, maxWidth: number, maxLines: number): CellLineWindow {
+  if (maxLines <= 0) {
+    const iterator = wrappedCellLines(text, maxWidth)
+    return { lines: [], hasMore: !iterator.next().done }
+  }
+  const lines: string[] = []
+  for (const line of wrappedCellLines(text, maxWidth)) {
+    if (lines.length === maxLines) return { lines, hasMore: true }
+    lines.push(line)
+  }
+  return { lines, hasMore: false }
+}
+
+export function wrapTailToCells(text: string, maxWidth: number, maxLines: number): CellLineWindow {
+  if (maxLines <= 0) {
+    const iterator = wrappedCellLines(text, maxWidth)
+    return { lines: [], hasMore: !iterator.next().done }
+  }
 
   const lines: string[] = []
+  let count = 0
+  let next = 0
+  for (const line of wrappedCellLines(text, maxWidth)) {
+    count++
+    if (lines.length < maxLines) {
+      lines.push(line)
+    } else {
+      lines[next] = line
+      next = (next + 1) % maxLines
+    }
+  }
+  if (count <= maxLines) return { lines, hasMore: false }
+  return { lines: [...lines.slice(next), ...lines.slice(0, next)], hasMore: true }
+}
+
+function* wrappedCellLines(text: string, maxWidth: number): Generator<string> {
+  if (maxWidth <= 0) return
+  if (text.length === 0) {
+    yield ""
+    return
+  }
+
   let line = ""
   let width = 0
   for (const { segment } of graphemes.segment(text)) {
     const segmentWidth = graphemeWidth(segment)
     if (width > 0 && width + segmentWidth > maxWidth) {
-      lines.push(line)
+      yield line
       line = ""
       width = 0
     }
     line += segment
     width += segmentWidth
   }
-  lines.push(line)
-  return lines
+  yield line
 }
 
 export function textWidth(text: string): number {

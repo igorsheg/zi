@@ -10,9 +10,11 @@ export function normalizeToolText(value: string): string {
 }
 
 export function boundInline(value: string, limit = maxToolInlineScalars): string {
-  const safe = normalizeToolText(value).replace(/\s*\n\s*/g, " ")
-  const scalars = Array.from(safe)
-  return scalars.length <= limit ? safe : `${scalars.slice(0, limit - 1).join("")}…`
+  return boundScalars(normalizeToolText(value).replace(/\s*\n\s*/g, " "), limit)
+}
+
+export function boundCommand(value: string): string {
+  return boundScalars(normalizeToolText(value), maxToolInlineScalars)
 }
 
 export function boundHead(value: string): string {
@@ -107,6 +109,7 @@ export function utf8Prefix(value: string, maxBytes: number): string {
 }
 
 export function formatBytes(bytes: number): string {
+  if (bytes === 1) return "1 byte"
   if (bytes >= 1024 * 1024 && bytes % (1024 * 1024) === 0) return `${bytes / (1024 * 1024)} MiB`
   if (bytes >= 1024 && bytes % 1024 === 0) return `${bytes / 1024} KiB`
   return `${bytes} bytes`
@@ -114,6 +117,11 @@ export function formatBytes(bytes: number): string {
 
 export function assertNever(value: never): never {
   throw new Error(`Unexpected tool presentation value: ${String(value)}`)
+}
+
+function boundScalars(value: string, limit: number): string {
+  const scalars = Array.from(value)
+  return scalars.length <= limit ? value : `${scalars.slice(0, limit - 1).join("")}…`
 }
 
 function stripAnsi(value: string): string {

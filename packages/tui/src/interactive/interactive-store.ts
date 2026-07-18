@@ -4,7 +4,8 @@ import type {
   AgentSessionEvent,
   ImageContent,
   PendingInputDelivery,
-  QueuedInputs
+  QueuedInputs,
+  ShellDemotionResult
 } from "@openzi/coding-agent"
 import { atom, computed, type ReadableAtom } from "nanostores"
 
@@ -47,7 +48,7 @@ export interface InteractiveStore {
   submit(submission: PromptSubmission): Promise<void>
   restoreQueuedInputs(): QueuedInputs
   abortAndRestoreQueuedInputs(): AbortedQueuedInputs
-  backgroundForegroundShellTask(): void
+  backgroundForegroundShellTask(): ShellDemotionResult
   dispose(): void
 }
 
@@ -114,7 +115,7 @@ export function createInteractiveStore(session: AgentSession): InteractiveStore 
       return currentSession().takeQueuedInputsAndAbort()
     },
     backgroundForegroundShellTask() {
-      currentSession().demoteForegroundShellTask()
+      return currentSession().demoteForegroundShellTask()
     },
     dispose() {
       if (disposed) return

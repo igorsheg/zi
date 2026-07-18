@@ -13,9 +13,17 @@ import { boundToolText, isBoundedToolText } from "./text.js"
 
 const DEFAULT_TIMEOUT_SECONDS = 120
 const maxCommandLength = 256 * 1024
+const maxDescriptionLength = 160
 
 const parameters = Type.Object({
   command: Type.String({ minLength: 1, maxLength: maxCommandLength, description: "Bash command to execute" }),
+  description: Type.Optional(
+    Type.String({
+      minLength: 1,
+      maxLength: maxDescriptionLength,
+      description: "Brief human description of what the command does; do not start with Run or Running"
+    })
+  ),
   timeout: Type.Optional(Type.Number({ exclusiveMinimum: 0, description: "Timeout in seconds" })),
   background: Type.Optional(Type.Boolean({ description: "Run in the background and return a task ID immediately" }))
 })
@@ -39,7 +47,7 @@ export function createBashTool(shell: SessionShell): AgentTool<typeof parameters
     name: "bash",
     label: "bash",
     description:
-      "Execute a shell command in the working directory. Output is limited to the last 2,000 lines or 50 KiB. Set background=true for a long-running command and use task_output or kill_task with the returned task ID.",
+      "Execute a shell command in the working directory. Provide a brief description for the activity row. Output is limited to the last 2,000 lines or 50 KiB. Set background=true for a long-running command and use task_output or kill_task with the returned task ID.",
     parameters,
     executionMode: "sequential",
     async execute(id, input, signal, onUpdate) {
@@ -119,9 +127,6 @@ function finish(result: ShellRunResult, timeoutSeconds: number) {
 
   const { task } = result
   const status = outcomeStatus(task.outcome)
-  if (task.outcome.type === "aborted" || task.outcome.type === "disposed") {
-    throw new Error(withStatus(outputText(task), status ?? "Command interrupted"))
-  }
   if (status) {
     const error = boundToolText(status)
     return toolResult(withStatus(outputText(task), error), { ...details(task, "error", timeoutSeconds), error })
@@ -220,7 +225,9 @@ function isExpectedShellErrorOutcome(value: unknown): value is ShellTaskOutcome 
     value.type === "signaled" ||
     value.type === "timed_out" ||
     value.type === "killed" ||
+    value.type === "aborted" ||
     value.type === "output_limit" ||
+    value.type === "disposed" ||
     value.type === "failed"
   )
 }

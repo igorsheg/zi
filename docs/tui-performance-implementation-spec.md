@@ -186,17 +186,18 @@ interface ToolCallView {
   update(frame: ToolViewFrame): boolean
   refreshElapsed(): boolean
   setExpanded(expanded: boolean): boolean
+  setActionHint(hint: string | undefined): boolean
   destroy(): void
 }
 ```
 
 `InteractiveStore` owns bounded `preparing | ready | running | done | failed | aborted` transitions. `message_update` uses `assistantMessageEvent.contentIndex` to update only the changed tool-call arguments. `message_end` marks complete arguments ready, `tool_execution_update` applies partial results, and the later tool-result commit removes transient state. `agent_end` converts every remaining nonterminal invocation to aborted so sequential calls skipped after interruption cannot remain waiting.
 
-The transcript projection calls coding-agent's pure `projectToolPresentation()` only when the source invocation changes. `ToolCallView` receives lifecycle status plus the resulting semantic header, optional terminal/source/diff/text body, structured notices, and compact policy. It never receives raw arguments/results and never switches on built-in names. Elapsed refresh updates generic lifecycle chrome only; it does not reproject, serialize, validate, truncate, or syntax-highlight tool data.
+The transcript projection calls coding-agent's pure `projectToolPresentation()` only when the source invocation changes. `ToolCallView` receives lifecycle status plus the resulting verb-first header, optional terminal/source/diff/text body, structured notices, explicit compact/detailed windows, and generic timing policy. It never receives raw arguments/results and never switches on built-in names. Timing refresh updates generic lifecycle chrome only; it does not reproject, serialize, validate, truncate, or syntax-highlight tool data.
 
 `StreamingAssistantView` embeds handles by tool-call ID. `TranscriptView` admits at most 64 projected tool IDs across all placements, indexes those non-owning handles, updates them from the transient map, and applies a committed tool result in place. Excess calls receive bounded omission rows. If no originating assistant tool view is retained, it creates one standalone fallback; that fallback is promoted rather than recreated when its result commits. If message eviction removes an assistant while its result remains retained, the embedded root is detached and promoted to that result position before its parent is destroyed. Only standalone roots are reordered.
 
-The handle retains stable header, body, notice, and elapsed owners. A body owner is selected only by the generic body primitive and updates in place while that primitive remains unchanged. Replacing a body subtree clears native selection first. Compact previews retain at most 12 rows and expanded previews at most 200 visual rows after cell-aware wrapping. The mode-owned `app.tools.expand` binding updates retained handles without replacing roots. One transcript-owned renderer live request refreshes elapsed labels only while a running tool intersects the viewport; views and tools own no timers. See `docs/tool-presentation-implementation-spec.md`.
+The handle retains stable header, body, notice, and action-hint owners. A body owner is selected only by the generic body primitive and updates in place while that primitive remains unchanged. Replacing a body subtree clears native selection first. Hidden previews short-circuit before line splitting or wrapping; visible compact previews retain at most 12 rows and detailed previews at most 200 visual rows through directional cell-aware head, tail, or edge admission. The mode-owned `app.tools.expand` binding updates retained handles without replacing roots. One transcript-owned renderer live request refreshes inline timing only while a running tool intersects the viewport; views and tools own no timers. Foreground shell action hints derive from the authoritative session task and semantic keybinding owner, not a tool-name branch. See `docs/tool-presentation-implementation-spec.md`.
 
 ## One notification stream
 

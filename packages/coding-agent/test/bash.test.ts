@@ -5,8 +5,9 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 
 import { defaultShellLimits, SessionShell, type ShellLimits } from "../src/session-shell.js"
-import { createBashTool } from "../src/tools/bash.js"
-import { createKillTaskTool, createTaskOutputTool } from "../src/tools/shell-tasks.js"
+import { createBashTool, isBashToolDetails } from "../src/tools/bash.js"
+import { projectToolPresentation } from "../src/tools/presentation/project.js"
+import { createKillTaskTool, createTaskOutputTool, isTaskOutputToolDetails } from "../src/tools/shell-tasks.js"
 import { DEFAULT_MAX_BYTES } from "../src/tools/truncate.js"
 
 test("bash bounds model output and preserves the full stream for the session lifetime", async () => {
@@ -27,6 +28,62 @@ test("bash bounds model output and preserves the full stream for the session lif
     expect(result.details.output.truncation.truncated).toBe(true)
     const fullOutput = result.details.output.fullOutput
     expect(fullOutput.type === "available" && existsSync(fullOutput.path)).toBe(true)
+  } finally {
+    await shell.dispose()
+    rmSync(cwd, { recursive: true, force: true })
+  }
+})
+
+test("newline-terminated shell output keeps its semantic presentation", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "openzi-bash-presentation-"))
+  const shell = createShell(cwd)
+  const bash = createBashTool(shell)
+  const output = createTaskOutputTool(shell)
+
+  try {
+    const command = `printf "alpha\\nbeta\\n"`
+    const result = await bash.execute("bash-newlines", { command, description: "Print rows" })
+    expect(isBashToolDetails(result.details)).toBe(true)
+    expect(result.details).toMatchObject({ output: { truncation: { totalLines: 2, outputLines: 2 } } })
+    expect(
+      projectToolPresentation({ status: "done", name: "bash", args: { command, description: "Print rows" }, result })
+        .header.label
+    ).toBe("Run")
+
+    const started = await bash.execute("bash-newlines-background", { command, background: true })
+    if (started.details.state === "rejected") throw new Error("Expected background task")
+    const completed = await output.execute("task-newlines", { taskId: started.details.taskId, timeout: 2 })
+    expect(isTaskOutputToolDetails(completed.details)).toBe(true)
+    expect(
+      projectToolPresentation({
+        status: "done",
+        name: "task_output",
+        args: { taskId: started.details.taskId, timeout: 2 },
+        result: completed
+      }).header.label
+    ).toBe("Task output")
+  } finally {
+    await shell.dispose()
+    rmSync(cwd, { recursive: true, force: true })
+  }
+})
+
+test("newline-terminated Bash output retains all 2,000 usable lines", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "openzi-bash-line-limit-"))
+  const shell = createShell(cwd)
+  const bash = createBashTool(shell)
+
+  try {
+    const result = await bash.execute("bash-line-limit", {
+      command: `node -e "let s='';for(let i=1;i<=2000;i++)s+='line-'+i+'\\n';process.stdout.write(s)"`
+    })
+    if (result.details.state === "rejected") throw new Error("Expected admitted Bash execution")
+    expect(result.details.output.truncation).toMatchObject({ truncated: false, totalLines: 2_000, outputLines: 2_000 })
+    const content = result.content[0]
+    if (content?.type !== "text") throw new Error("Expected Bash text output")
+    expect(content.text).toStartWith("line-1\n")
+    expect(content.text).toEndWith("line-2000\n")
+    expect(content.text.split("\n").slice(0, -1)).toHaveLength(2_000)
   } finally {
     await shell.dispose()
     rmSync(cwd, { recursive: true, force: true })
@@ -83,9 +140,18 @@ test("bash cancellation terminates the process group and settles with bounded ou
   try {
     await started.promise
     controller.abort()
-    const error = await rejection(execution)
-    expect(error.message).toContain("started")
-    expect(error.message).toContain("Command aborted")
+    const result = await execution
+    const content = result.content[0]
+    expect(content?.type).toBe("text")
+    if (content?.type !== "text") throw new Error("Expected Bash text output")
+    expect(content.text).toContain("started")
+    expect(content.text).toContain("Command aborted")
+    expect(result.details).toMatchObject({
+      outcome: "error",
+      state: "completed",
+      finalOutcome: { type: "aborted" },
+      error: "Command aborted"
+    })
   } finally {
     await shell.dispose()
     rmSync(cwd, { recursive: true, force: true })
@@ -113,7 +179,9 @@ test("bash cancellation kills a SIGTERM-resistant descendant before settling", a
     await waitUntil(() => existsSync(pidPath))
     pid = Number(await readFile(pidPath, "utf8"))
     controller.abort()
-    expect((await rejection(execution)).message).toContain("Command aborted")
+    const result = await execution
+    expect(result.content[0]).toMatchObject({ type: "text", text: expect.stringContaining("Command aborted") })
+    expect(result.details).toMatchObject({ outcome: "error", finalOutcome: { type: "aborted" } })
     expect(processRunning(pid)).toBe(false)
   } finally {
     if (pid && processRunning(pid)) process.kill(pid, "SIGKILL")
@@ -323,16 +391,6 @@ test("session shell disposal kills background work and removes retained output",
 
 function createShell(cwd: string, overrides: Partial<ShellLimits> = {}): SessionShell {
   return new SessionShell({ cwd, sessionId: crypto.randomUUID(), limits: { ...defaultShellLimits, ...overrides } })
-}
-
-async function rejection(promise: Promise<unknown>): Promise<Error> {
-  try {
-    await promise
-  } catch (cause) {
-    if (cause instanceof Error) return cause
-    throw new Error(`Promise rejected with a non-Error value: ${String(cause)}`, { cause })
-  }
-  throw new Error("Expected promise to reject")
 }
 
 async function waitUntil(condition: () => boolean): Promise<void> {

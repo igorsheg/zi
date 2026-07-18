@@ -4,6 +4,7 @@ import { dirname } from "node:path"
 import type { AgentTool } from "@earendil-works/pi-agent-core"
 import { Type } from "@earendil-works/pi-ai"
 
+import { countTextLines } from "./lines.js"
 import { withFileMutation } from "./mutation-queue.js"
 import { resolveToolPath } from "./path.js"
 import { boundToolText, isBoundedToolText } from "./text.js"
@@ -16,9 +17,17 @@ const parameters = Type.Object({
   content: Type.String({ maxLength: maxWriteBytes, description: "Content to write to the file" })
 })
 
+export type WriteToolErrorReason = "invalid_path" | "not_file" | "permission_denied" | "too_large" | "unwritable"
+
 export type WriteToolDetails =
   | { readonly outcome: "success"; readonly bytes: number; readonly lines: number }
-  | { readonly outcome: "error"; readonly bytes: number; readonly lines: number; readonly error: string }
+  | {
+      readonly outcome: "error"
+      readonly reason: WriteToolErrorReason
+      readonly bytes: number
+      readonly lines: number
+      readonly error: string
+    }
 
 export function createWriteTool(cwd: string): AgentTool<typeof parameters, WriteToolDetails> {
   return {
@@ -27,27 +36,30 @@ export function createWriteTool(cwd: string): AgentTool<typeof parameters, Write
     description: "Write content to a file. Creates parent directories and overwrites an existing file.",
     parameters,
     async execute(_id, input, signal) {
-      const path = resolveToolPath(input.path, cwd)
       const bytes = Buffer.byteLength(input.content)
-      const lines = logicalLines(input.content)
+      const lines = countWriteLines(input.content)
+      if (input.path.includes("\0")) return failure("invalid_path", bytes, lines, "Write path contains a null byte")
       if (bytes > maxWriteBytes) {
-        return failure(bytes, lines, `Write exceeds the ${maxWriteBytes} byte limit`)
+        return failure("too_large", bytes, lines, `Write exceeds the ${maxWriteBytes} byte limit`)
       }
 
+      const path = resolveToolPath(input.path, cwd)
       return withFileMutation(path, async () => {
         throwIfAborted(signal)
         try {
           await mkdir(dirname(path), { recursive: true })
           throwIfAborted(signal)
+          // A resolved write is the commit point; cancellation cannot truthfully turn it into an aborted mutation.
           await writeFile(path, input.content, "utf8")
         } catch (cause) {
           if (signal?.aborted) throw cause
           if (!isFilesystemError(cause)) throw cause
-          return failure(bytes, lines, errorMessage(cause))
+          return filesystemFailure(input.path, bytes, lines, cause)
         }
-        throwIfAborted(signal)
         return {
-          content: [{ type: "text", text: `Successfully wrote ${bytes} bytes to ${input.path}` }],
+          content: [
+            { type: "text", text: `Successfully wrote ${bytes} ${bytes === 1 ? "byte" : "bytes"} to ${input.path}` }
+          ],
           details: { outcome: "success", bytes, lines }
         }
       })
@@ -64,26 +76,53 @@ export function isWriteToolDetails(value: unknown): value is WriteToolDetails {
   ) {
     return false
   }
-  return value.outcome !== "error" || isBoundedToolText(value.error)
+  return value.outcome !== "error" || (isWriteErrorReason(value.reason) && isBoundedToolText(value.error))
 }
 
-function failure(bytes: number, lines: number, message: string) {
+function filesystemFailure(path: string, bytes: number, lines: number, cause: unknown) {
+  const code = filesystemErrorCode(cause)
+  if (code === "EISDIR" || code === "ENOTDIR" || code === "EEXIST") {
+    return failure("not_file", bytes, lines, `Path is not writable as a file: ${path}`)
+  }
+  if (code === "EACCES" || code === "EPERM") {
+    return failure("permission_denied", bytes, lines, `Permission denied: ${path}`)
+  }
+  if (code === "EINVAL" || code === "ENAMETOOLONG") {
+    return failure("invalid_path", bytes, lines, `Invalid write path: ${path}`)
+  }
+  return failure("unwritable", bytes, lines, errorMessage(cause))
+}
+
+function failure(reason: WriteToolErrorReason, bytes: number, lines: number, message: string) {
   const error = boundToolText(message)
   return {
     content: [{ type: "text" as const, text: error }],
-    details: { outcome: "error" as const, bytes, lines, error }
+    details: { outcome: "error" as const, reason, bytes, lines, error }
   }
 }
 
-function logicalLines(content: string): number {
-  if (!content) return 0
-  let lines = 1
-  for (const character of content) if (character === "\n") lines++
-  return lines
+export function countWriteLines(content: string): number {
+  return countTextLines(content)
 }
 
 function isFilesystemError(cause: unknown): boolean {
+  return filesystemErrorCode(cause) !== undefined
+}
+
+function filesystemErrorCode(cause: unknown): string | undefined {
   return typeof cause === "object" && cause !== null && typeof Reflect.get(cause, "code") === "string"
+    ? String(Reflect.get(cause, "code"))
+    : undefined
+}
+
+function isWriteErrorReason(value: unknown): value is WriteToolErrorReason {
+  return (
+    value === "invalid_path" ||
+    value === "not_file" ||
+    value === "permission_denied" ||
+    value === "too_large" ||
+    value === "unwritable"
+  )
 }
 
 function errorMessage(cause: unknown): string {

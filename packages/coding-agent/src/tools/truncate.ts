@@ -1,3 +1,5 @@
+import { countTextLines, splitTextLines } from "./lines.js"
+
 export const DEFAULT_MAX_LINES = 2_000
 export const DEFAULT_MAX_BYTES = 50 * 1024
 
@@ -60,13 +62,14 @@ export function truncateHead(
   maxLines = DEFAULT_MAX_LINES,
   maxBytes = DEFAULT_MAX_BYTES
 ): TruncationResult {
-  const lines = content.split("\n")
+  const lines = splitTextLines(content)
+  const totalLines = countTextLines(content)
   const totalBytes = Buffer.byteLength(content)
-  if (lines.length <= maxLines && totalBytes <= maxBytes) return result(content, false, null, lines.length, totalBytes)
+  if (totalLines <= maxLines && totalBytes <= maxBytes) return result(content, false, null, totalLines, totalBytes)
 
   const output: string[] = []
   let bytes = 0
-  let truncatedBy: "lines" | "bytes" = "lines"
+  let truncatedBy: "lines" | "bytes" = totalLines > maxLines ? "lines" : "bytes"
   for (const line of lines.slice(0, maxLines)) {
     const lineBytes = Buffer.byteLength(line) + (output.length > 0 ? 1 : 0)
     if (bytes + lineBytes > maxBytes) {
@@ -78,7 +81,7 @@ export function truncateHead(
   }
 
   const text = output.join("\n")
-  return { ...result(text, true, truncatedBy, lines.length, totalBytes), firstLineExceedsLimit: output.length === 0 }
+  return { ...result(text, true, truncatedBy, totalLines, totalBytes), firstLineExceedsLimit: output.length === 0 }
 }
 
 export function truncateTail(
@@ -86,13 +89,14 @@ export function truncateTail(
   maxLines = DEFAULT_MAX_LINES,
   maxBytes = DEFAULT_MAX_BYTES
 ): TruncationResult {
-  const lines = content.split("\n")
+  const lines = splitTextLines(content)
+  const totalLines = countTextLines(content)
   const totalBytes = Buffer.byteLength(content)
-  if (lines.length <= maxLines && totalBytes <= maxBytes) return result(content, false, null, lines.length, totalBytes)
+  if (totalLines <= maxLines && totalBytes <= maxBytes) return result(content, false, null, totalLines, totalBytes)
 
   const output: string[] = []
   let bytes = 0
-  let truncatedBy: "lines" | "bytes" = "lines"
+  let truncatedBy: "lines" | "bytes" = totalLines > maxLines ? "lines" : "bytes"
   let lastLinePartial = false
   for (let index = lines.length - 1; index >= 0 && output.length < maxLines; index--) {
     const line = lines[index] ?? ""
@@ -109,7 +113,7 @@ export function truncateTail(
     bytes += lineBytes
   }
 
-  return { ...result(output.join("\n"), true, truncatedBy, lines.length, totalBytes), lastLinePartial }
+  return { ...result(output.join("\n"), true, truncatedBy, totalLines, totalBytes), lastLinePartial }
 }
 
 function result(
@@ -125,7 +129,7 @@ function result(
     truncatedBy,
     totalLines,
     totalBytes,
-    outputLines: content.length === 0 ? 0 : content.split("\n").length,
+    outputLines: countTextLines(content),
     outputBytes: Buffer.byteLength(content),
     firstLineExceedsLimit: false,
     lastLinePartial: false

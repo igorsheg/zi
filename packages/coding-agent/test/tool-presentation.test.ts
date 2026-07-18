@@ -8,7 +8,7 @@ test("bash presentation separates bounded output from structured notices", () =>
   const presentation = projectToolPresentation({
     status: "done",
     name: "bash",
-    args: { command: "run" },
+    args: { command: "bun test", description: "Run the test suite" },
     result: {
       content: [{ type: "text", text: `tail\n\n[Output truncated. Full output: ${path}]` }],
       details: {
@@ -34,14 +34,90 @@ test("bash presentation separates bounded output from structured notices", () =>
     }
   })
 
-  expect(presentation.header.subject).toEqual({ type: "command", text: "run" })
+  expect(presentation.header).toMatchObject({
+    label: "Run",
+    subject: { type: "text", text: "the test suite" },
+    secondary: { type: "command", text: "bun test", prompt: true },
+    status: "truncated"
+  })
   expect(presentation.body).toEqual({ type: "terminal", text: "tail" })
-  expect(presentation.notices).toContainEqual({ type: "path", tone: "warning", label: "Full output", path })
+  expect(presentation.preview.compact).toEqual({ type: "tail", rows: 5 })
+  expect(presentation.notices).toContainEqual({
+    type: "path",
+    tone: "warning",
+    visibility: "detailed",
+    label: "Full output",
+    path
+  })
   expect(presentation.notices).toContainEqual({
     type: "message",
     tone: "warning",
+    visibility: "detailed",
     text: "Showing the last 2000 of 3000 lines"
   })
+})
+
+test("bash compact completion hides empty output and background handoff", () => {
+  const empty = projectToolPresentation({
+    status: "done",
+    name: "bash",
+    args: { command: "true" },
+    result: {
+      content: [{ type: "text", text: "(no output)" }],
+      details: {
+        outcome: "success",
+        taskId: "task-empty",
+        state: "completed",
+        timeoutSeconds: 120,
+        finalOutcome: { type: "exited", exitCode: 0 },
+        output: {
+          truncation: {
+            truncated: false,
+            truncatedBy: null,
+            totalLines: 0,
+            totalBytes: 0,
+            outputLines: 0,
+            outputBytes: 0,
+            firstLineExceedsLimit: false,
+            lastLinePartial: false
+          },
+          fullOutput: { type: "evicted", bytes: 0, truncated: false }
+        }
+      }
+    }
+  })
+  expect(empty.body).toEqual({ type: "terminal", text: "(no output)" })
+  expect(empty.preview.compact).toEqual({ type: "hidden" })
+
+  const background = projectToolPresentation({
+    status: "done",
+    name: "bash",
+    args: { command: "serve", background: true },
+    result: {
+      content: [{ type: "text", text: "tail\n\nCommand running in background (task task-bg)" }],
+      details: {
+        outcome: "success",
+        taskId: "task-bg",
+        state: "background",
+        timeoutSeconds: 120,
+        output: {
+          truncation: {
+            truncated: false,
+            truncatedBy: null,
+            totalLines: 1,
+            totalBytes: 4,
+            outputLines: 1,
+            outputBytes: 4,
+            firstLineExceedsLimit: false,
+            lastLinePartial: false
+          },
+          fullOutput: { type: "available", path: "/tmp/task-bg.log", bytes: 4, truncated: false }
+        }
+      }
+    }
+  })
+  expect(background.body).toEqual({ type: "terminal", text: "tail" })
+  expect(background.preview.compact).toEqual({ type: "hidden" })
 })
 
 test("read presentation derives continuation from details instead of model prose", () => {
@@ -76,7 +152,13 @@ test("read presentation derives continuation from details instead of model prose
   expect(presentation.notices).toContainEqual({
     type: "message",
     tone: "muted",
+    visibility: "detailed",
     text: "498 lines remain; continue at offset 3"
+  })
+  expect(presentation.header).toMatchObject({ label: "Read", details: ["1-2 of 500"], status: "truncated" })
+  expect(presentation.preview).toEqual({
+    compact: { type: "hidden" },
+    detailed: { type: "edges", head: 120, tail: 79 }
   })
 })
 
@@ -90,7 +172,13 @@ test("write, edit, task-output, and kill-task project only semantic primitives",
       details: { outcome: "success", bytes: 24, lines: 1 }
     }
   })
+  expect(write.header).toEqual({
+    label: "Write",
+    subject: { type: "path", path: "notes.ts" },
+    details: ["1 line", "24 bytes"]
+  })
   expect(write.body).toEqual({ type: "source", text: "export const answer = 42", path: "notes.ts" })
+  expect(write.preview).toEqual({ compact: { type: "hidden" }, detailed: { type: "head", rows: 200 } })
 
   const edit = projectToolPresentation({
     status: "done",
@@ -101,6 +189,8 @@ test("write, edit, task-output, and kill-task project only semantic primitives",
       details: {
         outcome: "success",
         replacements: 1,
+        additions: 1,
+        deletions: 1,
         diff: "--- a/notes.ts\n+++ b/notes.ts\n@@ -1,1 +1,1 @@\n-41\n+42",
         diffTruncated: false,
         firstChangedLine: 1
@@ -148,7 +238,7 @@ test("write, edit, task-output, and kill-task project only semantic primitives",
     }
   })
   expect(kill.body).toBeUndefined()
-  expect(kill.preview).toEqual({ type: "hidden" })
+  expect(kill.preview).toEqual({ compact: { type: "hidden" }, detailed: { type: "hidden" } })
 })
 
 test("all built-ins accept streamed partial arguments with one semantic placeholder", () => {
@@ -159,14 +249,14 @@ test("all built-ins accept streamed partial arguments with one semantic placehol
   }
 })
 
-test("malformed terminal built-ins and unknown tools use the bounded generic projection", () => {
+test("malformed terminal built-ins stay semantic while unknown tools use the bounded generic projection", () => {
   const malformed = projectToolPresentation({
     status: "done",
     name: "write",
     args: { path: "file.txt", content: "text" },
     result: { content: [{ type: "text", text: "old result" }], details: undefined }
   })
-  expect(malformed.header).toMatchObject({ label: "Tool", subject: { type: "text", text: "write" } })
+  expect(malformed.header).toMatchObject({ label: "Write", subject: { type: "path", path: "file.txt" } })
 
   const circular: { self?: unknown } = {}
   circular.self = circular
@@ -174,7 +264,7 @@ test("malformed terminal built-ins and unknown tools use the bounded generic pro
   expect(unknown.body).toMatchObject({ type: "text", text: expect.stringContaining("unserializable arguments") })
 })
 
-test("malformed semantic details and lifecycle mismatches fall back as whole values", () => {
+test("malformed semantic details and lifecycle mismatches degrade within their built-in row", () => {
   const truncation = {
     truncated: false,
     truncatedBy: null,
@@ -202,7 +292,8 @@ test("malformed semantic details and lifecycle mismatches fall back as whole val
       }
     }
   })
-  expect(malformedRead.header.label).toBe("Tool")
+  expect(malformedRead.header.label).toBe("Read")
+  expect(malformedRead.body).toMatchObject({ type: "source", text: "one" })
 
   const impossibleBash = projectToolPresentation({
     status: "failed",
@@ -224,7 +315,8 @@ test("malformed semantic details and lifecycle mismatches fall back as whole val
       }
     }
   })
-  expect(impossibleBash.header.label).toBe("Tool")
+  expect(impossibleBash.header).toMatchObject({ label: "Run", status: "failed" })
+  expect(impossibleBash.body).toMatchObject({ type: "terminal", text: "impossible" })
 
   const mismatchedLifecycle = projectToolPresentation({
     status: "failed",
@@ -232,7 +324,28 @@ test("malformed semantic details and lifecycle mismatches fall back as whole val
     args: { path: "file.txt", content: "one" },
     result: { content: [{ type: "text", text: "wrote" }], details: { outcome: "success", bytes: 3, lines: 1 } }
   })
-  expect(mismatchedLifecycle.header.label).toBe("Tool")
+  expect(mismatchedLifecycle.header.label).toBe("Write")
+  expect(mismatchedLifecycle.body).toMatchObject({ type: "text", text: "wrote", tone: "error" })
+
+  const malformedEdit = projectToolPresentation({
+    status: "done",
+    name: "edit",
+    args: { path: "file.txt", edits: [{ oldText: "one", newText: "two" }] },
+    result: {
+      content: [{ type: "text", text: "edited" }],
+      details: {
+        outcome: "success",
+        replacements: 1,
+        additions: 99,
+        deletions: 1,
+        diff: "--- a/file.txt\n+++ b/file.txt\n@@ -1,1 +1,1 @@\n-one\n+two",
+        diffTruncated: false,
+        firstChangedLine: 1
+      }
+    }
+  })
+  expect(malformedEdit.header.label).toBe("Edit")
+  expect(malformedEdit.body).toEqual({ type: "text", text: "edited", tone: "normal" })
 })
 
 test("generic projection bounds traversal before serialization", () => {
@@ -277,7 +390,10 @@ test("projection strips ANSI and unsafe controls before values cross into client
     name: "bash",
     args: { command: "\u001b[31mecho\u001b[0m\u0000 hi" }
   })
-  expect(presentation.header.subject).toEqual({ type: "command", text: "echo hi" })
+  expect(presentation.header).toMatchObject({
+    label: "Run",
+    subject: { type: "command", text: "echo hi", prompt: false }
+  })
 })
 
 function objectProperty(value: object, key: string): object {

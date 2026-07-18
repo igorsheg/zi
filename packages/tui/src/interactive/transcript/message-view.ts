@@ -6,6 +6,7 @@ import {
   type Renderable,
   StyledText,
   type SyntaxStyle,
+  type TreeSitterClient,
   TextAttributes,
   TextRenderable,
   type RenderContext
@@ -40,6 +41,7 @@ export interface MessageRenderOptions {
   readonly syntaxStyle: SyntaxStyle
   readonly toolCall?: ToolCallPresentation
   readonly cwd?: string
+  readonly treeSitterClient?: TreeSitterClient
 }
 
 export interface ToolCallPresentation {
@@ -56,7 +58,15 @@ export function createMessageView(
     case "user":
       return createUserMessage(ctx, textContent(message.content), options.theme)
     case "assistant":
-      return new StreamingAssistantView(ctx, message, options.theme, options.syntaxStyle, undefined, options.cwd).root
+      return new StreamingAssistantView(
+        ctx,
+        message,
+        options.theme,
+        options.syntaxStyle,
+        undefined,
+        options.cwd,
+        options.treeSitterClient
+      ).root
     case "toolResult":
       return createToolResultView(ctx, message, options.toolCall, options.theme, options.cwd ?? "")
     case "bashExecution":
@@ -127,6 +137,7 @@ export class StreamingAssistantView {
   readonly #syntaxStyle: SyntaxStyle
   readonly #toolViews: AssistantToolViewOwner | undefined
   readonly #cwd: string
+  readonly #treeSitterClient: TreeSitterClient | undefined
   readonly #parts: StreamingPartView[] = []
   #error: TextRenderable | undefined
   #errorValue: string | undefined
@@ -138,13 +149,15 @@ export class StreamingAssistantView {
     theme: Theme,
     syntaxStyle: SyntaxStyle,
     toolViews?: AssistantToolViewOwner,
-    cwd = ""
+    cwd = "",
+    treeSitterClient?: TreeSitterClient
   ) {
     this.#ctx = ctx
     this.#theme = theme
     this.#syntaxStyle = syntaxStyle
     this.#toolViews = toolViews
     this.#cwd = cwd
+    this.#treeSitterClient = treeSitterClient
     this.root = new BoxRenderable(ctx, {
       id: "streaming-assistant",
       paddingLeft: 1,
@@ -315,7 +328,8 @@ export class StreamingAssistantView {
         part.content,
         this.#theme,
         this.#syntaxStyle,
-        markdownStreamingWorkaround
+        markdownStreamingWorkaround,
+        this.#treeSitterClient
       )
       root.add(content)
       return { kind: "answer", root, content, value: part.content }
@@ -353,7 +367,8 @@ function createMarkdown(
   content: string,
   theme: Theme,
   syntaxStyle: SyntaxStyle,
-  streaming: boolean
+  streaming: boolean,
+  treeSitterClient?: TreeSitterClient
 ): MarkdownRenderable {
   return new MarkdownRenderable(ctx, {
     content,
@@ -362,6 +377,7 @@ function createMarkdown(
     bg: theme.surface.app,
     conceal: true,
     streaming,
+    ...(treeSitterClient ? { treeSitterClient } : {}),
     internalBlockMode: "top-level",
     tableOptions: { style: "grid" },
     renderNode: renderMarkdownNode
@@ -474,13 +490,18 @@ function createBashExecutionView(
       status,
       presentation: {
         header: {
-          label: "Bash",
-          subject: { type: "command", text: message.command },
-          details: [`exit ${message.exitCode}`]
+          label: "Run",
+          subject: { type: "command", text: message.command, prompt: false },
+          details: [],
+          ...(message.exitCode === 0 ? {} : { status: `exit ${message.exitCode}` })
         },
         body: { type: "terminal", text: message.output },
         notices: [],
-        preview: { type: "tail", rows: 5 }
+        preview: {
+          compact: message.exitCode === 0 ? { type: "hidden" } : { type: "edges", head: 2, tail: 3 },
+          detailed: { type: "edges", head: 80, tail: 119 }
+        },
+        timing: "hidden"
       }
     },
     theme,

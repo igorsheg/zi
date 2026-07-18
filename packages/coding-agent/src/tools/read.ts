@@ -3,6 +3,7 @@ import { readFile, stat } from "node:fs/promises"
 import type { AgentTool } from "@earendil-works/pi-agent-core"
 import { Type } from "@earendil-works/pi-ai"
 
+import { splitTextLines } from "./lines.js"
 import { resolveToolPath } from "./path.js"
 import { boundToolText, isBoundedToolText } from "./text.js"
 import {
@@ -22,6 +23,14 @@ const parameters = Type.Object({
   limit: Type.Optional(Type.Integer({ minimum: 1, description: "Maximum number of lines to read" }))
 })
 
+export type ReadToolErrorReason =
+  | "not_found"
+  | "not_file"
+  | "permission_denied"
+  | "too_large"
+  | "invalid_offset"
+  | "unreadable"
+
 export type ReadToolDetails =
   | {
       readonly outcome: "success"
@@ -32,7 +41,7 @@ export type ReadToolDetails =
       readonly remainingLines?: number
       readonly truncation: TruncationDetails
     }
-  | { readonly outcome: "error"; readonly error: string }
+  | { readonly outcome: "error"; readonly reason: ReadToolErrorReason; readonly error: string }
 
 export function createReadTool(cwd: string): AgentTool<typeof parameters, ReadToolDetails> {
   return {
@@ -47,18 +56,21 @@ export function createReadTool(cwd: string): AgentTool<typeof parameters, ReadTo
       let content: string
       try {
         const file = await stat(path)
-        if (file.size > maxReadFileBytes) return failure(`File exceeds the ${maxReadFileBytes} byte read limit`)
+        if (!file.isFile()) return failure("not_file", `Path is not a file: ${input.path}`)
+        if (file.size > maxReadFileBytes) {
+          return failure("too_large", `File exceeds the ${maxReadFileBytes} byte read limit`)
+        }
         content = await readFile(path, "utf8")
       } catch (cause) {
         if (signal?.aborted) throw cause
-        return failure(errorMessage(cause))
+        return filesystemFailure(input.path, cause)
       }
       throwIfAborted(signal)
 
-      const lines = content.split("\n")
+      const lines = splitTextLines(content)
       const start = (input.offset ?? 1) - 1
       if (start >= lines.length) {
-        return failure(`Offset ${input.offset} is beyond end of file (${lines.length} lines total)`)
+        return failure("invalid_offset", `Offset ${input.offset} is beyond end of file (${lines.length} lines total)`)
       }
 
       const requestedEnd = input.limit === undefined ? lines.length : Math.min(lines.length, start + input.limit)
@@ -105,7 +117,7 @@ export function createReadTool(cwd: string): AgentTool<typeof parameters, ReadTo
 
 export function isReadToolDetails(value: unknown): value is ReadToolDetails {
   if (!isRecord(value)) return false
-  if (value.outcome === "error") return isBoundedString(value.error)
+  if (value.outcome === "error") return isReadErrorReason(value.reason) && isBoundedString(value.error)
   if (
     value.outcome !== "success" ||
     !isPositiveInteger(value.startLine) ||
@@ -131,13 +143,34 @@ export function isReadToolDetails(value: unknown): value is ReadToolDetails {
   )
 }
 
-function failure(message: string) {
-  const error = boundToolText(message)
-  return { content: [{ type: "text" as const, text: error }], details: { outcome: "error" as const, error } }
+function filesystemFailure(path: string, cause: unknown) {
+  const code = filesystemErrorCode(cause)
+  if (code === "ENOENT") return failure("not_found", `File not found: ${path}`)
+  if (code === "EISDIR" || code === "ENOTDIR") return failure("not_file", `Path is not a file: ${path}`)
+  if (code === "EACCES" || code === "EPERM") return failure("permission_denied", `Permission denied: ${path}`)
+  return failure("unreadable", cause instanceof Error ? cause.message : String(cause))
 }
 
-function errorMessage(cause: unknown): string {
-  return cause instanceof Error ? cause.message : String(cause)
+function failure(reason: ReadToolErrorReason, message: string) {
+  const error = boundToolText(message)
+  return { content: [{ type: "text" as const, text: error }], details: { outcome: "error" as const, reason, error } }
+}
+
+function filesystemErrorCode(cause: unknown): string | undefined {
+  return typeof cause === "object" && cause !== null && typeof Reflect.get(cause, "code") === "string"
+    ? String(Reflect.get(cause, "code"))
+    : undefined
+}
+
+function isReadErrorReason(value: unknown): value is ReadToolErrorReason {
+  return (
+    value === "not_found" ||
+    value === "not_file" ||
+    value === "permission_denied" ||
+    value === "too_large" ||
+    value === "invalid_offset" ||
+    value === "unreadable"
+  )
 }
 
 function throwIfAborted(signal?: AbortSignal): void {

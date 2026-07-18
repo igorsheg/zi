@@ -48,8 +48,9 @@ test("the OpenTUI prompt drives a complete tool turn", async () => {
     const frame = setup.captureCharFrame()
     expect(frame).toContain("Write 42 to answer.txt")
     expect(frame).toContain("Use the write tool.")
-    expect(frame).toContain("╭───")
-    expect(frame).toContain("╰───")
+    expect(frame).toContain("◆ Write answer.txt · 1 line · 3 bytes")
+    expect(frame).not.toContain("│ 1 │ 42")
+    expect(frame).not.toContain("╭───")
     expect(frame).toContain("Checking the result.")
     expect(frame).toContain("Done")
     expect(frame).toContain("Wrote answer.txt with 42.")
@@ -94,6 +95,8 @@ test("Ctrl+G demotes the session-owned foreground shell task", async () => {
     input.setText("Start the command.")
     input.submit()
     await waitUntil(() => session.shellTasks.some(task => task.type === "foreground"))
+    await setup.renderOnce()
+    expect(setup.captureCharFrame()).toContain("Ctrl+G background")
 
     setup.mockInput.pressKey("g", { ctrl: true })
     await waitUntil(() => session.shellTasks.some(task => task.type === "background"))
@@ -102,6 +105,8 @@ test("Ctrl+G demotes the session-owned foreground shell task", async () => {
 
     expect(session.shellTasks).toHaveLength(1)
     expect(session.shellTasks[0]).toMatchObject({ type: "completed", outcome: { type: "exited", exitCode: 0 } })
+    await setup.renderOnce()
+    expect(setup.captureCharFrame()).toContain("background · task")
   } finally {
     session.dispose()
     setup.destroy()

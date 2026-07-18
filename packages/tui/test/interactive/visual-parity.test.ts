@@ -40,19 +40,19 @@ test("representative session keeps the accepted visual hierarchy at normal and c
       "",
       " The layout keeps content readable and highlights code.",
       "",
-      " Read src/app.tsx · 1-1 of 1",
+      " ◆ Read app.tsx",
       "",
-      " Bash $ bun test · task task-1 (error)",
-      " ╭───",
-      " │ 1 test failed",
-      " ╰───",
-      " [Command exited with code 1]",
+      " ◆ Edit app.tsx +1/-1",
+      "   │ 1 − export function App() {}",
+      "   │ 1 + export function Application() {}",
+      "",
+      " ◆ Write generated.ts · 1 line · 30 bytes",
+      "",
+      " ◆ Run bun test · exit 1",
+      "   │ 1 test failed",
+      "   Command exited with code 1",
       "",
       " The failed command remains visible without overwhelming the prompt.",
-      "",
-      "",
-      "",
-      "",
       "",
       "",
       "",
@@ -67,12 +67,14 @@ test("representative session keeps the accepted visual hierarchy at normal and c
     expect(span(spans, "Result").fg.toInts()).toEqual([230, 195, 132, 255])
     expect(span(spans, "Result").attributes).toBe(TextAttributes.BOLD)
     expect(span(spans, "code").fg.toInts()).toEqual([122, 168, 159, 255])
-    expect(span(spans, "╭───").fg.toInts()).toEqual([228, 104, 118, 255])
+    expect(spans.filter(candidate => candidate.text === "◆ ").map(candidate => candidate.fg.toInts())).toContainEqual([
+      228, 104, 118, 255
+    ])
 
     setup.resize(40, 8)
     await setup.renderOnce()
     expect(frameRows(setup.captureCharFrame(), 8)).toEqual([
-      " [Command exited with code 1]",
+      "   Command exited with code 1",
       "",
       " The failed command remains visible",
       " without overwhelming the prompt.",
@@ -126,6 +128,42 @@ function representativeMessages(): AgentMessage[] {
       },
       isError: false,
       timestamp: 3
+    },
+    fauxAssistantMessage(
+      fauxToolCall(
+        "edit",
+        { path: "src/app.tsx", edits: [{ oldText: "App", newText: "Application" }] },
+        { id: "edit-1" }
+      )
+    ),
+    {
+      role: "toolResult",
+      toolCallId: "edit-1",
+      toolName: "edit",
+      content: [{ type: "text", text: "Successfully replaced 1 block in src/app.tsx" }],
+      details: {
+        outcome: "success",
+        replacements: 1,
+        additions: 1,
+        deletions: 1,
+        diff: "--- a/src/app.tsx\n+++ b/src/app.tsx\n@@ -1,1 +1,1 @@\n-export function App() {}\n+export function Application() {}",
+        diffTruncated: false,
+        firstChangedLine: 1
+      },
+      isError: false,
+      timestamp: 4
+    },
+    fauxAssistantMessage(
+      fauxToolCall("write", { path: "src/generated.ts", content: "export const generated = true\n" }, { id: "write-1" })
+    ),
+    {
+      role: "toolResult",
+      toolCallId: "write-1",
+      toolName: "write",
+      content: [{ type: "text", text: "Successfully wrote 30 bytes to src/generated.ts" }],
+      details: { outcome: "success", bytes: 30, lines: 1 },
+      isError: false,
+      timestamp: 4
     },
     fauxAssistantMessage(fauxToolCall("bash", { command: "bun test" }, { id: "bash-1" })),
     {

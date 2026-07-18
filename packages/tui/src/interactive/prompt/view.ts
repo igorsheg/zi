@@ -199,10 +199,14 @@ export class PromptView {
         consume(key)
         this.#submit("followUp")
         return
-      case "background_task":
+      case "background_task": {
         consume(key)
-        this.#interactive.backgroundForegroundShellTask()
+        const result = this.#interactive.backgroundForegroundShellTask()
+        if (result.type === "capacity_exceeded") {
+          this.#store.reportFeedback({ type: "error", message: "Background task capacity exceeded" })
+        }
         return
+      }
       case "new_line":
         consume(key)
         this.input.newLine()

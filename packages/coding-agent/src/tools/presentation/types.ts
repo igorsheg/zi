@@ -11,16 +11,20 @@ export interface ToolPresentation {
   readonly body?: ToolBody
   readonly notices: readonly ToolNotice[]
   readonly preview: ToolPreviewPolicy
+  readonly timing: ToolTimingPolicy
 }
 
 export interface ToolHeader {
   readonly label: string
   readonly subject?: ToolSubject
+  readonly secondary?: ToolSubject
   readonly details: readonly string[]
+  readonly delta?: { readonly added: number; readonly removed: number }
+  readonly status?: string
 }
 
 export type ToolSubject =
-  | { readonly type: "command"; readonly text: string }
+  | { readonly type: "command"; readonly text: string; readonly prompt: boolean }
   | { readonly type: "path"; readonly path: string }
   | { readonly type: "task"; readonly id: string }
   | { readonly type: "text"; readonly text: string }
@@ -31,15 +35,32 @@ export type ToolBody =
   | { readonly type: "diff"; readonly text: string; readonly path?: string }
   | { readonly type: "text"; readonly text: string; readonly tone: "normal" | "muted" | "error" }
 
-export type ToolNotice =
-  | { readonly type: "message"; readonly tone: "muted" | "warning" | "error"; readonly text: string }
-  | { readonly type: "path"; readonly tone: "muted" | "warning"; readonly label: string; readonly path: string }
+interface ToolNoticeBase {
+  readonly tone: "muted" | "warning" | "error"
+  readonly visibility: "always" | "detailed"
+}
 
-export type ToolPreviewPolicy =
+export type ToolNotice =
+  | (ToolNoticeBase & { readonly type: "message"; readonly text: string })
+  | (Omit<ToolNoticeBase, "tone"> & {
+      readonly type: "path"
+      readonly tone: "muted" | "warning"
+      readonly label: string
+      readonly path: string
+    })
+
+export interface ToolPreviewPolicy {
+  readonly compact: ToolPreviewWindow
+  readonly detailed: ToolPreviewWindow
+}
+
+export type ToolPreviewWindow =
   | { readonly type: "hidden" }
   | { readonly type: "head"; readonly rows: number }
   | { readonly type: "tail"; readonly rows: number }
   | { readonly type: "edges"; readonly head: number; readonly tail: number }
+
+export type ToolTimingPolicy = "duration" | "started" | "hidden"
 
 export const maxToolInlineScalars = 4_096
 export const maxToolNotices = 8

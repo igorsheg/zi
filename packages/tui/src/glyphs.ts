@@ -2,7 +2,9 @@ export const glyphs = {
   listSelected: "› ",
   listUnselected: "  ",
   check: "✓",
-  toolBody: "│ ",
-  toolTop: "╭───",
-  toolBottom: "╰───"
+  toolPreparing: "◇ ",
+  tool: "◆ ",
+  toolRunning: "◈ ",
+  toolExpanded: "⌄ ",
+  toolBody: "  │ "
 } as const

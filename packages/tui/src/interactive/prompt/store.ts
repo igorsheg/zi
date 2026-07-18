@@ -56,6 +56,7 @@ export interface PromptStore {
   backPicker(): boolean
   restoreQueuedInputs(currentText: string): string
   abortAndRestoreQueuedInputs(currentText: string): string
+  reportFeedback(feedback: PromptFeedback): void
   clear(): void
   dispose(): void
 }
@@ -299,6 +300,11 @@ class PromptController implements PromptStore {
       this.#showError(cause)
       return currentText
     }
+  }
+
+  reportFeedback(feedback: PromptFeedback): void {
+    if (this.#disposed) return
+    this.$state.set({ ...this.$state.get(), feedback })
   }
 
   clear(): void {

@@ -4,8 +4,8 @@ import { join, resolve } from "node:path"
 
 import { compileStandalone } from "./compile-openzi.js"
 
-test("the standalone bundle resolves every lazy Pi AI OAuth implementation", async () => {
-  const temporary = await mkdtemp(join(import.meta.dirname, ".compiled-oauth-"))
+test("the standalone bundle resolves OAuth and marks its constrained runtime", async () => {
+  const temporary = await mkdtemp(join(import.meta.dirname, ".compiled-standalone-"))
   const entrypoint = join(temporary, "smoke.ts")
   const executable = join(temporary, process.platform === "win32" ? "smoke.exe" : "smoke")
   const providers = Bun.resolveSync(
@@ -17,6 +17,8 @@ test("the standalone bundle resolves every lazy Pi AI OAuth implementation", asy
       entrypoint,
       `
 import { builtinModels } from ${JSON.stringify(providers)}
+
+if (process.env.OPENZI_STANDALONE !== "1") throw new Error("Standalone runtime marker is missing")
 
 const providerIds = ["anthropic", "github-copilot", "openai-codex"]
 const credential = {

@@ -1,4 +1,4 @@
-import type { ToolPresentation, ToolPresentationSource } from "./types.js"
+import { maxExpandedToolRows, type ToolPresentation, type ToolPresentationSource } from "./types.js"
 import { boundHead, boundInline, resultText } from "./values.js"
 
 export function projectGeneric(source: ToolPresentationSource): ToolPresentation {
@@ -16,7 +16,8 @@ export function projectGeneric(source: ToolPresentationSource): ToolPresentation
       tone: source.status === "failed" || source.status === "aborted" ? "error" : "normal"
     },
     notices: [],
-    preview: { type: "head", rows: 10 }
+    preview: { compact: { type: "head", rows: 10 }, detailed: { type: "head", rows: maxExpandedToolRows } },
+    timing: "duration"
   }
 }
 

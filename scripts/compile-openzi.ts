@@ -42,7 +42,7 @@ export async function compileStandalone(
     minify: { syntax: true, whitespace: true, identifiers: false },
     packages: "bundle",
     conditions: ["bun", "node"],
-    define: { ...define },
+    define: { ...define, "process.env.OPENZI_STANDALONE": JSON.stringify("1") },
     plugins: [compiledOAuthPlugin(() => oauthLoaderRewrites++)],
     compile: {
       outfile,

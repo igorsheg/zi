@@ -1,5 +1,6 @@
 export * from "./bash.js"
 export * from "./edit.js"
+export * from "./lines.js"
 export * from "./read.js"
 export * from "./presentation/project.js"
 export * from "./presentation/types.js"

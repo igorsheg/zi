@@ -104,8 +104,8 @@ test("a streamed tool root keeps identity through argument, execution, and commi
     await harness.setup.flush()
     const root = requiredRenderable(harness, "active-tool:bash-life")
     const frame = harness.setup.captureCharFrame()
-    expect(frame.indexOf("Before the tool.")).toBeLessThan(frame.indexOf("$ printf hel"))
-    expect(frame.indexOf("$ printf hel")).toBeLessThan(frame.indexOf("After the tool."))
+    expect(frame.indexOf("Before the tool.")).toBeLessThan(frame.indexOf("Run printf hel"))
+    expect(frame.indexOf("Run printf hel")).toBeLessThan(frame.indexOf("After the tool."))
 
     const ready: ActiveTool = { ...preparing, args: { command: "printf hello" }, status: "ready" }
     harness.state.messages.push(assistant)
@@ -203,18 +203,21 @@ test("visible running tools refresh elapsed time from the renderer lifecycle", a
   const harness = await createTranscriptHarness([], { tools: new Map([[tool.id, tool]]) })
   try {
     await harness.setup.flush()
-    expect(harness.setup.captureCharFrame()).toContain("Elapsed 0.0s")
+    expect(harness.setup.captureCharFrame()).toContain("Run sleep 30 · 0.0s")
 
     now = 2_300
     await harness.setup.renderOnce()
-    expect(harness.setup.captureCharFrame()).toContain("Elapsed 1.3s")
+    expect(harness.setup.captureCharFrame()).toContain("Run sleep 30 · 1.3s")
     expect(harness.setup.renderer.liveRequestCount).toBeGreaterThan(0)
 
     const done: ActiveTool = { ...tool, status: "done", result: { content: [{ type: "text", text: "finished" }] } }
     harness.tools.set(new Map([[done.id, done]]))
     harness.revision.set(1)
     await harness.setup.flush()
-    expect(harness.setup.captureCharFrame()).toContain("Took 1.3s")
+    expect(harness.setup.captureCharFrame()).not.toContain("1.3s")
+    harness.setup.mockInput.pressKey("o", { ctrl: true })
+    await harness.setup.flush()
+    expect(harness.setup.captureCharFrame()).toContain("1.3s")
     expect(harness.setup.renderer.liveRequestCount).toBe(0)
   } finally {
     harness.destroy()
@@ -262,7 +265,7 @@ test("a coalesced agent end renders skipped sequential calls as aborted", async 
   try {
     await harness.setup.flush()
     const frame = harness.setup.captureCharFrame()
-    expect(frame).toContain("Tool read (aborted)")
+    expect(frame).toContain("Read never-read.txt · aborted")
     expect(frame).toContain("never-read.txt")
     expect(frame).not.toContain("preparing")
   } finally {
@@ -278,9 +281,8 @@ test("an aborted committed tool call remains terminal after transient state clea
   try {
     await harness.setup.flush()
     const frame = harness.setup.captureCharFrame()
-    expect(frame).toContain("Tool bash (aborted)")
-    expect(frame).toContain("sleep 10")
-    expect(frame).toContain("Operation aborted")
+    expect(frame).toContain("Run sleep 10 · aborted")
+    expect(frame).toContain("Operation aborted before execution")
     expect(frame).not.toContain("preparing")
   } finally {
     harness.destroy()
@@ -298,12 +300,14 @@ test("the semantic tool binding expands bounded previews without replacing roots
   try {
     await harness.setup.flush()
     const root = requiredRenderable(harness, "active-tool:write-expand")
-    expect(harness.setup.captureCharFrame()).toContain("Ctrl+O to expand")
+    expect(harness.setup.captureCharFrame()).toContain("Write large.txt")
+    expect(harness.setup.captureCharFrame()).not.toContain("xxxxxxxx")
 
     harness.setup.mockInput.pressKey("o", { ctrl: true })
     await harness.setup.flush()
     expect(requiredRenderable(harness, "active-tool:write-expand")).toBe(root)
-    expect(harness.setup.captureCharFrame()).not.toContain("Ctrl+O to expand")
+    expect(harness.setup.captureCharFrame()).toContain("xxxxxxxx")
+    expect(harness.setup.captureCharFrame()).not.toContain("Ctrl+O details")
   } finally {
     harness.destroy()
   }
