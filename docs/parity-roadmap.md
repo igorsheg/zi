@@ -52,6 +52,8 @@ The target is coding-agent architecture parity and observable product-behavior p
 - [x] Print and JSON modes sharing the same `AgentSession`
 - [x] Authentication commands and composer-owned provider flows
 
+Context accounting and compaction are specified in [`docs/context-compaction-implementation-spec.md`](context-compaction-implementation-spec.md). The spec keeps Pi's append-only, tail-preserving behavior while adopting Grok Build's provider-boundary accounting, validation, and bounded failure lessons.
+
 Pi's optional `grep`, `find`, and `ls` implementations are deliberately deferred: its vanilla session does not enable them, and Bash already supplies their default capability. They are not part of the current built-in UX scope.
 
 ### P1 session-lifecycle evidence
@@ -67,7 +69,7 @@ Pi's optional `grep`, `find`, and `ls` implementations are deliberately deferred
 - `packages/tui/test/interactive/model-selector.test.ts` drives slash completion, exact and fuzzy `/model` paths, configured-provider filtering, Pi ordering, wrapped navigation, cancellation, mutation failure, stale completion, session replacement, persistent composer focus, and nested parent-filter restoration through real OpenTUI input and `AgentSession`.
 - `packages/tui/test/interactive/picker-stack.test.ts` fixes top-frame filtering, wrapped selection, nested push/pop, and suspended parent-filter restoration without an input renderable.
 - `packages/coding-agent/test/slash-commands.test.ts` fixes coding-agent ownership of supported built-in command descriptors.
-- Mode-owned `InteractiveCommands` assembles completion and parses invocation text into closed intents. Mode-owned `InteractiveKeybindings` resolves effective terminal actions without containing callbacks. `PromptStore` owns typed workflows and operation identity. `PickerStack` owns nested choice mechanics, while `PickerStackView` renders below the composer without creating another input. `PromptView`, `Composer`, `PickerStackView`, and `PickerList` contain no supported command names, argument rules, or dispatch policy.
+- Mode-owned `SlashController` assembles a bounded current-session catalog, fuzzy-ranks command completion, safely splices the selected token, and parses invocation text into closed intents without retaining active picker state. Mode-owned `InteractiveKeybindings` resolves effective terminal actions without containing callbacks. `PromptStore` owns typed workflows and operation identity. `PickerStack` owns nested choice mechanics, while `PickerStackView` renders below the composer without creating another input. `PromptView`, `Composer`, `PickerStackView`, and `PickerList` contain no supported command names, argument rules, or dispatch policy.
 - Command catalog composition, terminal parsing, exact reference matching, fuzzy search, sorting, and selector keys are characterized from Pi's `interactive-mode.ts`, `model-selector.ts`, `model-search.ts`, `model-resolver.ts`, and `pi-tui` fuzzy/editor implementation at the pinned commit.
 
 ### P1 authentication evidence
@@ -129,7 +131,7 @@ Pi's optional `grep`, `find`, and `ls` implementations are deliberately deferred
 - Behavior is characterized from Pi `0e6909f0` in `core/resource-loader.ts`, `core/skills.ts`, `core/prompt-templates.ts`, `core/system-prompt.ts`, and `core/agent-session.ts`.
 - `packages/coding-agent/test/resource-loader.test.ts` fixes global instructions followed by root-to-cwd `AGENTS.md`/`CLAUDE.md`, project system-prompt precedence, project-over-global skill/template collisions, canonical deduplication, recursive `SKILL.md` discovery, root skill files, skill and prompt ignore rules, non-recursive prompt discovery, invalid-resource fallback, diagnostics, and bounds.
 - `packages/coding-agent/test/skills.test.ts`, `prompt-templates.test.ts`, and `session-resources.test.ts` fix progressive skill disclosure, fresh bounded explicit invocation, Pi-compatible template arguments, immutable snapshot ownership, system-prompt composition, and expansion before session admission.
-- `packages/tui/test/interactive/interactive-commands.test.ts` fixes mode-owned aggregation of built-ins with the current session's prompt and skill commands, including built-in precedence and session replacement.
+- `packages/tui/test/interactive/slash-controller.test.ts` fixes mode-owned aggregation of built-ins with the current session's prompt and skill commands, including built-in precedence, session replacement, fuzzy ranking, range-safe edits, and typed activation.
 - Project `.openzi` resolution is exact to the effective cwd; ancestor traversal applies only to instruction files, matching Pi's distinction between project configuration and contextual instructions.
 
 ## P3 — extension platform

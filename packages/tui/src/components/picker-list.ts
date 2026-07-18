@@ -3,6 +3,8 @@ import { BoxRenderable, fg, StyledText, TextRenderable, type RenderContext } fro
 import { glyphs } from "../glyphs.js"
 import type { Theme } from "../theme.js"
 
+export const maxPickerListRows = 10
+
 export interface PickerRow {
   readonly id: string
   readonly label: string
@@ -11,6 +13,7 @@ export interface PickerRow {
 }
 
 export interface PickerListOptions {
+  readonly scope: string
   readonly rows: readonly PickerRow[]
   readonly selectedId?: string
   readonly height: number
@@ -24,6 +27,14 @@ export interface PickerList {
   destroy(): void
 }
 
+interface PickerRowView {
+  readonly root: BoxRenderable
+  readonly text: TextRenderable
+  row: PickerRow | undefined
+  selected: boolean
+  theme: Theme
+}
+
 export function createPickerList(ctx: RenderContext, options: PickerListOptions): PickerList {
   const root = new BoxRenderable(ctx, {
     id: "picker-list",
@@ -31,40 +42,101 @@ export function createPickerList(ctx: RenderContext, options: PickerListOptions)
     alignItems: "stretch",
     alignSelf: "stretch",
     flexShrink: 0,
-    height: options.height,
+    height: Math.min(maxPickerListRows, Math.max(0, options.height)),
     overflow: "hidden",
     backgroundColor: options.theme.surface.composer
   })
+  const rowsById = new Map<string, PickerRowView>()
+  let emptyView: PickerRowView | undefined
+  let scope = options.scope
+  let height = -1
+  let visible = true
+
+  const createRow = (theme: Theme): PickerRowView => {
+    const row = new BoxRenderable(ctx, {
+      alignSelf: "stretch",
+      height: 1,
+      flexShrink: 0,
+      backgroundColor: theme.surface.composer
+    })
+    const text = new TextRenderable(ctx, { height: 1, wrapMode: "none", selectable: false })
+    row.add(text)
+    return { root: row, text, row: undefined, selected: false, theme }
+  }
+
+  const updateRow = (view: PickerRowView, row: PickerRow, selected: boolean, theme: Theme): void => {
+    const changed =
+      view.row?.label !== row.label ||
+      view.row?.detail !== row.detail ||
+      view.row?.metadata !== row.metadata ||
+      view.selected !== selected ||
+      view.theme !== theme
+    if (!changed) return
+    view.row = row
+    view.selected = selected
+    view.theme = theme
+    view.root.backgroundColor = theme.surface.composer
+    view.text.content = rowContent(row, selected, theme)
+  }
 
   const update = (next: PickerListOptions) => {
-    clear(root)
-    root.height = next.height
-    root.visible = next.height > 0
-    if (next.height <= 0) return
-
-    const visibleRows = pickerWindow(next.rows, next.selectedId, next.height)
-    for (let index = 0; index < next.height; index++) {
-      const row = visibleRows[index]
-      const line = new BoxRenderable(ctx, {
-        alignSelf: "stretch",
-        height: 1,
-        flexShrink: 0,
-        backgroundColor: next.theme.surface.composer
-      })
-      line.add(
-        new TextRenderable(ctx, {
-          height: 1,
-          wrapMode: "none",
-          selectable: false,
-          content: row
-            ? rowContent(row, next.selectedId, next.theme)
-            : next.rows.length === 0 && next.emptyText && index === 0
-              ? new StyledText([fg(next.theme.text.muted)(`${glyphs.listUnselected}${next.emptyText}`)])
-              : ""
-        })
-      )
-      root.add(line)
+    if (scope !== next.scope) {
+      removeRows(root, rowsById)
+      removeEmpty(root, emptyView)
+      emptyView = undefined
+      scope = next.scope
     }
+
+    const nextHeight = Math.min(maxPickerListRows, Math.max(0, next.height))
+    if (height !== nextHeight) {
+      height = nextHeight
+      root.height = nextHeight
+    }
+    const nextVisible = nextHeight > 0
+    if (visible !== nextVisible) {
+      visible = nextVisible
+      root.visible = nextVisible
+    }
+    if (!nextVisible) {
+      removeRows(root, rowsById)
+      removeEmpty(root, emptyView)
+      emptyView = undefined
+      return
+    }
+
+    const window = pickerWindow(next.rows, next.selectedId, nextHeight)
+    const visibleIds = new Set(window.map(row => row.id))
+    for (const [id, view] of rowsById) {
+      if (visibleIds.has(id)) continue
+      root.remove(view.root)
+      view.root.destroyRecursively()
+      rowsById.delete(id)
+    }
+
+    if (window.length > 0) {
+      removeEmpty(root, emptyView)
+      emptyView = undefined
+      for (const row of window) {
+        const view = rowsById.get(row.id) ?? createRow(next.theme)
+        rowsById.set(row.id, view)
+        updateRow(view, row, row.id === next.selectedId, next.theme)
+      }
+      orderRows(
+        root,
+        window.map(row => rowsById.get(row.id)!.root)
+      )
+      return
+    }
+
+    removeRows(root, rowsById)
+    if (!next.emptyText) {
+      removeEmpty(root, emptyView)
+      emptyView = undefined
+      return
+    }
+    emptyView ??= createRow(next.theme)
+    updateRow(emptyView, { id: "", label: next.emptyText }, false, next.theme)
+    if (root.getChildren()[0] !== emptyView.root) root.insertBefore(emptyView.root, root.getChildren()[0])
   }
 
   update(options)
@@ -72,13 +144,14 @@ export function createPickerList(ctx: RenderContext, options: PickerListOptions)
     root,
     update,
     destroy() {
+      rowsById.clear()
+      emptyView = undefined
       root.destroyRecursively()
     }
   }
 }
 
-function rowContent(row: PickerRow, selectedId: string | undefined, theme: Theme): StyledText {
-  const selected = row.id === selectedId
+function rowContent(row: PickerRow, selected: boolean, theme: Theme): StyledText {
   return new StyledText([
     fg(selected ? theme.text.accent : theme.text.muted)(selected ? glyphs.listSelected : glyphs.listUnselected),
     fg(theme.text.primary)(row.label),
@@ -97,9 +170,24 @@ function pickerWindow(
   return rows.slice(offset, offset + height)
 }
 
-function clear(root: BoxRenderable): void {
-  for (const child of root.getChildren()) {
-    root.remove(child)
-    child.destroyRecursively()
+function orderRows(root: BoxRenderable, rows: readonly BoxRenderable[]): void {
+  for (let index = 0; index < rows.length; index++) {
+    const row = rows[index]!
+    const current = root.getChildren()[index]
+    if (current !== row) root.insertBefore(row, current)
   }
+}
+
+function removeRows(root: BoxRenderable, rows: Map<string, PickerRowView>): void {
+  for (const view of rows.values()) {
+    root.remove(view.root)
+    view.root.destroyRecursively()
+  }
+  rows.clear()
+}
+
+function removeEmpty(root: BoxRenderable, view: PickerRowView | undefined): void {
+  if (!view || !root.getChildren().includes(view.root)) return
+  root.remove(view.root)
+  view.root.destroyRecursively()
 }

@@ -3,11 +3,11 @@ import { BoxRenderable, type CliRenderer, type SyntaxStyle } from "@opentui/core
 import type { Theme } from "../theme.js"
 import type { BrowserOpener } from "./browser-opener.js"
 import type { ExitGestureController } from "./exit-gesture.js"
-import type { InteractiveCommands } from "./interactive-commands.js"
 import type { InteractiveKeybindings } from "./interactive-keybindings.js"
 import type { InteractiveStore } from "./interactive-store.js"
 import type { PromptSessionActions } from "./prompt/store.js"
 import { PromptView } from "./prompt/view.js"
+import type { SlashController } from "./slash-controller.js"
 import { TranscriptView } from "./transcript/view.js"
 
 export class SessionScreen {
@@ -18,7 +18,7 @@ export class SessionScreen {
   constructor(
     renderer: CliRenderer,
     interactive: InteractiveStore,
-    commands: InteractiveCommands,
+    slash: SlashController,
     keybindings: InteractiveKeybindings,
     exitGestures: ExitGestureController,
     browserOpener: BrowserOpener,
@@ -34,7 +34,7 @@ export class SessionScreen {
     this.prompt = new PromptView(
       renderer,
       interactive,
-      commands,
+      slash,
       keybindings,
       exitGestures,
       browserOpener,

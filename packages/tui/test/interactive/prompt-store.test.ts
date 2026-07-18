@@ -3,14 +3,14 @@ import { expect, test } from "bun:test"
 import type { AgentSession } from "@openzi/coding-agent"
 import { createModels, createTestAgentRuntime as createAgentRuntime, fauxProvider } from "@openzi/coding-agent/testing"
 
-import { createInteractiveCommands } from "../../src/interactive/interactive-commands.js"
 import { createInteractiveStore } from "../../src/interactive/interactive-store.js"
 import { createPromptStore, type PromptSessionActions } from "../../src/interactive/prompt/store.js"
+import { SlashController } from "../../src/interactive/slash-controller.js"
 
 test("prompt store restores queued text, images, and status without a renderer", async () => {
   const session = await createSession("restore")
   const mode = createInteractiveStore(session)
-  const prompt = createPromptStore(mode, createInteractiveCommands())
+  const prompt = createPromptStore(mode, new SlashController())
 
   try {
     session.steer("queued text", [{ type: "image", data: "aW1hZ2U=", mimeType: "image/png" }])
@@ -21,7 +21,7 @@ test("prompt store restores queued text, images, and status without a renderer",
       feedback: { type: "status", message: "Restored 1 queued message to editor with 1 image" },
       images: [{ type: "image", data: "aW1hZ2U=", mimeType: "image/png" }],
       workflow: { type: "idle" },
-      inputEdit: { revision: 0, text: "" }
+      inputEdit: { revision: 0, text: "", cursorOffset: 0 }
     })
     expect(session.queuedInputs.steering).toHaveLength(0)
   } finally {
@@ -33,15 +33,15 @@ test("prompt store restores queued text, images, and status without a renderer",
 test("resource command selection edits the composer without dispatching TUI domain work", async () => {
   const session = await createSession("resource-command")
   const mode = createInteractiveStore(session)
-  const commands = createInteractiveCommands(() => ({
+  const slash = new SlashController(() => ({
     listResourceCommands: () => [{ name: "review", description: "Review code", argumentHint: "<path>" }]
   }))
-  const prompt = createPromptStore(mode, commands)
+  const prompt = createPromptStore(mode, slash)
 
   try {
-    prompt.draftChanged("/rev", 4)
-    expect(prompt.activatePicker("/rev", 4)).toBe(true)
-    expect(prompt.$state.get().inputEdit.text).toBe("/review ")
+    prompt.draftChanged("/rev path", 4)
+    expect(prompt.activatePicker("/rev path", 4)).toBe(true)
+    expect(prompt.$state.get().inputEdit).toEqual({ revision: 1, text: "/review path", cursorOffset: 8 })
     expect(session.messages).toEqual([])
   } finally {
     mode.dispose()
@@ -52,7 +52,7 @@ test("resource command selection edits the composer without dispatching TUI doma
 test("settings workflow restores suspended filters until a value closes the stack", async () => {
   const session = await createSession("settings-store")
   const mode = createInteractiveStore(session)
-  const prompt = createPromptStore(mode, createInteractiveCommands())
+  const prompt = createPromptStore(mode, new SlashController())
 
   try {
     expect(prompt.submit("/settings", "steer")).toBe(true)
@@ -80,7 +80,7 @@ test("settings workflow cannot cross a session replacement", async () => {
   const first = await createSession("settings-first")
   const second = await createSession("settings-second")
   const mode = createInteractiveStore(first)
-  const prompt = createPromptStore(mode, createInteractiveCommands())
+  const prompt = createPromptStore(mode, new SlashController())
 
   try {
     expect(prompt.submit("/settings", "steer")).toBe(true)
@@ -120,7 +120,7 @@ test("session replacement cancellation remains explicit until runtime settlement
     resumeSession: () => resume.promise,
     cancelReplacement: () => ({ type: "cancelled", settled: cancellation.promise })
   }
-  const prompt = createPromptStore(mode, createInteractiveCommands(), actions)
+  const prompt = createPromptStore(mode, new SlashController(), actions)
 
   try {
     expect(prompt.submit("/resume", "steer")).toBe(true)
@@ -149,7 +149,7 @@ test("session replacement cancellation remains explicit until runtime settlement
 test("prompt store retains rejected input and exposes the admission error", async () => {
   const session = await createSession("disposed")
   const mode = createInteractiveStore(session)
-  const prompt = createPromptStore(mode, createInteractiveCommands())
+  const prompt = createPromptStore(mode, new SlashController())
 
   session.dispose()
   expect(prompt.submit("keep this", "steer")).toBe(false)

@@ -103,14 +103,14 @@ export interface PromptState {
   readonly feedback: PromptFeedback
   readonly images: readonly ImageContent[]
   readonly workflow: PromptWorkflow
-  readonly inputEdit: { readonly revision: number; readonly text: string }
+  readonly inputEdit: { readonly revision: number; readonly text: string; readonly cursorOffset: number }
 }
 
 export const initialPromptState: PromptState = {
   feedback: { type: "none" },
   images: [],
   workflow: { type: "idle" },
-  inputEdit: { revision: 0, text: "" }
+  inputEdit: { revision: 0, text: "", cursorOffset: 0 }
 }
 
 export function promptInputIsSecret(workflow: PromptWorkflow): boolean {

@@ -1,6 +1,6 @@
 import { BoxRenderable, type CliRenderer, TextRenderable } from "@opentui/core"
 
-import { createPickerList, type PickerList } from "../../components/picker-list.js"
+import { createPickerList, maxPickerListRows, type PickerList } from "../../components/picker-list.js"
 import type { Theme } from "../../theme.js"
 import type { PickerStack } from "./picker.js"
 
@@ -14,7 +14,6 @@ export class PickerStackView {
   readonly #hint: TextRenderable
   readonly #list: PickerList
   readonly #footer: TextRenderable
-  readonly #release: () => void
 
   constructor(renderer: CliRenderer, stack: PickerStack, theme: Theme, filter: () => string) {
     this.#stack = stack
@@ -28,25 +27,24 @@ export class PickerStackView {
     })
     this.#title = new TextRenderable(renderer, { height: 1, wrapMode: "none", fg: theme.text.accent })
     this.#hint = new TextRenderable(renderer, { height: 1, wrapMode: "none", fg: theme.text.warning })
-    this.#list = createPickerList(renderer, { rows: [], height: 0, theme })
+    this.#list = createPickerList(renderer, { scope: "", rows: [], height: 0, theme })
     this.#footer = new TextRenderable(renderer, { height: 1, wrapMode: "none", fg: theme.text.muted })
     this.root.add(this.#title)
     this.root.add(this.#hint)
     this.root.add(this.#list.root)
     this.root.add(this.#footer)
-    this.#release = stack.$state.subscribe(() => this.update())
   }
 
-  update(maxHeight = 10): void {
+  update(maxHeight: number): boolean {
     const presentation = this.#stack.presentation(this.#filter())
-    if (!presentation) {
+    if (!presentation || maxHeight <= 0) {
       this.root.visible = false
-      this.#list.update({ rows: [], height: 0, theme: this.#theme })
-      return
+      this.#list.update({ scope: "", rows: [], height: 0, theme: this.#theme })
+      return false
     }
 
     this.root.visible = true
-    let available = Math.max(1, maxHeight)
+    let available = maxHeight
     const titleVisible = presentation.frame.title.length > 0 && available > 1
     this.#title.visible = titleVisible
     this.#title.content =
@@ -64,16 +62,18 @@ export class PickerStackView {
     if (footerVisible) available--
 
     this.#list.update({
+      scope: presentation.frame.id,
       rows: presentation.rows,
       ...(presentation.selectedId ? { selectedId: presentation.selectedId } : {}),
-      height: Math.min(available, Math.max(1, Math.min(10, presentation.rows.length))),
+      height: Math.min(available, Math.max(1, Math.min(maxPickerListRows, presentation.rows.length))),
       ...(presentation.frame.emptyText ? { emptyText: presentation.frame.emptyText } : {}),
       theme: this.#theme
     })
+    return true
   }
 
   destroy(): void {
-    this.#release()
+    this.#list.destroy()
     this.root.destroyRecursively()
   }
 }

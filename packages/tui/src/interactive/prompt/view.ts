@@ -11,9 +11,9 @@ import { composerGeometry, createComposer, type Composer } from "../../component
 import type { Theme } from "../../theme.js"
 import type { BrowserOpener } from "../browser-opener.js"
 import type { ExitGestureController } from "../exit-gesture.js"
-import type { InteractiveCommands } from "../interactive-commands.js"
 import type { InteractiveKeybindings, PromptKeyAction } from "../interactive-keybindings.js"
 import type { InteractiveStore } from "../interactive-store.js"
+import type { SlashController } from "../slash-controller.js"
 import { PromptFeedbackView } from "./feedback-view.js"
 import { PickerStackView } from "./picker-view.js"
 import { QueuedInputsView } from "./queue-view.js"
@@ -40,7 +40,7 @@ export class PromptView {
   constructor(
     renderer: CliRenderer,
     interactive: InteractiveStore,
-    commands: InteractiveCommands,
+    slash: SlashController,
     keybindings: InteractiveKeybindings,
     exitGestures: ExitGestureController,
     browserOpener: BrowserOpener,
@@ -51,7 +51,7 @@ export class PromptView {
     this.#interactive = interactive
     this.#keybindings = keybindings
     this.#exitGestures = exitGestures
-    this.#store = createPromptStore(interactive, commands, sessionActions)
+    this.#store = createPromptStore(interactive, slash, sessionActions)
     this.root = new BoxRenderable(renderer, { flexDirection: "column", flexShrink: 0 })
 
     this.#working = new BoxRenderable(renderer, { flexDirection: "row", flexShrink: 0 })
@@ -79,7 +79,11 @@ export class PromptView {
     this.root.add(this.#pickerStack.root)
 
     const update = () => this.#update()
-    this.#release.push(this.#store.$state.subscribe(update), interactive.$promptRevision.subscribe(update))
+    this.#release.push(
+      this.#store.$state.subscribe(update),
+      this.#store.picker.$state.subscribe(update),
+      interactive.$promptRevision.subscribe(update)
+    )
     renderer.keyInput.on("keypress", this.#onKeyPress)
     renderer.on(CliRenderEvents.RESIZE, update)
     this.#release.push(() => renderer.keyInput.off("keypress", this.#onKeyPress))
@@ -106,30 +110,29 @@ export class PromptView {
     const geometry = composerGeometry(this.#renderer.width, this.#renderer.height)
     if (prompt.inputEdit.revision > this.#appliedInputRevision) {
       this.#appliedInputRevision = prompt.inputEdit.revision
-      this.#replaceInput(prompt.inputEdit.text)
+      this.#replaceInput(prompt.inputEdit.text, prompt.inputEdit.cursorOffset)
     }
     const secretInput = promptInputIsSecret(prompt.workflow)
     this.input.attributes = secretInput ? TextAttributes.HIDDEN : 0
     this.input.selectable = !secretInput
     if (secretInput) this.#renderer.clearSelection()
-    const pickerVisible = Boolean(this.#store.picker.presentation(this.input.plainText))
     const feedbackVisible = this.#feedback.update(prompt.feedback, this.#renderer.width)
     const fixedRows = geometry.protectedRows + (session.isStreaming ? 1 : 0) + (feedbackVisible ? 1 : 0)
+    const pickerVisible = this.#pickerStack.update(Math.max(0, this.#renderer.height - fixedRows))
 
     this.#working.visible = session.isStreaming
     if (pickerVisible) this.#queue.hide()
     else this.#queue.update(session.queuedInputs, Math.max(0, this.#renderer.height - fixedRows))
     this.#composer.update(geometry, session.sessionManager.header.cwd, modelTitle(session))
-    this.#pickerStack.update(Math.max(1, this.#renderer.height - fixedRows))
   }
 
   #submit(delivery: "steer" | "followUp"): void {
     this.#store.submit(this.input.plainText, delivery)
   }
 
-  #replaceInput(text: string): void {
+  #replaceInput(text: string, cursorOffset = text.length): void {
     this.input.setText(text)
-    this.input.gotoBufferEnd()
+    this.input.cursorOffset = cursorOffset
     this.input.focus()
   }
 

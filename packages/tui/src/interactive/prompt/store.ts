@@ -10,14 +10,13 @@ import type {
   SettingsScope,
   SessionListResult,
   SessionReplacementCancellation,
-  SlashCommand,
   StoredCredential,
   ThinkingLevel
 } from "@openzi/coding-agent"
 import { atom, type ReadableAtom } from "nanostores"
 
-import type { InteractiveCommands } from "../interactive-commands.js"
 import type { InteractiveStore } from "../interactive-store.js"
+import type { InteractiveCommand, SlashController } from "../slash-controller.js"
 import {
   authenticationMethodId,
   authMethodFrame,
@@ -77,10 +76,10 @@ export interface PromptSessionActions {
 
 export function createPromptStore(
   interactive: InteractiveStore,
-  commands: InteractiveCommands,
+  slash: SlashController,
   sessionActions?: PromptSessionActions
 ): PromptStore {
-  return new PromptController(interactive, commands, sessionActions)
+  return new PromptController(interactive, slash, sessionActions)
 }
 
 class PromptController implements PromptStore {
@@ -88,16 +87,16 @@ class PromptController implements PromptStore {
   readonly picker = createPickerStack()
 
   readonly #interactive: InteractiveStore
-  readonly #commands: InteractiveCommands
+  readonly #slash: SlashController
   readonly #sessionActions: PromptSessionActions | undefined
   #disposed = false
   #nextOperationId = 0
   #nextBrowserRequestId = 0
   #pendingAuthPrompt: PendingAuthPrompt | undefined
 
-  constructor(interactive: InteractiveStore, commands: InteractiveCommands, sessionActions?: PromptSessionActions) {
+  constructor(interactive: InteractiveStore, slash: SlashController, sessionActions?: PromptSessionActions) {
     this.#interactive = interactive
-    this.#commands = commands
+    this.#slash = slash
     this.#sessionActions = sessionActions
   }
 
@@ -108,14 +107,17 @@ class PromptController implements PromptStore {
     const trimmed = text.trim()
     if (!trimmed || workflow.type !== "idle") return false
 
-    const command = this.#commands.parse(trimmed)
+    const command = this.#slash.parse(trimmed)
     if (this.#dispatchCommand(command)) return true
 
     try {
       const state = this.$state.get()
       const settled = this.#interactive.submit({ text: trimmed, images: state.images, delivery })
       this.picker.close()
-      this.$state.set({ ...initialPromptState, inputEdit: { revision: state.inputEdit.revision + 1, text: "" } })
+      this.$state.set({
+        ...initialPromptState,
+        inputEdit: { revision: state.inputEdit.revision + 1, text: "", cursorOffset: 0 }
+      })
       void settled.catch(cause => this.#showError(cause))
       return true
     } catch (cause) {
@@ -132,7 +134,7 @@ class PromptController implements PromptStore {
       return
     }
 
-    const suggestions = this.#commands.suggestions(text, cursorOffset)
+    const suggestions = this.#slash.suggestions(text, cursorOffset)
     if (suggestions.length === 0) {
       if (this.picker.presentation(text)?.frame.id === promptPickerFrameIds.commands) this.picker.close()
       return
@@ -145,11 +147,18 @@ class PromptController implements PromptStore {
   completePicker(text: string, cursorOffset: number): boolean {
     const presentation = this.picker.presentation(text)
     if (presentation?.frame.id !== promptPickerFrameIds.commands || !presentation.selectedId) return false
-    const command = this.#commandFor(text, cursorOffset, presentation.selectedId)
-    if (!command) return false
-    this.picker.close()
-    this.#requestInput(this.#commands.completion(command))
-    return true
+    const result = this.#slash.complete(text, cursorOffset, presentation.selectedId)
+    switch (result.type) {
+      case "unavailable":
+        this.picker.close()
+        return false
+      case "edit":
+        this.picker.close()
+        this.#requestInput(result.text, result.cursorOffset)
+        return true
+      default:
+        return assertNever(result)
+    }
   }
 
   activatePicker(text: string, cursorOffset: number): boolean {
@@ -311,7 +320,10 @@ class PromptController implements PromptStore {
     if (this.#cancelAuthentication() || this.#cancelSessionReplacement()) return
     this.picker.close()
     const state = this.$state.get()
-    this.$state.set({ ...initialPromptState, inputEdit: { revision: state.inputEdit.revision + 1, text: "" } })
+    this.$state.set({
+      ...initialPromptState,
+      inputEdit: { revision: state.inputEdit.revision + 1, text: "", cursorOffset: 0 }
+    })
   }
 
   dispose(): void {
@@ -324,14 +336,20 @@ class PromptController implements PromptStore {
 
   #activateCommand(presentation: PickerPresentation, text: string, cursorOffset: number): boolean {
     if (presentation.frame.id !== promptPickerFrameIds.commands || !presentation.selectedId) return false
-    const command = this.#commandFor(text, cursorOffset, presentation.selectedId)
-    if (!command) return false
-    const completion = this.#commands.completion(command)
-    const builtin = this.#commands.parse(completion.trim())
-    if (builtin) return this.#dispatchCommand(builtin, text)
-    this.picker.close()
-    this.#requestInput(completion)
-    return true
+    const result = this.#slash.activate(text, cursorOffset, presentation.selectedId)
+    switch (result.type) {
+      case "unavailable":
+        this.picker.close()
+        return false
+      case "edit":
+        this.picker.close()
+        this.#requestInput(result.text, result.cursorOffset)
+        return true
+      case "intent":
+        return this.#dispatchCommand(result.command, text)
+      default:
+        return assertNever(result)
+    }
   }
 
   #activateSettingsScope(
@@ -518,7 +536,7 @@ class PromptController implements PromptStore {
     return true
   }
 
-  #dispatchCommand(command: ReturnType<InteractiveCommands["parse"]>, parentFilter?: string): boolean {
+  #dispatchCommand(command: InteractiveCommand | undefined, parentFilter?: string): boolean {
     if (!command) return false
     switch (command.type) {
       case "model":
@@ -1031,10 +1049,6 @@ class PromptController implements PromptStore {
     return true
   }
 
-  #commandFor(text: string, cursorOffset: number, selectedId: string): SlashCommand | undefined {
-    return this.#commands.suggestions(text, cursorOffset).find(command => command.name === selectedId)
-  }
-
   #accepts(operationId: number, session: AgentSession): boolean {
     if (this.#disposed || this.#interactive.getSession() !== session) return false
     const workflow = this.$state.get().workflow
@@ -1064,9 +1078,9 @@ class PromptController implements PromptStore {
     return [...texts, currentText].filter(value => value.length > 0).join("\n\n")
   }
 
-  #requestInput(text: string): void {
+  #requestInput(text: string, cursorOffset = text.length): void {
     const state = this.$state.get()
-    this.$state.set({ ...state, inputEdit: { revision: state.inputEdit.revision + 1, text } })
+    this.$state.set({ ...state, inputEdit: { revision: state.inputEdit.revision + 1, text, cursorOffset } })
   }
 
   #setIdle(): void {

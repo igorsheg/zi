@@ -3,9 +3,9 @@ import { expect, test } from "bun:test"
 import { TextareaRenderable } from "@opentui/core"
 import { createModels, createTestAgentRuntime as createAgentRuntime, fauxProvider } from "@openzi/coding-agent/testing"
 
-import { createInteractiveCommands } from "../../src/interactive/interactive-commands.js"
 import { createInteractiveStore } from "../../src/interactive/interactive-store.js"
 import { createPromptStore } from "../../src/interactive/prompt/store.js"
+import { SlashController } from "../../src/interactive/slash-controller.js"
 import { createInteractiveTest, renderSettled } from "./harness.js"
 
 test("slash completion admits /model through the prompt workflow", async () => {
@@ -29,6 +29,44 @@ test("slash completion admits /model through the prompt workflow", async () => {
     expect(prompt.plainText).toBe("")
     expect(prompt.focused).toBe(true)
     expect(setup.captureCharFrame()).toContain("current  [select]  ✓")
+  } finally {
+    session.dispose()
+    setup.destroy()
+  }
+})
+
+test("slash completion preserves existing arguments and places the cursor after the command", async () => {
+  const { session, setup } = await createModelFixture()
+
+  try {
+    const prompt = promptInput(setup)
+    prompt.setText("/mo target")
+    prompt.cursorOffset = 3
+    await setup.mockInput.typeText("d", 0)
+    setup.mockInput.pressTab()
+
+    expect(prompt.plainText).toBe("/model target")
+    expect(prompt.cursorOffset).toBe(7)
+    expect(prompt.focused).toBe(true)
+  } finally {
+    session.dispose()
+    setup.destroy()
+  }
+})
+
+test("slash activation preserves arguments when completing a built-in command", async () => {
+  const { session, setup } = await createModelFixture()
+
+  try {
+    const prompt = promptInput(setup)
+    prompt.setText("/m target")
+    prompt.cursorOffset = 2
+    await setup.mockInput.typeText("o", 0)
+    setup.mockInput.pressEnter()
+    await renderSettled(setup)
+
+    expect(session.model.id).toBe("target")
+    expect(prompt.plainText).toBe("")
   } finally {
     session.dispose()
     setup.destroy()
@@ -217,7 +255,7 @@ test("model selection failure closes the picker and reports the error", async ()
 test("cancelled model selection rejects stale completion", async () => {
   const { session } = await createModelSession()
   const interactive = createInteractiveStore(session)
-  const prompt = createPromptStore(interactive, createInteractiveCommands())
+  const prompt = createPromptStore(interactive, new SlashController())
   const selection = deferred<void>()
   session.setModel = () => selection.promise
 

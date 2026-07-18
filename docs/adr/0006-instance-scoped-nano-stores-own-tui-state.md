@@ -14,7 +14,7 @@ createTranscriptStore()
 ```
 
 - `InteractiveStore` owns the current session subscription and generation, rejects stale events, bounds transient tool presentation, and exposes narrow prompt/transcript revision streams.
-- `PromptStore` owns feedback, retained images, typed command/model workflows, and one-shot composer edit requests. It receives typed command intents from the mode-owned `InteractiveCommands` and delegates prompt, queue, catalog, and mutation operations through `InteractiveStore` to `AgentSession`.
+- `PromptStore` owns feedback, retained images, typed command/model workflows, and cursor-targeted one-shot composer edit requests. It receives typed edits or command intents from the mode-owned `SlashController` and delegates prompt, queue, catalog, and mutation operations through `InteractiveStore` to `AgentSession`.
 - `PickerStack` owns nested picker frames, selected rows, suspended parent filters, and top-frame filtering. It receives the active composer filter as an operation argument and owns no input.
 - `TranscriptStore` owns follow/detached/unseen terminal navigation.
 

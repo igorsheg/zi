@@ -10,11 +10,11 @@ import {
   type TuiMemorySnapshot
 } from "./diagnostics.js"
 import { ExitGestureController } from "./exit-gesture.js"
-import { createInteractiveCommands, type InteractiveCommands } from "./interactive-commands.js"
 import { InteractiveKeybindings, type InteractiveKeybindingOverrides } from "./interactive-keybindings.js"
 import { createInteractiveStore, type InteractiveStore } from "./interactive-store.js"
 import type { PromptSessionActions } from "./prompt/store.js"
 import { SessionScreen } from "./screen.js"
+import { SlashController } from "./slash-controller.js"
 import type { TranscriptDiagnostics } from "./transcript/view.js"
 
 export interface InteractiveModeOptions {
@@ -39,7 +39,7 @@ export class InteractiveMode {
   readonly #exitGestures: ExitGestureController
   readonly #theme: Theme
   readonly #syntaxStyle: SyntaxStyle
-  readonly #commands: InteractiveCommands
+  readonly #slash: SlashController
   readonly #keybindings: InteractiveKeybindings
   readonly #diagnosticFlags: TuiDiagnosticFlags
   readonly #diagnostics: TuiDiagnosticsOverlay | undefined
@@ -81,7 +81,10 @@ export class InteractiveMode {
     this.store = createInteractiveStore(session)
     this.#theme = theme
     this.#syntaxStyle = createSyntaxStyle(theme)
-    this.#commands = createInteractiveCommands(() => this.store.getSession())
+    this.#slash = new SlashController(
+      () => this.store.getSession(),
+      () => this.store.$generation.get()
+    )
     this.#keybindings = new InteractiveKeybindings(keybindingOverrides)
     this.#diagnosticFlags = diagnostics
     this.root = new BoxRenderable(renderer, {
@@ -154,7 +157,7 @@ export class InteractiveMode {
     return new SessionScreen(
       this.#renderer,
       this.store,
-      this.#commands,
+      this.#slash,
       this.#keybindings,
       this.#exitGestures,
       this.#browserOpener,
