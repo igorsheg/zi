@@ -19,7 +19,8 @@
   "dependencies": {
     "@opentui/core": "catalog:",
     "@openzi/coding-agent": "workspace:*",
-    "nanostores": "catalog:"
+    "nanostores": "catalog:",
+    "string-width": "catalog:"
   },
   "devDependencies": {
     "@types/bun": "catalog:",

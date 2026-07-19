@@ -168,6 +168,7 @@ export function transitionInteractiveState(state: InteractiveState, event: Agent
       tools = updatePreparingTool(tools, event)
       break
     case "message_end":
+      promptRevision++
       transcriptRevision++
       if (event.message.role === "assistant") {
         tools = completeToolArguments(tools, event.message)

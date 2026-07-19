@@ -10,6 +10,8 @@ OpenZi now uses three concrete owners:
 - `PickerStack` owns open/closed state, ordered frames, selected row per frame, suspended parent filters, top-frame filtering, and push/pop transitions. It accepts the current composer text as a method argument and does not retain or render an active input.
 - `PickerStackView` renders only the active frame below the composer. It contains no textarea and does not interpret selected row IDs.
 
+`PromptView` preserves three vertical regions. Working state, feedback, and queued-input status stay above the composer as transient presentation. The composer rail contains only stable session metadata: cwd on the left, then model/effort and context on the right. Right-rail text is ordered by importance and admits only the largest fitting prefix, so context disappears before model/effort at constrained widths. The rail accepts text, not arbitrary renderables or extension callbacks. `PickerStackView` remains the only below-input choice surface.
+
 `PromptStore` owns the command/model workflow that creates frames and interprets selection. It issues revisioned one-shot input edits with explicit cursor targets when a transition must complete, clear, restore, or safely splice command completion into the composer. These edits are resource synchronization requests, not a mirrored editor model; subsequent native text and cursor remain authoritative in OpenTUI.
 
 The stack API is deliberately mechanical:

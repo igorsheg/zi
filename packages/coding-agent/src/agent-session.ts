@@ -21,6 +21,7 @@ import type {
   AuthenticationMethod,
   AuthenticationMethodType
 } from "./authentication.js"
+import { advanceContextUsage, estimateContextUsage, type ContextUsage } from "./context-usage.js"
 import type { StoredCredential } from "./credential-store.js"
 import type { ModelRegistry } from "./model-registry.js"
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.js"
@@ -32,6 +33,8 @@ import type { SettingsManager, SettingsScope } from "./settings-manager.js"
 import { expandSkillCommand, type Skill } from "./skills.js"
 import type { SlashCommand } from "./slash-commands.js"
 import { buildSystemPrompt } from "./system-prompt.js"
+
+export type { ContextUsage } from "./context-usage.js"
 
 export const maxPendingInputCount = 32
 export const maxPendingInputBytes = 8 * 1024 * 1024
@@ -151,6 +154,12 @@ interface CommittedMessageMemory {
   readonly bytes: number
 }
 
+interface ContextUsageCache {
+  readonly model: Model<Api>
+  readonly messageCount: number
+  readonly usage: ContextUsage
+}
+
 interface Settlement {
   readonly promise: Promise<void>
   resolve(): void
@@ -182,6 +191,7 @@ export class AgentSession {
   #modelState: SessionModelState
   #modelChoicesPromise: Promise<readonly ModelChoice[]> | undefined
   #committedMessageMemory: CommittedMessageMemory | undefined
+  #contextUsageCache: ContextUsageCache | undefined
 
   constructor(config: AgentSessionConfig) {
     this.#agent = config.agent
@@ -271,6 +281,20 @@ export class AgentSession {
       queuedInputBytes: this.#pendingBytes,
       subscribers: this.#listeners.size
     }
+  }
+
+  getContextUsage(): ContextUsage | undefined {
+    if (this.#modelState.type === "unselected") return undefined
+    const model = this.#modelState.model
+    if (model.contextWindow <= 0) return undefined
+
+    const messages = this.#agent.state.messages
+    const cached = this.#contextUsageCache
+    if (cached?.model === model && cached.messageCount === messages.length) return cached.usage
+
+    const usage = estimateContextUsage(messages, model.contextWindow)
+    this.#contextUsageCache = { model, messageCount: messages.length, usage }
+    return usage
   }
 
   get sessionId(): string {
@@ -528,6 +552,7 @@ export class AgentSession {
       this.#agent.state.model = model
       this.#agent.state.thinkingLevel = effectiveThinking
       this.#modelState = { type: "selected", model }
+      this.#contextUsageCache = undefined
       const events: AgentSessionEvent[] = []
       if (thinkingChanged) events.push({ type: "thinking_level_changed", level: effectiveThinking })
       events.push({ type: "model_changed", model })
@@ -713,14 +738,31 @@ export class AgentSession {
   }
 
   #recordCommittedMessage(message: AgentMessage): void {
-    const memory = this.#committedMessageMemory
-    if (!memory) return
     const messages = this.#agent.state.messages
-    if (messages.length !== memory.count + 1 || messages.at(-1) !== message) {
-      this.#committedMessageMemory = undefined
+    const memory = this.#committedMessageMemory
+    if (memory) {
+      this.#committedMessageMemory =
+        messages.length === memory.count + 1 && messages.at(-1) === message
+          ? { count: messages.length, bytes: memory.bytes + serializedMessageBytes(message) }
+          : undefined
+    }
+
+    const context = this.#contextUsageCache
+    if (!context) return
+    if (
+      this.#modelState.type === "unselected" ||
+      context.model !== this.#modelState.model ||
+      messages.length !== context.messageCount + 1 ||
+      messages.at(-1) !== message
+    ) {
+      this.#contextUsageCache = undefined
       return
     }
-    this.#committedMessageMemory = { count: messages.length, bytes: memory.bytes + serializedMessageBytes(message) }
+    this.#contextUsageCache = {
+      model: context.model,
+      messageCount: messages.length,
+      usage: advanceContextUsage(context.usage, message, context.model.contextWindow)
+    }
   }
 
   #removeDelivered(message: AgentMessage): void {

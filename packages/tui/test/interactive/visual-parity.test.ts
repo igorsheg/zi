@@ -16,9 +16,15 @@ import { createInteractiveTest } from "./harness.js"
 
 test("representative session keeps the accepted visual hierarchy at normal and constrained sizes", async () => {
   const models = createModels()
-  const faux = fauxProvider()
+  const faux = fauxProvider({ models: [{ id: "faux-1", reasoning: true, contextWindow: 247_000 }] })
   models.setProvider(faux.provider)
-  const bootstrap = await createAgentRuntime({ cwd: "/workspace/openzi", model: "faux/faux-1", models, persist: false })
+  const bootstrap = await createAgentRuntime({
+    cwd: "/workspace/openzi",
+    model: "faux/faux-1",
+    models,
+    persist: false,
+    settings: { thinkingLevel: "high" }
+  })
   const model = bootstrap.session.model
   bootstrap.session.dispose()
   const sessionManager = SessionManager.inMemory("/workspace/openzi")
@@ -56,9 +62,9 @@ test("representative session keeps the accepted visual hierarchy at normal and c
       "",
       "",
       "",
-      "╭─/workspace/openzi────────────────────────────────────────────────────────────╮",
+      "╭─/workspace/openzi───────────────────────────────faux-1 (high) (ctx 15%/247k)─╮",
       "│                                                                              │",
-      "╰───────────────────────────────────────────────────────────────────────faux-1─╯"
+      "╰──────────────────────────────────────────────────────────────────────────────╯"
     ])
 
     const spans = setup.captureSpans().lines.flatMap(line => line.spans)
@@ -79,9 +85,9 @@ test("representative session keeps the accepted visual hierarchy at normal and c
       " The failed command remains visible",
       " without overwhelming the prompt.",
       "",
-      "╭─/workspace/openzi────────────────────╮",
+      "╭─/workspace/openzi──────faux-1 (high)─╮",
       "│                                      │",
-      "╰───────────────────────────────faux-1─╯"
+      "╰──────────────────────────────────────╯"
     ])
 
     setup.resize(20, 4)
@@ -195,7 +201,17 @@ function representativeMessages(): AgentMessage[] {
       isError: true,
       timestamp: 5
     },
-    fauxAssistantMessage(fauxText("The failed command remains visible without overwhelming the prompt."))
+    {
+      ...fauxAssistantMessage(fauxText("The failed command remains visible without overwhelming the prompt.")),
+      usage: {
+        input: 36_000,
+        output: 1_000,
+        cacheRead: 0,
+        cacheWrite: 0,
+        totalTokens: 37_000,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }
+      }
+    }
   ]
 }
 

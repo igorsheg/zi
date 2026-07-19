@@ -84,6 +84,7 @@ test("tool arguments stream through preparing, ready, and running states", async
       { stopReason: "toolUse" }
     )
     state = transitionInteractiveState(state, { type: "message_end", message: complete })
+    expect(state.promptRevision).toBe(1)
     expect(state.tools.get("write-1")?.status).toBe("ready")
     expect(state.tools.get("write-1")?.args).toEqual({ path: "notes.txt", content: "hello" })
     expect(state.tools.get("read-1")?.status).toBe("ready")
