@@ -16,8 +16,8 @@ export type PromptFeedback =
   | { readonly type: "error"; readonly message: string }
   | { readonly type: "auth_link"; readonly requestId: number; readonly message: string; readonly url: string }
 
-export type EditableSetting = "thinkingLevel" | "steeringMode" | "followUpMode"
-export type EditableSettingValue = ThinkingLevel | QueueMode
+export type EditableSetting = "thinkingLevel" | "steeringMode" | "followUpMode" | "compactionEnabled"
+export type EditableSettingValue = ThinkingLevel | QueueMode | boolean
 
 export type PromptWorkflow =
   | { readonly type: "idle" }
@@ -74,6 +74,7 @@ export type PromptWorkflow =
       readonly session: AgentSession
       readonly providerId: string
     }
+  | { readonly type: "compacting"; readonly operationId: number; readonly session: AgentSession }
   | { readonly type: "starting_session"; readonly operationId: number; readonly session: AgentSession }
   | { readonly type: "loading_sessions"; readonly operationId: number; readonly session: AgentSession }
   | {

@@ -71,7 +71,8 @@ createAgentRuntime(options)
           -> admitted session resources
           -> SessionShell-backed bash and task tools
           -> other tool definitions
-          -> later: compaction, retry, extensions
+          -> context accounting and compaction transaction
+          -> later: retry, extensions
 ```
 
 ### `AgentRuntime` and `AgentSession`
@@ -89,7 +90,8 @@ createAgentRuntime(options)
 - one immutable `SessionResources` snapshot, system-prompt composition, resource diagnostics, prompt-template expansion, and bounded explicit skill invocation;
 - steering and follow-up queues;
 - active-run admission, interruption, queue disposition, cancellation, and settlement;
-- later, retry, compaction, branch, bash, and extension policy.
+- provider-anchored context accounting, manual and provider-boundary compaction, and one overflow recovery;
+- later, retry, branch, and extension policy.
 
 It exposes Pi agent events plus session-level events. Application modes subscribe; they do not control the provider loop or persist messages themselves. Runtime creation may produce an unselected session when no provider is authenticated; the terminal still starts, while prompt admission gives `/login` then `/model` guidance until `setModel()` commits the selected transition.
 
@@ -99,7 +101,7 @@ Queue-mode and thinking-level changes cross live and durable state through `Agen
 
 `OpenZiPaths` is the immutable path-policy owner for one effective cwd. It resolves the global `$HOME/.openzi/agent` directory, exact `<cwd>/.openzi` project directory, settings, authentication, resources, and cwd-partitioned sessions. Runtime construction opens an explicit session first, then creates cwd-bound paths and services from the header cwd. See [ADR 0011](adr/0011-openzi-path-policy.md).
 
-- `SessionManager` owns one append-only JSONL session tree and its leaf; persistent creation receives `OpenZiPaths`. Its static current-cwd catalog operation bounds candidates, previews, concurrency, returned rows, and invalid-journal reporting; continue-recent is distinct from strict resume.
+- `SessionManager` owns one append-only JSONL session tree and its leaf; persistent creation receives `OpenZiPaths`. Appends reach disk before mutating the in-memory leaf. Validated compaction markers derive one synthetic checkpoint plus an exact retained tail while `entries()` remains the full durable journal. Its static current-cwd catalog operation bounds candidates, previews, concurrency, returned rows, and invalid-journal reporting; continue-recent is distinct from strict resume.
 - `SettingsManager` owns defaults < valid global < valid project < runtime layering, explicit missing/loaded/invalid scopes, bounded locked persistence, reload, and non-fatal diagnostics.
 - `FileCredentialStore` owns bounded global `auth.json` serialization, redacted credential inspection, and the Pi AI `CredentialStore` contract.
 - Runtime model factories receive that credential owner, ensuring `ModelRegistry`, provider requests, OAuth refresh, and login operations cannot use shadow stores. The raw-model test adapter is isolated under `@openzi/coding-agent/testing`.

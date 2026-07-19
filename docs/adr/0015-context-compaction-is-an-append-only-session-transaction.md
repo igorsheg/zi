@@ -1,0 +1,11 @@
+# Context compaction is an append-only session transaction
+
+Status: Accepted
+
+OpenZi compacts provider context without replacing or deleting its durable conversation journal. `AgentSession` owns manual and automatic admission, operation identity, cancellation, threshold and overflow policy, summary sampling, and the final commit. `SessionManager` durably appends one validated compaction marker before exposing the marker's synthetic summary and exact retained tail as active context. A persistence failure, cancellation, model change, stale completion, invalid summary, or non-reducing result therefore cannot partially replace context.
+
+The active projection folds only the latest narrative summary forward, skips older markers, preserves safe assistant/tool-result groups, and may exclude one durable overflow failure named by the marker. Provider-reported usage anchors accounting until trailing messages require bounded estimates; every marker invalidates physically older usage. Summary input is labelled and processed sequentially with fixed limits on focus, tool-result serialization, chunks, output, metadata, and elapsed operation time. Automatic work runs only at provider boundaries, is limited to four compactions and one overflow recovery per run, and suppresses repeated threshold failure for that run.
+
+A successful append is irrevocable. Before publishing its `entry_appended` event, `AgentSession` enters an explicit committed state that cannot be changed into a cancelled or failed compaction by a reentrant abort or disposal observer. Public failure messages and manual rejections share one coding-agent-owned UTF-8 byte bound.
+
+Every client receives the same policy through `AgentSession`. The TUI owns only the admitted `/compact` workflow and presentation: status, automatic failure feedback, effective On/Off setting, context quality, and authoritative transcript rebuild. It does not retain another summary, token timeline, or context projection. This keeps Pi's append-only, tail-preserving architecture while adopting Grok Build's stronger preflight, validation, accounting, and bounded-failure lessons; whole-session replacement, memory sidecars, speculative prefire, and a dedicated compaction model remain out of scope.

@@ -44,7 +44,7 @@ The target is coding-agent architecture parity and observable product-behavior p
 - [x] Steering and follow-up with bounded queues
 - [x] Session-owned foreground/background shell tasks and interactive demotion
 - [ ] Retry policy and visible countdown
-- [ ] Context usage and automatic/manual compaction
+- [x] Context usage and automatic/manual compaction
 - [ ] Slash commands and file completion
 - [x] Conversation scrolling, follow-tail, unseen-line hint, selection/copy
 - [ ] Typed tool-result and semantic-presentation cutover, then vertical polish of all six active built-ins
@@ -52,7 +52,14 @@ The target is coding-agent architecture parity and observable product-behavior p
 - [x] Print and JSON modes sharing the same `AgentSession`
 - [x] Authentication commands and composer-owned provider flows
 
-Context accounting and compaction are specified in [`docs/context-compaction-implementation-spec.md`](context-compaction-implementation-spec.md). The spec keeps Pi's append-only, tail-preserving behavior while adopting Grok Build's provider-boundary accounting, validation, and bounded failure lessons.
+Context accounting and compaction are implemented from [`docs/context-compaction-implementation-spec.md`](context-compaction-implementation-spec.md) and accepted in [ADR 0015](adr/0015-context-compaction-is-an-append-only-session-transaction.md). The implementation keeps Pi's append-only, tail-preserving behavior while adopting Grok Build's provider-boundary accounting, validation, and bounded failure lessons.
+
+### P1 context-compaction evidence
+
+- `packages/coding-agent/test/compaction.test.ts` fixes provider-anchored estimates, model-relative budgets, safe assistant/tool-result cuts, iterative prior-summary carry-forward, deterministic successful file operations, bounded serialization and UTF-8 splitting, chunk refusal, and summary/reduction validation.
+- `packages/coding-agent/test/session-manager.test.ts` fixes transactional append ordering, marker restore, repeated projection across an older marker, durable overflow failures with active omission, semantic-reference rejection, torn-tail behavior, and in-memory parity.
+- `packages/coding-agent/test/agent-session-compaction.test.ts` fixes manual admission, commit and cancellation; pre-prompt and tool-boundary compaction; queue continuation; run-local failure suppression; one overflow recovery; second-overflow refusal; context replacement; and ordered lifecycle events despite observer failure. `packages/coding-agent/test/context-usage.test.ts` fixes measured/estimated transitions and stale pre-marker usage on restore.
+- `packages/tui/test/interactive/prompt-store.test.ts`, `settings.test.ts`, and `transcript-performance.test.ts` fix exact `/compact` focus forwarding, scoped On/Off policy, success feedback, and authoritative equal-length transcript rebuild with stable projection bounds. `packages/coding-agent/test/print-mode.test.ts` proves headless JSON preserves compaction start → durable entry → end ordering without terminal policy.
 
 Pi's optional `grep`, `find`, and `ls` implementations are deliberately deferred: its vanilla session does not enable them, and Bash already supplies their default capability. They are not part of the current built-in UX scope.
 

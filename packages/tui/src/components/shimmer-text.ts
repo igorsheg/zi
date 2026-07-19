@@ -48,9 +48,9 @@ export class ShimmerTextView {
 
   readonly #renderer: CliRenderer
   readonly #text: TextRenderable
-  readonly #line: ShimmerLine | undefined
+  #line: ShimmerLine | undefined
   readonly #palette: readonly RGBA[]
-  readonly #strengths: Uint8Array
+  #strengths: Uint8Array
   readonly #now: () => number
   #hasFrame = false
   #active = false
@@ -79,6 +79,15 @@ export class ShimmerTextView {
     })
     this.root.add(this.#text)
     this.root.onLifecyclePass = this.#renderFrame
+  }
+
+  setText(text: string): void {
+    const line = segmentLine(text)
+    if (line?.text === this.#line?.text) return
+    this.#line = line
+    this.#strengths = new Uint8Array(line?.graphemes.length ?? 0)
+    this.#hasFrame = false
+    this.#text.content = baseText(line?.text ?? firstLine(text), this.#palette[0]!)
   }
 
   setActive(active: boolean): void {

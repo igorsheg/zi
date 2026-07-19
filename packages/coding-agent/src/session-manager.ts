@@ -2,8 +2,9 @@ import { appendFileSync, mkdirSync, readFileSync, statSync, writeFileSync } from
 import { open, opendir, stat } from "node:fs/promises"
 import { dirname, join } from "node:path"
 
-import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core"
+import type { ThinkingLevel } from "@earendil-works/pi-agent-core"
 
+import { formatCompactionSummary, type AgentMessage, type CompactionSummaryMessage } from "./messages.js"
 import { type OpenZiPaths, resolveOpenZiPath } from "./paths.js"
 
 export interface SessionHeader {
@@ -20,12 +21,35 @@ interface SessionEntryBase {
   timestamp: string
 }
 
-type SessionEntryData =
+export type CompactionReason = "manual" | "threshold" | "overflow"
+
+export interface CompactionDetails {
+  readonly readFiles: readonly string[]
+  readonly modifiedFiles: readonly string[]
+  readonly omittedReadFiles: number
+  readonly omittedModifiedFiles: number
+}
+
+export interface CompactionEntryData {
+  readonly type: "compaction"
+  readonly reason: CompactionReason
+  readonly summary: string
+  readonly firstKeptEntryId: string
+  readonly tokensBefore: number
+  readonly estimatedTokensAfter: number
+  readonly details: CompactionDetails
+  readonly excludedFailureEntryId?: string
+}
+
+export type SessionEntryData =
   | { type: "message"; message: AgentMessage }
   | { type: "model_change"; provider: string; modelId: string }
   | { type: "thinking_level_change"; thinkingLevel: ThinkingLevel }
+  | CompactionEntryData
 
 export type SessionEntry = SessionEntryBase & SessionEntryData
+export type MessageEntry = SessionEntryBase & Extract<SessionEntryData, { type: "message" }>
+export type CompactionEntry = SessionEntryBase & CompactionEntryData
 
 export interface NewSessionOptions {
   sessionId?: string
@@ -37,6 +61,9 @@ export const maxSessionListCandidates = 4096
 export const maxSessionListResults = 200
 export const maxSessionListPreviewBytes = 256 * 1024
 export const maxSessionFirstMessageLength = 512
+export const maxCompactionSummaryBytes = 128 * 1024
+export const maxCompactionFilePaths = 256
+export const maxCompactionPathBytes = 4096
 
 const sessionListConcurrency = 8
 
@@ -106,6 +133,7 @@ export class SessionManager {
     }
     const manager = new SessionManager(resolveOpenZiPath(header.cwd), dirname(resolvedFile), header.id, false)
     manager.#file = resolvedFile
+    validateJournal(entries, resolvedFile)
     manager.#entries.push(...entries)
     manager.#leafId = manager.#entries.at(-1)?.id ?? null
     Object.assign(manager.header, header, { cwd: resolveOpenZiPath(header.cwd) })
@@ -188,20 +216,60 @@ export class SessionManager {
     return recent ? SessionManager.open(recent.path) : SessionManager.create(paths)
   }
 
-  appendMessage(message: AgentMessage): string {
+  appendMessage(message: AgentMessage): MessageEntry {
+    if (!isAgentMessage(message)) throw new Error("Invalid session message")
     return this.#append({ type: "message", message })
   }
 
-  appendModelChange(provider: string, modelId: string): string {
+  appendModelChange(provider: string, modelId: string): SessionEntry {
     return this.#append({ type: "model_change", provider, modelId })
   }
 
-  appendThinkingLevelChange(thinkingLevel: ThinkingLevel): string {
+  appendThinkingLevelChange(thinkingLevel: ThinkingLevel): SessionEntry {
     return this.#append({ type: "thinking_level_change", thinkingLevel })
+  }
+
+  appendCompaction(data: Omit<CompactionEntryData, "type">): CompactionEntry {
+    return this.#append({ type: "compaction", ...data })
   }
 
   messages(): AgentMessage[] {
     return this.#entries.flatMap(entry => (entry.type === "message" ? [entry.message] : []))
+  }
+
+  activeEntries(): readonly SessionEntry[] {
+    const markerIndex = this.#entries.findLastIndex(entry => entry.type === "compaction")
+    if (markerIndex < 0) return this.#entries.filter(isContextVisibleEntry)
+
+    const marker = this.#entries[markerIndex]
+    if (marker?.type !== "compaction") throw new Error("Compaction marker index is invalid")
+    const firstKeptIndex = this.#entries.findIndex(entry => entry.id === marker.firstKeptEntryId)
+    const excluded = marker.excludedFailureEntryId
+    const exact = [...this.#entries.slice(firstKeptIndex, markerIndex), ...this.#entries.slice(markerIndex + 1)].filter(
+      entry => isContextVisibleEntry(entry) && entry.id !== excluded
+    )
+    return [marker, ...exact]
+  }
+
+  activeMessages(): AgentMessage[] {
+    return this.activeEntries().flatMap(entry => {
+      if (entry.type === "message") return [entry.message]
+      if (entry.type !== "compaction") return []
+      return [compactionMessage(entry)]
+    })
+  }
+
+  latestCompaction(): CompactionEntry | undefined {
+    return this.#entries.findLast((entry): entry is CompactionEntry => entry.type === "compaction")
+  }
+
+  activeUsageAnchorIndex(): number {
+    const markerIndex = this.#entries.findLastIndex(entry => entry.type === "compaction")
+    if (markerIndex < 0) return 0
+    const active = this.activeEntries()
+    const afterMarker = new Set(this.#entries.slice(markerIndex + 1).map(entry => entry.id))
+    const firstAfterMarker = active.findIndex(entry => afterMarker.has(entry.id))
+    return firstAfterMarker < 0 ? active.length : firstAfterMarker
   }
 
   entries(): readonly SessionEntry[] {
@@ -220,17 +288,18 @@ export class SessionManager {
     return this.#file ? dirname(this.#file) : ""
   }
 
-  #append(entry: SessionEntryData): string {
+  #append<Entry extends SessionEntryData>(entry: Entry): SessionEntryBase & Entry {
     const next = {
       ...entry,
       id: crypto.randomUUID(),
       parentId: this.#leafId,
       timestamp: new Date().toISOString()
-    } as SessionEntry
+    } as SessionEntryBase & Entry
+    validateNextEntry(next, this.#entries, this.#file ?? "<memory>")
+    if (this.#file) appendFileSync(this.#file, `${JSON.stringify(next)}\n`)
     this.#entries.push(next)
     this.#leafId = next.id
-    if (this.#file) appendFileSync(this.#file, `${JSON.stringify(next)}\n`)
-    return next.id
+    return next
   }
 }
 
@@ -350,6 +419,19 @@ function parseEntry(line: string, file: string): SessionEntry {
   if (value.type === "thinking_level_change" && isThinkingLevel(value.thinkingLevel)) {
     return { ...base, type: value.type, thinkingLevel: value.thinkingLevel }
   }
+  if (value.type === "compaction" && isCompactionEntryData(value)) {
+    return {
+      ...base,
+      type: value.type,
+      reason: value.reason,
+      summary: value.summary,
+      firstKeptEntryId: value.firstKeptEntryId,
+      tokensBefore: value.tokensBefore,
+      estimatedTokensAfter: value.estimatedTokensAfter,
+      details: value.details,
+      ...(value.excludedFailureEntryId === undefined ? {} : { excludedFailureEntryId: value.excludedFailureEntryId })
+    }
+  }
   throw new Error(`Invalid session entry: ${file}`)
 }
 
@@ -391,7 +473,11 @@ function isAgentMessage(value: unknown): value is AgentMessage {
     case "branchSummary":
       return typeof value.summary === "string" && typeof value.fromId === "string"
     case "compactionSummary":
-      return typeof value.summary === "string" && typeof value.tokensBefore === "number"
+      return (
+        typeof value.summary === "string" &&
+        typeof value.tokensBefore === "number" &&
+        typeof value.estimatedTokensAfter === "number"
+      )
     default:
       return false
   }
@@ -427,7 +513,7 @@ function isUsage(value: unknown): boolean {
     value.cost.cacheRead,
     value.cost.cacheWrite,
     value.cost.total
-  ].every(item => typeof item === "number")
+  ].every(item => typeof item === "number" && Number.isFinite(item) && item >= 0)
 }
 
 function isStopReason(value: unknown): boolean {
@@ -444,6 +530,101 @@ function isThinkingLevel(value: unknown): value is ThinkingLevel {
     value === "xhigh" ||
     value === "max"
   )
+}
+
+function isCompactionEntryData(value: unknown): value is CompactionEntryData {
+  if (!isRecord(value)) return false
+  return (
+    isCompactionReason(value.reason) &&
+    typeof value.summary === "string" &&
+    Buffer.byteLength(value.summary) <= maxCompactionSummaryBytes &&
+    typeof value.firstKeptEntryId === "string" &&
+    isNonNegativeInteger(value.tokensBefore) &&
+    isNonNegativeInteger(value.estimatedTokensAfter) &&
+    isCompactionDetails(value.details) &&
+    (value.excludedFailureEntryId === undefined ||
+      (value.reason === "overflow" && typeof value.excludedFailureEntryId === "string"))
+  )
+}
+
+function isCompactionReason(value: unknown): value is CompactionReason {
+  return value === "manual" || value === "threshold" || value === "overflow"
+}
+
+function isCompactionDetails(value: unknown): value is CompactionDetails {
+  if (!isRecord(value)) return false
+  return (
+    isBoundedPathList(value.readFiles) &&
+    isBoundedPathList(value.modifiedFiles) &&
+    isNonNegativeInteger(value.omittedReadFiles) &&
+    isNonNegativeInteger(value.omittedModifiedFiles)
+  )
+}
+
+function isBoundedPathList(value: unknown): value is string[] {
+  return (
+    Array.isArray(value) &&
+    value.length <= maxCompactionFilePaths &&
+    value.every(path => typeof path === "string" && Buffer.byteLength(path) <= maxCompactionPathBytes)
+  )
+}
+
+function isNonNegativeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && Number.isInteger(value) && value >= 0
+}
+
+function validateJournal(entries: readonly SessionEntry[], file: string): void {
+  const ids = new Set<string>()
+  for (let index = 0; index < entries.length; index++) {
+    const entry = entries[index]!
+    if (ids.has(entry.id) || entry.parentId !== (entries[index - 1]?.id ?? null)) {
+      throw new Error(`Invalid session entry: ${file}`)
+    }
+    validateNextEntry(entry, entries.slice(0, index), file)
+    ids.add(entry.id)
+  }
+}
+
+function validateNextEntry(next: SessionEntry, preceding: readonly SessionEntry[], file: string): void {
+  if (next.type !== "compaction") return
+  if (!isCompactionEntryData(next)) throw new Error(`Invalid session entry: ${file}`)
+
+  const markerIndex = preceding.length
+  const firstKeptIndex = preceding.findIndex(entry => entry.id === next.firstKeptEntryId)
+  if (firstKeptIndex < 0 || firstKeptIndex >= markerIndex || !isContextVisibleEntry(preceding[firstKeptIndex]!)) {
+    throw new Error(`Invalid compaction boundary: ${file}`)
+  }
+  if (preceding[firstKeptIndex]!.type === "message" && preceding[firstKeptIndex]!.message.role === "toolResult") {
+    throw new Error(`Invalid compaction boundary: ${file}`)
+  }
+
+  if (next.excludedFailureEntryId !== undefined) {
+    const failure = preceding.find(entry => entry.id === next.excludedFailureEntryId)
+    if (failure?.type !== "message" || failure.message.role !== "assistant" || failure.message.stopReason !== "error") {
+      throw new Error(`Invalid compaction failure reference: ${file}`)
+    }
+  }
+
+  const firstProjected = preceding
+    .slice(firstKeptIndex)
+    .find(entry => isContextVisibleEntry(entry) && entry.id !== next.excludedFailureEntryId)
+  if (firstProjected?.type === "message" && firstProjected.message.role === "toolResult") {
+    throw new Error(`Invalid compaction boundary: ${file}`)
+  }
+}
+
+function isContextVisibleEntry(entry: SessionEntry): boolean {
+  return entry.type === "message" && !(entry.message.role === "bashExecution" && entry.message.excludeFromContext)
+}
+
+function compactionMessage(entry: CompactionEntry): CompactionSummaryMessage {
+  return {
+    role: "compactionSummary",
+    summary: formatCompactionSummary(entry.summary, entry.details),
+    tokensBefore: entry.tokensBefore,
+    estimatedTokensAfter: entry.estimatedTokensAfter,
+    timestamp: new Date(entry.timestamp).getTime()
+  }
 }
 
 function parseJson(line: string, kind: "header" | "entry", file: string): unknown {

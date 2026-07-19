@@ -17,6 +17,7 @@ test("SlashController aggregates a session catalog with deterministic built-in p
     "login",
     "logout",
     "settings",
+    "compact",
     "new",
     "resume",
     "review",
@@ -108,6 +109,10 @@ test("SlashController parses only supported built-in invocations", () => {
   expect(slash.parse("/review path")).toBeUndefined()
   expect(slash.parse("/model provider/model")).toEqual({ type: "model", search: "provider/model" })
   expect(slash.parse("/login provider")).toEqual({ type: "login", provider: "provider" })
+  expect(slash.parse("/compact preserve exact paths")).toEqual({
+    type: "compact",
+    instructions: "preserve exact paths"
+  })
   expect(slash.parse("/new")).toEqual({ type: "new_session" })
   expect(slash.parse("/resume")).toEqual({ type: "resume_session" })
 })

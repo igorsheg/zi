@@ -167,7 +167,8 @@ export function settingsFrame(session: AgentSession, scope: SettingsScope): Pick
     rows: [
       settingRow(session, scope, "thinkingLevel", "Thinking level", scoped.thinkingLevel),
       settingRow(session, scope, "steeringMode", "Steering mode", scoped.steeringMode),
-      settingRow(session, scope, "followUpMode", "Follow-up mode", scoped.followUpMode)
+      settingRow(session, scope, "followUpMode", "Follow-up mode", scoped.followUpMode),
+      settingRow(session, scope, "compactionEnabled", "Automatic compaction", scoped.compactionEnabled)
     ]
   }
 }
@@ -176,9 +177,14 @@ export function settingValuesFrame(session: AgentSession, scope: SettingsScope, 
   const scoped = scope === "global" ? session.settingsManager.getGlobal() : session.settingsManager.getProject()
   const saved = scoped[setting]
   const effective = effectiveSetting(session, setting)
-  const values =
-    setting === "thinkingLevel" ? session.getSupportedThinkingLevels() : (["one-at-a-time", "all"] as const)
-  const selectedId = values.find(value => value === saved) ?? effective
+  const values: readonly EditableSettingValue[] =
+    setting === "thinkingLevel"
+      ? session.getSupportedThinkingLevels()
+      : setting === "compactionEnabled"
+        ? [true, false]
+        : ["one-at-a-time", "all"]
+  const selected = values.find(value => value === saved) ?? effective
+  const selectedId = settingValueId(selected)
   return {
     id: promptPickerFrameIds.settingValues,
     title: `${settingLabel(setting)} · ${scopeLabel(scope)}`,
@@ -186,7 +192,7 @@ export function settingValuesFrame(session: AgentSession, scope: SettingsScope, 
     rows: values.map(value => settingValueRow(value, saved, effective)),
     selectedId,
     ...(scope === "global" && session.settingsManager.getProject()[setting] !== undefined
-      ? { hint: `Project override keeps the effective value at ${effective}.` }
+      ? { hint: `Project override keeps the effective value at ${settingValueLabel(effective)}.` }
       : {})
   }
 }
@@ -199,6 +205,8 @@ export function settingLabel(setting: EditableSetting): string {
       return "Steering mode"
     case "followUpMode":
       return "Follow-up mode"
+    case "compactionEnabled":
+      return "Automatic compaction"
     default:
       return assertNever(setting)
   }
@@ -236,11 +244,11 @@ function settingValueRow(
   effective: EditableSettingValue
 ): PickerStackRow {
   return {
-    id: value,
-    label: value,
+    id: settingValueId(value),
+    label: settingValueLabel(value),
     ...(value === saved ? { detail: "[saved]" } : {}),
     ...(value === effective ? { metadata: glyphs.check } : {}),
-    searchText: `${value} ${thinkingDescription(value)}`
+    searchText: `${settingValueLabel(value)} ${thinkingDescription(value)}`
   }
 }
 
@@ -256,8 +264,10 @@ function settingRow(
   return {
     id: setting,
     label,
-    detail: `[${saved ?? "inherited"}]`,
-    metadata: shadowed ? `Effective: ${effective} (project override)` : `Effective: ${effective}`,
+    detail: `[${saved === undefined ? "inherited" : settingValueLabel(saved)}]`,
+    metadata: shadowed
+      ? `Effective: ${settingValueLabel(effective)} (project override)`
+      : `Effective: ${settingValueLabel(effective)}`,
     searchText: `${label} ${setting} ${saved ?? "inherited"} ${effective}`
   }
 }
@@ -270,6 +280,8 @@ function effectiveSetting(session: AgentSession, setting: EditableSetting): Edit
       return session.steeringMode
     case "followUpMode":
       return session.followUpMode
+    case "compactionEnabled":
+      return session.settingsManager.get().compactionEnabled
     default:
       return assertNever(setting)
   }
@@ -281,6 +293,14 @@ function sessionDate(timestamp: string): string {
 
 function scopeLabel(scope: SettingsScope): string {
   return scope === "global" ? "Global" : "Project"
+}
+
+function settingValueId(value: EditableSettingValue): string {
+  return typeof value === "boolean" ? String(value) : value
+}
+
+function settingValueLabel(value: EditableSettingValue): string {
+  return typeof value === "boolean" ? (value ? "On" : "Off") : value
 }
 
 function thinkingDescription(value: EditableSettingValue): string {
@@ -303,6 +323,10 @@ function thinkingDescription(value: EditableSettingValue): string {
       return "batch all queued messages"
     case "one-at-a-time":
       return "deliver one queued message at a time"
+    case true:
+      return "compact before the model context fills"
+    case false:
+      return "do not compact automatically"
     default:
       return assertNever(value)
   }

@@ -23,8 +23,39 @@ test("settings resolve global, then project, then runtime overrides", async () =
     model: "project/model",
     thinkingLevel: "medium",
     steeringMode: "all",
-    followUpMode: "one-at-a-time"
+    followUpMode: "one-at-a-time",
+    compactionEnabled: true,
+    compactionReserveTokens: 16_384,
+    compactionKeepRecentTokens: 20_000
   })
+})
+
+test("compaction settings layer and validate bounded persisted values", async () => {
+  const root = await mkdtemp(join(tmpdir(), "openzi-settings-compaction-"))
+  const paths = new OpenZiPaths(join(root, "project"), join(root, "global"))
+  await mkdir(paths.projectDir, { recursive: true })
+  await mkdir(paths.globalDir, { recursive: true })
+  await writeFile(paths.globalSettingsFile, JSON.stringify({ compactionEnabled: false, compactionReserveTokens: 10 }))
+  await writeFile(
+    paths.projectSettingsFile,
+    JSON.stringify({ compactionEnabled: true, compactionKeepRecentTokens: 20 })
+  )
+
+  const settings = SettingsManager.create(paths)
+  expect(settings.get()).toMatchObject({
+    compactionEnabled: true,
+    compactionReserveTokens: 10,
+    compactionKeepRecentTokens: 20
+  })
+
+  await writeFile(paths.projectSettingsFile, JSON.stringify({ compactionReserveTokens: 0 }))
+  settings.reload()
+  expect(settings.get().compactionReserveTokens).toBe(10)
+  expect(settings.drainErrors()[0]?.error.message).toContain("compactionReserveTokens")
+  // oxlint-disable-next-line typescript/unbound-method -- Reflect models an untyped JavaScript SDK caller.
+  expect(() => Reflect.apply(settings.updateGlobal, settings, [{ compactionKeepRecentTokens: 0 }])).toThrow(
+    "Invalid compactionKeepRecentTokens"
+  )
 })
 
 test("global and project updates preserve fields owned by newer versions", async () => {
@@ -124,7 +155,10 @@ test("oversized settings are bounded and reported without entering effective sta
   expect(settings.get()).toEqual({
     thinkingLevel: "medium",
     steeringMode: "one-at-a-time",
-    followUpMode: "one-at-a-time"
+    followUpMode: "one-at-a-time",
+    compactionEnabled: true,
+    compactionReserveTokens: 16_384,
+    compactionKeepRecentTokens: 20_000
   })
   expect(settings.drainErrors()[0]?.error.message).toContain(`${maxSettingsFileBytes} bytes`)
 })

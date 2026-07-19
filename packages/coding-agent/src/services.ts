@@ -4,6 +4,7 @@ import { clampThinkingLevel, type Api, type Model } from "@earendil-works/pi-ai"
 import { AgentSession } from "./agent-session.js"
 import { Authentication } from "./authentication.js"
 import type { FileCredentialStore } from "./credential-store.js"
+import { convertToLlm } from "./messages.js"
 import type { ModelRegistry } from "./model-registry.js"
 import type { OpenZiPaths } from "./paths.js"
 import { createSessionResources, type ResourceLoader, type SessionResources } from "./resource-loader.js"
@@ -46,8 +47,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions): Pr
       ...(model ? { model } : {}),
       thinkingLevel,
       tools: [...options.tools],
-      messages: sessionManager.messages()
+      messages: sessionManager.activeMessages()
     },
+    convertToLlm,
     sessionId: sessionManager.sessionId,
     streamFn: (requestedModel, context, streamOptions) => {
       const apiKey = requestedModel.provider === model?.provider ? options.apiKey : undefined

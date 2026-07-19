@@ -10,6 +10,8 @@ import {
   maxPrintPromptCount,
   runPrintMode
 } from "../src/print-mode.js"
+import { createAgentSession } from "../src/services.js"
+import { SessionManager } from "../src/session-manager.js"
 import {
   createModels,
   createTestAgentRuntime as createAgentRuntime,
@@ -19,6 +21,8 @@ import {
   fauxThinking,
   fauxToolCall
 } from "../src/testing.js"
+
+/* oxlint-disable no-await-in-loop */
 
 test("JSON print mode emits the session header then source-ordered events", async () => {
   const models = createModels()
@@ -52,6 +56,76 @@ test("JSON print mode emits the session header then source-ordered events", asyn
   } finally {
     unsubscribe()
     session.dispose()
+  }
+})
+
+test("JSON mode preserves automatic compaction start, durable entry, and end ordering", async () => {
+  const models = createModels()
+  const faux = fauxProvider({ models: [{ id: "small", contextWindow: 500, maxTokens: 100 }] })
+  models.setProvider(faux.provider)
+  faux.setResponses([
+    fauxAssistantMessage("final answer"),
+    ...Array.from({ length: 8 }, () => fauxAssistantMessage("z"))
+  ])
+  const { session } = await createAgentRuntime({
+    cwd: "/work",
+    model: `${faux.provider.id}/small`,
+    models,
+    persist: false,
+    settings: { compactionReserveTokens: 100, compactionKeepRecentTokens: 1 }
+  })
+  const chunks: string[] = []
+
+  try {
+    const result = await runPrintMode(session, {
+      output: "json",
+      prompts: ["x".repeat(2_000)],
+      writer: {
+        write(chunk) {
+          chunks.push(chunk)
+        }
+      }
+    })
+    expect(result).toEqual({ type: "success" })
+    const records = chunks.map(parseJson)
+    const start = records.findIndex(record => recordType(record) === "compaction_start")
+    const entry = records.findIndex(record => recordType(record) === "entry_appended" && isCompactionEntryEvent(record))
+    const end = records.findIndex(record => recordType(record) === "compaction_end")
+    expect(start).toBeGreaterThan(0)
+    expect(entry).toBeGreaterThan(start)
+    expect(end).toBeGreaterThan(entry)
+  } finally {
+    session.dispose()
+  }
+})
+
+test("JSON mode closes failed and cancelled automatic compactions without a marker", async () => {
+  for (const outcome of ["failed", "cancelled"] as const) {
+    const { session, faux } = await compactionPrintSession()
+    if (outcome === "failed") faux.setResponses([fauxAssistantMessage("   "), fauxAssistantMessage("continued")])
+    else {
+      session.subscribe(event => {
+        if (event.type === "compaction_start") void session.abort()
+      })
+    }
+    const chunks: string[] = []
+
+    try {
+      const result = await runPrintMode(session, {
+        output: "json",
+        prompts: ["continue"],
+        writer: { write: chunk => void chunks.push(chunk) }
+      })
+      const records = chunks.map(parseJson)
+      const end = records.find(record => recordType(record) === "compaction_end")
+
+      expect(result.type).toBe("success")
+      expect(end).toMatchObject({ outcome: { type: outcome } })
+      expect(records.some(isCompactionEntryEvent)).toBe(false)
+      expect(session.sessionManager.latestCompaction()).toBeUndefined()
+    } finally {
+      session.dispose()
+    }
   }
 })
 
@@ -603,6 +677,48 @@ test("print mode bounds aggregate UTF-8 prompt bytes", async () => {
     session.dispose()
   }
 })
+
+async function compactionPrintSession() {
+  const models = createModels()
+  const faux = fauxProvider({ provider: "print-compaction", models: [{ id: "model", contextWindow: 4_000 }] })
+  models.setProvider(faux.provider)
+  const bootstrap = await createAgentRuntime({
+    cwd: "/work",
+    models,
+    persist: false,
+    settings: { compactionReserveTokens: 100, compactionKeepRecentTokens: 1 }
+  })
+  const model = bootstrap.session.model
+  bootstrap.session.dispose()
+  const history = SessionManager.inMemory("/work")
+  history.appendMessage({ role: "user", content: "old context", timestamp: 1 })
+  const answer = fauxAssistantMessage("old answer")
+  history.appendMessage({
+    ...answer,
+    usage: {
+      input: 3_900,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 3_900,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }
+    }
+  })
+  const session = await createAgentSession({ services: bootstrap.services, sessionManager: history, model, tools: [] })
+  return { session, faux }
+}
+
+function isCompactionEntryEvent(value: unknown): boolean {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "entry" in value &&
+    typeof value.entry === "object" &&
+    value.entry !== null &&
+    "type" in value.entry &&
+    value.entry.type === "compaction"
+  )
+}
 
 function parseJson(line: string): unknown {
   return JSON.parse(line)

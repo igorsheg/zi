@@ -1,7 +1,12 @@
 import { expect, test } from "bun:test"
 
-import type { AgentSession } from "@openzi/coding-agent"
-import { createModels, createTestAgentRuntime as createAgentRuntime, fauxProvider } from "@openzi/coding-agent/testing"
+import { createAgentSession, type AgentSession, SessionManager } from "@openzi/coding-agent"
+import {
+  createModels,
+  createTestAgentRuntime as createAgentRuntime,
+  fauxAssistantMessage,
+  fauxProvider
+} from "@openzi/coding-agent/testing"
 
 import { createInteractiveStore } from "../../src/interactive/interactive-store.js"
 import { createPromptStore, type PromptSessionActions } from "../../src/interactive/prompt/store.js"
@@ -44,6 +49,107 @@ test("resource command selection edits the composer without dispatching TUI doma
     expect(prompt.$state.get().inputEdit).toEqual({ revision: 1, text: "/review path", cursorOffset: 8 })
     expect(session.messages).toEqual([])
   } finally {
+    mode.dispose()
+    session.dispose()
+  }
+})
+
+test("compact command forwards focus without creating a user message", async () => {
+  const session = await createSession("compact-store")
+  const mode = createInteractiveStore(session)
+  const prompt = createPromptStore(mode, new SlashController())
+  let instructions: string | undefined
+  session.compact = async focus => {
+    instructions = focus
+    return {
+      reason: "manual",
+      summary: "summary",
+      firstKeptEntryId: "kept",
+      tokensBefore: 123_000,
+      estimatedTokensAfter: 24_000,
+      compactedEntries: 4,
+      details: { readFiles: [], modifiedFiles: [], omittedReadFiles: 0, omittedModifiedFiles: 0 }
+    }
+  }
+
+  try {
+    expect(prompt.submit("/compact preserve database decisions", "steer")).toBe(true)
+    expect(prompt.$state.get().workflow.type).toBe("compacting")
+    await Bun.sleep(0)
+    expect(instructions).toBe("preserve database decisions")
+    expect(session.messages).toEqual([])
+    expect(prompt.$state.get()).toMatchObject({
+      feedback: { type: "status", message: "Compacted 123k → ~24k context tokens." },
+      workflow: { type: "idle" }
+    })
+  } finally {
+    mode.dispose()
+    session.dispose()
+  }
+})
+
+test("compact cancellation stays blocking until settlement and reports no error", async () => {
+  const session = await createSession("compact-cancel")
+  const mode = createInteractiveStore(session)
+  const prompt = createPromptStore(mode, new SlashController())
+  const pending = rejectable<Awaited<ReturnType<AgentSession["compact"]>>>()
+  session.compact = () => pending.promise
+  session.abort = async () => {
+    pending.reject(new Error("Compaction cancelled"))
+  }
+
+  try {
+    expect(prompt.submit("/compact", "steer")).toBe(true)
+    expect(prompt.abortAndRestoreQueuedInputs("draft")).toBe("")
+    expect(prompt.$state.get().workflow.type).toBe("compacting")
+    expect(prompt.submit("new prompt", "steer")).toBe(false)
+    await Bun.sleep(0)
+    expect(prompt.$state.get()).toMatchObject({ feedback: { type: "none" }, workflow: { type: "idle" } })
+  } finally {
+    mode.dispose()
+    session.dispose()
+  }
+})
+
+test("automatic compaction failures surface through prompt feedback", async () => {
+  const models = createModels()
+  const faux = fauxProvider({ provider: "automatic-failure", models: [{ id: "model", contextWindow: 4_000 }] })
+  models.setProvider(faux.provider)
+  faux.setResponses([fauxAssistantMessage("   "), fauxAssistantMessage("continued")])
+  const bootstrap = await createAgentRuntime({
+    cwd: "/work",
+    models,
+    persist: false,
+    settings: { compactionReserveTokens: 100, compactionKeepRecentTokens: 1 }
+  })
+  const model = bootstrap.session.model
+  bootstrap.session.dispose()
+  const history = SessionManager.inMemory("/work")
+  history.appendMessage({ role: "user", content: "old context", timestamp: 1 })
+  const answer = fauxAssistantMessage("old answer")
+  history.appendMessage({
+    ...answer,
+    usage: {
+      input: 3_900,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 3_900,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }
+    }
+  })
+  const session = await createAgentSession({ services: bootstrap.services, sessionManager: history, model, tools: [] })
+  const mode = createInteractiveStore(session)
+  const prompt = createPromptStore(mode, new SlashController())
+
+  try {
+    expect(prompt.submit("continue", "steer")).toBe(true)
+    await session.waitForIdle()
+
+    expect(prompt.$state.get().feedback).toEqual({ type: "error", message: "Compaction produced an empty summary" })
+    expect(session.sessionManager.latestCompaction()).toBeUndefined()
+  } finally {
+    prompt.dispose()
     mode.dispose()
     session.dispose()
   }

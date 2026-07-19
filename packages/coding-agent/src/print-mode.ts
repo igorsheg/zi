@@ -1,6 +1,5 @@
-import type { AgentMessage } from "@earendil-works/pi-agent-core"
-
 import type { AgentSession, AgentSessionEvent } from "./agent-session.js"
+import type { AgentMessage } from "./messages.js"
 import type { SessionHeader } from "./session-manager.js"
 
 export const maxPrintPromptCount = 128

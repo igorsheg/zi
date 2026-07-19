@@ -1,6 +1,6 @@
 # Context compaction implementation spec
 
-Status: proposed
+Status: implemented
 
 This specification defines OpenZi's first context-compaction system. It compares Pi's coding-agent compaction at `earendil-works/pi@0e6909f0` with Grok Build's open-source full-replace system at `xai-org/grok-build@98c3b243`, then selects the parts that fit OpenZi's current ownership model.
 
@@ -338,9 +338,9 @@ A failed append therefore leaves both durable and in-memory journal state at the
 
 The existing torn-final-line recovery remains valid for process death during append. Malformed completed records still invalidate the journal.
 
-## Custom provider message
+## OpenZi summary message
 
-Declare OpenZi's summary message in `messages.ts` through Pi agent-core's `CustomAgentMessages` extension:
+Pi agent-core's root export loads its harness declaration, which already owns a weaker `compactionSummary` variant without post-compaction accounting. Redeclaring the same `CustomAgentMessages` key cannot strengthen that property safely. `messages.ts` therefore owns a narrow public facade that excludes Pi's variant and replaces it with:
 
 ```ts
 export interface CompactionSummaryMessage {
@@ -352,7 +352,7 @@ export interface CompactionSummaryMessage {
 }
 ```
 
-`convertToLlm()` maps it to one user message with a fixed continuation preamble and bounded summary text. `createAgentSession()` installs this converter on the Pi `Agent`. The TUI continues to receive the typed `compactionSummary` message and never parses the provider preamble.
+OpenZi exports this narrowed `AgentMessage`; journal admission validates it at runtime. The explicit Pi boundary still accepts Pi's broader union because Pi appends only base provider messages while OpenZi is the sole producer of summary messages. `convertToLlm()` maps the summary to one user message with a fixed continuation preamble and bounded summary text. `createAgentSession()` installs this converter on the Pi `Agent`. The TUI continues to receive the typed `compactionSummary` message and never parses the provider preamble.
 
 ## Active-entry projection
 

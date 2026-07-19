@@ -93,11 +93,17 @@ class PromptController implements PromptStore {
   #nextOperationId = 0
   #nextBrowserRequestId = 0
   #pendingAuthPrompt: PendingAuthPrompt | undefined
+  #cancelledCompactionOperationId: number | undefined
+  readonly #unsubscribeAutomaticCompactionFailure: () => void
 
   constructor(interactive: InteractiveStore, slash: SlashController, sessionActions?: PromptSessionActions) {
     this.#interactive = interactive
     this.#slash = slash
     this.#sessionActions = sessionActions
+    this.#unsubscribeAutomaticCompactionFailure = interactive.subscribeAutomaticCompactionFailure(message => {
+      if (this.#disposed) return
+      this.$state.set({ ...this.$state.get(), feedback: { type: "error", message } })
+    })
   }
 
   submit(text: string, delivery: PendingInputDelivery): boolean {
@@ -193,6 +199,7 @@ class PromptController implements PromptStore {
       case "auth_prompt":
       case "loading_logout":
       case "logging_out":
+      case "compacting":
       case "starting_session":
       case "loading_sessions":
       case "resuming_session":
@@ -275,6 +282,7 @@ class PromptController implements PromptStore {
       case "loading_logout":
       case "choosing_logout":
       case "logging_out":
+      case "compacting":
       case "starting_session":
       case "loading_sessions":
       case "choosing_session":
@@ -299,7 +307,7 @@ class PromptController implements PromptStore {
   }
 
   abortAndRestoreQueuedInputs(currentText: string): string {
-    if (this.#cancelAuthentication() || this.#cancelSessionReplacement()) return ""
+    if (this.#cancelAuthentication() || this.#cancelCompaction() || this.#cancelSessionReplacement()) return ""
     try {
       const aborted = this.#interactive.abortAndRestoreQueuedInputs()
       const text = this.#mergeQueue(aborted, currentText, false)
@@ -317,7 +325,7 @@ class PromptController implements PromptStore {
   }
 
   clear(): void {
-    if (this.#cancelAuthentication() || this.#cancelSessionReplacement()) return
+    if (this.#cancelAuthentication() || this.#cancelCompaction() || this.#cancelSessionReplacement()) return
     this.picker.close()
     const state = this.$state.get()
     this.$state.set({
@@ -329,8 +337,10 @@ class PromptController implements PromptStore {
   dispose(): void {
     if (this.#disposed) return
     this.#cancelAuthentication()
+    this.#cancelCompaction()
     this.#cancelSessionReplacement()
     this.#disposed = true
+    this.#unsubscribeAutomaticCompactionFailure()
     this.picker.dispose()
   }
 
@@ -551,6 +561,9 @@ class PromptController implements PromptStore {
       case "settings":
         this.#openSettings(parentFilter)
         return true
+      case "compact":
+        this.#compact(command.instructions)
+        return true
       case "new_session":
         this.#startNewSession()
         return true
@@ -560,6 +573,45 @@ class PromptController implements PromptStore {
       default:
         return assertNever(command)
     }
+  }
+
+  #compact(instructions: string): void {
+    const session = this.#interactive.getSession()
+    const operationId = ++this.#nextOperationId
+    this.#cancelledCompactionOperationId = undefined
+    this.picker.close()
+    this.$state.set({
+      ...this.$state.get(),
+      feedback: { type: "none" },
+      workflow: { type: "compacting", operationId, session }
+    })
+    this.#requestInput("")
+
+    const compact = async () => {
+      try {
+        const result = await session.compact(instructions || undefined)
+        if (!this.#accepts(operationId, session)) return
+        this.#cancelledCompactionOperationId = undefined
+        this.$state.set({
+          ...this.$state.get(),
+          feedback: {
+            type: "status",
+            message: `Compacted ${formatTokens(result.tokensBefore)} → ~${formatTokens(result.estimatedTokensAfter)} context tokens.`
+          },
+          workflow: { type: "idle" }
+        })
+      } catch (cause) {
+        if (!this.#accepts(operationId, session)) return
+        const cancelled = this.#cancelledCompactionOperationId === operationId
+        this.#cancelledCompactionOperationId = undefined
+        this.$state.set({
+          ...this.$state.get(),
+          feedback: cancelled ? { type: "none" } : { type: "error", message: errorMessage(cause) },
+          workflow: { type: "idle" }
+        })
+      }
+    }
+    void compact()
   }
 
   #startNewSession(): void {
@@ -888,6 +940,21 @@ class PromptController implements PromptStore {
     return true
   }
 
+  #cancelCompaction(): boolean {
+    const workflow = this.$state.get().workflow
+    if (workflow.type !== "compacting") return false
+    if (this.#cancelledCompactionOperationId === workflow.operationId) return true
+    this.#cancelledCompactionOperationId = workflow.operationId
+    try {
+      const settled = workflow.session.abort()
+      this.$state.set({ ...this.$state.get() })
+      void settled.catch(() => {})
+    } catch {
+      // Session disposal already owns the stale operation.
+    }
+    return true
+  }
+
   #cancelSessionReplacement(): boolean {
     const workflow = this.$state.get().workflow
     if (workflow.type === "cancelling_session") return true
@@ -1024,6 +1091,10 @@ class PromptController implements PromptStore {
           if (!isQueueMode(value)) return false
           mutation = workflow.session.setFollowUpMode(value, workflow.scope)
           break
+        case "compactionEnabled":
+          if (value !== "true" && value !== "false") return false
+          mutation = workflow.session.setCompactionEnabled(value === "true", workflow.scope)
+          break
         default:
           return assertNever(workflow.setting)
       }
@@ -1040,8 +1111,8 @@ class PromptController implements PromptStore {
       feedback: {
         type: "status",
         message: shadowed
-          ? `${settingLabel(workflow.setting)} saved as ${mutation.requested}; project override keeps ${mutation.effective} effective`
-          : `${settingLabel(workflow.setting)}: ${mutation.effective} (${workflow.scope})`
+          ? `${settingLabel(workflow.setting)} saved as ${settingValueLabel(mutation.requested)}; project override keeps ${settingValueLabel(mutation.effective)} effective`
+          : `${settingLabel(workflow.setting)}: ${settingValueLabel(mutation.effective)} (${workflow.scope})`
       },
       workflow: { type: "idle" }
     })
@@ -1111,7 +1182,12 @@ function settingsScope(value: string): SettingsScope | undefined {
 }
 
 function editableSetting(value: string): EditableSetting | undefined {
-  return value === "thinkingLevel" || value === "steeringMode" || value === "followUpMode" ? value : undefined
+  return value === "thinkingLevel" ||
+    value === "steeringMode" ||
+    value === "followUpMode" ||
+    value === "compactionEnabled"
+    ? value
+    : undefined
 }
 
 function isQueueMode(value: string): value is QueueMode {
@@ -1128,6 +1204,16 @@ function isThinkingLevel(value: string): value is ThinkingLevel {
     value === "xhigh" ||
     value === "max"
   )
+}
+
+function settingValueLabel(value: EditableSettingValue): string {
+  return typeof value === "boolean" ? (value ? "On" : "Off") : value
+}
+
+function formatTokens(tokens: number): string {
+  if (tokens < 1_000) return String(tokens)
+  if (tokens < 1_000_000) return `${Math.round(tokens / 1_000)}k`
+  return `${(tokens / 1_000_000).toFixed(1).replace(/\.0$/, "")}m`
 }
 
 function errorMessage(cause: unknown): string {

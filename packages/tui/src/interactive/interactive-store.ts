@@ -49,6 +49,7 @@ export interface InteractiveStore {
   restoreQueuedInputs(): QueuedInputs
   abortAndRestoreQueuedInputs(): AbortedQueuedInputs
   backgroundForegroundShellTask(): ShellDemotionResult
+  subscribeAutomaticCompactionFailure(listener: (message: string) => void): () => void
   dispose(): void
 }
 
@@ -61,6 +62,7 @@ export function createInteractiveStore(session: AgentSession): InteractiveStore 
   const $transcriptRevision = computed($state, state => state.transcriptRevision)
   const $activeTools = computed($state, state => state.tools)
   let unsubscribeSession: (() => void) | undefined
+  const automaticCompactionFailureListeners = new Set<(message: string) => void>()
   let disposed = false
 
   const currentSession = (): AgentSession => {
@@ -74,6 +76,15 @@ export function createInteractiveStore(session: AgentSession): InteractiveStore 
       const current = $state.get()
       const next = transitionInteractiveState(current, event)
       if (next !== current) $state.set(next)
+      if (event.type === "compaction_end" && event.reason !== "manual" && event.outcome.type === "failed") {
+        for (const listener of automaticCompactionFailureListeners) {
+          try {
+            listener(event.outcome.message)
+          } catch {
+            // Presentation observers cannot change the admitted session transition.
+          }
+        }
+      }
     })
   unsubscribeSession = subscribeSession(session)
 
@@ -117,11 +128,17 @@ export function createInteractiveStore(session: AgentSession): InteractiveStore 
     backgroundForegroundShellTask() {
       return currentSession().demoteForegroundShellTask()
     },
+    subscribeAutomaticCompactionFailure(listener) {
+      if (disposed) throw new Error("InteractiveStore is disposed")
+      automaticCompactionFailureListeners.add(listener)
+      return () => automaticCompactionFailureListeners.delete(listener)
+    },
     dispose() {
       if (disposed) return
       disposed = true
       unsubscribeSession?.()
       unsubscribeSession = undefined
+      automaticCompactionFailureListeners.clear()
     }
   }
 }
@@ -197,8 +214,17 @@ export function transitionInteractiveState(state: InteractiveState, event: Agent
         transcriptRevision++
       }
       break
+    case "compaction_end":
+      promptRevision++
+      if (event.outcome.type === "completed") {
+        tools = new Map()
+        transcriptRevision++
+      }
+      break
     case "agent_start":
     case "agent_settled":
+    case "compaction_start":
+    case "compaction_enabled_changed":
     case "queue_update":
     case "authentication_changed":
     case "model_changed":

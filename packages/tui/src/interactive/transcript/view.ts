@@ -174,6 +174,7 @@ export class TranscriptView {
     toolProjections: 0
   }
   #session: TranscriptSession
+  #messages: readonly AgentMessage[]
   #hasProjection = false
   #nextMessageIndex = 0
   #omittedMessageCount = 0
@@ -207,6 +208,7 @@ export class TranscriptView {
     this.#requestFrame = globalThis.requestAnimationFrame.bind(globalThis)
     this.#cancelFrame = globalThis.cancelAnimationFrame.bind(globalThis)
     this.#session = interactive.getSession()
+    this.#messages = this.#session.messages
     this.#transcriptRevision = interactive.$transcriptRevision.get()
     this.#navigation = createTranscriptStore()
 
@@ -330,8 +332,14 @@ export class TranscriptView {
     try {
       const session = this.#interactive.getSession()
       const activeTools = this.#interactive.$activeTools.get()
-      if (!this.#hasProjection || session !== this.#session || session.messages.length < this.#nextMessageIndex) {
+      if (
+        !this.#hasProjection ||
+        session !== this.#session ||
+        session.messages !== this.#messages ||
+        session.messages.length < this.#nextMessageIndex
+      ) {
         this.#session = session
+        this.#messages = session.messages
         this.#resetProjection(session)
         this.#hasProjection = true
       } else {
@@ -378,6 +386,7 @@ export class TranscriptView {
     this.#nextMessageIndex = start
     this.#setOmittedMessageCount(start)
     this.#appendCommittedMessages(session)
+    this.#jumpToTail()
   }
 
   #appendCommittedMessages(session: TranscriptSession): void {

@@ -111,10 +111,14 @@ export class PromptView {
     this.#input.selectable = !secretInput
     if (secretInput) this.#renderer.clearSelection()
     const feedbackVisible = this.#feedback.update(prompt.feedback, this.#renderer.width)
-    const fixedRows = geometry.protectedRows + (session.isStreaming ? 1 : 0) + (feedbackVisible ? 1 : 0)
+    const working = session.isStreaming || session.compactionStatus.type === "running"
+    const fixedRows = geometry.protectedRows + (working ? 1 : 0) + (feedbackVisible ? 1 : 0)
     const pickerVisible = this.#pickerStack.update(Math.max(0, this.#renderer.height - fixedRows))
 
-    this.#working.setActive(session.isStreaming)
+    this.#working.setText(
+      session.isAborting ? "Cancelling…" : session.compactionStatus.type === "running" ? "Compacting…" : "Working…"
+    )
+    this.#working.setActive(working)
     if (pickerVisible) this.#queue.hide()
     else this.#queue.update(session.queuedInputs, Math.max(0, this.#renderer.height - fixedRows))
     this.#composer.update(geometry, composerSlots(session))
@@ -158,7 +162,10 @@ export class PromptView {
     const action = this.#keybindings.promptAction(key, {
       pickerOpen: Boolean(this.#store.picker.presentation(this.#input.plainText)),
       editorEmpty: this.#input.plainText.length === 0,
-      streaming: session.isStreaming || authenticationActive(this.#store.$state.get().workflow),
+      streaming:
+        session.isStreaming ||
+        session.compactionStatus.type === "running" ||
+        authenticationActive(this.#store.$state.get().workflow),
       foregroundShellTask: session.shellTasks.some(task => task.type === "foreground")
     })
     if (!action) return
@@ -249,10 +256,13 @@ function authenticationActive(workflow: PromptWorkflow): boolean {
 }
 
 function composerSlots(session: ReturnType<InteractiveStore["getSession"]>): ComposerSlots {
-  const context = session.getContextUsage()
+  const context = session.contextUsage
   return {
     topLeft: session.sessionManager.header.cwd,
-    topRight: [modelTitle(session), ...(context ? [contextTitle(context.percent, context.contextWindow)] : [])]
+    topRight: [
+      modelTitle(session),
+      ...(context.type === "unavailable" ? [] : [contextTitle(context.type, context.percent)])
+    ]
   }
 }
 
@@ -262,13 +272,6 @@ function modelTitle(session: ReturnType<InteractiveStore["getSession"]>): string
   return session.thinkingLevel === "off" ? state.model.id : `${state.model.id} (${session.thinkingLevel})`
 }
 
-function contextTitle(percent: number, contextWindow: number): string {
-  return `(ctx ${Math.round(percent)}%/${formatTokens(contextWindow)})`
-}
-
-function formatTokens(tokens: number): string {
-  if (tokens < 1_000) return String(tokens)
-  if (tokens < 1_000_000) return `${Math.round(tokens / 1_000)}k`
-  if (tokens < 10_000_000) return `${(tokens / 1_000_000).toFixed(1).replace(/\.0$/, "")}m`
-  return `${Math.round(tokens / 1_000_000)}m`
+function contextTitle(type: "measured" | "estimated", percent: number): string {
+  return `${type === "estimated" ? "~" : ""}${Math.round(percent)}% ctx`
 }

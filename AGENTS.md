@@ -50,7 +50,7 @@ Explicit-state, data-oriented design is mandatory for stateful behavior.
 - Below-composer choice flows use the instance-scoped `PickerStack`: `Composer` remains the only input and focus owner; the stack owns frames, selection, suspended parent filters, and top-frame filtering; picker views render only the active frame and never create or edit an input.
 - Coding-agent owners do not depend on frontend state libraries. TUI stores use explicit binding and disposal; use Nano Stores `onMount()` only when a terminal resource lifetime genuinely follows observation.
 
-See `docs/adr/0004-explicit-state-and-transitions.md`, `docs/adr/0006-instance-scoped-nano-stores-own-tui-state.md`, `docs/adr/0008-composer-owned-picker-stack.md`, `docs/adr/0009-interruption-and-terminal-shutdown.md`, `docs/adr/0010-interactive-mode-owns-keybindings.md`, `docs/adr/0011-openzi-path-policy.md`, and `docs/adr/0012-agent-session-runtime-owns-replacement.md` for the project decisions.
+See `docs/adr/0004-explicit-state-and-transitions.md`, `docs/adr/0006-instance-scoped-nano-stores-own-tui-state.md`, `docs/adr/0008-composer-owned-picker-stack.md`, `docs/adr/0009-interruption-and-terminal-shutdown.md`, `docs/adr/0010-interactive-mode-owns-keybindings.md`, `docs/adr/0011-openzi-path-policy.md`, and `docs/adr/0012-agent-session-runtime-owns-replacement.md`, and `docs/adr/0015-context-compaction-is-an-append-only-session-transaction.md` for the project decisions.
 
 ## TUI hot paths and retained projections
 

@@ -12,6 +12,7 @@ export type InteractiveCommand =
   | { readonly type: "login"; readonly provider: string }
   | { readonly type: "logout" }
   | { readonly type: "settings" }
+  | { readonly type: "compact"; readonly instructions: string }
   | { readonly type: "new_session" }
   | { readonly type: "resume_session" }
 
@@ -154,6 +155,8 @@ function builtinIntent(name: BuiltinSlashCommandName, args: string): Interactive
       return { type: "logout" }
     case "settings":
       return { type: "settings" }
+    case "compact":
+      return { type: "compact", instructions: args.trim() }
     case "new":
       return { type: "new_session" }
     case "resume":

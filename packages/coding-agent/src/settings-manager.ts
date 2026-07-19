@@ -11,6 +11,9 @@ export interface AgentSettings {
   thinkingLevel: ThinkingLevel
   steeringMode: QueueMode
   followUpMode: QueueMode
+  compactionEnabled: boolean
+  compactionReserveTokens: number
+  compactionKeepRecentTokens: number
 }
 
 export const maxSettingsFileBytes = 1024 * 1024
@@ -18,7 +21,10 @@ export const maxSettingsFileBytes = 1024 * 1024
 const defaults: AgentSettings = {
   thinkingLevel: "medium",
   steeringMode: "one-at-a-time",
-  followUpMode: "one-at-a-time"
+  followUpMode: "one-at-a-time",
+  compactionEnabled: true,
+  compactionReserveTokens: 16_384,
+  compactionKeepRecentTokens: 20_000
 }
 
 export type SettingsScope = "global" | "project"
@@ -44,12 +50,14 @@ export class SettingsManager {
   #errors: SettingsError[] = []
 
   constructor(settings: Partial<AgentSettings> = {}) {
+    validateCompactionPatch(settings)
     this.#global = { type: "loaded", path: "<memory>", settings: { ...settings } }
     this.#project = { type: "missing", path: "<memory>" }
     this.#settings = mergeSettings(settings)
   }
 
   static create(paths: OpenZiPaths, runtime: Partial<AgentSettings> = {}): SettingsManager {
+    validateCompactionPatch(runtime)
     const manager = new SettingsManager()
     manager.#paths = paths
     manager.#sharedSettingsFile = paths.globalSettingsFile === paths.projectSettingsFile
@@ -93,6 +101,7 @@ export class SettingsManager {
   }
 
   applyRuntime(patch: Partial<AgentSettings>): void {
+    validateCompactionPatch(patch)
     this.#runtime = { ...this.#runtime, ...patch }
     this.#recompute()
   }
@@ -115,6 +124,7 @@ export class SettingsManager {
   }
 
   #updateScope(scope: SettingsScope, state: SettingsScopeState, patch: Partial<AgentSettings>): SettingsScopeState {
+    validateCompactionPatch(patch)
     if (state.type === "invalid") {
       throw new Error(`Cannot update invalid ${scope} settings: ${state.path}`, { cause: state.error })
     }
@@ -128,6 +138,18 @@ export class SettingsManager {
 
   #recompute(): void {
     this.#settings = mergeSettings(scopeSettings(this.#global), scopeSettings(this.#project), this.#runtime)
+  }
+}
+
+function validateCompactionPatch(patch: Partial<AgentSettings>): void {
+  if ("compactionEnabled" in patch && typeof patch.compactionEnabled !== "boolean") {
+    throw new Error("Invalid compactionEnabled setting")
+  }
+  if ("compactionReserveTokens" in patch && !isCompactionTokenSetting(patch.compactionReserveTokens)) {
+    throw new Error("Invalid compactionReserveTokens setting")
+  }
+  if ("compactionKeepRecentTokens" in patch && !isCompactionTokenSetting(patch.compactionKeepRecentTokens)) {
+    throw new Error("Invalid compactionKeepRecentTokens setting")
   }
 }
 
@@ -154,6 +176,9 @@ function clearRuntimeOverrides(runtime: Partial<AgentSettings>, patch: Partial<A
   if ("thinkingLevel" in patch) delete runtime.thinkingLevel
   if ("steeringMode" in patch) delete runtime.steeringMode
   if ("followUpMode" in patch) delete runtime.followUpMode
+  if ("compactionEnabled" in patch) delete runtime.compactionEnabled
+  if ("compactionReserveTokens" in patch) delete runtime.compactionReserveTokens
+  if ("compactionKeepRecentTokens" in patch) delete runtime.compactionKeepRecentTokens
 }
 
 function persistSettings(path: string, patch: Partial<AgentSettings>): void {
@@ -227,6 +252,22 @@ function loadSettings(path: string): Partial<AgentSettings> {
     if (!isQueueMode(value.followUpMode)) throw invalidSetting(path, "followUpMode")
     settings.followUpMode = value.followUpMode
   }
+  if (value.compactionEnabled !== undefined) {
+    if (typeof value.compactionEnabled !== "boolean") throw invalidSetting(path, "compactionEnabled")
+    settings.compactionEnabled = value.compactionEnabled
+  }
+  if (value.compactionReserveTokens !== undefined) {
+    if (!isCompactionTokenSetting(value.compactionReserveTokens)) {
+      throw invalidSetting(path, "compactionReserveTokens")
+    }
+    settings.compactionReserveTokens = value.compactionReserveTokens
+  }
+  if (value.compactionKeepRecentTokens !== undefined) {
+    if (!isCompactionTokenSetting(value.compactionKeepRecentTokens)) {
+      throw invalidSetting(path, "compactionKeepRecentTokens")
+    }
+    settings.compactionKeepRecentTokens = value.compactionKeepRecentTokens
+  }
   return settings
 }
 
@@ -255,6 +296,10 @@ function invalidSetting(path: string, field: keyof AgentSettings): Error {
 
 function isQueueMode(value: unknown): value is AgentSettings["steeringMode"] {
   return value === "all" || value === "one-at-a-time"
+}
+
+function isCompactionTokenSetting(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 1_000_000
 }
 
 function isThinkingLevel(value: unknown): value is ThinkingLevel {

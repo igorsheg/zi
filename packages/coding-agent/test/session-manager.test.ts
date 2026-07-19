@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test"
-import { appendFile, mkdir, mkdtemp, readFile, truncate, utimes, writeFile } from "node:fs/promises"
+import { appendFile, mkdir, mkdtemp, readFile, rename, truncate, utimes, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join, relative, resolve } from "node:path"
 
@@ -14,9 +14,151 @@ test("session entries form one append-only branch", () => {
   const message = session.appendMessage({ role: "user", content: "hello", timestamp: 1 })
   const entries = session.entries()
 
-  expect(entries.map(entry => entry.id)).toEqual([model, thinking, message])
-  expect(entries.map(entry => entry.parentId)).toEqual([null, model, thinking])
+  expect(entries.map(entry => entry.id)).toEqual([model.id, thinking.id, message.id])
+  expect(entries.map(entry => entry.parentId)).toEqual([null, model.id, thinking.id])
   expect(session.messages()).toEqual([{ role: "user", content: "hello", timestamp: 1 }])
+})
+
+test("compaction markers project one latest summary and an exact retained tail", () => {
+  const session = SessionManager.inMemory("/work")
+  const oldUser = session.appendMessage({ role: "user", content: "old", timestamp: 1 })
+  session.appendMessage({
+    role: "assistant",
+    content: [],
+    api: "test",
+    provider: "test",
+    model: "test",
+    usage: emptyUsage(),
+    stopReason: "stop",
+    timestamp: 2
+  })
+  const keptUser = session.appendMessage({ role: "user", content: "kept", timestamp: 3 })
+  const keptAssistant = session.appendMessage({
+    role: "assistant",
+    content: [],
+    api: "test",
+    provider: "test",
+    model: "test",
+    usage: emptyUsage(),
+    stopReason: "stop",
+    timestamp: 4
+  })
+  session.appendCompaction({
+    reason: "manual",
+    summary: "first summary",
+    firstKeptEntryId: keptUser.id,
+    tokensBefore: 100,
+    estimatedTokensAfter: 20,
+    details: emptyCompactionDetails()
+  })
+  session.appendMessage({ role: "user", content: "new", timestamp: 5 })
+  session.appendCompaction({
+    reason: "threshold",
+    summary: "latest summary",
+    firstKeptEntryId: keptAssistant.id,
+    tokensBefore: 120,
+    estimatedTokensAfter: 18,
+    details: emptyCompactionDetails()
+  })
+
+  expect(session.entries()[0]?.id).toBe(oldUser.id)
+  expect(session.activeMessages().map(message => message.role)).toEqual(["compactionSummary", "assistant", "user"])
+  expect(session.activeMessages()[0]).toMatchObject({ summary: "latest summary", estimatedTokensAfter: 18 })
+})
+
+test("persisted compaction markers restore the same active projection", async () => {
+  const root = await mkdtemp(join(tmpdir(), "openzi-session-compaction-restore-"))
+  const paths = new OpenZiPaths(join(root, "project"), join(root, "global"))
+  const session = SessionManager.create(paths)
+  session.appendMessage({ role: "user", content: "old", timestamp: 1 })
+  const kept = session.appendMessage({ role: "user", content: "kept", timestamp: 2 })
+  session.appendCompaction({
+    reason: "manual",
+    summary: "restored summary",
+    firstKeptEntryId: kept.id,
+    tokensBefore: 100,
+    estimatedTokensAfter: 10,
+    details: emptyCompactionDetails()
+  })
+
+  const restored = SessionManager.open(session.file!)
+  expect(restored.activeMessages()).toEqual(session.activeMessages())
+  expect(restored.entries()).toHaveLength(3)
+})
+
+test("overflow failures remain durable but are omitted from active context", () => {
+  const session = SessionManager.inMemory("/work")
+  const prompt = session.appendMessage({ role: "user", content: "retry me", timestamp: 1 })
+  const failure = session.appendMessage({
+    role: "assistant",
+    content: [{ type: "text", text: "too long" }],
+    api: "test",
+    provider: "test",
+    model: "test",
+    usage: emptyUsage(),
+    stopReason: "error",
+    errorMessage: "context length exceeded",
+    timestamp: 2
+  })
+  session.appendCompaction({
+    reason: "overflow",
+    summary: "retry summary",
+    firstKeptEntryId: prompt.id,
+    tokensBefore: 200,
+    estimatedTokensAfter: 10,
+    details: emptyCompactionDetails(),
+    excludedFailureEntryId: failure.id
+  })
+
+  expect(session.messages()).toHaveLength(2)
+  expect(session.activeMessages().map(message => message.role)).toEqual(["compactionSummary", "user"])
+})
+
+test("opening rejects completed compaction markers with invalid semantic references", async () => {
+  const root = await mkdtemp(join(tmpdir(), "openzi-session-invalid-compaction-"))
+  const paths = new OpenZiPaths(join(root, "project"), join(root, "global"))
+  const session = SessionManager.create(paths)
+  const kept = session.appendMessage({ role: "user", content: "kept", timestamp: 1 })
+  const invalid = {
+    type: "compaction",
+    id: "invalid-marker",
+    parentId: kept.id,
+    timestamp: new Date().toISOString(),
+    reason: "manual",
+    summary: "summary",
+    firstKeptEntryId: "missing",
+    tokensBefore: 10,
+    estimatedTokensAfter: 5,
+    details: emptyCompactionDetails()
+  }
+  await appendFile(session.file!, `${JSON.stringify(invalid)}\n`)
+
+  expect(() => SessionManager.open(session.file!)).toThrow("Invalid compaction boundary")
+})
+
+test("compaction append failure leaves the in-memory leaf unchanged", async () => {
+  const root = await mkdtemp(join(tmpdir(), "openzi-session-append-failure-"))
+  const paths = new OpenZiPaths(join(root, "project"), join(root, "global"))
+  const session = SessionManager.create(paths)
+  const first = session.appendMessage({ role: "user", content: "old", timestamp: 1 })
+  const kept = session.appendMessage({ role: "user", content: "kept", timestamp: 2 })
+  const before = [...session.entries()]
+  const file = session.file!
+  await rename(file, `${file}.saved`)
+  await mkdir(file)
+
+  expect(() =>
+    session.appendCompaction({
+      reason: "manual",
+      summary: "summary",
+      firstKeptEntryId: kept.id,
+      tokensBefore: 10,
+      estimatedTokensAfter: 5,
+      details: emptyCompactionDetails()
+    })
+  ).toThrow()
+  expect(session.entries()).toEqual(before)
+  expect(session.entries().at(-1)?.parentId).toBe(first.id)
 })
 
 test("persisted and explicitly opened session paths are canonical", async () => {
@@ -100,6 +242,21 @@ test("oversized session journals are refused before parsing", async () => {
   expect(() => SessionManager.open(file)).toThrow(`Session file cannot exceed ${maxSessionFileBytes} bytes`)
   expect(await SessionManager.list(paths)).toMatchObject({ sessions: [], invalid: 1 })
 })
+
+function emptyUsage() {
+  return {
+    input: 0,
+    output: 0,
+    cacheRead: 0,
+    cacheWrite: 0,
+    totalTokens: 0,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }
+  }
+}
+
+function emptyCompactionDetails() {
+  return { readFiles: [], modifiedFiles: [], omittedReadFiles: 0, omittedModifiedFiles: 0 }
+}
 
 test("session listing returns an empty immutable result for a missing directory", async () => {
   const root = await mkdtemp(join(tmpdir(), "openzi-session-missing-"))

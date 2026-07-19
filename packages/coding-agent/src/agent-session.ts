@@ -1,8 +1,10 @@
 import {
   type Agent,
   type AgentEvent,
-  type AgentMessage,
+  type AgentLoopTurnUpdate,
+  type AgentMessage as PiAgentMessage,
   type AgentTool,
+  type PrepareNextTurnContext,
   type QueueMode,
   type ThinkingLevel
 } from "@earendil-works/pi-agent-core"
@@ -10,6 +12,7 @@ import {
   clampThinkingLevel,
   cleanupSessionResources,
   getSupportedThinkingLevels,
+  isContextOverflow,
   type Api,
   type ImageContent,
   type Model
@@ -21,13 +24,38 @@ import type {
   AuthenticationMethod,
   AuthenticationMethodType
 } from "./authentication.js"
-import { advanceContextUsage, estimateContextUsage, type ContextUsage } from "./context-usage.js"
+import {
+  assertCustomInstructions,
+  effectiveCompactionSettings,
+  estimateMessageTokens,
+  generateCompactionSummary,
+  maxCompactionOperationMs,
+  normalizeCompactionError,
+  prepareCompaction,
+  shouldCompact,
+  validateCompactionReduction,
+  type CompactionPlan,
+  type EffectiveCompactionSettings
+} from "./compaction.js"
+import {
+  advanceContextUsage,
+  estimateContextUsage,
+  type AvailableContextUsage,
+  type ContextUsage
+} from "./context-usage.js"
 import type { StoredCredential } from "./credential-store.js"
+import { isOpenZiAgentMessage, type AgentMessage } from "./messages.js"
 import type { ModelRegistry } from "./model-registry.js"
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.js"
 import type { ResourceDiagnostic } from "./resource-diagnostics.js"
 import type { SessionResources } from "./resource-loader.js"
-import type { SessionEntry, SessionManager } from "./session-manager.js"
+import type {
+  CompactionDetails,
+  CompactionEntry,
+  CompactionReason,
+  SessionEntry,
+  SessionManager
+} from "./session-manager.js"
 import type { SessionShell, ShellDemotionResult, ShellKillResult, ShellTaskSnapshot } from "./session-shell.js"
 import type { SettingsManager, SettingsScope } from "./settings-manager.js"
 import { expandSkillCommand, type Skill } from "./skills.js"
@@ -58,9 +86,31 @@ export interface AbortedQueuedInputs extends QueuedInputs {
   readonly settled: Promise<void>
 }
 
+export interface CompactionResult {
+  readonly reason: CompactionReason
+  readonly summary: string
+  readonly firstKeptEntryId: string
+  readonly tokensBefore: number
+  readonly estimatedTokensAfter: number
+  readonly compactedEntries: number
+  readonly details: CompactionDetails
+}
+
+export type CompactionStatus =
+  | { readonly type: "idle" }
+  | { readonly type: "running"; readonly operationId: number; readonly reason: CompactionReason }
+
+export type CompactionOutcome =
+  | { readonly type: "completed"; readonly result: CompactionResult }
+  | { readonly type: "cancelled" }
+  | { readonly type: "failed"; readonly message: string }
+
 export type AgentSessionEvent =
   | AgentEvent
   | { type: "agent_settled" }
+  | { type: "compaction_start"; operationId: number; reason: CompactionReason }
+  | { type: "compaction_end"; operationId: number; reason: CompactionReason; outcome: CompactionOutcome }
+  | { type: "compaction_enabled_changed"; enabled: boolean }
   | ({ type: "queue_update" } & QueuedInputs)
   | { type: "entry_appended"; entry: SessionEntry }
   | { type: "model_changed"; model: Model<Api> }
@@ -107,6 +157,12 @@ export interface ThinkingLevelMutation {
   readonly effective: ThinkingLevel
 }
 
+export interface CompactionEnabledMutation {
+  readonly scope: SettingsScope
+  readonly requested: boolean
+  readonly effective: boolean
+}
+
 export interface AgentSessionConfig {
   agent: Agent
   sessionManager: SessionManager
@@ -126,10 +182,32 @@ export class QueueCapacityError extends Error {
   }
 }
 
+type RunPhase =
+  | { readonly type: "agent" }
+  | {
+      readonly type: "compacting"
+      readonly operationId: number
+      readonly reason: "threshold" | "overflow"
+      readonly controller: AbortController
+    }
+  | { readonly type: "compaction_committed"; readonly operationId: number; readonly reason: "threshold" | "overflow" }
+
+type RunningActivity = {
+  readonly type: "running"
+  readonly runId: number
+  readonly phase: RunPhase
+  readonly autoCompactions: number
+  readonly overflowRecoveries: 0 | 1
+  readonly thresholdSuppressed: boolean
+  readonly settled: Promise<void>
+}
+
 type Activity =
   | { type: "idle" }
-  | { type: "running"; runId: number; settled: Promise<void> }
+  | RunningActivity
   | { type: "aborting"; runId: number; settled: Promise<void> }
+  | { type: "compacting"; operationId: number; reason: "manual"; controller: AbortController; settled: Promise<void> }
+  | { type: "compaction_committed"; operationId: number; reason: "manual"; settled: Promise<void> }
   | { type: "failed"; runId: number; cause: unknown }
   | { type: "disposed"; settled: Promise<void> }
 
@@ -157,13 +235,25 @@ interface CommittedMessageMemory {
 interface ContextUsageCache {
   readonly model: Model<Api>
   readonly messageCount: number
-  readonly usage: ContextUsage
+  readonly usage: AvailableContextUsage
 }
 
-interface Settlement {
-  readonly promise: Promise<void>
-  resolve(): void
+interface Settlement<T = void> {
+  readonly promise: Promise<T>
+  resolve(value: T): void
   reject(cause: unknown): void
+}
+
+interface PreparedCompaction {
+  readonly model: Model<Api>
+  readonly settings: EffectiveCompactionSettings
+  readonly leafId: string | undefined
+  readonly plan: CompactionPlan
+}
+
+interface CommittedCompaction {
+  readonly marker: CompactionEntry
+  readonly result: CompactionResult
 }
 
 const emptyQueue = (): QueuedInputs => Object.freeze({ steering: Object.freeze([]), followUp: Object.freeze([]) })
@@ -187,6 +277,7 @@ export class AgentSession {
   #nextRunId = 0
   #nextEntryId = 0
   #nextModelOperationId = 0
+  #nextCompactionOperationId = 0
   #modelMutation: ModelMutationState = { type: "none" }
   #modelState: SessionModelState
   #modelChoicesPromise: Promise<readonly ModelChoice[]> | undefined
@@ -203,6 +294,7 @@ export class AgentSession {
     this.sessionManager = config.sessionManager
     this.settingsManager = config.settingsManager
     this.#modelState = config.model ? { type: "selected", model: config.model } : { type: "unselected" }
+    this.#agent.prepareNextTurnWithContext = (context, signal) => this.#prepareNextTurn(context, signal)
     this.#unsubscribeAgent = this.#agent.subscribe(event => this.#handleAgentEvent(event))
     this.#unsubscribeShell = this.#shell?.subscribe(taskId => {
       try {
@@ -214,11 +306,14 @@ export class AgentSession {
   }
 
   get messages(): readonly AgentMessage[] {
-    return this.#agent.state.messages
+    return this.#ownedMessages()
   }
 
   get streamingMessage(): AgentMessage | undefined {
-    return this.#agent.state.streamingMessage
+    const message = this.#agent.state.streamingMessage
+    if (!message) return undefined
+    if (!isOpenZiAgentMessage(message)) throw new Error("Invalid OpenZi streaming message")
+    return message
   }
 
   get modelState(): SessionModelState {
@@ -242,12 +337,29 @@ export class AgentSession {
     return this.#agent.followUpMode
   }
 
+  get compactionStatus(): CompactionStatus {
+    const activity = this.#activity
+    if (activity.type === "compacting") {
+      return { type: "running", operationId: activity.operationId, reason: activity.reason }
+    }
+    if (activity.type === "running" && activity.phase.type === "compacting") {
+      return { type: "running", operationId: activity.phase.operationId, reason: activity.phase.reason }
+    }
+    return { type: "idle" }
+  }
+
   get isStreaming(): boolean {
     return this.#activity.type === "running" || this.#activity.type === "aborting"
   }
 
   get isAborting(): boolean {
-    return this.#activity.type === "aborting"
+    return (
+      this.#activity.type === "aborting" ||
+      (this.#activity.type === "compacting" && this.#activity.controller.signal.aborted) ||
+      (this.#activity.type === "running" &&
+        this.#activity.phase.type === "compacting" &&
+        this.#activity.phase.controller.signal.aborted)
+    )
   }
 
   get queuedInputs(): QueuedInputs {
@@ -269,7 +381,7 @@ export class AgentSession {
   }
 
   get memoryDiagnostics(): AgentSessionMemoryDiagnostics {
-    const messages = this.#agent.state.messages
+    const messages = this.#ownedMessages()
     if (!this.#committedMessageMemory || this.#committedMessageMemory.count !== messages.length) {
       this.#committedMessageMemory = measureCommittedMessages(messages)
     }
@@ -283,18 +395,23 @@ export class AgentSession {
     }
   }
 
-  getContextUsage(): ContextUsage | undefined {
-    if (this.#modelState.type === "unselected") return undefined
+  get contextUsage(): ContextUsage {
+    if (this.#modelState.type === "unselected") return { type: "unavailable", reason: "no_model" }
     const model = this.#modelState.model
-    if (model.contextWindow <= 0) return undefined
+    if (model.contextWindow <= 0) return { type: "unavailable", reason: "unknown_window" }
 
-    const messages = this.#agent.state.messages
+    const messages = this.#ownedMessages()
     const cached = this.#contextUsageCache
     if (cached?.model === model && cached.messageCount === messages.length) return cached.usage
 
-    const usage = estimateContextUsage(messages, model.contextWindow)
+    const usage = estimateContextUsage(messages, model.contextWindow, this.sessionManager.activeUsageAnchorIndex())
     this.#contextUsageCache = { model, messageCount: messages.length, usage }
     return usage
+  }
+
+  getContextUsage(): AvailableContextUsage | undefined {
+    const usage = this.contextUsage
+    return usage.type === "unavailable" ? undefined : usage
   }
 
   get sessionId(): string {
@@ -389,6 +506,34 @@ export class AgentSession {
     return () => this.#listeners.delete(listener)
   }
 
+  compact(customInstructions?: string): Promise<CompactionResult> {
+    this.#assertIdle("compact context")
+    if (this.#modelMutation.type !== "none") {
+      throw new Error("Cannot compact context while a model change is active")
+    }
+    if (this.#pending.length > 0) throw new Error("Cannot compact context while queued input is pending")
+    assertCustomInstructions(customInstructions)
+    const prepared = this.#prepareCompaction()
+    if (!prepared) throw new Error("Nothing to compact")
+
+    const operationId = ++this.#nextCompactionOperationId
+    const controller = new AbortController()
+    const settlement = createSettlement<CompactionResult>()
+    this.#activity = {
+      type: "compacting",
+      operationId,
+      reason: "manual",
+      controller,
+      settled: settlement.promise.then(
+        () => undefined,
+        () => undefined
+      )
+    }
+    this.#emitAll([{ type: "compaction_start", operationId, reason: "manual" }])
+    void this.#driveManualCompaction(operationId, controller, prepared, customInstructions, settlement)
+    return settlement.promise
+  }
+
   prompt(text: string, options: PromptOptions = {}): Promise<void> {
     this.#assertOpen()
     if (this.#modelState.type === "unselected") throw new Error("No model selected. Use /login, then /model.")
@@ -399,7 +544,15 @@ export class AgentSession {
         this.#modelMutation = { type: "none" }
         const runId = ++this.#nextRunId
         const settlement = createSettlement()
-        this.#activity = { type: "running", runId, settled: settlement.promise }
+        this.#activity = {
+          type: "running",
+          runId,
+          phase: { type: "agent" },
+          autoCompactions: 0,
+          overflowRecoveries: 0,
+          thresholdSuppressed: false,
+          settled: settlement.promise
+        }
         void this.#drive(runId, expandedText, options.images, settlement)
         return settlement.promise
       }
@@ -409,6 +562,9 @@ export class AgentSession {
         return Promise.resolve()
       case "aborting":
         throw new Error("Cannot prompt while the agent is aborting")
+      case "compacting":
+      case "compaction_committed":
+        throw new Error("Cannot prompt while context compaction is active")
       case "failed":
         throw new Error("Restore or discard queued inputs from the failed run before prompting again")
       case "disposed":
@@ -429,6 +585,9 @@ export class AgentSession {
   takeQueuedInputs(): QueuedInputs {
     this.#assertOpen()
     if (this.#activity.type === "aborting") throw new Error("Cannot restore queued inputs while the agent is aborting")
+    if (this.#activity.type === "compacting" || this.#activity.type === "compaction_committed") {
+      throw new Error("Cannot restore queued inputs while context compaction is active")
+    }
     const queued = this.#detachQueuedInputs()
     if (this.#activity.type === "failed") this.#activity = { type: "idle" }
     this.#emitQueue()
@@ -445,15 +604,30 @@ export class AgentSession {
         return { ...queued, settled: authenticationSettled }
       }
       case "running": {
-        const { runId, settled } = this.#activity
+        const { runId, settled, phase } = this.#activity
         const queued = this.#detachQueuedInputs()
         this.#activity = { type: "aborting", runId, settled }
         try {
           this.#emitQueue()
         } finally {
+          if (phase.type === "compacting") phase.controller.abort()
           this.#agent.abort()
         }
         return { ...queued, settled: authenticationWasIdle ? settled : settleTogether(settled, authenticationSettled) }
+      }
+      case "compacting": {
+        const { settled, controller } = this.#activity
+        const queued = this.#detachQueuedInputs()
+        this.#emitQueue()
+        controller.abort()
+        return { ...queued, settled: authenticationWasIdle ? settled : settleTogether(settled, authenticationSettled) }
+      }
+      case "compaction_committed": {
+        const { settled } = this.#activity
+        return {
+          ...emptyQueue(),
+          settled: authenticationWasIdle ? settled : settleTogether(settled, authenticationSettled)
+        }
       }
       case "aborting":
         return {
@@ -489,7 +663,24 @@ export class AgentSession {
     const authenticationWasIdle = this.#authentication.isIdle
     const authenticationSettled = this.#authentication.cancel()
     switch (this.#activity.type) {
-      case "running":
+      case "running": {
+        const { runId, settled, phase } = this.#activity
+        if (phase.type === "compacting" || phase.type === "compaction_committed") {
+          this.#activity = { type: "aborting", runId, settled }
+          if (phase.type === "compacting") phase.controller.abort()
+        }
+        this.#agent.abort()
+        return authenticationWasIdle ? settled : settleTogether(settled, authenticationSettled)
+      }
+      case "compacting": {
+        const { settled, controller } = this.#activity
+        controller.abort()
+        return authenticationWasIdle ? settled : settleTogether(settled, authenticationSettled)
+      }
+      case "compaction_committed": {
+        const { settled } = this.#activity
+        return authenticationWasIdle ? settled : settleTogether(settled, authenticationSettled)
+      }
       case "aborting": {
         const { settled } = this.#activity
         this.#agent.abort()
@@ -517,6 +708,8 @@ export class AgentSession {
     switch (this.#activity.type) {
       case "running":
       case "aborting":
+      case "compacting":
+      case "compaction_committed":
       case "disposed":
         return settleTogether(this.#activity.settled, this.#authentication.waitForIdle())
       case "idle":
@@ -592,6 +785,17 @@ export class AgentSession {
     return Object.freeze({ scope, requested, effective })
   }
 
+  setCompactionEnabled(requested: boolean, scope: SettingsScope): CompactionEnabledMutation {
+    this.#assertOpen()
+    if (typeof requested !== "boolean") throw new Error(`Invalid compaction setting: ${String(requested)}`)
+    assertSettingsScope(scope)
+    if (scope === "global") this.settingsManager.updateGlobal({ compactionEnabled: requested })
+    else this.settingsManager.updateProject({ compactionEnabled: requested })
+    const effective = this.settingsManager.get().compactionEnabled
+    this.#emitAll([{ type: "compaction_enabled_changed", enabled: effective }])
+    return Object.freeze({ scope, requested, effective })
+  }
+
   setThinkingLevel(requested: ThinkingLevel, scope: SettingsScope = "global"): ThinkingLevelMutation {
     this.#assertIdle("change thinking level")
     assertThinkingLevel(requested)
@@ -620,13 +824,21 @@ export class AgentSession {
   dispose(): void {
     if (this.#activity.type === "disposed") return
     this.#modelMutation = { type: "none" }
+    const currentActivity = this.#activity
     const activeSettled =
-      this.#activity.type === "running" || this.#activity.type === "aborting"
-        ? this.#activity.settled
+      currentActivity.type === "running" ||
+      currentActivity.type === "aborting" ||
+      currentActivity.type === "compacting" ||
+      currentActivity.type === "compaction_committed"
+        ? currentActivity.settled
         : Promise.resolve()
     this.#pending = []
     this.#pendingBytes = 0
     this.#agent.clearAllQueues()
+    if (currentActivity.type === "compacting") currentActivity.controller.abort()
+    if (currentActivity.type === "running" && currentActivity.phase.type === "compacting") {
+      currentActivity.phase.controller.abort()
+    }
     this.#agent.abort()
     const settled = settleAll([
       activeSettled,
@@ -644,10 +856,18 @@ export class AgentSession {
   async #drive(runId: number, text: string, images: ImageContent[] | undefined, settlement: Settlement): Promise<void> {
     let failure: { cause: unknown } | undefined
     try {
-      await this.#agent.prompt(text, images)
-      // Core runs are sequential: each continuation decides which queued batch is eligible next.
-      // oxlint-disable-next-line no-await-in-loop
-      while (this.#canContinue(runId) && this.#agent.hasQueuedMessages()) await this.#agent.continue()
+      await this.#compactBeforePrompt(runId, text, images)
+      if (this.#canContinue(runId)) await this.#agent.prompt(text, images)
+      while (this.#canContinue(runId)) {
+        // Core runs are sequential: overflow recovery and each queued continuation own one run at a time.
+        // oxlint-disable-next-line no-await-in-loop
+        const overflow = await this.#recoverOverflow(runId)
+        if (overflow === "recovered") continue
+        if (overflow === "stop") break
+        if (!this.#agent.hasQueuedMessages()) break
+        // oxlint-disable-next-line no-await-in-loop
+        await this.#agent.continue()
+      }
     } catch (cause) {
       failure = { cause }
     }
@@ -670,8 +890,323 @@ export class AgentSession {
     }
   }
 
+  async #driveManualCompaction(
+    operationId: number,
+    controller: AbortController,
+    prepared: PreparedCompaction,
+    customInstructions: string | undefined,
+    settlement: Settlement<CompactionResult>
+  ): Promise<void> {
+    try {
+      const committed = await this.#performCompaction(operationId, "manual", controller, prepared, customInstructions)
+      const active = this.#activity
+      if (active.type === "compacting" && active.operationId === operationId) {
+        this.#activity = { type: "compaction_committed", operationId, reason: "manual", settled: active.settled }
+      }
+      this.#emitAll([
+        { type: "entry_appended", entry: committed.marker },
+        {
+          type: "compaction_end",
+          operationId,
+          reason: "manual",
+          outcome: { type: "completed", result: committed.result }
+        }
+      ])
+      if (this.#isManualCompactionCommitted(operationId)) this.#activity = { type: "idle" }
+      settlement.resolve(committed.result)
+    } catch (cause) {
+      const cancelled = controller.signal.aborted || !this.#isManualCompaction(operationId)
+      if (this.#isManualCompaction(operationId)) this.#activity = { type: "idle" }
+      const failure = normalizeCompactionError(cancelled ? "Compaction cancelled" : cause)
+      this.#emitAll([
+        {
+          type: "compaction_end",
+          operationId,
+          reason: "manual",
+          outcome: cancelled ? { type: "cancelled" } : { type: "failed", message: failure.message }
+        }
+      ])
+      settlement.reject(failure)
+    }
+  }
+
+  async #compactBeforePrompt(runId: number, text: string, images: ImageContent[] | undefined): Promise<void> {
+    const activity = this.#runningAgentActivity(runId)
+    if (!activity || !this.settingsManager.get().compactionEnabled) return
+    const settings = this.#effectiveCompactionSettings()
+    const usage = this.contextUsage
+    if (!settings || usage.type === "unavailable") return
+    const prospective = estimateMessageTokens(userMessage(text, images ?? []))
+    if (!shouldCompact(usage.tokens + prospective, settings)) return
+    await this.#runAutomaticCompaction(runId, "threshold")
+  }
+
+  async #prepareNextTurn(
+    context: PrepareNextTurnContext,
+    signal: AbortSignal | undefined
+  ): Promise<AgentLoopTurnUpdate | undefined> {
+    const activity = this.#activity
+    if (
+      activity.type !== "running" ||
+      activity.phase.type !== "agent" ||
+      activity.thresholdSuppressed ||
+      !this.settingsManager.get().compactionEnabled ||
+      signal?.aborted
+    ) {
+      return undefined
+    }
+    const settings = this.#effectiveCompactionSettings()
+    const usage = this.contextUsage
+    if (!settings || usage.type === "unavailable") return undefined
+    const queuedTokens = this.#pending.reduce((tokens, input) => tokens + estimateMessageTokens(input.message), 0)
+    if (!shouldCompact(usage.tokens + queuedTokens, settings)) return undefined
+
+    const outcome = await this.#runAutomaticCompaction(activity.runId, "threshold", undefined, signal)
+    if (outcome !== "completed" || !this.#canContinue(activity.runId)) return undefined
+    return { context: { ...context.context, messages: [...this.#agent.state.messages] } }
+  }
+
+  async #recoverOverflow(runId: number): Promise<"none" | "recovered" | "stop"> {
+    const activity = this.#runningAgentActivity(runId)
+    const message = this.#agent.state.messages.at(-1)
+    if (!activity || message?.role !== "assistant" || !isContextOverflow(message, this.model.contextWindow)) {
+      return "none"
+    }
+    if (!this.settingsManager.get().compactionEnabled) return "stop"
+    if (activity.overflowRecoveries === 1) {
+      throw new Error(
+        "Context still exceeds the model window after one recovery; use /compact, select a larger-context model, or start a new session."
+      )
+    }
+    const failureEntry = this.sessionManager
+      .entries()
+      .findLast(entry => entry.type === "message" && entry.message === message)
+    if (!failureEntry) return "stop"
+
+    const outcome = await this.#runAutomaticCompaction(runId, "overflow", failureEntry.id)
+    if (outcome !== "completed" || !this.#canContinue(runId)) return "stop"
+    const last = this.#agent.state.messages.at(-1)
+    if (!last || (last.role !== "user" && last.role !== "toolResult")) return "stop"
+    await this.#agent.continue()
+    return "recovered"
+  }
+
+  async #runAutomaticCompaction(
+    runId: number,
+    reason: "threshold" | "overflow",
+    excludedFailureEntryId?: string,
+    runSignal?: AbortSignal
+  ): Promise<"completed" | "noop" | "failed" | "cancelled"> {
+    const current = this.#runningAgentActivity(runId)
+    if (!current || current.autoCompactions >= 4 || (reason === "threshold" && current.thresholdSuppressed))
+      return "noop"
+    if (reason === "overflow" && current.overflowRecoveries === 1) return "noop"
+
+    let prepared: PreparedCompaction | undefined
+    try {
+      prepared = this.#prepareCompaction(excludedFailureEntryId)
+    } catch {
+      return "failed"
+    }
+    if (!prepared) return "noop"
+
+    const operationId = ++this.#nextCompactionOperationId
+    const controller = new AbortController()
+    const abort = () => controller.abort()
+    runSignal?.addEventListener("abort", abort, { once: true })
+    this.#activity = {
+      ...current,
+      phase: { type: "compacting", operationId, reason, controller },
+      autoCompactions: current.autoCompactions + 1,
+      overflowRecoveries: reason === "overflow" ? 1 : current.overflowRecoveries
+    }
+    this.#emitAll([{ type: "compaction_start", operationId, reason }])
+
+    try {
+      const committed = await this.#performCompaction(operationId, reason, controller, prepared)
+      if (this.#isAutomaticCompaction(runId, operationId)) {
+        const active = this.#activity
+        this.#activity = { ...active, phase: { type: "compaction_committed", operationId, reason } }
+      }
+      this.#emitAll([
+        { type: "entry_appended", entry: committed.marker },
+        { type: "compaction_end", operationId, reason, outcome: { type: "completed", result: committed.result } }
+      ])
+      if (this.#isAutomaticCompactionCommitted(runId, operationId)) {
+        const active = this.#activity
+        this.#activity = { ...active, phase: { type: "agent" } }
+      }
+      return "completed"
+    } catch (cause) {
+      const cancelled = controller.signal.aborted || !this.#isAutomaticCompaction(runId, operationId)
+      if (this.#isAutomaticCompaction(runId, operationId)) {
+        const active = this.#activity
+        this.#activity = {
+          ...active,
+          phase: { type: "agent" },
+          thresholdSuppressed: active.thresholdSuppressed || (reason === "threshold" && !cancelled)
+        }
+      }
+      const failure = normalizeCompactionError(cause)
+      this.#emitAll([
+        {
+          type: "compaction_end",
+          operationId,
+          reason,
+          outcome: cancelled ? { type: "cancelled" } : { type: "failed", message: failure.message }
+        }
+      ])
+      return cancelled ? "cancelled" : "failed"
+    } finally {
+      runSignal?.removeEventListener("abort", abort)
+    }
+  }
+
+  #prepareCompaction(excludedFailureEntryId?: string): PreparedCompaction | undefined {
+    if (this.#modelState.type === "unselected") throw new Error("No model selected. Use /login, then /model.")
+    if (!this.#authentication.isIdle) throw new Error("Cannot compact context while authentication is active")
+    const model = this.#modelState.model
+    const settings = this.#effectiveCompactionSettings()
+    if (!settings) throw new Error("Selected model does not report a usable context window")
+    const usage = this.contextUsage
+    if (usage.type === "unavailable") throw new Error("Context usage is unavailable for the selected model")
+    const preparation = prepareCompaction(
+      this.sessionManager.entries(),
+      settings,
+      { tokens: usage.tokens, quality: usage.type },
+      excludedFailureEntryId
+    )
+    if (preparation.type === "nothing_to_compact") return undefined
+    return { model, settings, leafId: this.sessionManager.entries().at(-1)?.id, plan: preparation.plan }
+  }
+
+  #effectiveCompactionSettings(): EffectiveCompactionSettings | undefined {
+    if (this.#modelState.type === "unselected") return undefined
+    const settings = this.settingsManager.get()
+    return effectiveCompactionSettings(this.#modelState.model, {
+      reserveTokens: settings.compactionReserveTokens,
+      keepRecentTokens: settings.compactionKeepRecentTokens
+    })
+  }
+
+  async #performCompaction(
+    operationId: number,
+    reason: CompactionReason,
+    controller: AbortController,
+    prepared: PreparedCompaction,
+    customInstructions?: string
+  ): Promise<CommittedCompaction> {
+    const deadline = new AbortController()
+    const timeout = setTimeout(() => deadline.abort(), maxCompactionOperationMs)
+    const signal = AbortSignal.any([controller.signal, deadline.signal])
+    try {
+      const summary = await generateCompactionSummary(
+        prepared.plan,
+        prepared.model,
+        prepared.settings,
+        customInstructions,
+        this.thinkingLevel,
+        (request, requestSignal) =>
+          settleBeforeAbort(
+            Promise.resolve(
+              this.#agent.streamFn(prepared.model, request.context, {
+                maxTokens: request.maxTokens,
+                signal: requestSignal,
+                ...(request.thinkingLevel ? { reasoning: request.thinkingLevel } : {})
+              })
+            ).then(stream => stream.result()),
+            requestSignal
+          ),
+        signal
+      )
+      const estimatedTokensAfter = validateCompactionReduction(prepared.plan, summary)
+      this.#assertCompactionCommit(operationId, prepared, signal)
+
+      const marker = this.sessionManager.appendCompaction({
+        reason,
+        summary,
+        firstKeptEntryId: prepared.plan.firstKeptEntryId,
+        tokensBefore: prepared.plan.tokensBefore,
+        estimatedTokensAfter,
+        details: prepared.plan.details,
+        ...(prepared.plan.excludedFailureEntryId
+          ? { excludedFailureEntryId: prepared.plan.excludedFailureEntryId }
+          : {})
+      })
+      this.#agent.state.messages = this.sessionManager.activeMessages()
+      this.#committedMessageMemory = undefined
+      this.#contextUsageCache = undefined
+      const result = Object.freeze({
+        reason,
+        summary,
+        firstKeptEntryId: prepared.plan.firstKeptEntryId,
+        tokensBefore: prepared.plan.tokensBefore,
+        estimatedTokensAfter,
+        compactedEntries: prepared.plan.compactedEntries,
+        details: prepared.plan.details
+      })
+      return Object.freeze({ marker, result })
+    } catch (cause) {
+      if (deadline.signal.aborted && !controller.signal.aborted) {
+        throw new Error("Compaction timed out after 120 seconds", { cause })
+      }
+      throw cause
+    } finally {
+      clearTimeout(timeout)
+    }
+  }
+
+  #assertCompactionCommit(operationId: number, prepared: PreparedCompaction, signal: AbortSignal): void {
+    if (signal.aborted) throw new Error("Compaction cancelled")
+    const active =
+      this.#isManualCompaction(operationId) ||
+      (this.#activity.type === "running" &&
+        this.#activity.phase.type === "compacting" &&
+        this.#activity.phase.operationId === operationId)
+    if (!active) throw new Error("Compaction completion is stale")
+    if (this.#modelState.type !== "selected" || this.#modelState.model !== prepared.model) {
+      throw new Error("Compaction model changed before commit")
+    }
+    if (this.sessionManager.entries().at(-1)?.id !== prepared.leafId) {
+      throw new Error("Session changed before compaction could commit")
+    }
+  }
+
+  #runningAgentActivity(runId: number): RunningActivity | undefined {
+    const activity = this.#activity
+    return activity.type === "running" && activity.runId === runId && activity.phase.type === "agent"
+      ? activity
+      : undefined
+  }
+
+  #isManualCompaction(operationId: number): boolean {
+    return this.#activity.type === "compacting" && this.#activity.operationId === operationId
+  }
+
+  #isManualCompactionCommitted(operationId: number): boolean {
+    return this.#activity.type === "compaction_committed" && this.#activity.operationId === operationId
+  }
+
+  #isAutomaticCompaction(runId: number, operationId: number): boolean {
+    return (
+      this.#activity.type === "running" &&
+      this.#activity.runId === runId &&
+      this.#activity.phase.type === "compacting" &&
+      this.#activity.phase.operationId === operationId
+    )
+  }
+
+  #isAutomaticCompactionCommitted(runId: number, operationId: number): boolean {
+    return (
+      this.#activity.type === "running" &&
+      this.#activity.runId === runId &&
+      this.#activity.phase.type === "compaction_committed" &&
+      this.#activity.phase.operationId === operationId
+    )
+  }
+
   #canContinue(runId: number): boolean {
-    return this.#activity.type === "running" && this.#activity.runId === runId
+    return this.#activity.type === "running" && this.#activity.runId === runId && this.#activity.phase.type === "agent"
   }
 
   #isCurrentRun(runId: number): boolean {
@@ -717,6 +1252,9 @@ export class AgentSession {
         return this.#nextRunId + 1
       case "aborting":
         throw new Error("Cannot queue input while the agent is aborting")
+      case "compacting":
+      case "compaction_committed":
+        throw new Error("Cannot queue input while context compaction is active")
       case "failed":
         throw new Error("Restore or discard queued inputs from the failed run before queueing again")
       case "disposed":
@@ -726,19 +1264,25 @@ export class AgentSession {
     }
   }
 
+  #ownedMessages(): AgentMessage[] {
+    // Pi can append only base provider messages; OpenZi is the sole producer of its stricter summary variant.
+    // oxlint-disable-next-line typescript/no-unsafe-type-assertion
+    return this.#agent.state.messages as AgentMessage[]
+  }
+
   async #handleAgentEvent(event: AgentEvent): Promise<void> {
     if (event.type === "message_start" && event.message.role === "user") this.#removeDelivered(event.message)
     if (event.type === "message_end") {
-      this.#recordCommittedMessage(event.message)
-      const id = this.sessionManager.appendMessage(event.message)
-      const entry = this.sessionManager.entries().find(candidate => candidate.id === id)
-      if (entry) this.#emit({ type: "entry_appended", entry })
+      if (!isOpenZiAgentMessage(event.message)) throw new Error("Invalid OpenZi agent message")
+      const entry = this.sessionManager.appendMessage(event.message)
+      this.#recordCommittedMessage(entry.message)
+      this.#emit({ type: "entry_appended", entry })
     }
     this.#emit(event)
   }
 
   #recordCommittedMessage(message: AgentMessage): void {
-    const messages = this.#agent.state.messages
+    const messages = this.#ownedMessages()
     const memory = this.#committedMessageMemory
     if (memory) {
       this.#committedMessageMemory =
@@ -765,7 +1309,7 @@ export class AgentSession {
     }
   }
 
-  #removeDelivered(message: AgentMessage): void {
+  #removeDelivered(message: PiAgentMessage): void {
     const runId =
       this.#activity.type === "running" || this.#activity.type === "aborting" ? this.#activity.runId : undefined
     if (runId === undefined) return
@@ -848,6 +1392,26 @@ export class AgentSession {
   }
 }
 
+function settleBeforeAbort<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) return Promise.reject(new Error("Compaction cancelled"))
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(new Error("Compaction cancelled"))
+    signal.addEventListener("abort", onAbort, { once: true })
+    void operation.then(
+      value => {
+        signal.removeEventListener("abort", onAbort)
+        resolve(value)
+        return undefined
+      },
+      cause => {
+        signal.removeEventListener("abort", onAbort)
+        reject(cause)
+        return undefined
+      }
+    )
+  })
+}
+
 async function settleTogether(first: Promise<void>, second: Promise<void>): Promise<void> {
   await Promise.all([first, second])
 }
@@ -858,10 +1422,10 @@ async function settleAll(operations: readonly Promise<void>[]): Promise<void> {
   if (failure) throw failure.reason
 }
 
-function createSettlement(): Settlement {
-  let resolve!: () => void
+function createSettlement<T = void>(): Settlement<T> {
+  let resolve!: (value: T) => void
   let reject!: (cause: unknown) => void
-  const promise = new Promise<void>((resolvePromise, rejectPromise) => {
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
     resolve = resolvePromise
     reject = rejectPromise
   })

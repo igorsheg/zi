@@ -45,6 +45,37 @@ test("transcript notifications coalesce at one renderer lifecycle pass and destr
   }
 })
 
+test("OpenZi summary messages require post-compaction accounting", () => {
+  // @ts-expect-error estimatedTokensAfter is part of OpenZi's public summary-message contract.
+  const invalid: AgentMessage = { role: "compactionSummary", summary: "checkpoint", tokensBefore: 100, timestamp: 1 }
+  expect(invalid.role).toBe("compactionSummary")
+})
+
+test("authoritative message-array replacement rebuilds an equal-length transcript", async () => {
+  const harness = await createTranscriptHarness([{ role: "user", content: "old transcript", timestamp: 1 }])
+  try {
+    await harness.setup.flush()
+    const oldRoot = harness.view.scroll.getChildren()[0]
+    harness.state.messages = [
+      {
+        role: "compactionSummary",
+        summary: "checkpoint summary",
+        tokensBefore: 100,
+        estimatedTokensAfter: 20,
+        timestamp: 2
+      }
+    ]
+    harness.revision.set(1)
+    await harness.setup.flush()
+
+    expect(harness.view.scroll.getChildren()[0]).not.toBe(oldRoot)
+    expect(harness.setup.captureCharFrame()).toContain("checkpoint summary")
+    expect(harness.view.scroll.stickyScroll).toBe(true)
+  } finally {
+    harness.destroy()
+  }
+})
+
 test("a started user message promotes its native root when committed", async () => {
   const message: AgentMessage = { role: "user", content: [{ type: "text", text: "Keep this root." }], timestamp: 1 }
   const harness = await createTranscriptHarness([], { streamingMessage: message })

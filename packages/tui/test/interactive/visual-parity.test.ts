@@ -62,7 +62,7 @@ test("representative session keeps the accepted visual hierarchy at normal and c
       "",
       "",
       "",
-      "╭─/workspace/openzi───────────────────────────────faux-1 (high) (ctx 15%/247k)─╮",
+      "╭─/workspace/openzi──────────────────────────────────────faux-1 (high) 15% ctx─╮",
       "│                                                                              │",
       "╰──────────────────────────────────────────────────────────────────────────────╯"
     ])
@@ -93,6 +93,37 @@ test("representative session keeps the accepted visual hierarchy at normal and c
     setup.resize(20, 4)
     await setup.renderOnce()
     expect(setup.captureCharFrame()).toContain("prompt.")
+  } finally {
+    session.dispose()
+    setup.destroy()
+  }
+})
+
+test("composer distinguishes estimated context after compaction", async () => {
+  const models = createModels()
+  const faux = fauxProvider({ provider: "estimated-context", models: [{ id: "model", contextWindow: 4_000 }] })
+  models.setProvider(faux.provider)
+  const bootstrap = await createAgentRuntime({
+    cwd: "/work",
+    models,
+    persist: false,
+    settings: { compactionReserveTokens: 100, compactionKeepRecentTokens: 1 }
+  })
+  const model = bootstrap.session.model
+  bootstrap.session.dispose()
+  const history = SessionManager.inMemory("/work")
+  history.appendMessage({ role: "user", content: "x".repeat(1_000), timestamp: 1 })
+  history.appendMessage(fauxAssistantMessage("old answer"))
+  history.appendMessage({ role: "user", content: "recent", timestamp: 3 })
+  history.appendMessage(fauxAssistantMessage("recent answer"))
+  const session = await createAgentSession({ services: bootstrap.services, sessionManager: history, model, tools: [] })
+  faux.setResponses([fauxAssistantMessage("checkpoint")])
+  await session.compact()
+  const setup = await createInteractiveTest(session, { width: 80, height: 6 })
+
+  try {
+    await setup.renderOnce()
+    expect(setup.captureCharFrame()).toMatch(/~\d+% ctx/)
   } finally {
     session.dispose()
     setup.destroy()
