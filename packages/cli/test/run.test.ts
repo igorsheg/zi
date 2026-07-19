@@ -107,6 +107,39 @@ test("text mode writes final output without loading the TUI and disposes its run
   expect(() => runtime?.session.prompt("disposed")).toThrow("AgentSession is disposed")
 })
 
+test("headless startup writes model fallback diagnostics to stderr", async () => {
+  const models = createModels()
+  const faux = fauxProvider()
+  models.setProvider(faux.provider)
+  faux.setResponses([fauxAssistantMessage("done")])
+  const output: string[] = []
+  const errors: string[] = []
+  const host = testHost({
+    output,
+    errors,
+    async createRuntime(options) {
+      const runtime = await createTestAgentRuntime({ ...options, models })
+      return {
+        ...runtime,
+        bootstrapDiagnostic: {
+          type: "model_fallback",
+          savedModel: { provider: "removed", modelId: "old" },
+          fallbackModel: { provider: faux.getModel().provider, modelId: faux.getModel().id },
+          message: `Could not restore model removed/old. Using ${faux.getModel().provider}/${faux.getModel().id}.`
+        }
+      }
+    }
+  })
+
+  const exitCode = await runCli(["-p", "--model", `${faux.getModel().provider}/${faux.getModel().id}`, "start"], host)
+
+  expect(exitCode).toBe(0)
+  expect(output).toEqual(["done\n"])
+  expect(errors).toEqual([
+    `Warning: Could not restore model removed/old. Using ${faux.getModel().provider}/${faux.getModel().id}.\n`
+  ])
+})
+
 test("JSON mode emits only parseable JSONL without loading the TUI", async () => {
   const models = createModels()
   const faux = fauxProvider()

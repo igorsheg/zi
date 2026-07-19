@@ -83,7 +83,7 @@ test("model and thinking selections persist a coherent canonical transition", as
     model: "select/reasoning",
     models,
     persist: false,
-    settings: { thinkingLevel: "high" }
+    settings: { defaultThinkingLevel: "high" }
   })
   models.getAuth = async () => configuredAuth()
 
@@ -101,7 +101,11 @@ test("model and thinking selections persist a coherent canonical transition", as
 
     expect(session.model).toBe(plain)
     expect(session.thinkingLevel).toBe("off")
-    expect(session.settingsManager.get()).toMatchObject({ model: "select/plain", thinkingLevel: "off" })
+    expect(session.settingsManager.get()).toMatchObject({
+      defaultProvider: "select",
+      defaultModel: "plain",
+      defaultThinkingLevel: "high"
+    })
     expect(
       session.sessionManager
         .entries()
@@ -137,7 +141,7 @@ test("model and thinking selections persist a coherent canonical transition", as
     session.setThinkingLevel("xhigh")
     session.setThinkingLevel("xhigh")
     expect(session.thinkingLevel).toBe("xhigh")
-    expect(session.settingsManager.get().thinkingLevel).toBe("xhigh")
+    expect(session.settingsManager.get().defaultThinkingLevel).toBe("xhigh")
     expect(
       session.sessionManager
         .entries()
@@ -148,7 +152,7 @@ test("model and thinking selections persist a coherent canonical transition", as
 
     expect(session.setThinkingLevel("low", "project")).toEqual({ scope: "project", requested: "low", effective: "low" })
     expect(session.thinkingLevel).toBe("low")
-    expect(session.settingsManager.getProject().thinkingLevel).toBe("low")
+    expect(session.settingsManager.getProject().defaultThinkingLevel).toBe("low")
   } finally {
     session.dispose()
   }
@@ -160,8 +164,8 @@ test("thinking mutations report an effective project override without false even
   const agentDir = join(root, "global")
   await mkdir(join(cwd, ".openzi"), { recursive: true })
   await mkdir(agentDir, { recursive: true })
-  await writeFile(join(agentDir, "settings.json"), JSON.stringify({ thinkingLevel: "medium" }))
-  await writeFile(join(cwd, ".openzi", "settings.json"), JSON.stringify({ thinkingLevel: "high" }))
+  await writeFile(join(agentDir, "settings.json"), JSON.stringify({ defaultThinkingLevel: "medium" }))
+  await writeFile(join(cwd, ".openzi", "settings.json"), JSON.stringify({ defaultThinkingLevel: "high" }))
   const models = createModels()
   const faux = fauxProvider({ provider: "thinking-shadow", models: [{ id: "model", reasoning: true }] })
   models.setProvider(faux.provider)
@@ -181,8 +185,8 @@ test("thinking mutations report an effective project override without false even
     const entries = session.sessionManager.entries().length
     expect(session.setThinkingLevel("low", "global")).toEqual({ scope: "global", requested: "low", effective: "high" })
     expect(session.thinkingLevel).toBe("high")
-    expect(session.settingsManager.get().thinkingLevel).toBe("high")
-    expect(session.settingsManager.getGlobal().thinkingLevel).toBe("low")
+    expect(session.settingsManager.get().defaultThinkingLevel).toBe("high")
+    expect(session.settingsManager.getGlobal().defaultThinkingLevel).toBe("low")
     expect(session.sessionManager.entries()).toHaveLength(entries)
     expect(events).toEqual([])
   } finally {
@@ -340,7 +344,7 @@ test("model change publishes every committed event when a subscriber throws", as
     model: "events/reasoning",
     models,
     persist: false,
-    settings: { thinkingLevel: "high" }
+    settings: { defaultThinkingLevel: "high" }
   })
   models.getAuth = async () => configuredAuth()
 

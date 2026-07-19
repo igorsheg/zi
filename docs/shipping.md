@@ -5,7 +5,7 @@ OpenZi has two distribution boundaries:
 - the end-user CLI ships as a native standalone executable built with the pinned Bun version;
 - embeddable packages will ship as transpiled ESM and declarations, not as executable bundles.
 
-The executable is always built on its target platform. This keeps Bun's embedded runtime, OpenTUI's native library, and its worker/WASM assets aligned with the host instead of relying on cross-compilation of optional native packages.
+The executable is always built on its target platform with the workspace-pinned Bun runtime. This keeps Bun's embedded runtime, OpenTUI's native library, and its worker/WASM assets aligned with the host instead of relying on cross-compilation of optional native packages.
 
 ## Local production build
 
@@ -34,7 +34,7 @@ openzi-0.1.0-<os>-<arch>.tar.gz
 openzi-0.1.0-<os>-<arch>.tar.gz.sha256
 ```
 
-A requested `--target` must match the current host. Release versions are restricted to SemVer core and prerelease forms so they are safe artifact names. Local and release builds share `scripts/compile-openzi.ts`, which embeds the version, disables Bun's runtime loading of project `.env`, `bunfig.toml`, and `package.json` files, and runs `openzi --version` against the compiled executable. Pi AI intentionally hides Node-only OAuth flows from generic bundlers, so this owner replaces its one opaque loader with bundler-visible literal imports for Anthropic, GitHub Copilot, and OpenAI Codex while preserving lazy loading; it fails if the pinned dependency no longer matches. A standalone regression test derives request authentication through all three implementations. The release builder then archives and checksums that executable.
+A requested `--target` must match the current host. Release versions are restricted to SemVer core and prerelease forms so they are safe artifact names. Local and release builds share `scripts/compile-openzi.ts`, which refuses to compile unless the running Bun version exactly matches the workspace `packageManager` pin, embeds the version, disables Bun's runtime loading of project `.env`, `bunfig.toml`, and `package.json` files, and runs `openzi --version` against the compiled executable. Pi AI intentionally hides Node-only OAuth flows from generic bundlers, so this owner replaces its one opaque loader with bundler-visible literal imports for Anthropic, GitHub Copilot, and OpenAI Codex while preserving lazy loading; it fails if the pinned dependency no longer matches. A standalone regression test derives request authentication through all three implementations. The release builder then archives and checksums that executable.
 
 ## GitHub delivery
 

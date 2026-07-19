@@ -1079,7 +1079,7 @@ class PromptController implements PromptStore {
     let mutation: { readonly requested: EditableSettingValue; readonly effective: EditableSettingValue }
     try {
       switch (workflow.setting) {
-        case "thinkingLevel":
+        case "defaultThinkingLevel":
           if (!isThinkingLevel(value)) return false
           mutation = workflow.session.setThinkingLevel(value, workflow.scope)
           break
@@ -1182,7 +1182,7 @@ function settingsScope(value: string): SettingsScope | undefined {
 }
 
 function editableSetting(value: string): EditableSetting | undefined {
-  return value === "thinkingLevel" ||
+  return value === "defaultThinkingLevel" ||
     value === "steeringMode" ||
     value === "followUpMode" ||
     value === "compactionEnabled"

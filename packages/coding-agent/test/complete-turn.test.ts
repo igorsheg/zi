@@ -82,7 +82,7 @@ test("one turn can write, read, edit, execute, stream, and persist", async () =>
     model: "faux/faux-1",
     models,
     sessionDir: sessions,
-    settings: { thinkingLevel: "low" }
+    settings: { defaultThinkingLevel: "low" }
   })
   const events: string[] = []
   const streamedWriteArguments: unknown[] = []

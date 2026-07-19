@@ -35,7 +35,7 @@ test("AgentSession exposes provider context usage plus its estimated trailing me
     timestamp: assistant.timestamp + 1
   })
 
-  const session = await createAgentSession({ services: bootstrap.services, sessionManager, model, tools: [] })
+  const { session } = await createAgentSession({ services: bootstrap.services, sessionManager, model, tools: [] })
   try {
     expect(session.getContextUsage()).toEqual({
       type: "estimated",
@@ -93,7 +93,7 @@ test("provider usage retained across a compaction marker is stale on restore", a
     estimatedTokensAfter: 10,
     details: { readFiles: [], modifiedFiles: [], omittedReadFiles: 0, omittedModifiedFiles: 0 }
   })
-  const session = await createAgentSession({ services: bootstrap.services, sessionManager, model, tools: [] })
+  const { session } = await createAgentSession({ services: bootstrap.services, sessionManager, model, tools: [] })
   try {
     expect(session.contextUsage).toMatchObject({ type: "estimated" })
     expect(session.contextUsage.type === "unavailable" ? 0 : session.contextUsage.tokens).toBeLessThan(100)

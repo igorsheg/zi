@@ -3,7 +3,7 @@ import { expect, test } from "bun:test"
 import { Type, type Context } from "@earendil-works/pi-ai"
 
 import { maxCompactionErrorBytes } from "../src/compaction.js"
-import { createAgentSession } from "../src/services.js"
+import { createAgentSession } from "../src/sdk.js"
 import { SessionManager } from "../src/session-manager.js"
 import {
   createModels,
@@ -300,7 +300,7 @@ test("automatic thresholds follow the newly selected model window", async () => 
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }
     }
   })
-  const session = await createAgentSession({
+  const { session } = await createAgentSession({
     services: bootstrap.services,
     sessionManager: history,
     model: small,
@@ -488,6 +488,43 @@ test("overflow failure stays durable while one compact-and-continue recovery suc
   setup.session.dispose()
 })
 
+test("a previous overflow failure is compacted before the next prompt without counting as that prompt's retry", async () => {
+  const setup = await compactionSession({ oldTextBytes: 100, contextWindow: 1_000 })
+  const sessionManager = setup.session.sessionManager
+  const model = setup.session.model
+  const overflow = sessionManager.appendMessage({
+    ...fauxAssistantMessage("", {
+      stopReason: "error",
+      errorMessage:
+        "Codex error: Your input exceeds the context window of this model. Please adjust your input and try again."
+    }),
+    provider: "compaction",
+    model: "model"
+  })
+  setup.session.dispose()
+
+  const { session } = await createAgentSession({ services: setup.services, sessionManager, model, tools: [] })
+  setup.faux.setResponses([
+    fauxAssistantMessage("overflow checkpoint"),
+    fauxAssistantMessage("", { stopReason: "error", errorMessage: "prompt is too long: 1001 tokens > 1000 maximum" }),
+    fauxAssistantMessage("retry checkpoint"),
+    fauxAssistantMessage("recovered")
+  ])
+  expect(session.model.provider).toBe("compaction")
+  expect(session.model.id).toBe("model")
+  expect(session.messages.at(-1)).toBe(overflow.message)
+  expect(session.messages.at(-1)).toMatchObject({ provider: "compaction", model: "model" })
+  await session.prompt("next input")
+
+  const markers = session.sessionManager.entries().filter(entry => entry.type === "compaction")
+  expect(markers).toHaveLength(2)
+  expect(markers[0]).toMatchObject({ reason: "overflow", excludedFailureEntryId: overflow.id })
+  expect(markers[1]).toMatchObject({ reason: "overflow" })
+  expect(session.messages.some(message => message === overflow.message)).toBe(false)
+  expect(session.messages.at(-1)).toMatchObject({ role: "assistant", content: [{ text: "recovered" }] })
+  session.dispose()
+})
+
 test("a second overflow stops without another compaction loop", async () => {
   const setup = await compactionSession({ oldTextBytes: 100, contextWindow: 1_000 })
   setup.faux.setResponses([overflowResponse(), fauxAssistantMessage("overflow checkpoint"), overflowResponse()])
@@ -526,7 +563,7 @@ async function compactionSession(
     model: "compaction/model",
     models,
     persist: false,
-    settings: { compactionReserveTokens: 100, compactionKeepRecentTokens: 1 }
+    settings: { compactionEnabled: true, compactionReserveTokens: 100, compactionKeepRecentTokens: 1 }
   })
   const model = bootstrap.session.model
   bootstrap.session.dispose()
@@ -553,8 +590,8 @@ async function compactionSession(
         : recent
     )
   }
-  const session = await createAgentSession({ services: bootstrap.services, sessionManager, model, tools: [] })
-  return { session, faux }
+  const { session } = await createAgentSession({ services: bootstrap.services, sessionManager, model, tools: [] })
+  return { session, faux, services: bootstrap.services }
 }
 
 function userTexts(context: Context): string[] {

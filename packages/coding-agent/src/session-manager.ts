@@ -86,20 +86,33 @@ export interface SessionListOptions {
   readonly limit?: number
 }
 
+export interface SessionModel {
+  readonly provider: string
+  readonly modelId: string
+}
+
+export interface SessionContext {
+  readonly messages: readonly AgentMessage[]
+  readonly model?: SessionModel
+  readonly thinkingLevel?: ThinkingLevel
+}
+
+type SessionPersistence =
+  | { readonly type: "memory" }
+  | { readonly type: "pending"; readonly file: string }
+  | { readonly type: "durable"; readonly file: string }
+
 export class SessionManager {
   readonly header: SessionHeader
-  #file: string | undefined
+  #persistence: SessionPersistence
   readonly #entries: SessionEntry[] = []
   #leafId: string | null = null
 
   private constructor(cwd: string, sessionDir: string, sessionId?: string, persist = true) {
     const id = sessionId ?? crypto.randomUUID()
     this.header = { type: "session", version: 1, id, timestamp: new Date().toISOString(), cwd }
-
-    if (!persist) return
-    mkdirSync(sessionDir, { recursive: true })
-    this.#file = join(sessionDir, `${id}.jsonl`)
-    writeFileSync(this.#file, `${JSON.stringify(this.header)}\n`, { flag: "wx" })
+    if (persist) mkdirSync(sessionDir, { recursive: true })
+    this.#persistence = persist ? { type: "pending", file: join(sessionDir, `${id}.jsonl`) } : { type: "memory" }
   }
 
   static create(paths: OpenZiPaths, options: NewSessionOptions = {}): SessionManager {
@@ -132,7 +145,7 @@ export class SessionManager {
       }
     }
     const manager = new SessionManager(resolveOpenZiPath(header.cwd), dirname(resolvedFile), header.id, false)
-    manager.#file = resolvedFile
+    manager.#persistence = { type: "durable", file: resolvedFile }
     validateJournal(entries, resolvedFile)
     manager.#entries.push(...entries)
     manager.#leafId = manager.#entries.at(-1)?.id ?? null
@@ -237,6 +250,19 @@ export class SessionManager {
     return this.#entries.flatMap(entry => (entry.type === "message" ? [entry.message] : []))
   }
 
+  buildSessionContext(): SessionContext {
+    let model: SessionContext["model"]
+    let thinkingLevel: ThinkingLevel | undefined
+    for (const entry of this.#entries) {
+      if (entry.type === "model_change") model = { provider: entry.provider, modelId: entry.modelId }
+      else if (entry.type === "thinking_level_change") thinkingLevel = entry.thinkingLevel
+      else if (entry.type === "message" && entry.message.role === "assistant") {
+        model = { provider: entry.message.provider, modelId: entry.message.model }
+      }
+    }
+    return { messages: this.activeMessages(), ...(model ? { model } : {}), ...(thinkingLevel ? { thinkingLevel } : {}) }
+  }
+
   activeEntries(): readonly SessionEntry[] {
     const markerIndex = this.#entries.findLastIndex(entry => entry.type === "compaction")
     if (markerIndex < 0) return this.#entries.filter(isContextVisibleEntry)
@@ -281,11 +307,11 @@ export class SessionManager {
   }
 
   get file(): string | undefined {
-    return this.#file
+    return this.#persistence.type === "memory" ? undefined : this.#persistence.file
   }
 
   get sessionDir(): string {
-    return this.#file ? dirname(this.#file) : ""
+    return this.#persistence.type === "memory" ? "" : dirname(this.#persistence.file)
   }
 
   #append<Entry extends SessionEntryData>(entry: Entry): SessionEntryBase & Entry {
@@ -295,11 +321,30 @@ export class SessionManager {
       parentId: this.#leafId,
       timestamp: new Date().toISOString()
     } as SessionEntryBase & Entry
-    validateNextEntry(next, this.#entries, this.#file ?? "<memory>")
-    if (this.#file) appendFileSync(this.#file, `${JSON.stringify(next)}\n`)
+    validateNextEntry(next, this.#entries, this.file ?? "<memory>")
+    this.#persist(next)
     this.#entries.push(next)
     this.#leafId = next.id
     return next
+  }
+
+  #persist(next: SessionEntry): void {
+    const persistence = this.#persistence
+    if (persistence.type === "memory") return
+    if (persistence.type === "durable") {
+      appendFileSync(persistence.file, `${JSON.stringify(next)}\n`)
+      return
+    }
+
+    if (next.type !== "message" || next.message.role !== "assistant") return
+
+    // Pi defers a new journal until the first assistant response so abandoned sessions never enter history.
+    writeFileSync(
+      persistence.file,
+      `${[this.header, ...this.#entries, next].map(entry => JSON.stringify(entry)).join("\n")}\n`,
+      { flag: "wx" }
+    )
+    this.#persistence = { type: "durable", file: persistence.file }
   }
 }
 

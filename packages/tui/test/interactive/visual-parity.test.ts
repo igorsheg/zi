@@ -23,13 +23,13 @@ test("representative session keeps the accepted visual hierarchy at normal and c
     model: "faux/faux-1",
     models,
     persist: false,
-    settings: { thinkingLevel: "high" }
+    settings: { defaultThinkingLevel: "high" }
   })
   const model = bootstrap.session.model
   bootstrap.session.dispose()
   const sessionManager = SessionManager.inMemory("/workspace/openzi")
   for (const message of representativeMessages()) sessionManager.appendMessage(message)
-  const session = await createAgentSession({ services: bootstrap.services, sessionManager, model, tools: [] })
+  const { session } = await createAgentSession({ services: bootstrap.services, sessionManager, model, tools: [] })
   const setup = await createInteractiveTest(session, { width: 80, height: 30 })
 
   try {
@@ -116,7 +116,12 @@ test("composer distinguishes estimated context after compaction", async () => {
   history.appendMessage(fauxAssistantMessage("old answer"))
   history.appendMessage({ role: "user", content: "recent", timestamp: 3 })
   history.appendMessage(fauxAssistantMessage("recent answer"))
-  const session = await createAgentSession({ services: bootstrap.services, sessionManager: history, model, tools: [] })
+  const { session } = await createAgentSession({
+    services: bootstrap.services,
+    sessionManager: history,
+    model,
+    tools: []
+  })
   faux.setResponses([fauxAssistantMessage("checkpoint")])
   await session.compact()
   const setup = await createInteractiveTest(session, { width: 80, height: 6 })

@@ -15,7 +15,7 @@ import {
   fauxProvider
 } from "../src/testing.js"
 
-test("session runtime lists once, creates a new session, and disposes the replaced session", async () => {
+test("session runtime omits a new unprompted session and disposes the replaced session", async () => {
   const root = await mkdtemp(join(tmpdir(), "openzi-session-runtime-new-"))
   const models = createModels()
   const faux = fauxProvider({ provider: "runtime-new", models: [{ id: "model" }] })
@@ -28,6 +28,7 @@ test("session runtime lists once, creates a new session, and disposes the replac
   })
   const previous = runtime.session
   previous.sessionManager.appendMessage({ role: "user", content: "first task", timestamp: 1 })
+  previous.sessionManager.appendMessage(fauxAssistantMessage("first answer"))
 
   try {
     const firstList = runtime.listSessions()
@@ -40,8 +41,11 @@ test("session runtime lists once, creates a new session, and disposes the replac
     expect(runtime.session).toBe(next.session)
     expect(next.services.paths.cwd).toBe(previous.sessionManager.header.cwd)
     expect(next.session.sessionManager.sessionId).not.toBe(previous.sessionManager.sessionId)
+    expect(existsSync(next.session.sessionManager.file!)).toBe(false)
     expect(() => previous.prompt("disposed")).toThrow("AgentSession is disposed")
-    expect((await runtime.listSessions()).sessions).toHaveLength(2)
+    expect((await runtime.listSessions()).sessions.map(session => session.id)).toEqual([
+      previous.sessionManager.sessionId
+    ])
   } finally {
     runtime.dispose()
     await runtime.waitForIdle()
@@ -79,6 +83,8 @@ test("session catalogs stay globally serialized and restart for a replaced runti
     const stale = runtime.listSessions()
     await firstStarted.promise
     const next = await runtime.newSession()
+    next.session.sessionManager.appendMessage({ role: "user", content: "next task", timestamp: 1 })
+    next.session.sessionManager.appendMessage(fauxAssistantMessage("next answer"))
     const current = runtime.listSessions()
     await Bun.sleep(0)
     expect(calls).toBe(1)
@@ -113,6 +119,8 @@ test("session catalog browsing remains read-only while a provider run is active"
     model: "runtime-list-active/model",
     models
   })
+  runtime.session.sessionManager.appendMessage({ role: "user", content: "saved task", timestamp: 1 })
+  runtime.session.sessionManager.appendMessage(fauxAssistantMessage("saved answer"))
   const run = runtime.session.prompt("active task")
 
   try {
@@ -142,6 +150,7 @@ test("session runtime rebuilds every cwd-bound service from the resumed header",
     models
   })
   target.session.sessionManager.appendMessage({ role: "user", content: "resumed task", timestamp: 1 })
+  target.session.sessionManager.appendMessage(fauxAssistantMessage("resumed answer"))
   const targetFile = target.session.sessionManager.file!
   target.session.dispose()
   await target.session.waitForIdle()

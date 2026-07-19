@@ -122,7 +122,7 @@ test("thinking values come from the model and persist through AgentSession", asy
     await renderSettled(setup)
 
     expect(session.thinkingLevel).toBe("low")
-    expect(session.settingsManager.getProject().thinkingLevel).toBe("low")
+    expect(session.settingsManager.getProject().defaultThinkingLevel).toBe("low")
     expect(prompt.plainText).toBe("")
     expect(setup.captureCharFrame()).toContain("Thinking level: low (project)")
     expect(setup.captureCharFrame()).not.toContain("Settings · Project")

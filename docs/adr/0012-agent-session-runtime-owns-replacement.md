@@ -12,7 +12,7 @@ Pi separates the same responsibilities in `core/agent-session.ts`, `core/session
 
 ## Decision
 
-`AgentRuntime` remains the immutable SDK value for one session and its cwd-bound services. The new `AgentSessionRuntime` is a narrow coding-agent owner used only when a client needs `/new` or `/resume`. It retains the original runtime construction policy, exposes the current `AgentSession` and services, and recreates a complete `AgentRuntime` for every replacement.
+`AgentRuntime` remains the immutable SDK value for one session, its cwd-bound services, and any bootstrap diagnostic. The new `AgentSessionRuntime` is a narrow coding-agent owner used only when a client needs `/new` or `/resume`. It retains the original runtime construction policy, exposes the current `AgentSession`, services, and bootstrap diagnostic, and recreates a complete `AgentRuntime` for every replacement.
 
 Its replacement state is explicit:
 
@@ -40,7 +40,7 @@ The runtime owns disposal of replaced and final sessions. Interactive mode may r
 
 The TUI opens the picker before starting catalog I/O, loads only on demand, and rejects completion from a replaced session. Browsing is read-only and remains available during a provider run; selection still passes through runtime replacement admission. The current session remains visibly selected and choosing it is a no-op, following Grok Build's focus-existing policy rather than rebuilding an already-open session. Escape cancellation remains in `cancelling_session` until the runtime settlement resolves, so the composer cannot advertise readiness while candidate cleanup is still active. This milestone remains current-cwd only: Pi's all-project scope, rename/delete controls, and richer sorting, plus Grok Build's remote/content-search lanes, require separate authoritative owners and measured product pressure.
 
-Strict resume and continue-recent remain distinct intents. Resume must open an existing journal. Continue-recent may create a new persistent journal when the current cwd has no saved session. A malformed unterminated final JSONL append is treated as a torn tail by both full loading and catalog preview; malformed completed records still invalidate the journal.
+Strict resume and continue-recent remain distinct intents. Resume must open an existing journal. Continue-recent may prepare a new persisted session when the current cwd has no saved session. Bootstrap precedence and the pending-to-durable journal transition are defined in ADR 0016. Unprompted and response-less sessions never enter the catalog. A malformed unterminated final JSONL append is treated as a torn tail by both full loading and catalog preview; malformed completed records still invalidate the journal.
 
 ## Consequences
 

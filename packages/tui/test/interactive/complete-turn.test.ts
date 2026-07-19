@@ -14,7 +14,7 @@ import {
   fauxToolCall
 } from "@openzi/coding-agent/testing"
 
-import { createInteractiveTest } from "./harness.js"
+import { createInteractiveTest, renderMarkdownSettled } from "./harness.js"
 
 test("the OpenTUI prompt drives a complete tool turn", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "openzi-tui-turn-"))
@@ -43,7 +43,7 @@ test("the OpenTUI prompt drives a complete tool turn", async () => {
     expect(setup.captureCharFrame()).toContain("Working…")
     expect(setup.renderer.liveRequestCount).toBeGreaterThan(0)
     await session.waitForIdle()
-    await setup.renderOnce()
+    await renderMarkdownSettled(setup)
     expect(setup.renderer.liveRequestCount).toBe(0)
 
     expect(await readFile(join(cwd, "answer.txt"), "utf8")).toBe("42\n")

@@ -11,7 +11,7 @@ import {
   fauxToolCall
 } from "@openzi/coding-agent/testing"
 
-import { createInteractiveTest, type InteractiveTestSetup, renderSettled } from "./harness.js"
+import { createInteractiveTest, type InteractiveTestSetup, renderMarkdownSettled, renderSettled } from "./harness.js"
 
 /* oxlint-disable no-await-in-loop */
 
@@ -398,7 +398,7 @@ test("streamed tool execution leaves a detached native viewport anchored", async
 
     releaseToolCall.resolve()
     await operation
-    await renderSettled(setup)
+    await renderMarkdownSettled(setup)
 
     expect(session.messages.some(message => message.role === "toolResult" && message.toolCallId === "nav-bash")).toBe(
       true
@@ -458,7 +458,7 @@ async function createTranscriptSession(responseCount: number): Promise<AgentSess
 
   const sessionManager = SessionManager.inMemory("/work")
   for (const message of transcriptMessages()) sessionManager.appendMessage(message)
-  return createAgentSession({ services: bootstrap.services, sessionManager, model, tools: [] })
+  return (await createAgentSession({ services: bootstrap.services, sessionManager, model, tools: [] })).session
 }
 
 function transcriptMessages(): AgentMessage[] {

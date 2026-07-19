@@ -88,6 +88,10 @@ export class PromptView {
     this.#input.focus()
   }
 
+  showWarning(message: string): void {
+    this.#store.reportFeedback({ type: "warning", message })
+  }
+
   destroy(): void {
     for (const release of this.#release.splice(0)) release()
     this.#working.destroy()

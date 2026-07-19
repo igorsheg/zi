@@ -39,7 +39,12 @@ export class PromptFeedbackView {
     } else {
       this.#text.content = truncateToCells(feedback.message, Math.max(0, width - 2))
     }
-    this.#text.fg = feedback.type === "error" ? this.#theme.text.error : this.#theme.text.muted
+    this.#text.fg =
+      feedback.type === "error"
+        ? this.#theme.text.error
+        : feedback.type === "warning"
+          ? this.#theme.text.warning
+          : this.#theme.text.muted
     return true
   }
 

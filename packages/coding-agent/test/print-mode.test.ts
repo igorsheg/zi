@@ -10,7 +10,7 @@ import {
   maxPrintPromptCount,
   runPrintMode
 } from "../src/print-mode.js"
-import { createAgentSession } from "../src/services.js"
+import { createAgentSession } from "../src/sdk.js"
 import { SessionManager } from "../src/session-manager.js"
 import {
   createModels,
@@ -704,7 +704,12 @@ async function compactionPrintSession() {
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }
     }
   })
-  const session = await createAgentSession({ services: bootstrap.services, sessionManager: history, model, tools: [] })
+  const { session } = await createAgentSession({
+    services: bootstrap.services,
+    sessionManager: history,
+    model,
+    tools: []
+  })
   return { session, faux }
 }
 

@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test"
-import { appendFile, mkdir, mkdtemp, readFile, rename, truncate, utimes, writeFile } from "node:fs/promises"
+import { existsSync } from "node:fs"
+import { appendFile, mkdir, mkdtemp, readFile, rename, rm, truncate, utimes, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join, relative, resolve } from "node:path"
 
@@ -17,6 +18,70 @@ test("session entries form one append-only branch", () => {
   expect(entries.map(entry => entry.id)).toEqual([model.id, thinking.id, message.id])
   expect(entries.map(entry => entry.parentId)).toEqual([null, model.id, thinking.id])
   expect(session.messages()).toEqual([{ role: "user", content: "hello", timestamp: 1 }])
+})
+
+test("session context derives resumable model and thinking state from the journal", () => {
+  const session = SessionManager.inMemory("/work")
+  expect(session.buildSessionContext()).toEqual({ messages: [] })
+
+  session.appendMessage({ role: "user", content: "hello", timestamp: 1 })
+  session.appendMessage({ ...assistantMessage(2), provider: "derived", model: "answer-model" })
+  session.appendThinkingLevelChange("high")
+
+  expect(session.buildSessionContext()).toEqual({
+    messages: [
+      { role: "user", content: "hello", timestamp: 1 },
+      { ...assistantMessage(2), provider: "derived", model: "answer-model" }
+    ],
+    model: { provider: "derived", modelId: "answer-model" },
+    thinkingLevel: "high"
+  })
+})
+
+test("new persisted sessions wait for the first assistant response before creating a journal", async () => {
+  const root = await mkdtemp(join(tmpdir(), "openzi-session-lazy-"))
+  const paths = new OpenZiPaths(join(root, "project"), join(root, "global"))
+  const session = SessionManager.create(paths)
+  const file = session.file!
+
+  session.appendModelChange("anthropic", "claude")
+  session.appendThinkingLevelChange("medium")
+  expect(existsSync(file)).toBe(false)
+
+  session.appendMessage({ role: "user", content: "hello", timestamp: 1 })
+  expect(existsSync(file)).toBe(false)
+
+  session.appendMessage({
+    role: "assistant",
+    content: [],
+    api: "test",
+    provider: "test",
+    model: "test",
+    usage: emptyUsage(),
+    stopReason: "stop",
+    timestamp: 2
+  })
+
+  expect(existsSync(file)).toBe(true)
+  expect(SessionManager.open(file).entries()).toEqual(session.entries())
+})
+
+test("a failed first journal write leaves pending entries retryable", async () => {
+  const root = await mkdtemp(join(tmpdir(), "openzi-session-lazy-failure-"))
+  const paths = new OpenZiPaths(join(root, "project"), join(root, "global"))
+  const session = SessionManager.create(paths)
+  const file = session.file!
+  session.appendModelChange("anthropic", "claude")
+  session.appendMessage({ role: "user", content: "hello", timestamp: 1 })
+  const before = [...session.entries()]
+  await mkdir(file, { recursive: true })
+
+  expect(() => session.appendMessage(assistantMessage(2))).toThrow()
+  expect(session.entries()).toEqual(before)
+
+  await rm(file, { recursive: true })
+  session.appendMessage(assistantMessage(2))
+  expect(SessionManager.open(file).entries()).toEqual(session.entries())
 })
 
 test("compaction markers project one latest summary and an exact retained tail", () => {
@@ -71,7 +136,8 @@ test("persisted compaction markers restore the same active projection", async ()
   const paths = new OpenZiPaths(join(root, "project"), join(root, "global"))
   const session = SessionManager.create(paths)
   session.appendMessage({ role: "user", content: "old", timestamp: 1 })
-  const kept = session.appendMessage({ role: "user", content: "kept", timestamp: 2 })
+  session.appendMessage(assistantMessage(2))
+  const kept = session.appendMessage({ role: "user", content: "kept", timestamp: 3 })
   session.appendCompaction({
     reason: "manual",
     summary: "restored summary",
@@ -83,7 +149,7 @@ test("persisted compaction markers restore the same active projection", async ()
 
   const restored = SessionManager.open(session.file!)
   expect(restored.activeMessages()).toEqual(session.activeMessages())
-  expect(restored.entries()).toHaveLength(3)
+  expect(restored.entries()).toHaveLength(4)
 })
 
 test("overflow failures remain durable but are omitted from active context", () => {
@@ -118,11 +184,12 @@ test("opening rejects completed compaction markers with invalid semantic referen
   const root = await mkdtemp(join(tmpdir(), "openzi-session-invalid-compaction-"))
   const paths = new OpenZiPaths(join(root, "project"), join(root, "global"))
   const session = SessionManager.create(paths)
-  const kept = session.appendMessage({ role: "user", content: "kept", timestamp: 1 })
+  session.appendMessage({ role: "user", content: "kept", timestamp: 1 })
+  const assistant = session.appendMessage(assistantMessage(2))
   const invalid = {
     type: "compaction",
     id: "invalid-marker",
-    parentId: kept.id,
+    parentId: assistant.id,
     timestamp: new Date().toISOString(),
     reason: "manual",
     summary: "summary",
@@ -140,8 +207,9 @@ test("compaction append failure leaves the in-memory leaf unchanged", async () =
   const root = await mkdtemp(join(tmpdir(), "openzi-session-append-failure-"))
   const paths = new OpenZiPaths(join(root, "project"), join(root, "global"))
   const session = SessionManager.create(paths)
-  const first = session.appendMessage({ role: "user", content: "old", timestamp: 1 })
+  session.appendMessage({ role: "user", content: "old", timestamp: 1 })
   const kept = session.appendMessage({ role: "user", content: "kept", timestamp: 2 })
+  session.appendMessage(assistantMessage(3))
   const before = [...session.entries()]
   const file = session.file!
   await rename(file, `${file}.saved`)
@@ -158,7 +226,6 @@ test("compaction append failure leaves the in-memory leaf unchanged", async () =
     })
   ).toThrow()
   expect(session.entries()).toEqual(before)
-  expect(session.entries().at(-1)?.parentId).toBe(first.id)
 })
 
 test("persisted and explicitly opened session paths are canonical", async () => {
@@ -167,6 +234,8 @@ test("persisted and explicitly opened session paths are canonical", async () => 
   const created = SessionManager.create(paths)
   const file = created.file
   if (!file) throw new Error("Session file was not created")
+  created.appendMessage({ role: "user", content: "persist", timestamp: 1 })
+  created.appendMessage(assistantMessage(2))
 
   const opened = SessionManager.open(relative(process.cwd(), file))
 
@@ -180,10 +249,14 @@ test("session listing reads only bounded recent metadata and isolates invalid jo
   const paths = new OpenZiPaths(join(root, "project"), join(root, "global"))
   const first = SessionManager.create(paths, { sessionId: "first" })
   first.appendMessage({ role: "user", content: "  first\n  task  ", timestamp: 1 })
+  first.appendMessage(assistantMessage(2))
   const second = SessionManager.create(paths, { sessionId: "second" })
   second.appendMessage({ role: "user", content: "x".repeat(maxSessionFirstMessageLength + 20), timestamp: 2 })
+  second.appendMessage(assistantMessage(3))
   const otherPaths = new OpenZiPaths(join(root, "other-project"), join(root, "global"), paths.sessionDir)
-  SessionManager.create(otherPaths, { sessionId: "other-project" })
+  const other = SessionManager.create(otherPaths, { sessionId: "other-project" })
+  other.appendMessage({ role: "user", content: "other", timestamp: 1 })
+  other.appendMessage(assistantMessage(2))
   const invalid = join(paths.sessionDir, "invalid.jsonl")
   await writeFile(invalid, "not json\n")
   await utimes(first.file!, new Date(1_000), new Date(1_000))
@@ -207,10 +280,11 @@ test("continue recent opens the newest valid session or creates the first one", 
   const created = await SessionManager.continueRecent(paths)
   expect(created.file).toBeDefined()
   created.appendMessage({ role: "user", content: "continue me", timestamp: 1 })
+  created.appendMessage(assistantMessage(2))
 
   const continued = await SessionManager.continueRecent(paths)
   expect(continued.sessionId).toBe(created.sessionId)
-  expect(continued.messages()).toEqual([{ role: "user", content: "continue me", timestamp: 1 }])
+  expect(continued.messages()).toEqual([{ role: "user", content: "continue me", timestamp: 1 }, assistantMessage(2)])
 })
 
 test("opening a session ignores only a malformed unterminated tail", async () => {
@@ -219,11 +293,17 @@ test("opening a session ignores only a malformed unterminated tail", async () =>
   const created = SessionManager.create(paths)
   const file = created.file!
   created.appendMessage({ role: "user", content: "kept", timestamp: 1 })
+  created.appendMessage(assistantMessage(2))
   await appendFile(file, '{"type":"message","id":"torn"')
 
-  expect(SessionManager.open(file).messages()).toEqual([{ role: "user", content: "kept", timestamp: 1 }])
+  expect(SessionManager.open(file).messages()).toEqual([
+    { role: "user", content: "kept", timestamp: 1 },
+    assistantMessage(2)
+  ])
 
   const tornOnly = SessionManager.create(paths, { sessionId: "torn-only" })
+  tornOnly.appendMessage({ role: "user", content: "kept", timestamp: 1 })
+  tornOnly.appendMessage(assistantMessage(2))
   await appendFile(tornOnly.file!, '{"type":"message","id":"torn"')
   expect((await SessionManager.list(paths)).sessions.map(session => session.id)).toContain("torn-only")
 
@@ -237,11 +317,26 @@ test("oversized session journals are refused before parsing", async () => {
   const paths = new OpenZiPaths(join(root, "project"), join(root, "global"))
   const created = SessionManager.create(paths)
   const file = created.file!
+  created.appendMessage({ role: "user", content: "persist", timestamp: 1 })
+  created.appendMessage(assistantMessage(2))
   await truncate(file, maxSessionFileBytes + 1)
 
   expect(() => SessionManager.open(file)).toThrow(`Session file cannot exceed ${maxSessionFileBytes} bytes`)
   expect(await SessionManager.list(paths)).toMatchObject({ sessions: [], invalid: 1 })
 })
+
+function assistantMessage(timestamp: number) {
+  return {
+    role: "assistant" as const,
+    content: [],
+    api: "test",
+    provider: "test",
+    model: "test",
+    usage: emptyUsage(),
+    stopReason: "stop" as const,
+    timestamp
+  }
+}
 
 function emptyUsage() {
   return {

@@ -1,13 +1,14 @@
+import type { ThinkingLevel } from "@earendil-works/pi-agent-core"
 import type { CredentialStore, Models } from "@earendil-works/pi-ai"
 import { builtinModels } from "@earendil-works/pi-ai/providers/all"
 
 import type { AgentSession } from "./agent-session.js"
 import { FileCredentialStore } from "./credential-store.js"
 import { ModelRegistry } from "./model-registry.js"
-import { resolveInitialModel } from "./model-resolver.js"
+import { resolveRequestedModel } from "./model-resolver.js"
 import { getAgentDir, OpenZiPaths } from "./paths.js"
 import { ResourceLoader } from "./resource-loader.js"
-import { createAgentSession, type AgentSessionServices } from "./services.js"
+import { createAgentSession, type AgentSessionServices, type SessionBootstrapDiagnostic } from "./sdk.js"
 import { SessionManager } from "./session-manager.js"
 import { SessionShell } from "./session-shell.js"
 import { SettingsManager, type AgentSettings } from "./settings-manager.js"
@@ -18,12 +19,14 @@ export type AgentRuntimeServices = AgentSessionServices
 export interface AgentRuntime {
   readonly session: AgentSession
   readonly services: AgentRuntimeServices
+  readonly bootstrapDiagnostic: SessionBootstrapDiagnostic | undefined
 }
 
 export interface CreateAgentRuntimeOptions {
   readonly cwd: string
   readonly model?: string
   readonly apiKey?: string
+  readonly thinkingLevel?: ThinkingLevel
   readonly modelFactory?: (credentials: CredentialStore) => Models
   readonly agentDir?: string
   readonly sessionDir?: string
@@ -49,18 +52,7 @@ export async function createAgentRuntime(options: CreateAgentRuntimeOptions): Pr
   const cwd = resumed?.header.cwd ?? options.cwd
   const sessionDir = options.sessionDir ?? resumed?.sessionDir
   const paths = new OpenZiPaths(cwd, agentDir, sessionDir)
-  const savedModel = resumed?.entries().findLast(entry => entry.type === "model_change")
-  const savedThinking = resumed?.entries().findLast(entry => entry.type === "thinking_level_change")
-  const runtimeSettings: Partial<AgentSettings> = { ...options.settings }
-  if (savedModel && runtimeSettings.model === undefined) {
-    runtimeSettings.model = `${savedModel.provider}/${savedModel.modelId}`
-  }
-  if (savedThinking && runtimeSettings.thinkingLevel === undefined) {
-    runtimeSettings.thinkingLevel = savedThinking.thinkingLevel
-  }
-  if (options.model !== undefined) runtimeSettings.model = options.model
-
-  const settingsManager = SettingsManager.create(paths, runtimeSettings)
+  const settingsManager = SettingsManager.create(paths, options.settings ?? {})
   const credentialStore = new FileCredentialStore(paths)
   const models = options.modelFactory?.(credentialStore) ?? builtinModels({ credentials: credentialStore })
   const modelRegistry = new ModelRegistry(models)
@@ -72,29 +64,34 @@ export async function createAgentRuntime(options: CreateAgentRuntimeOptions): Pr
     modelRegistry,
     resourceLoader
   })
-  const modelReference = settingsManager.get().model
   if (options.apiKey !== undefined && options.apiKey.length === 0) {
     throw new Error("--api-key requires a non-empty value")
   }
-  if (options.apiKey !== undefined && modelReference === undefined) {
-    throw new Error("--api-key requires a model so its provider can be determined")
-  }
-  const model = await resolveInitialModel(
-    modelRegistry,
-    modelReference,
-    options.model !== undefined || options.settings?.model !== undefined || options.apiKey !== undefined,
-    options.apiKey !== undefined
-  )
+  const model = options.model
+    ? resolveRequestedModel(modelRegistry, options.model)
+    : options.apiKey
+      ? resolveSettingsModel(modelRegistry, settingsManager)
+      : undefined
   const sessionManager =
     resumed ?? SessionManager.create(paths, options.persist === undefined ? {} : { persist: options.persist })
   const shell = new SessionShell({ cwd: paths.cwd, sessionId: sessionManager.sessionId })
-  const session = await createAgentSession({
+  const created = await createAgentSession({
     services,
     sessionManager,
     shell,
     ...(model ? { model } : {}),
+    ...(options.thinkingLevel ? { thinkingLevel: options.thinkingLevel } : {}),
     ...(options.apiKey ? { apiKey: options.apiKey } : {}),
     tools: createCodingTools({ cwd: paths.cwd, shell })
   })
-  return Object.freeze({ session, services })
+  return Object.freeze({ session: created.session, services, bootstrapDiagnostic: created.bootstrapDiagnostic })
+}
+
+function resolveSettingsModel(registry: ModelRegistry, settings: SettingsManager) {
+  const provider = settings.getDefaultProvider()
+  const modelId = settings.getDefaultModel()
+  if (!provider || !modelId) throw new Error("--api-key requires a model so its provider can be determined")
+  const model = registry.get(provider, modelId)
+  if (!model) throw new Error(`Unknown model: ${provider}/${modelId}. Use provider/model-id.`)
+  return model
 }

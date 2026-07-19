@@ -123,7 +123,7 @@ test("caller-supplied services keep a low-level session in memory", async () => 
     modelRegistry: new ModelRegistry(models),
     resourceLoader: new ResourceLoader({ paths })
   })
-  const session = await createAgentSession({
+  const { session } = await createAgentSession({
     services,
     sessionManager: SessionManager.inMemory(cwd),
     model: faux.getModel(),

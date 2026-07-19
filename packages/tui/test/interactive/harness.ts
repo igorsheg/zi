@@ -1,3 +1,4 @@
+import { CodeRenderable } from "@opentui/core"
 import { createTestRenderer, type TestRendererOptions, type TestRendererSetup } from "@opentui/core/testing"
 import type { AgentSession, AgentSessionRuntime } from "@openzi/coding-agent"
 
@@ -50,4 +51,27 @@ export function createInteractiveRuntimeTest(
 export async function renderSettled(setup: TestRendererSetup): Promise<void> {
   await setup.flush()
   await setup.flush()
+}
+
+export async function renderMarkdownSettled(setup: TestRendererSetup): Promise<void> {
+  for (let attempt = 0; attempt < 20; attempt++) {
+    // Highlight settlement is sequential across renderer frames.
+    // oxlint-disable-next-line no-await-in-loop
+    await setup.renderOnce()
+    const stack = [...setup.renderer.root.getChildren()]
+    const pending: CodeRenderable[] = []
+    while (stack.length > 0) {
+      const child = stack.pop()!
+      if (child instanceof CodeRenderable && child.isHighlighting) pending.push(child)
+      stack.push(...child.getChildren())
+    }
+    if (pending.length === 0) {
+      // oxlint-disable-next-line no-await-in-loop
+      await setup.renderOnce()
+      return
+    }
+    // oxlint-disable-next-line no-await-in-loop
+    await Promise.all(pending.map(child => child.highlightingDone))
+  }
+  throw new Error("Markdown highlighting did not settle")
 }

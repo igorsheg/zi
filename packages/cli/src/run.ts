@@ -116,6 +116,10 @@ export async function runCli(argv: readonly string[], host: CliHost): Promise<nu
       // oxlint-disable-next-line no-await-in-loop
       await host.writeStderr(`Warning: (${diagnostic.scope} settings) ${diagnostic.error.message}\n`)
     }
+    const bootstrapDiagnostic = runtime.bootstrapDiagnostic
+    if (mode !== "interactive" && bootstrapDiagnostic && bootstrapDiagnostic.type !== "no_model") {
+      await host.writeStderr(`Warning: ${bootstrapDiagnostic.message}\n`)
+    }
     if (mode === "interactive") {
       if (!sessionRuntime) throw new Error("Interactive session runtime was not created")
       await host.runInteractive(sessionRuntime, prompts)

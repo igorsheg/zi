@@ -1,5 +1,5 @@
 import { BoxRenderable, CliRenderEvents, type CliRenderer, type SyntaxStyle } from "@opentui/core"
-import type { AgentSession, AgentSessionRuntime } from "@openzi/coding-agent"
+import type { AgentSession, AgentSessionRuntime, SessionBootstrapDiagnostic } from "@openzi/coding-agent"
 
 import { createSyntaxStyle, defaultTheme, type Theme } from "../theme.js"
 import { type BrowserOpener, SystemBrowserOpener } from "./browser-opener.js"
@@ -26,6 +26,7 @@ export interface InteractiveModeOptions {
   readonly theme?: Theme
   readonly browserOpener?: BrowserOpener
   readonly diagnostics?: TuiDiagnosticFlags
+  readonly bootstrapDiagnostic?: SessionBootstrapDiagnostic
 }
 
 export class InteractiveMode {
@@ -55,7 +56,8 @@ export class InteractiveMode {
     keybindingOverrides,
     theme = defaultTheme,
     browserOpener = new SystemBrowserOpener(),
-    diagnostics = { showTimeToFirstDraw: false, showStats: false, showMemory: false }
+    diagnostics = { showTimeToFirstDraw: false, showStats: false, showMemory: false },
+    bootstrapDiagnostic
   }: InteractiveModeOptions) {
     if (sessionRuntime && sessionRuntime.session !== session) {
       throw new Error("InteractiveMode session must be the session runtime current session")
@@ -67,11 +69,11 @@ export class InteractiveMode {
           listSessions: () => sessionRuntime.listSessions(),
           startNewSession: async () => {
             const next = await sessionRuntime.newSession()
-            if (!this.#disposed) this.replaceSession(next.session)
+            if (!this.#disposed) this.replaceSession(next.session, next.bootstrapDiagnostic)
           },
           resumeSession: async path => {
             const next = await sessionRuntime.switchSession(path)
-            if (!this.#disposed) this.replaceSession(next.session)
+            if (!this.#disposed) this.replaceSession(next.session, next.bootstrapDiagnostic)
           },
           cancelReplacement: () => sessionRuntime.cancelReplacement()
         }
@@ -112,13 +114,15 @@ export class InteractiveMode {
     renderer.on(CliRenderEvents.SELECTION, this.#preservePromptFocus)
 
     this.#releaseGeneration = this.store.$generation.listen(() => this.#replaceScreen())
+    this.#showBootstrapWarning(bootstrapDiagnostic)
   }
 
-  replaceSession(session: AgentSession): void {
+  replaceSession(session: AgentSession, diagnostic?: SessionBootstrapDiagnostic): void {
     if (this.#sessionRuntime && this.#sessionRuntime.session !== session) {
       throw new Error("InteractiveMode can only bind the current session runtime session")
     }
     this.store.replaceSession(session)
+    this.#showBootstrapWarning(diagnostic)
   }
 
   get transcriptDiagnostics(): TranscriptDiagnostics {
@@ -144,6 +148,10 @@ export class InteractiveMode {
 
   #preservePromptFocus = (): void => {
     this.#screen.prompt.focus()
+  }
+
+  #showBootstrapWarning(diagnostic: SessionBootstrapDiagnostic | undefined): void {
+    if (diagnostic) this.#screen.prompt.showWarning(diagnostic.message)
   }
 
   #replaceScreen(): void {

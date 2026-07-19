@@ -13,10 +13,11 @@ import type {
 export type PromptFeedback =
   | { readonly type: "none" }
   | { readonly type: "status"; readonly message: string }
+  | { readonly type: "warning"; readonly message: string }
   | { readonly type: "error"; readonly message: string }
   | { readonly type: "auth_link"; readonly requestId: number; readonly message: string; readonly url: string }
 
-export type EditableSetting = "thinkingLevel" | "steeringMode" | "followUpMode" | "compactionEnabled"
+export type EditableSetting = "defaultThinkingLevel" | "steeringMode" | "followUpMode" | "compactionEnabled"
 export type EditableSettingValue = ThinkingLevel | QueueMode | boolean
 
 export type PromptWorkflow =

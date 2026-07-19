@@ -5,8 +5,10 @@ import { join } from "node:path"
 
 import type { CredentialStore } from "@earendil-works/pi-ai"
 
+import { OpenZiPaths } from "../src/paths.js"
 import { createAgentRuntime } from "../src/runtime.js"
-import { createModels, fauxProvider } from "../src/testing.js"
+import { SessionManager } from "../src/session-manager.js"
+import { createModels, fauxAssistantMessage, fauxProvider } from "../src/testing.js"
 
 test("a runtime without configured providers starts with an explicit unselected model", async () => {
   const root = await mkdtemp(join(tmpdir(), "openzi-onboarding-"))
@@ -76,33 +78,95 @@ test("selecting an authenticated model leaves the unselected state once and pers
 
     expect(runtime.session.modelState).toEqual({ type: "selected", model: faux.getModel() })
     expect(runtime.session.sessionManager.entries().filter(entry => entry.type === "model_change")).toHaveLength(1)
-    expect(runtime.session.settingsManager.get().model).toBe("login-required/model")
-    expect(events).toEqual(["authentication_changed", "model_changed"])
+    expect(runtime.session.settingsManager.get()).toMatchObject({
+      defaultProvider: "login-required",
+      defaultModel: "model"
+    })
+    expect(runtime.session.thinkingLevel).toBe("medium")
+    expect(runtime.session.settingsManager.getDefaultThinkingLevel()).toBe("medium")
+    expect(events).toEqual(["authentication_changed", "thinking_level_changed", "model_changed"])
   } finally {
     runtime.session.dispose()
   }
 })
 
-test("a configured model removed from the active catalog falls back to unselected startup", async () => {
+test("an unavailable settings default falls back to the first configured model", async () => {
   const root = await mkdtemp(join(tmpdir(), "openzi-onboarding-removed-"))
   const globalDir = join(root, "global")
   await mkdir(globalDir, { recursive: true })
-  await writeFile(join(globalDir, "settings.json"), JSON.stringify({ model: "removed/model" }))
+  await writeFile(
+    join(globalDir, "settings.json"),
+    JSON.stringify({ defaultProvider: "removed", defaultModel: "model" })
+  )
   const faux = fauxProvider({ provider: "available", models: [{ id: "model" }] })
-  const provider = { ...faux.provider, auth: { apiKey: { name: "Available key", resolve: async () => undefined } } }
   const runtime = await createAgentRuntime({
     cwd: join(root, "project"),
     agentDir: globalDir,
     persist: false,
     modelFactory(credentials) {
       const models = createModels({ credentials })
-      models.setProvider(provider)
+      models.setProvider(faux.provider)
       return models
     }
   })
 
   try {
-    expect(runtime.session.modelState).toEqual({ type: "unselected" })
+    expect(runtime.session.modelState).toEqual({ type: "selected", model: faux.getModel() })
+    expect(runtime.session.thinkingLevel).toBe("off")
+  } finally {
+    runtime.session.dispose()
+  }
+})
+
+test("automatic selection prefers Pi's provider default over registry order", async () => {
+  const models = createModels()
+  const faux = fauxProvider({
+    provider: "openai",
+    models: [
+      { id: "other", reasoning: false },
+      { id: "gpt-5.5", reasoning: true }
+    ]
+  })
+  models.setProvider(faux.provider)
+  const preferred = faux.getModel("gpt-5.5")
+  if (!preferred) throw new Error("Preferred model not found")
+  const runtime = await createAgentRuntime({ cwd: "/work", persist: false, modelFactory: () => models })
+
+  try {
+    expect(runtime.session.model).toBe(preferred)
+  } finally {
+    runtime.session.dispose()
+  }
+})
+
+test("resume warns when its saved model is unavailable and names the configured fallback", async () => {
+  const root = await mkdtemp(join(tmpdir(), "openzi-onboarding-fallback-"))
+  const journal = SessionManager.create(new OpenZiPaths(join(root, "project"), join(root, "global")))
+  journal.appendMessage({ role: "user", content: "saved prompt", timestamp: 1 })
+  journal.appendMessage({ ...fauxAssistantMessage("saved response"), provider: "removed", model: "old-model" })
+  const sessionFile = journal.file
+  if (!sessionFile) throw new Error("Session file was not created")
+
+  const faux = fauxProvider({ provider: "available", models: [{ id: "fallback-model" }] })
+  const runtime = await createAgentRuntime({
+    cwd: join(root, "ignored"),
+    agentDir: join(root, "global"),
+    sessionFile,
+    modelFactory() {
+      const models = createModels()
+      models.setProvider(faux.provider)
+      return models
+    }
+  })
+
+  try {
+    expect(runtime.session.modelState).toEqual({ type: "selected", model: faux.getModel() })
+    expect(runtime.bootstrapDiagnostic).toEqual({
+      type: "model_fallback",
+      savedModel: { provider: "removed", modelId: "old-model" },
+      fallbackModel: { provider: "available", modelId: "fallback-model" },
+      message: "Could not restore model removed/old-model. Using available/fallback-model."
+    })
   } finally {
     runtime.session.dispose()
   }
@@ -117,6 +181,7 @@ test("resuming a session whose model is no longer authenticated preserves histor
     JSON.stringify({ "login-required": { type: "api_key", key: "configured" } })
   )
   const faux = fauxProvider({ provider: "login-required", models: [{ id: "model" }] })
+  faux.setResponses([fauxAssistantMessage("saved response")])
   const provider = {
     ...faux.provider,
     auth: {
@@ -140,6 +205,7 @@ test("resuming a session whose model is no longer authenticated preserves histor
   })
   const sessionFile = created.session.sessionManager.file
   if (!sessionFile) throw new Error("Session file was not created")
+  await created.session.prompt("saved prompt")
   await created.services.credentialStore.delete("login-required")
   created.session.dispose()
 
@@ -152,6 +218,11 @@ test("resuming a session whose model is no longer authenticated preserves histor
 
   try {
     expect(resumed.session.modelState).toEqual({ type: "unselected" })
+    expect(resumed.bootstrapDiagnostic).toEqual({
+      type: "resumed_model_unavailable",
+      savedModel: { provider: "login-required", modelId: "model" },
+      message: "Could not restore model login-required/model. No configured models are available."
+    })
     expect(resumed.session.sessionManager.entries().filter(entry => entry.type === "model_change")).toHaveLength(1)
   } finally {
     resumed.session.dispose()

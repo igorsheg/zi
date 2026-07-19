@@ -1,5 +1,5 @@
 import { CliRenderEvents, createCliRenderer, DebugOverlayCorner, type CliRenderer } from "@opentui/core"
-import type { AgentSession, AgentSessionRuntime } from "@openzi/coding-agent"
+import type { AgentSession, AgentSessionRuntime, SessionBootstrapDiagnostic } from "@openzi/coding-agent"
 
 import { defaultTheme } from "../theme.js"
 import type { TuiDiagnosticFlags } from "./diagnostics.js"
@@ -11,6 +11,7 @@ export interface RunTuiOptions {
   readonly sessionRuntime?: AgentSessionRuntime
   readonly initialMessages?: readonly string[]
   readonly keybindingOverrides?: InteractiveKeybindingOverrides
+  readonly bootstrapDiagnostic?: SessionBootstrapDiagnostic
 }
 
 type CloseReason = "interactive" | "renderer" | "startup" | NodeJS.Signals
@@ -93,12 +94,14 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
 
   try {
     renderer.setTerminalTitle("openzi")
+    const bootstrapDiagnostic = sessionRuntime?.bootstrapDiagnostic ?? options.bootstrapDiagnostic
     mode = new InteractiveMode({
       renderer,
       session,
       ...(sessionRuntime ? { sessionRuntime } : {}),
       onExit: () => void requestClose("interactive"),
       diagnostics,
+      ...(bootstrapDiagnostic ? { bootstrapDiagnostic } : {}),
       ...(keybindingOverrides ? { keybindingOverrides } : {})
     })
     // Initial prompts share the interactive transcript and run after terminal ownership is established.

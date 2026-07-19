@@ -1,4 +1,4 @@
-import { mkdir } from "node:fs/promises"
+import { mkdir, readFile } from "node:fs/promises"
 import { dirname, resolve } from "node:path"
 
 export interface CompileOpenZiOptions {
@@ -33,6 +33,13 @@ export async function compileStandalone(
   outfile: string,
   define: Readonly<Record<string, string>> = {}
 ): Promise<void> {
+  const packageJson: unknown = JSON.parse(await readFile(resolve(import.meta.dirname, "../package.json"), "utf8"))
+  const packageManager =
+    typeof packageJson === "object" && packageJson !== null && "packageManager" in packageJson
+      ? packageJson.packageManager
+      : undefined
+  assertPinnedBunVersion(Bun.version, packageManager)
+
   let oauthLoaderRewrites = 0
   await mkdir(dirname(outfile), { recursive: true })
   await Bun.build({
@@ -42,7 +49,7 @@ export async function compileStandalone(
     minify: { syntax: true, whitespace: true, identifiers: false },
     packages: "bundle",
     conditions: ["bun", "node"],
-    define: { ...define, "process.env.OPENZI_STANDALONE": JSON.stringify("1") },
+    define: { ...define },
     plugins: [compiledOAuthPlugin(() => oauthLoaderRewrites++)],
     compile: {
       outfile,
@@ -54,6 +61,17 @@ export async function compileStandalone(
   })
   if (oauthLoaderRewrites !== 1) {
     throw new Error(`Expected to replace one Pi AI OAuth loader, replaced ${oauthLoaderRewrites}`)
+  }
+}
+
+export function assertPinnedBunVersion(actual: string, packageManager: unknown): void {
+  const match = typeof packageManager === "string" ? /^bun@(\d+\.\d+\.\d+)$/.exec(packageManager) : null
+  if (!match) throw new Error("OpenZi packageManager must pin Bun exactly")
+  const expected = match[1]!
+  if (actual !== expected) {
+    throw new Error(
+      `OpenZi builds require Bun ${expected}; running ${actual}. Update Bun before building the standalone executable.`
+    )
   }
 }
 

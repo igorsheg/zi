@@ -6,7 +6,6 @@ import {
   type Renderable,
   StyledText,
   type SyntaxStyle,
-  type TreeSitterClient,
   TextAttributes,
   TextRenderable,
   type RenderContext
@@ -17,7 +16,7 @@ import type { Theme } from "../../theme.js"
 import type { ActiveTool } from "../interactive-store.js"
 import { ToolCallView, type ToolViewFrame } from "./tool-view.js"
 
-// OpenTUI 0.4.3 drops the trailing block when streaming is false; pinned OpenCode also keeps it enabled.
+// OpenTUI 0.4.5 drops Markdown blocks from the immediate frame when streaming is false.
 const markdownStreamingWorkaround = true
 const renderMarkdownNode: NonNullable<MarkdownOptions["renderNode"]> = (token, context) => {
   if (token.type !== "heading") return null
@@ -41,7 +40,6 @@ export interface MessageRenderOptions {
   readonly syntaxStyle: SyntaxStyle
   readonly toolCall?: ToolCallPresentation
   readonly cwd?: string
-  readonly treeSitterClient?: TreeSitterClient
 }
 
 export interface ToolCallPresentation {
@@ -58,15 +56,7 @@ export function createMessageView(
     case "user":
       return createUserMessage(ctx, textContent(message.content), options.theme)
     case "assistant":
-      return new StreamingAssistantView(
-        ctx,
-        message,
-        options.theme,
-        options.syntaxStyle,
-        undefined,
-        options.cwd,
-        options.treeSitterClient
-      ).root
+      return new StreamingAssistantView(ctx, message, options.theme, options.syntaxStyle, undefined, options.cwd).root
     case "toolResult":
       return createToolResultView(ctx, message, options.toolCall, options.theme, options.cwd ?? "")
     case "bashExecution":
@@ -137,7 +127,6 @@ export class StreamingAssistantView {
   readonly #syntaxStyle: SyntaxStyle
   readonly #toolViews: AssistantToolViewOwner | undefined
   readonly #cwd: string
-  readonly #treeSitterClient: TreeSitterClient | undefined
   readonly #parts: StreamingPartView[] = []
   #error: TextRenderable | undefined
   #errorValue: string | undefined
@@ -149,15 +138,13 @@ export class StreamingAssistantView {
     theme: Theme,
     syntaxStyle: SyntaxStyle,
     toolViews?: AssistantToolViewOwner,
-    cwd = "",
-    treeSitterClient?: TreeSitterClient
+    cwd = ""
   ) {
     this.#ctx = ctx
     this.#theme = theme
     this.#syntaxStyle = syntaxStyle
     this.#toolViews = toolViews
     this.#cwd = cwd
-    this.#treeSitterClient = treeSitterClient
     this.root = new BoxRenderable(ctx, {
       id: "streaming-assistant",
       paddingLeft: 1,
@@ -328,8 +315,7 @@ export class StreamingAssistantView {
         part.content,
         this.#theme,
         this.#syntaxStyle,
-        markdownStreamingWorkaround,
-        this.#treeSitterClient
+        markdownStreamingWorkaround
       )
       root.add(content)
       return { kind: "answer", root, content, value: part.content }
@@ -367,8 +353,7 @@ function createMarkdown(
   content: string,
   theme: Theme,
   syntaxStyle: SyntaxStyle,
-  streaming: boolean,
-  treeSitterClient?: TreeSitterClient
+  streaming: boolean
 ): MarkdownRenderable {
   return new MarkdownRenderable(ctx, {
     content,
@@ -377,7 +362,6 @@ function createMarkdown(
     bg: theme.surface.app,
     conceal: true,
     streaming,
-    ...(treeSitterClient ? { treeSitterClient } : {}),
     internalBlockMode: "top-level",
     tableOptions: { style: "grid" },
     renderNode: renderMarkdownNode

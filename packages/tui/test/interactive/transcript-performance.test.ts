@@ -11,6 +11,7 @@ import { InteractiveKeybindings } from "../../src/interactive/interactive-keybin
 import type { ActiveTool } from "../../src/interactive/interactive-store.js"
 import { TranscriptView } from "../../src/interactive/transcript/view.js"
 import { createSyntaxStyle, defaultTheme } from "../../src/theme.js"
+import { renderMarkdownSettled } from "./harness.js"
 
 interface TranscriptHarness {
   readonly setup: TestRendererSetup
@@ -112,6 +113,53 @@ test("streaming assistant and markdown roots keep identity across deltas", async
     expect(markdown.content).toBe("first and second")
     expect(markdown.streaming).toBe(true)
     expect(harness.view.diagnostics).toMatchObject({ streamingCreates: 1, streamingUpdates: 1 })
+    await renderMarkdownSettled(harness.setup)
+  } finally {
+    harness.destroy()
+  }
+})
+
+test("committing a streamed assistant keeps Markdown visible without replacing the native root", async () => {
+  const message = fauxAssistantMessage("## Done\n\nFinal **answer**.")
+  const harness = await createTranscriptHarness([], { streamingMessage: message })
+  try {
+    await harness.setup.renderOnce()
+    const root = harness.setup.renderer.root.findDescendantById("streaming-assistant")
+    if (!root) throw new Error("Streaming assistant root not found")
+    const markdown = descendant(root, MarkdownRenderable)
+
+    harness.state.messages.push(message)
+    harness.state.streamingMessage = undefined
+    harness.revision.set(1)
+    await harness.setup.renderOnce()
+
+    expect(harness.setup.renderer.root.findDescendantById("assistant-message:0")).toBe(root)
+    expect(descendant(root, MarkdownRenderable)).toBe(markdown)
+    expect(markdown.streaming).toBe(true)
+    const frame = harness.setup.captureCharFrame()
+    expect(frame).toContain("Done")
+    expect(frame).toContain("Final answer.")
+    expect(frame).not.toContain("## Done")
+    expect(frame).not.toContain("**answer**")
+    await renderMarkdownSettled(harness.setup)
+  } finally {
+    harness.destroy()
+  }
+})
+
+test("restored assistant Markdown is visible on its first frame", async () => {
+  const harness = await createTranscriptHarness([fauxAssistantMessage("## Restored\n\nFinal **answer**.")])
+  try {
+    await harness.setup.renderOnce()
+    const root = harness.setup.renderer.root.findDescendantById("assistant-message:0")
+    if (!root) throw new Error("Committed assistant root not found")
+    expect(descendant(root, MarkdownRenderable).streaming).toBe(true)
+    const frame = harness.setup.captureCharFrame()
+    expect(frame).toContain("Restored")
+    expect(frame).toContain("Final answer.")
+    expect(frame).not.toContain("## Restored")
+    expect(frame).not.toContain("**answer**")
+    await renderMarkdownSettled(harness.setup)
   } finally {
     harness.destroy()
   }

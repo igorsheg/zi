@@ -18,22 +18,30 @@ test("/resume loads a bounded current-project catalog and replaces the whole ses
   const root = await mkdtemp(join(tmpdir(), "openzi-resume-picker-"))
   const cwd = join(root, "project")
   const agentDir = join(root, "global")
+  const savedModels = createModels()
+  const saved = fauxProvider({ provider: "removed", models: [{ id: "old-model" }] })
+  savedModels.setProvider(saved.provider)
   const models = createModels()
   const faux = fauxProvider({ provider: "resume-picker", models: [{ id: "model" }] })
   models.setProvider(faux.provider)
 
-  const target = await createTestAgentRuntime({ cwd, agentDir, model: "resume-picker/model", models })
+  const target = await createTestAgentRuntime({ cwd, agentDir, model: "removed/old-model", models: savedModels })
   target.session.sessionManager.appendMessage({ role: "user", content: "older task", timestamp: 1 })
-  target.session.sessionManager.appendMessage(fauxAssistantMessage("older answer"))
+  target.session.sessionManager.appendMessage({
+    ...fauxAssistantMessage("older answer"),
+    provider: "removed",
+    model: "old-model"
+  })
   const targetFile = target.session.sessionManager.file!
   const targetId = target.session.sessionManager.sessionId
   target.session.dispose()
   await target.session.waitForIdle()
   await utimes(targetFile, new Date(1_000), new Date(1_000))
 
-  const runtime = await createTestAgentSessionRuntime({ cwd, agentDir, model: "resume-picker/model", models })
+  const runtime = await createTestAgentSessionRuntime({ cwd, agentDir, models })
   const previous = runtime.session
   previous.sessionManager.appendMessage({ role: "user", content: "current task", timestamp: 2 })
+  previous.sessionManager.appendMessage(fauxAssistantMessage("current answer"))
   const invalid = join(runtime.services.paths.sessionDir, "invalid.jsonl")
   await writeFile(invalid, "invalid\n")
   await utimes(invalid, new Date(500), new Date(500))
@@ -59,8 +67,15 @@ test("/resume loads a bounded current-project catalog and replaces the whole ses
     await renderSettled(setup)
 
     expect(runtime.session.sessionManager.file).toBe(targetFile)
+    expect(runtime.bootstrapDiagnostic).toEqual({
+      type: "model_fallback",
+      savedModel: { provider: "removed", modelId: "old-model" },
+      fallbackModel: { provider: "resume-picker", modelId: "model" },
+      message: "Could not restore model removed/old-model. Using resume-picker/model."
+    })
     expect(setup.mode.store.getSession()).toBe(runtime.session)
     expect(setup.captureCharFrame()).toContain("older answer")
+    expect(setup.captureCharFrame()).toContain("Could not restore model removed/old-model. Using resume-picker/model.")
     expect(promptInput(setup).focused).toBe(true)
     expect(() => previous.prompt("disposed")).toThrow("AgentSession is disposed")
   } finally {
@@ -83,6 +98,7 @@ test("/resume keeps the active session selected without rebuilding it", async ()
   })
   const current = runtime.session
   current.sessionManager.appendMessage({ role: "user", content: "keep current transcript", timestamp: 1 })
+  current.sessionManager.appendMessage(fauxAssistantMessage("kept answer"))
   const setup = await createInteractiveRuntimeTest(runtime, { width: 64, height: 14, kittyKeyboard: true })
 
   try {
@@ -123,6 +139,7 @@ test("/resume can browse during a run but refuses replacement until the session 
 
   const target = await createTestAgentRuntime({ cwd, agentDir, model: "resume-active/model", models })
   target.session.sessionManager.appendMessage({ role: "user", content: "older active target", timestamp: 1 })
+  target.session.sessionManager.appendMessage(fauxAssistantMessage("older active answer"))
   const targetFile = target.session.sessionManager.file!
   target.session.dispose()
   await target.session.waitForIdle()
@@ -170,6 +187,7 @@ test("/new replaces the active session, clears its transcript, and preserves com
   })
   const previous = runtime.session
   previous.sessionManager.appendMessage({ role: "user", content: "old transcript", timestamp: 1 })
+  previous.sessionManager.appendMessage(fauxAssistantMessage("old answer"))
   const previousId = previous.sessionManager.sessionId
   const setup = await createInteractiveRuntimeTest(runtime, { width: 64, height: 14, kittyKeyboard: true })
 

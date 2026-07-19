@@ -165,7 +165,7 @@ export function settingsFrame(session: AgentSession, scope: SettingsScope): Pick
     title: `Settings · ${scopeLabel(scope)}`,
     filter: "fuzzy",
     rows: [
-      settingRow(session, scope, "thinkingLevel", "Thinking level", scoped.thinkingLevel),
+      settingRow(session, scope, "defaultThinkingLevel", "Thinking level", scoped.defaultThinkingLevel),
       settingRow(session, scope, "steeringMode", "Steering mode", scoped.steeringMode),
       settingRow(session, scope, "followUpMode", "Follow-up mode", scoped.followUpMode),
       settingRow(session, scope, "compactionEnabled", "Automatic compaction", scoped.compactionEnabled)
@@ -178,7 +178,7 @@ export function settingValuesFrame(session: AgentSession, scope: SettingsScope, 
   const saved = scoped[setting]
   const effective = effectiveSetting(session, setting)
   const values: readonly EditableSettingValue[] =
-    setting === "thinkingLevel"
+    setting === "defaultThinkingLevel"
       ? session.getSupportedThinkingLevels()
       : setting === "compactionEnabled"
         ? [true, false]
@@ -199,7 +199,7 @@ export function settingValuesFrame(session: AgentSession, scope: SettingsScope, 
 
 export function settingLabel(setting: EditableSetting): string {
   switch (setting) {
-    case "thinkingLevel":
+    case "defaultThinkingLevel":
       return "Thinking level"
     case "steeringMode":
       return "Steering mode"
@@ -274,7 +274,7 @@ function settingRow(
 
 function effectiveSetting(session: AgentSession, setting: EditableSetting): EditableSettingValue {
   switch (setting) {
-    case "thinkingLevel":
+    case "defaultThinkingLevel":
       return session.thinkingLevel
     case "steeringMode":
       return session.steeringMode

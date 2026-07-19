@@ -6,22 +6,31 @@ import { join } from "node:path"
 import { OpenZiPaths } from "../src/paths.js"
 import { maxSettingsFileBytes, SettingsManager } from "../src/settings-manager.js"
 
-test("settings resolve global, then project, then runtime overrides", async () => {
+test("settings resolve global, then project, then construction overrides", async () => {
   const root = await mkdtemp(join(tmpdir(), "openzi-settings-"))
   const paths = new OpenZiPaths(join(root, "project"), join(root, "global"))
   await mkdir(paths.projectDir, { recursive: true })
   await mkdir(paths.globalDir, { recursive: true })
   await writeFile(
     paths.globalSettingsFile,
-    JSON.stringify({ model: "global/model", thinkingLevel: "low", steeringMode: "all" })
+    JSON.stringify({
+      defaultProvider: "global",
+      defaultModel: "model",
+      defaultThinkingLevel: "low",
+      steeringMode: "all"
+    })
   )
-  await writeFile(paths.projectSettingsFile, JSON.stringify({ model: "project/model", thinkingLevel: "high" }))
+  await writeFile(
+    paths.projectSettingsFile,
+    JSON.stringify({ defaultProvider: "project", defaultModel: "model", defaultThinkingLevel: "high" })
+  )
 
-  const settings = SettingsManager.create(paths, { thinkingLevel: "medium" })
+  const settings = SettingsManager.create(paths, { defaultThinkingLevel: "medium" })
 
   expect(settings.get()).toEqual({
-    model: "project/model",
-    thinkingLevel: "medium",
+    defaultProvider: "project",
+    defaultModel: "model",
+    defaultThinkingLevel: "medium",
     steeringMode: "all",
     followUpMode: "one-at-a-time",
     compactionEnabled: true,
@@ -63,38 +72,46 @@ test("global and project updates preserve fields owned by newer versions", async
   const paths = new OpenZiPaths(join(root, "project"), join(root, "global"))
   await mkdir(paths.projectDir, { recursive: true })
   await mkdir(paths.globalDir, { recursive: true })
-  await writeFile(paths.globalSettingsFile, JSON.stringify({ model: "old/model", future: { enabled: true } }))
-  await writeFile(paths.projectSettingsFile, JSON.stringify({ thinkingLevel: "low", futureProject: 1 }))
+  await writeFile(
+    paths.globalSettingsFile,
+    JSON.stringify({ defaultProvider: "old", defaultModel: "model", future: { enabled: true } })
+  )
+  await writeFile(paths.projectSettingsFile, JSON.stringify({ defaultThinkingLevel: "low", futureProject: 1 }))
   const settings = SettingsManager.create(paths)
 
-  settings.updateGlobal({ model: "new/model" })
-  settings.updateProject({ thinkingLevel: "high" })
+  settings.updateGlobal({ defaultProvider: "new", defaultModel: "model" })
+  settings.updateProject({ defaultThinkingLevel: "high" })
 
   expect(JSON.parse(await readFile(paths.globalSettingsFile, "utf8"))).toEqual({
-    model: "new/model",
+    defaultProvider: "new",
+    defaultModel: "model",
     future: { enabled: true }
   })
   expect(JSON.parse(await readFile(paths.projectSettingsFile, "utf8"))).toEqual({
-    thinkingLevel: "high",
+    defaultThinkingLevel: "high",
     futureProject: 1
   })
-  expect(settings.get()).toMatchObject({ model: "new/model", thinkingLevel: "high" })
+  expect(settings.get()).toMatchObject({ defaultProvider: "new", defaultModel: "model", defaultThinkingLevel: "high" })
 })
 
 test("a home-directory project does not mirror one settings file across both scopes", async () => {
   const root = await mkdtemp(join(tmpdir(), "openzi-settings-home-"))
   const paths = new OpenZiPaths(root, join(root, ".openzi"))
   await mkdir(paths.globalDir, { recursive: true })
-  await writeFile(paths.globalSettingsFile, JSON.stringify({ model: "old/model", thinkingLevel: "low" }))
+  await writeFile(
+    paths.globalSettingsFile,
+    JSON.stringify({ defaultProvider: "old", defaultModel: "model", defaultThinkingLevel: "low" })
+  )
   const settings = SettingsManager.create(paths)
 
-  settings.updateGlobal({ model: "new/model" })
-  settings.updateProject({ thinkingLevel: "high" })
+  settings.updateGlobal({ defaultProvider: "new", defaultModel: "model" })
+  settings.updateProject({ defaultThinkingLevel: "high" })
 
-  expect(settings.get()).toMatchObject({ model: "new/model", thinkingLevel: "high" })
+  expect(settings.get()).toMatchObject({ defaultProvider: "new", defaultModel: "model", defaultThinkingLevel: "high" })
   expect(JSON.parse(await readFile(paths.globalSettingsFile, "utf8"))).toEqual({
-    model: "new/model",
-    thinkingLevel: "high"
+    defaultProvider: "new",
+    defaultModel: "model",
+    defaultThinkingLevel: "high"
   })
 })
 
@@ -103,14 +120,25 @@ test("an invalid project scope reports a diagnostic without hiding valid global 
   const paths = new OpenZiPaths(join(root, "project"), join(root, "global"))
   await mkdir(paths.projectDir, { recursive: true })
   await mkdir(paths.globalDir, { recursive: true })
-  await writeFile(paths.globalSettingsFile, JSON.stringify({ model: "global/model", thinkingLevel: "low" }))
-  await writeFile(paths.projectSettingsFile, JSON.stringify({ thinkingLevel: "turbo" }))
+  await writeFile(
+    paths.globalSettingsFile,
+    JSON.stringify({ defaultProvider: "global", defaultModel: "model", defaultThinkingLevel: "low" })
+  )
+  await writeFile(paths.projectSettingsFile, JSON.stringify({ defaultThinkingLevel: "turbo" }))
 
   const settings = SettingsManager.create(paths)
 
-  expect(settings.get()).toMatchObject({ model: "global/model", thinkingLevel: "low" })
+  expect(settings.get()).toMatchObject({
+    defaultProvider: "global",
+    defaultModel: "model",
+    defaultThinkingLevel: "low"
+  })
   expect(settings.drainErrors()).toMatchObject([
-    { scope: "project", path: paths.projectSettingsFile, error: { message: expect.stringContaining("thinkingLevel") } }
+    {
+      scope: "project",
+      path: paths.projectSettingsFile,
+      error: { message: expect.stringContaining("defaultThinkingLevel") }
+    }
   ])
   expect(settings.drainErrors()).toEqual([])
 })
@@ -119,28 +147,29 @@ test("writes refuse to overwrite an invalid settings scope", async () => {
   const root = await mkdtemp(join(tmpdir(), "openzi-settings-invalid-write-"))
   const paths = new OpenZiPaths(join(root, "project"), join(root, "global"))
   await mkdir(paths.projectDir, { recursive: true })
-  const malformed = '{"thinkingLevel":"turbo"}'
+  const malformed = '{"defaultThinkingLevel":"turbo"}'
   await writeFile(paths.projectSettingsFile, malformed)
   const settings = SettingsManager.create(paths)
 
-  expect(() => settings.updateProject({ thinkingLevel: "high" })).toThrow("Cannot update invalid project settings")
+  expect(() => settings.updateProject({ defaultThinkingLevel: "high" })).toThrow(
+    "Cannot update invalid project settings"
+  )
   expect(await readFile(paths.projectSettingsFile, "utf8")).toBe(malformed)
-  expect(settings.get().thinkingLevel).toBe("medium")
+  expect(settings.get().defaultThinkingLevel).toBeUndefined()
 })
 
 test("reload recovers an invalid scope after the file is corrected", async () => {
   const root = await mkdtemp(join(tmpdir(), "openzi-settings-reload-"))
   const paths = new OpenZiPaths(join(root, "project"), join(root, "global"))
   await mkdir(paths.projectDir, { recursive: true })
-  await writeFile(paths.projectSettingsFile, '{"thinkingLevel":"turbo"}')
+  await writeFile(paths.projectSettingsFile, '{"defaultThinkingLevel":"turbo"}')
   const settings = SettingsManager.create(paths)
-  settings.drainErrors()
 
-  await writeFile(paths.projectSettingsFile, JSON.stringify({ thinkingLevel: "high" }))
+  await writeFile(paths.projectSettingsFile, JSON.stringify({ defaultThinkingLevel: "high" }))
   settings.reload()
 
-  expect(settings.get().thinkingLevel).toBe("high")
-  expect(settings.getProject()).toEqual({ thinkingLevel: "high" })
+  expect(settings.get().defaultThinkingLevel).toBe("high")
+  expect(settings.getProject()).toEqual({ defaultThinkingLevel: "high" })
   expect(settings.drainErrors()).toEqual([])
 })
 
@@ -153,7 +182,6 @@ test("oversized settings are bounded and reported without entering effective sta
   const settings = SettingsManager.create(paths)
 
   expect(settings.get()).toEqual({
-    thinkingLevel: "medium",
     steeringMode: "one-at-a-time",
     followUpMode: "one-at-a-time",
     compactionEnabled: true,
@@ -172,7 +200,7 @@ test("a settings update cannot serialize beyond the file bound", async () => {
   await writeFile(paths.globalSettingsFile, original)
   const settings = SettingsManager.create(paths)
 
-  expect(() => settings.updateGlobal({ thinkingLevel: "high" })).toThrow(`${maxSettingsFileBytes} bytes`)
+  expect(() => settings.updateGlobal({ defaultThinkingLevel: "high" })).toThrow(`${maxSettingsFileBytes} bytes`)
   expect(await readFile(paths.globalSettingsFile, "utf8")).toBe(original)
-  expect(settings.get().thinkingLevel).toBe("medium")
+  expect(settings.get().defaultThinkingLevel).toBeUndefined()
 })

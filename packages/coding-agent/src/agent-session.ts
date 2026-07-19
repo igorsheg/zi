@@ -44,6 +44,7 @@ import {
   type ContextUsage
 } from "./context-usage.js"
 import type { StoredCredential } from "./credential-store.js"
+import { DEFAULT_THINKING_LEVEL } from "./defaults.js"
 import { isOpenZiAgentMessage, type AgentMessage } from "./messages.js"
 import type { ModelRegistry } from "./model-registry.js"
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.js"
@@ -737,11 +738,18 @@ export class AgentSession {
       this.#assertIdle("change model")
       if (!configured) throw new Error(`Model ${model.provider}/${model.id} is not authenticated`)
 
-      const effectiveThinking = clampThinkingLevel(model, this.thinkingLevel)
+      const preferredThinking =
+        this.#modelState.type === "selected" && this.#modelState.model.reasoning
+          ? this.thinkingLevel
+          : (this.settingsManager.getDefaultThinkingLevel() ?? DEFAULT_THINKING_LEVEL)
+      const effectiveThinking = clampThinkingLevel(model, preferredThinking)
       const thinkingChanged = effectiveThinking !== this.thinkingLevel
       this.sessionManager.appendModelChange(model.provider, model.id)
       if (thinkingChanged) this.sessionManager.appendThinkingLevelChange(effectiveThinking)
-      this.settingsManager.updateGlobal({ model: `${model.provider}/${model.id}`, thinkingLevel: effectiveThinking })
+      this.settingsManager.setDefaultModelAndProvider(model.provider, model.id)
+      if (thinkingChanged && (model.reasoning || effectiveThinking !== "off")) {
+        this.settingsManager.setDefaultThinkingLevel(effectiveThinking)
+      }
       this.#agent.state.model = model
       this.#agent.state.thinkingLevel = effectiveThinking
       this.#modelState = { type: "selected", model }
@@ -801,10 +809,13 @@ export class AgentSession {
     assertThinkingLevel(requested)
     assertSettingsScope(scope)
     const persisted = clampThinkingLevel(this.model, requested)
-    if (scope === "global") this.settingsManager.updateGlobal({ thinkingLevel: persisted })
-    else this.settingsManager.updateProject({ thinkingLevel: persisted })
-    const effective = clampThinkingLevel(this.model, this.settingsManager.get().thinkingLevel)
-    this.settingsManager.applyRuntime({ thinkingLevel: effective })
+    if (this.model.reasoning || persisted !== "off") {
+      this.settingsManager.setDefaultThinkingLevel(persisted, scope)
+    }
+    const effective = clampThinkingLevel(
+      this.model,
+      this.settingsManager.getDefaultThinkingLevel() ?? DEFAULT_THINKING_LEVEL
+    )
     if (effective !== this.thinkingLevel) {
       this.sessionManager.appendThinkingLevelChange(effective)
       this.#agent.state.thinkingLevel = effective
@@ -933,6 +944,13 @@ export class AgentSession {
   async #compactBeforePrompt(runId: number, text: string, images: ImageContent[] | undefined): Promise<void> {
     const activity = this.#runningAgentActivity(runId)
     if (!activity || !this.settingsManager.get().compactionEnabled) return
+
+    const lastAssistant = this.#lastAssistantMessage()
+    if (lastAssistant) {
+      await this.#compactAfterAssistant(runId, lastAssistant, { retryOverflow: false, countOverflowRecovery: false })
+    }
+    if (!this.#runningAgentActivity(runId)) return
+
     const settings = this.#effectiveCompactionSettings()
     const usage = this.contextUsage
     if (!settings || usage.type === "unavailable") return
@@ -967,24 +985,45 @@ export class AgentSession {
   }
 
   async #recoverOverflow(runId: number): Promise<"none" | "recovered" | "stop"> {
+    const message = this.#lastAssistantMessage()
+    if (!message) return "none"
+    return this.#compactAfterAssistant(runId, message, { retryOverflow: true, countOverflowRecovery: true })
+  }
+
+  async #compactAfterAssistant(
+    runId: number,
+    message: AgentMessage,
+    options: { readonly retryOverflow: boolean; readonly countOverflowRecovery: boolean }
+  ): Promise<"none" | "recovered" | "stop"> {
     const activity = this.#runningAgentActivity(runId)
-    const message = this.#agent.state.messages.at(-1)
-    if (!activity || message?.role !== "assistant" || !isContextOverflow(message, this.model.contextWindow)) {
-      return "none"
-    }
+    if (!activity || message.role !== "assistant" || !this.#isSelectedModelMessage(message)) return "none"
+    if (!isContextOverflow(message, this.model.contextWindow)) return "none"
     if (!this.settingsManager.get().compactionEnabled) return "stop"
-    if (activity.overflowRecoveries === 1) {
+
+    const shouldRetry = options.retryOverflow && message.stopReason !== "stop"
+    if (shouldRetry && activity.overflowRecoveries === 1) {
       throw new Error(
         "Context still exceeds the model window after one recovery; use /compact, select a larger-context model, or start a new session."
       )
     }
-    const failureEntry = this.sessionManager
-      .entries()
-      .findLast(entry => entry.type === "message" && entry.message === message)
-    if (!failureEntry) return "stop"
 
-    const outcome = await this.#runAutomaticCompaction(runId, "overflow", failureEntry.id)
-    if (outcome !== "completed" || !this.#canContinue(runId)) return "stop"
+    const failureEntry =
+      message.stopReason === "error"
+        ? this.sessionManager.entries().findLast(entry => entry.type === "message" && entry.message === message)
+        : undefined
+    if (message.stopReason === "error" && !failureEntry) return "stop"
+
+    if (failureEntry) this.#removeRuntimeMessage(message)
+    const outcome = await this.#runAutomaticCompaction(
+      runId,
+      "overflow",
+      failureEntry?.id,
+      undefined,
+      options.countOverflowRecovery && shouldRetry
+    )
+    if (outcome !== "completed" || !this.#canContinue(runId)) return shouldRetry ? "stop" : "none"
+    if (!shouldRetry) return "none"
+
     const last = this.#agent.state.messages.at(-1)
     if (!last || (last.role !== "user" && last.role !== "toolResult")) return "stop"
     await this.#agent.continue()
@@ -995,7 +1034,8 @@ export class AgentSession {
     runId: number,
     reason: "threshold" | "overflow",
     excludedFailureEntryId?: string,
-    runSignal?: AbortSignal
+    runSignal?: AbortSignal,
+    countOverflowRecovery = reason === "overflow"
   ): Promise<"completed" | "noop" | "failed" | "cancelled"> {
     const current = this.#runningAgentActivity(runId)
     if (!current || current.autoCompactions >= 4 || (reason === "threshold" && current.thresholdSuppressed))
@@ -1018,7 +1058,7 @@ export class AgentSession {
       ...current,
       phase: { type: "compacting", operationId, reason, controller },
       autoCompactions: current.autoCompactions + 1,
-      overflowRecoveries: reason === "overflow" ? 1 : current.overflowRecoveries
+      overflowRecoveries: reason === "overflow" && countOverflowRecovery ? 1 : current.overflowRecoveries
     }
     this.#emitAll([{ type: "compaction_start", operationId, reason }])
 
@@ -1268,6 +1308,25 @@ export class AgentSession {
     // Pi can append only base provider messages; OpenZi is the sole producer of its stricter summary variant.
     // oxlint-disable-next-line typescript/no-unsafe-type-assertion
     return this.#agent.state.messages as AgentMessage[]
+  }
+
+  #lastAssistantMessage(): AgentMessage | undefined {
+    return this.#ownedMessages().findLast(message => message.role === "assistant")
+  }
+
+  #isSelectedModelMessage(message: AgentMessage): boolean {
+    return (
+      this.#modelState.type === "selected" &&
+      message.role === "assistant" &&
+      message.provider === this.#modelState.model.provider &&
+      message.model === this.#modelState.model.id
+    )
+  }
+
+  #removeRuntimeMessage(message: AgentMessage): void {
+    const messages = this.#ownedMessages()
+    const index = messages.lastIndexOf(message)
+    if (index >= 0) this.#agent.state.messages = messages.toSpliced(index, 1)
   }
 
   async #handleAgentEvent(event: AgentEvent): Promise<void> {

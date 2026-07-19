@@ -124,7 +124,7 @@ Rules:
 5. Destroying the root unregisters the lifecycle pass before destroying owned renderables.
 6. Session replacement continues to destroy the old `SessionScreen`; no lifecycle pass from the old screen may mutate the replacement.
 
-OpenTUI 0.4.3 executes its installed `requestAnimationFrame` immediately when an idle renderer is activated, so RAF admission alone does not coalesce separately delivered provider deltas. No `setTimeout`, polling loop, or independent FPS scheduler is allowed in this path. Renderer-installed RAF remains appropriate for the one-frame-later detached-scroll anchor correction.
+OpenTUI 0.4.5 executes its installed `requestAnimationFrame` immediately when an idle renderer is activated, so RAF admission alone does not coalesce separately delivered provider deltas. No `setTimeout`, polling loop, or independent FPS scheduler is allowed in this path. Renderer-installed RAF remains appropriate for the one-frame-later detached-scroll anchor correction.
 
 ## Committed messages
 
@@ -163,6 +163,8 @@ Its `update(message)` operation:
 - rebuilds only the suffix beginning at the first part whose visible kind changed;
 - updates or removes the error row independently;
 - never reconstructs the root merely because text grew.
+
+Promoted and restored committed messages also retain streaming presentation because OpenTUI 0.4.5 otherwise drops Markdown blocks from the immediate frame. Revisit finalization only when it preserves first-frame content and native identity.
 
 Tool-call parts create keyed `ToolCallView` children at their source positions. The same child receives partial parsed arguments, ready/running state, partial output, and the committed tool result. A streaming assistant root is promoted only at the message index where that stream began, preventing a coalesced later stream from being attached to an earlier committed assistant message.
 
@@ -348,7 +350,7 @@ Inline picker state alone does not justify a modal stack because the composer re
 
 When triggered:
 
-- add `@opentui/keymap` `0.4.3` to the workspace catalog and `packages/tui` dependencies;
+- add `@opentui/keymap` `0.4.5` to the workspace catalog and `packages/tui` dependencies;
 - `InteractiveMode` creates exactly one `createDefaultOpenTuiKeymap(renderer)` instance;
 - `InteractiveKeybindings` remains the immutable semantic catalog, override parser, hint source, and conflict reporter;
 - components register concrete command layers and retain the returned cleanup;

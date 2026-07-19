@@ -67,6 +67,10 @@ export class AgentSessionRuntime {
     return this.#current().services
   }
 
+  get bootstrapDiagnostic(): AgentRuntime["bootstrapDiagnostic"] {
+    return this.#current().bootstrapDiagnostic
+  }
+
   listSessions(): Promise<SessionListResult> {
     const current = this.#requireReady()
     if (this.#sessionList?.current === current) return this.#sessionList.promise

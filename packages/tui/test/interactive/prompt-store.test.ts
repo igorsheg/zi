@@ -138,7 +138,12 @@ test("automatic compaction failures surface through prompt feedback", async () =
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }
     }
   })
-  const session = await createAgentSession({ services: bootstrap.services, sessionManager: history, model, tools: [] })
+  const { session } = await createAgentSession({
+    services: bootstrap.services,
+    sessionManager: history,
+    model,
+    tools: []
+  })
   const mode = createInteractiveStore(session)
   const prompt = createPromptStore(mode, new SlashController())
 
