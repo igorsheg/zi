@@ -162,6 +162,39 @@ test("read presentation derives continuation from details instead of model prose
   })
 })
 
+test("edit presentation keeps streamed replacements header-only until successful completion", () => {
+  const path = "notes.ts"
+  const first = { oldText: "41", newText: "42" }
+  const partial = projectToolPresentation({
+    status: "preparing",
+    name: "edit",
+    args: { path, edits: [first, { oldText: "old tail" }] }
+  })
+  expect(partial.header).toEqual({ label: "Edit", subject: { type: "path", path }, details: ["1 replacement so far"] })
+  expect(partial.body).toBeUndefined()
+  expect(partial.preview).toEqual({ compact: { type: "hidden" }, detailed: { type: "hidden" } })
+
+  const edits = [first, { oldText: "old tail", newText: "new tail" }]
+  const preparing = projectToolPresentation({ status: "preparing", name: "edit", args: { path, edits } })
+  expect(preparing.header.details).toEqual(["2 replacements so far"])
+  expect(preparing.body).toBeUndefined()
+
+  const ready = projectToolPresentation({ status: "ready", name: "edit", args: { path, edits } })
+  expect(ready.header.details).toEqual(["2 replacements"])
+  expect(ready.body).toBeUndefined()
+  expect(ready.preview).toEqual({ compact: { type: "hidden" }, detailed: { type: "hidden" } })
+
+  const running = projectToolPresentation({
+    status: "running",
+    name: "edit",
+    args: { path, edits },
+    result: { content: [{ type: "text", text: "non-authoritative progress" }] }
+  })
+  expect(running.header.details).toEqual(["2 replacements"])
+  expect(running.body).toBeUndefined()
+  expect(running.preview).toEqual({ compact: { type: "hidden" }, detailed: { type: "hidden" } })
+})
+
 test("write, edit, task-output, and kill-task project only semantic primitives", () => {
   const write = projectToolPresentation({
     status: "done",

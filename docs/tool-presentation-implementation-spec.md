@@ -54,7 +54,7 @@ Reject:
 
 - importing TUI components and themes into tool definitions;
 - renderer callbacks that return native components;
-- I/O from renderers, including edit-preview file reads;
+- I/O from renderers, including Edit file reads;
 - per-tool timers such as Bash elapsed intervals;
 - lifecycle represented by interacting booleans;
 - allowing every tool to invent resource lifetime and chrome.
@@ -241,7 +241,7 @@ Edit details carry:
 - a closed expected-failure reason (`invalid_path | not_found | not_file | permission_denied | too_large | invalid_edit | match_missing | match_ambiguous | overlap | no_change | unreadable | unwritable`);
 - a bounded error message for expected failure.
 
-The executed diff is authoritative after completion. Before it exists, the presenter may show bounded proposed replacement lines derived from arguments. The TUI renders the generic diff primitive and never reads the file, computes matches, coalesces invocations, or starts a highlighter worker.
+The executed diff is authoritative after completion. While arguments stream, the presenter reports only the number of complete replacement entries as `so far`; once arguments settle, that count is exact. Preparation, waiting, and execution remain header-only because argument progress is not filesystem mutation progress. Only a validated successful result introduces the generic diff primitive. The TUI never reads the file, computes matches, coalesces invocations, or starts a highlighter worker.
 
 ### Task output
 
@@ -627,14 +627,14 @@ One transcript-owned renderer live request refreshes visible running timing in g
 
 The architecture cutover gives every current built-in a coherent baseline. Later vertical slices may refine wording and visual treatment without changing the contract.
 
-| Tool        | Header subject                 | Body                                                          | Compact policy                                      | Structured notices                     |
-| ----------- | ------------------------------ | ------------------------------------------------------------- | --------------------------------------------------- | -------------------------------------- |
-| Bash        | `Run` description or command   | exact command + terminal result/progress                      | running/output success tail 5; failure edges 2/3    | outcome, task, truncation, full output |
-| Read        | path + actual range/status     | absolute-numbered source                                      | success hidden; failure head 4; detail edges 120/79 | detailed continuation/truncation       |
-| Write       | path + written size            | numbered source from arguments                                | success hidden; failure head 4; detail head 200     | detailed preview truncation            |
-| Edit        | path + insertion/deletion stat | context-rich executed diff; proposed changes before execution | success edges 5/5; proposal head 6; failure head 4  | detailed diff truncation               |
-| Task output | task ID + task-state detail    | terminal result                                               | tail 5                                              | truncation, full output, retention     |
-| Kill task   | task ID                        | text only when useful                                         | hidden on success; head on failure                  | stop state/failure                     |
+| Tool        | Header subject                | Body                                                       | Compact policy                                        | Structured notices                     |
+| ----------- | ----------------------------- | ---------------------------------------------------------- | ----------------------------------------------------- | -------------------------------------- |
+| Bash        | `Run` description or command  | exact command + terminal result/progress                   | running/output success tail 5; failure edges 2/3      | outcome, task, truncation, full output |
+| Read        | path + actual range/status    | absolute-numbered source                                   | success hidden; failure head 4; detail edges 120/79   | detailed continuation/truncation       |
+| Write       | path + written size           | numbered source from arguments                             | success hidden; failure head 4; detail head 200       | detailed preview truncation            |
+| Edit        | path + replacement/diff facts | context-rich executed diff only after successful execution | preterminal hidden; success edges 5/5; failure head 4 | detailed diff truncation               |
+| Task output | task ID + task-state detail   | terminal result                                            | tail 5                                                | truncation, full output, retention     |
+| Kill task   | task ID                       | text only when useful                                      | hidden on success; head on failure                    | stop state/failure                     |
 
 Bash is the first shipped post-cutover polish slice. It adds an optional bounded human description, verb-first compact rows, an exact secondary command, a completion-stable five-row output tail, failed edge peek, compact empty success and background handoff, structured background/admission/interruption states, detailed-only retention notices, shell highlighting, action hints, and typed cancellation without changing the client boundary. A terminal LF terminates the final usable output line instead of consuming an additional line slot; intentional blank lines before that terminator remain lines.
 
@@ -642,7 +642,7 @@ Read is the second shipped slice. Successful whole-file reads collapse to one ba
 
 Write is the third shipped slice. Preparing writes update a bounded `lines so far` fact from streamed arguments without implying filesystem progress. Successful writes collapse to one basename row with authoritative line and byte counts using the same terminal-LF line semantics as Read, Bash, truncation, and rendering; detailed mode restores the cwd-relative path and bounded numbered content derived from arguments. Empty writes remain a one-row success, preview truncation guidance is detailed-only, and closed operational failures replace attempted content with one bounded error body.
 
-Edit is the fourth shipped slice. Proposed replacements may peek while arguments prepare; successful execution keeps a bounded first/last diff review beneath the basename and authoritative `+N/-N` diffstat. Detailed mode restores the cwd-relative path and renders context-rich hunks with one relevant line-number gutter, explicit change markers, wrapped continuation gutters, and exact unchanged-line gaps. An oversized individual diff line becomes an explicit bounded added, removed, or context omission line so successful details always retain visible mutation evidence; header-only truncated diffs are invalid. Closed matching and filesystem failures replace proposed content with one bounded error body. Each invocation retains its own transcript identity; OpenZi does not adopt Grok Build's adjacent-edit coalescing, fullscreen block viewer, TUI filesystem reads, or progressive highlighter worker.
+Edit is the fourth shipped slice. Streamed arguments update a header-only `replacements so far` fact without exposing speculative content or implying filesystem progress; complete arguments waiting or running remain one line. Successful execution introduces a bounded first/last diff review beneath the basename and authoritative `+N/-N` diffstat. Detailed mode restores the cwd-relative path and renders context-rich hunks with one relevant line-number gutter, explicit change markers, wrapped continuation gutters, and exact unchanged-line gaps. An oversized individual diff line becomes an explicit bounded added, removed, or context omission line so successful details always retain visible mutation evidence; header-only truncated diffs are invalid. Closed matching and filesystem failures expose one bounded error body. Each invocation retains its own transcript identity; OpenZi does not adopt Grok Build's adjacent-edit coalescing, fullscreen block viewer, TUI filesystem reads, or progressive highlighter worker.
 
 Subsequent slices are Task output and Kill task. A slice includes its coding-agent outcome, projector, compact/detailed behavior, native body behavior, constrained-width fixture, lifecycle fixture, and restoration fixture.
 

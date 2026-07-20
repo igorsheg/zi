@@ -9,7 +9,7 @@ import { resolveToolPath } from "./path.js"
 import { boundToolText, isBoundedToolText } from "./text.js"
 import { truncateHead } from "./truncate.js"
 
-const maxEditChanges = 64
+export const maxEditChanges = 64
 const maxEditArgumentBytes = 8 * 1024 * 1024
 // JSON Schema cannot express an aggregate string-byte limit. This per-field cap keeps every schema-valid batch
 // below the execution bound even when every admitted Unicode scalar occupies four UTF-8 bytes.

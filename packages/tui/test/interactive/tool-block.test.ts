@@ -484,14 +484,16 @@ test("Write keeps one root and collapses completed content into a semantic succe
   }
 })
 
-test("Edit refines proposed replacements into a compact diff review and detailed numbered hunks", async () => {
+test("Edit stays header-only in flight and reveals only the successful authoritative diff", async () => {
   const setup = await createTestRenderer({ width: 64, height: 40, useThread: false })
   const path = "src/example.ts"
-  const args = { path, edits: [{ oldText: "old value", newText: "new value" }] }
+  const first = { oldText: "old value", newText: "new value" }
+  const partialArgs = { path, edits: [first, { oldText: "old tail" }] }
+  const args = { path, edits: [first, { oldText: "old tail", newText: "new tail" }] }
   const view = new ToolCallView(
     setup.renderer,
     "edit-lifecycle",
-    frame("preparing", projectToolPresentation({ status: "preparing", name: "edit", args })),
+    frame("preparing", projectToolPresentation({ status: "preparing", name: "edit", args: partialArgs })),
     defaultTheme,
     "/work",
     "Ctrl+O"
@@ -501,10 +503,39 @@ test("Edit refines proposed replacements into a compact diff review and detailed
   try {
     const root = view.root
     await setup.renderOnce()
-    const proposed = setup.captureCharFrame()
-    expect(proposed).toContain("◇ Edit example.ts · 1 replacement so far")
-    expect(proposed).toContain("− old value")
-    expect(proposed).toContain("+ new value")
+    const partial = setup.captureCharFrame()
+    expect(partial).toContain("◇ Edit example.ts · 1 replacement so far")
+    expect(partial).not.toContain("old value")
+    expect(partial).not.toContain("new value")
+
+    view.setExpanded(true)
+    await setup.renderOnce()
+    const expandedInFlight = setup.captureCharFrame()
+    expect(expandedInFlight).toContain("◇ Edit src/example.ts · 1 replacement so far")
+    expect(expandedInFlight).not.toContain("old value")
+    view.setExpanded(false)
+
+    expect(view.update(frame("preparing", projectToolPresentation({ status: "preparing", name: "edit", args })))).toBe(
+      true
+    )
+    expect(view.root).toBe(root)
+    await setup.renderOnce()
+    const preparing = setup.captureCharFrame()
+    expect(preparing).toContain("◇ Edit example.ts · 2 replacements so far")
+    expect(preparing).not.toContain("old tail")
+    expect(preparing).not.toContain("new tail")
+
+    expect(view.update(frame("ready", projectToolPresentation({ status: "ready", name: "edit", args })))).toBe(true)
+    await setup.renderOnce()
+    const ready = setup.captureCharFrame()
+    expect(ready).toContain("◆ Edit example.ts · 2 replacements · waiting")
+    expect(ready).not.toContain("old value")
+
+    expect(view.update(frame("running", projectToolPresentation({ status: "running", name: "edit", args })))).toBe(true)
+    await setup.renderOnce()
+    const running = setup.captureCharFrame()
+    expect(running).toContain("◈ Edit example.ts · 2 replacements")
+    expect(running).not.toContain("old value")
 
     const diff = [
       "--- a/src/example.ts",
@@ -685,7 +716,7 @@ test("oversized Edit lines retain explicit changed-line evidence", async () => {
   }
 })
 
-test("failed Edit exposes one semantic error without proposed replacement content", async () => {
+test("failed Edit exposes one bounded semantic error", async () => {
   const setup = await createTestRenderer({ width: 48, height: 10, useThread: false })
   const view = new ToolCallView(
     setup.renderer,
