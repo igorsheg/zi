@@ -126,12 +126,18 @@ Pi's optional `grep`, `find`, and `ls` implementations are deliberately deferred
 - [x] `AGENTS.md`/instruction discovery
 - [x] Skills (core global/project resources)
 - [x] Prompt templates (core global/project resources)
-- [ ] Images and clipboard input
+- [x] Images and clipboard input
 - [x] OAuth provider flows
 - [ ] Custom models/providers
 - [ ] Session tree/branch navigation and summaries
 - [ ] Export
 - [ ] Shell aliases and platform-specific behavior
+
+### P2 image and clipboard evidence
+
+- `packages/tui/test/interactive/prompt-paste.test.ts` drives real OpenTUI bracketed paste, CR/CRLF normalization, ANSI stripping, cursor insertion, one-step undo, paste bounds, Pi-compatible large-paste markers, exact payload submission, semantic native clipboard text fallback, atomic image attachment/removal/undo, image-only submission, inline transcript labels, and image-aware exit behavior. `packages/tui/test/composer.test.ts` fixes the exact `>10 lines | >1000 characters` thresholds, 32-marker/4 MiB retained bound with full-text fallback, marker expansion, and native image deletion/undo independently of the prompt workflow.
+- `packages/tui/test/interactive/clipboard.test.ts` fixes signature-based PNG/JPEG/GIF/WebP admission, MIME preference, bounded Wayland image reads, and text fallback. `packages/tui/test/interactive/prompt-store.test.ts` fixes model capability, attachment count/byte policy, cancellation, supersession, and stale-session rejection independently of rendering.
+- Bracketed-paste mechanics and atomic extmarks are delegated to OpenTUI `0c8c4f7c`. Marker integration is characterized from OpenCode v2 `4678bd104`; thresholds, labels, platform fallbacks, and image limits are characterized from Pi `0e6909f0`. OpenZi keeps platform clipboard access in the terminal package and submits direct `ImageContent` rather than Pi's temporary-path insertion.
 
 ### P2 session-resource evidence
 

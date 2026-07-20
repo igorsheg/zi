@@ -54,7 +54,7 @@ export function createMessageView(
 ): Renderable | undefined {
   switch (message.role) {
     case "user":
-      return createUserMessage(ctx, textContent(message.content), options.theme)
+      return createUserMessage(ctx, userContent(message.content), options.theme)
     case "assistant":
       return new StreamingAssistantView(ctx, message, options.theme, options.syntaxStyle, undefined, options.cwd).root
     case "toolResult":
@@ -509,6 +509,26 @@ function createPanelMessage(ctx: RenderContext, content: string, color: string, 
   })
   root.add(new TextRenderable(ctx, { fg: color, content }))
   return root
+}
+
+function userContent(content: string | readonly { type: string; text?: string; mimeType?: string }[]): string {
+  if (typeof content === "string") return content
+  let output = ""
+  let imageCount = 0
+  let previousWasImage = false
+  for (const part of content) {
+    if (part.text !== undefined) {
+      if (previousWasImage && output && !/\s$/.test(output) && !/^\s/.test(part.text)) output += " "
+      output += part.text
+      previousWasImage = false
+      continue
+    }
+    if (!part.mimeType) continue
+    if (output && !/\s$/.test(output)) output += " "
+    output += `[image #${++imageCount}]`
+    previousWasImage = true
+  }
+  return output
 }
 
 function textContent(content: string | readonly { type: string; text?: string; mimeType?: string }[]): string {

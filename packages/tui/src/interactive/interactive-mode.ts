@@ -3,6 +3,7 @@ import type { AgentSession, AgentSessionRuntime, SessionBootstrapDiagnostic } fr
 
 import { createSyntaxStyle, defaultTheme, type Theme } from "../theme.js"
 import { type BrowserOpener, SystemBrowserOpener } from "./browser-opener.js"
+import { type ClipboardReader, SystemClipboardReader } from "./clipboard.js"
 import {
   captureTuiMemorySnapshot,
   TuiDiagnosticsOverlay,
@@ -25,6 +26,7 @@ export interface InteractiveModeOptions {
   readonly keybindingOverrides?: InteractiveKeybindingOverrides
   readonly theme?: Theme
   readonly browserOpener?: BrowserOpener
+  readonly clipboard?: ClipboardReader
   readonly diagnostics?: TuiDiagnosticFlags
   readonly bootstrapDiagnostic?: SessionBootstrapDiagnostic
 }
@@ -37,6 +39,7 @@ export class InteractiveMode {
   readonly #sessionRuntime: AgentSessionRuntime | undefined
   readonly #sessionActions: PromptSessionActions | undefined
   readonly #browserOpener: BrowserOpener
+  readonly #clipboard: ClipboardReader
   readonly #exitGestures: ExitGestureController
   readonly #theme: Theme
   readonly #syntaxStyle: SyntaxStyle
@@ -56,6 +59,7 @@ export class InteractiveMode {
     keybindingOverrides,
     theme = defaultTheme,
     browserOpener = new SystemBrowserOpener(),
+    clipboard = new SystemClipboardReader(),
     diagnostics = { showTimeToFirstDraw: false, showStats: false, showMemory: false },
     bootstrapDiagnostic
   }: InteractiveModeOptions) {
@@ -79,6 +83,7 @@ export class InteractiveMode {
         }
       : undefined
     this.#browserOpener = browserOpener
+    this.#clipboard = clipboard
     this.#exitGestures = new ExitGestureController(onExit)
     this.store = createInteractiveStore(session)
     this.#theme = theme
@@ -169,6 +174,7 @@ export class InteractiveMode {
       this.#keybindings,
       this.#exitGestures,
       this.#browserOpener,
+      this.#clipboard,
       this.#theme,
       this.#syntaxStyle,
       this.#diagnosticFlags.showTimeToFirstDraw || this.#diagnosticFlags.showStats || this.#diagnosticFlags.showMemory,

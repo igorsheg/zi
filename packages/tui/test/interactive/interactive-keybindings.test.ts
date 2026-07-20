@@ -15,10 +15,14 @@ test("interactive keybindings resolve semantic prompt and transcript actions", (
   expect(keybindings.promptAction(key("escape"), context())).toBe("interrupt")
   expect(keybindings.promptAction(key("g", { ctrl: true }), context())).toBe("background_task")
   expect(
+    keybindings.promptAction(key("v", process.platform === "win32" ? { meta: true } : { ctrl: true }), context())
+  ).toBe("paste_clipboard")
+  expect(
     keybindings.promptAction(key("g", { ctrl: true }), { ...context(), foregroundShellTask: false })
   ).toBeUndefined()
   expect(keybindings.promptAction(key("c", { ctrl: true }), context())).toBe("clear")
   expect(keybindings.promptAction(key("d", { ctrl: true }), { ...context(), editorEmpty: false })).toBeUndefined()
+  expect(keybindings.promptAction(key("d", { ctrl: true }), { ...context(), hasImages: true })).toBeUndefined()
   expect(keybindings.promptAction(key("escape"), { ...context(), streaming: false })).toBeUndefined()
 
   expect(keybindings.promptAction(key("return"), context(true))).toBe("picker_confirm")
@@ -57,6 +61,7 @@ test("interactive keybindings expose resolved metadata for help and future short
     extension: "overridable"
   })
   expect(keybindings.list().map(binding => binding.id)).toContain("app.transcript.tail")
+  expect(keybindings.getHint("app.clipboard.paste")).toBe(process.platform === "win32" ? "Alt+V" : "Ctrl+V")
   expect(keybindings.getHint("app.tools.expand")).toBe("Ctrl+O")
   expect(keybindings.getHint("app.transcript.tail")).toBe("Ctrl+End")
   expect(keybindings.getHint("tui.select.confirm")).toBe("Enter")
@@ -78,7 +83,7 @@ test("interactive keybinding overrides reject unknown actions and unbounded key 
 })
 
 function context(pickerOpen = false) {
-  return { pickerOpen, editorEmpty: true, streaming: true, foregroundShellTask: true }
+  return { pickerOpen, editorEmpty: true, hasImages: false, streaming: true, foregroundShellTask: true }
 }
 
 function key(

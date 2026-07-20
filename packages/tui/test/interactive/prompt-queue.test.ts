@@ -225,7 +225,7 @@ test("restored queued images remain attached when the draft is resubmitted", asy
     setup.mockInput.pressArrow("up", { meta: true })
     await setup.renderOnce()
 
-    expect(input.plainText).toBe("with image")
+    expect(input.plainText).toBe("with image [image #1] ")
     expect(setup.captureCharFrame()).toContain("Restored 1 queued message")
     setup.mockInput.pressEnter({ meta: true })
 

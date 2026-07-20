@@ -1,9 +1,19 @@
-import { BoxRenderable, CliRenderEvents, type CliRenderer, type KeyEvent, TextAttributes } from "@opentui/core"
+import {
+  BoxRenderable,
+  CliRenderEvents,
+  decodePasteBytes,
+  type CliRenderer,
+  type KeyEvent,
+  type PasteEvent,
+  stripAnsiSequences,
+  TextAttributes
+} from "@opentui/core"
 
 import { composerGeometry, createComposer, type Composer, type ComposerSlots } from "../../components/composer.js"
 import { ShimmerTextView } from "../../components/shimmer-text.js"
 import type { Theme } from "../../theme.js"
 import type { BrowserOpener } from "../browser-opener.js"
+import { maxPastedTextBytes, type ClipboardReader } from "../clipboard.js"
 import type { ExitGestureController } from "../exit-gesture.js"
 import type { InteractiveKeybindings, PromptKeyAction } from "../interactive-keybindings.js"
 import type { InteractiveStore } from "../interactive-store.js"
@@ -30,6 +40,7 @@ export class PromptView {
   readonly #pickerStack: PickerStackView
   readonly #release: Array<() => void> = []
   #appliedInputRevision = 0
+  #syncedImages: ReturnType<Composer["activeImages"]> = []
 
   constructor(
     renderer: CliRenderer,
@@ -38,6 +49,7 @@ export class PromptView {
     keybindings: InteractiveKeybindings,
     exitGestures: ExitGestureController,
     browserOpener: BrowserOpener,
+    clipboard: ClipboardReader,
     theme: Theme,
     sessionActions?: PromptSessionActions
   ) {
@@ -45,7 +57,7 @@ export class PromptView {
     this.#interactive = interactive
     this.#keybindings = keybindings
     this.#exitGestures = exitGestures
-    this.#store = createPromptStore(interactive, slash, sessionActions)
+    this.#store = createPromptStore(interactive, slash, sessionActions, clipboard)
     this.root = new BoxRenderable(renderer, { flexDirection: "column", flexShrink: 0 })
 
     this.#working = new ShimmerTextView(renderer, "Working…", theme.text.muted, theme.text.primary)
@@ -59,7 +71,9 @@ export class PromptView {
       slots: composerSlots(session),
       theme,
       onSubmit: () => this.#submit("steer"),
-      onContentChange: () => this.#store.draftChanged(this.#input.plainText, this.#input.cursorOffset)
+      onContentChange: () => this.#store.draftChanged(this.#input.plainText, this.#input.cursorOffset),
+      onImageMarkersChange: images => this.#store.imageMarkersChanged(images),
+      onPaste: this.#onPaste
     })
     this.#input = this.#composer.input
     this.#pickerStack = new PickerStackView(renderer, this.#store.picker, theme, () => this.#input.plainText)
@@ -125,24 +139,69 @@ export class PromptView {
     this.#working.setActive(working)
     if (pickerVisible) this.#queue.hide()
     else this.#queue.update(session.queuedInputs, Math.max(0, this.#renderer.height - fixedRows))
-    this.#composer.update(geometry, composerSlots(session))
+    if (prompt.images !== this.#syncedImages) {
+      this.#syncedImages = prompt.images
+      this.#composer.syncImageMarkers(prompt.images)
+    }
+    this.#composer.update(geometry, composerSlots(session, prompt.images.length))
   }
 
   #submit(delivery: "steer" | "followUp"): void {
-    this.#store.submit(this.#input.plainText, delivery)
+    this.#store.imageMarkersChanged(this.#composer.activeImages())
+    this.#store.submit(this.#composer.expandedText(), delivery)
   }
 
-  #replaceInput(text: string, cursorOffset = text.length): void {
-    this.#input.setText(text)
-    this.#input.cursorOffset = cursorOffset
+  #onPaste = (event: PasteEvent): void => {
+    event.preventDefault()
+    if (event.metadata?.mimeType?.startsWith("image/")) {
+      this.#store.attachImage({ type: "image", bytes: event.bytes, mimeType: event.metadata.mimeType })
+      return
+    }
+    if (event.metadata?.kind === "binary") {
+      this.#store.reportFeedback({ type: "warning", message: "Unsupported binary clipboard content" })
+      return
+    }
+    if (event.bytes.byteLength > maxPastedTextBytes) {
+      this.#store.reportFeedback({ type: "error", message: "Pasted text exceeds the 1 MiB limit" })
+      return
+    }
+
+    const text = normalizePastedText(decodePasteBytes(event.bytes))
+    if (!text) {
+      this.#pasteClipboard()
+      return
+    }
+    this.#composer.insertPastedText(text)
+  }
+
+  #pasteClipboard(): void {
+    void this.#store
+      .pasteClipboard()
+      .then(text => {
+        if (text === undefined || this.#input.isDestroyed) return false
+        const normalized = normalizePastedText(text)
+        if (!normalized) return false
+        this.#composer.insertPastedText(normalized)
+        return true
+      })
+      .catch(() => false)
+  }
+
+  #replaceInput(text: string, cursorOffset?: number): void {
+    this.#composer.replaceText(text, cursorOffset)
+    const images = this.#store.$state.get().images
+    this.#syncedImages = images
+    this.#composer.syncImageMarkers(images)
     this.#input.focus()
   }
 
   #restore(abort: boolean): void {
+    this.#store.imageMarkersChanged(this.#composer.activeImages())
+    const currentText = this.#composer.expandedText()
     const text = abort
-      ? this.#store.abortAndRestoreQueuedInputs(this.#input.plainText)
-      : this.#store.restoreQueuedInputs(this.#input.plainText)
-    if (text !== this.#input.plainText) this.#replaceInput(text)
+      ? this.#store.abortAndRestoreQueuedInputs(currentText)
+      : this.#store.restoreQueuedInputs(currentText)
+    if (text !== currentText) this.#replaceInput(text)
   }
 
   #onKeyPress = (key: KeyEvent): void => {
@@ -163,13 +222,13 @@ export class PromptView {
     }
 
     const session = this.#interactive.getSession()
+    const prompt = this.#store.$state.get()
     const action = this.#keybindings.promptAction(key, {
       pickerOpen: Boolean(this.#store.picker.presentation(this.#input.plainText)),
       editorEmpty: this.#input.plainText.length === 0,
+      hasImages: prompt.images.length > 0,
       streaming:
-        session.isStreaming ||
-        session.compactionStatus.type === "running" ||
-        authenticationActive(this.#store.$state.get().workflow),
+        session.isStreaming || session.compactionStatus.type === "running" || authenticationActive(prompt.workflow),
       foregroundShellTask: session.shellTasks.some(task => task.type === "foreground")
     })
     if (!action) return
@@ -215,6 +274,10 @@ export class PromptView {
         }
         return
       }
+      case "paste_clipboard":
+        consume(key)
+        this.#pasteClipboard()
+        return
       case "new_line":
         consume(key)
         this.#input.newLine()
@@ -259,11 +322,12 @@ function authenticationActive(workflow: PromptWorkflow): boolean {
   )
 }
 
-function composerSlots(session: ReturnType<InteractiveStore["getSession"]>): ComposerSlots {
+function composerSlots(session: ReturnType<InteractiveStore["getSession"]>, imageCount = 0): ComposerSlots {
   const context = session.contextUsage
   return {
     topLeft: session.sessionManager.header.cwd,
     topRight: [
+      ...(imageCount === 0 ? [] : [`${imageCount} image${imageCount === 1 ? "" : "s"}`]),
       modelTitle(session),
       ...(context.type === "unavailable" ? [] : [contextTitle(context.type, context.percent)])
     ]
@@ -278,4 +342,8 @@ function modelTitle(session: ReturnType<InteractiveStore["getSession"]>): string
 
 function contextTitle(type: "measured" | "estimated", percent: number): string {
   return `${type === "estimated" ? "~" : ""}${Math.round(percent)}% ctx`
+}
+
+function normalizePastedText(text: string): string {
+  return stripAnsiSequences(text).replace(/\r\n/g, "\n").replace(/\r/g, "\n")
 }

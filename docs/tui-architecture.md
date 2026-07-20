@@ -52,7 +52,9 @@ AgentSession
 | `SlashController`        | one terminal mode    | bounded descriptor aggregation, fuzzy completion, safe input edits, and closed built-in intents        |
 | `InteractiveKeybindings` | one terminal mode    | semantic IDs, effective overrides, matching, hints, conflicts, closed prompt/transcript actions        |
 | `InteractiveStore`       | one terminal mode    | session binding/generation, stale-event rejection, bounded active tools, prompt and Escape delegation  |
-| `PromptStore`            | one prompt component | feedback, images, typed workflows, input-edit requests, bounded async operation identity               |
+| `SystemClipboardReader`  | one terminal mode    | bounded platform subprocesses for explicit local image/text clipboard reads                            |
+| `PromptStore`            | one prompt component | feedback, active images, typed workflows, input-edit requests, bounded async operation identity        |
+| `Composer`               | one prompt component | native text/editing plus atomic paste and image extmarks with exact submission expansion               |
 | `PickerStack`            | one prompt component | nested frames, top-frame selection/filtering, suspended parent filters, push/pop transitions           |
 | `TranscriptStore`        | one transcript       | following versus detached navigation and unseen-output state                                           |
 | imperative component     | one renderable tree  | native children, subscriptions, input/mouse handlers, explicit destruction                             |
@@ -66,6 +68,7 @@ packages/tui/src/
   interactive/
     interactive-mode.ts
     interactive-store.ts
+    clipboard.ts
     slash-controller.ts
     fuzzy-match.ts
     interactive-keybindings.ts
@@ -159,10 +162,11 @@ Durable transcript messages are appended without rebuilding existing renderables
 | Transient tools and terminal render revisions                                   | `InteractiveStore`            |
 | Prompt feedback, typed workflow, one-shot input edits                           | `PromptStore`                 |
 | Picker frames, selection, suspended parent filters                              | `PickerStack`                 |
-| Active picker filter text, cursor, focus, paste, undo                           | composer `TextareaRenderable` |
+| Active picker filter text, cursor, focus, paste markers/payloads, undo          | composer `TextareaRenderable` |
 | Follow/detached/unseen transcript navigation                                    | `TranscriptStore`             |
 | Scroll offset, viewport, selection                                              | OpenTUI renderables           |
 | Pending native callback generations                                             | component owning the resource |
+| Local clipboard subprocess and output bounds                                    | `SystemClipboardReader`       |
 | Renderer, signals, terminal title, close state, settlement deadline             | `runTui`                      |
 | Semantic clear/exit gesture, syntax style, root renderable                      | `InteractiveMode`             |
 
@@ -170,7 +174,7 @@ There is no module-global mutable application state.
 
 ## Input and lifecycle
 
-Global key handlers ask `InteractiveKeybindings` for a closed semantic action and prevent default before editor handling when terminal product semantics override native behavior. Native selection copy and picker back take precedence over the exit gesture and reset any earlier arm. Otherwise `InteractiveMode` owns `ready | armed { pressedAt }`: the first effective `app.clear` action—Ctrl+C by default—clears the composer and arms Pi's 500 ms window, while the second requests exit. Ctrl+D requests exit only from an empty composer; Escape cancels an active run and restores detached queued input. Ctrl+G's semantic task-background action requests the `AgentSession` foreground-to-background transition; the TUI never reaches a child process or copies the shell task registry. The composer remains mounted and focused during command completion, nested picker navigation, model selection, and transcript selection. Programmatic input edits carry an explicit cursor target; ordinary replacements target the end, while range-safe slash completion targets the inserted command boundary. Transcript navigation preserves detached intent across output and resize. Queued native callbacks validate their target before applying.
+Global key handlers ask `InteractiveKeybindings` for a closed semantic action and prevent default before editor handling when terminal product semantics override native behavior. OpenTUI owns bracketed-paste parsing and textarea editing; `PromptView` normalizes and bounds the delivered text event, while the semantic clipboard action asks the injected `ClipboardReader` for local image data or text fallback. `Composer` keeps Pi-compatible large-paste and image labels as atomic virtual extmarks, retains at most 32 compact text payloads or 4 MiB before falling back to full insertion, expands exact text payloads for submission, strips visual image labels from submitted text, and reports native image-marker deletion/undo. `PromptStore` admits and remains authoritative for active image attachments against the current model, MIME signature, count, encoded-byte, operation, and session bounds. Committed user messages derive inline `[image #N]` transcript labels from authoritative image content parts; those labels remain presentation-only and never enter model text. Native selection copy and picker back take precedence over the exit gesture and reset any earlier arm. Otherwise `InteractiveMode` owns `ready | armed { pressedAt }`: the first effective `app.clear` action—Ctrl+C by default—clears the composer and arms Pi's 500 ms window, while the second requests exit. Ctrl+D requests exit only from an empty composer; Escape cancels an active run and restores detached queued input. Ctrl+G's semantic task-background action requests the `AgentSession` foreground-to-background transition; the TUI never reaches a child process or copies the shell task registry. The composer remains mounted and focused during command completion, nested picker navigation, model selection, and transcript selection. Programmatic input edits carry an explicit cursor target; ordinary replacements target the end, while range-safe slash completion targets the inserted command boundary. Transcript navigation preserves detached intent across output and resize. Queued native callbacks validate their target before applying.
 
 `InteractiveMode.dispose()` releases stores, subscriptions, handlers, syntax resources, and renderables. `runTui` owns a `running | closing | closed` transition, renderer and signal resources, terminal title, and settlement deadline. The first close request disposes terminal input, asks `AgentSession` to discard queued work and abort, and restores the terminal immediately. Settlement is awaited afterward with a deadline. Concurrent interactive, signal, and renderer-destroy requests share that completion. Shutdown errors propagate after terminal restoration, and only the CLI disposes the session it created.
 

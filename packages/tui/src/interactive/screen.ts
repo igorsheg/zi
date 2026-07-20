@@ -2,6 +2,7 @@ import { BoxRenderable, type CliRenderer, type SyntaxStyle } from "@opentui/core
 
 import type { Theme } from "../theme.js"
 import type { BrowserOpener } from "./browser-opener.js"
+import type { ClipboardReader } from "./clipboard.js"
 import type { ExitGestureController } from "./exit-gesture.js"
 import type { InteractiveKeybindings } from "./interactive-keybindings.js"
 import type { InteractiveStore } from "./interactive-store.js"
@@ -22,6 +23,7 @@ export class SessionScreen {
     keybindings: InteractiveKeybindings,
     exitGestures: ExitGestureController,
     browserOpener: BrowserOpener,
+    clipboard: ClipboardReader,
     theme: Theme,
     syntaxStyle: SyntaxStyle,
     measureTranscriptSync: boolean,
@@ -38,6 +40,7 @@ export class SessionScreen {
       keybindings,
       exitGestures,
       browserOpener,
+      clipboard,
       theme,
       sessionActions
     )

@@ -3,6 +3,7 @@ import type {
   AuthenticationEvent,
   AuthenticationMethod,
   AuthenticationPrompt,
+  ImageContent,
   ModelChoice,
   PendingInputDelivery,
   QueueMode,
@@ -15,6 +16,13 @@ import type {
 } from "@openzi/coding-agent"
 import { atom, type ReadableAtom } from "nanostores"
 
+import {
+  detectClipboardImageMimeType,
+  maxClipboardImageBytes,
+  maxPastedTextBytes,
+  type ClipboardContent,
+  type ClipboardReader
+} from "../clipboard.js"
 import type { InteractiveStore } from "../interactive-store.js"
 import type { InteractiveCommand, SlashController } from "../slash-controller.js"
 import {
@@ -55,6 +63,9 @@ export interface PromptStore {
   backPicker(): boolean
   restoreQueuedInputs(currentText: string): string
   abortAndRestoreQueuedInputs(currentText: string): string
+  pasteClipboard(): Promise<string | undefined>
+  attachImage(image: Extract<ClipboardContent, { type: "image" }>): boolean
+  imageMarkersChanged(images: readonly ImageContent[]): void
   reportFeedback(feedback: PromptFeedback): void
   clear(): void
   dispose(): void
@@ -67,6 +78,20 @@ interface PendingAuthPrompt {
   readonly cleanup: () => void
 }
 
+type ClipboardReadState =
+  | { readonly type: "idle" }
+  | {
+      readonly type: "reading"
+      readonly operationId: number
+      readonly session: AgentSession
+      readonly controller: AbortController
+    }
+
+export const maxPromptClipboardImages = 8
+export const maxPromptClipboardEncodedBytes = 8 * 1024 * 1024
+
+const unavailableClipboard: ClipboardReader = { read: async () => undefined }
+
 export interface PromptSessionActions {
   listSessions(): Promise<SessionListResult>
   startNewSession(): Promise<void>
@@ -77,9 +102,10 @@ export interface PromptSessionActions {
 export function createPromptStore(
   interactive: InteractiveStore,
   slash: SlashController,
-  sessionActions?: PromptSessionActions
+  sessionActions?: PromptSessionActions,
+  clipboard: ClipboardReader = unavailableClipboard
 ): PromptStore {
-  return new PromptController(interactive, slash, sessionActions)
+  return new PromptController(interactive, slash, sessionActions, clipboard)
 }
 
 class PromptController implements PromptStore {
@@ -89,6 +115,8 @@ class PromptController implements PromptStore {
   readonly #interactive: InteractiveStore
   readonly #slash: SlashController
   readonly #sessionActions: PromptSessionActions | undefined
+  readonly #clipboard: ClipboardReader
+  #clipboardRead: ClipboardReadState = { type: "idle" }
   #disposed = false
   #nextOperationId = 0
   #nextBrowserRequestId = 0
@@ -96,10 +124,16 @@ class PromptController implements PromptStore {
   #cancelledCompactionOperationId: number | undefined
   readonly #unsubscribeAutomaticCompactionFailure: () => void
 
-  constructor(interactive: InteractiveStore, slash: SlashController, sessionActions?: PromptSessionActions) {
+  constructor(
+    interactive: InteractiveStore,
+    slash: SlashController,
+    sessionActions: PromptSessionActions | undefined,
+    clipboard: ClipboardReader
+  ) {
     this.#interactive = interactive
     this.#slash = slash
     this.#sessionActions = sessionActions
+    this.#clipboard = clipboard
     this.#unsubscribeAutomaticCompactionFailure = interactive.subscribeAutomaticCompactionFailure(message => {
       if (this.#disposed) return
       this.$state.set({ ...this.$state.get(), feedback: { type: "error", message } })
@@ -111,14 +145,20 @@ class PromptController implements PromptStore {
     if (workflow.type === "auth_prompt") return this.#submitAuthenticationPrompt(text, workflow)
 
     const trimmed = text.trim()
-    if (!trimmed || workflow.type !== "idle") return false
+    const state = this.$state.get()
+    if ((!trimmed && state.images.length === 0) || workflow.type !== "idle") return false
 
-    const command = this.#slash.parse(trimmed)
+    const command = trimmed ? this.#slash.parse(trimmed) : undefined
     if (this.#dispatchCommand(command)) return true
 
     try {
-      const state = this.$state.get()
+      const model = this.#interactive.getSession().modelState
+      if (state.images.length > 0 && (model.type !== "selected" || !model.model.input.includes("image"))) {
+        this.reportFeedback({ type: "warning", message: "The current model does not accept image input" })
+        return false
+      }
       const settled = this.#interactive.submit({ text: trimmed, images: state.images, delivery })
+      this.#cancelClipboardRead()
       this.picker.close()
       this.$state.set({
         ...initialPromptState,
@@ -319,12 +359,133 @@ class PromptController implements PromptStore {
     }
   }
 
+  async pasteClipboard(): Promise<string | undefined> {
+    if (this.#disposed) return undefined
+    let session: AgentSession
+    try {
+      session = this.#interactive.getSession()
+    } catch (cause) {
+      this.#showError(cause)
+      return undefined
+    }
+    this.#cancelClipboardRead()
+    const reading: Extract<ClipboardReadState, { type: "reading" }> = {
+      type: "reading",
+      operationId: ++this.#nextOperationId,
+      session,
+      controller: new AbortController()
+    }
+    this.#clipboardRead = reading
+
+    let content: ClipboardContent | undefined
+    try {
+      content = await this.#clipboard.read(reading.controller.signal)
+    } catch (cause) {
+      if (!this.#finishClipboardRead(reading)) return undefined
+      if (reading.controller.signal.aborted) return undefined
+      this.#showError(cause)
+      return undefined
+    }
+    if (!this.#finishClipboardRead(reading)) return undefined
+
+    if (!content) {
+      this.reportFeedback({ type: "warning", message: "Clipboard is empty or unavailable" })
+      return undefined
+    }
+    if (content.type === "image") {
+      this.attachImage(content)
+      return undefined
+    }
+    if (Buffer.byteLength(content.text) > maxPastedTextBytes) {
+      this.reportFeedback({ type: "error", message: "Clipboard text exceeds the 1 MiB paste limit" })
+      return undefined
+    }
+    return content.text
+  }
+
+  attachImage(image: Extract<ClipboardContent, { type: "image" }>): boolean {
+    if (this.#disposed) return false
+    const state = this.$state.get()
+    if (state.workflow.type !== "idle") {
+      this.reportFeedback({ type: "warning", message: "Images cannot be attached during the active prompt workflow" })
+      return false
+    }
+
+    let session: AgentSession
+    try {
+      session = this.#interactive.getSession()
+    } catch (cause) {
+      this.#showError(cause)
+      return false
+    }
+    if (session.modelState.type !== "selected" || !session.modelState.model.input.includes("image")) {
+      this.reportFeedback({ type: "warning", message: "The current model does not accept image input" })
+      return false
+    }
+    if (image.bytes.byteLength === 0 || image.bytes.byteLength > maxClipboardImageBytes) {
+      this.reportFeedback({ type: "error", message: "Clipboard image exceeds the 4.5 MiB encoded image limit" })
+      return false
+    }
+
+    const mimeType = detectClipboardImageMimeType(image.bytes)
+    if (!mimeType) {
+      this.reportFeedback({ type: "warning", message: "Clipboard image must be PNG, JPEG, WebP, or GIF" })
+      return false
+    }
+    if (state.images.length >= maxPromptClipboardImages) {
+      this.reportFeedback({
+        type: "error",
+        message: `A prompt cannot contain more than ${maxPromptClipboardImages} pasted images`
+      })
+      return false
+    }
+
+    const data = Buffer.from(image.bytes).toString("base64")
+    const retainedBytes = state.images.reduce((bytes, entry) => bytes + Buffer.byteLength(entry.data), 0)
+    if (retainedBytes + Buffer.byteLength(data) > maxPromptClipboardEncodedBytes) {
+      this.reportFeedback({ type: "error", message: "Pasted images exceed the 8 MiB prompt attachment limit" })
+      return false
+    }
+
+    const images = [...state.images, { type: "image" as const, data, mimeType }]
+    this.$state.set({
+      ...state,
+      images,
+      feedback: {
+        type: "status",
+        message: `Attached image ${images.length} (${mimeType.slice("image/".length).toUpperCase()})`
+      }
+    })
+    return true
+  }
+
+  imageMarkersChanged(images: readonly ImageContent[]): void {
+    if (this.#disposed) return
+    const state = this.$state.get()
+    if (
+      images.length > maxPromptClipboardImages ||
+      images.reduce((bytes, image) => bytes + Buffer.byteLength(image.data), 0) > maxPromptClipboardEncodedBytes
+    ) {
+      return
+    }
+    if (images.length === state.images.length && images.every((image, index) => image === state.images[index])) return
+
+    const feedback: PromptFeedback =
+      images.length < state.images.length
+        ? imageMarkerFeedback("Removed", state.images.length - images.length)
+        : images.length > state.images.length
+          ? imageMarkerFeedback("Restored", images.length - state.images.length)
+          : state.feedback
+    this.$state.set({ ...state, images: [...images], feedback })
+  }
+
   reportFeedback(feedback: PromptFeedback): void {
     if (this.#disposed) return
     this.$state.set({ ...this.$state.get(), feedback })
   }
 
   clear(): void {
+    this.#cancelClipboardRead()
     if (this.#cancelAuthentication() || this.#cancelCompaction() || this.#cancelSessionReplacement()) return
     this.picker.close()
     const state = this.$state.get()
@@ -336,6 +497,7 @@ class PromptController implements PromptStore {
 
   dispose(): void {
     if (this.#disposed) return
+    this.#cancelClipboardRead()
     this.#cancelAuthentication()
     this.#cancelCompaction()
     this.#cancelSessionReplacement()
@@ -1126,6 +1288,20 @@ class PromptController implements PromptStore {
     return workflow.type !== "idle" && workflow.operationId === operationId && workflow.session === session
   }
 
+  #finishClipboardRead(reading: Extract<ClipboardReadState, { type: "reading" }>): boolean {
+    const accepted =
+      !this.#disposed && this.#clipboardRead === reading && this.#interactive.getSession() === reading.session
+    if (this.#clipboardRead === reading) this.#clipboardRead = { type: "idle" }
+    return accepted
+  }
+
+  #cancelClipboardRead(): void {
+    const reading = this.#clipboardRead
+    if (reading.type === "idle") return
+    this.#clipboardRead = { type: "idle" }
+    reading.controller.abort()
+  }
+
   #mergeQueue(queue: QueuedInputs, currentText: string, showStatus: boolean): string {
     const entries = [...queue.steering, ...queue.followUp]
     const texts = entries.map(entry => entry.text)
@@ -1162,6 +1338,10 @@ class PromptController implements PromptStore {
     if (this.#disposed) return
     this.$state.set({ ...this.$state.get(), feedback: { type: "error", message: errorMessage(cause) } })
   }
+}
+
+function imageMarkerFeedback(action: "Removed" | "Restored", count: number): PromptFeedback {
+  return { type: "status", message: `${action} ${count} attached image${count === 1 ? "" : "s"}` }
 }
 
 function authenticationEventFeedback(event: AuthenticationEvent, requestId: number): PromptFeedback {

@@ -6,7 +6,7 @@ The previous `/model` selector replaced the composer with a second `TextareaRend
 
 OpenZi now uses three concrete owners:
 
-- `Composer` owns the only native textarea, its text, cursor, paste/undo history, and focus.
+- `Composer` owns the only native textarea, its text, cursor, paste/undo history, focus, and atomic paste/image extmarks. Text paste payloads stay with those native markers and expand only at copy or submission; `PromptStore` remains authoritative for active image payloads while marker edits report their retained image references.
 - `PickerStack` owns open/closed state, ordered frames, selected row per frame, suspended parent filters, top-frame filtering, and push/pop transitions. It accepts the current composer text as a method argument and does not retain or render an active input.
 - `PickerStackView` renders only the active frame below the composer. It contains no textarea and does not interpret selected row IDs.
 

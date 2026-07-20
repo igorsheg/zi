@@ -1,4 +1,13 @@
-import { BoxRenderable, RGBA, TextareaRenderable, type OptimizedBuffer, type RenderContext } from "@opentui/core"
+import {
+  BoxRenderable,
+  RGBA,
+  TextareaRenderable,
+  type Extmark,
+  type OptimizedBuffer,
+  type PasteEvent,
+  type RenderContext
+} from "@opentui/core"
+import type { ImageContent } from "@openzi/coding-agent"
 import stringWidth from "string-width"
 
 import type { Theme } from "../theme.js"
@@ -22,11 +31,18 @@ export interface ComposerOptions {
   readonly theme: Theme
   readonly onSubmit: () => void
   readonly onContentChange?: () => void
+  readonly onImageMarkersChange?: (images: readonly ImageContent[]) => void
+  readonly onPaste?: (event: PasteEvent) => void
 }
 
 export interface Composer {
   readonly root: BoxRenderable
   readonly input: TextareaRenderable
+  insertPastedText(text: string): void
+  syncImageMarkers(images: readonly ImageContent[]): void
+  activeImages(): readonly ImageContent[]
+  expandedText(): string
+  replaceText(text: string, cursorOffset?: number): void
   update(geometry: ComposerGeometry, slots: ComposerSlots): void
   destroy(): void
 }
@@ -35,6 +51,15 @@ interface RailLayout {
   readonly topRightText: string
   readonly topRightWidth: number
 }
+
+type ComposerMarkerData =
+  | { readonly type: "paste"; readonly marker: string; readonly text: string }
+  | { readonly type: "image"; readonly marker: string; readonly image: ImageContent }
+
+export const compactPasteLineThreshold = 10
+export const compactPasteCharacterThreshold = 1_000
+export const maxCompactPasteMarkers = 32
+export const maxCompactPasteRetainedBytes = 4 * 1024 * 1024
 
 export function composerGeometry(width: number, height: number): ComposerGeometry {
   const bordered = height >= 6 && width >= 4
@@ -61,7 +86,24 @@ export function createComposer(ctx: RenderContext, options: ComposerOptions): Co
       drawTopRightSlot(buffer, this, geometry.bordered, rail, railColor, railBackground)
     }
   })
-  const input = new TextareaRenderable(ctx, {
+  let suppressContentChange = false
+  let markerTypeId = 0
+  let nextPasteId = 0
+  let nextImageId = 0
+  let markerRevision = 0
+  let input!: TextareaRenderable
+
+  const notifyContentChange = () => {
+    if (suppressContentChange) return
+    options.onContentChange?.()
+    const revision = ++markerRevision
+    queueMicrotask(() => {
+      if (revision !== markerRevision || input.isDestroyed) return
+      options.onImageMarkersChange?.(imageMarkers(input, markerTypeId))
+    })
+  }
+
+  input = new TextareaRenderable(ctx, {
     id: "prompt-input",
     minHeight: 1,
     maxHeight: geometry.editorRows,
@@ -71,18 +113,121 @@ export function createComposer(ctx: RenderContext, options: ComposerOptions): Co
     cursorColor: options.theme.text.primary,
     backgroundColor: options.theme.surface.composer,
     focusedBackgroundColor: options.theme.surface.composer,
-    ...(options.onContentChange ? { onContentChange: options.onContentChange } : {}),
+    onContentChange: notifyContentChange,
+    ...(options.onPaste ? { onPaste: options.onPaste } : {}),
     keyBindings: [
       { name: "return", action: "submit" },
       { name: "return", shift: true, action: "newline" }
     ],
     onSubmit: options.onSubmit
   })
+  markerTypeId = input.extmarks.registerType("openzi-composer-marker")
+  const nativeGetSelectedText = input.getSelectedText.bind(input)
+  const nativeUndo = input.undo.bind(input)
+  const nativeRedo = input.redo.bind(input)
+  input.getSelectedText = () => {
+    const selectedText = nativeGetSelectedText()
+    const selection = input.getSelection()
+    if (!selection) return selectedText
+    const start = Math.min(selection.start, selection.end)
+    const end = Math.max(selection.start, selection.end)
+    const markers = composerMarkers(input, markerTypeId).flatMap(marker =>
+      marker.data.type === "paste" && marker.start >= start && marker.end <= end
+        ? [{ ...marker, start: marker.start - start, end: marker.end - start }]
+        : []
+    )
+    return expandMarkerRanges(selectedText, markers)
+  }
+  input.undo = () => {
+    const result = nativeUndo()
+    notifyContentChange()
+    return result
+  }
+  input.redo = () => {
+    const result = nativeRedo()
+    notifyContentChange()
+    return result
+  }
   root.add(input)
+
+  const insertMarker = (marker: string, data: ComposerMarkerData) => {
+    suppressContentChange = true
+    try {
+      const start = input.cursorOffset
+      input.insertText(marker)
+      input.extmarks.create({
+        start,
+        end: start + promptOffsetWidth(marker),
+        virtual: true,
+        typeId: markerTypeId,
+        data
+      })
+    } finally {
+      suppressContentChange = false
+    }
+    notifyContentChange()
+  }
 
   return {
     root,
     input,
+    insertPastedText(text) {
+      const lineCount = text.split("\n").length
+      if (lineCount <= compactPasteLineThreshold && text.length <= compactPasteCharacterThreshold) {
+        input.insertText(text)
+        return
+      }
+      const retainedPastes = composerMarkers(input, markerTypeId).flatMap(marker =>
+        marker.data.type === "paste" ? [marker.data] : []
+      )
+      if (
+        retainedPastes.length >= maxCompactPasteMarkers ||
+        retainedPastes.reduce((bytes, marker) => bytes + Buffer.byteLength(marker.text), 0) + Buffer.byteLength(text) >
+          maxCompactPasteRetainedBytes
+      ) {
+        input.insertText(text)
+        return
+      }
+      const marker =
+        lineCount > compactPasteLineThreshold
+          ? `[paste #${++nextPasteId} +${lineCount} lines]`
+          : `[paste #${++nextPasteId} ${text.length} chars]`
+      insertMarker(marker, { type: "paste", marker, text })
+    },
+    syncImageMarkers(images) {
+      const unmatched = imageMarkers(input, markerTypeId).slice()
+      const missing: ImageContent[] = []
+      for (const image of images) {
+        const index = unmatched.findIndex(candidate => candidate === image)
+        if (index === -1) missing.push(image)
+        else unmatched.splice(index, 1)
+      }
+      for (const image of missing) {
+        const before = displaySlice(input.plainText, 0, input.cursorOffset)
+        const prefix = before.length > 0 && !/\s$/.test(before) ? " " : ""
+        const marker = `${prefix}[image #${++nextImageId}] `
+        insertMarker(marker, { type: "image", marker, image })
+      }
+    },
+    activeImages() {
+      return imageMarkers(input, markerTypeId)
+    },
+    expandedText() {
+      return expandMarkerRanges(input.plainText, composerMarkers(input, markerTypeId))
+    },
+    replaceText(text, cursorOffset = promptOffsetWidth(text)) {
+      suppressContentChange = true
+      markerRevision++
+      nextPasteId = 0
+      nextImageId = 0
+      try {
+        input.setText(text)
+        input.cursorOffset = cursorOffset
+      } finally {
+        suppressContentChange = false
+      }
+      options.onContentChange?.()
+    },
     update(nextGeometry, nextSlots) {
       const geometryChanged = !sameGeometry(geometry, nextGeometry)
       const slotsChanged = !sameSlots(slots, nextSlots)
@@ -164,5 +309,76 @@ function sameSlots(left: ComposerSlots, right: ComposerSlots): boolean {
     left.topLeft === right.topLeft &&
     left.topRight.length === right.topRight.length &&
     left.topRight.every((item, index) => item === right.topRight[index])
+  )
+}
+
+const graphemes = new Intl.Segmenter(undefined, { granularity: "grapheme" })
+
+function promptOffsetWidth(value: string): number {
+  let width = 0
+  for (const part of graphemes.segment(value)) width += part.segment === "\n" ? 1 : stringWidth(part.segment)
+  return width
+}
+
+function displayOffsetIndex(value: string, offset: number): number {
+  if (offset <= 0) return 0
+  let width = 0
+  for (const part of graphemes.segment(value)) {
+    const next = width + promptOffsetWidth(part.segment)
+    if (next > offset) return part.index
+    width = next
+  }
+  return value.length
+}
+
+function displaySlice(value: string, start = 0, end = promptOffsetWidth(value)): string {
+  return value.slice(displayOffsetIndex(value, start), displayOffsetIndex(value, end))
+}
+
+function composerMarkers(
+  input: TextareaRenderable,
+  markerTypeId: number
+): Array<Extmark & { data: ComposerMarkerData }> {
+  // OpenTUI 0.4.5 restores extmarks on undo without rebuilding its type index.
+  return input.extmarks
+    .getAll()
+    .filter(extmark => extmark.typeId === markerTypeId)
+    .filter((extmark): extmark is Extmark & { data: ComposerMarkerData } => isComposerMarkerData(extmark.data))
+    .toSorted((left, right) => left.start - right.start)
+}
+
+function imageMarkers(input: TextareaRenderable, markerTypeId: number): ImageContent[] {
+  return composerMarkers(input, markerTypeId).flatMap(marker =>
+    marker.data.type === "image" ? [marker.data.image] : []
+  )
+}
+
+function expandMarkerRanges(text: string, markers: readonly (Extmark & { data: ComposerMarkerData })[]): string {
+  return markers
+    .toSorted((left, right) => right.start - left.start)
+    .reduce(
+      (expanded, marker) =>
+        displaySlice(expanded, 0, marker.start) +
+        (marker.data.type === "paste" ? marker.data.text : "") +
+        displaySlice(expanded, marker.end),
+      text
+    )
+}
+
+function isComposerMarkerData(value: unknown): value is ComposerMarkerData {
+  if (typeof value !== "object" || value === null || !("type" in value) || !("marker" in value)) return false
+  if (typeof value.marker !== "string") return false
+  if (value.type === "paste") return "text" in value && typeof value.text === "string"
+  if (value.type !== "image" || !("image" in value)) return false
+  const image = value.image
+  return (
+    typeof image === "object" &&
+    image !== null &&
+    "type" in image &&
+    image.type === "image" &&
+    "data" in image &&
+    typeof image.data === "string" &&
+    "mimeType" in image &&
+    typeof image.mimeType === "string"
   )
 }

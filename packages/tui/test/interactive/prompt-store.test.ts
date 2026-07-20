@@ -257,6 +257,142 @@ test("session replacement cancellation remains explicit until runtime settlement
   }
 })
 
+test("clipboard images are validated, retained, and support image-only submission", async () => {
+  const session = await createSession("clipboard-image")
+  const mode = createInteractiveStore(session)
+  const clipboard = { read: async () => ({ type: "image" as const, bytes: pngBytes(), mimeType: "image/png" }) }
+  const prompt = createPromptStore(mode, new SlashController(), undefined, clipboard)
+
+  try {
+    expect(await prompt.pasteClipboard()).toBeUndefined()
+    expect(prompt.$state.get()).toMatchObject({
+      feedback: { type: "status", message: "Attached image 1 (PNG)" },
+      images: [{ type: "image", mimeType: "image/png" }]
+    })
+    expect(prompt.submit("", "steer")).toBe(true)
+    await session.waitForIdle()
+
+    const user = session.messages.find(message => message.role === "user")
+    expect(user?.content).toEqual([
+      { type: "text", text: "" },
+      { type: "image", mimeType: "image/png", data: Buffer.from(pngBytes()).toString("base64") }
+    ])
+    expect(prompt.$state.get().images).toEqual([])
+  } finally {
+    prompt.dispose()
+    mode.dispose()
+    session.dispose()
+  }
+})
+
+test("clipboard images reject unsupported models, invalid bytes, and attachment overflow", async () => {
+  const session = await createSession("clipboard-limits", ["text"])
+  const mode = createInteractiveStore(session)
+  const prompt = createPromptStore(mode, new SlashController())
+  const image = { type: "image" as const, bytes: pngBytes(), mimeType: "image/png" }
+
+  try {
+    expect(prompt.attachImage(image)).toBe(false)
+    expect(prompt.$state.get().feedback).toEqual({
+      type: "warning",
+      message: "The current model does not accept image input"
+    })
+
+    session.model.input.push("image")
+    expect(prompt.attachImage({ ...image, bytes: new TextEncoder().encode("not an image") })).toBe(false)
+    expect(prompt.$state.get().feedback).toEqual({
+      type: "warning",
+      message: "Clipboard image must be PNG, JPEG, WebP, or GIF"
+    })
+
+    for (let index = 0; index < 8; index++) expect(prompt.attachImage(image)).toBe(true)
+    expect(prompt.attachImage(image)).toBe(false)
+    expect(prompt.$state.get().feedback).toEqual({
+      type: "error",
+      message: "A prompt cannot contain more than 8 pasted images"
+    })
+  } finally {
+    prompt.dispose()
+    mode.dispose()
+    session.dispose()
+  }
+})
+
+test("a newer clipboard read supersedes stale completion", async () => {
+  const session = await createSession("clipboard-supersede")
+  const mode = createInteractiveStore(session)
+  const first = deferred<{ type: "image"; bytes: Uint8Array; mimeType: string } | undefined>()
+  let calls = 0
+  const prompt = createPromptStore(mode, new SlashController(), undefined, {
+    read: () => {
+      calls++
+      return calls === 1 ? first.promise : Promise.resolve({ type: "image", bytes: pngBytes(), mimeType: "image/png" })
+    }
+  })
+
+  try {
+    const stale = prompt.pasteClipboard()
+    await prompt.pasteClipboard()
+    first.resolve({ type: "image", bytes: pngBytes(), mimeType: "image/png" })
+    await stale
+
+    expect(prompt.$state.get().images).toHaveLength(1)
+  } finally {
+    prompt.dispose()
+    mode.dispose()
+    session.dispose()
+  }
+})
+
+test("clipboard completion cannot attach to a replacement session", async () => {
+  const first = await createSession("clipboard-first")
+  const second = await createSession("clipboard-second")
+  const mode = createInteractiveStore(first)
+  const pending = deferred<{ type: "image"; bytes: Uint8Array; mimeType: string } | undefined>()
+  const prompt = createPromptStore(mode, new SlashController(), undefined, { read: () => pending.promise })
+
+  try {
+    const paste = prompt.pasteClipboard()
+    mode.replaceSession(second)
+    pending.resolve({ type: "image", bytes: pngBytes(), mimeType: "image/png" })
+    await paste
+
+    expect(prompt.$state.get().images).toEqual([])
+    expect(prompt.$state.get().feedback).toEqual({ type: "none" })
+  } finally {
+    prompt.dispose()
+    mode.dispose()
+    first.dispose()
+    second.dispose()
+  }
+})
+
+test("clearing a prompt aborts its admitted clipboard read", async () => {
+  const session = await createSession("clipboard-cancel")
+  const mode = createInteractiveStore(session)
+  let signal: AbortSignal | undefined
+  const prompt = createPromptStore(mode, new SlashController(), undefined, {
+    read: currentSignal => {
+      signal = currentSignal
+      return new Promise((_resolve, reject) => {
+        currentSignal.addEventListener("abort", () => reject(currentSignal.reason), { once: true })
+      })
+    }
+  })
+
+  try {
+    const paste = prompt.pasteClipboard()
+    prompt.clear()
+    await paste
+    expect(signal?.aborted).toBe(true)
+    expect(prompt.$state.get().images).toEqual([])
+  } finally {
+    prompt.dispose()
+    mode.dispose()
+    session.dispose()
+  }
+})
+
 test("prompt store retains rejected input and exposes the admission error", async () => {
   const session = await createSession("disposed")
   const mode = createInteractiveStore(session)
@@ -285,9 +421,13 @@ function rejectable<T>() {
   return { promise, reject }
 }
 
-async function createSession(provider: string): Promise<AgentSession> {
+function pngBytes(): Uint8Array {
+  return Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+}
+
+async function createSession(provider: string, input: ("text" | "image")[] = ["text", "image"]): Promise<AgentSession> {
   const models = createModels()
-  const faux = fauxProvider({ provider, models: [{ id: "model" }] })
+  const faux = fauxProvider({ provider, models: [{ id: "model", input }] })
   models.setProvider(faux.provider)
   return (await createAgentRuntime({ cwd: "/work", models, persist: false })).session
 }

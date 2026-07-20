@@ -96,6 +96,26 @@ test("a started user message promotes its native root when committed", async () 
   }
 })
 
+test("user image parts render as inline numbered markers", async () => {
+  const message: AgentMessage = {
+    role: "user",
+    content: [
+      { type: "text", text: "Compare" },
+      { type: "image", mimeType: "image/png", data: "AAAA" },
+      { type: "text", text: "with" },
+      { type: "image", mimeType: "image/jpeg", data: "BBBB" }
+    ],
+    timestamp: 1
+  }
+  const harness = await createTranscriptHarness([message])
+  try {
+    await harness.setup.flush()
+    expect(harness.setup.captureCharFrame()).toContain("Compare [image #1] with [image #2]")
+  } finally {
+    harness.destroy()
+  }
+})
+
 test("streaming assistant and markdown roots keep identity across deltas", async () => {
   const harness = await createTranscriptHarness([], { streamingMessage: fauxAssistantMessage("first") })
   try {

@@ -14,6 +14,7 @@ export type PromptKeyAction =
   | "submit"
   | "follow_up"
   | "background_task"
+  | "paste_clipboard"
   | "new_line"
   | "restore_queue"
   | "interrupt"
@@ -26,6 +27,7 @@ export type TranscriptKeyAction = "page_up" | "page_down" | "line_up" | "line_do
 export interface PromptKeyContext {
   readonly pickerOpen: boolean
   readonly editorEmpty: boolean
+  readonly hasImages: boolean
   readonly streaming: boolean
   readonly foregroundShellTask: boolean
 }
@@ -46,6 +48,12 @@ const defaultBindingEntries = [
   ["app.message.followUp", ["alt+return"], "Queue a follow-up message", "reserved"],
   ["app.message.dequeue", ["alt+up"], "Restore queued messages", "overridable"],
   ["app.task.background", ["ctrl+g"], "Move the foreground shell task to the background", "overridable"],
+  [
+    "app.clipboard.paste",
+    process.platform === "win32" ? ["alt+v"] : ["ctrl+v"],
+    "Paste an image or text from the system clipboard",
+    "overridable"
+  ],
   ["tui.input.submit", ["return"], "Submit input", "reserved"],
   ["tui.input.newLine", ["shift+return"], "Insert a newline", "overridable"],
   ["tui.input.tab", ["tab"], "Complete the active input", "overridable"],
@@ -146,9 +154,10 @@ export class InteractiveKeybindings {
     }
 
     if (context.foregroundShellTask && this.matches(event, "app.task.background")) return "background_task"
+    if (this.matches(event, "app.clipboard.paste")) return "paste_clipboard"
     if (context.streaming && this.matches(event, "app.interrupt")) return "interrupt"
     if (this.matches(event, "app.clear")) return "clear"
-    if (context.editorEmpty && this.matches(event, "app.exit")) return "exit"
+    if (context.editorEmpty && !context.hasImages && this.matches(event, "app.exit")) return "exit"
     if (this.matches(event, "app.message.followUp")) return "follow_up"
     if (this.matches(event, "app.message.dequeue")) return "restore_queue"
     if (this.matches(event, "tui.input.newLine")) return "new_line"
