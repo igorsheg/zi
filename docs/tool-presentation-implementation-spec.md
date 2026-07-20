@@ -2,6 +2,8 @@
 
 Status: implemented
 
+> Amended by [`transcript-item-presentation-implementation-spec.md`](transcript-item-presentation-implementation-spec.md): the shallow semantic presentation contract remains unchanged, while transcript-item spacing, transparent tool surfaces, lifecycle-only glyphs, and open-rail chrome replace the original panel treatment.
+
 This specification replaces the current built-in `ToolDisplay` projection and tool-specific `ToolCallView` composition. The cutover is intentionally breaking inside OpenZi: old display types, projector behavior, visual fixtures, and built-in result-detail shapes are not compatibility boundaries. Persisted sessions remain readable through Pi's existing `{ content, details }` tool-result envelope. A known built-in always keeps its semantic row; obsolete or malformed details are ignored as a whole and the row degrades to bounded arguments/result content. Only unknown tool names receive the JSON-oriented generic presentation. There are no legacy tool-specific parsers or shims.
 
 See [ADR 0014](adr/0014-tool-presentation-is-semantic-data.md) for the boundary decision and [ADR 0013](adr/0013-tool-invocations-keep-one-transcript-identity.md) for invocation identity and transcript placement.
@@ -584,7 +586,7 @@ The implementation may narrow each concrete `update()` internally. Do not export
 
 ## Compact and expanded density
 
-A body hidden by compact policy produces a dense verb-first row. A compact running or failed body is a bounded peek. When the same invocation still owns in-flight execution evidence at completion, its projector retains bounded compact evidence instead of collapsing solely because the lifecycle settled; an explicit ownership handoff such as background Bash may hide it. This is a deterministic current-state projection, never renderer memory of an earlier height. Detailed mode uses the projector's explicit detailed window. Body rows use one lightweight accent rail and panel surface rather than a top/bottom box.
+A body hidden by compact policy produces a dense verb-first row. A compact running or failed body is a bounded peek. When the same invocation still owns in-flight execution evidence at completion, its projector retains bounded compact evidence instead of collapsing solely because the lifecycle settled; an explicit ownership handoff such as background Bash may hide it. This is a deterministic current-state projection, never renderer memory of an earlier height. Detailed mode uses the projector's explicit detailed window. The accepted transcript-item amendment renders visible subordinate rows on the inherited transcript surface with a lifecycle-colored open rail, semantic separator, and short closing cap.
 
 `Ctrl+O` remains a mode-owned global action:
 
@@ -787,7 +789,7 @@ For each tool, capture normal and constrained widths for:
 - compact;
 - detailed when a body exists.
 
-Visual fixtures assert accepted hierarchy and semantic colors. They do not freeze incidental spacing that native cell wrapping owns.
+Visual fixtures assert accepted hierarchy, semantic colors, transparent tool surfaces, exact one-row inter-item spacing, and the open-rail grammar. Native cell wrapping remains structural rather than snapshot-incidental: every wrapped subordinate row keeps the rail while retained row counts stay bounded.
 
 # 10. Acceptance criteria
 

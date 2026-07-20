@@ -14,6 +14,7 @@ import { projectToolPresentation, type AgentMessage } from "@openzi/coding-agent
 
 import type { Theme } from "../../theme.js"
 import type { ActiveTool } from "../interactive-store.js"
+import type { TranscriptItemView } from "./item.js"
 import { ToolCallView, type ToolViewFrame } from "./tool-view.js"
 
 // OpenTUI 0.4.5 drops Markdown blocks from the immediate frame when streaming is false.
@@ -47,29 +48,39 @@ export interface ToolCallPresentation {
   readonly args: unknown
 }
 
-export function createMessageView(
+type ItemMessage = Exclude<AgentMessage, { readonly role: "assistant" }>
+
+export function createMessageItemView(
   ctx: RenderContext,
-  message: AgentMessage,
+  message: ItemMessage,
   options: MessageRenderOptions
-): Renderable | undefined {
+): TranscriptItemView | undefined {
   switch (message.role) {
     case "user":
-      return createUserMessage(ctx, userContent(message.content), options.theme)
-    case "assistant":
-      return new StreamingAssistantView(ctx, message, options.theme, options.syntaxStyle, undefined, options.cwd).root
+      return ownItem(ctx, createUserMessage(ctx, userContent(message.content), options.theme))
     case "toolResult":
       return createToolResultView(ctx, message, options.toolCall, options.theme, options.cwd ?? "")
     case "bashExecution":
       return createBashExecutionView(ctx, message, options.theme, options.cwd ?? "")
     case "custom":
       return message.display
-        ? createPanelMessage(ctx, textContent(message.content), options.theme.text.custom, options.theme)
+        ? ownItem(ctx, createPanelMessage(ctx, textContent(message.content), options.theme.text.custom, options.theme))
         : undefined
     case "branchSummary":
     case "compactionSummary":
-      return createPanelMessage(ctx, message.summary, options.theme.text.muted, options.theme)
+      return ownItem(ctx, createPanelMessage(ctx, message.summary, options.theme.text.muted, options.theme))
     default:
       return assertNever(message)
+  }
+}
+
+function ownItem(ctx: RenderContext, root: Renderable): TranscriptItemView {
+  return {
+    root,
+    destroy() {
+      if (ctx.hasSelection) ctx.clearSelection()
+      root.destroyRecursively()
+    }
   }
 }
 
@@ -80,6 +91,7 @@ function createUserMessage(ctx: RenderContext, content: string, theme: Theme): B
     paddingBottom: 1,
     paddingLeft: 1,
     paddingRight: 1,
+    marginTop: 0,
     marginBottom: 1,
     backgroundColor: theme.surface.userMessage,
     flexShrink: 0
@@ -90,18 +102,12 @@ function createUserMessage(ctx: RenderContext, content: string, theme: Theme): B
 
 type AssistantMessage = Extract<AgentMessage, { role: "assistant" }>
 type StreamingPart =
-  | { readonly kind: "thinking"; readonly content: string; readonly followedByAnswer: boolean }
+  | { readonly kind: "thinking"; readonly content: string }
   | { readonly kind: "answer"; readonly content: string }
   | { readonly kind: "tool"; readonly tool: ActiveTool }
   | { readonly kind: "omitted-tools"; readonly count: number }
 type StreamingPartView =
-  | {
-      readonly kind: "thinking"
-      readonly root: BoxRenderable
-      readonly content: TextRenderable
-      value: string
-      followedByAnswer: boolean
-    }
+  | { readonly kind: "thinking"; readonly root: BoxRenderable; readonly content: TextRenderable; value: string }
   | { readonly kind: "answer"; readonly root: BoxRenderable; readonly content: MarkdownRenderable; value: string }
   | {
       readonly kind: "tool"
@@ -130,7 +136,6 @@ export class StreamingAssistantView {
   readonly #parts: StreamingPartView[] = []
   #error: TextRenderable | undefined
   #errorValue: string | undefined
-  #hasBottomMargin = false
 
   constructor(
     ctx: RenderContext,
@@ -150,7 +155,9 @@ export class StreamingAssistantView {
       paddingLeft: 1,
       paddingRight: 1,
       flexDirection: "column",
-      flexShrink: 0
+      flexShrink: 0,
+      marginTop: 0,
+      marginBottom: 0
     })
     this.update(message)
   }
@@ -165,7 +172,6 @@ export class StreamingAssistantView {
     const [part] = this.#parts.splice(index, 1)
     if (!part || part.kind !== "tool") return false
     this.root.remove(part.root)
-    this.#syncBottomMargin()
     return true
   }
 
@@ -176,8 +182,8 @@ export class StreamingAssistantView {
     const [part] = this.#parts.splice(index, 1)
     if (!part || part.kind !== "tool") return false
     this.root.remove(part.root)
-    this.#toolViews?.release(this, part.id, part.view)
-    part.view.destroy()
+    if (this.#toolViews) this.#toolViews.release(this, part.id, part.view)
+    else part.view.destroy()
 
     const omitted = this.#parts.find(candidate => candidate.kind === "omitted-tools")
     if (omitted?.kind === "omitted-tools") {
@@ -190,7 +196,6 @@ export class StreamingAssistantView {
       else this.root.add(marker.root)
       this.#parts.splice(index, 0, marker)
     }
-    this.#syncBottomMargin()
     return true
   }
 
@@ -206,13 +211,14 @@ export class StreamingAssistantView {
     }
 
     let changed = firstChangedKind !== parts.length || firstChangedKind !== this.#parts.length
+    if (this.#parts.length > firstChangedKind && this.#ctx.hasSelection) this.#ctx.clearSelection()
     while (this.#parts.length > firstChangedKind) {
       const part = this.#parts.pop()
       if (!part) break
       this.root.remove(part.root)
       if (part.kind === "tool") {
-        this.#toolViews?.release(this, part.id, part.view)
-        part.view.destroy()
+        if (this.#toolViews) this.#toolViews.release(this, part.id, part.view)
+        else part.view.destroy()
       } else {
         part.root.destroyRecursively()
       }
@@ -250,11 +256,6 @@ export class StreamingAssistantView {
         view.value = part.content
         changed = true
       }
-      if (part.kind === "thinking" && view.kind === "thinking" && part.followedByAnswer !== view.followedByAnswer) {
-        view.root.marginBottom = part.followedByAnswer ? 1 : 0
-        view.followedByAnswer = part.followedByAnswer
-        changed = true
-      }
     }
 
     for (let index = firstChangedKind; index < parts.length; index++) {
@@ -270,6 +271,7 @@ export class StreamingAssistantView {
     if (error !== this.#errorValue) {
       if (error === undefined) {
         if (this.#error) {
+          if (this.#ctx.hasSelection) this.#ctx.clearSelection()
           this.root.remove(this.#error)
           this.#error.destroyRecursively()
           this.#error = undefined
@@ -277,20 +279,28 @@ export class StreamingAssistantView {
       } else if (this.#error) {
         this.#error.content = error
       } else {
-        this.#error = new TextRenderable(this.#ctx, { fg: this.#theme.text.error, content: error })
+        this.#error = new TextRenderable(this.#ctx, {
+          fg: this.#theme.text.error,
+          content: error,
+          marginTop: 0,
+          marginBottom: 1
+        })
         this.root.add(this.#error)
       }
       this.#errorValue = error
       changed = true
     }
 
-    if (this.#syncBottomMargin()) changed = true
     return changed
   }
 
   destroy(): void {
+    if (this.#ctx.hasSelection) this.#ctx.clearSelection()
     for (const part of this.#parts) {
-      if (part.kind === "tool") this.#toolViews?.release(this, part.id, part.view)
+      if (part.kind !== "tool") continue
+      this.root.remove(part.root)
+      if (this.#toolViews) this.#toolViews.release(this, part.id, part.view)
+      else part.view.destroy()
     }
     this.root.destroyRecursively()
     this.#parts.length = 0
@@ -298,18 +308,18 @@ export class StreamingAssistantView {
 
   #createPart(part: StreamingPart): StreamingPartView {
     if (part.kind === "thinking") {
-      const root = new BoxRenderable(this.#ctx, { flexShrink: 0, marginBottom: part.followedByAnswer ? 1 : 0 })
+      const root = new BoxRenderable(this.#ctx, { flexShrink: 0, marginTop: 0, marginBottom: 1 })
       const content = new TextRenderable(this.#ctx, {
         fg: this.#theme.text.thinking,
         attributes: TextAttributes.ITALIC,
         content: part.content
       })
       root.add(content)
-      return { kind: "thinking", root, content, value: part.content, followedByAnswer: part.followedByAnswer }
+      return { kind: "thinking", root, content, value: part.content }
     }
 
     if (part.kind === "answer") {
-      const root = new BoxRenderable(this.#ctx, { flexShrink: 0 })
+      const root = new BoxRenderable(this.#ctx, { flexShrink: 0, marginTop: 0, marginBottom: 1 })
       const content = createMarkdown(
         this.#ctx,
         part.content,
@@ -325,7 +335,9 @@ export class StreamingAssistantView {
       const root = new TextRenderable(this.#ctx, {
         selectable: false,
         fg: this.#theme.text.muted,
-        content: omittedToolsText(part.count)
+        content: omittedToolsText(part.count),
+        marginTop: 0,
+        marginBottom: 1
       })
       return { kind: "omitted-tools", root, count: part.count }
     }
@@ -335,16 +347,7 @@ export class StreamingAssistantView {
       this.#toolViews?.create(this, tool) ??
       new ToolCallView(this.#ctx, tool.id, toolFrame(tool), this.#theme, this.#cwd)
     if (this.#toolViews) this.#toolViews.update(view, tool)
-    view.root.marginTop = this.#parts.at(-1)?.kind === "tool" || this.#parts.length === 0 ? 0 : 1
     return { kind: "tool", root: view.root, id: tool.id, view, tool }
-  }
-
-  #syncBottomMargin(): boolean {
-    const hasBottomMargin = this.#parts.at(-1)?.kind !== "tool" && (this.#parts.length > 0 || this.#error !== undefined)
-    if (hasBottomMargin === this.#hasBottomMargin) return false
-    this.root.marginBottom = hasBottomMargin ? 1 : 0
-    this.#hasBottomMargin = hasBottomMargin
-    return true
   }
 }
 
@@ -374,19 +377,15 @@ function visibleStreamingParts(message: AssistantMessage, toolViews?: AssistantT
   const parts: StreamingPart[] = []
   let directToolCount = 0
   let omittedIndex: number | undefined
-  for (let index = 0; index < message.content.length; index++) {
-    const part = message.content[index]
-    if (!part) continue
+  for (const part of message.content) {
     if (part.type === "thinking") {
-      if (!part.thinking.trim()) continue
-      const followedByAnswer = message.content
-        .slice(index + 1)
-        .some(candidate => candidate.type === "text" && candidate.text.trim().length > 0)
-      parts.push({ kind: "thinking", content: part.thinking.trimEnd(), followedByAnswer })
+      if (part.thinking.trim() || parts.at(-1)?.kind === "thinking") {
+        appendAssistantText(parts, "thinking", part.thinking)
+      }
       continue
     }
-    if (part.type === "text" && part.text.trim()) {
-      parts.push({ kind: "answer", content: part.text.trim() })
+    if (part.type === "text" && (part.text.trim() || parts.at(-1)?.kind === "answer")) {
+      appendAssistantText(parts, "answer", part.text)
     } else if (part.type === "toolCall" && part.id) {
       const included = toolViews ? toolViews.includes(part.id) : directToolCount < maxAssistantToolCalls
       directToolCount++
@@ -401,7 +400,28 @@ function visibleStreamingParts(message: AssistantMessage, toolViews?: AssistantT
       }
     }
   }
-  return parts
+  const visible: StreamingPart[] = []
+  for (const part of parts) {
+    if (part.kind === "thinking") {
+      const content = part.content.trimEnd()
+      if (content.trim()) visible.push({ kind: "thinking", content })
+    } else if (part.kind === "answer") {
+      const content = part.content.trim()
+      if (content) visible.push({ kind: "answer", content })
+    } else {
+      visible.push(part)
+    }
+  }
+  return visible
+}
+
+function appendAssistantText(parts: StreamingPart[], kind: "thinking" | "answer", content: string): void {
+  const previous = parts.at(-1)
+  if (previous?.kind === kind) {
+    parts[parts.length - 1] = { kind, content: previous.content + content }
+  } else {
+    parts.push({ kind, content })
+  }
 }
 
 function toolFromMessage(
@@ -449,7 +469,7 @@ function createToolResultView(
   call: ToolCallPresentation | undefined,
   theme: Theme,
   cwd: string
-): BoxRenderable {
+): ToolCallView {
   const source: ActiveTool = {
     id: message.toolCallId,
     name: call?.name ?? message.toolName,
@@ -457,7 +477,7 @@ function createToolResultView(
     result: { content: message.content, details: message.details },
     status: message.isError ? "failed" : "done"
   }
-  return new ToolCallView(ctx, source.id, toolFrame(source), theme, cwd).root
+  return new ToolCallView(ctx, source.id, toolFrame(source), theme, cwd)
 }
 
 function createBashExecutionView(
@@ -465,7 +485,7 @@ function createBashExecutionView(
   message: Extract<AgentMessage, { role: "bashExecution" }>,
   theme: Theme,
   cwd: string
-): BoxRenderable {
+): ToolCallView {
   const status = message.exitCode === 0 ? ("done" as const) : ("failed" as const)
   return new ToolCallView(
     ctx,
@@ -479,7 +499,7 @@ function createBashExecutionView(
           details: [],
           ...(message.exitCode === 0 ? {} : { status: `exit ${message.exitCode}` })
         },
-        body: { type: "terminal", text: message.output },
+        ...(message.output ? { body: { type: "terminal" as const, text: message.output } } : {}),
         notices: [],
         preview: {
           compact: message.exitCode === 0 ? { type: "hidden" } : { type: "edges", head: 2, tail: 3 },
@@ -490,7 +510,7 @@ function createBashExecutionView(
     },
     theme,
     cwd
-  ).root
+  )
 }
 
 function toolFrame(tool: ActiveTool): ToolViewFrame {
@@ -503,6 +523,7 @@ function createPanelMessage(ctx: RenderContext, content: string, color: string, 
     paddingBottom: 1,
     paddingLeft: 1,
     paddingRight: 1,
+    marginTop: 0,
     marginBottom: 1,
     backgroundColor: theme.surface.panel,
     flexShrink: 0

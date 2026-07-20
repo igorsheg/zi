@@ -80,7 +80,7 @@ test("Ctrl+G demotes the session-owned foreground shell task", async () => {
     fauxAssistantMessage(
       fauxToolCall(
         "bash",
-        { command: `node -e "console.log('started'); setTimeout(() => console.log('done'), 200)"` },
+        { command: `node -e "console.log('started'); setTimeout(() => console.log('done'), 1000)"` },
         { id: "bash-background" }
       ),
       { stopReason: "toolUse" }
@@ -97,6 +97,7 @@ test("Ctrl+G demotes the session-owned foreground shell task", async () => {
     input.setText("Start the command.")
     input.submit()
     await waitUntil(() => session.shellTasks.some(task => task.type === "foreground"))
+    await setup.renderOnce()
     await setup.renderOnce()
     expect(setup.captureCharFrame()).toContain("Ctrl+G background")
 

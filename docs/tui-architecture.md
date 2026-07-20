@@ -38,7 +38,8 @@ AgentSession
       -> InteractiveStore
       -> SessionScreen
           -> TranscriptView + TranscriptStore
-              -> message and tool renderables
+              -> spacing-neutral message sequences
+                  -> TranscriptItemView owners
           -> PromptView + PromptStore
               -> Composer
               -> PickerStack + PickerStackView
@@ -57,6 +58,8 @@ AgentSession
 | `Composer`               | one prompt component | native text/editing plus atomic paste and image extmarks with exact submission expansion               |
 | `PickerStack`            | one prompt component | nested frames, top-frame selection/filtering, suspended parent filters, push/pop transitions           |
 | `TranscriptStore`        | one transcript       | following versus detached navigation and unseen-output state                                           |
+| `TranscriptView`         | one transcript       | retained message projection, keyed tool placement, bounded item ordering and eviction                  |
+| `TranscriptItemView`     | one visual item      | native subtree, concrete updates and exactly one trailing transcript gap                               |
 | imperative component     | one renderable tree  | native children, subscriptions, input/mouse handlers, explicit destruction                             |
 
 The mode is cohesive, not monolithic: stores split mutable families by invariant and lifetime, while `InteractiveMode` owns their composition.
@@ -85,6 +88,7 @@ packages/tui/src/
       feedback-view.ts
       queue-view.ts
     transcript/
+      item.ts
       navigation.ts
       view.ts
       message-view.ts
@@ -150,7 +154,7 @@ The owner:
 4. installs native handlers explicitly;
 5. removes handlers and subscriptions before destroying its subtree.
 
-Durable transcript messages are appended without rebuilding existing renderables. Streaming and active-tool tails are transient and reconcile independently of committed roots. The planned stable-tail reconciliation and bounded presentation window are specified in [TUI hot-path and scaling implementation spec](tui-performance-implementation-spec.md), together with performance evidence, the OpenTUI keymap adoption trigger, owner-driven loading rules, and the custom-renderable threshold.
+Durable transcript messages are appended without rebuilding existing renderables. Streaming and active-tool tails are transient and reconcile independently of committed roots. A transcript item owns one native root, concrete update operations, destruction, and exactly one trailing blank row; assistant-message roots are spacing-neutral sequence owners because one persisted message may contain thinking, Markdown, and tool items. The narrow item contract and lifecycle-colored transparent tool grammar are specified in [Transcript item and tool chrome implementation spec](transcript-item-presentation-implementation-spec.md). Stable-tail reconciliation and bounded presentation are specified in [TUI hot-path and scaling implementation spec](tui-performance-implementation-spec.md), together with performance evidence, the OpenTUI keymap adoption trigger, owner-driven loading rules, and the custom-renderable threshold.
 
 ## State placement
 

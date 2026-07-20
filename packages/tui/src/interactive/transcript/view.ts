@@ -14,8 +14,9 @@ import type { ReadableAtom } from "nanostores"
 import type { Theme } from "../../theme.js"
 import type { InteractiveKeybindings, TranscriptKeyAction } from "../interactive-keybindings.js"
 import type { ActiveTool } from "../interactive-store.js"
+import type { TranscriptItemView } from "./item.js"
 import {
-  createMessageView,
+  createMessageItemView,
   StreamingAssistantView,
   type AssistantToolViewOwner,
   type ToolCallPresentation
@@ -46,6 +47,7 @@ interface CommittedMessageView {
   readonly messageIndex: number
   root: Renderable | undefined
   toolCallIds: string[]
+  readonly item?: TranscriptItemView
   readonly assistant?: StreamingAssistantView
 }
 
@@ -61,8 +63,8 @@ type StreamingMessageView =
   | {
       readonly type: "static"
       readonly messageIndex: number
-      readonly role: AgentMessage["role"]
-      readonly root: Renderable | undefined
+      readonly role: Exclude<AgentMessage["role"], "assistant">
+      readonly item: TranscriptItemView | undefined
     }
 
 type Mutable<T> = { -readonly [Key in keyof T]: T[Key] }
@@ -152,6 +154,7 @@ export class TranscriptView {
       if (retained?.view === view && retained.placement === "embedded" && retained.owner === owner) {
         this.#toolViews.delete(id)
       }
+      view.destroy()
     }
   }
   readonly #diagnostics: Mutable<TranscriptDiagnostics> = {
@@ -401,17 +404,17 @@ export class TranscriptView {
           this.#streaming.role === message.role
             ? this.#streaming
             : undefined
-        const root =
-          promoted?.root ??
-          createMessageView(this.#renderer, message, {
+        const item =
+          promoted?.item ??
+          createMessageItemView(this.#renderer, message, {
             theme: this.#theme,
             syntaxStyle: this.#syntaxStyle,
             cwd: sessionCwd(this.#session)
           })
         if (promoted) this.#streaming = undefined
-        if (root) {
-          if (!promoted) this.#insertBeforeTransient(root)
-          this.#committed.push({ messageIndex: index, root, toolCallIds: [] })
+        if (item) {
+          if (!promoted) this.#insertBeforeTransient(item.root)
+          this.#committed.push({ messageIndex: index, root: item.root, toolCallIds: [], item })
         }
       }
       this.#nextMessageIndex = index + 1
@@ -588,6 +591,7 @@ export class TranscriptView {
       selectable: false,
       fg: this.#theme.text.muted,
       paddingLeft: 1,
+      marginTop: 0,
       marginBottom: 1,
       flexShrink: 0,
       content: "… tool invocation not rendered"
@@ -626,6 +630,7 @@ export class TranscriptView {
       if (view.root) {
         this.scroll.remove(view.root)
         if (view.assistant) view.assistant.destroy()
+        else if (view.item) view.item.destroy()
         else view.root.destroyRecursively()
       }
     }
@@ -656,6 +661,7 @@ export class TranscriptView {
       selectable: false,
       fg: this.#theme.text.muted,
       paddingLeft: 1,
+      marginTop: 0,
       marginBottom: 1,
       flexShrink: 0,
       content
@@ -718,13 +724,13 @@ export class TranscriptView {
 
     if (this.#streaming?.type === "static" && this.#streaming.role === message.role) return
     this.#destroyStreaming()
-    const root = createMessageView(this.#renderer, message, {
+    const item = createMessageItemView(this.#renderer, message, {
       theme: this.#theme,
       syntaxStyle: this.#syntaxStyle,
       cwd: sessionCwd(this.#session)
     })
-    this.#streaming = { type: "static", messageIndex: this.#nextMessageIndex, role: message.role, root }
-    if (root) this.#insertBeforeActiveTools(root)
+    this.#streaming = { type: "static", messageIndex: this.#nextMessageIndex, role: message.role, item }
+    if (item) this.#insertBeforeActiveTools(item.root)
     this.#diagnostics.streamingCreates++
   }
 
@@ -733,7 +739,7 @@ export class TranscriptView {
     const root = streamingRoot(this.#streaming)
     if (root) this.scroll.remove(root)
     if (this.#streaming.type === "assistant") this.#streaming.view.destroy()
-    else this.#streaming.root?.destroyRecursively()
+    else this.#streaming.item?.destroy()
     this.#streaming = undefined
   }
 
@@ -830,10 +836,24 @@ export class TranscriptView {
   #clearContent(): void {
     this.#setElapsedLive(false)
     if (this.#renderer.hasSelection) this.#renderer.clearSelection()
-    for (const child of this.scroll.getChildren()) {
-      this.scroll.remove(child)
-      child.destroyRecursively()
+    const children = this.scroll.getChildren()
+    for (const child of children) this.scroll.remove(child)
+
+    const assistants = new Set(this.#committed.flatMap(record => (record.assistant ? [record.assistant] : [])))
+    if (this.#streaming?.type === "assistant") assistants.add(this.#streaming.view)
+    for (const assistant of assistants) assistant.destroy()
+
+    const items = new Set(this.#committed.flatMap(record => (record.item ? [record.item] : [])))
+    if (this.#streaming?.type === "static" && this.#streaming.item) items.add(this.#streaming.item)
+    for (const item of items) item.destroy()
+
+    for (const { view } of this.#toolViews.values()) {
+      if (!view.root.isDestroyed) view.destroy()
     }
+    for (const child of children) {
+      if (!child.isDestroyed) child.destroyRecursively()
+    }
+
     this.#committed.length = 0
     this.#pendingToolCalls.clear()
     this.#projectedToolIds.clear()
@@ -983,7 +1003,7 @@ function sessionCwd(session: TranscriptSession): string {
 }
 
 function streamingRoot(streaming: StreamingMessageView): Renderable | undefined {
-  return streaming.type === "assistant" ? streaming.view.root : streaming.root
+  return streaming.type === "assistant" ? streaming.view.root : streaming.item?.root
 }
 
 function sameOrder(left: readonly string[], right: readonly string[]): boolean {

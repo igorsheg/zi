@@ -9,6 +9,7 @@ import { atom, type WritableAtom } from "nanostores"
 import { TuiDiagnosticsOverlay } from "../../src/interactive/diagnostics.js"
 import { InteractiveKeybindings } from "../../src/interactive/interactive-keybindings.js"
 import type { ActiveTool } from "../../src/interactive/interactive-store.js"
+import { createMessageItemView, StreamingAssistantView } from "../../src/interactive/transcript/message-view.js"
 import { TranscriptView } from "../../src/interactive/transcript/view.js"
 import { createSyntaxStyle, defaultTheme } from "../../src/theme.js"
 import { renderMarkdownSettled } from "./harness.js"
@@ -113,6 +114,84 @@ test("user image parts render as inline numbered markers", async () => {
     expect(harness.setup.captureCharFrame()).toContain("Compare [image #1] with [image #2]")
   } finally {
     harness.destroy()
+  }
+})
+
+test("assistant sequences coalesce adjacent semantic parts and give every item one trailing row", async () => {
+  const setup = await createTestRenderer({ width: 60, height: 20, useThread: false })
+  const syntaxStyle = createSyntaxStyle(defaultTheme)
+  const message = {
+    ...fauxAssistantMessage(
+      [
+        { type: "thinking" as const, thinking: "first" },
+        { type: "thinking" as const, thinking: " second" },
+        fauxText("answer"),
+        fauxText(" continued"),
+        fauxToolCall("read", { path: "file.ts" }, { id: "item-tool" }),
+        fauxText("after")
+      ],
+      { stopReason: "error" }
+    ),
+    errorMessage: "Assistant failed"
+  }
+  const view = new StreamingAssistantView(setup.renderer, message, defaultTheme, syntaxStyle, undefined, "/work")
+  setup.renderer.root.add(view.root)
+
+  try {
+    await setup.renderOnce()
+    const items = view.root.getChildren()
+    expect(items).toHaveLength(5)
+    expect(descendantsOfType(view.root, MarkdownRenderable)).toHaveLength(2)
+    const rows = setup
+      .captureCharFrame()
+      .split("\n")
+      .map(row => row.trim())
+    const thinking = rows.indexOf("first second")
+    const answer = rows.indexOf("answer continued")
+    const after = rows.indexOf("after")
+    const error = rows.indexOf("Assistant failed")
+    expect(answer - thinking).toBe(2)
+    expect(rows[answer + 1]).toBe("")
+    expect(rows[after - 1]).toBe("")
+    expect(error - after).toBe(2)
+    expect(rows[error + 1]).toBe("")
+    expect(view.toolCallIds).toEqual(["item-tool"])
+  } finally {
+    view.destroy()
+    syntaxStyle.destroy()
+    setup.renderer.destroy()
+  }
+})
+
+test("empty historical Bash failures stay header-only", async () => {
+  const setup = await createTestRenderer({ width: 48, height: 8, useThread: false })
+  const syntaxStyle = createSyntaxStyle(defaultTheme)
+  const item = createMessageItemView(
+    setup.renderer,
+    {
+      role: "bashExecution",
+      command: "false",
+      output: "",
+      truncated: false,
+      exitCode: 1,
+      cancelled: false,
+      timestamp: 1
+    },
+    { theme: defaultTheme, syntaxStyle, cwd: "/work" }
+  )
+  if (!item) throw new Error("Historical Bash item not created")
+  setup.renderer.root.add(item.root)
+
+  try {
+    await setup.renderOnce()
+    const frame = setup.captureCharFrame()
+    expect(frame).toContain("◆ Run false · exit 1")
+    expect(frame).not.toContain("│")
+    expect(frame).not.toContain("╰───")
+  } finally {
+    item.destroy()
+    syntaxStyle.destroy()
+    setup.renderer.destroy()
   }
 })
 
@@ -684,6 +763,18 @@ function requiredRenderable(harness: TranscriptHarness, id: string): Renderable 
   const renderable = harness.setup.renderer.root.findDescendantById(id)
   if (!renderable) throw new Error(`Renderable not found: ${id}`)
   return renderable
+}
+
+function descendantsOfType<T extends Renderable>(root: Renderable, type: abstract new (...args: never[]) => T): T[] {
+  const matches: T[] = []
+  const pending = [...root.getChildren()]
+  while (pending.length > 0) {
+    const candidate = pending.shift()
+    if (!candidate) continue
+    if (candidate instanceof type) matches.push(candidate)
+    pending.push(...candidate.getChildren())
+  }
+  return matches
 }
 
 function descendant<T extends Renderable>(root: Renderable, type: abstract new (...args: never[]) => T): T {

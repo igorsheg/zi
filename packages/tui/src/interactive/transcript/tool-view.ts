@@ -3,6 +3,8 @@ import { pathToFileURL } from "node:url"
 
 import { BoxRenderable, fg, link, StyledText, TextAttributes, TextRenderable, type RenderContext } from "@opentui/core"
 import {
+  maxExpandedToolRows,
+  maxToolPreviewRows,
   splitTextLines,
   type ToolBody,
   type ToolHeader,
@@ -13,9 +15,18 @@ import {
   type ToolPreviewWindow
 } from "@openzi/coding-agent"
 
-import { textWidth, truncateToCells, wrapHeadToCells, wrapTailToCells } from "../../components/cell-text.js"
+import {
+  openTuiTabIndicator,
+  openTuiTabWidth,
+  textWidth,
+  truncateToCells,
+  wrapHeadToCells,
+  wrapTailToCells,
+  wrapToCells
+} from "../../components/cell-text.js"
 import { glyphs } from "../../glyphs.js"
 import type { Theme } from "../../theme.js"
+import type { TranscriptItemView } from "./item.js"
 
 export type ToolStatus = ToolPresentationSource["status"]
 
@@ -33,18 +44,22 @@ const toolRailTone = {
   aborted: "error"
 } as const satisfies Record<ToolStatus, keyof Theme["text"]>
 
-type LineTone = "output" | "normal" | "muted" | "warning" | "success" | "error"
+type LineTone = "output" | "context" | "muted" | "warning" | "success" | "error"
 
 interface PresentationLine {
   readonly text: string
   readonly tone: LineTone
-  readonly prefix?: string
-  readonly prefixTone?: LineTone
+  readonly gutter?: string
+  readonly gutterTone?: LineTone
+  readonly marker?: string
+  readonly markerTone?: LineTone
+  readonly selectable?: boolean
 }
 
 interface OwnedToolBodyView {
   readonly root: BoxRenderable
   readonly type: ToolBody["type"]
+  readonly hasVisibleRows: boolean
   update(body: ToolBody): boolean
   setPreview(preview: ToolPreviewPolicy): boolean
   setExpanded(expanded: boolean): boolean
@@ -53,27 +68,32 @@ interface OwnedToolBodyView {
   destroy(): void
 }
 
-export class ToolCallView {
+export class ToolCallView implements TranscriptItemView {
   readonly root: BoxRenderable
 
   readonly #ctx: RenderContext
   readonly #header: ToolHeaderView
+  readonly #secondary: ToolSecondaryView
+  readonly #separator: TextRenderable
   readonly #notices: ToolNoticeView
-  readonly #action: TextRenderable
+  readonly #action: ToolActionHintView
+  readonly #cap: TextRenderable
   readonly #theme: Theme
   readonly #expandHint: string | undefined
   #frame: ToolViewFrame
   #body: OwnedToolBodyView | undefined
   #expanded = false
+  #embedded = false
   #contentWidth = 76
   #startedAt: number | undefined
   #endedAt: number | undefined
   #timingValue: string | undefined
-  #actionHint: string | undefined
+  #chromeStatus: ToolStatus
 
   constructor(ctx: RenderContext, id: string, frame: ToolViewFrame, theme: Theme, cwd: string, expandHint?: string) {
     this.#ctx = ctx
     this.#frame = frame
+    this.#chromeStatus = frame.status
     this.#theme = theme
     this.#expandHint = expandHint
     this.root = new BoxRenderable(ctx, {
@@ -82,28 +102,54 @@ export class ToolCallView {
       paddingRight: 1,
       flexDirection: "column",
       flexShrink: 0,
+      marginTop: 0,
       marginBottom: 1
     })
-    this.#header = new ToolHeaderView(
+    this.#header = new ToolHeaderView(ctx, frame.presentation.header, frame.status, theme, cwd)
+    this.#secondary = new ToolSecondaryView(
       ctx,
-      frame.presentation.header,
+      frame.presentation.header.secondary,
       frame.status,
-      isFoldable(frame.presentation),
-      hasCompactBody(frame.presentation),
       theme,
-      cwd
+      cwd,
+      expandHint
     )
-    this.#notices = new ToolNoticeView(ctx, frame.presentation.notices, theme, cwd)
-    this.#action = new TextRenderable(ctx, { fg: theme.text.muted, visible: false, wrapMode: "word" })
+    this.#separator = new TextRenderable(ctx, {
+      selectable: false,
+      content: glyphs.toolSeparator,
+      fg: railColor(frame.status, theme),
+      visible: false,
+      wrapMode: "none"
+    })
+    this.#notices = new ToolNoticeView(ctx, frame.presentation.notices, frame.status, theme, cwd, expandHint)
+    this.#action = new ToolActionHintView(ctx, frame.status, theme)
+    this.#cap = new TextRenderable(ctx, {
+      selectable: false,
+      content: glyphs.toolCap,
+      fg: railColor(frame.status, theme),
+      visible: false,
+      wrapMode: "none"
+    })
+
     this.root.add(this.#header.root)
+    this.root.add(this.#secondary.root)
+    this.root.add(this.#separator)
     this.#body = frame.presentation.body
       ? createBodyView(ctx, frame.presentation.body, frame.presentation.preview, frame.status, theme, expandHint)
       : undefined
+    this.#contentWidth = Math.max(1, ctx.width - 2)
+    this.#header.setWidth(this.#contentWidth)
+    this.#secondary.setWidth(this.#contentWidth)
+    this.#body?.setWidth(this.#contentWidth)
+    this.#notices.setWidth(this.#contentWidth)
+    this.#action.setWidth(this.#contentWidth)
     if (this.#body) this.root.add(this.#body.root)
     this.root.add(this.#notices.root)
-    this.root.add(this.#action)
+    this.root.add(this.#action.root)
+    this.root.add(this.#cap)
     this.#trackTiming(undefined, frame.status)
     this.#syncTiming()
+    this.#syncChrome()
     this.root.onSizeChange = () => this.#syncWidth()
   }
 
@@ -117,15 +163,14 @@ export class ToolCallView {
     this.#frame = frame
     this.#trackTiming(previous.status, frame.status)
 
-    let changed = this.#header.update(
-      frame.presentation.header,
-      frame.status,
-      isFoldable(frame.presentation),
-      hasCompactBody(frame.presentation)
-    )
+    let changed = this.#header.update(frame.presentation.header, frame.status)
+    if (this.#secondary.update(frame.presentation.header.secondary, frame.status)) changed = true
     if (this.#syncBody(frame.presentation.body, frame.presentation.preview, frame.status)) changed = true
     if (this.#notices.update(frame.presentation.notices)) changed = true
+    if (this.#notices.setStatus(frame.status)) changed = true
+    if (this.#action.setStatus(frame.status)) changed = true
     if (this.#syncTiming()) changed = true
+    if (this.#syncChrome()) changed = true
     return changed
   }
 
@@ -138,23 +183,26 @@ export class ToolCallView {
     if (expanded === this.#expanded) return false
     this.#expanded = expanded
     this.#header.setExpanded(expanded)
+    this.#secondary.setExpanded(expanded)
     this.#body?.setExpanded(expanded)
     this.#notices.setExpanded(expanded)
     this.#syncTiming()
+    this.#syncChrome()
     return true
   }
 
   setActionHint(hint: string | undefined): boolean {
-    if (hint === this.#actionHint) return false
-    this.#actionHint = hint
-    this.#action.visible = hint !== undefined
-    if (hint !== undefined) this.#action.content = `  ${hint}`
+    if (!this.#action.setHint(hint)) return false
+    this.#syncChrome()
     return true
   }
 
   setEmbedded(embedded: boolean): void {
+    if (embedded === this.#embedded) return
+    this.#embedded = embedded
     this.root.paddingLeft = embedded ? 0 : 1
     this.root.paddingRight = embedded ? 0 : 1
+    this.#syncWidth()
   }
 
   destroy(): void {
@@ -191,12 +239,43 @@ export class ToolCallView {
     return changed
   }
 
+  #syncChrome(): boolean {
+    const status = this.#frame.status
+    const evidenceVisible =
+      (this.#body?.hasVisibleRows ?? false) || this.#notices.hasVisibleRows || this.#action.hasVisibleRows
+    const secondaryVisible =
+      this.#frame.presentation.header.secondary !== undefined &&
+      (this.#expanded || evidenceVisible || status === "running" || status === "failed" || status === "aborted")
+    let changed = this.#secondary.setVisible(secondaryVisible)
+    const separatorVisible = this.#secondary.hasVisibleRows && evidenceVisible
+    const capVisible = this.#secondary.hasVisibleRows || evidenceVisible
+    if (this.#separator.visible !== separatorVisible) {
+      this.#separator.visible = separatorVisible
+      changed = true
+    }
+    if (this.#cap.visible !== capVisible) {
+      this.#cap.visible = capVisible
+      changed = true
+    }
+    if (status !== this.#chromeStatus) {
+      const color = railColor(status, this.#theme)
+      this.#separator.fg = color
+      this.#cap.fg = color
+      this.#chromeStatus = status
+      changed = true
+    }
+    return changed
+  }
+
   #syncWidth(): void {
-    const width = Math.max(1, this.root.width - 4)
+    const width = Math.max(1, this.root.width - (this.#embedded ? 0 : 2))
     if (width === this.#contentWidth) return
     this.#contentWidth = width
     this.#header.setWidth(width)
+    this.#secondary.setWidth(width)
     this.#body?.setWidth(width)
+    this.#notices.setWidth(width)
+    this.#action.setWidth(width)
   }
 
   #trackTiming(previous: ToolStatus | undefined, next: ToolStatus): void {
@@ -229,7 +308,6 @@ class ToolHeaderView {
 
   readonly #theme: Theme
   readonly #cwd: string
-  readonly #primary: BoxRenderable
   readonly #bullet: TextRenderable
   readonly #label: TextRenderable
   readonly #subject: TextRenderable
@@ -237,36 +315,26 @@ class ToolHeaderView {
   readonly #delta: TextRenderable
   readonly #status: TextRenderable
   readonly #timing: TextRenderable
-  readonly #secondaryRow: BoxRenderable
-  readonly #secondary: TextRenderable
   #header: ToolHeader
   #toolStatus: ToolStatus
-  #foldable: boolean
-  #compactBodyVisible: boolean
   #expanded = false
   #timingText: string | undefined
   #width = 76
 
-  constructor(
-    ctx: RenderContext,
-    header: ToolHeader,
-    status: ToolStatus,
-    foldable: boolean,
-    compactBodyVisible: boolean,
-    theme: Theme,
-    cwd: string
-  ) {
+  constructor(ctx: RenderContext, header: ToolHeader, status: ToolStatus, theme: Theme, cwd: string) {
     this.#header = header
     this.#toolStatus = status
-    this.#foldable = foldable
-    this.#compactBodyVisible = compactBodyVisible
     this.#theme = theme
     this.#cwd = cwd
-    this.root = new BoxRenderable(ctx, { flexDirection: "column", flexShrink: 0 })
-    this.#primary = new BoxRenderable(ctx, { flexDirection: "row", flexShrink: 0 })
+    this.root = new BoxRenderable(ctx, { flexDirection: "row", flexShrink: 0 })
     this.#bullet = new TextRenderable(ctx, { selectable: false, wrapMode: "none", flexShrink: 0 })
     this.#label = new TextRenderable(ctx, { selectable: false, wrapMode: "none", flexShrink: 0 })
-    this.#subject = new TextRenderable(ctx, { fg: theme.text.primary, wrapMode: "none", flexShrink: 1 })
+    this.#subject = new TextRenderable(ctx, {
+      fg: theme.text.primary,
+      wrapMode: "none",
+      tabIndicator: openTuiTabIndicator,
+      flexShrink: 1
+    })
     this.#details = new TextRenderable(ctx, {
       selectable: false,
       fg: theme.text.muted,
@@ -276,36 +344,21 @@ class ToolHeaderView {
     this.#delta = new TextRenderable(ctx, { selectable: false, wrapMode: "none", flexShrink: 0 })
     this.#status = new TextRenderable(ctx, { selectable: false, wrapMode: "none", flexShrink: 0 })
     this.#timing = new TextRenderable(ctx, { selectable: false, fg: theme.text.muted, wrapMode: "none" })
-    this.#secondaryRow = new BoxRenderable(ctx, { flexDirection: "row", flexShrink: 0, visible: false })
-    this.#secondary = new TextRenderable(ctx, { fg: theme.text.primary, wrapMode: "word", flexShrink: 1 })
 
-    this.#primary.add(this.#bullet)
-    this.#primary.add(this.#label)
-    this.#primary.add(this.#subject)
-    this.#primary.add(this.#details)
-    this.#primary.add(this.#delta)
-    this.#primary.add(this.#status)
-    this.#primary.add(this.#timing)
-    this.#secondaryRow.add(new TextRenderable(ctx, { selectable: false, content: "  ", wrapMode: "none" }))
-    this.#secondaryRow.add(this.#secondary)
-    this.root.add(this.#primary)
-    this.root.add(this.#secondaryRow)
+    this.root.add(this.#bullet)
+    this.root.add(this.#label)
+    this.root.add(this.#subject)
+    this.root.add(this.#details)
+    this.root.add(this.#delta)
+    this.root.add(this.#status)
+    this.root.add(this.#timing)
     this.#render()
   }
 
-  update(header: ToolHeader, status: ToolStatus, foldable: boolean, compactBodyVisible: boolean): boolean {
-    if (
-      sameHeader(header, this.#header) &&
-      status === this.#toolStatus &&
-      foldable === this.#foldable &&
-      compactBodyVisible === this.#compactBodyVisible
-    ) {
-      return false
-    }
+  update(header: ToolHeader, status: ToolStatus): boolean {
+    if (sameHeader(header, this.#header) && status === this.#toolStatus) return false
     this.#header = header
     this.#toolStatus = status
-    this.#foldable = foldable
-    this.#compactBodyVisible = compactBodyVisible
     this.#render()
     return true
   }
@@ -334,7 +387,7 @@ class ToolHeaderView {
   #render(): void {
     const header = this.#header
     const status = header.status ?? lifecycleStatus(this.#toolStatus)
-    this.#bullet.content = this.#expanded && this.#foldable ? glyphs.toolExpanded : toolGlyph(this.#toolStatus)
+    this.#bullet.content = toolGlyph(this.#toolStatus)
     this.#bullet.fg = statusColor(this.#toolStatus, this.#theme)
     this.#label.content = new StyledText([
       {
@@ -343,6 +396,7 @@ class ToolHeaderView {
       }
     ])
     const details = this.#detailsText(status)
+    this.#subject.visible = header.subject !== undefined
     this.#subject.content = subjectContent(
       header.subject,
       this.#theme,
@@ -367,24 +421,6 @@ class ToolHeaderView {
     this.#status.fg = statusColor(this.#toolStatus, this.#theme)
     this.#timing.visible = this.#timingText !== undefined
     this.#timing.content = this.#timingText === undefined ? "" : ` · ${this.#timingText}`
-
-    const showSecondary =
-      header.secondary !== undefined &&
-      (this.#expanded ||
-        this.#compactBodyVisible ||
-        this.#toolStatus === "running" ||
-        this.#toolStatus === "failed" ||
-        this.#toolStatus === "aborted")
-    this.#secondaryRow.visible = showSecondary
-    if (showSecondary) {
-      this.#secondary.content = subjectContent(
-        header.secondary,
-        this.#theme,
-        this.#cwd,
-        Math.max(1, this.#width - 2),
-        false
-      )
-    }
   }
 
   #detailsText(status: string | undefined): string {
@@ -427,6 +463,337 @@ class ToolHeaderView {
   }
 }
 
+interface SecondaryLine {
+  readonly type: "path" | "task" | "text" | "omission"
+  readonly text: string
+  readonly linkPath?: string
+}
+
+class ToolSecondaryView {
+  readonly root: BoxRenderable
+
+  readonly #ctx: RenderContext
+  readonly #theme: Theme
+  readonly #cwd: string
+  readonly #expandHint: string | undefined
+  readonly #command: SecondaryCommandView
+  readonly #rows: SecondaryRowView[] = []
+  #subject: ToolHeader["secondary"]
+  #status: ToolStatus
+  #visible = false
+  #expanded = false
+  #width = 76
+
+  constructor(
+    ctx: RenderContext,
+    subject: ToolHeader["secondary"],
+    status: ToolStatus,
+    theme: Theme,
+    cwd: string,
+    expandHint?: string
+  ) {
+    this.#ctx = ctx
+    this.#subject = subject
+    this.#status = status
+    this.#theme = theme
+    this.#cwd = cwd
+    this.#expandHint = expandHint
+    this.root = new BoxRenderable(ctx, { flexDirection: "column", flexShrink: 0 })
+    this.#command = new SecondaryCommandView(ctx, status, theme)
+    this.root.add(this.#command.root)
+  }
+
+  get hasVisibleRows(): boolean {
+    return this.#command.hasVisibleRows || this.#rows.length > 0
+  }
+
+  update(subject: ToolHeader["secondary"], status: ToolStatus): boolean {
+    const contentChanged = !sameSubject(subject, this.#subject)
+    const statusChanged = status !== this.#status
+    if (!contentChanged && !statusChanged) return false
+    this.#subject = subject
+    this.#status = status
+    this.#command.setStatus(status)
+    for (const row of this.#rows) row.setStatus(status)
+    if (contentChanged) this.#render()
+    return true
+  }
+
+  setVisible(visible: boolean): boolean {
+    if (visible === this.#visible) return false
+    this.#visible = visible
+    this.#render()
+    return true
+  }
+
+  setExpanded(expanded: boolean): boolean {
+    if (expanded === this.#expanded) return false
+    this.#expanded = expanded
+    this.#render()
+    return true
+  }
+
+  setWidth(width: number): boolean {
+    if (width === this.#width) return false
+    this.#width = width
+    this.#render()
+    return true
+  }
+
+  #render(): void {
+    const subject = this.#visible ? this.#subject : undefined
+    const limit = this.#expanded ? maxExpandedToolRows : maxToolPreviewRows
+    const omission = densityOmission("more context", this.#expanded, this.#expandHint)
+    if (subject?.type === "command") {
+      this.#clearRows()
+      this.#command.update(subject.text, subject.prompt, this.#width, limit, omission)
+      return
+    }
+
+    this.#command.hide()
+    const lines = subject ? secondaryLines(subject, this.#cwd, this.#width, limit, omission) : []
+    this.#reconcileRows(lines)
+  }
+
+  #reconcileRows(lines: readonly SecondaryLine[]): void {
+    if (this.#rows.length > lines.length && this.#ctx.hasSelection) this.#ctx.clearSelection()
+    while (this.#rows.length > lines.length) {
+      const row = this.#rows.pop()!
+      this.root.remove(row.root)
+      row.root.destroyRecursively()
+    }
+    while (this.#rows.length < lines.length) {
+      const row = new SecondaryRowView(this.#ctx, this.#status, this.#theme, this.#cwd)
+      this.root.add(row.root)
+      this.#rows.push(row)
+    }
+    for (let index = 0; index < lines.length; index++) this.#rows[index]!.update(lines[index]!, this.#status)
+  }
+
+  #clearRows(): void {
+    this.#reconcileRows([])
+  }
+}
+
+class SecondaryCommandView {
+  readonly root: BoxRenderable
+
+  readonly #ctx: RenderContext
+  readonly #theme: Theme
+  readonly #commandRow: BoxRenderable
+  readonly #rail: TextRenderable
+  readonly #prompt: TextRenderable
+  readonly #content: TextRenderable
+  readonly #omission: SecondaryRowView
+  #status: ToolStatus
+  #rowCount = 0
+
+  constructor(ctx: RenderContext, status: ToolStatus, theme: Theme) {
+    this.#ctx = ctx
+    this.#status = status
+    this.#theme = theme
+    this.root = new BoxRenderable(ctx, { flexDirection: "column", flexShrink: 0 })
+    this.#commandRow = new BoxRenderable(ctx, { flexDirection: "row", flexShrink: 0, visible: false })
+    this.#rail = new TextRenderable(ctx, { selectable: false, wrapMode: "none", flexShrink: 0 })
+    this.#prompt = new TextRenderable(ctx, { selectable: false, fg: theme.text.dim, wrapMode: "none", flexShrink: 0 })
+    this.#content = new TextRenderable(ctx, { wrapMode: "char", tabIndicator: openTuiTabIndicator, flexShrink: 0 })
+    this.#commandRow.add(this.#rail)
+    this.#commandRow.add(this.#prompt)
+    this.#commandRow.add(this.#content)
+    this.#omission = new SecondaryRowView(ctx, status, theme, "")
+    this.#omission.root.visible = false
+    this.root.add(this.#commandRow)
+    this.root.add(this.#omission.root)
+  }
+
+  get hasVisibleRows(): boolean {
+    return this.#rowCount > 0
+  }
+
+  update(text: string, prompt: boolean, width: number, limit: number, omission: string): void {
+    const promptWidth = prompt ? 2 : 0
+    const contentWidth = Math.max(openTuiTabWidth, width - textWidth(glyphs.toolRail) - promptWidth)
+    const projection = commandProjection(text, contentWidth, limit)
+    this.#rowCount = projection.rows + (projection.omitted ? 1 : 0)
+    this.#commandRow.visible = projection.rows > 0
+    this.#omission.root.visible = projection.omitted
+    if (projection.rows > 0) {
+      this.#rail.content = Array.from({ length: projection.rows }, () => glyphs.toolRail).join("\n")
+      this.#rail.fg = railColor(this.#status, this.#theme)
+      this.#prompt.visible = prompt
+      if (prompt) {
+        this.#prompt.content = Array.from({ length: projection.rows }, (_, index) => (index === 0 ? "$ " : "  ")).join(
+          "\n"
+        )
+      }
+      this.#content.width = contentWidth
+      this.#content.content = commandContent(projection.text, false, this.#theme, contentWidth, false)
+    }
+    if (projection.omitted) {
+      this.#omission.update({ type: "omission", text: omission }, this.#status)
+    }
+  }
+
+  hide(): void {
+    if (this.#rowCount > 0 && this.#ctx.hasSelection) this.#ctx.clearSelection()
+    this.#rowCount = 0
+    this.#commandRow.visible = false
+    this.#omission.root.visible = false
+  }
+
+  setStatus(status: ToolStatus): void {
+    if (status === this.#status) return
+    this.#status = status
+    this.#rail.fg = railColor(status, this.#theme)
+    this.#omission.setStatus(status)
+  }
+}
+
+class SecondaryRowView {
+  readonly root: BoxRenderable
+
+  readonly #theme: Theme
+  readonly #cwd: string
+  readonly #rail: TextRenderable
+  readonly #content: TextRenderable
+  #line: SecondaryLine | undefined
+  #status: ToolStatus
+
+  constructor(ctx: RenderContext, status: ToolStatus, theme: Theme, cwd: string) {
+    this.#status = status
+    this.#theme = theme
+    this.#cwd = cwd
+    this.root = new BoxRenderable(ctx, { flexDirection: "row", flexShrink: 0 })
+    this.#rail = new TextRenderable(ctx, {
+      selectable: false,
+      content: glyphs.toolRail,
+      fg: railColor(status, theme),
+      wrapMode: "none",
+      flexShrink: 0
+    })
+    this.#content = new TextRenderable(ctx, { wrapMode: "none", tabIndicator: openTuiTabIndicator, flexShrink: 1 })
+    this.root.add(this.#rail)
+    this.root.add(this.#content)
+  }
+
+  update(line: SecondaryLine, status: ToolStatus): void {
+    this.setStatus(status)
+    if (this.#line?.type === line.type && this.#line.text === line.text && this.#line.linkPath === line.linkPath) return
+    this.#line = line
+    this.#content.selectable = line.type !== "omission"
+    switch (line.type) {
+      case "path":
+        this.#content.content = new StyledText([
+          fg(this.#theme.text.primary)(link(fileUrl(this.#cwd, line.linkPath ?? line.text))(line.text))
+        ])
+        break
+      case "task":
+        this.#content.content = new StyledText([fg(this.#theme.text.accent)(line.text)])
+        break
+      case "text":
+        this.#content.content = line.text
+        this.#content.fg = this.#theme.text.primary
+        break
+      case "omission":
+        this.#content.content = line.text
+        this.#content.fg = this.#theme.text.muted
+        break
+      default:
+        assertNever(line.type)
+    }
+  }
+
+  setStatus(status: ToolStatus): void {
+    if (status === this.#status) return
+    this.#status = status
+    this.#rail.fg = railColor(status, this.#theme)
+  }
+}
+
+interface CommandProjection {
+  readonly text: string
+  readonly rows: number
+  readonly omitted: boolean
+}
+
+function commandProjection(text: string, width: number, limit: number): CommandProjection {
+  const full = commandHead(text, width, limit)
+  if (!full.hasMore) return { text, rows: full.rows, omitted: false }
+  const head = commandHead(text, width, Math.max(0, limit - 1))
+  return { text: head.text, rows: head.rows, omitted: true }
+}
+
+function commandHead(
+  text: string,
+  width: number,
+  limit: number
+): { readonly text: string; readonly rows: number; readonly hasMore: boolean } {
+  const logicalLines = text.length === 0 ? [] : text.split("\n")
+  let output = ""
+  let rows = 0
+  for (let index = 0; index < logicalLines.length; index++) {
+    if (rows === limit) return { text: output, rows, hasMore: true }
+    const wrapped = wrapHeadToCells(logicalLines[index]!, width, limit - rows)
+    if (index > 0) output += "\n"
+    output += wrapped.lines.join("")
+    rows += wrapped.lines.length
+    if (wrapped.hasMore || (rows === limit && index < logicalLines.length - 1)) {
+      return { text: output, rows, hasMore: true }
+    }
+  }
+  return { text: output, rows, hasMore: false }
+}
+
+function secondaryLines(
+  subject: Exclude<NonNullable<ToolHeader["secondary"]>, { readonly type: "command" }>,
+  cwd: string,
+  width: number,
+  limit: number,
+  omission: string
+): SecondaryLine[] {
+  const available = Math.max(1, width - textWidth(glyphs.toolRail))
+  switch (subject.type) {
+    case "path":
+      return [{ type: "path", text: displayPath(cwd, subject.path, available, false), linkPath: subject.path }]
+    case "task":
+      return boundedSecondaryLines("task", subject.id, available, limit, omission)
+    case "text":
+      return boundedSecondaryLines("text", subject.text, available, limit, omission)
+    default:
+      return assertNever(subject)
+  }
+}
+
+function boundedSecondaryLines(
+  type: "task" | "text",
+  text: string,
+  width: number,
+  limit: number,
+  omission: string
+): SecondaryLine[] {
+  const full = wrappedHead(text, width, limit)
+  if (!full.hasMore) return full.lines.map(line => ({ type, text: line }))
+  const head = wrappedHead(text, width, Math.max(0, limit - 1))
+  return [...head.lines.map(line => ({ type, text: line })), { type: "omission", text: omission }]
+}
+
+function wrappedHead(
+  text: string,
+  width: number,
+  limit: number
+): { readonly lines: readonly string[]; readonly hasMore: boolean } {
+  const output: string[] = []
+  const logicalLines = splitTextLines(text)
+  for (let index = 0; index < logicalLines.length; index++) {
+    const wrapped = wrapHeadToCells(logicalLines[index]!, width, limit - output.length)
+    output.push(...wrapped.lines)
+    if (wrapped.hasMore || (output.length === limit && index < logicalLines.length - 1)) {
+      return { lines: output, hasMore: true }
+    }
+  }
+  return { lines: output, hasMore: false }
+}
+
 abstract class RowBodyView implements OwnedToolBodyView {
   readonly root: BoxRenderable
   abstract readonly type: ToolBody["type"]
@@ -434,14 +801,12 @@ abstract class RowBodyView implements OwnedToolBodyView {
   readonly #ctx: RenderContext
   readonly #theme: Theme
   readonly #expandHint: string | undefined
-  readonly #rows: TextRenderable[] = []
+  readonly #rows: PresentationRowView[] = []
   #body: ToolBody
   #preview: ToolPreviewPolicy
   #status: ToolStatus
   #expanded = false
   #width = 76
-  #rendered: readonly PresentationLine[] = []
-  #renderedStatus: ToolStatus | undefined
 
   constructor(
     ctx: RenderContext,
@@ -459,6 +824,10 @@ abstract class RowBodyView implements OwnedToolBodyView {
     this.#expandHint = expandHint
     this.root = new BoxRenderable(ctx, { flexDirection: "column", flexShrink: 0 })
     this.#render()
+  }
+
+  get hasVisibleRows(): boolean {
+    return this.#rows.length > 0
   }
 
   update(body: ToolBody): boolean {
@@ -485,7 +854,7 @@ abstract class RowBodyView implements OwnedToolBodyView {
   setStatus(status: ToolStatus): boolean {
     if (status === this.#status) return false
     this.#status = status
-    this.#render()
+    for (const row of this.#rows) row.setStatus(status)
     return true
   }
 
@@ -517,7 +886,7 @@ abstract class RowBodyView implements OwnedToolBodyView {
       return
     }
     const lines = this.projectLines(
-      Math.max(1, this.#width - textWidth(glyphs.toolBody)),
+      Math.max(1, this.#width - textWidth(glyphs.toolRail)),
       policy,
       this.#expanded ? undefined : this.#expandHint
     )
@@ -525,50 +894,84 @@ abstract class RowBodyView implements OwnedToolBodyView {
   }
 
   #reconcile(lines: readonly PresentationLine[]): void {
-    if (lines.length === 0) {
-      this.#clearRows()
-      return
-    }
-
-    const railChanged = this.#renderedStatus !== this.#status
     if (this.#rows.length > lines.length && this.#ctx.hasSelection) this.#ctx.clearSelection()
     while (this.#rows.length > lines.length) {
       const row = this.#rows.pop()!
-      this.root.remove(row)
-      row.destroyRecursively()
+      this.root.remove(row.root)
+      row.root.destroyRecursively()
     }
     while (this.#rows.length < lines.length) {
-      const row = new TextRenderable(this.#ctx, { wrapMode: "none", bg: this.#theme.surface.panel })
-      this.root.add(row)
+      const row = new PresentationRowView(this.#ctx, this.#status, this.#theme)
+      this.root.add(row.root)
       this.#rows.push(row)
     }
-    for (let index = 0; index < lines.length; index++) {
-      const line = lines[index]!
-      const current = this.#rendered[index]
-      if (
-        !railChanged &&
-        current?.text === line.text &&
-        current.tone === line.tone &&
-        current.prefix === line.prefix &&
-        current.prefixTone === line.prefixTone
-      ) {
-        continue
-      }
-      this.#rows[index]!.content = previewLine(line, this.#status, this.#theme)
-    }
-    this.#rendered = lines.map(line => ({ ...line }))
-    this.#renderedStatus = this.#status
+    for (let index = 0; index < lines.length; index++) this.#rows[index]!.update(lines[index]!)
+  }
+}
+
+class PresentationRowView {
+  readonly root: BoxRenderable
+
+  readonly #theme: Theme
+  readonly #rail: TextRenderable
+  readonly #gutter: TextRenderable
+  readonly #marker: TextRenderable
+  readonly #content: TextRenderable
+  #line: PresentationLine | undefined
+  #status: ToolStatus
+
+  constructor(ctx: RenderContext, status: ToolStatus, theme: Theme) {
+    this.#status = status
+    this.#theme = theme
+    this.root = new BoxRenderable(ctx, { flexDirection: "row", flexShrink: 0 })
+    this.#rail = new TextRenderable(ctx, {
+      selectable: false,
+      content: glyphs.toolRail,
+      fg: railColor(status, theme),
+      wrapMode: "none",
+      flexShrink: 0
+    })
+    this.#gutter = new TextRenderable(ctx, { selectable: false, wrapMode: "none", flexShrink: 0 })
+    this.#marker = new TextRenderable(ctx, { wrapMode: "none", flexShrink: 0 })
+    this.#content = new TextRenderable(ctx, { wrapMode: "none", tabIndicator: openTuiTabIndicator, flexShrink: 1 })
+    this.root.add(this.#rail)
+    this.root.add(this.#gutter)
+    this.root.add(this.#marker)
+    this.root.add(this.#content)
   }
 
-  #clearRows(): void {
-    if (this.#rows.length > 0 && this.#ctx.hasSelection) this.#ctx.clearSelection()
-    for (const row of this.#rows.splice(0)) {
-      this.root.remove(row)
-      row.destroyRecursively()
-    }
-    this.#rendered = []
-    this.#renderedStatus = undefined
+  update(line: PresentationLine): void {
+    if (samePresentationLine(line, this.#line)) return
+    this.#line = { ...line }
+    this.#gutter.visible = line.gutter !== undefined
+    if (line.gutter !== undefined) this.#gutter.content = line.gutter
+    this.#gutter.fg = lineColor(line.gutterTone ?? "muted", this.#theme)
+    this.#marker.visible = line.marker !== undefined
+    if (line.marker !== undefined) this.#marker.content = line.marker
+    this.#marker.fg = lineColor(line.markerTone ?? "muted", this.#theme)
+    this.#content.content = line.text
+    this.#content.fg = lineColor(line.tone, this.#theme)
+    this.#content.selectable = line.selectable !== false
   }
+
+  setStatus(status: ToolStatus): void {
+    if (status === this.#status) return
+    this.#status = status
+    this.#rail.fg = railColor(status, this.#theme)
+  }
+}
+
+function samePresentationLine(left: PresentationLine, right: PresentationLine | undefined): boolean {
+  return (
+    right !== undefined &&
+    left.text === right.text &&
+    left.tone === right.tone &&
+    left.gutter === right.gutter &&
+    left.gutterTone === right.gutterTone &&
+    left.marker === right.marker &&
+    left.markerTone === right.markerTone &&
+    left.selectable === right.selectable
+  )
 }
 
 export class TerminalBodyView extends RowBodyView {
@@ -636,7 +1039,7 @@ export class TextBodyView extends RowBodyView {
   ): PresentationLine[] {
     const body = this.body
     if (body.type !== "text") return []
-    const tone = body.tone === "normal" ? "normal" : body.tone
+    const tone = body.tone === "normal" ? "output" : body.tone
     return applyDirectionalPreview(textLineSource(body.text, width, tone), policy, expandHint)
   }
 }
@@ -647,118 +1050,276 @@ class ToolNoticeView {
   readonly #ctx: RenderContext
   readonly #theme: Theme
   readonly #cwd: string
-  readonly #rows: NoticeRowView[] = []
+  readonly #expandHint: string | undefined
+  readonly #rows: NoticeLineView[] = []
   #notices: readonly ToolNotice[]
+  #status: ToolStatus
   #expanded = false
+  #width = 76
 
-  constructor(ctx: RenderContext, notices: readonly ToolNotice[], theme: Theme, cwd: string) {
+  constructor(
+    ctx: RenderContext,
+    notices: readonly ToolNotice[],
+    status: ToolStatus,
+    theme: Theme,
+    cwd: string,
+    expandHint?: string
+  ) {
     this.#ctx = ctx
     this.#notices = notices
+    this.#status = status
     this.#theme = theme
     this.#cwd = cwd
+    this.#expandHint = expandHint
     this.root = new BoxRenderable(ctx, { flexDirection: "column", flexShrink: 0 })
-    this.#reconcile(this.#visibleNotices())
+    this.#render()
+  }
+
+  get hasVisibleRows(): boolean {
+    return this.#rows.length > 0
   }
 
   update(notices: readonly ToolNotice[]): boolean {
     if (sameNotices(this.#notices, notices)) return false
     this.#notices = notices
-    this.#reconcile(this.#visibleNotices())
+    this.#render()
     return true
   }
 
   setExpanded(expanded: boolean): boolean {
     if (expanded === this.#expanded) return false
     this.#expanded = expanded
-    this.#reconcile(this.#visibleNotices())
+    this.#render()
     return true
   }
 
-  #visibleNotices(): readonly ToolNotice[] {
-    return this.#expanded ? this.#notices : this.#notices.filter(notice => notice.visibility === "always")
+  setStatus(status: ToolStatus): boolean {
+    if (status === this.#status) return false
+    this.#status = status
+    for (const row of this.#rows) row.setStatus(status)
+    return true
   }
 
-  #reconcile(notices: readonly ToolNotice[]): void {
-    if (this.#rows.length > notices.length && this.#ctx.hasSelection) this.#ctx.clearSelection()
-    while (this.#rows.length > notices.length) {
-      const row = this.#rows.pop()!
-      this.root.remove(row.root)
-      row.root.destroyRecursively()
-    }
-    for (let index = 0; index < notices.length; index++) {
-      const notice = notices[index]!
-      const row = this.#rows[index]
-      if (row?.type === notice.type) {
-        row.update(notice)
-        continue
-      }
-      if (row) {
-        if (this.#ctx.hasSelection) this.#ctx.clearSelection()
-        this.root.remove(row.root)
-        row.root.destroyRecursively()
-      }
-      const next = new NoticeRowView(this.#ctx, notice, this.#theme, this.#cwd)
-      if (row) {
-        const anchor = this.#rows[index + 1]?.root
-        if (anchor) this.root.insertBefore(next.root, anchor)
-        else this.root.add(next.root)
-        this.#rows[index] = next
-      } else {
-        this.root.add(next.root)
-        this.#rows.push(next)
-      }
-    }
-  }
-}
-
-class NoticeRowView {
-  readonly root: BoxRenderable
-  readonly type: ToolNotice["type"]
-
-  readonly #theme: Theme
-  readonly #cwd: string
-  readonly #label: TextRenderable
-  readonly #value: TextRenderable
-  readonly #closing: TextRenderable
-  #notice: ToolNotice
-
-  constructor(ctx: RenderContext, notice: ToolNotice, theme: Theme, cwd: string) {
-    this.type = notice.type
-    this.#notice = notice
-    this.#theme = theme
-    this.#cwd = cwd
-    this.root = new BoxRenderable(ctx, { flexDirection: "row", flexShrink: 0 })
-    this.#label = new TextRenderable(ctx, { selectable: false, wrapMode: "none" })
-    this.#value = new TextRenderable(ctx, { wrapMode: "word" })
-    this.#closing = new TextRenderable(ctx, { selectable: false, wrapMode: "none" })
-    this.root.add(this.#label)
-    this.root.add(this.#value)
-    this.root.add(this.#closing)
-    this.#render()
-  }
-
-  update(notice: ToolNotice): boolean {
-    if (sameNotice(this.#notice, notice)) return false
-    this.#notice = notice
+  setWidth(width: number): boolean {
+    if (width === this.#width) return false
+    this.#width = width
     this.#render()
     return true
   }
 
   #render(): void {
-    const notice = this.#notice
-    const color = noticeColor(notice.tone, this.#theme)
-    if (notice.type === "message") {
-      this.#label.content = "  "
-      this.#label.fg = color
-      this.#value.content = notice.text
-      this.#value.fg = color
-      this.#closing.content = ""
-      return
+    const notices = this.#expanded ? this.#notices : this.#notices.filter(notice => notice.visibility === "always")
+    const limit = this.#expanded ? maxExpandedToolRows : maxToolPreviewRows
+    const omission = densityOmission("more notices", this.#expanded, this.#expandHint)
+    const lines = projectedNoticeLines(notices, this.#width, limit, omission)
+    if (this.#rows.length > lines.length && this.#ctx.hasSelection) this.#ctx.clearSelection()
+    while (this.#rows.length > lines.length) {
+      const row = this.#rows.pop()!
+      this.root.remove(row.root)
+      row.root.destroyRecursively()
     }
-    this.#label.content = `  ${notice.label}: `
+    while (this.#rows.length < lines.length) {
+      const row = new NoticeLineView(this.#ctx, this.#status, this.#theme, this.#cwd)
+      this.root.add(row.root)
+      this.#rows.push(row)
+    }
+    for (let index = 0; index < lines.length; index++) this.#rows[index]!.update(lines[index]!)
+  }
+}
+
+interface NoticeLine {
+  readonly label: string
+  readonly text: string
+  readonly rows: number
+  readonly contentWidth: number
+  readonly tone: ToolNotice["tone"]
+  readonly linkPath?: string
+  readonly selectable?: boolean
+}
+
+class NoticeLineView {
+  readonly root: BoxRenderable
+
+  readonly #theme: Theme
+  readonly #cwd: string
+  readonly #rail: TextRenderable
+  readonly #label: TextRenderable
+  readonly #value: TextRenderable
+  #status: ToolStatus
+
+  constructor(ctx: RenderContext, status: ToolStatus, theme: Theme, cwd: string) {
+    this.#status = status
+    this.#theme = theme
+    this.#cwd = cwd
+    this.root = new BoxRenderable(ctx, { flexDirection: "row", flexShrink: 0 })
+    this.#rail = new TextRenderable(ctx, {
+      selectable: false,
+      content: glyphs.toolRail,
+      fg: railColor(status, theme),
+      wrapMode: "none",
+      flexShrink: 0
+    })
+    this.#label = new TextRenderable(ctx, { selectable: false, wrapMode: "none", flexShrink: 0 })
+    this.#value = new TextRenderable(ctx, { wrapMode: "none", tabIndicator: openTuiTabIndicator, flexShrink: 0 })
+    this.root.add(this.#rail)
+    this.root.add(this.#label)
+    this.root.add(this.#value)
+  }
+
+  update(line: NoticeLine): void {
+    const color = noticeColor(line.tone, this.#theme)
+    this.#rail.content = Array.from({ length: line.rows }, () => glyphs.toolRail).join("\n")
+    this.#label.visible = line.label.length > 0
+    if (line.label.length > 0) this.#label.content = line.label
     this.#label.fg = color
-    this.#value.content = new StyledText([fg(color)(link(fileUrl(this.#cwd, notice.path))(notice.path))])
-    this.#closing.content = ""
+    this.#value.selectable = line.selectable !== false
+    this.#value.width = line.contentWidth
+    this.#value.wrapMode = line.linkPath ? "char" : "none"
+    this.#value.fg = color
+    this.#value.content = line.linkPath
+      ? new StyledText([fg(color)(link(fileUrl(this.#cwd, line.linkPath))(line.text))])
+      : line.text
+  }
+
+  setStatus(status: ToolStatus): void {
+    if (status === this.#status) return
+    this.#status = status
+    this.#rail.fg = railColor(status, this.#theme)
+  }
+}
+
+function projectedNoticeLines(
+  notices: readonly ToolNotice[],
+  width: number,
+  limit: number,
+  omission: string
+): NoticeLine[] {
+  const full = noticeHead(notices, width, limit)
+  if (!full.hasMore) return [...full.lines]
+  const head = noticeHead(notices, width, Math.max(0, limit - 1))
+  return [
+    ...head.lines,
+    {
+      label: "",
+      text: omission,
+      rows: 1,
+      contentWidth: Math.max(1, width - textWidth(glyphs.toolRail)),
+      tone: "muted",
+      selectable: false
+    }
+  ]
+}
+
+interface NoticeHead {
+  readonly lines: readonly NoticeLine[]
+  readonly rows: number
+  readonly hasMore: boolean
+}
+
+function noticeHead(notices: readonly ToolNotice[], width: number, limit: number): NoticeHead {
+  const output: NoticeLine[] = []
+  let rows = 0
+  for (let index = 0; index < notices.length; index++) {
+    if (rows === limit) return { lines: output, rows, hasMore: true }
+    const notice = noticeLineHead(notices[index]!, width, limit - rows)
+    output.push(...notice.lines)
+    rows += notice.rows
+    if (notice.hasMore || (rows === limit && index < notices.length - 1)) {
+      return { lines: output, rows, hasMore: true }
+    }
+  }
+  return { lines: output, rows, hasMore: false }
+}
+
+function noticeLineHead(notice: ToolNotice, width: number, limit: number): NoticeHead {
+  const available = Math.max(1, width - textWidth(glyphs.toolRail))
+  if (notice.type === "message") {
+    const wrapped = wrappedHead(notice.text, available, limit)
+    return {
+      lines: wrapped.lines.map(text => ({ label: "", text, rows: 1, contentWidth: available, tone: notice.tone })),
+      rows: wrapped.lines.length,
+      hasMore: wrapped.hasMore
+    }
+  }
+
+  const label = `${notice.label}: `
+  const labelWidth = Math.min(textWidth(label), Math.max(0, available - openTuiTabWidth))
+  const displayLabel = labelWidth === 0 ? "" : truncateToCells(label, labelWidth)
+  const contentWidth = Math.max(openTuiTabWidth, available - labelWidth)
+  const path = commandHead(notice.path, contentWidth, limit)
+  return {
+    lines:
+      path.rows === 0
+        ? []
+        : [
+            {
+              label: displayLabel,
+              text: path.hasMore ? path.text : notice.path,
+              rows: path.rows,
+              contentWidth,
+              tone: notice.tone,
+              linkPath: notice.path
+            }
+          ],
+    rows: path.rows,
+    hasMore: path.hasMore
+  }
+}
+
+class ToolActionHintView {
+  readonly root: TextRenderable
+
+  readonly #theme: Theme
+  #status: ToolStatus
+  #hint: string | undefined
+  #width = 76
+
+  constructor(ctx: RenderContext, status: ToolStatus, theme: Theme) {
+    this.#status = status
+    this.#theme = theme
+    this.root = new TextRenderable(ctx, {
+      selectable: false,
+      visible: false,
+      wrapMode: "none",
+      tabIndicator: openTuiTabIndicator,
+      flexShrink: 0
+    })
+  }
+
+  get hasVisibleRows(): boolean {
+    return this.#hint !== undefined
+  }
+
+  setHint(hint: string | undefined): boolean {
+    if (hint === this.#hint) return false
+    this.#hint = hint
+    this.#render()
+    return true
+  }
+
+  setStatus(status: ToolStatus): boolean {
+    if (status === this.#status) return false
+    this.#status = status
+    this.#render()
+    return true
+  }
+
+  setWidth(width: number): boolean {
+    if (width === this.#width) return false
+    this.#width = width
+    this.#render()
+    return true
+  }
+
+  #render(): void {
+    this.root.visible = this.#hint !== undefined
+    if (!this.#hint) return
+    const lines = wrapToCells(this.#hint, Math.max(1, this.#width - textWidth(glyphs.toolRail)))
+    const chunks = lines.flatMap((line, index) => [
+      fg(railColor(this.#status, this.#theme))(glyphs.toolRail),
+      fg(this.#theme.text.muted)(`${line}${index === lines.length - 1 ? "" : "\n"}`)
+    ])
+    this.root.content = new StyledText(chunks)
   }
 }
 
@@ -897,9 +1458,9 @@ function sourceLine(
   return {
     lines: wrapped.lines.map((value, index) => ({
       text: value,
-      tone: "normal",
-      prefix: `${index === 0 && firstLineVisible ? String(line).padStart(digits) : " ".repeat(digits)} │ `,
-      prefixTone: "muted"
+      tone: "output",
+      gutter: `${index === 0 && firstLineVisible ? String(line).padStart(digits) : " ".repeat(digits)} │ `,
+      gutterTone: "muted"
     })),
     hasMore: wrapped.hasMore
   }
@@ -958,8 +1519,12 @@ function collectTail(source: DirectionalLineSource, limit: number): CollectedLin
   return { lines, hasMore: false }
 }
 
+function densityOmission(label: string, expanded: boolean, expandHint: string | undefined): string {
+  return `… ${label}${!expanded && expandHint ? ` · ${expandHint} details` : ""}`
+}
+
 function omissionLine(label: string, expandHint: string | undefined): PresentationLine {
-  return { text: `… ${label}${expandHint ? ` · ${expandHint} details` : ""}`, tone: "muted" }
+  return { text: densityOmission(label, false, expandHint), tone: "muted", selectable: false }
 }
 
 interface ParsedHunkHeader {
@@ -985,7 +1550,7 @@ function presentationLineWindow(
   direction: "head" | "tail",
   limit: number
 ): CollectedLines {
-  const prefixWidth = line.prefix ? textWidth(line.prefix) : 0
+  const prefixWidth = textWidth(line.gutter ?? "") + textWidth(line.marker ?? "")
   const contentWidth = Math.max(1, width - prefixWidth)
   const wrapped =
     direction === "head"
@@ -993,11 +1558,15 @@ function presentationLineWindow(
       : wrapTailToCells(line.text, contentWidth, limit)
   const firstLineVisible = direction === "head" || !wrapped.hasMore
   return {
-    lines: wrapped.lines.map((text, index) => ({
-      ...line,
-      text,
-      ...(line.prefix ? { prefix: index === 0 && firstLineVisible ? line.prefix : " ".repeat(prefixWidth) } : {})
-    })),
+    lines: wrapped.lines.map((text, index) =>
+      index === 0 && firstLineVisible
+        ? { ...line, text }
+        : {
+            text,
+            tone: line.tone,
+            ...(prefixWidth > 0 ? { gutter: " ".repeat(prefixWidth), gutterTone: "muted" as const } : {})
+          }
+    ),
     hasMore: wrapped.hasMore
   }
 }
@@ -1052,7 +1621,7 @@ function diffLogicalLines(diff: string): PresentationLine[] {
     } else if (marker === "+") {
       output.push(numberedDiffLine(content, newLine++, "+", "success", digits))
     } else if (marker === " ") {
-      output.push(numberedDiffLine(content, newLine++, " ", "normal", digits))
+      output.push(numberedDiffLine(content, newLine++, " ", "context", digits))
       oldLine++
     } else {
       output.push({ text: line, tone: "muted" })
@@ -1081,26 +1650,23 @@ function numberedDiffLine(
   tone: LineTone,
   digits: number
 ): PresentationLine {
+  if (marker === " ") {
+    return { text, tone, gutter: `${String(line).padStart(digits)}   `, gutterTone: "muted" }
+  }
   return {
     text,
     tone,
-    prefix: `${String(line).padStart(digits)} ${marker} `,
-    prefixTone: tone === "normal" ? "muted" : tone
+    gutter: `${String(line).padStart(digits)} `,
+    gutterTone: "muted",
+    marker: `${marker} `,
+    markerTone: tone
   }
 }
 
 function proposedDiffLine(line: string): PresentationLine {
-  if (line.startsWith("-")) return { text: line.slice(1), tone: "error", prefix: "− ", prefixTone: "error" }
-  if (line.startsWith("+")) return { text: line.slice(1), tone: "success", prefix: "+ ", prefixTone: "success" }
+  if (line.startsWith("-")) return { text: line.slice(1), tone: "error", marker: "− ", markerTone: "error" }
+  if (line.startsWith("+")) return { text: line.slice(1), tone: "success", marker: "+ ", markerTone: "success" }
   return { text: line, tone: "muted" }
-}
-
-function previewLine(line: PresentationLine, status: ToolStatus, theme: Theme): StyledText {
-  return new StyledText([
-    fg(railColor(status, theme))(glyphs.toolBody),
-    ...(line.prefix ? [fg(lineColor(line.prefixTone ?? "muted", theme))(line.prefix)] : []),
-    fg(lineColor(line.tone, theme))(line.text)
-  ])
 }
 
 function railColor(status: ToolStatus, theme: Theme): string {
@@ -1114,9 +1680,9 @@ function statusColor(status: ToolStatus, theme: Theme): string {
 function lineColor(tone: LineTone, theme: Theme): string {
   switch (tone) {
     case "output":
-      return theme.text.primary
-    case "normal":
-      return theme.text.primary
+      return theme.text.toolOutput
+    case "context":
+      return theme.diff.context
     case "muted":
       return theme.text.muted
     case "warning":
@@ -1249,10 +1815,10 @@ function lifecycleStatus(status: ToolStatus): string | undefined {
 function toolGlyph(status: ToolStatus): string {
   switch (status) {
     case "preparing":
+    case "ready":
       return glyphs.toolPreparing
     case "running":
       return glyphs.toolRunning
-    case "ready":
     case "done":
     case "failed":
     case "aborted":
@@ -1260,18 +1826,6 @@ function toolGlyph(status: ToolStatus): string {
     default:
       return assertNever(status)
   }
-}
-
-function isFoldable(presentation: ToolPresentation): boolean {
-  return (
-    presentation.body !== undefined ||
-    presentation.header.secondary !== undefined ||
-    presentation.notices.some(notice => notice.visibility === "detailed")
-  )
-}
-
-function hasCompactBody(presentation: ToolPresentation): boolean {
-  return presentation.body !== undefined && presentation.preview.compact.type !== "hidden"
 }
 
 function isTerminal(status: ToolStatus | undefined): boolean {

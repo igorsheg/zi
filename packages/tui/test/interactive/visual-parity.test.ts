@@ -30,11 +30,12 @@ test("representative session keeps the accepted visual hierarchy at normal and c
   const sessionManager = SessionManager.inMemory("/workspace/openzi")
   for (const message of representativeMessages()) sessionManager.appendMessage(message)
   const { session } = await createAgentSession({ services: bootstrap.services, sessionManager, model, tools: [] })
-  const setup = await createInteractiveTest(session, { width: 80, height: 30 })
+  const setup = await createInteractiveTest(session, { width: 80, height: 40 })
 
   try {
     await setup.renderOnce()
-    expect(frameRows(setup.captureCharFrame(), 30)).toEqual([
+    await setup.renderOnce()
+    expect(frameRows(setup.captureCharFrame(), 40)).toEqual([
       "",
       " Inspect the session UI.",
       " Keep the output concise.",
@@ -49,16 +50,26 @@ test("representative session keeps the accepted visual hierarchy at normal and c
       " ◆ Read app.tsx",
       "",
       " ◆ Edit app.tsx +1/-1",
-      "   │ 1 − export function App() {}",
-      "   │ 1 + export function Application() {}",
+      " │ 1 − export function App() {}",
+      " │ 1 + export function Application() {}",
+      " ╰───",
       "",
       " ◆ Write generated.ts · 1 line · 30 bytes",
       "",
       " ◆ Run bun test · exit 1",
-      "   │ 1 test failed",
-      "   Command exited with code 1",
+      " │ 1 test failed",
+      " │ Command exited with code 1",
+      " ╰───",
       "",
       " The failed command remains visible without overwhelming the prompt.",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
       "",
       "",
       "",
@@ -80,7 +91,7 @@ test("representative session keeps the accepted visual hierarchy at normal and c
     setup.resize(40, 8)
     await setup.renderOnce()
     expect(frameRows(setup.captureCharFrame(), 8)).toEqual([
-      "   Command exited with code 1",
+      " ╰───",
       "",
       " The failed command remains visible",
       " without overwhelming the prompt.",

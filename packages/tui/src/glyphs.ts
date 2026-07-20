@@ -5,6 +5,7 @@ export const glyphs = {
   toolPreparing: "◇ ",
   tool: "◆ ",
   toolRunning: "◈ ",
-  toolExpanded: "⌄ ",
-  toolBody: "  │ "
+  toolRail: "│ ",
+  toolSeparator: "├─",
+  toolCap: "╰───"
 } as const

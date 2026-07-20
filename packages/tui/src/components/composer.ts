@@ -8,9 +8,9 @@ import {
   type RenderContext
 } from "@opentui/core"
 import type { ImageContent } from "@openzi/coding-agent"
-import stringWidth from "string-width"
 
 import type { Theme } from "../theme.js"
+import { textWidth } from "./cell-text.js"
 
 export interface ComposerGeometry {
   readonly columns: number
@@ -260,11 +260,11 @@ export function createComposer(ctx: RenderContext, options: ComposerOptions): Co
 
 function layoutRail(geometry: ComposerGeometry, slots: ComposerSlots): RailLayout {
   if (!geometry.bordered || slots.topRight.length === 0) return { topRightText: "", topRightWidth: 0 }
-  const available = geometry.columns - 4 - stringWidth(slots.topLeft) - (slots.topLeft ? 1 : 0)
+  const available = geometry.columns - 4 - textWidth(slots.topLeft) - (slots.topLeft ? 1 : 0)
   let topRightText = ""
   let topRightWidth = 0
   for (const item of slots.topRight) {
-    const itemWidth = stringWidth(item)
+    const itemWidth = textWidth(item)
     const nextWidth = topRightWidth + (topRightText ? 1 : 0) + itemWidth
     if (nextWidth > available) break
     topRightText += `${topRightText ? " " : ""}${item}`
@@ -316,7 +316,7 @@ const graphemes = new Intl.Segmenter(undefined, { granularity: "grapheme" })
 
 function promptOffsetWidth(value: string): number {
   let width = 0
-  for (const part of graphemes.segment(value)) width += part.segment === "\n" ? 1 : stringWidth(part.segment)
+  for (const part of graphemes.segment(value)) width += part.segment === "\n" ? 1 : textWidth(part.segment)
   return width
 }
 
