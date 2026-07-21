@@ -55,7 +55,8 @@ import type {
   CompactionEntry,
   CompactionReason,
   SessionEntry,
-  SessionManager
+  SessionManager,
+  SessionPromptHistoryEntry
 } from "./session-manager.js"
 import type { SessionShell, ShellDemotionResult, ShellKillResult, ShellTaskSnapshot } from "./session-shell.js"
 import type { SettingsManager, SettingsScope } from "./settings-manager.js"
@@ -417,6 +418,14 @@ export class AgentSession {
 
   get sessionId(): string {
     return this.sessionManager.sessionId
+  }
+
+  latestPromptHistoryEntry(): SessionPromptHistoryEntry | undefined {
+    return this.sessionManager.latestPromptHistoryEntry()
+  }
+
+  olderPromptHistoryEntry(entryId: string): SessionPromptHistoryEntry | undefined {
+    return this.sessionManager.olderPromptHistoryEntry(entryId)
   }
 
   get resources(): SessionResources {

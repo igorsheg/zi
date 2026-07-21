@@ -70,6 +70,10 @@ export class PromptView {
       geometry,
       slots: composerSlots(session),
       theme,
+      historySource: {
+        latest: () => session.latestPromptHistoryEntry(),
+        older: entryId => session.olderPromptHistoryEntry(entryId)
+      },
       onSubmit: () => this.#submit("steer"),
       onContentChange: () => this.#store.draftChanged(this.#input.plainText, this.#input.cursorOffset),
       onImageMarkersChange: images => this.#store.imageMarkersChanged(images),
@@ -223,13 +227,15 @@ export class PromptView {
 
     const session = this.#interactive.getSession()
     const prompt = this.#store.$state.get()
+    const pickerOpen = Boolean(this.#store.picker.presentation(this.#input.plainText))
     const action = this.#keybindings.promptAction(key, {
-      pickerOpen: Boolean(this.#store.picker.presentation(this.#input.plainText)),
+      pickerOpen,
       editorEmpty: this.#input.plainText.length === 0,
       hasImages: prompt.images.length > 0,
       streaming:
         session.isStreaming || session.compactionStatus.type === "running" || authenticationActive(prompt.workflow),
-      foregroundShellTask: session.shellTasks.some(task => task.type === "foreground")
+      foregroundShellTask: session.shellTasks.some(task => task.type === "foreground"),
+      historyEnabled: prompt.workflow.type === "idle" && !pickerOpen
     })
     if (!action) return
     this.#handleKeyAction(key, action)
@@ -261,6 +267,14 @@ export class PromptView {
       case "submit":
         consume(key)
         this.#submit("steer")
+        return
+      case "history_previous":
+        consume(key)
+        this.#applyHistoryResult(this.#composer.historyPrevious())
+        return
+      case "history_next":
+        consume(key)
+        this.#applyHistoryResult(this.#composer.historyNext())
         return
       case "follow_up":
         consume(key)
@@ -304,6 +318,14 @@ export class PromptView {
       default:
         return assertNever(action)
     }
+  }
+
+  #applyHistoryResult(result: ReturnType<Composer["historyPrevious"]>): void {
+    if (result !== "history_changed") return
+    const images = this.#composer.activeImages()
+    this.#syncedImages = images
+    this.#store.imageMarkersChanged(images)
+    this.#syncedImages = this.#store.$state.get().images
   }
 }
 

@@ -1,4 +1,4 @@
-import { SyntaxStyle } from "@opentui/core"
+import { SyntaxStyle, type StyleDefinitionInput } from "@opentui/core"
 
 export type Color = `#${string}`
 
@@ -82,8 +82,8 @@ export const defaultTheme: Theme = {
   diff: { added: "#98BB6C", removed: "#E46876", context: "#535755" }
 }
 
-export function createSyntaxStyle(theme: Theme): SyntaxStyle {
-  return SyntaxStyle.fromStyles({
+function syntaxStyleDefinitions(theme: Theme): Record<string, StyleDefinitionInput> {
+  return {
     default: { fg: theme.text.primary },
     comment: { fg: theme.syntax.comment, italic: true },
     keyword: { fg: theme.syntax.keyword },
@@ -115,5 +115,18 @@ export function createSyntaxStyle(theme: Theme): SyntaxStyle {
     "markup.link.label": { fg: theme.markdown.link, underline: true },
     "markup.link.url": { fg: theme.markdown.linkUrl, underline: true },
     "markup.strikethrough": { fg: theme.text.muted }
-  })
+  }
+}
+
+export function createSyntaxStyle(theme: Theme): SyntaxStyle {
+  return SyntaxStyle.fromStyles(syntaxStyleDefinitions(theme))
+}
+
+export function createThinkingSyntaxStyle(theme: Theme): SyntaxStyle {
+  const styles = syntaxStyleDefinitions(theme)
+  for (const style of Object.values(styles)) {
+    style.fg = theme.text.thinking
+    style.italic = true
+  }
+  return SyntaxStyle.fromStyles(styles)
 }

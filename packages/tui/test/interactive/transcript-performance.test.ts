@@ -3,7 +3,7 @@ import { expect, spyOn, test } from "bun:test"
 import { CliRenderEvents, MarkdownRenderable, type Renderable, TextRenderable } from "@opentui/core"
 import { createTestRenderer, type TestRendererSetup } from "@opentui/core/testing"
 import type { AgentMessage } from "@openzi/coding-agent"
-import { fauxAssistantMessage, fauxText, fauxToolCall } from "@openzi/coding-agent/testing"
+import { fauxAssistantMessage, fauxText, fauxThinking, fauxToolCall } from "@openzi/coding-agent/testing"
 import { atom, type WritableAtom } from "nanostores"
 
 import { TuiDiagnosticsOverlay } from "../../src/interactive/diagnostics.js"
@@ -11,7 +11,7 @@ import { InteractiveKeybindings } from "../../src/interactive/interactive-keybin
 import type { ActiveTool } from "../../src/interactive/interactive-store.js"
 import { createMessageItemView, StreamingAssistantView } from "../../src/interactive/transcript/message-view.js"
 import { TranscriptView } from "../../src/interactive/transcript/view.js"
-import { createSyntaxStyle, defaultTheme } from "../../src/theme.js"
+import { createSyntaxStyle, createThinkingSyntaxStyle, defaultTheme } from "../../src/theme.js"
 import { renderMarkdownSettled } from "./harness.js"
 
 interface TranscriptHarness {
@@ -120,6 +120,7 @@ test("user image parts render as inline numbered markers", async () => {
 test("assistant sequences coalesce adjacent semantic parts and give every item one trailing row", async () => {
   const setup = await createTestRenderer({ width: 60, height: 20, useThread: false })
   const syntaxStyle = createSyntaxStyle(defaultTheme)
+  const thinkingSyntaxStyle = createThinkingSyntaxStyle(defaultTheme)
   const message = {
     ...fauxAssistantMessage(
       [
@@ -134,14 +135,22 @@ test("assistant sequences coalesce adjacent semantic parts and give every item o
     ),
     errorMessage: "Assistant failed"
   }
-  const view = new StreamingAssistantView(setup.renderer, message, defaultTheme, syntaxStyle, undefined, "/work")
+  const view = new StreamingAssistantView(
+    setup.renderer,
+    message,
+    defaultTheme,
+    syntaxStyle,
+    thinkingSyntaxStyle,
+    undefined,
+    "/work"
+  )
   setup.renderer.root.add(view.root)
 
   try {
     await setup.renderOnce()
     const items = view.root.getChildren()
     expect(items).toHaveLength(5)
-    expect(descendantsOfType(view.root, MarkdownRenderable)).toHaveLength(2)
+    expect(descendantsOfType(view.root, MarkdownRenderable)).toHaveLength(3)
     const rows = setup
       .captureCharFrame()
       .split("\n")
@@ -159,6 +168,7 @@ test("assistant sequences coalesce adjacent semantic parts and give every item o
   } finally {
     view.destroy()
     syntaxStyle.destroy()
+    thinkingSyntaxStyle.destroy()
     setup.renderer.destroy()
   }
 })
@@ -196,21 +206,30 @@ test("empty historical Bash failures stay header-only", async () => {
 })
 
 test("streaming assistant and markdown roots keep identity across deltas", async () => {
-  const harness = await createTranscriptHarness([], { streamingMessage: fauxAssistantMessage("first") })
+  const harness = await createTranscriptHarness([], {
+    streamingMessage: fauxAssistantMessage([fauxThinking("first **thought**"), fauxText("first")])
+  })
   try {
     await harness.setup.flush()
     const root = harness.setup.renderer.root.findDescendantById("streaming-assistant")
     if (!root) throw new Error("Streaming assistant root not found")
-    const markdown = descendant(root, MarkdownRenderable)
+    const [thinkingMarkdown, answerMarkdown] = descendantsOfType(root, MarkdownRenderable)
+    if (!thinkingMarkdown || !answerMarkdown) throw new Error("Assistant Markdown roots not found")
 
-    harness.state.streamingMessage = fauxAssistantMessage("first and second")
+    harness.state.streamingMessage = fauxAssistantMessage([
+      fauxThinking("first **thought** and second"),
+      fauxText("first and second")
+    ])
     harness.revision.set(1)
     await harness.setup.flush()
 
     expect(harness.setup.renderer.root.findDescendantById("streaming-assistant")).toBe(root)
-    expect(descendant(root, MarkdownRenderable)).toBe(markdown)
-    expect(markdown.content).toBe("first and second")
-    expect(markdown.streaming).toBe(true)
+    const updatedMarkdown = descendantsOfType(root, MarkdownRenderable)
+    expect(updatedMarkdown).toEqual([thinkingMarkdown, answerMarkdown])
+    expect(thinkingMarkdown.content).toBe("first **thought** and second")
+    expect(answerMarkdown.content).toBe("first and second")
+    expect(thinkingMarkdown.streaming).toBe(true)
+    expect(answerMarkdown.streaming).toBe(true)
     expect(harness.view.diagnostics).toMatchObject({ streamingCreates: 1, streamingUpdates: 1 })
     await renderMarkdownSettled(harness.setup)
   } finally {

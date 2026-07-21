@@ -7,10 +7,11 @@ import {
   type PasteEvent,
   type RenderContext
 } from "@opentui/core"
-import type { ImageContent } from "@openzi/coding-agent"
+import { maxSessionPromptHistoryEntries, type ImageContent } from "@openzi/coding-agent"
 
 import type { Theme } from "../theme.js"
 import { textWidth } from "./cell-text.js"
+import { createComposerHistoryReplacement } from "./composer-history-replacement.js"
 
 export interface ComposerGeometry {
   readonly columns: number
@@ -25,10 +26,23 @@ export interface ComposerSlots {
   readonly topRight: readonly string[]
 }
 
+export interface ComposerHistoryEntry {
+  readonly entryId: string
+  readonly text: string
+}
+
+export interface ComposerHistorySource {
+  latest(): ComposerHistoryEntry | undefined
+  older(entryId: string): ComposerHistoryEntry | undefined
+}
+
+export type ComposerHistoryResult = "cursor_moved" | "history_changed" | "unchanged"
+
 export interface ComposerOptions {
   readonly geometry: ComposerGeometry
   readonly slots: ComposerSlots
   readonly theme: Theme
+  readonly historySource?: ComposerHistorySource
   readonly onSubmit: () => void
   readonly onContentChange?: () => void
   readonly onImageMarkersChange?: (images: readonly ImageContent[]) => void
@@ -42,6 +56,8 @@ export interface Composer {
   syncImageMarkers(images: readonly ImageContent[]): void
   activeImages(): readonly ImageContent[]
   expandedText(): string
+  historyPrevious(): ComposerHistoryResult
+  historyNext(): ComposerHistoryResult
   replaceText(text: string, cursorOffset?: number): void
   update(geometry: ComposerGeometry, slots: ComposerSlots): void
   destroy(): void
@@ -55,6 +71,15 @@ interface RailLayout {
 type ComposerMarkerData =
   | { readonly type: "paste"; readonly marker: string; readonly text: string }
   | { readonly type: "image"; readonly marker: string; readonly image: ImageContent }
+
+type ComposerHistoryState =
+  | { readonly type: "idle" }
+  | {
+      readonly type: "browsing"
+      readonly olderEntryIds: readonly string[]
+      readonly currentEntryId: string
+      readonly newerEntryIds: readonly string[]
+    }
 
 export const compactPasteLineThreshold = 10
 export const compactPasteCharacterThreshold = 1_000
@@ -86,15 +111,15 @@ export function createComposer(ctx: RenderContext, options: ComposerOptions): Co
       drawTopRightSlot(buffer, this, geometry.bordered, rail, railColor, railBackground)
     }
   })
-  let suppressContentChange = false
+  let historyState: ComposerHistoryState = { type: "idle" }
   let markerTypeId = 0
   let nextPasteId = 0
   let nextImageId = 0
   let markerRevision = 0
   let input!: TextareaRenderable
 
-  const notifyContentChange = () => {
-    if (suppressContentChange) return
+  const reportContentChange = (detachHistory = true) => {
+    if (detachHistory) historyState = { type: "idle" }
     options.onContentChange?.()
     const revision = ++markerRevision
     queueMicrotask(() => {
@@ -113,7 +138,6 @@ export function createComposer(ctx: RenderContext, options: ComposerOptions): Co
     cursorColor: options.theme.text.primary,
     backgroundColor: options.theme.surface.composer,
     focusedBackgroundColor: options.theme.surface.composer,
-    onContentChange: notifyContentChange,
     ...(options.onPaste ? { onPaste: options.onPaste } : {}),
     keyBindings: [
       { name: "return", action: "submit" },
@@ -122,7 +146,27 @@ export function createComposer(ctx: RenderContext, options: ComposerOptions): Co
     onSubmit: options.onSubmit
   })
   markerTypeId = input.extmarks.registerType("openzi-composer-marker")
+  const historyReplacement = createComposerHistoryReplacement(input)
+  const detachHistory = () => {
+    if (historyState.type === "browsing") historyReplacement.abandonBrowse()
+    historyState = { type: "idle" }
+  }
   const nativeGetSelectedText = input.getSelectedText.bind(input)
+  const nativeInsertChar = input.insertChar.bind(input)
+  const nativeInsertText = input.insertText.bind(input)
+  const nativeDeleteChar = input.deleteChar.bind(input)
+  const nativeDeleteCharBackward = input.deleteCharBackward.bind(input)
+  const nativeDeleteLine = input.deleteLine.bind(input)
+  const nativeDeleteToLineEnd = input.deleteToLineEnd.bind(input)
+  const nativeDeleteToLineStart = input.deleteToLineStart.bind(input)
+  const nativeDeleteWordForward = input.deleteWordForward.bind(input)
+  const nativeDeleteWordBackward = input.deleteWordBackward.bind(input)
+  const nativeNewLine = input.newLine.bind(input)
+  const nativeDeleteRange = input.deleteRange.bind(input)
+  const nativeDeleteSelection = input.deleteSelection.bind(input)
+  const nativeClear = input.clear.bind(input)
+  const nativeSetText = input.setText.bind(input)
+  const nativeReplaceText = input.replaceText.bind(input)
   const nativeUndo = input.undo.bind(input)
   const nativeRedo = input.redo.bind(input)
   input.getSelectedText = () => {
@@ -138,34 +182,136 @@ export function createComposer(ctx: RenderContext, options: ComposerOptions): Co
     )
     return expandMarkerRanges(selectedText, markers)
   }
-  input.undo = () => {
-    const result = nativeUndo()
-    notifyContentChange()
+  // Native change events are deferred. Wrapping mutations keeps browse detachment and one coherent report synchronous.
+  const applyNativeContentMutation = <Result>(mutation: () => Result, clearsRedo = true): Result => {
+    detachHistory()
+    const beforeText = input.plainText
+    const beforeMarkers = composerMarkers(input, markerTypeId)
+    const result = mutation()
+    const changed = beforeText !== input.plainText || !sameMarkers(beforeMarkers, composerMarkers(input, markerTypeId))
+    if (changed) {
+      if (clearsRedo) historyReplacement.releaseCompletedBrowse()
+      reportContentChange()
+    }
     return result
   }
+
+  input.insertChar = char => applyNativeContentMutation(() => nativeInsertChar(char))
+  input.insertText = text => applyNativeContentMutation(() => nativeInsertText(text))
+  input.deleteChar = () => applyNativeContentMutation(() => nativeDeleteChar())
+  input.deleteCharBackward = () => applyNativeContentMutation(() => nativeDeleteCharBackward())
+  input.deleteLine = () => applyNativeContentMutation(() => nativeDeleteLine())
+  input.deleteToLineEnd = () => applyNativeContentMutation(() => nativeDeleteToLineEnd())
+  input.deleteToLineStart = () => applyNativeContentMutation(() => nativeDeleteToLineStart())
+  input.deleteWordForward = () => applyNativeContentMutation(() => nativeDeleteWordForward())
+  input.deleteWordBackward = () => applyNativeContentMutation(() => nativeDeleteWordBackward())
+  input.newLine = () => applyNativeContentMutation(() => nativeNewLine())
+  input.deleteRange = (startLine, startCol, endLine, endCol) =>
+    applyNativeContentMutation(() => nativeDeleteRange(startLine, startCol, endLine, endCol))
+  input.deleteSelection = () => applyNativeContentMutation(() => nativeDeleteSelection())
+  input.clear = () => applyNativeContentMutation(() => nativeClear())
+  input.setText = text => {
+    applyNativeContentMutation(() => nativeSetText(text))
+    historyReplacement.reset()
+  }
+  input.replaceText = text => applyNativeContentMutation(() => nativeReplaceText(text))
+  input.undo = () => {
+    historyReplacement.pinCompletedBrowse()
+    return applyNativeContentMutation(() => nativeUndo(), false)
+  }
   input.redo = () => {
-    const result = nativeRedo()
-    notifyContentChange()
-    return result
+    historyReplacement.pinCompletedBrowse()
+    return applyNativeContentMutation(() => nativeRedo(), false)
   }
   root.add(input)
 
-  const insertMarker = (marker: string, data: ComposerMarkerData) => {
-    suppressContentChange = true
+  const applyHistoryEffect = (
+    previousState: ComposerHistoryState,
+    effect: () => void,
+    cursor: "start" | "end" | "restore",
+    commit?: () => void
+  ) => {
     try {
-      const start = input.cursorOffset
-      input.insertText(marker)
-      input.extmarks.create({
-        start,
-        end: start + promptOffsetWidth(marker),
-        virtual: true,
-        typeId: markerTypeId,
-        data
-      })
-    } finally {
-      suppressContentChange = false
+      effect()
+      if (cursor === "start") input.cursorOffset = 0
+      else if (cursor === "end") input.cursorOffset = promptOffsetWidth(input.plainText)
+    } catch (cause) {
+      historyState = previousState
+      throw cause
     }
-    notifyContentChange()
+    commit?.()
+    reportContentChange(false)
+  }
+
+  const olderHistory = (): ComposerHistoryResult => {
+    const state = historyState
+    if (state.type === "idle") {
+      const latest = options.historySource?.latest()
+      if (!latest) return "unchanged"
+      historyState = { type: "browsing", olderEntryIds: [], currentEntryId: latest.entryId, newerEntryIds: [] }
+      applyHistoryEffect(state, () => historyReplacement.begin(latest, nativeReplaceText), "start")
+      return "history_changed"
+    }
+
+    const visited = state.olderEntryIds[0]
+    if (visited) {
+      historyState = {
+        type: "browsing",
+        olderEntryIds: state.olderEntryIds.slice(1),
+        currentEntryId: visited,
+        newerEntryIds: [state.currentEntryId, ...state.newerEntryIds]
+      }
+      applyHistoryEffect(state, () => nativeRedo(), "start")
+      return "history_changed"
+    }
+
+    const visitedCount = state.newerEntryIds.length + 1
+    if (visitedCount >= maxSessionPromptHistoryEntries) return "unchanged"
+    const older = options.historySource?.older(state.currentEntryId)
+    if (!older) return "unchanged"
+    historyState = {
+      type: "browsing",
+      olderEntryIds: [],
+      currentEntryId: older.entryId,
+      newerEntryIds: [state.currentEntryId, ...state.newerEntryIds]
+    }
+    applyHistoryEffect(state, () => historyReplacement.replace(older, nativeReplaceText), "start")
+    return "history_changed"
+  }
+
+  const newerHistory = (): ComposerHistoryResult => {
+    const state = historyState
+    if (state.type === "idle") return "unchanged"
+
+    const visited = state.newerEntryIds[0]
+    if (visited) {
+      historyState = {
+        type: "browsing",
+        olderEntryIds: [state.currentEntryId, ...state.olderEntryIds],
+        currentEntryId: visited,
+        newerEntryIds: state.newerEntryIds.slice(1)
+      }
+      applyHistoryEffect(state, () => nativeUndo(), "end")
+      return "history_changed"
+    }
+
+    historyState = { type: "idle" }
+    applyHistoryEffect(
+      state,
+      () => nativeUndo(),
+      "restore",
+      () => historyReplacement.restoreDraft()
+    )
+    return "history_changed"
+  }
+
+  const insertMarker = (marker: string, data: ComposerMarkerData) => {
+    detachHistory()
+    const start = input.cursorOffset
+    nativeInsertText(marker)
+    input.extmarks.create({ start, end: start + promptOffsetWidth(marker), virtual: true, typeId: markerTypeId, data })
+    historyReplacement.releaseCompletedBrowse()
+    reportContentChange()
   }
 
   return {
@@ -215,18 +361,47 @@ export function createComposer(ctx: RenderContext, options: ComposerOptions): Co
     expandedText() {
       return expandMarkerRanges(input.plainText, composerMarkers(input, markerTypeId))
     },
+    historyPrevious() {
+      if (input.hasSelection()) {
+        input.moveCursorUp()
+        return "cursor_moved"
+      }
+      const globalVisualRow = input.scrollY + input.visualCursor.visualRow
+      if (historyState.type === "browsing" && globalVisualRow === 0) return olderHistory()
+      if (historyState.type === "idle" && input.cursorOffset === 0) return olderHistory()
+      if (globalVisualRow === 0) {
+        input.cursorOffset = 0
+        return "cursor_moved"
+      }
+      input.moveCursorUp()
+      return "cursor_moved"
+    },
+    historyNext() {
+      if (input.hasSelection()) {
+        input.moveCursorDown()
+        return "cursor_moved"
+      }
+      const endOffset = promptOffsetWidth(input.plainText)
+      const globalVisualRow = input.scrollY + input.visualCursor.visualRow
+      const finalVisualRow = Math.max(0, input.editorView.getTotalVirtualLineCount() - 1)
+      if (historyState.type === "browsing" && globalVisualRow === finalVisualRow) return newerHistory()
+      if (historyState.type === "idle" && input.cursorOffset === endOffset) return newerHistory()
+      if (globalVisualRow === finalVisualRow) {
+        input.cursorOffset = endOffset
+        return "cursor_moved"
+      }
+      input.moveCursorDown()
+      return "cursor_moved"
+    },
     replaceText(text, cursorOffset = promptOffsetWidth(text)) {
-      suppressContentChange = true
+      historyState = { type: "idle" }
       markerRevision++
       nextPasteId = 0
       nextImageId = 0
-      try {
-        input.setText(text)
-        input.cursorOffset = cursorOffset
-      } finally {
-        suppressContentChange = false
-      }
-      options.onContentChange?.()
+      nativeSetText(text)
+      historyReplacement.reset()
+      input.cursorOffset = cursorOffset
+      reportContentChange()
     },
     update(nextGeometry, nextSlots) {
       const geometryChanged = !sameGeometry(geometry, nextGeometry)
@@ -253,6 +428,8 @@ export function createComposer(ctx: RenderContext, options: ComposerOptions): Co
       if (railChanged) root.requestRender()
     },
     destroy() {
+      historyState = { type: "idle" }
+      historyReplacement.destroy()
       root.destroyRecursively()
     }
   }
@@ -345,6 +522,25 @@ function composerMarkers(
     .filter(extmark => extmark.typeId === markerTypeId)
     .filter((extmark): extmark is Extmark & { data: ComposerMarkerData } => isComposerMarkerData(extmark.data))
     .toSorted((left, right) => left.start - right.start)
+}
+
+function sameMarkers(
+  left: readonly (Extmark & { data: ComposerMarkerData })[],
+  right: readonly (Extmark & { data: ComposerMarkerData })[]
+): boolean {
+  return (
+    left.length === right.length &&
+    left.every((marker, index) => {
+      const other = right[index]
+      return (
+        other !== undefined &&
+        marker.id === other.id &&
+        marker.start === other.start &&
+        marker.end === other.end &&
+        marker.data === other.data
+      )
+    })
+  )
 }
 
 function imageMarkers(input: TextareaRenderable, markerTypeId: number): ImageContent[] {

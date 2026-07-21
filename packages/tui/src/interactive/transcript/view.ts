@@ -11,7 +11,7 @@ import {
 import { projectToolPresentation, type AgentMessage } from "@openzi/coding-agent"
 import type { ReadableAtom } from "nanostores"
 
-import type { Theme } from "../../theme.js"
+import { createThinkingSyntaxStyle, type Theme } from "../../theme.js"
 import type { InteractiveKeybindings, TranscriptKeyAction } from "../interactive-keybindings.js"
 import type { ActiveTool } from "../interactive-store.js"
 import type { TranscriptItemView } from "./item.js"
@@ -102,6 +102,7 @@ export class TranscriptView {
   readonly #keybindings: InteractiveKeybindings
   readonly #theme: Theme
   readonly #syntaxStyle: SyntaxStyle
+  readonly #thinkingSyntaxStyle: SyntaxStyle
   readonly #navigation: TranscriptStore
   readonly #status: BoxRenderable
   readonly #measureSync: boolean
@@ -202,6 +203,7 @@ export class TranscriptView {
     this.#keybindings = keybindings
     this.#theme = theme
     this.#syntaxStyle = syntaxStyle
+    this.#thinkingSyntaxStyle = createThinkingSyntaxStyle(theme)
     this.#measureSync = options.measureSync ?? false
     this.#requestFrame = globalThis.requestAnimationFrame.bind(globalThis)
     this.#cancelFrame = globalThis.cancelAnimationFrame.bind(globalThis)
@@ -302,6 +304,7 @@ export class TranscriptView {
     for (const release of this.#release.splice(0)) release()
     this.#clearContent()
     this.root.destroyRecursively()
+    this.#thinkingSyntaxStyle.destroy()
   }
 
   #requestSync = (): void => {
@@ -434,6 +437,7 @@ export class TranscriptView {
         message,
         this.#theme,
         this.#syntaxStyle,
+        this.#thinkingSyntaxStyle,
         this.#assistantToolViews,
         sessionCwd(this.#session)
       )
@@ -713,6 +717,7 @@ export class TranscriptView {
         message,
         this.#theme,
         this.#syntaxStyle,
+        this.#thinkingSyntaxStyle,
         this.#assistantToolViews,
         sessionCwd(this.#session)
       )

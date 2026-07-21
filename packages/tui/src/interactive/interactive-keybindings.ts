@@ -16,6 +16,8 @@ export type PromptKeyAction =
   | "background_task"
   | "paste_clipboard"
   | "new_line"
+  | "history_previous"
+  | "history_next"
   | "restore_queue"
   | "interrupt"
   | "clear"
@@ -30,6 +32,7 @@ export interface PromptKeyContext {
   readonly hasImages: boolean
   readonly streaming: boolean
   readonly foregroundShellTask: boolean
+  readonly historyEnabled: boolean
 }
 
 interface ParsedKey {
@@ -56,6 +59,8 @@ const defaultBindingEntries = [
   ],
   ["tui.input.submit", ["return"], "Submit input", "reserved"],
   ["tui.input.newLine", ["shift+return"], "Insert a newline", "overridable"],
+  ["tui.input.historyPrevious", ["up"], "Previous session prompt", "overridable"],
+  ["tui.input.historyNext", ["down"], "Next session prompt", "overridable"],
   ["tui.input.tab", ["tab"], "Complete the active input", "overridable"],
   ["tui.input.copy", ["ctrl+c"], "Copy native selection", "reserved"],
   ["tui.select.up", ["up"], "Move selection up", "overridable"],
@@ -162,6 +167,8 @@ export class InteractiveKeybindings {
     if (this.matches(event, "app.message.dequeue")) return "restore_queue"
     if (this.matches(event, "tui.input.newLine")) return "new_line"
     if (this.matches(event, "tui.input.submit")) return "submit"
+    if (context.historyEnabled && this.matches(event, "tui.input.historyPrevious")) return "history_previous"
+    if (context.historyEnabled && this.matches(event, "tui.input.historyNext")) return "history_next"
     if (isNativeKey(event, "return")) return "consume"
     return undefined
   }

@@ -61,6 +61,8 @@ export const maxSessionListCandidates = 4096
 export const maxSessionListResults = 200
 export const maxSessionListPreviewBytes = 256 * 1024
 export const maxSessionFirstMessageLength = 512
+export const maxSessionPromptHistoryEntries = 100
+export const maxSessionPromptHistoryEntryBytes = 1024 * 1024
 export const maxCompactionSummaryBytes = 128 * 1024
 export const maxCompactionFilePaths = 256
 export const maxCompactionPathBytes = 4096
@@ -91,6 +93,11 @@ export interface SessionModel {
   readonly modelId: string
 }
 
+export interface SessionPromptHistoryEntry {
+  readonly entryId: string
+  readonly text: string
+}
+
 export interface SessionContext {
   readonly messages: readonly AgentMessage[]
   readonly model?: SessionModel
@@ -106,6 +113,7 @@ export class SessionManager {
   readonly header: SessionHeader
   #persistence: SessionPersistence
   readonly #entries: SessionEntry[] = []
+  readonly #promptHistory: MessageEntry[] = []
   #leafId: string | null = null
 
   private constructor(cwd: string, sessionDir: string, sessionId?: string, persist = true) {
@@ -148,6 +156,7 @@ export class SessionManager {
     manager.#persistence = { type: "durable", file: resolvedFile }
     validateJournal(entries, resolvedFile)
     manager.#entries.push(...entries)
+    for (const entry of entries) manager.#considerPromptHistoryEntry(entry)
     manager.#leafId = manager.#entries.at(-1)?.id ?? null
     Object.assign(manager.header, header, { cwd: resolveOpenZiPath(header.cwd) })
     return manager
@@ -289,6 +298,15 @@ export class SessionManager {
     return this.#entries.findLast((entry): entry is CompactionEntry => entry.type === "compaction")
   }
 
+  latestPromptHistoryEntry(): SessionPromptHistoryEntry | undefined {
+    return promptHistoryValue(this.#promptHistory.at(-1))
+  }
+
+  olderPromptHistoryEntry(entryId: string): SessionPromptHistoryEntry | undefined {
+    const index = this.#promptHistory.findIndex(entry => entry.id === entryId)
+    return index > 0 ? promptHistoryValue(this.#promptHistory[index - 1]) : undefined
+  }
+
   activeUsageAnchorIndex(): number {
     const markerIndex = this.#entries.findLastIndex(entry => entry.type === "compaction")
     if (markerIndex < 0) return 0
@@ -324,8 +342,17 @@ export class SessionManager {
     validateNextEntry(next, this.#entries, this.file ?? "<memory>")
     this.#persist(next)
     this.#entries.push(next)
+    this.#considerPromptHistoryEntry(next)
     this.#leafId = next.id
     return next
+  }
+
+  #considerPromptHistoryEntry(entry: SessionEntry): void {
+    if (entry.type !== "message" || entry.message.role !== "user") return
+    const text = promptHistoryText(entry.message.content)
+    if (text === undefined || promptHistoryValue(this.#promptHistory.at(-1))?.text === text) return
+    this.#promptHistory.push(entry)
+    if (this.#promptHistory.length > maxSessionPromptHistoryEntries) this.#promptHistory.shift()
   }
 
   #persist(next: SessionEntry): void {
@@ -399,6 +426,32 @@ async function loadSessionInfo(candidate: {
   } catch {
     return undefined
   }
+}
+
+function promptHistoryValue(entry: MessageEntry | undefined): SessionPromptHistoryEntry | undefined {
+  if (!entry || entry.message.role !== "user") return undefined
+  const text = promptHistoryText(entry.message.content)
+  return text === undefined ? undefined : { entryId: entry.id, text }
+}
+
+function promptHistoryText(content: unknown): string | undefined {
+  if (typeof content === "string") {
+    if (Buffer.byteLength(content) > maxSessionPromptHistoryEntryBytes) return undefined
+    const text = content.trim()
+    return text ? text : undefined
+  }
+  if (!Array.isArray(content)) return undefined
+
+  const parts: string[] = []
+  let bytes = 0
+  for (const part of content) {
+    if (!isRecord(part) || part.type !== "text" || typeof part.text !== "string") continue
+    bytes += Buffer.byteLength(part.text)
+    if (bytes > maxSessionPromptHistoryEntryBytes) return undefined
+    parts.push(part.text)
+  }
+  const text = parts.join("").trim()
+  return text ? text : undefined
 }
 
 function sessionMessageText(content: unknown): string {

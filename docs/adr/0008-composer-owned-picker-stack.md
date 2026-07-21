@@ -6,7 +6,7 @@ The previous `/model` selector replaced the composer with a second `TextareaRend
 
 OpenZi now uses three concrete owners:
 
-- `Composer` owns the only native textarea, its text, cursor, paste/undo history, focus, and atomic paste/image extmarks. Text paste payloads stay with those native markers and expand only at copy or submission; `PromptStore` remains authoritative for active image payloads while marker edits report their retained image references.
+- `Composer` owns the only native textarea, its text, cursor, paste/undo history, focus, atomic paste/image extmarks, and its `idle | browsing` session-history zipper. Text paste payloads stay with native markers and expand only at copy or submission; `PromptStore` remains authoritative for active image payloads while marker edits report their retained image references.
 - `PickerStack` owns open/closed state, ordered frames, selected row per frame, suspended parent filters, top-frame filtering, and push/pop transitions. It accepts the current composer text as a method argument and does not retain or render an active input.
 - `PickerStackView` renders only the active frame below the composer. It contains no textarea and does not interpret selected row IDs.
 
@@ -30,6 +30,8 @@ interface PickerStack {
   dispose(): void
 }
 ```
+
+Composer session history remains separate from the picker stack. `AgentSession` exposes bounded latest/older lookup over `SessionManager` journal references; Composer retains bounded entry IDs and native slot handles, while recalled text plus exact draft marker restoration stays with native replace/undo/redo. Picker navigation wins whenever a frame is active, so history adds neither a frame nor another input.
 
 Only the top frame receives the current composer filter. Pushing captures the parent filter on the child frame. Popping restores that filter while preserving the parent's selection. Open state contains a non-empty frame tuple. Depth, rows per frame, and suspended filter length are bounded at admission; row IDs are unique and configured selection must name an admitted row. Public presentation strips selection indices and suspended filters from the frame definition.
 

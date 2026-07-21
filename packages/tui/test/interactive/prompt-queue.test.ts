@@ -59,6 +59,7 @@ test("real prompt keys admit, present, and restore steering and follow-up queues
 
     expect(session.queuedInputs.steering.map(entry => entry.text)).toEqual(["steering first line\nsecond line"])
     expect(session.queuedInputs.followUp.map(entry => entry.text)).toEqual(["follow-up"])
+    expect(session.latestPromptHistoryEntry()?.text).toBe("start")
     const queuedFrame = setup.captureCharFrame()
     expect(queuedFrame).toContain("Steering: steering first line")
     expect(queuedFrame).not.toContain("second line")
@@ -66,6 +67,7 @@ test("real prompt keys admit, present, and restore steering and follow-up queues
     expect(queuedFrame).toContain("↳ Alt+Up to edit all queued messages")
 
     input.setText("draft")
+    input.gotoBufferEnd()
     setup.mockInput.pressArrow("up")
     setup.mockInput.pressArrow("up", { meta: true, shift: true })
     expect(input.plainText).toBe("draft")

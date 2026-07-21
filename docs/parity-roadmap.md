@@ -47,6 +47,7 @@ The target is coding-agent architecture parity and observable product-behavior p
 - [x] Context usage and automatic/manual compaction
 - [ ] Slash commands and file completion
 - [x] Conversation scrolling, follow-tail, unseen-line hint, selection/copy
+- [x] Composer session-history recall with multiline boundary movement and exact draft restoration
 - [x] Typed tool-result and semantic-presentation cutover with transcript-item spacing and open-rail polish for all six active built-ins
 - [x] Settings: global and project scope
 - [x] Print and JSON modes sharing the same `AgentSession`
@@ -85,6 +86,13 @@ Pi's optional `grep`, `find`, and `ls` implementations are deliberately deferred
 - `packages/coding-agent/test/runtime-api-key.test.ts` and `packages/cli/test/args.test.ts` fix `--api-key` parsing, required model-provider inference, request-option precedence, model availability, unchanged stored credentials, no auth-file creation, and loss of the override in a fresh runtime.
 - `Authentication` invokes the installed Pi AI provider contracts and persists through the runtime credential owner; provider protocols and OAuth refresh remain below that boundary. `AgentSession` gates this owner against runs and model mutations and chooses the provider's first known model after login when currently unselected.
 - `packages/tui/test/interactive/authentication.test.ts` drives slash completion, exact provider routing, nested provider/method filters, multi-prompt hidden API-key entry, OAuth URL/device/select/manual-code/progress presentation, OSC 8-safe links, Escape cancellation, stale session replacement, first-model title updates, and stored-only logout through real OpenTUI input.
+
+### P1 composer-history evidence
+
+- `packages/coding-agent/test/session-manager.test.ts` fixes bounded reference indexing, exact trimmed text extraction, consecutive deduplication, stable-ID traversal, compaction independence, append behavior, and journal restore. `AgentSession` exposes only latest/older lookup; no frontend receives a copied history timeline.
+- `packages/tui/test/composer.test.ts` fixes the direct `idle | browsing` zipper, Pi's idle-snap versus browsing-boundary cursor behavior, no-wrap traversal, visited redo, edit detachment, display-width cursor placement, exact draft cursor/paste/image restoration, replacement-failure rollback, catalog turnover without editor reset, stable-ID reuse across abandoned browses, pinned native undo/redo references, and repeated traversal beyond OpenTUI's default 255-slot failure point.
+- `packages/tui/test/interactive/prompt-history.test.ts` drives default and overridden semantic actions, picker precedence, full-journal compacted recall, session replacement, focus, and attachment synchronization through real OpenTUI input. Queue restoration remains the separate `app.message.dequeue` path.
+- The interaction follows Pi's inline editor history while deliberately keeping the bounded catalog in `SessionManager`, deriving resumed history from the full journal, admitting queued input only after commit, and deferring historical image recall. See [`docs/composer-history-implementation-spec.md`](composer-history-implementation-spec.md).
 
 ### P1 steering and follow-up evidence
 

@@ -1,12 +1,12 @@
 import {
   BoxRenderable,
   CodeRenderable,
+  createTextAttributes,
   MarkdownRenderable,
   type MarkdownOptions,
   type Renderable,
   StyledText,
   type SyntaxStyle,
-  TextAttributes,
   TextRenderable,
   type RenderContext
 } from "@opentui/core"
@@ -30,7 +30,12 @@ const renderMarkdownNode: NonNullable<MarkdownOptions["renderNode"]> = (token, c
       text: token.text,
       ...(style?.fg === undefined ? {} : { fg: style.fg }),
       ...(style?.bg === undefined ? {} : { bg: style.bg }),
-      attributes: TextAttributes.BOLD
+      attributes: createTextAttributes({
+        bold: true,
+        italic: style?.italic ?? false,
+        underline: style?.underline ?? false,
+        dim: style?.dim ?? false
+      })
     }
   ])
   return renderable
@@ -107,7 +112,7 @@ type StreamingPart =
   | { readonly kind: "tool"; readonly tool: ActiveTool }
   | { readonly kind: "omitted-tools"; readonly count: number }
 type StreamingPartView =
-  | { readonly kind: "thinking"; readonly root: BoxRenderable; readonly content: TextRenderable; value: string }
+  | { readonly kind: "thinking"; readonly root: BoxRenderable; readonly content: MarkdownRenderable; value: string }
   | { readonly kind: "answer"; readonly root: BoxRenderable; readonly content: MarkdownRenderable; value: string }
   | {
       readonly kind: "tool"
@@ -131,6 +136,7 @@ export class StreamingAssistantView {
   readonly #ctx: RenderContext
   readonly #theme: Theme
   readonly #syntaxStyle: SyntaxStyle
+  readonly #thinkingSyntaxStyle: SyntaxStyle
   readonly #toolViews: AssistantToolViewOwner | undefined
   readonly #cwd: string
   readonly #parts: StreamingPartView[] = []
@@ -142,12 +148,14 @@ export class StreamingAssistantView {
     message: AssistantMessage,
     theme: Theme,
     syntaxStyle: SyntaxStyle,
+    thinkingSyntaxStyle: SyntaxStyle,
     toolViews?: AssistantToolViewOwner,
     cwd = ""
   ) {
     this.#ctx = ctx
     this.#theme = theme
     this.#syntaxStyle = syntaxStyle
+    this.#thinkingSyntaxStyle = thinkingSyntaxStyle
     this.#toolViews = toolViews
     this.#cwd = cwd
     this.root = new BoxRenderable(ctx, {
@@ -309,11 +317,13 @@ export class StreamingAssistantView {
   #createPart(part: StreamingPart): StreamingPartView {
     if (part.kind === "thinking") {
       const root = new BoxRenderable(this.#ctx, { flexShrink: 0, marginTop: 0, marginBottom: 1 })
-      const content = new TextRenderable(this.#ctx, {
-        fg: this.#theme.text.thinking,
-        attributes: TextAttributes.ITALIC,
-        content: part.content
-      })
+      const content = createMarkdown(
+        this.#ctx,
+        part.content,
+        this.#theme,
+        this.#thinkingSyntaxStyle,
+        markdownStreamingWorkaround
+      )
       root.add(content)
       return { kind: "thinking", root, content, value: part.content }
     }

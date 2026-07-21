@@ -5,7 +5,13 @@ import { tmpdir } from "node:os"
 import { join, relative, resolve } from "node:path"
 
 import { OpenZiPaths } from "../src/paths.js"
-import { maxSessionFileBytes, maxSessionFirstMessageLength, SessionManager } from "../src/session-manager.js"
+import {
+  maxSessionFileBytes,
+  maxSessionFirstMessageLength,
+  maxSessionPromptHistoryEntries,
+  maxSessionPromptHistoryEntryBytes,
+  SessionManager
+} from "../src/session-manager.js"
 
 test("session entries form one append-only branch", () => {
   const session = SessionManager.inMemory("/work")
@@ -18,6 +24,86 @@ test("session entries form one append-only branch", () => {
   expect(entries.map(entry => entry.id)).toEqual([model.id, thinking.id, message.id])
   expect(entries.map(entry => entry.parentId)).toEqual([null, model.id, thinking.id])
   expect(session.messages()).toEqual([{ role: "user", content: "hello", timestamp: 1 }])
+})
+
+test("session prompt history traverses trimmed text chronologically with consecutive deduplication", () => {
+  const session = SessionManager.inMemory("/work")
+  expect(session.latestPromptHistoryEntry()).toBeUndefined()
+
+  const first = session.appendMessage({ role: "user", content: "  first\nline  ", timestamp: 1 })
+  session.appendMessage({ role: "user", content: "first\nline", timestamp: 2 })
+  session.appendMessage({ role: "user", content: "   ", timestamp: 3 })
+  session.appendMessage({
+    role: "user",
+    content: [
+      { type: "text", text: "mixed" },
+      { type: "image", mimeType: "image/png", data: "AAAA" },
+      { type: "text", text: " prompt" }
+    ],
+    timestamp: 4
+  })
+  session.appendMessage({
+    role: "user",
+    content: [{ type: "image", mimeType: "image/png", data: "BBBB" }],
+    timestamp: 5
+  })
+  const repeated = session.appendMessage({ role: "user", content: "first\nline", timestamp: 6 })
+
+  expect(session.latestPromptHistoryEntry()).toEqual({ entryId: repeated.id, text: "first\nline" })
+  const mixed = session.olderPromptHistoryEntry(repeated.id)
+  expect(mixed?.text).toBe("mixed prompt")
+  expect(session.olderPromptHistoryEntry(mixed!.entryId)).toEqual({ entryId: first.id, text: "first\nline" })
+  expect(session.olderPromptHistoryEntry(first.id)).toBeUndefined()
+  expect(session.olderPromptHistoryEntry("missing")).toBeUndefined()
+})
+
+test("session prompt history is bounded by references and rejects oversized text", () => {
+  const session = SessionManager.inMemory("/work")
+  session.appendMessage({
+    role: "user",
+    content: [
+      { type: "text", text: "x".repeat(maxSessionPromptHistoryEntryBytes) },
+      { type: "text", text: "x" }
+    ],
+    timestamp: 0
+  })
+  expect(session.latestPromptHistoryEntry()).toBeUndefined()
+
+  const entries = Array.from({ length: maxSessionPromptHistoryEntries + 2 }, (_, index) =>
+    session.appendMessage({ role: "user", content: `prompt-${index}`, timestamp: index + 1 })
+  )
+  const history = promptHistory(session)
+
+  expect(history).toHaveLength(maxSessionPromptHistoryEntries)
+  expect(history[0]).toEqual({ entryId: entries.at(-1)!.id, text: `prompt-${entries.length - 1}` })
+  expect(history.at(-1)).toEqual({ entryId: entries[2]!.id, text: "prompt-2" })
+  expect(session.olderPromptHistoryEntry(entries[1]!.id)).toBeUndefined()
+})
+
+test("session prompt history survives compaction, append, and journal restore by stable entry ID", async () => {
+  const root = await mkdtemp(join(tmpdir(), "openzi-session-prompt-history-"))
+  const paths = new OpenZiPaths(join(root, "project"), join(root, "global"))
+  const session = SessionManager.create(paths)
+  const old = session.appendMessage({ role: "user", content: " old ", timestamp: 1 })
+  session.appendMessage(assistantMessage(2))
+  const kept = session.appendMessage({ role: "user", content: "kept", timestamp: 3 })
+  session.appendCompaction({
+    reason: "manual",
+    summary: "summary",
+    firstKeptEntryId: kept.id,
+    tokensBefore: 100,
+    estimatedTokensAfter: 10,
+    details: emptyCompactionDetails()
+  })
+  const latest = session.latestPromptHistoryEntry()!
+  const appended = session.appendMessage({ role: "user", content: "new", timestamp: 4 })
+
+  expect(session.olderPromptHistoryEntry(latest.entryId)).toEqual({ entryId: old.id, text: "old" })
+  expect(session.olderPromptHistoryEntry(appended.id)).toEqual(latest)
+  expect(session.activeMessages().some(message => message.role === "user" && message.content === "old")).toBe(false)
+
+  const restored = SessionManager.open(session.file!)
+  expect(promptHistory(restored)).toEqual(promptHistory(session))
 })
 
 test("session context derives resumable model and thinking state from the journal", () => {
@@ -324,6 +410,16 @@ test("oversized session journals are refused before parsing", async () => {
   expect(() => SessionManager.open(file)).toThrow(`Session file cannot exceed ${maxSessionFileBytes} bytes`)
   expect(await SessionManager.list(paths)).toMatchObject({ sessions: [], invalid: 1 })
 })
+
+function promptHistory(session: SessionManager) {
+  const entries = []
+  let current = session.latestPromptHistoryEntry()
+  while (current) {
+    entries.push(current)
+    current = session.olderPromptHistoryEntry(current.entryId)
+  }
+  return entries
+}
 
 function assistantMessage(timestamp: number) {
   return {

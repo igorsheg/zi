@@ -80,7 +80,9 @@ test("representative session keeps the accepted visual hierarchy at normal and c
 
     const spans = setup.captureSpans().lines.flatMap(line => line.spans)
     expect(span(spans, "Inspect the session UI.").bg.toInts()).toEqual([13, 18, 24, 255])
-    expect(span(spans, "Checking spacing and semantic color.").attributes).toBe(TextAttributes.ITALIC)
+    expect(span(spans, "Checking ").attributes).toBe(TextAttributes.ITALIC)
+    expect(span(spans, "spacing").attributes).toBe(TextAttributes.BOLD | TextAttributes.ITALIC)
+    expect(span(spans, "spacing").fg.toInts()).toEqual([127, 131, 129, 255])
     expect(span(spans, "Result").fg.toInts()).toEqual([230, 195, 132, 255])
     expect(span(spans, "Result").attributes).toBe(TextAttributes.BOLD)
     expect(span(spans, "code").fg.toInts()).toEqual([122, 168, 159, 255])
@@ -154,7 +156,7 @@ function representativeMessages(): AgentMessage[] {
       timestamp: 1
     },
     fauxAssistantMessage([
-      fauxThinking("Checking spacing and semantic color."),
+      fauxThinking("Checking **spacing** and semantic color."),
       fauxText("## Result\n\nThe layout keeps **content** readable and highlights `code`."),
       fauxToolCall("read", { path: "src/app.tsx" }, { id: "read-1" })
     ]),
