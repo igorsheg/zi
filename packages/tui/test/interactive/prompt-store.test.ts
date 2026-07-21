@@ -9,6 +9,7 @@ import {
 } from "@openzi/coding-agent/testing"
 
 import { createInteractiveStore } from "../../src/interactive/interactive-store.js"
+import { fileCompletionInputFromText } from "../../src/interactive/prompt/file-completion.js"
 import { createPromptStore, type PromptSessionActions } from "../../src/interactive/prompt/store.js"
 import { SlashController } from "../../src/interactive/slash-controller.js"
 
@@ -26,7 +27,7 @@ test("prompt store restores queued text, images, and status without a renderer",
       feedback: { type: "status", message: "Restored 1 queued message to editor with 1 image" },
       images: [{ type: "image", data: "aW1hZ2U=", mimeType: "image/png" }],
       workflow: { type: "idle" },
-      inputEdit: { revision: 0, text: "", cursorOffset: 0 }
+      inputEdit: { type: "replace", revision: 0, text: "", cursorOffset: 0 }
     })
     expect(session.queuedInputs.steering).toHaveLength(0)
   } finally {
@@ -44,9 +45,14 @@ test("resource command selection edits the composer without dispatching TUI doma
   const prompt = createPromptStore(mode, slash)
 
   try {
-    prompt.draftChanged("/rev path", 4)
-    expect(prompt.activatePicker("/rev path", 4)).toBe(true)
-    expect(prompt.$state.get().inputEdit).toEqual({ revision: 1, text: "/review path", cursorOffset: 8 })
+    prompt.draftChanged("/rev path", fileCompletionInputFromText("/rev path", 4))
+    expect(prompt.activatePicker("/rev path", fileCompletionInputFromText("/rev path", 4))).toBe(true)
+    expect(prompt.$state.get().inputEdit).toEqual({
+      type: "replace",
+      revision: 1,
+      text: "/review path",
+      cursorOffset: 8
+    })
     expect(session.messages).toEqual([])
   } finally {
     mode.dispose()
@@ -167,19 +173,19 @@ test("settings workflow restores suspended filters until a value closes the stac
 
   try {
     expect(prompt.submit("/settings", "steer")).toBe(true)
-    prompt.draftChanged("glob", 4)
-    expect(prompt.activatePicker("glob", 4)).toBe(true)
-    prompt.draftChanged("steer", 5)
-    expect(prompt.activatePicker("steer", 5)).toBe(true)
+    prompt.draftChanged("glob", fileCompletionInputFromText("glob", 4))
+    expect(prompt.activatePicker("glob", fileCompletionInputFromText("glob", 4))).toBe(true)
+    prompt.draftChanged("steer", fileCompletionInputFromText("steer", 5))
+    expect(prompt.activatePicker("steer", fileCompletionInputFromText("steer", 5))).toBe(true)
     prompt.movePicker("", 1)
     expect(prompt.backPicker()).toBe(true)
-    expect(prompt.$state.get().inputEdit.text).toBe("steer")
+    expect(prompt.$state.get().inputEdit).toMatchObject({ type: "replace", text: "steer" })
     expect(prompt.picker.presentation("steer")?.frame.id).toBe("settings")
-    expect(prompt.activatePicker("steer", 5)).toBe(true)
+    expect(prompt.activatePicker("steer", fileCompletionInputFromText("steer", 5))).toBe(true)
     prompt.movePicker("", 1)
-    expect(prompt.activatePicker("", 0)).toBe(true)
+    expect(prompt.activatePicker("", fileCompletionInputFromText("", 0))).toBe(true)
     expect(session.steeringMode).toBe("all")
-    expect(prompt.$state.get().inputEdit.text).toBe("")
+    expect(prompt.$state.get().inputEdit).toMatchObject({ type: "replace", text: "" })
     expect(prompt.picker.presentation("")).toBeUndefined()
   } finally {
     mode.dispose()
@@ -196,7 +202,7 @@ test("settings workflow cannot cross a session replacement", async () => {
   try {
     expect(prompt.submit("/settings", "steer")).toBe(true)
     mode.replaceSession(second)
-    expect(prompt.activatePicker("", 0)).toBe(false)
+    expect(prompt.activatePicker("", fileCompletionInputFromText("", 0))).toBe(false)
     expect(first.steeringMode).toBe("one-at-a-time")
     expect(second.steeringMode).toBe("one-at-a-time")
   } finally {
@@ -236,7 +242,7 @@ test("session replacement cancellation remains explicit until runtime settlement
   try {
     expect(prompt.submit("/resume", "steer")).toBe(true)
     await Bun.sleep(0)
-    expect(prompt.activatePicker("", 0)).toBe(true)
+    expect(prompt.activatePicker("", fileCompletionInputFromText("", 0))).toBe(true)
     expect(prompt.$state.get().workflow.type).toBe("resuming_session")
 
     expect(prompt.abortAndRestoreQueuedInputs("")).toBe("")

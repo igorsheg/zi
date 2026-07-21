@@ -4,6 +4,7 @@ import { TextareaRenderable } from "@opentui/core"
 import { createModels, createTestAgentRuntime as createAgentRuntime, fauxProvider } from "@openzi/coding-agent/testing"
 
 import { createInteractiveStore } from "../../src/interactive/interactive-store.js"
+import { fileCompletionInputFromText } from "../../src/interactive/prompt/file-completion.js"
 import { createPromptStore } from "../../src/interactive/prompt/store.js"
 import { SlashController } from "../../src/interactive/slash-controller.js"
 import { createInteractiveTest, renderSettled } from "./harness.js"
@@ -264,7 +265,7 @@ test("cancelled model selection rejects stale completion", async () => {
     await waitFor(() => prompt.$state.get().workflow.type === "choosing_model")
     expect(prompt.$state.get().workflow.type).toBe("choosing_model")
     expect(prompt.submit("/model", "steer")).toBe(false)
-    expect(prompt.activatePicker("", 0)).toBe(true)
+    expect(prompt.activatePicker("", fileCompletionInputFromText("", 0))).toBe(true)
     expect(prompt.backPicker()).toBe(true)
 
     selection.reject(new Error("stale selection failed"))

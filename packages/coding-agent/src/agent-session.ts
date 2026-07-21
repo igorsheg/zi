@@ -47,6 +47,7 @@ import type { StoredCredential } from "./credential-store.js"
 import { DEFAULT_THINKING_LEVEL } from "./defaults.js"
 import { isOpenZiAgentMessage, type AgentMessage } from "./messages.js"
 import type { ModelRegistry } from "./model-registry.js"
+import { type ProjectFileSearch, type ProjectFileSearchResult } from "./project-file-search.js"
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.js"
 import type { ResourceDiagnostic } from "./resource-diagnostics.js"
 import type { SessionResources } from "./resource-loader.js"
@@ -172,6 +173,7 @@ export interface AgentSessionConfig {
   authentication: Authentication
   modelRegistry: ModelRegistry
   resources: SessionResources
+  projectFileSearch: ProjectFileSearch
   shell?: SessionShell
   model?: Model<Api>
   apiKeyProvider?: string
@@ -268,6 +270,7 @@ export class AgentSession {
   readonly #authentication: Authentication
   readonly #modelRegistry: ModelRegistry
   readonly #resources: SessionResources
+  readonly #projectFileSearch: ProjectFileSearch
   readonly #shell: SessionShell | undefined
   readonly #apiKeyProvider: string | undefined
   readonly #listeners = new Set<(event: AgentSessionEvent) => void>()
@@ -291,6 +294,7 @@ export class AgentSession {
     this.#authentication = config.authentication
     this.#modelRegistry = config.modelRegistry
     this.#resources = config.resources
+    this.#projectFileSearch = config.projectFileSearch
     this.#shell = config.shell
     this.#apiKeyProvider = config.apiKeyProvider
     this.sessionManager = config.sessionManager
@@ -715,19 +719,25 @@ export class AgentSession {
   }
 
   waitForIdle(): Promise<void> {
+    const searchSettled = this.#projectFileSearch.waitForIdle()
     switch (this.#activity.type) {
       case "running":
       case "aborting":
       case "compacting":
       case "compaction_committed":
       case "disposed":
-        return settleTogether(this.#activity.settled, this.#authentication.waitForIdle())
+        return settleAll([this.#activity.settled, this.#authentication.waitForIdle(), searchSettled])
       case "idle":
       case "failed":
-        return this.#authentication.waitForIdle()
+        return settleTogether(this.#authentication.waitForIdle(), searchSettled)
       default:
         return assertNever(this.#activity)
     }
+  }
+
+  searchProjectFiles(query: string, signal: AbortSignal): Promise<ProjectFileSearchResult> {
+    this.#assertOpen()
+    return this.#projectFileSearch.search(query, signal)
   }
 
   getSupportedThinkingLevels(): readonly ThinkingLevel[] {
@@ -863,6 +873,7 @@ export class AgentSession {
     const settled = settleAll([
       activeSettled,
       this.#authentication.dispose(),
+      this.#projectFileSearch.dispose(),
       this.#shell?.dispose() ?? Promise.resolve()
     ])
     this.#activity = { type: "disposed", settled }

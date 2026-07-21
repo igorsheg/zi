@@ -2,6 +2,7 @@ import type {
   AgentSession,
   AuthenticationMethod,
   ModelChoice,
+  ProjectFileSearchResult,
   SessionInfo,
   SlashCommand,
   SettingsScope,
@@ -15,6 +16,7 @@ import type { EditableSetting, EditableSettingValue } from "./state.js"
 
 export const promptPickerFrameIds = {
   commands: "commands",
+  files: "files",
   models: "models",
   authProviders: "auth-providers",
   authMethods: "auth-methods",
@@ -38,6 +40,21 @@ export function commandFrame(commands: readonly SlashCommand[]): PickerFrame {
       metadata: command.description,
       searchText: `${command.name} ${command.description} ${command.argumentHint ?? ""}`
     }))
+  }
+}
+
+export function fileFrame(result: ProjectFileSearchResult, query: string): PickerFrame {
+  return {
+    id: promptPickerFrameIds.files,
+    title: "",
+    filter: "none",
+    rows: result.matches.map(match => ({
+      id: `${match.type}:${match.path}`,
+      label: `@${match.path}${match.type === "directory" ? "/" : ""}`,
+      ...(match.type === "directory" ? { detail: "[directory]" } : {}),
+      searchText: match.path
+    })),
+    ...(result.truncated ? { footer: `Search limited; refine @${query}` } : {})
   }
 }
 

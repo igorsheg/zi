@@ -48,6 +48,18 @@ _Avoid_: Session manager, root store, TUI session controller
 The immutable coding-agent policy value for one effective cwd. It resolves global `$HOME/.openzi/agent`, exact project `<cwd>/.openzi`, credentials, scoped settings/resources, and cwd-partitioned sessions. A resumed session's stored cwd is admitted before this value and its cwd-bound services are constructed.
 _Avoid_: Path registry, config singleton, ambient cwd
 
+**Project file search**:
+The bounded coding-agent operation that enumerates and ranks validated paths beneath one session's immutable `OpenZiPaths.cwd`. It uses per-query Git or ignore-aware fallback traversal, retains no complete index, and owns cancellation and filesystem/process cleanup.
+_Avoid_: File catalog, TUI filesystem search, workspace index
+
+**Project-file autocomplete**:
+The terminal interaction that parses an active textual `@` token, requests bounded project file matches through `AgentSession`, presents them in the composer-owned picker, and replaces only that token. Accepted text does not read or attach file contents.
+_Avoid_: File attachment, mention part, autocomplete provider registry
+
+**Completion range edit**:
+A revisioned one-shot request to replace one display-offset range in the native Composer with an explicit cursor target. It is not a copied draft; OpenTUI remains authoritative for text, markers, selection, and undo.
+_Avoid_: Prompt model, frontend draft state, delete-then-insert
+
 **Coding-agent parity**:
 Behavioral and architectural compatibility with `pi-coding-agent`, verified capability by capability while keeping the recreated layer owned by OpenZi.
 _Avoid_: Source identity, dependency parity

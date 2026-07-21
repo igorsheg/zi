@@ -6,13 +6,13 @@ The previous `/model` selector replaced the composer with a second `TextareaRend
 
 OpenZi now uses three concrete owners:
 
-- `Composer` owns the only native textarea, its text, cursor, paste/undo history, focus, atomic paste/image extmarks, and its `idle | browsing` session-history zipper. Text paste payloads stay with native markers and expand only at copy or submission; `PromptStore` remains authoritative for active image payloads while marker edits report their retained image references.
+- `Composer` owns the only native textarea, its text, cursor, paste/undo history, focus, atomic paste/image extmarks, completion range replacement, and its `idle | browsing` session-history zipper. Text paste payloads stay with native markers and expand only at copy or submission; `PromptStore` remains authoritative for active image payloads while marker edits report their retained image references.
 - `PickerStack` owns open/closed state, ordered frames, selected row per frame, suspended parent filters, top-frame filtering, and push/pop transitions. It accepts the current composer text as a method argument and does not retain or render an active input.
 - `PickerStackView` renders only the active frame below the composer. It contains no textarea and does not interpret selected row IDs.
 
 `PromptView` preserves three vertical regions. Working state, feedback, and queued-input status stay above the composer as transient presentation. The composer rail contains only stable session metadata: cwd on the left, then model/effort and context on the right. Right-rail text is ordered by importance and admits only the largest fitting prefix, so context disappears before model/effort at constrained widths. The rail accepts text, not arbitrary renderables or extension callbacks. `PickerStackView` remains the only below-input choice surface.
 
-`PromptStore` owns the command/model workflow that creates frames and interprets selection. It issues revisioned one-shot input edits with explicit cursor targets when a transition must complete, clear, restore, or safely splice command completion into the composer. These edits are resource synchronization requests, not a mirrored editor model; subsequent native text and cursor remain authoritative in OpenTUI.
+`PromptStore` owns the command/model workflow that creates frames and interprets selection. Its concrete `FileCompletionController` creates file frames and interprets their selections without adding file state to `PromptState`. The store issues revisioned one-shot `replace | range` input edits with explicit cursor targets when a transition must complete, clear, restore, or splice completion into the composer. These edits are resource synchronization requests, not a mirrored editor model; subsequent native text and cursor remain authoritative in OpenTUI. File range edits preserve text and Composer-owned markers outside the active token and create one native undo point through the pinned OpenTUI 0.4.5 adapter.
 
 The stack API is deliberately mechanical:
 
@@ -30,6 +30,8 @@ interface PickerStack {
   dispose(): void
 }
 ```
+
+Project-file and command frames are sibling top-level uses of the stack. The store gives command-name completion precedence, while file results use coding-agent ranking with `filter: "none"`; Enter and Tab resolve the selected bounded row through its owning controller. Escape dismisses a file trigger without clearing ordinary composer text. The stack itself knows neither syntax nor arbitration.
 
 Composer session history remains separate from the picker stack. `AgentSession` exposes bounded latest/older lookup over `SessionManager` journal references; Composer retains bounded entry IDs and native slot handles, while recalled text plus exact draft marker restoration stays with native replace/undo/redo. Picker navigation wins whenever a frame is active, so history adds neither a frame nor another input.
 

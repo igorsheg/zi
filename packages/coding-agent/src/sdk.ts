@@ -9,6 +9,7 @@ import { convertToLlm, type AgentMessage } from "./messages.js"
 import type { ModelRegistry } from "./model-registry.js"
 import { findInitialModel, restoreModelFromSession } from "./model-resolver.js"
 import type { OpenZiPaths } from "./paths.js"
+import { ProjectFileSearch } from "./project-file-search.js"
 import { createSessionResources, type ResourceLoader, type SessionResources } from "./resource-loader.js"
 import type { SessionManager, SessionModel } from "./session-manager.js"
 import type { SessionShell } from "./session-shell.js"
@@ -137,6 +138,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions): Pr
     authentication: new Authentication(services.modelRegistry.models, services.credentialStore),
     modelRegistry: services.modelRegistry,
     resources,
+    projectFileSearch: new ProjectFileSearch(services.paths),
     ...(options.shell ? { shell: options.shell } : {}),
     ...(model ? { model } : {}),
     ...(options.apiKey && model ? { apiKeyProvider: model.provider } : {})

@@ -45,13 +45,15 @@ The target is coding-agent architecture parity and observable product-behavior p
 - [x] Session-owned foreground/background shell tasks and interactive demotion
 - [ ] Retry policy and visible countdown
 - [x] Context usage and automatic/manual compaction
-- [ ] Slash commands and file completion
+- [x] Slash-command completion and `@` project-file completion
 - [x] Conversation scrolling, follow-tail, unseen-line hint, selection/copy
 - [x] Composer session-history recall with multiline boundary movement and exact draft restoration
 - [x] Typed tool-result and semantic-presentation cutover with transcript-item spacing and open-rail polish for all six active built-ins
 - [x] Settings: global and project scope
 - [x] Print and JSON modes sharing the same `AgentSession`
 - [x] Authentication commands and composer-owned provider flows
+
+`@` project-file autocomplete is implemented from [`docs/file-autocomplete-implementation-spec.md`](file-autocomplete-implementation-spec.md). OpenZi preserves Pi's textual completion behavior while moving bounded Git/fallback search into coding-agent, restricting scope to the exact project cwd, and keeping accepted references ordinary prompt text.
 
 Context accounting and compaction are implemented from [`docs/context-compaction-implementation-spec.md`](context-compaction-implementation-spec.md) and accepted in [ADR 0015](adr/0015-context-compaction-is-an-append-only-session-transaction.md). The implementation keeps Pi's append-only, tail-preserving behavior while adopting Grok Build's provider-boundary accounting, validation, and bounded failure lessons.
 
@@ -79,6 +81,13 @@ Pi's optional `grep`, `find`, and `ls` implementations are deliberately deferred
 - `packages/coding-agent/test/slash-commands.test.ts` fixes coding-agent ownership of supported built-in command descriptors.
 - Mode-owned `SlashController` assembles a bounded current-session catalog, fuzzy-ranks command completion, safely splices the selected token, and parses invocation text into closed intents without retaining active picker state. Mode-owned `InteractiveKeybindings` resolves effective terminal actions without containing callbacks. `PromptStore` owns typed workflows and operation identity. `PickerStack` owns nested choice mechanics, while `PickerStackView` renders below the composer without creating another input. `PromptView`, `Composer`, `PickerStackView`, and `PickerList` contain no supported command names, argument rules, or dispatch policy.
 - Command catalog composition, terminal parsing, exact reference matching, fuzzy search, sorting, and selector keys are characterized from Pi's `interactive-mode.ts`, `model-selector.ts`, `model-search.ts`, `model-resolver.ts`, and `pi-tui` fuzzy/editor implementation at the pinned commit.
+
+### P1 project-file autocomplete evidence
+
+- `packages/coding-agent/test/project-file-search.test.ts` fixes exact `OpenZiPaths.cwd` rooting, Git tracked/untracked and standard-ignore behavior, directory-scoped nested ignore semantics, conservative unreadable/oversized-ignore truncation, hidden entries, directory-symlink non-traversal, nested ranking, validation, cancellation, single flight, and disposal.
+- `packages/tui/test/file-completion.test.ts` fixes bounded native-cursor token parsing, email and out-of-project rejection, full-token ranges, quoting, file/directory formatting, debounce, latest-query collapse, post-acceptance dismissal, stale work, and bounded picker projection. `packages/tui/test/composer.test.ts` fixes one-step native undo/redo, prior history, marker identity and offset preservation, overlap refusal, and more than 255 owned replacements without registry growth.
+- `packages/tui/test/interactive/file-autocomplete.test.ts` drives directory continuation, file acceptance, Enter/Tab/Escape, persistent focus, and ordinary-text submission through the real OpenTUI composer and coding-agent search boundary.
+- OpenZi deliberately differs from Pi by owning search in coding-agent, admitting only project-relative paths under the immutable session cwd, using Git plus a bounded fallback walk rather than managed `fd`, not traversing directory symlinks, and never reading completed files implicitly.
 
 ### P1 authentication evidence
 

@@ -74,6 +74,40 @@ export function textWidth(text: string): number {
   return width
 }
 
+/** OpenTUI edit-buffer width: terminal cells, with every newline occupying one offset. */
+export function promptTextWidth(text: string): number {
+  let width = 0
+  for (const { segment } of graphemes.segment(text)) width += segment === "\n" ? 1 : cellWidth(segment)
+  return width
+}
+
+export function promptTextIndex(text: string, offset: number): number {
+  if (offset <= 0) return 0
+  let width = 0
+  for (const part of graphemes.segment(text)) {
+    const next = width + promptTextWidth(part.segment)
+    if (next > offset) return part.index
+    width = next
+  }
+  return text.length
+}
+
+export function promptTextSlice(text: string, start = 0, end = promptTextWidth(text)): string {
+  return text.slice(promptTextIndex(text, start), promptTextIndex(text, end))
+}
+
+export function promptTextOffsetIsBoundary(text: string, offset: number): boolean {
+  if (!Number.isInteger(offset) || offset < 0) return false
+  let width = 0
+  if (offset === 0) return true
+  for (const { segment } of graphemes.segment(text)) {
+    width += promptTextWidth(segment)
+    if (width === offset) return true
+    if (width > offset) return false
+  }
+  return false
+}
+
 function* wrappedLines(text: string, maxWidth: number): Generator<string> {
   if (maxWidth <= 0) return
   if (text.length === 0) {

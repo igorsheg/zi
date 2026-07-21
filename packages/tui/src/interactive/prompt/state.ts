@@ -101,18 +101,29 @@ export type PromptWorkflow =
       readonly setting: EditableSetting
     }
 
+export type PromptInputEdit =
+  | { readonly type: "replace"; readonly revision: number; readonly text: string; readonly cursorOffset: number }
+  | {
+      readonly type: "range"
+      readonly revision: number
+      readonly startOffset: number
+      readonly endOffset: number
+      readonly replacement: string
+      readonly cursorOffset: number
+    }
+
 export interface PromptState {
   readonly feedback: PromptFeedback
   readonly images: readonly ImageContent[]
   readonly workflow: PromptWorkflow
-  readonly inputEdit: { readonly revision: number; readonly text: string; readonly cursorOffset: number }
+  readonly inputEdit: PromptInputEdit
 }
 
 export const initialPromptState: PromptState = {
   feedback: { type: "none" },
   images: [],
   workflow: { type: "idle" },
-  inputEdit: { revision: 0, text: "", cursorOffset: 0 }
+  inputEdit: { type: "replace", revision: 0, text: "", cursorOffset: 0 }
 }
 
 export function promptInputIsSecret(workflow: PromptWorkflow): boolean {

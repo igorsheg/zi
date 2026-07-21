@@ -10,8 +10,13 @@ import {
 import { maxSessionPromptHistoryEntries, type ImageContent } from "@openzi/coding-agent"
 
 import type { Theme } from "../theme.js"
-import { textWidth } from "./cell-text.js"
+import { promptTextSlice, promptTextWidth, textWidth } from "./cell-text.js"
 import { createComposerHistoryReplacement } from "./composer-history-replacement.js"
+import {
+  replaceComposerRange,
+  type ComposerRangeEdit,
+  type ComposerRangeReplacementResult
+} from "./composer-range-replacement.js"
 
 export interface ComposerGeometry {
   readonly columns: number
@@ -45,6 +50,7 @@ export interface ComposerOptions {
   readonly historySource?: ComposerHistorySource
   readonly onSubmit: () => void
   readonly onContentChange?: () => void
+  readonly onCursorChange?: () => void
   readonly onImageMarkersChange?: (images: readonly ImageContent[]) => void
   readonly onPaste?: (event: PasteEvent) => void
 }
@@ -59,6 +65,7 @@ export interface Composer {
   historyPrevious(): ComposerHistoryResult
   historyNext(): ComposerHistoryResult
   replaceText(text: string, cursorOffset?: number): void
+  replaceRange(edit: ComposerRangeEdit): ComposerRangeReplacementResult
   update(geometry: ComposerGeometry, slots: ComposerSlots): void
   destroy(): void
 }
@@ -139,6 +146,7 @@ export function createComposer(ctx: RenderContext, options: ComposerOptions): Co
     backgroundColor: options.theme.surface.composer,
     focusedBackgroundColor: options.theme.surface.composer,
     ...(options.onPaste ? { onPaste: options.onPaste } : {}),
+    ...(options.onCursorChange ? { onCursorChange: options.onCursorChange } : {}),
     keyBindings: [
       { name: "return", action: "submit" },
       { name: "return", shift: true, action: "newline" }
@@ -234,7 +242,7 @@ export function createComposer(ctx: RenderContext, options: ComposerOptions): Co
     try {
       effect()
       if (cursor === "start") input.cursorOffset = 0
-      else if (cursor === "end") input.cursorOffset = promptOffsetWidth(input.plainText)
+      else if (cursor === "end") input.cursorOffset = promptTextWidth(input.plainText)
     } catch (cause) {
       historyState = previousState
       throw cause
@@ -309,7 +317,7 @@ export function createComposer(ctx: RenderContext, options: ComposerOptions): Co
     detachHistory()
     const start = input.cursorOffset
     nativeInsertText(marker)
-    input.extmarks.create({ start, end: start + promptOffsetWidth(marker), virtual: true, typeId: markerTypeId, data })
+    input.extmarks.create({ start, end: start + promptTextWidth(marker), virtual: true, typeId: markerTypeId, data })
     historyReplacement.releaseCompletedBrowse()
     reportContentChange()
   }
@@ -349,7 +357,7 @@ export function createComposer(ctx: RenderContext, options: ComposerOptions): Co
         else unmatched.splice(index, 1)
       }
       for (const image of missing) {
-        const before = displaySlice(input.plainText, 0, input.cursorOffset)
+        const before = promptTextSlice(input.plainText, 0, input.cursorOffset)
         const prefix = before.length > 0 && !/\s$/.test(before) ? " " : ""
         const marker = `${prefix}[image #${++nextImageId}] `
         insertMarker(marker, { type: "image", marker, image })
@@ -381,7 +389,7 @@ export function createComposer(ctx: RenderContext, options: ComposerOptions): Co
         input.moveCursorDown()
         return "cursor_moved"
       }
-      const endOffset = promptOffsetWidth(input.plainText)
+      const endOffset = promptTextWidth(input.plainText)
       const globalVisualRow = input.scrollY + input.visualCursor.visualRow
       const finalVisualRow = Math.max(0, input.editorView.getTotalVirtualLineCount() - 1)
       if (historyState.type === "browsing" && globalVisualRow === finalVisualRow) return newerHistory()
@@ -393,7 +401,7 @@ export function createComposer(ctx: RenderContext, options: ComposerOptions): Co
       input.moveCursorDown()
       return "cursor_moved"
     },
-    replaceText(text, cursorOffset = promptOffsetWidth(text)) {
+    replaceText(text, cursorOffset = promptTextWidth(text)) {
       historyState = { type: "idle" }
       markerRevision++
       nextPasteId = 0
@@ -402,6 +410,14 @@ export function createComposer(ctx: RenderContext, options: ComposerOptions): Co
       historyReplacement.reset()
       input.cursorOffset = cursorOffset
       reportContentChange()
+    },
+    replaceRange(edit) {
+      const result = replaceComposerRange(input, markerTypeId, edit)
+      if (result === "unavailable") return result
+      detachHistory()
+      historyReplacement.releaseCompletedBrowse()
+      reportContentChange()
+      return result
     },
     update(nextGeometry, nextSlots) {
       const geometryChanged = !sameGeometry(geometry, nextGeometry)
@@ -489,29 +505,6 @@ function sameSlots(left: ComposerSlots, right: ComposerSlots): boolean {
   )
 }
 
-const graphemes = new Intl.Segmenter(undefined, { granularity: "grapheme" })
-
-function promptOffsetWidth(value: string): number {
-  let width = 0
-  for (const part of graphemes.segment(value)) width += part.segment === "\n" ? 1 : textWidth(part.segment)
-  return width
-}
-
-function displayOffsetIndex(value: string, offset: number): number {
-  if (offset <= 0) return 0
-  let width = 0
-  for (const part of graphemes.segment(value)) {
-    const next = width + promptOffsetWidth(part.segment)
-    if (next > offset) return part.index
-    width = next
-  }
-  return value.length
-}
-
-function displaySlice(value: string, start = 0, end = promptOffsetWidth(value)): string {
-  return value.slice(displayOffsetIndex(value, start), displayOffsetIndex(value, end))
-}
-
 function composerMarkers(
   input: TextareaRenderable,
   markerTypeId: number
@@ -554,9 +547,9 @@ function expandMarkerRanges(text: string, markers: readonly (Extmark & { data: C
     .toSorted((left, right) => right.start - left.start)
     .reduce(
       (expanded, marker) =>
-        displaySlice(expanded, 0, marker.start) +
+        promptTextSlice(expanded, 0, marker.start) +
         (marker.data.type === "paste" ? marker.data.text : "") +
-        displaySlice(expanded, marker.end),
+        promptTextSlice(expanded, marker.end),
       text
     )
 }

@@ -16,6 +16,7 @@ import type {
 } from "@openzi/coding-agent"
 import { atom, type ReadableAtom } from "nanostores"
 
+import { promptTextWidth } from "../../components/cell-text.js"
 import {
   detectClipboardImageMimeType,
   maxClipboardImageBytes,
@@ -25,6 +26,7 @@ import {
 } from "../clipboard.js"
 import type { InteractiveStore } from "../interactive-store.js"
 import type { InteractiveCommand, SlashController } from "../slash-controller.js"
+import { FileCompletionController, type FileCompletionInput, type FileCompletionRangeEdit } from "./file-completion.js"
 import {
   authenticationMethodId,
   authMethodFrame,
@@ -56,9 +58,10 @@ export interface PromptStore {
   readonly $state: ReadableAtom<PromptState>
   readonly picker: PickerStack
   submit(text: string, delivery: PendingInputDelivery): boolean
-  draftChanged(text: string, cursorOffset: number): void
-  completePicker(text: string, cursorOffset: number): boolean
-  activatePicker(text: string, cursorOffset: number): boolean
+  draftChanged(text: string, input: FileCompletionInput): void
+  cursorChanged(text: string, input: FileCompletionInput): void
+  completePicker(text: string, input: FileCompletionInput): boolean
+  activatePicker(text: string, input: FileCompletionInput): boolean
   movePicker(filter: string, direction: -1 | 1): void
   backPicker(): boolean
   restoreQueuedInputs(currentText: string): string
@@ -116,7 +119,9 @@ class PromptController implements PromptStore {
   readonly #slash: SlashController
   readonly #sessionActions: PromptSessionActions | undefined
   readonly #clipboard: ClipboardReader
+  readonly #fileCompletion: FileCompletionController
   #clipboardRead: ClipboardReadState = { type: "idle" }
+  #draftRevision = 0
   #disposed = false
   #nextOperationId = 0
   #nextBrowserRequestId = 0
@@ -134,6 +139,7 @@ class PromptController implements PromptStore {
     this.#slash = slash
     this.#sessionActions = sessionActions
     this.#clipboard = clipboard
+    this.#fileCompletion = new FileCompletionController(this.picker, edit => this.#requestRange(edit))
     this.#unsubscribeAutomaticCompactionFailure = interactive.subscribeAutomaticCompactionFailure(message => {
       if (this.#disposed) return
       this.$state.set({ ...this.$state.get(), feedback: { type: "error", message } })
@@ -151,6 +157,7 @@ class PromptController implements PromptStore {
     const command = trimmed ? this.#slash.parse(trimmed) : undefined
     if (this.#dispatchCommand(command)) return true
 
+    this.#fileCompletion.close()
     try {
       const model = this.#interactive.getSession().modelState
       if (state.images.length > 0 && (model.type !== "selected" || !model.model.input.includes("image"))) {
@@ -162,7 +169,7 @@ class PromptController implements PromptStore {
       this.picker.close()
       this.$state.set({
         ...initialPromptState,
-        inputEdit: { revision: state.inputEdit.revision + 1, text: "", cursorOffset: 0 }
+        inputEdit: { type: "replace", revision: state.inputEdit.revision + 1, text: "", cursorOffset: 0 }
       })
       void settled.catch(cause => this.#showError(cause))
       return true
@@ -172,28 +179,23 @@ class PromptController implements PromptStore {
     }
   }
 
-  draftChanged(text: string, cursorOffset: number): void {
-    const workflow = this.$state.get().workflow
-    if (workflow.type === "auth_prompt" || workflow.type === "authenticating") return
-    if (workflow.type !== "idle") {
-      this.picker.queryChanged(text)
-      return
-    }
-
-    const suggestions = this.#slash.suggestions(text, cursorOffset)
-    if (suggestions.length === 0) {
-      if (this.picker.presentation(text)?.frame.id === promptPickerFrameIds.commands) this.picker.close()
-      return
-    }
-    const frame = commandFrame(suggestions)
-    if (this.picker.presentation(text)?.frame.id === promptPickerFrameIds.commands) this.picker.replaceTop(frame, text)
-    else this.picker.open(frame)
+  draftChanged(text: string, input: FileCompletionInput): void {
+    this.#draftRevision++
+    this.#completionContextChanged(text, input, true)
   }
 
-  completePicker(text: string, cursorOffset: number): boolean {
+  cursorChanged(text: string, input: FileCompletionInput): void {
+    this.#completionContextChanged(text, input, false)
+  }
+
+  completePicker(text: string, input: FileCompletionInput): boolean {
     const presentation = this.picker.presentation(text)
-    if (presentation?.frame.id !== promptPickerFrameIds.commands || !presentation.selectedId) return false
-    const result = this.#slash.complete(text, cursorOffset, presentation.selectedId)
+    if (!presentation?.selectedId) return false
+    if (presentation.frame.id === promptPickerFrameIds.files) {
+      return this.#fileCompletion.complete(presentation.selectedId, input)
+    }
+    if (presentation.frame.id !== promptPickerFrameIds.commands) return false
+    const result = this.#slash.complete(text, input.cursorOffset, presentation.selectedId)
     switch (result.type) {
       case "unavailable":
         this.picker.close()
@@ -207,14 +209,20 @@ class PromptController implements PromptStore {
     }
   }
 
-  activatePicker(text: string, cursorOffset: number): boolean {
+  activatePicker(text: string, input: FileCompletionInput): boolean {
     const presentation = this.picker.presentation(text)
     if (!presentation?.selectedId) return false
 
     const workflow = this.$state.get().workflow
     switch (workflow.type) {
       case "idle":
-        return this.#activateCommand(presentation, text, cursorOffset)
+        if (presentation.frame.id === promptPickerFrameIds.commands) {
+          return this.#activateCommand(presentation, text, input.cursorOffset)
+        }
+        if (presentation.frame.id === promptPickerFrameIds.files) {
+          return this.#fileCompletion.complete(presentation.selectedId, input)
+        }
+        return false
       case "choosing_settings_scope":
         return this.#activateSettingsScope(workflow, presentation, text)
       case "choosing_setting":
@@ -264,6 +272,10 @@ class PromptController implements PromptStore {
     }
     if (workflow.type === "idle" && presentation.frame.id === promptPickerFrameIds.commands) {
       this.picker.close()
+      return true
+    }
+    if (workflow.type === "idle" && presentation.frame.id === promptPickerFrameIds.files) {
+      this.#fileCompletion.dismiss()
       return true
     }
     if (workflow.type === "choosing_auth_option") return this.#cancelAuthentication()
@@ -487,11 +499,12 @@ class PromptController implements PromptStore {
   clear(): void {
     this.#cancelClipboardRead()
     if (this.#cancelAuthentication() || this.#cancelCompaction() || this.#cancelSessionReplacement()) return
+    this.#fileCompletion.close()
     this.picker.close()
     const state = this.$state.get()
     this.$state.set({
       ...initialPromptState,
-      inputEdit: { revision: state.inputEdit.revision + 1, text: "", cursorOffset: 0 }
+      inputEdit: { type: "replace", revision: state.inputEdit.revision + 1, text: "", cursorOffset: 0 }
     })
   }
 
@@ -503,6 +516,7 @@ class PromptController implements PromptStore {
     this.#cancelSessionReplacement()
     this.#disposed = true
     this.#unsubscribeAutomaticCompactionFailure()
+    this.#fileCompletion.dispose()
     this.picker.dispose()
   }
 
@@ -710,6 +724,7 @@ class PromptController implements PromptStore {
 
   #dispatchCommand(command: InteractiveCommand | undefined, parentFilter?: string): boolean {
     if (!command) return false
+    this.#fileCompletion.close()
     switch (command.type) {
       case "model":
         this.#openModels(command.search, parentFilter)
@@ -1325,9 +1340,44 @@ class PromptController implements PromptStore {
     return [...texts, currentText].filter(value => value.length > 0).join("\n\n")
   }
 
-  #requestInput(text: string, cursorOffset = text.length): void {
+  #completionContextChanged(text: string, input: FileCompletionInput, allowCommandOpen: boolean): void {
+    const workflow = this.$state.get().workflow
+    if (workflow.type === "auth_prompt" || workflow.type === "authenticating") {
+      this.#fileCompletion.close()
+      return
+    }
+    if (workflow.type !== "idle") {
+      this.#fileCompletion.close()
+      if (allowCommandOpen) this.picker.queryChanged(text)
+      return
+    }
+
+    const suggestions = this.#slash.suggestions(text, input.cursorOffset)
+    const presentation = this.picker.presentation(text)
+    if (suggestions.length > 0) {
+      this.#fileCompletion.close()
+      if (!allowCommandOpen && presentation?.frame.id !== promptPickerFrameIds.commands) return
+      const frame = commandFrame(suggestions)
+      if (presentation?.frame.id === promptPickerFrameIds.commands) this.picker.replaceTop(frame, text)
+      else this.picker.open(frame)
+      return
+    }
+    if (presentation?.frame.id === promptPickerFrameIds.commands) this.picker.close()
+    this.#fileCompletion.update(this.#interactive.getSession(), this.#draftRevision, input)
+  }
+
+  #requestInput(text: string, cursorOffset = promptTextWidth(text)): void {
+    this.#fileCompletion.close()
     const state = this.$state.get()
-    this.$state.set({ ...state, inputEdit: { revision: state.inputEdit.revision + 1, text, cursorOffset } })
+    this.$state.set({
+      ...state,
+      inputEdit: { type: "replace", revision: state.inputEdit.revision + 1, text, cursorOffset }
+    })
+  }
+
+  #requestRange(edit: FileCompletionRangeEdit): void {
+    const state = this.$state.get()
+    this.$state.set({ ...state, inputEdit: { type: "range", revision: state.inputEdit.revision + 1, ...edit } })
   }
 
   #setIdle(): void {

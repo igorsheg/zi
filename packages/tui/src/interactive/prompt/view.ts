@@ -19,9 +19,10 @@ import type { InteractiveKeybindings, PromptKeyAction } from "../interactive-key
 import type { InteractiveStore } from "../interactive-store.js"
 import type { SlashController } from "../slash-controller.js"
 import { PromptFeedbackView } from "./feedback-view.js"
+import { captureFileCompletionInput } from "./file-completion.js"
 import { PickerStackView } from "./picker-view.js"
 import { QueuedInputsView } from "./queue-view.js"
-import { promptInputIsSecret, type PromptWorkflow } from "./state.js"
+import { promptInputIsSecret, type PromptInputEdit, type PromptWorkflow } from "./state.js"
 import { createPromptStore, type PromptSessionActions, type PromptStore } from "./store.js"
 
 export class PromptView {
@@ -75,7 +76,8 @@ export class PromptView {
         older: entryId => session.olderPromptHistoryEntry(entryId)
       },
       onSubmit: () => this.#submit("steer"),
-      onContentChange: () => this.#store.draftChanged(this.#input.plainText, this.#input.cursorOffset),
+      onContentChange: () => this.#store.draftChanged(this.#input.plainText, captureFileCompletionInput(this.#input)),
+      onCursorChange: () => this.#store.cursorChanged(this.#input.plainText, captureFileCompletionInput(this.#input)),
       onImageMarkersChange: images => this.#store.imageMarkersChanged(images),
       onPaste: this.#onPaste
     })
@@ -113,10 +115,10 @@ export class PromptView {
   destroy(): void {
     for (const release of this.#release.splice(0)) release()
     this.#working.destroy()
-    this.#pickerStack.destroy()
     this.#feedback.destroy()
     this.#queue.destroy()
     this.#store.dispose()
+    this.#pickerStack.destroy()
     this.root.destroyRecursively()
   }
 
@@ -126,7 +128,7 @@ export class PromptView {
     const geometry = composerGeometry(this.#renderer.width, this.#renderer.height)
     if (prompt.inputEdit.revision > this.#appliedInputRevision) {
       this.#appliedInputRevision = prompt.inputEdit.revision
-      this.#replaceInput(prompt.inputEdit.text, prompt.inputEdit.cursorOffset)
+      this.#applyInputEdit(prompt.inputEdit)
     }
     const secretInput = promptInputIsSecret(prompt.workflow)
     this.#input.attributes = secretInput ? TextAttributes.HIDDEN : 0
@@ -191,6 +193,26 @@ export class PromptView {
       .catch(() => false)
   }
 
+  #applyInputEdit(edit: PromptInputEdit): void {
+    switch (edit.type) {
+      case "replace":
+        this.#replaceInput(edit.text, edit.cursorOffset)
+        return
+      case "range":
+        if (this.#composer.replaceRange(edit) === "unavailable") {
+          this.#store.reportFeedback({
+            type: "warning",
+            message: "File completion could not replace this marked range"
+          })
+        }
+        this.#syncedImages = this.#composer.activeImages()
+        this.#input.focus()
+        return
+      default:
+        return assertNever(edit)
+    }
+  }
+
   #replaceInput(text: string, cursorOffset?: number): void {
     this.#composer.replaceText(text, cursorOffset)
     const images = this.#store.$state.get().images
@@ -245,11 +267,11 @@ export class PromptView {
     switch (action) {
       case "picker_confirm":
         consume(key)
-        this.#store.activatePicker(this.#input.plainText, this.#input.cursorOffset)
+        this.#store.activatePicker(this.#input.plainText, captureFileCompletionInput(this.#input))
         return
       case "picker_complete":
         consume(key)
-        this.#store.completePicker(this.#input.plainText, this.#input.cursorOffset)
+        this.#store.completePicker(this.#input.plainText, captureFileCompletionInput(this.#input))
         return
       case "picker_cancel":
         consume(key)

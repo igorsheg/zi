@@ -2,6 +2,7 @@ import { expect, test } from "bun:test"
 
 import { createTestRenderer } from "@opentui/core/testing"
 
+import { promptTextWidth } from "../src/components/cell-text.js"
 import {
   compactPasteCharacterThreshold,
   compactPasteLineThreshold,
@@ -13,6 +14,154 @@ import {
   type ComposerHistorySource
 } from "../src/components/composer.js"
 import { defaultTheme } from "../src/theme.js"
+
+test("composer range replacement is one undo point and preserves prior native history", async () => {
+  const setup = await createTestRenderer({ width: 60, height: 8, useThread: false })
+  const composer = createComposer(setup.renderer, {
+    geometry: composerGeometry(60, 8),
+    slots: { topLeft: "/work", topRight: [] },
+    theme: defaultTheme,
+    onSubmit() {}
+  })
+  setup.renderer.root.add(composer.root)
+
+  try {
+    composer.input.insertText("prefix @sr suffix")
+    const start = promptTextWidth("prefix ")
+    const end = promptTextWidth("prefix @sr")
+    expect(
+      composer.replaceRange({
+        startOffset: start,
+        endOffset: end,
+        replacement: "@src/index.ts",
+        cursorOffset: promptTextWidth("prefix @src/index.ts")
+      })
+    ).toBe("applied")
+    expect(composer.input.plainText).toBe("prefix @src/index.ts suffix")
+    expect(composer.input.cursorOffset).toBe(promptTextWidth("prefix @src/index.ts"))
+
+    composer.input.undo()
+    expect(composer.input.plainText).toBe("prefix @sr suffix")
+    composer.input.redo()
+    expect(composer.input.plainText).toBe("prefix @src/index.ts suffix")
+    composer.input.undo()
+    composer.input.undo()
+    expect(composer.input.plainText).toBe("")
+  } finally {
+    composer.destroy()
+    if (!setup.renderer.isDestroyed) setup.renderer.destroy()
+  }
+})
+
+test("composer range replacement shifts owned markers and preserves payload identity through undo and redo", async () => {
+  const setup = await createTestRenderer({ width: 80, height: 8, useThread: false })
+  const paste = "x".repeat(compactPasteCharacterThreshold + 1)
+  const image = { type: "image" as const, mimeType: "image/png", data: "AAAA" }
+  const composer = createComposer(setup.renderer, {
+    geometry: composerGeometry(80, 8),
+    slots: { topLeft: "/work", topRight: [] },
+    theme: defaultTheme,
+    onSubmit() {}
+  })
+  setup.renderer.root.add(composer.root)
+
+  try {
+    composer.insertPastedText(paste)
+    composer.input.insertText(" @sr ")
+    composer.syncImageMarkers([image])
+    const before = composer.input.extmarks.getAll()
+    const payloads = before.map(marker => marker.data)
+    const imageStart = before[1]!.start
+    const tokenStart = promptTextWidth("[paste #1 1001 chars] ")
+    const tokenEnd = tokenStart + promptTextWidth("@sr")
+
+    expect(
+      composer.replaceRange({
+        startOffset: tokenStart,
+        endOffset: tokenEnd,
+        replacement: "@src/index.ts",
+        cursorOffset: tokenStart + promptTextWidth("@src/index.ts")
+      })
+    ).toBe("applied")
+    const completed = composer.input.extmarks.getAll()
+    expect(completed.map(marker => marker.data)).toEqual(payloads)
+    expect(completed[0]!.data).toBe(payloads[0])
+    expect(completed[1]!.data).toBe(payloads[1])
+    expect(completed.find(marker => marker.data === payloads[1])!.start).toBe(
+      imageStart + promptTextWidth("@src/index.ts") - promptTextWidth("@sr")
+    )
+    expect(composer.expandedText()).toBe(`${paste} @src/index.ts `)
+    expect(composer.activeImages()[0]).toBe(image)
+
+    composer.input.undo()
+    expect(composer.input.plainText).toContain("@sr")
+    expect(composer.input.extmarks.getAll()[0]!.data).toBe(payloads[0])
+    expect(composer.activeImages()[0]).toBe(image)
+    composer.input.redo()
+    expect(composer.input.plainText).toContain("@src/index.ts")
+    expect(composer.input.extmarks.getAll()[1]!.data).toBe(payloads[1])
+  } finally {
+    composer.destroy()
+    if (!setup.renderer.isDestroyed) setup.renderer.destroy()
+  }
+})
+
+test("composer range replacement refuses marker overlap without changing selection or text", async () => {
+  const setup = await createTestRenderer({ width: 60, height: 8, useThread: false })
+  const composer = createComposer(setup.renderer, {
+    geometry: composerGeometry(60, 8),
+    slots: { topLeft: "/work", topRight: [] },
+    theme: defaultTheme,
+    onSubmit() {}
+  })
+  setup.renderer.root.add(composer.root)
+
+  try {
+    composer.insertPastedText("x".repeat(compactPasteCharacterThreshold + 1))
+    const text = composer.input.plainText
+    composer.input.setSelection(0, 3)
+    expect(composer.replaceRange({ startOffset: 1, endOffset: 3, replacement: "x", cursorOffset: 2 })).toBe(
+      "unavailable"
+    )
+    expect(composer.input.plainText).toBe(text)
+    expect(composer.input.getSelection()).toEqual({ start: 0, end: 3 })
+  } finally {
+    composer.destroy()
+    if (!setup.renderer.isDestroyed) setup.renderer.destroy()
+  }
+})
+
+test("composer owned range replacements do not consume OpenTUI replacement registry slots", async () => {
+  const setup = await createTestRenderer({ width: 40, height: 8, useThread: false })
+  const composer = createComposer(setup.renderer, {
+    geometry: composerGeometry(40, 8),
+    slots: { topLeft: "/work", topRight: [] },
+    theme: defaultTheme,
+    onSubmit() {}
+  })
+  setup.renderer.root.add(composer.root)
+
+  try {
+    composer.replaceText("@x", 2)
+    const retainedBefore: unknown = Reflect.get(composer.input.editBuffer, "_textBytes")
+    const countBefore = Array.isArray(retainedBefore) ? retainedBefore.length : -1
+    for (let index = 0; index < 300; index++) {
+      expect(
+        composer.replaceRange({
+          startOffset: 0,
+          endOffset: 2,
+          replacement: index % 2 === 0 ? "@y" : "@x",
+          cursorOffset: 2
+        })
+      ).toBe("applied")
+    }
+    const retainedAfter: unknown = Reflect.get(composer.input.editBuffer, "_textBytes")
+    expect(Array.isArray(retainedAfter) ? retainedAfter.length : -1).toBe(countBefore)
+  } finally {
+    composer.destroy()
+    if (!setup.renderer.isDestroyed) setup.renderer.destroy()
+  }
+})
 
 test("composer history traverses stable entries and restores the native draft", async () => {
   const setup = await createTestRenderer({ width: 40, height: 8, useThread: false })
