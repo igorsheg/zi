@@ -43,16 +43,19 @@ interface PendingNativeRead {
   resize: boolean
 }
 
+type ToolViewIdentity = string | symbol
+
 interface CommittedMessageView {
   readonly messageIndex: number
   root: Renderable | undefined
-  toolCallIds: string[]
+  toolCallIds: ToolViewIdentity[]
   readonly item?: TranscriptItemView
   readonly assistant?: StreamingAssistantView
 }
 
 interface IndexedToolView {
   readonly view: ToolCallView
+  readonly toolCallId: string
   source: ActiveTool
   placement: "embedded" | "standalone" | "committed"
   owner: StreamingAssistantView | undefined
@@ -111,8 +114,8 @@ export class TranscriptView {
   readonly #release: Array<() => void> = []
   readonly #committed: CommittedMessageView[] = []
   readonly #pendingToolCalls = new Map<string, ToolCallPresentation>()
-  readonly #projectedToolIds = new Map<string, true>()
-  readonly #toolViews = new Map<string, IndexedToolView>()
+  readonly #projectedToolIds = new Map<ToolViewIdentity, true>()
+  readonly #toolViews = new Map<ToolViewIdentity, IndexedToolView>()
   readonly #activeToolViews = new Map<string, ToolCallView>()
   readonly #assistantToolViews: AssistantToolViewOwner = {
     includes: id => this.#projectedToolIds.has(id),
@@ -141,7 +144,7 @@ export class TranscriptView {
       )
       view.setExpanded(this.#toolsExpanded)
       view.setEmbedded(true)
-      this.#toolViews.set(tool.id, { view, source: tool, placement: "embedded", owner })
+      this.#toolViews.set(tool.id, { view, toolCallId: tool.id, source: tool, placement: "embedded", owner })
       this.#diagnostics.activeToolCreates++
       return view
     },
@@ -151,9 +154,10 @@ export class TranscriptView {
       return retained?.view === view ? this.#updateToolView(retained, tool) : view.update(this.#projectTool(tool))
     },
     release: (owner, id, view) => {
-      const retained = this.#toolViews.get(id)
-      if (retained?.view === view && retained.placement === "embedded" && retained.owner === owner) {
-        this.#toolViews.delete(id)
+      const identity = this.#toolIdentity(id, view)
+      const retained = identity === undefined ? undefined : this.#toolViews.get(identity)
+      if (identity !== undefined && retained?.placement === "embedded" && retained.owner === owner) {
+        this.#toolViews.delete(identity)
       }
       view.destroy()
     }
@@ -445,7 +449,22 @@ export class TranscriptView {
       this.#diagnostics.streamingCreates++
     }
     view.root.id = `assistant-message:${messageIndex}`
-    this.#committed.push({ messageIndex, root: view.root, toolCallIds: [...view.toolCallIds], assistant: view })
+    const toolCallIds =
+      message.stopReason === "error"
+        ? view.toolCallIds.map(id => this.#scopeFailedTool(view, id, messageIndex))
+        : [...view.toolCallIds]
+    this.#committed.push({ messageIndex, root: view.root, toolCallIds, assistant: view })
+  }
+
+  #scopeFailedTool(owner: StreamingAssistantView, toolCallId: string, messageIndex: number): ToolViewIdentity {
+    const retained = this.#toolViews.get(toolCallId)
+    if (!retained || retained.owner !== owner) return toolCallId
+    const identity = Symbol(`failed-tool:${messageIndex}:${toolCallId}`)
+    retained.view.root.id = `active-tool:failed:${messageIndex}:${toolCallId}`
+    this.#toolViews.delete(toolCallId)
+    this.#toolViews.set(identity, retained)
+    if (this.#projectedToolIds.delete(toolCallId)) this.#projectedToolIds.set(identity, true)
+    return identity
   }
 
   #commitToolResult(message: Extract<AgentMessage, { role: "toolResult" }>, messageIndex: number): void {
@@ -478,7 +497,13 @@ export class TranscriptView {
         this.#keybindings.getHint("app.tools.expand")
       )
       view.setExpanded(this.#toolsExpanded)
-      this.#toolViews.set(message.toolCallId, { view, source: tool, placement: "committed", owner: undefined })
+      this.#toolViews.set(message.toolCallId, {
+        view,
+        toolCallId: message.toolCallId,
+        source: tool,
+        placement: "committed",
+        owner: undefined
+      })
       this.#insertBeforeTransient(view.root)
       this.#committed.push({ messageIndex, root: view.root, toolCallIds: [message.toolCallId] })
       this.#diagnostics.activeToolCreates++
@@ -518,21 +543,23 @@ export class TranscriptView {
     this.#projectedToolIds.set(id, true)
   }
 
-  #omitProjectedTool(id: string): void {
+  #omitProjectedTool(id: ToolViewIdentity): void {
     const indexed = this.#toolViews.get(id)
     if (!indexed) return
 
     this.#toolViews.delete(id)
-    this.#activeToolViews.delete(id)
-    this.#activeToolOrder = this.#activeToolOrder.filter(candidate => candidate !== id)
+    if (this.#activeToolViews.get(indexed.toolCallId) === indexed.view) {
+      this.#activeToolViews.delete(indexed.toolCallId)
+      this.#activeToolOrder = this.#activeToolOrder.filter(candidate => candidate !== indexed.toolCallId)
+    }
 
     const result = this.#committed.find(view => view.toolCallIds.includes(id) && view.assistant === undefined)
     if (indexed.placement === "embedded" && indexed.owner) {
       if (result) {
-        indexed.owner.detachTool(id, indexed.view)
+        indexed.owner.detachTool(indexed.toolCallId, indexed.view)
         indexed.view.destroy()
       } else {
-        indexed.owner.omitTool(id, indexed.view)
+        indexed.owner.omitTool(indexed.toolCallId, indexed.view)
       }
     } else {
       if (indexed.view.root.parent) indexed.view.root.parent.remove(indexed.view.root)
@@ -560,7 +587,7 @@ export class TranscriptView {
         )
         const indexed = this.#toolViews.get(id)
         if (!result || !indexed || indexed.placement !== "embedded" || indexed.owner !== assistant.assistant) continue
-        if (!assistant.assistant.detachTool(id, indexed.view)) continue
+        if (!assistant.assistant.detachTool(indexed.toolCallId, indexed.view)) continue
 
         assistant.toolCallIds = assistant.toolCallIds.filter(candidate => candidate !== id)
         indexed.placement = "committed"
@@ -776,7 +803,7 @@ export class TranscriptView {
       )
       view.setExpanded(this.#toolsExpanded)
       this.scroll.add(view.root)
-      this.#toolViews.set(id, { view, source: tool, placement: "standalone", owner: undefined })
+      this.#toolViews.set(id, { view, toolCallId: id, source: tool, placement: "standalone", owner: undefined })
       this.#activeToolViews.set(id, view)
       this.#diagnostics.activeToolCreates++
     }
@@ -787,6 +814,14 @@ export class TranscriptView {
       for (const id of order) this.scroll.add(this.#activeToolViews.get(id)!.root)
       this.#activeToolOrder = order
     }
+  }
+
+  #toolIdentity(toolCallId: string, view: ToolCallView): ToolViewIdentity | undefined {
+    if (this.#toolViews.get(toolCallId)?.view === view) return toolCallId
+    for (const [identity, retained] of this.#toolViews) {
+      if (retained.view === view) return identity
+    }
+    return undefined
   }
 
   #authoritativeTool(fallback: ActiveTool): ActiveTool {
@@ -809,8 +844,8 @@ export class TranscriptView {
     const action = foreground
       ? `${this.#keybindings.getHint("app.task.background")} background · ${this.#keybindings.getHint("app.interrupt")} interrupt`
       : undefined
-    for (const [id, { view }] of this.#toolViews) {
-      view.setActionHint(id === foreground?.toolCallId ? action : undefined)
+    for (const [identity, { view }] of this.#toolViews) {
+      view.setActionHint(typeof identity === "string" && identity === foreground?.toolCallId ? action : undefined)
     }
   }
 

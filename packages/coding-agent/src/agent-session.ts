@@ -1136,9 +1136,37 @@ export class AgentSession {
   }
 
   async #recoverOverflow(runId: number): Promise<"none" | "recovered" | "stop"> {
+    const activity = this.#runningAgentActivity(runId)
     const message = this.#lastAssistantMessage()
     if (!message) return "none"
-    return this.#compactAfterAssistant(runId, message, { retryOverflow: true, countOverflowRecovery: true })
+    try {
+      const outcome = await this.#compactAfterAssistant(runId, message, {
+        retryOverflow: true,
+        countOverflowRecovery: true
+      })
+      if (outcome === "stop" && activity && activity.retryAttempts > 0) {
+        this.#finishFailedRetry(runId, activity.retryAttempts, message)
+      }
+      return outcome
+    } catch (cause) {
+      if (activity && activity.retryAttempts > 0) this.#finishFailedRetry(runId, activity.retryAttempts, message)
+      throw cause
+    }
+  }
+
+  #finishFailedRetry(runId: number, attempt: number, message: AssistantMessage): void {
+    const activity = this.#activity
+    if (activity.type === "running" && activity.runId === runId) {
+      this.#activity = { ...activity, retryAttempts: 0 }
+    }
+    this.#emitAll([
+      {
+        type: "auto_retry_end",
+        success: false,
+        attempt,
+        finalError: boundedRetryError(message.errorMessage || "Unknown provider error")
+      }
+    ])
   }
 
   async #retryAssistant(runId: number): Promise<"none" | "retry"> {
@@ -1440,51 +1468,54 @@ export class AgentSession {
     const settings = this.settingsManager.get()
     let attempt = 0
     let retryStarted = false
-    for (;;) {
-      // oxlint-disable-next-line no-await-in-loop
-      const response = await sample(request, signal)
-      const retryable =
-        response.stopReason === "error" &&
-        !isContextOverflow(response, model.contextWindow) &&
-        isRetryableAssistantError(response)
-      if (!settings.retryEnabled || !retryable || attempt >= settings.retryMaxRetries) {
-        if (retryStarted) this.#finishSummarizationRetry(operationId, reason)
-        return response
-      }
+    try {
+      for (;;) {
+        // oxlint-disable-next-line no-await-in-loop
+        const response = await sample(request, signal)
+        const retryable =
+          response.stopReason === "error" &&
+          !isContextOverflow(response, model.contextWindow) &&
+          isRetryableAssistantError(response)
+        if (!settings.retryEnabled || !retryable || attempt >= settings.retryMaxRetries) return response
 
-      attempt++
-      retryStarted = true
-      const delayMs = retryDelayMs(settings.retryBaseDelayMs, attempt)
-      const retryAt = Date.now() + delayMs
-      const errorMessage = boundedRetryError(response.errorMessage || "Unknown provider error")
-      const stage: CompactionStage = {
-        type: "retry_wait",
-        attempt,
-        maxAttempts: settings.retryMaxRetries,
-        delayMs,
-        retryAt,
-        errorMessage
-      }
-      if (!this.#setCompactionStage(operationId, stage)) return retryAbortedMessage(response)
-      this.#emitAll([
-        {
-          type: "summarization_retry_scheduled",
-          operationId,
-          reason,
+        attempt++
+        retryStarted = true
+        const delayMs = retryDelayMs(settings.retryBaseDelayMs, attempt)
+        const retryAt = Date.now() + delayMs
+        const errorMessage = boundedRetryError(response.errorMessage || "Unknown provider error")
+        const stage: CompactionStage = {
+          type: "retry_wait",
           attempt,
           maxAttempts: settings.retryMaxRetries,
           delayMs,
           retryAt,
           errorMessage
         }
-      ])
+        if (!this.#setCompactionStage(operationId, stage)) return retryAbortedMessage(response)
+        this.#emitAll([
+          {
+            type: "summarization_retry_scheduled",
+            operationId,
+            reason,
+            attempt,
+            maxAttempts: settings.retryMaxRetries,
+            delayMs,
+            retryAt,
+            errorMessage
+          }
+        ])
 
-      // oxlint-disable-next-line no-await-in-loop
-      if (!(await waitForRetryDelay(delayMs, signal)) || !this.#setCompactionStage(operationId, { type: "sampling" })) {
-        this.#finishSummarizationRetry(operationId, reason)
-        return retryAbortedMessage(response)
+        if (
+          // oxlint-disable-next-line no-await-in-loop
+          !(await waitForRetryDelay(delayMs, signal)) ||
+          !this.#setCompactionStage(operationId, { type: "sampling" })
+        ) {
+          return retryAbortedMessage(response)
+        }
+        this.#emitAll([{ type: "summarization_retry_attempt_start", operationId, reason }])
       }
-      this.#emitAll([{ type: "summarization_retry_attempt_start", operationId, reason }])
+    } finally {
+      if (retryStarted) this.#finishSummarizationRetry(operationId, reason)
     }
   }
 
@@ -1506,7 +1537,7 @@ export class AgentSession {
   }
 
   #finishSummarizationRetry(operationId: number, reason: CompactionReason): void {
-    if (!this.#setCompactionStage(operationId, { type: "sampling" })) return
+    this.#setCompactionStage(operationId, { type: "sampling" })
     this.#emitAll([{ type: "summarization_retry_finished", operationId, reason }])
   }
 
@@ -1624,8 +1655,8 @@ export class AgentSession {
     return this.#agent.state.messages as AgentMessage[]
   }
 
-  #lastAssistantMessage(): AgentMessage | undefined {
-    return this.#ownedMessages().findLast(message => message.role === "assistant")
+  #lastAssistantMessage(): AssistantMessage | undefined {
+    return this.#ownedMessages().findLast((message): message is AssistantMessage => message.role === "assistant")
   }
 
   #isSelectedModelMessage(message: AgentMessage): boolean {

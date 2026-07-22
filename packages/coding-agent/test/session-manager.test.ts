@@ -266,6 +266,24 @@ test("overflow failures remain durable but are omitted from active context", () 
   expect(session.activeMessages().map(message => message.role)).toEqual(["compactionSummary", "user"])
 })
 
+test("presentation retains messages excluded only from provider context", () => {
+  const session = SessionManager.inMemory("/work")
+  const bash = {
+    role: "bashExecution" as const,
+    command: "printf evidence",
+    output: "evidence",
+    truncated: false,
+    exitCode: 0,
+    cancelled: false,
+    excludeFromContext: true,
+    timestamp: 1
+  }
+  session.appendMessage(bash)
+
+  expect(session.activeMessages()).toEqual([])
+  expect(session.presentationMessages()).toEqual([bash])
+})
+
 test("retry markers durably exclude failed attempts from active context", async () => {
   const root = await mkdtemp(join(tmpdir(), "openzi-session-retry-restore-"))
   const paths = new OpenZiPaths(join(root, "project"), join(root, "global"))
@@ -295,6 +313,42 @@ test("retry markers durably exclude failed attempts from active context", async 
   expect(restored.activeMessages()).toEqual(session.activeMessages())
   expect(restored.presentationMessages()).toEqual(session.presentationMessages())
   expect(restored.entries().map(entry => entry.type)).toEqual(["message", "message", "retry", "message"])
+})
+
+test("compaction boundaries cannot begin with a tool result after retry exclusions", () => {
+  const session = SessionManager.inMemory("/work")
+  session.appendMessage({ role: "user", content: "retry", timestamp: 1 })
+  const failure = session.appendMessage({
+    role: "assistant",
+    content: [{ type: "toolCall", id: "failed-call", name: "read", arguments: { path: "file" } }],
+    api: "test",
+    provider: "test",
+    model: "test",
+    usage: emptyUsage(),
+    stopReason: "error",
+    errorMessage: "network error",
+    timestamp: 2
+  })
+  session.appendRetry(failure.id, 1)
+  session.appendMessage({
+    role: "toolResult",
+    toolCallId: "failed-call",
+    toolName: "read",
+    content: [{ type: "text", text: "result" }],
+    isError: false,
+    timestamp: 3
+  })
+
+  expect(() =>
+    session.appendCompaction({
+      reason: "manual",
+      summary: "summary",
+      firstKeptEntryId: failure.id,
+      tokensBefore: 100,
+      estimatedTokensAfter: 10,
+      details: emptyCompactionDetails()
+    })
+  ).toThrow("Invalid compaction boundary")
 })
 
 test("opening rejects completed compaction markers with invalid semantic references", async () => {

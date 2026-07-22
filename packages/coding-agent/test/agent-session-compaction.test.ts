@@ -98,6 +98,39 @@ test("manual compaction cancellation owns its retry backoff", async () => {
   setup.session.dispose()
 })
 
+test("manual compaction closes retry events when an active sample is aborted", async () => {
+  const setup = await compactionSession({ retryBaseDelayMs: 0 })
+  setup.faux.setResponses([
+    fauxAssistantMessage("", { stopReason: "error", errorMessage: "terminated" }),
+    (_, options) =>
+      new Promise(resolve => {
+        const finish = () => resolve(fauxAssistantMessage("", { stopReason: "aborted" }))
+        if (options?.signal?.aborted) finish()
+        else options?.signal?.addEventListener("abort", finish, { once: true })
+      })
+  ])
+  const attemptStarted = deferred<void>()
+  const events: string[] = []
+  setup.session.subscribe(event => {
+    if (event.type === "summarization_retry_scheduled") events.push("scheduled")
+    if (event.type === "summarization_retry_attempt_start") {
+      events.push("attempt")
+      attemptStarted.resolve()
+    }
+    if (event.type === "summarization_retry_finished") events.push("finished")
+    if (event.type === "compaction_end") events.push(event.outcome.type)
+  })
+
+  const compacting = setup.session.compact()
+  await attemptStarted.promise
+  await setup.session.abort().catch(() => {})
+  const failure = await rejection(compacting)
+
+  expect(failure.message).toContain("cancelled")
+  expect(events).toEqual(["scheduled", "attempt", "finished", "cancelled"])
+  setup.session.dispose()
+})
+
 test("manual compaction remains completed when observers abort or dispose after commit", async () => {
   for (const action of ["abort", "dispose"] as const) {
     const setup = await compactionSession()

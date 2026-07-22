@@ -340,6 +340,34 @@ test("a streamed tool root keeps identity through argument, execution, and commi
   }
 })
 
+test("retry attempts retain separate tool roots when a provider reuses a call ID", async () => {
+  const failed = {
+    ...fauxAssistantMessage(fauxToolCall("bash", { command: "echo failed-attempt" }, { id: "reused-call" }), {
+      stopReason: "error"
+    }),
+    errorMessage: "network error"
+  }
+  const retry = fauxAssistantMessage(fauxToolCall("bash", { command: "echo retry-attempt" }, { id: "reused-call" }), {
+    stopReason: "toolUse"
+  })
+  const harness = await createTranscriptHarness([failed, retry])
+  try {
+    await harness.setup.flush()
+    const first = requiredRenderable(harness, "assistant-message:0").findDescendantById(
+      "active-tool:failed:0:reused-call"
+    )
+    const second = requiredRenderable(harness, "assistant-message:1").findDescendantById("active-tool:reused-call")
+
+    expect(first).toBeDefined()
+    expect(second).toBeDefined()
+    expect(first).not.toBe(second)
+    expect(harness.setup.captureCharFrame()).toContain("echo failed-attempt")
+    expect(harness.setup.captureCharFrame()).toContain("echo retry-attempt")
+  } finally {
+    harness.destroy()
+  }
+})
+
 test("live eviction promotes a still-retained tool result out of its assistant root", async () => {
   const assistant = fauxAssistantMessage(fauxToolCall("bash", { command: "printf kept" }, { id: "boundary" }), {
     stopReason: "toolUse"

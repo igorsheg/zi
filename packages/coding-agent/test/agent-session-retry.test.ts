@@ -109,6 +109,35 @@ test("retry exhaustion keeps the final failure and closes one attempt sequence",
   session.dispose()
 })
 
+test("terminal overflow closes an active retry sequence", async () => {
+  const models = createModels()
+  const faux = fauxProvider({ models: [{ id: "small", contextWindow: 1_000 }] })
+  models.setProvider(faux.provider)
+  faux.setResponses([
+    fauxAssistantMessage("", { stopReason: "error", errorMessage: "network error" }),
+    fauxAssistantMessage("", { stopReason: "error", errorMessage: "prompt is too long: 1001 tokens > 1000 maximum" })
+  ])
+  const { session } = await createAgentRuntime({
+    cwd: "/work",
+    model: "faux/small",
+    models,
+    persist: false,
+    settings: { retryBaseDelayMs: 0, compactionEnabled: false }
+  })
+  const events: string[] = []
+  session.subscribe(event => {
+    if (event.type === "auto_retry_start") events.push("start")
+    if (event.type === "auto_retry_end") events.push(`end:${event.success}`)
+    if (event.type === "agent_settled") events.push("settled")
+  })
+
+  await session.prompt("try once")
+
+  expect(events).toEqual(["start", "end:false", "settled"])
+  expect(session.retryStatus).toEqual({ type: "idle" })
+  session.dispose()
+})
+
 test("cancelling retry backoff restores queued input and settles the logical prompt", async () => {
   const models = createModels()
   const faux = fauxProvider()

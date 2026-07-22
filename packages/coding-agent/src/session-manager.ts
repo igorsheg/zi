@@ -356,7 +356,7 @@ export class SessionManager {
   #updatePresentationMessages(entry: SessionEntry): void {
     if (entry.type === "compaction") {
       this.#rebuildPresentationMessages()
-    } else if (isContextVisibleEntry(entry)) {
+    } else if (entry.type === "message") {
       this.#presentationMessages.push(entry.message)
     }
   }
@@ -740,10 +740,8 @@ function validateNextEntry(next: SessionEntry, preceding: readonly SessionEntry[
     }
   }
 
-  const firstProjected = preceding
-    .slice(firstKeptIndex)
-    .find(entry => isContextVisibleEntry(entry) && entry.id !== next.excludedFailureEntryId)
-  if (firstProjected?.type === "message" && firstProjected.message.role === "toolResult") {
+  const firstProjected = projectSessionEntries([...preceding, next], "context").find(isContextVisibleEntry)
+  if (firstProjected?.id !== firstKept.id || firstProjected.message.role === "toolResult") {
     throw new Error(`Invalid compaction boundary: ${file}`)
   }
 }
@@ -757,7 +755,8 @@ function projectSessionEntries(entries: readonly SessionEntry[], mode: "context"
       retryFailures.add(entry.failedEntryId)
     }
   }
-  const visible = (entry: SessionEntry) => isContextVisibleEntry(entry) && !retryFailures.has(entry.id)
+  const visible = (entry: SessionEntry) =>
+    (mode === "context" ? isContextVisibleEntry(entry) : entry.type === "message") && !retryFailures.has(entry.id)
   if (markerIndex < 0) return entries.filter(visible)
 
   const marker = entries[markerIndex]
