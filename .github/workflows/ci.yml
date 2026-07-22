@@ -1,99 +1,25 @@
-name: CI
+name: ci
 
 on:
   pull_request:
   push:
-    branches:
-      - main
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
 
 jobs:
-  fmt:
-    name: Check formatting
-    runs-on: ubuntu-latest
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup Zig
-        uses: mlugg/setup-zig@v2
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
-          version: 0.16.0
-
-      - name: Check formatting
-        shell: bash
-        run: git ls-files '*.zig' -z | xargs -0 zig fmt --check
-
-  test:
-    name: Test ${{ matrix.dist_target }}
-    needs: fmt
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            zig_target: x86_64-linux-musl
-            dist_target: x86_64-unknown-linux-musl
-          - os: macos-14
-            zig_target: native
-            dist_target: aarch64-apple-darwin
-
-    runs-on: ${{ matrix.os }}
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup Zig
-        uses: mlugg/setup-zig@v2
-        with:
-          version: 0.16.0
-
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: 22.19.0
-          cache: npm
-          cache-dependency-path: extensions/host/package-lock.json
-
-      - name: Install extension host dependencies
-        run: npm --prefix extensions/host ci
-
-      - name: Build debug
-        run: zig build
-
-      - name: Smoke-test debug binary
-        shell: bash
-        run: |
-          test "$(./zig-out/bin/zi --version)" = "zi 0.0.1-dev"
-          ./zig-out/bin/zi --help >/dev/null
-
-      - name: Run tests
-        run: zig build test --summary all
-
-      - name: Build release-safe
-        shell: bash
-        run: |
-          args=(-Doptimize=ReleaseSafe -Dstrip=true -Dversion=0.0.0-ci)
-          if [ "${{ matrix.zig_target }}" != "native" ]; then
-            args+=("-Dtarget=${{ matrix.zig_target }}")
-          fi
-          zig build "${args[@]}"
-
-      - name: Smoke-test release-safe binary
-        shell: bash
-        run: |
-          test "$(./zig-out/bin/zi --version)" = "zi 0.0.0-ci"
-          ./zig-out/bin/zi --help >/dev/null
-
-      - name: Package release artifact
-        shell: bash
-        run: ./scripts/package-release.sh "0.0.0-ci" "${{ matrix.dist_target }}"
-
-      - name: Validate release artifact
-        shell: bash
-        run: |
-          archive="dist/zi-v0.0.0-ci-${{ matrix.dist_target }}.tar.gz"
-          tar -tzf "$archive" >/dev/null
-          ./scripts/checksums.sh "$archive" > dist/checksums.txt
-          test -s dist/checksums.txt
+          bun-version: 1.3.14
+      - run: bun install --frozen-lockfile
+      - run: bun run check

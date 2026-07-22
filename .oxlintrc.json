@@ -1,0 +1,16 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "plugins": ["typescript", "unicorn", "oxc", "import", "react", "promise", "node"],
+  "categories": { "correctness": "error", "suspicious": "error", "perf": "warn" },
+  "options": { "denyWarnings": true, "reportUnusedDisableDirectives": "error", "typeAware": true },
+  "rules": {
+    "eqeqeq": "error",
+    "import/no-cycle": "error",
+    "react/react-in-jsx-scope": "off",
+    "typescript/await-thenable": "error",
+    "typescript/consistent-type-imports": "error",
+    "typescript/no-floating-promises": "error",
+    "typescript/no-misused-promises": "error"
+  },
+  "settings": { "react": { "version": "19.2.7" } }
+}
