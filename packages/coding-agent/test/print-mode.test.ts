@@ -59,6 +59,41 @@ test("JSON print mode emits the session header then source-ordered events", asyn
   }
 })
 
+test("JSON mode preserves retry attempts inside one final session settlement", async () => {
+  const models = createModels()
+  const faux = fauxProvider()
+  models.setProvider(faux.provider)
+  faux.setResponses([
+    fauxAssistantMessage("", { stopReason: "error", errorMessage: "network error" }),
+    fauxAssistantMessage("recovered")
+  ])
+  const { session } = await createAgentRuntime({
+    cwd: "/work",
+    models,
+    persist: false,
+    settings: { retryBaseDelayMs: 0 }
+  })
+  const chunks: string[] = []
+
+  try {
+    const result = await runPrintMode(session, {
+      output: "json",
+      prompts: ["start"],
+      writer: { write: chunk => void chunks.push(chunk) }
+    })
+
+    expect(result).toEqual({ type: "success" })
+    const eventTypes = chunks.map(parseJson).slice(1).map(recordType)
+    expect(eventTypes.filter(type => type === "auto_retry_start" || type === "auto_retry_end")).toEqual([
+      "auto_retry_start",
+      "auto_retry_end"
+    ])
+    expect(eventTypes.filter(type => type === "agent_settled")).toEqual(["agent_settled"])
+  } finally {
+    session.dispose()
+  }
+})
+
 test("JSON mode preserves automatic compaction start, durable entry, and end ordering", async () => {
   const models = createModels()
   const faux = fauxProvider({ models: [{ id: "small", contextWindow: 500, maxTokens: 100 }] })

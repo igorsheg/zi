@@ -45,6 +45,59 @@ test("manual compaction samples, commits, replaces active context, and orders li
   session.dispose()
 })
 
+test("manual compaction retries a transient summary failure inside the owning operation", async () => {
+  const setup = await compactionSession({ retryBaseDelayMs: 0 })
+  setup.faux.setResponses([
+    fauxAssistantMessage("", { stopReason: "error", errorMessage: "terminated" }),
+    fauxAssistantMessage("recovered checkpoint")
+  ])
+  const events: string[] = []
+  let retryStatus: typeof setup.session.retryStatus | undefined
+  setup.session.subscribe(event => {
+    if (event.type === "summarization_retry_scheduled") {
+      events.push(`scheduled:${event.attempt}`)
+      retryStatus = setup.session.retryStatus
+    }
+    if (event.type === "summarization_retry_attempt_start") events.push("attempt")
+    if (event.type === "summarization_retry_finished") events.push("finished")
+  })
+
+  const result = await setup.session.compact()
+
+  expect(result.summary).toBe("recovered checkpoint")
+  expect(setup.faux.state.callCount).toBe(2)
+  expect(events).toEqual(["scheduled:1", "attempt", "finished"])
+  expect(retryStatus).toMatchObject({ type: "waiting", source: "compaction", reason: "manual", attempt: 1 })
+  expect(setup.session.retryStatus).toEqual({ type: "idle" })
+  setup.session.dispose()
+})
+
+test("manual compaction cancellation owns its retry backoff", async () => {
+  const setup = await compactionSession({ retryBaseDelayMs: 15_000 })
+  setup.faux.setResponses([
+    fauxAssistantMessage("", { stopReason: "error", errorMessage: "terminated" }),
+    fauxAssistantMessage("should not run")
+  ])
+  const scheduled = deferred<void>()
+  const events: string[] = []
+  setup.session.subscribe(event => {
+    if (event.type === "summarization_retry_scheduled") scheduled.resolve()
+    if (event.type === "summarization_retry_finished") events.push("finished")
+    if (event.type === "compaction_end") events.push(event.outcome.type)
+  })
+
+  const compacting = setup.session.compact()
+  await scheduled.promise
+  await setup.session.abort().catch(() => {})
+  const failure = await rejection(compacting)
+
+  expect(failure.message).toContain("cancelled")
+  expect(setup.faux.state.callCount).toBe(1)
+  expect(events).toEqual(["finished", "cancelled"])
+  expect(setup.session.retryStatus).toEqual({ type: "idle" })
+  setup.session.dispose()
+})
+
 test("manual compaction remains completed when observers abort or dispose after commit", async () => {
   for (const action of ["abort", "dispose"] as const) {
     const setup = await compactionSession()
@@ -201,6 +254,26 @@ test("automatic cancellation and disposal reject late pre-commit summaries", asy
     expect(setup.session.sessionManager.latestCompaction()).toBeUndefined()
     if (action === "abort") setup.session.dispose()
   }
+})
+
+test("automatic compaction retries a transient summary failure before continuing the prompt", async () => {
+  const setup = await compactionSession({ contextWindow: 4_000, reportedTokens: 3_900, retryBaseDelayMs: 0 })
+  setup.faux.setResponses([
+    fauxAssistantMessage("", { stopReason: "error", errorMessage: "terminated" }),
+    fauxAssistantMessage("recovered checkpoint"),
+    fauxAssistantMessage("answer")
+  ])
+  const retryReasons: string[] = []
+  setup.session.subscribe(event => {
+    if (event.type === "summarization_retry_scheduled") retryReasons.push(event.reason)
+  })
+
+  await setup.session.prompt("new prompt")
+
+  expect(setup.faux.state.callCount).toBe(3)
+  expect(retryReasons).toEqual(["threshold"])
+  expect(setup.session.sessionManager.latestCompaction()?.reason).toBe("threshold")
+  setup.session.dispose()
 })
 
 test("automatic pre-prompt compaction includes prospective input and changes the provider context", async () => {
@@ -550,6 +623,7 @@ async function compactionSession(
     readonly contextWindow?: number
     readonly oldTextBytes?: number
     readonly reportedTokens?: number
+    readonly retryBaseDelayMs?: number
   } = {}
 ) {
   const models = createModels()
@@ -563,7 +637,12 @@ async function compactionSession(
     model: "compaction/model",
     models,
     persist: false,
-    settings: { compactionEnabled: true, compactionReserveTokens: 100, compactionKeepRecentTokens: 1 }
+    settings: {
+      compactionEnabled: true,
+      compactionReserveTokens: 100,
+      compactionKeepRecentTokens: 1,
+      ...(options.retryBaseDelayMs === undefined ? {} : { retryBaseDelayMs: options.retryBaseDelayMs })
+    }
   })
   const model = bootstrap.session.model
   bootstrap.session.dispose()

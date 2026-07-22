@@ -17,7 +17,12 @@ export type PromptFeedback =
   | { readonly type: "error"; readonly message: string }
   | { readonly type: "auth_link"; readonly requestId: number; readonly message: string; readonly url: string }
 
-export type EditableSetting = "defaultThinkingLevel" | "steeringMode" | "followUpMode" | "compactionEnabled"
+export type EditableSetting =
+  | "defaultThinkingLevel"
+  | "steeringMode"
+  | "followUpMode"
+  | "compactionEnabled"
+  | "retryEnabled"
 export type EditableSettingValue = ThinkingLevel | QueueMode | boolean
 
 export type PromptWorkflow =

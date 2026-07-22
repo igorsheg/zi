@@ -60,6 +60,7 @@ export class PromptView {
     this.#exitGestures = exitGestures
     this.#store = createPromptStore(interactive, slash, sessionActions, clipboard)
     this.root = new BoxRenderable(renderer, { flexDirection: "column", flexShrink: 0 })
+    this.root.onLifecyclePass = this.#refreshWorkingStatus
 
     this.#working = new ShimmerTextView(renderer, "Working…", theme.text.muted, theme.text.primary)
     this.#feedback = new PromptFeedbackView(renderer, browserOpener, theme)
@@ -114,6 +115,7 @@ export class PromptView {
 
   destroy(): void {
     for (const release of this.#release.splice(0)) release()
+    this.root.onLifecyclePass = null
     this.#working.destroy()
     this.#feedback.destroy()
     this.#queue.destroy()
@@ -139,9 +141,7 @@ export class PromptView {
     const fixedRows = geometry.protectedRows + (working ? 1 : 0) + (feedbackVisible ? 1 : 0)
     const pickerVisible = this.#pickerStack.update(Math.max(0, this.#renderer.height - fixedRows))
 
-    this.#working.setText(
-      session.isAborting ? "Cancelling…" : session.compactionStatus.type === "running" ? "Compacting…" : "Working…"
-    )
+    this.#working.setText(workingStatusText(session, this.#keybindings.getHint("app.interrupt"), Date.now()))
     this.#working.setActive(working)
     if (pickerVisible) this.#queue.hide()
     else this.#queue.update(session.queuedInputs, Math.max(0, this.#renderer.height - fixedRows))
@@ -150,6 +150,12 @@ export class PromptView {
       this.#composer.syncImageMarkers(prompt.images)
     }
     this.#composer.update(geometry, composerSlots(session, prompt.images.length))
+  }
+
+  #refreshWorkingStatus = (): void => {
+    const session = this.#interactive.getSession()
+    if (session.retryStatus.type !== "waiting") return
+    this.#working.setText(workingStatusText(session, this.#keybindings.getHint("app.interrupt"), Date.now()))
   }
 
   #submit(delivery: "steer" | "followUp"): void {
@@ -364,6 +370,21 @@ function authenticationActive(workflow: PromptWorkflow): boolean {
   return (
     workflow.type === "authenticating" || workflow.type === "auth_prompt" || workflow.type === "choosing_auth_option"
   )
+}
+
+function workingStatusText(
+  session: ReturnType<InteractiveStore["getSession"]>,
+  interruptHint: string | undefined,
+  now: number
+): string {
+  if (session.isAborting) return "Cancelling…"
+  const retry = session.retryStatus
+  if (retry.type === "waiting") {
+    const seconds = Math.max(0, Math.ceil((retry.retryAt - now) / 1_000))
+    const cancel = interruptHint ? `${interruptHint} to cancel` : "interrupt to cancel"
+    return `Retrying (${retry.attempt}/${retry.maxAttempts}) in ${seconds}s… (${cancel})`
+  }
+  return session.compactionStatus.type === "running" ? "Compacting…" : "Working…"
 }
 
 function composerSlots(session: ReturnType<InteractiveStore["getSession"]>, imageCount = 0): ComposerSlots {

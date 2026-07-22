@@ -266,6 +266,37 @@ test("overflow failures remain durable but are omitted from active context", () 
   expect(session.activeMessages().map(message => message.role)).toEqual(["compactionSummary", "user"])
 })
 
+test("retry markers durably exclude failed attempts from active context", async () => {
+  const root = await mkdtemp(join(tmpdir(), "openzi-session-retry-restore-"))
+  const paths = new OpenZiPaths(join(root, "project"), join(root, "global"))
+  const session = SessionManager.create(paths)
+  const presentation = session.presentationMessages()
+  session.appendMessage({ role: "user", content: "retry me", timestamp: 1 })
+  const failure = session.appendMessage({
+    role: "assistant",
+    content: [{ type: "text", text: "partial" }],
+    api: "test",
+    provider: "test",
+    model: "test",
+    usage: emptyUsage(),
+    stopReason: "error",
+    errorMessage: "network error",
+    timestamp: 2
+  })
+  session.appendRetry(failure.id, 1)
+  session.appendMessage(assistantMessage(3))
+
+  expect(session.messages()).toHaveLength(3)
+  expect(session.activeMessages().map(message => message.role)).toEqual(["user", "assistant"])
+  expect(session.presentationMessages()).toBe(presentation)
+  expect(session.presentationMessages().map(message => message.role)).toEqual(["user", "assistant", "assistant"])
+
+  const restored = SessionManager.open(session.file!)
+  expect(restored.activeMessages()).toEqual(session.activeMessages())
+  expect(restored.presentationMessages()).toEqual(session.presentationMessages())
+  expect(restored.entries().map(entry => entry.type)).toEqual(["message", "message", "retry", "message"])
+})
+
 test("opening rejects completed compaction markers with invalid semantic references", async () => {
   const root = await mkdtemp(join(tmpdir(), "openzi-session-invalid-compaction-"))
   const paths = new OpenZiPaths(join(root, "project"), join(root, "global"))

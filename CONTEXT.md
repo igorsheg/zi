@@ -28,6 +28,14 @@ _Avoid_: Tool view model, render callback, tool component
 The cwd-bound prompt inputs active for one agent session: base and appended system prompts, contextual instruction files, skill descriptors, and prompt templates. Resource discovery finds candidates; the agent session owns the coherent catalog used by its conversation. Terminal themes and extension/package loading are separate capabilities.
 _Avoid_: Core resources, resource registry, frontend resources
 
+**Retry sequence**:
+One bounded chain of consecutive transient model failures inside an admitted agent turn or summarization call. `AgentSession` owns classification, attempts, exponential backoff, cancellation, context exclusion, events, and final settlement. Provider/SDK retries remain a separate lower-level policy and default to zero attempts.
+_Avoid_: Request loop, tool retry, overflow recovery
+
+**Retry marker**:
+An append-only session entry recording that one durable assistant failure was admitted for retry. It keeps the failed attempt available to transcript presentation while excluding it from live and resumed provider context, including later compaction input.
+_Avoid_: Deleted error, UI retry row, mutable context flag
+
 **Run interruption**:
 A request to stop active provider/tool work while keeping the `AgentSession` reusable. Escape cancellation returns pending queued input to the composer; lower-level interruption may preserve admitted queue work. Neither operation owns terminal teardown.
 _Avoid_: Quit, shutdown, dispose

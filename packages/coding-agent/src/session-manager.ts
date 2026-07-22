@@ -6,6 +6,7 @@ import type { ThinkingLevel } from "@earendil-works/pi-agent-core"
 
 import { formatCompactionSummary, type AgentMessage, type CompactionSummaryMessage } from "./messages.js"
 import { type OpenZiPaths, resolveOpenZiPath } from "./paths.js"
+import { maxRetryCount } from "./retry.js"
 
 export interface SessionHeader {
   type: "session"
@@ -30,6 +31,12 @@ export interface CompactionDetails {
   readonly omittedModifiedFiles: number
 }
 
+export interface RetryEntryData {
+  readonly type: "retry"
+  readonly failedEntryId: string
+  readonly attempt: number
+}
+
 export interface CompactionEntryData {
   readonly type: "compaction"
   readonly reason: CompactionReason
@@ -45,10 +52,12 @@ export type SessionEntryData =
   | { type: "message"; message: AgentMessage }
   | { type: "model_change"; provider: string; modelId: string }
   | { type: "thinking_level_change"; thinkingLevel: ThinkingLevel }
+  | RetryEntryData
   | CompactionEntryData
 
 export type SessionEntry = SessionEntryBase & SessionEntryData
 export type MessageEntry = SessionEntryBase & Extract<SessionEntryData, { type: "message" }>
+export type RetryEntry = SessionEntryBase & RetryEntryData
 export type CompactionEntry = SessionEntryBase & CompactionEntryData
 
 export interface NewSessionOptions {
@@ -113,6 +122,7 @@ export class SessionManager {
   readonly header: SessionHeader
   #persistence: SessionPersistence
   readonly #entries: SessionEntry[] = []
+  #presentationMessages: AgentMessage[] = []
   readonly #promptHistory: MessageEntry[] = []
   #leafId: string | null = null
 
@@ -156,6 +166,7 @@ export class SessionManager {
     manager.#persistence = { type: "durable", file: resolvedFile }
     validateJournal(entries, resolvedFile)
     manager.#entries.push(...entries)
+    manager.#rebuildPresentationMessages()
     for (const entry of entries) manager.#considerPromptHistoryEntry(entry)
     manager.#leafId = manager.#entries.at(-1)?.id ?? null
     Object.assign(manager.header, header, { cwd: resolveOpenZiPath(header.cwd) })
@@ -251,6 +262,10 @@ export class SessionManager {
     return this.#append({ type: "thinking_level_change", thinkingLevel })
   }
 
+  appendRetry(failedEntryId: string, attempt: number): RetryEntry {
+    return this.#append({ type: "retry", failedEntryId, attempt })
+  }
+
   appendCompaction(data: Omit<CompactionEntryData, "type">): CompactionEntry {
     return this.#append({ type: "compaction", ...data })
   }
@@ -273,25 +288,15 @@ export class SessionManager {
   }
 
   activeEntries(): readonly SessionEntry[] {
-    const markerIndex = this.#entries.findLastIndex(entry => entry.type === "compaction")
-    if (markerIndex < 0) return this.#entries.filter(isContextVisibleEntry)
-
-    const marker = this.#entries[markerIndex]
-    if (marker?.type !== "compaction") throw new Error("Compaction marker index is invalid")
-    const firstKeptIndex = this.#entries.findIndex(entry => entry.id === marker.firstKeptEntryId)
-    const excluded = marker.excludedFailureEntryId
-    const exact = [...this.#entries.slice(firstKeptIndex, markerIndex), ...this.#entries.slice(markerIndex + 1)].filter(
-      entry => isContextVisibleEntry(entry) && entry.id !== excluded
-    )
-    return [marker, ...exact]
+    return projectSessionEntries(this.#entries, "context")
   }
 
   activeMessages(): AgentMessage[] {
-    return this.activeEntries().flatMap(entry => {
-      if (entry.type === "message") return [entry.message]
-      if (entry.type !== "compaction") return []
-      return [compactionMessage(entry)]
-    })
+    return projectMessages(this.activeEntries())
+  }
+
+  presentationMessages(): readonly AgentMessage[] {
+    return this.#presentationMessages
   }
 
   latestCompaction(): CompactionEntry | undefined {
@@ -342,9 +347,22 @@ export class SessionManager {
     validateNextEntry(next, this.#entries, this.file ?? "<memory>")
     this.#persist(next)
     this.#entries.push(next)
+    this.#updatePresentationMessages(next)
     this.#considerPromptHistoryEntry(next)
     this.#leafId = next.id
     return next
+  }
+
+  #updatePresentationMessages(entry: SessionEntry): void {
+    if (entry.type === "compaction") {
+      this.#rebuildPresentationMessages()
+    } else if (isContextVisibleEntry(entry)) {
+      this.#presentationMessages.push(entry.message)
+    }
+  }
+
+  #rebuildPresentationMessages(): void {
+    this.#presentationMessages = projectMessages(projectSessionEntries(this.#entries, "presentation"))
   }
 
   #considerPromptHistoryEntry(entry: SessionEntry): void {
@@ -517,6 +535,9 @@ function parseEntry(line: string, file: string): SessionEntry {
   if (value.type === "thinking_level_change" && isThinkingLevel(value.thinkingLevel)) {
     return { ...base, type: value.type, thinkingLevel: value.thinkingLevel }
   }
+  if (value.type === "retry" && typeof value.failedEntryId === "string" && isRetryAttempt(value.attempt)) {
+    return { ...base, type: value.type, failedEntryId: value.failedEntryId, attempt: value.attempt }
+  }
   if (value.type === "compaction" && isCompactionEntryData(value)) {
     return {
       ...base,
@@ -630,6 +651,10 @@ function isThinkingLevel(value: unknown): value is ThinkingLevel {
   )
 }
 
+function isRetryAttempt(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= maxRetryCount
+}
+
 function isCompactionEntryData(value: unknown): value is CompactionEntryData {
   if (!isRecord(value)) return false
   return (
@@ -684,17 +709,29 @@ function validateJournal(entries: readonly SessionEntry[], file: string): void {
 }
 
 function validateNextEntry(next: SessionEntry, preceding: readonly SessionEntry[], file: string): void {
+  if (next.type === "retry") {
+    const failure = preceding.at(-1)
+    if (
+      failure?.id !== next.failedEntryId ||
+      failure.type !== "message" ||
+      failure.message.role !== "assistant" ||
+      failure.message.stopReason !== "error" ||
+      !isRetryAttempt(next.attempt)
+    ) {
+      throw new Error(`Invalid retry failure reference: ${file}`)
+    }
+    return
+  }
   if (next.type !== "compaction") return
   if (!isCompactionEntryData(next)) throw new Error(`Invalid session entry: ${file}`)
 
   const markerIndex = preceding.length
   const firstKeptIndex = preceding.findIndex(entry => entry.id === next.firstKeptEntryId)
-  if (firstKeptIndex < 0 || firstKeptIndex >= markerIndex || !isContextVisibleEntry(preceding[firstKeptIndex]!)) {
+  const firstKept = preceding[firstKeptIndex]
+  if (firstKeptIndex < 0 || firstKeptIndex >= markerIndex || !firstKept || !isContextVisibleEntry(firstKept)) {
     throw new Error(`Invalid compaction boundary: ${file}`)
   }
-  if (preceding[firstKeptIndex]!.type === "message" && preceding[firstKeptIndex]!.message.role === "toolResult") {
-    throw new Error(`Invalid compaction boundary: ${file}`)
-  }
+  if (firstKept.message.role === "toolResult") throw new Error(`Invalid compaction boundary: ${file}`)
 
   if (next.excludedFailureEntryId !== undefined) {
     const failure = preceding.find(entry => entry.id === next.excludedFailureEntryId)
@@ -711,7 +748,36 @@ function validateNextEntry(next: SessionEntry, preceding: readonly SessionEntry[
   }
 }
 
-function isContextVisibleEntry(entry: SessionEntry): boolean {
+function projectSessionEntries(entries: readonly SessionEntry[], mode: "context" | "presentation"): SessionEntry[] {
+  const markerIndex = entries.findLastIndex(entry => entry.type === "compaction")
+  const retryFailures = new Set<string>()
+  for (let index = 0; index < entries.length; index++) {
+    const entry = entries[index]!
+    if (entry.type === "retry" && (mode === "context" || (markerIndex >= 0 && index < markerIndex))) {
+      retryFailures.add(entry.failedEntryId)
+    }
+  }
+  const visible = (entry: SessionEntry) => isContextVisibleEntry(entry) && !retryFailures.has(entry.id)
+  if (markerIndex < 0) return entries.filter(visible)
+
+  const marker = entries[markerIndex]
+  if (marker?.type !== "compaction") throw new Error("Compaction marker index is invalid")
+  const firstKeptIndex = entries.findIndex(entry => entry.id === marker.firstKeptEntryId)
+  const exact = [...entries.slice(firstKeptIndex, markerIndex), ...entries.slice(markerIndex + 1)].filter(
+    entry => visible(entry) && entry.id !== marker.excludedFailureEntryId
+  )
+  return [marker, ...exact]
+}
+
+function projectMessages(entries: readonly SessionEntry[]): AgentMessage[] {
+  return entries.flatMap(entry => {
+    if (entry.type === "message") return [entry.message]
+    if (entry.type === "compaction") return [compactionMessage(entry)]
+    return []
+  })
+}
+
+function isContextVisibleEntry(entry: SessionEntry): entry is MessageEntry {
   return entry.type === "message" && !(entry.message.role === "bashExecution" && entry.message.excludeFromContext)
 }
 

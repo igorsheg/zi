@@ -191,7 +191,8 @@ export function settingsFrame(session: AgentSession, scope: SettingsScope): Pick
       settingRow(session, scope, "defaultThinkingLevel", "Thinking level", scoped.defaultThinkingLevel),
       settingRow(session, scope, "steeringMode", "Steering mode", scoped.steeringMode),
       settingRow(session, scope, "followUpMode", "Follow-up mode", scoped.followUpMode),
-      settingRow(session, scope, "compactionEnabled", "Automatic compaction", scoped.compactionEnabled)
+      settingRow(session, scope, "compactionEnabled", "Automatic compaction", scoped.compactionEnabled),
+      settingRow(session, scope, "retryEnabled", "Automatic retry", scoped.retryEnabled)
     ]
   }
 }
@@ -203,7 +204,7 @@ export function settingValuesFrame(session: AgentSession, scope: SettingsScope, 
   const values: readonly EditableSettingValue[] =
     setting === "defaultThinkingLevel"
       ? session.getSupportedThinkingLevels()
-      : setting === "compactionEnabled"
+      : setting === "compactionEnabled" || setting === "retryEnabled"
         ? [true, false]
         : ["one-at-a-time", "all"]
   const selected = values.find(value => value === saved) ?? effective
@@ -230,6 +231,8 @@ export function settingLabel(setting: EditableSetting): string {
       return "Follow-up mode"
     case "compactionEnabled":
       return "Automatic compaction"
+    case "retryEnabled":
+      return "Automatic retry"
     default:
       return assertNever(setting)
   }
@@ -305,6 +308,8 @@ function effectiveSetting(session: AgentSession, setting: EditableSetting): Edit
       return session.followUpMode
     case "compactionEnabled":
       return session.settingsManager.get().compactionEnabled
+    case "retryEnabled":
+      return session.settingsManager.get().retryEnabled
     default:
       return assertNever(setting)
   }

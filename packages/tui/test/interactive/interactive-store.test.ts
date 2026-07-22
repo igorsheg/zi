@@ -115,7 +115,7 @@ test("an aborted assistant message settles prepared tool rows", async () => {
       result: { content: [{ text: "Operation aborted" }] }
     })
 
-    state = transitionInteractiveState(state, { type: "agent_end", messages: [message] })
+    state = transitionInteractiveState(state, { type: "agent_end", messages: [message], willRetry: false })
     expect(state.tools.get("bash-1")?.status).toBe("aborted")
   } finally {
     session.dispose()
@@ -160,7 +160,7 @@ test("agent end aborts sequential calls that never started", async () => {
         timestamp: 2
       }
     })
-    state = transitionInteractiveState(state, { type: "agent_end", messages: [assistant] })
+    state = transitionInteractiveState(state, { type: "agent_end", messages: [assistant], willRetry: false })
 
     expect(state.tools).toHaveLength(1)
     expect(state.tools.get("waiting")).toMatchObject({

@@ -37,7 +37,7 @@ The first implementation does not add:
 - branch summarization or tree navigation;
 - lossy request-time tool-result pruning as a substitute for durable compaction;
 - a `CompactionManager`, generic state-machine framework, command bus, or frontend compaction owner;
-- transient provider retry policy beyond the existing provider layer; the separate retry milestone remains separate;
+- transient provider retry policy in the original compaction slice; the later retry milestone wraps each summary sample without changing this transaction;
 - config compatibility with Pi or Grok Build.
 
 # 1. Reference comparison
@@ -527,7 +527,7 @@ For every model response:
 
 Before commit, estimate the old and candidate active messages with the same local estimator. Reject the candidate when `estimatedTokensAfter >= estimatedTokensBefore`; provider-anchored `tokensBefore` is retained for diagnostics but is not used as the other side of this reduction comparison. Automatic compaction also rejects a candidate whose retained boundary or summary would create an invalid provider sequence.
 
-There is no compaction-specific retry of transient network/provider failures in this milestone. The installed provider transport retains its own bounded retry behavior. Empty output, deterministic overflow, authentication failure, and cancellation are never retried unchanged.
+The original compaction milestone did not retry transient network/provider failures. The later retry milestone now wraps each summary sample with the bounded session policy while retaining this operation's eight-chunk and 120-second limits. Empty output, deterministic overflow, authentication failure, and cancellation are never retried unchanged. See [`retry-implementation-spec.md`](retry-implementation-spec.md).
 
 # 9. Transaction and run integration
 
@@ -765,7 +765,7 @@ JSON mode emits ordered session events, including `compaction_start`, committed 
 | Empty/oversized summary            | No marker; same failure handling                                                |
 | Non-reducing summary               | No marker; same failure handling                                                |
 | Compaction request overflow        | Split the source; never retry identical input; fail after chunk bound           |
-| Other provider/network failure     | Rely on provider transport; no extra compaction retry                           |
+| Transient provider/network failure | Retry the same summary sample within the owning operation's bounded policy      |
 | Journal append failure             | No in-memory leaf or active-context mutation                                    |
 | Escape during manual compaction    | Abort request, emit cancelled, return idle                                      |
 | Escape during automatic compaction | Abort request and active run, preserve normal queue-restoration semantics       |

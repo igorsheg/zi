@@ -73,7 +73,8 @@ createAgentRuntime(options)
           -> SessionShell-backed bash and task tools
           -> other tool definitions
           -> context accounting and compaction transaction
-          -> later: retry, extensions
+          -> bounded agent-turn and summarization retry
+          -> later: extensions
 ```
 
 ### `AgentRuntime` and `AgentSession`
@@ -92,7 +93,8 @@ createAgentRuntime(options)
 - steering and follow-up queues;
 - active-run admission, interruption, queue disposition, cancellation, and settlement;
 - provider-anchored context accounting, manual and provider-boundary compaction, and one overflow recovery;
-- later, retry, branch, and extension policy.
+- bounded transient retry across agent turns and compaction summaries, with durable failure exclusion;
+- later, branch and extension policy.
 
 It exposes Pi agent events plus session-level events. Application modes subscribe; they do not control the provider loop or persist messages themselves. Runtime creation may produce an unselected session when no provider is authenticated; the terminal still starts, while prompt admission gives `/login` then `/model` guidance until `setModel()` commits the selected transition.
 

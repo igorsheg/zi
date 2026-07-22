@@ -43,7 +43,7 @@ The target is coding-agent architecture parity and observable product-behavior p
 - [x] Session create/resume/list/switch
 - [x] Steering and follow-up with bounded queues
 - [x] Session-owned foreground/background shell tasks and interactive demotion
-- [ ] Retry policy and visible countdown
+- [x] Retry policy and visible countdown
 - [x] Context usage and automatic/manual compaction
 - [x] Slash-command completion and `@` project-file completion
 - [x] Conversation scrolling, follow-tail, unseen-line hint, selection/copy
@@ -65,6 +65,13 @@ Context accounting and compaction are implemented from [`docs/context-compaction
 - `packages/tui/test/interactive/prompt-store.test.ts`, `settings.test.ts`, and `transcript-performance.test.ts` fix exact `/compact` focus forwarding, scoped On/Off policy, success feedback, and authoritative equal-length transcript rebuild with stable projection bounds. `packages/coding-agent/test/print-mode.test.ts` proves headless JSON preserves compaction start → durable entry → end ordering without terminal policy.
 
 Pi's optional `grep`, `find`, and `ls` implementations are deliberately deferred: its vanilla session does not enable them, and Bash already supplies their default capability. They are not part of the current built-in UX scope.
+
+### P1 retry evidence
+
+- `packages/coding-agent/test/agent-session-retry.test.ts` fixes Pi AI-owned transient classification, disabled/quota refusal, the three-attempt budget, one logical settlement, `agent_end.willRetry`, cancellation with exact queue restoration, retry-before-follow-up ordering, durable context exclusion across compaction and resume, and retained failed-attempt presentation.
+- `packages/coding-agent/test/agent-session-compaction.test.ts` proves manual and automatic summarization use the same bounded policy, remain inside the compaction operation, and release cancellation without another provider call. `packages/coding-agent/test/print-mode.test.ts` fixes source-ordered retry events and one final headless settlement.
+- `packages/tui/test/interactive/retry.test.ts` drives the real semantic interrupt binding, derives the countdown from the session deadline through the existing renderer live lifecycle, proves live-request cleanup, and retains the failed attempt beside the recovered answer. `packages/tui/test/interactive/settings.test.ts` exposes scoped automatic retry enablement.
+- Pi turn behavior is characterized from `core/agent-session.ts`, retry classification from `pi-ai/src/utils/retry.ts`, and countdown behavior from Pi interactive mode at the pinned commit. Post-pin Pi `8e53e0e4` and its aborted-retry fix `243f64be` supplied the compaction/branch-wide policy evidence. OpenZi keeps provider/SDK retries at zero by default, caps three exponential waits below two minutes, persists retry markers for deterministic resume, and uses no terminal timer. See [`docs/retry-implementation-spec.md`](retry-implementation-spec.md).
 
 ### P1 session-lifecycle evidence
 

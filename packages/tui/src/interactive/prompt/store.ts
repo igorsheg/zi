@@ -1272,6 +1272,10 @@ class PromptController implements PromptStore {
           if (value !== "true" && value !== "false") return false
           mutation = workflow.session.setCompactionEnabled(value === "true", workflow.scope)
           break
+        case "retryEnabled":
+          if (value !== "true" && value !== "false") return false
+          mutation = workflow.session.setRetryEnabled(value === "true", workflow.scope)
+          break
         default:
           return assertNever(workflow.setting)
       }
@@ -1415,7 +1419,8 @@ function editableSetting(value: string): EditableSetting | undefined {
   return value === "defaultThinkingLevel" ||
     value === "steeringMode" ||
     value === "followUpMode" ||
-    value === "compactionEnabled"
+    value === "compactionEnabled" ||
+    value === "retryEnabled"
     ? value
     : undefined
 }

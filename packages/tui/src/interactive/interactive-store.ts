@@ -223,8 +223,14 @@ export function transitionInteractiveState(state: InteractiveState, event: Agent
       break
     case "agent_start":
     case "agent_settled":
+    case "auto_retry_start":
+    case "auto_retry_end":
+    case "summarization_retry_scheduled":
+    case "summarization_retry_attempt_start":
+    case "summarization_retry_finished":
     case "compaction_start":
     case "compaction_enabled_changed":
+    case "retry_enabled_changed":
     case "queue_update":
     case "authentication_changed":
     case "model_changed":

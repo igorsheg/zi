@@ -13,7 +13,9 @@ import {
   cleanupSessionResources,
   getSupportedThinkingLevels,
   isContextOverflow,
+  isRetryableAssistantError,
   type Api,
+  type AssistantMessage,
   type ImageContent,
   type Model
 } from "@earendil-works/pi-ai"
@@ -35,7 +37,9 @@ import {
   shouldCompact,
   validateCompactionReduction,
   type CompactionPlan,
-  type EffectiveCompactionSettings
+  type EffectiveCompactionSettings,
+  type SummaryRequest,
+  type SummarySampler
 } from "./compaction.js"
 import {
   advanceContextUsage,
@@ -51,6 +55,7 @@ import { type ProjectFileSearch, type ProjectFileSearchResult } from "./project-
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.js"
 import type { ResourceDiagnostic } from "./resource-diagnostics.js"
 import type { SessionResources } from "./resource-loader.js"
+import { boundedRetryError, retryAbortedMessage, retryDelayMs, waitForRetryDelay } from "./retry.js"
 import type {
   CompactionDetails,
   CompactionEntry,
@@ -69,6 +74,7 @@ export type { ContextUsage } from "./context-usage.js"
 
 export const maxPendingInputCount = 32
 export const maxPendingInputBytes = 8 * 1024 * 1024
+export { maxRetryDelayMs, maxRetryErrorBytes } from "./retry.js"
 
 export type PendingInputDelivery = "steer" | "followUp"
 
@@ -103,17 +109,50 @@ export type CompactionStatus =
   | { readonly type: "idle" }
   | { readonly type: "running"; readonly operationId: number; readonly reason: CompactionReason }
 
+export type RetryStatus =
+  | { readonly type: "idle" }
+  | ({ readonly type: "waiting"; readonly source: "agent" } & RetrySchedule)
+  | ({
+      readonly type: "waiting"
+      readonly source: "compaction"
+      readonly operationId: number
+      readonly reason: CompactionReason
+    } & RetrySchedule)
+
 export type CompactionOutcome =
   | { readonly type: "completed"; readonly result: CompactionResult }
   | { readonly type: "cancelled" }
   | { readonly type: "failed"; readonly message: string }
 
 export type AgentSessionEvent =
-  | AgentEvent
+  | Exclude<AgentEvent, { type: "agent_end" }>
+  | { type: "agent_end"; messages: AgentMessage[]; willRetry: boolean }
   | { type: "agent_settled" }
+  | {
+      type: "auto_retry_start"
+      attempt: number
+      maxAttempts: number
+      delayMs: number
+      retryAt: number
+      errorMessage: string
+    }
+  | { type: "auto_retry_end"; success: boolean; attempt: number; finalError?: string }
+  | {
+      type: "summarization_retry_scheduled"
+      operationId: number
+      reason: CompactionReason
+      attempt: number
+      maxAttempts: number
+      delayMs: number
+      retryAt: number
+      errorMessage: string
+    }
+  | { type: "summarization_retry_attempt_start"; operationId: number; reason: CompactionReason }
+  | { type: "summarization_retry_finished"; operationId: number; reason: CompactionReason }
   | { type: "compaction_start"; operationId: number; reason: CompactionReason }
   | { type: "compaction_end"; operationId: number; reason: CompactionReason; outcome: CompactionOutcome }
   | { type: "compaction_enabled_changed"; enabled: boolean }
+  | { type: "retry_enabled_changed"; enabled: boolean }
   | ({ type: "queue_update" } & QueuedInputs)
   | { type: "entry_appended"; entry: SessionEntry }
   | { type: "model_changed"; model: Model<Api> }
@@ -166,6 +205,12 @@ export interface CompactionEnabledMutation {
   readonly effective: boolean
 }
 
+export interface RetryEnabledMutation {
+  readonly scope: SettingsScope
+  readonly requested: boolean
+  readonly effective: boolean
+}
+
 export interface AgentSessionConfig {
   agent: Agent
   sessionManager: SessionManager
@@ -186,13 +231,25 @@ export class QueueCapacityError extends Error {
   }
 }
 
+interface RetrySchedule {
+  readonly attempt: number
+  readonly maxAttempts: number
+  readonly delayMs: number
+  readonly retryAt: number
+  readonly errorMessage: string
+}
+
+type CompactionStage = { readonly type: "sampling" } | ({ readonly type: "retry_wait" } & RetrySchedule)
+
 type RunPhase =
   | { readonly type: "agent" }
+  | ({ readonly type: "retry_wait"; readonly controller: AbortController } & RetrySchedule)
   | {
       readonly type: "compacting"
       readonly operationId: number
       readonly reason: "threshold" | "overflow"
       readonly controller: AbortController
+      readonly stage: CompactionStage
     }
   | { readonly type: "compaction_committed"; readonly operationId: number; readonly reason: "threshold" | "overflow" }
 
@@ -202,6 +259,7 @@ type RunningActivity = {
   readonly phase: RunPhase
   readonly autoCompactions: number
   readonly overflowRecoveries: 0 | 1
+  readonly retryAttempts: number
   readonly thresholdSuppressed: boolean
   readonly settled: Promise<void>
 }
@@ -210,7 +268,14 @@ type Activity =
   | { type: "idle" }
   | RunningActivity
   | { type: "aborting"; runId: number; settled: Promise<void> }
-  | { type: "compacting"; operationId: number; reason: "manual"; controller: AbortController; settled: Promise<void> }
+  | {
+      type: "compacting"
+      operationId: number
+      reason: "manual"
+      controller: AbortController
+      stage: CompactionStage
+      settled: Promise<void>
+    }
   | { type: "compaction_committed"; operationId: number; reason: "manual"; settled: Promise<void> }
   | { type: "failed"; runId: number; cause: unknown }
   | { type: "disposed"; settled: Promise<void> }
@@ -312,7 +377,7 @@ export class AgentSession {
   }
 
   get messages(): readonly AgentMessage[] {
-    return this.#ownedMessages()
+    return this.sessionManager.presentationMessages()
   }
 
   get streamingMessage(): AgentMessage | undefined {
@@ -354,6 +419,47 @@ export class AgentSession {
     return { type: "idle" }
   }
 
+  get retryStatus(): RetryStatus {
+    const activity = this.#activity
+    if (activity.type === "running" && activity.phase.type === "retry_wait") {
+      const { attempt, maxAttempts, delayMs, retryAt, errorMessage } = activity.phase
+      return { type: "waiting", source: "agent", attempt, maxAttempts, delayMs, retryAt, errorMessage }
+    }
+    if (activity.type === "compacting" && activity.stage.type === "retry_wait") {
+      const { attempt, maxAttempts, delayMs, retryAt, errorMessage } = activity.stage
+      return {
+        type: "waiting",
+        source: "compaction",
+        operationId: activity.operationId,
+        reason: activity.reason,
+        attempt,
+        maxAttempts,
+        delayMs,
+        retryAt,
+        errorMessage
+      }
+    }
+    if (
+      activity.type === "running" &&
+      activity.phase.type === "compacting" &&
+      activity.phase.stage.type === "retry_wait"
+    ) {
+      const { attempt, maxAttempts, delayMs, retryAt, errorMessage } = activity.phase.stage
+      return {
+        type: "waiting",
+        source: "compaction",
+        operationId: activity.phase.operationId,
+        reason: activity.phase.reason,
+        attempt,
+        maxAttempts,
+        delayMs,
+        retryAt,
+        errorMessage
+      }
+    }
+    return { type: "idle" }
+  }
+
   get isStreaming(): boolean {
     return this.#activity.type === "running" || this.#activity.type === "aborting"
   }
@@ -363,7 +469,7 @@ export class AgentSession {
       this.#activity.type === "aborting" ||
       (this.#activity.type === "compacting" && this.#activity.controller.signal.aborted) ||
       (this.#activity.type === "running" &&
-        this.#activity.phase.type === "compacting" &&
+        (this.#activity.phase.type === "compacting" || this.#activity.phase.type === "retry_wait") &&
         this.#activity.phase.controller.signal.aborted)
     )
   }
@@ -538,6 +644,7 @@ export class AgentSession {
       operationId,
       reason: "manual",
       controller,
+      stage: { type: "sampling" },
       settled: settlement.promise.then(
         () => undefined,
         () => undefined
@@ -564,6 +671,7 @@ export class AgentSession {
           phase: { type: "agent" },
           autoCompactions: 0,
           overflowRecoveries: 0,
+          retryAttempts: 0,
           thresholdSuppressed: false,
           settled: settlement.promise
         }
@@ -624,7 +732,7 @@ export class AgentSession {
         try {
           this.#emitQueue()
         } finally {
-          if (phase.type === "compacting") phase.controller.abort()
+          if (phase.type === "compacting" || phase.type === "retry_wait") phase.controller.abort()
           this.#agent.abort()
         }
         return { ...queued, settled: authenticationWasIdle ? settled : settleTogether(settled, authenticationSettled) }
@@ -682,6 +790,8 @@ export class AgentSession {
         if (phase.type === "compacting" || phase.type === "compaction_committed") {
           this.#activity = { type: "aborting", runId, settled }
           if (phase.type === "compacting") phase.controller.abort()
+        } else if (phase.type === "retry_wait") {
+          phase.controller.abort()
         }
         this.#agent.abort()
         return authenticationWasIdle ? settled : settleTogether(settled, authenticationSettled)
@@ -823,6 +933,17 @@ export class AgentSession {
     return Object.freeze({ scope, requested, effective })
   }
 
+  setRetryEnabled(requested: boolean, scope: SettingsScope): RetryEnabledMutation {
+    this.#assertOpen()
+    if (typeof requested !== "boolean") throw new Error(`Invalid retry setting: ${String(requested)}`)
+    assertSettingsScope(scope)
+    if (scope === "global") this.settingsManager.updateGlobal({ retryEnabled: requested })
+    else this.settingsManager.updateProject({ retryEnabled: requested })
+    const effective = this.settingsManager.get().retryEnabled
+    this.#emitAll([{ type: "retry_enabled_changed", enabled: effective }])
+    return Object.freeze({ scope, requested, effective })
+  }
+
   setThinkingLevel(requested: ThinkingLevel, scope: SettingsScope = "global"): ThinkingLevelMutation {
     this.#assertIdle("change thinking level")
     assertThinkingLevel(requested)
@@ -866,7 +987,10 @@ export class AgentSession {
     this.#pendingBytes = 0
     this.#agent.clearAllQueues()
     if (currentActivity.type === "compacting") currentActivity.controller.abort()
-    if (currentActivity.type === "running" && currentActivity.phase.type === "compacting") {
+    if (
+      currentActivity.type === "running" &&
+      (currentActivity.phase.type === "compacting" || currentActivity.phase.type === "retry_wait")
+    ) {
       currentActivity.phase.controller.abort()
     }
     this.#agent.abort()
@@ -895,6 +1019,13 @@ export class AgentSession {
         const overflow = await this.#recoverOverflow(runId)
         if (overflow === "recovered") continue
         if (overflow === "stop") break
+        // oxlint-disable-next-line no-await-in-loop
+        const retry = await this.#retryAssistant(runId)
+        if (retry === "retry") {
+          // oxlint-disable-next-line no-await-in-loop
+          await this.#agent.continue()
+          continue
+        }
         if (!this.#agent.hasQueuedMessages()) break
         // oxlint-disable-next-line no-await-in-loop
         await this.#agent.continue()
@@ -1010,6 +1141,86 @@ export class AgentSession {
     return this.#compactAfterAssistant(runId, message, { retryOverflow: true, countOverflowRecovery: true })
   }
 
+  async #retryAssistant(runId: number): Promise<"none" | "retry"> {
+    const activity = this.#runningAgentActivity(runId)
+    const message = this.#lastAssistantMessage()
+    if (
+      !activity ||
+      !message ||
+      message.role !== "assistant" ||
+      message.stopReason !== "error" ||
+      !this.#isSelectedModelMessage(message) ||
+      isContextOverflow(message, this.model.contextWindow)
+    ) {
+      return "none"
+    }
+
+    const settings = this.settingsManager.get()
+    const retryable = isRetryableAssistantError(message)
+    if (!settings.retryEnabled || !retryable || activity.retryAttempts >= settings.retryMaxRetries) {
+      if (activity.retryAttempts > 0) {
+        this.#activity = { ...activity, retryAttempts: 0 }
+        this.#emitAll([
+          {
+            type: "auto_retry_end",
+            success: false,
+            attempt: activity.retryAttempts,
+            finalError: boundedRetryError(message.errorMessage || "Unknown provider error")
+          }
+        ])
+      }
+      return "none"
+    }
+
+    const attempt = activity.retryAttempts + 1
+    const failureEntry = this.sessionManager
+      .entries()
+      .findLast(entry => entry.type === "message" && entry.message === message)
+    if (!failureEntry) return "none"
+    const marker = this.sessionManager.appendRetry(failureEntry.id, attempt)
+    this.#removeRuntimeMessage(message)
+    const delayMs = retryDelayMs(settings.retryBaseDelayMs, attempt)
+    const retryAt = Date.now() + delayMs
+    const errorMessage = boundedRetryError(message.errorMessage || "Unknown provider error")
+    const controller = new AbortController()
+    this.#activity = {
+      ...activity,
+      retryAttempts: attempt,
+      phase: {
+        type: "retry_wait",
+        attempt,
+        maxAttempts: settings.retryMaxRetries,
+        delayMs,
+        retryAt,
+        errorMessage,
+        controller
+      }
+    }
+    this.#emitAll([
+      { type: "entry_appended", entry: marker },
+      { type: "auto_retry_start", attempt, maxAttempts: settings.retryMaxRetries, delayMs, retryAt, errorMessage }
+    ])
+
+    const elapsed = await waitForRetryDelay(delayMs, controller.signal)
+    const current = this.#activity
+    if (
+      !elapsed ||
+      current.type !== "running" ||
+      current.runId !== runId ||
+      current.phase.type !== "retry_wait" ||
+      current.phase.controller !== controller
+    ) {
+      if (current.type === "running" && current.runId === runId && current.phase.type === "retry_wait") {
+        this.#activity = { ...current, retryAttempts: 0, phase: { type: "agent" } }
+      }
+      this.#emitAll([{ type: "auto_retry_end", success: false, attempt, finalError: "Retry cancelled" }])
+      return "none"
+    }
+
+    this.#activity = { ...current, phase: { type: "agent" } }
+    return "retry"
+  }
+
   async #compactAfterAssistant(
     runId: number,
     message: AgentMessage,
@@ -1076,7 +1287,7 @@ export class AgentSession {
     runSignal?.addEventListener("abort", abort, { once: true })
     this.#activity = {
       ...current,
-      phase: { type: "compacting", operationId, reason, controller },
+      phase: { type: "compacting", operationId, reason, controller, stage: { type: "sampling" } },
       autoCompactions: current.autoCompactions + 1,
       overflowRecoveries: reason === "overflow" && countOverflowRecovery ? 1 : current.overflowRecoveries
     }
@@ -1160,6 +1371,17 @@ export class AgentSession {
     const timeout = setTimeout(() => deadline.abort(), maxCompactionOperationMs)
     const signal = AbortSignal.any([controller.signal, deadline.signal])
     try {
+      const sample: SummarySampler = (request, requestSignal) =>
+        settleBeforeAbort(
+          Promise.resolve(
+            this.#agent.streamFn(prepared.model, request.context, {
+              maxTokens: request.maxTokens,
+              signal: requestSignal,
+              ...(request.thinkingLevel ? { reasoning: request.thinkingLevel } : {})
+            })
+          ).then(stream => stream.result()),
+          requestSignal
+        )
       const summary = await generateCompactionSummary(
         prepared.plan,
         prepared.model,
@@ -1167,16 +1389,7 @@ export class AgentSession {
         customInstructions,
         this.thinkingLevel,
         (request, requestSignal) =>
-          settleBeforeAbort(
-            Promise.resolve(
-              this.#agent.streamFn(prepared.model, request.context, {
-                maxTokens: request.maxTokens,
-                signal: requestSignal,
-                ...(request.thinkingLevel ? { reasoning: request.thinkingLevel } : {})
-              })
-            ).then(stream => stream.result()),
-            requestSignal
-          ),
+          this.#sampleCompactionWithRetry(operationId, reason, prepared.model, request, requestSignal, sample),
         signal
       )
       const estimatedTokensAfter = validateCompactionReduction(prepared.plan, summary)
@@ -1214,6 +1427,87 @@ export class AgentSession {
     } finally {
       clearTimeout(timeout)
     }
+  }
+
+  async #sampleCompactionWithRetry(
+    operationId: number,
+    reason: CompactionReason,
+    model: Model<Api>,
+    request: SummaryRequest,
+    signal: AbortSignal,
+    sample: SummarySampler
+  ): Promise<AssistantMessage> {
+    const settings = this.settingsManager.get()
+    let attempt = 0
+    let retryStarted = false
+    for (;;) {
+      // oxlint-disable-next-line no-await-in-loop
+      const response = await sample(request, signal)
+      const retryable =
+        response.stopReason === "error" &&
+        !isContextOverflow(response, model.contextWindow) &&
+        isRetryableAssistantError(response)
+      if (!settings.retryEnabled || !retryable || attempt >= settings.retryMaxRetries) {
+        if (retryStarted) this.#finishSummarizationRetry(operationId, reason)
+        return response
+      }
+
+      attempt++
+      retryStarted = true
+      const delayMs = retryDelayMs(settings.retryBaseDelayMs, attempt)
+      const retryAt = Date.now() + delayMs
+      const errorMessage = boundedRetryError(response.errorMessage || "Unknown provider error")
+      const stage: CompactionStage = {
+        type: "retry_wait",
+        attempt,
+        maxAttempts: settings.retryMaxRetries,
+        delayMs,
+        retryAt,
+        errorMessage
+      }
+      if (!this.#setCompactionStage(operationId, stage)) return retryAbortedMessage(response)
+      this.#emitAll([
+        {
+          type: "summarization_retry_scheduled",
+          operationId,
+          reason,
+          attempt,
+          maxAttempts: settings.retryMaxRetries,
+          delayMs,
+          retryAt,
+          errorMessage
+        }
+      ])
+
+      // oxlint-disable-next-line no-await-in-loop
+      if (!(await waitForRetryDelay(delayMs, signal)) || !this.#setCompactionStage(operationId, { type: "sampling" })) {
+        this.#finishSummarizationRetry(operationId, reason)
+        return retryAbortedMessage(response)
+      }
+      this.#emitAll([{ type: "summarization_retry_attempt_start", operationId, reason }])
+    }
+  }
+
+  #setCompactionStage(operationId: number, stage: CompactionStage): boolean {
+    const activity = this.#activity
+    if (activity.type === "compacting" && activity.operationId === operationId) {
+      this.#activity = { ...activity, stage }
+      return true
+    }
+    if (
+      activity.type === "running" &&
+      activity.phase.type === "compacting" &&
+      activity.phase.operationId === operationId
+    ) {
+      this.#activity = { ...activity, phase: { ...activity.phase, stage } }
+      return true
+    }
+    return false
+  }
+
+  #finishSummarizationRetry(operationId: number, reason: CompactionReason): void {
+    if (!this.#setCompactionStage(operationId, { type: "sampling" })) return
+    this.#emitAll([{ type: "summarization_retry_finished", operationId, reason }])
   }
 
   #assertCompactionCommit(operationId: number, prepared: PreparedCompaction, signal: AbortSignal): void {
@@ -1357,7 +1651,47 @@ export class AgentSession {
       this.#recordCommittedMessage(entry.message)
       this.#emit({ type: "entry_appended", entry })
     }
-    this.#emit(event)
+    if (event.type === "agent_end") {
+      const messages: AgentMessage[] = []
+      for (const message of event.messages) {
+        if (!isOpenZiAgentMessage(message)) throw new Error("Invalid OpenZi agent message")
+        messages.push(message)
+      }
+      this.#emit({ type: "agent_end", messages, willRetry: this.#willRetryAfterAgentEnd(event) })
+    } else {
+      this.#emit(event)
+    }
+    if (event.type === "message_end" && event.message.role === "assistant" && event.message.stopReason !== "error") {
+      this.#finishRetryResponse(event.message)
+    }
+  }
+
+  #willRetryAfterAgentEnd(event: Extract<AgentEvent, { type: "agent_end" }>): boolean {
+    const activity = this.#activity
+    const settings = this.settingsManager.get()
+    if (
+      activity.type !== "running" ||
+      activity.phase.type !== "agent" ||
+      !settings.retryEnabled ||
+      activity.retryAttempts >= settings.retryMaxRetries
+    ) {
+      return false
+    }
+    const message = event.messages.findLast(candidate => candidate.role === "assistant")
+    return (
+      message?.role === "assistant" &&
+      !isContextOverflow(message, this.model.contextWindow) &&
+      isRetryableAssistantError(message)
+    )
+  }
+
+  #finishRetryResponse(message: Extract<AgentMessage, { role: "assistant" }>): void {
+    const activity = this.#activity
+    if (activity.type !== "running" || activity.retryAttempts === 0) return
+    this.#activity = { ...activity, retryAttempts: 0 }
+    this.#emitAll([
+      { type: "auto_retry_end", success: message.stopReason !== "aborted", attempt: activity.retryAttempts }
+    ])
   }
 
   #recordCommittedMessage(message: AgentMessage): void {

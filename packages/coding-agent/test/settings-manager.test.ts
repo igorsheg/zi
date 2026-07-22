@@ -33,10 +33,38 @@ test("settings resolve global, then project, then construction overrides", async
     defaultThinkingLevel: "medium",
     steeringMode: "all",
     followUpMode: "one-at-a-time",
+    retryEnabled: true,
+    retryMaxRetries: 3,
+    retryBaseDelayMs: 2_000,
     compactionEnabled: true,
     compactionReserveTokens: 16_384,
     compactionKeepRecentTokens: 20_000
   })
+})
+
+test("retry settings layer and reject unbounded backoff", async () => {
+  const root = await mkdtemp(join(tmpdir(), "openzi-settings-retry-"))
+  const paths = new OpenZiPaths(join(root, "project"), join(root, "global"))
+  await mkdir(paths.projectDir, { recursive: true })
+  await mkdir(paths.globalDir, { recursive: true })
+  await writeFile(
+    paths.globalSettingsFile,
+    JSON.stringify({ retryEnabled: false, retryMaxRetries: 1, retryBaseDelayMs: 1_000 })
+  )
+  await writeFile(paths.projectSettingsFile, JSON.stringify({ retryEnabled: true, retryMaxRetries: 2 }))
+
+  const settings = SettingsManager.create(paths)
+  expect(settings.get()).toMatchObject({ retryEnabled: true, retryMaxRetries: 2, retryBaseDelayMs: 1_000 })
+
+  await writeFile(paths.projectSettingsFile, JSON.stringify({ retryMaxRetries: 4 }))
+  settings.reload()
+  expect(settings.get()).toMatchObject({ retryEnabled: false, retryMaxRetries: 1, retryBaseDelayMs: 1_000 })
+  expect(settings.drainErrors()[0]?.error.message).toContain("retryMaxRetries")
+
+  // oxlint-disable-next-line typescript/unbound-method -- Reflect models an untyped JavaScript SDK caller.
+  expect(() => Reflect.apply(settings.updateGlobal, settings, [{ retryBaseDelayMs: 17_001 }])).toThrow(
+    "Invalid retryBaseDelayMs"
+  )
 })
 
 test("compaction settings layer and validate bounded persisted values", async () => {
@@ -184,6 +212,9 @@ test("oversized settings are bounded and reported without entering effective sta
   expect(settings.get()).toEqual({
     steeringMode: "one-at-a-time",
     followUpMode: "one-at-a-time",
+    retryEnabled: true,
+    retryMaxRetries: 3,
+    retryBaseDelayMs: 2_000,
     compactionEnabled: true,
     compactionReserveTokens: 16_384,
     compactionKeepRecentTokens: 20_000

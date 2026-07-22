@@ -98,6 +98,37 @@ test("automatic compaction is an explicit scoped On or Off setting", async () =>
   }
 })
 
+test("automatic retry is an explicit scoped On or Off setting", async () => {
+  const { session, setup } = await createSettingsFixture()
+
+  try {
+    const prompt = promptInput(setup)
+    prompt.setText("/settings")
+    prompt.gotoBufferEnd()
+    setup.mockInput.pressEnter()
+    await renderSettled(setup)
+    setup.mockInput.pressEnter()
+    await renderSettled(setup)
+    await setup.mockInput.typeText("retry", 0)
+    setup.mockInput.pressEnter()
+    await renderSettled(setup)
+
+    expect(setup.captureCharFrame()).toContain("Automatic retry · Global")
+    expect(setup.captureCharFrame()).toContain("On")
+    expect(setup.captureCharFrame()).toContain("Off")
+    setup.mockInput.pressArrow("down")
+    setup.mockInput.pressEnter()
+    await renderSettled(setup)
+
+    expect(session.settingsManager.getGlobal().retryEnabled).toBe(false)
+    expect(session.settingsManager.get().retryEnabled).toBe(false)
+    expect(setup.captureCharFrame()).toContain("Automatic retry: Off (global)")
+  } finally {
+    session.dispose()
+    setup.destroy()
+  }
+})
+
 test("thinking values come from the model and persist through AgentSession", async () => {
   const { session, setup } = await createSettingsFixture()
 

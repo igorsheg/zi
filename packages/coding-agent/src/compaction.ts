@@ -406,7 +406,13 @@ function projectedExactEntries(
   latestMarker: CompactionEntry | undefined,
   operationExcluded: string | undefined
 ): Array<Extract<SessionEntry, { type: "message" }>> {
-  const excluded = new Set([latestMarker?.excludedFailureEntryId, operationExcluded].filter(id => id !== undefined))
+  const excluded = new Set(
+    [
+      latestMarker?.excludedFailureEntryId,
+      operationExcluded,
+      ...entries.flatMap(entry => (entry.type === "retry" ? [entry.failedEntryId] : []))
+    ].filter(id => id !== undefined)
+  )
   const messages = (values: readonly SessionEntry[]) =>
     values.filter(
       (entry): entry is Extract<SessionEntry, { type: "message" }> =>

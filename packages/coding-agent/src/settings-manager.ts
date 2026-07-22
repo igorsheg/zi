@@ -5,6 +5,9 @@ import type { QueueMode, ThinkingLevel } from "@earendil-works/pi-agent-core"
 import lockfile from "proper-lockfile"
 
 import type { OpenZiPaths } from "./paths.js"
+import { isRetryCount, isRetryDelay } from "./retry.js"
+
+export { maxRetryBaseDelayMs, maxRetryCount } from "./retry.js"
 
 export interface AgentSettings {
   defaultProvider?: string
@@ -12,6 +15,9 @@ export interface AgentSettings {
   defaultThinkingLevel?: ThinkingLevel
   steeringMode: QueueMode
   followUpMode: QueueMode
+  retryEnabled: boolean
+  retryMaxRetries: number
+  retryBaseDelayMs: number
   compactionEnabled: boolean
   compactionReserveTokens: number
   compactionKeepRecentTokens: number
@@ -22,6 +28,9 @@ export const maxSettingsFileBytes = 1024 * 1024
 const defaults: AgentSettings = {
   steeringMode: "one-at-a-time",
   followUpMode: "one-at-a-time",
+  retryEnabled: true,
+  retryMaxRetries: 3,
+  retryBaseDelayMs: 2_000,
   compactionEnabled: true,
   compactionReserveTokens: 16_384,
   compactionKeepRecentTokens: 20_000
@@ -173,6 +182,15 @@ function validateSettingsPatch(patch: Partial<AgentSettings>): void {
   if ("followUpMode" in patch && !isQueueMode(patch.followUpMode)) {
     throw new Error("Invalid followUpMode setting")
   }
+  if ("retryEnabled" in patch && typeof patch.retryEnabled !== "boolean") {
+    throw new Error("Invalid retryEnabled setting")
+  }
+  if ("retryMaxRetries" in patch && !isRetryCount(patch.retryMaxRetries)) {
+    throw new Error("Invalid retryMaxRetries setting")
+  }
+  if ("retryBaseDelayMs" in patch && !isRetryDelay(patch.retryBaseDelayMs)) {
+    throw new Error("Invalid retryBaseDelayMs setting")
+  }
   if ("compactionEnabled" in patch && typeof patch.compactionEnabled !== "boolean") {
     throw new Error("Invalid compactionEnabled setting")
   }
@@ -208,6 +226,9 @@ function clearOverrides(overrides: Partial<AgentSettings>, patch: Partial<AgentS
   if ("defaultThinkingLevel" in patch) delete overrides.defaultThinkingLevel
   if ("steeringMode" in patch) delete overrides.steeringMode
   if ("followUpMode" in patch) delete overrides.followUpMode
+  if ("retryEnabled" in patch) delete overrides.retryEnabled
+  if ("retryMaxRetries" in patch) delete overrides.retryMaxRetries
+  if ("retryBaseDelayMs" in patch) delete overrides.retryBaseDelayMs
   if ("compactionEnabled" in patch) delete overrides.compactionEnabled
   if ("compactionReserveTokens" in patch) delete overrides.compactionReserveTokens
   if ("compactionKeepRecentTokens" in patch) delete overrides.compactionKeepRecentTokens
@@ -291,6 +312,18 @@ function loadSettings(path: string): Partial<AgentSettings> {
   if (value.followUpMode !== undefined) {
     if (!isQueueMode(value.followUpMode)) throw invalidSetting(path, "followUpMode")
     settings.followUpMode = value.followUpMode
+  }
+  if (value.retryEnabled !== undefined) {
+    if (typeof value.retryEnabled !== "boolean") throw invalidSetting(path, "retryEnabled")
+    settings.retryEnabled = value.retryEnabled
+  }
+  if (value.retryMaxRetries !== undefined) {
+    if (!isRetryCount(value.retryMaxRetries)) throw invalidSetting(path, "retryMaxRetries")
+    settings.retryMaxRetries = value.retryMaxRetries
+  }
+  if (value.retryBaseDelayMs !== undefined) {
+    if (!isRetryDelay(value.retryBaseDelayMs)) throw invalidSetting(path, "retryBaseDelayMs")
+    settings.retryBaseDelayMs = value.retryBaseDelayMs
   }
   if (value.compactionEnabled !== undefined) {
     if (typeof value.compactionEnabled !== "boolean") throw invalidSetting(path, "compactionEnabled")
