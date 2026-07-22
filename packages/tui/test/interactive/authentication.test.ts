@@ -64,6 +64,7 @@ test("exact /login uses hidden composer input and selects the provider model wit
       .find(span => span.text.includes("super-secret"))
     expect((hiddenSpan?.attributes ?? 0) & TextAttributes.HIDDEN).toBe(TextAttributes.HIDDEN)
     setup.mockInput.pressEnter()
+    await runtime.session.waitForIdle()
     await renderSettled(setup)
 
     expect(runtime.session.modelState).toEqual({ type: "selected", model: faux.getModel() })
@@ -77,6 +78,7 @@ test("exact /login uses hidden composer input and selects the provider model wit
     input.setText("/logout")
     input.gotoBufferEnd()
     setup.mockInput.pressEnter()
+    await runtime.session.waitForIdle()
     await renderSettled(setup)
     expect(setup.captureCharFrame()).toContain("environment")
     expect(await runtime.services.credentialStore.read("secured")).toBeUndefined()
