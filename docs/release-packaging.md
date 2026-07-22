@@ -58,12 +58,15 @@ Before the first public release:
 
 ## npm publish workflow
 
-The tag workflow now builds npm tarballs but does not publish them. Publishing becomes a separate final gate after npm trusted publishing is configured for the repository:
+The tag workflow now builds npm tarballs and publishes them from a protected `npm` environment. During bootstrap it uses the short-lived `NPM_TOKEN` GitHub secret because the packages do not exist yet:
 
 1. trigger on the same SemVer tag;
-2. download the `npm-packages` artifact from the release run or rebuild it from attested archives;
+2. download the `npm-packages` artifact from the release run;
 3. publish platform packages first, then the top-level package, with `npm publish --provenance --access public`;
-4. verify `npm view @with-zi/zi version` matches the tag.
+4. use the `next` dist-tag for prereleases and `latest` for stable releases;
+5. verify `npm view @with-zi/zi version` matches the tag.
+
+After the first successful publish creates the packages, configure npm trusted publishing for every `@with-zi/zi*` package, delete `NPM_TOKEN`, and remove token auth from the workflow. The permanent workflow should rely on `id-token: write` and `npm publish --provenance` only.
 
 Package `files` allowlists should be explicit. No package should include source tests, local config, session data, or build caches.
 

@@ -123,3 +123,42 @@ jobs:
           flags=()
           if [[ "$TAG" == *-* ]]; then flags+=(--prerelease); fi
           gh release create "$TAG" dist/* --verify-tag --generate-notes --title "Zi $TAG" "${flags[@]}"
+
+  publish-npm:
+    needs: [publish, npm-package]
+    runs-on: ubuntu-24.04
+    environment:
+      name: npm
+      url: https://www.npmjs.com/package/@with-zi/zi
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: npm-packages
+          path: dist/npm
+      - name: Publish npm packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          dist_tag="latest"
+          if [[ "$version" == *-* ]]; then dist_tag="next"; fi
+
+          npm config set //registry.npmjs.org/:_authToken "$NODE_AUTH_TOKEN"
+
+          for target in darwin-arm64 darwin-x64 linux-arm64 linux-x64 windows-x64; do
+            npm publish "dist/npm/with-zi-zi-${target}-${version}.tgz" \
+              --access public \
+              --provenance \
+              --tag "$dist_tag"
+          done
+
+          npm publish "dist/npm/with-zi-zi-${version}.tgz" \
+            --access public \
+            --provenance \
+            --tag "$dist_tag"

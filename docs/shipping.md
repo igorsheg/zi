@@ -56,13 +56,14 @@ Pushing a tag such as `v0.1.0` starts `.github/workflows/release.yml`. It:
 4. assembles `@with-zi/zi` plus platform npm tarballs from those archives and install-smokes the current runner package;
 5. verifies and combines SHA-256 checksums;
 6. creates GitHub build-provenance attestations;
-7. publishes one GitHub release only after every target succeeds.
+7. publishes one GitHub release only after every target succeeds;
+8. publishes `@with-zi/zi` npm packages from the protected `npm` environment.
 
-A SemVer prerelease tag such as `v0.2.0-rc.1` creates a prerelease. The tag is the product-version source; package versions do not control executable releases. The final job deploys through the GitHub `release` environment, where repository settings can require approval without changing the workflow.
+A SemVer prerelease tag such as `v0.2.0-rc.1` creates a prerelease and publishes npm packages under the `next` dist-tag. Stable tags publish under `latest`. The tag is the product-version source; package versions do not control executable releases. GitHub release publishing deploys through the `release` environment, and npm publishing deploys through the separate `npm` environment.
 
 ```sh
 git tag -s v0.1.0 -m "Zi v0.1.0"
 git push origin v0.1.0
 ```
 
-Before the first public release, expand third-party notices and configure macOS notarization and Windows signing. GitHub attestations prove workflow provenance but do not replace platform signatures. npm publishing is intentionally a later gate after trusted publishing is configured for the `@with-zi` organization.
+Before the first public release, expand third-party notices and configure macOS notarization and Windows signing. GitHub attestations and npm provenance prove workflow origin but do not replace platform signatures. The first npm publish uses a short-lived bootstrap token; after packages exist, switch the `@with-zi` packages to trusted publishing and remove that token.
