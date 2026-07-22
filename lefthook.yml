@@ -1,0 +1,14 @@
+pre-commit:
+  jobs:
+    - name: format
+      glob: "*.{js,jsx,ts,tsx,json,jsonc,md,yml,yaml,toml}"
+      run: bunx oxfmt --write {staged_files}
+      stage_fixed: true
+    - name: lint
+      glob: "*.{js,jsx,ts,tsx}"
+      run: bunx oxlint {staged_files}
+
+pre-push:
+  jobs:
+    - name: check
+      run: bun run check

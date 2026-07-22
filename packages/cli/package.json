@@ -1,0 +1,30 @@
+{
+  "name": "@zi/cli",
+  "version": "0.0.0",
+  "private": true,
+  "license": "MIT",
+  "bin": {
+    "zi": "./src/main.ts"
+  },
+  "type": "module",
+  "scripts": {
+    "check": "bun run format:check && bun run lint && bun run typecheck && bun run test",
+    "dev": "bun --hot src/main.ts",
+    "fix": "bun run lint:fix && bun run format",
+    "format": "oxfmt --write .",
+    "format:check": "oxfmt --check .",
+    "lint": "oxlint .",
+    "lint:fix": "oxlint --fix .",
+    "start": "bun src/main.ts",
+    "test": "bun test --pass-with-no-tests",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@zi/coding-agent": "workspace:*",
+    "@zi/tui": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/bun": "catalog:",
+    "typescript": "catalog:"
+  }
+}

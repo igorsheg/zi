@@ -1,245 +1,117 @@
-# zi context
+# Zi
 
-Zi is a Zig coding agent built around the completed gen-3 architecture: one
-interactive owner loop, one runtime, direct function calls between product owners,
-and bounded presentation state. Future work should deepen that shape, not create
-new translation tiers around it.
+Zi is an extensible local coding-agent product. Pi supplies model and agent-loop primitives, Zi owns coding-agent policy, and OpenTUI presents that policy as a terminal application.
 
-`docs/gen3-tui-plan.md` is the architecture record and trap list for the frontend
-migration. Its phase checklist is historical now; its constraints remain useful
-review vocabulary.
+## Language
 
-## Product references
+**Agent core**:
+The lower-level Pi agent loop that streams model output and executes tools. It is a mechanism Zi configures, not the Zi product boundary.
+_Avoid_: Pi coding agent, runtime
 
-**`.references/pi-mono/`** is a behavioral and visual reference. Use it to answer
-"what should this feel like?" Do not copy its layering or framework choices.
+**Agent session**:
+One coding conversation and its policy: active model, session resources, tools, durable history, queueing, compaction, retries, and lifecycle.
+_Avoid_: Chat, agent core
 
-**`docs/gen3-tui-plan.md`** records why gen-1/gen-2 failed: too many in-process
-protocol/view-model layers between the agent and the screen. Use it to reject
-new translation corridors.
+**Session shell**:
+The session-scoped coding-agent owner of shell task identity, foreground/background transitions, subprocess groups, bounded output files and previews, completion, retention, and disposal. Its Bash and task tools are adapters over the same task state. Run interruption stops foreground work; demoted or explicitly backgrounded work survives until completion, explicit kill, timeout, output bounds, or final session disposal.
+_Avoid_: Global process manager, TUI task registry, detached Bash process
 
-**`docs/runtime-zio-capabilities.md`** inventories the zio surface Zi actually
-uses. Use it before changing `src/runtime` or evaluating a zio replacement.
+**Tool result details**:
+The bounded, typed, client-neutral facts a built-in tool returns separately from model-facing content. They describe progress or outcome without requiring a client to parse explanatory prose.
+_Avoid_: UI metadata, rendered result, tool payload
 
-**`docs/tui-performance.md`** defines transcript layout ownership, invalidation,
-work bounds, and the performance tests required for TUI changes.
+**Tool presentation**:
+A bounded, framework-neutral display value derived from one tool invocation's arguments, lifecycle phase, content, and result details. It is never persisted or authoritative; terminal layout and native resources remain TUI-owned.
+_Avoid_: Tool view model, render callback, tool component
 
-## Architecture in one sentence
+**Session resources**:
+The cwd-bound prompt inputs active for one agent session: base and appended system prompts, contextual instruction files, skill descriptors, and prompt templates. Resource discovery finds candidates; the agent session owns the coherent catalog used by its conversation. Terminal themes and extension/package loading are separate capabilities.
+_Avoid_: Core resources, resource registry, frontend resources
 
-`cli` selects a concrete frontend; the frontend owns the driving loop; the loop
-calls `AgentSession` directly; `agent.Agent` emits events; subscribers fold those
-events into durable session state and bounded presentation state; Vaxis paints
-the final cells.
+**Retry sequence**:
+One bounded chain of consecutive transient model failures inside an admitted agent turn or summarization call. `AgentSession` owns classification, attempts, exponential backoff, cancellation, context exclusion, events, and final settlement. Provider/SDK retries remain a separate lower-level policy and default to zero attempts.
+_Avoid_: Request loop, tool retry, overflow recovery
 
-```text
-main.zig
-  -> cli/root.zig
-      -> tui/root.zig + tui/Loop.zig             interactive alt-screen frontend
-      -> frontends/print/print_mode.zig         text/json prompt frontend
-      -> coding_agent/auth_mode.zig             auth commands
+**Retry marker**:
+An append-only session entry recording that one durable assistant failure was admitted for retry. It keeps the failed attempt available to transcript presentation while excluding it from live and resumed provider context, including later compaction input.
+_Avoid_: Deleted error, UI retry row, mutable context flag
 
-coding_agent/session_bootstrap.zig
-  -> AgentSession.zig
-      -> agent.Agent                            provider/tool turn loop
-      -> session_manager.zig                    durable jsonl session log
-      -> tool_registry.zig + tools/*            builtin tools
-      -> settings/auth/resources/path owners
+**Run interruption**:
+A request to stop active provider/tool work while keeping the `AgentSession` reusable. Escape cancellation returns pending queued input to the composer; lower-level interruption may preserve admitted queue work. Neither operation owns terminal teardown.
+_Avoid_: Quit, shutdown, dispose
 
-runtime/*                                      std.Io-first mechanism only
-ai/*                                           provider protocol and models
-tui/*                                          Vaxis terminal product
-```
+**Terminal shutdown**:
+The terminal-run transition that stops input, discards queued work, signals active cancellation, restores OpenTUI immediately, and then awaits bounded settlement. The CLI remains responsible for final session disposal and exit reporting.
+_Avoid_: Abort, component unmount, session disposal
 
-## Ownership language
+**Runtime services**:
+The process-scoped capabilities from which agent sessions are constructed, including models, credentials, settings, filesystem/process access, and persistence.
+_Avoid_: Globals, app context
 
-Use these terms consistently in design notes, reviews, and comments.
+**Agent session runtime**:
+The optional coding-agent owner of one replaceable current `AgentRuntime`. It performs bounded session listing and whole-runtime new/resume transitions, rebuilding cwd-bound services and disposing replaced sessions. Single-session SDK callers do not need it.
+_Avoid_: Session manager, root store, TUI session controller
 
-**Owner**
-The struct or loop allowed to mutate a piece of state and responsible for its
-shutdown/deinit. If you add mutable state, name the owner first.
+**Zi paths**:
+The immutable coding-agent policy value for one effective cwd. It resolves global `$HOME/.zi/agent`, exact project `<cwd>/.zi`, credentials, scoped settings/resources, and cwd-partitioned sessions. A resumed session's stored cwd is admitted before this value and its cwd-bound services are constructed.
+_Avoid_: Path registry, config singleton, ambient cwd
 
-**Bounded policy**
-The explicit behavior at an accumulation point: reject, evict, backpressure,
-spill, or deadline/cancel. "Should stay small" is not a policy.
+**Project file search**:
+The bounded coding-agent operation that enumerates and ranks validated paths beneath one session's immutable `ZiPaths.cwd`. It uses per-query Git or ignore-aware fallback traversal, retains no complete index, and owns cancellation and filesystem/process cleanup.
+_Avoid_: File catalog, TUI filesystem search, workspace index
 
-**Concrete frontend**
-A process-facing adapter that owns a user-visible driving loop. Today:
-`src/tui` for interactive alt-screen and `src/frontends/print` for text/json.
-Concrete frontends may bridge `coding_agent`, `agent`, `ai`, and `runtime`.
+**File-completion context**:
+A boundary-safe textual `@` token containing the cursor. The context can remain valid while its picker is hidden; syntactic eligibility and visible choices are distinct facts.
+_Avoid_: Open picker, file attachment, mention part
 
-**RuntimeServices**
-Cwd-scoped service bundle shared by concrete frontends: cwd, agent dir, settings,
-auth, provider registry, providers, and the host task runtime.
+**Project-file autocomplete**:
+The terminal interaction that scores bounded project file matches through `AgentSession`, presents useful choices in the composer-owned picker, and replaces only the active file-completion context after selection. Accepted text does not read or attach file contents.
+_Avoid_: File attachment, mention part, autocomplete provider registry
 
-**AgentSession**
-One session's policy spine: prompt resources, system prompt, builtin tools,
-durable history, long-lived `agent.Agent`, lifecycle, retry, compaction,
-settings-facing mutations, and private session event state.
+**File-completion dismissal**:
+The user's decision to hide choices for one active `@` token. Editing within that token does not revoke dismissal; ending the token does.
+_Avoid_: Draft clearing, revision-scoped cancellation
 
-**Extension host**
-The optional, supervised Node runtime that executes trusted TypeScript
-extensions and requests actions from Zi owners. It owns no agent, session,
-transcript, settings, or TUI state.
+**Completion range edit**:
+A revisioned one-shot request to replace one display-offset range in the native Composer with an explicit cursor target. It is not a copied draft; OpenTUI remains authoritative for text, markers, selection, and undo.
+_Avoid_: Prompt model, frontend draft state, delete-then-insert
 
-**Extension discovery**
-The bounded selection of global, project-local, and explicit extension modules.
-Global modules are trusted user resources; project modules require the current
-run's project trust decision.
+**Coding-agent parity**:
+Behavioral and architectural compatibility with `pi-coding-agent`, verified capability by capability while keeping the recreated layer owned by Zi.
+_Avoid_: Source identity, dependency parity
 
-**Extension load plan**
-The bounded, immutable set of trusted extension modules selected for one host
-startup or replacement. Discovery canonicalizes and deduplicates modules before
-constructing the plan.
+**Interactive-mode parity**:
+Behavioral compatibility with the interactive mode inside `pi-coding-agent`, including editor actions, keybindings, queues, commands, selectors, session flows, and visible lifecycle semantics. It does not include `pi-tui`, Pi's screen architecture, or Pi's visual design.
+_Avoid_: Pi TUI parity, `pi-tui` parity
 
-**Host generation**
-One initialized extension-host process and its generation-scoped operations.
-Replacement prepares a complete next generation before making it active.
+**State owner**:
+The module, class, store instance, reducer, or cohesive component that holds one mutable state family, owns any resources tied to it, and admits all changes to it.
+_Avoid_: Shared state, mirrored state
 
-**Extension capability**
-One bounded kind of contribution an extension may declare, such as a command,
-tool, setting, workflow interaction, lifecycle observer, or AI adapter. Each
-capability names the Zi owner that validates and applies its requests.
+**Product mode**:
+An application adapter over `AgentSession` for one interaction environment. Interactive mode is terminal-specific; print and RPC modes are non-terminal siblings. Shared policy moves into `AgentSession` or a concrete manager, not into a lowest-common-denominator mode facade.
+_Avoid_: CLI branch, universal frontend mode
 
-**Extension operation**
-One generation-bound invocation of extension code with typed input, bounded
-output, cancellation, a deadline, and one terminal result.
+**Interactive store**:
+The instance-scoped Nano Store owner created by one terminal `InteractiveMode`. It binds the current `AgentSession`, rejects stale events, and owns only terminal state such as transient tool blocks and render revisions. It does not mirror durable session state.
+_Avoid_: Global store, frontend database, coding-agent policy
 
-**Extension setting**
-A declared, namespaced global or project preference persisted by Zi's settings
-owner. It is distinct from extension-owned files and durable session facts.
+**Interactive keybindings**:
+The instance-scoped terminal owner of semantic action IDs, effective key overrides, matching, hints, and conflict metadata. It translates OpenTUI key events into closed prompt/transcript actions but contains no callbacks or session operations.
+_Avoid_: Global keymap, raw product chords in components, command bus
 
-**Extension session fact**
-A declared, namespaced fact persisted in one session through `AgentSession`. It
-is distinct from global/project settings and ephemeral host-generation state.
+**Imperative TUI component**:
+An owner of one OpenTUI renderable subtree and its direct updates. It exposes concrete renderables and explicit disposal; it may compose product presentation but does not decide coding-agent policy.
+_Avoid_: React component, virtual DOM adapter, generic widget framework
 
-**Prompt command**
-A generation-bound extension registration that transforms one slash invocation
-into a bounded user prompt. Zi, not the extension, submits and persists the
-result through the normal session path.
+**Picker stack**:
+The instance-scoped owner of below-composer choice frames, top-frame selection/filtering, and suspended parent filters. It receives filter text from the always-focused composer and never owns an input renderable or domain action callbacks.
+_Avoid_: Selector screen, picker input, dialog stack
 
-**agent.Agent**
-Product-agnostic turn loop. It owns provider streaming, runtime transcript
-context, tool execution, and steering/follow-up queues. It does not know TUI,
-print mode, settings files, or session jsonl.
+**Explicit state machine**:
+Concrete domain states and allowed transitions represented directly in data and owned operations. This describes every stateful behavior at its appropriate scale; it does not imply a statechart library, event bus, or generic tagged-union helper.
+_Avoid_: Flag soup, generic payload protocol
 
-**AgentEvent**
-The in-process event stream from `agent.Agent`. Events are consumed directly by
-subscribers; they are not converted into a second protocol for in-process use.
-
-**Durable session log**
-Append-only jsonl session truth: header, message entries, compaction entries,
-and durable session facts such as model/thinking changes. It is not the screen
-transcript.
-
-**Transcript**
-The bounded TUI render fold owned by `src/tui/Transcript.zig`. It is rebuilt from
-live `AgentEvent`s or restored session entries and exists to render the screen.
-It owns all derived transcript layout caches and the transcript line index.
-It is presentation state, not durable truth.
-
-**Loop**
-The interactive TUI owner in `src/tui/Loop.zig`: input actions, editor, picker
-stack, viewport, run driving, notices, trace counters, and frame composition.
-It calls `AgentSession` directly.
-
-**Screen**
-`src/tui/screen.zig`: cell/line/frame primitives, the Kanso color tokens, and the
-Vaxis paint adapter. It holds no product state.
-
-**Text shimmer**
-`src/tui/text_shimmer.zig`: the only permitted ad-hoc/interpolated RGB color
-exception. It exists solely for the working-status gradient; other UI colors use
-semantic tokens from `screen.zig`.
-
-**Chrome**
-`src/tui/chrome.zig`: composer, picker/completion listbox, status/footer, and
-viewport chrome. It composes already-owned state; it does not drive sessions.
-
-**Blocks**
-`src/tui/blocks.zig`: transcript block rendering, especially tool-call UX. Tool
-visual policy belongs here, with neutral display data coming from `Transcript`.
-
-**Vaxis**
-Vendored terminal mechanism: raw tty, parser, screen/window primitives, borders,
-diff/render, styles, color, and Unicode width. Zi should not duplicate these
-mechanisms locally unless a bounded Vaxis gap is demonstrated.
-
-**Resource path policy**
-All `.zi`, settings, auth, skills, prompt-resource, session, and agent-dir path
-policy belongs in `src/coding_agent/paths.zig`. `ZI_CODING_AGENT_DIR` overrides
-the agent dir.
-
-## Binding relationships
-
-- `main.zig` owns process/runtime setup only, then calls `cli.main`.
-- `cli/` parses flags/modes and dispatches to a concrete frontend or auth.
-- `frontends/print` owns non-interactive prompt execution and process output.
-- `tui` owns the interactive terminal product and may sample concrete
-  `AgentSession` facts directly.
-- `coding_agent` owns product policy shared by frontends: sessions, resources,
-  settings, tools, auth, persistence, extension-host supervision, file
-  completion, slash-command catalog, and bootstrap.
-- `agent` owns the generic provider/tool turn protocol.
-- `ai` owns provider APIs, model catalog, wire adapters, and stream shapes.
-- `runtime` owns mechanism only: tasks, wakes, event pipes, process I/O, and zio
-  adaptation.
-
-## Import shape
-
-```text
-ai            -> std (+ runtime I/O mechanism where needed)
-agent         -> std, ai, runtime
-runtime       -> std publicly; zio private behind src/runtime/zio_backend.zig
-coding_agent  -> std, ai, agent, runtime
-tui           -> std, vaxis, ai, agent, coding_agent, runtime
-frontends     -> std, ai/agent/coding_agent/runtime as concrete adapters need
-cli           -> concrete frontend selection and process policy
-```
-
-Lower layers do not import higher layers. `coding_agent` never imports `tui` or
-`frontends`. `agent` never imports `coding_agent`. `runtime` never imports product
-policy. `vaxis` imports stay inside `src/tui`.
-
-## Gen-3 invariants
-
-1. **No in-process protocol corridor.** Agent-to-screen is a function call and
-   subscriber dispatch, not envelopes, view models, wire protocols, or client
-   protocols.
-2. **One owner per visible fact.** If a fact is displayed, the owner that knows
-   its cause should compose the user-facing copy or display contract.
-3. **One transcript representation.** TUI has one bounded `Transcript`, which
-   also owns its ephemeral derived layout/cache and line-index state. Do not add
-   mirrors with revision taxonomies.
-4. **One wait point.** `Loop.run` waits on input/runtime wake sources with its
-   nearest owned deadline. Producers wake; the owner inspects state.
-5. **Streaming-first.** Assistant text, thinking, tool calls, and tool output are
-   folded live. Backpressure belongs to bounded runtime pipes, not UI throttles.
-6. **Alt-screen is intentional.** Terminal scrollback is not the product history;
-   Zi owns virtual scrollback and export/copy features explicitly.
-7. **Vaxis owns terminal mechanics.** Zi owns product layout and semantics, not
-   ANSI encoders, raw-mode stacks, cell buffers, diff renderers, or width engines.
-8. **Persistence precedes live mutation for durable facts.** Model/thinking/session
-   facts are stored before the live agent state changes.
-9. **Ephemeral sessions are explicit policy.** `--no-session` is a frontend/session
-   bootstrap policy, not an inference from nullable internals.
-10. **Tests use real frontend paths.** E2E tests drive provider resolution through
-    `ZI_ENABLE_FAUX_PROVIDER=1`; do not inject stream callbacks to bypass runtime
-    services.
-
-## Common ambiguities to resolve this way
-
-- **Session history vs transcript**: jsonl is durable truth; `Transcript` is UI
-  presentation state.
-- **Wake vs payload**: a wake carries no data and grants no mutation authority.
-  After waking, inspect the owned state.
-- **Cancel request vs completion**: cancel is intent; owners still drain/settle and
-  observe the terminal outcome before deinit.
-- **Settings vs session facts**: global/project settings are owned by
-  `SettingsManager`; durable per-session facts are owned by `SessionManager` and
-  `AgentSession`.
-- **Picker focus**: the composer is the omni input. Pickers are listbox frames
-  filtered by composer text, not nested modal inputs.
-- **Tool display vs tool execution**: execution belongs to `agent`/tool runners;
-  display policy belongs to TUI `Transcript`/`blocks`.
-- **Behavior reference vs architecture reference**: pi-mono can answer UX parity
-  questions; gen-3 answers ownership and dataflow questions.
+**Transition**:
+An allowed change from one explicit state to another, decided by the state owner separately from the bounded side effect it may start or complete.
+_Avoid_: Setter, incidental effect

@@ -1,282 +1,80 @@
-# zi agent operating guide
+# Zi engineering rules
 
-Read `CONTEXT.md` first for vocabulary and ownership. This file is the working
-checklist for changing Zi without drifting from the completed gen-3 architecture.
+## Product references
 
-## Primary design rule
+- `pi-coding-agent` is the coding-agent behavior **and architecture** reference, and its interactive mode is the TUI product-behavior reference.
+- `pi-ai` and `pi-agent-core` are dependencies; `pi-coding-agent` and `pi-tui` are not.
+- Imperative `@opentui/core` renderables are the terminal architecture; `@opentui/react` and Pi's TUI implementation are not.
+- OpenCode is a source of proven OpenTUI application patterns, not a template to copy wholesale.
 
-**Prefer one bounded, explicit, somewhat complex owner over several
-simple-looking modules connected by synchronization contracts.** Local
-implementation complexity is a good trade when it lowers system complexity and
-makes scaling predictable.
+## Code quality
 
-Complexity must be essential and contained: the owner mutates the state, its
-public API stays small and direct, every accumulation and unit of work is
-bounded, state transitions are explicit, callers do not mirror internals, and
-deterministic tests protect the invariants. Do not split an owner merely to make
-individual files look cleaner; distributed coordination is the more dangerous
-complexity.
+Legibility, local reasoning, and ease of change are the top priorities. Do not emit verbose, defensive AI-slop code.
 
-The default review question for any change is: **does this make the direct
-frontend -> AgentSession -> agent -> Transcript/screen path clearer, smaller, or
-more bounded?** If not, redesign before editing.
+- Write direct code with one obvious control path.
+- Name the owner of mutable state and resource lifetimes.
+- Keep modules deep and interfaces narrow.
+- Prefer concrete types over generic frameworks and option bags.
+- Do not create `shared`, `common`, `utils`, manager-of-managers, command buses, or view-model corridors without concrete repeated pressure.
+- Do not mirror state between layers. Derive cheap values where they are rendered.
+- Do not add defensive branches for states made impossible by the types or owner.
+- Do validate external input, persisted data, provider data, and process boundaries.
+- Bound queues, output, retries, subprocesses, retained UI data, and shutdown waits.
+- Treat interruption, cancellation, shutdown, and disposal as distinct owner transitions. Restore terminal resources before bounded settlement waits; only the layer that created a session disposes it.
+- Derive global `$HOME/.zi/agent` and exact `<cwd>/.zi` configuration through the immutable coding-agent `ZiPaths` owner. Settings, credentials, resources, and persistent session creation consume that cwd-bound value; do not join `.zi` or re-read process cwd inside those owners.
+- Bind terminal product behavior through the instance-scoped semantic keybinding owner. Components may handle native mechanics but do not hard-code product chords; future extension shortcuts join through mode-owned conflict resolution, not mutable global registration.
+- Comments explain invariants, trade-offs, and provenance. They do not narrate syntax or restate types.
+- Avoid boilerplate JSDoc on self-explanatory symbols.
+- Port one Pi capability at a time with its behavior tests and upstream provenance.
+- For capabilities spanning `coding-agent` and a client, preserve owner decomposition: coding-agent owners expose authoritative domain data and operations; the client mode composes those owners and translates client input into closed typed intents; stores own admitted transient workflows; components only render state and report native interaction—never hard-code domain catalogs, parse domain syntax, or dispatch business operations.
+- Keep imperative components cohesive. A deep prompt owner is preferable to many pass-through wrappers.
+- Do not introduce a frontend-wide projection schema until multiple screens need it.
 
-## Start every task
+## State and transition design
 
-1. Read the code that owns the state you intend to change.
-2. Identify the owner allowed to mutate that state.
-3. Identify the bounded policy for every queue, buffer, transcript view, picker,
-   retry, subprocess, tool output, batch, or concurrent task you touch.
-4. Check whether the behavior belongs to TUI, print, `coding_agent`, `agent`,
-   `ai`, or `runtime`. Do not put it in a convenient neighbor.
-5. Preserve unrelated user changes. Never revert files you did not intentionally
-   change.
+Explicit-state, data-oriented design is mandatory for stateful behavior.
 
-## Gen-3 non-negotiables
+- Name the state owner, the concrete states, and the allowed transitions before distributing behavior across methods, hooks, or components.
+- Represent mutually exclusive states as explicit discriminated unions with domain-named fields. Make invalid combinations unrepresentable instead of coordinating boolean flags and optional properties.
+- Write unions directly. Do not hide domain states behind generic tagged-union builders, payload envelopes, class hierarchies, or a state-machine framework.
+- Keep transition rules with the state owner. UI components render state and request operations; effects synchronize owned resources but do not become a second transition system.
+- Separate transition decisions from side effects. Admit an operation from the current state, record the new state, run the bounded effect, then apply its success, failure, or cancellation transition.
+- Handle closed unions exhaustively and use `never` checks. Validate open or external events before they enter the machine.
+- Test transitions and forbidden transitions as behavior. Include races, cancellation, stale completion, and bounds where the owner crosses asynchronous or process boundaries.
+- A boolean is acceptable only for a truly independent binary fact. When combinations acquire meaning, replace the flags with explicit states.
+- Keep one source of truth. Derived render values are not additional state, and mutable state is never mirrored between owners.
+- `AgentSession` is the shared client-independent business boundary. The terminal-specific `InteractiveMode`, OpenTUI renderables, and presentation stores live under `packages/tui/src/interactive/`.
+- Stores are instance-scoped and created by factories. Never export a mutable module-global application store or collect unrelated capabilities into one root state blob.
+- Store writable atoms are private implementation details. Components subscribe and request domain-named operations; they do not call `.set()`.
+- TUI stores may retain an `AgentSession` reference for subscription identity but may not copy messages, model, queues, or other authoritative state. Native textarea and scroll state remain OpenTUI-owned.
+- Below-composer choice flows use the instance-scoped `PickerStack`: `Composer` remains the only input and focus owner; the stack owns frames, selection, suspended parent filters, and top-frame filtering; picker views render only the active frame and never create or edit an input.
+- Coding-agent owners do not depend on frontend state libraries. TUI stores use explicit binding and disposal; use Nano Stores `onMount()` only when a terminal resource lifetime genuinely follows observation.
 
-- No Engine, ViewModel, wire protocol, client protocol, or in-process event
-  translation tier may be reintroduced.
-- No generic frontend framework may be added around `src/tui`. Zi has a concrete
-  TUI product, not a reusable TUI SDK.
-- No duplicate transcript model. `Transcript` is the TUI render fold; session
-  jsonl is durable truth; `agent.Agent` holds runtime context.
-- No opaque ids as local UI discriminators when a typed action or direct function
-  call can be used.
-- No producer-side UI throttles, reveal queues, pacing constants, or extra timing
-  layers. Coalescing belongs to the frame/render policy.
-- No unbounded owner-loop work. If a CPU step can exceed roughly a frame budget,
-  move it behind a bounded runtime task and poll the typed result.
-- No local terminal mechanisms that Vaxis already owns: ANSI encoders, raw-mode
-  stacks, cell buffers, diff renderers, style/color encodings, or width engines.
-- No new dependency without explicit approval. `zio` and `vaxis` are vendored;
-  `zio` stays private behind `src/runtime`.
+See `docs/adr/0004-explicit-state-and-transitions.md`, `docs/adr/0006-instance-scoped-nano-stores-own-tui-state.md`, `docs/adr/0008-composer-owned-picker-stack.md`, `docs/adr/0009-interruption-and-terminal-shutdown.md`, `docs/adr/0010-interactive-mode-owns-keybindings.md`, `docs/adr/0011-zi-path-policy.md`, `docs/adr/0012-agent-session-runtime-owns-replacement.md`, `docs/adr/0015-context-compaction-is-an-append-only-session-transaction.md`, `docs/adr/0016-session-bootstrap-separates-preferences-context-and-durability.md`, and `docs/adr/0017-retry-failures-remain-durable-but-leave-provider-context.md` for the project decisions.
 
-## Layer boundaries
+## TUI hot paths and retained projections
 
-```text
-main.zig       process/runtime setup, then cli.main
-cli            parse flags/modes, select concrete frontend/auth
-ai             provider protocol, models, registry, wire adapters, streams
-agent          generic transcript/tool/provider turn loop
-runtime        std.Io-first mechanism; zio private behind adapters
-coding_agent   sessions, resources, settings, auth, tools, paths, persistence
-frontends      concrete non-interactive adapters such as print mode
-tui            concrete alt-screen terminal product on vaxis
-```
+Terminal performance is an ownership and data-flow property, not a late rendering optimization.
 
-Import rules:
+- Treat native renderable identity, retained node count, subscriptions, scheduled frames, and listeners as owned resources with explicit lifetimes.
+- A TUI projection reads authoritative domain state; it may retain bounded indexes, keys, omission counts, and renderable handles, but never copied message text or a second mutable timeline.
+- Hot-path work must scale with the changed tail or invalidated suffix. Do not scan complete sessions, rebuild unchanged siblings, or recreate roots for streaming text and progress updates.
+- Keep committed renderables stable until explicit reset or bounded eviction. Keep transient renderables keyed and update native properties only when their visible presentation changed.
+- Admit high-frequency presentation work through one semantic notification stream and one renderer-owned pre-layout lifecycle admission per visible frame. Use renderer-installed `requestAnimationFrame` only for work that must observe the following frame's settled layout; do not add polling, timers, or an independent FPS scheduler.
+- Every retained terminal collection and presentation index has a hard bound. Eviction must preserve explicit navigation state, clear native selection before destroying selectable nodes, and anchor detached viewports when layout changes.
+- The owner that creates a renderable, subscription, listener, scheduled callback, or live renderer request releases it. Destroyed or replaced screens must reject stale callbacks.
+- Test performance properties structurally: reconciliation count, stable identity, bounded roots, sibling retention, native assignment avoidance, stale completion, and cleanup. Do not use CI wall-clock thresholds.
+- Add custom framebuffer renderables only after instrumentation proves stable core renderables, bounded projection, reduced assignments, and frame coalescing are insufficient.
+- New asynchronous terminal catalogs and history views load from their presenting feature owner after first draw; the authoritative coding-agent owner provides bounded single-flight operations. Do not introduce a generic query cache or preload inactive screens.
 
-- `ai`: std plus runtime I/O mechanism only when needed.
-- `agent`: std, ai, runtime. Never `coding_agent`, `tui`, or concrete frontends.
-- `runtime`: std only publicly. No product policy. `zio` imports stay private.
-- `coding_agent`: std, ai, agent, runtime. Never `tui` or concrete frontends.
-- `frontends`: concrete adapters may bridge cli/process resources to
-  `coding_agent`, `agent`, `ai`, and `runtime`.
-- `tui`: std, vendored vaxis, ai, agent, coding_agent, runtime. Never imported by
-  lower layers.
+Before adding a new retained row or transient workflow, identify its authoritative source, stable key, invalidation boundary, retention bound, disposal path, and structural tests.
 
-## Where changes belong
+See `docs/tui-performance-implementation-spec.md` and `docs/adr/0013-tool-invocations-keep-one-transcript-identity.md` for the current transcript limits, tool lifecycle, diagnostics, and migration sequence.
 
-### CLI and frontend selection
+## Workspace ownership
 
-Use `src/cli` for argv parsing, mode selection, process-facing errors, and wiring
-concrete frontends. CLI does not own session internals or TUI state.
+- `packages/coding-agent`: `AgentSession`, coding-agent policy, managers, tools, and non-terminal modes such as print/RPC.
+- `packages/tui`: the terminal-specific interactive mode, Nano Stores, and imperative OpenTUI composition.
+- `packages/cli`: argument parsing, mode selection, and process exit reporting only.
 
-### Runtime services and session bootstrap
-
-Use `RuntimeServices` for cwd-scoped services shared by frontends. Use
-`session_bootstrap.OpenSpec` for fresh/resumed/ephemeral session policy. Keep
-session creation complete before passing it to a frontend loop.
-
-### AgentSession
-
-`AgentSession` owns one long-lived `agent.Agent` plus resources, builtin tools,
-persistence, lifecycle, retry, compaction, and session event state.
-
-Rules:
-
-- Frontends drive runs by creating `RunHandle`s, setting wake handles, polling,
-  settling, and deinitializing handles.
-- Persist durable session facts before mutating the live agent.
-- Session replacement builds the next session completely before swapping.
-- Shutdown is two phase: request, drain/observe terminal completion, then deinit.
-- `store == null` is persistence mechanism, not a UI policy flag. Frontends carry
-  explicit persistence intent such as `persist_new_sessions`.
-
-### agent
-
-Use `src/agent` only for product-agnostic provider/tool turn mechanics. It should
-not know settings files, TUI chrome, print formatting, session jsonl names, or
-resource paths.
-
-### Runtime
-
-When touching `src/runtime` or code that uses it:
-
-- Read `docs/runtime-zio-capabilities.md` before changing zio-backed behavior or
-  evaluating a zio replacement.
-- Pass `std.Io` explicitly. Do not add ambient I/O or globals.
-- Wakes are coalesced and payload-free; after waking, inspect owned state.
-- Cancellation is request -> observe completion, not request -> assume stopped.
-- `deinit` must not race worker-visible memory.
-- Name the bounded policy: reject, evict, backpressure, spill, or deadline/cancel.
-- Do not add a generic operation/completion registry unless repeated concrete
-  code proves the owner, bound, and failure mode.
-
-### TUI owner loop
-
-`src/tui/Loop.zig` owns interactive product state: composer, viewport, agent-run
-state, foreground operations, notices, trace counters, and frame composition.
-Mutate it through `Loop.run`, `Loop.step`, `Loop.dispatch`, and explicit owner
-methods.
-
-Rules:
-
-- The composer is the omni input. Pickers filter from composer text and render as
-  listbox frames; they do not take focus through nested modal text fields.
-- ESC cascade stays centralized in the loop.
-- Typed input is foreground work and must remain responsive while streaming.
-- Time enters through the `Loop` iteration deadline and `std.Io` timestamps at
-  owner edges; do not scatter wall-clock reads.
-- Rendering is compose -> paint -> synchronous flush -> clear dirty only after
-  success.
-- `Loop.run` waits over input/runtime wake sources with the nearest owned
-  deadline.
-- The debug watchdog budget is meaningful; do not add exemptions to hide owner
-  loop stalls.
-
-### Transcript and tool UI
-
-`src/tui/Transcript.zig` owns the bounded fold from live/restored events to render
-items plus all derived transcript layout caches and line-index state. `Loop` owns
-viewport policy but only asks `Transcript` for positions and visible lines.
-`src/tui/blocks.zig` owns transcript block rendering and tool-call UX. Follow
-`docs/tui-performance.md` when changing this path.
-
-Rules:
-
-- Tool execution details are converted into neutral display data before rendering.
-- Tool-specific visuals belong in `blocks.zig`, not `screen.zig`, `chrome.zig`, or
-  session persistence.
-- Write/read/bash/edit presentation should be tested as user-visible UX,
-  including streaming args and capped bodies.
-- Coalesce stream fragments before layout/render when ordering allows.
-- Content mutations classify layout invalidation inside `Transcript`; callers do
-  not mutate cache fields or maintain another prefix/line index.
-- Transcript retention is bounded by item/byte caps; eviction must preserve valid
-  viewport anchors.
-
-### Screen, chrome, layout, and colors
-
-- `screen.zig` owns primitive frame/line/span types, Kanso raw tokens, semantic
-  color tokens, and Vaxis painting. It holds zero application state.
-- Text styles should default to transparent/default backgrounds; row surfaces own
-  backgrounds.
-- Shimmer is the only allowed ad-hoc/interpolated RGB color path. Keep that
-  exception contained in `text_shimmer.zig`; all other UI colors use semantic
-  tokens.
-- `chrome.zig` composes composer, picker/completion listbox, status, footer, and
-  viewport hint from already-owned state.
-- `layout.zig` and `markdown.zig` are pure presentation helpers. They should not
-  sample sessions or mutate product state.
-
-### Print frontend
-
-`src/frontends/print` owns non-interactive text/json prompt behavior. It drives
-one `AgentSession.RunHandle`, writes bounded output to supplied writers, honors
-retry/compaction policy, and returns process-ready status. It must not import
-`tui` or share TUI presentation state.
-
-### Tools
-
-Builtin tools live under `src/coding_agent/tools` and are registered through
-`tool_registry.zig`.
-
-Rules:
-
-- Tool definitions include metadata, JSON schema, prompt text, and implementation.
-- The core agent receives borrowed `agent.AgentTool` views.
-- File mutation goes through `FileMutationQueue`.
-- Tool output is bounded and classified by explicit policy.
-- Process tools require timeout and cancellation.
-- Add a new builtin by updating implementation, metadata/registry, prompt text,
-  output policy, transcript display policy, and tests together.
-
-### Paths, resources, settings, auth
-
-- All path policy lives in `src/coding_agent/paths.zig`.
-- Use `.zi`, never `.pi`, for Zi-owned behavior.
-- Do not hardcode agent-dir resource names outside the path owner.
-- `ZI_CODING_AGENT_DIR` overrides the agent dir.
-- Option resolution is explicit -> project -> global -> default. Provider/model
-  are scope-atomic; reject mixed-scope pairs and record a diagnostic.
-
-## Feature design checklist
-
-Before implementing any feature, write down the answers in your own notes or PR:
-
-1. User-visible behavior: what will the user see or be able to do?
-2. Owner: which existing owner mutates the state?
-3. Dataflow: what direct function call or existing event fold carries the fact?
-4. Bounds: what is the cap and what happens at the cap?
-5. Persistence: is it durable jsonl, settings, ephemeral UI state, or runtime
-   context only?
-6. Frontends: does print need behavior too, or is this TUI-only?
-7. Tests: what headless unit test and what pty/e2e or focused integration test
-   prove the behavior?
-
-If the answer requires a new mirror model, protocol envelope, global registry, or
-unbounded queue, stop and redesign.
-
-## Testing expectations
-
-Scale tests to risk and owner boundary:
-
-- Parser/input/editor behavior: same-file unit tests.
-- TUI layout/render/viewport/tool UX: headless `Loop`/`Transcript`/`screen` tests.
-- Terminal behavior, responsiveness, restore, picker flows, and regressions that
-  depend on real tty mechanics: `zig build pty-test`.
-- Print/text/json behavior: print frontend and CLI tests using the env-gated faux
-  provider path.
-- Runtime/tool/process behavior: focused owner tests plus cancellation/timeout
-  coverage.
-
-E2E provider tests must use `ZI_ENABLE_FAUX_PROVIDER=1` and normal provider
-resolution. Do not inject private stream callbacks to bypass `RuntimeServices`.
-
-## Zig workflow
-
-- Use the local Zig 0.16 toolchain and vendored sources as the API source of truth.
-- Pass allocators and `std.Io` explicitly.
-- Use small structs with explicit lifetimes.
-- Prefer state machines over callback control flow.
-- Borrowed slices are valid only for the owner call that returned them.
-- Use `errdefer` for partial initialization.
-- `deinit` releases all owned memory and poisons `self` when practical.
-- Prefer fixed arrays or bounded owned buffers over unbounded lists.
-- Use `std.json.encodeJsonString` or runtime JSON helpers for JSON strings.
-- Validate boundary text with `std.unicode`.
-- Delete dead code completely. No commented-out code, shims, or "just in case".
-- Comments explain why, edge cases, or surprising constraints only.
-
-## Before finishing
-
-For code changes, run:
-
-```sh
-zig build test
-zig build pty-test
-zig build
-zig fmt --check src
-zig fmt --check build.zig
-git diff --check
-```
-
-For docs-only changes, run at least:
-
-```sh
-git diff --check
-```
-
-For focused behavior, also run the narrow command that exercises the changed
-path. Report any gate you did not run.
+Dependencies point `cli -> tui -> coding-agent`, with `cli -> coding-agent` for shared runtime construction and future non-terminal modes. `coding-agent` never imports a frontend. The TUI entrypoint is loaded dynamically so print/JSON modes need not load OpenTUI.
