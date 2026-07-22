@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test"
-import { existsSync, rmSync } from "node:fs"
+import { existsSync, readFileSync, rmSync } from "node:fs"
 import { mkdtemp, readFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -177,12 +177,13 @@ test("bash cancellation kills a SIGTERM-resistant descendant before settling", a
 
   try {
     await waitUntil(() => existsSync(pidPath))
-    pid = Number(await readFile(pidPath, "utf8"))
+    const childPid = Number(await readFile(pidPath, "utf8"))
+    pid = childPid
     controller.abort()
     const result = await execution
     expect(result.content[0]).toMatchObject({ type: "text", text: expect.stringContaining("Command aborted") })
     expect(result.details).toMatchObject({ outcome: "error", finalOutcome: { type: "aborted" } })
-    expect(processRunning(pid)).toBe(false)
+    await waitUntil(() => !processRunning(childPid))
   } finally {
     if (pid && processRunning(pid)) process.kill(pid, "SIGKILL")
     await shell.dispose()
@@ -384,7 +385,7 @@ test("session shell disposal kills background work and removes retained output",
   if (output.type !== "available") throw new Error("Expected retained output")
 
   await shell.dispose()
-  expect(processRunning(pid)).toBe(false)
+  await waitUntil(() => !processRunning(pid))
   expect(existsSync(output.path)).toBe(false)
   rmSync(cwd, { recursive: true, force: true })
 })
@@ -404,6 +405,14 @@ async function waitUntil(condition: () => boolean): Promise<void> {
 }
 
 function processRunning(pid: number): boolean {
+  if (process.platform === "linux") {
+    try {
+      const stat = readFileSync(`/proc/${pid}/stat`, "utf8")
+      const stateOffset = stat.lastIndexOf(")") + 2
+      return stat[stateOffset] !== "Z"
+    } catch {}
+  }
+
   try {
     process.kill(pid, 0)
     return true

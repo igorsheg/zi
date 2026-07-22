@@ -94,7 +94,8 @@ async function verifyZi(executable: string, version: string): Promise<void> {
     new Response(child.stdout).text(),
     new Response(child.stderr).text()
   ])
-  if (exitCode !== 0 || stdout !== `zi ${version}\n` || stderr !== "") {
+  const normalizedStdout = stdout.replaceAll("\r\n", "\n")
+  if (exitCode !== 0 || normalizedStdout !== `zi ${version}\n` || stderr !== "") {
     throw new Error(`Compiled executable failed its version smoke test (exit ${exitCode}): ${stderr || stdout}`)
   }
 }
