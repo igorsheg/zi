@@ -24,6 +24,7 @@ import {
   wrapTailToCells,
   wrapToCells
 } from "../../components/cell-text.js"
+import { createColorRamp } from "../../components/color-ramp.js"
 import { glyphs } from "../../glyphs.js"
 import type { Theme } from "../../theme.js"
 import type { TranscriptItemView } from "./item.js"
@@ -43,6 +44,9 @@ const toolRailTone = {
   failed: "error",
   aborted: "error"
 } as const satisfies Record<ToolStatus, keyof Theme["text"]>
+
+const runningMarkerFrameMs = 100
+const runningMarkerFrames = [0, 1, 2, 3, 4, 3, 2, 1] as const
 
 type LineTone = "output" | "context" | "muted" | "warning" | "success" | "error"
 
@@ -174,9 +178,11 @@ export class ToolCallView implements TranscriptItemView {
     return changed
   }
 
-  refreshElapsed(): boolean {
+  refreshRunning(now: number): boolean {
     if (!this.isRunning) return false
-    return this.#syncTiming()
+    let changed = this.#syncTiming(now)
+    if (this.#header.refreshRunningMarker(now)) changed = true
+    return changed
   }
 
   setExpanded(expanded: boolean): boolean {
@@ -287,18 +293,18 @@ export class ToolCallView implements TranscriptItemView {
     }
   }
 
-  #syncTiming(): boolean {
-    const timing = this.#timingText()
+  #syncTiming(now = performance.now()): boolean {
+    const timing = this.#timingText(now)
     if (timing === this.#timingValue) return false
     this.#timingValue = timing
     return this.#header.setTiming(timing)
   }
 
-  #timingText(): string | undefined {
+  #timingText(now: number): string | undefined {
     if (this.#frame.presentation.timing === "hidden" || this.#startedAt === undefined) return undefined
     const running = this.#endedAt === undefined
     if (!running && !this.#expanded) return undefined
-    const elapsed = `${(((this.#endedAt ?? performance.now()) - this.#startedAt) / 1_000).toFixed(1)}s`
+    const elapsed = `${(((this.#endedAt ?? now) - this.#startedAt) / 1_000).toFixed(1)}s`
     return !running && this.#frame.presentation.timing === "started" ? `started in ${elapsed}` : elapsed
   }
 }
@@ -315,8 +321,10 @@ class ToolHeaderView {
   readonly #delta: TextRenderable
   readonly #status: TextRenderable
   readonly #timing: TextRenderable
+  readonly #runningMarkerColors: ReturnType<typeof createColorRamp>
   #header: ToolHeader
   #toolStatus: ToolStatus
+  #runningMarkerFrame: number | undefined
   #expanded = false
   #timingText: string | undefined
   #width = 76
@@ -326,6 +334,7 @@ class ToolHeaderView {
     this.#toolStatus = status
     this.#theme = theme
     this.#cwd = cwd
+    this.#runningMarkerColors = createColorRamp(theme.text.dim, theme.text.accent, 5)
     this.root = new BoxRenderable(ctx, { flexDirection: "row", flexShrink: 0 })
     this.#bullet = new TextRenderable(ctx, { selectable: false, wrapMode: "none", flexShrink: 0 })
     this.#label = new TextRenderable(ctx, { selectable: false, wrapMode: "none", flexShrink: 0 })
@@ -359,7 +368,17 @@ class ToolHeaderView {
     if (sameHeader(header, this.#header) && status === this.#toolStatus) return false
     this.#header = header
     this.#toolStatus = status
+    if (status !== "running") this.#runningMarkerFrame = undefined
     this.#render()
+    return true
+  }
+
+  refreshRunningMarker(now: number): boolean {
+    if (this.#toolStatus !== "running") return false
+    const frame = Math.floor(now / runningMarkerFrameMs) % runningMarkerFrames.length
+    if (frame === this.#runningMarkerFrame) return false
+    this.#runningMarkerFrame = frame
+    this.#bullet.fg = this.#runningMarkerColors[runningMarkerFrames[frame]!]!
     return true
   }
 
@@ -373,7 +392,7 @@ class ToolHeaderView {
   setTiming(timing: string | undefined): boolean {
     if (timing === this.#timingText) return false
     this.#timingText = timing
-    this.#render()
+    this.#renderContent()
     return true
   }
 
@@ -385,10 +404,21 @@ class ToolHeaderView {
   }
 
   #render(): void {
+    this.#renderMarker()
+    this.#renderContent()
+  }
+
+  #renderMarker(): void {
+    this.#bullet.content = toolGlyph(this.#toolStatus)
+    this.#bullet.fg =
+      this.#runningMarkerFrame === undefined
+        ? statusColor(this.#toolStatus, this.#theme)
+        : this.#runningMarkerColors[runningMarkerFrames[this.#runningMarkerFrame]!]!
+  }
+
+  #renderContent(): void {
     const header = this.#header
     const status = header.status ?? lifecycleStatus(this.#toolStatus)
-    this.#bullet.content = toolGlyph(this.#toolStatus)
-    this.#bullet.fg = statusColor(this.#toolStatus, this.#theme)
     this.#label.content = new StyledText([
       {
         ...fg(this.#theme.text.primary)(`${header.label}${header.subject ? " " : ""}`),

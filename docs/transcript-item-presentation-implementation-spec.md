@@ -29,7 +29,7 @@ This work does not:
 - add per-tool renderer registration or extension-provided native components;
 - add per-row tool focus, expansion state, navigation, or copy commands;
 - group adjacent tool invocations or remove their one-row separation;
-- add a Grok-style animated accent wave, another timer, or another renderer scheduler;
+- animate the open rail, add a completion flash, or add another timer or renderer scheduler;
 - change user-message surfaces, Markdown styling, composer styling, or transcript navigation;
 - change the 200-message, 64-tool, 12-row compact, or 200-row detailed bounds;
 - flatten `AgentSession` messages into a copied frontend timeline.
@@ -236,18 +236,18 @@ Read source, Write source, task output, operational failures, and generic tool b
 
 Glyph shape represents lifecycle only. Detailed density never changes it.
 
-| Lifecycle state | Glyph | Chrome tone | Generic header treatment    |
-| --------------- | ----- | ----------- | --------------------------- |
-| `preparing`     | `◇`   | muted       | current partial facts       |
-| `ready`         | `◇`   | accent      | current `waiting` status    |
-| `running`       | `◈`   | accent      | current elapsed timing      |
-| `done`          | `◆`   | success     | no generic success word     |
-| `failed`        | `◆`   | error       | semantic status or `failed` |
-| `aborted`       | `◆`   | error       | current `aborted` status    |
+| Lifecycle state | Glyph | Chrome tone                                      | Generic header treatment    |
+| --------------- | ----- | ------------------------------------------------ | --------------------------- |
+| `preparing`     | `◇`   | muted                                            | current partial facts       |
+| `ready`         | `◇`   | accent                                           | current `waiting` status    |
+| `running`       | `◈`   | stepped dim-to-accent marker; static accent rail | current elapsed timing      |
+| `done`          | `◆`   | success                                          | no generic success word     |
+| `failed`        | `◆`   | error                                            | semantic status or `failed` |
+| `aborted`       | `◆`   | error                                            | current `aborted` status    |
 
-The marker, every `│`, `├─`, and `╰───` belonging to one invocation use the current lifecycle tone. Keep the existing `ToolHeader.status` precedence and verb-first header language. Do not add generic `done` or `success` prose.
+Every `│`, `├─`, and `╰───` belonging to one invocation uses the current lifecycle tone. Markers do too except while running, when `◈` pulses between the dim and accent endpoints. Keep the existing `ToolHeader.status` precedence and verb-first header language. Do not add generic `done` or `success` prose.
 
-The running rail is static. `◈` and elapsed time provide the active signal. This work adds no animated rail, timer, RAF loop, or renderer live request. The existing transcript-owned elapsed refresh remains the only live request.
+OpenZi adopts the running-marker sample from Grok Build's synchronized bullet-and-rail wave, not its animated rail or completion flash. The marker uses eight discrete phases—`dim → 25% → 50% → 75% → accent → 75% → 50% → 25%`—at one phase per 100 ms. All visible running markers derive their phase from the same transcript-supplied timestamp. The rail remains static accent, terminal states do not flash, and no tool owns a timer, RAF loop, renderer scheduler, or live request. The existing visibility-gated transcript live request drives both timing and marker refresh.
 
 ## Density is not lifecycle
 

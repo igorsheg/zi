@@ -120,7 +120,7 @@ Reject:
 | Mapping typed expected failures to Pi `isError`                             | Agent construction in `createAgentSession()`    |
 | Transient preparing/ready/running/done/failed/aborted state                 | `InteractiveStore`                              |
 | Validation and framework-neutral presentation projection                    | `packages/coding-agent/src/tools/presentation/` |
-| Tool root identity, placement, eviction, and elapsed refresh admission      | `TranscriptView`                                |
+| Tool root identity, placement, eviction, and running refresh admission      | `TranscriptView`                                |
 | Tool header/body/notice renderables and their disposal                      | `ToolCallView` and concrete body views          |
 | Theme, syntax highlighting, path display, links, cell wrapping, selection   | TUI body/header views                           |
 | Durable transcript and restored tool results                                | `AgentSession` / `SessionManager`               |
@@ -479,14 +479,14 @@ interface ToolCallView {
   readonly root: BoxRenderable
   readonly isRunning: boolean
   update(frame: ToolViewFrame): boolean
-  refreshElapsed(): boolean
+  refreshRunning(now: number): boolean
   setExpanded(expanded: boolean): boolean
   setActionHint(hint: string | undefined): boolean
   destroy(): void
 }
 ```
 
-The transcript projection invokes `projectToolPresentation()` only when the source invocation object changes. Elapsed refresh updates only generic lifecycle chrome; it never reserializes arguments, revalidates details, retruncates source data, or rebuilds syntax presentation.
+The transcript projection invokes `projectToolPresentation()` only when the source invocation object changes. Running refresh updates only generic lifecycle chrome: elapsed text and the stepped `◈` marker pulse. It never reserializes arguments, revalidates details, retruncates source data, or rebuilds syntax presentation.
 
 ## Native ownership
 
@@ -618,7 +618,7 @@ Lifecycle chrome is generic:
 | ----------- | --------------------------------------------------- | ------------------------------------------ |
 | `preparing` | arguments still streaming                           | muted hollow glyph and eager placeholder   |
 | `ready`     | complete arguments waiting for sequential execution | accent glyph and `waiting`                 |
-| `running`   | execution admitted                                  | animated-form accent glyph and inline time |
+| `running`   | execution admitted                                  | stepped dim-to-accent `◈` and inline time  |
 | `done`      | successful typed outcome                            | compact success glyph                      |
 | `failed`    | Pi error or typed expected error                    | error glyph, semantic status, bounded peek |
 | `aborted`   | call did not settle because the run was interrupted | error glyph and `aborted`                  |
@@ -703,10 +703,10 @@ The feature branch may proceed in internal commits, but the mergeable result has
 
 ## Slice D — generic native views
 
-- split stable header, body, notice, and elapsed ownership;
+- split stable header, body, notice, and running-refresh ownership;
 - implement terminal/source/diff/text body owners;
 - preserve one tool root, selection cleanup, post-wrap limits, and equal-assignment avoidance;
-- make elapsed refresh independent of projection.
+- make running refresh independent of projection.
 
 ## Slice E — cutover and deletion
 
@@ -749,7 +749,7 @@ Generic primitive tests cover:
 - notice persistence outside body preview;
 - body-kind replacement with selection cleanup;
 - unchanged frame avoiding native assignments;
-- elapsed refresh changing only lifecycle chrome;
+- running refresh changing only lifecycle chrome;
 - destruction releasing every renderable and live request.
 
 ## Transcript tests
@@ -809,7 +809,7 @@ The refactor is complete when:
 - [x] body-kind replacement clears selection before destruction;
 - [x] compact truncation occurs after cell-aware wrapping;
 - [x] detailed bodies retain at most 200 visual rows;
-- [x] elapsed refresh does not reproject tool data;
+- [x] running refresh does not reproject tool data;
 - [x] no tool owns a timer, live request, or polling loop;
 - [x] all replaced display types, helpers, tests, and dual paths are deleted;
 - [x] `bun run check` passes;
@@ -824,7 +824,7 @@ The cutover is not complete while any of these concepts remain:
 - `displayPresentation()` switching on tool display variants;
 - TUI parsing of built-in arguments or details;
 - regex extraction of built-in bracket notices;
-- elapsed refresh that reconstructs tool presentation;
+- running refresh that reconstructs tool presentation;
 - old `createToolBlock`/`createCommandToolBlock` compatibility helpers if no non-test caller remains;
 - tests whose only purpose is preserving the replaced display contract;
 - comments or docs claiming the old union is the accepted boundary.

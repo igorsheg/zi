@@ -393,7 +393,7 @@ test("embedded tool views share one hard transcript projection bound", async () 
   }
 })
 
-test("visible running tools refresh elapsed time from the renderer lifecycle", async () => {
+test("visible running tools refresh their marker and elapsed time from the renderer lifecycle", async () => {
   let now = 1_000
   const nowSpy = spyOn(performance, "now").mockImplementation(() => now)
   const tool: ActiveTool = { id: "elapsed", name: "bash", args: { command: "sleep 30" }, status: "running" }
@@ -401,11 +401,25 @@ test("visible running tools refresh elapsed time from the renderer lifecycle", a
   try {
     await harness.setup.flush()
     expect(harness.setup.captureCharFrame()).toContain("Run sleep 30 · 0.0s")
+    expect(
+      harness.setup
+        .captureSpans()
+        .lines.flatMap(line => line.spans)
+        .find(span => span.text === "◈ ")
+        ?.fg.toInts()
+    ).toEqual([114, 139, 133, 255])
 
     now = 2_300
     await harness.setup.renderOnce()
     expect(harness.setup.captureCharFrame()).toContain("Run sleep 30 · 1.3s")
-    expect(harness.setup.renderer.liveRequestCount).toBeGreaterThan(0)
+    expect(
+      harness.setup
+        .captureSpans()
+        .lines.flatMap(line => line.spans)
+        .find(span => span.text === "◈ ")
+        ?.fg.toInts()
+    ).toEqual([110, 124, 120, 255])
+    expect(harness.setup.renderer.liveRequestCount).toBe(1)
 
     const done: ActiveTool = { ...tool, status: "done", result: { content: [{ type: "text", text: "finished" }] } }
     harness.tools.set(new Map([[done.id, done]]))
@@ -422,12 +436,12 @@ test("visible running tools refresh elapsed time from the renderer lifecycle", a
   }
 })
 
-test("transcript destruction releases a running elapsed live request", async () => {
+test("transcript destruction releases its running-tool live request", async () => {
   const tool: ActiveTool = { id: "elapsed-dispose", name: "bash", args: { command: "sleep 30" }, status: "running" }
   const harness = await createTranscriptHarness([], { tools: new Map([[tool.id, tool]]) })
   try {
     await harness.setup.flush()
-    expect(harness.setup.renderer.liveRequestCount).toBeGreaterThan(0)
+    expect(harness.setup.renderer.liveRequestCount).toBe(1)
     harness.view.destroy()
     expect(harness.setup.renderer.liveRequestCount).toBe(0)
   } finally {

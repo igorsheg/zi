@@ -835,6 +835,52 @@ test("failed Read uses semantic status and one bounded error body", async () => 
   }
 })
 
+test("running marker uses a stepped dim-to-accent pulse while its rail stays static", async () => {
+  const setup = await createTestRenderer({ width: 36, height: 8, useThread: false })
+  const running = presentation({
+    header: { label: "Tool", subject: { type: "text", text: "example" }, details: [] },
+    body: { type: "text", text: "evidence", tone: "normal" },
+    preview: { compact: { type: "head", rows: 12 }, detailed: { type: "head", rows: 200 } },
+    timing: "hidden"
+  })
+  const view = new ToolCallView(setup.renderer, "running-pulse", frame("running", running), defaultTheme, "/work")
+  setup.renderer.root.add(view.root)
+
+  const colorOf = (text: string) =>
+    setup
+      .captureSpans()
+      .lines.flatMap(line => line.spans)
+      .find(span => span.text === text)
+      ?.fg.toInts()
+
+  try {
+    expect(view.refreshRunning(0)).toBe(true)
+    await setup.renderOnce()
+    expect(colorOf("◈ ")).toEqual([106, 110, 108, 255])
+    expect(colorOf("│ ")).toEqual([122, 168, 159, 255])
+
+    expect(view.refreshRunning(99)).toBe(false)
+    expect(view.refreshRunning(100)).toBe(true)
+    await setup.renderOnce()
+    expect(colorOf("◈ ")).toEqual([110, 124, 120, 255])
+
+    expect(view.refreshRunning(400)).toBe(true)
+    await setup.renderOnce()
+    expect(colorOf("◈ ")).toEqual([122, 168, 159, 255])
+
+    expect(view.refreshRunning(800)).toBe(true)
+    await setup.renderOnce()
+    expect(colorOf("◈ ")).toEqual([106, 110, 108, 255])
+
+    expect(view.update(frame("done", running))).toBe(true)
+    await setup.renderOnce()
+    expect(colorOf("◆ ")).toEqual([135, 169, 135, 255])
+  } finally {
+    view.destroy()
+    setup.renderer.destroy()
+  }
+})
+
 test("tool chrome uses lifecycle-only glyphs, tones, and stable transparent rows", async () => {
   const setup = await createTestRenderer({ width: 36, height: 10, useThread: false })
   const makeFrame = (status: ToolViewFrame["status"]) =>
@@ -864,7 +910,8 @@ test("tool chrome uses lifecycle-only glyphs, tones, and stable transparent rows
 
     for (const status of ["preparing", "ready", "running", "done", "failed", "aborted"] as const) {
       if (status !== "preparing") view.update(makeFrame(status))
-      // Lifecycle frames are asserted in transition order.
+      if (status === "running") view.refreshRunning(400)
+      // Lifecycle frames are asserted in transition order; running uses its accent pulse endpoint.
       // oxlint-disable-next-line no-await-in-loop
       await setup.renderOnce()
       expect(view.root).toBe(root)

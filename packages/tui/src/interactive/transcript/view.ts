@@ -187,7 +187,7 @@ export class TranscriptView {
   #pendingNativeRead: PendingNativeRead | undefined
   #transcriptRevision: number
   #toolsExpanded = false
-  #elapsedLive = false
+  #runningLive = false
   #destroyed = false
 
   constructor(
@@ -299,7 +299,7 @@ export class TranscriptView {
     this.#operationGeneration++
     this.#pendingNativeRead = undefined
     this.#dirty = false
-    this.#setElapsedLive(false)
+    this.#setRunningLive(false)
     this.#cancelAnchorFrame()
     for (const release of this.#release.splice(0)) release()
     this.#clearContent()
@@ -324,7 +324,7 @@ export class TranscriptView {
       this.#dirty = false
       this.#syncContent()
     }
-    this.#refreshElapsedTools()
+    this.#refreshRunningTools()
   }
 
   #syncContent(): void {
@@ -814,14 +814,15 @@ export class TranscriptView {
     }
   }
 
-  #refreshElapsedTools(): void {
+  #refreshRunningTools(): void {
     let hasVisibleRunningTool = false
+    const now = performance.now()
     for (const { view } of this.#toolViews.values()) {
       if (!view.isRunning || !this.#isVisible(view.root)) continue
       hasVisibleRunningTool = true
-      view.refreshElapsed()
+      view.refreshRunning(now)
     }
-    this.#setElapsedLive(hasVisibleRunningTool)
+    this.#setRunningLive(hasVisibleRunningTool)
   }
 
   #isVisible(root: Renderable): boolean {
@@ -831,15 +832,15 @@ export class TranscriptView {
     return root.screenY < bottom && root.screenY + root.height > top
   }
 
-  #setElapsedLive(live: boolean): void {
-    if (live === this.#elapsedLive) return
-    this.#elapsedLive = live
+  #setRunningLive(live: boolean): void {
+    if (live === this.#runningLive) return
+    this.#runningLive = live
     if (live) this.#renderer.requestLive()
     else this.#renderer.dropLive()
   }
 
   #clearContent(): void {
-    this.#setElapsedLive(false)
+    this.#setRunningLive(false)
     if (this.#renderer.hasSelection) this.#renderer.clearSelection()
     const children = this.scroll.getChildren()
     for (const child of children) this.scroll.remove(child)

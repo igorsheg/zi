@@ -1,17 +1,9 @@
-import {
-  BoxRenderable,
-  parseColor,
-  RGBA,
-  StyledText,
-  TextRenderable,
-  type CliRenderer,
-  type TextChunk
-} from "@opentui/core"
+import { BoxRenderable, StyledText, TextRenderable, type CliRenderer, type RGBA, type TextChunk } from "@opentui/core"
 
 import type { Color } from "../theme.js"
 import { textWidth } from "./cell-text.js"
+import { createColorRamp } from "./color-ramp.js"
 
-// Shimmer is the sole TUI component that synthesizes colors between semantic theme endpoints.
 const phaseScale = 256
 const maxShimmerGraphemes = 64
 const graphemes = new Intl.Segmenter(undefined, { granularity: "grapheme" })
@@ -59,7 +51,7 @@ export class ShimmerTextView {
   constructor(renderer: CliRenderer, text: string, baseColor: Color, peakColor: Color, now = () => performance.now()) {
     this.#renderer = renderer
     this.#line = segmentLine(text)
-    this.#palette = colorPalette(baseColor, peakColor)
+    this.#palette = createColorRamp(baseColor, peakColor, 256)
     this.#strengths = new Uint8Array(this.#line?.graphemes.length ?? 0)
     this.#now = now
 
@@ -175,27 +167,6 @@ function firstLine(text: string): string {
 function flooredStrength(rawStrength: number, floor: number): number {
   if (rawStrength <= floor) return 0
   return Math.trunc(((rawStrength - floor) * 255) / (255 - floor))
-}
-
-function colorPalette(baseColor: Color, peakColor: Color): readonly RGBA[] {
-  const base = parseColor(baseColor)
-  const peak = parseColor(peakColor)
-  const baseChannels = base.toInts()
-  const peakChannels = peak.toInts()
-  return Array.from({ length: 256 }, (_, strength) => {
-    if (strength === 0) return base
-    if (strength === 255) return peak
-    return RGBA.fromInts(
-      lerpChannel(baseChannels[0], peakChannels[0], strength),
-      lerpChannel(baseChannels[1], peakChannels[1], strength),
-      lerpChannel(baseChannels[2], peakChannels[2], strength),
-      lerpChannel(baseChannels[3], peakChannels[3], strength)
-    )
-  })
-}
-
-function lerpChannel(from: number, to: number, strength: number): number {
-  return Math.max(0, Math.min(from + Math.trunc(((to - from) * strength) / 255), 255))
 }
 
 function styledLine(segments: readonly ShimmerGrapheme[], strengths: Uint8Array, palette: readonly RGBA[]): StyledText {
