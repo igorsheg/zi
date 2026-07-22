@@ -18,8 +18,8 @@ function processHost(): CliHost {
     stdinIsTTY: process.stdin.isTTY,
     stdoutIsTTY: process.stdout.isTTY,
     readStdin: readPipedStdin,
-    writeStdout: chunk => writeOutput(process.stdout, chunk),
-    writeStderr: chunk => writeOutput(process.stderr, chunk),
+    writeStdout: chunk => writeOutput(Bun.stdout, chunk),
+    writeStderr: chunk => writeOutput(Bun.stderr, chunk),
     createRuntime: defaultRuntimeFactory,
     createSessionRuntime: defaultSessionRuntimeFactory,
     async runInteractive(sessionRuntime, initialMessages) {
@@ -53,13 +53,8 @@ async function readPipedStdin(): Promise<string | undefined> {
   return Buffer.concat(chunks, bytes).toString("utf8")
 }
 
-function writeOutput(stream: NodeJS.WriteStream, chunk: string): Promise<void> {
-  return new Promise((resolve, reject) => {
-    stream.write(chunk, error => {
-      if (error) reject(error)
-      else resolve()
-    })
-  })
+async function writeOutput(stream: Bun.BunFile, chunk: string): Promise<void> {
+  await stream.write(chunk)
 }
 
 if (import.meta.main) {
