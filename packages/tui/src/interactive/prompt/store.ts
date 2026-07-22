@@ -190,7 +190,7 @@ class PromptController implements PromptStore {
 
   completePicker(text: string, input: FileCompletionInput): boolean {
     const presentation = this.picker.presentation(text)
-    if (!presentation?.selectedId) return false
+    if (!presentation?.selectedId || presentation.frame.disabled) return false
     if (presentation.frame.id === promptPickerFrameIds.files) {
       return this.#fileCompletion.complete(presentation.selectedId, input)
     }
@@ -211,7 +211,7 @@ class PromptController implements PromptStore {
 
   activatePicker(text: string, input: FileCompletionInput): boolean {
     const presentation = this.picker.presentation(text)
-    if (!presentation?.selectedId) return false
+    if (!presentation?.selectedId || presentation.frame.disabled) return false
 
     const workflow = this.$state.get().workflow
     switch (workflow.type) {

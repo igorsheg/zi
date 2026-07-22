@@ -61,11 +61,17 @@ export class PickerStackView {
     this.#footer.content = presentation.frame.footer ?? ""
     if (footerVisible) available--
 
+    const chromeRows = maxHeight - available
+    const listHeight =
+      presentation.frame.height === undefined
+        ? Math.max(1, Math.min(maxPickerListRows, presentation.rows.length))
+        : Math.max(1, presentation.frame.height - chromeRows)
     this.#list.update({
       scope: presentation.frame.id,
       rows: presentation.rows,
       ...(presentation.selectedId ? { selectedId: presentation.selectedId } : {}),
-      height: Math.min(available, Math.max(1, Math.min(maxPickerListRows, presentation.rows.length))),
+      ...(presentation.frame.disabled ? { disabled: true } : {}),
+      height: Math.min(available, listHeight),
       ...(presentation.frame.emptyText ? { emptyText: presentation.frame.emptyText } : {}),
       theme: this.#theme
     })

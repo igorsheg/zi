@@ -25,6 +25,24 @@ test("PickerList renders rows without owning domain actions", async () => {
     const spans = setup.captureSpans().lines.flatMap(line => line.spans)
     expect(span(spans, "› ").fg.toInts()).toEqual([122, 168, 159, 255])
     expect(span(spans, "First").fg.toInts()).toEqual([197, 201, 199, 255])
+
+    const first = picker.root.getChildren()[0]
+    picker.update({
+      scope: "test",
+      rows: [
+        { id: "first", label: "First", detail: "detail" },
+        { id: "second", label: "Second", metadata: "unavailable" }
+      ],
+      selectedId: "first",
+      disabled: true,
+      height: 4,
+      theme: defaultTheme
+    })
+    await setup.renderOnce()
+    expect(picker.root.getChildren()[0]).toBe(first)
+    expect(frameRows(setup.captureCharFrame(), 4)).toEqual(["  First  detail", "  Second  unavailable", "", ""])
+    const disabledSpans = setup.captureSpans().lines.flatMap(line => line.spans)
+    expect(spanContaining(disabledSpans, "First").fg.toInts()).toEqual([127, 131, 129, 255])
   } finally {
     picker.destroy()
     setup.renderer.destroy()
@@ -165,5 +183,11 @@ function frameRows(frame: string, height: number): string[] {
 function span<T extends { text: string }>(spans: readonly T[], text: string): T {
   const found = spans.find(candidate => candidate.text === text)
   if (!found) throw new Error(`Missing span: ${text}`)
+  return found
+}
+
+function spanContaining<T extends { text: string }>(spans: readonly T[], text: string): T {
+  const found = spans.find(candidate => candidate.text.includes(text))
+  if (!found) throw new Error(`Missing span containing: ${text}`)
   return found
 }

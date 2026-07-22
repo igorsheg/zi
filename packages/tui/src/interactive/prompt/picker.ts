@@ -1,6 +1,6 @@
 import { atom, type ReadableAtom } from "nanostores"
 
-import type { PickerRow } from "../../components/picker-list.js"
+import { maxPickerListRows, type PickerRow } from "../../components/picker-list.js"
 import { fuzzyMatch } from "../fuzzy-match.js"
 
 export const maxPickerDepth = 8
@@ -16,6 +16,10 @@ export interface PickerFrame {
   readonly title: string
   readonly rows: readonly PickerStackRow[]
   readonly filter: "none" | "fuzzy"
+  /** Preferred total rows, including title, hint, or footer chrome. */
+  readonly height?: number
+  /** Retain rows and selection for presentation without admitting interaction. */
+  readonly disabled?: boolean
   readonly selectedId?: string
   readonly hint?: string
   readonly emptyText?: string
@@ -142,6 +146,7 @@ export function createPickerStack(): PickerStack {
     },
     move(filter, direction) {
       updateTop(frame => {
+        if (frame.disabled) return frame
         const rows = filteredRows(frame, filter)
         if (rows.length === 0) return frame
         let selectedIndex = frame.selectedIndex + direction
@@ -165,6 +170,12 @@ export function createPickerStack(): PickerStack {
 }
 
 function validateFrame(frame: PickerFrame): void {
+  if (
+    frame.height !== undefined &&
+    (!Number.isInteger(frame.height) || frame.height < 1 || frame.height > maxPickerListRows)
+  ) {
+    throw new Error(`Picker frame height must be between 1 and ${maxPickerListRows}`)
+  }
   if (frame.rows.length > maxPickerRows) {
     throw new Error(`Picker frames cannot exceed ${maxPickerRows} rows`)
   }
@@ -184,6 +195,8 @@ function pickerFrame(frame: PickerStackFrameState): PickerFrame {
     title: frame.title,
     rows: frame.rows,
     filter: frame.filter,
+    ...(frame.height === undefined ? {} : { height: frame.height }),
+    ...(frame.disabled ? { disabled: true } : {}),
     ...(frame.selectedId ? { selectedId: frame.selectedId } : {}),
     ...(frame.hint ? { hint: frame.hint } : {}),
     ...(frame.emptyText ? { emptyText: frame.emptyText } : {}),

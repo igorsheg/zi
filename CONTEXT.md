@@ -52,9 +52,17 @@ _Avoid_: Path registry, config singleton, ambient cwd
 The bounded coding-agent operation that enumerates and ranks validated paths beneath one session's immutable `OpenZiPaths.cwd`. It uses per-query Git or ignore-aware fallback traversal, retains no complete index, and owns cancellation and filesystem/process cleanup.
 _Avoid_: File catalog, TUI filesystem search, workspace index
 
+**File-completion context**:
+A boundary-safe textual `@` token containing the cursor. The context can remain valid while its picker is hidden; syntactic eligibility and visible choices are distinct facts.
+_Avoid_: Open picker, file attachment, mention part
+
 **Project-file autocomplete**:
-The terminal interaction that parses an active textual `@` token, requests bounded project file matches through `AgentSession`, presents them in the composer-owned picker, and replaces only that token. Accepted text does not read or attach file contents.
+The terminal interaction that scores bounded project file matches through `AgentSession`, presents useful choices in the composer-owned picker, and replaces only the active file-completion context after selection. Accepted text does not read or attach file contents.
 _Avoid_: File attachment, mention part, autocomplete provider registry
+
+**File-completion dismissal**:
+The user's decision to hide choices for one active `@` token. Editing within that token does not revoke dismissal; ending the token does.
+_Avoid_: Draft clearing, revision-scoped cancellation
 
 **Completion range edit**:
 A revisioned one-shot request to replace one display-offset range in the native Composer with an explicit cursor target. It is not a copied draft; OpenTUI remains authoritative for text, markers, selection, and undo.

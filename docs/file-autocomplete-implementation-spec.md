@@ -15,15 +15,16 @@ The implementation must provide:
 1. natural `@` activation at a valid token boundary anywhere in an ordinary composer draft;
 2. recursive project-relative file and directory suggestions rooted at the current session's immutable `OpenZiPaths.cwd`;
 3. deterministic fuzzy ranking of basename and nested-path matches;
-4. the same below-composer picker chrome, retained rows, focus, navigation, completion, and cancellation behavior as the existing `/` command picker;
+4. a preferred seven-row below-composer frame that remains stable while the active query is rescored;
 5. Enter and Tab acceptance, with file termination and directory continuation handled separately;
 6. quoted completion for paths containing spaces or token delimiters;
 7. display-width-correct parsing, replacement ranges, and cursor targets for Unicode drafts and paths;
 8. one native undo step for an accepted completion while preserving unrelated compact-paste and image extmarks;
 9. bounded, cancellable, single-flight filesystem work with no project-wide TUI catalog;
 10. stale-result rejection across rapid typing, cursor movement, cancellation, disposal, and session replacement;
-11. no startup scan, polling loop, file-content read, prompt-part schema, persistence format, or model-context mutation;
-12. behavior and structural tests for parsing, ranking, bounds, races, native identity, undo, extmarks, and cleanup.
+11. quiet exact-file, unmatched-refinement, and token-scoped Escape behavior that lets ordinary prose continue;
+12. no startup scan, polling loop, file-content read, prompt-part schema, persistence format, or model-context mutation;
+13. behavior and structural tests for parsing, ranking, bounds, races, native identity, undo, extmarks, and cleanup.
 
 ## Non-goals
 
@@ -76,6 +77,8 @@ Pi's combined TUI provider:
 - debounces natural attachment completion by 20 ms;
 - aborts an active subprocess when typing continues;
 - serializes requests and validates the complete text and cursor snapshot before applying a result;
+- leaves the previously scored list visible while a replacement request is pending;
+- closes the list when a current request has no suggestions, although editing the same token can trigger it again;
 - records one editor undo snapshot before applying completion.
 
 Keep:
@@ -118,7 +121,8 @@ OpenCode:
 - distinguishes files from directories and lets Tab expand a directory;
 - inserts a structured file part plus a virtual extmark;
 - optionally attaches a line range to the file URL;
-- positions an autocomplete popup around the native textarea.
+- positions an autocomplete popup around the native textarea;
+- hides when the cursor leaves the token or whitespace appears after the trigger, but a later edit inside the same token can reopen it.
 
 Keep:
 
@@ -193,6 +197,7 @@ Grok Build:
 - runs an ignore-aware background tree walk and Nucleo matcher;
 - retains up to 1,000 matched rows from an index containing the walked tree;
 - polls daemon results while the file picker may be active;
+- renders the dropdown only while the context has non-empty results;
 - distinguishes file acceptance from directory drill-down;
 - groups accepted replacement into one undo operation;
 - turns accepted files into atomic prompt elements;
@@ -219,6 +224,8 @@ Reject:
 - atomic file elements and submission-time file reads;
 - ACP, actor, dashboard, and remote-workspace ownership.
 
+Pi, OpenCode, and Grok all keep a manually typed exact path eligible until selection or a token delimiter, and all can reacquire an escaped token after another edit. OpenZi deliberately departs from that behavior because its accepted representation remains ordinary text rather than an atomic reference: an exact unquoted file already names its target, and Escape is a decision about the token rather than one draft revision.
+
 Grok's provider-boundary expansion is a distinct attachment feature. Importing it into autocomplete would make typing a path silently change model context and persistence semantics without an admitted file-content owner.
 
 ## Decision matrix
@@ -240,9 +247,9 @@ Grok's provider-boundary expansion is a distinct attachment feature. Importing i
 
 # 2. Canonical language
 
-**Project-file autocomplete** is the terminal interaction that recognizes an active `@` token, asks the current `AgentSession` for bounded project-relative path matches, presents those matches in the existing picker, and replaces only that token after selection.
+**Project-file autocomplete** is the terminal interaction that scores bounded project-relative path matches for a file-completion context, presents useful choices in the existing picker, and replaces only that token after selection.
 
-**File-completion context** is the parsed active token: trigger start, full token end, current cursor offset, decoded project-relative query, and quoted state. Its offsets use OpenTUI display-width units, including one unit for a newline.
+**File-completion context** is the parsed active token: trigger start, full token end, current cursor offset, decoded project-relative query, and quoted state. Its offsets use OpenTUI display-width units, including one unit for a newline. A valid context does not imply that a picker is visible.
 
 **Project file match** is a validated project-relative path plus its `file | directory` kind. It contains no file contents, stat payload, renderable, callback, or provider part.
 
@@ -254,7 +261,11 @@ Grok's provider-boundary expansion is a distinct attachment feature. Importing i
 
 **Directory continuation** replaces the active token with a complete directory reference ending in `/`, leaves the cursor in the path, and allows a new query to begin immediately.
 
-**Dismissal** closes project-file autocomplete for the current trigger and unchanged draft revision. It does not delete or replace composer text.
+**Dismissal** records the user's decision to hide project-file autocomplete for the lifetime of the current trigger token. Edits and cursor movement within that token do not revoke it; ending the token does. Dismissal does not delete or replace composer text.
+
+**Quiet exact file** is a current unquoted query whose complete token exactly equals a returned file path. Its picker is hidden because the ordinary text already names one file.
+
+**Quiet unmatched query** is a current query with no matches. Its picker is hidden only while the next query is an append-only refinement in both raw token text and canonical matcher text. Backspacing always searches again, even when removing `/` leaves the canonical matcher unchanged, because raw slash state affects exact-directory inclusion. Rewriting or crossing a normalization boundary also searches again.
 
 **Incomplete search** is a successful search whose configured scan, byte, directory, depth, or duration bound stopped enumeration before the source was exhausted. It is not an unbounded best-effort result.
 
@@ -272,13 +283,13 @@ Autocomplete is eligible only when:
 
 It remains available while the agent is streaming because ordinary prompt input can become steering or follow-up input. Search is read-only and does not interact with provider activity.
 
-The empty token `@` is valid and returns shallow project entries. Typing continues to replace the active request rather than stacking work.
+The empty token `@` is valid and returns shallow project entries. Debounce and initial search do not open a loading frame; the picker becomes visible only after a current query returns useful rows. Typing continues to replace the active request rather than stacking work.
 
 ## Token boundary
 
 An `@` starts a candidate token when it is at the start of the draft or its preceding Unicode character is not a letter, number, or underscore. This rejects `user@example.com` and `name_@value` while allowing prose punctuation such as `(@src/file.ts)`.
 
-For an unquoted token, whitespace, comma, or semicolon ends the full token. Newline is whitespace. The parser finds the rightmost eligible `@` at or before the cursor and requires the cursor to remain within that token.
+For an unquoted token, whitespace, comma, or semicolon ends the full token. Newline is whitespace. The parser finds the rightmost eligible `@` at or before the cursor, rejects any delimiter between that trigger and the cursor, and requires the cursor to remain within the token. Delimiter text is never admitted as an unquoted search query.
 
 For a quoted token beginning `@"`, spaces, commas, and semicolons are ordinary path characters until the closing quote. Completion remains active only while the cursor is before the closing quote. A manually typed closing quote therefore dismisses completion unless a directory completion deliberately places the cursor before it.
 
@@ -339,7 +350,7 @@ For a file:
 - if the token is at end of input, append one space and place the cursor after it;
 - if one horizontal space or tab already follows the token, do not duplicate it and place the cursor after that separator;
 - if newline, comma, or semicolon follows, preserve it and place the cursor immediately after the reference;
-- dismiss autocomplete.
+- dismiss autocomplete for the completed file token.
 
 For a directory:
 
@@ -348,15 +359,17 @@ For a directory:
 - for an unquoted result, place the cursor after `/`;
 - for a quoted result, emit `@"path/"` and place the cursor immediately before the closing quote;
 - do not append a prose separator;
-- close the stale frame and immediately admit a new query from the resulting context.
+- keep the current rows visible but non-actionable until the resulting child query installs its scored rows.
 
-When the query already ends in `/`, the exact directory named by that query is excluded from results. Directory continuation must make progress into descendants rather than repeatedly offering a no-op selection.
+When the raw query ends in `/`, the exact directory named by its canonical matcher query is excluded from results. Repeated separators and leading `./` segments do not bypass that exclusion: `empty/`, `empty//`, and `././empty/` all omit the `empty` directory itself. Directory continuation must make progress into descendants rather than repeatedly offering a no-op selection.
 
-## Cancellation and no matches
+## Picker visibility, cancellation, and no matches
 
-Escape closes a file frame and leaves the exact draft, cursor, markers, and selection unchanged. The same trigger stays dismissed while the draft revision and trigger start are unchanged. Moving away and back to that trigger does not immediately reopen it; editing the draft or moving to a different valid trigger does.
+A valid file-completion context and a visible picker are separate facts. Initial debounce/search remains invisible. Once rows are visible, changed queries retain those scored rows until the current result replaces them atomically; the controller marks retained rows disabled, removes their selection accent, prevents navigation, and rejects activation. Selection follows the same row ID when it survives rescoring and otherwise resets to the first current row.
 
-A successful empty result closes the file frame. OpenZi does not retain stale rows and does not render an empty loading panel. The typed `@query` remains ordinary text.
+Escape closes a file frame and leaves the exact draft, cursor, markers, and selection unchanged. The same trigger stays dismissed while the cursor and edits remain within that token. Ending the token with whitespace, comma, semicolon, deletion, or a changed draft outside the context releases dismissal; a later trigger can open normally.
+
+A successful empty result closes the frame. Refinements that append to both the raw query and its canonical matcher query start no redundant search. Backspacing—including `empty/` to `empty`—rewriting, or canonicalization that removes/reinterprets matcher text admits search again. A current exact unquoted file path at the end of its token also closes the frame without editing the draft. Exact directories remain visible for drill-down, while quoted references close naturally when their closing quote ends the context. The typed `@query` always remains ordinary text.
 
 Filesystem failures are silent optional-completion failures unless they violate an OpenZi invariant. They close the frame without modifying the draft. Cancellation and stale completion never produce prompt feedback.
 
@@ -544,7 +557,7 @@ Tests must characterize admission counts, kill/close calls, retained result coun
 
 ## Ranking
 
-Normalize query and candidate paths to `/` and lowercase only for comparison. Preserve the original validated path for display and insertion.
+Normalize query and candidate paths to `/` and lowercase only for comparison, stripping repeated leading `./` segments and matcher-only trailing slashes. The normalizer is idempotent and produces the same matcher text whether called on raw client input or the already validated query admitted by `ProjectFileSearch`. Preserve the original validated path for display and insertion. Coding-agent exposes this exact normalization so the TUI can require both raw and matcher append direction without duplicating ranking policy.
 
 Ranking precedence is:
 
@@ -648,43 +661,58 @@ type FileCompletionState =
       readonly previousSettled: Promise<void>
     }
   | { readonly type: "showing"; readonly request: PendingFileCompletion; readonly result: ProjectFileSearchResult }
+  | { readonly type: "continuing"; readonly request: PendingFileCompletion }
   | {
       readonly type: "dismissed"
+      readonly session: AgentSession
       readonly draftRevision: number
       readonly triggerStart: number
-      readonly acceptsPreviousRevision: boolean
     }
+  | {
+      readonly type: "accepted"
+      readonly session: AgentSession
+      readonly draftRevision: number
+      readonly triggerStart: number
+    }
+  | { readonly type: "exact"; readonly request: PendingFileCompletion }
+  | { readonly type: "unmatched"; readonly request: PendingFileCompletion }
   | { readonly type: "disposed" }
 ```
 
 `fileCompletionDebounceMs` is 20, following Pi. The timer belongs to the controller, is not a render scheduler, and is cleared on every transition that no longer needs it.
 
-The state retains only one parsed query and at most 20 matches. It never retains full draft text, all scanned paths, a queue of every typed query, or a second selected index. Selection remains `PickerStack` state.
+The state retains only one parsed query and at most 20 matches. `exact` and `unmatched` are quiet context states, `dismissed` is token-scoped user suppression, `accepted` rejects the native cursor/content notifications caused by one file range edit, and `continuing` keeps disabled parent rows visible until a directory range edit starts its child query. It never retains full draft text, all scanned paths, a queue of every typed query, or a second selected index. Selection remains `PickerStack` state.
 
 ## Transition table
 
-| Current        | Input/outcome                     | Next               | Side effect                                                             |
-| -------------- | --------------------------------- | ------------------ | ----------------------------------------------------------------------- |
-| `closed`       | valid context                     | `waiting`          | arm 20 ms debounce                                                      |
-| `waiting`      | same context                      | unchanged          | none                                                                    |
-| `waiting`      | newer valid context               | `waiting` latest   | replace timer and pending request                                       |
-| `waiting`      | timer fires                       | `searching`        | call current session search                                             |
-| `waiting`      | context closes/workflow changes   | `closed`           | clear timer                                                             |
-| `searching`    | same context                      | unchanged          | none                                                                    |
-| `searching`    | newer valid context               | `switching`        | abort active, debounce latest, await active settlement                  |
-| `switching`    | newer valid context               | `switching` latest | replace timer; retain one previous settlement                           |
-| `switching`    | timer and previous settle         | `searching`        | start latest search                                                     |
-| `searching`    | non-empty current success         | `showing`          | open file frame                                                         |
-| `searching`    | empty current success             | `closed`           | close file frame                                                        |
-| `searching`    | current failure                   | `closed`           | close file frame                                                        |
-| `showing`      | same context                      | unchanged          | preserve selection                                                      |
-| `showing`      | changed valid context             | `waiting`          | close stale frame; debounce new query                                   |
-| `showing`      | accepted file                     | `dismissed`        | close frame; emit range edit; suppress its cursor/content notifications |
-| `showing`      | accepted directory                | `closed`           | close frame; emit range edit; resulting content starts next query       |
-| `showing`      | Escape                            | `dismissed`        | close frame, preserve input                                             |
-| `dismissed`    | same revision and trigger         | unchanged          | remain closed                                                           |
-| `dismissed`    | edited draft or different trigger | `waiting`          | admit new context                                                       |
-| any live state | session replacement/dispose       | `disposed`         | clear timer, abort request, close owned frame                           |
+| Current                | Input/outcome                                | Next               | Side effect                                                             |
+| ---------------------- | -------------------------------------------- | ------------------ | ----------------------------------------------------------------------- |
+| `closed`               | valid context                                | `waiting`          | arm 20 ms debounce; keep picker closed                                  |
+| `waiting`              | same context                                 | unchanged          | none                                                                    |
+| `waiting`              | newer valid context                          | `waiting` latest   | replace timer and pending request                                       |
+| `waiting`              | timer fires                                  | `searching`        | call current session search                                             |
+| `waiting`              | context closes/workflow changes              | `closed`           | clear timer                                                             |
+| `searching`            | same context                                 | unchanged          | none                                                                    |
+| `searching`            | newer valid context                          | `switching`        | abort active; debounce latest; retain any visible rows                  |
+| `switching`            | newer valid context                          | `switching` latest | replace timer; retain one previous settlement                           |
+| `switching`            | timer and previous settle                    | `searching`        | start latest search                                                     |
+| `searching`            | useful current success                       | `showing`          | atomically install rows; preserve selected row ID when present          |
+| `searching`            | exact unquoted file at token end             | `exact`            | close file frame without editing text                                   |
+| `searching`            | empty current success                        | `unmatched`        | close file frame                                                        |
+| `searching`            | current failure                              | `closed`           | close file frame                                                        |
+| `showing`              | same context                                 | unchanged          | preserve selection                                                      |
+| `showing`              | changed valid context                        | `waiting`          | visibly disable retained rows; debounce new query                       |
+| `showing`              | accepted file                                | `accepted`         | close frame; emit range edit; suppress its cursor/content notifications |
+| `showing`              | accepted directory                           | `continuing`       | disable retained rows; emit range edit; resulting content starts query  |
+| `continuing`           | resulting directory context                  | `waiting`          | retain disabled rows; debounce child query                              |
+| any visible file state | Escape                                       | `dismissed`        | clear timer or abort search; close frame; preserve input                |
+| `dismissed`            | same trigger token                           | `dismissed` latest | remain closed across edits and cursor movement                          |
+| `dismissed`            | token ends or a different trigger activates  | `closed`/`waiting` | release suppression or admit the different context                      |
+| `exact`                | same exact query                             | `exact` latest     | remain closed                                                           |
+| `exact`                | changed query                                | `waiting`          | debounce changed context                                                |
+| `unmatched`            | raw and canonical append-only refinement     | `unmatched` latest | remain closed; start no redundant search                                |
+| `unmatched`            | backspaced, rewritten, or renormalized query | `waiting`          | debounce changed context                                                |
+| any live state         | session replacement/dispose                  | `disposed`         | clear timer, abort request, close owned frame                           |
 
 Every async completion validates:
 
@@ -725,9 +753,12 @@ The frame uses:
   id: promptPickerFrameIds.files,
   title: "",
   filter: "none",
+  height: 7,
   rows: /* ranked project matches */
 }
 ```
+
+`height` is the preferred total frame height, not a guaranteed result-row count. `PickerStackView` gives rows remaining after optional title, hint, and footer chrome to the list. A normal file frame therefore shows up to seven results, while a truncation footer leaves six result rows inside the same seven-row outer geometry. Debounce, initial loading, exact, and unmatched states own no frame.
 
 Rows use the same existing `PickerList` grammar as slash commands:
 
@@ -743,7 +774,7 @@ A truncated result adds the muted footer:
 Search limited; refine @query
 ```
 
-The frame contains at most 20 rows. `PickerList` continues to retain at most ten visible native row roots and uses its existing selected/unselected glyphs, centered window, composer surface, and clipping behavior.
+The frame contains at most 20 rows. The file list displays at most seven at once—or six beside the truncation footer—and centers its moving selection inside that stable outer frame; `PickerList` keeps its generic ten-row hard bound and existing glyphs, composer surface, and clipping behavior. Rescoring retains the current frame with `disabled: true` until replacement rows are ready, dims every retained row, and carries the selected row ID forward when that candidate survives.
 
 The entire relative path remains visible as the primary value rather than Pi's basename-plus-description split. This matches OpenZi's existing `/command` row contract and makes the inserted value unambiguous.
 
@@ -774,7 +805,7 @@ While idle:
 - command frame: existing Tab completion;
 - file frame: the same file completion used by Enter.
 
-`backPicker()` gains a file-frame branch parallel to the existing command-frame branch. It calls controller dismissal and closes the picker without `#requestInput("")`. The generic nested-picker back path must never clear an ordinary `@` draft.
+`backPicker()` gains a file-frame branch parallel to the existing command-frame branch. It calls controller dismissal and closes the picker without `#requestInput("")`. Dismissal remains attached to that token across edits until the context ends. The generic nested-picker back path must never clear an ordinary `@` draft.
 
 ## Key precedence
 
@@ -961,10 +992,12 @@ Project-file autocomplete is an input hot path. The following structural propert
 - at most one TUI debounce timer;
 - at most one active and one latest pending TUI request;
 - at most 20 retained matches;
-- at most ten visible picker row renderables;
+- at most seven visible file row renderables, or six with footer chrome, within `PickerList`'s generic ten-row bound;
+- stable file-frame and list-root identity while visible results are rescored;
 - stable visible row identity for navigation within one result frame;
-- file frame replacement resets scope identity when the query result changes;
-- stale frames close before a new query becomes selectable;
+- old scored rows remain visible but cannot activate while a newer query is pending;
+- no loading or empty frame;
+- raw-and-canonical append-only refinements of a current unmatched query start no redundant traversal;
 - no per-frame polling, animation tick, independent FPS scheduler, or anchor-position interval;
 - no full draft copy in controller or store state;
 - no filesystem work in `PickerStackView`, `PickerList`, or `Composer`;
@@ -1007,7 +1040,7 @@ Add `packages/coding-agent/test/project-file-search.test.ts` covering:
 3. standard Git ignores and hard `.git` exclusion;
 4. non-Git fallback with root and nested `.gitignore` files;
 5. hidden non-ignored paths;
-6. root and derived directory candidates;
+6. root and derived directory candidates plus canonical exact-directory exclusion for repeated slashes and `./` prefixes;
 7. deep nested fuzzy queries and ordered segment matching;
 8. exact, basename-prefix, fuzzy, depth, directory, and lexical ranking;
 9. deterministic empty-query results;
@@ -1027,7 +1060,7 @@ Tests assert structural counts and owner cleanup. They do not benchmark wall-clo
 
 Add `packages/tui/test/file-completion.test.ts` covering:
 
-1. start-of-draft and punctuation boundaries;
+1. start-of-draft and punctuation boundaries, including delimiters before the cursor;
 2. email and underscore rejection;
 3. multiple `@` tokens and rightmost-context selection;
 4. multiline token termination;
@@ -1037,13 +1070,16 @@ Add `packages/tui/test/file-completion.test.ts` covering:
 8. Unicode text before the token and Unicode candidate paths;
 9. quoted closing-quote deduplication;
 10. file separator insertion/reuse around end, space, tab, newline, comma, and semicolon;
-11. directory continuation with quoted cursor placement;
+11. directory continuation with quoted cursor placement and disabled-row retention;
 12. candidate ID membership validation;
 13. debounce replacement and one-latest-pending bound;
 14. stale success, stale failure, cancellation, and session identity;
-15. dismissal until edit or a different trigger;
-16. empty/error closure without draft mutation;
-17. disposal clearing timers and requests.
+15. token-scoped Escape dismissal across edits and cursor movement;
+16. exact-file quieting while exact directories remain available;
+17. empty-result closure, raw-and-canonical append suppression, slash backspace, and normalization re-search;
+18. old-row retention, visible disabled state, attempted stale activation, atomic replacement, and selected-ID preservation;
+19. error closure without draft mutation;
+20. disposal clearing timers and requests.
 
 Use a small fake `AgentSession` search boundary and real `PickerStack`; do not instantiate OpenTUI for pure controller transitions.
 
@@ -1072,18 +1108,18 @@ These tests use real `@opentui/core/testing` and native undo/redo.
 
 Add `packages/tui/test/interactive/file-autocomplete.test.ts` covering:
 
-1. typing `@` loads after input admission and opens `picker-stack` with no second textarea;
-2. rows use the same glyphs, colors, surface, height bound, and focus behavior as `/` completion;
+1. typing `@` starts input admission without a loading frame and opens `picker-stack` only when rows arrive;
+2. rows use the same glyphs, colors, surface, preferred seven-row outer frame, and focus behavior as `/` completion;
 3. nested file and directory display;
 4. wrapped Up/Down navigation;
 5. Enter file acceptance without prompt submission;
 6. Tab file acceptance;
-7. directory acceptance and immediate child query;
-8. Escape preserving exact text and cursor;
+7. directory acceptance retaining its outer frame through the immediate child query;
+8. Escape preserving exact text and cursor and remaining dismissed while that token is edited;
 9. picker priority over history, submit, newline, clear, and interruption;
 10. Left/Right cursor movement closing or changing context;
-11. rapid typing rejecting stale rows;
-12. no-match closure;
+11. rapid typing retaining old rows, rejecting their activation, and atomically installing current rows;
+12. exact-file and no-match closure;
 13. truncation footer;
 14. completion beside compact paste and image markers;
 15. steering/follow-up availability while streaming;
@@ -1229,9 +1265,9 @@ Rejected. OpenCode and Grok prove indexing can be fast, but their retained catal
 
 Rejected. It delays first draw and loads an inactive catalog. Search starts only after a valid `@` context, in line with the TUI performance specification.
 
-## Keep old rows visible while the next query loads
+## Replace old rows with a loading or empty frame
 
-Rejected. OpenCode uses this to reduce flicker, but a stale row can be activated against a newer token. OpenZi closes the stale frame, retains no selectable stale result, and reopens only after current completion.
+Rejected. The interaction is a scoring surface, not a progress panel. Replacing rows on each keystroke causes visible result/loading flicker even when total geometry is fixed. OpenZi keeps old scored rows mounted but visibly dimmed and disabled while the controller rejects their activation, atomically installs only a current result, and hides the frame when no useful rows exist.
 
 ## Use `deleteRange()` then `insertText()`
 
@@ -1272,7 +1308,7 @@ The feature is complete only when:
 - [x] repeated completion exceeds 255 operations without registry failure;
 - [x] file rows render through the existing `PickerStackView` and `PickerList`;
 - [x] no second input, popup anchor, polling loop, or new keybinding catalog exists;
-- [x] rapid typing, Escape, empty results, errors, replacement, and disposal reject stale work;
+- [x] rapid typing retains stable rows while Escape, exact files, empty results, errors, replacement, and disposal reject stale work;
 - [x] submission remains ordinary text with no implicit file read or attachment;
 - [x] coding-agent, pure transition, Composer, and real OpenTUI tests are green;
 - [x] architecture, ADR, and parity documentation record the owner split and intentional deviations.

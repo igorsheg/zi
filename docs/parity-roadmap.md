@@ -53,7 +53,7 @@ The target is coding-agent architecture parity and observable product-behavior p
 - [x] Print and JSON modes sharing the same `AgentSession`
 - [x] Authentication commands and composer-owned provider flows
 
-`@` project-file autocomplete is implemented from [`docs/file-autocomplete-implementation-spec.md`](file-autocomplete-implementation-spec.md). OpenZi preserves Pi's textual completion behavior while moving bounded Git/fallback search into coding-agent, restricting scope to the exact project cwd, and keeping accepted references ordinary prompt text.
+`@` project-file autocomplete is implemented from [`docs/file-autocomplete-implementation-spec.md`](file-autocomplete-implementation-spec.md). OpenZi preserves Pi's textual completion behavior while moving bounded Git/fallback search into coding-agent, restricting scope to the exact project cwd, and keeping accepted references ordinary prompt text. Unlike Pi's editor, exact file text and unmatched refinements become quiet, Escape suppresses the whole token, and visible results remain stable while a changed query is rescored.
 
 Context accounting and compaction are implemented from [`docs/context-compaction-implementation-spec.md`](context-compaction-implementation-spec.md) and accepted in [ADR 0015](adr/0015-context-compaction-is-an-append-only-session-transaction.md). The implementation keeps Pi's append-only, tail-preserving behavior while adopting Grok Build's provider-boundary accounting, validation, and bounded failure lessons.
 
@@ -86,7 +86,7 @@ Pi's optional `grep`, `find`, and `ls` implementations are deliberately deferred
 
 - `packages/coding-agent/test/project-file-search.test.ts` fixes exact `OpenZiPaths.cwd` rooting, Git tracked/untracked and standard-ignore behavior, directory-scoped nested ignore semantics, conservative unreadable/oversized-ignore truncation, hidden entries, directory-symlink non-traversal, nested ranking, validation, cancellation, single flight, and disposal.
 - `packages/tui/test/file-completion.test.ts` fixes bounded native-cursor token parsing, email and out-of-project rejection, full-token ranges, quoting, file/directory formatting, debounce, latest-query collapse, post-acceptance dismissal, stale work, and bounded picker projection. `packages/tui/test/composer.test.ts` fixes one-step native undo/redo, prior history, marker identity and offset preservation, overlap refusal, and more than 255 owned replacements without registry growth.
-- `packages/tui/test/interactive/file-autocomplete.test.ts` drives directory continuation, file acceptance, Enter/Tab/Escape, persistent focus, and ordinary-text submission through the real OpenTUI composer and coding-agent search boundary.
+- `packages/tui/test/interactive/file-autocomplete.test.ts` drives stable rescoring, exact-file quieting, token-scoped Escape, directory continuation, file acceptance, persistent focus, and ordinary-text submission through the real OpenTUI composer and coding-agent search boundary.
 - OpenZi deliberately differs from Pi by owning search in coding-agent, admitting only project-relative paths under the immutable session cwd, using Git plus a bounded fallback walk rather than managed `fd`, not traversing directory symlinks, and never reading completed files implicitly.
 
 ### P1 authentication evidence

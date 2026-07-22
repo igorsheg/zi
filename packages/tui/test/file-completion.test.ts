@@ -30,6 +30,9 @@ test("file context parsing recognizes boundaries, the rightmost token, and compl
   expect(parseFileCompletionContext("user@example.com", promptTextWidth("user@example"))).toBeUndefined()
   expect(parseFileCompletionContext("name_@value", promptTextWidth("name_@val"))).toBeUndefined()
   expect(parseFileCompletionContext("(@src", promptTextWidth("(@src"))).toMatchObject({ query: "src" })
+  for (const terminated of ["@src ", "@src,", "@src;"]) {
+    expect(parseFileCompletionContext(terminated, promptTextWidth(terminated))).toBeUndefined()
+  }
 })
 
 test("quoted parsing uses display offsets and owns one manually typed closing quote", () => {
@@ -87,13 +90,14 @@ test("file controller debounces, opens the existing picker, and emits one select
   const controller = new FileCompletionController(picker, edit => edits.push(edit))
 
   controller.update(session, 1, fileCompletionInputFromText("review @sr", promptTextWidth("review @sr")))
+  expect(picker.presentation("")).toBeUndefined()
   await Bun.sleep(25)
   expect(session.calls.map(call => call.query)).toEqual(["sr"])
   session.calls[0]!.resolve({ matches: [{ path: "src/index.ts", type: "file" }], truncated: false })
   await Bun.sleep(0)
 
   const presentation = picker.presentation("review @sr")
-  expect(presentation?.frame.id).toBe("files")
+  expect(presentation?.frame).toMatchObject({ id: "files", height: 7 })
   const selectedId = fileCompletionCandidateId({ path: "src/index.ts", type: "file" })
   expect(
     controller.complete(selectedId, fileCompletionInputFromText("review @sr", promptTextWidth("review @sr")))
@@ -107,6 +111,31 @@ test("file controller debounces, opens the existing picker, and emits one select
     }
   ])
   expect(picker.presentation("")).toBeUndefined()
+  controller.dispose()
+  picker.dispose()
+})
+
+test("directory acceptance retains disabled rows while the child query starts", async () => {
+  const picker = createPickerStack()
+  const session = new FakeFileSession()
+  const edits: unknown[] = []
+  const controller = new FileCompletionController(picker, edit => edits.push(edit))
+
+  controller.update(session, 1, fileCompletionInputFromText("@s", 2))
+  await Bun.sleep(25)
+  session.calls[0]!.resolve({ matches: [{ path: "src", type: "directory" }], truncated: false })
+  await Bun.sleep(0)
+
+  expect(controller.complete("directory:src", fileCompletionInputFromText("@s", 2))).toBe(true)
+  expect(edits).toEqual([{ startOffset: 0, endOffset: 2, replacement: "@src/", cursorOffset: 5 }])
+  expect(picker.presentation("")).toMatchObject({
+    frame: { id: "files", disabled: true },
+    rows: [{ id: "directory:src" }]
+  })
+
+  controller.update(session, 2, fileCompletionInputFromText("@src/", 5))
+  expect(picker.presentation("")?.frame.disabled).toBe(true)
+
   controller.dispose()
   picker.dispose()
 })
@@ -161,7 +190,134 @@ test("file acceptance stays dismissed through its cursor and content notificatio
   picker.dispose()
 })
 
-test("file controller aborts stale work, admits only the latest query, and keeps dismissal revision-scoped", async () => {
+test("file controller hides unmatched queries and skips append-only refinements", async () => {
+  const picker = createPickerStack()
+  const session = new FakeFileSession()
+  const controller = new FileCompletionController(picker, () => {})
+
+  controller.update(session, 1, fileCompletionInputFromText("@missing", 8))
+  await Bun.sleep(25)
+  session.calls[0]!.resolve({ matches: [], truncated: false })
+  await Bun.sleep(0)
+  expect(picker.presentation("")).toBeUndefined()
+
+  controller.update(session, 2, fileCompletionInputFromText("@missingx", 9))
+  await Bun.sleep(25)
+  expect(session.calls).toHaveLength(1)
+
+  controller.update(session, 3, fileCompletionInputFromText("@missin", 7))
+  await Bun.sleep(25)
+  expect(session.calls.map(call => call.query)).toEqual(["missing", "missin"])
+
+  controller.dispose()
+  picker.dispose()
+})
+
+test("file controller re-searches unmatched backspaces and canonicalization boundaries", async () => {
+  await Promise.all(
+    (
+      [
+        [".", "./"],
+        ["empty/", "empty"],
+        ["./.", "././"]
+      ] as const
+    ).map(async ([initial, next]) => {
+      const picker = createPickerStack()
+      const session = new FakeFileSession()
+      const controller = new FileCompletionController(picker, () => {})
+
+      controller.update(session, 1, fileCompletionInputFromText(`@${initial}`, initial.length + 1))
+      await Bun.sleep(25)
+      session.calls[0]!.resolve({ matches: [], truncated: false })
+      await Bun.sleep(0)
+
+      controller.update(session, 2, fileCompletionInputFromText(`@${next}`, next.length + 1))
+      await Bun.sleep(25)
+      expect(session.calls.map(call => call.query)).toEqual([initial, next])
+
+      controller.dispose()
+      picker.dispose()
+    })
+  )
+})
+
+test("file controller closes an exact file path but keeps exact directories available for drill-down", async () => {
+  const picker = createPickerStack()
+  const session = new FakeFileSession()
+  const controller = new FileCompletionController(picker, () => {})
+
+  const exactFile = "docs/adr/0011-openzi-path-policy.md"
+  controller.update(session, 1, fileCompletionInputFromText(`@${exactFile}`, exactFile.length + 1))
+  await Bun.sleep(25)
+  session.calls[0]!.resolve({
+    matches: [
+      { path: exactFile, type: "file" },
+      { path: "docs/adr/0010-interactive-mode-owns-keybindings.md", type: "file" }
+    ],
+    truncated: false
+  })
+  await Bun.sleep(0)
+  expect(picker.presentation("")).toBeUndefined()
+
+  controller.update(session, 2, fileCompletionInputFromText(`@${exactFile}x`, exactFile.length + 2))
+  await Bun.sleep(25)
+  expect(session.calls).toHaveLength(2)
+  session.calls[1]!.resolve({ matches: [{ path: "docs", type: "directory" }], truncated: false })
+  await Bun.sleep(0)
+
+  controller.update(session, 3, fileCompletionInputFromText("@docs", 5))
+  await Bun.sleep(25)
+  session.calls[2]!.resolve({ matches: [{ path: "docs", type: "directory" }], truncated: false })
+  await Bun.sleep(0)
+  expect(picker.presentation("")).toMatchObject({ frame: { id: "files", height: 7 } })
+
+  controller.dispose()
+  picker.dispose()
+})
+
+test("file controller disables scored rows until their replacement is ready", async () => {
+  const picker = createPickerStack()
+  const session = new FakeFileSession()
+  const edits: unknown[] = []
+  const controller = new FileCompletionController(picker, edit => edits.push(edit))
+
+  controller.update(session, 1, fileCompletionInputFromText("@s", 2))
+  await Bun.sleep(25)
+  session.calls[0]!.resolve({
+    matches: [
+      { path: "src", type: "directory" },
+      { path: "src/index.ts", type: "file" }
+    ],
+    truncated: false
+  })
+  await Bun.sleep(0)
+  expect(picker.presentation("")?.rows.map(row => row.label)).toEqual(["@src/", "@src/index.ts"])
+  picker.move("", 1)
+  expect(picker.presentation("")?.selectedId).toBe("file:src/index.ts")
+
+  controller.update(session, 2, fileCompletionInputFromText("@sr", 3))
+  expect(picker.presentation("")?.rows.map(row => row.label)).toEqual(["@src/", "@src/index.ts"])
+  expect(picker.presentation("")?.frame.disabled).toBe(true)
+  expect(controller.complete("file:src/index.ts", fileCompletionInputFromText("@sr", 3))).toBe(false)
+  expect(edits).toEqual([])
+  await Bun.sleep(25)
+  session.calls[1]!.resolve({
+    matches: [
+      { path: "src/lib.ts", type: "file" },
+      { path: "src/index.ts", type: "file" }
+    ],
+    truncated: false
+  })
+  await Bun.sleep(0)
+  expect(picker.presentation("")?.rows.map(row => row.label)).toEqual(["@src/lib.ts", "@src/index.ts"])
+  expect(picker.presentation("")?.frame.disabled).toBeUndefined()
+  expect(picker.presentation("")?.selectedId).toBe("file:src/index.ts")
+
+  controller.dispose()
+  picker.dispose()
+})
+
+test("file controller aborts stale work and keeps Escape dismissal scoped to the whole token", async () => {
   const picker = createPickerStack()
   const session = new FakeFileSession()
   const controller = new FileCompletionController(picker, () => {})
@@ -170,6 +326,7 @@ test("file controller aborts stale work, admits only the latest query, and keeps
   await Bun.sleep(25)
   controller.update(session, 2, fileCompletionInputFromText("@sr", 3))
   expect(session.calls[0]!.signal.aborted).toBe(true)
+  expect(picker.presentation("")).toBeUndefined()
   await Bun.sleep(25)
   expect(session.calls.map(call => call.query)).toEqual(["s", "sr"])
   session.calls[1]!.resolve({ matches: [{ path: "src", type: "directory" }], truncated: false })
@@ -179,11 +336,14 @@ test("file controller aborts stale work, admits only the latest query, and keeps
   controller.dismiss()
   controller.update(session, 2, fileCompletionInputFromText("@sr", 0))
   controller.update(session, 2, fileCompletionInputFromText("@sr", 3))
-  await Bun.sleep(25)
-  expect(session.calls).toHaveLength(2)
   controller.update(session, 3, fileCompletionInputFromText("@src", 4))
   await Bun.sleep(25)
-  expect(session.calls).toHaveLength(3)
+  expect(session.calls).toHaveLength(2)
+
+  controller.update(session, 4, fileCompletionInputFromText("@src ", 5))
+  controller.update(session, 5, fileCompletionInputFromText("@src @i", 7))
+  await Bun.sleep(25)
+  expect(session.calls.map(call => call.query)).toEqual(["s", "sr", "i"])
 
   controller.dispose()
   expect(session.calls[2]!.signal.aborted).toBe(true)

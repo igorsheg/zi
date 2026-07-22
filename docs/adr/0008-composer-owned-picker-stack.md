@@ -31,7 +31,7 @@ interface PickerStack {
 }
 ```
 
-Project-file and command frames are sibling top-level uses of the stack. The store gives command-name completion precedence, while file results use coding-agent ranking with `filter: "none"`; Enter and Tab resolve the selected bounded row through its owning controller. Escape dismisses a file trigger without clearing ordinary composer text. The stack itself knows neither syntax nor arbitration.
+Project-file and command frames are sibling top-level uses of the stack. The store gives command-name completion precedence, while file results use coding-agent ranking with `filter: "none"`; Enter and Tab resolve the selected bounded row through its owning controller. File results use a preferred seven-row outer frame: rescoring visibly dims and disables prior rows until current rows replace them atomically, while initial loading, exact-file, and unmatched contexts own no frame. Directory continuation retains that disabled frame until child rows arrive. Surviving row IDs preserve selection; optional footer chrome reduces the list to six rows without changing total geometry. Escape dismisses the whole file token without clearing ordinary composer text or reopening on its next edit. The stack itself knows neither syntax nor arbitration.
 
 Composer session history remains separate from the picker stack. `AgentSession` exposes bounded latest/older lookup over `SessionManager` journal references; Composer retains bounded entry IDs and native slot handles, while recalled text plus exact draft marker restoration stays with native replace/undo/redo. Picker navigation wins whenever a frame is active, so history adds neither a frame nor another input.
 

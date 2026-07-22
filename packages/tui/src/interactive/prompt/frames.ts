@@ -14,6 +14,8 @@ import { sameModel } from "./model-choices.js"
 import type { PickerFrame, PickerStackRow } from "./picker.js"
 import type { EditableSetting, EditableSettingValue } from "./state.js"
 
+export const projectFilePickerHeight = 7
+
 export const promptPickerFrameIds = {
   commands: "commands",
   files: "files",
@@ -43,17 +45,21 @@ export function commandFrame(commands: readonly SlashCommand[]): PickerFrame {
   }
 }
 
-export function fileFrame(result: ProjectFileSearchResult, query: string): PickerFrame {
+export function fileFrame(result: ProjectFileSearchResult, query: string, previousSelectedId?: string): PickerFrame {
+  const rows = result.matches.map(match => ({
+    id: `${match.type}:${match.path}`,
+    label: `@${match.path}${match.type === "directory" ? "/" : ""}`,
+    ...(match.type === "directory" ? { detail: "[directory]" } : {}),
+    searchText: match.path
+  }))
+  const selectedId = rows.some(row => row.id === previousSelectedId) ? previousSelectedId : undefined
   return {
     id: promptPickerFrameIds.files,
     title: "",
     filter: "none",
-    rows: result.matches.map(match => ({
-      id: `${match.type}:${match.path}`,
-      label: `@${match.path}${match.type === "directory" ? "/" : ""}`,
-      ...(match.type === "directory" ? { detail: "[directory]" } : {}),
-      searchText: match.path
-    })),
+    height: projectFilePickerHeight,
+    rows,
+    ...(selectedId ? { selectedId } : {}),
     ...(result.truncated ? { footer: `Search limited; refine @${query}` } : {})
   }
 }

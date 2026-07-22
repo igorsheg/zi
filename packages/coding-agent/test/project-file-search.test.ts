@@ -8,9 +8,24 @@ import { OpenZiPaths } from "../src/paths.js"
 import {
   maxProjectFileSearchIgnoreBytes,
   maxProjectFileSearchResults,
+  normalizeProjectFileSearchMatcherQuery,
   ProjectFileSearch,
-  ProjectFileSearchQueryError
+  ProjectFileSearchQueryError,
+  validateProjectFileSearchQuery
 } from "../src/project-file-search.js"
+
+test("project file matcher normalization is idempotent and matches repeated search admission", () => {
+  expect(normalizeProjectFileSearchMatcherQuery("./SRC\\nested///")).toBe("src/nested")
+  expect(normalizeProjectFileSearchMatcherQuery(".")).toBe(".")
+  expect(normalizeProjectFileSearchMatcherQuery("./")).toBe("")
+  expect(normalizeProjectFileSearchMatcherQuery("././")).toBe("")
+  expect(normalizeProjectFileSearchMatcherQuery(validateProjectFileSearchQuery("././"))).toBe("")
+
+  for (const query of ["", ".", "src/nested", "././src///"]) {
+    const normalized = normalizeProjectFileSearchMatcherQuery(query)
+    expect(normalizeProjectFileSearchMatcherQuery(normalized)).toBe(normalized)
+  }
+})
 
 test("project file search roots Git enumeration at OpenZiPaths.cwd and respects standard ignores", async () => {
   const root = await mkdtemp(join(tmpdir(), "openzi-file-search-git-"))
@@ -33,6 +48,15 @@ test("project file search roots Git enumeration at OpenZiPaths.cwd and respects 
   expect(result.matches.some(match => match.path.includes("outside") || match.path.includes("ignored"))).toBe(false)
   expect(result.matches.length).toBeLessThanOrEqual(maxProjectFileSearchResults)
   expect(Object.isFrozen(result.matches)).toBe(true)
+
+  const slashTerminated = await search.search("src/", new AbortController().signal)
+  const repeatedSlash = await search.search("src//", new AbortController().signal)
+  const repeatedPrefix = await search.search("././src/", new AbortController().signal)
+  for (const scoped of [slashTerminated, repeatedSlash, repeatedPrefix]) {
+    expect(scoped.matches).not.toContainEqual({ path: "src", type: "directory" })
+    expect(scoped.matches).toContainEqual({ path: "src/tracked.ts", type: "file" })
+  }
+
   await search.dispose()
 })
 
@@ -76,6 +100,14 @@ test("non-Git fallback is ignore-aware, includes hidden entries, and never trave
   const unignored = await search.search("keep", new AbortController().signal)
   expect(unignored.matches).toContainEqual({ path: "a/keep.log", type: "file" })
   expect(unignored.matches).toContainEqual({ path: "a/keep.tmp", type: "file" })
+
+  const repeatedSlash = await search.search("a//", new AbortController().signal)
+  const repeatedPrefix = await search.search("././a/", new AbortController().signal)
+  for (const scoped of [repeatedSlash, repeatedPrefix]) {
+    expect(scoped.matches).not.toContainEqual({ path: "a", type: "directory" })
+    expect(scoped.matches).toContainEqual({ path: "a/keep.log", type: "file" })
+  }
+
   if (process.platform !== "win32") {
     const literalBackslash = await search.search("literal", new AbortController().signal)
     expect(literalBackslash.matches).toEqual([])

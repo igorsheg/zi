@@ -1,11 +1,16 @@
 import { expect, test } from "bun:test"
 
+import { BoxRenderable } from "@opentui/core"
+import { createTestRenderer } from "@opentui/core/testing"
+
+import { PickerStackView } from "../../src/interactive/prompt/picker-view.js"
 import {
   createPickerStack,
   maxPickerDepth,
   maxPickerRows,
   maxSuspendedFilterLength
 } from "../../src/interactive/prompt/picker.js"
+import { defaultTheme } from "../../src/theme.js"
 
 test("picker stack filters only its top frame and restores suspended parent filters", () => {
   const stack = createPickerStack()
@@ -71,6 +76,7 @@ test("picker stack rejects unbounded and forbidden transitions", () => {
   try {
     expect(() => stack.replaceTop(boundedFrame("closed"), "")).toThrow("closed")
     expect(() => stack.open(boundedFrame("wide", maxPickerRows + 1))).toThrow(`${maxPickerRows}`)
+    expect(() => stack.open({ ...boundedFrame("tall"), height: 11 })).toThrow("frame height")
 
     stack.open(boundedFrame("root"))
     for (let depth = 1; depth < maxPickerDepth; depth++) stack.push(boundedFrame(`level-${depth}`), "filter")
@@ -86,6 +92,34 @@ test("picker stack rejects unbounded and forbidden transitions", () => {
   }
 })
 
+test("picker view keeps a preferred total height while optional chrome changes", async () => {
+  const setup = await createTestRenderer({ width: 40, height: 10, useThread: false })
+  const stack = createPickerStack()
+  const view = new PickerStackView(setup.renderer, stack, defaultTheme, () => "")
+  setup.renderer.root.add(view.root)
+  const frame = { ...boundedFrame("stable", 20), title: "", height: 7 }
+
+  try {
+    stack.open(frame)
+    view.update(10)
+    await setup.renderOnce()
+    const list = view.root.findDescendantById("picker-list")
+    if (!(list instanceof BoxRenderable)) throw new Error("Picker list not found")
+    expect(view.root.height).toBe(7)
+    expect(list.height).toBe(7)
+
+    stack.replaceTop({ ...frame, footer: "Search limited" }, "")
+    view.update(10)
+    await setup.renderOnce()
+    expect(view.root.height).toBe(7)
+    expect(list.height).toBe(6)
+  } finally {
+    view.destroy()
+    stack.dispose()
+    if (!setup.renderer.isDestroyed) setup.renderer.destroy()
+  }
+})
+
 test("picker stack wraps top-frame selection without owning the filter input", () => {
   const stack = createPickerStack()
 
@@ -94,6 +128,7 @@ test("picker stack wraps top-frame selection without owning the filter input", (
       id: "models",
       title: "Models",
       filter: "fuzzy",
+      height: 7,
       selectedId: "current",
       rows: [
         { id: "current", label: "Current", searchText: "current provider" },
@@ -101,7 +136,7 @@ test("picker stack wraps top-frame selection without owning the filter input", (
       ]
     })
     stack.move("", -1)
-    expect(stack.presentation("")?.selectedId).toBe("target")
+    expect(stack.presentation("")).toMatchObject({ frame: { height: 7 }, selectedId: "target" })
     stack.queryChanged("curr")
     expect(stack.presentation("curr")?.selectedId).toBe("current")
   } finally {

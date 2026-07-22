@@ -16,6 +16,7 @@ export interface PickerListOptions {
   readonly scope: string
   readonly rows: readonly PickerRow[]
   readonly selectedId?: string
+  readonly disabled?: boolean
   readonly height: number
   readonly emptyText?: string
   readonly theme: Theme
@@ -32,6 +33,7 @@ interface PickerRowView {
   readonly text: TextRenderable
   row: PickerRow | undefined
   selected: boolean
+  disabled: boolean
   theme: Theme
 }
 
@@ -61,22 +63,24 @@ export function createPickerList(ctx: RenderContext, options: PickerListOptions)
     })
     const text = new TextRenderable(ctx, { height: 1, wrapMode: "none", selectable: false })
     row.add(text)
-    return { root: row, text, row: undefined, selected: false, theme }
+    return { root: row, text, row: undefined, selected: false, disabled: false, theme }
   }
 
-  const updateRow = (view: PickerRowView, row: PickerRow, selected: boolean, theme: Theme): void => {
+  const updateRow = (view: PickerRowView, row: PickerRow, selected: boolean, disabled: boolean, theme: Theme): void => {
     const changed =
       view.row?.label !== row.label ||
       view.row?.detail !== row.detail ||
       view.row?.metadata !== row.metadata ||
       view.selected !== selected ||
+      view.disabled !== disabled ||
       view.theme !== theme
     if (!changed) return
     view.row = row
     view.selected = selected
+    view.disabled = disabled
     view.theme = theme
     view.root.backgroundColor = theme.surface.composer
-    view.text.content = rowContent(row, selected, theme)
+    view.text.content = rowContent(row, selected, disabled, theme)
   }
 
   const update = (next: PickerListOptions) => {
@@ -119,7 +123,7 @@ export function createPickerList(ctx: RenderContext, options: PickerListOptions)
       for (const row of window) {
         const view = rowsById.get(row.id) ?? createRow(next.theme)
         rowsById.set(row.id, view)
-        updateRow(view, row, row.id === next.selectedId, next.theme)
+        updateRow(view, row, row.id === next.selectedId, next.disabled ?? false, next.theme)
       }
       orderRows(
         root,
@@ -135,7 +139,7 @@ export function createPickerList(ctx: RenderContext, options: PickerListOptions)
       return
     }
     emptyView ??= createRow(next.theme)
-    updateRow(emptyView, { id: "", label: next.emptyText }, false, next.theme)
+    updateRow(emptyView, { id: "", label: next.emptyText }, false, next.disabled ?? false, next.theme)
     if (root.getChildren()[0] !== emptyView.root) root.insertBefore(emptyView.root, root.getChildren()[0])
   }
 
@@ -151,10 +155,11 @@ export function createPickerList(ctx: RenderContext, options: PickerListOptions)
   }
 }
 
-function rowContent(row: PickerRow, selected: boolean, theme: Theme): StyledText {
+function rowContent(row: PickerRow, selected: boolean, disabled: boolean, theme: Theme): StyledText {
+  const active = selected && !disabled
   return new StyledText([
-    fg(selected ? theme.text.accent : theme.text.muted)(selected ? glyphs.listSelected : glyphs.listUnselected),
-    fg(theme.text.primary)(row.label),
+    fg(active ? theme.text.accent : theme.text.muted)(active ? glyphs.listSelected : glyphs.listUnselected),
+    fg(disabled ? theme.text.muted : theme.text.primary)(row.label),
     ...(row.detail ? [fg(theme.text.muted)(`  ${row.detail}`)] : []),
     ...(row.metadata ? [fg(theme.text.muted)(`  ${row.metadata}`)] : [])
   ])

@@ -155,6 +155,13 @@ export class ProjectFileSearch {
   }
 }
 
+export function normalizeProjectFileSearchMatcherQuery(query: string): string {
+  return validateProjectFileSearchQuery(query)
+    .replace(/^(?:\.\/)+/u, "")
+    .toLowerCase()
+    .replace(/\/+$/u, "")
+}
+
 export function validateProjectFileSearchQuery(query: string): string {
   if (Buffer.byteLength(query) > maxProjectFileSearchQueryBytes) {
     throw new ProjectFileSearchQueryError("Project file search query is too long")
@@ -190,15 +197,21 @@ export class ProjectFileSearchQueryError extends Error {
 class GitUnavailableError extends Error {}
 
 class MatchAccumulator {
-  readonly #query: string
+  readonly #needle: string
+  readonly #exactDirectory: string | undefined
   readonly #matches = new Map<string, RankedMatch>()
 
   constructor(query: string) {
-    this.#query = query
+    this.#needle = normalizeProjectFileSearchMatcherQuery(query)
+    this.#exactDirectory = query.endsWith("/") ? this.#needle : undefined
+  }
+
+  excludesExactDirectory(path: string): boolean {
+    return this.#exactDirectory !== undefined && path.toLowerCase() === this.#exactDirectory
   }
 
   add(path: string, type: ProjectFileMatch["type"]): void {
-    const ranked = rankMatch(path, type, this.#query)
+    const ranked = rankMatch(path, type, this.#needle)
     if (!ranked) return
     const key = `${type}:${path}`
     const previous = this.#matches.get(key)
@@ -259,7 +272,7 @@ async function searchGit(cwd: string, query: string, signal: AbortSignal): Promi
         stopChild(child)
         return
       }
-      admitGitPath(pending.subarray(0, delimiter), query, accumulator)
+      admitGitPath(pending.subarray(0, delimiter), accumulator)
       pending = pending.subarray(delimiter + 1)
       delimiter = pending.indexOf(0)
     }
@@ -277,7 +290,7 @@ async function searchGit(cwd: string, query: string, signal: AbortSignal): Promi
   return { accumulator, truncated }
 }
 
-function admitGitPath(bytes: Uint8Array, query: string, accumulator: MatchAccumulator): void {
+function admitGitPath(bytes: Uint8Array, accumulator: MatchAccumulator): void {
   if (bytes.byteLength === 0 || bytes.byteLength > maxProjectFileSearchPathBytes) return
   let path: string
   try {
@@ -292,9 +305,7 @@ function admitGitPath(bytes: Uint8Array, query: string, accumulator: MatchAccumu
   parts.pop()
   while (parts.length > 0) {
     const directory = parts.join("/")
-    if (!(query.endsWith("/") && directory.toLowerCase() === query.slice(0, -1).toLowerCase())) {
-      accumulator.add(directory, "directory")
-    }
+    if (!accumulator.excludesExactDirectory(directory)) accumulator.add(directory, "directory")
     parts.pop()
   }
 }
@@ -390,11 +401,7 @@ async function searchWalk(cwd: string, query: string, signal: AbortSignal): Prom
         }
       }
       if (!type || isIgnored(ignoreAdmission.scope, normalized, type === "directory")) continue
-      if (
-        !(type === "directory" && query.endsWith("/") && normalized.toLowerCase() === query.slice(0, -1).toLowerCase())
-      ) {
-        accumulator.add(normalized, type)
-      }
+      if (type !== "directory" || !accumulator.excludesExactDirectory(normalized)) accumulator.add(normalized, type)
 
       if (traversable) {
         const nextDepth = current.depth + 1
@@ -496,9 +503,8 @@ function validProjectPath(path: string): string | undefined {
   return normalized
 }
 
-function rankMatch(path: string, type: ProjectFileMatch["type"], query: string): RankedMatch | undefined {
+function rankMatch(path: string, type: ProjectFileMatch["type"], needle: string): RankedMatch | undefined {
   const candidate = path.toLowerCase()
-  const needle = query.toLowerCase().replace(/^\.\//u, "").replace(/\/+$/u, "")
   const basename = candidate.slice(candidate.lastIndexOf("/") + 1)
   const depth = candidate.split("/").length - 1
   let matchClass: number

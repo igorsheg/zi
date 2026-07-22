@@ -1,6 +1,7 @@
 import type { TextareaRenderable } from "@opentui/core"
 import {
   maxProjectFileSearchQueryBytes,
+  normalizeProjectFileSearchMatcherQuery,
   type ProjectFileMatch,
   type ProjectFileSearchResult,
   validateProjectFileSearchQuery
@@ -13,7 +14,7 @@ import {
   promptTextWidth
 } from "../../components/cell-text.js"
 import { fileFrame, promptPickerFrameIds } from "./frames.js"
-import type { PickerStack } from "./picker.js"
+import type { PickerFrame, PickerStack } from "./picker.js"
 
 export const fileCompletionDebounceMs = 20
 
@@ -71,12 +72,21 @@ type FileCompletionState =
       readonly previousSettled: Promise<void>
     }
   | { readonly type: "showing"; readonly request: PendingFileCompletion; readonly result: ProjectFileSearchResult }
+  | { readonly type: "continuing"; readonly request: PendingFileCompletion }
   | {
       readonly type: "dismissed"
+      readonly session: FileCompletionSearchSession
       readonly draftRevision: number
       readonly triggerStart: number
-      readonly acceptsPreviousRevision: boolean
     }
+  | {
+      readonly type: "accepted"
+      readonly session: FileCompletionSearchSession
+      readonly draftRevision: number
+      readonly triggerStart: number
+    }
+  | { readonly type: "exact"; readonly request: PendingFileCompletion }
+  | { readonly type: "unmatched"; readonly request: PendingFileCompletion }
   | { readonly type: "disposed" }
 
 export class FileCompletionController {
@@ -97,16 +107,10 @@ export class FileCompletionController {
     if (this.#state.type === "disposed") return
     const context = parseFileCompletionContext(input)
     if (!context) {
-      this.#current = undefined
-      if (this.#state.type === "dismissed") {
-        this.#closeFrame()
-        return
-      }
-      this.close()
+      this.#contextEnded(draftRevision)
       return
     }
 
-    const current: PendingFileCompletion = { operationId: ++this.#nextOperationId, session, draftRevision, context }
     const previousCurrent = this.#current
     if (
       previousCurrent &&
@@ -116,19 +120,63 @@ export class FileCompletionController {
     ) {
       return
     }
-    this.#current = current
 
+    const current: PendingFileCompletion = { operationId: ++this.#nextOperationId, session, draftRevision, context }
+    this.#current = current
     const state = this.#state
-    if (
-      state.type === "dismissed" &&
-      (state.draftRevision === draftRevision ||
-        (state.acceptsPreviousRevision && state.draftRevision === draftRevision + 1)) &&
-      state.triggerStart === context.triggerStart
-    ) {
-      return
+    switch (state.type) {
+      case "dismissed":
+        if (state.session === session && state.triggerStart === context.triggerStart) {
+          this.#state = { ...state, draftRevision }
+          return
+        }
+        break
+      case "accepted":
+        if (
+          state.session === session &&
+          state.triggerStart === context.triggerStart &&
+          (state.draftRevision === draftRevision || state.draftRevision === draftRevision + 1)
+        ) {
+          return
+        }
+        break
+      case "exact":
+        if (
+          sameRequestTrigger(state.request, current) &&
+          !context.quoted &&
+          context.cursorOffset === context.tokenEnd &&
+          state.request.context.query === context.query
+        ) {
+          this.#state = { type: "exact", request: current }
+          return
+        }
+        break
+      case "unmatched":
+        if (
+          sameRequestTrigger(state.request, current) &&
+          state.request.context.quoted === context.quoted &&
+          context.query.startsWith(state.request.context.query) &&
+          normalizeProjectFileSearchMatcherQuery(context.query).startsWith(
+            normalizeProjectFileSearchMatcherQuery(state.request.context.query)
+          )
+        ) {
+          this.#state = { type: "unmatched", request: current }
+          return
+        }
+        break
+      case "closed":
+      case "waiting":
+      case "searching":
+      case "switching":
+      case "showing":
+      case "continuing":
+        break
+      default:
+        return assertNever(state)
     }
 
-    this.#closeFrame()
+    if (state.type === "showing") this.#disableFrame()
+
     switch (state.type) {
       case "waiting":
         this.#cancelTimer(state.timer)
@@ -144,7 +192,11 @@ export class FileCompletionController {
         return
       case "closed":
       case "showing":
+      case "continuing":
       case "dismissed":
+      case "accepted":
+      case "exact":
+      case "unmatched":
         this.#wait(current)
         return
       default:
@@ -174,14 +226,15 @@ export class FileCompletionController {
     this.#state =
       match.type === "file"
         ? {
-            type: "dismissed",
+            type: "accepted",
+            session: state.request.session,
             draftRevision: state.request.draftRevision + 1,
-            triggerStart: context.triggerStart,
-            acceptsPreviousRevision: true
+            triggerStart: context.triggerStart
           }
-        : { type: "closed" }
+        : { type: "continuing", request: state.request }
     this.#current = undefined
-    this.#closeFrame()
+    if (match.type === "file") this.#closeFrame()
+    else this.#disableFrame()
     this.#requestEdit({
       startOffset: context.triggerStart,
       endOffset: context.tokenEnd,
@@ -193,23 +246,45 @@ export class FileCompletionController {
 
   dismiss(): void {
     const state = this.#state
-    if (state.type !== "showing") return
+    let request: PendingFileCompletion
+    switch (state.type) {
+      case "waiting":
+        this.#cancelTimer(state.timer)
+        request = state.pending
+        break
+      case "searching":
+        state.controller.abort()
+        request = state.active
+        break
+      case "switching":
+        this.#cancelTimer(state.timer)
+        request = state.pending
+        break
+      case "showing":
+      case "continuing":
+        request = state.request
+        break
+      case "closed":
+      case "dismissed":
+      case "accepted":
+      case "exact":
+      case "unmatched":
+      case "disposed":
+        return
+      default:
+        return assertNever(state)
+    }
     this.#state = {
       type: "dismissed",
-      draftRevision: state.request.draftRevision,
-      triggerStart: state.request.context.triggerStart,
-      acceptsPreviousRevision: false
+      session: request.session,
+      draftRevision: request.draftRevision,
+      triggerStart: request.context.triggerStart
     }
     this.#closeFrame()
   }
 
   close(): void {
     const state = this.#state
-    if (state.type === "dismissed") {
-      this.#current = undefined
-      this.#closeFrame()
-      return
-    }
     switch (state.type) {
       case "waiting":
         this.#cancelTimer(state.timer)
@@ -222,6 +297,11 @@ export class FileCompletionController {
         break
       case "closed":
       case "showing":
+      case "continuing":
+      case "dismissed":
+      case "accepted":
+      case "exact":
+      case "unmatched":
         break
       case "disposed":
         return
@@ -242,6 +322,44 @@ export class FileCompletionController {
     this.#state = { type: "disposed" }
     this.#current = undefined
     this.#closeFrame()
+  }
+
+  #contextEnded(draftRevision: number): void {
+    const state = this.#state
+    this.#current = undefined
+    switch (state.type) {
+      case "dismissed":
+        if (state.draftRevision === draftRevision) {
+          this.#closeFrame()
+          return
+        }
+        break
+      case "accepted":
+        if (state.draftRevision === draftRevision || state.draftRevision === draftRevision + 1) {
+          this.#closeFrame()
+          return
+        }
+        break
+      case "exact":
+      case "unmatched":
+        if (state.request.draftRevision === draftRevision) {
+          this.#closeFrame()
+          return
+        }
+        break
+      case "closed":
+      case "waiting":
+      case "searching":
+      case "switching":
+      case "showing":
+      case "continuing":
+        break
+      case "disposed":
+        return
+      default:
+        assertNever(state)
+    }
+    this.close()
   }
 
   #wait(pending: PendingFileCompletion): void {
@@ -298,17 +416,23 @@ export class FileCompletionController {
       .then(result => {
         if (!this.#isCurrentSearch(active)) return undefined
         if (result.matches.length === 0) {
-          this.#state = { type: "closed" }
+          this.#state = { type: "unmatched", request: active }
+          this.#closeFrame()
+          return undefined
+        }
+        if (hasExactFileMatch(result, active.context)) {
+          this.#state = { type: "exact", request: active }
           this.#closeFrame()
           return undefined
         }
         const presentation = this.#picker.presentation("")
-        if (presentation && presentation.frame.id !== promptPickerFrameIds.files) {
+        const previousSelectedId =
+          presentation?.frame.id === promptPickerFrameIds.files ? presentation.selectedId : undefined
+        if (!this.#showFrame(fileFrame(result, active.context.query, previousSelectedId))) {
           this.#state = { type: "closed" }
           return undefined
         }
         this.#state = { type: "showing", request: active, result }
-        this.#picker.open(fileFrame(result, active.context.query))
         return undefined
       })
       .catch(() => {
@@ -325,6 +449,30 @@ export class FileCompletionController {
       sameRequest(this.#state.active, active) &&
       sameRequestContext(active, this.#current)
     )
+  }
+
+  #disableFrame(): void {
+    const presentation = this.#picker.presentation("")
+    if (!presentation || presentation.frame.id !== promptPickerFrameIds.files || presentation.frame.disabled) return
+    this.#picker.replaceTop(
+      {
+        ...presentation.frame,
+        disabled: true,
+        ...(presentation.selectedId ? { selectedId: presentation.selectedId } : {})
+      },
+      ""
+    )
+  }
+
+  #showFrame(frame: PickerFrame): boolean {
+    const presentation = this.#picker.presentation("")
+    if (!presentation) {
+      this.#picker.open(frame)
+      return true
+    }
+    if (presentation.frame.id !== promptPickerFrameIds.files) return false
+    this.#picker.replaceTop(frame, "")
+    return true
   }
 
   #closeFrame(): void {
@@ -396,6 +544,7 @@ export function parseFileCompletionContext(input: FileCompletionInput): FileComp
   const query = before.slice(queryStart)
   if (
     query.length > maxProjectFileSearchQueryBytes ||
+    (!quoted && /[\s,;]/u.test(query)) ||
     query.includes('"') ||
     Buffer.byteLength(query) > maxProjectFileSearchQueryBytes
   ) {
@@ -480,8 +629,18 @@ function sameFileCompletionContext(left: FileCompletionContext, right: FileCompl
   )
 }
 
+function hasExactFileMatch(result: ProjectFileSearchResult, context: FileCompletionContext): boolean {
+  if (context.quoted || context.cursorOffset !== context.tokenEnd) return false
+  const normalizedQuery = validateProjectFileSearchQuery(context.query)
+  return result.matches.some(match => match.type === "file" && match.path === normalizedQuery)
+}
+
 function sameRequest(left: PendingFileCompletion, right: PendingFileCompletion): boolean {
   return left.operationId === right.operationId && left.session === right.session
+}
+
+function sameRequestTrigger(left: PendingFileCompletion, right: PendingFileCompletion): boolean {
+  return left.session === right.session && left.context.triggerStart === right.context.triggerStart
 }
 
 function sameRequestContext(left: PendingFileCompletion, right: PendingFileCompletion | undefined): boolean {
