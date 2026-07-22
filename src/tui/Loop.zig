@@ -49,7 +49,7 @@ pub const agent_events_per_iteration_max: usize = 8;
 pub const watchdog_budget_ns: u64 = 33 * std.time.ns_per_ms;
 pub const double_key_window_ns: u64 = 500 * std.time.ns_per_ms;
 pub const spinner_interval_ns: u64 = 80 * std.time.ns_per_ms;
-const retry_status_tick_ns: u64 = std.time.ns_per_s;
+const retry_activity_tick_ns: u64 = std.time.ns_per_s;
 pub const shutdown_cancel_bound_ns: u64 = 5 * std.time.ns_per_s;
 const session_listing_deadline_ns: u64 = 5 * std.time.ns_per_s;
 const session_opening_deadline_ns: u64 = 30 * std.time.ns_per_s;
@@ -58,46 +58,17 @@ const extension_prompt_command_deadline_ns: u64 = 30 * std.time.ns_per_s;
 const restore_entries_per_iteration_max: usize = 16;
 const restore_work_bytes_per_iteration_target: usize = 256 * 1024;
 const exit_hint_text = "press ctrl+c again to exit";
-const scratch_capacity = 8192;
 const synthetic_flood_rate_bytes_per_second: u64 = 1024 * 1024;
 pub const synthetic_flood_duration_ns: u64 = 30 * std.time.ns_per_s;
 pub const synthetic_flood_tool_body_bytes: usize = 4 * 1024 * 1024;
 const synthetic_flood_tool_emit_ns: u64 = synthetic_flood_duration_ns / 2;
 const viewport_hint_buffer_len = 64;
-const completion_popup_rows_max: usize = chrome.popup_rows_max;
+const listbox_rows_max: usize = chrome.listbox_rows_max;
 const completion_candidates_max: usize = 64;
 const completion_text_bytes_max: usize = 256;
 const picker_rows_max: usize = 128;
-const picker_visible_rows_max: usize = 8;
 const title_buffer_len: usize = 256;
 const composer_label_buffer_len: usize = 256;
-
-pub const Scratch = struct {
-    buffer: [scratch_capacity]u8 = undefined,
-    len: usize = 0,
-    evicted_bytes: usize = 0,
-
-    pub fn text(self: *const Scratch) []const u8 {
-        return self.buffer[0..self.len];
-    }
-
-    pub fn appendRepeated(self: *Scratch, byte: u8, count: usize) void {
-        if (count >= self.buffer.len) {
-            @memset(&self.buffer, byte);
-            self.evicted_bytes += self.len + count - self.buffer.len;
-            self.len = self.buffer.len;
-            return;
-        }
-        if (count > self.buffer.len - self.len) {
-            const evict_count = count - (self.buffer.len - self.len);
-            std.mem.copyForwards(u8, self.buffer[0 .. self.len - evict_count], self.buffer[evict_count..self.len]);
-            self.len -= evict_count;
-            self.evicted_bytes += evict_count;
-        }
-        @memset(self.buffer[self.len..][0..count], byte);
-        self.len += count;
-    }
-};
 
 pub const SyntheticFlood = struct {
     enabled: bool = false,
@@ -350,34 +321,34 @@ const CompletionCandidate = struct {
     }
 };
 
-const CompletionPopup = struct {
+const CompletionState = struct {
     active: bool = false,
     mode: CompletionMode = .slash,
     candidates: [completion_candidates_max]CompletionCandidate = undefined,
     candidate_len: usize = 0,
     selected: usize = 0,
 
-    fn clear(self: *CompletionPopup) void {
+    fn clear(self: *CompletionState) void {
         self.active = false;
         self.candidate_len = 0;
         self.selected = 0;
     }
 
-    fn reset(self: *CompletionPopup, mode: CompletionMode) void {
+    fn reset(self: *CompletionState, mode: CompletionMode) void {
         self.active = true;
         self.mode = mode;
         self.candidate_len = 0;
         self.selected = 0;
     }
 
-    fn append(self: *CompletionPopup, label: []const u8, insert: []const u8, detail: []const u8, selectable: bool) void {
+    fn append(self: *CompletionState, label: []const u8, insert: []const u8, detail: []const u8, selectable: bool) void {
         if (self.candidate_len == self.candidates.len) return;
         self.candidates[self.candidate_len].set(label, insert, detail, selectable);
         self.candidate_len += 1;
     }
 
     fn appendFile(
-        self: *CompletionPopup,
+        self: *CompletionState,
         label: []const u8,
         detail: []const u8,
         edit: coding_agent.file_completion.Edit,
@@ -387,12 +358,12 @@ const CompletionPopup = struct {
         self.candidate_len += 1;
     }
 
-    fn selectedCandidate(self: *const CompletionPopup) ?*const CompletionCandidate {
+    fn selectedCandidate(self: *const CompletionState) ?*const CompletionCandidate {
         if (!self.active or self.candidate_len == 0) return null;
         return &self.candidates[@min(self.selected, self.candidate_len - 1)];
     }
 
-    fn move(self: *CompletionPopup, delta: i32) void {
+    fn move(self: *CompletionState, delta: i32) void {
         if (!self.active or self.candidate_len == 0) return;
         const len: i32 = @intCast(self.candidate_len);
         var next: i32 = @intCast(self.selected);
@@ -570,13 +541,13 @@ const Composer = struct {
     editor: Editor = .{},
     paste: PasteCapture = .{},
     preferred_column_cells: ?usize = null,
-    completion: CompletionPopup = .{},
+    completion: CompletionState = .{},
     picker: Picker = .{},
     dismissed_picker_kind: ?PickerKind = null,
     dismissed_picker_text: [Editor.capacity]u8 = undefined,
     dismissed_picker_text_len: usize = 0,
-    completion_lines: [completion_popup_rows_max]screen.Line = undefined,
-    picker_lines: [picker_visible_rows_max]screen.Line = undefined,
+    completion_lines: [listbox_rows_max]screen.Line = undefined,
+    picker_lines: [listbox_rows_max]screen.Line = undefined,
     file_index: ?coding_agent.file_completion.Index = null,
     file_index_task: ?runtime.Task(anyerror!coding_agent.file_completion.Index) = null,
     file_index_stale: bool = false,
@@ -683,7 +654,6 @@ pub const Loop = struct {
     last_animated_frame_start_ns: ?u64 = null,
     ctrl_c_deadline_ns: ?u64 = null,
     exit_hint_visible: bool = false,
-    scratch: Scratch = .{},
     synthetic_flood: SyntheticFlood = .{},
     frame_input_bytes: usize = 0,
     frame_events_applied: usize = 0,
@@ -702,7 +672,7 @@ pub const Loop = struct {
     trace_io_ready: bool = false,
     queue_buffers: [4][256]u8 = undefined,
     queue_lines: [4][]const u8 = undefined,
-    status_buffer: [256]u8 = undefined,
+    activity_buffer: [256]u8 = undefined,
     composer_left_buffer: [composer_label_buffer_len]u8 = undefined,
     composer_right_buffer: [composer_label_buffer_len]u8 = undefined,
     terminal_title_buffer: [title_buffer_len]u8 = undefined,
@@ -711,10 +681,6 @@ pub const Loop = struct {
     foreground_operation: ForegroundOperation = .idle,
     clipboard_image_serial: u64 = 0,
     draft_images: DraftImageAttachments = .{},
-    token_cache_entry_count: usize = 0,
-    token_input_total: u64 = 0,
-    token_output_total: u64 = 0,
-    compaction_count: usize = 0,
     shutdown_requested: bool = false,
 
     pub const InitOptions = struct {
@@ -1296,14 +1262,10 @@ pub const Loop = struct {
         const session = self.session orelse return;
         self.transcript.clear();
         self.composer.editor.clearHistory();
-        self.token_cache_entry_count = std.math.maxInt(usize);
-        self.token_input_total = 0;
-        self.token_output_total = 0;
         var entry_index: usize = 0;
         while (entry_index < session.manager.entries.items.len) {
             entry_index = try self.restoreEntriesStep(entry_index);
         }
-        self.refreshTokenCache();
         self.repinViewport();
         self.dirty = true;
         self.pending_title_update = true;
@@ -1615,7 +1577,6 @@ pub const Loop = struct {
 
     pub fn composeFrameAt(self: *Loop, width: u16, height: u16, now_ns: u64) anyerror!screen.Frame {
         _ = self.noteResize(width, height);
-        self.refreshTokenCache();
         const rebuild_start_ns = traceNowNs();
         const layout_result = try self.transcript.prepareLayout(self.layout_state);
         if (layout_result == .published) {
@@ -1624,33 +1585,30 @@ pub const Loop = struct {
         }
 
         const queue_lines = self.collectQueueLines();
-        const status = self.statusView(now_ns);
-        const status_visible = status.text.len > 0;
+        const activity = self.activityView(now_ns);
         self.updateViewportHint();
         const provisional_plan = chrome.planRows(.{
-            .editor = &self.composer.editor,
-            .picker_open = self.composer.picker.active,
-            .popup_row_count = if (self.composer.picker.active or !self.composer.completion.active) 0 else chrome.popup_rows_max,
-            .queue_line_count = queue_lines.len,
-            .viewport_hint_len = self.viewport_hint.len,
-            .status_open = status_visible,
+            .attention = .{
+                .viewport_hint = self.viewport_hint,
+                .queue_lines = queue_lines,
+            },
+            .activity_open = activity.text.len > 0,
+            .composer = &self.composer.editor,
+            .listbox = self.listboxMeasure(),
         }, width, height);
         self.applyPendingViewportMotion(provisional_plan.transcript_rows);
         self.updateViewportHint();
 
-        var picker_view = self.pickerView(provisional_plan.picker_rows);
-        var popup_view = self.popupView(if (picker_view == null) provisional_plan.popup_rows else 0);
-        const popup_rows = if (popup_view) |popup| popup.rows.len else 0;
         const plan = chrome.planRows(.{
-            .editor = &self.composer.editor,
-            .picker_open = picker_view != null,
-            .popup_row_count = popup_rows,
-            .queue_line_count = queue_lines.len,
-            .viewport_hint_len = self.viewport_hint.len,
-            .status_open = status_visible,
+            .attention = .{
+                .viewport_hint = self.viewport_hint,
+                .queue_lines = queue_lines,
+            },
+            .activity_open = activity.text.len > 0,
+            .composer = &self.composer.editor,
+            .listbox = self.listboxMeasure(),
         }, width, height);
-        picker_view = self.pickerView(plan.picker_rows);
-        popup_view = self.popupView(if (picker_view == null) plan.popup_rows else 0);
+        const listbox = self.listboxView(plan.listbox_rows);
         const transcript_lines = self.collectTranscriptLines(plan.transcript_rows);
         self.last_transcript_rows = plan.transcript_rows;
         const layout_work = self.transcript.lastLayoutWork();
@@ -1662,21 +1620,23 @@ pub const Loop = struct {
         );
 
         return chrome.compose(.{
-            .status = status,
-            .composer_top_left = self.composerLeftText(),
-            .composer_top_right = self.composerRightText(),
-            .scratch_text = self.scratch.text(),
             .transcript_lines = transcript_lines,
-            .queue_lines = queue_lines,
-            .viewport_hint = self.viewport_hint,
-            .editor = &self.composer.editor,
-            .popup = popup_view,
-            .picker = picker_view,
+            .attention = .{
+                .viewport_hint = self.viewport_hint,
+                .queue_lines = queue_lines,
+            },
+            .activity = activity,
+            .composer = .{
+                .editor = &self.composer.editor,
+                .top_left = self.composerLeftText(),
+                .top_right = self.composerRightText(),
+            },
+            .listbox = listbox,
         }, plan, width, height);
     }
 
     pub fn shouldRender(self: *const Loop, now_ns: u64) bool {
-        if (self.statusAnimationDue(now_ns)) return true;
+        if (self.activityAnimationDue(now_ns)) return true;
         return render_policy.shouldRenderWithFloor(
             self.dirty,
             now_ns,
@@ -1685,7 +1645,7 @@ pub const Loop = struct {
         );
     }
 
-    fn statusAnimationDue(self: *const Loop, now_ns: u64) bool {
+    fn activityAnimationDue(self: *const Loop, now_ns: u64) bool {
         if (self.transcript.hasPendingRelayout()) {
             return render_policy.shouldRenderWithFloor(
                 true,
@@ -1694,7 +1654,7 @@ pub const Loop = struct {
                 frame_floor_ns,
             );
         }
-        if (self.statusAnimated()) {
+        if (self.activityAnimated()) {
             return render_policy.shouldRenderWithFloor(
                 true,
                 now_ns,
@@ -1702,7 +1662,7 @@ pub const Loop = struct {
                 frame_floor_ns,
             );
         }
-        if (self.run_state.state == .retry_wait) return now_ns -| self.last_frame_start_ns >= retry_status_tick_ns;
+        if (self.run_state.state == .retry_wait) return now_ns -| self.last_frame_start_ns >= retry_activity_tick_ns;
         return false;
     }
 
@@ -1748,12 +1708,12 @@ pub const Loop = struct {
                 deadline = if (deadline) |current| @min(current, extension_deadline) else extension_deadline;
             }
         }
-        if (self.statusAnimated() or self.transcript.hasPendingRelayout()) {
+        if (self.activityAnimated() or self.transcript.hasPendingRelayout()) {
             const animation_due = render_policy.nextRenderDueNsWithFloor(self.last_frame_start_ns, frame_floor_ns);
             deadline = if (deadline) |current| @min(current, animation_due) else animation_due;
         } else if (self.run_state.state == .retry_wait) {
-            const retry_status_due = self.last_frame_start_ns +| retry_status_tick_ns;
-            deadline = if (deadline) |current| @min(current, retry_status_due) else retry_status_due;
+            const retry_activity_due = self.last_frame_start_ns +| retry_activity_tick_ns;
+            deadline = if (deadline) |current| @min(current, retry_activity_due) else retry_activity_due;
         }
         if (self.synthetic_flood.enabled and !self.synthetic_flood.completed) {
             const flood_due = self.last_frame_start_ns +| frame_floor_ns;
@@ -1794,7 +1754,7 @@ pub const Loop = struct {
             },
             else => {},
         }
-        if (self.statusAnimated()) {
+        if (self.activityAnimated()) {
             if (self.last_animated_frame_start_ns) |previous| {
                 self.trace.recordAnimatedFrameGap(frame_start_ns -| previous, frame_floor_ns);
             }
@@ -2012,7 +1972,7 @@ pub const Loop = struct {
     }
 
     pub fn noticeFmt(self: *Loop, level: Transcript.NoticeLevel, comptime fmt: []const u8, args: anytype) !void {
-        const text = try std.fmt.bufPrint(&self.status_buffer, fmt, args);
+        const text = try std.fmt.bufPrint(&self.activity_buffer, fmt, args);
         try self.notice(level, text);
     }
 
@@ -2208,7 +2168,7 @@ pub const Loop = struct {
         return self.queue_lines[0..count];
     }
 
-    fn statusView(self: *Loop, now_ns: u64) chrome.StatusView {
+    fn activityView(self: *Loop, now_ns: u64) chrome.ActivityView {
         if (self.exit_requested) return .{ .text = "exiting" };
         if (self.exit_hint_visible) return .{ .text = exit_hint_text };
         switch (self.foreground_operation) {
@@ -2232,7 +2192,7 @@ pub const Loop = struct {
             .retry_wait => if (self.run_state.retry) |retry| {
                 const remaining_ns = retry.deadline_ns -| now_ns;
                 const remaining_s = (remaining_ns + std.time.ns_per_s - 1) / std.time.ns_per_s;
-                const text = std.fmt.bufPrint(&self.status_buffer, "Retrying ({d}/{d}) in {d}s… (esc to cancel)", .{ retry.attempt, retry.max, remaining_s }) catch "Retrying";
+                const text = std.fmt.bufPrint(&self.activity_buffer, "Retrying ({d}/{d}) in {d}s… (esc to cancel)", .{ retry.attempt, retry.max, remaining_s }) catch "Retrying";
                 return .{ .text = text };
             },
             .compacting => return .{ .text = "Compacting context… (esc to cancel)", .style = screen.shimmer.base, .effect = .shimmer, .now_ns = now_ns },
@@ -2242,7 +2202,7 @@ pub const Loop = struct {
         return .{};
     }
 
-    fn statusAnimated(self: *const Loop) bool {
+    fn activityAnimated(self: *const Loop) bool {
         return self.transcript.run_active or self.run_state.state == .running or self.run_state.state == .compacting;
     }
 
@@ -2311,31 +2271,27 @@ pub const Loop = struct {
         return "session";
     }
 
-    fn refreshTokenCache(self: *Loop) void {
-        const session = self.session orelse return;
-        if (self.token_cache_entry_count == session.manager.entries.items.len) return;
-        self.token_cache_entry_count = session.manager.entries.items.len;
-        self.token_input_total = 0;
-        self.token_output_total = 0;
-        self.compaction_count = 0;
-        for (session.manager.entries.items) |entry| switch (entry) {
-            .message => |message| {
-                if (message.message != .assistant) continue;
-                const usage = message.message.assistant.usage;
-                self.token_input_total +|= usage.input +| usage.cache_read +| usage.cache_write;
-                self.token_output_total +|= usage.output;
-            },
-            .compaction => self.compaction_count += 1,
-            .model_change, .thinking_level_change => {},
-        };
+    fn listboxMeasure(self: *const Loop) ?chrome.ListboxMeasure {
+        if (self.composer.picker.active) return .picker;
+        if (!self.composer.completion.active or self.composer.completion.candidate_len == 0) return null;
+        return .{ .completion = @min(self.composer.completion.candidate_len, listbox_rows_max) };
     }
 
-    fn popupView(self: *Loop, capacity: usize) ?chrome.PopupView {
-        if (!self.composer.completion.active or self.composer.completion.candidate_len == 0 or self.composer.picker.active) return null;
+    fn listboxView(self: *Loop, capacity: usize) ?chrome.ListboxView {
+        if (self.composer.picker.active) {
+            const rows = self.pickerListboxRows(capacity) orelse return null;
+            return .{ .picker = rows };
+        }
+        const rows = self.completionListboxRows(capacity) orelse return null;
+        return .{ .completion = rows };
+    }
+
+    fn completionListboxRows(self: *Loop, capacity: usize) ?chrome.ListboxRows {
+        if (!self.composer.completion.active or self.composer.completion.candidate_len == 0) return null;
         const visible_capacity = @min(capacity, self.composer.completion_lines.len);
         if (visible_capacity == 0) return null;
         const selected = @min(self.composer.completion.selected, self.composer.completion.candidate_len - 1);
-        const offset = popupVisibleOffset(self.composer.completion.candidate_len, visible_capacity, selected);
+        const offset = listboxVisibleOffset(self.composer.completion.candidate_len, visible_capacity, selected);
         const count = @min(self.composer.completion.candidate_len - offset, visible_capacity);
         for (self.composer.completion.candidates[offset..][0..count], 0..) |*candidate, visible_index| {
             const absolute_index = offset + visible_index;
@@ -2350,12 +2306,12 @@ pub const Loop = struct {
         return .{ .rows = self.composer.completion_lines[0..count], .selected = selected - offset };
     }
 
-    fn popupVisibleOffset(total: usize, capacity: usize, selected: usize) usize {
+    fn listboxVisibleOffset(total: usize, capacity: usize, selected: usize) usize {
         if (capacity == 0 or selected < capacity) return 0;
         return @min(selected - capacity + 1, total -| capacity);
     }
 
-    fn pickerView(self: *Loop, capacity: usize) ?chrome.PickerView {
+    fn pickerListboxRows(self: *Loop, capacity: usize) ?chrome.ListboxRows {
         if (!self.composer.picker.active) return null;
         const visible_capacity = @min(capacity, self.composer.picker_lines.len);
         if (visible_capacity == 0) return null;
@@ -3801,9 +3757,6 @@ pub const Loop = struct {
     fn beginInteractiveRestore(self: *Loop, success_notice: OperationNotice) void {
         self.transcript.clear();
         self.composer.editor.clearHistory();
-        self.token_cache_entry_count = std.math.maxInt(usize);
-        self.token_input_total = 0;
-        self.token_output_total = 0;
         self.foreground_operation = .{ .restoring = .{ .success_notice = success_notice } };
         self.repinViewport();
         self.dirty = true;
@@ -3824,7 +3777,6 @@ pub const Loop = struct {
         }
         const success_notice = restoring.success_notice;
         self.foreground_operation = .idle;
-        self.refreshTokenCache();
         self.repinViewport();
         self.pending_title_update = true;
         try self.notice(.info, success_notice.text());
@@ -5030,15 +4982,141 @@ test "loop nearest deadline includes lone escape and foreground operations" {
     } };
     try std.testing.expectEqual(@as(?u64, 900), loop.nextDeadline());
     try std.testing.expect(loop.foregroundOperationBlocksSubmit());
-    try std.testing.expectEqualStrings("Loading sessions… (esc to cancel)", loop.statusView(0).text);
+    try std.testing.expectEqualStrings("Loading sessions… (esc to cancel)", loop.activityView(0).text);
 
     loop.foreground_operation = .{ .reading_clipboard = .{
         .task = undefined,
         .deadline_ns = 700,
     } };
     try std.testing.expectEqual(@as(?u64, 700), loop.nextDeadline());
-    try std.testing.expectEqualStrings("Reading clipboard image… (esc to cancel)", loop.statusView(0).text);
+    try std.testing.expectEqualStrings("Reading clipboard image… (esc to cancel)", loop.activityView(0).text);
     loop.foreground_operation = .idle;
+}
+
+test "loop Activity covers foreground operation families" {
+    var loop = try Loop.initTest(std.testing.allocator, null);
+    defer loop.deinit();
+    const cases = [_]struct {
+        operation: ForegroundOperation,
+        expected: []const u8,
+    }{
+        .{
+            .operation = .{ .listing = .{
+                .task = undefined,
+                .cancel = undefined,
+                .deadline_ns = 1,
+            } },
+            .expected = "Loading sessions… (esc to cancel)",
+        },
+        .{
+            .operation = .{ .opening = .{
+                .task = undefined,
+                .cancel = undefined,
+                .deadline_ns = 1,
+                .success_notice = .{},
+            } },
+            .expected = "Opening session… (esc to cancel)",
+        },
+        .{
+            .operation = .{ .discarding_opened = undefined },
+            .expected = "Canceling…",
+        },
+        .{
+            .operation = .{ .draining_previous = .{
+                .next_session = undefined,
+                .deadline_ns = 1,
+                .success_notice = .{},
+            } },
+            .expected = "Switching session…",
+        },
+        .{
+            .operation = .{ .restoring = .{ .success_notice = .{} } },
+            .expected = "Restoring session…",
+        },
+        .{
+            .operation = .{ .preparing_images = .{
+                .task = undefined,
+                .cancel = undefined,
+                .deadline_ns = 1,
+                .prompt = .{},
+                .recovery_prompt = .{},
+            } },
+            .expected = "Preparing images… (esc to cancel)",
+        },
+        .{
+            .operation = .{ .preparing_images = .{
+                .task = undefined,
+                .cancel = undefined,
+                .deadline_ns = 1,
+                .apply_result = false,
+                .prompt = .{},
+                .recovery_prompt = .{},
+            } },
+            .expected = "Canceling image preparation…",
+        },
+        .{
+            .operation = .{ .reading_clipboard = .{
+                .task = undefined,
+                .deadline_ns = 1,
+            } },
+            .expected = "Reading clipboard image… (esc to cancel)",
+        },
+        .{
+            .operation = .{ .extension_prompt = .{
+                .handle = undefined,
+                .invocation = .{},
+                .deadline_ns = 1,
+            } },
+            .expected = "Running extension command… (esc to cancel)",
+        },
+    };
+
+    for (cases) |case| {
+        loop.foreground_operation = case.operation;
+        try std.testing.expectEqualStrings(case.expected, loop.activityView(0).text);
+        loop.foreground_operation = .idle;
+    }
+}
+
+test "loop Activity precedence is exhaustive" {
+    var loop = try Loop.initTest(std.testing.allocator, null);
+    defer loop.deinit();
+    var compaction_run: coding_agent.AgentSession.CompactionRun = undefined;
+    compaction_run.state = .settled;
+    const handle = coding_agent.AgentSession.RunHandle.compaction(&compaction_run);
+
+    try std.testing.expectEqualStrings("", loop.activityView(0).text);
+
+    loop.transcript.run_active = true;
+    try std.testing.expectEqualStrings("Working…", loop.activityView(0).text);
+
+    loop.run_state.state = .{ .compacting = .{ .handle = handle, .will_retry = false } };
+    const compacting = loop.activityView(0);
+    try std.testing.expectEqualStrings("Compacting context… (esc to cancel)", compacting.text);
+    try std.testing.expectEqual(chrome.ActivityEffect.shimmer, compacting.effect);
+
+    loop.run_state.state = .{ .retry_wait = .{ .delay_ms = 5_000 } };
+    loop.run_state.retry = .{ .deadline_ns = 5 * std.time.ns_per_s, .attempt = 1, .max = 3 };
+    try std.testing.expectEqualStrings("Retrying (1/3) in 5s… (esc to cancel)", loop.activityView(0).text);
+
+    compaction_run.state = .cancel_requested;
+    loop.run_state.state = .{ .compacting = .{ .handle = handle, .will_retry = false } };
+    try std.testing.expectEqualStrings("Canceling…", loop.activityView(0).text);
+
+    loop.foreground_operation = .{ .restoring = .{ .success_notice = .{} } };
+    try std.testing.expectEqualStrings("Restoring session…", loop.activityView(0).text);
+
+    loop.exit_hint_visible = true;
+    try std.testing.expectEqualStrings(exit_hint_text, loop.activityView(0).text);
+
+    loop.exit_requested = true;
+    try std.testing.expectEqualStrings("exiting", loop.activityView(0).text);
+
+    loop.exit_requested = false;
+    loop.exit_hint_visible = false;
+    loop.foreground_operation = .idle;
+    loop.run_state = .{};
+    loop.transcript.run_active = false;
 }
 
 test "prompt image worker enforces aggregate encoded cap and cancellation" {
@@ -5512,7 +5590,7 @@ test "loop tool UX renders edit patch with diff styles" {
     try std.testing.expect(std.meta.eql(frame.rows()[added_row.?].spans()[2].style.fg, screen.diff.added.fg));
 }
 
-test "loop working status uses shimmer effect" {
+test "loop working Activity uses shimmer effect" {
     var loop = try Loop.initTest(std.testing.allocator, null);
     defer loop.deinit();
     loop.transcript.run_active = true;
@@ -5536,7 +5614,7 @@ test "loop shimmer cadence recovers immediately after a slow frame" {
     try std.testing.expect(loop.shouldRender(due));
 }
 
-test "loop retry status redraws on countdown cadence without dirty" {
+test "loop retry Activity redraws on countdown cadence without dirty" {
     var loop = try Loop.initTest(std.testing.allocator, null);
     defer loop.deinit();
     loop.run_state.state = .{ .retry_wait = .{ .delay_ms = 5_000 } };
@@ -5544,9 +5622,17 @@ test "loop retry status redraws on countdown cadence without dirty" {
     loop.markRendered(0, 1 * std.time.ns_per_ms);
     loop.dirty = false;
 
-    try std.testing.expectEqual(@as(?u64, retry_status_tick_ns), loop.nextDeadline());
-    try std.testing.expect(!loop.shouldRender(retry_status_tick_ns - 1));
-    try std.testing.expect(loop.shouldRender(retry_status_tick_ns));
+    try std.testing.expectEqualStrings(
+        "Retrying (1/3) in 5s… (esc to cancel)",
+        loop.activityView(0).text,
+    );
+    try std.testing.expectEqualStrings(
+        "Retrying (1/3) in 4s… (esc to cancel)",
+        loop.activityView(retry_activity_tick_ns).text,
+    );
+    try std.testing.expectEqual(@as(?u64, retry_activity_tick_ns), loop.nextDeadline());
+    try std.testing.expect(!loop.shouldRender(retry_activity_tick_ns - 1));
+    try std.testing.expect(loop.shouldRender(retry_activity_tick_ns));
 }
 
 test "loop dirty cadence is independent of historical render cost" {
@@ -5707,7 +5793,35 @@ test "loop slash completion only activates for command token at input start" {
     try std.testing.expect(!loop.composer.completion.active);
 }
 
-test "loop picker window follows chrome candidate capacity" {
+test "loop Listbox renders progress metadata and no-match rows" {
+    var loop = try Loop.initTest(std.testing.allocator, null);
+    defer loop.deinit();
+
+    loop.composer.completion.reset(.file);
+    loop.composer.completion.append("indexing files…", "", "", false);
+    const progress_frame = try loop.composeFrame(80, 6);
+    try expectFrameContains(&progress_frame, "indexing files…");
+
+    loop.composer.completion.clear();
+    loop.composer.picker.reset(.model);
+    loop.composer.picker.appendRow(
+        "model",
+        "provider/model",
+        "Model name",
+        "not authenticated",
+        null,
+        false,
+        .none,
+    );
+    const metadata_frame = try loop.composeFrame(80, 12);
+    try expectFrameContains(&metadata_frame, "provider/model  Model name  not authenticated");
+
+    try loop.dispatch(.{ .insert = "/model no-match" });
+    const no_match_frame = try loop.composeFrame(80, 12);
+    try expectFrameContains(&no_match_frame, "  no matches");
+}
+
+test "loop picker Listbox window follows candidate capacity" {
     var loop = try Loop.initTest(std.testing.allocator, null);
     defer loop.deinit();
 
@@ -5724,7 +5838,7 @@ test "loop picker window follows chrome candidate capacity" {
     try expectFrameContains(&frame, "› item5");
 }
 
-test "loop P4 composer chrome caches assistant usage" {
+test "loop Composer metadata renders context model and thinking" {
     var fixture = try RunTestFixture.init("done");
     defer fixture.deinit();
 
@@ -5876,7 +5990,7 @@ test "loop explicit tab completes ordinary dot slash path" {
     try std.testing.expectEqualStrings("open ./src/", loop.composer.editor.text());
 }
 
-test "loop completion popup windows selected candidate" {
+test "loop completion Listbox windows selected candidate" {
     var loop = try Loop.initTest(std.testing.allocator, null);
     defer loop.deinit();
 

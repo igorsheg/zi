@@ -163,9 +163,9 @@ fn writeBaseline(path: []const u8, actual: []const u8) !void {
 
 test "semantic frame golden startup idle" {
     var editor: Editor = .{};
-    const snapshot: chrome.Snapshot = .{ .editor = &editor };
-    const plan = chrome.planRows(.{ .editor = &editor }, 80, 24);
-    const frame = try chrome.compose(snapshot, plan, 80, 24);
+    const view: chrome.FrameView = .{ .composer = .{ .editor = &editor } };
+    const plan = chrome.planRows(.{ .composer = &editor }, 80, 24);
+    const frame = try chrome.compose(view, plan, 80, 24);
     const actual = try serialize(std.testing.allocator, &frame, 80, 24);
     defer std.testing.allocator.free(actual);
     try expectBaseline("startup-idle-80x24", actual);
@@ -174,15 +174,51 @@ test "semantic frame golden startup idle" {
 test "semantic frame golden multiline unicode" {
     var editor: Editor = .{};
     try editor.insert("wide 界界\ncombining e\u{301} and wrapped text");
-    const snapshot: chrome.Snapshot = .{
-        .status = .{ .text = "Preparing images… (esc to cancel)" },
-        .editor = &editor,
+    const view: chrome.FrameView = .{
+        .activity = .{ .text = "Preparing images… (esc to cancel)" },
+        .composer = .{ .editor = &editor },
     };
-    const plan = chrome.planRows(.{ .editor = &editor, .status_open = true }, 40, 10);
-    const frame = try chrome.compose(snapshot, plan, 40, 10);
+    const plan = chrome.planRows(.{ .composer = &editor, .activity_open = true }, 40, 10);
+    const frame = try chrome.compose(view, plan, 40, 10);
     const actual = try serialize(std.testing.allocator, &frame, 40, 10);
     defer std.testing.allocator.free(actual);
     try expectBaseline("multiline-unicode-40x10", actual);
+}
+
+test "semantic frame golden explicit regions" {
+    var editor: Editor = .{};
+    try editor.insert("draft");
+    const transcript = [_]screen.Line{screen.singleSpanLine("conversation", screen.text.normal)};
+    const queues = [_][]const u8{ "steering: inspect tests", "alt+q edits queued messages" };
+    const choices = [_]screen.Line{
+        screen.singleSpanLine("main.zig", screen.text.normal),
+        screen.singleSpanLine("module.zig", screen.text.normal),
+    };
+    const view: chrome.FrameView = .{
+        .transcript_lines = &transcript,
+        .attention = .{ .viewport_hint = "↓ 2 new lines", .queue_lines = &queues },
+        .activity = .{
+            .text = "Working…",
+            .style = screen.shimmer.base,
+            .effect = .shimmer,
+        },
+        .composer = .{
+            .editor = &editor,
+            .top_left = "~/workspace/zi",
+            .top_right = "ctx 10%/128k • faux-default",
+        },
+        .listbox = .{ .completion = .{ .rows = &choices, .selected = 1 } },
+    };
+    const plan = chrome.planRows(.{
+        .attention = view.attention,
+        .activity_open = true,
+        .composer = &editor,
+        .listbox = .{ .completion = choices.len },
+    }, 40, 12);
+    const frame = try chrome.compose(view, plan, 40, 12);
+    const actual = try serialize(std.testing.allocator, &frame, 40, 12);
+    defer std.testing.allocator.free(actual);
+    try expectBaseline("explicit-regions-40x12", actual);
 }
 
 test "typed semantic scenario is bounded and drives concrete owner actions" {

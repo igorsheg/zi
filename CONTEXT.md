@@ -146,14 +146,21 @@ It calls `AgentSession` directly.
 `src/tui/screen.zig`: cell/line/frame primitives, the Kanso color tokens, and the
 Vaxis paint adapter. It holds no product state.
 
+**Frame regions**
+The concrete TUI frame is composed in screen order from Transcript, Attention,
+Activity, Composer, and optional Listbox regions. Region views are borrowed
+inputs for one frame; they own no state, focus, timers, or invalidation. The
+terminal title remains a direct out-of-frame `Loop` side effect.
+
 **Text shimmer**
 `src/tui/text_shimmer.zig`: the only permitted ad-hoc/interpolated RGB color
-exception. It exists solely for the working-status gradient; other UI colors use
-semantic tokens from `screen.zig`.
+exception. It exists solely for the working-activity gradient; other UI colors
+use semantic tokens from `screen.zig`.
 
 **Chrome**
-`src/tui/chrome.zig`: composer, picker/completion listbox, status/footer, and
-viewport chrome. It composes already-owned state; it does not drive sessions.
+`src/tui/chrome.zig`: the concrete frame-region row planner and composer. It
+renders already-owned Transcript, Attention, Activity, Composer, and optional
+Listbox facts; it does not retain state or drive sessions.
 
 **Blocks**
 `src/tui/blocks.zig`: transcript block rendering, especially tool-call UX. Tool

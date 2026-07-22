@@ -1,0 +1,38 @@
+frame width=40 height=12
+cursor row=8 col=6
+row 0 text="conversation" surface={fg=default,bg=default,ul=default,ul_style=off,bold=false,dim=false,italic=false,blink=false,reverse=false,invisible=false,strikethrough=false}
+  span 0 text="conversation" style={fg=default,bg=default,ul=default,ul_style=off,bold=false,dim=false,italic=false,blink=false,reverse=false,invisible=false,strikethrough=false}
+row 1 text="" surface={fg=default,bg=default,ul=default,ul_style=off,bold=false,dim=false,italic=false,blink=false,reverse=false,invisible=false,strikethrough=false}
+row 2 text="" surface={fg=default,bg=default,ul=default,ul_style=off,bold=false,dim=false,italic=false,blink=false,reverse=false,invisible=false,strikethrough=false}
+row 3 text="↓ 2 new lines" surface={fg=default,bg=default,ul=default,ul_style=off,bold=false,dim=false,italic=false,blink=false,reverse=false,invisible=false,strikethrough=false}
+  span 0 text="↓ 2 new lines" style={fg=rgb(#7F8381),bg=default,ul=default,ul_style=off,bold=false,dim=false,italic=false,blink=false,reverse=false,invisible=false,strikethrough=false}
+row 4 text="steering: inspect tests" surface={fg=default,bg=default,ul=default,ul_style=off,bold=false,dim=false,italic=false,blink=false,reverse=false,invisible=false,strikethrough=false}
+  span 0 text="steering: inspect tests" style={fg=rgb(#7F8381),bg=default,ul=default,ul_style=off,bold=false,dim=false,italic=false,blink=false,reverse=false,invisible=false,strikethrough=false}
+row 5 text="alt+q edits queued messages" surface={fg=default,bg=default,ul=default,ul_style=off,bold=false,dim=false,italic=false,blink=false,reverse=false,invisible=false,strikethrough=false}
+  span 0 text="alt+q edits queued messages" style={fg=rgb(#7F8381),bg=default,ul=default,ul_style=off,bold=false,dim=false,italic=false,blink=false,reverse=false,invisible=false,strikethrough=false}
+row 6 text="Working…" surface={fg=default,bg=default,ul=default,ul_style=off,bold=false,dim=false,italic=false,blink=false,reverse=false,invisible=false,strikethrough=false}
+  span 0 text="Working…" style={fg=rgb(#6A6E6C),bg=default,ul=default,ul_style=off,bold=false,dim=false,italic=false,blink=false,reverse=false,invisible=false,strikethrough=false}
+row 7 text="╭ ~/workspace/zi  ctx 10%/128k • faux- ╮" surface={fg=default,bg=rgb(#090E13),ul=default,ul_style=off,bold=false,dim=false,italic=false,blink=false,reverse=false,invisible=false,strikethrough=false}
+  span 0 text="╭" style={fg=rgb(#6A6E6C),bg=default,ul=default,ul_style=off,bold=false,dim=false,italic=false,blink=false,reverse=false,invisible=false,strikethrough=false}
+  span 1 text=" " style={fg=rgb(#6A6E6C),bg=default,ul=default,ul_style=off,bold=false,dim=false,italic=false,blink=false,reverse=false,invisible=false,strikethrough=false}
+  span 2 text="~/workspace/zi" style={fg=rgb(#7F8381),bg=default,ul=default,ul_style=off,bold=false,dim=false,italic=false,blink=false,reverse=false,invisible=false,strikethrough=false}
+  span 3 text=" " style={fg=rgb(#6A6E6C),bg=default,ul=default,ul_style=off,bold=false,dim=false,italic=false,blink=false,reverse=false,invisible=false,strikethrough=false}
+  span 4 text=" " style={fg=rgb(#6A6E6C),bg=default,ul=default,ul_style=off,bold=false,dim=false,italic=false,blink=false,reverse=false,invisible=false,strikethrough=false}
+  span 5 text="ctx 10%/128k • faux-" style={fg=rgb(#7F8381),bg=default,ul=default,ul_style=off,bold=false,dim=false,italic=false,blink=false,reverse=false,invisible=false,strikethrough=false}
+  span 6 text=" " style={fg=rgb(#6A6E6C),bg=default,ul=default,ul_style=off,bold=false,dim=false,italic=false,blink=false,reverse=false,invisible=false,strikethrough=false}
+  span 7 text="╮" style={fg=rgb(#6A6E6C),bg=default,ul=default,ul_style=off,bold=false,dim=false,italic=false,blink=false,reverse=false,invisible=false,strikethrough=false}
+row 8 text="│draft                                 │" surface={fg=default,bg=rgb(#090E13),ul=default,ul_style=off,bold=false,dim=false,italic=false,blink=false,reverse=false,invisible=false,strikethrough=false}
+  span 0 text="│" style={fg=rgb(#6A6E6C),bg=default,ul=default,ul_style=off,bold=false,dim=false,italic=false,blink=false,reverse=false,invisible=false,strikethrough=false}
+  span 1 text="draft" style={fg=default,bg=default,ul=default,ul_style=off,bold=false,dim=false,italic=false,blink=false,reverse=false,invisible=false,strikethrough=false}
+  span 2 text="                                 " style={fg=default,bg=default,ul=default,ul_style=off,bold=false,dim=false,italic=false,blink=false,reverse=false,invisible=false,strikethrough=false}
+  span 3 text="│" style={fg=rgb(#6A6E6C),bg=default,ul=default,ul_style=off,bold=false,dim=false,italic=false,blink=false,reverse=false,invisible=false,strikethrough=false}
+row 9 text="╰──────────────────────────────────────╯" surface={fg=default,bg=rgb(#090E13),ul=default,ul_style=off,bold=false,dim=false,italic=false,blink=false,reverse=false,invisible=false,strikethrough=false}
+  span 0 text="╰" style={fg=rgb(#6A6E6C),bg=default,ul=default,ul_style=off,bold=false,dim=false,italic=false,blink=false,reverse=false,invisible=false,strikethrough=false}
+  span 1 text="──────────────────────────────────────" style={fg=rgb(#6A6E6C),bg=default,ul=default,ul_style=off,bold=false,dim=false,italic=false,blink=false,reverse=false,invisible=false,strikethrough=false}
+  span 2 text="╯" style={fg=rgb(#6A6E6C),bg=default,ul=default,ul_style=off,bold=false,dim=false,italic=false,blink=false,reverse=false,invisible=false,strikethrough=false}
+row 10 text="  main.zig" surface={fg=default,bg=rgb(#090E13),ul=default,ul_style=off,bold=false,dim=false,italic=false,blink=false,reverse=false,invisible=false,strikethrough=false}
+  span 0 text="  " style={fg=rgb(#7F8381),bg=default,ul=default,ul_style=off,bold=false,dim=false,italic=false,blink=false,reverse=false,invisible=false,strikethrough=false}
+  span 1 text="main.zig" style={fg=default,bg=default,ul=default,ul_style=off,bold=false,dim=false,italic=false,blink=false,reverse=false,invisible=false,strikethrough=false}
+row 11 text="› module.zig" surface={fg=default,bg=rgb(#090E13),ul=default,ul_style=off,bold=false,dim=false,italic=false,blink=false,reverse=false,invisible=false,strikethrough=false}
+  span 0 text="› " style={fg=rgb(#7AA89F),bg=default,ul=default,ul_style=off,bold=false,dim=false,italic=false,blink=false,reverse=false,invisible=false,strikethrough=false}
+  span 1 text="module.zig" style={fg=default,bg=default,ul=default,ul_style=off,bold=false,dim=false,italic=false,blink=false,reverse=false,invisible=false,strikethrough=false}

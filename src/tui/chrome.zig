@@ -5,210 +5,247 @@ const screen = @import("screen.zig");
 const text_shimmer = @import("text_shimmer.zig");
 
 pub const prompt = "";
-pub const popup_rows_max: usize = 8;
+pub const listbox_rows_max: usize = 8;
+const attention_rows_max: usize = 4;
 const fill_capacity = 4096;
 const border_fill = glyphs.composer_horizontal ** fill_capacity;
 const border_spaces = " " ** fill_capacity;
 
-pub const PopupView = struct {
-    rows: []const screen.Line = &.{},
-    selected: usize = 0,
+pub const ActivityEffect = enum { none, shimmer };
+
+pub const ActivityView = struct {
+    text: []const u8 = "",
+    style: screen.Style = screen.text.muted,
+    effect: ActivityEffect = .none,
+    now_ns: u64 = 0,
 };
 
-pub const PickerView = struct {
+pub const AttentionView = struct {
+    viewport_hint: []const u8 = "",
+    queue_lines: []const []const u8 = &.{},
+};
+
+pub const ComposerView = struct {
+    editor: *const Editor,
+    top_left: []const u8 = "",
+    top_right: []const u8 = "",
+    top_right_style: screen.Style = screen.text.muted,
+    border_style: screen.Style = screen.text.border,
+};
+
+pub const ListboxRows = struct {
     rows: []const screen.Line = &.{},
     selected: ?usize = null,
 };
 
-pub const StatusEffect = enum { none, shimmer };
+pub const ListboxView = union(enum) {
+    completion: ListboxRows,
+    picker: ListboxRows,
 
-pub const StatusView = struct {
-    text: []const u8 = "",
-    style: screen.Style = screen.text.muted,
-    effect: StatusEffect = .none,
-    now_ns: u64 = 0,
+    fn rows(self: ListboxView) ListboxRows {
+        return switch (self) {
+            .completion => |value| value,
+            .picker => |value| value,
+        };
+    }
 };
 
-pub const Snapshot = struct {
-    status: StatusView = .{},
-    composer_top_left: []const u8 = "",
-    composer_top_right: []const u8 = "",
-    composer_top_right_style: screen.Style = screen.text.muted,
-    composer_bottom_left: []const u8 = "",
-    composer_bottom_right: []const u8 = "",
-    composer_bottom_right_style: screen.Style = screen.text.muted,
-    scratch_text: []const u8 = "",
+pub const FrameView = struct {
     transcript_lines: []const screen.Line = &.{},
-    queue_lines: []const []const u8 = &.{},
-    viewport_hint: []const u8 = "",
-    editor: *const Editor,
-    editor_border_style: screen.Style = screen.text.border,
-    popup: ?PopupView = null,
-    picker: ?PickerView = null,
+    attention: AttentionView = .{},
+    activity: ActivityView = .{},
+    composer: ComposerView,
+    listbox: ?ListboxView = null,
+};
+
+pub const ListboxMeasure = union(enum) {
+    completion: usize,
+    picker,
 };
 
 pub const PlanInput = struct {
-    editor: *const Editor,
-    picker_open: bool = false,
-    popup_row_count: usize = 0,
-    queue_line_count: usize = 0,
-    viewport_hint_len: usize = 0,
-    status_open: bool = false,
+    attention: AttentionView = .{},
+    activity_open: bool = false,
+    composer: *const Editor,
+    listbox: ?ListboxMeasure = null,
 };
 
 pub const RowPlan = struct {
     transcript_rows: usize = 0,
-    queue_rows: usize = 0,
-    status_rows: usize = 0,
-    popup_rows: usize = 0,
-    picker_rows: usize = 0,
+    attention_rows: usize = 0,
+    activity_rows: usize = 0,
     composer_rows: usize = 0,
+    listbox_rows: usize = 0,
 
     pub fn totalRows(self: RowPlan) usize {
-        return self.transcript_rows + self.queue_rows + self.status_rows +
-            self.popup_rows + self.picker_rows + self.composer_rows;
+        return self.transcript_rows + self.attention_rows + self.activity_rows +
+            self.composer_rows + self.listbox_rows;
     }
 };
 
 pub fn planRows(input: PlanInput, width: u16, height: u16) RowPlan {
     if (height == 0) return .{};
     if (height == 1) return .{ .composer_rows = 1 };
+
+    const desired_activity_rows: usize = if (input.activity_open) 1 else 0;
+    const desired_attention_rows = attentionRowCount(input.attention);
     if (height == 2) {
-        const status_rows: usize = if (input.status_open) 1 else 0;
-        const queue_rows: usize = if (!input.status_open and
-            (input.queue_line_count > 0 or input.viewport_hint_len > 0)) 1 else 0;
+        const activity_rows = desired_activity_rows;
+        const attention_rows: usize = if (activity_rows == 0 and desired_attention_rows > 0) 1 else 0;
         return .{
-            .transcript_rows = if (status_rows == 0 and queue_rows == 0) 1 else 0,
-            .queue_rows = queue_rows,
-            .status_rows = status_rows,
+            .transcript_rows = if (activity_rows == 0 and attention_rows == 0) 1 else 0,
+            .attention_rows = attention_rows,
+            .activity_rows = activity_rows,
             .composer_rows = 1,
         };
     }
 
-    const top_chrome = clampedTopChromeRows(
-        queueRowCount(input.queue_line_count, input.viewport_hint_len),
-        if (input.status_open) 1 else 0,
-        height,
-    );
+    const upper = clampedUpperRows(desired_attention_rows, desired_activity_rows, height);
     return rowPlan(
-        input.editor,
-        input.picker_open,
-        top_chrome.queue_rows,
-        top_chrome.status_rows,
-        @min(input.popup_row_count, popup_rows_max),
+        input.composer,
+        upper.attention_rows,
+        upper.activity_rows,
+        desiredListboxRows(input.listbox),
         width,
         height,
     );
 }
 
-pub fn compose(snapshot: Snapshot, plan: RowPlan, width: u16, height: u16) error{ FrameFull, LineFull }!screen.Frame {
+pub fn compose(view: FrameView, plan: RowPlan, width: u16, height: u16) error{ FrameFull, LineFull }!screen.Frame {
     std.debug.assert(plan.totalRows() <= height);
-    std.debug.assert(snapshot.transcript_lines.len <= plan.transcript_rows);
-    if (snapshot.popup) |popup| std.debug.assert(popup.rows.len <= plan.popup_rows);
-    if (snapshot.picker) |picker| std.debug.assert(picker.rows.len <= plan.picker_rows);
+    std.debug.assert(view.transcript_lines.len <= plan.transcript_rows);
+    if (view.listbox) |listbox| std.debug.assert(listbox.rows().rows.len <= plan.listbox_rows);
 
     var frame: screen.Frame = .{};
     if (height == 0) return frame;
-    const bottom_rows = plan.status_rows + plan.popup_rows + plan.composer_rows + plan.picker_rows;
+    const lower_rows = plan.attention_rows + plan.activity_rows + plan.composer_rows + plan.listbox_rows;
 
-    appendTranscriptTail(&frame, snapshot.transcript_lines, plan.transcript_rows) catch |err| return err;
-    if (snapshot.scratch_text.len > 0 and frame.rows().len + plan.queue_rows + bottom_rows < height) {
-        try frame.appendLine(screen.singleSpanLine(tailLine(snapshot.scratch_text), screen.text.normal));
+    try appendTranscriptTail(&frame, view.transcript_lines, plan.transcript_rows);
+    while (frame.rows().len + lower_rows < height) try frame.appendLine(.{});
+    try appendAttention(&frame, view.attention, plan.attention_rows);
+    if (plan.activity_rows > 0) try appendActivityLine(&frame, view.activity);
+    if (plan.composer_rows > 0) {
+        try appendEditor(
+            &frame,
+            view.composer,
+            @intCast(frame.rows().len),
+            plan.composer_rows,
+            width,
+            useBorder(height, width) and plan.composer_rows >= 3,
+        );
     }
-    while (frame.rows().len + plan.queue_rows + bottom_rows < height) try frame.appendLine(.{});
-
-    var remaining_queue_rows = plan.queue_rows;
-    if (snapshot.viewport_hint.len > 0 and remaining_queue_rows > 0) {
-        try frame.appendLine(screen.singleSpanLine(snapshot.viewport_hint, screen.text.muted));
-        remaining_queue_rows -= 1;
-    }
-    for (snapshot.queue_lines[0..@min(snapshot.queue_lines.len, remaining_queue_rows)]) |line| try frame.appendLine(screen.singleSpanLine(line, screen.text.muted));
-    if (plan.status_rows > 0) try appendStatusLine(&frame, snapshot.status);
-    if (plan.composer_rows > 0) appendEditor(&frame, snapshot, @intCast(frame.rows().len), plan.composer_rows, width, snapshot.editor_border_style, useBorder(height, width) and plan.composer_rows >= 3) catch |err| return err;
-    if (snapshot.picker) |picker| try appendPicker(&frame, picker, plan.picker_rows);
-    if (snapshot.popup) |popup| try appendPopup(&frame, popup, plan.popup_rows);
+    if (view.listbox) |listbox| try appendListbox(&frame, listbox, plan.listbox_rows);
     return frame;
 }
 
-fn appendStatusLine(frame: *screen.Frame, status: StatusView) error{ FrameFull, LineFull }!void {
+fn appendAttention(
+    frame: *screen.Frame,
+    attention: AttentionView,
+    rows: usize,
+) error{ FrameFull, LineFull }!void {
+    var remaining = rows;
+    if (attention.viewport_hint.len > 0 and remaining > 0) {
+        try frame.appendLine(screen.singleSpanLine(attention.viewport_hint, screen.text.muted));
+        remaining -= 1;
+    }
+    for (attention.queue_lines[0..@min(attention.queue_lines.len, remaining)]) |line| {
+        try frame.appendLine(screen.singleSpanLine(line, screen.text.muted));
+    }
+}
+
+fn appendActivityLine(frame: *screen.Frame, activity: ActivityView) error{ FrameFull, LineFull }!void {
     var line: screen.Line = .{};
-    switch (status.effect) {
-        .none => try line.append(.{ .text = status.text, .style = status.style }),
-        .shimmer => try text_shimmer.append(&line, status.text, status.now_ns, .{ .base_style = status.style }),
+    switch (activity.effect) {
+        .none => try line.append(.{ .text = activity.text, .style = activity.style }),
+        .shimmer => try text_shimmer.append(
+            &line,
+            activity.text,
+            activity.now_ns,
+            .{ .base_style = activity.style },
+        ),
     }
     try frame.appendLine(line);
 }
 
-const TopChromeRows = struct { queue_rows: usize, status_rows: usize };
+const UpperRows = struct { attention_rows: usize, activity_rows: usize };
 
-fn clampedTopChromeRows(queue_rows: usize, status_rows: usize, height: u16) TopChromeRows {
-    const max_non_editor = @as(usize, height) -| 1;
-    const status = @min(status_rows, max_non_editor);
-    const queue = @min(queue_rows, max_non_editor - status);
-    return .{ .queue_rows = queue, .status_rows = status };
+fn clampedUpperRows(attention_rows: usize, activity_rows: usize, height: u16) UpperRows {
+    const max_non_composer = @as(usize, height) -| 1;
+    const activity = @min(activity_rows, max_non_composer);
+    const attention = @min(attention_rows, max_non_composer - activity);
+    return .{ .attention_rows = attention, .activity_rows = activity };
 }
 
-fn rowPlan(editor: *const Editor, picker_open: bool, queue_rows: usize, status_rows: usize, popup_rows: usize, width: u16, height: u16) RowPlan {
-    var editor_rows_value = editorRows(editor, height, width);
-    var popup_rows_value = popup_rows;
-    var picker_rows_value = if (picker_open) pickerRows(height) else 0;
-
-    const fixed_without_bottom = status_rows + queue_rows;
-    const bottom_budget = @as(usize, height) -| fixed_without_bottom;
-    if (editor_rows_value > bottom_budget) {
-        editor_rows_value = bottom_budget;
-        popup_rows_value = 0;
-        picker_rows_value = 0;
+fn rowPlan(
+    editor: *const Editor,
+    attention_rows: usize,
+    activity_rows: usize,
+    desired_listbox_rows: usize,
+    width: u16,
+    height: u16,
+) RowPlan {
+    var composer_rows = editorRows(editor, height, width);
+    var listbox_rows = desired_listbox_rows;
+    const upper_rows = activity_rows + attention_rows;
+    const lower_budget = @as(usize, height) -| upper_rows;
+    if (composer_rows > lower_budget) {
+        composer_rows = lower_budget;
+        listbox_rows = 0;
     } else {
-        var remaining = bottom_budget - editor_rows_value;
-        if (popup_rows_value > remaining) popup_rows_value = remaining;
-        remaining -= popup_rows_value;
-        if (picker_rows_value > remaining) picker_rows_value = remaining;
+        listbox_rows = @min(listbox_rows, lower_budget - composer_rows);
     }
 
-    const fixed_rows = fixed_without_bottom + editor_rows_value + popup_rows_value + picker_rows_value;
+    const fixed_rows = upper_rows + composer_rows + listbox_rows;
     return .{
         .transcript_rows = if (height > fixed_rows) height - fixed_rows else 0,
-        .queue_rows = queue_rows,
-        .status_rows = status_rows,
-        .composer_rows = editor_rows_value,
-        .popup_rows = popup_rows_value,
-        .picker_rows = picker_rows_value,
+        .attention_rows = attention_rows,
+        .activity_rows = activity_rows,
+        .composer_rows = composer_rows,
+        .listbox_rows = listbox_rows,
     };
 }
 
-fn queueRowCount(queue_line_count: usize, viewport_hint_len: usize) usize {
-    const hint_rows: usize = if (viewport_hint_len > 0) 1 else 0;
-    return @min(queue_line_count + hint_rows, @as(usize, 4));
+fn attentionRowCount(attention: AttentionView) usize {
+    const hint_rows: usize = if (attention.viewport_hint.len > 0) 1 else 0;
+    return @min(attention.queue_lines.len + hint_rows, attention_rows_max);
 }
 
-fn popupRowCount(snapshot: Snapshot) usize {
-    return if (snapshot.popup) |popup| @min(popup.rows.len, popup_rows_max) else 0;
+fn desiredListboxRows(listbox: ?ListboxMeasure) usize {
+    const value = listbox orelse return 0;
+    return switch (value) {
+        .completion => |row_count| @min(row_count, listbox_rows_max),
+        .picker => listbox_rows_max,
+    };
 }
 
-fn pickerRows(_: u16) usize {
-    return popup_rows_max;
-}
-
-fn appendPopup(frame: *screen.Frame, popup: PopupView, rows: usize) error{ FrameFull, LineFull }!void {
-    for (popup.rows[0..@min(rows, popup.rows.len)], 0..) |source, index| {
-        try appendSelectableLine(frame, source, index == popup.selected);
-    }
-}
-
-fn appendPicker(frame: *screen.Frame, picker: PickerView, rows: usize) error{ FrameFull, LineFull }!void {
+fn appendListbox(
+    frame: *screen.Frame,
+    listbox: ListboxView,
+    rows: usize,
+) error{ FrameFull, LineFull }!void {
     if (rows == 0) return;
+    const values = listbox.rows();
     const start_len = frame.rows().len;
-    for (picker.rows[0..@min(rows, picker.rows.len)], 0..) |source, index| {
-        const selected = if (picker.selected) |selected_index| index == selected_index else false;
-        try appendSelectableLine(frame, source, selected);
+    for (values.rows[0..@min(rows, values.rows.len)], 0..) |source, index| {
+        const selected = if (values.selected) |selected_index| index == selected_index else false;
+        try appendListboxLine(frame, source, selected);
     }
-    while (frame.rows().len - start_len < rows) try frame.appendLine(.{});
+    switch (listbox) {
+        .completion => {},
+        .picker => while (frame.rows().len - start_len < rows) try frame.appendLine(.{}),
+    }
 }
 
-fn appendSelectableLine(frame: *screen.Frame, source: screen.Line, selected: bool) error{ FrameFull, LineFull }!void {
+fn appendListboxLine(
+    frame: *screen.Frame,
+    source: screen.Line,
+    selected: bool,
+) error{ FrameFull, LineFull }!void {
     var line: screen.Line = .{ .row_style = screen.surface.composer };
-    try line.append(.{ .text = if (selected) glyphs.picker_selected else glyphs.picker_unselected, .style = if (selected) screen.text.accent else screen.text.muted });
+    try line.append(.{
+        .text = if (selected) glyphs.picker_selected else glyphs.picker_unselected,
+        .style = if (selected) screen.text.accent else screen.text.muted,
+    });
     for (source.spans()) |span| try line.append(span);
     try frame.appendLine(line);
 }
@@ -217,11 +254,6 @@ fn appendTranscriptTail(frame: *screen.Frame, lines: []const screen.Line, rows: 
     if (rows == 0) return;
     const start = lines.len - @min(lines.len, rows);
     for (lines[start..]) |line| try frame.appendLine(line);
-}
-
-fn tailLine(text: []const u8) []const u8 {
-    if (text.len <= 80) return text;
-    return text[text.len - 80 ..];
 }
 
 fn editorRows(editor: *const Editor, height: u16, width: u16) usize {
@@ -457,22 +489,46 @@ fn isSoftWrapBreakByte(byte: u8) bool {
     };
 }
 
-fn appendEditor(frame: *screen.Frame, snapshot: Snapshot, start_row: u16, rows: usize, width: u16, border_style: screen.Style, bordered: bool) error{ FrameFull, LineFull }!void {
+fn appendEditor(
+    frame: *screen.Frame,
+    composer: ComposerView,
+    start_row: u16,
+    rows: usize,
+    width: u16,
+    bordered: bool,
+) error{ FrameFull, LineFull }!void {
     const content_rows = rows - if (bordered) @as(usize, 2) else 0;
     const text_cols = composerTextColumns(width, bordered);
-    const total_visual = visualEditorLineCount(snapshot.editor, text_cols);
-    const cursor_visual = cursorVisualLineIndex(snapshot.editor, text_cols);
+    const total_visual = visualEditorLineCount(composer.editor, text_cols);
+    const cursor_visual = cursorVisualLineIndex(composer.editor, text_cols);
     const first_visual = firstVisibleVisualLine(total_visual, cursor_visual, content_rows);
     var row: u16 = start_row;
     if (bordered) {
-        try frame.appendLine(borderLine(width, border_style, true, snapshot.composer_top_left, snapshot.composer_top_right, snapshot.composer_top_right_style));
+        try frame.appendLine(borderLine(
+            width,
+            composer.border_style,
+            true,
+            composer.top_left,
+            composer.top_right,
+            composer.top_right_style,
+        ));
         row += 1;
     }
     for (0..content_rows) |row_offset| {
-        const visual = visualEditorLineAt(snapshot.editor, text_cols, first_visual + row_offset);
-        try appendEditorVisualLine(frame, snapshot.editor, visual, row + @as(u16, @intCast(row_offset)), width, border_style, bordered);
+        const visual = visualEditorLineAt(composer.editor, text_cols, first_visual + row_offset);
+        try appendEditorVisualLine(
+            frame,
+            composer.editor,
+            visual,
+            row + @as(u16, @intCast(row_offset)),
+            width,
+            composer.border_style,
+            bordered,
+        );
     }
-    if (bordered) try frame.appendLine(borderLine(width, border_style, false, snapshot.composer_bottom_left, snapshot.composer_bottom_right, snapshot.composer_bottom_right_style));
+    if (bordered) {
+        try frame.appendLine(borderLine(width, composer.border_style, false, "", "", screen.text.muted));
+    }
 }
 
 fn appendEditorVisualLine(frame: *screen.Frame, editor: *const Editor, maybe_visual: ?VisualEditorLine, row: u16, width: u16, border_style: screen.Style, bordered: bool) error{ FrameFull, LineFull }!void {
@@ -555,16 +611,18 @@ fn spaceFill(cols: usize) []const u8 {
     return border_spaces[0..@min(border_spaces.len, cols)];
 }
 
-fn composeForTest(snapshot: Snapshot, width: u16, height: u16) error{ FrameFull, LineFull }!screen.Frame {
+fn composeForTest(view: FrameView, width: u16, height: u16) error{ FrameFull, LineFull }!screen.Frame {
+    const listbox_measure: ?ListboxMeasure = if (view.listbox) |listbox| switch (listbox) {
+        .completion => |rows| .{ .completion = rows.rows.len },
+        .picker => .picker,
+    } else null;
     const plan = planRows(.{
-        .editor = snapshot.editor,
-        .picker_open = snapshot.picker != null,
-        .popup_row_count = popupRowCount(snapshot),
-        .queue_line_count = snapshot.queue_lines.len,
-        .viewport_hint_len = snapshot.viewport_hint.len,
-        .status_open = snapshot.status.text.len > 0,
+        .attention = view.attention,
+        .activity_open = view.activity.text.len > 0,
+        .composer = view.composer.editor,
+        .listbox = listbox_measure,
     }, width, height);
-    return compose(snapshot, plan, width, height);
+    return compose(view, plan, width, height);
 }
 
 test "vertical cursor targets hard lines and preserves preferred display column" {
@@ -614,29 +672,34 @@ test "chrome row plan is authoritative across pathological dimensions" {
     try editor.insert("one\ntwo\nthree");
     const widths = [_]u16{ 0, 1, 2, 3, 10, 80 };
     const heights = [_]u16{ 0, 1, 2, 3, 6, 12, screen.row_capacity };
+    const queues = [_][]const u8{ "steering: one", "follow-up: two", "alt+q edits queued messages" };
+    const listboxes = [_]?ListboxMeasure{ null, .{ .completion = listbox_rows_max }, .picker };
     for (widths) |width| {
         for (heights) |height| {
-            inline for (.{ false, true }) |picker_open| {
+            for (listboxes) |listbox| {
                 const plan = planRows(.{
-                    .editor = &editor,
-                    .picker_open = picker_open,
-                    .popup_row_count = if (picker_open) 0 else popup_rows_max,
-                    .queue_line_count = 4,
-                    .viewport_hint_len = 8,
-                    .status_open = true,
+                    .attention = .{ .viewport_hint = "↓ 2 new lines", .queue_lines = &queues },
+                    .activity_open = true,
+                    .composer = &editor,
+                    .listbox = listbox,
                 }, width, height);
                 try std.testing.expect(plan.totalRows() <= height);
                 if (height > 0) try std.testing.expectEqual(@as(usize, height), plan.totalRows());
-                if (picker_open) try std.testing.expectEqual(@as(usize, 0), plan.popup_rows);
+                try std.testing.expect(plan.attention_rows <= attention_rows_max);
+                try std.testing.expect(plan.activity_rows <= 1);
+                try std.testing.expect(plan.listbox_rows <= listbox_rows_max);
             }
         }
     }
 }
 
-test "chrome composes status and editor rows" {
+test "chrome composes Activity and Composer regions" {
     var editor: Editor = .{};
     try editor.insert("hello");
-    var frame = try composeForTest(.{ .status = .{ .text = "ready" }, .editor = &editor }, 80, 3);
+    const frame = try composeForTest(.{
+        .activity = .{ .text = "ready" },
+        .composer = .{ .editor = &editor },
+    }, 80, 3);
 
     try std.testing.expectEqual(@as(usize, 3), frame.rows().len);
     var buffer: [32]u8 = undefined;
@@ -647,11 +710,16 @@ test "chrome composes status and editor rows" {
     try std.testing.expectEqual(@as(u16, 2), frame.cursor.?.row);
 }
 
-test "chrome composes shimmer status as bounded spans" {
+test "chrome composes shimmer Activity as bounded spans" {
     var editor: Editor = .{};
     const frame = try composeForTest(.{
-        .status = .{ .text = "Working…", .style = screen.shimmer.base, .effect = .shimmer, .now_ns = 6 * 32 * std.time.ns_per_ms },
-        .editor = &editor,
+        .activity = .{
+            .text = "Working…",
+            .style = screen.shimmer.base,
+            .effect = .shimmer,
+            .now_ns = 6 * 32 * std.time.ns_per_ms,
+        },
+        .composer = .{ .editor = &editor },
     }, 80, 3);
 
     var buffer: [32]u8 = undefined;
@@ -659,11 +727,14 @@ test "chrome composes shimmer status as bounded spans" {
     try std.testing.expect(frame.rows()[1].spans().len > 1);
 }
 
-test "chrome uses two-row spare row for transcript when no status" {
+test "chrome uses two-row spare row for Transcript when Activity is absent" {
     var editor: Editor = .{};
     try editor.insert("draft");
     const transcript = [_]screen.Line{screen.singleSpanLine("streaming", screen.text.normal)};
-    const frame = try composeForTest(.{ .transcript_lines = &transcript, .editor = &editor }, 80, 2);
+    const frame = try composeForTest(.{
+        .transcript_lines = &transcript,
+        .composer = .{ .editor = &editor },
+    }, 80, 2);
 
     var buffer: [128]u8 = undefined;
     try std.testing.expectEqualStrings("streaming", frame.rows()[0].copyText(&buffer));
@@ -672,12 +743,17 @@ test "chrome uses two-row spare row for transcript when no status" {
     try std.testing.expectEqual(@as(u16, 1), frame.cursor.?.row);
 }
 
-test "chrome renders transcript and queue lines above editor" {
+test "chrome renders Transcript Attention Activity and Composer in screen order" {
     var editor: Editor = .{};
     try editor.insert("draft");
     const transcript = [_]screen.Line{screen.singleSpanLine("streaming", screen.text.normal)};
     const queues = [_][]const u8{"steering: next"};
-    const frame = try composeForTest(.{ .status = .{ .text = "ready" }, .transcript_lines = &transcript, .queue_lines = &queues, .editor = &editor }, 80, 8);
+    const frame = try composeForTest(.{
+        .transcript_lines = &transcript,
+        .attention = .{ .queue_lines = &queues },
+        .activity = .{ .text = "ready" },
+        .composer = .{ .editor = &editor },
+    }, 80, 8);
 
     var buffer: [128]u8 = undefined;
     try std.testing.expectEqualStrings("streaming", frame.rows()[0].copyText(&buffer));
@@ -686,45 +762,84 @@ test "chrome renders transcript and queue lines above editor" {
     try std.testing.expect(std.mem.startsWith(u8, frame.rows()[6].copyText(&buffer), "│draft"));
 }
 
-test "chrome golden matrix protects transcript and composer across lower chrome" {
+test "Attention consumes zero rows when absent and keeps queue order" {
+    var editor: Editor = .{};
+    const empty = planRows(.{ .composer = &editor }, 80, 8);
+    try std.testing.expectEqual(@as(usize, 0), empty.attention_rows);
+
+    const queues = [_][]const u8{
+        "steering: one",
+        "follow-up: two",
+        "alt+q edits queued messages",
+    };
+    const frame = try composeForTest(.{
+        .attention = .{ .queue_lines = &queues },
+        .composer = .{ .editor = &editor },
+    }, 80, 8);
+
+    var buffer: [128]u8 = undefined;
+    try std.testing.expectEqualStrings("steering: one", frame.rows()[2].copyText(&buffer));
+    try std.testing.expectEqualStrings("follow-up: two", frame.rows()[3].copyText(&buffer));
+    try std.testing.expectEqualStrings("alt+q edits queued messages", frame.rows()[4].copyText(&buffer));
+}
+
+test "Attention is capped and viewport hint displaces the action hint" {
+    var editor: Editor = .{};
+    const queues = [_][]const u8{
+        "steering: one",
+        "follow-up: two",
+        "follow-up: three",
+        "alt+q edits queued messages",
+    };
+    const frame = try composeForTest(.{
+        .attention = .{ .viewport_hint = "↓ 2 new lines", .queue_lines = &queues },
+        .composer = .{ .editor = &editor },
+    }, 80, 8);
+
+    var buffer: [128]u8 = undefined;
+    try std.testing.expectEqualStrings("↓ 2 new lines", frame.rows()[1].copyText(&buffer));
+    try std.testing.expectEqualStrings("steering: one", frame.rows()[2].copyText(&buffer));
+    try std.testing.expectEqualStrings("follow-up: two", frame.rows()[3].copyText(&buffer));
+    try std.testing.expectEqualStrings("follow-up: three", frame.rows()[4].copyText(&buffer));
+    for (frame.rows()) |row| {
+        try std.testing.expect(std.mem.indexOf(u8, row.copyText(&buffer), "alt+q") == null);
+    }
+}
+
+test "chrome region matrix protects Transcript and Composer" {
     var editor: Editor = .{};
     try editor.insert("draft");
     const transcript = [_]screen.Line{screen.singleSpanLine("transcript", screen.text.normal)};
     const queues = [_][]const u8{"steering: next"};
-    const popup_rows = [_]screen.Line{screen.singleSpanLine("completion", screen.text.normal)};
+    const completion_rows = [_]screen.Line{screen.singleSpanLine("completion", screen.text.normal)};
     const picker_rows = [_]screen.Line{screen.singleSpanLine("picker", screen.text.normal)};
     const cases = [_]struct {
         height: u16,
-        queue_lines: []const []const u8 = &.{},
-        status: StatusView = .{},
-        viewport_hint: []const u8 = "",
-        popup: ?PopupView = null,
-        picker: ?PickerView = null,
+        attention: AttentionView = .{},
+        activity: ActivityView = .{},
+        listbox: ?ListboxView = null,
     }{
         .{ .height = 2 },
-        .{ .height = 6, .status = .{ .text = "working" } },
-        .{ .height = 8, .queue_lines = &queues },
-        .{ .height = 8, .viewport_hint = "↓ 2 new lines" },
-        .{ .height = 10, .popup = .{ .rows = &popup_rows } },
-        .{ .height = 14, .picker = .{ .rows = &picker_rows } },
+        .{ .height = 6, .activity = .{ .text = "working" } },
+        .{ .height = 8, .attention = .{ .queue_lines = &queues } },
+        .{ .height = 8, .attention = .{ .viewport_hint = "↓ 2 new lines" } },
+        .{ .height = 10, .listbox = .{ .completion = .{ .rows = &completion_rows } } },
+        .{ .height = 14, .listbox = .{ .picker = .{ .rows = &picker_rows } } },
         .{
             .height = 16,
-            .queue_lines = &queues,
-            .status = .{ .text = "working" },
-            .viewport_hint = "↓ 2 new lines",
-            .popup = .{ .rows = &popup_rows },
+            .attention = .{ .viewport_hint = "↓ 2 new lines", .queue_lines = &queues },
+            .activity = .{ .text = "working" },
+            .listbox = .{ .completion = .{ .rows = &completion_rows } },
         },
     };
 
     for (cases) |case| {
         const frame = try composeForTest(.{
             .transcript_lines = &transcript,
-            .queue_lines = case.queue_lines,
-            .status = case.status,
-            .viewport_hint = case.viewport_hint,
-            .editor = &editor,
-            .popup = case.popup,
-            .picker = case.picker,
+            .attention = case.attention,
+            .activity = case.activity,
+            .composer = .{ .editor = &editor },
+            .listbox = case.listbox,
         }, 40, case.height);
         try std.testing.expectEqual(@as(usize, case.height), frame.rows().len);
         try std.testing.expect(frame.cursor != null);
@@ -739,19 +854,21 @@ test "chrome golden matrix protects transcript and composer across lower chrome"
     }
 }
 
-test "chrome clamps cursor to frame width" {
+test "chrome clamps Composer cursor to frame width" {
     var editor: Editor = .{};
     try editor.insert("hello");
-    const frame = try composeForTest(.{ .editor = &editor }, 4, 2);
+    const frame = try composeForTest(.{ .composer = .{ .editor = &editor } }, 4, 2);
 
     try std.testing.expectEqual(@as(u16, 1), frame.cursor.?.col);
     try std.testing.expectEqual(@as(u16, 1), frame.cursor.?.row);
 }
 
-test "chrome renders bordered editor with supplied border style" {
+test "chrome renders bordered Composer with supplied border style" {
     var editor: Editor = .{};
     try editor.insert("draft");
-    const frame = try composeForTest(.{ .editor = &editor, .editor_border_style = screen.text.error_ }, 20, 6);
+    const frame = try composeForTest(.{
+        .composer = .{ .editor = &editor, .border_style = screen.text.error_ },
+    }, 20, 6);
 
     var buffer: [128]u8 = undefined;
     try std.testing.expectEqualStrings("╭──────────────────╮", frame.rows()[3].copyText(&buffer));
@@ -760,12 +877,14 @@ test "chrome renders bordered editor with supplied border style" {
     try std.testing.expect(std.meta.eql(frame.rows()[3].spans()[0].style.fg, screen.text.error_.fg));
 }
 
-test "chrome composer border labels are display-column aligned" {
+test "chrome Composer metadata is display-column aligned" {
     var editor: Editor = .{};
     const frame = try composeForTest(.{
-        .editor = &editor,
-        .composer_top_left = "~/workspace/dev/personal/zi",
-        .composer_top_right = "ctx 10%/259k • gpt-5.5 (low)",
+        .composer = .{
+            .editor = &editor,
+            .top_left = "~/workspace/dev/personal/zi",
+            .top_right = "ctx 10%/259k • gpt-5.5 (low)",
+        },
     }, 100, 6);
 
     var buffer: [256]u8 = undefined;
@@ -775,10 +894,10 @@ test "chrome composer border labels are display-column aligned" {
     try std.testing.expect(std.mem.endsWith(u8, top, "╮"));
 }
 
-test "chrome bordered editor uses display columns for fill and cursor" {
+test "chrome bordered Composer uses display columns for fill and cursor" {
     var editor: Editor = .{};
     try editor.insert("λ🙂");
-    const frame = try composeForTest(.{ .editor = &editor }, 20, 6);
+    const frame = try composeForTest(.{ .composer = .{ .editor = &editor } }, 20, 6);
 
     var buffer: [128]u8 = undefined;
     const row = frame.rows()[4].copyText(&buffer);
@@ -788,10 +907,10 @@ test "chrome bordered editor uses display columns for fill and cursor" {
     try std.testing.expectEqual(@as(u16, 4), frame.cursor.?.col);
 }
 
-test "chrome wraps composer input by display columns" {
+test "chrome wraps Composer input by display columns" {
     var editor: Editor = .{};
     try editor.insert("hello my good friend");
-    const frame = try composeForTest(.{ .editor = &editor }, 20, 10);
+    const frame = try composeForTest(.{ .composer = .{ .editor = &editor } }, 20, 10);
 
     var buffer: [128]u8 = undefined;
     try std.testing.expectEqualStrings("│hello my good     │", frame.rows()[7].copyText(&buffer));
@@ -800,11 +919,11 @@ test "chrome wraps composer input by display columns" {
     try std.testing.expectEqual(@as(u16, 8), frame.cursor.?.row);
 }
 
-test "chrome keeps wrapped composer cursor visible" {
+test "chrome keeps wrapped Composer cursor visible" {
     var editor: Editor = .{};
     try editor.insert("abcdefgh ijklmnop qrstuvwx yz");
     editor.moveBufferStart();
-    const frame = try composeForTest(.{ .editor = &editor }, 12, 20);
+    const frame = try composeForTest(.{ .composer = .{ .editor = &editor } }, 12, 20);
 
     var buffer: [128]u8 = undefined;
     try std.testing.expectEqualStrings("│abcdefgh  │", frame.rows()[15].copyText(&buffer));
@@ -812,10 +931,10 @@ test "chrome keeps wrapped composer cursor visible" {
     try std.testing.expectEqual(@as(u16, 15), frame.cursor.?.row);
 }
 
-test "chrome wraps composer input by unicode cell width" {
+test "chrome wraps Composer input by unicode cell width" {
     var editor: Editor = .{};
     try editor.insert("λ🙂abcdef");
-    const frame = try composeForTest(.{ .editor = &editor }, 10, 10);
+    const frame = try composeForTest(.{ .composer = .{ .editor = &editor } }, 10, 10);
 
     var buffer: [128]u8 = undefined;
     try std.testing.expectEqualStrings("│λ🙂abcde│", frame.rows()[7].copyText(&buffer));
@@ -824,16 +943,16 @@ test "chrome wraps composer input by unicode cell width" {
     try std.testing.expectEqual(@as(u16, 8), frame.cursor.?.row);
 }
 
-test "chrome renders picker with main selection marker" {
+test "chrome renders picker Listbox with shared selection marker" {
     var editor: Editor = .{};
     const rows = [_]screen.Line{
         screen.singleSpanLine("alpha", screen.text.normal),
         screen.singleSpanLine("beta", screen.text.normal),
     };
     const frame = try composeForTest(.{
-        .status = .{ .text = "ready" },
-        .editor = &editor,
-        .picker = .{ .rows = &rows, .selected = 1 },
+        .activity = .{ .text = "ready" },
+        .composer = .{ .editor = &editor },
+        .listbox = .{ .picker = .{ .rows = &rows, .selected = 1 } },
     }, 80, 10);
 
     var buffer: [128]u8 = undefined;
@@ -843,7 +962,7 @@ test "chrome renders picker with main selection marker" {
     try std.testing.expect(std.meta.eql(frame.rows()[5].row_style.bg, screen.surface.composer.bg));
 }
 
-test "chrome renders completion popup with main selection marker" {
+test "chrome renders completion Listbox with shared selection marker" {
     var editor: Editor = .{};
     try editor.insert("@m");
     const rows = [_]screen.Line{
@@ -851,9 +970,9 @@ test "chrome renders completion popup with main selection marker" {
         screen.singleSpanLine("module.zig", screen.text.normal),
     };
     const frame = try composeForTest(.{
-        .status = .{ .text = "ready" },
-        .editor = &editor,
-        .popup = .{ .rows = &rows, .selected = 1 },
+        .activity = .{ .text = "ready" },
+        .composer = .{ .editor = &editor },
+        .listbox = .{ .completion = .{ .rows = &rows, .selected = 1 } },
     }, 80, 9);
 
     var buffer: [128]u8 = undefined;
@@ -863,11 +982,15 @@ test "chrome renders completion popup with main selection marker" {
     try std.testing.expect(std.meta.eql(frame.rows()[8].row_style.bg, screen.surface.composer.bg));
 }
 
-test "chrome protects composer under small queued/status chrome" {
+test "chrome protects Activity and Composer under constrained Attention" {
     var editor: Editor = .{};
     try editor.insert("draft");
     const queues = [_][]const u8{ "steering: one", "follow-up: two", "follow-up: three" };
-    const frame = try composeForTest(.{ .status = .{ .text = "Working…" }, .queue_lines = &queues, .editor = &editor }, 40, 3);
+    const frame = try composeForTest(.{
+        .attention = .{ .queue_lines = &queues },
+        .activity = .{ .text = "Working…" },
+        .composer = .{ .editor = &editor },
+    }, 40, 3);
 
     var buffer: [128]u8 = undefined;
     try std.testing.expectEqualStrings("steering: one", frame.rows()[0].copyText(&buffer));
@@ -877,7 +1000,7 @@ test "chrome protects composer under small queued/status chrome" {
     try std.testing.expectEqual(@as(u16, 2), frame.cursor.?.row);
 }
 
-test "chrome picker keeps eighth visible candidate" {
+test "chrome picker Listbox reserves eight rows" {
     var editor: Editor = .{};
     const rows = [_]screen.Line{
         screen.singleSpanLine("item0", screen.text.normal),
@@ -890,11 +1013,23 @@ test "chrome picker keeps eighth visible candidate" {
         screen.singleSpanLine("item7", screen.text.normal),
     };
     const frame = try composeForTest(.{
-        .editor = &editor,
-        .picker = .{ .rows = &rows, .selected = 7 },
+        .composer = .{ .editor = &editor },
+        .listbox = .{ .picker = .{ .rows = &rows, .selected = 7 } },
     }, 80, 30);
 
     var buffer: [128]u8 = undefined;
     try std.testing.expectEqualStrings("› item7", frame.rows()[29].copyText(&buffer));
     try std.testing.expect(std.meta.eql(frame.rows()[29].row_style.bg, screen.surface.composer.bg));
+}
+
+test "chrome picker Listbox renders non-selectable empty state" {
+    var editor: Editor = .{};
+    const rows = [_]screen.Line{screen.singleSpanLine("no matches", screen.text.muted)};
+    const frame = try composeForTest(.{
+        .composer = .{ .editor = &editor },
+        .listbox = .{ .picker = .{ .rows = &rows, .selected = null } },
+    }, 40, 12);
+
+    var buffer: [128]u8 = undefined;
+    try std.testing.expectEqualStrings("  no matches", frame.rows()[4].copyText(&buffer));
 }

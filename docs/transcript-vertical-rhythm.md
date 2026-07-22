@@ -26,8 +26,9 @@ AgentEvent / restored session entry
 - `src/tui/layout.zig` and `src/tui/markdown.zig` turn source text into physical
   rows but do not own spacing between transcript items.
 - `src/tui/Loop.zig` owns the viewport and selects a contiguous visible range.
-- `src/tui/chrome.zig` places those rows above queues, status, and composer. It
-  does not add spacing between transcript items.
+- `src/tui/chrome.zig` gives the Transcript region the rows left after planning
+  Attention, Activity, Composer, and optional Listbox regions. It does not add
+  spacing between transcript items.
 - `src/tui/screen.zig` paints one `screen.Line` into one terminal row. There is
   no independent line-height setting.
 
@@ -697,7 +698,7 @@ row count for at least these fixtures at wide and narrow widths:
 16. every pair of adjacent item classes, asserting exactly one outer margin;
 17. follow-tail with 1, 2, and many transcript rows available;
 18. anchored viewport beginning on content, semantic blank, and outer margin;
-19. queue/status/picker/popup combinations around the same transcript tail;
+19. Attention/Activity/Composer/Listbox combinations around the same transcript tail;
 20. width 0, 1, 2, 3, normal, and resize transitions.
 
 PTY evidence should then cover only mechanics that headless rows cannot prove:

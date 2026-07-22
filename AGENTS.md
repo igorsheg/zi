@@ -175,8 +175,8 @@ Rules:
 - Shimmer is the only allowed ad-hoc/interpolated RGB color path. Keep that
   exception contained in `text_shimmer.zig`; all other UI colors use semantic
   tokens.
-- `chrome.zig` composes composer, picker/completion listbox, status, footer, and
-  viewport hint from already-owned state.
+- `chrome.zig` plans and composes the concrete Transcript, Attention, Activity,
+  Composer, and optional Listbox regions from already-owned borrowed state.
 - `layout.zig` and `markdown.zig` are pure presentation helpers. They should not
   sample sessions or mutate product state.
 

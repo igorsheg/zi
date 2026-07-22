@@ -12,15 +12,17 @@ input and agent producers
   -> Loop dispatch/tick
   -> Transcript content mutation and layout invalidation
   -> Transcript prepareLayout and visible-line lookup
-  -> chrome composition
+  -> chrome authoritative region RowPlan and composition
   -> screen paint
   -> Vaxis cell diff and synchronous terminal flush
 ```
 
 `Loop` owns input, viewport policy, run driving, timers, and frame composition.
 `Transcript` owns bounded transcript items and every derived transcript layout
-cache and line index. `layout.zig` is pure text presentation mechanism. Vaxis
-owns terminal cells and diffing.
+cache and line index. `chrome` composes borrowed Transcript, Attention, Activity,
+Composer, and optional Listbox views using one authoritative `RowPlan`.
+`layout.zig` is pure text presentation mechanism. Vaxis owns terminal cells and
+diffing.
 
 No other TUI module may mutate transcript layout state or maintain a mirror of
 its line index.
