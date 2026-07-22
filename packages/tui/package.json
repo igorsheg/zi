@@ -1,5 +1,5 @@
 {
-  "name": "@zi/tui",
+  "name": "@with-zi/tui",
   "version": "0.0.0",
   "private": true,
   "license": "MIT",
@@ -19,7 +19,7 @@
   },
   "dependencies": {
     "@opentui/core": "catalog:",
-    "@zi/coding-agent": "workspace:*",
+    "@with-zi/coding-agent": "workspace:*",
     "nanostores": "catalog:",
     "string-width": "catalog:"
   },

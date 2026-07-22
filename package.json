@@ -26,6 +26,7 @@
     "format:check": "oxfmt --check .",
     "lint": "oxlint .",
     "lint:fix": "oxlint --fix .",
+    "package:npm": "bun scripts/build-npm-packages.ts",
     "prepare": "lefthook install",
     "release:build": "bun scripts/build-release.ts",
     "start": "bun packages/cli/src/main.ts",

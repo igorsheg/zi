@@ -5,9 +5,9 @@ import { basename, join, resolve } from "node:path"
 
 import { compileZi } from "./compile-zi.js"
 
-const releaseTargets = ["darwin-arm64", "darwin-x64", "linux-arm64", "linux-x64", "windows-x64"] as const
+export const releaseTargets = ["darwin-arm64", "darwin-x64", "linux-arm64", "linux-x64", "windows-x64"] as const
 
-type ReleaseTarget = (typeof releaseTargets)[number]
+export type ReleaseTarget = (typeof releaseTargets)[number]
 
 export interface ReleaseBuildOptions {
   readonly version: string
@@ -109,7 +109,7 @@ async function run(
   if (exitCode !== 0) throw new Error(`${command[0]} exited with code ${exitCode}`)
 }
 
-function releaseTarget(value: string): ReleaseTarget {
+export function releaseTarget(value: string): ReleaseTarget {
   switch (value) {
     case "darwin-arm64":
     case "darwin-x64":

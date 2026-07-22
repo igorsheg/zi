@@ -1,5 +1,5 @@
 import { CliRenderEvents, createCliRenderer, DebugOverlayCorner, type CliRenderer } from "@opentui/core"
-import type { AgentSession, AgentSessionRuntime, SessionBootstrapDiagnostic } from "@zi/coding-agent"
+import type { AgentSession, AgentSessionRuntime, SessionBootstrapDiagnostic } from "@with-zi/coding-agent"
 
 import { defaultTheme } from "../theme.js"
 import type { TuiDiagnosticFlags } from "./diagnostics.js"

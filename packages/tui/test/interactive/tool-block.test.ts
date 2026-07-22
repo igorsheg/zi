@@ -2,7 +2,7 @@ import { expect, test } from "bun:test"
 
 import { BoxRenderable, type RenderContext, type Renderable, TextRenderable } from "@opentui/core"
 import { createTestRenderer } from "@opentui/core/testing"
-import { projectToolPresentation, type ToolPresentation } from "@zi/coding-agent"
+import { projectToolPresentation, type ToolPresentation } from "@with-zi/coding-agent"
 
 import { ToolCallView, type ToolViewFrame } from "../../src/interactive/transcript/tool-view.js"
 import { defaultTheme } from "../../src/theme.js"
@@ -1006,7 +1006,7 @@ test("header-only, notices-only, and action-only tools share the open-rail gramm
 
 test("wrapped secondary commands copy exactly without decorative prompts or visual newlines", async () => {
   const setup = await createTestRenderer({ width: 24, height: 20, useThread: false })
-  const command = "bun run --filter @zi/tui test --watch=false"
+  const command = "bun run --filter @with-zi/tui test --watch=false"
   const view = new ToolCallView(
     setup.renderer,
     "wrapped-command",

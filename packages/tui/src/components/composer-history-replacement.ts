@@ -1,5 +1,5 @@
 import type { TextareaRenderable } from "@opentui/core"
-import { maxSessionPromptHistoryEntries } from "@zi/coding-agent"
+import { maxSessionPromptHistoryEntries } from "@with-zi/coding-agent"
 
 const maxComposerHistoryReplacementSlots = maxSessionPromptHistoryEntries * 2 + 1
 

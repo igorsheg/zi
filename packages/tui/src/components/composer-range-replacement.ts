@@ -1,5 +1,5 @@
 import type { Extmark, TextareaRenderable } from "@opentui/core"
-import { maxSessionPromptHistoryEntryBytes } from "@zi/coding-agent"
+import { maxSessionPromptHistoryEntryBytes } from "@with-zi/coding-agent"
 
 import { promptTextOffsetIsBoundary, promptTextSlice, promptTextWidth } from "./cell-text.js"
 

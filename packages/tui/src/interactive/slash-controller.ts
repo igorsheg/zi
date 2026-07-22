@@ -3,7 +3,7 @@ import {
   type AgentSession,
   type BuiltinSlashCommandName,
   type SlashCommand
-} from "@zi/coding-agent"
+} from "@with-zi/coding-agent"
 
 import { fuzzyMatch } from "./fuzzy-match.js"
 

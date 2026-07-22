@@ -23,7 +23,7 @@ packages/cli
   runtime construction and mode selection
 ```
 
-- `coding-agent` imports neither `@zi/tui` nor `@opentui/core`.
+- `coding-agent` imports neither `@with-zi/tui` nor `@opentui/core`.
 - `tui` consumes coding-agent public APIs and `@opentui/core`.
 - Future print/RPC modes consume `AgentSession` without loading OpenTUI.
 - A future web client receives its own application owner rather than terminal state.

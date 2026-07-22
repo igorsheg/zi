@@ -1,5 +1,5 @@
 import { BoxRenderable, CliRenderEvents, type CliRenderer, type SyntaxStyle } from "@opentui/core"
-import type { AgentSession, AgentSessionRuntime, SessionBootstrapDiagnostic } from "@zi/coding-agent"
+import type { AgentSession, AgentSessionRuntime, SessionBootstrapDiagnostic } from "@with-zi/coding-agent"
 
 import { createSyntaxStyle, defaultTheme, type Theme } from "../theme.js"
 import { type BrowserOpener, SystemBrowserOpener } from "./browser-opener.js"

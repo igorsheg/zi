@@ -2,8 +2,8 @@ import { expect, spyOn, test } from "bun:test"
 
 import { CliRenderEvents, MarkdownRenderable, type Renderable, TextRenderable } from "@opentui/core"
 import { createTestRenderer, type TestRendererSetup } from "@opentui/core/testing"
-import type { AgentMessage } from "@zi/coding-agent"
-import { fauxAssistantMessage, fauxText, fauxThinking, fauxToolCall } from "@zi/coding-agent/testing"
+import type { AgentMessage } from "@with-zi/coding-agent"
+import { fauxAssistantMessage, fauxText, fauxThinking, fauxToolCall } from "@with-zi/coding-agent/testing"
 import { atom, type WritableAtom } from "nanostores"
 
 import { TuiDiagnosticsOverlay } from "../../src/interactive/diagnostics.js"

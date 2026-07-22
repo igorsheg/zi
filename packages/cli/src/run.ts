@@ -7,7 +7,7 @@ import {
   type AgentSessionRuntime,
   type CreateAgentRuntimeOptions,
   type PrintModeResult
-} from "@zi/coding-agent"
+} from "@with-zi/coding-agent"
 
 import { parseArgs, type Args } from "./args.js"
 import { ziVersion } from "./version.js"

@@ -14,14 +14,14 @@
       },
     },
     "packages/cli": {
-      "name": "@zi/cli",
+      "name": "@with-zi/cli",
       "version": "0.0.0",
       "bin": {
         "zi": "./src/main.ts",
       },
       "dependencies": {
-        "@zi/coding-agent": "workspace:*",
-        "@zi/tui": "workspace:*",
+        "@with-zi/coding-agent": "workspace:*",
+        "@with-zi/tui": "workspace:*",
       },
       "devDependencies": {
         "@types/bun": "catalog:",
@@ -29,7 +29,7 @@
       },
     },
     "packages/coding-agent": {
-      "name": "@zi/coding-agent",
+      "name": "@with-zi/coding-agent",
       "version": "0.0.0",
       "dependencies": {
         "@earendil-works/pi-agent-core": "catalog:",
@@ -46,11 +46,11 @@
       },
     },
     "packages/tui": {
-      "name": "@zi/tui",
+      "name": "@with-zi/tui",
       "version": "0.0.0",
       "dependencies": {
         "@opentui/core": "catalog:",
-        "@zi/coding-agent": "workspace:*",
+        "@with-zi/coding-agent": "workspace:*",
         "nanostores": "catalog:",
         "string-width": "catalog:",
       },
@@ -152,11 +152,11 @@
 
     "@opentui/core-win32-x64": ["@opentui/core-win32-x64@0.4.5", "", { "os": "win32", "cpu": "x64" }, "sha512-Y8T/yXCDGagRGiQrtmuB6AhRcPucKFs/Dre3v8kJwNYqDccI4FzUPKclZ7djfmRZNjl7JUqPhZZP/PwDpQocMg=="],
 
-    "@zi/cli": ["@zi/cli@workspace:packages/cli"],
+    "@with-zi/cli": ["@with-zi/cli@workspace:packages/cli"],
 
-    "@zi/coding-agent": ["@zi/coding-agent@workspace:packages/coding-agent"],
+    "@with-zi/coding-agent": ["@with-zi/coding-agent@workspace:packages/coding-agent"],
 
-    "@zi/tui": ["@zi/tui@workspace:packages/tui"],
+    "@with-zi/tui": ["@with-zi/tui@workspace:packages/tui"],
 
     "@oxfmt/binding-android-arm-eabi": ["@oxfmt/binding-android-arm-eabi@0.58.0", "", { "os": "android", "cpu": "arm" }, "sha512-Uz62sHduGGPftXtILGyxdSW4PX82rUg+rfdNqhsgxe881g4rIoXlIqmZQ6HVKcF4f+F8qMhdD03Bx5u7gmeTdg=="],
 

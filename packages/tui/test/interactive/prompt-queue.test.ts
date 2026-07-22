@@ -7,7 +7,7 @@ import {
   fauxAssistantMessage,
   fauxProvider,
   fauxThinking
-} from "@zi/coding-agent/testing"
+} from "@with-zi/coding-agent/testing"
 
 import { createInteractiveTest } from "./harness.js"
 

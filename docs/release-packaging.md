@@ -17,19 +17,20 @@ The GitHub executable remains the source artifact. npm packaging should wrap tho
 
 ## npm package shape
 
-Target package names need one final ownership decision before publish:
+The owned npm scope is `@with-zi`:
 
-- top-level CLI: prefer `zi` if available;
-- platform packages: prefer `@zi/zi-<target>` if the npm scope is owned, otherwise use an owned scope such as `@igorsheg/zi-<target>`;
-- SDK packages: keep private `@zi/coding-agent`/`@zi/tui` names until an owned public scope exists.
+- top-level CLI: `@with-zi/zi`;
+- platform packages: `@with-zi/zi-<target>`;
+- SDK packages: private source packages use `@with-zi/coding-agent` and `@with-zi/tui` until their public boundary is ready.
 
-The top-level package should contain:
+`scripts/build-npm-packages.ts` assembles these packages from the native GitHub release archives. The top-level package contains:
 
 ```text
 package.json
 bin/zi.js          # tiny platform resolver
 README.md
 LICENSE
+THIRD_PARTY_NOTICES.md
 ```
 
 Each platform package should contain:
@@ -41,32 +42,28 @@ LICENSE
 THIRD_PARTY_NOTICES.md
 ```
 
-The resolver should only locate the installed optional package for `process.platform`/`process.arch`, then replace the current process with the native executable. If the optional package is missing, it should print a short reinstall diagnostic rather than downloading a binary.
+The resolver only locates the installed optional package for `process.platform`/`process.arch`, then runs the native executable. If the optional package is missing, it prints a short reinstall diagnostic rather than downloading a binary.
 
 ## GitHub release hardening
 
-The current release workflow already has the right spine: verify once, build on native runners, smoke-test, archive, checksum, attest, and publish after every target succeeds.
+The current release workflow verifies once, builds on native runners, smoke-tests, archives, packages npm tarballs, verifies a local npm install, checksums, attests, and publishes GitHub release assets only after every target succeeds.
 
 Before the first public release:
 
-- add `THIRD_PARTY_NOTICES.md` generated from the dependency graph and bundled OpenTUI assets;
-- decide whether Windows artifacts should stay `.tar.gz` or additionally publish `.zip`;
+- expand `THIRD_PARTY_NOTICES.md` from a maintained summary to a generated dependency-graph notice;
+- decide whether Windows GitHub artifacts should stay `.tar.gz` or additionally publish `.zip`;
 - configure macOS signing/notarization and Windows signing;
 - run a prerelease tag through the `release` environment;
-- document install and update commands in `README.md` after the npm package name is final.
+- document install and update commands in `README.md` after the first npm dry run succeeds.
 
 ## npm publish workflow
 
-Add a separate workflow after the GitHub archive flow is proven:
+The tag workflow now builds npm tarballs but does not publish them. Publishing becomes a separate final gate after npm trusted publishing is configured for the repository:
 
 1. trigger on the same SemVer tag;
-2. run the complete check;
-3. build or download the attested native archives;
-4. assemble one platform package per archive with exact version matching the tag;
-5. assemble the top-level CLI package with optional dependencies on the platform packages;
-6. run `npm pack --dry-run --json` for every package;
-7. install the packed top-level package in a clean temp project and run `zi --version` plus `zi --help`;
-8. publish platform packages first, then the top-level package, with `npm publish --provenance`.
+2. download the `npm-packages` artifact from the release run or rebuild it from attested archives;
+3. publish platform packages first, then the top-level package, with `npm publish --provenance --access public`;
+4. verify `npm view @with-zi/zi version` matches the tag.
 
 Package `files` allowlists should be explicit. No package should include source tests, local config, session data, or build caches.
 

@@ -34,6 +34,14 @@ zi-0.1.0-<os>-<arch>.tar.gz
 zi-0.1.0-<os>-<arch>.tar.gz.sha256
 ```
 
+After a release archive exists for the current target, the npm package assembler can validate the package shape without publishing:
+
+```sh
+bun scripts/build-npm-packages.ts --version 0.1.0 --target <os>-<arch> --dry-run
+```
+
+Use `--pack --verify-current` to create local `@with-zi/zi` and `@with-zi/zi-<target>` tarballs and install-smoke them from a temporary npm project.
+
 A requested `--target` must match the current host. Release versions are restricted to SemVer core and prerelease forms so they are safe artifact names. Local and release builds share `scripts/compile-zi.ts`, which refuses to compile unless the running Bun version exactly matches the workspace `packageManager` pin, embeds the version, disables Bun's runtime loading of project `.env`, `bunfig.toml`, and `package.json` files, and runs `zi --version` against the compiled executable. Pi AI intentionally hides Node-only OAuth flows from generic bundlers, so this owner replaces its one opaque loader with bundler-visible literal imports for Anthropic, GitHub Copilot, and OpenAI Codex while preserving lazy loading; it fails if the pinned dependency no longer matches. A standalone regression test derives request authentication through all three implementations. The release builder then archives and checksums that executable.
 
 ## GitHub delivery
@@ -45,9 +53,10 @@ Pushing a tag such as `v0.1.0` starts `.github/workflows/release.yml`. It:
 1. runs the complete check once;
 2. builds macOS arm64/x64, Linux arm64/x64, and Windows x64 on native runners;
 3. smoke-tests and archives each executable;
-4. verifies and combines SHA-256 checksums;
-5. creates GitHub build-provenance attestations;
-6. publishes one GitHub release only after every target succeeds.
+4. assembles `@with-zi/zi` plus platform npm tarballs from those archives and install-smokes the current runner package;
+5. verifies and combines SHA-256 checksums;
+6. creates GitHub build-provenance attestations;
+7. publishes one GitHub release only after every target succeeds.
 
 A SemVer prerelease tag such as `v0.2.0-rc.1` creates a prerelease. The tag is the product-version source; package versions do not control executable releases. The final job deploys through the GitHub `release` environment, where repository settings can require approval without changing the workflow.
 
@@ -56,4 +65,4 @@ git tag -s v0.1.0 -m "Zi v0.1.0"
 git push origin v0.1.0
 ```
 
-Before the first public release, add third-party notices and configure macOS notarization and Windows signing. GitHub attestations prove workflow provenance but do not replace platform signatures.
+Before the first public release, expand third-party notices and configure macOS notarization and Windows signing. GitHub attestations prove workflow provenance but do not replace platform signatures. npm publishing is intentionally a later gate after trusted publishing is configured for the `@with-zi` organization.

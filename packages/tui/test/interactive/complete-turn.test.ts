@@ -12,7 +12,7 @@ import {
   fauxText,
   fauxThinking,
   fauxToolCall
-} from "@zi/coding-agent/testing"
+} from "@with-zi/coding-agent/testing"
 
 import { createInteractiveTest, renderMarkdownSettled } from "./harness.js"
 

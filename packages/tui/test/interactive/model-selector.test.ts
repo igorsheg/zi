@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test"
 
 import { TextareaRenderable } from "@opentui/core"
-import { createModels, createTestAgentRuntime as createAgentRuntime, fauxProvider } from "@zi/coding-agent/testing"
+import { createModels, createTestAgentRuntime as createAgentRuntime, fauxProvider } from "@with-zi/coding-agent/testing"
 
 import { createInteractiveStore } from "../../src/interactive/interactive-store.js"
 import { fileCompletionInputFromText } from "../../src/interactive/prompt/file-completion.js"

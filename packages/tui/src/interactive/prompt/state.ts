@@ -8,7 +8,7 @@ import type {
   SessionInfo,
   StoredCredential,
   ThinkingLevel
-} from "@zi/coding-agent"
+} from "@with-zi/coding-agent"
 
 export type PromptFeedback =
   | { readonly type: "none" }

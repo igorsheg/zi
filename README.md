@@ -44,10 +44,10 @@ Piped stdin is the first prompt and positional prompts follow in argument order.
 
 ## SDK
 
-`@zi/coding-agent` can run without the CLI or TUI. `createAgentRuntime()` is the high-level constructor: it resolves one cwd, assembles path-owned services, and returns a frozen `{ session, services }` shell. The caller that creates the runtime always owns final session disposal.
+`@with-zi/coding-agent` can run without the CLI or TUI. `createAgentRuntime()` is the high-level constructor: it resolves one cwd, assembles path-owned services, and returns a frozen `{ session, services }` shell. The caller that creates the runtime always owns final session disposal.
 
 ```ts
-import { createAgentRuntime } from "@zi/coding-agent"
+import { createAgentRuntime } from "@with-zi/coding-agent"
 
 const runtime = await createAgentRuntime({ cwd: process.cwd() }) // persistent session by default
 try {
@@ -80,12 +80,12 @@ const runtime = await createAgentRuntime({
 
 For a client that supports whole-session `/new` and `/resume`, use `createAgentSessionRuntime(options)`. It exposes the current session and services, reconstructs every cwd-bound owner when switching, and owns disposal of replaced sessions. Its creator owns final `runtime.dispose()` followed by `runtime.waitForIdle()`.
 
-For full assembly control, `createAgentSession({ services, sessionManager, model, tools })` is the lower-level constructor. It consumes caller-owned `ZiPaths`, `SettingsManager`, `FileCredentialStore`, `ModelRegistry`, `ResourceLoader`, and `SessionManager`; it does not construct or dispose them. Raw `Models` injection is test-only under `@zi/coding-agent/testing`.
+For full assembly control, `createAgentSession({ services, sessionManager, model, tools })` is the lower-level constructor. It consumes caller-owned `ZiPaths`, `SettingsManager`, `FileCredentialStore`, `ModelRegistry`, `ResourceLoader`, and `SessionManager`; it does not construct or dispose them. Raw `Models` injection is test-only under `@with-zi/coding-agent/testing`.
 
 Text batch execution reuses the same caller-owned session and does not access process streams or signals:
 
 ```ts
-import { runPrintMode } from "@zi/coding-agent"
+import { runPrintMode } from "@with-zi/coding-agent"
 
 const result = await runPrintMode(runtime.session, {
   output: "text",

@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test"
 
 import { TextAttributes } from "@opentui/core"
-import { createAgentSession, type AgentMessage, SessionManager } from "@zi/coding-agent"
+import { createAgentSession, type AgentMessage, SessionManager } from "@with-zi/coding-agent"
 import {
   createModels,
   createTestAgentRuntime as createAgentRuntime,
@@ -10,7 +10,7 @@ import {
   fauxText,
   fauxThinking,
   fauxToolCall
-} from "@zi/coding-agent/testing"
+} from "@with-zi/coding-agent/testing"
 
 import { createInteractiveTest } from "./harness.js"
 

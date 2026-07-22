@@ -4,8 +4,8 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 
 import { TextareaRenderable, TextAttributes } from "@opentui/core"
-import { createAgentRuntime, type AuthenticationEvent, type AuthenticationPrompt } from "@zi/coding-agent"
-import { createModels, fauxProvider } from "@zi/coding-agent/testing"
+import { createAgentRuntime, type AuthenticationEvent, type AuthenticationPrompt } from "@with-zi/coding-agent"
+import { createModels, fauxProvider } from "@with-zi/coding-agent/testing"
 
 import { createInteractiveTest, renderSettled } from "./harness.js"
 

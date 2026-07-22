@@ -1,5 +1,5 @@
 import { BoxRenderable, type CliRenderer, TextRenderable } from "@opentui/core"
-import type { QueuedInputs } from "@zi/coding-agent"
+import type { QueuedInputs } from "@with-zi/coding-agent"
 
 import { truncateToCells } from "../../components/cell-text.js"
 import type { Theme } from "../../theme.js"

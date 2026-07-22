@@ -6,7 +6,7 @@ import {
   createTestAgentRuntime as createAgentRuntime,
   fauxAssistantMessage,
   fauxProvider
-} from "@zi/coding-agent/testing"
+} from "@with-zi/coding-agent/testing"
 
 import { createInteractiveTest, renderMarkdownSettled, renderSettled } from "./harness.js"
 

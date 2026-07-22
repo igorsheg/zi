@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test"
 
-import { createAgentRuntime } from "@zi/coding-agent"
-import { createModels, fauxProvider } from "@zi/coding-agent/testing"
+import { createAgentRuntime } from "@with-zi/coding-agent"
+import { createModels, fauxProvider } from "@with-zi/coding-agent/testing"
 
 import { createInteractiveTest } from "./harness.js"
 

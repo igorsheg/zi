@@ -6,7 +6,7 @@ import {
   createTestAgentRuntime as createAgentRuntime,
   fauxAssistantMessage,
   fauxProvider
-} from "@zi/coding-agent/testing"
+} from "@with-zi/coding-agent/testing"
 
 import { maxPastedTextBytes, type ClipboardReader } from "../../src/interactive/clipboard.js"
 import { createInteractiveTest } from "./harness.js"

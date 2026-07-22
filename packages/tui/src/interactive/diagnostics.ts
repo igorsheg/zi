@@ -8,7 +8,7 @@ import {
   TextRenderable,
   TimeToFirstDrawRenderable
 } from "@opentui/core"
-import type { AgentSession, AgentSessionMemoryDiagnostics } from "@zi/coding-agent"
+import type { AgentSession, AgentSessionMemoryDiagnostics } from "@with-zi/coding-agent"
 
 import type { Theme } from "../theme.js"
 import type { TranscriptView } from "./transcript/view.js"

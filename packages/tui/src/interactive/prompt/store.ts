@@ -13,7 +13,7 @@ import type {
   SessionReplacementCancellation,
   StoredCredential,
   ThinkingLevel
-} from "@zi/coding-agent"
+} from "@with-zi/coding-agent"
 import { atom, type ReadableAtom } from "nanostores"
 
 import { promptTextWidth } from "../../components/cell-text.js"

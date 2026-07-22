@@ -4,7 +4,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 
 import { BoxRenderable, TextareaRenderable } from "@opentui/core"
-import { createModels, createTestAgentRuntime as createAgentRuntime, fauxProvider } from "@zi/coding-agent/testing"
+import { createModels, createTestAgentRuntime as createAgentRuntime, fauxProvider } from "@with-zi/coding-agent/testing"
 
 import { promptTextWidth } from "../../src/components/cell-text.js"
 import {

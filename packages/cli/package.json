@@ -1,5 +1,5 @@
 {
-  "name": "@zi/cli",
+  "name": "@with-zi/cli",
   "version": "0.0.0",
   "private": true,
   "license": "MIT",
@@ -20,8 +20,8 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@zi/coding-agent": "workspace:*",
-    "@zi/tui": "workspace:*"
+    "@with-zi/coding-agent": "workspace:*",
+    "@with-zi/tui": "workspace:*"
   },
   "devDependencies": {
     "@types/bun": "catalog:",

@@ -6,7 +6,7 @@ import type {
   PendingInputDelivery,
   QueuedInputs,
   ShellDemotionResult
-} from "@zi/coding-agent"
+} from "@with-zi/coding-agent"
 import { atom, computed, type ReadableAtom } from "nanostores"
 
 interface ActiveToolIdentity {

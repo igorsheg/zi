@@ -1,6 +1,6 @@
 import { CodeRenderable } from "@opentui/core"
 import { createTestRenderer, type TestRendererOptions, type TestRendererSetup } from "@opentui/core/testing"
-import type { AgentSession, AgentSessionRuntime } from "@zi/coding-agent"
+import type { AgentSession, AgentSessionRuntime } from "@with-zi/coding-agent"
 
 import type { BrowserOpener } from "../../src/interactive/browser-opener.js"
 import type { ClipboardReader } from "../../src/interactive/clipboard.js"

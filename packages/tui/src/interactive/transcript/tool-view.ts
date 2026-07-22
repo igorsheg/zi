@@ -13,7 +13,7 @@ import {
   type ToolPresentationSource,
   type ToolPreviewPolicy,
   type ToolPreviewWindow
-} from "@zi/coding-agent"
+} from "@with-zi/coding-agent"
 
 import {
   openTuiTabIndicator,

@@ -1,4 +1,4 @@
-import type { ModelChoice } from "@zi/coding-agent"
+import type { ModelChoice } from "@with-zi/coding-agent"
 
 export function configuredModelChoices(
   choices: readonly ModelChoice[],

@@ -23,7 +23,7 @@ function processHost(): CliHost {
     createRuntime: defaultRuntimeFactory,
     createSessionRuntime: defaultSessionRuntimeFactory,
     async runInteractive(sessionRuntime, initialMessages) {
-      const { runTui } = await import("@zi/tui")
+      const { runTui } = await import("@with-zi/tui")
       await runTui({ sessionRuntime, initialMessages })
     },
     onSignal(listener) {

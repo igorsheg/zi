@@ -5,7 +5,7 @@ import {
   type ProjectFileMatch,
   type ProjectFileSearchResult,
   validateProjectFileSearchQuery
-} from "@zi/coding-agent"
+} from "@with-zi/coding-agent"
 
 import {
   promptTextIndex,

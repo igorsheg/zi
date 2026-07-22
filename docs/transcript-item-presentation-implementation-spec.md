@@ -192,7 +192,7 @@ A Bash invocation with a human description keeps the exact command as subordinat
 
 ```text
 ◆ Run the full TUI test suite · timeout 180s
-│ $ bun run --filter @zi/tui test
+│ $ bun run --filter @with-zi/tui test
 ├─
 │ … earlier output · Ctrl+O details
 │ 146 tests passed

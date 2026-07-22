@@ -7,7 +7,7 @@ import type {
   SlashCommand,
   SettingsScope,
   StoredCredential
-} from "@zi/coding-agent"
+} from "@with-zi/coding-agent"
 
 import { glyphs } from "../../glyphs.js"
 import { sameModel } from "./model-choices.js"

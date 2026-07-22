@@ -7,7 +7,7 @@ import {
   type PasteEvent,
   type RenderContext
 } from "@opentui/core"
-import { maxSessionPromptHistoryEntries, type ImageContent } from "@zi/coding-agent"
+import { maxSessionPromptHistoryEntries, type ImageContent } from "@with-zi/coding-agent"
 
 import type { Theme } from "../theme.js"
 import { promptTextSlice, promptTextWidth, textWidth } from "./cell-text.js"

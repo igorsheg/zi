@@ -10,7 +10,7 @@ import {
   TextRenderable,
   type RenderContext
 } from "@opentui/core"
-import { projectToolPresentation, type AgentMessage } from "@zi/coding-agent"
+import { projectToolPresentation, type AgentMessage } from "@with-zi/coding-agent"
 
 import type { Theme } from "../../theme.js"
 import type { ActiveTool } from "../interactive-store.js"

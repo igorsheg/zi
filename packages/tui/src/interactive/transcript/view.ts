@@ -8,7 +8,7 @@ import {
   type SyntaxStyle,
   TextRenderable
 } from "@opentui/core"
-import { projectToolPresentation, type AgentMessage } from "@zi/coding-agent"
+import { projectToolPresentation, type AgentMessage } from "@with-zi/coding-agent"
 import type { ReadableAtom } from "nanostores"
 
 import { createThinkingSyntaxStyle, type Theme } from "../../theme.js"

@@ -7,7 +7,7 @@ import {
   createTestAgentRuntime as createAgentRuntime,
   fauxAssistantMessage,
   fauxProvider
-} from "@zi/coding-agent/testing"
+} from "@with-zi/coding-agent/testing"
 
 test("initial CLI prompts run after interactive terminal ownership is established", async () => {
   const setup = await createTestRenderer({ width: 40, height: 8, useThread: false })

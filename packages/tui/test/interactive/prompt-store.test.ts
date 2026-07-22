@@ -1,12 +1,12 @@
 import { expect, test } from "bun:test"
 
-import { createAgentSession, type AgentSession, SessionManager } from "@zi/coding-agent"
+import { createAgentSession, type AgentSession, SessionManager } from "@with-zi/coding-agent"
 import {
   createModels,
   createTestAgentRuntime as createAgentRuntime,
   fauxAssistantMessage,
   fauxProvider
-} from "@zi/coding-agent/testing"
+} from "@with-zi/coding-agent/testing"
 
 import { createInteractiveStore } from "../../src/interactive/interactive-store.js"
 import { fileCompletionInputFromText } from "../../src/interactive/prompt/file-completion.js"

@@ -1,14 +1,14 @@
 import { expect, test } from "bun:test"
 import { join } from "node:path"
 
-import type { AgentMessage, AgentRuntime, AgentSessionRuntime, CreateAgentRuntimeOptions } from "@zi/coding-agent"
+import type { AgentMessage, AgentRuntime, AgentSessionRuntime, CreateAgentRuntimeOptions } from "@with-zi/coding-agent"
 import {
   createModels,
   createTestAgentRuntime,
   createTestAgentSessionRuntime,
   fauxAssistantMessage,
   fauxProvider
-} from "@zi/coding-agent/testing"
+} from "@with-zi/coding-agent/testing"
 
 import {
   helpText,

@@ -6,8 +6,8 @@ import {
   type AgentSessionServices,
   type CreateAgentRuntimeOptions,
   type CreateAgentSessionOptions
-} from "@zi/coding-agent"
-import { createModels } from "@zi/coding-agent/testing"
+} from "@with-zi/coding-agent"
+import { createModels } from "@with-zi/coding-agent/testing"
 
 export async function useHighLevelRuntime(options: CreateAgentRuntimeOptions): Promise<readonly string[]> {
   const runtime: AgentRuntime = await createAgentRuntime(options)

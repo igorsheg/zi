@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test"
 
-import type { SlashCommand } from "@zi/coding-agent"
+import type { SlashCommand } from "@with-zi/coding-agent"
 
 import { SlashController } from "../../src/interactive/slash-controller.js"
 

@@ -10,7 +10,7 @@ import {
   createTestAgentSessionRuntime,
   fauxAssistantMessage,
   fauxProvider
-} from "@zi/coding-agent/testing"
+} from "@with-zi/coding-agent/testing"
 
 import { createInteractiveRuntimeTest, renderSettled, type InteractiveTestSetup } from "./harness.js"
 

@@ -1,13 +1,13 @@
 import { expect, test } from "bun:test"
 
-import type { AgentSession, AgentSessionEvent } from "@zi/coding-agent"
+import type { AgentSession, AgentSessionEvent } from "@with-zi/coding-agent"
 import {
   createModels,
   createTestAgentRuntime as createAgentRuntime,
   fauxAssistantMessage,
   fauxProvider,
   fauxToolCall
-} from "@zi/coding-agent/testing"
+} from "@with-zi/coding-agent/testing"
 
 import {
   createInteractiveStore,

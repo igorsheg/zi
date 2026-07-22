@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test"
 
 import { BoxRenderable, ScrollBoxRenderable, TextareaRenderable } from "@opentui/core"
-import { createAgentSession, type AgentMessage, type AgentSession, SessionManager } from "@zi/coding-agent"
+import { createAgentSession, type AgentMessage, type AgentSession, SessionManager } from "@with-zi/coding-agent"
 import {
   createModels,
   createTestAgentRuntime as createAgentRuntime,
@@ -9,7 +9,7 @@ import {
   fauxProvider,
   fauxThinking,
   fauxToolCall
-} from "@zi/coding-agent/testing"
+} from "@with-zi/coding-agent/testing"
 
 import { createInteractiveTest, type InteractiveTestSetup, renderMarkdownSettled, renderSettled } from "./harness.js"
 
