@@ -1035,6 +1035,7 @@ export class AgentSession {
     }
 
     try {
+      if (failure) this.#finishExceptionalRetry(runId, failure.cause)
       if (this.#isCurrentRun(runId)) {
         if (failure && this.#pending.some(entry => entry.runId === runId)) {
           this.#activity = { type: "failed", runId, cause: failure.cause }
@@ -1145,28 +1146,29 @@ export class AgentSession {
         countOverflowRecovery: true
       })
       if (outcome === "stop" && activity && activity.retryAttempts > 0) {
-        this.#finishFailedRetry(runId, activity.retryAttempts, message)
+        this.#finishFailedRetry(runId, activity.retryAttempts, message.errorMessage || "Unknown provider error")
       }
       return outcome
     } catch (cause) {
-      if (activity && activity.retryAttempts > 0) this.#finishFailedRetry(runId, activity.retryAttempts, message)
+      if (activity && activity.retryAttempts > 0) {
+        this.#finishFailedRetry(runId, activity.retryAttempts, message.errorMessage || "Unknown provider error")
+      }
       throw cause
     }
   }
 
-  #finishFailedRetry(runId: number, attempt: number, message: AssistantMessage): void {
+  #finishExceptionalRetry(runId: number, cause: unknown): void {
+    const activity = this.#activity
+    if (activity.type !== "running" || activity.runId !== runId || activity.retryAttempts === 0) return
+    this.#finishFailedRetry(runId, activity.retryAttempts, cause instanceof Error ? cause.message : String(cause))
+  }
+
+  #finishFailedRetry(runId: number, attempt: number, finalError: string): void {
     const activity = this.#activity
     if (activity.type === "running" && activity.runId === runId) {
       this.#activity = { ...activity, retryAttempts: 0 }
     }
-    this.#emitAll([
-      {
-        type: "auto_retry_end",
-        success: false,
-        attempt,
-        finalError: boundedRetryError(message.errorMessage || "Unknown provider error")
-      }
-    ])
+    this.#emitAll([{ type: "auto_retry_end", success: false, attempt, finalError: boundedRetryError(finalError) }])
   }
 
   async #retryAssistant(runId: number): Promise<"none" | "retry"> {

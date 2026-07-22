@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test"
+import { mkdirSync, renameSync, rmSync } from "node:fs"
 import { mkdtemp } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -107,6 +108,62 @@ test("retry exhaustion keeps the final failure and closes one attempt sequence",
   expect(session.messages.at(-1)).toMatchObject({ role: "assistant", errorMessage: "server error 3" })
   expect(session.sessionManager.entries().filter(entry => entry.type === "message")).toHaveLength(4)
   session.dispose()
+})
+
+test("durable marker failure closes an active retry sequence", async () => {
+  const root = await mkdtemp(join(tmpdir(), "openzi-retry-marker-failure-"))
+  const models = createModels()
+  const faux = fauxProvider()
+  models.setProvider(faux.provider)
+  faux.setResponses([
+    fauxAssistantMessage("", { stopReason: "error", errorMessage: "network error 1" }),
+    fauxAssistantMessage("", { stopReason: "error", errorMessage: "network error 2" })
+  ])
+  const { session } = await createAgentRuntime({
+    cwd: root,
+    agentDir: join(root, "agent"),
+    models,
+    settings: { retryBaseDelayMs: 0 }
+  })
+  const events: string[] = []
+  let errorEntries = 0
+  let file: string | undefined
+  let backup: string | undefined
+  session.subscribe(event => {
+    if (event.type === "auto_retry_start") events.push("start")
+    if (event.type === "auto_retry_end") events.push(`end:${event.success}`)
+    if (event.type === "agent_settled") events.push("settled")
+    if (
+      event.type === "entry_appended" &&
+      event.entry.type === "message" &&
+      event.entry.message.role === "assistant" &&
+      event.entry.message.stopReason === "error" &&
+      ++errorEntries === 2
+    ) {
+      file = session.sessionManager.file
+      if (!file) throw new Error("Persistent session file was not created")
+      backup = `${file}.backup`
+      renameSync(file, backup)
+      mkdirSync(file)
+    }
+  })
+
+  try {
+    const failure = await session.prompt("keep trying").then(
+      () => undefined,
+      cause => cause
+    )
+
+    expect(failure).toBeInstanceOf(Error)
+    expect(events).toEqual(["start", "end:false", "settled"])
+    expect(session.retryStatus).toEqual({ type: "idle" })
+  } finally {
+    if (file && backup) {
+      rmSync(file, { recursive: true })
+      renameSync(backup, file)
+    }
+    session.dispose()
+  }
 })
 
 test("terminal overflow closes an active retry sequence", async () => {

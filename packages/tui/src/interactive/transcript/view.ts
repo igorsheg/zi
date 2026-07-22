@@ -825,6 +825,7 @@ export class TranscriptView {
   }
 
   #authoritativeTool(fallback: ActiveTool): ActiveTool {
+    if (fallback.status === "failed" || fallback.status === "aborted") return fallback
     return this.#interactive.$activeTools.get().get(fallback.id) ?? fallback
   }
 

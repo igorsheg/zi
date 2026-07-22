@@ -368,6 +368,46 @@ test("retry attempts retain separate tool roots when a provider reuses a call ID
   }
 })
 
+test("consecutive failed retries render terminal tool data from their own messages", async () => {
+  const first = {
+    ...fauxAssistantMessage(fauxToolCall("bash", { command: "echo first-attempt" }, { id: "reused-failure" }), {
+      stopReason: "error"
+    }),
+    errorMessage: "first failure"
+  }
+  const second = {
+    ...fauxAssistantMessage(fauxToolCall("bash", { command: "echo second-attempt" }, { id: "reused-failure" }), {
+      stopReason: "error"
+    }),
+    errorMessage: "second failure"
+  }
+  const stale: ActiveTool = {
+    id: "reused-failure",
+    name: "bash",
+    args: { command: "echo first-attempt" },
+    status: "failed",
+    result: { content: [{ type: "text", text: "first failure" }] }
+  }
+  const harness = await createTranscriptHarness([first, second], { tools: new Map([[stale.id, stale]]) })
+  try {
+    await harness.setup.flush()
+    const frame = harness.setup.captureCharFrame()
+
+    expect(
+      requiredRenderable(harness, "assistant-message:0").findDescendantById("active-tool:failed:0:reused-failure")
+    ).toBeDefined()
+    expect(
+      requiredRenderable(harness, "assistant-message:1").findDescendantById("active-tool:failed:1:reused-failure")
+    ).toBeDefined()
+    expect(frame).toContain("echo first-attempt")
+    expect(frame).toContain("first failure")
+    expect(frame).toContain("echo second-attempt")
+    expect(frame).toContain("second failure")
+  } finally {
+    harness.destroy()
+  }
+})
+
 test("live eviction promotes a still-retained tool result out of its assistant root", async () => {
   const assistant = fauxAssistantMessage(fauxToolCall("bash", { command: "printf kept" }, { id: "boundary" }), {
     stopReason: "toolUse"
