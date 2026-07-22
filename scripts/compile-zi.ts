@@ -88,7 +88,7 @@ function compiledOAuthPlugin(onRewrite: () => void): Bun.BunPlugin {
 }
 
 async function verifyZi(executable: string, version: string): Promise<void> {
-  const child = Bun.spawn([executable, "--version"], { stdin: "ignore", stdout: "pipe", stderr: "pipe" })
+  const child = Bun.spawn([executable, "-V"], { stdin: "ignore", stdout: "pipe", stderr: "pipe" })
   const [exitCode, stdout, stderr] = await Promise.all([
     child.exited,
     new Response(child.stdout).text(),
@@ -96,6 +96,8 @@ async function verifyZi(executable: string, version: string): Promise<void> {
   ])
   const normalizedStdout = stdout.replaceAll("\r\n", "\n")
   if (exitCode !== 0 || normalizedStdout !== `zi ${version}\n` || stderr !== "") {
-    throw new Error(`Compiled executable failed its version smoke test (exit ${exitCode}): ${stderr || stdout}`)
+    throw new Error(
+      `Compiled executable failed its version smoke test (exit ${exitCode}): stdout=${JSON.stringify(stdout)} stderr=${JSON.stringify(stderr)}`
+    )
   }
 }

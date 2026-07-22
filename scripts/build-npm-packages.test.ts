@@ -68,7 +68,9 @@ test("npm package assembly wraps release archives without install-time downloads
       bin: { zi: "./bin/zi.js" },
       optionalDependencies: { "@with-zi/zi-linux-x64": version }
     })
-    expect(await readFile(join(cli!.directory, "bin", "zi.js"), "utf8")).not.toContain("curl")
+    const resolver = await readFile(join(cli!.directory, "bin", "zi.js"), "utf8")
+    expect(resolver).not.toContain("curl")
+    expect(resolver).toContain('arg === "--version" ? "-V" : arg')
   } finally {
     await rm(distDir, { recursive: true, force: true })
   }

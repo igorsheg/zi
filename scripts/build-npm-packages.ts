@@ -224,7 +224,8 @@ try {
 }
 
 const executable = join(dirname(packageJson), "bin", process.platform === "win32" ? "zi.exe" : "zi")
-const result = spawnSync(executable, process.argv.slice(2), { stdio: "inherit" })
+const args = process.platform === "win32" ? process.argv.slice(2).map(arg => arg === "--version" ? "-V" : arg) : process.argv.slice(2)
+const result = spawnSync(executable, args, { stdio: "inherit" })
 if (result.error) {
   console.error(result.error.message)
   process.exit(1)
@@ -281,14 +282,16 @@ async function verifyCurrentInstall(result: NpmPackageBuildResult, version: stri
       temporary
     )
     const command = join(temporary, "node_modules", ".bin", process.platform === "win32" ? "zi.cmd" : "zi")
-    const child = Bun.spawn([command, "--version"], { cwd: temporary, stdin: "ignore", stdout: "pipe", stderr: "pipe" })
+    const child = Bun.spawn([command, "-V"], { cwd: temporary, stdin: "ignore", stdout: "pipe", stderr: "pipe" })
     const [exitCode, stdout, stderr] = await Promise.all([
       child.exited,
       new Response(child.stdout).text(),
       new Response(child.stderr).text()
     ])
     if (exitCode !== 0 || stdout !== `zi ${version}\n` || stderr !== "") {
-      throw new Error(`Packed npm CLI failed its version smoke test (exit ${exitCode}): ${stderr || stdout}`)
+      throw new Error(
+        `Packed npm CLI failed its version smoke test (exit ${exitCode}): stdout=${JSON.stringify(stdout)} stderr=${JSON.stringify(stderr)}`
+      )
     }
   } finally {
     await rm(temporary, { recursive: true, force: true })

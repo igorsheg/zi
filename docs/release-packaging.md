@@ -13,7 +13,7 @@ The GitHub executable remains the source artifact. npm packaging should wrap tho
 - **No network postinstall**: avoid installer scripts that fetch release assets. They fail behind proxies, complicate provenance, and are harder to audit.
 - **Pinned automation**: keep GitHub Actions pinned by SHA, with minimal permissions per job and release publishing behind the `release` environment.
 - **Provenance**: publish GitHub artifact attestations for archives and npm provenance for packages through OIDC (`id-token: write`, `npm publish --provenance`).
-- **Pack tests**: every package path needs `npm pack --dry-run --json`, install-from-tarball smoke tests, and `zi --version` verification before publish.
+- **Pack tests**: every package path needs `npm pack --dry-run --json`, install-from-tarball smoke tests, and `zi -V` verification before publish.
 
 ## npm package shape
 
