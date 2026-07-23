@@ -937,6 +937,57 @@ test("tool chrome uses lifecycle-only glyphs, tones, and stable transparent rows
   }
 })
 
+test("skill reads keep their source path and instructions behind details", async () => {
+  const setup = await createTestRenderer({ width: 56, height: 14, useThread: false })
+  const path = "/home/user/.zi/skills/review/SKILL.md"
+  const result = {
+    content: [{ type: "text", text: "Review carefully." }],
+    details: {
+      outcome: "success",
+      startLine: 1,
+      endLine: 1,
+      totalLines: 1,
+      truncation: {
+        truncated: false,
+        truncatedBy: null,
+        totalLines: 1,
+        totalBytes: 17,
+        outputLines: 1,
+        outputBytes: 17,
+        firstLineExceedsLimit: false,
+        lastLinePartial: false
+      }
+    }
+  }
+  const view = new ToolCallView(
+    setup.renderer,
+    "read-skill",
+    frame("done", projectToolPresentation({ status: "done", name: "read", args: { path }, result })),
+    defaultTheme,
+    "/work",
+    "Ctrl+O"
+  )
+  setup.renderer.root.add(view.root)
+
+  try {
+    await setup.renderOnce()
+    const compact = setup.captureCharFrame()
+    expect(compact).toContain("◆ Skill review")
+    expect(compact).not.toContain(path)
+    expect(compact).not.toContain("Review carefully.")
+
+    view.setExpanded(true)
+    await setup.renderOnce()
+    const detailed = setup.captureCharFrame()
+    expect(detailed).toContain("◆ Skill review")
+    expect(detailed).toContain(path)
+    expect(detailed).toContain("Review carefully.")
+  } finally {
+    view.destroy()
+    setup.renderer.destroy()
+  }
+})
+
 test("header-only, notices-only, and action-only tools share the open-rail grammar", async () => {
   const setup = await createTestRenderer({ width: 40, height: 16, useThread: false })
   const headerOnly = new ToolCallView(

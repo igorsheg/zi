@@ -1,3 +1,5 @@
+import { basename, dirname } from "node:path"
+
 import { isReadToolDetails, type ReadToolDetails, type ReadToolErrorReason } from "../read.js"
 import { DEFAULT_MAX_BYTES } from "../truncate.js"
 import { maxExpandedToolRows, type ToolNotice, type ToolPresentation, type ToolPresentationSource } from "./types.js"
@@ -43,8 +45,7 @@ export function projectRead(source: ToolPresentationSource): ToolPresentation {
   if (failure) {
     return {
       header: {
-        label: "Read",
-        subject: { type: "path", path: boundInline(path ?? "…") },
+        ...readTarget(path),
         details: range ? [boundInline(range)] : [],
         ...(details?.outcome === "error" ? { status: errorStatus(details.reason) } : {})
       },
@@ -62,12 +63,7 @@ export function projectRead(source: ToolPresentationSource): ToolPresentation {
   const sourceText = details?.outcome === "success" ? selectedText(text, details.truncation.outputBytes) : text
   const status = details?.outcome === "success" ? successStatus(details) : undefined
   return {
-    header: {
-      label: "Read",
-      subject: { type: "path", path: boundInline(path ?? "…") },
-      details: range ? [boundInline(range)] : [],
-      ...(status ? { status } : {})
-    },
+    header: { ...readTarget(path), details: range ? [boundInline(range)] : [], ...(status ? { status } : {}) },
     ...(sourceText
       ? {
           body: {
@@ -84,6 +80,17 @@ export function projectRead(source: ToolPresentationSource): ToolPresentation {
       detailed: { type: "edges", head: detailedReadHeadRows, tail: detailedReadTailRows }
     },
     timing: "duration"
+  }
+}
+
+function readTarget(path: string | undefined) {
+  const displayPath = boundInline(path ?? "…")
+  const skillName = path === undefined || basename(path) !== "SKILL.md" ? undefined : basename(dirname(path))
+  if (!skillName || skillName === ".") return { label: "Read", subject: { type: "path" as const, path: displayPath } }
+  return {
+    label: "Skill",
+    subject: { type: "text" as const, text: boundInline(skillName) },
+    secondary: { type: "path" as const, path: displayPath }
   }
 }
 

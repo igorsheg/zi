@@ -58,6 +58,31 @@ test("read returns exact ranges and compact semantic presentation", async () => 
   }
 })
 
+test("read presents skill definitions by name while retaining their source path", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "zi-read-skill-"))
+  const skillDir = join(cwd, ".zi", "skills", "review")
+  const path = join(skillDir, "SKILL.md")
+  const tool = createReadTool(cwd)
+  await mkdir(skillDir, { recursive: true })
+  await writeFile(path, "---\nname: review\ndescription: Review code\n---\n\nReview carefully.\n")
+
+  try {
+    const result = await tool.execute("read-skill", { path })
+    const presentation = projectToolPresentation({ status: "done", name: "read", args: { path }, result })
+
+    expect(presentation.header).toEqual({
+      label: "Skill",
+      subject: { type: "text", text: "review" },
+      secondary: { type: "path", path },
+      details: []
+    })
+    expect(presentation.body).toMatchObject({ type: "source", path })
+    expect(presentation.preview.compact).toEqual({ type: "hidden" })
+  } finally {
+    await rm(cwd, { recursive: true, force: true })
+  }
+})
+
 test("read exposes empty files and operational failures as semantic states", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "zi-read-errors-"))
   const tool = createReadTool(cwd)
@@ -88,6 +113,23 @@ test("read exposes empty files and operational failures as semantic states", asy
       expect(presentation.body).toMatchObject({ type: "text", tone: "error" })
       expect(presentation.notices).toEqual([])
     }
+
+    const skillPath = join(cwd, ".zi", "skills", "missing", "SKILL.md")
+    const missingSkill = await tool.execute("read-missing-skill", { path: skillPath })
+    const missingSkillPresentation = projectToolPresentation({
+      status: "failed",
+      name: "read",
+      args: { path: skillPath },
+      result: missingSkill
+    })
+    expect(missingSkillPresentation.header).toEqual({
+      label: "Skill",
+      subject: { type: "text", text: "missing" },
+      secondary: { type: "path", path: skillPath },
+      details: [],
+      status: "not found"
+    })
+    expect(missingSkillPresentation.body).toMatchObject({ type: "text", tone: "error" })
   } finally {
     await rm(cwd, { recursive: true, force: true })
   }
