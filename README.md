@@ -136,6 +136,7 @@ Requires Bun 1.3.14. Installing dependencies also installs the Lefthook Git hook
 bun install
 bun run start         # run Zi directly from TypeScript
 bun run build         # compile the local production executable to dist/zi
+bun run build:website # build the static website to dist/website
 bun run fix           # apply Oxlint fixes, then format with Oxfmt
 bun run check         # formatting, linting, TypeScript, and tests
 ```

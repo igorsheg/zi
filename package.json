@@ -19,6 +19,7 @@
   "type": "module",
   "scripts": {
     "build": "bun scripts/build-local.ts",
+    "build:website": "bun scripts/build-website.ts",
     "check": "bun run format:check && bun run lint && bun run typecheck && bun run test",
     "dev": "bun --hot packages/cli/src/main.ts",
     "fix": "bun run lint:fix && bun run format",

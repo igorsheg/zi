@@ -1,0 +1,3 @@
+/manual /man/ 301
+/docs /man/ 301
+/docs/* /man/:splat 301
