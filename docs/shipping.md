@@ -59,7 +59,7 @@ Pushing a tag such as `v0.1.0` starts `.github/workflows/release.yml`. It:
 7. publishes one GitHub release only after every target succeeds;
 8. publishes `@with-zi/zi` npm packages from the protected `npm` environment.
 
-A SemVer prerelease tag such as `v0.2.0-rc.1` creates a prerelease and publishes npm packages under the `next` dist-tag. Stable tags publish under `latest`. The tag is the product-version source; package versions do not control executable releases. GitHub release publishing deploys through the `release` environment, and npm publishing deploys through the separate `npm` environment.
+A SemVer prerelease tag such as `v0.2.0-rc.1` creates a GitHub prerelease, but npm packages still publish under the default `latest` dist-tag. The tag is the product-version source; package versions do not control executable releases. GitHub release publishing deploys through the `release` environment, and npm publishing deploys through the separate `npm` environment.
 
 ```sh
 git tag -s v0.1.0 -m "Zi v0.1.0"

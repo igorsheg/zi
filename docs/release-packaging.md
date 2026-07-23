@@ -63,8 +63,8 @@ The tag workflow builds npm tarballs and publishes them from the protected `npm`
 1. trigger on the same SemVer tag;
 2. download the `npm-packages` artifact from the release run;
 3. publish platform packages first, then the top-level package, with `npm publish --provenance --access public`;
-4. use the `next` dist-tag for prereleases and `latest` for stable releases;
-5. verify `npm view @with-zi/zi@next version` for prereleases or `npm view @with-zi/zi@latest version` for stable releases.
+4. publish under the default `latest` dist-tag for both prereleases and stable releases;
+5. verify `npm view @with-zi/zi@latest version` matches the tag.
 
 Trusted publishing must stay configured for every `@with-zi/zi*` package with repository `igorsheg/zi`, workflow `release.yml`, environment `npm`, and the `npm publish` action.
 
