@@ -66,4 +66,4 @@ git tag -s v0.1.0 -m "Zi v0.1.0"
 git push origin v0.1.0
 ```
 
-Before the first public release, expand third-party notices and configure macOS notarization and Windows signing. GitHub attestations and npm provenance prove workflow origin but do not replace platform signatures. The first npm publish uses a short-lived bootstrap token; after packages exist, switch the `@with-zi` packages to trusted publishing and remove that token.
+Before a stable public release, expand third-party notices and configure macOS notarization and Windows signing. GitHub attestations and npm provenance prove workflow origin but do not replace platform signatures. npm publishing uses npm trusted publishing for the protected `npm` environment; no registry token is required in the workflow.

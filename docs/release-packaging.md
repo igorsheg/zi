@@ -3,7 +3,7 @@
 Zi has two release channels with different owners:
 
 1. **GitHub Releases** publish native standalone executables for direct download.
-2. **npm** will provide the developer install path and a future SDK boundary.
+2. **npm** provides the developer install path and a future SDK boundary.
 
 The GitHub executable remains the source artifact. npm packaging should wrap those same per-platform executables instead of rebuilding or downloading arbitrary assets during install.
 
@@ -58,15 +58,15 @@ Before the first public release:
 
 ## npm publish workflow
 
-The tag workflow now builds npm tarballs and publishes them from a protected `npm` environment. During bootstrap it uses the short-lived `NPM_TOKEN` GitHub secret because the packages do not exist yet:
+The tag workflow builds npm tarballs and publishes them from the protected `npm` environment through npm trusted publishing. The alpha bootstrap used a short-lived `NPM_TOKEN` only to create the packages; the permanent workflow relies on `id-token: write` and `npm publish --provenance`.
 
 1. trigger on the same SemVer tag;
 2. download the `npm-packages` artifact from the release run;
 3. publish platform packages first, then the top-level package, with `npm publish --provenance --access public`;
 4. use the `next` dist-tag for prereleases and `latest` for stable releases;
-5. verify `npm view @with-zi/zi version` matches the tag.
+5. verify `npm view @with-zi/zi@next version` for prereleases or `npm view @with-zi/zi@latest version` for stable releases.
 
-After the first successful publish creates the packages, configure npm trusted publishing for every `@with-zi/zi*` package, delete `NPM_TOKEN`, and remove token auth from the workflow. The permanent workflow should rely on `id-token: write` and `npm publish --provenance` only.
+Trusted publishing must stay configured for every `@with-zi/zi*` package with repository `igorsheg/zi`, workflow `release.yml`, environment `npm`, and the `npm publish` action.
 
 Package `files` allowlists should be explicit. No package should include source tests, local config, session data, or build caches.
 
