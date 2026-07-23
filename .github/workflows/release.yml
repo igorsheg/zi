@@ -144,15 +144,12 @@ jobs:
           path: dist/npm
       - name: Publish npm packages
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
           version="${TAG#v}"
           dist_tag="latest"
           if [[ "$version" == *-* ]]; then dist_tag="next"; fi
-
-          npm config set //registry.npmjs.org/:_authToken "$NODE_AUTH_TOKEN"
 
           for target in darwin-arm64 darwin-x64 linux-arm64 linux-x64 windows-x64; do
             npm publish "dist/npm/with-zi-zi-${target}-${version}.tgz" \
