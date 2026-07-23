@@ -17,7 +17,7 @@ export { maxCompactionFilePaths, maxCompactionPathBytes, maxCompactionSummaryByt
 export const maxCompactionInstructionsBytes = 16 * 1024
 export const maxCompactionChunks = 8
 export const maxCompactionErrorBytes = 2_000
-export const maxCompactionOperationMs = 120_000
+export const maxCompactionOperationMs = 10 * 60_000
 export const maxSerializedToolResultChars = 2_000
 
 const estimatedImageTokens = 1_200

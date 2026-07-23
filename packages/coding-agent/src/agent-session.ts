@@ -1401,25 +1401,30 @@ export class AgentSession {
     const timeout = setTimeout(() => deadline.abort(), maxCompactionOperationMs)
     const signal = AbortSignal.any([controller.signal, deadline.signal])
     try {
-      const sample: SummarySampler = (request, requestSignal) =>
-        settleBeforeAbort(
-          Promise.resolve(
-            this.#agent.streamFn(prepared.model, request.context, {
-              maxTokens: request.maxTokens,
-              signal: requestSignal,
-              ...(request.thinkingLevel ? { reasoning: request.thinkingLevel } : {})
-            })
-          ).then(stream => stream.result()),
-          requestSignal
-        )
       const summary = await generateCompactionSummary(
         prepared.plan,
         prepared.model,
         prepared.settings,
         customInstructions,
         this.thinkingLevel,
-        (request, requestSignal) =>
-          this.#sampleCompactionWithRetry(operationId, reason, prepared.model, request, requestSignal, sample),
+        (request, requestSignal) => {
+          // Pi 9b3a2059: summaries are standalone requests, not continuations of the agent's routing/cache session.
+          const sessionId = crypto.randomUUID()
+          const sample: SummarySampler = (sampleRequest, sampleSignal) =>
+            settleBeforeAbort(
+              Promise.resolve(
+                this.#agent.streamFn(prepared.model, sampleRequest.context, {
+                  maxTokens: sampleRequest.maxTokens,
+                  signal: sampleSignal,
+                  cacheRetention: "none",
+                  sessionId,
+                  ...(sampleRequest.thinkingLevel ? { reasoning: sampleRequest.thinkingLevel } : {})
+                })
+              ).then(stream => stream.result()),
+              sampleSignal
+            )
+          return this.#sampleCompactionWithRetry(operationId, reason, prepared.model, request, requestSignal, sample)
+        },
         signal
       )
       const estimatedTokensAfter = validateCompactionReduction(prepared.plan, summary)
@@ -1451,7 +1456,7 @@ export class AgentSession {
       return Object.freeze({ marker, result })
     } catch (cause) {
       if (deadline.signal.aborted && !controller.signal.aborted) {
-        throw new Error("Compaction timed out after 120 seconds", { cause })
+        throw new Error(`Compaction timed out after ${maxCompactionOperationMs / 60_000} minutes`, { cause })
       }
       throw cause
     } finally {

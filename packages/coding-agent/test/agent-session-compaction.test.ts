@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test"
 
-import { Type, type Context } from "@earendil-works/pi-ai"
+import { Type, type Context, type StreamOptions } from "@earendil-works/pi-ai"
 
 import { maxCompactionErrorBytes } from "../src/compaction.js"
 import { createAgentSession } from "../src/sdk.js"
@@ -45,11 +45,18 @@ test("manual compaction samples, commits, replaces active context, and orders li
   session.dispose()
 })
 
-test("manual compaction retries a transient summary failure inside the owning operation", async () => {
+test("manual compaction retries a transient summary failure inside one isolated request session", async () => {
   const setup = await compactionSession({ retryBaseDelayMs: 0 })
+  const requests: StreamOptions[] = []
   setup.faux.setResponses([
-    fauxAssistantMessage("", { stopReason: "error", errorMessage: "terminated" }),
-    fauxAssistantMessage("recovered checkpoint")
+    (_context, options) => {
+      if (options) requests.push(options)
+      return fauxAssistantMessage("", { stopReason: "error", errorMessage: "terminated" })
+    },
+    (_context, options) => {
+      if (options) requests.push(options)
+      return fauxAssistantMessage("recovered checkpoint")
+    }
   ])
   const events: string[] = []
   let retryStatus: typeof setup.session.retryStatus | undefined
@@ -68,6 +75,11 @@ test("manual compaction retries a transient summary failure inside the owning op
   expect(setup.faux.state.callCount).toBe(2)
   expect(events).toEqual(["scheduled:1", "attempt", "finished"])
   expect(retryStatus).toMatchObject({ type: "waiting", source: "compaction", reason: "manual", attempt: 1 })
+  expect(requests).toHaveLength(2)
+  expect(requests.every(options => options.cacheRetention === "none")).toBe(true)
+  expect(requests[0]?.sessionId).toBeTruthy()
+  expect(requests[1]?.sessionId).toBe(requests[0]?.sessionId)
+  expect(requests[0]?.sessionId).not.toBe(setup.session.sessionId)
   expect(setup.session.retryStatus).toEqual({ type: "idle" })
   setup.session.dispose()
 })
@@ -574,17 +586,26 @@ test("threshold failure keeps the original tool-loop context and suppresses repe
   setup.session.dispose()
 })
 
-test("overflow failure stays durable while one compact-and-continue recovery succeeds", async () => {
+test("Codex context-window failure stays durable while one compact-and-continue recovery succeeds", async () => {
   const setup = await compactionSession({ oldTextBytes: 100, contextWindow: 1_000 })
   setup.faux.setResponses([
-    fauxAssistantMessage("", { stopReason: "error", errorMessage: "prompt is too long: 1001 tokens > 1000 maximum" }),
+    fauxAssistantMessage("", {
+      stopReason: "error",
+      errorMessage:
+        "Codex error: Your input exceeds the context window of this model. Please adjust your input and try again."
+    }),
     fauxAssistantMessage("overflow checkpoint"),
     fauxAssistantMessage("recovered")
   ])
+  const starts: string[] = []
+  setup.session.subscribe(event => {
+    if (event.type === "compaction_start") starts.push(event.reason)
+  })
 
   await setup.session.prompt("retry input")
 
   expect(setup.faux.state.callCount).toBe(3)
+  expect(starts).toEqual(["overflow"])
   const marker = setup.session.sessionManager.latestCompaction()
   expect(marker).toMatchObject({ reason: "overflow" })
   const failure = setup.session.sessionManager.entries().find(entry => entry.id === marker?.excludedFailureEntryId)

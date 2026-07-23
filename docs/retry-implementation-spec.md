@@ -135,7 +135,7 @@ For each call the helper:
 
 Coding-agent translates those callbacks to summarization retry events. The interactive client temporarily replaces the compaction or branch indicator with the retry countdown, then restores the owning operation indicator when the next attempt starts.
 
-The budget is per assistant-producing call, not a global budget for the complete multi-chunk compaction. Zi already bounds compaction to eight chunks and 120 seconds; retry work must remain under that existing operation deadline.
+The budget is per assistant-producing call, not a global budget for the complete multi-chunk compaction. Zi bounds compaction to eight chunks and ten minutes; retry work must remain under that operation deadline.
 
 The immediate follow-up `243f64be` is relevant acceptance evidence: if a retried request is aborted, retry completion is unsuccessful rather than successful merely because `stopReason` is no longer `"error"`.
 
@@ -187,7 +187,7 @@ Enabling provider/SDK retries by default would duplicate budgets and hide waits.
 | Agent run lifecycle            | `AgentSession`                            | Retry waiting is an explicit run phase inside one prompt settlement                 |
 | Agent failure persistence      | `SessionManager`                          | Append-only retry markers retain failures while excluding provider context          |
 | Transcript projection          | `SessionManager`                          | Stable append projection retains failed attempts; compaction explicitly replaces it |
-| Manual/automatic compaction    | `AgentSession` + `compaction.ts`          | Each summary sample uses the same policy within eight chunks and 120 seconds        |
+| Manual/automatic compaction    | `AgentSession` + `compaction.ts`          | Each summary sample uses the same policy within eight chunks and ten minutes        |
 | Settings                       | `SettingsManager`                         | Strict flat retry fields with global/project/runtime layering and scoped enablement |
 | Interactive status             | `PromptView` + `ShimmerTextView`          | Deadline-derived countdown reuses the existing renderer live lifecycle              |
 | Interruption                   | `AgentSession` + semantic `app.interrupt` | Escape restores queued input and cancels provider, compaction, or retry backoff     |

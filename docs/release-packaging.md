@@ -69,7 +69,3 @@ The tag workflow builds npm tarballs and publishes them from the protected `npm`
 Trusted publishing must stay configured for every `@with-zi/zi*` package with repository `igorsheg/zi`, workflow `release.yml`, environment `npm`, and the `npm publish` action.
 
 Package `files` allowlists should be explicit. No package should include source tests, local config, session data, or build caches.
-
-## Migration note
-
-The rename moves product state from `$HOME/.openzi/agent` and `<cwd>/.openzi` to `$HOME/.zi/agent` and `<cwd>/.zi`. README documents the optional copy commands for dogfood users. Do not auto-move credentials or sessions without an explicit user action.

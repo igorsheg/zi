@@ -319,7 +319,7 @@ const maxCompactionSummaryBytes = 128 * 1024
 const maxCompactionFilePaths = 256
 const maxCompactionPathBytes = 4096
 const maxCompactionChunks = 8
-const maxCompactionOperationMs = 120_000
+const maxCompactionOperationMs = 10 * 60_000
 const maxSerializedToolResultChars = 2_000
 ```
 
@@ -784,7 +784,7 @@ The implementation must prove:
 - no more than one compaction operation per session at a time;
 - no more than four automatic compactions and one overflow recovery per run;
 - no more than eight summary chunks per operation;
-- no compaction operation longer than 120 seconds;
+- no compaction operation longer than ten minutes;
 - no summary or custom instruction above its byte bound;
 - no unbounded file-operation arrays;
 - no context beginning at an orphan tool result;
