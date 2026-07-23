@@ -17,6 +17,19 @@ A coding agent built from Pi's lower-level AI/agent packages with an imperative 
 
 See [`docs/architecture.md`](docs/architecture.md), [`docs/tui-architecture.md`](docs/tui-architecture.md), [`docs/parity-roadmap.md`](docs/parity-roadmap.md), and [`AGENTS.md`](AGENTS.md).
 
+## Install
+
+```sh
+npm install -g @with-zi/zi
+zi --version
+```
+
+Update with the normal global npm update path:
+
+```sh
+npm update -g @with-zi/zi
+```
+
 ## Configuration paths
 
 Zi keeps coding-agent global state in `$HOME/.zi/agent` and project-scoped configuration in the effective working directory's `.zi/`:
@@ -27,6 +40,19 @@ $HOME/.zi/agent/{settings.json,auth.json,sessions/,AGENTS.md,SYSTEM.md,...}
 ```
 
 Global settings are overlaid by project settings and then runtime overrides. Authentication and default sessions remain global; sessions are partitioned by canonical cwd. Resuming a session rebuilds cwd-bound services from the cwd stored in its header. See [ADR 0011](docs/adr/0011-zi-path-policy.md).
+
+Dogfood builds named OpenZi used `$HOME/.openzi/agent` and `<cwd>/.openzi`. Zi does not auto-move those files. To copy them without overwriting existing Zi state:
+
+```sh
+if [ -d "$HOME/.openzi/agent" ] && [ ! -e "$HOME/.zi/agent" ]; then
+  mkdir -p "$HOME/.zi"
+  cp -a "$HOME/.openzi/agent" "$HOME/.zi/agent"
+fi
+
+if [ -d .openzi ] && [ ! -e .zi ]; then
+  cp -a .openzi .zi
+fi
+```
 
 A fresh terminal can start without credentials; use `/login`, then `/model` if needed. `/logout` removes only stored credentials, not environment or external provider configuration. `/settings` edits thinking, queues, automatic compaction, and automatic retry with an explicit global or project scope. Transient model failures retry after 2, 4, and 8 seconds by default; the visible countdown can be cancelled with the active interrupt binding. `/new` starts a fresh session and `/resume` opens the bounded current-project session picker. For a one-process override, use `zi --model provider/model-id --api-key "$KEY"`; the key is applied in memory and is never written to settings or `auth.json`.
 

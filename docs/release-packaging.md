@@ -48,13 +48,13 @@ The resolver only locates the installed optional package for `process.platform`/
 
 The current release workflow verifies once, builds on native runners, smoke-tests, archives, packages npm tarballs, verifies a local npm install, checksums, attests, and publishes GitHub release assets only after every target succeeds.
 
-Before the first public release:
+Before a stable public release:
 
 - expand `THIRD_PARTY_NOTICES.md` from a maintained summary to a generated dependency-graph notice;
 - decide whether Windows GitHub artifacts should stay `.tar.gz` or additionally publish `.zip`;
-- configure macOS signing/notarization and Windows signing;
-- run a prerelease tag through the `release` environment;
-- document install and update commands in `README.md` after the first npm dry run succeeds.
+- configure macOS signing/notarization and Windows signing.
+
+The alpha release path has been exercised end-to-end: native artifacts, GitHub release publication, npm package publication, provenance, install smoke, and trusted publishing are in place.
 
 ## npm publish workflow
 
@@ -72,4 +72,4 @@ Package `files` allowlists should be explicit. No package should include source 
 
 ## Migration note
 
-The rename moves product state from `$HOME/.openzi/agent` and `<cwd>/.openzi` to `$HOME/.zi/agent` and `<cwd>/.zi`. Before a public release, add a one-time documented manual migration command for dogfood users; do not auto-move credentials or sessions without an explicit user action.
+The rename moves product state from `$HOME/.openzi/agent` and `<cwd>/.openzi` to `$HOME/.zi/agent` and `<cwd>/.zi`. README documents the optional copy commands for dogfood users. Do not auto-move credentials or sessions without an explicit user action.
