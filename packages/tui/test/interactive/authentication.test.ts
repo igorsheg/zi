@@ -4,7 +4,12 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 
 import { TextareaRenderable, TextAttributes } from "@opentui/core"
-import { createAgentRuntime, type AuthenticationEvent, type AuthenticationPrompt } from "@with-zi/coding-agent"
+import {
+  createAgentRuntime,
+  type AgentSession,
+  type AuthenticationEvent,
+  type AuthenticationPrompt
+} from "@with-zi/coding-agent"
 import { createModels, fauxProvider } from "@with-zi/coding-agent/testing"
 
 import { createInteractiveTest, renderSettled } from "./harness.js"
@@ -63,9 +68,10 @@ test("exact /login uses hidden composer input and selects the provider model wit
       .lines.flatMap(line => line.spans)
       .find(span => span.text.includes("super-secret"))
     expect((hiddenSpan?.attributes ?? 0) & TextAttributes.HIDDEN).toBe(TextAttributes.HIDDEN)
+    const modelChanged = waitForModelChanged(runtime.session)
     setup.mockInput.pressEnter()
-    await runtime.session.waitForIdle()
-    await renderSettled(setup)
+    await modelChanged
+    await settle(setup)
 
     expect(runtime.session.modelState).toEqual({ type: "selected", model: faux.getModel() })
     expect(setup.captureCharFrame()).toContain("secured-model")
@@ -359,13 +365,7 @@ test("OAuth login renders URL, device, select, manual-code, and progress steps t
     expect(setup.captureCharFrame()).toContain("Exchanging authorization code")
     expect(input.plainText).toBe("")
 
-    const modelChanged = new Promise<void>(resolve => {
-      const unsubscribe = runtime.session.subscribe(event => {
-        if (event.type !== "model_changed") return
-        unsubscribe()
-        resolve()
-      })
-    })
+    const modelChanged = waitForModelChanged(runtime.session)
     afterProgress.resolve(undefined)
     await modelChanged
     await settle(setup)
@@ -377,6 +377,16 @@ test("OAuth login renders URL, device, select, manual-code, and progress steps t
     setup.destroy()
   }
 })
+
+function waitForModelChanged(session: AgentSession): Promise<void> {
+  return new Promise(resolve => {
+    const unsubscribe = session.subscribe(event => {
+      if (event.type !== "model_changed") return
+      unsubscribe()
+      resolve()
+    })
+  })
+}
 
 function promptInput(setup: Awaited<ReturnType<typeof createInteractiveTest>>): TextareaRenderable {
   const input = setup.renderer.root.findDescendantById("prompt-input")
