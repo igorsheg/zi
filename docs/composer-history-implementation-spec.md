@@ -212,7 +212,7 @@ A future explicit history-search capability may reconsider the search panel afte
 | Concern                                                           | Owner                                             |
 | ----------------------------------------------------------------- | ------------------------------------------------- |
 | Complete append-only session entries                              | `SessionManager`                                  |
-| Bounded eligible-history reference index                          | `SessionManager`                                  |
+| Bounded eligible-history value index                              | `SessionManager`                                  |
 | Client-independent history lookup boundary                        | `AgentSession`                                    |
 | Effective physical bindings and closed prompt actions             | `InteractiveKeybindings`                          |
 | Native text, cursor, undo/redo, viewport, selection, and extmarks | OpenTUI `TextareaRenderable`                      |
@@ -221,7 +221,7 @@ A future explicit history-search capability may reconsider the search panel afte
 | Active image payload admission and authoritative attachment state | `PromptStore`                                     |
 | Session replacement and old-screen disposal                       | `InteractiveMode` / `InteractiveStore` generation |
 
-No owner retains a copied history timeline in the TUI. `SessionManager` may retain at most 100 references to entries it already owns. `Composer` may retain at most 100 stable entry IDs in its browse zipper and current slot assignment, plus at most 201 bounded native slot handles across current, completed, and pinned browse lifetimes. Encoded slot bytes remain in OpenTUI's `EditBuffer`; Composer never retains historical message text.
+No owner retains a copied history timeline in the TUI. `SessionManager` may retain at most 100 prompt-history values within its 8 MiB aggregate bound. `Composer` may retain at most 100 stable entry IDs in its browse zipper and current slot assignment, plus at most 201 bounded native slot handles across current, completed, and pinned browse lifetimes. Encoded slot bytes remain in OpenTUI's `EditBuffer`; Composer never retains historical message text.
 
 No `PromptState` field, writable Nano Store, module-global history, root-store entry, or generic history manager is added.
 
@@ -280,21 +280,22 @@ Add explicit exported limits:
 ```ts
 export const maxSessionPromptHistoryEntries = 100
 export const maxSessionPromptHistoryEntryBytes = 1024 * 1024
+export const maxSessionPromptHistoryBytes = 8 * 1024 * 1024
 ```
 
-The projection stores references, not copied text. Nevertheless, extraction must not build an oversized concatenated string before enforcing the byte limit. Walk text parts in order, accumulate UTF-8 bytes, and reject the candidate as soon as it exceeds the entry limit.
+The projection stores bounded `{ entryId, text }` values so compacted messages can leave the parsed resident session tail without breaking recall. Extraction must not build an oversized concatenated string before enforcing the per-entry byte limit. Walk text parts in order, accumulate UTF-8 bytes, and reject the candidate as soon as it exceeds that limit. Oldest values are evicted when either the count or 8 MiB aggregate bound is exceeded.
 
-The existing 64 MiB session-file bound remains the outer bound for the authoritative journal. No independent aggregate payload bound is needed for the reference index because it owns no text payloads.
+The journal and session image blobs share a separate 64 MiB authoritative storage bound. Prompt history's aggregate bound limits its deliberate copied-text residency.
 
 ## Construction and append
 
 `SessionManager.open()` rebuilds the bounded index by considering validated entries in chronological order. `SessionManager.appendMessage()` updates the index only after the journal append has succeeded and the in-memory entry has committed.
 
-The index stores oldest to newest so stable older lookup is direct within a maximum of 100 references. Admission evicts the oldest reference when the count bound is exceeded.
+The index stores oldest to newest so stable older lookup is direct within a maximum of 100 values. Admission evicts the oldest value when the count or aggregate byte bound is exceeded.
 
-Compaction markers do not alter the index. `activeEntries()` and `activeMessages()` remain provider-context projections; composer history deliberately derives from `entries()`, the full journal. A resumed compacted session therefore retains recent eligible prompts even when they precede the active-context marker, subject to the 100-entry limit.
+Compaction markers do not alter the index. `activeEntries()` and `activeMessages()` remain provider-context projections; prompt-history values are accumulated during streaming journal restore before cold entries are released. A resumed compacted session therefore retains recent eligible prompts even when they precede the active-context marker.
 
-No persistence format changes. Old and new sessions derive the same projection from existing user messages.
+Format-1 inline-image and format-2 blob-backed sessions derive the same text-only prompt history.
 
 ## Identity and concurrent append
 
@@ -524,7 +525,7 @@ Change:
 Deliver:
 
 1. `SessionPromptHistoryEntry` and explicit bounds;
-2. bounded reference indexing on open and append;
+2. bounded value indexing on open and append;
 3. exact text extraction and consecutive deduplication;
 4. latest and stable older lookup;
 5. `AgentSession` delegation;

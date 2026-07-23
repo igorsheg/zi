@@ -307,7 +307,7 @@ type SessionEntryData =
 
 `excludedFailureEntryId` exists only for overflow recovery. It identifies the one durable assistant error entry that must not be returned to the provider after compaction. The transcript record remains in the journal. General context-exclusion lists are not introduced.
 
-The existing session header remains version 1 because this is an additive validated entry variant. A future incompatible header change remains a separate migration decision.
+The compaction entry itself was additive and originally kept session header version 1. ADR 0018 later introduced format 2 for external image blobs; format-1 journals remain readable and preserve the same compaction semantics.
 
 ## Bounds
 
@@ -379,7 +379,7 @@ On open, semantic validation requires:
 - summary/details satisfy their bounds;
 - projected context does not begin with a tool result after the synthetic summary.
 
-`SessionManager.entries()` remains the full durable journal. Session statistics and future history views use it deliberately; provider execution and the current TUI transcript use the active projection.
+`SessionManager.entries()` explicitly materializes the full durable journal when needed. Runtime policy uses the parsed resident suffix exposed by `retainedEntries()`; provider execution and the current TUI transcript use projections of that suffix. Persisted cold records remain authoritative on disk, while in-memory sessions retain an encoded UTF-8 cold prefix. See ADR 0018.
 
 # 6. Context accounting
 

@@ -1,6 +1,17 @@
 import { expect, test } from "bun:test"
 import { existsSync } from "node:fs"
-import { appendFile, mkdir, mkdtemp, readFile, rename, rm, truncate, utimes, writeFile } from "node:fs/promises"
+import {
+  appendFile,
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rename,
+  rm,
+  truncate,
+  utimes,
+  writeFile
+} from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join, relative, resolve } from "node:path"
 
@@ -10,6 +21,8 @@ import {
   maxSessionFirstMessageLength,
   maxSessionPromptHistoryEntries,
   maxSessionPromptHistoryEntryBytes,
+  maxSessionStorageBytes,
+  SessionCapacityError,
   SessionManager
 } from "../src/session-manager.js"
 
@@ -57,7 +70,7 @@ test("session prompt history traverses trimmed text chronologically with consecu
   expect(session.olderPromptHistoryEntry("missing")).toBeUndefined()
 })
 
-test("session prompt history is bounded by references and rejects oversized text", () => {
+test("session prompt history is bounded by values and rejects oversized text", () => {
   const session = SessionManager.inMemory("/work")
   session.appendMessage({
     role: "user",
@@ -78,6 +91,22 @@ test("session prompt history is bounded by references and rejects oversized text
   expect(history[0]).toEqual({ entryId: entries.at(-1)!.id, text: `prompt-${entries.length - 1}` })
   expect(history.at(-1)).toEqual({ entryId: entries[2]!.id, text: "prompt-2" })
   expect(session.olderPromptHistoryEntry(entries[1]!.id)).toBeUndefined()
+})
+
+test("session prompt history evicts oldest values at its aggregate byte bound", () => {
+  const session = SessionManager.inMemory("/work")
+  const entries = Array.from({ length: 9 }, (_, index) =>
+    session.appendMessage({
+      role: "user",
+      content: String(index).repeat(maxSessionPromptHistoryEntryBytes),
+      timestamp: index
+    })
+  )
+
+  const history = promptHistory(session)
+  expect(history).toHaveLength(8)
+  expect(history[0]?.entryId).toBe(entries[8]!.id)
+  expect(history.at(-1)?.entryId).toBe(entries[1]!.id)
 })
 
 test("session prompt history survives compaction, append, and journal restore by stable entry ID", async () => {
@@ -415,6 +444,25 @@ test("persisted and explicitly opened session paths are canonical", async () => 
   expect(opened.header.cwd).toBe(resolve(paths.cwd))
 })
 
+test("format 1 journals remain readable and keep inline images on append", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-session-v1-"))
+  const paths = new ZiPaths(join(root, "project"), join(root, "global"))
+  const created = SessionManager.create(paths)
+  created.appendMessage({ role: "user", content: "legacy", timestamp: 1 })
+  created.appendMessage(assistantMessage(2))
+  const file = created.file!
+  const content = await readFile(file, "utf8")
+  await writeFile(file, content.replace('"version":2', '"version":1'))
+
+  const restored = SessionManager.open(file)
+  const data = Buffer.from("legacy image").toString("base64")
+  restored.appendMessage({ role: "user", content: [{ type: "image", mimeType: "image/png", data }], timestamp: 3 })
+
+  expect(restored.header.version).toBe(1)
+  expect(await readFile(file, "utf8")).toContain(data)
+  expect(restored.messages().at(-1)).toMatchObject({ role: "user", content: [{ data }] })
+})
+
 test("session listing reads only bounded recent metadata and isolates invalid journals", async () => {
   const root = await mkdtemp(join(tmpdir(), "zi-session-list-"))
   const paths = new ZiPaths(join(root, "project"), join(root, "global"))
@@ -477,10 +525,102 @@ test("opening a session ignores only a malformed unterminated tail", async () =>
   tornOnly.appendMessage(assistantMessage(2))
   await appendFile(tornOnly.file!, '{"type":"message","id":"torn"')
   expect((await SessionManager.list(paths)).sessions.map(session => session.id)).toContain("torn-only")
+  const repaired = SessionManager.open(tornOnly.file!)
+  repaired.appendMessage({ role: "user", content: "after repair", timestamp: 3 })
+  expect(SessionManager.open(tornOnly.file!).messages().at(-1)).toMatchObject({ role: "user", content: "after repair" })
 
   const content = await readFile(file, "utf8")
   await writeFile(file, `${content}\n`)
   expect(() => SessionManager.open(file)).toThrow(`Invalid session entry: ${file}`)
+})
+
+test("version 2 journals externalize image bytes and retain only the compacted active suffix", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-session-image-blobs-"))
+  const paths = new ZiPaths(join(root, "project"), join(root, "global"))
+  const session = SessionManager.create(paths)
+  const imageBytes = Buffer.from("a durable binary image payload")
+  const imageData = imageBytes.toString("base64")
+  const old = session.appendMessage({
+    role: "user",
+    content: [
+      { type: "text", text: "inspect this" },
+      { type: "image", mimeType: "image/png", data: imageData }
+    ],
+    timestamp: 1
+  })
+  session.appendMessage(assistantMessage(2))
+  const kept = session.appendMessage({ role: "user", content: "keep", timestamp: 3 })
+  session.appendCompaction({
+    reason: "manual",
+    summary: "image summarized",
+    firstKeptEntryId: kept.id,
+    tokensBefore: 100,
+    estimatedTokensAfter: 10,
+    details: emptyCompactionDetails()
+  })
+
+  const file = session.file!
+  const persisted = await readFile(file, "utf8")
+  const blobDir = file.replace(/\.jsonl$/u, ".blobs")
+  const blobs = await readdir(blobDir)
+  expect(session.header.version).toBe(2)
+  expect(persisted).not.toContain(imageData)
+  expect(persisted).toContain('"blob":{"sha256"')
+  expect(blobs).toHaveLength(1)
+  expect((await readFile(join(blobDir, blobs[0]!))).equals(imageBytes)).toBe(true)
+  expect(session.memoryDiagnostics).toMatchObject({
+    entries: 4,
+    residentEntries: 2,
+    coldEntries: 2,
+    imageBlobBytes: imageBytes.byteLength,
+    coldMemoryBytes: 0
+  })
+  expect(session.retainedEntries().map(entry => entry.id)).toEqual([kept.id, session.latestCompaction()!.id])
+  expect(session.entries().find(entry => entry.id === old.id)).toMatchObject({
+    type: "message",
+    message: { content: expect.arrayContaining([{ type: "image", mimeType: "image/png", data: imageData }]) }
+  })
+
+  const restored = SessionManager.open(file)
+  expect(restored.memoryDiagnostics).toMatchObject({ entries: 4, residentEntries: 2, coldEntries: 2 })
+  expect(restored.activeMessages()).toEqual(session.activeMessages())
+  expect(restored.entries()).toEqual(session.entries())
+
+  await writeFile(join(blobDir, blobs[0]!), Buffer.alloc(imageBytes.byteLength, 0xff))
+  expect(() => SessionManager.open(file)).toThrow("Invalid session image blob")
+})
+
+test("in-memory compaction encodes its cold prefix without losing full journal access", () => {
+  const session = SessionManager.inMemory("/work")
+  const oldText = "x".repeat(128 * 1024)
+  const old = session.appendMessage({ role: "user", content: oldText, timestamp: 1 })
+  session.appendMessage(assistantMessage(2))
+  const kept = session.appendMessage({ role: "user", content: "kept", timestamp: 3 })
+  session.appendCompaction({
+    reason: "manual",
+    summary: "summary",
+    firstKeptEntryId: kept.id,
+    tokensBefore: 100,
+    estimatedTokensAfter: 10,
+    details: emptyCompactionDetails()
+  })
+
+  expect(session.memoryDiagnostics).toMatchObject({ entries: 4, residentEntries: 2, coldEntries: 2 })
+  expect(session.memoryDiagnostics.coldMemoryBytes).toBeGreaterThan(128 * 1024)
+  expect(session.entries().map(entry => entry.id)).toEqual([old.id, expect.any(String), kept.id, expect.any(String)])
+  expect(session.activeMessages().some(message => message.role === "user" && message.content === oldText)).toBe(false)
+  expect(session.olderPromptHistoryEntry(kept.id)).toEqual({ entryId: old.id, text: oldText })
+})
+
+test("live session storage admission is transactional at the resumability bound", () => {
+  const session = SessionManager.inMemory("/work")
+  const entries = session.entries()
+
+  expect(() =>
+    session.appendMessage({ role: "user", content: "x".repeat(maxSessionStorageBytes), timestamp: 1 })
+  ).toThrow(SessionCapacityError)
+  expect(session.entries()).toBe(entries)
+  expect(session.memoryDiagnostics).toMatchObject({ entries: 0, residentEntries: 0, coldEntries: 0 })
 })
 
 test("oversized session journals are refused before parsing", async () => {

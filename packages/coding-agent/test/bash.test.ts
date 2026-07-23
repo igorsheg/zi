@@ -34,6 +34,26 @@ test("bash bounds model output and preserves the full stream for the session lif
   }
 })
 
+test("bash keeps a UTF-8 aligned fixed tail after output exceeds its preview buffer", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "zi-bash-ring-tail-"))
+  const shell = createShell(cwd)
+  const tool = createBashTool(shell)
+
+  try {
+    const result = await tool.execute("bash-ring-tail", {
+      command: `node -e "process.stdout.write('🙂'.repeat(${DEFAULT_MAX_BYTES}) + 'TAIL')"`
+    })
+    const output = result.content[0]
+    if (output?.type !== "text") throw new Error("Expected text output")
+    expect(output.text).toContain("TAIL\n\n[Output truncated")
+    expect(output.text).not.toContain("�")
+    expect(Buffer.byteLength(output.text)).toBeLessThan(DEFAULT_MAX_BYTES + 512)
+  } finally {
+    await shell.dispose()
+    rmSync(cwd, { recursive: true, force: true })
+  }
+})
+
 test("newline-terminated shell output keeps its semantic presentation", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "zi-bash-presentation-"))
   const shell = createShell(cwd)

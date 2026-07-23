@@ -1,5 +1,18 @@
-import { appendFileSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs"
-import { open, opendir, stat } from "node:fs/promises"
+import { createHash } from "node:crypto"
+import {
+  appendFileSync,
+  closeSync,
+  linkSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readSync,
+  rmSync,
+  statSync,
+  truncateSync,
+  writeFileSync
+} from "node:fs"
+import { open, opendir, rm, stat, unlink } from "node:fs/promises"
 import { dirname, join } from "node:path"
 
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core"
@@ -8,9 +21,11 @@ import { formatCompactionSummary, type AgentMessage, type CompactionSummaryMessa
 import { type ZiPaths, resolveZiPath } from "./paths.js"
 import { maxRetryCount } from "./retry.js"
 
+export type SessionFormatVersion = 1 | 2
+
 export interface SessionHeader {
   type: "session"
-  version: 1
+  version: SessionFormatVersion
   id: string
   timestamp: string
   cwd: string
@@ -66,17 +81,22 @@ export interface NewSessionOptions {
 }
 
 export const maxSessionFileBytes = 64 * 1024 * 1024
+export const maxSessionStorageBytes = 64 * 1024 * 1024
 export const maxSessionListCandidates = 4096
 export const maxSessionListResults = 200
 export const maxSessionListPreviewBytes = 256 * 1024
 export const maxSessionFirstMessageLength = 512
 export const maxSessionPromptHistoryEntries = 100
 export const maxSessionPromptHistoryEntryBytes = 1024 * 1024
+export const maxSessionPromptHistoryBytes = 8 * 1024 * 1024
 export const maxCompactionSummaryBytes = 128 * 1024
 export const maxCompactionFilePaths = 256
 export const maxCompactionPathBytes = 4096
 
+const currentSessionFormat: SessionFormatVersion = 2
+const sessionReadBufferBytes = 64 * 1024
 const sessionListConcurrency = 8
+const imageDigestPattern = /^[0-9a-f]{64}$/
 
 export interface SessionInfo {
   readonly path: string
@@ -113,22 +133,120 @@ export interface SessionContext {
   readonly thinkingLevel?: ThinkingLevel
 }
 
+export interface SessionJournalMemoryDiagnostics {
+  readonly entries: number
+  readonly residentEntries: number
+  readonly coldEntries: number
+  readonly journalBytes: number
+  readonly residentEntryBytes: number
+  readonly imageBlobBytes: number
+  readonly coldMemoryBytes: number
+}
+
 type SessionPersistence =
   | { readonly type: "memory" }
   | { readonly type: "pending"; readonly file: string }
-  | { readonly type: "durable"; readonly file: string }
+  | {
+      readonly type: "durable"
+      readonly file: string
+      readonly appendRepair?: { readonly type: "truncate"; readonly offset: number } | { readonly type: "newline" }
+    }
+
+interface StoredImageReference {
+  readonly type: "image"
+  readonly mimeType: string
+  readonly blob: { readonly sha256: string; readonly bytes: number }
+}
+
+interface StoredAgentMessage extends Record<string, unknown> {
+  readonly role: AgentMessage["role"]
+  readonly timestamp: number
+}
+
+type StoredMessageEntry = SessionEntryBase & { readonly type: "message"; readonly message: StoredAgentMessage }
+type StoredSessionEntry = Exclude<SessionEntry, MessageEntry> | StoredMessageEntry
+
+interface PreparedBlob {
+  readonly sha256: string
+  readonly bytes: number
+  readonly data: Buffer
+}
+
+interface PreparedRecord {
+  readonly line: string
+  readonly bytes: number
+  readonly blobs: ReadonlyMap<string, PreparedBlob>
+}
+
+interface JournalRecord {
+  readonly line: string
+  readonly bytes: number
+  readonly start: number
+  readonly end: number
+  readonly terminated: boolean
+}
+
+interface EntryReference {
+  readonly id: string
+  readonly index: number
+  readonly type: SessionEntry["type"]
+  readonly role?: AgentMessage["role"]
+  readonly stopReason?: unknown
+  readonly contextVisible: boolean
+}
+
+interface LoadedJournal {
+  readonly header: SessionHeader
+  readonly entries: SessionEntry[]
+  readonly recordBytes: number[]
+  readonly promptHistory: SessionPromptHistoryEntry[]
+  readonly promptHistoryBytes: number
+  readonly model: SessionModel | undefined
+  readonly thinkingLevel: ThinkingLevel | undefined
+  readonly leafId: string | null
+  readonly entryCount: number
+  readonly journalBytes: number
+  readonly imageBlobs: Map<string, number>
+  readonly imageBlobBytes: number
+  readonly appendRepair?: { readonly type: "truncate"; readonly offset: number } | { readonly type: "newline" }
+}
+
+export class SessionCapacityError extends Error {
+  constructor() {
+    super(`Session storage cannot exceed ${maxSessionStorageBytes} bytes`)
+    this.name = "SessionCapacityError"
+  }
+}
 
 export class SessionManager {
   readonly header: SessionHeader
   #persistence: SessionPersistence
   readonly #entries: SessionEntry[] = []
+  readonly #residentRecordBytes: number[] = []
   #presentationMessages: AgentMessage[] = []
-  readonly #promptHistory: MessageEntry[] = []
+  readonly #promptHistory: SessionPromptHistoryEntry[] = []
+  readonly #coldMemory: Buffer[] = []
+  readonly #imageBlobs = new Map<string, number>()
+  #promptHistoryBytes = 0
   #leafId: string | null = null
+  #entryCount = 0
+  #journalBytes: number
+  #imageBlobBytes = 0
+  #model: SessionModel | undefined
+  #thinkingLevel: ThinkingLevel | undefined
 
-  private constructor(cwd: string, sessionDir: string, sessionId?: string, persist = true) {
+  private constructor(
+    cwd: string,
+    sessionDir: string,
+    sessionId?: string,
+    persist = true,
+    restoredHeader?: SessionHeader
+  ) {
     const id = sessionId ?? crypto.randomUUID()
-    this.header = { type: "session", version: 1, id, timestamp: new Date().toISOString(), cwd }
+    this.header =
+      restoredHeader ??
+      ({ type: "session", version: currentSessionFormat, id, timestamp: new Date().toISOString(), cwd } as const)
+    this.#journalBytes = lineBytes(JSON.stringify(this.header))
     if (persist) mkdirSync(sessionDir, { recursive: true })
     this.#persistence = persist ? { type: "pending", file: join(sessionDir, `${id}.jsonl`) } : { type: "memory" }
   }
@@ -143,33 +261,31 @@ export class SessionManager {
 
   static open(file: string): SessionManager {
     const resolvedFile = resolveZiPath(file)
-    const size = statSync(resolvedFile).size
-    if (size > maxSessionFileBytes) {
-      throw new Error(`Session file cannot exceed ${maxSessionFileBytes} bytes: ${resolvedFile}`)
+    const loaded = loadJournal(resolvedFile, "active")
+    const manager = new SessionManager(
+      resolveZiPath(loaded.header.cwd),
+      dirname(resolvedFile),
+      loaded.header.id,
+      false,
+      { ...loaded.header, cwd: resolveZiPath(loaded.header.cwd) }
+    )
+    manager.#persistence = {
+      type: "durable",
+      file: resolvedFile,
+      ...(loaded.appendRepair ? { appendRepair: loaded.appendRepair } : {})
     }
-    const content = readFileSync(resolvedFile, "utf8")
-    const lines = content.split("\n")
-    if (lines.at(-1) === "") lines.pop()
-    const header = parseHeader(lines.shift() ?? "null", resolvedFile)
-    const entries: SessionEntry[] = []
-    for (let index = 0; index < lines.length; index++) {
-      const line = lines[index]
-      if (!line) continue
-      try {
-        entries.push(parseEntry(line, resolvedFile))
-      } catch (cause) {
-        if (index === lines.length - 1 && !content.endsWith("\n")) break
-        throw cause
-      }
-    }
-    const manager = new SessionManager(resolveZiPath(header.cwd), dirname(resolvedFile), header.id, false)
-    manager.#persistence = { type: "durable", file: resolvedFile }
-    validateJournal(entries, resolvedFile)
-    manager.#entries.push(...entries)
+    manager.#entries.push(...loaded.entries)
+    manager.#residentRecordBytes.push(...loaded.recordBytes)
+    manager.#promptHistory.push(...loaded.promptHistory)
+    manager.#promptHistoryBytes = loaded.promptHistoryBytes
+    manager.#leafId = loaded.leafId
+    manager.#entryCount = loaded.entryCount
+    manager.#journalBytes = loaded.journalBytes
+    manager.#imageBlobBytes = loaded.imageBlobBytes
+    for (const [digest, bytes] of loaded.imageBlobs) manager.#imageBlobs.set(digest, bytes)
+    manager.#model = loaded.model
+    manager.#thinkingLevel = loaded.thinkingLevel
     manager.#rebuildPresentationMessages()
-    for (const entry of entries) manager.#considerPromptHistoryEntry(entry)
-    manager.#leafId = manager.#entries.at(-1)?.id ?? null
-    Object.assign(manager.header, header, { cwd: resolveZiPath(header.cwd) })
     return manager
   }
 
@@ -270,21 +386,37 @@ export class SessionManager {
     return this.#append({ type: "compaction", ...data })
   }
 
+  /** Materializes the complete journal. Runtime policy should consume retainedEntries(). */
+  entries(): readonly SessionEntry[] {
+    if (this.#entryCount === this.#entries.length) return this.#entries
+    if (this.#persistence.type === "durable") return loadJournal(this.#persistence.file, "all").entries
+
+    const entries: SessionEntry[] = []
+    for (const chunk of this.#coldMemory) {
+      for (const line of chunk.toString("utf8").split("\n")) {
+        if (!line) continue
+        entries.push(hydrateStoredEntry(parseStoredEntry(line, "<memory>", this.header.version), undefined))
+      }
+    }
+    entries.push(...this.#entries)
+    validateJournal(entries, "<memory>")
+    return entries
+  }
+
+  retainedEntries(): readonly SessionEntry[] {
+    return this.#entries
+  }
+
   messages(): AgentMessage[] {
-    return this.#entries.flatMap(entry => (entry.type === "message" ? [entry.message] : []))
+    return this.entries().flatMap(entry => (entry.type === "message" ? [entry.message] : []))
   }
 
   buildSessionContext(): SessionContext {
-    let model: SessionContext["model"]
-    let thinkingLevel: ThinkingLevel | undefined
-    for (const entry of this.#entries) {
-      if (entry.type === "model_change") model = { provider: entry.provider, modelId: entry.modelId }
-      else if (entry.type === "thinking_level_change") thinkingLevel = entry.thinkingLevel
-      else if (entry.type === "message" && entry.message.role === "assistant") {
-        model = { provider: entry.message.provider, modelId: entry.message.model }
-      }
+    return {
+      messages: this.activeMessages(),
+      ...(this.#model ? { model: this.#model } : {}),
+      ...(this.#thinkingLevel ? { thinkingLevel: this.#thinkingLevel } : {})
     }
-    return { messages: this.activeMessages(), ...(model ? { model } : {}), ...(thinkingLevel ? { thinkingLevel } : {}) }
   }
 
   activeEntries(): readonly SessionEntry[] {
@@ -304,12 +436,12 @@ export class SessionManager {
   }
 
   latestPromptHistoryEntry(): SessionPromptHistoryEntry | undefined {
-    return promptHistoryValue(this.#promptHistory.at(-1))
+    return clonePromptHistory(this.#promptHistory.at(-1))
   }
 
   olderPromptHistoryEntry(entryId: string): SessionPromptHistoryEntry | undefined {
-    const index = this.#promptHistory.findIndex(entry => entry.id === entryId)
-    return index > 0 ? promptHistoryValue(this.#promptHistory[index - 1]) : undefined
+    const index = this.#promptHistory.findIndex(entry => entry.entryId === entryId)
+    return index > 0 ? clonePromptHistory(this.#promptHistory[index - 1]) : undefined
   }
 
   activeUsageAnchorIndex(): number {
@@ -321,8 +453,16 @@ export class SessionManager {
     return firstAfterMarker < 0 ? active.length : firstAfterMarker
   }
 
-  entries(): readonly SessionEntry[] {
-    return this.#entries
+  get memoryDiagnostics(): SessionJournalMemoryDiagnostics {
+    return {
+      entries: this.#entryCount,
+      residentEntries: this.#entries.length,
+      coldEntries: this.#entryCount - this.#entries.length,
+      journalBytes: this.#journalBytes,
+      residentEntryBytes: this.#residentRecordBytes.reduce((total, bytes) => total + bytes, 0),
+      imageBlobBytes: this.#imageBlobBytes,
+      coldMemoryBytes: this.#coldMemory.reduce((total, chunk) => total + chunk.byteLength, 0)
+    }
   }
 
   get sessionId(): string {
@@ -337,6 +477,14 @@ export class SessionManager {
     return this.#persistence.type === "memory" ? "" : dirname(this.#persistence.file)
   }
 
+  async discardPersistence(): Promise<void> {
+    const file = this.file
+    if (!file) return
+    const outcomes = await Promise.allSettled([unlink(file), rm(blobDirectory(file), { recursive: true, force: true })])
+    const failure = outcomes.find((outcome): outcome is PromiseRejectedResult => outcome.status === "rejected")
+    if (failure && !isMissingFile(failure.reason)) throw failure.reason
+  }
+
   #append<Entry extends SessionEntryData>(entry: Entry): SessionEntryBase & Entry {
     const next = {
       ...entry,
@@ -345,20 +493,37 @@ export class SessionManager {
       timestamp: new Date().toISOString()
     } as SessionEntryBase & Entry
     validateNextEntry(next, this.#entries, this.file ?? "<memory>")
-    this.#persist(next)
+
+    const prepared = prepareRecord(next, this.header.version, this.#persistence.type !== "memory")
+    const newBlobBytes = additionalBlobBytes(prepared.blobs, this.#imageBlobs)
+    if (
+      this.#journalBytes + prepared.bytes > maxSessionFileBytes ||
+      this.#journalBytes + prepared.bytes + this.#imageBlobBytes + newBlobBytes > maxSessionStorageBytes
+    ) {
+      throw new SessionCapacityError()
+    }
+
+    this.#persist(next, prepared)
     this.#entries.push(next)
+    this.#residentRecordBytes.push(prepared.bytes)
+    this.#entryCount++
+    this.#journalBytes += prepared.bytes
+    for (const blob of prepared.blobs.values()) {
+      if (this.#imageBlobs.has(blob.sha256)) continue
+      this.#imageBlobs.set(blob.sha256, blob.bytes)
+      this.#imageBlobBytes += blob.bytes
+    }
     this.#updatePresentationMessages(next)
     this.#considerPromptHistoryEntry(next)
+    this.#considerSessionContextEntry(next)
     this.#leafId = next.id
+    if (next.type === "compaction") this.#pruneCompactedPrefix(next)
     return next
   }
 
   #updatePresentationMessages(entry: SessionEntry): void {
-    if (entry.type === "compaction") {
-      this.#rebuildPresentationMessages()
-    } else if (entry.type === "message") {
-      this.#presentationMessages.push(entry.message)
-    }
+    if (entry.type === "compaction") this.#rebuildPresentationMessages()
+    else if (entry.type === "message") this.#presentationMessages.push(entry.message)
   }
 
   #rebuildPresentationMessages(): void {
@@ -368,27 +533,83 @@ export class SessionManager {
   #considerPromptHistoryEntry(entry: SessionEntry): void {
     if (entry.type !== "message" || entry.message.role !== "user") return
     const text = promptHistoryText(entry.message.content)
-    if (text === undefined || promptHistoryValue(this.#promptHistory.at(-1))?.text === text) return
-    this.#promptHistory.push(entry)
-    if (this.#promptHistory.length > maxSessionPromptHistoryEntries) this.#promptHistory.shift()
+    if (text === undefined || this.#promptHistory.at(-1)?.text === text) return
+    this.#promptHistory.push({ entryId: entry.id, text })
+    this.#promptHistoryBytes += Buffer.byteLength(text)
+    while (
+      this.#promptHistory.length > maxSessionPromptHistoryEntries ||
+      this.#promptHistoryBytes > maxSessionPromptHistoryBytes
+    ) {
+      const removed = this.#promptHistory.shift()
+      if (removed) this.#promptHistoryBytes -= Buffer.byteLength(removed.text)
+    }
   }
 
-  #persist(next: SessionEntry): void {
+  #considerSessionContextEntry(entry: SessionEntry): void {
+    if (entry.type === "model_change") this.#model = { provider: entry.provider, modelId: entry.modelId }
+    else if (entry.type === "thinking_level_change") this.#thinkingLevel = entry.thinkingLevel
+    else if (entry.type === "message" && entry.message.role === "assistant") {
+      this.#model = { provider: entry.message.provider, modelId: entry.message.model }
+    }
+  }
+
+  #pruneCompactedPrefix(marker: CompactionEntry): void {
+    const boundary = this.#entries.findIndex(entry => entry.id === marker.firstKeptEntryId)
+    if (boundary <= 0) return
+
+    if (this.#persistence.type === "memory") {
+      const bytes = this.#residentRecordBytes.slice(0, boundary).reduce((total, value) => total + value, 0)
+      const cold = Buffer.allocUnsafe(bytes)
+      let offset = 0
+      for (let index = 0; index < boundary; index++) {
+        const entry = this.#entries[index]!
+        const line = `${JSON.stringify(entry)}\n`
+        offset += cold.write(line, offset, "utf8")
+      }
+      this.#coldMemory.push(cold)
+    }
+
+    this.#entries.splice(0, boundary)
+    this.#residentRecordBytes.splice(0, boundary)
+  }
+
+  #persist(next: SessionEntry, prepared: PreparedRecord): void {
     const persistence = this.#persistence
     if (persistence.type === "memory") return
     if (persistence.type === "durable") {
-      appendFileSync(persistence.file, `${JSON.stringify(next)}\n`)
+      const created = writeBlobs(blobDirectory(persistence.file), prepared.blobs, this.#imageBlobs, false)
+      try {
+        if (persistence.appendRepair?.type === "truncate")
+          truncateSync(persistence.file, persistence.appendRepair.offset)
+        else if (persistence.appendRepair?.type === "newline") appendFileSync(persistence.file, "\n")
+        appendFileSync(persistence.file, prepared.line)
+      } catch (cause) {
+        for (const path of created) rmSync(path, { force: true })
+        throw cause
+      }
+      if (persistence.appendRepair) this.#persistence = { type: "durable", file: persistence.file }
       return
     }
 
     if (next.type !== "message" || next.message.role !== "assistant") return
 
-    // Pi defers a new journal until the first assistant response so abandoned sessions never enter history.
-    writeFileSync(
-      persistence.file,
-      `${[this.header, ...this.#entries, next].map(entry => JSON.stringify(entry)).join("\n")}\n`,
-      { flag: "wx" }
-    )
+    const entries = [...this.#entries, next]
+    const records = entries.map(entry => prepareRecord(entry, this.header.version, true))
+    const blobs = mergePreparedBlobs(records)
+    const created = writeBlobs(blobDirectory(persistence.file), blobs, new Map(), true)
+    try {
+      const handle = openSync(persistence.file, "wx", 0o600)
+      try {
+        writeFileSync(handle, `${JSON.stringify(this.header)}\n`)
+        for (const record of records) writeFileSync(handle, record.line)
+      } finally {
+        closeSync(handle)
+      }
+    } catch (cause) {
+      rmSync(persistence.file, { force: true })
+      for (const path of created) rmSync(path, { force: true })
+      throw cause
+    }
     this.#persistence = { type: "durable", file: persistence.file }
   }
 }
@@ -419,9 +640,9 @@ async function loadSessionInfo(candidate: {
     for (let index = 0; index < lines.length; index++) {
       const line = lines[index]
       if (!line) continue
-      let entry: SessionEntry
+      let entry: StoredSessionEntry
       try {
-        entry = parseEntry(line, candidate.path)
+        entry = parseStoredEntry(line, candidate.path, header.version)
       } catch (cause) {
         if (candidate.size === bytesRead && index === lines.length - 1 && !content.endsWith("\n")) break
         throw cause
@@ -446,10 +667,477 @@ async function loadSessionInfo(candidate: {
   }
 }
 
-function promptHistoryValue(entry: MessageEntry | undefined): SessionPromptHistoryEntry | undefined {
-  if (!entry || entry.message.role !== "user") return undefined
-  const text = promptHistoryText(entry.message.content)
-  return text === undefined ? undefined : { entryId: entry.id, text }
+function loadJournal(file: string, retention: "active" | "all"): LoadedJournal {
+  const metadata = statSync(file)
+  if (metadata.size > maxSessionFileBytes) {
+    throw new Error(`Session file cannot exceed ${maxSessionFileBytes} bytes: ${file}`)
+  }
+
+  const handle = openSync(file, "r")
+  let validBytes = metadata.size
+  let repair: "none" | "truncate" | "newline" = "none"
+  let header: SessionHeader | undefined
+  const references = new Map<string, EntryReference>()
+  const retryFailures = new Set<string>()
+  const promptHistory: SessionPromptHistoryEntry[] = []
+  let promptHistoryBytes = 0
+  const imageBlobs = new Map<string, number>()
+  let imageBlobBytes = 0
+  let previous: EntryReference | undefined
+  let entryCount = 0
+  let latestBoundaryId: string | undefined
+  let model: SessionModel | undefined
+  let thinkingLevel: ThinkingLevel | undefined
+
+  try {
+    let firstRecord = true
+    for (const record of readJournalRecords(handle, metadata.size)) {
+      if (firstRecord) {
+        firstRecord = false
+        header = parseHeader(record.line || "null", file)
+        continue
+      }
+      if (!record.line) continue
+
+      let entry: StoredSessionEntry
+      try {
+        entry = parseStoredEntry(record.line, file, header!.version)
+      } catch (cause) {
+        if (!record.terminated && record.end === metadata.size) {
+          validBytes = record.start
+          repair = "truncate"
+          break
+        }
+        throw cause
+      }
+
+      if (!record.terminated && record.end === metadata.size) repair = "newline"
+      const reference = validateStoredJournalEntry(entry, entryCount, previous, references, retryFailures, file)
+      references.set(entry.id, reference)
+      previous = reference
+      entryCount++
+
+      if (entry.type === "compaction") latestBoundaryId = entry.firstKeptEntryId
+      if (entry.type === "model_change") model = { provider: entry.provider, modelId: entry.modelId }
+      else if (entry.type === "thinking_level_change") thinkingLevel = entry.thinkingLevel
+      else if (entry.type === "message") {
+        if (entry.message.role === "assistant") {
+          model = { provider: String(entry.message.provider), modelId: String(entry.message.model) }
+        } else if (entry.message.role === "user") {
+          const text = promptHistoryText(entry.message.content)
+          if (text !== undefined && promptHistory.at(-1)?.text !== text) {
+            promptHistory.push({ entryId: entry.id, text })
+            promptHistoryBytes += Buffer.byteLength(text)
+            while (
+              promptHistory.length > maxSessionPromptHistoryEntries ||
+              promptHistoryBytes > maxSessionPromptHistoryBytes
+            ) {
+              const removed = promptHistory.shift()
+              if (removed) promptHistoryBytes -= Buffer.byteLength(removed.text)
+            }
+          }
+        }
+        for (const image of storedImageReferences(entry.message)) {
+          const previousBytes = imageBlobs.get(image.blob.sha256)
+          if (previousBytes !== undefined && previousBytes !== image.blob.bytes) {
+            throw new Error(`Invalid session image reference: ${file}`)
+          }
+          if (previousBytes === undefined) {
+            imageBlobs.set(image.blob.sha256, image.blob.bytes)
+            imageBlobBytes += image.blob.bytes
+          }
+        }
+      }
+    }
+    if (!header) throw new Error(`Invalid session header: ${file}`)
+
+    verifyBlobs(file, imageBlobs)
+    if (validBytes + (repair === "newline" ? 1 : 0) + imageBlobBytes > maxSessionStorageBytes) {
+      throw new Error(`Session storage cannot exceed ${maxSessionStorageBytes} bytes: ${file}`)
+    }
+
+    const entries: SessionEntry[] = []
+    const recordBytes: number[] = []
+    let retain = retention === "all" || latestBoundaryId === undefined
+    let firstRetainedRecord = true
+    for (const record of readJournalRecords(handle, validBytes)) {
+      if (firstRetainedRecord) {
+        firstRetainedRecord = false
+        continue
+      }
+      if (!record.line) continue
+      const stored = parseStoredEntry(record.line, file, header.version)
+      if (!retain && stored.id === latestBoundaryId) retain = true
+      if (!retain) continue
+      entries.push(hydrateStoredEntry(stored, file))
+      recordBytes.push(record.bytes)
+    }
+    if (!retain) throw new Error(`Invalid compaction boundary: ${file}`)
+
+    if (repair === "newline" && validBytes === maxSessionFileBytes) {
+      throw new Error(`Session file cannot exceed ${maxSessionFileBytes} bytes: ${file}`)
+    }
+    const journalBytes = repair === "newline" ? validBytes + 1 : validBytes
+
+    return {
+      header,
+      entries,
+      recordBytes,
+      promptHistory,
+      promptHistoryBytes,
+      model,
+      thinkingLevel,
+      leafId: previous?.id ?? null,
+      entryCount,
+      journalBytes,
+      imageBlobs,
+      imageBlobBytes,
+      ...(repair === "truncate"
+        ? { appendRepair: { type: "truncate" as const, offset: validBytes } }
+        : repair === "newline"
+          ? { appendRepair: { type: "newline" as const } }
+          : {})
+    }
+  } finally {
+    closeSync(handle)
+  }
+}
+
+function* readJournalRecords(handle: number, size: number): Generator<JournalRecord> {
+  const readBuffer = Buffer.allocUnsafe(sessionReadBufferBytes)
+  const parts: Buffer[] = []
+  let partsBytes = 0
+  let position = 0
+  let lineStart = 0
+
+  while (position < size) {
+    const requested = Math.min(readBuffer.length, size - position)
+    const bytesRead = readSync(handle, readBuffer, 0, requested, position)
+    if (bytesRead === 0) break
+    const chunkStart = position
+    position += bytesRead
+    let segmentStart = 0
+    let newline = readBuffer.indexOf(10, segmentStart)
+
+    while (newline >= 0 && newline < bytesRead) {
+      const segment = readBuffer.subarray(segmentStart, newline)
+      const lineBuffer =
+        parts.length === 0 ? segment : Buffer.concat([...parts, segment], partsBytes + segment.byteLength)
+      const end = chunkStart + newline + 1
+      yield { line: decodeJournalLine(lineBuffer), bytes: end - lineStart, start: lineStart, end, terminated: true }
+      parts.length = 0
+      partsBytes = 0
+      segmentStart = newline + 1
+      lineStart = end
+      newline = readBuffer.indexOf(10, segmentStart)
+    }
+
+    if (segmentStart < bytesRead) {
+      const tail = Buffer.from(readBuffer.subarray(segmentStart, bytesRead))
+      parts.push(tail)
+      partsBytes += tail.byteLength
+      if (partsBytes > maxSessionFileBytes) throw new Error("Session record exceeds the session file limit")
+    }
+  }
+
+  if (partsBytes > 0) {
+    const lineBuffer = parts.length === 1 ? parts[0]! : Buffer.concat(parts, partsBytes)
+    yield {
+      line: decodeJournalLine(lineBuffer),
+      bytes: size - lineStart,
+      start: lineStart,
+      end: size,
+      terminated: false
+    }
+  }
+}
+
+function decodeJournalLine(buffer: Buffer): string {
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(buffer)
+  } catch {
+    throw new Error("Session journal contains invalid UTF-8")
+  }
+}
+
+function parseHeader(line: string, file: string): SessionHeader {
+  const value = parseJson(line, "header", file)
+  if (
+    !isRecord(value) ||
+    value.type !== "session" ||
+    (value.version !== 1 && value.version !== 2) ||
+    typeof value.id !== "string" ||
+    typeof value.timestamp !== "string" ||
+    typeof value.cwd !== "string"
+  ) {
+    throw new Error(`Invalid session header: ${file}`)
+  }
+  return { type: value.type, version: value.version, id: value.id, timestamp: value.timestamp, cwd: value.cwd }
+}
+
+function parseStoredEntry(line: string, file: string, version: SessionFormatVersion): StoredSessionEntry {
+  const value = parseJson(line, "entry", file)
+  if (
+    !isRecord(value) ||
+    typeof value.id !== "string" ||
+    (value.parentId !== null && typeof value.parentId !== "string") ||
+    typeof value.timestamp !== "string"
+  ) {
+    throw new Error(`Invalid session entry: ${file}`)
+  }
+
+  const base = { id: value.id, parentId: value.parentId, timestamp: value.timestamp }
+  if (value.type === "message" && isStoredAgentMessage(value.message, version)) {
+    return { ...base, type: value.type, message: value.message }
+  }
+  if (value.type === "model_change" && typeof value.provider === "string" && typeof value.modelId === "string") {
+    return { ...base, type: value.type, provider: value.provider, modelId: value.modelId }
+  }
+  if (value.type === "thinking_level_change" && isThinkingLevel(value.thinkingLevel)) {
+    return { ...base, type: value.type, thinkingLevel: value.thinkingLevel }
+  }
+  if (value.type === "retry" && typeof value.failedEntryId === "string" && isRetryAttempt(value.attempt)) {
+    return { ...base, type: value.type, failedEntryId: value.failedEntryId, attempt: value.attempt }
+  }
+  if (value.type === "compaction" && isCompactionEntryData(value)) {
+    return {
+      ...base,
+      type: value.type,
+      reason: value.reason,
+      summary: value.summary,
+      firstKeptEntryId: value.firstKeptEntryId,
+      tokensBefore: value.tokensBefore,
+      estimatedTokensAfter: value.estimatedTokensAfter,
+      details: value.details,
+      ...(value.excludedFailureEntryId === undefined ? {} : { excludedFailureEntryId: value.excludedFailureEntryId })
+    }
+  }
+  throw new Error(`Invalid session entry: ${file}`)
+}
+
+function hydrateStoredEntry(entry: StoredSessionEntry, file: string | undefined): SessionEntry {
+  if (entry.type !== "message") return entry
+  const content = entry.message.content
+  if (!Array.isArray(content) || !content.some(isStoredImageReference)) {
+    if (!isAgentMessage(entry.message)) throw new Error(`Invalid session message: ${file ?? "<memory>"}`)
+    return { ...entry, message: entry.message }
+  }
+  if (!file) throw new Error("In-memory session cannot reference an image blob")
+
+  const hydratedContent = content.map(part => {
+    if (!isStoredImageReference(part)) return part
+    const path = join(blobDirectory(file), part.blob.sha256)
+    const data = readFileSync(path)
+    if (data.byteLength !== part.blob.bytes || sha256(data) !== part.blob.sha256) {
+      throw new Error(`Invalid session image blob: ${path}`)
+    }
+    return { type: "image" as const, mimeType: part.mimeType, data: data.toString("base64") }
+  })
+  const message = { ...entry.message, content: hydratedContent }
+  if (!isAgentMessage(message)) throw new Error(`Invalid session message: ${file}`)
+  return { ...entry, message }
+}
+
+function validateStoredJournalEntry(
+  entry: StoredSessionEntry,
+  index: number,
+  previous: EntryReference | undefined,
+  references: ReadonlyMap<string, EntryReference>,
+  retryFailures: Set<string>,
+  file: string
+): EntryReference {
+  if (references.has(entry.id) || entry.parentId !== (previous?.id ?? null)) {
+    throw new Error(`Invalid session entry: ${file}`)
+  }
+
+  if (entry.type === "retry") {
+    if (
+      previous?.id !== entry.failedEntryId ||
+      previous.type !== "message" ||
+      previous.role !== "assistant" ||
+      previous.stopReason !== "error"
+    ) {
+      throw new Error(`Invalid retry failure reference: ${file}`)
+    }
+    retryFailures.add(entry.failedEntryId)
+  } else if (entry.type === "compaction") {
+    const firstKept = references.get(entry.firstKeptEntryId)
+    if (
+      !firstKept ||
+      firstKept.index >= index ||
+      !firstKept.contextVisible ||
+      firstKept.role === "toolResult" ||
+      retryFailures.has(firstKept.id) ||
+      entry.excludedFailureEntryId === firstKept.id
+    ) {
+      throw new Error(`Invalid compaction boundary: ${file}`)
+    }
+    if (entry.excludedFailureEntryId !== undefined) {
+      const failure = references.get(entry.excludedFailureEntryId)
+      if (!failure || failure.role !== "assistant" || failure.stopReason !== "error") {
+        throw new Error(`Invalid compaction failure reference: ${file}`)
+      }
+    }
+  }
+
+  return storedEntryReference(entry, index)
+}
+
+function storedEntryReference(entry: StoredSessionEntry, index: number): EntryReference {
+  if (entry.type !== "message") {
+    return { id: entry.id, index, type: entry.type, contextVisible: false }
+  }
+  const excludeFromContext = entry.message.role === "bashExecution" && entry.message.excludeFromContext === true
+  return {
+    id: entry.id,
+    index,
+    type: entry.type,
+    role: entry.message.role,
+    stopReason: entry.message.stopReason,
+    contextVisible: !excludeFromContext
+  }
+}
+
+function prepareRecord(entry: SessionEntry, version: SessionFormatVersion, externalizeImages: boolean): PreparedRecord {
+  const blobs = new Map<string, PreparedBlob>()
+  let stored: unknown = entry
+  if (
+    version === 2 &&
+    externalizeImages &&
+    entry.type === "message" &&
+    "content" in entry.message &&
+    Array.isArray(entry.message.content)
+  ) {
+    let changed = false
+    const content = entry.message.content.map(part => {
+      if (part.type !== "image") return part
+      changed = true
+      const data = decodeBase64(part.data)
+      const digest = sha256(data)
+      blobs.set(digest, { sha256: digest, bytes: data.byteLength, data })
+      return { type: "image" as const, mimeType: part.mimeType, blob: { sha256: digest, bytes: data.byteLength } }
+    })
+    if (changed) stored = { ...entry, message: { ...entry.message, content } }
+  }
+  const line = `${JSON.stringify(stored)}\n`
+  return { line, bytes: Buffer.byteLength(line), blobs }
+}
+
+function decodeBase64(value: string): Buffer {
+  if (!/^[A-Za-z0-9+/]*={0,2}$/.test(value)) throw new Error("Invalid base64 session image")
+  const data = Buffer.from(value, "base64")
+  if (data.toString("base64").replace(/=+$/u, "") !== value.replace(/=+$/u, "")) {
+    throw new Error("Invalid base64 session image")
+  }
+  return data
+}
+
+function mergePreparedBlobs(records: readonly PreparedRecord[]): Map<string, PreparedBlob> {
+  const blobs = new Map<string, PreparedBlob>()
+  for (const record of records) for (const [digest, blob] of record.blobs) blobs.set(digest, blob)
+  return blobs
+}
+
+function additionalBlobBytes(blobs: ReadonlyMap<string, PreparedBlob>, known: ReadonlyMap<string, number>): number {
+  let bytes = 0
+  for (const blob of blobs.values()) if (!known.has(blob.sha256)) bytes += blob.bytes
+  return bytes
+}
+
+function writeBlobs(
+  directory: string,
+  blobs: ReadonlyMap<string, PreparedBlob>,
+  known: ReadonlyMap<string, number>,
+  force: boolean
+): string[] {
+  const selected = [...blobs.values()].filter(blob => force || !known.has(blob.sha256))
+  if (selected.length === 0) return []
+  mkdirSync(directory, { recursive: true, mode: 0o700 })
+  const created: string[] = []
+  try {
+    for (const blob of selected) {
+      const path = join(directory, blob.sha256)
+      if (writeBlob(path, blob)) created.push(path)
+    }
+    return created
+  } catch (cause) {
+    for (const path of created) rmSync(path, { force: true })
+    throw cause
+  }
+}
+
+function writeBlob(path: string, blob: PreparedBlob): boolean {
+  let existing
+  try {
+    existing = statSync(path)
+  } catch (cause) {
+    if (!isMissingFile(cause)) throw cause
+  }
+  if (existing) {
+    if (existing.size !== blob.bytes || hashFile(path) !== blob.sha256) {
+      throw new Error(`Invalid existing session image blob: ${path}`)
+    }
+    return false
+  }
+
+  const pending = `${path}.${process.pid}.${crypto.randomUUID()}.tmp`
+  writeFileSync(pending, blob.data, { flag: "wx", mode: 0o600 })
+  try {
+    linkSync(pending, path)
+    return true
+  } catch (cause) {
+    if (!isAlreadyExists(cause)) throw cause
+    const metadata = statSync(path)
+    if (metadata.size !== blob.bytes || hashFile(path) !== blob.sha256) {
+      throw new Error(`Invalid existing session image blob: ${path}`, { cause })
+    }
+    return false
+  } finally {
+    rmSync(pending, { force: true })
+  }
+}
+
+function verifyBlobs(file: string, blobs: ReadonlyMap<string, number>): void {
+  const directory = blobDirectory(file)
+  for (const [digest, bytes] of blobs) {
+    const path = join(directory, digest)
+    let metadata
+    try {
+      metadata = statSync(path)
+    } catch {
+      throw new Error(`Missing session image blob: ${path}`)
+    }
+    if (!metadata.isFile() || metadata.size !== bytes || hashFile(path) !== digest) {
+      throw new Error(`Invalid session image blob: ${path}`)
+    }
+  }
+}
+
+function hashFile(path: string): string {
+  const handle = openSync(path, "r")
+  const buffer = Buffer.allocUnsafe(sessionReadBufferBytes)
+  const hash = createHash("sha256")
+  try {
+    for (;;) {
+      const bytesRead = readSync(handle, buffer, 0, buffer.length, null)
+      if (bytesRead === 0) return hash.digest("hex")
+      hash.update(buffer.subarray(0, bytesRead))
+    }
+  } finally {
+    closeSync(handle)
+  }
+}
+
+function blobDirectory(file: string): string {
+  return file.endsWith(".jsonl") ? `${file.slice(0, -".jsonl".length)}.blobs` : `${file}.blobs`
+}
+
+function sha256(data: Uint8Array): string {
+  return createHash("sha256").update(data).digest("hex")
+}
+
+function clonePromptHistory(entry: SessionPromptHistoryEntry | undefined): SessionPromptHistoryEntry | undefined {
+  return entry ? { entryId: entry.entryId, text: entry.text } : undefined
 }
 
 function promptHistoryText(content: unknown): string | undefined {
@@ -499,69 +1187,18 @@ function isMissingFile(cause: unknown): boolean {
   return isRecord(cause) && cause.code === "ENOENT"
 }
 
-function parseHeader(line: string, file: string): SessionHeader {
-  const value = parseJson(line, "header", file)
-  if (
-    !isRecord(value) ||
-    value.type !== "session" ||
-    value.version !== 1 ||
-    typeof value.id !== "string" ||
-    typeof value.timestamp !== "string" ||
-    typeof value.cwd !== "string"
-  ) {
-    throw new Error(`Invalid session header: ${file}`)
-  }
-  return { type: value.type, version: value.version, id: value.id, timestamp: value.timestamp, cwd: value.cwd }
+function isAlreadyExists(cause: unknown): boolean {
+  return isRecord(cause) && cause.code === "EEXIST"
 }
 
-function parseEntry(line: string, file: string): SessionEntry {
-  const value = parseJson(line, "entry", file)
-  if (
-    !isRecord(value) ||
-    typeof value.id !== "string" ||
-    (value.parentId !== null && typeof value.parentId !== "string") ||
-    typeof value.timestamp !== "string"
-  ) {
-    throw new Error(`Invalid session entry: ${file}`)
-  }
-
-  const base = { id: value.id, parentId: value.parentId, timestamp: value.timestamp }
-  if (value.type === "message" && isAgentMessage(value.message)) {
-    return { ...base, type: value.type, message: value.message }
-  }
-  if (value.type === "model_change" && typeof value.provider === "string" && typeof value.modelId === "string") {
-    return { ...base, type: value.type, provider: value.provider, modelId: value.modelId }
-  }
-  if (value.type === "thinking_level_change" && isThinkingLevel(value.thinkingLevel)) {
-    return { ...base, type: value.type, thinkingLevel: value.thinkingLevel }
-  }
-  if (value.type === "retry" && typeof value.failedEntryId === "string" && isRetryAttempt(value.attempt)) {
-    return { ...base, type: value.type, failedEntryId: value.failedEntryId, attempt: value.attempt }
-  }
-  if (value.type === "compaction" && isCompactionEntryData(value)) {
-    return {
-      ...base,
-      type: value.type,
-      reason: value.reason,
-      summary: value.summary,
-      firstKeptEntryId: value.firstKeptEntryId,
-      tokensBefore: value.tokensBefore,
-      estimatedTokensAfter: value.estimatedTokensAfter,
-      details: value.details,
-      ...(value.excludedFailureEntryId === undefined ? {} : { excludedFailureEntryId: value.excludedFailureEntryId })
-    }
-  }
-  throw new Error(`Invalid session entry: ${file}`)
-}
-
-function isAgentMessage(value: unknown): value is AgentMessage {
+function isStoredAgentMessage(value: unknown, version: SessionFormatVersion): value is StoredAgentMessage {
   if (!isRecord(value) || typeof value.timestamp !== "number") return false
   switch (value.role) {
     case "user":
-      return typeof value.content === "string" || isContentArray(value.content)
+      return typeof value.content === "string" || isStoredContentArray(value.content, version)
     case "assistant":
       return (
-        isContentArray(value.content) &&
+        isStoredContentArray(value.content, version) &&
         typeof value.api === "string" &&
         typeof value.provider === "string" &&
         typeof value.model === "string" &&
@@ -572,7 +1209,7 @@ function isAgentMessage(value: unknown): value is AgentMessage {
       return (
         typeof value.toolCallId === "string" &&
         typeof value.toolName === "string" &&
-        isContentArray(value.content) &&
+        isStoredContentArray(value.content, version) &&
         typeof value.isError === "boolean"
       )
     case "bashExecution":
@@ -586,7 +1223,7 @@ function isAgentMessage(value: unknown): value is AgentMessage {
     case "custom":
       return (
         typeof value.customType === "string" &&
-        (typeof value.content === "string" || isContentArray(value.content)) &&
+        (typeof value.content === "string" || isStoredContentArray(value.content, version)) &&
         typeof value.display === "boolean"
       )
     case "branchSummary":
@@ -602,21 +1239,47 @@ function isAgentMessage(value: unknown): value is AgentMessage {
   }
 }
 
-function isContentArray(value: unknown): boolean {
-  return Array.isArray(value) && value.every(isContent)
+function isAgentMessage(value: unknown): value is AgentMessage {
+  return isStoredAgentMessage(value, 1)
 }
 
-function isContent(value: unknown): boolean {
+function isStoredContentArray(value: unknown, version: SessionFormatVersion): boolean {
+  return Array.isArray(value) && value.every(part => isStoredContent(part, version))
+}
+
+function isStoredContent(value: unknown, version: SessionFormatVersion): boolean {
   if (!isRecord(value)) return false
   if (value.type === "text") return typeof value.text === "string"
   if (value.type === "thinking") return typeof value.thinking === "string"
-  if (value.type === "image") return typeof value.data === "string" && typeof value.mimeType === "string"
+  if (value.type === "image") {
+    return (
+      typeof value.mimeType === "string" &&
+      (typeof value.data === "string" || (version === 2 && isStoredImageReference(value)))
+    )
+  }
   return (
     value.type === "toolCall" &&
     typeof value.id === "string" &&
     typeof value.name === "string" &&
     isRecord(value.arguments)
   )
+}
+
+function isStoredImageReference(value: unknown): value is StoredImageReference {
+  return (
+    isRecord(value) &&
+    value.type === "image" &&
+    typeof value.mimeType === "string" &&
+    value.data === undefined &&
+    isRecord(value.blob) &&
+    typeof value.blob.sha256 === "string" &&
+    imageDigestPattern.test(value.blob.sha256) &&
+    isNonNegativeInteger(value.blob.bytes)
+  )
+}
+
+function storedImageReferences(message: StoredAgentMessage): StoredImageReference[] {
+  return Array.isArray(message.content) ? message.content.filter(isStoredImageReference) : []
 }
 
 function isUsage(value: unknown): boolean {
@@ -796,6 +1459,10 @@ function parseJson(line: string, kind: "header" | "entry", file: string): unknow
   } catch {
     throw new Error(`Invalid session ${kind}: ${file}`)
   }
+}
+
+function lineBytes(lineWithoutNewline: string): number {
+  return Buffer.byteLength(lineWithoutNewline) + 1
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

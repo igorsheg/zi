@@ -1,5 +1,3 @@
-import { unlink } from "node:fs/promises"
-
 import type { Api, Model } from "@earendil-works/pi-ai"
 
 import { resolveZiPath } from "./paths.js"
@@ -222,18 +220,18 @@ export class AgentSessionRuntime {
   }
 
   async #discard(runtime: AgentRuntime, discardFile: boolean): Promise<void> {
-    const file = discardFile ? runtime.session.sessionManager.file : undefined
+    const discardPersistence = discardFile && runtime.session.sessionManager.file !== undefined
     runtime.session.dispose()
     try {
       await runtime.session.waitForIdle()
     } catch (cause) {
       this.#cleanupFailure ??= { cause }
     }
-    if (!file) return
+    if (!discardPersistence) return
     try {
-      await unlink(file)
+      await runtime.session.sessionManager.discardPersistence()
     } catch (cause) {
-      if (!isMissingFile(cause)) this.#cleanupFailure ??= { cause }
+      this.#cleanupFailure ??= { cause }
     }
   }
 
@@ -321,10 +319,6 @@ function isOperation(
   operationId: number
 ): state is Extract<RuntimeState, { operationId: number }> {
   return "operationId" in state && state.operationId === operationId
-}
-
-function isMissingFile(cause: unknown): boolean {
-  return typeof cause === "object" && cause !== null && Reflect.get(cause, "code") === "ENOENT"
 }
 
 function deferred(): { readonly settled: Promise<void>; resolve(): void } {

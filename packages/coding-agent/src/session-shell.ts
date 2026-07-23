@@ -670,6 +670,41 @@ export class SessionShell {
   }
 }
 
+class Utf8TailBuffer {
+  readonly #buffer: Buffer
+  #length = 0
+
+  constructor(capacity: number) {
+    this.#buffer = Buffer.allocUnsafe(capacity)
+  }
+
+  append(chunk: Buffer): void {
+    if (chunk.length >= this.#buffer.length) {
+      let start = chunk.length - this.#buffer.length
+      while (start < chunk.length && isUtf8Continuation(chunk[start]!)) start++
+      this.#length = chunk.copy(this.#buffer, 0, start)
+      return
+    }
+
+    const overflow = this.#length + chunk.length - this.#buffer.length
+    if (overflow > 0) {
+      let retainedStart = overflow
+      while (retainedStart < this.#length && isUtf8Continuation(this.#buffer[retainedStart]!)) retainedStart++
+      this.#buffer.copyWithin(0, retainedStart, this.#length)
+      this.#length -= retainedStart
+    }
+    this.#length += chunk.copy(this.#buffer, this.#length)
+  }
+
+  toString(): string {
+    return this.#buffer.toString("utf8", 0, this.#length)
+  }
+}
+
+function isUtf8Continuation(byte: number): boolean {
+  return (byte & 0xc0) === 0x80
+}
+
 interface TaskOutputOptions {
   readonly path: string
   readonly maxBytes: number
@@ -690,7 +725,7 @@ class TaskOutput {
   readonly #failed: (cause: Error) => void
   readonly #file: WriteStream
   readonly #sources = new Map<NodeJS.ReadableStream, (chunk: Buffer) => void>()
-  #tail = Buffer.alloc(0)
+  readonly #tail = new Utf8TailBuffer(DEFAULT_MAX_BYTES * 2)
   #totalBytes = 0
   #newlines = 0
   #endsWithNewline = false
@@ -724,12 +759,7 @@ class TaskOutput {
       this.#totalBytes += chunk.length
       this.#newlines += countByte(chunk, 10)
       if (chunk.length > 0) this.#endsWithNewline = chunk[chunk.length - 1] === 10
-      this.#tail = Buffer.concat([this.#tail, chunk])
-      if (this.#tail.length > DEFAULT_MAX_BYTES * 2) {
-        let tailStart = this.#tail.length - DEFAULT_MAX_BYTES * 2
-        while (tailStart < this.#tail.length && (this.#tail[tailStart]! & 0xc0) === 0x80) tailStart++
-        this.#tail = this.#tail.subarray(tailStart)
-      }
+      this.#tail.append(chunk)
 
       const taskAvailable = Math.max(0, this.#maxBytes - this.#retainedBytes)
       const admitted = this.#reserve(Math.min(taskAvailable, chunk.length))

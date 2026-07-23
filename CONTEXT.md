@@ -12,6 +12,18 @@ _Avoid_: Pi coding agent, runtime
 One coding conversation and its policy: active model, session resources, tools, durable history, queueing, compaction, retries, and lifecycle.
 _Avoid_: Chat, agent core
 
+**Session journal**:
+The append-only JSONL authority for one agent session's durable history. Format 2 stores image bytes in content-addressed session image blobs while journal records retain validated references. The session journal owns aggregate storage admission, transactional appends, torn-tail repair on the next append, streaming restore, and deletion of its blob directory.
+_Avoid_: Transcript cache, provider context, message database
+
+**Resident session tail**:
+The exact physical journal suffix required to derive current provider context and transcript presentation after the latest compaction. Persisted history before this suffix remains authoritative on disk but is not retained as parsed messages; in-memory sessions retain that cold prefix as encoded UTF-8. Explicit full-journal access may materialize cold entries without changing residency.
+_Avoid_: Deleted history, compacted journal, TUI message cache
+
+**Session image blob**:
+A SHA-256-addressed raw image file owned by one format-2 session journal. Active messages hydrate the provider's base64 image value on demand; compacted cold history retains only its journal reference. Blob bytes and journal bytes share one session storage limit.
+_Avoid_: Attachment upload, global media cache, inline base64 journal
+
 **Session shell**:
 The session-scoped coding-agent owner of shell task identity, foreground/background transitions, subprocess groups, bounded output files and previews, completion, retention, and disposal. Its Bash and task tools are adapters over the same task state. Run interruption stops foreground work; demoted or explicitly backgrounded work survives until completion, explicit kill, timeout, output bounds, or final session disposal.
 _Avoid_: Global process manager, TUI task registry, detached Bash process

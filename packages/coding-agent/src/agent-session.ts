@@ -61,6 +61,7 @@ import type {
   CompactionEntry,
   CompactionReason,
   SessionEntry,
+  SessionJournalMemoryDiagnostics,
   SessionManager,
   SessionPromptHistoryEntry
 } from "./session-manager.js"
@@ -185,6 +186,7 @@ export interface AgentSessionMemoryDiagnostics {
   readonly queuedInputs: number
   readonly queuedInputBytes: number
   readonly subscribers: number
+  readonly journal: SessionJournalMemoryDiagnostics
 }
 
 export interface QueueModeMutation {
@@ -503,7 +505,8 @@ export class AgentSession {
       streamingMessageBytes: this.streamingMessage ? serializedMessageBytes(this.streamingMessage) : 0,
       queuedInputs: this.#pending.length,
       queuedInputBytes: this.#pendingBytes,
-      subscribers: this.#listeners.size
+      subscribers: this.#listeners.size,
+      journal: this.sessionManager.memoryDiagnostics
     }
   }
 
@@ -1204,7 +1207,7 @@ export class AgentSession {
 
     const attempt = activity.retryAttempts + 1
     const failureEntry = this.sessionManager
-      .entries()
+      .retainedEntries()
       .findLast(entry => entry.type === "message" && entry.message === message)
     if (!failureEntry) return "none"
     const marker = this.sessionManager.appendRetry(failureEntry.id, attempt)
@@ -1270,7 +1273,7 @@ export class AgentSession {
 
     const failureEntry =
       message.stopReason === "error"
-        ? this.sessionManager.entries().findLast(entry => entry.type === "message" && entry.message === message)
+        ? this.sessionManager.retainedEntries().findLast(entry => entry.type === "message" && entry.message === message)
         : undefined
     if (message.stopReason === "error" && !failureEntry) return "stop"
 
@@ -1372,13 +1375,13 @@ export class AgentSession {
     const usage = this.contextUsage
     if (usage.type === "unavailable") throw new Error("Context usage is unavailable for the selected model")
     const preparation = prepareCompaction(
-      this.sessionManager.entries(),
+      this.sessionManager.retainedEntries(),
       settings,
       { tokens: usage.tokens, quality: usage.type },
       excludedFailureEntryId
     )
     if (preparation.type === "nothing_to_compact") return undefined
-    return { model, settings, leafId: this.sessionManager.entries().at(-1)?.id, plan: preparation.plan }
+    return { model, settings, leafId: this.sessionManager.retainedEntries().at(-1)?.id, plan: preparation.plan }
   }
 
   #effectiveCompactionSettings(): EffectiveCompactionSettings | undefined {
@@ -1559,7 +1562,7 @@ export class AgentSession {
     if (this.#modelState.type !== "selected" || this.#modelState.model !== prepared.model) {
       throw new Error("Compaction model changed before commit")
     }
-    if (this.sessionManager.entries().at(-1)?.id !== prepared.leafId) {
+    if (this.sessionManager.retainedEntries().at(-1)?.id !== prepared.leafId) {
       throw new Error("Session changed before compaction could commit")
     }
   }

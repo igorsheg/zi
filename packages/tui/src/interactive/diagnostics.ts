@@ -87,7 +87,7 @@ export class TuiDiagnosticsOverlay {
     this.#renderer = renderer
     this.#transcript = transcript
     this.#captureMemory = captureMemory
-    const height = (flags.showTimeToFirstDraw ? 1 : 0) + (flags.showStats ? 3 : 0) + (flags.showMemory ? 3 : 0)
+    const height = (flags.showTimeToFirstDraw ? 1 : 0) + (flags.showStats ? 3 : 0) + (flags.showMemory ? 4 : 0)
     this.root = new BoxRenderable(renderer, {
       id: "tui-diagnostics",
       position: "absolute",
@@ -171,8 +171,9 @@ export class TuiDiagnosticsOverlay {
     if (!this.#memory) return
     this.#memory.content = [
       `RSS ${formatBytes(snapshot.process.rssBytes)} · heapUsed ${formatBytes(snapshot.process.heapUsedBytes)} · heapTotal ${formatBytes(snapshot.process.heapTotalBytes)}`,
-      `Messages ${snapshot.session.committedMessages} · payload ${formatBytes(snapshot.session.committedMessageBytes)} · stream ${formatBytes(snapshot.session.streamingMessageBytes)}`,
-      `Renderables ${snapshot.renderer.reachableRenderables}/${snapshot.renderer.registeredRenderables} · transcript ${snapshot.renderer.transcriptRoots} · listeners ${snapshot.listeners.renderer + snapshot.listeners.keyInput}`
+      `Active ${snapshot.session.committedMessages} · ${formatBytes(snapshot.session.committedMessageBytes)} · journal ${snapshot.session.journal.residentEntries}/${snapshot.session.journal.entries}`,
+      `Journal ${formatBytes(snapshot.session.journal.journalBytes)} + blobs ${formatBytes(snapshot.session.journal.imageBlobBytes)} · cold ${snapshot.session.journal.coldEntries}`,
+      `Nodes ${snapshot.renderer.reachableRenderables}/${snapshot.renderer.registeredRenderables} · transcript ${snapshot.renderer.transcriptRoots} · listeners ${snapshot.listeners.renderer + snapshot.listeners.keyInput}`
     ].join("\n")
   }
 }

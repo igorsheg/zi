@@ -750,7 +750,16 @@ test("diagnostic overlay samples at a bounded rate and releases its frame listen
           streamingMessageBytes: 0,
           queuedInputs: 0,
           queuedInputBytes: 0,
-          subscribers: 1
+          subscribers: 1,
+          journal: {
+            entries: 0,
+            residentEntries: 0,
+            coldEntries: 0,
+            journalBytes: 100,
+            residentEntryBytes: 0,
+            imageBlobBytes: 0,
+            coldMemoryBytes: 0
+          }
         },
         renderer: {
           reachableRenderables: 4,

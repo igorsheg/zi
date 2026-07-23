@@ -59,7 +59,8 @@ test("session memory diagnostics account for owned messages, queues, and subscri
       streamingMessageBytes: 0,
       queuedInputs: 0,
       queuedInputBytes: 0,
-      subscribers: 0
+      subscribers: 0,
+      journal: session.sessionManager.memoryDiagnostics
     })
 
     const unsubscribe = session.subscribe(() => {})
@@ -83,7 +84,8 @@ test("session memory diagnostics account for owned messages, queues, and subscri
       streamingMessageBytes: 0,
       queuedInputs: 0,
       queuedInputBytes: 0,
-      subscribers: 0
+      subscribers: 0,
+      journal: session.sessionManager.memoryDiagnostics
     })
   } finally {
     session.dispose()
