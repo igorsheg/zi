@@ -10,6 +10,7 @@ import {
   fauxProvider
 } from "@with-zi/coding-agent/testing"
 
+import { defaultCliArgv } from "../src/main.js"
 import {
   helpText,
   maxCliStdinBytes,
@@ -52,6 +53,13 @@ test("spawned version stays stdout-clean and never initializes a terminal", asyn
   ])
 
   expect({ exitCode, stdout, stderr }).toEqual({ exitCode: 0, stdout: versionText, stderr: "" })
+})
+
+test("CLI argument defaults handle Bun scripts and compiled executables", () => {
+  expect(defaultCliArgv(["/usr/local/bin/bun", "/work/packages/cli/src/main.ts", "-V"])).toEqual(["-V"])
+  expect(defaultCliArgv(["bun", "/$bunfs/root/standalone", "-V"])).toEqual(["-V"])
+  expect(defaultCliArgv(["bun", "-V"])).toEqual(["-V"])
+  expect(defaultCliArgv(["C:\\tools\\zi.exe", "-V"])).toEqual(["-V"])
 })
 
 test("CLI mode resolution gives explicit JSON priority and otherwise follows TTY facts", () => {

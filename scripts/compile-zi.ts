@@ -22,7 +22,7 @@ export async function compileZi(options: CompileZiOptions): Promise<void> {
   }
 
   const root = resolve(import.meta.dirname, "..")
-  await compileStandalone(resolve(root, "packages/cli/src/main.ts"), options.outfile, {
+  await compileStandalone(resolve(root, "packages/cli/src/standalone.ts"), options.outfile, {
     "process.env.ZI_BUILD_VERSION": JSON.stringify(options.version)
   })
   await verifyZi(options.outfile, options.version)

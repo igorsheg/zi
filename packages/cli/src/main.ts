@@ -9,8 +9,18 @@ import {
   type CliSignal
 } from "./run.js"
 
-export async function main(argv: readonly string[] = process.argv.slice(2)): Promise<number> {
+export async function main(argv: readonly string[] = defaultCliArgv()): Promise<number> {
   return runCli(argv, processHost())
+}
+
+export function defaultCliArgv(argv: readonly string[] = process.argv): readonly string[] {
+  // Bun standalone argv includes a virtual $bunfs script on Unix; Windows builds may expose only executable argv.
+  const second = argv[1]
+  if (!second) return []
+  if (second.startsWith("-")) return argv.slice(1)
+  if (second.includes("$bunfs") || /\.[cm]?[jt]sx?$/.test(second)) return argv.slice(2)
+  if (/(^|[\\/])bun(?:\.exe)?$/i.test(argv[0] ?? "")) return argv.slice(2)
+  return argv.slice(1)
 }
 
 function processHost(): CliHost {
@@ -59,10 +69,10 @@ async function writeOutput(stream: Bun.BunFile, chunk: string): Promise<void> {
 
 if (import.meta.main) {
   try {
-    process.exitCode = await main()
+    process.exitCode = await main(defaultCliArgv())
   } catch (cause) {
     const message = cause instanceof Error ? cause.message : String(cause)
-    process.stderr.write(`${message}\n`)
+    await Bun.stderr.write(`${message}\n`)
     process.exitCode = 1
   }
 }
