@@ -14,11 +14,11 @@ The spike implemented five production paths:
 4. fixed UTF-8-aligned shell output tails;
 5. aggregate live session storage admission.
 
-ADR 0018 records the resulting ownership model.
+ADR 0018 records the resulting ownership model. A follow-up promoted bounded Zstd compression for the compacted cold prefix of non-persistent sessions.
 
 ## Method
 
-Measurements used a standalone executable compiled from the working tree with Bun 1.3.14 on macOS 15.7 arm64. The TUI ran at 120×35 with `ZI_TUI_MEMORY=1`. Each scenario ran in a fresh process and received one harmless input edit after loading so the frame-driven diagnostic overlay sampled settled state. RSS values are single-run characterization evidence, not CI thresholds.
+Measurements used a standalone executable compiled from the working tree with Bun 1.3.14 on macOS 15.7 arm64. The TUI ran at 120×35 with `ZI_TUI_MEMORY=1`. Each scenario ran in a fresh process and received one harmless input edit after loading so the frame-driven diagnostic overlay sampled settled state. The original RSS values are single-run characterization evidence, not CI thresholds. The compression follow-up ran the committed raw-prefix implementation and the Zstd implementation in isolated Bun processes against the same project-shaped 48 MiB logical cold history; its table reports the median of three fresh processes.
 
 The long-session fixture contains 4,000 alternating user/assistant messages and a 32.5 MiB format-1 JSONL file. Its compacted variant retains 21 active messages. Using format 1 keeps the before/after journal payload identical, so those rows isolate restore and residency changes.
 
@@ -45,6 +45,19 @@ A compacted session with one 8 MiB base64 image was restored through both format
 
 Format 2 reduced durable storage by 25% and settled restore RSS by about 64 MiB for this cold-image case. Active images still require Pi's base64 value and therefore do not receive the same heap reduction until compaction makes them cold.
 
+### Non-persistent cold history
+
+A real `SessionManager.inMemory()` run appended 5,696 session entries from the same project source corpus, compacted to two resident entries, forced collection, and retained full-journal access:
+
+| Cold representation | Logical cold bytes | Retained cold bytes | Blocks |       RSS | Heap used | External |
+| ------------------- | -----------------: | ------------------: | -----: | --------: | --------: | -------: |
+| Raw UTF-8           |           48.0 MiB |            48.0 MiB |      1 | 286.4 MiB |  54.4 MiB | 50.8 MiB |
+| Bounded Zstd        |           48.0 MiB |             9.4 MiB |     49 | 168.8 MiB |  26.8 MiB | 12.4 MiB |
+
+Zstd reduced retained cold bytes by 80% and settled RSS by about 118 MiB in this characterization. Fixed 1 MiB blocks bound codec input and decoded working memory. A block remains raw when compression would expand it, and the only partial block is recombined on later compactions so block count follows logical bytes rather than compaction count. Compression is prepared before session mutation and affects no persisted journal format.
+
+A separate codec comparison included 25% incompressible content. Zstd retained 33.7% of logical bytes versus LZ4's 48.9%, while still encoding at roughly 400 MiB/s and decoding at roughly 700 MiB/s. Bun already provides Zstd through `node:zlib`; LZ4's speed advantage did not justify an external native dependency.
+
 ### Shell tail
 
 An isolated allocation stress fed 64 MiB as 4 KiB chunks while retaining the same 100 KiB tail:
@@ -62,6 +75,6 @@ Live journal plus unique image-blob bytes are now rejected transactionally befor
 
 ## Verdict
 
-All five changes produced either a measured memory reduction or a new hard ownership invariant. The largest wins came from changing lifetimes—cold parsed history and image base64—not from packing ordinary message metadata into typed arrays. Neither mmap nor SIMD was required for this slice.
+All five original changes and the non-persistent cold-history follow-up produced either a measured memory reduction or a new hard ownership invariant. The largest wins came from changing lifetimes—cold parsed history and image base64—not from packing ordinary message metadata into typed arrays. Neither mmap nor SIMD was required for this slice.
 
 The remaining large compacted-restore RSS is temporary JSON parsing high-water, not retained session payload. A future experiment should target metadata-only cold-record validation before adding a native parser, mmap, Wasm, or SIMD dependency.

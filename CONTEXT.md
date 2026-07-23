@@ -17,7 +17,7 @@ The append-only JSONL authority for one agent session's durable history. Format 
 _Avoid_: Transcript cache, provider context, message database
 
 **Resident session tail**:
-The exact physical journal suffix required to derive current provider context and transcript presentation after the latest compaction. Persisted history before this suffix remains authoritative on disk but is not retained as parsed messages; in-memory sessions retain that cold prefix as encoded UTF-8. Explicit full-journal access may materialize cold entries without changing residency.
+The exact physical journal suffix required to derive current provider context and transcript presentation after the latest compaction. Persisted history before this suffix remains authoritative on disk but is not retained as parsed messages; in-memory sessions retain that cold prefix in bounded raw-or-Zstd UTF-8 blocks. Explicit full-journal access may materialize cold entries without changing residency.
 _Avoid_: Deleted history, compacted journal, TUI message cache
 
 **Session image blob**:

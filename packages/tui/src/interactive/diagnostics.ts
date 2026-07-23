@@ -172,7 +172,7 @@ export class TuiDiagnosticsOverlay {
     this.#memory.content = [
       `RSS ${formatBytes(snapshot.process.rssBytes)} · heapUsed ${formatBytes(snapshot.process.heapUsedBytes)} · heapTotal ${formatBytes(snapshot.process.heapTotalBytes)}`,
       `Active ${snapshot.session.committedMessages} · ${formatBytes(snapshot.session.committedMessageBytes)} · journal ${snapshot.session.journal.residentEntries}/${snapshot.session.journal.entries}`,
-      `Journal ${formatBytes(snapshot.session.journal.journalBytes)} + blobs ${formatBytes(snapshot.session.journal.imageBlobBytes)} · cold ${snapshot.session.journal.coldEntries}`,
+      `Journal ${formatBytes(snapshot.session.journal.journalBytes)} + blobs ${formatBytes(snapshot.session.journal.imageBlobBytes)} · cold ${snapshot.session.journal.coldEntries} ${formatBytes(snapshot.session.journal.coldMemoryBytes)}/${formatBytes(snapshot.session.journal.coldMemoryLogicalBytes)}`,
       `Nodes ${snapshot.renderer.reachableRenderables}/${snapshot.renderer.registeredRenderables} · transcript ${snapshot.renderer.transcriptRoots} · listeners ${snapshot.listeners.renderer + snapshot.listeners.keyInput}`
     ].join("\n")
   }

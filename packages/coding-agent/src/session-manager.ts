@@ -20,6 +20,13 @@ import type { ThinkingLevel } from "@earendil-works/pi-agent-core"
 import { formatCompactionSummary, type AgentMessage, type CompactionSummaryMessage } from "./messages.js"
 import { type ZiPaths, resolveZiPath } from "./paths.js"
 import { maxRetryCount } from "./retry.js"
+import {
+  appendSessionColdEntries,
+  sessionColdBytes,
+  sessionColdLogicalBytes,
+  type SessionColdBlock,
+  visitSessionColdLines
+} from "./session-cold-history.js"
 
 export type SessionFormatVersion = 1 | 2
 
@@ -141,6 +148,8 @@ export interface SessionJournalMemoryDiagnostics {
   readonly residentEntryBytes: number
   readonly imageBlobBytes: number
   readonly coldMemoryBytes: number
+  readonly coldMemoryLogicalBytes: number
+  readonly coldMemoryBlocks: number
 }
 
 type SessionPersistence =
@@ -176,6 +185,11 @@ interface PreparedRecord {
   readonly line: string
   readonly bytes: number
   readonly blobs: ReadonlyMap<string, PreparedBlob>
+}
+
+interface PreparedCompaction {
+  readonly boundary: number
+  readonly coldBlocks: readonly SessionColdBlock[] | undefined
 }
 
 interface JournalRecord {
@@ -225,7 +239,7 @@ export class SessionManager {
   readonly #residentRecordBytes: number[] = []
   #presentationMessages: AgentMessage[] = []
   readonly #promptHistory: SessionPromptHistoryEntry[] = []
-  readonly #coldMemory: Buffer[] = []
+  #coldMemory: readonly SessionColdBlock[] = []
   readonly #imageBlobs = new Map<string, number>()
   #promptHistoryBytes = 0
   #leafId: string | null = null
@@ -392,12 +406,9 @@ export class SessionManager {
     if (this.#persistence.type === "durable") return loadJournal(this.#persistence.file, "all").entries
 
     const entries: SessionEntry[] = []
-    for (const chunk of this.#coldMemory) {
-      for (const line of chunk.toString("utf8").split("\n")) {
-        if (!line) continue
-        entries.push(hydrateStoredEntry(parseStoredEntry(line, "<memory>", this.header.version), undefined))
-      }
-    }
+    visitSessionColdLines(this.#coldMemory, line => {
+      entries.push(hydrateStoredEntry(parseStoredEntry(line, "<memory>", this.header.version), undefined))
+    })
     entries.push(...this.#entries)
     validateJournal(entries, "<memory>")
     return entries
@@ -461,7 +472,9 @@ export class SessionManager {
       journalBytes: this.#journalBytes,
       residentEntryBytes: this.#residentRecordBytes.reduce((total, bytes) => total + bytes, 0),
       imageBlobBytes: this.#imageBlobBytes,
-      coldMemoryBytes: this.#coldMemory.reduce((total, chunk) => total + chunk.byteLength, 0)
+      coldMemoryBytes: sessionColdBytes(this.#coldMemory),
+      coldMemoryLogicalBytes: sessionColdLogicalBytes(this.#coldMemory),
+      coldMemoryBlocks: this.#coldMemory.length
     }
   }
 
@@ -503,6 +516,7 @@ export class SessionManager {
       throw new SessionCapacityError()
     }
 
+    const preparedCompaction = next.type === "compaction" ? this.#prepareCompaction(next) : undefined
     this.#persist(next, prepared)
     this.#entries.push(next)
     this.#residentRecordBytes.push(prepared.bytes)
@@ -517,7 +531,7 @@ export class SessionManager {
     this.#considerPromptHistoryEntry(next)
     this.#considerSessionContextEntry(next)
     this.#leafId = next.id
-    if (next.type === "compaction") this.#pruneCompactedPrefix(next)
+    if (preparedCompaction) this.#pruneCompactedPrefix(preparedCompaction)
     return next
   }
 
@@ -553,24 +567,22 @@ export class SessionManager {
     }
   }
 
-  #pruneCompactedPrefix(marker: CompactionEntry): void {
+  #prepareCompaction(marker: CompactionEntry): PreparedCompaction {
     const boundary = this.#entries.findIndex(entry => entry.id === marker.firstKeptEntryId)
-    if (boundary <= 0) return
-
-    if (this.#persistence.type === "memory") {
-      const bytes = this.#residentRecordBytes.slice(0, boundary).reduce((total, value) => total + value, 0)
-      const cold = Buffer.allocUnsafe(bytes)
-      let offset = 0
-      for (let index = 0; index < boundary; index++) {
-        const entry = this.#entries[index]!
-        const line = `${JSON.stringify(entry)}\n`
-        offset += cold.write(line, offset, "utf8")
-      }
-      this.#coldMemory.push(cold)
+    return {
+      boundary,
+      coldBlocks:
+        boundary > 0 && this.#persistence.type === "memory"
+          ? appendSessionColdEntries(this.#coldMemory, this.#entries.slice(0, boundary))
+          : undefined
     }
+  }
 
-    this.#entries.splice(0, boundary)
-    this.#residentRecordBytes.splice(0, boundary)
+  #pruneCompactedPrefix(compaction: PreparedCompaction): void {
+    if (compaction.boundary <= 0) return
+    if (compaction.coldBlocks) this.#coldMemory = compaction.coldBlocks
+    this.#entries.splice(0, compaction.boundary)
+    this.#residentRecordBytes.splice(0, compaction.boundary)
   }
 
   #persist(next: SessionEntry, prepared: PreparedRecord): void {

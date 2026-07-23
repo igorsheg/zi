@@ -379,7 +379,7 @@ On open, semantic validation requires:
 - summary/details satisfy their bounds;
 - projected context does not begin with a tool result after the synthetic summary.
 
-`SessionManager.entries()` explicitly materializes the full durable journal when needed. Runtime policy uses the parsed resident suffix exposed by `retainedEntries()`; provider execution and the current TUI transcript use projections of that suffix. Persisted cold records remain authoritative on disk, while in-memory sessions retain an encoded UTF-8 cold prefix. See ADR 0018.
+`SessionManager.entries()` explicitly materializes the full durable journal when needed. Runtime policy uses the parsed resident suffix exposed by `retainedEntries()`; provider execution and the current TUI transcript use projections of that suffix. Persisted cold records remain authoritative on disk, while in-memory sessions retain the cold prefix in at most 1 MiB raw-or-Zstd UTF-8 blocks. The partial tail block is recombined during later compactions, and complete history is decoded sequentially only on explicit access. See ADR 0018.
 
 # 6. Context accounting
 

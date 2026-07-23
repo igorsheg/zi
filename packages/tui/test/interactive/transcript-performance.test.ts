@@ -752,13 +752,15 @@ test("diagnostic overlay samples at a bounded rate and releases its frame listen
           queuedInputBytes: 0,
           subscribers: 1,
           journal: {
-            entries: 0,
+            entries: 2,
             residentEntries: 0,
-            coldEntries: 0,
+            coldEntries: 2,
             journalBytes: 100,
             residentEntryBytes: 0,
             imageBlobBytes: 0,
-            coldMemoryBytes: 0
+            coldMemoryBytes: 50,
+            coldMemoryLogicalBytes: 100,
+            coldMemoryBlocks: 1
           }
         },
         renderer: {
@@ -787,6 +789,7 @@ test("diagnostic overlay samples at a bounded rate and releases its frame listen
     expect(frame).toContain("Overall avg")
     expect(frame).toContain("heapUsed")
     expect(frame).toContain("heapTotal")
+    expect(frame).toContain("cold 2 50B/100B")
     expect(frame).not.toContain(" native ")
     expect(memoryCaptures).toBe(1)
   } finally {

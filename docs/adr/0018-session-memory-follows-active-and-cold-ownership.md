@@ -15,7 +15,7 @@ The 64 MiB session file limit was checked only during listing and restore. A liv
 The session journal remains append-only and authoritative. Its in-memory representation now distinguishes the **resident session tail** from cold durable history.
 
 - `SessionManager` retains only the physical suffix beginning at the latest compaction marker's `firstKeptEntryId`. This suffix is sufficient for repeated compaction, retry exclusion, provider context, and current transcript presentation.
-- Persisted cold entries remain only in JSONL. In-memory sessions encode a pruned cold prefix as UTF-8 bytes so `persist: false` keeps full-journal behavior without retaining duplicate parsed object graphs.
+- Persisted cold entries remain only in JSONL. In-memory sessions encode a pruned cold prefix into at most 1 MiB UTF-8 blocks so `persist: false` keeps full-journal behavior without retaining duplicate parsed object graphs. Each block uses Bun's bundled Zstd codec when that reduces retained bytes and otherwise remains raw. The one partial tail block is recombined on later compactions, bounding block count by logical session bytes rather than compaction count.
 - Explicit `entries()` and `messages()` calls may materialize the complete journal. Runtime policy uses `retainedEntries()` and never materializes cold history accidentally.
 - Prompt history owns bounded `{ entryId, text }` values rather than message references. It remains limited to 100 entries, 1 MiB per entry, and 8 MiB in aggregate.
 - Restore scans a bounded file through one reusable 64 KiB read buffer. The first pass validates journal order and semantic references, derives model, thinking, prompt history, blob references, and the latest resident boundary. The second pass hydrates only the requested full journal or resident suffix. A malformed unterminated tail remains untouched until the next append, which repairs it before committing a new record.
@@ -29,11 +29,12 @@ New journals use format version 2.
 
 The session shell retains preview bytes in one fixed UTF-8-aligned buffer. Overflow moves the bounded tail in place instead of allocating a concatenated buffer for each chunk. Full shell output remains file-backed under the existing session-shell limits.
 
-Memory diagnostics report total, resident, and cold entry counts; logical journal bytes; resident entry bytes; image blob bytes; and encoded in-memory cold bytes. These are ownership diagnostics, not estimates of JavaScript object layout.
+Memory diagnostics report total, resident, and cold entry counts; logical journal bytes; resident entry bytes; image blob bytes; and retained versus logical in-memory cold bytes and block count. These are ownership diagnostics, not estimates of JavaScript object layout.
 
 ## Consequences
 
 - Compaction now releases persisted cold message objects and strings while preserving the append-only durable journal.
+- Zstd is only an in-memory representation for non-persistent cold history. It changes no journal format, adds no external native dependency, and is prepared before the compaction marker mutates session state.
 - Uncompacted sessions still retain their complete active history because the provider and transcript can require it.
 - Full-journal inspection is deliberately expensive and explicit. A future history view must page through a bounded coding-agent operation rather than repeatedly call `entries()`.
 - Format-2 journals depend on their sibling blob directory. Copying or backing up a session requires both.

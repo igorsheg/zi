@@ -573,7 +573,9 @@ test("version 2 journals externalize image bytes and retain only the compacted a
     residentEntries: 2,
     coldEntries: 2,
     imageBlobBytes: imageBytes.byteLength,
-    coldMemoryBytes: 0
+    coldMemoryBytes: 0,
+    coldMemoryLogicalBytes: 0,
+    coldMemoryBlocks: 0
   })
   expect(session.retainedEntries().map(entry => entry.id)).toEqual([kept.id, session.latestCompaction()!.id])
   expect(session.entries().find(entry => entry.id === old.id)).toMatchObject({
@@ -582,7 +584,14 @@ test("version 2 journals externalize image bytes and retain only the compacted a
   })
 
   const restored = SessionManager.open(file)
-  expect(restored.memoryDiagnostics).toMatchObject({ entries: 4, residentEntries: 2, coldEntries: 2 })
+  expect(restored.memoryDiagnostics).toMatchObject({
+    entries: 4,
+    residentEntries: 2,
+    coldEntries: 2,
+    coldMemoryBytes: 0,
+    coldMemoryLogicalBytes: 0,
+    coldMemoryBlocks: 0
+  })
   expect(restored.activeMessages()).toEqual(session.activeMessages())
   expect(restored.entries()).toEqual(session.entries())
 
@@ -606,10 +615,59 @@ test("in-memory compaction encodes its cold prefix without losing full journal a
   })
 
   expect(session.memoryDiagnostics).toMatchObject({ entries: 4, residentEntries: 2, coldEntries: 2 })
-  expect(session.memoryDiagnostics.coldMemoryBytes).toBeGreaterThan(128 * 1024)
+  expect(session.memoryDiagnostics.coldMemoryLogicalBytes).toBeGreaterThan(128 * 1024)
+  expect(session.memoryDiagnostics.coldMemoryBytes).toBeLessThan(session.memoryDiagnostics.coldMemoryLogicalBytes)
   expect(session.entries().map(entry => entry.id)).toEqual([old.id, expect.any(String), kept.id, expect.any(String)])
   expect(session.activeMessages().some(message => message.role === "user" && message.content === oldText)).toBe(false)
   expect(session.olderPromptHistoryEntry(kept.id)).toEqual({ entryId: old.id, text: oldText })
+})
+
+test("in-memory cold history materializes UTF-8 records spanning compression blocks", () => {
+  const session = SessionManager.inMemory("/work")
+  const oldText = `prefix-${"🙂".repeat(300_000)}-suffix`
+  session.appendMessage({ role: "user", content: oldText, timestamp: 1 })
+  session.appendMessage(assistantMessage(2))
+  const kept = session.appendMessage({ role: "user", content: "kept", timestamp: 3 })
+  session.appendCompaction({
+    reason: "manual",
+    summary: "summary",
+    firstKeptEntryId: kept.id,
+    tokensBefore: 100,
+    estimatedTokensAfter: 10,
+    details: emptyCompactionDetails()
+  })
+
+  expect(session.memoryDiagnostics.coldMemoryLogicalBytes).toBeGreaterThan(1024 * 1024)
+  expect(session.messages()[0]).toEqual({ role: "user", content: oldText, timestamp: 1 })
+})
+
+test("in-memory cold history coalesces repeated compactions into bounded blocks", () => {
+  const session = SessionManager.inMemory("/work")
+  session.appendMessage({ role: "user", content: "old", timestamp: 0 })
+  let kept = session.appendMessage({ role: "user", content: "kept-0", timestamp: 1 })
+  session.appendCompaction({
+    reason: "manual",
+    summary: "summary-0",
+    firstKeptEntryId: kept.id,
+    tokensBefore: 100,
+    estimatedTokensAfter: 10,
+    details: emptyCompactionDetails()
+  })
+
+  for (let index = 1; index <= 16; index++) {
+    kept = session.appendMessage({ role: "user", content: `kept-${index}`, timestamp: index + 1 })
+    session.appendCompaction({
+      reason: "threshold",
+      summary: `summary-${index}`,
+      firstKeptEntryId: kept.id,
+      tokensBefore: 100,
+      estimatedTokensAfter: 10,
+      details: emptyCompactionDetails()
+    })
+  }
+
+  expect(session.memoryDiagnostics.coldMemoryBlocks).toBe(1)
+  expect(session.entries()).toHaveLength(35)
 })
 
 test("live session storage admission is transactional at the resumability bound", () => {

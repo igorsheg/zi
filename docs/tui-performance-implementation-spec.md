@@ -316,7 +316,7 @@ The optional overlay may read `renderer.getStats()` and the transcript snapshot 
 
 ## Memory diagnostics
 
-`AgentSession` exposes a readonly memory diagnostic containing committed active-message count and serialized UTF-8 bytes, current streaming bytes, queued input count and bytes, subscriber count, and `SessionManager` journal ownership. Journal diagnostics distinguish total, resident, and cold entry counts; logical journal bytes; resident entry bytes; image blob bytes; and encoded in-memory cold bytes. Committed accounting initializes lazily and advances on the append-only `message_end` path; a replacement or shrink invalidates it for recomputation. Byte values describe encoded payloads, not JavaScript engine heap allocation.
+`AgentSession` exposes a readonly memory diagnostic containing committed active-message count and serialized UTF-8 bytes, current streaming bytes, queued input count and bytes, subscriber count, and `SessionManager` journal ownership. Journal diagnostics distinguish total, resident, and cold entry counts; logical journal bytes; resident entry bytes; image blob bytes; and retained versus logical in-memory cold bytes and block count. Committed accounting initializes lazily and advances on the append-only `message_end` path; a replacement or shrink invalidates it for recomputation. Byte values describe encoded payloads, not JavaScript engine heap allocation.
 
 `InteractiveMode.captureMemoryDiagnostics()` composes that authoritative session snapshot with `process.memoryUsage()`, reachable and process-registered OpenTUI renderable counts, transcript roots, renderer buffer bytes, lifecycle/live request counts, and renderer/key-input listener counts. The result contains plain numbers and retains no owner references.
 
