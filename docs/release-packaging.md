@@ -54,11 +54,11 @@ Before a stable public release:
 - decide whether Windows GitHub artifacts should stay `.tar.gz` or additionally publish `.zip`;
 - configure macOS signing/notarization and Windows signing.
 
-The alpha release path has been exercised end-to-end: native artifacts, GitHub release publication, npm package publication, provenance, install smoke, and trusted publishing are in place.
+The alpha release path covers native artifacts, GitHub release publication, npm package publication, provenance, and install smoke.
 
 ## npm publish workflow
 
-The tag workflow builds npm tarballs and publishes them from the protected `npm` environment through npm trusted publishing. The alpha bootstrap used a short-lived `NPM_TOKEN` only to create the packages; the permanent workflow relies on `id-token: write` and `npm publish --provenance`.
+The tag workflow builds npm tarballs and publishes them from the protected `npm` environment through npm trusted publishing. The alpha bootstrap used a short-lived `NPM_TOKEN` only to create the packages; the permanent workflow relies on `id-token: write` and `npm publish --provenance`. It pins Node 24 and an npm release newer than the npm 11.5.1 minimum so the client can exchange GitHub's OIDC identity instead of falling back to registry credentials.
 
 1. trigger on the same SemVer tag;
 2. download the `npm-packages` artifact from the release run;
