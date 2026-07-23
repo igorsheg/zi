@@ -52,9 +52,7 @@ test("/resume loads a bounded current-project catalog and replaces the whole ses
     prompt.setText("/resume")
     prompt.gotoBufferEnd()
     setup.mockInput.pressEnter()
-    await renderSettled(setup)
-
-    const picker = setup.captureCharFrame()
+    const picker = await waitForFrame(setup, "older task")
     expect(picker).toContain("Resume session")
     expect(picker).toContain("current task")
     expect(picker).toContain("older task")
@@ -106,9 +104,9 @@ test("/resume keeps the active session selected without rebuilding it", async ()
     prompt.setText("/resume")
     prompt.gotoBufferEnd()
     setup.mockInput.pressEnter()
-    await renderSettled(setup)
+    await waitForFrame(setup, "keep current transcript")
     setup.mockInput.pressEnter()
-    await renderSettled(setup)
+    await waitForFrame(setup, "Session already active")
 
     expect(runtime.session).toBe(current)
     expect(setup.mode.store.getSession()).toBe(current)
@@ -155,8 +153,7 @@ test("/resume can browse during a run but refuses replacement until the session 
     prompt.setText("/resume")
     prompt.gotoBufferEnd()
     setup.mockInput.pressEnter()
-    await renderSettled(setup)
-    expect(setup.captureCharFrame()).toContain("older active target")
+    await waitForFrame(setup, "older active target")
 
     setup.mockInput.pressArrow("down")
     setup.mockInput.pressEnter()
@@ -232,4 +229,16 @@ async function waitUntil(predicate: () => boolean): Promise<void> {
     await Bun.sleep(1)
   }
   throw new Error("Condition was not met")
+}
+
+async function waitForFrame(setup: InteractiveTestSetup, expected: string): Promise<string> {
+  for (let attempt = 0; attempt < 100; attempt++) {
+    // oxlint-disable-next-line no-await-in-loop
+    await renderSettled(setup)
+    const frame = setup.captureCharFrame()
+    if (frame.includes(expected)) return frame
+    // oxlint-disable-next-line no-await-in-loop
+    await Bun.sleep(1)
+  }
+  throw new Error(`Frame did not contain ${JSON.stringify(expected)}:\n${setup.captureCharFrame()}`)
 }
