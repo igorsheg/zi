@@ -84,9 +84,7 @@ test("exact /login uses hidden composer input and selects the provider model wit
     input.setText("/logout")
     input.gotoBufferEnd()
     setup.mockInput.pressEnter()
-    await runtime.session.waitForIdle()
-    await renderSettled(setup)
-    expect(setup.captureCharFrame()).toContain("environment")
+    await waitForFrame(setup, "environment")
     expect(await runtime.services.credentialStore.read("secured")).toBeUndefined()
   } finally {
     runtime.session.dispose()
@@ -398,6 +396,21 @@ async function settle(setup: Awaited<ReturnType<typeof createInteractiveTest>>):
   await Promise.resolve()
   await Promise.resolve()
   await renderSettled(setup)
+}
+
+async function waitForFrame(
+  setup: Awaited<ReturnType<typeof createInteractiveTest>>,
+  expected: string
+): Promise<string> {
+  for (let attempt = 0; attempt < 100; attempt++) {
+    // oxlint-disable-next-line no-await-in-loop
+    await settle(setup)
+    const frame = setup.captureCharFrame()
+    if (frame.includes(expected)) return frame
+    // oxlint-disable-next-line no-await-in-loop
+    await Bun.sleep(1)
+  }
+  throw new Error(`Frame did not contain ${JSON.stringify(expected)}:\n${setup.captureCharFrame()}`)
 }
 
 function deferred<T>() {
