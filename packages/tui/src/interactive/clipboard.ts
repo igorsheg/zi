@@ -3,12 +3,14 @@ import { release, tmpdir } from "node:os"
 import { join } from "node:path"
 
 export const maxPastedTextBytes = 1024 * 1024
+export const maxCopiedTextBytes = 4 * 1024 * 1024
 export const maxClipboardImageBytes = Math.floor((4.5 * 1024 * 1024 * 3) / 4)
 
 const maxClipboardImageOutputBytes = Math.ceil((maxClipboardImageBytes * 4) / 3) + 1024
 const maxClipboardTypeBytes = 64 * 1024
 const listTimeoutMs = 1_000
 const readTimeoutMs = 3_000
+const writeTimeoutMs = 3_000
 const powershellTimeoutMs = 5_000
 
 export type ClipboardContent =
@@ -18,6 +20,27 @@ export type ClipboardContent =
 export interface ClipboardReader {
   read(signal: AbortSignal): Promise<ClipboardContent | undefined>
 }
+
+export type ClipboardWriteResult =
+  | { readonly type: "copied"; readonly route: "native" | "osc52" | "native_and_osc52" }
+  | { readonly type: "unavailable" }
+  | { readonly type: "too_large"; readonly maxBytes: number }
+
+export interface ClipboardWriter {
+  write(text: string, signal: AbortSignal): Promise<ClipboardWriteResult>
+}
+
+export interface ClipboardWriteCommandOptions {
+  readonly input: Uint8Array
+  readonly timeoutMs: number
+  readonly signal: AbortSignal
+}
+
+export type ClipboardWriteCommand = (
+  command: string,
+  args: readonly string[],
+  options: ClipboardWriteCommandOptions
+) => Promise<boolean>
 
 export interface ClipboardCommandOptions {
   readonly maxBytes: number
@@ -32,6 +55,89 @@ export type ClipboardCommand = (
 ) => Promise<Uint8Array | undefined>
 
 export class ClipboardContentTooLargeError extends Error {}
+
+export class SystemClipboardWriter implements ClipboardWriter {
+  readonly #osc52: (text: string) => boolean
+  readonly #command: ClipboardWriteCommand
+  readonly #platform: NodeJS.Platform
+  readonly #release: string
+  readonly #env: Readonly<Record<string, string | undefined>>
+
+  constructor(
+    osc52: (text: string) => boolean,
+    command: ClipboardWriteCommand = runClipboardWriteCommand,
+    platform: NodeJS.Platform = process.platform,
+    systemRelease: string = release(),
+    env: Readonly<Record<string, string | undefined>> = process.env
+  ) {
+    this.#osc52 = osc52
+    this.#command = command
+    this.#platform = platform
+    this.#release = systemRelease
+    this.#env = env
+  }
+
+  async write(text: string, signal: AbortSignal): Promise<ClipboardWriteResult> {
+    signal.throwIfAborted()
+    if (Buffer.byteLength(text) > maxCopiedTextBytes) return { type: "too_large", maxBytes: maxCopiedTextBytes }
+    const input = new TextEncoder().encode(text)
+
+    let osc52 = false
+    try {
+      osc52 = this.#osc52(text)
+    } catch {}
+
+    signal.throwIfAborted()
+    const native = isRemoteSession(this.#env) ? false : await this.#writeNative(input, signal)
+    if (native && osc52) return { type: "copied", route: "native_and_osc52" }
+    if (native) return { type: "copied", route: "native" }
+    if (osc52) return { type: "copied", route: "osc52" }
+    return { type: "unavailable" }
+  }
+
+  async #writeNative(input: Uint8Array, signal: AbortSignal): Promise<boolean> {
+    if (this.#platform === "darwin") return this.#run("pbcopy", [], input, writeTimeoutMs, signal)
+    if (this.#platform === "win32") return this.#writeWindows(input, signal)
+    if (this.#platform !== "linux") return false
+
+    if (isWsl(this.#release, this.#env) && (await this.#writeWindows(input, signal))) return true
+    if (this.#env.TERMUX_VERSION && (await this.#run("termux-clipboard-set", [], input, writeTimeoutMs, signal))) {
+      return true
+    }
+    if (
+      isWayland(this.#env) &&
+      (await this.#run("wl-copy", ["--type", "text/plain;charset=utf-8"], input, writeTimeoutMs, signal))
+    ) {
+      return true
+    }
+    if (!this.#env.DISPLAY) return false
+    if (await this.#run("xclip", ["-selection", "clipboard", "-in"], input, writeTimeoutMs, signal)) return true
+    return this.#run("xsel", ["--clipboard", "--input"], input, writeTimeoutMs, signal)
+  }
+
+  #writeWindows(input: Uint8Array, signal: AbortSignal): Promise<boolean> {
+    const script =
+      "[Console]::InputEncoding = [System.Text.Encoding]::UTF8; Set-Clipboard -Value ([Console]::In.ReadToEnd())"
+    return this.#run(
+      "powershell.exe",
+      ["-NonInteractive", "-NoProfile", "-Command", script],
+      input,
+      powershellTimeoutMs,
+      signal
+    )
+  }
+
+  #run(
+    command: string,
+    args: readonly string[],
+    input: Uint8Array,
+    timeoutMs: number,
+    signal: AbortSignal
+  ): Promise<boolean> {
+    signal.throwIfAborted()
+    return this.#command(command, args, { input, timeoutMs, signal })
+  }
+}
 
 export class SystemClipboardReader implements ClipboardReader {
   readonly #command: ClipboardCommand
@@ -269,6 +375,36 @@ export function selectClipboardImageMimeType(bytes: Uint8Array | undefined): str
   return ["image/png", "image/jpeg", "image/webp", "image/gif"].find(candidate => types.has(candidate))
 }
 
+export async function runClipboardWriteCommand(
+  command: string,
+  args: readonly string[],
+  options: ClipboardWriteCommandOptions
+): Promise<boolean> {
+  options.signal.throwIfAborted()
+  let child: ReturnType<typeof spawnClipboardWriteProcess>
+  try {
+    child = spawnClipboardWriteProcess(command, args, options.input)
+  } catch {
+    return false
+  }
+
+  let timedOut = false
+  const stop = () => child.kill(9)
+  const timeout = setTimeout(() => {
+    timedOut = true
+    child.kill(9)
+  }, options.timeoutMs)
+  options.signal.addEventListener("abort", stop, { once: true })
+  try {
+    const exitCode = await child.exited
+    if (options.signal.aborted) throw options.signal.reason
+    return !timedOut && exitCode === 0
+  } finally {
+    clearTimeout(timeout)
+    options.signal.removeEventListener("abort", stop)
+  }
+}
+
 export async function runClipboardCommand(
   command: string,
   args: readonly string[],
@@ -320,6 +456,10 @@ export async function runClipboardCommand(
   }
 }
 
+function spawnClipboardWriteProcess(command: string, args: readonly string[], input: Uint8Array) {
+  return Bun.spawn([command, ...args], { stdin: input, stdout: "ignore", stderr: "ignore" })
+}
+
 function spawnClipboardProcess(command: string, args: readonly string[]) {
   return Bun.spawn([command, ...args], { stdin: "ignore", stdout: "pipe", stderr: "ignore" })
 }
@@ -338,6 +478,10 @@ function textContent(bytes: Uint8Array | undefined): ClipboardContent | undefine
 
 function isWayland(env: Readonly<Record<string, string | undefined>>): boolean {
   return Boolean(env.WAYLAND_DISPLAY) || env.XDG_SESSION_TYPE === "wayland"
+}
+
+function isRemoteSession(env: Readonly<Record<string, string | undefined>>): boolean {
+  return Boolean(env.SSH_CLIENT || env.SSH_CONNECTION || env.SSH_TTY)
 }
 
 function isWsl(systemRelease: string, env: Readonly<Record<string, string | undefined>>): boolean {

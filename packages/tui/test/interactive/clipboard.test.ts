@@ -2,9 +2,12 @@ import { expect, test } from "bun:test"
 
 import {
   detectClipboardImageMimeType,
+  maxCopiedTextBytes,
   selectClipboardImageMimeType,
   SystemClipboardReader,
-  type ClipboardCommand
+  SystemClipboardWriter,
+  type ClipboardCommand,
+  type ClipboardWriteCommand
 } from "../../src/interactive/clipboard.js"
 
 const encoder = new TextEncoder()
@@ -54,4 +57,81 @@ test("system clipboard falls back from unavailable image targets to Wayland text
 
   const content = await reader.read(new AbortController().signal)
   expect(content).toEqual({ type: "text", text: "first\r\nsecond" })
+})
+
+test("system clipboard writes through native Wayland and OSC 52 routes", async () => {
+  const calls: Array<{ command: string; args: readonly string[]; text: string; timeoutMs: number }> = []
+  const command: ClipboardWriteCommand = async (name, args, options) => {
+    calls.push({ command: name, args, text: new TextDecoder().decode(options.input), timeoutMs: options.timeoutMs })
+    return name === "wl-copy"
+  }
+  const osc52: string[] = []
+  const writer = new SystemClipboardWriter(
+    text => {
+      osc52.push(text)
+      return true
+    },
+    command,
+    "linux",
+    "6.8.0",
+    { WAYLAND_DISPLAY: "wayland-0" }
+  )
+
+  expect(await writer.write("copy 世界", new AbortController().signal)).toEqual({
+    type: "copied",
+    route: "native_and_osc52"
+  })
+  expect(osc52).toEqual(["copy 世界"])
+  expect(calls).toEqual([
+    { command: "wl-copy", args: ["--type", "text/plain;charset=utf-8"], text: "copy 世界", timeoutMs: 3_000 }
+  ])
+})
+
+test("system clipboard falls back across local native writers when OSC 52 is unavailable", async () => {
+  const calls: string[] = []
+  const command: ClipboardWriteCommand = async name => {
+    calls.push(name)
+    return name === "xsel"
+  }
+  const writer = new SystemClipboardWriter(() => false, command, "linux", "6.8.0", { DISPLAY: ":0" })
+
+  expect(await writer.write("local", new AbortController().signal)).toEqual({ type: "copied", route: "native" })
+  expect(calls).toEqual(["xclip", "xsel"])
+})
+
+test("remote clipboard writes avoid the remote host clipboard and use OSC 52 only", async () => {
+  const calls: string[] = []
+  const command: ClipboardWriteCommand = async name => {
+    calls.push(name)
+    return true
+  }
+  const writer = new SystemClipboardWriter(() => true, command, "linux", "6.8.0", { SSH_CONNECTION: "client server" })
+
+  expect(await writer.write("remote", new AbortController().signal)).toEqual({ type: "copied", route: "osc52" })
+  expect(calls).toEqual([])
+})
+
+test("clipboard writes reject oversized text before attempting a delivery route", async () => {
+  let osc52Calls = 0
+  let nativeCalls = 0
+  const writer = new SystemClipboardWriter(
+    () => {
+      osc52Calls++
+      return true
+    },
+    async () => {
+      nativeCalls++
+      return true
+    },
+    "darwin",
+    "23.0.0",
+    {}
+  )
+
+  expect(await writer.write("x".repeat(maxCopiedTextBytes + 1), new AbortController().signal)).toEqual({
+    type: "too_large",
+    maxBytes: maxCopiedTextBytes
+  })
+  expect(osc52Calls).toBe(0)
+  expect(nativeCalls).toBe(0)
 })

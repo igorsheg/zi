@@ -88,6 +88,18 @@ _Avoid_: Draft clearing, revision-scoped cancellation
 A revisioned one-shot request to replace one display-offset range in the native Composer with an explicit cursor target. It is not a copied draft; OpenTUI remains authoritative for text, markers, selection, and undo.
 _Avoid_: Prompt model, frontend draft state, delete-then-insert
 
+**Native text selection**:
+The current terminal-highlighted text range across the composer or transcript. It is an ephemeral interaction surface, not conversation state or a selected transcript item.
+_Avoid_: Copy buffer, transcript cursor, selected message
+
+**Selection copy**:
+The explicit terminal interaction that delivers the current non-empty native text selection to a clipboard. Selecting text alone never performs this operation, and failure preserves the selection for retry.
+_Avoid_: Copy-on-select, message export, clipboard paste
+
+**Clipboard delivery**:
+The bounded attempt to make copied text available through one or more terminal or local-system routes. Delivery outcome is distinct from the selected text and from clipboard input.
+_Avoid_: Selection state, paste handling, guaranteed remote clipboard
+
 **Coding-agent parity**:
 Behavioral and architectural compatibility with `pi-coding-agent`, verified capability by capability while keeping the recreated layer owned by Zi.
 _Avoid_: Source identity, dependency parity

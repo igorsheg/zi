@@ -9,6 +9,7 @@ import {
   fauxThinking
 } from "@with-zi/coding-agent/testing"
 
+import type { ClipboardWriter, ClipboardWriteResult } from "../../src/interactive/clipboard.js"
 import { createInteractiveTest } from "./harness.js"
 
 test("real prompt keys admit, present, and restore steering and follow-up queues", async () => {
@@ -242,15 +243,31 @@ test("restored queued images remain attached when the draft is resubmitted", asy
   }
 })
 
-test("Ctrl+C copies native transcript selection before preserving the exact prompt draft", async () => {
+test("explicit selection copy precedes prompt clearing and supports a delivered Cmd+C", async () => {
   const models = createModels()
   const faux = fauxProvider()
   models.setProvider(faux.provider)
   faux.setResponses([fauxAssistantMessage(fauxThinking("assistant response"))])
   const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
   await session.prompt("copy target")
-  const setup = await createInteractiveTest(session, { width: 48, height: 16, kittyKeyboard: true })
-  const originalCopy = setup.renderer.copyToClipboardOSC52.bind(setup.renderer)
+  let delivery: ClipboardWriteResult = { type: "unavailable" }
+  const writes: string[] = []
+  const writer: ClipboardWriter = {
+    write: async text => {
+      writes.push(text)
+      return delivery
+    }
+  }
+  const setup = await createInteractiveTest(
+    session,
+    { width: 48, height: 16, kittyKeyboard: true },
+    () => {},
+    { "app.selection.copy": ["super+c", "ctrl+c"] },
+    undefined,
+    undefined,
+    undefined,
+    writer
+  )
 
   try {
     await setup.renderOnce()
@@ -264,34 +281,32 @@ test("Ctrl+C copies native transcript selection before preserving the exact prom
 
     await setup.mockMouse.drag(1, row, 12, row)
     const selected = setup.renderer.getSelection()?.getSelectedText()
+    if (!selected) throw new Error("Transcript selection not found")
     expect(selected).toBe("copy target")
+    expect(writes).toEqual([])
 
     const failedSelection = setup.renderer.getSelection()
-    let rejectedCopy: string | undefined
-    setup.renderer.copyToClipboardOSC52 = text => {
-      rejectedCopy = text
-      return false
-    }
     input.setText("preserve on unsupported copy")
     setup.mockInput.pressCtrlC()
+    await Promise.resolve()
 
-    expect(rejectedCopy).toBe(selected)
+    expect(writes).toEqual([selected])
     expect(input.plainText).toBe("preserve on unsupported copy")
     expect(setup.renderer.getSelection()).toBe(failedSelection)
+    await setup.renderOnce()
+    expect(setup.captureCharFrame()).toContain("Copy failed; the selection was preserved")
 
-    let copied: string | undefined
-    setup.renderer.copyToClipboardOSC52 = text => {
-      copied = text
-      return true
-    }
+    delivery = { type: "copied", route: "native" }
     input.setText("keep this exact draft")
-    setup.mockInput.pressCtrlC()
+    setup.mockInput.pressKey("c", { super: true })
+    await Promise.resolve()
 
-    expect(copied).toBe(selected)
+    expect(writes).toEqual([selected, selected])
     expect(input.plainText).toBe("keep this exact draft")
     expect(setup.renderer.getSelection()).toBeNull()
+    await setup.renderOnce()
+    expect(setup.captureCharFrame()).not.toContain("Copy failed")
   } finally {
-    setup.renderer.copyToClipboardOSC52 = originalCopy
     session.dispose()
     setup.destroy()
   }

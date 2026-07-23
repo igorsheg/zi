@@ -14,6 +14,7 @@ export type PromptFeedback =
   | { readonly type: "none" }
   | { readonly type: "status"; readonly message: string }
   | { readonly type: "warning"; readonly message: string }
+  | { readonly type: "copy_warning"; readonly message: string }
   | { readonly type: "error"; readonly message: string }
   | { readonly type: "auth_link"; readonly requestId: number; readonly message: string; readonly url: string }
 

@@ -42,7 +42,7 @@ export class PromptFeedbackView {
     this.#text.fg =
       feedback.type === "error"
         ? this.#theme.text.error
-        : feedback.type === "warning"
+        : feedback.type === "warning" || feedback.type === "copy_warning"
           ? this.#theme.text.warning
           : this.#theme.text.muted
     return true

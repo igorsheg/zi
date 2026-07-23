@@ -3,7 +3,7 @@ import { createTestRenderer, type TestRendererOptions, type TestRendererSetup } 
 import type { AgentSession, AgentSessionRuntime } from "@with-zi/coding-agent"
 
 import type { BrowserOpener } from "../../src/interactive/browser-opener.js"
-import type { ClipboardReader } from "../../src/interactive/clipboard.js"
+import type { ClipboardReader, ClipboardWriter } from "../../src/interactive/clipboard.js"
 import type { InteractiveKeybindingOverrides } from "../../src/interactive/interactive-keybindings.js"
 import { InteractiveMode } from "../../src/interactive/interactive-mode.js"
 
@@ -19,7 +19,8 @@ export async function createInteractiveTest(
   keybindingOverrides?: InteractiveKeybindingOverrides,
   browserOpener: BrowserOpener = { open: async () => {}, dispose() {} },
   sessionRuntime?: AgentSessionRuntime,
-  clipboard?: ClipboardReader
+  clipboardReader?: ClipboardReader,
+  clipboardWriter?: ClipboardWriter
 ): Promise<InteractiveTestSetup> {
   const setup = await createTestRenderer({ ...options, useThread: false })
   const mode = new InteractiveMode({
@@ -28,7 +29,8 @@ export async function createInteractiveTest(
     ...(sessionRuntime ? { sessionRuntime } : {}),
     onExit,
     browserOpener,
-    ...(clipboard ? { clipboard } : {}),
+    ...(clipboardReader ? { clipboardReader } : {}),
+    ...(clipboardWriter ? { clipboardWriter } : {}),
     ...(keybindingOverrides ? { keybindingOverrides } : {})
   })
   return {

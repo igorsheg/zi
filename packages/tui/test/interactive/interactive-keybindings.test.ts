@@ -27,6 +27,8 @@ test("interactive keybindings resolve semantic prompt and transcript actions", (
   expect(keybindings.promptAction(key("up"), context())).toBe("history_previous")
   expect(keybindings.promptAction(key("down"), context())).toBe("history_next")
   expect(keybindings.promptAction(key("up"), { ...context(), historyEnabled: false })).toBeUndefined()
+  expect(keybindings.matches(key("c", { ctrl: true }), "app.selection.copy")).toBe(true)
+  expect(keybindings.matches(key("c", { super: true }), "app.selection.copy")).toBe(process.platform === "darwin")
 
   expect(keybindings.promptAction(key("return"), context(true))).toBe("picker_confirm")
   expect(keybindings.promptAction(key("tab"), context(true))).toBe("picker_complete")
@@ -75,6 +77,10 @@ test("interactive keybindings expose resolved metadata for help and future short
   })
   expect(keybindings.list().map(binding => binding.id)).toContain("app.transcript.tail")
   expect(keybindings.getHint("app.clipboard.paste")).toBe(process.platform === "win32" ? "Alt+V" : "Ctrl+V")
+  expect(keybindings.getKeys("app.selection.copy")).toEqual(
+    process.platform === "darwin" ? ["super+c", "ctrl+c"] : ["ctrl+c"]
+  )
+  expect(keybindings.getHint("app.selection.copy")).toBe(process.platform === "darwin" ? "Cmd+C" : "Ctrl+C")
   expect(keybindings.getHint("app.tools.expand")).toBe("Ctrl+O")
   expect(keybindings.getHint("app.transcript.tail")).toBe("Ctrl+End")
   expect(keybindings.getHint("tui.select.confirm")).toBe("Enter")

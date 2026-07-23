@@ -142,8 +142,8 @@ Pi's optional `grep`, `find`, and `ls` implementations are deliberately deferred
 
 - `packages/tui/test/interactive/transcript-store.test.ts` fixes the Nano Store-owned follow/detached/unseen transition policy, including forbidden resize and output effects.
 - `packages/tui/test/interactive/transcript.test.ts` drives native line, page, wheel, resize, selection, streamed tool output, tail jumps, and stale session callbacks through a real OpenTUI renderer and `AgentSession`.
-- `packages/tui/test/interactive/prompt-queue.test.ts` proves native selected text takes precedence over draft clearing and is cleared only after successful OSC 52 copy.
-- Native mechanics are characterized from OpenTUI `5d57e27e`; direct scrollbox, sticky-tail, focus-aware key, and selection patterns are characterized from OpenCode `cb8be9ba1`, as pinned in `docs/reference-pins.md`.
+- `packages/tui/test/interactive/prompt-queue.test.ts` proves explicit native-selection copy takes precedence over draft clearing, supports a delivered Cmd+C, never copies on selection alone, and clears only after confirmed clipboard delivery. `selection-copy.test.ts` fixes semantic-key admission, supersession, stale completion, and exact-selection clearing. `clipboard.test.ts` fixes bounded native plus OSC 52 delivery, platform fallback, remote routing, and copy-size refusal.
+- Native selection mechanics and terminal-aware OSC 52 are characterized from OpenTUI `0c8c4f7c`; app-level precedence and native fallback are characterized from OpenCode v2 `4678bd104`; explicit outcomes and remote routing are characterized from Grok Build `98c3b243`, as pinned in `docs/reference-pins.md`. Zi deliberately rejects copy-on-selection and custom scrollback range state; see ADR 0019.
 
 ## P2 — resource and provider parity
 

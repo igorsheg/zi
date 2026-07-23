@@ -113,6 +113,19 @@ export class PromptView {
     this.#store.reportFeedback({ type: "warning", message })
   }
 
+  showCopyWarning(message: string): void {
+    const state = this.#store.$state.get()
+    if (state.workflow.type === "idle" && (state.feedback.type === "none" || state.feedback.type === "copy_warning")) {
+      this.#store.reportFeedback({ type: "copy_warning", message })
+    }
+  }
+
+  clearCopyWarning(): void {
+    if (this.#store.$state.get().feedback.type === "copy_warning") {
+      this.#store.reportFeedback({ type: "none" })
+    }
+  }
+
   destroy(): void {
     for (const release of this.#release.splice(0)) release()
     this.root.onLifecyclePass = null
@@ -237,22 +250,6 @@ export class PromptView {
   }
 
   #onKeyPress = (key: KeyEvent): void => {
-    if (this.#keybindings.matches(key, "tui.input.copy")) {
-      const selectedText = this.#renderer.getSelection()?.getSelectedText()
-      if (selectedText) {
-        consume(key)
-        this.#exitGestures.consume()
-        let copied = false
-        try {
-          copied = this.#renderer.copyToClipboardOSC52(selectedText)
-        } catch {
-          return
-        }
-        if (copied) this.#renderer.clearSelection()
-        return
-      }
-    }
-
     const session = this.#interactive.getSession()
     const prompt = this.#store.$state.get()
     const pickerOpen = Boolean(this.#store.picker.presentation(this.#input.plainText))

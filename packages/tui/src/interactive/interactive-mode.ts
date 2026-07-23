@@ -3,7 +3,12 @@ import type { AgentSession, AgentSessionRuntime, SessionBootstrapDiagnostic } fr
 
 import { createSyntaxStyle, defaultTheme, type Theme } from "../theme.js"
 import { type BrowserOpener, SystemBrowserOpener } from "./browser-opener.js"
-import { type ClipboardReader, SystemClipboardReader } from "./clipboard.js"
+import {
+  type ClipboardReader,
+  type ClipboardWriter,
+  SystemClipboardReader,
+  SystemClipboardWriter
+} from "./clipboard.js"
 import {
   captureTuiMemorySnapshot,
   TuiDiagnosticsOverlay,
@@ -15,6 +20,7 @@ import { InteractiveKeybindings, type InteractiveKeybindingOverrides } from "./i
 import { createInteractiveStore, type InteractiveStore } from "./interactive-store.js"
 import type { PromptSessionActions } from "./prompt/store.js"
 import { SessionScreen } from "./screen.js"
+import { SelectionCopyController } from "./selection-copy.js"
 import { SlashController } from "./slash-controller.js"
 import type { TranscriptDiagnostics } from "./transcript/view.js"
 
@@ -26,7 +32,8 @@ export interface InteractiveModeOptions {
   readonly keybindingOverrides?: InteractiveKeybindingOverrides
   readonly theme?: Theme
   readonly browserOpener?: BrowserOpener
-  readonly clipboard?: ClipboardReader
+  readonly clipboardReader?: ClipboardReader
+  readonly clipboardWriter?: ClipboardWriter
   readonly diagnostics?: TuiDiagnosticFlags
   readonly bootstrapDiagnostic?: SessionBootstrapDiagnostic
 }
@@ -39,12 +46,14 @@ export class InteractiveMode {
   readonly #sessionRuntime: AgentSessionRuntime | undefined
   readonly #sessionActions: PromptSessionActions | undefined
   readonly #browserOpener: BrowserOpener
-  readonly #clipboard: ClipboardReader
+  readonly #clipboardReader: ClipboardReader
+  readonly #clipboardWriter: ClipboardWriter
   readonly #exitGestures: ExitGestureController
   readonly #theme: Theme
   readonly #syntaxStyle: SyntaxStyle
   readonly #slash: SlashController
   readonly #keybindings: InteractiveKeybindings
+  readonly #selectionCopy: SelectionCopyController
   readonly #diagnosticFlags: TuiDiagnosticFlags
   readonly #diagnostics: TuiDiagnosticsOverlay | undefined
   #screen: SessionScreen
@@ -59,7 +68,8 @@ export class InteractiveMode {
     keybindingOverrides,
     theme = defaultTheme,
     browserOpener = new SystemBrowserOpener(),
-    clipboard = new SystemClipboardReader(),
+    clipboardReader = new SystemClipboardReader(),
+    clipboardWriter,
     diagnostics = { showTimeToFirstDraw: false, showStats: false, showMemory: false },
     bootstrapDiagnostic
   }: InteractiveModeOptions) {
@@ -83,7 +93,8 @@ export class InteractiveMode {
         }
       : undefined
     this.#browserOpener = browserOpener
-    this.#clipboard = clipboard
+    this.#clipboardReader = clipboardReader
+    this.#clipboardWriter = clipboardWriter ?? new SystemClipboardWriter(text => renderer.copyToClipboardOSC52(text))
     this.#exitGestures = new ExitGestureController(onExit)
     this.store = createInteractiveStore(session)
     this.#theme = theme
@@ -93,6 +104,14 @@ export class InteractiveMode {
       () => this.store.$generation.get()
     )
     this.#keybindings = new InteractiveKeybindings(keybindingOverrides)
+    this.#selectionCopy = new SelectionCopyController(
+      renderer,
+      this.#keybindings,
+      this.#clipboardWriter,
+      () => this.#exitGestures.consume(),
+      () => this.#clearCopyWarning(),
+      message => this.#showCopyWarning(message)
+    )
     this.#diagnosticFlags = diagnostics
     this.root = new BoxRenderable(renderer, {
       id: "interactive-mode",
@@ -142,6 +161,7 @@ export class InteractiveMode {
     if (this.#disposed) return
     this.#disposed = true
     this.#releaseGeneration()
+    this.#selectionCopy.dispose()
     this.#renderer.off(CliRenderEvents.SELECTION, this.#preservePromptFocus)
     this.#diagnostics?.destroy()
     this.#screen.destroy()
@@ -159,6 +179,14 @@ export class InteractiveMode {
     if (diagnostic) this.#screen.prompt.showWarning(diagnostic.message)
   }
 
+  #showCopyWarning(message: string): void {
+    if (!this.#disposed) this.#screen.prompt.showCopyWarning(message)
+  }
+
+  #clearCopyWarning(): void {
+    if (!this.#disposed) this.#screen.prompt.clearCopyWarning()
+  }
+
   #replaceScreen(): void {
     this.#screen.destroy()
     this.#screen = this.#createScreen()
@@ -174,7 +202,7 @@ export class InteractiveMode {
       this.#keybindings,
       this.#exitGestures,
       this.#browserOpener,
-      this.#clipboard,
+      this.#clipboardReader,
       this.#theme,
       this.#syntaxStyle,
       this.#diagnosticFlags.showTimeToFirstDraw || this.#diagnosticFlags.showStats || this.#diagnosticFlags.showMemory,

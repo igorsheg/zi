@@ -62,7 +62,12 @@ const defaultBindingEntries = [
   ["tui.input.historyPrevious", ["up"], "Previous session prompt", "overridable"],
   ["tui.input.historyNext", ["down"], "Next session prompt", "overridable"],
   ["tui.input.tab", ["tab"], "Complete the active input", "overridable"],
-  ["tui.input.copy", ["ctrl+c"], "Copy native selection", "reserved"],
+  [
+    "app.selection.copy",
+    process.platform === "darwin" ? ["super+c", "ctrl+c"] : ["ctrl+c"],
+    "Copy native selection",
+    "reserved"
+  ],
   ["tui.select.up", ["up"], "Move selection up", "overridable"],
   ["tui.select.down", ["down"], "Move selection down", "overridable"],
   ["tui.select.confirm", ["return"], "Confirm selection", "reserved"],
@@ -265,7 +270,7 @@ function formatKeyHint(key: string): string {
         case "alt":
           return "Alt"
         case "super":
-          return "Super"
+          return process.platform === "darwin" ? "Cmd" : "Super"
         case "hyper":
           return "Hyper"
         case "return":
