@@ -1,0 +1,871 @@
+# Extension system infrastructure implementation spec
+
+- Status: proposed
+- Pi behavior reference: `badlogic/pi-mono` at Zi's pinned `0e6909f0` (`v0.80.6`)
+- Current Pi comparison: `fc85bdd88be93b1e9a6b6bcfa41c684282ec79cc`
+- Product owner: `AgentSession`
+- Infrastructure owner: coding-agent `ExtensionHost`
+
+## 1. Purpose
+
+Zi will eventually support the full behavioral capability of Pi's extension system: trusted TypeScript extensions, lifecycle and agent events, tools, commands, durable messages and entries, providers, model operations, session operations, terminal contributions, and package distribution.
+
+This specification establishes the extension substrate before any product capability is added. The first accepted implementation can discover, trust-gate, load, identify, reload, and shut down otherwise empty TypeScript extensions through a supervised extension generation.
+
+The first public extension contract contains lifecycle registration only. It does not smuggle tools, commands, providers, UI, or a generic event framework into the infrastructure patch.
+
+The target is capability parity, not source identity with Pi. In particular, Zi will not expose Pi TUI components or copy Pi's broad in-process object graph.
+
+## 2. Outcomes
+
+The infrastructure must provide:
+
+1. deterministic discovery of global, project, and explicit extension sources;
+2. project-trust admission before any project-owned code or configuration is applied;
+3. an immutable, cwd-bound extension load plan derived from `ZiPaths`;
+4. lazy startup with no subprocess when the plan is empty;
+5. TypeScript module loading with Node built-ins and extension-local npm dependencies;
+6. a supervised extension worker isolated from the Zi process and TUI owner loop;
+7. versioned, framed, bounded, bidirectional IPC;
+8. one current extension generation and at most one candidate generation;
+9. whole-generation reload with stale-generation rejection;
+10. source-attributed, bounded diagnostics without aborting ordinary Zi startup;
+11. bounded lifecycle settlement and final process teardown;
+12. an initial public contract containing only `session_start` and `session_shutdown` registration;
+13. structural and compiled acceptance tests covering races, bounds, crashes, hangs, replacement, and cleanup.
+
+## 3. Non-goals
+
+This slice does not implement:
+
+- custom tools;
+- commands, shortcuts, or CLI extension flags;
+- agent, provider, tool, input, compaction, or session-tree interception;
+- custom messages, durable entries, names, or labels;
+- model or provider registration;
+- resource contribution from extensions;
+- direct OpenTUI renderables or terminal widgets;
+- an inter-extension event bus;
+- package install, update, or removal;
+- Pi extension source compatibility;
+- automatic worker restart;
+- one process per extension;
+- a generic internal command bus or event envelope inside Zi;
+- a frontend store for extension state.
+
+Later capabilities extend the closed process protocol and bind through their authoritative coding-agent or TUI owners. They do not expand this infrastructure into a manager-of-managers.
+
+## 4. Pi provenance
+
+The useful Pi infrastructure is spread across these sources:
+
+- [`core/extensions/loader.ts`](https://github.com/badlogic/pi-mono/blob/0e6909f050eeb15e8f6c05185511f3788357ddb3/packages/coding-agent/src/core/extensions/loader.ts): async factories, module loading, source records, TypeScript loading, aliases, and compiled-binary virtual modules;
+- [`core/resource-loader.ts`](https://github.com/badlogic/pi-mono/blob/0e6909f050eeb15e8f6c05185511f3788357ddb3/packages/coding-agent/src/core/resource-loader.ts): pre-trust and final extension passes, deterministic source ordering, diagnostics, and reload;
+- [`core/extensions/runner.ts`](https://github.com/badlogic/pi-mono/blob/0e6909f050eeb15e8f6c05185511f3788357ddb3/packages/coding-agent/src/core/extensions/runner.ts): source-attributed errors, ordered handlers, late-bound contexts, and stale-runtime rejection;
+- [`core/agent-session.ts`](https://github.com/badlogic/pi-mono/blob/0e6909f050eeb15e8f6c05185511f3788357ddb3/packages/coding-agent/src/core/agent-session.ts): session binding, shutdown-before-reload, generation reconstruction, and lifecycle ordering;
+- [`docs/extensions.md`](https://github.com/badlogic/pi-mono/blob/0e6909f050eeb15e8f6c05185511f3788357ddb3/packages/coding-agent/docs/extensions.md): extension locations, trust, async factory semantics, dependency resolution, and the rule that long-lived resources start at `session_start` and stop at `session_shutdown`.
+
+The complete public Pi surface is inventoried in [`docs/pi-mono-extension-api-reference.md`](pi-mono-extension-api-reference.md).
+
+### 4.1 Pi behavior to preserve
+
+Zi takes these ideas from Pi:
+
+- an extension exports one synchronous or asynchronous default factory;
+- factory settlement forms the initial registration barrier;
+- each extension has stable source identity and provenance;
+- global, project, package, and temporary sources remain distinguishable;
+- project code does not load before project trust;
+- load order is deterministic and later capability owners receive that order;
+- one extension's import or factory failure is attributed to that extension;
+- a reload creates a fresh module generation;
+- old contexts become invalid after reload or session replacement;
+- lifecycle handlers are asynchronous and ordered;
+- TypeScript works without a separate extension build step;
+- official extension imports remain available from the standalone executable;
+- npm dependencies resolve from the extension's package hierarchy;
+- module caches do not leak across generations;
+- long-lived resources belong between `session_start` and `session_shutdown`.
+
+### 4.2 Pi implementation not to copy
+
+Zi does not copy:
+
+- Pi's in-process execution, which allows an extension to block the agent and TUI;
+- the module-global cwd/generation extension cache;
+- `ExtensionRuntime` objects populated with throwing stubs and mutated later by `bindCore()`;
+- one `ExtensionRunner` that owns tools, commands, flags, shortcuts, providers, models, messages, rendering, UI, and events;
+- generic no-op UI implementations for unsupported modes;
+- direct mutable access to `SessionManager`, `ModelRegistry`, or `AgentSession`;
+- direct Pi TUI `Component` values;
+- an untyped event bus as internal application architecture;
+- unbounded import, handler, output, queue, or shutdown waits.
+
+Pi's event-specific combination rules remain behavioral references for later slices. Zi will implement each event explicitly rather than inventing one generic reducer now.
+
+## 5. Terminology
+
+**Extension source**  
+One canonical extension entry point plus its declared path, scope, origin, and stable identity.
+
+**Extension load plan**  
+The immutable ordered set of extension sources admitted for one exact `ZiPaths.cwd` after trust resolution.
+
+**Extension worker**  
+The child-process program that loads TypeScript modules, owns extension JavaScript state, runs factories and handlers, and communicates only through the extension protocol.
+
+**Extension generation**  
+One worker process, one load plan, one protocol generation ID, and all resources tied to that process. A generation is never mutated into another generation.
+
+**Extension host**  
+The coding-agent owner of the current and candidate generations, protocol resources, diagnostics, reload, bounded settlement, and disposal.
+
+**Extension lifecycle**  
+The interval beginning when a committed generation receives `session_start` and ending when it receives `session_shutdown` or is forcibly terminated.
+
+## 6. Ownership and package placement
+
+### 6.1 `ZiPaths`
+
+`ZiPaths` remains the only path-policy owner. Extension discovery consumes:
+
+```text
+$HOME/.zi/agent/extensions/
+<effective-cwd>/.zi/extensions/
+```
+
+Explicit CLI paths are resolved once at argument admission and are never reinterpreted after session cwd replacement.
+
+No extension owner joins `.zi`, reads `process.cwd()`, or derives the global agent directory independently.
+
+### 6.2 Project trust
+
+A coding-agent project-trust owner decides whether project configuration is admitted for one canonical cwd. Trust gates project settings, system prompts, skills, prompts, and extensions together, as required by ADR 0011.
+
+Extension-only trust is forbidden. Zi must not execute project extensions while applying or rejecting other project configuration through a separate decision.
+
+### 6.3 `ExtensionHost`
+
+`ExtensionHost` is one instance-scoped coding-agent owner. It owns:
+
+- current and candidate generation identity;
+- child processes and every pipe;
+- protocol decoder and serialized writer queues;
+- request correlation and pending-request bounds;
+- startup, lifecycle, and shutdown deadlines;
+- stderr retention;
+- diagnostics;
+- reload admission;
+- stale-generation rejection;
+- final disposal.
+
+The loader, transport, request map, and generation transition rules do not become independently mutable managers.
+
+### 6.4 `AgentSession`
+
+Runtime bootstrap may create a candidate `ExtensionHost` before `AgentSession`, because future extension registrations can affect model and tool construction. Ownership transfers only after session construction succeeds:
+
+1. runtime bootstrap creates the host;
+2. bootstrap starts and validates its initial generation;
+3. successful `createAgentSession()` takes ownership;
+4. failed session construction disposes the candidate host;
+5. `AgentSession.dispose()` initiates final host shutdown;
+6. `AgentSessionRuntime` replacement naturally replaces the entire host with the old session.
+
+The TUI never owns or disposes the host.
+
+### 6.5 Source layout
+
+The initial implementation should remain under coding-agent until the runtime probe proves a separately built worker package is required:
+
+```text
+packages/coding-agent/src/extensions/
+  discovery.ts
+  host.ts
+  protocol.ts
+  worker.ts
+```
+
+These are deep modules with distinct responsibilities:
+
+- `discovery.ts` is bounded filesystem admission and returns immutable data;
+- `host.ts` owns all mutable process and generation state;
+- `protocol.ts` defines and validates the closed process boundary;
+- `worker.ts` is the separately invoked worker entry point and TypeScript loader.
+
+A public `@with-zi/extension-api` package is justified when the lifecycle contract is shipped because extension authors need a stable import independent of Zi internals. It initially exports lifecycle types only.
+
+Do not create a separate package solely to hold the private protocol.
+
+## 7. Project trust and source admission
+
+### 7.1 Trust states
+
+The project-trust owner uses an explicit state:
+
+```ts
+type ProjectTrustState =
+  | { type: "unresolved"; cwd: string }
+  | { type: "resolving"; cwd: string; operationId: number }
+  | { type: "trusted"; cwd: string; source: "stored" | "interactive" | "runtime" }
+  | { type: "untrusted"; cwd: string; source: "stored" | "interactive" | "runtime" }
+```
+
+Trust is keyed by canonical cwd. Persisted trust input is bounded and validated before admission.
+
+Global and explicit CLI extensions are already user-admitted. Project extensions require `trusted`. In noninteractive modes, unresolved project trust excludes project configuration unless a stored or runtime decision exists and emits a diagnostic.
+
+Global extensions may participate in trust decisions in a later event slice. The initial infrastructure uses Zi's built-in trust resolver only.
+
+### 7.2 Two-pass admission
+
+```text
+construct ZiPaths
+  -> load global settings needed for trust policy
+  -> discover global and explicit extension sources
+  -> resolve project trust
+  -> if trusted, admit project settings/resources/extensions
+  -> construct final ExtensionLoadPlan
+```
+
+No project extension module, project extension package manifest, or project settings file is evaluated before trust.
+
+### 7.3 Source value
+
+```ts
+interface ExtensionSource {
+  readonly id: string
+  readonly declaredPath: string
+  readonly entryPath: string
+  readonly scope: "global" | "project" | "temporary"
+  readonly origin: "directory" | "package" | "cli"
+}
+
+interface ExtensionLoadPlan {
+  readonly cwd: string
+  readonly sources: readonly ExtensionSource[]
+}
+```
+
+`entryPath` is canonical and absolute. `id` is derived from canonical source identity and does not depend on load success or filesystem enumeration order.
+
+### 7.4 Initial discovery rules
+
+The first implementation recognizes:
+
+```text
+extensions/*.ts
+extensions/*.js
+extensions/*/index.ts
+extensions/*/index.js
+```
+
+Discovery is one level deep. Package manifests and npm/git package installation arrive in the package slice. Explicit paths may point to a file or a directory following the same entry rules.
+
+Discovery:
+
+- sorts directory entries before admission;
+- canonicalizes and deduplicates paths;
+- does not traverse directory symlinks recursively;
+- preserves the first admitted source for a canonical duplicate;
+- reports missing, unreadable, unsupported, duplicate, and omitted sources;
+- returns no executable code or mutable registry.
+
+Capability owners, not discovery, later decide conflicts between declarations such as duplicate tool or command names.
+
+## 8. Host state and transitions
+
+```ts
+type ExtensionHostState =
+  | { type: "disabled" }
+  | { type: "starting"; candidate: ExtensionGeneration }
+  | { type: "ready"; current: ExtensionGeneration }
+  | { type: "replacing"; current: ExtensionGeneration; candidate: ExtensionGeneration }
+  | { type: "stopping"; current: ExtensionGeneration }
+  | { type: "failed"; diagnostic: ExtensionDiagnostic }
+  | { type: "disposed" }
+```
+
+A generation contains its immutable ID and plan plus the process resources tied to that ID. It is private to `ExtensionHost`.
+
+### 8.1 Allowed transitions
+
+```text
+disabled -> starting             non-empty plan admitted
+starting -> ready                worker handshake and factory barrier settle
+starting -> failed               fatal spawn/handshake/protocol/startup failure
+starting -> stopping             shutdown admitted during startup
+ready -> replacing              reload admitted
+ready -> stopping               final shutdown admitted
+replacing -> ready(current)      candidate fails before commit
+replacing -> ready(candidate)    candidate commits and old generation settles
+replacing -> stopping            final shutdown supersedes reload
+failed -> starting               explicit reload/retry
+failed -> disposed               final disposal
+stopping -> disposed             bounded process teardown settles
+disabled -> disposed             final disposal
+```
+
+No operation is admitted from `disposed`. Concurrent reload requests share the active replacement or are rejected as already replacing; they do not create a queue.
+
+### 8.2 Startup
+
+An empty plan produces `disabled` and does not spawn or materialize a worker.
+
+For a non-empty plan:
+
+1. record `starting` with a fresh generation ID;
+2. spawn the worker and install all owned readers, writers, and deadlines;
+3. send `initialize`;
+4. validate every worker frame;
+5. wait for the factory registration barrier;
+6. commit `ready`, or apply `failed` after bounded teardown.
+
+Per-extension import or factory errors are ordinary diagnostics. The generation may become ready with the successfully loaded subset, matching Pi's non-fatal source behavior. A process crash, protocol failure, or blocked worker is a fatal generation failure.
+
+### 8.3 Atomic replacement
+
+Reload replaces the worker process rather than invalidating module caches in place:
+
+1. admit `replacing` while retaining the current generation;
+2. spawn and initialize one candidate generation;
+3. if the candidate fatally fails, destroy it and return to the current `ready` generation;
+4. after candidate readiness, send `session_shutdown` to the current generation;
+5. await bounded lifecycle settlement;
+6. terminate the current process and release its resources;
+7. commit the candidate as current;
+8. send `session_start` to the candidate;
+9. reject every later frame from the old generation.
+
+At most two generation processes exist during replacement. Ordinary per-extension load diagnostics do not make the candidate fatal; they produce the same partial extension set Pi would expose after reload.
+
+### 8.4 Final shutdown
+
+Final shutdown is distinct from reload and tool/run interruption:
+
+1. stop admitting extension requests;
+2. cancel an uncommitted candidate;
+3. send `session_shutdown` to the current generation when possible;
+4. await its bounded settlement;
+5. close protocol admission;
+6. request graceful process exit;
+7. terminate and then force-kill within the remaining deadline;
+8. close pipes, reject pending requests, and release listeners;
+9. transition to `disposed`.
+
+During terminal shutdown, OpenTUI is restored before the caller awaits this settlement, consistent with ADR 0009.
+
+## 9. Worker runtime decision probe
+
+The implementation must not assume whether the compiled Bun executable can host external TypeScript reliably. A throwaway probe precedes production code.
+
+### 9.1 Candidate A: self-hosted Bun worker
+
+Spawn the Zi executable in an internal extension-worker mode. This avoids a new runtime dependency and keeps release artifacts self-contained.
+
+### 9.2 Candidate B: supervised Node worker
+
+If the standalone executable cannot reliably provide external TypeScript, Node built-ins, extension-local dependency resolution, and dedicated protocol pipes on every release platform, use a separately materialized Node worker with an explicit minimum version.
+
+### 9.3 Probe requirements
+
+The probe must run from the compiled `dist/zi` executable and prove:
+
+- external `.ts` loading;
+- async default factory execution;
+- `node:fs` import;
+- one extension-local npm dependency;
+- extension stdout and stderr isolation from protocol traffic;
+- dedicated protocol transport;
+- clean process exit;
+- deliberate exception attribution;
+- deliberate process crash containment;
+- deliberate infinite-loop containment;
+- macOS, Linux, and Windows behavior.
+
+The selected mechanism is recorded in an ADR before production host code lands. The rejected probe is deleted.
+
+## 10. TypeScript module loading
+
+Pi's `jiti/static` integration is the reference implementation to evaluate. The selected worker must provide:
+
+- `.ts` and `.js` entry points without a separate extension build;
+- extension-local relative imports;
+- extension-local `node_modules` resolution;
+- Node built-ins;
+- a fresh module graph per generation;
+- a validated default export function;
+- awaited async factory settlement;
+- official virtual modules available from the standalone distribution.
+
+The initial official virtual modules are limited to:
+
+```text
+@with-zi/extension-api
+typebox
+typebox/compile
+typebox/value
+```
+
+Zi does not expose `@with-zi/coding-agent`, OpenTUI, `AgentSession`, `SessionManager`, `ModelRegistry`, or private implementation modules to extensions.
+
+The factory may register lifecycle handlers during execution. Factory completion sends the worker's `ready` barrier. Later dynamic registrations remain possible in the protocol design but no non-lifecycle registration exists in this slice.
+
+Extension factories should not create long-lived resources. The documented lifetime is `session_start` through `session_shutdown`. Zi cannot make arbitrary JavaScript obey this convention, so process replacement and forced teardown remain the final resource boundary.
+
+## 11. Initial public extension contract
+
+```ts
+export type ExtensionStartReason = "startup" | "reload" | "new" | "resume" | "fork"
+export type ExtensionShutdownReason = "quit" | "reload" | "new" | "resume" | "fork"
+
+export type ExtensionLifecycleEvent =
+  | { readonly type: "session_start"; readonly reason: ExtensionStartReason }
+  | { readonly type: "session_shutdown"; readonly reason: ExtensionShutdownReason }
+
+export interface ExtensionAPI {
+  on(
+    event: "session_start",
+    handler: (event: Extract<ExtensionLifecycleEvent, { type: "session_start" }>) => void | Promise<void>
+  ): void
+  on(
+    event: "session_shutdown",
+    handler: (event: Extract<ExtensionLifecycleEvent, { type: "session_shutdown" }>) => void | Promise<void>
+  ): void
+}
+
+export type ExtensionFactory = (zi: ExtensionAPI) => void | Promise<void>
+```
+
+An extension with no contribution is valid:
+
+```ts
+import type { ExtensionAPI } from "@with-zi/extension-api"
+
+export default async function (_zi: ExtensionAPI): Promise<void> {}
+```
+
+Lifecycle handlers execute in source load order and registration order. A handler failure emits a diagnostic and continues to the next handler. A lifecycle timeout is fatal to that generation because JavaScript execution cannot be safely preempted in place.
+
+## 12. Process protocol
+
+### 12.1 Transport
+
+Use length-prefixed UTF-8 JSON over dedicated process pipes:
+
+```text
+parent -> child: child stdin
+child -> parent: dedicated extra pipe
+child stdout: bounded extension log stream
+child stderr: bounded extension diagnostic log stream
+```
+
+The frame prefix is a four-byte unsigned big-endian payload length. The decoder accepts partial prefixes, partial payloads, and multiple frames per read. It rejects zero-length, oversized, malformed UTF-8/JSON, and unknown messages before they enter the host state machine.
+
+A dedicated child-to-parent pipe keeps arbitrary `console.log()` and `process.stdout.write()` calls from corrupting protocol framing. The runtime probe must prove extra-pipe behavior on all release platforms.
+
+### 12.2 Initial host messages
+
+```ts
+type HostMessage =
+  | {
+      readonly type: "initialize"
+      readonly protocolVersion: 1
+      readonly generation: number
+      readonly plan: ExtensionLoadPlan
+    }
+  | {
+      readonly type: "session_start"
+      readonly generation: number
+      readonly requestId: number
+      readonly reason: ExtensionStartReason
+    }
+  | {
+      readonly type: "session_shutdown"
+      readonly generation: number
+      readonly requestId: number
+      readonly reason: ExtensionShutdownReason
+    }
+  | { readonly type: "stop"; readonly generation: number; readonly requestId: number }
+  | { readonly type: "cancel"; readonly generation: number; readonly requestId: number }
+```
+
+### 12.3 Initial worker messages
+
+```ts
+type WorkerMessage =
+  | {
+      readonly type: "ready"
+      readonly protocolVersion: 1
+      readonly generation: number
+      readonly extensions: readonly ExtensionLoadResult[]
+    }
+  | { readonly type: "settled"; readonly generation: number; readonly requestId: number }
+  | { readonly type: "diagnostic"; readonly generation: number; readonly diagnostic: ExtensionDiagnostic }
+  | { readonly type: "fatal"; readonly generation: number; readonly diagnostic: ExtensionDiagnostic }
+```
+
+Every open-world frame is schema-validated. Exhaustive internal handling begins only after validation.
+
+### 12.4 Correlation and reentrancy
+
+Future Pi-equivalent handlers must be able to call back into Zi while Zi awaits the handler, such as a tool or event requesting a confirmation. The infrastructure therefore supports bidirectional correlated requests from the start:
+
+- host and worker use disjoint request-ID namespaces;
+- each side owns one reader loop and one serialized writer;
+- the reader loop never blocks while awaiting a dispatched request;
+- pending requests are bounded;
+- a nested request may settle before its parent request;
+- cancellation identifies one request and never means process shutdown;
+- process shutdown rejects every pending request exactly once.
+
+Do not implement lockstep request/response I/O or hold one global request mutex across handler execution.
+
+### 12.5 Protocol evolution
+
+The protocol version is negotiated during `initialize`/`ready`. New capability messages extend closed unions. Unsupported versions fail startup with a source-independent protocol diagnostic.
+
+Do not use JSON-RPC method strings, generic payload envelopes inside coding-agent, or an application-wide event bus. The external process seam is the only place where a transport protocol exists.
+
+## 13. Diagnostics
+
+```ts
+interface ExtensionDiagnostic {
+  readonly extensionId?: string
+  readonly path?: string
+  readonly phase:
+    | "discovery"
+    | "trust"
+    | "spawn"
+    | "handshake"
+    | "resolve"
+    | "import"
+    | "factory"
+    | "lifecycle"
+    | "protocol"
+    | "shutdown"
+  readonly severity: "warning" | "error"
+  readonly message: string
+  readonly stack?: string
+}
+
+interface ExtensionLoadResult {
+  readonly source: ExtensionSource
+  readonly status: "loaded" | "failed"
+  readonly diagnostic?: ExtensionDiagnostic
+}
+```
+
+Diagnostics are data returned by coding-agent owners. Workers and components do not write application stderr directly. CLI and TUI modes decide presentation.
+
+Import and factory failures remain local to their source. Fatal worker or protocol failures identify the generation and leave `AgentSession` usable without extensions.
+
+## 14. Initial bounds
+
+The first implementation uses hard limits:
+
+```ts
+const maxExtensionSources = 128
+const maxExtensionPathBytes = 4 * 1024
+const maxExtensionProtocolFrameBytes = 1024 * 1024
+const maxExtensionPendingRequests = 128
+const maxExtensionQueuedWriteBytes = 8 * 1024 * 1024
+const maxExtensionDiagnostics = 256
+const maxExtensionDiagnosticMessageBytes = 16 * 1024
+const maxExtensionDiagnosticStackBytes = 64 * 1024
+const maxExtensionLogBytesPerStream = 256 * 1024
+const extensionStartupTimeoutMs = 30_000
+const extensionLifecycleTimeoutMs = 10_000
+const extensionShutdownTimeoutMs = 3_000
+```
+
+Only the retained tail of stdout/stderr is kept, with an omitted-byte count. Frame bounds apply before JSON allocation. Source and path bounds apply before process startup.
+
+Later capabilities must work within the frame bound through bounded chunks or references; they may not silently increase it for large tool output or images.
+
+There is no automatic worker restart in this slice. Explicit reload is the recovery operation.
+
+## 15. Runtime and mode integration
+
+### 15.1 Runtime bootstrap
+
+```text
+open explicit session header if present
+  -> derive effective ZiPaths
+  -> resolve project trust
+  -> discover ExtensionLoadPlan
+  -> start ExtensionHost when non-empty
+  -> construct cwd-bound settings, resources, models, and session
+  -> transfer ExtensionHost ownership to AgentSession
+```
+
+Future provider declarations may require host registration before model selection. The host therefore starts before final session construction, but `session_start` is emitted only after the session and selected mode have bound their operations.
+
+### 15.2 Interactive mode
+
+Interactive mode may present trust and diagnostics, but it receives no worker process or mutable extension registry. It binds terminal-specific future capabilities through `InteractiveMode` and the semantic keybinding owner.
+
+Terminal shutdown restores OpenTUI before awaiting bounded extension settlement.
+
+### 15.3 Text and JSON modes
+
+Text and JSON modes load the same extension generation. Without a stored or runtime trust decision, they exclude project sources and report a diagnostic on stderr through the CLI owner. No TUI module is loaded.
+
+### 15.4 Session replacement
+
+`AgentSessionRuntime` continues to replace whole cwd-bound runtimes. A candidate runtime includes its own trust decision, extension plan, and host. Failure before runtime commit preserves the old session and old extension generation.
+
+## 16. Failure policy
+
+| Failure                          | Result                                                                               |
+| -------------------------------- | ------------------------------------------------------------------------------------ |
+| Missing or unsupported source    | Source diagnostic; continue                                                          |
+| Import failure                   | Source diagnostic; continue                                                          |
+| Factory rejection                | Source diagnostic; continue                                                          |
+| Pending async factory timeout    | Source diagnostic when worker remains responsive; otherwise fatal generation failure |
+| Infinite loop or blocked worker  | Kill candidate/current generation after deadline; Zi remains usable                  |
+| Malformed or oversized frame     | Fatal generation protocol failure                                                    |
+| Unknown protocol version/message | Fatal generation protocol failure                                                    |
+| Lifecycle handler rejection      | Diagnostic; continue remaining handlers                                              |
+| Lifecycle deadline               | Fatal generation failure and forced teardown                                         |
+| Worker crash during startup      | Initial host becomes failed; session starts without extensions                       |
+| Candidate crash during reload    | Candidate destroyed; current generation retained                                     |
+| Current worker crash             | Host becomes failed; session remains usable; explicit reload may recover             |
+| Shutdown timeout                 | Force-kill, release resources, report bounded diagnostic                             |
+| Stale generation frame           | Ignore and count structurally; never mutate current state                            |
+
+A failed extension host never aborts an active provider run merely because extension infrastructure disappeared. Later capabilities define how one in-flight extension operation settles when its host fails.
+
+## 17. Testing strategy
+
+Tests fix behavior at the owners' interfaces rather than exposing private registries.
+
+### 17.1 Discovery tests
+
+Cover:
+
+- exact `ZiPaths` roots;
+- global/project/explicit scope;
+- deterministic sorted order;
+- file and one-level directory entries;
+- canonical deduplication;
+- symlink behavior;
+- missing and unreadable sources;
+- source and path bounds;
+- cancellation and descriptor cleanup;
+- project exclusion before trust.
+
+### 17.2 Protocol tests
+
+Cover:
+
+- partial prefix and payload reads;
+- multiple frames in one read;
+- UTF-8 boundaries;
+- malformed length, JSON, and message unions;
+- frame and write-queue bounds;
+- bidirectional request-ID separation;
+- nested request settlement;
+- cancellation races;
+- stale generation frames;
+- pending-request rejection on process exit;
+- reader, writer, and listener cleanup.
+
+### 17.3 Host transition tests
+
+Use a controlled process adapter to prove:
+
+- forbidden transitions;
+- empty-plan laziness;
+- startup success and failure;
+- per-source diagnostic isolation;
+- one admitted reload;
+- fatal candidate failure preserving current;
+- successful replacement invalidating old callbacks;
+- shutdown superseding replacement;
+- crash during every state;
+- lifecycle rejection and timeout;
+- bounded diagnostics and log tails;
+- one settlement per request;
+- final disposal idempotence.
+
+### 17.4 Worker tests
+
+Fixture extensions prove:
+
+- empty factory;
+- async factory;
+- invalid default export;
+- import failure;
+- factory rejection;
+- lifecycle registration and ordering;
+- local module import;
+- Node built-in import;
+- local npm dependency import;
+- stdout/stderr isolation;
+- pending promise timeout;
+- process crash;
+- infinite loop containment.
+
+### 17.5 Compiled acceptance
+
+The release-shaped acceptance test:
+
+1. compiles Zi with the pinned Bun version;
+2. starts the executable with a temporary global extension;
+3. loads TypeScript and one local npm dependency;
+4. observes ready and lifecycle settlement through a test-only external effect;
+5. reloads to a new generation;
+6. proves the old process is gone;
+7. exits with no leaked process or temporary artifact.
+
+CI uses deterministic process and resource assertions rather than wall-clock performance thresholds.
+
+## 18. Implementation slices
+
+### Slice A — runtime probe and decision
+
+Deliver:
+
+- throwaway self-hosted Bun worker probe;
+- external TypeScript, Node built-in, npm dependency, extra pipe, crash, and hang fixtures;
+- release-platform results;
+- ADR selecting self-hosted Bun or supervised Node;
+- deletion of the rejected prototype.
+
+No production extension abstraction lands in this slice.
+
+### Slice B — trust and discovery
+
+Likely files:
+
+- `packages/coding-agent/src/paths.ts`
+- `packages/coding-agent/src/settings-manager.ts`
+- `packages/coding-agent/src/resource-loader.ts`
+- `packages/coding-agent/src/extensions/discovery.ts`
+- coding-agent tests
+
+Deliver:
+
+- project-trust owner and persisted/runtime decisions;
+- coordinated gating of every project configuration owner;
+- bounded immutable extension source discovery;
+- deterministic `ExtensionLoadPlan`;
+- diagnostics and explicit path admission;
+- no worker process yet.
+
+### Slice C — protocol and worker loader
+
+Likely files:
+
+- `packages/coding-agent/src/extensions/protocol.ts`
+- `packages/coding-agent/src/extensions/worker.ts`
+- extension API package or generated virtual module
+- worker/protocol tests
+
+Deliver:
+
+- closed protocol unions and validation;
+- framing and bounded writers;
+- TypeScript loader;
+- source metadata and per-extension results;
+- async factory barrier;
+- lifecycle-only registration;
+- compiled virtual modules.
+
+### Slice D — `ExtensionHost`
+
+Likely files:
+
+- `packages/coding-agent/src/extensions/host.ts`
+- host transition tests
+
+Deliver:
+
+- explicit host state;
+- process and generation ownership;
+- request correlation and reentrancy;
+- startup, replacement, shutdown, and disposal;
+- diagnostics and retained log tails;
+- stale-generation rejection;
+- all bounds.
+
+### Slice E — runtime and session integration
+
+Likely files:
+
+- `packages/coding-agent/src/runtime.ts`
+- `packages/coding-agent/src/sdk.ts`
+- `packages/coding-agent/src/agent-session.ts`
+- `packages/coding-agent/src/agent-session-runtime.ts`
+- `packages/cli/src/args.ts`
+- mode and runtime tests
+
+Deliver:
+
+- explicit extension paths reaching coding-agent;
+- host construction and ownership transfer;
+- lifecycle binding;
+- session replacement behavior;
+- text/JSON diagnostic behavior;
+- terminal-shutdown ordering unchanged.
+
+### Slice F — packaging and documentation
+
+Likely files:
+
+- `scripts/compile-zi.ts`
+- release scripts and workflows
+- public manual pages
+- compiled acceptance tests
+
+Deliver:
+
+- worker or self-host assets in every release artifact;
+- no install-time downloader;
+- official extension API import availability;
+- extension author quick start for lifecycle-only extensions;
+- third-party notice updates for the selected loader/runtime dependencies.
+
+## 19. Acceptance checklist
+
+The extension infrastructure is complete when:
+
+- [ ] the worker-runtime probe has selected and documented one mechanism;
+- [ ] all project configuration, including extensions, shares one trust decision;
+- [ ] global, project, and explicit sources produce a deterministic bounded load plan;
+- [ ] no extension source causes ambient cwd or `.zi` path derivation;
+- [ ] an empty plan creates no subprocess or materialized worker;
+- [ ] the compiled executable loads external TypeScript;
+- [ ] extension-local npm dependencies and Node built-ins resolve;
+- [ ] async factories are awaited before ready;
+- [ ] every loaded or failed extension retains stable source metadata;
+- [ ] import and factory failures are source-attributed and non-fatal;
+- [ ] a blocked factory cannot freeze Zi or the TUI;
+- [ ] protocol frames, queues, logs, requests, sources, diagnostics, and waits are bounded;
+- [ ] nested bidirectional requests cannot deadlock the protocol;
+- [ ] candidate fatal failure preserves the current generation;
+- [ ] successful replacement rejects all stale-generation work;
+- [ ] lifecycle handlers run in deterministic order;
+- [ ] lifecycle and shutdown waits are bounded;
+- [ ] a worker crash leaves `AgentSession` usable;
+- [ ] terminal restoration still precedes bounded extension settlement;
+- [ ] final disposal leaves no child process, listener, pipe, callback, or temporary artifact;
+- [ ] text and JSON modes do not load OpenTUI;
+- [ ] no tools, commands, providers, UI contributions, generic event bus, or package manager entered this slice;
+- [ ] formatting, linting, typechecking, unit tests, and compiled acceptance pass.
+
+## 20. Capability sequence after infrastructure
+
+Once this substrate is accepted, capabilities should arrive independently in this order unless user evidence changes the priority:
+
+1. custom tools and bounded tool execution;
+2. project/global extension lifecycle and explicit reload UX;
+3. agent and tool interception events;
+4. commands and durable extension state;
+5. declarative and executable provider registration;
+6. session-tree hooks after Zi owns branch navigation;
+7. terminal contributions after OpenTUI keymap adoption;
+8. package install, update, remove, and source provenance.
+
+Each slice adds closed protocol messages, behavior tests, and upstream provenance. No slice expands a generic extension facade in anticipation of later ones.
