@@ -66,6 +66,12 @@ Context accounting and compaction are implemented from [`docs/context-compaction
 
 Pi's optional `grep`, `find`, and `ls` implementations are deliberately deferred: its vanilla session does not enable them, and Bash already supplies their default capability. They are not part of the current built-in UX scope.
 
+### P1 prompt-cache affinity evidence
+
+- `packages/coding-agent/test/prompt-cache.test.ts` fixes one stable provider session ID, default cached transport, unchanged system/tool prefixes, and append-only message prefixes across ordinary turns and tool-loop subrequests. It also proves resume reuses the journal session ID and preserves opaque reasoning signatures and response IDs needed for exact provider replay.
+- `packages/coding-agent/test/agent-session-compaction.test.ts` proves standalone compaction samples do not join the conversation's cache/routing session and reuse one isolated request identity across bounded retries. Provider-specific cache controls, affinity headers, WebSocket continuation, and usage accounting remain owned by `@earendil-works/pi-ai`.
+- The request shape is characterized from Pi `v0.80.6` `core/sdk.ts`, `pi-agent-core` context snapshots, and `test/sdk-codex-cache-probe-tool-loop.ts`. Zi keeps the same append-only cacheability mechanics while retaining its own session journal and compaction owners.
+
 ### P1 retry evidence
 
 - `packages/coding-agent/test/agent-session-retry.test.ts` fixes Pi AI-owned transient classification, disabled/quota refusal, the three-attempt budget, one logical settlement, `agent_end.willRetry`, cancellation with exact queue restoration, retry-before-follow-up ordering, durable context exclusion across compaction and resume, and retained failed-attempt presentation.
