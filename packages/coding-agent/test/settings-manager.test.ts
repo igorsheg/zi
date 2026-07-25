@@ -4,7 +4,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 
 import { ZiPaths } from "../src/paths.js"
-import { maxSettingsFileBytes, SettingsManager } from "../src/settings-manager.js"
+import { maxExternalEditorCommandLength, maxSettingsFileBytes, SettingsManager } from "../src/settings-manager.js"
 
 test("settings resolve global, then project, then construction overrides", async () => {
   const root = await mkdtemp(join(tmpdir(), "zi-settings-"))
@@ -17,12 +17,18 @@ test("settings resolve global, then project, then construction overrides", async
       defaultProvider: "global",
       defaultModel: "model",
       defaultThinkingLevel: "low",
+      externalEditor: "global-editor",
       steeringMode: "all"
     })
   )
   await writeFile(
     paths.projectSettingsFile,
-    JSON.stringify({ defaultProvider: "project", defaultModel: "model", defaultThinkingLevel: "high" })
+    JSON.stringify({
+      defaultProvider: "project",
+      defaultModel: "model",
+      defaultThinkingLevel: "high",
+      externalEditor: "project-editor"
+    })
   )
 
   const settings = SettingsManager.create(paths, { defaultThinkingLevel: "medium" })
@@ -31,6 +37,7 @@ test("settings resolve global, then project, then construction overrides", async
     defaultProvider: "project",
     defaultModel: "model",
     defaultThinkingLevel: "medium",
+    externalEditor: "project-editor",
     steeringMode: "all",
     followUpMode: "one-at-a-time",
     retryEnabled: true,
@@ -40,6 +47,37 @@ test("settings resolve global, then project, then construction overrides", async
     compactionReserveTokens: 16_384,
     compactionKeepRecentTokens: 20_000
   })
+  expect(settings.getExternalEditorCommand()).toBe("project-editor")
+})
+
+test("external editor resolution follows configured, VISUAL, EDITOR, then platform fallback", () => {
+  const originalVisual = process.env.VISUAL
+  const originalEditor = process.env.EDITOR
+
+  try {
+    process.env.VISUAL = "vim"
+    process.env.EDITOR = "nano"
+    const captured = new SettingsManager()
+    expect(captured.getExternalEditorCommand()).toBe("vim")
+    expect(new SettingsManager({ externalEditor: "code --wait" }).getExternalEditorCommand()).toBe("code --wait")
+
+    process.env.VISUAL = " "
+    process.env.EDITOR = "emacs"
+    expect(new SettingsManager().getExternalEditorCommand()).toBe("emacs")
+    expect(captured.getExternalEditorCommand()).toBe("vim")
+
+    delete process.env.EDITOR
+    expect(new SettingsManager().getExternalEditorCommand()).toBe(process.platform === "win32" ? "notepad" : "nano")
+    expect(() => new SettingsManager({ externalEditor: " " })).toThrow("Invalid externalEditor")
+    expect(() => new SettingsManager({ externalEditor: "x".repeat(maxExternalEditorCommandLength + 1) })).toThrow(
+      "Invalid externalEditor"
+    )
+  } finally {
+    if (originalVisual === undefined) delete process.env.VISUAL
+    else process.env.VISUAL = originalVisual
+    if (originalEditor === undefined) delete process.env.EDITOR
+    else process.env.EDITOR = originalEditor
+  }
 })
 
 test("retry settings layer and reject unbounded backoff", async () => {

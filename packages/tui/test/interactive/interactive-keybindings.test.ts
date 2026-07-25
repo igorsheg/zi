@@ -17,8 +17,15 @@ test("interactive keybindings resolve semantic prompt and transcript actions", (
   expect(
     keybindings.promptAction(key("v", process.platform === "win32" ? { meta: true } : { ctrl: true }), context())
   ).toBe("paste_clipboard")
+  expect(keybindings.promptAction(key("g", { ctrl: true }), { ...context(), foregroundShellTask: false })).toBe(
+    "external_editor"
+  )
   expect(
-    keybindings.promptAction(key("g", { ctrl: true }), { ...context(), foregroundShellTask: false })
+    keybindings.promptAction(key("g", { ctrl: true }), {
+      ...context(),
+      foregroundShellTask: false,
+      externalEditorEnabled: false
+    })
   ).toBeUndefined()
   expect(keybindings.promptAction(key("c", { ctrl: true }), context())).toBe("clear")
   expect(keybindings.promptAction(key("d", { ctrl: true }), { ...context(), editorEmpty: false })).toBeUndefined()
@@ -46,6 +53,7 @@ test("interactive keybinding overrides rebind and disable semantic actions per m
   const keybindings = new InteractiveKeybindings({
     "app.clear": ["ctrl+x"],
     "app.exit": [],
+    "app.editor.external": ["ctrl+e"],
     "tui.input.historyPrevious": ["ctrl+p"],
     "tui.input.historyNext": []
   })
@@ -53,6 +61,9 @@ test("interactive keybinding overrides rebind and disable semantic actions per m
   expect(keybindings.promptAction(key("c", { ctrl: true }), context())).toBeUndefined()
   expect(keybindings.promptAction(key("x", { ctrl: true }), context())).toBe("clear")
   expect(keybindings.promptAction(key("d", { ctrl: true }), context())).toBeUndefined()
+  expect(keybindings.promptAction(key("e", { ctrl: true }), { ...context(), foregroundShellTask: false })).toBe(
+    "external_editor"
+  )
   expect(keybindings.promptAction(key("up"), context())).toBeUndefined()
   expect(keybindings.promptAction(key("p", { ctrl: true }), context())).toBe("history_previous")
   expect(keybindings.promptAction(key("down"), context())).toBeUndefined()
@@ -82,6 +93,7 @@ test("interactive keybindings expose resolved metadata for help and future short
   )
   expect(keybindings.getHint("app.selection.copy")).toBe(process.platform === "darwin" ? "Cmd+C" : "Ctrl+C")
   expect(keybindings.getHint("app.tools.expand")).toBe("Ctrl+O")
+  expect(keybindings.getHint("app.editor.external")).toBe("Ctrl+G")
   expect(keybindings.getHint("app.transcript.tail")).toBe("Ctrl+End")
   expect(keybindings.getHint("tui.select.confirm")).toBe("Enter")
   expect(keybindings.getConflicts()).toEqual([])
@@ -115,6 +127,7 @@ function context(pickerOpen = false) {
     hasImages: false,
     streaming: true,
     foregroundShellTask: true,
+    externalEditorEnabled: true,
     historyEnabled: !pickerOpen
   }
 }

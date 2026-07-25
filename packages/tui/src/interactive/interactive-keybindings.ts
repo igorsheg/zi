@@ -14,6 +14,7 @@ export type PromptKeyAction =
   | "submit"
   | "follow_up"
   | "background_task"
+  | "external_editor"
   | "paste_clipboard"
   | "new_line"
   | "history_previous"
@@ -32,6 +33,7 @@ export interface PromptKeyContext {
   readonly hasImages: boolean
   readonly streaming: boolean
   readonly foregroundShellTask: boolean
+  readonly externalEditorEnabled: boolean
   readonly historyEnabled: boolean
 }
 
@@ -51,6 +53,7 @@ const defaultBindingEntries = [
   ["app.message.followUp", ["alt+return"], "Queue a follow-up message", "reserved"],
   ["app.message.dequeue", ["alt+up"], "Restore queued messages", "overridable"],
   ["app.task.background", ["ctrl+g"], "Move the foreground shell task to the background", "overridable"],
+  ["app.editor.external", ["ctrl+g"], "Open the prompt in an external editor", "overridable"],
   [
     "app.clipboard.paste",
     process.platform === "win32" ? ["alt+v"] : ["ctrl+v"],
@@ -164,6 +167,7 @@ export class InteractiveKeybindings {
     }
 
     if (context.foregroundShellTask && this.matches(event, "app.task.background")) return "background_task"
+    if (context.externalEditorEnabled && this.matches(event, "app.editor.external")) return "external_editor"
     if (this.matches(event, "app.clipboard.paste")) return "paste_clipboard"
     if (context.streaming && this.matches(event, "app.interrupt")) return "interrupt"
     if (this.matches(event, "app.clear")) return "clear"

@@ -15,6 +15,7 @@ import type { Theme } from "../../theme.js"
 import type { BrowserOpener } from "../browser-opener.js"
 import { maxPastedTextBytes, type ClipboardReader } from "../clipboard.js"
 import type { ExitGestureController } from "../exit-gesture.js"
+import type { ExternalEditor } from "../external-editor.js"
 import type { InteractiveKeybindings, PromptKeyAction } from "../interactive-keybindings.js"
 import type { InteractiveStore } from "../interactive-store.js"
 import type { SlashController } from "../slash-controller.js"
@@ -25,6 +26,11 @@ import { QueuedInputsView } from "./queue-view.js"
 import { promptInputIsSecret, type PromptInputEdit, type PromptWorkflow } from "./state.js"
 import { createPromptStore, type PromptSessionActions, type PromptStore } from "./store.js"
 
+type ExternalEditorState =
+  | { readonly type: "idle" }
+  | { readonly type: "editing"; readonly operationId: number }
+  | { readonly type: "disposed" }
+
 export class PromptView {
   readonly root: BoxRenderable
 
@@ -32,6 +38,7 @@ export class PromptView {
   readonly #interactive: InteractiveStore
   readonly #keybindings: InteractiveKeybindings
   readonly #exitGestures: ExitGestureController
+  readonly #externalEditor: ExternalEditor
   readonly #store: PromptStore
   readonly #working: ShimmerTextView
   readonly #feedback: PromptFeedbackView
@@ -42,6 +49,8 @@ export class PromptView {
   readonly #release: Array<() => void> = []
   #appliedInputRevision = 0
   #syncedImages: ReturnType<Composer["activeImages"]> = []
+  #externalEditorState: ExternalEditorState = { type: "idle" }
+  #nextExternalEditorOperationId = 0
 
   constructor(
     renderer: CliRenderer,
@@ -51,6 +60,7 @@ export class PromptView {
     exitGestures: ExitGestureController,
     browserOpener: BrowserOpener,
     clipboard: ClipboardReader,
+    externalEditor: ExternalEditor,
     theme: Theme,
     sessionActions?: PromptSessionActions
   ) {
@@ -58,6 +68,7 @@ export class PromptView {
     this.#interactive = interactive
     this.#keybindings = keybindings
     this.#exitGestures = exitGestures
+    this.#externalEditor = externalEditor
     this.#store = createPromptStore(interactive, slash, sessionActions, clipboard)
     this.root = new BoxRenderable(renderer, { flexDirection: "column", flexShrink: 0 })
     this.root.onLifecyclePass = this.#refreshWorkingStatus
@@ -127,6 +138,7 @@ export class PromptView {
   }
 
   destroy(): void {
+    this.#externalEditorState = { type: "disposed" }
     for (const release of this.#release.splice(0)) release()
     this.root.onLifecyclePass = null
     this.#working.destroy()
@@ -260,6 +272,7 @@ export class PromptView {
       streaming:
         session.isStreaming || session.compactionStatus.type === "running" || authenticationActive(prompt.workflow),
       foregroundShellTask: session.shellTasks.some(task => task.type === "foreground"),
+      externalEditorEnabled: prompt.workflow.type === "idle",
       historyEnabled: prompt.workflow.type === "idle" && !pickerOpen
     })
     if (!action) return
@@ -313,6 +326,10 @@ export class PromptView {
         }
         return
       }
+      case "external_editor":
+        consume(key)
+        void this.#openExternalEditor()
+        return
       case "paste_clipboard":
         consume(key)
         this.#pasteClipboard()
@@ -343,6 +360,30 @@ export class PromptView {
       default:
         return assertNever(action)
     }
+  }
+
+  async #openExternalEditor(): Promise<void> {
+    if (this.#externalEditorState.type !== "idle") return
+    const operationId = ++this.#nextExternalEditorOperationId
+    this.#externalEditorState = { type: "editing", operationId }
+    const session = this.#interactive.getSession()
+
+    let result: Awaited<ReturnType<ExternalEditor["edit"]>>
+    try {
+      result = await this.#externalEditor.edit({
+        command: session.settingsManager.getExternalEditorCommand(),
+        content: this.#composer.expandedText(),
+        cwd: session.sessionManager.header.cwd
+      })
+    } catch (cause) {
+      result = { type: "failed", message: cause instanceof Error ? cause.message : String(cause) }
+    }
+
+    const state = this.#externalEditorState
+    if (state.type !== "editing" || state.operationId !== operationId) return
+    this.#externalEditorState = { type: "idle" }
+    if (result.type === "complete") this.#replaceInput(result.content)
+    else this.#store.reportFeedback({ type: "warning", message: result.message })
   }
 
   #applyHistoryResult(result: ReturnType<Composer["historyPrevious"]>): void {

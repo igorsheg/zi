@@ -16,6 +16,7 @@ import {
   type TuiMemorySnapshot
 } from "./diagnostics.js"
 import { ExitGestureController } from "./exit-gesture.js"
+import { type ExternalEditor, SystemExternalEditor } from "./external-editor.js"
 import { InteractiveKeybindings, type InteractiveKeybindingOverrides } from "./interactive-keybindings.js"
 import { createInteractiveStore, type InteractiveStore } from "./interactive-store.js"
 import type { PromptSessionActions } from "./prompt/store.js"
@@ -34,6 +35,7 @@ export interface InteractiveModeOptions {
   readonly browserOpener?: BrowserOpener
   readonly clipboardReader?: ClipboardReader
   readonly clipboardWriter?: ClipboardWriter
+  readonly externalEditor?: ExternalEditor
   readonly diagnostics?: TuiDiagnosticFlags
   readonly bootstrapDiagnostic?: SessionBootstrapDiagnostic
 }
@@ -48,6 +50,7 @@ export class InteractiveMode {
   readonly #browserOpener: BrowserOpener
   readonly #clipboardReader: ClipboardReader
   readonly #clipboardWriter: ClipboardWriter
+  readonly #externalEditor: ExternalEditor
   readonly #exitGestures: ExitGestureController
   readonly #theme: Theme
   readonly #syntaxStyle: SyntaxStyle
@@ -70,6 +73,7 @@ export class InteractiveMode {
     browserOpener = new SystemBrowserOpener(),
     clipboardReader = new SystemClipboardReader(),
     clipboardWriter,
+    externalEditor,
     diagnostics = { showTimeToFirstDraw: false, showStats: false, showMemory: false },
     bootstrapDiagnostic
   }: InteractiveModeOptions) {
@@ -95,6 +99,7 @@ export class InteractiveMode {
     this.#browserOpener = browserOpener
     this.#clipboardReader = clipboardReader
     this.#clipboardWriter = clipboardWriter ?? new SystemClipboardWriter(text => renderer.copyToClipboardOSC52(text))
+    this.#externalEditor = externalEditor ?? new SystemExternalEditor(renderer)
     this.#exitGestures = new ExitGestureController(onExit)
     this.store = createInteractiveStore(session)
     this.#theme = theme
@@ -165,6 +170,7 @@ export class InteractiveMode {
     this.#renderer.off(CliRenderEvents.SELECTION, this.#preservePromptFocus)
     this.#diagnostics?.destroy()
     this.#screen.destroy()
+    this.#externalEditor.dispose()
     this.#browserOpener.dispose()
     this.root.destroyRecursively()
     this.#syntaxStyle.destroy()
@@ -203,6 +209,7 @@ export class InteractiveMode {
       this.#exitGestures,
       this.#browserOpener,
       this.#clipboardReader,
+      this.#externalEditor,
       this.#theme,
       this.#syntaxStyle,
       this.#diagnosticFlags.showTimeToFirstDraw || this.#diagnosticFlags.showStats || this.#diagnosticFlags.showMemory,

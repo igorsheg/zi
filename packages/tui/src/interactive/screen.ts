@@ -4,6 +4,7 @@ import type { Theme } from "../theme.js"
 import type { BrowserOpener } from "./browser-opener.js"
 import type { ClipboardReader } from "./clipboard.js"
 import type { ExitGestureController } from "./exit-gesture.js"
+import type { ExternalEditor } from "./external-editor.js"
 import type { InteractiveKeybindings } from "./interactive-keybindings.js"
 import type { InteractiveStore } from "./interactive-store.js"
 import type { PromptSessionActions } from "./prompt/store.js"
@@ -24,6 +25,7 @@ export class SessionScreen {
     exitGestures: ExitGestureController,
     browserOpener: BrowserOpener,
     clipboard: ClipboardReader,
+    externalEditor: ExternalEditor,
     theme: Theme,
     syntaxStyle: SyntaxStyle,
     measureTranscriptSync: boolean,
@@ -41,6 +43,7 @@ export class SessionScreen {
       exitGestures,
       browserOpener,
       clipboard,
+      externalEditor,
       theme,
       sessionActions
     )

@@ -13,6 +13,7 @@ export interface AgentSettings {
   defaultProvider?: string
   defaultModel?: string
   defaultThinkingLevel?: ThinkingLevel
+  externalEditor?: string
   steeringMode: QueueMode
   followUpMode: QueueMode
   retryEnabled: boolean
@@ -24,6 +25,7 @@ export interface AgentSettings {
 }
 
 export const maxSettingsFileBytes = 1024 * 1024
+export const maxExternalEditorCommandLength = 16 * 1024
 
 const defaults: AgentSettings = {
   steeringMode: "one-at-a-time",
@@ -57,9 +59,11 @@ export class SettingsManager {
   #paths: ZiPaths | undefined
   #sharedSettingsFile = false
   #errors: SettingsError[] = []
+  readonly #externalEditorFallback: string
 
   constructor(settings: Partial<AgentSettings> = {}) {
     validateSettingsPatch(settings)
+    this.#externalEditorFallback = resolveExternalEditorFallback(process.env, process.platform)
     this.#global = { type: "loaded", path: "<memory>", settings: { ...settings } }
     this.#project = { type: "missing", path: "<memory>" }
     this.#settings = mergeSettings(settings)
@@ -103,6 +107,10 @@ export class SettingsManager {
 
   getDefaultThinkingLevel(): ThinkingLevel | undefined {
     return this.#settings.defaultThinkingLevel
+  }
+
+  getExternalEditorCommand(): string {
+    return this.#settings.externalEditor ?? this.#externalEditorFallback
   }
 
   setDefaultModelAndProvider(provider: string, modelId: string): void {
@@ -176,6 +184,9 @@ function validateSettingsPatch(patch: Partial<AgentSettings>): void {
   if ("defaultThinkingLevel" in patch && !isThinkingLevel(patch.defaultThinkingLevel)) {
     throw new Error("Invalid defaultThinkingLevel setting")
   }
+  if ("externalEditor" in patch && !isExternalEditorCommand(patch.externalEditor)) {
+    throw new Error("Invalid externalEditor setting")
+  }
   if ("steeringMode" in patch && !isQueueMode(patch.steeringMode)) {
     throw new Error("Invalid steeringMode setting")
   }
@@ -224,6 +235,7 @@ function clearOverrides(overrides: Partial<AgentSettings>, patch: Partial<AgentS
   if ("defaultProvider" in patch) delete overrides.defaultProvider
   if ("defaultModel" in patch) delete overrides.defaultModel
   if ("defaultThinkingLevel" in patch) delete overrides.defaultThinkingLevel
+  if ("externalEditor" in patch) delete overrides.externalEditor
   if ("steeringMode" in patch) delete overrides.steeringMode
   if ("followUpMode" in patch) delete overrides.followUpMode
   if ("retryEnabled" in patch) delete overrides.retryEnabled
@@ -305,6 +317,10 @@ function loadSettings(path: string): Partial<AgentSettings> {
     if (!isThinkingLevel(value.defaultThinkingLevel)) throw invalidSetting(path, "defaultThinkingLevel")
     settings.defaultThinkingLevel = value.defaultThinkingLevel
   }
+  if (value.externalEditor !== undefined) {
+    if (!isExternalEditorCommand(value.externalEditor)) throw invalidSetting(path, "externalEditor")
+    settings.externalEditor = value.externalEditor
+  }
   if (value.steeringMode !== undefined) {
     if (!isQueueMode(value.steeringMode)) throw invalidSetting(path, "steeringMode")
     settings.steeringMode = value.steeringMode
@@ -365,6 +381,18 @@ function readSettingsFile(path: string): string {
 
 function invalidSetting(path: string, field: keyof AgentSettings): Error {
   return new Error(`Invalid ${field} setting: ${path}`)
+}
+
+function isExternalEditorCommand(value: unknown): value is string {
+  return (
+    typeof value === "string" && value.trim().length > 0 && Buffer.byteLength(value) <= maxExternalEditorCommandLength
+  )
+}
+
+function resolveExternalEditorFallback(env: NodeJS.ProcessEnv, platform: NodeJS.Platform): string {
+  if (isExternalEditorCommand(env.VISUAL)) return env.VISUAL
+  if (isExternalEditorCommand(env.EDITOR)) return env.EDITOR
+  return platform === "win32" ? "notepad" : "nano"
 }
 
 function isQueueMode(value: unknown): value is AgentSettings["steeringMode"] {
