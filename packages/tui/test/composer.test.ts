@@ -679,7 +679,7 @@ function fakeHistory(texts: readonly string[]): ComposerHistorySource & { append
 test("reapplying the same composer presentation does not schedule another frame", async () => {
   const setup = await createTestRenderer({ width: 40, height: 8, useThread: false })
   const geometry = composerGeometry(40, 8)
-  const slots = { topLeft: "/workspace/zi", topRight: ["model (high)", "(ctx 15%/247k)"] }
+  const slots = { topLeft: "/workspace/zi", topRight: ["ctx 15%/247k", "model (high)"] }
   const composer = createComposer(setup.renderer, { geometry, slots, theme: defaultTheme, onSubmit() {} })
   setup.renderer.root.add(composer.root)
 
@@ -687,7 +687,7 @@ test("reapplying the same composer presentation does not schedule another frame"
     await setup.waitForVisualIdle()
     expect(setup.renderer.getSchedulerState().hasScheduledRender).toBe(false)
 
-    composer.update(composerGeometry(40, 8), { topLeft: "/workspace/zi", topRight: ["model (high)", "(ctx 15%/247k)"] })
+    composer.update(composerGeometry(40, 8), { topLeft: "/workspace/zi", topRight: ["ctx 15%/247k", "model (high)"] })
 
     expect(setup.renderer.getSchedulerState().hasScheduledRender).toBe(false)
   } finally {

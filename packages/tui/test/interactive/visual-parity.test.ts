@@ -73,7 +73,7 @@ test("representative session keeps the accepted visual hierarchy at normal and c
       "",
       "",
       "",
-      "╭─/workspace/zi──────────────────────────────────────────faux-1 (high) 15% ctx─╮",
+      "╭─/workspace/zi─────────────────────────────────────ctx 15%/247k faux-1 (high)─╮",
       "│                                                                              │",
       "╰──────────────────────────────────────────────────────────────────────────────╯"
     ])
@@ -98,7 +98,7 @@ test("representative session keeps the accepted visual hierarchy at normal and c
       " The failed command remains visible",
       " without overwhelming the prompt.",
       "",
-      "╭─/workspace/zi──faux-1 (high) 15% ctx─╮",
+      "╭─/workspace/zi───────────ctx 15%/247k─╮",
       "│                                      │",
       "╰──────────────────────────────────────╯"
     ])
@@ -141,7 +141,7 @@ test("composer distinguishes estimated context after compaction", async () => {
 
   try {
     await setup.renderOnce()
-    expect(setup.captureCharFrame()).toMatch(/~\d+% ctx/)
+    expect(setup.captureCharFrame()).toMatch(/ctx ~\d+%\/4k/)
   } finally {
     session.dispose()
     setup.destroy()

@@ -390,8 +390,8 @@ function composerSlots(session: ReturnType<InteractiveStore["getSession"]>, imag
     topLeft: session.sessionManager.header.cwd,
     topRight: [
       ...(imageCount === 0 ? [] : [`${imageCount} image${imageCount === 1 ? "" : "s"}`]),
-      modelTitle(session),
-      ...(context.type === "unavailable" ? [] : [contextTitle(context.type, context.percent)])
+      ...(context.type === "unavailable" ? [] : [contextTitle(context.type, context.percent, context.contextWindow)]),
+      modelTitle(session)
     ]
   }
 }
@@ -402,8 +402,14 @@ function modelTitle(session: ReturnType<InteractiveStore["getSession"]>): string
   return session.thinkingLevel === "off" ? state.model.id : `${state.model.id} (${session.thinkingLevel})`
 }
 
-function contextTitle(type: "measured" | "estimated", percent: number): string {
-  return `${type === "estimated" ? "~" : ""}${Math.round(percent)}% ctx`
+function contextTitle(type: "measured" | "estimated", percent: number, contextWindow: number): string {
+  const window =
+    contextWindow < 1_000
+      ? String(contextWindow)
+      : contextWindow < 1_000_000
+        ? `${Math.round(contextWindow / 1_000)}k`
+        : `${(contextWindow / 1_000_000).toFixed(1).replace(/\.0$/, "")}m`
+  return `ctx ${type === "estimated" ? "~" : ""}${Math.round(percent)}%/${window}`
 }
 
 function normalizePastedText(text: string): string {
