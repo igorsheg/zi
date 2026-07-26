@@ -188,7 +188,7 @@ test("composer history traverses stable entries and restores the native draft", 
     expect(composer.input.plainText).toBe("middle")
     expect(composer.historyPrevious()).toBe("history_changed")
     expect(composer.input.plainText).toBe("oldest")
-    expect(composer.historyPrevious()).toBe("unchanged")
+    expect(composer.historyPrevious()).toBe("history_boundary")
     expect(composer.input.plainText).toBe("oldest")
 
     composer.input.gotoBufferEnd()
@@ -207,8 +207,8 @@ test("composer history traverses stable entries and restores the native draft", 
     expect(composer.historyNext()).toBe("history_changed")
     expect(composer.input.plainText).toBe("draft")
     expect(composer.input.cursorOffset).toBe(0)
-    expect(composer.historyNext()).toBe("cursor_moved")
-    expect(composer.historyNext()).toBe("unchanged")
+    expect(composer.historyNext()).toBe("cursor_boundary")
+    expect(composer.historyNext()).toBe("history_boundary")
     await Bun.sleep(0)
     expect(changes).toBe(8)
   } finally {
@@ -268,7 +268,7 @@ test("composer history replacement remains bounded across repeated complete trav
       for (let entry = 0; entry < 100; entry++) {
         expect(composer.historyPrevious()).toBe("history_changed")
       }
-      expect(composer.historyPrevious()).toBe("unchanged")
+      expect(composer.historyPrevious()).toBe("history_boundary")
       for (let entry = 0; entry < 100; entry++) {
         expect(composer.historyNext()).toBe("history_changed")
       }
@@ -492,11 +492,13 @@ test("composer history respects multiline, wrapped, selection, and display-width
     await setup.renderOnce()
     composer.replaceText("first line that wraps\nlast", 0)
     composer.input.gotoBufferEnd()
-    expect(composer.historyPrevious()).toBe("cursor_moved")
-    expect(composer.input.plainText).toBe("first line that wraps\nlast")
-    while (composer.input.cursorOffset !== 0) {
-      expect(composer.historyPrevious()).toBe("cursor_moved")
-    }
+    const endOffset = composer.input.cursorOffset
+    expect(composer.historyPrevious()).toBe("native_fallthrough")
+    expect(composer.input.cursorOffset).toBe(endOffset)
+    composer.input.cursorOffset = 1
+    expect(composer.input.scrollY + composer.input.visualCursor.visualRow).toBe(0)
+    expect(composer.historyPrevious()).toBe("cursor_boundary")
+    expect(composer.input.cursorOffset).toBe(0)
     expect(composer.historyPrevious()).toBe("history_changed")
     expect(composer.input.plainText).toBe("界")
     expect(composer.input.cursorOffset).toBe(0)
@@ -506,11 +508,13 @@ test("composer history respects multiline, wrapped, selection, and display-width
 
     composer.input.gotoBufferEnd()
     composer.input.cursorOffset--
-    expect(composer.historyNext()).toBe("cursor_moved")
+    expect(composer.historyNext()).toBe("cursor_boundary")
     expect(composer.input.cursorOffset).toBe(composer.input.plainText.length)
 
     composer.input.setSelection(0, 5)
-    expect(composer.historyPrevious()).toBe("cursor_moved")
+    const selection = composer.input.getSelection()
+    expect(composer.historyPrevious()).toBe("native_fallthrough")
+    expect(composer.input.getSelection()).toEqual(selection)
     expect(composer.input.plainText).toBe("first line that wraps\nlast")
   } finally {
     composer.destroy()

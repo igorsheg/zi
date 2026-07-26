@@ -319,12 +319,10 @@ export class PromptView {
         this.#submit("steer")
         return
       case "history_previous":
-        consume(key)
-        this.#applyHistoryResult(this.#composer.historyPrevious())
+        this.#handleHistoryKey(key, this.#composer.historyPrevious())
         return
       case "history_next":
-        consume(key)
-        this.#applyHistoryResult(this.#composer.historyNext())
+        this.#handleHistoryKey(key, this.#composer.historyNext())
         return
       case "follow_up":
         consume(key)
@@ -398,12 +396,25 @@ export class PromptView {
     else this.#store.reportFeedback({ type: "warning", message: result.message })
   }
 
-  #applyHistoryResult(result: ReturnType<Composer["historyPrevious"]>): void {
-    if (result !== "history_changed") return
-    const images = this.#composer.activeImages()
-    this.#syncedImages = images
-    this.#store.imageMarkersChanged(images)
-    this.#syncedImages = this.#store.$state.get().images
+  #handleHistoryKey(key: KeyEvent, result: ReturnType<Composer["historyPrevious"]>): void {
+    switch (result) {
+      case "native_fallthrough":
+        return
+      case "cursor_boundary":
+      case "history_boundary":
+        consume(key)
+        return
+      case "history_changed": {
+        consume(key)
+        const images = this.#composer.activeImages()
+        this.#syncedImages = images
+        this.#store.imageMarkersChanged(images)
+        this.#syncedImages = this.#store.$state.get().images
+        return
+      }
+      default:
+        return assertNever(result)
+    }
   }
 }
 
@@ -413,7 +424,7 @@ function consume(key: KeyEvent): void {
 }
 
 function assertNever(value: never): never {
-  throw new Error(`Unhandled prompt key action: ${String(value)}`)
+  throw new Error(`Unhandled prompt value: ${String(value)}`)
 }
 
 function authenticationActive(workflow: PromptWorkflow): boolean {

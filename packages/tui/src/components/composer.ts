@@ -41,7 +41,7 @@ export interface ComposerHistorySource {
   older(entryId: string): ComposerHistoryEntry | undefined
 }
 
-export type ComposerHistoryResult = "cursor_moved" | "history_changed" | "unchanged"
+export type ComposerHistoryResult = "native_fallthrough" | "cursor_boundary" | "history_changed" | "history_boundary"
 
 export interface ComposerOptions {
   readonly geometry: ComposerGeometry
@@ -255,7 +255,7 @@ export function createComposer(ctx: RenderContext, options: ComposerOptions): Co
     const state = historyState
     if (state.type === "idle") {
       const latest = options.historySource?.latest()
-      if (!latest) return "unchanged"
+      if (!latest) return "history_boundary"
       historyState = { type: "browsing", olderEntryIds: [], currentEntryId: latest.entryId, newerEntryIds: [] }
       applyHistoryEffect(state, () => historyReplacement.begin(latest, nativeReplaceText), "start")
       return "history_changed"
@@ -274,9 +274,9 @@ export function createComposer(ctx: RenderContext, options: ComposerOptions): Co
     }
 
     const visitedCount = state.newerEntryIds.length + 1
-    if (visitedCount >= maxSessionPromptHistoryEntries) return "unchanged"
+    if (visitedCount >= maxSessionPromptHistoryEntries) return "history_boundary"
     const older = options.historySource?.older(state.currentEntryId)
-    if (!older) return "unchanged"
+    if (!older) return "history_boundary"
     historyState = {
       type: "browsing",
       olderEntryIds: [],
@@ -289,7 +289,7 @@ export function createComposer(ctx: RenderContext, options: ComposerOptions): Co
 
   const newerHistory = (): ComposerHistoryResult => {
     const state = historyState
-    if (state.type === "idle") return "unchanged"
+    if (state.type === "idle") return "history_boundary"
 
     const visited = state.newerEntryIds[0]
     if (visited) {
@@ -370,36 +370,24 @@ export function createComposer(ctx: RenderContext, options: ComposerOptions): Co
       return expandMarkerRanges(input.plainText, composerMarkers(input, markerTypeId))
     },
     historyPrevious() {
-      if (input.hasSelection()) {
-        input.moveCursorUp()
-        return "cursor_moved"
-      }
+      if (input.hasSelection()) return "native_fallthrough"
       const globalVisualRow = input.scrollY + input.visualCursor.visualRow
       if (historyState.type === "browsing" && globalVisualRow === 0) return olderHistory()
       if (historyState.type === "idle" && input.cursorOffset === 0) return olderHistory()
-      if (globalVisualRow === 0) {
-        input.cursorOffset = 0
-        return "cursor_moved"
-      }
-      input.moveCursorUp()
-      return "cursor_moved"
+      if (globalVisualRow !== 0) return "native_fallthrough"
+      input.cursorOffset = 0
+      return "cursor_boundary"
     },
     historyNext() {
-      if (input.hasSelection()) {
-        input.moveCursorDown()
-        return "cursor_moved"
-      }
+      if (input.hasSelection()) return "native_fallthrough"
       const endOffset = promptTextWidth(input.plainText)
       const globalVisualRow = input.scrollY + input.visualCursor.visualRow
       const finalVisualRow = Math.max(0, input.editorView.getTotalVirtualLineCount() - 1)
       if (historyState.type === "browsing" && globalVisualRow === finalVisualRow) return newerHistory()
       if (historyState.type === "idle" && input.cursorOffset === endOffset) return newerHistory()
-      if (globalVisualRow === finalVisualRow) {
-        input.cursorOffset = endOffset
-        return "cursor_moved"
-      }
-      input.moveCursorDown()
-      return "cursor_moved"
+      if (globalVisualRow !== finalVisualRow) return "native_fallthrough"
+      input.cursorOffset = endOffset
+      return "cursor_boundary"
     },
     replaceText(text, cursorOffset = promptTextWidth(text)) {
       historyState = { type: "idle" }

@@ -50,7 +50,57 @@ test("default Up and Down recall the full compacted session journal and restore 
   }
 })
 
-test("effective history overrides leave unclaimed arrows to native textarea movement", async () => {
+test("default Up and Down fall through to native multiline movement", async () => {
+  const { session } = await createSession("history-native-movement")
+  session.sessionManager.appendMessage({ role: "user", content: "remembered", timestamp: 1 })
+  const setup = await createInteractiveTest(session, { width: 48, height: 12, kittyKeyboard: true })
+
+  try {
+    await setup.renderOnce()
+    const input = promptInput(setup)
+    const handleKeyPress = input.handleKeyPress.bind(input)
+    const nativeVerticalKeys: string[] = []
+    input.handleKeyPress = key => {
+      if (key.name === "up" || key.name === "down") nativeVerticalKeys.push(key.name)
+      return handleKeyPress(key)
+    }
+    input.setText("abcdef\nx\nabcdef")
+    input.cursorOffset = 5
+
+    setup.mockInput.pressArrow("down")
+    expect(input.cursorOffset).toBe(8)
+    setup.mockInput.pressArrow("down")
+    expect(input.cursorOffset).toBe(14)
+    setup.mockInput.pressArrow("up")
+    expect(input.cursorOffset).toBe(8)
+    setup.mockInput.pressArrow("up")
+    expect(input.cursorOffset).toBe(5)
+    expect(nativeVerticalKeys).toEqual(["down", "down", "up", "up"])
+    expect(input.plainText).toBe("abcdef\nx\nabcdef")
+
+    const verticalKeyCount = nativeVerticalKeys.length
+    input.setSelection(0, 5)
+    setup.mockInput.pressArrow("down")
+    expect(nativeVerticalKeys).toHaveLength(verticalKeyCount + 1)
+    expect(nativeVerticalKeys.at(-1)).toBe("down")
+    expect(input.plainText).toBe("abcdef\nx\nabcdef")
+
+    input.setText("x".repeat(100))
+    input.gotoBufferEnd()
+    const wrappedRow = input.scrollY + input.visualCursor.visualRow
+    expect(wrappedRow).toBeGreaterThan(0)
+    setup.mockInput.pressArrow("up")
+    expect(input.scrollY + input.visualCursor.visualRow).toBe(wrappedRow - 1)
+    setup.mockInput.pressArrow("down")
+    expect(input.scrollY + input.visualCursor.visualRow).toBe(wrappedRow)
+    expect(nativeVerticalKeys.slice(-2)).toEqual(["up", "down"])
+  } finally {
+    session.dispose()
+    setup.destroy()
+  }
+})
+
+test("effective history overrides intercept only at history boundaries", async () => {
   const { session } = await createSession("history-overrides")
   session.sessionManager.appendMessage({ role: "user", content: "remembered", timestamp: 1 })
   const setup = await createInteractiveTest(session, { width: 48, height: 12, kittyKeyboard: true }, () => {}, {
@@ -61,19 +111,47 @@ test("effective history overrides leave unclaimed arrows to native textarea move
   try {
     await setup.renderOnce()
     const input = promptInput(setup)
-    input.setText("draft")
-    input.cursorOffset = 0
+    const handleKeyPress = input.handleKeyPress.bind(input)
+    const nativeKeys: string[] = []
+    input.handleKeyPress = key => {
+      nativeKeys.push(`${key.ctrl ? "ctrl+" : ""}${key.name}`)
+      return handleKeyPress(key)
+    }
+    const draft = "abcdef\nx\nabcdef"
+    input.setText(draft)
+    input.cursorOffset = 14
 
+    setup.mockInput.pressKey("p", { ctrl: true })
+    expect(input.cursorOffset).toBe(14)
     setup.mockInput.pressArrow("up")
-    expect(input.plainText).toBe("draft")
+    expect(input.cursorOffset).toBe(8)
+    setup.mockInput.pressArrow("up")
+    expect(input.cursorOffset).toBe(5)
+    expect(nativeKeys).toEqual(["ctrl+p", "up", "up"])
+
+    input.cursorOffset = 5
+    setup.mockInput.pressKey("p", { ctrl: true })
+    expect(input.cursorOffset).toBe(0)
+    expect(nativeKeys).toEqual(["ctrl+p", "up", "up"])
+
     setup.mockInput.pressKey("p", { ctrl: true })
     expect(input.plainText).toBe("remembered")
+    setup.mockInput.pressKey("p", { ctrl: true })
+    expect(input.plainText).toBe("remembered")
+    expect(nativeKeys).toEqual(["ctrl+p", "up", "up"])
 
     input.gotoBufferEnd()
-    setup.mockInput.pressArrow("down")
-    expect(input.plainText).toBe("remembered")
     setup.mockInput.pressKey("n", { ctrl: true })
-    expect(input.plainText).toBe("draft")
+    expect(input.plainText).toBe(draft)
+    expect(nativeKeys).toEqual(["ctrl+p", "up", "up"])
+
+    input.setText("draft")
+    input.cursorOffset = 0
+    setup.mockInput.pressKey("n", { ctrl: true })
+    expect(input.cursorOffset).toBe(5)
+    setup.mockInput.pressKey("n", { ctrl: true })
+    expect(input.cursorOffset).toBe(5)
+    expect(nativeKeys).toEqual(["ctrl+p", "up", "up"])
   } finally {
     session.dispose()
     setup.destroy()

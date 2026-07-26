@@ -2,7 +2,7 @@
 
 Status: implemented
 
-This specification defines shell-style Up/Down recall for the interactive composer. It compares Pi's editor history at `earendil-works/pi@0e6909f0`, OpenTUI's native editor mechanics at `anomalyco/opentui@0c8c4f7c`, OpenCode's prompt-history implementations at `anomalyco/opencode@cb8be9ba1` and `4678bd104`, and Grok Build's prompt-history browser at `xai-org/grok-build@98c3b243`.
+This specification defines shell-style Up/Down recall for the interactive composer. It compares Pi's editor history at `earendil-works/pi@0e6909f0`, OpenTUI's native editor mechanics at `anomalyco/opentui@0c8c4f7c`, OpenCode's prompt-history implementations at `anomalyco/opencode@cb8be9ba1` and `4678bd104`, and Grok Build's prompt-history browser at `xai-org/grok-build@98c3b243`. Conditional native-key fallthrough was subsequently verified against OpenCode `7534d23551f665e65080809975b4ca5c7d63807b`.
 
 The product decision is deliberate: Zi will implement Pi-style inline history, not a hybrid history UI. Up and Down remain ordinary multiline cursor movement until they reach a composer boundary; only then do they traverse the current session's prompts. OpenCode contributes proven OpenTUI boundary and draft-restoration mechanics. Grok Build contributes session scoping and retention lessons. Neither contributes a second history panel or persistence path.
 
@@ -400,9 +400,15 @@ The corresponding closed prompt actions are:
 "history_previous" | "history_next"
 ```
 
-These actions mean **vertical prompt navigation with history at the boundary**, not unconditional text replacement. With the default bindings, PromptView consumes plain Up/Down and asks Composer to perform either native movement or history traversal.
+These actions mean **conditional history interception over native textarea movement**, not unconditional text replacement or application-owned cursor movement. PromptView asks Composer whether the semantic history key is intercepted. Composer returns one closed result:
 
-If a history binding is disabled, plain Up/Down falls through to OpenTUI and remains ordinary cursor movement without history. If rebound, the effective key performs the same vertical/history behavior while OpenTUI's unclaimed arrow keys retain native cursor movement.
+```ts
+type ComposerHistoryResult = "native_fallthrough" | "cursor_boundary" | "history_changed" | "history_boundary"
+```
+
+For `native_fallthrough`, PromptView leaves the original event unconsumed and the focused `TextareaRenderable` applies its own keymap. PromptView consumes every other result. This follows OpenCode's higher-priority history command rejecting an interior movement so its lower OpenTUI textarea command receives the same key, while retaining Zi's instance-scoped keybinding owner and direct typed routing.
+
+If a history binding is disabled, plain Up/Down falls through to OpenTUI and remains ordinary cursor movement without history. If rebound, the effective key intercepts only boundary behavior; in an interior row it falls through to whatever native behavior that physical key already has. A rebound Ctrl+P therefore does not masquerade as Up inside a multiline draft. OpenTUI's unclaimed arrow keys retain native cursor movement.
 
 Both bindings are overridable. Intentional default overlap with `tui.select.up` and `tui.select.down` is resolved by context rather than reported as a conflict.
 
@@ -410,20 +416,20 @@ Both bindings are overridable. Intentional default overlap with `tui.select.up` 
 
 For `history_previous`:
 
-1. if native selection is active, call ordinary `moveCursorUp()` and stop;
+1. if native selection is active, return `native_fallthrough`;
 2. compute the global visual row as `scrollY + visualCursor.visualRow`;
 3. while browsing, if the global visual row is zero, request older history immediately;
 4. while idle, if `cursorOffset === 0`, request older history;
-5. otherwise, if the global visual row is zero, set `cursorOffset = 0` and stop;
-6. otherwise call `moveCursorUp()`.
+5. if the global visual row is not zero, return `native_fallthrough`;
+6. set `cursorOffset = 0` and return `cursor_boundary`.
 
-The idle snap in step 5 matches Pi and OpenCode: a non-empty first line reaches its start on one Up and enters history on the next. Once browsing, horizontal movement on the first visual line does not add another snap before older traversal.
+An admitted older transition returns `history_changed`; an unavailable older entry returns `history_boundary`. The idle snap in step 6 matches Pi and OpenCode: a non-empty first line reaches its start on one Up and enters history on the next. Once browsing, horizontal movement on the first visual line does not add another snap before older traversal.
 
 ## Next boundary algorithm
 
 For `history_next`:
 
-1. if native selection is active, call ordinary `moveCursorDown()` and stop;
+1. if native selection is active, return `native_fallthrough`;
 2. compute the buffer-end display offset using the Composer's grapheme/cell-aware offset function;
 3. compute:
 
@@ -434,10 +440,10 @@ const finalVisualRow = Math.max(0, input.editorView.getTotalVirtualLineCount() -
 
 4. while browsing, if the rows are equal, request newer history immediately;
 5. while idle, if `cursorOffset` equals the end offset, request newer history;
-6. otherwise, if the rows are equal, set the cursor to the buffer-end display offset and stop;
-7. otherwise call `moveCursorDown()`.
+6. if the rows are not equal, return `native_fallthrough`;
+7. set the cursor to the buffer-end display offset and return `cursor_boundary`.
 
-The end snap applies only before browsing. Once browsing, horizontal movement on the last visual line does not delay newer traversal. Do not compare `cursorOffset` with JavaScript `text.length`; wide graphemes and newlines use OpenTUI display offsets.
+An admitted newer transition returns `history_changed`; idle or the unavailable newer boundary returns `history_boundary`. The end snap applies only before browsing. Once browsing, horizontal movement on the last visual line does not delay newer traversal. Do not compare `cursorOffset` with JavaScript `text.length`; wide graphemes and newlines use OpenTUI display offsets.
 
 ## Context precedence
 
@@ -609,49 +615,50 @@ Record the intentional deviations from Pi:
 
 ## Composer transitions
 
-| Behavior                                                     | Test               |
-| ------------------------------------------------------------ | ------------------ |
-| Empty source leaves buffer unchanged                         | `composer.test.ts` |
-| First Up recalls latest                                      | `composer.test.ts` |
-| Repeated Up reaches oldest and stops                         | `composer.test.ts` |
-| Down traverses newer and restores draft                      | `composer.test.ts` |
-| Up after Down uses visited redo path                         | `composer.test.ts` |
-| Edit exits browsing                                          | `composer.test.ts` |
-| External replacement exits browsing                          | `composer.test.ts` |
-| Idle first-line nonzero cursor snaps before recall           | `composer.test.ts` |
-| Idle last-line non-end cursor snaps to the buffer end        | `composer.test.ts` |
-| Browsing boundary traversal ignores horizontal cursor offset | `composer.test.ts` |
-| Wrapped/multiline cursor movement precedes history           | `composer.test.ts` |
-| Selection collapses/moves rather than opening history        | `composer.test.ts` |
-| Older cursor starts at zero                                  | `composer.test.ts` |
-| Newer cursor uses cell-aware end                             | `composer.test.ts` |
-| Draft restores its original cursor                           | `composer.test.ts` |
-| Compact paste marker and exact payload restore               | `composer.test.ts` |
-| Image markers and references restore                         | `composer.test.ts` |
-| Browse round trip preserves prior native undo                | `composer.test.ts` |
-| Repeated complete traversals reuse bounded native slots      | `composer.test.ts` |
-| Catalog turnover recalls a new ID without editor reset       | `composer.test.ts` |
-| Repeated abandoned browses reuse pinned stable-ID slots      | `composer.test.ts` |
-| Slots retained by ordinary native redo are not recycled      | `composer.test.ts` |
-| Native replacement failure restores the previous zipper      | `composer.test.ts` |
-| New source append during browse does not shift visited path  | `composer.test.ts` |
+| Behavior                                                         | Test               |
+| ---------------------------------------------------------------- | ------------------ |
+| Empty source leaves buffer unchanged                             | `composer.test.ts` |
+| First Up recalls latest                                          | `composer.test.ts` |
+| Repeated Up reaches oldest and stops                             | `composer.test.ts` |
+| Down traverses newer and restores draft                          | `composer.test.ts` |
+| Up after Down uses visited redo path                             | `composer.test.ts` |
+| Edit exits browsing                                              | `composer.test.ts` |
+| External replacement exits browsing                              | `composer.test.ts` |
+| Idle first-line nonzero cursor snaps before recall               | `composer.test.ts` |
+| Idle last-line non-end cursor snaps to the buffer end            | `composer.test.ts` |
+| Browsing boundary traversal ignores horizontal cursor offset     | `composer.test.ts` |
+| Wrapped/multiline interior requests native fallthrough           | `composer.test.ts` |
+| Selection returns native fallthrough rather than opening history | `composer.test.ts` |
+| Older cursor starts at zero                                      | `composer.test.ts` |
+| Newer cursor uses cell-aware end                                 | `composer.test.ts` |
+| Draft restores its original cursor                               | `composer.test.ts` |
+| Compact paste marker and exact payload restore                   | `composer.test.ts` |
+| Image markers and references restore                             | `composer.test.ts` |
+| Browse round trip preserves prior native undo                    | `composer.test.ts` |
+| Repeated complete traversals reuse bounded native slots          | `composer.test.ts` |
+| Catalog turnover recalls a new ID without editor reset           | `composer.test.ts` |
+| Repeated abandoned browses reuse pinned stable-ID slots          | `composer.test.ts` |
+| Slots retained by ordinary native redo are not recycled          | `composer.test.ts` |
+| Native replacement failure restores the previous zipper          | `composer.test.ts` |
+| New source append during browse does not shift visited path      | `composer.test.ts` |
 
 ## Interactive behavior
 
-| Behavior                                                       | Test                                     |
-| -------------------------------------------------------------- | ---------------------------------------- |
-| Real committed session messages are recalled                   | `prompt-history.test.ts`                 |
-| Default Up/Down drive the Composer                             | `prompt-history.test.ts`                 |
-| Effective overrides drive history                              | `prompt-history.test.ts`                 |
-| Disabled binding leaves native cursor movement only            | `prompt-history.test.ts`                 |
-| Command/model/settings picker navigation wins                  | `prompt-history.test.ts`                 |
-| Auth and non-idle workflows do not expose history              | `prompt-history.test.ts`                 |
-| Queued input remains absent until committed                    | `prompt-history.test.ts`                 |
-| Alt+Up queue restoration remains unchanged                     | existing queue test plus history fixture |
-| Compacted restored session recalls pre-marker input            | `prompt-history.test.ts`                 |
-| Session replacement switches catalogs and resets browse        | `prompt-history.test.ts`                 |
-| Recalled draft attachment state clears and restores coherently | `prompt-history.test.ts`                 |
-| Focus remains on the sole Composer textarea                    | `prompt-history.test.ts`                 |
+| Behavior                                                        | Test                                     |
+| --------------------------------------------------------------- | ---------------------------------------- |
+| Real committed session messages are recalled                    | `prompt-history.test.ts`                 |
+| Default Up/Down drive Composer only at history boundaries       | `prompt-history.test.ts`                 |
+| Interior Up/Down reaches the native textarea with sticky column | `prompt-history.test.ts`                 |
+| Effective overrides intercept only at history boundaries        | `prompt-history.test.ts`                 |
+| Disabled binding leaves native cursor movement only             | `prompt-history.test.ts`                 |
+| Command/model/settings picker navigation wins                   | `prompt-history.test.ts`                 |
+| Auth and non-idle workflows do not expose history               | `prompt-history.test.ts`                 |
+| Queued input remains absent until committed                     | `prompt-history.test.ts`                 |
+| Alt+Up queue restoration remains unchanged                      | existing queue test plus history fixture |
+| Compacted restored session recalls pre-marker input             | `prompt-history.test.ts`                 |
+| Session replacement switches catalogs and resets browse         | `prompt-history.test.ts`                 |
+| Recalled draft attachment state clears and restores coherently  | `prompt-history.test.ts`                 |
+| Focus remains on the sole Composer textarea                     | `prompt-history.test.ts`                 |
 
 Tests assert state, text, cursor, extmark payloads, stable IDs, and native behavior. They do not use wall-clock performance thresholds.
 
@@ -683,7 +690,7 @@ Saving a JavaScript draft snapshot and using `setText()` is rejected. `setText()
 
 ## Unconditional Up/Down interception
 
-Replacing text whenever Up/Down is pressed is rejected. It breaks multiline editing and wrapped-line navigation. History is admitted only at native buffer boundaries.
+Replacing text whenever Up/Down is pressed is rejected. Consuming every history chord and manually invoking `moveCursorUp/Down()` for interior rows is also rejected: although it reaches the same movement primitive, product routing unnecessarily claims native mechanics and makes rebound history chords behave like arrows. History is admitted only at native buffer boundaries; ordinary movement receives the original event.
 
 ## Historical attachment recall now
 
@@ -700,7 +707,7 @@ The capability is complete when:
 - [x] no TUI owner retains a copied history list;
 - [x] default and overridden semantic bindings work;
 - [x] picker and workflow precedence is fixed by tests;
-- [x] multiline and wrapped cursor movement remains native;
+- [x] multiline and wrapped cursor movement receives the original native key event;
 - [x] oldest/newest traversal does not wrap;
 - [x] Down past newest restores exact draft text, cursor, paste markers, and image markers;
 - [x] ordinary edits and external replacement release browsing state;
