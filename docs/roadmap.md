@@ -19,18 +19,19 @@ The current product milestone is the [`custom-tool extension golden path`](exten
 
 - [x] Add a release-shaped, self-hosted Bun worker probe.
 - [x] Prove the candidate locally on macOS arm64 with Bun 1.3.14.
-- [ ] Run the probe on all five release targets.
-- [ ] Record the selected self-hosted Bun or supervised Node mechanism in an ADR.
-- [ ] Delete the probe and its temporary workflow after the ADR lands.
+- [x] Run the probe on all five release targets.
+- [x] Record the selected self-hosted Bun mechanism and portable process pipes in ADR 0021.
+- [x] Delete the probe and its temporary workflow after the ADR lands.
 
 ### 3. Admit trusted extension sources
 
 - [x] Add bounded global persistence for canonical cwd trust decisions and nearest-parent inheritance.
 - [x] Detect exact project configuration that requires trust without reading its contents.
-- [ ] Add the cwd-keyed project-trust resolution state and interactive/runtime decisions.
-- [ ] Gate project settings, resources, and extensions through the same decision.
+- [x] Add cwd-keyed project-trust resolution and process-local runtime decisions.
+- [x] Give project settings, resources, and extension discovery one admission value.
 - [x] Add deterministic bounded global, project, and explicit source discovery.
-- [ ] Present trust in interactive mode; exclude unresolved project sources with a diagnostic in headless modes.
+- [x] Exclude unresolved project configuration with a diagnostic in headless modes.
+- [ ] Present and remember cwd-keyed project-trust decisions in interactive mode.
 
 ### 4. Supervise one lifecycle generation
 

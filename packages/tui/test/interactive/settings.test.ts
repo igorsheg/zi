@@ -257,6 +257,7 @@ async function createSettingsFixture(
     agentDir,
     model: "settings/model",
     models,
+    projectTrust: { type: "trusted", cwd, source: "runtime" },
     session: { type: "new", persist: false }
   })
   const setup = await createInteractiveTest(session, { width: 100, height: 18, kittyKeyboard: true })

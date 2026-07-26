@@ -191,7 +191,7 @@ test("caller-supplied services keep a low-level session in memory", async () => 
     settingsManager: new SettingsManager(),
     credentialStore: new FileCredentialStore(paths),
     modelRegistry: new ModelRegistry(models),
-    resourceLoader: new ResourceLoader({ paths })
+    resourceLoader: new ResourceLoader({ paths, project: "trusted" })
   })
   const { session } = await createAgentSession({
     services,

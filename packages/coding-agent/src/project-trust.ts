@@ -20,6 +20,41 @@ export const maxProjectTrustFileBytes = 1024 * 1024
 export const maxProjectTrustDecisions = 1024
 export const maxProjectTrustPathBytes = 4096
 
+export type ProjectConfigurationAdmission = "trusted" | "untrusted" | "absent"
+
+export type ProjectTrustDecision =
+  | { readonly type: "trusted"; readonly cwd: string; readonly source: "interactive" | "runtime" }
+  | { readonly type: "untrusted"; readonly cwd: string; readonly source: "interactive" | "runtime" }
+
+export interface ProjectTrustDiagnostic {
+  readonly cwd: string
+  readonly path: string
+  readonly message: string
+}
+
+export type ProjectTrustResolution =
+  | {
+      readonly type: "not_required"
+      readonly cwd: string
+      readonly reason: "no_project_configuration" | "project_configuration_is_global"
+      readonly diagnostic?: never
+    }
+  | { readonly type: "unresolved"; readonly cwd: string; readonly diagnostic: ProjectTrustDiagnostic }
+  | {
+      readonly type: "trusted"
+      readonly cwd: string
+      readonly source: "stored" | "interactive" | "runtime"
+      readonly savedCwd?: string
+      readonly diagnostic?: never
+    }
+  | {
+      readonly type: "untrusted"
+      readonly cwd: string
+      readonly source: "stored" | "interactive" | "runtime"
+      readonly savedCwd?: string
+      readonly diagnostic?: ProjectTrustDiagnostic
+    }
+
 export type StoredProjectTrust =
   | { readonly type: "unresolved"; readonly cwd: string }
   | { readonly type: "trusted"; readonly cwd: string; readonly savedCwd: string }
@@ -90,6 +125,73 @@ export class ProjectTrustStore {
   }
 }
 
+export async function resolveProjectTrust(
+  paths: ZiPaths,
+  decision?: ProjectTrustDecision
+): Promise<ProjectTrustResolution> {
+  const cwd = canonicalProjectPath(paths.cwd)
+  if (decision !== undefined) {
+    validateProjectTrustDecision(decision)
+    const decisionCwd = canonicalProjectPath(decision.cwd)
+    if (decisionCwd !== cwd) {
+      throw new Error(`Project trust decision for ${decisionCwd} does not match runtime cwd ${cwd}`)
+    }
+  }
+  if (paths.projectConfigIsGlobal) {
+    return Object.freeze({ type: "not_required", cwd, reason: "project_configuration_is_global" })
+  }
+
+  const hasProjectConfiguration = hasTrustRequiringProjectConfiguration(paths)
+  if (decision !== undefined) {
+    if (decision.type === "trusted") {
+      return Object.freeze({ type: "trusted", cwd, source: decision.source })
+    }
+    return Object.freeze({
+      type: "untrusted",
+      cwd,
+      source: decision.source,
+      ...(hasProjectConfiguration ? { diagnostic: untrustedDiagnostic(paths, cwd) } : {})
+    })
+  }
+
+  let stored: StoredProjectTrust
+  try {
+    stored = await new ProjectTrustStore(paths).lookup(cwd)
+  } catch (cause) {
+    const diagnostic = Object.freeze({
+      cwd,
+      path: paths.trustFile,
+      message: `Project configuration was ignored because project trust could not be read: ${errorMessage(cause)}`
+    })
+    return Object.freeze({ type: "unresolved", cwd, diagnostic })
+  }
+
+  if (stored.type === "trusted") {
+    return Object.freeze({ type: "trusted", cwd, source: "stored", savedCwd: stored.savedCwd })
+  }
+  if (stored.type === "untrusted") {
+    return Object.freeze({
+      type: "untrusted",
+      cwd,
+      source: "stored",
+      savedCwd: stored.savedCwd,
+      ...(hasProjectConfiguration ? { diagnostic: untrustedDiagnostic(paths, cwd) } : {})
+    })
+  }
+  if (!hasProjectConfiguration) {
+    return Object.freeze({ type: "not_required", cwd, reason: "no_project_configuration" })
+  }
+  return Object.freeze({ type: "unresolved", cwd, diagnostic: unresolvedDiagnostic(paths, cwd) })
+}
+
+export function projectConfigurationAdmission(trust: ProjectTrustResolution): ProjectConfigurationAdmission {
+  if (trust.type === "trusted") return "trusted"
+  if (trust.type === "not_required") {
+    return trust.reason === "project_configuration_is_global" ? "trusted" : "absent"
+  }
+  return "untrusted"
+}
+
 export function hasTrustRequiringProjectConfiguration(paths: ZiPaths): boolean {
   if (paths.projectConfigIsGlobal) return false
   return [
@@ -101,6 +203,33 @@ export function hasTrustRequiringProjectConfiguration(paths: ZiPaths): boolean {
     paths.projectResourceDir("prompts"),
     paths.projectResourceDir("themes")
   ].some(existsSync)
+}
+
+function validateProjectTrustDecision(decision: unknown): asserts decision is ProjectTrustDecision {
+  if (!isRecord(decision)) throw new Error("Project trust decisions must be objects")
+  if (decision.type !== "trusted" && decision.type !== "untrusted") {
+    throw new Error(`Unknown project trust decision: ${String(decision.type)}`)
+  }
+  if (typeof decision.cwd !== "string") throw new Error("Project trust decisions require a cwd")
+  if (decision.source !== "interactive" && decision.source !== "runtime") {
+    throw new Error(`Unknown project trust decision source: ${String(decision.source)}`)
+  }
+}
+
+function untrustedDiagnostic(paths: ZiPaths, cwd: string): ProjectTrustDiagnostic {
+  return Object.freeze({
+    cwd,
+    path: paths.projectDir,
+    message: `Project configuration is not trusted and was ignored: ${paths.projectDir}`
+  })
+}
+
+function unresolvedDiagnostic(paths: ZiPaths, cwd: string): ProjectTrustDiagnostic {
+  return Object.freeze({
+    cwd,
+    path: paths.projectDir,
+    message: `Project configuration trust is unresolved and was ignored: ${paths.projectDir}`
+  })
 }
 
 function canonicalProjectPath(path: string): string {
@@ -187,4 +316,8 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function hasCode(error: unknown, code: string): boolean {
   return isRecord(error) && error.code === code
+}
+
+function errorMessage(cause: unknown): string {
+  return cause instanceof Error ? cause.message : String(cause)
 }

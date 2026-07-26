@@ -153,6 +153,9 @@ export async function runCli(argv: readonly string[], host: CliHost): Promise<nu
 
   let exitCode: number
   try {
+    if (runtime.projectTrust.diagnostic) {
+      await host.writeStderr(`Warning: ${runtime.projectTrust.diagnostic.message}\n`)
+    }
     for (const diagnostic of runtime.services.settingsManager.drainErrors()) {
       // Keep scoped diagnostics ordered on the single stderr writer.
       // oxlint-disable-next-line no-await-in-loop

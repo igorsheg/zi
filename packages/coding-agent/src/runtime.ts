@@ -5,6 +5,7 @@ import { FileCredentialStore } from "./credential-store.js"
 import { ModelRegistry } from "./model-registry.js"
 import { resolveRequestedModel } from "./model-resolver.js"
 import { getAgentDir, ZiPaths } from "./paths.js"
+import { projectConfigurationAdmission, resolveProjectTrust, type ProjectTrustResolution } from "./project-trust.js"
 import { ResourceLoader } from "./resource-loader.js"
 import {
   snapshotAgentRuntimeOptions,
@@ -24,6 +25,7 @@ export type AgentRuntimeServices = AgentSessionServices
 export interface AgentRuntime {
   readonly session: AgentSession
   readonly services: AgentRuntimeServices
+  readonly projectTrust: ProjectTrustResolution
   readonly bootstrapDiagnostic: SessionBootstrapDiagnostic | undefined
 }
 
@@ -37,12 +39,15 @@ export async function createAgentRuntime(requested: CreateAgentRuntimeOptions): 
   const cwd = selected.type === "resumed" ? selected.manager.header.cwd : options.cwd
   const sessionDir = options.sessionDir ?? (selected.type === "resumed" ? selected.manager.sessionDir : undefined)
   const paths = new ZiPaths(cwd, agentDir, sessionDir)
-  const settingsManager = SettingsManager.create(paths, options.settings ?? {})
+  const projectTrust = await resolveProjectTrust(paths, options.projectTrust)
+  const project = projectConfigurationAdmission(projectTrust)
+  const settingsManager = SettingsManager.create(paths, project, options.settings ?? {})
   const credentialStore = new FileCredentialStore(paths)
   const models = options.modelFactory?.(credentialStore) ?? builtinModels({ credentials: credentialStore })
   const modelRegistry = new ModelRegistry(models)
   const resourceLoader = new ResourceLoader({
     paths,
+    project,
     ...(options.systemPrompt === undefined ? {} : { systemPrompt: options.systemPrompt }),
     ...(options.appendSystemPrompt === undefined ? {} : { appendSystemPrompt: options.appendSystemPrompt })
   })
@@ -73,7 +78,12 @@ export async function createAgentRuntime(requested: CreateAgentRuntimeOptions): 
     ...(options.apiKey ? { apiKey: options.apiKey } : {}),
     tools: createCodingTools({ cwd: paths.cwd, shell })
   })
-  return Object.freeze({ session: created.session, services, bootstrapDiagnostic: created.bootstrapDiagnostic })
+  return Object.freeze({
+    session: created.session,
+    services,
+    projectTrust,
+    bootstrapDiagnostic: created.bootstrapDiagnostic
+  })
 }
 
 const defaultRuntimeSession: AgentRuntimeSessionIntent = Object.freeze({ type: "new", persist: true })

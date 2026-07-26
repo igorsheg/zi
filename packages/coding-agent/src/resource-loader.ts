@@ -2,6 +2,7 @@ import { existsSync } from "node:fs"
 import { dirname, join } from "node:path"
 
 import type { ZiPaths } from "./paths.js"
+import type { ProjectConfigurationAdmission } from "./project-trust.js"
 import { loadPromptTemplates, type PromptTemplate } from "./prompt-templates.js"
 import { ResourceDiagnostics, type ResourceDiagnostic, type ResourceKind } from "./resource-diagnostics.js"
 import {
@@ -42,17 +43,23 @@ export interface CreateSessionResourcesOptions {
 
 export interface ResourceLoaderOptions {
   readonly paths: ZiPaths
+  readonly project: ProjectConfigurationAdmission
   readonly systemPrompt?: string
   readonly appendSystemPrompt?: readonly string[]
 }
 
 export class ResourceLoader {
   readonly #paths: ZiPaths
+  readonly #projectConfigurationAdmitted: boolean
   readonly #systemPrompt: string | undefined
   readonly #appendSystemPrompt: readonly string[] | undefined
 
   constructor(options: ResourceLoaderOptions) {
+    if (options.project !== "trusted" && options.project !== "untrusted" && options.project !== "absent") {
+      throw new Error(`Unknown project configuration admission: ${String(options.project)}`)
+    }
     this.#paths = options.paths
+    this.#projectConfigurationAdmitted = options.project === "trusted" && !options.paths.projectConfigIsGlobal
     this.#systemPrompt = options.systemPrompt
     this.#appendSystemPrompt = options.appendSystemPrompt ? [...options.appendSystemPrompt] : undefined
   }
@@ -63,7 +70,7 @@ export class ResourceLoader {
     const systemPrompt =
       this.#systemPrompt === undefined
         ? readPreferred(
-            this.#paths.projectSystemPromptFile,
+            this.#projectConfigurationAdmitted ? this.#paths.projectSystemPromptFile : undefined,
             this.#paths.globalSystemPromptFile,
             "system-prompt",
             budget,
@@ -74,7 +81,7 @@ export class ResourceLoader {
       this.#appendSystemPrompt === undefined
         ? asList(
             readPreferred(
-              this.#paths.projectAppendSystemPromptFile,
+              this.#projectConfigurationAdmitted ? this.#paths.projectAppendSystemPromptFile : undefined,
               this.#paths.globalAppendSystemPromptFile,
               "append-system-prompt",
               budget,
@@ -87,14 +94,18 @@ export class ResourceLoader {
           })
     const contextFiles = loadContextFiles(this.#paths, budget, diagnostics)
     const roots = [
-      { path: this.#paths.projectResourceDir("skills"), scope: "project" as const },
+      ...(this.#projectConfigurationAdmitted
+        ? [{ path: this.#paths.projectResourceDir("skills"), scope: "project" as const }]
+        : []),
       { path: this.#paths.globalResourceDir("skills"), scope: "global" as const }
     ]
     const skills = loadSkills(roots, budget, diagnostics)
     const promptTemplates = loadPromptTemplates(
       [
-        { path: this.#paths.projectResourceDir("prompts"), scope: "project" },
-        { path: this.#paths.globalResourceDir("prompts"), scope: "global" }
+        ...(this.#projectConfigurationAdmitted
+          ? [{ path: this.#paths.projectResourceDir("prompts"), scope: "project" as const }]
+          : []),
+        { path: this.#paths.globalResourceDir("prompts"), scope: "global" as const }
       ],
       budget,
       diagnostics
@@ -197,14 +208,14 @@ function readContextFile(
 }
 
 function readPreferred(
-  projectPath: string,
+  projectPath: string | undefined,
   globalPath: string,
   resource: "system-prompt" | "append-system-prompt",
   budget: SessionResourceBudget,
   diagnostics: ResourceDiagnostics
 ): string | undefined {
   for (const path of [projectPath, globalPath]) {
-    if (!existsSync(path)) continue
+    if (path === undefined || !existsSync(path)) continue
     const content = readFile(path, resource, budget, diagnostics)
     if (content !== undefined) return content
   }

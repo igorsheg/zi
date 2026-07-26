@@ -40,7 +40,7 @@ test("session resources follow cwd-bound Pi discovery and precedence", async () 
     "---\ndescription: Project commit\nargument-hint: <path>\n---\nProject $1"
   )
 
-  const resources = await new ResourceLoader({ paths }).load()
+  const resources = await new ResourceLoader({ paths, project: "trusted" }).load()
 
   expect(resources.systemPrompt).toBe("project system")
   expect(resources.appendSystemPrompt).toEqual(["project append"])
@@ -87,7 +87,7 @@ test("skill recursion and prompt discovery match Pi rules", async () => {
   await writeFile(join(prompts, "top.md"), "Top prompt")
   await writeFile(join(prompts, "nested", "hidden.md"), "Must not load")
 
-  const resources = await new ResourceLoader({ paths }).load()
+  const resources = await new ResourceLoader({ paths, project: "trusted" }).load()
 
   expect(resources.skills.map(skill => skill.name)).toEqual(["nested", "root"])
   expect(resources.promptTemplates.map(prompt => prompt.name)).toEqual(["top"])
@@ -110,7 +110,7 @@ test("canonical skill and prompt paths load once through project and global syml
   await symlink(sharedPrompt, join(paths.projectResourceDir("prompts"), "review.md"))
   await symlink(sharedPrompt, join(paths.globalResourceDir("prompts"), "review.md"))
 
-  const resources = await new ResourceLoader({ paths }).load()
+  const resources = await new ResourceLoader({ paths, project: "trusted" }).load()
 
   expect(resources.skills.map(skill => [skill.name, skill.scope])).toEqual([["shared", "project"]])
   expect(resources.promptTemplates.map(prompt => [prompt.name, prompt.scope])).toEqual([["review", "project"]])
@@ -134,7 +134,7 @@ test("session resource catalog and retained-byte bounds omit further candidates 
     }).flat()
   )
 
-  const catalog = await new ResourceLoader({ paths }).load()
+  const catalog = await new ResourceLoader({ paths, project: "trusted" }).load()
 
   expect(catalog.skills).toHaveLength(256)
   expect(catalog.promptTemplates).toHaveLength(256)
@@ -153,7 +153,8 @@ test("session resource catalog and retained-byte bounds omit further candidates 
     })
   )
   const retained = await new ResourceLoader({
-    paths: new ZiPaths(retainedDirectories.at(-1)!, join(root, "empty-global"))
+    paths: new ZiPaths(retainedDirectories.at(-1)!, join(root, "empty-global")),
+    project: "trusted"
   }).load()
   expect(retained.contextFiles).toHaveLength(8)
   expect(retained.diagnostics).toContainEqual(
@@ -171,12 +172,50 @@ test("context discovery stops at its file-count bound", async () => {
     })
   )
 
-  const resources = await new ResourceLoader({ paths: new ZiPaths(directories.at(-1)!, join(root, "global")) }).load()
+  const resources = await new ResourceLoader({
+    paths: new ZiPaths(directories.at(-1)!, join(root, "global")),
+    project: "trusted"
+  }).load()
 
   expect(resources.contextFiles).toHaveLength(128)
   expect(resources.diagnostics).toContainEqual(
     expect.objectContaining({ type: "limit", resource: "context", limit: 128 })
   )
+})
+
+test("excluded project resources stay unread while contextual instructions remain", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-resource-untrusted-"))
+  const cwd = join(root, "project")
+  const paths = new ZiPaths(cwd, join(root, "global"))
+  await mkdir(paths.projectDir, { recursive: true })
+  await mkdir(paths.globalDir, { recursive: true })
+  const absentLoader = new ResourceLoader({ paths, project: "absent" })
+  await writeFile(join(cwd, "AGENTS.md"), "context remains admitted")
+  await writeFile(paths.projectSystemPromptFile, "project system")
+  await writeFile(paths.globalSystemPromptFile, "global system")
+  await writeFile(paths.projectAppendSystemPromptFile, "project append")
+  await writeFile(paths.globalAppendSystemPromptFile, "global append")
+  await writeSkill(join(paths.projectResourceDir("skills"), "review", "SKILL.md"), "review", "Project review")
+  await writeSkill(join(paths.globalResourceDir("skills"), "review", "SKILL.md"), "review", "Global review")
+  await mkdir(paths.projectResourceDir("prompts"), { recursive: true })
+  await mkdir(paths.globalResourceDir("prompts"), { recursive: true })
+  await writeFile(join(paths.projectResourceDir("prompts"), "commit.md"), "Project prompt")
+  await writeFile(join(paths.globalResourceDir("prompts"), "commit.md"), "Global prompt")
+
+  const resources = await new ResourceLoader({ paths, project: "untrusted" }).load()
+  const raced = await absentLoader.load()
+
+  expect(resources.systemPrompt).toBe("global system")
+  expect(resources.appendSystemPrompt).toEqual(["global append"])
+  expect(resources.contextFiles).toContainEqual({ path: join(cwd, "AGENTS.md"), content: "context remains admitted" })
+  expect(resources.skills.map(skill => [skill.name, skill.description, skill.scope])).toEqual([
+    ["review", "Global review", "global"]
+  ])
+  expect(resources.promptTemplates.map(prompt => [prompt.name, prompt.content, prompt.scope])).toEqual([
+    ["commit", "Global prompt", "global"]
+  ])
+  expect(resources.diagnostics.filter(diagnostic => diagnostic.type === "collision")).toEqual([])
+  expect(raced).toEqual(resources)
 })
 
 test("invalid project resources diagnose and fall back to valid global resources", async () => {
@@ -193,7 +232,7 @@ test("invalid project resources diagnose and fall back to valid global resources
   await writeFile(join(paths.projectResourceDir("prompts"), "review.md"), "---\ninvalid: [\n---\nProject")
   await writeFile(join(paths.globalResourceDir("prompts"), "review.md"), "Global review")
 
-  const resources = await new ResourceLoader({ paths }).load()
+  const resources = await new ResourceLoader({ paths, project: "trusted" }).load()
 
   expect(resources.systemPrompt).toBe("global fallback")
   expect(resources.skills.map(skill => [skill.name, skill.scope])).toEqual([["deploy", "global"]])

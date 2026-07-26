@@ -1,6 +1,7 @@
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core"
 import type { CredentialStore, Models } from "@earendil-works/pi-ai"
 
+import type { ProjectTrustDecision } from "./project-trust.js"
 import type { AgentSettings } from "./settings-manager.js"
 
 export type AgentRuntimeSessionIntent =
@@ -19,6 +20,7 @@ export interface CreateAgentRuntimeOptions {
   readonly agentDir?: string
   readonly sessionDir?: string
   readonly session?: AgentRuntimeSessionIntent
+  readonly projectTrust?: ProjectTrustDecision
   readonly settings?: Readonly<Partial<AgentSettings>>
 }
 
@@ -26,6 +28,7 @@ export function snapshotAgentRuntimeOptions(options: CreateAgentRuntimeOptions):
   return Object.freeze({
     ...options,
     ...(options.session === undefined ? {} : { session: snapshotSession(options.session) }),
+    ...(options.projectTrust === undefined ? {} : { projectTrust: Object.freeze({ ...options.projectTrust }) }),
     ...(options.appendSystemPrompt === undefined
       ? {}
       : { appendSystemPrompt: Object.freeze([...options.appendSystemPrompt]) }),

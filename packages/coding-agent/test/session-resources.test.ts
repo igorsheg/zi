@@ -51,6 +51,7 @@ test("AgentSession owns resource catalogs, prompt construction, and command expa
     cwd,
     agentDir: globalDir,
     models,
+    projectTrust: { type: "trusted", cwd, source: "runtime" },
     session: { type: "new", persist: false }
   })
 
@@ -105,6 +106,7 @@ test("steering and follow-up queues retain expanded resource input", async () =>
     cwd,
     agentDir: paths.globalDir,
     models,
+    projectTrust: { type: "trusted", cwd, source: "runtime" },
     session: { type: "new", persist: false }
   })
 

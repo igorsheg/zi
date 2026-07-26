@@ -181,7 +181,13 @@ test("follow-up mode mutation persists project scope and updates live behavior",
 
   const models = createModels()
   models.setProvider(fauxProvider().provider)
-  const { session } = await createAgentRuntime({ cwd, agentDir, models, session: { type: "new", persist: false } })
+  const { session } = await createAgentRuntime({
+    cwd,
+    agentDir,
+    models,
+    projectTrust: { type: "trusted", cwd, source: "runtime" },
+    session: { type: "new", persist: false }
+  })
 
   expect(session.followUpMode).toBe("one-at-a-time")
   expect(session.setFollowUpMode("all", "project")).toEqual({ scope: "project", requested: "all", effective: "all" })
@@ -205,7 +211,13 @@ test("queue mode events publish only effective layered changes", async () => {
 
   const models = createModels()
   models.setProvider(fauxProvider().provider)
-  const { session } = await createAgentRuntime({ cwd, agentDir, models, session: { type: "new", persist: false } })
+  const { session } = await createAgentRuntime({
+    cwd,
+    agentDir,
+    models,
+    projectTrust: { type: "trusted", cwd, source: "runtime" },
+    session: { type: "new", persist: false }
+  })
   const changes: string[] = []
   session.subscribe(event => {
     if (event.type === "steering_mode_changed") changes.push(event.mode)
@@ -275,7 +287,13 @@ test("settings persistence failure leaves live queue modes unchanged", async () 
 
   const models = createModels()
   models.setProvider(fauxProvider().provider)
-  const { session } = await createAgentRuntime({ cwd, agentDir, models, session: { type: "new", persist: false } })
+  const { session } = await createAgentRuntime({
+    cwd,
+    agentDir,
+    models,
+    projectTrust: { type: "trusted", cwd, source: "runtime" },
+    session: { type: "new", persist: false }
+  })
   let changes = 0
   session.subscribe(event => {
     if (event.type === "follow_up_mode_changed") changes++
@@ -300,6 +318,7 @@ test("recreated runtimes restore persisted queue modes", async () => {
     cwd,
     agentDir,
     models: firstModels,
+    projectTrust: { type: "trusted", cwd, source: "runtime" },
     session: { type: "new", persist: false }
   })
   first.session.setSteeringMode("all", "global")
@@ -312,6 +331,7 @@ test("recreated runtimes restore persisted queue modes", async () => {
     cwd,
     agentDir,
     models: secondModels,
+    projectTrust: { type: "trusted", cwd, source: "runtime" },
     session: { type: "new", persist: false }
   })
   expect(second.session.steeringMode).toBe("all")

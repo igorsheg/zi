@@ -179,6 +179,7 @@ test("thinking mutations report an effective project override without false even
     agentDir,
     model: "thinking-shadow/model",
     models,
+    projectTrust: { type: "trusted", cwd, source: "runtime" },
     session: { type: "new", persist: false }
   })
   const events: string[] = []

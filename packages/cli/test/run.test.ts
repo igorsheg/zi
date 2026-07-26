@@ -233,6 +233,42 @@ test("headless startup writes model fallback diagnostics to stderr", async () =>
   ])
 })
 
+test("headless startup reports excluded project configuration without contaminating stdout", async () => {
+  const models = createModels()
+  const faux = fauxProvider()
+  models.setProvider(faux.provider)
+  faux.setResponses([fauxAssistantMessage("done")])
+  const output: string[] = []
+  const errors: string[] = []
+  const host = testHost({
+    output,
+    errors,
+    async createRuntime(options) {
+      const runtime = await createTestAgentRuntime({ ...options, models })
+      return {
+        ...runtime,
+        projectTrust: {
+          type: "unresolved",
+          cwd: options.cwd,
+          diagnostic: {
+            cwd: options.cwd,
+            path: join(options.cwd, ".zi"),
+            message: `Project configuration trust is unresolved and was ignored: ${join(options.cwd, ".zi")}`
+          }
+        }
+      }
+    }
+  })
+
+  const exitCode = await runCli(["-p", "--model", `${faux.getModel().provider}/${faux.getModel().id}`, "start"], host)
+
+  expect(exitCode).toBe(0)
+  expect(output).toEqual(["done\n"])
+  expect(errors).toEqual([
+    `Warning: Project configuration trust is unresolved and was ignored: ${join(resolvePath("/work"), ".zi")}\n`
+  ])
+})
+
 test("JSON mode emits only parseable JSONL without loading the TUI", async () => {
   const models = createModels()
   const faux = fauxProvider()

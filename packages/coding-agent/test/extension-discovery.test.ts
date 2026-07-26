@@ -53,7 +53,7 @@ test("extension directory resolution falls back when index.ts is not a file", as
   expect(result.plan.sources[0]?.entryPath.endsWith("index.js")).toBe(true)
 })
 
-test("untrusted extension discovery never reads or diagnoses the project directory", async () => {
+test("excluded extension discovery never reads or diagnoses the project directory", async () => {
   const root = await mkdtemp(join(tmpdir(), "zi-extension-untrusted-"))
   const paths = new ZiPaths(join(root, "project"), join(root, "global"))
   await mkdir(paths.projectDir, { recursive: true })
@@ -61,10 +61,11 @@ test("untrusted extension discovery never reads or diagnoses the project directo
   await mkdir(paths.globalResourceDir("extensions"), { recursive: true })
   await writeFile(join(paths.globalResourceDir("extensions"), "global.ts"), "export default () => {}")
 
-  const result = discoverExtensionLoadPlan(paths, "untrusted")
-
-  expect(result.plan.sources.map(source => source.scope)).toEqual(["global"])
-  expect(result.diagnostics.some(diagnostic => diagnostic.path.startsWith(paths.projectDir))).toBe(false)
+  for (const admission of ["untrusted", "absent"] as const) {
+    const result = discoverExtensionLoadPlan(paths, admission)
+    expect(result.plan.sources.map(source => source.scope)).toEqual(["global"])
+    expect(result.diagnostics.some(diagnostic => diagnostic.path.startsWith(paths.projectDir))).toBe(false)
+  }
 })
 
 test("coincident global and project extension roots retain global admission and identity", async () => {

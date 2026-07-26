@@ -1,6 +1,6 @@
 # Extension system infrastructure implementation spec
 
-- Status: in progress — Slice A complete and Slice B trust foundation
+- Status: in progress — Slices A and B complete
 - Pi behavior reference: `badlogic/pi-mono` at Zi's pinned `0e6909f0` (`v0.80.6`)
 - Current Pi comparison: `fc85bdd88be93b1e9a6b6bcfa41c684282ec79cc`
 - Project-trust comparison: `5bc1c2c0a6f07e00e8c240304182f213ab8d311f`
@@ -148,7 +148,7 @@ A coding-agent project-trust owner decides whether project configuration is admi
 
 Extension-only trust is forbidden. Zi must not execute project extensions while applying or rejecting other project configuration through a separate decision.
 
-`ZiPaths.trustFile` resolves the bounded global `trust.json`. `ProjectTrustStore` owns canonical cwd persistence, locked atomic updates, and nearest-parent lookup. A bare project `.zi` directory and contextual `AGENTS.md`/`CLAUDE.md` files do not require project trust; exact project settings, system prompts, skills, prompts, themes, and extensions do. Persisted-store failure remains an unresolved safe state for the later resolver to diagnose; it never admits project configuration.
+`ZiPaths.trustFile` resolves the bounded global `trust.json`. `ProjectTrustStore` owns canonical cwd persistence, locked atomic updates, and nearest-parent lookup. A bare project `.zi` directory and contextual `AGENTS.md`/`CLAUDE.md` files do not require project trust; exact project settings, system prompts, skills, prompts, themes, and extensions do. Persisted-store failure remains an unresolved safe state that the resolver diagnoses; it never admits project configuration.
 
 ### 6.3 `ExtensionHost`
 
@@ -205,21 +205,29 @@ Do not create a separate package solely to hold the private protocol.
 
 ## 7. Project trust and source admission
 
-### 7.1 Trust states
+### 7.1 Trust resolution
 
-The project-trust owner uses an explicit state:
+Runtime construction awaits one immutable resolution for its canonical cwd:
 
 ```ts
-type ProjectTrustState =
-  | { type: "unresolved"; cwd: string }
-  | { type: "resolving"; cwd: string; operationId: number }
-  | { type: "trusted"; cwd: string; source: "stored" | "interactive" | "runtime" }
-  | { type: "untrusted"; cwd: string; source: "stored" | "interactive" | "runtime" }
+type ProjectTrustResolution =
+  | { type: "not_required"; cwd: string; reason: "no_project_configuration" | "project_configuration_is_global" }
+  | { type: "unresolved"; cwd: string; diagnostic: ProjectTrustDiagnostic }
+  | { type: "trusted"; cwd: string; source: "stored" | "interactive" | "runtime"; savedCwd?: string }
+  | {
+      type: "untrusted"
+      cwd: string
+      source: "stored" | "interactive" | "runtime"
+      savedCwd?: string
+      diagnostic?: ProjectTrustDiagnostic
+    }
 ```
 
-Trust is keyed by canonical cwd. Persisted trust input is bounded and validated before admission. Stored decisions live only in global `trust.json`; the nearest exact or parent decision applies. Interactive and runtime decisions may remain process-local, while only an explicit remember operation mutates the store.
+Trust is keyed by canonical cwd. Persisted trust input is bounded and validated before admission. Stored decisions live only in global `trust.json`; the nearest exact or parent decision applies. Process-local interactive and runtime decisions carry their exact cwd, so a decision cannot cross session replacement into another project. Only an explicit remember operation mutates the store.
 
-Global and explicit CLI extensions are already user-admitted. Project extensions require `trusted`. In noninteractive modes, unresolved project trust excludes project configuration unless a stored or runtime decision exists and emits a diagnostic.
+The resolution becomes one `trusted | untrusted | absent` project-configuration admission shared by settings, resources, and extension discovery. `absent` means protected configuration did not exist at resolution: owners still do not scan project paths, but an explicit project-settings write may atomically create a new file and must fail if a file raced into place. Coincident global/project configuration is `not_required` and admitted only through global scope.
+
+Global and explicit CLI extensions are already user-admitted. Project extensions require `trusted`. In noninteractive modes, unresolved or untrusted protected project configuration is excluded and emits a diagnostic.
 
 Global extensions may participate in trust decisions in a later event slice. The initial infrastructure uses Zi's built-in trust resolver only.
 
@@ -772,7 +780,7 @@ Progress:
 - [x] `ZiPaths`-owned global trust path;
 - [x] bounded canonical persistence with nearest-parent lookup;
 - [x] exact protected-project-configuration detection;
-- [ ] trust resolution and coordinated project gating;
+- [x] trust resolution and coordinated project gating;
 - [x] bounded immutable extension discovery.
 
 Likely files:

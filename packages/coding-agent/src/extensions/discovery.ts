@@ -3,14 +3,13 @@ import { closeSync, openSync, statSync } from "node:fs"
 import { isAbsolute, join, resolve } from "node:path"
 
 import type { ZiPaths } from "../paths.js"
+import type { ProjectConfigurationAdmission } from "../project-trust.js"
 import { canonicalResourcePath, readResourceDirectory } from "../resource-files.js"
 
 export const maxExtensionSources = 128
 export const maxExplicitExtensionPaths = 128
 export const maxExtensionPathBytes = 4096
 export const maxExtensionDiscoveryDiagnostics = 256
-
-export type ProjectExtensionAdmission = "trusted" | "untrusted"
 
 export interface ExtensionSource {
   readonly id: string
@@ -53,8 +52,8 @@ class Discovery {
 
   constructor(readonly paths: ZiPaths) {}
 
-  run(project: ProjectExtensionAdmission, explicitPaths: readonly string[]): ExtensionDiscoveryResult {
-    if (project !== "trusted" && project !== "untrusted") {
+  run(project: ProjectConfigurationAdmission, explicitPaths: readonly string[]): ExtensionDiscoveryResult {
+    if (project !== "trusted" && project !== "untrusted" && project !== "absent") {
       throw new Error(`Unknown project extension admission: ${String(project)}`)
     }
 
@@ -302,7 +301,7 @@ class Discovery {
 
 export function discoverExtensionLoadPlan(
   paths: ZiPaths,
-  project: ProjectExtensionAdmission,
+  project: ProjectConfigurationAdmission,
   explicitPaths: readonly string[] = []
 ): ExtensionDiscoveryResult {
   return new Discovery(paths).run(project, explicitPaths)

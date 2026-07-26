@@ -7,6 +7,7 @@ import { dirname, join, resolve } from "node:path"
 import type { CredentialStore } from "@earendil-works/pi-ai"
 
 import { ZiPaths } from "../src/paths.js"
+import { ProjectTrustStore } from "../src/project-trust.js"
 import { createAgentRuntime } from "../src/runtime.js"
 import { SessionManager } from "../src/session-manager.js"
 import { createModels, createTestAgentRuntime, fauxAssistantMessage, fauxProvider } from "../src/testing.js"
@@ -24,7 +25,12 @@ test("runtime settings and sessions share the resumed session cwd path policy", 
   const faux = fauxProvider({ provider: "paths", models: [{ id: "model", reasoning: true }] })
   faux.setResponses([fauxAssistantMessage("saved")])
   models.setProvider(faux.provider)
-  const created = await createTestAgentRuntime({ cwd, agentDir: globalDir, models })
+  const created = await createTestAgentRuntime({
+    cwd,
+    agentDir: globalDir,
+    models,
+    projectTrust: { type: "trusted", cwd, source: "runtime" }
+  })
   const sessionFile = created.session.sessionManager.file
   if (!sessionFile) throw new Error("Session file was not created")
 
@@ -56,7 +62,8 @@ test("runtime settings and sessions share the resumed session cwd path policy", 
     cwd: join(root, "ignored"),
     agentDir: globalDir,
     session: { type: "resume", file: sessionFile },
-    models
+    models,
+    projectTrust: { type: "trusted", cwd, source: "runtime" }
   })
   try {
     expect(resumed.services.paths.cwd).toBe(resolve(cwd))
@@ -64,6 +71,55 @@ test("runtime settings and sessions share the resumed session cwd path policy", 
     expect(resumed.session.sessionManager.file).toBe(sessionFile)
   } finally {
     resumed.session.dispose()
+  }
+})
+
+test("runtime gates every protected project configuration owner through one trust resolution", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-runtime-trust-"))
+  const cwd = join(root, "project")
+  const agentDir = join(root, "global")
+  const paths = new ZiPaths(cwd, agentDir)
+  await mkdir(paths.projectDir, { recursive: true })
+  await mkdir(paths.globalDir, { recursive: true })
+  await writeFile(paths.projectSettingsFile, JSON.stringify({ defaultThinkingLevel: "high" }))
+  await writeFile(paths.projectSystemPromptFile, "project system")
+  await writeFile(paths.globalSystemPromptFile, "global system")
+
+  const models = createModels()
+  const faux = fauxProvider({ provider: "trust", models: [{ id: "model", reasoning: true }] })
+  models.setProvider(faux.provider)
+
+  const excluded = await createTestAgentRuntime({
+    cwd,
+    agentDir,
+    model: "trust/model",
+    models,
+    session: { type: "new", persist: false }
+  })
+  try {
+    expect(excluded.projectTrust).toMatchObject({ type: "unresolved", diagnostic: { path: paths.projectDir } })
+    expect(excluded.session.thinkingLevel).toBe("medium")
+    expect(excluded.session.resources.systemPrompt).toBe("global system")
+    expect(excluded.services.settingsManager.getProject()).toEqual({})
+  } finally {
+    excluded.session.dispose()
+  }
+
+  await new ProjectTrustStore(paths).update([{ type: "trusted", cwd }])
+  const admitted = await createTestAgentRuntime({
+    cwd,
+    agentDir,
+    model: "trust/model",
+    models,
+    session: { type: "new", persist: false }
+  })
+  try {
+    expect(admitted.projectTrust).toMatchObject({ type: "trusted", source: "stored" })
+    expect(admitted.session.thinkingLevel).toBe("high")
+    expect(admitted.session.resources.systemPrompt).toBe("project system")
+    expect(admitted.services.settingsManager.getProject()).toEqual({ defaultThinkingLevel: "high" })
+  } finally {
+    admitted.session.dispose()
   }
 })
 

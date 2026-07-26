@@ -70,6 +70,10 @@ export class AgentSessionRuntime {
     return this.#current().services
   }
 
+  get projectTrust(): AgentRuntime["projectTrust"] {
+    return this.#current().projectTrust
+  }
+
   get bootstrapDiagnostic(): AgentRuntime["bootstrapDiagnostic"] {
     return this.#current().bootstrapDiagnostic
   }

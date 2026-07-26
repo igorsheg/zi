@@ -8,7 +8,9 @@ import {
   hasTrustRequiringProjectConfiguration,
   maxProjectTrustDecisions,
   maxProjectTrustFileBytes,
-  ProjectTrustStore
+  projectConfigurationAdmission,
+  ProjectTrustStore,
+  resolveProjectTrust
 } from "../src/project-trust.js"
 
 test("project trust inherits the nearest canonical stored decision", async () => {
@@ -88,6 +90,54 @@ test("project trust rejects malformed and unbounded persisted input without over
   expect(store.lookup(paths.cwd)).rejects.toThrow(`${maxProjectTrustDecisions} decisions`)
 })
 
+test("project trust resolution is cwd-keyed and fails closed with diagnostics", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-project-trust-resolution-"))
+  const cwd = join(root, "project")
+  const paths = new ZiPaths(cwd, join(root, "global"))
+  await mkdir(paths.projectDir, { recursive: true })
+  await writeFile(paths.projectSettingsFile, "{}")
+  const canonicalCwd = await realpath(cwd)
+
+  const unresolved = await resolveProjectTrust(paths)
+  expect(unresolved).toEqual({
+    type: "unresolved",
+    cwd: canonicalCwd,
+    diagnostic: {
+      cwd: canonicalCwd,
+      path: paths.projectDir,
+      message: `Project configuration trust is unresolved and was ignored: ${paths.projectDir}`
+    }
+  })
+  expect(projectConfigurationAdmission(unresolved)).toBe("untrusted")
+
+  expect(resolveProjectTrust(paths, { type: "trusted", cwd: join(root, "other"), source: "runtime" })).rejects.toThrow(
+    "does not match runtime cwd"
+  )
+  expect(await resolveProjectTrust(paths, { type: "trusted", cwd, source: "interactive" })).toEqual({
+    type: "trusted",
+    cwd: canonicalCwd,
+    source: "interactive"
+  })
+
+  const store = new ProjectTrustStore(paths)
+  await store.update([{ type: "trusted", cwd: root }])
+  expect(await resolveProjectTrust(paths)).toEqual({
+    type: "trusted",
+    cwd: canonicalCwd,
+    source: "stored",
+    savedCwd: await realpath(root)
+  })
+
+  await writeFile(paths.trustFile, "not json")
+  const failed = await resolveProjectTrust(paths)
+  expect(failed).toMatchObject({
+    type: "unresolved",
+    cwd: canonicalCwd,
+    diagnostic: { path: paths.trustFile, message: expect.stringContaining("could not be read") }
+  })
+  expect(projectConfigurationAdmission(failed)).toBe("untrusted")
+})
+
 test("coincident global and project configuration is already user-admitted", async () => {
   const root = await mkdtemp(join(tmpdir(), "zi-project-trust-global-project-"))
   const paths = new ZiPaths(root, join(root, ".zi"))
@@ -96,6 +146,20 @@ test("coincident global and project configuration is already user-admitted", asy
 
   expect(paths.projectConfigIsGlobal).toBe(true)
   expect(hasTrustRequiringProjectConfiguration(paths)).toBe(false)
+  const trust = await resolveProjectTrust(paths)
+  expect(trust).toEqual({ type: "not_required", cwd: await realpath(root), reason: "project_configuration_is_global" })
+  expect(projectConfigurationAdmission(trust)).toBe("trusted")
+})
+
+test("a project without protected configuration remains absent until an explicit write", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-project-trust-absent-"))
+  const cwd = join(root, "project")
+  const paths = new ZiPaths(cwd, join(root, "global"))
+  await mkdir(cwd, { recursive: true })
+
+  const trust = await resolveProjectTrust(paths)
+  expect(trust).toEqual({ type: "not_required", cwd: await realpath(cwd), reason: "no_project_configuration" })
+  expect(projectConfigurationAdmission(trust)).toBe("absent")
 })
 
 test("project trust detects only exact project configuration that requires admission", async () => {

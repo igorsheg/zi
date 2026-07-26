@@ -5,6 +5,7 @@ import type { QueueMode, ThinkingLevel } from "@earendil-works/pi-agent-core"
 import lockfile from "proper-lockfile"
 
 import type { ZiPaths } from "./paths.js"
+import type { ProjectConfigurationAdmission } from "./project-trust.js"
 import { isRetryCount, isRetryDelay } from "./retry.js"
 
 export { maxRetryBaseDelayMs, maxRetryCount } from "./retry.js"
@@ -47,6 +48,8 @@ export interface SettingsError {
 }
 
 type SettingsScopeState =
+  | { readonly type: "absent"; readonly path: string }
+  | { readonly type: "excluded"; readonly path: string }
   | { readonly type: "missing"; readonly path: string }
   | { readonly type: "loaded"; readonly path: string; readonly settings: Partial<AgentSettings> }
   | { readonly type: "invalid"; readonly path: string; readonly error: Error }
@@ -69,7 +72,14 @@ export class SettingsManager {
     this.#settings = mergeSettings(settings)
   }
 
-  static create(paths: ZiPaths, overrides: Partial<AgentSettings> = {}): SettingsManager {
+  static create(
+    paths: ZiPaths,
+    projectAdmission: ProjectConfigurationAdmission,
+    overrides: Partial<AgentSettings> = {}
+  ): SettingsManager {
+    if (projectAdmission !== "trusted" && projectAdmission !== "untrusted" && projectAdmission !== "absent") {
+      throw new Error(`Unknown project configuration admission: ${String(projectAdmission)}`)
+    }
     validateSettingsPatch(overrides)
     const manager = new SettingsManager()
     manager.#paths = paths
@@ -77,7 +87,9 @@ export class SettingsManager {
     manager.#global = loadScope(paths.globalSettingsFile)
     manager.#project = manager.#sharedSettingsFile
       ? { type: "missing", path: paths.projectSettingsFile }
-      : loadScope(paths.projectSettingsFile)
+      : projectAdmission === "trusted"
+        ? loadScope(paths.projectSettingsFile)
+        : { type: projectAdmission === "absent" ? "absent" : "excluded", path: paths.projectSettingsFile }
     manager.#overrides = { ...overrides }
     manager.#recordLoadError("global", manager.#global)
     manager.#recordLoadError("project", manager.#project)
@@ -133,6 +145,9 @@ export class SettingsManager {
       this.updateGlobal(patch)
       return
     }
+    if (this.#project.type === "excluded") {
+      throw new Error(`Cannot update project settings before project trust: ${this.#project.path}`)
+    }
     this.#project = this.#updateScope("project", this.#project, patch)
     clearOverrides(this.#overrides, patch)
     this.#recompute()
@@ -140,11 +155,14 @@ export class SettingsManager {
 
   reload(): void {
     if (!this.#paths) return
+    const projectState = this.#project.type
     this.#errors = []
     this.#global = loadScope(this.#paths.globalSettingsFile)
     this.#project = this.#sharedSettingsFile
       ? { type: "missing", path: this.#paths.projectSettingsFile }
-      : loadScope(this.#paths.projectSettingsFile)
+      : projectState === "excluded" || projectState === "absent"
+        ? { type: projectState, path: this.#paths.projectSettingsFile }
+        : loadScope(this.#paths.projectSettingsFile)
     this.#recordLoadError("global", this.#global)
     this.#recordLoadError("project", this.#project)
     this.#recompute()
@@ -161,7 +179,10 @@ export class SettingsManager {
     if (state.type === "invalid") {
       throw new Error(`Cannot update invalid ${scope} settings: ${state.path}`, { cause: state.error })
     }
-    if (this.#paths) persistSettings(state.path, patch)
+    if (this.#paths) {
+      if (state.type === "absent") persistNewProjectSettings(state.path, patch)
+      else persistSettings(state.path, patch)
+    }
     return { type: "loaded", path: state.path, settings: { ...scopeSettings(state), ...patch } }
   }
 
@@ -244,6 +265,24 @@ function clearOverrides(overrides: Partial<AgentSettings>, patch: Partial<AgentS
   if ("compactionEnabled" in patch) delete overrides.compactionEnabled
   if ("compactionReserveTokens" in patch) delete overrides.compactionReserveTokens
   if ("compactionKeepRecentTokens" in patch) delete overrides.compactionKeepRecentTokens
+}
+
+function persistNewProjectSettings(path: string, patch: Partial<AgentSettings>): void {
+  mkdirSync(dirname(path), { recursive: true })
+  const serialized = `${JSON.stringify(patch, null, 2)}\n`
+  if (Buffer.byteLength(serialized) > maxSettingsFileBytes) {
+    throw new Error(`Settings files cannot exceed ${maxSettingsFileBytes} bytes: ${path}`)
+  }
+  try {
+    writeFileSync(path, serialized, { flag: "wx" })
+  } catch (cause) {
+    if (hasCode(cause, "EEXIST")) {
+      throw new Error(`Cannot create project settings before project trust because the file now exists: ${path}`, {
+        cause
+      })
+    }
+    throw cause
+  }
 }
 
 function persistSettings(path: string, patch: Partial<AgentSettings>): void {
