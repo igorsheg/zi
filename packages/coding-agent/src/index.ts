@@ -7,11 +7,13 @@ export * from "./agent-session-runtime.js"
 export * from "./authentication.js"
 export * from "./credential-store.js"
 export * from "./defaults.js"
+export * from "./extensions/discovery.js"
 export * from "./model-registry.js"
 export * from "./model-resolver.js"
 export * from "./paths.js"
 export * from "./print-mode.js"
 export * from "./project-file-search.js"
+export * from "./project-trust.js"
 export { maxPromptTemplateCount, type PromptTemplate } from "./prompt-templates.js"
 export {
   maxResourceDiagnostics,

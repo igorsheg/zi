@@ -65,8 +65,12 @@ The optional coding-agent owner of one replaceable current `AgentRuntime`. It pe
 _Avoid_: Session manager, root store, TUI session controller
 
 **Zi paths**:
-The immutable coding-agent policy value for one effective cwd. It resolves global `$HOME/.zi/agent`, exact project `<cwd>/.zi`, credentials, scoped settings/resources, and cwd-partitioned sessions. A resumed session's stored cwd is admitted before this value and its cwd-bound services are constructed.
+The immutable coding-agent policy value for one effective cwd. It resolves global `$HOME/.zi/agent`, exact project `<cwd>/.zi`, credentials, project trust, scoped settings/resources, and cwd-partitioned sessions. A resumed session's stored cwd is admitted before this value and its cwd-bound services are constructed.
 _Avoid_: Path registry, config singleton, ambient cwd
+
+**Project trust**:
+The admission decision controlling whether configuration owned by one canonical project cwd may affect Zi. Stored decisions may come from the cwd or its nearest decided parent; trust gates project settings, system prompts, skills, prompts, themes, and extensions together and is not a sandbox for later agent activity. A project configuration root that coincides with the explicitly admitted global root is global configuration and does not require project trust.
+_Avoid_: Extension trust, repository safety, tool sandbox
 
 **Project file search**:
 The bounded coding-agent operation that enumerates and ranks validated paths beneath one session's immutable `ZiPaths.cwd`. It uses per-query Git or ignore-aware fallback traversal, retains no complete index, and owns cancellation and filesystem/process cleanup.
@@ -100,9 +104,25 @@ _Avoid_: Copy-on-select, message export, clipboard paste
 The bounded attempt to make copied text available through one or more terminal or local-system routes. Delivery outcome is distinct from the selected text and from clipboard input.
 _Avoid_: Selection state, paste handling, guaranteed remote clipboard
 
+**Building block**:
+A supported way to configure, extend, drive, or embed Zi with explicit compatibility and lifecycle expectations. A repository package or exported internal symbol is not a building block merely because it is technically reachable.
+_Avoid_: Public internals, speculative extension point
+
+**Extension source**:
+One canonical extension entry point with its declared path, global/project/temporary scope, origin, and stable identity. Discovery returns source data without loading executable code.
+_Avoid_: Loaded extension, plugin instance
+
+**Extension load plan**:
+The immutable ordered extension sources admitted for one exact session cwd after project trust. Explicit sources precede trusted project sources, which precede global sources.
+_Avoid_: Extension registry, worker generation
+
+**Custom-tool extension golden path**:
+The first externally useful extension outcome: a trusted repository-owned TypeScript extension adds one model-callable tool that behaves consistently across interactive and headless Zi modes without modifying Zi.
+_Avoid_: Extension infrastructure complete, plugin demo
+
 **Coding-agent parity**:
-Behavioral and architectural compatibility with `pi-coding-agent`, verified capability by capability while keeping the recreated layer owned by Zi.
-_Avoid_: Source identity, dependency parity
+Behavioral and architectural compatibility with `pi-coding-agent`, verified capability by capability while keeping the recreated layer owned by Zi. It is a capability and provenance standard, not the product priority order.
+_Avoid_: Source identity, dependency parity, product roadmap
 
 **Interactive-mode parity**:
 Behavioral compatibility with the interactive mode inside `pi-coding-agent`, including editor actions, keybindings, queues, commands, selectors, session flows, and visible lifecycle semantics. It does not include `pi-tui`, Pi's screen architecture, or Pi's visual design.

@@ -1,8 +1,9 @@
 # Extension system infrastructure implementation spec
 
-- Status: proposed
+- Status: in progress — Slice A runtime probe and Slice B trust foundation
 - Pi behavior reference: `badlogic/pi-mono` at Zi's pinned `0e6909f0` (`v0.80.6`)
 - Current Pi comparison: `fc85bdd88be93b1e9a6b6bcfa41c684282ec79cc`
+- Project-trust comparison: `5bc1c2c0a6f07e00e8c240304182f213ab8d311f`
 - Product owner: `AgentSession`
 - Infrastructure owner: coding-agent `ExtensionHost`
 
@@ -12,7 +13,9 @@ Zi will eventually support the full behavioral capability of Pi's extension syst
 
 This specification establishes the extension substrate before any product capability is added. The first accepted implementation can discover, trust-gate, load, identify, reload, and shut down otherwise empty TypeScript extensions through a supervised extension generation.
 
-The first public extension contract contains lifecycle registration only. It does not smuggle tools, commands, providers, UI, or a generic event framework into the infrastructure patch.
+The initial extension contract contains lifecycle registration only. It does not smuggle tools, commands, providers, UI, or a generic event framework into the infrastructure patch.
+
+Lifecycle loading is an infrastructure checkpoint, not the product launch boundary. The first usable outcome is the [`custom-tool extension golden path`](extension-custom-tool-golden-path.md), which must work across interactive, text, and JSON modes against the compiled release.
 
 The target is capability parity, not source identity with Pi. In particular, Zi will not expose Pi TUI components or copy Pi's broad in-process object graph.
 
@@ -49,6 +52,7 @@ This slice does not implement:
 - package install, update, or removal;
 - Pi extension source compatibility;
 - automatic worker restart;
+- an OS security sandbox or credential-confidentiality boundary;
 - one process per extension;
 - a generic internal command bus or event envelope inside Zi;
 - a frontend store for extension state.
@@ -144,12 +148,14 @@ A coding-agent project-trust owner decides whether project configuration is admi
 
 Extension-only trust is forbidden. Zi must not execute project extensions while applying or rejecting other project configuration through a separate decision.
 
+`ZiPaths.trustFile` resolves the bounded global `trust.json`. `ProjectTrustStore` owns canonical cwd persistence, locked atomic updates, and nearest-parent lookup. A bare project `.zi` directory and contextual `AGENTS.md`/`CLAUDE.md` files do not require project trust; exact project settings, system prompts, skills, prompts, themes, and extensions do. Persisted-store failure remains an unresolved safe state for the later resolver to diagnose; it never admits project configuration.
+
 ### 6.3 `ExtensionHost`
 
 `ExtensionHost` is one instance-scoped coding-agent owner. It owns:
 
 - current and candidate generation identity;
-- child processes and every pipe;
+- worker processes it creates and every attached pipe;
 - protocol decoder and serialized writer queues;
 - request correlation and pending-request bounds;
 - startup, lifecycle, and shutdown deadlines;
@@ -159,7 +165,7 @@ Extension-only trust is forbidden. Zi must not execute project extensions while 
 - stale-generation rejection;
 - final disposal.
 
-The loader, transport, request map, and generation transition rules do not become independently mutable managers.
+The loader, transport, request map, and generation transition rules do not become independently mutable managers. Extension-spawned processes remain extension-owned. Lifecycle documentation requires cooperative cleanup during `session_shutdown`, but forced worker teardown cannot guarantee termination of detached or otherwise surviving descendants; that would require a separately specified process-tree/job owner.
 
 ### 6.4 `AgentSession`
 
@@ -193,7 +199,7 @@ These are deep modules with distinct responsibilities:
 - `protocol.ts` defines and validates the closed process boundary;
 - `worker.ts` is the separately invoked worker entry point and TypeScript loader.
 
-A public `@with-zi/extension-api` package is justified when the lifecycle contract is shipped because extension authors need a stable import independent of Zi internals. It initially exports lifecycle types only.
+A separate `@with-zi/extension-api` workspace package is justified when the lifecycle contract lands because external source fixtures need a stable import independent of Zi internals. It initially exports lifecycle types only and is available as a compiled virtual module. Npm publication waits for the custom-tool golden path rather than promoting an otherwise empty lifecycle API as a usable platform.
 
 Do not create a separate package solely to hold the private protocol.
 
@@ -211,7 +217,7 @@ type ProjectTrustState =
   | { type: "untrusted"; cwd: string; source: "stored" | "interactive" | "runtime" }
 ```
 
-Trust is keyed by canonical cwd. Persisted trust input is bounded and validated before admission.
+Trust is keyed by canonical cwd. Persisted trust input is bounded and validated before admission. Stored decisions live only in global `trust.json`; the nearest exact or parent decision applies. Interactive and runtime decisions may remain process-local, while only an explicit remember operation mutates the store.
 
 Global and explicit CLI extensions are already user-admitted. Project extensions require `trusted`. In noninteractive modes, unresolved project trust excludes project configuration unless a stored or runtime decision exists and emits a diagnostic.
 
@@ -262,13 +268,21 @@ extensions/*/index.js
 
 Discovery is one level deep. Package manifests and npm/git package installation arrive in the package slice. Explicit paths may point to a file or a directory following the same entry rules.
 
-Discovery:
+Discovery admits explicit CLI paths first, then trusted project sources, then global sources. When `ZiPaths.projectConfigIsGlobal` is true, that coincident root is already user-admitted global configuration and is scanned exactly once as global regardless of project trust. This preserves current Pi's temporary → project → user load order while making project omission one closed admission input. Within each root it:
 
-- sorts directory entries before admission;
+- requires explicit paths to have been resolved absolutely at CLI admission;
+- fails closed for a root whose bounded directory read truncates before sorting;
+- sorts complete bounded directory entries before admission;
 - canonicalizes and deduplicates paths;
 - does not traverse directory symlinks recursively;
+- prefers `index.ts` only when it resolves to a file, preserves unreadable diagnostics, and otherwise falls back to a valid `index.js`;
+- preserves missing, unreadable, and unsupported outcomes through extension-specific path inspection;
+- resolves symlinks, revalidates the canonical path bound, and then deduplicates;
 - preserves the first admitted source for a canonical duplicate;
+- opens every candidate entry point for reading before admission;
 - reports missing, unreadable, unsupported, duplicate, and omitted sources;
+- derives stable source IDs from canonical entry paths;
+- admits at most 128 sources and 256 bounded diagnostics;
 - returns no executable code or mutable registry.
 
 Capability owners, not discovery, later decide conflicts between declarations such as duplicate tool or command names.
@@ -369,7 +383,7 @@ If the standalone executable cannot reliably provide external TypeScript, Node b
 
 ### 9.3 Probe requirements
 
-The probe must run from the compiled `dist/zi` executable and prove:
+The probe must run from a compiled release-shaped Zi executable containing the full CLI entrypoint plus temporary parent/worker dispatch, and prove:
 
 - external `.ts` loading;
 - async default factory execution;
@@ -384,6 +398,26 @@ The probe must run from the compiled `dist/zi` executable and prove:
 - macOS, Linux, and Windows behavior.
 
 The selected mechanism is recorded in an ADR before production host code lands. The rejected probe is deleted.
+
+### 9.4 Probe status
+
+The temporary probe runs with:
+
+```sh
+bun run probe:extension-worker
+```
+
+It compiles a release-shaped Zi entrypoint, self-spawns that executable as a worker, and exercises external TypeScript, an async factory, a Node built-in, an extension-local dependency, isolated stdout/stderr, a dedicated protocol pipe, attributed failure, process crash, and forced termination of an infinite loop.
+
+| Target      | Result                                       |
+| ----------- | -------------------------------------------- |
+| macOS arm64 | Passed locally with Bun 1.3.14 on 2026-07-26 |
+| macOS x64   | Pending CI probe                             |
+| Linux arm64 | Pending CI probe                             |
+| Linux x64   | Pending CI probe                             |
+| Windows x64 | Pending CI probe                             |
+
+The prototype lives at `scripts/extension-worker-runtime-probe.ts`; `.github/workflows/extension-worker-probe.yml` runs the release-platform matrix. Both are deleted after the runtime ADR records the result.
 
 ## 10. TypeScript module loading
 
@@ -407,13 +441,13 @@ typebox/compile
 typebox/value
 ```
 
-Zi does not expose `@with-zi/coding-agent`, OpenTUI, `AgentSession`, `SessionManager`, `ModelRegistry`, or private implementation modules to extensions.
+Zi does not expose `@with-zi/coding-agent`, OpenTUI, `AgentSession`, `SessionManager`, `ModelRegistry`, credentials, or private implementation modules through the extension interface. Extensions remain trusted JavaScript running with the Zi user's operating-system authority: they can read user-accessible files and environment variables, spawn processes, and interfere with worker-local resources or descriptors. The worker boundary contains faults and protects Zi's owner loop from ordinary crashes and hangs; it is not a sandbox or credential-confidentiality boundary.
 
 The factory may register lifecycle handlers during execution. Factory completion sends the worker's `ready` barrier. Later dynamic registrations remain possible in the protocol design but no non-lifecycle registration exists in this slice.
 
 Extension factories should not create long-lived resources. The documented lifetime is `session_start` through `session_shutdown`. Zi cannot make arbitrary JavaScript obey this convention, so process replacement and forced teardown remain the final resource boundary.
 
-## 11. Initial public extension contract
+## 11. Initial extension contract
 
 ```ts
 export type ExtensionStartReason = "startup" | "reload" | "new" | "resume" | "fork"
@@ -727,15 +761,23 @@ CI uses deterministic process and resource assertions rather than wall-clock per
 
 Deliver:
 
-- throwaway self-hosted Bun worker probe;
-- external TypeScript, Node built-in, npm dependency, extra pipe, crash, and hang fixtures;
-- release-platform results;
-- ADR selecting self-hosted Bun or supervised Node;
-- deletion of the rejected prototype.
+- [x] throwaway self-hosted Bun worker probe;
+- [x] external TypeScript, Node built-in, npm dependency, extra pipe, crash, and hang fixtures;
+- [ ] release-platform results;
+- [ ] ADR selecting self-hosted Bun or supervised Node;
+- [ ] deletion of the rejected prototype.
 
 No production extension abstraction lands in this slice.
 
 ### Slice B — trust and discovery
+
+Progress:
+
+- [x] `ZiPaths`-owned global trust path;
+- [x] bounded canonical persistence with nearest-parent lookup;
+- [x] exact protected-project-configuration detection;
+- [ ] trust resolution and coordinated project gating;
+- [x] bounded immutable extension discovery.
 
 Likely files:
 
@@ -823,8 +865,8 @@ Deliver:
 
 - worker or self-host assets in every release artifact;
 - no install-time downloader;
-- official extension API import availability;
-- extension author quick start for lifecycle-only extensions;
+- official extension API virtual-import availability;
+- infrastructure diagnostics and lifecycle documentation;
 - third-party notice updates for the selected loader/runtime dependencies.
 
 ## 19. Acceptance checklist
@@ -850,7 +892,7 @@ The extension infrastructure is complete when:
 - [ ] lifecycle and shutdown waits are bounded;
 - [ ] a worker crash leaves `AgentSession` usable;
 - [ ] terminal restoration still precedes bounded extension settlement;
-- [ ] final disposal leaves no child process, listener, pipe, callback, or temporary artifact;
+- [ ] final disposal leaves no `ExtensionHost`-owned worker process, listener, pipe, callback, or temporary artifact;
 - [ ] text and JSON modes do not load OpenTUI;
 - [ ] no tools, commands, providers, UI contributions, generic event bus, or package manager entered this slice;
 - [ ] formatting, linting, typechecking, unit tests, and compiled acceptance pass.

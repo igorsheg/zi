@@ -9,6 +9,8 @@ A coding agent you can build with.
 Use it as-is, or teach it one habit at a time: a command, a tool, a prompt rule, a model preference, or a bit of UI.
 The goal is dependable agent work you can understand and change.
 
+Zi is developed as a dependable coding-agent building block with an opinionated reference terminal client. See the [building-block strategy](docs/building-block-strategy.md), [product roadmap](docs/roadmap.md), and current [custom-tool extension milestone](docs/extension-custom-tool-golden-path.md).
+
 ## Install
 
 ```sh

@@ -11,9 +11,11 @@ export class ZiPaths {
   readonly cwd: string
   readonly globalDir: string
   readonly projectDir: string
+  readonly projectConfigIsGlobal: boolean
   readonly globalSettingsFile: string
   readonly projectSettingsFile: string
   readonly authFile: string
+  readonly trustFile: string
   readonly globalSystemPromptFile: string
   readonly projectSystemPromptFile: string
   readonly globalAppendSystemPromptFile: string
@@ -25,9 +27,11 @@ export class ZiPaths {
     this.cwd = resolveZiPath(cwd)
     this.globalDir = resolveZiPath(globalDir)
     this.projectDir = join(this.cwd, projectConfigDirName)
+    this.projectConfigIsGlobal = this.projectDir === this.globalDir
     this.globalSettingsFile = join(this.globalDir, "settings.json")
     this.projectSettingsFile = join(this.projectDir, "settings.json")
     this.authFile = join(this.globalDir, "auth.json")
+    this.trustFile = join(this.globalDir, "trust.json")
     this.globalSystemPromptFile = join(this.globalDir, "SYSTEM.md")
     this.projectSystemPromptFile = join(this.projectDir, "SYSTEM.md")
     this.globalAppendSystemPromptFile = join(this.globalDir, "APPEND_SYSTEM.md")

@@ -73,7 +73,7 @@ export class SettingsManager {
     validateSettingsPatch(overrides)
     const manager = new SettingsManager()
     manager.#paths = paths
-    manager.#sharedSettingsFile = paths.globalSettingsFile === paths.projectSettingsFile
+    manager.#sharedSettingsFile = paths.projectConfigIsGlobal
     manager.#global = loadScope(paths.globalSettingsFile)
     manager.#project = manager.#sharedSettingsFile
       ? { type: "missing", path: paths.projectSettingsFile }

@@ -6,6 +6,15 @@
 - `pi-ai` and `pi-agent-core` are dependencies; `pi-coding-agent` and `pi-tui` are not.
 - Imperative `@opentui/core` renderables are the terminal architecture; `@opentui/react` and Pi's TUI implementation are not.
 - OpenCode is a source of proven OpenTUI application patterns, not a template to copy wholesale.
+- `docs/building-block-strategy.md` sets product direction; `docs/roadmap.md` orders current work. `docs/parity-roadmap.md` remains the capability and provenance inventory, not the product priority order.
+
+## Product direction
+
+- Zi is a dependable coding-agent substrate with an opinionated reference terminal client. Optimize supported surfaces for downstream configuration, extension, process composition, and eventually deliberate embedding—not for exporting internal modules.
+- Use the least powerful sufficient customization level: prompt policy, skill/template, CLI composition, extension, RPC, curated SDK, then separate client or fork.
+- Route universal coding-agent policy into `AgentSession` or another concrete coding-agent owner; route specialized executable behavior into extensions; route external applications through RPC; keep substantially different interaction models in clients or forks.
+- A public building block requires a narrow documented contract, one complete example, compiled-release acceptance, explicit lifecycle/cancellation/bounds/versioning, and no dependency on private Zi modules.
+- Mainline adopts downstream behavior after repeated evidence or when required by a universal invariant or the reference client. Do not add speculative hooks, registries, package splits, or UI callbacks to appear extensible.
 
 ## Code quality
 

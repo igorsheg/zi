@@ -1,6 +1,6 @@
 # Pi coding-agent parity roadmap
 
-The target is coding-agent architecture parity and observable product-behavior parity, including Pi's interactive mode, without source identity. Each item is complete only with an Zi-owned acceptance test.
+The target is coding-agent architecture parity and observable product-behavior parity, including Pi's interactive mode, without source identity. Each item is complete only with a Zi-owned acceptance test. This document is the capability and provenance inventory; [`roadmap.md`](roadmap.md) orders product work by the [`building-block strategy`](building-block-strategy.md).
 
 ## P0 — one dependable turn
 
@@ -177,7 +177,9 @@ Pi's optional `grep`, `find`, and `ls` implementations are deliberately deferred
 - `packages/tui/test/interactive/slash-controller.test.ts` fixes mode-owned aggregation of built-ins with the current session's prompt and skill commands, including built-in precedence, session replacement, fuzzy ranking, range-safe edits, and typed activation.
 - Project `.zi` resolution is exact to the effective cwd; ancestor traversal applies only to instruction files, matching Pi's distinction between project configuration and contextual instructions.
 
-## P3 — extension platform
+## P3 — extension platform (current strategic priority)
+
+The first usable outcome is the [`custom-tool extension golden path`](extension-custom-tool-golden-path.md); lifecycle infrastructure alone does not complete this milestone.
 
 - [ ] Extension discovery and trust policy
 - [ ] Typed extension host boundary
