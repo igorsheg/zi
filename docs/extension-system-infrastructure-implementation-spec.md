@@ -1,6 +1,6 @@
 # Extension system infrastructure implementation spec
 
-- Status: in progress — Slice A runtime probe and Slice B trust foundation
+- Status: in progress — Slice A complete and Slice B trust foundation
 - Pi behavior reference: `badlogic/pi-mono` at Zi's pinned `0e6909f0` (`v0.80.6`)
 - Current Pi comparison: `fc85bdd88be93b1e9a6b6bcfa41c684282ec79cc`
 - Project-trust comparison: `5bc1c2c0a6f07e00e8c240304182f213ab8d311f`
@@ -182,7 +182,7 @@ The TUI never owns or disposes the host.
 
 ### 6.5 Source layout
 
-The initial implementation should remain under coding-agent until the runtime probe proves a separately built worker package is required:
+ADR 0021 confirmed that the initial implementation remains under coding-agent and self-hosts its worker from the compiled Zi executable:
 
 ```text
 packages/coding-agent/src/extensions/
@@ -369,9 +369,9 @@ Final shutdown is distinct from reload and tool/run interruption:
 
 During terminal shutdown, OpenTUI is restored before the caller awaits this settlement, consistent with ADR 0009.
 
-## 9. Worker runtime decision probe
+## 9. Worker runtime decision
 
-The implementation must not assume whether the compiled Bun executable can host external TypeScript reliably. A throwaway probe precedes production code.
+[ADR 0021](adr/0021-compiled-zi-self-hosts-extension-workers.md) selects a self-hosted compiled Bun worker using portable Node-compatible process pipes. A release-shaped probe preceded production code and verified the decision across every release target.
 
 ### 9.1 Candidate A: self-hosted Bun worker
 
@@ -397,27 +397,23 @@ The probe must run from a compiled release-shaped Zi executable containing the f
 - deliberate infinite-loop containment;
 - macOS, Linux, and Windows behavior.
 
-The selected mechanism is recorded in an ADR before production host code lands. The rejected probe is deleted.
+ADR 0021 records the selected mechanism before production host code lands. The temporary probe is deleted.
 
-### 9.4 Probe status
+### 9.4 Probe result
 
-The temporary probe runs with:
+The probe compiled a release-shaped Zi entrypoint, self-spawned that executable as a worker, and exercised external TypeScript, an async factory, a Node built-in, an extension-local dependency, isolated stdout/stderr, a dedicated protocol pipe, attributed failure, process crash, and forced termination of an infinite loop.
 
-```sh
-bun run probe:extension-worker
-```
+The first transport used Bun's direct subprocess file-descriptor APIs. It passed on macOS and Linux but failed on Windows x64. The selected transport uses `node:child_process.spawn()` with an extra stdio pipe and `node:fs` descriptor I/O inside the Bun executable.
 
-It compiles a release-shaped Zi entrypoint, self-spawns that executable as a worker, and exercises external TypeScript, an async factory, a Node built-in, an extension-local dependency, isolated stdout/stderr, a dedicated protocol pipe, attributed failure, process crash, and forced termination of an infinite loop.
+| Target      | Bun    | Result | Evidence                                                                              |
+| ----------- | ------ | ------ | ------------------------------------------------------------------------------------- |
+| macOS arm64 | 1.3.14 | Passed | [GitHub Actions 30218801769](https://github.com/igorsheg/zi/actions/runs/30218801769) |
+| macOS x64   | 1.3.14 | Passed | [GitHub Actions 30218801769](https://github.com/igorsheg/zi/actions/runs/30218801769) |
+| Linux arm64 | 1.3.14 | Passed | [GitHub Actions 30218801769](https://github.com/igorsheg/zi/actions/runs/30218801769) |
+| Linux x64   | 1.3.14 | Passed | [GitHub Actions 30218801769](https://github.com/igorsheg/zi/actions/runs/30218801769) |
+| Windows x64 | 1.3.14 | Passed | [GitHub Actions 30218801769](https://github.com/igorsheg/zi/actions/runs/30218801769) |
 
-| Target      | Result                                       |
-| ----------- | -------------------------------------------- |
-| macOS arm64 | Passed locally with Bun 1.3.14 on 2026-07-26 |
-| macOS x64   | Pending CI probe                             |
-| Linux arm64 | Pending CI probe                             |
-| Linux x64   | Pending CI probe                             |
-| Windows x64 | Pending CI probe                             |
-
-The prototype lives at `scripts/extension-worker-runtime-probe.ts`; `.github/workflows/extension-worker-probe.yml` runs the release-platform matrix. Both are deleted after the runtime ADR records the result.
+The temporary probe and workflow were deleted after ADR 0021 recorded the result.
 
 ## 10. TypeScript module loading
 
@@ -763,9 +759,9 @@ Deliver:
 
 - [x] throwaway self-hosted Bun worker probe;
 - [x] external TypeScript, Node built-in, npm dependency, extra pipe, crash, and hang fixtures;
-- [ ] release-platform results;
-- [ ] ADR selecting self-hosted Bun or supervised Node;
-- [ ] deletion of the rejected prototype.
+- [x] release-platform results;
+- [x] ADR selecting a self-hosted Bun worker with portable Node-compatible process pipes;
+- [x] deletion of the temporary prototype.
 
 No production extension abstraction lands in this slice.
 
@@ -873,7 +869,7 @@ Deliver:
 
 The extension infrastructure is complete when:
 
-- [ ] the worker-runtime probe has selected and documented one mechanism;
+- [x] the worker-runtime probe has selected and documented one mechanism;
 - [ ] all project configuration, including extensions, shares one trust decision;
 - [ ] global, project, and explicit sources produce a deterministic bounded load plan;
 - [ ] no extension source causes ambient cwd or `.zi` path derivation;
