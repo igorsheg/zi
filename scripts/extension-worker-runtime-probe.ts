@@ -188,7 +188,9 @@ export default async function load(): Promise<ProbeValue> {
 
 function standaloneSource(): string {
   const mainModule = resolve(import.meta.dirname, "../packages/cli/src/main.ts")
-  return `import { pathToFileURL } from "node:url"
+  return `import { spawn } from "node:child_process"
+import { closeSync, writeFileSync } from "node:fs"
+import { pathToFileURL } from "node:url"
 import { defaultCliArgv, main } from ${JSON.stringify(mainModule)}
 
 const parentIndex = process.argv.indexOf("--probe-extension-parent")
@@ -203,47 +205,59 @@ if (workerIndex >= 0) {
 }
 
 async function runWorker(source) {
-  const protocol = Bun.file(3).writer()
+  let report
   try {
     const extension = await import(pathToFileURL(source).href)
     const value = await extension.default()
-    protocol.write(JSON.stringify({ status: "loaded", source, value }))
+    report = { status: "loaded", source, value }
   } catch (cause) {
-    protocol.write(JSON.stringify({
+    report = {
       status: "failed",
       source,
       message: cause instanceof Error ? cause.message : String(cause)
-    }))
-  } finally {
-    await protocol.end()
+    }
   }
+  writeFileSync(3, JSON.stringify(report))
+  closeSync(3)
 }
 
 async function runParent(scenario, source) {
-  const child = Bun.spawn([process.execPath, "--probe-extension-worker", source], {
-    stdio: ["ignore", "pipe", "pipe", "pipe"]
+  const child = spawn(process.execPath, ["--probe-extension-worker", source], {
+    stdio: ["ignore", "pipe", "pipe", "pipe"],
+    windowsHide: true
   })
-  const protocolFd = child.stdio[3]
-  if (protocolFd === null) throw new Error("Bun did not create the dedicated protocol pipe")
-  const protocolPromise = Bun.file(protocolFd).text()
-  const stdoutPromise = new Response(child.stdout).text()
-  const stderrPromise = new Response(child.stderr).text()
+  const protocolStream = child.stdio[3]
+  if (!child.stdout || !child.stderr || !protocolStream) {
+    throw new Error("Node-compatible spawn did not create the dedicated protocol pipe")
+  }
+  const protocolPromise = readStream(protocolStream)
+  const stdoutPromise = readStream(child.stdout)
+  const stderrPromise = readStream(child.stderr)
+  const exitCodePromise = new Promise((resolve, reject) => {
+    child.once("error", reject)
+    child.once("close", (code, signal) => resolve(code ?? (signal ? 1 : 0)))
+  })
   let killed = false
   let timeout
   if (scenario === "hang") {
     timeout = setTimeout(() => {
-      child.kill("SIGKILL")
-      killed = true
+      killed = child.kill("SIGKILL")
     }, 500)
   }
   const [exitCode, stdout, stderr, protocol] = await Promise.all([
-    child.exited,
+    exitCodePromise,
     stdoutPromise,
     stderrPromise,
     protocolPromise
   ])
   if (timeout) clearTimeout(timeout)
   console.log(JSON.stringify({ exitCode, stdout, stderr, protocol, killed }))
+}
+
+async function readStream(stream) {
+  const chunks = []
+  for await (const chunk of stream) chunks.push(Buffer.from(chunk))
+  return Buffer.concat(chunks).toString("utf8")
 }
 `
 }
