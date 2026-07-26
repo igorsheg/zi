@@ -2,10 +2,10 @@ import { expect, test } from "bun:test"
 import { existsSync } from "node:fs"
 import { mkdtemp } from "node:fs/promises"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { dirname, join } from "node:path"
 
 import { AgentSessionRuntime } from "../src/agent-session-runtime.js"
-import type { AgentRuntime, CreateAgentRuntimeOptions } from "../src/runtime.js"
+import { createAgentRuntime, type AgentRuntime, type CreateAgentRuntimeOptions } from "../src/runtime.js"
 import { SessionManager, type SessionListResult } from "../src/session-manager.js"
 import {
   createModels,
@@ -49,6 +49,115 @@ test("session runtime omits a new unprompted session and disposes the replaced s
   } finally {
     runtime.dispose()
     await runtime.waitForIdle()
+  }
+})
+
+test("new sessions retain an explicit session directory after resume", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-session-runtime-custom-dir-"))
+  const models = createModels()
+  const faux = fauxProvider({ provider: "runtime-custom-dir", models: [{ id: "model" }] })
+  models.setProvider(faux.provider)
+  const archived = await createTestAgentRuntime({
+    cwd: join(root, "project"),
+    agentDir: join(root, "global"),
+    sessionDir: join(root, "archive"),
+    model: "runtime-custom-dir/model",
+    models
+  })
+  archived.session.sessionManager.appendMessage({ role: "user", content: "archived task", timestamp: 1 })
+  archived.session.sessionManager.appendMessage(fauxAssistantMessage("archived answer"))
+  const archiveFile = archived.session.sessionManager.file!
+  archived.session.dispose()
+  await archived.session.waitForIdle()
+
+  const isolated = join(root, "isolated")
+  const runtime = await createTestAgentSessionRuntime({
+    cwd: join(root, "ignored"),
+    agentDir: join(root, "global"),
+    sessionDir: isolated,
+    session: { type: "resume", file: archiveFile },
+    model: "runtime-custom-dir/model",
+    models
+  })
+
+  try {
+    expect(runtime.session.sessionManager.sessionDir).toBe(join(root, "archive"))
+    expect(runtime.services.paths.sessionDir).toBe(isolated)
+
+    const next = await runtime.newSession()
+
+    expect(next.session.sessionManager.sessionDir).toBe(isolated)
+    expect(dirname(next.session.sessionManager.file!)).toBe(isolated)
+  } finally {
+    runtime.dispose()
+    await runtime.waitForIdle()
+  }
+})
+
+test("session runtime owns invocation prompt arrays across replacements", async () => {
+  const models = createModels()
+  const faux = fauxProvider({ provider: "runtime-options", models: [{ id: "model" }] })
+  models.setProvider(faux.provider)
+  const appendSystemPrompt = ["Original"]
+  const options: CreateAgentRuntimeOptions = {
+    cwd: "/work",
+    model: "runtime-options/model",
+    session: { type: "new", persist: false },
+    appendSystemPrompt,
+    modelFactory: () => models
+  }
+  const initial = await createAgentRuntime(options)
+  let replacementOptions: CreateAgentRuntimeOptions | undefined
+  const runtime = new AgentSessionRuntime(initial, options, async replacement => {
+    replacementOptions = replacement
+    return createAgentRuntime(replacement)
+  })
+  appendSystemPrompt[0] = "Changed"
+
+  try {
+    await runtime.newSession()
+
+    expect(replacementOptions?.appendSystemPrompt).toEqual(["Original"])
+    expect(Object.isFrozen(replacementOptions?.appendSystemPrompt)).toBe(true)
+  } finally {
+    runtime.dispose()
+    await runtime.waitForIdle()
+  }
+})
+
+test("session runtime retains its initial global directory across ambient changes", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-session-runtime-global-dir-"))
+  const firstAgentDir = join(root, "first-agent")
+  const secondAgentDir = join(root, "second-agent")
+  const previousAgentDir = process.env.ZI_AGENT_DIR
+  const models = createModels()
+  const faux = fauxProvider({ provider: "runtime-global-dir", models: [{ id: "model" }] })
+  models.setProvider(faux.provider)
+  const options: CreateAgentRuntimeOptions = {
+    cwd: join(root, "project"),
+    model: "runtime-global-dir/model",
+    session: { type: "new", persist: false },
+    modelFactory: () => models
+  }
+  let runtime: AgentSessionRuntime | undefined
+
+  try {
+    process.env.ZI_AGENT_DIR = firstAgentDir
+    const initial = await createAgentRuntime(options)
+    runtime = new AgentSessionRuntime(initial, options, createAgentRuntime)
+    expect(runtime.services.paths.globalDir).toBe(firstAgentDir)
+
+    process.env.ZI_AGENT_DIR = secondAgentDir
+    const next = await runtime.newSession()
+
+    expect(next.services.paths.globalDir).toBe(firstAgentDir)
+  } finally {
+    if (runtime) {
+      runtime.dispose()
+      await runtime.waitForIdle()
+    }
+    if (previousAgentDir === undefined) delete process.env.ZI_AGENT_DIR
+    else process.env.ZI_AGENT_DIR = previousAgentDir
   }
 })
 
@@ -184,10 +293,15 @@ test("replacement construction failure leaves the current session usable", async
   const options: CreateAgentRuntimeOptions = {
     cwd: "/work",
     model: "runtime-failure/model",
-    persist: false,
+    session: { type: "new", persist: false },
     modelFactory: () => models
   }
-  const initial = await createTestAgentRuntime({ cwd: "/work", model: "runtime-failure/model", persist: false, models })
+  const initial = await createTestAgentRuntime({
+    cwd: "/work",
+    model: "runtime-failure/model",
+    session: { type: "new", persist: false },
+    models
+  })
   const runtime = new AgentSessionRuntime(initial, options, async () => {
     throw new Error("replacement failed")
   })
@@ -220,14 +334,24 @@ test("replacement rechecks the old session before commit and disposes a stale ca
   const options: CreateAgentRuntimeOptions = {
     cwd: "/work",
     model: "runtime-race/model",
-    persist: false,
+    session: { type: "new", persist: false },
     modelFactory: () => models
   }
-  const initial = await createTestAgentRuntime({ cwd: "/work", model: "runtime-race/model", persist: false, models })
+  const initial = await createTestAgentRuntime({
+    cwd: "/work",
+    model: "runtime-race/model",
+    session: { type: "new", persist: false },
+    models
+  })
   const candidateReady = deferred<AgentRuntime>()
   const runtime = new AgentSessionRuntime(initial, options, () => candidateReady.promise)
   const replacement = runtime.newSession()
-  const candidate = await createTestAgentRuntime({ cwd: "/work", model: "runtime-race/model", persist: false, models })
+  const candidate = await createTestAgentRuntime({
+    cwd: "/work",
+    model: "runtime-race/model",
+    session: { type: "new", persist: false },
+    models
+  })
   const run = initial.session.prompt("start")
   candidateReady.resolve(candidate)
 

@@ -24,7 +24,12 @@ test("model choices preserve registry identity and resolve provider configuratio
   const second = fauxProvider({ provider: "second", models: [{ id: "c", name: "C", reasoning: false }] })
   models.setProvider(first.provider)
   models.setProvider(second.provider)
-  const { session } = await createAgentRuntime({ cwd: "/work", model: "first/a", models, persist: false })
+  const { session } = await createAgentRuntime({
+    cwd: "/work",
+    model: "first/a",
+    models,
+    session: { type: "new", persist: false }
+  })
 
   try {
     const auth = new Map([
@@ -82,7 +87,7 @@ test("model and thinking selections persist a coherent canonical transition", as
     cwd,
     model: "select/reasoning",
     models,
-    persist: false,
+    session: { type: "new", persist: false },
     settings: { defaultThinkingLevel: "high" }
   })
   models.getAuth = async () => configuredAuth()
@@ -174,7 +179,7 @@ test("thinking mutations report an effective project override without false even
     agentDir,
     model: "thinking-shadow/model",
     models,
-    persist: false
+    session: { type: "new", persist: false }
   })
   const events: string[] = []
   session.subscribe(event => {
@@ -207,7 +212,12 @@ test("model selection rejects unconfigured and non-idle sessions before domain m
   const current = faux.getModel("current")
   const target = faux.getModel("target")
   if (!current || !target) throw new Error("Admission models not found")
-  const { session } = await createAgentRuntime({ cwd: "/work", model: "admission/current", models, persist: false })
+  const { session } = await createAgentRuntime({
+    cwd: "/work",
+    model: "admission/current",
+    models,
+    session: { type: "new", persist: false }
+  })
   const modelEvents: string[] = []
   session.subscribe(event => {
     if (event.type === "model_changed" || event.type === "thinking_level_changed") modelEvents.push(event.type)
@@ -287,7 +297,12 @@ test("model validation rejects prompt, disposal, and out-of-order completion rac
   models.setProvider(latestProvider.provider)
   const first = firstProvider.getModel()
   const latest = latestProvider.getModel()
-  const { session } = await createAgentRuntime({ cwd: "/work", model: "race-current/current", models, persist: false })
+  const { session } = await createAgentRuntime({
+    cwd: "/work",
+    model: "race-current/current",
+    models,
+    session: { type: "new", persist: false }
+  })
 
   try {
     const firstAuth = deferred<AuthResult | undefined>()
@@ -343,7 +358,7 @@ test("model change publishes every committed event when a subscriber throws", as
     cwd: "/work",
     model: "events/reasoning",
     models,
-    persist: false,
+    session: { type: "new", persist: false },
     settings: { defaultThinkingLevel: "high" }
   })
   models.getAuth = async () => configuredAuth()
@@ -372,7 +387,12 @@ test("catalog configuration work is bounded to four providers and propagates aut
     fauxProvider({ provider: `provider-${index}`, models: [{ id: `model-${index}`, reasoning: true }] })
   )
   for (const provider of providers) models.setProvider(provider.provider)
-  const { session } = await createAgentRuntime({ cwd: "/work", model: "provider-0/model-0", models, persist: false })
+  const { session } = await createAgentRuntime({
+    cwd: "/work",
+    model: "provider-0/model-0",
+    models,
+    session: { type: "new", persist: false }
+  })
 
   try {
     const release = deferred<void>()
@@ -413,7 +433,12 @@ test("catalog, selection, and failure retries share one four-provider auth bound
   )
   for (const provider of providers) models.setProvider(provider.provider)
   const external = fauxProvider({ provider: "external", models: [{ id: "target", reasoning: true }] }).getModel()
-  const { session } = await createAgentRuntime({ cwd: "/work", model: "shared-0/model-0", models, persist: false })
+  const { session } = await createAgentRuntime({
+    cwd: "/work",
+    model: "shared-0/model-0",
+    models,
+    session: { type: "new", persist: false }
+  })
 
   try {
     const release = deferred<void>()

@@ -252,7 +252,13 @@ async function createSettingsFixture(
   const models = createModels()
   const faux = fauxProvider({ provider: "settings", models: [{ id: "model", reasoning: true }] })
   models.setProvider(faux.provider)
-  const { session } = await createTestAgentRuntime({ cwd, agentDir, model: "settings/model", models, persist: false })
+  const { session } = await createTestAgentRuntime({
+    cwd,
+    agentDir,
+    model: "settings/model",
+    models,
+    session: { type: "new", persist: false }
+  })
   const setup = await createInteractiveTest(session, { width: 100, height: 18, kittyKeyboard: true })
   return { session, setup }
 }

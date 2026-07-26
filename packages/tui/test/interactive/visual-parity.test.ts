@@ -22,7 +22,7 @@ test("representative session keeps the accepted visual hierarchy at normal and c
     cwd: "/workspace/zi",
     model: "faux/faux-1",
     models,
-    persist: false,
+    session: { type: "new", persist: false },
     settings: { defaultThinkingLevel: "high" }
   })
   const model = bootstrap.session.model
@@ -119,7 +119,7 @@ test("composer distinguishes estimated context after compaction", async () => {
   const bootstrap = await createAgentRuntime({
     cwd: "/work",
     models,
-    persist: false,
+    session: { type: "new", persist: false },
     settings: { compactionReserveTokens: 100, compactionKeepRecentTokens: 1 }
   })
   const model = bootstrap.session.model

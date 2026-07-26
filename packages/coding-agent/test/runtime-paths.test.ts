@@ -52,7 +52,12 @@ test("runtime settings and sessions share the resumed session cwd path policy", 
   ).toEqual(["model_change", "thinking_level_change", "message", "message"])
   created.session.dispose()
 
-  const resumed = await createTestAgentRuntime({ cwd: join(root, "ignored"), agentDir: globalDir, sessionFile, models })
+  const resumed = await createTestAgentRuntime({
+    cwd: join(root, "ignored"),
+    agentDir: globalDir,
+    session: { type: "resume", file: sessionFile },
+    models
+  })
   try {
     expect(resumed.services.paths.cwd).toBe(resolve(cwd))
     expect(resumed.services.paths.projectDir).toBe(join(resolve(cwd), ".zi"))
@@ -86,7 +91,7 @@ test("runtime continueRecent reuses the newest current-cwd journal", async () =>
     JSON.stringify({ defaultProvider: "changed-default", defaultModel: "model", defaultThinkingLevel: "high" })
   )
 
-  const continued = await createTestAgentRuntime({ cwd, agentDir, continueRecent: true, models })
+  const continued = await createTestAgentRuntime({ cwd, agentDir, session: { type: "continue" }, models })
   try {
     expect(continued.session.sessionManager.sessionId).toBe(sessionId)
     expect(continued.session.model).toBe(original.getModel())
@@ -115,7 +120,12 @@ test("resume derives an old journal model and repairs missing thinking metadata"
   const models = createModels()
   const faux = fauxProvider({ provider: "context-repair", models: [{ id: "model", reasoning: true }] })
   models.setProvider(faux.provider)
-  const resumed = await createTestAgentRuntime({ cwd: "/ignored", agentDir, sessionFile: journal.file!, models })
+  const resumed = await createTestAgentRuntime({
+    cwd: "/ignored",
+    agentDir,
+    session: { type: "resume", file: journal.file! },
+    models
+  })
 
   try {
     expect(resumed.session.model).toBe(faux.getModel())
@@ -154,7 +164,7 @@ test("the model factory receives the runtime-owned credential store", async () =
     cwd: join(root, "project"),
     agentDir: join(root, "global"),
     model: "factory/model",
-    persist: false,
+    session: { type: "new", persist: false },
     modelFactory(credentials) {
       received = credentials
       const models = createModels({ credentials })

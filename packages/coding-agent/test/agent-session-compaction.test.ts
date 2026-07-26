@@ -397,7 +397,7 @@ test("automatic thresholds follow the newly selected model window", async () => 
     cwd: "/work",
     model: "window-change/small",
     models,
-    persist: false,
+    session: { type: "new", persist: false },
     settings: { compactionReserveTokens: 100, compactionKeepRecentTokens: 1 }
   })
   const small = bootstrap.session.model
@@ -690,7 +690,7 @@ async function compactionSession(
     cwd: "/work",
     model: "compaction/model",
     models,
-    persist: false,
+    session: { type: "new", persist: false },
     settings: {
       compactionEnabled: true,
       compactionReserveTokens: 100,

@@ -23,7 +23,7 @@ test("retry countdown is visible and the semantic interrupt cancels its backoff"
   const { session } = await createAgentRuntime({
     cwd: "/work",
     models,
-    persist: false,
+    session: { type: "new", persist: false },
     settings: { retryBaseDelayMs: 15_000 }
   })
   const setup = await createInteractiveTest(session, { width: 72, height: 10 })
@@ -73,7 +73,7 @@ test("successful retry retains the failed attempt as transcript evidence", async
   const { session } = await createAgentRuntime({
     cwd: "/work",
     models,
-    persist: false,
+    session: { type: "new", persist: false },
     settings: { retryBaseDelayMs: 0 }
   })
   const setup = await createInteractiveTest(session, { width: 72, height: 12 })

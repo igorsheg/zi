@@ -1,5 +1,7 @@
 #!/usr/bin/env bun
 
+import { homedir } from "node:os"
+
 import {
   defaultRuntimeFactory,
   defaultSessionRuntimeFactory,
@@ -25,6 +27,9 @@ export function defaultCliArgv(argv: readonly string[] = process.argv): readonly
 
 function processHost(): CliHost {
   return {
+    cwd: process.cwd(),
+    home: homedir(),
+    env: Object.freeze({ ...process.env }),
     stdinIsTTY: process.stdin.isTTY,
     stdoutIsTTY: process.stdout.isTTY,
     readStdin: readPipedStdin,

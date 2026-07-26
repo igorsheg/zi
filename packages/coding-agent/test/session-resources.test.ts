@@ -47,7 +47,12 @@ test("AgentSession owns resource catalogs, prompt construction, and command expa
       return fauxAssistantMessage("tools changed")
     }
   ])
-  const { session } = await createAgentRuntime({ cwd, agentDir: globalDir, models, persist: false })
+  const { session } = await createAgentRuntime({
+    cwd,
+    agentDir: globalDir,
+    models,
+    session: { type: "new", persist: false }
+  })
 
   try {
     expect(session.promptTemplates.map(template => template.name)).toEqual(["review"])
@@ -96,7 +101,12 @@ test("steering and follow-up queues retain expanded resource input", async () =>
     fauxAssistantMessage("steering"),
     fauxAssistantMessage("follow-up")
   ])
-  const { session } = await createAgentRuntime({ cwd, agentDir: paths.globalDir, models, persist: false })
+  const { session } = await createAgentRuntime({
+    cwd,
+    agentDir: paths.globalDir,
+    models,
+    session: { type: "new", persist: false }
+  })
 
   try {
     const run = session.prompt("start")

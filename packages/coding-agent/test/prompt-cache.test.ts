@@ -44,7 +44,12 @@ test("ordinary and tool-loop requests preserve one cache-affinity prefix", async
     captureRequest(requests, fauxAssistantMessage("turn two complete"))
   ])
 
-  const { session } = await createAgentRuntime({ cwd: root, model: "faux/faux-1", models, persist: false })
+  const { session } = await createAgentRuntime({
+    cwd: root,
+    model: "faux/faux-1",
+    models,
+    session: { type: "new", persist: false }
+  })
   session.setActiveTools([
     {
       name: "probe",
@@ -110,8 +115,7 @@ test("resume preserves cache affinity and provider replay metadata", async () =>
     cwd: root,
     model: "faux/faux-1",
     sessionDir: join(root, "sessions"),
-    models,
-    persist: true
+    models
   })
   const prior = await (async () => {
     try {
@@ -126,9 +130,8 @@ test("resume preserves cache affinity and provider replay metadata", async () =>
 
   const resumed = await createAgentRuntime({
     cwd: "/ignored-on-resume",
-    sessionFile: prior.file,
-    models,
-    persist: true
+    session: { type: "resume", file: prior.file },
+    models
   })
   try {
     expect(resumed.session.sessionId).toBe(prior.sessionId)

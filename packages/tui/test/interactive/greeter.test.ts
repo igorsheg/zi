@@ -14,7 +14,7 @@ test("a fresh session greets the user immediately above the composer", async () 
   const models = createModels()
   const faux = fauxProvider()
   models.setProvider(faux.provider)
-  const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
+  const { session } = await createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
   const setup = await createInteractiveTest(session, { width: 40, height: 12 })
 
   try {
@@ -45,7 +45,7 @@ test("resizing reuses the greeter and keeps the composer focused", async () => {
   const models = createModels()
   const faux = fauxProvider()
   models.setProvider(faux.provider)
-  const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
+  const { session } = await createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
   const setup = await createInteractiveTest(session, { width: 40, height: 12 })
 
   try {
@@ -89,7 +89,7 @@ test("the greeter yields its rows to a prompt picker", async () => {
   const models = createModels()
   const faux = fauxProvider()
   models.setProvider(faux.provider)
-  const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
+  const { session } = await createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
   const setup = await createInteractiveTest(session, { width: 40, height: 12, kittyKeyboard: true })
 
   try {
@@ -114,7 +114,7 @@ test("an existing session opens without the greeter", async () => {
   const faux = fauxProvider()
   faux.setResponses([fauxAssistantMessage("earlier response")])
   models.setProvider(faux.provider)
-  const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
+  const { session } = await createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
   await session.prompt("earlier prompt")
   const setup = await createInteractiveTest(session, { width: 40, height: 12 })
 
@@ -134,7 +134,7 @@ test("the greeter leaves when the first prompt becomes part of the session", asy
   const faux = fauxProvider()
   faux.setResponses([fauxAssistantMessage("hello")])
   models.setProvider(faux.provider)
-  const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
+  const { session } = await createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
   const setup = await createInteractiveTest(session, { width: 40, height: 12 })
 
   try {

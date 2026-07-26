@@ -35,7 +35,7 @@ test("steering waits for the current tool batch and leaves the pending queue bef
   const started = deferred<void>()
   const release = deferred<void>()
   let startedTools = 0
-  const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
+  const { session } = await createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
   session.setActiveTools([
     {
       name: "hold",
@@ -88,7 +88,7 @@ test("default queue modes deliver steering first and one entry per assistant res
     })
   ])
 
-  const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
+  const { session } = await createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
   const hold = installHoldingTool(session)
   const run = session.prompt("start")
   await hold.started.promise
@@ -124,7 +124,7 @@ test("all queue modes batch each selected queue while preserving steering priori
   const { session } = await createAgentRuntime({
     cwd: "/work",
     models,
-    persist: false,
+    session: { type: "new", persist: false },
     settings: { steeringMode: "all", followUpMode: "all" }
   })
   const hold = installHoldingTool(session)
@@ -156,7 +156,7 @@ test("steering mode mutation persists globally and updates live behavior", async
 
   const models = createModels()
   models.setProvider(fauxProvider().provider)
-  const { session } = await createAgentRuntime({ cwd, agentDir, models, persist: false })
+  const { session } = await createAgentRuntime({ cwd, agentDir, models, session: { type: "new", persist: false } })
 
   expect(session.steeringMode).toBe("one-at-a-time")
   const entriesBefore = session.sessionManager.entries()
@@ -181,7 +181,7 @@ test("follow-up mode mutation persists project scope and updates live behavior",
 
   const models = createModels()
   models.setProvider(fauxProvider().provider)
-  const { session } = await createAgentRuntime({ cwd, agentDir, models, persist: false })
+  const { session } = await createAgentRuntime({ cwd, agentDir, models, session: { type: "new", persist: false } })
 
   expect(session.followUpMode).toBe("one-at-a-time")
   expect(session.setFollowUpMode("all", "project")).toEqual({ scope: "project", requested: "all", effective: "all" })
@@ -205,7 +205,7 @@ test("queue mode events publish only effective layered changes", async () => {
 
   const models = createModels()
   models.setProvider(fauxProvider().provider)
-  const { session } = await createAgentRuntime({ cwd, agentDir, models, persist: false })
+  const { session } = await createAgentRuntime({ cwd, agentDir, models, session: { type: "new", persist: false } })
   const changes: string[] = []
   session.subscribe(event => {
     if (event.type === "steering_mode_changed") changes.push(event.mode)
@@ -222,7 +222,7 @@ test("queue mode events publish only effective layered changes", async () => {
 test("subscriber failure cannot roll back a committed follow-up mode change", async () => {
   const models = createModels()
   models.setProvider(fauxProvider().provider)
-  const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
+  const { session } = await createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
   let calls = 0
   session.subscribe(event => {
     if (event.type !== "follow_up_mode_changed") return
@@ -240,7 +240,7 @@ test("subscriber failure cannot roll back a committed follow-up mode change", as
 test("queue mode mutations reject unknown scopes without changing live state", async () => {
   const models = createModels()
   models.setProvider(fauxProvider().provider)
-  const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
+  const { session } = await createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
 
   // oxlint-disable-next-line typescript/unbound-method -- Reflect models an untyped JavaScript SDK caller.
   expect(() => Reflect.apply(session.setSteeringMode, session, ["all", "workspace"])).toThrow(
@@ -254,7 +254,7 @@ test("queue mode mutations reject unknown scopes without changing live state", a
 test("queue mode mutations reject unknown modes without changing settings", async () => {
   const models = createModels()
   models.setProvider(fauxProvider().provider)
-  const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
+  const { session } = await createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
 
   // oxlint-disable-next-line typescript/unbound-method -- Reflect models an untyped JavaScript SDK caller.
   expect(() => Reflect.apply(session.setFollowUpMode, session, ["grouped", "global"])).toThrow(
@@ -275,7 +275,7 @@ test("settings persistence failure leaves live queue modes unchanged", async () 
 
   const models = createModels()
   models.setProvider(fauxProvider().provider)
-  const { session } = await createAgentRuntime({ cwd, agentDir, models, persist: false })
+  const { session } = await createAgentRuntime({ cwd, agentDir, models, session: { type: "new", persist: false } })
   let changes = 0
   session.subscribe(event => {
     if (event.type === "follow_up_mode_changed") changes++
@@ -296,14 +296,24 @@ test("recreated runtimes restore persisted queue modes", async () => {
 
   const firstModels = createModels()
   firstModels.setProvider(fauxProvider().provider)
-  const first = await createAgentRuntime({ cwd, agentDir, models: firstModels, persist: false })
+  const first = await createAgentRuntime({
+    cwd,
+    agentDir,
+    models: firstModels,
+    session: { type: "new", persist: false }
+  })
   first.session.setSteeringMode("all", "global")
   first.session.setFollowUpMode("all", "project")
   first.session.dispose()
 
   const secondModels = createModels()
   secondModels.setProvider(fauxProvider().provider)
-  const second = await createAgentRuntime({ cwd, agentDir, models: secondModels, persist: false })
+  const second = await createAgentRuntime({
+    cwd,
+    agentDir,
+    models: secondModels,
+    session: { type: "new", persist: false }
+  })
   expect(second.session.steeringMode).toBe("all")
   expect(second.session.followUpMode).toBe("all")
   second.session.dispose()
@@ -326,7 +336,7 @@ test("queue mode mutations during a run control the next eligible drains", async
     }
   ])
 
-  const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
+  const { session } = await createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
   const hold = installHoldingTool(session)
   const run = session.prompt("start")
   await hold.started.promise
@@ -353,7 +363,7 @@ test("same-text entries retain identity, images, and grouped dequeue order", asy
     fauxAssistantMessage(fauxToolCall("hold", {}, { id: "hold-identity" }), { stopReason: "toolUse" }),
     fauxAssistantMessage("done")
   ])
-  const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
+  const { session } = await createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
   const hold = installHoldingTool(session)
   const firstImage: ImageContent = { type: "image", mimeType: "image/png", data: "AAAA" }
   const secondImage: ImageContent = { type: "image", mimeType: "image/jpeg", data: "BBBB" }
@@ -386,7 +396,7 @@ test("delivery commits the exact entry before a concurrent clear detaches the re
     fauxAssistantMessage(fauxToolCall("hold", {}, { id: "hold-boundary" }), { stopReason: "toolUse" }),
     fauxAssistantMessage("done")
   ])
-  const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
+  const { session } = await createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
   const hold = installHoldingTool(session)
   let takenAtDelivery: ReturnType<AgentSession["takeQueuedInputs"]> | undefined
   session.subscribe(event => {
@@ -420,7 +430,7 @@ test("queue bounds are aggregate, exact, and reject without mutation or events",
       return response.promise
     }
   ])
-  const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
+  const { session } = await createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
   let updates = 0
   session.subscribe(event => {
     if (event.type === "queue_update") updates++
@@ -465,7 +475,7 @@ test("queue operations enforce activity transitions and Escape abort shares sett
       return response.promise
     }
   ])
-  const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
+  const { session } = await createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
   session.steer("idle")
   expect(session.takeQueuedInputs().steering.map(entry => entry.text)).toEqual(["idle"])
   const run = session.prompt("start")
@@ -504,7 +514,7 @@ test("queue detachment is published before abort reaches the active provider", a
       return fauxAssistantMessage("aborted", { stopReason: "aborted" })
     }
   ])
-  const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
+  const { session } = await createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
   session.subscribe(event => {
     if (event.type === "queue_update") order.push(`queue:${event.steering.length + event.followUp.length}`)
   })
@@ -543,7 +553,7 @@ test("waitForIdle captures its run when an agent-settled listener starts the nex
       return fauxAssistantMessage("second done")
     }
   ])
-  const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
+  const { session } = await createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
   let secondRun: Promise<void> | undefined
   session.subscribe(event => {
     if (event.type === "agent_settled" && !secondRun) secondRun = session.prompt("second")
@@ -577,7 +587,7 @@ test("agent-end admission and provider errors continue within one logical run", 
     fauxAssistantMessage("after error"),
     fauxAssistantMessage("late continuation")
   ])
-  const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
+  const { session } = await createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
   let admittedLate = false
   let settled = 0
   session.subscribe(event => {
@@ -615,7 +625,7 @@ test("idle inputs queue for the next run and survive public abort", async () => 
       return fauxAssistantMessage("second")
     }
   ])
-  const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
+  const { session } = await createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
 
   session.steer("before prompt")
   session.followUp("after turn")
@@ -647,7 +657,7 @@ test("public abort preserves queued work and continues it after the aborted core
     },
     fauxAssistantMessage("continued")
   ])
-  const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
+  const { session } = await createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
   const run = session.prompt("start")
   await providerStarted.promise
   session.followUp("preserve me")
@@ -680,7 +690,7 @@ test("shutdown abort discards queued work before cancelling the active run", asy
     },
     fauxAssistantMessage("must not continue")
   ])
-  const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
+  const { session } = await createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
   const run = session.prompt("start")
   await providerStarted.promise
   session.followUp("discard me")
@@ -701,7 +711,7 @@ test("subscriber failures reject their operation without stranding session settl
   const faux = fauxProvider()
   models.setProvider(faux.provider)
   faux.setResponses([fauxAssistantMessage("first"), fauxAssistantMessage("second")])
-  const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
+  const { session } = await createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
   let settledEvents = 0
   const unsubscribeQueueFailure = session.subscribe(event => {
     if (event.type === "queue_update") throw new Error("queue listener failed")
@@ -745,7 +755,7 @@ test("a failed run detaches the core queue and requires explicit recovery before
       return fauxAssistantMessage("fresh response")
     }
   ])
-  const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
+  const { session } = await createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
   const appendMessage = session.sessionManager.appendMessage.bind(session.sessionManager)
   let failPersistence = false
   session.sessionManager.appendMessage = message => {
@@ -781,7 +791,7 @@ test("same-text delivery acknowledges only the committed identity", async () => 
     fauxAssistantMessage(fauxToolCall("hold", {}, { id: "hold-duplicate-boundary" }), { stopReason: "toolUse" }),
     fauxAssistantMessage("done")
   ])
-  const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
+  const { session } = await createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
   const hold = installHoldingTool(session)
   const steeringImage: ImageContent = { type: "image", mimeType: "image/jpeg", data: "steering" }
   const followUpImage: ImageContent = { type: "image", mimeType: "image/png", data: "follow-up" }
@@ -815,7 +825,7 @@ test("Escape abort at queued message commit returns only the undelivered remaind
     fauxAssistantMessage(fauxToolCall("hold", {}, { id: "hold-abort-boundary" }), { stopReason: "toolUse" }),
     fauxAssistantMessage("aborted", { stopReason: "aborted" })
   ])
-  const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
+  const { session } = await createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
   const hold = installHoldingTool(session)
   let aborted: ReturnType<AgentSession["takeQueuedInputsAndAbort"]> | undefined
   let settlements = 0
@@ -851,7 +861,7 @@ test("delivery acknowledgement reclaims queue count capacity", async () => {
     fauxAssistantMessage(fauxToolCall("hold", {}, { id: "hold-count-reclaim" }), { stopReason: "toolUse" }),
     fauxAssistantMessage("done")
   ])
-  const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
+  const { session } = await createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
   const hold = installHoldingTool(session)
   let remainder: ReturnType<AgentSession["takeQueuedInputs"]> | undefined
   session.subscribe(event => {
@@ -880,7 +890,7 @@ test("delivery acknowledgement reclaims UTF-8 byte capacity", async () => {
     fauxAssistantMessage(fauxToolCall("hold", {}, { id: "hold-byte-reclaim" }), { stopReason: "toolUse" }),
     fauxAssistantMessage("done")
   ])
-  const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
+  const { session } = await createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
   const hold = installHoldingTool(session)
   const exactText = "界".repeat(Math.floor(maxPendingInputBytes / 3)) + "aa"
   let replacement: ReturnType<AgentSession["takeQueuedInputs"]> | undefined

@@ -382,7 +382,7 @@ test("streamed tool execution leaves a detached native viewport anchored", async
     },
     fauxAssistantMessage(fauxThinking("tool complete"))
   ])
-  const { session } = await createAgentRuntime({ cwd: process.cwd(), models, persist: false })
+  const { session } = await createAgentRuntime({ cwd: process.cwd(), models, session: { type: "new", persist: false } })
   await session.prompt("seed history")
   const setup = await createInteractiveTest(session, { width: 48, height: 12, kittyKeyboard: true })
 
@@ -452,7 +452,7 @@ async function createTranscriptSession(responseCount: number): Promise<AgentSess
       fauxAssistantMessage(fauxThinking(`streamed thought ${index + 1}`))
     )
   )
-  const bootstrap = await createAgentRuntime({ cwd: "/work", models, persist: false })
+  const bootstrap = await createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
   const model = bootstrap.session.model
   bootstrap.session.dispose()
 

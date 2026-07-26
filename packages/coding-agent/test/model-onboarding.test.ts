@@ -27,7 +27,7 @@ test("a runtime without configured providers starts with an explicit unselected 
   const { session } = await createAgentRuntime({
     cwd: join(root, "project"),
     agentDir: join(root, "global"),
-    persist: false,
+    session: { type: "new", persist: false },
     modelFactory(credentials) {
       const models = createModels({ credentials })
       models.setProvider(provider)
@@ -63,7 +63,7 @@ test("selecting an authenticated model leaves the unselected state once and pers
   const runtime = await createAgentRuntime({
     cwd: join(root, "project"),
     agentDir: join(root, "global"),
-    persist: false,
+    session: { type: "new", persist: false },
     modelFactory(credentials) {
       const models = createModels({ credentials })
       models.setProvider(provider)
@@ -102,7 +102,7 @@ test("an unavailable settings default falls back to the first configured model",
   const runtime = await createAgentRuntime({
     cwd: join(root, "project"),
     agentDir: globalDir,
-    persist: false,
+    session: { type: "new", persist: false },
     modelFactory(credentials) {
       const models = createModels({ credentials })
       models.setProvider(faux.provider)
@@ -130,7 +130,11 @@ test("automatic selection prefers Pi's provider default over registry order", as
   models.setProvider(faux.provider)
   const preferred = faux.getModel("gpt-5.5")
   if (!preferred) throw new Error("Preferred model not found")
-  const runtime = await createAgentRuntime({ cwd: "/work", persist: false, modelFactory: () => models })
+  const runtime = await createAgentRuntime({
+    cwd: "/work",
+    session: { type: "new", persist: false },
+    modelFactory: () => models
+  })
 
   try {
     expect(runtime.session.model).toBe(preferred)
@@ -151,7 +155,7 @@ test("resume warns when its saved model is unavailable and names the configured 
   const runtime = await createAgentRuntime({
     cwd: join(root, "ignored"),
     agentDir: join(root, "global"),
-    sessionFile,
+    session: { type: "resume", file: sessionFile },
     modelFactory() {
       const models = createModels()
       models.setProvider(faux.provider)
@@ -212,7 +216,7 @@ test("resuming a session whose model is no longer authenticated preserves histor
   const resumed = await createAgentRuntime({
     cwd: join(root, "ignored"),
     agentDir: globalDir,
-    sessionFile,
+    session: { type: "resume", file: sessionFile },
     modelFactory
   })
 

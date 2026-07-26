@@ -25,7 +25,7 @@ test("a transient assistant failure retries inside one logical prompt", async ()
   const { session } = await createAgentRuntime({
     cwd: "/work",
     models,
-    persist: false,
+    session: { type: "new", persist: false },
     settings: { retryEnabled: true, retryMaxRetries: 3, retryBaseDelayMs: 0 }
   })
   const events: string[] = []
@@ -62,7 +62,7 @@ test("disabled retry and quota exhaustion fail without another provider call", a
     const { session } = await createAgentRuntime({
       cwd: "/work",
       models,
-      persist: false,
+      session: { type: "new", persist: false },
       settings: { retryEnabled: scenario.retryEnabled, retryBaseDelayMs: 0 }
     })
     const retryEvents: string[] = []
@@ -91,7 +91,7 @@ test("retry exhaustion keeps the final failure and closes one attempt sequence",
   const { session } = await createAgentRuntime({
     cwd: "/work",
     models,
-    persist: false,
+    session: { type: "new", persist: false },
     settings: { retryEnabled: true, retryMaxRetries: 2, retryBaseDelayMs: 0 }
   })
   const events: string[] = []
@@ -178,7 +178,7 @@ test("terminal overflow closes an active retry sequence", async () => {
     cwd: "/work",
     model: "faux/small",
     models,
-    persist: false,
+    session: { type: "new", persist: false },
     settings: { retryBaseDelayMs: 0, compactionEnabled: false }
   })
   const events: string[] = []
@@ -206,7 +206,7 @@ test("cancelling retry backoff restores queued input and settles the logical pro
   const { session } = await createAgentRuntime({
     cwd: "/work",
     models,
-    persist: false,
+    session: { type: "new", persist: false },
     settings: { retryEnabled: true, retryMaxRetries: 3, retryBaseDelayMs: 15_000 }
   })
   const retryStarted = deferred<void>()
@@ -269,7 +269,7 @@ test("cancelling a started retry reports unsuccessful completion", async () => {
   const { session } = await createAgentRuntime({
     cwd: "/work",
     models,
-    persist: false,
+    session: { type: "new", persist: false },
     settings: { retryBaseDelayMs: 0 }
   })
   const retryEnds: boolean[] = []
@@ -312,7 +312,7 @@ test("queued follow-up input waits for retry recovery inside the logical prompt"
   const { session } = await createAgentRuntime({
     cwd: "/work",
     models,
-    persist: false,
+    session: { type: "new", persist: false },
     settings: { retryBaseDelayMs: 0 }
   })
 
@@ -357,7 +357,7 @@ test("compaction never folds excluded retry failures back into summarized contex
     cwd: "/work",
     model: "retry-compaction/model",
     models,
-    persist: false,
+    session: { type: "new", persist: false },
     settings: {
       retryBaseDelayMs: 0,
       compactionEnabled: true,
@@ -403,7 +403,7 @@ test("resuming a successful retry never restores failed attempts to provider con
   const resumed = await createAgentRuntime({
     cwd: "/ignored",
     agentDir: join(root, "agent"),
-    sessionFile,
+    session: { type: "resume", file: sessionFile },
     models,
     settings: { retryBaseDelayMs: 0 }
   })

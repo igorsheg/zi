@@ -48,7 +48,7 @@ test("runtime API key wins for its selected provider without changing stored cre
     agentDir: globalDir,
     model: "secured/model",
     apiKey: "runtime-key",
-    persist: false,
+    session: { type: "new", persist: false },
     modelFactory
   })
   try {
@@ -64,7 +64,7 @@ test("runtime API key wins for its selected provider without changing stored cre
     cwd: join(root, "project"),
     agentDir: globalDir,
     model: "secured/model",
-    persist: false,
+    session: { type: "new", persist: false },
     modelFactory
   })
   try {
@@ -92,7 +92,7 @@ test("runtime API key alone authenticates its explicit model without creating au
     agentDir: globalDir,
     model: "key-only/model",
     apiKey: "runtime-key",
-    persist: false,
+    session: { type: "new", persist: false },
     modelFactory(credentials) {
       const models = createModels({ credentials })
       models.setProvider(provider)
@@ -119,7 +119,7 @@ test("runtime API key requires a model provider", async () => {
       cwd: join(root, "project"),
       agentDir: join(root, "global"),
       apiKey: "runtime-key",
-      persist: false,
+      session: { type: "new", persist: false },
       modelFactory: credentials => createModels({ credentials })
     })
   )

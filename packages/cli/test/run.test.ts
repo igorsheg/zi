@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test"
-import { join } from "node:path"
+import { tmpdir } from "node:os"
+import { join, resolve as resolvePath } from "node:path"
 
 import type { AgentMessage, AgentRuntime, AgentSessionRuntime, CreateAgentRuntimeOptions } from "@with-zi/coding-agent"
 import {
@@ -20,6 +21,8 @@ import {
   type CliHost,
   type CliSignal
 } from "../src/run.js"
+
+const cliTestHome = join(tmpdir(), `zi-cli-${process.pid}`)
 
 test("spawned help stays stdout-clean and never initializes a terminal", async () => {
   const child = Bun.spawn([process.execPath, join(import.meta.dir, "../src/main.ts"), "--help"], {
@@ -62,15 +65,15 @@ test("CLI argument defaults handle Bun scripts and compiled executables", () => 
   expect(defaultCliArgv(["C:\\tools\\zi.exe", "-V"])).toEqual(["-V"])
 })
 
-test("CLI mode resolution gives explicit JSON priority and otherwise follows TTY facts", () => {
-  const base = { cwd: "/work", noSession: false, print: false, messages: [], help: false, version: false } as const
-
-  expect(resolveAppMode({ ...base, mode: "json" }, true, true)).toBe("json")
-  expect(resolveAppMode({ ...base, mode: "text" }, true, true)).toBe("text")
-  expect(resolveAppMode({ ...base, print: true }, true, true)).toBe("text")
-  expect(resolveAppMode(base, false, true)).toBe("text")
-  expect(resolveAppMode(base, true, false)).toBe("text")
-  expect(resolveAppMode(base, true, true)).toBe("interactive")
+test("CLI mode resolution keeps explicit protocols and otherwise follows TTY facts", () => {
+  expect(resolveAppMode("json", true, true)).toBe("json")
+  expect(resolveAppMode("text", true, true)).toBe("text")
+  expect(resolveAppMode("auto", false, true)).toBe("text")
+  expect(resolveAppMode("auto", true, false)).toBe("text")
+  expect(resolveAppMode("auto", true, true)).toBe("interactive")
+  expect(resolveAppMode("interactive", true, true)).toBe("interactive")
+  expect(() => resolveAppMode("interactive", false, true)).toThrow("Interactive mode requires TTY stdin and stdout")
+  expect(() => resolveAppMode("interactive", true, false)).toThrow("Interactive mode requires TTY stdin and stdout")
 })
 
 test("text mode writes final output without loading the TUI and disposes its runtime", async () => {
@@ -109,10 +112,92 @@ test("text mode writes final output without loading the TUI and disposes its run
     host
   )
   expect({ exitCode, output, errors }).toEqual({ exitCode: 0, output: ["done\n"], errors: [] })
-  expect(receivedOptions).toMatchObject({ persist: false, apiKey: "cli-secret" })
+  expect(receivedOptions).toMatchObject({ session: { type: "new", persist: false }, apiKey: "cli-secret" })
   expect(output.join("")).not.toContain("cli-secret")
   expect(interactiveLoads).toBe(0)
   expect(() => runtime?.session.prompt("disposed")).toThrow("AgentSession is disposed")
+})
+
+test("environment defaults resolve once before runtime construction and CLI values win", async () => {
+  const models = createModels()
+  const faux = fauxProvider()
+  models.setProvider(faux.provider)
+  faux.setResponses([fauxAssistantMessage("done")])
+  let receivedOptions: CreateAgentRuntimeOptions | undefined
+  const output: string[] = []
+  const errors: string[] = []
+  const host = testHost({
+    output,
+    errors,
+    cwd: "/process-cwd",
+    env: {
+      ZI_MODE: "text",
+      ZI_AGENT_DIR: "/env-agent",
+      ZI_SESSION_DIR: "/env-sessions",
+      ZI_DEFAULT_MODEL: "ignored/model",
+      ZI_DEFAULT_THINKING: "low"
+    },
+    async createRuntime(options) {
+      receivedOptions = options
+      return createTestAgentRuntime({
+        ...options,
+        cwd: "/work",
+        agentDir: "/agent",
+        session: { type: "new", persist: false },
+        models
+      })
+    }
+  })
+
+  const model = `${faux.getModel().provider}/${faux.getModel().id}`
+  const exitCode = await runCli(
+    [
+      "--model",
+      model,
+      "--thinking",
+      "high",
+      "--system-prompt",
+      "Act as a reviewer",
+      "--append-system-prompt",
+      "Use concise findings",
+      "start"
+    ],
+    host
+  )
+
+  expect({ exitCode, output, errors }).toEqual({ exitCode: 0, output: ["done\n"], errors: [] })
+  expect(receivedOptions).toMatchObject({
+    cwd: resolvePath("/process-cwd"),
+    agentDir: resolvePath("/env-agent"),
+    sessionDir: resolvePath("/env-sessions"),
+    model,
+    thinkingLevel: "high",
+    systemPrompt: "Act as a reviewer",
+    appendSystemPrompt: ["Use concise findings"]
+  })
+})
+
+test("environment model existence remains runtime-owned after piped stdin", async () => {
+  const models = createModels()
+  let reads = 0
+  const output: string[] = []
+  const errors: string[] = []
+  const host = testHost({
+    output,
+    errors,
+    stdin: "piped",
+    stdinIsTTY: false,
+    env: { ZI_MODE: "text", ZI_DEFAULT_MODEL: "missing/model" },
+    onReadStdin() {
+      reads++
+    },
+    createRuntime: options => createTestAgentRuntime({ ...options, models })
+  })
+
+  expect(await runCli([], host)).toBe(1)
+  expect(reads).toBe(1)
+  expect(output).toEqual([])
+  expect(errors).toEqual(["Unknown model: missing/model. Use provider/model-id.\n"])
 })
 
 test("headless startup writes model fallback diagnostics to stderr", async () => {
@@ -218,9 +303,8 @@ test("continue-recent reaches runtime construction as a distinct headless intent
     errors,
     async createRuntime(options) {
       receivedOptions = options
-      const testOptions = { ...options }
-      delete testOptions.continueRecent
-      return createTestAgentRuntime({ ...testOptions, persist: false, models })
+      const testOptions = { ...options, session: { type: "new" as const, persist: false } }
+      return createTestAgentRuntime({ ...testOptions, models })
     }
   })
 
@@ -230,7 +314,7 @@ test("continue-recent reaches runtime construction as a distinct headless intent
   )
 
   expect(exitCode).toBe(0)
-  expect(receivedOptions?.continueRecent).toBe(true)
+  expect(receivedOptions?.session).toEqual({ type: "continue" })
   expect(output).toEqual(["continued\n"])
   expect(errors).toEqual([])
 })
@@ -296,6 +380,7 @@ test("help exits without reading stdin, creating a runtime, or loading the TUI",
   const host = testHost({
     output,
     errors,
+    env: { ZI_MODE: "invalid-but-irrelevant-to-help" },
     onReadStdin() {
       reads++
     },
@@ -413,6 +498,9 @@ interface TestHostOptions {
   readonly output: string[]
   readonly errors: string[]
   readonly createRuntime: CliHost["createRuntime"]
+  readonly cwd?: string
+  readonly home?: string
+  readonly env?: Readonly<Record<string, string | undefined>>
   readonly createSessionRuntime?: CliHost["createSessionRuntime"]
   readonly runInteractive?: CliHost["runInteractive"]
   readonly stdin?: string
@@ -434,6 +522,9 @@ function userText(message: AgentMessage): string {
 
 function testHost(options: TestHostOptions): CliHost {
   return {
+    cwd: options.cwd ?? "/work",
+    home: options.home ?? cliTestHome,
+    env: options.env ?? {},
     stdinIsTTY: options.stdinIsTTY ?? true,
     stdoutIsTTY: options.stdoutIsTTY ?? true,
     async readStdin() {

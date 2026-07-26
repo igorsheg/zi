@@ -20,7 +20,7 @@ Pi keeps these concerns separate in `core/sdk.ts`, `core/model-resolver.ts`, `co
 
 Global settings load first, project settings override them, and construction overrides remain invocation-local. Session metadata never enters `SettingsManager`.
 
-`createAgentSession()` owns bootstrap after runtime construction has selected the cwd-bound services and optional explicit model. It classifies the journal directly:
+`createAgentRuntime()` admits one closed session intent—new with an explicit persistence choice, continue recent, or resume an exact file—and snapshots mutable invocation inputs before asynchronous work. `createAgentSession()` owns bootstrap after runtime construction has selected the journal, cwd-bound services, and optional explicit model. It classifies the journal directly:
 
 ```text
 new(context with no messages)

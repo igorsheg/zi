@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test"
 import { existsSync } from "node:fs"
-import { mkdtemp } from "node:fs/promises"
+import { mkdir, mkdtemp, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
@@ -8,6 +8,7 @@ import {
   createAgentSession,
   createSessionResources,
   FileCredentialStore,
+  maxResourceFileBytes,
   ModelRegistry,
   ZiPaths,
   ResourceLoader,
@@ -25,7 +26,11 @@ test("the high-level runtime is a frozen caller-owned SDK shell", async () => {
   models.setProvider(faux.provider)
   faux.setResponses([fauxAssistantMessage("ready")])
 
-  const runtime: AgentRuntime = await createTestAgentRuntime({ cwd: "/work", models, persist: false })
+  const runtime: AgentRuntime = await createTestAgentRuntime({
+    cwd: "/work",
+    models,
+    session: { type: "new", persist: false }
+  })
   const eventTypes: string[] = []
   const unsubscribe = runtime.session.subscribe(event => eventTypes.push(event.type))
 
@@ -45,12 +50,75 @@ test("the high-level runtime is a frozen caller-owned SDK shell", async () => {
   expect(() => runtime.session.prompt("disposed")).toThrow("AgentSession is disposed")
 })
 
+test("runtime session intents validate external resume input", async () => {
+  const models = createModels()
+
+  expect(createTestAgentRuntime({ cwd: "/work", models, session: { type: "resume", file: " " } })).rejects.toThrow(
+    "Resumed runtime session requires a file"
+  )
+})
+
+test("runtime invocation prompts override discovered system prompt inputs", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-runtime-prompts-"))
+  const cwd = join(root, "project")
+  await mkdir(join(cwd, ".zi"), { recursive: true })
+  await writeFile(join(cwd, ".zi", "APPEND_SYSTEM.md"), "Discovered addition")
+  const models = createModels()
+  const faux = fauxProvider()
+  models.setProvider(faux.provider)
+  let systemPrompt = ""
+  faux.setResponses([
+    context => {
+      systemPrompt = context.systemPrompt ?? ""
+      return fauxAssistantMessage("ready")
+    }
+  ])
+  const runtime = await createTestAgentRuntime({
+    cwd,
+    models,
+    session: { type: "new", persist: false },
+    systemPrompt: "Invocation system prompt",
+    appendSystemPrompt: ["First addition", "Second addition"]
+  })
+
+  try {
+    await runtime.session.prompt("start")
+    expect(systemPrompt).toContain("Invocation system prompt\n\nFirst addition\n\nSecond addition")
+    expect(systemPrompt).not.toContain("Discovered addition")
+  } finally {
+    runtime.session.dispose()
+  }
+})
+
+test("runtime invocation prompts retain resource bounds", async () => {
+  const models = createModels()
+  const runtime = await createTestAgentRuntime({
+    cwd: "/work",
+    models,
+    session: { type: "new", persist: false },
+    systemPrompt: "x".repeat(maxResourceFileBytes + 1)
+  })
+
+  try {
+    expect(runtime.session.resources.systemPrompt).toBeUndefined()
+    expect(runtime.session.resourceDiagnostics).toContainEqual({
+      type: "limit",
+      resource: "system-prompt",
+      limit: maxResourceFileBytes,
+      path: "<runtime>",
+      message: `Inline resource cannot exceed ${maxResourceFileBytes} bytes`
+    })
+  } finally {
+    runtime.session.dispose()
+  }
+})
+
 test("session memory diagnostics account for owned messages, queues, and subscribers", async () => {
   const models = createModels()
   const faux = fauxProvider()
   models.setProvider(faux.provider)
   faux.setResponses([fauxAssistantMessage("measured response")])
-  const { session } = await createTestAgentRuntime({ cwd: "/work", models, persist: false })
+  const { session } = await createTestAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
 
   try {
     expect(session.memoryDiagnostics).toEqual({
@@ -97,7 +165,7 @@ test("a consumer can return without disposing its caller-owned session", async (
   const faux = fauxProvider()
   models.setProvider(faux.provider)
   faux.setResponses([fauxAssistantMessage("first"), fauxAssistantMessage("second")])
-  const runtime = await createTestAgentRuntime({ cwd: "/work", models, persist: false })
+  const runtime = await createTestAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
 
   try {
     await runOneTurn(runtime.session, "one")
@@ -167,14 +235,14 @@ test("two runtimes isolate paths, settings, credentials, models, sessions, and c
     cwd: join(root, "first-project"),
     agentDir: join(root, "first-global"),
     models: firstModels,
-    persist: false,
+    session: { type: "new", persist: false },
     settings: { steeringMode: "all" }
   })
   const second = await createTestAgentRuntime({
     cwd: join(root, "second-project"),
     agentDir: join(root, "second-global"),
     models: secondModels,
-    persist: false
+    session: { type: "new", persist: false }
   })
 
   try {

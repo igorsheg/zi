@@ -19,7 +19,7 @@ test("interactive mode renders an unauthenticated session without requiring a mo
   }
   const { session } = await createAgentRuntime({
     cwd: "/work",
-    persist: false,
+    session: { type: "new", persist: false },
     modelFactory(credentials) {
       const models = createModels({ credentials })
       models.setProvider(provider)

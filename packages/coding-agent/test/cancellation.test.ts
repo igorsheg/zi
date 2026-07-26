@@ -13,7 +13,12 @@ test("abort settles the active session", async () => {
   const faux = fauxProvider({ tokensPerSecond: 5, tokenSize: { min: 1, max: 1 } })
   models.setProvider(faux.provider)
   faux.setResponses([fauxAssistantMessage("This response should be interrupted before it finishes.")])
-  const { session } = await createAgentRuntime({ cwd, model: "faux/faux-1", models, persist: false })
+  const { session } = await createAgentRuntime({
+    cwd,
+    model: "faux/faux-1",
+    models,
+    session: { type: "new", persist: false }
+  })
 
   const run = session.prompt("Start a long response")
   await Bun.sleep(30)

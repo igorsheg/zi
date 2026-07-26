@@ -29,7 +29,7 @@ test("JSON print mode emits the session header then source-ordered events", asyn
   const faux = fauxProvider()
   models.setProvider(faux.provider)
   faux.setResponses([fauxAssistantMessage("hello")])
-  const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
+  const { session } = await createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
   const sourceEvents: string[] = []
   const chunks: string[] = []
   const unsubscribe = session.subscribe(event => sourceEvents.push(event.type))
@@ -70,7 +70,7 @@ test("JSON mode preserves retry attempts inside one final session settlement", a
   const { session } = await createAgentRuntime({
     cwd: "/work",
     models,
-    persist: false,
+    session: { type: "new", persist: false },
     settings: { retryBaseDelayMs: 0 }
   })
   const chunks: string[] = []
@@ -106,7 +106,7 @@ test("JSON mode preserves automatic compaction start, durable entry, and end ord
     cwd: "/work",
     model: `${faux.provider.id}/small`,
     models,
-    persist: false,
+    session: { type: "new", persist: false },
     settings: { compactionReserveTokens: 100, compactionKeepRecentTokens: 1 }
   })
   const chunks: string[] = []
@@ -169,7 +169,7 @@ test("JSON mode keeps multiple prompts in one continuous stream", async () => {
   const faux = fauxProvider()
   models.setProvider(faux.provider)
   faux.setResponses([fauxAssistantMessage("first"), fauxAssistantMessage("second")])
-  const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
+  const { session } = await createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
   const chunks: string[] = []
 
   try {
@@ -201,7 +201,7 @@ test("JSON output never includes runtime or stored credentials", async () => {
     models,
     model: "private/model",
     apiKey: "runtime-secret",
-    persist: false
+    session: { type: "new", persist: false }
   })
   const chunks: string[] = []
 
@@ -229,7 +229,7 @@ test("JSONL framing preserves Unicode separators without creating extra records"
   const faux = fauxProvider()
   models.setProvider(faux.provider)
   faux.setResponses([fauxAssistantMessage("line one\nline two\u2028paragraph\u2029end")])
-  const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
+  const { session } = await createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
   const chunks: string[] = []
 
   try {
@@ -263,7 +263,7 @@ test("JSON mode fails a slow writer at its pending-record bound", async () => {
       return fauxAssistantMessage(Array.from({ length: maxPendingJsonlRecords + 64 }, () => fauxText("x")))
     }
   ])
-  const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
+  const { session } = await createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
   const release = deferred<void>()
   let writes = 0
 
@@ -298,7 +298,7 @@ test("JSON mode contains unserializable events and releases its subscription", a
     fauxAssistantMessage(fauxToolCall("inspect", {}, { id: "inspect-json" }), { stopReason: "toolUse" }),
     fauxAssistantMessage("unused")
   ])
-  const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
+  const { session } = await createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
   session.setActiveTools([
     {
       name: "inspect",
@@ -337,7 +337,7 @@ test("JSON writer failure stops before provider work", async () => {
   const faux = fauxProvider()
   models.setProvider(faux.provider)
   faux.setResponses([fauxAssistantMessage("unused")])
-  const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
+  const { session } = await createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
 
   try {
     const result = await runPrintMode(session, {
@@ -361,7 +361,7 @@ test("text print mode writes the final assistant text through a caller-owned ses
   const faux = fauxProvider()
   models.setProvider(faux.provider)
   faux.setResponses([fauxAssistantMessage("hello")])
-  const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
+  const { session } = await createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
   const chunks: string[] = []
 
   try {
@@ -393,7 +393,7 @@ test("text mode omits thinking, tools, and intermediate assistant output", async
     }),
     fauxAssistantMessage([fauxThinking("final thought"), fauxText("visible")])
   ])
-  const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
+  const { session } = await createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
   session.setActiveTools([
     {
       name: "inspect",
@@ -430,7 +430,7 @@ test("multiple prompts run sequentially and print only the final response", asyn
   const faux = fauxProvider()
   models.setProvider(faux.provider)
   faux.setResponses([fauxAssistantMessage("first"), fauxAssistantMessage("final"), fauxAssistantMessage("reused")])
-  const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
+  const { session } = await createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
   const chunks: string[] = []
 
   try {
@@ -458,7 +458,7 @@ test("text output is rejected before writing when it exceeds the chunk bound", a
   const faux = fauxProvider()
   models.setProvider(faux.provider)
   faux.setResponses([fauxAssistantMessage(Array.from({ length: maxPrintOutputChunks + 1 }, () => fauxText("")))])
-  const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
+  const { session } = await createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
   let writes = 0
 
   try {
@@ -486,7 +486,7 @@ test("text output is rejected before writing when it exceeds the byte bound", as
   const faux = fauxProvider()
   models.setProvider(faux.provider)
   faux.setResponses([fauxAssistantMessage("x".repeat(maxPrintOutputBytes))])
-  const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
+  const { session } = await createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
   let writes = 0
 
   try {
@@ -512,7 +512,7 @@ test("output failures return a bounded result and leave the session reusable", a
   const faux = fauxProvider()
   models.setProvider(faux.provider)
   faux.setResponses([fauxAssistantMessage("first"), fauxAssistantMessage("second")])
-  const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
+  const { session } = await createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
 
   try {
     const result = await runPrintMode(session, {
@@ -546,7 +546,7 @@ test("external cancellation settles print mode without disposing its session", a
     },
     fauxAssistantMessage("after abort")
   ])
-  const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
+  const { session } = await createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
 
   try {
     const run = runPrintMode(session, { output: "text", prompts: ["start"], writer: { write() {} } })
@@ -566,7 +566,7 @@ test("JSON provider errors stay parseable and return a non-success result", asyn
   const faux = fauxProvider()
   models.setProvider(faux.provider)
   faux.setResponses([fauxAssistantMessage("partial", { stopReason: "error", errorMessage: "provider failed" })])
-  const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
+  const { session } = await createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
   const chunks: string[] = []
 
   try {
@@ -591,7 +591,7 @@ test("assistant provider errors return a failure without writing response text",
   const faux = fauxProvider()
   models.setProvider(faux.provider)
   faux.setResponses([fauxAssistantMessage("partial", { stopReason: "error", errorMessage: "provider failed" })])
-  const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
+  const { session } = await createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
   const chunks: string[] = []
 
   try {
@@ -617,7 +617,7 @@ test("aborted assistant responses return a distinct failure", async () => {
   const faux = fauxProvider()
   models.setProvider(faux.provider)
   faux.setResponses([fauxAssistantMessage("partial", { stopReason: "aborted" })])
-  const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
+  const { session } = await createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
 
   try {
     const result = await runPrintMode(session, { output: "text", prompts: ["start"], writer: { write() {} } })
@@ -632,7 +632,7 @@ test("prompt admission failures return a deterministic result", async () => {
   const models = createModels()
   const faux = fauxProvider()
   models.setProvider(faux.provider)
-  const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
+  const { session } = await createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
   session.dispose()
 
   const result = await runPrintMode(session, { output: "text", prompts: ["start"], writer: { write() {} } })
@@ -641,7 +641,7 @@ test("prompt admission failures return a deterministic result", async () => {
 
 test("print mode rejects an unselected session before provider work", async () => {
   const models = createModels()
-  const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
+  const { session } = await createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
   let writes = 0
 
   try {
@@ -667,7 +667,7 @@ test("print mode requires at least one prompt", async () => {
   const models = createModels()
   const faux = fauxProvider()
   models.setProvider(faux.provider)
-  const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
+  const { session } = await createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
 
   try {
     const result = await runPrintMode(session, { output: "text", prompts: [], writer: { write() {} } })
@@ -682,7 +682,7 @@ test("print mode bounds the number of prompts before provider work", async () =>
   const models = createModels()
   const faux = fauxProvider()
   models.setProvider(faux.provider)
-  const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
+  const { session } = await createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
 
   try {
     const result = await runPrintMode(session, {
@@ -701,7 +701,7 @@ test("print mode bounds aggregate UTF-8 prompt bytes", async () => {
   const models = createModels()
   const faux = fauxProvider()
   models.setProvider(faux.provider)
-  const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
+  const { session } = await createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
   const oversized = "界".repeat(Math.floor(maxPrintPromptBytes / 3) + 1)
 
   try {
@@ -720,7 +720,7 @@ async function compactionPrintSession() {
   const bootstrap = await createAgentRuntime({
     cwd: "/work",
     models,
-    persist: false,
+    session: { type: "new", persist: false },
     settings: { compactionReserveTokens: 100, compactionKeepRecentTokens: 1 }
   })
   const model = bootstrap.session.model

@@ -323,7 +323,12 @@ test("model picker omits unconfigured providers, sorts like Pi, and wraps select
   models.setProvider(hidden.provider)
   models.getAuth = async model =>
     model.provider === "hidden" ? undefined : { auth: { apiKey: "configured" }, source: "test" }
-  const { session } = await createAgentRuntime({ cwd: "/work", model: "zeta/current", models, persist: false })
+  const { session } = await createAgentRuntime({
+    cwd: "/work",
+    model: "zeta/current",
+    models,
+    session: { type: "new", persist: false }
+  })
   const setup = await createInteractiveTest(session, { width: 52, height: 16, kittyKeyboard: true })
 
   try {
@@ -392,7 +397,12 @@ async function createModelSession(provider = "select") {
   })
   models.setProvider(faux.provider)
   models.getAuth = async () => ({ auth: { apiKey: "configured" }, source: "test" })
-  const { session } = await createAgentRuntime({ cwd: "/work", model: `${provider}/current`, models, persist: false })
+  const { session } = await createAgentRuntime({
+    cwd: "/work",
+    model: `${provider}/current`,
+    models,
+    session: { type: "new", persist: false }
+  })
   return { session }
 }
 

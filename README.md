@@ -17,7 +17,7 @@ npm install -g @with-zi/zi
 
 ## Getting Started
 
-Read the docs at https://withzi.dev/man/.
+Read the docs at https://withzi.dev/man/. For process composition, see the [CLI contract](docs/cli.md).
 
 ## Build from source
 

@@ -38,7 +38,12 @@ test("built-in expected failures keep typed details and are finalized as Pi erro
     fauxAssistantMessage(fauxText("Failures observed."))
   ])
 
-  const { session } = await createAgentRuntime({ cwd: root, model: "faux/faux-1", models, persist: false })
+  const { session } = await createAgentRuntime({
+    cwd: root,
+    model: "faux/faux-1",
+    models,
+    session: { type: "new", persist: false }
+  })
   try {
     await session.prompt("Exercise expected tool failures.")
     const results = session.messages.filter(message => message.role === "toolResult")
@@ -127,9 +132,8 @@ test("one turn can write, read, edit, execute, stream, and persist", async () =>
   expect(restored.messages()).toEqual([...session.messages])
   const resumed = await createAgentRuntime({
     cwd: "/ignored-on-resume",
-    sessionFile: session.sessionManager.file!,
-    models,
-    persist: true
+    session: { type: "resume", file: session.sessionManager.file! },
+    models
   })
   expect(resumed.services.paths.cwd).toBe(root)
   expect(resumed.services.paths.sessionDir).toBe(sessions)

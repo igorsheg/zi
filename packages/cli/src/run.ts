@@ -9,7 +9,7 @@ import {
   type PrintModeResult
 } from "@with-zi/coding-agent"
 
-import { parseArgs, type Args } from "./args.js"
+import { parseArgs, resolveCliInvocation, type CliInvocation, type CliMode, type ParsedArgs } from "./args.js"
 import { ziVersion } from "./version.js"
 
 export const maxCliStdinBytes = 8 * 1024 * 1024
@@ -19,6 +19,9 @@ export type AppMode = "interactive" | "text" | "json"
 export type CliSignal = "SIGHUP" | "SIGINT" | "SIGTERM"
 
 export interface CliHost {
+  readonly cwd: string
+  readonly home: string
+  readonly env: Readonly<Record<string, string | undefined>>
   readonly stdinIsTTY: boolean
   readonly stdoutIsTTY: boolean
   readStdin(): Promise<string | undefined>
@@ -32,50 +35,89 @@ export interface CliHost {
 
 export const helpText = `Usage: zi [options] [prompt ...]
 
-Options:
-  -p, --print                 Print the final response and exit
-      --mode text             Print the final response and exit
-      --mode json             Emit header-first JSONL session events
+Output:
+  -p, --print                 Alias for --mode text
+      --mode mode             auto, interactive, text, or json
+
+Runtime:
       --cwd path              Set the effective working directory
+      --agent-dir path        Set the global Zi agent directory
+      --session-dir path      Set session storage for this invocation
       --model provider/model  Select a model
-      --api-key key           Use a memory-only provider API key
-  -r, --resume file          Resume a session file
-  -c, --continue             Continue the most recent session
-      --no-session            Do not persist the session
+      --thinking level        off, minimal, low, medium, high, xhigh, or max
+      --api-key key           Use a memory-only key for the selected provider
+      --system-prompt text    Replace the built-in system prompt
+      --append-system-prompt text
+                              Append system prompt text; repeatable
+
+Session:
+  -r, --resume file           Resume a session file
+  -c, --continue              Continue the most recent session
+      --new-session           Start a persistent new session
+      --no-session            Start an ephemeral new session
+
+Other:
   -h, --help                  Show this help
   -V, --version               Show the Zi version
 
+Environment defaults:
+  ZI_MODE                     auto, interactive, text, or json
+  ZI_AGENT_DIR                Global agent directory
+  ZI_SESSION_DIR              Session storage directory
+  ZI_DEFAULT_MODEL            provider/model selection
+  ZI_DEFAULT_THINKING         Default thinking level for this invocation
+
+CLI values override environment defaults. Within argv, the last scalar or
+session selector wins; repeatable append-system-prompt values keep their order.
 Piped stdin is the first prompt; positional prompts follow in argument order.
-RPC mode is not available yet.
+Provider credential variables such as ANTHROPIC_API_KEY remain supported.
+RPC is not available yet.
 `
 
 export const versionText = `zi ${ziVersion}\n`
 
-export function resolveAppMode(args: Args, stdinIsTTY: boolean, stdoutIsTTY: boolean): AppMode {
-  if (args.mode === "json") return "json"
-  if (args.mode === "text" || args.print || !stdinIsTTY || !stdoutIsTTY) return "text"
-  return "interactive"
+export function resolveAppMode(mode: CliMode, stdinIsTTY: boolean, stdoutIsTTY: boolean): AppMode {
+  switch (mode) {
+    case "text":
+    case "json":
+      return mode
+    case "interactive":
+      if (!stdinIsTTY || !stdoutIsTTY) throw new Error("Interactive mode requires TTY stdin and stdout")
+      return "interactive"
+    case "auto":
+      return stdinIsTTY && stdoutIsTTY ? "interactive" : "text"
+    default:
+      return assertNever(mode)
+  }
 }
 
 export async function runCli(argv: readonly string[], host: CliHost): Promise<number> {
-  let args: Args
+  let parsed: ParsedArgs
   try {
-    args = parseArgs(argv)
+    parsed = parseArgs(argv)
   } catch (cause) {
     await host.writeStderr(`${errorMessage(cause)}\n`)
     return 1
   }
 
-  if (args.help) {
+  if (parsed.help) {
     await host.writeStdout(helpText)
     return 0
   }
-  if (args.version) {
+  if (parsed.version) {
     await host.writeStdout(versionText)
     return 0
   }
 
-  const mode = resolveAppMode(args, host.stdinIsTTY, host.stdoutIsTTY)
+  let args: CliInvocation
+  let mode: AppMode
+  try {
+    args = resolveCliInvocation(parsed, host)
+    mode = resolveAppMode(args.mode, host.stdinIsTTY, host.stdoutIsTTY)
+  } catch (cause) {
+    await host.writeStderr(`${errorMessage(cause)}\n`)
+    return 1
+  }
   let stdin: string | undefined
   if (!host.stdinIsTTY) {
     try {
@@ -143,14 +185,17 @@ export async function runCli(argv: readonly string[], host: CliHost): Promise<nu
   return exitCode
 }
 
-function runtimeOptions(args: Args): CreateAgentRuntimeOptions {
+function runtimeOptions(args: CliInvocation): CreateAgentRuntimeOptions {
   return {
     cwd: args.cwd,
-    persist: !args.noSession,
+    agentDir: args.agentDir,
+    session: args.session,
+    ...(args.sessionDir === undefined ? {} : { sessionDir: args.sessionDir }),
     ...(args.model === undefined ? {} : { model: args.model }),
+    ...(args.thinkingLevel === undefined ? {} : { thinkingLevel: args.thinkingLevel }),
     ...(args.apiKey === undefined ? {} : { apiKey: args.apiKey }),
-    ...(args.sessionFile === undefined ? {} : { sessionFile: args.sessionFile }),
-    ...(args.continueRecent ? { continueRecent: true } : {})
+    ...(args.systemPrompt === undefined ? {} : { systemPrompt: args.systemPrompt }),
+    ...(args.appendSystemPrompt === undefined ? {} : { appendSystemPrompt: args.appendSystemPrompt })
   }
 }
 
@@ -201,6 +246,10 @@ function signalExitCode(signal: CliSignal): number {
   if (signal === "SIGHUP") return 129
   if (signal === "SIGINT") return 130
   return 143
+}
+
+function assertNever(value: never): never {
+  throw new Error(`Unknown CLI state: ${String(value)}`)
 }
 
 function errorMessage(cause: unknown): string {

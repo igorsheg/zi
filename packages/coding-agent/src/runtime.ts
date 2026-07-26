@@ -1,5 +1,3 @@
-import type { ThinkingLevel } from "@earendil-works/pi-agent-core"
-import type { CredentialStore, Models } from "@earendil-works/pi-ai"
 import { builtinModels } from "@earendil-works/pi-ai/providers/all"
 
 import type { AgentSession } from "./agent-session.js"
@@ -8,11 +6,18 @@ import { ModelRegistry } from "./model-registry.js"
 import { resolveRequestedModel } from "./model-resolver.js"
 import { getAgentDir, ZiPaths } from "./paths.js"
 import { ResourceLoader } from "./resource-loader.js"
+import {
+  snapshotAgentRuntimeOptions,
+  type AgentRuntimeSessionIntent,
+  type CreateAgentRuntimeOptions
+} from "./runtime-options.js"
 import { createAgentSession, type AgentSessionServices, type SessionBootstrapDiagnostic } from "./sdk.js"
 import { SessionManager } from "./session-manager.js"
 import { SessionShell } from "./session-shell.js"
-import { SettingsManager, type AgentSettings } from "./settings-manager.js"
+import { SettingsManager } from "./settings-manager.js"
 import { createCodingTools } from "./tools/index.js"
+
+export type { AgentRuntimeSessionIntent, CreateAgentRuntimeOptions } from "./runtime-options.js"
 
 export type AgentRuntimeServices = AgentSessionServices
 
@@ -22,41 +27,25 @@ export interface AgentRuntime {
   readonly bootstrapDiagnostic: SessionBootstrapDiagnostic | undefined
 }
 
-export interface CreateAgentRuntimeOptions {
-  readonly cwd: string
-  readonly model?: string
-  readonly apiKey?: string
-  readonly thinkingLevel?: ThinkingLevel
-  readonly modelFactory?: (credentials: CredentialStore) => Models
-  readonly agentDir?: string
-  readonly sessionDir?: string
-  readonly sessionFile?: string
-  readonly continueRecent?: boolean
-  readonly persist?: boolean
-  readonly settings?: Readonly<Partial<AgentSettings>>
-}
-
 /** Assemble cwd-bound production services and a session. The caller owns `session.dispose()`. */
-export async function createAgentRuntime(options: CreateAgentRuntimeOptions): Promise<AgentRuntime> {
-  if (options.sessionFile && options.continueRecent)
-    throw new Error("sessionFile and continueRecent cannot be combined")
-  if (options.continueRecent && options.persist === false)
-    throw new Error("continueRecent requires session persistence")
+export async function createAgentRuntime(requested: CreateAgentRuntimeOptions): Promise<AgentRuntime> {
+  const options = snapshotAgentRuntimeOptions(requested)
+  const session = options.session ?? defaultRuntimeSession
   const agentDir = options.agentDir ?? getAgentDir()
   const requestedPaths = new ZiPaths(options.cwd, agentDir, options.sessionDir)
-  const resumed = options.sessionFile
-    ? SessionManager.open(options.sessionFile)
-    : options.continueRecent
-      ? await SessionManager.continueRecent(requestedPaths)
-      : undefined
-  const cwd = resumed?.header.cwd ?? options.cwd
-  const sessionDir = options.sessionDir ?? resumed?.sessionDir
+  const selected = await selectSession(session, requestedPaths)
+  const cwd = selected.type === "resumed" ? selected.manager.header.cwd : options.cwd
+  const sessionDir = options.sessionDir ?? (selected.type === "resumed" ? selected.manager.sessionDir : undefined)
   const paths = new ZiPaths(cwd, agentDir, sessionDir)
   const settingsManager = SettingsManager.create(paths, options.settings ?? {})
   const credentialStore = new FileCredentialStore(paths)
   const models = options.modelFactory?.(credentialStore) ?? builtinModels({ credentials: credentialStore })
   const modelRegistry = new ModelRegistry(models)
-  const resourceLoader = new ResourceLoader({ paths })
+  const resourceLoader = new ResourceLoader({
+    paths,
+    ...(options.systemPrompt === undefined ? {} : { systemPrompt: options.systemPrompt }),
+    ...(options.appendSystemPrompt === undefined ? {} : { appendSystemPrompt: options.appendSystemPrompt })
+  })
   const services: AgentRuntimeServices = Object.freeze({
     paths,
     settingsManager,
@@ -73,7 +62,7 @@ export async function createAgentRuntime(options: CreateAgentRuntimeOptions): Pr
       ? resolveSettingsModel(modelRegistry, settingsManager)
       : undefined
   const sessionManager =
-    resumed ?? SessionManager.create(paths, options.persist === undefined ? {} : { persist: options.persist })
+    selected.type === "resumed" ? selected.manager : SessionManager.create(paths, { persist: selected.persist })
   const shell = new SessionShell({ cwd: paths.cwd, sessionId: sessionManager.sessionId })
   const created = await createAgentSession({
     services,
@@ -87,6 +76,25 @@ export async function createAgentRuntime(options: CreateAgentRuntimeOptions): Pr
   return Object.freeze({ session: created.session, services, bootstrapDiagnostic: created.bootstrapDiagnostic })
 }
 
+const defaultRuntimeSession: AgentRuntimeSessionIntent = Object.freeze({ type: "new", persist: true })
+
+type SelectedSession =
+  | { readonly type: "new"; readonly persist: boolean }
+  | { readonly type: "resumed"; readonly manager: SessionManager }
+
+async function selectSession(session: AgentRuntimeSessionIntent, paths: ZiPaths): Promise<SelectedSession> {
+  switch (session.type) {
+    case "new":
+      return { type: "new", persist: session.persist }
+    case "continue":
+      return { type: "resumed", manager: await SessionManager.continueRecent(paths) }
+    case "resume":
+      return { type: "resumed", manager: SessionManager.open(session.file) }
+    default:
+      return assertNever(session)
+  }
+}
+
 function resolveSettingsModel(registry: ModelRegistry, settings: SettingsManager) {
   const provider = settings.getDefaultProvider()
   const modelId = settings.getDefaultModel()
@@ -94,4 +102,8 @@ function resolveSettingsModel(registry: ModelRegistry, settings: SettingsManager
   const model = registry.get(provider, modelId)
   if (!model) throw new Error(`Unknown model: ${provider}/${modelId}. Use provider/model-id.`)
   return model
+}
+
+function assertNever(value: never): never {
+  throw new Error(`Unknown runtime session: ${String(value)}`)
 }

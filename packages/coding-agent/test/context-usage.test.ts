@@ -12,7 +12,12 @@ test("AgentSession exposes provider context usage plus its estimated trailing me
   const models = createModels()
   const faux = fauxProvider({ provider: "context", models: [{ id: "model", contextWindow: 247_000 }] })
   models.setProvider(faux.provider)
-  const bootstrap = await createAgentRuntime({ cwd: "/work", model: "context/model", models, persist: false })
+  const bootstrap = await createAgentRuntime({
+    cwd: "/work",
+    model: "context/model",
+    models,
+    session: { type: "new", persist: false }
+  })
   const model = bootstrap.session.model
   bootstrap.session.dispose()
 
@@ -69,7 +74,12 @@ test("provider usage retained across a compaction marker is stale on restore", a
   const models = createModels()
   const faux = fauxProvider({ provider: "context-marker", models: [{ id: "model", contextWindow: 10_000 }] })
   models.setProvider(faux.provider)
-  const bootstrap = await createAgentRuntime({ cwd: "/work", model: "context-marker/model", models, persist: false })
+  const bootstrap = await createAgentRuntime({
+    cwd: "/work",
+    model: "context-marker/model",
+    models,
+    session: { type: "new", persist: false }
+  })
   const model = bootstrap.session.model
   bootstrap.session.dispose()
 

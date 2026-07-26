@@ -91,7 +91,7 @@ test("the default model registry resolves credentials from the runtime path poli
     cwd: join(root, "project"),
     agentDir: globalDir,
     model: `${model.provider}/${model.id}`,
-    persist: false
+    session: { type: "new", persist: false }
   })
 
   try {

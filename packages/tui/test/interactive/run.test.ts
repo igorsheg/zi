@@ -18,7 +18,7 @@ test("initial CLI prompts run after interactive terminal ownership is establishe
   const faux = fauxProvider()
   models.setProvider(faux.provider)
   faux.setResponses([fauxAssistantMessage("done")])
-  const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
+  const { session } = await createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
 
   try {
     const { runTui } = await import("../../src/interactive/run.js")
@@ -54,7 +54,7 @@ test("interactive exit restores the terminal before settlement and discards queu
     fauxAssistantMessage("must not continue")
   ])
   models.setProvider(faux.provider)
-  const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
+  const { session } = await createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
   const dispose = session.dispose.bind(session)
   let disposals = 0
   session.dispose = () => {
@@ -124,7 +124,7 @@ test("interactive shutdown restores the terminal before joining authentication c
       }
     }
   })
-  const runtime = await createAgentRuntime({ cwd: "/work", models, persist: false })
+  const runtime = await createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
   const loginFailure = rejection(
     runtime.session.login("shutdown-auth", "api_key", { prompt: async () => "", notify() {} })
   )
@@ -156,7 +156,7 @@ test("external renderer destruction joins normal terminal cleanup", async () => 
   const models = createModels()
   const faux = fauxProvider()
   models.setProvider(faux.provider)
-  const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
+  const { session } = await createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
   const dispose = session.dispose.bind(session)
   let disposals = 0
   session.dispose = () => {
@@ -209,7 +209,7 @@ test("development diagnostics are admitted from runtime flags", async () => {
   const models = createModels()
   const faux = fauxProvider()
   models.setProvider(faux.provider)
-  const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
+  const { session } = await createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
 
   try {
     const { runTui } = await import("../../src/interactive/run.js")
@@ -245,7 +245,7 @@ test("shutdown failure surfaces only after terminal resources are restored", asy
   const models = createModels()
   const faux = fauxProvider()
   models.setProvider(faux.provider)
-  const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
+  const { session } = await createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
   session.abortAndDiscardQueuedInputs = () => Promise.reject(new Error("shutdown failed"))
   const titles: string[] = []
   const setTerminalTitle = setup.renderer.setTerminalTitle.bind(setup.renderer)

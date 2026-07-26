@@ -23,7 +23,7 @@ test("interactive @ completion uses the below-composer picker and distinguishes 
   const models = createModels()
   const faux = fauxProvider()
   models.setProvider(faux.provider)
-  const { session } = await createAgentRuntime({ cwd, models, persist: false })
+  const { session } = await createAgentRuntime({ cwd, models, session: { type: "new", persist: false } })
   const setup = await createInteractiveTest(session, { width: 60, height: 12 })
 
   try {

@@ -116,6 +116,14 @@ _Avoid_: Shared state, mirrored state
 An application adapter over `AgentSession` for one interaction environment. Interactive mode is terminal-specific; print and RPC modes are non-terminal siblings. Shared policy moves into `AgentSession` or a concrete manager, not into a lowest-common-denominator mode facade.
 _Avoid_: CLI branch, universal frontend mode
 
+**CLI invocation**:
+One immutable startup intent resolved before runtime construction from arguments, supported Zi environment defaults, and captured process facts. Arguments outrank environment defaults; cwd and session selection remain explicit invocation operations rather than ambient configuration.
+_Avoid_: CLI settings, process globals, argument bag
+
+**Runtime session intent**:
+The one startup choice admitted by the coding-agent SDK: create a new persistent or ephemeral session, continue the current cwd's recent session, or resume an exact journal. Persistence belongs only to the new-session state.
+_Avoid_: Session flags, combinable persistence options
+
 **Interactive store**:
 The instance-scoped Nano Store owner created by one terminal `InteractiveMode`. It binds the current `AgentSession`, rejects stale events, and owns only terminal state such as transient tool blocks and render revisions. It does not mirror durable session state.
 _Avoid_: Global store, frontend database, coding-agent policy

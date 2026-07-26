@@ -35,7 +35,7 @@ test("exact /login uses hidden composer input and selects the provider model wit
   const runtime = await createAgentRuntime({
     cwd: "/work",
     agentDir: await mkdtemp(join(tmpdir(), "zi-tui-auth-secret-")),
-    persist: false,
+    session: { type: "new", persist: false },
     modelFactory(credentials) {
       const models = createModels({ credentials })
       models.setProvider(provider)
@@ -111,7 +111,7 @@ test("Escape cancels secret entry, clears native text, and rejects credential pe
   const runtime = await createAgentRuntime({
     cwd: "/work",
     agentDir: await mkdtemp(join(tmpdir(), "zi-tui-auth-cancel-")),
-    persist: false,
+    session: { type: "new", persist: false },
     modelFactory(credentials) {
       const models = createModels({ credentials })
       models.setProvider(provider)
@@ -161,7 +161,7 @@ test("session replacement cancels pending authentication and cannot accept stale
   const oldRuntime = await createAgentRuntime({
     cwd: "/old",
     agentDir: await mkdtemp(join(tmpdir(), "zi-tui-auth-old-")),
-    persist: false,
+    session: { type: "new", persist: false },
     modelFactory(credentials) {
       const models = createModels({ credentials })
       models.setProvider(oldProvider)
@@ -172,7 +172,7 @@ test("session replacement cancels pending authentication and cannot accept stale
   const newRuntime = await createAgentRuntime({
     cwd: "/new",
     agentDir: await mkdtemp(join(tmpdir(), "zi-tui-auth-new-")),
-    persist: false,
+    session: { type: "new", persist: false },
     modelFactory(credentials) {
       const models = createModels({ credentials })
       models.setProvider(newFaux.provider)
@@ -232,7 +232,7 @@ test("/login nests provider and method pickers and restores the provider filter"
   const runtime = await createAgentRuntime({
     cwd: "/work",
     agentDir: await mkdtemp(join(tmpdir(), "zi-tui-auth-picker-")),
-    persist: false,
+    session: { type: "new", persist: false },
     modelFactory(credentials) {
       const models = createModels({ credentials })
       models.setProvider(provider)
@@ -317,7 +317,7 @@ test("OAuth login renders URL, device, select, manual-code, and progress steps t
   const runtime = await createAgentRuntime({
     cwd: "/work",
     agentDir: await mkdtemp(join(tmpdir(), "zi-tui-auth-oauth-")),
-    persist: false,
+    session: { type: "new", persist: false },
     modelFactory(credentials) {
       const models = createModels({ credentials })
       models.setProvider(provider)

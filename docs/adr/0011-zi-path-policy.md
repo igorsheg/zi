@@ -42,7 +42,7 @@ $HOME/.zi/
   themes/
 ```
 
-`ZI_AGENT_DIR` replaces the complete global directory. It does not affect the project directory. Leading `~` is expanded for admitted path inputs; relative custom session directories resolve against the effective cwd. Other relative runtime paths must likewise be resolved once at their admitting boundary, not later against mutable process state.
+`ZI_AGENT_DIR` replaces the complete global directory. It does not affect the project directory. CLI `--agent-dir` overrides it. `ZI_SESSION_DIR` supplies a custom session directory and is overridden by CLI `--session-dir`. Leading `~` is expanded for admitted path inputs; relative custom session directories resolve against the effective cwd. Other relative runtime paths must likewise be resolved once at their admitting boundary, not later against mutable process state. See [ADR 0020](0020-cli-invocation-resolves-once-from-explicit-layers.md) for CLI resolution.
 
 The current policies are:
 

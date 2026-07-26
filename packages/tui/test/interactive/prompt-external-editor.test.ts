@@ -16,7 +16,7 @@ test("Ctrl+G replaces the draft with content saved by the resolved external edit
   const { session } = await createTestAgentRuntime({
     cwd: "/work",
     models,
-    persist: false,
+    session: { type: "new", persist: false },
     settings: { externalEditor: "code --wait" }
   })
   const editor = new FakeExternalEditor({ type: "complete", content: "edited prompt" })
@@ -52,8 +52,8 @@ test("Ctrl+G replaces the draft with content saved by the resolved external edit
 test("external editor admission is single-flight and stale completion cannot cross session replacement", async () => {
   const models = createModels()
   models.setProvider(fauxProvider().provider)
-  const first = await createTestAgentRuntime({ cwd: "/first", models, persist: false })
-  const second = await createTestAgentRuntime({ cwd: "/second", models, persist: false })
+  const first = await createTestAgentRuntime({ cwd: "/first", models, session: { type: "new", persist: false } })
+  const second = await createTestAgentRuntime({ cwd: "/second", models, session: { type: "new", persist: false } })
   const editor = new DeferredExternalEditor()
   const setup = await createInteractiveTest(
     first.session,
@@ -92,7 +92,7 @@ test("external editor admission is single-flight and stale completion cannot cro
 test("external editor failure preserves the draft and reports feedback", async () => {
   const models = createModels()
   models.setProvider(fauxProvider().provider)
-  const { session } = await createTestAgentRuntime({ cwd: "/work", models, persist: false })
+  const { session } = await createTestAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
   const editor = new FakeExternalEditor({ type: "failed", message: "editor failed" })
   const setup = await createInteractiveTest(
     session,

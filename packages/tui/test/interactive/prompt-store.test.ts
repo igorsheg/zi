@@ -125,7 +125,7 @@ test("automatic compaction failures surface through prompt feedback", async () =
   const bootstrap = await createAgentRuntime({
     cwd: "/work",
     models,
-    persist: false,
+    session: { type: "new", persist: false },
     settings: { compactionReserveTokens: 100, compactionKeepRecentTokens: 1 }
   })
   const model = bootstrap.session.model
@@ -435,5 +435,5 @@ async function createSession(provider: string, input: ("text" | "image")[] = ["t
   const models = createModels()
   const faux = fauxProvider({ provider, models: [{ id: "model", input }] })
   models.setProvider(faux.provider)
-  return (await createAgentRuntime({ cwd: "/work", models, persist: false })).session
+  return (await createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })).session
 }

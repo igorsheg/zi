@@ -32,7 +32,7 @@ cli -> coding-agent
 
 - `coding-agent` never imports a frontend.
 - `tui` consumes coding-agent public APIs and owns terminal behavior and native interaction state.
-- `cli` owns argument/TTY mode resolution, bounded stdin, process output backpressure, signals, exit status, and final session disposal. It dynamically imports `tui` only after selecting interactive mode.
+- `cli` owns the immutable CLI invocation: argument/environment precedence, TTY mode resolution, bounded stdin, process output backpressure, signals, exit status, and final session disposal. It dynamically imports `tui` only after selecting interactive mode. See [ADR 0020](adr/0020-cli-invocation-resolves-once-from-explicit-layers.md).
 - Future web clients consume `AgentSession`, concrete managers, or RPC; they do not inherit terminal interaction state.
 - There is no `shared`, `common`, universal mode facade, generic UI model, or event bus.
 - A new package requires an independently meaningful lifecycle or public use case.
@@ -79,9 +79,9 @@ createAgentRuntime(options)
 
 ### `AgentRuntime` and `AgentSession`
 
-`createAgentRuntime()` is the high-level SDK constructor. It returns a readonly, frozen shell containing one `AgentSession`, its concrete path-owned services, and any user-visible bootstrap diagnostic. `createAgentSession()` is the lower-level Pi-aligned bootstrap owner for callers that already own those services and a `SessionManager`; it classifies `new | resumed`, resolves model and thinking precedence without copying journal state into settings, seeds or repairs session metadata, and asks the caller-owned `ResourceLoader` for the session's initial resources unless the caller supplies an immutable snapshot. In both cases, the creator owns final `session.dispose()`. Application modes consume caller-owned sessions and must not dispose them. See [ADR 0016](adr/0016-session-bootstrap-separates-preferences-context-and-durability.md).
+`createAgentRuntime()` is the high-level SDK constructor. It receives one closed `new | continue | resume` session intent, snapshots caller-owned settings and prompt arrays, and returns a readonly, frozen shell containing one `AgentSession`, its concrete path-owned services, and any user-visible bootstrap diagnostic. `createAgentSession()` is the lower-level Pi-aligned bootstrap owner for callers that already own those services and a `SessionManager`; it classifies `new | resumed`, resolves model and thinking precedence without copying journal state into settings, seeds or repairs session metadata, and asks the caller-owned `ResourceLoader` for the session's initial resources unless the caller supplies an immutable snapshot. In both cases, the creator owns final `session.dispose()`. Application modes consume caller-owned sessions and must not dispose them. See [ADR 0016](adr/0016-session-bootstrap-separates-preferences-context-and-durability.md).
 
-`AgentSessionRuntime` is the narrow owner for clients that replace whole sessions. It retains runtime construction policy, owns `ready | replacing | cancelling | settling | disposed`, globally serializes runtime-keyed catalog scans, rebuilds every cwd-bound service for `/new` and `/resume`, and disposes replaced sessions. Construction or pre-commit validation failure leaves the old runtime usable. Selecting the already-current journal is a no-op. The creator owns final runtime disposal; terminal mode may only request replacement cancellation during shutdown. See [ADR 0012](adr/0012-agent-session-runtime-owns-replacement.md).
+`AgentSessionRuntime` is the narrow owner for clients that replace whole sessions. It retains runtime construction policy plus the initial runtime's canonical global agent directory, owns `ready | replacing | cancelling | settling | disposed`, globally serializes runtime-keyed catalog scans, rebuilds every cwd-bound service for `/new` and `/resume`, and disposes replaced sessions. Construction or pre-commit validation failure leaves the old runtime usable. Selecting the already-current journal is a no-op. The creator owns final runtime disposal; terminal mode may only request replacement cancellation during shutdown. See [ADR 0012](adr/0012-agent-session-runtime-owns-replacement.md).
 
 `AgentSession` is the policy spine shared by application modes. It owns:
 
@@ -130,6 +130,8 @@ The TUI receives lifecycle status plus `ToolPresentation`. It never switches on 
 The active built-in UX scope is `read`, `bash`, `edit`, `write`, `task_output`, and `kill_task`. Pi's optional `grep`, `find`, and `ls` implementations remain deferred because Pi's vanilla session does not enable them and Bash already supplies their default capability.
 
 ## Application modes
+
+The CLI parses argument-owned intent before consulting supported `ZI_*` defaults, then resolves one immutable invocation before runtime construction. Cwd is argument-only; model and thinking environment defaults use `ZI_DEFAULT_*` names so future dynamic shell metadata keeps `ZI_MODEL` and `ZI_REASONING_LEVEL`. Scalar precedence is last CLI occurrence, environment default, then the owning runtime/settings policy. Output mode and session selection are closed unions; session operations, API-key overrides, and prompt content are never ambient environment defaults. Help and version exit before environment resolution. See [ADR 0020](adr/0020-cli-invocation-resolves-once-from-explicit-layers.md).
 
 Modes are adapters over `AgentSession`, not one universal abstraction.
 

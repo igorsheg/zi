@@ -87,7 +87,12 @@ test("Ctrl+G demotes the session-owned foreground shell task", async () => {
     ),
     fauxAssistantMessage("The task is running in the background.")
   ])
-  const { session } = await createAgentRuntime({ cwd, model: "faux/faux-1", models, persist: false })
+  const { session } = await createAgentRuntime({
+    cwd,
+    model: "faux/faux-1",
+    models,
+    session: { type: "new", persist: false }
+  })
   const setup = await createInteractiveTest(session, { width: 80, height: 24 })
 
   try {

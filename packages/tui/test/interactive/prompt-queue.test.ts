@@ -25,7 +25,7 @@ test("real prompt keys admit, present, and restore steering and follow-up queues
       return fauxAssistantMessage("done")
     }
   ])
-  const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
+  const { session } = await createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
   const setup = await createInteractiveTest(session, { width: 48, height: 14, kittyKeyboard: true })
 
   try {
@@ -107,7 +107,7 @@ test("a maximum queue preserves the constrained composer and Ctrl+C leaves pendi
       return fauxAssistantMessage("done")
     }
   ])
-  const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
+  const { session } = await createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
   const setup = await createInteractiveTest(session, { width: 42, height: 8, kittyKeyboard: true })
 
   try {
@@ -161,7 +161,7 @@ test("Escape restores grouped duplicates immediately and queue rows truncate as 
       return fauxAssistantMessage("aborted", { stopReason: "aborted" })
     }
   ])
-  const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
+  const { session } = await createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
   const setup = await createInteractiveTest(session, { width: 30, height: 14, kittyKeyboard: true })
 
   try {
@@ -213,7 +213,7 @@ test("restored queued images remain attached when the draft is resubmitted", asy
       return fauxAssistantMessage("done")
     }
   ])
-  const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
+  const { session } = await createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
   const setup = await createInteractiveTest(session, { width: 48, height: 14, kittyKeyboard: true })
   const image = { type: "image" as const, mimeType: "image/png", data: "AAAA" }
 
@@ -248,7 +248,7 @@ test("explicit selection copy precedes prompt clearing and supports a delivered 
   const faux = fauxProvider()
   models.setProvider(faux.provider)
   faux.setResponses([fauxAssistantMessage(fauxThinking("assistant response"))])
-  const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
+  const { session } = await createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
   await session.prompt("copy target")
   let delivery: ClipboardWriteResult = { type: "unavailable" }
   const writes: string[] = []

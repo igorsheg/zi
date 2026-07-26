@@ -212,5 +212,5 @@ async function sessionWithResponses(provider: string) {
   const faux = fauxProvider({ provider })
   faux.setResponses([fauxAssistantMessage("done")])
   models.setProvider(faux.provider)
-  return createAgentRuntime({ cwd: "/work", models, persist: false })
+  return createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
 }

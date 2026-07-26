@@ -295,7 +295,7 @@ test("AgentSession gates model work and joins authentication cancellation", asyn
   const runtime = await createAgentRuntime({
     cwd: join(root, "project"),
     agentDir: join(root, "global"),
-    persist: false,
+    session: { type: "new", persist: false },
     modelFactory(credentials) {
       const models = createModels({ credentials })
       models.setProvider(provider)

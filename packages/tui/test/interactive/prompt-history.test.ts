@@ -249,5 +249,5 @@ async function createSession(provider: string) {
   const models = createModels()
   const faux = fauxProvider({ provider })
   models.setProvider(faux.provider)
-  return createAgentRuntime({ cwd: "/work", models, persist: false })
+  return createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
 }

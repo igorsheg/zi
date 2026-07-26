@@ -200,7 +200,7 @@ async function createSession(provider: string): Promise<AgentSession> {
   const models = createModels()
   const faux = fauxProvider({ provider, models: [{ id: "model" }] })
   models.setProvider(faux.provider)
-  return (await createAgentRuntime({ cwd: "/work", models, persist: false })).session
+  return (await createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })).session
 }
 
 function toolStarted(toolCallId: string): AgentSessionEvent {

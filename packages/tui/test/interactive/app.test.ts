@@ -9,7 +9,7 @@ test("the session app fills the terminal and protects the prompt", async () => {
   const models = createModels()
   const faux = fauxProvider()
   models.setProvider(faux.provider)
-  const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
+  const { session } = await createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
   let exits = 0
   const setup = await createInteractiveTest(session, { width: 40, height: 8 }, () => exits++)
 
@@ -41,7 +41,7 @@ test("interactive memory diagnostics compose process, session, renderer, and lis
   const models = createModels()
   const faux = fauxProvider()
   models.setProvider(faux.provider)
-  const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
+  const { session } = await createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
   const setup = await createInteractiveTest(session, { width: 40, height: 8 })
 
   try {
@@ -66,7 +66,7 @@ test("a second Ctrl+C within Pi's window exits the interactive mode", async () =
   const models = createModels()
   const faux = fauxProvider()
   models.setProvider(faux.provider)
-  const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
+  const { session } = await createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
   let exits = 0
   const setup = await createInteractiveTest(session, { width: 40, height: 8 }, () => exits++)
 
@@ -85,7 +85,7 @@ test("a picker-consumed Ctrl+C resets an armed exit gesture", async () => {
   const models = createModels()
   const faux = fauxProvider()
   models.setProvider(faux.provider)
-  const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
+  const { session } = await createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
   let exits = 0
   const setup = await createInteractiveTest(session, { width: 40, height: 8 }, () => exits++)
 
@@ -109,7 +109,7 @@ test("interactive keybinding overrides drive clear and exit through semantic act
   const models = createModels()
   const faux = fauxProvider()
   models.setProvider(faux.provider)
-  const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
+  const { session } = await createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
   let exits = 0
   const setup = await createInteractiveTest(session, { width: 40, height: 8, kittyKeyboard: true }, () => exits++, {
     "app.clear": ["ctrl+x"],
@@ -157,7 +157,7 @@ test("provider failures paint after settlement without keyboard input", async ()
     }
   ])
   models.setProvider(faux.provider)
-  const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
+  const { session } = await createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
   const setup = await createInteractiveTest(session, { width: 40, height: 8 })
 
   try {
@@ -187,7 +187,7 @@ test("an expired Ctrl+C arm starts a new exit window", async () => {
   const models = createModels()
   const faux = fauxProvider()
   models.setProvider(faux.provider)
-  const { session } = await createAgentRuntime({ cwd: "/work", models, persist: false })
+  const { session } = await createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
   let exits = 0
   const setup = await createInteractiveTest(session, { width: 40, height: 8 }, () => exits++)
   const now = spyOn(Date, "now").mockReturnValue(1_000)

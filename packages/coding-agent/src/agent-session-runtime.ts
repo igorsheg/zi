@@ -1,7 +1,12 @@
 import type { Api, Model } from "@earendil-works/pi-ai"
 
 import { resolveZiPath } from "./paths.js"
-import { createAgentRuntime, type AgentRuntime, type CreateAgentRuntimeOptions } from "./runtime.js"
+import {
+  snapshotAgentRuntimeOptions,
+  type AgentRuntimeSessionIntent,
+  type CreateAgentRuntimeOptions
+} from "./runtime-options.js"
+import { createAgentRuntime, type AgentRuntime } from "./runtime.js"
 import { SessionManager, type SessionListResult } from "./session-manager.js"
 
 export type AgentRuntimeFactory = (options: CreateAgentRuntimeOptions) => Promise<AgentRuntime>
@@ -53,7 +58,7 @@ export class AgentSessionRuntime {
 
   constructor(initial: AgentRuntime, options: CreateAgentRuntimeOptions, createRuntime: AgentRuntimeFactory) {
     this.#state = { type: "ready", current: initial }
-    this.#options = Object.freeze({ ...options })
+    this.#options = snapshotAgentRuntimeOptions({ ...options, agentDir: initial.services.paths.globalDir })
     this.#createRuntime = createRuntime
   }
 
@@ -95,8 +100,8 @@ export class AgentSessionRuntime {
     return this.#replace(
       runtimeOptions(this.#options, {
         cwd: current.services.paths.cwd,
-        sessionDir: persisted ? current.session.sessionManager.sessionDir : current.services.paths.sessionDir,
-        persist: persisted,
+        sessionDir: current.services.paths.sessionDir,
+        session: { type: "new", persist: persisted },
         ...(model ? { model } : {})
       }),
       true
@@ -105,12 +110,13 @@ export class AgentSessionRuntime {
 
   switchSession(sessionFile: string): Promise<AgentRuntime> {
     const current = this.#requireReady()
-    if (current.session.sessionManager.file === resolveZiPath(sessionFile)) return Promise.resolve(current)
+    const resolvedSessionFile = resolveZiPath(sessionFile, current.services.paths.cwd)
+    if (current.session.sessionManager.file === resolvedSessionFile) return Promise.resolve(current)
     const model = replacementModel(this.#options, current)
     return this.#replace(
       runtimeOptions(this.#options, {
         cwd: current.services.paths.cwd,
-        sessionFile,
+        session: { type: "resume", file: resolvedSessionFile },
         ...(this.#options.sessionDir ? { sessionDir: this.#options.sessionDir } : {}),
         ...(model ? { model } : {})
       })
@@ -281,27 +287,24 @@ export async function createAgentSessionRuntime(
   options: CreateAgentRuntimeOptions,
   createRuntime: AgentRuntimeFactory = createAgentRuntime
 ): Promise<AgentSessionRuntime> {
-  const initial = await createRuntime(options)
-  return new AgentSessionRuntime(initial, options, createRuntime)
+  const snapshot = snapshotAgentRuntimeOptions(options)
+  const initial = await createRuntime(snapshot)
+  return new AgentSessionRuntime(initial, snapshot, createRuntime)
 }
 
 function runtimeOptions(
   base: CreateAgentRuntimeOptions,
   replacement: {
     readonly cwd: string
-    readonly sessionFile?: string
+    readonly session: AgentRuntimeSessionIntent
     readonly sessionDir?: string
-    readonly persist?: boolean
     readonly model?: string
   }
 ): CreateAgentRuntimeOptions {
   const options = { ...base, ...replacement }
-  delete options.continueRecent
-  if (!replacement.sessionFile) delete options.sessionFile
-  if (!replacement.sessionDir) delete options.sessionDir
-  if (replacement.persist === undefined) delete options.persist
-  if (!replacement.model) delete options.model
-  return options
+  if (replacement.sessionDir === undefined) delete options.sessionDir
+  if (replacement.model === undefined) delete options.model
+  return snapshotAgentRuntimeOptions(options)
 }
 
 function replacementModel(options: CreateAgentRuntimeOptions, current: AgentRuntime): string | undefined {
