@@ -144,11 +144,15 @@ test("interactive keybinding overrides drive clear and exit through semantic act
   }
 })
 
-test("provider failures surface in the focused prompt after settlement", async () => {
+test("provider failures paint after settlement without keyboard input", async () => {
   const models = createModels()
   const faux = fauxProvider()
+  const providerStarted = deferred<void>()
+  const releaseFailure = deferred<void>()
   faux.setResponses([
     async () => {
+      providerStarted.resolve()
+      await releaseFailure.promise
       throw new Error("provider failed")
     }
   ])
@@ -161,10 +165,17 @@ test("provider failures surface in the focused prompt after settlement", async (
     if (!(input instanceof TextareaRenderable)) throw new Error("Prompt textarea not found")
     input.setText("fail")
     setup.mockInput.pressEnter()
-    await session.waitForIdle()
-    await renderSettled(setup)
+    await providerStarted.promise
+    await setup.renderOnce()
+    expect(setup.captureCharFrame()).toContain("Working…")
 
-    expect(setup.captureCharFrame()).toContain("provider failed")
+    releaseFailure.resolve()
+    await session.waitForIdle()
+    await setup.renderer.idle()
+
+    const frame = setup.captureCharFrame()
+    expect(frame).toContain("provider failed")
+    expect(frame).not.toContain("Working…")
     expect(input.focused).toBe(true)
   } finally {
     session.dispose()
@@ -195,3 +206,11 @@ test("an expired Ctrl+C arm starts a new exit window", async () => {
     setup.destroy()
   }
 })
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void
+  const promise = new Promise<T>(resolvePromise => {
+    resolve = resolvePromise
+  })
+  return { promise, resolve }
+}

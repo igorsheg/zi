@@ -87,8 +87,13 @@ export class ShimmerTextView {
     this.#active = active
     this.root.visible = active
     if (!this.#line || this.#line.graphemes.length === 0) return
-    if (active) this.#renderer.requestLive()
-    else this.#renderer.dropLive()
+    if (active) {
+      this.#renderer.requestLive()
+    } else {
+      this.#renderer.dropLive()
+      // OpenTUI 0.4.5 cancels the pending frame when the final live request drops.
+      this.#renderer.requestRender()
+    }
   }
 
   destroy(): void {
