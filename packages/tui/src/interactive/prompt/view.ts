@@ -21,6 +21,7 @@ import type { InteractiveStore } from "../interactive-store.js"
 import type { SlashController } from "../slash-controller.js"
 import { PromptFeedbackView } from "./feedback-view.js"
 import { captureFileCompletionInput } from "./file-completion.js"
+import { SessionGreeterView } from "./greeter-view.js"
 import { PickerStackView } from "./picker-view.js"
 import { QueuedInputsView } from "./queue-view.js"
 import { promptInputIsSecret, type PromptInputEdit, type PromptWorkflow } from "./state.js"
@@ -43,6 +44,7 @@ export class PromptView {
   readonly #working: ShimmerTextView
   readonly #feedback: PromptFeedbackView
   readonly #queue: QueuedInputsView
+  readonly #greeter: SessionGreeterView
   readonly #composer: Composer
   readonly #input: Composer["input"]
   readonly #pickerStack: PickerStackView
@@ -76,6 +78,7 @@ export class PromptView {
     this.#working = new ShimmerTextView(renderer, "Working…", theme.text.muted, theme.text.primary)
     this.#feedback = new PromptFeedbackView(renderer, browserOpener, theme)
     this.#queue = new QueuedInputsView(renderer, keybindings, theme)
+    this.#greeter = new SessionGreeterView(renderer, theme)
 
     const session = interactive.getSession()
     const geometry = composerGeometry(renderer.width, renderer.height)
@@ -100,6 +103,7 @@ export class PromptView {
     this.root.add(this.#working.root)
     this.root.add(this.#feedback.root)
     this.root.add(this.#queue.root)
+    this.root.add(this.#greeter.root)
     this.root.add(this.#composer.root)
     this.root.add(this.#pickerStack.root)
 
@@ -144,6 +148,7 @@ export class PromptView {
     this.#working.destroy()
     this.#feedback.destroy()
     this.#queue.destroy()
+    this.#greeter.destroy()
     this.#store.dispose()
     this.#pickerStack.destroy()
     this.root.destroyRecursively()
@@ -163,7 +168,14 @@ export class PromptView {
     if (secretInput) this.#renderer.clearSelection()
     const feedbackVisible = this.#feedback.update(prompt.feedback, this.#renderer.width)
     const working = session.isStreaming || session.compactionStatus.type === "running"
-    const fixedRows = geometry.protectedRows + (working ? 1 : 0) + (feedbackVisible ? 1 : 0)
+    const pickerOpen = Boolean(this.#store.picker.presentation(this.#input.plainText))
+    const greeterRows = this.#greeter.update(
+      session.messages.length === 0,
+      this.#renderer.width,
+      this.#renderer.height,
+      pickerOpen
+    )
+    const fixedRows = geometry.protectedRows + greeterRows + (working ? 1 : 0) + (feedbackVisible ? 1 : 0)
     const pickerVisible = this.#pickerStack.update(Math.max(0, this.#renderer.height - fixedRows))
 
     this.#working.setText(workingStatusText(session, this.#keybindings.getHint("app.interrupt"), Date.now()))
