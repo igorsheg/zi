@@ -16,7 +16,8 @@ test("AgentSession owns one discovered extension lifecycle through final disposa
   const runtime = await createAgentRuntime({
     cwd: fixture.cwd,
     agentDir: fixture.agentDir,
-    session: { type: "new", persist: false }
+    session: { type: "new", persist: false },
+    extensionWorkerCommand: workerCommand
   })
 
   try {
