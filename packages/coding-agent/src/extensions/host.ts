@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process"
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { delimiter, isAbsolute, join } from "node:path"
@@ -1307,6 +1308,10 @@ export class ExtensionHost {
   }
 }
 
+type SpawnedExtensionChild =
+  | { readonly type: "bun"; readonly process: Bun.Subprocess<"pipe", "pipe", "pipe"> }
+  | { readonly type: "node"; readonly process: ReturnType<typeof spawn> }
+
 export function createExtensionWorkerSpawner(
   command: readonly string[],
   removePublicApiDirectory: (path: string) => void = path => rmSync(path, { recursive: true, force: true })
@@ -1325,20 +1330,37 @@ export function createExtensionWorkerSpawner(
   const inheritedEnvironment = Object.freeze({ ...process.env })
   return plan => {
     const publicApi = createPublicApiModule(removePublicApiDirectory)
-    let child: Bun.Subprocess<"pipe", "pipe", "pipe">
+    const args = [...admitted.slice(1), extensionWorkerArgument]
+    const env = {
+      ...inheritedEnvironment,
+      NODE_PATH: inheritedEnvironment.NODE_PATH
+        ? `${publicApi.nodeModules}${delimiter}${inheritedEnvironment.NODE_PATH}`
+        : publicApi.nodeModules
+    }
+    let child: SpawnedExtensionChild
     try {
-      // Bun owns pipe creation; its node:child_process adapter can fail while materializing fd 3 on Linux.
-      child = Bun.spawn([admitted[0]!, ...admitted.slice(1), extensionWorkerArgument], {
-        cwd: plan.cwd,
-        env: {
-          ...inheritedEnvironment,
-          NODE_PATH: inheritedEnvironment.NODE_PATH
-            ? `${publicApi.nodeModules}${delimiter}${inheritedEnvironment.NODE_PATH}`
-            : publicApi.nodeModules
-        },
-        stdio: ["pipe", "pipe", "pipe", "pipe"],
-        windowsHide: true
-      })
+      // Bun owns POSIX pipe creation because its node adapter can fail while materializing fd 3 under Linux load.
+      // The node adapter remains required on Windows, where Bun's direct fd 3 transport is not connected.
+      child =
+        process.platform === "win32"
+          ? {
+              type: "node",
+              process: spawn(admitted[0]!, args, {
+                cwd: plan.cwd,
+                env,
+                stdio: ["pipe", "pipe", "pipe", "pipe"],
+                windowsHide: true
+              })
+            }
+          : {
+              type: "bun",
+              process: Bun.spawn([admitted[0]!, ...args], {
+                cwd: plan.cwd,
+                env,
+                stdio: ["pipe", "pipe", "pipe", "pipe"],
+                windowsHide: true
+              })
+            }
     } catch (cause) {
       publicApi.dispose()
       throw cause
@@ -1348,17 +1370,34 @@ export function createExtensionWorkerSpawner(
     let stderr: Readable
     let protocol: Readable
     try {
-      const protocolDescriptor = child.stdio[3]
-      if (typeof protocolDescriptor !== "number") {
-        throw new Error("Extension worker process did not expose all required pipes")
+      if (child.type === "bun") {
+        const protocolDescriptor = child.process.stdio[3]
+        if (typeof protocolDescriptor !== "number") {
+          throw new Error("Extension worker process did not expose all required pipes")
+        }
+        input = createBunProcessInput(child.process.stdin)
+        stdout = Readable.from(child.process.stdout)
+        stderr = Readable.from(child.process.stderr)
+        protocol = Readable.from(Bun.file(protocolDescriptor).stream())
+      } else {
+        const protocolStream = child.process.stdio[3]
+        if (
+          !child.process.stdin ||
+          !child.process.stdout ||
+          !child.process.stderr ||
+          !(protocolStream instanceof Readable)
+        ) {
+          throw new Error("Extension worker process did not expose all required pipes")
+        }
+        input = child.process.stdin
+        stdout = child.process.stdout
+        stderr = child.process.stderr
+        protocol = protocolStream
       }
-      input = createBunProcessInput(child.stdin)
-      stdout = Readable.from(child.stdout)
-      stderr = Readable.from(child.stderr)
-      protocol = Readable.from(Bun.file(protocolDescriptor).stream())
     } catch (cause) {
-      child.kill("SIGKILL")
-      child.unref()
+      if (child.type === "node") child.process.once("error", () => {})
+      killSpawnedExtensionChild(child, "SIGKILL")
+      unrefSpawnedExtensionChild(child)
       const cleanupError = publicApi.dispose()
       if (cleanupError) {
         throw new Error(`${errorMessage(cause, "Could not connect extension worker pipes")}; ${cleanupError.message}`, {
@@ -1387,13 +1426,29 @@ export function createExtensionWorkerSpawner(
       }
       resolveExit({ code, signal, ...(processError ? { error: processError } : {}) })
     }
-    void child.exited.then(
-      code => finish(code, child.signalCode),
-      cause => {
-        processError = cause instanceof Error ? cause : new Error("Extension worker process failed")
-        finish(child.exitCode, child.signalCode)
+    let stopObservingExit: (() => void) | undefined
+    if (child.type === "bun") {
+      const childProcess = child.process
+      void childProcess.exited.then(
+        code => finish(code, childProcess.signalCode),
+        cause => {
+          processError = cause instanceof Error ? cause : new Error("Extension worker process failed")
+          finish(childProcess.exitCode, childProcess.signalCode)
+        }
+      )
+    } else {
+      const childProcess = child.process
+      const onError = (cause: Error): void => {
+        processError = cause
       }
-    )
+      const onClose = (code: number | null, signal: NodeJS.Signals | null): void => finish(code, signal)
+      childProcess.on("error", onError)
+      childProcess.on("close", onClose)
+      stopObservingExit = () => {
+        childProcess.off("error", onError)
+        childProcess.off("close", onClose)
+      }
+    }
 
     return {
       input,
@@ -1402,17 +1457,31 @@ export function createExtensionWorkerSpawner(
       protocol,
       exited,
       terminate(force) {
-        if (!settled) child.kill(force ? "SIGKILL" : "SIGTERM")
+        if (!settled) killSpawnedExtensionChild(child, force ? "SIGKILL" : "SIGTERM")
       },
       dispose() {
+        stopObservingExit?.()
         if (!settled) {
-          child.unref()
+          unrefSpawnedExtensionChild(child)
           processError ??= new Error("Extension worker process ownership ended before exit observation")
-          finish(child.exitCode, child.signalCode)
+          const exit = spawnedExtensionChildExit(child)
+          finish(exit.code, exit.signal)
         }
       }
     }
   }
+}
+
+function killSpawnedExtensionChild(child: SpawnedExtensionChild, signal: NodeJS.Signals): void {
+  child.process.kill(signal)
+}
+
+function unrefSpawnedExtensionChild(child: SpawnedExtensionChild): void {
+  child.process.unref()
+}
+
+function spawnedExtensionChildExit(child: SpawnedExtensionChild): Pick<ExtensionWorkerExit, "code" | "signal"> {
+  return { code: child.process.exitCode, signal: child.process.signalCode }
 }
 
 function createBunProcessInput(sink: Bun.FileSink): Writable {
