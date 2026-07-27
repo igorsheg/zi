@@ -13,7 +13,7 @@ The current product milestone is the [`custom-tool extension golden path`](exten
 
 - [x] Record the building-block strategy and feature-routing rule.
 - [x] Define the custom-tool golden path and launch acceptance.
-- [ ] Keep the extension platform described as infrastructure until that path passes.
+- [x] Keep the extension platform described as infrastructure until that path passes.
 
 ### 2. Select the extension-worker runtime
 
@@ -54,7 +54,7 @@ The current product milestone is the [`custom-tool extension golden path`](exten
 - [ ] Publish `@with-zi/extension-api`; keep private coding-agent modules private.
 - [x] Ship `examples/extensions/custom-tool/` with an executable acceptance test.
 - [x] Add extension author documentation and source-attributed diagnostics.
-- [ ] Pass the compiled example acceptance in the five-target release matrix.
+- [x] Pass the compiled example acceptance in the five-target release matrix.
 
 ## Next — drive Zi as a process
 

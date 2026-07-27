@@ -1,6 +1,6 @@
 # Extension system infrastructure implementation spec
 
-- Status: in progress — lifecycle infrastructure complete; custom-tool capability implemented
+- Status: accepted for custom tools; later capabilities remain deferred
 - Pi behavior reference: `badlogic/pi-mono` at Zi's pinned `0e6909f0` (`v0.80.6`)
 - Current Pi comparison: `fc85bdd88be93b1e9a6b6bcfa41c684282ec79cc`
 - Project-trust comparison: `5bc1c2c0a6f07e00e8c240304182f213ab8d311f`
@@ -948,7 +948,7 @@ Progress:
 - [x] canonical custom-tool example and author guide;
 - [x] compiled worker acceptance for the example and public API module;
 - [x] release-package assembly for `@with-zi/extension-api`;
-- [ ] compiled interactive, text, and JSON acceptance on every release target.
+- [x] compiled interactive, text, and JSON acceptance on every release target.
 
 Likely files:
 

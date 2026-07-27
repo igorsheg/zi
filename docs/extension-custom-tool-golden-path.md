@@ -1,6 +1,6 @@
 # Custom-tool extension golden path
 
-- Status: target
+- Status: accepted — five-target compiled matrix passed
 - Product milestone: teach Zi one executable habit without modifying Zi
 - Authoritative product owner: `AgentSession`
 - Infrastructure owner: coding-agent `ExtensionHost`
@@ -92,6 +92,8 @@ ZiPaths + project trust
 - `@with-zi/extension-api` is the only supported package import.
 - `examples/extensions/custom-tool/` is copyable, documented, and run against the compiled executable in CI.
 - Acceptance passes on macOS arm64/x64, Linux arm64/x64, and Windows x64.
+
+[GitHub Actions 30303055257](https://github.com/igorsheg/zi/actions/runs/30303055257) passed the complete release matrix on macOS arm64/x64, Linux arm64/x64, and Windows x64.
 
 `scripts/extension-custom-tool-acceptance.ts` owns the release-shaped check. It copies the canonical source into a trusted temporary project's `.zi/extensions/`, starts a bounded local Responses provider, requires the provider to select `repository_status`, verifies the tool result on the second request, and runs the complete turn in text, JSON, and interactive modes. Interactive acceptance drives the native executable through Bun's PTY on POSIX and Git for Windows' `winpty.exe` on Windows; it verifies the final assistant presentation and terminal restoration (alternate-screen exit on POSIX and cursor restoration on Windows). After cursor restoration, the harness stops the wrapper process tree before winpty 0.4.3 can enter its broken non-TTY resize path or retain acceptance files. The provider boundary verifies the exact tool result because incremental terminal frames do not guarantee that an already-visible row appears contiguously in the raw terminal byte stream. `scripts/build-release.ts` runs this check before archiving every native artifact.
 
