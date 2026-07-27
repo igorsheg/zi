@@ -2,6 +2,8 @@
 
 import { homedir } from "node:os"
 
+import { extensionWorkerArgument, runExtensionWorkerFromStdio } from "@with-zi/coding-agent/internal/extension-worker"
+
 import {
   defaultRuntimeFactory,
   defaultSessionRuntimeFactory,
@@ -13,6 +15,14 @@ import {
 
 export async function main(argv: readonly string[] = defaultCliArgv()): Promise<number> {
   return runCli(argv, processHost())
+}
+
+export async function runEntrypoint(argv: readonly string[] = defaultCliArgv()): Promise<number> {
+  if (argv.length === 1 && argv[0] === extensionWorkerArgument) {
+    await runExtensionWorkerFromStdio()
+    return 0
+  }
+  return main(argv)
 }
 
 export function defaultCliArgv(argv: readonly string[] = process.argv): readonly string[] {
@@ -74,7 +84,7 @@ async function writeOutput(stream: Bun.BunFile, chunk: string): Promise<void> {
 
 if (import.meta.main) {
   try {
-    process.exitCode = await main(defaultCliArgv())
+    process.exitCode = await runEntrypoint(defaultCliArgv())
   } catch (cause) {
     const message = cause instanceof Error ? cause.message : String(cause)
     await Bun.stderr.write(`${message}\n`)

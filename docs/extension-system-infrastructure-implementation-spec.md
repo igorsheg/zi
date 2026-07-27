@@ -1,6 +1,6 @@
 # Extension system infrastructure implementation spec
 
-- Status: in progress — Slices A and B complete
+- Status: in progress — Slices A and B complete; Slice C protocol and worker loader
 - Pi behavior reference: `badlogic/pi-mono` at Zi's pinned `0e6909f0` (`v0.80.6`)
 - Current Pi comparison: `fc85bdd88be93b1e9a6b6bcfa41c684282ec79cc`
 - Project-trust comparison: `5bc1c2c0a6f07e00e8c240304182f213ab8d311f`
@@ -199,7 +199,7 @@ These are deep modules with distinct responsibilities:
 - `protocol.ts` defines and validates the closed process boundary;
 - `worker.ts` is the separately invoked worker entry point and TypeScript loader.
 
-A separate `@with-zi/extension-api` workspace package is justified when the lifecycle contract lands because external source fixtures need a stable import independent of Zi internals. It initially exports lifecycle types only and is available as a compiled virtual module. Npm publication waits for the custom-tool golden path rather than promoting an otherwise empty lifecycle API as a usable platform.
+A separate `@with-zi/extension-api` workspace package is justified when the lifecycle contract lands because external source fixtures need a stable import independent of Zi internals. It initially exports lifecycle types only; type-only imports erase before external modules execute, so the compiled virtual module is deferred until the custom-tool contract introduces runtime values. Npm publication likewise waits for the custom-tool golden path rather than promoting an otherwise empty lifecycle API as a usable platform.
 
 Do not create a separate package solely to hold the private protocol.
 
@@ -436,7 +436,7 @@ Pi's `jiti/static` integration is the reference implementation to evaluate. The 
 - awaited async factory settlement;
 - official virtual modules available from the standalone distribution.
 
-The initial official virtual modules are limited to:
+The first runtime-valued official virtual modules are limited to:
 
 ```text
 @with-zi/extension-api
@@ -444,6 +444,8 @@ typebox
 typebox/compile
 typebox/value
 ```
+
+They land with custom-tool registration, when the API first exports schema values. The lifecycle-only loader already accepts erased `import type` references to `@with-zi/extension-api` without exposing a runtime module.
 
 Zi does not expose `@with-zi/coding-agent`, OpenTUI, `AgentSession`, `SessionManager`, `ModelRegistry`, credentials, or private implementation modules through the extension interface. Extensions remain trusted JavaScript running with the Zi user's operating-system authority: they can read user-accessible files and environment variables, spawn processes, and interfere with worker-local resources or descriptors. The worker boundary contains faults and protects Zi's owner loop from ordinary crashes and hangs; it is not a sandbox or credential-confidentiality boundary.
 
@@ -605,12 +607,16 @@ The first implementation uses hard limits:
 ```ts
 const maxExtensionSources = 128
 const maxExtensionPathBytes = 4 * 1024
-const maxExtensionProtocolFrameBytes = 1024 * 1024
+const maxExtensionProtocolFrameBytes = 4 * 1024 * 1024
 const maxExtensionPendingRequests = 128
 const maxExtensionQueuedWriteBytes = 8 * 1024 * 1024
+const maxExtensionQueuedWrites = 1024
 const maxExtensionDiagnostics = 256
 const maxExtensionDiagnosticMessageBytes = 16 * 1024
 const maxExtensionDiagnosticStackBytes = 64 * 1024
+const maxExtensionLoadDiagnosticMessageBytes = 2 * 1024
+const maxExtensionIdBytes = 256
+const maxExtensionLifecycleHandlers = 1024
 const maxExtensionLogBytesPerStream = 256 * 1024
 const extensionStartupTimeoutMs = 30_000
 const extensionLifecycleTimeoutMs = 10_000
@@ -801,6 +807,15 @@ Deliver:
 - no worker process yet.
 
 ### Slice C — protocol and worker loader
+
+Progress:
+
+- [x] closed versioned messages, validation, framing, and bounded serialized writers;
+- [x] internal CLI worker mode over stdin and a dedicated descriptor-three pipe;
+- [x] external TypeScript, Node built-ins, local dependencies, and async factory settlement;
+- [x] lifecycle-only registration, deterministic dispatch, diagnostics, deadlines, and transition rejection;
+- [x] type-only `@with-zi/extension-api` workspace contract;
+- [ ] runtime-valued virtual modules, deferred until custom-tool schemas require them.
 
 Likely files:
 

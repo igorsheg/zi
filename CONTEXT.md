@@ -116,6 +116,18 @@ _Avoid_: Loaded extension, plugin instance
 The immutable ordered extension sources admitted for one exact session cwd after project trust. Explicit sources precede trusted project sources, which precede global sources.
 _Avoid_: Extension registry, worker generation
 
+**Extension worker**:
+The supervised child process that loads trusted extension modules, owns their JavaScript state, runs factories and handlers, and exchanges bounded protocol messages with Zi. It contains faults but is not a security sandbox.
+_Avoid_: Plugin sandbox, extension thread, credential boundary
+
+**Extension generation**:
+One extension worker, one immutable load plan, one generation identity, and the resources tied to that process lifetime. Replacement creates a generation rather than mutating one.
+_Avoid_: Module-cache refresh, extension registry version
+
+**Extension lifecycle**:
+The interval beginning when a committed generation receives `session_start` and ending when it receives `session_shutdown` or is forcibly terminated.
+_Avoid_: Factory execution, process disposal, tool cancellation
+
 **Custom-tool extension golden path**:
 The first externally useful extension outcome: a trusted repository-owned TypeScript extension adds one model-callable tool that behaves consistently across interactive and headless Zi modes without modifying Zi.
 _Avoid_: Extension infrastructure complete, plugin demo

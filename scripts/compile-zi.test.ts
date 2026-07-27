@@ -1,7 +1,17 @@
 import { expect, test } from "bun:test"
+import { spawn } from "node:child_process"
 import { chmod, mkdtemp, rm } from "node:fs/promises"
 import { join, resolve } from "node:path"
+import { pathToFileURL } from "node:url"
 
+import {
+  ExtensionProtocolDecoder,
+  type WorkerMessage,
+  encodeExtensionProtocolFrame,
+  extensionProtocolVersion,
+  validateWorkerMessage
+} from "../packages/coding-agent/src/extensions/protocol.js"
+import { extensionWorkerArgument } from "../packages/coding-agent/src/extensions/worker-entry.js"
 import { assertPinnedBunVersion, compileStandalone } from "./compile-zi.js"
 
 test("standalone compilation requires the workspace-pinned Bun runtime", () => {
@@ -9,6 +19,116 @@ test("standalone compilation requires the workspace-pinned Bun runtime", () => {
   expect(() => assertPinnedBunVersion("1.3.14", "bun@1.3.14")).not.toThrow()
   expect(() => assertPinnedBunVersion("1.3.14", "npm@11.4.2")).toThrow("packageManager must pin Bun exactly")
 })
+
+test("the compiled Zi executable runs the dedicated extension worker protocol", async () => {
+  const temporary = await mkdtemp(join(import.meta.dirname, ".compiled-extension-worker-"))
+  const executable = join(temporary, process.platform === "win32" ? "zi.exe" : "zi")
+  const extension = join(temporary, "extension.ts")
+  let child: ReturnType<typeof spawn> | undefined
+
+  try {
+    await Bun.write(
+      extension,
+      `
+import type { ExtensionAPI } from "@with-zi/extension-api"
+
+export default function (zi: ExtensionAPI): void {
+  console.log("compiled worker stdout")
+  console.error("compiled worker stderr")
+  zi.on("session_start", () => {})
+  zi.on("session_shutdown", () => {})
+}
+`
+    )
+    await compileZiInSubprocess(executable)
+    if (process.platform !== "win32") await chmod(executable, 0o755)
+
+    child = spawn(executable, [extensionWorkerArgument], {
+      cwd: temporary,
+      stdio: ["pipe", "pipe", "pipe", "pipe"],
+      windowsHide: true
+    })
+    const protocolOutput = child.stdio[3]
+    if (!child.stdin || !child.stdout || !child.stderr || !protocolOutput) {
+      throw new Error("Compiled extension worker did not expose its protocol and log pipes")
+    }
+
+    const stdout = readNodeStream(child.stdout)
+    const stderr = readNodeStream(child.stderr)
+    const protocolMessages: WorkerMessage[] = []
+    const protocol = new Promise<void>((resolveProtocol, rejectProtocol) => {
+      let completed = false
+      const decoder = new ExtensionProtocolDecoder(validateWorkerMessage)
+      const receive = (message: WorkerMessage): void => {
+        protocolMessages.push(message)
+        if (message.type === "fatal") {
+          rejectProtocol(new Error(message.diagnostic.message))
+          return
+        }
+        if (message.type === "ready") {
+          child!.stdin!.write(
+            encodeExtensionProtocolFrame({ type: "session_start", generation: 1, requestId: 1, reason: "startup" })
+          )
+          return
+        }
+        if (message.type === "settled" && message.requestId === 1) {
+          child!.stdin!.write(
+            encodeExtensionProtocolFrame({ type: "session_shutdown", generation: 1, requestId: 2, reason: "quit" })
+          )
+          return
+        }
+        if (message.type === "settled" && message.requestId === 2) {
+          child!.stdin!.write(encodeExtensionProtocolFrame({ type: "stop", generation: 1, requestId: 3 }))
+          return
+        }
+        if (message.type === "settled" && message.requestId === 3) {
+          completed = true
+          resolveProtocol()
+        }
+      }
+      protocolOutput.on("data", chunk => {
+        try {
+          for (const message of decoder.push(chunk)) receive(message)
+        } catch (cause) {
+          rejectProtocol(cause)
+        }
+      })
+      protocolOutput.on("error", rejectProtocol)
+      protocolOutput.on("end", () => {
+        if (!completed) rejectProtocol(new Error("Compiled extension worker closed its protocol pipe early"))
+      })
+    })
+
+    child.stdin.write(
+      encodeExtensionProtocolFrame({
+        type: "initialize",
+        protocolVersion: extensionProtocolVersion,
+        generation: 1,
+        plan: {
+          cwd: temporary,
+          sources: [
+            {
+              id: "compiled-extension",
+              declaredPath: extension,
+              entryPath: extension,
+              scope: "temporary",
+              origin: "cli"
+            }
+          ]
+        }
+      })
+    )
+
+    const [exitCode, capturedStdout, capturedStderr] = await Promise.all([childExit(child), stdout, stderr, protocol])
+    expect(exitCode).toBe(0)
+    expect(capturedStdout).toBe("compiled worker stdout\n")
+    expect(capturedStderr).toBe("compiled worker stderr\n")
+    expect(protocolMessages.map(message => message.type)).toEqual(["ready", "settled", "settled", "settled"])
+  } finally {
+    child?.kill()
+    await rm(temporary, { recursive: true, force: true })
+  }
+}, 60_000)
 
 test("the standalone bundle resolves OAuth and settles highlighted Markdown", async () => {
   const temporary = await mkdtemp(join(import.meta.dirname, ".compiled-standalone-"))
@@ -129,3 +249,39 @@ try {
     await rm(temporary, { recursive: true, force: true })
   }
 }, 60_000)
+
+async function compileZiInSubprocess(outfile: string): Promise<void> {
+  const compilerSource = pathToFileURL(resolve(import.meta.dirname, "compile-zi.ts")).href
+  const code = `
+const { compileZi } = await import(${JSON.stringify(compilerSource)})
+await compileZi({ outfile: process.env.ZI_COMPILED_TEST_OUTFILE, version: "compiled-extension-worker-test" })
+`
+  const compiler = Bun.spawn([process.execPath, "-e", code], {
+    cwd: resolve(import.meta.dirname, ".."),
+    env: { ...process.env, ZI_COMPILED_TEST_OUTFILE: outfile },
+    stdin: "ignore",
+    stdout: "pipe",
+    stderr: "pipe"
+  })
+  const [exitCode, stdout, stderr] = await Promise.all([
+    compiler.exited,
+    new Response(compiler.stdout).text(),
+    new Response(compiler.stderr).text()
+  ])
+  if (exitCode !== 0) {
+    throw new Error(`Compiled Zi build failed: stdout=${JSON.stringify(stdout)} stderr=${JSON.stringify(stderr)}`)
+  }
+}
+
+async function readNodeStream(stream: NodeJS.ReadableStream): Promise<string> {
+  let text = ""
+  for await (const chunk of stream) text += Buffer.from(chunk).toString("utf8")
+  return text
+}
+
+function childExit(child: ReturnType<typeof spawn>): Promise<number | null> {
+  return new Promise((resolveExit, rejectExit) => {
+    child.once("error", rejectExit)
+    child.once("exit", code => resolveExit(code))
+  })
+}

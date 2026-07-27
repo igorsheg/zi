@@ -6,6 +6,7 @@
   "type": "module",
   "exports": {
     ".": "./src/index.ts",
+    "./internal/extension-worker": "./src/extensions/worker-entry.ts",
     "./testing": "./src/testing.ts"
   },
   "scripts": {
@@ -21,6 +22,7 @@
   "dependencies": {
     "@earendil-works/pi-agent-core": "catalog:",
     "@earendil-works/pi-ai": "catalog:",
+    "@with-zi/extension-api": "workspace:*",
     "diff": "9.0.0",
     "ignore": "7.0.5",
     "proper-lockfile": "4.1.2",
