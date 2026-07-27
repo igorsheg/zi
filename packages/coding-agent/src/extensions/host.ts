@@ -639,6 +639,17 @@ class ExtensionGeneration {
         this.#onDiagnostic(
           diagnostic("shutdown", `Extension worker cleanup failed: ${exit.error.message}`, exit.error, "warning")
         )
+      } else if (state.type === "failed") {
+        const stderr = this.#stderr.snapshot().text.trim()
+        const suffix = `code ${String(exit.code)}, signal ${String(exit.signal)}`
+        this.#onDiagnostic(
+          diagnostic(
+            "shutdown",
+            `Extension worker exited after failure (${suffix})${stderr ? `: ${stderr}` : ""}`,
+            undefined,
+            "warning"
+          )
+        )
       }
       return
     }
