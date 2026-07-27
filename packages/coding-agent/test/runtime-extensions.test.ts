@@ -21,14 +21,18 @@ test("AgentSession owns one discovered extension lifecycle through final disposa
   })
 
   try {
-    expect(await readFile(fixture.lifecycle, "utf8")).toBe("start:startup\n")
-    expect(runtime.session.extensionHostSnapshot).toMatchObject({
+    const snapshot = runtime.session.extensionHostSnapshot
+    expect(snapshot).toMatchObject({
       status: "ready",
       lifecycle: "started",
       extensions: [{ status: "loaded" }],
       stdout: { text: "runtime extension stdout\n" },
       stderr: { text: "runtime extension stderr\n" }
     })
+    if (!existsSync(fixture.lifecycle)) {
+      throw new Error(`Lifecycle handler did not run: ${JSON.stringify(snapshot)}`)
+    }
+    expect(await readFile(fixture.lifecycle, "utf8")).toBe("start:startup\n")
   } finally {
     runtime.session.dispose()
     await runtime.session.waitForIdle()
