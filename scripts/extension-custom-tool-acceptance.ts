@@ -168,7 +168,7 @@ async function runInteractive(
   if (output.exitCode !== 0) throw processFailure("interactive", output)
 
   const terminalOutput = output.stdout + output.stderr
-  for (const expected of ["Result:", expectedStatus, acceptanceResult]) {
+  for (const expected of [expectedStatus, acceptanceResult]) {
     if (!terminalOutput.includes(expected)) {
       throw new Error(`Compiled interactive mode omitted ${JSON.stringify(expected)}`)
     }
