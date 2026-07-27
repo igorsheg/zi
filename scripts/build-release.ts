@@ -73,7 +73,7 @@ async function buildRelease(options: ReleaseBuildOptions): Promise<void> {
   const archive = join(outputDirectory, releaseArchiveName(options))
 
   await mkdir(outputDirectory, { recursive: true })
-  await rm(packageDirectory, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 })
+  await removeReleasePackage(packageDirectory)
   await rm(archive, { force: true })
   await rm(`${archive}.sha256`, { force: true })
   await mkdir(packageDirectory)
@@ -90,7 +90,26 @@ async function buildRelease(options: ReleaseBuildOptions): Promise<void> {
     await Bun.write(`${archive}.sha256`, `${digest}  ${basename(archive)}\n`)
     console.log(`${archive}\n${archive}.sha256`)
   } finally {
-    await rm(packageDirectory, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 })
+    await removeReleasePackage(packageDirectory)
+  }
+}
+
+async function removeReleasePackage(path: string): Promise<void> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      // Each cleanup attempt owns the same path and must settle before the next retry.
+      // oxlint-disable-next-line no-await-in-loop
+      await rm(path, { recursive: true, force: true })
+      return
+    } catch (cause) {
+      const code = cause instanceof Error ? (cause as NodeJS.ErrnoException).code : undefined
+      if (attempt === 19 || (code !== "EACCES" && code !== "EBUSY" && code !== "EPERM" && code !== "ENOTEMPTY")) {
+        throw cause
+      }
+      // winpty's agent can retain the exited Windows image briefly after its adapter closes.
+      // oxlint-disable-next-line no-await-in-loop
+      await Bun.sleep(100)
+    }
   }
 }
 
