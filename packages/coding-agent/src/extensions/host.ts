@@ -1,9 +1,7 @@
-import { spawn } from "node:child_process"
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { delimiter, isAbsolute, join } from "node:path"
-import { Readable } from "node:stream"
-import type { Writable } from "node:stream"
+import { Readable, Writable } from "node:stream"
 
 import type { ExtensionShutdownReason, ExtensionStartReason } from "@with-zi/extension-api"
 
@@ -1327,9 +1325,10 @@ export function createExtensionWorkerSpawner(
   const inheritedEnvironment = Object.freeze({ ...process.env })
   return plan => {
     const publicApi = createPublicApiModule(removePublicApiDirectory)
-    let child: ReturnType<typeof spawn>
+    let child: Bun.Subprocess<"pipe", "pipe", "pipe">
     try {
-      child = spawn(admitted[0]!, [...admitted.slice(1), extensionWorkerArgument], {
+      // Bun owns pipe creation; its node:child_process adapter can fail while materializing fd 3 on Linux.
+      child = Bun.spawn([admitted[0]!, ...admitted.slice(1), extensionWorkerArgument], {
         cwd: plan.cwd,
         env: {
           ...inheritedEnvironment,
@@ -1349,16 +1348,15 @@ export function createExtensionWorkerSpawner(
     let stderr: Readable
     let protocol: Readable
     try {
-      const childProtocol = child.stdio[3]
-      if (!child.stdin || !child.stdout || !child.stderr || !(childProtocol instanceof Readable)) {
+      const protocolDescriptor = child.stdio[3]
+      if (typeof protocolDescriptor !== "number") {
         throw new Error("Extension worker process did not expose all required pipes")
       }
-      input = child.stdin
-      stdout = child.stdout
-      stderr = child.stderr
-      protocol = childProtocol
+      input = createBunProcessInput(child.stdin)
+      stdout = Readable.from(child.stdout)
+      stderr = Readable.from(child.stderr)
+      protocol = Readable.from(Bun.file(protocolDescriptor).stream())
     } catch (cause) {
-      child.once("error", () => {})
       child.kill("SIGKILL")
       child.unref()
       const cleanupError = publicApi.dispose()
@@ -1389,12 +1387,13 @@ export function createExtensionWorkerSpawner(
       }
       resolveExit({ code, signal, ...(processError ? { error: processError } : {}) })
     }
-    const onError = (cause: Error): void => {
-      processError = cause
-    }
-    const onClose = (code: number | null, signal: NodeJS.Signals | null): void => finish(code, signal)
-    child.on("error", onError)
-    child.on("close", onClose)
+    void child.exited.then(
+      code => finish(code, child.signalCode),
+      cause => {
+        processError = cause instanceof Error ? cause : new Error("Extension worker process failed")
+        finish(child.exitCode, child.signalCode)
+      }
+    )
 
     return {
       input,
@@ -1406,8 +1405,6 @@ export function createExtensionWorkerSpawner(
         if (!settled) child.kill(force ? "SIGKILL" : "SIGTERM")
       },
       dispose() {
-        child.off("error", onError)
-        child.off("close", onClose)
         if (!settled) {
           child.unref()
           processError ??= new Error("Extension worker process ownership ended before exit observation")
@@ -1416,6 +1413,58 @@ export function createExtensionWorkerSpawner(
       }
     }
   }
+}
+
+function createBunProcessInput(sink: Bun.FileSink): Writable {
+  let ended = false
+  return new Writable({
+    write(chunk: Buffer, _encoding, callback) {
+      void writeBunProcessInput(sink, chunk, callback)
+    },
+    final(callback) {
+      ended = true
+      void closeBunProcessInput(sink, null, callback)
+    },
+    destroy(cause, callback) {
+      if (ended) {
+        callback(cause)
+        return
+      }
+      ended = true
+      void closeBunProcessInput(sink, cause, callback)
+    }
+  })
+}
+
+async function writeBunProcessInput(
+  sink: Bun.FileSink,
+  chunk: Buffer,
+  callback: (error?: Error | null) => void
+): Promise<void> {
+  try {
+    await sink.write(chunk)
+    await sink.flush()
+    callback()
+  } catch (cause) {
+    callback(processStreamError(cause))
+  }
+}
+
+async function closeBunProcessInput(
+  sink: Bun.FileSink,
+  cause: Error | null,
+  callback: (error: Error | null) => void
+): Promise<void> {
+  try {
+    await sink.end(cause ?? undefined)
+    callback(cause)
+  } catch (failure) {
+    callback(cause ?? processStreamError(failure))
+  }
+}
+
+function processStreamError(cause: unknown): Error {
+  return cause instanceof Error ? cause : new Error("Extension worker process stream failed")
 }
 
 function createPublicApiModule(removeDirectory: (path: string) => void): {
