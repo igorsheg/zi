@@ -32,7 +32,7 @@
     "prepare": "lefthook install",
     "release:build": "bun scripts/build-release.ts",
     "start": "bun packages/cli/src/main.ts",
-    "test": "bun test scripts && bun run --filter '*' test",
+    "test": "bun test scripts && bun run --sequential --filter '*' test",
     "typecheck": "tsc --noEmit -p scripts/tsconfig.json && bun run --filter '*' typecheck"
   },
   "devDependencies": {
