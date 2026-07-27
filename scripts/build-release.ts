@@ -73,7 +73,7 @@ async function buildRelease(options: ReleaseBuildOptions): Promise<void> {
   const archive = join(outputDirectory, releaseArchiveName(options))
 
   await mkdir(outputDirectory, { recursive: true })
-  await rm(packageDirectory, { recursive: true, force: true })
+  await rm(packageDirectory, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 })
   await rm(archive, { force: true })
   await rm(`${archive}.sha256`, { force: true })
   await mkdir(packageDirectory)
@@ -90,7 +90,7 @@ async function buildRelease(options: ReleaseBuildOptions): Promise<void> {
     await Bun.write(`${archive}.sha256`, `${digest}  ${basename(archive)}\n`)
     console.log(`${archive}\n${archive}.sha256`)
   } finally {
-    await rm(packageDirectory, { recursive: true, force: true })
+    await rm(packageDirectory, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 })
   }
 }
 
