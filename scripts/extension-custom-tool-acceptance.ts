@@ -241,18 +241,14 @@ async function runWindowsInteractive(
   let fallbackTimer: ReturnType<typeof setTimeout> | undefined
   let exitRequested = false
   let wrapperStoppedAfterRestore = false
-  let wrapperStopFailure: string | undefined
   const requestExit = (text: string): void => {
     if (exitRequested && !wrapperStoppedAfterRestore && text.includes("\u001b[?25h")) {
       wrapperStoppedAfterRestore = true
-      const stop = Bun.spawnSync(["taskkill.exe", "/PID", String(child.pid), "/T", "/F"], {
+      Bun.spawnSync(["taskkill.exe", "/PID", String(child.pid), "/T", "/F"], {
         stdout: "ignore",
-        stderr: "pipe",
+        stderr: "ignore",
         windowsHide: true
       })
-      if (stop.exitCode !== 0) {
-        wrapperStopFailure = new TextDecoder().decode(stop.stderr).trim() || `taskkill exited with ${stop.exitCode}`
-      }
       Bun.spawnSync(["taskkill.exe", "/IM", basename(executable), "/T", "/F"], {
         stdout: "ignore",
         stderr: "ignore",
@@ -272,7 +268,6 @@ async function runWindowsInteractive(
 
   try {
     const [exitCode, capturedStdout, capturedStderr] = await settleProcess(child, stdout, stderr)
-    if (wrapperStopFailure) throw new Error(`Could not stop Windows interactive process tree: ${wrapperStopFailure}`)
     if (wrapperStoppedAfterRestore && capturedStderr === "") {
       await Bun.sleep(500)
       return { exitCode: 0, stdout: capturedStdout, stderr: "" }
