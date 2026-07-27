@@ -1,7 +1,7 @@
 # Product roadmap
 
 - Status: active
-- Updated: 2026-07-26
+- Updated: 2026-07-27
 
 This roadmap orders product work by downstream leverage. [`parity-roadmap.md`](parity-roadmap.md) remains the capability and provenance inventory; parity evidence no longer determines product priority by itself. Product choices follow the [`building-block strategy`](building-block-strategy.md).
 
@@ -47,14 +47,14 @@ The current product milestone is the [`custom-tool extension golden path`](exten
 - [x] Execute invocations through bounded correlated IPC with cancellation.
 - [x] Present unknown/custom tools through the existing generic tool presentation.
 - [x] Prove worker crash, hang, malformed result, stale completion, and shutdown behavior.
-- [ ] Pass the golden path in interactive, text, and JSON modes.
+- [x] Pass the golden path in interactive, text, and JSON modes.
 
 ### 6. Make the path copyable
 
 - [ ] Publish `@with-zi/extension-api`; keep private coding-agent modules private.
 - [x] Ship `examples/extensions/custom-tool/` with an executable acceptance test.
 - [x] Add extension author documentation and source-attributed diagnostics.
-- [ ] Run the example against compiled release artifacts on every release platform.
+- [ ] Pass the compiled example acceptance in the five-target release matrix.
 
 ## Next — drive Zi as a process
 

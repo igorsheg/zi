@@ -593,6 +593,7 @@ Future Pi-equivalent handlers must be able to call back into Zi while Zi awaits 
 - cancellation identifies one request and never means process shutdown;
 - a cancelling tool remains owned and counted until its execution settles; a missed cancellation deadline fails the generation;
 - result/cancel crossings settle once without turning a completed request into a protocol failure;
+- an observed tool response may cross an immediately following lifecycle or stop request while the worker's serialized-writer callback is still pending; only running or cancelling execution blocks shutdown;
 - process shutdown rejects every pending request exactly once.
 
 Do not implement lockstep request/response I/O or hold one global request mutex across handler execution.
@@ -807,17 +808,12 @@ Fixture extensions prove:
 
 ### 17.5 Compiled acceptance
 
-The release-shaped acceptance test:
+Compiled acceptance has two layers:
 
-1. compiles Zi with the pinned Bun version;
-2. starts the executable with a temporary global extension;
-3. loads TypeScript and one local npm dependency;
-4. observes ready and lifecycle settlement through a test-only external effect;
-5. reloads to a new generation;
-6. proves the old process is gone;
-7. exits with no leaked process or temporary artifact.
+1. the worker-protocol test compiles Zi with the pinned Bun version, loads external TypeScript plus the canonical example, invokes its tool over the dedicated protocol pipe, checks lifecycle settlement and log isolation, and exits without leaked process or temporary state;
+2. the release-product test copies the canonical example beneath a persisted-trusted temporary project's `.zi/extensions/`, starts a bounded local Responses provider, and requires the compiled executable to complete one real custom-tool turn in text, JSON, and interactive modes.
 
-CI uses deterministic process and resource assertions rather than wall-clock performance thresholds.
+The product test checks registration in the first provider request, the exact custom-tool result in the second request, text stdout isolation, ordered JSON tool events, generic interactive result presentation, and alternate-screen restoration. POSIX acceptance owns a Bun PTY; the Windows release runner uses its Git for Windows `winpty.exe`. `build-release.ts` runs this acceptance before archiving each native target. CI uses deterministic process and resource assertions rather than wall-clock performance thresholds; deadlines only bound failed subprocess settlement.
 
 ## 18. Implementation slices
 

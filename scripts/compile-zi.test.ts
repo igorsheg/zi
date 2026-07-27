@@ -15,6 +15,7 @@ import {
 import { extensionApiModuleSource } from "../packages/coding-agent/src/extensions/public-api-module.js"
 import { extensionWorkerArgument } from "../packages/coding-agent/src/extensions/worker-entry.js"
 import { assertPinnedBunVersion, compileStandalone } from "./compile-zi.js"
+import { runExtensionCustomToolAcceptance } from "./extension-custom-tool-acceptance.js"
 
 test("standalone compilation requires the workspace-pinned Bun runtime", () => {
   expect(() => assertPinnedBunVersion("1.3.5", "bun@1.3.14")).toThrow("Zi builds require Bun 1.3.14; running 1.3.5")
@@ -226,11 +227,13 @@ export default function (zi: ExtensionAPI): void {
     expect(productStdout).not.toContain("compiled worker stdout")
     expect(productStderr).not.toContain("compiled worker stderr")
     expect(await Bun.file(lifecycle).text()).toBe("start:startup\nstop:quit\n")
+
+    await runExtensionCustomToolAcceptance({ executable, extensionSource: exampleExtension })
   } finally {
     child?.kill()
     await rm(temporary, { recursive: true, force: true })
   }
-}, 60_000)
+}, 90_000)
 
 test("the standalone bundle resolves OAuth and settles highlighted Markdown", async () => {
   const temporary = await mkdtemp(join(import.meta.dirname, ".compiled-standalone-"))

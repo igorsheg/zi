@@ -93,6 +93,8 @@ ZiPaths + project trust
 - `examples/extensions/custom-tool/` is copyable, documented, and run against the compiled executable in CI.
 - Acceptance passes on macOS arm64/x64, Linux arm64/x64, and Windows x64.
 
+`scripts/extension-custom-tool-acceptance.ts` owns the release-shaped check. It copies the canonical source into a trusted temporary project's `.zi/extensions/`, starts a bounded local Responses provider, requires the provider to select `repository_status`, verifies the tool result on the second request, and runs the complete turn in text, JSON, and interactive modes. Interactive acceptance drives the native executable through Bun's PTY on POSIX and Git for Windows' `winpty.exe` on the Windows release runner; it verifies the generic result row and alternate-screen restoration. `scripts/build-release.ts` runs this check before archiving every native artifact.
+
 ## Launch boundary
 
 Lifecycle-only loading is an infrastructure milestone. Zi calls the extension platform usable only when the custom-tool example passes this document against a compiled release on every supported platform.
