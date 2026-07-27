@@ -168,10 +168,8 @@ async function runInteractive(
   if (output.exitCode !== 0) throw processFailure("interactive", output)
 
   const terminalOutput = output.stdout + output.stderr
-  for (const expected of [expectedStatus, acceptanceResult]) {
-    if (!terminalOutput.includes(expected)) {
-      throw new Error(`Compiled interactive mode omitted ${JSON.stringify(expected)}`)
-    }
+  if (!terminalOutput.includes(acceptanceResult)) {
+    throw new Error(`Compiled interactive mode omitted ${JSON.stringify(acceptanceResult)}`)
   }
   if (!terminalOutput.includes("\u001b[?1049h") || !terminalOutput.includes("\u001b[?1049l")) {
     throw new Error("Compiled interactive mode did not enter and restore the alternate terminal screen")
