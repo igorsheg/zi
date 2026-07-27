@@ -1146,6 +1146,13 @@ export class ExtensionHost {
         this.#state = { type: "failed", lifecycle, diagnostic: failure, cleanup }
       }
       await cleanup
+      this.#lastLogs = candidate.logs()
+      const stderr = this.#lastLogs.stderr.text.trim()
+      if (stderr) {
+        this.#diagnose(
+          diagnostic("handshake", `Extension worker stderr after startup failure: ${stderr}`, undefined, "warning")
+        )
+      }
       return
     }
     if (this.#state !== spawned) {
