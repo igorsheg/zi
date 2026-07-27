@@ -282,7 +282,7 @@ class ExtensionWorkerProcess {
       return
     }
     if (message.type === "session_start" || message.type === "session_shutdown") {
-      if (message.type === "session_shutdown" && this.#toolInvocations.size > 0) {
+      if (message.type === "session_shutdown" && this.#hasExecutingToolInvocations()) {
         this.#protocolFailure("Extension worker cannot shut down with active tool invocations")
         return
       }
@@ -298,7 +298,7 @@ class ExtensionWorkerProcess {
       return
     }
     if (message.type === "stop") {
-      if (this.#toolInvocations.size > 0) {
+      if (this.#hasExecutingToolInvocations()) {
         this.#protocolFailure("Extension worker cannot stop with active tool invocations")
         return
       }
@@ -424,6 +424,13 @@ class ExtensionWorkerProcess {
     } catch (cause) {
       this.#fail(cause)
     }
+  }
+
+  #hasExecutingToolInvocations(): boolean {
+    for (const invocation of this.#toolInvocations.values()) {
+      if (invocation.type !== "responding") return true
+    }
+    return false
   }
 
   #rememberSettledToolRequest(requestId: number): void {
