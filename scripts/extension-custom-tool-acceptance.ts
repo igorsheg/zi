@@ -249,11 +249,13 @@ async function runWindowsInteractive(
         stderr: "ignore",
         windowsHide: true
       })
-      Bun.spawnSync(["taskkill.exe", "/IM", basename(executable), "/T", "/F"], {
-        stdout: "ignore",
-        stderr: "ignore",
-        windowsHide: true
-      })
+      for (const image of [basename(executable), "winpty-agent.exe"]) {
+        Bun.spawnSync(["taskkill.exe", "/IM", image, "/T", "/F"], {
+          stdout: "ignore",
+          stderr: "ignore",
+          windowsHide: true
+        })
+      }
       return
     }
     if (exitRequested || !text.includes(acceptanceResult)) return
