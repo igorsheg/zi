@@ -16,7 +16,7 @@
     "format:check": "oxfmt --check .",
     "lint": "oxlint .",
     "lint:fix": "oxlint --fix .",
-    "test": "bun test --preload ../../test/isolate-zi-home.ts",
+    "test": "bun test --max-concurrency=1 --preload ../../test/isolate-zi-home.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
