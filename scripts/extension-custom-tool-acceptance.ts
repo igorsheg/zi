@@ -1,7 +1,7 @@
 import { existsSync, realpathSync } from "node:fs"
 import { copyFile, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
-import { join, resolve } from "node:path"
+import { basename, join, resolve } from "node:path"
 
 const acceptancePrompt = "Call repository_status once, then report success."
 const acceptanceResult = "Extension acceptance passed."
@@ -61,7 +61,7 @@ export async function runExtensionCustomToolAcceptance(options: ExtensionCustomT
       }
     }
   } finally {
-    await rm(temporary, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 })
+    await rm(temporary, { recursive: true, force: true, maxRetries: 50, retryDelay: 100 })
   }
 }
 
@@ -253,6 +253,11 @@ async function runWindowsInteractive(
       if (stop.exitCode !== 0) {
         wrapperStopFailure = new TextDecoder().decode(stop.stderr).trim() || `taskkill exited with ${stop.exitCode}`
       }
+      Bun.spawnSync(["taskkill.exe", "/IM", basename(executable), "/T", "/F"], {
+        stdout: "ignore",
+        stderr: "ignore",
+        windowsHide: true
+      })
       return
     }
     if (exitRequested || !text.includes(acceptanceResult)) return
@@ -269,6 +274,7 @@ async function runWindowsInteractive(
     const [exitCode, capturedStdout, capturedStderr] = await settleProcess(child, stdout, stderr)
     if (wrapperStopFailure) throw new Error(`Could not stop Windows interactive process tree: ${wrapperStopFailure}`)
     if (wrapperStoppedAfterRestore && capturedStderr === "") {
+      await Bun.sleep(500)
       return { exitCode: 0, stdout: capturedStdout, stderr: "" }
     }
     return { exitCode, stdout: capturedStdout, stderr: capturedStderr }
