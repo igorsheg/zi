@@ -1,4 +1,4 @@
-import { existsSync, realpathSync } from "node:fs"
+import { realpathSync } from "node:fs"
 import { copyFile, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
@@ -9,8 +9,6 @@ const expectedStatus = "?? acceptance.txt"
 const maxProviderRequestBytes = 2 * 1024 * 1024
 const maxProcessOutputBytes = 8 * 1024 * 1024
 const processDeadlineMs = 15_000
-const winptyNonTtyResizeAssertion =
-  'Assertion failed: ASSERT_CONDITION("wp != nullptr && cols > 0 && rows > 0"), file src/libwinpty/winpty.cc, line 924'
 
 type AcceptanceMode = "text" | "json" | "interactive"
 
@@ -228,10 +226,7 @@ async function runWindowsInteractive(
   cwd: string,
   env: Readonly<Record<string, string | undefined>>
 ): Promise<ProcessOutput> {
-  const winpty = findWinpty()
-  if (!winpty) throw new Error("Compiled Windows interactive acceptance requires Git for Windows winpty.exe")
-
-  const child = Bun.spawn([winpty, "-Xallow-non-tty", "--", executable, ...args], {
+  const child = Bun.spawn([executable, ...args], {
     cwd,
     env,
     stdin: "pipe",
@@ -255,17 +250,6 @@ async function runWindowsInteractive(
 
   try {
     const [exitCode, capturedStdout, capturedStderr] = await settleProcess(child, stdout, stderr)
-    const normalizedStderr = normalizeNewlines(capturedStderr).trim()
-    // Git for Windows' winpty 0.4.3 reads a zero non-TTY size after child EOF and asserts in its adapter.
-    // Admit only that exact wrapper failure after Zi produced and restored the accepted terminal frame.
-    if (
-      exitCode === 3 &&
-      capturedStdout.includes(acceptanceResult) &&
-      capturedStdout.includes("\u001b[?25h") &&
-      normalizedStderr === winptyNonTtyResizeAssertion
-    ) {
-      return { exitCode: 0, stdout: capturedStdout, stderr: "" }
-    }
     return { exitCode, stdout: capturedStdout, stderr: capturedStderr }
   } finally {
     if (exitTimer) clearTimeout(exitTimer)
@@ -536,17 +520,6 @@ function terminalResponse(id: string): Record<string, unknown> {
 function initializeRepository(cwd: string): void {
   const git = Bun.spawnSync(["git", "init", "--quiet"], { cwd })
   if (git.exitCode !== 0) throw new Error(`Could not initialize acceptance repository: ${git.stderr.toString()}`)
-}
-
-function findWinpty(): string | undefined {
-  const discovered = Bun.which("winpty.exe") ?? Bun.which("winpty")
-  if (discovered) return discovered
-  for (const root of [process.env.ProgramFiles, process.env["ProgramFiles(x86)"], process.env.ProgramW6432]) {
-    if (!root) continue
-    const candidate = join(root, "Git", "usr", "bin", "winpty.exe")
-    if (existsSync(candidate)) return candidate
-  }
-  return undefined
 }
 
 function sendInteractiveInput(stdin: Bun.FileSink, data: string): void {
