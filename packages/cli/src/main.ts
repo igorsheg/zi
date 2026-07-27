@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 
 import { homedir } from "node:os"
+import { resolve } from "node:path"
 
 import { extensionWorkerArgument, runExtensionWorkerFromStdio } from "@with-zi/coding-agent/internal/extension-worker"
 
@@ -42,6 +43,7 @@ function processHost(): CliHost {
     env: Object.freeze({ ...process.env }),
     stdinIsTTY: process.stdin.isTTY,
     stdoutIsTTY: process.stdout.isTTY,
+    extensionWorkerCommand: currentZiCommand(),
     readStdin: readPipedStdin,
     writeStdout: chunk => writeOutput(Bun.stdout, chunk),
     writeStderr: chunk => writeOutput(Bun.stderr, chunk),
@@ -63,6 +65,14 @@ function processHost(): CliHost {
       }
     }
   }
+}
+
+export function currentZiCommand(argv: readonly string[] = process.argv): readonly string[] {
+  const script = argv[1]
+  if (script && !script.includes("$bunfs") && /\.[cm]?[jt]sx?$/.test(script)) {
+    return Object.freeze([process.execPath, resolve(script)])
+  }
+  return Object.freeze([process.execPath])
 }
 
 async function readPipedStdin(): Promise<string | undefined> {

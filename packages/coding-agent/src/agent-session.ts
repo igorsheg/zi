@@ -19,6 +19,7 @@ import {
   type ImageContent,
   type Model
 } from "@earendil-works/pi-ai"
+import type { ExtensionShutdownReason, ExtensionStartReason } from "@with-zi/extension-api"
 
 import type {
   Authentication,
@@ -49,6 +50,7 @@ import {
 } from "./context-usage.js"
 import type { StoredCredential } from "./credential-store.js"
 import { DEFAULT_THINKING_LEVEL } from "./defaults.js"
+import type { ExtensionHost, ExtensionHostSnapshot } from "./extensions/host.js"
 import { isZiAgentMessage, type AgentMessage } from "./messages.js"
 import type { ModelRegistry } from "./model-registry.js"
 import { type ProjectFileSearch, type ProjectFileSearchResult } from "./project-file-search.js"
@@ -221,6 +223,7 @@ export interface AgentSessionConfig {
   modelRegistry: ModelRegistry
   resources: SessionResources
   projectFileSearch: ProjectFileSearch
+  extensionHost?: ExtensionHost
   shell?: SessionShell
   model?: Model<Api>
   apiKeyProvider?: string
@@ -281,6 +284,14 @@ type Activity =
   | { type: "compaction_committed"; operationId: number; reason: "manual"; settled: Promise<void> }
   | { type: "failed"; runId: number; cause: unknown }
   | { type: "disposed"; settled: Promise<void> }
+
+type ExtensionLifecycleState =
+  | { readonly type: "absent" }
+  | { readonly type: "unbound"; readonly host: ExtensionHost }
+  | { readonly type: "starting"; readonly host: ExtensionHost; readonly settled: Promise<void> }
+  | { readonly type: "started"; readonly host: ExtensionHost }
+  | { readonly type: "disposing"; readonly host: ExtensionHost; readonly settled: Promise<void> }
+  | { readonly type: "disposed"; readonly settled: Promise<void> }
 
 type ModelMutationState = { type: "none" } | { type: "validating"; operationId: number }
 
@@ -344,6 +355,7 @@ export class AgentSession {
   readonly #unsubscribeAgent: () => void
   readonly #unsubscribeShell: (() => void) | undefined
   #activity: Activity = { type: "idle" }
+  #extensionLifecycle: ExtensionLifecycleState
   #pending: PendingInput[] = []
   #pendingBytes = 0
   #nextRunId = 0
@@ -362,6 +374,9 @@ export class AgentSession {
     this.#modelRegistry = config.modelRegistry
     this.#resources = config.resources
     this.#projectFileSearch = config.projectFileSearch
+    this.#extensionLifecycle = config.extensionHost
+      ? { type: "unbound", host: config.extensionHost }
+      : { type: "absent" }
     this.#shell = config.shell
     this.#apiKeyProvider = config.apiKeyProvider
     this.sessionManager = config.sessionManager
@@ -824,6 +839,39 @@ export class AgentSession {
     }
   }
 
+  get extensionHostSnapshot(): ExtensionHostSnapshot | undefined {
+    const state = this.#extensionLifecycle
+    return state.type === "absent" || state.type === "disposed" ? undefined : state.host.snapshot()
+  }
+
+  startExtensionLifecycle(reason: ExtensionStartReason): Promise<void> {
+    const state = this.#extensionLifecycle
+    if (state.type === "absent" || state.type === "started") return Promise.resolve()
+    if (state.type === "starting") return state.settled
+    if (state.type === "disposing" || state.type === "disposed") {
+      return Promise.reject(new Error("Cannot start extensions after session disposal"))
+    }
+
+    const operation = createSettlement()
+    const starting: ExtensionLifecycleState = { type: "starting", host: state.host, settled: operation.promise }
+    this.#extensionLifecycle = starting
+    void state.host.sessionStart(reason).then(
+      () => {
+        if (this.#extensionLifecycle === starting) {
+          this.#extensionLifecycle = { type: "started", host: state.host }
+        }
+        operation.resolve()
+        return undefined
+      },
+      cause => {
+        if (this.#extensionLifecycle === starting) this.#extensionLifecycle = state
+        operation.reject(cause)
+        return undefined
+      }
+    )
+    return operation.promise
+  }
+
   assertReplaceable(): void {
     this.#assertIdle("replace the session")
     if (this.#modelMutation.type !== "none")
@@ -833,16 +881,17 @@ export class AgentSession {
 
   waitForIdle(): Promise<void> {
     const searchSettled = this.#projectFileSearch.waitForIdle()
+    const extensionsSettled = this.#extensionSettlement()
     switch (this.#activity.type) {
       case "running":
       case "aborting":
       case "compacting":
       case "compaction_committed":
       case "disposed":
-        return settleAll([this.#activity.settled, this.#authentication.waitForIdle(), searchSettled])
+        return settleAll([this.#activity.settled, this.#authentication.waitForIdle(), searchSettled, extensionsSettled])
       case "idle":
       case "failed":
-        return settleTogether(this.#authentication.waitForIdle(), searchSettled)
+        return settleAll([this.#authentication.waitForIdle(), searchSettled, extensionsSettled])
       default:
         return assertNever(this.#activity)
     }
@@ -975,7 +1024,7 @@ export class AgentSession {
     this.#agent.state.systemPrompt = systemPrompt
   }
 
-  dispose(): void {
+  dispose(reason: ExtensionShutdownReason = "quit"): void {
     if (this.#activity.type === "disposed") return
     this.#modelMutation = { type: "none" }
     const currentActivity = this.#activity
@@ -1001,7 +1050,8 @@ export class AgentSession {
       activeSettled,
       this.#authentication.dispose(),
       this.#projectFileSearch.dispose(),
-      this.#shell?.dispose() ?? Promise.resolve()
+      this.#shell?.dispose() ?? Promise.resolve(),
+      this.#disposeExtensions(reason)
     ])
     this.#activity = { type: "disposed", settled }
     this.#unsubscribeAgent()
@@ -1009,6 +1059,60 @@ export class AgentSession {
     this.#listeners.clear()
     cleanupSessionResources(this.sessionId)
     void settled.catch(() => {})
+  }
+
+  #extensionSettlement(): Promise<void> {
+    const state = this.#extensionLifecycle
+    switch (state.type) {
+      case "absent":
+      case "unbound":
+      case "started":
+        return Promise.resolve()
+      case "starting":
+      case "disposing":
+      case "disposed":
+        return state.settled
+      default:
+        return assertNever(state)
+    }
+  }
+
+  #disposeExtensions(reason: ExtensionShutdownReason): Promise<void> {
+    const state = this.#extensionLifecycle
+    if (state.type === "absent") {
+      const settled = Promise.resolve()
+      this.#extensionLifecycle = { type: "disposed", settled }
+      return settled
+    }
+    if (state.type === "disposing" || state.type === "disposed") return state.settled
+
+    const operation = createSettlement()
+    const disposing: ExtensionLifecycleState = { type: "disposing", host: state.host, settled: operation.promise }
+    this.#extensionLifecycle = disposing
+    const shutdown = async (): Promise<void> => {
+      try {
+        if (state.type === "started") await state.host.sessionShutdown(reason)
+      } finally {
+        await state.host.dispose(reason)
+      }
+    }
+    void shutdown()
+      .then(
+        () => {
+          operation.resolve()
+          return undefined
+        },
+        cause => {
+          operation.reject(cause)
+          return undefined
+        }
+      )
+      .finally(() => {
+        if (this.#extensionLifecycle === disposing) {
+          this.#extensionLifecycle = { type: "disposed", settled: operation.promise }
+        }
+      })
+    return operation.promise
   }
 
   async #drive(runId: number, text: string, images: ImageContent[] | undefined, settlement: Settlement): Promise<void> {

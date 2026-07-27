@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test"
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join, resolve as resolvePath } from "node:path"
 
@@ -11,7 +12,7 @@ import {
   fauxProvider
 } from "@with-zi/coding-agent/testing"
 
-import { defaultCliArgv } from "../src/main.js"
+import { currentZiCommand, defaultCliArgv } from "../src/main.js"
 import {
   helpText,
   maxCliStdinBytes,
@@ -58,11 +59,79 @@ test("spawned version stays stdout-clean and never initializes a terminal", asyn
   expect({ exitCode, stdout, stderr }).toEqual({ exitCode: 0, stdout: versionText, stderr: "" })
 })
 
+test("spawned text and JSON modes own the same explicit extension lifecycle", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-cli-extension-"))
+  const cwd = join(root, "project")
+  const agentDir = join(root, "agent")
+  const extension = join(root, "extension.ts")
+  const lifecycle = join(root, "lifecycle.log")
+  await mkdir(cwd, { recursive: true })
+  await writeFile(
+    extension,
+    `import { appendFileSync } from "node:fs"
+export default function (zi): void {
+  console.log("extension must not reach stdout")
+  zi.on("session_start", event => appendFileSync(${JSON.stringify(lifecycle)}, "start:" + event.reason + "\\n"))
+  zi.on("session_shutdown", event => appendFileSync(${JSON.stringify(lifecycle)}, "stop:" + event.reason + "\\n"))
+}
+`
+  )
+
+  try {
+    for (const mode of ["text", "json"]) {
+      // Each mode receives the same isolated lifecycle file in deterministic order.
+      // oxlint-disable-next-line eslint/no-await-in-loop
+      await writeFile(lifecycle, "")
+      const child = Bun.spawn(
+        [
+          process.execPath,
+          join(import.meta.dir, "../src/main.ts"),
+          "--cwd",
+          cwd,
+          "--agent-dir",
+          agentDir,
+          "--no-session",
+          "--extension",
+          extension,
+          "--mode",
+          mode,
+          "prompt"
+        ],
+        {
+          env: { PATH: process.env.PATH ?? "", HOME: root, USERPROFILE: root },
+          stdin: "pipe",
+          stdout: "pipe",
+          stderr: "pipe"
+        }
+      )
+      void child.stdin.end()
+      // Keep each process lifetime separate so its lifecycle evidence cannot interleave.
+      // oxlint-disable-next-line eslint/no-await-in-loop
+      const [exitCode, stdout] = await Promise.all([
+        child.exited,
+        new Response(child.stdout).text(),
+        new Response(child.stderr).text()
+      ])
+      expect(exitCode).toBe(1)
+      expect(stdout).not.toContain("extension must not reach stdout")
+      // oxlint-disable-next-line eslint/no-await-in-loop
+      expect(await readFile(lifecycle, "utf8")).toBe("start:startup\nstop:quit\n")
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+}, 10_000)
+
 test("CLI argument defaults handle Bun scripts and compiled executables", () => {
   expect(defaultCliArgv(["/usr/local/bin/bun", "/work/packages/cli/src/main.ts", "-V"])).toEqual(["-V"])
   expect(defaultCliArgv(["bun", "/$bunfs/root/standalone", "-V"])).toEqual(["-V"])
   expect(defaultCliArgv(["bun", "-V"])).toEqual(["-V"])
   expect(defaultCliArgv(["C:\\tools\\zi.exe", "-V"])).toEqual(["-V"])
+  expect(currentZiCommand([process.execPath, "/work/packages/cli/src/main.ts"])).toEqual([
+    process.execPath,
+    resolvePath("/work/packages/cli/src/main.ts")
+  ])
+  expect(currentZiCommand([process.execPath, "/$bunfs/root/standalone"])).toEqual([process.execPath])
 })
 
 test("CLI mode resolution keeps explicit protocols and otherwise follows TTY facts", () => {
@@ -230,6 +299,34 @@ test("headless startup writes model fallback diagnostics to stderr", async () =>
   expect(output).toEqual(["done\n"])
   expect(errors).toEqual([
     `Warning: Could not restore model removed/old. Using ${faux.getModel().provider}/${faux.getModel().id}.\n`
+  ])
+})
+
+test("headless startup reports source-attributed extension diagnostics on stderr", async () => {
+  const models = createModels()
+  const faux = fauxProvider()
+  models.setProvider(faux.provider)
+  faux.setResponses([fauxAssistantMessage("done")])
+  const output: string[] = []
+  const errors: string[] = []
+  const host = testHost({ output, errors, createRuntime: options => createTestAgentRuntime({ ...options, models }) })
+
+  const exitCode = await runCli(
+    [
+      "-p",
+      "--extension",
+      "missing-extension.ts",
+      "--model",
+      `${faux.getModel().provider}/${faux.getModel().id}`,
+      "start"
+    ],
+    host
+  )
+
+  expect(exitCode).toBe(0)
+  expect(output).toEqual(["done\n"])
+  expect(errors).toEqual([
+    `Warning: (extension ${resolvePath("/work/missing-extension.ts")}) Extension path does not exist\n`
   ])
 })
 
@@ -563,6 +660,7 @@ function testHost(options: TestHostOptions): CliHost {
     env: options.env ?? {},
     stdinIsTTY: options.stdinIsTTY ?? true,
     stdoutIsTTY: options.stdoutIsTTY ?? true,
+    extensionWorkerCommand: Object.freeze([process.execPath]),
     async readStdin() {
       options.onReadStdin?.()
       return options.stdin

@@ -7,6 +7,13 @@ export * from "./agent-session-runtime.js"
 export * from "./authentication.js"
 export * from "./credential-store.js"
 export * from "./defaults.js"
+export type {
+  ExtensionHostLifecycle,
+  ExtensionHostSnapshot,
+  ExtensionHostStatus,
+  ExtensionLogTail
+} from "./extensions/host.js"
+export type { ExtensionDiagnostic, ExtensionLoadResult } from "./extensions/protocol.js"
 export * from "./extensions/discovery.js"
 export * from "./model-registry.js"
 export * from "./model-resolver.js"
@@ -23,7 +30,13 @@ export {
 } from "./resource-diagnostics.js"
 export { maxResourceDirectoryEntries, maxResourceFileBytes } from "./resource-files.js"
 export * from "./resource-loader.js"
-export * from "./runtime.js"
+export { createAgentRuntime } from "./runtime.js"
+export type {
+  AgentRuntime,
+  AgentRuntimeServices,
+  AgentRuntimeSessionIntent,
+  CreateAgentRuntimeOptions
+} from "./runtime.js"
 export * from "./sdk.js"
 export * from "./session-manager.js"
 export * from "./session-shell.js"

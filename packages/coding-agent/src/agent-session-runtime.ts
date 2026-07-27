@@ -6,9 +6,10 @@ import {
   type AgentRuntimeSessionIntent,
   type CreateAgentRuntimeOptions
 } from "./runtime-options.js"
-import { createAgentRuntime, type AgentRuntime } from "./runtime.js"
+import { createUnboundAgentRuntime, type AgentRuntime } from "./runtime.js"
 import { SessionManager, type SessionListResult } from "./session-manager.js"
 
+// Replacement factories keep extension lifecycle unbound until the old runtime retires.
 export type AgentRuntimeFactory = (options: CreateAgentRuntimeOptions) => Promise<AgentRuntime>
 
 export type SessionReplacementCancellation =
@@ -108,6 +109,7 @@ export class AgentSessionRuntime {
         session: { type: "new", persist: persisted },
         ...(model ? { model } : {})
       }),
+      "new",
       true
     )
   }
@@ -123,7 +125,8 @@ export class AgentSessionRuntime {
         session: { type: "resume", file: resolvedSessionFile },
         ...(this.#options.sessionDir ? { sessionDir: this.#options.sessionDir } : {}),
         ...(model ? { model } : {})
-      })
+      }),
+      "resume"
     )
   }
 
@@ -172,7 +175,11 @@ export class AgentSessionRuntime {
     ])
   }
 
-  async #replace(options: CreateAgentRuntimeOptions, discardFile = false): Promise<AgentRuntime> {
+  async #replace(
+    options: CreateAgentRuntimeOptions,
+    reason: "new" | "resume",
+    discardFile = false
+  ): Promise<AgentRuntime> {
     const current = this.#requireReady()
     current.session.assertReplaceable()
     const operationId = ++this.#nextOperationId
@@ -193,7 +200,7 @@ export class AgentSessionRuntime {
 
     const state = this.#readState()
     if (state.type === "disposed" || !isOperation(state, operationId) || state.type === "cancelling") {
-      await this.#discard(next, discardFile)
+      await this.#discard(next, discardFile, reason)
       if (isOperation(this.#readState(), operationId)) this.#state = { type: "ready", current }
       operation.resolve()
       throw new Error(
@@ -204,13 +211,13 @@ export class AgentSessionRuntime {
     try {
       current.session.assertReplaceable()
     } catch (cause) {
-      await this.#discard(next, discardFile)
+      await this.#discard(next, discardFile, reason)
       if (isOperation(this.#readState(), operationId)) this.#state = { type: "ready", current }
       operation.resolve()
       throw cause
     }
 
-    current.session.dispose()
+    current.session.dispose(reason)
     this.#retire(current.session.waitForIdle())
     this.#state = { type: "settling", current: next, operationId, settled: operation.settled }
     await this.#finishRetired()
@@ -224,14 +231,25 @@ export class AgentSessionRuntime {
       operation.resolve()
       throw new Error("Session replacement was superseded")
     }
+
+    await next.session.startExtensionLifecycle(reason)
+    const activated = this.#readState()
+    if (activated.type === "disposed") {
+      operation.resolve()
+      throw new Error("AgentSessionRuntime is disposed")
+    }
+    if (!isOperation(activated, operationId)) {
+      operation.resolve()
+      throw new Error("Session replacement was superseded")
+    }
     this.#state = { type: "ready", current: next }
     operation.resolve()
     return next
   }
 
-  async #discard(runtime: AgentRuntime, discardFile: boolean): Promise<void> {
+  async #discard(runtime: AgentRuntime, discardFile: boolean, reason: "new" | "resume"): Promise<void> {
     const discardPersistence = discardFile && runtime.session.sessionManager.file !== undefined
-    runtime.session.dispose()
+    runtime.session.dispose(reason)
     try {
       await runtime.session.waitForIdle()
     } catch (cause) {
@@ -289,11 +307,18 @@ export class AgentSessionRuntime {
 
 export async function createAgentSessionRuntime(
   options: CreateAgentRuntimeOptions,
-  createRuntime: AgentRuntimeFactory = createAgentRuntime
+  createRuntime: AgentRuntimeFactory = createUnboundAgentRuntime
 ): Promise<AgentSessionRuntime> {
   const snapshot = snapshotAgentRuntimeOptions(options)
   const initial = await createRuntime(snapshot)
-  return new AgentSessionRuntime(initial, snapshot, createRuntime)
+  try {
+    await initial.session.startExtensionLifecycle("startup")
+    return new AgentSessionRuntime(initial, snapshot, createRuntime)
+  } catch (cause) {
+    initial.session.dispose()
+    await initial.session.waitForIdle()
+    throw cause
+  }
 }
 
 function runtimeOptions(

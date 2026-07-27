@@ -9,7 +9,7 @@ The lower-level Pi agent loop that streams model output and executes tools. It i
 _Avoid_: Pi coding agent, runtime
 
 **Agent session**:
-One coding conversation and its policy: active model, session resources, tools, durable history, queueing, compaction, retries, and lifecycle.
+One coding conversation and its policy: active model, session resources, tools, durable history, queueing, compaction, retries, and its bound extension lifecycle.
 _Avoid_: Chat, agent core
 
 **Session journal**:
@@ -61,7 +61,7 @@ The process-scoped capabilities from which agent sessions are constructed, inclu
 _Avoid_: Globals, app context
 
 **Agent session runtime**:
-The optional coding-agent owner of one replaceable current `AgentRuntime`. It performs bounded session listing and whole-runtime new/resume transitions, rebuilding cwd-bound services and disposing replaced sessions. Single-session SDK callers do not need it.
+The optional coding-agent owner of one replaceable current `AgentRuntime`. It performs bounded session listing and whole-runtime new/resume transitions, building an unbound candidate, retiring the current extension lifecycle, and only then activating the candidate. Single-session SDK callers do not need it.
 _Avoid_: Session manager, root store, TUI session controller
 
 **Zi paths**:

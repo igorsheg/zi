@@ -5,6 +5,7 @@ import { AgentSession } from "./agent-session.js"
 import { Authentication } from "./authentication.js"
 import type { FileCredentialStore } from "./credential-store.js"
 import { DEFAULT_THINKING_LEVEL } from "./defaults.js"
+import type { ExtensionHost } from "./extensions/host.js"
 import { convertToLlm, type AgentMessage } from "./messages.js"
 import type { ModelRegistry } from "./model-registry.js"
 import { findInitialModel, restoreModelFromSession } from "./model-resolver.js"
@@ -62,6 +63,7 @@ export interface CreateAgentSessionOptions {
   readonly apiKey?: string
   readonly tools: readonly AgentTool[]
   readonly shell?: SessionShell
+  readonly extensionHost?: ExtensionHost
   readonly resources?: SessionResources
 }
 
@@ -139,6 +141,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions): Pr
     modelRegistry: services.modelRegistry,
     resources,
     projectFileSearch: new ProjectFileSearch(services.paths),
+    ...(options.extensionHost ? { extensionHost: options.extensionHost } : {}),
     ...(options.shell ? { shell: options.shell } : {}),
     ...(model ? { model } : {}),
     ...(options.apiKey && model ? { apiKeyProvider: model.provider } : {})

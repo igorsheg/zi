@@ -2,6 +2,9 @@ import { builtinModels } from "@earendil-works/pi-ai/providers/all"
 
 import type { AgentSession } from "./agent-session.js"
 import { FileCredentialStore } from "./credential-store.js"
+import { discoverExtensionLoadPlan, type ExtensionDiscoveryDiagnostic } from "./extensions/discovery.js"
+import { createExtensionWorkerSpawner, ExtensionHost } from "./extensions/host.js"
+import type { ExtensionDiagnostic } from "./extensions/protocol.js"
 import { ModelRegistry } from "./model-registry.js"
 import { resolveRequestedModel } from "./model-resolver.js"
 import { getAgentDir, ZiPaths } from "./paths.js"
@@ -31,6 +34,18 @@ export interface AgentRuntime {
 
 /** Assemble cwd-bound production services and a session. The caller owns `session.dispose()`. */
 export async function createAgentRuntime(requested: CreateAgentRuntimeOptions): Promise<AgentRuntime> {
+  const runtime = await createUnboundAgentRuntime(requested)
+  try {
+    await runtime.session.startExtensionLifecycle("startup")
+    return runtime
+  } catch (cause) {
+    runtime.session.dispose()
+    await runtime.session.waitForIdle()
+    throw cause
+  }
+}
+
+export async function createUnboundAgentRuntime(requested: CreateAgentRuntimeOptions): Promise<AgentRuntime> {
   const options = snapshotAgentRuntimeOptions(requested)
   const session = options.session ?? defaultRuntimeSession
   const agentDir = options.agentDir ?? getAgentDir()
@@ -41,49 +56,66 @@ export async function createAgentRuntime(requested: CreateAgentRuntimeOptions): 
   const paths = new ZiPaths(cwd, agentDir, sessionDir)
   const projectTrust = await resolveProjectTrust(paths, options.projectTrust)
   const project = projectConfigurationAdmission(projectTrust)
-  const settingsManager = SettingsManager.create(paths, project, options.settings ?? {})
-  const credentialStore = new FileCredentialStore(paths)
-  const models = options.modelFactory?.(credentialStore) ?? builtinModels({ credentials: credentialStore })
-  const modelRegistry = new ModelRegistry(models)
-  const resourceLoader = new ResourceLoader({
-    paths,
-    project,
-    ...(options.systemPrompt === undefined ? {} : { systemPrompt: options.systemPrompt }),
-    ...(options.appendSystemPrompt === undefined ? {} : { appendSystemPrompt: options.appendSystemPrompt })
-  })
-  const services: AgentRuntimeServices = Object.freeze({
-    paths,
-    settingsManager,
-    credentialStore,
-    modelRegistry,
-    resourceLoader
-  })
-  if (options.apiKey !== undefined && options.apiKey.length === 0) {
-    throw new Error("--api-key requires a non-empty value")
+  const extensions = discoverExtensionLoadPlan(paths, project, options.extensionPaths ?? [])
+  const extensionHost = new ExtensionHost(
+    createExtensionWorkerSpawner(options.extensionWorkerCommand ?? [process.execPath])
+  )
+  extensionHost.admitDiagnostics(
+    extensions.diagnostics.map(extensionDiscoveryDiagnostic),
+    extensions.omittedDiagnostics
+  )
+  await extensionHost.start(extensions.plan)
+
+  let shell: SessionShell | undefined
+  try {
+    const settingsManager = SettingsManager.create(paths, project, options.settings ?? {})
+    const credentialStore = new FileCredentialStore(paths)
+    const models = options.modelFactory?.(credentialStore) ?? builtinModels({ credentials: credentialStore })
+    const modelRegistry = new ModelRegistry(models)
+    const resourceLoader = new ResourceLoader({
+      paths,
+      project,
+      ...(options.systemPrompt === undefined ? {} : { systemPrompt: options.systemPrompt }),
+      ...(options.appendSystemPrompt === undefined ? {} : { appendSystemPrompt: options.appendSystemPrompt })
+    })
+    const services: AgentRuntimeServices = Object.freeze({
+      paths,
+      settingsManager,
+      credentialStore,
+      modelRegistry,
+      resourceLoader
+    })
+    if (options.apiKey !== undefined && options.apiKey.length === 0) {
+      throw new Error("--api-key requires a non-empty value")
+    }
+    const model = options.model
+      ? resolveRequestedModel(modelRegistry, options.model)
+      : options.apiKey
+        ? resolveSettingsModel(modelRegistry, settingsManager)
+        : undefined
+    const sessionManager =
+      selected.type === "resumed" ? selected.manager : SessionManager.create(paths, { persist: selected.persist })
+    shell = new SessionShell({ cwd: paths.cwd, sessionId: sessionManager.sessionId })
+    const created = await createAgentSession({
+      services,
+      sessionManager,
+      shell,
+      extensionHost,
+      ...(model ? { model } : {}),
+      ...(options.thinkingLevel ? { thinkingLevel: options.thinkingLevel } : {}),
+      ...(options.apiKey ? { apiKey: options.apiKey } : {}),
+      tools: createCodingTools({ cwd: paths.cwd, shell })
+    })
+    return Object.freeze({
+      session: created.session,
+      services,
+      projectTrust,
+      bootstrapDiagnostic: created.bootstrapDiagnostic
+    })
+  } catch (cause) {
+    await Promise.all([extensionHost.dispose(), shell?.dispose() ?? Promise.resolve()])
+    throw cause
   }
-  const model = options.model
-    ? resolveRequestedModel(modelRegistry, options.model)
-    : options.apiKey
-      ? resolveSettingsModel(modelRegistry, settingsManager)
-      : undefined
-  const sessionManager =
-    selected.type === "resumed" ? selected.manager : SessionManager.create(paths, { persist: selected.persist })
-  const shell = new SessionShell({ cwd: paths.cwd, sessionId: sessionManager.sessionId })
-  const created = await createAgentSession({
-    services,
-    sessionManager,
-    shell,
-    ...(model ? { model } : {}),
-    ...(options.thinkingLevel ? { thinkingLevel: options.thinkingLevel } : {}),
-    ...(options.apiKey ? { apiKey: options.apiKey } : {}),
-    tools: createCodingTools({ cwd: paths.cwd, shell })
-  })
-  return Object.freeze({
-    session: created.session,
-    services,
-    projectTrust,
-    bootstrapDiagnostic: created.bootstrapDiagnostic
-  })
 }
 
 const defaultRuntimeSession: AgentRuntimeSessionIntent = Object.freeze({ type: "new", persist: true })
@@ -102,6 +134,15 @@ async function selectSession(session: AgentRuntimeSessionIntent, paths: ZiPaths)
       return { type: "resumed", manager: SessionManager.open(session.file) }
     default:
       return assertNever(session)
+  }
+}
+
+function extensionDiscoveryDiagnostic(value: ExtensionDiscoveryDiagnostic): ExtensionDiagnostic {
+  return {
+    path: value.path,
+    phase: "discovery",
+    severity: value.type === "duplicate" ? "warning" : "error",
+    message: value.message
   }
 }
 

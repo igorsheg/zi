@@ -24,19 +24,21 @@ test("the compiled Zi executable runs the dedicated extension worker protocol", 
   const temporary = await mkdtemp(join(import.meta.dirname, ".compiled-extension-worker-"))
   const executable = join(temporary, process.platform === "win32" ? "zi.exe" : "zi")
   const extension = join(temporary, "extension.ts")
+  const lifecycle = join(temporary, "lifecycle.log")
   let child: ReturnType<typeof spawn> | undefined
 
   try {
     await Bun.write(
       extension,
       `
+import { appendFileSync } from "node:fs"
 import type { ExtensionAPI } from "@with-zi/extension-api"
 
 export default function (zi: ExtensionAPI): void {
   console.log("compiled worker stdout")
   console.error("compiled worker stderr")
-  zi.on("session_start", () => {})
-  zi.on("session_shutdown", () => {})
+  zi.on("session_start", event => appendFileSync(${JSON.stringify(lifecycle)}, "start:" + event.reason + "\\n"))
+  zi.on("session_shutdown", event => appendFileSync(${JSON.stringify(lifecycle)}, "stop:" + event.reason + "\\n"))
 }
 `
     )
@@ -124,6 +126,35 @@ export default function (zi: ExtensionAPI): void {
     expect(capturedStdout).toBe("compiled worker stdout\n")
     expect(capturedStderr).toBe("compiled worker stderr\n")
     expect(protocolMessages.map(message => message.type)).toEqual(["ready", "settled", "settled", "settled"])
+    expect(await Bun.file(lifecycle).text()).toBe("start:startup\nstop:quit\n")
+
+    await Bun.write(lifecycle, "")
+    child = spawn(
+      executable,
+      [
+        "--cwd",
+        temporary,
+        "--agent-dir",
+        join(temporary, "agent"),
+        "--no-session",
+        "--extension",
+        extension,
+        "--mode",
+        "text",
+        "prompt"
+      ],
+      { cwd: temporary, env: providerFreeEnvironment(temporary), stdio: ["pipe", "pipe", "pipe"], windowsHide: true }
+    )
+    child.stdin!.end()
+    const [productExit, productStdout, productStderr] = await Promise.all([
+      childExit(child),
+      readNodeStream(child.stdout!),
+      readNodeStream(child.stderr!)
+    ])
+    expect(productExit).toBe(1)
+    expect(productStdout).not.toContain("compiled worker stdout")
+    expect(productStderr).not.toContain("compiled worker stderr")
+    expect(await Bun.file(lifecycle).text()).toBe("start:startup\nstop:quit\n")
   } finally {
     child?.kill()
     await rm(temporary, { recursive: true, force: true })
@@ -249,6 +280,18 @@ try {
     await rm(temporary, { recursive: true, force: true })
   }
 }, 60_000)
+
+function providerFreeEnvironment(home: string): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {}
+  const credentialName =
+    /(api[_-]?key|token|secret|credential|anthropic|openai|ollama|aws_|azure|google|github|gemini|mistral|groq|xai)/i
+  for (const [name, value] of Object.entries(process.env)) {
+    if (value !== undefined && !credentialName.test(name)) env[name] = value
+  }
+  env.HOME = home
+  env.USERPROFILE = home
+  return env
+}
 
 async function compileZiInSubprocess(outfile: string): Promise<void> {
   const compilerSource = pathToFileURL(resolve(import.meta.dirname, "compile-zi.ts")).href

@@ -20,6 +20,7 @@ export interface ParsedArgs {
   readonly apiKey?: string
   readonly systemPrompt?: string
   readonly appendSystemPrompt?: readonly string[]
+  readonly extensionPaths?: readonly string[]
   readonly session?: CliSession
   readonly mode?: CliMode
   readonly messages: readonly string[]
@@ -36,6 +37,7 @@ export interface CliInvocation {
   readonly apiKey?: string
   readonly systemPrompt?: string
   readonly appendSystemPrompt?: readonly string[]
+  readonly extensionPaths: readonly string[]
   readonly session: CliSession
   readonly mode: CliMode
   readonly messages: readonly string[]
@@ -58,6 +60,7 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
   let apiKey: string | undefined
   let systemPrompt: string | undefined
   let appendSystemPrompt: string[] | undefined
+  let extensionPaths: string[] | undefined
   let session: CliSession | undefined
   let mode: CliMode | undefined
   let help = false
@@ -109,6 +112,11 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
       appendSystemPrompt ??= []
       appendSystemPrompt.push(value)
       index = nextIndex
+    } else if (flag === "--extension") {
+      const [value, nextIndex] = requiredValue(argv, index, flag, inlineValue)
+      extensionPaths ??= []
+      extensionPaths.push(value)
+      index = nextIndex
     } else if (flag === "--resume" || flag === "-r") {
       const [file, nextIndex] = requiredValue(argv, index, flag, inlineValue)
       session = Object.freeze({ type: "resume", file })
@@ -154,6 +162,7 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
     ...(apiKey === undefined ? {} : { apiKey }),
     ...(systemPrompt === undefined ? {} : { systemPrompt }),
     ...(appendSystemPrompt === undefined ? {} : { appendSystemPrompt: Object.freeze(appendSystemPrompt) }),
+    ...(extensionPaths === undefined ? {} : { extensionPaths: Object.freeze(extensionPaths) }),
     ...(session === undefined ? {} : { session }),
     ...(mode === undefined ? {} : { mode })
   })
@@ -172,10 +181,14 @@ export function resolveCliInvocation(parsed: ParsedArgs, context: CliResolutionC
   const thinkingLevel = parsed.thinkingLevel ?? environmentThinkingLevel(context.env)
   const mode = parsed.mode ?? environmentMode(context.env) ?? "auto"
   const session = resolveSession(parsed.session, context)
+  const extensionPaths = Object.freeze(
+    (parsed.extensionPaths ?? []).map(path => resolveZiPath(path, context.cwd, context.home))
+  )
 
   return Object.freeze({
     cwd,
     agentDir,
+    extensionPaths,
     session,
     mode,
     messages: parsed.messages,

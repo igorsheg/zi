@@ -21,6 +21,9 @@ test("CLI parses runtime overrides, prompts, and long-option equals syntax", () 
     "--append-system-prompt=First",
     "--append-system-prompt",
     "Second",
+    "--extension",
+    "extension.ts",
+    "--extension=~/global.ts",
     "--no-session",
     "first",
     "second"
@@ -35,6 +38,7 @@ test("CLI parses runtime overrides, prompts, and long-option equals syntax", () 
     apiKey: "test-key",
     systemPrompt: "Be direct",
     appendSystemPrompt: ["First", "Second"],
+    extensionPaths: [join(context.cwd, "extension.ts"), join(context.home, "global.ts")],
     session: { type: "new", persist: false },
     mode: "auto",
     messages: ["first", "second"]
@@ -117,6 +121,7 @@ test("environment values provide invocation defaults", () => {
     sessionDir: resolve("/sessions"),
     model: "provider/model",
     thinkingLevel: "xhigh",
+    extensionPaths: [],
     session: { type: "new", persist: true },
     mode: "interactive",
     messages: []

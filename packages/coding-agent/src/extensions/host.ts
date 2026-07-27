@@ -583,6 +583,18 @@ export class ExtensionHost {
     return host
   }
 
+  admitDiagnostics(values: readonly ExtensionDiagnostic[], omitted = 0): void {
+    const state = this.#state
+    if (state.type !== "disabled" || state.lifecycle !== "unbound") {
+      throw new Error("Extension host diagnostics must be admitted before startup")
+    }
+    if (!Number.isSafeInteger(omitted) || omitted < 0) {
+      throw new Error("Omitted extension diagnostics must be a non-negative safe integer")
+    }
+    for (const value of values) this.#diagnose(boundedExtensionDiagnostic(value))
+    this.#omittedDiagnostics = Math.min(Number.MAX_SAFE_INTEGER, this.#omittedDiagnostics + omitted)
+  }
+
   async start(plan: ExtensionLoadPlan): Promise<void> {
     const state = this.#state
     if (state.type !== "disabled" && state.type !== "failed") {
@@ -639,7 +651,7 @@ export class ExtensionHost {
         this.#state = { type: "ready", lifecycle: "started", current: state.current }
       }
     } catch (cause) {
-      await this.#operationFailed(dispatching, state.current, cause)
+      await this.#operationFailed(dispatching, state.current, cause, "started")
     }
   }
 
@@ -675,7 +687,7 @@ export class ExtensionHost {
         this.#state = { type: "ready", lifecycle: "stopped", current: state.current }
       }
     } catch (cause) {
-      await this.#operationFailed(dispatching, state.current, cause)
+      await this.#operationFailed(dispatching, state.current, cause, "stopped")
     }
   }
 

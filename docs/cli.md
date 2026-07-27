@@ -24,7 +24,7 @@ zi --mode json --mode text "answer with one line"  # text
 zi --no-session --new-session "keep this run"      # persistent new session
 ```
 
-Repeatable `--append-system-prompt` values accumulate instead of replacing one another. `--flag=value` and `--flag value` are equivalent. `--` ends option parsing.
+Repeatable `--append-system-prompt` and `--extension` values accumulate instead of replacing one another. `--flag=value` and `--flag value` are equivalent. `--` ends option parsing.
 
 | Value                  | CLI                 | Environment           | Fallback                             |
 | ---------------------- | ------------------- | --------------------- | ------------------------------------ |
@@ -34,10 +34,11 @@ Repeatable `--append-system-prompt` values accumulate instead of replacing one a
 | Session directory      | `--session-dir`     | `ZI_SESSION_DIR`      | cwd-partitioned agent sessions       |
 | Model                  | `--model`           | `ZI_DEFAULT_MODEL`    | session, settings, provider fallback |
 | Thinking level         | `--thinking`        | `ZI_DEFAULT_THINKING` | session, settings, `medium`          |
+| Explicit extensions    | `--extension`       | —                     | discovered project/global sources    |
 
 Empty supported `ZI_*` values and invalid mode or thinking syntax fail before stdin is read. Model existence and filesystem validity are checked by their coding-agent owners during runtime construction. `--help` and `--version` do not resolve runtime environment values.
 
-Relative `--cwd`, `--agent-dir`, and `--resume` paths are resolved against the process cwd captured at startup. Leading `~` uses the captured home directory. A relative session directory is resolved later against the effective session cwd, including a resumed journal's stored cwd.
+Relative `--cwd`, `--agent-dir`, `--resume`, and `--extension` paths are resolved against the process cwd captured at startup. Leading `~` uses the captured home directory. A relative session directory is resolved later against the effective session cwd, including a resumed journal's stored cwd.
 
 Cwd, session selection, system-prompt content, and `--api-key` are intentionally argument-only so inherited environment cannot silently redirect a nested run, resume a conversation, replace agent policy, or apply a provider-ambiguous secret. Provider-native credential variables such as `ANTHROPIC_API_KEY` and `OPENAI_API_KEY` remain supported by Pi AI.
 
@@ -54,7 +55,7 @@ Cwd, session selection, system-prompt content, and `--api-key` are intentionally
 
 `-p` and `--print` are aliases for `--mode text`. RPC remains reserved but is not implemented yet.
 
-Headless modes require a positional prompt or piped stdin. Piped stdin is bounded at 8 MiB and becomes the first prompt; positional prompts run afterward in argument order. Diagnostics and failures go to stderr, preserving text and JSON stdout protocols.
+Headless modes require a positional prompt or piped stdin. Piped stdin is bounded at 8 MiB and becomes the first prompt; positional prompts run afterward in argument order. Diagnostics and failures go to stderr, preserving text and JSON stdout protocols. Explicit extensions join trusted project and global extension sources in every mode; `--extension <path>` is repeatable and loads before discovered sources.
 
 ## Sessions
 

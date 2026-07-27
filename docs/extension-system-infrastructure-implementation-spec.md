@@ -1,6 +1,6 @@
 # Extension system infrastructure implementation spec
 
-- Status: in progress — lifecycle infrastructure Slices A through D complete
+- Status: in progress — lifecycle infrastructure Slices A through E complete
 - Pi behavior reference: `badlogic/pi-mono` at Zi's pinned `0e6909f0` (`v0.80.6`)
 - Current Pi comparison: `fc85bdd88be93b1e9a6b6bcfa41c684282ec79cc`
 - Project-trust comparison: `5bc1c2c0a6f07e00e8c240304182f213ab8d311f`
@@ -882,6 +882,16 @@ Deliver:
 
 ### Slice E — runtime and session integration
 
+Progress:
+
+- [x] repeatable explicit extension paths admitted by CLI and runtime options;
+- [x] trust-gated discovery and host startup before final session construction;
+- [x] `AgentSession` ownership of start, shutdown, diagnostics, and bounded settlement;
+- [x] whole-runtime replacement keeps candidates unbound until the current lifecycle retires;
+- [x] text and JSON modes share the same lifecycle without contaminating stdout;
+- [x] terminal restoration remains outside and before extension disposal settlement;
+- [x] compiled product acceptance exercises the production `ExtensionHost` path.
+
 Likely files:
 
 - `packages/coding-agent/src/runtime.ts`
@@ -938,12 +948,12 @@ The extension infrastructure is complete when:
 - [x] successful replacement rejects all stale-generation work;
 - [x] lifecycle handlers run in deterministic order;
 - [x] lifecycle and shutdown waits are bounded;
-- [ ] a worker crash leaves `AgentSession` usable;
-- [ ] terminal restoration still precedes bounded extension settlement;
+- [x] a worker crash leaves `AgentSession` usable;
+- [x] terminal restoration still precedes bounded extension settlement;
 - [x] final disposal leaves no `ExtensionHost`-owned worker process, listener, pipe, callback, or temporary artifact;
-- [ ] text and JSON modes do not load OpenTUI;
+- [x] text and JSON modes do not load OpenTUI;
 - [x] no tools, commands, providers, UI contributions, generic event bus, or package manager entered this slice;
-- [ ] formatting, linting, typechecking, unit tests, and compiled acceptance pass.
+- [x] formatting, linting, typechecking, unit tests, and compiled acceptance pass.
 
 ## 20. Capability sequence after infrastructure
 

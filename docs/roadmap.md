@@ -37,8 +37,8 @@ The current product milestone is the [`custom-tool extension golden path`](exten
 
 - [x] Add the versioned framed process protocol and TypeScript worker loader.
 - [x] Add `ExtensionHost` ownership of startup, diagnostics, current/candidate generations, replacement, and disposal.
-- [ ] Bind lifecycle to `AgentSession` without exposing the host to clients.
-- [ ] Preserve immediate terminal restoration before bounded extension settlement.
+- [x] Bind lifecycle to `AgentSession` without exposing the host to clients.
+- [x] Preserve immediate terminal restoration before bounded extension settlement.
 
 ### 5. Complete the custom-tool path
 

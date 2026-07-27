@@ -24,6 +24,7 @@ export interface CliHost {
   readonly env: Readonly<Record<string, string | undefined>>
   readonly stdinIsTTY: boolean
   readonly stdoutIsTTY: boolean
+  readonly extensionWorkerCommand: readonly string[]
   readStdin(): Promise<string | undefined>
   writeStdout(chunk: string): Promise<void>
   writeStderr(chunk: string): Promise<void>
@@ -49,6 +50,7 @@ Runtime:
       --system-prompt text    Replace the built-in system prompt
       --append-system-prompt text
                               Append system prompt text; repeatable
+      --extension path        Load an explicit extension source; repeatable
 
 Session:
   -r, --resume file           Resume a session file
@@ -141,10 +143,10 @@ export async function runCli(argv: readonly string[], host: CliHost): Promise<nu
   let sessionRuntime: AgentSessionRuntime | undefined
   try {
     if (mode === "interactive") {
-      sessionRuntime = await host.createSessionRuntime(runtimeOptions(args))
+      sessionRuntime = await host.createSessionRuntime(runtimeOptions(args, host.extensionWorkerCommand))
       runtime = sessionRuntime
     } else {
-      runtime = await host.createRuntime(runtimeOptions(args))
+      runtime = await host.createRuntime(runtimeOptions(args, host.extensionWorkerCommand))
     }
   } catch (cause) {
     await host.writeStderr(`${errorMessage(cause)}\n`)
@@ -160,6 +162,24 @@ export async function runCli(argv: readonly string[], host: CliHost): Promise<nu
       // Keep scoped diagnostics ordered on the single stderr writer.
       // oxlint-disable-next-line no-await-in-loop
       await host.writeStderr(`Warning: (${diagnostic.scope} settings) ${diagnostic.error.message}\n`)
+    }
+    const extensionSnapshot = runtime.session.extensionHostSnapshot
+    if (extensionSnapshot) {
+      const diagnostics =
+        extensionSnapshot.failure && !extensionSnapshot.diagnostics.includes(extensionSnapshot.failure)
+          ? [...extensionSnapshot.diagnostics, extensionSnapshot.failure]
+          : extensionSnapshot.diagnostics
+      for (const diagnostic of diagnostics) {
+        const source = diagnostic.path ? ` ${diagnosticLine(diagnostic.path)}` : ""
+        // Keep extension diagnostics ordered without contaminating protocol stdout.
+        // oxlint-disable-next-line no-await-in-loop
+        await host.writeStderr(`Warning: (extension${source}) ${diagnosticLine(diagnostic.message)}\n`)
+      }
+      if (extensionSnapshot.omittedDiagnostics > 0) {
+        await host.writeStderr(
+          `Warning: ${extensionSnapshot.omittedDiagnostics} additional extension diagnostics were omitted\n`
+        )
+      }
     }
     const bootstrapDiagnostic = runtime.bootstrapDiagnostic
     if (mode !== "interactive" && bootstrapDiagnostic && bootstrapDiagnostic.type !== "no_model") {
@@ -188,10 +208,12 @@ export async function runCli(argv: readonly string[], host: CliHost): Promise<nu
   return exitCode
 }
 
-function runtimeOptions(args: CliInvocation): CreateAgentRuntimeOptions {
+function runtimeOptions(args: CliInvocation, extensionWorkerCommand: readonly string[]): CreateAgentRuntimeOptions {
   return {
     cwd: args.cwd,
     agentDir: args.agentDir,
+    extensionPaths: args.extensionPaths,
+    extensionWorkerCommand,
     session: args.session,
     ...(args.sessionDir === undefined ? {} : { sessionDir: args.sessionDir }),
     ...(args.model === undefined ? {} : { model: args.model }),
@@ -253,6 +275,10 @@ function signalExitCode(signal: CliSignal): number {
 
 function assertNever(value: never): never {
   throw new Error(`Unknown CLI state: ${String(value)}`)
+}
+
+function diagnosticLine(value: string): string {
+  return value.replace(/[\r\n]+/g, " ")
 }
 
 function errorMessage(cause: unknown): string {

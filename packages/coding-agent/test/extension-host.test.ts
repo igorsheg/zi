@@ -131,6 +131,16 @@ test("fatal startup failure leaves a diagnosable retryable host", async () => {
   await host.dispose()
 })
 
+test("failed lifecycle requests preserve the session's desired lifecycle", async () => {
+  const workers = new TestWorkerSpawner()
+  workers.behaviors.push({ type: "fatal_start" })
+  const host = await ExtensionHost.create(planOne, workers.spawn, testTimeouts)
+
+  await host.sessionStart("startup")
+  expect(host.snapshot()).toMatchObject({ status: "failed", lifecycle: "started" })
+  await host.dispose()
+})
+
 test("replacement preserves current on candidate failure and commits one successful candidate", async () => {
   const workers = new TestWorkerSpawner()
   const host = await ExtensionHost.create(planOne, workers.spawn, testTimeouts)
@@ -266,6 +276,7 @@ class TestWorkerSpawner {
 type TestWorkerBehavior =
   | { readonly type: "ready" }
   | { readonly type: "wrong_ready" }
+  | { readonly type: "fatal_start" }
   | { readonly type: "spawn_error"; readonly message: string }
   | { readonly type: "fatal"; readonly message: string }
   | { readonly type: "pending" }
@@ -356,6 +367,14 @@ class TestWorkerProcess implements ExtensionWorkerProcess {
       return
     }
     if (message.type === "cancel") return
+    if (message.type === "session_start" && this.#behavior.type === "fatal_start") {
+      this.send({
+        type: "fatal",
+        generation: message.generation,
+        diagnostic: { phase: "lifecycle", severity: "error", message: "start failed" }
+      })
+      return
+    }
     if (message.type === "stop" && this.#behavior.type === "resist_terminate") return
     this.send({ type: "settled", generation: message.generation, requestId: message.requestId })
     if (message.type === "stop") queueMicrotask(() => this.#finish({ code: 0, signal: null }))
