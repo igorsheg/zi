@@ -844,6 +844,12 @@ export class AgentSession {
     return state.type === "absent" || state.type === "disposed" ? undefined : state.host.snapshot()
   }
 
+  assertExtensionLifecycleUnbound(): void {
+    const state = this.#extensionLifecycle
+    if (state.type === "absent" || state.type === "unbound") return
+    throw new Error("AgentSession extension lifecycle is already bound")
+  }
+
   startExtensionLifecycle(reason: ExtensionStartReason): Promise<void> {
     const state = this.#extensionLifecycle
     if (state.type === "absent" || state.type === "started") return Promise.resolve()

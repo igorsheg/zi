@@ -1,6 +1,11 @@
 import { expect, test } from "bun:test"
 
-import { createAgentSession, type AgentSession, SessionManager } from "@with-zi/coding-agent"
+import {
+  createAgentSession,
+  type AgentSession,
+  type ProjectTrustSelection,
+  SessionManager
+} from "@with-zi/coding-agent"
 import {
   createModels,
   createTestAgentRuntime as createAgentRuntime,
@@ -193,6 +198,54 @@ test("settings workflow restores suspended filters until a value closes the stac
   }
 })
 
+test("project trust choices are explicit, safe by default, and dismissible", async () => {
+  const session = await createSession("project-trust-store")
+  const mode = createInteractiveStore(session)
+  const decisions: ProjectTrustSelection[] = []
+  let dismissed = 0
+  const actions: PromptSessionActions = {
+    listSessions: async () => ({ sessions: [], invalid: 0, omitted: 0 }),
+    startNewSession: async () => {},
+    resumeSession: async () => {},
+    decideProjectTrust: async selection => {
+      decisions.push(selection)
+    },
+    dismissProjectTrust: () => {
+      dismissed++
+    },
+    cancelReplacement: () => ({ type: "none", settled: Promise.resolve() })
+  }
+  const prompt = createPromptStore(mode, new SlashController(), actions)
+
+  try {
+    prompt.requestProjectTrust("/work/project")
+    expect(prompt.picker.presentation("")?.selectedId).toBe("untrusted-session")
+    expect(prompt.activatePicker("", fileCompletionInputFromText("", 0))).toBe(true)
+    await Bun.sleep(0)
+    expect(decisions).toEqual([{ type: "untrusted", persistence: "session" }])
+    expect(prompt.$state.get().workflow.type).toBe("idle")
+
+    prompt.requestProjectTrust("/work/project")
+    prompt.movePicker("", 1)
+    prompt.movePicker("", 1)
+    expect(prompt.activatePicker("", fileCompletionInputFromText("", 0))).toBe(true)
+    await Bun.sleep(0)
+    expect(decisions[1]).toEqual({ type: "trusted", persistence: "saved" })
+
+    prompt.requestProjectTrust("/work/project")
+    expect(prompt.backPicker()).toBe(true)
+    expect(dismissed).toBe(1)
+    expect(prompt.$state.get()).toMatchObject({
+      feedback: { type: "warning", message: expect.stringContaining("remains disabled") },
+      workflow: { type: "idle" }
+    })
+  } finally {
+    prompt.dispose()
+    mode.dispose()
+    session.dispose()
+  }
+})
+
 test("settings workflow cannot cross a session replacement", async () => {
   const first = await createSession("settings-first")
   const second = await createSession("settings-second")
@@ -235,6 +288,8 @@ test("session replacement cancellation remains explicit until runtime settlement
     }),
     startNewSession: async () => {},
     resumeSession: () => resume.promise,
+    decideProjectTrust: async () => {},
+    dismissProjectTrust: () => {},
     cancelReplacement: () => ({ type: "cancelled", settled: cancellation.promise })
   }
   const prompt = createPromptStore(mode, new SlashController(), actions)

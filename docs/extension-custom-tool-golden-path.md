@@ -20,7 +20,7 @@ The extension author should need only to:
 3. import the public `@with-zi/extension-api` contract;
 4. export one synchronous or asynchronous factory;
 5. register one named tool with a description, argument schema, and asynchronous execution;
-6. run Zi and approve project trust.
+6. run Zi, choose **Trust and remember** in the project-trust picker, and let Zi reload the project runtime.
 
 No separate TypeScript build, generated manifest, OpenTUI dependency, coding-agent import, or package publication is required.
 

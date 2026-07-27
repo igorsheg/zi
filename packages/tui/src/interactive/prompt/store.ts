@@ -6,6 +6,7 @@ import type {
   ImageContent,
   ModelChoice,
   PendingInputDelivery,
+  ProjectTrustSelection,
   QueueMode,
   QueuedInputs,
   SettingsScope,
@@ -36,6 +37,8 @@ import {
   logoutFrame,
   modelChoiceId,
   modelFrame,
+  projectTrustFrame,
+  projectTrustSelection,
   promptPickerFrameIds,
   sessionFrame,
   settingLabel,
@@ -64,6 +67,7 @@ export interface PromptStore {
   activatePicker(text: string, input: FileCompletionInput): boolean
   movePicker(filter: string, direction: -1 | 1): void
   backPicker(): boolean
+  requestProjectTrust(cwd: string): void
   restoreQueuedInputs(currentText: string): string
   abortAndRestoreQueuedInputs(currentText: string): string
   pasteClipboard(): Promise<string | undefined>
@@ -99,6 +103,8 @@ export interface PromptSessionActions {
   listSessions(): Promise<SessionListResult>
   startNewSession(): Promise<void>
   resumeSession(path: string): Promise<void>
+  decideProjectTrust(selection: ProjectTrustSelection): Promise<void>
+  dismissProjectTrust(): void
   cancelReplacement(): SessionReplacementCancellation
 }
 
@@ -241,6 +247,8 @@ class PromptController implements PromptStore {
         return this.#activateLogout(workflow, presentation)
       case "choosing_session":
         return this.#activateSession(workflow, presentation)
+      case "choosing_project_trust":
+        return this.#activateProjectTrust(workflow, presentation)
       case "loading_models":
       case "selecting_model":
       case "authenticating":
@@ -252,6 +260,7 @@ class PromptController implements PromptStore {
       case "loading_sessions":
       case "resuming_session":
       case "cancelling_session":
+      case "saving_project_trust":
         return false
       default:
         return assertNever(workflow)
@@ -267,7 +276,11 @@ class PromptController implements PromptStore {
     if (!presentation) return false
 
     const workflow = this.$state.get().workflow
-    if (workflow.type === "resuming_session" || workflow.type === "cancelling_session") {
+    if (
+      workflow.type === "resuming_session" ||
+      workflow.type === "saving_project_trust" ||
+      workflow.type === "cancelling_session"
+    ) {
       return this.#cancelSessionReplacement()
     }
     if (workflow.type === "idle" && presentation.frame.id === promptPickerFrameIds.commands) {
@@ -279,6 +292,17 @@ class PromptController implements PromptStore {
       return true
     }
     if (workflow.type === "choosing_auth_option") return this.#cancelAuthentication()
+    if (workflow.type === "choosing_project_trust") {
+      this.picker.close()
+      this.#sessionActions?.dismissProjectTrust()
+      this.$state.set({
+        ...this.$state.get(),
+        feedback: { type: "warning", message: "Project .zi configuration remains disabled for this session" },
+        workflow: { type: "idle" }
+      })
+      this.#requestInput("")
+      return true
+    }
 
     const result = this.picker.back()
     switch (workflow.type) {
@@ -347,6 +371,19 @@ class PromptController implements PromptStore {
 
     this.#requestInput(result.type === "revealed" ? result.filter : "")
     return true
+  }
+
+  requestProjectTrust(cwd: string): void {
+    if (this.#disposed || this.$state.get().workflow.type !== "idle") return
+    const session = this.#interactive.getSession()
+    const operationId = ++this.#nextOperationId
+    this.picker.open(projectTrustFrame(cwd))
+    this.$state.set({
+      ...this.$state.get(),
+      feedback: { type: "none" },
+      workflow: { type: "choosing_project_trust", operationId, session, cwd }
+    })
+    this.#requestInput("")
   }
 
   restoreQueuedInputs(currentText: string): string {
@@ -719,6 +756,52 @@ class PromptController implements PromptStore {
       this.#requestInput("")
     }
     void resume()
+    return true
+  }
+
+  #activateProjectTrust(
+    workflow: Extract<PromptWorkflow, { type: "choosing_project_trust" }>,
+    presentation: PickerPresentation
+  ): boolean {
+    if (presentation.frame.id !== promptPickerFrameIds.projectTrust || !presentation.selectedId) return false
+    if (!this.#accepts(workflow.operationId, workflow.session)) return false
+    const selected = projectTrustSelection(presentation.selectedId)
+    if (!selected) return false
+    const actions = this.#sessionActions
+    if (!actions) {
+      this.#showError("Session runtime is unavailable")
+      return false
+    }
+
+    this.$state.set({
+      ...this.$state.get(),
+      feedback: { type: "status", message: "Applying project trust…" },
+      workflow: {
+        type: "saving_project_trust",
+        operationId: workflow.operationId,
+        session: workflow.session,
+        cwd: workflow.cwd,
+        selection: selected.selection
+      }
+    })
+    this.picker.replaceTop(projectTrustFrame(workflow.cwd, selected.id, true), "")
+    this.#requestInput("")
+
+    const apply = async () => {
+      try {
+        await actions.decideProjectTrust(selected.selection)
+      } catch (cause) {
+        if (!this.#accepts(workflow.operationId, workflow.session)) return
+        this.picker.replaceTop(projectTrustFrame(workflow.cwd, selected.id), "")
+        this.$state.set({ ...this.$state.get(), feedback: { type: "error", message: errorMessage(cause) }, workflow })
+        return
+      }
+      if (!this.#accepts(workflow.operationId, workflow.session)) return
+      this.picker.close()
+      this.$state.set({ ...this.$state.get(), feedback: { type: "none" }, workflow: { type: "idle" } })
+      this.#requestInput("")
+    }
+    void apply()
     return true
   }
 
@@ -1135,7 +1218,13 @@ class PromptController implements PromptStore {
   #cancelSessionReplacement(): boolean {
     const workflow = this.$state.get().workflow
     if (workflow.type === "cancelling_session") return true
-    if (workflow.type !== "starting_session" && workflow.type !== "resuming_session") return false
+    if (
+      workflow.type !== "starting_session" &&
+      workflow.type !== "resuming_session" &&
+      workflow.type !== "saving_project_trust"
+    ) {
+      return false
+    }
     const cancellation = this.#sessionActions?.cancelReplacement()
     if (!cancellation || cancellation.type !== "cancelled") return true
 

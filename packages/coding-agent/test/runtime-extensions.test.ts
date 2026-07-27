@@ -14,8 +14,7 @@ test("AgentSession owns one discovered extension lifecycle through final disposa
   const runtime = await createAgentRuntime({
     cwd: fixture.cwd,
     agentDir: fixture.agentDir,
-    session: { type: "new", persist: false },
-    extensionWorkerCommand: workerCommand
+    session: { type: "new", persist: false }
   })
 
   try {
@@ -50,31 +49,25 @@ export default function (): void { writeFileSync(${JSON.stringify(loaded)}, "loa
 `
   )
 
-  const excluded = await createAgentRuntime({
+  const runtime = await createAgentSessionRuntime({
     cwd,
     agentDir,
     session: { type: "new", persist: false },
     extensionWorkerCommand: workerCommand
   })
-  expect(excluded.projectTrust.type).toBe("unresolved")
-  expect(excluded.session.extensionHostSnapshot).toMatchObject({ status: "disabled", extensions: [] })
+  const excluded = runtime.session
+  expect(runtime.projectTrust.type).toBe("unresolved")
+  expect(excluded.extensionHostSnapshot).toMatchObject({ status: "disabled", extensions: [] })
   expect(access(loaded)).rejects.toThrow()
-  excluded.session.dispose()
-  await excluded.session.waitForIdle()
 
-  const trusted = await createAgentRuntime({
-    cwd,
-    agentDir,
-    session: { type: "new", persist: false },
-    projectTrust: { type: "trusted", cwd, source: "runtime" },
-    extensionWorkerCommand: workerCommand
-  })
   try {
+    await runtime.decideProjectTrust({ type: "trusted", persistence: "session" })
     expect(await readFile(loaded, "utf8")).toBe("loaded")
-    expect(trusted.session.extensionHostSnapshot).toMatchObject({ status: "ready", lifecycle: "started" })
+    expect(runtime.session.extensionHostSnapshot).toMatchObject({ status: "ready", lifecycle: "started" })
+    expect(() => excluded.prompt("disposed")).toThrow("AgentSession is disposed")
   } finally {
-    trusted.session.dispose()
-    await trusted.session.waitForIdle()
+    runtime.dispose()
+    await runtime.waitForIdle()
     await rm(root, { recursive: true, force: true })
   }
 }, 10_000)

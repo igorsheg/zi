@@ -26,6 +26,10 @@ export type ProjectTrustDecision =
   | { readonly type: "trusted"; readonly cwd: string; readonly source: "interactive" | "runtime" }
   | { readonly type: "untrusted"; readonly cwd: string; readonly source: "interactive" | "runtime" }
 
+export type ProjectTrustSelection =
+  | { readonly type: "trusted"; readonly persistence: "session" | "saved" }
+  | { readonly type: "untrusted"; readonly persistence: "session" | "saved" }
+
 export interface ProjectTrustDiagnostic {
   readonly cwd: string
   readonly path: string

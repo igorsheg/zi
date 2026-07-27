@@ -5,7 +5,12 @@ import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 
 import { AgentSessionRuntime } from "../src/agent-session-runtime.js"
-import { createAgentRuntime, type AgentRuntime, type CreateAgentRuntimeOptions } from "../src/runtime.js"
+import {
+  createAgentRuntime,
+  createUnboundAgentRuntime,
+  type AgentRuntime,
+  type CreateAgentRuntimeOptions
+} from "../src/runtime.js"
 import { SessionManager, type SessionListResult } from "../src/session-manager.js"
 import {
   createModels,
@@ -110,7 +115,7 @@ test("session runtime owns invocation prompt arrays across replacements", async 
   let replacementOptions: CreateAgentRuntimeOptions | undefined
   const runtime = new AgentSessionRuntime(initial, options, async replacement => {
     replacementOptions = replacement
-    return createAgentRuntime(replacement)
+    return createUnboundAgentRuntime(replacement)
   })
   appendSystemPrompt[0] = "Changed"
 
@@ -119,6 +124,27 @@ test("session runtime owns invocation prompt arrays across replacements", async 
 
     expect(replacementOptions?.appendSystemPrompt).toEqual(["Original"])
     expect(Object.isFrozen(replacementOptions?.appendSystemPrompt)).toBe(true)
+  } finally {
+    runtime.dispose()
+    await runtime.waitForIdle()
+  }
+})
+
+test("session runtime rejects replacement factories that bind lifecycle before commit", async () => {
+  const models = createModels()
+  const options: CreateAgentRuntimeOptions = {
+    cwd: "/work",
+    session: { type: "new", persist: false },
+    modelFactory: () => models
+  }
+  const initial = await createAgentRuntime(options)
+  const candidate = await createAgentRuntime(options)
+  const runtime = new AgentSessionRuntime(initial, options, async () => candidate)
+
+  try {
+    await expectRejection(runtime.newSession(), "extension lifecycle is already bound")
+    expect(runtime.session).toBe(initial.session)
+    expect(() => candidate.session.prompt("disposed")).toThrow("AgentSession is disposed")
   } finally {
     runtime.dispose()
     await runtime.waitForIdle()
@@ -144,7 +170,7 @@ test("session runtime retains its initial global directory across ambient change
   try {
     process.env.ZI_AGENT_DIR = firstAgentDir
     const initial = await createAgentRuntime(options)
-    runtime = new AgentSessionRuntime(initial, options, createAgentRuntime)
+    runtime = new AgentSessionRuntime(initial, options, createUnboundAgentRuntime)
     expect(runtime.services.paths.globalDir).toBe(firstAgentDir)
 
     process.env.ZI_AGENT_DIR = secondAgentDir
@@ -346,12 +372,7 @@ test("replacement rechecks the old session before commit and disposes a stale ca
   const candidateReady = deferred<AgentRuntime>()
   const runtime = new AgentSessionRuntime(initial, options, () => candidateReady.promise)
   const replacement = runtime.newSession()
-  const candidate = await createTestAgentRuntime({
-    cwd: "/work",
-    model: "runtime-race/model",
-    session: { type: "new", persist: false },
-    models
-  })
+  const candidate = await createUnboundAgentRuntime(options)
   const run = initial.session.prompt("start")
   candidateReady.resolve(candidate)
 
@@ -386,7 +407,7 @@ test("cancelling an in-flight replacement keeps the current session and removes 
   const replacement = runtime.newSession()
   const cancellation = runtime.cancelReplacement()
   expect(cancellation.type).toBe("cancelled")
-  const candidate = await createTestAgentRuntime({ cwd, agentDir, model: "runtime-cancel/model", models })
+  const candidate = await createUnboundAgentRuntime(options)
   const candidateFile = candidate.session.sessionManager.file!
   candidateReady.resolve(candidate)
 

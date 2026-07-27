@@ -3,6 +3,7 @@ import type {
   AuthenticationMethod,
   ImageContent,
   ModelChoice,
+  ProjectTrustSelection,
   QueueMode,
   SettingsScope,
   SessionInfo,
@@ -92,6 +93,19 @@ export type PromptWorkflow =
     }
   | { readonly type: "resuming_session"; readonly operationId: number; readonly session: AgentSession }
   | { readonly type: "cancelling_session"; readonly operationId: number; readonly session: AgentSession }
+  | {
+      readonly type: "choosing_project_trust"
+      readonly operationId: number
+      readonly session: AgentSession
+      readonly cwd: string
+    }
+  | {
+      readonly type: "saving_project_trust"
+      readonly operationId: number
+      readonly session: AgentSession
+      readonly cwd: string
+      readonly selection: ProjectTrustSelection
+    }
   | { readonly type: "choosing_settings_scope"; readonly operationId: number; readonly session: AgentSession }
   | {
       readonly type: "choosing_setting"

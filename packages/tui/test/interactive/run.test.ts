@@ -1,10 +1,14 @@
 import { expect, mock, test } from "bun:test"
+import { mkdir, mkdtemp, writeFile } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 
 import { type CliRendererConfig, TextareaRenderable } from "@opentui/core"
 import { createTestRenderer } from "@opentui/core/testing"
 import {
   createModels,
   createTestAgentRuntime as createAgentRuntime,
+  createTestAgentSessionRuntime,
   fauxAssistantMessage,
   fauxProvider
 } from "@with-zi/coding-agent/testing"
@@ -30,6 +34,76 @@ test("initial CLI prompts run after interactive terminal ownership is establishe
     await running
   } finally {
     session.dispose()
+    if (!setup.renderer.isDestroyed) setup.renderer.destroy()
+    mock.restore()
+  }
+})
+
+test("initial CLI prompts wait for project trust and use the admitted replacement session", async () => {
+  const setup = await createTestRenderer({ width: 64, height: 14, useThread: false })
+  const core = await import("@opentui/core")
+  await mock.module("@opentui/core", () => ({ ...core, createCliRenderer: async () => setup.renderer }))
+
+  const root = await mkdtemp(join(tmpdir(), "zi-run-project-trust-"))
+  const cwd = join(root, "project")
+  await mkdir(join(cwd, ".zi"), { recursive: true })
+  await writeFile(join(cwd, ".zi", "settings.json"), "{}")
+  const models = createModels()
+  const faux = fauxProvider()
+  models.setProvider(faux.provider)
+  faux.setResponses([fauxAssistantMessage("trusted")])
+  const runtime = await createTestAgentSessionRuntime({ cwd, agentDir: join(root, "global"), models })
+  const excluded = runtime.session
+
+  try {
+    const { runTui } = await import("../../src/interactive/run.js")
+    const running = runTui({ sessionRuntime: runtime, initialMessages: ["after trust"] })
+    await waitUntil(() => setup.renderer.root.findDescendantById("prompt-input") instanceof TextareaRenderable)
+    expect(faux.state.callCount).toBe(0)
+
+    setup.mockInput.pressArrow("down")
+    setup.mockInput.pressArrow("down")
+    setup.mockInput.pressEnter()
+    await waitUntil(() => faux.state.callCount === 1)
+    await runtime.session.waitForIdle()
+
+    expect(runtime.session).not.toBe(excluded)
+    expect(runtime.session.messages.filter(message => message.role === "user")).toHaveLength(1)
+    expect(() => excluded.prompt("disposed")).toThrow("AgentSession is disposed")
+    setup.mockInput.pressKey("d", { ctrl: true })
+    await running
+  } finally {
+    runtime.dispose()
+    await runtime.waitForIdle()
+    if (!setup.renderer.isDestroyed) setup.renderer.destroy()
+    mock.restore()
+  }
+})
+
+test("closing an unresolved trust picker does not release initial prompts", async () => {
+  const setup = await createTestRenderer({ width: 64, height: 14, useThread: false })
+  const core = await import("@opentui/core")
+  await mock.module("@opentui/core", () => ({ ...core, createCliRenderer: async () => setup.renderer }))
+
+  const root = await mkdtemp(join(tmpdir(), "zi-run-project-trust-close-"))
+  const cwd = join(root, "project")
+  await mkdir(join(cwd, ".zi"), { recursive: true })
+  await writeFile(join(cwd, ".zi", "settings.json"), "{}")
+  const models = createModels()
+  const faux = fauxProvider()
+  models.setProvider(faux.provider)
+  const runtime = await createTestAgentSessionRuntime({ cwd, agentDir: join(root, "global"), models })
+
+  try {
+    const { runTui } = await import("../../src/interactive/run.js")
+    const running = runTui({ sessionRuntime: runtime, initialMessages: ["must not run"] })
+    await waitUntil(() => setup.renderer.root.findDescendantById("prompt-input") instanceof TextareaRenderable)
+    setup.mockInput.pressKey("d", { ctrl: true })
+    await running
+    expect(faux.state.callCount).toBe(0)
+  } finally {
+    runtime.dispose()
+    await runtime.waitForIdle()
     if (!setup.renderer.isDestroyed) setup.renderer.destroy()
     mock.restore()
   }
@@ -271,10 +345,10 @@ test("shutdown failure surfaces only after terminal resources are restored", asy
 })
 
 async function waitUntil(predicate: () => boolean): Promise<void> {
-  for (let attempt = 0; attempt < 20; attempt++) {
+  for (let attempt = 0; attempt < 100; attempt++) {
     if (predicate()) return
     // oxlint-disable-next-line no-await-in-loop
-    await Promise.resolve()
+    await Bun.sleep(1)
   }
   throw new Error("Condition was not met")
 }

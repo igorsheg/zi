@@ -20,3 +20,12 @@ export async function runExtensionWorkerFromStdio(): Promise<void> {
   if (result.type === "failure") throw result.cause
   if (outputResult.type === "failure") throw outputResult.cause
 }
+
+if (import.meta.main) {
+  try {
+    await runExtensionWorkerFromStdio()
+  } catch (cause) {
+    await Bun.stderr.write(`${cause instanceof Error ? cause.message : String(cause)}\n`)
+    process.exitCode = 1
+  }
+}

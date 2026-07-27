@@ -666,7 +666,7 @@ Future provider declarations may require host registration before model selectio
 
 ### 15.2 Interactive mode
 
-Interactive mode may present trust and diagnostics, but it receives no worker process or mutable extension registry. It binds terminal-specific future capabilities through `InteractiveMode` and the semantic keybinding owner.
+When project trust is unresolved, `InteractiveMode` opens a below-composer picker before positional prompts run. The safe default keeps project configuration disabled; each trust or rejection choice is explicitly session-only or saved for the canonical cwd. `AgentSessionRuntime` applies the choice by replacing the whole cwd-bound runtime, so no protected owner is mutated into a newly trusted state. The TUI receives authoritative trust data and operations but no worker process or mutable extension registry.
 
 Terminal shutdown restores OpenTUI before awaiting bounded extension settlement.
 

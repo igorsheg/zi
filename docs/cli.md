@@ -57,6 +57,8 @@ Cwd, session selection, system-prompt content, and `--api-key` are intentionally
 
 Headless modes require a positional prompt or piped stdin. Piped stdin is bounded at 8 MiB and becomes the first prompt; positional prompts run afterward in argument order. Diagnostics and failures go to stderr, preserving text and JSON stdout protocols. Explicit extensions join trusted project and global extension sources in every mode; `--extension <path>` is repeatable and loads before discovered sources.
 
+When protected project `.zi` configuration exists without a stored decision, interactive mode opens a project-trust picker before running positional prompts. Its safe default keeps project configuration disabled. Trust or rejection may apply only to the current session or be saved for the canonical cwd; a saved parent decision is inherited. Applying a choice replaces the whole cwd-bound runtime so settings, prompts, skills, themes, and extensions share the same admission. Text and JSON modes never prompt and continue with unresolved project configuration excluded.
+
 ## Sessions
 
 The last session selector chooses exactly one intent:

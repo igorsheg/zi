@@ -31,7 +31,7 @@ The current product milestone is the [`custom-tool extension golden path`](exten
 - [x] Give project settings, resources, and extension discovery one admission value.
 - [x] Add deterministic bounded global, project, and explicit source discovery.
 - [x] Exclude unresolved project configuration with a diagnostic in headless modes.
-- [ ] Present and remember cwd-keyed project-trust decisions in interactive mode.
+- [x] Present and remember cwd-keyed project-trust decisions in interactive mode.
 
 ### 4. Supervise one lifecycle generation
 

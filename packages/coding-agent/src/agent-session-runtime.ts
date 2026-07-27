@@ -1,6 +1,9 @@
+import { existsSync } from "node:fs"
+
 import type { Api, Model } from "@earendil-works/pi-ai"
 
 import { resolveZiPath } from "./paths.js"
+import { ProjectTrustStore, type ProjectTrustSelection } from "./project-trust.js"
 import {
   snapshotAgentRuntimeOptions,
   type AgentRuntimeSessionIntent,
@@ -9,7 +12,7 @@ import {
 import { createUnboundAgentRuntime, type AgentRuntime } from "./runtime.js"
 import { SessionManager, type SessionListResult } from "./session-manager.js"
 
-// Replacement factories keep extension lifecycle unbound until the old runtime retires.
+// Replacement factories return an unbound session; AgentSessionRuntime owns lifecycle commit ordering.
 export type AgentRuntimeFactory = (options: CreateAgentRuntimeOptions) => Promise<AgentRuntime>
 
 export type SessionReplacementCancellation =
@@ -130,6 +133,33 @@ export class AgentSessionRuntime {
     )
   }
 
+  decideProjectTrust(selection: ProjectTrustSelection): Promise<AgentRuntime> {
+    const current = this.#requireReady()
+    if (current.projectTrust.type !== "unresolved") {
+      throw new Error("Project trust is already resolved for this session")
+    }
+    validateProjectTrustSelection(selection)
+    const cwd = current.projectTrust.cwd
+    const session = trustReplacementSession(current)
+    const model = replacementModel(this.#options, current)
+    const options = snapshotAgentRuntimeOptions({
+      ...runtimeOptions(this.#options, {
+        cwd: current.services.paths.cwd,
+        session,
+        ...(session.type === "new" || this.#options.sessionDir
+          ? { sessionDir: current.services.paths.sessionDir }
+          : {}),
+        ...(model ? { model } : {})
+      }),
+      projectTrust: { type: selection.type, cwd, source: "interactive" }
+    })
+    const remember =
+      selection.persistence === "saved"
+        ? () => new ProjectTrustStore(current.services.paths).update([{ type: selection.type, cwd }])
+        : undefined
+    return this.#replace(options, "reload", false, remember)
+  }
+
   cancelReplacement(): SessionReplacementCancellation {
     const state = this.#state
     if (state.type === "replacing") {
@@ -177,8 +207,9 @@ export class AgentSessionRuntime {
 
   async #replace(
     options: CreateAgentRuntimeOptions,
-    reason: "new" | "resume",
-    discardFile = false
+    reason: "new" | "resume" | "reload",
+    discardFile = false,
+    prepare?: () => Promise<void>
   ): Promise<AgentRuntime> {
     const current = this.#requireReady()
     current.session.assertReplaceable()
@@ -188,6 +219,13 @@ export class AgentSessionRuntime {
 
     let next: AgentRuntime
     try {
+      if (prepare) {
+        await prepare()
+        const prepared = this.#readState()
+        if (!isOperation(prepared, operationId) || prepared.type === "cancelling") {
+          throw new Error("Session replacement was cancelled before runtime construction")
+        }
+      }
       next = await this.#createRuntime(options)
     } catch (cause) {
       const state = this.#readState()
@@ -206,6 +244,15 @@ export class AgentSessionRuntime {
       throw new Error(
         state.type === "disposed" ? "AgentSessionRuntime is disposed" : "Session replacement was cancelled"
       )
+    }
+
+    try {
+      next.session.assertExtensionLifecycleUnbound()
+    } catch (cause) {
+      await this.#discard(next, discardFile, reason)
+      this.#state = { type: "ready", current }
+      operation.resolve()
+      throw cause
     }
 
     try {
@@ -247,7 +294,7 @@ export class AgentSessionRuntime {
     return next
   }
 
-  async #discard(runtime: AgentRuntime, discardFile: boolean, reason: "new" | "resume"): Promise<void> {
+  async #discard(runtime: AgentRuntime, discardFile: boolean, reason: "new" | "resume" | "reload"): Promise<void> {
     const discardPersistence = discardFile && runtime.session.sessionManager.file !== undefined
     runtime.session.dispose(reason)
     try {
@@ -334,6 +381,26 @@ function runtimeOptions(
   if (replacement.sessionDir === undefined) delete options.sessionDir
   if (replacement.model === undefined) delete options.model
   return snapshotAgentRuntimeOptions(options)
+}
+
+function trustReplacementSession(current: AgentRuntime): AgentRuntimeSessionIntent {
+  const file = current.session.sessionManager.file
+  if (file && existsSync(file)) return { type: "resume", file }
+  return { type: "new", persist: file !== undefined }
+}
+
+function validateProjectTrustSelection(selection: unknown): asserts selection is ProjectTrustSelection {
+  if (!isRecord(selection)) throw new Error("Project trust selections must be objects")
+  if (selection.type !== "trusted" && selection.type !== "untrusted") {
+    throw new Error(`Unknown project trust selection: ${String(selection.type)}`)
+  }
+  if (selection.persistence !== "session" && selection.persistence !== "saved") {
+    throw new Error(`Unknown project trust persistence: ${String(selection.persistence)}`)
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
 }
 
 function replacementModel(options: CreateAgentRuntimeOptions, current: AgentRuntime): string | undefined {

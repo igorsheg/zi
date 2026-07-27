@@ -3,6 +3,7 @@ import type {
   AuthenticationMethod,
   ModelChoice,
   ProjectFileSearchResult,
+  ProjectTrustSelection,
   SessionInfo,
   SlashCommand,
   SettingsScope,
@@ -27,7 +28,8 @@ export const promptPickerFrameIds = {
   settingsScopes: "settings-scopes",
   settings: "settings",
   settingValues: "setting-values",
-  sessions: "sessions"
+  sessions: "sessions",
+  projectTrust: "project-trust"
 } as const
 
 export function commandFrame(commands: readonly SlashCommand[]): PickerFrame {
@@ -156,6 +158,67 @@ export function sessionFrame(
     })),
     ...(selected ? { selectedId: selected } : {}),
     ...(notices.length > 0 ? { footer: notices.join(" · ") } : {})
+  }
+}
+
+export type ProjectTrustSelectionId = "untrusted-session" | "trusted-session" | "trusted-saved" | "untrusted-saved"
+
+export function projectTrustFrame(
+  cwd: string,
+  selectedId: ProjectTrustSelectionId = "untrusted-session",
+  disabled = false
+): PickerFrame {
+  return {
+    id: promptPickerFrameIds.projectTrust,
+    title: "Project trust",
+    hint: "Project .zi settings, prompts, skills, themes, and executable extensions are currently ignored.",
+    footer: disabled ? "Applying project trust…" : cwd,
+    filter: "none",
+    disabled,
+    selectedId,
+    rows: [
+      {
+        id: "untrusted-session",
+        label: "Do not trust (this session)",
+        metadata: "Keep all project .zi configuration disabled",
+        searchText: "do not trust session"
+      },
+      {
+        id: "trusted-session",
+        label: "Trust (this session)",
+        metadata: "Enable project .zi configuration until this session is replaced",
+        searchText: "trust session"
+      },
+      {
+        id: "trusted-saved",
+        label: "Trust and remember",
+        metadata: "Enable project .zi configuration and save this folder decision",
+        searchText: "trust remember save"
+      },
+      {
+        id: "untrusted-saved",
+        label: "Do not trust and remember",
+        metadata: "Keep project .zi configuration disabled and save this folder decision",
+        searchText: "do not trust remember save"
+      }
+    ]
+  }
+}
+
+export function projectTrustSelection(
+  id: string
+): { readonly id: ProjectTrustSelectionId; readonly selection: ProjectTrustSelection } | undefined {
+  switch (id) {
+    case "untrusted-session":
+      return { id, selection: { type: "untrusted", persistence: "session" } }
+    case "trusted-session":
+      return { id, selection: { type: "trusted", persistence: "session" } }
+    case "trusted-saved":
+      return { id, selection: { type: "trusted", persistence: "saved" } }
+    case "untrusted-saved":
+      return { id, selection: { type: "untrusted", persistence: "saved" } }
+    default:
+      return undefined
   }
 }
 

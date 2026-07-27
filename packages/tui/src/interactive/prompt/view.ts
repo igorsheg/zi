@@ -128,6 +128,10 @@ export class PromptView {
     this.#store.reportFeedback({ type: "warning", message })
   }
 
+  requestProjectTrust(cwd: string): void {
+    this.#store.requestProjectTrust(cwd)
+  }
+
   showCopyWarning(message: string): void {
     const state = this.#store.$state.get()
     if (state.workflow.type === "idle" && (state.feedback.type === "none" || state.feedback.type === "copy_warning")) {

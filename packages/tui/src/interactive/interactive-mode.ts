@@ -1,5 +1,10 @@
 import { BoxRenderable, CliRenderEvents, type CliRenderer, type SyntaxStyle } from "@opentui/core"
-import type { AgentSession, AgentSessionRuntime, SessionBootstrapDiagnostic } from "@with-zi/coding-agent"
+import type {
+  AgentSession,
+  AgentSessionRuntime,
+  ProjectTrustResolution,
+  SessionBootstrapDiagnostic
+} from "@with-zi/coding-agent"
 
 import { createSyntaxStyle, defaultTheme, type Theme } from "../theme.js"
 import { type BrowserOpener, SystemBrowserOpener } from "./browser-opener.js"
@@ -24,6 +29,10 @@ import { SessionScreen } from "./screen.js"
 import { SelectionCopyController } from "./selection-copy.js"
 import { SlashController } from "./slash-controller.js"
 import type { TranscriptDiagnostics } from "./transcript/view.js"
+
+type InitialProjectTrustState =
+  | { readonly type: "pending"; readonly settled: Promise<void>; readonly resolve: () => void }
+  | { readonly type: "settled"; readonly settled: Promise<void> }
 
 export interface InteractiveModeOptions {
   readonly renderer: CliRenderer
@@ -59,6 +68,7 @@ export class InteractiveMode {
   readonly #selectionCopy: SelectionCopyController
   readonly #diagnosticFlags: TuiDiagnosticFlags
   readonly #diagnostics: TuiDiagnosticsOverlay | undefined
+  #initialProjectTrust = createInitialProjectTrustState()
   #screen: SessionScreen
   #releaseGeneration: () => void
   #disposed = false
@@ -93,6 +103,11 @@ export class InteractiveMode {
             const next = await sessionRuntime.switchSession(path)
             if (!this.#disposed) this.replaceSession(next.session, next.bootstrapDiagnostic)
           },
+          decideProjectTrust: async selection => {
+            const next = await sessionRuntime.decideProjectTrust(selection)
+            if (!this.#disposed) this.replaceSession(next.session, next.bootstrapDiagnostic)
+          },
+          dismissProjectTrust: () => this.#settleInitialProjectTrust(),
           cancelReplacement: () => sessionRuntime.cancelReplacement()
         }
       : undefined
@@ -144,6 +159,11 @@ export class InteractiveMode {
 
     this.#releaseGeneration = this.store.$generation.listen(() => this.#replaceScreen())
     this.#showBootstrapWarning(bootstrapDiagnostic)
+    this.#presentProjectTrust(sessionRuntime?.projectTrust)
+  }
+
+  waitForInitialProjectTrust(): Promise<void> {
+    return this.#initialProjectTrust.settled
   }
 
   replaceSession(session: AgentSession, diagnostic?: SessionBootstrapDiagnostic): void {
@@ -152,6 +172,7 @@ export class InteractiveMode {
     }
     this.store.replaceSession(session)
     this.#showBootstrapWarning(diagnostic)
+    this.#presentProjectTrust(this.#sessionRuntime?.projectTrust)
   }
 
   get transcriptDiagnostics(): TranscriptDiagnostics {
@@ -165,6 +186,7 @@ export class InteractiveMode {
   dispose(): void {
     if (this.#disposed) return
     this.#disposed = true
+    this.#settleInitialProjectTrust()
     this.#releaseGeneration()
     this.#selectionCopy.dispose()
     this.#renderer.off(CliRenderEvents.SELECTION, this.#preservePromptFocus)
@@ -183,6 +205,35 @@ export class InteractiveMode {
 
   #showBootstrapWarning(diagnostic: SessionBootstrapDiagnostic | undefined): void {
     if (diagnostic) this.#screen.prompt.showWarning(diagnostic.message)
+  }
+
+  #presentProjectTrust(trust: ProjectTrustResolution | undefined): void {
+    if (!trust) {
+      this.#settleInitialProjectTrust()
+      return
+    }
+    switch (trust.type) {
+      case "unresolved":
+        this.#screen.prompt.requestProjectTrust(trust.cwd)
+        return
+      case "untrusted":
+        if (trust.diagnostic) this.#screen.prompt.showWarning(trust.diagnostic.message)
+        this.#settleInitialProjectTrust()
+        return
+      case "trusted":
+      case "not_required":
+        this.#settleInitialProjectTrust()
+        return
+      default:
+        assertNever(trust)
+    }
+  }
+
+  #settleInitialProjectTrust(): void {
+    const trust = this.#initialProjectTrust
+    if (trust.type === "settled") return
+    this.#initialProjectTrust = { type: "settled", settled: trust.settled }
+    trust.resolve()
   }
 
   #showCopyWarning(message: string): void {
@@ -216,4 +267,16 @@ export class InteractiveMode {
       this.#sessionActions
     )
   }
+}
+
+function createInitialProjectTrustState(): InitialProjectTrustState {
+  let resolve!: () => void
+  const settled = new Promise<void>(resolvePromise => {
+    resolve = resolvePromise
+  })
+  return { type: "pending", settled, resolve }
+}
+
+function assertNever(value: never): never {
+  throw new Error(`Unknown project trust resolution: ${String(value)}`)
 }

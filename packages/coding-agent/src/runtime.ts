@@ -1,3 +1,5 @@
+import { fileURLToPath } from "node:url"
+
 import { builtinModels } from "@earendil-works/pi-ai/providers/all"
 
 import type { AgentSession } from "./agent-session.js"
@@ -58,7 +60,7 @@ export async function createUnboundAgentRuntime(requested: CreateAgentRuntimeOpt
   const project = projectConfigurationAdmission(projectTrust)
   const extensions = discoverExtensionLoadPlan(paths, project, options.extensionPaths ?? [])
   const extensionHost = new ExtensionHost(
-    createExtensionWorkerSpawner(options.extensionWorkerCommand ?? [process.execPath])
+    createExtensionWorkerSpawner(options.extensionWorkerCommand ?? defaultExtensionWorkerCommand)
   )
   extensionHost.admitDiagnostics(
     extensions.diagnostics.map(extensionDiscoveryDiagnostic),
@@ -119,6 +121,10 @@ export async function createUnboundAgentRuntime(requested: CreateAgentRuntimeOpt
 }
 
 const defaultRuntimeSession: AgentRuntimeSessionIntent = Object.freeze({ type: "new", persist: true })
+const defaultExtensionWorkerCommand = Object.freeze([
+  process.execPath,
+  fileURLToPath(new URL("./extensions/worker-entry.ts", import.meta.url))
+])
 
 type SelectedSession =
   | { readonly type: "new"; readonly persist: boolean }

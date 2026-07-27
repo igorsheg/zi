@@ -104,10 +104,16 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       ...(bootstrapDiagnostic ? { bootstrapDiagnostic } : {}),
       ...(keybindingOverrides ? { keybindingOverrides } : {})
     })
-    // Initial prompts share the interactive transcript and run after terminal ownership is established.
-    // oxlint-disable-next-line no-await-in-loop
-    for (const message of initialMessages) await session.prompt(message)
-    await finished
+    // Initial prompts share the interactive transcript and wait for any project configuration decision.
+    const startup = await Promise.race([
+      mode.waitForInitialProjectTrust().then(() => "admitted" as const),
+      finished.then(() => "closed" as const)
+    ])
+    if (startup === "admitted" && state.type === "running") {
+      // oxlint-disable-next-line no-await-in-loop
+      for (const message of initialMessages) await (sessionRuntime?.session ?? session).prompt(message)
+      await finished
+    }
   } finally {
     for (const { signal, handler } of signalHandlers) process.off(signal, handler)
     await requestClose(mode ? "renderer" : "startup")

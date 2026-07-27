@@ -69,7 +69,7 @@ The immutable coding-agent policy value for one effective cwd. It resolves globa
 _Avoid_: Path registry, config singleton, ambient cwd
 
 **Project trust**:
-The admission decision controlling whether configuration owned by one canonical project cwd may affect Zi. Stored decisions may come from the cwd or its nearest decided parent; trust gates project settings, system prompts, skills, prompts, themes, and extensions together and is not a sandbox for later agent activity. A project configuration root that coincides with the explicitly admitted global root is global configuration and does not require project trust.
+The admission decision controlling whether configuration owned by one canonical project cwd may affect Zi. Interactive decisions are explicitly session-only or saved; stored decisions may come from the cwd or its nearest decided parent. Applying an unresolved decision replaces the whole cwd-bound runtime before queued startup prompts so project settings, system prompts, skills, prompts, themes, and extensions share one admission. Trust is not a sandbox for later agent activity. A project configuration root that coincides with the explicitly admitted global root is global configuration and does not require project trust.
 _Avoid_: Extension trust, repository safety, tool sandbox
 
 **Project file search**:
