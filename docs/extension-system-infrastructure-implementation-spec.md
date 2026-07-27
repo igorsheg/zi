@@ -1,6 +1,6 @@
 # Extension system infrastructure implementation spec
 
-- Status: in progress — Slices A and B complete; Slice C protocol and worker loader
+- Status: in progress — lifecycle infrastructure Slices A through D complete
 - Pi behavior reference: `badlogic/pi-mono` at Zi's pinned `0e6909f0` (`v0.80.6`)
 - Current Pi comparison: `fc85bdd88be93b1e9a6b6bcfa41c684282ec79cc`
 - Project-trust comparison: `5bc1c2c0a6f07e00e8c240304182f213ab8d311f`
@@ -298,17 +298,30 @@ Capability owners, not discovery, later decide conflicts between declarations su
 ## 8. Host state and transitions
 
 ```ts
+type ExtensionHostLifecycle = "unbound" | "started" | "stopped"
+
 type ExtensionHostState =
-  | { type: "disabled" }
-  | { type: "starting"; candidate: ExtensionGeneration }
-  | { type: "ready"; current: ExtensionGeneration }
-  | { type: "replacing"; current: ExtensionGeneration; candidate: ExtensionGeneration }
-  | { type: "stopping"; current: ExtensionGeneration }
-  | { type: "failed"; diagnostic: ExtensionDiagnostic }
+  | { type: "disabled"; lifecycle: ExtensionHostLifecycle }
+  | { type: "starting"; lifecycle: ExtensionHostLifecycle; candidate: Candidate }
+  | { type: "ready"; lifecycle: ExtensionHostLifecycle; current: ExtensionGeneration }
+  | {
+      type: "dispatching"
+      lifecycle: ExtensionHostLifecycle
+      current: ExtensionGeneration
+      event: "session_start" | "session_shutdown"
+    }
+  | {
+      type: "replacing"
+      lifecycle: ExtensionHostLifecycle
+      current: ExtensionGeneration
+      candidate: Candidate | { type: "empty" }
+    }
+  | { type: "stopping"; lifecycle: ExtensionHostLifecycle; generations: readonly ExtensionGeneration[] }
+  | { type: "failed"; lifecycle: ExtensionHostLifecycle; diagnostic: ExtensionDiagnostic; cleanup: Promise<void> }
   | { type: "disposed" }
 ```
 
-A generation contains its immutable ID and plan plus the process resources tied to that ID. It is private to `ExtensionHost`.
+A generation contains its immutable ID and plan plus the process resources tied to that ID. It is private to `ExtensionHost`. `Candidate` distinguishes an admitted spawn from a spawned generation so the host records its transition before performing process I/O. Failed state retains only the bounded cleanup settlement needed to prevent a retry or final disposal from outrunning process teardown.
 
 ### 8.1 Allowed transitions
 
@@ -317,13 +330,19 @@ disabled -> starting             non-empty plan admitted
 starting -> ready                worker handshake and factory barrier settle
 starting -> failed               fatal spawn/handshake/protocol/startup failure
 starting -> stopping             shutdown admitted during startup
-ready -> replacing              reload admitted
-ready -> stopping               final shutdown admitted
-replacing -> ready(current)      candidate fails before commit
-replacing -> ready(candidate)    candidate commits and old generation settles
-replacing -> stopping            final shutdown supersedes reload
-failed -> starting               explicit reload/retry
-failed -> disposed               final disposal
+ready -> dispatching             lifecycle request admitted
+dispatching -> ready             lifecycle request settles
+dispatching -> failed            lifecycle generation fails
+dispatching -> stopping          final shutdown supersedes lifecycle work
+ready -> replacing               reload admitted
+ready -> stopping                final shutdown admitted
+replacing -> ready(current)       candidate fails before commit
+replacing -> ready(candidate)     candidate commits and old generation settles
+replacing -> disabled             replacement intentionally has an empty plan
+replacing -> failed               current and candidate both fail
+replacing -> stopping             final shutdown supersedes reload
+failed -> starting               explicit reload/retry after cleanup
+failed -> disposed               final disposal after cleanup
 stopping -> disposed             bounded process teardown settles
 disabled -> disposed             final disposal
 ```
@@ -836,6 +855,16 @@ Deliver:
 
 ### Slice D — `ExtensionHost`
 
+Progress:
+
+- [x] explicit host and generation states with forbidden-transition rejection;
+- [x] lazy empty plans, bounded startup, correlated lifecycle requests, and deterministic diagnostics;
+- [x] current/candidate ownership with candidate-failure rollback and process-based replacement;
+- [x] stale-frame rejection plus bounded stdout and stderr tails;
+- [x] shutdown supersession, graceful stop, termination, force-kill, and idempotent disposal;
+- [x] controlled transition tests and real CLI-worker process coverage;
+- [ ] worker-initiated correlated request types, deferred until the first capability requires one.
+
 Likely files:
 
 - `packages/coding-agent/src/extensions/host.ts`
@@ -893,27 +922,27 @@ Deliver:
 The extension infrastructure is complete when:
 
 - [x] the worker-runtime probe has selected and documented one mechanism;
-- [ ] all project configuration, including extensions, shares one trust decision;
-- [ ] global, project, and explicit sources produce a deterministic bounded load plan;
-- [ ] no extension source causes ambient cwd or `.zi` path derivation;
-- [ ] an empty plan creates no subprocess or materialized worker;
-- [ ] the compiled executable loads external TypeScript;
-- [ ] extension-local npm dependencies and Node built-ins resolve;
-- [ ] async factories are awaited before ready;
-- [ ] every loaded or failed extension retains stable source metadata;
-- [ ] import and factory failures are source-attributed and non-fatal;
-- [ ] a blocked factory cannot freeze Zi or the TUI;
-- [ ] protocol frames, queues, logs, requests, sources, diagnostics, and waits are bounded;
+- [x] all project configuration, including extensions, shares one trust decision;
+- [x] global, project, and explicit sources produce a deterministic bounded load plan;
+- [x] no extension source causes ambient cwd or `.zi` path derivation;
+- [x] an empty plan creates no subprocess or materialized worker;
+- [x] the compiled executable loads external TypeScript;
+- [x] extension-local npm dependencies and Node built-ins resolve;
+- [x] async factories are awaited before ready;
+- [x] every loaded or failed extension retains stable source metadata;
+- [x] import and factory failures are source-attributed and non-fatal;
+- [x] a blocked factory cannot freeze Zi or the TUI;
+- [x] protocol frames, queues, logs, requests, sources, diagnostics, and waits are bounded;
 - [ ] nested bidirectional requests cannot deadlock the protocol;
-- [ ] candidate fatal failure preserves the current generation;
-- [ ] successful replacement rejects all stale-generation work;
-- [ ] lifecycle handlers run in deterministic order;
-- [ ] lifecycle and shutdown waits are bounded;
+- [x] candidate fatal failure preserves the current generation;
+- [x] successful replacement rejects all stale-generation work;
+- [x] lifecycle handlers run in deterministic order;
+- [x] lifecycle and shutdown waits are bounded;
 - [ ] a worker crash leaves `AgentSession` usable;
 - [ ] terminal restoration still precedes bounded extension settlement;
-- [ ] final disposal leaves no `ExtensionHost`-owned worker process, listener, pipe, callback, or temporary artifact;
+- [x] final disposal leaves no `ExtensionHost`-owned worker process, listener, pipe, callback, or temporary artifact;
 - [ ] text and JSON modes do not load OpenTUI;
-- [ ] no tools, commands, providers, UI contributions, generic event bus, or package manager entered this slice;
+- [x] no tools, commands, providers, UI contributions, generic event bus, or package manager entered this slice;
 - [ ] formatting, linting, typechecking, unit tests, and compiled acceptance pass.
 
 ## 20. Capability sequence after infrastructure

@@ -1,0 +1,1193 @@
+import { spawn } from "node:child_process"
+import { isAbsolute } from "node:path"
+import { Readable } from "node:stream"
+import type { Writable } from "node:stream"
+
+import type { ExtensionShutdownReason, ExtensionStartReason } from "@with-zi/extension-api"
+
+import type { ExtensionLoadPlan } from "./discovery.js"
+import {
+  boundedExtensionDiagnostic,
+  extensionLifecycleTimeoutMs,
+  ExtensionProtocolDecoder,
+  ExtensionProtocolWriter,
+  extensionProtocolVersion,
+  extensionShutdownTimeoutMs,
+  extensionStartupTimeoutMs,
+  maxExtensionDiagnostics,
+  maxExtensionLogBytesPerStream,
+  type ExtensionDiagnostic,
+  type ExtensionLoadResult,
+  type HostMessage,
+  type WorkerMessage,
+  validateWorkerMessage
+} from "./protocol.js"
+import { extensionWorkerArgument } from "./worker-entry.js"
+
+export interface ExtensionWorkerExit {
+  readonly code: number | null
+  readonly signal: NodeJS.Signals | null
+  readonly error?: Error
+}
+
+export interface ExtensionWorkerProcess {
+  readonly input: Writable
+  readonly stdout: Readable
+  readonly stderr: Readable
+  readonly protocol: Readable
+  readonly exited: Promise<ExtensionWorkerExit>
+  terminate(force: boolean): void
+  dispose(): void
+}
+
+export type SpawnExtensionWorker = (plan: ExtensionLoadPlan) => ExtensionWorkerProcess
+
+export interface ExtensionHostTimeouts {
+  readonly startupMs: number
+  readonly lifecycleMs: number
+  readonly shutdownMs: number
+}
+
+export const defaultExtensionHostTimeouts: ExtensionHostTimeouts = Object.freeze({
+  startupMs: extensionStartupTimeoutMs,
+  lifecycleMs: extensionLifecycleTimeoutMs,
+  shutdownMs: extensionShutdownTimeoutMs
+})
+
+export type ExtensionReplacementReason = Exclude<ExtensionStartReason, "startup">
+export type ExtensionHostLifecycle = "unbound" | "started" | "stopped"
+export type ExtensionHostStatus =
+  | "disabled"
+  | "starting"
+  | "ready"
+  | "dispatching"
+  | "replacing"
+  | "stopping"
+  | "failed"
+  | "disposed"
+
+export interface ExtensionLogTail {
+  readonly text: string
+  readonly retainedBytes: number
+  readonly omittedBytes: number
+}
+
+export interface ExtensionHostSnapshot {
+  readonly status: ExtensionHostStatus
+  readonly lifecycle: ExtensionHostLifecycle
+  readonly extensions: readonly ExtensionLoadResult[]
+  readonly diagnostics: readonly ExtensionDiagnostic[]
+  readonly failure?: ExtensionDiagnostic
+  readonly omittedDiagnostics: number
+  readonly staleFrames: number
+  readonly stdout: ExtensionLogTail
+  readonly stderr: ExtensionLogTail
+}
+
+type Candidate =
+  | { readonly type: "spawning"; readonly id: number; readonly plan: ExtensionLoadPlan }
+  | { readonly type: "spawned"; readonly generation: ExtensionGeneration }
+
+type ExtensionHostState =
+  | { readonly type: "disabled"; readonly lifecycle: ExtensionHostLifecycle }
+  | { readonly type: "starting"; readonly lifecycle: ExtensionHostLifecycle; readonly candidate: Candidate }
+  | { readonly type: "ready"; readonly lifecycle: ExtensionHostLifecycle; readonly current: ExtensionGeneration }
+  | {
+      readonly type: "dispatching"
+      readonly lifecycle: ExtensionHostLifecycle
+      readonly current: ExtensionGeneration
+      readonly event: "session_start" | "session_shutdown"
+    }
+  | {
+      readonly type: "replacing"
+      readonly lifecycle: ExtensionHostLifecycle
+      readonly current: ExtensionGeneration
+      readonly candidate: Candidate | { readonly type: "empty" }
+    }
+  | {
+      readonly type: "stopping"
+      readonly lifecycle: ExtensionHostLifecycle
+      readonly generations: readonly ExtensionGeneration[]
+      readonly shutdown?: ExtensionGeneration
+      readonly cleanups: readonly Promise<void>[]
+      readonly settled: VoidDeferred
+    }
+  | {
+      readonly type: "failed"
+      readonly lifecycle: ExtensionHostLifecycle
+      readonly diagnostic: ExtensionDiagnostic
+      readonly cleanup: Promise<void>
+    }
+  | { readonly type: "disposed" }
+
+type GenerationLifecycle = "loaded" | "started" | "stopped"
+
+type GenerationState =
+  | { readonly type: "starting"; readonly ready: Deferred<readonly ExtensionLoadResult[]> }
+  | { readonly type: "ready"; readonly lifecycle: GenerationLifecycle }
+  | {
+      readonly type: "requesting"
+      readonly requestId: number
+      readonly request: "session_start" | "session_shutdown"
+      readonly lifecycle: GenerationLifecycle
+      readonly settled: VoidDeferred
+    }
+  | {
+      readonly type: "disposing_stopping"
+      readonly requestId: number
+      readonly settled: VoidDeferred
+      readonly disposal: VoidDeferred
+    }
+  | { readonly type: "disposing_waiting_exit"; readonly disposal: VoidDeferred }
+  | { readonly type: "disposing_terminating"; readonly disposal: VoidDeferred }
+  | { readonly type: "failed"; readonly error: ExtensionGenerationError }
+  | { readonly type: "disposed" }
+
+type ProcessStatus = { readonly type: "running" } | { readonly type: "exited"; readonly exit: ExtensionWorkerExit }
+
+class ExtensionGenerationError extends Error {
+  readonly diagnostic: ExtensionDiagnostic
+
+  constructor(value: ExtensionDiagnostic, options?: ErrorOptions) {
+    super(value.message, options)
+    this.name = "ExtensionGenerationError"
+    this.diagnostic = value
+  }
+}
+
+class LogTail {
+  #bytes = Buffer.alloc(0)
+  #omittedBytes = 0
+
+  append(chunk: Uint8Array): void {
+    const incoming = Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength)
+    if (incoming.byteLength >= maxExtensionLogBytesPerStream) {
+      this.#omit(this.#bytes.byteLength + incoming.byteLength - maxExtensionLogBytesPerStream)
+      this.#bytes = Buffer.from(incoming.subarray(incoming.byteLength - maxExtensionLogBytesPerStream))
+      return
+    }
+    const overflow = this.#bytes.byteLength + incoming.byteLength - maxExtensionLogBytesPerStream
+    if (overflow > 0) {
+      this.#omit(overflow)
+      this.#bytes = Buffer.concat([this.#bytes.subarray(overflow), incoming])
+      return
+    }
+    this.#bytes = Buffer.concat([this.#bytes, incoming])
+  }
+
+  snapshot(): ExtensionLogTail {
+    return Object.freeze({
+      text: this.#bytes.toString("utf8"),
+      retainedBytes: this.#bytes.byteLength,
+      omittedBytes: this.#omittedBytes
+    })
+  }
+
+  #omit(bytes: number): void {
+    this.#omittedBytes = Math.min(Number.MAX_SAFE_INTEGER, this.#omittedBytes + bytes)
+  }
+}
+
+class ExtensionGeneration {
+  readonly id: number
+  readonly plan: ExtensionLoadPlan
+  readonly #process: ExtensionWorkerProcess
+  readonly #writer: ExtensionProtocolWriter
+  readonly #decoder = new ExtensionProtocolDecoder(validateWorkerMessage)
+  readonly #timeouts: ExtensionHostTimeouts
+  readonly #onDiagnostic: (diagnostic: ExtensionDiagnostic) => void
+  readonly #onFailure: (generation: ExtensionGeneration, diagnostic: ExtensionDiagnostic) => void
+  readonly #onStaleFrame: () => void
+  readonly #stdout = new LogTail()
+  readonly #stderr = new LogTail()
+  readonly #onProtocolData: (chunk: Buffer) => void
+  readonly #onProtocolEnd: () => void
+  readonly #onProtocolError: (cause: Error) => void
+  readonly #onStdoutData: (chunk: Buffer) => void
+  readonly #onStderrData: (chunk: Buffer) => void
+  readonly #onStdoutError: (cause: Error) => void
+  readonly #onStderrError: (cause: Error) => void
+  #state: GenerationState
+  #processStatus: ProcessStatus = { type: "running" }
+  #nextRequestId = 1
+
+  constructor(
+    id: number,
+    plan: ExtensionLoadPlan,
+    process: ExtensionWorkerProcess,
+    timeouts: ExtensionHostTimeouts,
+    onDiagnostic: (diagnostic: ExtensionDiagnostic) => void,
+    onFailure: (generation: ExtensionGeneration, diagnostic: ExtensionDiagnostic) => void,
+    onStaleFrame: () => void
+  ) {
+    this.id = id
+    this.plan = plan
+    this.#process = process
+    this.#timeouts = timeouts
+    this.#onDiagnostic = onDiagnostic
+    this.#onFailure = onFailure
+    this.#onStaleFrame = onStaleFrame
+    this.#state = { type: "starting", ready: deferred<readonly ExtensionLoadResult[]>() }
+    this.#writer = new ExtensionProtocolWriter(process.input, cause =>
+      this.#fail("protocol", "Extension worker protocol output failed", cause)
+    )
+    this.#onProtocolData = chunk => this.#receiveBytes(chunk)
+    this.#onProtocolEnd = () => this.#protocolEnded()
+    this.#onProtocolError = cause => this.#fail("protocol", "Extension worker protocol input failed", cause)
+    this.#onStdoutData = chunk => this.#stdout.append(chunk)
+    this.#onStderrData = chunk => this.#stderr.append(chunk)
+    this.#onStdoutError = cause => this.#logFailure("stdout", cause)
+    this.#onStderrError = cause => this.#logFailure("stderr", cause)
+    process.protocol.on("data", this.#onProtocolData)
+    process.protocol.once("end", this.#onProtocolEnd)
+    process.protocol.once("error", this.#onProtocolError)
+    process.stdout.on("data", this.#onStdoutData)
+    process.stderr.on("data", this.#onStderrData)
+    process.stdout.on("error", this.#onStdoutError)
+    process.stderr.on("error", this.#onStderrError)
+    void process.exited.then(exit => this.#processExited(exit))
+  }
+
+  get lifecycle(): GenerationLifecycle | undefined {
+    const state = this.#state
+    if (state.type === "ready" || state.type === "requesting") return state.lifecycle
+    return undefined
+  }
+
+  get failure(): ExtensionDiagnostic | undefined {
+    return this.#state.type === "failed" ? this.#state.error.diagnostic : undefined
+  }
+
+  logs(): { readonly stdout: ExtensionLogTail; readonly stderr: ExtensionLogTail } {
+    return Object.freeze({ stdout: this.#stdout.snapshot(), stderr: this.#stderr.snapshot() })
+  }
+
+  async initialize(): Promise<readonly ExtensionLoadResult[]> {
+    const state = this.#state
+    if (state.type !== "starting") throw new Error("Extension generation initialization was already admitted")
+    const initialize: HostMessage = {
+      type: "initialize",
+      protocolVersion: extensionProtocolVersion,
+      generation: this.id,
+      plan: this.plan
+    }
+    try {
+      return await within(
+        Promise.all([this.#writer.send(initialize), state.ready.promise]).then(([, extensions]) => extensions),
+        this.#timeouts.startupMs,
+        "Extension worker startup deadline exceeded"
+      )
+    } catch (cause) {
+      if (cause instanceof ExtensionGenerationError) throw cause
+      this.#fail("handshake", errorMessage(cause, "Extension worker startup failed"), cause)
+      throw generationError(this.#state, cause)
+    }
+  }
+
+  async requestStart(reason: ExtensionStartReason): Promise<void> {
+    const admitted = this.#admitRequest("session_start")
+    void this.#runRequest(
+      { type: "session_start", generation: this.id, requestId: admitted.requestId, reason },
+      admitted.settled
+    )
+    return admitted.settled.promise
+  }
+
+  async requestShutdown(reason: ExtensionShutdownReason): Promise<void> {
+    const admitted = this.#admitRequest("session_shutdown")
+    void this.#runRequest(
+      { type: "session_shutdown", generation: this.id, requestId: admitted.requestId, reason },
+      admitted.settled
+    )
+    return admitted.settled.promise
+  }
+
+  dispose(): Promise<void> {
+    const state = this.#state
+    switch (state.type) {
+      case "disposed":
+        return Promise.resolve()
+      case "disposing_stopping":
+      case "disposing_waiting_exit":
+      case "disposing_terminating":
+        return state.disposal.promise
+      case "ready": {
+        const disposal = deferred<void>()
+        const settled = deferred<void>()
+        const requestId = this.#takeRequestId()
+        this.#state = { type: "disposing_stopping", requestId, settled, disposal }
+        void this.#gracefulDispose(requestId, settled, disposal)
+        return disposal.promise
+      }
+      case "starting":
+        state.ready.reject(new Error("Extension generation was disposed during startup"))
+        break
+      case "requesting":
+        state.settled.reject(new Error("Extension generation request was superseded by disposal"))
+        break
+      case "failed":
+        break
+      default:
+        return assertNever(state)
+    }
+    const disposal = deferred<void>()
+    this.#state = { type: "disposing_terminating", disposal }
+    void this.#terminateAndRelease(disposal)
+    return disposal.promise
+  }
+
+  #admitRequest(request: "session_start" | "session_shutdown"): {
+    readonly requestId: number
+    readonly settled: VoidDeferred
+  } {
+    const state = this.#state
+    if (state.type !== "ready") {
+      throw new Error(`Extension generation cannot dispatch ${request} while ${state.type}`)
+    }
+    if (request === "session_start" && state.lifecycle !== "loaded") {
+      throw new Error(`Extension generation cannot start while ${state.lifecycle}`)
+    }
+    if (request === "session_shutdown" && state.lifecycle !== "started") {
+      throw new Error(`Extension generation cannot shut down while ${state.lifecycle}`)
+    }
+
+    const requestId = this.#takeRequestId()
+    const settled = deferred<void>()
+    this.#state = { type: "requesting", requestId, request, lifecycle: state.lifecycle, settled }
+    return { requestId, settled }
+  }
+
+  async #runRequest(message: HostMessage, settled: VoidDeferred): Promise<void> {
+    try {
+      await this.#writer.send(message)
+      await within(settled.promise, this.#timeouts.lifecycleMs, "Extension lifecycle deadline exceeded")
+    } catch (cause) {
+      const state = this.#state
+      if (state.type === "requesting" && state.settled === settled) {
+        this.#fail("lifecycle", errorMessage(cause, "Extension lifecycle failed"), cause)
+      }
+    }
+  }
+
+  #receiveBytes(chunk: Buffer): void {
+    try {
+      for (const message of this.#decoder.push(chunk)) this.#receive(message)
+    } catch (cause) {
+      this.#fail("protocol", errorMessage(cause, "Extension worker sent invalid protocol data"), cause)
+    }
+  }
+
+  #receive(message: WorkerMessage): void {
+    if (message.generation !== this.id) {
+      this.#onStaleFrame()
+      return
+    }
+    const state = this.#state
+    switch (message.type) {
+      case "ready":
+        if (state.type !== "starting") {
+          this.#fail("protocol", `Extension worker sent ready while ${state.type}`)
+          return
+        }
+        if (!matchesLoadPlan(this.plan, message.extensions)) {
+          this.#fail("handshake", "Extension worker ready results did not match its admitted load plan")
+          return
+        }
+        this.#state = { type: "ready", lifecycle: "loaded" }
+        state.ready.resolve(message.extensions)
+        return
+      case "settled":
+        if (state.type === "requesting" && state.requestId === message.requestId) {
+          const lifecycle = state.request === "session_start" ? "started" : "stopped"
+          this.#state = { type: "ready", lifecycle }
+          state.settled.resolve()
+          return
+        }
+        if (state.type === "disposing_stopping" && state.requestId === message.requestId) {
+          this.#state = { type: "disposing_waiting_exit", disposal: state.disposal }
+          state.settled.resolve()
+          return
+        }
+        this.#fail("protocol", "Extension worker settled an unknown request")
+        return
+      case "diagnostic":
+        this.#onDiagnostic(message.diagnostic)
+        return
+      case "fatal":
+        this.#fail(message.diagnostic.phase, message.diagnostic.message, undefined, message.diagnostic)
+        return
+      default:
+        return assertNever(message)
+    }
+  }
+
+  #protocolEnded(): void {
+    try {
+      this.#decoder.end()
+    } catch (cause) {
+      this.#fail("protocol", errorMessage(cause, "Extension worker protocol ended with a partial frame"), cause)
+      return
+    }
+    const state = this.#state
+    if (
+      state.type !== "disposing_waiting_exit" &&
+      state.type !== "disposing_terminating" &&
+      state.type !== "disposed" &&
+      state.type !== "failed"
+    ) {
+      this.#fail(state.type === "starting" ? "handshake" : "protocol", "Extension worker protocol ended unexpectedly")
+    }
+  }
+
+  #processExited(exit: ExtensionWorkerExit): void {
+    if (this.#processStatus.type === "exited") return
+    this.#processStatus = { type: "exited", exit }
+    const state = this.#state
+    if (
+      state.type === "disposing_waiting_exit" ||
+      state.type === "disposing_terminating" ||
+      state.type === "disposed" ||
+      state.type === "failed"
+    )
+      return
+    const suffix = exit.error
+      ? `: ${exit.error.message}`
+      : ` (code ${String(exit.code)}, signal ${String(exit.signal)})`
+    const phase = state.type === "starting" ? "handshake" : "protocol"
+    this.#fail(phase, `Extension worker exited unexpectedly${suffix}`, exit.error)
+  }
+
+  async #gracefulDispose(requestId: number, settled: VoidDeferred, disposal: VoidDeferred): Promise<void> {
+    const startedAt = Date.now()
+    const graceEndsAt = startedAt + Math.floor(this.#timeouts.shutdownMs / 3)
+    try {
+      await this.#writer.send({ type: "stop", generation: this.id, requestId })
+      await until(settled.promise, graceEndsAt, "Extension worker stop deadline exceeded")
+      await until(this.#process.exited, graceEndsAt, "Extension worker exit deadline exceeded")
+    } catch (cause) {
+      this.#onDiagnostic(
+        diagnostic("shutdown", errorMessage(cause, "Extension worker did not stop gracefully"), cause, "warning")
+      )
+    }
+    await this.#terminateAndRelease(disposal, startedAt)
+  }
+
+  async #terminateAndRelease(disposal: VoidDeferred, startedAt = Date.now()): Promise<void> {
+    if (this.#state.type !== "disposing_terminating") {
+      this.#state = { type: "disposing_terminating", disposal }
+    }
+    const terminateEndsAt = startedAt + Math.floor((this.#timeouts.shutdownMs * 2) / 3)
+    const forceEndsAt = startedAt + this.#timeouts.shutdownMs
+
+    if (this.#processStatus.type === "running") {
+      this.#process.terminate(false)
+      await ignoreDeadline(this.#process.exited, terminateEndsAt)
+    }
+    if (this.#processStatus.type === "running") {
+      this.#process.terminate(true)
+      await ignoreDeadline(this.#process.exited, forceEndsAt)
+    }
+    if (this.#processStatus.type === "running") {
+      this.#onDiagnostic(
+        diagnostic("shutdown", "Extension worker did not exit before its forced shutdown deadline", undefined, "error")
+      )
+    }
+
+    this.#release()
+    this.#state = { type: "disposed" }
+    disposal.resolve()
+  }
+
+  #fail(
+    phase: ExtensionDiagnostic["phase"],
+    message: string,
+    cause?: unknown,
+    suppliedDiagnostic?: ExtensionDiagnostic
+  ): void {
+    const state = this.#state
+    if (state.type === "failed" || state.type === "disposed" || state.type === "disposing_terminating") return
+    const diagnosticValue = suppliedDiagnostic ?? diagnostic(phase, message, cause)
+    const error = new ExtensionGenerationError(diagnosticValue, cause === undefined ? undefined : { cause })
+
+    if (state.type === "disposing_stopping") {
+      state.settled.reject(error)
+      this.#state = { type: "disposing_terminating", disposal: state.disposal }
+    } else if (state.type === "disposing_waiting_exit") {
+      this.#state = { type: "disposing_terminating", disposal: state.disposal }
+    } else {
+      if (state.type === "starting") state.ready.reject(error)
+      if (state.type === "requesting") state.settled.reject(error)
+      this.#state = { type: "failed", error }
+    }
+    this.#writer.fail(error)
+    this.#onFailure(this, diagnosticValue)
+  }
+
+  #logFailure(stream: "stdout" | "stderr", cause: Error): void {
+    this.#onDiagnostic(
+      diagnostic("protocol", `Extension worker ${stream} log stream failed: ${cause.message}`, cause, "warning")
+    )
+  }
+
+  #takeRequestId(): number {
+    const requestId = this.#nextRequestId
+    if (!Number.isSafeInteger(requestId)) throw new Error("Extension request IDs are exhausted")
+    this.#nextRequestId++
+    return requestId
+  }
+
+  #release(): void {
+    this.#writer.dispose()
+    this.#process.protocol.off("data", this.#onProtocolData)
+    this.#process.protocol.off("end", this.#onProtocolEnd)
+    this.#process.protocol.off("error", this.#onProtocolError)
+    this.#process.stdout.off("data", this.#onStdoutData)
+    this.#process.stderr.off("data", this.#onStderrData)
+    this.#process.stdout.off("error", this.#onStdoutError)
+    this.#process.stderr.off("error", this.#onStderrError)
+    this.#process.input.destroy()
+    this.#process.protocol.destroy()
+    this.#process.stdout.destroy()
+    this.#process.stderr.destroy()
+    this.#process.dispose()
+  }
+}
+
+export class ExtensionHost {
+  readonly #spawnWorker: SpawnExtensionWorker
+  readonly #timeouts: ExtensionHostTimeouts
+  readonly #diagnostics: ExtensionDiagnostic[] = []
+  #state: ExtensionHostState = { type: "disabled", lifecycle: "unbound" }
+  #nextGenerationId = 1
+  #omittedDiagnostics = 0
+  #staleFrames = 0
+  #extensions: readonly ExtensionLoadResult[] = Object.freeze([])
+  #lastLogs: { readonly stdout: ExtensionLogTail; readonly stderr: ExtensionLogTail } = Object.freeze({
+    stdout: emptyLogTail(),
+    stderr: emptyLogTail()
+  })
+
+  constructor(spawnWorker: SpawnExtensionWorker, timeouts: ExtensionHostTimeouts = defaultExtensionHostTimeouts) {
+    validateTimeouts(timeouts)
+    this.#spawnWorker = spawnWorker
+    this.#timeouts = Object.freeze({ ...timeouts })
+  }
+
+  static async create(
+    plan: ExtensionLoadPlan,
+    spawnWorker: SpawnExtensionWorker,
+    timeouts: ExtensionHostTimeouts = defaultExtensionHostTimeouts
+  ): Promise<ExtensionHost> {
+    const host = new ExtensionHost(spawnWorker, timeouts)
+    await host.start(plan)
+    return host
+  }
+
+  async start(plan: ExtensionLoadPlan): Promise<void> {
+    const state = this.#state
+    if (state.type !== "disabled" && state.type !== "failed") {
+      throw new Error(`Extension host cannot start while ${state.type}`)
+    }
+    if (state.type === "failed") {
+      await state.cleanup
+      if (this.#state !== state) return
+    }
+    await this.#startPlan(plan, state.lifecycle)
+  }
+
+  snapshot(): ExtensionHostSnapshot {
+    const state = this.#state
+    const logs = this.#activeGeneration(state)?.logs() ?? this.#lastLogs
+    return Object.freeze({
+      status: hostStatus(state),
+      lifecycle: state.type === "disposed" ? "stopped" : state.lifecycle,
+      extensions: this.#extensions,
+      diagnostics: Object.freeze([...this.#diagnostics]),
+      ...(state.type === "failed" ? { failure: state.diagnostic } : {}),
+      omittedDiagnostics: this.#omittedDiagnostics,
+      staleFrames: this.#staleFrames,
+      stdout: logs.stdout,
+      stderr: logs.stderr
+    })
+  }
+
+  async sessionStart(reason: ExtensionStartReason): Promise<void> {
+    const state = this.#state
+    if (state.type === "disabled") {
+      if (state.lifecycle !== "unbound") throw new Error(`Extension host cannot start while ${state.lifecycle}`)
+      this.#state = { type: "disabled", lifecycle: "started" }
+      return
+    }
+    if (state.type === "failed") {
+      if (state.lifecycle !== "unbound") throw new Error(`Extension host cannot start while ${state.lifecycle}`)
+      this.#state = { ...state, lifecycle: "started" }
+      return
+    }
+    if (state.type !== "ready") throw new Error(`Extension host cannot start a session while ${state.type}`)
+    if (state.lifecycle !== "unbound") throw new Error(`Extension host cannot start while ${state.lifecycle}`)
+
+    const dispatching: ExtensionHostState = {
+      type: "dispatching",
+      lifecycle: state.lifecycle,
+      current: state.current,
+      event: "session_start"
+    }
+    this.#state = dispatching
+    try {
+      await state.current.requestStart(reason)
+      if (this.#state === dispatching) {
+        this.#state = { type: "ready", lifecycle: "started", current: state.current }
+      }
+    } catch (cause) {
+      await this.#operationFailed(dispatching, state.current, cause)
+    }
+  }
+
+  async sessionShutdown(reason: ExtensionShutdownReason): Promise<void> {
+    const state = this.#state
+    if (state.type === "disabled") {
+      if (state.lifecycle === "stopped") return
+      this.#state = { type: "disabled", lifecycle: "stopped" }
+      return
+    }
+    if (state.type === "failed") {
+      if (state.lifecycle === "stopped") return
+      this.#state = { ...state, lifecycle: "stopped" }
+      return
+    }
+    if (state.type !== "ready") throw new Error(`Extension host cannot shut down a session while ${state.type}`)
+    if (state.lifecycle === "stopped") return
+    if (state.lifecycle === "unbound") {
+      this.#state = { ...state, lifecycle: "stopped" }
+      return
+    }
+
+    const dispatching: ExtensionHostState = {
+      type: "dispatching",
+      lifecycle: state.lifecycle,
+      current: state.current,
+      event: "session_shutdown"
+    }
+    this.#state = dispatching
+    try {
+      await state.current.requestShutdown(reason)
+      if (this.#state === dispatching) {
+        this.#state = { type: "ready", lifecycle: "stopped", current: state.current }
+      }
+    } catch (cause) {
+      await this.#operationFailed(dispatching, state.current, cause)
+    }
+  }
+
+  async reload(plan: ExtensionLoadPlan, reason: ExtensionReplacementReason = "reload"): Promise<void> {
+    const state = this.#state
+    if (state.type === "disposed" || state.type === "stopping") {
+      throw new Error(`Extension host cannot reload while ${state.type}`)
+    }
+    if (state.type === "starting" || state.type === "dispatching" || state.type === "replacing") {
+      throw new Error(`Extension host cannot reload while ${state.type}`)
+    }
+    if (state.lifecycle === "stopped") throw new Error("Extension host cannot reload after session shutdown")
+    if (state.type === "failed") {
+      await state.cleanup
+      if (this.#state !== state) return
+    }
+
+    if (state.type === "disabled" || state.type === "failed") {
+      if (plan.sources.length === 0) {
+        this.#state = { type: "disabled", lifecycle: state.lifecycle }
+        this.#extensions = Object.freeze([])
+        return
+      }
+      await this.#startPlan(plan, state.lifecycle, reason)
+      return
+    }
+
+    if (plan.sources.length === 0) {
+      const replacing: ExtensionHostState = {
+        type: "replacing",
+        lifecycle: state.lifecycle,
+        current: state.current,
+        candidate: { type: "empty" }
+      }
+      this.#state = replacing
+      await this.#retireCurrent(replacing, state.current, reason)
+      if (this.#state === replacing) {
+        this.#extensions = Object.freeze([])
+        this.#state = { type: "disabled", lifecycle: state.lifecycle }
+      }
+      return
+    }
+
+    const id = this.#takeGenerationId()
+    const replacing: ExtensionHostState = {
+      type: "replacing",
+      lifecycle: state.lifecycle,
+      current: state.current,
+      candidate: { type: "spawning", id, plan }
+    }
+    this.#state = replacing
+    let candidate: ExtensionGeneration
+    try {
+      candidate = this.#spawn(plan, id)
+    } catch (cause) {
+      this.#diagnose(diagnostic("spawn", errorMessage(cause, "Could not spawn extension worker"), cause))
+      if (this.#state === replacing) this.#state = state
+      return
+    }
+    const spawned: ExtensionHostState = { ...replacing, candidate: { type: "spawned", generation: candidate } }
+    this.#state = spawned
+
+    let extensions: readonly ExtensionLoadResult[]
+    try {
+      extensions = await candidate.initialize()
+    } catch {
+      await candidate.dispose()
+      if (this.#state === spawned) {
+        const currentFailure = state.current.failure
+        if (currentFailure) {
+          const cleanup = state.current.dispose()
+          this.#extensions = Object.freeze([])
+          this.#state = { type: "failed", lifecycle: state.lifecycle, diagnostic: currentFailure, cleanup }
+          await cleanup
+        } else {
+          this.#state = state
+        }
+      }
+      return
+    }
+    if (this.#state !== spawned) {
+      await candidate.dispose()
+      return
+    }
+    this.#admitLoadResults(extensions)
+    await this.#retireCurrent(spawned, state.current, reason)
+    if (this.#state !== spawned) {
+      await candidate.dispose()
+      return
+    }
+
+    this.#extensions = extensions
+    if (state.lifecycle === "started") {
+      const dispatching: ExtensionHostState = {
+        type: "dispatching",
+        lifecycle: "unbound",
+        current: candidate,
+        event: "session_start"
+      }
+      this.#state = dispatching
+      try {
+        await candidate.requestStart(reason)
+        if (this.#state === dispatching) {
+          this.#state = { type: "ready", lifecycle: "started", current: candidate }
+        }
+      } catch (cause) {
+        await this.#operationFailed(dispatching, candidate, cause, "started")
+      }
+      return
+    }
+    this.#state = { type: "ready", lifecycle: state.lifecycle, current: candidate }
+  }
+
+  dispose(reason: ExtensionShutdownReason = "quit"): Promise<void> {
+    const state = this.#state
+    if (state.type === "disposed") return Promise.resolve()
+    if (state.type === "stopping") return state.settled.promise
+
+    const generations: ExtensionGeneration[] = []
+    const cleanups: Promise<void>[] = []
+    let shutdown: ExtensionGeneration | undefined
+    if (state.type === "ready") {
+      generations.push(state.current)
+      if (state.lifecycle === "started") shutdown = state.current
+    } else if (state.type === "dispatching") {
+      generations.push(state.current)
+    } else if (state.type === "starting" && state.candidate.type === "spawned") {
+      generations.push(state.candidate.generation)
+    } else if (state.type === "replacing") {
+      if (state.candidate.type === "spawned") generations.push(state.candidate.generation)
+      generations.push(state.current)
+      if (state.lifecycle === "started" && state.current.lifecycle === "started") shutdown = state.current
+    } else if (state.type === "failed") {
+      cleanups.push(state.cleanup)
+    }
+
+    const lifecycle = state.lifecycle
+    const settled = deferred<void>()
+    const stopping: ExtensionHostState = {
+      type: "stopping",
+      lifecycle,
+      generations: Object.freeze(generations),
+      ...(shutdown ? { shutdown } : {}),
+      cleanups: Object.freeze(cleanups),
+      settled
+    }
+    this.#state = stopping
+    void this.#finishDispose(stopping, reason)
+    return settled.promise
+  }
+
+  async #startPlan(
+    plan: ExtensionLoadPlan,
+    lifecycle: ExtensionHostLifecycle,
+    startReason?: ExtensionReplacementReason
+  ): Promise<void> {
+    if (plan.sources.length === 0) {
+      this.#state = { type: "disabled", lifecycle }
+      this.#extensions = Object.freeze([])
+      return
+    }
+    const id = this.#takeGenerationId()
+    const starting: ExtensionHostState = { type: "starting", lifecycle, candidate: { type: "spawning", id, plan } }
+    this.#state = starting
+    let candidate: ExtensionGeneration
+    try {
+      candidate = this.#spawn(plan, id)
+    } catch (cause) {
+      const failure = diagnostic("spawn", errorMessage(cause, "Could not spawn extension worker"), cause)
+      this.#diagnose(failure)
+      if (this.#state === starting) {
+        this.#state = { type: "failed", lifecycle, diagnostic: failure, cleanup: Promise.resolve() }
+      }
+      return
+    }
+    const spawned: ExtensionHostState = { ...starting, candidate: { type: "spawned", generation: candidate } }
+    this.#state = spawned
+
+    let extensions: readonly ExtensionLoadResult[]
+    try {
+      extensions = await candidate.initialize()
+    } catch (cause) {
+      const cleanup = candidate.dispose()
+      if (this.#state === spawned) {
+        const failure = failureDiagnostic(cause)
+        this.#extensions = Object.freeze([])
+        this.#state = { type: "failed", lifecycle, diagnostic: failure, cleanup }
+      }
+      await cleanup
+      return
+    }
+    if (this.#state !== spawned) {
+      await candidate.dispose()
+      return
+    }
+    this.#admitLoadResults(extensions)
+    this.#extensions = extensions
+
+    if (lifecycle === "started") {
+      const dispatching: ExtensionHostState = {
+        type: "dispatching",
+        lifecycle: "unbound",
+        current: candidate,
+        event: "session_start"
+      }
+      this.#state = dispatching
+      try {
+        await candidate.requestStart(startReason ?? "reload")
+        if (this.#state === dispatching) {
+          this.#state = { type: "ready", lifecycle: "started", current: candidate }
+        }
+      } catch (cause) {
+        await this.#operationFailed(dispatching, candidate, cause, "started")
+      }
+      return
+    }
+    this.#state = { type: "ready", lifecycle, current: candidate }
+  }
+
+  #spawn(plan: ExtensionLoadPlan, id: number): ExtensionGeneration {
+    const process = this.#spawnWorker(plan)
+    return new ExtensionGeneration(
+      id,
+      plan,
+      process,
+      this.#timeouts,
+      value => this.#diagnose(value),
+      (generation, value) => this.#generationFailed(generation, value),
+      () => this.#staleFrame()
+    )
+  }
+
+  async #retireCurrent(
+    ownerState: Extract<ExtensionHostState, { type: "replacing" }>,
+    current: ExtensionGeneration,
+    reason: ExtensionReplacementReason
+  ): Promise<void> {
+    if (ownerState.lifecycle === "started" && current.lifecycle === "started") {
+      try {
+        await current.requestShutdown(reason)
+      } catch (cause) {
+        if (!(cause instanceof ExtensionGenerationError)) this.#diagnose(failureDiagnostic(cause))
+      }
+    }
+    await current.dispose()
+    this.#lastLogs = current.logs()
+  }
+
+  async #operationFailed(
+    ownerState: Extract<ExtensionHostState, { type: "dispatching" }>,
+    generation: ExtensionGeneration,
+    cause: unknown,
+    lifecycle: ExtensionHostLifecycle = ownerState.lifecycle
+  ): Promise<void> {
+    const failure = failureDiagnostic(cause)
+    const cleanup = generation.dispose()
+    if (this.#state === ownerState) {
+      if (!(cause instanceof ExtensionGenerationError)) this.#diagnose(failure)
+      this.#extensions = Object.freeze([])
+      this.#state = { type: "failed", lifecycle, diagnostic: failure, cleanup }
+    }
+    await cleanup
+    this.#lastLogs = generation.logs()
+  }
+
+  #generationFailed(generation: ExtensionGeneration, value: ExtensionDiagnostic): void {
+    this.#diagnose(value)
+    const state = this.#state
+    if (state.type === "ready" && state.current === generation) {
+      const cleanup = generation.dispose().then(() => {
+        this.#lastLogs = generation.logs()
+        return undefined
+      })
+      this.#extensions = Object.freeze([])
+      this.#state = { type: "failed", lifecycle: state.lifecycle, diagnostic: value, cleanup }
+    }
+  }
+
+  async #finishDispose(state: Extract<ExtensionHostState, { type: "stopping" }>, reason: ExtensionShutdownReason) {
+    if (state.shutdown?.lifecycle === "started") {
+      try {
+        await state.shutdown.requestShutdown(reason)
+      } catch (cause) {
+        if (!(cause instanceof ExtensionGenerationError)) this.#diagnose(failureDiagnostic(cause))
+      }
+    }
+    await Promise.all([...state.cleanups, ...state.generations.map(generation => generation.dispose())])
+    const retainedGeneration = state.generations.at(-1)
+    if (retainedGeneration) this.#lastLogs = retainedGeneration.logs()
+    if (this.#state === state) {
+      this.#extensions = Object.freeze([])
+      this.#state = { type: "disposed" }
+    }
+    state.settled.resolve()
+  }
+
+  #admitLoadResults(results: readonly ExtensionLoadResult[]): void {
+    for (const result of results) {
+      if (result.status === "failed" && result.diagnostic) this.#diagnose(result.diagnostic)
+    }
+  }
+
+  #diagnose(value: ExtensionDiagnostic): void {
+    if (this.#diagnostics.length >= maxExtensionDiagnostics) {
+      this.#omittedDiagnostics = Math.min(Number.MAX_SAFE_INTEGER, this.#omittedDiagnostics + 1)
+      return
+    }
+    this.#diagnostics.push(value)
+  }
+
+  #staleFrame(): void {
+    this.#staleFrames = Math.min(Number.MAX_SAFE_INTEGER, this.#staleFrames + 1)
+  }
+
+  #takeGenerationId(): number {
+    const id = this.#nextGenerationId
+    if (!Number.isSafeInteger(id)) throw new Error("Extension generation IDs are exhausted")
+    this.#nextGenerationId++
+    return id
+  }
+
+  #activeGeneration(state: ExtensionHostState): ExtensionGeneration | undefined {
+    switch (state.type) {
+      case "starting":
+        return state.candidate.type === "spawned" ? state.candidate.generation : undefined
+      case "ready":
+      case "dispatching":
+        return state.current
+      case "replacing":
+        return state.current
+      case "stopping":
+        return state.generations[0]
+      case "disabled":
+      case "failed":
+      case "disposed":
+        return undefined
+      default:
+        return assertNever(state)
+    }
+  }
+}
+
+export function createExtensionWorkerSpawner(command: readonly string[]): SpawnExtensionWorker {
+  if (
+    command.length === 0 ||
+    command.length > 16 ||
+    !isAbsolute(command[0]!) ||
+    command.some(part => part.length === 0 || part.includes("\0") || Buffer.byteLength(part) > 4096)
+  ) {
+    throw new Error(
+      "Extension worker commands require an absolute executable and at most 15 non-empty 4096-byte prefix arguments"
+    )
+  }
+  const admitted = Object.freeze([...command])
+  return plan => {
+    const child = spawn(admitted[0]!, [...admitted.slice(1), extensionWorkerArgument], {
+      cwd: plan.cwd,
+      stdio: ["pipe", "pipe", "pipe", "pipe"],
+      windowsHide: true
+    })
+    const protocol = child.stdio[3]
+    if (!child.stdin || !child.stdout || !child.stderr || !(protocol instanceof Readable)) {
+      child.kill("SIGKILL")
+      throw new Error("Extension worker process did not expose all required pipes")
+    }
+
+    let settled = false
+    let processError: Error | undefined
+    let resolveExit!: (exit: ExtensionWorkerExit) => void
+    const exited = new Promise<ExtensionWorkerExit>(resolve => {
+      resolveExit = resolve
+    })
+    const finish = (code: number | null, signal: NodeJS.Signals | null): void => {
+      if (settled) return
+      settled = true
+      resolveExit({ code, signal, ...(processError ? { error: processError } : {}) })
+    }
+    const onError = (cause: Error): void => {
+      processError = cause
+    }
+    const onClose = (code: number | null, signal: NodeJS.Signals | null): void => finish(code, signal)
+    child.on("error", onError)
+    child.on("close", onClose)
+
+    return {
+      input: child.stdin,
+      stdout: child.stdout,
+      stderr: child.stderr,
+      protocol,
+      exited,
+      terminate(force) {
+        if (!settled) child.kill(force ? "SIGKILL" : "SIGTERM")
+      },
+      dispose() {
+        child.off("error", onError)
+        child.off("close", onClose)
+        if (!settled) {
+          child.unref()
+          processError ??= new Error("Extension worker process ownership ended before exit observation")
+          finish(child.exitCode, child.signalCode)
+        }
+      }
+    }
+  }
+}
+
+function matchesLoadPlan(plan: ExtensionLoadPlan, results: readonly ExtensionLoadResult[]): boolean {
+  if (plan.sources.length !== results.length) return false
+  return plan.sources.every((source, index) => {
+    const result = results[index]
+    if (!result) return false
+    const received = result.source
+    return (
+      received.id === source.id &&
+      received.declaredPath === source.declaredPath &&
+      received.entryPath === source.entryPath &&
+      received.scope === source.scope &&
+      received.origin === source.origin
+    )
+  })
+}
+
+function hostStatus(state: ExtensionHostState): ExtensionHostStatus {
+  return state.type
+}
+
+function diagnostic(
+  phase: ExtensionDiagnostic["phase"],
+  message: string,
+  cause?: unknown,
+  severity: ExtensionDiagnostic["severity"] = "error"
+): ExtensionDiagnostic {
+  const error = cause instanceof Error ? cause : undefined
+  return boundedExtensionDiagnostic({ phase, severity, message, ...(error?.stack ? { stack: error.stack } : {}) })
+}
+
+function failureDiagnostic(cause: unknown): ExtensionDiagnostic {
+  if (cause instanceof ExtensionGenerationError) return cause.diagnostic
+  return diagnostic("protocol", errorMessage(cause, "Extension generation failed"), cause)
+}
+
+function generationError(state: GenerationState, cause: unknown): ExtensionGenerationError {
+  if (state.type === "failed") return state.error
+  return new ExtensionGenerationError(
+    diagnostic("handshake", errorMessage(cause, "Extension generation failed"), cause)
+  )
+}
+
+function errorMessage(cause: unknown, fallback: string): string {
+  return cause instanceof Error && cause.message ? cause.message : fallback
+}
+
+function emptyLogTail(): ExtensionLogTail {
+  return Object.freeze({ text: "", retainedBytes: 0, omittedBytes: 0 })
+}
+
+function validateTimeouts(timeouts: ExtensionHostTimeouts): void {
+  for (const [name, value] of Object.entries(timeouts)) {
+    if (!Number.isSafeInteger(value) || value <= 0) throw new Error(`Extension host ${name} must be a positive integer`)
+  }
+}
+
+class DeadlineError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = "DeadlineError"
+  }
+}
+
+function within<T>(operation: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+  return until(operation, Date.now() + timeoutMs, message)
+}
+
+function until<T>(operation: Promise<T>, deadline: number, message: string): Promise<T> {
+  const remaining = Math.max(0, deadline - Date.now())
+  let timeout: ReturnType<typeof setTimeout> | undefined
+  const expired = new Promise<never>((_, reject) => {
+    timeout = setTimeout(() => reject(new DeadlineError(message)), remaining)
+    timeout.unref?.()
+  })
+  return Promise.race([operation, expired]).finally(() => {
+    if (timeout) clearTimeout(timeout)
+  })
+}
+
+async function ignoreDeadline(operation: Promise<unknown>, deadline: number): Promise<void> {
+  try {
+    await until(operation, deadline, "Extension process settlement deadline exceeded")
+  } catch {
+    // The next teardown stage owns escalation.
+  }
+}
+
+interface Deferred<T> {
+  readonly promise: Promise<T>
+  resolve(value: T): void
+  reject(cause: unknown): void
+}
+
+type VoidDeferred = Omit<Deferred<void>, "resolve"> & { resolve(): void }
+
+function deferred<T>(): Deferred<T> {
+  let resolve!: (value: T) => void
+  let reject!: (cause: unknown) => void
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise
+    reject = rejectPromise
+  })
+  void promise.catch(() => {})
+  return { promise, resolve, reject }
+}
+
+function assertNever(value: never): never {
+  throw new Error(`Unhandled extension host state: ${String(value)}`)
+}

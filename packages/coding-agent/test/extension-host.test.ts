@@ -1,0 +1,381 @@
+import { expect, test } from "bun:test"
+import { resolve } from "node:path"
+import { PassThrough, Writable } from "node:stream"
+
+import type { ExtensionLoadPlan, ExtensionSource } from "../src/extensions/discovery.js"
+import {
+  ExtensionHost,
+  type ExtensionHostTimeouts,
+  type ExtensionWorkerExit,
+  type ExtensionWorkerProcess,
+  type SpawnExtensionWorker
+} from "../src/extensions/host.js"
+import {
+  encodeExtensionProtocolFrame,
+  ExtensionProtocolDecoder,
+  extensionProtocolVersion,
+  maxExtensionDiagnostics,
+  maxExtensionLogBytesPerStream,
+  type HostMessage,
+  type WorkerMessage,
+  validateHostMessage
+} from "../src/extensions/protocol.js"
+
+const testTimeouts: ExtensionHostTimeouts = Object.freeze({ startupMs: 100, lifecycleMs: 100, shutdownMs: 90 })
+
+const sourceOne = extensionSource("one")
+const sourceTwo = extensionSource("two")
+
+const emptyPlan: ExtensionLoadPlan = Object.freeze({ cwd: resolve("extension-host-empty"), sources: Object.freeze([]) })
+const planOne = extensionPlan("one", [sourceOne])
+const planTwo = extensionPlan("two", [sourceTwo])
+
+test("empty extension plans stay lazy through lifecycle and disposal", async () => {
+  const workers = new TestWorkerSpawner()
+  const host = await ExtensionHost.create(emptyPlan, workers.spawn, testTimeouts)
+
+  expect(host.snapshot()).toMatchObject({ status: "disabled", lifecycle: "unbound", extensions: [] })
+  expect(workers.processes).toHaveLength(0)
+  await host.sessionStart("startup")
+  expect(host.snapshot()).toMatchObject({ status: "disabled", lifecycle: "started" })
+  await host.reload(emptyPlan)
+  expect(workers.processes).toHaveLength(0)
+  await host.dispose()
+  await host.dispose()
+  expect(host.snapshot()).toMatchObject({ status: "disposed", lifecycle: "stopped" })
+})
+
+test("host startup owns lifecycle requests, bounded logs, and process cleanup", async () => {
+  const workers = new TestWorkerSpawner()
+  const host = await ExtensionHost.create(planOne, workers.spawn, testTimeouts)
+  const worker = workers.processes[0]!
+
+  expect(host.snapshot()).toMatchObject({ status: "ready", lifecycle: "unbound" })
+  await host.sessionStart("startup")
+  expect(worker.messages.map(message => message.type)).toEqual(["initialize", "session_start"])
+  expect(host.sessionStart("startup")).rejects.toThrow("cannot start while started")
+
+  worker.stdout.write(Buffer.alloc(maxExtensionLogBytesPerStream + 17, 0x61))
+  worker.stderr.write("stderr evidence")
+  expect(host.snapshot()).toMatchObject({
+    stdout: { retainedBytes: maxExtensionLogBytesPerStream, omittedBytes: 17 },
+    stderr: { text: "stderr evidence", omittedBytes: 0 }
+  })
+
+  await host.sessionShutdown("quit")
+  await host.dispose()
+  expect(worker.messages.map(message => message.type)).toEqual([
+    "initialize",
+    "session_start",
+    "session_shutdown",
+    "stop"
+  ])
+  expect(worker.disposed).toBe(true)
+  expect(host.snapshot()).toMatchObject({ status: "disposed", lifecycle: "stopped" })
+})
+
+test("startup and teardown deadlines terminate unresponsive workers", async () => {
+  const timeouts: ExtensionHostTimeouts = { startupMs: 10, lifecycleMs: 10, shutdownMs: 9 }
+  const startupWorkers = new TestWorkerSpawner()
+  startupWorkers.behaviors.push({ type: "pending" })
+  const failed = await ExtensionHost.create(planOne, startupWorkers.spawn, timeouts)
+  expect(failed.snapshot()).toMatchObject({
+    status: "failed",
+    diagnostics: [{ phase: "handshake", message: "Extension worker startup deadline exceeded" }]
+  })
+  expect(startupWorkers.processes[0]!.terminated).toEqual(["SIGTERM"])
+
+  const shutdownWorkers = new TestWorkerSpawner()
+  shutdownWorkers.behaviors.push({ type: "resist_terminate" })
+  const host = await ExtensionHost.create(planOne, shutdownWorkers.spawn, timeouts)
+  await host.dispose()
+  expect(shutdownWorkers.processes[0]!.terminated).toEqual(["SIGTERM", "SIGKILL"])
+  expect(host.snapshot().diagnostics).toContainEqual(
+    expect.objectContaining({ phase: "shutdown", severity: "warning" })
+  )
+})
+
+test("ready barriers must describe the exact admitted load plan", async () => {
+  const workers = new TestWorkerSpawner()
+  workers.behaviors.push({ type: "wrong_ready" })
+  const host = await ExtensionHost.create(planOne, workers.spawn, testTimeouts)
+
+  expect(host.snapshot()).toMatchObject({
+    status: "failed",
+    extensions: [],
+    diagnostics: [
+      { phase: "handshake", message: "Extension worker ready results did not match its admitted load plan" }
+    ]
+  })
+  await host.dispose()
+})
+
+test("fatal startup failure leaves a diagnosable retryable host", async () => {
+  const workers = new TestWorkerSpawner()
+  workers.behaviors.push({ type: "fatal", message: "factory barrier crashed" })
+  const host = await ExtensionHost.create(planOne, workers.spawn, testTimeouts)
+
+  expect(host.snapshot()).toMatchObject({
+    status: "failed",
+    lifecycle: "unbound",
+    diagnostics: [{ phase: "handshake", message: "factory barrier crashed" }]
+  })
+  expect(workers.processes[0]!.terminated).toEqual(["SIGTERM"])
+  expect(workers.processes[0]!.disposed).toBe(true)
+
+  await host.sessionStart("startup")
+  workers.behaviors.push({ type: "ready" })
+  await host.reload(planTwo)
+  expect(host.snapshot()).toMatchObject({ status: "ready", lifecycle: "started" })
+  expect(workers.processes[1]!.messages.map(message => message.type)).toEqual(["initialize", "session_start"])
+  await host.dispose()
+})
+
+test("replacement preserves current on candidate failure and commits one successful candidate", async () => {
+  const workers = new TestWorkerSpawner()
+  const host = await ExtensionHost.create(planOne, workers.spawn, testTimeouts)
+  const current = workers.processes[0]!
+  await host.sessionStart("startup")
+
+  workers.behaviors.push({ type: "spawn_error", message: "candidate spawn failed" })
+  await host.reload(planTwo)
+  expect(host.snapshot()).toMatchObject({ status: "ready", lifecycle: "started" })
+  expect(current.messages.map(message => message.type)).toEqual(["initialize", "session_start"])
+
+  workers.behaviors.push({ type: "fatal", message: "candidate failed" })
+  await host.reload(planTwo)
+  expect(host.snapshot()).toMatchObject({
+    status: "ready",
+    lifecycle: "started",
+    extensions: [{ source: { id: sourceOne.id } }]
+  })
+  expect(current.messages.map(message => message.type)).toEqual(["initialize", "session_start"])
+
+  workers.behaviors.push({ type: "ready" })
+  await host.reload(planTwo)
+  const candidate = workers.processes[2]!
+  expect(host.snapshot()).toMatchObject({
+    status: "ready",
+    lifecycle: "started",
+    extensions: [{ source: { id: sourceTwo.id } }]
+  })
+  expect(current.messages.map(message => message.type)).toEqual([
+    "initialize",
+    "session_start",
+    "session_shutdown",
+    "stop"
+  ])
+  expect(current.disposed).toBe(true)
+  expect(candidate.messages.map(message => message.type)).toEqual(["initialize", "session_start"])
+
+  candidate.send({
+    type: "diagnostic",
+    generation: 999,
+    diagnostic: { phase: "protocol", severity: "warning", message: "stale" }
+  })
+  expect(host.snapshot()).toMatchObject({ status: "ready", staleFrames: 1 })
+  await host.dispose()
+})
+
+test("replacement fails instead of restoring a current generation that crashed with its candidate", async () => {
+  const workers = new TestWorkerSpawner()
+  const host = await ExtensionHost.create(planOne, workers.spawn, testTimeouts)
+  await host.sessionStart("startup")
+  const current = workers.processes[0]!
+
+  workers.behaviors.push({ type: "pending" })
+  const replacement = host.reload(planTwo)
+  await Promise.resolve()
+  const candidate = workers.processes[1]!
+  current.crash(new Error("current crashed"))
+  await Promise.resolve()
+  candidate.failStartup("candidate crashed")
+  await replacement
+
+  expect(host.snapshot()).toMatchObject({ status: "failed", lifecycle: "started", extensions: [] })
+  expect(current.disposed).toBe(true)
+  expect(candidate.disposed).toBe(true)
+  await host.dispose()
+})
+
+test("final disposal supersedes startup and replacement without leaking either process", async () => {
+  const startupWorkers = new TestWorkerSpawner()
+  startupWorkers.behaviors.push({ type: "pending" })
+  const startingHost = new ExtensionHost(startupWorkers.spawn, testTimeouts)
+  const startup = startingHost.start(planOne)
+  await Promise.resolve()
+  const startupDisposal = startingHost.dispose()
+  await Promise.all([startup, startupDisposal])
+  expect(startingHost.snapshot().status).toBe("disposed")
+  expect(startupWorkers.processes[0]).toMatchObject({ disposed: true, terminated: ["SIGTERM"] })
+
+  const replacementWorkers = new TestWorkerSpawner()
+  const replacingHost = await ExtensionHost.create(planOne, replacementWorkers.spawn, testTimeouts)
+  await replacingHost.sessionStart("startup")
+  replacementWorkers.behaviors.push({ type: "pending" })
+  const replacement = replacingHost.reload(planTwo)
+  await Promise.resolve()
+  expect(replacingHost.reload(planTwo)).rejects.toThrow("cannot reload while replacing")
+  const replacementDisposal = replacingHost.dispose()
+  await Promise.all([replacement, replacementDisposal])
+
+  expect(replacingHost.snapshot().status).toBe("disposed")
+  expect(replacementWorkers.processes.every(process => process.disposed)).toBe(true)
+  expect(replacementWorkers.processes[0]!.messages.map(message => message.type)).toContain("session_shutdown")
+})
+
+test("current crashes fail closed, retain bounded diagnostics, and remain disposable", async () => {
+  const workers = new TestWorkerSpawner()
+  const host = await ExtensionHost.create(planOne, workers.spawn, testTimeouts)
+  const worker = workers.processes[0]!
+  await host.sessionStart("startup")
+
+  for (let index = 0; index < maxExtensionDiagnostics + 10; index++) {
+    worker.send({
+      type: "diagnostic",
+      generation: 1,
+      diagnostic: { phase: "lifecycle", severity: "warning", message: `diagnostic ${index}` }
+    })
+  }
+  worker.crash(new Error("worker crash"))
+  await Promise.resolve()
+
+  const snapshot = host.snapshot()
+  expect(snapshot).toMatchObject({
+    status: "failed",
+    failure: { phase: "protocol", severity: "error" },
+    omittedDiagnostics: 11
+  })
+  expect(snapshot.diagnostics).toHaveLength(maxExtensionDiagnostics)
+  await host.dispose()
+  expect(worker.disposed).toBe(true)
+})
+
+class TestWorkerSpawner {
+  readonly behaviors: TestWorkerBehavior[] = []
+  readonly processes: TestWorkerProcess[] = []
+  readonly spawn: SpawnExtensionWorker = plan => {
+    const behavior = this.behaviors.shift() ?? { type: "ready" }
+    if (behavior.type === "spawn_error") throw new Error(behavior.message)
+    const process = new TestWorkerProcess(plan, behavior)
+    this.processes.push(process)
+    return process
+  }
+}
+
+type TestWorkerBehavior =
+  | { readonly type: "ready" }
+  | { readonly type: "wrong_ready" }
+  | { readonly type: "spawn_error"; readonly message: string }
+  | { readonly type: "fatal"; readonly message: string }
+  | { readonly type: "pending" }
+  | { readonly type: "resist_terminate" }
+
+class TestWorkerProcess implements ExtensionWorkerProcess {
+  readonly stdout = new PassThrough()
+  readonly stderr = new PassThrough()
+  readonly protocol = new PassThrough()
+  readonly input: Writable
+  readonly exited: Promise<ExtensionWorkerExit>
+  readonly messages: HostMessage[] = []
+  readonly terminated: Array<"SIGTERM" | "SIGKILL"> = []
+  disposed = false
+  readonly #plan: ExtensionLoadPlan
+  readonly #behavior: TestWorkerBehavior
+  readonly #decoder = new ExtensionProtocolDecoder(validateHostMessage)
+  readonly #resolveExit: (exit: ExtensionWorkerExit) => void
+  #generation = 0
+  #exited = false
+
+  constructor(plan: ExtensionLoadPlan, behavior: TestWorkerBehavior) {
+    this.#plan = plan
+    this.#behavior = behavior
+    let resolveExit!: (exit: ExtensionWorkerExit) => void
+    this.exited = new Promise(resolveProcessExit => {
+      resolveExit = resolveProcessExit
+    })
+    this.#resolveExit = resolveExit
+    this.input = new Writable({
+      write: (chunk: Buffer, _encoding, callback) => {
+        try {
+          for (const message of this.#decoder.push(chunk)) this.#receive(message)
+          callback()
+        } catch (cause) {
+          callback(cause instanceof Error ? cause : new Error(String(cause)))
+        }
+      }
+    })
+  }
+
+  send(message: WorkerMessage): void {
+    if (!this.#exited) this.protocol.write(encodeExtensionProtocolFrame(message))
+  }
+
+  failStartup(message: string): void {
+    this.send({
+      type: "fatal",
+      generation: this.#generation,
+      diagnostic: { phase: "handshake", severity: "error", message }
+    })
+  }
+
+  crash(error: Error): void {
+    this.#finish({ code: 1, signal: null, error })
+  }
+
+  terminate(force: boolean): void {
+    this.terminated.push(force ? "SIGKILL" : "SIGTERM")
+    if (this.#behavior.type === "resist_terminate" && !force) return
+    this.#finish({ code: null, signal: force ? "SIGKILL" : "SIGTERM" })
+  }
+
+  dispose(): void {
+    this.disposed = true
+  }
+
+  #receive(message: HostMessage): void {
+    this.messages.push(message)
+    if (message.type === "initialize") {
+      this.#generation = message.generation
+      if (this.#behavior.type === "pending") return
+      if (this.#behavior.type === "fatal") {
+        this.send({
+          type: "fatal",
+          generation: message.generation,
+          diagnostic: { phase: "handshake", severity: "error", message: this.#behavior.message }
+        })
+        return
+      }
+      this.send({
+        type: "ready",
+        protocolVersion: extensionProtocolVersion,
+        generation: message.generation,
+        extensions:
+          this.#behavior.type === "wrong_ready" ? [] : this.#plan.sources.map(source => ({ source, status: "loaded" }))
+      })
+      return
+    }
+    if (message.type === "cancel") return
+    if (message.type === "stop" && this.#behavior.type === "resist_terminate") return
+    this.send({ type: "settled", generation: message.generation, requestId: message.requestId })
+    if (message.type === "stop") queueMicrotask(() => this.#finish({ code: 0, signal: null }))
+  }
+
+  #finish(exit: ExtensionWorkerExit): void {
+    if (this.#exited) return
+    this.#exited = true
+    this.protocol.end()
+    this.stdout.end()
+    this.stderr.end()
+    this.#resolveExit(exit)
+  }
+}
+
+function extensionSource(id: string): ExtensionSource {
+  const path = resolve(`extension-host-${id}.ts`)
+  return Object.freeze({ id, declaredPath: path, entryPath: path, scope: "temporary", origin: "cli" })
+}
+
+function extensionPlan(name: string, sources: readonly ExtensionSource[]): ExtensionLoadPlan {
+  return Object.freeze({ cwd: resolve(`extension-host-${name}`), sources: Object.freeze([...sources]) })
+}

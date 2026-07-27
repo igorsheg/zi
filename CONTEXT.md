@@ -116,6 +116,10 @@ _Avoid_: Loaded extension, plugin instance
 The immutable ordered extension sources admitted for one exact session cwd after project trust. Explicit sources precede trusted project sources, which precede global sources.
 _Avoid_: Extension registry, worker generation
 
+**Extension host**:
+The coding-agent owner that supervises extension generations, correlated protocol requests, diagnostics, bounded logs, atomic replacement, and final process teardown. Clients receive domain data and operations, never worker handles.
+_Avoid_: Plugin registry, process manager, extension store
+
 **Extension worker**:
 The supervised child process that loads trusted extension modules, owns their JavaScript state, runs factories and handlers, and exchanges bounded protocol messages with Zi. It contains faults but is not a security sandbox.
 _Avoid_: Plugin sandbox, extension thread, credential boundary
