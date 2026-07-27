@@ -171,7 +171,11 @@ async function runInteractive(
   if (!terminalOutput.includes(acceptanceResult)) {
     throw new Error(`Compiled interactive mode omitted ${JSON.stringify(acceptanceResult)}`)
   }
-  if (!terminalOutput.includes("\u001b[?1049h") || !terminalOutput.includes("\u001b[?1049l")) {
+  if (process.platform === "win32") {
+    if (!terminalOutput.includes("\u001b[?25l") || !terminalOutput.includes("\u001b[?25h")) {
+      throw new Error("Compiled interactive mode did not restore the Windows terminal cursor")
+    }
+  } else if (!terminalOutput.includes("\u001b[?1049h") || !terminalOutput.includes("\u001b[?1049l")) {
     throw new Error("Compiled interactive mode did not enter and restore the alternate terminal screen")
   }
 }
@@ -225,7 +229,7 @@ async function runWindowsInteractive(
   const winpty = findWinpty()
   if (!winpty) throw new Error("Compiled Windows interactive acceptance requires Git for Windows winpty.exe")
 
-  const child = Bun.spawn([winpty, "-Xallow-non-tty", "--", executable, ...args], {
+  const child = Bun.spawn([winpty, "-Xallow-non-tty", "--width", "100", "--height", "30", "--", executable, ...args], {
     cwd,
     env,
     stdin: "pipe",
