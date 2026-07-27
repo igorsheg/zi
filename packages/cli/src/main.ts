@@ -27,7 +27,8 @@ export async function runEntrypoint(argv: readonly string[] = defaultCliArgv()):
 }
 
 export function defaultCliArgv(argv: readonly string[] = process.argv): readonly string[] {
-  // Bun standalone argv includes a virtual $bunfs script on Unix; Windows builds may expose only executable argv.
+  // Bun standalone argv includes a virtual script path whose Windows spelling has changed across releases.
+  if (argv.at(-1) === extensionWorkerArgument) return [extensionWorkerArgument]
   const second = argv[1]
   if (!second) return []
   if (second.startsWith("-")) return argv.slice(1)

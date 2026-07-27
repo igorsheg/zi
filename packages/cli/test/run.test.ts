@@ -4,6 +4,7 @@ import { tmpdir } from "node:os"
 import { join, resolve as resolvePath } from "node:path"
 
 import type { AgentMessage, AgentRuntime, AgentSessionRuntime, CreateAgentRuntimeOptions } from "@with-zi/coding-agent"
+import { extensionWorkerArgument } from "@with-zi/coding-agent/internal/extension-worker"
 import {
   createModels,
   createTestAgentRuntime,
@@ -129,6 +130,9 @@ test("CLI argument defaults handle Bun scripts and compiled executables", () => 
   expect(defaultCliArgv(["bun", "/$bunfs/root/standalone", "-V"])).toEqual(["-V"])
   expect(defaultCliArgv(["bun", "-V"])).toEqual(["-V"])
   expect(defaultCliArgv(["C:\\tools\\zi.exe", "-V"])).toEqual(["-V"])
+  expect(defaultCliArgv(["C:\\tools\\zi.exe", "B:\\~BUN\\root\\standalone", extensionWorkerArgument])).toEqual([
+    extensionWorkerArgument
+  ])
   expect(currentZiCommand([process.execPath, "/work/packages/cli/src/main.ts"])).toEqual([
     process.execPath,
     resolvePath("/work/packages/cli/src/main.ts")
