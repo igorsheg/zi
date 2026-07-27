@@ -1,4 +1,4 @@
-import { realpathSync } from "node:fs"
+import { existsSync, realpathSync } from "node:fs"
 import { copyFile, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
@@ -226,7 +226,10 @@ async function runWindowsInteractive(
   cwd: string,
   env: Readonly<Record<string, string | undefined>>
 ): Promise<ProcessOutput> {
-  const child = Bun.spawn([executable, ...args], {
+  const winpty = findWinpty()
+  if (!winpty) throw new Error("Compiled Windows interactive acceptance requires Git for Windows winpty.exe")
+
+  const child = Bun.spawn([winpty, "-Xallow-non-tty", "--", executable, ...args], {
     cwd,
     env,
     stdin: "pipe",
@@ -237,7 +240,13 @@ async function runWindowsInteractive(
   let exitTimer: ReturnType<typeof setTimeout> | undefined
   let fallbackTimer: ReturnType<typeof setTimeout> | undefined
   let exitRequested = false
+  let wrapperStoppedAfterRestore = false
   const requestExit = (text: string): void => {
+    if (exitRequested && !wrapperStoppedAfterRestore && text.includes("\u001b[?25h")) {
+      wrapperStoppedAfterRestore = true
+      child.kill("SIGTERM")
+      return
+    }
     if (exitRequested || !text.includes(acceptanceResult)) return
     exitRequested = true
     exitTimer = setTimeout(() => {
@@ -250,6 +259,9 @@ async function runWindowsInteractive(
 
   try {
     const [exitCode, capturedStdout, capturedStderr] = await settleProcess(child, stdout, stderr)
+    if (wrapperStoppedAfterRestore && capturedStderr === "") {
+      return { exitCode: 0, stdout: capturedStdout, stderr: "" }
+    }
     return { exitCode, stdout: capturedStdout, stderr: capturedStderr }
   } finally {
     if (exitTimer) clearTimeout(exitTimer)
@@ -520,6 +532,17 @@ function terminalResponse(id: string): Record<string, unknown> {
 function initializeRepository(cwd: string): void {
   const git = Bun.spawnSync(["git", "init", "--quiet"], { cwd })
   if (git.exitCode !== 0) throw new Error(`Could not initialize acceptance repository: ${git.stderr.toString()}`)
+}
+
+function findWinpty(): string | undefined {
+  const discovered = Bun.which("winpty.exe") ?? Bun.which("winpty")
+  if (discovered) return discovered
+  for (const root of [process.env.ProgramFiles, process.env["ProgramFiles(x86)"], process.env.ProgramW6432]) {
+    if (!root) continue
+    const candidate = join(root, "Git", "usr", "bin", "winpty.exe")
+    if (existsSync(candidate)) return candidate
+  }
+  return undefined
 }
 
 function sendInteractiveInput(stdin: Bun.FileSink, data: string): void {
