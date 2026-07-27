@@ -7,6 +7,7 @@ import { join } from "node:path"
 import {
   buildNpmPackages,
   npmCliPackageName,
+  npmExtensionApiPackageName,
   npmPlatform,
   npmPlatformPackageName,
   parseNpmPackageBuildOptions
@@ -15,6 +16,7 @@ import { releaseArchiveName } from "./build-release.js"
 
 test("npm package options use the owned @with-zi scope and bounded release inputs", () => {
   expect(npmCliPackageName).toBe("@with-zi/zi")
+  expect(npmExtensionApiPackageName).toBe("@with-zi/extension-api")
   expect(npmPlatformPackageName("linux-x64")).toBe("@with-zi/zi-linux-x64")
   expect(npmPlatform("windows-x64")).toEqual({ os: "win32", cpu: "x64", executable: "zi.exe" })
   expect(
@@ -52,8 +54,10 @@ test("npm package assembly wraps release archives without install-time downloads
     })
 
     const platform = result.packages.find(candidate => candidate.packageName === "@with-zi/zi-linux-x64")
+    const extensionApi = result.packages.find(candidate => candidate.packageName === "@with-zi/extension-api")
     const cli = result.packages.find(candidate => candidate.packageName === "@with-zi/zi")
     expect(platform).toBeDefined()
+    expect(extensionApi).toBeDefined()
     expect(cli).toBeDefined()
     expect(existsSync(join(platform!.directory, "bin", "zi"))).toBe(true)
     expect(JSON.parse(await readFile(join(platform!.directory, "package.json"), "utf8"))).toMatchObject({
@@ -62,6 +66,14 @@ test("npm package assembly wraps release archives without install-time downloads
       os: ["linux"],
       cpu: ["x64"]
     })
+    expect(JSON.parse(await readFile(join(extensionApi!.directory, "package.json"), "utf8"))).toMatchObject({
+      name: "@with-zi/extension-api",
+      version,
+      exports: { ".": { types: "./index.d.ts", import: "./index.js" } },
+      dependencies: { typebox: "1.1.38" }
+    })
+    expect(existsSync(join(extensionApi!.directory, "index.js"))).toBe(true)
+    expect(existsSync(join(extensionApi!.directory, "index.d.ts"))).toBe(true)
     expect(JSON.parse(await readFile(join(cli!.directory, "package.json"), "utf8"))).toMatchObject({
       name: "@with-zi/zi",
       version,

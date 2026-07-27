@@ -42,18 +42,18 @@ The current product milestone is the [`custom-tool extension golden path`](exten
 
 ### 5. Complete the custom-tool path
 
-- [ ] Add the narrow public tool-registration contract.
-- [ ] Admit custom tool definitions into the authoritative `AgentSession` tool catalog.
-- [ ] Execute invocations through bounded correlated IPC with cancellation.
-- [ ] Present unknown/custom tools through the existing generic tool presentation.
-- [ ] Prove worker crash, hang, malformed result, stale completion, and shutdown behavior.
+- [x] Add the narrow public tool-registration contract.
+- [x] Admit custom tool definitions into the authoritative `AgentSession` tool catalog.
+- [x] Execute invocations through bounded correlated IPC with cancellation.
+- [x] Present unknown/custom tools through the existing generic tool presentation.
+- [x] Prove worker crash, hang, malformed result, stale completion, and shutdown behavior.
 - [ ] Pass the golden path in interactive, text, and JSON modes.
 
 ### 6. Make the path copyable
 
 - [ ] Publish `@with-zi/extension-api`; keep private coding-agent modules private.
-- [ ] Ship `examples/extensions/custom-tool/` with an executable acceptance test.
-- [ ] Add extension author documentation and source-attributed diagnostics.
+- [x] Ship `examples/extensions/custom-tool/` with an executable acceptance test.
+- [x] Add extension author documentation and source-attributed diagnostics.
 - [ ] Run the example against compiled release artifacts on every release platform.
 
 ## Next — drive Zi as a process

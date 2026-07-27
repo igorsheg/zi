@@ -5,13 +5,17 @@ import type {
   ExtensionAPI,
   ExtensionLifecycleEvent,
   ExtensionShutdownEvent,
-  ExtensionStartEvent
+  ExtensionStartEvent,
+  ExtensionToolContext
 } from "@with-zi/extension-api"
+import { Type } from "typebox"
+import { Compile, type Validator } from "typebox/compile"
 
 import type { ExtensionLoadPlan, ExtensionSource } from "./discovery.js"
 import {
   boundedExtensionDiagnostic,
   boundedExtensionLoadDiagnostic,
+  boundedExtensionToolError,
   extensionLifecycleTimeoutMs,
   ExtensionProtocolDecoder,
   ExtensionProtocolError,
@@ -19,9 +23,16 @@ import {
   extensionProtocolVersion,
   extensionStartupTimeoutMs,
   maxExtensionDiagnostics,
+  maxExtensionPendingRequests,
+  maxExtensionTools,
   type ExtensionDiagnostic,
   type ExtensionLoadResult,
+  type ExtensionToolRegistration,
   type HostMessage,
+  type JsonValue,
+  validateExtensionToolArguments,
+  validateExtensionToolRegistration,
+  validateExtensionToolResult,
   validateHostMessage
 } from "./protocol.js"
 
@@ -55,6 +66,21 @@ interface ShutdownHandler {
   readonly handler: (event: ExtensionShutdownEvent) => void | Promise<void>
 }
 
+interface RegisteredTool {
+  readonly registration: ExtensionToolRegistration
+  readonly checker: Validator
+  readonly execute: (
+    parameters: Readonly<Record<string, JsonValue>>,
+    context: ExtensionToolContext
+  ) => string | Promise<string>
+}
+
+interface WorkerToolInvocation {
+  readonly requestId: number
+  readonly generation: number
+  readonly controller: AbortController
+}
+
 export interface ExtensionLifecycleResult {
   readonly diagnostics: readonly ExtensionDiagnostic[]
   readonly omittedDiagnostics: number
@@ -71,18 +97,38 @@ type LifecycleState =
 
 export class LoadedExtensionGeneration {
   readonly results: readonly ExtensionLoadResult[]
+  readonly tools: readonly ExtensionToolRegistration[]
   readonly #startHandlers: readonly StartHandler[]
   readonly #shutdownHandlers: readonly ShutdownHandler[]
+  readonly #toolsByName: ReadonlyMap<string, RegisteredTool>
   #state: LifecycleState = { type: "loaded" }
 
   constructor(
     results: readonly ExtensionLoadResult[],
     startHandlers: readonly StartHandler[],
-    shutdownHandlers: readonly ShutdownHandler[]
+    shutdownHandlers: readonly ShutdownHandler[],
+    tools: readonly RegisteredTool[]
   ) {
     this.results = Object.freeze([...results])
+    this.tools = Object.freeze(tools.map(tool => tool.registration))
     this.#startHandlers = Object.freeze([...startHandlers])
     this.#shutdownHandlers = Object.freeze([...shutdownHandlers])
+    this.#toolsByName = new Map(tools.map(tool => [tool.registration.name, tool]))
+  }
+
+  invoke(name: string, parameters: Readonly<Record<string, JsonValue>>, signal: AbortSignal): Promise<string> {
+    if (this.#state.type !== "started") {
+      return Promise.reject(new Error(`Cannot invoke extension tools while lifecycle is ${this.#state.type}`))
+    }
+    const tool = this.#toolsByName.get(name)
+    if (!tool) return Promise.reject(new Error(`Unknown extension tool: ${name}`))
+    if (!tool.checker.Check(parameters)) {
+      return Promise.reject(new Error(`Invalid arguments for extension tool ${name}`))
+    }
+    const context = Object.freeze({ signal })
+    return Promise.resolve()
+      .then(() => tool.execute(parameters, context))
+      .then(validateExtensionToolResult)
   }
 
   dispatch(event: ExtensionLifecycleEvent, timeoutMs = extensionLifecycleTimeoutMs): Promise<ExtensionLifecycleResult> {
@@ -155,6 +201,7 @@ export class LoadedExtensionGeneration {
 class ExtensionWorkerProcess {
   readonly #writer: ExtensionProtocolWriter
   readonly #terminal = deferred()
+  readonly #toolInvocations = new Map<number, WorkerToolInvocation>()
   #state: WorkerProcessState = { type: "awaiting_initialize" }
 
   constructor(output: Writable) {
@@ -182,12 +229,17 @@ class ExtensionWorkerProcess {
       this.#protocolFailure("Extension worker received a request before initialization")
       return
     }
-    if (message.type === "cancel" && state.type === "dispatching") {
-      if (message.generation !== state.generation || message.requestId !== state.requestId) {
-        this.#protocolFailure("Extension worker received cancellation for a stale request")
+    if (message.type === "cancel") {
+      if (state.type === "dispatching") {
+        if (message.generation !== state.generation || message.requestId !== state.requestId) {
+          this.#protocolFailure("Extension worker received cancellation for a stale request")
+          return
+        }
+        this.#state = { ...state, type: "cancelling" }
         return
       }
-      this.#state = { ...state, type: "cancelling" }
+      if (state.type === "ready" && this.#cancelToolInvocation(message)) return
+      this.#protocolFailure("Extension worker received cancellation for a stale request")
       return
     }
     if (state.type !== "ready") {
@@ -199,7 +251,29 @@ class ExtensionWorkerProcess {
       return
     }
 
+    if (message.type === "tool_invoke") {
+      if (this.#toolInvocations.size >= maxExtensionPendingRequests) {
+        this.#protocolFailure(`Extension worker cannot run more than ${maxExtensionPendingRequests} tool invocations`)
+        return
+      }
+      if (this.#toolInvocations.has(message.requestId)) {
+        this.#protocolFailure("Extension worker received a duplicate tool request")
+        return
+      }
+      const invocation: WorkerToolInvocation = {
+        requestId: message.requestId,
+        generation: message.generation,
+        controller: new AbortController()
+      }
+      this.#toolInvocations.set(message.requestId, invocation)
+      void this.#invokeTool(state.extensions, message, invocation)
+      return
+    }
     if (message.type === "session_start" || message.type === "session_shutdown") {
+      if (message.type === "session_shutdown" && this.#toolInvocations.size > 0) {
+        this.#protocolFailure("Extension worker cannot shut down with active tool invocations")
+        return
+      }
       const operation = deferred()
       this.#state = {
         type: "dispatching",
@@ -212,6 +286,10 @@ class ExtensionWorkerProcess {
       return
     }
     if (message.type === "stop") {
+      if (this.#toolInvocations.size > 0) {
+        this.#protocolFailure("Extension worker cannot stop with active tool invocations")
+        return
+      }
       const operation = deferred()
       this.#state = {
         type: "stopping",
@@ -259,12 +337,62 @@ class ExtensionWorkerProcess {
         type: "ready",
         protocolVersion: extensionProtocolVersion,
         generation: message.generation,
-        extensions: extensions.results
+        extensions: extensions.results,
+        tools: extensions.tools
       })
     } catch (cause) {
       this.#fatal(message.generation, fatalDiagnostic("handshake", cause), cause)
     } finally {
       operation.resolve()
+    }
+  }
+
+  #cancelToolInvocation(message: Extract<HostMessage, { type: "cancel" }>): boolean {
+    const invocation = this.#toolInvocations.get(message.requestId)
+    if (!invocation || invocation.generation !== message.generation) return false
+    this.#toolInvocations.delete(message.requestId)
+    invocation.controller.abort()
+    void this.#writer
+      .send({ type: "tool_cancelled", generation: message.generation, requestId: message.requestId })
+      .catch(cause => this.#fail(cause))
+    return true
+  }
+
+  async #invokeTool(
+    extensions: LoadedExtensionGeneration,
+    message: Extract<HostMessage, { type: "tool_invoke" }>,
+    invocation: WorkerToolInvocation
+  ): Promise<void> {
+    let outcome:
+      | { readonly type: "result"; readonly content: string }
+      | { readonly type: "error"; readonly message: string }
+    try {
+      const parameters = validateExtensionToolArguments(message.arguments)
+      const content = await extensions.invoke(message.name, parameters, invocation.controller.signal)
+      outcome = { type: "result", content }
+    } catch (cause) {
+      outcome = { type: "error", message: boundedExtensionToolError(cause) }
+    }
+    if (this.#toolInvocations.get(message.requestId) !== invocation) return
+    this.#toolInvocations.delete(message.requestId)
+    const response =
+      outcome.type === "result"
+        ? {
+            type: "tool_result" as const,
+            generation: message.generation,
+            requestId: message.requestId,
+            content: outcome.content
+          }
+        : {
+            type: "tool_error" as const,
+            generation: message.generation,
+            requestId: message.requestId,
+            message: outcome.message
+          }
+    try {
+      await this.#writer.send(response)
+    } catch (cause) {
+      this.#fail(cause)
     }
   }
 
@@ -344,6 +472,7 @@ class ExtensionWorkerProcess {
   #fatal(generation: number, diagnostic: ExtensionDiagnostic, cause: unknown): void {
     if (this.#state.type === "failed" || this.#state.type === "stopped") return
     const error = cause instanceof Error ? cause : new Error(String(cause))
+    this.#abortToolInvocations()
     this.#state = { type: "failed", error }
     void this.#writer.send({ type: "fatal", generation, diagnostic }).then(
       () => this.#terminal.reject(error),
@@ -351,9 +480,15 @@ class ExtensionWorkerProcess {
     )
   }
 
+  #abortToolInvocations(): void {
+    for (const invocation of this.#toolInvocations.values()) invocation.controller.abort()
+    this.#toolInvocations.clear()
+  }
+
   #fail(cause: unknown): void {
     if (this.#state.type === "failed" || this.#state.type === "stopped") return
     const error = cause instanceof Error ? cause : new Error(String(cause))
+    this.#abortToolInvocations()
     this.#state = { type: "failed", error }
     this.#writer.fail(error)
     this.#terminal.reject(error)
@@ -406,10 +541,14 @@ export async function loadExtensionGeneration(
   const results: ExtensionLoadResult[] = []
   const startHandlers: StartHandler[] = []
   const shutdownHandlers: ShutdownHandler[] = []
+  const tools: RegisteredTool[] = []
+  const toolNames = new Set<string>()
 
   for (const source of plan.sources) {
     const localStart: StartHandler[] = []
     const localShutdown: ShutdownHandler[] = []
+    const localTools: RegisteredTool[] = []
+    const localToolNames = new Set<string>()
     let acceptingRegistrations = true
     const api = Object.freeze({
       on(registeredEvent: unknown, handler: unknown): void {
@@ -438,6 +577,22 @@ export async function loadExtensionGeneration(
           return
         }
         throw new Error(`Unknown extension lifecycle event: ${String(registeredEvent)}`)
+      },
+      registerTool(value: unknown): void {
+        if (!acceptingRegistrations)
+          throw new ExtensionRegistrationError("Extension registration closed after factory settlement")
+        if (tools.length + localTools.length >= maxExtensionTools) {
+          throw new ExtensionRegistrationError(
+            `Extension generations cannot register more than ${maxExtensionTools} tools`
+          )
+        }
+        const registered = registerTool(source, value)
+        const name = registered.registration.name
+        if (toolNames.has(name) || localToolNames.has(name)) {
+          throw new ExtensionRegistrationError(`Duplicate extension tool name: ${name}`)
+        }
+        localToolNames.add(name)
+        localTools.push(registered)
       }
     }) as ExtensionAPI
 
@@ -470,23 +625,72 @@ export async function loadExtensionGeneration(
       acceptingRegistrations = false
       startHandlers.push(...localStart)
       shutdownHandlers.push(...localShutdown)
+      tools.push(...localTools)
+      for (const name of localToolNames) toolNames.add(name)
       results.push(Object.freeze({ source, status: "loaded" }))
     } catch (cause) {
       acceptingRegistrations = false
-      results.push(failedResult(source, "factory", cause))
+      results.push(
+        failedResult(source, cause instanceof ExtensionRegistrationError ? "registration" : "factory", cause)
+      )
     }
   }
 
-  return new LoadedExtensionGeneration(results, startHandlers, shutdownHandlers)
+  return new LoadedExtensionGeneration(results, startHandlers, shutdownHandlers, tools)
 }
 
-function failedResult(source: ExtensionSource, phase: "import" | "factory", cause: unknown): ExtensionLoadResult {
+function registerTool(source: ExtensionSource, value: unknown): RegisteredTool {
+  if (!isRecord(value)) throw new ExtensionRegistrationError("Extension tools must be objects")
+  if (!isCallable(value.execute)) {
+    throw new ExtensionRegistrationError("Extension tools require an execute function")
+  }
+  let registration: ExtensionToolRegistration
+  try {
+    registration = validateExtensionToolRegistration({
+      source,
+      name: value.name,
+      label: value.label ?? value.name,
+      description: value.description,
+      parameters: value.parameters
+    })
+  } catch (cause) {
+    throw new ExtensionRegistrationError(cause instanceof Error ? cause.message : String(cause), { cause })
+  }
+  let checker: Validator
+  try {
+    checker = Compile(Type.Unsafe(registration.parameters))
+  } catch (cause) {
+    throw new ExtensionRegistrationError(cause instanceof Error ? cause.message : "Invalid extension tool schema", {
+      cause
+    })
+  }
+  const execute: (...arguments_: unknown[]) => unknown = value.execute
+  return Object.freeze({
+    registration,
+    checker,
+    execute: (parameters: Readonly<Record<string, JsonValue>>, context: ExtensionToolContext) =>
+      Promise.resolve(execute(parameters, context)).then(validateExtensionToolResult)
+  })
+}
+
+class ExtensionRegistrationError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options)
+    this.name = "ExtensionRegistrationError"
+  }
+}
+
+function failedResult(
+  source: ExtensionSource,
+  phase: "import" | "factory" | "registration",
+  cause: unknown
+): ExtensionLoadResult {
   return Object.freeze({ source, status: "failed", diagnostic: diagnosticFor(source, phase, cause) })
 }
 
 function diagnosticFor(
   source: ExtensionSource,
-  phase: "import" | "factory" | "lifecycle",
+  phase: "import" | "factory" | "registration" | "lifecycle",
   cause: unknown
 ): ExtensionDiagnostic {
   const error = cause instanceof Error ? cause : new Error(String(cause))
@@ -576,7 +780,11 @@ function forbiddenLifecycle(state: LifecycleState, event: ExtensionLifecycleEven
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+}
+
+function isCallable(value: unknown): value is (...arguments_: unknown[]) => unknown {
+  return typeof value === "function"
 }
 
 function assertNever(value: never): never {

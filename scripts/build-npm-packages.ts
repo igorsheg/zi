@@ -16,6 +16,7 @@ import {
 
 export const npmPackageScope = "@with-zi"
 export const npmCliPackageName = `${npmPackageScope}/zi`
+export const npmExtensionApiPackageName = `${npmPackageScope}/extension-api`
 
 export type NpmPackMode = "none" | "dry-run" | "pack"
 
@@ -117,7 +118,11 @@ export async function buildNpmPackages(options: NpmPackageBuildOptions): Promise
       buildPlatformPackage({ root, npmRoot, extractRoot, version: options.version, target })
     )
   )
-  const packages = [...platformPackages, await buildCliPackage({ root, npmRoot, version: options.version })]
+  const packages = [
+    ...platformPackages,
+    await buildExtensionApiPackage({ root, npmRoot, version: options.version }),
+    await buildCliPackage({ root, npmRoot, version: options.version })
+  ]
 
   const packed = await Promise.all(
     packages.map(async built => {
@@ -171,6 +176,65 @@ async function buildPlatformPackage(input: {
     publishConfig: { access: "public" }
   })
   return Object.freeze({ packageName, directory })
+}
+
+async function buildExtensionApiPackage(input: {
+  readonly root: string
+  readonly npmRoot: string
+  readonly version: string
+}): Promise<NpmPackageBuild> {
+  const directory = join(input.npmRoot, packageDirectoryName(npmExtensionApiPackageName))
+  await mkdir(directory, { recursive: true })
+  await copyReleaseMetadata(input.root, directory)
+  await cp(join(input.root, "packages", "extension-api", "README.md"), join(directory, "README.md"))
+
+  const build = await Bun.build({
+    entrypoints: [join(input.root, "packages", "extension-api", "src", "index.ts")],
+    outdir: directory,
+    naming: "index.js",
+    target: "node",
+    format: "esm",
+    external: ["typebox"]
+  })
+  if (!build.success) {
+    throw new Error(`Extension API build failed: ${build.logs.map(log => log.message).join("; ")}`)
+  }
+  await run(
+    [
+      process.execPath,
+      "x",
+      "tsc",
+      "--ignoreConfig",
+      join(input.root, "packages", "extension-api", "src", "index.ts"),
+      "--declaration",
+      "--emitDeclarationOnly",
+      "--outDir",
+      directory,
+      "--module",
+      "NodeNext",
+      "--moduleResolution",
+      "NodeNext",
+      "--target",
+      "ES2022",
+      "--strict",
+      "--skipLibCheck"
+    ],
+    input.root
+  )
+
+  await writeJson(join(directory, "package.json"), {
+    name: npmExtensionApiPackageName,
+    version: input.version,
+    description: "Public TypeScript API for trusted Zi extensions",
+    license: "MIT",
+    type: "module",
+    repository,
+    exports: { ".": { types: "./index.d.ts", import: "./index.js" } },
+    files: ["index.js", "index.d.ts", "README.md", "LICENSE", "THIRD_PARTY_NOTICES.md"],
+    dependencies: { typebox: "1.1.38" },
+    publishConfig: { access: "public" }
+  })
+  return Object.freeze({ packageName: npmExtensionApiPackageName, directory })
 }
 
 async function buildCliPackage(input: {
@@ -260,12 +324,13 @@ async function packPackage(directory: string, npmRoot: string, mode: NpmPackMode
 async function verifyCurrentInstall(result: NpmPackageBuildResult, version: string): Promise<void> {
   const target = currentReleaseTarget()
   const platformTarball = requirePackedTarball(result, npmPlatformPackageName(target))
+  const extensionApiTarball = requirePackedTarball(result, npmExtensionApiPackageName)
   const cliTarball = requirePackedTarball(result, npmCliPackageName)
   const temporary = await mkdtemp(join(tmpdir(), "zi-npm-install-"))
   try {
     await writeJson(join(temporary, "package.json"), { private: true })
-    // The current platform tarball is installed directly; npm still probes optional dependency metadata.
-    // Keep that probe bounded so local packaging does not require the packages to exist in the registry yet.
+    // The current platform tarball is installed directly; npm still resolves the extension API's TypeBox dependency.
+    // Keep registry work bounded while allowing an ordinary dependency fetch on a clean release runner.
     await run(
       [
         "npm",
@@ -274,9 +339,10 @@ async function verifyCurrentInstall(result: NpmPackageBuildResult, version: stri
         "--omit=optional",
         "--no-audit",
         "--no-fund",
-        "--fetch-retries=0",
-        "--fetch-timeout=1000",
+        "--fetch-retries=1",
+        "--fetch-timeout=10000",
         platformTarball,
+        extensionApiTarball,
         cliTarball
       ],
       temporary
@@ -293,6 +359,15 @@ async function verifyCurrentInstall(result: NpmPackageBuildResult, version: stri
         `Packed npm CLI failed its version smoke test (exit ${exitCode}): stdout=${JSON.stringify(stdout)} stderr=${JSON.stringify(stderr)}`
       )
     }
+    await run(
+      [
+        "node",
+        "--input-type=module",
+        "--eval",
+        'import { Schema } from "@with-zi/extension-api"; if (Schema.object({ value: Schema.string() }).type !== "object") process.exit(1)'
+      ],
+      temporary
+    )
   } finally {
     await rm(temporary, { recursive: true, force: true })
   }

@@ -51,6 +51,142 @@ export default function (zi: ExtensionAPI): void {
   }
 }, 10_000)
 
+test("ExtensionHost provides the public runtime API to external TypeScript tools", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-extension-host-tool-"))
+  const extensionPath = join(root, "tool.ts")
+  await writeFile(
+    extensionPath,
+    `import { Schema, type ExtensionAPI } from "@with-zi/extension-api"
+export default function (zi: ExtensionAPI): void {
+  zi.registerTool({
+    name: "echo_message",
+    description: "Echo one message",
+    parameters: Schema.object({
+      message: Schema.string(),
+      amount: Schema.number(),
+      count: Schema.integer(),
+      enabled: Schema.boolean(),
+      tags: Schema.array(Schema.string()),
+      mode: Schema.literal("loud"),
+      note: Schema.optional(Schema.string())
+    }),
+    execute: ({ message, amount, count, enabled, tags, mode, note }) =>
+      [message.toUpperCase(), amount, count, enabled, tags.join(","), mode, note ?? "none"].join(":")
+  })
+}
+`
+  )
+  const source: ExtensionSource = Object.freeze({
+    id: "host-tool-fixture",
+    declaredPath: extensionPath,
+    entryPath: extensionPath,
+    scope: "temporary",
+    origin: "cli"
+  })
+  const plan: ExtensionLoadPlan = Object.freeze({ cwd: root, sources: Object.freeze([source]) })
+  const cli = resolve(import.meta.dirname, "../../cli/src/main.ts")
+  const host = await ExtensionHost.create(plan, createExtensionWorkerSpawner([process.execPath, cli]))
+
+  try {
+    expect(host.toolCatalog()).toMatchObject([{ name: "echo_message", source: { id: source.id } }])
+    await host.sessionStart("startup")
+    expect(
+      await host.invokeTool("echo_message", {
+        message: "external",
+        amount: 1.5,
+        count: 2,
+        enabled: true,
+        tags: ["a", "b"],
+        mode: "loud"
+      })
+    ).toBe("EXTERNAL:1.5:2:true:a,b:loud:none")
+  } finally {
+    await host.dispose()
+    await rm(root, { recursive: true, force: true })
+  }
+}, 10_000)
+
+test("ExtensionHost contains a real worker crash during tool invocation", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-extension-host-tool-crash-"))
+  const extensionPath = join(root, "tool.ts")
+  await writeFile(
+    extensionPath,
+    `import { Schema } from "@with-zi/extension-api"
+export default zi => zi.registerTool({
+  name: "crash_tool",
+  description: "Crash this worker",
+  parameters: Schema.object({}),
+  execute: () => process.exit(17)
+})
+`
+  )
+  const source: ExtensionSource = Object.freeze({
+    id: "host-tool-crash-fixture",
+    declaredPath: extensionPath,
+    entryPath: extensionPath,
+    scope: "temporary",
+    origin: "cli"
+  })
+  const plan: ExtensionLoadPlan = Object.freeze({ cwd: root, sources: Object.freeze([source]) })
+  const cli = resolve(import.meta.dirname, "../../cli/src/main.ts")
+  const host = await ExtensionHost.create(plan, createExtensionWorkerSpawner([process.execPath, cli]))
+
+  try {
+    await host.sessionStart("startup")
+    expect(host.invokeTool("crash_tool", {})).rejects.toThrow("unexpectedly")
+    await Bun.sleep(10)
+    expect(host.snapshot()).toMatchObject({ status: "failed", lifecycle: "started", failure: { phase: "protocol" } })
+  } finally {
+    await host.dispose()
+    await rm(root, { recursive: true, force: true })
+  }
+}, 10_000)
+
+test("ExtensionHost bounds shutdown with an active tool invocation", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-extension-host-tool-shutdown-"))
+  const extensionPath = join(root, "tool.ts")
+  await writeFile(
+    extensionPath,
+    `import { Schema } from "@with-zi/extension-api"
+export default zi => zi.registerTool({
+  name: "pending_tool",
+  description: "Never settle",
+  parameters: Schema.object({}),
+  execute: async () => await new Promise(() => {})
+})
+`
+  )
+  const source: ExtensionSource = Object.freeze({
+    id: "host-tool-shutdown-fixture",
+    declaredPath: extensionPath,
+    entryPath: extensionPath,
+    scope: "temporary",
+    origin: "cli"
+  })
+  const plan: ExtensionLoadPlan = Object.freeze({ cwd: root, sources: Object.freeze([source]) })
+  const cli = resolve(import.meta.dirname, "../../cli/src/main.ts")
+  const timeouts: ExtensionHostTimeouts = {
+    startupMs: 2_000,
+    lifecycleMs: 100,
+    shutdownMs: 300,
+    toolMs: 2_000,
+    toolCancellationMs: 25
+  }
+  const host = await ExtensionHost.create(plan, createExtensionWorkerSpawner([process.execPath, cli]), timeouts)
+
+  try {
+    await host.sessionStart("startup")
+    const invocation = host.invokeTool("pending_tool", {})
+    const disposal = host.dispose()
+    expect(invocation).rejects.toThrow("disposed during tool invocation")
+    await disposal
+    expect(host.snapshot()).toMatchObject({ status: "disposed", lifecycle: "stopped" })
+  } finally {
+    await host.dispose()
+    await rm(root, { recursive: true, force: true })
+  }
+}, 10_000)
+
 test("ExtensionHost contains a real worker crash during startup", async () => {
   const root = await mkdtemp(join(tmpdir(), "zi-extension-host-crash-"))
   const extensionPath = join(root, "crash.ts")
@@ -91,7 +227,13 @@ test("ExtensionHost terminates a real worker blocked by extension JavaScript", a
   })
   const plan: ExtensionLoadPlan = Object.freeze({ cwd: root, sources: Object.freeze([source]) })
   const cli = resolve(import.meta.dirname, "../../cli/src/main.ts")
-  const timeouts: ExtensionHostTimeouts = { startupMs: 2_000, lifecycleMs: 100, shutdownMs: 300 }
+  const timeouts: ExtensionHostTimeouts = {
+    startupMs: 2_000,
+    lifecycleMs: 100,
+    shutdownMs: 300,
+    toolMs: 100,
+    toolCancellationMs: 25
+  }
   const host = await ExtensionHost.create(plan, createExtensionWorkerSpawner([process.execPath, cli]), timeouts)
 
   try {

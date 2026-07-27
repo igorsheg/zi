@@ -6,6 +6,7 @@ import { Authentication } from "./authentication.js"
 import type { FileCredentialStore } from "./credential-store.js"
 import { DEFAULT_THINKING_LEVEL } from "./defaults.js"
 import type { ExtensionHost } from "./extensions/host.js"
+import { admitExtensionTools } from "./extensions/tools.js"
 import { convertToLlm, type AgentMessage } from "./messages.js"
 import type { ModelRegistry } from "./model-registry.js"
 import { findInitialModel, restoreModelFromSession } from "./model-resolver.js"
@@ -96,13 +97,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions): Pr
     DEFAULT_THINKING_LEVEL
   const thinkingLevel = model ? clampThinkingLevel(model, preferredThinking) : "off"
   const bootstrapDiagnostic = createBootstrapDiagnostic(unavailableSessionModel, model)
+  const tools = admitExtensionTools(options.tools, options.extensionHost)
 
   const agent = new Agent({
     initialState: {
-      systemPrompt: buildSystemPrompt(sessionManager.header.cwd, resources, options.tools),
+      systemPrompt: buildSystemPrompt(sessionManager.header.cwd, resources, tools),
       ...(model ? { model } : {}),
       thinkingLevel,
-      tools: [...options.tools],
+      tools: [...tools],
       messages: [...bootstrap.messages]
     },
     convertToLlm,

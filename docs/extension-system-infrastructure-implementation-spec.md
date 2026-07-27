@@ -1,6 +1,6 @@
 # Extension system infrastructure implementation spec
 
-- Status: in progress — lifecycle infrastructure Slices A through E complete
+- Status: in progress — lifecycle infrastructure complete; custom-tool capability implemented
 - Pi behavior reference: `badlogic/pi-mono` at Zi's pinned `0e6909f0` (`v0.80.6`)
 - Current Pi comparison: `fc85bdd88be93b1e9a6b6bcfa41c684282ec79cc`
 - Project-trust comparison: `5bc1c2c0a6f07e00e8c240304182f213ab8d311f`
@@ -13,7 +13,7 @@ Zi will eventually support the full behavioral capability of Pi's extension syst
 
 This specification establishes the extension substrate before any product capability is added. The first accepted implementation can discover, trust-gate, load, identify, reload, and shut down otherwise empty TypeScript extensions through a supervised extension generation.
 
-The initial extension contract contains lifecycle registration only. It does not smuggle tools, commands, providers, UI, or a generic event framework into the infrastructure patch.
+The initial infrastructure contract contained lifecycle registration only. Protocol version 2 adds the first separate capability: bounded model-callable tools. Commands, providers, UI, and a generic event framework remain excluded.
 
 Lifecycle loading is an infrastructure checkpoint, not the product launch boundary. The first usable outcome is the [`custom-tool extension golden path`](extension-custom-tool-golden-path.md), which must work across interactive, text, and JSON modes against the compiled release.
 
@@ -34,15 +34,14 @@ The infrastructure must provide:
 9. whole-generation reload with stale-generation rejection;
 10. source-attributed, bounded diagnostics without aborting ordinary Zi startup;
 11. bounded lifecycle settlement and final process teardown;
-12. an initial public contract containing only `session_start` and `session_shutdown` registration;
+12. a public lifecycle contract plus protocol-v2 tool registration and execution;
 13. structural and compiled acceptance tests covering races, bounds, crashes, hangs, replacement, and cleanup.
 
 ## 3. Non-goals
 
-This slice does not implement:
+The current capability does not implement:
 
-- custom tools;
-- commands, shortcuts, or CLI extension flags;
+- commands, shortcuts, or extension-owned CLI flags;
 - agent, provider, tool, input, compaction, or session-tree interception;
 - custom messages, durable entries, names, or labels;
 - model or provider registration;
@@ -455,24 +454,15 @@ Pi's `jiti/static` integration is the reference implementation to evaluate. The 
 - awaited async factory settlement;
 - official virtual modules available from the standalone distribution.
 
-The first runtime-valued official virtual modules are limited to:
-
-```text
-@with-zi/extension-api
-typebox
-typebox/compile
-typebox/value
-```
-
-They land with custom-tool registration, when the API first exports schema values. The lifecycle-only loader already accepts erased `import type` references to `@with-zi/extension-api` without exposing a runtime module.
+The only runtime-valued official module is `@with-zi/extension-api`. Custom-tool registration adds its narrow `Schema` builders without exposing TypeBox itself as a worker virtual module. Third-party packages, including direct TypeBox usage, resolve from the extension's own package hierarchy.
 
 Zi does not expose `@with-zi/coding-agent`, OpenTUI, `AgentSession`, `SessionManager`, `ModelRegistry`, credentials, or private implementation modules through the extension interface. Extensions remain trusted JavaScript running with the Zi user's operating-system authority: they can read user-accessible files and environment variables, spawn processes, and interfere with worker-local resources or descriptors. The worker boundary contains faults and protects Zi's owner loop from ordinary crashes and hangs; it is not a sandbox or credential-confidentiality boundary.
 
-The factory may register lifecycle handlers during execution. Factory completion sends the worker's `ready` barrier. Later dynamic registrations remain possible in the protocol design but no non-lifecycle registration exists in this slice.
+The factory may register lifecycle handlers and tools during execution. Factory completion closes registration and sends the worker's `ready` barrier. Registrations attempted later are rejected.
 
 Extension factories should not create long-lived resources. The documented lifetime is `session_start` through `session_shutdown`. Zi cannot make arbitrary JavaScript obey this convention, so process replacement and forced teardown remain the final resource boundary.
 
-## 11. Initial extension contract
+## 11. Public extension contract
 
 ```ts
 export type ExtensionStartReason = "startup" | "reload" | "new" | "resume" | "fork"
@@ -483,6 +473,7 @@ export type ExtensionLifecycleEvent =
   | { readonly type: "session_shutdown"; readonly reason: ExtensionShutdownReason }
 
 export interface ExtensionAPI {
+  registerTool<TParameters extends TSchema>(definition: ExtensionToolDefinition<TParameters>): void
   on(
     event: "session_start",
     handler: (event: Extract<ExtensionLifecycleEvent, { type: "session_start" }>) => void | Promise<void>
@@ -493,8 +484,21 @@ export interface ExtensionAPI {
   ): void
 }
 
+export interface ExtensionToolDefinition<TParameters extends TSchema> {
+  readonly name: string
+  readonly label?: string
+  readonly description: string
+  readonly parameters: TParameters
+  readonly execute: (
+    arguments_: Static<TParameters>,
+    context: { readonly signal: AbortSignal }
+  ) => string | Promise<string>
+}
+
 export type ExtensionFactory = (zi: ExtensionAPI) => void | Promise<void>
 ```
+
+`Schema` exports only `string`, `number`, `integer`, `boolean`, `literal`, `optional`, `array`, and `object`. Tool parameters must have an object root. Arguments and one textual result are bounded and validated across the process boundary. Registration is factory-scoped and rolled back per source on failure.
 
 An extension with no contribution is valid:
 
@@ -523,13 +527,13 @@ The frame prefix is a four-byte unsigned big-endian payload length. The decoder 
 
 A dedicated child-to-parent pipe keeps arbitrary `console.log()` and `process.stdout.write()` calls from corrupting protocol framing. The runtime probe must prove extra-pipe behavior on all release platforms.
 
-### 12.2 Initial host messages
+### 12.2 Host messages
 
 ```ts
 type HostMessage =
   | {
       readonly type: "initialize"
-      readonly protocolVersion: 1
+      readonly protocolVersion: 2
       readonly generation: number
       readonly plan: ExtensionLoadPlan
     }
@@ -545,21 +549,32 @@ type HostMessage =
       readonly requestId: number
       readonly reason: ExtensionShutdownReason
     }
-  | { readonly type: "stop"; readonly generation: number; readonly requestId: number }
+  | {
+      readonly type: "tool_invoke"
+      readonly generation: number
+      readonly requestId: number
+      readonly name: string
+      readonly arguments: Readonly<Record<string, JsonValue>>
+    }
   | { readonly type: "cancel"; readonly generation: number; readonly requestId: number }
+  | { readonly type: "stop"; readonly generation: number; readonly requestId: number }
 ```
 
-### 12.3 Initial worker messages
+### 12.3 Worker messages
 
 ```ts
 type WorkerMessage =
   | {
       readonly type: "ready"
-      readonly protocolVersion: 1
+      readonly protocolVersion: 2
       readonly generation: number
       readonly extensions: readonly ExtensionLoadResult[]
+      readonly tools: readonly ExtensionToolRegistration[]
     }
   | { readonly type: "settled"; readonly generation: number; readonly requestId: number }
+  | { readonly type: "tool_result"; readonly generation: number; readonly requestId: number; readonly content: string }
+  | { readonly type: "tool_error"; readonly generation: number; readonly requestId: number; readonly message: string }
+  | { readonly type: "tool_cancelled"; readonly generation: number; readonly requestId: number }
   | { readonly type: "diagnostic"; readonly generation: number; readonly diagnostic: ExtensionDiagnostic }
   | { readonly type: "fatal"; readonly generation: number; readonly diagnostic: ExtensionDiagnostic }
 ```
@@ -600,7 +615,9 @@ interface ExtensionDiagnostic {
     | "resolve"
     | "import"
     | "factory"
+    | "registration"
     | "lifecycle"
+    | "tool"
     | "protocol"
     | "shutdown"
   readonly severity: "warning" | "error"
@@ -636,10 +653,22 @@ const maxExtensionDiagnosticStackBytes = 64 * 1024
 const maxExtensionLoadDiagnosticMessageBytes = 2 * 1024
 const maxExtensionIdBytes = 256
 const maxExtensionLifecycleHandlers = 1024
+const maxExtensionTools = 64
+const maxExtensionToolNameBytes = 64
+const maxExtensionToolLabelBytes = 256
+const maxExtensionToolDescriptionBytes = 4 * 1024
+const maxExtensionToolSchemaBytes = 16 * 1024
+const maxExtensionToolArgumentsBytes = 256 * 1024
+const maxExtensionToolResultBytes = 256 * 1024
+const maxExtensionJsonDepth = 32
+const maxExtensionJsonNodes = 4096
+const maxExtensionJsonKeyBytes = 4 * 1024
 const maxExtensionLogBytesPerStream = 256 * 1024
 const extensionStartupTimeoutMs = 30_000
 const extensionLifecycleTimeoutMs = 10_000
 const extensionShutdownTimeoutMs = 3_000
+const extensionToolTimeoutMs = 30_000
+const extensionToolCancellationTimeoutMs = 1_000
 ```
 
 Only the retained tail of stdout/stderr is kept, with an omitted-byte count. Frame bounds apply before JSON allocation. Source and path bounds apply before process startup.
@@ -685,6 +714,9 @@ Text and JSON modes load the same extension generation. Without a stored or runt
 | Missing or unsupported source    | Source diagnostic; continue                                                          |
 | Import failure                   | Source diagnostic; continue                                                          |
 | Factory rejection                | Source diagnostic; continue                                                          |
+| Invalid or conflicting tool      | Source registration diagnostic; omit that tool and continue                          |
+| Tool rejection                   | Settle that invocation with an error; keep the generation reusable                   |
+| Tool execution/cancel deadline   | Fatal generation failure and forced teardown                                         |
 | Pending async factory timeout    | Source diagnostic when worker remains responsive; otherwise fatal generation failure |
 | Infinite loop or blocked worker  | Kill candidate/current generation after deadline; Zi remains usable                  |
 | Malformed or oversized frame     | Fatal generation protocol failure                                                    |
@@ -697,7 +729,7 @@ Text and JSON modes load the same extension generation. Without a stored or runt
 | Shutdown timeout                 | Force-kill, release resources, report bounded diagnostic                             |
 | Stale generation frame           | Ignore and count structurally; never mutate current state                            |
 
-A failed extension host never aborts an active provider run merely because extension infrastructure disappeared. Later capabilities define how one in-flight extension operation settles when its host fails.
+A failed extension host never aborts an active provider run merely because extension infrastructure disappeared. Active extension-tool invocations reject exactly once, the admitted catalog is removed, and the session remains usable without that generation.
 
 ## 17. Testing strategy
 
@@ -832,9 +864,9 @@ Progress:
 - [x] closed versioned messages, validation, framing, and bounded serialized writers;
 - [x] internal CLI worker mode over stdin and a dedicated descriptor-three pipe;
 - [x] external TypeScript, Node built-ins, local dependencies, and async factory settlement;
-- [x] lifecycle-only registration, deterministic dispatch, diagnostics, deadlines, and transition rejection;
-- [x] type-only `@with-zi/extension-api` workspace contract;
-- [ ] runtime-valued virtual modules, deferred until custom-tool schemas require them.
+- [x] lifecycle registration, deterministic dispatch, diagnostics, deadlines, and transition rejection;
+- [x] protocol-v2 tool registration, schema validation, execution, and cancellation;
+- [x] runtime-valued `@with-zi/extension-api` availability from compiled workers.
 
 Likely files:
 
@@ -850,8 +882,8 @@ Deliver:
 - TypeScript loader;
 - source metadata and per-extension results;
 - async factory barrier;
-- lifecycle-only registration;
-- compiled virtual modules.
+- lifecycle and custom-tool registration;
+- compiled public API module.
 
 ### Slice D — `ExtensionHost`
 
@@ -912,6 +944,13 @@ Deliver:
 
 ### Slice F — packaging and documentation
 
+Progress:
+
+- [x] canonical custom-tool example and author guide;
+- [x] compiled worker acceptance for the example and public API module;
+- [x] release-package assembly for `@with-zi/extension-api`;
+- [ ] compiled interactive, text, and JSON acceptance on every release target.
+
 Likely files:
 
 - `scripts/compile-zi.ts`
@@ -952,14 +991,14 @@ The extension infrastructure is complete when:
 - [x] terminal restoration still precedes bounded extension settlement;
 - [x] final disposal leaves no `ExtensionHost`-owned worker process, listener, pipe, callback, or temporary artifact;
 - [x] text and JSON modes do not load OpenTUI;
-- [x] no tools, commands, providers, UI contributions, generic event bus, or package manager entered this slice;
+- [x] no commands, providers, UI contributions, generic event bus, or package manager entered with custom tools;
 - [x] formatting, linting, typechecking, unit tests, and compiled acceptance pass.
 
 ## 20. Capability sequence after infrastructure
 
 Once this substrate is accepted, capabilities should arrive independently in this order unless user evidence changes the priority:
 
-1. custom tools and bounded tool execution;
+1. custom tools and bounded tool execution — implemented;
 2. project/global extension lifecycle and explicit reload UX;
 3. agent and tool interception events;
 4. commands and durable extension state;

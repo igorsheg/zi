@@ -9,7 +9,9 @@ import {
   createTestAgentRuntime,
   createTestAgentSessionRuntime,
   fauxAssistantMessage,
-  fauxProvider
+  fauxProvider,
+  fauxText,
+  fauxToolCall
 } from "@with-zi/coding-agent/testing"
 
 import { currentZiCommand, defaultCliArgv } from "../src/main.js"
@@ -393,6 +395,76 @@ test("JSON mode emits only parseable JSONL without loading the TUI", async () =>
   expect(output.length).toBeGreaterThan(1)
   expect(output.every(line => line.endsWith("\n") && JSON.parse(line) !== undefined)).toBe(true)
 })
+
+test("custom extension tools preserve text and JSON stdout protocols", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-cli-extension-tool-"))
+  const extensionPath = join(root, "extension.ts")
+  await writeFile(
+    extensionPath,
+    `import { Schema, type ExtensionAPI } from "@with-zi/extension-api"
+export default function (zi: ExtensionAPI): void {
+  zi.registerTool({
+    name: "cli_echo",
+    description: "Echo a CLI value",
+    parameters: Schema.object({ value: Schema.string() }),
+    execute: ({ value }) => "tool:" + value
+  })
+}
+`
+  )
+  const cli = resolvePath(import.meta.dirname, "../src/main.ts")
+
+  try {
+    for (const mode of ["text", "json"] as const) {
+      const models = createModels()
+      const faux = fauxProvider()
+      models.setProvider(faux.provider)
+      faux.setResponses([
+        fauxAssistantMessage(fauxToolCall("cli_echo", { value: mode }, { id: `cli-tool-${mode}` }), {
+          stopReason: "toolUse"
+        }),
+        fauxAssistantMessage(fauxText(`finished:${mode}`))
+      ])
+      const output: string[] = []
+      const errors: string[] = []
+      const host = testHost({
+        cwd: root,
+        output,
+        errors,
+        createRuntime: options =>
+          createTestAgentRuntime({ ...options, extensionWorkerCommand: [process.execPath, cli], models })
+      })
+
+      // Each mode owns and disposes its runtime before the next starts.
+      // oxlint-disable-next-line no-await-in-loop
+      const exitCode = await runCli(
+        [
+          "--mode",
+          mode,
+          "--no-session",
+          "--extension",
+          extensionPath,
+          "--model",
+          `${faux.getModel().provider}/${faux.getModel().id}`,
+          "use the custom tool"
+        ],
+        host
+      )
+
+      expect(exitCode).toBe(0)
+      expect(errors).toEqual([])
+      if (mode === "text") {
+        expect(output).toEqual(["finished:text\n"])
+      } else {
+        expect(output.every(line => JSON.parse(line) !== undefined)).toBe(true)
+        expect(output.join("")).toContain(`"toolName":"cli_echo"`)
+        expect(output.join("")).toContain(`"text":"tool:json"`)
+      }
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+}, 10_000)
 
 test("piped stdin becomes the first prompt before positional messages", async () => {
   const models = createModels()

@@ -1,10 +1,14 @@
 import { expect, test } from "bun:test"
 import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { join, resolve } from "node:path"
+import { pathToFileURL } from "node:url"
 
 import type { ExtensionLoadPlan, ExtensionSource } from "../src/extensions/discovery.js"
+import { maxExtensionTools } from "../src/extensions/protocol.js"
 import { loadExtensionGeneration, maxExtensionLifecycleHandlers } from "../src/extensions/worker.js"
+
+const extensionApi = pathToFileURL(resolve(import.meta.dirname, "../../extension-api/src/index.ts")).href
 
 test("worker loading awaits factories and runs lifecycle handlers in source and registration order", async () => {
   const root = await mkdtemp(join(tmpdir(), "zi-extension-worker-load-"))
@@ -56,6 +60,128 @@ export default function (zi: ExtensionAPI): void {
   expect(generation.dispatch({ type: "session_start", reason: "reload" })).rejects.toThrow(
     "while extension lifecycle is stopped"
   )
+})
+
+test("worker registration exposes typed tools and validates arguments before execution", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-extension-worker-tools-"))
+  const log = join(root, "tool.log")
+  const extension = await writeExtension(
+    root,
+    "tools.ts",
+    `import { appendFileSync } from "node:fs"
+import { Schema } from ${JSON.stringify(extensionApi)}
+export default function (zi): void {
+  zi.registerTool({
+    name: "echo_message",
+    label: "Echo",
+    description: "Echo one message",
+    parameters: Schema.object({ message: Schema.string() }),
+    execute: ({ message }, { signal }) => {
+      appendFileSync(${JSON.stringify(log)}, message + ":" + signal.aborted + "\\n")
+      return message.toUpperCase()
+    }
+  })
+}
+`
+  )
+
+  const generation = await loadExtensionGeneration(extensionPlan(root, [extension]), 1)
+  expect(generation.results.map(result => result.status)).toEqual(["loaded"])
+  expect(generation.tools).toMatchObject([
+    {
+      source: { id: extension.id },
+      name: "echo_message",
+      label: "Echo",
+      description: "Echo one message",
+      parameters: { type: "object", properties: { message: { type: "string" } } }
+    }
+  ])
+  await generation.dispatch({ type: "session_start", reason: "startup" })
+
+  expect(await generation.invoke("echo_message", { message: "hello" }, new AbortController().signal)).toBe("HELLO")
+  expect(generation.invoke("echo_message", { message: 42 }, new AbortController().signal)).rejects.toThrow(
+    "Invalid arguments"
+  )
+  expect(await readFile(log, "utf8")).toBe("hello:false\n")
+})
+
+test("invalid and duplicate tool registrations fail only their source", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-extension-worker-tool-registration-"))
+  const first = await writeExtension(
+    root,
+    "first.ts",
+    `import { Schema } from ${JSON.stringify(extensionApi)}
+export default zi => zi.registerTool({
+  name: "shared_tool",
+  description: "First",
+  parameters: Schema.object({}),
+  execute: () => "first"
+})
+`
+  )
+  const duplicate = await writeExtension(
+    root,
+    "duplicate.ts",
+    `import { Schema } from ${JSON.stringify(extensionApi)}
+export default zi => zi.registerTool({
+  name: "shared_tool",
+  description: "Duplicate",
+  parameters: Schema.object({}),
+  execute: () => "duplicate"
+})
+`
+  )
+  const invalid = await writeExtension(
+    root,
+    "invalid.ts",
+    `import { Schema } from ${JSON.stringify(extensionApi)}
+export default zi => zi.registerTool({
+  name: "Invalid-Tool",
+  description: "Invalid",
+  parameters: Schema.string(),
+  execute: () => "invalid"
+})
+`
+  )
+  const malformedSchema = await writeExtension(
+    root,
+    "malformed-schema.ts",
+    `export default zi => zi.registerTool({
+  name: "malformed_schema",
+  description: "Malformed schema",
+  parameters: { type: "object", properties: { value: { type: "string", pattern: "[" } } },
+  execute: () => "invalid"
+})
+`
+  )
+  const valid = await writeExtension(
+    root,
+    "valid.ts",
+    `import { Schema } from ${JSON.stringify(extensionApi)}
+export default zi => zi.registerTool({
+  name: "valid_tool",
+  description: "Valid",
+  parameters: Schema.object({}),
+  execute: () => "valid"
+})
+`
+  )
+
+  const generation = await loadExtensionGeneration(
+    extensionPlan(root, [first, duplicate, invalid, malformedSchema, valid]),
+    1
+  )
+  expect(generation.results.map(result => [result.status, result.diagnostic?.phase])).toEqual([
+    ["loaded", undefined],
+    ["failed", "registration"],
+    ["failed", "registration"],
+    ["failed", "registration"],
+    ["loaded", undefined]
+  ])
+  expect(generation.results[1]?.diagnostic?.message).toContain("Duplicate extension tool name")
+  expect(generation.results[2]?.diagnostic?.message).toContain("tool names")
+  expect(generation.results[3]?.diagnostic?.message).toContain("Invalid regular expression")
+  expect(generation.tools.map(tool => tool.name)).toEqual(["shared_tool", "valid_tool"])
 })
 
 test("worker loading attributes import, export, and factory failures and discards partial registration", async () => {
@@ -168,6 +294,45 @@ test("worker lifecycle admission rejects concurrent and out-of-order transitions
     "while extension lifecycle is starting"
   )
   expect((await start).fatal?.phase).toBe("lifecycle")
+})
+
+test("failed registrations cannot consume the generation tool bound", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-extension-worker-tool-bound-"))
+  const excessive = await writeExtension(
+    root,
+    "excessive.ts",
+    `import { Schema } from ${JSON.stringify(extensionApi)}
+export default function (zi): void {
+  for (let index = 0; index <= ${maxExtensionTools}; index++) {
+    zi.registerTool({
+      name: "tool_" + index,
+      description: "Bounded tool",
+      parameters: Schema.object({}),
+      execute: () => "done"
+    })
+  }
+}
+`
+  )
+  const valid = await writeExtension(
+    root,
+    "valid.ts",
+    `import { Schema } from ${JSON.stringify(extensionApi)}
+export default zi => zi.registerTool({
+  name: "valid_tool",
+  description: "Valid",
+  parameters: Schema.object({}),
+  execute: () => "done"
+})
+`
+  )
+
+  const generation = await loadExtensionGeneration(extensionPlan(root, [excessive, valid]), 1)
+  expect(generation.results.map(result => [result.status, result.diagnostic?.message])).toEqual([
+    ["failed", `Extension generations cannot register more than ${maxExtensionTools} tools`],
+    ["loaded", undefined]
+  ])
+  expect(generation.tools.map(tool => tool.name)).toEqual(["valid_tool"])
 })
 
 test("failed factories cannot consume the generation lifecycle-handler bound", async () => {

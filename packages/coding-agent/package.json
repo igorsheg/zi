@@ -26,6 +26,7 @@
     "diff": "9.0.0",
     "ignore": "7.0.5",
     "proper-lockfile": "4.1.2",
+    "typebox": "catalog:",
     "yaml": "2.9.0"
   },
   "devDependencies": {

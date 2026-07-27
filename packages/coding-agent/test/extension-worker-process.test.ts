@@ -1,8 +1,9 @@
 import { expect, test } from "bun:test"
 import { mkdtemp, readFile, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { join, resolve } from "node:path"
 import { PassThrough, Writable } from "node:stream"
+import { pathToFileURL } from "node:url"
 
 import type { ExtensionLoadPlan, ExtensionSource } from "../src/extensions/discovery.js"
 import {
@@ -14,6 +15,8 @@ import {
   validateWorkerMessage
 } from "../src/extensions/protocol.js"
 import { runExtensionWorkerProcess } from "../src/extensions/worker.js"
+
+const extensionApi = pathToFileURL(resolve(import.meta.dirname, "../../extension-api/src/index.ts")).href
 
 test("worker process decodes requests without stdout and settles one lifecycle", async () => {
   const root = await mkdtemp(join(tmpdir(), "zi-extension-worker-process-"))
@@ -131,6 +134,99 @@ test("worker process correlates cancellation without treating it as shutdown", a
   expect(await messages.next()).toEqual({ type: "settled", generation: 1, requestId: 3 })
 
   await run
+  messages.dispose()
+  output.destroy()
+})
+
+test("worker process executes, rejects, cancels, and reuses registered tools", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-extension-worker-tool-"))
+  const extension = await fixture(
+    root,
+    "tool.ts",
+    `import { Schema } from ${JSON.stringify(extensionApi)}
+export default function (zi): void {
+  zi.registerTool({
+    name: "echo_message",
+    description: "Echo a message",
+    parameters: Schema.object({ message: Schema.string() }),
+    async execute({ message }, { signal }) {
+      if (message === "throw") throw new Error("tool exploded")
+      if (message === "wait") {
+        await new Promise(resolve => signal.addEventListener("abort", resolve, { once: true }))
+        return "late"
+      }
+      return message.toUpperCase()
+    }
+  })
+}
+`
+  )
+  const input = new PassThrough()
+  const output = new PassThrough()
+  const messages = new WorkerMessageQueue(output)
+  const run = runExtensionWorkerProcess(input, output)
+
+  send(input, initialize(extensionPlan(root, [extension])))
+  expect(await messages.next()).toMatchObject({
+    type: "ready",
+    tools: [{ name: "echo_message", source: { id: extension.id } }]
+  })
+  send(input, { type: "session_start", generation: 1, requestId: 1, reason: "startup" })
+  expect((await messages.next()).type).toBe("settled")
+
+  send(input, {
+    type: "tool_invoke",
+    generation: 1,
+    requestId: 2,
+    name: "echo_message",
+    arguments: { message: "hello" }
+  })
+  expect(await messages.next()).toEqual({ type: "tool_result", generation: 1, requestId: 2, content: "HELLO" })
+  send(input, { type: "tool_invoke", generation: 1, requestId: 3, name: "echo_message", arguments: { message: 42 } })
+  expect(await messages.next()).toMatchObject({
+    type: "tool_error",
+    requestId: 3,
+    message: expect.stringContaining("Invalid arguments")
+  })
+  send(input, {
+    type: "tool_invoke",
+    generation: 1,
+    requestId: 4,
+    name: "echo_message",
+    arguments: { message: "throw" }
+  })
+  expect(await messages.next()).toMatchObject({ type: "tool_error", requestId: 4, message: "tool exploded" })
+  send(input, {
+    type: "tool_invoke",
+    generation: 1,
+    requestId: 5,
+    name: "echo_message",
+    arguments: { message: "wait" }
+  })
+  send(input, { type: "cancel", generation: 1, requestId: 5 })
+  expect(await messages.next()).toEqual({ type: "tool_cancelled", generation: 1, requestId: 5 })
+  send(input, {
+    type: "tool_invoke",
+    generation: 1,
+    requestId: 6,
+    name: "echo_message",
+    arguments: { message: "again" }
+  })
+  expect(await messages.next()).toEqual({ type: "tool_result", generation: 1, requestId: 6, content: "AGAIN" })
+
+  send(input, {
+    type: "tool_invoke",
+    generation: 1,
+    requestId: 7,
+    name: "echo_message",
+    arguments: { message: "wait" }
+  })
+  send(input, { type: "session_shutdown", generation: 1, requestId: 8, reason: "quit" })
+  expect(await messages.next()).toMatchObject({
+    type: "fatal",
+    diagnostic: { phase: "protocol", message: "Extension worker cannot shut down with active tool invocations" }
+  })
+  expect(run).rejects.toThrow("cannot shut down with active tool invocations")
   messages.dispose()
   output.destroy()
 })
@@ -263,7 +359,7 @@ class ControlledWorkerOutput extends Writable {
   next(): Promise<WorkerMessage> {
     const message = this.#messages.shift()
     if (message) return Promise.resolve(message)
-    return new Promise(resolve => this.#waiters.push(resolve))
+    return new Promise(resolveMessage => this.#waiters.push(resolveMessage))
   }
 
   releaseWrite(): void {
@@ -299,7 +395,7 @@ class WorkerMessageQueue {
   next(): Promise<WorkerMessage> {
     const message = this.#messages.shift()
     if (message) return Promise.resolve(message)
-    return new Promise(resolve => this.#waiters.push(resolve))
+    return new Promise(resolveMessage => this.#waiters.push(resolveMessage))
   }
 
   dispose(): void {

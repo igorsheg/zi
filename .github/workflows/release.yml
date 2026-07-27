@@ -162,6 +162,11 @@ jobs:
               --tag latest
           done
 
+          npm publish "dist/npm/with-zi-extension-api-${version}.tgz" \
+            --access public \
+            --provenance \
+            --tag latest
+
           npm publish "dist/npm/with-zi-zi-${version}.tgz" \
             --access public \
             --provenance \

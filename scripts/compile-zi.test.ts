@@ -1,7 +1,8 @@
 import { expect, test } from "bun:test"
 import { spawn } from "node:child_process"
-import { chmod, mkdtemp, rm } from "node:fs/promises"
-import { join, resolve } from "node:path"
+import { chmod, mkdir, mkdtemp, rm } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { delimiter, join, resolve } from "node:path"
 import { pathToFileURL } from "node:url"
 
 import {
@@ -11,6 +12,7 @@ import {
   extensionProtocolVersion,
   validateWorkerMessage
 } from "../packages/coding-agent/src/extensions/protocol.js"
+import { extensionApiModuleSource } from "../packages/coding-agent/src/extensions/public-api-module.js"
 import { extensionWorkerArgument } from "../packages/coding-agent/src/extensions/worker-entry.js"
 import { assertPinnedBunVersion, compileStandalone } from "./compile-zi.js"
 
@@ -21,10 +23,11 @@ test("standalone compilation requires the workspace-pinned Bun runtime", () => {
 })
 
 test("the compiled Zi executable runs the dedicated extension worker protocol", async () => {
-  const temporary = await mkdtemp(join(import.meta.dirname, ".compiled-extension-worker-"))
+  const temporary = await mkdtemp(join(tmpdir(), "zi-compiled-extension-worker-"))
   const executable = join(temporary, process.platform === "win32" ? "zi.exe" : "zi")
   const extension = join(temporary, "extension.ts")
   const lifecycle = join(temporary, "lifecycle.log")
+  const exampleExtension = resolve(import.meta.dirname, "../examples/extensions/custom-tool/index.ts")
   let child: ReturnType<typeof spawn> | undefined
 
   try {
@@ -44,9 +47,25 @@ export default function (zi: ExtensionAPI): void {
     )
     await compileZiInSubprocess(executable)
     if (process.platform !== "win32") await chmod(executable, 0o755)
+    const gitInit = Bun.spawnSync(["git", "init", "--quiet"], { cwd: temporary })
+    if (gitInit.exitCode !== 0) throw new Error(new TextDecoder().decode(gitInit.stderr))
+    const publicNodeModules = join(temporary, "public-api", "node_modules")
+    const publicApi = join(publicNodeModules, "@with-zi", "extension-api")
+    await mkdir(publicApi, { recursive: true })
+    await Bun.write(
+      join(publicApi, "package.json"),
+      JSON.stringify({ name: "@with-zi/extension-api", type: "module", exports: "./index.js" })
+    )
+    await Bun.write(join(publicApi, "index.js"), extensionApiModuleSource)
 
     child = spawn(executable, [extensionWorkerArgument], {
       cwd: temporary,
+      env: {
+        ...process.env,
+        NODE_PATH: process.env.NODE_PATH
+          ? `${publicNodeModules}${delimiter}${process.env.NODE_PATH}`
+          : publicNodeModules
+      },
       stdio: ["pipe", "pipe", "pipe", "pipe"],
       windowsHide: true
     })
@@ -58,6 +77,7 @@ export default function (zi: ExtensionAPI): void {
     const stdout = readNodeStream(child.stdout)
     const stderr = readNodeStream(child.stderr)
     const protocolMessages: WorkerMessage[] = []
+    let compiledToolResult: string | undefined
     const protocol = new Promise<void>((resolveProtocol, rejectProtocol) => {
       let completed = false
       const decoder = new ExtensionProtocolDecoder(validateWorkerMessage)
@@ -68,6 +88,12 @@ export default function (zi: ExtensionAPI): void {
           return
         }
         if (message.type === "ready") {
+          if (!message.tools.some(tool => tool.name === "repository_status")) {
+            rejectProtocol(
+              new Error(`Compiled worker omitted the canonical custom tool: ${JSON.stringify(message.extensions)}`)
+            )
+            return
+          }
           child!.stdin!.write(
             encodeExtensionProtocolFrame({ type: "session_start", generation: 1, requestId: 1, reason: "startup" })
           )
@@ -75,15 +101,28 @@ export default function (zi: ExtensionAPI): void {
         }
         if (message.type === "settled" && message.requestId === 1) {
           child!.stdin!.write(
-            encodeExtensionProtocolFrame({ type: "session_shutdown", generation: 1, requestId: 2, reason: "quit" })
+            encodeExtensionProtocolFrame({
+              type: "tool_invoke",
+              generation: 1,
+              requestId: 2,
+              name: "repository_status",
+              arguments: {}
+            })
           )
           return
         }
-        if (message.type === "settled" && message.requestId === 2) {
-          child!.stdin!.write(encodeExtensionProtocolFrame({ type: "stop", generation: 1, requestId: 3 }))
+        if (message.type === "tool_result" && message.requestId === 2) {
+          compiledToolResult = message.content
+          child!.stdin!.write(
+            encodeExtensionProtocolFrame({ type: "session_shutdown", generation: 1, requestId: 3, reason: "quit" })
+          )
           return
         }
         if (message.type === "settled" && message.requestId === 3) {
+          child!.stdin!.write(encodeExtensionProtocolFrame({ type: "stop", generation: 1, requestId: 4 }))
+          return
+        }
+        if (message.type === "settled" && message.requestId === 4) {
           completed = true
           resolveProtocol()
         }
@@ -115,6 +154,13 @@ export default function (zi: ExtensionAPI): void {
               entryPath: extension,
               scope: "temporary",
               origin: "cli"
+            },
+            {
+              id: "compiled-custom-tool-example",
+              declaredPath: exampleExtension,
+              entryPath: exampleExtension,
+              scope: "temporary",
+              origin: "cli"
             }
           ]
         }
@@ -125,10 +171,35 @@ export default function (zi: ExtensionAPI): void {
     expect(exitCode).toBe(0)
     expect(capturedStdout).toBe("compiled worker stdout\n")
     expect(capturedStderr).toBe("compiled worker stderr\n")
-    expect(protocolMessages.map(message => message.type)).toEqual(["ready", "settled", "settled", "settled"])
+    expect(protocolMessages.map(message => message.type)).toEqual([
+      "ready",
+      "settled",
+      "tool_result",
+      "settled",
+      "settled"
+    ])
+    expect(compiledToolResult).toContain("zi")
     expect(await Bun.file(lifecycle).text()).toBe("start:startup\nstop:quit\n")
 
     await Bun.write(lifecycle, "")
+    await Bun.write(
+      extension,
+      `
+import { appendFileSync } from "node:fs"
+import { Schema, type ExtensionAPI } from "@with-zi/extension-api"
+
+export default function (zi: ExtensionAPI): void {
+  zi.registerTool({
+    name: "compiled_echo",
+    description: "Echo from the compiled extension worker",
+    parameters: Schema.object({ value: Schema.string() }),
+    execute: ({ value }) => "compiled:" + value
+  })
+  zi.on("session_start", event => appendFileSync(${JSON.stringify(lifecycle)}, "start:" + event.reason + "\\n"))
+  zi.on("session_shutdown", event => appendFileSync(${JSON.stringify(lifecycle)}, "stop:" + event.reason + "\\n"))
+}
+`
+    )
     child = spawn(
       executable,
       [

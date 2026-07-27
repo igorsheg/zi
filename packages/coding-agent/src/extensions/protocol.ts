@@ -10,7 +10,7 @@ import {
   type ExtensionSource
 } from "./discovery.js"
 
-export const extensionProtocolVersion = 1
+export const extensionProtocolVersion = 2
 export const maxExtensionProtocolFrameBytes = 4 * 1024 * 1024
 export const maxExtensionPendingRequests = 128
 export const maxExtensionQueuedWriteBytes = 8 * 1024 * 1024
@@ -24,6 +24,18 @@ export const maxExtensionLogBytesPerStream = 256 * 1024
 export const extensionStartupTimeoutMs = 30_000
 export const extensionLifecycleTimeoutMs = 10_000
 export const extensionShutdownTimeoutMs = 3_000
+export const extensionToolTimeoutMs = 30_000
+export const extensionToolCancellationTimeoutMs = 1_000
+export const maxExtensionTools = 64
+export const maxExtensionToolNameBytes = 64
+export const maxExtensionToolLabelBytes = 256
+export const maxExtensionToolDescriptionBytes = 4 * 1024
+export const maxExtensionToolSchemaBytes = 16 * 1024
+export const maxExtensionToolArgumentsBytes = 256 * 1024
+export const maxExtensionToolResultBytes = 256 * 1024
+export const maxExtensionJsonDepth = 32
+export const maxExtensionJsonNodes = 4096
+export const maxExtensionJsonKeyBytes = 4 * 1024
 
 export type { ExtensionShutdownReason, ExtensionStartReason } from "@with-zi/extension-api"
 
@@ -38,7 +50,9 @@ export interface ExtensionDiagnostic {
     | "resolve"
     | "import"
     | "factory"
+    | "registration"
     | "lifecycle"
+    | "tool"
     | "protocol"
     | "shutdown"
   readonly severity: "warning" | "error"
@@ -55,7 +69,7 @@ export interface ExtensionLoadResult {
 export type HostMessage =
   | {
       readonly type: "initialize"
-      readonly protocolVersion: 1
+      readonly protocolVersion: 2
       readonly generation: number
       readonly plan: ExtensionLoadPlan
     }
@@ -71,19 +85,40 @@ export type HostMessage =
       readonly requestId: number
       readonly reason: ExtensionShutdownReason
     }
+  | {
+      readonly type: "tool_invoke"
+      readonly generation: number
+      readonly requestId: number
+      readonly name: string
+      readonly arguments: Readonly<Record<string, JsonValue>>
+    }
   | { readonly type: "stop"; readonly generation: number; readonly requestId: number }
   | { readonly type: "cancel"; readonly generation: number; readonly requestId: number }
 
 export type WorkerMessage =
   | {
       readonly type: "ready"
-      readonly protocolVersion: 1
+      readonly protocolVersion: 2
       readonly generation: number
       readonly extensions: readonly ExtensionLoadResult[]
+      readonly tools: readonly ExtensionToolRegistration[]
     }
   | { readonly type: "settled"; readonly generation: number; readonly requestId: number }
+  | { readonly type: "tool_result"; readonly generation: number; readonly requestId: number; readonly content: string }
+  | { readonly type: "tool_error"; readonly generation: number; readonly requestId: number; readonly message: string }
+  | { readonly type: "tool_cancelled"; readonly generation: number; readonly requestId: number }
   | { readonly type: "diagnostic"; readonly generation: number; readonly diagnostic: ExtensionDiagnostic }
   | { readonly type: "fatal"; readonly generation: number; readonly diagnostic: ExtensionDiagnostic }
+
+export type JsonValue = null | boolean | number | string | readonly JsonValue[] | { readonly [key: string]: JsonValue }
+
+export interface ExtensionToolRegistration {
+  readonly source: ExtensionSource
+  readonly name: string
+  readonly label: string
+  readonly description: string
+  readonly parameters: Readonly<Record<string, JsonValue>>
+}
 
 export class ExtensionProtocolError extends Error {
   constructor(message: string, options?: ErrorOptions) {
@@ -311,6 +346,14 @@ export function validateHostMessage(value: unknown): HostMessage {
         requestId: positiveInteger(message.requestId, "requestId"),
         reason: shutdownReason(message.reason)
       })
+    case "tool_invoke":
+      return Object.freeze({
+        type: "tool_invoke",
+        generation: positiveInteger(message.generation, "generation"),
+        requestId: positiveInteger(message.requestId, "requestId"),
+        name: toolName(message.name),
+        arguments: jsonRecord(message.arguments, "tool arguments", maxExtensionToolArgumentsBytes)
+      })
     case "stop":
     case "cancel":
       return Object.freeze({
@@ -331,18 +374,44 @@ export function validateWorkerMessage(value: unknown): WorkerMessage {
       if (extensions.length > maxExtensionSources) {
         throw new ExtensionProtocolError(`Extension results cannot exceed ${maxExtensionSources}`)
       }
+      const tools = protocolArray(message.tools, "tools")
+      if (tools.length > maxExtensionTools) {
+        throw new ExtensionProtocolError(`Extension tools cannot exceed ${maxExtensionTools}`)
+      }
+      const admittedTools = tools.map(extensionToolRegistration)
+      const names = new Set<string>()
+      for (const tool of admittedTools) {
+        if (names.has(tool.name)) throw new ExtensionProtocolError(`Extension tool names must be unique: ${tool.name}`)
+        names.add(tool.name)
+      }
       return Object.freeze({
         type: "ready",
         protocolVersion: protocolVersion(message.protocolVersion),
         generation: positiveInteger(message.generation, "generation"),
-        extensions: Object.freeze(extensions.map(extensionLoadResult))
+        extensions: Object.freeze(extensions.map(extensionLoadResult)),
+        tools: Object.freeze(admittedTools)
       })
     }
     case "settled":
+    case "tool_cancelled":
       return Object.freeze({
-        type: "settled",
+        type: message.type,
         generation: positiveInteger(message.generation, "generation"),
         requestId: positiveInteger(message.requestId, "requestId")
+      })
+    case "tool_result":
+      return Object.freeze({
+        type: "tool_result",
+        generation: positiveInteger(message.generation, "generation"),
+        requestId: positiveInteger(message.requestId, "requestId"),
+        content: boundedString(message.content, "tool result", maxExtensionToolResultBytes)
+      })
+    case "tool_error":
+      return Object.freeze({
+        type: "tool_error",
+        generation: positiveInteger(message.generation, "generation"),
+        requestId: positiveInteger(message.requestId, "requestId"),
+        message: boundedRequiredText(message.message, "tool error", maxExtensionDiagnosticMessageBytes)
       })
     case "diagnostic":
     case "fatal":
@@ -353,6 +422,27 @@ export function validateWorkerMessage(value: unknown): WorkerMessage {
       })
     default:
       throw new ExtensionProtocolError("Unknown worker protocol message")
+  }
+}
+
+export function validateExtensionToolRegistration(value: unknown): ExtensionToolRegistration {
+  return extensionToolRegistration(value)
+}
+
+export function validateExtensionToolArguments(value: unknown): Readonly<Record<string, JsonValue>> {
+  return jsonRecord(value, "tool arguments", maxExtensionToolArgumentsBytes)
+}
+
+export function validateExtensionToolResult(value: unknown): string {
+  return boundedString(value, "tool result", maxExtensionToolResultBytes)
+}
+
+export function boundedExtensionToolError(cause: unknown): string {
+  try {
+    const error = cause instanceof Error ? cause : new Error(String(cause))
+    return boundedText(error.message || error.name || "Extension tool failed", maxExtensionDiagnosticMessageBytes)
+  } catch {
+    return "Extension tool failed"
   }
 }
 
@@ -445,6 +535,108 @@ function extensionLoadResult(value: unknown): ExtensionLoadResult {
   throw new ExtensionProtocolError("Unknown extension load status")
 }
 
+function extensionToolRegistration(value: unknown): ExtensionToolRegistration {
+  const tool = protocolRecord(value)
+  const name = toolName(tool.name)
+  const label = boundedRequiredText(tool.label, "tool label", maxExtensionToolLabelBytes)
+  const description = boundedRequiredText(tool.description, "tool description", maxExtensionToolDescriptionBytes)
+  const parameters = jsonRecord(tool.parameters, "tool parameters", maxExtensionToolSchemaBytes)
+  if (parameters.type !== "object") {
+    throw new ExtensionProtocolError("Extension tool parameters must be an object schema")
+  }
+  validateToolSchema(parameters, "parameters")
+  return Object.freeze({ source: extensionSource(tool.source), name, label, description, parameters })
+}
+
+function validateToolSchema(value: JsonValue, path: string): void {
+  if (!isProtocolRecord(value)) throw new ExtensionProtocolError(`Extension tool schema ${path} must be an object`)
+  if (Object.hasOwn(value, "const")) return
+  const type = value.type
+  if (type === "string" || type === "number" || type === "integer" || type === "boolean") return
+  if (type === "array") {
+    if (!("items" in value)) throw new ExtensionProtocolError(`Extension tool array schema ${path} requires items`)
+    validateToolSchema(value.items, `${path}.items`)
+    return
+  }
+  if (type === "object") {
+    const properties = value.properties
+    if (!isProtocolRecord(properties)) {
+      throw new ExtensionProtocolError(`Extension tool object schema ${path} requires properties`)
+    }
+    for (const [name, property] of Object.entries(properties)) {
+      validateToolSchema(property, `${path}.properties.${name}`)
+    }
+    if (value.required !== undefined) {
+      if (
+        !Array.isArray(value.required) ||
+        value.required.some(name => typeof name !== "string" || !(name in properties))
+      ) {
+        throw new ExtensionProtocolError(`Extension tool object schema ${path} has invalid required properties`)
+      }
+    }
+    return
+  }
+  throw new ExtensionProtocolError(`Extension tool schema ${path} has an unsupported type`)
+}
+
+function toolName(value: unknown): string {
+  const name = boundedRequiredText(value, "tool name", maxExtensionToolNameBytes)
+  if (!/^[a-z][a-z0-9_]*$/.test(name)) {
+    throw new ExtensionProtocolError("Extension tool names must start with a lowercase letter and use a-z, 0-9, or _")
+  }
+  return name
+}
+
+function jsonRecord(value: unknown, field: string, maxBytes: number): Readonly<Record<string, JsonValue>> {
+  const admitted = jsonValue(value, field, maxBytes)
+  if (!isProtocolRecord(admitted)) throw new ExtensionProtocolError(`Extension protocol ${field} must be an object`)
+  return admitted
+}
+
+function jsonValue(value: unknown, field: string, maxBytes: number): JsonValue {
+  let serialized: string | undefined
+  try {
+    serialized = JSON.stringify(value)
+  } catch (cause) {
+    throw new ExtensionProtocolError(`Extension protocol ${field} must be JSON`, { cause })
+  }
+  if (serialized === undefined || Buffer.byteLength(serialized) > maxBytes) {
+    throw new ExtensionProtocolError(`Extension protocol ${field} cannot exceed ${maxBytes} bytes`)
+  }
+  const state = { nodes: 0 }
+  return copyJsonValue(value, field, 0, state)
+}
+
+function copyJsonValue(value: unknown, field: string, depth: number, state: { nodes: number }): JsonValue {
+  state.nodes++
+  if (state.nodes > maxExtensionJsonNodes) {
+    throw new ExtensionProtocolError(`Extension protocol ${field} cannot exceed ${maxExtensionJsonNodes} JSON nodes`)
+  }
+  if (depth > maxExtensionJsonDepth) {
+    throw new ExtensionProtocolError(`Extension protocol ${field} cannot exceed depth ${maxExtensionJsonDepth}`)
+  }
+  if (value === null || typeof value === "string" || typeof value === "boolean") return value
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) throw new ExtensionProtocolError(`Extension protocol ${field} numbers must be finite`)
+    return value
+  }
+  if (Array.isArray(value)) {
+    return Object.freeze(value.map(item => copyJsonValue(item, field, depth + 1, state)))
+  }
+  if (isProtocolRecord(value)) {
+    const entries = Object.entries(value).map(([key, item]) => {
+      if (Buffer.byteLength(key) > maxExtensionJsonKeyBytes) {
+        throw new ExtensionProtocolError(
+          `Extension protocol ${field} object keys cannot exceed ${maxExtensionJsonKeyBytes} bytes`
+        )
+      }
+      return [key, copyJsonValue(item, field, depth + 1, state)] as const
+    })
+    return Object.freeze(Object.fromEntries(entries))
+  }
+  throw new ExtensionProtocolError(`Extension protocol ${field} contains a non-JSON value`)
+}
+
 function extensionDiagnostic(value: unknown): ExtensionDiagnostic {
   const diagnostic = protocolRecord(value)
   const phase = diagnostic.phase
@@ -456,7 +648,9 @@ function extensionDiagnostic(value: unknown): ExtensionDiagnostic {
     phase !== "resolve" &&
     phase !== "import" &&
     phase !== "factory" &&
+    phase !== "registration" &&
     phase !== "lifecycle" &&
+    phase !== "tool" &&
     phase !== "protocol" &&
     phase !== "shutdown"
   ) {
@@ -496,7 +690,7 @@ function protocolArray(value: unknown, field: string): readonly unknown[] {
   return value
 }
 
-function protocolVersion(value: unknown): 1 {
+function protocolVersion(value: unknown): 2 {
   if (value !== extensionProtocolVersion) throw new ExtensionProtocolError("Unsupported extension protocol version")
   return extensionProtocolVersion
 }
@@ -510,6 +704,13 @@ function positiveInteger(value: unknown, field: string): number {
 
 function pathText(value: unknown, field: string): string {
   return boundedRequiredText(value, field, maxExtensionPathBytes)
+}
+
+function boundedString(value: unknown, field: string, maxBytes: number): string {
+  if (typeof value !== "string" || Buffer.byteLength(value) > maxBytes) {
+    throw new ExtensionProtocolError(`Extension protocol ${field} cannot exceed ${maxBytes} bytes`)
+  }
+  return value
 }
 
 function boundedRequiredText(value: unknown, field: string, maxBytes: number): string {

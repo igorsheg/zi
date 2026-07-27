@@ -13,7 +13,12 @@ export type {
   ExtensionHostStatus,
   ExtensionLogTail
 } from "./extensions/host.js"
-export type { ExtensionDiagnostic, ExtensionLoadResult } from "./extensions/protocol.js"
+export type {
+  ExtensionDiagnostic,
+  ExtensionLoadResult,
+  ExtensionToolRegistration,
+  JsonValue
+} from "./extensions/protocol.js"
 export * from "./extensions/discovery.js"
 export * from "./model-registry.js"
 export * from "./model-resolver.js"

@@ -13,6 +13,11 @@ import {
   maxExtensionIdBytes,
   maxExtensionProtocolFrameBytes,
   maxExtensionQueuedWrites,
+  maxExtensionToolArgumentsBytes,
+  maxExtensionToolDescriptionBytes,
+  maxExtensionToolResultBytes,
+  maxExtensionToolSchemaBytes,
+  maxExtensionTools,
   type HostMessage,
   validateHostMessage,
   validateWorkerMessage
@@ -68,20 +73,30 @@ test("protocol decoding rejects malformed framing, UTF-8, JSON, and closed messa
 })
 
 test("host protocol validation bounds and freezes the complete load plan", () => {
-  const initialize = validateHostMessage({ type: "initialize", protocolVersion: 1, generation: 7, plan })
-  expect(initialize).toEqual({ type: "initialize", protocolVersion: 1, generation: 7, plan })
+  const initialize = validateHostMessage({
+    type: "initialize",
+    protocolVersion: extensionProtocolVersion,
+    generation: 7,
+    plan
+  })
+  expect(initialize).toEqual({ type: "initialize", protocolVersion: extensionProtocolVersion, generation: 7, plan })
   expect(Object.isFrozen(initialize)).toBe(true)
 
-  expect(() => validateHostMessage({ type: "initialize", protocolVersion: 2, generation: 1, plan })).toThrow(
+  expect(() => validateHostMessage({ type: "initialize", protocolVersion: 1, generation: 1, plan })).toThrow(
     "Unsupported"
   )
   expect(() =>
-    validateHostMessage({ type: "initialize", protocolVersion: 1, generation: 1, plan: { ...plan, cwd: "relative" } })
+    validateHostMessage({
+      type: "initialize",
+      protocolVersion: extensionProtocolVersion,
+      generation: 1,
+      plan: { ...plan, cwd: "relative" }
+    })
   ).toThrow("cwd must be absolute")
   expect(() =>
     validateHostMessage({
       type: "initialize",
-      protocolVersion: 1,
+      protocolVersion: extensionProtocolVersion,
       generation: 1,
       plan: { ...plan, sources: [{ ...source, entryPath: "relative" }] }
     })
@@ -89,7 +104,7 @@ test("host protocol validation bounds and freezes the complete load plan", () =>
   expect(() =>
     validateHostMessage({
       type: "initialize",
-      protocolVersion: 1,
+      protocolVersion: extensionProtocolVersion,
       generation: 1,
       plan: { ...plan, sources: [{ ...source, id: "x".repeat(maxExtensionIdBytes + 1) }] }
     })
@@ -111,20 +126,22 @@ test("worker protocol validation keeps source-attributed load and lifecycle resu
   expect(
     validateWorkerMessage({
       type: "ready",
-      protocolVersion: 1,
+      protocolVersion: extensionProtocolVersion,
       generation: 1,
       extensions: [
         { source, status: "loaded" },
         { source: { ...source, id: "failed" }, status: "failed", diagnostic }
-      ]
+      ],
+      tools: []
     })
   ).toMatchObject({ type: "ready", extensions: [{ status: "loaded" }, { status: "failed", diagnostic }] })
   expect(() =>
     validateWorkerMessage({
       type: "ready",
-      protocolVersion: 1,
+      protocolVersion: extensionProtocolVersion,
       generation: 1,
-      extensions: [{ source, status: "failed" }]
+      extensions: [{ source, status: "failed" }],
+      tools: []
     })
   ).toThrow("require a diagnostic")
   expect(() =>
@@ -135,6 +152,78 @@ test("worker protocol validation keeps source-attributed load and lifecycle resu
     })
   ).toThrow(`${maxExtensionDiagnosticMessageBytes} bytes`)
   expect(() => validateWorkerMessage({ type: "settled", generation: 1, requestId: -1 })).toThrow("requestId")
+})
+
+test("tool protocol validation closes registration, arguments, results, and correlation", () => {
+  const registration = {
+    source,
+    name: "echo_message",
+    label: "Echo message",
+    description: "Echo one message",
+    parameters: { type: "object", required: ["message"], properties: { message: { type: "string" } } }
+  }
+  const ready = validateWorkerMessage({
+    type: "ready",
+    protocolVersion: extensionProtocolVersion,
+    generation: 1,
+    extensions: [{ source, status: "loaded" }],
+    tools: [registration]
+  })
+  expect(ready).toMatchObject({ type: "ready", tools: [{ name: "echo_message" }] })
+  expect(Object.isFrozen(ready.type === "ready" ? ready.tools[0]?.parameters.properties : undefined)).toBe(true)
+
+  const invoke = validateHostMessage({
+    type: "tool_invoke",
+    generation: 1,
+    requestId: 2,
+    name: "echo_message",
+    arguments: { message: "hello" }
+  })
+  expect(invoke).toEqual({
+    type: "tool_invoke",
+    generation: 1,
+    requestId: 2,
+    name: "echo_message",
+    arguments: { message: "hello" }
+  })
+  expect(() =>
+    validateHostMessage({ ...invoke, arguments: { value: "x".repeat(maxExtensionToolArgumentsBytes) } })
+  ).toThrow(`${maxExtensionToolArgumentsBytes} bytes`)
+  expect(() =>
+    validateWorkerMessage({
+      type: "ready",
+      protocolVersion: extensionProtocolVersion,
+      generation: 1,
+      extensions: [{ source, status: "loaded" }],
+      tools: [{ ...registration, name: "Invalid-name" }]
+    })
+  ).toThrow("tool names")
+  expect(() =>
+    validateWorkerMessage({
+      type: "ready",
+      protocolVersion: extensionProtocolVersion,
+      generation: 1,
+      extensions: [{ source, status: "loaded" }],
+      tools: [{ ...registration, parameters: { type: "object", properties: { value: { type: "future" } } } }]
+    })
+  ).toThrow("unsupported type")
+  expect(() =>
+    validateWorkerMessage({
+      type: "ready",
+      protocolVersion: extensionProtocolVersion,
+      generation: 1,
+      extensions: [{ source, status: "loaded" }],
+      tools: [registration, registration]
+    })
+  ).toThrow("unique")
+  expect(() =>
+    validateWorkerMessage({
+      type: "tool_result",
+      generation: 1,
+      requestId: 2,
+      content: "x".repeat(maxExtensionToolResultBytes + 1)
+    })
+  ).toThrow(`${maxExtensionToolResultBytes} bytes`)
 })
 
 test("maximum admitted load results fit in one protocol frame", () => {
@@ -155,7 +244,28 @@ test("maximum admitted load results fit in one protocol frame", () => {
     type: "ready",
     protocolVersion: extensionProtocolVersion,
     generation: 1,
-    extensions: Array.from({ length: maxExtensionSources }, () => result)
+    extensions: Array.from({ length: maxExtensionSources }, () => result),
+    tools: []
+  })
+
+  expect(encodeExtensionProtocolFrame(message).byteLength).toBeLessThanOrEqual(maxExtensionProtocolFrameBytes + 4)
+})
+
+test("the maximum admitted tool catalog fits one ready frame", () => {
+  const path = resolve("root", "x".repeat(3_500))
+  const toolSource: ExtensionSource = { ...source, declaredPath: path, entryPath: path }
+  const message = validateWorkerMessage({
+    type: "ready",
+    protocolVersion: extensionProtocolVersion,
+    generation: 1,
+    extensions: [{ source: toolSource, status: "loaded" }],
+    tools: Array.from({ length: maxExtensionTools }, (_, index) => ({
+      source: toolSource,
+      name: `tool_${index}`,
+      label: `Tool ${index}`,
+      description: "d".repeat(maxExtensionToolDescriptionBytes),
+      parameters: { type: "object", description: "s".repeat(maxExtensionToolSchemaBytes - 64), properties: {} }
+    }))
   })
 
   expect(encodeExtensionProtocolFrame(message).byteLength).toBeLessThanOrEqual(maxExtensionProtocolFrameBytes + 4)

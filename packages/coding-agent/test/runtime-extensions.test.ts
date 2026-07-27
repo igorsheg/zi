@@ -1,10 +1,12 @@
 import { expect, test } from "bun:test"
+import { existsSync } from "node:fs"
 import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
 
 import { createAgentSessionRuntime } from "../src/agent-session-runtime.js"
 import { createAgentRuntime } from "../src/runtime.js"
+import { createModels, fauxAssistantMessage, fauxProvider, fauxText, fauxToolCall } from "../src/testing.js"
 
 const cli = resolve(import.meta.dirname, "../../cli/src/main.ts")
 const workerCommand = Object.freeze([process.execPath, cli])
@@ -72,6 +74,176 @@ export default function (): void { writeFileSync(${JSON.stringify(loaded)}, "loa
   }
 }, 10_000)
 
+test("a registered extension tool joins a real agent turn and durable history", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-runtime-extension-tool-"))
+  const cwd = join(root, "project")
+  const agentDir = join(root, "agent")
+  const extensionDir = join(agentDir, "extensions", "repository-tool")
+  const dependencyDir = join(extensionDir, "node_modules", "repository-prefix")
+  await mkdir(cwd, { recursive: true })
+  await mkdir(dependencyDir, { recursive: true })
+  await writeFile(
+    join(dependencyDir, "package.json"),
+    JSON.stringify({ name: "repository-prefix", type: "module", exports: "./index.js" })
+  )
+  await writeFile(join(dependencyDir, "index.js"), `export const prefix = "repository"\n`)
+  await writeFile(
+    join(extensionDir, "index.ts"),
+    `import { Schema, type ExtensionAPI } from "@with-zi/extension-api"
+import { prefix } from "repository-prefix"
+export default function (zi: ExtensionAPI): void {
+  zi.registerTool({
+    name: "repository_echo",
+    description: "Echo a repository value",
+    parameters: Schema.object({ value: Schema.string() }),
+    execute: ({ value }) => prefix + ":" + value
+  })
+}
+`
+  )
+  const models = createModels()
+  const faux = fauxProvider()
+  models.setProvider(faux.provider)
+  faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("repository_echo", { value: "accepted" }, { id: "extension-tool-1" }), {
+      stopReason: "toolUse"
+    }),
+    fauxAssistantMessage(fauxText("Extension completed."))
+  ])
+  const runtime = await createAgentRuntime({
+    cwd,
+    agentDir,
+    model: "faux/faux-1",
+    modelFactory: () => models,
+    session: { type: "new", persist: true }
+  })
+
+  try {
+    await runtime.session.prompt("Use the repository echo tool.")
+    const results = runtime.session.messages.filter(message => message.role === "toolResult")
+    expect(results).toHaveLength(1)
+    expect(results[0]).toMatchObject({
+      toolCallId: "extension-tool-1",
+      toolName: "repository_echo",
+      content: [{ type: "text", text: "repository:accepted" }],
+      details: { type: "extension", toolName: "repository_echo", outcome: "success" }
+    })
+    expect(runtime.session.extensionHostSnapshot).toMatchObject({ status: "ready", lifecycle: "started" })
+  } finally {
+    runtime.session.dispose()
+    await runtime.session.waitForIdle()
+    await rm(root, { recursive: true, force: true })
+  }
+}, 10_000)
+
+test("AgentSession rejects extension tools that conflict with built-ins", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-runtime-extension-tool-conflict-"))
+  const cwd = join(root, "project")
+  const agentDir = join(root, "agent")
+  const extensionDir = join(agentDir, "extensions")
+  await mkdir(cwd, { recursive: true })
+  await mkdir(extensionDir, { recursive: true })
+  await writeFile(
+    join(extensionDir, "conflict.ts"),
+    `import { Schema, type ExtensionAPI } from "@with-zi/extension-api"
+export default function (zi: ExtensionAPI): void {
+  zi.registerTool({
+    name: "read",
+    description: "Conflicts with built-in read",
+    parameters: Schema.object({}),
+    execute: () => "must not run"
+  })
+}
+`
+  )
+  const runtime = await createAgentRuntime({ cwd, agentDir, session: { type: "new", persist: false } })
+
+  try {
+    expect(runtime.session.extensionHostSnapshot).toMatchObject({
+      status: "ready",
+      tools: [],
+      diagnostics: [
+        expect.objectContaining({
+          path: expect.any(String),
+          phase: "registration",
+          message: expect.stringContaining("conflicts with an existing session tool")
+        })
+      ]
+    })
+  } finally {
+    runtime.session.dispose()
+    await runtime.session.waitForIdle()
+    await rm(root, { recursive: true, force: true })
+  }
+}, 10_000)
+
+test("interrupting an extension tool keeps its generation reusable", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-runtime-extension-tool-cancel-"))
+  const cwd = join(root, "project")
+  const agentDir = join(root, "agent")
+  const extensionDir = join(agentDir, "extensions")
+  const started = join(root, "started")
+  await mkdir(cwd, { recursive: true })
+  await mkdir(extensionDir, { recursive: true })
+  await writeFile(
+    join(extensionDir, "cancellable.ts"),
+    `import { writeFileSync } from "node:fs"
+import { Schema, type ExtensionAPI } from "@with-zi/extension-api"
+export default function (zi: ExtensionAPI): void {
+  zi.registerTool({
+    name: "cancellable_echo",
+    description: "Wait or echo",
+    parameters: Schema.object({ value: Schema.string() }),
+    async execute({ value }, { signal }) {
+      if (value !== "wait") return value
+      writeFileSync(${JSON.stringify(started)}, "started")
+      await new Promise(resolve => signal.addEventListener("abort", resolve, { once: true }))
+      return "late"
+    }
+  })
+}
+`
+  )
+  const models = createModels()
+  const faux = fauxProvider()
+  models.setProvider(faux.provider)
+  faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("cancellable_echo", { value: "wait" }, { id: "cancel-tool-1" }), {
+      stopReason: "toolUse"
+    })
+  ])
+  const runtime = await createAgentRuntime({
+    cwd,
+    agentDir,
+    model: "faux/faux-1",
+    modelFactory: () => models,
+    session: { type: "new", persist: false }
+  })
+
+  try {
+    const run = runtime.session.prompt("Wait in the extension tool.")
+    await waitForFile(started)
+    await runtime.session.abort()
+    await run
+    expect(runtime.session.extensionHostSnapshot).toMatchObject({ status: "ready", lifecycle: "started" })
+
+    faux.setResponses([
+      fauxAssistantMessage(fauxToolCall("cancellable_echo", { value: "again" }, { id: "cancel-tool-2" }), {
+        stopReason: "toolUse"
+      }),
+      fauxAssistantMessage("Recovered.")
+    ])
+    await runtime.session.prompt("Use the extension again.")
+    expect(
+      runtime.session.messages.find(message => message.role === "toolResult" && message.toolCallId === "cancel-tool-2")
+    ).toMatchObject({ content: [{ type: "text", text: "again" }] })
+  } finally {
+    runtime.session.dispose()
+    await runtime.session.waitForIdle()
+    await rm(root, { recursive: true, force: true })
+  }
+}, 10_000)
+
 test("whole-runtime replacement starts the candidate only after retiring the current lifecycle", async () => {
   const fixture = await extensionFixture("replacement")
   const runtime = await createAgentSessionRuntime({
@@ -82,6 +254,7 @@ test("whole-runtime replacement starts the candidate only after retiring the cur
   })
 
   try {
+    expect(runtime.session.extensionHostSnapshot).toMatchObject({ status: "ready", lifecycle: "started" })
     await runtime.newSession()
     expect(await readFile(fixture.lifecycle, "utf8")).toBe("start:startup\nstop:new\nstart:new\n")
   } finally {
@@ -92,6 +265,15 @@ test("whole-runtime replacement starts the candidate only after retiring the cur
   expect(await readFile(fixture.lifecycle, "utf8")).toBe("start:startup\nstop:new\nstart:new\nstop:quit\n")
   await rm(fixture.root, { recursive: true, force: true })
 }, 10_000)
+
+async function waitForFile(path: string): Promise<void> {
+  for (let attempt = 0; attempt < 1_000; attempt++) {
+    if (existsSync(path)) return
+    // oxlint-disable-next-line no-await-in-loop
+    await Bun.sleep(1)
+  }
+  throw new Error(`File was not created: ${path}`)
+}
 
 async function extensionFixture(
   name: string

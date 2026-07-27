@@ -1,3 +1,5 @@
+import { basename } from "node:path"
+
 import { BoxRenderable, CliRenderEvents, type CliRenderer, type SyntaxStyle } from "@opentui/core"
 import type {
   AgentSession,
@@ -159,6 +161,7 @@ export class InteractiveMode {
 
     this.#releaseGeneration = this.store.$generation.listen(() => this.#replaceScreen())
     this.#showBootstrapWarning(bootstrapDiagnostic)
+    this.#showExtensionWarning(session)
     this.#presentProjectTrust(sessionRuntime?.projectTrust)
   }
 
@@ -172,6 +175,7 @@ export class InteractiveMode {
     }
     this.store.replaceSession(session)
     this.#showBootstrapWarning(diagnostic)
+    this.#showExtensionWarning(session)
     this.#presentProjectTrust(this.#sessionRuntime?.projectTrust)
   }
 
@@ -205,6 +209,17 @@ export class InteractiveMode {
 
   #showBootstrapWarning(diagnostic: SessionBootstrapDiagnostic | undefined): void {
     if (diagnostic) this.#screen.prompt.showWarning(diagnostic.message)
+  }
+
+  #showExtensionWarning(session: AgentSession): void {
+    const snapshot = session.extensionHostSnapshot
+    if (!snapshot) return
+    const diagnostic = snapshot.diagnostics[0] ?? snapshot.failure
+    if (!diagnostic) return
+    const source = diagnostic.path ? `${basename(diagnostic.path)}: ` : ""
+    const omitted = snapshot.omittedDiagnostics + Math.max(0, snapshot.diagnostics.length - 1)
+    const suffix = omitted > 0 ? ` (${omitted} additional diagnostics)` : ""
+    this.#screen.prompt.showWarning(`Extension ${source}${diagnostic.message.replace(/[\r\n]+/g, " ")}${suffix}`)
   }
 
   #presentProjectTrust(trust: ProjectTrustResolution | undefined): void {
