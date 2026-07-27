@@ -15,9 +15,6 @@
     "test": "bun test",
     "typecheck": "tsc --noEmit"
   },
-  "dependencies": {
-    "typebox": "catalog:"
-  },
   "devDependencies": {
     "@types/bun": "catalog:",
     "typescript": "catalog:"

@@ -136,6 +136,65 @@ export default function (zi: ExtensionAPI): void {
   }
 }, 10_000)
 
+test("a failed extension generation is removed from current and future provider catalogs", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-runtime-extension-tool-failure-"))
+  const cwd = join(root, "project")
+  const agentDir = join(root, "agent")
+  const extensionDir = join(agentDir, "extensions")
+  await mkdir(cwd, { recursive: true })
+  await mkdir(extensionDir, { recursive: true })
+  await writeFile(
+    join(extensionDir, "crash.ts"),
+    `import { Schema } from "@with-zi/extension-api"
+export default zi => zi.registerTool({
+  name: "crash_tool",
+  description: "Crash the extension worker",
+  parameters: Schema.object({}),
+  execute: () => process.exit(17)
+})
+`
+  )
+  const faux = fauxProvider()
+  const catalogs: string[][] = []
+  faux.setResponses([
+    context => {
+      catalogs.push((context.tools ?? []).map(tool => tool.name))
+      return fauxAssistantMessage(fauxToolCall("crash_tool", {}, { id: "crash-call" }), { stopReason: "toolUse" })
+    },
+    context => {
+      catalogs.push((context.tools ?? []).map(tool => tool.name))
+      return fauxAssistantMessage("Recovered without extension tools.")
+    },
+    context => {
+      catalogs.push((context.tools ?? []).map(tool => tool.name))
+      return fauxAssistantMessage("Still recovered.")
+    }
+  ])
+  const models = createModels()
+  models.setProvider(faux.provider)
+  const runtime = await createAgentRuntime({
+    cwd,
+    agentDir,
+    model: "faux/faux-1",
+    modelFactory: () => models,
+    session: { type: "new", persist: false },
+    extensionWorkerCommand: workerCommand
+  })
+
+  try {
+    await runtime.session.prompt("Crash the extension tool.")
+    await runtime.session.prompt("Continue without it.")
+    expect(catalogs[0]).toContain("crash_tool")
+    expect(catalogs[1]).not.toContain("crash_tool")
+    expect(catalogs[2]).not.toContain("crash_tool")
+    expect(runtime.session.extensionHostSnapshot).toMatchObject({ status: "failed", tools: [] })
+  } finally {
+    runtime.session.dispose()
+    await runtime.session.waitForIdle()
+    await rm(root, { recursive: true, force: true })
+  }
+}, 10_000)
+
 test("AgentSession rejects extension tools that conflict with built-ins", async () => {
   const root = await mkdtemp(join(tmpdir(), "zi-runtime-extension-tool-conflict-"))
   const cwd = join(root, "project")

@@ -193,8 +193,7 @@ async function buildExtensionApiPackage(input: {
     outdir: directory,
     naming: "index.js",
     target: "node",
-    format: "esm",
-    external: ["typebox"]
+    format: "esm"
   })
   if (!build.success) {
     throw new Error(`Extension API build failed: ${build.logs.map(log => log.message).join("; ")}`)
@@ -231,7 +230,6 @@ async function buildExtensionApiPackage(input: {
     repository,
     exports: { ".": { types: "./index.d.ts", import: "./index.js" } },
     files: ["index.js", "index.d.ts", "README.md", "LICENSE", "THIRD_PARTY_NOTICES.md"],
-    dependencies: { typebox: "1.1.38" },
     publishConfig: { access: "public" }
   })
   return Object.freeze({ packageName: npmExtensionApiPackageName, directory })
@@ -329,8 +327,8 @@ async function verifyCurrentInstall(result: NpmPackageBuildResult, version: stri
   const temporary = await mkdtemp(join(tmpdir(), "zi-npm-install-"))
   try {
     await writeJson(join(temporary, "package.json"), { private: true })
-    // The current platform tarball is installed directly; npm still resolves the extension API's TypeBox dependency.
-    // Keep registry work bounded while allowing an ordinary dependency fetch on a clean release runner.
+    // The current platform tarball is installed directly; npm still probes optional dependency metadata.
+    // Keep that probe bounded so local packaging does not require unpublished platform packages.
     await run(
       [
         "npm",
@@ -339,8 +337,8 @@ async function verifyCurrentInstall(result: NpmPackageBuildResult, version: stri
         "--omit=optional",
         "--no-audit",
         "--no-fund",
-        "--fetch-retries=1",
-        "--fetch-timeout=10000",
+        "--fetch-retries=0",
+        "--fetch-timeout=1000",
         platformTarball,
         extensionApiTarball,
         cliTarball

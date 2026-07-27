@@ -143,6 +143,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions): Pr
     modelRegistry: services.modelRegistry,
     resources,
     projectFileSearch: new ProjectFileSearch(services.paths),
+    tools: options.tools,
     ...(options.extensionHost ? { extensionHost: options.extensionHost } : {}),
     ...(options.shell ? { shell: options.shell } : {}),
     ...(model ? { model } : {}),

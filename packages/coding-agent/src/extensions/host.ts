@@ -145,6 +145,7 @@ type GenerationToolInvocation =
   | {
       readonly type: "running"
       readonly requestId: number
+      readonly registration: ExtensionToolRegistration
       readonly settled: Deferred<string>
       readonly signal?: AbortSignal
       readonly onAbort?: () => void
@@ -153,6 +154,7 @@ type GenerationToolInvocation =
   | {
       readonly type: "cancelling"
       readonly requestId: number
+      readonly registration: ExtensionToolRegistration
       readonly settled: Deferred<string>
       readonly signal: AbortSignal
       readonly onAbort: () => void
@@ -357,9 +359,8 @@ class ExtensionGeneration {
     if (state.type !== "ready" || state.lifecycle !== "started") {
       return Promise.reject(new Error(`Extension generation cannot invoke tools while ${state.type}`))
     }
-    if (!this.#tools.some(tool => tool.name === name)) {
-      return Promise.reject(new Error(`Unknown extension tool: ${name}`))
-    }
+    const registration = this.#tools.find(tool => tool.name === name)
+    if (!registration) return Promise.reject(new Error(`Unknown extension tool: ${name}`))
     if (this.#toolInvocations.size >= maxExtensionPendingRequests) {
       return Promise.reject(
         new Error(`Extension generation cannot run more than ${maxExtensionPendingRequests} tool invocations`)
@@ -378,6 +379,7 @@ class ExtensionGeneration {
     const invocation: GenerationToolInvocation = {
       type: "running",
       requestId,
+      registration,
       settled,
       ...(signal ? { signal } : {}),
       ...(onAbort ? { onAbort } : {}),
@@ -387,7 +389,10 @@ class ExtensionGeneration {
     if (signal && onAbort) signal.addEventListener("abort", onAbort, { once: true })
     void this.#writer
       .send({ type: "tool_invoke", generation: this.id, requestId, name, arguments: arguments_ })
-      .catch(cause => this.#fail("tool", errorMessage(cause, "Extension tool request failed"), cause))
+      .catch(cause => {
+        const message = errorMessage(cause, "Extension tool request failed")
+        this.#fail("tool", message, cause, this.#toolDiagnostic(registration, message))
+      })
     return settled.promise
   }
 
@@ -471,20 +476,33 @@ class ExtensionGeneration {
     const cancelling: GenerationToolInvocation = {
       type: "cancelling",
       requestId,
+      registration: invocation.registration,
       settled: invocation.settled,
       signal: invocation.signal,
       onAbort: invocation.onAbort,
       timeout
     }
     this.#toolInvocations.set(requestId, cancelling)
-    void this.#writer
-      .send({ type: "cancel", generation: this.id, requestId })
-      .catch(cause => this.#fail("tool", errorMessage(cause, "Extension tool cancellation failed"), cause))
+    void this.#writer.send({ type: "cancel", generation: this.id, requestId }).catch(cause => {
+      const message = errorMessage(cause, "Extension tool cancellation failed")
+      this.#fail("tool", message, cause, this.#toolDiagnostic(invocation.registration, message))
+    })
   }
 
   #toolInvocationTimedOut(requestId: number, message: string): void {
-    if (!this.#toolInvocations.has(requestId)) return
-    this.#fail("tool", message)
+    const invocation = this.#toolInvocations.get(requestId)
+    if (!invocation) return
+    this.#fail("tool", message, undefined, this.#toolDiagnostic(invocation.registration, message))
+  }
+
+  #toolDiagnostic(registration: ExtensionToolRegistration, message: string): ExtensionDiagnostic {
+    return boundedExtensionDiagnostic({
+      extensionId: registration.source.id,
+      path: registration.source.entryPath,
+      phase: "tool",
+      severity: "error",
+      message
+    })
   }
 
   #finishToolInvocation(invocation: GenerationToolInvocation, outcome: { content: string } | { error: Error }): void {
@@ -617,8 +635,14 @@ class ExtensionGeneration {
       state.type === "disposing_terminating" ||
       state.type === "disposed" ||
       state.type === "failed"
-    )
+    ) {
+      if (exit.error) {
+        this.#onDiagnostic(
+          diagnostic("shutdown", `Extension worker cleanup failed: ${exit.error.message}`, exit.error, "warning")
+        )
+      }
       return
+    }
     const suffix = exit.error
       ? `: ${exit.error.message}`
       : ` (code ${String(exit.code)}, signal ${String(exit.signal)})`
@@ -725,7 +749,13 @@ class ExtensionGeneration {
     this.#process.protocol.destroy()
     this.#process.stdout.destroy()
     this.#process.stderr.destroy()
-    this.#process.dispose()
+    try {
+      this.#process.dispose()
+    } catch (cause) {
+      this.#onDiagnostic(
+        diagnostic("shutdown", errorMessage(cause, "Extension worker process cleanup failed"), cause, "warning")
+      )
+    }
   }
 }
 
@@ -739,6 +769,7 @@ export class ExtensionHost {
   #staleFrames = 0
   #extensions: readonly ExtensionLoadResult[] = Object.freeze([])
   #tools: readonly ExtensionToolRegistration[] = Object.freeze([])
+  #toolCatalogListener: ((tools: readonly ExtensionToolRegistration[]) => void) | undefined
   #lastLogs: { readonly stdout: ExtensionLogTail; readonly stderr: ExtensionLogTail } = Object.freeze({
     stdout: emptyLogTail(),
     stderr: emptyLogTail()
@@ -805,6 +836,15 @@ export class ExtensionHost {
     return this.#tools
   }
 
+  bindToolCatalog(listener: (tools: readonly ExtensionToolRegistration[]) => void): () => void {
+    if (this.#state.type === "disposed") throw new Error("Extension host is disposed")
+    if (this.#toolCatalogListener) throw new Error("Extension host tool catalog is already bound")
+    this.#toolCatalogListener = listener
+    return () => {
+      if (this.#toolCatalogListener === listener) this.#toolCatalogListener = undefined
+    }
+  }
+
   invokeTool(name: string, arguments_: unknown, signal?: AbortSignal): Promise<string> {
     const state = this.#state
     if (state.type !== "ready" || state.lifecycle !== "started") {
@@ -824,7 +864,7 @@ export class ExtensionHost {
 
   rejectTool(tool: ExtensionToolRegistration, message: string): void {
     if (!this.#tools.includes(tool)) throw new Error("Extension host cannot reject an unknown tool registration")
-    this.#tools = Object.freeze(this.#tools.filter(candidate => candidate !== tool))
+    this.#setToolCatalog(Object.freeze(this.#tools.filter(candidate => candidate !== tool)))
     this.#diagnose(
       boundedExtensionDiagnostic({
         extensionId: tool.source.id,
@@ -922,7 +962,7 @@ export class ExtensionHost {
       if (plan.sources.length === 0) {
         this.#state = { type: "disabled", lifecycle: state.lifecycle }
         this.#extensions = Object.freeze([])
-        this.#tools = Object.freeze([])
+        this.#setToolCatalog(Object.freeze([]))
         return
       }
       await this.#startPlan(plan, state.lifecycle, reason)
@@ -940,7 +980,7 @@ export class ExtensionHost {
       await this.#retireCurrent(replacing, state.current, reason)
       if (this.#state === replacing) {
         this.#extensions = Object.freeze([])
-        this.#tools = Object.freeze([])
+        this.#setToolCatalog(Object.freeze([]))
         this.#state = { type: "disabled", lifecycle: state.lifecycle }
       }
       return
@@ -975,7 +1015,7 @@ export class ExtensionHost {
         if (currentFailure) {
           const cleanup = state.current.dispose()
           this.#extensions = Object.freeze([])
-          this.#tools = Object.freeze([])
+          this.#setToolCatalog(Object.freeze([]))
           this.#state = { type: "failed", lifecycle: state.lifecycle, diagnostic: currentFailure, cleanup }
           await cleanup
         } else {
@@ -996,7 +1036,7 @@ export class ExtensionHost {
     }
 
     this.#extensions = ready.extensions
-    this.#tools = ready.tools
+    this.#setToolCatalog(ready.tools)
     if (state.lifecycle === "started") {
       const dispatching: ExtensionHostState = {
         type: "dispatching",
@@ -1064,7 +1104,7 @@ export class ExtensionHost {
     if (plan.sources.length === 0) {
       this.#state = { type: "disabled", lifecycle }
       this.#extensions = Object.freeze([])
-      this.#tools = Object.freeze([])
+      this.#setToolCatalog(Object.freeze([]))
       return
     }
     const id = this.#takeGenerationId()
@@ -1092,7 +1132,7 @@ export class ExtensionHost {
       if (this.#state === spawned) {
         const failure = failureDiagnostic(cause)
         this.#extensions = Object.freeze([])
-        this.#tools = Object.freeze([])
+        this.#setToolCatalog(Object.freeze([]))
         this.#state = { type: "failed", lifecycle, diagnostic: failure, cleanup }
       }
       await cleanup
@@ -1104,7 +1144,7 @@ export class ExtensionHost {
     }
     this.#admitLoadResults(ready.extensions)
     this.#extensions = ready.extensions
-    this.#tools = ready.tools
+    this.#setToolCatalog(ready.tools)
 
     if (lifecycle === "started") {
       const dispatching: ExtensionHostState = {
@@ -1167,7 +1207,7 @@ export class ExtensionHost {
     if (this.#state === ownerState) {
       if (!(cause instanceof ExtensionGenerationError)) this.#diagnose(failure)
       this.#extensions = Object.freeze([])
-      this.#tools = Object.freeze([])
+      this.#setToolCatalog(Object.freeze([]))
       this.#state = { type: "failed", lifecycle, diagnostic: failure, cleanup }
     }
     await cleanup
@@ -1183,7 +1223,7 @@ export class ExtensionHost {
         return undefined
       })
       this.#extensions = Object.freeze([])
-      this.#tools = Object.freeze([])
+      this.#setToolCatalog(Object.freeze([]))
       this.#state = { type: "failed", lifecycle: state.lifecycle, diagnostic: value, cleanup }
     }
   }
@@ -1196,20 +1236,36 @@ export class ExtensionHost {
         if (!(cause instanceof ExtensionGenerationError)) this.#diagnose(failureDiagnostic(cause))
       }
     }
-    await Promise.all([...state.cleanups, ...state.generations.map(generation => generation.dispose())])
-    const retainedGeneration = state.generations.at(-1)
-    if (retainedGeneration) this.#lastLogs = retainedGeneration.logs()
-    if (this.#state === state) {
-      this.#extensions = Object.freeze([])
-      this.#tools = Object.freeze([])
-      this.#state = { type: "disposed" }
+    try {
+      await Promise.all([...state.cleanups, ...state.generations.map(generation => generation.dispose())])
+    } catch (cause) {
+      this.#diagnose(diagnostic("shutdown", errorMessage(cause, "Extension host cleanup failed"), cause, "warning"))
+    } finally {
+      const retainedGeneration = state.generations.at(-1)
+      if (retainedGeneration) this.#lastLogs = retainedGeneration.logs()
+      if (this.#state === state) {
+        this.#extensions = Object.freeze([])
+        this.#setToolCatalog(Object.freeze([]))
+        this.#state = { type: "disposed" }
+      }
+      this.#toolCatalogListener = undefined
+      state.settled.resolve()
     }
-    state.settled.resolve()
   }
 
   #admitLoadResults(results: readonly ExtensionLoadResult[]): void {
     for (const result of results) {
       if (result.status === "failed" && result.diagnostic) this.#diagnose(result.diagnostic)
+    }
+  }
+
+  #setToolCatalog(tools: readonly ExtensionToolRegistration[]): void {
+    if (this.#tools === tools) return
+    this.#tools = tools
+    try {
+      this.#toolCatalogListener?.(tools)
+    } catch (cause) {
+      this.#diagnose(diagnostic("protocol", errorMessage(cause, "Extension tool catalog binding failed"), cause))
     }
   }
 
@@ -1253,7 +1309,10 @@ export class ExtensionHost {
   }
 }
 
-export function createExtensionWorkerSpawner(command: readonly string[]): SpawnExtensionWorker {
+export function createExtensionWorkerSpawner(
+  command: readonly string[],
+  removePublicApiDirectory: (path: string) => void = path => rmSync(path, { recursive: true, force: true })
+): SpawnExtensionWorker {
   if (
     command.length === 0 ||
     command.length > 16 ||
@@ -1267,7 +1326,7 @@ export function createExtensionWorkerSpawner(command: readonly string[]): SpawnE
   const admitted = Object.freeze([...command])
   const inheritedEnvironment = Object.freeze({ ...process.env })
   return plan => {
-    const publicApi = createPublicApiModule()
+    const publicApi = createPublicApiModule(removePublicApiDirectory)
     let child: ReturnType<typeof spawn>
     try {
       child = spawn(admitted[0]!, [...admitted.slice(1), extensionWorkerArgument], {
@@ -1301,7 +1360,14 @@ export function createExtensionWorkerSpawner(command: readonly string[]): SpawnE
     const finish = (code: number | null, signal: NodeJS.Signals | null): void => {
       if (settled) return
       settled = true
-      publicApi.dispose()
+      const cleanupError = publicApi.dispose()
+      if (cleanupError) {
+        processError = processError
+          ? new Error(`${processError.message}; public API cleanup failed: ${cleanupError.message}`, {
+              cause: processError
+            })
+          : cleanupError
+      }
       resolveExit({ code, signal, ...(processError ? { error: processError } : {}) })
     }
     const onError = (cause: Error): void => {
@@ -1333,7 +1399,10 @@ export function createExtensionWorkerSpawner(command: readonly string[]): SpawnE
   }
 }
 
-function createPublicApiModule(): { readonly nodeModules: string; dispose(): void } {
+function createPublicApiModule(removeDirectory: (path: string) => void): {
+  readonly nodeModules: string
+  dispose(): Error | undefined
+} {
   const root = mkdtempSync(join(tmpdir(), "zi-extension-api-"))
   const nodeModules = join(root, "node_modules")
   const packageDirectory = join(nodeModules, "@with-zi", "extension-api")
@@ -1346,16 +1415,28 @@ function createPublicApiModule(): { readonly nodeModules: string; dispose(): voi
     )
     writeFileSync(join(packageDirectory, "index.js"), extensionApiModuleSource, { mode: 0o600 })
   } catch (cause) {
-    rmSync(root, { recursive: true, force: true })
+    try {
+      removeDirectory(root)
+    } catch (cleanupCause) {
+      throw new Error(
+        `${errorMessage(cause, "Could not create extension public API module")}; cleanup failed: ${errorMessage(cleanupCause, "unknown cleanup error")}`,
+        { cause: cleanupCause }
+      )
+    }
     throw cause
   }
   let disposed = false
   return {
     nodeModules,
     dispose() {
-      if (disposed) return
+      if (disposed) return undefined
       disposed = true
-      rmSync(root, { recursive: true, force: true })
+      try {
+        removeDirectory(root)
+        return undefined
+      } catch (cause) {
+        return cause instanceof Error ? cause : new Error(String(cause))
+      }
     }
   }
 }

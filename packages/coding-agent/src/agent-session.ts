@@ -51,6 +51,7 @@ import {
 import type { StoredCredential } from "./credential-store.js"
 import { DEFAULT_THINKING_LEVEL } from "./defaults.js"
 import type { ExtensionHost, ExtensionHostSnapshot } from "./extensions/host.js"
+import { admitExtensionTools } from "./extensions/tools.js"
 import { isZiAgentMessage, type AgentMessage } from "./messages.js"
 import type { ModelRegistry } from "./model-registry.js"
 import { type ProjectFileSearch, type ProjectFileSearchResult } from "./project-file-search.js"
@@ -223,6 +224,7 @@ export interface AgentSessionConfig {
   modelRegistry: ModelRegistry
   resources: SessionResources
   projectFileSearch: ProjectFileSearch
+  tools: readonly AgentTool[]
   extensionHost?: ExtensionHost
   shell?: SessionShell
   model?: Model<Api>
@@ -349,11 +351,14 @@ export class AgentSession {
   readonly #modelRegistry: ModelRegistry
   readonly #resources: SessionResources
   readonly #projectFileSearch: ProjectFileSearch
+  readonly #extensionHost: ExtensionHost | undefined
   readonly #shell: SessionShell | undefined
   readonly #apiKeyProvider: string | undefined
   readonly #listeners = new Set<(event: AgentSessionEvent) => void>()
   readonly #unsubscribeAgent: () => void
   readonly #unsubscribeShell: (() => void) | undefined
+  readonly #unbindExtensionTools: (() => void) | undefined
+  #activeTools: readonly AgentTool[]
   #activity: Activity = { type: "idle" }
   #extensionLifecycle: ExtensionLifecycleState
   #pending: PendingInput[] = []
@@ -374,6 +379,8 @@ export class AgentSession {
     this.#modelRegistry = config.modelRegistry
     this.#resources = config.resources
     this.#projectFileSearch = config.projectFileSearch
+    this.#extensionHost = config.extensionHost
+    this.#activeTools = Object.freeze([...config.tools])
     this.#extensionLifecycle = config.extensionHost
       ? { type: "unbound", host: config.extensionHost }
       : { type: "absent" }
@@ -384,6 +391,7 @@ export class AgentSession {
     this.#modelState = config.model ? { type: "selected", model: config.model } : { type: "unselected" }
     this.#agent.prepareNextTurnWithContext = (context, signal) => this.#prepareNextTurn(context, signal)
     this.#unsubscribeAgent = this.#agent.subscribe(event => this.#handleAgentEvent(event))
+    this.#unbindExtensionTools = config.extensionHost?.bindToolCatalog(() => this.#applyActiveTools())
     this.#unsubscribeShell = this.#shell?.subscribe(taskId => {
       try {
         this.#emit({ type: "shell_task_changed", taskId })
@@ -1024,10 +1032,14 @@ export class AgentSession {
 
   setActiveTools(tools: readonly AgentTool[]): void {
     this.#assertIdle("change tools")
-    const activeTools = [...tools]
-    const systemPrompt = buildSystemPrompt(this.sessionManager.header.cwd, this.#resources, activeTools)
-    this.#agent.state.tools = activeTools
-    this.#agent.state.systemPrompt = systemPrompt
+    this.#activeTools = Object.freeze([...tools])
+    this.#applyActiveTools()
+  }
+
+  #applyActiveTools(): void {
+    const tools = admitExtensionTools(this.#activeTools, this.#extensionHost)
+    this.#agent.state.tools = [...tools]
+    this.#agent.state.systemPrompt = buildSystemPrompt(this.sessionManager.header.cwd, this.#resources, tools)
   }
 
   dispose(reason: ExtensionShutdownReason = "quit"): void {
@@ -1052,6 +1064,7 @@ export class AgentSession {
       currentActivity.phase.controller.abort()
     }
     this.#agent.abort()
+    this.#unbindExtensionTools?.()
     const settled = settleAll([
       activeSettled,
       this.#authentication.dispose(),
@@ -1229,24 +1242,27 @@ export class AgentSession {
     signal: AbortSignal | undefined
   ): Promise<AgentLoopTurnUpdate | undefined> {
     const activity = this.#activity
-    if (
-      activity.type !== "running" ||
-      activity.phase.type !== "agent" ||
-      activity.thresholdSuppressed ||
-      !this.settingsManager.get().compactionEnabled ||
-      signal?.aborted
-    ) {
-      return undefined
-    }
+    if (activity.type !== "running" || activity.phase.type !== "agent" || signal?.aborted) return undefined
+
+    const activeTools = this.#agent.state.tools
+    const contextTools = context.context.tools ?? []
+    const toolsChanged =
+      activeTools.length !== contextTools.length || activeTools.some((tool, index) => tool !== contextTools[index])
+    const synchronizedContext = toolsChanged
+      ? { ...context.context, systemPrompt: this.#agent.state.systemPrompt, tools: [...activeTools] }
+      : undefined
+    const synchronized = synchronizedContext ? { context: synchronizedContext } : undefined
+
+    if (activity.thresholdSuppressed || !this.settingsManager.get().compactionEnabled) return synchronized
     const settings = this.#effectiveCompactionSettings()
     const usage = this.contextUsage
-    if (!settings || usage.type === "unavailable") return undefined
+    if (!settings || usage.type === "unavailable") return synchronized
     const queuedTokens = this.#pending.reduce((tokens, input) => tokens + estimateMessageTokens(input.message), 0)
-    if (!shouldCompact(usage.tokens + queuedTokens, settings)) return undefined
+    if (!shouldCompact(usage.tokens + queuedTokens, settings)) return synchronized
 
     const outcome = await this.#runAutomaticCompaction(activity.runId, "threshold", undefined, signal)
-    if (outcome !== "completed" || !this.#canContinue(activity.runId)) return undefined
-    return { context: { ...context.context, messages: [...this.#agent.state.messages] } }
+    if (outcome !== "completed" || !this.#canContinue(activity.runId)) return synchronized
+    return { context: { ...(synchronizedContext ?? context.context), messages: [...this.#agent.state.messages] } }
   }
 
   async #recoverOverflow(runId: number): Promise<"none" | "recovered" | "stop"> {

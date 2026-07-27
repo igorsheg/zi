@@ -473,7 +473,7 @@ export type ExtensionLifecycleEvent =
   | { readonly type: "session_shutdown"; readonly reason: ExtensionShutdownReason }
 
 export interface ExtensionAPI {
-  registerTool<TParameters extends TSchema>(definition: ExtensionToolDefinition<TParameters>): void
+  registerTool<TParameters extends TObject>(definition: ExtensionToolDefinition<TParameters>): void
   on(
     event: "session_start",
     handler: (event: Extract<ExtensionLifecycleEvent, { type: "session_start" }>) => void | Promise<void>
@@ -484,7 +484,7 @@ export interface ExtensionAPI {
   ): void
 }
 
-export interface ExtensionToolDefinition<TParameters extends TSchema> {
+export interface ExtensionToolDefinition<TParameters extends TObject> {
   readonly name: string
   readonly label?: string
   readonly description: string
@@ -591,6 +591,8 @@ Future Pi-equivalent handlers must be able to call back into Zi while Zi awaits 
 - pending requests are bounded;
 - a nested request may settle before its parent request;
 - cancellation identifies one request and never means process shutdown;
+- a cancelling tool remains owned and counted until its execution settles; a missed cancellation deadline fails the generation;
+- result/cancel crossings settle once without turning a completed request into a protocol failure;
 - process shutdown rejects every pending request exactly once.
 
 Do not implement lockstep request/response I/O or hold one global request mutex across handler execution.
@@ -654,6 +656,7 @@ const maxExtensionLoadDiagnosticMessageBytes = 2 * 1024
 const maxExtensionIdBytes = 256
 const maxExtensionLifecycleHandlers = 1024
 const maxExtensionTools = 64
+const maxExtensionToolCatalogBytes = 512 * 1024
 const maxExtensionToolNameBytes = 64
 const maxExtensionToolLabelBytes = 256
 const maxExtensionToolDescriptionBytes = 4 * 1024
@@ -671,7 +674,7 @@ const extensionToolTimeoutMs = 30_000
 const extensionToolCancellationTimeoutMs = 1_000
 ```
 
-Only the retained tail of stdout/stderr is kept, with an omitted-byte count. Frame bounds apply before JSON allocation. Source and path bounds apply before process startup.
+Only the retained tail of stdout/stderr is kept, with an omitted-byte count. Frame bounds apply before JSON allocation. Source and path bounds apply before process startup. The aggregate tool-catalog budget leaves room for the maximum source-result set inside one ready frame.
 
 Later capabilities must work within the frame bound through bounded chunks or references; they may not silently increase it for large tool output or images.
 

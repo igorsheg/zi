@@ -10,6 +10,7 @@ import {
   encodeExtensionProtocolFrame,
   ExtensionProtocolDecoder,
   extensionProtocolVersion,
+  maxExtensionPendingRequests,
   type HostMessage,
   type WorkerMessage,
   validateWorkerMessage
@@ -152,7 +153,7 @@ export default function (zi): void {
     async execute({ message }, { signal }) {
       if (message === "throw") throw new Error("tool exploded")
       if (message === "wait") {
-        await new Promise(resolve => signal.addEventListener("abort", resolve, { once: true }))
+        if (!signal.aborted) await new Promise(resolve => signal.addEventListener("abort", resolve, { once: true }))
         return "late"
       }
       return message.toUpperCase()
@@ -227,6 +228,101 @@ export default function (zi): void {
     diagnostic: { phase: "protocol", message: "Extension worker cannot shut down with active tool invocations" }
   })
   expect(run).rejects.toThrow("cannot shut down with active tool invocations")
+  messages.dispose()
+  output.destroy()
+})
+
+test("worker process tolerates cancellation crossing a completed tool response", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-extension-worker-tool-crossing-"))
+  const extension = await fixture(
+    root,
+    "tool.ts",
+    `import { Schema } from ${JSON.stringify(extensionApi)}
+export default zi => zi.registerTool({
+  name: "echo_message",
+  description: "Echo",
+  parameters: Schema.object({ message: Schema.string() }),
+  execute: ({ message }) => message
+})
+`
+  )
+  const input = new PassThrough()
+  const output = new ControlledWorkerOutput()
+  const run = runExtensionWorkerProcess(input, output)
+
+  send(input, initialize(extensionPlan(root, [extension])))
+  expect((await output.next()).type).toBe("ready")
+  output.releaseWrite()
+  send(input, { type: "session_start", generation: 1, requestId: 1, reason: "startup" })
+  expect((await output.next()).type).toBe("settled")
+  output.releaseWrite()
+
+  send(input, {
+    type: "tool_invoke",
+    generation: 1,
+    requestId: 2,
+    name: "echo_message",
+    arguments: { message: "done" }
+  })
+  expect(await output.next()).toEqual({ type: "tool_result", generation: 1, requestId: 2, content: "done" })
+  send(input, { type: "cancel", generation: 1, requestId: 2 })
+  output.releaseWrite()
+  await Bun.sleep(0)
+  send(input, { type: "cancel", generation: 1, requestId: 2 })
+  send(input, { type: "session_shutdown", generation: 1, requestId: 3, reason: "quit" })
+  expect((await output.next()).type).toBe("settled")
+  output.releaseWrite()
+  send(input, { type: "stop", generation: 1, requestId: 4 })
+  expect((await output.next()).type).toBe("settled")
+  output.releaseWrite()
+  await run
+  output.endProtocol()
+})
+
+test("cancelled tools remain owned until execution settles", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-extension-worker-tool-cancel-bound-"))
+  const extension = await fixture(
+    root,
+    "tool.ts",
+    `import { Schema } from ${JSON.stringify(extensionApi)}
+export default zi => zi.registerTool({
+  name: "pending_tool",
+  description: "Never settle",
+  parameters: Schema.object({}),
+  execute: async () => await new Promise(() => {})
+})
+`
+  )
+  const input = new PassThrough()
+  const output = new PassThrough()
+  const messages = new WorkerMessageQueue(output)
+  const run = runExtensionWorkerProcess(input, output)
+
+  send(input, initialize(extensionPlan(root, [extension])))
+  expect((await messages.next()).type).toBe("ready")
+  send(input, { type: "session_start", generation: 1, requestId: 1, reason: "startup" })
+  expect((await messages.next()).type).toBe("settled")
+  for (let index = 0; index < maxExtensionPendingRequests; index++) {
+    const requestId = index + 2
+    send(input, { type: "tool_invoke", generation: 1, requestId, name: "pending_tool", arguments: {} })
+    send(input, { type: "cancel", generation: 1, requestId })
+  }
+  send(input, {
+    type: "tool_invoke",
+    generation: 1,
+    requestId: maxExtensionPendingRequests + 2,
+    name: "pending_tool",
+    arguments: {}
+  })
+
+  expect(await messages.next()).toMatchObject({
+    type: "fatal",
+    diagnostic: {
+      phase: "protocol",
+      message: `Extension worker cannot run more than ${maxExtensionPendingRequests} tool invocations`
+    }
+  })
+  expect(run).rejects.toThrow(`more than ${maxExtensionPendingRequests} tool invocations`)
   messages.dispose()
   output.destroy()
 })

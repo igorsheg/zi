@@ -1,22 +1,35 @@
 export const extensionApiModuleSource = `
-const make = (type, options = {}) => Object.freeze({ ...options, type })
 const optionalKey = "~optional"
+const make = (type, options = {}) => Object.freeze({ ...options, type })
+const primitiveType = value => {
+  if (value === null) return "null"
+  switch (typeof value) {
+    case "string": return "string"
+    case "number": return "number"
+    case "boolean": return "boolean"
+    default: throw new Error("Literal values must be JSON primitives")
+  }
+}
 
 export const Schema = Object.freeze({
   string: options => make("string", options),
   number: options => make("number", options),
   integer: options => make("integer", options),
   boolean: options => make("boolean", options),
-  literal: value => Object.freeze({ const: value }),
+  literal: (value, options = {}) => Object.freeze({
+    ...options,
+    type: primitiveType(value),
+    const: value
+  }),
   array: (items, options = {}) => Object.freeze({ ...options, type: "array", items }),
-  optional: value => Object.freeze({ ...value, [optionalKey]: true }),
+  optional: schema => Object.freeze({ ...schema, [optionalKey]: true }),
   object: (properties, options = {}) => {
     const admitted = {}
     const required = []
-    for (const [name, value] of Object.entries(properties)) {
-      const { [optionalKey]: optional, ...property } = value
+    for (const [name, schema] of Object.entries(properties)) {
+      const { [optionalKey]: isOptional, ...property } = schema
       admitted[name] = Object.freeze(property)
-      if (!optional) required.push(name)
+      if (!isOptional) required.push(name)
     }
     return Object.freeze({
       ...options,

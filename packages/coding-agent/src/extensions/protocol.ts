@@ -27,6 +27,7 @@ export const extensionShutdownTimeoutMs = 3_000
 export const extensionToolTimeoutMs = 30_000
 export const extensionToolCancellationTimeoutMs = 1_000
 export const maxExtensionTools = 64
+export const maxExtensionToolCatalogBytes = 512 * 1024
 export const maxExtensionToolNameBytes = 64
 export const maxExtensionToolLabelBytes = 256
 export const maxExtensionToolDescriptionBytes = 4 * 1024
@@ -374,16 +375,7 @@ export function validateWorkerMessage(value: unknown): WorkerMessage {
       if (extensions.length > maxExtensionSources) {
         throw new ExtensionProtocolError(`Extension results cannot exceed ${maxExtensionSources}`)
       }
-      const tools = protocolArray(message.tools, "tools")
-      if (tools.length > maxExtensionTools) {
-        throw new ExtensionProtocolError(`Extension tools cannot exceed ${maxExtensionTools}`)
-      }
-      const admittedTools = tools.map(extensionToolRegistration)
-      const names = new Set<string>()
-      for (const tool of admittedTools) {
-        if (names.has(tool.name)) throw new ExtensionProtocolError(`Extension tool names must be unique: ${tool.name}`)
-        names.add(tool.name)
-      }
+      const admittedTools = validateExtensionToolCatalog(message.tools)
       return Object.freeze({
         type: "ready",
         protocolVersion: protocolVersion(message.protocolVersion),
@@ -427,6 +419,23 @@ export function validateWorkerMessage(value: unknown): WorkerMessage {
 
 export function validateExtensionToolRegistration(value: unknown): ExtensionToolRegistration {
   return extensionToolRegistration(value)
+}
+
+export function validateExtensionToolCatalog(value: unknown): readonly ExtensionToolRegistration[] {
+  const tools = protocolArray(value, "tools")
+  if (tools.length > maxExtensionTools) {
+    throw new ExtensionProtocolError(`Extension tools cannot exceed ${maxExtensionTools}`)
+  }
+  const admitted = tools.map(extensionToolRegistration)
+  const names = new Set<string>()
+  for (const tool of admitted) {
+    if (names.has(tool.name)) throw new ExtensionProtocolError(`Extension tool names must be unique: ${tool.name}`)
+    names.add(tool.name)
+  }
+  if (Buffer.byteLength(JSON.stringify(admitted)) > maxExtensionToolCatalogBytes) {
+    throw new ExtensionProtocolError(`Extension tool catalog cannot exceed ${maxExtensionToolCatalogBytes} bytes`)
+  }
+  return Object.freeze(admitted)
 }
 
 export function validateExtensionToolArguments(value: unknown): Readonly<Record<string, JsonValue>> {

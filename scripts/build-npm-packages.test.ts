@@ -69,8 +69,7 @@ test("npm package assembly wraps release archives without install-time downloads
     expect(JSON.parse(await readFile(join(extensionApi!.directory, "package.json"), "utf8"))).toMatchObject({
       name: "@with-zi/extension-api",
       version,
-      exports: { ".": { types: "./index.d.ts", import: "./index.js" } },
-      dependencies: { typebox: "1.1.38" }
+      exports: { ".": { types: "./index.d.ts", import: "./index.js" } }
     })
     expect(existsSync(join(extensionApi!.directory, "index.js"))).toBe(true)
     expect(existsSync(join(extensionApi!.directory, "index.d.ts"))).toBe(true)

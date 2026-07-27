@@ -5,7 +5,11 @@ import { join, resolve } from "node:path"
 import { pathToFileURL } from "node:url"
 
 import type { ExtensionLoadPlan, ExtensionSource } from "../src/extensions/discovery.js"
-import { maxExtensionTools } from "../src/extensions/protocol.js"
+import {
+  maxExtensionToolCatalogBytes,
+  maxExtensionToolDescriptionBytes,
+  maxExtensionTools
+} from "../src/extensions/protocol.js"
 import { loadExtensionGeneration, maxExtensionLifecycleHandlers } from "../src/extensions/worker.js"
 
 const extensionApi = pathToFileURL(resolve(import.meta.dirname, "../../extension-api/src/index.ts")).href
@@ -294,6 +298,45 @@ test("worker lifecycle admission rejects concurrent and out-of-order transitions
     "while extension lifecycle is starting"
   )
   expect((await start).fatal?.phase).toBe("lifecycle")
+})
+
+test("an aggregate tool catalog overflow rolls back only its source", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-extension-worker-tool-catalog-bound-"))
+  const excessive = await writeExtension(
+    root,
+    "excessive.ts",
+    `import { Schema } from ${JSON.stringify(extensionApi)}
+export default function (zi): void {
+  for (let index = 0; index < ${maxExtensionTools}; index++) {
+    zi.registerTool({
+      name: "catalog_tool_" + index,
+      description: "d".repeat(${maxExtensionToolDescriptionBytes}),
+      parameters: Schema.object({}, { description: "s".repeat(8_000) }),
+      execute: () => "done"
+    })
+  }
+}
+`
+  )
+  const valid = await writeExtension(
+    root,
+    "valid.ts",
+    `import { Schema } from ${JSON.stringify(extensionApi)}
+export default zi => zi.registerTool({
+  name: "valid_tool",
+  description: "Valid",
+  parameters: Schema.object({}),
+  execute: () => "done"
+})
+`
+  )
+
+  const generation = await loadExtensionGeneration(extensionPlan(root, [excessive, valid]), 1)
+  expect(generation.results.map(result => [result.status, result.diagnostic?.message])).toEqual([
+    ["failed", `Extension tool catalog cannot exceed ${maxExtensionToolCatalogBytes} bytes`],
+    ["loaded", undefined]
+  ])
+  expect(generation.tools.map(tool => tool.name)).toEqual(["valid_tool"])
 })
 
 test("failed registrations cannot consume the generation tool bound", async () => {

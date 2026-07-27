@@ -1,17 +1,162 @@
-import { Type, type Static, type TSchema } from "typebox"
+export type JsonValue = null | boolean | number | string | readonly JsonValue[] | { readonly [key: string]: JsonValue }
+export type JsonPrimitive = null | boolean | number | string
 
-export type { Static, TSchema } from "typebox"
+interface SchemaAnnotations {
+  readonly title?: string
+  readonly description?: string
+  readonly default?: JsonValue
+}
 
-export const Schema = Object.freeze({
-  object: Type.Object,
-  string: Type.String,
-  number: Type.Number,
-  integer: Type.Integer,
-  boolean: Type.Boolean,
-  array: Type.Array,
-  literal: Type.Literal,
-  optional: Type.Optional
-})
+export interface StringSchemaOptions extends SchemaAnnotations {
+  readonly minLength?: number
+  readonly maxLength?: number
+  readonly pattern?: string
+}
+
+export interface NumberSchemaOptions extends SchemaAnnotations {
+  readonly minimum?: number
+  readonly maximum?: number
+  readonly exclusiveMinimum?: number
+  readonly exclusiveMaximum?: number
+  readonly multipleOf?: number
+}
+
+export type IntegerSchemaOptions = NumberSchemaOptions
+
+export interface ArraySchemaOptions extends SchemaAnnotations {
+  readonly minItems?: number
+  readonly maxItems?: number
+  readonly uniqueItems?: boolean
+}
+
+export interface ObjectSchemaOptions extends SchemaAnnotations {
+  readonly additionalProperties?: boolean
+  readonly minProperties?: number
+  readonly maxProperties?: number
+}
+
+declare const staticType: unique symbol
+
+export interface TSchema<T = unknown> {
+  readonly [key: string]: unknown
+  readonly [staticType]?: T
+}
+
+export type Static<T extends TSchema> = T extends TSchema<infer Value> ? Value : never
+
+export interface TString extends TSchema<string>, StringSchemaOptions {
+  readonly type: "string"
+}
+
+export interface TNumber extends TSchema<number>, NumberSchemaOptions {
+  readonly type: "number"
+}
+
+export interface TInteger extends TSchema<number>, IntegerSchemaOptions {
+  readonly type: "integer"
+}
+
+export interface TBoolean extends TSchema<boolean>, SchemaAnnotations {
+  readonly type: "boolean"
+}
+
+export interface TLiteral<T extends JsonPrimitive> extends TSchema<T>, SchemaAnnotations {
+  readonly type: "null" | "boolean" | "number" | "string"
+  readonly const: T
+}
+
+export interface TArray<TItems extends TSchema> extends TSchema<readonly Static<TItems>[]>, ArraySchemaOptions {
+  readonly type: "array"
+  readonly items: TItems
+}
+
+export type TOptional<T extends TSchema> = T & { readonly "~optional": true }
+
+export type SchemaProperties = Readonly<Record<string, TSchema>>
+type OptionalPropertyKeys<TProperties extends SchemaProperties> = {
+  [Key in keyof TProperties]: TProperties[Key] extends { readonly "~optional": true } ? Key : never
+}[keyof TProperties]
+type RequiredPropertyKeys<TProperties extends SchemaProperties> = Exclude<
+  keyof TProperties,
+  OptionalPropertyKeys<TProperties>
+>
+type ObjectStatic<TProperties extends SchemaProperties> = {
+  readonly [Key in RequiredPropertyKeys<TProperties>]: Static<TProperties[Key]>
+} & {
+  readonly [Key in OptionalPropertyKeys<TProperties>]?: Static<TProperties[Key]>
+}
+
+export interface TObject<TProperties extends SchemaProperties = SchemaProperties>
+  extends TSchema<ObjectStatic<TProperties>>, ObjectSchemaOptions {
+  readonly type: "object"
+  readonly properties: SchemaProperties
+  readonly required?: readonly string[]
+}
+
+const optionalKey = "~optional"
+
+function string(options: StringSchemaOptions = {}): TString {
+  return Object.freeze({ ...options, type: "string" as const })
+}
+
+function number(options: NumberSchemaOptions = {}): TNumber {
+  return Object.freeze({ ...options, type: "number" as const })
+}
+
+function integer(options: IntegerSchemaOptions = {}): TInteger {
+  return Object.freeze({ ...options, type: "integer" as const })
+}
+
+function boolean(options: SchemaAnnotations = {}): TBoolean {
+  return Object.freeze({ ...options, type: "boolean" as const })
+}
+
+function literal<T extends JsonPrimitive>(value: T, options: SchemaAnnotations = {}): TLiteral<T> {
+  return Object.freeze({ ...options, type: primitiveType(value), const: value })
+}
+
+function primitiveType(value: JsonPrimitive): TLiteral<JsonPrimitive>["type"] {
+  if (value === null) return "null"
+  switch (typeof value) {
+    case "string":
+      return "string"
+    case "number":
+      return "number"
+    case "boolean":
+      return "boolean"
+    default:
+      throw new Error("Literal values must be JSON primitives")
+  }
+}
+
+function array<TItems extends TSchema>(items: TItems, options: ArraySchemaOptions = {}): TArray<TItems> {
+  return Object.freeze({ ...options, type: "array" as const, items })
+}
+
+function optional<T extends TSchema>(schema: T): TOptional<T> {
+  return Object.freeze({ ...schema, [optionalKey]: true as const })
+}
+
+function object<TProperties extends SchemaProperties>(
+  properties: TProperties,
+  options: ObjectSchemaOptions = {}
+): TObject<TProperties> {
+  const admitted: Record<string, TSchema> = {}
+  const required: string[] = []
+  for (const [name, schema] of Object.entries(properties)) {
+    const { [optionalKey]: isOptional, ...property } = schema
+    admitted[name] = Object.freeze(property)
+    if (!isOptional) required.push(name)
+  }
+  return Object.freeze({
+    ...options,
+    type: "object" as const,
+    properties: Object.freeze(admitted),
+    ...(required.length > 0 ? { required: Object.freeze(required) } : {})
+  })
+}
+
+export const Schema = Object.freeze({ string, number, integer, boolean, literal, array, optional, object })
 
 export type ExtensionStartReason = "startup" | "reload" | "new" | "resume" | "fork"
 export type ExtensionShutdownReason = "quit" | "reload" | "new" | "resume" | "fork"
@@ -27,7 +172,7 @@ export interface ExtensionToolContext {
   readonly signal: AbortSignal
 }
 
-export interface ExtensionToolDefinition<TParameters extends TSchema = TSchema> {
+export interface ExtensionToolDefinition<TParameters extends TObject = TObject> {
   readonly name: string
   readonly label?: string
   readonly description: string
@@ -38,7 +183,7 @@ export interface ExtensionToolDefinition<TParameters extends TSchema = TSchema> 
 export interface ExtensionAPI {
   on(event: "session_start", handler: (event: ExtensionStartEvent) => void | Promise<void>): void
   on(event: "session_shutdown", handler: (event: ExtensionShutdownEvent) => void | Promise<void>): void
-  registerTool<TParameters extends TSchema>(tool: ExtensionToolDefinition<TParameters>): void
+  registerTool<TParameters extends TObject>(tool: ExtensionToolDefinition<TParameters>): void
 }
 
 export type ExtensionFactory = (zi: ExtensionAPI) => void | Promise<void>

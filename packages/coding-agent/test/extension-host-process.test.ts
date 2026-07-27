@@ -187,6 +187,40 @@ export default zi => zi.registerTool({
   }
 }, 10_000)
 
+test("ExtensionHost settles when temporary public API cleanup fails", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-extension-host-cleanup-"))
+  const extensionPath = join(root, "extension.ts")
+  await writeFile(extensionPath, "export default function () {}\n")
+  const source: ExtensionSource = Object.freeze({
+    id: "host-cleanup-fixture",
+    declaredPath: extensionPath,
+    entryPath: extensionPath,
+    scope: "temporary",
+    origin: "cli"
+  })
+  const plan: ExtensionLoadPlan = Object.freeze({ cwd: root, sources: Object.freeze([source]) })
+  const cli = resolve(import.meta.dirname, "../../cli/src/main.ts")
+  let publicApiRoot: string | undefined
+  const spawner = createExtensionWorkerSpawner([process.execPath, cli], path => {
+    publicApiRoot = path
+    throw new Error("public API cleanup denied")
+  })
+  const host = await ExtensionHost.create(plan, spawner)
+
+  try {
+    await host.sessionStart("startup")
+    await host.dispose()
+    expect(host.snapshot()).toMatchObject({
+      status: "disposed",
+      diagnostics: [expect.objectContaining({ phase: "shutdown", message: expect.stringContaining("cleanup denied") })]
+    })
+  } finally {
+    await host.dispose()
+    if (publicApiRoot) await rm(publicApiRoot, { recursive: true, force: true })
+    await rm(root, { recursive: true, force: true })
+  }
+}, 10_000)
+
 test("ExtensionHost contains a real worker crash during startup", async () => {
   const root = await mkdtemp(join(tmpdir(), "zi-extension-host-crash-"))
   const extensionPath = join(root, "crash.ts")

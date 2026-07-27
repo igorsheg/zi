@@ -172,6 +172,20 @@ test("host tool invocation is correlated, cancellable, and generation-reusable",
   await host.dispose()
 })
 
+test("a tool result crossing host cancellation settles as cancellation", async () => {
+  const workers = new TestWorkerSpawner()
+  workers.behaviors.push({ type: "tool_cancel_crossing" })
+  const host = await ExtensionHost.create(planOne, workers.spawn, testTimeouts)
+  await host.sessionStart("startup")
+  const controller = new AbortController()
+  const invocation = host.invokeTool("echo_message", { message: "pending" }, controller.signal)
+
+  controller.abort()
+  expect(invocation).rejects.toMatchObject({ name: "AbortError" })
+  expect(host.snapshot()).toMatchObject({ status: "ready", lifecycle: "started" })
+  await host.dispose()
+})
+
 test("a malformed tool result fails its generation without escaping the host", async () => {
   const workers = new TestWorkerSpawner()
   workers.behaviors.push({ type: "malformed_tool" })
@@ -184,6 +198,26 @@ test("a malformed tool result fails its generation without escaping the host", a
   await host.dispose()
 })
 
+test("a cancellation deadline fails a tool generation with source attribution", async () => {
+  const workers = new TestWorkerSpawner()
+  workers.behaviors.push({ type: "tool_hang" })
+  const timeouts = { ...testTimeouts, toolMs: 1_000, toolCancellationMs: 10 }
+  const host = await ExtensionHost.create(planOne, workers.spawn, timeouts)
+  await host.sessionStart("startup")
+  const controller = new AbortController()
+  const invocation = host.invokeTool("echo_message", { message: "pending" }, controller.signal)
+
+  controller.abort()
+  expect(invocation).rejects.toThrow("cancellation deadline exceeded")
+  await Bun.sleep(15)
+  expect(host.snapshot()).toMatchObject({
+    status: "failed",
+    failure: { phase: "tool", extensionId: sourceOne.id, path: sourceOne.entryPath }
+  })
+  expect(workers.processes[0]!.terminated).toEqual(["SIGTERM"])
+  await host.dispose()
+})
+
 test("a tool deadline fails and terminates its generation", async () => {
   const workers = new TestWorkerSpawner()
   workers.behaviors.push({ type: "tool_hang" })
@@ -193,7 +227,10 @@ test("a tool deadline fails and terminates its generation", async () => {
 
   expect(host.invokeTool("echo_message", { message: "pending" })).rejects.toThrow("deadline exceeded")
   await Bun.sleep(15)
-  expect(host.snapshot()).toMatchObject({ status: "failed", failure: { phase: "tool" } })
+  expect(host.snapshot()).toMatchObject({
+    status: "failed",
+    failure: { phase: "tool", extensionId: sourceOne.id, path: sourceOne.entryPath }
+  })
   expect(workers.processes[0]!.terminated).toEqual(["SIGTERM"])
   await host.dispose()
 })
@@ -354,7 +391,7 @@ type TestWorkerBehavior =
   | { readonly type: "ready" }
   | { readonly type: "wrong_ready" }
   | { readonly type: "fatal_start" }
-  | { readonly type: "tools" | "tool_hang" | "malformed_tool" }
+  | { readonly type: "tools" | "tool_hang" | "tool_cancel_crossing" | "malformed_tool" }
   | { readonly type: "spawn_error"; readonly message: string }
   | { readonly type: "fatal"; readonly message: string }
   | { readonly type: "pending" }
@@ -444,6 +481,7 @@ class TestWorkerProcess implements ExtensionWorkerProcess {
         tools:
           this.#behavior.type === "tools" ||
           this.#behavior.type === "tool_hang" ||
+          this.#behavior.type === "tool_cancel_crossing" ||
           this.#behavior.type === "malformed_tool"
             ? [toolRegistration(this.#plan.sources[0]!)]
             : []
@@ -453,6 +491,13 @@ class TestWorkerProcess implements ExtensionWorkerProcess {
     if (message.type === "cancel") {
       if (this.#behavior.type === "tools") {
         this.send({ type: "tool_cancelled", generation: message.generation, requestId: message.requestId })
+      } else if (this.#behavior.type === "tool_cancel_crossing") {
+        this.send({
+          type: "tool_result",
+          generation: message.generation,
+          requestId: message.requestId,
+          content: "late"
+        })
       }
       return
     }

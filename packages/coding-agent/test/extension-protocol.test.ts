@@ -14,6 +14,7 @@ import {
   maxExtensionProtocolFrameBytes,
   maxExtensionQueuedWrites,
   maxExtensionToolArgumentsBytes,
+  maxExtensionToolCatalogBytes,
   maxExtensionToolDescriptionBytes,
   maxExtensionToolResultBytes,
   maxExtensionToolSchemaBytes,
@@ -251,21 +252,54 @@ test("maximum admitted load results fit in one protocol frame", () => {
   expect(encodeExtensionProtocolFrame(message).byteLength).toBeLessThanOrEqual(maxExtensionProtocolFrameBytes + 4)
 })
 
-test("the maximum admitted tool catalog fits one ready frame", () => {
-  const path = resolve("root", "x".repeat(3_500))
-  const toolSource: ExtensionSource = { ...source, declaredPath: path, entryPath: path }
+test("tool catalogs have one aggregate ready-frame budget", () => {
+  const toolSource: ExtensionSource = { ...source }
+  const tools = Array.from({ length: maxExtensionTools }, (_, index) => ({
+    source: toolSource,
+    name: `tool_${index}`,
+    label: `Tool ${index}`,
+    description: "d".repeat(maxExtensionToolDescriptionBytes),
+    parameters: { type: "object", description: "s".repeat(maxExtensionToolSchemaBytes - 64), properties: {} }
+  }))
+
+  expect(() =>
+    validateWorkerMessage({
+      type: "ready",
+      protocolVersion: extensionProtocolVersion,
+      generation: 1,
+      extensions: [{ source: toolSource, status: "loaded" }],
+      tools
+    })
+  ).toThrow(`catalog cannot exceed ${maxExtensionToolCatalogBytes} bytes`)
+})
+
+test("maximum source results and an aggregate tool catalog fit one ready frame", () => {
+  const path = resolve("root", '"'.repeat(3_500))
+  const largestSource: ExtensionSource = {
+    id: "x".repeat(maxExtensionIdBytes),
+    declaredPath: path,
+    entryPath: path,
+    scope: "temporary",
+    origin: "cli"
+  }
+  const failed = {
+    source: largestSource,
+    status: "failed",
+    diagnostic: { extensionId: largestSource.id, path, phase: "import", severity: "error", message: '"'.repeat(2_048) }
+  }
+  const tools = Array.from({ length: maxExtensionTools }, (_, index) => ({
+    source,
+    name: `tool_${index}`,
+    label: `Tool ${index}`,
+    description: '"'.repeat(3_000),
+    parameters: { type: "object", properties: {} }
+  }))
   const message = validateWorkerMessage({
     type: "ready",
     protocolVersion: extensionProtocolVersion,
     generation: 1,
-    extensions: [{ source: toolSource, status: "loaded" }],
-    tools: Array.from({ length: maxExtensionTools }, (_, index) => ({
-      source: toolSource,
-      name: `tool_${index}`,
-      label: `Tool ${index}`,
-      description: "d".repeat(maxExtensionToolDescriptionBytes),
-      parameters: { type: "object", description: "s".repeat(maxExtensionToolSchemaBytes - 64), properties: {} }
-    }))
+    extensions: [...Array.from({ length: maxExtensionSources - 1 }, () => failed), { source, status: "loaded" }],
+    tools
   })
 
   expect(encodeExtensionProtocolFrame(message).byteLength).toBeLessThanOrEqual(maxExtensionProtocolFrameBytes + 4)

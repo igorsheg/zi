@@ -30,7 +30,9 @@ import {
   type ExtensionToolRegistration,
   type HostMessage,
   type JsonValue,
+  type WorkerMessage,
   validateExtensionToolArguments,
+  validateExtensionToolCatalog,
   validateExtensionToolRegistration,
   validateExtensionToolResult,
   validateHostMessage
@@ -75,11 +77,18 @@ interface RegisteredTool {
   ) => string | Promise<string>
 }
 
-interface WorkerToolInvocation {
+interface WorkerToolExecution {
   readonly requestId: number
   readonly generation: number
   readonly controller: AbortController
 }
+
+type WorkerToolInvocation =
+  | ({ readonly type: "running" } & WorkerToolExecution)
+  | ({ readonly type: "cancelling" } & WorkerToolExecution)
+  | { readonly type: "responding"; readonly requestId: number; readonly generation: number }
+
+type WorkerToolResponse = Extract<WorkerMessage, { type: "tool_result" | "tool_error" | "tool_cancelled" }>
 
 export interface ExtensionLifecycleResult {
   readonly diagnostics: readonly ExtensionDiagnostic[]
@@ -202,6 +211,8 @@ class ExtensionWorkerProcess {
   readonly #writer: ExtensionProtocolWriter
   readonly #terminal = deferred()
   readonly #toolInvocations = new Map<number, WorkerToolInvocation>()
+  readonly #settledToolRequests = new Set<number>()
+  readonly #settledToolRequestOrder: number[] = []
   #state: WorkerProcessState = { type: "awaiting_initialize" }
 
   constructor(output: Writable) {
@@ -261,6 +272,7 @@ class ExtensionWorkerProcess {
         return
       }
       const invocation: WorkerToolInvocation = {
+        type: "running",
         requestId: message.requestId,
         generation: message.generation,
         controller: new AbortController()
@@ -349,19 +361,19 @@ class ExtensionWorkerProcess {
 
   #cancelToolInvocation(message: Extract<HostMessage, { type: "cancel" }>): boolean {
     const invocation = this.#toolInvocations.get(message.requestId)
-    if (!invocation || invocation.generation !== message.generation) return false
-    this.#toolInvocations.delete(message.requestId)
+    if (!invocation) return this.#settledToolRequests.has(message.requestId)
+    if (invocation.generation !== message.generation) return false
+    if (invocation.type !== "running") return true
+    const cancelling: WorkerToolInvocation = { ...invocation, type: "cancelling" }
+    this.#toolInvocations.set(message.requestId, cancelling)
     invocation.controller.abort()
-    void this.#writer
-      .send({ type: "tool_cancelled", generation: message.generation, requestId: message.requestId })
-      .catch(cause => this.#fail(cause))
     return true
   }
 
   async #invokeTool(
     extensions: LoadedExtensionGeneration,
     message: Extract<HostMessage, { type: "tool_invoke" }>,
-    invocation: WorkerToolInvocation
+    invocation: Extract<WorkerToolInvocation, { type: "running" }>
   ): Promise<void> {
     let outcome:
       | { readonly type: "result"; readonly content: string }
@@ -373,27 +385,53 @@ class ExtensionWorkerProcess {
     } catch (cause) {
       outcome = { type: "error", message: boundedExtensionToolError(cause) }
     }
-    if (this.#toolInvocations.get(message.requestId) !== invocation) return
-    this.#toolInvocations.delete(message.requestId)
-    const response =
-      outcome.type === "result"
-        ? {
-            type: "tool_result" as const,
-            generation: message.generation,
-            requestId: message.requestId,
-            content: outcome.content
-          }
-        : {
-            type: "tool_error" as const,
-            generation: message.generation,
-            requestId: message.requestId,
-            message: outcome.message
-          }
+    const current = this.#toolInvocations.get(message.requestId)
+    if (!current || current.type === "responding" || current.controller !== invocation.controller) return
+    const response: WorkerToolResponse =
+      current.type === "cancelling"
+        ? { type: "tool_cancelled", generation: message.generation, requestId: message.requestId }
+        : outcome.type === "result"
+          ? {
+              type: "tool_result",
+              generation: message.generation,
+              requestId: message.requestId,
+              content: outcome.content
+            }
+          : {
+              type: "tool_error",
+              generation: message.generation,
+              requestId: message.requestId,
+              message: outcome.message
+            }
+    await this.#respondTool(current, response)
+  }
+
+  async #respondTool(
+    invocation: Exclude<WorkerToolInvocation, { type: "responding" }>,
+    response: WorkerToolResponse
+  ): Promise<void> {
+    const responding: WorkerToolInvocation = {
+      type: "responding",
+      generation: invocation.generation,
+      requestId: invocation.requestId
+    }
+    this.#toolInvocations.set(invocation.requestId, responding)
     try {
       await this.#writer.send(response)
+      if (this.#toolInvocations.get(invocation.requestId) !== responding) return
+      this.#toolInvocations.delete(invocation.requestId)
+      this.#rememberSettledToolRequest(invocation.requestId)
     } catch (cause) {
       this.#fail(cause)
     }
+  }
+
+  #rememberSettledToolRequest(requestId: number): void {
+    this.#settledToolRequests.add(requestId)
+    this.#settledToolRequestOrder.push(requestId)
+    if (this.#settledToolRequestOrder.length <= maxExtensionPendingRequests) return
+    const evicted = this.#settledToolRequestOrder.shift()
+    if (evicted !== undefined) this.#settledToolRequests.delete(evicted)
   }
 
   async #dispatch(
@@ -481,8 +519,12 @@ class ExtensionWorkerProcess {
   }
 
   #abortToolInvocations(): void {
-    for (const invocation of this.#toolInvocations.values()) invocation.controller.abort()
+    for (const invocation of this.#toolInvocations.values()) {
+      if (invocation.type !== "responding") invocation.controller.abort()
+    }
     this.#toolInvocations.clear()
+    this.#settledToolRequests.clear()
+    this.#settledToolRequestOrder.length = 0
   }
 
   #fail(cause: unknown): void {
@@ -591,6 +633,11 @@ export async function loadExtensionGeneration(
         if (toolNames.has(name) || localToolNames.has(name)) {
           throw new ExtensionRegistrationError(`Duplicate extension tool name: ${name}`)
         }
+        validateExtensionToolCatalog([
+          ...tools.map(tool => tool.registration),
+          ...localTools.map(tool => tool.registration),
+          registered.registration
+        ])
         localToolNames.add(name)
         localTools.push(registered)
       }
