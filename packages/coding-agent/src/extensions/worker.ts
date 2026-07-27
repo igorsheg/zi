@@ -254,13 +254,13 @@ class ExtensionWorkerProcess {
       const extensions = await loadExtensionGeneration(message.plan, message.generation)
       const state = this.#state
       if (state.type !== "initializing" || state.generation !== message.generation) return
+      this.#state = { type: "ready", generation: message.generation, extensions }
       await this.#writer.send({
         type: "ready",
         protocolVersion: extensionProtocolVersion,
         generation: message.generation,
         extensions: extensions.results
       })
-      if (this.#state === state) this.#state = { type: "ready", generation: message.generation, extensions }
     } catch (cause) {
       this.#fatal(message.generation, fatalDiagnostic("handshake", cause), cause)
     } finally {
@@ -301,14 +301,14 @@ class ExtensionWorkerProcess {
         this.#fatal(message.generation, result.fatal, new Error(result.fatal.message))
         return
       }
-      await this.#writer.send({ type: "settled", generation: message.generation, requestId: message.requestId })
       const completedState = this.#state
       if (
-        (completedState.type === "dispatching" || completedState.type === "cancelling") &&
-        completedState.requestId === message.requestId
-      ) {
-        this.#state = { type: "ready", generation: message.generation, extensions }
-      }
+        (completedState.type !== "dispatching" && completedState.type !== "cancelling") ||
+        completedState.requestId !== message.requestId
+      )
+        return
+      this.#state = { type: "ready", generation: message.generation, extensions }
+      await this.#writer.send({ type: "settled", generation: message.generation, requestId: message.requestId })
     } catch (cause) {
       this.#fatal(message.generation, fatalDiagnostic("lifecycle", cause), cause)
     } finally {

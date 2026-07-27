@@ -2,7 +2,7 @@ import { expect, test } from "bun:test"
 import { mkdtemp, readFile, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { PassThrough } from "node:stream"
+import { PassThrough, Writable } from "node:stream"
 
 import type { ExtensionLoadPlan, ExtensionSource } from "../src/extensions/discovery.js"
 import {
@@ -47,6 +47,32 @@ export default function (zi): void {
   expect(await readFile(log, "utf8")).toBe("start:startup\nstop:quit\n")
   messages.dispose()
   output.destroy()
+})
+
+test("worker process commits transitions before publishing their acknowledgements", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-extension-worker-ack-"))
+  const extension = await fixture(root, "loaded.ts", `export default function () {}\n`)
+  const input = new PassThrough()
+  const output = new ControlledWorkerOutput()
+  const run = runExtensionWorkerProcess(input, output)
+
+  send(input, initialize(extensionPlan(root, [extension])))
+  expect((await output.next()).type).toBe("ready")
+  send(input, { type: "session_start", generation: 1, requestId: 1, reason: "startup" })
+  output.releaseWrite()
+
+  expect(await output.next()).toEqual({ type: "settled", generation: 1, requestId: 1 })
+  send(input, { type: "session_shutdown", generation: 1, requestId: 2, reason: "quit" })
+  output.releaseWrite()
+
+  expect(await output.next()).toEqual({ type: "settled", generation: 1, requestId: 2 })
+  send(input, { type: "stop", generation: 1, requestId: 3 })
+  output.releaseWrite()
+
+  expect(await output.next()).toEqual({ type: "settled", generation: 1, requestId: 3 })
+  output.releaseWrite()
+  await run
+  output.endProtocol()
 })
 
 test("worker process keeps reading while a lifecycle handler is pending", async () => {
@@ -218,6 +244,38 @@ test("worker process rejects malformed input before initialization", async () =>
   expect(run).rejects.toThrow("frames cannot be empty")
   output.destroy()
 })
+
+class ControlledWorkerOutput extends Writable {
+  readonly #decoder = new ExtensionProtocolDecoder(validateWorkerMessage)
+  readonly #messages: WorkerMessage[] = []
+  readonly #waiters: Array<(message: WorkerMessage) => void> = []
+  readonly #writes: Array<() => void> = []
+
+  override _write(chunk: Buffer, _encoding: BufferEncoding, callback: (error?: Error | null) => void): void {
+    for (const message of this.#decoder.push(chunk)) {
+      const waiter = this.#waiters.shift()
+      if (waiter) waiter(message)
+      else this.#messages.push(message)
+    }
+    this.#writes.push(callback)
+  }
+
+  next(): Promise<WorkerMessage> {
+    const message = this.#messages.shift()
+    if (message) return Promise.resolve(message)
+    return new Promise(resolve => this.#waiters.push(resolve))
+  }
+
+  releaseWrite(): void {
+    const write = this.#writes.shift()
+    if (!write) throw new Error("Extension worker has no protocol write to release")
+    write()
+  }
+
+  endProtocol(): void {
+    this.#decoder.end()
+  }
+}
 
 class WorkerMessageQueue {
   readonly #stream: PassThrough
