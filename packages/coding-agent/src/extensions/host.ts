@@ -1344,11 +1344,30 @@ export function createExtensionWorkerSpawner(
       publicApi.dispose()
       throw cause
     }
-    const protocol = child.stdio[3]
-    if (!child.stdin || !child.stdout || !child.stderr || !(protocol instanceof Readable)) {
+    let input: Writable
+    let stdout: Readable
+    let stderr: Readable
+    let protocol: Readable
+    try {
+      const childProtocol = child.stdio[3]
+      if (!child.stdin || !child.stdout || !child.stderr || !(childProtocol instanceof Readable)) {
+        throw new Error("Extension worker process did not expose all required pipes")
+      }
+      input = child.stdin
+      stdout = child.stdout
+      stderr = child.stderr
+      protocol = childProtocol
+    } catch (cause) {
+      child.once("error", () => {})
       child.kill("SIGKILL")
-      publicApi.dispose()
-      throw new Error("Extension worker process did not expose all required pipes")
+      child.unref()
+      const cleanupError = publicApi.dispose()
+      if (cleanupError) {
+        throw new Error(`${errorMessage(cause, "Could not connect extension worker pipes")}; ${cleanupError.message}`, {
+          cause
+        })
+      }
+      throw cause
     }
 
     let settled = false
@@ -1378,9 +1397,9 @@ export function createExtensionWorkerSpawner(
     child.on("close", onClose)
 
     return {
-      input: child.stdin,
-      stdout: child.stdout,
-      stderr: child.stderr,
+      input,
+      stdout,
+      stderr,
       protocol,
       exited,
       terminate(force) {
