@@ -91,6 +91,53 @@ test("RPC mode sequences authoritative events, concurrent interruption, and page
   }
 })
 
+test("RPC exposes committed custom entries while message pages retain presentation policy", async () => {
+  const models = createModels()
+  const runtime = await createTestAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
+  const input = new RpcTestInput()
+  const output = new RpcTestOutput()
+  const running = runRpcMode(runtime.session, { input, writer: output })
+
+  try {
+    await output.frame(frame => frame.type === "ready")
+    runtime.session.appendCustomEntry("example.state", { enabled: true })
+    runtime.session.sendCustomMessage(
+      { customType: "example.visible", content: "visible", display: true },
+      { type: "append" }
+    )
+    runtime.session.sendCustomMessage(
+      { customType: "example.hidden", content: "hidden", display: false },
+      { type: "append" }
+    )
+    await output.frame(
+      frame =>
+        frame.type === "session_event" &&
+        frame.event.type === "entry_appended" &&
+        frame.event.entry.type === "custom_message" &&
+        frame.event.entry.customType === "example.hidden"
+    )
+
+    const appended = output.frames.flatMap(frame =>
+      frame.type === "session_event" && frame.event.type === "entry_appended" ? [frame.event.entry.type] : []
+    )
+    expect(appended).toEqual(["custom", "custom_message", "custom_message"])
+
+    input.send({ version: 1, id: "messages", method: "session.get_messages", params: { start: 0, limit: 100 } })
+    const page = await output.response("messages")
+    if (!page.ok || !isMessagePage(page.result)) throw new Error("Expected custom message page")
+    expect(page.result.messages).toEqual([
+      expect.objectContaining({ role: "custom", customType: "example.visible", content: "visible" })
+    ])
+
+    input.close()
+    expect(await running).toEqual({ type: "eof" })
+  } finally {
+    input.close()
+    runtime.session.dispose()
+    await runtime.session.waitForIdle()
+  }
+})
+
 test("RPC mode bounds concurrent waits while reserving interruption capacity", async () => {
   const models = createModels()
   const faux = fauxProvider({ provider: "rpc-capacity", models: [{ id: "model", name: "Model" }] })

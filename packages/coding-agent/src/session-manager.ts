@@ -16,6 +16,7 @@ import { open, opendir, rm, stat, unlink } from "node:fs/promises"
 import { dirname, join } from "node:path"
 
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core"
+import type { ImageContent, TextContent } from "@earendil-works/pi-ai"
 
 import { formatCompactionSummary, type AgentMessage, type CompactionSummaryMessage } from "./messages.js"
 import { type ZiPaths, resolveZiPath } from "./paths.js"
@@ -70,17 +71,52 @@ export interface CompactionEntryData {
   readonly excludedFailureEntryId?: string
 }
 
+export type SessionJson =
+  | null
+  | boolean
+  | number
+  | string
+  | readonly SessionJson[]
+  | { readonly [key: string]: SessionJson }
+
+export interface CustomEntryData {
+  readonly type: "custom"
+  readonly customType: string
+  readonly data?: SessionJson
+}
+
+export type CustomMessageContent = string | readonly (TextContent | ImageContent)[]
+
+export interface CustomMessageEntryData {
+  readonly type: "custom_message"
+  readonly customType: string
+  readonly content: CustomMessageContent
+  readonly display: boolean
+  readonly details?: SessionJson
+}
+
+export interface CustomMessageInput {
+  readonly customType: string
+  readonly content: CustomMessageContent
+  readonly display: boolean
+  readonly details?: SessionJson
+}
+
 export type SessionEntryData =
   | { type: "message"; message: AgentMessage }
   | { type: "model_change"; provider: string; modelId: string }
   | { type: "thinking_level_change"; thinkingLevel: ThinkingLevel }
   | RetryEntryData
   | CompactionEntryData
+  | CustomEntryData
+  | CustomMessageEntryData
 
 export type SessionEntry = SessionEntryBase & SessionEntryData
 export type MessageEntry = SessionEntryBase & Extract<SessionEntryData, { type: "message" }>
 export type RetryEntry = SessionEntryBase & RetryEntryData
 export type CompactionEntry = SessionEntryBase & CompactionEntryData
+export type CustomEntry = SessionEntryBase & CustomEntryData
+export type CustomMessageEntry = SessionEntryBase & CustomMessageEntryData
 
 export interface NewSessionOptions {
   sessionId?: string
@@ -99,6 +135,15 @@ export const maxSessionPromptHistoryBytes = 8 * 1024 * 1024
 export const maxCompactionSummaryBytes = 128 * 1024
 export const maxCompactionFilePaths = 256
 export const maxCompactionPathBytes = 4096
+export const maxCustomTypeBytes = 128
+export const maxCustomJsonDepth = 32
+export const maxCustomJsonNodes = 4096
+export const maxCustomJsonBytes = 256 * 1024
+export const maxCustomMessageBytes = 1024 * 1024
+export const maxCustomStateEntries = 2048
+export const maxCustomStateBytes = 2 * 1024 * 1024
+
+const customTypePattern = /^[a-z][a-z0-9._:/-]*$/
 
 const currentSessionFormat: SessionFormatVersion = 2
 const sessionReadBufferBytes = 64 * 1024
@@ -147,6 +192,8 @@ export interface SessionJournalMemoryDiagnostics {
   readonly journalBytes: number
   readonly residentEntryBytes: number
   readonly imageBlobBytes: number
+  readonly customStateEntries: number
+  readonly customStateBytes: number
   readonly coldMemoryBytes: number
   readonly coldMemoryLogicalBytes: number
   readonly coldMemoryBlocks: number
@@ -173,7 +220,13 @@ interface StoredAgentMessage extends Record<string, unknown> {
 }
 
 type StoredMessageEntry = SessionEntryBase & { readonly type: "message"; readonly message: StoredAgentMessage }
-type StoredSessionEntry = Exclude<SessionEntry, MessageEntry> | StoredMessageEntry
+type StoredCustomMessageContent = string | readonly (TextContent | ImageContent | StoredImageReference)[]
+type StoredCustomMessageEntry = SessionEntryBase &
+  Omit<CustomMessageEntryData, "content"> & { readonly content: StoredCustomMessageContent }
+type StoredSessionEntry =
+  | Exclude<SessionEntry, MessageEntry | CustomMessageEntry>
+  | StoredMessageEntry
+  | StoredCustomMessageEntry
 
 interface PreparedBlob {
   readonly sha256: string
@@ -222,6 +275,8 @@ interface LoadedJournal {
   readonly journalBytes: number
   readonly imageBlobs: Map<string, number>
   readonly imageBlobBytes: number
+  readonly customEntries: CustomEntry[]
+  readonly customStateBytes: number
   readonly appendRepair?: { readonly type: "truncate"; readonly offset: number } | { readonly type: "newline" }
 }
 
@@ -232,6 +287,13 @@ export class SessionCapacityError extends Error {
   }
 }
 
+export class CustomStateCapacityError extends Error {
+  constructor() {
+    super(`Custom session state cannot exceed ${maxCustomStateEntries} entries or ${maxCustomStateBytes} bytes`)
+    this.name = "CustomStateCapacityError"
+  }
+}
+
 export class SessionManager {
   readonly header: SessionHeader
   #persistence: SessionPersistence
@@ -239,9 +301,11 @@ export class SessionManager {
   readonly #residentRecordBytes: number[] = []
   #presentationMessages: AgentMessage[] = []
   readonly #promptHistory: SessionPromptHistoryEntry[] = []
+  readonly #customEntries: CustomEntry[] = []
   #coldMemory: readonly SessionColdBlock[] = []
   readonly #imageBlobs = new Map<string, number>()
   #promptHistoryBytes = 0
+  #customStateBytes = 0
   #leafId: string | null = null
   #entryCount = 0
   #journalBytes: number
@@ -296,6 +360,8 @@ export class SessionManager {
     manager.#entryCount = loaded.entryCount
     manager.#journalBytes = loaded.journalBytes
     manager.#imageBlobBytes = loaded.imageBlobBytes
+    manager.#customEntries.push(...loaded.customEntries)
+    manager.#customStateBytes = loaded.customStateBytes
     for (const [digest, bytes] of loaded.imageBlobs) manager.#imageBlobs.set(digest, bytes)
     manager.#model = loaded.model
     manager.#thinkingLevel = loaded.thinkingLevel
@@ -381,7 +447,34 @@ export class SessionManager {
 
   appendMessage(message: AgentMessage): MessageEntry {
     if (!isAgentMessage(message)) throw new Error("Invalid session message")
+    if (message.role === "custom") throw new Error("Custom messages must use appendCustomMessage()")
     return this.#append({ type: "message", message })
+  }
+
+  appendCustomEntry(customType: string, data?: SessionJson): CustomEntry {
+    validateCustomType(customType)
+    if (data === undefined) return this.#append({ type: "custom", customType })
+    return this.#append({ type: "custom", customType, data: snapshotSessionJson(data) })
+  }
+
+  appendCustomMessage(message: CustomMessageInput): CustomMessageEntry {
+    const snapshot = snapshotCustomMessage(message)
+    return this.#append(
+      snapshot.details === undefined
+        ? {
+            type: "custom_message",
+            customType: snapshot.customType,
+            content: snapshot.content,
+            display: snapshot.display
+          }
+        : {
+            type: "custom_message",
+            customType: snapshot.customType,
+            content: snapshot.content,
+            display: snapshot.display,
+            details: snapshot.details
+          }
+    )
   }
 
   appendModelChange(provider: string, modelId: string): SessionEntry {
@@ -435,11 +528,16 @@ export class SessionManager {
   }
 
   activeMessages(): AgentMessage[] {
-    return projectMessages(this.activeEntries())
+    return projectMessages(this.activeEntries(), "context")
   }
 
   presentationMessages(): readonly AgentMessage[] {
     return this.#presentationMessages
+  }
+
+  customEntries(customType: string): readonly CustomEntry[] {
+    validateCustomType(customType)
+    return this.#customEntries.filter(entry => entry.customType === customType)
   }
 
   latestCompaction(): CompactionEntry | undefined {
@@ -472,6 +570,8 @@ export class SessionManager {
       journalBytes: this.#journalBytes,
       residentEntryBytes: this.#residentRecordBytes.reduce((total, bytes) => total + bytes, 0),
       imageBlobBytes: this.#imageBlobBytes,
+      customStateEntries: this.#customEntries.length,
+      customStateBytes: this.#customStateBytes,
       coldMemoryBytes: sessionColdBytes(this.#coldMemory),
       coldMemoryLogicalBytes: sessionColdLogicalBytes(this.#coldMemory),
       coldMemoryBlocks: this.#coldMemory.length
@@ -506,6 +606,17 @@ export class SessionManager {
       timestamp: new Date().toISOString()
     } as SessionEntryBase & Entry
     validateNextEntry(next, this.#entries, this.file ?? "<memory>")
+    if (next.type === "custom") freezeCustomEntry(next)
+    else if (next.type === "custom_message") freezeCustomMessageEntry(next)
+
+    const customStateBytes = next.type === "custom" ? serializedCustomStateBytes(next) : 0
+    if (
+      next.type === "custom" &&
+      (this.#customEntries.length === maxCustomStateEntries ||
+        this.#customStateBytes + customStateBytes > maxCustomStateBytes)
+    ) {
+      throw new CustomStateCapacityError()
+    }
 
     const prepared = prepareRecord(next, this.header.version, this.#persistence.type !== "memory")
     const newBlobBytes = additionalBlobBytes(prepared.blobs, this.#imageBlobs)
@@ -527,6 +638,10 @@ export class SessionManager {
       this.#imageBlobs.set(blob.sha256, blob.bytes)
       this.#imageBlobBytes += blob.bytes
     }
+    if (next.type === "custom") {
+      this.#customEntries.push(next)
+      this.#customStateBytes += customStateBytes
+    }
     this.#updatePresentationMessages(next)
     this.#considerPromptHistoryEntry(next)
     this.#considerSessionContextEntry(next)
@@ -536,12 +651,16 @@ export class SessionManager {
   }
 
   #updatePresentationMessages(entry: SessionEntry): void {
-    if (entry.type === "compaction") this.#rebuildPresentationMessages()
-    else if (entry.type === "message") this.#presentationMessages.push(entry.message)
+    if (entry.type === "compaction") {
+      this.#rebuildPresentationMessages()
+      return
+    }
+    const message = sessionEntryToPresentationMessage(entry)
+    if (message) this.#presentationMessages.push(message)
   }
 
   #rebuildPresentationMessages(): void {
-    this.#presentationMessages = projectMessages(projectSessionEntries(this.#entries, "presentation"))
+    this.#presentationMessages = projectMessages(projectSessionEntries(this.#entries, "presentation"), "presentation")
   }
 
   #considerPromptHistoryEntry(entry: SessionEntry): void {
@@ -603,7 +722,13 @@ export class SessionManager {
       return
     }
 
-    if (next.type !== "message" || next.message.role !== "assistant") return
+    if (
+      next.type !== "custom" &&
+      next.type !== "custom_message" &&
+      (next.type !== "message" || next.message.role !== "assistant")
+    ) {
+      return
+    }
 
     const entries = [...this.#entries, next]
     const records = entries.map(entry => prepareRecord(entry, this.header.version, true))
@@ -695,6 +820,8 @@ function loadJournal(file: string, retention: "active" | "all"): LoadedJournal {
   let promptHistoryBytes = 0
   const imageBlobs = new Map<string, number>()
   let imageBlobBytes = 0
+  const customEntries: CustomEntry[] = []
+  let customStateBytes = 0
   let previous: EntryReference | undefined
   let entryCount = 0
   let latestBoundaryId: string | undefined
@@ -730,6 +857,13 @@ function loadJournal(file: string, retention: "active" | "all"): LoadedJournal {
       entryCount++
 
       if (entry.type === "compaction") latestBoundaryId = entry.firstKeptEntryId
+      if (entry.type === "custom") {
+        customEntries.push(freezeCustomEntry(entry))
+        customStateBytes += serializedCustomStateBytes(entry)
+        if (customEntries.length > maxCustomStateEntries || customStateBytes > maxCustomStateBytes) {
+          throw new CustomStateCapacityError()
+        }
+      }
       if (entry.type === "model_change") model = { provider: entry.provider, modelId: entry.modelId }
       else if (entry.type === "thinking_level_change") thinkingLevel = entry.thinkingLevel
       else if (entry.type === "message") {
@@ -749,7 +883,10 @@ function loadJournal(file: string, retention: "active" | "all"): LoadedJournal {
             }
           }
         }
-        for (const image of storedImageReferences(entry.message)) {
+      }
+      if (entry.type === "message" || entry.type === "custom_message") {
+        const content = entry.type === "message" ? entry.message.content : entry.content
+        for (const image of storedImageReferences(content)) {
           const previousBytes = imageBlobs.get(image.blob.sha256)
           if (previousBytes !== undefined && previousBytes !== image.blob.bytes) {
             throw new Error(`Invalid session image reference: ${file}`)
@@ -804,6 +941,8 @@ function loadJournal(file: string, retention: "active" | "all"): LoadedJournal {
       journalBytes,
       imageBlobs,
       imageBlobBytes,
+      customEntries,
+      customStateBytes,
       ...(repair === "truncate"
         ? { appendRepair: { type: "truncate" as const, offset: validBytes } }
         : repair === "newline"
@@ -879,7 +1018,7 @@ function parseHeader(line: string, file: string): SessionHeader {
     value.type !== "session" ||
     (value.version !== 1 && value.version !== 2) ||
     typeof value.id !== "string" ||
-    typeof value.timestamp !== "string" ||
+    !isValidTimestamp(value.timestamp) ||
     typeof value.cwd !== "string"
   ) {
     throw new Error(`Invalid session header: ${file}`)
@@ -893,7 +1032,7 @@ function parseStoredEntry(line: string, file: string, version: SessionFormatVers
     !isRecord(value) ||
     typeof value.id !== "string" ||
     (value.parentId !== null && typeof value.parentId !== "string") ||
-    typeof value.timestamp !== "string"
+    !isValidTimestamp(value.timestamp)
   ) {
     throw new Error(`Invalid session entry: ${file}`)
   }
@@ -910,6 +1049,21 @@ function parseStoredEntry(line: string, file: string, version: SessionFormatVers
   }
   if (value.type === "retry" && typeof value.failedEntryId === "string" && isRetryAttempt(value.attempt)) {
     return { ...base, type: value.type, failedEntryId: value.failedEntryId, attempt: value.attempt }
+  }
+  if (value.type === "custom" && isStoredCustomEntry(value)) {
+    return value.data === undefined
+      ? { ...base, type: value.type, customType: value.customType }
+      : { ...base, type: value.type, customType: value.customType, data: value.data }
+  }
+  if (value.type === "custom_message" && isStoredCustomMessageEntry(value, version)) {
+    return {
+      ...base,
+      type: value.type,
+      customType: value.customType,
+      content: value.content,
+      display: value.display,
+      ...(value.details === undefined ? {} : { details: value.details })
+    }
   }
   if (value.type === "compaction" && isCompactionEntryData(value)) {
     return {
@@ -928,15 +1082,28 @@ function parseStoredEntry(line: string, file: string, version: SessionFormatVers
 }
 
 function hydrateStoredEntry(entry: StoredSessionEntry, file: string | undefined): SessionEntry {
-  if (entry.type !== "message") return entry
-  const content = entry.message.content
-  if (!Array.isArray(content) || !content.some(isStoredImageReference)) {
-    if (!isAgentMessage(entry.message)) throw new Error(`Invalid session message: ${file ?? "<memory>"}`)
-    return { ...entry, message: entry.message }
+  if (entry.type === "message") {
+    const content = hydrateStoredContent(entry.message.content, file)
+    const message = content === entry.message.content ? entry.message : { ...entry.message, content }
+    if (!isAgentMessage(message)) throw new Error(`Invalid session message: ${file ?? "<memory>"}`)
+    return { ...entry, message }
   }
+  if (entry.type === "custom") return freezeCustomEntry(entry)
+  if (entry.type === "custom_message") {
+    const content = hydrateStoredContent(entry.content, file)
+    if (!isRuntimeCustomMessageContent(content)) {
+      throw new Error(`Invalid session message: ${file ?? "<memory>"}`)
+    }
+    return freezeCustomMessageEntry({ ...entry, content })
+  }
+  return entry
+}
+
+function hydrateStoredContent(content: unknown, file: string | undefined): unknown {
+  if (!Array.isArray(content) || !content.some(isStoredImageReference)) return content
   if (!file) throw new Error("In-memory session cannot reference an image blob")
 
-  const hydratedContent = content.map(part => {
+  return content.map(part => {
     if (!isStoredImageReference(part)) return part
     const path = join(blobDirectory(file), part.blob.sha256)
     const data = readFileSync(path)
@@ -945,9 +1112,6 @@ function hydrateStoredEntry(entry: StoredSessionEntry, file: string | undefined)
     }
     return { type: "image" as const, mimeType: part.mimeType, data: data.toString("base64") }
   })
-  const message = { ...entry.message, content: hydratedContent }
-  if (!isAgentMessage(message)) throw new Error(`Invalid session message: ${file}`)
-  return { ...entry, message }
 }
 
 function validateStoredJournalEntry(
@@ -996,43 +1160,55 @@ function validateStoredJournalEntry(
 }
 
 function storedEntryReference(entry: StoredSessionEntry, index: number): EntryReference {
-  if (entry.type !== "message") {
-    return { id: entry.id, index, type: entry.type, contextVisible: false }
+  if (entry.type === "custom_message") {
+    return { id: entry.id, index, type: entry.type, role: "custom", contextVisible: true }
   }
-  const excludeFromContext = entry.message.role === "bashExecution" && entry.message.excludeFromContext === true
-  return {
-    id: entry.id,
-    index,
-    type: entry.type,
-    role: entry.message.role,
-    stopReason: entry.message.stopReason,
-    contextVisible: !excludeFromContext
+  if (entry.type === "message") {
+    const excludeFromContext = entry.message.role === "bashExecution" && entry.message.excludeFromContext === true
+    return {
+      id: entry.id,
+      index,
+      type: entry.type,
+      role: entry.message.role,
+      stopReason: entry.message.stopReason,
+      contextVisible: !excludeFromContext
+    }
   }
+  return { id: entry.id, index, type: entry.type, contextVisible: false }
 }
 
 function prepareRecord(entry: SessionEntry, version: SessionFormatVersion, externalizeImages: boolean): PreparedRecord {
   const blobs = new Map<string, PreparedBlob>()
   let stored: unknown = entry
-  if (
-    version === 2 &&
-    externalizeImages &&
-    entry.type === "message" &&
-    "content" in entry.message &&
-    Array.isArray(entry.message.content)
-  ) {
-    let changed = false
-    const content = entry.message.content.map(part => {
-      if (part.type !== "image") return part
-      changed = true
-      const data = decodeBase64(part.data)
-      const digest = sha256(data)
-      blobs.set(digest, { sha256: digest, bytes: data.byteLength, data })
-      return { type: "image" as const, mimeType: part.mimeType, blob: { sha256: digest, bytes: data.byteLength } }
-    })
-    if (changed) stored = { ...entry, message: { ...entry.message, content } }
+  if (version === 2 && externalizeImages) {
+    if (entry.type === "message" && "content" in entry.message && Array.isArray(entry.message.content)) {
+      const content = externalizeContentImages(entry.message.content, blobs)
+      if (content !== entry.message.content) stored = { ...entry, message: { ...entry.message, content } }
+    } else if (entry.type === "custom_message" && Array.isArray(entry.content)) {
+      const content = externalizeContentImages(entry.content, blobs)
+      if (content !== entry.content) stored = { ...entry, content }
+    }
   }
   const line = `${JSON.stringify(stored)}\n`
   return { line, bytes: Buffer.byteLength(line), blobs }
+}
+
+function externalizeContentImages(content: readonly unknown[], blobs: Map<string, PreparedBlob>): readonly unknown[] {
+  if (!content.some(part => isRecord(part) && part.type === "image")) return content
+  return content.map(part => {
+    if (
+      !isRecord(part) ||
+      part.type !== "image" ||
+      typeof part.mimeType !== "string" ||
+      typeof part.data !== "string"
+    ) {
+      return part
+    }
+    const data = decodeBase64(part.data)
+    const digest = sha256(data)
+    blobs.set(digest, { sha256: digest, bytes: data.byteLength, data })
+    return { type: "image" as const, mimeType: part.mimeType, blob: { sha256: digest, bytes: data.byteLength } }
+  })
 }
 
 function decodeBase64(value: string): Buffer {
@@ -1255,6 +1431,214 @@ function isAgentMessage(value: unknown): value is AgentMessage {
   return isStoredAgentMessage(value, 1)
 }
 
+function freezeCustomEntry(entry: CustomEntry): CustomEntry {
+  if (entry.data !== undefined) freezeSessionJson(entry.data)
+  return Object.freeze(entry)
+}
+
+function freezeCustomMessageEntry(entry: CustomMessageEntry): CustomMessageEntry {
+  if (Array.isArray(entry.content)) {
+    for (const part of entry.content) Object.freeze(part)
+    Object.freeze(entry.content)
+  }
+  if (entry.details !== undefined) freezeSessionJson(entry.details)
+  return Object.freeze(entry)
+}
+
+function freezeSessionJson(value: SessionJson): void {
+  if (value === null || typeof value !== "object") return
+  const pending: object[] = [value]
+  while (pending.length > 0) {
+    const current = pending.pop()!
+    for (const child of Object.values(current)) {
+      if (child !== null && typeof child === "object") pending.push(child)
+    }
+    Object.freeze(current)
+  }
+}
+
+function snapshotCustomMessage(value: unknown): CustomMessageInput {
+  let snapshot: unknown
+  try {
+    snapshot = structuredClone(value)
+  } catch {
+    throw new Error("Invalid custom message")
+  }
+  validateCustomMessageInput(snapshot)
+  return snapshot
+}
+
+function snapshotSessionJson(value: unknown): SessionJson {
+  let snapshot: unknown
+  try {
+    snapshot = structuredClone(value)
+  } catch {
+    throw new Error("Invalid session entry")
+  }
+  if (!isSessionJson(snapshot)) throw new Error("Invalid session entry")
+  return snapshot
+}
+
+export function validateCustomMessageInput(value: unknown): asserts value is CustomMessageInput {
+  if (!isRecord(value)) throw new Error("Invalid custom message")
+  const candidate = {
+    type: "custom_message",
+    id: "validation",
+    parentId: null,
+    timestamp: new Date(0).toISOString(),
+    customType: value.customType,
+    content: value.content,
+    display: value.display,
+    ...(value.details === undefined ? {} : { details: value.details })
+  }
+  if (
+    !hasOnlyKeys(value, ["customType", "content", "display", "details"]) ||
+    !isStoredCustomMessageEntry(candidate, 1)
+  ) {
+    throw new Error("Invalid custom message")
+  }
+}
+
+function isStoredCustomEntry(value: unknown): value is Record<string, unknown> & CustomEntryData {
+  return (
+    isRecord(value) &&
+    hasOnlyKeys(value, ["type", "id", "parentId", "timestamp", "customType", "data"]) &&
+    isCustomType(value.customType) &&
+    (value.data === undefined || isSessionJson(value.data))
+  )
+}
+
+function isStoredCustomMessageEntry(
+  value: unknown,
+  version: SessionFormatVersion
+): value is Record<string, unknown> & Omit<StoredCustomMessageEntry, keyof SessionEntryBase> {
+  return (
+    isRecord(value) &&
+    hasOnlyKeys(value, ["type", "id", "parentId", "timestamp", "customType", "content", "display", "details"]) &&
+    isCustomType(value.customType) &&
+    isStoredCustomMessageContent(value.content, version) &&
+    serializedBytesAtMost(value.content, maxCustomMessageBytes) &&
+    typeof value.display === "boolean" &&
+    (value.details === undefined || isSessionJson(value.details))
+  )
+}
+
+function isRuntimeCustomMessageContent(value: unknown): value is CustomMessageContent {
+  return isStoredCustomMessageContent(value, 1)
+}
+
+function isStoredCustomMessageContent(
+  value: unknown,
+  version: SessionFormatVersion
+): value is StoredCustomMessageContent {
+  return (
+    typeof value === "string" ||
+    (Array.isArray(value) &&
+      value.every(part => {
+        if (!isRecord(part)) return false
+        if (part.type === "text") return hasOnlyKeys(part, ["type", "text"]) && typeof part.text === "string"
+        if (part.type !== "image" || typeof part.mimeType !== "string") return false
+        if (typeof part.data === "string") {
+          return hasOnlyKeys(part, ["type", "mimeType", "data"]) && isValidBase64(part.data)
+        }
+        return (
+          version === 2 &&
+          hasOnlyKeys(part, ["type", "mimeType", "blob"]) &&
+          isStoredImageReference(part) &&
+          hasOnlyKeys(part.blob, ["sha256", "bytes"])
+        )
+      }))
+  )
+}
+
+function isCustomType(value: unknown): value is string {
+  return typeof value === "string" && Buffer.byteLength(value) <= maxCustomTypeBytes && customTypePattern.test(value)
+}
+
+export function validateCustomType(value: unknown): asserts value is string {
+  if (!isCustomType(value)) {
+    throw new Error(`Custom type must match ${customTypePattern} and fit in ${maxCustomTypeBytes} bytes`)
+  }
+}
+
+export function isSessionJson(value: unknown): value is SessionJson {
+  try {
+    validateSessionJson(value)
+    return serializedBytes(value) <= maxCustomJsonBytes
+  } catch {
+    return false
+  }
+}
+
+function validateSessionJson(root: unknown): asserts root is SessionJson {
+  type Visit =
+    | { readonly type: "value"; readonly value: unknown; readonly depth: number }
+    | { readonly type: "leave"; readonly value: object }
+  const pending: Visit[] = [{ type: "value", value: root, depth: 1 }]
+  const ancestors = new Set<object>()
+  let nodes = 0
+  while (pending.length > 0) {
+    const visit = pending.pop()!
+    if (visit.type === "leave") {
+      ancestors.delete(visit.value)
+      continue
+    }
+    const { value, depth } = visit
+    nodes++
+    if (nodes > maxCustomJsonNodes || depth > maxCustomJsonDepth) throw new Error("Custom JSON exceeds its bounds")
+    if (value === null || typeof value === "string" || typeof value === "boolean") continue
+    if (typeof value === "number" && Number.isFinite(value)) continue
+    if (typeof value !== "object" || ancestors.has(value)) throw new Error("Custom data must be JSON")
+    ancestors.add(value)
+    pending.push({ type: "leave", value })
+    if (Array.isArray(value)) {
+      for (const item of value) pending.push({ type: "value", value: item, depth: depth + 1 })
+      continue
+    }
+    if (
+      !isRecord(value) ||
+      (Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null)
+    ) {
+      throw new Error("Custom data must be JSON")
+    }
+    for (const item of Object.values(value)) pending.push({ type: "value", value: item, depth: depth + 1 })
+  }
+}
+
+function serializedBytes(value: unknown): number {
+  const serialized = JSON.stringify(value)
+  if (serialized === undefined) throw new Error("Custom data must be JSON")
+  return Buffer.byteLength(serialized)
+}
+
+function serializedBytesAtMost(value: unknown, maximum: number): boolean {
+  try {
+    return serializedBytes(value) <= maximum
+  } catch {
+    return false
+  }
+}
+
+function serializedCustomStateBytes(entry: Pick<CustomEntry, "customType" | "data">): number {
+  return serializedBytes(
+    entry.data === undefined ? { customType: entry.customType } : { customType: entry.customType, data: entry.data }
+  )
+}
+
+function hasOnlyKeys(value: Record<string, unknown>, allowed: readonly string[]): boolean {
+  const keys = Object.keys(value)
+  return keys.length <= allowed.length && keys.every(key => allowed.includes(key))
+}
+
+function isValidBase64(value: string): boolean {
+  try {
+    decodeBase64(value)
+    return true
+  } catch {
+    return false
+  }
+}
+
 function isStoredContentArray(value: unknown, version: SessionFormatVersion): boolean {
   return Array.isArray(value) && value.every(part => isStoredContent(part, version))
 }
@@ -1290,8 +1674,8 @@ function isStoredImageReference(value: unknown): value is StoredImageReference {
   )
 }
 
-function storedImageReferences(message: StoredAgentMessage): StoredImageReference[] {
-  return Array.isArray(message.content) ? message.content.filter(isStoredImageReference) : []
+function storedImageReferences(content: unknown): StoredImageReference[] {
+  return Array.isArray(content) ? content.filter(isStoredImageReference) : []
 }
 
 function isUsage(value: unknown): boolean {
@@ -1384,6 +1768,14 @@ function validateJournal(entries: readonly SessionEntry[], file: string): void {
 }
 
 function validateNextEntry(next: SessionEntry, preceding: readonly SessionEntry[], file: string): void {
+  if (next.type === "custom") {
+    if (!isStoredCustomEntry(next)) throw new Error(`Invalid session entry: ${file}`)
+    return
+  }
+  if (next.type === "custom_message") {
+    if (!isStoredCustomMessageEntry(next, 1)) throw new Error(`Invalid session entry: ${file}`)
+    return
+  }
   if (next.type === "retry") {
     const failure = preceding.at(-1)
     if (
@@ -1403,10 +1795,12 @@ function validateNextEntry(next: SessionEntry, preceding: readonly SessionEntry[
   const markerIndex = preceding.length
   const firstKeptIndex = preceding.findIndex(entry => entry.id === next.firstKeptEntryId)
   const firstKept = preceding[firstKeptIndex]
-  if (firstKeptIndex < 0 || firstKeptIndex >= markerIndex || !firstKept || !isContextVisibleEntry(firstKept)) {
+  if (firstKeptIndex < 0 || firstKeptIndex >= markerIndex || !firstKept || !isCompactionBoundaryEntry(firstKept)) {
     throw new Error(`Invalid compaction boundary: ${file}`)
   }
-  if (firstKept.message.role === "toolResult") throw new Error(`Invalid compaction boundary: ${file}`)
+  if (sessionEntryToContextMessage(firstKept)?.role === "toolResult") {
+    throw new Error(`Invalid compaction boundary: ${file}`)
+  }
 
   if (next.excludedFailureEntryId !== undefined) {
     const failure = preceding.find(entry => entry.id === next.excludedFailureEntryId)
@@ -1415,8 +1809,9 @@ function validateNextEntry(next: SessionEntry, preceding: readonly SessionEntry[
     }
   }
 
-  const firstProjected = projectSessionEntries([...preceding, next], "context").find(isContextVisibleEntry)
-  if (firstProjected?.id !== firstKept.id || firstProjected.message.role === "toolResult") {
+  const firstProjected = projectSessionEntries([...preceding, next], "context").find(isCompactionBoundaryEntry)
+  const firstMessage = firstProjected && sessionEntryToContextMessage(firstProjected)
+  if (firstProjected?.id !== firstKept.id || firstMessage?.role === "toolResult") {
     throw new Error(`Invalid compaction boundary: ${file}`)
   }
 }
@@ -1431,28 +1826,78 @@ function projectSessionEntries(entries: readonly SessionEntry[], mode: "context"
     }
   }
   const visible = (entry: SessionEntry) =>
-    (mode === "context" ? isContextVisibleEntry(entry) : entry.type === "message") && !retryFailures.has(entry.id)
+    (mode === "context"
+      ? sessionEntryToContextMessage(entry) !== undefined
+      : sessionEntryToPresentationMessage(entry) !== undefined) && !retryFailures.has(entry.id)
   if (markerIndex < 0) return entries.filter(visible)
 
   const marker = entries[markerIndex]
   if (marker?.type !== "compaction") throw new Error("Compaction marker index is invalid")
   const firstKeptIndex = entries.findIndex(entry => entry.id === marker.firstKeptEntryId)
   const exact = [...entries.slice(firstKeptIndex, markerIndex), ...entries.slice(markerIndex + 1)].filter(
-    entry => visible(entry) && entry.id !== marker.excludedFailureEntryId
+    entry => entry.type !== "compaction" && visible(entry) && entry.id !== marker.excludedFailureEntryId
   )
   return [marker, ...exact]
 }
 
-function projectMessages(entries: readonly SessionEntry[]): AgentMessage[] {
+function projectMessages(entries: readonly SessionEntry[], mode: "context" | "presentation"): AgentMessage[] {
   return entries.flatMap(entry => {
-    if (entry.type === "message") return [entry.message]
-    if (entry.type === "compaction") return [compactionMessage(entry)]
-    return []
+    const message = mode === "context" ? sessionEntryToContextMessage(entry) : sessionEntryToPresentationMessage(entry)
+    return message ? [message] : []
   })
 }
 
-function isContextVisibleEntry(entry: SessionEntry): entry is MessageEntry {
-  return entry.type === "message" && !(entry.message.role === "bashExecution" && entry.message.excludeFromContext)
+export function sessionEntryToContextMessage(entry: SessionEntry): AgentMessage | undefined {
+  switch (entry.type) {
+    case "message":
+      return entry.message.role === "bashExecution" && entry.message.excludeFromContext ? undefined : entry.message
+    case "custom_message":
+      return customMessage(entry)
+    case "compaction":
+      return compactionMessage(entry)
+    case "custom":
+    case "model_change":
+    case "thinking_level_change":
+    case "retry":
+      return undefined
+    default:
+      return assertNever(entry)
+  }
+}
+
+function sessionEntryToPresentationMessage(entry: SessionEntry): AgentMessage | undefined {
+  switch (entry.type) {
+    case "message":
+      return entry.message.role === "custom" && !entry.message.display ? undefined : entry.message
+    case "custom_message":
+      return entry.display ? customMessage(entry) : undefined
+    case "compaction":
+      return compactionMessage(entry)
+    case "custom":
+    case "model_change":
+    case "thinking_level_change":
+    case "retry":
+      return undefined
+    default:
+      return assertNever(entry)
+  }
+}
+
+function isCompactionBoundaryEntry(entry: SessionEntry): boolean {
+  return entry.type !== "compaction" && sessionEntryToContextMessage(entry) !== undefined
+}
+
+function customMessage(entry: CustomMessageEntry): Extract<AgentMessage, { role: "custom" }> {
+  const content = typeof entry.content === "string" ? entry.content : [...entry.content]
+  if (Array.isArray(content)) Object.freeze(content)
+  return Object.freeze({
+    role: "custom",
+    customType: entry.customType,
+    content,
+    display: entry.display,
+    ...(entry.details === undefined ? {} : { details: entry.details }),
+    timestamp: Date.parse(entry.timestamp)
+  })
 }
 
 function compactionMessage(entry: CompactionEntry): CompactionSummaryMessage {
@@ -1477,6 +1922,14 @@ function lineBytes(lineWithoutNewline: string): number {
   return Buffer.byteLength(lineWithoutNewline) + 1
 }
 
+function isValidTimestamp(value: unknown): value is string {
+  return typeof value === "string" && Number.isFinite(Date.parse(value))
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)
+}
+
+function assertNever(value: never): never {
+  throw new Error(`Unexpected session entry: ${String(value)}`)
 }

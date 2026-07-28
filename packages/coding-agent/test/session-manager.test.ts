@@ -17,13 +17,19 @@ import { join, relative, resolve } from "node:path"
 
 import { ZiPaths } from "../src/paths.js"
 import {
+  maxCustomJsonBytes,
+  maxCustomJsonDepth,
+  maxCustomMessageBytes,
+  maxCustomStateEntries,
   maxSessionFileBytes,
   maxSessionFirstMessageLength,
   maxSessionPromptHistoryEntries,
   maxSessionPromptHistoryEntryBytes,
   maxSessionStorageBytes,
+  CustomStateCapacityError,
   SessionCapacityError,
-  SessionManager
+  SessionManager,
+  type SessionJson
 } from "../src/session-manager.js"
 
 test("session entries form one append-only branch", () => {
@@ -181,6 +187,213 @@ test("new persisted sessions wait for the first assistant response before creati
   expect(SessionManager.open(file).entries()).toEqual(session.entries())
 })
 
+test("custom state and messages keep durability, context, and presentation independent", () => {
+  const session = SessionManager.inMemory("/work")
+  const stateData = { count: 1 }
+  const messageDetails = { source: "test" }
+  const state = session.appendCustomEntry("example.counter", stateData)
+  const hidden = session.appendCustomMessage({
+    customType: "example.policy",
+    content: "hidden model context",
+    display: false,
+    details: messageDetails
+  })
+  const displayed = session.appendCustomMessage({
+    customType: "example.notice",
+    content: [{ type: "text", text: "visible model context" }],
+    display: true
+  })
+  stateData.count = 2
+  messageDetails.source = "mutated"
+
+  expect(session.entries().map(entry => entry.type)).toEqual(["custom", "custom_message", "custom_message"])
+  expect(session.customEntries("example.counter")).toEqual([state])
+  expect(session.activeMessages()).toEqual([
+    {
+      role: "custom",
+      customType: "example.policy",
+      content: "hidden model context",
+      display: false,
+      details: { source: "test" },
+      timestamp: new Date(hidden.timestamp).getTime()
+    },
+    {
+      role: "custom",
+      customType: "example.notice",
+      content: [{ type: "text", text: "visible model context" }],
+      display: true,
+      timestamp: new Date(displayed.timestamp).getTime()
+    }
+  ])
+  expect(session.presentationMessages()).toEqual([session.activeMessages()[1]!])
+  expect(() =>
+    session.appendMessage({ role: "custom", customType: "legacy", content: "new write", display: true, timestamp: 1 })
+  ).toThrow("appendCustomMessage")
+})
+
+test("journal-owned custom values cannot be mutated through entries or projections", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-session-custom-immutable-"))
+  const paths = new ZiPaths(join(root, "project"), join(root, "global"))
+  const session = SessionManager.create(paths)
+  const state = session.appendCustomEntry("example.state", { nested: { count: 1 } })
+  const message = session.appendCustomMessage({
+    customType: "example.message",
+    content: [{ type: "text", text: "original" }],
+    display: true,
+    details: { nested: { enabled: true } }
+  })
+  const projected = session.activeMessages().find(candidate => candidate.role === "custom")
+  if (!projected || projected.role !== "custom") throw new Error("Expected custom projection")
+
+  expect(Reflect.set(jsonObject(jsonObject(state.data).nested), "count", 2)).toBe(false)
+  const current = session.customEntries("example.state")[0]!
+  expect(Reflect.set(jsonObject(jsonObject(current.data).nested), "count", 3)).toBe(false)
+  expect(Reflect.set(jsonObject(jsonObject(message.details).nested), "enabled", false)).toBe(false)
+  const content = projected.content
+  if (!Array.isArray(content) || content[0]?.type !== "text") throw new Error("Expected text content")
+  expect(Reflect.set(content[0], "text", "mutated")).toBe(false)
+
+  const restored = SessionManager.open(session.file!)
+  expect(session.customEntries("example.state")).toEqual(restored.customEntries("example.state"))
+  expect(session.activeMessages()).toEqual(restored.activeMessages())
+})
+
+test("the first custom append flushes pending persistence and restores folded state", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-session-custom-persistence-"))
+  const paths = new ZiPaths(join(root, "project"), join(root, "global"))
+  const session = SessionManager.create(paths)
+  const state = session.appendCustomEntry("example.counter", { count: 1 })
+  expect(existsSync(session.file!)).toBe(true)
+
+  session.appendMessage({ role: "user", content: "old", timestamp: 1 })
+  const kept = session.appendMessage({ role: "user", content: "kept", timestamp: 2 })
+  session.appendCompaction({
+    reason: "manual",
+    summary: "summary",
+    firstKeptEntryId: kept.id,
+    tokensBefore: 100,
+    estimatedTokensAfter: 10,
+    details: emptyCompactionDetails()
+  })
+
+  expect(session.retainedEntries().some(entry => entry.id === state.id)).toBe(false)
+  expect(session.customEntries("example.counter")).toEqual([state])
+  const restored = SessionManager.open(session.file!)
+  expect(restored.customEntries("example.counter")).toEqual([state])
+  expect(restored.retainedEntries().some(entry => entry.id === state.id)).toBe(false)
+})
+
+test("custom message images share format-2 session blob ownership", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-session-custom-image-"))
+  const paths = new ZiPaths(join(root, "project"), join(root, "global"))
+  const session = SessionManager.create(paths)
+  const image = Buffer.from("custom image payload")
+  const data = image.toString("base64")
+  session.appendCustomMessage({
+    customType: "example.image",
+    content: [{ type: "image", mimeType: "image/png", data }],
+    display: true
+  })
+
+  const file = session.file!
+  const persisted = await readFile(file, "utf8")
+  const blobDir = file.replace(/\.jsonl$/u, ".blobs")
+  const blobs = await readdir(blobDir)
+  expect(persisted).not.toContain(data)
+  expect(persisted).toContain('"type":"custom_message"')
+  expect(blobs).toHaveLength(1)
+  expect((await readFile(join(blobDir, blobs[0]!))).equals(image)).toBe(true)
+  expect(SessionManager.open(file).activeMessages()).toEqual(session.activeMessages())
+})
+
+test("custom values and aggregate state reject before journal mutation", () => {
+  const session = SessionManager.inMemory("/work")
+  const entries = session.entries()
+  expect(() => session.appendCustomEntry("Invalid Type", null)).toThrow("Custom type")
+  expect(() => session.appendCustomEntry("example.large", "x".repeat(maxCustomJsonBytes))).toThrow(
+    "Invalid session entry"
+  )
+  expect(() =>
+    session.appendCustomMessage({
+      customType: "example.large",
+      content: "x".repeat(maxCustomMessageBytes + 1),
+      display: true
+    })
+  ).toThrow("Invalid custom message")
+
+  let nested: SessionJson = null
+  for (let depth = 0; depth < maxCustomJsonDepth; depth++) nested = [nested]
+  expect(() => session.appendCustomEntry("example.deep", nested)).toThrow("Invalid session entry")
+  expect(session.entries()).toBe(entries)
+
+  for (let index = 0; index < maxCustomStateEntries; index++) {
+    session.appendCustomEntry("example.count", null)
+  }
+  expect(() => session.appendCustomEntry("example.count", null)).toThrow(CustomStateCapacityError)
+  expect(session.customEntries("example.count")).toHaveLength(maxCustomStateEntries)
+})
+
+test("restore preserves legacy custom messages but rejects unknown fields on new custom kinds", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-session-custom-restore-"))
+  const paths = new ZiPaths(join(root, "project"), join(root, "global"))
+  const legacy = SessionManager.create(paths, { sessionId: "legacy-custom" })
+  const parent = legacy.appendCustomEntry("example.state", null)
+  await appendFile(
+    legacy.file!,
+    `${JSON.stringify({
+      type: "message",
+      id: "legacy-message",
+      parentId: parent.id,
+      timestamp: new Date().toISOString(),
+      message: {
+        role: "custom",
+        customType: "legacy.notice",
+        content: "legacy hidden context",
+        display: false,
+        timestamp: 1
+      }
+    })}\n`
+  )
+  const restored = SessionManager.open(legacy.file!)
+  expect(restored.activeMessages()).toContainEqual({
+    role: "custom",
+    customType: "legacy.notice",
+    content: "legacy hidden context",
+    display: false,
+    timestamp: 1
+  })
+  expect(restored.presentationMessages()).toEqual([])
+
+  const strict = SessionManager.create(paths, { sessionId: "strict-custom" })
+  strict.appendCustomEntry("example.state", null)
+  const records = (await readFile(strict.file!, "utf8")).trimEnd().split("\n")
+  const entry = JSON.parse(records[1]!)
+  entry.unknown = true
+  records[1] = JSON.stringify(entry)
+  await writeFile(strict.file!, `${records.join("\n")}\n`)
+  expect(() => SessionManager.open(strict.file!)).toThrow("Invalid session entry")
+})
+
+test("restore rejects invalid custom entry timestamps", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-session-custom-timestamp-"))
+  const paths = new ZiPaths(join(root, "project"), join(root, "global"))
+
+  for (const kind of ["custom", "custom_message"] as const) {
+    const session = SessionManager.create(paths, { sessionId: `invalid-${kind}` })
+    if (kind === "custom") session.appendCustomEntry("example.state", null)
+    else session.appendCustomMessage({ customType: "example.message", content: "message", display: true })
+    // Each mutation must finish before the same path is reopened.
+    // oxlint-disable-next-line no-await-in-loop
+    const records = (await readFile(session.file!, "utf8")).trimEnd().split("\n")
+    const entry = JSON.parse(records[1]!)
+    entry.timestamp = "not-a-date"
+    records[1] = JSON.stringify(entry)
+    // oxlint-disable-next-line no-await-in-loop
+    await writeFile(session.file!, `${records.join("\n")}\n`)
+    expect(() => SessionManager.open(session.file!)).toThrow("Invalid session entry")
+  }
+})
+
 test("a failed first journal write leaves pending entries retryable", async () => {
   const root = await mkdtemp(join(tmpdir(), "zi-session-lazy-failure-"))
   const paths = new ZiPaths(join(root, "project"), join(root, "global"))
@@ -244,6 +457,31 @@ test("compaction markers project one latest summary and an exact retained tail",
   expect(session.entries()[0]?.id).toBe(oldUser.id)
   expect(session.activeMessages().map(message => message.role)).toEqual(["compactionSummary", "assistant", "user"])
   expect(session.activeMessages()[0]).toMatchObject({ summary: "latest summary", estimatedTokensAfter: 18 })
+})
+
+test("a compaction marker cannot become a later exact-tail boundary", () => {
+  const session = SessionManager.inMemory("/work")
+  session.appendMessage({ role: "user", content: "old", timestamp: 1 })
+  const kept = session.appendMessage({ role: "user", content: "kept", timestamp: 2 })
+  const marker = session.appendCompaction({
+    reason: "manual",
+    summary: "first",
+    firstKeptEntryId: kept.id,
+    tokensBefore: 100,
+    estimatedTokensAfter: 10,
+    details: emptyCompactionDetails()
+  })
+
+  expect(() =>
+    session.appendCompaction({
+      reason: "threshold",
+      summary: "second",
+      firstKeptEntryId: marker.id,
+      tokensBefore: 100,
+      estimatedTokensAfter: 9,
+      details: emptyCompactionDetails()
+    })
+  ).toThrow("Invalid compaction boundary")
 })
 
 test("persisted compaction markers restore the same active projection", async () => {
@@ -702,6 +940,15 @@ function promptHistory(session: SessionManager) {
     current = session.olderPromptHistoryEntry(current.entryId)
   }
   return entries
+}
+
+function jsonObject(value: SessionJson | undefined): { readonly [key: string]: SessionJson } {
+  if (!isJsonObject(value)) throw new Error("Expected JSON object")
+  return value
+}
+
+function isJsonObject(value: SessionJson | undefined): value is { readonly [key: string]: SessionJson } {
+  return value !== null && value !== undefined && typeof value === "object" && !Array.isArray(value)
 }
 
 function assistantMessage(timestamp: number) {

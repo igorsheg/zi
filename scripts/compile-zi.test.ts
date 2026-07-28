@@ -29,6 +29,7 @@ test("the compiled Zi executable runs the dedicated extension worker protocol", 
   const extension = join(temporary, "extension.ts")
   const lifecycle = join(temporary, "lifecycle.log")
   const exampleExtension = resolve(import.meta.dirname, "../examples/extensions/custom-tool/index.ts")
+  const durableExtension = resolve(import.meta.dirname, "../examples/extensions/durable-counter/index.ts")
   let child: ReturnType<typeof spawn> | undefined
 
   try {
@@ -79,6 +80,8 @@ export default function (zi: ExtensionAPI): void {
     const stderr = readNodeStream(child.stderr)
     const protocolMessages: WorkerMessage[] = []
     let compiledToolResult: string | undefined
+    let compiledCounterResult: string | undefined
+    let compiledCustomMessage: string | undefined
     const protocol = new Promise<void>((resolveProtocol, rejectProtocol) => {
       let completed = false
       const decoder = new ExtensionProtocolDecoder(validateWorkerMessage)
@@ -89,14 +92,28 @@ export default function (zi: ExtensionAPI): void {
           return
         }
         if (message.type === "ready") {
-          if (!message.tools.some(tool => tool.name === "repository_status")) {
+          if (
+            !message.tools.some(tool => tool.name === "repository_status") ||
+            !message.tools.some(tool => tool.name === "increment_counter")
+          ) {
             rejectProtocol(
-              new Error(`Compiled worker omitted the canonical custom tool: ${JSON.stringify(message.extensions)}`)
+              new Error(`Compiled worker omitted a canonical extension tool: ${JSON.stringify(message.extensions)}`)
             )
             return
           }
           child!.stdin!.write(
             encodeExtensionProtocolFrame({ type: "session_start", generation: 1, requestId: 1, reason: "startup" })
+          )
+          return
+        }
+        if (message.type === "custom_entries_get") {
+          child!.stdin!.write(
+            encodeExtensionProtocolFrame({
+              type: "custom_entries_result",
+              generation: 1,
+              requestId: message.requestId,
+              entries: []
+            })
           )
           return
         }
@@ -106,24 +123,60 @@ export default function (zi: ExtensionAPI): void {
               type: "tool_invoke",
               generation: 1,
               requestId: 2,
+              name: "increment_counter",
+              arguments: {}
+            })
+          )
+          return
+        }
+        if (message.type === "custom_entry_append") {
+          child!.stdin!.write(
+            encodeExtensionProtocolFrame({
+              type: "custom_entry_result",
+              generation: 1,
+              requestId: message.requestId,
+              entry: {
+                id: "compiled-counter-entry",
+                timestamp: new Date(0).toISOString(),
+                customType: message.customType,
+                ...(message.data === undefined ? {} : { data: message.data })
+              }
+            })
+          )
+          return
+        }
+        if (message.type === "custom_message_send") {
+          compiledCustomMessage = typeof message.message.content === "string" ? message.message.content : undefined
+          child!.stdin!.write(
+            encodeExtensionProtocolFrame({ type: "custom_message_result", generation: 1, requestId: message.requestId })
+          )
+          return
+        }
+        if (message.type === "tool_result" && message.requestId === 2) {
+          compiledCounterResult = message.content
+          child!.stdin!.write(
+            encodeExtensionProtocolFrame({
+              type: "tool_invoke",
+              generation: 1,
+              requestId: 3,
               name: "repository_status",
               arguments: {}
             })
           )
           return
         }
-        if (message.type === "tool_result" && message.requestId === 2) {
+        if (message.type === "tool_result" && message.requestId === 3) {
           compiledToolResult = message.content
           child!.stdin!.write(
-            encodeExtensionProtocolFrame({ type: "session_shutdown", generation: 1, requestId: 3, reason: "quit" })
+            encodeExtensionProtocolFrame({ type: "session_shutdown", generation: 1, requestId: 4, reason: "quit" })
           )
           return
         }
-        if (message.type === "settled" && message.requestId === 3) {
-          child!.stdin!.write(encodeExtensionProtocolFrame({ type: "stop", generation: 1, requestId: 4 }))
+        if (message.type === "settled" && message.requestId === 4) {
+          child!.stdin!.write(encodeExtensionProtocolFrame({ type: "stop", generation: 1, requestId: 5 }))
           return
         }
-        if (message.type === "settled" && message.requestId === 4) {
+        if (message.type === "settled" && message.requestId === 5) {
           completed = true
           resolveProtocol()
         }
@@ -162,6 +215,13 @@ export default function (zi: ExtensionAPI): void {
               entryPath: exampleExtension,
               scope: "temporary",
               origin: "cli"
+            },
+            {
+              id: "compiled-durable-counter-example",
+              declaredPath: durableExtension,
+              entryPath: durableExtension,
+              scope: "temporary",
+              origin: "cli"
             }
           ]
         }
@@ -174,11 +234,17 @@ export default function (zi: ExtensionAPI): void {
     expect(capturedStderr).toBe("compiled worker stderr\n")
     expect(protocolMessages.map(message => message.type)).toEqual([
       "ready",
+      "custom_entries_get",
       "settled",
+      "custom_entry_append",
+      "custom_message_send",
+      "tool_result",
       "tool_result",
       "settled",
       "settled"
     ])
+    expect(compiledCounterResult).toBe("1")
+    expect(compiledCustomMessage).toBe("Counter: 1")
     expect(compiledToolResult).toContain("zi")
     expect(await Bun.file(lifecycle).text()).toBe("start:startup\nstop:quit\n")
 

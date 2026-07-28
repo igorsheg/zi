@@ -69,7 +69,7 @@ export function createMessageItemView(
       return createBashExecutionView(ctx, message, options.theme, options.cwd ?? "")
     case "custom":
       return message.display
-        ? ownItem(ctx, createPanelMessage(ctx, textContent(message.content), options.theme.text.custom, options.theme))
+        ? ownItem(ctx, createPanelMessage(ctx, customPanelContent(message), options.theme.text.custom, options.theme))
         : undefined
     case "branchSummary":
     case "compactionSummary":
@@ -560,6 +560,12 @@ function userContent(content: string | readonly { type: string; text?: string; m
     previousWasImage = true
   }
   return output
+}
+
+function customPanelContent(message: Extract<AgentMessage, { role: "custom" }>): string {
+  const label = `[${message.customType}]`
+  const body = textContent(message.content)
+  return body ? `${label}\n${body}` : label
 }
 
 function textContent(content: string | readonly { type: string; text?: string; mimeType?: string }[]): string {

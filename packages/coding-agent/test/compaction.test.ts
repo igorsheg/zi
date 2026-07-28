@@ -103,6 +103,30 @@ test("cut planning keeps assistant and parallel tool results structurally intact
   ])
 })
 
+test("custom messages participate in compaction budgeting and cut points", () => {
+  const session = SessionManager.inMemory("/work")
+  session.appendCustomMessage({ customType: "example.context", content: "old custom context", display: false })
+  const kept = session.appendCustomMessage({
+    customType: "example.context",
+    content: "recent custom context",
+    display: true
+  })
+  const settings = effectiveCompactionSettings(
+    { contextWindow: 100, maxTokens: 20 },
+    { reserveTokens: 20, keepRecentTokens: 1 }
+  )!
+
+  const preparation = prepareCompaction(session.entries(), settings, { tokens: 50, quality: "estimated" })
+  if (preparation.type !== "ready") throw new Error("Expected custom-message compaction plan")
+  expect(preparation.plan.firstKeptEntryId).toBe(kept.id)
+  expect(preparation.plan.sourceMessages).toEqual([
+    expect.objectContaining({ role: "custom", content: "old custom context", display: false })
+  ])
+  expect(preparation.plan.retainedMessages).toEqual([
+    expect.objectContaining({ role: "custom", content: "recent custom context", display: true })
+  ])
+})
+
 test("repeated planning carries only the latest previous summary", () => {
   const session = SessionManager.inMemory("/work")
   session.appendMessage({ role: "user", content: "old", timestamp: 1 })

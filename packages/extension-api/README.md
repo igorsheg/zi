@@ -17,4 +17,4 @@ export default function (zi: ExtensionAPI): void {
 
 Zi provides this module to extension workers at runtime. Install it as a development dependency when authoring or type-checking an extension. Extensions execute with the current user's authority; the worker is fault containment, not a security sandbox.
 
-See the [extension author guide](https://github.com/igorsheg/zi/blob/main/docs/extensions.md) and [canonical custom-tool example](https://github.com/igorsheg/zi/tree/main/examples/extensions/custom-tool).
+See the [extension author guide](https://github.com/igorsheg/zi/blob/main/docs/extensions.md), [custom-tool example](https://github.com/igorsheg/zi/tree/main/examples/extensions/custom-tool), and [durable-counter example](https://github.com/igorsheg/zi/tree/main/examples/extensions/durable-counter).

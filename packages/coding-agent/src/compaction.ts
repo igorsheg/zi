@@ -6,6 +6,7 @@ import {
   maxCompactionFilePaths,
   maxCompactionPathBytes,
   maxCompactionSummaryBytes,
+  sessionEntryToContextMessage,
   type CompactionDetails,
   type CompactionEntry,
   type SessionEntry
@@ -401,11 +402,16 @@ function splitSerializedItem(value: string): readonly [string, string] | undefin
   return [parts.slice(0, midpoint).join(""), parts.slice(midpoint).join("")]
 }
 
+interface ExactContextEntry {
+  readonly id: string
+  readonly message: AgentMessage
+}
+
 function projectedExactEntries(
   entries: readonly SessionEntry[],
   latestMarker: CompactionEntry | undefined,
   operationExcluded: string | undefined
-): Array<Extract<SessionEntry, { type: "message" }>> {
+): ExactContextEntry[] {
   const excluded = new Set(
     [
       latestMarker?.excludedFailureEntryId,
@@ -414,22 +420,18 @@ function projectedExactEntries(
     ].filter(id => id !== undefined)
   )
   const messages = (values: readonly SessionEntry[]) =>
-    values.filter(
-      (entry): entry is Extract<SessionEntry, { type: "message" }> =>
-        entry.type === "message" &&
-        !excluded.has(entry.id) &&
-        !(entry.message.role === "bashExecution" && entry.message.excludeFromContext)
-    )
+    values.flatMap(entry => {
+      if (entry.type === "compaction" || excluded.has(entry.id)) return []
+      const message = sessionEntryToContextMessage(entry)
+      return message ? [{ id: entry.id, message }] : []
+    })
   if (!latestMarker) return messages(entries)
   const markerIndex = entries.indexOf(latestMarker)
   const boundaryIndex = entries.findIndex(entry => entry.id === latestMarker.firstKeptEntryId)
   return [...messages(entries.slice(boundaryIndex, markerIndex)), ...messages(entries.slice(markerIndex + 1))]
 }
 
-function safeRetainedBoundary(
-  entries: readonly Extract<SessionEntry, { type: "message" }>[],
-  fromIndex: number
-): number {
+function safeRetainedBoundary(entries: readonly ExactContextEntry[], fromIndex: number): number {
   for (let index = Math.max(0, fromIndex); index < entries.length; index++) {
     if (entries[index]!.message.role !== "toolResult") return index
   }

@@ -23,6 +23,7 @@ import {
   validateHostMessage,
   validateWorkerMessage
 } from "../src/extensions/protocol.js"
+import { maxCustomStateEntries } from "../src/session-manager.js"
 
 const source: ExtensionSource = Object.freeze({
   id: "extension-fixture",
@@ -225,6 +226,64 @@ test("tool protocol validation closes registration, arguments, results, and corr
       content: "x".repeat(maxExtensionToolResultBytes + 1)
     })
   ).toThrow(`${maxExtensionToolResultBytes} bytes`)
+})
+
+test("session-operation protocol validates source, values, delivery, and bounded results", () => {
+  const append = validateWorkerMessage({
+    type: "custom_entry_append",
+    generation: 1,
+    requestId: 7,
+    extensionId: source.id,
+    customType: "example.counter",
+    data: { count: 1 }
+  })
+  expect(append).toEqual({
+    type: "custom_entry_append",
+    generation: 1,
+    requestId: 7,
+    extensionId: source.id,
+    customType: "example.counter",
+    data: { count: 1 }
+  })
+  expect(Object.isFrozen(append.type === "custom_entry_append" ? append.data : undefined)).toBe(true)
+
+  expect(
+    validateWorkerMessage({
+      type: "custom_message_send",
+      generation: 1,
+      requestId: 8,
+      extensionId: source.id,
+      message: { customType: "example.notice", content: "hello", display: false, details: { count: 1 } },
+      delivery: "follow_up"
+    })
+  ).toMatchObject({ type: "custom_message_send", delivery: "follow_up", message: { display: false } })
+  expect(() => validateWorkerMessage({ ...append, customType: "Invalid Type" })).toThrow("custom type")
+  expect(() =>
+    validateWorkerMessage({
+      type: "custom_message_send",
+      generation: 1,
+      requestId: 8,
+      extensionId: source.id,
+      message: { customType: "example.notice", content: "hello", display: true },
+      delivery: "later"
+    })
+  ).toThrow("delivery")
+
+  const entry = { id: "entry", timestamp: new Date(0).toISOString(), customType: "example.counter", data: null }
+  expect(validateHostMessage({ type: "custom_entries_result", generation: 1, requestId: 7, entries: [entry] })).toEqual(
+    { type: "custom_entries_result", generation: 1, requestId: 7, entries: [entry] }
+  )
+  expect(() =>
+    validateHostMessage({
+      type: "custom_entries_result",
+      generation: 1,
+      requestId: 7,
+      entries: Array.from({ length: maxCustomStateEntries + 1 }, () => entry)
+    })
+  ).toThrow(`${maxCustomStateEntries}`)
+  expect(() =>
+    validateHostMessage({ type: "session_operation_error", generation: 1, requestId: 7, message: "" })
+  ).toThrow("session operation error")
 })
 
 test("maximum admitted load results fit in one protocol frame", () => {

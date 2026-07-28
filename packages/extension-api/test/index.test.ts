@@ -1,6 +1,19 @@
 import { expect, test } from "bun:test"
 
-import { Schema, type ExtensionToolDefinition, type Static } from "../src/index.js"
+import { Schema, type ExtensionAPI, type ExtensionToolDefinition, type Static } from "../src/index.js"
+
+async function sessionOperations(api: ExtensionAPI): Promise<void> {
+  const entries = await api.getSessionEntries("example.counter")
+  const appended = await api.appendEntry("example.counter", { count: entries.length })
+  await api.sendMessage(
+    { customType: appended.customType, content: "updated", display: true, details: appended.data ?? null },
+    "follow_up"
+  )
+  // @ts-expect-error session values must be JSON
+  await api.appendEntry("example.counter", { count: 1n })
+  // @ts-expect-error delivery is a closed contract
+  await api.sendMessage({ customType: "example.counter", content: "updated", display: true }, "later")
+}
 
 function invalidSchemas(): void {
   // @ts-expect-error tool parameters require an object schema
@@ -53,4 +66,5 @@ test("tool schemas infer required and optional execution parameters", () => {
 
 test("public types reject values outside the worker schema contract", () => {
   expect(typeof invalidSchemas).toBe("function")
+  expect(typeof sessionOperations).toBe("function")
 })

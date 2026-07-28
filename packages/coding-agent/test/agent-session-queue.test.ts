@@ -649,6 +649,10 @@ test("idle inputs queue for the next run and survive public abort", async () => 
 
   session.steer("before prompt")
   session.followUp("after turn")
+  session.sendCustomMessage(
+    { customType: "example.discard", content: "discard before prompt", display: true },
+    { type: "next_turn" }
+  )
   await session.abort()
   expect(session.queuedInputs.steering.map(entry => entry.text)).toEqual(["before prompt"])
   expect(session.queuedInputs.followUp.map(entry => entry.text)).toEqual(["after turn"])
@@ -657,6 +661,7 @@ test("idle inputs queue for the next run and survive public abort", async () => 
 
   expect(requests.map(texts => texts.at(-1))).toEqual(["before prompt", "after turn"])
   expect(userTextsFromMessages(session.messages)).toEqual(["start", "before prompt", "after turn"])
+  expect(session.sessionManager.entries().some(entry => entry.type === "custom_message")).toBe(false)
   expect("state" in session).toBe(false)
   session.dispose()
 })

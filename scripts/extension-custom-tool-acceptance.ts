@@ -23,9 +23,17 @@ type ProviderState =
   | { readonly type: "complete" }
   | { readonly type: "failed"; readonly message: string }
 
+type CounterProviderState =
+  | { readonly type: "awaiting_tool_call" }
+  | { readonly type: "awaiting_tool_result" }
+  | { readonly type: "awaiting_custom_message" }
+  | { readonly type: "complete" }
+  | { readonly type: "failed"; readonly message: string }
+
 export interface ExtensionCustomToolAcceptanceOptions {
   readonly executable: string
   readonly extensionSource?: string
+  readonly durableExtensionSource?: string
 }
 
 export async function runExtensionCustomToolAcceptance(options: ExtensionCustomToolAcceptanceOptions): Promise<void> {
@@ -33,13 +41,18 @@ export async function runExtensionCustomToolAcceptance(options: ExtensionCustomT
   const project = join(temporary, "project")
   const agentDirectory = join(temporary, "agent")
   const projectExtension = join(project, ".zi", "extensions", "repository-status", "index.ts")
+  const durableProjectExtension = join(project, ".zi", "extensions", "durable-counter", "index.ts")
   const extensionSource =
     options.extensionSource ?? resolve(import.meta.dirname, "../examples/extensions/custom-tool/index.ts")
+  const durableExtensionSource =
+    options.durableExtensionSource ?? resolve(import.meta.dirname, "../examples/extensions/durable-counter/index.ts")
 
   try {
     await mkdir(join(project, ".zi", "extensions", "repository-status"), { recursive: true })
+    await mkdir(join(project, ".zi", "extensions", "durable-counter"), { recursive: true })
     await mkdir(agentDirectory, { recursive: true })
     await copyFile(extensionSource, projectExtension)
+    await copyFile(durableExtensionSource, durableProjectExtension)
     await writeFile(join(project, "acceptance.txt"), "extension acceptance\n")
     initializeRepository(project)
     await writeFile(join(agentDirectory, "trust.json"), JSON.stringify({ [realpathSync.native(project)]: true }))
@@ -89,8 +102,96 @@ export async function runExtensionCustomToolAcceptance(options: ExtensionCustomT
         await provider.dispose()
       }
     }
+    await runDurableCounterAcceptance(options.executable, project, agentDirectory)
   } finally {
     await removeTemporaryDirectory(temporary)
+  }
+}
+
+async function runDurableCounterAcceptance(executable: string, project: string, agentDirectory: string): Promise<void> {
+  for (const expectedCount of [1, 2] as const) {
+    const provider = new DurableCounterProvider(expectedCount)
+    try {
+      const env = { ...process.env, AZURE_OPENAI_BASE_URL: provider.baseUrl }
+      // The second process must observe the journal committed by the first.
+      // oxlint-disable-next-line no-await-in-loop
+      const output = await runHeadless(
+        executable,
+        durableCounterArguments(project, agentDirectory, expectedCount === 1 ? "new" : "continue"),
+        project,
+        env
+      )
+      if (output.exitCode !== 0 || output.stderr !== "") throw processFailure("durable counter", output)
+      if (normalizeNewlines(output.stdout) !== `Durable counter ${expectedCount} passed.\n`) {
+        throw new Error(`Compiled durable counter returned unexpected output: ${JSON.stringify(output.stdout)}`)
+      }
+      provider.assertComplete()
+    } finally {
+      // oxlint-disable-next-line no-await-in-loop
+      await provider.dispose()
+    }
+  }
+}
+
+class DurableCounterProvider {
+  readonly #server: ReturnType<typeof Bun.serve>
+  readonly #expectedCount: 1 | 2
+  #state: CounterProviderState = { type: "awaiting_tool_call" }
+
+  constructor(expectedCount: 1 | 2) {
+    this.#expectedCount = expectedCount
+    this.#server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: request => this.#receive(request) })
+  }
+
+  get baseUrl(): string {
+    return `${this.#server.url}v1`
+  }
+
+  assertComplete(): void {
+    if (this.#state.type === "complete") return
+    const detail = this.#state.type === "failed" ? `: ${this.#state.message}` : ` (${this.#state.type})`
+    throw new Error(`Compiled durable counter did not complete its append/resume round trip${detail}`)
+  }
+
+  async dispose(): Promise<void> {
+    await this.#server.stop(true)
+  }
+
+  async #receive(request: Request): Promise<Response> {
+    try {
+      if (request.method !== "POST" || new URL(request.url).pathname !== "/v1/responses") {
+        throw new Error(`Unexpected durable-counter provider request: ${request.method} ${request.url}`)
+      }
+      const payload: unknown = JSON.parse(await readBoundedRequest(request))
+      switch (this.#state.type) {
+        case "awaiting_tool_call":
+          validateCounterRegistration(payload)
+          this.#state = { type: "awaiting_tool_result" }
+          return eventStreamResponse(counterToolCallEvents(this.#expectedCount))
+        case "awaiting_tool_result":
+          validateCounterResult(payload, this.#expectedCount)
+          this.#state = { type: "awaiting_custom_message" }
+          return eventStreamResponse(
+            textResponseEvents("Counter tool completed.", `counter-tool-${this.#expectedCount}`)
+          )
+        case "awaiting_custom_message":
+          validateCounterMessage(payload, this.#expectedCount)
+          this.#state = { type: "complete" }
+          return eventStreamResponse(
+            textResponseEvents(`Durable counter ${this.#expectedCount} passed.`, `counter-final-${this.#expectedCount}`)
+          )
+        case "complete":
+          throw new Error("Durable-counter provider received more than three requests")
+        case "failed":
+          throw new Error(this.#state.message)
+        default:
+          return assertNever(this.#state)
+      }
+    } catch (cause) {
+      const message = cause instanceof Error ? cause.message : String(cause)
+      this.#state = { type: "failed", message }
+      return Response.json({ error: { message } }, { status: 500 })
+    }
   }
 }
 
@@ -168,6 +269,25 @@ function productArguments(mode: Exclude<AcceptanceMode, "rpc">, project: string,
     "--thinking",
     "off",
     acceptancePrompt
+  ]
+}
+
+function durableCounterArguments(project: string, agentDirectory: string, session: "new" | "continue"): string[] {
+  return [
+    "--mode",
+    "text",
+    session === "new" ? "--new-session" : "--continue",
+    "--cwd",
+    project,
+    "--agent-dir",
+    agentDirectory,
+    "--model",
+    "azure-openai-responses/gpt-4.1",
+    "--api-key",
+    "extension-acceptance",
+    "--thinking",
+    "off",
+    "Call increment_counter exactly once."
   ]
 }
 
@@ -482,6 +602,35 @@ function validateToolRegistration(value: unknown): void {
   }
 }
 
+function validateCounterRegistration(value: unknown): void {
+  const payload = requireRecord(value, "counter provider payload")
+  const tools = requireArray(payload.tools, "counter provider tools")
+  const registration = tools
+    .map(tool => requireRecord(tool, "counter provider tool"))
+    .find(tool => tool.name === "increment_counter")
+  if (!registration || registration.description !== "Increment a counter persisted in the current Zi session") {
+    throw new Error("Counter provider request omitted the durable counter tool")
+  }
+}
+
+function validateCounterResult(value: unknown, expectedCount: number): void {
+  const payload = requireRecord(value, "counter result payload")
+  const input = requireArray(payload.input, "counter result input")
+  const result = input
+    .map(item => requireRecord(item, "counter result item"))
+    .find(item => item.type === "function_call_output" && item.call_id === `counter_call_${expectedCount}`)
+  if (result?.output !== String(expectedCount)) {
+    throw new Error(`Counter provider expected tool result ${expectedCount}`)
+  }
+}
+
+function validateCounterMessage(value: unknown, expectedCount: number): void {
+  const payload = requireRecord(value, "counter custom-message payload")
+  if (!JSON.stringify(payload.input).includes(`Counter: ${expectedCount}`)) {
+    throw new Error(`Counter provider omitted custom message ${expectedCount}`)
+  }
+}
+
 function validateToolResult(value: unknown): void {
   const payload = requireRecord(value, "second provider payload")
   const input = requireArray(payload.input, "provider input")
@@ -517,33 +666,54 @@ function toolCallEvents(): readonly Record<string, unknown>[] {
   ]
 }
 
-function textEvents(): readonly Record<string, unknown>[] {
+function counterToolCallEvents(expectedCount: number): readonly Record<string, unknown>[] {
+  const itemId = `counter_fc_${expectedCount}`
+  const callId = `counter_call_${expectedCount}`
+  const item = {
+    type: "function_call",
+    id: itemId,
+    call_id: callId,
+    name: "increment_counter",
+    arguments: "{}",
+    status: "completed"
+  }
   return [
-    { type: "response.created", response: { id: "resp_2" } },
+    { type: "response.created", response: { id: `counter_resp_${expectedCount}` } },
+    { type: "response.output_item.added", output_index: 0, item: { ...item, arguments: "", status: "in_progress" } },
+    { type: "response.function_call_arguments.delta", output_index: 0, item_id: itemId, delta: "{}" },
+    { type: "response.function_call_arguments.done", output_index: 0, item_id: itemId, arguments: "{}" },
+    { type: "response.output_item.done", output_index: 0, item },
+    { type: "response.completed", response: terminalResponse(`counter_resp_${expectedCount}`) }
+  ]
+}
+
+function textEvents(): readonly Record<string, unknown>[] {
+  return textResponseEvents(acceptanceResult, "acceptance")
+}
+
+function textResponseEvents(text: string, id: string): readonly Record<string, unknown>[] {
+  const responseId = `resp_${id}`
+  const messageId = `msg_${id}`
+  return [
+    { type: "response.created", response: { id: responseId } },
     {
       type: "response.output_item.added",
       output_index: 0,
-      item: { type: "message", id: "msg_1", role: "assistant", status: "in_progress", content: [] }
+      item: { type: "message", id: messageId, role: "assistant", status: "in_progress", content: [] }
     },
-    {
-      type: "response.output_text.delta",
-      output_index: 0,
-      content_index: 0,
-      item_id: "msg_1",
-      delta: acceptanceResult
-    },
+    { type: "response.output_text.delta", output_index: 0, content_index: 0, item_id: messageId, delta: text },
     {
       type: "response.output_item.done",
       output_index: 0,
       item: {
         type: "message",
-        id: "msg_1",
+        id: messageId,
         role: "assistant",
         status: "completed",
-        content: [{ type: "output_text", text: acceptanceResult, annotations: [] }]
+        content: [{ type: "output_text", text, annotations: [] }]
       }
     },
-    { type: "response.completed", response: terminalResponse("resp_2") }
+    { type: "response.completed", response: terminalResponse(responseId) }
   ]
 }
 

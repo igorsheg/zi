@@ -181,12 +181,14 @@ Pi's optional `grep`, `find`, and `ls` implementations are deliberately deferred
 
 The first usable outcome is the [`custom-tool extension golden path`](extension-custom-tool-golden-path.md); lifecycle infrastructure alone does not complete this milestone.
 
-- [ ] Extension discovery and trust policy
-- [ ] Typed extension host boundary
-- [ ] Custom tools, commands, messages, and provider hooks
+- [x] Extension discovery and trust policy
+- [x] Typed extension host boundary
+- [x] Custom tools
+- [x] Durable custom state and custom messages
+- [ ] Commands and provider hooks
 - [ ] UI contributions expressed through stable imperative OpenTUI component boundaries
 - [ ] Package install/update/remove
-- [ ] Extension fault isolation, cancellation, and bounded IPC
+- [x] Extension fault isolation, cancellation, and bounded IPC
 
 ## Parity method
 

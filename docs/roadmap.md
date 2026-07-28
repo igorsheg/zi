@@ -85,6 +85,15 @@ After custom tools and RPC are in use, choose independently proven slices:
 
 Each capability receives its own closed protocol messages, owner, bounds, example, and behavior tests. No capability expands a generic extension facade in anticipation of another.
 
+### Selected — commands and durable extension state
+
+- [x] Research Pi's custom state/message split and record provenance.
+- [x] Accept the journal and projection ownership decision in ADR 0023.
+- [x] Add the bounded journal kinds, canonical context projector, custom-state index, and image transaction.
+- [x] Add closed `AgentSession` custom-entry and delivery admissions.
+- [x] Render displayed custom messages through authoritative client projections.
+- [x] Add concrete correlated extension session operations and a compiled durable-counter example.
+
 ## Deliberately deferred
 
 Unless user evidence changes priority, defer:

@@ -7,6 +7,7 @@ import type {
   ContextUsage
 } from "../agent-session.js"
 import type { AgentMessage } from "../messages.js"
+import type { CustomEntry, CustomMessageEntry, SessionEntry } from "../session-manager.js"
 import {
   decodeRpcRequest,
   maxRpcFrameBytes,
@@ -83,9 +84,19 @@ export interface RpcMessagePage {
   readonly messages: readonly AgentMessage[]
 }
 
+export type RpcSessionEntry =
+  | Extract<SessionEntry, { readonly type: "message" }>
+  | Extract<SessionEntry, { readonly type: "model_change" }>
+  | Extract<SessionEntry, { readonly type: "thinking_level_change" }>
+  | Extract<SessionEntry, { readonly type: "retry" }>
+  | Extract<SessionEntry, { readonly type: "compaction" }>
+  | CustomEntry
+  | CustomMessageEntry
+
 export type RpcSessionEvent =
-  | Exclude<AgentSessionEvent, { type: "model_changed" }>
+  | Exclude<AgentSessionEvent, { type: "model_changed" | "entry_appended" }>
   | { readonly type: "model_changed"; readonly model: RpcModel }
+  | { readonly type: "entry_appended"; readonly entry: RpcSessionEntry }
 
 interface RpcFrameBase {
   readonly version: 1

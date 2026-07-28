@@ -1,6 +1,6 @@
 # Extensions
 
-Zi extensions are trusted TypeScript modules that add repository-specific behavior without changing Zi. The supported public surface currently consists of lifecycle handlers and model-callable tools.
+Zi extensions are trusted TypeScript modules that add repository-specific behavior without changing Zi. The supported public surface consists of lifecycle handlers, model-callable tools, and bounded durable session operations.
 
 ## Trust and authority
 
@@ -18,7 +18,7 @@ Zi discovers entry points in deterministic order:
 
 A directory entry may use `index.ts`; a direct `.ts` file also works. TypeScript and relative imports load without a build. Install third-party dependencies in the extension's own package hierarchy so normal bare-module resolution can find them.
 
-Start with [`examples/extensions/custom-tool/index.ts`](../examples/extensions/custom-tool/index.ts).
+Start with [`examples/extensions/custom-tool/index.ts`](../examples/extensions/custom-tool/index.ts). For session persistence and custom messages, see [`examples/extensions/durable-counter/index.ts`](../examples/extensions/durable-counter/index.ts).
 
 ## Public API
 
@@ -46,9 +46,29 @@ Tool names use lowercase letters, numbers, and underscores and must begin with a
 
 `execute` receives an invocation-scoped `AbortSignal`. Cancellation is cooperative: pass the signal to subprocess or I/O APIs and stop owned work promptly. Zi rejects late completion and terminates a worker that misses execution or cancellation deadlines.
 
+### Durable state and custom messages
+
+Use `getSessionEntries(customType)` and `appendEntry(customType, data)` for extension state that must survive resume but must not enter model context. Values are bounded JSON. Reads return that custom type's complete bounded session history, including entries older than the active post-compaction message tail.
+
+Use `sendMessage(message, delivery)` for conversation side channels. Content may contain text and images; optional `details` are durable JSON for clients and extensions, not model content. Delivery is one of `append`, `trigger_turn`, `steer`, `follow_up`, or `next_turn`.
+
+```ts
+zi.on("session_start", async () => {
+  const entries = await zi.getSessionEntries("example.mode")
+  // Restore from entries.at(-1)?.data.
+})
+
+await zi.appendEntry("example.mode", { enabled: true })
+await zi.sendMessage({ customType: "example.mode", content: "Mode enabled", display: true }, "follow_up")
+```
+
+`display` controls transcript presentation only. Both `display: true` and `display: false` messages enter provider context and compaction budgets. Use `appendEntry`—not a hidden custom message—for model-invisible state. Session-operation promises settle when Zi admits or refuses the operation; `trigger_turn` does not wait for the resulting provider turn.
+
+Custom types use lowercase ASCII names beginning with a letter. They may contain digits and `._:/-`, up to 128 bytes. Session operations share the worker's bounded correlated-request capacity. A domain refusal rejects only that operation promise; malformed protocol data still fails the worker generation.
+
 ## Lifecycle and resources
 
-Use `zi.on("session_start", handler)` to create long-lived resources and `zi.on("session_shutdown", handler)` to stop them. The extension that creates a subprocess, listener, or other resource owns its cleanup. Shutdown waits are bounded, and Zi cannot clean up detached descendants.
+Use `zi.on("session_start", handler)` to create long-lived resources and `zi.on("session_shutdown", handler)` to stop them. Shutdown handlers may read custom entries and append final custom state until all handlers settle; conversation delivery is closed once session disposal begins. Zi then removes the session-operation binding before disposing the worker. The extension that creates a subprocess, listener, or other resource owns its cleanup. Shutdown waits are bounded, and Zi cannot clean up detached descendants.
 
 ## Modes and diagnostics
 

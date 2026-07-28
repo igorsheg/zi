@@ -168,6 +168,33 @@ export type ExtensionLifecycleEvent =
 export type ExtensionStartEvent = Extract<ExtensionLifecycleEvent, { type: "session_start" }>
 export type ExtensionShutdownEvent = Extract<ExtensionLifecycleEvent, { type: "session_shutdown" }>
 
+export interface ExtensionTextContent {
+  readonly type: "text"
+  readonly text: string
+}
+
+export interface ExtensionImageContent {
+  readonly type: "image"
+  readonly mimeType: string
+  readonly data: string
+}
+
+export interface ExtensionCustomEntry {
+  readonly id: string
+  readonly timestamp: string
+  readonly customType: string
+  readonly data?: JsonValue
+}
+
+export interface ExtensionCustomMessage {
+  readonly customType: string
+  readonly content: string | readonly (ExtensionTextContent | ExtensionImageContent)[]
+  readonly display: boolean
+  readonly details?: JsonValue
+}
+
+export type ExtensionMessageDelivery = "append" | "trigger_turn" | "steer" | "follow_up" | "next_turn"
+
 export interface ExtensionToolContext {
   readonly signal: AbortSignal
 }
@@ -184,6 +211,9 @@ export interface ExtensionAPI {
   on(event: "session_start", handler: (event: ExtensionStartEvent) => void | Promise<void>): void
   on(event: "session_shutdown", handler: (event: ExtensionShutdownEvent) => void | Promise<void>): void
   registerTool<TParameters extends TObject>(tool: ExtensionToolDefinition<TParameters>): void
+  getSessionEntries(customType: string): Promise<readonly ExtensionCustomEntry[]>
+  appendEntry(customType: string, data?: JsonValue): Promise<ExtensionCustomEntry>
+  sendMessage(message: ExtensionCustomMessage, delivery: ExtensionMessageDelivery): Promise<void>
 }
 
 export type ExtensionFactory = (zi: ExtensionAPI) => void | Promise<void>

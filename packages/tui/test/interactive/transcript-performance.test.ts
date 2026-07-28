@@ -205,6 +205,45 @@ test("empty historical Bash failures stay header-only", async () => {
   }
 })
 
+test("displayed custom messages use labelled default chrome while hidden messages allocate nothing", async () => {
+  const setup = await createTestRenderer({ width: 48, height: 8, useThread: false })
+  const syntaxStyle = createSyntaxStyle(defaultTheme)
+  const displayed = createMessageItemView(
+    setup.renderer,
+    {
+      role: "custom",
+      customType: "example.notice",
+      content: [
+        { type: "text", text: "custom body" },
+        { type: "image", mimeType: "image/png", data: "aW1hZ2U=" }
+      ],
+      display: true,
+      timestamp: 1
+    },
+    { theme: defaultTheme, syntaxStyle }
+  )
+  const hidden = createMessageItemView(
+    setup.renderer,
+    { role: "custom", customType: "example.hidden", content: "hidden body", display: false, timestamp: 2 },
+    { theme: defaultTheme, syntaxStyle }
+  )
+  if (!displayed) throw new Error("Displayed custom item not created")
+  setup.renderer.root.add(displayed.root)
+
+  try {
+    await setup.renderOnce()
+    const frame = setup.captureCharFrame()
+    expect(frame).toContain("[example.notice]")
+    expect(frame).toContain("custom body")
+    expect(frame).toContain("[image: image/png]")
+    expect(hidden).toBeUndefined()
+  } finally {
+    displayed.destroy()
+    syntaxStyle.destroy()
+    setup.renderer.destroy()
+  }
+})
+
 test("streaming assistant and markdown roots keep identity across deltas", async () => {
   const harness = await createTranscriptHarness([], {
     streamingMessage: fauxAssistantMessage([fauxThinking("first **thought**"), fauxText("first")])
@@ -758,6 +797,8 @@ test("diagnostic overlay samples at a bounded rate and releases its frame listen
             journalBytes: 100,
             residentEntryBytes: 0,
             imageBlobBytes: 0,
+            customStateEntries: 0,
+            customStateBytes: 0,
             coldMemoryBytes: 50,
             coldMemoryLogicalBytes: 100,
             coldMemoryBlocks: 1

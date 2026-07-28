@@ -3,10 +3,14 @@ import { pathToFileURL } from "node:url"
 
 import type {
   ExtensionAPI,
+  ExtensionCustomEntry,
+  ExtensionCustomMessage,
   ExtensionLifecycleEvent,
+  ExtensionMessageDelivery,
   ExtensionShutdownEvent,
   ExtensionStartEvent,
-  ExtensionToolContext
+  ExtensionToolContext,
+  JsonValue as ExtensionJsonValue
 } from "@with-zi/extension-api"
 import { Type } from "typebox"
 import { Compile, type Validator } from "typebox/compile"
@@ -27,6 +31,7 @@ import {
   maxExtensionTools,
   type ExtensionDiagnostic,
   type ExtensionLoadResult,
+  type ExtensionSessionResponse,
   type ExtensionToolRegistration,
   type HostMessage,
   type JsonValue,
@@ -35,7 +40,8 @@ import {
   validateExtensionToolCatalog,
   validateExtensionToolRegistration,
   validateExtensionToolResult,
-  validateHostMessage
+  validateHostMessage,
+  validateWorkerMessage
 } from "./protocol.js"
 
 export const maxExtensionLifecycleHandlers = 1024
@@ -89,6 +95,21 @@ type WorkerToolInvocation =
   | { readonly type: "responding"; readonly requestId: number; readonly generation: number }
 
 type WorkerToolResponse = Extract<WorkerMessage, { type: "tool_result" | "tool_error" | "tool_cancelled" }>
+
+type WorkerSessionRequest =
+  | { readonly type: "custom_entries_get"; readonly settled: Deferred<readonly ExtensionCustomEntry[]> }
+  | { readonly type: "custom_entry_append"; readonly settled: Deferred<ExtensionCustomEntry> }
+  | { readonly type: "custom_message_send"; readonly settled: VoidDeferred }
+
+export interface WorkerSessionOperations {
+  getEntries(source: ExtensionSource, customType: string): Promise<readonly ExtensionCustomEntry[]>
+  appendEntry(source: ExtensionSource, customType: string, data?: ExtensionJsonValue): Promise<ExtensionCustomEntry>
+  sendMessage(
+    source: ExtensionSource,
+    message: ExtensionCustomMessage,
+    delivery: ExtensionMessageDelivery
+  ): Promise<void>
+}
 
 export interface ExtensionLifecycleResult {
   readonly diagnostics: readonly ExtensionDiagnostic[]
@@ -213,6 +234,8 @@ class ExtensionWorkerProcess {
   readonly #toolInvocations = new Map<number, WorkerToolInvocation>()
   readonly #settledToolRequests = new Set<number>()
   readonly #settledToolRequestOrder: number[] = []
+  readonly #sessionRequests = new Map<number, WorkerSessionRequest>()
+  #nextSessionRequestId = 1
   #state: WorkerProcessState = { type: "awaiting_initialize" }
 
   constructor(output: Writable) {
@@ -225,6 +248,15 @@ class ExtensionWorkerProcess {
 
   receive(message: HostMessage): void {
     const state = this.#state
+    if (
+      message.type === "custom_entries_result" ||
+      message.type === "custom_entry_result" ||
+      message.type === "custom_message_result" ||
+      message.type === "session_operation_error"
+    ) {
+      this.#settleSessionRequest(message)
+      return
+    }
     if (message.type === "initialize") {
       if (state.type !== "awaiting_initialize") {
         this.#protocolFailure("Extension worker was initialized more than once")
@@ -336,12 +368,18 @@ class ExtensionWorkerProcess {
   }
 
   dispose(): void {
+    this.#rejectSessionRequests(new Error("Extension worker disposed with pending session operations"))
     this.#writer.dispose()
   }
 
   async #initialize(message: Extract<HostMessage, { type: "initialize" }>, operation: VoidDeferred): Promise<void> {
     try {
-      const extensions = await loadExtensionGeneration(message.plan, message.generation)
+      const extensions = await loadExtensionGeneration(
+        message.plan,
+        message.generation,
+        extensionStartupTimeoutMs,
+        this.#extensionSessionOperations(message.generation)
+      )
       const state = this.#state
       if (state.type !== "initializing" || state.generation !== message.generation) return
       this.#state = { type: "ready", generation: message.generation, extensions }
@@ -357,6 +395,119 @@ class ExtensionWorkerProcess {
     } finally {
       operation.resolve()
     }
+  }
+
+  #extensionSessionOperations(generation: number): WorkerSessionOperations {
+    const operations: WorkerSessionOperations = {
+      getEntries: (source, customType) => {
+        const settled = deferred<readonly ExtensionCustomEntry[]>()
+        this.#requestSessionOperation(
+          generation,
+          { type: "custom_entries_get", settled },
+          { type: "custom_entries_get", extensionId: source.id, customType }
+        )
+        return settled.promise
+      },
+      appendEntry: (source, customType, data) => {
+        const settled = deferred<ExtensionCustomEntry>()
+        this.#requestSessionOperation(
+          generation,
+          { type: "custom_entry_append", settled },
+          { type: "custom_entry_append", extensionId: source.id, customType, ...(data === undefined ? {} : { data }) }
+        )
+        return settled.promise
+      },
+      sendMessage: (source, message, delivery) => {
+        const settled = deferred<void>()
+        this.#requestSessionOperation(
+          generation,
+          { type: "custom_message_send", settled },
+          { type: "custom_message_send", extensionId: source.id, message, delivery }
+        )
+        return settled.promise
+      }
+    }
+    return Object.freeze(operations)
+  }
+
+  #requestSessionOperation(
+    generation: number,
+    request: WorkerSessionRequest,
+    fields:
+      | { readonly type: "custom_entries_get"; readonly extensionId: string; readonly customType: string }
+      | {
+          readonly type: "custom_entry_append"
+          readonly extensionId: string
+          readonly customType: string
+          readonly data?: ExtensionJsonValue
+        }
+      | {
+          readonly type: "custom_message_send"
+          readonly extensionId: string
+          readonly message: ExtensionCustomMessage
+          readonly delivery: ExtensionMessageDelivery
+        }
+  ): void {
+    if (workerGeneration(this.#state) !== generation) {
+      request.settled.reject(new Error("Extension session operation belongs to a stale generation"))
+      return
+    }
+    if (this.#sessionRequests.size >= maxExtensionPendingRequests) {
+      request.settled.reject(
+        new Error(`Extension workers cannot await more than ${maxExtensionPendingRequests} session operations`)
+      )
+      return
+    }
+    const requestId = this.#nextSessionRequestId
+    if (!Number.isSafeInteger(requestId)) {
+      request.settled.reject(new Error("Extension session operation request IDs are exhausted"))
+      return
+    }
+
+    let message: WorkerMessage
+    try {
+      message = validateWorkerMessage({ ...fields, generation, requestId })
+    } catch (cause) {
+      request.settled.reject(cause)
+      return
+    }
+    this.#nextSessionRequestId++
+    this.#sessionRequests.set(requestId, request)
+    void this.#writer.send(message).catch(cause => {
+      if (this.#sessionRequests.get(requestId) === request) {
+        this.#sessionRequests.delete(requestId)
+        request.settled.reject(cause)
+      }
+    })
+  }
+
+  #settleSessionRequest(response: ExtensionSessionResponse): void {
+    const generation = workerGeneration(this.#state)
+    const request = this.#sessionRequests.get(response.requestId)
+    if (generation !== response.generation || !request) {
+      this.#protocolFailure("Extension host settled an unknown session operation")
+      return
+    }
+    this.#sessionRequests.delete(response.requestId)
+    if (response.type === "session_operation_error") {
+      request.settled.reject(new Error(response.message))
+      return
+    }
+    if (request.type === "custom_entries_get" && response.type === "custom_entries_result") {
+      request.settled.resolve(response.entries)
+      return
+    }
+    if (request.type === "custom_entry_append" && response.type === "custom_entry_result") {
+      request.settled.resolve(response.entry)
+      return
+    }
+    if (request.type === "custom_message_send" && response.type === "custom_message_result") {
+      request.settled.resolve()
+      return
+    }
+    const error = new ExtensionProtocolError("Extension host returned the wrong session-operation result")
+    request.settled.reject(error)
+    this.#protocolFailure(error.message)
   }
 
   #cancelToolInvocation(message: Extract<HostMessage, { type: "cancel" }>): boolean {
@@ -518,11 +669,17 @@ class ExtensionWorkerProcess {
     if (this.#state.type === "failed" || this.#state.type === "stopped") return
     const error = cause instanceof Error ? cause : new Error(String(cause))
     this.#abortToolInvocations()
+    this.#rejectSessionRequests(error)
     this.#state = { type: "failed", error }
     void this.#writer.send({ type: "fatal", generation, diagnostic }).then(
       () => this.#terminal.reject(error),
       writerCause => this.#terminal.reject(writerCause)
     )
+  }
+
+  #rejectSessionRequests(error: Error): void {
+    for (const request of this.#sessionRequests.values()) request.settled.reject(error)
+    this.#sessionRequests.clear()
   }
 
   #abortToolInvocations(): void {
@@ -538,6 +695,7 @@ class ExtensionWorkerProcess {
     if (this.#state.type === "failed" || this.#state.type === "stopped") return
     const error = cause instanceof Error ? cause : new Error(String(cause))
     this.#abortToolInvocations()
+    this.#rejectSessionRequests(error)
     this.#state = { type: "failed", error }
     this.#writer.fail(error)
     this.#terminal.reject(error)
@@ -577,10 +735,17 @@ export async function runExtensionWorkerProcess(input: Readable, output: Writabl
   }
 }
 
+const unavailableSessionOperations: WorkerSessionOperations = Object.freeze({
+  getEntries: () => Promise.reject(new Error("Extension session operations are unavailable")),
+  appendEntry: () => Promise.reject(new Error("Extension session operations are unavailable")),
+  sendMessage: () => Promise.reject(new Error("Extension session operations are unavailable"))
+})
+
 export async function loadExtensionGeneration(
   plan: ExtensionLoadPlan,
   generation: number,
-  factoryTimeoutMs = extensionStartupTimeoutMs
+  factoryTimeoutMs = extensionStartupTimeoutMs,
+  sessionOperations: WorkerSessionOperations = unavailableSessionOperations
 ): Promise<LoadedExtensionGeneration> {
   if (!Number.isSafeInteger(generation) || generation <= 0) {
     throw new Error("Extension generation must be a positive safe integer")
@@ -647,6 +812,15 @@ export async function loadExtensionGeneration(
         ])
         localToolNames.add(name)
         localTools.push(registered)
+      },
+      getSessionEntries(customType: string) {
+        return sessionOperations.getEntries(source, customType)
+      },
+      appendEntry(customType: string, data?: ExtensionJsonValue) {
+        return sessionOperations.appendEntry(source, customType, data)
+      },
+      sendMessage(message: ExtensionCustomMessage, delivery: ExtensionMessageDelivery) {
+        return sessionOperations.sendMessage(source, message, delivery)
       }
     }) as ExtensionAPI
 
@@ -767,10 +941,12 @@ interface Deferred<T> {
 
 type VoidDeferred = Omit<Deferred<void>, "resolve"> & { resolve(): void }
 
-function deferred(): VoidDeferred {
-  let resolve!: () => void
+function deferred(): VoidDeferred
+function deferred<T>(): Deferred<T>
+function deferred<T = void>(): Deferred<T> {
+  let resolve!: (value: T) => void
   let reject!: (cause: unknown) => void
-  const promise = new Promise<void>((resolvePromise, rejectPromise) => {
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
     resolve = resolvePromise
     reject = rejectPromise
   })

@@ -1,6 +1,6 @@
 # Extension system infrastructure implementation spec
 
-- Status: accepted for custom tools; later capabilities remain deferred
+- Status: accepted for custom tools and durable session operations; later capabilities remain deferred
 - Pi behavior reference: `badlogic/pi-mono` at Zi's pinned `0e6909f0` (`v0.80.6`)
 - Current Pi comparison: `fc85bdd88be93b1e9a6b6bcfa41c684282ec79cc`
 - Project-trust comparison: `5bc1c2c0a6f07e00e8c240304182f213ab8d311f`
@@ -13,7 +13,7 @@ Zi will eventually support the full behavioral capability of Pi's extension syst
 
 This specification establishes the extension substrate before any product capability is added. The first accepted implementation can discover, trust-gate, load, identify, reload, and shut down otherwise empty TypeScript extensions through a supervised extension generation.
 
-The initial infrastructure contract contained lifecycle registration only. Protocol version 2 adds the first separate capability: bounded model-callable tools. Commands, providers, UI, and a generic event framework remain excluded.
+The initial infrastructure contract contained lifecycle registration only. Protocol version 2 added bounded model-callable tools. Protocol version 3 adds source-attributed correlated operations for custom session state and custom messages. Commands, providers, extension-owned UI, and a generic event framework remain excluded.
 
 Lifecycle loading is an infrastructure checkpoint, not the product launch boundary. The first usable outcome is the [`custom-tool extension golden path`](extension-custom-tool-golden-path.md), which must work across interactive, text, JSON, and RPC modes against the compiled release.
 
@@ -35,7 +35,8 @@ The infrastructure must provide:
 10. source-attributed, bounded diagnostics without aborting ordinary Zi startup;
 11. bounded lifecycle settlement and final process teardown;
 12. a public lifecycle contract plus protocol-v2 tool registration and execution;
-13. structural and compiled acceptance tests covering races, bounds, crashes, hangs, replacement, and cleanup.
+13. protocol-v3 custom-state reads/appends and custom-message delivery;
+14. structural and compiled acceptance tests covering races, bounds, crashes, hangs, replacement, and cleanup.
 
 ## 3. Non-goals
 
@@ -43,7 +44,7 @@ The current capability does not implement:
 
 - commands, shortcuts, or extension-owned CLI flags;
 - agent, provider, tool, input, compaction, or session-tree interception;
-- custom messages, durable entries, names, or labels;
+- session names, labels, branches, or tree navigation;
 - model or provider registration;
 - resource contribution from extensions;
 - direct OpenTUI renderables or terminal widgets;
@@ -533,7 +534,7 @@ A dedicated child-to-parent pipe keeps arbitrary `console.log()` and `process.st
 type HostMessage =
   | {
       readonly type: "initialize"
-      readonly protocolVersion: 2
+      readonly protocolVersion: 3
       readonly generation: number
       readonly plan: ExtensionLoadPlan
     }
@@ -558,6 +559,25 @@ type HostMessage =
     }
   | { readonly type: "cancel"; readonly generation: number; readonly requestId: number }
   | { readonly type: "stop"; readonly generation: number; readonly requestId: number }
+  | {
+      readonly type: "custom_entries_result"
+      readonly generation: number
+      readonly requestId: number
+      readonly entries: readonly ExtensionCustomEntry[]
+    }
+  | {
+      readonly type: "custom_entry_result"
+      readonly generation: number
+      readonly requestId: number
+      readonly entry: ExtensionCustomEntry
+    }
+  | { readonly type: "custom_message_result"; readonly generation: number; readonly requestId: number }
+  | {
+      readonly type: "session_operation_error"
+      readonly generation: number
+      readonly requestId: number
+      readonly message: string
+    }
 ```
 
 ### 12.3 Worker messages
@@ -566,7 +586,7 @@ type HostMessage =
 type WorkerMessage =
   | {
       readonly type: "ready"
-      readonly protocolVersion: 2
+      readonly protocolVersion: 3
       readonly generation: number
       readonly extensions: readonly ExtensionLoadResult[]
       readonly tools: readonly ExtensionToolRegistration[]
@@ -575,6 +595,29 @@ type WorkerMessage =
   | { readonly type: "tool_result"; readonly generation: number; readonly requestId: number; readonly content: string }
   | { readonly type: "tool_error"; readonly generation: number; readonly requestId: number; readonly message: string }
   | { readonly type: "tool_cancelled"; readonly generation: number; readonly requestId: number }
+  | {
+      readonly type: "custom_entries_get"
+      readonly generation: number
+      readonly requestId: number
+      readonly extensionId: string
+      readonly customType: string
+    }
+  | {
+      readonly type: "custom_entry_append"
+      readonly generation: number
+      readonly requestId: number
+      readonly extensionId: string
+      readonly customType: string
+      readonly data?: JsonValue
+    }
+  | {
+      readonly type: "custom_message_send"
+      readonly generation: number
+      readonly requestId: number
+      readonly extensionId: string
+      readonly message: ExtensionCustomMessage
+      readonly delivery: ExtensionMessageDelivery
+    }
   | { readonly type: "diagnostic"; readonly generation: number; readonly diagnostic: ExtensionDiagnostic }
   | { readonly type: "fatal"; readonly generation: number; readonly diagnostic: ExtensionDiagnostic }
 ```

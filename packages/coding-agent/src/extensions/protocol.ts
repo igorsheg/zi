@@ -1,8 +1,20 @@
 import { isAbsolute } from "node:path"
 import type { Writable } from "node:stream"
 
-import type { ExtensionShutdownReason, ExtensionStartReason } from "@with-zi/extension-api"
+import type {
+  ExtensionCustomEntry,
+  ExtensionCustomMessage,
+  ExtensionMessageDelivery,
+  ExtensionShutdownReason,
+  ExtensionStartReason
+} from "@with-zi/extension-api"
 
+import {
+  maxCustomJsonBytes,
+  maxCustomStateEntries,
+  validateCustomMessageInput,
+  validateCustomType
+} from "../session-manager.js"
 import {
   maxExtensionPathBytes,
   maxExtensionSources,
@@ -10,7 +22,7 @@ import {
   type ExtensionSource
 } from "./discovery.js"
 
-export const extensionProtocolVersion = 2
+export const extensionProtocolVersion = 3
 export const maxExtensionProtocolFrameBytes = 4 * 1024 * 1024
 export const maxExtensionPendingRequests = 128
 export const maxExtensionQueuedWriteBytes = 8 * 1024 * 1024
@@ -70,7 +82,7 @@ export interface ExtensionLoadResult {
 export type HostMessage =
   | {
       readonly type: "initialize"
-      readonly protocolVersion: 2
+      readonly protocolVersion: 3
       readonly generation: number
       readonly plan: ExtensionLoadPlan
     }
@@ -95,11 +107,30 @@ export type HostMessage =
     }
   | { readonly type: "stop"; readonly generation: number; readonly requestId: number }
   | { readonly type: "cancel"; readonly generation: number; readonly requestId: number }
+  | {
+      readonly type: "custom_entries_result"
+      readonly generation: number
+      readonly requestId: number
+      readonly entries: readonly ExtensionCustomEntry[]
+    }
+  | {
+      readonly type: "custom_entry_result"
+      readonly generation: number
+      readonly requestId: number
+      readonly entry: ExtensionCustomEntry
+    }
+  | { readonly type: "custom_message_result"; readonly generation: number; readonly requestId: number }
+  | {
+      readonly type: "session_operation_error"
+      readonly generation: number
+      readonly requestId: number
+      readonly message: string
+    }
 
 export type WorkerMessage =
   | {
       readonly type: "ready"
-      readonly protocolVersion: 2
+      readonly protocolVersion: 3
       readonly generation: number
       readonly extensions: readonly ExtensionLoadResult[]
       readonly tools: readonly ExtensionToolRegistration[]
@@ -108,10 +139,44 @@ export type WorkerMessage =
   | { readonly type: "tool_result"; readonly generation: number; readonly requestId: number; readonly content: string }
   | { readonly type: "tool_error"; readonly generation: number; readonly requestId: number; readonly message: string }
   | { readonly type: "tool_cancelled"; readonly generation: number; readonly requestId: number }
+  | {
+      readonly type: "custom_entries_get"
+      readonly generation: number
+      readonly requestId: number
+      readonly extensionId: string
+      readonly customType: string
+    }
+  | {
+      readonly type: "custom_entry_append"
+      readonly generation: number
+      readonly requestId: number
+      readonly extensionId: string
+      readonly customType: string
+      readonly data?: JsonValue
+    }
+  | {
+      readonly type: "custom_message_send"
+      readonly generation: number
+      readonly requestId: number
+      readonly extensionId: string
+      readonly message: ExtensionCustomMessage
+      readonly delivery: ExtensionMessageDelivery
+    }
   | { readonly type: "diagnostic"; readonly generation: number; readonly diagnostic: ExtensionDiagnostic }
   | { readonly type: "fatal"; readonly generation: number; readonly diagnostic: ExtensionDiagnostic }
 
 export type JsonValue = null | boolean | number | string | readonly JsonValue[] | { readonly [key: string]: JsonValue }
+
+export type ExtensionSessionRequest = Extract<
+  WorkerMessage,
+  { readonly type: "custom_entries_get" | "custom_entry_append" | "custom_message_send" }
+>
+export type ExtensionSessionResponse = Extract<
+  HostMessage,
+  {
+    readonly type: "custom_entries_result" | "custom_entry_result" | "custom_message_result" | "session_operation_error"
+  }
+>
 
 export interface ExtensionToolRegistration {
   readonly source: ExtensionSource
@@ -357,10 +422,37 @@ export function validateHostMessage(value: unknown): HostMessage {
       })
     case "stop":
     case "cancel":
+    case "custom_message_result":
       return Object.freeze({
         type: message.type,
         generation: positiveInteger(message.generation, "generation"),
         requestId: positiveInteger(message.requestId, "requestId")
+      })
+    case "custom_entries_result": {
+      const entries = protocolArray(message.entries, "custom entries")
+      if (entries.length > maxCustomStateEntries) {
+        throw new ExtensionProtocolError(`Custom entries cannot exceed ${maxCustomStateEntries}`)
+      }
+      return Object.freeze({
+        type: "custom_entries_result",
+        generation: positiveInteger(message.generation, "generation"),
+        requestId: positiveInteger(message.requestId, "requestId"),
+        entries: Object.freeze(entries.map(extensionCustomEntry))
+      })
+    }
+    case "custom_entry_result":
+      return Object.freeze({
+        type: "custom_entry_result",
+        generation: positiveInteger(message.generation, "generation"),
+        requestId: positiveInteger(message.requestId, "requestId"),
+        entry: extensionCustomEntry(message.entry)
+      })
+    case "session_operation_error":
+      return Object.freeze({
+        type: "session_operation_error",
+        generation: positiveInteger(message.generation, "generation"),
+        requestId: positiveInteger(message.requestId, "requestId"),
+        message: boundedRequiredText(message.message, "session operation error", maxExtensionDiagnosticMessageBytes)
       })
     default:
       throw new ExtensionProtocolError("Unknown host protocol message")
@@ -405,6 +497,34 @@ export function validateWorkerMessage(value: unknown): WorkerMessage {
         requestId: positiveInteger(message.requestId, "requestId"),
         message: boundedRequiredText(message.message, "tool error", maxExtensionDiagnosticMessageBytes)
       })
+    case "custom_entries_get":
+      return Object.freeze({
+        type: "custom_entries_get",
+        generation: positiveInteger(message.generation, "generation"),
+        requestId: positiveInteger(message.requestId, "requestId"),
+        extensionId: boundedRequiredText(message.extensionId, "extension id", maxExtensionIdBytes),
+        customType: customType(message.customType)
+      })
+    case "custom_entry_append":
+      return Object.freeze({
+        type: "custom_entry_append",
+        generation: positiveInteger(message.generation, "generation"),
+        requestId: positiveInteger(message.requestId, "requestId"),
+        extensionId: boundedRequiredText(message.extensionId, "extension id", maxExtensionIdBytes),
+        customType: customType(message.customType),
+        ...(message.data === undefined
+          ? {}
+          : { data: jsonValue(message.data, "custom entry data", maxCustomJsonBytes) })
+      })
+    case "custom_message_send":
+      return Object.freeze({
+        type: "custom_message_send",
+        generation: positiveInteger(message.generation, "generation"),
+        requestId: positiveInteger(message.requestId, "requestId"),
+        extensionId: boundedRequiredText(message.extensionId, "extension id", maxExtensionIdBytes),
+        message: extensionCustomMessage(message.message),
+        delivery: extensionMessageDelivery(message.delivery)
+      })
     case "diagnostic":
     case "fatal":
       return Object.freeze({
@@ -447,11 +567,19 @@ export function validateExtensionToolResult(value: unknown): string {
 }
 
 export function boundedExtensionToolError(cause: unknown): string {
+  return boundedOperationError(cause, "Extension tool failed")
+}
+
+export function boundedExtensionSessionOperationError(cause: unknown): string {
+  return boundedOperationError(cause, "Extension session operation failed")
+}
+
+function boundedOperationError(cause: unknown, fallback: string): string {
   try {
     const error = cause instanceof Error ? cause : new Error(String(cause))
-    return boundedText(error.message || error.name || "Extension tool failed", maxExtensionDiagnosticMessageBytes)
+    return boundedText(error.message || error.name || fallback, maxExtensionDiagnosticMessageBytes)
   } catch {
-    return "Extension tool failed"
+    return fallback
   }
 }
 
@@ -588,6 +716,58 @@ function validateToolSchema(value: JsonValue, path: string): void {
   throw new ExtensionProtocolError(`Extension tool schema ${path} has an unsupported type`)
 }
 
+function extensionCustomEntry(value: unknown): ExtensionCustomEntry {
+  const entry = protocolRecord(value)
+  const customTypeValue = customType(entry.customType)
+  const timestamp = boundedRequiredText(entry.timestamp, "custom entry timestamp", 128)
+  if (!Number.isFinite(Date.parse(timestamp))) {
+    throw new ExtensionProtocolError("Extension custom entry timestamps must be valid dates")
+  }
+  return Object.freeze({
+    id: boundedRequiredText(entry.id, "custom entry id", maxExtensionIdBytes),
+    timestamp,
+    customType: customTypeValue,
+    ...(entry.data === undefined ? {} : { data: jsonValue(entry.data, "custom entry data", maxCustomJsonBytes) })
+  })
+}
+
+function extensionCustomMessage(value: unknown): ExtensionCustomMessage {
+  const admitted = jsonValue(value, "custom message", maxExtensionProtocolFrameBytes)
+  try {
+    validateCustomMessageInput(admitted)
+  } catch (cause) {
+    throw new ExtensionProtocolError("Invalid extension custom message", { cause })
+  }
+  return Object.freeze({
+    customType: admitted.customType,
+    content: admitted.content,
+    display: admitted.display,
+    ...(admitted.details === undefined ? {} : { details: admitted.details })
+  })
+}
+
+function extensionMessageDelivery(value: unknown): ExtensionMessageDelivery {
+  if (
+    value !== "append" &&
+    value !== "trigger_turn" &&
+    value !== "steer" &&
+    value !== "follow_up" &&
+    value !== "next_turn"
+  ) {
+    throw new ExtensionProtocolError("Unknown extension custom message delivery")
+  }
+  return value
+}
+
+function customType(value: unknown): string {
+  try {
+    validateCustomType(value)
+    return value
+  } catch (cause) {
+    throw new ExtensionProtocolError("Invalid extension custom type", { cause })
+  }
+}
+
 function toolName(value: unknown): string {
   const name = boundedRequiredText(value, "tool name", maxExtensionToolNameBytes)
   if (!/^[a-z][a-z0-9_]*$/.test(name)) {
@@ -699,7 +879,7 @@ function protocolArray(value: unknown, field: string): readonly unknown[] {
   return value
 }
 
-function protocolVersion(value: unknown): 2 {
+function protocolVersion(value: unknown): 3 {
   if (value !== extensionProtocolVersion) throw new ExtensionProtocolError("Unsupported extension protocol version")
   return extensionProtocolVersion
 }

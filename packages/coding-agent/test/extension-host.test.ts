@@ -172,6 +172,65 @@ test("host tool invocation is correlated, cancellable, and generation-reusable",
   await host.dispose()
 })
 
+test("worker session requests are source-attributed and domain refusals keep the generation ready", async () => {
+  const workers = new TestWorkerSpawner()
+  const host = await ExtensionHost.create(planOne, workers.spawn, testTimeouts)
+  const release = host.bindSessionOperations({
+    getEntries: customType => [{ id: "state-1", timestamp: new Date(0).toISOString(), customType, data: { count: 1 } }],
+    appendEntry: (customType, data) => ({
+      id: "state-2",
+      timestamp: new Date(1).toISOString(),
+      customType,
+      ...(data === undefined ? {} : { data })
+    }),
+    sendMessage: () => {}
+  })
+  await host.sessionStart("startup")
+  const worker = workers.processes[0]!
+
+  worker.send({
+    type: "custom_entries_get",
+    generation: 1,
+    requestId: 41,
+    extensionId: sourceOne.id,
+    customType: "example.counter"
+  })
+  await Bun.sleep(0)
+  expect(worker.messages).toContainEqual({
+    type: "custom_entries_result",
+    generation: 1,
+    requestId: 41,
+    entries: [
+      { id: "state-1", timestamp: new Date(0).toISOString(), customType: "example.counter", data: { count: 1 } }
+    ]
+  })
+
+  worker.send({
+    type: "custom_entries_get",
+    generation: 1,
+    requestId: 42,
+    extensionId: "unknown-source",
+    customType: "example.counter"
+  })
+  await Bun.sleep(0)
+  expect(worker.messages).toContainEqual(expect.objectContaining({ type: "session_operation_error", requestId: 42 }))
+  expect(host.snapshot()).toMatchObject({ status: "ready", lifecycle: "started" })
+
+  release()
+  worker.send({
+    type: "custom_entry_append",
+    generation: 1,
+    requestId: 43,
+    extensionId: sourceOne.id,
+    customType: "example.counter",
+    data: { count: 2 }
+  })
+  await Bun.sleep(0)
+  expect(worker.messages).toContainEqual(expect.objectContaining({ type: "session_operation_error", requestId: 43 }))
+  expect(host.snapshot()).toMatchObject({ status: "ready", lifecycle: "started" })
+  await host.dispose()
+})
+
 test("a tool result crossing host cancellation settles as cancellation", async () => {
   const workers = new TestWorkerSpawner()
   workers.behaviors.push({ type: "tool_cancel_crossing" })
@@ -348,6 +407,42 @@ test("final disposal supersedes startup and replacement without leaking either p
   expect(replacementWorkers.processes[0]!.messages.map(message => message.type)).toContain("session_shutdown")
 })
 
+test("replacement disposal authorizes shutdown state operations from the current generation", async () => {
+  const workers = new TestWorkerSpawner()
+  workers.behaviors.push({ type: "shutdown_append" })
+  const host = await ExtensionHost.create(planOne, workers.spawn, testTimeouts)
+  const appended: Array<{ readonly customType: string; readonly data?: unknown }> = []
+  host.bindSessionOperations({
+    getEntries: () => [],
+    appendEntry: (customType, data) => {
+      appended.push(data === undefined ? { customType } : { customType, data })
+      return {
+        id: "shutdown-state",
+        timestamp: new Date(0).toISOString(),
+        customType,
+        ...(data === undefined ? {} : { data })
+      }
+    },
+    sendMessage: () => {}
+  })
+  await host.sessionStart("startup")
+  const current = workers.processes[0]!
+
+  workers.behaviors.push({ type: "pending" })
+  const replacement = host.reload(planTwo)
+  await Promise.resolve()
+  const candidate = workers.processes[1]!
+  const disposal = host.dispose()
+  await Promise.all([replacement, disposal])
+
+  expect(appended).toEqual([{ customType: "example.shutdown", data: { final: true } }])
+  expect(current.messages).toContainEqual(
+    expect.objectContaining({ type: "custom_entry_result", requestId: 1, generation: 1 })
+  )
+  expect(current.disposed).toBe(true)
+  expect(candidate.disposed).toBe(true)
+})
+
 test("current crashes fail closed, retain bounded diagnostics, and remain disposable", async () => {
   const workers = new TestWorkerSpawner()
   const host = await ExtensionHost.create(planOne, workers.spawn, testTimeouts)
@@ -395,6 +490,7 @@ type TestWorkerBehavior =
   | { readonly type: "spawn_error"; readonly message: string }
   | { readonly type: "fatal"; readonly message: string }
   | { readonly type: "pending" }
+  | { readonly type: "shutdown_append" }
   | { readonly type: "resist_terminate" }
 
 class TestWorkerProcess implements ExtensionWorkerProcess {
@@ -411,6 +507,7 @@ class TestWorkerProcess implements ExtensionWorkerProcess {
   readonly #decoder = new ExtensionProtocolDecoder(validateHostMessage)
   readonly #resolveExit: (exit: ExtensionWorkerExit) => void
   #generation = 0
+  #shutdownRequestId: number | undefined
   #exited = false
 
   constructor(plan: ExtensionLoadPlan, behavior: TestWorkerBehavior) {
@@ -461,6 +558,19 @@ class TestWorkerProcess implements ExtensionWorkerProcess {
 
   #receive(message: HostMessage): void {
     this.messages.push(message)
+    if (
+      message.type === "custom_entries_result" ||
+      message.type === "custom_entry_result" ||
+      message.type === "custom_message_result" ||
+      message.type === "session_operation_error"
+    ) {
+      if (this.#behavior.type === "shutdown_append" && this.#shutdownRequestId !== undefined) {
+        const requestId = this.#shutdownRequestId
+        this.#shutdownRequestId = undefined
+        this.send({ type: "settled", generation: this.#generation, requestId })
+      }
+      return
+    }
     if (message.type === "initialize") {
       this.#generation = message.generation
       if (this.#behavior.type === "pending") return
@@ -538,6 +648,18 @@ class TestWorkerProcess implements ExtensionWorkerProcess {
         type: "fatal",
         generation: message.generation,
         diagnostic: { phase: "lifecycle", severity: "error", message: "start failed" }
+      })
+      return
+    }
+    if (message.type === "session_shutdown" && this.#behavior.type === "shutdown_append") {
+      this.#shutdownRequestId = message.requestId
+      this.send({
+        type: "custom_entry_append",
+        generation: message.generation,
+        requestId: 1,
+        extensionId: this.#plan.sources[0]!.id,
+        customType: "example.shutdown",
+        data: { final: true }
       })
       return
     }

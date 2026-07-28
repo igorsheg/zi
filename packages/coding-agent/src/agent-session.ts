@@ -19,7 +19,12 @@ import {
   type ImageContent,
   type Model
 } from "@earendil-works/pi-ai"
-import type { ExtensionShutdownReason, ExtensionStartReason } from "@with-zi/extension-api"
+import type {
+  ExtensionCustomEntry,
+  ExtensionMessageDelivery,
+  ExtensionShutdownReason,
+  ExtensionStartReason
+} from "@with-zi/extension-api"
 
 import type {
   Authentication,
@@ -59,14 +64,21 @@ import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.js
 import type { ResourceDiagnostic } from "./resource-diagnostics.js"
 import type { SessionResources } from "./resource-loader.js"
 import { boundedRetryError, retryAbortedMessage, retryDelayMs, waitForRetryDelay } from "./retry.js"
-import type {
-  CompactionDetails,
-  CompactionEntry,
-  CompactionReason,
-  SessionEntry,
-  SessionJournalMemoryDiagnostics,
-  SessionManager,
-  SessionPromptHistoryEntry
+import {
+  isSessionJson,
+  sessionEntryToContextMessage,
+  validateCustomMessageInput,
+  type CompactionDetails,
+  type CompactionEntry,
+  type CompactionReason,
+  type CustomEntry,
+  type CustomMessageEntry,
+  type CustomMessageInput,
+  type SessionEntry,
+  type SessionJournalMemoryDiagnostics,
+  type SessionJson,
+  type SessionManager,
+  type SessionPromptHistoryEntry
 } from "./session-manager.js"
 import type { SessionShell, ShellDemotionResult, ShellKillResult, ShellTaskSnapshot } from "./session-shell.js"
 import type { SettingsManager, SettingsScope } from "./settings-manager.js"
@@ -81,6 +93,18 @@ export const maxPendingInputBytes = 8 * 1024 * 1024
 export { maxRetryDelayMs, maxRetryErrorBytes } from "./retry.js"
 
 export type PendingInputDelivery = "steer" | "followUp"
+
+export type CustomMessageDelivery =
+  | { readonly type: "append" }
+  | { readonly type: "trigger_turn" }
+  | { readonly type: "steer" }
+  | { readonly type: "follow_up" }
+  | { readonly type: "next_turn" }
+
+export type CustomMessageAdmission =
+  | { readonly type: "appended"; readonly entry: CustomMessageEntry }
+  | { readonly type: "queued"; readonly delivery: "steer" | "follow_up" | "next_turn" }
+  | { readonly type: "turn_started"; readonly entry: CustomMessageEntry; readonly settled: Promise<void> }
 
 export interface QueuedInput {
   readonly id: number
@@ -260,9 +284,12 @@ type RunPhase =
     }
   | { readonly type: "compaction_committed"; readonly operationId: number; readonly reason: "threshold" | "overflow" }
 
+type ProviderStart = { readonly type: "pending"; readonly controller: AbortController } | { readonly type: "active" }
+
 type RunningActivity = {
   readonly type: "running"
   readonly runId: number
+  readonly providerStart: ProviderStart
   readonly phase: RunPhase
   readonly autoCompactions: number
   readonly overflowRecoveries: 0 | 1
@@ -292,6 +319,7 @@ type ExtensionLifecycleState =
   | { readonly type: "unbound"; readonly host: ExtensionHost }
   | { readonly type: "starting"; readonly host: ExtensionHost; readonly settled: Promise<void> }
   | { readonly type: "started"; readonly host: ExtensionHost }
+  | { readonly type: "shutdown"; readonly host: ExtensionHost; readonly settled: Promise<void> }
   | { readonly type: "disposing"; readonly host: ExtensionHost; readonly settled: Promise<void> }
   | { readonly type: "disposed"; readonly settled: Promise<void> }
 
@@ -301,7 +329,8 @@ export type SessionModelState =
   | { readonly type: "unselected" }
   | { readonly type: "selected"; readonly model: Model<Api> }
 
-interface PendingInput {
+interface PendingUserInput {
+  readonly type: "user"
   readonly id: number
   readonly runId: number
   readonly delivery: PendingInputDelivery
@@ -310,6 +339,38 @@ interface PendingInput {
   readonly bytes: number
   readonly message: AgentMessage
 }
+
+type PendingCustomInput =
+  | {
+      readonly type: "custom"
+      readonly id: number
+      readonly runId: number
+      readonly delivery: PendingInputDelivery
+      readonly bytes: number
+      readonly message: RuntimeCustomMessage
+    }
+  | {
+      readonly type: "custom"
+      readonly id: number
+      readonly delivery: "nextTurn"
+      readonly bytes: number
+      readonly message: RuntimeCustomMessage
+    }
+
+type PendingInput = PendingUserInput | PendingCustomInput
+
+type PendingMessageCancellation = "interrupt" | "restore"
+
+type QueueRestoreCancellationState =
+  | { readonly type: "none" }
+  | { readonly type: "awaiting_synthetic_failure"; readonly runId: number }
+  | { readonly type: "suppressing_synthetic_failure"; readonly runId: number; readonly message: AssistantMessage }
+
+type RuntimeCustomMessage = Extract<AgentMessage, { role: "custom" }> & { readonly details?: SessionJson }
+
+type RunStart =
+  | { readonly type: "prompt"; readonly messages: readonly AgentMessage[] }
+  | { readonly type: "continuation" }
 
 interface CommittedMessageMemory {
   readonly count: number
@@ -358,11 +419,14 @@ export class AgentSession {
   readonly #unsubscribeAgent: () => void
   readonly #unsubscribeShell: (() => void) | undefined
   readonly #unbindExtensionTools: (() => void) | undefined
+  readonly #unbindExtensionSessionOperations: (() => void) | undefined
   #activeTools: readonly AgentTool[]
   #activity: Activity = { type: "idle" }
   #extensionLifecycle: ExtensionLifecycleState
   #pending: PendingInput[] = []
   #pendingBytes = 0
+  readonly #cancelledPendingMessages = new Map<PiAgentMessage, PendingMessageCancellation>()
+  #queueRestoreCancellation: QueueRestoreCancellationState = { type: "none" }
   #nextRunId = 0
   #nextEntryId = 0
   #nextModelOperationId = 0
@@ -392,6 +456,13 @@ export class AgentSession {
     this.#agent.prepareNextTurnWithContext = (context, signal) => this.#prepareNextTurn(context, signal)
     this.#unsubscribeAgent = this.#agent.subscribe(event => this.#handleAgentEvent(event))
     this.#unbindExtensionTools = config.extensionHost?.bindToolCatalog(() => this.#applyActiveTools())
+    this.#unbindExtensionSessionOperations = config.extensionHost?.bindSessionOperations({
+      getEntries: customType => this.#getExtensionCustomEntries(customType).map(extensionCustomEntry),
+      appendEntry: (customType, data) => extensionCustomEntry(this.#appendExtensionCustomEntry(customType, data)),
+      sendMessage: (message, delivery) => {
+        this.sendCustomMessage(message, extensionMessageDelivery(delivery))
+      }
+    })
     this.#unsubscribeShell = this.#shell?.subscribe(taskId => {
       try {
         this.#emit({ type: "shell_task_changed", taskId })
@@ -652,6 +723,64 @@ export class AgentSession {
     return () => this.#listeners.delete(listener)
   }
 
+  appendCustomEntry(customType: string, data?: SessionJson): CustomEntry {
+    this.#assertCustomStateAppend()
+    const entry = this.sessionManager.appendCustomEntry(customType, data)
+    this.#emitAll([{ type: "entry_appended", entry }])
+    return entry
+  }
+
+  getCustomEntries(customType: string): readonly CustomEntry[] {
+    this.#assertOpen()
+    return this.sessionManager.customEntries(customType)
+  }
+
+  #getExtensionCustomEntries(customType: string): readonly CustomEntry[] {
+    if (this.#extensionLifecycle.type === "shutdown") return this.sessionManager.customEntries(customType)
+    return this.getCustomEntries(customType)
+  }
+
+  #appendExtensionCustomEntry(customType: string, data?: SessionJson): CustomEntry {
+    if (this.#extensionLifecycle.type !== "shutdown") return this.appendCustomEntry(customType, data)
+    return data === undefined
+      ? this.sessionManager.appendCustomEntry(customType)
+      : this.sessionManager.appendCustomEntry(customType, data)
+  }
+
+  sendCustomMessage(message: CustomMessageInput, delivery: CustomMessageDelivery): CustomMessageAdmission {
+    switch (delivery.type) {
+      case "append": {
+        if (this.#activity.type !== "idle") throw new Error("Custom messages can only append while the agent is idle")
+        const committed = this.#appendCustomMessage(message)
+        this.#publishCustomMessage(committed)
+        return { type: "appended", entry: committed.entry }
+      }
+      case "trigger_turn": {
+        if (this.#activity.type !== "idle") {
+          throw new Error("Custom messages can only trigger a turn while the agent is idle")
+        }
+        if (this.#modelState.type === "unselected") throw new Error("No model selected. Use /login, then /model.")
+        if (!this.#authentication.isIdle) throw new Error("Cannot trigger a turn while authentication is active")
+        const committed = this.#appendCustomMessage(message)
+        const run = this.#beginRun()
+        this.#publishCustomMessage(committed)
+        void this.#drive(run.runId, { type: "continuation" }, run.settlement)
+        return { type: "turn_started", entry: committed.entry, settled: run.settlement.promise }
+      }
+      case "steer":
+        this.#enqueueCustom("steer", message)
+        return { type: "queued", delivery: "steer" }
+      case "follow_up":
+        this.#enqueueCustom("followUp", message)
+        return { type: "queued", delivery: "follow_up" }
+      case "next_turn":
+        this.#enqueueCustom("nextTurn", message)
+        return { type: "queued", delivery: "next_turn" }
+      default:
+        return assertNever(delivery)
+    }
+  }
+
   compact(customInstructions?: string): Promise<CompactionResult> {
     this.#assertIdle("compact context")
     if (this.#modelMutation.type !== "none") {
@@ -688,25 +817,14 @@ export class AgentSession {
     switch (this.#activity.type) {
       case "idle": {
         const expandedText = this.#expandResourceInput(text)
-        this.#modelMutation = { type: "none" }
-        const runId = ++this.#nextRunId
-        const settlement = createSettlement()
-        this.#activity = {
-          type: "running",
-          runId,
-          phase: { type: "agent" },
-          autoCompactions: 0,
-          overflowRecoveries: 0,
-          retryAttempts: 0,
-          thresholdSuppressed: false,
-          settled: settlement.promise
-        }
-        void this.#drive(runId, expandedText, options.images, settlement)
-        return settlement.promise
+        const run = this.#beginRun()
+        const messages = [...this.#nextTurnCustomMessages(), userMessage(expandedText, options.images ?? [])]
+        void this.#drive(run.runId, { type: "prompt", messages }, run.settlement)
+        return run.settlement.promise
       }
       case "running":
         if (!options.streamingBehavior) throw new Error("streamingBehavior is required while the agent is running")
-        this.#enqueue(options.streamingBehavior, text, options.images)
+        this.#enqueueUser(options.streamingBehavior, text, options.images)
         return Promise.resolve()
       case "aborting":
         throw new Error("Cannot prompt while the agent is aborting")
@@ -723,11 +841,11 @@ export class AgentSession {
   }
 
   steer(text: string, images?: ImageContent[]): void {
-    this.#enqueue("steer", text, images)
+    this.#enqueueUser("steer", text, images)
   }
 
   followUp(text: string, images?: ImageContent[]): void {
-    this.#enqueue("followUp", text, images)
+    this.#enqueueUser("followUp", text, images)
   }
 
   takeQueuedInputs(): QueuedInputs {
@@ -736,7 +854,7 @@ export class AgentSession {
     if (this.#activity.type === "compacting" || this.#activity.type === "compaction_committed") {
       throw new Error("Cannot restore queued inputs while context compaction is active")
     }
-    const queued = this.#detachQueuedInputs()
+    const queued = this.#detachQueuedInputs("restore")
     if (this.#activity.type === "failed") this.#activity = { type: "idle" }
     this.#emitQueue()
     return queued
@@ -747,17 +865,18 @@ export class AgentSession {
     const authenticationSettled = this.#authentication.cancel()
     switch (this.#activity.type) {
       case "idle": {
-        const queued = this.#detachQueuedInputs()
+        const queued = this.#detachQueuedInputs("interrupt")
         this.#emitQueue()
         return { ...queued, settled: authenticationSettled }
       }
       case "running": {
-        const { runId, settled, phase } = this.#activity
-        const queued = this.#detachQueuedInputs()
+        const { runId, settled, providerStart, phase } = this.#activity
+        const queued = this.#detachQueuedInputs("interrupt")
         this.#activity = { type: "aborting", runId, settled }
         try {
           this.#emitQueue()
         } finally {
+          if (providerStart.type === "pending") providerStart.controller.abort()
           if (phase.type === "compacting" || phase.type === "retry_wait") phase.controller.abort()
           this.#agent.abort()
         }
@@ -765,7 +884,7 @@ export class AgentSession {
       }
       case "compacting": {
         const { settled, controller } = this.#activity
-        const queued = this.#detachQueuedInputs()
+        const queued = this.#detachQueuedInputs("interrupt")
         this.#emitQueue()
         controller.abort()
         return { ...queued, settled: authenticationWasIdle ? settled : settleTogether(settled, authenticationSettled) }
@@ -785,7 +904,7 @@ export class AgentSession {
             : settleTogether(this.#activity.settled, authenticationSettled)
         }
       case "failed": {
-        const queued = this.#detachQueuedInputs()
+        const queued = this.#detachQueuedInputs("interrupt")
         this.#activity = { type: "idle" }
         this.#emitQueue()
         return { ...queued, settled: authenticationSettled }
@@ -810,10 +929,15 @@ export class AgentSession {
   abort(): Promise<void> {
     const authenticationWasIdle = this.#authentication.isIdle
     const authenticationSettled = this.#authentication.cancel()
+    if (this.#activity.type !== "disposed") this.#discardPendingCustomInputs()
     switch (this.#activity.type) {
       case "running": {
-        const { runId, settled, phase } = this.#activity
-        if (phase.type === "compacting" || phase.type === "compaction_committed") {
+        const { runId, settled, providerStart, phase } = this.#activity
+        if (providerStart.type === "pending") {
+          this.#activity = { type: "aborting", runId, settled }
+          providerStart.controller.abort()
+          if (phase.type === "compacting") phase.controller.abort()
+        } else if (phase.type === "compacting" || phase.type === "compaction_committed") {
           this.#activity = { type: "aborting", runId, settled }
           if (phase.type === "compacting") phase.controller.abort()
         } else if (phase.type === "retry_wait") {
@@ -862,7 +986,7 @@ export class AgentSession {
     const state = this.#extensionLifecycle
     if (state.type === "absent" || state.type === "started") return Promise.resolve()
     if (state.type === "starting") return state.settled
-    if (state.type === "disposing" || state.type === "disposed") {
+    if (state.type === "shutdown" || state.type === "disposing" || state.type === "disposed") {
       return Promise.reject(new Error("Cannot start extensions after session disposal"))
     }
 
@@ -1057,11 +1181,11 @@ export class AgentSession {
     this.#pendingBytes = 0
     this.#agent.clearAllQueues()
     if (currentActivity.type === "compacting") currentActivity.controller.abort()
-    if (
-      currentActivity.type === "running" &&
-      (currentActivity.phase.type === "compacting" || currentActivity.phase.type === "retry_wait")
-    ) {
-      currentActivity.phase.controller.abort()
+    if (currentActivity.type === "running") {
+      if (currentActivity.providerStart.type === "pending") currentActivity.providerStart.controller.abort()
+      if (currentActivity.phase.type === "compacting" || currentActivity.phase.type === "retry_wait") {
+        currentActivity.phase.controller.abort()
+      }
     }
     this.#agent.abort()
     this.#unbindExtensionTools?.()
@@ -1088,6 +1212,7 @@ export class AgentSession {
       case "started":
         return Promise.resolve()
       case "starting":
+      case "shutdown":
       case "disposing":
       case "disposed":
         return state.settled
@@ -1103,15 +1228,19 @@ export class AgentSession {
       this.#extensionLifecycle = { type: "disposed", settled }
       return settled
     }
-    if (state.type === "disposing" || state.type === "disposed") return state.settled
+    if (state.type === "shutdown" || state.type === "disposing" || state.type === "disposed") {
+      return state.settled
+    }
 
     const operation = createSettlement()
-    const disposing: ExtensionLifecycleState = { type: "disposing", host: state.host, settled: operation.promise }
-    this.#extensionLifecycle = disposing
+    const shutdownState: ExtensionLifecycleState = { type: "shutdown", host: state.host, settled: operation.promise }
+    this.#extensionLifecycle = shutdownState
     const shutdown = async (): Promise<void> => {
       try {
         if (state.type === "started") await state.host.sessionShutdown(reason)
       } finally {
+        this.#unbindExtensionSessionOperations?.()
+        this.#extensionLifecycle = { type: "disposing", host: state.host, settled: operation.promise }
         await state.host.dispose(reason)
       }
     }
@@ -1127,18 +1256,22 @@ export class AgentSession {
         }
       )
       .finally(() => {
-        if (this.#extensionLifecycle === disposing) {
+        const current = this.#extensionLifecycle
+        if ((current.type === "shutdown" || current.type === "disposing") && current.settled === operation.promise) {
           this.#extensionLifecycle = { type: "disposed", settled: operation.promise }
         }
       })
     return operation.promise
   }
 
-  async #drive(runId: number, text: string, images: ImageContent[] | undefined, settlement: Settlement): Promise<void> {
+  async #drive(runId: number, start: RunStart, settlement: Settlement): Promise<void> {
     let failure: { cause: unknown } | undefined
     try {
-      await this.#compactBeforePrompt(runId, text, images)
-      if (this.#canContinue(runId)) await this.#agent.prompt(text, images)
+      await this.#compactBeforeMessages(runId, start.type === "prompt" ? start.messages : [])
+      if (this.#activateProviderStart(runId)) {
+        if (start.type === "prompt") await this.#runAgent(() => this.#agent.prompt([...start.messages]))
+        else await this.#runAgent(() => this.#agent.continue())
+      }
       while (this.#canContinue(runId)) {
         // Core runs are sequential: overflow recovery and each queued continuation own one run at a time.
         // oxlint-disable-next-line no-await-in-loop
@@ -1149,12 +1282,12 @@ export class AgentSession {
         const retry = await this.#retryAssistant(runId)
         if (retry === "retry") {
           // oxlint-disable-next-line no-await-in-loop
-          await this.#agent.continue()
+          await this.#runAgent(() => this.#agent.continue())
           continue
         }
         if (!this.#agent.hasQueuedMessages()) break
         // oxlint-disable-next-line no-await-in-loop
-        await this.#agent.continue()
+        await this.#runAgent(() => this.#agent.continue())
       }
     } catch (cause) {
       failure = { cause }
@@ -1163,7 +1296,7 @@ export class AgentSession {
     try {
       if (failure) this.#finishExceptionalRetry(runId, failure.cause)
       if (this.#isCurrentRun(runId)) {
-        if (failure && this.#pending.some(entry => entry.runId === runId)) {
+        if (failure && this.#pending.some(entry => "runId" in entry && entry.runId === runId)) {
           this.#activity = { type: "failed", runId, cause: failure.cause }
         } else {
           this.#activity = { type: "idle" }
@@ -1174,6 +1307,8 @@ export class AgentSession {
     } catch (cause) {
       failure ??= { cause }
     } finally {
+      this.#cancelledPendingMessages.clear()
+      this.#queueRestoreCancellation = { type: "none" }
       if (failure) settlement.reject(failure.cause)
       else settlement.resolve()
     }
@@ -1219,7 +1354,7 @@ export class AgentSession {
     }
   }
 
-  async #compactBeforePrompt(runId: number, text: string, images: ImageContent[] | undefined): Promise<void> {
+  async #compactBeforeMessages(runId: number, prospectiveMessages: readonly AgentMessage[]): Promise<void> {
     const activity = this.#runningAgentActivity(runId)
     if (!activity || !this.settingsManager.get().compactionEnabled) return
 
@@ -1232,7 +1367,7 @@ export class AgentSession {
     const settings = this.#effectiveCompactionSettings()
     const usage = this.contextUsage
     if (!settings || usage.type === "unavailable") return
-    const prospective = estimateMessageTokens(userMessage(text, images ?? []))
+    const prospective = prospectiveMessages.reduce((tokens, message) => tokens + estimateMessageTokens(message), 0)
     if (!shouldCompact(usage.tokens + prospective, settings)) return
     await this.#runAutomaticCompaction(runId, "threshold")
   }
@@ -1416,7 +1551,8 @@ export class AgentSession {
 
     const last = this.#agent.state.messages.at(-1)
     if (!last || (last.role !== "user" && last.role !== "toolResult")) return "stop"
-    await this.#agent.continue()
+    if (!this.#activateProviderStart(runId)) return "stop"
+    await this.#runAgent(() => this.#agent.continue())
     return "recovered"
   }
 
@@ -1734,17 +1870,77 @@ export class AgentSession {
     return (this.#activity.type === "running" || this.#activity.type === "aborting") && this.#activity.runId === runId
   }
 
-  #enqueue(delivery: PendingInputDelivery, text: string, images: ImageContent[] | undefined): void {
+  #activateProviderStart(runId: number): boolean {
+    const activity = this.#activity
+    if (activity.type !== "running" || activity.runId !== runId || activity.phase.type !== "agent") return false
+    if (activity.providerStart.type === "active") return true
+    if (activity.providerStart.controller.signal.aborted) return false
+    this.#activity = { ...activity, providerStart: { type: "active" } }
+    return true
+  }
+
+  async #runAgent(operation: () => Promise<void>): Promise<void> {
+    try {
+      await operation()
+    } finally {
+      this.#cancelledPendingMessages.clear()
+      this.#queueRestoreCancellation = { type: "none" }
+    }
+  }
+
+  #beginRun(): { readonly runId: number; readonly settlement: Settlement } {
+    this.#modelMutation = { type: "none" }
+    const runId = ++this.#nextRunId
+    const settlement = createSettlement()
+    this.#activity = {
+      type: "running",
+      runId,
+      providerStart: { type: "pending", controller: new AbortController() },
+      phase: { type: "agent" },
+      autoCompactions: 0,
+      overflowRecoveries: 0,
+      retryAttempts: 0,
+      thresholdSuppressed: false,
+      settled: settlement.promise
+    }
+    return { runId, settlement }
+  }
+
+  #appendCustomMessage(input: CustomMessageInput): {
+    readonly entry: CustomMessageEntry
+    readonly message: RuntimeCustomMessage
+  } {
+    const retained = customMessageInput(runtimeCustomMessage(input))
+    const entry = this.sessionManager.appendCustomMessage(retained)
+    const message = sessionEntryToContextMessage(entry)
+    if (message?.role !== "custom" || !isRuntimeCustomMessage(message)) {
+      throw new Error("Custom message projection is invalid")
+    }
+    this.#agent.state.messages = [...this.#ownedMessages(), message]
+    this.#recordCommittedMessage(message)
+    return { entry, message }
+  }
+
+  #publishCustomMessage(committed: {
+    readonly entry: CustomMessageEntry
+    readonly message: RuntimeCustomMessage
+  }): void {
+    this.#emitAll([
+      { type: "entry_appended", entry: committed.entry },
+      { type: "message_end", message: committed.message }
+    ])
+  }
+
+  #enqueueUser(delivery: PendingInputDelivery, text: string, images: ImageContent[] | undefined): void {
     const runId = this.#queueRunId()
     const expandedText = this.#expandResourceInput(text)
     const retainedImages = (images ?? []).map(cloneImage)
     const bytes = retainedBytes(expandedText, retainedImages)
-    if (this.#pending.length === maxPendingInputCount || this.#pendingBytes + bytes > maxPendingInputBytes) {
-      throw new QueueCapacityError()
-    }
+    this.#assertQueueCapacity(bytes)
 
     const message = userMessage(expandedText, retainedImages)
-    const entry: PendingInput = {
+    const entry: PendingUserInput = {
+      type: "user",
       id: ++this.#nextEntryId,
       runId,
       delivery,
@@ -1758,6 +1954,89 @@ export class AgentSession {
     if (delivery === "steer") this.#agent.steer(message)
     else this.#agent.followUp(message)
     this.#emitQueue()
+  }
+
+  #enqueueCustom(delivery: PendingInputDelivery | "nextTurn", input: CustomMessageInput): void {
+    validateCustomMessageInput(input)
+    const activity = this.#activity
+    let target:
+      | { readonly type: "next_turn" }
+      | { readonly type: "active_run"; readonly runId: number; readonly delivery: PendingInputDelivery }
+    if (delivery === "nextTurn") {
+      if (activity.type !== "idle" && activity.type !== "running") {
+        throw new Error("Cannot queue a custom message for the next turn in the current session state")
+      }
+      target = { type: "next_turn" }
+    } else {
+      if (activity.type !== "running" || activity.phase.type === "compaction_committed") {
+        throw new Error(`Custom message delivery '${delivery}' requires an active agent run`)
+      }
+      target = { type: "active_run", runId: activity.runId, delivery }
+    }
+
+    const message = runtimeCustomMessage(input)
+    const bytes = serializedMessageBytes(message)
+    this.#assertQueueCapacity(bytes)
+    const id = ++this.#nextEntryId
+    if (target.type === "next_turn") {
+      this.#pending.push({ type: "custom", id, delivery: "nextTurn", bytes, message })
+    } else {
+      this.#pending.push({ type: "custom", id, runId: target.runId, delivery: target.delivery, bytes, message })
+      if (target.delivery === "steer") this.#agent.steer(message)
+      else this.#agent.followUp(message)
+    }
+    this.#pendingBytes += bytes
+    this.#emitQueue()
+  }
+
+  #assertQueueCapacity(bytes: number): void {
+    if (this.#pending.length === maxPendingInputCount || this.#pendingBytes + bytes > maxPendingInputBytes) {
+      throw new QueueCapacityError()
+    }
+  }
+
+  #nextTurnCustomMessages(): readonly RuntimeCustomMessage[] {
+    return this.#pending.flatMap(entry =>
+      entry.type === "custom" && entry.delivery === "nextTurn" ? [entry.message] : []
+    )
+  }
+
+  #discardPendingCustomInputs(): void {
+    if (this.#pending.length === 0) return
+    const runId =
+      this.#activity.type === "running" || this.#activity.type === "aborting"
+        ? this.#activity.runId
+        : this.#activity.type === "idle"
+          ? this.#nextRunId + 1
+          : undefined
+    let customRemoved = false
+    const retained: PendingInput[] = []
+    for (const entry of this.#pending) {
+      if (entry.type === "custom") {
+        customRemoved = true
+        this.#pendingBytes -= entry.bytes
+        if (runId !== undefined && this.#activity.type !== "idle") {
+          this.#cancelledPendingMessages.set(entry.message, "interrupt")
+        }
+        continue
+      }
+      if (runId !== undefined && this.#activity.type !== "idle" && entry.runId === runId) {
+        this.#cancelledPendingMessages.set(entry.message, "interrupt")
+        retained.push({ ...entry, message: userMessage(entry.text, entry.images) })
+      } else {
+        retained.push(entry)
+      }
+    }
+    this.#pending = retained
+    this.#agent.clearAllQueues()
+    if (runId !== undefined) {
+      for (const entry of this.#pending) {
+        if (entry.type !== "user" || entry.runId !== runId) continue
+        if (entry.delivery === "steer") this.#agent.steer(entry.message)
+        else this.#agent.followUp(entry.message)
+      }
+    }
+    if (customRemoved) this.#emitAll([{ type: "queue_update", ...this.#queueSnapshot() }])
   }
 
   #expandResourceInput(text: string): string {
@@ -1807,16 +2086,101 @@ export class AgentSession {
   #removeRuntimeMessage(message: AgentMessage): void {
     const messages = this.#ownedMessages()
     const index = messages.lastIndexOf(message)
-    if (index >= 0) this.#agent.state.messages = messages.toSpliced(index, 1)
+    if (index < 0) return
+    this.#agent.state.messages = messages.toSpliced(index, 1)
+    this.#invalidateMessageCaches()
+  }
+
+  #replaceRuntimeMessage(source: AgentMessage, replacement: AgentMessage): void {
+    const messages = this.#ownedMessages()
+    const index = messages.lastIndexOf(source)
+    if (index < 0) throw new Error("Committed custom message is missing from runtime context")
+    this.#agent.state.messages = messages.toSpliced(index, 1, replacement)
+    this.#invalidateMessageCaches()
+  }
+
+  #invalidateMessageCaches(): void {
+    this.#committedMessageMemory = undefined
+    this.#contextUsageCache = undefined
   }
 
   async #handleAgentEvent(event: AgentEvent): Promise<void> {
-    if (event.type === "message_start" && event.message.role === "user") this.#removeDelivered(event.message)
+    const queueRestore = this.#queueRestoreCancellation
+    if (
+      queueRestore.type === "awaiting_synthetic_failure" &&
+      event.type === "message_start" &&
+      event.message.role === "assistant"
+    ) {
+      this.#queueRestoreCancellation = {
+        type: "suppressing_synthetic_failure",
+        runId: queueRestore.runId,
+        message: event.message
+      }
+      return
+    }
+    if (queueRestore.type === "suppressing_synthetic_failure") {
+      if (event.type === "message_end" && event.message === queueRestore.message) {
+        this.#removeRuntimeMessage(queueRestore.message)
+        return
+      }
+      if (event.type === "turn_end" && event.message === queueRestore.message) return
+      if (event.type === "agent_end" && event.messages.includes(queueRestore.message)) {
+        const messages: AgentMessage[] = []
+        for (const message of event.messages) {
+          if (message === queueRestore.message) continue
+          if (!isZiAgentMessage(message)) throw new Error("Invalid Zi agent message")
+          messages.push(message)
+        }
+        this.#queueRestoreCancellation = { type: "none" }
+        this.#emit({ type: "agent_end", messages, willRetry: false })
+        return
+      }
+    }
+
+    if (event.type === "message_start") {
+      const cancellation = this.#cancelledPendingMessages.get(event.message)
+      if (cancellation) {
+        this.#cancelledPendingMessages.delete(event.message)
+        if (cancellation === "restore") {
+          const activity = this.#activity
+          if (activity.type !== "running" && activity.type !== "aborting") {
+            throw new Error("Queue restoration crossed its owning run")
+          }
+          this.#queueRestoreCancellation = { type: "awaiting_synthetic_failure", runId: activity.runId }
+        }
+        this.#agent.abort()
+        throw new Error("Queued input was cancelled by interruption")
+      }
+    }
+    if (event.type === "message_start" && (event.message.role === "user" || event.message.role === "custom")) {
+      this.#removeDelivered(event.message)
+    }
+
+    let committedCustomEvent: Extract<AgentEvent, { type: "message_end" }> | undefined
     if (event.type === "message_end") {
       if (!isZiAgentMessage(event.message)) throw new Error("Invalid Zi agent message")
-      const entry = this.sessionManager.appendMessage(event.message)
-      this.#recordCommittedMessage(entry.message)
-      this.#emit({ type: "entry_appended", entry })
+      if (event.message.role === "custom") {
+        const input = customMessageInput(event.message)
+        let entry: CustomMessageEntry
+        try {
+          entry = this.sessionManager.appendCustomMessage(input)
+        } catch (cause) {
+          this.#removeRuntimeMessage(event.message)
+          throw cause
+        }
+        const message = sessionEntryToContextMessage(entry)
+        if (message?.role !== "custom" || !isRuntimeCustomMessage(message)) {
+          throw new Error("Custom message projection is invalid")
+        }
+        this.#replaceRuntimeMessage(event.message, message)
+        this.#recordCommittedMessage(message)
+        this.#emit({ type: "entry_appended", entry })
+        committedCustomEvent = { ...event, message }
+      } else {
+        const entry = this.sessionManager.appendMessage(event.message)
+        this.#recordCommittedMessage(entry.message)
+        this.#emit({ type: "entry_appended", entry })
+      }
     }
     if (event.type === "agent_end") {
       const messages: AgentMessage[] = []
@@ -1825,6 +2189,8 @@ export class AgentSession {
         messages.push(message)
       }
       this.#emit({ type: "agent_end", messages, willRetry: this.#willRetryAfterAgentEnd(event) })
+    } else if (committedCustomEvent) {
+      this.#emit(committedCustomEvent)
     } else {
       this.#emit(event)
     }
@@ -1893,7 +2259,11 @@ export class AgentSession {
     const runId =
       this.#activity.type === "running" || this.#activity.type === "aborting" ? this.#activity.runId : undefined
     if (runId === undefined) return
-    const index = this.#pending.findIndex(entry => entry.runId === runId && entry.message === message)
+    const index = this.#pending.findIndex(
+      entry =>
+        entry.message === message &&
+        (entry.type === "custom" && entry.delivery === "nextTurn" ? true : entry.runId === runId)
+    )
     if (index < 0) return
     const [entry] = this.#pending.splice(index, 1)
     if (!entry) return
@@ -1901,8 +2271,11 @@ export class AgentSession {
     this.#emitQueue()
   }
 
-  #detachQueuedInputs(): QueuedInputs {
+  #detachQueuedInputs(cancellation: PendingMessageCancellation): QueuedInputs {
     const queued = this.#queueSnapshot()
+    if (this.#activity.type === "running" || this.#activity.type === "aborting") {
+      for (const entry of this.#pending) this.#cancelledPendingMessages.set(entry.message, cancellation)
+    }
     this.#pending = []
     this.#pendingBytes = 0
     this.#agent.clearAllQueues()
@@ -1913,6 +2286,7 @@ export class AgentSession {
     const steering: QueuedInput[] = []
     const followUp: QueuedInput[] = []
     for (const entry of this.#pending) {
+      if (entry.type !== "user") continue
       const snapshot = Object.freeze({
         id: entry.id,
         delivery: entry.delivery,
@@ -1958,6 +2332,29 @@ export class AgentSession {
 
   #assertOpen(): void {
     if (this.#activity.type === "disposed") throw new Error("AgentSession is disposed")
+  }
+
+  #assertCustomStateAppend(): void {
+    switch (this.#activity.type) {
+      case "idle":
+        return
+      case "running":
+        if (this.#activity.phase.type === "compacting" || this.#activity.phase.type === "compaction_committed") {
+          throw new Error("Cannot append custom state while context compaction is active")
+        }
+        return
+      case "aborting":
+        throw new Error("Cannot append custom state while the agent is aborting")
+      case "compacting":
+      case "compaction_committed":
+        throw new Error("Cannot append custom state while context compaction is active")
+      case "failed":
+        throw new Error("Cannot append custom state while the agent is failed")
+      case "disposed":
+        throw new Error("AgentSession is disposed")
+      default:
+        return assertNever(this.#activity)
+    }
   }
 
   #assertIdle(action: string): void {
@@ -2014,6 +2411,67 @@ function createSettlement<T = void>(): Settlement<T> {
 
 function userMessage(text: string, images: readonly ImageContent[]): AgentMessage {
   return { role: "user", content: [{ type: "text", text }, ...images], timestamp: Date.now() }
+}
+
+function extensionCustomEntry(entry: CustomEntry): ExtensionCustomEntry {
+  return Object.freeze({
+    id: entry.id,
+    timestamp: entry.timestamp,
+    customType: entry.customType,
+    ...(entry.data === undefined ? {} : { data: structuredClone(entry.data) })
+  })
+}
+
+function extensionMessageDelivery(delivery: ExtensionMessageDelivery): CustomMessageDelivery {
+  switch (delivery) {
+    case "append":
+    case "trigger_turn":
+    case "steer":
+    case "follow_up":
+    case "next_turn":
+      return { type: delivery }
+    default:
+      return assertNever(delivery)
+  }
+}
+
+function runtimeCustomMessage(input: CustomMessageInput): RuntimeCustomMessage {
+  validateCustomMessageInput(input)
+  const content =
+    typeof input.content === "string"
+      ? input.content
+      : input.content.map(part =>
+          part.type === "text" ? { type: "text" as const, text: part.text } : cloneImage(part)
+        )
+  return {
+    role: "custom",
+    customType: input.customType,
+    content,
+    display: input.display,
+    ...(input.details === undefined ? {} : { details: structuredClone(input.details) }),
+    timestamp: Date.now()
+  }
+}
+
+function customMessageInput(message: Extract<AgentMessage, { role: "custom" }>): CustomMessageInput {
+  const input: unknown = {
+    customType: message.customType,
+    content: message.content,
+    display: message.display,
+    ...(message.details === undefined ? {} : { details: message.details })
+  }
+  validateCustomMessageInput(input)
+  return input
+}
+
+function isRuntimeCustomMessage(message: AgentMessage): message is RuntimeCustomMessage {
+  if (message.role !== "custom" || (message.details !== undefined && !isSessionJson(message.details))) return false
+  try {
+    customMessageInput(message)
+    return true
+  } catch {
+    return false
+  }
 }
 
 function cloneImage(image: ImageContent): ImageContent {

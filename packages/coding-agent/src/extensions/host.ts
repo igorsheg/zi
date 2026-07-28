@@ -4,11 +4,19 @@ import { tmpdir } from "node:os"
 import { delimiter, isAbsolute, join } from "node:path"
 import { Readable, Writable } from "node:stream"
 
-import type { ExtensionShutdownReason, ExtensionStartReason } from "@with-zi/extension-api"
+import type {
+  ExtensionCustomEntry,
+  ExtensionCustomMessage,
+  ExtensionMessageDelivery,
+  ExtensionShutdownReason,
+  ExtensionStartReason,
+  JsonValue as ExtensionJsonValue
+} from "@with-zi/extension-api"
 
 import type { ExtensionLoadPlan } from "./discovery.js"
 import {
   boundedExtensionDiagnostic,
+  boundedExtensionSessionOperationError,
   extensionLifecycleTimeoutMs,
   ExtensionProtocolDecoder,
   ExtensionProtocolWriter,
@@ -22,6 +30,8 @@ import {
   maxExtensionPendingRequests,
   type ExtensionDiagnostic,
   type ExtensionLoadResult,
+  type ExtensionSessionRequest,
+  type ExtensionSessionResponse,
   type ExtensionToolRegistration,
   type HostMessage,
   type JsonValue,
@@ -49,6 +59,12 @@ export interface ExtensionWorkerProcess {
 }
 
 export type SpawnExtensionWorker = (plan: ExtensionLoadPlan) => ExtensionWorkerProcess
+
+export interface ExtensionSessionOperations {
+  getEntries(customType: string): readonly ExtensionCustomEntry[]
+  appendEntry(customType: string, data?: ExtensionJsonValue): ExtensionCustomEntry
+  sendMessage(message: ExtensionCustomMessage, delivery: ExtensionMessageDelivery): void
+}
 
 export interface ExtensionHostTimeouts {
   readonly startupMs: number
@@ -181,6 +197,12 @@ type GenerationState =
   | { readonly type: "failed"; readonly error: ExtensionGenerationError }
   | { readonly type: "disposed" }
 
+type ExtensionSessionRequestOutcome =
+  | { readonly type: "custom_entries_result"; readonly entries: readonly ExtensionCustomEntry[] }
+  | { readonly type: "custom_entry_result"; readonly entry: ExtensionCustomEntry }
+  | { readonly type: "custom_message_result" }
+  | { readonly type: "session_operation_error"; readonly message: string }
+
 type ProcessStatus = { readonly type: "running" } | { readonly type: "exited"; readonly exit: ExtensionWorkerExit }
 
 class ExtensionGenerationError extends Error {
@@ -243,9 +265,15 @@ class ExtensionGeneration {
   readonly #onDiagnostic: (diagnostic: ExtensionDiagnostic) => void
   readonly #onFailure: (generation: ExtensionGeneration, diagnostic: ExtensionDiagnostic) => void
   readonly #onStaleFrame: () => void
+  readonly #onSessionRequest: (
+    generation: ExtensionGeneration,
+    request: ExtensionSessionRequest
+  ) => ExtensionSessionRequestOutcome
   readonly #stdout = new LogTail()
   readonly #stderr = new LogTail()
   readonly #toolInvocations = new Map<number, GenerationToolInvocation>()
+  readonly #sessionResponses = new Set<number>()
+  #lastSessionRequestId = 0
   #tools: readonly ExtensionToolRegistration[] = Object.freeze([])
   readonly #onProtocolData: (chunk: Buffer) => void
   readonly #onProtocolEnd: () => void
@@ -265,7 +293,11 @@ class ExtensionGeneration {
     timeouts: ExtensionHostTimeouts,
     onDiagnostic: (diagnostic: ExtensionDiagnostic) => void,
     onFailure: (generation: ExtensionGeneration, diagnostic: ExtensionDiagnostic) => void,
-    onStaleFrame: () => void
+    onStaleFrame: () => void,
+    onSessionRequest: (
+      generation: ExtensionGeneration,
+      request: ExtensionSessionRequest
+    ) => ExtensionSessionRequestOutcome
   ) {
     this.id = id
     this.plan = plan
@@ -274,6 +306,7 @@ class ExtensionGeneration {
     this.#onDiagnostic = onDiagnostic
     this.#onFailure = onFailure
     this.#onStaleFrame = onStaleFrame
+    this.#onSessionRequest = onSessionRequest
     this.#state = { type: "starting", ready: deferred<ExtensionGenerationReady>() }
     this.#writer = new ExtensionProtocolWriter(process.input, cause =>
       this.#fail("protocol", "Extension worker protocol output failed", cause)
@@ -542,6 +575,11 @@ class ExtensionGeneration {
     }
     const state = this.#state
     switch (message.type) {
+      case "custom_entries_get":
+      case "custom_entry_append":
+      case "custom_message_send":
+        this.#respondToSessionRequest(message)
+        return
       case "ready":
         if (state.type !== "starting") {
           this.#fail("protocol", `Extension worker sent ready while ${state.type}`)
@@ -605,6 +643,34 @@ class ExtensionGeneration {
       default:
         return assertNever(message)
     }
+  }
+
+  #respondToSessionRequest(request: ExtensionSessionRequest): void {
+    if (this.#sessionResponses.size >= maxExtensionPendingRequests || request.requestId <= this.#lastSessionRequestId) {
+      this.#fail("protocol", "Extension worker exceeded or reused its pending session-operation requests")
+      return
+    }
+    this.#lastSessionRequestId = request.requestId
+
+    let outcome: ExtensionSessionRequestOutcome
+    try {
+      outcome = this.#onSessionRequest(this, request)
+    } catch (cause) {
+      outcome = { type: "session_operation_error", message: boundedExtensionSessionOperationError(cause) }
+    }
+    const response: ExtensionSessionResponse = { ...outcome, generation: this.id, requestId: request.requestId }
+    this.#sessionResponses.add(request.requestId)
+    void this.#writer.send(response).then(
+      () => {
+        this.#sessionResponses.delete(request.requestId)
+        return undefined
+      },
+      cause => {
+        this.#sessionResponses.delete(request.requestId)
+        this.#fail("protocol", "Extension session-operation response failed", cause)
+        return undefined
+      }
+    )
   }
 
   #protocolEnded(): void {
@@ -714,6 +780,7 @@ class ExtensionGeneration {
     for (const invocation of this.#toolInvocations.values()) {
       this.#finishToolInvocation(invocation, { error })
     }
+    this.#sessionResponses.clear()
 
     if (state.type === "disposing_stopping") {
       state.settled.reject(error)
@@ -747,6 +814,7 @@ class ExtensionGeneration {
     for (const invocation of this.#toolInvocations.values()) {
       this.#finishToolInvocation(invocation, { error })
     }
+    this.#sessionResponses.clear()
     this.#writer.dispose()
     this.#process.protocol.off("data", this.#onProtocolData)
     this.#process.protocol.off("end", this.#onProtocolEnd)
@@ -780,6 +848,7 @@ export class ExtensionHost {
   #extensions: readonly ExtensionLoadResult[] = Object.freeze([])
   #tools: readonly ExtensionToolRegistration[] = Object.freeze([])
   #toolCatalogListener: ((tools: readonly ExtensionToolRegistration[]) => void) | undefined
+  #sessionOperations: ExtensionSessionOperations | undefined
   #lastLogs: { readonly stdout: ExtensionLogTail; readonly stderr: ExtensionLogTail } = Object.freeze({
     stdout: emptyLogTail(),
     stderr: emptyLogTail()
@@ -844,6 +913,15 @@ export class ExtensionHost {
 
   toolCatalog(): readonly ExtensionToolRegistration[] {
     return this.#tools
+  }
+
+  bindSessionOperations(operations: ExtensionSessionOperations): () => void {
+    if (this.#state.type === "disposed") throw new Error("Extension host is disposed")
+    if (this.#sessionOperations) throw new Error("Extension host session operations are already bound")
+    this.#sessionOperations = operations
+    return () => {
+      if (this.#sessionOperations === operations) this.#sessionOperations = undefined
+    }
   }
 
   bindToolCatalog(listener: (tools: readonly ExtensionToolRegistration[]) => void): () => void {
@@ -1193,8 +1271,54 @@ export class ExtensionHost {
       this.#timeouts,
       value => this.#diagnose(value),
       (generation, value) => this.#generationFailed(generation, value),
-      () => this.#staleFrame()
+      () => this.#staleFrame(),
+      (generation, request) => this.#handleSessionRequest(generation, request)
     )
+  }
+
+  #handleSessionRequest(
+    generation: ExtensionGeneration,
+    request: ExtensionSessionRequest
+  ): ExtensionSessionRequestOutcome {
+    if (this.#activeGeneration(this.#state) !== generation) {
+      this.#staleFrame()
+      return { type: "session_operation_error", message: "Extension session operation came from a stale generation" }
+    }
+    const loaded = this.#extensions.some(
+      result => result.status === "loaded" && result.source.id === request.extensionId
+    )
+    if (!loaded) {
+      return {
+        type: "session_operation_error",
+        message: `Extension session operation has unknown source: ${request.extensionId}`
+      }
+    }
+    const operations = this.#sessionOperations
+    if (!operations) {
+      return { type: "session_operation_error", message: "Extension session operations are not bound" }
+    }
+
+    try {
+      switch (request.type) {
+        case "custom_entries_get":
+          return { type: "custom_entries_result", entries: operations.getEntries(request.customType) }
+        case "custom_entry_append":
+          return {
+            type: "custom_entry_result",
+            entry:
+              request.data === undefined
+                ? operations.appendEntry(request.customType)
+                : operations.appendEntry(request.customType, request.data)
+          }
+        case "custom_message_send":
+          operations.sendMessage(request.message, request.delivery)
+          return { type: "custom_message_result" }
+        default:
+          return assertNever(request)
+      }
+    } catch (cause) {
+      return { type: "session_operation_error", message: boundedExtensionSessionOperationError(cause) }
+    }
   }
 
   async #retireCurrent(
@@ -1315,7 +1439,7 @@ export class ExtensionHost {
       case "replacing":
         return state.current
       case "stopping":
-        return state.generations[0]
+        return state.shutdown ?? state.generations[0]
       case "disabled":
       case "failed":
       case "disposed":

@@ -6,6 +6,7 @@ import { join, resolve } from "node:path"
 
 import { createAgentSessionRuntime } from "../src/agent-session-runtime.js"
 import { createAgentRuntime } from "../src/runtime.js"
+import { SessionManager } from "../src/session-manager.js"
 import { createModels, fauxAssistantMessage, fauxProvider, fauxText, fauxToolCall } from "../src/testing.js"
 
 const cli = resolve(import.meta.dirname, "../../cli/src/main.ts")
@@ -40,6 +41,40 @@ test("AgentSession owns one discovered extension lifecycle through final disposa
 
   expect(await readFile(fixture.lifecycle, "utf8")).toBe("start:startup\nstop:quit\n")
   await rm(fixture.root, { recursive: true, force: true })
+}, 10_000)
+
+test("session shutdown handlers can commit final extension state before operations unbind", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-runtime-extension-shutdown-state-"))
+  const cwd = join(root, "project")
+  const agentDir = join(root, "agent")
+  const extensionDir = join(agentDir, "extensions")
+  await mkdir(cwd, { recursive: true })
+  await mkdir(extensionDir, { recursive: true })
+  await writeFile(
+    join(extensionDir, "shutdown-state.ts"),
+    `import type { ExtensionAPI } from "@with-zi/extension-api"
+export default function (zi: ExtensionAPI): void {
+  zi.on("session_shutdown", async () => {
+    const previous = await zi.getSessionEntries("example.shutdown")
+    await zi.appendEntry("example.shutdown", { previous: previous.length })
+  })
+}
+`
+  )
+  const runtime = await createAgentRuntime({
+    cwd,
+    agentDir,
+    session: { type: "new", persist: true },
+    extensionWorkerCommand: workerCommand
+  })
+  const sessionFile = runtime.session.sessionManager.file!
+
+  runtime.session.dispose()
+  await runtime.session.waitForIdle()
+
+  expect(runtime.session.extensionHostSnapshot).toBeUndefined()
+  expect(SessionManager.open(sessionFile).customEntries("example.shutdown")).toMatchObject([{ data: { previous: 0 } }])
+  await rm(root, { recursive: true, force: true })
 }, 10_000)
 
 test("runtime project trust excludes extension code before worker startup", async () => {
@@ -137,6 +172,101 @@ export default function (zi: ExtensionAPI): void {
   } finally {
     runtime.session.dispose()
     await runtime.session.waitForIdle()
+    await rm(root, { recursive: true, force: true })
+  }
+}, 10_000)
+
+test("extension lifecycle and tools can read, append, and message through nested session operations", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-runtime-extension-session-"))
+  const cwd = join(root, "project")
+  const agentDir = join(root, "agent")
+  const extensionDir = join(agentDir, "extensions")
+  const observed = join(root, "observed.log")
+  await mkdir(cwd, { recursive: true })
+  await mkdir(extensionDir, { recursive: true })
+  await writeFile(
+    join(extensionDir, "durable-counter.ts"),
+    `import { appendFileSync } from "node:fs"
+import { Schema, type ExtensionAPI } from "@with-zi/extension-api"
+export default function (zi: ExtensionAPI): void {
+  let count = 0
+  zi.on("session_start", async () => {
+    const entries = await zi.getSessionEntries("example.counter")
+    const latest = entries.at(-1)?.data
+    count = typeof latest === "object" && latest !== null && !Array.isArray(latest) && typeof latest.count === "number"
+      ? latest.count
+      : 0
+    appendFileSync(${JSON.stringify(observed)}, "start:" + count + "\\n")
+  })
+  zi.registerTool({
+    name: "increment_counter",
+    description: "Increment durable session state",
+    parameters: Schema.object({}),
+    async execute() {
+      count++
+      await zi.appendEntry("example.counter", { count })
+      let refused = false
+      try { await zi.appendEntry("Invalid Type", null) } catch { refused = true }
+      await zi.sendMessage(
+        { customType: "example.counter", content: "counter:" + count, display: true },
+        "follow_up"
+      )
+      return String(count) + ":" + refused
+    }
+  })
+}
+`
+  )
+  const models = createModels()
+  const faux = fauxProvider()
+  models.setProvider(faux.provider)
+  faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("increment_counter", {}, { id: "counter-1" }), { stopReason: "toolUse" }),
+    fauxAssistantMessage("Tool completed."),
+    fauxAssistantMessage("Custom follow-up handled.")
+  ])
+  const first = await createAgentRuntime({
+    cwd,
+    agentDir,
+    model: "faux/faux-1",
+    modelFactory: () => models,
+    session: { type: "new", persist: true },
+    extensionWorkerCommand: workerCommand
+  })
+  let sessionFile: string
+  try {
+    await first.session.prompt("Increment the counter.")
+    sessionFile = first.session.sessionManager.file!
+    expect(first.session.getCustomEntries("example.counter")).toMatchObject([
+      { customType: "example.counter", data: { count: 1 } }
+    ])
+    expect(first.session.messages).toContainEqual(
+      expect.objectContaining({ role: "custom", customType: "example.counter", content: "counter:1" })
+    )
+    expect(first.session.messages).toContainEqual(
+      expect.objectContaining({ role: "toolResult", content: [{ type: "text", text: "1:true" }] })
+    )
+    expect(first.session.extensionHostSnapshot).toMatchObject({ status: "ready", lifecycle: "started" })
+  } finally {
+    first.session.dispose()
+    await first.session.waitForIdle()
+  }
+
+  const resumedModels = createModels()
+  resumedModels.setProvider(fauxProvider().provider)
+  const second = await createAgentRuntime({
+    cwd,
+    agentDir,
+    modelFactory: () => resumedModels,
+    session: { type: "resume", file: sessionFile },
+    extensionWorkerCommand: workerCommand
+  })
+  try {
+    expect(await readFile(observed, "utf8")).toBe("start:0\nstart:1\n")
+    expect(second.session.getCustomEntries("example.counter")).toMatchObject([{ data: { count: 1 } }])
+  } finally {
+    second.session.dispose()
+    await second.session.waitForIdle()
     await rm(root, { recursive: true, force: true })
   }
 }, 10_000)
