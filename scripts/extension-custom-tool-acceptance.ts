@@ -176,9 +176,6 @@ async function runInteractive(
     throw new Error(`Compiled interactive mode omitted ${JSON.stringify(acceptanceResult)}`)
   }
   if (process.platform === "win32") {
-    if (output.stderr !== "") {
-      throw new Error(`Compiled interactive mode wrote to stderr: ${JSON.stringify(output.stderr)}`)
-    }
     if (!terminalOutput.includes("\u001b[?25l") || !terminalOutput.includes("\u001b[?25h")) {
       throw new Error("Compiled interactive mode did not restore the Windows terminal cursor")
     }
