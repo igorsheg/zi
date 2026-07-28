@@ -50,7 +50,7 @@ The target is coding-agent architecture parity and observable product-behavior p
 - [x] Composer session-history recall with multiline boundary movement and exact draft restoration
 - [x] Typed tool-result and semantic-presentation cutover with transcript-item spacing and open-rail polish for all six active built-ins
 - [x] Settings: global and project scope
-- [x] Print and JSON modes sharing the same `AgentSession`
+- [x] Print, JSON, and versioned RPC modes sharing the same `AgentSession`
 - [x] Authentication commands and composer-owned provider flows
 
 `@` project-file autocomplete is implemented from [`docs/file-autocomplete-implementation-spec.md`](file-autocomplete-implementation-spec.md). Zi preserves Pi's textual completion behavior while moving bounded Git/fallback search into coding-agent, restricting scope to the exact project cwd, and keeping accepted references ordinary prompt text. Unlike Pi's editor, exact file text and unmatched refinements become quiet, Escape suppresses the whole token, and visible results remain stable while a changed query is rescored.
@@ -142,7 +142,7 @@ Pi's optional `grep`, `find`, and `ls` implementations are deliberately deferred
 
 - `packages/coding-agent/test/print-mode.test.ts` fixes bounded sequential prompts, final-text-only output, tool/thinking omission, missing-model/provider/abort results, caller cancellation, and caller-owned session reuse without process or terminal dependencies. It also fixes header-first/source-ordered JSONL, multi-prompt continuity, Unicode framing, credential exclusion, serialization failure, and bounded writer backpressure.
 - Behavior is characterized from Pi's `modes/print-mode.ts`, strict RPC JSONL helper, `test/print-mode.test.ts`, and `test/rpc-jsonl.test.ts` at the pinned commit. Zi deliberately injects the writer, aborts on bounded JSON output failure, and leaves signals and final disposal with the caller.
-- `packages/cli/test/args.test.ts` and `run.test.ts` fix last-CLI/environment/runtime precedence, closed mode and session intents, explicit/TTY mode resolution, bounded stdin-first prompt ordering, text/JSON stdout cleanliness, missing-model diagnostics, runtime/API-key/session/prompt option forwarding, dynamic TUI isolation, signal exit codes, listener cleanup, and creator-owned disposal. `packages/tui/test/interactive/run.test.ts` proves positional TTY prompts start only after terminal ownership. See ADR 0020 and `docs/cli.md`.
+- `packages/cli/test/args.test.ts` and `run.test.ts` fix last-CLI/environment/runtime precedence, closed mode and session intents, explicit/TTY mode resolution, bounded stdin-first prompt ordering, text/JSON/RPC stdout cleanliness, missing-model diagnostics, runtime/API-key/session/prompt option forwarding, dynamic TUI isolation, signal exit codes, listener cleanup, and creator-owned disposal. `packages/coding-agent/test/rpc-protocol.test.ts` and `rpc-mode.test.ts` fix versioned framing, request validation, total output sequence, state/message projection, concurrent interruption, operation capacity, and output failure. `scripts/compile-zi.test.ts` proves the standalone process protocol. See ADR 0020, ADR 0022, `docs/cli.md`, and `docs/rpc.md`.
 
 ### P1 conversation navigation evidence
 

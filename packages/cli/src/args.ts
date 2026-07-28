@@ -3,7 +3,7 @@ import { isAbsolute } from "node:path"
 import { getDefaultAgentDir, resolveZiPath, type ThinkingLevel } from "@with-zi/coding-agent"
 
 export type CliOutputMode = "text" | "json"
-export type CliMode = "auto" | "interactive" | CliOutputMode
+export type CliMode = "auto" | "interactive" | "rpc" | CliOutputMode
 
 export type CliSession =
   | { readonly type: "new"; readonly persist: true }
@@ -224,9 +224,10 @@ function rejectInlineValue(flag: string, inlineValue: string | undefined): void 
 }
 
 function parseMode(value: string, source: string): CliMode {
-  if (value === "auto" || value === "interactive" || value === "text" || value === "json") return value
-  if (value === "rpc") throw new Error("RPC mode is not available yet")
-  throw new Error(`Invalid ${source} value: ${value} (expected auto, interactive, text, or json)`)
+  if (value === "auto" || value === "interactive" || value === "text" || value === "json" || value === "rpc") {
+    return value
+  }
+  throw new Error(`Invalid ${source} value: ${value} (expected auto, interactive, text, json, or rpc)`)
 }
 
 function parseThinkingLevel(value: string, source: string): ThinkingLevel {

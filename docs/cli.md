@@ -7,6 +7,7 @@ zi                                      # interactive when stdin and stdout are 
 zi -p "summarize this repository"       # final assistant text
 zi --mode json "inspect package.json"   # header-first JSONL events
 cat error.log | zi -p "find the cause"  # stdin, then positional prompts
+zi --mode rpc --no-session              # versioned JSONL process protocol
 ```
 
 ## Resolution
@@ -51,13 +52,14 @@ Cwd, session selection, system-prompt content, and `--api-key` are intentionally
 - `auto`: interactive only when stdin and stdout are TTYs; otherwise text;
 - `interactive`: require TTY stdin and stdout;
 - `text`: write only the final assistant text to stdout;
-- `json`: write the session header and source-ordered events as JSONL to stdout.
+- `json`: write the session header and source-ordered events as JSONL to stdout;
+- `rpc`: read version-1 JSONL requests from stdin and write ordered protocol frames to stdout.
 
-`-p` and `--print` are aliases for `--mode text`. RPC remains reserved but is not implemented yet.
+`-p` and `--print` are aliases for `--mode text`. Text and JSON modes require a positional prompt or piped stdin. Piped stdin is bounded at 8 MiB and becomes the first prompt; positional prompts run afterward in argument order. RPC rejects positional prompts because stdin is its protocol transport. Diagnostics and failures go to stderr, preserving all stdout protocols. Explicit extensions join trusted project and global extension sources in every mode; `--extension <path>` is repeatable and loads before discovered sources.
 
-Headless modes require a positional prompt or piped stdin. Piped stdin is bounded at 8 MiB and becomes the first prompt; positional prompts run afterward in argument order. Diagnostics and failures go to stderr, preserving text and JSON stdout protocols. Explicit extensions join trusted project and global extension sources in every mode; `--extension <path>` is repeatable and loads before discovered sources.
+The RPC request catalog, framing, bounds, and lifecycle are documented in the [RPC protocol](rpc.md).
 
-When protected project `.zi` configuration exists without a stored decision, interactive mode opens a project-trust picker before running positional prompts. Its safe default keeps project configuration disabled. Trust or rejection may apply only to the current session or be saved for the canonical cwd; a saved parent decision is inherited. Applying a choice replaces the whole cwd-bound runtime so settings, prompts, skills, themes, and extensions share the same admission. Text and JSON modes never prompt and continue with unresolved project configuration excluded.
+When protected project `.zi` configuration exists without a stored decision, interactive mode opens a project-trust picker before running positional prompts. Its safe default keeps project configuration disabled. Trust or rejection may apply only to the current session or be saved for the canonical cwd; a saved parent decision is inherited. Applying a choice replaces the whole cwd-bound runtime so settings, prompts, skills, themes, and extensions share the same admission. Text, JSON, and RPC modes never prompt and continue with unresolved project configuration excluded.
 
 ## Sessions
 
@@ -87,4 +89,4 @@ These values are bounded by the coding-agent session-resource budget and remain 
 
 Successful completion, help, and version return `0`. Configuration, admission, provider, or shutdown failure returns `1`. Headless `SIGHUP`, `SIGINT`, and `SIGTERM` return `129`, `130`, and `143` after requesting bounded cancellation and disposing the session.
 
-The architecture and rationale are recorded in [ADR 0020](adr/0020-cli-invocation-resolves-once-from-explicit-layers.md).
+Invocation resolution is recorded in [ADR 0020](adr/0020-cli-invocation-resolves-once-from-explicit-layers.md); RPC transport ownership is recorded in [ADR 0022](adr/0022-rpc-connections-own-versioned-session-transport.md).

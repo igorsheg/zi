@@ -3,6 +3,7 @@
 import { homedir } from "node:os"
 import { resolve } from "node:path"
 
+import { runRpcMode } from "@with-zi/coding-agent"
 import { extensionWorkerArgument, runExtensionWorkerFromStdio } from "@with-zi/coding-agent/internal/extension-worker"
 
 import {
@@ -59,6 +60,9 @@ export function createProcessHost(forceInteractive: boolean): CliHost {
       const { runTui } = await import("@with-zi/tui")
       await runTui({ sessionRuntime, initialMessages })
     },
+    runRpc(session, signal) {
+      return runRpcMode(session, { input: process.stdin, writer: { write: writeRpcOutput }, signal })
+    },
     onSignal(listener) {
       const signals: CliSignal[] = ["SIGHUP", "SIGINT", "SIGTERM"]
       const handlers = signals.map(signal => {
@@ -96,6 +100,10 @@ async function readPipedStdin(): Promise<string | undefined> {
 
 async function writeOutput(stream: Bun.BunFile, chunk: string): Promise<void> {
   await stream.write(chunk)
+}
+
+async function writeRpcOutput(chunk: string): Promise<void> {
+  await Bun.stdout.write(chunk)
 }
 
 if (import.meta.main) {

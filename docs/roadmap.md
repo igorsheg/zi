@@ -61,12 +61,13 @@ Zi v0.1.12 shipped the [`custom-tool extension golden path`](extension-custom-to
 
 Implement a versioned RPC mode over the existing `AgentSession` policy:
 
-- observe authoritative session state and ordered events;
-- submit direct, steering, and follow-up input;
-- interrupt and await settlement;
-- select model and thinking level;
-- preserve bounded output, cancellation, and creator-owned disposal;
-- ship one reference client tested against `dist/zi`.
+- [x] Observe authoritative session state, paged messages, and ordered events.
+- [x] Submit direct, steering, and follow-up input.
+- [x] Interrupt and await settlement with reserved control capacity.
+- [x] List and select models and thinking levels.
+- [x] Preserve bounded framing, operations, output, cancellation, and creator-owned disposal.
+- [x] Prove the protocol against a compiled standalone executable.
+- [ ] Ship one reference client tested against `dist/zi`.
 
 RPC should not introduce a universal frontend facade or duplicate session policy.
 

@@ -152,6 +152,10 @@ _Avoid_: Shared state, mirrored state
 An application adapter over `AgentSession` for one interaction environment. Interactive mode is terminal-specific; print and RPC modes are non-terminal siblings. Shared policy moves into `AgentSession` or a concrete manager, not into a lowest-common-denominator mode facade.
 _Avoid_: CLI branch, universal frontend mode
 
+**RPC connection**:
+One versioned JSONL process relationship over a caller-owned `AgentSession`. It owns framing, request validation, correlation, total output sequence, bounded concurrent operations, backpressure, cancellation, and settlement; it projects public session facts but owns no conversation policy or session disposal.
+_Avoid_: Remote session, API server, command bus, RPC runtime
+
 **CLI invocation**:
 One immutable startup intent resolved before runtime construction from arguments, supported Zi environment defaults, and captured process facts. Arguments outrank environment defaults; cwd and session selection remain explicit invocation operations rather than ambient configuration.
 _Avoid_: CLI settings, process globals, argument bag

@@ -6,7 +6,8 @@ import {
   type AgentSession,
   type AgentSessionRuntime,
   type CreateAgentRuntimeOptions,
-  type PrintModeResult
+  type PrintModeResult,
+  type RpcModeResult
 } from "@with-zi/coding-agent"
 
 import { parseArgs, resolveCliInvocation, type CliInvocation, type CliMode, type ParsedArgs } from "./args.js"
@@ -15,7 +16,7 @@ import { ziVersion } from "./version.js"
 export const maxCliStdinBytes = 8 * 1024 * 1024
 export const cliShutdownTimeoutMs = 5_000
 
-export type AppMode = "interactive" | "text" | "json"
+export type AppMode = "interactive" | "text" | "json" | "rpc"
 export type CliSignal = "SIGHUP" | "SIGINT" | "SIGTERM"
 
 export interface CliHost {
@@ -31,6 +32,7 @@ export interface CliHost {
   createRuntime(options: CreateAgentRuntimeOptions): Promise<AgentRuntime>
   createSessionRuntime(options: CreateAgentRuntimeOptions): Promise<AgentSessionRuntime>
   runInteractive(runtime: AgentSessionRuntime, initialMessages: readonly string[]): Promise<void>
+  runRpc(session: AgentSession, signal: AbortSignal): Promise<RpcModeResult>
   onSignal(listener: (signal: CliSignal) => void): () => void
 }
 
@@ -38,7 +40,7 @@ export const helpText = `Usage: zi [options] [prompt ...]
 
 Output:
   -p, --print                 Alias for --mode text
-      --mode mode             auto, interactive, text, or json
+      --mode mode             auto, interactive, text, json, or rpc
 
 Runtime:
       --cwd path              Set the effective working directory
@@ -63,7 +65,7 @@ Other:
   -V, --version               Show the Zi version
 
 Environment defaults:
-  ZI_MODE                     auto, interactive, text, or json
+  ZI_MODE                     auto, interactive, text, json, or rpc
   ZI_AGENT_DIR                Global agent directory
   ZI_SESSION_DIR              Session storage directory
   ZI_DEFAULT_MODEL            provider/model selection
@@ -73,7 +75,7 @@ CLI values override environment defaults. Within argv, the last scalar or
 session selector wins; repeatable append-system-prompt values keep their order.
 Piped stdin is the first prompt; positional prompts follow in argument order.
 Provider credential variables such as ANTHROPIC_API_KEY remain supported.
-RPC is not available yet.
+RPC reads versioned JSONL requests from stdin and writes only protocol frames to stdout.
 `
 
 export const versionText = `zi ${ziVersion}\n`
@@ -82,6 +84,7 @@ export function resolveAppMode(mode: CliMode, stdinIsTTY: boolean, stdoutIsTTY: 
   switch (mode) {
     case "text":
     case "json":
+    case "rpc":
       return mode
     case "interactive":
       if (!stdinIsTTY || !stdoutIsTTY) throw new Error("Interactive mode requires TTY stdin and stdout")
@@ -120,8 +123,12 @@ export async function runCli(argv: readonly string[], host: CliHost): Promise<nu
     await host.writeStderr(`${errorMessage(cause)}\n`)
     return 1
   }
+  if (mode === "rpc" && args.messages.length > 0) {
+    await host.writeStderr("RPC mode accepts input only through its JSONL protocol\n")
+    return 1
+  }
   let stdin: string | undefined
-  if (!host.stdinIsTTY) {
+  if (mode !== "rpc" && !host.stdinIsTTY) {
     try {
       stdin = await host.readStdin()
     } catch (cause) {
@@ -134,7 +141,7 @@ export async function runCli(argv: readonly string[], host: CliHost): Promise<nu
     }
   }
   const prompts = Object.freeze([...(stdin ? [stdin] : []), ...args.messages])
-  if (mode !== "interactive" && prompts.length === 0) {
+  if (mode !== "interactive" && mode !== "rpc" && prompts.length === 0) {
     await host.writeStderr("Headless mode requires a prompt or piped stdin\n")
     return 1
   }
@@ -189,6 +196,8 @@ export async function runCli(argv: readonly string[], host: CliHost): Promise<nu
       if (!sessionRuntime) throw new Error("Interactive session runtime was not created")
       await host.runInteractive(sessionRuntime, prompts)
       exitCode = 0
+    } else if (mode === "rpc") {
+      exitCode = await runRpc(runtime.session, host)
     } else {
       exitCode = await runHeadless(runtime.session, mode, prompts, host)
     }
@@ -258,6 +267,28 @@ async function runHeadless(
     else if (outcome.result.type !== "success") await host.writeStderr(`${outcome.result.message}\n`)
     if (signal) return signalExitCode(signal)
     return outcome.type === "result" ? resultExitCode(outcome.result) : 1
+  } finally {
+    removeSignals()
+  }
+}
+
+async function runRpc(session: AgentSession, host: CliHost): Promise<number> {
+  let signal: CliSignal | undefined
+  const controller = new AbortController()
+  const removeSignals = host.onSignal(received => {
+    if (signal) return
+    signal = received
+    controller.abort()
+    try {
+      void session.abortAndDiscardQueuedInputs().catch(() => {})
+    } catch {}
+  })
+
+  try {
+    const result = await host.runRpc(session, controller.signal)
+    if (result.type !== "eof" && result.type !== "cancelled") await host.writeStderr(`${result.message}\n`)
+    if (signal) return signalExitCode(signal)
+    return result.type === "eof" ? 0 : 1
   } finally {
     removeSignals()
   }

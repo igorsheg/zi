@@ -35,6 +35,8 @@ export {
 } from "./resource-diagnostics.js"
 export { maxResourceDirectoryEntries, maxResourceFileBytes } from "./resource-files.js"
 export * from "./resource-loader.js"
+export * from "./rpc/protocol.js"
+export * from "./rpc/rpc-mode.js"
 export { createAgentRuntime } from "./runtime.js"
 export type {
   AgentRuntime,

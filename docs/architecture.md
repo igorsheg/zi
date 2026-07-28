@@ -137,7 +137,7 @@ Modes are adapters over `AgentSession`, not one universal abstraction.
 
 - Terminal `InteractiveMode` lives in `packages/tui` because it owns OpenTUI resources and terminal semantics.
 - Print mode lives in `packages/coding-agent`; it sequences bounded prompts over a caller-owned session and returns closed success/failure results without owning process or session lifetime. Text output writes only final assistant text. JSON output writes the session header and source-ordered session events as strict JSONL through a bounded single-writer queue.
-- Future RPC mode belongs in `packages/coding-agent` and owns its protocol.
+- RPC mode lives in `packages/coding-agent`; one connection owns versioned JSONL framing, closed request translation, ordered session-event projection, correlated concurrent operations, output backpressure, cancellation, and bounded settlement over a caller-owned session. See [ADR 0022](adr/0022-rpc-connections-own-versioned-session-transport.md).
 
 If terminal and web clients later duplicate concrete command or session-flow policy, that policy moves into `AgentSession` or a dedicated coding-agent owner. Zi does not anticipate that reuse with a forwarding facade.
 

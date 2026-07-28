@@ -152,6 +152,7 @@ test("the internal acceptance host changes only CLI TTY admission facts", () => 
 test("CLI mode resolution keeps explicit protocols and otherwise follows TTY facts", () => {
   expect(resolveAppMode("json", true, true)).toBe("json")
   expect(resolveAppMode("text", true, true)).toBe("text")
+  expect(resolveAppMode("rpc", false, false)).toBe("rpc")
   expect(resolveAppMode("auto", false, true)).toBe("text")
   expect(resolveAppMode("auto", true, false)).toBe("text")
   expect(resolveAppMode("auto", true, true)).toBe("interactive")
@@ -569,6 +570,90 @@ test("TTY mode delegates positional prompts only to the dynamic interactive load
   expect(errors).toEqual([])
 })
 
+test("RPC mode delegates protocol input without reading it as a prompt", async () => {
+  const models = createModels()
+  const output: string[] = []
+  const errors: string[] = []
+  let stdinReads = 0
+  let rpcRuns = 0
+  let runtime: AgentRuntime | undefined
+  const host = testHost({
+    output,
+    errors,
+    stdinIsTTY: false,
+    stdoutIsTTY: false,
+    onReadStdin() {
+      stdinReads++
+    },
+    async createRuntime(options) {
+      runtime = await createTestAgentRuntime({ ...options, models })
+      return runtime
+    },
+    async runRpc(_session, signal) {
+      rpcRuns++
+      expect(signal.aborted).toBe(false)
+      return { type: "eof" }
+    }
+  })
+
+  expect(await runCli(["--mode", "rpc", "--no-session"], host)).toBe(0)
+  expect({ stdinReads, rpcRuns }).toEqual({ stdinReads: 0, rpcRuns: 1 })
+  expect(() => runtime?.session.prompt("disposed")).toThrow("AgentSession is disposed")
+  expect(output).toEqual([])
+  expect(errors).toEqual([])
+})
+
+test("RPC signal cancellation keeps process exit and session disposal with the CLI", async () => {
+  const models = createModels()
+  const output: string[] = []
+  const errors: string[] = []
+  const signals: TestSignalControl = { listener: undefined, removes: 0 }
+  const started = deferred<void>()
+  let runtime: AgentRuntime | undefined
+  const host = testHost({
+    output,
+    errors,
+    signals,
+    async createRuntime(options) {
+      runtime = await createTestAgentRuntime({ ...options, models })
+      return runtime
+    },
+    async runRpc(_session, signal) {
+      started.resolve()
+      await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }))
+      return { type: "cancelled" }
+    }
+  })
+
+  const running = runCli(["--mode", "rpc", "--no-session"], host)
+  await started.promise
+  signals.listener?.("SIGTERM")
+
+  expect(await running).toBe(143)
+  expect(signals.removes).toBe(1)
+  expect(() => runtime?.session.prompt("disposed")).toThrow("AgentSession is disposed")
+  expect(output).toEqual([])
+  expect(errors).toEqual([])
+})
+
+test("RPC mode rejects positional prompts before runtime construction", async () => {
+  const output: string[] = []
+  const errors: string[] = []
+  let runtimeCreates = 0
+  const host = testHost({
+    output,
+    errors,
+    async createRuntime() {
+      runtimeCreates++
+      throw new Error("unexpected runtime")
+    }
+  })
+
+  expect(await runCli(["--mode", "rpc", "prompt"], host)).toBe(1)
+  expect(runtimeCreates).toBe(0)
+  expect(errors).toEqual(["RPC mode accepts input only through its JSONL protocol\n"])
+})
+
 test("missing models fail on stderr without contaminating stdout", async () => {
   const models = createModels()
   const output: string[] = []
@@ -721,6 +806,7 @@ interface TestHostOptions {
   readonly env?: Readonly<Record<string, string | undefined>>
   readonly createSessionRuntime?: CliHost["createSessionRuntime"]
   readonly runInteractive?: CliHost["runInteractive"]
+  readonly runRpc?: CliHost["runRpc"]
   readonly stdin?: string
   readonly stdinIsTTY?: boolean
   readonly stdoutIsTTY?: boolean
@@ -763,6 +849,11 @@ function testHost(options: TestHostOptions): CliHost {
         throw new Error("unexpected interactive runtime")
       }),
     runInteractive: options.runInteractive ?? (async () => {}),
+    runRpc:
+      options.runRpc ??
+      (async () => {
+        throw new Error("unexpected RPC mode")
+      }),
     onSignal(listener: (signal: CliSignal) => void) {
       if (options.signals) options.signals.listener = listener
       return () => {

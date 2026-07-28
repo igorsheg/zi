@@ -228,6 +228,32 @@ export default function (zi: ExtensionAPI): void {
     expect(productStderr).not.toContain("compiled worker stderr")
     expect(await Bun.file(lifecycle).text()).toBe("start:startup\nstop:quit\n")
 
+    child = spawn(
+      executable,
+      ["--cwd", temporary, "--agent-dir", join(temporary, "rpc-agent"), "--no-session", "--mode", "rpc"],
+      { cwd: temporary, env: providerFreeEnvironment(temporary), stdio: ["pipe", "pipe", "pipe"], windowsHide: true }
+    )
+    child.stdin!.end(`${JSON.stringify({ version: 1, id: "state", method: "session.get_state" })}\n`)
+    const [rpcExit, rpcStdout, rpcStderr] = await Promise.all([
+      childExit(child),
+      readNodeStream(child.stdout!),
+      readNodeStream(child.stderr!)
+    ])
+    expect(rpcExit).toBe(0)
+    expect(rpcStderr).toBe("")
+    expect(parseJsonLines(rpcStdout)).toMatchObject([
+      { version: 1, sequence: 1, type: "ready", state: { activity: { type: "idle" } } },
+      {
+        version: 1,
+        sequence: 2,
+        type: "response",
+        id: "state",
+        method: "session.get_state",
+        ok: true,
+        result: { activity: { type: "idle" } }
+      }
+    ])
+
     await runExtensionCustomToolAcceptance({ executable, extensionSource: exampleExtension })
   } finally {
     child?.kill()
@@ -388,6 +414,21 @@ await compileZi({ outfile: process.env.ZI_COMPILED_TEST_OUTFILE, version: "compi
   if (exitCode !== 0) {
     throw new Error(`Compiled Zi build failed: stdout=${JSON.stringify(stdout)} stderr=${JSON.stringify(stderr)}`)
   }
+}
+
+function parseJsonLines(output: string): Record<string, unknown>[] {
+  return output
+    .trimEnd()
+    .split("\n")
+    .map(line => {
+      const value: unknown = JSON.parse(line)
+      if (!isRecord(value)) throw new Error("Compiled RPC output must contain JSON objects")
+      return value
+    })
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
 }
 
 async function readNodeStream(stream: NodeJS.ReadableStream): Promise<string> {

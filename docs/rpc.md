@@ -1,0 +1,94 @@
+# RPC protocol
+
+Zi RPC is a long-lived process protocol over the same authoritative `AgentSession` used by interactive and print modes.
+
+```sh
+zi --mode rpc --no-session
+```
+
+The client writes strict UTF-8 JSONL to stdin and reads JSONL from stdout. Positional prompts are rejected. Diagnostics use stderr and never contaminate protocol stdout.
+
+## Framing and ordering
+
+Every request carries protocol version `1` and a required correlation ID:
+
+```json
+{ "version": 1, "id": "state-1", "method": "session.get_state" }
+```
+
+Every server frame carries version `1` and a connection-local monotonic `sequence`. The first frame is always `ready`:
+
+```json
+{
+  "version": 1,
+  "sequence": 1,
+  "type": "ready",
+  "state": {
+    "sessionId": "…",
+    "activity": { "type": "idle" },
+    "model": { "type": "unselected" },
+    "thinkingLevel": "off",
+    "supportedThinkingLevels": ["off"],
+    "steeringMode": "one-at-a-time",
+    "followUpMode": "one-at-a-time",
+    "queuedInputs": { "steering": [], "followUp": [] },
+    "messageCount": 0,
+    "compaction": { "type": "idle" },
+    "retry": { "type": "idle" },
+    "contextUsage": { "type": "unavailable", "reason": "no_model" }
+  }
+}
+```
+
+A successful request receives a correlated response:
+
+```json
+{
+  "version": 1,
+  "sequence": 2,
+  "type": "response",
+  "id": "state-1",
+  "method": "session.get_state",
+  "ok": true,
+  "result": { "sessionId": "…" }
+}
+```
+
+Operation failures use `ok: false` with `capacity`, `not_found`, or `operation_failed`. Invalid JSON and rejected request shapes produce `protocol_error` frames and do not close the connection. Invalid UTF-8 and oversized framing are fatal after one `invalid_framing` frame.
+
+`session_event` frames contain source-ordered `AgentSessionEvent` values. Model-change events use the public model projection described below instead of exposing provider configuration or credentials.
+
+## Methods
+
+| Method                 | Parameters                                                 | Result                                               |
+| ---------------------- | ---------------------------------------------------------- | ---------------------------------------------------- |
+| `session.get_state`    | none                                                       | Current session snapshot                             |
+| `session.get_messages` | `start` defaults to `0`; `limit` defaults to and maxes 100 | Indexed message page, total count, and next start    |
+| `session.prompt`       | `delivery`: `direct`, `steer`, or `follow_up`; `text`      | Admitted delivery                                    |
+| `session.interrupt`    | none                                                       | Empty object after interruption settles              |
+| `session.await_idle`   | none                                                       | Empty object after current session work settles      |
+| `model.list`           | none                                                       | Bounded model descriptors with authentication status |
+| `model.select`         | `provider`, `id`                                           | Selected public model descriptor                     |
+| `thinking.list`        | none                                                       | Levels supported by the selected model               |
+| `thinking.select`      | `level`; optional `scope`: `global` or `project`           | Requested, effective, and persisted scope            |
+
+A direct prompt response means the input was admitted, not that provider work completed. Use ordered session events or `session.await_idle` for completion. Steering and follow-up input retain `AgentSession` queue semantics and may be queued before the next direct prompt.
+
+Public model descriptors contain only `provider`, `id`, `name`, `reasoning`, `input`, `contextWindow`, and `maxTokens`. Catalog results add `configured`. Base URLs, headers, compatibility settings, prices, and credentials do not cross RPC.
+
+Message pages are bounded by both count and encoded bytes. A client should retain the `total` from each response, follow `nextStart`, and restart paging if intervening event sequences indicate the session changed.
+
+## Bounds and lifecycle
+
+- input or output record: 16 MiB;
+- prompt text: 8 MiB;
+- message page: 100 messages and 8 MiB;
+- request ID, model provider, or model ID: 256 bytes;
+- ordinary in-flight operations: 32;
+- reserved concurrent interruption: 1;
+- pending output: 1,024 records and 32 MiB;
+- connection settlement: 5 seconds.
+
+Closing stdin means the client has disconnected. Zi stops admitting requests, discards queued input, interrupts active work, waits boundedly, restores protocol resources, and then lets the CLI dispose the session it created. `SIGHUP`, `SIGINT`, and `SIGTERM` follow the same cancellation path and retain the CLI's established exit codes.
+
+The ownership and compatibility decision is recorded in [ADR 0022](adr/0022-rpc-connections-own-versioned-session-transport.md).

@@ -201,8 +201,8 @@ test("help and version are parse-time intents", () => {
   expect(parseArgs(["-h", "-V"])).toMatchObject({ help: true, version: true, messages: [] })
 })
 
-test("RPC remains explicitly deferred", () => {
-  expect(() => parseArgs(["--mode", "rpc"])).toThrow("RPC mode is not available yet")
+test("RPC is an explicit protocol mode", () => {
+  expect(resolveCliInvocation(parseArgs(["--mode", "rpc"]), context).mode).toBe("rpc")
 })
 
 test("values and environment defaults are validated at their boundary", () => {
