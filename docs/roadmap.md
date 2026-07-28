@@ -57,9 +57,9 @@ Zi v0.1.12 shipped the [`custom-tool extension golden path`](extension-custom-to
 - [x] Pass the compiled example acceptance in the five-target release matrix.
 - [x] Publish Zi v0.1.12, its five native packages, and `@with-zi/extension-api` through the release workflow.
 
-## Now — drive Zi as a process
+## Shipped — drive Zi as a process
 
-Implement a versioned RPC mode over the existing `AgentSession` policy:
+Zi v0.1.13 shipped a versioned RPC mode over the existing `AgentSession` policy and a copyable process-owning reference client:
 
 - [x] Observe authoritative session state, paged messages, and ordered events.
 - [x] Submit direct, steering, and follow-up input.
@@ -71,7 +71,7 @@ Implement a versioned RPC mode over the existing `AgentSession` policy:
 
 RPC should not introduce a universal frontend facade or duplicate session policy.
 
-## Then — follow demonstrated pressure
+## Now — follow demonstrated pressure
 
 After custom tools and RPC are in use, choose independently proven slices:
 

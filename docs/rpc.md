@@ -1,6 +1,6 @@
 # RPC protocol
 
-Zi RPC is a long-lived process protocol over the same authoritative `AgentSession` used by interactive and print modes. A copyable one-shot implementation lives in [`examples/rpc/client.ts`](../examples/rpc/client.ts). [GitHub Actions 30352314254](https://github.com/igorsheg/zi/actions/runs/30352314254) accepted the server, client, custom-tool round trip, and npm package shape against compiled executables on all five release targets.
+Zi RPC is a long-lived process protocol over the same authoritative `AgentSession` used by interactive and print modes. Zi v0.1.13 shipped the server and the copyable one-shot implementation in [`examples/rpc/client.ts`](../examples/rpc/client.ts). Its [release workflow](https://github.com/igorsheg/zi/actions/runs/30353017056) accepted the server, client, custom-tool round trip, and npm package shape against compiled executables on all five release targets.
 
 ```sh
 zi --mode rpc --no-session
