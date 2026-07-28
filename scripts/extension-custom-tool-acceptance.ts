@@ -241,21 +241,11 @@ async function runWindowsInteractive(
   let fallbackTimer: ReturnType<typeof setTimeout> | undefined
   let exitRequested = false
   let wrapperStoppedAfterRestore = false
+  let wrapperStopFailure: string | undefined
   const requestExit = (text: string): void => {
     if (exitRequested && !wrapperStoppedAfterRestore && text.includes("\u001b[?25h")) {
       wrapperStoppedAfterRestore = true
-      Bun.spawnSync(["taskkill.exe", "/PID", String(child.pid), "/T", "/F"], {
-        stdout: "ignore",
-        stderr: "ignore",
-        windowsHide: true
-      })
-      for (const image of [basename(executable), "winpty-agent.exe"]) {
-        Bun.spawnSync(["taskkill.exe", "/IM", image, "/T", "/F"], {
-          stdout: "ignore",
-          stderr: "ignore",
-          windowsHide: true
-        })
-      }
+      wrapperStopFailure = stopWindowsInteractiveProcesses(child.pid, basename(executable))
       return
     }
     if (exitRequested || !text.includes(acceptanceResult)) return
@@ -270,6 +260,7 @@ async function runWindowsInteractive(
 
   try {
     const [exitCode, capturedStdout, capturedStderr] = await settleProcess(child, stdout, stderr)
+    if (wrapperStopFailure) throw new Error(wrapperStopFailure)
     if (wrapperStoppedAfterRestore && capturedStderr === "") {
       await Bun.sleep(500)
       return { exitCode: 0, stdout: capturedStdout, stderr: "" }
@@ -544,6 +535,43 @@ function terminalResponse(id: string): Record<string, unknown> {
 function initializeRepository(cwd: string): void {
   const git = Bun.spawnSync(["git", "init", "--quiet"], { cwd })
   if (git.exitCode !== 0) throw new Error(`Could not initialize acceptance repository: ${git.stderr.toString()}`)
+}
+
+function stopWindowsInteractiveProcesses(wrapperPid: number, executableImage: string): string | undefined {
+  const script = `$ErrorActionPreference = "SilentlyContinue"
+$processes = @(Get-CimInstance Win32_Process)
+$ids = [System.Collections.Generic.HashSet[int]]::new()
+[void]$ids.Add(${wrapperPid})
+foreach ($process in $processes) {
+  if ($process.Name -in @(${JSON.stringify(executableImage)}, "winpty-agent.exe")) {
+    [void]$ids.Add([int]$process.ProcessId)
+  }
+}
+do {
+  $added = $false
+  foreach ($process in $processes) {
+    if ($ids.Contains([int]$process.ParentProcessId) -and $ids.Add([int]$process.ProcessId)) {
+      $added = $true
+    }
+  }
+} while ($added)
+$targets = [int[]]@($ids)
+Stop-Process -Id $targets -Force
+for ($attempt = 0; $attempt -lt 50; $attempt++) {
+  $remaining = @(Get-Process -Id $targets)
+  if ($remaining.Count -eq 0) { exit 0 }
+  Start-Sleep -Milliseconds 100
+}
+Write-Error ("Windows interactive processes remained: " + (($remaining | ForEach-Object { $_.Id }) -join ", "))
+exit 1`
+  const encoded = Buffer.from(script, "utf16le").toString("base64")
+  const stopped = Bun.spawnSync(
+    ["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
+    { stdout: "ignore", stderr: "pipe", windowsHide: true }
+  )
+  if (stopped.exitCode === 0) return undefined
+  const detail = new TextDecoder().decode(stopped.stderr.slice(0, 4 * 1024)).trim()
+  return `Could not stop Windows interactive processes${detail ? `: ${detail}` : ""}`
 }
 
 function findWinpty(): string | undefined {
