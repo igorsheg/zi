@@ -1,13 +1,13 @@
 # Product roadmap
 
 - Status: active
-- Updated: 2026-07-27
+- Updated: 2026-07-28
 
 This roadmap orders product work by downstream leverage. [`parity-roadmap.md`](parity-roadmap.md) remains the capability and provenance inventory; parity evidence no longer determines product priority by itself. Product choices follow the [`building-block strategy`](building-block-strategy.md).
 
-## Now — teach Zi one executable habit
+## Shipped — teach Zi one executable habit
 
-The current product milestone is the [`custom-tool extension golden path`](extension-custom-tool-golden-path.md): a repository can add one trusted TypeScript tool that works in interactive, text, and JSON modes without modifying Zi.
+Zi v0.1.12 shipped the [`custom-tool extension golden path`](extension-custom-tool-golden-path.md): a repository can add one trusted TypeScript tool that works in interactive, text, and JSON modes without modifying Zi.
 
 ### 1. Fix the target
 
@@ -55,8 +55,9 @@ The current product milestone is the [`custom-tool extension golden path`](exten
 - [x] Ship `examples/extensions/custom-tool/` with an executable acceptance test.
 - [x] Add extension author documentation and source-attributed diagnostics.
 - [x] Pass the compiled example acceptance in the five-target release matrix.
+- [x] Publish Zi v0.1.12, its five native packages, and `@with-zi/extension-api` through the release workflow.
 
-## Next — drive Zi as a process
+## Now — drive Zi as a process
 
 Implement a versioned RPC mode over the existing `AgentSession` policy:
 
