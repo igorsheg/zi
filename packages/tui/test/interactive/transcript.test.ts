@@ -393,7 +393,10 @@ test("streamed tool execution leaves a detached native viewport anchored", async
     operation = session.prompt("run the tool")
     await providerStarted.promise
     await setup.renderOnce()
-    await pressRaw(setup, "\x1b[5~")
+    setup.renderer.stdin.emit("data", Buffer.from("\x1b[5~"))
+    await Promise.resolve()
+    // Live provider work owns a frame request, so visual idle is not an admissible wait here.
+    await setup.renderOnce()
     const detachedTop = scroll.scrollTop
 
     releaseToolCall.resolve()
