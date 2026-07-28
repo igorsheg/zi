@@ -6,6 +6,8 @@ import { basename, join, resolve } from "node:path"
 const acceptancePrompt = "Call repository_status once, then report success."
 const acceptanceResult = "Extension acceptance passed."
 const expectedStatus = "?? acceptance.txt"
+const winptyNonTtyResizeFailure =
+  'Assertion failed: ASSERT_CONDITION("wp != nullptr && cols > 0 && rows > 0"), file src/libwinpty/winpty.cc, line 924'
 const maxProviderRequestBytes = 2 * 1024 * 1024
 const maxProcessOutputBytes = 8 * 1024 * 1024
 const processDeadlineMs = 15_000
@@ -268,7 +270,10 @@ async function runWindowsInteractive(
   try {
     const [exitCode, capturedStdout, capturedStderr] = await settleProcess(child, stdout, stderr)
     if (wrapperStopFailure) throw new Error(wrapperStopFailure)
-    if (wrapperStoppedAfterRestore && capturedStderr === "") {
+    if (
+      wrapperStoppedAfterRestore &&
+      (capturedStderr === "" || normalizeNewlines(capturedStderr).trim() === winptyNonTtyResizeFailure)
+    ) {
       await Bun.sleep(500)
       return { exitCode: 0, stdout: capturedStdout, stderr: "" }
     }
