@@ -1,17 +1,17 @@
-import { existsSync, realpathSync } from "node:fs"
+import { realpathSync } from "node:fs"
 import { copyFile, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
-import { basename, join, resolve } from "node:path"
+import { join, resolve } from "node:path"
+
+import { interactiveAcceptanceArgument } from "../packages/cli/src/main.js"
 
 const acceptancePrompt = "Call repository_status once, then report success."
 const acceptanceResult = "Extension acceptance passed."
 const expectedStatus = "?? acceptance.txt"
-const winptyNonTtyResizeFailure =
-  'Assertion failed: ASSERT_CONDITION("wp != nullptr && cols > 0 && rows > 0"), file src/libwinpty/winpty.cc, line 924'
 const maxProviderRequestBytes = 2 * 1024 * 1024
 const maxProcessOutputBytes = 8 * 1024 * 1024
 const processDeadlineMs = 15_000
-const temporaryCleanupDeadlineMs = process.platform === "win32" ? 30_000 : 500
+const temporaryCleanupDeadlineMs = process.platform === "win32" ? 5_000 : 500
 const temporaryCleanupRetryDelayMs = 100
 
 type AcceptanceMode = "text" | "json" | "interactive"
@@ -176,6 +176,9 @@ async function runInteractive(
     throw new Error(`Compiled interactive mode omitted ${JSON.stringify(acceptanceResult)}`)
   }
   if (process.platform === "win32") {
+    if (output.stderr !== "") {
+      throw new Error(`Compiled interactive mode wrote to stderr: ${JSON.stringify(output.stderr)}`)
+    }
     if (!terminalOutput.includes("\u001b[?25l") || !terminalOutput.includes("\u001b[?25h")) {
       throw new Error("Compiled interactive mode did not restore the Windows terminal cursor")
     }
@@ -230,12 +233,9 @@ async function runWindowsInteractive(
   cwd: string,
   env: Readonly<Record<string, string | undefined>>
 ): Promise<ProcessOutput> {
-  const winpty = findWinpty()
-  if (!winpty) throw new Error("Compiled Windows interactive acceptance requires Git for Windows winpty.exe")
-
-  const child = Bun.spawn([winpty, "-Xallow-non-tty", "--", executable, ...args], {
+  const child = Bun.spawn([executable, ...args, interactiveAcceptanceArgument], {
     cwd,
-    env,
+    env: { ...env, COLUMNS: "100", LINES: "30" },
     stdin: "pipe",
     stdout: "pipe",
     stderr: "pipe",
@@ -244,14 +244,7 @@ async function runWindowsInteractive(
   let exitTimer: ReturnType<typeof setTimeout> | undefined
   let fallbackTimer: ReturnType<typeof setTimeout> | undefined
   let exitRequested = false
-  let wrapperStoppedAfterRestore = false
-  let wrapperStopFailure: string | undefined
   const requestExit = (text: string): void => {
-    if (exitRequested && !wrapperStoppedAfterRestore && text.includes("\u001b[?25h")) {
-      wrapperStoppedAfterRestore = true
-      wrapperStopFailure = stopWindowsInteractiveProcesses(child.pid, basename(executable))
-      return
-    }
     if (exitRequested || !text.includes(acceptanceResult)) return
     exitRequested = true
     exitTimer = setTimeout(() => {
@@ -264,14 +257,6 @@ async function runWindowsInteractive(
 
   try {
     const [exitCode, capturedStdout, capturedStderr] = await settleProcess(child, stdout, stderr)
-    if (wrapperStopFailure) throw new Error(wrapperStopFailure)
-    if (
-      wrapperStoppedAfterRestore &&
-      (capturedStderr === "" || normalizeNewlines(capturedStderr).trim() === winptyNonTtyResizeFailure)
-    ) {
-      await Bun.sleep(500)
-      return { exitCode: 0, stdout: capturedStdout, stderr: "" }
-    }
     return { exitCode, stdout: capturedStdout, stderr: capturedStderr }
   } finally {
     if (exitTimer) clearTimeout(exitTimer)
@@ -576,7 +561,7 @@ function windowsAcceptanceProcesses(path: string): string {
 Get-CimInstance Win32_Process |
   Where-Object {
     ($_.CommandLine -and $_.CommandLine.ToLower().Contains($needle)) -or
-    $_.Name -match "^(zi|winpty|winpty-agent|conhost|OpenConsole)\\.exe$"
+    $_.Name -match "^(zi|conhost|OpenConsole)\\.exe$"
   } |
   Select-Object ProcessId, ParentProcessId, Name, CommandLine |
   ConvertTo-Json -Compress`
@@ -588,54 +573,6 @@ Get-CimInstance Win32_Process |
   if (snapshot.exitCode !== 0) return ""
   const output = new TextDecoder().decode(snapshot.stdout.slice(0, 16 * 1024)).trim()
   return output ? `Windows acceptance processes: ${output}` : ""
-}
-
-function stopWindowsInteractiveProcesses(wrapperPid: number, executableImage: string): string | undefined {
-  const script = `$ErrorActionPreference = "SilentlyContinue"
-$processes = @(Get-CimInstance Win32_Process)
-$ids = [System.Collections.Generic.HashSet[int]]::new()
-[void]$ids.Add(${wrapperPid})
-foreach ($process in $processes) {
-  if ($process.Name -in @(${JSON.stringify(executableImage)}, "winpty-agent.exe")) {
-    [void]$ids.Add([int]$process.ProcessId)
-  }
-}
-do {
-  $added = $false
-  foreach ($process in $processes) {
-    if ($ids.Contains([int]$process.ParentProcessId) -and $ids.Add([int]$process.ProcessId)) {
-      $added = $true
-    }
-  }
-} while ($added)
-$targets = [int[]]@($ids)
-Stop-Process -Id $targets -Force
-for ($attempt = 0; $attempt -lt 50; $attempt++) {
-  $remaining = @(Get-Process -Id $targets)
-  if ($remaining.Count -eq 0) { exit 0 }
-  Start-Sleep -Milliseconds 100
-}
-Write-Error ("Windows interactive processes remained: " + (($remaining | ForEach-Object { $_.Id }) -join ", "))
-exit 1`
-  const encoded = Buffer.from(script, "utf16le").toString("base64")
-  const stopped = Bun.spawnSync(
-    ["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
-    { stdout: "ignore", stderr: "pipe", windowsHide: true }
-  )
-  if (stopped.exitCode === 0) return undefined
-  const detail = new TextDecoder().decode(stopped.stderr.slice(0, 4 * 1024)).trim()
-  return `Could not stop Windows interactive processes${detail ? `: ${detail}` : ""}`
-}
-
-function findWinpty(): string | undefined {
-  const discovered = Bun.which("winpty.exe") ?? Bun.which("winpty")
-  if (discovered) return discovered
-  for (const root of [process.env.ProgramFiles, process.env["ProgramFiles(x86)"], process.env.ProgramW6432]) {
-    if (!root) continue
-    const candidate = join(root, "Git", "usr", "bin", "winpty.exe")
-    if (existsSync(candidate)) return candidate
-  }
-  return undefined
 }
 
 function sendInteractiveInput(stdin: Bun.FileSink, data: string): void {

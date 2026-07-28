@@ -106,7 +106,7 @@ async function removeReleasePackage(path: string): Promise<void> {
       if (attempt === 19 || (code !== "EACCES" && code !== "EBUSY" && code !== "EPERM" && code !== "ENOTEMPTY")) {
         throw cause
       }
-      // winpty's agent can retain the exited Windows image briefly after its adapter closes.
+      // Windows can retain a recently exited compiled image briefly after process settlement.
       // oxlint-disable-next-line no-await-in-loop
       await Bun.sleep(100)
     }

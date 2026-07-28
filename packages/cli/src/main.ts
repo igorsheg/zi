@@ -14,14 +14,19 @@ import {
   type CliSignal
 } from "./run.js"
 
+export const interactiveAcceptanceArgument = "--zi-internal-interactive-acceptance"
+
 export async function main(argv: readonly string[] = defaultCliArgv()): Promise<number> {
-  return runCli(argv, processHost())
+  return runCli(argv, createProcessHost(false))
 }
 
 export async function runEntrypoint(argv: readonly string[] = defaultCliArgv()): Promise<number> {
   if (argv.length === 1 && argv[0] === extensionWorkerArgument) {
     await runExtensionWorkerFromStdio()
     return 0
+  }
+  if (argv.at(-1) === interactiveAcceptanceArgument) {
+    return runCli(argv.slice(0, -1), createProcessHost(true))
   }
   return main(argv)
 }
@@ -37,13 +42,13 @@ export function defaultCliArgv(argv: readonly string[] = process.argv): readonly
   return argv.slice(1)
 }
 
-function processHost(): CliHost {
+export function createProcessHost(forceInteractive: boolean): CliHost {
   return {
     cwd: process.cwd(),
     home: homedir(),
     env: Object.freeze({ ...process.env }),
-    stdinIsTTY: process.stdin.isTTY,
-    stdoutIsTTY: process.stdout.isTTY,
+    stdinIsTTY: forceInteractive || process.stdin.isTTY,
+    stdoutIsTTY: forceInteractive || process.stdout.isTTY,
     extensionWorkerCommand: currentZiCommand(),
     readStdin: readPipedStdin,
     writeStdout: chunk => writeOutput(Bun.stdout, chunk),

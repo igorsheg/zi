@@ -15,7 +15,7 @@ import {
   fauxToolCall
 } from "@with-zi/coding-agent/testing"
 
-import { currentZiCommand, defaultCliArgv } from "../src/main.js"
+import { createProcessHost, currentZiCommand, defaultCliArgv, interactiveAcceptanceArgument } from "../src/main.js"
 import {
   helpText,
   maxCliStdinBytes,
@@ -133,11 +133,20 @@ test("CLI argument defaults handle Bun scripts and compiled executables", () => 
   expect(defaultCliArgv(["C:\\tools\\zi.exe", "B:\\~BUN\\root\\standalone", extensionWorkerArgument])).toEqual([
     extensionWorkerArgument
   ])
+  expect(defaultCliArgv(["C:\\tools\\zi.exe", "--mode", "interactive", interactiveAcceptanceArgument])).toEqual([
+    "--mode",
+    "interactive",
+    interactiveAcceptanceArgument
+  ])
   expect(currentZiCommand([process.execPath, "/work/packages/cli/src/main.ts"])).toEqual([
     process.execPath,
     resolvePath("/work/packages/cli/src/main.ts")
   ])
   expect(currentZiCommand([process.execPath, "/$bunfs/root/standalone"])).toEqual([process.execPath])
+})
+
+test("the internal acceptance host changes only CLI TTY admission facts", () => {
+  expect(createProcessHost(true)).toMatchObject({ stdinIsTTY: true, stdoutIsTTY: true })
 })
 
 test("CLI mode resolution keeps explicit protocols and otherwise follows TTY facts", () => {
