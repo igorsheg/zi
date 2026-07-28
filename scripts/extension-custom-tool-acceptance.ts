@@ -9,6 +9,8 @@ const expectedStatus = "?? acceptance.txt"
 const maxProviderRequestBytes = 2 * 1024 * 1024
 const maxProcessOutputBytes = 8 * 1024 * 1024
 const processDeadlineMs = 15_000
+const temporaryCleanupRetries = process.platform === "win32" ? 300 : 3
+const temporaryCleanupRetryDelayMs = 100
 
 type AcceptanceMode = "text" | "json" | "interactive"
 
@@ -61,7 +63,12 @@ export async function runExtensionCustomToolAcceptance(options: ExtensionCustomT
       }
     }
   } finally {
-    await rm(temporary, { recursive: true, force: true, maxRetries: 50, retryDelay: 100 })
+    await rm(temporary, {
+      recursive: true,
+      force: true,
+      maxRetries: temporaryCleanupRetries,
+      retryDelay: temporaryCleanupRetryDelayMs
+    })
   }
 }
 
