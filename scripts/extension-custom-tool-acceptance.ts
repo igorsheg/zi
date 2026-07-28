@@ -11,7 +11,7 @@ const winptyNonTtyResizeFailure =
 const maxProviderRequestBytes = 2 * 1024 * 1024
 const maxProcessOutputBytes = 8 * 1024 * 1024
 const processDeadlineMs = 15_000
-const temporaryCleanupRetries = process.platform === "win32" ? 300 : 3
+const temporaryCleanupDeadlineMs = process.platform === "win32" ? 30_000 : 500
 const temporaryCleanupRetryDelayMs = 100
 
 type AcceptanceMode = "text" | "json" | "interactive"
@@ -65,12 +65,7 @@ export async function runExtensionCustomToolAcceptance(options: ExtensionCustomT
       }
     }
   } finally {
-    await rm(temporary, {
-      recursive: true,
-      force: true,
-      maxRetries: temporaryCleanupRetries,
-      retryDelay: temporaryCleanupRetryDelayMs
-    })
+    await removeTemporaryDirectory(temporary)
   }
 }
 
@@ -547,6 +542,52 @@ function terminalResponse(id: string): Record<string, unknown> {
 function initializeRepository(cwd: string): void {
   const git = Bun.spawnSync(["git", "init", "--quiet"], { cwd })
   if (git.exitCode !== 0) throw new Error(`Could not initialize acceptance repository: ${git.stderr.toString()}`)
+}
+
+async function removeTemporaryDirectory(path: string): Promise<void> {
+  const deadline = Date.now() + temporaryCleanupDeadlineMs
+  while (true) {
+    try {
+      // Cleanup attempts are sequential because each observes handles released by the previous attempt.
+      // oxlint-disable-next-line no-await-in-loop
+      await rm(path, { recursive: true, force: true })
+      return
+    } catch (cause) {
+      if (!isRetryableCleanupError(cause) || Date.now() >= deadline) {
+        if (process.platform !== "win32") throw cause
+        const detail = windowsAcceptanceProcesses(path)
+        throw new Error(`${cause instanceof Error ? cause.message : String(cause)}${detail ? `\n${detail}` : ""}`, {
+          cause
+        })
+      }
+      // oxlint-disable-next-line no-await-in-loop
+      await Bun.sleep(temporaryCleanupRetryDelayMs)
+    }
+  }
+}
+
+function isRetryableCleanupError(cause: unknown): boolean {
+  if (!(cause instanceof Error) || !("code" in cause)) return false
+  return ["EACCES", "EBUSY", "ENOTEMPTY", "EPERM"].includes(String(cause.code))
+}
+
+function windowsAcceptanceProcesses(path: string): string {
+  const script = `$needle = ${JSON.stringify(path.toLowerCase())}
+Get-CimInstance Win32_Process |
+  Where-Object {
+    ($_.CommandLine -and $_.CommandLine.ToLower().Contains($needle)) -or
+    $_.Name -match "^(zi|winpty|winpty-agent|conhost|OpenConsole)\\.exe$"
+  } |
+  Select-Object ProcessId, ParentProcessId, Name, CommandLine |
+  ConvertTo-Json -Compress`
+  const encoded = Buffer.from(script, "utf16le").toString("base64")
+  const snapshot = Bun.spawnSync(
+    ["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
+    { stdout: "pipe", stderr: "ignore", windowsHide: true }
+  )
+  if (snapshot.exitCode !== 0) return ""
+  const output = new TextDecoder().decode(snapshot.stdout.slice(0, 16 * 1024)).trim()
+  return output ? `Windows acceptance processes: ${output}` : ""
 }
 
 function stopWindowsInteractiveProcesses(wrapperPid: number, executableImage: string): string | undefined {
