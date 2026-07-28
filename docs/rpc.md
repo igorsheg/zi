@@ -1,6 +1,6 @@
 # RPC protocol
 
-Zi RPC is a long-lived process protocol over the same authoritative `AgentSession` used by interactive and print modes.
+Zi RPC is a long-lived process protocol over the same authoritative `AgentSession` used by interactive and print modes. A copyable one-shot implementation lives in [`examples/rpc/client.ts`](../examples/rpc/client.ts) and is accepted against the compiled executable on every release target.
 
 ```sh
 zi --mode rpc --no-session

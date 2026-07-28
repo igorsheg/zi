@@ -15,7 +15,7 @@ This specification establishes the extension substrate before any product capabi
 
 The initial infrastructure contract contained lifecycle registration only. Protocol version 2 adds the first separate capability: bounded model-callable tools. Commands, providers, UI, and a generic event framework remain excluded.
 
-Lifecycle loading is an infrastructure checkpoint, not the product launch boundary. The first usable outcome is the [`custom-tool extension golden path`](extension-custom-tool-golden-path.md), which must work across interactive, text, and JSON modes against the compiled release.
+Lifecycle loading is an infrastructure checkpoint, not the product launch boundary. The first usable outcome is the [`custom-tool extension golden path`](extension-custom-tool-golden-path.md), which must work across interactive, text, JSON, and RPC modes against the compiled release.
 
 The target is capability parity, not source identity with Pi. In particular, Zi will not expose Pi TUI components or copy Pi's broad in-process object graph.
 
@@ -811,7 +811,7 @@ Fixture extensions prove:
 Compiled acceptance has two layers:
 
 1. the worker-protocol test compiles Zi with the pinned Bun version, loads external TypeScript plus the canonical example, invokes its tool over the dedicated protocol pipe, checks lifecycle settlement and log isolation, and exits without leaked process or temporary state;
-2. the release-product test copies the canonical example beneath a persisted-trusted temporary project's `.zi/extensions/`, starts a bounded local Responses provider, and requires the compiled executable to complete one real custom-tool turn in text, JSON, and interactive modes.
+2. the release-product test copies the canonical example beneath a persisted-trusted temporary project's `.zi/extensions/`, starts a bounded local Responses provider, and requires the compiled executable to complete one real custom-tool turn in text, JSON, RPC, and interactive modes.
 
 The product test checks registration in the first provider request, the exact custom-tool result in the second request, text stdout isolation, ordered JSON tool events, final interactive assistant presentation, and platform terminal restoration. It does not search the raw PTY byte stream for a completed tool row because incremental terminal frames can compose visible text across writes. POSIX acceptance owns a Bun PTY. The Windows release runner uses bounded stdio and a private final CLI argument that changes only TTY admission facts for that acceptance process. Both paths require durable output and platform terminal restoration. `build-release.ts` runs this acceptance before archiving each native target. CI uses deterministic process and resource assertions rather than wall-clock performance thresholds; deadlines only bound failed subprocess settlement.
 
@@ -948,7 +948,7 @@ Progress:
 - [x] canonical custom-tool example and author guide;
 - [x] compiled worker acceptance for the example and public API module;
 - [x] release-package assembly for `@with-zi/extension-api`;
-- [x] compiled interactive, text, and JSON acceptance on every release target.
+- [x] compiled interactive, text, JSON, and RPC acceptance on every release target.
 
 Likely files:
 

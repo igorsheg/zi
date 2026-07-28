@@ -7,7 +7,7 @@
 
 ## User outcome
 
-A user adds one TypeScript extension beneath the current project's `.zi/extensions/`, trusts that project, starts the compiled Zi executable, and lets the model invoke the extension's tool. The same extension works in interactive, text, and JSON modes without importing Zi internals or building a separate bundle.
+A user adds one TypeScript extension beneath the current project's `.zi/extensions/`, trusts that project, starts the compiled Zi executable, and lets the model invoke the extension's tool. The same extension works in interactive, text, JSON, and RPC modes without importing Zi internals or building a separate bundle.
 
 The canonical [`repository_status` example](../examples/extensions/custom-tool/index.ts) is a small repository-specific tool with typed arguments, cooperative cancellation, and a bounded textual result. It is meant to be copied and changed by a person or coding agent, not to demonstrate every future extension capability.
 
@@ -33,7 +33,7 @@ ZiPaths + project trust
       -> extension factory registration
       -> bounded tool invocation in worker
   -> AgentSession authoritative tool catalog and invocation lifecycle
-  -> interactive | text | JSON mode presentation
+  -> interactive | text | JSON | RPC mode presentation
 ```
 
 - `ZiPaths` supplies exact global and project roots.
@@ -95,7 +95,7 @@ ZiPaths + project trust
 
 [Zi v0.1.12](https://github.com/igorsheg/zi/releases/tag/v0.1.12) shipped this capability after [GitHub Actions 30344904697](https://github.com/igorsheg/zi/actions/runs/30344904697) passed the complete release matrix on macOS arm64/x64, Linux arm64/x64, and Windows x64, assembled the npm packages, published the GitHub release, and published all seven npm packages through trusted publishing.
 
-`scripts/extension-custom-tool-acceptance.ts` owns the release-shaped check. It copies the canonical source into a trusted temporary project's `.zi/extensions/`, starts a bounded local Responses provider, requires the provider to select `repository_status`, verifies the tool result on the second request, and runs the complete turn in text, JSON, and interactive modes. Interactive acceptance drives the native executable through Bun's PTY on POSIX and bounded stdio on Windows; a private final CLI argument changes only TTY admission facts for the Windows acceptance process. The harness verifies the final assistant presentation and terminal restoration (alternate-screen exit on POSIX and cursor restoration on Windows). The provider boundary verifies the exact tool result because incremental terminal frames do not guarantee that an already-visible row appears contiguously in the raw terminal byte stream. `scripts/build-release.ts` runs this check before archiving every native artifact.
+`scripts/extension-custom-tool-acceptance.ts` owns the release-shaped check. It copies the canonical source into a trusted temporary project's `.zi/extensions/`, starts a bounded local Responses provider, requires the provider to select `repository_status`, verifies the tool result on the second request, and runs the complete turn in text, JSON, RPC, and interactive modes. Interactive acceptance drives the native executable through Bun's PTY on POSIX and bounded stdio on Windows; a private final CLI argument changes only TTY admission facts for the Windows acceptance process. The harness verifies the final assistant presentation and terminal restoration (alternate-screen exit on POSIX and cursor restoration on Windows). The provider boundary verifies the exact tool result because incremental terminal frames do not guarantee that an already-visible row appears contiguously in the raw terminal byte stream. `scripts/build-release.ts` runs this check before archiving every native artifact.
 
 ## Launch boundary
 

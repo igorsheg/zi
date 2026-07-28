@@ -3,6 +3,7 @@ import { copyFile, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
 
+import { runRpcPrompt } from "../examples/rpc/client.js"
 import { interactiveAcceptanceArgument } from "../packages/cli/src/main.js"
 
 const acceptancePrompt = "Call repository_status once, then report success."
@@ -14,7 +15,7 @@ const processDeadlineMs = 15_000
 const temporaryCleanupDeadlineMs = process.platform === "win32" ? 5_000 : 500
 const temporaryCleanupRetryDelayMs = 100
 
-type AcceptanceMode = "text" | "json" | "interactive"
+type AcceptanceMode = "text" | "json" | "rpc" | "interactive"
 
 type ProviderState =
   | { readonly type: "awaiting_tool_call" }
@@ -43,18 +44,42 @@ export async function runExtensionCustomToolAcceptance(options: ExtensionCustomT
     initializeRepository(project)
     await writeFile(join(agentDirectory, "trust.json"), JSON.stringify({ [realpathSync.native(project)]: true }))
 
-    for (const mode of ["text", "json", "interactive"] as const) {
+    for (const mode of ["text", "json", "rpc", "interactive"] as const) {
       const provider = new ToolRoundTripProvider()
       try {
-        const args = productArguments(mode, project, agentDirectory)
         const env = { ...process.env, AZURE_OPENAI_BASE_URL: provider.baseUrl, TERM: "xterm-256color" }
-        if (mode === "interactive") {
+        if (mode === "rpc") {
+          // The copyable client owns correlation, event sequencing, paging, and process settlement.
+          const controller = new AbortController()
+          const deadline = setTimeout(() => controller.abort(), processDeadlineMs)
+          let result: string
+          try {
+            // oxlint-disable-next-line no-await-in-loop
+            result = await runRpcPrompt({
+              command: [options.executable, ...rpcProductArguments(project, agentDirectory)],
+              cwd: project,
+              env,
+              prompt: acceptancePrompt,
+              signal: controller.signal
+            })
+          } finally {
+            clearTimeout(deadline)
+          }
+          if (normalizeNewlines(result) !== acceptanceResult) {
+            throw new Error(`Compiled RPC mode omitted ${JSON.stringify(acceptanceResult)}`)
+          }
+        } else if (mode === "interactive") {
           // Release modes share one deterministic project and are intentionally accepted in product order.
           // oxlint-disable-next-line no-await-in-loop
-          await runInteractive(options.executable, args, project, env)
+          await runInteractive(options.executable, productArguments(mode, project, agentDirectory), project, env)
         } else {
           // oxlint-disable-next-line no-await-in-loop
-          const output = await runHeadless(options.executable, args, project, env)
+          const output = await runHeadless(
+            options.executable,
+            productArguments(mode, project, agentDirectory),
+            project,
+            env
+          )
           if (mode === "text") validateTextOutput(output)
           else validateJsonOutput(output)
         }
@@ -127,7 +152,7 @@ interface ProcessOutput {
   readonly stderr: string
 }
 
-function productArguments(mode: AcceptanceMode, project: string, agentDirectory: string): string[] {
+function productArguments(mode: Exclude<AcceptanceMode, "rpc">, project: string, agentDirectory: string): string[] {
   return [
     "--mode",
     mode,
@@ -143,6 +168,22 @@ function productArguments(mode: AcceptanceMode, project: string, agentDirectory:
     "--thinking",
     "off",
     acceptancePrompt
+  ]
+}
+
+function rpcProductArguments(project: string, agentDirectory: string): string[] {
+  return [
+    "--no-session",
+    "--cwd",
+    project,
+    "--agent-dir",
+    agentDirectory,
+    "--model",
+    "azure-openai-responses/gpt-4.1",
+    "--api-key",
+    "extension-acceptance",
+    "--thinking",
+    "off"
   ]
 }
 

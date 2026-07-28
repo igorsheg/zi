@@ -4,7 +4,7 @@ Zi extensions are trusted TypeScript modules that add repository-specific behavi
 
 ## Trust and authority
 
-Project extensions are loaded only after the project `.zi` directory is trusted. Interactive mode asks; text and JSON modes never prompt and exclude unresolved project configuration. Global and explicit extensions are already user-admitted configuration.
+Project extensions are loaded only after the project `.zi` directory is trusted. Interactive mode asks; text, JSON, and RPC modes never prompt and exclude unresolved project configuration. Global and explicit extensions are already user-admitted configuration.
 
 Extensions run as the current user. They can read files and environment variables, access credentials, and spawn processes. The worker process contains crashes and hangs; it is not a security sandbox or credential boundary. Review extension code before trusting it.
 
@@ -52,6 +52,6 @@ Use `zi.on("session_start", handler)` to create long-lived resources and `zi.on(
 
 ## Modes and diagnostics
 
-The authoritative tool catalog is shared by interactive, text, and JSON modes. Interactive mode uses Zi's generic tool frame. Text mode writes tool progress to stderr and the final answer to stdout. JSON mode emits ordered tool lifecycle events on stdout. Extension `stdout` and `stderr` are retained separately in bounded worker log tails and never join those output protocols.
+The authoritative tool catalog is shared by interactive, text, JSON, and RPC modes. Interactive mode uses Zi's generic tool frame. Text mode writes tool progress to stderr and the final answer to stdout. JSON mode emits ordered tool lifecycle events on stdout. RPC emits versioned, sequenced session events and correlated responses. Extension `stdout` and `stderr` are retained separately in bounded worker log tails and never join those output protocols.
 
 Import, factory, registration, protocol, execution, and worker failures are source-attributed and fail closed. A failed worker generation is not restarted implicitly; reload or create a new session after correcting the extension.

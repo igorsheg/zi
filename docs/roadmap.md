@@ -67,7 +67,7 @@ Implement a versioned RPC mode over the existing `AgentSession` policy:
 - [x] List and select models and thinking levels.
 - [x] Preserve bounded framing, operations, output, cancellation, and creator-owned disposal.
 - [x] Prove the protocol against a compiled standalone executable.
-- [ ] Ship one reference client tested against `dist/zi`.
+- [x] Ship one copyable reference client tested against the compiled standalone executable.
 
 RPC should not introduce a universal frontend facade or duplicate session policy.
 
