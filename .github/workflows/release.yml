@@ -157,19 +157,21 @@ jobs:
           set -euo pipefail
           version="${TAG#v}"
 
+          publish() {
+            package="$1"
+            tarball="$2"
+            if npm view "${package}@${version}" version >/dev/null 2>&1; then
+              echo "${package}@${version} is already published"
+              return
+            fi
+            npm publish "$tarball" --access public --provenance --tag latest
+          }
+
+          # Prove trusted publishing for the newest package before publishing the native set.
+          publish "@with-zi/extension-api" "dist/npm/with-zi-extension-api-${version}.tgz"
+
           for target in darwin-arm64 darwin-x64 linux-arm64 linux-x64 windows-x64; do
-            npm publish "dist/npm/with-zi-zi-${target}-${version}.tgz" \
-              --access public \
-              --provenance \
-              --tag latest
+            publish "@with-zi/zi-${target}" "dist/npm/with-zi-zi-${target}-${version}.tgz"
           done
 
-          npm publish "dist/npm/with-zi-extension-api-${version}.tgz" \
-            --access public \
-            --provenance \
-            --tag latest
-
-          npm publish "dist/npm/with-zi-zi-${version}.tgz" \
-            --access public \
-            --provenance \
-            --tag latest
+          publish "@with-zi/zi" "dist/npm/with-zi-zi-${version}.tgz"
