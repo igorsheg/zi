@@ -51,7 +51,7 @@ The current product milestone is the [`custom-tool extension golden path`](exten
 
 ### 6. Make the path copyable
 
-- [ ] Publish `@with-zi/extension-api`; keep private coding-agent modules private.
+- [x] Publish `@with-zi/extension-api`; keep private coding-agent modules private.
 - [x] Ship `examples/extensions/custom-tool/` with an executable acceptance test.
 - [x] Add extension author documentation and source-attributed diagnostics.
 - [x] Pass the compiled example acceptance in the five-target release matrix.
