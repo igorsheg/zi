@@ -82,7 +82,7 @@ Native code mode is implemented as a default additive tool for data-dependent or
 - [x] Persist and present bounded nested evidence and include nested file operations in compaction accounting.
 - [x] Reserve `code` against extension conflicts and remove the prototype flag and code-only catalog.
 - [x] Record runtime, authority, ownership, and v1 scope in ADR 0024.
-- [ ] Pass the production compiled acceptance on all five release targets.
+- [x] Pass the production compiled acceptance on all five release targets.
 
 V1 remains stateless and deliberately excludes approvals, replay, rollback, snippets, connectors, and ambient network access.
 
