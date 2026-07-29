@@ -14,6 +14,7 @@ import {
 } from "../packages/coding-agent/src/extensions/protocol.js"
 import { extensionApiModuleSource } from "../packages/coding-agent/src/extensions/public-api-module.js"
 import { extensionWorkerArgument } from "../packages/coding-agent/src/extensions/worker-entry.js"
+import { runCodeModeAcceptance } from "./code-mode-acceptance.js"
 import { assertPinnedBunVersion, compileStandalone } from "./compile-zi.js"
 import { runExtensionCustomToolAcceptance } from "./extension-custom-tool-acceptance.js"
 
@@ -23,7 +24,7 @@ test("standalone compilation requires the workspace-pinned Bun runtime", () => {
   expect(() => assertPinnedBunVersion("1.3.14", "npm@11.4.2")).toThrow("packageManager must pin Bun exactly")
 })
 
-test("the compiled Zi executable runs the dedicated extension worker protocol", async () => {
+test("the compiled Zi executable runs its dedicated internal worker protocols", async () => {
   const temporary = await mkdtemp(join(tmpdir(), "zi-compiled-extension-worker-"))
   const executable = join(temporary, process.platform === "win32" ? "zi.exe" : "zi")
   const extension = join(temporary, "extension.ts")
@@ -321,6 +322,8 @@ export default function (zi: ExtensionAPI): void {
     ])
 
     await runExtensionCustomToolAcceptance({ executable, extensionSource: exampleExtension })
+
+    await runCodeModeAcceptance({ executable, cwd: temporary })
   } finally {
     child?.kill()
     await rm(temporary, { recursive: true, force: true })

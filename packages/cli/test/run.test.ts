@@ -4,6 +4,7 @@ import { tmpdir } from "node:os"
 import { join, resolve as resolvePath } from "node:path"
 
 import type { AgentMessage, AgentRuntime, AgentSessionRuntime, CreateAgentRuntimeOptions } from "@with-zi/coding-agent"
+import { codeModeWorkerArgument } from "@with-zi/coding-agent/internal/code-mode-worker-mode"
 import { extensionWorkerArgument } from "@with-zi/coding-agent/internal/extension-worker"
 import {
   createModels,
@@ -130,6 +131,9 @@ test("CLI argument defaults handle Bun scripts and compiled executables", () => 
   expect(defaultCliArgv(["bun", "/$bunfs/root/standalone", "-V"])).toEqual(["-V"])
   expect(defaultCliArgv(["bun", "-V"])).toEqual(["-V"])
   expect(defaultCliArgv(["C:\\tools\\zi.exe", "-V"])).toEqual(["-V"])
+  expect(defaultCliArgv(["C:\\tools\\zi.exe", "B:\\~BUN\\root\\standalone", codeModeWorkerArgument])).toEqual([
+    codeModeWorkerArgument
+  ])
   expect(defaultCliArgv(["C:\\tools\\zi.exe", "B:\\~BUN\\root\\standalone", extensionWorkerArgument])).toEqual([
     extensionWorkerArgument
   ])
@@ -832,6 +836,7 @@ function testHost(options: TestHostOptions): CliHost {
     stdinIsTTY: options.stdinIsTTY ?? true,
     stdoutIsTTY: options.stdoutIsTTY ?? true,
     extensionWorkerCommand: Object.freeze([process.execPath]),
+    codeModeWorkerCommand: Object.freeze([process.execPath]),
     async readStdin() {
       options.onReadStdin?.()
       return options.stdin

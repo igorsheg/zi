@@ -1,7 +1,7 @@
 # Product roadmap
 
 - Status: active
-- Updated: 2026-07-28
+- Updated: 2026-07-29
 
 This roadmap orders product work by downstream leverage. [`parity-roadmap.md`](parity-roadmap.md) remains the capability and provenance inventory; parity evidence no longer determines product priority by itself. Product choices follow the [`building-block strategy`](building-block-strategy.md).
 
@@ -70,6 +70,21 @@ Zi v0.1.13 shipped a versioned RPC mode over the existing `AgentSession` policy 
 - [x] Ship one copyable reference client tested against the compiled standalone executable.
 
 RPC should not introduce a universal frontend facade or duplicate session policy.
+
+## Ready — orchestrate tools without replacing them
+
+Native code mode is implemented as a default additive tool for data-dependent orchestration:
+
+- [x] Evaluate replacement and additive catalogs on opaque extension orchestration and an ordinary repository edit.
+- [x] Select QuickJS and prove its compiled single-file WASM variant on all five release targets.
+- [x] Isolate each code execution in one bounded, cancellable, self-hosted child worker.
+- [x] Preserve host-owned tool validation, expected errors, cancellation, deterministic mutation order, and termination.
+- [x] Persist and present bounded nested evidence and include nested file operations in compaction accounting.
+- [x] Reserve `code` against extension conflicts and remove the prototype flag and code-only catalog.
+- [x] Record runtime, authority, ownership, and v1 scope in ADR 0024.
+- [x] Pass the production compiled acceptance on all five release targets.
+
+V1 remains stateless and deliberately excludes approvals, replay, rollback, snippets, connectors, and ambient network access.
 
 ## Now — follow demonstrated pressure
 

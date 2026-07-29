@@ -32,6 +32,7 @@ import type {
   AuthenticationMethod,
   AuthenticationMethodType
 } from "./authentication.js"
+import type { CodeMode } from "./code-mode/code-mode.js"
 import {
   assertCustomInstructions,
   effectiveCompactionSettings,
@@ -249,6 +250,7 @@ export interface AgentSessionConfig {
   resources: SessionResources
   projectFileSearch: ProjectFileSearch
   tools: readonly AgentTool[]
+  codeMode?: CodeMode
   extensionHost?: ExtensionHost
   shell?: SessionShell
   model?: Model<Api>
@@ -412,6 +414,7 @@ export class AgentSession {
   readonly #modelRegistry: ModelRegistry
   readonly #resources: SessionResources
   readonly #projectFileSearch: ProjectFileSearch
+  readonly #codeMode: CodeMode | undefined
   readonly #extensionHost: ExtensionHost | undefined
   readonly #shell: SessionShell | undefined
   readonly #apiKeyProvider: string | undefined
@@ -443,6 +446,7 @@ export class AgentSession {
     this.#modelRegistry = config.modelRegistry
     this.#resources = config.resources
     this.#projectFileSearch = config.projectFileSearch
+    this.#codeMode = config.codeMode
     this.#extensionHost = config.extensionHost
     this.#activeTools = Object.freeze([...config.tools])
     this.#extensionLifecycle = config.extensionHost
@@ -1162,8 +1166,13 @@ export class AgentSession {
 
   #applyActiveTools(): void {
     const tools = admitExtensionTools(this.#activeTools, this.#extensionHost)
-    this.#agent.state.tools = [...tools]
-    this.#agent.state.systemPrompt = buildSystemPrompt(this.sessionManager.header.cwd, this.#resources, tools)
+    this.#agent.state.tools = this.#codeMode ? [...tools, this.#codeMode.createTool(tools)] : [...tools]
+    this.#agent.state.systemPrompt = buildSystemPrompt(
+      this.sessionManager.header.cwd,
+      this.#resources,
+      tools,
+      this.#codeMode !== undefined
+    )
   }
 
   dispose(reason: ExtensionShutdownReason = "quit"): void {

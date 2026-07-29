@@ -148,6 +148,14 @@ export default function (zi: ExtensionAPI): void {
     fauxAssistantMessage(fauxToolCall("repository_echo", { value: "accepted" }, { id: "extension-tool-1" }), {
       stopReason: "toolUse"
     }),
+    fauxAssistantMessage(
+      fauxToolCall(
+        "code",
+        { code: `async () => (await zi.repository_echo({ value: "nested" })).text` },
+        { id: "extension-code-1" }
+      ),
+      { stopReason: "toolUse" }
+    ),
     fauxAssistantMessage(fauxText("Extension completed."))
   ])
   const runtime = await createAgentRuntime({
@@ -161,12 +169,22 @@ export default function (zi: ExtensionAPI): void {
   try {
     await runtime.session.prompt("Use the repository echo tool.")
     const results = runtime.session.messages.filter(message => message.role === "toolResult")
-    expect(results).toHaveLength(1)
+    expect(results).toHaveLength(2)
     expect(results[0]).toMatchObject({
       toolCallId: "extension-tool-1",
       toolName: "repository_echo",
       content: [{ type: "text", text: "repository:accepted" }],
       details: { type: "extension", toolName: "repository_echo", outcome: "success" }
+    })
+    expect(results[1]).toMatchObject({
+      toolCallId: "extension-code-1",
+      toolName: "code",
+      content: [{ type: "text", text: "repository:nested" }],
+      details: {
+        type: "code_mode",
+        outcome: "success",
+        calls: [expect.objectContaining({ name: "repository_echo", state: "succeeded" })]
+      }
     })
     expect(runtime.session.extensionHostSnapshot).toMatchObject({ status: "ready", lifecycle: "started" })
   } finally {
@@ -341,9 +359,9 @@ test("AgentSession rejects extension tools that conflict with built-ins", async 
     join(extensionDir, "conflict.ts"),
     `import { Schema, type ExtensionAPI } from "@with-zi/extension-api"
 export default function (zi: ExtensionAPI): void {
-  zi.registerTool({
-    name: "read",
-    description: "Conflicts with built-in read",
+  for (const name of ["read", "code", "then"]) zi.registerTool({
+    name,
+    description: "Conflicts with built-in " + name,
     parameters: Schema.object({}),
     execute: () => "must not run"
   })
@@ -360,7 +378,17 @@ export default function (zi: ExtensionAPI): void {
         expect.objectContaining({
           path: expect.any(String),
           phase: "registration",
-          message: expect.stringContaining("conflicts with an existing session tool")
+          message: expect.stringContaining("read conflicts with an existing session tool")
+        }),
+        expect.objectContaining({
+          path: expect.any(String),
+          phase: "registration",
+          message: expect.stringContaining("code conflicts with an existing session tool")
+        }),
+        expect.objectContaining({
+          path: expect.any(String),
+          phase: "registration",
+          message: expect.stringContaining("then conflicts with an existing session tool")
         })
       ]
     })

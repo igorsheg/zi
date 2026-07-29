@@ -3,6 +3,53 @@ import { expect, test } from "bun:test"
 import { createEditTool } from "../src/tools/edit.js"
 import { projectToolPresentation } from "../src/tools/presentation/project.js"
 
+test("code presentation retains bounded nested activity and outcomes", () => {
+  const presentation = projectToolPresentation({
+    status: "running",
+    name: "code",
+    args: { code: "async () => zi.read({ path: 'src/index.ts' })" },
+    result: {
+      content: [{ type: "text", text: "Running write" }],
+      details: {
+        type: "code_mode",
+        outcome: "progress",
+        calls: [
+          {
+            state: "succeeded",
+            id: 0,
+            name: "read",
+            arguments: { path: "src/index.ts" },
+            startedAt: 1,
+            durationMs: 2,
+            result: "file contents"
+          },
+          {
+            state: "running",
+            id: 1,
+            name: "write",
+            arguments: { path: "src/output.ts" },
+            startedAt: 3,
+            preview: "Writing"
+          }
+        ],
+        logs: []
+      }
+    }
+  })
+
+  expect(presentation.header).toEqual({
+    label: "Code",
+    subject: { type: "text", text: "write" },
+    details: ["write · 1/2"]
+  })
+  expect(presentation.body).toEqual({
+    type: "text",
+    text: "✓ read src/index.ts — file contents\n… write src/output.ts — Writing",
+    tone: "normal"
+  })
+  expect(presentation.preview.compact).toEqual({ type: "tail", rows: 5 })
+})
+
 test("bash presentation separates bounded output from structured notices", () => {
   const path = "/tmp/zi/full-output.log"
   const presentation = projectToolPresentation({
