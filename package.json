@@ -30,6 +30,8 @@
     "lint:fix": "oxlint --fix .",
     "package:npm": "bun scripts/build-npm-packages.ts",
     "prepare": "lefthook install",
+    "probe:code-mode-agent": "bun scripts/code-mode-agent-eval-prototype.ts",
+    "probe:code-mode-coding": "bun scripts/code-mode-coding-eval-prototype.ts",
     "probe:code-mode-sandbox": "bun scripts/code-mode-sandbox-prototype.ts",
     "release:build": "bun scripts/build-release.ts",
     "start": "bun packages/cli/src/main.ts",

@@ -106,6 +106,7 @@ export async function createUnboundAgentRuntime(requested: CreateAgentRuntimeOpt
       ...(model ? { model } : {}),
       ...(options.thinkingLevel ? { thinkingLevel: options.thinkingLevel } : {}),
       ...(options.apiKey ? { apiKey: options.apiKey } : {}),
+      ...(options.codeModePrototype ? { codeModePrototype: true } : {}),
       tools: createCodingTools({ cwd: paths.cwd, shell })
     })
     return Object.freeze({

@@ -182,6 +182,7 @@ function runtimeOptions(args: CliInvocation, extensionWorkerCommand: readonly st
     extensionPaths: args.extensionPaths,
     extensionWorkerCommand,
     session: args.session,
+    ...(args.codeModePrototype ? { codeModePrototype: true } : {}),
     ...(args.sessionDir === undefined ? {} : { sessionDir: args.sessionDir }),
     ...(args.model === undefined ? {} : { model: args.model }),
     ...(args.thinkingLevel === undefined ? {} : { thinkingLevel: args.thinkingLevel }),

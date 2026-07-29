@@ -25,9 +25,13 @@ export interface CreateAgentRuntimeOptions {
   readonly settings?: Readonly<Partial<AgentSettings>>
   readonly extensionPaths?: readonly string[]
   readonly extensionWorkerCommand?: readonly string[]
+  readonly codeModePrototype?: boolean
 }
 
 export function snapshotAgentRuntimeOptions(options: CreateAgentRuntimeOptions): CreateAgentRuntimeOptions {
+  if (options.codeModePrototype !== undefined && typeof options.codeModePrototype !== "boolean") {
+    throw new Error("Code-mode prototype selection must be boolean")
+  }
   return Object.freeze({
     ...options,
     ...(options.session === undefined ? {} : { session: snapshotSession(options.session) }),

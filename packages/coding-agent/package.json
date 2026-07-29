@@ -23,10 +23,12 @@
   "dependencies": {
     "@earendil-works/pi-agent-core": "catalog:",
     "@earendil-works/pi-ai": "catalog:",
+    "@jitl/quickjs-singlefile-mjs-release-sync": "0.32.0",
     "@with-zi/extension-api": "workspace:*",
     "diff": "9.0.0",
     "ignore": "7.0.5",
     "proper-lockfile": "4.1.2",
+    "quickjs-emscripten-core": "0.32.0",
     "typebox": "catalog:",
     "yaml": "2.9.0"
   },

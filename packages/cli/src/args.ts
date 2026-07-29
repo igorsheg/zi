@@ -21,6 +21,7 @@ export interface ParsedArgs {
   readonly systemPrompt?: string
   readonly appendSystemPrompt?: readonly string[]
   readonly extensionPaths?: readonly string[]
+  readonly codeModePrototype?: boolean
   readonly session?: CliSession
   readonly mode?: CliMode
   readonly messages: readonly string[]
@@ -38,6 +39,7 @@ export interface CliInvocation {
   readonly systemPrompt?: string
   readonly appendSystemPrompt?: readonly string[]
   readonly extensionPaths: readonly string[]
+  readonly codeModePrototype?: boolean
   readonly session: CliSession
   readonly mode: CliMode
   readonly messages: readonly string[]
@@ -61,6 +63,7 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
   let systemPrompt: string | undefined
   let appendSystemPrompt: string[] | undefined
   let extensionPaths: string[] | undefined
+  let codeModePrototype = false
   let session: CliSession | undefined
   let mode: CliMode | undefined
   let help = false
@@ -117,6 +120,9 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
       extensionPaths ??= []
       extensionPaths.push(value)
       index = nextIndex
+    } else if (flag === "--code-mode-prototype") {
+      rejectInlineValue(flag, inlineValue)
+      codeModePrototype = true
     } else if (flag === "--resume" || flag === "-r") {
       const [file, nextIndex] = requiredValue(argv, index, flag, inlineValue)
       session = Object.freeze({ type: "resume", file })
@@ -163,6 +169,7 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
     ...(systemPrompt === undefined ? {} : { systemPrompt }),
     ...(appendSystemPrompt === undefined ? {} : { appendSystemPrompt: Object.freeze(appendSystemPrompt) }),
     ...(extensionPaths === undefined ? {} : { extensionPaths: Object.freeze(extensionPaths) }),
+    ...(codeModePrototype ? { codeModePrototype: true } : {}),
     ...(session === undefined ? {} : { session }),
     ...(mode === undefined ? {} : { mode })
   })
@@ -189,6 +196,7 @@ export function resolveCliInvocation(parsed: ParsedArgs, context: CliResolutionC
     cwd,
     agentDir,
     extensionPaths,
+    ...(parsed.codeModePrototype ? { codeModePrototype: true } : {}),
     session,
     mode,
     messages: parsed.messages,

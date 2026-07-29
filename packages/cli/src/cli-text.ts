@@ -17,6 +17,7 @@ Runtime:
       --append-system-prompt text
                               Append system prompt text; repeatable
       --extension path        Load an explicit extension source; repeatable
+      --code-mode-prototype   Replace direct tools with the experimental code tool
 
 Session:
   -r, --resume file           Resume a session file

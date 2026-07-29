@@ -3,10 +3,27 @@ import type { AgentTool } from "@earendil-works/pi-agent-core"
 import type { SessionResources } from "./resource-loader.js"
 import { formatSkillsForPrompt } from "./skills.js"
 
-export function buildSystemPrompt(cwd: string, resources: SessionResources, tools: readonly AgentTool[]): string {
+export function buildSystemPrompt(
+  cwd: string,
+  resources: SessionResources,
+  tools: readonly AgentTool[],
+  codeModePrototype = false
+): string {
   const prompt =
     resources.systemPrompt ??
-    `You are an expert coding assistant operating inside Zi.
+    (codeModePrototype
+      ? `You are an expert coding assistant operating inside Zi's experimental code mode.
+
+Available tool:
+- code: Execute JavaScript that orchestrates Zi's coding tools through the zi global
+
+Guidelines:
+- Use zi.read to inspect files instead of zi.bash with cat or sed
+- Use zi.edit for precise changes and zi.write for new files or complete rewrites
+- Return the useful final result from each code execution
+- Be concise
+- Show file paths clearly`
+      : `You are an expert coding assistant operating inside Zi.
 
 Available tools:
 - read: Read file contents
@@ -18,7 +35,7 @@ Guidelines:
 - Use read to inspect files instead of shelling out to cat or sed
 - Use edit for precise changes and write for new files or complete rewrites
 - Be concise
-- Show file paths clearly`
+- Show file paths clearly`)
 
   const sections = [prompt]
   if (resources.appendSystemPrompt.length > 0) sections.push(resources.appendSystemPrompt.join("\n\n"))
