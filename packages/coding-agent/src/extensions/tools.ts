@@ -14,9 +14,12 @@ export function admitExtensionTools(
   builtInTools: readonly AgentTool[],
   host: ExtensionHost | undefined
 ): readonly AgentTool[] {
+  if (builtInTools.some(tool => tool.name === "code")) {
+    throw new Error("The tool name code is reserved for native code mode")
+  }
   if (!host) return builtInTools
   const admitted: AgentTool[] = [...builtInTools]
-  const names = new Set(builtInTools.map(tool => tool.name))
+  const names = new Set([...builtInTools.map(tool => tool.name), "code"])
 
   for (const registration of host.toolCatalog()) {
     if (names.has(registration.name)) {

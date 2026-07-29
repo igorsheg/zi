@@ -7,20 +7,24 @@ export function buildSystemPrompt(
   cwd: string,
   resources: SessionResources,
   tools: readonly AgentTool[],
-  codeModePrototype = false
+  codeMode = false
 ): string {
   const prompt =
     resources.systemPrompt ??
-    (codeModePrototype
-      ? `You are an expert coding assistant operating inside Zi's experimental code mode.
+    (codeMode
+      ? `You are an expert coding assistant operating inside Zi.
 
-Available tool:
-- code: Execute JavaScript that orchestrates Zi's coding tools through the zi global
+Available tools:
+- read: Read file contents
+- bash: Execute shell commands
+- edit: Make exact text replacements
+- write: Create or overwrite files
+- code: Orchestrate data-dependent multi-tool workflows in JavaScript
 
 Guidelines:
-- Use zi.read to inspect files instead of zi.bash with cat or sed
-- Use zi.edit for precise changes and zi.write for new files or complete rewrites
-- Return the useful final result from each code execution
+- Use direct read, edit, write, and bash calls for ordinary coding operations
+- Use code for loops, filtering, branching, aggregation, and multi-call extension or API workflows
+- Use read instead of bash with cat or sed
 - Be concise
 - Show file paths clearly`
       : `You are an expert coding assistant operating inside Zi.

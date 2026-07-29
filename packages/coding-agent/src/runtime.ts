@@ -3,6 +3,7 @@ import { fileURLToPath } from "node:url"
 import { builtinModels } from "@earendil-works/pi-ai/providers/all"
 
 import type { AgentSession } from "./agent-session.js"
+import { CodeMode } from "./code-mode/code-mode.js"
 import { FileCredentialStore } from "./credential-store.js"
 import { discoverExtensionLoadPlan, type ExtensionDiscoveryDiagnostic } from "./extensions/discovery.js"
 import { createExtensionWorkerSpawner, ExtensionHost } from "./extensions/host.js"
@@ -98,15 +99,16 @@ export async function createUnboundAgentRuntime(requested: CreateAgentRuntimeOpt
     const sessionManager =
       selected.type === "resumed" ? selected.manager : SessionManager.create(paths, { persist: selected.persist })
     shell = new SessionShell({ cwd: paths.cwd, sessionId: sessionManager.sessionId })
+    const codeMode = new CodeMode(paths.cwd, options.codeModeWorkerCommand ?? defaultCodeModeWorkerCommand)
     const created = await createAgentSession({
       services,
       sessionManager,
       shell,
       extensionHost,
+      codeMode,
       ...(model ? { model } : {}),
       ...(options.thinkingLevel ? { thinkingLevel: options.thinkingLevel } : {}),
       ...(options.apiKey ? { apiKey: options.apiKey } : {}),
-      ...(options.codeModePrototype ? { codeModePrototype: true } : {}),
       tools: createCodingTools({ cwd: paths.cwd, shell })
     })
     return Object.freeze({
@@ -122,6 +124,10 @@ export async function createUnboundAgentRuntime(requested: CreateAgentRuntimeOpt
 }
 
 const defaultRuntimeSession: AgentRuntimeSessionIntent = Object.freeze({ type: "new", persist: true })
+const defaultCodeModeWorkerCommand = Object.freeze([
+  process.execPath,
+  fileURLToPath(new URL("./code-mode/worker-entry.ts", import.meta.url))
+])
 const defaultExtensionWorkerCommand = Object.freeze([
   process.execPath,
   fileURLToPath(new URL("./extensions/worker-entry.ts", import.meta.url))

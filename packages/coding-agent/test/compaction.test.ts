@@ -161,7 +161,8 @@ test("file details include only successful discarded tool operations", () => {
       [
         { type: "toolCall", id: "read", name: "read", arguments: { path: "z.ts" } },
         { type: "toolCall", id: "write", name: "write", arguments: { path: "a.ts" } },
-        { type: "toolCall", id: "failed", name: "edit", arguments: { path: "failed.ts" } }
+        { type: "toolCall", id: "failed", name: "edit", arguments: { path: "failed.ts" } },
+        { type: "toolCall", id: "code", name: "code", arguments: { code: "async () => {}" } }
       ],
       { stopReason: "toolUse" }
     )
@@ -180,6 +181,48 @@ test("file details include only successful discarded tool operations", () => {
       timestamp: 3
     })
   }
+  session.appendMessage({
+    role: "toolResult",
+    toolCallId: "code",
+    toolName: "code",
+    content: [{ type: "text", text: "nested result" }],
+    details: {
+      type: "code_mode",
+      outcome: "success",
+      calls: [
+        {
+          state: "succeeded",
+          id: 0,
+          name: "read",
+          arguments: { path: "nested-read.ts" },
+          startedAt: 1,
+          durationMs: 1,
+          result: "read"
+        },
+        {
+          state: "succeeded",
+          id: 1,
+          name: "edit",
+          arguments: { path: "nested-edit.ts" },
+          startedAt: 2,
+          durationMs: 1,
+          result: "edited"
+        },
+        {
+          state: "failed",
+          id: 2,
+          name: "write",
+          arguments: { path: "nested-failed.ts" },
+          startedAt: 3,
+          durationMs: 1,
+          error: "failed"
+        }
+      ],
+      logs: []
+    },
+    isError: false,
+    timestamp: 3
+  })
   session.appendMessage({ role: "user", content: "recent", timestamp: 4 })
   session.appendMessage(fauxAssistantMessage("done"))
   const settings = effectiveCompactionSettings(
@@ -190,8 +233,8 @@ test("file details include only successful discarded tool operations", () => {
   if (preparation.type !== "ready") throw new Error("Expected compaction plan")
 
   expect(preparation.plan.details).toEqual({
-    readFiles: ["z.ts"],
-    modifiedFiles: ["a.ts"],
+    readFiles: ["nested-read.ts", "z.ts"],
+    modifiedFiles: ["a.ts", "nested-edit.ts"],
     omittedReadFiles: 0,
     omittedModifiedFiles: 0
   })

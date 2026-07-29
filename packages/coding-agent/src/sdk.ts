@@ -3,7 +3,8 @@ import { clampThinkingLevel, type Api, type Model } from "@earendil-works/pi-ai"
 
 import { AgentSession } from "./agent-session.js"
 import { Authentication } from "./authentication.js"
-import { CodeModePrototype } from "./code-mode-prototype.js"
+import type { CodeMode } from "./code-mode/code-mode.js"
+import { isCodeModeDetails } from "./code-mode/trace.js"
 import type { FileCredentialStore } from "./credential-store.js"
 import { DEFAULT_THINKING_LEVEL } from "./defaults.js"
 import type { ExtensionHost } from "./extensions/host.js"
@@ -67,7 +68,7 @@ export interface CreateAgentSessionOptions {
   readonly shell?: SessionShell
   readonly extensionHost?: ExtensionHost
   readonly resources?: SessionResources
-  readonly codeModePrototype?: boolean
+  readonly codeMode?: CodeMode
 }
 
 /** Build one session from caller-owned services. The caller owns the returned session's disposal. */
@@ -100,12 +101,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions): Pr
   const thinkingLevel = model ? clampThinkingLevel(model, preferredThinking) : "off"
   const bootstrapDiagnostic = createBootstrapDiagnostic(unavailableSessionModel, model)
   const tools = admitExtensionTools(options.tools, options.extensionHost)
-  const codeModePrototype = options.codeModePrototype ? new CodeModePrototype() : undefined
-  const modelTools = codeModePrototype ? [codeModePrototype.createTool(tools)] : tools
+  const modelTools = options.codeMode ? [...tools, options.codeMode.createTool(tools)] : tools
 
   const agent = new Agent({
     initialState: {
-      systemPrompt: buildSystemPrompt(sessionManager.header.cwd, resources, tools, codeModePrototype !== undefined),
+      systemPrompt: buildSystemPrompt(sessionManager.header.cwd, resources, tools, options.codeMode !== undefined),
       ...(model ? { model } : {}),
       thinkingLevel,
       tools: [...modelTools],
@@ -124,7 +124,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions): Pr
     followUpMode: settings.followUpMode,
     toolExecution: "parallel",
     afterToolCall: async ({ toolCall, result, isError }) =>
-      !isError && isBuiltInToolError(toolCall.name, result.details) ? { isError: true } : undefined
+      !isError &&
+      (isBuiltInToolError(toolCall.name, result.details) ||
+        (toolCall.name === "code" && isCodeModeDetails(result.details) && result.details.outcome === "error"))
+        ? { isError: true }
+        : undefined
   })
 
   switch (bootstrap.type) {
@@ -148,7 +152,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions): Pr
     resources,
     projectFileSearch: new ProjectFileSearch(services.paths),
     tools: options.tools,
-    ...(codeModePrototype ? { codeModePrototype } : {}),
+    ...(options.codeMode ? { codeMode: options.codeMode } : {}),
     ...(options.extensionHost ? { extensionHost: options.extensionHost } : {}),
     ...(options.shell ? { shell: options.shell } : {}),
     ...(model ? { model } : {}),

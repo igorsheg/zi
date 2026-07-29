@@ -14,6 +14,11 @@ try {
     case "version":
       await Bun.stdout.write(versionText)
       break
+    case "code_mode_worker": {
+      const { runCodeModeWorkerFromStdio } = await import("@with-zi/coding-agent/internal/code-mode-worker")
+      await runCodeModeWorkerFromStdio()
+      break
+    }
     case "extension_worker": {
       const { runExtensionWorkerFromStdio } = await import("@with-zi/coding-agent/internal/extension-worker")
       await runExtensionWorkerFromStdio()

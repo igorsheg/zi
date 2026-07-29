@@ -48,10 +48,11 @@ The target is coding-agent architecture parity and observable product-behavior p
 - [x] Slash-command completion and `@` project-file completion
 - [x] Conversation scrolling, follow-tail, unseen-line hint, selection/copy
 - [x] Composer session-history recall with multiline boundary movement and exact draft restoration
-- [x] Typed tool-result and semantic-presentation cutover with transcript-item spacing and open-rail polish for all six active built-ins
+- [x] Typed tool-result and semantic-presentation cutover with transcript-item spacing and open-rail polish for all six direct built-ins and additive code mode
 - [x] Settings: global and project scope
 - [x] Print, JSON, and versioned RPC modes sharing the same `AgentSession`
 - [x] Authentication commands and composer-owned provider flows
+- [x] Isolated additive code mode with bounded nested evidence and a release-matrix acceptance contract
 
 `@` project-file autocomplete is implemented from [`docs/file-autocomplete-implementation-spec.md`](file-autocomplete-implementation-spec.md). Zi preserves Pi's textual completion behavior while moving bounded Git/fallback search into coding-agent, restricting scope to the exact project cwd, and keeping accepted references ordinary prompt text. Unlike Pi's editor, exact file text and unmatched refinements become quiet, Escape suppresses the whole token, and visible results remain stable while a changed query is rescored.
 

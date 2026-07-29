@@ -1,4 +1,5 @@
 import { projectBash } from "./bash.js"
+import { projectCodeTool } from "./code.js"
 import { projectEdit } from "./edit.js"
 import { projectGeneric } from "./generic.js"
 import { projectRead } from "./read.js"
@@ -11,6 +12,9 @@ export function projectToolPresentation(source: ToolPresentationSource): ToolPre
   switch (source.name) {
     case "bash":
       presentation = projectBash(source)
+      break
+    case "code":
+      presentation = projectCodeTool(source)
       break
     case "read":
       presentation = projectRead(source)

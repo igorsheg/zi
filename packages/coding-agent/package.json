@@ -8,6 +8,8 @@
     ".": "./src/index.ts",
     "./internal/extension-worker": "./src/extensions/worker-entry.ts",
     "./internal/extension-worker-mode": "./src/extensions/worker-mode.ts",
+    "./internal/code-mode-worker": "./src/code-mode/worker-entry.ts",
+    "./internal/code-mode-worker-mode": "./src/code-mode/worker-mode.ts",
     "./testing": "./src/testing.ts"
   },
   "scripts": {
@@ -25,6 +27,7 @@
     "@earendil-works/pi-ai": "catalog:",
     "@jitl/quickjs-singlefile-mjs-release-sync": "0.32.0",
     "@with-zi/extension-api": "workspace:*",
+    "acorn": "8.17.0",
     "diff": "9.0.0",
     "ignore": "7.0.5",
     "proper-lockfile": "4.1.2",

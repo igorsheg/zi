@@ -5,13 +5,11 @@
     "": {
       "name": "zi-workspace",
       "devDependencies": {
-        "@jitl/quickjs-singlefile-mjs-release-sync": "0.32.0",
         "@types/bun": "catalog:",
         "lefthook": "2.1.10",
         "oxfmt": "0.58.0",
         "oxlint": "1.73.0",
         "oxlint-tsgolint": "0.24.0",
-        "quickjs-emscripten-core": "0.32.0",
         "typescript": "catalog:",
       },
     },
@@ -38,6 +36,7 @@
         "@earendil-works/pi-ai": "catalog:",
         "@jitl/quickjs-singlefile-mjs-release-sync": "0.32.0",
         "@with-zi/extension-api": "workspace:*",
+        "acorn": "8.17.0",
         "diff": "9.0.0",
         "ignore": "7.0.5",
         "proper-lockfile": "4.1.2",
@@ -350,6 +349,8 @@
     "@with-zi/extension-api": ["@with-zi/extension-api@workspace:packages/extension-api"],
 
     "@with-zi/tui": ["@with-zi/tui@workspace:packages/tui"],
+
+    "acorn": ["acorn@8.17.0", "", { "bin": { "acorn": "bin/acorn" } }, "sha512-xRQbDb9BnwDafYNn6Vwl839DYVjqXYb1XVGtWAZ1kcDc6iwAL4hg3B1dZlRiuENFeO2H53gFG3in621AdERVAg=="],
 
     "agent-base": ["agent-base@7.1.4", "", {}, "sha512-MnA+YT8fwfJPgBx3m60MNqakm30XOkyIoH1y6huTQvC0PwZG7ki8NacLBcrPbNoo8vEZy7Jpuk7+jMO+CUovTQ=="],
 

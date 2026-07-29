@@ -32,6 +32,22 @@ _Avoid_: Global process manager, TUI task registry, detached Bash process
 The bounded, typed, client-neutral facts a built-in tool returns separately from model-facing content. They describe progress or outcome without requiring a client to parse explanatory prose.
 _Avoid_: UI metadata, rendered result, tool payload
 
+**Code mode**:
+The default additive Zi tool for executing generated JavaScript that orchestrates an immutable admitted catalog of direct and extension tools. It is for data-dependent loops, branching, filtering, aggregation, and multi-call workflows; ordinary coding keeps direct tools.
+_Avoid_: Tool replacement, feature flag, script runner, shell alias
+
+**Code execution**:
+One stateless `code` invocation and its single owner of child-process lifetime, VM limits, deadline, cancellation, serialized nested calls, bounded trace, outcome, and cleanup. It is the only transcript tool identity for its nested work.
+_Avoid_: Agent turn, transaction, reusable sandbox, nested session
+
+**Code worker**:
+The isolated child process that owns one bounded QuickJS runtime and exchanges versioned framed messages with its host. Generated code receives only `console` and the `zi` proxy; the worker has no host effects and the guest has no ambient process, module, filesystem, credential, or network authority.
+_Avoid_: Extension worker, coding-agent process, security approval boundary
+
+**Nested tool trace**:
+The bounded durable evidence projected from calls made during one code execution: admitted arguments such as paths, commands, or operations; current activity; outcomes; durations; short result/error previews; and console logs. Full nested results remain transient protocol data.
+_Avoid_: Nested transcript, replay log, rollback journal, copied tool timeline
+
 **Tool presentation**:
 A bounded, framework-neutral display value derived from one tool invocation's arguments, lifecycle phase, content, and result details. It is never persisted or authoritative; terminal layout and native resources remain TUI-owned.
 _Avoid_: Tool view model, render callback, tool component

@@ -28,6 +28,7 @@ export interface CliHost {
   readonly stdinIsTTY: boolean
   readonly stdoutIsTTY: boolean
   readonly extensionWorkerCommand: readonly string[]
+  readonly codeModeWorkerCommand: readonly string[]
   readStdin(): Promise<string | undefined>
   writeStdout(chunk: string): Promise<void>
   writeStderr(chunk: string): Promise<void>
@@ -108,10 +109,12 @@ export async function runCli(argv: readonly string[], host: CliHost): Promise<nu
   let sessionRuntime: AgentSessionRuntime | undefined
   try {
     if (mode === "interactive") {
-      sessionRuntime = await host.createSessionRuntime(runtimeOptions(args, host.extensionWorkerCommand))
+      sessionRuntime = await host.createSessionRuntime(
+        runtimeOptions(args, host.extensionWorkerCommand, host.codeModeWorkerCommand)
+      )
       runtime = sessionRuntime
     } else {
-      runtime = await host.createRuntime(runtimeOptions(args, host.extensionWorkerCommand))
+      runtime = await host.createRuntime(runtimeOptions(args, host.extensionWorkerCommand, host.codeModeWorkerCommand))
     }
   } catch (cause) {
     await host.writeStderr(`${errorMessage(cause)}\n`)
@@ -175,14 +178,18 @@ export async function runCli(argv: readonly string[], host: CliHost): Promise<nu
   return exitCode
 }
 
-function runtimeOptions(args: CliInvocation, extensionWorkerCommand: readonly string[]): CreateAgentRuntimeOptions {
+function runtimeOptions(
+  args: CliInvocation,
+  extensionWorkerCommand: readonly string[],
+  codeModeWorkerCommand: readonly string[]
+): CreateAgentRuntimeOptions {
   return {
     cwd: args.cwd,
     agentDir: args.agentDir,
     extensionPaths: args.extensionPaths,
     extensionWorkerCommand,
+    codeModeWorkerCommand,
     session: args.session,
-    ...(args.codeModePrototype ? { codeModePrototype: true } : {}),
     ...(args.sessionDir === undefined ? {} : { sessionDir: args.sessionDir }),
     ...(args.model === undefined ? {} : { model: args.model }),
     ...(args.thinkingLevel === undefined ? {} : { thinkingLevel: args.thinkingLevel }),

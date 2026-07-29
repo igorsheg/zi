@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test"
-import { mkdtemp, readFile } from "node:fs/promises"
+import { mkdtemp, readFile, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
@@ -31,7 +31,8 @@ test("built-in expected failures keep typed details and are finalized as Pi erro
           { id: "edit-error" }
         ),
         fauxToolCall("task_output", { taskId: "missing-task" }, { id: "output-error" }),
-        fauxToolCall("kill_task", { taskId: "missing-task" }, { id: "kill-error" })
+        fauxToolCall("kill_task", { taskId: "missing-task" }, { id: "kill-error" }),
+        fauxToolCall("code", { code: `async () => { throw new Error("expected code failure") }` }, { id: "code-error" })
       ],
       { stopReason: "toolUse" }
     ),
@@ -47,7 +48,7 @@ test("built-in expected failures keep typed details and are finalized as Pi erro
   try {
     await session.prompt("Exercise expected tool failures.")
     const results = session.messages.filter(message => message.role === "toolResult")
-    expect(results).toHaveLength(6)
+    expect(results).toHaveLength(7)
     for (const result of results) {
       expect(result.isError).toBe(true)
       expect(result.details).toMatchObject({ outcome: "error" })
@@ -56,6 +57,58 @@ test("built-in expected failures keep typed details and are finalized as Pi erro
     expect(JSON.stringify(results.find(result => result.toolCallId === "output-error")?.details)).not.toContain(
       '"text"'
     )
+  } finally {
+    session.dispose()
+  }
+})
+
+test("code runs through the normal turn lifecycle with durable nested evidence", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-code-turn-"))
+  await writeFile(join(root, "input.txt"), "needle\n")
+  const models = createModels()
+  const faux = fauxProvider({ tokensPerSecond: 10_000 })
+  models.setProvider(faux.provider)
+  faux.setResponses([
+    fauxAssistantMessage(
+      fauxToolCall(
+        "code",
+        {
+          code: `async () => {
+  const file = await zi.read({ path: "input.txt" });
+  return file.text.includes("needle");
+}`
+        },
+        { id: "code-1" }
+      ),
+      { stopReason: "toolUse" }
+    ),
+    fauxAssistantMessage("Nested evidence observed.")
+  ])
+  const { session } = await createAgentRuntime({
+    cwd: root,
+    model: "faux/faux-1",
+    models,
+    session: { type: "new", persist: false }
+  })
+  const events: string[] = []
+  session.subscribe(event => events.push(event.type))
+
+  try {
+    await session.prompt("Inspect input through code.")
+    const result = session.messages.find(message => message.role === "toolResult" && message.toolCallId === "code-1")
+    expect(result).toMatchObject({
+      role: "toolResult",
+      toolName: "code",
+      isError: false,
+      content: [{ type: "text", text: "true" }],
+      details: {
+        type: "code_mode",
+        outcome: "success",
+        calls: [expect.objectContaining({ name: "read", state: "succeeded", arguments: { path: "input.txt" } })]
+      }
+    })
+    expect(events.filter(event => event === "tool_execution_start")).toHaveLength(1)
+    expect(events.filter(event => event === "tool_execution_end")).toHaveLength(1)
   } finally {
     session.dispose()
   }

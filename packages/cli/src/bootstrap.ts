@@ -1,6 +1,7 @@
+import { codeModeWorkerArgument } from "@with-zi/coding-agent/internal/code-mode-worker-mode"
 import { extensionWorkerArgument } from "@with-zi/coding-agent/internal/extension-worker-mode"
 
-export type StandaloneRoute = "help" | "version" | "extension_worker" | "main"
+export type StandaloneRoute = "help" | "version" | "code_mode_worker" | "extension_worker" | "main"
 
 export function standaloneRoute(argv: readonly string[]): StandaloneRoute {
   if (argv.length !== 1) return "main"
@@ -11,6 +12,8 @@ export function standaloneRoute(argv: readonly string[]): StandaloneRoute {
     case "-V":
     case "--version":
       return "version"
+    case codeModeWorkerArgument:
+      return "code_mode_worker"
     case extensionWorkerArgument:
       return "extension_worker"
     default:
@@ -20,6 +23,7 @@ export function standaloneRoute(argv: readonly string[]): StandaloneRoute {
 
 export function defaultCliArgv(argv: readonly string[] = process.argv): readonly string[] {
   // Bun standalone argv includes a virtual script path whose Windows spelling has changed across releases.
+  if (argv.at(-1) === codeModeWorkerArgument) return [codeModeWorkerArgument]
   if (argv.at(-1) === extensionWorkerArgument) return [extensionWorkerArgument]
   const second = argv[1]
   if (!second) return []

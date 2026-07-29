@@ -25,13 +25,10 @@ export interface CreateAgentRuntimeOptions {
   readonly settings?: Readonly<Partial<AgentSettings>>
   readonly extensionPaths?: readonly string[]
   readonly extensionWorkerCommand?: readonly string[]
-  readonly codeModePrototype?: boolean
+  readonly codeModeWorkerCommand?: readonly string[]
 }
 
 export function snapshotAgentRuntimeOptions(options: CreateAgentRuntimeOptions): CreateAgentRuntimeOptions {
-  if (options.codeModePrototype !== undefined && typeof options.codeModePrototype !== "boolean") {
-    throw new Error("Code-mode prototype selection must be boolean")
-  }
   return Object.freeze({
     ...options,
     ...(options.session === undefined ? {} : { session: snapshotSession(options.session) }),
@@ -45,7 +42,10 @@ export function snapshotAgentRuntimeOptions(options: CreateAgentRuntimeOptions):
       : { extensionPaths: snapshotStrings(options.extensionPaths, maxExplicitExtensionPaths, "Extension paths") }),
     ...(options.extensionWorkerCommand === undefined
       ? {}
-      : { extensionWorkerCommand: snapshotStrings(options.extensionWorkerCommand, 16, "Extension worker command") })
+      : { extensionWorkerCommand: snapshotStrings(options.extensionWorkerCommand, 16, "Extension worker command") }),
+    ...(options.codeModeWorkerCommand === undefined
+      ? {}
+      : { codeModeWorkerCommand: snapshotStrings(options.codeModeWorkerCommand, 16, "Code-mode worker command") })
   })
 }
 

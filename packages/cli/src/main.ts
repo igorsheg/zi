@@ -4,6 +4,7 @@ import { homedir } from "node:os"
 import { resolve } from "node:path"
 
 import { runRpcMode } from "@with-zi/coding-agent"
+import { codeModeWorkerArgument } from "@with-zi/coding-agent/internal/code-mode-worker-mode"
 import { extensionWorkerArgument } from "@with-zi/coding-agent/internal/extension-worker-mode"
 
 import { defaultCliArgv } from "./bootstrap.js"
@@ -25,6 +26,11 @@ export async function main(argv: readonly string[] = defaultCliArgv()): Promise<
 }
 
 export async function runEntrypoint(argv: readonly string[] = defaultCliArgv()): Promise<number> {
+  if (argv.length === 1 && argv[0] === codeModeWorkerArgument) {
+    const { runCodeModeWorkerFromStdio } = await import("@with-zi/coding-agent/internal/code-mode-worker")
+    await runCodeModeWorkerFromStdio()
+    return 0
+  }
   if (argv.length === 1 && argv[0] === extensionWorkerArgument) {
     const { runExtensionWorkerFromStdio } = await import("@with-zi/coding-agent/internal/extension-worker")
     await runExtensionWorkerFromStdio()
@@ -44,6 +50,7 @@ export function createProcessHost(forceInteractive: boolean): CliHost {
     stdinIsTTY: forceInteractive || process.stdin.isTTY,
     stdoutIsTTY: forceInteractive || process.stdout.isTTY,
     extensionWorkerCommand: currentZiCommand(),
+    codeModeWorkerCommand: currentZiCommand(),
     readStdin: readPipedStdin,
     writeStdout: chunk => writeOutput(Bun.stdout, chunk),
     writeStderr: chunk => writeOutput(Bun.stderr, chunk),

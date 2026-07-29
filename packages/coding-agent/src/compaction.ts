@@ -1,6 +1,7 @@
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core"
 import { isContextOverflow, type Api, type AssistantMessage, type Context, type Model } from "@earendil-works/pi-ai"
 
+import { isCodeModeDetails } from "./code-mode/trace.js"
 import { formatCompactionSummary, type AgentMessage } from "./messages.js"
 import {
   maxCompactionFilePaths,
@@ -471,7 +472,23 @@ function collectCompactionDetails(
       }
       continue
     }
-    if (message.role !== "toolResult" || message.isError) continue
+    if (message.role !== "toolResult") continue
+    if (message.toolName === "code" && isCodeModeDetails(message.details)) {
+      for (const nested of message.details.calls) {
+        if (
+          nested.state !== "succeeded" ||
+          (nested.name !== "read" && nested.name !== "write" && nested.name !== "edit") ||
+          !isRecord(nested.arguments) ||
+          typeof nested.arguments.path !== "string"
+        ) {
+          continue
+        }
+        if (nested.name === "read") read.add(nested.arguments.path)
+        else modified.add(nested.arguments.path)
+      }
+      continue
+    }
+    if (message.isError) continue
     const call = calls.get(message.toolCallId)
     if (!call) continue
     if (call.name === "read") read.add(call.path)

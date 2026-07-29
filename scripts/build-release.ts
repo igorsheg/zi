@@ -3,6 +3,7 @@
 import { chmod, mkdir, rm } from "node:fs/promises"
 import { basename, join, resolve } from "node:path"
 
+import { runCodeModeAcceptance } from "./code-mode-acceptance.js"
 import { compileZi } from "./compile-zi.js"
 import { runExtensionCustomToolAcceptance } from "./extension-custom-tool-acceptance.js"
 
@@ -82,6 +83,7 @@ async function buildRelease(options: ReleaseBuildOptions): Promise<void> {
     await compileZi({ outfile: executable, version: options.version })
     if (process.platform !== "win32") await chmod(executable, 0o755)
     await runExtensionCustomToolAcceptance({ executable })
+    await runCodeModeAcceptance({ executable, cwd: packageDirectory })
     await run(["tar", "-czf", archive, "-C", outputDirectory, packageName], {
       cwd: root,
       env: { ...process.env, COPYFILE_DISABLE: "1" }
