@@ -4,7 +4,7 @@ import { finished } from "node:stream/promises"
 
 import { runExtensionWorkerProcess } from "./worker.js"
 
-export const extensionWorkerArgument = "--zi-internal-extension-worker"
+export { extensionWorkerArgument } from "./worker-mode.js"
 
 export async function runExtensionWorkerFromStdio(): Promise<void> {
   const output = createProtocolOutput(3)

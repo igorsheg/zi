@@ -7,6 +7,7 @@
   "exports": {
     ".": "./src/index.ts",
     "./internal/extension-worker": "./src/extensions/worker-entry.ts",
+    "./internal/extension-worker-mode": "./src/extensions/worker-mode.ts",
     "./testing": "./src/testing.ts"
   },
   "scripts": {

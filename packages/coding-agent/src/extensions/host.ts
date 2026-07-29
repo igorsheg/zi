@@ -40,7 +40,7 @@ import {
   validateWorkerMessage
 } from "./protocol.js"
 import { extensionApiModuleSource } from "./public-api-module.js"
-import { extensionWorkerArgument } from "./worker-entry.js"
+import { extensionWorkerArgument } from "./worker-mode.js"
 
 export interface ExtensionWorkerExit {
   readonly code: number | null

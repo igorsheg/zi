@@ -4,8 +4,9 @@ import { homedir } from "node:os"
 import { resolve } from "node:path"
 
 import { runRpcMode } from "@with-zi/coding-agent"
-import { extensionWorkerArgument, runExtensionWorkerFromStdio } from "@with-zi/coding-agent/internal/extension-worker"
+import { extensionWorkerArgument } from "@with-zi/coding-agent/internal/extension-worker-mode"
 
+import { defaultCliArgv } from "./bootstrap.js"
 import {
   defaultRuntimeFactory,
   defaultSessionRuntimeFactory,
@@ -15,6 +16,8 @@ import {
   type CliSignal
 } from "./run.js"
 
+export { defaultCliArgv } from "./bootstrap.js"
+
 export const interactiveAcceptanceArgument = "--zi-internal-interactive-acceptance"
 
 export async function main(argv: readonly string[] = defaultCliArgv()): Promise<number> {
@@ -23,6 +26,7 @@ export async function main(argv: readonly string[] = defaultCliArgv()): Promise<
 
 export async function runEntrypoint(argv: readonly string[] = defaultCliArgv()): Promise<number> {
   if (argv.length === 1 && argv[0] === extensionWorkerArgument) {
+    const { runExtensionWorkerFromStdio } = await import("@with-zi/coding-agent/internal/extension-worker")
     await runExtensionWorkerFromStdio()
     return 0
   }
@@ -30,17 +34,6 @@ export async function runEntrypoint(argv: readonly string[] = defaultCliArgv()):
     return runCli(argv.slice(0, -1), createProcessHost(true))
   }
   return main(argv)
-}
-
-export function defaultCliArgv(argv: readonly string[] = process.argv): readonly string[] {
-  // Bun standalone argv includes a virtual script path whose Windows spelling has changed across releases.
-  if (argv.at(-1) === extensionWorkerArgument) return [extensionWorkerArgument]
-  const second = argv[1]
-  if (!second) return []
-  if (second.startsWith("-")) return argv.slice(1)
-  if (second.includes("$bunfs") || /\.[cm]?[jt]sx?$/.test(second)) return argv.slice(2)
-  if (/(^|[\\/])bun(?:\.exe)?$/i.test(argv[0] ?? "")) return argv.slice(2)
-  return argv.slice(1)
 }
 
 export function createProcessHost(forceInteractive: boolean): CliHost {
