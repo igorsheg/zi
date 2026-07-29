@@ -162,7 +162,8 @@ test("tool protocol validation closes registration, arguments, results, and corr
     name: "echo_message",
     label: "Echo message",
     description: "Echo one message",
-    parameters: { type: "object", required: ["message"], properties: { message: { type: "string" } } }
+    parameters: { type: "object", required: ["message"], properties: { message: { type: "string" } } },
+    outputSchema: { type: "object", required: ["echoed"], properties: { echoed: { type: "string" } } }
   }
   const ready = validateWorkerMessage({
     type: "ready",
@@ -206,6 +207,15 @@ test("tool protocol validation closes registration, arguments, results, and corr
       protocolVersion: extensionProtocolVersion,
       generation: 1,
       extensions: [{ source, status: "loaded" }],
+      tools: [{ ...registration, outputSchema: undefined }]
+    })
+  ).toThrow("output schema")
+  expect(() =>
+    validateWorkerMessage({
+      type: "ready",
+      protocolVersion: extensionProtocolVersion,
+      generation: 1,
+      extensions: [{ source, status: "loaded" }],
       tools: [{ ...registration, parameters: { type: "object", properties: { value: { type: "future" } } } }]
     })
   ).toThrow("unsupported type")
@@ -223,9 +233,12 @@ test("tool protocol validation closes registration, arguments, results, and corr
       type: "tool_result",
       generation: 1,
       requestId: 2,
-      content: "x".repeat(maxExtensionToolResultBytes + 1)
+      value: "x".repeat(maxExtensionToolResultBytes + 1)
     })
   ).toThrow(`${maxExtensionToolResultBytes} bytes`)
+  expect(
+    validateWorkerMessage({ type: "tool_result", generation: 1, requestId: 2, value: { echoed: "hello" } })
+  ).toEqual({ type: "tool_result", generation: 1, requestId: 2, value: { echoed: "hello" } })
 })
 
 test("session-operation protocol validates source, values, delivery, and bounded results", () => {
@@ -318,7 +331,8 @@ test("tool catalogs have one aggregate ready-frame budget", () => {
     name: `tool_${index}`,
     label: `Tool ${index}`,
     description: "d".repeat(maxExtensionToolDescriptionBytes),
-    parameters: { type: "object", description: "s".repeat(maxExtensionToolSchemaBytes - 64), properties: {} }
+    parameters: { type: "object", description: "s".repeat(maxExtensionToolSchemaBytes - 64), properties: {} },
+    outputSchema: { type: "string" }
   }))
 
   expect(() =>
@@ -351,7 +365,8 @@ test("maximum source results and an aggregate tool catalog fit one ready frame",
     name: `tool_${index}`,
     label: `Tool ${index}`,
     description: '"'.repeat(3_000),
-    parameters: { type: "object", properties: {} }
+    parameters: { type: "object", properties: {} },
+    outputSchema: { type: "string" }
   }))
   const message = validateWorkerMessage({
     type: "ready",

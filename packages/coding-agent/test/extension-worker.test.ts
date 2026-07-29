@@ -97,7 +97,8 @@ export default function (zi): void {
       name: "echo_message",
       label: "Echo",
       description: "Echo one message",
-      parameters: { type: "object", properties: { message: { type: "string" } } }
+      parameters: { type: "object", properties: { message: { type: "string" } } },
+      outputSchema: { type: "string" }
     }
   ])
   await generation.dispatch({ type: "session_start", reason: "startup" })
@@ -107,6 +108,48 @@ export default function (zi): void {
     "Invalid arguments"
   )
   expect(await readFile(log, "utf8")).toBe("hello:false\n")
+})
+
+test("worker validates structured tool outputs against their declared schema", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-extension-worker-output-"))
+  const extension = await writeExtension(
+    root,
+    "structured.ts",
+    `import { Schema } from ${JSON.stringify(extensionApi)}
+export default function (zi): void {
+  const outputSchema = Schema.object({ count: Schema.integer(), label: Schema.string() })
+  zi.registerTool({
+    name: "structured_result",
+    description: "Return a structured result",
+    parameters: Schema.object({ count: Schema.integer() }),
+    outputSchema,
+    execute: ({ count }) => ({ count, label: String(count) })
+  })
+  zi.registerTool({
+    name: "invalid_result",
+    description: "Return an invalid result",
+    parameters: Schema.object({}),
+    outputSchema,
+    execute: () => ({ count: "wrong", label: "invalid" })
+  })
+}
+`
+  )
+
+  const generation = await loadExtensionGeneration(extensionPlan(root, [extension]), 1)
+  expect(generation.tools).toMatchObject([
+    { name: "structured_result", outputSchema: { type: "object" } },
+    { name: "invalid_result", outputSchema: { type: "object" } }
+  ])
+  await generation.dispatch({ type: "session_start", reason: "startup" })
+
+  expect(await generation.invoke("structured_result", { count: 3 }, new AbortController().signal)).toEqual({
+    count: 3,
+    label: "3"
+  })
+  expect(generation.invoke("invalid_result", {}, new AbortController().signal)).rejects.toThrow(
+    "Invalid result for extension tool invalid_result"
+  )
 })
 
 test("invalid and duplicate tool registrations fail only their source", async () => {

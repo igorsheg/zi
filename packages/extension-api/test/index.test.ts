@@ -15,6 +15,16 @@ async function sessionOperations(api: ExtensionAPI): Promise<void> {
   await api.sendMessage({ customType: "example.counter", content: "updated", display: true }, "later")
 }
 
+function registerStructuredTool(api: ExtensionAPI): void {
+  api.registerTool({
+    name: "double_value",
+    description: "Double one value",
+    parameters: Schema.object({ value: Schema.integer() }),
+    outputSchema: Schema.object({ doubled: Schema.integer() }),
+    execute: ({ value }) => ({ doubled: value * 2 })
+  })
+}
+
 function invalidSchemas(): void {
   // @ts-expect-error tool parameters require an object schema
   const nonObject: ExtensionToolDefinition = { name: "bad", description: "bad", parameters: Schema.string() }
@@ -22,7 +32,17 @@ function invalidSchemas(): void {
   const bigint = Schema.literal(1n)
   // @ts-expect-error patterns are JSON strings, not RegExp objects
   const pattern = Schema.string({ pattern: /x/ })
-  void [nonObject, bigint, pattern]
+  const parameters = Schema.object({})
+  const outputSchema = Schema.object({ count: Schema.integer() })
+  const invalidOutput: ExtensionToolDefinition<typeof parameters, typeof outputSchema> = {
+    name: "bad_output",
+    description: "bad output",
+    parameters,
+    outputSchema,
+    // @ts-expect-error execute must return the declared output
+    execute: () => ({ count: "one" })
+  }
+  void [nonObject, bigint, pattern, invalidOutput]
 }
 
 test("the public extension API exposes one frozen JSON-schema runtime", async () => {
@@ -64,7 +84,22 @@ test("tool schemas infer required and optional execution parameters", () => {
   expect(value).toEqual({ message: "hello" })
 })
 
+test("tool output schemas infer structured execution results", async () => {
+  const parameters = Schema.object({ value: Schema.integer() })
+  const outputSchema = Schema.object({ doubled: Schema.integer(), label: Schema.string() })
+  const tool: ExtensionToolDefinition<typeof parameters, typeof outputSchema> = {
+    name: "double_value",
+    description: "Double one value",
+    parameters,
+    outputSchema,
+    execute: ({ value }) => ({ doubled: value * 2, label: String(value) })
+  }
+
+  expect(await tool.execute({ value: 3 }, { signal: new AbortController().signal })).toEqual({ doubled: 6, label: "3" })
+})
+
 test("public types reject values outside the worker schema contract", () => {
   expect(typeof invalidSchemas).toBe("function")
   expect(typeof sessionOperations).toBe("function")
+  expect(typeof registerStructuredTool).toBe("function")
 })

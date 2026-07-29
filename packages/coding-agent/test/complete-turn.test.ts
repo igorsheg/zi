@@ -75,7 +75,7 @@ test("code runs through the normal turn lifecycle with durable nested evidence",
         {
           code: `async () => {
   const file = await zi.read({ path: "input.txt" });
-  return file.text.includes("needle");
+  return file.includes("needle");
 }`
         },
         { id: "code-1" }

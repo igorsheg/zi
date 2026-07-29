@@ -161,7 +161,7 @@ type GenerationToolInvocation =
       readonly type: "running"
       readonly requestId: number
       readonly registration: ExtensionToolRegistration
-      readonly settled: Deferred<string>
+      readonly settled: Deferred<JsonValue>
       readonly signal?: AbortSignal
       readonly onAbort?: () => void
       readonly timeout: ReturnType<typeof setTimeout>
@@ -170,7 +170,7 @@ type GenerationToolInvocation =
       readonly type: "cancelling"
       readonly requestId: number
       readonly registration: ExtensionToolRegistration
-      readonly settled: Deferred<string>
+      readonly settled: Deferred<JsonValue>
       readonly signal: AbortSignal
       readonly onAbort: () => void
       readonly timeout: ReturnType<typeof setTimeout>
@@ -386,7 +386,7 @@ class ExtensionGeneration {
     return admitted.settled.promise
   }
 
-  requestTool(name: string, arguments_: Readonly<Record<string, JsonValue>>, signal?: AbortSignal): Promise<string> {
+  requestTool(name: string, arguments_: Readonly<Record<string, JsonValue>>, signal?: AbortSignal): Promise<JsonValue> {
     const state = this.#state
     if (state.type !== "ready" || state.lifecycle !== "started") {
       return Promise.reject(new Error(`Extension generation cannot invoke tools while ${state.type}`))
@@ -401,7 +401,7 @@ class ExtensionGeneration {
     if (signal?.aborted) return Promise.reject(abortError())
 
     const requestId = this.#takeRequestId()
-    const settled = deferred<string>()
+    const settled = deferred<JsonValue>()
     const onAbort = signal ? () => this.#cancelToolInvocation(requestId) : undefined
     const timeout = setTimeout(
       () => this.#toolInvocationTimedOut(requestId, "Extension tool deadline exceeded"),
@@ -537,14 +537,14 @@ class ExtensionGeneration {
     })
   }
 
-  #finishToolInvocation(invocation: GenerationToolInvocation, outcome: { content: string } | { error: Error }): void {
+  #finishToolInvocation(invocation: GenerationToolInvocation, outcome: { value: JsonValue } | { error: Error }): void {
     if (this.#toolInvocations.get(invocation.requestId) !== invocation) return
     this.#toolInvocations.delete(invocation.requestId)
     clearTimeout(invocation.timeout)
     if (invocation.signal && invocation.onAbort) {
       invocation.signal.removeEventListener("abort", invocation.onAbort)
     }
-    if ("content" in outcome) invocation.settled.resolve(outcome.content)
+    if ("value" in outcome) invocation.settled.resolve(outcome.value)
     else invocation.settled.reject(outcome.error)
   }
 
@@ -624,7 +624,7 @@ class ExtensionGeneration {
           return
         }
         if (message.type === "tool_result") {
-          this.#finishToolInvocation(invocation, { content: message.content })
+          this.#finishToolInvocation(invocation, { value: message.value })
           return
         }
         if (message.type === "tool_error") {
@@ -933,7 +933,7 @@ export class ExtensionHost {
     }
   }
 
-  invokeTool(name: string, arguments_: unknown, signal?: AbortSignal): Promise<string> {
+  invokeTool(name: string, arguments_: unknown, signal?: AbortSignal): Promise<JsonValue> {
     const state = this.#state
     if (state.type !== "ready" || state.lifecycle !== "started") {
       return Promise.reject(new Error(`Extension host cannot invoke tools while ${state.type}`))

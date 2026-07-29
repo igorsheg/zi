@@ -32,6 +32,10 @@ _Avoid_: Global process manager, TUI task registry, detached Bash process
 The bounded, typed, client-neutral facts a built-in tool returns separately from model-facing content. They describe progress or outcome without requiring a client to parse explanatory prose.
 _Avoid_: UI metadata, rendered result, tool payload
 
+**Code-mode tool value**:
+The bounded JSON-compatible operational result that one admitted tool returns to generated Code Mode JavaScript. Its declared shape is distinct from model-facing content and tool result details; plain text tools return a string value.
+_Avoid_: Tool result details, presentation envelope, encoded JSON response
+
 **Code mode**:
 The default additive Zi tool for executing generated JavaScript that orchestrates an immutable admitted catalog of direct and extension tools. It is for data-dependent loops, branching, filtering, aggregation, and multi-call workflows; ordinary coding keeps direct tools.
 _Avoid_: Tool replacement, feature flag, script runner, shell alias

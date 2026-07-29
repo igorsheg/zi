@@ -11,6 +11,7 @@ import {
 import { normalizeCode } from "./normalize.js"
 import {
   CodeModeProtocolDecoder,
+  codeModeProtocolVersion,
   encodeCodeModeFrame,
   maxCodeModeCalls,
   maxCodeModeLogBytes,
@@ -85,7 +86,12 @@ async function startRun(start: Extract<CodeModeHostMessage, { type: "start" }>):
       try {
         send(message)
       } catch (cause) {
-        send({ version: 1, type: "failed", error: `Could not encode sandbox result: ${errorMessage(cause)}`, logs })
+        send({
+          version: codeModeProtocolVersion,
+          type: "failed",
+          error: `Could not encode sandbox result: ${errorMessage(cause)}`,
+          logs
+        })
       }
     } catch (cause) {
       process.stderr.write(`Could not send code-mode result: ${errorMessage(cause)}\n`)
@@ -104,13 +110,18 @@ async function startRun(start: Extract<CodeModeHostMessage, { type: "start" }>):
     if (!jobs.error) return
     const error = quickJsError(context, jobs.error)
     jobs.error.dispose()
-    finish({ version: 1, type: "failed", error, logs })
+    finish({ version: codeModeProtocolVersion, type: "failed", error, logs })
   }
   const resolveCall = (id: number, envelope: unknown): void => {
     if (state.type !== "running") return
     const promise = pending.get(id)
     if (!promise) {
-      finish({ version: 1, type: "failed", error: `Unknown code-mode tool response ID: ${id}`, logs })
+      finish({
+        version: codeModeProtocolVersion,
+        type: "failed",
+        error: `Unknown code-mode tool response ID: ${id}`,
+        logs
+      })
       return
     }
     pending.delete(id)
@@ -140,7 +151,7 @@ async function startRun(start: Extract<CodeModeHostMessage, { type: "start" }>):
     const promise = context.newPromise()
     pending.set(id, promise)
     try {
-      send({ version: 1, type: "tool_call", id, name, arguments: validateCodeModeJson(input) })
+      send({ version: codeModeProtocolVersion, type: "tool_call", id, name, arguments: validateCodeModeJson(input) })
     } catch (cause) {
       pending.delete(id)
       promise.dispose()
@@ -162,11 +173,11 @@ async function startRun(start: Extract<CodeModeHostMessage, { type: "start" }>):
     if (prelude.error) {
       const error = quickJsError(context, prelude.error)
       prelude.error.dispose()
-      finish({ version: 1, type: "failed", error, logs })
+      finish({ version: codeModeProtocolVersion, type: "failed", error, logs })
       return { settled, accept: () => {}, cancel: () => {} }
     }
     prelude.value.dispose()
-    send({ version: 1, type: "ready" })
+    send({ version: codeModeProtocolVersion, type: "ready" })
 
     guestDeadline = Date.now() + guestBurstMs
     const normalized = normalizeCode(start.code)
@@ -177,7 +188,7 @@ async function startRun(start: Extract<CodeModeHostMessage, { type: "start" }>):
     if (evaluation.error) {
       const error = quickJsError(context, evaluation.error)
       evaluation.error.dispose()
-      finish({ version: 1, type: "failed", error, logs })
+      finish({ version: codeModeProtocolVersion, type: "failed", error, logs })
       return { settled, accept: () => {}, cancel: () => {} }
     }
     const promiseHandle = evaluation.value
@@ -193,14 +204,14 @@ async function startRun(start: Extract<CodeModeHostMessage, { type: "start" }>):
       if (outcome.error) {
         const error = quickJsError(context, outcome.error)
         outcome.error.dispose()
-        finish({ version: 1, type: "failed", error, logs })
+        finish({ version: codeModeProtocolVersion, type: "failed", error, logs })
         return undefined
       }
       const encoded = context.getString(outcome.value)
       outcome.value.dispose()
       if (pending.size > 0) {
         finish({
-          version: 1,
+          version: codeModeProtocolVersion,
           type: "failed",
           error: `Code returned with ${pending.size} unawaited tool ${pending.size === 1 ? "call" : "calls"}`,
           logs
@@ -211,18 +222,18 @@ async function startRun(start: Extract<CodeModeHostMessage, { type: "start" }>):
         const decoded: unknown = JSON.parse(encoded)
         if (!isRecord(decoded) || typeof decoded.defined !== "boolean") throw new Error("Invalid sandbox result")
         finish({
-          version: 1,
+          version: codeModeProtocolVersion,
           type: "completed",
           ...(decoded.defined ? { result: validateCodeModeJson(decoded.value) } : {}),
           logs
         })
       } catch (cause) {
-        finish({ version: 1, type: "failed", error: errorMessage(cause), logs })
+        finish({ version: codeModeProtocolVersion, type: "failed", error: errorMessage(cause), logs })
       }
       return undefined
     })
   } catch (cause) {
-    finish({ version: 1, type: "failed", error: errorMessage(cause), logs })
+    finish({ version: codeModeProtocolVersion, type: "failed", error: errorMessage(cause), logs })
   }
 
   return {
@@ -231,8 +242,8 @@ async function startRun(start: Extract<CodeModeHostMessage, { type: "start" }>):
       if (state.type !== "running") return
       switch (message.type) {
         case "tool_result":
-          if (message.result.terminate) terminateRequested = true
-          resolveCall(message.id, { result: message.result })
+          if (message.terminate) terminateRequested = true
+          resolveCall(message.id, { result: message.value })
           break
         case "tool_error":
           resolveCall(message.id, { error: message.error })
@@ -242,7 +253,7 @@ async function startRun(start: Extract<CodeModeHostMessage, { type: "start" }>):
       }
     },
     cancel() {
-      finish({ version: 1, type: "failed", error: "Code execution cancelled", logs })
+      finish({ version: codeModeProtocolVersion, type: "failed", error: "Code execution cancelled", logs })
     }
   }
 }

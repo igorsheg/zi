@@ -7,6 +7,7 @@ import { createCodeModeWorkerSpawner, type CodeModeWorkerExit, type CodeModeWork
 import {
   CodeModeProtocolDecoder,
   CodeModeProtocolWriter,
+  codeModeProtocolVersion,
   isCodeModeToolName,
   maxCodeBytes,
   maxCodeModeErrorBytes,
@@ -15,9 +16,9 @@ import {
   validateWorkerMessage,
   type CodeModeHostMessage,
   type CodeModeJson,
-  type CodeModeWorkerMessage,
-  type SandboxToolResult
+  type CodeModeWorkerMessage
 } from "./protocol.js"
+import { codeModeToolContract } from "./tool-contract.js"
 import { type CodeModeCall, type CodeModeDetails } from "./trace.js"
 
 export { isCodeModeDetails, type CodeModeCall, type CodeModeDetails } from "./trace.js"
@@ -189,7 +190,7 @@ class CodeExecution {
     let cancellation: Error | undefined
     try {
       const start: CodeModeHostMessage = {
-        version: 1,
+        version: codeModeProtocolVersion,
         type: "start",
         code: this.#code,
         tools: Object.freeze([...this.#tools.keys()])
@@ -350,20 +351,25 @@ class CodeExecution {
         name: message.name,
         arguments: prepared
       })
-      const result = await tool.execute(
-        `${this.#toolCallId}:code:${message.id}`,
-        validated,
-        this.#controller.signal,
-        partial => {
-          const call = this.#calls[callIndex]
-          if (!call || call.state !== "running") return
-          this.#calls[callIndex] = { ...call, preview: boundedText(toolResultText(partial)) }
-          this.#publishProgress()
-        }
-      )
-      if (isBuiltInToolError(message.name, result.details)) throw new Error(toolResultText(result))
-      if (result.terminate) this.#terminate = true
-      return sandboxResult(result)
+      const onUpdate: AgentToolUpdateCallback<unknown> = partial => {
+        const call = this.#calls[callIndex]
+        if (!call || call.state !== "running") return
+        this.#calls[callIndex] = { ...call, preview: boundedText(toolResultText(partial)) }
+        this.#publishProgress()
+      }
+      const toolCallId = `${this.#toolCallId}:code:${message.id}`
+      const contract = codeModeToolContract(tool)
+      const invocation = contract
+        ? await contract.execute(toolCallId, validated, this.#controller.signal, onUpdate)
+        : { result: await tool.execute(toolCallId, validated, this.#controller.signal, onUpdate), value: undefined }
+      const text = toolResultText(invocation.result)
+      if (isBuiltInToolError(message.name, invocation.result.details)) throw new Error(text)
+      if (invocation.result.terminate) this.#terminate = true
+      return {
+        text,
+        value: contract ? validateCodeModeJson(invocation.value) : text,
+        terminate: invocation.result.terminate === true
+      }
     })
     this.#dispatchQueue = operation.then(
       () => undefined,
@@ -384,7 +390,13 @@ class CodeExecution {
         this.#publishProgress()
         if (this.#state.type !== "running") return undefined
         try {
-          await this.#writer.send({ version: 1, type: "tool_result", id: message.id, result })
+          await this.#writer.send({
+            version: codeModeProtocolVersion,
+            type: "tool_result",
+            id: message.id,
+            value: result.value,
+            ...(result.terminate ? { terminate: true } : {})
+          })
         } catch (cause) {
           await this.#sendCallError(message.id, errorMessage(cause))
         }
@@ -413,7 +425,12 @@ class CodeExecution {
   async #sendCallError(id: number, error: string): Promise<void> {
     if (this.#state.type !== "running") return
     try {
-      await this.#writer.send({ version: 1, type: "tool_error", id, error: boundedErrorText(error) })
+      await this.#writer.send({
+        version: codeModeProtocolVersion,
+        type: "tool_error",
+        id,
+        error: boundedErrorText(error)
+      })
     } catch (cause) {
       this.#failure.reject(cause)
     }
@@ -445,15 +462,6 @@ class CodeExecution {
   }
 }
 
-function sandboxResult(result: AgentToolResult<unknown>): SandboxToolResult {
-  const details = jsonCompatible(result.details)
-  return {
-    text: toolResultText(result),
-    ...(details === undefined ? {} : { details }),
-    ...(result.terminate ? { terminate: true } : {})
-  }
-}
-
 function toolResultText(result: AgentToolResult<unknown>): string {
   return result.content.map(part => (part.type === "text" ? part.text : `[image: ${part.mimeType}]`)).join("\n")
 }
@@ -462,15 +470,14 @@ function codeToolDescription(tools: readonly AgentTool[]): string {
   const prefix = `Execute JavaScript that orchestrates the other Zi tools.
 
 Every direct tool is also available as zi.<tool>(input) with the same input fields; use zi["tool-name"] for punctuation.
-Successful calls return { text, details }; tool failures throw Error and may be handled with try/catch.
-Use JSON.parse(response.text) for JSON output. Console logs are retained when execution completes, not streamed live.
+Successful calls return the declared JSON-compatible JavaScript value directly; values are already decoded.
+Tool failures throw Error and may be handled with try/catch. Console logs are retained when execution completes, not streamed live.
 Use code for data-dependent loops, filtering, branching, aggregation, and multi-call extension/API workflows.
 Prefer direct read, edit, write, and bash calls for ordinary coding operations that do not benefit from orchestration.
 Await every zi tool call before returning. Unawaited calls fail the execution.
 Do not use TypeScript syntax, imports, fetch, process, Bun, require, or ambient filesystem APIs.
 
 Available APIs:
-interface ZiToolResult { text: string; details?: unknown }
 declare const zi: {
 `
   const suffix = "\n};"
@@ -479,7 +486,8 @@ declare const zi: {
   let omitted = 0
   for (const tool of tools) {
     const description = tool.description.replaceAll("*/", "* /").replaceAll(/\s+/g, " ").trim()
-    const block = `  /** ${description} */\n  ${typescriptProperty(tool.name)}: (input: ${schemaType(tool.parameters, 0)}) => Promise<ZiToolResult>;\n`
+    const outputSchema = codeModeToolContract(tool)?.outputSchema ?? { type: "string" }
+    const block = `  /** ${description} */\n  ${typescriptProperty(tool.name)}: (input: ${schemaType(tool.parameters, 0)}) => Promise<${schemaType(outputSchema, 0)}>;\n`
     const blockBytes = Buffer.byteLength(block)
     if (bytes + blockBytes > maxDescriptionBytes - 256) {
       omitted++
@@ -580,16 +588,6 @@ function traceJson(value: unknown, budget: { nodes: number; scalars: number }, d
     output[projectedKey] = traceJson(item, budget, depth + 1)
   }
   return Object.freeze(output)
-}
-
-function jsonCompatible(value: unknown): CodeModeJson | undefined {
-  if (value === undefined) return undefined
-  try {
-    const encoded = JSON.stringify(value)
-    return encoded === undefined ? undefined : validateCodeModeJson(JSON.parse(encoded))
-  } catch {
-    return undefined
-  }
 }
 
 function snapshotCalls(calls: readonly CodeModeCall[]): readonly CodeModeCall[] {

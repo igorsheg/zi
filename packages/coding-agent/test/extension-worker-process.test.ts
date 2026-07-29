@@ -182,7 +182,7 @@ export default function (zi): void {
     name: "echo_message",
     arguments: { message: "hello" }
   })
-  expect(await messages.next()).toEqual({ type: "tool_result", generation: 1, requestId: 2, content: "HELLO" })
+  expect(await messages.next()).toEqual({ type: "tool_result", generation: 1, requestId: 2, value: "HELLO" })
   send(input, { type: "tool_invoke", generation: 1, requestId: 3, name: "echo_message", arguments: { message: 42 } })
   expect(await messages.next()).toMatchObject({
     type: "tool_error",
@@ -213,7 +213,7 @@ export default function (zi): void {
     name: "echo_message",
     arguments: { message: "again" }
   })
-  expect(await messages.next()).toEqual({ type: "tool_result", generation: 1, requestId: 6, content: "AGAIN" })
+  expect(await messages.next()).toEqual({ type: "tool_result", generation: 1, requestId: 6, value: "AGAIN" })
 
   send(input, {
     type: "tool_invoke",
@@ -264,7 +264,7 @@ export default zi => zi.registerTool({
     name: "echo_message",
     arguments: { message: "done" }
   })
-  expect(await output.next()).toEqual({ type: "tool_result", generation: 1, requestId: 2, content: "done" })
+  expect(await output.next()).toEqual({ type: "tool_result", generation: 1, requestId: 2, value: "done" })
   send(input, { type: "cancel", generation: 1, requestId: 2 })
   send(input, { type: "session_shutdown", generation: 1, requestId: 3, reason: "quit" })
   await Bun.sleep(0)

@@ -1,6 +1,6 @@
 import type { Writable } from "node:stream"
 
-export const codeModeProtocolVersion = 1
+export const codeModeProtocolVersion = 2
 export const codeModeWorkerArgument = "--zi-internal-code-mode-worker"
 
 export const maxCodeBytes = 256 * 1024
@@ -23,33 +23,33 @@ export type CodeModeJson =
   | readonly CodeModeJson[]
   | { readonly [key: string]: CodeModeJson }
 
-export interface SandboxToolResult {
-  readonly text: string
-  readonly details?: CodeModeJson
-  readonly terminate?: boolean
-}
-
 export type CodeModeHostMessage =
-  | { readonly version: 1; readonly type: "start"; readonly code: string; readonly tools: readonly string[] }
-  | { readonly version: 1; readonly type: "tool_result"; readonly id: number; readonly result: SandboxToolResult }
-  | { readonly version: 1; readonly type: "tool_error"; readonly id: number; readonly error: string }
+  | { readonly version: 2; readonly type: "start"; readonly code: string; readonly tools: readonly string[] }
+  | {
+      readonly version: 2
+      readonly type: "tool_result"
+      readonly id: number
+      readonly value: CodeModeJson
+      readonly terminate?: boolean
+    }
+  | { readonly version: 2; readonly type: "tool_error"; readonly id: number; readonly error: string }
 
 export type CodeModeWorkerMessage =
-  | { readonly version: 1; readonly type: "ready" }
+  | { readonly version: 2; readonly type: "ready" }
   | {
-      readonly version: 1
+      readonly version: 2
       readonly type: "tool_call"
       readonly id: number
       readonly name: string
       readonly arguments: CodeModeJson
     }
   | {
-      readonly version: 1
+      readonly version: 2
       readonly type: "completed"
       readonly result?: CodeModeJson
       readonly logs: readonly string[]
     }
-  | { readonly version: 1; readonly type: "failed"; readonly error: string; readonly logs: readonly string[] }
+  | { readonly version: 2; readonly type: "failed"; readonly error: string; readonly logs: readonly string[] }
 
 export class CodeModeProtocolError extends Error {
   constructor(message: string, options?: ErrorOptions) {
@@ -237,40 +237,38 @@ export function validateHostMessage(value: unknown): CodeModeHostMessage {
     ) {
       throw new CodeModeProtocolError("Code-mode start requires unique bounded tool names")
     }
-    return { version: 1, type: "start", code: message.code, tools: Object.freeze([...message.tools]) }
+    return { version: 2, type: "start", code: message.code, tools: Object.freeze([...message.tools]) }
   }
   if (message.type === "tool_result") {
-    const id = callId(message.id)
-    if (!isRecord(message.result) || typeof message.result.text !== "string") {
-      throw new CodeModeProtocolError("Code-mode tool results require text")
+    let result: CodeModeJson
+    try {
+      result = validateCodeModeJson(message.value)
+    } catch (cause) {
+      throw new CodeModeProtocolError("Code-mode tool results require a JSON-compatible value", { cause })
     }
-    const details = message.result.details === undefined ? undefined : validateCodeModeJson(message.result.details)
     return {
-      version: 1,
+      version: 2,
       type: "tool_result",
-      id,
-      result: {
-        text: message.result.text,
-        ...(details === undefined ? {} : { details }),
-        ...(message.result.terminate === true ? { terminate: true } : {})
-      }
+      id: callId(message.id),
+      value: result,
+      ...(message.terminate === true ? { terminate: true } : {})
     }
   }
   if (message.type === "tool_error") {
-    return { version: 1, type: "tool_error", id: callId(message.id), error: boundedError(message.error) }
+    return { version: 2, type: "tool_error", id: callId(message.id), error: boundedError(message.error) }
   }
   throw new CodeModeProtocolError(`Unknown code-mode host message: ${String(message.type)}`)
 }
 
 export function validateWorkerMessage(value: unknown): CodeModeWorkerMessage {
   const message = messageRecord(value)
-  if (message.type === "ready") return { version: 1, type: "ready" }
+  if (message.type === "ready") return { version: 2, type: "ready" }
   if (message.type === "tool_call") {
     if (typeof message.name !== "string" || !isCodeModeToolName(message.name)) {
       throw new CodeModeProtocolError("Code-mode tool calls require a valid tool name")
     }
     return {
-      version: 1,
+      version: 2,
       type: "tool_call",
       id: callId(message.id),
       name: message.name,
@@ -280,14 +278,14 @@ export function validateWorkerMessage(value: unknown): CodeModeWorkerMessage {
   const logs = logValues(message.logs)
   if (message.type === "completed") {
     return {
-      version: 1,
+      version: 2,
       type: "completed",
       ...(message.result === undefined ? {} : { result: validateCodeModeJson(message.result) }),
       logs
     }
   }
   if (message.type === "failed") {
-    return { version: 1, type: "failed", error: boundedError(message.error), logs }
+    return { version: 2, type: "failed", error: boundedError(message.error), logs }
   }
   throw new CodeModeProtocolError(`Unknown code-mode worker message: ${String(message.type)}`)
 }

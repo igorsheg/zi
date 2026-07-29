@@ -9,7 +9,7 @@
 
 A user adds one TypeScript extension beneath the current project's `.zi/extensions/`, trusts that project, starts the compiled Zi executable, and lets the model invoke the extension's tool. The same extension works in interactive, text, JSON, and RPC modes without importing Zi internals or building a separate bundle.
 
-The canonical [`repository_status` example](../examples/extensions/custom-tool/index.ts) is a small repository-specific tool with typed arguments, cooperative cancellation, and a bounded textual result. It is meant to be copied and changed by a person or coding agent, not to demonstrate every future extension capability.
+The canonical [`repository_status` example](../examples/extensions/custom-tool/index.ts) is a small repository-specific tool with typed arguments, cooperative cancellation, and a bounded structured result that works in direct calls and Code Mode. It is meant to be copied and changed by a person or coding agent, not to demonstrate every future extension capability.
 
 ## Authoring path
 

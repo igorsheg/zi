@@ -13,7 +13,7 @@ Zi will eventually support the full behavioral capability of Pi's extension syst
 
 This specification establishes the extension substrate before any product capability is added. The first accepted implementation can discover, trust-gate, load, identify, reload, and shut down otherwise empty TypeScript extensions through a supervised extension generation.
 
-The initial infrastructure contract contained lifecycle registration only. Protocol version 2 added bounded model-callable tools. Protocol version 3 adds source-attributed correlated operations for custom session state and custom messages. Commands, providers, extension-owned UI, and a generic event framework remain excluded.
+The initial infrastructure contract contained lifecycle registration only. Protocol version 2 added bounded model-callable tools. Protocol version 3 added source-attributed correlated operations for custom session state and custom messages. Protocol version 4 adds declared, validated JSON tool outputs while preserving string results by default. Commands, providers, extension-owned UI, and a generic event framework remain excluded.
 
 Lifecycle loading is an infrastructure checkpoint, not the product launch boundary. The first usable outcome is the [`custom-tool extension golden path`](extension-custom-tool-golden-path.md), which must work across interactive, text, JSON, and RPC modes against the compiled release.
 
@@ -474,7 +474,9 @@ export type ExtensionLifecycleEvent =
   | { readonly type: "session_shutdown"; readonly reason: ExtensionShutdownReason }
 
 export interface ExtensionAPI {
-  registerTool<TParameters extends TObject>(definition: ExtensionToolDefinition<TParameters>): void
+  registerTool<TParameters extends TObject, TOutputSchema extends TSchema | undefined = undefined>(
+    definition: ExtensionToolDefinition<TParameters, TOutputSchema>
+  ): void
   on(
     event: "session_start",
     handler: (event: Extract<ExtensionLifecycleEvent, { type: "session_start" }>) => void | Promise<void>
@@ -485,21 +487,34 @@ export interface ExtensionAPI {
   ): void
 }
 
-export interface ExtensionToolDefinition<TParameters extends TObject> {
+export type ExtensionToolDefinition<
+  TParameters extends TObject,
+  TOutputSchema extends TSchema | undefined = undefined
+> = {
   readonly name: string
   readonly label?: string
   readonly description: string
   readonly parameters: TParameters
-  readonly execute: (
-    arguments_: Static<TParameters>,
-    context: { readonly signal: AbortSignal }
-  ) => string | Promise<string>
-}
+} & (TOutputSchema extends TSchema
+  ? {
+      readonly outputSchema: TOutputSchema
+      readonly execute: (
+        arguments_: Static<TParameters>,
+        context: { readonly signal: AbortSignal }
+      ) => Static<TOutputSchema> | Promise<Static<TOutputSchema>>
+    }
+  : {
+      readonly outputSchema?: never
+      readonly execute: (
+        arguments_: Static<TParameters>,
+        context: { readonly signal: AbortSignal }
+      ) => string | Promise<string>
+    })
 
 export type ExtensionFactory = (zi: ExtensionAPI) => void | Promise<void>
 ```
 
-`Schema` exports only `string`, `number`, `integer`, `boolean`, `literal`, `optional`, `array`, and `object`. Tool parameters must have an object root. Arguments and one textual result are bounded and validated across the process boundary. Registration is factory-scoped and rolled back per source on failure.
+`Schema` exports only `string`, `number`, `integer`, `boolean`, `literal`, `optional`, `array`, and `object`. Tool parameters must have an object root. Arguments and results are bounded and validated across the process seam. Omitting `outputSchema` keeps the textual result contract; declaring it admits a matching JSON result. Registration is factory-scoped and rolled back per source on failure.
 
 An extension with no contribution is valid:
 

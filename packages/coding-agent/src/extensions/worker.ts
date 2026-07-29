@@ -76,11 +76,9 @@ interface ShutdownHandler {
 
 interface RegisteredTool {
   readonly registration: ExtensionToolRegistration
-  readonly checker: Validator
-  readonly execute: (
-    parameters: Readonly<Record<string, JsonValue>>,
-    context: ExtensionToolContext
-  ) => string | Promise<string>
+  readonly inputChecker: Validator
+  readonly outputChecker: Validator
+  readonly execute: (parameters: Readonly<Record<string, JsonValue>>, context: ExtensionToolContext) => Promise<unknown>
 }
 
 interface WorkerToolExecution {
@@ -146,19 +144,25 @@ export class LoadedExtensionGeneration {
     this.#toolsByName = new Map(tools.map(tool => [tool.registration.name, tool]))
   }
 
-  invoke(name: string, parameters: Readonly<Record<string, JsonValue>>, signal: AbortSignal): Promise<string> {
+  invoke(name: string, parameters: Readonly<Record<string, JsonValue>>, signal: AbortSignal): Promise<JsonValue> {
     if (this.#state.type !== "started") {
       return Promise.reject(new Error(`Cannot invoke extension tools while lifecycle is ${this.#state.type}`))
     }
     const tool = this.#toolsByName.get(name)
     if (!tool) return Promise.reject(new Error(`Unknown extension tool: ${name}`))
-    if (!tool.checker.Check(parameters)) {
+    if (!tool.inputChecker.Check(parameters)) {
       return Promise.reject(new Error(`Invalid arguments for extension tool ${name}`))
     }
     const context = Object.freeze({ signal })
     return Promise.resolve()
       .then(() => tool.execute(parameters, context))
-      .then(validateExtensionToolResult)
+      .then(value => {
+        const result = validateExtensionToolResult(value)
+        if (!tool.outputChecker.Check(result)) {
+          throw new Error(`Invalid result for extension tool ${name}`)
+        }
+        return result
+      })
   }
 
   dispatch(event: ExtensionLifecycleEvent, timeoutMs = extensionLifecycleTimeoutMs): Promise<ExtensionLifecycleResult> {
@@ -527,12 +531,12 @@ class ExtensionWorkerProcess {
     invocation: Extract<WorkerToolInvocation, { type: "running" }>
   ): Promise<void> {
     let outcome:
-      | { readonly type: "result"; readonly content: string }
+      | { readonly type: "result"; readonly value: JsonValue }
       | { readonly type: "error"; readonly message: string }
     try {
       const parameters = validateExtensionToolArguments(message.arguments)
-      const content = await extensions.invoke(message.name, parameters, invocation.controller.signal)
-      outcome = { type: "result", content }
+      const value = await extensions.invoke(message.name, parameters, invocation.controller.signal)
+      outcome = { type: "result", value }
     } catch (cause) {
       outcome = { type: "error", message: boundedExtensionToolError(cause) }
     }
@@ -542,12 +546,7 @@ class ExtensionWorkerProcess {
       current.type === "cancelling"
         ? { type: "tool_cancelled", generation: message.generation, requestId: message.requestId }
         : outcome.type === "result"
-          ? {
-              type: "tool_result",
-              generation: message.generation,
-              requestId: message.requestId,
-              content: outcome.content
-            }
+          ? { type: "tool_result", generation: message.generation, requestId: message.requestId, value: outcome.value }
           : {
               type: "tool_error",
               generation: message.generation,
@@ -879,14 +878,17 @@ function registerTool(source: ExtensionSource, value: unknown): RegisteredTool {
       name: value.name,
       label: value.label ?? value.name,
       description: value.description,
-      parameters: value.parameters
+      parameters: value.parameters,
+      outputSchema: value.outputSchema ?? Type.String()
     })
   } catch (cause) {
     throw new ExtensionRegistrationError(cause instanceof Error ? cause.message : String(cause), { cause })
   }
-  let checker: Validator
+  let inputChecker: Validator
+  let outputChecker: Validator
   try {
-    checker = Compile(Type.Unsafe(registration.parameters))
+    inputChecker = Compile(Type.Unsafe(registration.parameters))
+    outputChecker = Compile(Type.Unsafe(registration.outputSchema))
   } catch (cause) {
     throw new ExtensionRegistrationError(cause instanceof Error ? cause.message : "Invalid extension tool schema", {
       cause
@@ -895,9 +897,10 @@ function registerTool(source: ExtensionSource, value: unknown): RegisteredTool {
   const execute: (...arguments_: unknown[]) => unknown = value.execute
   return Object.freeze({
     registration,
-    checker,
+    inputChecker,
+    outputChecker,
     execute: (parameters: Readonly<Record<string, JsonValue>>, context: ExtensionToolContext) =>
-      Promise.resolve(execute(parameters, context)).then(validateExtensionToolResult)
+      Promise.resolve(execute(parameters, context))
   })
 }
 

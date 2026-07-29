@@ -80,8 +80,8 @@ export default function (zi: ExtensionAPI): void {
     const stdout = readNodeStream(child.stdout)
     const stderr = readNodeStream(child.stderr)
     const protocolMessages: WorkerMessage[] = []
-    let compiledToolResult: string | undefined
-    let compiledCounterResult: string | undefined
+    let compiledToolResult: unknown
+    let compiledCounterResult: unknown
     let compiledCustomMessage: string | undefined
     const protocol = new Promise<void>((resolveProtocol, rejectProtocol) => {
       let completed = false
@@ -154,7 +154,7 @@ export default function (zi: ExtensionAPI): void {
           return
         }
         if (message.type === "tool_result" && message.requestId === 2) {
-          compiledCounterResult = message.content
+          compiledCounterResult = message.value
           child!.stdin!.write(
             encodeExtensionProtocolFrame({
               type: "tool_invoke",
@@ -167,7 +167,7 @@ export default function (zi: ExtensionAPI): void {
           return
         }
         if (message.type === "tool_result" && message.requestId === 3) {
-          compiledToolResult = message.content
+          compiledToolResult = message.value
           child!.stdin!.write(
             encodeExtensionProtocolFrame({ type: "session_shutdown", generation: 1, requestId: 4, reason: "quit" })
           )
@@ -246,7 +246,7 @@ export default function (zi: ExtensionAPI): void {
     ])
     expect(compiledCounterResult).toBe("1")
     expect(compiledCustomMessage).toBe("Counter: 1")
-    expect(compiledToolResult).toContain("zi")
+    expect(JSON.stringify(compiledToolResult)).toContain("zi")
     expect(await Bun.file(lifecycle).text()).toBe("start:startup\nstop:quit\n")
 
     await Bun.write(lifecycle, "")

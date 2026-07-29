@@ -304,7 +304,7 @@ test("tool completion from a retired generation cannot cross replacement", async
 
   await host.reload(planTwo)
   expect(invocation).rejects.toThrow("disposed during tool invocation")
-  retired.send({ type: "tool_result", generation: 1, requestId: 2, content: "stale" })
+  retired.send({ type: "tool_result", generation: 1, requestId: 2, value: "stale" })
   expect(host.snapshot()).toMatchObject({
     status: "ready",
     lifecycle: "started",
@@ -602,12 +602,7 @@ class TestWorkerProcess implements ExtensionWorkerProcess {
       if (this.#behavior.type === "tools") {
         this.send({ type: "tool_cancelled", generation: message.generation, requestId: message.requestId })
       } else if (this.#behavior.type === "tool_cancel_crossing") {
-        this.send({
-          type: "tool_result",
-          generation: message.generation,
-          requestId: message.requestId,
-          content: "late"
-        })
+        this.send({ type: "tool_result", generation: message.generation, requestId: message.requestId, value: "late" })
       }
       return
     }
@@ -639,7 +634,7 @@ class TestWorkerProcess implements ExtensionWorkerProcess {
         type: "tool_result",
         generation: message.generation,
         requestId: message.requestId,
-        content: content.toUpperCase()
+        value: content.toUpperCase()
       })
       return
     }
@@ -684,7 +679,8 @@ function toolRegistration(source: ExtensionSource) {
     name: "echo_message",
     label: "Echo",
     description: "Echo a message",
-    parameters: { type: "object", required: ["message"], properties: { message: { type: "string" } } }
+    parameters: { type: "object", required: ["message"], properties: { message: { type: "string" } } },
+    outputSchema: { type: "string" }
   } as const
 }
 

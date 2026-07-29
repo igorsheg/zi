@@ -199,18 +199,36 @@ export interface ExtensionToolContext {
   readonly signal: AbortSignal
 }
 
-export interface ExtensionToolDefinition<TParameters extends TObject = TObject> {
+interface ExtensionToolDefinitionBase<TParameters extends TObject> {
   readonly name: string
   readonly label?: string
   readonly description: string
   readonly parameters: TParameters
-  execute(parameters: Static<TParameters>, context: ExtensionToolContext): string | Promise<string>
 }
+
+export type ExtensionToolDefinition<
+  TParameters extends TObject = TObject,
+  TOutputSchema extends TSchema | undefined = undefined
+> = ExtensionToolDefinitionBase<TParameters> &
+  (TOutputSchema extends TSchema
+    ? {
+        readonly outputSchema: TOutputSchema
+        execute(
+          parameters: Static<TParameters>,
+          context: ExtensionToolContext
+        ): Static<TOutputSchema> | Promise<Static<TOutputSchema>>
+      }
+    : {
+        readonly outputSchema?: never
+        execute(parameters: Static<TParameters>, context: ExtensionToolContext): string | Promise<string>
+      })
 
 export interface ExtensionAPI {
   on(event: "session_start", handler: (event: ExtensionStartEvent) => void | Promise<void>): void
   on(event: "session_shutdown", handler: (event: ExtensionShutdownEvent) => void | Promise<void>): void
-  registerTool<TParameters extends TObject>(tool: ExtensionToolDefinition<TParameters>): void
+  registerTool<TParameters extends TObject, TOutputSchema extends TSchema | undefined = undefined>(
+    tool: ExtensionToolDefinition<TParameters, TOutputSchema>
+  ): void
   getSessionEntries(customType: string): Promise<readonly ExtensionCustomEntry[]>
   appendEntry(customType: string, data?: JsonValue): Promise<ExtensionCustomEntry>
   sendMessage(message: ExtensionCustomMessage, delivery: ExtensionMessageDelivery): Promise<void>

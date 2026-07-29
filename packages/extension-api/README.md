@@ -10,7 +10,8 @@ export default function (zi: ExtensionAPI): void {
     name: "repository_rule",
     description: "Look up one repository rule",
     parameters: Schema.object({ topic: Schema.string() }),
-    execute: ({ topic }) => `Rule for ${topic}`
+    outputSchema: Schema.object({ topic: Schema.string(), rule: Schema.string() }),
+    execute: ({ topic }) => ({ topic, rule: `Rule for ${topic}` })
   })
 }
 ```

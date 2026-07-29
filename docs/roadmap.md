@@ -79,6 +79,7 @@ Native code mode is implemented as a default additive tool for data-dependent or
 - [x] Select QuickJS and prove its compiled single-file WASM variant on all five release targets.
 - [x] Isolate each code execution in one bounded, cancellable, self-hosted child worker.
 - [x] Preserve host-owned tool validation, expected errors, cancellation, deterministic mutation order, and termination.
+- [x] Deliver declared, validated native tool values to generated code without exposing presentation envelopes.
 - [x] Persist and present bounded nested evidence and include nested file operations in compaction accounting.
 - [x] Reserve `code` against extension conflicts and remove the prototype flag and code-only catalog.
 - [x] Record runtime, authority, ownership, and v1 scope in ADR 0024.

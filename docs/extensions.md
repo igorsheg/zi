@@ -32,9 +32,10 @@ export default function (zi: ExtensionAPI): void {
     name: "repository_rule",
     description: "Look up one repository rule",
     parameters: Schema.object({ topic: Schema.string() }),
+    outputSchema: Schema.object({ topic: Schema.string(), rule: Schema.string() }),
     async execute({ topic }, { signal }) {
       signal.throwIfAborted()
-      return `Rule for ${topic}`
+      return { topic, rule: `Rule for ${topic}` }
     }
   })
 }
@@ -42,7 +43,9 @@ export default function (zi: ExtensionAPI): void {
 
 The default factory may be synchronous or asynchronous. Registration is allowed only while that factory runs. A failure rolls back registrations from that source without preventing other extensions or Zi from starting.
 
-Tool names use lowercase letters, numbers, and underscores and must begin with a letter. Parameters must be an object schema built from `Schema.string`, `number`, `integer`, `boolean`, `literal`, `optional`, `array`, and `object`. Literals are JSON primitives and string patterns are strings, not `RegExp` objects. The public types reject non-object tool parameters. Zi validates arguments before calling `execute`. A tool returns one bounded string or throws an error. Built-in Zi tool names take precedence over extension registrations.
+Tool names use lowercase letters, numbers, and underscores and must begin with a letter. Parameters must be an object schema built from `Schema.string`, `number`, `integer`, `boolean`, `literal`, `optional`, `array`, and `object`. Literals are JSON primitives and string patterns are strings, not `RegExp` objects. The public types reject non-object tool parameters. Zi validates arguments before calling `execute`.
+
+Without `outputSchema`, a tool returns one bounded string. Declaring `outputSchema` lets it return a matching bounded JSON value. Zi validates that value in the extension worker, renders it as JSON for direct model calls, and delivers it as an already-decoded JavaScript value in Code Mode. Tools throw errors for failed operations. Built-in Zi tool names take precedence over extension registrations.
 
 `execute` receives an invocation-scoped `AbortSignal`. Cancellation is cooperative: pass the signal to subprocess or I/O APIs and stop owned work promptly. Zi rejects late completion and terminates a worker that misses execution or cancellation deadlines.
 

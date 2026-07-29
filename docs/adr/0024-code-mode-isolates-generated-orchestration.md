@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted.
+Accepted. The nested guest result shape is amended by ADR 0025.
 
 ## Context
 
@@ -26,7 +26,7 @@ Host and worker exchange versioned, length-prefixed JSON frames over private pip
 
 The host freezes the admitted direct and extension tool catalog for an execution. Nested calls use the ordinary tool's argument preparation and schema validation, receive the execution cancellation signal and partial-update callback, and retain built-in expected-error classification. Calls are serialized even when guest promises are created together so mutation order is deterministic. A terminating nested result prevents later calls and propagates termination through the outer `code` result. The guest must await every call; unawaited calls fail the execution. V1 does not promise rollback for effects admitted before that failure is detected.
 
-Successful nested responses have the stable guest shape `{ text, details }`; failures throw `Error` so guest code can branch with `try/catch`. Full nested results remain transient protocol data. Durable `code_mode` details retain at most 64 projected calls with bounded arguments, command/path/operation evidence, outcome, duration, and a short result, error, or current preview, plus bounded completion-time console logs. Built-in write content and edit replacements are reduced to path, byte-count, and operation-count evidence. The outer tool is the single transcript identity. Coding-agent presentation projects this trace for all clients; the TUI renders the same bounded facts. Successful nested `read`, `write`, and `edit` calls contribute to compaction file accounting.
+Successful nested responses originally had the guest shape `{ text, details }`; ADR 0025 replaces that shape with declared Code-mode tool values while preserving host-owned presentation and trace projection. Failures throw `Error` so guest code can branch with `try/catch`. Full nested results remain transient protocol data. Durable `code_mode` details retain at most 64 projected calls with bounded arguments, command/path/operation evidence, outcome, duration, and a short result, error, or current preview, plus bounded completion-time console logs. Built-in write content and edit replacements are reduced to path, byte-count, and operation-count evidence. The outer tool is the single transcript identity. Coding-agent presentation projects this trace for all clients; the TUI renders the same bounded facts. Successful nested `read`, `write`, and `edit` calls contribute to compaction file accounting.
 
 V1 is stateless. Approvals, replay, rollback, snippets, connectors, network access, and durable code artifacts remain deferred. New extension interception or approval contracts require independent product evidence.
 

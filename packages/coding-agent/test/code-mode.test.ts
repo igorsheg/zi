@@ -8,6 +8,7 @@ import type { AgentTool } from "@earendil-works/pi-agent-core"
 import { Type } from "@earendil-works/pi-ai"
 
 import { CodeMode, isCodeModeDetails } from "../src/code-mode/code-mode.js"
+import type { CodeModeCapableTool } from "../src/code-mode/tool-contract.js"
 import { createModels, createTestAgentRuntime, fauxAssistantMessage, fauxProvider } from "../src/testing.js"
 import { createReadTool } from "../src/tools/read.js"
 
@@ -25,6 +26,11 @@ const echoTool: AgentTool<typeof echoParameters, { readonly echoed: string }> = 
   parameters: echoParameters,
   execute: async (_id, input) => ({ content: [{ type: "text", text: input.value }], details: { echoed: input.value } })
 }
+
+const statsExecute: AgentTool["execute"] = async () => ({
+  content: [{ type: "text", text: "3 files, 12 lines" }],
+  details: { files: 3, lines: 12 }
+})
 
 test("new Zi sessions expose direct coding tools and code by default", async () => {
   const faux = fauxProvider()
@@ -60,7 +66,7 @@ test("code executes serial nested calls in an isolated worker", async () => {
     {
       code: `async () => {
   const output = [];
-  for (const value of ["a", "b", "c"]) output.push((await zi.echo({ value })).text);
+  for (const value of ["a", "b", "c"]) output.push(await zi.echo({ value }));
   return output.join(",");
 }`
     },
@@ -76,6 +82,36 @@ test("code executes serial nested calls in an isolated worker", async () => {
     ["echo", "succeeded"],
     ["echo", "succeeded"]
   ])
+})
+
+test("code exposes declared native values instead of presentation envelopes", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "zi-code-mode-native-value-"))
+  const statsTool: CodeModeCapableTool = {
+    name: "stats",
+    label: "stats",
+    description: "Count files and lines",
+    parameters: Type.Object({}),
+    execute: statsExecute,
+    codeMode: {
+      outputSchema: Type.Object({ files: Type.Number(), lines: Type.Number() }),
+      async execute(toolCallId, input, signal, onUpdate) {
+        return { result: await statsExecute(toolCallId, input, signal, onUpdate), value: { files: 3, lines: 12 } }
+      }
+    }
+  }
+  const tool = new CodeMode(cwd, workerCommand).createTool([statsTool])
+
+  expect(tool.description).toContain("stats: (input: {  }) => Promise<{ files: number; lines: number }>")
+  expect(tool.description).not.toContain("ZiToolResult")
+  expect(tool.description).not.toContain("JSON.parse(response.text)")
+
+  const result = await tool.execute(
+    "outer",
+    { code: `async () => { const stats = await zi.stats({}); return stats.lines; }` },
+    undefined
+  )
+
+  expect(result.content).toEqual([{ type: "text", text: "12" }])
 })
 
 test("code serializes guest-created calls for deterministic mutation order", async () => {
@@ -280,11 +316,7 @@ test("code supports punctuation in extension tool names", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "zi-code-mode-tool-name-"))
   const namedTool: typeof echoTool = { ...echoTool, name: "api.search-v2" }
   const tool = new CodeMode(cwd, workerCommand).createTool([namedTool])
-  const result = await tool.execute(
-    "outer",
-    { code: `async () => (await zi["api.search-v2"]({ value: "found" })).text` },
-    undefined
-  )
+  const result = await tool.execute("outer", { code: `async () => zi["api.search-v2"]({ value: "found" })` }, undefined)
 
   expect(result.content).toEqual([{ type: "text", text: "found" }])
 })

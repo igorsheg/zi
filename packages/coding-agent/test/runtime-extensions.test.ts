@@ -136,7 +136,8 @@ export default function (zi: ExtensionAPI): void {
     name: "repository_echo",
     description: "Echo a repository value",
     parameters: Schema.object({ value: Schema.string() }),
-    execute: ({ value }) => prefix + ":" + value
+    outputSchema: Schema.object({ prefix: Schema.string(), value: Schema.string() }),
+    execute: ({ value }) => ({ prefix, value })
   })
 }
 `
@@ -151,7 +152,7 @@ export default function (zi: ExtensionAPI): void {
     fauxAssistantMessage(
       fauxToolCall(
         "code",
-        { code: `async () => (await zi.repository_echo({ value: "nested" })).text` },
+        { code: `async () => (await zi.repository_echo({ value: "nested" })).value` },
         { id: "extension-code-1" }
       ),
       { stopReason: "toolUse" }
@@ -173,13 +174,13 @@ export default function (zi: ExtensionAPI): void {
     expect(results[0]).toMatchObject({
       toolCallId: "extension-tool-1",
       toolName: "repository_echo",
-      content: [{ type: "text", text: "repository:accepted" }],
+      content: [{ type: "text", text: '{"prefix":"repository","value":"accepted"}' }],
       details: { type: "extension", toolName: "repository_echo", outcome: "success" }
     })
     expect(results[1]).toMatchObject({
       toolCallId: "extension-code-1",
       toolName: "code",
-      content: [{ type: "text", text: "repository:nested" }],
+      content: [{ type: "text", text: "nested" }],
       details: {
         type: "code_mode",
         outcome: "success",

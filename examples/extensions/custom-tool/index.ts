@@ -7,6 +7,10 @@ export default function (zi: ExtensionAPI): void {
     parameters: Schema.object({
       path: Schema.optional(Schema.string({ description: "Optional repository-relative path" }))
     }),
+    outputSchema: Schema.object({
+      status: Schema.string({ description: "Concise Git status output" }),
+      clean: Schema.boolean({ description: "Whether the selected worktree is clean" })
+    }),
     async execute({ path }, { signal }) {
       const child = Bun.spawn(["git", "status", "--short", ...(path ? ["--", path] : [])], {
         cwd: process.cwd(),
@@ -20,7 +24,7 @@ export default function (zi: ExtensionAPI): void {
         new Response(child.stderr).text()
       ])
       if (exitCode !== 0) throw new Error(stderr.trim() || `git status exited with ${exitCode}`)
-      return stdout || "Working tree is clean."
+      return { status: stdout || "Working tree is clean.", clean: stdout.length === 0 }
     }
   })
 }

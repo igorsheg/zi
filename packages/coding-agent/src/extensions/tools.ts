@@ -1,7 +1,9 @@
 import type { AgentTool } from "@earendil-works/pi-agent-core"
 import { Type } from "typebox"
 
+import type { CodeModeCapableTool, CodeModeToolInvocation } from "../code-mode/tool-contract.js"
 import type { ExtensionHost } from "./host.js"
+import type { ExtensionToolRegistration, JsonValue } from "./protocol.js"
 
 export interface ExtensionToolDetails {
   readonly type: "extension"
@@ -31,24 +33,40 @@ export function admitExtensionTools(
     }
     names.add(registration.name)
     const parameters = Type.Unsafe(registration.parameters)
-    admitted.push({
+    const invoke = async (
+      _toolCallId: string,
+      arguments_: unknown,
+      signal?: AbortSignal
+    ): Promise<CodeModeToolInvocation> => {
+      const value = await host.invokeTool(registration.name, arguments_, signal)
+      return { value, result: extensionToolResult(registration, value) }
+    }
+    const tool: CodeModeCapableTool = {
       name: registration.name,
       label: registration.label,
       description: registration.description,
       parameters,
       executionMode: "parallel",
-      async execute(_toolCallId, arguments_, signal) {
-        const content = await host.invokeTool(registration.name, arguments_, signal)
-        const details: ExtensionToolDetails = {
-          type: "extension",
-          extensionId: registration.source.id,
-          toolName: registration.name,
-          outcome: "success"
-        }
-        return { content: [{ type: "text", text: content }], details }
-      }
-    })
+      async execute(toolCallId, arguments_, signal) {
+        return (await invoke(toolCallId, arguments_, signal)).result
+      },
+      codeMode: { outputSchema: registration.outputSchema, execute: invoke }
+    }
+    admitted.push(tool)
   }
 
   return Object.freeze(admitted)
+}
+
+function extensionToolResult(registration: ExtensionToolRegistration, value: JsonValue) {
+  const details: ExtensionToolDetails = {
+    type: "extension",
+    extensionId: registration.source.id,
+    toolName: registration.name,
+    outcome: "success"
+  }
+  return {
+    content: [{ type: "text" as const, text: typeof value === "string" ? value : JSON.stringify(value) }],
+    details
+  }
 }

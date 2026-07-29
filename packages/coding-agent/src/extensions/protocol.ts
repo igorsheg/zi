@@ -22,7 +22,7 @@ import {
   type ExtensionSource
 } from "./discovery.js"
 
-export const extensionProtocolVersion = 3
+export const extensionProtocolVersion = 4
 export const maxExtensionProtocolFrameBytes = 4 * 1024 * 1024
 export const maxExtensionPendingRequests = 128
 export const maxExtensionQueuedWriteBytes = 8 * 1024 * 1024
@@ -82,7 +82,7 @@ export interface ExtensionLoadResult {
 export type HostMessage =
   | {
       readonly type: "initialize"
-      readonly protocolVersion: 3
+      readonly protocolVersion: 4
       readonly generation: number
       readonly plan: ExtensionLoadPlan
     }
@@ -130,13 +130,13 @@ export type HostMessage =
 export type WorkerMessage =
   | {
       readonly type: "ready"
-      readonly protocolVersion: 3
+      readonly protocolVersion: 4
       readonly generation: number
       readonly extensions: readonly ExtensionLoadResult[]
       readonly tools: readonly ExtensionToolRegistration[]
     }
   | { readonly type: "settled"; readonly generation: number; readonly requestId: number }
-  | { readonly type: "tool_result"; readonly generation: number; readonly requestId: number; readonly content: string }
+  | { readonly type: "tool_result"; readonly generation: number; readonly requestId: number; readonly value: JsonValue }
   | { readonly type: "tool_error"; readonly generation: number; readonly requestId: number; readonly message: string }
   | { readonly type: "tool_cancelled"; readonly generation: number; readonly requestId: number }
   | {
@@ -184,6 +184,7 @@ export interface ExtensionToolRegistration {
   readonly label: string
   readonly description: string
   readonly parameters: Readonly<Record<string, JsonValue>>
+  readonly outputSchema: Readonly<Record<string, JsonValue>>
 }
 
 export class ExtensionProtocolError extends Error {
@@ -488,7 +489,7 @@ export function validateWorkerMessage(value: unknown): WorkerMessage {
         type: "tool_result",
         generation: positiveInteger(message.generation, "generation"),
         requestId: positiveInteger(message.requestId, "requestId"),
-        content: boundedString(message.content, "tool result", maxExtensionToolResultBytes)
+        value: jsonValue(message.value, "tool result", maxExtensionToolResultBytes)
       })
     case "tool_error":
       return Object.freeze({
@@ -562,8 +563,8 @@ export function validateExtensionToolArguments(value: unknown): Readonly<Record<
   return jsonRecord(value, "tool arguments", maxExtensionToolArgumentsBytes)
 }
 
-export function validateExtensionToolResult(value: unknown): string {
-  return boundedString(value, "tool result", maxExtensionToolResultBytes)
+export function validateExtensionToolResult(value: unknown): JsonValue {
+  return jsonValue(value, "tool result", maxExtensionToolResultBytes)
 }
 
 export function boundedExtensionToolError(cause: unknown): string {
@@ -681,8 +682,10 @@ function extensionToolRegistration(value: unknown): ExtensionToolRegistration {
   if (parameters.type !== "object") {
     throw new ExtensionProtocolError("Extension tool parameters must be an object schema")
   }
+  const outputSchema = jsonRecord(tool.outputSchema, "tool output schema", maxExtensionToolSchemaBytes)
   validateToolSchema(parameters, "parameters")
-  return Object.freeze({ source: extensionSource(tool.source), name, label, description, parameters })
+  validateToolSchema(outputSchema, "outputSchema")
+  return Object.freeze({ source: extensionSource(tool.source), name, label, description, parameters, outputSchema })
 }
 
 function validateToolSchema(value: JsonValue, path: string): void {
@@ -879,7 +882,7 @@ function protocolArray(value: unknown, field: string): readonly unknown[] {
   return value
 }
 
-function protocolVersion(value: unknown): 3 {
+function protocolVersion(value: unknown): 4 {
   if (value !== extensionProtocolVersion) throw new ExtensionProtocolError("Unsupported extension protocol version")
   return extensionProtocolVersion
 }
@@ -893,13 +896,6 @@ function positiveInteger(value: unknown, field: string): number {
 
 function pathText(value: unknown, field: string): string {
   return boundedRequiredText(value, field, maxExtensionPathBytes)
-}
-
-function boundedString(value: unknown, field: string, maxBytes: number): string {
-  if (typeof value !== "string" || Buffer.byteLength(value) > maxBytes) {
-    throw new ExtensionProtocolError(`Extension protocol ${field} cannot exceed ${maxBytes} bytes`)
-  }
-  return value
 }
 
 function boundedRequiredText(value: unknown, field: string, maxBytes: number): string {
