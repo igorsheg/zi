@@ -3,6 +3,7 @@ const definitions = [
   { name: "login", description: "Authenticate a provider", argumentHint: "<provider>" },
   { name: "logout", description: "Remove stored provider credentials" },
   { name: "settings", description: "Open settings menu" },
+  { name: "codex-settings", description: "Open OpenAI Codex settings" },
   { name: "compact", description: "Compact context, optionally preserving a specified focus", argumentHint: "[focus]" },
   { name: "new", description: "Start a new session" },
   { name: "resume", description: "Browse and resume saved sessions" }

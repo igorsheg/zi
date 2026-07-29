@@ -40,6 +40,7 @@ test("settings resolve global, then project, then construction overrides", async
     externalEditor: "project-editor",
     steeringMode: "all",
     followUpMode: "one-at-a-time",
+    codexFastMode: false,
     retryEnabled: true,
     retryMaxRetries: 3,
     retryBaseDelayMs: 2_000,
@@ -131,6 +132,25 @@ test("compaction settings layer and validate bounded persisted values", async ()
   expect(() => Reflect.apply(settings.updateGlobal, settings, [{ compactionKeepRecentTokens: 0 }])).toThrow(
     "Invalid compactionKeepRecentTokens"
   )
+})
+
+test("Codex Fast Mode defaults off, validates persisted state, and updates global settings", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-settings-codex-"))
+  const paths = new ZiPaths(join(root, "project"), join(root, "global"))
+  await mkdir(paths.globalDir, { recursive: true })
+  await writeFile(paths.globalSettingsFile, JSON.stringify({ codexFastMode: true }))
+
+  const settings = SettingsManager.create(paths, "trusted")
+  expect(settings.get().codexFastMode).toBe(true)
+
+  settings.updateGlobal({ codexFastMode: false })
+  expect(settings.get().codexFastMode).toBe(false)
+  expect(JSON.parse(await readFile(paths.globalSettingsFile, "utf8"))).toEqual({ codexFastMode: false })
+
+  await writeFile(paths.globalSettingsFile, JSON.stringify({ codexFastMode: "on" }))
+  settings.reload()
+  expect(settings.get().codexFastMode).toBe(false)
+  expect(settings.drainErrors()[0]?.error.message).toContain("codexFastMode")
 })
 
 test("global and project updates preserve fields owned by newer versions", async () => {
@@ -294,6 +314,7 @@ test("oversized settings are bounded and reported without entering effective sta
   expect(settings.get()).toEqual({
     steeringMode: "one-at-a-time",
     followUpMode: "one-at-a-time",
+    codexFastMode: false,
     retryEnabled: true,
     retryMaxRetries: 3,
     retryBaseDelayMs: 2_000,

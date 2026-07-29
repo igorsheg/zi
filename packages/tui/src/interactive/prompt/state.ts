@@ -106,6 +106,8 @@ export type PromptWorkflow =
       readonly cwd: string
       readonly selection: ProjectTrustSelection
     }
+  | { readonly type: "choosing_codex_setting"; readonly operationId: number; readonly session: AgentSession }
+  | { readonly type: "choosing_codex_fast_mode"; readonly operationId: number; readonly session: AgentSession }
   | { readonly type: "choosing_settings_scope"; readonly operationId: number; readonly session: AgentSession }
   | {
       readonly type: "choosing_setting"

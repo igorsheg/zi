@@ -9,6 +9,40 @@ import { createModels, createTestAgentRuntime, fauxProvider } from "@with-zi/cod
 
 import { createInteractiveTest, renderSettled, type InteractiveTestSetup } from "./harness.js"
 
+test("/codex-settings toggles Fast Mode through two focused picker frames", async () => {
+  const { session, setup } = await createSettingsFixture()
+
+  try {
+    const prompt = promptInput(setup)
+    prompt.setText("/codex-settings")
+    prompt.gotoBufferEnd()
+    setup.mockInput.pressEnter()
+    await renderSettled(setup)
+
+    expect(prompt.focused).toBe(true)
+    expect(setup.captureCharFrame()).toContain("OpenAI Codex settings")
+    expect(setup.captureCharFrame()).toContain("Fast mode")
+    setup.mockInput.pressEnter()
+    await renderSettled(setup)
+
+    const values = setup.captureCharFrame()
+    expect(values).toContain("Fast mode · OpenAI Codex")
+    expect(values).toContain("On")
+    expect(values).toContain("Off")
+    expect(values).toContain("priority service tier")
+    setup.mockInput.pressArrow("down")
+    setup.mockInput.pressEnter()
+    await renderSettled(setup)
+
+    expect(session.settingsManager.getGlobal().codexFastMode).toBe(true)
+    expect(setup.captureCharFrame()).toContain("Codex Fast mode: On")
+    expect(setup.captureCharFrame()).not.toContain("OpenAI Codex settings")
+  } finally {
+    session.dispose()
+    setup.destroy()
+  }
+})
+
 test("/settings keeps the composer focused through scoped nested selection", async () => {
   const { session, setup } = await createSettingsFixture()
 

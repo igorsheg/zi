@@ -25,6 +25,8 @@ export const promptPickerFrameIds = {
   authMethods: "auth-methods",
   authOptions: "auth-options",
   logoutProviders: "logout-providers",
+  codexSettings: "codex-settings",
+  codexSettingValues: "codex-setting-values",
   settingsScopes: "settings-scopes",
   settings: "settings",
   settingValues: "setting-values",
@@ -219,6 +221,40 @@ export function projectTrustSelection(
       return { id, selection: { type: "untrusted", persistence: "saved" } }
     default:
       return undefined
+  }
+}
+
+export function codexSettingsFrame(session: AgentSession): PickerFrame {
+  const enabled = session.settingsManager.get().codexFastMode
+  return {
+    id: promptPickerFrameIds.codexSettings,
+    title: "OpenAI Codex settings",
+    filter: "fuzzy",
+    rows: [
+      {
+        id: "fast-mode",
+        label: "Fast mode",
+        detail: `[${settingValueLabel(enabled)}]`,
+        metadata: enabled ? "Low verbosity · priority service tier" : "Provider-default verbosity and service tier",
+        searchText: `fast mode fast-mode ${enabled ? "on enabled low priority" : "off disabled default"}`
+      }
+    ]
+  }
+}
+
+export function codexFastModeValuesFrame(session: AgentSession): PickerFrame {
+  const saved = session.settingsManager.getGlobal().codexFastMode
+  const effective = session.settingsManager.get().codexFastMode
+  return {
+    id: promptPickerFrameIds.codexSettingValues,
+    title: "Fast mode · OpenAI Codex",
+    hint: "On sends low text verbosity and the priority service tier. Off sends neither.",
+    filter: "fuzzy",
+    rows: [true, false].map(value => settingValueRow(value, saved, effective)),
+    selectedId: settingValueId(effective),
+    ...(session.settingsManager.getProject().codexFastMode !== undefined
+      ? { footer: `Project settings keep Fast mode ${settingValueLabel(effective)}.` }
+      : {})
   }
 }
 

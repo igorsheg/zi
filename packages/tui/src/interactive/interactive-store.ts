@@ -231,6 +231,7 @@ export function transitionInteractiveState(state: InteractiveState, event: Agent
     case "compaction_start":
     case "compaction_enabled_changed":
     case "retry_enabled_changed":
+    case "codex_fast_mode_changed":
     case "queue_update":
     case "authentication_changed":
     case "model_changed":

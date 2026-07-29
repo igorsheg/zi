@@ -5,6 +5,7 @@ import { AgentSession } from "./agent-session.js"
 import { Authentication } from "./authentication.js"
 import type { CodeMode } from "./code-mode/code-mode.js"
 import { isCodeModeDetails } from "./code-mode/trace.js"
+import { applyCodexRequestSettings } from "./codex-settings.js"
 import type { FileCredentialStore } from "./credential-store.js"
 import { DEFAULT_THINKING_LEVEL } from "./defaults.js"
 import type { ExtensionHost } from "./extensions/host.js"
@@ -115,8 +116,15 @@ export async function createAgentSession(options: CreateAgentSessionOptions): Pr
     sessionId: sessionManager.sessionId,
     streamFn: (requestedModel, requestContext, streamOptions) => {
       const apiKey = requestedModel.provider === model?.provider ? options.apiKey : undefined
+      const codexFastMode = services.settingsManager.get().codexFastMode
+      const onPayload =
+        requestedModel.provider === "openai-codex"
+          ? (payload: unknown, payloadModel: Model<Api>) =>
+              applyCodexRequestSettings(payload, payloadModel, codexFastMode, streamOptions?.onPayload)
+          : streamOptions?.onPayload
       return services.modelRegistry.models.streamSimple(requestedModel, requestContext, {
         ...streamOptions,
+        ...(onPayload ? { onPayload } : {}),
         ...(apiKey ? { apiKey } : {})
       })
     },

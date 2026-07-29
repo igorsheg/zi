@@ -17,6 +17,7 @@ export interface AgentSettings {
   externalEditor?: string
   steeringMode: QueueMode
   followUpMode: QueueMode
+  codexFastMode: boolean
   retryEnabled: boolean
   retryMaxRetries: number
   retryBaseDelayMs: number
@@ -31,6 +32,7 @@ export const maxExternalEditorCommandLength = 16 * 1024
 const defaults: AgentSettings = {
   steeringMode: "one-at-a-time",
   followUpMode: "one-at-a-time",
+  codexFastMode: false,
   retryEnabled: true,
   retryMaxRetries: 3,
   retryBaseDelayMs: 2_000,
@@ -214,6 +216,9 @@ function validateSettingsPatch(patch: Partial<AgentSettings>): void {
   if ("followUpMode" in patch && !isQueueMode(patch.followUpMode)) {
     throw new Error("Invalid followUpMode setting")
   }
+  if ("codexFastMode" in patch && typeof patch.codexFastMode !== "boolean") {
+    throw new Error("Invalid codexFastMode setting")
+  }
   if ("retryEnabled" in patch && typeof patch.retryEnabled !== "boolean") {
     throw new Error("Invalid retryEnabled setting")
   }
@@ -259,6 +264,7 @@ function clearOverrides(overrides: Partial<AgentSettings>, patch: Partial<AgentS
   if ("externalEditor" in patch) delete overrides.externalEditor
   if ("steeringMode" in patch) delete overrides.steeringMode
   if ("followUpMode" in patch) delete overrides.followUpMode
+  if ("codexFastMode" in patch) delete overrides.codexFastMode
   if ("retryEnabled" in patch) delete overrides.retryEnabled
   if ("retryMaxRetries" in patch) delete overrides.retryMaxRetries
   if ("retryBaseDelayMs" in patch) delete overrides.retryBaseDelayMs
@@ -367,6 +373,10 @@ function loadSettings(path: string): Partial<AgentSettings> {
   if (value.followUpMode !== undefined) {
     if (!isQueueMode(value.followUpMode)) throw invalidSetting(path, "followUpMode")
     settings.followUpMode = value.followUpMode
+  }
+  if (value.codexFastMode !== undefined) {
+    if (typeof value.codexFastMode !== "boolean") throw invalidSetting(path, "codexFastMode")
+    settings.codexFastMode = value.codexFastMode
   }
   if (value.retryEnabled !== undefined) {
     if (typeof value.retryEnabled !== "boolean") throw invalidSetting(path, "retryEnabled")

@@ -171,6 +171,46 @@ test("automatic compaction failures surface through prompt feedback", async () =
   }
 })
 
+test("Codex settings use two picker frames and persist Fast Mode through AgentSession", async () => {
+  const session = await createSession("codex-settings-store")
+  const mode = createInteractiveStore(session)
+  const prompt = createPromptStore(mode, new SlashController())
+
+  try {
+    expect(prompt.submit("/codex-settings", "steer")).toBe(true)
+    expect(prompt.picker.presentation("")).toMatchObject({
+      depth: 1,
+      frame: { id: "codex-settings" },
+      selectedId: "fast-mode"
+    })
+    expect(prompt.activatePicker("", fileCompletionInputFromText("", 0))).toBe(true)
+    expect(prompt.picker.presentation("")).toMatchObject({
+      depth: 2,
+      frame: { id: "codex-setting-values" },
+      selectedId: "false"
+    })
+
+    expect(prompt.backPicker()).toBe(true)
+    expect(prompt.$state.get().inputEdit).toMatchObject({ type: "replace", text: "fast-mode" })
+    expect(prompt.picker.presentation("fast-mode")?.frame.id).toBe("codex-settings")
+    expect(prompt.activatePicker("fast-mode", fileCompletionInputFromText("fast-mode", 9))).toBe(true)
+    prompt.movePicker("", 1)
+    expect(prompt.activatePicker("", fileCompletionInputFromText("", 0))).toBe(true)
+
+    expect(session.settingsManager.getGlobal().codexFastMode).toBe(true)
+    expect(session.settingsManager.get().codexFastMode).toBe(true)
+    expect(prompt.$state.get()).toMatchObject({
+      feedback: { type: "status", message: "Codex Fast mode: On" },
+      workflow: { type: "idle" }
+    })
+    expect(prompt.picker.presentation("")).toBeUndefined()
+  } finally {
+    prompt.dispose()
+    mode.dispose()
+    session.dispose()
+  }
+})
+
 test("settings workflow restores suspended filters until a value closes the stack", async () => {
   const session = await createSession("settings-store")
   const mode = createInteractiveStore(session)

@@ -8,6 +8,7 @@ test("coding-agent owns descriptors for supported built-in slash commands", () =
     { name: "login", description: "Authenticate a provider", argumentHint: "<provider>" },
     { name: "logout", description: "Remove stored provider credentials" },
     { name: "settings", description: "Open settings menu" },
+    { name: "codex-settings", description: "Open OpenAI Codex settings" },
     {
       name: "compact",
       description: "Compact context, optionally preserving a specified focus",

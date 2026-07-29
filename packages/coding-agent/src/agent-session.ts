@@ -182,6 +182,7 @@ export type AgentSessionEvent =
   | { type: "compaction_end"; operationId: number; reason: CompactionReason; outcome: CompactionOutcome }
   | { type: "compaction_enabled_changed"; enabled: boolean }
   | { type: "retry_enabled_changed"; enabled: boolean }
+  | { type: "codex_fast_mode_changed"; enabled: boolean }
   | ({ type: "queue_update" } & QueuedInputs)
   | { type: "entry_appended"; entry: SessionEntry }
   | { type: "model_changed"; model: Model<Api> }
@@ -237,6 +238,11 @@ export interface CompactionEnabledMutation {
 
 export interface RetryEnabledMutation {
   readonly scope: SettingsScope
+  readonly requested: boolean
+  readonly effective: boolean
+}
+
+export interface CodexFastModeMutation {
   readonly requested: boolean
   readonly effective: boolean
 }
@@ -1114,6 +1120,15 @@ export class AgentSession {
       this.#emitAll([{ type: "follow_up_mode_changed", mode: effective }])
     }
     return Object.freeze({ scope, requested, effective })
+  }
+
+  setCodexFastMode(requested: boolean): CodexFastModeMutation {
+    this.#assertOpen()
+    if (typeof requested !== "boolean") throw new Error(`Invalid Codex Fast Mode setting: ${String(requested)}`)
+    this.settingsManager.updateGlobal({ codexFastMode: requested })
+    const effective = this.settingsManager.get().codexFastMode
+    this.#emitAll([{ type: "codex_fast_mode_changed", enabled: effective }])
+    return Object.freeze({ requested, effective })
   }
 
   setCompactionEnabled(requested: boolean, scope: SettingsScope): CompactionEnabledMutation {

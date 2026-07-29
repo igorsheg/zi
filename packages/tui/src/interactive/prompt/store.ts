@@ -33,6 +33,8 @@ import {
   authMethodFrame,
   authOptionFrame,
   authProviderFrame,
+  codexFastModeValuesFrame,
+  codexSettingsFrame,
   commandFrame,
   logoutFrame,
   modelChoiceId,
@@ -229,6 +231,10 @@ class PromptController implements PromptStore {
           return this.#fileCompletion.complete(presentation.selectedId, input)
         }
         return false
+      case "choosing_codex_setting":
+        return this.#activateCodexSetting(workflow, presentation, text)
+      case "choosing_codex_fast_mode":
+        return this.#activateCodexFastMode(workflow, presentation)
       case "choosing_settings_scope":
         return this.#activateSettingsScope(workflow, presentation, text)
       case "choosing_setting":
@@ -306,6 +312,16 @@ class PromptController implements PromptStore {
 
     const result = this.picker.back()
     switch (workflow.type) {
+      case "choosing_codex_fast_mode":
+        if (result.type === "revealed") {
+          this.$state.set({
+            ...this.$state.get(),
+            workflow: { type: "choosing_codex_setting", operationId: workflow.operationId, session: workflow.session }
+          })
+        } else {
+          this.#setIdle()
+        }
+        break
       case "choosing_setting_value":
         if (result.type === "revealed") {
           this.$state.set({
@@ -362,6 +378,7 @@ class PromptController implements PromptStore {
       case "starting_session":
       case "loading_sessions":
       case "choosing_session":
+      case "choosing_codex_setting":
       case "choosing_settings_scope":
         this.#setIdle()
         break
@@ -573,6 +590,57 @@ class PromptController implements PromptStore {
       default:
         return assertNever(result)
     }
+  }
+
+  #activateCodexSetting(
+    workflow: Extract<PromptWorkflow, { type: "choosing_codex_setting" }>,
+    presentation: PickerPresentation,
+    text: string
+  ): boolean {
+    if (presentation.frame.id !== promptPickerFrameIds.codexSettings || presentation.selectedId !== "fast-mode") {
+      return false
+    }
+    if (!this.#accepts(workflow.operationId, workflow.session)) return false
+    this.picker.push(codexFastModeValuesFrame(workflow.session), text || presentation.selectedId)
+    this.$state.set({
+      ...this.$state.get(),
+      workflow: { type: "choosing_codex_fast_mode", operationId: workflow.operationId, session: workflow.session }
+    })
+    this.#requestInput("")
+    return true
+  }
+
+  #activateCodexFastMode(
+    workflow: Extract<PromptWorkflow, { type: "choosing_codex_fast_mode" }>,
+    presentation: PickerPresentation
+  ): boolean {
+    if (presentation.frame.id !== promptPickerFrameIds.codexSettingValues || !presentation.selectedId) return false
+    if (!this.#accepts(workflow.operationId, workflow.session)) return false
+    if (presentation.selectedId !== "true" && presentation.selectedId !== "false") return false
+
+    let mutation: ReturnType<AgentSession["setCodexFastMode"]>
+    try {
+      mutation = workflow.session.setCodexFastMode(presentation.selectedId === "true")
+    } catch (cause) {
+      this.#showError(cause)
+      return false
+    }
+    if (!this.#accepts(workflow.operationId, workflow.session)) return false
+
+    this.picker.close()
+    this.$state.set({
+      ...this.$state.get(),
+      feedback: {
+        type: "status",
+        message:
+          mutation.requested === mutation.effective
+            ? `Codex Fast mode: ${settingValueLabel(mutation.effective)}`
+            : `Codex Fast mode saved as ${settingValueLabel(mutation.requested)}; project settings keep ${settingValueLabel(mutation.effective)} effective`
+      },
+      workflow: { type: "idle" }
+    })
+    this.#requestInput("")
+    return true
   }
 
   #activateSettingsScope(
@@ -820,6 +888,9 @@ class PromptController implements PromptStore {
         return true
       case "settings":
         this.#openSettings(parentFilter)
+        return true
+      case "codex_settings":
+        this.#openCodexSettings(parentFilter)
         return true
       case "compact":
         this.#compact(command.instructions)
@@ -1324,6 +1395,20 @@ class PromptController implements PromptStore {
       })
     }
     void apply()
+  }
+
+  #openCodexSettings(parentFilter?: string): void {
+    const session = this.#interactive.getSession()
+    const operationId = ++this.#nextOperationId
+    const frame = codexSettingsFrame(session)
+    if (parentFilter === undefined) this.picker.open(frame)
+    else this.picker.push(frame, parentFilter)
+    this.$state.set({
+      ...this.$state.get(),
+      feedback: { type: "none" },
+      workflow: { type: "choosing_codex_setting", operationId, session }
+    })
+    this.#requestInput("")
   }
 
   #openSettings(parentFilter?: string): void {

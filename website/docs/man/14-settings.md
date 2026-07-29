@@ -23,6 +23,14 @@ Global settings are your preferences. Project settings belong to the repo. Runti
 
 The settings picker writes either the global or project scope, then reports the effective value. If a project setting shadows a global write, Zi says so instead of pretending the global value took effect.
 
+Open provider-specific Codex settings with:
+
+```text
+/codex-settings
+```
+
+Its two-step picker exposes Fast Mode. On sends `text.verbosity: "low"` and `service_tier: "priority"` to the `openai-codex` provider. Off removes both fields. The picker writes the global setting.
+
 ## Example
 
 ```json
@@ -32,6 +40,7 @@ The settings picker writes either the global or project scope, then reports the 
   "defaultThinkingLevel": "medium",
   "steeringMode": "one-at-a-time",
   "followUpMode": "one-at-a-time",
+  "codexFastMode": false,
   "retryEnabled": true,
   "retryMaxRetries": 3,
   "retryBaseDelayMs": 2000,
@@ -59,6 +68,9 @@ Provider and model should move together. If a project needs a different model, s
 
 `followUpMode`
 : How prompts submitted after a run has pending follow-up are queued.
+
+`codexFastMode`
+: Send low text verbosity and the priority service tier to OpenAI Codex. When false, Zi removes both request fields.
 
 `retryEnabled`
 : Turn automatic retry on or off.

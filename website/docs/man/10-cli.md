@@ -19,7 +19,7 @@ zi
 zi "fix the failing build"
 ```
 
-Interactive mode is the default when stdin and stdout are terminals. It opens the TUI, streams assistant text and tool calls, keeps the prompt focused, and lets you run slash commands such as `/login`, `/model`, `/settings`, `/compact`, `/new`, and `/resume`.
+Interactive mode is the default when stdin and stdout are terminals. It opens the TUI, streams assistant text and tool calls, keeps the prompt focused, and lets you run slash commands such as `/login`, `/model`, `/settings`, `/codex-settings`, `/compact`, `/new`, and `/resume`.
 
 ## Text
 
