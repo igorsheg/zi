@@ -78,7 +78,9 @@ export class CodeMode {
   }
 
   createTool(tools: readonly AgentTool[]): AgentTool<typeof parameters, CodeModeDetails> {
-    if (tools.some(tool => tool.name === "code")) throw new Error("The tool name code is reserved for native code mode")
+    if (tools.some(tool => tool.name === "code" || tool.name === "then")) {
+      throw new Error("The tool names code and then are reserved for native code mode")
+    }
     if (tools.length > maxCodeModeToolNames) {
       throw new Error(`Code mode cannot admit more than ${maxCodeModeToolNames} tools`)
     }
@@ -330,7 +332,7 @@ class CodeExecution {
     }
     this.#callIds.add(message.id)
     const startedAt = Date.now()
-    const traceArguments = traceValue(message.arguments)
+    const traceArguments = projectTraceArguments(message.name, message.arguments)
     const callIndex =
       this.#calls.push({ state: "running", id: message.id, name: message.name, arguments: traceArguments, startedAt }) -
       1
@@ -459,8 +461,9 @@ function toolResultText(result: AgentToolResult<unknown>): string {
 function codeToolDescription(tools: readonly AgentTool[]): string {
   const prefix = `Execute JavaScript that orchestrates the other Zi tools.
 
-Every direct tool is also available as zi.<tool>(input) with the same input fields.
-Tool responses have { text, details }; use JSON.parse(response.text) for JSON output.
+Every direct tool is also available as zi.<tool>(input) with the same input fields; use zi["tool-name"] for punctuation.
+Successful calls return { text, details }; tool failures throw Error and may be handled with try/catch.
+Use JSON.parse(response.text) for JSON output. Console logs are retained when execution completes, not streamed live.
 Use code for data-dependent loops, filtering, branching, aggregation, and multi-call extension/API workflows.
 Prefer direct read, edit, write, and bash calls for ordinary coding operations that do not benefit from orchestration.
 Await every zi tool call before returning. Unawaited calls fail the execution.
@@ -515,6 +518,23 @@ function schemaType(schema: unknown, depth: number): string {
   if (schema.type === "boolean") return "boolean"
   if (schema.type === "null") return "null"
   return "unknown"
+}
+
+function projectTraceArguments(name: string, value: CodeModeJson): CodeModeJson {
+  if (!isRecord(value)) return traceValue(value)
+  if (name === "write") {
+    const output: Record<string, CodeModeJson> = {}
+    if (typeof value.path === "string") output.path = traceValue(value.path)
+    if (typeof value.content === "string") output.contentBytes = Buffer.byteLength(value.content)
+    return Object.freeze(output)
+  }
+  if (name === "edit") {
+    const output: Record<string, CodeModeJson> = {}
+    if (typeof value.path === "string") output.path = traceValue(value.path)
+    if (Array.isArray(value.edits)) output.operations = value.edits.length
+    return Object.freeze(output)
+  }
+  return traceValue(value)
 }
 
 function traceValue(value: unknown): CodeModeJson {

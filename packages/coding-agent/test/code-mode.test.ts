@@ -9,6 +9,7 @@ import { Type } from "@earendil-works/pi-ai"
 
 import { CodeMode, isCodeModeDetails } from "../src/code-mode/code-mode.js"
 import { createModels, createTestAgentRuntime, fauxAssistantMessage, fauxProvider } from "../src/testing.js"
+import { createReadTool } from "../src/tools/read.js"
 
 const workerCommand = Object.freeze([
   process.execPath,
@@ -122,6 +123,52 @@ test("code preserves nested schema failures as bounded trace evidence", async ()
   expect(result.content[0]).toMatchObject({ type: "text" })
 })
 
+test("code exposes a closed non-thenable guest tool catalog", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "zi-code-mode-proxy-"))
+  let calls = 0
+  const countedEcho: typeof echoTool = {
+    ...echoTool,
+    execute: async (...arguments_) => {
+      calls++
+      return echoTool.execute(...arguments_)
+    }
+  }
+  const tool = new CodeMode(cwd, workerCommand).createTool([countedEcho])
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(new Error("guest proxy remained thenable")), 250)
+  try {
+    const result = await tool.execute(
+      "outer",
+      {
+        code: `async () => {
+  const resolved = await Promise.resolve(zi);
+  return {
+    same: resolved === zi,
+    admitted: typeof zi.echo,
+    then: typeof zi.then,
+    unknown: typeof zi.notATool,
+    keys: Object.keys(zi),
+    frozen: Object.isFrozen(zi),
+    string: String(zi)
+  };
+}`
+      },
+      controller.signal
+    )
+
+    expect(result.content).toEqual([
+      {
+        type: "text",
+        text: '{\n  "same": true,\n  "admitted": "function",\n  "then": "undefined",\n  "unknown": "undefined",\n  "keys": [\n    "echo"\n  ],\n  "frozen": true,\n  "string": "[Zi tools]"\n}'
+      }
+    ])
+    expect(calls).toBe(0)
+    expect(isCodeModeDetails(result.details) && result.details.calls).toHaveLength(0)
+  } finally {
+    clearTimeout(timeout)
+  }
+})
+
 test("code guest has no ambient process, filesystem, module, credential, or network authority", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "zi-code-mode-isolation-"))
   const tool = new CodeMode(cwd, workerCommand).createTool([echoTool])
@@ -161,6 +208,72 @@ test("code enforces its nested call bound", async () => {
   if (result.details.outcome !== "error") throw new Error("Expected code-mode error")
   expect(result.details.calls).toHaveLength(64)
   expect(result.details.error).toContain("64 tool calls")
+})
+
+test("code guest can catch built-in expected errors and uncaught failures settle the outer tool", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "zi-code-mode-expected-error-"))
+  const tool = new CodeMode(cwd, workerCommand).createTool([createReadTool(cwd)])
+  const caught = await tool.execute(
+    "caught",
+    {
+      code: `async () => {
+  try { await zi.read({ path: "missing.txt" }); }
+  catch (error) { return String(error).includes("missing.txt"); }
+}`
+    },
+    undefined
+  )
+  expect(caught.content).toEqual([{ type: "text", text: "true" }])
+  expect(isCodeModeDetails(caught.details) && caught.details.calls[0]?.state).toBe("failed")
+
+  const uncaught = await tool.execute("uncaught", { code: `async () => zi.read({ path: "missing.txt" })` }, undefined)
+  expect(isCodeModeDetails(uncaught.details)).toBe(true)
+  if (!isCodeModeDetails(uncaught.details) || uncaught.details.outcome !== "error") {
+    throw new Error("Expected uncaught nested failure")
+  }
+  expect(uncaught.details.calls[0]?.state).toBe("failed")
+})
+
+test("code durable traces redact built-in write and edit payloads", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "zi-code-mode-trace-redaction-"))
+  const writeTool: AgentTool = {
+    name: "write",
+    label: "write",
+    description: "Write content",
+    parameters: Type.Object({ path: Type.String(), content: Type.String() }),
+    execute: async () => ({ content: [{ type: "text", text: "Wrote secret.txt" }], details: { outcome: "success" } })
+  }
+  const editTool: AgentTool = {
+    name: "edit",
+    label: "edit",
+    description: "Edit content",
+    parameters: Type.Object({
+      path: Type.String(),
+      edits: Type.Array(Type.Object({ oldText: Type.String(), newText: Type.String() }))
+    }),
+    execute: async () => ({ content: [{ type: "text", text: "Edited secret.txt" }], details: { outcome: "success" } })
+  }
+  const tool = new CodeMode(cwd, workerCommand).createTool([writeTool, editTool])
+  const result = await tool.execute(
+    "outer",
+    {
+      code: `async () => {
+  await zi.write({ path: "secret.txt", content: "write-secret-payload" });
+  await zi.edit({ path: "secret.txt", edits: [{ oldText: "old-secret", newText: "new-secret" }] });
+}`
+    },
+    undefined
+  )
+
+  expect(isCodeModeDetails(result.details)).toBe(true)
+  if (!isCodeModeDetails(result.details)) throw new Error("Expected code-mode details")
+  expect(result.details.calls.map(call => call.arguments)).toEqual([
+    { path: "secret.txt", contentBytes: 20 },
+    { path: "secret.txt", operations: 1 }
+  ])
+  expect(JSON.stringify(result.details)).not.toContain("secret-payload")
+  expect(JSON.stringify(result.details)).not.toContain("old-secret")
+  expect(JSON.stringify(result.details)).not.toContain("new-secret")
 })
 
 test("code supports punctuation in extension tool names", async () => {

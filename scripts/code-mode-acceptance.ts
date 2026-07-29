@@ -17,9 +17,15 @@ export async function runCodeModeAcceptance(options: {
       "compiled-acceptance",
       {
         code: `async () => {
+  const catalog = await Promise.resolve(zi);
   const file = await zi.read({ path: ".zi-code-mode-acceptance" });
   return {
     content: file.text,
+    catalog: catalog === zi,
+    then: typeof zi.then,
+    unknown: typeof zi.notATool,
+    keys: Object.keys(zi),
+    frozen: Object.isFrozen(zi),
     process: typeof process,
     bun: typeof Bun,
     require: typeof require,
@@ -39,6 +45,12 @@ export async function runCodeModeAcceptance(options: {
     const text = result.content[0]?.type === "text" ? result.content[0].text : ""
     if (
       !text.includes("compiled\\nisolated\\nbounded") ||
+      !text.includes('"catalog": true') ||
+      !text.includes('"then": "undefined"') ||
+      !text.includes('"unknown": "undefined"') ||
+      !text.includes('"keys": [') ||
+      !text.includes('"read"') ||
+      !text.includes('"frozen": true') ||
       !text.includes('"process": "undefined"') ||
       !text.includes('"bridge": "undefined"')
     ) {

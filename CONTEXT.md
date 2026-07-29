@@ -41,7 +41,7 @@ One stateless `code` invocation and its single owner of child-process lifetime, 
 _Avoid_: Agent turn, transaction, reusable sandbox, nested session
 
 **Code worker**:
-The isolated child process that owns one bounded QuickJS runtime and exchanges versioned framed messages with its host. Generated code receives only `console` and the `zi` proxy; the worker has no host effects and the guest has no ambient process, module, filesystem, credential, or network authority.
+The isolated child process that owns one bounded QuickJS runtime and exchanges versioned framed messages with its host. Generated code receives only `console` and a frozen non-thenable `zi` catalog; session effects remain host-owned and the guest has no ambient process, module, filesystem, credential, or network authority. The worker is fault containment, not a security boundary against a QuickJS escape.
 _Avoid_: Extension worker, coding-agent process, security approval boundary
 
 **Nested tool trace**:

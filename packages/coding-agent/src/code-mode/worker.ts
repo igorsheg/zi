@@ -158,7 +158,7 @@ async function startRun(start: Extract<CodeModeHostMessage, { type: "start" }>):
   hostLog.consume(handle => context.setProp(context.global, "__ziHostLog", handle))
 
   try {
-    const prelude = context.evalCode(sandboxPrelude())
+    const prelude = context.evalCode(sandboxPrelude(start.tools))
     if (prelude.error) {
       const error = quickJsError(context, prelude.error)
       prelude.error.dispose()
@@ -247,18 +247,28 @@ async function startRun(start: Extract<CodeModeHostMessage, { type: "start" }>):
   }
 }
 
-function sandboxPrelude(): string {
+function sandboxPrelude(tools: readonly string[]): string {
+  const catalog = JSON.stringify(tools).replaceAll("\u2028", "\\u2028").replaceAll("\u2029", "\\u2029")
   return `
 (() => {
   const callHost = globalThis.__ziHostCall;
   const writeLog = globalThis.__ziHostLog;
-  globalThis.zi = new Proxy(Object.create(null), {
-    get: (_target, name) => async (input) => {
-      const response = JSON.parse(await callHost(String(name), JSON.stringify(input ?? {})));
-      if (response.error) throw new Error(response.error);
-      return response.result;
-    }
-  });
+  const zi = Object.create(null);
+  for (const name of ${catalog}) {
+    if (name === "then") continue;
+    Object.defineProperty(zi, name, {
+      enumerable: true,
+      value: async (input) => {
+        const response = JSON.parse(await callHost(name, JSON.stringify(input ?? {})));
+        if (response.error) throw new Error(response.error);
+        return response.result;
+      }
+    });
+  }
+  Object.defineProperty(zi, Symbol.toPrimitive, { value: () => "[Zi tools]" });
+  Object.defineProperty(zi, Symbol.toStringTag, { value: "Zi tools" });
+  Object.freeze(zi);
+  Object.defineProperty(globalThis, "zi", { value: zi, writable: false, configurable: false });
   globalThis.console = Object.freeze({
     log: (...values) => writeLog(values.map(String).join(" ")),
     warn: (...values) => writeLog("[warn] " + values.map(String).join(" ")),

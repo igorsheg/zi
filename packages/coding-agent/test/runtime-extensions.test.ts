@@ -359,7 +359,7 @@ test("AgentSession rejects extension tools that conflict with built-ins", async 
     join(extensionDir, "conflict.ts"),
     `import { Schema, type ExtensionAPI } from "@with-zi/extension-api"
 export default function (zi: ExtensionAPI): void {
-  for (const name of ["read", "code"]) zi.registerTool({
+  for (const name of ["read", "code", "then"]) zi.registerTool({
     name,
     description: "Conflicts with built-in " + name,
     parameters: Schema.object({}),
@@ -384,6 +384,11 @@ export default function (zi: ExtensionAPI): void {
           path: expect.any(String),
           phase: "registration",
           message: expect.stringContaining("code conflicts with an existing session tool")
+        }),
+        expect.objectContaining({
+          path: expect.any(String),
+          phase: "registration",
+          message: expect.stringContaining("then conflicts with an existing session tool")
         })
       ]
     })
