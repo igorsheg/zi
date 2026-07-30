@@ -17,7 +17,24 @@ export type PromptFeedback =
   | { readonly type: "warning"; readonly message: string }
   | { readonly type: "copy_warning"; readonly message: string }
   | { readonly type: "error"; readonly message: string }
-  | { readonly type: "auth_link"; readonly requestId: number; readonly message: string; readonly url: string }
+
+/** Sticky OAuth/API-key ceremony retained above the composer while login runs. */
+export interface AuthCeremony {
+  readonly providerName: string
+  readonly methodName: string
+  readonly url?: { readonly href: string; readonly instructions?: string; readonly requestId: number }
+  readonly device?: { readonly userCode: string; readonly verificationUri: string; readonly requestId: number }
+  readonly info?: {
+    readonly message: string
+    readonly links?: readonly { readonly url: string; readonly label?: string }[]
+  }
+  readonly status?: string
+  readonly prompt?: {
+    readonly type: "text" | "secret" | "manual_code"
+    readonly message: string
+    readonly placeholder?: string
+  }
+}
 
 export type EditableSetting =
   | "defaultThinkingLevel"
@@ -136,6 +153,7 @@ export type PromptInputEdit =
 
 export interface PromptState {
   readonly feedback: PromptFeedback
+  readonly authCeremony: AuthCeremony | undefined
   readonly images: readonly ImageContent[]
   readonly workflow: PromptWorkflow
   readonly inputEdit: PromptInputEdit
@@ -143,6 +161,7 @@ export interface PromptState {
 
 export const initialPromptState: PromptState = {
   feedback: { type: "none" },
+  authCeremony: undefined,
   images: [],
   workflow: { type: "idle" },
   inputEdit: { type: "replace", revision: 0, text: "", cursorOffset: 0 }

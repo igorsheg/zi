@@ -322,7 +322,9 @@ test("model picker omits unconfigured providers, sorts like Pi, and wraps select
   models.setProvider(alpha.provider)
   models.setProvider(hidden.provider)
   models.getAuth = async model =>
-    model.provider === "hidden" ? undefined : { auth: { apiKey: "configured" }, source: "test" }
+    (typeof model === "string" ? model : model.provider) === "hidden"
+      ? undefined
+      : { auth: { apiKey: "configured" }, source: "test" }
   const { session } = await createAgentRuntime({
     cwd: "/work",
     model: "zeta/current",

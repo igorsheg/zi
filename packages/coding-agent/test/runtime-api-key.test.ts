@@ -86,7 +86,17 @@ test("runtime API key alone authenticates its explicit model without creating au
       return fauxAssistantMessage("ok")
     }
   ])
-  const provider = { ...faux.provider, auth: { apiKey: { name: "Key only", resolve: async () => undefined } } }
+  // Runtime --api-key is applied as an AuthResolutionOverrides credential; resolve must honor it.
+  const provider = {
+    ...faux.provider,
+    auth: {
+      apiKey: {
+        name: "Key only",
+        resolve: async ({ credential }: { credential?: { key?: string } }) =>
+          credential?.key ? { auth: { apiKey: credential.key }, source: "runtime" } : undefined
+      }
+    }
+  }
   const runtime = await createAgentRuntime({
     cwd: join(root, "project"),
     agentDir: globalDir,

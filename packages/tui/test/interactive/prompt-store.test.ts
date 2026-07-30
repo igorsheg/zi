@@ -30,6 +30,7 @@ test("prompt store restores queued text, images, and status without a renderer",
     expect(text).toBe("queued text\n\ncurrent draft")
     expect(prompt.$state.get()).toEqual({
       feedback: { type: "status", message: "Restored 1 queued message to editor with 1 image" },
+      authCeremony: undefined,
       images: [{ type: "image", data: "aW1hZ2U=", mimeType: "image/png" }],
       workflow: { type: "idle" },
       inputEdit: { type: "replace", revision: 0, text: "", cursorOffset: 0 }

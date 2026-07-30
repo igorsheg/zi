@@ -38,8 +38,9 @@ test("model choices preserve registry identity and resolve provider configuratio
     ])
     const calls: string[] = []
     models.getAuth = async model => {
-      calls.push(model.provider)
-      return auth.get(model.provider)
+      const provider = authProviderId(model)
+      calls.push(provider)
+      return auth.get(provider)
     }
 
     const firstLoad = session.listModelChoices()
@@ -234,6 +235,8 @@ test("model selection rejects unconfigured and non-idle sessions before domain m
     expect(session.sessionManager.entries()).toHaveLength(entryStart)
     expect(modelEvents).toEqual([])
 
+    // Provider streaming resolves auth again; restore configuration before starting a run.
+    models.getAuth = async () => configuredAuth()
     const providerStarted = deferred<void>()
     const release = deferred<void>()
     faux.setResponses([
@@ -245,7 +248,6 @@ test("model selection rejects unconfigured and non-idle sessions before domain m
     ])
     const run = session.prompt("running")
     await providerStarted.promise
-    models.getAuth = async () => configuredAuth()
     expect((await rejection(session.setModel(target))).message).toContain("while the agent is running")
     session.steer("pending")
     const aborted = session.takeQueuedInputsAndAbort()
@@ -309,8 +311,9 @@ test("model validation rejects prompt, disposal, and out-of-order completion rac
     const firstAuth = deferred<AuthResult | undefined>()
     const latestAuth = deferred<AuthResult | undefined>()
     models.getAuth = model => {
-      if (model.provider === "race-first") return firstAuth.promise
-      if (model.provider === "race-latest") return latestAuth.promise
+      const provider = authProviderId(model)
+      if (provider === "race-first") return firstAuth.promise
+      if (provider === "race-latest") return latestAuth.promise
       return Promise.resolve(configuredAuth())
     }
     const earlier = session.setModel(first)
@@ -322,7 +325,8 @@ test("model validation rejects prompt, disposal, and out-of-order completion rac
     expect(session.model).toBe(latest)
 
     const promptAuth = deferred<AuthResult | undefined>()
-    models.getAuth = model => (model.provider === "race-first" ? promptAuth.promise : Promise.resolve(configuredAuth()))
+    models.getAuth = model =>
+      authProviderId(model) === "race-first" ? promptAuth.promise : Promise.resolve(configuredAuth())
     latestProvider.setResponses([fauxAssistantMessage("done")])
     const staleForPrompt = session.setModel(first)
     await session.prompt("invalidate model validation")
@@ -332,7 +336,7 @@ test("model validation rejects prompt, disposal, and out-of-order completion rac
 
     const disposeAuth = deferred<AuthResult | undefined>()
     models.getAuth = model =>
-      model.provider === "race-first" ? disposeAuth.promise : Promise.resolve(configuredAuth())
+      authProviderId(model) === "race-first" ? disposeAuth.promise : Promise.resolve(configuredAuth())
     const staleForDispose = session.setModel(first)
     session.dispose()
     disposeAuth.resolve(configuredAuth())
@@ -471,7 +475,7 @@ test("catalog, selection, and failure retries share one four-provider auth bound
     models.getAuth = async model => {
       active++
       peak = Math.max(peak, active)
-      if (model.provider === "shared-0" && !failed) {
+      if (authProviderId(model) === "shared-0" && !failed) {
         failed = true
         active--
         throw new Error("first lookup failed")
@@ -495,6 +499,10 @@ test("catalog, selection, and failure retries share one four-provider auth bound
 
 function configuredAuth(): AuthResult {
   return { auth: { apiKey: "configured" }, source: "test" }
+}
+
+function authProviderId(model: { readonly provider: string } | string): string {
+  return typeof model === "string" ? model : model.provider
 }
 
 async function waitFor(predicate: () => boolean): Promise<void> {

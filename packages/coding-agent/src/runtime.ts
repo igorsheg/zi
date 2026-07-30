@@ -1,6 +1,11 @@
 import { fileURLToPath } from "node:url"
 
+// Pi AI keeps OAuth flows behind dynamic imports for browser bundlers. Standalone
+// Bun binaries register the static loaders so /login can open subscription flows.
+import { registerBunOAuthFlows } from "@earendil-works/pi-ai/bun-oauth"
 import { builtinModels } from "@earendil-works/pi-ai/providers/all"
+
+registerBunOAuthFlows()
 
 import type { AgentSession } from "./agent-session.js"
 import { CodeMode } from "./code-mode/code-mode.js"

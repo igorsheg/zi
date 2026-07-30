@@ -1,4 +1,4 @@
-import type { AuthEvent, AuthLoginCallbacks, AuthPrompt, Credential, Models } from "@earendil-works/pi-ai"
+import type { AuthEvent, AuthInteraction, AuthPrompt, Credential, Models } from "@earendil-works/pi-ai"
 
 import type { FileCredentialStore } from "./credential-store.js"
 
@@ -137,9 +137,9 @@ export class Authentication {
         throw new Error(`Authentication interaction count exceeds ${MAX_LOGIN_INTERACTIONS}`)
       }
     }
-    const callbacks: AuthLoginCallbacks = {
+    const callbacks: AuthInteraction = {
       signal: controller.signal,
-      prompt: async prompt => {
+      prompt: async (prompt: AuthPrompt) => {
         admitInteraction()
         const bounded = boundedPrompt(prompt)
         const answer = await interaction.prompt(bounded)
@@ -150,7 +150,7 @@ export class Authentication {
         }
         return answer
       },
-      notify: event => {
+      notify: (event: AuthEvent) => {
         admitInteraction()
         interaction.notify(boundedEvent(event))
       }
@@ -317,6 +317,25 @@ function boundedEvent(event: AuthEvent): AuthEvent {
       return Object.freeze({
         type: "progress",
         message: boundedText("Authentication progress", event.message, MAX_PRESENTATION_TEXT_LENGTH)
+      })
+    case "info":
+      return Object.freeze({
+        type: "info",
+        message: boundedText("Authentication info", event.message, MAX_PRESENTATION_TEXT_LENGTH),
+        ...(event.links
+          ? {
+              links: Object.freeze(
+                event.links.map(item =>
+                  Object.freeze({
+                    url: boundedUrl("Authentication info URL", item.url),
+                    ...(item.label
+                      ? { label: boundedText("Authentication info label", item.label, MAX_PRESENTATION_TEXT_LENGTH) }
+                      : {})
+                  })
+                )
+              )
+            }
+          : {})
       })
     default:
       return assertNever(event)

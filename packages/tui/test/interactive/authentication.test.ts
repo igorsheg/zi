@@ -327,7 +327,7 @@ test("OAuth login renders URL, device, select, manual-code, and progress steps t
   const openedUrls: string[] = []
   const setup = await createInteractiveTest(
     runtime.session,
-    { width: 64, height: 14, kittyKeyboard: true },
+    { width: 64, height: 22, kittyKeyboard: true },
     undefined,
     undefined,
     { open: async url => void openedUrls.push(url), dispose() {} }
@@ -346,21 +346,28 @@ test("OAuth login renders URL, device, select, manual-code, and progress steps t
     await settle(setup)
     expect(setup.captureCharFrame()).toContain("ABCD")
     expect(setup.captureCharFrame()).toContain("https://example.com/device")
+    expect(setup.captureCharFrame()).toContain("https://example.com/login")
+    expect(setup.captureCharFrame()).toContain("Waiting for authentication")
     expect(openedUrls).toEqual(["https://example.com/login", "https://example.com/device"])
 
     afterDevice.resolve(undefined)
     await settle(setup)
     expect(setup.captureCharFrame()).toContain("Browser callback")
     expect(setup.captureCharFrame()).toContain("Manual code")
+    expect(setup.captureCharFrame()).toContain("https://example.com/login")
     setup.mockInput.pressEnter()
     await settle(setup)
     expect(setup.captureCharFrame()).toContain("Paste authorization code")
+    expect(setup.captureCharFrame()).toContain("https://example.com/login")
+    expect(setup.captureCharFrame()).toContain("ABCD")
     expect(input.selectable).toBe(true)
 
     await setup.mockInput.typeText("oauth-code", 0)
     setup.mockInput.pressEnter()
     await settle(setup)
     expect(setup.captureCharFrame()).toContain("Exchanging authorization code")
+    expect(setup.captureCharFrame()).toContain("https://example.com/login")
+    expect(setup.captureCharFrame()).toContain("ABCD")
     expect(input.plainText).toBe("")
 
     const modelChanged = waitForModelChanged(runtime.session)

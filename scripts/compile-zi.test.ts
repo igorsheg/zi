@@ -334,10 +334,9 @@ test("the standalone bundle resolves OAuth and settles highlighted Markdown", as
   const temporary = await mkdtemp(join(import.meta.dirname, ".compiled-standalone-"))
   const entrypoint = join(temporary, "smoke.ts")
   const executable = join(temporary, process.platform === "win32" ? "smoke.exe" : "smoke")
-  const providers = Bun.resolveSync(
-    "@earendil-works/pi-ai/providers/all",
-    resolve(import.meta.dirname, "../packages/coding-agent/src")
-  )
+  const codingAgentSource = resolve(import.meta.dirname, "../packages/coding-agent/src")
+  const providers = Bun.resolveSync("@earendil-works/pi-ai/providers/all", codingAgentSource)
+  const bunOauth = Bun.resolveSync("@earendil-works/pi-ai/bun-oauth", codingAgentSource)
   const tuiSource = resolve(import.meta.dirname, "../packages/tui/src")
   const openTuiCore = Bun.resolveSync("@opentui/core", tuiSource)
   const openTuiTesting = Bun.resolveSync("@opentui/core/testing", tuiSource)
@@ -363,7 +362,10 @@ import {
 } from ${JSON.stringify(openTuiCore)}
 import { createTestRenderer } from ${JSON.stringify(openTuiTesting)}
 
-const providerIds = ["anthropic", "github-copilot", "openai-codex"]
+import { registerBunOAuthFlows } from ${JSON.stringify(bunOauth)}
+registerBunOAuthFlows()
+
+const providerIds = ["anthropic", "github-copilot", "openai-codex", "xai"]
 const credential = {
   type: "oauth",
   access: "compiled-oauth-access",
@@ -381,6 +383,8 @@ const credentials = {
 }
 const models = builtinModels({ credentials })
 for (const providerId of providerIds) {
+  const provider = models.getProvider(providerId)
+  if (!provider?.auth.oauth) throw new Error(\`Missing OAuth method for \${providerId}\`)
   const model = models.getModels(providerId)[0]
   if (!model) throw new Error(\`Missing model for \${providerId}\`)
   const auth = await models.getAuth(model)

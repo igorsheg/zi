@@ -52,6 +52,7 @@ import { configuredModelChoices, exactModelChoice } from "./model-choices.js"
 import { createPickerStack, type PickerPresentation, type PickerStack } from "./picker.js"
 import {
   initialPromptState,
+  type AuthCeremony,
   type EditableSetting,
   type EditableSettingValue,
   type PromptFeedback,
@@ -752,8 +753,10 @@ class PromptController implements PromptStore {
     pending.cleanup()
     this.#pendingAuthPrompt = undefined
     this.picker.close()
+    const state = this.$state.get()
     this.$state.set({
-      ...this.$state.get(),
+      ...state,
+      authCeremony: clearCeremonyChoice(state.authCeremony),
       workflow: {
         type: "authenticating",
         operationId: workflow.operationId,
@@ -1148,7 +1151,8 @@ class PromptController implements PromptStore {
     this.picker.close()
     this.$state.set({
       ...this.$state.get(),
-      feedback: { type: "status", message: `Starting ${method.name}…` },
+      feedback: { type: "none" },
+      authCeremony: { providerName: method.providerName, methodName: method.name, status: `Starting ${method.name}…` },
       workflow: { type: "authenticating", operationId, session, providerId: method.providerId }
     })
     this.#requestInput("")
@@ -1160,8 +1164,10 @@ class PromptController implements PromptStore {
           if (this.#pendingAuthPrompt?.operationId !== operationId) return
           this.#pendingAuthPrompt = undefined
           this.picker.close()
+          const state = this.$state.get()
           this.$state.set({
-            ...this.$state.get(),
+            ...state,
+            authCeremony: clearCeremonyPrompt(state.authCeremony),
             workflow: { type: "authenticating", operationId, session, providerId: method.providerId }
           })
           this.#requestInput("")
@@ -1175,11 +1181,13 @@ class PromptController implements PromptStore {
           cleanup: () => authPrompt.signal?.removeEventListener("abort", onAbort)
         }
 
+        const state = this.$state.get()
+        const ceremony = state.authCeremony ?? { providerName: method.providerName, methodName: method.name }
         if (authPrompt.type === "select") {
           this.picker.open(authOptionFrame(authPrompt.options))
           this.$state.set({
-            ...this.$state.get(),
-            feedback: { type: "status", message: authPrompt.message },
+            ...state,
+            authCeremony: withCeremonyStatus(clearCeremonyPrompt(ceremony) ?? ceremony, authPrompt.message),
             workflow: {
               type: "choosing_auth_option",
               operationId,
@@ -1190,8 +1198,12 @@ class PromptController implements PromptStore {
           })
         } else {
           this.$state.set({
-            ...this.$state.get(),
-            feedback: { type: "status", message: authPrompt.message },
+            ...state,
+            authCeremony: withCeremonyPrompt(clearCeremonyStartingStatus(ceremony), {
+              type: authPrompt.type,
+              message: authPrompt.message,
+              ...(authPrompt.placeholder ? { placeholder: authPrompt.placeholder } : {})
+            }),
             workflow: {
               type: "auth_prompt",
               operationId,
@@ -1211,9 +1223,11 @@ class PromptController implements PromptStore {
           prompt,
           notify: event => {
             if (!this.#accepts(operationId, session)) return
+            const state = this.$state.get()
+            const ceremony = state.authCeremony ?? { providerName: method.providerName, methodName: method.name }
             this.$state.set({
-              ...this.$state.get(),
-              feedback: authenticationEventFeedback(event, ++this.#nextBrowserRequestId)
+              ...state,
+              authCeremony: applyAuthenticationEvent(ceremony, event, ++this.#nextBrowserRequestId)
             })
           }
         })
@@ -1234,8 +1248,10 @@ class PromptController implements PromptStore {
     const pending = this.#pendingAuthPrompt
     pending.cleanup()
     this.#pendingAuthPrompt = undefined
+    const state = this.$state.get()
     this.$state.set({
-      ...this.$state.get(),
+      ...state,
+      authCeremony: clearCeremonyPrompt(state.authCeremony),
       workflow: {
         type: "authenticating",
         operationId: workflow.operationId,
@@ -1261,7 +1277,12 @@ class PromptController implements PromptStore {
     this.#pendingAuthPrompt?.cleanup()
     this.#pendingAuthPrompt?.reject(new Error("Authentication cancelled"))
     this.#pendingAuthPrompt = undefined
-    this.$state.set({ ...this.$state.get(), feedback: { type: "none" }, workflow: { type: "idle" } })
+    this.$state.set({
+      ...this.$state.get(),
+      feedback: { type: "none" },
+      authCeremony: undefined,
+      workflow: { type: "idle" }
+    })
     this.#requestInput("")
     try {
       void workflow.session.abort().catch(cause => this.#showError(cause))
@@ -1326,7 +1347,7 @@ class PromptController implements PromptStore {
     this.#pendingAuthPrompt?.cleanup()
     this.#pendingAuthPrompt = undefined
     this.picker.close()
-    this.$state.set({ ...this.$state.get(), feedback, workflow: { type: "idle" } })
+    this.$state.set({ ...this.$state.get(), feedback, authCeremony: undefined, workflow: { type: "idle" } })
     this.#requestInput("")
   }
 
@@ -1572,17 +1593,67 @@ function imageMarkerFeedback(action: "Removed" | "Restored", count: number): Pro
   return { type: "status", message: `${action} ${count} attached image${count === 1 ? "" : "s"}` }
 }
 
-function authenticationEventFeedback(event: AuthenticationEvent, requestId: number): PromptFeedback {
+function applyAuthenticationEvent(ceremony: AuthCeremony, event: AuthenticationEvent, requestId: number): AuthCeremony {
   switch (event.type) {
     case "auth_url":
-      return { type: "auth_link", requestId, message: event.instructions ?? "Open", url: event.url }
-    case "device_code":
-      return { type: "auth_link", requestId, message: `Enter ${event.userCode} at`, url: event.verificationUri }
+      return {
+        ...clearCeremonyTransientStatus(ceremony),
+        url: { href: event.url, requestId, ...(event.instructions ? { instructions: event.instructions } : {}) }
+      }
+    case "device_code": {
+      const waiting =
+        ceremony.status && !isTransientCeremonyStatus(ceremony.status) ? ceremony.status : "Waiting for authentication…"
+      return {
+        ...withCeremonyStatus(ceremony, waiting),
+        device: { userCode: event.userCode, verificationUri: event.verificationUri, requestId }
+      }
+    }
     case "progress":
-      return { type: "status", message: event.message }
+      return withCeremonyStatus(ceremony, event.message)
+    case "info":
+      return {
+        ...clearCeremonyTransientStatus(ceremony),
+        info: { message: event.message, ...(event.links ? { links: event.links } : {}) }
+      }
     default:
       return assertNever(event)
   }
+}
+
+function clearCeremonyPrompt(ceremony: AuthCeremony | undefined): AuthCeremony | undefined {
+  if (!ceremony?.prompt) return ceremony
+  const { prompt: _prompt, ...rest } = ceremony
+  return rest
+}
+
+function clearCeremonyChoice(ceremony: AuthCeremony | undefined): AuthCeremony | undefined {
+  if (!ceremony) return undefined
+  const { prompt: _prompt, status: _status, ...rest } = ceremony
+  return rest
+}
+
+function clearCeremonyStartingStatus(ceremony: AuthCeremony): AuthCeremony {
+  if (!ceremony.status?.startsWith("Starting ")) return ceremony
+  const { status: _status, ...rest } = ceremony
+  return rest
+}
+
+function clearCeremonyTransientStatus(ceremony: AuthCeremony): AuthCeremony {
+  if (!ceremony.status || !isTransientCeremonyStatus(ceremony.status)) return ceremony
+  const { status: _status, ...rest } = ceremony
+  return rest
+}
+
+function withCeremonyStatus(ceremony: AuthCeremony, status: string): AuthCeremony {
+  return { ...ceremony, status }
+}
+
+function withCeremonyPrompt(ceremony: AuthCeremony, prompt: NonNullable<AuthCeremony["prompt"]>): AuthCeremony {
+  return { ...ceremony, prompt }
+}
+
+function isTransientCeremonyStatus(status: string): boolean {
+  return status.startsWith("Starting ") || status.startsWith("Select ") || status.startsWith("Choose ")
 }
 
 function settingsScope(value: string): SettingsScope | undefined {

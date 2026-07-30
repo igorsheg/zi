@@ -1702,7 +1702,7 @@ export class AgentSession {
           const sample: SummarySampler = (sampleRequest, sampleSignal) =>
             settleBeforeAbort(
               Promise.resolve(
-                this.#agent.streamFn(prepared.model, sampleRequest.context, {
+                this.#agent.streamFunction(prepared.model, sampleRequest.context, {
                   maxTokens: sampleRequest.maxTokens,
                   signal: sampleSignal,
                   cacheRetention: "none",

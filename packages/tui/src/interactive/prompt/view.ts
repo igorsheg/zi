@@ -170,7 +170,7 @@ export class PromptView {
     this.#input.attributes = secretInput ? TextAttributes.HIDDEN : 0
     this.#input.selectable = !secretInput
     if (secretInput) this.#renderer.clearSelection()
-    const feedbackVisible = this.#feedback.update(prompt.feedback, this.#renderer.width)
+    const feedbackRows = this.#feedback.update(prompt.feedback, prompt.authCeremony, this.#renderer.width)
     const working = session.isStreaming || session.compactionStatus.type === "running"
     const pickerOpen = Boolean(this.#store.picker.presentation(this.#input.plainText))
     const greeterRows = this.#greeter.update(
@@ -179,7 +179,7 @@ export class PromptView {
       this.#renderer.height,
       pickerOpen
     )
-    const fixedRows = geometry.protectedRows + greeterRows + (working ? 1 : 0) + (feedbackVisible ? 1 : 0)
+    const fixedRows = geometry.protectedRows + greeterRows + (working ? 1 : 0) + feedbackRows
     const pickerVisible = this.#pickerStack.update(Math.max(0, this.#renderer.height - fixedRows))
 
     this.#working.setText(workingStatusText(session, this.#keybindings.getHint("app.interrupt"), Date.now()))

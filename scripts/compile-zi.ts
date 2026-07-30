@@ -6,16 +6,6 @@ export interface CompileZiOptions {
   readonly version: string
 }
 
-// Pi AI 0.80.6 keeps Node-only OAuth flows behind a variable import so browser
-// bundlers cannot discover them. Standalone Bun builds need literal imports;
-// fail-closed rewrite counting and the compiled OAuth test pin this seam until
-// Pi AI exposes a supported Node/Bun bundling entrypoint.
-const bundledOAuthLoader = `
-export const loadAnthropicOAuth = async () => (await import("./anthropic.js")).anthropicOAuth
-export const loadOpenAICodexOAuth = async () => (await import("./openai-codex.js")).openaiCodexOAuth
-export const loadGitHubCopilotOAuth = async () => (await import("./github-copilot.js")).githubCopilotOAuth
-`
-
 export async function compileZi(options: CompileZiOptions): Promise<void> {
   if (!options.version || options.version.length > 128 || /[\r\n]/.test(options.version)) {
     throw new Error("Zi build versions must contain 1 to 128 characters on one line")
@@ -40,7 +30,6 @@ export async function compileStandalone(
       : undefined
   assertPinnedBunVersion(Bun.version, packageManager)
 
-  let oauthLoaderRewrites = 0
   await mkdir(dirname(outfile), { recursive: true })
   await Bun.build({
     entrypoints: [entrypoint],
@@ -50,7 +39,6 @@ export async function compileStandalone(
     packages: "bundle",
     conditions: ["bun", "node"],
     define: { ...define },
-    plugins: [compiledOAuthPlugin(() => oauthLoaderRewrites++)],
     compile: {
       outfile,
       autoloadDotenv: false,
@@ -59,9 +47,6 @@ export async function compileStandalone(
       autoloadPackageJson: false
     }
   })
-  if (oauthLoaderRewrites !== 1) {
-    throw new Error(`Expected to replace one Pi AI OAuth loader, replaced ${oauthLoaderRewrites}`)
-  }
 }
 
 export function assertPinnedBunVersion(actual: string, packageManager: unknown): void {
@@ -72,18 +57,6 @@ export function assertPinnedBunVersion(actual: string, packageManager: unknown):
     throw new Error(
       `Zi builds require Bun ${expected}; running ${actual}. Update Bun before building the standalone executable.`
     )
-  }
-}
-
-function compiledOAuthPlugin(onRewrite: () => void): Bun.BunPlugin {
-  return {
-    name: "zi-compiled-oauth",
-    setup(builder) {
-      builder.onLoad({ filter: /[\\/]@earendil-works[\\/]pi-ai[\\/]dist[\\/]utils[\\/]oauth[\\/]load\.js$/ }, () => {
-        onRewrite()
-        return { contents: bundledOAuthLoader, loader: "js" }
-      })
-    }
   }
 }
 
