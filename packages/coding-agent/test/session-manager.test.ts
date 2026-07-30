@@ -457,6 +457,12 @@ test("compaction markers project one latest summary and an exact retained tail",
   expect(session.entries()[0]?.id).toBe(oldUser.id)
   expect(session.activeMessages().map(message => message.role)).toEqual(["compactionSummary", "assistant", "user"])
   expect(session.activeMessages()[0]).toMatchObject({ summary: "latest summary", estimatedTokensAfter: 18 })
+  expect(session.presentationMessages().map(message => message.role)).toEqual([
+    "assistant",
+    "user",
+    "compactionSummary"
+  ])
+  expect(session.presentationMessages().at(-1)).toMatchObject({ summary: "latest summary", estimatedTokensAfter: 18 })
 })
 
 test("a compaction marker cannot become a later exact-tail boundary", () => {

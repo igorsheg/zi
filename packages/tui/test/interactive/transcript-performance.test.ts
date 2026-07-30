@@ -71,10 +71,100 @@ test("authoritative message-array replacement rebuilds an equal-length transcrip
     await harness.setup.flush()
 
     expect(harness.view.scroll.getChildren()[0]).not.toBe(oldRoot)
-    expect(harness.setup.captureCharFrame()).toContain("checkpoint summary")
+    const collapsed = harness.setup.captureCharFrame()
+    expect(collapsed).toContain("[compaction]")
+    expect(collapsed).toContain("Compacted from 100 tokens")
+    expect(collapsed).not.toContain("checkpoint summary")
     expect(harness.view.scroll.stickyScroll).toBe(true)
   } finally {
     harness.destroy()
+  }
+})
+
+test("compaction summaries stay collapsed until tools expand, then reveal the checkpoint body", async () => {
+  const harness = await createTranscriptHarness([
+    {
+      role: "compactionSummary",
+      summary: "Recovered auth flow and kept recent tool results.",
+      tokensBefore: 12345,
+      estimatedTokensAfter: 2400,
+      timestamp: 1
+    }
+  ])
+  try {
+    await harness.setup.flush()
+    const collapsed = harness.setup.captureCharFrame()
+    expect(collapsed).toContain("[compaction]")
+    expect(collapsed).toContain("Compacted from 12,345 tokens (Ctrl+O to expand)")
+    expect(collapsed).not.toContain("Recovered auth flow")
+
+    harness.setup.mockInput.pressKey("o", { ctrl: true })
+    await harness.setup.flush()
+    const expanded = harness.setup.captureCharFrame()
+    expect(expanded).toContain("[compaction]")
+    expect(expanded).toContain("Compacted from 12,345 tokens")
+    expect(expanded).toContain("Recovered auth flow and kept recent tool results.")
+    expect(expanded).not.toContain("to expand")
+
+    harness.setup.mockInput.pressKey("o", { ctrl: true })
+    await harness.setup.flush()
+    const recoollapsed = harness.setup.captureCharFrame()
+    expect(recoollapsed).toContain("Ctrl+O to expand")
+    expect(recoollapsed).not.toContain("Recovered auth flow")
+  } finally {
+    harness.destroy()
+  }
+})
+
+test("post-compaction presentation keeps the marker at the transcript tail", async () => {
+  const harness = await createTranscriptHarness([
+    { role: "user", content: "old work that stays in the exact tail", timestamp: 1 },
+    {
+      role: "compactionSummary",
+      summary: "checkpoint after compact",
+      tokensBefore: 89000,
+      estimatedTokensAfter: 21000,
+      timestamp: 2
+    }
+  ])
+  try {
+    await harness.setup.flush()
+    const frame = harness.setup.captureCharFrame()
+    expect(frame).toContain("old work that stays in the exact tail")
+    expect(frame).toContain("[compaction]")
+    expect(frame).toContain("Compacted from 89,000 tokens")
+    expect(frame.indexOf("[compaction]")).toBeGreaterThan(frame.indexOf("old work that stays in the exact tail"))
+  } finally {
+    harness.destroy()
+  }
+})
+
+test("branch summaries use the same expandable labelled chrome as compaction", async () => {
+  const setup = await createTestRenderer({ width: 56, height: 10, useThread: false })
+  const syntaxStyle = createSyntaxStyle(defaultTheme)
+  const item = createMessageItemView(
+    setup.renderer,
+    { role: "branchSummary", summary: "Switched after the failed deploy.", fromId: "leaf-1", timestamp: 1 },
+    { theme: defaultTheme, syntaxStyle, expandHint: "Ctrl+O" }
+  )
+  if (!item) throw new Error("Branch summary item not created")
+  setup.renderer.root.add(item.root)
+  try {
+    await setup.renderOnce()
+    const collapsed = setup.captureCharFrame()
+    expect(collapsed).toContain("[branch]")
+    expect(collapsed).toContain("Branch summary (Ctrl+O to expand)")
+    expect(collapsed).not.toContain("failed deploy")
+
+    expect(item.setExpanded?.(true)).toBe(true)
+    await setup.renderOnce()
+    const expanded = setup.captureCharFrame()
+    expect(expanded).toContain("Branch Summary")
+    expect(expanded).toContain("Switched after the failed deploy.")
+  } finally {
+    item.destroy()
+    syntaxStyle.destroy()
+    setup.renderer.destroy()
   }
 })
 

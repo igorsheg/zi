@@ -411,13 +411,7 @@ export class TranscriptView {
           this.#streaming.role === message.role
             ? this.#streaming
             : undefined
-        const item =
-          promoted?.item ??
-          createMessageItemView(this.#renderer, message, {
-            theme: this.#theme,
-            syntaxStyle: this.#syntaxStyle,
-            cwd: sessionCwd(this.#session)
-          })
+        const item = promoted?.item ?? this.#createMessageItem(message)
         if (promoted) this.#streaming = undefined
         if (item) {
           if (!promoted) this.#insertBeforeTransient(item.root)
@@ -756,14 +750,22 @@ export class TranscriptView {
 
     if (this.#streaming?.type === "static" && this.#streaming.role === message.role) return
     this.#destroyStreaming()
-    const item = createMessageItemView(this.#renderer, message, {
-      theme: this.#theme,
-      syntaxStyle: this.#syntaxStyle,
-      cwd: sessionCwd(this.#session)
-    })
+    const item = this.#createMessageItem(message)
     this.#streaming = { type: "static", messageIndex: this.#nextMessageIndex, role: message.role, item }
     if (item) this.#insertBeforeActiveTools(item.root)
     this.#diagnostics.streamingCreates++
+  }
+
+  #createMessageItem(message: Exclude<AgentMessage, { role: "assistant" }>): TranscriptItemView | undefined {
+    const expandHint = this.#keybindings.getHint("app.tools.expand")
+    const item = createMessageItemView(this.#renderer, message, {
+      theme: this.#theme,
+      syntaxStyle: this.#syntaxStyle,
+      cwd: sessionCwd(this.#session),
+      ...(expandHint === undefined ? {} : { expandHint })
+    })
+    item?.setExpanded?.(this.#toolsExpanded)
+    return item
   }
 
   #destroyStreaming(): void {
@@ -1032,6 +1034,8 @@ export class TranscriptView {
       case "toggle_tools":
         this.#toolsExpanded = !this.#toolsExpanded
         for (const { view } of this.#toolViews.values()) view.setExpanded(this.#toolsExpanded)
+        for (const committed of this.#committed) committed.item?.setExpanded?.(this.#toolsExpanded)
+        if (this.#streaming?.type === "static") this.#streaming.item?.setExpanded?.(this.#toolsExpanded)
         this.#renderer.requestRender()
         return
       default:

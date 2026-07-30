@@ -2,11 +2,13 @@ import {
   BoxRenderable,
   CodeRenderable,
   createTextAttributes,
+  fg,
   MarkdownRenderable,
   type MarkdownOptions,
   type Renderable,
   StyledText,
   type SyntaxStyle,
+  TextAttributes,
   TextRenderable,
   type RenderContext
 } from "@opentui/core"
@@ -46,6 +48,7 @@ export interface MessageRenderOptions {
   readonly syntaxStyle: SyntaxStyle
   readonly toolCall?: ToolCallPresentation
   readonly cwd?: string
+  readonly expandHint?: string
 }
 
 export interface ToolCallPresentation {
@@ -64,16 +67,31 @@ export function createMessageItemView(
     case "user":
       return ownItem(ctx, createUserMessage(ctx, userContent(message.content), options.theme))
     case "toolResult":
-      return createToolResultView(ctx, message, options.toolCall, options.theme, options.cwd ?? "")
+      return createToolResultView(ctx, message, options.toolCall, options.theme, options.cwd ?? "", options.expandHint)
     case "bashExecution":
-      return createBashExecutionView(ctx, message, options.theme, options.cwd ?? "")
+      return createBashExecutionView(ctx, message, options.theme, options.cwd ?? "", options.expandHint)
     case "custom":
       return message.display
         ? ownItem(ctx, createPanelMessage(ctx, customPanelContent(message), options.theme.text.custom, options.theme))
         : undefined
-    case "branchSummary":
     case "compactionSummary":
-      return ownItem(ctx, createPanelMessage(ctx, message.summary, options.theme.text.muted, options.theme))
+      return new ExpandableSummaryView(ctx, {
+        label: "compaction",
+        collapsed: expandHint => compactionCollapsedText(message.tokensBefore, expandHint, options.theme),
+        expandedMarkdown: `**Compacted from ${formatTokenCount(message.tokensBefore)} tokens**\n\n${message.summary}`,
+        theme: options.theme,
+        syntaxStyle: options.syntaxStyle,
+        ...(options.expandHint === undefined ? {} : { expandHint: options.expandHint })
+      })
+    case "branchSummary":
+      return new ExpandableSummaryView(ctx, {
+        label: "branch",
+        collapsed: expandHint => branchCollapsedText(expandHint, options.theme),
+        expandedMarkdown: `**Branch Summary**\n\n${message.summary}`,
+        theme: options.theme,
+        syntaxStyle: options.syntaxStyle,
+        ...(options.expandHint === undefined ? {} : { expandHint: options.expandHint })
+      })
     default:
       return assertNever(message)
   }
@@ -366,13 +384,15 @@ function createMarkdown(
   content: string,
   theme: Theme,
   syntaxStyle: SyntaxStyle,
-  streaming: boolean
+  streaming: boolean,
+  fgColor: string = theme.text.primary,
+  bgColor: string = theme.surface.app
 ): MarkdownRenderable {
   return new MarkdownRenderable(ctx, {
     content,
     syntaxStyle,
-    fg: theme.text.primary,
-    bg: theme.surface.app,
+    fg: fgColor,
+    bg: bgColor,
     conceal: true,
     streaming,
     internalBlockMode: "top-level",
@@ -478,7 +498,8 @@ function createToolResultView(
   message: ToolResultMessage,
   call: ToolCallPresentation | undefined,
   theme: Theme,
-  cwd: string
+  cwd: string,
+  expandHint?: string
 ): ToolCallView {
   const source: ActiveTool = {
     id: message.toolCallId,
@@ -487,14 +508,15 @@ function createToolResultView(
     result: { content: message.content, details: message.details },
     status: message.isError ? "failed" : "done"
   }
-  return new ToolCallView(ctx, source.id, toolFrame(source), theme, cwd)
+  return new ToolCallView(ctx, source.id, toolFrame(source), theme, cwd, expandHint)
 }
 
 function createBashExecutionView(
   ctx: RenderContext,
   message: Extract<AgentMessage, { role: "bashExecution" }>,
   theme: Theme,
-  cwd: string
+  cwd: string,
+  expandHint?: string
 ): ToolCallView {
   const status = message.exitCode === 0 ? ("done" as const) : ("failed" as const)
   return new ToolCallView(
@@ -519,8 +541,116 @@ function createBashExecutionView(
       }
     },
     theme,
-    cwd
+    cwd,
+    expandHint
   )
+}
+
+interface ExpandableSummaryOptions {
+  readonly label: string
+  readonly collapsed: (expandHint: string | undefined) => StyledText
+  readonly expandedMarkdown: string
+  readonly theme: Theme
+  readonly syntaxStyle: SyntaxStyle
+  readonly expandHint?: string
+}
+
+class ExpandableSummaryView implements TranscriptItemView {
+  readonly root: BoxRenderable
+
+  readonly #ctx: RenderContext
+  readonly #theme: Theme
+  readonly #syntaxStyle: SyntaxStyle
+  readonly #collapsed: (expandHint: string | undefined) => StyledText
+  readonly #expandedMarkdown: string
+  readonly #expandHint: string | undefined
+  #body: Renderable | undefined
+  #expanded = false
+
+  constructor(ctx: RenderContext, options: ExpandableSummaryOptions) {
+    this.#ctx = ctx
+    this.#theme = options.theme
+    this.#syntaxStyle = options.syntaxStyle
+    this.#collapsed = options.collapsed
+    this.#expandedMarkdown = options.expandedMarkdown
+    this.#expandHint = options.expandHint
+    this.root = new BoxRenderable(ctx, {
+      paddingTop: 1,
+      paddingBottom: 1,
+      paddingLeft: 1,
+      paddingRight: 1,
+      marginTop: 0,
+      marginBottom: 1,
+      backgroundColor: options.theme.surface.panel,
+      flexDirection: "column",
+      flexShrink: 0
+    })
+    this.root.add(
+      new TextRenderable(ctx, {
+        content: new StyledText([
+          { ...fg(options.theme.text.custom)(`[${options.label}]`), attributes: TextAttributes.BOLD }
+        ]),
+        marginBottom: 1
+      })
+    )
+    this.#renderBody()
+  }
+
+  setExpanded(expanded: boolean): boolean {
+    if (expanded === this.#expanded) return false
+    this.#expanded = expanded
+    this.#renderBody()
+    return true
+  }
+
+  destroy(): void {
+    if (this.#ctx.hasSelection) this.#ctx.clearSelection()
+    this.root.destroyRecursively()
+  }
+
+  #renderBody(): void {
+    if (this.#ctx.hasSelection) this.#ctx.clearSelection()
+    if (this.#body) {
+      this.root.remove(this.#body)
+      this.#body.destroyRecursively()
+      this.#body = undefined
+    }
+    this.#body = this.#expanded
+      ? createMarkdown(
+          this.#ctx,
+          this.#expandedMarkdown,
+          this.#theme,
+          this.#syntaxStyle,
+          markdownStreamingWorkaround,
+          this.#theme.text.custom,
+          this.#theme.surface.panel
+        )
+      : new TextRenderable(this.#ctx, { content: this.#collapsed(this.#expandHint), wrapMode: "word" })
+    this.root.add(this.#body)
+  }
+}
+
+function compactionCollapsedText(tokensBefore: number, expandHint: string | undefined, theme: Theme): StyledText {
+  const tokens = formatTokenCount(tokensBefore)
+  if (!expandHint) return new StyledText([fg(theme.text.custom)(`Compacted from ${tokens} tokens`)])
+  return new StyledText([
+    fg(theme.text.custom)(`Compacted from ${tokens} tokens (`),
+    fg(theme.text.dim)(expandHint),
+    fg(theme.text.custom)(" to expand)")
+  ])
+}
+
+function branchCollapsedText(expandHint: string | undefined, theme: Theme): StyledText {
+  if (!expandHint) return new StyledText([fg(theme.text.custom)("Branch summary")])
+  return new StyledText([
+    fg(theme.text.custom)("Branch summary ("),
+    fg(theme.text.dim)(expandHint),
+    fg(theme.text.custom)(" to expand)")
+  ])
+}
+
+function formatTokenCount(tokens: number): string {
+  return tokens.toLocaleString("en-US")
 }
 
 function toolFrame(tool: ActiveTool): ToolViewFrame {

@@ -1834,10 +1834,13 @@ function projectSessionEntries(entries: readonly SessionEntry[], mode: "context"
   const marker = entries[markerIndex]
   if (marker?.type !== "compaction") throw new Error("Compaction marker index is invalid")
   const firstKeptIndex = entries.findIndex(entry => entry.id === marker.firstKeptEntryId)
-  const exact = [...entries.slice(firstKeptIndex, markerIndex), ...entries.slice(markerIndex + 1)].filter(
-    entry => entry.type !== "compaction" && visible(entry) && entry.id !== marker.excludedFailureEntryId
-  )
-  return [marker, ...exact]
+  const keep = (entry: SessionEntry) =>
+    entry.type !== "compaction" && visible(entry) && entry.id !== marker.excludedFailureEntryId
+  const beforeMarker = entries.slice(firstKeptIndex, markerIndex).filter(keep)
+  const afterMarker = entries.slice(markerIndex + 1).filter(keep)
+  // Context leads with the checkpoint so the model sees summary then exact tail.
+  // Presentation keeps journal order so the marker lands at the transcript tail after compact.
+  return mode === "presentation" ? [...beforeMarker, marker, ...afterMarker] : [marker, ...beforeMarker, ...afterMarker]
 }
 
 function projectMessages(entries: readonly SessionEntry[], mode: "context" | "presentation"): AgentMessage[] {
