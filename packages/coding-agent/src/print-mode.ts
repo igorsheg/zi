@@ -54,9 +54,10 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
       // Prompts share one transcript and must settle in caller order.
       // oxlint-disable-next-line no-await-in-loop
       for (const prompt of options.prompts) await session.prompt(prompt)
-      result = resultFromLastMessage(session.messages.at(-1))
+      const assistant = lastAssistantMessage(session.messages)
+      result = resultFromLastMessage(assistant)
       if (result.type === "success" && options.output === "text") {
-        result = await writeText(session.messages.at(-1), options.writer)
+        result = await writeText(assistant, options.writer)
       }
     } catch (cause) {
       result = { type: "provider_error", message: cause instanceof Error ? cause.message : "Print request failed" }
@@ -86,6 +87,16 @@ function validateInput(options: PrintModeOptions): PrintModeResult | undefined {
     if (promptBytes > maxPrintPromptBytes) {
       return { type: "invalid_input", message: `Print prompts cannot exceed ${maxPrintPromptBytes} bytes` }
     }
+  }
+  return undefined
+}
+
+function lastAssistantMessage(
+  messages: readonly AgentMessage[]
+): Extract<AgentMessage, { role: "assistant" }> | undefined {
+  for (let index = messages.length - 1; index >= 0; index--) {
+    const message = messages[index]
+    if (message?.role === "assistant") return message
   }
   return undefined
 }
