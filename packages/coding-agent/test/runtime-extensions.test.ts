@@ -467,6 +467,222 @@ export default function (zi: ExtensionAPI): void {
   }
 }, 10_000)
 
+test("session reload keeps identity and runs reload lifecycle through the current host", async () => {
+  const fixture = await extensionFixture("reload")
+  const skillDir = join(fixture.agentDir, "skills", "reload-skill")
+  await mkdir(skillDir, { recursive: true })
+  await writeFile(
+    join(skillDir, "SKILL.md"),
+    `---
+name: reload-skill
+description: before reload
+---
+# Before
+`
+  )
+  const runtime = await createAgentRuntime({
+    cwd: fixture.cwd,
+    agentDir: fixture.agentDir,
+    session: { type: "new", persist: true },
+    extensionWorkerCommand: workerCommand
+  })
+
+  try {
+    const sessionId = runtime.session.sessionManager.sessionId
+    const sessionFile = runtime.session.sessionManager.file
+    expect(runtime.session.skills.map(skill => skill.description)).toContain("before reload")
+
+    await writeFile(
+      join(skillDir, "SKILL.md"),
+      `---
+name: reload-skill
+description: after reload
+---
+# After
+`
+    )
+    const result = await runtime.session.reload()
+    expect(result.extensions?.outcome).toBe("replaced")
+    expect(runtime.session.sessionManager.sessionId).toBe(sessionId)
+    expect(runtime.session.sessionManager.file).toBe(sessionFile)
+    expect(runtime.session.skills.map(skill => skill.description)).toContain("after reload")
+    expect(await readFile(fixture.lifecycle, "utf8")).toBe("start:startup\nstop:reload\nstart:reload\n")
+  } finally {
+    runtime.session.dispose()
+    await runtime.session.waitForIdle()
+    await rm(fixture.root, { recursive: true, force: true })
+  }
+}, 10_000)
+
+test("session reload restores durable extension state and recovers a failed host", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-runtime-extension-reload-state-"))
+  const cwd = join(root, "project")
+  const agentDir = join(root, "agent")
+  const extensionDir = join(agentDir, "extensions")
+  const observed = join(root, "observed.log")
+  await mkdir(cwd, { recursive: true })
+  await mkdir(extensionDir, { recursive: true })
+  await writeFile(
+    join(extensionDir, "durable-counter.ts"),
+    `import { appendFileSync } from "node:fs"
+import { Schema, type ExtensionAPI } from "@with-zi/extension-api"
+export default function (zi: ExtensionAPI): void {
+  let count = 0
+  zi.on("session_start", async event => {
+    const entries = await zi.getSessionEntries("example.counter")
+    const latest = entries.at(-1)?.data
+    count = typeof latest === "object" && latest !== null && !Array.isArray(latest) && typeof latest.count === "number"
+      ? latest.count
+      : 0
+    appendFileSync(${JSON.stringify(observed)}, "start:" + event.reason + ":" + count + "\\n")
+    if (event.reason === "reload") {
+      await zi.appendEntry("example.counter", { count, restored: true })
+      await zi.sendMessage(
+        { customType: "example.counter", content: "restored:" + count, display: true },
+        "append"
+      )
+    }
+  })
+  zi.on("session_shutdown", async event => {
+    await zi.appendEntry("example.counter", { count, shutdown: event.reason })
+  })
+  zi.registerTool({
+    name: "increment_counter",
+    description: "Increment durable session state",
+    parameters: Schema.object({}),
+    async execute() {
+      count++
+      await zi.appendEntry("example.counter", { count })
+      return String(count)
+    }
+  })
+  zi.registerTool({
+    name: "crash_worker",
+    description: "Crash the extension worker",
+    parameters: Schema.object({}),
+    async execute() {
+      process.exit(97)
+    }
+  })
+}
+`
+  )
+  const models = createModels()
+  const faux = fauxProvider()
+  models.setProvider(faux.provider)
+  faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("increment_counter", {}, { id: "counter-1" }), { stopReason: "toolUse" }),
+    fauxAssistantMessage("Incremented."),
+    fauxAssistantMessage(fauxToolCall("crash_worker", {}, { id: "crash-1" }), { stopReason: "toolUse" }),
+    fauxAssistantMessage("Crashed.")
+  ])
+  const runtime = await createAgentRuntime({
+    cwd,
+    agentDir,
+    model: "faux/faux-1",
+    modelFactory: () => models,
+    session: { type: "new", persist: true },
+    extensionWorkerCommand: workerCommand
+  })
+
+  try {
+    const sessionId = runtime.session.sessionManager.sessionId
+    await runtime.session.prompt("Increment the counter.")
+    expect(runtime.session.getCustomEntries("example.counter")).toMatchObject([{ data: { count: 1 } }])
+
+    const reloaded = await runtime.session.reload()
+    expect(reloaded.extensions?.outcome).toBe("replaced")
+    expect(runtime.session.sessionManager.sessionId).toBe(sessionId)
+    expect(await readFile(observed, "utf8")).toContain("start:reload:1")
+    expect(runtime.session.getCustomEntries("example.counter")).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ data: { count: 1 } }),
+        expect.objectContaining({ data: { count: 1, shutdown: "reload" } }),
+        expect.objectContaining({ data: { count: 1, restored: true } })
+      ])
+    )
+    expect(runtime.session.messages).toContainEqual(
+      expect.objectContaining({ role: "custom", customType: "example.counter", content: "restored:1" })
+    )
+
+    await runtime.session.prompt("Crash the worker.")
+    expect(runtime.session.extensionHostSnapshot?.status).toBe("failed")
+
+    const recovered = await runtime.session.reload()
+    expect(recovered.extensions?.outcome).toBe("replaced")
+    expect(runtime.session.extensionHostSnapshot).toMatchObject({ status: "ready", lifecycle: "started" })
+    expect(await readFile(observed, "utf8")).toMatch(/start:reload:1[\s\S]*start:reload:/)
+  } finally {
+    runtime.session.dispose()
+    await runtime.session.waitForIdle()
+    await rm(root, { recursive: true, force: true })
+  }
+}, 15_000)
+
+test("dispose during session reload settles without leaving the host running", async () => {
+  const fixture = await extensionFixture("reload-dispose")
+  const runtime = await createAgentRuntime({
+    cwd: fixture.cwd,
+    agentDir: fixture.agentDir,
+    session: { type: "new", persist: false },
+    extensionWorkerCommand: workerCommand
+  })
+
+  try {
+    const reload = runtime.session.reload()
+    runtime.session.dispose()
+    const result = await reload
+    await runtime.session.waitForIdle()
+    expect(["replaced", "superseded", "disabled"]).toContain(result.extensions?.outcome ?? "disabled")
+    expect(runtime.session.extensionHostSnapshot).toBeUndefined()
+  } finally {
+    await runtime.session.waitForIdle()
+    await rm(fixture.root, { recursive: true, force: true })
+  }
+}, 10_000)
+
+test("session reload refuses concurrent work and applies settings queue modes", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-runtime-extension-reload-admit-"))
+  const cwd = join(root, "project")
+  const agentDir = join(root, "agent")
+  await mkdir(cwd, { recursive: true })
+  await mkdir(join(agentDir, "extensions"), { recursive: true })
+  const models = createModels()
+  const faux = fauxProvider()
+  models.setProvider(faux.provider)
+  faux.setResponses([fauxAssistantMessage("hello")])
+  const runtime = await createAgentRuntime({
+    cwd,
+    agentDir,
+    model: "faux/faux-1",
+    modelFactory: () => models,
+    session: { type: "new", persist: false },
+    extensionWorkerCommand: workerCommand
+  })
+
+  try {
+    const pending = runtime.session.prompt("stay busy")
+    expect(runtime.session.reload()).rejects.toThrow("Cannot reload while the agent is running")
+    await pending
+
+    await writeFile(join(agentDir, "settings.json"), JSON.stringify({ steeringMode: "all", followUpMode: "all" }))
+    const events: string[] = []
+    const unsubscribe = runtime.session.subscribe(event => {
+      if (event.type === "steering_mode_changed" || event.type === "follow_up_mode_changed") events.push(event.type)
+    })
+    const result = await runtime.session.reload()
+    unsubscribe()
+    expect(result.extensions?.outcome).toBe("disabled")
+    expect(runtime.session.steeringMode).toBe("all")
+    expect(runtime.session.followUpMode).toBe("all")
+    expect(events).toEqual(["steering_mode_changed", "follow_up_mode_changed"])
+  } finally {
+    runtime.session.dispose()
+    await runtime.session.waitForIdle()
+    await rm(root, { recursive: true, force: true })
+  }
+}, 10_000)
+
 test("whole-runtime replacement starts the candidate only after retiring the current lifecycle", async () => {
   const fixture = await extensionFixture("replacement")
   const runtime = await createAgentSessionRuntime({

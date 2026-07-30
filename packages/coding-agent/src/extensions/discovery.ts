@@ -5,6 +5,7 @@ import { isAbsolute, join, resolve } from "node:path"
 import type { ZiPaths } from "../paths.js"
 import type { ProjectConfigurationAdmission } from "../project-trust.js"
 import { canonicalResourcePath, readResourceDirectory } from "../resource-files.js"
+import type { ExtensionDiagnostic } from "./protocol.js"
 
 export const maxExtensionSources = 128
 export const maxExplicitExtensionPaths = 128
@@ -305,6 +306,15 @@ export function discoverExtensionLoadPlan(
   explicitPaths: readonly string[] = []
 ): ExtensionDiscoveryResult {
   return new Discovery(paths).run(project, explicitPaths)
+}
+
+export function extensionDiscoveryDiagnostic(value: ExtensionDiscoveryDiagnostic): ExtensionDiagnostic {
+  return {
+    path: value.path,
+    phase: "discovery",
+    severity: value.type === "duplicate" ? "warning" : "error",
+    message: value.message
+  }
 }
 
 interface DirectoryEntryResolution {

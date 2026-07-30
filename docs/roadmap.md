@@ -1,7 +1,7 @@
 # Product roadmap
 
 - Status: active
-- Updated: 2026-07-29
+- Updated: 2026-07-30
 
 This roadmap orders product work by downstream leverage. [`parity-roadmap.md`](parity-roadmap.md) remains the capability and provenance inventory; parity evidence no longer determines product priority by itself. Product choices follow the [`building-block strategy`](building-block-strategy.md).
 
@@ -101,7 +101,7 @@ After custom tools and RPC are in use, choose independently proven slices:
 
 Each capability receives its own closed protocol messages, owner, bounds, example, and behavior tests. No capability expands a generic extension facade in anticipation of another.
 
-### Selected — commands and durable extension state
+### Shipped — commands and durable extension state
 
 - [x] Research Pi's custom state/message split and record provenance.
 - [x] Accept the journal and projection ownership decision in ADR 0023.
@@ -109,6 +109,17 @@ Each capability receives its own closed protocol messages, owner, bounds, exampl
 - [x] Add closed `AgentSession` custom-entry and delivery admissions.
 - [x] Render displayed custom messages through authoritative client projections.
 - [x] Add concrete correlated extension session operations and a compiled durable-counter example.
+
+### Shipped — extension reload UX
+
+Research: [`extension-reload-research.md`](extension-reload-research.md).
+
+- [x] Characterize Pi's `/reload` path and Zi's existing `ExtensionHost.reload` ownership.
+- [x] Add `AgentSession.reload()` for in-session settings, resource, and extension-generation refresh.
+- [x] Keep session identity and journal stable; do not route ordinary reload through `AgentSessionRuntime` replacement.
+- [x] Enforce idle-only admission in coding-agent; surface `/reload` in interactive mode.
+- [x] Prove candidate failure retention, failed-host recovery, durable-state restore on reload `session_start`, and dispose-during-reload settlement.
+- [x] Update extension docs and the author recovery habit (edit or crash → explicit reload).
 
 ## Deliberately deferred
 

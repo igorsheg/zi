@@ -10,9 +10,8 @@ registerBunOAuthFlows()
 import type { AgentSession } from "./agent-session.js"
 import { CodeMode } from "./code-mode/code-mode.js"
 import { FileCredentialStore } from "./credential-store.js"
-import { discoverExtensionLoadPlan, type ExtensionDiscoveryDiagnostic } from "./extensions/discovery.js"
+import { discoverExtensionLoadPlan, extensionDiscoveryDiagnostic } from "./extensions/discovery.js"
 import { createExtensionWorkerSpawner, ExtensionHost } from "./extensions/host.js"
-import type { ExtensionDiagnostic } from "./extensions/protocol.js"
 import { ModelRegistry } from "./model-registry.js"
 import { resolveRequestedModel } from "./model-resolver.js"
 import { getAgentDir, ZiPaths } from "./paths.js"
@@ -111,6 +110,8 @@ export async function createUnboundAgentRuntime(requested: CreateAgentRuntimeOpt
       shell,
       extensionHost,
       codeMode,
+      project,
+      extensionPaths: options.extensionPaths ?? [],
       ...(model ? { model } : {}),
       ...(options.thinkingLevel ? { thinkingLevel: options.thinkingLevel } : {}),
       ...(options.apiKey ? { apiKey: options.apiKey } : {}),
@@ -152,15 +153,6 @@ async function selectSession(session: AgentRuntimeSessionIntent, paths: ZiPaths)
       return { type: "resumed", manager: SessionManager.open(session.file) }
     default:
       return assertNever(session)
-  }
-}
-
-function extensionDiscoveryDiagnostic(value: ExtensionDiscoveryDiagnostic): ExtensionDiagnostic {
-  return {
-    path: value.path,
-    phase: "discovery",
-    severity: value.type === "duplicate" ? "warning" : "error",
-    message: value.message
   }
 }
 

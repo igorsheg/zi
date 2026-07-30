@@ -11,7 +11,10 @@ export type {
   ExtensionHostLifecycle,
   ExtensionHostSnapshot,
   ExtensionHostStatus,
-  ExtensionLogTail
+  ExtensionLogTail,
+  ExtensionReloadOutcome,
+  ExtensionReloadRequest,
+  ExtensionReloadResult
 } from "./extensions/host.js"
 export type {
   ExtensionDiagnostic,

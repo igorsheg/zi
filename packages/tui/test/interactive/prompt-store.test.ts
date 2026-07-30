@@ -100,6 +100,180 @@ test("compact command forwards focus without creating a user message", async () 
   }
 })
 
+test("reload command awaits session reload, invalidates slash catalog, and reports outcome", async () => {
+  const session = await createSession("reload-store")
+  const mode = createInteractiveStore(session)
+  let generation = 0
+  let reads = 0
+  let resources = [{ name: "review", description: "Review code" }]
+  const slash = new SlashController(
+    () => ({
+      listResourceCommands() {
+        reads++
+        return resources
+      }
+    }),
+    () => generation
+  )
+  const prompt = createPromptStore(mode, slash)
+  let reloaded = false
+  session.reload = async () => {
+    reloaded = true
+    resources = [{ name: "deploy", description: "Deploy current project" }]
+    return {
+      resources: session.resources,
+      extensions: {
+        outcome: "replaced",
+        snapshot: session.extensionHostSnapshot ?? {
+          status: "disabled",
+          lifecycle: "started",
+          extensions: [],
+          tools: [],
+          diagnostics: [],
+          omittedDiagnostics: 0,
+          staleFrames: 0,
+          stdout: { text: "", retainedBytes: 0, omittedBytes: 0 },
+          stderr: { text: "", retainedBytes: 0, omittedBytes: 0 }
+        },
+        diagnostics: [],
+        omittedDiagnostics: 0
+      },
+      settingsErrors: []
+    }
+  }
+
+  try {
+    expect(slash.suggestions("/rev", 4)[0]?.name).toBe("review")
+    expect(reads).toBe(1)
+    expect(prompt.submit("/reload", "steer")).toBe(true)
+    expect(prompt.$state.get().workflow.type).toBe("reloading")
+    await Bun.sleep(0)
+    expect(reloaded).toBe(true)
+    expect(prompt.$state.get()).toMatchObject({
+      feedback: { type: "status", message: "Reloaded settings, resources, and extensions" },
+      workflow: { type: "idle" }
+    })
+    expect(slash.suggestions("/dep", 4)[0]?.name).toBe("deploy")
+    expect(reads).toBe(2)
+  } finally {
+    mode.dispose()
+    session.dispose()
+  }
+})
+
+test("reload feedback surfaces the first source-attributed diagnostic", async () => {
+  const session = await createSession("reload-diagnostics")
+  const mode = createInteractiveStore(session)
+  const prompt = createPromptStore(mode, new SlashController())
+  session.reload = async () => ({
+    resources: {
+      ...session.resources,
+      diagnostics: [
+        { type: "warning", resource: "skill", path: "/tmp/skills/broken/SKILL.md", message: "missing frontmatter" }
+      ]
+    },
+    extensions: {
+      outcome: "replaced",
+      snapshot: {
+        status: "ready",
+        lifecycle: "started",
+        extensions: [],
+        tools: [],
+        diagnostics: [],
+        omittedDiagnostics: 0,
+        staleFrames: 0,
+        stdout: { text: "", retainedBytes: 0, omittedBytes: 0 },
+        stderr: { text: "", retainedBytes: 0, omittedBytes: 0 }
+      },
+      diagnostics: [
+        { path: "/tmp/extensions/bad.ts", phase: "import", severity: "error", message: "Cannot find module" }
+      ],
+      omittedDiagnostics: 2
+    },
+    settingsErrors: []
+  })
+
+  try {
+    expect(prompt.submit("/reload", "steer")).toBe(true)
+    await Bun.sleep(0)
+    expect(prompt.$state.get()).toMatchObject({
+      feedback: {
+        type: "warning",
+        message: "Reloaded settings, resources, and extensions: /tmp/extensions/bad.ts: Cannot find module (+3 more)"
+      },
+      workflow: { type: "idle" }
+    })
+  } finally {
+    mode.dispose()
+    session.dispose()
+  }
+})
+
+test("reload remaining count includes omitted extension diagnostics behind settings errors", async () => {
+  const session = await createSession("reload-omitted-remaining")
+  const mode = createInteractiveStore(session)
+  const prompt = createPromptStore(mode, new SlashController())
+  session.reload = async () => ({
+    resources: session.resources,
+    extensions: {
+      outcome: "replaced",
+      snapshot: {
+        status: "ready",
+        lifecycle: "started",
+        extensions: [],
+        tools: [],
+        diagnostics: [],
+        omittedDiagnostics: 0,
+        staleFrames: 0,
+        stdout: { text: "", retainedBytes: 0, omittedBytes: 0 },
+        stderr: { text: "", retainedBytes: 0, omittedBytes: 0 }
+      },
+      diagnostics: [],
+      omittedDiagnostics: 2
+    },
+    settingsErrors: [{ scope: "global", path: "/tmp/settings.json", error: new Error("invalid json") }]
+  })
+
+  try {
+    expect(prompt.submit("/reload", "steer")).toBe(true)
+    await Bun.sleep(0)
+    expect(prompt.$state.get()).toMatchObject({
+      feedback: {
+        type: "warning",
+        message: "Reloaded settings, resources, and extensions: /tmp/settings.json: invalid json (+2 more)"
+      },
+      workflow: { type: "idle" }
+    })
+  } finally {
+    mode.dispose()
+    session.dispose()
+  }
+})
+
+test("reload refuses while the session is streaming", async () => {
+  const session = await createSession("reload-busy")
+  const mode = createInteractiveStore(session)
+  const prompt = createPromptStore(mode, new SlashController())
+  Object.defineProperty(session, "isStreaming", { configurable: true, get: () => true })
+  let reloaded = false
+  session.reload = async () => {
+    reloaded = true
+    return { resources: session.resources, extensions: undefined, settingsErrors: [] }
+  }
+
+  try {
+    expect(prompt.submit("/reload", "steer")).toBe(true)
+    expect(reloaded).toBe(false)
+    expect(prompt.$state.get()).toMatchObject({
+      feedback: { type: "warning", message: "Wait for the current response before reloading" },
+      workflow: { type: "idle" }
+    })
+  } finally {
+    mode.dispose()
+    session.dispose()
+  }
+})
+
 test("compact cancellation stays blocking until settlement and reports no error", async () => {
   const session = await createSession("compact-cancel")
   const mode = createInteractiveStore(session)

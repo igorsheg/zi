@@ -36,6 +36,10 @@ const emptyPlan: ExtensionLoadPlan = Object.freeze({ cwd: resolve("extension-hos
 const planOne = extensionPlan("one", [sourceOne])
 const planTwo = extensionPlan("two", [sourceTwo])
 
+function reloadRequest(plan: ExtensionLoadPlan) {
+  return { plan, diagnostics: [], omittedDiagnostics: 0 } as const
+}
+
 test("empty extension plans stay lazy through lifecycle and disposal", async () => {
   const workers = new TestWorkerSpawner()
   const host = await ExtensionHost.create(emptyPlan, workers.spawn, testTimeouts)
@@ -44,7 +48,7 @@ test("empty extension plans stay lazy through lifecycle and disposal", async () 
   expect(workers.processes).toHaveLength(0)
   await host.sessionStart("startup")
   expect(host.snapshot()).toMatchObject({ status: "disabled", lifecycle: "started" })
-  await host.reload(emptyPlan)
+  expect(await host.reload(reloadRequest(emptyPlan))).toMatchObject({ outcome: "disabled" })
   expect(workers.processes).toHaveLength(0)
   await host.dispose()
   await host.dispose()
@@ -137,7 +141,7 @@ test("fatal startup failure leaves a diagnosable retryable host", async () => {
 
   await host.sessionStart("startup")
   workers.behaviors.push({ type: "ready" })
-  await host.reload(planTwo)
+  await host.reload(reloadRequest(planTwo))
   expect(host.snapshot()).toMatchObject({ status: "ready", lifecycle: "started" })
   expect(workers.processes[1]!.messages.map(message => message.type)).toEqual(["initialize", "session_start"])
   await host.dispose()
@@ -302,7 +306,7 @@ test("tool completion from a retired generation cannot cross replacement", async
   await host.sessionStart("startup")
   const invocation = host.invokeTool("echo_message", { message: "pending" })
 
-  await host.reload(planTwo)
+  await host.reload(reloadRequest(planTwo))
   expect(invocation).rejects.toThrow("disposed during tool invocation")
   retired.send({ type: "tool_result", generation: 1, requestId: 2, value: "stale" })
   expect(host.snapshot()).toMatchObject({
@@ -314,6 +318,46 @@ test("tool completion from a retired generation cannot cross replacement", async
   await host.dispose()
 })
 
+test("candidate session_start failure after retirement returns failed", async () => {
+  const workers = new TestWorkerSpawner()
+  const host = await ExtensionHost.create(planOne, workers.spawn, testTimeouts)
+  const current = workers.processes[0]!
+  await host.sessionStart("startup")
+
+  workers.behaviors.push({ type: "fatal_start" })
+  expect(await host.reload(reloadRequest(planTwo))).toMatchObject({
+    outcome: "failed",
+    diagnostics: [expect.objectContaining({ phase: "lifecycle", message: "start failed" })]
+  })
+  expect(host.snapshot()).toMatchObject({ status: "failed", lifecycle: "started", extensions: [], tools: [] })
+  expect(current.messages.map(message => message.type)).toEqual([
+    "initialize",
+    "session_start",
+    "session_shutdown",
+    "stop"
+  ])
+  expect(current.disposed).toBe(true)
+  expect(workers.processes[1]!.disposed).toBe(true)
+  await host.dispose()
+})
+
+test("failed-host recovery rejects a concurrent reload while the first attempt owns cleanup", async () => {
+  const workers = new TestWorkerSpawner()
+  workers.behaviors.push({ type: "fatal_start" })
+  const host = await ExtensionHost.create(planOne, workers.spawn, testTimeouts)
+  await host.sessionStart("startup")
+  expect(host.snapshot().status).toBe("failed")
+
+  workers.behaviors.push({ type: "pending" })
+  const first = host.reload(reloadRequest(planTwo))
+  await Promise.resolve()
+  expect(host.reload(reloadRequest(planTwo))).rejects.toThrow("cannot reload while reloading")
+
+  workers.processes[1]!.failStartup("candidate abandoned")
+  expect(await first).toMatchObject({ outcome: "failed" })
+  await host.dispose()
+})
+
 test("replacement preserves current on candidate failure and commits one successful candidate", async () => {
   const workers = new TestWorkerSpawner()
   const host = await ExtensionHost.create(planOne, workers.spawn, testTimeouts)
@@ -321,12 +365,12 @@ test("replacement preserves current on candidate failure and commits one success
   await host.sessionStart("startup")
 
   workers.behaviors.push({ type: "spawn_error", message: "candidate spawn failed" })
-  await host.reload(planTwo)
+  expect(await host.reload(reloadRequest(planTwo))).toMatchObject({ outcome: "retained" })
   expect(host.snapshot()).toMatchObject({ status: "ready", lifecycle: "started" })
   expect(current.messages.map(message => message.type)).toEqual(["initialize", "session_start"])
 
   workers.behaviors.push({ type: "fatal", message: "candidate failed" })
-  await host.reload(planTwo)
+  expect(await host.reload(reloadRequest(planTwo))).toMatchObject({ outcome: "retained" })
   expect(host.snapshot()).toMatchObject({
     status: "ready",
     lifecycle: "started",
@@ -335,7 +379,7 @@ test("replacement preserves current on candidate failure and commits one success
   expect(current.messages.map(message => message.type)).toEqual(["initialize", "session_start"])
 
   workers.behaviors.push({ type: "ready" })
-  await host.reload(planTwo)
+  expect(await host.reload(reloadRequest(planTwo))).toMatchObject({ outcome: "replaced" })
   const candidate = workers.processes[2]!
   expect(host.snapshot()).toMatchObject({
     status: "ready",
@@ -367,13 +411,13 @@ test("replacement fails instead of restoring a current generation that crashed w
   const current = workers.processes[0]!
 
   workers.behaviors.push({ type: "pending" })
-  const replacement = host.reload(planTwo)
+  const replacement = host.reload(reloadRequest(planTwo))
   await Promise.resolve()
   const candidate = workers.processes[1]!
   current.crash(new Error("current crashed"))
   await Promise.resolve()
   candidate.failStartup("candidate crashed")
-  await replacement
+  expect(await replacement).toMatchObject({ outcome: "failed" })
 
   expect(host.snapshot()).toMatchObject({ status: "failed", lifecycle: "started", extensions: [] })
   expect(current.disposed).toBe(true)
@@ -396,11 +440,12 @@ test("final disposal supersedes startup and replacement without leaking either p
   const replacingHost = await ExtensionHost.create(planOne, replacementWorkers.spawn, testTimeouts)
   await replacingHost.sessionStart("startup")
   replacementWorkers.behaviors.push({ type: "pending" })
-  const replacement = replacingHost.reload(planTwo)
+  const replacement = replacingHost.reload(reloadRequest(planTwo))
   await Promise.resolve()
-  expect(replacingHost.reload(planTwo)).rejects.toThrow("cannot reload while replacing")
+  expect(replacingHost.reload(reloadRequest(planTwo))).rejects.toThrow("cannot reload while reloading")
   const replacementDisposal = replacingHost.dispose()
-  await Promise.all([replacement, replacementDisposal])
+  const [reloadResult] = await Promise.all([replacement, replacementDisposal])
+  expect(reloadResult).toMatchObject({ outcome: "superseded" })
 
   expect(replacingHost.snapshot().status).toBe("disposed")
   expect(replacementWorkers.processes.every(process => process.disposed)).toBe(true)
@@ -429,7 +474,7 @@ test("replacement disposal authorizes shutdown state operations from the current
   const current = workers.processes[0]!
 
   workers.behaviors.push({ type: "pending" })
-  const replacement = host.reload(planTwo)
+  const replacement = host.reload(reloadRequest(planTwo))
   await Promise.resolve()
   const candidate = workers.processes[1]!
   const disposal = host.dispose()

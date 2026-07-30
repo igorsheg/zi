@@ -9,6 +9,7 @@ import type {
   ProjectTrustSelection,
   QueueMode,
   QueuedInputs,
+  SessionReloadResult,
   SettingsScope,
   SessionListResult,
   SessionReplacementCancellation,
@@ -263,6 +264,7 @@ class PromptController implements PromptStore {
       case "loading_logout":
       case "logging_out":
       case "compacting":
+      case "reloading":
       case "starting_session":
       case "loading_sessions":
       case "resuming_session":
@@ -376,6 +378,7 @@ class PromptController implements PromptStore {
       case "choosing_logout":
       case "logging_out":
       case "compacting":
+      case "reloading":
       case "starting_session":
       case "loading_sessions":
       case "choosing_session":
@@ -898,6 +901,9 @@ class PromptController implements PromptStore {
       case "compact":
         this.#compact(command.instructions)
         return true
+      case "reload":
+        this.#reload()
+        return true
       case "new_session":
         this.#startNewSession()
         return true
@@ -946,6 +952,43 @@ class PromptController implements PromptStore {
       }
     }
     void compact()
+  }
+
+  #reload(): void {
+    const session = this.#interactive.getSession()
+    if (session.isStreaming) {
+      this.reportFeedback({ type: "warning", message: "Wait for the current response before reloading" })
+      return
+    }
+    const operationId = ++this.#nextOperationId
+    this.picker.close()
+    this.$state.set({
+      ...this.$state.get(),
+      feedback: { type: "status", message: "Reloading…" },
+      workflow: { type: "reloading", operationId, session }
+    })
+    this.#requestInput("")
+
+    const reload = async () => {
+      try {
+        const result = await session.reload()
+        if (!this.#accepts(operationId, session)) return
+        this.#slash.invalidateCatalog()
+        this.$state.set({
+          ...this.$state.get(),
+          feedback: { type: reloadFeedbackType(result), message: reloadStatusMessage(result) },
+          workflow: { type: "idle" }
+        })
+      } catch (cause) {
+        if (!this.#accepts(operationId, session)) return
+        this.$state.set({
+          ...this.$state.get(),
+          feedback: { type: "error", message: errorMessage(cause) },
+          workflow: { type: "idle" }
+        })
+      }
+    }
+    void reload()
   }
 
   #startNewSession(): void {
@@ -1698,6 +1741,99 @@ function formatTokens(tokens: number): string {
 
 function errorMessage(cause: unknown): string {
   return cause instanceof Error ? cause.message : String(cause)
+}
+
+function reloadFeedbackType(result: SessionReloadResult): "status" | "warning" | "error" {
+  const outcome = result.extensions?.outcome
+  if (outcome === "failed") return "error"
+  if (outcome === "retained" || outcome === "superseded") return "warning"
+  if (firstReloadDiagnostic(result)) return "warning"
+  return "status"
+}
+
+function reloadStatusMessage(result: SessionReloadResult): string {
+  const outcome = result.extensions?.outcome
+  const base =
+    outcome === "replaced"
+      ? "Reloaded settings, resources, and extensions"
+      : outcome === "retained"
+        ? "Reloaded settings and resources; kept the previous extension generation"
+        : outcome === "disabled"
+          ? "Reloaded settings and resources; extensions disabled"
+          : outcome === "failed"
+            ? "Reload failed after retiring the previous extension generation"
+            : outcome === "superseded"
+              ? "Reload was superseded"
+              : "Reloaded settings and resources"
+  const detail = firstReloadDiagnostic(result)
+  return detail ? `${base}: ${detail}` : base
+}
+
+function firstReloadDiagnostic(result: SessionReloadResult): string | undefined {
+  const remaining = reloadDiagnosticRemaining(result)
+  const extension =
+    result.extensions?.diagnostics.find(diagnostic => diagnostic.severity === "error") ??
+    result.extensions?.diagnostics[0]
+  if (extension) {
+    return formatReloadDiagnostic(extension.path ?? extension.extensionId, extension.message, remaining)
+  }
+
+  const settings = result.settingsErrors[0]
+  if (settings) {
+    return formatReloadDiagnostic(settings.path, settings.error.message, remaining)
+  }
+
+  const resource = result.resources.diagnostics[0]
+  if (resource) {
+    return formatReloadDiagnostic(resourceDiagnosticPath(resource), resourceDiagnosticMessage(resource), remaining)
+  }
+
+  const omitted = result.extensions?.omittedDiagnostics ?? 0
+  if (omitted > 0) return `${omitted} omitted extension diagnostic${omitted === 1 ? "" : "s"}`
+  return undefined
+}
+
+/** Count of diagnostics not shown once the first one is displayed. Includes omitted extension diagnostics. */
+function reloadDiagnosticRemaining(result: SessionReloadResult): number {
+  const total =
+    result.settingsErrors.length +
+    result.resources.diagnostics.length +
+    (result.extensions?.diagnostics.length ?? 0) +
+    (result.extensions?.omittedDiagnostics ?? 0)
+  return Math.max(0, total - 1)
+}
+
+function formatReloadDiagnostic(source: string | undefined, message: string, remaining: number): string {
+  const body = source ? `${source}: ${message}` : message
+  return remaining > 0 ? `${body} (+${remaining} more)` : body
+}
+
+function resourceDiagnosticPath(
+  diagnostic: SessionReloadResult["resources"]["diagnostics"][number]
+): string | undefined {
+  switch (diagnostic.type) {
+    case "warning":
+      return diagnostic.path
+    case "collision":
+      return diagnostic.loserPath
+    case "limit":
+      return diagnostic.path
+    default:
+      return assertNever(diagnostic)
+  }
+}
+
+function resourceDiagnosticMessage(diagnostic: SessionReloadResult["resources"]["diagnostics"][number]): string {
+  switch (diagnostic.type) {
+    case "warning":
+      return diagnostic.message
+    case "collision":
+      return `${diagnostic.resource} "${diagnostic.name}" collides with ${diagnostic.winnerPath}`
+    case "limit":
+      return diagnostic.message
+    default:
+      return assertNever(diagnostic)
+  }
 }
 
 function assertNever(value: never): never {

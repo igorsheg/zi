@@ -94,6 +94,21 @@ export type ExtensionHostStatus =
   | "failed"
   | "disposed"
 
+export type ExtensionReloadOutcome = "replaced" | "retained" | "disabled" | "failed" | "superseded"
+
+export interface ExtensionReloadRequest {
+  readonly plan: ExtensionLoadPlan
+  readonly diagnostics: readonly ExtensionDiagnostic[]
+  readonly omittedDiagnostics: number
+}
+
+export interface ExtensionReloadResult {
+  readonly outcome: ExtensionReloadOutcome
+  readonly snapshot: ExtensionHostSnapshot
+  readonly diagnostics: readonly ExtensionDiagnostic[]
+  readonly omittedDiagnostics: number
+}
+
 export interface ExtensionLogTail {
   readonly text: string
   readonly retainedBytes: number
@@ -112,6 +127,13 @@ export interface ExtensionHostSnapshot {
   readonly stdout: ExtensionLogTail
   readonly stderr: ExtensionLogTail
 }
+
+interface ReloadAttempt {
+  readonly diagnostics: ExtensionDiagnostic[]
+  omitted: number
+}
+
+type SessionOperationPhase = "full" | "state_only" | "none"
 
 type Candidate =
   | { readonly type: "spawning"; readonly id: number; readonly plan: ExtensionLoadPlan }
@@ -849,6 +871,7 @@ export class ExtensionHost {
   #tools: readonly ExtensionToolRegistration[] = Object.freeze([])
   #toolCatalogListener: ((tools: readonly ExtensionToolRegistration[]) => void) | undefined
   #sessionOperations: ExtensionSessionOperations | undefined
+  #reloadAttempt: ReloadAttempt | undefined
   #lastLogs: { readonly stdout: ExtensionLogTail; readonly stderr: ExtensionLogTail } = Object.freeze({
     stdout: emptyLogTail(),
     stderr: emptyLogTail()
@@ -1032,7 +1055,11 @@ export class ExtensionHost {
     }
   }
 
-  async reload(plan: ExtensionLoadPlan, reason: ExtensionReplacementReason = "reload"): Promise<void> {
+  async reload(
+    request: ExtensionReloadRequest,
+    reason: ExtensionReplacementReason = "reload"
+  ): Promise<ExtensionReloadResult> {
+    if (this.#reloadAttempt) throw new Error("Extension host cannot reload while reloading")
     const state = this.#state
     if (state.type === "disposed" || state.type === "stopping") {
       throw new Error(`Extension host cannot reload while ${state.type}`)
@@ -1041,9 +1068,17 @@ export class ExtensionHost {
       throw new Error(`Extension host cannot reload while ${state.type}`)
     }
     if (state.lifecycle === "stopped") throw new Error("Extension host cannot reload after session shutdown")
+    if (!Number.isSafeInteger(request.omittedDiagnostics) || request.omittedDiagnostics < 0) {
+      throw new Error("Omitted extension diagnostics must be a non-negative safe integer")
+    }
+
+    this.#beginReloadAttempt()
+    this.#admitAttemptDiagnostics(request.diagnostics, request.omittedDiagnostics)
+    const plan = request.plan
+
     if (state.type === "failed") {
       await state.cleanup
-      if (this.#state !== state) return
+      if (this.#state !== state) return this.#finishReloadAttempt("superseded")
     }
 
     if (state.type === "disabled" || state.type === "failed") {
@@ -1051,10 +1086,10 @@ export class ExtensionHost {
         this.#state = { type: "disabled", lifecycle: state.lifecycle }
         this.#extensions = Object.freeze([])
         this.#setToolCatalog(Object.freeze([]))
-        return
+        return this.#finishReloadAttempt("disabled")
       }
       await this.#startPlan(plan, state.lifecycle, reason)
-      return
+      return this.#finishReloadAttempt(reloadOutcomeAfterStart(this.#state))
     }
 
     if (plan.sources.length === 0) {
@@ -1066,12 +1101,11 @@ export class ExtensionHost {
       }
       this.#state = replacing
       await this.#retireCurrent(replacing, state.current, reason)
-      if (this.#state === replacing) {
-        this.#extensions = Object.freeze([])
-        this.#setToolCatalog(Object.freeze([]))
-        this.#state = { type: "disabled", lifecycle: state.lifecycle }
-      }
-      return
+      if (this.#state !== replacing) return this.#finishReloadAttempt("superseded")
+      this.#extensions = Object.freeze([])
+      this.#setToolCatalog(Object.freeze([]))
+      this.#state = { type: "disabled", lifecycle: state.lifecycle }
+      return this.#finishReloadAttempt("disabled")
     }
 
     const id = this.#takeGenerationId()
@@ -1088,7 +1122,7 @@ export class ExtensionHost {
     } catch (cause) {
       this.#diagnose(diagnostic("spawn", errorMessage(cause, "Could not spawn extension worker"), cause))
       if (this.#state === replacing) this.#state = state
-      return
+      return this.#finishReloadAttempt(this.#state === state ? "retained" : "superseded")
     }
     const spawned: ExtensionHostState = { ...replacing, candidate: { type: "spawned", generation: candidate } }
     this.#state = spawned
@@ -1098,29 +1132,28 @@ export class ExtensionHost {
       ready = await candidate.initialize()
     } catch {
       await candidate.dispose()
-      if (this.#state === spawned) {
-        const currentFailure = state.current.failure
-        if (currentFailure) {
-          const cleanup = state.current.dispose()
-          this.#extensions = Object.freeze([])
-          this.#setToolCatalog(Object.freeze([]))
-          this.#state = { type: "failed", lifecycle: state.lifecycle, diagnostic: currentFailure, cleanup }
-          await cleanup
-        } else {
-          this.#state = state
-        }
+      if (this.#state !== spawned) return this.#finishReloadAttempt("superseded")
+      const currentFailure = state.current.failure
+      if (currentFailure) {
+        const cleanup = state.current.dispose()
+        this.#extensions = Object.freeze([])
+        this.#setToolCatalog(Object.freeze([]))
+        this.#state = { type: "failed", lifecycle: state.lifecycle, diagnostic: currentFailure, cleanup }
+        await cleanup
+        return this.#finishReloadAttempt("failed")
       }
-      return
+      this.#state = state
+      return this.#finishReloadAttempt("retained")
     }
     if (this.#state !== spawned) {
       await candidate.dispose()
-      return
+      return this.#finishReloadAttempt("superseded")
     }
     this.#admitLoadResults(ready.extensions)
     await this.#retireCurrent(spawned, state.current, reason)
     if (this.#state !== spawned) {
       await candidate.dispose()
-      return
+      return this.#finishReloadAttempt("superseded")
     }
 
     this.#extensions = ready.extensions
@@ -1135,15 +1168,16 @@ export class ExtensionHost {
       this.#state = dispatching
       try {
         await candidate.requestStart(reason)
-        if (this.#state === dispatching) {
-          this.#state = { type: "ready", lifecycle: "started", current: candidate }
-        }
+        if (this.#state !== dispatching) return this.#finishReloadAttempt("superseded")
+        this.#state = { type: "ready", lifecycle: "started", current: candidate }
+        return this.#finishReloadAttempt("replaced")
       } catch (cause) {
         await this.#operationFailed(dispatching, candidate, cause, "started")
+        return this.#finishReloadAttempt(this.snapshot().status === "failed" ? "failed" : "superseded")
       }
-      return
     }
     this.#state = { type: "ready", lifecycle: state.lifecycle, current: candidate }
+    return this.#finishReloadAttempt("replaced")
   }
 
   dispose(reason: ExtensionShutdownReason = "quit"): Promise<void> {
@@ -1280,7 +1314,8 @@ export class ExtensionHost {
     generation: ExtensionGeneration,
     request: ExtensionSessionRequest
   ): ExtensionSessionRequestOutcome {
-    if (this.#activeGeneration(this.#state) !== generation) {
+    const phase = this.#sessionOperationPhase(this.#state, generation)
+    if (phase === "none") {
       this.#staleFrame()
       return { type: "session_operation_error", message: "Extension session operation came from a stale generation" }
     }
@@ -1296,6 +1331,9 @@ export class ExtensionHost {
     const operations = this.#sessionOperations
     if (!operations) {
       return { type: "session_operation_error", message: "Extension session operations are not bound" }
+    }
+    if (request.type === "custom_message_send" && phase === "state_only") {
+      return { type: "session_operation_error", message: "Conversation delivery is closed during extension shutdown" }
     }
 
     try {
@@ -1411,11 +1449,66 @@ export class ExtensionHost {
   }
 
   #diagnose(value: ExtensionDiagnostic): void {
+    const attempt = this.#reloadAttempt
+    if (attempt) {
+      if (attempt.diagnostics.length >= maxExtensionDiagnostics) {
+        attempt.omitted = Math.min(Number.MAX_SAFE_INTEGER, attempt.omitted + 1)
+      } else {
+        attempt.diagnostics.push(value)
+      }
+    }
     if (this.#diagnostics.length >= maxExtensionDiagnostics) {
       this.#omittedDiagnostics = Math.min(Number.MAX_SAFE_INTEGER, this.#omittedDiagnostics + 1)
       return
     }
     this.#diagnostics.push(value)
+  }
+
+  #beginReloadAttempt(): void {
+    this.#reloadAttempt = { diagnostics: [], omitted: 0 }
+  }
+
+  #admitAttemptDiagnostics(values: readonly ExtensionDiagnostic[], omitted: number): void {
+    for (const value of values) this.#diagnose(boundedExtensionDiagnostic(value))
+    if (omitted === 0) return
+    this.#omittedDiagnostics = Math.min(Number.MAX_SAFE_INTEGER, this.#omittedDiagnostics + omitted)
+    const attempt = this.#reloadAttempt
+    if (attempt) attempt.omitted = Math.min(Number.MAX_SAFE_INTEGER, attempt.omitted + omitted)
+  }
+
+  #finishReloadAttempt(outcome: ExtensionReloadOutcome): ExtensionReloadResult {
+    const attempt = this.#reloadAttempt ?? { diagnostics: [], omitted: 0 }
+    this.#reloadAttempt = undefined
+    return Object.freeze({
+      outcome,
+      snapshot: this.snapshot(),
+      diagnostics: Object.freeze([...attempt.diagnostics]),
+      omittedDiagnostics: attempt.omitted
+    })
+  }
+
+  #sessionOperationPhase(state: ExtensionHostState, generation: ExtensionGeneration): SessionOperationPhase {
+    switch (state.type) {
+      case "ready":
+        return state.current === generation && state.lifecycle === "started" ? "full" : "none"
+      case "dispatching":
+        // Ordinary startup and reload candidate start both dispatch session_start. Message delivery
+        // policy for reload stays on AgentSession (activity is reloading); the host only closes
+        // conversation delivery during shutdown.
+        if (state.current !== generation) return "none"
+        return state.event === "session_start" ? "full" : "state_only"
+      case "replacing":
+        return state.current === generation ? "state_only" : "none"
+      case "stopping":
+        return state.shutdown === generation ? "state_only" : "none"
+      case "starting":
+      case "disabled":
+      case "failed":
+      case "disposed":
+        return "none"
+      default:
+        return assertNever(state)
+    }
   }
 
   #staleFrame(): void {
@@ -1447,6 +1540,22 @@ export class ExtensionHost {
       default:
         return assertNever(state)
     }
+  }
+}
+
+function reloadOutcomeAfterStart(state: ExtensionHostState): ExtensionReloadOutcome {
+  switch (state.type) {
+    case "ready":
+      return "replaced"
+    case "disabled":
+      return "disabled"
+    case "failed":
+      return "failed"
+    case "disposed":
+    case "stopping":
+      return "superseded"
+    default:
+      return "superseded"
   }
 }
 

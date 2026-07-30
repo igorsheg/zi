@@ -19,6 +19,7 @@ test("SlashController aggregates a session catalog with deterministic built-in p
     "settings",
     "codex-settings",
     "compact",
+    "reload",
     "new",
     "resume",
     "review",
@@ -46,7 +47,12 @@ test("SlashController caches one bounded catalog until the session generation ch
   )
 
   expect(slash.suggestions("/rev", 4)[0]?.name).toBe("review")
-  expect(slash.suggestions("/re", 3)[0]?.name).toBe("resume")
+  expect(
+    slash
+      .suggestions("/re", 3)
+      .map(command => command.name)
+      .slice(0, 2)
+  ).toEqual(["reload", "resume"])
   expect(reads).toBe(1)
 
   resources = [{ name: "deploy", description: "Deploy current project" }]
@@ -115,8 +121,32 @@ test("SlashController parses only supported built-in invocations", () => {
     type: "compact",
     instructions: "preserve exact paths"
   })
+  expect(slash.parse("/reload")).toEqual({ type: "reload" })
   expect(slash.parse("/new")).toEqual({ type: "new_session" })
   expect(slash.parse("/resume")).toEqual({ type: "resume_session" })
+})
+
+test("SlashController invalidates a cached catalog without a session generation change", () => {
+  let generation = 0
+  let reads = 0
+  let resources: readonly SlashCommand[] = [{ name: "review", description: "Review code" }]
+  const slash = new SlashController(
+    () => ({
+      listResourceCommands() {
+        reads++
+        return resources
+      }
+    }),
+    () => generation
+  )
+
+  expect(slash.suggestions("/rev", 4)[0]?.name).toBe("review")
+  expect(reads).toBe(1)
+
+  resources = [{ name: "deploy", description: "Deploy current project" }]
+  slash.invalidateCatalog()
+  expect(slash.suggestions("/dep", 4)[0]?.name).toBe("deploy")
+  expect(reads).toBe(2)
 })
 
 function commandSession(commands: readonly SlashCommand[]) {

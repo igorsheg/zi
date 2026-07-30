@@ -1,7 +1,7 @@
 import { Agent, type AgentTool, type ThinkingLevel } from "@earendil-works/pi-agent-core"
 import { clampThinkingLevel, type Api, type Model } from "@earendil-works/pi-ai"
 
-import { AgentSession } from "./agent-session.js"
+import { AgentSession, type SessionReloadDeps } from "./agent-session.js"
 import { Authentication } from "./authentication.js"
 import type { CodeMode } from "./code-mode/code-mode.js"
 import { isCodeModeDetails } from "./code-mode/trace.js"
@@ -15,6 +15,7 @@ import type { ModelRegistry } from "./model-registry.js"
 import { findInitialModel, restoreModelFromSession } from "./model-resolver.js"
 import type { ZiPaths } from "./paths.js"
 import { ProjectFileSearch } from "./project-file-search.js"
+import type { ProjectConfigurationAdmission } from "./project-trust.js"
 import { createSessionResources, type ResourceLoader, type SessionResources } from "./resource-loader.js"
 import type { SessionManager, SessionModel } from "./session-manager.js"
 import type { SessionShell } from "./session-shell.js"
@@ -70,6 +71,8 @@ export interface CreateAgentSessionOptions {
   readonly extensionHost?: ExtensionHost
   readonly resources?: SessionResources
   readonly codeMode?: CodeMode
+  readonly project?: ProjectConfigurationAdmission
+  readonly extensionPaths?: readonly string[]
 }
 
 /** Build one session from caller-owned services. The caller owns the returned session's disposal. */
@@ -151,6 +154,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions): Pr
       return assertNever(bootstrap)
   }
 
+  const reload: SessionReloadDeps = Object.freeze({
+    resourceLoader: services.resourceLoader,
+    paths: services.paths,
+    project: options.project ?? "absent",
+    extensionPaths: Object.freeze([...(options.extensionPaths ?? [])])
+  })
   const session = new AgentSession({
     agent,
     sessionManager,
@@ -160,6 +169,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions): Pr
     resources,
     projectFileSearch: new ProjectFileSearch(services.paths),
     tools: options.tools,
+    reload,
     ...(options.codeMode ? { codeMode: options.codeMode } : {}),
     ...(options.extensionHost ? { extensionHost: options.extensionHost } : {}),
     ...(options.shell ? { shell: options.shell } : {}),

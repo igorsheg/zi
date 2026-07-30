@@ -14,6 +14,7 @@ export type InteractiveCommand =
   | { readonly type: "settings" }
   | { readonly type: "codex_settings" }
   | { readonly type: "compact"; readonly instructions: string }
+  | { readonly type: "reload" }
   | { readonly type: "new_session" }
   | { readonly type: "resume_session" }
 
@@ -81,6 +82,10 @@ export class SlashController {
     const prefix = `/${command.name}`
     const args = text === prefix ? "" : text.slice(prefix.length + 1)
     return builtinIntent(command.name, args)
+  }
+
+  invalidateCatalog(): void {
+    this.#catalogGeneration = undefined
   }
 
   #commands(): readonly SlashCommand[] {
@@ -160,6 +165,8 @@ function builtinIntent(name: BuiltinSlashCommandName, args: string): Interactive
       return { type: "codex_settings" }
     case "compact":
       return { type: "compact", instructions: args.trim() }
+    case "reload":
+      return { type: "reload" }
     case "new":
       return { type: "new_session" }
     case "resume":

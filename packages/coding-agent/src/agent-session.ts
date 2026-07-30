@@ -56,14 +56,17 @@ import {
 } from "./context-usage.js"
 import type { StoredCredential } from "./credential-store.js"
 import { DEFAULT_THINKING_LEVEL } from "./defaults.js"
-import type { ExtensionHost, ExtensionHostSnapshot } from "./extensions/host.js"
+import { discoverExtensionLoadPlan, extensionDiscoveryDiagnostic } from "./extensions/discovery.js"
+import type { ExtensionHost, ExtensionHostSnapshot, ExtensionReloadResult } from "./extensions/host.js"
 import { admitExtensionTools } from "./extensions/tools.js"
 import { isZiAgentMessage, type AgentMessage } from "./messages.js"
 import type { ModelRegistry } from "./model-registry.js"
+import type { ZiPaths } from "./paths.js"
 import { type ProjectFileSearch, type ProjectFileSearchResult } from "./project-file-search.js"
+import type { ProjectConfigurationAdmission } from "./project-trust.js"
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.js"
 import type { ResourceDiagnostic } from "./resource-diagnostics.js"
-import type { SessionResources } from "./resource-loader.js"
+import type { ResourceLoader, SessionResources } from "./resource-loader.js"
 import { boundedRetryError, retryAbortedMessage, retryDelayMs, waitForRetryDelay } from "./retry.js"
 import {
   isSessionJson,
@@ -82,7 +85,7 @@ import {
   type SessionPromptHistoryEntry
 } from "./session-manager.js"
 import type { SessionShell, ShellDemotionResult, ShellKillResult, ShellTaskSnapshot } from "./session-shell.js"
-import type { SettingsManager, SettingsScope } from "./settings-manager.js"
+import type { SettingsError, SettingsManager, SettingsScope } from "./settings-manager.js"
 import { expandSkillCommand, type Skill } from "./skills.js"
 import type { SlashCommand } from "./slash-commands.js"
 import { buildSystemPrompt } from "./system-prompt.js"
@@ -247,6 +250,19 @@ export interface CodexFastModeMutation {
   readonly effective: boolean
 }
 
+export interface SessionReloadDeps {
+  readonly resourceLoader: ResourceLoader
+  readonly paths: ZiPaths
+  readonly project: ProjectConfigurationAdmission
+  readonly extensionPaths: readonly string[]
+}
+
+export interface SessionReloadResult {
+  readonly resources: SessionResources
+  readonly extensions: ExtensionReloadResult | undefined
+  readonly settingsErrors: readonly SettingsError[]
+}
+
 export interface AgentSessionConfig {
   agent: Agent
   sessionManager: SessionManager
@@ -256,6 +272,7 @@ export interface AgentSessionConfig {
   resources: SessionResources
   projectFileSearch: ProjectFileSearch
   tools: readonly AgentTool[]
+  reload: SessionReloadDeps
   codeMode?: CodeMode
   extensionHost?: ExtensionHost
   shell?: SessionShell
@@ -319,6 +336,7 @@ type Activity =
       settled: Promise<void>
     }
   | { type: "compaction_committed"; operationId: number; reason: "manual"; settled: Promise<void> }
+  | { type: "reloading"; operationId: number; settled: Promise<void> }
   | { type: "failed"; runId: number; cause: unknown }
   | { type: "disposed"; settled: Promise<void> }
 
@@ -418,7 +436,7 @@ export class AgentSession {
   readonly #agent: Agent
   readonly #authentication: Authentication
   readonly #modelRegistry: ModelRegistry
-  readonly #resources: SessionResources
+  readonly #reload: SessionReloadDeps
   readonly #projectFileSearch: ProjectFileSearch
   readonly #codeMode: CodeMode | undefined
   readonly #extensionHost: ExtensionHost | undefined
@@ -429,6 +447,7 @@ export class AgentSession {
   readonly #unsubscribeShell: (() => void) | undefined
   readonly #unbindExtensionTools: (() => void) | undefined
   readonly #unbindExtensionSessionOperations: (() => void) | undefined
+  #resources: SessionResources
   #activeTools: readonly AgentTool[]
   #activity: Activity = { type: "idle" }
   #extensionLifecycle: ExtensionLifecycleState
@@ -440,6 +459,7 @@ export class AgentSession {
   #nextEntryId = 0
   #nextModelOperationId = 0
   #nextCompactionOperationId = 0
+  #nextReloadOperationId = 0
   #modelMutation: ModelMutationState = { type: "none" }
   #modelState: SessionModelState
   #modelChoicesPromise: Promise<readonly ModelChoice[]> | undefined
@@ -450,6 +470,7 @@ export class AgentSession {
     this.#agent = config.agent
     this.#authentication = config.authentication
     this.#modelRegistry = config.modelRegistry
+    this.#reload = config.reload
     this.#resources = config.resources
     this.#projectFileSearch = config.projectFileSearch
     this.#codeMode = config.codeMode
@@ -470,7 +491,7 @@ export class AgentSession {
       getEntries: customType => this.#getExtensionCustomEntries(customType).map(extensionCustomEntry),
       appendEntry: (customType, data) => extensionCustomEntry(this.#appendExtensionCustomEntry(customType, data)),
       sendMessage: (message, delivery) => {
-        this.sendCustomMessage(message, extensionMessageDelivery(delivery))
+        this.#sendExtensionCustomMessage(message, delivery)
       }
     })
     this.#unsubscribeShell = this.#shell?.subscribe(taskId => {
@@ -746,15 +767,39 @@ export class AgentSession {
   }
 
   #getExtensionCustomEntries(customType: string): readonly CustomEntry[] {
-    if (this.#extensionLifecycle.type === "shutdown") return this.sessionManager.customEntries(customType)
+    if (this.#activity.type === "reloading" || this.#extensionLifecycle.type === "shutdown") {
+      return this.sessionManager.customEntries(customType)
+    }
     return this.getCustomEntries(customType)
   }
 
   #appendExtensionCustomEntry(customType: string, data?: SessionJson): CustomEntry {
-    if (this.#extensionLifecycle.type !== "shutdown") return this.appendCustomEntry(customType, data)
-    return data === undefined
-      ? this.sessionManager.appendCustomEntry(customType)
-      : this.sessionManager.appendCustomEntry(customType, data)
+    if (this.#activity.type === "reloading") {
+      const entry =
+        data === undefined
+          ? this.sessionManager.appendCustomEntry(customType)
+          : this.sessionManager.appendCustomEntry(customType, data)
+      this.#emitAll([{ type: "entry_appended", entry }])
+      return entry
+    }
+    if (this.#extensionLifecycle.type === "shutdown") {
+      return data === undefined
+        ? this.sessionManager.appendCustomEntry(customType)
+        : this.sessionManager.appendCustomEntry(customType, data)
+    }
+    return this.appendCustomEntry(customType, data)
+  }
+
+  #sendExtensionCustomMessage(message: CustomMessageInput, delivery: ExtensionMessageDelivery): void {
+    if (this.#activity.type === "reloading") {
+      if (delivery !== "append") {
+        throw new Error("Only append custom messages are allowed while reloading")
+      }
+      const committed = this.#appendCustomMessage(message)
+      this.#publishCustomMessage(committed)
+      return
+    }
+    this.sendCustomMessage(message, extensionMessageDelivery(delivery))
   }
 
   sendCustomMessage(message: CustomMessageInput, delivery: CustomMessageDelivery): CustomMessageAdmission {
@@ -788,6 +833,59 @@ export class AgentSession {
         return { type: "queued", delivery: "next_turn" }
       default:
         return assertNever(delivery)
+    }
+  }
+
+  async reload(): Promise<SessionReloadResult> {
+    this.#assertReloadAdmissible()
+    const operationId = ++this.#nextReloadOperationId
+    const settlement = createSettlement()
+    this.#activity = {
+      type: "reloading",
+      operationId,
+      settled: settlement.promise.then(
+        () => undefined,
+        () => undefined
+      )
+    }
+
+    try {
+      this.settingsManager.reload()
+      const settingsErrors = Object.freeze(this.settingsManager.drainErrors())
+      this.#applyQueueModesFromSettings()
+
+      const resources = await this.#reload.resourceLoader.load()
+      if (!this.#ownsReload(operationId)) {
+        settlement.resolve()
+        return Object.freeze({ resources, extensions: undefined, settingsErrors })
+      }
+      this.#resources = resources
+      this.#applyActiveTools()
+
+      let extensions: ExtensionReloadResult | undefined
+      if (this.#extensionHost) {
+        const discovery = discoverExtensionLoadPlan(
+          this.#reload.paths,
+          this.#reload.project,
+          this.#reload.extensionPaths
+        )
+        extensions = await this.#extensionHost.reload(
+          {
+            plan: discovery.plan,
+            diagnostics: discovery.diagnostics.map(extensionDiscoveryDiagnostic),
+            omittedDiagnostics: discovery.omittedDiagnostics
+          },
+          "reload"
+        )
+      }
+
+      if (this.#ownsReload(operationId)) this.#activity = { type: "idle" }
+      settlement.resolve()
+      return Object.freeze({ resources, extensions, settingsErrors })
+    } catch (cause) {
+      if (this.#ownsReload(operationId)) this.#activity = { type: "idle" }
+      settlement.reject(cause)
+      throw cause
     }
   }
 
@@ -841,6 +939,8 @@ export class AgentSession {
       case "compacting":
       case "compaction_committed":
         throw new Error("Cannot prompt while context compaction is active")
+      case "reloading":
+        throw new Error("Cannot prompt while reload is active")
       case "failed":
         throw new Error("Restore or discard queued inputs from the failed run before prompting again")
       case "disposed":
@@ -864,6 +964,7 @@ export class AgentSession {
     if (this.#activity.type === "compacting" || this.#activity.type === "compaction_committed") {
       throw new Error("Cannot restore queued inputs while context compaction is active")
     }
+    if (this.#activity.type === "reloading") throw new Error("Cannot restore queued inputs while reload is active")
     const queued = this.#detachQueuedInputs("restore")
     if (this.#activity.type === "failed") this.#activity = { type: "idle" }
     this.#emitQueue()
@@ -918,6 +1019,13 @@ export class AgentSession {
         this.#activity = { type: "idle" }
         this.#emitQueue()
         return { ...queued, settled: authenticationSettled }
+      }
+      case "reloading": {
+        const { settled } = this.#activity
+        return {
+          ...emptyQueue(),
+          settled: authenticationWasIdle ? settled : settleTogether(settled, authenticationSettled)
+        }
       }
       case "disposed":
         throw new Error("AgentSession is disposed")
@@ -974,6 +1082,10 @@ export class AgentSession {
       case "failed":
         this.#agent.abort()
         return authenticationSettled
+      case "reloading": {
+        const { settled } = this.#activity
+        return authenticationWasIdle ? settled : settleTogether(settled, authenticationSettled)
+      }
       case "disposed":
         throw new Error("AgentSession is disposed")
       default:
@@ -1035,6 +1147,7 @@ export class AgentSession {
       case "aborting":
       case "compacting":
       case "compaction_committed":
+      case "reloading":
       case "disposed":
         return settleAll([this.#activity.settled, this.#authentication.waitForIdle(), searchSettled, extensionsSettled])
       case "idle":
@@ -1198,7 +1311,8 @@ export class AgentSession {
       currentActivity.type === "running" ||
       currentActivity.type === "aborting" ||
       currentActivity.type === "compacting" ||
-      currentActivity.type === "compaction_committed"
+      currentActivity.type === "compaction_committed" ||
+      currentActivity.type === "reloading"
         ? currentActivity.settled
         : Promise.resolve()
     this.#pending = []
@@ -2079,6 +2193,8 @@ export class AgentSession {
       case "compacting":
       case "compaction_committed":
         throw new Error("Cannot queue input while context compaction is active")
+      case "reloading":
+        throw new Error("Cannot queue input while reload is active")
       case "failed":
         throw new Error("Restore or discard queued inputs from the failed run before queueing again")
       case "disposed":
@@ -2372,12 +2488,56 @@ export class AgentSession {
       case "compacting":
       case "compaction_committed":
         throw new Error("Cannot append custom state while context compaction is active")
+      case "reloading":
+        throw new Error("Cannot append custom state while reload is active")
       case "failed":
         throw new Error("Cannot append custom state while the agent is failed")
       case "disposed":
         throw new Error("AgentSession is disposed")
       default:
         return assertNever(this.#activity)
+    }
+  }
+
+  #assertReloadAdmissible(): void {
+    this.#assertIdle("reload")
+    if (this.#modelMutation.type !== "none") throw new Error("Cannot reload while a model change is active")
+    if (this.#pending.length > 0) throw new Error("Cannot reload while queued input is pending")
+    switch (this.#extensionLifecycle.type) {
+      case "absent":
+      case "started":
+        break
+      case "unbound":
+        throw new Error("Cannot reload before extension lifecycle start")
+      case "starting":
+      case "shutdown":
+      case "disposing":
+      case "disposed":
+        throw new Error(`Cannot reload while extension lifecycle is ${this.#extensionLifecycle.type}`)
+      default:
+        return assertNever(this.#extensionLifecycle)
+    }
+    const host = this.#extensionHost
+    if (!host) return
+    const status = host.snapshot().status
+    if (status !== "disabled" && status !== "ready" && status !== "failed") {
+      throw new Error(`Cannot reload while extension host is ${status}`)
+    }
+  }
+
+  #ownsReload(operationId: number): boolean {
+    return this.#activity.type === "reloading" && this.#activity.operationId === operationId
+  }
+
+  #applyQueueModesFromSettings(): void {
+    const settings = this.settingsManager.get()
+    if (settings.steeringMode !== this.#agent.steeringMode) {
+      this.#agent.steeringMode = settings.steeringMode
+      this.#emitAll([{ type: "steering_mode_changed", mode: settings.steeringMode }])
+    }
+    if (settings.followUpMode !== this.#agent.followUpMode) {
+      this.#agent.followUpMode = settings.followUpMode
+      this.#emitAll([{ type: "follow_up_mode_changed", mode: settings.followUpMode }])
     }
   }
 

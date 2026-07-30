@@ -5,6 +5,7 @@ const definitions = [
   { name: "settings", description: "Open settings menu" },
   { name: "codex-settings", description: "Open OpenAI Codex settings" },
   { name: "compact", description: "Compact context, optionally preserving a specified focus", argumentHint: "[focus]" },
+  { name: "reload", description: "Reload settings, extensions, skills, prompts, and context files" },
   { name: "new", description: "Start a new session" },
   { name: "resume", description: "Browse and resume saved sessions" }
 ] as const

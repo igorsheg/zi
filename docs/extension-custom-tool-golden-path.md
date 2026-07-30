@@ -82,7 +82,7 @@ ZiPaths + project trust
 - Import and factory failure affect only the originating extension.
 - A thrown tool error settles that invocation once and leaves the session and generation usable.
 - Malformed or oversized protocol data fails the generation without crashing Zi.
-- A worker crash settles pending invocations, leaves `AgentSession` usable without extensions, and requires explicit reload to recover.
+- A worker crash settles pending invocations, leaves `AgentSession` usable without extensions, and requires explicit `/reload` (or a new session) to recover.
 - A blocked factory or invocation is killed after its deadline and cannot freeze the TUI.
 - Stale completions from a replaced generation cannot mutate the current session.
 - Final disposal releases every `ExtensionHost`-owned worker process, pipe, listener, request, timer, and temporary artifact. Extensions own processes they spawn and should stop them during `session_shutdown`; Zi does not guarantee cleanup of detached or otherwise surviving descendants.
