@@ -224,7 +224,7 @@ class SubagentProvider {
       this.#complete = true
       return eventStreamResponse(textEvents(acceptanceText, this.#mode))
     } catch (cause) {
-      this.#failed = cause instanceof Error ? cause.message : String(cause)
+      this.#failed ??= cause instanceof Error ? cause.message : String(cause)
       return Response.json({ error: { message: this.#failed } }, { status: 500 })
     }
   }
