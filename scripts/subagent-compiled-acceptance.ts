@@ -414,8 +414,10 @@ async function readPidMarker(path: string): Promise<number> {
 
 function containmentProbeCommand(markerPath: string): string {
   if (process.platform === "win32") {
-    const encodedPath = Buffer.from(markerPath, "utf16le").toString("base64")
-    return `powershell.exe -NoProfile -NonInteractive -Command "$path=[Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('${encodedPath}')); [IO.File]::WriteAllText($path,[string]$PID); Start-Sleep -Seconds 600"`
+    const pathLiteral = markerPath.replaceAll("'", "''")
+    const script = `[IO.File]::WriteAllText('${pathLiteral}',[string]$PID); Start-Sleep -Seconds 600`
+    const encoded = Buffer.from(script, "utf16le").toString("base64")
+    return `powershell.exe -NoProfile -NonInteractive -EncodedCommand ${encoded}`
   }
   return `/bin/sh -c 'printf "%s" "$$" > "$1"; exec sleep 600' zi-probe ${shellQuote(markerPath)}`
 }
