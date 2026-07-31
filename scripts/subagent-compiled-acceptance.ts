@@ -101,6 +101,7 @@ async function runMode(
 
     const [exitCode, stdout, stderr] = await settleProcess(parent)
     if (exitCode !== 0 || stderr !== "" || stdout.trim() !== acceptanceText) {
+      provider.assertComplete()
       throw new Error(
         `Compiled ${mode} subagent acceptance failed: exit=${exitCode} stdout=${JSON.stringify(stdout)} stderr=${JSON.stringify(stderr)}`
       )
