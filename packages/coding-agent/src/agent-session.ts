@@ -88,6 +88,8 @@ import type { SessionShell, ShellDemotionResult, ShellKillResult, ShellTaskSnaps
 import type { SettingsError, SettingsManager, SettingsScope } from "./settings-manager.js"
 import { expandSkillCommand, type Skill } from "./skills.js"
 import type { SlashCommand } from "./slash-commands.js"
+import type { SubagentSnapshot, SubagentStatus, SubagentSupervisor } from "./subagents/supervisor.js"
+import { createSubagentTools } from "./subagents/tools.js"
 import { buildSystemPrompt } from "./system-prompt.js"
 
 export type { ContextUsage } from "./context-usage.js"
@@ -193,6 +195,7 @@ export type AgentSessionEvent =
   | { type: "steering_mode_changed"; mode: QueueMode }
   | { type: "follow_up_mode_changed"; mode: QueueMode }
   | { type: "shell_task_changed"; taskId: string }
+  | { type: "subagent_changed"; agentId: string }
   | {
       type: "authentication_changed"
       status: "logged_in" | "logged_out"
@@ -276,6 +279,7 @@ export interface AgentSessionConfig {
   codeMode?: CodeMode
   extensionHost?: ExtensionHost
   shell?: SessionShell
+  subagents?: SubagentSupervisor
   model?: Model<Api>
   apiKeyProvider?: string
 }
@@ -441,14 +445,16 @@ export class AgentSession {
   readonly #codeMode: CodeMode | undefined
   readonly #extensionHost: ExtensionHost | undefined
   readonly #shell: SessionShell | undefined
+  readonly #subagents: SubagentSupervisor | undefined
   readonly #apiKeyProvider: string | undefined
   readonly #listeners = new Set<(event: AgentSessionEvent) => void>()
   readonly #unsubscribeAgent: () => void
   readonly #unsubscribeShell: (() => void) | undefined
-  readonly #unbindExtensionTools: (() => void) | undefined
+  readonly #unsubscribeSubagents: (() => void) | undefined
+  readonly #unbindExtensionCatalog: (() => void) | undefined
   readonly #unbindExtensionSessionOperations: (() => void) | undefined
   #resources: SessionResources
-  #activeTools: readonly AgentTool[]
+  #baseTools: readonly AgentTool[]
   #activity: Activity = { type: "idle" }
   #extensionLifecycle: ExtensionLifecycleState
   #pending: PendingInput[] = []
@@ -475,23 +481,36 @@ export class AgentSession {
     this.#projectFileSearch = config.projectFileSearch
     this.#codeMode = config.codeMode
     this.#extensionHost = config.extensionHost
-    this.#activeTools = Object.freeze([...config.tools])
+    this.#baseTools = Object.freeze([...config.tools])
     this.#extensionLifecycle = config.extensionHost
       ? { type: "unbound", host: config.extensionHost }
       : { type: "absent" }
     this.#shell = config.shell
+    this.#subagents = config.subagents
     this.#apiKeyProvider = config.apiKeyProvider
     this.sessionManager = config.sessionManager
     this.settingsManager = config.settingsManager
     this.#modelState = config.model ? { type: "selected", model: config.model } : { type: "unselected" }
     this.#agent.prepareNextTurnWithContext = (context, signal) => this.#prepareNextTurn(context, signal)
     this.#unsubscribeAgent = this.#agent.subscribe(event => this.#handleAgentEvent(event))
-    this.#unbindExtensionTools = config.extensionHost?.bindToolCatalog(() => this.#applyActiveTools())
+    this.#applyActiveTools()
+    this.#unbindExtensionCatalog = config.extensionHost?.bindCatalog(catalog => {
+      config.subagents?.replaceExtensionTypes(catalog.subagentTypes)
+      this.#applyActiveTools()
+    })
     this.#unbindExtensionSessionOperations = config.extensionHost?.bindSessionOperations({
       getEntries: customType => this.#getExtensionCustomEntries(customType).map(extensionCustomEntry),
       appendEntry: (customType, data) => extensionCustomEntry(this.#appendExtensionCustomEntry(customType, data)),
       sendMessage: (message, delivery) => {
         this.#sendExtensionCustomMessage(message, delivery)
+      }
+    })
+    this.#unsubscribeSubagents = this.#subagents?.subscribe(event => {
+      try {
+        if (event.type === "changed") this.#emit({ type: "subagent_changed", agentId: event.agentId })
+        else this.#emit({ type: "entry_appended", entry: event.entry })
+      } catch {
+        // Process ownership cannot cross into an observer.
       }
     })
     this.#unsubscribeShell = this.#shell?.subscribe(taskId => {
@@ -607,6 +626,18 @@ export class AgentSession {
 
   get shellTasks(): readonly ShellTaskSnapshot[] {
     return this.#shell?.snapshots() ?? []
+  }
+
+  get subagents(): readonly SubagentSnapshot[] {
+    return this.#subagents?.snapshots() ?? []
+  }
+
+  get runningSubagentCount(): number {
+    return this.#subagents?.runningCount() ?? 0
+  }
+
+  get subagentStatus(): SubagentStatus {
+    return this.#subagents?.status() ?? { workingAgentIds: [], readyAgentIds: [] }
   }
 
   demoteForegroundShellTask(): ShellDemotionResult {
@@ -1288,12 +1319,15 @@ export class AgentSession {
 
   setActiveTools(tools: readonly AgentTool[]): void {
     this.#assertIdle("change tools")
-    this.#activeTools = Object.freeze([...tools])
+    this.#baseTools = Object.freeze([...tools])
     this.#applyActiveTools()
   }
 
   #applyActiveTools(): void {
-    const tools = admitExtensionTools(this.#activeTools, this.#extensionHost)
+    const nativeTools = this.#subagents
+      ? Object.freeze([...this.#baseTools, ...createSubagentTools(this.#subagents)])
+      : this.#baseTools
+    const tools = admitExtensionTools(nativeTools, this.#extensionHost)
     this.#agent.state.tools = this.#codeMode ? [...tools, this.#codeMode.createTool(tools)] : [...tools]
     this.#agent.state.systemPrompt = buildSystemPrompt(
       this.sessionManager.header.cwd,
@@ -1326,17 +1360,19 @@ export class AgentSession {
       }
     }
     this.#agent.abort()
-    this.#unbindExtensionTools?.()
+    this.#unbindExtensionCatalog?.()
     const settled = settleAll([
       activeSettled,
       this.#authentication.dispose(),
       this.#projectFileSearch.dispose(),
       this.#shell?.dispose() ?? Promise.resolve(),
+      this.#subagents?.shutdown() ?? Promise.resolve(),
       this.#disposeExtensions(reason)
     ])
     this.#activity = { type: "disposed", settled }
     this.#unsubscribeAgent()
     this.#unsubscribeShell?.()
+    this.#unsubscribeSubagents?.()
     this.#listeners.clear()
     cleanupSessionResources(this.sessionId)
     void settled.catch(() => {})
@@ -1521,9 +1557,18 @@ export class AgentSession {
     const contextTools = context.context.tools ?? []
     const toolsChanged =
       activeTools.length !== contextTools.length || activeTools.some((tool, index) => tool !== contextTools[index])
-    const synchronizedContext = toolsChanged
+    let synchronizedContext = toolsChanged
       ? { ...context.context, systemPrompt: this.#agent.state.systemPrompt, tools: [...activeTools] }
       : undefined
+    const subagentNotice = this.#subagents?.completionNotice()
+    if (subagentNotice) {
+      const source = synchronizedContext ?? context.context
+      synchronizedContext = {
+        ...source,
+        tools: source.tools ?? [],
+        messages: [...source.messages, subagentNoticeMessage(subagentNotice)]
+      }
+    }
     const synchronized = synchronizedContext ? { context: synchronizedContext } : undefined
 
     if (activity.thresholdSuppressed || !this.settingsManager.get().compactionEnabled) return synchronized
@@ -2617,6 +2662,10 @@ function extensionMessageDelivery(delivery: ExtensionMessageDelivery): CustomMes
     default:
       return assertNever(delivery)
   }
+}
+
+function subagentNoticeMessage(content: string): RuntimeCustomMessage {
+  return { role: "custom", customType: "zi.subagent.notice", content, display: false, timestamp: Date.now() }
 }
 
 function runtimeCustomMessage(input: CustomMessageInput): RuntimeCustomMessage {

@@ -199,6 +199,12 @@ export interface ExtensionToolContext {
   readonly signal: AbortSignal
 }
 
+export interface SubagentTypeDefinition {
+  readonly name: string
+  readonly description: string
+  readonly instructions: string
+}
+
 interface ExtensionToolDefinitionBase<TParameters extends TObject> {
   readonly name: string
   readonly label?: string
@@ -229,6 +235,7 @@ export interface ExtensionAPI {
   registerTool<TParameters extends TObject, TOutputSchema extends TSchema | undefined = undefined>(
     tool: ExtensionToolDefinition<TParameters, TOutputSchema>
   ): void
+  registerSubagentType(definition: SubagentTypeDefinition): void
   getSessionEntries(customType: string): Promise<readonly ExtensionCustomEntry[]>
   appendEntry(customType: string, data?: JsonValue): Promise<ExtensionCustomEntry>
   sendMessage(message: ExtensionCustomMessage, delivery: ExtensionMessageDelivery): Promise<void>

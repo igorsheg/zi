@@ -26,6 +26,10 @@ export interface CreateAgentRuntimeOptions {
   readonly extensionPaths?: readonly string[]
   readonly extensionWorkerCommand?: readonly string[]
   readonly codeModeWorkerCommand?: readonly string[]
+  readonly subagentCommand?: readonly string[]
+  /** Private invocation marker used by Zi child sessions to prevent recursive delegation. */
+  readonly internalSubagentDepth?: 0 | 1
+  readonly internalSubagentEnvironment?: Readonly<Record<string, string | undefined>>
 }
 
 export function snapshotAgentRuntimeOptions(options: CreateAgentRuntimeOptions): CreateAgentRuntimeOptions {
@@ -45,8 +49,41 @@ export function snapshotAgentRuntimeOptions(options: CreateAgentRuntimeOptions):
       : { extensionWorkerCommand: snapshotStrings(options.extensionWorkerCommand, 16, "Extension worker command") }),
     ...(options.codeModeWorkerCommand === undefined
       ? {}
-      : { codeModeWorkerCommand: snapshotStrings(options.codeModeWorkerCommand, 16, "Code-mode worker command") })
+      : { codeModeWorkerCommand: snapshotStrings(options.codeModeWorkerCommand, 16, "Code-mode worker command") }),
+    ...(options.subagentCommand === undefined
+      ? {}
+      : { subagentCommand: snapshotStrings(options.subagentCommand, 16, "Subagent command") }),
+    ...(options.internalSubagentDepth === undefined
+      ? {}
+      : { internalSubagentDepth: snapshotSubagentDepth(options.internalSubagentDepth) }),
+    ...(options.internalSubagentEnvironment === undefined
+      ? {}
+      : { internalSubagentEnvironment: snapshotEnvironment(options.internalSubagentEnvironment) })
   })
+}
+
+function snapshotEnvironment(
+  value: Readonly<Record<string, string | undefined>>
+): Readonly<Record<string, string | undefined>> {
+  const entries = Object.entries(value)
+  if (entries.length > 4096) throw new Error("Subagent environment cannot exceed 4096 entries")
+  for (const [name, entry] of entries) {
+    if (name.length === 0 || name.includes("\0") || Buffer.byteLength(name) > 4096) {
+      throw new Error("Subagent environment contains an invalid name")
+    }
+    if (
+      entry !== undefined &&
+      (typeof entry !== "string" || entry.includes("\0") || Buffer.byteLength(entry) > 64 * 1024)
+    ) {
+      throw new Error(`Subagent environment value is invalid: ${name}`)
+    }
+  }
+  return Object.freeze(Object.fromEntries(entries))
+}
+
+function snapshotSubagentDepth(value: unknown): 0 | 1 {
+  if (value !== 0 && value !== 1) throw new Error("Internal subagent depth must be zero or one")
+  return value
 }
 
 function snapshotStrings(values: readonly string[], maximum: number, name: string): readonly string[] {

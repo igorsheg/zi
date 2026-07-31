@@ -408,6 +408,7 @@ packages/coding-agent/src/tools/presentation/
   write.ts
   edit.ts
   shell-task.ts
+  subagent.ts
   generic.ts
 ```
 
@@ -637,6 +638,7 @@ The architecture cutover gives every current built-in a coherent baseline. Later
 | Edit        | path + replacement/diff facts | context-rich executed diff only after successful execution | preterminal hidden; success edges 5/5; failure head 4 | detailed diff truncation               |
 | Task output | task ID + task-state detail   | terminal result                                            | tail 5                                                | truncation, full output, retention     |
 | Kill task   | task ID                       | text only when useful                                      | hidden on success; head on failure                    | stop state/failure                     |
+| Subagents   | human type or bounded count   | task/message details or bounded completion summaries       | administrative success hidden; wait head 6            | detailed agent IDs                     |
 
 Bash is the first shipped post-cutover polish slice. It adds an optional bounded human description, verb-first compact rows, an exact secondary command, a completion-stable five-row output tail, failed edge peek, compact empty success and background handoff, structured background/admission/interruption states, detailed-only retention notices, shell highlighting, action hints, and typed cancellation without changing the client boundary. A terminal LF terminates the final usable output line instead of consuming an additional line slot; intentional blank lines before that terminator remain lines.
 

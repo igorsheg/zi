@@ -50,6 +50,14 @@ Guidelines:
         .join("\n\n")}\n</project_context>`
     )
   }
+  if (tools.some(tool => tool.name === "spawn_subagent")) {
+    sections.push(`Subagents:
+- Delegate independent or context-heavy work; do not delegate trivial work.
+- At most four direct children may be live.
+- Children share this process user's filesystem and credential authority.
+- Use wait_subagents to obtain completed output.
+- send_subagent is queue-only and does not wake an idle child.`)
+  }
   if (tools.some(tool => tool.name === "read")) {
     const skills = formatSkillsForPrompt(resources.skills)
     if (skills.length > 0) sections.push(skills)

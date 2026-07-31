@@ -6,6 +6,7 @@ import { basename, join, resolve } from "node:path"
 import { runCodeModeAcceptance } from "./code-mode-acceptance.js"
 import { compileZi } from "./compile-zi.js"
 import { runExtensionCustomToolAcceptance } from "./extension-custom-tool-acceptance.js"
+import { runSubagentCompiledAcceptance } from "./subagent-compiled-acceptance.js"
 
 export const releaseTargets = ["darwin-arm64", "darwin-x64", "linux-arm64", "linux-x64", "windows-x64"] as const
 
@@ -84,6 +85,7 @@ async function buildRelease(options: ReleaseBuildOptions): Promise<void> {
     if (process.platform !== "win32") await chmod(executable, 0o755)
     await runExtensionCustomToolAcceptance({ executable })
     await runCodeModeAcceptance({ executable, cwd: packageDirectory })
+    await runSubagentCompiledAcceptance({ executable })
     await run(["tar", "-czf", archive, "-C", outputDirectory, packageName], {
       cwd: root,
       env: { ...process.env, COPYFILE_DISABLE: "1" }

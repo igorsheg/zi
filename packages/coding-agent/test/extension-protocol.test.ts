@@ -19,6 +19,8 @@ import {
   maxExtensionToolResultBytes,
   maxExtensionToolSchemaBytes,
   maxExtensionTools,
+  maxSubagentTypeNameBytes,
+  maxSubagentTypes,
   type HostMessage,
   validateHostMessage,
   validateWorkerMessage
@@ -134,7 +136,8 @@ test("worker protocol validation keeps source-attributed load and lifecycle resu
         { source, status: "loaded" },
         { source: { ...source, id: "failed" }, status: "failed", diagnostic }
       ],
-      tools: []
+      tools: [],
+      subagentTypes: []
     })
   ).toMatchObject({ type: "ready", extensions: [{ status: "loaded" }, { status: "failed", diagnostic }] })
   expect(() =>
@@ -143,7 +146,8 @@ test("worker protocol validation keeps source-attributed load and lifecycle resu
       protocolVersion: extensionProtocolVersion,
       generation: 1,
       extensions: [{ source, status: "failed" }],
-      tools: []
+      tools: [],
+      subagentTypes: []
     })
   ).toThrow("require a diagnostic")
   expect(() =>
@@ -170,7 +174,8 @@ test("tool protocol validation closes registration, arguments, results, and corr
     protocolVersion: extensionProtocolVersion,
     generation: 1,
     extensions: [{ source, status: "loaded" }],
-    tools: [registration]
+    tools: [registration],
+    subagentTypes: []
   })
   expect(ready).toMatchObject({ type: "ready", tools: [{ name: "echo_message" }] })
   expect(Object.isFrozen(ready.type === "ready" ? ready.tools[0]?.parameters.properties : undefined)).toBe(true)
@@ -198,7 +203,8 @@ test("tool protocol validation closes registration, arguments, results, and corr
       protocolVersion: extensionProtocolVersion,
       generation: 1,
       extensions: [{ source, status: "loaded" }],
-      tools: [{ ...registration, name: "Invalid-name" }]
+      tools: [{ ...registration, name: "Invalid-name" }],
+      subagentTypes: []
     })
   ).toThrow("tool names")
   expect(() =>
@@ -207,7 +213,8 @@ test("tool protocol validation closes registration, arguments, results, and corr
       protocolVersion: extensionProtocolVersion,
       generation: 1,
       extensions: [{ source, status: "loaded" }],
-      tools: [{ ...registration, outputSchema: undefined }]
+      tools: [{ ...registration, outputSchema: undefined }],
+      subagentTypes: []
     })
   ).toThrow("output schema")
   expect(() =>
@@ -216,7 +223,8 @@ test("tool protocol validation closes registration, arguments, results, and corr
       protocolVersion: extensionProtocolVersion,
       generation: 1,
       extensions: [{ source, status: "loaded" }],
-      tools: [{ ...registration, parameters: { type: "object", properties: { value: { type: "future" } } } }]
+      tools: [{ ...registration, parameters: { type: "object", properties: { value: { type: "future" } } } }],
+      subagentTypes: []
     })
   ).toThrow("unsupported type")
   expect(() =>
@@ -225,7 +233,8 @@ test("tool protocol validation closes registration, arguments, results, and corr
       protocolVersion: extensionProtocolVersion,
       generation: 1,
       extensions: [{ source, status: "loaded" }],
-      tools: [registration, registration]
+      tools: [registration, registration],
+      subagentTypes: []
     })
   ).toThrow("unique")
   expect(() =>
@@ -239,6 +248,67 @@ test("tool protocol validation closes registration, arguments, results, and corr
   expect(
     validateWorkerMessage({ type: "tool_result", generation: 1, requestId: 2, value: { echoed: "hello" } })
   ).toEqual({ type: "tool_result", generation: 1, requestId: 2, value: { echoed: "hello" } })
+})
+
+test("subagent type protocol validation is strict, bounded, and source-attributed", () => {
+  const definition = {
+    source,
+    name: "reviewer",
+    description: "Review changes",
+    instructions: "Inspect the requested change and report findings."
+  }
+  const ready = validateWorkerMessage({
+    type: "ready",
+    protocolVersion: extensionProtocolVersion,
+    generation: 1,
+    extensions: [{ source, status: "loaded" }],
+    tools: [],
+    subagentTypes: [definition]
+  })
+  expect(ready).toMatchObject({ type: "ready", subagentTypes: [{ name: "reviewer", source: { id: source.id } }] })
+  expect(Object.isFrozen(ready.type === "ready" ? ready.subagentTypes : undefined)).toBe(true)
+
+  for (const invalid of [
+    { ...definition, name: "general" },
+    { ...definition, name: "Invalid" },
+    { ...definition, name: "x".repeat(maxSubagentTypeNameBytes + 1) },
+    { ...definition, extra: true },
+    { ...definition, source: { ...source, entryPath: "relative" } }
+  ]) {
+    expect(() =>
+      validateWorkerMessage({
+        type: "ready",
+        protocolVersion: extensionProtocolVersion,
+        generation: 1,
+        extensions: [{ source, status: "loaded" }],
+        tools: [],
+        subagentTypes: [invalid]
+      })
+    ).toThrow()
+  }
+  expect(() =>
+    validateWorkerMessage({
+      type: "ready",
+      protocolVersion: extensionProtocolVersion,
+      generation: 1,
+      extensions: [{ source, status: "loaded" }],
+      tools: [],
+      subagentTypes: [definition, definition]
+    })
+  ).toThrow("Duplicate subagent type name")
+  expect(() =>
+    validateWorkerMessage({
+      type: "ready",
+      protocolVersion: extensionProtocolVersion,
+      generation: 1,
+      extensions: [{ source, status: "loaded" }],
+      tools: [],
+      subagentTypes: Array.from({ length: maxSubagentTypes + 1 }, (_, index) => ({
+        ...definition,
+        name: `reviewer_${index}`
+      }))
+    })
+  ).toThrow(`${maxSubagentTypes}`)
 })
 
 test("session-operation protocol validates source, values, delivery, and bounded results", () => {
@@ -318,7 +388,8 @@ test("maximum admitted load results fit in one protocol frame", () => {
     protocolVersion: extensionProtocolVersion,
     generation: 1,
     extensions: Array.from({ length: maxExtensionSources }, () => result),
-    tools: []
+    tools: [],
+    subagentTypes: []
   })
 
   expect(encodeExtensionProtocolFrame(message).byteLength).toBeLessThanOrEqual(maxExtensionProtocolFrameBytes + 4)
@@ -341,7 +412,8 @@ test("tool catalogs have one aggregate ready-frame budget", () => {
       protocolVersion: extensionProtocolVersion,
       generation: 1,
       extensions: [{ source: toolSource, status: "loaded" }],
-      tools
+      tools,
+      subagentTypes: []
     })
   ).toThrow(`catalog cannot exceed ${maxExtensionToolCatalogBytes} bytes`)
 })
@@ -373,7 +445,8 @@ test("maximum source results and an aggregate tool catalog fit one ready frame",
     protocolVersion: extensionProtocolVersion,
     generation: 1,
     extensions: [...Array.from({ length: maxExtensionSources - 1 }, () => failed), { source, status: "loaded" }],
-    tools
+    tools,
+    subagentTypes: []
   })
 
   expect(encodeExtensionProtocolFrame(message).byteLength).toBeLessThanOrEqual(maxExtensionProtocolFrameBytes + 4)

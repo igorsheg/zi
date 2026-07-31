@@ -1,6 +1,12 @@
 import { expect, test } from "bun:test"
 
-import { Schema, type ExtensionAPI, type ExtensionToolDefinition, type Static } from "../src/index.js"
+import {
+  Schema,
+  type ExtensionAPI,
+  type ExtensionToolDefinition,
+  type Static,
+  type SubagentTypeDefinition
+} from "../src/index.js"
 
 async function sessionOperations(api: ExtensionAPI): Promise<void> {
   const entries = await api.getSessionEntries("example.counter")
@@ -16,6 +22,11 @@ async function sessionOperations(api: ExtensionAPI): Promise<void> {
 }
 
 function registerStructuredTool(api: ExtensionAPI): void {
+  api.registerSubagentType({
+    name: "reviewer",
+    description: "Review changes",
+    instructions: "Inspect the requested change and report findings."
+  })
   api.registerTool({
     name: "double_value",
     description: "Double one value",
@@ -96,6 +107,15 @@ test("tool output schemas infer structured execution results", async () => {
   }
 
   expect(await tool.execute({ value: 3 }, { signal: new AbortController().signal })).toEqual({ doubled: 6, label: "3" })
+})
+
+test("subagent definitions expose only declarative policy", () => {
+  const definition: SubagentTypeDefinition = {
+    name: "reviewer",
+    description: "Review changes",
+    instructions: "Inspect the requested change and report findings."
+  }
+  expect(definition.name).toBe("reviewer")
 })
 
 test("public types reject values outside the worker schema contract", () => {

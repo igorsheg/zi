@@ -26,6 +26,7 @@
     "fix": "bun run lint:fix && bun run format",
     "format": "oxfmt --write .",
     "format:check": "oxfmt --check .",
+    "install:local": "bun scripts/install-local-zi.ts",
     "lint": "oxlint .",
     "lint:fix": "oxlint --fix .",
     "package:npm": "bun scripts/build-npm-packages.ts",

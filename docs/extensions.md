@@ -1,6 +1,6 @@
 # Extensions
 
-Zi extensions are trusted TypeScript modules that add repository-specific behavior without changing Zi. The supported public surface consists of lifecycle handlers, model-callable tools, and bounded durable session operations.
+Zi extensions are trusted TypeScript modules that add repository-specific behavior without changing Zi. The supported public surface consists of lifecycle handlers, model-callable tools, declarative subagent definitions, and bounded durable session operations.
 
 ## Trust and authority
 
@@ -13,8 +13,8 @@ Extensions run as the current user. They can read files and environment variable
 Zi discovers entry points in deterministic order:
 
 1. repeated `--extension <path>` arguments;
-2. `$HOME/.zi/agent/extensions/`;
-3. `<cwd>/.zi/extensions/`, when trusted.
+2. `<cwd>/.zi/extensions/`, when trusted;
+3. `$HOME/.zi/agent/extensions/`.
 
 A directory entry may use `index.ts`; a direct `.ts` file also works. TypeScript and relative imports load without a build. Install third-party dependencies in the extension's own package hierarchy so normal bare-module resolution can find them.
 
@@ -48,6 +48,22 @@ Tool names use lowercase letters, numbers, and underscores and must begin with a
 Without `outputSchema`, a tool returns one bounded string. Declaring `outputSchema` lets it return a matching bounded JSON value. Zi validates that value in the extension worker, renders it as JSON for direct model calls, and delivers it as an already-decoded JavaScript value in Code Mode. Tools throw errors for failed operations. Built-in Zi tool names take precedence over extension registrations.
 
 `execute` receives an invocation-scoped `AbortSignal`. Cancellation is cooperative: pass the signal to subprocess or I/O APIs and stop owned work promptly. Zi rejects late completion and terminates a worker that misses execution or cancellation deadlines.
+
+### Subagent definitions
+
+Native Zi owns subagent processes, RPC sequencing, admission, completion durability, and shutdown. Extensions may contribute only declarative types during factory execution:
+
+```ts
+zi.registerSubagentType({
+  name: "reviewer",
+  description: "Review a change for correctness and missing tests",
+  instructions: "Inspect the requested change. Do not edit files. Return findings with paths and line numbers."
+})
+```
+
+The V1 definition has exactly `name`, `description`, and `instructions`. It cannot select a model, executable, tool set, permission policy, or worktree. The built-in `general` name cannot be replaced. Names and bounded normalized descriptions appear in the model-facing `spawn_subagent.type` catalog; child-only `instructions` do not. Source precedence is explicit, trusted project, then global; a conflicting later source fails its registration. Reload atomically replaces extension definitions and the derived direct/Code Mode tool catalogs, while live children keep their spawn-time snapshot and survive extension removal or worker failure.
+
+See [`examples/extensions/subagent/`](../examples/extensions/subagent/) for the complete example. Extensions do not receive a procedural subagent API.
 
 ### Durable state and custom messages
 

@@ -29,13 +29,17 @@ import {
   maxExtensionDiagnostics,
   maxExtensionPendingRequests,
   maxExtensionTools,
+  maxSubagentTypes,
   type ExtensionDiagnostic,
   type ExtensionLoadResult,
   type ExtensionSessionResponse,
+  type ExtensionSubagentTypeRegistration,
   type ExtensionToolRegistration,
   type HostMessage,
   type JsonValue,
   type WorkerMessage,
+  validateExtensionSubagentTypeCatalog,
+  validateExtensionSubagentTypeRegistration,
   validateExtensionToolArguments,
   validateExtensionToolCatalog,
   validateExtensionToolRegistration,
@@ -126,6 +130,7 @@ type LifecycleState =
 export class LoadedExtensionGeneration {
   readonly results: readonly ExtensionLoadResult[]
   readonly tools: readonly ExtensionToolRegistration[]
+  readonly subagentTypes: readonly ExtensionSubagentTypeRegistration[]
   readonly #startHandlers: readonly StartHandler[]
   readonly #shutdownHandlers: readonly ShutdownHandler[]
   readonly #toolsByName: ReadonlyMap<string, RegisteredTool>
@@ -135,10 +140,12 @@ export class LoadedExtensionGeneration {
     results: readonly ExtensionLoadResult[],
     startHandlers: readonly StartHandler[],
     shutdownHandlers: readonly ShutdownHandler[],
-    tools: readonly RegisteredTool[]
+    tools: readonly RegisteredTool[],
+    subagentTypes: readonly ExtensionSubagentTypeRegistration[]
   ) {
     this.results = Object.freeze([...results])
     this.tools = Object.freeze(tools.map(tool => tool.registration))
+    this.subagentTypes = Object.freeze([...subagentTypes])
     this.#startHandlers = Object.freeze([...startHandlers])
     this.#shutdownHandlers = Object.freeze([...shutdownHandlers])
     this.#toolsByName = new Map(tools.map(tool => [tool.registration.name, tool]))
@@ -392,7 +399,8 @@ class ExtensionWorkerProcess {
         protocolVersion: extensionProtocolVersion,
         generation: message.generation,
         extensions: extensions.results,
-        tools: extensions.tools
+        tools: extensions.tools,
+        subagentTypes: extensions.subagentTypes
       })
     } catch (cause) {
       this.#fatal(message.generation, fatalDiagnostic("handshake", cause), cause)
@@ -756,12 +764,16 @@ export async function loadExtensionGeneration(
   const shutdownHandlers: ShutdownHandler[] = []
   const tools: RegisteredTool[] = []
   const toolNames = new Set<string>()
+  const subagentTypes: ExtensionSubagentTypeRegistration[] = []
+  const subagentTypeNames = new Set<string>()
 
   for (const source of plan.sources) {
     const localStart: StartHandler[] = []
     const localShutdown: ShutdownHandler[] = []
     const localTools: RegisteredTool[] = []
     const localToolNames = new Set<string>()
+    const localSubagentTypes: ExtensionSubagentTypeRegistration[] = []
+    const localSubagentTypeNames = new Set<string>()
     let acceptingRegistrations = true
     const api = Object.freeze({
       on(registeredEvent: unknown, handler: unknown): void {
@@ -812,6 +824,27 @@ export async function loadExtensionGeneration(
         localToolNames.add(name)
         localTools.push(registered)
       },
+      registerSubagentType(value: unknown): void {
+        if (!acceptingRegistrations) {
+          throw new ExtensionRegistrationError("Extension registration closed after factory settlement")
+        }
+        if (subagentTypes.length + localSubagentTypes.length >= maxSubagentTypes) {
+          throw new ExtensionRegistrationError(
+            `Extension generations cannot register more than ${maxSubagentTypes} subagent types`
+          )
+        }
+        const registered = registerSubagentType(source, value)
+        if (subagentTypeNames.has(registered.name) || localSubagentTypeNames.has(registered.name)) {
+          throw new ExtensionRegistrationError(`Duplicate subagent type name: ${registered.name}`)
+        }
+        try {
+          validateExtensionSubagentTypeCatalog([...subagentTypes, ...localSubagentTypes, registered])
+        } catch (cause) {
+          throw new ExtensionRegistrationError(cause instanceof Error ? cause.message : String(cause), { cause })
+        }
+        localSubagentTypeNames.add(registered.name)
+        localSubagentTypes.push(registered)
+      },
       getSessionEntries(customType: string) {
         return sessionOperations.getEntries(source, customType)
       },
@@ -854,6 +887,8 @@ export async function loadExtensionGeneration(
       shutdownHandlers.push(...localShutdown)
       tools.push(...localTools)
       for (const name of localToolNames) toolNames.add(name)
+      subagentTypes.push(...localSubagentTypes)
+      for (const name of localSubagentTypeNames) subagentTypeNames.add(name)
       results.push(Object.freeze({ source, status: "loaded" }))
     } catch (cause) {
       acceptingRegistrations = false
@@ -863,7 +898,25 @@ export async function loadExtensionGeneration(
     }
   }
 
-  return new LoadedExtensionGeneration(results, startHandlers, shutdownHandlers, tools)
+  return new LoadedExtensionGeneration(results, startHandlers, shutdownHandlers, tools, subagentTypes)
+}
+
+function registerSubagentType(source: ExtensionSource, value: unknown): ExtensionSubagentTypeRegistration {
+  let definition
+  try {
+    definition = validateExtensionSubagentTypeRegistration({ source, ...strictSubagentTypeDefinition(value) })
+  } catch (cause) {
+    throw new ExtensionRegistrationError(cause instanceof Error ? cause.message : String(cause), { cause })
+  }
+  return definition
+}
+
+function strictSubagentTypeDefinition(value: unknown): Readonly<Record<string, unknown>> {
+  if (!isRecord(value)) throw new ExtensionRegistrationError("Subagent type definitions must be objects")
+  if (Object.keys(value).some(key => key !== "name" && key !== "description" && key !== "instructions")) {
+    throw new ExtensionRegistrationError("Subagent type definitions require only name, description, and instructions")
+  }
+  return value
 }
 
 function registerTool(source: ExtensionSource, value: unknown): RegisteredTool {

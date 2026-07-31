@@ -18,6 +18,7 @@ export interface AgentSettings {
   steeringMode: QueueMode
   followUpMode: QueueMode
   codexFastMode: boolean
+  subagentsEnabled: boolean
   retryEnabled: boolean
   retryMaxRetries: number
   retryBaseDelayMs: number
@@ -33,6 +34,7 @@ const defaults: AgentSettings = {
   steeringMode: "one-at-a-time",
   followUpMode: "one-at-a-time",
   codexFastMode: false,
+  subagentsEnabled: true,
   retryEnabled: true,
   retryMaxRetries: 3,
   retryBaseDelayMs: 2_000,
@@ -218,6 +220,9 @@ function validateSettingsPatch(patch: Partial<AgentSettings>): void {
   }
   if ("codexFastMode" in patch && typeof patch.codexFastMode !== "boolean") {
     throw new Error("Invalid codexFastMode setting")
+  }
+  if ("subagentsEnabled" in patch && typeof patch.subagentsEnabled !== "boolean") {
+    throw new Error("Invalid subagentsEnabled setting")
   }
   if ("retryEnabled" in patch && typeof patch.retryEnabled !== "boolean") {
     throw new Error("Invalid retryEnabled setting")

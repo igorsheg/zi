@@ -176,6 +176,18 @@ _Avoid_: CLI branch, universal frontend mode
 One versioned JSONL process relationship over a caller-owned `AgentSession`. It owns framing, request validation, correlation, total output sequence, bounded concurrent operations, backpressure, cancellation, and settlement; it projects public session facts but owns no conversation policy or session disposal.
 _Avoid_: Remote session, API server, command bus, RPC runtime
 
+**Subagent**:
+One delegated child Zi agent session whose conversation remains authoritative in that child. V1 subagents are direct children of one parent session and do not form a peer network.
+_Avoid_: Worker, tool call, copied parent agent
+
+**Subagent supervisor**:
+The `AgentSession`-owned controller of direct-child identity, admission, process lifetimes, work cycles, the completion mailbox, durable evidence, and shutdown. It supervises child sessions but does not copy or own their conversations; extensions may contribute definitions but never own the supervisor.
+_Avoid_: Extension generation, agent coordinator, process manager, session registry
+
+**Subagent completion**:
+The bounded result projected when admitted subagent work settles, including identity, status, final text, usage when available, duration, and omission facts. It is not a copied child transcript.
+_Avoid_: Child stdout, event stream, transcript snapshot
+
 **CLI invocation**:
 One immutable startup intent resolved before runtime construction from arguments, supported Zi environment defaults, and captured process facts. Arguments outrank environment defaults; cwd and session selection remain explicit invocation operations rather than ambient configuration.
 _Avoid_: CLI settings, process globals, argument bag

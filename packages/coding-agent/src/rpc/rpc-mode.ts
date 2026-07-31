@@ -90,6 +90,7 @@ export type RpcSessionEntry =
   | Extract<SessionEntry, { readonly type: "thinking_level_change" }>
   | Extract<SessionEntry, { readonly type: "retry" }>
   | Extract<SessionEntry, { readonly type: "compaction" }>
+  | Extract<SessionEntry, { readonly type: "subagent" }>
   | CustomEntry
   | CustomMessageEntry
 
@@ -162,6 +163,16 @@ export async function runRpcMode(session: AgentSession, transport: RpcModeTransp
   let sequence = 0
   let normalOperations = 0
   let interruptActive = false
+  // Connection-owned event projection. Default remains "all" for compatibility.
+  let eventMode: "all" | "none" = "all"
+  const connection = {
+    get eventMode() {
+      return eventMode
+    },
+    set eventMode(mode: "all" | "none") {
+      eventMode = mode
+    }
+  }
   const operations = new Set<Promise<void>>()
   const stopped = deferred<void>()
   const currentState = (): ConnectionState => state
@@ -179,7 +190,7 @@ export async function runRpcMode(session: AgentSession, transport: RpcModeTransp
   }
 
   const unsubscribe = session.subscribe(event => {
-    if (state.type === "open") send({ type: "session_event", event: projectEvent(event) })
+    if (state.type === "open" && eventMode === "all") send({ type: "session_event", event: projectEvent(event) })
   })
   const removeAbort = listenForAbort(transport.signal, () => stop({ type: "cancelled" }))
   const decoder = new RpcLineDecoder()
@@ -312,7 +323,7 @@ export async function runRpcMode(session: AgentSession, transport: RpcModeTransp
   }
 
   function launch(request: RpcRequest, isInterruption: boolean): void {
-    const operation = handleRequest(session, request)
+    const operation = handleRequest(session, request, connection)
       .then(operationResult => {
         if (state.type === "open" || state.type === "stopping") {
           send({ type: "response", id: request.id, method: request.method, ok: true, result: operationResult })
@@ -342,7 +353,11 @@ export async function runRpcMode(session: AgentSession, transport: RpcModeTransp
   }
 }
 
-async function handleRequest(session: AgentSession, request: RpcRequest): Promise<unknown> {
+async function handleRequest(
+  session: AgentSession,
+  request: RpcRequest,
+  connection: { eventMode: "all" | "none" }
+): Promise<unknown> {
   switch (request.method) {
     case "session.get_state":
       return sessionState(session)
@@ -354,8 +369,12 @@ async function handleRequest(session: AgentSession, request: RpcRequest): Promis
         void settlement.catch(() => {})
       } else if (request.params.delivery === "steer") {
         session.steer(request.params.text)
-      } else {
+      } else if (request.params.delivery === "follow_up") {
         session.followUp(request.params.text)
+      } else {
+        // continue: child AgentSession decides idle->direct vs running->follow-up atomically.
+        const settlement = session.prompt(request.params.text, { streamingBehavior: "followUp" })
+        void settlement.catch(() => {})
       }
       return { delivery: request.params.delivery }
     case "session.interrupt":
@@ -364,6 +383,10 @@ async function handleRequest(session: AgentSession, request: RpcRequest): Promis
     case "session.await_idle":
       await session.waitForIdle()
       return {}
+    case "connection.set_events":
+      // Applied synchronously in input order before the response is emitted.
+      connection.eventMode = request.params.mode
+      return { mode: request.params.mode }
     case "model.list": {
       const choices = await session.listModelChoices()
       return { models: choices.map(projectModelChoice) }

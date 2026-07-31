@@ -1587,6 +1587,53 @@ test("source bodies keep semantic starting line numbers in the lightweight panel
   }
 })
 
+test("subagent rows stay concise until details are requested", async () => {
+  const setup = await createTestRenderer({ width: 72, height: 12, useThread: false })
+  const agentId = "a609c336-fe8c-443b-965b-91fb7a2949c7"
+  const projected = projectToolPresentation({
+    status: "done",
+    name: "spawn_subagent",
+    args: { prompt: "Review shutdown behavior", type: "reviewer" },
+    result: {
+      content: [{ type: "text", text: JSON.stringify({ agent_id: agentId }) }],
+      details: {
+        type: "subagent",
+        outcome: "success",
+        operation: "spawn",
+        agent: { agentId, definitionName: "reviewer", lifecycle: "running", workCycle: 1 }
+      }
+    }
+  })
+  const view = new ToolCallView(
+    setup.renderer,
+    "spawn-agent",
+    frame("done", projected),
+    defaultTheme,
+    "/work",
+    "Ctrl+O"
+  )
+  setup.renderer.root.add(view.root)
+
+  try {
+    await setup.renderOnce()
+    const compact = setup.captureCharFrame()
+    expect(compact).toContain("◆ Started Reviewer · Review shutdown behavior")
+    expect(compact).not.toContain(agentId)
+    expect(compact).not.toContain("│ Review shutdown behavior")
+    expect(compact).not.toContain("spawn_subagent")
+
+    view.setExpanded(true)
+    await setup.renderOnce()
+    const detailed = setup.captureCharFrame()
+    expect(detailed).toContain("│ Review shutdown behavior")
+    expect(detailed).toContain(`Agent id: ${agentId}`)
+    expect(detailed).toContain("╰───")
+  } finally {
+    view.destroy()
+    setup.renderer.destroy()
+  }
+})
+
 function descendants(root: Renderable): Renderable[] {
   const result: Renderable[] = []
   const pending = [...root.getChildren()]

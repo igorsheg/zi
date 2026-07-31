@@ -56,23 +56,30 @@ A successful request receives a correlated response:
 
 Operation failures use `ok: false` with `capacity`, `not_found`, or `operation_failed`. Invalid JSON and rejected request shapes produce `protocol_error` frames and do not close the connection. Invalid UTF-8 and oversized framing are fatal after one `invalid_framing` frame.
 
-`session_event` frames contain source-ordered `AgentSessionEvent` values. Model-change events use the public model projection described below instead of exposing provider configuration or credentials. `entry_appended` explicitly includes `custom` and `custom_message` journal variants. Message pages include displayed custom messages and omit hidden ones; a hidden custom message's committed entry event remains observable to the trusted process client.
+`session_event` frames contain source-ordered `AgentSessionEvent` values. Model-change events use the public model projection described below instead of exposing provider configuration or credentials. `entry_appended` explicitly includes `custom`, `custom_message`, and native `subagent` journal variants. Message pages include displayed custom messages and omit hidden ones; a hidden custom message's committed entry event remains observable to the trusted process client. Native subagent lifecycle also emits `subagent_changed` with the affected direct-child ID.
 
 ## Methods
 
-| Method                 | Parameters                                                 | Result                                               |
-| ---------------------- | ---------------------------------------------------------- | ---------------------------------------------------- |
-| `session.get_state`    | none                                                       | Current session snapshot                             |
-| `session.get_messages` | `start` defaults to `0`; `limit` defaults to and maxes 100 | Indexed message page, total count, and next start    |
-| `session.prompt`       | `delivery`: `direct`, `steer`, or `follow_up`; `text`      | Admitted delivery                                    |
-| `session.interrupt`    | none                                                       | Empty object after interruption settles              |
-| `session.await_idle`   | none                                                       | Empty object after current session work settles      |
-| `model.list`           | none                                                       | Bounded model descriptors with authentication status |
-| `model.select`         | `provider`, `id`                                           | Selected public model descriptor                     |
-| `thinking.list`        | none                                                       | Levels supported by the selected model               |
-| `thinking.select`      | `level`; optional `scope`: `global` or `project`           | Requested, effective, and persisted scope            |
+| Method                  | Parameters                                                        | Result                                               |
+| ----------------------- | ----------------------------------------------------------------- | ---------------------------------------------------- |
+| `session.get_state`     | none                                                              | Current session snapshot                             |
+| `session.get_messages`  | `start` defaults to `0`; `limit` defaults to and maxes 100        | Indexed message page, total count, and next start    |
+| `session.prompt`        | `delivery`: `direct`, `steer`, `follow_up`, or `continue`; `text` | Admitted delivery                                    |
+| `session.interrupt`     | none                                                              | Empty object after interruption settles              |
+| `session.await_idle`    | none                                                              | Empty object after current session work settles      |
+| `connection.set_events` | `mode`: `all` (default) or `none`                                 | Active event mode                                    |
+| `model.list`            | none                                                              | Bounded model descriptors with authentication status |
+| `model.select`          | `provider`, `id`                                                  | Selected public model descriptor                     |
+| `thinking.list`         | none                                                              | Levels supported by the selected model               |
+| `thinking.select`       | `level`; optional `scope`: `global` or `project`                  | Requested, effective, and persisted scope            |
 
 A direct prompt response means the input was admitted, not that provider work completed. Use ordered session events or `session.await_idle` for completion. Steering and follow-up input retain `AgentSession` queue semantics and may be queued before the next direct prompt.
+
+`delivery: "continue"` is decided inside the child `AgentSession`: idle starts a direct run; running queues follow-up into the active run. Aborting, compacting, reloading, failed, and disposed states reject the operation. The response reports only that the continue input was admitted, not that its resulting work settled.
+
+`connection.set_events` is owned by the RPC connection, not `AgentSession`. Admission applies the mode synchronously in input order before its response is emitted. Mode `none` suppresses only `session_event` frames; `ready`, `response`, and `protocol_error` are never suppressed. The compatibility default remains `all`.
+
+RPC remains a transport for one parent session. A root session's model may use the seven native subagent tools through ordinary tool calls, and clients may observe their tool, journal, and semantic events. V1 deliberately adds no `agent.*` topology methods or direct external subagent control plane.
 
 Public model descriptors contain only `provider`, `id`, `name`, `reasoning`, `input`, `contextWindow`, and `maxTokens`. Catalog results add `configured`. Base URLs, headers, compatibility settings, prices, and credentials do not cross RPC.
 

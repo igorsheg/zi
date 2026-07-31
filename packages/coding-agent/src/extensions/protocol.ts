@@ -16,13 +16,23 @@ import {
   validateCustomType
 } from "../session-manager.js"
 import {
+  maxSubagentTypeCatalogBytes,
+  maxSubagentTypeDescriptionBytes,
+  maxSubagentTypeInstructionsBytes,
+  maxSubagentTypeNameBytes,
+  maxSubagentTypes,
+  type RegisteredSubagentType,
+  validateSubagentTypeCatalog,
+  validateSubagentTypeDefinition
+} from "../subagents/definitions.js"
+import {
   maxExtensionPathBytes,
   maxExtensionSources,
   type ExtensionLoadPlan,
   type ExtensionSource
 } from "./discovery.js"
 
-export const extensionProtocolVersion = 4
+export const extensionProtocolVersion = 5
 export const maxExtensionProtocolFrameBytes = 4 * 1024 * 1024
 export const maxExtensionPendingRequests = 128
 export const maxExtensionQueuedWriteBytes = 8 * 1024 * 1024
@@ -82,7 +92,7 @@ export interface ExtensionLoadResult {
 export type HostMessage =
   | {
       readonly type: "initialize"
-      readonly protocolVersion: 4
+      readonly protocolVersion: 5
       readonly generation: number
       readonly plan: ExtensionLoadPlan
     }
@@ -130,10 +140,11 @@ export type HostMessage =
 export type WorkerMessage =
   | {
       readonly type: "ready"
-      readonly protocolVersion: 4
+      readonly protocolVersion: 5
       readonly generation: number
       readonly extensions: readonly ExtensionLoadResult[]
       readonly tools: readonly ExtensionToolRegistration[]
+      readonly subagentTypes: readonly ExtensionSubagentTypeRegistration[]
     }
   | { readonly type: "settled"; readonly generation: number; readonly requestId: number }
   | { readonly type: "tool_result"; readonly generation: number; readonly requestId: number; readonly value: JsonValue }
@@ -185,6 +196,16 @@ export interface ExtensionToolRegistration {
   readonly description: string
   readonly parameters: Readonly<Record<string, JsonValue>>
   readonly outputSchema: Readonly<Record<string, JsonValue>>
+}
+
+export type ExtensionSubagentTypeRegistration = RegisteredSubagentType
+
+export {
+  maxSubagentTypeCatalogBytes,
+  maxSubagentTypeDescriptionBytes,
+  maxSubagentTypeInstructionsBytes,
+  maxSubagentTypeNameBytes,
+  maxSubagentTypes
 }
 
 export class ExtensionProtocolError extends Error {
@@ -469,12 +490,14 @@ export function validateWorkerMessage(value: unknown): WorkerMessage {
         throw new ExtensionProtocolError(`Extension results cannot exceed ${maxExtensionSources}`)
       }
       const admittedTools = validateExtensionToolCatalog(message.tools)
+      const admittedSubagentTypes = validateExtensionSubagentTypeCatalog(message.subagentTypes)
       return Object.freeze({
         type: "ready",
         protocolVersion: protocolVersion(message.protocolVersion),
         generation: positiveInteger(message.generation, "generation"),
         extensions: Object.freeze(extensions.map(extensionLoadResult)),
-        tools: Object.freeze(admittedTools)
+        tools: Object.freeze(admittedTools),
+        subagentTypes: admittedSubagentTypes
       })
     }
     case "settled":
@@ -557,6 +580,25 @@ export function validateExtensionToolCatalog(value: unknown): readonly Extension
     throw new ExtensionProtocolError(`Extension tool catalog cannot exceed ${maxExtensionToolCatalogBytes} bytes`)
   }
   return Object.freeze(admitted)
+}
+
+export function validateExtensionSubagentTypeRegistration(value: unknown): ExtensionSubagentTypeRegistration {
+  return extensionSubagentTypeRegistration(value)
+}
+
+export function validateExtensionSubagentTypeCatalog(value: unknown): readonly ExtensionSubagentTypeRegistration[] {
+  const values = protocolArray(value, "subagent types")
+  if (values.length > maxSubagentTypes) {
+    throw new ExtensionProtocolError(
+      `Extension generations cannot register more than ${maxSubagentTypes} subagent types`
+    )
+  }
+  const definitions = values.map(extensionSubagentTypeRegistration)
+  try {
+    return validateSubagentTypeCatalog(definitions)
+  } catch (cause) {
+    throw new ExtensionProtocolError(cause instanceof Error ? cause.message : String(cause), { cause })
+  }
 }
 
 export function validateExtensionToolArguments(value: unknown): Readonly<Record<string, JsonValue>> {
@@ -671,6 +713,30 @@ function extensionLoadResult(value: unknown): ExtensionLoadResult {
     return Object.freeze({ source, status: "failed", diagnostic: extensionDiagnostic(result.diagnostic) })
   }
   throw new ExtensionProtocolError("Unknown extension load status")
+}
+
+function extensionSubagentTypeRegistration(value: unknown): ExtensionSubagentTypeRegistration {
+  const registration = protocolRecord(value)
+  if (
+    Object.keys(registration).some(
+      key => key !== "source" && key !== "name" && key !== "description" && key !== "instructions"
+    )
+  ) {
+    throw new ExtensionProtocolError(
+      "Registered subagent types require only source, name, description, and instructions"
+    )
+  }
+  let definition
+  try {
+    definition = validateSubagentTypeDefinition({
+      name: registration.name,
+      description: registration.description,
+      instructions: registration.instructions
+    })
+  } catch (cause) {
+    throw new ExtensionProtocolError(cause instanceof Error ? cause.message : String(cause), { cause })
+  }
+  return Object.freeze({ source: extensionSource(registration.source), ...definition })
 }
 
 function extensionToolRegistration(value: unknown): ExtensionToolRegistration {
@@ -882,7 +948,7 @@ function protocolArray(value: unknown, field: string): readonly unknown[] {
   return value
 }
 
-function protocolVersion(value: unknown): 4 {
+function protocolVersion(value: unknown): 5 {
   if (value !== extensionProtocolVersion) throw new ExtensionProtocolError("Unsupported extension protocol version")
   return extensionProtocolVersion
 }

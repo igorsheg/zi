@@ -239,6 +239,7 @@ export function transitionInteractiveState(state: InteractiveState, event: Agent
     case "steering_mode_changed":
     case "follow_up_mode_changed":
     case "shell_task_changed":
+    case "subagent_changed":
       promptRevision++
       break
     case "turn_start":

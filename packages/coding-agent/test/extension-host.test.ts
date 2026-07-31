@@ -157,6 +157,25 @@ test("failed lifecycle requests preserve the session's desired lifecycle", async
   await host.dispose()
 })
 
+test("catalog replacement publishes tools and subagent types atomically", async () => {
+  const workers = new TestWorkerSpawner()
+  workers.behaviors.push({ type: "catalog" }, { type: "catalog" })
+  const host = await ExtensionHost.create(planOne, workers.spawn, testTimeouts)
+  const catalogs: Array<{ readonly tools: readonly string[]; readonly subagentTypes: readonly string[] }> = []
+  const unbind = host.bindCatalog(catalog => {
+    catalogs.push({
+      tools: catalog.tools.map(tool => `${tool.source.id}:${tool.name}`),
+      subagentTypes: catalog.subagentTypes.map(definition => `${definition.source.id}:${definition.name}`)
+    })
+  })
+
+  expect(await host.reload(reloadRequest(planTwo))).toMatchObject({ outcome: "replaced" })
+  expect(catalogs).toEqual([{ tools: [`${sourceTwo.id}:echo_message`], subagentTypes: [`${sourceTwo.id}:reviewer`] }])
+
+  unbind()
+  await host.dispose()
+})
+
 test("host tool invocation is correlated, cancellable, and generation-reusable", async () => {
   const workers = new TestWorkerSpawner()
   workers.behaviors.push({ type: "tools" })
@@ -531,7 +550,7 @@ type TestWorkerBehavior =
   | { readonly type: "ready" }
   | { readonly type: "wrong_ready" }
   | { readonly type: "fatal_start" }
-  | { readonly type: "tools" | "tool_hang" | "tool_cancel_crossing" | "malformed_tool" }
+  | { readonly type: "tools" | "catalog" | "tool_hang" | "tool_cancel_crossing" | "malformed_tool" }
   | { readonly type: "spawn_error"; readonly message: string }
   | { readonly type: "fatal"; readonly message: string }
   | { readonly type: "pending" }
@@ -635,11 +654,13 @@ class TestWorkerProcess implements ExtensionWorkerProcess {
           this.#behavior.type === "wrong_ready" ? [] : this.#plan.sources.map(source => ({ source, status: "loaded" })),
         tools:
           this.#behavior.type === "tools" ||
+          this.#behavior.type === "catalog" ||
           this.#behavior.type === "tool_hang" ||
           this.#behavior.type === "tool_cancel_crossing" ||
           this.#behavior.type === "malformed_tool"
             ? [toolRegistration(this.#plan.sources[0]!)]
-            : []
+            : [],
+        subagentTypes: this.#behavior.type === "catalog" ? [subagentTypeRegistration(this.#plan.sources[0]!)] : []
       })
       return
     }
@@ -727,6 +748,10 @@ function toolRegistration(source: ExtensionSource) {
     parameters: { type: "object", required: ["message"], properties: { message: { type: "string" } } },
     outputSchema: { type: "string" }
   } as const
+}
+
+function subagentTypeRegistration(source: ExtensionSource) {
+  return { source, name: "reviewer", description: "Review changes", instructions: "Review without editing" } as const
 }
 
 function extensionSource(id: string): ExtensionSource {

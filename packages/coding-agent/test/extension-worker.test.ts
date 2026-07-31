@@ -8,7 +8,10 @@ import type { ExtensionLoadPlan, ExtensionSource } from "../src/extensions/disco
 import {
   maxExtensionToolCatalogBytes,
   maxExtensionToolDescriptionBytes,
-  maxExtensionTools
+  maxExtensionTools,
+  maxSubagentTypeCatalogBytes,
+  maxSubagentTypeInstructionsBytes,
+  maxSubagentTypes
 } from "../src/extensions/protocol.js"
 import { loadExtensionGeneration, maxExtensionLifecycleHandlers } from "../src/extensions/worker.js"
 
@@ -229,6 +232,101 @@ export default zi => zi.registerTool({
   expect(generation.results[2]?.diagnostic?.message).toContain("tool names")
   expect(generation.results[3]?.diagnostic?.message).toContain("Invalid regular expression")
   expect(generation.tools.map(tool => tool.name)).toEqual(["shared_tool", "valid_tool"])
+})
+
+test("subagent type registration follows source order and rolls back one conflicting source", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-extension-worker-subagent-types-"))
+  const first = await writeExtension(
+    root,
+    "first.ts",
+    `export default zi => zi.registerSubagentType({
+  name: "reviewer",
+  description: "First reviewer",
+  instructions: "Review the requested change."
+})
+`
+  )
+  const duplicate = await writeExtension(
+    root,
+    "duplicate.ts",
+    `export default zi => {
+  zi.registerSubagentType({ name: "planner", description: "Planner", instructions: "Plan the work." })
+  zi.registerSubagentType({ name: "reviewer", description: "Later reviewer", instructions: "Must lose." })
+}
+`
+  )
+  const reserved = await writeExtension(
+    root,
+    "reserved.ts",
+    `export default zi => zi.registerSubagentType({
+  name: "general",
+  description: "Replacement general",
+  instructions: "Must not replace the built-in type."
+})
+`
+  )
+  const valid = await writeExtension(
+    root,
+    "valid.ts",
+    `export default zi => zi.registerSubagentType({
+  name: "tester",
+  description: "Test changes",
+  instructions: "Run focused tests and report failures."
+})
+`
+  )
+
+  const generation = await loadExtensionGeneration(extensionPlan(root, [first, duplicate, reserved, valid]), 1)
+
+  expect(generation.results.map(result => [result.status, result.diagnostic?.phase])).toEqual([
+    ["loaded", undefined],
+    ["failed", "registration"],
+    ["failed", "registration"],
+    ["loaded", undefined]
+  ])
+  expect(generation.results[1]?.diagnostic?.message).toContain("Duplicate subagent type name: reviewer")
+  expect(generation.results[2]?.diagnostic?.message).toContain("general cannot be replaced")
+  expect(generation.subagentTypes.map(definition => [definition.name, definition.source.id])).toEqual([
+    ["reviewer", first.id],
+    ["tester", valid.id]
+  ])
+  expect(Object.isFrozen(generation.subagentTypes)).toBe(true)
+})
+
+test("subagent type catalog bounds roll back a source without consuming generation capacity", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-extension-worker-subagent-bounds-"))
+  const instructions = maxSubagentTypeInstructionsBytes
+  const count = Math.min(maxSubagentTypes, Math.floor(maxSubagentTypeCatalogBytes / instructions) + 1)
+  const excessive = await writeExtension(
+    root,
+    "excessive.ts",
+    `export default zi => {
+  for (let index = 0; index < ${count}; index++) zi.registerSubagentType({
+    name: "large_" + index,
+    description: "Large definition",
+    instructions: "x".repeat(${instructions})
+  })
+}
+`
+  )
+  const valid = await writeExtension(
+    root,
+    "valid.ts",
+    `export default zi => zi.registerSubagentType({
+  name: "valid",
+  description: "Valid definition",
+  instructions: "Complete the task."
+})
+`
+  )
+
+  const generation = await loadExtensionGeneration(extensionPlan(root, [excessive, valid]), 1)
+
+  expect(generation.results.map(result => [result.status, result.diagnostic?.message])).toEqual([
+    ["failed", `Subagent type catalog cannot exceed ${maxSubagentTypeCatalogBytes} bytes`],
+    ["loaded", undefined]
+  ])
+  expect(generation.subagentTypes.map(definition => definition.name)).toEqual(["valid"])
 })
 
 test("worker loading attributes import, export, and factory failures and discards partial registration", async () => {

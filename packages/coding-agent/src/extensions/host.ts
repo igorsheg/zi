@@ -14,6 +14,7 @@ import type {
 } from "@with-zi/extension-api"
 
 import type { ExtensionLoadPlan } from "./discovery.js"
+import { createProcessScope, type ProcessScope } from "./process-scope.js"
 import {
   boundedExtensionDiagnostic,
   boundedExtensionSessionOperationError,
@@ -32,6 +33,7 @@ import {
   type ExtensionLoadResult,
   type ExtensionSessionRequest,
   type ExtensionSessionResponse,
+  type ExtensionSubagentTypeRegistration,
   type ExtensionToolRegistration,
   type HostMessage,
   type JsonValue,
@@ -115,11 +117,17 @@ export interface ExtensionLogTail {
   readonly omittedBytes: number
 }
 
+export interface ExtensionCatalog {
+  readonly tools: readonly ExtensionToolRegistration[]
+  readonly subagentTypes: readonly ExtensionSubagentTypeRegistration[]
+}
+
 export interface ExtensionHostSnapshot {
   readonly status: ExtensionHostStatus
   readonly lifecycle: ExtensionHostLifecycle
   readonly extensions: readonly ExtensionLoadResult[]
   readonly tools: readonly ExtensionToolRegistration[]
+  readonly subagentTypes: readonly ExtensionSubagentTypeRegistration[]
   readonly diagnostics: readonly ExtensionDiagnostic[]
   readonly failure?: ExtensionDiagnostic
   readonly omittedDiagnostics: number
@@ -176,6 +184,7 @@ type GenerationLifecycle = "loaded" | "started" | "stopped"
 interface ExtensionGenerationReady {
   readonly extensions: readonly ExtensionLoadResult[]
   readonly tools: readonly ExtensionToolRegistration[]
+  readonly subagentTypes: readonly ExtensionSubagentTypeRegistration[]
 }
 
 type GenerationToolInvocation =
@@ -297,6 +306,7 @@ class ExtensionGeneration {
   readonly #sessionResponses = new Set<number>()
   #lastSessionRequestId = 0
   #tools: readonly ExtensionToolRegistration[] = Object.freeze([])
+  #subagentTypes: readonly ExtensionSubagentTypeRegistration[] = Object.freeze([])
   readonly #onProtocolData: (chunk: Buffer) => void
   readonly #onProtocolEnd: () => void
   readonly #onProtocolError: (cause: Error) => void
@@ -362,6 +372,10 @@ class ExtensionGeneration {
 
   get tools(): readonly ExtensionToolRegistration[] {
     return this.#tools
+  }
+
+  get subagentTypes(): readonly ExtensionSubagentTypeRegistration[] {
+    return this.#subagentTypes
   }
 
   logs(): { readonly stdout: ExtensionLogTail; readonly stderr: ExtensionLogTail } {
@@ -615,9 +629,18 @@ class ExtensionGeneration {
           this.#fail("handshake", "Extension worker tools did not match its loaded extensions")
           return
         }
+        if (!subagentTypesMatchLoadedExtensions(message.subagentTypes, message.extensions)) {
+          this.#fail("handshake", "Extension worker subagent types did not match its loaded extensions")
+          return
+        }
         this.#tools = message.tools
+        this.#subagentTypes = message.subagentTypes
         this.#state = { type: "ready", lifecycle: "loaded" }
-        state.ready.resolve({ extensions: message.extensions, tools: message.tools })
+        state.ready.resolve({
+          extensions: message.extensions,
+          tools: message.tools,
+          subagentTypes: message.subagentTypes
+        })
         return
       case "settled":
         if (state.type === "requesting" && state.requestId === message.requestId) {
@@ -869,7 +892,8 @@ export class ExtensionHost {
   #staleFrames = 0
   #extensions: readonly ExtensionLoadResult[] = Object.freeze([])
   #tools: readonly ExtensionToolRegistration[] = Object.freeze([])
-  #toolCatalogListener: ((tools: readonly ExtensionToolRegistration[]) => void) | undefined
+  #subagentTypes: readonly ExtensionSubagentTypeRegistration[] = Object.freeze([])
+  #catalogListener: ((catalog: ExtensionCatalog) => void) | undefined
   #sessionOperations: ExtensionSessionOperations | undefined
   #reloadAttempt: ReloadAttempt | undefined
   #lastLogs: { readonly stdout: ExtensionLogTail; readonly stderr: ExtensionLogTail } = Object.freeze({
@@ -925,6 +949,7 @@ export class ExtensionHost {
       lifecycle: state.type === "disposed" ? "stopped" : state.lifecycle,
       extensions: this.#extensions,
       tools: this.#tools,
+      subagentTypes: this.#subagentTypes,
       diagnostics: Object.freeze([...this.#diagnostics]),
       ...(state.type === "failed" ? { failure: state.diagnostic } : {}),
       omittedDiagnostics: this.#omittedDiagnostics,
@@ -938,6 +963,10 @@ export class ExtensionHost {
     return this.#tools
   }
 
+  subagentTypeCatalog(): readonly ExtensionSubagentTypeRegistration[] {
+    return this.#subagentTypes
+  }
+
   bindSessionOperations(operations: ExtensionSessionOperations): () => void {
     if (this.#state.type === "disposed") throw new Error("Extension host is disposed")
     if (this.#sessionOperations) throw new Error("Extension host session operations are already bound")
@@ -947,12 +976,12 @@ export class ExtensionHost {
     }
   }
 
-  bindToolCatalog(listener: (tools: readonly ExtensionToolRegistration[]) => void): () => void {
+  bindCatalog(listener: (catalog: ExtensionCatalog) => void): () => void {
     if (this.#state.type === "disposed") throw new Error("Extension host is disposed")
-    if (this.#toolCatalogListener) throw new Error("Extension host tool catalog is already bound")
-    this.#toolCatalogListener = listener
+    if (this.#catalogListener) throw new Error("Extension host catalog is already bound")
+    this.#catalogListener = listener
     return () => {
-      if (this.#toolCatalogListener === listener) this.#toolCatalogListener = undefined
+      if (this.#catalogListener === listener) this.#catalogListener = undefined
     }
   }
 
@@ -975,7 +1004,7 @@ export class ExtensionHost {
 
   rejectTool(tool: ExtensionToolRegistration, message: string): void {
     if (!this.#tools.includes(tool)) throw new Error("Extension host cannot reject an unknown tool registration")
-    this.#setToolCatalog(Object.freeze(this.#tools.filter(candidate => candidate !== tool)))
+    this.#setCatalogs(Object.freeze(this.#tools.filter(candidate => candidate !== tool)), this.#subagentTypes)
     this.#diagnose(
       boundedExtensionDiagnostic({
         extensionId: tool.source.id,
@@ -1085,7 +1114,7 @@ export class ExtensionHost {
       if (plan.sources.length === 0) {
         this.#state = { type: "disabled", lifecycle: state.lifecycle }
         this.#extensions = Object.freeze([])
-        this.#setToolCatalog(Object.freeze([]))
+        this.#setCatalogs(Object.freeze([]), Object.freeze([]))
         return this.#finishReloadAttempt("disabled")
       }
       await this.#startPlan(plan, state.lifecycle, reason)
@@ -1103,7 +1132,7 @@ export class ExtensionHost {
       await this.#retireCurrent(replacing, state.current, reason)
       if (this.#state !== replacing) return this.#finishReloadAttempt("superseded")
       this.#extensions = Object.freeze([])
-      this.#setToolCatalog(Object.freeze([]))
+      this.#setCatalogs(Object.freeze([]), Object.freeze([]))
       this.#state = { type: "disabled", lifecycle: state.lifecycle }
       return this.#finishReloadAttempt("disabled")
     }
@@ -1137,7 +1166,7 @@ export class ExtensionHost {
       if (currentFailure) {
         const cleanup = state.current.dispose()
         this.#extensions = Object.freeze([])
-        this.#setToolCatalog(Object.freeze([]))
+        this.#setCatalogs(Object.freeze([]), Object.freeze([]))
         this.#state = { type: "failed", lifecycle: state.lifecycle, diagnostic: currentFailure, cleanup }
         await cleanup
         return this.#finishReloadAttempt("failed")
@@ -1157,7 +1186,7 @@ export class ExtensionHost {
     }
 
     this.#extensions = ready.extensions
-    this.#setToolCatalog(ready.tools)
+    this.#setCatalogs(ready.tools, ready.subagentTypes)
     if (state.lifecycle === "started") {
       const dispatching: ExtensionHostState = {
         type: "dispatching",
@@ -1226,7 +1255,7 @@ export class ExtensionHost {
     if (plan.sources.length === 0) {
       this.#state = { type: "disabled", lifecycle }
       this.#extensions = Object.freeze([])
-      this.#setToolCatalog(Object.freeze([]))
+      this.#setCatalogs(Object.freeze([]), Object.freeze([]))
       return
     }
     const id = this.#takeGenerationId()
@@ -1254,7 +1283,7 @@ export class ExtensionHost {
       if (this.#state === spawned) {
         const failure = failureDiagnostic(cause)
         this.#extensions = Object.freeze([])
-        this.#setToolCatalog(Object.freeze([]))
+        this.#setCatalogs(Object.freeze([]), Object.freeze([]))
         this.#state = { type: "failed", lifecycle, diagnostic: failure, cleanup }
       }
       await cleanup
@@ -1273,7 +1302,7 @@ export class ExtensionHost {
     }
     this.#admitLoadResults(ready.extensions)
     this.#extensions = ready.extensions
-    this.#setToolCatalog(ready.tools)
+    this.#setCatalogs(ready.tools, ready.subagentTypes)
 
     if (lifecycle === "started") {
       const dispatching: ExtensionHostState = {
@@ -1386,7 +1415,7 @@ export class ExtensionHost {
     if (this.#state === ownerState) {
       if (!(cause instanceof ExtensionGenerationError)) this.#diagnose(failure)
       this.#extensions = Object.freeze([])
-      this.#setToolCatalog(Object.freeze([]))
+      this.#setCatalogs(Object.freeze([]), Object.freeze([]))
       this.#state = { type: "failed", lifecycle, diagnostic: failure, cleanup }
     }
     await cleanup
@@ -1402,7 +1431,7 @@ export class ExtensionHost {
         return undefined
       })
       this.#extensions = Object.freeze([])
-      this.#setToolCatalog(Object.freeze([]))
+      this.#setCatalogs(Object.freeze([]), Object.freeze([]))
       this.#state = { type: "failed", lifecycle: state.lifecycle, diagnostic: value, cleanup }
     }
   }
@@ -1424,10 +1453,10 @@ export class ExtensionHost {
       if (retainedGeneration) this.#lastLogs = retainedGeneration.logs()
       if (this.#state === state) {
         this.#extensions = Object.freeze([])
-        this.#setToolCatalog(Object.freeze([]))
+        this.#setCatalogs(Object.freeze([]), Object.freeze([]))
         this.#state = { type: "disposed" }
       }
-      this.#toolCatalogListener = undefined
+      this.#catalogListener = undefined
       state.settled.resolve()
     }
   }
@@ -1438,13 +1467,19 @@ export class ExtensionHost {
     }
   }
 
-  #setToolCatalog(tools: readonly ExtensionToolRegistration[]): void {
-    if (this.#tools === tools) return
+  #setCatalogs(
+    tools: readonly ExtensionToolRegistration[],
+    subagentTypes: readonly ExtensionSubagentTypeRegistration[]
+  ): void {
+    const toolsChanged = this.#tools !== tools
+    const subagentTypesChanged = this.#subagentTypes !== subagentTypes
+    if (!toolsChanged && !subagentTypesChanged) return
     this.#tools = tools
+    this.#subagentTypes = subagentTypes
     try {
-      this.#toolCatalogListener?.(tools)
+      this.#catalogListener?.(Object.freeze({ tools, subagentTypes }))
     } catch (cause) {
-      this.#diagnose(diagnostic("protocol", errorMessage(cause, "Extension tool catalog binding failed"), cause))
+      this.#diagnose(diagnostic("protocol", errorMessage(cause, "Extension catalog binding failed"), cause))
     }
   }
 
@@ -1592,6 +1627,8 @@ export function createExtensionWorkerSpawner(
     try {
       // Bun owns POSIX pipe creation because its node adapter can fail while materializing fd 3 under Linux load.
       // The node adapter remains required on Windows, where Bun's direct fd 3 transport is not connected.
+      // POSIX workers start a dedicated session/process group so hard containment can signal
+      // the whole group. Windows workers join a kill-on-close Job Object after spawn.
       child =
         process.platform === "win32"
           ? {
@@ -1609,6 +1646,7 @@ export function createExtensionWorkerSpawner(
                 cwd: plan.cwd,
                 env,
                 stdio: ["pipe", "pipe", "pipe", "pipe"],
+                detached: true,
                 windowsHide: true
               })
             }
@@ -1664,9 +1702,64 @@ export function createExtensionWorkerSpawner(
     const exited = new Promise<ExtensionWorkerExit>(resolve => {
       resolveExit = resolve
     })
+    const workerPid = child.process.pid
+    let processScope: ProcessScope | undefined
+    let scopeRefresh: ReturnType<typeof setInterval> | undefined
+    if (typeof workerPid === "number" && workerPid > 0) {
+      try {
+        processScope = createProcessScope(workerPid)
+        // Refresh while the worker is alive so unexpected exit can use the last pre-exit snapshot.
+        scopeRefresh = setInterval(() => {
+          if (!processScope) return
+          try {
+            const refresh = processScope.refresh()
+            if (refresh.type === "overflow") {
+              processError ??= new Error("Extension worker process scope exceeded tracked descendant capacity")
+              processScope.terminate()
+              processScope = undefined
+              killSpawnedExtensionChild(child, "SIGKILL")
+            }
+          } catch (cause) {
+            processError ??=
+              cause instanceof Error ? cause : new Error(errorMessage(cause, "process scope refresh failed"))
+            processScope?.terminate()
+            processScope = undefined
+            killSpawnedExtensionChild(child, "SIGKILL")
+          }
+        }, 250)
+        scopeRefresh.unref?.()
+      } catch (cause) {
+        processError = cause instanceof Error ? cause : new Error("Could not create extension worker process scope")
+        killSpawnedExtensionChild(child, "SIGKILL")
+        unrefSpawnedExtensionChild(child)
+        const cleanupError = publicApi.dispose()
+        if (cleanupError) {
+          throw new Error(`${processError.message}; ${cleanupError.message}`, { cause })
+        }
+        throw processError
+      }
+    }
     const finish = (code: number | null, signal: NodeJS.Signals | null): void => {
       if (settled) return
       settled = true
+      if (scopeRefresh) {
+        clearInterval(scopeRefresh)
+        scopeRefresh = undefined
+      }
+      // Unexpected exit uses the last pre-exit snapshot; refresh is a no-op once the worker is gone.
+      try {
+        processScope?.terminate()
+      } catch (cause) {
+        processError = processError
+          ? new Error(`${processError.message}; process scope cleanup failed: ${errorMessage(cause, "unknown")}`, {
+              cause: processError
+            })
+          : cause instanceof Error
+            ? cause
+            : new Error(errorMessage(cause, "process scope cleanup failed"))
+      } finally {
+        processScope = undefined
+      }
       const cleanupError = publicApi.dispose()
       if (cleanupError) {
         processError = processError
@@ -1708,7 +1801,28 @@ export function createExtensionWorkerSpawner(
       protocol,
       exited,
       terminate(force) {
-        if (!settled) killSpawnedExtensionChild(child, force ? "SIGKILL" : "SIGTERM")
+        if (settled) return
+        // Refresh immediately before host-initiated termination so detached descendants are retained.
+        try {
+          const refresh = processScope?.refresh()
+          if (refresh?.type === "overflow") {
+            processError ??= new Error("Extension worker process scope exceeded tracked descendant capacity")
+            processScope?.terminate()
+            processScope = undefined
+            killSpawnedExtensionChild(child, "SIGKILL")
+            return
+          }
+        } catch (cause) {
+          processError ??=
+            cause instanceof Error ? cause : new Error(errorMessage(cause, "process scope refresh failed"))
+        }
+        if (force) {
+          processScope?.terminate()
+          processScope = undefined
+          killSpawnedExtensionChild(child, "SIGKILL")
+          return
+        }
+        killSpawnedExtensionChild(child, "SIGTERM")
       },
       dispose() {
         stopObservingExit?.()
@@ -1854,10 +1968,16 @@ function toolsMatchLoadedExtensions(
   )
 }
 
-function sameExtensionSource(
-  left: ExtensionToolRegistration["source"],
-  right: ExtensionToolRegistration["source"]
+function subagentTypesMatchLoadedExtensions(
+  subagentTypes: readonly ExtensionSubagentTypeRegistration[],
+  extensions: readonly ExtensionLoadResult[]
 ): boolean {
+  return subagentTypes.every(definition =>
+    extensions.some(result => result.status === "loaded" && sameExtensionSource(result.source, definition.source))
+  )
+}
+
+function sameExtensionSource(left: ExtensionSourceIdentity, right: ExtensionSourceIdentity): boolean {
   return (
     left.id === right.id &&
     left.declaredPath === right.declaredPath &&
@@ -1866,6 +1986,8 @@ function sameExtensionSource(
     left.origin === right.origin
   )
 }
+
+type ExtensionSourceIdentity = ExtensionToolRegistration["source"]
 
 function hostStatus(state: ExtensionHostState): ExtensionHostStatus {
   return state.type

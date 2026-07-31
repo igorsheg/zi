@@ -110,11 +110,13 @@ export async function runCli(argv: readonly string[], host: CliHost): Promise<nu
   try {
     if (mode === "interactive") {
       sessionRuntime = await host.createSessionRuntime(
-        runtimeOptions(args, host.extensionWorkerCommand, host.codeModeWorkerCommand)
+        runtimeOptions(args, host.extensionWorkerCommand, host.codeModeWorkerCommand, host.env)
       )
       runtime = sessionRuntime
     } else {
-      runtime = await host.createRuntime(runtimeOptions(args, host.extensionWorkerCommand, host.codeModeWorkerCommand))
+      runtime = await host.createRuntime(
+        runtimeOptions(args, host.extensionWorkerCommand, host.codeModeWorkerCommand, host.env)
+      )
     }
   } catch (cause) {
     await host.writeStderr(`${errorMessage(cause)}\n`)
@@ -181,7 +183,8 @@ export async function runCli(argv: readonly string[], host: CliHost): Promise<nu
 function runtimeOptions(
   args: CliInvocation,
   extensionWorkerCommand: readonly string[],
-  codeModeWorkerCommand: readonly string[]
+  codeModeWorkerCommand: readonly string[],
+  environment: Readonly<Record<string, string | undefined>>
 ): CreateAgentRuntimeOptions {
   return {
     cwd: args.cwd,
@@ -189,6 +192,8 @@ function runtimeOptions(
     extensionPaths: args.extensionPaths,
     extensionWorkerCommand,
     codeModeWorkerCommand,
+    subagentCommand: extensionWorkerCommand,
+    internalSubagentDepth: environment.ZI_SUBAGENT_DEPTH === "1" ? 1 : 0,
     session: args.session,
     ...(args.sessionDir === undefined ? {} : { sessionDir: args.sessionDir }),
     ...(args.model === undefined ? {} : { model: args.model }),

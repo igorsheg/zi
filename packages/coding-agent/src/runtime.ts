@@ -104,6 +104,12 @@ export async function createUnboundAgentRuntime(requested: CreateAgentRuntimeOpt
       selected.type === "resumed" ? selected.manager : SessionManager.create(paths, { persist: selected.persist })
     shell = new SessionShell({ cwd: paths.cwd, sessionId: sessionManager.sessionId })
     const codeMode = new CodeMode(paths.cwd, options.codeModeWorkerCommand ?? defaultCodeModeWorkerCommand)
+    const subagentEnvironment: Record<string, string | undefined> = {
+      ...(options.internalSubagentEnvironment ?? process.env),
+      ZI_AGENT_DIR: paths.globalDir,
+      ZI_SUBAGENT_DEPTH: "1"
+    }
+    delete subagentEnvironment.ZI_SUBAGENT_EXECUTABLE
     const created = await createAgentSession({
       services,
       sessionManager,
@@ -112,6 +118,9 @@ export async function createUnboundAgentRuntime(requested: CreateAgentRuntimeOpt
       codeMode,
       project,
       extensionPaths: options.extensionPaths ?? [],
+      ...(options.subagentCommand ? { subagentCommand: options.subagentCommand } : {}),
+      subagentEnvironment: Object.freeze(subagentEnvironment),
+      internalSubagentDepth: options.internalSubagentDepth ?? 0,
       ...(model ? { model } : {}),
       ...(options.thinkingLevel ? { thinkingLevel: options.thinkingLevel } : {}),
       ...(options.apiKey ? { apiKey: options.apiKey } : {}),

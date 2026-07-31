@@ -26,6 +26,7 @@ import { PickerStackView } from "./picker-view.js"
 import { QueuedInputsView } from "./queue-view.js"
 import { promptInputIsSecret, type PromptInputEdit, type PromptWorkflow } from "./state.js"
 import { createPromptStore, type PromptSessionActions, type PromptStore } from "./store.js"
+import { subagentStatusTitles } from "./subagent-status.js"
 
 type ExternalEditorState =
   | { readonly type: "idle" }
@@ -457,6 +458,7 @@ function composerSlots(session: ReturnType<InteractiveStore["getSession"]>, imag
   return {
     topLeft: session.sessionManager.header.cwd,
     topRight: [
+      ...subagentStatusTitles(session.subagentStatus, session.subagents),
       ...(imageCount === 0 ? [] : [`${imageCount} image${imageCount === 1 ? "" : "s"}`]),
       ...(context.type === "unavailable" ? [] : [contextTitle(context.type, context.percent, context.contextWindow)]),
       modelTitle(session)

@@ -303,6 +303,146 @@ test("RPC mode validates recoverable records and projects model and thinking sel
   }
 })
 
+test("connection.set_events suppresses only session_event frames in input order", async () => {
+  const models = createModels()
+  const faux = fauxProvider({ provider: "rpc", models: [{ id: "model", name: "RPC Model", reasoning: false }] })
+  models.setProvider(faux.provider)
+  let release: (() => void) | undefined
+  const gate = new Promise<void>(resolve => {
+    release = resolve
+  })
+  faux.setResponses([
+    async () => {
+      await gate
+      return fauxAssistantMessage("done")
+    }
+  ])
+  const runtime = await createTestAgentRuntime({
+    cwd: "/work",
+    model: "rpc/model",
+    apiKey: "test",
+    models,
+    session: { type: "new", persist: false }
+  })
+  const input = new RpcTestInput()
+  const output = new RpcTestOutput()
+  const running = runRpcMode(runtime.session, { input, writer: output })
+
+  try {
+    await output.frame(frame => frame.type === "ready")
+    input.send({ version: 1, id: "events-none", method: "connection.set_events", params: { mode: "none" } })
+    expect(await output.response("events-none")).toMatchObject({ ok: true, result: { mode: "none" } })
+
+    input.send({ version: 1, id: "prompt", method: "session.prompt", params: { delivery: "direct", text: "start" } })
+    expect((await output.response("prompt")).ok).toBe(true)
+    release?.()
+    input.send({ version: 1, id: "idle", method: "session.await_idle" })
+    expect((await output.response("idle")).ok).toBe(true)
+
+    expect(output.frames.some(frame => frame.type === "session_event")).toBe(false)
+    expect(output.frames.some(frame => frame.type === "response")).toBe(true)
+
+    input.send({ version: 1, id: "events-all", method: "connection.set_events", params: { mode: "all" } })
+    expect(await output.response("events-all")).toMatchObject({ ok: true, result: { mode: "all" } })
+
+    input.close()
+    expect(await running).toEqual({ type: "eof" })
+  } finally {
+    input.close()
+    runtime.session.dispose()
+    await runtime.session.waitForIdle()
+  }
+})
+
+test("delivery continue starts idle work and queues follow-up while running", async () => {
+  const models = createModels()
+  const faux = fauxProvider({ provider: "rpc", models: [{ id: "model", name: "RPC Model", reasoning: false }] })
+  models.setProvider(faux.provider)
+  const firstStarted = deferred<void>()
+  let releaseFirst: (() => void) | undefined
+  const firstGate = new Promise<void>(resolve => {
+    releaseFirst = resolve
+  })
+  faux.setResponses([
+    async () => {
+      firstStarted.resolve()
+      await firstGate
+      return fauxAssistantMessage("first")
+    },
+    async () => fauxAssistantMessage("second")
+  ])
+  const runtime = await createTestAgentRuntime({
+    cwd: "/work",
+    model: "rpc/model",
+    apiKey: "test",
+    models,
+    session: { type: "new", persist: false }
+  })
+  const input = new RpcTestInput()
+  const output = new RpcTestOutput()
+  const running = runRpcMode(runtime.session, { input, writer: output })
+
+  try {
+    await output.frame(frame => frame.type === "ready")
+
+    input.send({
+      version: 1,
+      id: "continue-idle",
+      method: "session.prompt",
+      params: { delivery: "continue", text: "wake" }
+    })
+    expect(await output.response("continue-idle")).toMatchObject({ ok: true, result: { delivery: "continue" } })
+    await firstStarted.promise
+
+    input.send({
+      version: 1,
+      id: "continue-running",
+      method: "session.prompt",
+      params: { delivery: "continue", text: "follow" }
+    })
+    expect(await output.response("continue-running")).toMatchObject({ ok: true, result: { delivery: "continue" } })
+    expect(runtime.session.queuedInputs.followUp.map(entry => entry.text)).toEqual(["follow"])
+
+    releaseFirst?.()
+    input.send({ version: 1, id: "idle", method: "session.await_idle" })
+    expect((await output.response("idle")).ok).toBe(true)
+
+    input.close()
+    expect(await running).toEqual({ type: "eof" })
+  } finally {
+    input.close()
+    runtime.session.dispose()
+    await runtime.session.waitForIdle()
+  }
+})
+
+test("delivery continue rejects non-runnable session states without mutation", async () => {
+  const models = createModels()
+  const runtime = await createTestAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
+  const input = new RpcTestInput()
+  const output = new RpcTestOutput()
+  const running = runRpcMode(runtime.session, { input, writer: output })
+
+  try {
+    await output.frame(frame => frame.type === "ready")
+    runtime.session.dispose()
+
+    input.send({
+      version: 1,
+      id: "continue-disposed",
+      method: "session.prompt",
+      params: { delivery: "continue", text: "nope" }
+    })
+    const response = await output.response("continue-disposed")
+    expect(response).toMatchObject({ ok: false, error: { code: "operation_failed" } })
+
+    input.close()
+    expect(await running).toEqual({ type: "eof" })
+  } finally {
+    input.close()
+  }
+})
+
 class RpcTestInput implements AsyncIterable<Uint8Array> {
   readonly #chunks: Uint8Array[] = []
   readonly #waiters: Array<(result: IteratorResult<Uint8Array>) => void> = []

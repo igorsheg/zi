@@ -9,7 +9,6 @@ import { applyCodexRequestSettings } from "./codex-settings.js"
 import type { FileCredentialStore } from "./credential-store.js"
 import { DEFAULT_THINKING_LEVEL } from "./defaults.js"
 import type { ExtensionHost } from "./extensions/host.js"
-import { admitExtensionTools } from "./extensions/tools.js"
 import { convertToLlm, type AgentMessage } from "./messages.js"
 import type { ModelRegistry } from "./model-registry.js"
 import { findInitialModel, restoreModelFromSession } from "./model-resolver.js"
@@ -20,6 +19,7 @@ import { createSessionResources, type ResourceLoader, type SessionResources } fr
 import type { SessionManager, SessionModel } from "./session-manager.js"
 import type { SessionShell } from "./session-shell.js"
 import type { SettingsManager } from "./settings-manager.js"
+import { SubagentSupervisor } from "./subagents/supervisor.js"
 import { buildSystemPrompt } from "./system-prompt.js"
 import { isBuiltInToolError } from "./tools/index.js"
 
@@ -73,6 +73,9 @@ export interface CreateAgentSessionOptions {
   readonly codeMode?: CodeMode
   readonly project?: ProjectConfigurationAdmission
   readonly extensionPaths?: readonly string[]
+  readonly subagentCommand?: readonly string[]
+  readonly subagentEnvironment?: Readonly<Record<string, string | undefined>>
+  readonly internalSubagentDepth?: 0 | 1
 }
 
 /** Build one session from caller-owned services. The caller owns the returned session's disposal. */
@@ -104,15 +107,33 @@ export async function createAgentSession(options: CreateAgentSessionOptions): Pr
     DEFAULT_THINKING_LEVEL
   const thinkingLevel = model ? clampThinkingLevel(model, preferredThinking) : "off"
   const bootstrapDiagnostic = createBootstrapDiagnostic(unavailableSessionModel, model)
-  const tools = admitExtensionTools(options.tools, options.extensionHost)
-  const modelTools = options.codeMode ? [...tools, options.codeMode.createTool(tools)] : tools
-
+  let session: AgentSession | undefined
+  const subagents =
+    model && options.subagentCommand && options.internalSubagentDepth !== 1 && settings.subagentsEnabled
+      ? new SubagentSupervisor({
+          command: options.subagentCommand,
+          cwd: sessionManager.header.cwd,
+          env: options.subagentEnvironment ?? {},
+          selection: () => ({
+            model: session ? `${session.model.provider}/${session.model.id}` : `${model.provider}/${model.id}`,
+            thinkingLevel: session?.thinkingLevel ?? thinkingLevel,
+            ...(options.apiKey ? { apiKey: options.apiKey } : {})
+          }),
+          sessionManager,
+          extensionTypes: options.extensionHost?.subagentTypeCatalog() ?? []
+        })
+      : undefined
   const agent = new Agent({
     initialState: {
-      systemPrompt: buildSystemPrompt(sessionManager.header.cwd, resources, tools, options.codeMode !== undefined),
+      systemPrompt: buildSystemPrompt(
+        sessionManager.header.cwd,
+        resources,
+        options.tools,
+        options.codeMode !== undefined
+      ),
       ...(model ? { model } : {}),
       thinkingLevel,
-      tools: [...modelTools],
+      tools: [...options.tools],
       messages: [...bootstrap.messages]
     },
     convertToLlm,
@@ -160,7 +181,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions): Pr
     project: options.project ?? "absent",
     extensionPaths: Object.freeze([...(options.extensionPaths ?? [])])
   })
-  const session = new AgentSession({
+  session = new AgentSession({
     agent,
     sessionManager,
     settingsManager: services.settingsManager,
@@ -170,6 +191,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions): Pr
     projectFileSearch: new ProjectFileSearch(services.paths),
     tools: options.tools,
     reload,
+    ...(subagents ? { subagents } : {}),
     ...(options.codeMode ? { codeMode: options.codeMode } : {}),
     ...(options.extensionHost ? { extensionHost: options.extensionHost } : {}),
     ...(options.shell ? { shell: options.shell } : {}),
