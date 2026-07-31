@@ -263,7 +263,7 @@ function functionOutputs(input: unknown): Map<string, string> {
 
 function parseAgentId(output: string): string {
   const match = /"agent_id"\s*:\s*"([^"]+)"/.exec(output)
-  if (!match?.[1]) throw new Error("Spawn output omitted agent_id")
+  if (!match?.[1]) throw new Error(`Spawn output omitted agent_id: ${JSON.stringify(output)}`)
   return match[1]
 }
 
