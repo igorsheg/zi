@@ -129,9 +129,15 @@ export class ChildZiProcess {
     this.#scopeRefresh.unref?.()
     this.#stdoutSettlement = this.#consumeStdout().catch(cause => this.#fail(cause))
     this.#stderrSettlement = this.#consumeStderr().catch(cause => this.#fail(cause))
-    void this.#child.exited.then(code => {
+    void this.#child.exited.then(async code => {
+      await settleWithin(this.#stderrSettlement, 1_000)
       if (this.#state.type !== "closing" && this.#state.type !== "exited") {
-        this.#fail(new Error(`Subagent ${this.agentId} exited unexpectedly with code ${String(code)}`))
+        const diagnostic = this.#stderr.trim()
+        this.#fail(
+          new Error(
+            `Subagent ${this.agentId} exited unexpectedly with code ${String(code)}${diagnostic ? `: ${diagnostic}` : ""}`
+          )
+        )
       }
       return undefined
     })
