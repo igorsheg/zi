@@ -151,6 +151,7 @@ test("CLI argument defaults handle Bun scripts and compiled executables", () => 
     resolvePath("/work/packages/cli/src/main.ts")
   ])
   expect(currentZiCommand([process.execPath, "/$bunfs/root/standalone"])).toEqual([process.execPath])
+  expect(currentZiCommand([process.execPath, "B:\\~BUN\\root\\standalone.ts"])).toEqual([process.execPath])
 })
 
 test("the internal acceptance host changes only CLI TTY admission facts", () => {

@@ -79,7 +79,7 @@ export function createProcessHost(forceInteractive: boolean): CliHost {
 
 export function currentZiCommand(argv: readonly string[] = process.argv): readonly string[] {
   const script = argv[1]
-  if (script && !script.includes("$bunfs") && /\.[cm]?[jt]sx?$/.test(script)) {
+  if (script && !script.includes("$bunfs") && !/[\\/]~BUN[\\/]/i.test(script) && /\.[cm]?[jt]sx?$/.test(script)) {
     return Object.freeze([process.execPath, resolve(script)])
   }
   return Object.freeze([process.execPath])
