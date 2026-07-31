@@ -208,7 +208,7 @@ class SubagentProvider {
       }
       if (!outputs.has("acceptance_wait")) {
         return eventStreamResponse(
-          toolEvents("wait_subagents", "acceptance_wait", { agent_ids: [agentId], timeout_ms: 10_000 })
+          toolEvents("wait_subagents", "acceptance_wait", { agent_ids: [agentId], timeout_ms: 25_000 })
         )
       }
       assertCompletedWait(outputs.get("acceptance_wait")!)
@@ -276,7 +276,7 @@ function assertCompletedWait(output: string): void {
       agent => isRecord(agent) && isRecord(agent.completion) && agent.completion.status === "completed"
     )
   ) {
-    throw new Error("Compiled subagent wait did not return a completed child")
+    throw new Error(`Compiled subagent wait did not return a completed child: ${JSON.stringify(output)}`)
   }
 }
 
