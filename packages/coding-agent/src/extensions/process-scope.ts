@@ -1,6 +1,6 @@
 import { readdirSync, readFileSync } from "node:fs"
 
-import type { WindowsHandle, WindowsJobNative } from "./process-scope-windows.js"
+import { loadWindowsJobNative, type WindowsHandle, type WindowsJobNative } from "./process-scope-windows.js"
 
 /**
  * Host-owned killable process scope for one extension-worker generation.
@@ -307,9 +307,7 @@ class WindowsJobHandle {
   }
 
   static create(): WindowsJobHandle {
-    // Lazy require keeps kernel32/bun:ffi out of POSIX module evaluation.
-    const windows = loadWindowsModule()
-    const native = windows.loadWindowsJobNative()
+    const native = loadWindowsJobNative()
     const handle = native.createJob()
     try {
       native.configureKillOnClose(handle)
@@ -332,10 +330,4 @@ class WindowsJobHandle {
     this.#handle = undefined
     this.#native.close(handle)
   }
-}
-
-function loadWindowsModule(): { loadWindowsJobNative: () => WindowsJobNative } {
-  // Windows module is required only when create() runs on win32.
-  // oxlint-disable-next-line typescript/no-unsafe-type-assertion
-  return require("./process-scope-windows.js") as { loadWindowsJobNative: () => WindowsJobNative }
 }

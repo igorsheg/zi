@@ -1,7 +1,9 @@
 // @ts-nocheck -- bun:ffi kernel32 bindings are Windows-only and pointer-typed loosely.
 /**
- * Windows Job Object helpers. Loaded only on win32 so POSIX hosts never touch kernel32.
+ * Windows Job Object helpers. kernel32 is opened only when the Windows process scope is created.
  */
+
+import { dlopen } from "bun:ffi"
 
 export type WindowsHandle = bigint | number
 
@@ -15,7 +17,6 @@ export type WindowsJobNative = {
 export function loadWindowsJobNative(): WindowsJobNative {
   if (process.platform !== "win32") throw new Error("Windows job API is only available on win32")
 
-  const { dlopen } = require("bun:ffi")
   const kernel32 = dlopen("kernel32.dll", {
     CreateJobObjectW: { args: ["ptr", "ptr"], returns: "ptr" },
     SetInformationJobObject: { args: ["ptr", "i32", "ptr", "u32"], returns: "i32" },
