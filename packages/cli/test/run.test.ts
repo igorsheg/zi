@@ -137,6 +137,10 @@ test("CLI argument defaults handle Bun scripts and compiled executables", () => 
   expect(defaultCliArgv(["C:\\tools\\zi.exe", "B:\\~BUN\\root\\standalone", extensionWorkerArgument])).toEqual([
     extensionWorkerArgument
   ])
+  expect(defaultCliArgv(["C:\\tools\\zi.exe", "B:\\~BUN\\root\\standalone", "--mode", "rpc"])).toEqual([
+    "--mode",
+    "rpc"
+  ])
   expect(defaultCliArgv(["C:\\tools\\zi.exe", "--mode", "interactive", interactiveAcceptanceArgument])).toEqual([
     "--mode",
     "interactive",

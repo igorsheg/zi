@@ -28,7 +28,9 @@ export function defaultCliArgv(argv: readonly string[] = process.argv): readonly
   const second = argv[1]
   if (!second) return []
   if (second.startsWith("-")) return argv.slice(1)
-  if (second.includes("$bunfs") || /\.[cm]?[jt]sx?$/.test(second)) return argv.slice(2)
+  if (second.includes("$bunfs") || /[\\/]~BUN[\\/]/i.test(second) || /\.[cm]?[jt]sx?$/.test(second)) {
+    return argv.slice(2)
+  }
   if (/(^|[\\/])bun(?:\.exe)?$/i.test(argv[0] ?? "")) return argv.slice(2)
   return argv.slice(1)
 }
