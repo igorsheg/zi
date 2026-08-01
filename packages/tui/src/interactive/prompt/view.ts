@@ -19,6 +19,7 @@ import type { ExternalEditor } from "../external-editor.js"
 import type { InteractiveKeybindings, PromptKeyAction } from "../interactive-keybindings.js"
 import type { InteractiveStore } from "../interactive-store.js"
 import type { SlashController } from "../slash-controller.js"
+import type { SystemNoticeActions } from "../system-notifications.js"
 import { PromptFeedbackView } from "./feedback-view.js"
 import { captureFileCompletionInput } from "./file-completion.js"
 import { SessionGreeterView } from "./greeter-view.js"
@@ -26,7 +27,6 @@ import { PickerStackView } from "./picker-view.js"
 import { QueuedInputsView } from "./queue-view.js"
 import { promptInputIsSecret, type PromptInputEdit, type PromptWorkflow } from "./state.js"
 import { createPromptStore, type PromptSessionActions, type PromptStore } from "./store.js"
-import { subagentStatusTitles } from "./subagent-status.js"
 
 type ExternalEditorState =
   | { readonly type: "idle" }
@@ -41,6 +41,7 @@ export class PromptView {
   readonly #keybindings: InteractiveKeybindings
   readonly #exitGestures: ExitGestureController
   readonly #externalEditor: ExternalEditor
+  readonly #systemNotices: SystemNoticeActions
   readonly #store: PromptStore
   readonly #working: ShimmerTextView
   readonly #feedback: PromptFeedbackView
@@ -65,6 +66,7 @@ export class PromptView {
     clipboard: ClipboardReader,
     externalEditor: ExternalEditor,
     theme: Theme,
+    systemNotices: SystemNoticeActions,
     sessionActions?: PromptSessionActions
   ) {
     this.#renderer = renderer
@@ -72,7 +74,8 @@ export class PromptView {
     this.#keybindings = keybindings
     this.#exitGestures = exitGestures
     this.#externalEditor = externalEditor
-    this.#store = createPromptStore(interactive, slash, sessionActions, clipboard)
+    this.#systemNotices = systemNotices
+    this.#store = createPromptStore(interactive, slash, sessionActions, clipboard, systemNotices)
     this.root = new BoxRenderable(renderer, { flexDirection: "column", flexShrink: 0 })
     this.root.onLifecyclePass = this.#refreshWorkingStatus
 
@@ -125,25 +128,8 @@ export class PromptView {
     this.#input.focus()
   }
 
-  showWarning(message: string): void {
-    this.#store.reportFeedback({ type: "warning", message })
-  }
-
   requestProjectTrust(cwd: string): void {
     this.#store.requestProjectTrust(cwd)
-  }
-
-  showCopyWarning(message: string): void {
-    const state = this.#store.$state.get()
-    if (state.workflow.type === "idle" && (state.feedback.type === "none" || state.feedback.type === "copy_warning")) {
-      this.#store.reportFeedback({ type: "copy_warning", message })
-    }
-  }
-
-  clearCopyWarning(): void {
-    if (this.#store.$state.get().feedback.type === "copy_warning") {
-      this.#store.reportFeedback({ type: "none" })
-    }
   }
 
   destroy(): void {
@@ -336,9 +322,7 @@ export class PromptView {
       case "background_task": {
         consume(key)
         const result = this.#interactive.backgroundForegroundShellTask()
-        if (result.type === "capacity_exceeded") {
-          this.#store.reportFeedback({ type: "error", message: "Background task capacity exceeded" })
-        }
+        if (result.type === "capacity_exceeded") this.#systemNotices.backgroundTaskCapacityExceeded()
         return
       }
       case "external_editor":
@@ -458,7 +442,6 @@ function composerSlots(session: ReturnType<InteractiveStore["getSession"]>, imag
   return {
     topLeft: session.sessionManager.header.cwd,
     topRight: [
-      ...subagentStatusTitles(session.subagentStatus, session.subagents),
       ...(imageCount === 0 ? [] : [`${imageCount} image${imageCount === 1 ? "" : "s"}`]),
       ...(context.type === "unavailable" ? [] : [contextTitle(context.type, context.percent, context.contextWindow)]),
       modelTitle(session)

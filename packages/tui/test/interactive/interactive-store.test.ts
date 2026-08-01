@@ -10,10 +10,49 @@ import {
 } from "@with-zi/coding-agent/testing"
 
 import {
+  compactionNoticeEvent,
   createInteractiveStore,
   initialInteractiveState,
   transitionInteractiveState
 } from "../../src/interactive/interactive-store.js"
+
+test("compaction notices report automatic failures and clear after any successful compaction", () => {
+  expect(
+    compactionNoticeEvent({
+      type: "compaction_end",
+      operationId: 1,
+      reason: "threshold",
+      outcome: { type: "failed", message: "empty summary" }
+    })
+  ).toEqual({ type: "failed", message: "empty summary" })
+  expect(
+    compactionNoticeEvent({
+      type: "compaction_end",
+      operationId: 2,
+      reason: "manual",
+      outcome: { type: "failed", message: "manual" }
+    })
+  ).toBeUndefined()
+  expect(
+    compactionNoticeEvent({
+      type: "compaction_end",
+      operationId: 3,
+      reason: "manual",
+      outcome: {
+        type: "completed",
+        result: {
+          reason: "manual",
+          summary: "summary",
+          firstKeptEntryId: "kept",
+          tokensBefore: 100,
+          estimatedTokensAfter: 20,
+          compactedEntries: 2,
+          details: { readFiles: [], modifiedFiles: [], omittedReadFiles: 0, omittedModifiedFiles: 0 }
+        }
+      }
+    })
+  ).toEqual({ type: "completed" })
+})
 
 test("interactive store owns bounded transient tools", async () => {
   const session = await createSession("tools")

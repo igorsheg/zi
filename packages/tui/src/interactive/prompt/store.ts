@@ -28,6 +28,7 @@ import {
 } from "../clipboard.js"
 import type { InteractiveStore } from "../interactive-store.js"
 import type { InteractiveCommand, SlashController } from "../slash-controller.js"
+import type { ReloadNoticeOutcome, SystemNoticeActions } from "../system-notifications.js"
 import { FileCompletionController, type FileCompletionInput, type FileCompletionRangeEdit } from "./file-completion.js"
 import {
   authenticationMethodId,
@@ -102,6 +103,11 @@ export const maxPromptClipboardImages = 8
 export const maxPromptClipboardEncodedBytes = 8 * 1024 * 1024
 
 const unavailableClipboard: ClipboardReader = { read: async () => undefined }
+const unavailableSystemNotices: SystemNoticeActions = {
+  backgroundTaskCapacityExceeded() {},
+  reloadCompleted() {},
+  reloadFailed() {}
+}
 
 export interface PromptSessionActions {
   listSessions(): Promise<SessionListResult>
@@ -116,9 +122,10 @@ export function createPromptStore(
   interactive: InteractiveStore,
   slash: SlashController,
   sessionActions?: PromptSessionActions,
-  clipboard: ClipboardReader = unavailableClipboard
+  clipboard: ClipboardReader = unavailableClipboard,
+  systemNotices: SystemNoticeActions = unavailableSystemNotices
 ): PromptStore {
-  return new PromptController(interactive, slash, sessionActions, clipboard)
+  return new PromptController(interactive, slash, sessionActions, clipboard, systemNotices)
 }
 
 class PromptController implements PromptStore {
@@ -129,6 +136,7 @@ class PromptController implements PromptStore {
   readonly #slash: SlashController
   readonly #sessionActions: PromptSessionActions | undefined
   readonly #clipboard: ClipboardReader
+  readonly #systemNotices: SystemNoticeActions
   readonly #fileCompletion: FileCompletionController
   #clipboardRead: ClipboardReadState = { type: "idle" }
   #draftRevision = 0
@@ -137,23 +145,20 @@ class PromptController implements PromptStore {
   #nextBrowserRequestId = 0
   #pendingAuthPrompt: PendingAuthPrompt | undefined
   #cancelledCompactionOperationId: number | undefined
-  readonly #unsubscribeAutomaticCompactionFailure: () => void
 
   constructor(
     interactive: InteractiveStore,
     slash: SlashController,
     sessionActions: PromptSessionActions | undefined,
-    clipboard: ClipboardReader
+    clipboard: ClipboardReader,
+    systemNotices: SystemNoticeActions
   ) {
     this.#interactive = interactive
     this.#slash = slash
     this.#sessionActions = sessionActions
     this.#clipboard = clipboard
+    this.#systemNotices = systemNotices
     this.#fileCompletion = new FileCompletionController(this.picker, edit => this.#requestRange(edit))
-    this.#unsubscribeAutomaticCompactionFailure = interactive.subscribeAutomaticCompactionFailure(message => {
-      if (this.#disposed) return
-      this.$state.set({ ...this.$state.get(), feedback: { type: "error", message } })
-    })
   }
 
   submit(text: string, delivery: PendingInputDelivery): boolean {
@@ -304,11 +309,7 @@ class PromptController implements PromptStore {
     if (workflow.type === "choosing_project_trust") {
       this.picker.close()
       this.#sessionActions?.dismissProjectTrust()
-      this.$state.set({
-        ...this.$state.get(),
-        feedback: { type: "warning", message: "Project .zi configuration remains disabled for this session" },
-        workflow: { type: "idle" }
-      })
+      this.$state.set({ ...this.$state.get(), feedback: { type: "none" }, workflow: { type: "idle" } })
       this.#requestInput("")
       return true
     }
@@ -573,7 +574,6 @@ class PromptController implements PromptStore {
     this.#cancelCompaction()
     this.#cancelSessionReplacement()
     this.#disposed = true
-    this.#unsubscribeAutomaticCompactionFailure()
     this.#fileCompletion.dispose()
     this.picker.dispose()
   }
@@ -970,23 +970,21 @@ class PromptController implements PromptStore {
     this.#requestInput("")
 
     const reload = async () => {
+      let result: SessionReloadResult
       try {
-        const result = await session.reload()
-        if (!this.#accepts(operationId, session)) return
-        this.#slash.invalidateCatalog()
-        this.$state.set({
-          ...this.$state.get(),
-          feedback: { type: reloadFeedbackType(result), message: reloadStatusMessage(result) },
-          workflow: { type: "idle" }
-        })
+        result = await session.reload()
       } catch (cause) {
         if (!this.#accepts(operationId, session)) return
-        this.$state.set({
-          ...this.$state.get(),
-          feedback: { type: "error", message: errorMessage(cause) },
-          workflow: { type: "idle" }
-        })
+        this.$state.set({ ...this.$state.get(), feedback: { type: "none" }, workflow: { type: "idle" } })
+        this.#systemNotices.reloadFailed(errorMessage(cause))
+        return
       }
+      if (!this.#accepts(operationId, session)) return
+      this.#slash.invalidateCatalog()
+      const outcome = reloadNoticeOutcome(result)
+      const message = reloadStatusMessage(result)
+      this.$state.set({ ...this.$state.get(), feedback: { type: "none" }, workflow: { type: "idle" } })
+      this.#systemNotices.reloadCompleted(outcome, message)
     }
     void reload()
   }
@@ -1743,12 +1741,12 @@ function errorMessage(cause: unknown): string {
   return cause instanceof Error ? cause.message : String(cause)
 }
 
-function reloadFeedbackType(result: SessionReloadResult): "status" | "warning" | "error" {
+function reloadNoticeOutcome(result: SessionReloadResult): ReloadNoticeOutcome {
   const outcome = result.extensions?.outcome
   if (outcome === "failed") return "error"
   if (outcome === "retained" || outcome === "superseded") return "warning"
   if (firstReloadDiagnostic(result)) return "warning"
-  return "status"
+  return "success"
 }
 
 function reloadStatusMessage(result: SessionReloadResult): string {

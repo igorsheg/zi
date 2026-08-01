@@ -2,9 +2,9 @@
 
 ## Status
 
-Partially superseded by [ADR 0027](0027-session-owned-native-subagents.md).
+Partially superseded first by [ADR 0027](0027-session-owned-native-subagents.md) and then by [ADR 0029](0029-subagent-profiles-share-session-owned-orchestration.md).
 
-ADR 0027 supersedes this ADR's extension-generation ownership, extension custom-state completion delivery, and reload-terminates-children decisions. The RPC subprocess transport, `ChildZiProcess` boundary, JSONL protocol additions, depth and capacity bounds, and cross-platform process-containment requirements remain accepted.
+ADR 0029 retains this ADR's RPC subprocess transport, `ChildZiProcess` boundary, JSONL protocol additions, depth and capacity bounds, and cross-platform process-containment requirements. It rejects generation-owned child lifetime and derives standard model-facing orchestration from the `AgentSession`-owned profile catalog; extension orchestration is optional.
 
 ## Context
 
@@ -39,16 +39,15 @@ The retained decisions migrate as follows:
 - native child process scopes belong to the subagent owner and must not be registered as extension-worker descendants;
 - RPC remains a single-session transport and still gains no `agent.*` topology API.
 
-The local implementation does not complete the release gate. Compiled acceptance on all five release targets, including a real Windows Job Object containment test, is still required before native background subagents ship.
+The local implementation does not complete the release gate. Compiled acceptance on all five release targets, including a real Windows Job Object containment test, is still required before the child-process substrate is release-supported.
 
 ## Historical consequences of the superseded extension owner
 
 - Zi composes its existing supported building blocks instead of exposing runtime services or private session constructors.
 - Process EOF, stderr, exit status, and process-tree termination give every child a concrete, inspectable lifecycle and fault-containment boundary.
 - Process isolation is not a sandbox: children retain the invoked Zi process's filesystem, environment, credential, extension, and network authority.
-- V1 child conversations are ephemeral across close, reload, worker crash, and parent restart; only bounded parent-side lifecycle evidence and completion projections are durable.
-- Completion durability may lag child settlement while parent custom-state admission is closed, but the bounded delivery owner never mistakes pending evidence for durable evidence.
+- Child conversations are ephemeral across explicit close and parent restart; bounded parent-side lifecycle evidence and completion projections are durable. Session-owned children survive extension reload and worker failure.
 - RPC event suppression becomes useful to any process client that wants correlated operations and final state without token-stream traffic.
-- ADR 0027 removes the complete orchestration extension from the product. The retained protocol, process-tree containment, behavior tests, and compiled acceptance on all release targets remain required before native background subagents are supported.
+- ADR 0027 removed the complete orchestration extension from the product; ADR 0029 makes profile declarations activate shared standard orchestration. The retained protocol, process-tree containment, behavior tests, and compiled acceptance on all release targets remain required before profile-driven background subagents are release-supported.
 
-The migrated native contract, retained process bounds, transitions, and release gates are in [`../subagent-process-orchestration-spec.md`](../subagent-process-orchestration-spec.md). The ownership decision is in [ADR 0027](0027-session-owned-native-subagents.md).
+The retained process bounds, transitions, and release gates are in [`../subagent-process-orchestration-spec.md`](../subagent-process-orchestration-spec.md). The current ownership decision is in [ADR 0029](0029-subagent-profiles-share-session-owned-orchestration.md).

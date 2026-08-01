@@ -4,7 +4,7 @@ import { join, resolve } from "node:path"
 export const projectConfigDirName = ".zi"
 export const globalAgentDirName = "agent"
 
-export type ResourceDirectory = "extensions" | "prompts" | "skills" | "themes"
+export type ResourceDirectory = "extensions" | "prompts" | "skills" | "subagents" | "themes"
 
 /** Immutable global/project path policy for one effective working directory. */
 export class ZiPaths {

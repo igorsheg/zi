@@ -1767,7 +1767,7 @@ function isRetryAttempt(value: unknown): value is number {
 }
 
 function validateSubagentEntryData(value: unknown): asserts value is SubagentEntryData {
-  if (!isSubagentEntryData(value)) throw new Error("Invalid native subagent journal entry")
+  if (!isSubagentEntryData(value)) throw new Error("Invalid subagent substrate journal entry")
 }
 
 function isSubagentEntryData(value: unknown): value is SubagentEntryData {

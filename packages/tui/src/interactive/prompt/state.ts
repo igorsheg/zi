@@ -15,7 +15,6 @@ export type PromptFeedback =
   | { readonly type: "none" }
   | { readonly type: "status"; readonly message: string }
   | { readonly type: "warning"; readonly message: string }
-  | { readonly type: "copy_warning"; readonly message: string }
   | { readonly type: "error"; readonly message: string }
 
 /** Sticky OAuth/API-key ceremony retained above the composer while login runs. */

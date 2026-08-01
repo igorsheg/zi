@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test"
 import { existsSync } from "node:fs"
-import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
+import { access, copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
 
@@ -10,7 +10,16 @@ import { SessionManager } from "../src/session-manager.js"
 import { createModels, fauxAssistantMessage, fauxProvider, fauxText, fauxToolCall } from "../src/testing.js"
 
 const cli = resolve(import.meta.dirname, "../../cli/src/main.ts")
+const mockChild = resolve(import.meta.dirname, "fixtures/mock-rpc-child.ts")
 const workerCommand = Object.freeze([process.execPath, cli])
+
+function programmaticProfileSource(name: string): string {
+  return `import type { ExtensionAPI } from "@with-zi/extension-api"
+export default function (zi: ExtensionAPI): void {
+  zi.registerSubagentProfile({ name: "${name}", description: "${name} profile", instructions: "Work." })
+}
+`
+}
 
 test("AgentSession owns one discovered extension lifecycle through final disposal", async () => {
   const fixture = await extensionFixture("direct")
@@ -290,6 +299,583 @@ export default function (zi: ExtensionAPI): void {
   }
 }, 10_000)
 
+test("custom extension orchestration shares session-owned profile mechanics", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-runtime-extension-subagent-"))
+  const cwd = join(root, "project")
+  const agentDir = join(root, "agent")
+  const childArgv = join(root, "child-argv.json")
+  await mkdir(cwd, { recursive: true })
+  await mkdir(join(agentDir, "extensions"), { recursive: true })
+  await mkdir(join(agentDir, "subagents"), { recursive: true })
+  await writeFile(
+    join(agentDir, "subagents", "resource-reviewer.md"),
+    "---\ndescription: Review from a resource\n---\nReview the requested change."
+  )
+  await writeFile(
+    join(agentDir, "subagents", "unavailable.md"),
+    "---\ndescription: Missing model\nmodel: missing/model\n---\nThis profile cannot start."
+  )
+  await writeFile(
+    join(agentDir, "extensions", "delegate.ts"),
+    `import { Schema, type ExtensionAPI } from "@with-zi/extension-api"
+export default function (zi: ExtensionAPI): void {
+  zi.registerSubagentProfile({
+    name: "resource-reviewer",
+    description: "Extension default that must lose to the resource",
+    instructions: "Extension fallback."
+  })
+  zi.registerSubagentProfile({
+    name: "extension-finder",
+    description: "Find evidence",
+    instructions: "Find only the requested evidence.",
+    model: "faux/faux-1",
+    thinking: "high"
+  })
+  zi.registerTool({
+    name: "delegate_once",
+    description: "Delegate one task",
+    parameters: Schema.object({}),
+    async execute(_input, context) {
+      if (!zi.subagents) throw new Error("subagents unavailable")
+      const profiles = await zi.subagents.listProfiles()
+      let unavailableSource = false
+      try {
+        await zi.subagents.spawn("unavailable", "missing-1", "inspect", context.signal)
+      } catch (cause) {
+        unavailableSource = cause instanceof Error && cause.message.includes("unavailable.md")
+      }
+      const name = await zi.subagents.spawn("extension-finder", "finder-1", "inspect", context.signal)
+      const active = await zi.subagents.list()
+      await zi.subagents.send(name, "context")
+      const followed = await zi.subagents.continue(name, "follow up")
+      const waited = await zi.subagents.wait([name], 5_000, context.signal)
+      const started = await zi.subagents.continue(name, "second cycle")
+      const interrupted = await zi.subagents.interrupt(name)
+      const cancelled = await zi.subagents.wait([name], 5_000, context.signal)
+      const closed = await zi.subagents.close(name)
+      return JSON.stringify({
+        profiles: profiles.map(profile => profile.name),
+        resourceDescription: profiles.find(profile => profile.name === "resource-reviewer")?.description,
+        unavailableSource,
+        active: active.map(snapshot => snapshot.name),
+        followed,
+        result: waited[0]?.completion?.text,
+        started,
+        interrupted,
+        cancelled: cancelled[0]?.completion?.status,
+        closed: closed.name
+      })
+    }
+  })
+}
+`
+  )
+  const models = createModels()
+  const faux = fauxProvider()
+  models.setProvider(faux.provider)
+  faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("delegate_once", {}, { id: "delegate-1" }), { stopReason: "toolUse" }),
+    fauxAssistantMessage("Delegation complete.")
+  ])
+  const runtime = await createAgentRuntime({
+    cwd,
+    agentDir,
+    model: "faux/faux-1",
+    modelFactory: () => models,
+    session: { type: "new", persist: false },
+    extensionWorkerCommand: workerCommand,
+    subagentCommand: [process.execPath, mockChild],
+    internalSubagentEnvironment: {
+      MOCK_RPC_REPLY: "extension-result",
+      MOCK_RPC_DELAY_MS: "100",
+      MOCK_RPC_ARGV: childArgv
+    }
+  })
+  try {
+    expect(runtime.session.extensionHostSnapshot).toMatchObject({
+      status: "ready",
+      extensions: [{ status: "loaded" }],
+      tools: [{ name: "delegate_once" }]
+    })
+    expect(runtime.session.resourceDiagnostics).toContainEqual(
+      expect.objectContaining({
+        type: "collision",
+        resource: "subagent-profile",
+        name: "resource-reviewer",
+        winnerPath: expect.stringContaining("resource-reviewer.md"),
+        loserPath: expect.stringContaining("delegate.ts")
+      })
+    )
+    await runtime.session.prompt("Delegate this task.")
+    const result = runtime.session.messages.find(
+      message => message.role === "toolResult" && message.toolName === "delegate_once"
+    )
+    expect(result).toMatchObject({
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify({
+            profiles: ["resource-reviewer", "unavailable", "extension-finder"],
+            resourceDescription: "Review from a resource",
+            unavailableSource: true,
+            active: ["finder-1"],
+            followed: "follow_up",
+            result: "extension-result",
+            started: "started_turn",
+            interrupted: "interrupted",
+            cancelled: "cancelled",
+            closed: "finder-1"
+          })
+        }
+      ]
+    })
+    expect(JSON.parse(await readFile(childArgv, "utf8"))).toEqual(
+      expect.arrayContaining(["--model", "faux/faux-1", "--thinking", "high"])
+    )
+  } finally {
+    runtime.session.dispose()
+    await runtime.session.waitForIdle()
+    await rm(root, { recursive: true, force: true })
+  }
+}, 15_000)
+
+test("extension reload replaces profile registrations without terminating admitted children", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-runtime-extension-subagent-reload-"))
+  const cwd = join(root, "project")
+  const agentDir = join(root, "agent")
+  await mkdir(cwd, { recursive: true })
+  await mkdir(join(agentDir, "extensions"), { recursive: true })
+  await writeFile(
+    join(agentDir, "extensions", "background.ts"),
+    `import { Schema, type ExtensionAPI } from "@with-zi/extension-api"
+export default function (zi: ExtensionAPI): void {
+  zi.registerSubagentProfile({ name: "slow", description: "Slow worker", instructions: "Finish the task." })
+  zi.registerTool({
+    name: "begin_background",
+    description: "Start background work",
+    parameters: Schema.object({}),
+    async execute(_input, context) {
+      if (!zi.subagents) throw new Error("subagents unavailable")
+      return zi.subagents.spawn("slow", "slow-1", "work", context.signal)
+    }
+  })
+  zi.registerTool({
+    name: "collect_background",
+    description: "Collect background work",
+    parameters: Schema.object({}),
+    async execute(_input, context) {
+      if (!zi.subagents) throw new Error("subagents unavailable")
+      const profiles = await zi.subagents.listProfiles()
+      const waited = await zi.subagents.wait(["slow-1"], 5_000, context.signal)
+      await zi.subagents.close("slow-1")
+      return profiles.map(profile => profile.name).join(",") + ":" + waited[0]?.completion?.text
+    }
+  })
+}
+`
+  )
+  const models = createModels()
+  const faux = fauxProvider()
+  models.setProvider(faux.provider)
+  faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("begin_background", {}, { id: "begin-1" }), { stopReason: "toolUse" }),
+    fauxAssistantMessage("Started."),
+    fauxAssistantMessage(fauxToolCall("collect_background", {}, { id: "collect-1" }), { stopReason: "toolUse" }),
+    fauxAssistantMessage("Collected.")
+  ])
+  const runtime = await createAgentRuntime({
+    cwd,
+    agentDir,
+    model: "faux/faux-1",
+    modelFactory: () => models,
+    session: { type: "new", persist: false },
+    extensionWorkerCommand: workerCommand,
+    subagentCommand: [process.execPath, mockChild],
+    internalSubagentEnvironment: { MOCK_RPC_REPLY: "survived-reload", MOCK_RPC_DELAY_MS: "400" }
+  })
+  try {
+    await runtime.session.prompt("Start background work.")
+    expect(await runtime.session.reload()).toMatchObject({ extensions: { outcome: "replaced" } })
+    await runtime.session.prompt("Collect background work.")
+    expect(runtime.session.messages).toContainEqual(
+      expect.objectContaining({
+        role: "toolResult",
+        toolName: "collect_background",
+        content: [{ type: "text", text: "slow:survived-reload" }]
+      })
+    )
+  } finally {
+    runtime.session.dispose()
+    await runtime.session.waitForIdle()
+    await rm(root, { recursive: true, force: true })
+  }
+}, 15_000)
+
+test("the canonical programmatic profile example activates standard tools", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-runtime-subagent-example-"))
+  const cwd = join(root, "project")
+  const agentDir = join(root, "agent")
+  await mkdir(cwd, { recursive: true })
+  await mkdir(join(agentDir, "extensions"), { recursive: true })
+  await copyFile(
+    resolve(import.meta.dirname, "../../../examples/extensions/subagents/index.ts"),
+    join(agentDir, "extensions", "subagents.ts")
+  )
+  const models = createModels()
+  const faux = fauxProvider()
+  models.setProvider(faux.provider)
+  faux.setResponses([
+    fauxAssistantMessage(
+      fauxToolCall(
+        "spawn_subagent",
+        { profile: "finder", name: "example-finder", prompt: "Find one fact." },
+        { id: "example-spawn-1" }
+      ),
+      { stopReason: "toolUse" }
+    ),
+    fauxAssistantMessage(
+      fauxToolCall("wait_subagents", { names: ["example-finder"], timeout_ms: 5_000 }, { id: "example-wait-1" }),
+      { stopReason: "toolUse" }
+    ),
+    fauxAssistantMessage("Example complete.")
+  ])
+  const runtime = await createAgentRuntime({
+    cwd,
+    agentDir,
+    model: "faux/faux-1",
+    modelFactory: () => models,
+    session: { type: "new", persist: false },
+    extensionWorkerCommand: workerCommand,
+    subagentCommand: [process.execPath, mockChild],
+    internalSubagentEnvironment: { MOCK_RPC_REPLY: "example-result" }
+  })
+  try {
+    await runtime.session.prompt("Use the example.")
+    expect(runtime.session.messages).toContainEqual(
+      expect.objectContaining({
+        role: "toolResult",
+        toolName: "wait_subagents",
+        content: [expect.objectContaining({ type: "text", text: expect.stringContaining("example-result") })]
+      })
+    )
+  } finally {
+    runtime.session.dispose()
+    await runtime.session.waitForIdle()
+    await rm(root, { recursive: true, force: true })
+  }
+}, 15_000)
+
+test("a Markdown profile activates the standard subagent tools without an extension", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-runtime-subagent-resource-tools-"))
+  const cwd = join(root, "project")
+  const agentDir = join(root, "agent")
+  const childArgv = join(root, "child-argv.json")
+  await mkdir(cwd, { recursive: true })
+  await mkdir(join(agentDir, "subagents"), { recursive: true })
+  await writeFile(
+    join(agentDir, "subagents", "pathfinder.md"),
+    `---\ndescription: Find authoritative implementation paths\n---\nReturn concrete file paths.\n`
+  )
+  const models = createModels()
+  const faux = fauxProvider()
+  models.setProvider(faux.provider)
+  let admittedTools: readonly string[] = []
+  faux.setResponses([
+    context => {
+      admittedTools = (context.tools ?? []).map(tool => tool.name)
+      return fauxAssistantMessage(
+        fauxToolCall(
+          "spawn_subagent",
+          { profile: "pathfinder", name: "finder-1", prompt: "Find ResourceDirectory." },
+          { id: "spawn-standard-1" }
+        ),
+        { stopReason: "toolUse" }
+      )
+    },
+    fauxAssistantMessage(
+      fauxToolCall("wait_subagents", { names: ["finder-1"], timeout_ms: 5_000 }, { id: "wait-standard-1" }),
+      { stopReason: "toolUse" }
+    ),
+    fauxAssistantMessage("Delegation complete.")
+  ])
+  const runtime = await createAgentRuntime({
+    cwd,
+    agentDir,
+    model: "faux/faux-1",
+    modelFactory: () => models,
+    session: { type: "new", persist: false },
+    extensionWorkerCommand: workerCommand,
+    subagentCommand: [process.execPath, mockChild],
+    internalSubagentEnvironment: { MOCK_RPC_REPLY: "resource-profile-result", MOCK_RPC_ARGV: childArgv }
+  })
+  try {
+    await runtime.session.prompt("Delegate this search.")
+    expect(admittedTools).toContain("list_subagent_profiles")
+    expect(admittedTools).toContain("spawn_subagent")
+    const waited = runtime.session.messages.find(
+      message => message.role === "toolResult" && message.toolName === "wait_subagents"
+    )
+    expect(waited).toMatchObject({
+      content: [{ type: "text", text: expect.stringContaining("resource-profile-result") }]
+    })
+    expect(JSON.parse(await readFile(childArgv, "utf8"))).toEqual(
+      expect.arrayContaining(["--model", "faux/faux-1", "--thinking", "off"])
+    )
+  } finally {
+    runtime.session.dispose()
+    await runtime.session.waitForIdle()
+    await rm(root, { recursive: true, force: true })
+  }
+}, 15_000)
+
+test("a programmatic profile activates the same standard subagent tools", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-runtime-subagent-programmatic-tools-"))
+  const cwd = join(root, "project")
+  const agentDir = join(root, "agent")
+  await mkdir(cwd, { recursive: true })
+  await mkdir(join(agentDir, "extensions"), { recursive: true })
+  await writeFile(
+    join(agentDir, "extensions", "reviewer.ts"),
+    `import type { ExtensionAPI } from "@with-zi/extension-api"
+export default function (zi: ExtensionAPI): void {
+  zi.registerSubagentProfile({
+    name: "reviewer",
+    description: "Review one bounded implementation",
+    instructions: "Return concrete evidence."
+  })
+}
+`
+  )
+  const models = createModels()
+  const faux = fauxProvider()
+  models.setProvider(faux.provider)
+  let admittedTools: readonly string[] = []
+  faux.setResponses([
+    context => {
+      admittedTools = (context.tools ?? []).map(tool => tool.name)
+      return fauxAssistantMessage(
+        fauxToolCall(
+          "spawn_subagent",
+          { profile: "reviewer", name: "reviewer-1", prompt: "Review the owner." },
+          { id: "spawn-programmatic-1" }
+        ),
+        { stopReason: "toolUse" }
+      )
+    },
+    fauxAssistantMessage(
+      fauxToolCall("wait_subagents", { names: ["reviewer-1"], timeout_ms: 5_000 }, { id: "wait-programmatic-1" }),
+      { stopReason: "toolUse" }
+    ),
+    fauxAssistantMessage("Review complete.")
+  ])
+  const runtime = await createAgentRuntime({
+    cwd,
+    agentDir,
+    model: "faux/faux-1",
+    modelFactory: () => models,
+    session: { type: "new", persist: false },
+    extensionWorkerCommand: workerCommand,
+    subagentCommand: [process.execPath, mockChild],
+    internalSubagentEnvironment: { MOCK_RPC_REPLY: "programmatic-profile-result" }
+  })
+  try {
+    expect(runtime.session.extensionHostSnapshot).toMatchObject({ tools: [] })
+    await runtime.session.prompt("Delegate this review.")
+    expect(admittedTools).toContain("list_subagent_profiles")
+    expect(admittedTools).toContain("spawn_subagent")
+    expect(runtime.session.messages).toContainEqual(
+      expect.objectContaining({
+        role: "toolResult",
+        toolName: "wait_subagents",
+        content: [expect.objectContaining({ text: expect.stringContaining("programmatic-profile-result") })]
+      })
+    )
+  } finally {
+    runtime.session.dispose()
+    await runtime.session.waitForIdle()
+    await rm(root, { recursive: true, force: true })
+  }
+}, 15_000)
+
+test("subagent mechanics expose no model-facing tools without admitted profiles", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-runtime-subagent-empty-catalog-"))
+  const cwd = join(root, "project")
+  await mkdir(cwd, { recursive: true })
+  const models = createModels()
+  const faux = fauxProvider()
+  models.setProvider(faux.provider)
+  let admittedTools: readonly string[] = []
+  faux.setResponses([
+    context => {
+      admittedTools = (context.tools ?? []).map(tool => tool.name)
+      return fauxAssistantMessage("No delegation tools.")
+    }
+  ])
+  const runtime = await createAgentRuntime({
+    cwd,
+    agentDir: join(root, "agent"),
+    model: "faux/faux-1",
+    modelFactory: () => models,
+    session: { type: "new", persist: false },
+    extensionWorkerCommand: workerCommand,
+    subagentCommand: [process.execPath, mockChild]
+  })
+  try {
+    await runtime.session.prompt("Inspect available tools.")
+    expect(admittedTools).not.toContain("list_subagent_profiles")
+    expect(admittedTools).not.toContain("spawn_subagent")
+  } finally {
+    runtime.session.dispose()
+    await runtime.session.waitForIdle()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test("a depth-one child does not activate recursive subagent tools", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-runtime-subagent-depth-one-"))
+  const cwd = join(root, "project")
+  const agentDir = join(root, "agent")
+  await mkdir(cwd, { recursive: true })
+  await mkdir(join(agentDir, "subagents"), { recursive: true })
+  await writeFile(
+    join(agentDir, "subagents", "nested.md"),
+    "---\ndescription: Must not activate recursively\n---\nWork.\n"
+  )
+  const models = createModels()
+  const faux = fauxProvider()
+  models.setProvider(faux.provider)
+  let admittedTools: readonly string[] = []
+  faux.setResponses([
+    context => {
+      admittedTools = (context.tools ?? []).map(tool => tool.name)
+      return fauxAssistantMessage("No recursive delegation.")
+    }
+  ])
+  const runtime = await createAgentRuntime({
+    cwd,
+    agentDir,
+    model: "faux/faux-1",
+    modelFactory: () => models,
+    session: { type: "new", persist: false },
+    subagentCommand: [process.execPath, mockChild],
+    internalSubagentDepth: 1
+  })
+  try {
+    await runtime.session.prompt("Inspect tools.")
+    expect(admittedTools).not.toContain("list_subagent_profiles")
+    expect(admittedTools).not.toContain("spawn_subagent")
+  } finally {
+    runtime.session.dispose()
+    await runtime.session.waitForIdle()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test("reload adds and removes standard tools with Markdown profiles", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-runtime-subagent-resource-reload-"))
+  const cwd = join(root, "project")
+  const agentDir = join(root, "agent")
+  const profileDir = join(agentDir, "subagents")
+  await mkdir(cwd, { recursive: true })
+  const catalogs: string[][] = []
+  const models = createModels()
+  const faux = fauxProvider()
+  models.setProvider(faux.provider)
+  faux.setResponses([
+    context => {
+      catalogs.push((context.tools ?? []).map(tool => tool.name))
+      return fauxAssistantMessage("No profile.")
+    },
+    context => {
+      catalogs.push((context.tools ?? []).map(tool => tool.name))
+      return fauxAssistantMessage("Profile added.")
+    },
+    context => {
+      catalogs.push((context.tools ?? []).map(tool => tool.name))
+      return fauxAssistantMessage("Profile removed.")
+    }
+  ])
+  const runtime = await createAgentRuntime({
+    cwd,
+    agentDir,
+    model: "faux/faux-1",
+    modelFactory: () => models,
+    session: { type: "new", persist: false },
+    extensionWorkerCommand: workerCommand,
+    subagentCommand: [process.execPath, mockChild]
+  })
+  try {
+    await runtime.session.prompt("Inspect tools before the profile exists.")
+    await mkdir(profileDir, { recursive: true })
+    const profilePath = join(profileDir, "finder.md")
+    await writeFile(profilePath, "---\ndescription: Find evidence\n---\nReturn paths.\n")
+    await runtime.session.reload()
+    await runtime.session.prompt("Inspect tools after adding the profile.")
+    await rm(profilePath)
+    await runtime.session.reload()
+    await runtime.session.prompt("Inspect tools after removing the profile.")
+
+    expect(catalogs[0]).not.toContain("spawn_subagent")
+    expect(catalogs[1]).toContain("spawn_subagent")
+    expect(catalogs[2]).not.toContain("spawn_subagent")
+  } finally {
+    runtime.session.dispose()
+    await runtime.session.waitForIdle()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test("reload replaces programmatic profiles in the canonical catalog", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-runtime-subagent-profile-generation-"))
+  const cwd = join(root, "project")
+  const agentDir = join(root, "agent")
+  const extensionDir = join(agentDir, "extensions")
+  const extensionPath = join(extensionDir, "profile.ts")
+  await mkdir(cwd, { recursive: true })
+  await mkdir(extensionDir, { recursive: true })
+  await writeFile(extensionPath, programmaticProfileSource("alpha"))
+  const models = createModels()
+  const faux = fauxProvider()
+  models.setProvider(faux.provider)
+  faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("list_subagent_profiles", {}, { id: "profiles-alpha" }), {
+      stopReason: "toolUse"
+    }),
+    fauxAssistantMessage("Alpha listed."),
+    fauxAssistantMessage(fauxToolCall("list_subagent_profiles", {}, { id: "profiles-beta" }), {
+      stopReason: "toolUse"
+    }),
+    fauxAssistantMessage("Beta listed.")
+  ])
+  const runtime = await createAgentRuntime({
+    cwd,
+    agentDir,
+    model: "faux/faux-1",
+    modelFactory: () => models,
+    session: { type: "new", persist: false },
+    extensionWorkerCommand: workerCommand,
+    subagentCommand: [process.execPath, mockChild]
+  })
+  try {
+    await runtime.session.prompt("List profiles.")
+    await writeFile(extensionPath, programmaticProfileSource("beta"))
+    await runtime.session.reload()
+    await runtime.session.prompt("List profiles again.")
+
+    const results = runtime.session.messages.filter(
+      message => message.role === "toolResult" && message.toolName === "list_subagent_profiles"
+    )
+    expect(results).toHaveLength(2)
+    expect(results[0]).toMatchObject({ content: [{ text: expect.stringContaining('"name":"alpha"') }] })
+    expect(results[1]).toMatchObject({ content: [{ text: expect.stringContaining('"name":"beta"') }] })
+    expect(results[1]).not.toMatchObject({ content: [{ text: expect.stringContaining('"name":"alpha"') }] })
+  } finally {
+    runtime.session.dispose()
+    await runtime.session.waitForIdle()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 test("a failed extension generation is removed from current and future provider catalogs", async () => {
   const root = await mkdtemp(join(tmpdir(), "zi-runtime-extension-tool-failure-"))
   const cwd = join(root, "project")
@@ -299,13 +885,20 @@ test("a failed extension generation is removed from current and future provider 
   await mkdir(extensionDir, { recursive: true })
   await writeFile(
     join(extensionDir, "crash.ts"),
-    `import { Schema } from "@with-zi/extension-api"
-export default zi => zi.registerTool({
-  name: "crash_tool",
-  description: "Crash the extension worker",
-  parameters: Schema.object({}),
-  execute: () => process.exit(17)
-})
+    `import { Schema, type ExtensionAPI } from "@with-zi/extension-api"
+export default function (zi: ExtensionAPI): void {
+  zi.registerSubagentProfile({
+    name: "crash-profile",
+    description: "Profile owned by a failing generation",
+    instructions: "Work."
+  })
+  zi.registerTool({
+    name: "crash_tool",
+    description: "Crash the extension worker",
+    parameters: Schema.object({}),
+    execute: () => process.exit(17)
+  })
+}
 `
   )
   const faux = fauxProvider()
@@ -332,15 +925,19 @@ export default zi => zi.registerTool({
     model: "faux/faux-1",
     modelFactory: () => models,
     session: { type: "new", persist: false },
-    extensionWorkerCommand: workerCommand
+    extensionWorkerCommand: workerCommand,
+    subagentCommand: [process.execPath, mockChild]
   })
 
   try {
     await runtime.session.prompt("Crash the extension tool.")
     await runtime.session.prompt("Continue without it.")
     expect(catalogs[0]).toContain("crash_tool")
+    expect(catalogs[0]).toContain("spawn_subagent")
     expect(catalogs[1]).not.toContain("crash_tool")
+    expect(catalogs[1]).not.toContain("spawn_subagent")
     expect(catalogs[2]).not.toContain("crash_tool")
+    expect(catalogs[2]).not.toContain("spawn_subagent")
     expect(runtime.session.extensionHostSnapshot).toMatchObject({ status: "failed", tools: [] })
   } finally {
     runtime.session.dispose()
@@ -360,7 +957,12 @@ test("AgentSession rejects extension tools that conflict with built-ins", async 
     join(extensionDir, "conflict.ts"),
     `import { Schema, type ExtensionAPI } from "@with-zi/extension-api"
 export default function (zi: ExtensionAPI): void {
-  for (const name of ["read", "code", "then"]) zi.registerTool({
+  zi.registerSubagentProfile({
+    name: "conflict-profile",
+    description: "Activates standard tools",
+    instructions: "Work."
+  })
+  for (const name of ["read", "code", "then", "spawn_subagent"]) zi.registerTool({
     name,
     description: "Conflicts with built-in " + name,
     parameters: Schema.object({}),
@@ -369,7 +971,12 @@ export default function (zi: ExtensionAPI): void {
 }
 `
   )
-  const runtime = await createAgentRuntime({ cwd, agentDir, session: { type: "new", persist: false } })
+  const runtime = await createAgentRuntime({
+    cwd,
+    agentDir,
+    session: { type: "new", persist: false },
+    subagentCommand: [process.execPath, mockChild]
+  })
 
   try {
     expect(runtime.session.extensionHostSnapshot).toMatchObject({
@@ -390,6 +997,11 @@ export default function (zi: ExtensionAPI): void {
           path: expect.any(String),
           phase: "registration",
           message: expect.stringContaining("then conflicts with an existing session tool")
+        }),
+        expect.objectContaining({
+          path: expect.any(String),
+          phase: "registration",
+          message: expect.stringContaining("spawn_subagent conflicts with an existing session tool")
         })
       ]
     })

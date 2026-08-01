@@ -45,14 +45,14 @@ test("session entries form one append-only branch", () => {
   expect(session.messages()).toEqual([{ role: "user", content: "hello", timestamp: 1 }])
 })
 
-test("native subagent journal evidence restores and rejects malformed variants", async () => {
+test("subagent substrate journal evidence restores and rejects malformed variants", async () => {
   const root = await mkdtemp(join(tmpdir(), "zi-subagent-journal-"))
   const paths = new ZiPaths(join(root, "project"), join(root, "agent"))
   const session = SessionManager.create(paths)
   const appendSubagent: unknown = Reflect.get(session, "appendSubagent")
   if (typeof appendSubagent !== "function") throw new Error("Expected appendSubagent")
   expect(() => Reflect.apply(appendSubagent, session, [{ event: "starting", agentId: "legacy-uuid" }])).toThrow(
-    "Invalid native subagent journal entry"
+    "Invalid subagent substrate journal entry"
   )
   session.appendSubagent({ event: "starting", name: "journal-worker" })
   session.appendSubagent({ event: "work_cycle_started", name: "journal-worker", workCycle: 1 })

@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted. Local implementation exists; supported release remains gated on compiled acceptance on all five release targets.
+Superseded by [ADR 0029](0029-subagent-profiles-share-session-owned-orchestration.md). This document records the former native-product decision.
 
 Supersedes the extension-generation ownership decision in [ADR 0026](0026-subagent-orchestration-supervises-rpc-processes.md). Retains ADR 0026's RPC subprocess, child-process, protocol, bounds, and process-containment decisions.
 
@@ -66,6 +66,7 @@ Native process containment inherits ADR 0026's release requirement. Graceful EOF
 - Multi-child waits target names and wait for every work cycle captured at admission by default; timeout still returns current state without cancellation.
 - `close_subagent` returns the pre-close lifecycle as `previous_status` and previous completion status when present, without model-facing cycle or delivery bookkeeping.
 - Completion notices do not consume the parent's bounded queued-input budget or trigger inference automatically.
+- `AgentSession` exposes authoritative live-child occupancy alongside bounded working and ready status. The reference TUI renders aggregate capacity/activity in the composer rail and projects durable uncollected results into persistent notification items without copying completion text.
 - Child sessions keep the current user's filesystem, environment, credentials, extension, and network authority. Process isolation is fault containment, not a sandbox.
 - V1 remains direct-child only, with at most four live children and no peer messaging, role catalog, worktree isolation, parent-history fork, durable child resume, or procedural extension orchestration API.
 - RPC remains inspectable JSONL and does not become a multi-agent topology service.

@@ -23,7 +23,9 @@ import type {
   ExtensionCustomEntry,
   ExtensionMessageDelivery,
   ExtensionShutdownReason,
-  ExtensionStartReason
+  ExtensionStartReason,
+  ExtensionSubagentProfile,
+  ExtensionSubagentSnapshot
 } from "@with-zi/extension-api"
 
 import type {
@@ -66,7 +68,7 @@ import type { ProcessTreeTracker } from "./processes/process-tree.js"
 import { type ProjectFileSearch, type ProjectFileSearchResult } from "./project-file-search.js"
 import type { ProjectConfigurationAdmission } from "./project-trust.js"
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.js"
-import type { ResourceDiagnostic } from "./resource-diagnostics.js"
+import { maxResourceDiagnostics, type ResourceDiagnostic } from "./resource-diagnostics.js"
 import type { ResourceLoader, SessionResources } from "./resource-loader.js"
 import { boundedRetryError, retryAbortedMessage, retryDelayMs, waitForRetryDelay } from "./retry.js"
 import {
@@ -89,7 +91,7 @@ import type { SessionShell, ShellDemotionResult, ShellKillResult, ShellTaskSnaps
 import type { SettingsError, SettingsManager, SettingsScope } from "./settings-manager.js"
 import { expandSkillCommand, type Skill } from "./skills.js"
 import type { SlashCommand } from "./slash-commands.js"
-import type { SubagentSnapshot, SubagentStatus, SubagentSupervisor } from "./subagents/supervisor.js"
+import type { SubagentSnapshot, SubagentSupervisor } from "./subagents/supervisor.js"
 import { createSubagentTools } from "./subagents/tools.js"
 import { buildSystemPrompt } from "./system-prompt.js"
 
@@ -196,7 +198,6 @@ export type AgentSessionEvent =
   | { type: "steering_mode_changed"; mode: QueueMode }
   | { type: "follow_up_mode_changed"; mode: QueueMode }
   | { type: "shell_task_changed"; taskId: string }
-  | { type: "subagent_changed"; name: string }
   | {
       type: "authentication_changed"
       status: "logged_in" | "logged_out"
@@ -267,7 +268,7 @@ export interface SessionReloadResult {
   readonly settingsErrors: readonly SettingsError[]
 }
 
-export interface AgentSessionConfig {
+interface AgentSessionConfig {
   agent: Agent
   sessionManager: SessionManager
   settingsManager: SettingsManager
@@ -280,7 +281,7 @@ export interface AgentSessionConfig {
   codeMode?: CodeMode
   extensionHost?: ExtensionHost
   shell?: SessionShell
-  subagents?: SubagentSupervisor
+  subagentSupervisor?: SubagentSupervisor
   processTreeTracker?: ProcessTreeTracker
   model?: Model<Api>
   apiKeyProvider?: string
@@ -489,7 +490,7 @@ export class AgentSession {
       ? { type: "unbound", host: config.extensionHost }
       : { type: "absent" }
     this.#shell = config.shell
-    this.#subagents = config.subagents
+    this.#subagents = config.subagentSupervisor
     this.#processTreeTracker = config.processTreeTracker
     this.#apiKeyProvider = config.apiKeyProvider
     this.sessionManager = config.sessionManager
@@ -498,18 +499,36 @@ export class AgentSession {
     this.#agent.prepareNextTurnWithContext = (context, signal) => this.#prepareNextTurn(context, signal)
     this.#unsubscribeAgent = this.#agent.subscribe(event => this.#handleAgentEvent(event))
     this.#applyActiveTools()
-    this.#unbindExtensionTools = config.extensionHost?.bindToolCatalog(() => this.#applyActiveTools())
+    this.#unbindExtensionTools = config.extensionHost?.bindCatalog(() => this.#applyActiveTools())
     this.#unbindExtensionSessionOperations = config.extensionHost?.bindSessionOperations({
       getEntries: customType => this.#getExtensionCustomEntries(customType).map(extensionCustomEntry),
       appendEntry: (customType, data) => extensionCustomEntry(this.#appendExtensionCustomEntry(customType, data)),
       sendMessage: (message, delivery) => {
         this.#sendExtensionCustomMessage(message, delivery)
-      }
+      },
+      ...(this.#subagents
+        ? {
+            subagents: {
+              listProfiles: () => this.#subagentProfiles(),
+              spawn: (_extensionId, profile, name, prompt, signal) =>
+                this.#spawnSubagentFromProfile(profile, name, prompt, signal),
+              send: (_extensionId, name, text) => this.#requireSubagents().send(name, text),
+              continue: (_extensionId, name, text) => this.#requireSubagents().continue(name, text),
+              wait: (_extensionId, names, timeoutMs, signal) =>
+                this.#requireSubagents()
+                  .wait(names, timeoutMs, signal)
+                  .then(snapshots => snapshots.map(extensionSubagentSnapshot)),
+              interrupt: (_extensionId, name) => this.#requireSubagents().interrupt(name),
+              close: (_extensionId, name) => this.#requireSubagents().close(name).then(extensionSubagentSnapshot),
+              list: () => this.#requireSubagents().snapshots().map(extensionSubagentSnapshot)
+            }
+          }
+        : {})
     })
     this.#unsubscribeSubagents = this.#subagents?.subscribe(event => {
+      if (event.type !== "entry_appended") return
       try {
-        if (event.type === "changed") this.#emit({ type: "subagent_changed", name: event.name })
-        else this.#emit({ type: "entry_appended", entry: event.entry })
+        this.#emit({ type: "entry_appended", entry: event.entry })
       } catch {
         // Process ownership cannot cross into an observer.
       }
@@ -629,18 +648,6 @@ export class AgentSession {
     return this.#shell?.snapshots() ?? []
   }
 
-  get subagents(): readonly SubagentSnapshot[] {
-    return this.#subagents?.snapshots() ?? []
-  }
-
-  get runningSubagentCount(): number {
-    return this.#subagents?.runningCount() ?? 0
-  }
-
-  get subagentStatus(): SubagentStatus {
-    return this.#subagents?.status() ?? { workingNames: [], readyNames: [] }
-  }
-
   demoteForegroundShellTask(): ShellDemotionResult {
     this.#assertOpen()
     return this.#shell?.demoteForeground() ?? { type: "none" }
@@ -711,7 +718,35 @@ export class AgentSession {
   }
 
   get resourceDiagnostics(): readonly ResourceDiagnostic[] {
-    return this.#resources.diagnostics
+    const diagnostics = [...this.#resources.diagnostics]
+    const resources = new Map(this.#resources.subagentProfiles.map(profile => [profile.name, profile]))
+    const collisions: ResourceDiagnostic[] = []
+    for (const registered of this.#extensionHost?.subagentCatalog() ?? []) {
+      const winner = resources.get(registered.name)
+      if (!winner) continue
+      collisions.push(
+        Object.freeze({
+          type: "collision",
+          resource: "subagent-profile",
+          name: registered.name,
+          winnerPath: winner.filePath,
+          loserPath: registered.source.entryPath
+        })
+      )
+    }
+    const remaining = maxResourceDiagnostics - diagnostics.length
+    if (collisions.length <= remaining) return Object.freeze([...diagnostics, ...collisions])
+    if (remaining <= 0) return Object.freeze(diagnostics)
+    diagnostics.push(...collisions.slice(0, remaining - 1))
+    diagnostics.push(
+      Object.freeze({
+        type: "limit",
+        resource: "discovery",
+        limit: maxResourceDiagnostics,
+        message: `Resource diagnostics are limited to ${maxResourceDiagnostics} entries`
+      })
+    )
+    return Object.freeze(diagnostics)
   }
 
   listResourceCommands(): readonly SlashCommand[] {
@@ -820,6 +855,59 @@ export class AgentSession {
         : this.sessionManager.appendCustomEntry(customType, data)
     }
     return this.appendCustomEntry(customType, data)
+  }
+
+  #subagentProfiles(): readonly ExtensionSubagentProfile[] {
+    const profiles = new Map<string, ExtensionSubagentProfile>()
+    for (const resource of this.#resources.subagentProfiles) profiles.set(resource.name, resource)
+    for (const registered of this.#extensionHost?.subagentCatalog() ?? []) {
+      if (!profiles.has(registered.name)) profiles.set(registered.name, registered)
+    }
+    return Object.freeze([...profiles.values()])
+  }
+
+  async #spawnSubagentFromProfile(
+    profileName: string,
+    name: string,
+    prompt: string,
+    signal?: AbortSignal
+  ): Promise<string> {
+    const resource = this.#resources.subagentProfiles.find(candidate => candidate.name === profileName)
+    const registered = this.#extensionHost?.subagentCatalog().find(candidate => candidate.name === profileName)
+    const profile = resource ?? registered
+    if (!profile) throw new Error(`Unknown subagent profile: ${profileName}`)
+    const source = resource?.filePath ?? registered?.source.entryPath
+    let model: string | undefined
+    if (profile.model) {
+      const resolved = this.#modelRegistry.find(profile.model)
+      let available = false
+      try {
+        available =
+          resolved !== undefined &&
+          (resolved.provider === this.#apiKeyProvider || (await this.#modelRegistry.isConfigured(resolved)))
+      } catch (cause) {
+        throw new Error(
+          `Subagent profile ${profileName}${source ? ` from ${source}` : ""} requests unavailable model: ${profile.model}`,
+          { cause }
+        )
+      }
+      if (!resolved || !available) {
+        throw new Error(
+          `Subagent profile ${profileName}${source ? ` from ${source}` : ""} requests unavailable model: ${profile.model}`
+        )
+      }
+      model = `${resolved.provider}/${resolved.id}`
+    }
+    const task = `${profile.instructions.trimEnd()}\n\nTask:\n${prompt}`
+    return this.#requireSubagents().spawn(name, task, signal, {
+      ...(model ? { model } : {}),
+      ...(profile.thinking ? { thinkingLevel: profile.thinking } : {})
+    })
+  }
+
+  #requireSubagents(): SubagentSupervisor {
+    if (!this.#subagents) throw new Error("Subagent session operations are unavailable")
+    return this.#subagents
   }
 
   #sendExtensionCustomMessage(message: CustomMessageInput, delivery: ExtensionMessageDelivery): void {
@@ -1325,10 +1413,13 @@ export class AgentSession {
   }
 
   #applyActiveTools(): void {
-    const nativeTools = this.#subagents
-      ? Object.freeze([...this.#baseTools, ...createSubagentTools(this.#subagents)])
-      : this.#baseTools
-    const tools = admitExtensionTools(nativeTools, this.#extensionHost)
+    const profiles = this.#subagentProfiles()
+    const subagentTools = this.#subagents
+      ? createSubagentTools(profiles, this.#subagents, (profile, name, prompt, signal) =>
+          this.#spawnSubagentFromProfile(profile, name, prompt, signal)
+        )
+      : []
+    const tools = admitExtensionTools([...this.#baseTools, ...subagentTools], this.#extensionHost)
     this.#agent.state.tools = this.#codeMode ? [...tools, this.#codeMode.createTool(tools)] : [...tools]
     this.#agent.state.systemPrompt = buildSystemPrompt(
       this.sessionManager.header.cwd,
@@ -1564,18 +1655,9 @@ export class AgentSession {
     const contextTools = context.context.tools ?? []
     const toolsChanged =
       activeTools.length !== contextTools.length || activeTools.some((tool, index) => tool !== contextTools[index])
-    let synchronizedContext = toolsChanged
+    const synchronizedContext = toolsChanged
       ? { ...context.context, systemPrompt: this.#agent.state.systemPrompt, tools: [...activeTools] }
       : undefined
-    const subagentNotice = this.#subagents?.completionNotice()
-    if (subagentNotice) {
-      const source = synchronizedContext ?? context.context
-      synchronizedContext = {
-        ...source,
-        tools: source.tools ?? [],
-        messages: [...source.messages, subagentNoticeMessage(subagentNotice)]
-      }
-    }
     const synchronized = synchronizedContext ? { context: synchronizedContext } : undefined
 
     if (activity.thresholdSuppressed || !this.settingsManager.get().compactionEnabled) return synchronized
@@ -2649,6 +2731,29 @@ function userMessage(text: string, images: readonly ImageContent[]): AgentMessag
   return { role: "user", content: [{ type: "text", text }, ...images], timestamp: Date.now() }
 }
 
+function extensionSubagentSnapshot(snapshot: SubagentSnapshot): ExtensionSubagentSnapshot {
+  const completion = snapshot.completion
+  return Object.freeze({
+    name: snapshot.name,
+    lifecycle: snapshot.lifecycle,
+    resultReady: snapshot.completionDelivery === "durable",
+    ...(completion
+      ? {
+          completion: Object.freeze({
+            status: completion.status,
+            text: completion.text,
+            originalBytes: completion.originalBytes,
+            omittedBytes: completion.omittedBytes,
+            truncated: completion.truncated,
+            durationMs: completion.durationMs,
+            ...(completion.reason ? { reason: completion.reason } : {}),
+            ...(completion.error ? { error: completion.error } : {})
+          })
+        }
+      : {})
+  })
+}
+
 function extensionCustomEntry(entry: CustomEntry): ExtensionCustomEntry {
   return Object.freeze({
     id: entry.id,
@@ -2669,10 +2774,6 @@ function extensionMessageDelivery(delivery: ExtensionMessageDelivery): CustomMes
     default:
       return assertNever(delivery)
   }
-}
-
-function subagentNoticeMessage(content: string): RuntimeCustomMessage {
-  return { role: "custom", customType: "zi.subagent.notice", content, display: false, timestamp: Date.now() }
 }
 
 function runtimeCustomMessage(input: CustomMessageInput): RuntimeCustomMessage {

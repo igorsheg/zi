@@ -56,7 +56,7 @@ A successful request receives a correlated response:
 
 Operation failures use `ok: false` with `capacity`, `not_found`, or `operation_failed`. Invalid JSON and rejected request shapes produce `protocol_error` frames and do not close the connection. Invalid UTF-8 and oversized framing are fatal after one `invalid_framing` frame.
 
-`session_event` frames contain source-ordered `AgentSessionEvent` values. Model-change events use the public model projection described below instead of exposing provider configuration or credentials. `entry_appended` explicitly includes `custom`, `custom_message`, and native `subagent` journal variants. Message pages include displayed custom messages and omit hidden ones; a hidden custom message's committed entry event remains observable to the trusted process client. Native subagent lifecycle also emits `subagent_changed` with the affected direct-child name.
+`session_event` frames contain source-ordered `AgentSessionEvent` values. Model-change events use the public model projection described below instead of exposing provider configuration or credentials. `entry_appended` explicitly includes `custom`, `custom_message`, and substrate `subagent` journal variants. Message pages include displayed custom messages and omit hidden ones; a hidden custom message's committed entry event remains observable to the trusted process client. Child mechanics add no separate semantic session event.
 
 ## Methods
 
@@ -79,7 +79,7 @@ A direct prompt response means the input was admitted, not that provider work co
 
 `connection.set_events` is owned by the RPC connection, not `AgentSession`. Admission applies the mode synchronously in input order before its response is emitted. Mode `none` suppresses only `session_event` frames; `ready`, `response`, and `protocol_error` are never suppressed. The compatibility default remains `all`.
 
-RPC remains a transport for one parent session. A root session's model may use the seven native subagent tools through ordinary tool calls, and clients may observe their tool, journal, and semantic events. V1 deliberately adds no `agent.*` topology methods or direct external subagent control plane.
+RPC remains a transport for one parent session. Profile-driven standard delegation tools and optional extension-defined orchestration appear as ordinary tools; their durable substrate evidence may appear as journal-entry events. RPC deliberately adds no `agent.*` topology methods or direct external subagent control plane.
 
 Public model descriptors contain only `provider`, `id`, `name`, `reasoning`, `input`, `contextWindow`, and `maxTokens`. Catalog results add `configured`. Base URLs, headers, compatibility settings, prices, and credentials do not cross RPC.
 

@@ -29,6 +29,10 @@ export interface PromptSubmission {
   readonly delivery: PendingInputDelivery
 }
 
+export type AutomaticCompactionNoticeEvent =
+  | { readonly type: "failed"; readonly message: string }
+  | { readonly type: "completed" }
+
 export interface InteractiveState {
   readonly session: AgentSession
   readonly generation: number
@@ -49,7 +53,7 @@ export interface InteractiveStore {
   restoreQueuedInputs(): QueuedInputs
   abortAndRestoreQueuedInputs(): AbortedQueuedInputs
   backgroundForegroundShellTask(): ShellDemotionResult
-  subscribeAutomaticCompactionFailure(listener: (message: string) => void): () => void
+  subscribeAutomaticCompaction(listener: (event: AutomaticCompactionNoticeEvent) => void): () => void
   dispose(): void
 }
 
@@ -62,7 +66,7 @@ export function createInteractiveStore(session: AgentSession): InteractiveStore 
   const $transcriptRevision = computed($state, state => state.transcriptRevision)
   const $activeTools = computed($state, state => state.tools)
   let unsubscribeSession: (() => void) | undefined
-  const automaticCompactionFailureListeners = new Set<(message: string) => void>()
+  const automaticCompactionListeners = new Set<(event: AutomaticCompactionNoticeEvent) => void>()
   let disposed = false
 
   const currentSession = (): AgentSession => {
@@ -76,12 +80,15 @@ export function createInteractiveStore(session: AgentSession): InteractiveStore 
       const current = $state.get()
       const next = transitionInteractiveState(current, event)
       if (next !== current) $state.set(next)
-      if (event.type === "compaction_end" && event.reason !== "manual" && event.outcome.type === "failed") {
-        for (const listener of automaticCompactionFailureListeners) {
-          try {
-            listener(event.outcome.message)
-          } catch {
-            // Presentation observers cannot change the admitted session transition.
+      if (event.type === "compaction_end") {
+        const noticeEvent = compactionNoticeEvent(event)
+        if (noticeEvent) {
+          for (const listener of automaticCompactionListeners) {
+            try {
+              listener(noticeEvent)
+            } catch {
+              // Presentation observers cannot change the admitted session transition.
+            }
           }
         }
       }
@@ -128,19 +135,28 @@ export function createInteractiveStore(session: AgentSession): InteractiveStore 
     backgroundForegroundShellTask() {
       return currentSession().demoteForegroundShellTask()
     },
-    subscribeAutomaticCompactionFailure(listener) {
+    subscribeAutomaticCompaction(listener) {
       if (disposed) throw new Error("InteractiveStore is disposed")
-      automaticCompactionFailureListeners.add(listener)
-      return () => automaticCompactionFailureListeners.delete(listener)
+      automaticCompactionListeners.add(listener)
+      return () => automaticCompactionListeners.delete(listener)
     },
     dispose() {
       if (disposed) return
       disposed = true
       unsubscribeSession?.()
       unsubscribeSession = undefined
-      automaticCompactionFailureListeners.clear()
+      automaticCompactionListeners.clear()
     }
   }
+}
+
+export function compactionNoticeEvent(event: AgentSessionEvent): AutomaticCompactionNoticeEvent | undefined {
+  if (event.type !== "compaction_end") return undefined
+  if (event.outcome.type === "completed") return { type: "completed" }
+  if (event.reason !== "manual" && event.outcome.type === "failed") {
+    return { type: "failed", message: event.outcome.message }
+  }
+  return undefined
 }
 
 export function initialInteractiveState(session: AgentSession): InteractiveState {
@@ -239,7 +255,6 @@ export function transitionInteractiveState(state: InteractiveState, event: Agent
     case "steering_mode_changed":
     case "follow_up_mode_changed":
     case "shell_task_changed":
-    case "subagent_changed":
       promptRevision++
       break
     case "turn_start":

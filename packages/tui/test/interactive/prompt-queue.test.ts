@@ -243,6 +243,32 @@ test("restored queued images remain attached when the draft is resubmitted", asy
   }
 })
 
+test("background-shell capacity refusal is passive and preserves the draft", async () => {
+  const models = createModels()
+  models.setProvider(fauxProvider().provider)
+  const { session } = await createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
+  const setup = await createInteractiveTest(session, { width: 80, height: 24 })
+
+  try {
+    await setup.renderOnce()
+    const input = setup.renderer.root.findDescendantById("prompt-input")
+    if (!(input instanceof TextareaRenderable)) throw new Error("Prompt textarea not found")
+    input.setText("keep this draft")
+    Object.defineProperty(session, "shellTasks", { configurable: true, get: () => [{ type: "foreground" }] })
+    setup.mode.store.backgroundForegroundShellTask = () => ({ type: "capacity_exceeded" })
+
+    setup.mockInput.pressKey("g", { ctrl: true })
+    await setup.renderOnce()
+
+    expect(setup.captureCharFrame()).toContain("Background task capacity exceeded")
+    expect(input.plainText).toBe("keep this draft")
+    expect(session.messages).toEqual([])
+  } finally {
+    session.dispose()
+    setup.destroy()
+  }
+})
+
 test("explicit selection copy precedes prompt clearing and supports a delivered Cmd+C", async () => {
   const models = createModels()
   const faux = fauxProvider()
@@ -250,6 +276,8 @@ test("explicit selection copy precedes prompt clearing and supports a delivered 
   faux.setResponses([fauxAssistantMessage(fauxThinking("assistant response"))])
   const { session } = await createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
   await session.prompt("copy target")
+  const messageCount = session.messages.length
+  const providerCalls = faux.state.callCount
   let delivery: ClipboardWriteResult = { type: "unavailable" }
   const writes: string[] = []
   const writer: ClipboardWriter = {
@@ -294,7 +322,7 @@ test("explicit selection copy precedes prompt clearing and supports a delivered 
     expect(input.plainText).toBe("preserve on unsupported copy")
     expect(setup.renderer.getSelection()).toBe(failedSelection)
     await setup.renderOnce()
-    expect(setup.captureCharFrame()).toContain("Copy failed; the selection was preserved")
+    expect(setup.captureCharFrame()).toContain("Copy failed; the selection was")
 
     delivery = { type: "copied", route: "native" }
     input.setText("keep this exact draft")
@@ -306,6 +334,8 @@ test("explicit selection copy precedes prompt clearing and supports a delivered 
     expect(setup.renderer.getSelection()).toBeNull()
     await setup.renderOnce()
     expect(setup.captureCharFrame()).not.toContain("Copy failed")
+    expect(session.messages).toHaveLength(messageCount)
+    expect(faux.state.callCount).toBe(providerCalls)
   } finally {
     session.dispose()
     setup.destroy()

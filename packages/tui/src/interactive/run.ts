@@ -5,12 +5,14 @@ import { defaultTheme } from "../theme.js"
 import type { TuiDiagnosticFlags } from "./diagnostics.js"
 import type { InteractiveKeybindingOverrides } from "./interactive-keybindings.js"
 import { InteractiveMode } from "./interactive-mode.js"
+import type { NotificationCenterOptions } from "./notifications.js"
 
 export interface RunTuiOptions {
   readonly session?: AgentSession
   readonly sessionRuntime?: AgentSessionRuntime
   readonly initialMessages?: readonly string[]
   readonly keybindingOverrides?: InteractiveKeybindingOverrides
+  readonly notificationOptions?: NotificationCenterOptions
   readonly bootstrapDiagnostic?: SessionBootstrapDiagnostic
 }
 
@@ -25,7 +27,7 @@ type RunState =
 const shutdownTimeoutMs = 5_000
 
 export async function runTui(options: RunTuiOptions): Promise<void> {
-  const { initialMessages = [], keybindingOverrides, sessionRuntime } = options
+  const { initialMessages = [], keybindingOverrides, notificationOptions, sessionRuntime } = options
   const session = sessionRuntime?.session ?? options.session
   if (!session) throw new Error("runTui requires a session or session runtime")
   const diagnostics = readDiagnosticFlags(process.env)
@@ -101,6 +103,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       ...(sessionRuntime ? { sessionRuntime } : {}),
       onExit: () => void requestClose("interactive"),
       diagnostics,
+      ...(notificationOptions ? { notificationOptions } : {}),
       ...(bootstrapDiagnostic ? { bootstrapDiagnostic } : {}),
       ...(keybindingOverrides ? { keybindingOverrides } : {})
     })

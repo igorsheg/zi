@@ -78,11 +78,7 @@ export class PromptFeedbackView {
 function feedbackLines(feedback: PromptFeedback, width: number, theme: Theme): CeremonyLine[] {
   if (feedback.type === "none") return []
   const color =
-    feedback.type === "error"
-      ? theme.text.error
-      : feedback.type === "warning" || feedback.type === "copy_warning"
-        ? theme.text.warning
-        : theme.text.muted
+    feedback.type === "error" ? theme.text.error : feedback.type === "warning" ? theme.text.warning : theme.text.muted
   return [{ kind: "status", content: textLine(color, feedback.message, width) }]
 }
 

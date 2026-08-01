@@ -1587,52 +1587,6 @@ test("source bodies keep semantic starting line numbers in the lightweight panel
   }
 })
 
-test("subagent rows stay concise until details are requested", async () => {
-  const setup = await createTestRenderer({ width: 72, height: 12, useThread: false })
-  const projected = projectToolPresentation({
-    status: "done",
-    name: "spawn_subagent",
-    args: { name: "shutdown-reviewer", prompt: "Review shutdown behavior" },
-    result: {
-      content: [{ type: "text", text: JSON.stringify({ name: "shutdown-reviewer" }) }],
-      details: {
-        type: "subagent",
-        outcome: "success",
-        operation: "spawn",
-        agent: { name: "shutdown-reviewer", lifecycle: "running", workCycle: 1 }
-      }
-    }
-  })
-  const view = new ToolCallView(
-    setup.renderer,
-    "spawn-agent",
-    frame("done", projected),
-    defaultTheme,
-    "/work",
-    "Ctrl+O"
-  )
-  setup.renderer.root.add(view.root)
-
-  try {
-    await setup.renderOnce()
-    const compact = setup.captureCharFrame()
-    expect(compact).toContain("◆ Started Shutdown reviewer · Review shutdown behavior")
-    expect(compact).not.toContain("agent_id")
-    expect(compact).not.toContain("│ Review shutdown behavior")
-    expect(compact).not.toContain("spawn_subagent")
-
-    view.setExpanded(true)
-    await setup.renderOnce()
-    const detailed = setup.captureCharFrame()
-    expect(detailed).toContain("│ Review shutdown behavior")
-    expect(detailed).not.toContain("Agent id")
-    expect(detailed).toContain("╰───")
-  } finally {
-    view.destroy()
-    setup.renderer.destroy()
-  }
-})
-
 function descendants(root: Renderable): Renderable[] {
   const result: Renderable[] = []
   const pending = [...root.getChildren()]

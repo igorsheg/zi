@@ -72,7 +72,9 @@ export async function createUnboundAgentRuntime(requested: CreateAgentRuntimeOpt
   const extensions = discoverExtensionLoadPlan(paths, project, options.extensionPaths ?? [])
   const processTreeTracker = createProcessTreeTracker()
   const extensionHost = new ExtensionHost(
-    createExtensionWorkerSpawner(options.extensionWorkerCommand ?? defaultExtensionWorkerCommand, processTreeTracker)
+    createExtensionWorkerSpawner(options.extensionWorkerCommand ?? defaultExtensionWorkerCommand, processTreeTracker),
+    undefined,
+    { subagents: options.subagentCommand !== undefined && options.internalSubagentDepth !== 1 }
   )
   let shell: SessionShell | undefined
   try {

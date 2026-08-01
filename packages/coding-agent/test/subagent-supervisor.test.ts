@@ -25,11 +25,8 @@ test("SubagentSupervisor spawns, durably publishes completion, waits, and closes
     })
     expect(harness.supervisor.status()).toEqual({ workingNames: [name], readyNames: [] })
 
-    await waitFor(() => harness.supervisor.completionNotice() !== undefined, 5_000)
+    await waitFor(() => harness.supervisor.status().readyNames.length > 0, 5_000)
     expect(harness.supervisor.status()).toEqual({ workingNames: [], readyNames: [name] })
-    expect(harness.supervisor.completionNotice()).toBe(
-      `Subagents completed: project-inspector. Call wait_subagents for their output.`
-    )
     expect(harness.sessionManager.subagentEntries().at(-1)).toMatchObject({
       event: "work_cycle_finished",
       name,
@@ -54,7 +51,6 @@ test("SubagentSupervisor spawns, durably publishes completion, waits, and closes
     })
     expect(harness.supervisor.snapshots()[0]).toMatchObject({ completionDelivery: "delivered" })
     expect(harness.supervisor.status()).toEqual({ workingNames: [], readyNames: [] })
-    expect(harness.supervisor.completionNotice()).toBeUndefined()
 
     await harness.supervisor.close(name)
     expect(harness.supervisor.snapshots()[0]).toMatchObject({ name, lifecycle: "exited" })
@@ -222,6 +218,7 @@ test("SubagentSupervisor interrupts a child and reuses it for another cycle", as
 test("SubagentSupervisor admits four live children and rejects a fifth", async () => {
   const harness = await createHarness("capacity", { delayMs: 20 })
   try {
+    expect(harness.supervisor.capacity()).toEqual({ live: 0, maximum: 4 })
     const names: string[] = []
     for (let index = 0; index < 4; index++) {
       // oxlint-disable-next-line no-await-in-loop -- capacity is admitted one child at a time
@@ -230,9 +227,12 @@ test("SubagentSupervisor admits four live children and rejects a fifth", async (
 
     expect(new Set(names).size).toBe(4)
     expect(harness.supervisor.snapshots()).toHaveLength(4)
+    expect(harness.supervisor.capacity()).toEqual({ live: 4, maximum: 4 })
     expect(harness.supervisor.spawn("extra-worker", "one too many")).rejects.toThrow(
       "Subagent capacity exceeded: at most 4 live children"
     )
+    await harness.supervisor.close(names[0]!)
+    expect(harness.supervisor.capacity()).toEqual({ live: 3, maximum: 4 })
   } finally {
     await harness.dispose()
   }
@@ -319,7 +319,6 @@ test("recovered completion and exited projections stay bounded", async () => {
   try {
     expect(supervisor.snapshots()).toHaveLength(32)
     expect(supervisor.snapshots()[0]?.name).toBe("worker-8")
-    expect(supervisor.completionNotice()?.split(",").length).toBeLessThanOrEqual(16)
     expect(supervisor.spawn("worker-0", "duplicate evicted child")).rejects.toThrow(
       "Subagent name already in use: worker-0"
     )

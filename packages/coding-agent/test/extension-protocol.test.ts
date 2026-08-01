@@ -13,6 +13,11 @@ import {
   maxExtensionIdBytes,
   maxExtensionProtocolFrameBytes,
   maxExtensionQueuedWrites,
+  maxExtensionSubagentDescriptionBytes,
+  maxExtensionSubagentInstructionsBytes,
+  maxExtensionSubagentModelBytes,
+  maxExtensionSubagentNameBytes,
+  maxExtensionSubagentProfiles,
   maxExtensionToolArgumentsBytes,
   maxExtensionToolCatalogBytes,
   maxExtensionToolDescriptionBytes,
@@ -299,6 +304,111 @@ test("session-operation protocol validates source, values, delivery, and bounded
   ).toThrow("session operation error")
 })
 
+test("subagent protocol bounds profiles, operations, snapshots, and cancellation", () => {
+  const profile = {
+    source,
+    name: "finder",
+    description: "Find evidence",
+    instructions: "Find only requested evidence",
+    thinking: "high"
+  }
+  const ready = validateWorkerMessage({
+    type: "ready",
+    protocolVersion: extensionProtocolVersion,
+    generation: 1,
+    extensions: [{ source, status: "loaded" }],
+    tools: [],
+    subagents: [profile]
+  })
+  expect(ready).toMatchObject({ subagents: [{ name: "finder", thinking: "high" }] })
+  expect(Object.isFrozen(ready.type === "ready" ? ready.subagents?.[0] : undefined)).toBe(true)
+  expect(() =>
+    validateWorkerMessage({
+      type: "ready",
+      protocolVersion: extensionProtocolVersion,
+      generation: 1,
+      extensions: [{ source, status: "loaded" }],
+      tools: [],
+      subagents: [profile, profile]
+    })
+  ).toThrow("unique")
+  expect(() =>
+    validateWorkerMessage({
+      type: "ready",
+      protocolVersion: extensionProtocolVersion,
+      generation: 1,
+      extensions: [{ source, status: "loaded" }],
+      tools: [],
+      subagents: [{ ...profile, instructions: "x".repeat(maxExtensionSubagentInstructionsBytes + 1) }]
+    })
+  ).toThrow(`${maxExtensionSubagentInstructionsBytes}`)
+  expect(() =>
+    validateWorkerMessage({
+      type: "ready",
+      protocolVersion: extensionProtocolVersion,
+      generation: 1,
+      extensions: [{ source, status: "loaded" }],
+      tools: [],
+      subagents: [{ ...profile, description: " \n ", instructions: " \t " }]
+    })
+  ).toThrow("blank")
+  expect(() =>
+    validateWorkerMessage({
+      type: "ready",
+      protocolVersion: extensionProtocolVersion,
+      generation: 1,
+      extensions: [{ source, status: "loaded" }],
+      tools: [],
+      subagents: [{ ...profile, model: "   " }]
+    })
+  ).toThrow("blank")
+  expect(
+    validateWorkerMessage({
+      type: "ready",
+      protocolVersion: extensionProtocolVersion,
+      generation: 1,
+      extensions: [{ source, status: "loaded" }],
+      tools: [],
+      subagents: [
+        {
+          ...profile,
+          description: "d".repeat(maxExtensionSubagentDescriptionBytes),
+          instructions: "i".repeat(maxExtensionSubagentInstructionsBytes),
+          model: "m".repeat(maxExtensionSubagentModelBytes)
+        }
+      ]
+    })
+  ).toMatchObject({ subagents: [{ name: "finder" }] })
+  expect(() =>
+    validateWorkerMessage({
+      type: "subagent_spawn",
+      generation: 1,
+      requestId: 2,
+      extensionId: source.id,
+      profile: "finder",
+      name: "x".repeat(maxExtensionSubagentNameBytes + 1),
+      prompt: "inspect"
+    })
+  ).toThrow(`${maxExtensionSubagentNameBytes}`)
+  expect(
+    validateWorkerMessage({
+      type: "subagent_operation_cancel",
+      generation: 1,
+      requestId: 2,
+      extensionId: source.id,
+      targetRequestId: 2
+    })
+  ).toMatchObject({ type: "subagent_operation_cancel", targetRequestId: 2 })
+  expect(
+    validateHostMessage({
+      type: "subagent_wait_result",
+      generation: 1,
+      requestId: 2,
+      snapshots: [{ name: "finder-1", lifecycle: "idle", resultReady: false }]
+    })
+  ).toMatchObject({ type: "subagent_wait_result", snapshots: [{ name: "finder-1", lifecycle: "idle" }] })
+})
+
 test("maximum admitted load results fit in one protocol frame", () => {
   const path = resolve("root", '"'.repeat(3_500))
   const largestSource: ExtensionSource = {
@@ -346,7 +456,7 @@ test("tool catalogs have one aggregate ready-frame budget", () => {
   ).toThrow(`catalog cannot exceed ${maxExtensionToolCatalogBytes} bytes`)
 })
 
-test("maximum source results and an aggregate tool catalog fit one ready frame", () => {
+test("ready-frame validation bounds combined source, tool, and subagent catalogs", () => {
   const path = resolve("root", '"'.repeat(3_500))
   const largestSource: ExtensionSource = {
     id: "x".repeat(maxExtensionIdBytes),
@@ -368,15 +478,35 @@ test("maximum source results and an aggregate tool catalog fit one ready frame",
     parameters: { type: "object", properties: {} },
     outputSchema: { type: "string" }
   }))
-  const message = validateWorkerMessage({
+  const subagents = Array.from({ length: maxExtensionSubagentProfiles }, (_, index) => ({
+    source,
+    name: `profile-${index}`,
+    description: "d".repeat(maxExtensionSubagentDescriptionBytes),
+    instructions: "i".repeat(maxExtensionSubagentInstructionsBytes),
+    model: "m".repeat(maxExtensionSubagentModelBytes)
+  }))
+  expect(() =>
+    validateWorkerMessage({
+      type: "ready",
+      protocolVersion: extensionProtocolVersion,
+      generation: 1,
+      extensions: [...Array.from({ length: maxExtensionSources - 1 }, () => failed), { source, status: "loaded" }],
+      tools,
+      subagents
+    })
+  ).toThrow(`ready frame cannot exceed ${maxExtensionProtocolFrameBytes} bytes`)
+
+  const maximumProfiles = validateWorkerMessage({
     type: "ready",
     protocolVersion: extensionProtocolVersion,
     generation: 1,
-    extensions: [...Array.from({ length: maxExtensionSources - 1 }, () => failed), { source, status: "loaded" }],
-    tools
+    extensions: [{ source, status: "loaded" }],
+    tools: [],
+    subagents
   })
-
-  expect(encodeExtensionProtocolFrame(message).byteLength).toBeLessThanOrEqual(maxExtensionProtocolFrameBytes + 4)
+  expect(encodeExtensionProtocolFrame(maximumProfiles).byteLength).toBeLessThanOrEqual(
+    maxExtensionProtocolFrameBytes + 4
+  )
 })
 
 test("diagnostic construction truncates UTF-8 on a complete code point", () => {

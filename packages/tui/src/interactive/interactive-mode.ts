@@ -26,10 +26,19 @@ import { ExitGestureController } from "./exit-gesture.js"
 import { type ExternalEditor, SystemExternalEditor } from "./external-editor.js"
 import { InteractiveKeybindings, type InteractiveKeybindingOverrides } from "./interactive-keybindings.js"
 import { createInteractiveStore, type InteractiveStore } from "./interactive-store.js"
+import {
+  NotificationCenter,
+  type NotificationAPI,
+  type NotificationCenterOptions,
+  type NotificationLevel,
+  type NotificationOptions,
+  validateNotificationCenterOptions
+} from "./notifications.js"
 import type { PromptSessionActions } from "./prompt/store.js"
 import { SessionScreen } from "./screen.js"
 import { SelectionCopyController } from "./selection-copy.js"
 import { SlashController } from "./slash-controller.js"
+import { SystemNotificationPresenter, type SystemNoticeActions } from "./system-notifications.js"
 import type { TranscriptDiagnostics } from "./transcript/view.js"
 
 type InitialProjectTrustState =
@@ -48,12 +57,14 @@ export interface InteractiveModeOptions {
   readonly clipboardWriter?: ClipboardWriter
   readonly externalEditor?: ExternalEditor
   readonly diagnostics?: TuiDiagnosticFlags
+  readonly notificationOptions?: NotificationCenterOptions
   readonly bootstrapDiagnostic?: SessionBootstrapDiagnostic
 }
 
 export class InteractiveMode {
   readonly root: BoxRenderable
   readonly store: InteractiveStore
+  readonly notifications: NotificationAPI
 
   readonly #renderer: CliRenderer
   readonly #sessionRuntime: AgentSessionRuntime | undefined
@@ -70,6 +81,8 @@ export class InteractiveMode {
   readonly #selectionCopy: SelectionCopyController
   readonly #diagnosticFlags: TuiDiagnosticFlags
   readonly #diagnostics: TuiDiagnosticsOverlay | undefined
+  readonly #notifications: NotificationCenter
+  readonly #systemNotifications: SystemNotificationPresenter
   #initialProjectTrust = createInitialProjectTrustState()
   #screen: SessionScreen
   #releaseGeneration: () => void
@@ -87,11 +100,13 @@ export class InteractiveMode {
     clipboardWriter,
     externalEditor,
     diagnostics = { showTimeToFirstDraw: false, showStats: false, showMemory: false },
+    notificationOptions,
     bootstrapDiagnostic
   }: InteractiveModeOptions) {
     if (sessionRuntime && sessionRuntime.session !== session) {
       throw new Error("InteractiveMode session must be the session runtime current session")
     }
+    validateNotificationCenterOptions(notificationOptions)
     this.#renderer = renderer
     this.#sessionRuntime = sessionRuntime
     this.#sessionActions = sessionRuntime
@@ -109,7 +124,12 @@ export class InteractiveMode {
             const next = await sessionRuntime.decideProjectTrust(selection)
             if (!this.#disposed) this.replaceSession(next.session, next.bootstrapDiagnostic)
           },
-          dismissProjectTrust: () => this.#settleInitialProjectTrust(),
+          dismissProjectTrust: () => {
+            if (!this.#disposed) {
+              this.#systemNotifications.setProjectTrust("Project .zi configuration remains disabled for this session")
+            }
+            this.#settleInitialProjectTrust()
+          },
           cancelReplacement: () => sessionRuntime.cancelReplacement()
         }
       : undefined
@@ -131,8 +151,8 @@ export class InteractiveMode {
       this.#keybindings,
       this.#clipboardWriter,
       () => this.#exitGestures.consume(),
-      () => this.#clearCopyWarning(),
-      message => this.#showCopyWarning(message)
+      () => this.#systemNotifications.copySucceeded(),
+      message => this.#systemNotifications.copyFailed(message)
     )
     this.#diagnosticFlags = diagnostics
     this.root = new BoxRenderable(renderer, {
@@ -142,8 +162,35 @@ export class InteractiveMode {
       flexDirection: "column",
       backgroundColor: theme.surface.app
     })
-    this.#screen = this.#createScreen()
-    this.root.add(this.#screen.root)
+    const notifications = new NotificationCenter(renderer, theme, notificationOptions)
+    let systemNotifications: SystemNotificationPresenter
+    try {
+      systemNotifications = new SystemNotificationPresenter(this.store, notifications)
+    } catch (cause) {
+      notifications.dispose()
+      throw cause
+    }
+    let screen: SessionScreen
+    try {
+      screen = this.#createScreen(systemNotifications)
+    } catch (cause) {
+      systemNotifications.dispose()
+      notifications.dispose()
+      throw cause
+    }
+    try {
+      this.root.add(screen.root)
+      notifications.attach(screen.transcript.root)
+    } catch (cause) {
+      screen.destroy()
+      systemNotifications.dispose()
+      notifications.dispose()
+      throw cause
+    }
+    this.#notifications = notifications
+    this.notifications = notifications
+    this.#systemNotifications = systemNotifications
+    this.#screen = screen
     this.#diagnostics =
       diagnostics.showTimeToFirstDraw || diagnostics.showStats || diagnostics.showMemory
         ? new TuiDiagnosticsOverlay(
@@ -163,6 +210,10 @@ export class InteractiveMode {
     this.#showBootstrapWarning(bootstrapDiagnostic)
     this.#showExtensionWarning(session)
     this.#presentProjectTrust(sessionRuntime?.projectTrust)
+  }
+
+  notify(msg: string | null | undefined, level?: NotificationLevel | null, opts?: NotificationOptions): void {
+    this.#notifications.notify(msg, level, opts)
   }
 
   waitForInitialProjectTrust(): Promise<void> {
@@ -195,6 +246,8 @@ export class InteractiveMode {
     this.#selectionCopy.dispose()
     this.#renderer.off(CliRenderEvents.SELECTION, this.#preservePromptFocus)
     this.#diagnostics?.destroy()
+    this.#systemNotifications.dispose()
+    this.#notifications.dispose()
     this.#screen.destroy()
     this.#externalEditor.dispose()
     this.#browserOpener.dispose()
@@ -208,35 +261,44 @@ export class InteractiveMode {
   }
 
   #showBootstrapWarning(diagnostic: SessionBootstrapDiagnostic | undefined): void {
-    if (diagnostic) this.#screen.prompt.showWarning(diagnostic.message)
+    this.#systemNotifications.setBootstrap(diagnostic?.message)
   }
 
   #showExtensionWarning(session: AgentSession): void {
     const snapshot = session.extensionHostSnapshot
-    if (!snapshot) return
+    if (!snapshot) {
+      this.#systemNotifications.setExtension(undefined)
+      return
+    }
     const diagnostic = snapshot.diagnostics[0] ?? snapshot.failure
-    if (!diagnostic) return
+    if (!diagnostic) {
+      this.#systemNotifications.setExtension(undefined)
+      return
+    }
     const source = diagnostic.path ? `${basename(diagnostic.path)}: ` : ""
     const omitted = snapshot.omittedDiagnostics + Math.max(0, snapshot.diagnostics.length - 1)
     const suffix = omitted > 0 ? ` (${omitted} additional diagnostics)` : ""
-    this.#screen.prompt.showWarning(`Extension ${source}${diagnostic.message.replace(/[\r\n]+/g, " ")}${suffix}`)
+    this.#systemNotifications.setExtension(`Extension ${source}${diagnostic.message.replace(/[\r\n]+/g, " ")}${suffix}`)
   }
 
   #presentProjectTrust(trust: ProjectTrustResolution | undefined): void {
     if (!trust) {
+      this.#systemNotifications.setProjectTrust(undefined)
       this.#settleInitialProjectTrust()
       return
     }
     switch (trust.type) {
       case "unresolved":
+        this.#systemNotifications.setProjectTrust(undefined)
         this.#screen.prompt.requestProjectTrust(trust.cwd)
         return
       case "untrusted":
-        if (trust.diagnostic) this.#screen.prompt.showWarning(trust.diagnostic.message)
+        this.#systemNotifications.setProjectTrust(trust.diagnostic?.message)
         this.#settleInitialProjectTrust()
         return
       case "trusted":
       case "not_required":
+        this.#systemNotifications.setProjectTrust(undefined)
         this.#settleInitialProjectTrust()
         return
       default:
@@ -251,22 +313,16 @@ export class InteractiveMode {
     trust.resolve()
   }
 
-  #showCopyWarning(message: string): void {
-    if (!this.#disposed) this.#screen.prompt.showCopyWarning(message)
-  }
-
-  #clearCopyWarning(): void {
-    if (!this.#disposed) this.#screen.prompt.clearCopyWarning()
-  }
-
   #replaceScreen(): void {
+    this.#notifications.detach()
     this.#screen.destroy()
-    this.#screen = this.#createScreen()
+    this.#screen = this.#createScreen(this.#systemNotifications)
     this.root.add(this.#screen.root)
+    this.#notifications.attach(this.#screen.transcript.root)
     this.#screen.prompt.focus()
   }
 
-  #createScreen(): SessionScreen {
+  #createScreen(systemNotices: SystemNoticeActions): SessionScreen {
     return new SessionScreen(
       this.#renderer,
       this.store,
@@ -279,6 +335,7 @@ export class InteractiveMode {
       this.#theme,
       this.#syntaxStyle,
       this.#diagnosticFlags.showTimeToFirstDraw || this.#diagnosticFlags.showStats || this.#diagnosticFlags.showMemory,
+      systemNotices,
       this.#sessionActions
     )
   }

@@ -101,6 +101,7 @@ test("interactive mode presents source-attributed extension failures", async () 
     const frame = setup.captureCharFrame()
     expect(frame).toContain("Extension")
     expect(frame).toContain("failed.ts: factory failed")
+    expect(frame).toContain("System ❰❰")
   } finally {
     setup.destroy()
     runtime.session.dispose()

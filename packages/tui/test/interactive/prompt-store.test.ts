@@ -17,6 +17,7 @@ import { createInteractiveStore } from "../../src/interactive/interactive-store.
 import { fileCompletionInputFromText } from "../../src/interactive/prompt/file-completion.js"
 import { createPromptStore, type PromptSessionActions } from "../../src/interactive/prompt/store.js"
 import { SlashController } from "../../src/interactive/slash-controller.js"
+import type { ReloadNoticeOutcome, SystemNoticeActions } from "../../src/interactive/system-notifications.js"
 
 test("prompt store restores queued text, images, and status without a renderer", async () => {
   const session = await createSession("restore")
@@ -115,7 +116,8 @@ test("reload command awaits session reload, invalidates slash catalog, and repor
     }),
     () => generation
   )
-  const prompt = createPromptStore(mode, slash)
+  const notices = captureSystemNotices()
+  const prompt = createPromptStore(mode, slash, undefined, undefined, notices.actions)
   let reloaded = false
   session.reload = async () => {
     reloaded = true
@@ -149,10 +151,9 @@ test("reload command awaits session reload, invalidates slash catalog, and repor
     expect(prompt.$state.get().workflow.type).toBe("reloading")
     await Bun.sleep(0)
     expect(reloaded).toBe(true)
-    expect(prompt.$state.get()).toMatchObject({
-      feedback: { type: "status", message: "Reloaded settings, resources, and extensions" },
-      workflow: { type: "idle" }
-    })
+    expect(prompt.$state.get()).toMatchObject({ feedback: { type: "none" }, workflow: { type: "idle" } })
+    expect(notices.reloads).toEqual([{ outcome: "success", message: "Reloaded settings, resources, and extensions" }])
+    expect(session.messages).toEqual([])
     expect(slash.suggestions("/dep", 4)[0]?.name).toBe("deploy")
     expect(reads).toBe(2)
   } finally {
@@ -164,7 +165,8 @@ test("reload command awaits session reload, invalidates slash catalog, and repor
 test("reload feedback surfaces the first source-attributed diagnostic", async () => {
   const session = await createSession("reload-diagnostics")
   const mode = createInteractiveStore(session)
-  const prompt = createPromptStore(mode, new SlashController())
+  const notices = captureSystemNotices()
+  const prompt = createPromptStore(mode, new SlashController(), undefined, undefined, notices.actions)
   session.reload = async () => ({
     resources: {
       ...session.resources,
@@ -196,13 +198,13 @@ test("reload feedback surfaces the first source-attributed diagnostic", async ()
   try {
     expect(prompt.submit("/reload", "steer")).toBe(true)
     await Bun.sleep(0)
-    expect(prompt.$state.get()).toMatchObject({
-      feedback: {
-        type: "warning",
+    expect(prompt.$state.get()).toMatchObject({ feedback: { type: "none" }, workflow: { type: "idle" } })
+    expect(notices.reloads).toEqual([
+      {
+        outcome: "warning",
         message: "Reloaded settings, resources, and extensions: /tmp/extensions/bad.ts: Cannot find module (+3 more)"
-      },
-      workflow: { type: "idle" }
-    })
+      }
+    ])
   } finally {
     mode.dispose()
     session.dispose()
@@ -212,7 +214,8 @@ test("reload feedback surfaces the first source-attributed diagnostic", async ()
 test("reload remaining count includes omitted extension diagnostics behind settings errors", async () => {
   const session = await createSession("reload-omitted-remaining")
   const mode = createInteractiveStore(session)
-  const prompt = createPromptStore(mode, new SlashController())
+  const notices = captureSystemNotices()
+  const prompt = createPromptStore(mode, new SlashController(), undefined, undefined, notices.actions)
   session.reload = async () => ({
     resources: session.resources,
     extensions: {
@@ -237,13 +240,35 @@ test("reload remaining count includes omitted extension diagnostics behind setti
   try {
     expect(prompt.submit("/reload", "steer")).toBe(true)
     await Bun.sleep(0)
-    expect(prompt.$state.get()).toMatchObject({
-      feedback: {
-        type: "warning",
+    expect(prompt.$state.get()).toMatchObject({ feedback: { type: "none" }, workflow: { type: "idle" } })
+    expect(notices.reloads).toEqual([
+      {
+        outcome: "warning",
         message: "Reloaded settings, resources, and extensions: /tmp/settings.json: invalid json (+2 more)"
-      },
-      workflow: { type: "idle" }
-    })
+      }
+    ])
+  } finally {
+    mode.dispose()
+    session.dispose()
+  }
+})
+
+test("reload failures settle through system notices without becoming prompt feedback", async () => {
+  const session = await createSession("reload-failure")
+  const mode = createInteractiveStore(session)
+  const notices = captureSystemNotices()
+  const prompt = createPromptStore(mode, new SlashController(), undefined, undefined, notices.actions)
+  session.reload = async () => {
+    throw new Error("reload exploded")
+  }
+
+  try {
+    expect(prompt.submit("/reload", "steer")).toBe(true)
+    expect(prompt.$state.get().feedback).toEqual({ type: "status", message: "Reloading…" })
+    await Bun.sleep(0)
+    expect(prompt.$state.get()).toMatchObject({ feedback: { type: "none" }, workflow: { type: "idle" } })
+    expect(notices.reloads).toEqual([{ outcome: "error", message: "reload exploded" }])
+    expect(session.messages).toEqual([])
   } finally {
     mode.dispose()
     session.dispose()
@@ -297,7 +322,7 @@ test("compact cancellation stays blocking until settlement and reports no error"
   }
 })
 
-test("automatic compaction failures surface through prompt feedback", async () => {
+test("automatic compaction failures do not overwrite prompt feedback", async () => {
   const models = createModels()
   const faux = fauxProvider({ provider: "automatic-failure", models: [{ id: "model", contextWindow: 4_000 }] })
   models.setProvider(faux.provider)
@@ -337,7 +362,7 @@ test("automatic compaction failures surface through prompt feedback", async () =
     expect(prompt.submit("continue", "steer")).toBe(true)
     await session.waitForIdle()
 
-    expect(prompt.$state.get().feedback).toEqual({ type: "error", message: "Compaction produced an empty summary" })
+    expect(prompt.$state.get().feedback).toEqual({ type: "none" })
     expect(session.sessionManager.latestCompaction()).toBeUndefined()
   } finally {
     prompt.dispose()
@@ -450,10 +475,7 @@ test("project trust choices are explicit, safe by default, and dismissible", asy
     prompt.requestProjectTrust("/work/project")
     expect(prompt.backPicker()).toBe(true)
     expect(dismissed).toBe(1)
-    expect(prompt.$state.get()).toMatchObject({
-      feedback: { type: "warning", message: expect.stringContaining("remains disabled") },
-      workflow: { type: "idle" }
-    })
+    expect(prompt.$state.get()).toMatchObject({ feedback: { type: "none" }, workflow: { type: "idle" } })
   } finally {
     prompt.dispose()
     mode.dispose()
@@ -680,6 +702,21 @@ test("prompt store retains rejected input and exposes the admission error", asyn
 
   mode.dispose()
 })
+
+function captureSystemNotices(): {
+  readonly actions: SystemNoticeActions
+  readonly reloads: { readonly outcome: ReloadNoticeOutcome; readonly message: string }[]
+} {
+  const reloads: { outcome: ReloadNoticeOutcome; message: string }[] = []
+  return {
+    actions: {
+      backgroundTaskCapacityExceeded() {},
+      reloadCompleted: (outcome, message) => reloads.push({ outcome, message }),
+      reloadFailed: message => reloads.push({ outcome: "error", message })
+    },
+    reloads
+  }
+}
 
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void

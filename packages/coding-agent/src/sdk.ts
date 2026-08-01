@@ -117,16 +117,20 @@ export async function createAgentSessionWithProcessTreeTracker(
   const bootstrapDiagnostic = createBootstrapDiagnostic(unavailableSessionModel, model)
   let session: AgentSession | undefined
   const subagents =
-    model && options.subagentCommand && options.internalSubagentDepth !== 1 && settings.subagentsEnabled
+    options.subagentCommand && options.internalSubagentDepth !== 1
       ? new SubagentSupervisor({
           command: options.subagentCommand,
           cwd: sessionManager.header.cwd,
           env: options.subagentEnvironment ?? {},
-          selection: () => ({
-            model: session ? `${session.model.provider}/${session.model.id}` : `${model.provider}/${model.id}`,
-            thinkingLevel: session?.thinkingLevel ?? thinkingLevel,
-            ...(options.apiKey ? { apiKey: options.apiKey } : {})
-          }),
+          selection: () => {
+            const selected = session?.model ?? model
+            if (!selected) throw new Error("No model selected. Use /login, then /model.")
+            return {
+              model: `${selected.provider}/${selected.id}`,
+              thinkingLevel: session?.thinkingLevel ?? thinkingLevel,
+              ...(options.apiKey ? { apiKey: options.apiKey } : {})
+            }
+          },
           sessionManager,
           processTreeTracker,
           waitTimeoutMs: settings.subagentWaitTimeoutMs
@@ -200,7 +204,7 @@ export async function createAgentSessionWithProcessTreeTracker(
     projectFileSearch: new ProjectFileSearch(services.paths),
     tools: options.tools,
     reload,
-    ...(subagents ? { subagents } : {}),
+    ...(subagents ? { subagentSupervisor: subagents } : {}),
     ...(options.codeMode ? { codeMode: options.codeMode } : {}),
     ...(options.extensionHost ? { extensionHost: options.extensionHost } : {}),
     processTreeTracker,

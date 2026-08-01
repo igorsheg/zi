@@ -11,15 +11,18 @@ on:
       - packages/coding-agent/src/agent-session.ts
       - packages/coding-agent/src/runtime-options.ts
       - packages/coding-agent/src/runtime.ts
+      - packages/coding-agent/src/resource-loader.ts
       - packages/coding-agent/src/session-shell.ts
       - packages/coding-agent/src/sdk.ts
       - packages/coding-agent/src/session-manager.ts
       - packages/coding-agent/src/settings-manager.ts
+      - packages/coding-agent/src/subagent-profiles.ts
       - packages/coding-agent/src/subagents/**
       - packages/coding-agent/src/rpc/**
       - packages/coding-agent/src/tools/bash.ts
       - packages/coding-agent/src/extensions/**
       - packages/extension-api/**
+      - examples/extensions/subagents/**
       - scripts/build-release.ts
       - scripts/compile-zi.ts
       - scripts/subagent-compiled-acceptance.ts
@@ -56,7 +59,7 @@ jobs:
         with:
           bun-version: 1.3.14
       - run: bun install --frozen-lockfile
-      - name: Build and exercise native subagents in the release executable
+      - name: Build and exercise profile-driven subagents in the release executable
         env:
           ZI_RELEASE_VERSION: 0.0.0-subagent-acceptance
           ZI_RELEASE_TARGET: ${{ matrix.target }}

@@ -1,6 +1,6 @@
 # Extensions
 
-Zi extensions are trusted TypeScript modules that add repository-specific behavior without changing Zi. The supported public surface consists of lifecycle handlers, model-callable tools, and bounded durable session operations.
+Zi extensions are trusted TypeScript modules that add repository-specific behavior without changing Zi. The supported public surface consists of lifecycle handlers, model-callable tools, bounded durable session operations, and optional subagent profiles and operations.
 
 ## Trust and authority
 
@@ -18,7 +18,7 @@ Zi discovers entry points in deterministic order:
 
 A directory entry may use `index.ts`; a direct `.ts` file also works. TypeScript and relative imports load without a build. Install third-party dependencies in the extension's own package hierarchy so normal bare-module resolution can find them.
 
-Start with [`examples/extensions/custom-tool/index.ts`](../examples/extensions/custom-tool/index.ts). For session persistence and custom messages, see [`examples/extensions/durable-counter/index.ts`](../examples/extensions/durable-counter/index.ts).
+Start with [`examples/extensions/custom-tool/index.ts`](../examples/extensions/custom-tool/index.ts). For session persistence and custom messages, see [`examples/extensions/durable-counter/index.ts`](../examples/extensions/durable-counter/index.ts). For programmatic subagent profiles, see [`examples/extensions/subagents/index.ts`](../examples/extensions/subagents/index.ts).
 
 ## Public API
 
@@ -49,11 +49,11 @@ Without `outputSchema`, a tool returns one bounded string. Declaring `outputSche
 
 `execute` receives an invocation-scoped `AbortSignal`. Cancellation is cooperative: pass the signal to subprocess or I/O APIs and stop owned work promptly. Zi rejects late completion and terminates a worker that misses execution or cancellation deadlines.
 
-### Native subagents are not an extension catalog
+### Programmatic subagent profiles
 
-Extensions neither register subagent types nor receive a procedural subagent API. Native `spawn_subagent` requires a model-authored `{ name, prompt }`; that parent-session-unique name is the sole child identity. The session-owned supervisor applies universal child instructions and owns process, RPC, mailbox, durability, and shutdown policy.
+`registerSubagentProfile(...)` is the programmatic counterpart to a Markdown profile resource. Both declarations join one `AgentSession`-owned catalog with the same name, description, instructions, optional model, and optional thinking contract. When child execution is available, a programmatic registration alone activates Zi's standard subagent tools; an extension does not need to register a second delegation tool.
 
-Zi deliberately defers extension-provided roles until a role can express concrete enforced semantics such as model routing, tool filtering, permissions, or worktree isolation. Prompt-only personas would imply authority the runtime does not enforce.
+Extensions may optionally build specialized orchestration with the bounded `zi.subagents` operations. The parent session retains profile precedence, process, protocol, concurrency, output, cancellation, durable evidence, containment, and shutdown ownership. Extension generation replacement removes its profile registrations without terminating admitted children. Profiles do not claim permissions, read-only behavior, worktrees, tool restrictions, or isolation. See [Profile-driven subagents](subagents.md) for the complete contract and example.
 
 ### Durable state and custom messages
 
@@ -79,7 +79,7 @@ Custom types use lowercase ASCII names beginning with a letter. They may contain
 
 Use `zi.on("session_start", handler)` to create long-lived resources and `zi.on("session_shutdown", handler)` to stop them. Shutdown handlers may read custom entries and append final custom state until all handlers settle; conversation delivery is closed once session disposal begins. Zi then removes the session-operation binding before disposing the worker. The extension that creates a subprocess, listener, or other resource owns its cleanup. Shutdown waits are bounded, and Zi cannot clean up detached descendants.
 
-Edit trusted extensions, skills, prompts, settings, or context files, then run `/reload` in interactive mode (or call `AgentSession.reload()` from a client). Reload keeps the same session identity and journal, rereads settings and resources under the current project-trust admission, replaces the extension generation in place, and emits `session_shutdown` / `session_start` with reason `"reload"`. Candidate `session_start` may append custom state and append-only custom messages; turn-triggering delivery stays closed until reload settles. A failed candidate before commit retains the previous generation. A worker crash leaves the session usable without extensions until an explicit reload recovers it.
+Edit trusted extensions, skills, prompts, settings, or context files, then run `/reload` in interactive mode (or call `AgentSession.reload()` from a client). Reload keeps the same session identity and journal, rereads settings and resources under the current project-trust admission, replaces the extension generation in place, and emits `session_shutdown` / `session_start` with reason `"reload"`. Candidate `session_start` may append custom state and append-only custom messages; turn-triggering delivery stays closed until reload settles. A failed candidate before commit retains the previous generation. A worker crash leaves the session usable without extensions until an explicit reload recovers it. Subagent profiles registered by the old generation are replaced with the generation, while already admitted child work remains owned by the session.
 
 ## Modes and diagnostics
 

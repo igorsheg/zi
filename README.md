@@ -9,7 +9,7 @@ A coding agent you can build with.
 Use it as-is, or teach it one habit at a time: a command, a tool, a prompt rule, a model preference, or a bit of UI.
 The goal is dependable agent work you can understand and change.
 
-Zi is developed as a dependable coding-agent building block with an opinionated reference terminal client. See the [building-block strategy](docs/building-block-strategy.md), [product roadmap](docs/roadmap.md), [native subagent guide](docs/subagents.md), [extension author guide](docs/extensions.md), and [RPC protocol](docs/rpc.md).
+Zi is developed as a dependable coding-agent building block with an opinionated reference terminal client. See the [building-block strategy](docs/building-block-strategy.md), [product roadmap](docs/roadmap.md), [profile-driven subagent guide](docs/subagents.md), [notification API](docs/notifications.md), [extension author guide](docs/extensions.md), and [RPC protocol](docs/rpc.md).
 
 ## Install
 

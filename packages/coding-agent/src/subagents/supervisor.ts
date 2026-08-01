@@ -12,7 +12,8 @@ export { defaultWaitTimeoutMs, maxWaitTimeoutMs } from "./wait-policy.js"
 
 export const maxLiveChildren = 4
 export const maxRetainedSubagents = 32
-export const maxMailboxCompletions = 32
+export const maxSubagentReadyResults = 32
+export const maxMailboxCompletions = maxSubagentReadyResults
 export const maxWaitNames = 16
 export const maxSubagentPromptBytes = 8 * 1024 * 1024
 export const maxSubagentNameBytes = 64
@@ -40,6 +41,11 @@ export interface SubagentStatus {
   readonly readyNames: readonly string[]
 }
 
+export interface SubagentCapacity {
+  readonly live: number
+  readonly maximum: number
+}
+
 interface LiveRecord {
   readonly child: ChildZiProcess
   readonly serial: PromiseQueue
@@ -50,6 +56,11 @@ interface LiveRecord {
 interface ExitedRecord {
   readonly snapshot: ChildSnapshot
   readonly exitedAt: number
+}
+
+export interface SubagentSpawnSelection {
+  readonly model?: string
+  readonly thinkingLevel?: ThinkingLevel
 }
 
 export interface SubagentSupervisorOptions {
@@ -113,6 +124,10 @@ export class SubagentSupervisor {
     ])
   }
 
+  capacity(): SubagentCapacity {
+    return Object.freeze({ live: this.#live.size, maximum: maxLiveChildren })
+  }
+
   runningCount(): number {
     let count = 0
     for (const record of this.#live.values()) {
@@ -135,17 +150,12 @@ export class SubagentSupervisor {
     return Object.freeze({ workingNames: Object.freeze(workingNames), readyNames: Object.freeze(readyNames) })
   }
 
-  completionNotice(): string | undefined {
-    const names = [...this.#mailbox.entries()]
-      .filter(([, delivery]) => delivery.type === "durable")
-      .map(([key]) => key.slice(0, key.lastIndexOf(":")))
-    const unique = [...new Set(names)].slice(0, maxWaitNames)
-    return unique.length === 0
-      ? undefined
-      : `Subagents completed: ${unique.join(", ")}. Call wait_subagents for their output.`
-  }
-
-  async spawn(name: string, prompt: string, signal?: AbortSignal): Promise<string> {
+  async spawn(
+    name: string,
+    prompt: string,
+    signal?: AbortSignal,
+    requestedSelection: SubagentSpawnSelection = {}
+  ): Promise<string> {
     this.#assertOpen()
     validateSubagentName(name)
     validateText(prompt, "Subagent prompt", maxSubagentPromptBytes)
@@ -153,7 +163,14 @@ export class SubagentSupervisor {
       throw new Error(`Subagent capacity exceeded: at most ${maxLiveChildren} live children`)
     }
     if (this.#names.has(name)) throw new Error(`Subagent name already in use: ${name}`)
-    const selection = this.#selection()
+    const inheritedSelection = this.#selection()
+    const selection = {
+      model: requestedSelection.model ?? inheritedSelection.model,
+      thinkingLevel: requestedSelection.thinkingLevel ?? inheritedSelection.thinkingLevel,
+      ...(requestedSelection.model === undefined || requestedSelection.model === inheritedSelection.model
+        ? { apiKey: inheritedSelection.apiKey }
+        : {})
+    }
     validateText(selection.model, "Subagent model", 4_096)
     if (selection.apiKey) validateText(selection.apiKey, "Subagent API key", 64 * 1024)
     const reservationKey = this.#reserveCompletion(name, 1)
@@ -214,8 +231,7 @@ export class SubagentSupervisor {
       const sessionId = child.snapshot().sessionId
       this.#append({ event: "ready", name, ...(sessionId ? { sessionId } : {}) })
       this.#append({ event: "work_cycle_started", name, workCycle: 1 })
-      const admittedPrompt = `Complete the delegated task independently. Return a concise final answer with relevant paths and findings.\n\nDelegated task:\n${prompt}`
-      await child.spawnAdmit(admittedPrompt)
+      await child.spawnAdmit(prompt)
       signal?.removeEventListener("abort", abort)
       return name
     } catch (cause) {
@@ -266,11 +282,10 @@ export class SubagentSupervisor {
     validateSubagentName(name)
     const record = this.#live.get(name)
     if (!record) return this.#snapshotFor(name)
-    const previous = this.#snapshot(record.child.snapshot())
     this.#append({ event: "closing", name, reason })
     await record.child.close(reason, graceMs, forceMs)
     this.#retainExit(name, record)
-    return previous
+    return this.#snapshotFor(name)
   }
 
   async wait(
@@ -280,9 +295,9 @@ export class SubagentSupervisor {
   ): Promise<SubagentSnapshot[]> {
     this.#assertOpen()
     if (names.length === 0 || names.length > maxWaitNames) {
-      throw new Error(`wait_subagents requires 1 through ${maxWaitNames} names`)
+      throw new Error(`Subagent wait requires 1 through ${maxWaitNames} names`)
     }
-    if (new Set(names).size !== names.length) throw new Error("wait_subagents rejects duplicate names")
+    if (new Set(names).size !== names.length) throw new Error("Subagent wait rejects duplicate names")
     for (const name of names) {
       validateSubagentName(name)
       this.#requireKnown(name)

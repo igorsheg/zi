@@ -14,6 +14,7 @@ import {
   SessionResourceBudget
 } from "./resource-files.js"
 import { loadSkills, type Skill } from "./skills.js"
+import { loadSubagentProfiles, type SubagentProfile } from "./subagent-profiles.js"
 
 export const maxContextFileCount = 128
 export const maxSessionResourceBytes = 8 * 1024 * 1024
@@ -29,6 +30,7 @@ export interface SessionResources {
   readonly contextFiles: readonly ContextFile[]
   readonly skills: readonly Skill[]
   readonly promptTemplates: readonly PromptTemplate[]
+  readonly subagentProfiles: readonly SubagentProfile[]
   readonly diagnostics: readonly ResourceDiagnostic[]
 }
 
@@ -38,6 +40,7 @@ export interface CreateSessionResourcesOptions {
   readonly contextFiles?: readonly ContextFile[]
   readonly skills?: readonly Skill[]
   readonly promptTemplates?: readonly PromptTemplate[]
+  readonly subagentProfiles?: readonly SubagentProfile[]
   readonly diagnostics?: readonly ResourceDiagnostic[]
 }
 
@@ -110,6 +113,16 @@ export class ResourceLoader {
       budget,
       diagnostics
     )
+    const subagentProfiles = loadSubagentProfiles(
+      [
+        ...(this.#projectConfigurationAdmitted
+          ? [{ path: this.#paths.projectResourceDir("subagents"), scope: "project" as const }]
+          : []),
+        { path: this.#paths.globalResourceDir("subagents"), scope: "global" as const }
+      ],
+      budget,
+      diagnostics
+    )
 
     return createSessionResources({
       ...(systemPrompt === undefined ? {} : { systemPrompt }),
@@ -117,6 +130,7 @@ export class ResourceLoader {
       contextFiles,
       skills,
       promptTemplates,
+      subagentProfiles,
       diagnostics: diagnostics.snapshot()
     })
   }
@@ -129,6 +143,7 @@ export function createSessionResources(options: CreateSessionResourcesOptions = 
   )
   const skills = Object.freeze((options.skills ?? []).map(skill => Object.freeze({ ...skill })))
   const promptTemplates = Object.freeze((options.promptTemplates ?? []).map(template => Object.freeze({ ...template })))
+  const subagentProfiles = Object.freeze((options.subagentProfiles ?? []).map(profile => Object.freeze({ ...profile })))
   const diagnostics = Object.freeze(
     (options.diagnostics ?? []).map(diagnostic => Object.freeze({ ...diagnostic }) as ResourceDiagnostic)
   )
@@ -137,6 +152,7 @@ export function createSessionResources(options: CreateSessionResourcesOptions = 
     contextFiles,
     skills,
     promptTemplates,
+    subagentProfiles,
     diagnostics,
     ...(options.systemPrompt === undefined ? {} : { systemPrompt: options.systemPrompt })
   })

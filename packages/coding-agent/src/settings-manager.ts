@@ -19,7 +19,6 @@ export interface AgentSettings {
   steeringMode: QueueMode
   followUpMode: QueueMode
   codexFastMode: boolean
-  subagentsEnabled: boolean
   subagentWaitTimeoutMs: number
   retryEnabled: boolean
   retryMaxRetries: number
@@ -36,7 +35,6 @@ const defaults: AgentSettings = {
   steeringMode: "one-at-a-time",
   followUpMode: "one-at-a-time",
   codexFastMode: false,
-  subagentsEnabled: true,
   subagentWaitTimeoutMs: defaultWaitTimeoutMs,
   retryEnabled: true,
   retryMaxRetries: 3,
@@ -224,9 +222,6 @@ function validateSettingsPatch(patch: Partial<AgentSettings>): void {
   if ("codexFastMode" in patch && typeof patch.codexFastMode !== "boolean") {
     throw new Error("Invalid codexFastMode setting")
   }
-  if ("subagentsEnabled" in patch && typeof patch.subagentsEnabled !== "boolean") {
-    throw new Error("Invalid subagentsEnabled setting")
-  }
   if ("subagentWaitTimeoutMs" in patch && !isSubagentWaitTimeout(patch.subagentWaitTimeoutMs)) {
     throw new Error("Invalid subagentWaitTimeoutMs setting")
   }
@@ -276,7 +271,6 @@ function clearOverrides(overrides: Partial<AgentSettings>, patch: Partial<AgentS
   if ("steeringMode" in patch) delete overrides.steeringMode
   if ("followUpMode" in patch) delete overrides.followUpMode
   if ("codexFastMode" in patch) delete overrides.codexFastMode
-  if ("subagentsEnabled" in patch) delete overrides.subagentsEnabled
   if ("subagentWaitTimeoutMs" in patch) delete overrides.subagentWaitTimeoutMs
   if ("retryEnabled" in patch) delete overrides.retryEnabled
   if ("retryMaxRetries" in patch) delete overrides.retryMaxRetries
@@ -390,10 +384,6 @@ function loadSettings(path: string): Partial<AgentSettings> {
   if (value.codexFastMode !== undefined) {
     if (typeof value.codexFastMode !== "boolean") throw invalidSetting(path, "codexFastMode")
     settings.codexFastMode = value.codexFastMode
-  }
-  if (value.subagentsEnabled !== undefined) {
-    if (typeof value.subagentsEnabled !== "boolean") throw invalidSetting(path, "subagentsEnabled")
-    settings.subagentsEnabled = value.subagentsEnabled
   }
   if (value.subagentWaitTimeoutMs !== undefined) {
     if (!isSubagentWaitTimeout(value.subagentWaitTimeoutMs)) throw invalidSetting(path, "subagentWaitTimeoutMs")

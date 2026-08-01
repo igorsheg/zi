@@ -47,6 +47,29 @@ test("interactive project trust safely defaults to exclusion and can remember ad
   }
 })
 
+test("dismissing project trust reports passive configuration exclusion", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-interactive-project-trust-dismiss-"))
+  const cwd = join(root, "project")
+  await mkdir(join(cwd, ".zi"), { recursive: true })
+  await writeFile(join(cwd, ".zi", "settings.json"), "{}")
+  const runtime = await createTestAgentSessionRuntime({ cwd, agentDir: join(root, "global"), models: createModels() })
+  const setup = await createInteractiveRuntimeTest(runtime, { width: 76, height: 18, kittyKeyboard: true })
+
+  try {
+    await waitForFrame(setup, "Project trust")
+    setup.mockInput.pressEscape()
+    const frame = await waitForFrame(setup, "Project .zi configuration remains disabled")
+
+    expect(runtime.projectTrust.type).toBe("unresolved")
+    expect(frame).toContain("System ❰❰")
+    expect(runtime.session.messages).toEqual([])
+  } finally {
+    setup.destroy()
+    runtime.dispose()
+    await runtime.waitForIdle()
+  }
+})
+
 function promptInput(setup: InteractiveTestSetup): TextareaRenderable {
   const input = setup.renderer.root.findDescendantById("prompt-input")
   if (!(input instanceof TextareaRenderable)) throw new Error("Prompt textarea not found")

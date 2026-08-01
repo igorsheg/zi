@@ -7,10 +7,11 @@ import { join, resolve } from "node:path"
 
 import { createProcessTreeTracker, type ProcessScope } from "../packages/coding-agent/src/processes/process-tree.js"
 
-const acceptanceText = "Native subagent acceptance passed."
+const acceptanceText = "Profile-driven subagent acceptance passed."
 const acceptanceApiKey = "compiled-subagent-private-key"
 const requestLimitBytes = 8 * 1024 * 1024
 const subagentToolNames = Object.freeze([
+  "list_subagent_profiles",
   "spawn_subagent",
   "send_subagent",
   "continue_subagent",
@@ -21,6 +22,7 @@ const subagentToolNames = Object.freeze([
 ])
 
 type Mode = "close" | "crash" | "dispose"
+type Declaration = "markdown" | "programmatic"
 
 interface ProcessMarker {
   readonly childPid: number
@@ -40,13 +42,21 @@ export async function runSubagentCompiledAcceptance(options: { readonly executab
     for (const mode of ["close", "crash", "dispose"] as const) {
       const agentDirectory = join(temporary, `agent-${mode}`)
       const extensions = join(agentDirectory, "extensions")
+      const declaration: Declaration = mode === "close" ? "markdown" : "programmatic"
       // Each run owns one compiled parent, provider, credential store, extension worker, and process markers.
       // oxlint-disable-next-line no-await-in-loop
       await mkdir(extensions, { recursive: true })
       // oxlint-disable-next-line no-await-in-loop
       await writeFile(join(extensions, "acceptance.ts"), acceptanceExtension())
+      if (declaration === "markdown") {
+        const profiles = join(agentDirectory, "subagents")
+        // oxlint-disable-next-line no-await-in-loop
+        await mkdir(profiles, { recursive: true })
+        // oxlint-disable-next-line no-await-in-loop
+        await writeFile(join(profiles, "acceptance.md"), acceptanceMarkdownProfile())
+      }
       // oxlint-disable-next-line no-await-in-loop
-      await runMode(options.executable, project, agentDirectory, join(temporary, `${mode}.json`), mode)
+      await runMode(options.executable, project, agentDirectory, join(temporary, `${mode}.json`), mode, declaration)
     }
   } finally {
     await rm(temporary, { recursive: true, force: true })
@@ -58,7 +68,8 @@ async function runMode(
   project: string,
   agentDirectory: string,
   markerPath: string,
-  mode: Mode
+  mode: Mode,
+  declaration: Declaration
 ): Promise<void> {
   const descendantMarkerPath = `${markerPath}.descendant`
   const provider = new SubagentProvider(mode, markerPath, descendantMarkerPath)
@@ -85,7 +96,7 @@ async function runMode(
         acceptanceApiKey,
         "--thinking",
         "off",
-        `Complete the ${mode} native subagent acceptance workflow.`
+        `Complete the ${mode} ${declaration} profile-driven subagent acceptance workflow.`
       ],
       {
         cwd: project,
@@ -95,7 +106,8 @@ async function runMode(
           AZURE_OPENAI_BASE_URL: provider.baseUrl,
           ZI_AGENT_DIR: agentDirectory,
           ZI_SUBAGENT_DEPTH: "0",
-          ZI_SUBAGENT_ACCEPTANCE_MARKER: markerPath
+          ZI_SUBAGENT_ACCEPTANCE_MARKER: markerPath,
+          ZI_SUBAGENT_PROFILE_DECLARATION: declaration
         },
         stdin: "ignore",
         stdout: "pipe",
@@ -146,8 +158,8 @@ class SubagentProvider {
   #descendantStarted = false
   #childInitialReplySent = false
   #childProviderRequests = 0
-  #noticeProbeId: string | undefined
-  #noticeProbeCount = 0
+  #resultProbeId: string | undefined
+  #resultProbeCount = 0
   #name: string | undefined
   #parentPhase = "starting"
   #childPhase = "starting"
@@ -170,7 +182,7 @@ class SubagentProvider {
   }
 
   diagnostic(): string {
-    return `parent=${this.#parentPhase}; child=${this.#childPhase}; child requests=${this.#childProviderRequests}; notice probes=${this.#noticeProbeCount}`
+    return `parent=${this.#parentPhase}; child=${this.#childPhase}; child requests=${this.#childProviderRequests}; result probes=${this.#resultProbeCount}`
   }
 
   assertComplete(): void {
@@ -232,10 +244,10 @@ class SubagentProvider {
       return eventStreamResponse(textEvents("Compiled second cycle completed.", "child-second-cycle"))
     }
     if (
-      !payloadText.includes("Complete the delegated task independently.") ||
+      !payloadText.includes("Complete the acceptance task and return bounded evidence.") ||
       !payloadText.includes("Return one sentence.")
     ) {
-      throw new Error("Compiled child did not receive universal instructions and the delegated prompt")
+      throw new Error("Compiled child did not receive profile instructions and the delegated prompt")
     }
     if (!outputs.has("acceptance_descendant")) {
       return eventStreamResponse(
@@ -266,10 +278,19 @@ class SubagentProvider {
 
   async #receiveParent(payloadText: string, outputs: ReadonlyMap<string, string>): Promise<Response> {
     this.#parentPhase = [...outputs.keys()].at(-1) ?? "initial"
+    const profileOutput = outputs.get("acceptance_profiles")
+    if (!profileOutput) {
+      return eventStreamResponse(toolEvents("list_subagent_profiles", "acceptance_profiles", {}))
+    }
+    assertProfileCatalog(profileOutput)
     const spawnOutput = outputs.get("acceptance_spawn")
     if (!spawnOutput) {
       return eventStreamResponse(
-        toolEvents("spawn_subagent", "acceptance_spawn", { name: "acceptance-worker", prompt: "Return one sentence." })
+        toolEvents("spawn_subagent", "acceptance_spawn", {
+          profile: "acceptance",
+          name: "acceptance-worker",
+          prompt: "Return one sentence."
+        })
       )
     }
     const name = parseName(spawnOutput)
@@ -296,27 +317,23 @@ class SubagentProvider {
   ): Promise<Response> {
     const initialWait = outputs.get("acceptance_wait_initial")
     if (!initialWait) {
-      if (this.#noticeProbeId) {
-        const probeOutput = outputs.get(this.#noticeProbeId)
-        if (!probeOutput) throw new Error(`Compiled parent omitted ${this.#noticeProbeId} output`)
+      if (this.#resultProbeId) {
+        const probeOutput = outputs.get(this.#resultProbeId)
+        if (!probeOutput) throw new Error(`Compiled parent omitted ${this.#resultProbeId} output`)
         if (hasReadyCompletion(probeOutput)) {
-          if (
-            !payloadText.includes("Subagents completed:") ||
-            !payloadText.includes("acceptance-worker") ||
-            !payloadText.includes(name)
-          ) {
-            throw new Error("Compiled parent omitted the durable completion notice before wait")
+          if (payloadText.includes("Subagents completed:")) {
+            throw new Error("Compiled parent injected an unsolicited subagent completion message")
           }
           return eventStreamResponse(
             toolEvents("wait_subagents", "acceptance_wait_initial", { names: [name], timeout_ms: 25_000 })
           )
         }
       }
-      if (++this.#noticeProbeCount > 40)
-        throw new Error("Compiled completion did not become durable during notice probe")
+      if (++this.#resultProbeCount > 40)
+        throw new Error("Compiled completion did not become durable during result probe")
       await Bun.sleep(25)
-      this.#noticeProbeId = `acceptance_notice_probe_${this.#noticeProbeCount}`
-      return eventStreamResponse(toolEvents("list_subagents", this.#noticeProbeId, {}))
+      this.#resultProbeId = `acceptance_result_probe_${this.#resultProbeCount}`
+      return eventStreamResponse(toolEvents("list_subagents", this.#resultProbeId, {}))
     }
     assertWaitCompletion(initialWait, { status: "completed", text: "Compiled child completed." })
 
@@ -391,14 +408,8 @@ class SubagentProvider {
       return eventStreamResponse(toolEvents("close_subagent", "acceptance_close", { name }))
     }
     const close = record(JSON.parse(outputs.get("acceptance_close")!), "close result")
-    const previousCompletion = record(close.previous_completion, "close previous completion")
-    if (
-      close.name !== name ||
-      close.closed !== true ||
-      close.previous_status !== "idle" ||
-      previousCompletion.status !== "completed"
-    ) {
-      throw new Error(`Compiled close result omitted its prior state: ${outputs.get("acceptance_close")}`)
+    if (close.name !== name || close.status !== "exited") {
+      throw new Error(`Compiled close result omitted its exited state: ${outputs.get("acceptance_close")}`)
     }
     this.#complete = true
     return eventStreamResponse(textEvents(acceptanceText, "close"))
@@ -424,7 +435,18 @@ function acceptanceExtension(): string {
   return `import { Schema, type ExtensionFactory } from "@with-zi/extension-api"
 
 const extension: ExtensionFactory = zi => {
-  if (process.env.ZI_SUBAGENT_DEPTH !== "1") return
+  if (process.env.ZI_SUBAGENT_DEPTH !== "1") {
+    if (process.env.ZI_SUBAGENT_PROFILE_DECLARATION === "programmatic") {
+      zi.registerSubagentProfile({
+        name: "acceptance",
+        description: "Exercise the compiled profile-driven subagent system",
+        instructions: "Complete the acceptance task and return bounded evidence.",
+        model: "azure-openai-responses/gpt-4.1",
+        thinking: "off"
+      })
+    }
+    return
+  }
   const marker = process.env.ZI_SUBAGENT_ACCEPTANCE_MARKER
   if (!marker) throw new Error("missing subagent acceptance marker")
   if (process.env.ZI_INTERNAL_SUBAGENT_API_KEY !== undefined) {
@@ -451,6 +473,16 @@ export default extension
 `
 }
 
+function acceptanceMarkdownProfile(): string {
+  return `---
+description: Exercise the compiled profile-driven subagent system
+model: azure-openai-responses/gpt-4.1
+thinking: off
+---
+Complete the acceptance task and return bounded evidence.
+`
+}
+
 function functionOutputs(input: unknown): Map<string, string> {
   const outputs = new Map<string, string>()
   if (!Array.isArray(input)) return outputs
@@ -469,9 +501,17 @@ function parseName(output: string): string {
   return match[1]
 }
 
+function assertProfileCatalog(output: string): void {
+  const result = record(JSON.parse(output), "profile catalog")
+  const profiles = Array.isArray(result.profiles) ? result.profiles : []
+  if (!profiles.some(profile => isRecord(profile) && profile.name === "acceptance")) {
+    throw new Error(`Compiled parent omitted the acceptance profile: ${JSON.stringify(output)}`)
+  }
+}
+
 function assertWaitCompletion(output: string, expected: { readonly status: string; readonly text?: string }): void {
   const result = record(JSON.parse(output), "wait result")
-  const agent = Array.isArray(result.agents) ? result.agents.find(isRecord) : undefined
+  const agent = Array.isArray(result.subagents) ? result.subagents.find(isRecord) : undefined
   const completion = agent && isRecord(agent.completion) ? agent.completion : undefined
   if (
     !agent ||
@@ -485,15 +525,15 @@ function assertWaitCompletion(output: string, expected: { readonly status: strin
 
 function assertInterruptResult(output: string, expected: "interrupted" | "already_idle"): void {
   const result = record(JSON.parse(output), "interrupt result")
-  if (result.result !== expected) {
+  if (result.outcome !== expected) {
     throw new Error(`Compiled subagent interrupt returned ${JSON.stringify(output)} instead of ${expected}`)
   }
 }
 
 function hasReadyCompletion(output: string): boolean {
   const result = record(JSON.parse(output), "list result")
-  if (!Array.isArray(result.agents)) return false
-  return result.agents.some(agent => isRecord(agent) && isRecord(agent.result_ready))
+  if (!Array.isArray(result.subagents)) return false
+  return result.subagents.some(agent => isRecord(agent) && isRecord(agent.result_ready))
 }
 
 function toolEvents(name: string, callId: string, args: Record<string, unknown>): readonly Record<string, unknown>[] {

@@ -223,12 +223,66 @@ export type ExtensionToolDefinition<
         execute(parameters: Static<TParameters>, context: ExtensionToolContext): string | Promise<string>
       })
 
+export type ExtensionThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+
+export interface ExtensionSubagentProfile {
+  readonly name: string
+  readonly description: string
+  readonly instructions: string
+  readonly model?: string
+  readonly thinking?: ExtensionThinkingLevel
+}
+
+export type ExtensionSubagentLifecycle =
+  | "starting"
+  | "idle"
+  | "spawn_admitting"
+  | "running"
+  | "interrupting"
+  | "closing"
+  | "exited"
+
+export interface ExtensionSubagentCompletion {
+  readonly status: "completed" | "failed" | "cancelled"
+  readonly text: string
+  readonly originalBytes: number
+  readonly omittedBytes: number
+  readonly truncated: boolean
+  readonly durationMs: number
+  readonly reason?: string
+  readonly error?: string
+}
+
+export interface ExtensionSubagentSnapshot {
+  readonly name: string
+  readonly lifecycle: ExtensionSubagentLifecycle
+  readonly resultReady: boolean
+  readonly completion?: ExtensionSubagentCompletion
+}
+
+export interface ExtensionSubagentAPI {
+  listProfiles(): Promise<readonly ExtensionSubagentProfile[]>
+  spawn(profile: string, name: string, prompt: string, signal?: AbortSignal): Promise<string>
+  send(name: string, text: string): Promise<void>
+  continue(name: string, text: string): Promise<"started_turn" | "follow_up">
+  wait(
+    names: readonly string[],
+    timeoutMs?: number,
+    signal?: AbortSignal
+  ): Promise<readonly ExtensionSubagentSnapshot[]>
+  interrupt(name: string): Promise<"interrupted" | "already_idle">
+  close(name: string): Promise<ExtensionSubagentSnapshot>
+  list(): Promise<readonly ExtensionSubagentSnapshot[]>
+}
+
 export interface ExtensionAPI {
+  readonly subagents?: ExtensionSubagentAPI
   on(event: "session_start", handler: (event: ExtensionStartEvent) => void | Promise<void>): void
   on(event: "session_shutdown", handler: (event: ExtensionShutdownEvent) => void | Promise<void>): void
   registerTool<TParameters extends TObject, TOutputSchema extends TSchema | undefined = undefined>(
     tool: ExtensionToolDefinition<TParameters, TOutputSchema>
   ): void
+  registerSubagentProfile(profile: ExtensionSubagentProfile): void
   getSessionEntries(customType: string): Promise<readonly ExtensionCustomEntry[]>
   appendEntry(customType: string, data?: JsonValue): Promise<ExtensionCustomEntry>
   sendMessage(message: ExtensionCustomMessage, delivery: ExtensionMessageDelivery): Promise<void>

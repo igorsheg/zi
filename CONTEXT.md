@@ -57,7 +57,7 @@ A bounded, framework-neutral display value derived from one tool invocation's ar
 _Avoid_: Tool view model, render callback, tool component
 
 **Session resources**:
-The cwd-bound prompt inputs active for one agent session: base and appended system prompts, contextual instruction files, skill descriptors, and prompt templates. Resource discovery finds candidates; the agent session owns the coherent catalog used by its conversation. Terminal themes and extension/package loading are separate capabilities.
+The cwd-bound prompt inputs active for one agent session: base and appended system prompts, contextual instruction files, skill descriptors, prompt templates, and subagent profiles. Resource discovery finds candidates; the agent session owns the coherent catalog used by its conversation. Terminal themes and extension/package loading are separate capabilities.
 _Avoid_: Core resources, resource registry, frontend resources
 
 **Retry sequence**:
@@ -176,17 +176,21 @@ _Avoid_: CLI branch, universal frontend mode
 One versioned JSONL process relationship over a caller-owned `AgentSession`. It owns framing, request validation, correlation, total output sequence, bounded concurrent operations, backpressure, cancellation, and settlement; it projects public session facts but owns no conversation policy or session disposal.
 _Avoid_: Remote session, API server, command bus, RPC runtime
 
+**Subagent profile**:
+Static configuration for delegated work: a profile name, description, instructions, and optional model and thinking selection. Trusted resources and programmatic extension registration are equal declaration paths into one session-owned catalog; an admitted profile activates standard orchestration but is not a running child or a claim about permissions, tools, worktrees, or filesystem isolation.
+_Avoid_: Subagent, role, agent type, permission profile
+
 **Subagent**:
-One delegated child Zi agent session whose conversation remains authoritative in that child. V1 subagents are direct children of one parent session and do not form a peer network.
-_Avoid_: Worker, tool call, copied parent agent
+One runtime child Zi agent session created from a subagent profile whose conversation remains authoritative in that child. Subagents are direct children of one parent session and do not form a peer network.
+_Avoid_: Subagent profile, worker, tool call, copied parent agent
 
 **Subagent name**:
-The model-authored, parent-session-unique identity chosen when a subagent is spawned. It is both the readable collaboration label and the routing key for every later operation, but does not select a role, policy, model, tool set, or permission set.
+The parent-session-unique runtime identity chosen when a subagent is spawned. It is both the readable collaboration label and the routing key for every later operation; the selected subagent profile remains separate static configuration.
 _Avoid_: Subagent type, role, operational ID
 
 **Subagent supervisor**:
-The `AgentSession`-owned controller of direct-child names, admission, process lifetimes, work cycles, the completion mailbox, durable evidence, universal child instructions, and shutdown. It supervises child sessions but does not copy or own their conversations.
-_Avoid_: Extension generation, agent coordinator, process manager, session registry
+The `AgentSession`-owned controller of direct-child names, admission, process lifetimes, work cycles, bounded completion retention, durable evidence, and shutdown. `AgentSession` derives standard orchestration from its admitted profile catalog; extensions may reach the same mechanics only through bounded session operations for optional custom workflows.
+_Avoid_: Extension generation, agent coordinator, extension API object, session registry
 
 **Subagent completion**:
 The bounded result projected when admitted subagent work settles, including identity, status, final text, duration, and omission facts. It is not a copied child transcript.
@@ -207,6 +211,18 @@ _Avoid_: Global store, frontend database, coding-agent policy
 **Interactive keybindings**:
 The instance-scoped terminal owner of semantic action IDs, effective key overrides, matching, hints, and conflict metadata. It translates OpenTUI key events into closed prompt/transcript actions but contains no callbacks or session operations.
 _Avoid_: Global keymap, raw product chords in components, command bus
+
+**Notification center**:
+The `InteractiveMode`-owned controller of active notification groups, exclusive internal group claims, keyed item replacement, finite expiry, close and suppression state, bounded removed history, and the retained bottom-right transcript surface. It remains passive presentation, survives session-screen replacement, and never starts a model turn.
+_Avoid_: Toast store, transcript message, session notification state
+
+**System notification presenter**:
+The `InteractiveMode`-owned producer for the exclusive bounded `zi.system` group. It translates passive bootstrap, extension, project-trust, compaction, copy, shell-capacity, and reload outcomes into keyed notices, and removes them when their authoritative condition or session generation changes.
+_Avoid_: Prompt feedback proxy, public notification API in components, session state
+
+**Notification item**:
+One bounded active notice identified optionally by a key within a group. It retains message, annotation, severity, expiry, visibility, history policy, and immutable JSON data until expiry or explicit removal moves it to bounded history.
+_Avoid_: Transcript row, prompt feedback, subagent result
 
 **Imperative TUI component**:
 An owner of one OpenTUI renderable subtree and its direct updates. It exposes concrete renderables and explicit disposal; it may compose product presentation but does not decide coding-agent policy.

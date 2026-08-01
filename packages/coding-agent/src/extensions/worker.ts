@@ -9,6 +9,9 @@ import type {
   ExtensionMessageDelivery,
   ExtensionShutdownEvent,
   ExtensionStartEvent,
+  ExtensionSubagentAPI,
+  ExtensionSubagentProfile,
+  ExtensionSubagentSnapshot,
   ExtensionToolContext,
   JsonValue as ExtensionJsonValue
 } from "@with-zi/extension-api"
@@ -28,14 +31,18 @@ import {
   extensionStartupTimeoutMs,
   maxExtensionDiagnostics,
   maxExtensionPendingRequests,
+  maxExtensionSubagentProfiles,
   maxExtensionTools,
   type ExtensionDiagnostic,
   type ExtensionLoadResult,
+  type ExtensionSessionRequest,
   type ExtensionSessionResponse,
+  type ExtensionSubagentRegistration,
   type ExtensionToolRegistration,
   type HostMessage,
   type JsonValue,
   type WorkerMessage,
+  validateExtensionSubagentCatalog,
   validateExtensionToolArguments,
   validateExtensionToolCatalog,
   validateExtensionToolRegistration,
@@ -98,8 +105,23 @@ type WorkerSessionRequest =
   | { readonly type: "custom_entries_get"; readonly settled: Deferred<readonly ExtensionCustomEntry[]> }
   | { readonly type: "custom_entry_append"; readonly settled: Deferred<ExtensionCustomEntry> }
   | { readonly type: "custom_message_send"; readonly settled: VoidDeferred }
+  | { readonly type: "subagent_profiles_get"; readonly settled: Deferred<readonly ExtensionSubagentProfile[]> }
+  | { readonly type: "subagent_spawn"; readonly settled: Deferred<string> }
+  | { readonly type: "subagent_send"; readonly settled: VoidDeferred }
+  | { readonly type: "subagent_continue"; readonly settled: Deferred<"started_turn" | "follow_up"> }
+  | { readonly type: "subagent_wait"; readonly settled: Deferred<readonly ExtensionSubagentSnapshot[]> }
+  | { readonly type: "subagent_interrupt"; readonly settled: Deferred<"interrupted" | "already_idle"> }
+  | { readonly type: "subagent_close"; readonly settled: Deferred<ExtensionSubagentSnapshot> }
+  | { readonly type: "subagent_list"; readonly settled: Deferred<readonly ExtensionSubagentSnapshot[]> }
+
+type WorkerSessionRequestFields = ExtensionSessionRequest extends infer Request
+  ? Request extends ExtensionSessionRequest
+    ? Omit<Request, "generation" | "requestId">
+    : never
+  : never
 
 export interface WorkerSessionOperations {
+  readonly subagentsAvailable: boolean
   getEntries(source: ExtensionSource, customType: string): Promise<readonly ExtensionCustomEntry[]>
   appendEntry(source: ExtensionSource, customType: string, data?: ExtensionJsonValue): Promise<ExtensionCustomEntry>
   sendMessage(
@@ -107,6 +129,25 @@ export interface WorkerSessionOperations {
     message: ExtensionCustomMessage,
     delivery: ExtensionMessageDelivery
   ): Promise<void>
+  listSubagentProfiles(source: ExtensionSource): Promise<readonly ExtensionSubagentProfile[]>
+  spawnSubagent(
+    source: ExtensionSource,
+    profile: string,
+    name: string,
+    prompt: string,
+    signal?: AbortSignal
+  ): Promise<string>
+  sendSubagent(source: ExtensionSource, name: string, text: string): Promise<void>
+  continueSubagent(source: ExtensionSource, name: string, text: string): Promise<"started_turn" | "follow_up">
+  waitSubagents(
+    source: ExtensionSource,
+    names: readonly string[],
+    timeoutMs?: number,
+    signal?: AbortSignal
+  ): Promise<readonly ExtensionSubagentSnapshot[]>
+  interruptSubagent(source: ExtensionSource, name: string): Promise<"interrupted" | "already_idle">
+  closeSubagent(source: ExtensionSource, name: string): Promise<ExtensionSubagentSnapshot>
+  listSubagents(source: ExtensionSource): Promise<readonly ExtensionSubagentSnapshot[]>
 }
 
 export interface ExtensionLifecycleResult {
@@ -126,6 +167,7 @@ type LifecycleState =
 export class LoadedExtensionGeneration {
   readonly results: readonly ExtensionLoadResult[]
   readonly tools: readonly ExtensionToolRegistration[]
+  readonly subagents: readonly ExtensionSubagentRegistration[]
   readonly #startHandlers: readonly StartHandler[]
   readonly #shutdownHandlers: readonly ShutdownHandler[]
   readonly #toolsByName: ReadonlyMap<string, RegisteredTool>
@@ -135,10 +177,12 @@ export class LoadedExtensionGeneration {
     results: readonly ExtensionLoadResult[],
     startHandlers: readonly StartHandler[],
     shutdownHandlers: readonly ShutdownHandler[],
-    tools: readonly RegisteredTool[]
+    tools: readonly RegisteredTool[],
+    subagents: readonly ExtensionSubagentRegistration[]
   ) {
     this.results = Object.freeze([...results])
     this.tools = Object.freeze(tools.map(tool => tool.registration))
+    this.subagents = Object.freeze([...subagents])
     this.#startHandlers = Object.freeze([...startHandlers])
     this.#shutdownHandlers = Object.freeze([...shutdownHandlers])
     this.#toolsByName = new Map(tools.map(tool => [tool.registration.name, tool]))
@@ -256,6 +300,14 @@ class ExtensionWorkerProcess {
       message.type === "custom_entries_result" ||
       message.type === "custom_entry_result" ||
       message.type === "custom_message_result" ||
+      message.type === "subagent_profiles_result" ||
+      message.type === "subagent_spawn_result" ||
+      message.type === "subagent_send_result" ||
+      message.type === "subagent_continue_result" ||
+      message.type === "subagent_wait_result" ||
+      message.type === "subagent_interrupt_result" ||
+      message.type === "subagent_close_result" ||
+      message.type === "subagent_list_result" ||
       message.type === "session_operation_error"
     ) {
       this.#settleSessionRequest(message)
@@ -382,7 +434,7 @@ class ExtensionWorkerProcess {
         message.plan,
         message.generation,
         extensionStartupTimeoutMs,
-        this.#extensionSessionOperations(message.generation)
+        this.#extensionSessionOperations(message.generation, message.subagentsAvailable === true)
       )
       const state = this.#state
       if (state.type !== "initializing" || state.generation !== message.generation) return
@@ -392,7 +444,8 @@ class ExtensionWorkerProcess {
         protocolVersion: extensionProtocolVersion,
         generation: message.generation,
         extensions: extensions.results,
-        tools: extensions.tools
+        tools: extensions.tools,
+        subagents: extensions.subagents
       })
     } catch (cause) {
       this.#fatal(message.generation, fatalDiagnostic("handshake", cause), cause)
@@ -401,8 +454,9 @@ class ExtensionWorkerProcess {
     }
   }
 
-  #extensionSessionOperations(generation: number): WorkerSessionOperations {
+  #extensionSessionOperations(generation: number, subagentsAvailable: boolean): WorkerSessionOperations {
     const operations: WorkerSessionOperations = {
+      subagentsAvailable,
       getEntries: (source, customType) => {
         const settled = deferred<readonly ExtensionCustomEntry[]>()
         this.#requestSessionOperation(
@@ -429,6 +483,80 @@ class ExtensionWorkerProcess {
           { type: "custom_message_send", extensionId: source.id, message, delivery }
         )
         return settled.promise
+      },
+      listSubagentProfiles: source => {
+        const settled = deferred<readonly ExtensionSubagentProfile[]>()
+        this.#requestSessionOperation(
+          generation,
+          { type: "subagent_profiles_get", settled },
+          { type: "subagent_profiles_get", extensionId: source.id }
+        )
+        return settled.promise
+      },
+      spawnSubagent: (source, profile, name, prompt, signal) => {
+        const settled = deferred<string>()
+        this.#requestSessionOperation(
+          generation,
+          { type: "subagent_spawn", settled },
+          { type: "subagent_spawn", extensionId: source.id, profile, name, prompt },
+          signal
+        )
+        return settled.promise
+      },
+      sendSubagent: (source, name, text) => {
+        const settled = deferred<void>()
+        this.#requestSessionOperation(
+          generation,
+          { type: "subagent_send", settled },
+          { type: "subagent_send", extensionId: source.id, name, text }
+        )
+        return settled.promise
+      },
+      continueSubagent: (source, name, text) => {
+        const settled = deferred<"started_turn" | "follow_up">()
+        this.#requestSessionOperation(
+          generation,
+          { type: "subagent_continue", settled },
+          { type: "subagent_continue", extensionId: source.id, name, text }
+        )
+        return settled.promise
+      },
+      waitSubagents: (source, names, timeoutMs, signal) => {
+        const settled = deferred<readonly ExtensionSubagentSnapshot[]>()
+        this.#requestSessionOperation(
+          generation,
+          { type: "subagent_wait", settled },
+          { type: "subagent_wait", extensionId: source.id, names, ...(timeoutMs === undefined ? {} : { timeoutMs }) },
+          signal
+        )
+        return settled.promise
+      },
+      interruptSubagent: (source, name) => {
+        const settled = deferred<"interrupted" | "already_idle">()
+        this.#requestSessionOperation(
+          generation,
+          { type: "subagent_interrupt", settled },
+          { type: "subagent_interrupt", extensionId: source.id, name }
+        )
+        return settled.promise
+      },
+      closeSubagent: (source, name) => {
+        const settled = deferred<ExtensionSubagentSnapshot>()
+        this.#requestSessionOperation(
+          generation,
+          { type: "subagent_close", settled },
+          { type: "subagent_close", extensionId: source.id, name }
+        )
+        return settled.promise
+      },
+      listSubagents: source => {
+        const settled = deferred<readonly ExtensionSubagentSnapshot[]>()
+        this.#requestSessionOperation(
+          generation,
+          { type: "subagent_list", settled },
+          { type: "subagent_list", extensionId: source.id }
+        )
+        return settled.promise
       }
     }
     return Object.freeze(operations)
@@ -437,21 +565,13 @@ class ExtensionWorkerProcess {
   #requestSessionOperation(
     generation: number,
     request: WorkerSessionRequest,
-    fields:
-      | { readonly type: "custom_entries_get"; readonly extensionId: string; readonly customType: string }
-      | {
-          readonly type: "custom_entry_append"
-          readonly extensionId: string
-          readonly customType: string
-          readonly data?: ExtensionJsonValue
-        }
-      | {
-          readonly type: "custom_message_send"
-          readonly extensionId: string
-          readonly message: ExtensionCustomMessage
-          readonly delivery: ExtensionMessageDelivery
-        }
+    fields: WorkerSessionRequestFields,
+    signal?: AbortSignal
   ): void {
+    if (signal?.aborted) {
+      request.settled.reject(new Error("Extension subagent operation was cancelled"))
+      return
+    }
     if (workerGeneration(this.#state) !== generation) {
       request.settled.reject(new Error("Extension session operation belongs to a stale generation"))
       return
@@ -477,6 +597,26 @@ class ExtensionWorkerProcess {
     }
     this.#nextSessionRequestId++
     this.#sessionRequests.set(requestId, request)
+    const cancel = signal
+      ? () => {
+          void this.#writer.send(
+            validateWorkerMessage({
+              type: "subagent_operation_cancel",
+              generation,
+              requestId,
+              extensionId: fields.extensionId,
+              targetRequestId: requestId
+            })
+          )
+        }
+      : undefined
+    signal?.addEventListener("abort", cancel!, { once: true })
+    if (cancel) {
+      void request.settled.promise.then(
+        () => signal?.removeEventListener("abort", cancel),
+        () => signal?.removeEventListener("abort", cancel)
+      )
+    }
     void this.#writer.send(message).catch(cause => {
       if (this.#sessionRequests.get(requestId) === request) {
         this.#sessionRequests.delete(requestId)
@@ -507,6 +647,38 @@ class ExtensionWorkerProcess {
     }
     if (request.type === "custom_message_send" && response.type === "custom_message_result") {
       request.settled.resolve()
+      return
+    }
+    if (request.type === "subagent_profiles_get" && response.type === "subagent_profiles_result") {
+      request.settled.resolve(response.profiles)
+      return
+    }
+    if (request.type === "subagent_spawn" && response.type === "subagent_spawn_result") {
+      request.settled.resolve(response.name)
+      return
+    }
+    if (request.type === "subagent_send" && response.type === "subagent_send_result") {
+      request.settled.resolve()
+      return
+    }
+    if (request.type === "subagent_continue" && response.type === "subagent_continue_result") {
+      request.settled.resolve(response.delivery)
+      return
+    }
+    if (request.type === "subagent_wait" && response.type === "subagent_wait_result") {
+      request.settled.resolve(response.snapshots)
+      return
+    }
+    if (request.type === "subagent_interrupt" && response.type === "subagent_interrupt_result") {
+      request.settled.resolve(response.result)
+      return
+    }
+    if (request.type === "subagent_close" && response.type === "subagent_close_result") {
+      request.settled.resolve(response.snapshot)
+      return
+    }
+    if (request.type === "subagent_list" && response.type === "subagent_list_result") {
+      request.settled.resolve(response.snapshots)
       return
     }
     const error = new ExtensionProtocolError("Extension host returned the wrong session-operation result")
@@ -734,10 +906,20 @@ export async function runExtensionWorkerProcess(input: Readable, output: Writabl
   }
 }
 
+const unavailableOperation = () => Promise.reject(new Error("Extension session operations are unavailable"))
 const unavailableSessionOperations: WorkerSessionOperations = Object.freeze({
-  getEntries: () => Promise.reject(new Error("Extension session operations are unavailable")),
-  appendEntry: () => Promise.reject(new Error("Extension session operations are unavailable")),
-  sendMessage: () => Promise.reject(new Error("Extension session operations are unavailable"))
+  subagentsAvailable: false,
+  getEntries: unavailableOperation,
+  appendEntry: unavailableOperation,
+  sendMessage: unavailableOperation,
+  listSubagentProfiles: unavailableOperation,
+  spawnSubagent: unavailableOperation,
+  sendSubagent: unavailableOperation,
+  continueSubagent: unavailableOperation,
+  waitSubagents: unavailableOperation,
+  interruptSubagent: unavailableOperation,
+  closeSubagent: unavailableOperation,
+  listSubagents: unavailableOperation
 })
 
 export async function loadExtensionGeneration(
@@ -756,14 +938,32 @@ export async function loadExtensionGeneration(
   const shutdownHandlers: ShutdownHandler[] = []
   const tools: RegisteredTool[] = []
   const toolNames = new Set<string>()
+  const subagents: ExtensionSubagentRegistration[] = []
+  const subagentNames = new Set<string>()
 
   for (const source of plan.sources) {
     const localStart: StartHandler[] = []
     const localShutdown: ShutdownHandler[] = []
     const localTools: RegisteredTool[] = []
     const localToolNames = new Set<string>()
+    const localSubagents: ExtensionSubagentRegistration[] = []
+    const localSubagentNames = new Set<string>()
     let acceptingRegistrations = true
+    const subagentApi: ExtensionSubagentAPI | undefined = sessionOperations.subagentsAvailable
+      ? Object.freeze({
+          listProfiles: () => sessionOperations.listSubagentProfiles(source),
+          spawn: (profile, name, prompt, signal) =>
+            sessionOperations.spawnSubagent(source, profile, name, prompt, signal),
+          send: (name, text) => sessionOperations.sendSubagent(source, name, text),
+          continue: (name, text) => sessionOperations.continueSubagent(source, name, text),
+          wait: (names, timeoutMs, signal) => sessionOperations.waitSubagents(source, names, timeoutMs, signal),
+          interrupt: name => sessionOperations.interruptSubagent(source, name),
+          close: name => sessionOperations.closeSubagent(source, name),
+          list: () => sessionOperations.listSubagents(source)
+        } satisfies ExtensionSubagentAPI)
+      : undefined
     const api = Object.freeze({
+      ...(subagentApi ? { subagents: subagentApi } : {}),
       on(registeredEvent: unknown, handler: unknown): void {
         if (!acceptingRegistrations) throw new Error("Extension registration closed after factory settlement")
         if (typeof handler !== "function") throw new Error("Extension lifecycle handlers must be functions")
@@ -812,6 +1012,23 @@ export async function loadExtensionGeneration(
         localToolNames.add(name)
         localTools.push(registered)
       },
+      registerSubagentProfile(value: ExtensionSubagentProfile): void {
+        if (!acceptingRegistrations) {
+          throw new ExtensionRegistrationError("Extension registration closed after factory settlement")
+        }
+        if (subagents.length + localSubagents.length >= maxExtensionSubagentProfiles) {
+          throw new ExtensionRegistrationError(
+            `Extension generations cannot register more than ${maxExtensionSubagentProfiles} subagent profiles`
+          )
+        }
+        const registered = validateExtensionSubagentCatalog([{ ...value, source }])[0]!
+        if (subagentNames.has(registered.name) || localSubagentNames.has(registered.name)) {
+          throw new ExtensionRegistrationError(`Duplicate extension subagent profile name: ${registered.name}`)
+        }
+        validateExtensionSubagentCatalog([...subagents, ...localSubagents, registered])
+        localSubagentNames.add(registered.name)
+        localSubagents.push(registered)
+      },
       getSessionEntries(customType: string) {
         return sessionOperations.getEntries(source, customType)
       },
@@ -854,6 +1071,8 @@ export async function loadExtensionGeneration(
       shutdownHandlers.push(...localShutdown)
       tools.push(...localTools)
       for (const name of localToolNames) toolNames.add(name)
+      subagents.push(...localSubagents)
+      for (const name of localSubagentNames) subagentNames.add(name)
       results.push(Object.freeze({ source, status: "loaded" }))
     } catch (cause) {
       acceptingRegistrations = false
@@ -863,7 +1082,7 @@ export async function loadExtensionGeneration(
     }
   }
 
-  return new LoadedExtensionGeneration(results, startHandlers, shutdownHandlers, tools)
+  return new LoadedExtensionGeneration(results, startHandlers, shutdownHandlers, tools, subagents)
 }
 
 function registerTool(source: ExtensionSource, value: unknown): RegisteredTool {

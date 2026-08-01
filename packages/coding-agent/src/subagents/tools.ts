@@ -1,25 +1,25 @@
 import type { AgentTool } from "@earendil-works/pi-agent-core"
 import { Type } from "@earendil-works/pi-ai"
+import type { ExtensionSubagentProfile } from "@with-zi/extension-api"
 
 import type { SubagentCompletion } from "./child-process.js"
 import { clipUtf8 } from "./child-process.js"
 import type { SubagentSupervisor, SubagentSnapshot } from "./supervisor.js"
 import { maxSubagentNameBytes, maxSubagentPromptBytes, maxWaitNames, maxWaitTimeoutMs } from "./supervisor.js"
-import { projectSubagentToolAgent, type SubagentToolDetails } from "./tool-details.js"
 
+const subagentName = Type.String({
+  minLength: 1,
+  maxLength: maxSubagentNameBytes,
+  pattern: "^[a-z][a-z0-9_-]*$",
+  description: "Unique runtime name. Use lowercase letters, numbers, _ or -."
+})
 const messageParameters = Type.Object({
-  name: Type.String({ minLength: 1, maxLength: maxSubagentNameBytes, pattern: "^[a-z][a-z0-9_-]*$" }),
+  name: subagentName,
   text: Type.String({ minLength: 1, maxLength: maxSubagentPromptBytes })
 })
-const agentParameters = Type.Object({
-  name: Type.String({ minLength: 1, maxLength: maxSubagentNameBytes, pattern: "^[a-z][a-z0-9_-]*$" })
-})
+const nameParameters = Type.Object({ name: subagentName })
 const waitParameters = Type.Object({
-  names: Type.Array(Type.String({ minLength: 1, maxLength: maxSubagentNameBytes, pattern: "^[a-z][a-z0-9_-]*$" }), {
-    minItems: 1,
-    maxItems: maxWaitNames,
-    uniqueItems: true
-  }),
+  names: Type.Array(subagentName, { minItems: 1, maxItems: maxWaitNames, uniqueItems: true }),
   timeout_ms: Type.Optional(
     Type.Number({
       minimum: 0,
@@ -28,163 +28,142 @@ const waitParameters = Type.Object({
     })
   )
 })
-const listParameters = Type.Object({})
+const emptyParameters = Type.Object({})
 
-export const maxWaitResultBytes = 64 * 1024
+export const maxSubagentToolResultBytes = 64 * 1024
 
-export function createSubagentTools(supervisor: SubagentSupervisor): readonly AgentTool[] {
+type SpawnProfile = (profile: string, name: string, prompt: string, signal?: AbortSignal) => Promise<string>
+
+type SubagentToolDetails = {
+  readonly type: "subagent"
+  readonly operation: "profiles" | "spawn" | "send" | "continue" | "wait" | "interrupt" | "close" | "list"
+}
+
+export function createSubagentTools(
+  profiles: readonly ExtensionSubagentProfile[],
+  supervisor: SubagentSupervisor,
+  spawnProfile: SpawnProfile
+): readonly AgentTool[] {
+  if (profiles.length === 0) return Object.freeze([])
+
+  const profileNames = profiles.map(profile => profile.name)
   const spawnParameters = Type.Object({
-    name: Type.String({
-      minLength: 1,
-      maxLength: maxSubagentNameBytes,
-      pattern: "^[a-z][a-z0-9_-]*$",
-      description: "Unique short name for this child. Use lowercase letters, numbers, _ or -."
+    profile: Type.String({
+      enum: profileNames,
+      description: `Admitted profile name. Available profiles: ${profileNames.join(", ")}`
     }),
+    name: subagentName,
     prompt: Type.String({
       minLength: 1,
       maxLength: maxSubagentPromptBytes,
-      description: "Initial task for the child agent"
+      description: "Initial task for the subagent"
     })
   })
-  const spawn: AgentTool<typeof spawnParameters> = {
+  const listProfiles: AgentTool<typeof emptyParameters, SubagentToolDetails> = {
+    name: "list_subagent_profiles",
+    label: "list_subagent_profiles",
+    description: "List the admitted subagent profiles and their purposes before selecting one for spawn_subagent.",
+    parameters: emptyParameters,
+    executionMode: "parallel",
+    execute() {
+      return Promise.resolve(
+        textResult(JSON.stringify(projectProfileCatalog(profiles)), { type: "subagent", operation: "profiles" })
+      )
+    }
+  }
+  const spawn: AgentTool<typeof spawnParameters, SubagentToolDetails> = {
     name: "spawn_subagent",
     label: "spawn_subagent",
     description:
-      "Start one background Zi subagent with an initial direct prompt. Returns its name after admission; use wait_subagents for output.",
+      "Start one background Zi subagent from an admitted profile. Returns its runtime name after admission; use wait_subagents for output.",
     parameters: spawnParameters,
     executionMode: "parallel",
     async execute(_id, input, signal) {
-      const name = await supervisor.spawn(input.name, input.prompt, signal)
-      return textResult(JSON.stringify({ name }), {
-        type: "subagent",
-        outcome: "success",
-        operation: "spawn",
-        agent: projectSubagentToolAgent(requireSnapshot(supervisor, name))
-      })
+      const name = await spawnProfile(input.profile, input.name, input.prompt, signal)
+      return textResult(JSON.stringify({ name, profile: input.profile }), { type: "subagent", operation: "spawn" })
     }
   }
-  const send: AgentTool<typeof messageParameters> = {
+  const send: AgentTool<typeof messageParameters, SubagentToolDetails> = {
     name: "send_subagent",
     label: "send_subagent",
     description:
-      "Deliver information without starting a child turn. An idle child stores it for its next assigned task; a running child receives it as follow-up.",
+      "Deliver information without starting a subagent turn. An idle subagent retains it for its next task; a running subagent receives it as follow-up.",
     parameters: messageParameters,
     executionMode: "parallel",
     async execute(_id, input) {
       await supervisor.send(input.name, input.text)
       return textResult(JSON.stringify({ name: input.name, accepted: true, started_turn: false }), {
         type: "subagent",
-        outcome: "success",
-        operation: "send",
-        agent: projectSubagentToolAgent(requireSnapshot(supervisor, input.name))
+        operation: "send"
       })
     }
   }
-  const continueTool: AgentTool<typeof messageParameters> = {
+  const continueTool: AgentTool<typeof messageParameters, SubagentToolDetails> = {
     name: "continue_subagent",
     label: "continue_subagent",
     description:
-      "Assign follow-up work to a child. Starts a turn when the child is idle; otherwise delivers the task to its current turn.",
+      "Assign follow-up work to a subagent. Starts a turn when it is idle; otherwise delivers the task to its current turn.",
     parameters: messageParameters,
     executionMode: "parallel",
     async execute(_id, input) {
       const delivery = await supervisor.continue(input.name, input.text)
       return textResult(
         JSON.stringify({ name: input.name, accepted: true, started_turn: delivery === "started_turn" }),
-        {
-          type: "subagent",
-          outcome: "success",
-          operation: "continue",
-          agent: projectSubagentToolAgent(requireSnapshot(supervisor, input.name))
-        }
+        { type: "subagent", operation: "continue" }
       )
     }
   }
-  const wait: AgentTool<typeof waitParameters> = {
+  const wait: AgentTool<typeof waitParameters, SubagentToolDetails> = {
     name: "wait_subagents",
     label: "wait_subagents",
     description:
-      "Wait for all requested current child tasks. Returns each completion, or current status on timeout, without cancelling children.",
+      "Wait for all requested current subagent tasks. Returns each completion, or current status on timeout, without cancelling subagents.",
     parameters: waitParameters,
     executionMode: "parallel",
     async execute(_id, input, signal) {
       const snapshots = await supervisor.wait(input.names, input.timeout_ms ?? supervisor.waitTimeoutMs, signal)
-      return textResult(JSON.stringify(projectWaitResult(snapshots)), {
-        type: "subagent",
-        outcome: "success",
-        operation: "wait",
-        agents: snapshots.map(projectSubagentToolAgent)
-      })
+      return textResult(JSON.stringify(projectWaitResult(snapshots)), { type: "subagent", operation: "wait" })
     }
   }
-  const interrupt: AgentTool<typeof agentParameters> = {
+  const interrupt: AgentTool<typeof nameParameters, SubagentToolDetails> = {
     name: "interrupt_subagent",
     label: "interrupt_subagent",
-    description: "Interrupt current child work while keeping the process reusable.",
-    parameters: agentParameters,
+    description: "Interrupt current subagent work while keeping its process reusable.",
+    parameters: nameParameters,
     executionMode: "parallel",
     async execute(_id, input) {
-      const result = await supervisor.interrupt(input.name)
-      return textResult(JSON.stringify({ name: input.name, result }), {
-        type: "subagent",
-        outcome: "success",
-        operation: "interrupt",
-        agent: projectSubagentToolAgent(requireSnapshot(supervisor, input.name)),
-        result
-      })
+      const outcome = await supervisor.interrupt(input.name)
+      return textResult(JSON.stringify({ name: input.name, outcome }), { type: "subagent", operation: "interrupt" })
     }
   }
-  const close: AgentTool<typeof agentParameters> = {
+  const close: AgentTool<typeof nameParameters, SubagentToolDetails> = {
     name: "close_subagent",
     label: "close_subagent",
-    description:
-      "Close one child process, return its prior status and previous completion status, and release its live-child capacity.",
-    parameters: agentParameters,
+    description: "Close one subagent process and release its live-child capacity.",
+    parameters: nameParameters,
     executionMode: "parallel",
     async execute(_id, input) {
-      const previous = await supervisor.close(input.name)
-      const previousCompletion = previous.completion ? { status: previous.completion.status } : undefined
-      return textResult(
-        JSON.stringify({
-          name: input.name,
-          closed: true,
-          previous_status: previous.lifecycle,
-          ...(previousCompletion ? { previous_completion: previousCompletion } : {})
-        }),
-        {
-          type: "subagent",
-          outcome: "success",
-          operation: "close",
-          agent: projectSubagentToolAgent(requireSnapshot(supervisor, input.name)),
-          previousStatus: previous.lifecycle,
-          ...(previous.completion ? { previousCompletionStatus: previous.completion.status } : {})
-        }
-      )
+      const snapshot = await supervisor.close(input.name)
+      return textResult(JSON.stringify(projectListSnapshot(snapshot)), { type: "subagent", operation: "close" })
     }
   }
-  const list: AgentTool<typeof listParameters> = {
+  const list: AgentTool<typeof emptyParameters, SubagentToolDetails> = {
     name: "list_subagents",
     label: "list_subagents",
     description:
-      "Return current direct-child status and any uncollected result readiness, without child conversations.",
-    parameters: listParameters,
+      "List current direct-subagent status and uncollected result readiness without returning conversations.",
+    parameters: emptyParameters,
     executionMode: "parallel",
     execute() {
-      const snapshots = supervisor.snapshots()
-      const status = supervisor.status()
       return Promise.resolve(
-        textResult(JSON.stringify({ agents: snapshots.map(projectListSnapshot) }), {
+        textResult(JSON.stringify({ subagents: supervisor.snapshots().map(projectListSnapshot) }), {
           type: "subagent",
-          outcome: "success",
-          operation: "list",
-          agents: snapshots.map(projectSubagentToolAgent),
-          workingNames: status.workingNames,
-          readyNames: status.readyNames
+          operation: "list"
         })
       )
     }
   }
-  return Object.freeze([spawn, send, continueTool, wait, interrupt, close, list])
+  return Object.freeze([listProfiles, spawn, send, continueTool, wait, interrupt, close, list])
 }
 
 type WaitCompletion = {
@@ -198,49 +177,77 @@ type WaitCompletion = {
   error?: string
 }
 
-type WaitAgent = { name: string; completion: WaitCompletion } | { name: string; status: SubagentSnapshot["lifecycle"] }
+type WaitSubagent =
+  | { name: string; completion: WaitCompletion }
+  | { name: string; status: SubagentSnapshot["lifecycle"] }
 
 function projectWaitResult(snapshots: readonly SubagentSnapshot[]) {
-  const agents: WaitAgent[] = snapshots.map(projectSnapshot)
-  let omittedBytes = agents.reduce(
-    (total, agent) => total + ("completion" in agent ? agent.completion.omitted_bytes : 0),
+  const subagents: WaitSubagent[] = snapshots.map(projectSnapshot)
+  let omittedBytes = subagents.reduce(
+    (total, subagent) => total + ("completion" in subagent ? subagent.completion.omitted_bytes : 0),
     0
   )
-  const result = { agents, all_completed: agents.every(agent => "completion" in agent), omitted_bytes: omittedBytes }
+  const projected = {
+    subagents,
+    all_completed: subagents.every(subagent => "completion" in subagent),
+    omitted_bytes: omittedBytes
+  }
 
-  while (Buffer.byteLength(JSON.stringify(result)) > maxWaitResultBytes) {
-    const evidence = largestWaitEvidence(agents)
-    if (!evidence) throw new Error(`Subagent wait metadata exceeds ${maxWaitResultBytes} bytes`)
-    const excess = Buffer.byteLength(JSON.stringify(result)) - maxWaitResultBytes
+  while (Buffer.byteLength(JSON.stringify(projected)) > maxSubagentToolResultBytes) {
+    const evidence = largestWaitEvidence(subagents)
+    if (!evidence) throw new Error(`Subagent wait metadata exceeds ${maxSubagentToolResultBytes} bytes`)
+    const excess = Buffer.byteLength(JSON.stringify(projected)) - maxSubagentToolResultBytes
     const clipped = clipUtf8(evidence.completion[evidence.field] ?? "", Math.max(0, evidence.bytes - excess))
     evidence.completion[evidence.field] = clipped.text
     evidence.completion.omitted_bytes += clipped.omittedBytes
     evidence.completion.truncated = true
     omittedBytes += clipped.omittedBytes
-    result.omitted_bytes = omittedBytes
+    projected.omitted_bytes = omittedBytes
   }
 
-  return result
+  return projected
+}
+
+function projectProfileCatalog(profiles: readonly ExtensionSubagentProfile[]) {
+  const projected = profiles.map(profile => ({ name: profile.name, description: profile.description }))
+  let omittedBytes = 0
+  const catalog = { profiles: projected, omitted_bytes: omittedBytes }
+  while (Buffer.byteLength(JSON.stringify(catalog)) > maxSubagentToolResultBytes) {
+    const largest = projected.reduce<{ profile: (typeof projected)[number]; bytes: number } | undefined>(
+      (current, profile) => {
+        const bytes = Buffer.byteLength(profile.description)
+        return !current || bytes > current.bytes ? { profile, bytes } : current
+      },
+      undefined
+    )
+    if (!largest || largest.bytes === 0)
+      throw new Error(`Subagent profile metadata exceeds ${maxSubagentToolResultBytes} bytes`)
+    const excess = Buffer.byteLength(JSON.stringify(catalog)) - maxSubagentToolResultBytes
+    const clipped = clipUtf8(largest.profile.description, Math.max(0, largest.bytes - excess))
+    largest.profile.description = clipped.text
+    omittedBytes += clipped.omittedBytes
+    catalog.omitted_bytes = omittedBytes
+  }
+  return catalog
 }
 
 function largestWaitEvidence(
-  agents: readonly WaitAgent[]
+  subagents: readonly WaitSubagent[]
 ): { completion: WaitCompletion; field: "text" | "reason" | "error"; bytes: number } | undefined {
   let largest: { completion: WaitCompletion; field: "text" | "reason" | "error"; bytes: number } | undefined
-  for (const agent of agents) {
-    if (!("completion" in agent)) continue
-    const completion = agent.completion
+  for (const subagent of subagents) {
+    if (!("completion" in subagent)) continue
     for (const field of ["text", "reason", "error"] as const) {
-      const value = completion[field]
+      const value = subagent.completion[field]
       if (!value) continue
       const bytes = Buffer.byteLength(value)
-      if (!largest || bytes > largest.bytes) largest = { completion, field, bytes }
+      if (!largest || bytes > largest.bytes) largest = { completion: subagent.completion, field, bytes }
     }
   }
   return largest
 }
 
-function projectSnapshot(snapshot: SubagentSnapshot): WaitAgent {
+function projectSnapshot(snapshot: SubagentSnapshot): WaitSubagent {
   const completion = snapshot.completion
   if (!completion || completion.workCycle !== snapshot.workCycle) {
     return { name: snapshot.name, status: snapshot.lifecycle }
@@ -268,12 +275,6 @@ function projectListSnapshot(snapshot: SubagentSnapshot) {
       ? { result_ready: { status: snapshot.completion.status } }
       : {})
   }
-}
-
-function requireSnapshot(supervisor: SubagentSupervisor, name: string): SubagentSnapshot {
-  const snapshot = supervisor.snapshots().find(value => value.name === name)
-  if (!snapshot) throw new Error(`Subagent ${name} completed an operation without a retained snapshot`)
-  return snapshot
 }
 
 function textResult(text: string, details: SubagentToolDetails) {
