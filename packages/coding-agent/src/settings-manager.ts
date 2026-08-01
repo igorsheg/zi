@@ -7,6 +7,7 @@ import lockfile from "proper-lockfile"
 import type { ZiPaths } from "./paths.js"
 import type { ProjectConfigurationAdmission } from "./project-trust.js"
 import { isRetryCount, isRetryDelay } from "./retry.js"
+import { defaultWaitTimeoutMs, isSubagentWaitTimeout } from "./subagents/wait-policy.js"
 
 export { maxRetryBaseDelayMs, maxRetryCount } from "./retry.js"
 
@@ -18,6 +19,8 @@ export interface AgentSettings {
   steeringMode: QueueMode
   followUpMode: QueueMode
   codexFastMode: boolean
+  subagentsEnabled: boolean
+  subagentWaitTimeoutMs: number
   retryEnabled: boolean
   retryMaxRetries: number
   retryBaseDelayMs: number
@@ -33,6 +36,8 @@ const defaults: AgentSettings = {
   steeringMode: "one-at-a-time",
   followUpMode: "one-at-a-time",
   codexFastMode: false,
+  subagentsEnabled: true,
+  subagentWaitTimeoutMs: defaultWaitTimeoutMs,
   retryEnabled: true,
   retryMaxRetries: 3,
   retryBaseDelayMs: 2_000,
@@ -219,6 +224,12 @@ function validateSettingsPatch(patch: Partial<AgentSettings>): void {
   if ("codexFastMode" in patch && typeof patch.codexFastMode !== "boolean") {
     throw new Error("Invalid codexFastMode setting")
   }
+  if ("subagentsEnabled" in patch && typeof patch.subagentsEnabled !== "boolean") {
+    throw new Error("Invalid subagentsEnabled setting")
+  }
+  if ("subagentWaitTimeoutMs" in patch && !isSubagentWaitTimeout(patch.subagentWaitTimeoutMs)) {
+    throw new Error("Invalid subagentWaitTimeoutMs setting")
+  }
   if ("retryEnabled" in patch && typeof patch.retryEnabled !== "boolean") {
     throw new Error("Invalid retryEnabled setting")
   }
@@ -265,6 +276,8 @@ function clearOverrides(overrides: Partial<AgentSettings>, patch: Partial<AgentS
   if ("steeringMode" in patch) delete overrides.steeringMode
   if ("followUpMode" in patch) delete overrides.followUpMode
   if ("codexFastMode" in patch) delete overrides.codexFastMode
+  if ("subagentsEnabled" in patch) delete overrides.subagentsEnabled
+  if ("subagentWaitTimeoutMs" in patch) delete overrides.subagentWaitTimeoutMs
   if ("retryEnabled" in patch) delete overrides.retryEnabled
   if ("retryMaxRetries" in patch) delete overrides.retryMaxRetries
   if ("retryBaseDelayMs" in patch) delete overrides.retryBaseDelayMs
@@ -377,6 +390,14 @@ function loadSettings(path: string): Partial<AgentSettings> {
   if (value.codexFastMode !== undefined) {
     if (typeof value.codexFastMode !== "boolean") throw invalidSetting(path, "codexFastMode")
     settings.codexFastMode = value.codexFastMode
+  }
+  if (value.subagentsEnabled !== undefined) {
+    if (typeof value.subagentsEnabled !== "boolean") throw invalidSetting(path, "subagentsEnabled")
+    settings.subagentsEnabled = value.subagentsEnabled
+  }
+  if (value.subagentWaitTimeoutMs !== undefined) {
+    if (!isSubagentWaitTimeout(value.subagentWaitTimeoutMs)) throw invalidSetting(path, "subagentWaitTimeoutMs")
+    settings.subagentWaitTimeoutMs = value.subagentWaitTimeoutMs
   }
   if (value.retryEnabled !== undefined) {
     if (typeof value.retryEnabled !== "boolean") throw invalidSetting(path, "retryEnabled")

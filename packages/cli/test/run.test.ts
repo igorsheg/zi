@@ -7,6 +7,10 @@ import type { AgentMessage, AgentRuntime, AgentSessionRuntime, CreateAgentRuntim
 import { codeModeWorkerArgument } from "@with-zi/coding-agent/internal/code-mode-worker-mode"
 import { extensionWorkerArgument } from "@with-zi/coding-agent/internal/extension-worker"
 import {
+  internalSubagentApiKeyEnvironment,
+  internalSubagentDepthEnvironment
+} from "@with-zi/coding-agent/internal/subagent-invocation"
+import {
   createModels,
   createTestAgentRuntime,
   createTestAgentSessionRuntime,
@@ -137,6 +141,10 @@ test("CLI argument defaults handle Bun scripts and compiled executables", () => 
   expect(defaultCliArgv(["C:\\tools\\zi.exe", "B:\\~BUN\\root\\standalone", extensionWorkerArgument])).toEqual([
     extensionWorkerArgument
   ])
+  expect(defaultCliArgv(["C:\\tools\\zi.exe", "B:\\~BUN\\root\\standalone", "--mode", "rpc"])).toEqual([
+    "--mode",
+    "rpc"
+  ])
   expect(defaultCliArgv(["C:\\tools\\zi.exe", "--mode", "interactive", interactiveAcceptanceArgument])).toEqual([
     "--mode",
     "interactive",
@@ -147,10 +155,28 @@ test("CLI argument defaults handle Bun scripts and compiled executables", () => 
     resolvePath("/work/packages/cli/src/main.ts")
   ])
   expect(currentZiCommand([process.execPath, "/$bunfs/root/standalone"])).toEqual([process.execPath])
+  expect(currentZiCommand([process.execPath, "B:\\~BUN\\root\\standalone.ts"])).toEqual([process.execPath])
 })
 
 test("the internal acceptance host changes only CLI TTY admission facts", () => {
   expect(createProcessHost(true)).toMatchObject({ stdinIsTTY: true, stdoutIsTTY: true })
+})
+
+test("the child process host captures then scrubs its private credential", () => {
+  const previousDepth = process.env[internalSubagentDepthEnvironment]
+  const previousApiKey = process.env[internalSubagentApiKeyEnvironment]
+  process.env[internalSubagentDepthEnvironment] = "1"
+  process.env[internalSubagentApiKeyEnvironment] = "child-secret"
+  try {
+    const host = createProcessHost(false)
+    expect(host.env[internalSubagentApiKeyEnvironment]).toBe("child-secret")
+    expect(process.env[internalSubagentApiKeyEnvironment]).toBeUndefined()
+  } finally {
+    if (previousDepth === undefined) delete process.env[internalSubagentDepthEnvironment]
+    else process.env[internalSubagentDepthEnvironment] = previousDepth
+    if (previousApiKey === undefined) delete process.env[internalSubagentApiKeyEnvironment]
+    else process.env[internalSubagentApiKeyEnvironment] = previousApiKey
+  }
 })
 
 test("CLI mode resolution keeps explicit protocols and otherwise follows TTY facts", () => {
@@ -205,6 +231,31 @@ test("text mode writes final output without loading the TUI and disposes its run
   expect(output.join("")).not.toContain("cli-secret")
   expect(interactiveLoads).toBe(0)
   expect(() => runtime?.session.prompt("disposed")).toThrow("AgentSession is disposed")
+})
+
+test("a depth-one child admits its scrubbed private credential without a CLI argument", async () => {
+  const models = createModels()
+  const faux = fauxProvider()
+  models.setProvider(faux.provider)
+  faux.setResponses([fauxAssistantMessage("done")])
+  let receivedOptions: CreateAgentRuntimeOptions | undefined
+  const output: string[] = []
+  const errors: string[] = []
+  const host = testHost({
+    output,
+    errors,
+    env: { [internalSubagentDepthEnvironment]: "1", [internalSubagentApiKeyEnvironment]: "child-secret" },
+    async createRuntime(options) {
+      receivedOptions = options
+      return createTestAgentRuntime({ ...options, models })
+    }
+  })
+
+  const model = `${faux.getModel().provider}/${faux.getModel().id}`
+  const exitCode = await runCli(["-p", "--no-session", "--model", model, "start"], host)
+
+  expect({ exitCode, output, errors }).toEqual({ exitCode: 0, output: ["done\n"], errors: [] })
+  expect(receivedOptions).toMatchObject({ apiKey: "child-secret", internalSubagentDepth: 1 })
 })
 
 test("environment defaults resolve once before runtime construction and CLI values win", async () => {

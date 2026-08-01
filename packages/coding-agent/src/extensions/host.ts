@@ -13,6 +13,7 @@ import type {
   JsonValue as ExtensionJsonValue
 } from "@with-zi/extension-api"
 
+import type { ProcessScope, ProcessTreeTracker } from "../processes/process-tree.js"
 import type { ExtensionLoadPlan } from "./discovery.js"
 import {
   boundedExtensionDiagnostic,
@@ -53,9 +54,10 @@ export interface ExtensionWorkerProcess {
   readonly stdout: Readable
   readonly stderr: Readable
   readonly protocol: Readable
+  readonly admitted?: Promise<void>
   readonly exited: Promise<ExtensionWorkerExit>
   terminate(force: boolean): void
-  dispose(): void
+  dispose(): void | Promise<void>
 }
 
 export type SpawnExtensionWorker = (plan: ExtensionLoadPlan) => ExtensionWorkerProcess
@@ -369,6 +371,7 @@ class ExtensionGeneration {
   }
 
   async initialize(): Promise<ExtensionGenerationReady> {
+    await this.#process.admitted
     const state = this.#state
     if (state.type !== "starting") throw new Error("Extension generation initialization was already admitted")
     const initialize: HostMessage = {
@@ -784,7 +787,7 @@ class ExtensionGeneration {
       )
     }
 
-    this.#release()
+    await this.#release()
     this.#state = { type: "disposed" }
     disposal.resolve()
   }
@@ -831,7 +834,7 @@ class ExtensionGeneration {
     return requestId
   }
 
-  #release(): void {
+  async #release(): Promise<void> {
     const error = new Error("Extension generation disposed during tool invocation")
     for (const invocation of this.#toolInvocations.values()) {
       this.#finishToolInvocation(invocation, { error })
@@ -850,7 +853,7 @@ class ExtensionGeneration {
     this.#process.stdout.destroy()
     this.#process.stderr.destroy()
     try {
-      this.#process.dispose()
+      await this.#process.dispose()
     } catch (cause) {
       this.#onDiagnostic(
         diagnostic("shutdown", errorMessage(cause, "Extension worker process cleanup failed"), cause, "warning")
@@ -1565,6 +1568,7 @@ type SpawnedExtensionChild =
 
 export function createExtensionWorkerSpawner(
   command: readonly string[],
+  processTreeTracker: ProcessTreeTracker,
   removePublicApiDirectory: (path: string) => void = path => rmSync(path, { recursive: true, force: true })
 ): SpawnExtensionWorker {
   if (
@@ -1592,6 +1596,8 @@ export function createExtensionWorkerSpawner(
     try {
       // Bun owns POSIX pipe creation because its node adapter can fail while materializing fd 3 under Linux load.
       // The node adapter remains required on Windows, where Bun's direct fd 3 transport is not connected.
+      // POSIX workers start a dedicated session/process group so hard containment can signal
+      // the whole group. Windows workers join a kill-on-close Job Object after spawn.
       child =
         process.platform === "win32"
           ? {
@@ -1609,6 +1615,7 @@ export function createExtensionWorkerSpawner(
                 cwd: plan.cwd,
                 env,
                 stdio: ["pipe", "pipe", "pipe", "pipe"],
+                detached: true,
                 windowsHide: true
               })
             }
@@ -1659,23 +1666,61 @@ export function createExtensionWorkerSpawner(
     }
 
     let settled = false
+    let finishSettlement: Promise<void> | undefined
     let processError: Error | undefined
     let resolveExit!: (exit: ExtensionWorkerExit) => void
     const exited = new Promise<ExtensionWorkerExit>(resolve => {
       resolveExit = resolve
     })
-    const finish = (code: number | null, signal: NodeJS.Signals | null): void => {
-      if (settled) return
-      settled = true
+    const workerPid = child.process.pid
+    if (typeof workerPid !== "number" || workerPid <= 0) {
+      killSpawnedExtensionChild(child, "SIGKILL")
+      unrefSpawnedExtensionChild(child)
+      publicApi.dispose()
+      throw new Error("Extension worker did not expose a process id")
+    }
+    let processScope: ProcessScope
+    try {
+      processScope = processTreeTracker.track(workerPid, error => {
+        processError ??= error
+        killSpawnedExtensionChild(child, "SIGKILL")
+      })
+    } catch (cause) {
+      processError = cause instanceof Error ? cause : new Error("Could not create extension worker process scope")
+      killSpawnedExtensionChild(child, "SIGKILL")
+      unrefSpawnedExtensionChild(child)
       const cleanupError = publicApi.dispose()
       if (cleanupError) {
-        processError = processError
-          ? new Error(`${processError.message}; public API cleanup failed: ${cleanupError.message}`, {
-              cause: processError
-            })
-          : cleanupError
+        throw new Error(`${processError.message}; ${cleanupError.message}`, { cause })
       }
-      resolveExit({ code, signal, ...(processError ? { error: processError } : {}) })
+      throw processError
+    }
+    const finish = (code: number | null, signal: NodeJS.Signals | null): Promise<void> => {
+      if (finishSettlement) return finishSettlement
+      settled = true
+      finishSettlement = (async () => {
+        try {
+          await processScope.terminate()
+        } catch (cause) {
+          processError = processError
+            ? new Error(`${processError.message}; process scope cleanup failed: ${errorMessage(cause, "unknown")}`, {
+                cause: processError
+              })
+            : cause instanceof Error
+              ? cause
+              : new Error(errorMessage(cause, "process scope cleanup failed"))
+        }
+        const cleanupError = publicApi.dispose()
+        if (cleanupError) {
+          processError = processError
+            ? new Error(`${processError.message}; public API cleanup failed: ${cleanupError.message}`, {
+                cause: processError
+              })
+            : cleanupError
+        }
+        resolveExit({ code, signal, ...(processError ? { error: processError } : {}) })
+      })()
+      return finishSettlement
     }
     let stopObservingExit: (() => void) | undefined
     if (child.type === "bun") {
@@ -1684,7 +1729,7 @@ export function createExtensionWorkerSpawner(
         code => finish(code, childProcess.signalCode),
         cause => {
           processError = cause instanceof Error ? cause : new Error("Extension worker process failed")
-          finish(childProcess.exitCode, childProcess.signalCode)
+          void finish(childProcess.exitCode, childProcess.signalCode)
         }
       )
     } else {
@@ -1692,7 +1737,9 @@ export function createExtensionWorkerSpawner(
       const onError = (cause: Error): void => {
         processError = cause
       }
-      const onClose = (code: number | null, signal: NodeJS.Signals | null): void => finish(code, signal)
+      const onClose = (code: number | null, signal: NodeJS.Signals | null): void => {
+        void finish(code, signal)
+      }
       childProcess.on("error", onError)
       childProcess.on("close", onClose)
       stopObservingExit = () => {
@@ -1706,18 +1753,31 @@ export function createExtensionWorkerSpawner(
       stdout,
       stderr,
       protocol,
+      admitted: processScope.admitted,
       exited,
       terminate(force) {
-        if (!settled) killSpawnedExtensionChild(child, force ? "SIGKILL" : "SIGTERM")
-      },
-      dispose() {
-        stopObservingExit?.()
-        if (!settled) {
-          unrefSpawnedExtensionChild(child)
-          processError ??= new Error("Extension worker process ownership ended before exit observation")
-          const exit = spawnedExtensionChildExit(child)
-          finish(exit.code, exit.signal)
+        if (settled) return
+        if (force) {
+          killSpawnedExtensionChild(child, "SIGKILL")
+          void processScope.terminate().catch(cause => {
+            processError ??=
+              cause instanceof Error ? cause : new Error(errorMessage(cause, "process scope cleanup failed"))
+          })
+          return
         }
+        killSpawnedExtensionChild(child, "SIGTERM")
+      },
+      async dispose() {
+        stopObservingExit?.()
+        if (finishSettlement) {
+          await finishSettlement
+          return
+        }
+        await processScope.terminate()
+        unrefSpawnedExtensionChild(child)
+        processError ??= new Error("Extension worker process ownership ended before exit observation")
+        const exit = spawnedExtensionChildExit(child)
+        await finish(exit.code, exit.signal)
       }
     }
   }

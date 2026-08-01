@@ -9,7 +9,8 @@ export const maxRpcRequestIdBytes = 256
 export const maxRpcMessagePageCount = 100
 export const maxRpcMessagePageBytes = 8 * 1024 * 1024
 
-export type RpcInputDelivery = "direct" | "steer" | "follow_up"
+export type RpcInputDelivery = "direct" | "steer" | "follow_up" | "continue"
+export type RpcEventMode = "all" | "none"
 
 export type RpcRequest =
   | { readonly version: 1; readonly id: string; readonly method: "session.get_state" }
@@ -27,6 +28,12 @@ export type RpcRequest =
     }
   | { readonly version: 1; readonly id: string; readonly method: "session.interrupt" }
   | { readonly version: 1; readonly id: string; readonly method: "session.await_idle" }
+  | {
+      readonly version: 1
+      readonly id: string
+      readonly method: "connection.set_events"
+      readonly params: { readonly mode: RpcEventMode }
+    }
   | { readonly version: 1; readonly id: string; readonly method: "model.list" }
   | {
       readonly version: 1
@@ -176,11 +183,29 @@ export function decodeRpcRequest(value: unknown): RpcRequest {
       requireKeys(value, ["version", "id", "method", "params"], requestId)
       const params = requireRecord(value.params, "session.prompt params", requestId)
       requireKeys(params, ["delivery", "text"], requestId)
-      if (params.delivery !== "direct" && params.delivery !== "steer" && params.delivery !== "follow_up") {
-        throw new RpcRequestError("invalid_request", "Prompt delivery must be direct, steer, or follow_up", requestId)
+      if (
+        params.delivery !== "direct" &&
+        params.delivery !== "steer" &&
+        params.delivery !== "follow_up" &&
+        params.delivery !== "continue"
+      ) {
+        throw new RpcRequestError(
+          "invalid_request",
+          "Prompt delivery must be direct, steer, follow_up, or continue",
+          requestId
+        )
       }
       const text = boundedString(params.text, "Prompt text", maxRpcInputTextBytes, requestId)
       return { version: 1, id: requestId, method: "session.prompt", params: { delivery: params.delivery, text } }
+    }
+    case "connection.set_events": {
+      requireKeys(value, ["version", "id", "method", "params"], requestId)
+      const params = requireRecord(value.params, "connection.set_events params", requestId)
+      requireKeys(params, ["mode"], requestId)
+      if (params.mode !== "all" && params.mode !== "none") {
+        throw new RpcRequestError("invalid_request", "Event mode must be all or none", requestId)
+      }
+      return { version: 1, id: requestId, method: "connection.set_events", params: { mode: params.mode } }
     }
     case "model.select": {
       requireKeys(value, ["version", "id", "method", "params"], requestId)

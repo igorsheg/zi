@@ -1,7 +1,7 @@
 # Product roadmap
 
 - Status: active
-- Updated: 2026-07-30
+- Updated: 2026-07-31
 
 This roadmap orders product work by downstream leverage. [`parity-roadmap.md`](parity-roadmap.md) remains the capability and provenance inventory; parity evidence no longer determines product priority by itself. Product choices follow the [`building-block strategy`](building-block-strategy.md).
 
@@ -98,6 +98,27 @@ After custom tools and RPC are in use, choose independently proven slices:
 - session-tree operations;
 - package installation and provenance;
 - declarative terminal contributions.
+
+### In progress — native subagents
+
+Design: accepted [`native subagent design`](subagent-native-design-proposal.md), migrated [`process orchestration specification`](subagent-process-orchestration-spec.md), [ADR 0027](adr/0027-session-owned-native-subagents.md). ADR 0026 remains the RPC subprocess and containment decision.
+
+- [x] Prove the RPC subprocess vertical slice in an extension spike.
+- [x] Add RPC `connection.set_events` and atomic `delivery: "continue"` with behavior tests.
+- [x] Move `ChildZiProcess`, `SubagentSupervisor`, and the seven native tools under `packages/coding-agent`.
+- [x] Make `AgentSession` own supervisor lifetime, native journal evidence, the bounded completion mailbox, completion notices, and client-neutral change events.
+- [x] Make `spawn_subagent` require a model-authored `{ name, prompt }`, reserve names as the sole identity for the parent session, and apply universal child instructions as native supervisor policy.
+- [x] Exercise the local native owner against mock RPC children, including spawn/wait/close, queue-only/continue, interruption/reuse, capacity, recovery, and shutdown.
+- [x] Add native race, cancellation, name uniqueness and recovery, journal, mailbox-bound, and Code Mode acceptance with mock RPC children.
+- [x] Add release-shaped compiled acceptance for close, forced child death, session disposal, descendant settlement, completion notice, queue-only delivery, interruption/reuse, and native journal evidence to the five-target matrix.
+- [x] Keep ephemeral parent API-key overrides out of child argv and scrub their private invocation environment value before child extensions or shell tools start.
+- [x] Add concise model policy for self-contained non-overlapping assignments, collection and synthesis, cleanup, and parent/child interruption ownership.
+- [x] Bound aggregate wait output, keep completion text out of list results, expose expanded completion evidence, and distinguish ready, failed, and cancelled status in the TUI.
+- [x] Publish the [subagent product guide](subagents.md) and [real-model evaluation rubric](subagents-evaluation.md).
+- [ ] Pass the real-model delegation rubric with two provider families and record the enabled/disabled comparison.
+- [ ] Pass compiled real-Zi acceptance on darwin-arm64, darwin-x64, linux-arm64, linux-x64, and windows-x64.
+- [ ] Prove graceful and forced descendant cleanup on every target, including a real Windows Job Object, before supported release.
+- [x] Remove the copyable orchestration extension and the speculative subagent type/definition extension catalog; defer roles until Zi has concrete enforced semantics.
 
 Each capability receives its own closed protocol messages, owner, bounds, example, and behavior tests. No capability expands a generic extension facade in anticipation of another.
 

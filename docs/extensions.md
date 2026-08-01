@@ -13,8 +13,8 @@ Extensions run as the current user. They can read files and environment variable
 Zi discovers entry points in deterministic order:
 
 1. repeated `--extension <path>` arguments;
-2. `$HOME/.zi/agent/extensions/`;
-3. `<cwd>/.zi/extensions/`, when trusted.
+2. `<cwd>/.zi/extensions/`, when trusted;
+3. `$HOME/.zi/agent/extensions/`.
 
 A directory entry may use `index.ts`; a direct `.ts` file also works. TypeScript and relative imports load without a build. Install third-party dependencies in the extension's own package hierarchy so normal bare-module resolution can find them.
 
@@ -48,6 +48,12 @@ Tool names use lowercase letters, numbers, and underscores and must begin with a
 Without `outputSchema`, a tool returns one bounded string. Declaring `outputSchema` lets it return a matching bounded JSON value. Zi validates that value in the extension worker, renders it as JSON for direct model calls, and delivers it as an already-decoded JavaScript value in Code Mode. Tools throw errors for failed operations. Built-in Zi tool names take precedence over extension registrations.
 
 `execute` receives an invocation-scoped `AbortSignal`. Cancellation is cooperative: pass the signal to subprocess or I/O APIs and stop owned work promptly. Zi rejects late completion and terminates a worker that misses execution or cancellation deadlines.
+
+### Native subagents are not an extension catalog
+
+Extensions neither register subagent types nor receive a procedural subagent API. Native `spawn_subagent` requires a model-authored `{ name, prompt }`; that parent-session-unique name is the sole child identity. The session-owned supervisor applies universal child instructions and owns process, RPC, mailbox, durability, and shutdown policy.
+
+Zi deliberately defers extension-provided roles until a role can express concrete enforced semantics such as model routing, tool filtering, permissions, or worktree isolation. Prompt-only personas would imply authority the runtime does not enforce.
 
 ### Durable state and custom messages
 

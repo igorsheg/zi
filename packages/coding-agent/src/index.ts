@@ -47,7 +47,13 @@ export type {
   AgentRuntimeSessionIntent,
   CreateAgentRuntimeOptions
 } from "./runtime.js"
-export * from "./sdk.js"
+export { createAgentSession } from "./sdk.js"
+export type {
+  AgentSessionServices,
+  CreateAgentSessionOptions,
+  CreateAgentSessionResult,
+  SessionBootstrapDiagnostic
+} from "./sdk.js"
 export * from "./session-manager.js"
 export * from "./session-shell.js"
 export * from "./settings-manager.js"
@@ -59,5 +65,6 @@ export {
   type Skill
 } from "./skills.js"
 export * from "./slash-commands.js"
+export type { SubagentSnapshot, SubagentStatus } from "./subagents/supervisor.js"
 export * from "./system-prompt.js"
 export * from "./tools/index.js"

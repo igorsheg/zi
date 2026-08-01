@@ -50,6 +50,22 @@ Guidelines:
         .join("\n\n")}\n</project_context>`
     )
   }
+  if (tools.some(tool => tool.name === "spawn_subagent")) {
+    sections.push(`Subagents:
+- Delegate independent or context-heavy work; do not delegate trivial work.
+- Give each child a short unique name and a concrete, self-contained task.
+- State the exact expected output, relevant context, explicit scope or file boundaries, and a stopping condition.
+- For exploration, set a bounded time or scope budget and ask for findings instead of an indefinite scan.
+- Parallel assignments must not overlap; sequence dependent work instead.
+- While children run, continue non-overlapping local work; wait only when blocked on their results.
+- At most four direct children may be live.
+- Children share this process user's filesystem and credential authority.
+- Use wait_subagents to wait for delegated work and synthesize the results before answering.
+- Close children when their work is done to release capacity.
+- Interrupting the parent does not interrupt admitted children; interrupt or close them explicitly.
+- Use send_subagent to deliver information without starting a turn.
+- Use continue_subagent to assign follow-up work; it starts an idle child turn.`)
+  }
   if (tools.some(tool => tool.name === "read")) {
     const skills = formatSkillsForPrompt(resources.skills)
     if (skills.length > 0) sections.push(skills)

@@ -15,6 +15,7 @@ import { createExtensionWorkerSpawner, ExtensionHost } from "./extensions/host.j
 import { ModelRegistry } from "./model-registry.js"
 import { resolveRequestedModel } from "./model-resolver.js"
 import { getAgentDir, ZiPaths } from "./paths.js"
+import { createProcessTreeTracker } from "./processes/process-tree.js"
 import { projectConfigurationAdmission, resolveProjectTrust, type ProjectTrustResolution } from "./project-trust.js"
 import { ResourceLoader } from "./resource-loader.js"
 import {
@@ -22,10 +23,15 @@ import {
   type AgentRuntimeSessionIntent,
   type CreateAgentRuntimeOptions
 } from "./runtime-options.js"
-import { createAgentSession, type AgentSessionServices, type SessionBootstrapDiagnostic } from "./sdk.js"
+import {
+  createAgentSessionWithProcessTreeTracker,
+  type AgentSessionServices,
+  type SessionBootstrapDiagnostic
+} from "./sdk.js"
 import { SessionManager } from "./session-manager.js"
 import { SessionShell } from "./session-shell.js"
 import { SettingsManager } from "./settings-manager.js"
+import { internalSubagentApiKeyEnvironment, internalSubagentDepthEnvironment } from "./subagents/invocation.js"
 import { createCodingTools } from "./tools/index.js"
 
 export type { AgentRuntimeSessionIntent, CreateAgentRuntimeOptions } from "./runtime-options.js"
@@ -64,17 +70,17 @@ export async function createUnboundAgentRuntime(requested: CreateAgentRuntimeOpt
   const projectTrust = await resolveProjectTrust(paths, options.projectTrust)
   const project = projectConfigurationAdmission(projectTrust)
   const extensions = discoverExtensionLoadPlan(paths, project, options.extensionPaths ?? [])
+  const processTreeTracker = createProcessTreeTracker()
   const extensionHost = new ExtensionHost(
-    createExtensionWorkerSpawner(options.extensionWorkerCommand ?? defaultExtensionWorkerCommand)
+    createExtensionWorkerSpawner(options.extensionWorkerCommand ?? defaultExtensionWorkerCommand, processTreeTracker)
   )
-  extensionHost.admitDiagnostics(
-    extensions.diagnostics.map(extensionDiscoveryDiagnostic),
-    extensions.omittedDiagnostics
-  )
-  await extensionHost.start(extensions.plan)
-
   let shell: SessionShell | undefined
   try {
+    extensionHost.admitDiagnostics(
+      extensions.diagnostics.map(extensionDiscoveryDiagnostic),
+      extensions.omittedDiagnostics
+    )
+    await extensionHost.start(extensions.plan)
     const settingsManager = SettingsManager.create(paths, project, options.settings ?? {})
     const credentialStore = new FileCredentialStore(paths)
     const models = options.modelFactory?.(credentialStore) ?? builtinModels({ credentials: credentialStore })
@@ -104,19 +110,32 @@ export async function createUnboundAgentRuntime(requested: CreateAgentRuntimeOpt
       selected.type === "resumed" ? selected.manager : SessionManager.create(paths, { persist: selected.persist })
     shell = new SessionShell({ cwd: paths.cwd, sessionId: sessionManager.sessionId })
     const codeMode = new CodeMode(paths.cwd, options.codeModeWorkerCommand ?? defaultCodeModeWorkerCommand)
-    const created = await createAgentSession({
-      services,
-      sessionManager,
-      shell,
-      extensionHost,
-      codeMode,
-      project,
-      extensionPaths: options.extensionPaths ?? [],
-      ...(model ? { model } : {}),
-      ...(options.thinkingLevel ? { thinkingLevel: options.thinkingLevel } : {}),
-      ...(options.apiKey ? { apiKey: options.apiKey } : {}),
-      tools: createCodingTools({ cwd: paths.cwd, shell })
-    })
+    const subagentEnvironment: Record<string, string | undefined> = {
+      ...(options.internalSubagentEnvironment ?? process.env),
+      ZI_AGENT_DIR: paths.globalDir,
+      [internalSubagentDepthEnvironment]: "1"
+    }
+    delete subagentEnvironment.ZI_SUBAGENT_EXECUTABLE
+    delete subagentEnvironment[internalSubagentApiKeyEnvironment]
+    const created = await createAgentSessionWithProcessTreeTracker(
+      {
+        services,
+        sessionManager,
+        shell,
+        extensionHost,
+        codeMode,
+        project,
+        extensionPaths: options.extensionPaths ?? [],
+        ...(options.subagentCommand ? { subagentCommand: options.subagentCommand } : {}),
+        subagentEnvironment: Object.freeze(subagentEnvironment),
+        internalSubagentDepth: options.internalSubagentDepth ?? 0,
+        ...(model ? { model } : {}),
+        ...(options.thinkingLevel ? { thinkingLevel: options.thinkingLevel } : {}),
+        ...(options.apiKey ? { apiKey: options.apiKey } : {}),
+        tools: createCodingTools({ cwd: paths.cwd, shell })
+      },
+      processTreeTracker
+    )
     return Object.freeze({
       session: created.session,
       services,
@@ -125,6 +144,7 @@ export async function createUnboundAgentRuntime(requested: CreateAgentRuntimeOpt
     })
   } catch (cause) {
     await Promise.all([extensionHost.dispose(), shell?.dispose() ?? Promise.resolve()])
+    await processTreeTracker.dispose()
     throw cause
   }
 }

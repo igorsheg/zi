@@ -4,7 +4,20 @@ import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
 
 import type { ExtensionLoadPlan, ExtensionSource } from "../src/extensions/discovery.js"
-import { createExtensionWorkerSpawner, ExtensionHost, type ExtensionHostTimeouts } from "../src/extensions/host.js"
+import {
+  createExtensionWorkerSpawner as createProductionExtensionWorkerSpawner,
+  ExtensionHost,
+  type ExtensionHostTimeouts,
+  type SpawnExtensionWorker
+} from "../src/extensions/host.js"
+import { createProcessTreeTracker } from "../src/processes/process-tree.js"
+
+function createExtensionWorkerSpawner(
+  command: readonly string[],
+  removePublicApiDirectory?: (path: string) => void
+): SpawnExtensionWorker {
+  return createProductionExtensionWorkerSpawner(command, createProcessTreeTracker(), removePublicApiDirectory)
+}
 
 test("ExtensionHost supervises the CLI worker over dedicated process pipes", async () => {
   const root = await mkdtemp(join(tmpdir(), "zi-extension-host-process-"))

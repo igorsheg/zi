@@ -10,6 +10,8 @@ cat error.log | zi -p "find the cause"  # stdin, then positional prompts
 zi --mode rpc --no-session              # versioned JSONL process protocol
 ```
 
+Development builds expose native subagent tools by default; supported release remains gated on the five-target compiled acceptance in the [roadmap](roadmap.md#in-progress--native-subagents). See the [subagent product guide](subagents.md) for delegation, shared-authority, cost, collection, and cleanup behavior. Zi launches each direct child with the exact current command as `--mode rpc --no-session --cwd <parent cwd>` and explicitly forwards the admitted model and thinking level. An ephemeral parent `--api-key` override crosses through a private child-invocation environment value, is captured before runtime construction, and is removed from the child process environment before extensions or shell tools start; it never enters child argv. No extension installation, PATH rediscovery, or `ZI_SUBAGENT_EXECUTABLE` setting is used. Set `subagentsEnabled: false` in the admitted settings file to disable the entire capability. Depth-one child invocations omit subagent tools through an internal marker.
+
 ## Resolution
 
 Zi resolves one invocation before reading stdin or constructing an agent runtime:

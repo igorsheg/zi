@@ -6,6 +6,10 @@ import { resolve } from "node:path"
 import { runRpcMode } from "@with-zi/coding-agent"
 import { codeModeWorkerArgument } from "@with-zi/coding-agent/internal/code-mode-worker-mode"
 import { extensionWorkerArgument } from "@with-zi/coding-agent/internal/extension-worker-mode"
+import {
+  internalSubagentApiKeyEnvironment,
+  internalSubagentDepthEnvironment
+} from "@with-zi/coding-agent/internal/subagent-invocation"
 
 import { defaultCliArgv } from "./bootstrap.js"
 import {
@@ -43,10 +47,14 @@ export async function runEntrypoint(argv: readonly string[] = defaultCliArgv()):
 }
 
 export function createProcessHost(forceInteractive: boolean): CliHost {
+  const environment = { ...process.env }
+  if (environment[internalSubagentDepthEnvironment] === "1") {
+    delete process.env[internalSubagentApiKeyEnvironment]
+  }
   return {
     cwd: process.cwd(),
     home: homedir(),
-    env: Object.freeze({ ...process.env }),
+    env: Object.freeze(environment),
     stdinIsTTY: forceInteractive || process.stdin.isTTY,
     stdoutIsTTY: forceInteractive || process.stdout.isTTY,
     extensionWorkerCommand: currentZiCommand(),
@@ -79,7 +87,7 @@ export function createProcessHost(forceInteractive: boolean): CliHost {
 
 export function currentZiCommand(argv: readonly string[] = process.argv): readonly string[] {
   const script = argv[1]
-  if (script && !script.includes("$bunfs") && /\.[cm]?[jt]sx?$/.test(script)) {
+  if (script && !script.includes("$bunfs") && !/[\\/]~BUN[\\/]/i.test(script) && /\.[cm]?[jt]sx?$/.test(script)) {
     return Object.freeze([process.execPath, resolve(script)])
   }
   return Object.freeze([process.execPath])

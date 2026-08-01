@@ -10,6 +10,7 @@
     "./internal/extension-worker-mode": "./src/extensions/worker-mode.ts",
     "./internal/code-mode-worker": "./src/code-mode/worker-entry.ts",
     "./internal/code-mode-worker-mode": "./src/code-mode/worker-mode.ts",
+    "./internal/subagent-invocation": "./src/subagents/invocation.ts",
     "./testing": "./src/testing.ts"
   },
   "scripts": {

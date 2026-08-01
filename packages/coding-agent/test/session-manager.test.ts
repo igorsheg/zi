@@ -45,6 +45,47 @@ test("session entries form one append-only branch", () => {
   expect(session.messages()).toEqual([{ role: "user", content: "hello", timestamp: 1 }])
 })
 
+test("native subagent journal evidence restores and rejects malformed variants", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-subagent-journal-"))
+  const paths = new ZiPaths(join(root, "project"), join(root, "agent"))
+  const session = SessionManager.create(paths)
+  const appendSubagent: unknown = Reflect.get(session, "appendSubagent")
+  if (typeof appendSubagent !== "function") throw new Error("Expected appendSubagent")
+  expect(() => Reflect.apply(appendSubagent, session, [{ event: "starting", agentId: "legacy-uuid" }])).toThrow(
+    "Invalid native subagent journal entry"
+  )
+  session.appendSubagent({ event: "starting", name: "journal-worker" })
+  session.appendSubagent({ event: "work_cycle_started", name: "journal-worker", workCycle: 1 })
+  session.appendSubagent({
+    event: "work_cycle_finished",
+    name: "journal-worker",
+    workCycle: 1,
+    status: "completed",
+    preview: "done",
+    originalBytes: 4,
+    omittedBytes: 0,
+    truncated: false,
+    durationMs: 10
+  })
+  expect(SessionManager.open(session.file!).subagentEntries()).toMatchObject([
+    { event: "starting", name: "journal-worker" },
+    { event: "work_cycle_started", workCycle: 1 },
+    { event: "work_cycle_finished", status: "completed", preview: "done" }
+  ])
+
+  const malformed: unknown = JSON.parse((await readFile(session.file!, "utf8")).trim().split("\n").at(-1)!)
+  if (typeof malformed !== "object" || malformed === null || Array.isArray(malformed)) {
+    throw new Error("Expected a journal entry object")
+  }
+  Reflect.set(malformed, "status", "unknown")
+  await appendFile(
+    session.file!,
+    `${JSON.stringify({ ...malformed, id: crypto.randomUUID(), parentId: Reflect.get(malformed, "id") })}\n`
+  )
+  expect(() => SessionManager.open(session.file!)).toThrow("Invalid session entry")
+  await rm(root, { recursive: true, force: true })
+})
+
 test("session prompt history traverses trimmed text chronologically with consecutive deduplication", () => {
   const session = SessionManager.inMemory("/work")
   expect(session.latestPromptHistoryEntry()).toBeUndefined()

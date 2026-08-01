@@ -102,6 +102,41 @@ export interface CustomMessageInput {
   readonly details?: SessionJson
 }
 
+export type SubagentCompletionStatus = "completed" | "failed" | "cancelled"
+
+export type SubagentEntryData =
+  | { readonly type: "subagent"; readonly event: "starting"; readonly name: string }
+  | { readonly type: "subagent"; readonly event: "ready"; readonly name: string; readonly sessionId?: string }
+  | {
+      readonly type: "subagent"
+      readonly event: "work_cycle_started"
+      readonly name: string
+      readonly workCycle: number
+    }
+  | {
+      readonly type: "subagent"
+      readonly event: "work_cycle_finished"
+      readonly name: string
+      readonly workCycle: number
+      readonly status: SubagentCompletionStatus
+      readonly preview: string
+      readonly originalBytes: number
+      readonly omittedBytes: number
+      readonly truncated: boolean
+      readonly durationMs: number
+      readonly reason?: string
+      readonly error?: string
+    }
+  | { readonly type: "subagent"; readonly event: "closing"; readonly name: string; readonly reason: string }
+  | { readonly type: "subagent"; readonly event: "exited"; readonly name: string; readonly outcome: string }
+  | { readonly type: "subagent"; readonly event: "lost"; readonly name: string; readonly reason: "session_restored" }
+
+export type SubagentEntryInput = SubagentEntryData extends infer Entry
+  ? Entry extends { readonly type: "subagent" }
+    ? Omit<Entry, "type">
+    : never
+  : never
+
 export type SessionEntryData =
   | { type: "message"; message: AgentMessage }
   | { type: "model_change"; provider: string; modelId: string }
@@ -110,6 +145,7 @@ export type SessionEntryData =
   | CompactionEntryData
   | CustomEntryData
   | CustomMessageEntryData
+  | SubagentEntryData
 
 export type SessionEntry = SessionEntryBase & SessionEntryData
 export type MessageEntry = SessionEntryBase & Extract<SessionEntryData, { type: "message" }>
@@ -117,6 +153,7 @@ export type RetryEntry = SessionEntryBase & RetryEntryData
 export type CompactionEntry = SessionEntryBase & CompactionEntryData
 export type CustomEntry = SessionEntryBase & CustomEntryData
 export type CustomMessageEntry = SessionEntryBase & CustomMessageEntryData
+export type SubagentEntry = SessionEntryBase & SubagentEntryData
 
 export interface NewSessionOptions {
   sessionId?: string
@@ -142,6 +179,7 @@ export const maxCustomJsonBytes = 256 * 1024
 export const maxCustomMessageBytes = 1024 * 1024
 export const maxCustomStateEntries = 2048
 export const maxCustomStateBytes = 2 * 1024 * 1024
+export const maxSubagentJournalTextBytes = 8 * 1024
 
 const customTypePattern = /^[a-z][a-z0-9._:/-]*$/
 
@@ -493,6 +531,16 @@ export class SessionManager {
     return this.#append({ type: "compaction", ...data })
   }
 
+  appendSubagent(data: SubagentEntryInput): SubagentEntry {
+    const entry = { type: "subagent" as const, ...data } as SubagentEntryData
+    validateSubagentEntryData(entry)
+    return this.#append(entry)
+  }
+
+  subagentEntries(): readonly SubagentEntry[] {
+    return this.entries().filter((entry): entry is SubagentEntry => entry.type === "subagent")
+  }
+
   /** Materializes the complete journal. Runtime policy should consume retainedEntries(). */
   entries(): readonly SessionEntry[] {
     if (this.#entryCount === this.#entries.length) return this.#entries
@@ -725,6 +773,7 @@ export class SessionManager {
     if (
       next.type !== "custom" &&
       next.type !== "custom_message" &&
+      next.type !== "subagent" &&
       (next.type !== "message" || next.message.role !== "assistant")
     ) {
       return
@@ -1064,6 +1113,9 @@ function parseStoredEntry(line: string, file: string, version: SessionFormatVers
       display: value.display,
       ...(value.details === undefined ? {} : { details: value.details })
     }
+  }
+  if (value.type === "subagent" && isSubagentEntryData(value)) {
+    return { ...base, ...value }
   }
   if (value.type === "compaction" && isCompactionEntryData(value)) {
     return {
@@ -1714,6 +1766,57 @@ function isRetryAttempt(value: unknown): value is number {
   return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= maxRetryCount
 }
 
+function validateSubagentEntryData(value: unknown): asserts value is SubagentEntryData {
+  if (!isSubagentEntryData(value)) throw new Error("Invalid native subagent journal entry")
+}
+
+function isSubagentEntryData(value: unknown): value is SubagentEntryData {
+  if (
+    !isRecord(value) ||
+    value.type !== "subagent" ||
+    !boundedString(value.name, 64) ||
+    !/^[a-z][a-z0-9_-]*$/.test(value.name)
+  ) {
+    return false
+  }
+  switch (value.event) {
+    case "starting":
+      return true
+    case "ready":
+      return value.sessionId === undefined || boundedString(value.sessionId, 256)
+    case "work_cycle_started":
+      return positiveSafeInteger(value.workCycle)
+    case "work_cycle_finished":
+      return (
+        positiveSafeInteger(value.workCycle) &&
+        (value.status === "completed" || value.status === "failed" || value.status === "cancelled") &&
+        boundedString(value.preview, maxSubagentJournalTextBytes, true) &&
+        isNonNegativeInteger(value.originalBytes) &&
+        isNonNegativeInteger(value.omittedBytes) &&
+        typeof value.truncated === "boolean" &&
+        isNonNegativeInteger(value.durationMs) &&
+        (value.reason === undefined || boundedString(value.reason, maxSubagentJournalTextBytes, true)) &&
+        (value.error === undefined || boundedString(value.error, maxSubagentJournalTextBytes, true))
+      )
+    case "closing":
+      return boundedString(value.reason, 256)
+    case "exited":
+      return boundedString(value.outcome, maxSubagentJournalTextBytes)
+    case "lost":
+      return value.reason === "session_restored"
+    default:
+      return false
+  }
+}
+
+function boundedString(value: unknown, maxBytes: number, allowEmpty = false): value is string {
+  return typeof value === "string" && (allowEmpty || value.length > 0) && Buffer.byteLength(value) <= maxBytes
+}
+
+function positiveSafeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0
+}
+
 function isCompactionEntryData(value: unknown): value is CompactionEntryData {
   if (!isRecord(value)) return false
   return (
@@ -1774,6 +1877,10 @@ function validateNextEntry(next: SessionEntry, preceding: readonly SessionEntry[
   }
   if (next.type === "custom_message") {
     if (!isStoredCustomMessageEntry(next, 1)) throw new Error(`Invalid session entry: ${file}`)
+    return
+  }
+  if (next.type === "subagent") {
+    if (!isSubagentEntryData(next)) throw new Error(`Invalid session entry: ${file}`)
     return
   }
   if (next.type === "retry") {
@@ -1862,6 +1969,7 @@ export function sessionEntryToContextMessage(entry: SessionEntry): AgentMessage 
     case "model_change":
     case "thinking_level_change":
     case "retry":
+    case "subagent":
       return undefined
     default:
       return assertNever(entry)
@@ -1880,6 +1988,7 @@ function sessionEntryToPresentationMessage(entry: SessionEntry): AgentMessage | 
     case "model_change":
     case "thinking_level_change":
     case "retry":
+    case "subagent":
       return undefined
     default:
       return assertNever(entry)

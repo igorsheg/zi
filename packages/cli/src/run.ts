@@ -9,6 +9,10 @@ import {
   type PrintModeResult,
   type RpcModeResult
 } from "@with-zi/coding-agent"
+import {
+  internalSubagentApiKeyEnvironment,
+  internalSubagentDepthEnvironment
+} from "@with-zi/coding-agent/internal/subagent-invocation"
 
 import { parseArgs, resolveCliInvocation, type CliInvocation, type CliMode, type ParsedArgs } from "./args.js"
 import { helpText, versionText } from "./cli-text.js"
@@ -110,11 +114,13 @@ export async function runCli(argv: readonly string[], host: CliHost): Promise<nu
   try {
     if (mode === "interactive") {
       sessionRuntime = await host.createSessionRuntime(
-        runtimeOptions(args, host.extensionWorkerCommand, host.codeModeWorkerCommand)
+        runtimeOptions(args, host.extensionWorkerCommand, host.codeModeWorkerCommand, host.env)
       )
       runtime = sessionRuntime
     } else {
-      runtime = await host.createRuntime(runtimeOptions(args, host.extensionWorkerCommand, host.codeModeWorkerCommand))
+      runtime = await host.createRuntime(
+        runtimeOptions(args, host.extensionWorkerCommand, host.codeModeWorkerCommand, host.env)
+      )
     }
   } catch (cause) {
     await host.writeStderr(`${errorMessage(cause)}\n`)
@@ -181,19 +187,24 @@ export async function runCli(argv: readonly string[], host: CliHost): Promise<nu
 function runtimeOptions(
   args: CliInvocation,
   extensionWorkerCommand: readonly string[],
-  codeModeWorkerCommand: readonly string[]
+  codeModeWorkerCommand: readonly string[],
+  environment: Readonly<Record<string, string | undefined>>
 ): CreateAgentRuntimeOptions {
+  const internalSubagent = environment[internalSubagentDepthEnvironment] === "1"
+  const apiKey = args.apiKey ?? (internalSubagent ? environment[internalSubagentApiKeyEnvironment] : undefined)
   return {
     cwd: args.cwd,
     agentDir: args.agentDir,
     extensionPaths: args.extensionPaths,
     extensionWorkerCommand,
     codeModeWorkerCommand,
+    subagentCommand: extensionWorkerCommand,
+    internalSubagentDepth: internalSubagent ? 1 : 0,
     session: args.session,
     ...(args.sessionDir === undefined ? {} : { sessionDir: args.sessionDir }),
     ...(args.model === undefined ? {} : { model: args.model }),
     ...(args.thinkingLevel === undefined ? {} : { thinkingLevel: args.thinkingLevel }),
-    ...(args.apiKey === undefined ? {} : { apiKey: args.apiKey }),
+    ...(apiKey === undefined ? {} : { apiKey }),
     ...(args.systemPrompt === undefined ? {} : { systemPrompt: args.systemPrompt }),
     ...(args.appendSystemPrompt === undefined ? {} : { appendSystemPrompt: args.appendSystemPrompt })
   }

@@ -28,8 +28,28 @@ test("RPC request decoding admits only the versioned closed command catalog", ()
   expectRequestError({ version: 1, id: "", method: "session.get_state" }, "invalid_request")
   expectRequestError({ version: 1, id: "x", method: "session.get_state", extra: true }, "invalid_request")
   expectRequestError({ version: 1, id: "x", method: "unknown" }, "unknown_method")
+  expect(
+    decodeRpcRequest({
+      version: 1,
+      id: "continue-1",
+      method: "session.prompt",
+      params: { delivery: "continue", text: "wake" }
+    })
+  ).toEqual({ version: 1, id: "continue-1", method: "session.prompt", params: { delivery: "continue", text: "wake" } })
+  expect(
+    decodeRpcRequest({ version: 1, id: "events-1", method: "connection.set_events", params: { mode: "none" } })
+  ).toEqual({ version: 1, id: "events-1", method: "connection.set_events", params: { mode: "none" } })
+
   expectRequestError(
     { version: 1, id: "x", method: "session.prompt", params: { delivery: "later", text: "hello" } },
+    "invalid_request"
+  )
+  expectRequestError(
+    { version: 1, id: "x", method: "connection.set_events", params: { mode: "sometimes" } },
+    "invalid_request"
+  )
+  expectRequestError(
+    { version: 1, id: "x", method: "connection.set_events", params: { mode: "none", extra: true } },
     "invalid_request"
   )
   expectRequestError(

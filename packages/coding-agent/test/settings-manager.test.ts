@@ -41,6 +41,8 @@ test("settings resolve global, then project, then construction overrides", async
     steeringMode: "all",
     followUpMode: "one-at-a-time",
     codexFastMode: false,
+    subagentsEnabled: true,
+    subagentWaitTimeoutMs: 30_000,
     retryEnabled: true,
     retryMaxRetries: 3,
     retryBaseDelayMs: 2_000,
@@ -79,6 +81,22 @@ test("external editor resolution follows configured, VISUAL, EDITOR, then platfo
     if (originalEditor === undefined) delete process.env.EDITOR
     else process.env.EDITOR = originalEditor
   }
+})
+
+test("subagent wait timeout is configurable within the one-hour hard bound", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-settings-subagent-wait-"))
+  const paths = new ZiPaths(join(root, "project"), join(root, "global"))
+  await mkdir(paths.globalDir, { recursive: true })
+  await writeFile(paths.globalSettingsFile, JSON.stringify({ subagentWaitTimeoutMs: 180_000 }))
+
+  const settings = SettingsManager.create(paths, "absent")
+  expect(settings.get().subagentWaitTimeoutMs).toBe(180_000)
+
+  await writeFile(paths.globalSettingsFile, JSON.stringify({ subagentWaitTimeoutMs: 3_600_001 }))
+  settings.reload()
+  expect(settings.get().subagentWaitTimeoutMs).toBe(30_000)
+  expect(settings.drainErrors()[0]?.error.message).toContain("subagentWaitTimeoutMs")
+  expect(() => new SettingsManager({ subagentWaitTimeoutMs: 1.5 })).toThrow("Invalid subagentWaitTimeoutMs")
 })
 
 test("retry settings layer and reject unbounded backoff", async () => {
@@ -315,6 +333,8 @@ test("oversized settings are bounded and reported without entering effective sta
     steeringMode: "one-at-a-time",
     followUpMode: "one-at-a-time",
     codexFastMode: false,
+    subagentsEnabled: true,
+    subagentWaitTimeoutMs: 30_000,
     retryEnabled: true,
     retryMaxRetries: 3,
     retryBaseDelayMs: 2_000,
