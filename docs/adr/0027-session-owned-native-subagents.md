@@ -70,4 +70,4 @@ Native process containment inherits ADR 0026's release requirement. Graceful EOF
 - Child sessions keep the current user's filesystem, environment, credentials, extension, and network authority. Process isolation is fault containment, not a sandbox.
 - V1 remains direct-child only, with at most four live children and no peer messaging, role catalog, worktree isolation, parent-history fork, durable child resume, or procedural extension orchestration API.
 - RPC remains inspectable JSONL and does not become a multi-agent topology service.
-- The local implementation and mock-process behavior tests are development evidence only. Release remains blocked until compiled real-Zi acceptance passes on `darwin-arm64`, `darwin-x64`, `linux-arm64`, `linux-x64`, and `windows-x64`, including graceful and forced descendant cleanup through a real Windows Job Object.
+- The local implementation and mock-process behavior tests were development evidence only. Zi v0.1.16 later passed compiled real-Zi acceptance on `darwin-arm64`, `darwin-x64`, `linux-arm64`, `linux-x64`, and `windows-x64`, including graceful and forced descendant cleanup through a real Windows Job Object.

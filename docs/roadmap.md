@@ -1,7 +1,7 @@
 # Product roadmap
 
 - Status: active
-- Updated: 2026-07-31
+- Updated: 2026-08-02
 
 This roadmap orders product work by downstream leverage. [`parity-roadmap.md`](parity-roadmap.md) remains the capability and provenance inventory; parity evidence no longer determines product priority by itself. Product choices follow the [`building-block strategy`](building-block-strategy.md).
 
@@ -99,9 +99,9 @@ After custom tools and RPC are in use, choose independently proven slices:
 - package installation and provenance;
 - declarative terminal contributions.
 
-### In progress — profile-driven subagents
+### Shipped — profile-driven subagents
 
-Decision: [ADR 0029](adr/0029-subagent-profiles-share-session-owned-orchestration.md). ADR 0026 remains the RPC subprocess and containment decision; ADR 0027 is superseded.
+Zi v0.1.16 shipped profile-driven subagents after the compiled real-process acceptance passed on all five release targets. Decision: [ADR 0029](adr/0029-subagent-profiles-share-session-owned-orchestration.md). ADR 0026 remains the RPC subprocess and containment decision; ADR 0027 is superseded.
 
 - [x] Retain session-owned `ChildZiProcess` and `SubagentSupervisor` mechanics with bounded concurrency, output, waits, cancellation, shutdown, credentials, cwd propagation, and process-tree containment.
 - [x] Admit trusted global/project Markdown profiles and programmatic `registerSubagentProfile(...)` declarations into one bounded catalog with shared shape and precedence.
@@ -112,7 +112,7 @@ Decision: [ADR 0029](adr/0029-subagent-profiles-share-session-owned-orchestratio
 - [x] Remove the enablement setting, native delegation system prompt, session-level status projections, composer rail, and subagent-specific notifications while retaining semantic tool-call presentation.
 - [x] Publish the [profile-driven subagent guide](subagents.md) and a complete [programmatic profile example](../examples/extensions/subagents/index.ts).
 - [x] Add compiled acceptance for both declaration paths and standard child operations on all release targets.
-- [ ] Prove graceful and forced descendant cleanup on every target, including a real Windows Job Object, before calling the substrate release-supported.
+- [x] Prove graceful and forced descendant cleanup on every target, including a real Windows Job Object, in the [five-target acceptance run](https://github.com/igorsheg/zi/actions/runs/30743314637) and [v0.1.16 release](https://github.com/igorsheg/zi/actions/runs/30743390630).
 
 Each capability receives its own closed protocol messages, owner, bounds, example, and behavior tests. No capability expands a generic extension facade in anticipation of another.
 

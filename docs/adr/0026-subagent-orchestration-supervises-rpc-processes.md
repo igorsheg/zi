@@ -39,7 +39,7 @@ The retained decisions migrate as follows:
 - native child process scopes belong to the subagent owner and must not be registered as extension-worker descendants;
 - RPC remains a single-session transport and still gains no `agent.*` topology API.
 
-The local implementation does not complete the release gate. Compiled acceptance on all five release targets, including a real Windows Job Object containment test, is still required before the child-process substrate is release-supported.
+Zi v0.1.16 completed the release gate. The compiled real-process acceptance passed on all five release targets, including graceful and forced descendant cleanup through a Windows Job Object, in the [dedicated acceptance run](https://github.com/igorsheg/zi/actions/runs/30743314637) and again in the [release workflow](https://github.com/igorsheg/zi/actions/runs/30743390630).
 
 ## Historical consequences of the superseded extension owner
 
@@ -48,6 +48,6 @@ The local implementation does not complete the release gate. Compiled acceptance
 - Process isolation is not a sandbox: children retain the invoked Zi process's filesystem, environment, credential, extension, and network authority.
 - Child conversations are ephemeral across explicit close and parent restart; bounded parent-side lifecycle evidence and completion projections are durable. Session-owned children survive extension reload and worker failure.
 - RPC event suppression becomes useful to any process client that wants correlated operations and final state without token-stream traffic.
-- ADR 0027 removed the complete orchestration extension from the product; ADR 0029 makes profile declarations activate shared standard orchestration. The retained protocol, process-tree containment, behavior tests, and compiled acceptance on all release targets remain required before profile-driven background subagents are release-supported.
+- ADR 0027 removed the complete orchestration extension from the product; ADR 0029 makes profile declarations activate shared standard orchestration. Profile-driven background subagents became release-supported after the retained protocol, process-tree containment, behavior tests, and compiled acceptance passed on all release targets.
 
 The retained process bounds, transitions, and release gates are in [`../subagent-process-orchestration-spec.md`](../subagent-process-orchestration-spec.md). The current ownership decision is in [ADR 0029](0029-subagent-profiles-share-session-owned-orchestration.md).

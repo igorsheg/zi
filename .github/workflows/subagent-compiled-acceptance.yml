@@ -21,6 +21,7 @@ on:
       - packages/coding-agent/src/rpc/**
       - packages/coding-agent/src/tools/bash.ts
       - packages/coding-agent/src/extensions/**
+      - packages/coding-agent/src/processes/**
       - packages/extension-api/**
       - examples/extensions/subagents/**
       - scripts/build-release.ts

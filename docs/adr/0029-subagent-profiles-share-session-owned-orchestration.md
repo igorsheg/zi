@@ -22,4 +22,4 @@ Zi retains no native delegation system prompt, generated completion message, ena
 
 Dropping one valid Markdown file into an admitted subagent resource directory is sufficient to activate standard delegation on the next session or reload. Registering the same shape from an extension produces the same behavior and shares the same mechanics. Custom extension orchestration remains possible without becoming a prerequisite for declarative profiles.
 
-The canonical acceptance case covers both declaration paths: each must activate the same standard tool catalog and complete real child work. A profile-less session must expose no standard subagent tools, and a depth-one child session must not recursively expose child execution.
+The canonical acceptance case covers both declaration paths: each must activate the same standard tool catalog and complete real child work. A profile-less session must expose no standard subagent tools, and a depth-one child session must not recursively expose child execution. Zi v0.1.16 passed that compiled acceptance on all five release targets, including graceful and forced descendant cleanup through a real Windows Job Object.
