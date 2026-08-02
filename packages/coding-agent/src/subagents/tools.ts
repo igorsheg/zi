@@ -219,7 +219,7 @@ export function createSubagentTools(
     name: "list_subagents",
     label: "list_subagents",
     description:
-      "List current direct-subagent status and uncollected result readiness without returning conversations.",
+      "List direct-subagent status and uncollected result readiness without returning conversations. For an idle child, assign work with continue_subagent or release its slot with close_subagent; collect a ready result with wait_subagents.",
     parameters: emptyParameters,
     executionMode: "parallel",
     execute() {

@@ -279,7 +279,7 @@ test("list presentation reports authoritative working and ready counts", () => {
   expect(presentation.preview.compact).toEqual({ type: "hidden" })
   expect(presentation.body).toEqual({
     type: "text",
-    text: "Shutdown reviewer — result ready\nActive worker — working · result ready",
+    text: "Shutdown reviewer — result ready · wait, continue, or close\nActive worker — working · result ready",
     tone: "muted"
   })
 })

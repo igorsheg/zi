@@ -240,7 +240,7 @@ export class SubagentSupervisor {
       this.#assertSpawnAdmission(name, record, signal)
       const sessionId = child.snapshot().sessionId
       this.#append({ event: "ready", name, ...(sessionId ? { sessionId } : {}) })
-      this.#append({ event: "work_cycle_started", name, workCycle: 1 })
+      this.#appendWorkCycleStarted(record, name, 1)
       await child.spawnAdmit(prompt)
       this.#assertSpawnAdmission(name, record, signal)
       signal?.removeEventListener("abort", abort)
@@ -275,19 +275,22 @@ export class SubagentSupervisor {
     validateSubagentName(name)
     validateText(text, "Subagent message", maxSubagentPromptBytes)
     const record = this.#requireLive(name)
-    const snapshot = record.child.snapshot()
-    const nextCycle = (snapshot.workCycle ?? 0) + 1
-    const startedTurn = snapshot.lifecycle === "idle"
-    const reservationKey = startedTurn ? this.#reserveCompletion(name, nextCycle) : undefined
-    if (reservationKey) this.#append({ event: "work_cycle_started", name, workCycle: nextCycle })
-    try {
-      await record.serial.run(() => record.child.continueWith(text))
-    } catch (cause) {
-      if (reservationKey) this.#completionReservations.delete(reservationKey)
-      throw cause
-    }
+    const delivery = await record.serial.run(async () => {
+      const snapshot = record.child.snapshot()
+      const nextCycle = (snapshot.workCycle ?? 0) + 1
+      const startedTurn = snapshot.lifecycle === "idle"
+      const reservationKey = startedTurn ? this.#reserveCompletion(name, nextCycle) : undefined
+      try {
+        if (reservationKey) this.#appendWorkCycleStarted(record, name, nextCycle)
+        await record.child.continueWith(text)
+      } catch (cause) {
+        if (reservationKey) this.#completionReservations.delete(reservationKey)
+        throw cause
+      }
+      return startedTurn ? "started_turn" : "follow_up"
+    })
     this.#pumpMailbox()
-    return startedTurn ? "started_turn" : "follow_up"
+    return delivery
   }
 
   async interrupt(name: string): Promise<"interrupted" | "already_idle"> {
@@ -621,6 +624,12 @@ export class SubagentSupervisor {
     const entry = this.#sessionManager.appendSubagent(data)
     this.#emit({ type: "entry_appended", entry })
     return entry
+  }
+
+  #appendWorkCycleStarted(record: LiveRecord, name: string, workCycle: number): void {
+    const entry = this.#sessionManager.appendSubagent({ event: "work_cycle_started", name, workCycle })
+    record.lastWorkCycle = workCycle
+    this.#emit({ type: "entry_appended", entry })
   }
 
   #assertSpawnAdmission(name: string, record: LiveRecord, signal?: AbortSignal): void {

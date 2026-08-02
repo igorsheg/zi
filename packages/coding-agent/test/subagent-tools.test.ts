@@ -85,6 +85,8 @@ test("standard subagent tools exist only for an admitted profile catalog", async
     const waitNames = requireRecord(waitProperties.names, "wait names parameter")
     expect(requireString(waitNames.description, "wait names description")).toContain("once when the call begins")
     expect(requireTool(tools, "close_subagent").description).toContain("runtime name remains reserved")
+    expect(requireTool(tools, "list_subagents").description).toContain("assign work with continue_subagent")
+    expect(requireTool(tools, "list_subagents").description).toContain("release its slot with close_subagent")
 
     const spawned = await spawn.execute(
       "spawn",

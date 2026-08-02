@@ -310,6 +310,82 @@ test("SubagentSupervisor keeps queue-only send idle and continue extends the cur
   }
 }, 15_000)
 
+test("concurrent continues serialize work-cycle admission", async () => {
+  const harness = await createHarness("concurrent-continue", { reply: "concurrent-ok", delayMs: 250 })
+  try {
+    const name = await harness.supervisor.spawn("cycle-worker", "first cycle")
+    await harness.supervisor.wait([name], 5_000)
+
+    const outcomes = await Promise.all([
+      harness.supervisor.continue(name, "start second cycle"),
+      harness.supervisor.continue(name, "extend second cycle")
+    ])
+
+    expect(outcomes.toSorted()).toEqual(["follow_up", "started_turn"])
+    expect(
+      harness.sessionManager
+        .subagentEntries()
+        .filter(entry => entry.event === "work_cycle_started")
+        .map(entry => entry.workCycle)
+    ).toEqual([1, 2])
+
+    const waited = await harness.supervisor.wait([name], 5_000)
+    expect(waited[0]).toMatchObject({
+      lifecycle: "idle",
+      workCycle: 2,
+      completion: { status: "completed", workCycle: 2 }
+    })
+  } finally {
+    await harness.dispose()
+  }
+}, 15_000)
+
+test("shutdown after work-cycle admission publishes terminal evidence", async () => {
+  const harness = await createHarness("continue-shutdown-admission", { delayMs: 250 })
+  let shutdown: Promise<void> | undefined
+  try {
+    const name = await harness.supervisor.spawn("cycle-worker", "first cycle")
+    await harness.supervisor.wait([name], 5_000)
+    const unsubscribe = harness.supervisor.subscribe(event => {
+      if (
+        event.type === "entry_appended" &&
+        event.entry.type === "subagent" &&
+        event.entry.event === "work_cycle_started" &&
+        event.entry.workCycle === 2
+      ) {
+        shutdown = harness.supervisor.shutdown()
+      }
+    })
+
+    const outcome = harness.supervisor.continue(name, "start second cycle").then(
+      () => "fulfilled" as const,
+      () => "rejected" as const
+    )
+
+    expect(await outcome).toBe("rejected")
+    expect(shutdown).toBeDefined()
+    await shutdown
+    unsubscribe()
+
+    expect(harness.sessionManager.subagentEntries()).toContainEqual(
+      expect.objectContaining({
+        event: "work_cycle_finished",
+        name,
+        workCycle: 2,
+        status: "failed",
+        reason: "child_exited"
+      })
+    )
+    expect(harness.supervisor.snapshots()[0]).toMatchObject({
+      name,
+      lifecycle: "exited",
+      completion: { workCycle: 2, status: "failed", reason: "child_exited" }
+    })
+  } finally {
+    await harness.dispose()
+  }
+}, 15_000)
+
 test("ready results remain visible while the same child starts another cycle", async () => {
   const harness = await createHarness("ready-while-working", { reply: "cycle-ok", delayMs: 200 })
   try {

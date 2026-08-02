@@ -336,11 +336,10 @@ function waitCompletion(
 
 function listLine(agent: SubagentToolAgentDetails, readyNames: ReadonlySet<string>): string {
   const lifecycle = lifecycleLabel(agent.lifecycle)
-  const state = readyNames.has(agent.name)
-    ? agent.lifecycle === "idle" || agent.lifecycle === "exited"
-      ? "result ready"
-      : `${lifecycle} · result ready`
-    : lifecycle
+  const ready = readyNames.has(agent.name)
+  let state = lifecycle
+  if (agent.lifecycle === "idle") state = ready ? "result ready · wait, continue, or close" : "idle · continue or close"
+  else if (ready) state = agent.lifecycle === "exited" ? "result ready" : `${lifecycle} · result ready`
   return `${agentNameLabel(agent.name)} — ${state}`
 }
 
