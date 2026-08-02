@@ -77,6 +77,7 @@ test("standard subagent tools exist only for an admitted profile catalog", async
     expect(spawn.description).toContain("at most 4 live subagents")
     expect(requireTool(tools, "send_subagent").description).toContain("never starts an idle turn")
     expect(requireTool(tools, "continue_subagent").description).toContain("Starts a new turn when idle")
+    expect(requireTool(tools, "continue_subagent").description).toContain("separate next assignment")
     const waitTool = requireTool(tools, "wait_subagents")
     expect(waitTool.description).toContain("later changes do not join the wait")
     const waitSchema = requireRecord(waitTool.parameters, "wait schema")

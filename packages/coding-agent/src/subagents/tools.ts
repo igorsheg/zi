@@ -31,7 +31,8 @@ const messageParameters = Type.Object({
   text: Type.String({
     minLength: 1,
     maxLength: maxSubagentPromptBytes,
-    description: "Context or information for the current or next task; not a new task. Never starts an idle turn."
+    description:
+      "Context or information that should inform the current or next task without becoming a new task. Never starts an idle turn."
   })
 })
 const followupParameters = Type.Object({
@@ -39,7 +40,8 @@ const followupParameters = Type.Object({
   text: Type.String({
     minLength: 1,
     maxLength: maxSubagentPromptBytes,
-    description: "Task to perform. Starts an idle subagent turn or extends its current work cycle."
+    description:
+      "Task to perform. Starts an idle turn; while running, joins the current work cycle rather than scheduling a separate next cycle."
   })
 })
 const nameParameters = Type.Object({ name: subagentName })
@@ -126,7 +128,7 @@ export function createSubagentTools(
     name: "send_subagent",
     label: "send_subagent",
     description:
-      "Queue context or information for an existing subagent. This never starts an idle turn; use continue_subagent to assign work or wake an idle subagent.",
+      "Queue context or information that should inform an existing subagent's assignment. This never starts an idle turn; use continue_subagent to assign work or wake an idle subagent.",
     parameters: messageParameters,
     executionMode: "parallel",
     async execute(_id, input) {
@@ -143,7 +145,7 @@ export function createSubagentTools(
     name: "continue_subagent",
     label: "continue_subagent",
     description:
-      "Assign follow-up work to an existing subagent. Starts a new turn when idle; while running, adds the task to the current work cycle.",
+      "Assign follow-up work to an existing subagent. Starts a new turn when idle; while running, joins the current work cycle. Wait until idle first if the task must run as a separate next assignment.",
     parameters: followupParameters,
     executionMode: "parallel",
     async execute(_id, input) {
