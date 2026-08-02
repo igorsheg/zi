@@ -124,10 +124,9 @@ async function runMode(
       throw new Error(`Compiled ${mode} subagent acceptance exposed the ephemeral API key`)
     }
     if (exitCode !== 0 || stderr !== "" || stdout.trim() !== acceptanceText) {
-      provider.assertComplete()
-      throw new Error(
-        `Compiled ${mode} subagent acceptance failed: exit=${exitCode} stdout=${JSON.stringify(stdout)} stderr=${JSON.stringify(stderr)}`
-      )
+      const processFailure = `exit=${exitCode} stdout=${JSON.stringify(stdout)} stderr=${JSON.stringify(stderr)}`
+      provider.assertComplete(processFailure)
+      throw new Error(`Compiled ${mode} subagent acceptance failed: ${processFailure}`)
     }
     provider.assertComplete()
     await assertNativeJournal(agentDirectory, provider.name, mode)
@@ -185,9 +184,10 @@ class SubagentProvider {
     return `parent=${this.#parentPhase}; child=${this.#childPhase}; child requests=${this.#childProviderRequests}; result probes=${this.#resultProbeCount}`
   }
 
-  assertComplete(): void {
-    if (this.#failed) throw new Error(`Compiled ${this.#mode} subagent provider failed: ${this.#failed}`)
-    if (!this.#complete) throw new Error(`Compiled ${this.#mode} subagent provider did not complete`)
+  assertComplete(processFailure?: string): void {
+    const suffix = processFailure ? `; ${processFailure}` : ""
+    if (this.#failed) throw new Error(`Compiled ${this.#mode} subagent provider failed: ${this.#failed}${suffix}`)
+    if (!this.#complete) throw new Error(`Compiled ${this.#mode} subagent provider did not complete${suffix}`)
   }
 
   async dispose(): Promise<void> {
