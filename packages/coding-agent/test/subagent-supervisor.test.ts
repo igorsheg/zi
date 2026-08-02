@@ -155,6 +155,49 @@ test("shutdown wins the spawn admission race without appending late ready work",
   }
 }, 15_000)
 
+test("shutdown after initial cycle admission publishes terminal evidence", async () => {
+  const harness = await createHarness("spawn-shutdown-admission", { delayMs: 300 })
+  let shutdown: Promise<void> | undefined
+  const unsubscribe = harness.supervisor.subscribe(event => {
+    if (
+      event.type === "entry_appended" &&
+      event.entry.type === "subagent" &&
+      event.entry.event === "work_cycle_started" &&
+      event.entry.workCycle === 1
+    ) {
+      shutdown = harness.supervisor.shutdown()
+    }
+  })
+
+  try {
+    const outcome = harness.supervisor.spawn("cycle-worker", "initial work").then(
+      () => "fulfilled" as const,
+      () => "rejected" as const
+    )
+
+    expect(await outcome).toBe("rejected")
+    expect(shutdown).toBeDefined()
+    await shutdown
+    expect(harness.sessionManager.subagentEntries()).toContainEqual(
+      expect.objectContaining({
+        event: "work_cycle_finished",
+        name: "cycle-worker",
+        workCycle: 1,
+        status: "failed",
+        reason: "child_exited"
+      })
+    )
+    expect(harness.supervisor.snapshots()[0]).toMatchObject({
+      name: "cycle-worker",
+      lifecycle: "exited",
+      completion: { workCycle: 1, status: "failed", reason: "child_exited" }
+    })
+  } finally {
+    unsubscribe()
+    await harness.dispose()
+  }
+}, 15_000)
+
 test("shutdown before spawn ownership transfer rejects the admitted child", async () => {
   const harness = await createHarness("shutdown-spawn-transfer", { delayMs: 300 })
   let shutdown: Promise<void> | undefined
