@@ -6,6 +6,16 @@ Public TypeScript contract for trusted [Zi](https://github.com/igorsheg/zi) exte
 import { Schema, type ExtensionAPI } from "@with-zi/extension-api"
 
 export default function (zi: ExtensionAPI): void {
+  zi.registerCommand({
+    name: "repository-check",
+    description: "Run one local repository check",
+    argumentHint: "[name]",
+    execute: (arguments_, { signal }) => {
+      signal.throwIfAborted()
+      return `Checked ${arguments_.trim() || "repository"}`
+    }
+  })
+
   zi.registerTool({
     name: "repository_rule",
     description: "Look up one repository rule",

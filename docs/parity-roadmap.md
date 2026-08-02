@@ -186,10 +186,13 @@ The first usable outcome is the [`custom-tool extension golden path`](extension-
 - [x] Typed extension host boundary
 - [x] Custom tools
 - [x] Durable custom state and custom messages
-- [ ] Commands and provider hooks
+- [x] Extension commands
+- [ ] Provider hooks
 - [ ] UI contributions expressed through stable imperative OpenTUI component boundaries
 - [ ] Package install/update/remove
 - [x] Extension fault isolation, cancellation, and bounded IPC
+
+Command provenance and intentional differences are fixed by [ADR 0030](adr/0030-extension-commands-are-session-owned-user-actions.md). Zi keeps Pi's session-level admission but not its immediate-during-streaming execution, duplicate suffixing, or broad in-process command context. It preserves Grok Build's host-parsed raw invocation and exact one-owner routing, then adds worker isolation, bounds, cancellation, reload generations, and source attribution. Codex remains evidence for closed built-in identity, availability, validation, and typed dispatch rather than an extension API.
 
 ## Parity method
 

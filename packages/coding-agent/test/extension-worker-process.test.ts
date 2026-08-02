@@ -139,6 +139,111 @@ test("worker process correlates cancellation without treating it as shutdown", a
   output.destroy()
 })
 
+test("worker process executes, rejects, cancels, and reuses registered commands", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-extension-worker-command-"))
+  const extension = await fixture(
+    root,
+    "command.ts",
+    `export default function (zi): void {
+  zi.registerCommand({
+    name: "echo",
+    description: "Echo command arguments",
+    argumentHint: "[text]",
+    async execute(arguments_, { signal }) {
+      if (arguments_ === "throw") throw new Error("command exploded")
+      if (arguments_ === "wait") {
+        if (!signal.aborted) await new Promise(resolve => signal.addEventListener("abort", resolve, { once: true }))
+        return "late"
+      }
+      return arguments_.toUpperCase()
+    }
+  })
+}
+`
+  )
+  const input = new PassThrough()
+  const output = new PassThrough()
+  const messages = new WorkerMessageQueue(output)
+  const run = runExtensionWorkerProcess(input, output)
+
+  send(input, initialize(extensionPlan(root, [extension])))
+  expect(await messages.next()).toMatchObject({
+    type: "ready",
+    commands: [{ name: "echo", source: { id: extension.id } }]
+  })
+  send(input, { type: "session_start", generation: 1, requestId: 1, reason: "startup" })
+  expect((await messages.next()).type).toBe("settled")
+
+  send(input, { type: "command_invoke", generation: 1, requestId: 2, name: "echo", arguments: "hello" })
+  expect(await messages.next()).toEqual({ type: "command_result", generation: 1, requestId: 2, message: "HELLO" })
+  send(input, { type: "command_invoke", generation: 1, requestId: 3, name: "echo", arguments: "throw" })
+  expect(await messages.next()).toEqual({
+    type: "command_error",
+    generation: 1,
+    requestId: 3,
+    message: "command exploded"
+  })
+  send(input, { type: "command_invoke", generation: 1, requestId: 4, name: "echo", arguments: "wait" })
+  send(input, { type: "cancel", generation: 1, requestId: 4 })
+  expect(await messages.next()).toEqual({ type: "command_cancelled", generation: 1, requestId: 4 })
+  send(input, { type: "command_invoke", generation: 1, requestId: 5, name: "echo", arguments: "again" })
+  expect(await messages.next()).toEqual({ type: "command_result", generation: 1, requestId: 5, message: "AGAIN" })
+
+  send(input, { type: "session_shutdown", generation: 1, requestId: 6, reason: "quit" })
+  expect((await messages.next()).type).toBe("settled")
+  send(input, { type: "stop", generation: 1, requestId: 7 })
+  expect((await messages.next()).type).toBe("settled")
+  await run
+  messages.dispose()
+  output.destroy()
+})
+
+test("worker process rejects command replay after bounded settled-request eviction", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-extension-worker-command-replay-"))
+  const calls = join(root, "calls.log")
+  const extension = await fixture(
+    root,
+    "command.ts",
+    `import { appendFileSync } from "node:fs"
+export default zi => zi.registerCommand({
+  name: "record",
+  description: "Record one call",
+  execute: () => {
+    appendFileSync(${JSON.stringify(calls)}, "called\\n")
+    return "done"
+  }
+})
+`
+  )
+  const input = new PassThrough()
+  const output = new PassThrough()
+  const messages = new WorkerMessageQueue(output)
+  const run = runExtensionWorkerProcess(input, output)
+
+  send(input, initialize(extensionPlan(root, [extension])))
+  expect((await messages.next()).type).toBe("ready")
+  send(input, { type: "session_start", generation: 1, requestId: 1, reason: "startup" })
+  expect((await messages.next()).type).toBe("settled")
+  send(input, { type: "command_invoke", generation: 1, requestId: 2, name: "record", arguments: "" })
+  expect(await messages.next()).toEqual({ type: "command_result", generation: 1, requestId: 2, message: "done" })
+  for (let requestId = 3; requestId < maxExtensionPendingRequests + 3; requestId++) {
+    send(input, { type: "command_invoke", generation: 1, requestId, name: "record", arguments: "" })
+    // Sequential settlement intentionally advances beyond the bounded cancellation-crossing window.
+    // oxlint-disable-next-line no-await-in-loop
+    expect(await messages.next()).toEqual({ type: "command_result", generation: 1, requestId, message: "done" })
+  }
+
+  send(input, { type: "command_invoke", generation: 1, requestId: 2, name: "record", arguments: "" })
+  expect(await messages.next()).toMatchObject({
+    type: "fatal",
+    diagnostic: { phase: "protocol", message: "Extension worker received a replayed invocation request" }
+  })
+  expect(run).rejects.toThrow("replayed invocation request")
+  expect(await readFile(calls, "utf8")).toBe("called\n".repeat(maxExtensionPendingRequests + 1))
+  messages.dispose()
+  output.destroy()
+})
+
 test("worker process executes, rejects, cancels, and reuses registered tools", async () => {
   const root = await mkdtemp(join(tmpdir(), "zi-extension-worker-tool-"))
   const extension = await fixture(
@@ -225,9 +330,9 @@ export default function (zi): void {
   send(input, { type: "session_shutdown", generation: 1, requestId: 8, reason: "quit" })
   expect(await messages.next()).toMatchObject({
     type: "fatal",
-    diagnostic: { phase: "protocol", message: "Extension worker cannot shut down with active tool invocations" }
+    diagnostic: { phase: "protocol", message: "Extension worker cannot shut down with active invocations" }
   })
-  expect(run).rejects.toThrow("cannot shut down with active tool invocations")
+  expect(run).rejects.toThrow("cannot shut down with active invocations")
   messages.dispose()
   output.destroy()
 })
@@ -279,6 +384,48 @@ export default zi => zi.registerTool({
   output.endProtocol()
 })
 
+test("worker process rejects stale-generation cancellation after an invocation settles", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-extension-worker-stale-cancel-"))
+  const extension = await fixture(
+    root,
+    "tool.ts",
+    `import { Schema } from ${JSON.stringify(extensionApi)}
+export default zi => zi.registerTool({
+  name: "echo_message",
+  description: "Echo",
+  parameters: Schema.object({ message: Schema.string() }),
+  execute: ({ message }) => message
+})
+`
+  )
+  const input = new PassThrough()
+  const output = new PassThrough()
+  const messages = new WorkerMessageQueue(output)
+  const run = runExtensionWorkerProcess(input, output)
+
+  send(input, initialize(extensionPlan(root, [extension])))
+  expect((await messages.next()).type).toBe("ready")
+  send(input, { type: "session_start", generation: 1, requestId: 1, reason: "startup" })
+  expect((await messages.next()).type).toBe("settled")
+  send(input, {
+    type: "tool_invoke",
+    generation: 1,
+    requestId: 2,
+    name: "echo_message",
+    arguments: { message: "done" }
+  })
+  expect(await messages.next()).toEqual({ type: "tool_result", generation: 1, requestId: 2, value: "done" })
+
+  send(input, { type: "cancel", generation: 2, requestId: 2 })
+  expect(await messages.next()).toMatchObject({
+    type: "fatal",
+    diagnostic: { phase: "protocol", message: "Extension worker received cancellation for a stale generation" }
+  })
+  expect(run).rejects.toThrow("cancellation for a stale generation")
+  messages.dispose()
+  output.destroy()
+})
+
 test("cancelled tools remain owned until execution settles", async () => {
   const root = await mkdtemp(join(tmpdir(), "zi-extension-worker-tool-cancel-bound-"))
   const extension = await fixture(
@@ -319,10 +466,10 @@ export default zi => zi.registerTool({
     type: "fatal",
     diagnostic: {
       phase: "protocol",
-      message: `Extension worker cannot run more than ${maxExtensionPendingRequests} tool invocations`
+      message: `Extension worker cannot run more than ${maxExtensionPendingRequests} invocations`
     }
   })
-  expect(run).rejects.toThrow(`more than ${maxExtensionPendingRequests} tool invocations`)
+  expect(run).rejects.toThrow(`more than ${maxExtensionPendingRequests} invocations`)
   messages.dispose()
   output.destroy()
 })

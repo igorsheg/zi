@@ -195,6 +195,17 @@ export interface ExtensionCustomMessage {
 
 export type ExtensionMessageDelivery = "append" | "trigger_turn" | "steer" | "follow_up" | "next_turn"
 
+export interface ExtensionCommandContext {
+  readonly signal: AbortSignal
+}
+
+export interface ExtensionCommandDefinition {
+  readonly name: string
+  readonly description: string
+  readonly argumentHint?: string
+  execute(arguments_: string, context: ExtensionCommandContext): void | string | Promise<void | string>
+}
+
 export interface ExtensionToolContext {
   readonly signal: AbortSignal
 }
@@ -279,6 +290,7 @@ export interface ExtensionAPI {
   readonly subagents?: ExtensionSubagentAPI
   on(event: "session_start", handler: (event: ExtensionStartEvent) => void | Promise<void>): void
   on(event: "session_shutdown", handler: (event: ExtensionShutdownEvent) => void | Promise<void>): void
+  registerCommand(command: ExtensionCommandDefinition): void
   registerTool<TParameters extends TObject, TOutputSchema extends TSchema | undefined = undefined>(
     tool: ExtensionToolDefinition<TParameters, TOutputSchema>
   ): void

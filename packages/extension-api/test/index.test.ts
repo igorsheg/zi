@@ -1,6 +1,12 @@
 import { expect, test } from "bun:test"
 
-import { Schema, type ExtensionAPI, type ExtensionToolDefinition, type Static } from "../src/index.js"
+import {
+  Schema,
+  type ExtensionAPI,
+  type ExtensionCommandDefinition,
+  type ExtensionToolDefinition,
+  type Static
+} from "../src/index.js"
 
 async function sessionOperations(api: ExtensionAPI): Promise<void> {
   const entries = await api.getSessionEntries("example.counter")
@@ -13,6 +19,15 @@ async function sessionOperations(api: ExtensionAPI): Promise<void> {
   await api.appendEntry("example.counter", { count: 1n })
   // @ts-expect-error delivery is a closed contract
   await api.sendMessage({ customType: "example.counter", content: "updated", display: true }, "later")
+}
+
+function registerCommand(api: ExtensionAPI): void {
+  api.registerCommand({
+    name: "counter",
+    description: "Manage the counter",
+    argumentHint: "[show|increment|reset]",
+    execute: async (arguments_, { signal }) => (signal.aborted ? undefined : `Counter command: ${arguments_}`)
+  })
 }
 
 function registerStructuredTool(api: ExtensionAPI): void {
@@ -70,6 +85,17 @@ test("the public extension API exposes one frozen JSON-schema runtime", async ()
   expect(Object.isFrozen(schema.properties)).toBe(true)
 })
 
+test("commands expose bounded raw arguments, cancellation, and optional local feedback", async () => {
+  const command: ExtensionCommandDefinition = {
+    name: "counter",
+    description: "Manage the counter",
+    argumentHint: "[show|increment|reset]",
+    execute: (arguments_, { signal }) => (signal.aborted ? undefined : `Counter: ${arguments_}`)
+  }
+
+  expect(await command.execute("show", { signal: new AbortController().signal })).toBe("Counter: show")
+})
+
 test("tool schemas infer required and optional execution parameters", () => {
   const parameters = Schema.object({ message: Schema.string(), suffix: Schema.optional(Schema.string()) })
   const tool: ExtensionToolDefinition<typeof parameters> = {
@@ -101,5 +127,6 @@ test("tool output schemas infer structured execution results", async () => {
 test("public types reject values outside the worker schema contract", () => {
   expect(typeof invalidSchemas).toBe("function")
   expect(typeof sessionOperations).toBe("function")
+  expect(typeof registerCommand).toBe("function")
   expect(typeof registerStructuredTool).toBe("function")
 })

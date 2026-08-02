@@ -47,6 +47,8 @@ test("resource command selection edits the composer without dispatching TUI doma
   const session = await createSession("resource-command")
   const mode = createInteractiveStore(session)
   const slash = new SlashController(() => ({
+    extensionCommandRevision: 0,
+    listExtensionCommands: () => [],
     listResourceCommands: () => [{ name: "review", description: "Review code", argumentHint: "<path>" }]
   }))
   const prompt = createPromptStore(mode, slash)
@@ -59,6 +61,39 @@ test("resource command selection edits the composer without dispatching TUI doma
       revision: 1,
       text: "/review path",
       cursorOffset: 8
+    })
+    expect(session.messages).toEqual([])
+  } finally {
+    mode.dispose()
+    session.dispose()
+  }
+})
+
+test("extension command dispatch is typed, local, and creates no user message", async () => {
+  const session = await createSession("extension-command-store")
+  const mode = createInteractiveStore(session)
+  const slash = new SlashController(() => ({
+    extensionCommandRevision: 1,
+    listExtensionCommands: () => [
+      { name: "counter", description: "Manage counter", argumentHint: "[show|increment]", extensionId: "counter" }
+    ],
+    listResourceCommands: () => []
+  }))
+  const prompt = createPromptStore(mode, slash)
+  let invocation: { name: string; arguments: string } | undefined
+  session.invokeExtensionCommand = async (name, arguments_) => {
+    invocation = { name, arguments: arguments_ }
+    return "Counter: 1"
+  }
+
+  try {
+    expect(prompt.submit("/counter increment", "steer")).toBe(true)
+    expect(prompt.$state.get().workflow).toMatchObject({ type: "running_extension_command", name: "counter" })
+    await Bun.sleep(0)
+    expect(invocation).toEqual({ name: "counter", arguments: "increment" })
+    expect(prompt.$state.get()).toMatchObject({
+      feedback: { type: "status", message: "Counter: 1" },
+      workflow: { type: "idle" }
     })
     expect(session.messages).toEqual([])
   } finally {
@@ -109,6 +144,8 @@ test("reload command awaits session reload, invalidates slash catalog, and repor
   let resources = [{ name: "review", description: "Review code" }]
   const slash = new SlashController(
     () => ({
+      extensionCommandRevision: 0,
+      listExtensionCommands: () => [],
       listResourceCommands() {
         reads++
         return resources
@@ -130,6 +167,7 @@ test("reload command awaits session reload, invalidates slash catalog, and repor
           status: "disabled",
           lifecycle: "started",
           extensions: [],
+          commands: [],
           tools: [],
           diagnostics: [],
           omittedDiagnostics: 0,
@@ -180,6 +218,7 @@ test("reload feedback surfaces the first source-attributed diagnostic", async ()
         status: "ready",
         lifecycle: "started",
         extensions: [],
+        commands: [],
         tools: [],
         diagnostics: [],
         omittedDiagnostics: 0,
@@ -224,6 +263,7 @@ test("reload remaining count includes omitted extension diagnostics behind setti
         status: "ready",
         lifecycle: "started",
         extensions: [],
+        commands: [],
         tools: [],
         diagnostics: [],
         omittedDiagnostics: 0,

@@ -39,6 +39,24 @@ test("RPC request decoding admits only the versioned closed command catalog", ()
   expect(
     decodeRpcRequest({ version: 1, id: "events-1", method: "connection.set_events", params: { mode: "none" } })
   ).toEqual({ version: 1, id: "events-1", method: "connection.set_events", params: { mode: "none" } })
+  expect(decodeRpcRequest({ version: 1, id: "commands-1", method: "command.list" })).toEqual({
+    version: 1,
+    id: "commands-1",
+    method: "command.list"
+  })
+  expect(
+    decodeRpcRequest({
+      version: 1,
+      id: "command-1",
+      method: "command.invoke",
+      params: { name: "counter", arguments: "increment" }
+    })
+  ).toEqual({
+    version: 1,
+    id: "command-1",
+    method: "command.invoke",
+    params: { name: "counter", arguments: "increment" }
+  })
 
   expectRequestError(
     { version: 1, id: "x", method: "session.prompt", params: { delivery: "later", text: "hello" } },
@@ -54,6 +72,10 @@ test("RPC request decoding admits only the versioned closed command catalog", ()
   )
   expectRequestError(
     { version: 1, id: "x", method: "session.get_messages", params: { start: -1, limit: 101 } },
+    "invalid_request"
+  )
+  expectRequestError(
+    { version: 1, id: "x", method: "command.invoke", params: { name: "Invalid_Command", arguments: "" } },
     "invalid_request"
   )
 })

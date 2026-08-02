@@ -60,6 +60,7 @@ export type RpcSessionActivity =
   | { readonly type: "running" }
   | { readonly type: "aborting" }
   | { readonly type: "compacting"; readonly operationId: number; readonly reason: string }
+  | { readonly type: "extension_command"; readonly name: string; readonly phase: "executing" | "cancelling" }
 
 export interface RpcSessionState {
   readonly sessionId: string
@@ -387,6 +388,15 @@ async function handleRequest(
       // Applied synchronously in input order before the response is emitted.
       connection.eventMode = request.params.mode
       return { mode: request.params.mode }
+    case "command.list":
+      return { commands: session.listExtensionCommands() }
+    case "command.invoke": {
+      if (!session.listExtensionCommands().some(command => command.name === request.params.name)) {
+        throw new RpcOperationError("not_found", `Command not found: ${request.params.name}`)
+      }
+      const message = await session.invokeExtensionCommand(request.params.name, request.params.arguments)
+      return message === undefined ? {} : { message }
+    }
     case "model.list": {
       const choices = await session.listModelChoices()
       return { models: choices.map(projectModelChoice) }
@@ -417,9 +427,12 @@ function sessionState(session: AgentSession): RpcSessionState {
       ? { type: "selected", model: projectModel(session.modelState.model) }
       : { type: "unselected" }
   const compaction = session.compactionStatus
+  const extensionCommand = session.extensionCommandStatus
   let activity: RpcSessionActivity
-  if (session.isAborting) activity = { type: "aborting" }
-  else if (compaction.type === "running") {
+  if (session.isAborting && extensionCommand.type === "idle") activity = { type: "aborting" }
+  else if (extensionCommand.type === "running") {
+    activity = { type: "extension_command", name: extensionCommand.name, phase: extensionCommand.phase }
+  } else if (compaction.type === "running") {
     activity = { type: "compacting", operationId: compaction.operationId, reason: compaction.reason }
   } else if (session.isStreaming) activity = { type: "running" }
   else activity = { type: "idle" }

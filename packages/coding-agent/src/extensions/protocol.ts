@@ -25,7 +25,7 @@ import {
   type ExtensionSource
 } from "./discovery.js"
 
-export const extensionProtocolVersion = 5
+export const extensionProtocolVersion = 6
 export const maxExtensionProtocolFrameBytes = 4 * 1024 * 1024
 export const maxExtensionPendingRequests = 128
 export const maxExtensionQueuedWriteBytes = 8 * 1024 * 1024
@@ -39,6 +39,15 @@ export const maxExtensionLogBytesPerStream = 256 * 1024
 export const extensionStartupTimeoutMs = 30_000
 export const extensionLifecycleTimeoutMs = 10_000
 export const extensionShutdownTimeoutMs = 3_000
+export const extensionCommandTimeoutMs = 30_000
+export const extensionCommandCancellationTimeoutMs = 1_000
+export const maxExtensionCommands = 128
+export const maxExtensionCommandCatalogBytes = 512 * 1024
+export const maxExtensionCommandNameBytes = 64
+export const maxExtensionCommandDescriptionBytes = 4 * 1024
+export const maxExtensionCommandArgumentHintBytes = 1024
+export const maxExtensionCommandArgumentsBytes = 256 * 1024
+export const maxExtensionCommandResultBytes = 16 * 1024
 export const extensionToolTimeoutMs = 30_000
 export const extensionToolCancellationTimeoutMs = 1_000
 export const maxExtensionTools = 64
@@ -77,6 +86,7 @@ export interface ExtensionDiagnostic {
     | "factory"
     | "registration"
     | "lifecycle"
+    | "command"
     | "tool"
     | "protocol"
     | "shutdown"
@@ -94,7 +104,7 @@ export interface ExtensionLoadResult {
 export type HostMessage =
   | {
       readonly type: "initialize"
-      readonly protocolVersion: 5
+      readonly protocolVersion: 6
       readonly generation: number
       readonly plan: ExtensionLoadPlan
       readonly subagentsAvailable?: boolean
@@ -110,6 +120,13 @@ export type HostMessage =
       readonly generation: number
       readonly requestId: number
       readonly reason: ExtensionShutdownReason
+    }
+  | {
+      readonly type: "command_invoke"
+      readonly generation: number
+      readonly requestId: number
+      readonly name: string
+      readonly arguments: string
     }
   | {
       readonly type: "tool_invoke"
@@ -186,13 +203,27 @@ export type HostMessage =
 export type WorkerMessage =
   | {
       readonly type: "ready"
-      readonly protocolVersion: 5
+      readonly protocolVersion: 6
       readonly generation: number
       readonly extensions: readonly ExtensionLoadResult[]
+      readonly commands: readonly ExtensionCommandRegistration[]
       readonly tools: readonly ExtensionToolRegistration[]
       readonly subagents?: readonly ExtensionSubagentRegistration[]
     }
   | { readonly type: "settled"; readonly generation: number; readonly requestId: number }
+  | {
+      readonly type: "command_result"
+      readonly generation: number
+      readonly requestId: number
+      readonly message?: string
+    }
+  | {
+      readonly type: "command_error"
+      readonly generation: number
+      readonly requestId: number
+      readonly message: string
+    }
+  | { readonly type: "command_cancelled"; readonly generation: number; readonly requestId: number }
   | { readonly type: "tool_result"; readonly generation: number; readonly requestId: number; readonly value: JsonValue }
   | { readonly type: "tool_error"; readonly generation: number; readonly requestId: number; readonly message: string }
   | { readonly type: "tool_cancelled"; readonly generation: number; readonly requestId: number }
@@ -301,6 +332,13 @@ export type ExtensionSessionResponse = Extract<
 
 export interface ExtensionSubagentRegistration extends ExtensionSubagentProfile {
   readonly source: ExtensionSource
+}
+
+export interface ExtensionCommandRegistration {
+  readonly source: ExtensionSource
+  readonly name: string
+  readonly description: string
+  readonly argumentHint?: string
 }
 
 export interface ExtensionToolRegistration {
@@ -541,6 +579,14 @@ export function validateHostMessage(value: unknown): HostMessage {
         requestId: positiveInteger(message.requestId, "requestId"),
         reason: shutdownReason(message.reason)
       })
+    case "command_invoke":
+      return Object.freeze({
+        type: "command_invoke",
+        generation: positiveInteger(message.generation, "generation"),
+        requestId: positiveInteger(message.requestId, "requestId"),
+        name: commandName(message.name),
+        arguments: boundedTextValue(message.arguments, "command arguments", maxExtensionCommandArgumentsBytes)
+      })
     case "tool_invoke":
       return Object.freeze({
         type: "tool_invoke",
@@ -640,6 +686,7 @@ export function validateWorkerMessage(value: unknown): WorkerMessage {
       if (extensions.length > maxExtensionSources) {
         throw new ExtensionProtocolError(`Extension results cannot exceed ${maxExtensionSources}`)
       }
+      const admittedCommands = validateExtensionCommandCatalog(message.commands)
       const admittedTools = validateExtensionToolCatalog(message.tools)
       const admittedSubagents =
         message.subagents === undefined ? undefined : validateExtensionSubagentCatalog(message.subagents)
@@ -648,6 +695,7 @@ export function validateWorkerMessage(value: unknown): WorkerMessage {
         protocolVersion: protocolVersion(message.protocolVersion),
         generation: positiveInteger(message.generation, "generation"),
         extensions: Object.freeze(extensions.map(extensionLoadResult)),
+        commands: admittedCommands,
         tools: Object.freeze(admittedTools),
         ...(admittedSubagents ? { subagents: admittedSubagents } : {})
       })
@@ -657,11 +705,28 @@ export function validateWorkerMessage(value: unknown): WorkerMessage {
       return admitted
     }
     case "settled":
+    case "command_cancelled":
     case "tool_cancelled":
       return Object.freeze({
         type: message.type,
         generation: positiveInteger(message.generation, "generation"),
         requestId: positiveInteger(message.requestId, "requestId")
+      })
+    case "command_result":
+      return Object.freeze({
+        type: "command_result",
+        generation: positiveInteger(message.generation, "generation"),
+        requestId: positiveInteger(message.requestId, "requestId"),
+        ...(message.message === undefined
+          ? {}
+          : { message: boundedTextValue(message.message, "command result", maxExtensionCommandResultBytes) })
+      })
+    case "command_error":
+      return Object.freeze({
+        type: "command_error",
+        generation: positiveInteger(message.generation, "generation"),
+        requestId: positiveInteger(message.requestId, "requestId"),
+        message: boundedRequiredText(message.message, "command error", maxExtensionDiagnosticMessageBytes)
       })
     case "tool_result":
       return Object.freeze({
@@ -771,6 +836,29 @@ export function validateWorkerMessage(value: unknown): WorkerMessage {
   }
 }
 
+export function validateExtensionCommandRegistration(value: unknown): ExtensionCommandRegistration {
+  return extensionCommandRegistration(value)
+}
+
+export function validateExtensionCommandCatalog(value: unknown): readonly ExtensionCommandRegistration[] {
+  const commands = protocolArray(value, "commands")
+  if (commands.length > maxExtensionCommands) {
+    throw new ExtensionProtocolError(`Extension commands cannot exceed ${maxExtensionCommands}`)
+  }
+  const admitted = commands.map(extensionCommandRegistration)
+  const names = new Set<string>()
+  for (const command of admitted) {
+    if (names.has(command.name)) {
+      throw new ExtensionProtocolError(`Extension command names must be unique: ${command.name}`)
+    }
+    names.add(command.name)
+  }
+  if (Buffer.byteLength(JSON.stringify(admitted)) > maxExtensionCommandCatalogBytes) {
+    throw new ExtensionProtocolError(`Extension command catalog cannot exceed ${maxExtensionCommandCatalogBytes} bytes`)
+  }
+  return Object.freeze(admitted)
+}
+
 export function validateExtensionToolRegistration(value: unknown): ExtensionToolRegistration {
   return extensionToolRegistration(value)
 }
@@ -813,12 +901,25 @@ export function validateExtensionSubagentCatalog(value: unknown): readonly Exten
   return Object.freeze(admitted)
 }
 
+export function validateExtensionCommandArguments(value: unknown): string {
+  return boundedTextValue(value, "command arguments", maxExtensionCommandArgumentsBytes)
+}
+
+export function validateExtensionCommandResult(value: unknown): string | undefined {
+  if (value === undefined) return undefined
+  return boundedTextValue(value, "command result", maxExtensionCommandResultBytes)
+}
+
 export function validateExtensionToolArguments(value: unknown): Readonly<Record<string, JsonValue>> {
   return jsonRecord(value, "tool arguments", maxExtensionToolArgumentsBytes)
 }
 
 export function validateExtensionToolResult(value: unknown): JsonValue {
   return jsonValue(value, "tool result", maxExtensionToolResultBytes)
+}
+
+export function boundedExtensionCommandError(cause: unknown): string {
+  return boundedOperationError(cause, "Extension command failed")
 }
 
 export function boundedExtensionToolError(cause: unknown): string {
@@ -1017,6 +1118,20 @@ function extensionSubagentCompletion(value: unknown): NonNullable<ExtensionSubag
   })
 }
 
+function extensionCommandRegistration(value: unknown): ExtensionCommandRegistration {
+  const command = protocolRecord(value)
+  const argumentHint =
+    command.argumentHint === undefined
+      ? undefined
+      : boundedRequiredText(command.argumentHint, "command argument hint", maxExtensionCommandArgumentHintBytes)
+  return Object.freeze({
+    source: extensionSource(command.source),
+    name: commandName(command.name),
+    description: boundedRequiredText(command.description, "command description", maxExtensionCommandDescriptionBytes),
+    ...(argumentHint === undefined ? {} : { argumentHint })
+  })
+}
+
 function extensionToolRegistration(value: unknown): ExtensionToolRegistration {
   const tool = protocolRecord(value)
   const name = toolName(tool.name)
@@ -1173,6 +1288,16 @@ function subagentInterruptResult(value: unknown): "interrupted" | "already_idle"
   return value
 }
 
+function commandName(value: unknown): string {
+  const name = boundedRequiredText(value, "command name", maxExtensionCommandNameBytes)
+  if (!/^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/.test(name)) {
+    throw new ExtensionProtocolError(
+      "Extension command names must start with a lowercase letter and use lowercase letters, numbers, or single hyphens"
+    )
+  }
+  return name
+}
+
 function toolName(value: unknown): string {
   const name = boundedRequiredText(value, "tool name", maxExtensionToolNameBytes)
   if (!/^[a-z][a-z0-9_]*$/.test(name)) {
@@ -1244,6 +1369,7 @@ function extensionDiagnostic(value: unknown): ExtensionDiagnostic {
     phase !== "factory" &&
     phase !== "registration" &&
     phase !== "lifecycle" &&
+    phase !== "command" &&
     phase !== "tool" &&
     phase !== "protocol" &&
     phase !== "shutdown"
@@ -1284,7 +1410,7 @@ function protocolArray(value: unknown, field: string): readonly unknown[] {
   return value
 }
 
-function protocolVersion(value: unknown): 5 {
+function protocolVersion(value: unknown): 6 {
   if (value !== extensionProtocolVersion) throw new ExtensionProtocolError("Unsupported extension protocol version")
   return extensionProtocolVersion
 }

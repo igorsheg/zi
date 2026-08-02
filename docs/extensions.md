@@ -1,6 +1,6 @@
 # Extensions
 
-Zi extensions are trusted TypeScript modules that add repository-specific behavior without changing Zi. The supported public surface consists of lifecycle handlers, model-callable tools, bounded durable session operations, and optional subagent profiles and operations.
+Zi extensions are trusted TypeScript modules that add repository-specific behavior without changing Zi. The supported public surface consists of lifecycle handlers, user-invoked commands, model-callable tools, bounded durable session operations, and optional subagent profiles and operations.
 
 ## Trust and authority
 
@@ -43,6 +43,32 @@ export default function (zi: ExtensionAPI): void {
 
 The default factory may be synchronous or asynchronous. Registration is allowed only while that factory runs. A failure rolls back registrations from that source without preventing other extensions or Zi from starting.
 
+### User commands
+
+Register one idle-only user action with `registerCommand(...)`:
+
+```ts
+zi.registerCommand({
+  name: "counter",
+  description: "Show or increment the durable counter",
+  argumentHint: "[show|increment]",
+  async execute(arguments_, { signal }) {
+    signal.throwIfAborted()
+    return arguments_.trim() === "increment" ? "Counter incremented" : "Counter unchanged"
+  }
+})
+```
+
+Command names are lowercase kebab-case, begin with a letter, and are unique across the active extension generation. Built-in names are reserved. Interactive catalog precedence is built-in command, extension command, then prompt or skill resource. Duplicate extension names fail the later source instead of suffixing or shadowing the first.
+
+The handler receives one bounded raw argument string and an invocation-scoped `AbortSignal`. It may return a bounded string for local user feedback or return nothing. Feedback is neither a journal entry nor provider context. Throw to report failure. Commands cannot run, queue, or intercept text while another session operation is active; interruption aborts the invocation, and `ExtensionHost` enforces execution and cancellation deadlines. Use `appendEntry(...)` when a command must persist model-invisible state. Conversation `sendMessage(...)` delivery is refused while a command owns the session; return feedback instead.
+
+Interactive mode parses `/name arguments` and dispatches a typed intent through `AgentSession`; the extension never receives TUI objects. RPC clients use `command.list` and `command.invoke` directly rather than sending slash text through `session.prompt`. Completion providers, command shortcuts, arbitrary UI, provider interception, and session replacement authority are not part of this contract.
+
+The catalog is limited to 128 commands and 512 KiB. Names are limited to 64 bytes, descriptions to 4 KiB, argument hints to 1 KiB, invocation arguments to 256 KiB, and local results to 16 KiB.
+
+### Model-callable tools
+
 Tool names use lowercase letters, numbers, and underscores and must begin with a letter. Parameters must be an object schema built from `Schema.string`, `number`, `integer`, `boolean`, `literal`, `optional`, `array`, and `object`. Literals are JSON primitives and string patterns are strings, not `RegExp` objects. The public types reject non-object tool parameters. Zi validates arguments before calling `execute`.
 
 Without `outputSchema`, a tool returns one bounded string. Declaring `outputSchema` lets it return a matching bounded JSON value. Zi validates that value in the extension worker, renders it as JSON for direct model calls, and delivers it as an already-decoded JavaScript value in Code Mode. Tools throw errors for failed operations. Built-in Zi tool names take precedence over extension registrations.
@@ -83,6 +109,6 @@ Edit trusted extensions, skills, prompts, settings, or context files, then run `
 
 ## Modes and diagnostics
 
-The authoritative tool catalog is shared by interactive, text, JSON, and RPC modes. Interactive mode uses Zi's generic tool frame. Text mode writes tool progress to stderr and the final answer to stdout. JSON mode emits ordered tool lifecycle events on stdout. RPC emits versioned, sequenced session events and correlated responses. Extension `stdout` and `stderr` are retained separately in bounded worker log tails and never join those output protocols.
+The authoritative command catalog is shared by interactive mode and RPC. RPC exposes `command.list` and `command.invoke`; text and JSON modes do not parse slash commands. The authoritative tool catalog is shared by interactive, text, JSON, and RPC modes. Interactive mode uses Zi's generic tool frame. Text mode writes tool progress to stderr and the final answer to stdout. JSON mode emits ordered tool lifecycle events on stdout. RPC emits versioned, sequenced session events and correlated responses. Extension `stdout` and `stderr` are retained separately in bounded worker log tails and never join those output protocols.
 
 Import, factory, registration, protocol, execution, and worker failures are source-attributed and fail closed. A failed worker generation is not restarted implicitly; use `/reload` or create a new session after correcting the extension.

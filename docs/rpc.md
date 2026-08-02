@@ -68,6 +68,8 @@ Operation failures use `ok: false` with `capacity`, `not_found`, or `operation_f
 | `session.interrupt`     | none                                                              | Empty object after interruption settles              |
 | `session.await_idle`    | none                                                              | Empty object after current session work settles      |
 | `connection.set_events` | `mode`: `all` (default) or `none`                                 | Active event mode                                    |
+| `command.list`          | none                                                              | Admitted extension-command descriptors               |
+| `command.invoke`        | `name`, bounded raw `arguments` string                            | Optional local feedback after command settlement     |
 | `model.list`            | none                                                              | Bounded model descriptors with authentication status |
 | `model.select`          | `provider`, `id`                                                  | Selected public model descriptor                     |
 | `thinking.list`         | none                                                              | Levels supported by the selected model               |
@@ -76,6 +78,8 @@ Operation failures use `ok: false` with `capacity`, `not_found`, or `operation_f
 A direct prompt response means the input was admitted, not that provider work completed. Use ordered session events or `session.await_idle` for completion. Steering and follow-up input retain `AgentSession` queue semantics and may be queued before the next direct prompt.
 
 `delivery: "continue"` is decided inside the child `AgentSession`: idle starts a direct run; running queues follow-up into the active run. Aborting, compacting, reloading, failed, and disposed states reject the operation. The response reports only that the continue input was admitted, not that its resulting work settled.
+
+`command.invoke` addresses an admitted extension command directly; it does not parse slash text. Commands are idle-only `AgentSession` operations. Their optional feedback is returned as `{ "message": "…" }` (or `{}`), remains outside the journal and provider context, and may be interrupted with `session.interrupt`. Unknown names return `not_found`. The copyable client exposes `runRpcCommand(...)`, which checks `command.list` before invoking the exact name.
 
 `connection.set_events` is owned by the RPC connection, not `AgentSession`. Admission applies the mode synchronously in input order before its response is emitted. Mode `none` suppresses only `session_event` frames; `ready`, `response`, and `protocol_error` are never suppressed. The compatibility default remains `all`.
 
@@ -91,6 +95,7 @@ Message pages are bounded by both count and encoded bytes. A client should retai
 - prompt text: 8 MiB;
 - message page: 100 messages and 8 MiB;
 - request ID, model provider, or model ID: 256 bytes;
+- command name: 64 bytes; command arguments: 256 KiB;
 - ordinary in-flight operations: 32;
 - reserved concurrent interruption: 1;
 - pending output: 1,024 records and 32 MiB;

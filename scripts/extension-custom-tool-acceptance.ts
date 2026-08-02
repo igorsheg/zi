@@ -3,7 +3,7 @@ import { copyFile, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
 
-import { runRpcPrompt } from "../examples/rpc/client.js"
+import { runRpcCommand, runRpcPrompt } from "../examples/rpc/client.js"
 import { interactiveAcceptanceArgument } from "../packages/cli/src/main.js"
 
 const acceptancePrompt = "Call repository_status once, then report success."
@@ -102,9 +102,44 @@ export async function runExtensionCustomToolAcceptance(options: ExtensionCustomT
         await provider.dispose()
       }
     }
+    await runCommandAcceptance(options.executable, project, agentDirectory)
     await runDurableCounterAcceptance(options.executable, project, agentDirectory)
   } finally {
     await removeTemporaryDirectory(temporary)
+  }
+}
+
+async function runCommandAcceptance(executable: string, project: string, agentDirectory: string): Promise<void> {
+  const incremented = await invokeAcceptedCommand(executable, project, agentDirectory, "new", "increment")
+  if (incremented !== "Counter: 1") {
+    throw new Error(`Compiled extension command returned unexpected output: ${JSON.stringify(incremented)}`)
+  }
+  const restored = await invokeAcceptedCommand(executable, project, agentDirectory, "continue", "show")
+  if (restored !== "Counter: 1") {
+    throw new Error(`Compiled extension command did not restore its state: ${JSON.stringify(restored)}`)
+  }
+}
+
+async function invokeAcceptedCommand(
+  executable: string,
+  project: string,
+  agentDirectory: string,
+  session: "new" | "continue",
+  arguments_: string
+): Promise<string | undefined> {
+  const controller = new AbortController()
+  const deadline = setTimeout(() => controller.abort(), processDeadlineMs)
+  try {
+    return await runRpcCommand({
+      command: [executable, ...rpcCommandArguments(project, agentDirectory, session)],
+      cwd: project,
+      env: process.env,
+      name: "counter",
+      arguments: arguments_,
+      signal: controller.signal
+    })
+  } finally {
+    clearTimeout(deadline)
   }
 }
 
@@ -289,6 +324,10 @@ function durableCounterArguments(project: string, agentDirectory: string, sessio
     "off",
     "Call increment_counter exactly once."
   ]
+}
+
+function rpcCommandArguments(project: string, agentDirectory: string, session: "new" | "continue"): string[] {
+  return [session === "new" ? "--new-session" : "--continue", "--cwd", project, "--agent-dir", agentDirectory]
 }
 
 function rpcProductArguments(project: string, agentDirectory: string): string[] {

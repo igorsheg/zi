@@ -11,13 +11,21 @@ export const rpcClientReadyTimeoutMs = 10_000
 export const rpcClientRequestTimeoutMs = 5 * 60_000
 export const rpcClientCloseTimeoutMs = 5_000
 
-export interface RpcPromptClientOptions {
+interface RpcClientOptions {
   readonly command: readonly string[]
-  readonly prompt: string
   readonly cwd?: string
   readonly env?: Readonly<Record<string, string | undefined>>
   readonly signal?: AbortSignal
   readonly onEvent?: (event: Readonly<Record<string, unknown>>) => void
+}
+
+export interface RpcPromptClientOptions extends RpcClientOptions {
+  readonly prompt: string
+}
+
+export interface RpcCommandClientOptions extends RpcClientOptions {
+  readonly name: string
+  readonly arguments: string
 }
 
 type ClientState =
@@ -43,8 +51,8 @@ interface MessagePage {
 
 /** A copyable one-shot client that demonstrates the supported process contract without private Zi imports. */
 export async function runRpcPrompt(options: RpcPromptClientOptions): Promise<string> {
-  validateOptions(options)
-  const client = new RpcPromptClient(options)
+  validatePromptOptions(options)
+  const client = new RpcClient(options)
   try {
     await client.ready()
     await client.request("session.prompt", { delivery: "direct", text: options.prompt })
@@ -55,9 +63,29 @@ export async function runRpcPrompt(options: RpcPromptClientOptions): Promise<str
   }
 }
 
-class RpcPromptClient {
+/** Invoke one admitted extension command without parsing slash text. */
+export async function runRpcCommand(options: RpcCommandClientOptions): Promise<string | undefined> {
+  validateCommandOptions(options)
+  const client = new RpcClient(options)
+  try {
+    await client.ready()
+    const catalog = await client.request("command.list")
+    if (!commandCatalogContains(catalog, options.name)) {
+      throw new Error(`RPC command catalog omitted ${options.name}`)
+    }
+    const result = await client.request("command.invoke", { name: options.name, arguments: options.arguments })
+    if (!isRecord(result) || (result.message !== undefined && typeof result.message !== "string")) {
+      throw new Error("RPC command invocation returned an invalid result")
+    }
+    return result.message
+  } finally {
+    await client.close()
+  }
+}
+
+class RpcClient {
   readonly #child: Bun.Subprocess<"pipe", "pipe", "pipe">
-  readonly #onEvent: RpcPromptClientOptions["onEvent"]
+  readonly #onEvent: RpcClientOptions["onEvent"]
   readonly #ready = deferred<void>()
   readonly #removeAbort: () => void
   readonly #pending = new Map<string, PendingRequest>()
@@ -70,7 +98,7 @@ class RpcPromptClient {
   #pendingWriteBytes = 0
   #stderr = ""
 
-  constructor(options: RpcPromptClientOptions) {
+  constructor(options: RpcClientOptions) {
     this.#onEvent = options.onEvent
     this.#child = Bun.spawn([...options.command, "--mode", "rpc"], {
       ...(options.cwd ? { cwd: options.cwd } : {}),
@@ -422,7 +450,25 @@ function assistantText(
   }
 }
 
-function validateOptions(options: RpcPromptClientOptions): void {
+function validatePromptOptions(options: RpcPromptClientOptions): void {
+  validateClientOptions(options)
+  if (typeof options.prompt !== "string" || Buffer.byteLength(options.prompt) > maxRpcClientPromptBytes) {
+    throw new Error(`RPC client prompt cannot exceed ${maxRpcClientPromptBytes} bytes`)
+  }
+}
+
+function validateCommandOptions(options: RpcCommandClientOptions): void {
+  validateClientOptions(options)
+  if (typeof options.name !== "string" || !/^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/.test(options.name)) {
+    throw new Error("RPC command name must use lowercase kebab-case")
+  }
+  if (Buffer.byteLength(options.name) > 64) throw new Error("RPC command name cannot exceed 64 bytes")
+  if (typeof options.arguments !== "string" || Buffer.byteLength(options.arguments) > 256 * 1024) {
+    throw new Error("RPC command arguments cannot exceed 262144 bytes")
+  }
+}
+
+function validateClientOptions(options: RpcClientOptions): void {
   if (
     options.command.length === 0 ||
     options.command.length > 128 ||
@@ -433,9 +479,11 @@ function validateOptions(options: RpcPromptClientOptions): void {
   if (Buffer.byteLength(options.command.join("\0")) > 64 * 1024) {
     throw new Error("RPC client command cannot exceed 65536 bytes")
   }
-  if (typeof options.prompt !== "string" || Buffer.byteLength(options.prompt) > maxRpcClientPromptBytes) {
-    throw new Error(`RPC client prompt cannot exceed ${maxRpcClientPromptBytes} bytes`)
-  }
+}
+
+function commandCatalogContains(value: unknown, name: string): boolean {
+  if (!isRecord(value) || !Array.isArray(value.commands)) throw new Error("RPC command catalog is invalid")
+  return value.commands.some(command => isRecord(command) && command.name === name)
 }
 
 async function settleWithin(operation: Promise<void>, timeoutMs: number): Promise<boolean> {

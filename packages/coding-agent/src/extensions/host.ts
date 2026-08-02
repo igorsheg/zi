@@ -20,6 +20,8 @@ import type { ExtensionLoadPlan } from "./discovery.js"
 import {
   boundedExtensionDiagnostic,
   boundedExtensionSessionOperationError,
+  extensionCommandCancellationTimeoutMs,
+  extensionCommandTimeoutMs,
   extensionLifecycleTimeoutMs,
   ExtensionProtocolDecoder,
   ExtensionProtocolWriter,
@@ -31,6 +33,7 @@ import {
   maxExtensionDiagnostics,
   maxExtensionLogBytesPerStream,
   maxExtensionPendingRequests,
+  type ExtensionCommandRegistration,
   type ExtensionDiagnostic,
   type ExtensionLoadResult,
   type ExtensionSessionRequest,
@@ -40,6 +43,7 @@ import {
   type HostMessage,
   type JsonValue,
   type WorkerMessage,
+  validateExtensionCommandArguments,
   validateExtensionToolArguments,
   validateWorkerMessage
 } from "./protocol.js"
@@ -98,6 +102,8 @@ export interface ExtensionHostTimeouts {
   readonly startupMs: number
   readonly lifecycleMs: number
   readonly shutdownMs: number
+  readonly commandMs: number
+  readonly commandCancellationMs: number
   readonly toolMs: number
   readonly toolCancellationMs: number
 }
@@ -106,6 +112,8 @@ export const defaultExtensionHostTimeouts: ExtensionHostTimeouts = Object.freeze
   startupMs: extensionStartupTimeoutMs,
   lifecycleMs: extensionLifecycleTimeoutMs,
   shutdownMs: extensionShutdownTimeoutMs,
+  commandMs: extensionCommandTimeoutMs,
+  commandCancellationMs: extensionCommandCancellationTimeoutMs,
   toolMs: extensionToolTimeoutMs,
   toolCancellationMs: extensionToolCancellationTimeoutMs
 })
@@ -143,10 +151,16 @@ export interface ExtensionLogTail {
   readonly omittedBytes: number
 }
 
+export interface ExtensionHostCatalog {
+  readonly commands: readonly ExtensionCommandRegistration[]
+  readonly tools: readonly ExtensionToolRegistration[]
+}
+
 export interface ExtensionHostSnapshot {
   readonly status: ExtensionHostStatus
   readonly lifecycle: ExtensionHostLifecycle
   readonly extensions: readonly ExtensionLoadResult[]
+  readonly commands: readonly ExtensionCommandRegistration[]
   readonly tools: readonly ExtensionToolRegistration[]
   readonly diagnostics: readonly ExtensionDiagnostic[]
   readonly failure?: ExtensionDiagnostic
@@ -203,9 +217,30 @@ type GenerationLifecycle = "loaded" | "started" | "stopped"
 
 interface ExtensionGenerationReady {
   readonly extensions: readonly ExtensionLoadResult[]
+  readonly commands: readonly ExtensionCommandRegistration[]
   readonly tools: readonly ExtensionToolRegistration[]
   readonly subagents: readonly ExtensionSubagentRegistration[]
 }
+
+type GenerationCommandInvocation =
+  | {
+      readonly type: "running"
+      readonly requestId: number
+      readonly registration: ExtensionCommandRegistration
+      readonly settled: Deferred<string | undefined>
+      readonly signal?: AbortSignal
+      readonly onAbort?: () => void
+      readonly timeout: ReturnType<typeof setTimeout>
+    }
+  | {
+      readonly type: "cancelling"
+      readonly requestId: number
+      readonly registration: ExtensionCommandRegistration
+      readonly settled: Deferred<string | undefined>
+      readonly signal: AbortSignal
+      readonly onAbort: () => void
+      readonly timeout: ReturnType<typeof setTimeout>
+    }
 
 type GenerationToolInvocation =
   | {
@@ -274,6 +309,13 @@ class ExtensionGenerationError extends Error {
   }
 }
 
+class ExtensionCommandExecutionError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = "ExtensionCommandExecutionError"
+  }
+}
+
 class ExtensionToolExecutionError extends Error {
   constructor(message: string) {
     super(message)
@@ -331,6 +373,7 @@ class ExtensionGeneration {
   ) => Promise<ExtensionSessionRequestOutcome>
   readonly #stdout = new LogTail()
   readonly #stderr = new LogTail()
+  readonly #commandInvocations = new Map<number, GenerationCommandInvocation>()
   readonly #toolInvocations = new Map<number, GenerationToolInvocation>()
   readonly #sessionResponses = new Set<number>()
   readonly #sessionOperations = new Map<
@@ -338,6 +381,7 @@ class ExtensionGeneration {
     { readonly extensionId: string; readonly controller: AbortController }
   >()
   #lastSessionRequestId = 0
+  #commands: readonly ExtensionCommandRegistration[] = Object.freeze([])
   #tools: readonly ExtensionToolRegistration[] = Object.freeze([])
   #subagents: readonly ExtensionSubagentRegistration[] = Object.freeze([])
   readonly #onProtocolData: (chunk: Buffer) => void
@@ -405,6 +449,10 @@ class ExtensionGeneration {
     return this.#state.type === "failed" ? this.#state.error.diagnostic : undefined
   }
 
+  get commands(): readonly ExtensionCommandRegistration[] {
+    return this.#commands
+  }
+
   get tools(): readonly ExtensionToolRegistration[] {
     return this.#tools
   }
@@ -459,6 +507,48 @@ class ExtensionGeneration {
     return admitted.settled.promise
   }
 
+  requestCommand(name: string, arguments_: string, signal?: AbortSignal): Promise<string | undefined> {
+    const state = this.#state
+    if (state.type !== "ready" || state.lifecycle !== "started") {
+      return Promise.reject(new Error(`Extension generation cannot invoke commands while ${state.type}`))
+    }
+    const registration = this.#commands.find(command => command.name === name)
+    if (!registration) return Promise.reject(new Error(`Unknown extension command: ${name}`))
+    if (this.#commandInvocations.size + this.#toolInvocations.size >= maxExtensionPendingRequests) {
+      return Promise.reject(
+        new Error(`Extension generation cannot run more than ${maxExtensionPendingRequests} invocations`)
+      )
+    }
+    if (signal?.aborted) return Promise.reject(abortError())
+
+    const requestId = this.#takeRequestId()
+    const settled = deferred<string | undefined>()
+    const onAbort = signal ? () => this.#cancelCommandInvocation(requestId) : undefined
+    const timeout = setTimeout(
+      () => this.#commandInvocationTimedOut(requestId, "Extension command deadline exceeded"),
+      this.#timeouts.commandMs
+    )
+    timeout.unref?.()
+    const invocation: GenerationCommandInvocation = {
+      type: "running",
+      requestId,
+      registration,
+      settled,
+      ...(signal ? { signal } : {}),
+      ...(onAbort ? { onAbort } : {}),
+      timeout
+    }
+    this.#commandInvocations.set(requestId, invocation)
+    if (signal && onAbort) signal.addEventListener("abort", onAbort, { once: true })
+    void this.#writer
+      .send({ type: "command_invoke", generation: this.id, requestId, name, arguments: arguments_ })
+      .catch(cause => {
+        const message = errorMessage(cause, "Extension command request failed")
+        this.#fail("command", message, cause, this.#commandDiagnostic(registration, message))
+      })
+    return settled.promise
+  }
+
   requestTool(name: string, arguments_: Readonly<Record<string, JsonValue>>, signal?: AbortSignal): Promise<JsonValue> {
     const state = this.#state
     if (state.type !== "ready" || state.lifecycle !== "started") {
@@ -466,9 +556,9 @@ class ExtensionGeneration {
     }
     const registration = this.#tools.find(tool => tool.name === name)
     if (!registration) return Promise.reject(new Error(`Unknown extension tool: ${name}`))
-    if (this.#toolInvocations.size >= maxExtensionPendingRequests) {
+    if (this.#commandInvocations.size + this.#toolInvocations.size >= maxExtensionPendingRequests) {
       return Promise.reject(
-        new Error(`Extension generation cannot run more than ${maxExtensionPendingRequests} tool invocations`)
+        new Error(`Extension generation cannot run more than ${maxExtensionPendingRequests} invocations`)
       )
     }
     if (signal?.aborted) return Promise.reject(abortError())
@@ -503,8 +593,11 @@ class ExtensionGeneration {
 
   dispose(): Promise<void> {
     const state = this.#state
-    if (this.#toolInvocations.size > 0) {
-      const error = new Error("Extension generation disposed during tool invocation")
+    if (this.#commandInvocations.size > 0 || this.#toolInvocations.size > 0) {
+      const error = new Error("Extension generation disposed during invocation")
+      for (const invocation of this.#commandInvocations.values()) {
+        this.#finishCommandInvocation(invocation, { error })
+      }
       for (const invocation of this.#toolInvocations.values()) {
         this.#finishToolInvocation(invocation, { error })
       }
@@ -559,14 +652,69 @@ class ExtensionGeneration {
     if (request === "session_shutdown" && state.lifecycle !== "started") {
       throw new Error(`Extension generation cannot shut down while ${state.lifecycle}`)
     }
-    if (request === "session_shutdown" && this.#toolInvocations.size > 0) {
-      throw new Error("Extension generation cannot shut down with active tool invocations")
+    if (request === "session_shutdown" && (this.#commandInvocations.size > 0 || this.#toolInvocations.size > 0)) {
+      throw new Error("Extension generation cannot shut down with active invocations")
     }
 
     const requestId = this.#takeRequestId()
     const settled = deferred<void>()
     this.#state = { type: "requesting", requestId, request, lifecycle: state.lifecycle, settled }
     return { requestId, settled }
+  }
+
+  #cancelCommandInvocation(requestId: number): void {
+    const invocation = this.#commandInvocations.get(requestId)
+    if (!invocation || invocation.type !== "running" || !invocation.signal || !invocation.onAbort) return
+    clearTimeout(invocation.timeout)
+    const timeout = setTimeout(
+      () => this.#commandInvocationTimedOut(requestId, "Extension command cancellation deadline exceeded"),
+      this.#timeouts.commandCancellationMs
+    )
+    timeout.unref?.()
+    const cancelling: GenerationCommandInvocation = {
+      type: "cancelling",
+      requestId,
+      registration: invocation.registration,
+      settled: invocation.settled,
+      signal: invocation.signal,
+      onAbort: invocation.onAbort,
+      timeout
+    }
+    this.#commandInvocations.set(requestId, cancelling)
+    void this.#writer.send({ type: "cancel", generation: this.id, requestId }).catch(cause => {
+      const message = errorMessage(cause, "Extension command cancellation failed")
+      this.#fail("command", message, cause, this.#commandDiagnostic(invocation.registration, message))
+    })
+  }
+
+  #commandInvocationTimedOut(requestId: number, message: string): void {
+    const invocation = this.#commandInvocations.get(requestId)
+    if (!invocation) return
+    this.#fail("command", message, undefined, this.#commandDiagnostic(invocation.registration, message))
+  }
+
+  #commandDiagnostic(registration: ExtensionCommandRegistration, message: string): ExtensionDiagnostic {
+    return boundedExtensionDiagnostic({
+      extensionId: registration.source.id,
+      path: registration.source.entryPath,
+      phase: "command",
+      severity: "error",
+      message
+    })
+  }
+
+  #finishCommandInvocation(
+    invocation: GenerationCommandInvocation,
+    outcome: { message: string | undefined } | { error: Error }
+  ): void {
+    if (this.#commandInvocations.get(invocation.requestId) !== invocation) return
+    this.#commandInvocations.delete(invocation.requestId)
+    clearTimeout(invocation.timeout)
+    if (invocation.signal && invocation.onAbort) {
+      invocation.signal.removeEventListener("abort", invocation.onAbort)
+    }
+    if ("message" in outcome) invocation.settled.resolve(outcome.message)
+    else invocation.settled.reject(outcome.error)
   }
 
   #cancelToolInvocation(requestId: number): void {
@@ -675,6 +823,10 @@ class ExtensionGeneration {
           this.#fail("handshake", "Extension worker ready results did not match its admitted load plan")
           return
         }
+        if (!commandsMatchLoadedExtensions(message.commands, message.extensions)) {
+          this.#fail("handshake", "Extension worker commands did not match its loaded extensions")
+          return
+        }
         if (!toolsMatchLoadedExtensions(message.tools, message.extensions)) {
           this.#fail("handshake", "Extension worker tools did not match its loaded extensions")
           return
@@ -684,10 +836,16 @@ class ExtensionGeneration {
           this.#fail("handshake", "Extension worker subagent profiles did not match its loaded extensions")
           return
         }
+        this.#commands = message.commands
         this.#tools = message.tools
         this.#subagents = subagents
         this.#state = { type: "ready", lifecycle: "loaded" }
-        state.ready.resolve({ extensions: message.extensions, tools: message.tools, subagents })
+        state.ready.resolve({
+          extensions: message.extensions,
+          commands: message.commands,
+          tools: message.tools,
+          subagents
+        })
         return
       case "settled":
         if (state.type === "requesting" && state.requestId === message.requestId) {
@@ -703,6 +861,29 @@ class ExtensionGeneration {
         }
         this.#fail("protocol", "Extension worker settled an unknown request")
         return
+      case "command_result":
+      case "command_error":
+      case "command_cancelled": {
+        const invocation = this.#commandInvocations.get(message.requestId)
+        if (!invocation) {
+          this.#fail("protocol", "Extension worker settled an unknown command request")
+          return
+        }
+        if (invocation.type === "cancelling") {
+          this.#finishCommandInvocation(invocation, { error: abortError() })
+          return
+        }
+        if (message.type === "command_result") {
+          this.#finishCommandInvocation(invocation, { message: message.message })
+          return
+        }
+        if (message.type === "command_error") {
+          this.#finishCommandInvocation(invocation, { error: new ExtensionCommandExecutionError(message.message) })
+          return
+        }
+        this.#fail("protocol", "Extension worker cancelled a command request that was not cancelling")
+        return
+      }
       case "tool_result":
       case "tool_error":
       case "tool_cancelled": {
@@ -875,6 +1056,9 @@ class ExtensionGeneration {
     if (state.type === "failed" || state.type === "disposed" || state.type === "disposing_terminating") return
     const diagnosticValue = suppliedDiagnostic ?? diagnostic(phase, message, cause)
     const error = new ExtensionGenerationError(diagnosticValue, cause === undefined ? undefined : { cause })
+    for (const invocation of this.#commandInvocations.values()) {
+      this.#finishCommandInvocation(invocation, { error })
+    }
     for (const invocation of this.#toolInvocations.values()) {
       this.#finishToolInvocation(invocation, { error })
     }
@@ -910,7 +1094,10 @@ class ExtensionGeneration {
   }
 
   async #release(): Promise<void> {
-    const error = new Error("Extension generation disposed during tool invocation")
+    const error = new Error("Extension generation disposed during invocation")
+    for (const invocation of this.#commandInvocations.values()) {
+      this.#finishCommandInvocation(invocation, { error })
+    }
     for (const invocation of this.#toolInvocations.values()) {
       this.#finishToolInvocation(invocation, { error })
     }
@@ -949,9 +1136,10 @@ export class ExtensionHost {
   #omittedDiagnostics = 0
   #staleFrames = 0
   #extensions: readonly ExtensionLoadResult[] = Object.freeze([])
+  #commands: readonly ExtensionCommandRegistration[] = Object.freeze([])
   #tools: readonly ExtensionToolRegistration[] = Object.freeze([])
   #subagents: readonly ExtensionSubagentRegistration[] = Object.freeze([])
-  #catalogListener: ((tools: readonly ExtensionToolRegistration[]) => void) | undefined
+  #catalogListener: ((catalog: ExtensionHostCatalog) => void) | undefined
   #sessionOperations: ExtensionSessionOperations | undefined
   #reloadAttempt: ReloadAttempt | undefined
   #lastLogs: { readonly stdout: ExtensionLogTail; readonly stderr: ExtensionLogTail } = Object.freeze({
@@ -1011,6 +1199,7 @@ export class ExtensionHost {
       status: hostStatus(state),
       lifecycle: state.type === "disposed" ? "stopped" : state.lifecycle,
       extensions: this.#extensions,
+      commands: this.#commands,
       tools: this.#tools,
       diagnostics: Object.freeze([...this.#diagnostics]),
       ...(state.type === "failed" ? { failure: state.diagnostic } : {}),
@@ -1019,6 +1208,10 @@ export class ExtensionHost {
       stdout: logs.stdout,
       stderr: logs.stderr
     })
+  }
+
+  commandCatalog(): readonly ExtensionCommandRegistration[] {
+    return this.#commands
   }
 
   toolCatalog(): readonly ExtensionToolRegistration[] {
@@ -1038,13 +1231,30 @@ export class ExtensionHost {
     }
   }
 
-  bindCatalog(listener: (tools: readonly ExtensionToolRegistration[]) => void): () => void {
+  bindCatalog(listener: (catalog: ExtensionHostCatalog) => void): () => void {
     if (this.#state.type === "disposed") throw new Error("Extension host is disposed")
-    if (this.#catalogListener) throw new Error("Extension host tool catalog is already bound")
+    if (this.#catalogListener) throw new Error("Extension host catalog is already bound")
     this.#catalogListener = listener
     return () => {
       if (this.#catalogListener === listener) this.#catalogListener = undefined
     }
+  }
+
+  invokeCommand(name: string, arguments_: unknown, signal?: AbortSignal): Promise<string | undefined> {
+    const state = this.#state
+    if (state.type !== "ready" || state.lifecycle !== "started") {
+      return Promise.reject(new Error(`Extension host cannot invoke commands while ${state.type}`))
+    }
+    if (!this.#commands.some(command => command.name === name)) {
+      return Promise.reject(new Error(`Unknown admitted extension command: ${name}`))
+    }
+    let admittedArguments: string
+    try {
+      admittedArguments = validateExtensionCommandArguments(arguments_)
+    } catch (cause) {
+      return Promise.reject(cause)
+    }
+    return state.current.requestCommand(name, admittedArguments, signal)
   }
 
   invokeTool(name: string, arguments_: unknown, signal?: AbortSignal): Promise<JsonValue> {
@@ -1064,9 +1274,33 @@ export class ExtensionHost {
     return state.current.requestTool(name, parameters, signal)
   }
 
+  rejectCommands(
+    rejections: readonly { readonly command: ExtensionCommandRegistration; readonly message: string }[]
+  ): void {
+    if (rejections.length === 0) return
+    for (const { command } of rejections) {
+      if (!this.#commands.includes(command)) {
+        throw new Error("Extension host cannot reject an unknown command registration")
+      }
+    }
+    const rejected = new Set(rejections.map(rejection => rejection.command))
+    this.#setCatalog(Object.freeze(this.#commands.filter(command => !rejected.has(command))), this.#tools)
+    for (const { command, message } of rejections) {
+      this.#diagnose(
+        boundedExtensionDiagnostic({
+          extensionId: command.source.id,
+          path: command.source.entryPath,
+          phase: "registration",
+          severity: "error",
+          message
+        })
+      )
+    }
+  }
+
   rejectTool(tool: ExtensionToolRegistration, message: string): void {
     if (!this.#tools.includes(tool)) throw new Error("Extension host cannot reject an unknown tool registration")
-    this.#setToolCatalog(Object.freeze(this.#tools.filter(candidate => candidate !== tool)))
+    this.#setCatalog(this.#commands, Object.freeze(this.#tools.filter(candidate => candidate !== tool)))
     this.#diagnose(
       boundedExtensionDiagnostic({
         extensionId: tool.source.id,
@@ -1177,7 +1411,7 @@ export class ExtensionHost {
         this.#state = { type: "disabled", lifecycle: state.lifecycle }
         this.#extensions = Object.freeze([])
         this.#subagents = Object.freeze([])
-        this.#setToolCatalog(Object.freeze([]))
+        this.#setCatalog(Object.freeze([]), Object.freeze([]))
         return this.#finishReloadAttempt("disabled")
       }
       await this.#startPlan(plan, state.lifecycle, reason)
@@ -1196,7 +1430,7 @@ export class ExtensionHost {
       if (this.#state !== replacing) return this.#finishReloadAttempt("superseded")
       this.#extensions = Object.freeze([])
       this.#subagents = Object.freeze([])
-      this.#setToolCatalog(Object.freeze([]))
+      this.#setCatalog(Object.freeze([]), Object.freeze([]))
       this.#state = { type: "disabled", lifecycle: state.lifecycle }
       return this.#finishReloadAttempt("disabled")
     }
@@ -1231,7 +1465,7 @@ export class ExtensionHost {
         const cleanup = state.current.dispose()
         this.#extensions = Object.freeze([])
         this.#subagents = Object.freeze([])
-        this.#setToolCatalog(Object.freeze([]))
+        this.#setCatalog(Object.freeze([]), Object.freeze([]))
         this.#state = { type: "failed", lifecycle: state.lifecycle, diagnostic: currentFailure, cleanup }
         await cleanup
         return this.#finishReloadAttempt("failed")
@@ -1252,7 +1486,7 @@ export class ExtensionHost {
 
     this.#extensions = ready.extensions
     this.#subagents = ready.subagents
-    this.#setToolCatalog(ready.tools)
+    this.#setCatalog(ready.commands, ready.tools)
     if (state.lifecycle === "started") {
       const dispatching: ExtensionHostState = {
         type: "dispatching",
@@ -1322,7 +1556,7 @@ export class ExtensionHost {
       this.#state = { type: "disabled", lifecycle }
       this.#extensions = Object.freeze([])
       this.#subagents = Object.freeze([])
-      this.#setToolCatalog(Object.freeze([]))
+      this.#setCatalog(Object.freeze([]), Object.freeze([]))
       return
     }
     const id = this.#takeGenerationId()
@@ -1351,7 +1585,7 @@ export class ExtensionHost {
         const failure = failureDiagnostic(cause)
         this.#extensions = Object.freeze([])
         this.#subagents = Object.freeze([])
-        this.#setToolCatalog(Object.freeze([]))
+        this.#setCatalog(Object.freeze([]), Object.freeze([]))
         this.#state = { type: "failed", lifecycle, diagnostic: failure, cleanup }
       }
       await cleanup
@@ -1371,7 +1605,7 @@ export class ExtensionHost {
     this.#admitLoadResults(ready.extensions)
     this.#extensions = ready.extensions
     this.#subagents = ready.subagents
-    this.#setToolCatalog(ready.tools)
+    this.#setCatalog(ready.commands, ready.tools)
 
     if (lifecycle === "started") {
       const dispatching: ExtensionHostState = {
@@ -1539,7 +1773,7 @@ export class ExtensionHost {
       if (!(cause instanceof ExtensionGenerationError)) this.#diagnose(failure)
       this.#extensions = Object.freeze([])
       this.#subagents = Object.freeze([])
-      this.#setToolCatalog(Object.freeze([]))
+      this.#setCatalog(Object.freeze([]), Object.freeze([]))
       this.#state = { type: "failed", lifecycle, diagnostic: failure, cleanup }
     }
     await cleanup
@@ -1556,7 +1790,7 @@ export class ExtensionHost {
       })
       this.#extensions = Object.freeze([])
       this.#subagents = Object.freeze([])
-      this.#setToolCatalog(Object.freeze([]))
+      this.#setCatalog(Object.freeze([]), Object.freeze([]))
       this.#state = { type: "failed", lifecycle: state.lifecycle, diagnostic: value, cleanup }
     }
   }
@@ -1579,7 +1813,7 @@ export class ExtensionHost {
       if (this.#state === state) {
         this.#extensions = Object.freeze([])
         this.#subagents = Object.freeze([])
-        this.#setToolCatalog(Object.freeze([]))
+        this.#setCatalog(Object.freeze([]), Object.freeze([]))
         this.#state = { type: "disposed" }
       }
       this.#catalogListener = undefined
@@ -1593,13 +1827,14 @@ export class ExtensionHost {
     }
   }
 
-  #setToolCatalog(tools: readonly ExtensionToolRegistration[]): void {
-    if (this.#tools === tools) return
+  #setCatalog(commands: readonly ExtensionCommandRegistration[], tools: readonly ExtensionToolRegistration[]): void {
+    if (this.#commands === commands && this.#tools === tools) return
+    this.#commands = commands
     this.#tools = tools
     try {
-      this.#catalogListener?.(tools)
+      this.#catalogListener?.(Object.freeze({ commands, tools }))
     } catch (cause) {
-      this.#diagnose(diagnostic("protocol", errorMessage(cause, "Extension tool catalog binding failed"), cause))
+      this.#diagnose(diagnostic("protocol", errorMessage(cause, "Extension catalog binding failed"), cause))
     }
   }
 
@@ -2057,6 +2292,15 @@ function matchesLoadPlan(plan: ExtensionLoadPlan, results: readonly ExtensionLoa
   })
 }
 
+function commandsMatchLoadedExtensions(
+  commands: readonly ExtensionCommandRegistration[],
+  extensions: readonly ExtensionLoadResult[]
+): boolean {
+  return commands.every(command =>
+    extensions.some(result => result.status === "loaded" && sameExtensionSource(result.source, command.source))
+  )
+}
+
 function toolsMatchLoadedExtensions(
   tools: readonly ExtensionToolRegistration[],
   extensions: readonly ExtensionLoadResult[]
@@ -2119,7 +2363,7 @@ function errorMessage(cause: unknown, fallback: string): string {
 }
 
 function abortError(): Error {
-  const error = new Error("Extension tool invocation was cancelled")
+  const error = new Error("Extension invocation was cancelled")
   error.name = "AbortError"
   return error
 }

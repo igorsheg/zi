@@ -32,12 +32,70 @@ test("SlashController aggregates a session catalog with deterministic built-in p
   expect(slash.suggestions("/rev", 4)).toEqual([])
 })
 
+test("SlashController gives extension commands precedence over resources and returns typed intents", () => {
+  const slash = new SlashController(() => ({
+    extensionCommandRevision: 1,
+    listExtensionCommands: () => [
+      { name: "counter", description: "Manage counter", argumentHint: "[show|increment]", extensionId: "counter" },
+      { name: "model", description: "Cannot shadow built-in", extensionId: "shadow" }
+    ],
+    listResourceCommands: () => [
+      { name: "counter", description: "Resource collision" },
+      { name: "review", description: "Review code" }
+    ]
+  }))
+
+  expect(slash.suggestions("/", 1).map(command => command.name)).toEqual([
+    "model",
+    "login",
+    "logout",
+    "settings",
+    "codex-settings",
+    "compact",
+    "reload",
+    "new",
+    "resume",
+    "counter",
+    "review"
+  ])
+  expect(slash.activate("/cou increment", 4, "counter")).toEqual({
+    type: "intent",
+    command: { type: "extension_command", name: "counter", arguments: "increment" }
+  })
+  expect(slash.parse("/counter increment")).toEqual({
+    type: "extension_command",
+    name: "counter",
+    arguments: "increment"
+  })
+})
+
+test("SlashController invalidates extension commands when their session-owned revision changes", () => {
+  let revision = 0
+  let commands = [{ name: "counter", description: "Counter", extensionId: "counter" }]
+  const slash = new SlashController(
+    () => ({
+      extensionCommandRevision: revision,
+      listExtensionCommands: () => commands,
+      listResourceCommands: () => []
+    }),
+    () => 1
+  )
+
+  expect(slash.suggestions("/cou", 4)[0]?.name).toBe("counter")
+  commands = [{ name: "deploy", description: "Deploy", extensionId: "deploy" }]
+  revision++
+  expect(slash.suggestions("/dep", 4)[0]?.name).toBe("deploy")
+  expect(slash.parse("/counter")).toBeUndefined()
+})
+
 test("SlashController caches one bounded catalog until the session generation changes", () => {
   let generation = 0
   let reads = 0
   let resources: readonly SlashCommand[] = [{ name: "review", description: "Review code" }]
   const slash = new SlashController(
     () => ({
+      extensionCommandRevision: 0,
+      listExtensionCommands: () => [],
       listResourceCommands() {
         reads++
         return resources
@@ -132,6 +190,8 @@ test("SlashController invalidates a cached catalog without a session generation 
   let resources: readonly SlashCommand[] = [{ name: "review", description: "Review code" }]
   const slash = new SlashController(
     () => ({
+      extensionCommandRevision: 0,
+      listExtensionCommands: () => [],
       listResourceCommands() {
         reads++
         return resources
@@ -150,5 +210,5 @@ test("SlashController invalidates a cached catalog without a session generation 
 })
 
 function commandSession(commands: readonly SlashCommand[]) {
-  return { listResourceCommands: () => commands }
+  return { extensionCommandRevision: 0, listExtensionCommands: () => [], listResourceCommands: () => commands }
 }

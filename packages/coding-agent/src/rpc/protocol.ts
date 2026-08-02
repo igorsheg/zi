@@ -8,6 +8,8 @@ export const maxRpcInputTextBytes = 8 * 1024 * 1024
 export const maxRpcRequestIdBytes = 256
 export const maxRpcMessagePageCount = 100
 export const maxRpcMessagePageBytes = 8 * 1024 * 1024
+export const maxRpcCommandNameBytes = 64
+export const maxRpcCommandArgumentsBytes = 256 * 1024
 
 export type RpcInputDelivery = "direct" | "steer" | "follow_up" | "continue"
 export type RpcEventMode = "all" | "none"
@@ -33,6 +35,13 @@ export type RpcRequest =
       readonly id: string
       readonly method: "connection.set_events"
       readonly params: { readonly mode: RpcEventMode }
+    }
+  | { readonly version: 1; readonly id: string; readonly method: "command.list" }
+  | {
+      readonly version: 1
+      readonly id: string
+      readonly method: "command.invoke"
+      readonly params: { readonly name: string; readonly arguments: string }
     }
   | { readonly version: 1; readonly id: string; readonly method: "model.list" }
   | {
@@ -156,6 +165,7 @@ export function decodeRpcRequest(value: unknown): RpcRequest {
     case "session.get_state":
     case "session.interrupt":
     case "session.await_idle":
+    case "command.list":
     case "model.list":
     case "thinking.list":
       requireKeys(value, ["version", "id", "method"], requestId)
@@ -197,6 +207,22 @@ export function decodeRpcRequest(value: unknown): RpcRequest {
       }
       const text = boundedString(params.text, "Prompt text", maxRpcInputTextBytes, requestId)
       return { version: 1, id: requestId, method: "session.prompt", params: { delivery: params.delivery, text } }
+    }
+    case "command.invoke": {
+      requireKeys(value, ["version", "id", "method", "params"], requestId)
+      const params = requireRecord(value.params, "command.invoke params", requestId)
+      requireKeys(params, ["name", "arguments"], requestId)
+      const name = boundedString(params.name, "Command name", maxRpcCommandNameBytes, requestId, true)
+      if (!/^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/.test(name)) {
+        throw new RpcRequestError("invalid_request", "Command name must use lowercase kebab-case", requestId)
+      }
+      const commandArguments = boundedString(
+        params.arguments,
+        "Command arguments",
+        maxRpcCommandArgumentsBytes,
+        requestId
+      )
+      return { version: 1, id: requestId, method: "command.invoke", params: { name, arguments: commandArguments } }
     }
     case "connection.set_events": {
       requireKeys(value, ["version", "id", "method", "params"], requestId)

@@ -80,6 +80,7 @@ export default function (zi: ExtensionAPI): void {
     const stdout = readNodeStream(child.stdout)
     const stderr = readNodeStream(child.stderr)
     const protocolMessages: WorkerMessage[] = []
+    let compiledCommandResult: string | undefined
     let compiledToolResult: unknown
     let compiledCounterResult: unknown
     let compiledCustomMessage: string | undefined
@@ -94,11 +95,14 @@ export default function (zi: ExtensionAPI): void {
         }
         if (message.type === "ready") {
           if (
+            !message.commands.some(command => command.name === "counter") ||
             !message.tools.some(tool => tool.name === "repository_status") ||
             !message.tools.some(tool => tool.name === "increment_counter")
           ) {
             rejectProtocol(
-              new Error(`Compiled worker omitted a canonical extension tool: ${JSON.stringify(message.extensions)}`)
+              new Error(
+                `Compiled worker omitted a canonical extension contribution: ${JSON.stringify(message.extensions)}`
+              )
             )
             return
           }
@@ -121,9 +125,22 @@ export default function (zi: ExtensionAPI): void {
         if (message.type === "settled" && message.requestId === 1) {
           child!.stdin!.write(
             encodeExtensionProtocolFrame({
-              type: "tool_invoke",
+              type: "command_invoke",
               generation: 1,
               requestId: 2,
+              name: "counter",
+              arguments: "show"
+            })
+          )
+          return
+        }
+        if (message.type === "command_result" && message.requestId === 2) {
+          compiledCommandResult = message.message
+          child!.stdin!.write(
+            encodeExtensionProtocolFrame({
+              type: "tool_invoke",
+              generation: 1,
+              requestId: 3,
               name: "increment_counter",
               arguments: {}
             })
@@ -153,31 +170,31 @@ export default function (zi: ExtensionAPI): void {
           )
           return
         }
-        if (message.type === "tool_result" && message.requestId === 2) {
+        if (message.type === "tool_result" && message.requestId === 3) {
           compiledCounterResult = message.value
           child!.stdin!.write(
             encodeExtensionProtocolFrame({
               type: "tool_invoke",
               generation: 1,
-              requestId: 3,
+              requestId: 4,
               name: "repository_status",
               arguments: {}
             })
           )
           return
         }
-        if (message.type === "tool_result" && message.requestId === 3) {
+        if (message.type === "tool_result" && message.requestId === 4) {
           compiledToolResult = message.value
           child!.stdin!.write(
-            encodeExtensionProtocolFrame({ type: "session_shutdown", generation: 1, requestId: 4, reason: "quit" })
+            encodeExtensionProtocolFrame({ type: "session_shutdown", generation: 1, requestId: 5, reason: "quit" })
           )
           return
         }
-        if (message.type === "settled" && message.requestId === 4) {
-          child!.stdin!.write(encodeExtensionProtocolFrame({ type: "stop", generation: 1, requestId: 5 }))
+        if (message.type === "settled" && message.requestId === 5) {
+          child!.stdin!.write(encodeExtensionProtocolFrame({ type: "stop", generation: 1, requestId: 6 }))
           return
         }
-        if (message.type === "settled" && message.requestId === 5) {
+        if (message.type === "settled" && message.requestId === 6) {
           completed = true
           resolveProtocol()
         }
@@ -237,6 +254,7 @@ export default function (zi: ExtensionAPI): void {
       "ready",
       "custom_entries_get",
       "settled",
+      "command_result",
       "custom_entry_append",
       "custom_message_send",
       "tool_result",
@@ -244,6 +262,7 @@ export default function (zi: ExtensionAPI): void {
       "settled",
       "settled"
     ])
+    expect(compiledCommandResult).toBe("Counter: 0")
     expect(compiledCounterResult).toBe("1")
     expect(compiledCustomMessage).toBe("Counter: 1")
     expect(JSON.stringify(compiledToolResult)).toContain("zi")

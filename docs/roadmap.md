@@ -118,12 +118,18 @@ Each capability receives its own closed protocol messages, owner, bounds, exampl
 
 ### Shipped — commands and durable extension state
 
+Decision: [ADR 0030](adr/0030-extension-commands-are-session-owned-user-actions.md) and [ADR 0023](adr/0023-session-journal-separates-custom-state-and-custom-messages.md).
+
 - [x] Research Pi's custom state/message split and record provenance.
 - [x] Accept the journal and projection ownership decision in ADR 0023.
 - [x] Add the bounded journal kinds, canonical context projector, custom-state index, and image transaction.
 - [x] Add closed `AgentSession` custom-entry and delivery admissions.
 - [x] Render displayed custom messages through authoritative client projections.
 - [x] Add concrete correlated extension session operations and a compiled durable-counter example.
+- [x] Characterize Pi, Grok Build, and Codex command mechanics and preserve host-parsed one-owner routing.
+- [x] Add factory-time `registerCommand(...)`, bounded raw arguments, cancellation, local model-invisible feedback, reserved built-in names, and idle-only `AgentSession` admission.
+- [x] Add command catalogs and correlated invocation across extension protocol v6, interactive typed intents, direct RPC list/invoke, reload replacement, and stale-completion containment.
+- [x] Extend the durable-counter example with `/counter show|increment|reset` and compiled worker/session behavior acceptance.
 
 ### Shipped — extension reload UX
 

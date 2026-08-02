@@ -91,6 +91,48 @@ test("RPC mode sequences authoritative events, concurrent interruption, and page
   }
 })
 
+test("RPC lists and invokes extension commands without slash parsing", async () => {
+  const runtime = await createTestAgentRuntime({
+    cwd: "/work",
+    models: createModels(),
+    session: { type: "new", persist: false }
+  })
+  const input = new RpcTestInput()
+  const output = new RpcTestOutput()
+  let invocation: { name: string; arguments: string } | undefined
+  runtime.session.listExtensionCommands = () => [
+    { name: "counter", description: "Manage counter", argumentHint: "[show|increment]", extensionId: "counter" }
+  ]
+  runtime.session.invokeExtensionCommand = async (name, arguments_) => {
+    invocation = { name, arguments: arguments_ }
+    return "Counter: 1"
+  }
+  const running = runRpcMode(runtime.session, { input, writer: output })
+
+  try {
+    await output.frame(frame => frame.type === "ready")
+    input.send(
+      { version: 1, id: "list", method: "command.list" },
+      { version: 1, id: "invoke", method: "command.invoke", params: { name: "counter", arguments: "increment" } },
+      { version: 1, id: "missing", method: "command.invoke", params: { name: "missing", arguments: "" } }
+    )
+    expect(await output.response("list")).toMatchObject({
+      ok: true,
+      result: { commands: [{ name: "counter", extensionId: "counter" }] }
+    })
+    expect(await output.response("invoke")).toMatchObject({ ok: true, result: { message: "Counter: 1" } })
+    expect(invocation).toEqual({ name: "counter", arguments: "increment" })
+    expect(await output.response("missing")).toMatchObject({ ok: false, error: { code: "not_found" } })
+
+    input.close()
+    expect(await running).toEqual({ type: "eof" })
+  } finally {
+    input.close()
+    runtime.session.dispose()
+    await runtime.session.waitForIdle()
+  }
+})
+
 test("RPC exposes committed custom entries while message pages retain presentation policy", async () => {
   const models = createModels()
   const runtime = await createTestAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })

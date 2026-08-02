@@ -66,6 +66,75 @@ export default function (zi: ExtensionAPI): void {
   )
 })
 
+test("worker registration exposes commands with raw arguments and local feedback", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-extension-worker-commands-"))
+  const log = join(root, "command.log")
+  const extension = await writeExtension(
+    root,
+    "commands.ts",
+    `import { appendFileSync } from "node:fs"
+export default function (zi): void {
+  zi.registerCommand({
+    name: "counter",
+    description: "Manage the counter",
+    argumentHint: "[show|increment]",
+    execute: (arguments_, { signal }) => {
+      appendFileSync(${JSON.stringify(log)}, arguments_ + ":" + signal.aborted + "\\n")
+      return arguments_ === "increment" ? "Counter: 1" : undefined
+    }
+  })
+}
+`
+  )
+
+  const generation = await loadExtensionGeneration(extensionPlan(root, [extension]), 1)
+  expect(generation.results.map(result => result.status)).toEqual(["loaded"])
+  expect(generation.commands).toMatchObject([
+    {
+      source: { id: extension.id },
+      name: "counter",
+      description: "Manage the counter",
+      argumentHint: "[show|increment]"
+    }
+  ])
+  await generation.dispatch({ type: "session_start", reason: "startup" })
+
+  expect(await generation.invokeCommand("counter", "increment", new AbortController().signal)).toBe("Counter: 1")
+  expect(await generation.invokeCommand("counter", "show", new AbortController().signal)).toBeUndefined()
+  expect(generation.invokeCommand("missing", "", new AbortController().signal)).rejects.toThrow(
+    "Unknown extension command"
+  )
+  expect(await readFile(log, "utf8")).toBe("increment:false\nshow:false\n")
+})
+
+test("duplicate command registrations fail only their source", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-extension-worker-command-registration-"))
+  const first = await writeExtension(
+    root,
+    "first.ts",
+    `export default zi => zi.registerCommand({ name: "shared", description: "First", execute: () => "first" })\n`
+  )
+  const duplicate = await writeExtension(
+    root,
+    "duplicate.ts",
+    `export default zi => zi.registerCommand({ name: "shared", description: "Second", execute: () => "second" })\n`
+  )
+  const valid = await writeExtension(
+    root,
+    "valid.ts",
+    `export default zi => zi.registerCommand({ name: "valid-command", description: "Valid", execute: () => {} })\n`
+  )
+
+  const generation = await loadExtensionGeneration(extensionPlan(root, [first, duplicate, valid]), 1)
+  expect(generation.results.map(result => [result.status, result.diagnostic?.phase])).toEqual([
+    ["loaded", undefined],
+    ["failed", "registration"],
+    ["loaded", undefined]
+  ])
+  expect(generation.results[1]?.diagnostic?.message).toContain("Duplicate extension command name")
+  expect(generation.commands.map(command => command.name)).toEqual(["shared", "valid-command"])
+})
+
 test("worker registration exposes typed tools and validates arguments before execution", async () => {
   const root = await mkdtemp(join(tmpdir(), "zi-extension-worker-tools-"))
   const log = join(root, "tool.log")

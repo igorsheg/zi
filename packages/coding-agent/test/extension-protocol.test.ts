@@ -9,6 +9,11 @@ import {
   ExtensionProtocolDecoder,
   ExtensionProtocolWriter,
   extensionProtocolVersion,
+  maxExtensionCommandArgumentsBytes,
+  maxExtensionCommandCatalogBytes,
+  maxExtensionCommandDescriptionBytes,
+  maxExtensionCommandResultBytes,
+  maxExtensionCommands,
   maxExtensionDiagnosticMessageBytes,
   maxExtensionIdBytes,
   maxExtensionProtocolFrameBytes,
@@ -139,6 +144,7 @@ test("worker protocol validation keeps source-attributed load and lifecycle resu
         { source, status: "loaded" },
         { source: { ...source, id: "failed" }, status: "failed", diagnostic }
       ],
+      commands: [],
       tools: []
     })
   ).toMatchObject({ type: "ready", extensions: [{ status: "loaded" }, { status: "failed", diagnostic }] })
@@ -148,6 +154,7 @@ test("worker protocol validation keeps source-attributed load and lifecycle resu
       protocolVersion: extensionProtocolVersion,
       generation: 1,
       extensions: [{ source, status: "failed" }],
+      commands: [],
       tools: []
     })
   ).toThrow("require a diagnostic")
@@ -159,6 +166,116 @@ test("worker protocol validation keeps source-attributed load and lifecycle resu
     })
   ).toThrow(`${maxExtensionDiagnosticMessageBytes} bytes`)
   expect(() => validateWorkerMessage({ type: "settled", generation: 1, requestId: -1 })).toThrow("requestId")
+})
+
+test("command protocol validates catalogs, raw arguments, feedback, and correlation", () => {
+  const registration = {
+    source,
+    name: "counter",
+    description: "Manage the durable counter",
+    argumentHint: "[show|increment|reset]"
+  }
+  const ready = validateWorkerMessage({
+    type: "ready",
+    protocolVersion: extensionProtocolVersion,
+    generation: 1,
+    extensions: [{ source, status: "loaded" }],
+    commands: [registration],
+    tools: []
+  })
+  expect(ready).toMatchObject({ type: "ready", commands: [{ name: "counter" }] })
+
+  expect(
+    validateHostMessage({
+      type: "command_invoke",
+      generation: 1,
+      requestId: 2,
+      name: "counter",
+      arguments: "increment now"
+    })
+  ).toEqual({ type: "command_invoke", generation: 1, requestId: 2, name: "counter", arguments: "increment now" })
+  expect(() =>
+    validateHostMessage({
+      type: "command_invoke",
+      generation: 1,
+      requestId: 2,
+      name: "counter",
+      arguments: "x".repeat(maxExtensionCommandArgumentsBytes + 1)
+    })
+  ).toThrow(`${maxExtensionCommandArgumentsBytes} bytes`)
+  expect(validateWorkerMessage({ type: "command_result", generation: 1, requestId: 2, message: "Counter: 1" })).toEqual(
+    { type: "command_result", generation: 1, requestId: 2, message: "Counter: 1" }
+  )
+  expect(validateWorkerMessage({ type: "command_result", generation: 1, requestId: 3 })).toEqual({
+    type: "command_result",
+    generation: 1,
+    requestId: 3
+  })
+  expect(() =>
+    validateWorkerMessage({
+      type: "command_result",
+      generation: 1,
+      requestId: 2,
+      message: "x".repeat(maxExtensionCommandResultBytes + 1)
+    })
+  ).toThrow(`${maxExtensionCommandResultBytes} bytes`)
+  expect(() =>
+    validateWorkerMessage({
+      type: "ready",
+      protocolVersion: extensionProtocolVersion,
+      generation: 1,
+      extensions: [{ source, status: "loaded" }],
+      commands: [registration, registration],
+      tools: []
+    })
+  ).toThrow("unique")
+  expect(() =>
+    validateWorkerMessage({
+      type: "ready",
+      protocolVersion: extensionProtocolVersion,
+      generation: 1,
+      extensions: [{ source, status: "loaded" }],
+      commands: [{ ...registration, name: "Invalid_Command" }],
+      tools: []
+    })
+  ).toThrow("command names")
+  expect(() =>
+    validateWorkerMessage({
+      type: "ready",
+      protocolVersion: extensionProtocolVersion,
+      generation: 1,
+      extensions: [{ source, status: "loaded" }],
+      commands: [{ ...registration, description: "x".repeat(maxExtensionCommandDescriptionBytes + 1) }],
+      tools: []
+    })
+  ).toThrow(`${maxExtensionCommandDescriptionBytes} bytes`)
+  expect(() =>
+    validateWorkerMessage({
+      type: "ready",
+      protocolVersion: extensionProtocolVersion,
+      generation: 1,
+      extensions: [{ source, status: "loaded" }],
+      commands: Array.from({ length: maxExtensionCommands + 1 }, (_, index) => ({
+        ...registration,
+        name: `command-${index}`
+      })),
+      tools: []
+    })
+  ).toThrow(`cannot exceed ${maxExtensionCommands}`)
+  expect(() =>
+    validateWorkerMessage({
+      type: "ready",
+      protocolVersion: extensionProtocolVersion,
+      generation: 1,
+      extensions: [{ source, status: "loaded" }],
+      commands: Array.from({ length: maxExtensionCommands }, (_, index) => ({
+        ...registration,
+        name: `command-${index}`,
+        description: "x".repeat(maxExtensionCommandDescriptionBytes)
+      })),
+      tools: []
+    })
+  ).toThrow(`catalog cannot exceed ${maxExtensionCommandCatalogBytes} bytes`)
 })
 
 test("tool protocol validation closes registration, arguments, results, and correlation", () => {
@@ -175,6 +292,7 @@ test("tool protocol validation closes registration, arguments, results, and corr
     protocolVersion: extensionProtocolVersion,
     generation: 1,
     extensions: [{ source, status: "loaded" }],
+    commands: [],
     tools: [registration]
   })
   expect(ready).toMatchObject({ type: "ready", tools: [{ name: "echo_message" }] })
@@ -203,6 +321,7 @@ test("tool protocol validation closes registration, arguments, results, and corr
       protocolVersion: extensionProtocolVersion,
       generation: 1,
       extensions: [{ source, status: "loaded" }],
+      commands: [],
       tools: [{ ...registration, name: "Invalid-name" }]
     })
   ).toThrow("tool names")
@@ -212,6 +331,7 @@ test("tool protocol validation closes registration, arguments, results, and corr
       protocolVersion: extensionProtocolVersion,
       generation: 1,
       extensions: [{ source, status: "loaded" }],
+      commands: [],
       tools: [{ ...registration, outputSchema: undefined }]
     })
   ).toThrow("output schema")
@@ -221,6 +341,7 @@ test("tool protocol validation closes registration, arguments, results, and corr
       protocolVersion: extensionProtocolVersion,
       generation: 1,
       extensions: [{ source, status: "loaded" }],
+      commands: [],
       tools: [{ ...registration, parameters: { type: "object", properties: { value: { type: "future" } } } }]
     })
   ).toThrow("unsupported type")
@@ -230,6 +351,7 @@ test("tool protocol validation closes registration, arguments, results, and corr
       protocolVersion: extensionProtocolVersion,
       generation: 1,
       extensions: [{ source, status: "loaded" }],
+      commands: [],
       tools: [registration, registration]
     })
   ).toThrow("unique")
@@ -317,6 +439,7 @@ test("subagent protocol bounds profiles, operations, snapshots, and cancellation
     protocolVersion: extensionProtocolVersion,
     generation: 1,
     extensions: [{ source, status: "loaded" }],
+    commands: [],
     tools: [],
     subagents: [profile]
   })
@@ -328,6 +451,7 @@ test("subagent protocol bounds profiles, operations, snapshots, and cancellation
       protocolVersion: extensionProtocolVersion,
       generation: 1,
       extensions: [{ source, status: "loaded" }],
+      commands: [],
       tools: [],
       subagents: [profile, profile]
     })
@@ -338,6 +462,7 @@ test("subagent protocol bounds profiles, operations, snapshots, and cancellation
       protocolVersion: extensionProtocolVersion,
       generation: 1,
       extensions: [{ source, status: "loaded" }],
+      commands: [],
       tools: [],
       subagents: [{ ...profile, instructions: "x".repeat(maxExtensionSubagentInstructionsBytes + 1) }]
     })
@@ -348,6 +473,7 @@ test("subagent protocol bounds profiles, operations, snapshots, and cancellation
       protocolVersion: extensionProtocolVersion,
       generation: 1,
       extensions: [{ source, status: "loaded" }],
+      commands: [],
       tools: [],
       subagents: [{ ...profile, description: " \n ", instructions: " \t " }]
     })
@@ -358,6 +484,7 @@ test("subagent protocol bounds profiles, operations, snapshots, and cancellation
       protocolVersion: extensionProtocolVersion,
       generation: 1,
       extensions: [{ source, status: "loaded" }],
+      commands: [],
       tools: [],
       subagents: [{ ...profile, model: "   " }]
     })
@@ -368,6 +495,7 @@ test("subagent protocol bounds profiles, operations, snapshots, and cancellation
       protocolVersion: extensionProtocolVersion,
       generation: 1,
       extensions: [{ source, status: "loaded" }],
+      commands: [],
       tools: [],
       subagents: [
         {
@@ -428,6 +556,7 @@ test("maximum admitted load results fit in one protocol frame", () => {
     protocolVersion: extensionProtocolVersion,
     generation: 1,
     extensions: Array.from({ length: maxExtensionSources }, () => result),
+    commands: [],
     tools: []
   })
 
@@ -451,6 +580,7 @@ test("tool catalogs have one aggregate ready-frame budget", () => {
       protocolVersion: extensionProtocolVersion,
       generation: 1,
       extensions: [{ source: toolSource, status: "loaded" }],
+      commands: [],
       tools
     })
   ).toThrow(`catalog cannot exceed ${maxExtensionToolCatalogBytes} bytes`)
@@ -491,6 +621,7 @@ test("ready-frame validation bounds combined source, tool, and subagent catalogs
       protocolVersion: extensionProtocolVersion,
       generation: 1,
       extensions: [...Array.from({ length: maxExtensionSources - 1 }, () => failed), { source, status: "loaded" }],
+      commands: [],
       tools,
       subagents
     })
@@ -501,6 +632,7 @@ test("ready-frame validation bounds combined source, tool, and subagent catalogs
     protocolVersion: extensionProtocolVersion,
     generation: 1,
     extensions: [{ source, status: "loaded" }],
+    commands: [],
     tools: [],
     subagents
   })

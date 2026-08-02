@@ -123,6 +123,98 @@ export default function (): void { writeFileSync(${JSON.stringify(loaded)}, "loa
   }
 }, 10_000)
 
+test("extension commands are idle session actions with durable state and model-invisible feedback", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-runtime-extension-command-"))
+  const cwd = join(root, "project")
+  const agentDir = join(root, "agent")
+  const extensionDir = join(agentDir, "extensions")
+  await mkdir(cwd, { recursive: true })
+  await mkdir(extensionDir, { recursive: true })
+  await writeFile(
+    join(extensionDir, "counter.ts"),
+    `import type { ExtensionAPI } from "@with-zi/extension-api"
+export default function (zi: ExtensionAPI): void {
+  let count = 0
+  zi.on("session_start", async () => {
+    const latest = (await zi.getSessionEntries("example.counter")).at(-1)?.data
+    if (typeof latest === "object" && latest !== null && !Array.isArray(latest) && typeof latest.count === "number") {
+      count = latest.count
+    }
+  })
+  zi.registerCommand({
+    name: "counter",
+    description: "Manage the durable counter",
+    argumentHint: "[show|increment|wait]",
+    async execute(arguments_, { signal }) {
+      if (arguments_ === "wait") {
+        if (!signal.aborted) await new Promise(resolve => signal.addEventListener("abort", resolve, { once: true }))
+        return "late"
+      }
+      if (arguments_ === "increment") {
+        count++
+        await zi.appendEntry("example.counter", { count })
+      }
+      return "Counter: " + count
+    }
+  })
+  zi.registerCommand({ name: "reload", description: "Must not shadow the built-in", execute: () => "shadow" })
+  zi.registerCommand({ name: "new", description: "Must also not shadow the built-in", execute: () => "shadow" })
+}
+`
+  )
+  const runtime = await createAgentRuntime({
+    cwd,
+    agentDir,
+    session: { type: "new", persist: true },
+    extensionWorkerCommand: workerCommand
+  })
+
+  try {
+    expect(runtime.session.listExtensionCommands()).toEqual([
+      {
+        name: "counter",
+        description: "Manage the durable counter",
+        argumentHint: "[show|increment|wait]",
+        extensionId: expect.any(String)
+      }
+    ])
+    expect(
+      runtime.session.extensionHostSnapshot?.diagnostics.filter(
+        diagnostic => diagnostic.phase === "registration" && diagnostic.message.includes("built-in command")
+      )
+    ).toHaveLength(2)
+    expect(await runtime.session.invokeExtensionCommand("counter", "increment")).toBe("Counter: 1")
+    expect(runtime.session.messages).toEqual([])
+    expect(runtime.session.getCustomEntries("example.counter")).toMatchObject([{ data: { count: 1 } }])
+
+    const pending = runtime.session.invokeExtensionCommand("counter", "wait")
+    const observed = pending.then(
+      value => ({ type: "resolved" as const, value }),
+      cause => ({ type: "rejected" as const, cause })
+    )
+    expect(runtime.session.extensionCommandStatus).toEqual({ type: "running", name: "counter", phase: "executing" })
+    expect(() => runtime.session.invokeExtensionCommand("counter", "show")).toThrow("agent is running")
+    await runtime.session.abort()
+    expect(await observed).toEqual({ type: "rejected", cause: expect.objectContaining({ name: "AbortError" }) })
+    expect(runtime.session.extensionCommandStatus).toEqual({ type: "idle" })
+
+    expect((await runtime.session.reload()).extensions?.outcome).toBe("replaced")
+    const reloadDiagnostics = runtime.session.extensionHostSnapshot?.diagnostics ?? []
+    expect(
+      reloadDiagnostics.filter(
+        diagnostic => diagnostic.phase === "registration" && diagnostic.message.includes("built-in command")
+      )
+    ).toHaveLength(4)
+    expect(reloadDiagnostics.some(diagnostic => diagnostic.phase === "protocol")).toBe(false)
+    expect(await runtime.session.invokeExtensionCommand("counter", "show")).toBe("Counter: 1")
+    expect(runtime.session.messages).toEqual([])
+  } finally {
+    runtime.session.dispose()
+    await runtime.session.waitForIdle()
+    await rm(root, { recursive: true, force: true })
+  }
+}, 10_000)
+
 test("a registered extension tool joins a real agent turn and durable history", async () => {
   const root = await mkdtemp(join(tmpdir(), "zi-runtime-extension-tool-"))
   const cwd = join(root, "project")

@@ -11,6 +11,27 @@ export default function durableCounter(zi: ExtensionAPI): void {
     }
   })
 
+  zi.registerCommand({
+    name: "counter",
+    description: "Show, increment, or reset the durable session counter",
+    argumentHint: "[show|increment|reset]",
+    async execute(arguments_) {
+      const action = arguments_.trim() || "show"
+      if (action === "show") return `Counter: ${count}`
+      if (action === "increment") {
+        count++
+        await zi.appendEntry("example.counter", { count })
+        return `Counter: ${count}`
+      }
+      if (action === "reset") {
+        count = 0
+        await zi.appendEntry("example.counter", { count })
+        return "Counter: 0"
+      }
+      throw new Error("Usage: /counter [show|increment|reset]")
+    }
+  })
+
   zi.registerTool({
     name: "increment_counter",
     description: "Increment a counter persisted in the current Zi session",

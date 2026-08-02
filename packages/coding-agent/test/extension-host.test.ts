@@ -25,6 +25,8 @@ const testTimeouts: ExtensionHostTimeouts = Object.freeze({
   startupMs: 100,
   lifecycleMs: 100,
   shutdownMs: 90,
+  commandMs: 100,
+  commandCancellationMs: 20,
   toolMs: 100,
   toolCancellationMs: 20
 })
@@ -89,6 +91,8 @@ test("startup and teardown deadlines terminate unresponsive workers", async () =
     startupMs: 10,
     lifecycleMs: 10,
     shutdownMs: 9,
+    commandMs: 10,
+    commandCancellationMs: 5,
     toolMs: 10,
     toolCancellationMs: 5
   }
@@ -154,6 +158,25 @@ test("failed lifecycle requests preserve the session's desired lifecycle", async
 
   await host.sessionStart("startup")
   expect(host.snapshot()).toMatchObject({ status: "failed", lifecycle: "started" })
+  await host.dispose()
+})
+
+test("host command invocation is correlated, cancellable, and generation-reusable", async () => {
+  const workers = new TestWorkerSpawner()
+  workers.behaviors.push({ type: "commands" })
+  const host = await ExtensionHost.create(planOne, workers.spawn, testTimeouts)
+  await host.sessionStart("startup")
+
+  expect(host.commandCatalog()).toMatchObject([{ name: "echo", source: { id: sourceOne.id } }])
+  expect(await host.invokeCommand("echo", "hello")).toBe("HELLO")
+  expect(host.invokeCommand("echo", "error")).rejects.toThrow("command failed")
+
+  const controller = new AbortController()
+  const cancelled = host.invokeCommand("echo", "pending", controller.signal)
+  controller.abort()
+  expect(cancelled).rejects.toMatchObject({ name: "AbortError" })
+  expect(await host.invokeCommand("echo", "again")).toBe("AGAIN")
+  expect(host.snapshot()).toMatchObject({ status: "ready", lifecycle: "started" })
   await host.dispose()
 })
 
@@ -261,6 +284,26 @@ test("a malformed tool result fails its generation without escaping the host", a
   await host.dispose()
 })
 
+test("a cancellation deadline fails a command generation with source attribution", async () => {
+  const workers = new TestWorkerSpawner()
+  workers.behaviors.push({ type: "command_hang" })
+  const timeouts = { ...testTimeouts, commandMs: 1_000, commandCancellationMs: 10 }
+  const host = await ExtensionHost.create(planOne, workers.spawn, timeouts)
+  await host.sessionStart("startup")
+  const controller = new AbortController()
+  const invocation = host.invokeCommand("echo", "pending", controller.signal)
+
+  controller.abort()
+  expect(invocation).rejects.toThrow("cancellation deadline exceeded")
+  await Bun.sleep(15)
+  expect(host.snapshot()).toMatchObject({
+    status: "failed",
+    failure: { phase: "command", extensionId: sourceOne.id, path: sourceOne.entryPath }
+  })
+  expect(workers.processes[0]!.terminated).toEqual(["SIGTERM"])
+  await host.dispose()
+})
+
 test("a cancellation deadline fails a tool generation with source attribution", async () => {
   const workers = new TestWorkerSpawner()
   workers.behaviors.push({ type: "tool_hang" })
@@ -277,6 +320,25 @@ test("a cancellation deadline fails a tool generation with source attribution", 
     status: "failed",
     failure: { phase: "tool", extensionId: sourceOne.id, path: sourceOne.entryPath }
   })
+  expect(workers.processes[0]!.terminated).toEqual(["SIGTERM"])
+  await host.dispose()
+})
+
+test("a command deadline fails, clears the catalog, and terminates its generation", async () => {
+  const workers = new TestWorkerSpawner()
+  workers.behaviors.push({ type: "command_hang" })
+  const timeouts = { ...testTimeouts, commandMs: 10 }
+  const host = await ExtensionHost.create(planOne, workers.spawn, timeouts)
+  await host.sessionStart("startup")
+
+  expect(host.invokeCommand("echo", "pending")).rejects.toThrow("deadline exceeded")
+  await Bun.sleep(15)
+  expect(host.snapshot()).toMatchObject({
+    status: "failed",
+    failure: { phase: "command", extensionId: sourceOne.id, path: sourceOne.entryPath },
+    commands: []
+  })
+  expect(host.commandCatalog()).toEqual([])
   expect(workers.processes[0]!.terminated).toEqual(["SIGTERM"])
   await host.dispose()
 })
@@ -298,6 +360,26 @@ test("a tool deadline fails and terminates its generation", async () => {
   await host.dispose()
 })
 
+test("command completion from a retired generation cannot cross replacement", async () => {
+  const workers = new TestWorkerSpawner()
+  workers.behaviors.push({ type: "commands" }, { type: "commands" })
+  const host = await ExtensionHost.create(planOne, workers.spawn, testTimeouts)
+  const retired = workers.processes[0]!
+  await host.sessionStart("startup")
+  const invocation = host.invokeCommand("echo", "pending")
+
+  await host.reload(reloadRequest(planTwo))
+  expect(invocation).rejects.toThrow("disposed during invocation")
+  retired.send({ type: "command_result", generation: 1, requestId: 2, message: "stale" })
+  expect(host.snapshot()).toMatchObject({
+    status: "ready",
+    lifecycle: "started",
+    commands: [{ source: { id: sourceTwo.id }, name: "echo" }]
+  })
+  expect(await host.invokeCommand("echo", "current")).toBe("CURRENT")
+  await host.dispose()
+})
+
 test("tool completion from a retired generation cannot cross replacement", async () => {
   const workers = new TestWorkerSpawner()
   workers.behaviors.push({ type: "tools" }, { type: "tools" })
@@ -307,7 +389,7 @@ test("tool completion from a retired generation cannot cross replacement", async
   const invocation = host.invokeTool("echo_message", { message: "pending" })
 
   await host.reload(reloadRequest(planTwo))
-  expect(invocation).rejects.toThrow("disposed during tool invocation")
+  expect(invocation).rejects.toThrow("disposed during invocation")
   retired.send({ type: "tool_result", generation: 1, requestId: 2, value: "stale" })
   expect(host.snapshot()).toMatchObject({
     status: "ready",
@@ -531,7 +613,7 @@ type TestWorkerBehavior =
   | { readonly type: "ready" }
   | { readonly type: "wrong_ready" }
   | { readonly type: "fatal_start" }
-  | { readonly type: "tools" | "tool_hang" | "tool_cancel_crossing" | "malformed_tool" }
+  | { readonly type: "commands" | "command_hang" | "tools" | "tool_hang" | "tool_cancel_crossing" | "malformed_tool" }
   | { readonly type: "spawn_error"; readonly message: string }
   | { readonly type: "fatal"; readonly message: string }
   | { readonly type: "pending" }
@@ -633,6 +715,10 @@ class TestWorkerProcess implements ExtensionWorkerProcess {
         generation: message.generation,
         extensions:
           this.#behavior.type === "wrong_ready" ? [] : this.#plan.sources.map(source => ({ source, status: "loaded" })),
+        commands:
+          this.#behavior.type === "commands" || this.#behavior.type === "command_hang"
+            ? [commandRegistration(this.#plan.sources[0]!)]
+            : [],
         tools:
           this.#behavior.type === "tools" ||
           this.#behavior.type === "tool_hang" ||
@@ -644,11 +730,32 @@ class TestWorkerProcess implements ExtensionWorkerProcess {
       return
     }
     if (message.type === "cancel") {
-      if (this.#behavior.type === "tools") {
+      if (this.#behavior.type === "commands") {
+        this.send({ type: "command_cancelled", generation: message.generation, requestId: message.requestId })
+      } else if (this.#behavior.type === "tools") {
         this.send({ type: "tool_cancelled", generation: message.generation, requestId: message.requestId })
       } else if (this.#behavior.type === "tool_cancel_crossing") {
         this.send({ type: "tool_result", generation: message.generation, requestId: message.requestId, value: "late" })
       }
+      return
+    }
+    if (message.type === "command_invoke") {
+      if (message.arguments === "pending") return
+      if (message.arguments === "error") {
+        this.send({
+          type: "command_error",
+          generation: message.generation,
+          requestId: message.requestId,
+          message: "command failed"
+        })
+        return
+      }
+      this.send({
+        type: "command_result",
+        generation: message.generation,
+        requestId: message.requestId,
+        message: message.arguments.toUpperCase()
+      })
       return
     }
     if (message.type === "tool_invoke") {
@@ -716,6 +823,10 @@ class TestWorkerProcess implements ExtensionWorkerProcess {
     this.stderr.end()
     this.#resolveExit(exit)
   }
+}
+
+function commandRegistration(source: ExtensionSource) {
+  return { source, name: "echo", description: "Echo command arguments", argumentHint: "[text]" } as const
 }
 
 function toolRegistration(source: ExtensionSource) {

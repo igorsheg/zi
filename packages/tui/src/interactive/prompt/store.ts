@@ -145,6 +145,7 @@ class PromptController implements PromptStore {
   #nextBrowserRequestId = 0
   #pendingAuthPrompt: PendingAuthPrompt | undefined
   #cancelledCompactionOperationId: number | undefined
+  #cancelledExtensionCommandOperationId: number | undefined
 
   constructor(
     interactive: InteractiveStore,
@@ -269,6 +270,7 @@ class PromptController implements PromptStore {
       case "loading_logout":
       case "logging_out":
       case "compacting":
+      case "running_extension_command":
       case "reloading":
       case "starting_session":
       case "loading_sessions":
@@ -351,6 +353,9 @@ class PromptController implements PromptStore {
           this.#setIdle()
         }
         break
+      case "running_extension_command":
+        this.#cancelExtensionCommand()
+        break
       case "choosing_auth_method": {
         const providerFrame =
           result.type === "revealed" &&
@@ -418,7 +423,14 @@ class PromptController implements PromptStore {
   }
 
   abortAndRestoreQueuedInputs(currentText: string): string {
-    if (this.#cancelAuthentication() || this.#cancelCompaction() || this.#cancelSessionReplacement()) return ""
+    if (
+      this.#cancelAuthentication() ||
+      this.#cancelCompaction() ||
+      this.#cancelExtensionCommand() ||
+      this.#cancelSessionReplacement()
+    ) {
+      return ""
+    }
     try {
       const aborted = this.#interactive.abortAndRestoreQueuedInputs()
       const text = this.#mergeQueue(aborted, currentText, false)
@@ -557,7 +569,14 @@ class PromptController implements PromptStore {
 
   clear(): void {
     this.#cancelClipboardRead()
-    if (this.#cancelAuthentication() || this.#cancelCompaction() || this.#cancelSessionReplacement()) return
+    if (
+      this.#cancelAuthentication() ||
+      this.#cancelCompaction() ||
+      this.#cancelExtensionCommand() ||
+      this.#cancelSessionReplacement()
+    ) {
+      return
+    }
     this.#fileCompletion.close()
     this.picker.close()
     const state = this.$state.get()
@@ -572,6 +591,7 @@ class PromptController implements PromptStore {
     this.#cancelClipboardRead()
     this.#cancelAuthentication()
     this.#cancelCompaction()
+    this.#cancelExtensionCommand()
     this.#cancelSessionReplacement()
     this.#disposed = true
     this.#fileCompletion.dispose()
@@ -901,6 +921,9 @@ class PromptController implements PromptStore {
       case "compact":
         this.#compact(command.instructions)
         return true
+      case "extension_command":
+        this.#runExtensionCommand(command.name, command.arguments)
+        return true
       case "reload":
         this.#reload()
         return true
@@ -952,6 +975,46 @@ class PromptController implements PromptStore {
       }
     }
     void compact()
+  }
+
+  #runExtensionCommand(name: string, arguments_: string): void {
+    const session = this.#interactive.getSession()
+    if (session.isStreaming || session.isAborting) {
+      this.reportFeedback({ type: "warning", message: "Wait for the current response before running a command" })
+      return
+    }
+    const operationId = ++this.#nextOperationId
+    this.#cancelledExtensionCommandOperationId = undefined
+    this.picker.close()
+    this.$state.set({
+      ...this.$state.get(),
+      feedback: { type: "status", message: `Running /${name}…` },
+      workflow: { type: "running_extension_command", operationId, session, name }
+    })
+    this.#requestInput("")
+
+    const run = async () => {
+      try {
+        const message = await session.invokeExtensionCommand(name, arguments_)
+        if (!this.#accepts(operationId, session)) return
+        this.#cancelledExtensionCommandOperationId = undefined
+        this.$state.set({
+          ...this.$state.get(),
+          feedback: message === undefined || message.length === 0 ? { type: "none" } : { type: "status", message },
+          workflow: { type: "idle" }
+        })
+      } catch (cause) {
+        if (!this.#accepts(operationId, session)) return
+        const cancelled = this.#cancelledExtensionCommandOperationId === operationId
+        this.#cancelledExtensionCommandOperationId = undefined
+        this.$state.set({
+          ...this.$state.get(),
+          feedback: cancelled ? { type: "none" } : { type: "error", message: errorMessage(cause) },
+          workflow: { type: "idle" }
+        })
+      }
+    }
+    void run()
   }
 
   #reload(): void {
@@ -1338,6 +1401,21 @@ class PromptController implements PromptStore {
     if (workflow.type !== "compacting") return false
     if (this.#cancelledCompactionOperationId === workflow.operationId) return true
     this.#cancelledCompactionOperationId = workflow.operationId
+    try {
+      const settled = workflow.session.abort()
+      this.$state.set({ ...this.$state.get() })
+      void settled.catch(() => {})
+    } catch {
+      // Session disposal already owns the stale operation.
+    }
+    return true
+  }
+
+  #cancelExtensionCommand(): boolean {
+    const workflow = this.$state.get().workflow
+    if (workflow.type !== "running_extension_command") return false
+    if (this.#cancelledExtensionCommandOperationId === workflow.operationId) return true
+    this.#cancelledExtensionCommandOperationId = workflow.operationId
     try {
       const settled = workflow.session.abort()
       this.$state.set({ ...this.$state.get() })

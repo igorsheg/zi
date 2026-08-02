@@ -1,6 +1,6 @@
 # Extension system infrastructure implementation spec
 
-- Status: accepted for custom tools and durable session operations; later capabilities remain deferred
+- Status: accepted historical substrate; later command policy is in [ADR 0030](adr/0030-extension-commands-are-session-owned-user-actions.md)
 - Pi behavior reference: `badlogic/pi-mono` at Zi's pinned `0e6909f0` (`v0.80.6`)
 - Current Pi comparison: `fc85bdd88be93b1e9a6b6bcfa41c684282ec79cc`
 - Project-trust comparison: `5bc1c2c0a6f07e00e8c240304182f213ab8d311f`
@@ -13,7 +13,7 @@ Zi will eventually support the full behavioral capability of Pi's extension syst
 
 This specification establishes the extension substrate before any product capability is added. The first accepted implementation can discover, trust-gate, load, identify, reload, and shut down otherwise empty TypeScript extensions through a supervised extension generation.
 
-The initial infrastructure contract contained lifecycle registration only. Protocol version 2 added bounded model-callable tools. Protocol version 3 added source-attributed correlated operations for custom session state and custom messages. Protocol version 4 adds declared, validated JSON tool outputs while preserving string results by default. Commands, providers, extension-owned UI, and a generic event framework remain excluded.
+The initial infrastructure contract contained lifecycle registration only. Protocol version 2 added bounded model-callable tools. Protocol version 3 added source-attributed correlated operations for custom session state and custom messages. Protocol version 4 added declared, validated JSON tool outputs while preserving string results by default. Later slices added subagent operations and profiles in protocol version 5 and extension commands in protocol version 6. Providers, extension-owned UI, and a generic event framework remain excluded.
 
 Lifecycle loading is an infrastructure checkpoint, not the product launch boundary. The first usable outcome is the [`custom-tool extension golden path`](extension-custom-tool-golden-path.md), which must work across interactive, text, JSON, and RPC modes against the compiled release.
 
@@ -40,9 +40,9 @@ The infrastructure must provide:
 
 ## 3. Non-goals
 
-The current capability does not implement:
+This infrastructure slice did not implement commands; their later accepted contract is [ADR 0030](adr/0030-extension-commands-are-session-owned-user-actions.md). The current platform still does not implement:
 
-- commands, shortcuts, or extension-owned CLI flags;
+- extension shortcuts or extension-owned CLI flags;
 - agent, provider, tool, input, compaction, or session-tree interception;
 - session names, labels, branches, or tree navigation;
 - model or provider registration;
@@ -871,7 +871,7 @@ Compiled acceptance has two layers:
 1. the worker-protocol test compiles Zi with the pinned Bun version, loads external TypeScript plus the canonical example, invokes its tool over the dedicated protocol pipe, checks lifecycle settlement and log isolation, and exits without leaked process or temporary state;
 2. the release-product test copies the canonical example beneath a persisted-trusted temporary project's `.zi/extensions/`, starts a bounded local Responses provider, and requires the compiled executable to complete one real custom-tool turn in text, JSON, RPC, and interactive modes.
 
-The product test checks registration in the first provider request, the exact custom-tool result in the second request, text stdout isolation, ordered JSON tool events, final interactive assistant presentation, and platform terminal restoration. It does not search the raw PTY byte stream for a completed tool row because incremental terminal frames can compose visible text across writes. POSIX acceptance owns a Bun PTY. The Windows release runner uses bounded stdio and a private final CLI argument that changes only TTY admission facts for that acceptance process. Both paths require durable output and platform terminal restoration. `build-release.ts` runs this acceptance before archiving each native target. CI uses deterministic process and resource assertions rather than wall-clock performance thresholds; deadlines only bound failed subprocess settlement.
+The product test checks registration in the first provider request, the exact custom-tool result in the second request, text stdout isolation, ordered JSON tool events, final interactive assistant presentation, and platform terminal restoration. Protocol version 6 also requires the compiled worker to publish and execute the canonical durable-counter command, then requires the compiled RPC product to list and invoke that command across a persisted new/continue session pair. It does not search the raw PTY byte stream for a completed tool or command row because incremental terminal frames can compose visible text across writes. POSIX acceptance owns a Bun PTY. The Windows release runner uses bounded stdio and a private final CLI argument that changes only TTY admission facts for that acceptance process. Both paths require durable output and platform terminal restoration. `build-release.ts` runs this acceptance before archiving each native target. CI uses deterministic process and resource assertions rather than wall-clock performance thresholds; deadlines only bound failed subprocess settlement.
 
 ## 18. Implementation slices
 

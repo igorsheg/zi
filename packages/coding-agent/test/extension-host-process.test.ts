@@ -119,6 +119,53 @@ export default function (zi: ExtensionAPI): void {
   }
 }, 10_000)
 
+test("ExtensionHost invokes external TypeScript commands with cancellation", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-extension-host-command-"))
+  const extensionPath = join(root, "command.ts")
+  await writeFile(
+    extensionPath,
+    `import type { ExtensionAPI } from "@with-zi/extension-api"
+export default function (zi: ExtensionAPI): void {
+  zi.registerCommand({
+    name: "echo",
+    description: "Echo command arguments",
+    argumentHint: "[text]",
+    async execute(arguments_, { signal }) {
+      if (arguments_ === "wait") {
+        if (!signal.aborted) await new Promise(resolve => signal.addEventListener("abort", resolve, { once: true }))
+        return "late"
+      }
+      return arguments_.toUpperCase()
+    }
+  })
+}
+`
+  )
+  const source: ExtensionSource = Object.freeze({
+    id: "host-command-fixture",
+    declaredPath: extensionPath,
+    entryPath: extensionPath,
+    scope: "temporary",
+    origin: "cli"
+  })
+  const plan: ExtensionLoadPlan = Object.freeze({ cwd: root, sources: Object.freeze([source]) })
+  const cli = resolve(import.meta.dirname, "../../cli/src/main.ts")
+  const host = await ExtensionHost.create(plan, createExtensionWorkerSpawner([process.execPath, cli]))
+
+  try {
+    expect(host.commandCatalog()).toMatchObject([{ name: "echo", source: { id: source.id } }])
+    await host.sessionStart("startup")
+    expect(await host.invokeCommand("echo", "external")).toBe("EXTERNAL")
+    const controller = new AbortController()
+    const cancelled = host.invokeCommand("echo", "wait", controller.signal)
+    controller.abort()
+    expect(cancelled).rejects.toMatchObject({ name: "AbortError" })
+  } finally {
+    await host.dispose()
+    await rm(root, { recursive: true, force: true })
+  }
+}, 10_000)
+
 test("ExtensionHost contains a real worker crash during tool invocation", async () => {
   const root = await mkdtemp(join(tmpdir(), "zi-extension-host-tool-crash-"))
   const extensionPath = join(root, "tool.ts")
@@ -182,6 +229,8 @@ export default zi => zi.registerTool({
     startupMs: 2_000,
     lifecycleMs: 100,
     shutdownMs: 300,
+    commandMs: 2_000,
+    commandCancellationMs: 25,
     toolMs: 2_000,
     toolCancellationMs: 25
   }
@@ -191,7 +240,7 @@ export default zi => zi.registerTool({
     await host.sessionStart("startup")
     const invocation = host.invokeTool("pending_tool", {})
     const disposal = host.dispose()
-    expect(invocation).rejects.toThrow("disposed during tool invocation")
+    expect(invocation).rejects.toThrow("disposed during invocation")
     await disposal
     expect(host.snapshot()).toMatchObject({ status: "disposed", lifecycle: "stopped" })
   } finally {
@@ -278,6 +327,8 @@ test("ExtensionHost terminates a real worker blocked by extension JavaScript", a
     startupMs: 2_000,
     lifecycleMs: 100,
     shutdownMs: 300,
+    commandMs: 100,
+    commandCancellationMs: 25,
     toolMs: 100,
     toolCancellationMs: 25
   }

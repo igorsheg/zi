@@ -90,7 +90,7 @@ import {
 import type { SessionShell, ShellDemotionResult, ShellKillResult, ShellTaskSnapshot } from "./session-shell.js"
 import type { SettingsError, SettingsManager, SettingsScope } from "./settings-manager.js"
 import { expandSkillCommand, type Skill } from "./skills.js"
-import type { SlashCommand } from "./slash-commands.js"
+import { builtinSlashCommands, type SlashCommand } from "./slash-commands.js"
 import type { SubagentSnapshot, SubagentSupervisor } from "./subagents/supervisor.js"
 import { createSubagentTools } from "./subagents/tools.js"
 import { buildSystemPrompt } from "./system-prompt.js"
@@ -343,6 +343,13 @@ type Activity =
       settled: Promise<void>
     }
   | { type: "compaction_committed"; operationId: number; reason: "manual"; settled: Promise<void> }
+  | {
+      type: "extension_command"
+      operationId: number
+      name: string
+      controller: AbortController
+      settled: Promise<void>
+    }
   | { type: "reloading"; operationId: number; settled: Promise<void> }
   | { type: "failed"; runId: number; cause: unknown }
   | { type: "disposed"; settled: Promise<void> }
@@ -436,6 +443,10 @@ interface CommittedCompaction {
 
 const emptyQueue = (): QueuedInputs => Object.freeze({ steering: Object.freeze([]), followUp: Object.freeze([]) })
 
+export interface ExtensionCommand extends SlashCommand {
+  readonly extensionId: string
+}
+
 export class AgentSession {
   readonly sessionManager: SessionManager
   readonly settingsManager: SettingsManager
@@ -455,7 +466,7 @@ export class AgentSession {
   readonly #unsubscribeAgent: () => void
   readonly #unsubscribeShell: (() => void) | undefined
   readonly #unsubscribeSubagents: (() => void) | undefined
-  readonly #unbindExtensionTools: (() => void) | undefined
+  readonly #unbindExtensionCatalog: (() => void) | undefined
   readonly #unbindExtensionSessionOperations: (() => void) | undefined
   #resources: SessionResources
   #baseTools: readonly AgentTool[]
@@ -469,12 +480,14 @@ export class AgentSession {
   #nextEntryId = 0
   #nextModelOperationId = 0
   #nextCompactionOperationId = 0
+  #nextExtensionCommandOperationId = 0
   #nextReloadOperationId = 0
   #modelMutation: ModelMutationState = { type: "none" }
   #modelState: SessionModelState
   #modelChoicesPromise: Promise<readonly ModelChoice[]> | undefined
   #committedMessageMemory: CommittedMessageMemory | undefined
   #contextUsageCache: ContextUsageCache | undefined
+  #extensionCommandRevision = 0
 
   constructor(config: AgentSessionConfig) {
     this.#agent = config.agent
@@ -498,8 +511,8 @@ export class AgentSession {
     this.#modelState = config.model ? { type: "selected", model: config.model } : { type: "unselected" }
     this.#agent.prepareNextTurnWithContext = (context, signal) => this.#prepareNextTurn(context, signal)
     this.#unsubscribeAgent = this.#agent.subscribe(event => this.#handleAgentEvent(event))
-    this.#applyActiveTools()
-    this.#unbindExtensionTools = config.extensionHost?.bindCatalog(() => this.#applyActiveTools())
+    this.#applyExtensionCatalog()
+    this.#unbindExtensionCatalog = config.extensionHost?.bindCatalog(() => this.#applyExtensionCatalog())
     this.#unbindExtensionSessionOperations = config.extensionHost?.bindSessionOperations({
       getEntries: customType => this.#getExtensionCustomEntries(customType).map(extensionCustomEntry),
       appendEntry: (customType, data) => extensionCustomEntry(this.#appendExtensionCustomEntry(customType, data)),
@@ -634,6 +647,7 @@ export class AgentSession {
     return (
       this.#activity.type === "aborting" ||
       (this.#activity.type === "compacting" && this.#activity.controller.signal.aborted) ||
+      (this.#activity.type === "extension_command" && this.#activity.controller.signal.aborted) ||
       (this.#activity.type === "running" &&
         (this.#activity.phase.type === "compacting" || this.#activity.phase.type === "retry_wait") &&
         this.#activity.phase.controller.signal.aborted)
@@ -747,6 +761,73 @@ export class AgentSession {
       })
     )
     return Object.freeze(diagnostics)
+  }
+
+  get extensionCommandRevision(): number {
+    return this.#extensionCommandRevision
+  }
+
+  get extensionCommandStatus():
+    | { readonly type: "idle" }
+    | { readonly type: "running"; readonly name: string; readonly phase: "executing" | "cancelling" } {
+    const activity = this.#activity
+    if (activity.type !== "extension_command") return { type: "idle" }
+    return {
+      type: "running",
+      name: activity.name,
+      phase: activity.controller.signal.aborted ? "cancelling" : "executing"
+    }
+  }
+
+  listExtensionCommands(): readonly ExtensionCommand[] {
+    return Object.freeze(
+      (this.#extensionHost?.commandCatalog() ?? []).map(command =>
+        Object.freeze({
+          name: command.name,
+          description: command.description,
+          ...(command.argumentHint === undefined ? {} : { argumentHint: command.argumentHint }),
+          extensionId: command.source.id
+        })
+      )
+    )
+  }
+
+  invokeExtensionCommand(name: string, arguments_: string): Promise<string | undefined> {
+    this.#assertIdle("run an extension command")
+    if (this.#modelMutation.type !== "none") {
+      throw new Error("Cannot run an extension command while a model change is active")
+    }
+    if (this.#pending.length > 0) throw new Error("Cannot run an extension command while queued input is pending")
+    const lifecycle = this.#extensionLifecycle
+    if (lifecycle.type !== "started") {
+      throw new Error(`Cannot run an extension command while extension lifecycle is ${lifecycle.type}`)
+    }
+    if (!lifecycle.host.commandCatalog().some(command => command.name === name)) {
+      throw new Error(`Unknown extension command: ${name}`)
+    }
+
+    const operationId = ++this.#nextExtensionCommandOperationId
+    const controller = new AbortController()
+    const operation = createSettlement<string | undefined>()
+    this.#activity = {
+      type: "extension_command",
+      operationId,
+      name,
+      controller,
+      settled: operation.promise.then(
+        () => undefined,
+        () => undefined
+      )
+    }
+    void Promise.resolve()
+      .then(() => lifecycle.host.invokeCommand(name, arguments_, controller.signal))
+      .then(
+        value => operation.resolve(value),
+        cause => operation.reject(cause)
+      )
+    return operation.promise.finally(() => {
+      if (this.#ownsExtensionCommand(operationId)) this.#activity = { type: "idle" }
+    })
   }
 
   listResourceCommands(): readonly SlashCommand[] {
@@ -1059,6 +1140,8 @@ export class AgentSession {
       case "compacting":
       case "compaction_committed":
         throw new Error("Cannot prompt while context compaction is active")
+      case "extension_command":
+        throw new Error("Cannot prompt while an extension command is active")
       case "reloading":
         throw new Error("Cannot prompt while reload is active")
       case "failed":
@@ -1083,6 +1166,9 @@ export class AgentSession {
     if (this.#activity.type === "aborting") throw new Error("Cannot restore queued inputs while the agent is aborting")
     if (this.#activity.type === "compacting" || this.#activity.type === "compaction_committed") {
       throw new Error("Cannot restore queued inputs while context compaction is active")
+    }
+    if (this.#activity.type === "extension_command") {
+      throw new Error("Cannot restore queued inputs while an extension command is active")
     }
     if (this.#activity.type === "reloading") throw new Error("Cannot restore queued inputs while reload is active")
     const queued = this.#detachQueuedInputs("restore")
@@ -1139,6 +1225,14 @@ export class AgentSession {
         this.#activity = { type: "idle" }
         this.#emitQueue()
         return { ...queued, settled: authenticationSettled }
+      }
+      case "extension_command": {
+        const { settled, controller } = this.#activity
+        controller.abort()
+        return {
+          ...emptyQueue(),
+          settled: authenticationWasIdle ? settled : settleTogether(settled, authenticationSettled)
+        }
       }
       case "reloading": {
         const { settled } = this.#activity
@@ -1202,6 +1296,11 @@ export class AgentSession {
       case "failed":
         this.#agent.abort()
         return authenticationSettled
+      case "extension_command": {
+        const { settled, controller } = this.#activity
+        controller.abort()
+        return authenticationWasIdle ? settled : settleTogether(settled, authenticationSettled)
+      }
       case "reloading": {
         const { settled } = this.#activity
         return authenticationWasIdle ? settled : settleTogether(settled, authenticationSettled)
@@ -1267,6 +1366,7 @@ export class AgentSession {
       case "aborting":
       case "compacting":
       case "compaction_committed":
+      case "extension_command":
       case "reloading":
       case "disposed":
         return settleAll([this.#activity.settled, this.#authentication.waitForIdle(), searchSettled, extensionsSettled])
@@ -1412,6 +1512,22 @@ export class AgentSession {
     this.#applyActiveTools()
   }
 
+  #applyExtensionCatalog(): void {
+    const host = this.#extensionHost
+    if (host) {
+      const rejectedCommands = host
+        .commandCatalog()
+        .filter(command => builtinSlashCommands.some(builtin => builtin.name === command.name))
+        .map(command => ({
+          command,
+          message: `Extension command ${command.name} conflicts with a built-in command and was ignored`
+        }))
+      if (rejectedCommands.length > 0) host.rejectCommands(rejectedCommands)
+    }
+    this.#extensionCommandRevision++
+    this.#applyActiveTools()
+  }
+
   #applyActiveTools(): void {
     const profiles = this.#subagentProfiles()
     const subagentTools = this.#subagents
@@ -1438,13 +1554,16 @@ export class AgentSession {
       currentActivity.type === "aborting" ||
       currentActivity.type === "compacting" ||
       currentActivity.type === "compaction_committed" ||
+      currentActivity.type === "extension_command" ||
       currentActivity.type === "reloading"
         ? currentActivity.settled
         : Promise.resolve()
     this.#pending = []
     this.#pendingBytes = 0
     this.#agent.clearAllQueues()
-    if (currentActivity.type === "compacting") currentActivity.controller.abort()
+    if (currentActivity.type === "compacting" || currentActivity.type === "extension_command") {
+      currentActivity.controller.abort()
+    }
     if (currentActivity.type === "running") {
       if (currentActivity.providerStart.type === "pending") currentActivity.providerStart.controller.abort()
       if (currentActivity.phase.type === "compacting" || currentActivity.phase.type === "retry_wait") {
@@ -1452,7 +1571,7 @@ export class AgentSession {
       }
     }
     this.#agent.abort()
-    this.#unbindExtensionTools?.()
+    this.#unbindExtensionCatalog?.()
     const processOwners = (async (): Promise<void> => {
       try {
         await settleAll([this.#subagents?.shutdown() ?? Promise.resolve(), this.#disposeExtensions(reason)])
@@ -2327,6 +2446,8 @@ export class AgentSession {
       case "compacting":
       case "compaction_committed":
         throw new Error("Cannot queue input while context compaction is active")
+      case "extension_command":
+        throw new Error("Cannot queue input while an extension command is active")
       case "reloading":
         throw new Error("Cannot queue input while reload is active")
       case "failed":
@@ -2611,6 +2732,7 @@ export class AgentSession {
   #assertCustomStateAppend(): void {
     switch (this.#activity.type) {
       case "idle":
+      case "extension_command":
         return
       case "running":
         if (this.#activity.phase.type === "compacting" || this.#activity.phase.type === "compaction_committed") {
@@ -2657,6 +2779,10 @@ export class AgentSession {
     if (status !== "disabled" && status !== "ready" && status !== "failed") {
       throw new Error(`Cannot reload while extension host is ${status}`)
     }
+  }
+
+  #ownsExtensionCommand(operationId: number): boolean {
+    return this.#activity.type === "extension_command" && this.#activity.operationId === operationId
   }
 
   #ownsReload(operationId: number): boolean {

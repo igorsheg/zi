@@ -14,6 +14,7 @@ export type InteractiveCommand =
   | { readonly type: "settings" }
   | { readonly type: "codex_settings" }
   | { readonly type: "compact"; readonly instructions: string }
+  | { readonly type: "extension_command"; readonly name: string; readonly arguments: string }
   | { readonly type: "reload" }
   | { readonly type: "new_session" }
   | { readonly type: "resume_session" }
@@ -24,7 +25,7 @@ export type SlashCompletion =
 
 export type SlashActivation = SlashCompletion | { readonly type: "intent"; readonly command: InteractiveCommand }
 
-type CommandSession = Pick<AgentSession, "listResourceCommands">
+type CommandSession = Pick<AgentSession, "extensionCommandRevision" | "listExtensionCommands" | "listResourceCommands">
 
 interface SlashInput {
   readonly query: string
@@ -36,6 +37,8 @@ export class SlashController {
   readonly #getSession: (() => CommandSession) | undefined
   readonly #getGeneration: (() => number) | undefined
   #catalogGeneration: number | undefined
+  #catalogCommandRevision: number | undefined
+  #extensionCommandNames: ReadonlySet<string> = new Set()
   #catalog: readonly SlashCommand[] = builtinSlashCommands
 
   constructor(getSession?: () => CommandSession, getGeneration?: () => number) {
@@ -73,33 +76,68 @@ export class SlashController {
     if (!selection) return { type: "unavailable" }
     const edit = completionEdit(text, selection.input, selection.command)
     const builtin = builtinSlashCommands.find(command => command.name === selection.command.name)
-    return builtin ? { type: "intent", command: builtinIntent(builtin.name, edit.text.slice(edit.cursorOffset)) } : edit
+    if (builtin) return { type: "intent", command: builtinIntent(builtin.name, edit.text.slice(edit.cursorOffset)) }
+    if (this.#extensionCommandNames.has(selection.command.name)) {
+      return {
+        type: "intent",
+        command: {
+          type: "extension_command",
+          name: selection.command.name,
+          arguments: edit.text.slice(edit.cursorOffset).trim()
+        }
+      }
+    }
+    return edit
   }
 
   parse(text: string): InteractiveCommand | undefined {
-    const command = builtinSlashCommands.find(candidate => invokes(text, candidate.name))
-    if (!command) return undefined
-    const prefix = `/${command.name}`
-    const args = text === prefix ? "" : text.slice(prefix.length + 1)
-    return builtinIntent(command.name, args)
+    const builtin = builtinSlashCommands.find(candidate => invokes(text, candidate.name))
+    if (builtin) {
+      const prefix = `/${builtin.name}`
+      const args = text === prefix ? "" : text.slice(prefix.length + 1)
+      return builtinIntent(builtin.name, args)
+    }
+    this.#commands()
+    if (!text.startsWith("/")) return undefined
+    const separator = text.slice(1).search(/\s/)
+    const name = separator === -1 ? text.slice(1) : text.slice(1, separator + 1)
+    if (!name || !this.#extensionCommandNames.has(name) || !invokes(text, name)) return undefined
+    const prefix = `/${name}`
+    return { type: "extension_command", name, arguments: text.slice(prefix.length).trim() }
   }
 
   invalidateCatalog(): void {
     this.#catalogGeneration = undefined
+    this.#catalogCommandRevision = undefined
   }
 
   #commands(): readonly SlashCommand[] {
     const session = this.#getSession?.()
     if (!session) return builtinSlashCommands
     const generation = this.#getGeneration?.()
-    if (generation !== undefined && generation === this.#catalogGeneration) return this.#catalog
+    const commandRevision = session.extensionCommandRevision
+    if (
+      generation !== undefined &&
+      generation === this.#catalogGeneration &&
+      commandRevision === this.#catalogCommandRevision
+    ) {
+      return this.#catalog
+    }
 
     const byName = new Map<string, SlashCommand>()
     for (const command of builtinSlashCommands) byName.set(command.name, command)
+    const extensionCommandNames = new Set<string>()
+    for (const command of session.listExtensionCommands()) {
+      if (byName.has(command.name)) continue
+      byName.set(command.name, command)
+      extensionCommandNames.add(command.name)
+    }
     for (const command of session.listResourceCommands()) {
       if (!byName.has(command.name)) byName.set(command.name, command)
     }
     this.#catalogGeneration = generation
+    this.#catalogCommandRevision = commandRevision
+    this.#extensionCommandNames = extensionCommandNames
     this.#catalog = [...byName.values()]
     return this.#catalog
   }
@@ -176,8 +214,9 @@ function builtinIntent(name: BuiltinSlashCommandName, args: string): Interactive
   }
 }
 
-function invokes(text: string, name: BuiltinSlashCommandName): boolean {
-  return text === `/${name}` || text.startsWith(`/${name} `)
+function invokes(text: string, name: string): boolean {
+  const prefix = `/${name}`
+  return text === prefix || (text.startsWith(prefix) && /\s/.test(text[prefix.length] ?? ""))
 }
 
 function assertNever(value: never): never {

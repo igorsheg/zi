@@ -99,6 +99,12 @@ export type PromptWorkflow =
       readonly providerId: string
     }
   | { readonly type: "compacting"; readonly operationId: number; readonly session: AgentSession }
+  | {
+      readonly type: "running_extension_command"
+      readonly operationId: number
+      readonly session: AgentSession
+      readonly name: string
+    }
   | { readonly type: "reloading"; readonly operationId: number; readonly session: AgentSession }
   | { readonly type: "starting_session"; readonly operationId: number; readonly session: AgentSession }
   | { readonly type: "loading_sessions"; readonly operationId: number; readonly session: AgentSession }
