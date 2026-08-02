@@ -109,7 +109,7 @@ Decision: [ADR 0029](adr/0029-subagent-profiles-share-session-owned-orchestratio
 - [x] Make omitted profile model and thinking inherit the parent selection; report unavailable explicit models with profile source.
 - [x] Preserve admitted child work across extension reload while replacing programmatic registrations.
 - [x] Keep optional bounded extension orchestration operations over the same session-owned mechanics.
-- [x] Remove the enablement setting, native delegation system prompt, semantic status projections, composer rail, and subagent-specific notifications.
+- [x] Remove the enablement setting, native delegation system prompt, session-level status projections, composer rail, and subagent-specific notifications while retaining semantic tool-call presentation.
 - [x] Publish the [profile-driven subagent guide](subagents.md) and a complete [programmatic profile example](../examples/extensions/subagents/index.ts).
 - [x] Add compiled acceptance for both declaration paths and standard child operations on all release targets.
 - [ ] Prove graceful and forced descendant cleanup on every target, including a real Windows Job Object, before calling the substrate release-supported.

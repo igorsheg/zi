@@ -8,7 +8,9 @@ import type { AgentTool } from "@earendil-works/pi-agent-core"
 import { createProcessTreeTracker } from "../src/processes/process-tree.js"
 import { SessionManager } from "../src/session-manager.js"
 import { SubagentSupervisor } from "../src/subagents/supervisor.js"
+import { isSubagentToolDetails, maxSubagentToolDetailsBytes } from "../src/subagents/tool-details.js"
 import { createSubagentTools, maxSubagentToolResultBytes } from "../src/subagents/tools.js"
+import { projectToolPresentation } from "../src/tools/presentation/project.js"
 
 const mockChild = resolve(import.meta.dir, "fixtures/mock-rpc-child.ts")
 const pathfinderProfile = Object.freeze({
@@ -51,6 +53,14 @@ test("standard subagent tools exist only for an admitted profile catalog", async
       undefined
     )
     expect(JSON.parse(resultText(spawned))).toEqual({ name: "finder-1", profile: "pathfinder" })
+    expect(spawned.details).toMatchObject({
+      type: "subagent",
+      outcome: "success",
+      operation: "spawn",
+      profile: "pathfinder",
+      agent: { name: "finder-1" }
+    })
+    expect(isSubagentToolDetails(spawned.details)).toBe(true)
     expect(harness.admissions).toEqual([{ profile: "pathfinder", name: "finder-1", prompt: "Locate the owner" }])
 
     const wait = requireTool(tools, "wait_subagents")
@@ -59,6 +69,35 @@ test("standard subagent tools exist only for an admitted profile catalog", async
       subagents: [{ name: "finder-1", completion: { status: "completed", text: "found" } }],
       all_completed: true
     })
+    expect(isSubagentToolDetails(waited.details)).toBe(true)
+
+    const sent = await requireTool(tools, "send_subagent").execute(
+      "send",
+      { name: "finder-1", text: "Include ownership notes" },
+      undefined
+    )
+    expect(isSubagentToolDetails(sent.details)).toBe(true)
+
+    const continued = await requireTool(tools, "continue_subagent").execute(
+      "continue",
+      { name: "finder-1", text: "Report the final answer" },
+      undefined
+    )
+    expect(isSubagentToolDetails(continued.details)).toBe(true)
+    await wait.execute("wait-again", { names: ["finder-1"], timeout_ms: 5_000 }, undefined)
+
+    const interrupted = await requireTool(tools, "interrupt_subagent").execute(
+      "interrupt",
+      { name: "finder-1" },
+      undefined
+    )
+    expect(isSubagentToolDetails(interrupted.details)).toBe(true)
+
+    const listed = await requireTool(tools, "list_subagents").execute("list", {}, undefined)
+    expect(isSubagentToolDetails(listed.details)).toBe(true)
+
+    const closed = await requireTool(tools, "close_subagent").execute("close", { name: "finder-1" }, undefined)
+    expect(isSubagentToolDetails(closed.details)).toBe(true)
   } finally {
     await harness.dispose()
   }
@@ -77,6 +116,8 @@ test("profile and wait projections remain bounded", async () => {
     const listed = await requireTool(tools, "list_subagent_profiles").execute("profiles", {}, undefined)
     expect(Buffer.byteLength(resultText(listed))).toBeLessThanOrEqual(maxSubagentToolResultBytes)
     expect(JSON.parse(resultText(listed)).omitted_bytes).toBeGreaterThan(0)
+    expect(Buffer.byteLength(JSON.stringify(listed.details))).toBeLessThanOrEqual(maxSubagentToolDetailsBytes)
+    expect(isSubagentToolDetails(listed.details)).toBe(true)
 
     await harness.spawn("profile-1", "first", "inspect")
     await harness.spawn("profile-2", "second", "inspect")
@@ -88,6 +129,16 @@ test("profile and wait projections remain bounded", async () => {
     const text = resultText(waited)
     expect(Buffer.byteLength(text)).toBeLessThanOrEqual(maxSubagentToolResultBytes)
     expect(JSON.parse(text).omitted_bytes).toBeGreaterThan(0)
+    expect(Buffer.byteLength(JSON.stringify(waited.details))).toBeLessThanOrEqual(maxSubagentToolDetailsBytes)
+    expect(isSubagentToolDetails(waited.details)).toBe(true)
+    const presentation = projectToolPresentation({
+      status: "done",
+      name: "wait_subagents",
+      args: { names: ["first", "second"] },
+      result: waited
+    })
+    expect(presentation.body?.text).toContain("First output:")
+    expect(presentation.body?.text).toContain("Second output:")
   } finally {
     await harness.dispose()
   }

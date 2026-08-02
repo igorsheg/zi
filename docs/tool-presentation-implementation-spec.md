@@ -629,15 +629,15 @@ One transcript-owned renderer live request refreshes visible running timing in g
 
 The architecture cutover gives every current built-in a coherent baseline. Later vertical slices may refine wording and visual treatment without changing the contract.
 
-| Tool           | Header subject                | Body                                                       | Compact policy                                        | Structured notices                     |
-| -------------- | ----------------------------- | ---------------------------------------------------------- | ----------------------------------------------------- | -------------------------------------- |
-| Bash           | `Run` description or command  | exact command + terminal result/progress                   | running/output success tail 5; failure edges 2/3      | outcome, task, truncation, full output |
-| Read           | path + actual range/status    | absolute-numbered source                                   | success hidden; failure head 4; detail edges 120/79   | detailed continuation/truncation       |
-| Write          | path + written size           | numbered source from arguments                             | success hidden; failure head 4; detail head 200       | detailed preview truncation            |
-| Edit           | path + replacement/diff facts | context-rich executed diff only after successful execution | preterminal hidden; success edges 5/5; failure head 4 | detailed diff truncation               |
-| Task output    | task ID + task-state detail   | terminal result                                            | tail 5                                                | truncation, full output, retention     |
-| Kill task      | task ID                       | text only when useful                                      | hidden on success; head on failure                    | stop state/failure                     |
-| Subagent tools | generic tool label            | bounded JSON or text result                                | generic fallback                                      | none                                   |
+| Tool           | Header subject                          | Body                                                       | Compact policy                                        | Structured notices                     |
+| -------------- | --------------------------------------- | ---------------------------------------------------------- | ----------------------------------------------------- | -------------------------------------- |
+| Bash           | `Run` description or command            | exact command + terminal result/progress                   | running/output success tail 5; failure edges 2/3      | outcome, task, truncation, full output |
+| Read           | path + actual range/status              | absolute-numbered source                                   | success hidden; failure head 4; detail edges 120/79   | detailed continuation/truncation       |
+| Write          | path + written size                     | numbered source from arguments                             | success hidden; failure head 4; detail head 200       | detailed preview truncation            |
+| Edit           | path + replacement/diff facts           | context-rich executed diff only after successful execution | preterminal hidden; success edges 5/5; failure head 4 | detailed diff truncation               |
+| Task output    | task ID + task-state detail             | terminal result                                            | tail 5                                                | truncation, full output, retention     |
+| Kill task      | task ID                                 | text only when useful                                      | hidden on success; head on failure                    | stop state/failure                     |
+| Subagent tools | profile, runtime name, or bounded count | delegated task or bounded completion summaries             | administrative success hidden; wait head 6            | truncation when relevant               |
 
 Bash is the first shipped post-cutover polish slice. It adds an optional bounded human description, verb-first compact rows, an exact secondary command, a completion-stable five-row output tail, failed edge peek, compact empty success and background handoff, structured background/admission/interruption states, detailed-only retention notices, shell highlighting, action hints, and typed cancellation without changing the client boundary. A terminal LF terminates the final usable output line instead of consuming an additional line slot; intentional blank lines before that terminator remain lines.
 

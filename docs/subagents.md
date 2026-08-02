@@ -101,4 +101,4 @@ Extensions never receive `SubagentSupervisor` or child-process handles. Extensio
 
 The parent `AgentSession` owns admitted child processes. Zi enforces child concurrency, runtime names, RPC framing, output retention, cancellation, wait bounds, credential and cwd propagation, process-tree containment, durable journal evidence, and forced cleanup.
 
-Subagent completion never wakes the parent model automatically. The parent collects completion through standard or custom tools. Zi adds no subagent-specific terminal rail, notification channel, or generated completion prompt.
+Subagent completion never wakes the parent model automatically. The parent collects completion through standard or custom tools. Standard calls have concise semantic tool rows and expandable completion evidence, but Zi adds no separate subagent rail, notification channel, or generated completion prompt.

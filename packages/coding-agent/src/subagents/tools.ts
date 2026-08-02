@@ -6,6 +6,12 @@ import type { SubagentCompletion } from "./child-process.js"
 import { clipUtf8 } from "./child-process.js"
 import type { SubagentSupervisor, SubagentSnapshot } from "./supervisor.js"
 import { maxSubagentNameBytes, maxSubagentPromptBytes, maxWaitNames, maxWaitTimeoutMs } from "./supervisor.js"
+import {
+  maxProjectedSubagentProfileDetailsBytes,
+  projectSubagentToolAgent,
+  projectSubagentToolAgents,
+  type SubagentToolDetails
+} from "./tool-details.js"
 
 const subagentName = Type.String({
   minLength: 1,
@@ -34,11 +40,6 @@ export const maxSubagentToolResultBytes = 64 * 1024
 
 type SpawnProfile = (profile: string, name: string, prompt: string, signal?: AbortSignal) => Promise<string>
 
-type SubagentToolDetails = {
-  readonly type: "subagent"
-  readonly operation: "profiles" | "spawn" | "send" | "continue" | "wait" | "interrupt" | "close" | "list"
-}
-
 export function createSubagentTools(
   profiles: readonly ExtensionSubagentProfile[],
   supervisor: SubagentSupervisor,
@@ -66,8 +67,15 @@ export function createSubagentTools(
     parameters: emptyParameters,
     executionMode: "parallel",
     execute() {
+      const catalog = projectProfileCatalog(profiles)
       return Promise.resolve(
-        textResult(JSON.stringify(projectProfileCatalog(profiles)), { type: "subagent", operation: "profiles" })
+        textResult(JSON.stringify(catalog), {
+          type: "subagent",
+          outcome: "success",
+          operation: "profiles",
+          profiles: catalog.profiles,
+          omittedBytes: catalog.omitted_bytes
+        })
       )
     }
   }
@@ -80,7 +88,13 @@ export function createSubagentTools(
     executionMode: "parallel",
     async execute(_id, input, signal) {
       const name = await spawnProfile(input.profile, input.name, input.prompt, signal)
-      return textResult(JSON.stringify({ name, profile: input.profile }), { type: "subagent", operation: "spawn" })
+      return textResult(JSON.stringify({ name, profile: input.profile }), {
+        type: "subagent",
+        outcome: "success",
+        operation: "spawn",
+        profile: input.profile,
+        agent: projectSubagentToolAgent(requireSnapshot(supervisor, name))
+      })
     }
   }
   const send: AgentTool<typeof messageParameters, SubagentToolDetails> = {
@@ -94,7 +108,9 @@ export function createSubagentTools(
       await supervisor.send(input.name, input.text)
       return textResult(JSON.stringify({ name: input.name, accepted: true, started_turn: false }), {
         type: "subagent",
-        operation: "send"
+        outcome: "success",
+        operation: "send",
+        agent: projectSubagentToolAgent(requireSnapshot(supervisor, input.name))
       })
     }
   }
@@ -109,7 +125,12 @@ export function createSubagentTools(
       const delivery = await supervisor.continue(input.name, input.text)
       return textResult(
         JSON.stringify({ name: input.name, accepted: true, started_turn: delivery === "started_turn" }),
-        { type: "subagent", operation: "continue" }
+        {
+          type: "subagent",
+          outcome: "success",
+          operation: "continue",
+          agent: projectSubagentToolAgent(requireSnapshot(supervisor, input.name))
+        }
       )
     }
   }
@@ -122,7 +143,12 @@ export function createSubagentTools(
     executionMode: "parallel",
     async execute(_id, input, signal) {
       const snapshots = await supervisor.wait(input.names, input.timeout_ms ?? supervisor.waitTimeoutMs, signal)
-      return textResult(JSON.stringify(projectWaitResult(snapshots)), { type: "subagent", operation: "wait" })
+      return textResult(JSON.stringify(projectWaitResult(snapshots)), {
+        type: "subagent",
+        outcome: "success",
+        operation: "wait",
+        agents: projectSubagentToolAgents(snapshots)
+      })
     }
   }
   const interrupt: AgentTool<typeof nameParameters, SubagentToolDetails> = {
@@ -133,7 +159,13 @@ export function createSubagentTools(
     executionMode: "parallel",
     async execute(_id, input) {
       const outcome = await supervisor.interrupt(input.name)
-      return textResult(JSON.stringify({ name: input.name, outcome }), { type: "subagent", operation: "interrupt" })
+      return textResult(JSON.stringify({ name: input.name, outcome }), {
+        type: "subagent",
+        outcome: "success",
+        operation: "interrupt",
+        agent: projectSubagentToolAgent(requireSnapshot(supervisor, input.name)),
+        result: outcome
+      })
     }
   }
   const close: AgentTool<typeof nameParameters, SubagentToolDetails> = {
@@ -143,8 +175,16 @@ export function createSubagentTools(
     parameters: nameParameters,
     executionMode: "parallel",
     async execute(_id, input) {
+      const previous = requireSnapshot(supervisor, input.name)
       const snapshot = await supervisor.close(input.name)
-      return textResult(JSON.stringify(projectListSnapshot(snapshot)), { type: "subagent", operation: "close" })
+      return textResult(JSON.stringify(projectListSnapshot(snapshot)), {
+        type: "subagent",
+        outcome: "success",
+        operation: "close",
+        agent: projectSubagentToolAgent(snapshot),
+        previousStatus: previous.lifecycle,
+        ...(previous.completion ? { previousCompletionStatus: previous.completion.status } : {})
+      })
     }
   }
   const list: AgentTool<typeof emptyParameters, SubagentToolDetails> = {
@@ -155,10 +195,16 @@ export function createSubagentTools(
     parameters: emptyParameters,
     executionMode: "parallel",
     execute() {
+      const snapshots = supervisor.snapshots()
+      const status = supervisor.status()
       return Promise.resolve(
-        textResult(JSON.stringify({ subagents: supervisor.snapshots().map(projectListSnapshot) }), {
+        textResult(JSON.stringify({ subagents: snapshots.map(projectListSnapshot) }), {
           type: "subagent",
-          operation: "list"
+          outcome: "success",
+          operation: "list",
+          agents: projectSubagentToolAgents(snapshots),
+          workingNames: status.workingNames,
+          readyNames: status.readyNames
         })
       )
     }
@@ -212,7 +258,7 @@ function projectProfileCatalog(profiles: readonly ExtensionSubagentProfile[]) {
   const projected = profiles.map(profile => ({ name: profile.name, description: profile.description }))
   let omittedBytes = 0
   const catalog = { profiles: projected, omitted_bytes: omittedBytes }
-  while (Buffer.byteLength(JSON.stringify(catalog)) > maxSubagentToolResultBytes) {
+  while (Buffer.byteLength(JSON.stringify(catalog)) > maxProjectedSubagentProfileDetailsBytes) {
     const largest = projected.reduce<{ profile: (typeof projected)[number]; bytes: number } | undefined>(
       (current, profile) => {
         const bytes = Buffer.byteLength(profile.description)
@@ -222,7 +268,7 @@ function projectProfileCatalog(profiles: readonly ExtensionSubagentProfile[]) {
     )
     if (!largest || largest.bytes === 0)
       throw new Error(`Subagent profile metadata exceeds ${maxSubagentToolResultBytes} bytes`)
-    const excess = Buffer.byteLength(JSON.stringify(catalog)) - maxSubagentToolResultBytes
+    const excess = Buffer.byteLength(JSON.stringify(catalog)) - maxProjectedSubagentProfileDetailsBytes
     const clipped = clipUtf8(largest.profile.description, Math.max(0, largest.bytes - excess))
     largest.profile.description = clipped.text
     omittedBytes += clipped.omittedBytes
@@ -275,6 +321,12 @@ function projectListSnapshot(snapshot: SubagentSnapshot) {
       ? { result_ready: { status: snapshot.completion.status } }
       : {})
   }
+}
+
+function requireSnapshot(supervisor: SubagentSupervisor, name: string): SubagentSnapshot {
+  const snapshot = supervisor.snapshots().find(candidate => candidate.name === name)
+  if (!snapshot) throw new Error(`Unknown subagent: ${name}`)
+  return snapshot
 }
 
 function textResult(text: string, details: SubagentToolDetails) {

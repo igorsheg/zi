@@ -16,7 +16,7 @@ Extensions may register profiles without registering tools. They may also build 
 
 Profiles deliberately do not declare permissions, read-only behavior, worktrees, tool restrictions, budgets, or filesystem isolation because Zi cannot enforce those claims. Omitted model and thinking values inherit the parent selection; an unavailable explicit model fails with profile source attribution.
 
-Zi retains no native delegation system prompt, generated completion message, enablement setting, semantic `subagent_changed` event, composer rail, subagent-specific notification presenter, or specialized terminal status surface. Standard tools use ordinary tool lifecycle and presentation. Completion remains passive until the parent collects it through a tool.
+Zi retains no native delegation system prompt, generated completion message, enablement setting, semantic `subagent_changed` event, composer rail, subagent-specific notification presenter, or separate terminal status surface. Standard tools use ordinary tool lifecycle plus coding-agent-owned semantic projections rendered through the TUI's generic tool primitives. Completion remains passive until the parent collects it through a tool.
 
 ## Consequences
 
