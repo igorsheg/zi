@@ -78,6 +78,36 @@ test("wait holds until every requested subagent has completed", async () => {
   }
 }, 15_000)
 
+test("cancelling wait rejects only the waiter and preserves uncollected results", async () => {
+  const harness = await createHarness("wait-cancel", { reply: "wait-ok", delayMs: 300 })
+  try {
+    const completed = await harness.supervisor.spawn("completed-worker", "finish first")
+    await waitFor(() => harness.supervisor.status().readyNames.includes(completed), 5_000)
+    const running = await harness.supervisor.spawn("running-worker", "keep working")
+    const controller = new AbortController()
+
+    const outcome = harness.supervisor.wait([completed, running], 5_000, controller.signal).then(
+      () => ({ type: "resolved" as const }),
+      (cause: unknown) => ({ type: "rejected" as const, cause })
+    )
+    controller.abort()
+
+    expect(await outcome).toEqual({
+      type: "rejected",
+      cause: expect.objectContaining({ name: "AbortError", message: "Subagent wait was cancelled" })
+    })
+    expect(harness.supervisor.status()).toEqual({ workingNames: [running], readyNames: [completed] })
+
+    const collected = await harness.supervisor.wait([completed, running], 5_000)
+    expect(collected).toEqual([
+      expect.objectContaining({ name: completed, completionDelivery: "durable" }),
+      expect.objectContaining({ name: running, completionDelivery: "durable" })
+    ])
+  } finally {
+    await harness.dispose()
+  }
+}, 15_000)
+
 test("shutdown wins the spawn admission race without appending late ready work", async () => {
   const harness = await createHarness("shutdown-spawn-admission", { delayMs: 300 })
   let shutdown: Promise<void> | undefined

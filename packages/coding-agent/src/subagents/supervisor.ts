@@ -312,18 +312,21 @@ export class SubagentSupervisor {
       validateSubagentName(name)
       this.#requireKnown(name)
     }
+    throwIfWaitCancelled(signal)
     const targetCycles = new Map(names.map(name => [name, this.#currentWorkCycle(name)]))
     const boundedTimeout = Math.min(Math.max(0, timeoutMs), maxWaitTimeoutMs)
     const deadline = Date.now() + boundedTimeout
     this.#pumpMailbox()
+    throwIfWaitCancelled(signal)
     while (
       Date.now() < deadline &&
       !names.every(name => this.#hasDurableCompletion(name, targetCycles.get(name) ?? 0))
     ) {
-      if (signal?.aborted) break
       // oxlint-disable-next-line no-await-in-loop -- one bounded semantic wait owner
       await this.#waitPulse(Math.min(100, deadline - Date.now()), signal)
+      throwIfWaitCancelled(signal)
       this.#pumpMailbox()
+      throwIfWaitCancelled(signal)
     }
     const snapshots = names.map(name => this.#snapshotFor(name))
     for (const name of names) this.#markDelivered(name)
@@ -707,6 +710,13 @@ function deferredVoid(): { readonly promise: Promise<void>; resolve(): void } {
       resolvePromise()
     }
   }
+}
+
+function throwIfWaitCancelled(signal?: AbortSignal): void {
+  if (!signal?.aborted) return
+  const error = new Error("Subagent wait was cancelled")
+  error.name = "AbortError"
+  throw error
 }
 
 function completionKey(name: string, workCycle: number): string {
