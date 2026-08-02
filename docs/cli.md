@@ -61,7 +61,7 @@ Cwd, session selection, system-prompt content, and `--api-key` are intentionally
 
 The RPC request catalog, framing, bounds, and lifecycle are documented in the [RPC protocol](rpc.md).
 
-When protected project `.zi` configuration exists without a stored decision, interactive mode opens a project-trust picker before running positional prompts. Its safe default keeps project configuration disabled. Trust or rejection may apply only to the current session or be saved for the canonical cwd; a saved parent decision is inherited. Applying a choice replaces the whole cwd-bound runtime so settings, prompts, skills, themes, and extensions share the same admission. Text, JSON, and RPC modes never prompt and continue with unresolved project configuration excluded.
+When protected project `.zi` configuration exists without a stored decision, interactive mode opens a project-trust picker before running positional prompts. Its safe default keeps project configuration disabled. Trust or rejection may apply only to the current session or be saved for the canonical cwd; a saved parent decision is inherited. Applying a choice replaces the whole cwd-bound runtime so settings, prompts, skills, subagent profiles, themes, and extensions share the same admission. Text, JSON, and RPC modes never prompt and continue with unresolved project configuration excluded.
 
 ## Sessions
 

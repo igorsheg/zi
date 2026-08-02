@@ -148,7 +148,7 @@ A coding-agent project-trust owner decides whether project configuration is admi
 
 Extension-only trust is forbidden. Zi must not execute project extensions while applying or rejecting other project configuration through a separate decision.
 
-`ZiPaths.trustFile` resolves the bounded global `trust.json`. `ProjectTrustStore` owns canonical cwd persistence, locked atomic updates, and nearest-parent lookup. A bare project `.zi` directory and contextual `AGENTS.md`/`CLAUDE.md` files do not require project trust; exact project settings, system prompts, skills, prompts, themes, and extensions do. Persisted-store failure remains an unresolved safe state that the resolver diagnoses; it never admits project configuration.
+`ZiPaths.trustFile` resolves the bounded global `trust.json`. `ProjectTrustStore` owns canonical cwd persistence, locked atomic updates, and nearest-parent lookup. A bare project `.zi` directory and contextual `AGENTS.md`/`CLAUDE.md` files do not require project trust; exact project settings, system prompts, skills, prompts, subagent profiles, themes, and extensions do. Persisted-store failure remains an unresolved safe state that the resolver diagnoses; it never admits project configuration.
 
 ### 6.3 `ExtensionHost`
 

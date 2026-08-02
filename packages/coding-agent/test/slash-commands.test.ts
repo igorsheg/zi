@@ -14,7 +14,10 @@ test("coding-agent owns descriptors for supported built-in slash commands", () =
       description: "Compact context, optionally preserving a specified focus",
       argumentHint: "[focus]"
     },
-    { name: "reload", description: "Reload settings, extensions, skills, prompts, and context files" },
+    {
+      name: "reload",
+      description: "Reload settings, extensions, skills, prompts, subagent profiles, and context files"
+    },
     { name: "new", description: "Start a new session" },
     { name: "resume", description: "Browse and resume saved sessions" }
   ])

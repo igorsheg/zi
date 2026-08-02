@@ -15,6 +15,23 @@ import {
 } from "../src/components/composer.js"
 import { defaultTheme } from "../src/theme.js"
 
+test("composer cursor does not blink", async () => {
+  const setup = await createTestRenderer({ width: 60, height: 8, useThread: false })
+  const composer = createComposer(setup.renderer, {
+    geometry: composerGeometry(60, 8),
+    slots: { topLeft: "/work", topRight: [] },
+    theme: defaultTheme,
+    onSubmit() {}
+  })
+
+  try {
+    expect(composer.input.cursorStyle).toEqual({ style: "block", blinking: false })
+  } finally {
+    composer.destroy()
+    if (!setup.renderer.isDestroyed) setup.renderer.destroy()
+  }
+})
+
 test("composer range replacement is one undo point and preserves prior native history", async () => {
   const setup = await createTestRenderer({ width: 60, height: 8, useThread: false })
   const composer = createComposer(setup.renderer, {

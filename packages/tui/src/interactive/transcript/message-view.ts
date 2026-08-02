@@ -13,6 +13,7 @@ import {
   type RenderContext
 } from "@opentui/core"
 import { projectToolPresentation, type AgentMessage } from "@with-zi/coding-agent"
+import stringWidth from "string-width"
 
 import type { Theme } from "../../theme.js"
 import type { ActiveTool } from "../interactive-store.js"
@@ -57,6 +58,7 @@ export interface ToolCallPresentation {
 }
 
 type ItemMessage = Exclude<AgentMessage, { readonly role: "assistant" }>
+type CompactionSummaryMessage = Extract<ItemMessage, { readonly role: "compactionSummary" }>
 
 export function createMessageItemView(
   ctx: RenderContext,
@@ -75,14 +77,7 @@ export function createMessageItemView(
         ? ownItem(ctx, createPanelMessage(ctx, customPanelContent(message), options.theme.text.custom, options.theme))
         : undefined
     case "compactionSummary":
-      return new ExpandableSummaryView(ctx, {
-        label: "compaction",
-        collapsed: expandHint => compactionCollapsedText(message.tokensBefore, expandHint, options.theme),
-        expandedMarkdown: `**Compacted from ${formatTokenCount(message.tokensBefore)} tokens**\n\n${message.summary}`,
-        theme: options.theme,
-        syntaxStyle: options.syntaxStyle,
-        ...(options.expandHint === undefined ? {} : { expandHint: options.expandHint })
-      })
+      return new CompactionSummaryView(ctx, message, options.theme, options.syntaxStyle, options.expandHint)
     case "branchSummary":
       return new ExpandableSummaryView(ctx, {
         label: "branch",
@@ -546,6 +541,144 @@ function createBashExecutionView(
   )
 }
 
+class CompactionSummaryView implements TranscriptItemView {
+  readonly root: BoxRenderable
+
+  readonly #ctx: RenderContext
+  readonly #message: CompactionSummaryMessage
+  readonly #theme: Theme
+  readonly #syntaxStyle: SyntaxStyle
+  readonly #expandHint: string | undefined
+  readonly #divider: TextRenderable
+  #dividerText = ""
+  #body: Renderable | undefined
+  #expanded = false
+
+  constructor(
+    ctx: RenderContext,
+    message: CompactionSummaryMessage,
+    theme: Theme,
+    syntaxStyle: SyntaxStyle,
+    expandHint: string | undefined
+  ) {
+    this.#ctx = ctx
+    this.#message = message
+    this.#theme = theme
+    this.#syntaxStyle = syntaxStyle
+    this.#expandHint = expandHint
+    this.root = new BoxRenderable(ctx, {
+      width: "100%",
+      paddingTop: 1,
+      paddingBottom: 1,
+      marginTop: 0,
+      marginBottom: 1,
+      flexDirection: "column",
+      flexShrink: 0
+    })
+    this.#divider = new TextRenderable(ctx, {
+      width: "100%",
+      height: 1,
+      fg: theme.text.custom,
+      content: "",
+      wrapMode: "none",
+      flexShrink: 0
+    })
+    this.root.add(this.#divider)
+    this.#syncDivider()
+    this.root.onSizeChange = this.#syncDivider
+  }
+
+  setExpanded(expanded: boolean): boolean {
+    if (expanded === this.#expanded) return false
+    this.#expanded = expanded
+    this.#renderBody()
+    return true
+  }
+
+  destroy(): void {
+    if (this.#ctx.hasSelection) this.#ctx.clearSelection()
+    this.root.onSizeChange = undefined
+    this.root.destroyRecursively()
+  }
+
+  readonly #syncDivider = (): void => {
+    const width = this.root.width || this.#ctx.width
+    const presentation = compactionDividerPresentation(
+      this.#message.tokensBefore,
+      this.#message.estimatedTokensAfter,
+      this.#expanded ? undefined : this.#expandHint,
+      width
+    )
+    const text = presentation.text + "─".repeat(Math.max(0, width - stringWidth(presentation.text)))
+    if (text === this.#dividerText) return
+    this.#dividerText = text
+    const labelStart = text.indexOf(presentation.label)
+    this.#divider.content = new StyledText([
+      fg(this.#theme.text.custom)(text.slice(0, labelStart)),
+      { ...fg(this.#theme.text.custom)(presentation.label), attributes: TextAttributes.BOLD },
+      fg(this.#theme.text.custom)(text.slice(labelStart + presentation.label.length))
+    ])
+  }
+
+  #renderBody(): void {
+    if (this.#ctx.hasSelection) this.#ctx.clearSelection()
+    if (this.#body) {
+      this.root.remove(this.#body)
+      this.#body.destroyRecursively()
+      this.#body = undefined
+    }
+    this.#syncDivider()
+    if (!this.#expanded) return
+    this.#body = createMarkdown(
+      this.#ctx,
+      this.#message.summary,
+      this.#theme,
+      this.#syntaxStyle,
+      markdownStreamingWorkaround,
+      this.#theme.text.custom,
+      "transparent"
+    )
+    this.#body.marginTop = 1
+    this.root.add(this.#body)
+  }
+}
+
+interface CompactionDividerPresentation {
+  readonly label: string
+  readonly text: string
+}
+
+function compactionDividerPresentation(
+  tokensBefore: number,
+  estimatedTokensAfter: number,
+  expandHint: string | undefined,
+  width: number
+): CompactionDividerPresentation {
+  const metrics = `${formatCompactTokenCount(tokensBefore)} → ~${formatCompactTokenCount(estimatedTokensAfter)}`
+  const fullLabel = "Conversation compacted"
+  const shortLabel = "Compacted"
+  const candidates: CompactionDividerPresentation[] = expandHint
+    ? [
+        { label: fullLabel, text: `─────── ${fullLabel} • ${metrics} tokens • ${expandHint} to expand ` },
+        { label: fullLabel, text: `─────── ${fullLabel} • ${metrics} • ${expandHint} expand ` },
+        { label: shortLabel, text: `─────── ${shortLabel} • ${metrics} • ${expandHint} ` },
+        { label: shortLabel, text: `── ${shortLabel} • ${expandHint} ` }
+      ]
+    : [
+        { label: fullLabel, text: `─────── ${fullLabel} • ${metrics} tokens ` },
+        { label: fullLabel, text: `─────── ${fullLabel} • ${metrics} ` },
+        { label: shortLabel, text: `─────── ${shortLabel} • ${metrics} ` },
+        { label: shortLabel, text: `── ${shortLabel} ` }
+      ]
+  return candidates.find(candidate => stringWidth(candidate.text) <= width) ?? { label: shortLabel, text: shortLabel }
+}
+
+function formatCompactTokenCount(tokens: number): string {
+  if (tokens < 1_000) return String(tokens)
+  if (tokens < 1_000_000) return `${Math.round(tokens / 1_000)}k`
+  return `${(tokens / 1_000_000).toFixed(1).replace(/\.0$/, "")}m`
+}
+
 interface ExpandableSummaryOptions {
   readonly label: string
   readonly collapsed: (expandHint: string | undefined) => StyledText
@@ -630,16 +763,6 @@ class ExpandableSummaryView implements TranscriptItemView {
   }
 }
 
-function compactionCollapsedText(tokensBefore: number, expandHint: string | undefined, theme: Theme): StyledText {
-  const tokens = formatTokenCount(tokensBefore)
-  if (!expandHint) return new StyledText([fg(theme.text.custom)(`Compacted from ${tokens} tokens`)])
-  return new StyledText([
-    fg(theme.text.custom)(`Compacted from ${tokens} tokens (`),
-    fg(theme.text.dim)(expandHint),
-    fg(theme.text.custom)(" to expand)")
-  ])
-}
-
 function branchCollapsedText(expandHint: string | undefined, theme: Theme): StyledText {
   if (!expandHint) return new StyledText([fg(theme.text.custom)("Branch summary")])
   return new StyledText([
@@ -647,10 +770,6 @@ function branchCollapsedText(expandHint: string | undefined, theme: Theme): Styl
     fg(theme.text.dim)(expandHint),
     fg(theme.text.custom)(" to expand)")
   ])
-}
-
-function formatTokenCount(tokens: number): string {
-  return tokens.toLocaleString("en-US")
 }
 
 function toolFrame(tool: ActiveTool): ToolViewFrame {

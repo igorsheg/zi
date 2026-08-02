@@ -143,6 +143,7 @@ export function createComposer(ctx: RenderContext, options: ComposerOptions): Co
     textColor: options.theme.text.primary,
     focusedTextColor: options.theme.text.primary,
     cursorColor: options.theme.text.primary,
+    cursorStyle: { style: "block", blinking: false },
     backgroundColor: options.theme.surface.composer,
     focusedBackgroundColor: options.theme.surface.composer,
     ...(options.onPaste ? { onPaste: options.onPaste } : {}),

@@ -1,6 +1,13 @@
 import { expect, spyOn, test } from "bun:test"
 
-import { CliRenderEvents, MarkdownRenderable, type Renderable, TextRenderable } from "@opentui/core"
+import {
+  BoxRenderable,
+  CliRenderEvents,
+  MarkdownRenderable,
+  type Renderable,
+  TextAttributes,
+  TextRenderable
+} from "@opentui/core"
 import { createTestRenderer, type TestRendererSetup } from "@opentui/core/testing"
 import type { AgentMessage } from "@with-zi/coding-agent"
 import { fauxAssistantMessage, fauxText, fauxThinking, fauxToolCall } from "@with-zi/coding-agent/testing"
@@ -53,6 +60,66 @@ test("Zi summary messages require post-compaction accounting", () => {
   expect(invalid.role).toBe("compactionSummary")
 })
 
+test("compaction summaries render as full-width custom-color dividers without panel chrome", async () => {
+  const setup = await createTestRenderer({ width: 80, height: 8, useThread: false })
+  const syntaxStyle = createSyntaxStyle(defaultTheme)
+  const item = createMessageItemView(
+    setup.renderer,
+    {
+      role: "compactionSummary",
+      summary: "Checkpoint summary.",
+      tokensBefore: 223_000,
+      estimatedTokensAfter: 21_000,
+      timestamp: 1
+    },
+    { theme: defaultTheme, syntaxStyle, expandHint: "Ctrl+O" }
+  )
+  if (!item) throw new Error("Compaction summary item not created")
+  setup.renderer.root.add(item.root)
+
+  try {
+    await setup.renderOnce()
+    const prefix = "─────── Conversation compacted • 223k → ~21k tokens • Ctrl+O to expand "
+    const divider = setup
+      .captureCharFrame()
+      .split("\n")
+      .find(row => row.includes("Conversation compacted"))
+    expect(divider).toBe(prefix + "─".repeat(80 - prefix.length))
+
+    const dividerSpans = setup
+      .captureSpans()
+      .lines.find(line => line.spans.some(span => span.text === "Conversation compacted"))?.spans
+    if (!dividerSpans) throw new Error("Compaction divider spans not found")
+    for (const dividerSpan of dividerSpans.filter(candidate => candidate.text.trim())) {
+      expect(dividerSpan.fg.toInts()).toEqual([147, 138, 169, 255])
+    }
+    expect(dividerSpans.find(span => span.text === "Conversation compacted")?.attributes).toBe(TextAttributes.BOLD)
+
+    if (!(item.root instanceof BoxRenderable)) throw new Error("Compaction summary root is not a box")
+    expect(item.root.backgroundColor.toInts()[3]).toBe(0)
+    for (const text of descendantsOfType(item.root, TextRenderable)) expect(text.bg.toInts()[3]).toBe(0)
+
+    setup.resize(48, 8)
+    await setup.renderOnce()
+    const narrowPrefix = "─────── Compacted • 223k → ~21k • Ctrl+O "
+    const narrowDivider = setup
+      .captureCharFrame()
+      .split("\n")
+      .find(row => row.includes("Compacted"))
+    expect(narrowDivider).toBe(narrowPrefix + "─".repeat(48 - narrowPrefix.length))
+
+    expect(item.setExpanded?.(true)).toBe(true)
+    await renderMarkdownSettled(setup)
+    const expandedBackground = descendant(item.root, MarkdownRenderable).bg
+    if (!expandedBackground) throw new Error("Expanded compaction background not found")
+    expect(expandedBackground.toInts()[3]).toBe(0)
+  } finally {
+    item.destroy()
+    syntaxStyle.destroy()
+    setup.renderer.destroy()
+  }
+})
+
 test("authoritative message-array replacement rebuilds an equal-length transcript", async () => {
   const harness = await createTranscriptHarness([{ role: "user", content: "old transcript", timestamp: 1 }])
   try {
@@ -72,8 +139,8 @@ test("authoritative message-array replacement rebuilds an equal-length transcrip
 
     expect(harness.view.scroll.getChildren()[0]).not.toBe(oldRoot)
     const collapsed = harness.setup.captureCharFrame()
-    expect(collapsed).toContain("[compaction]")
-    expect(collapsed).toContain("Compacted from 100 tokens")
+    expect(collapsed).toContain("Conversation compacted • 100 → ~20 • Ctrl+O expand")
+    expect(collapsed).not.toContain("[compaction]")
     expect(collapsed).not.toContain("checkpoint summary")
     expect(harness.view.scroll.stickyScroll).toBe(true)
   } finally {
@@ -94,22 +161,21 @@ test("compaction summaries stay collapsed until tools expand, then reveal the ch
   try {
     await harness.setup.flush()
     const collapsed = harness.setup.captureCharFrame()
-    expect(collapsed).toContain("[compaction]")
-    expect(collapsed).toContain("Compacted from 12,345 tokens (Ctrl+O to expand)")
+    expect(collapsed).toContain("Conversation compacted • 12k → ~2k • Ctrl+O expand")
+    expect(collapsed).not.toContain("[compaction]")
     expect(collapsed).not.toContain("Recovered auth flow")
 
     harness.setup.mockInput.pressKey("o", { ctrl: true })
     await harness.setup.flush()
     const expanded = harness.setup.captureCharFrame()
-    expect(expanded).toContain("[compaction]")
-    expect(expanded).toContain("Compacted from 12,345 tokens")
+    expect(expanded).toContain("Conversation compacted • 12k → ~2k tokens")
     expect(expanded).toContain("Recovered auth flow and kept recent tool results.")
-    expect(expanded).not.toContain("to expand")
+    expect(expanded).not.toContain("Ctrl+O")
 
     harness.setup.mockInput.pressKey("o", { ctrl: true })
     await harness.setup.flush()
     const recoollapsed = harness.setup.captureCharFrame()
-    expect(recoollapsed).toContain("Ctrl+O to expand")
+    expect(recoollapsed).toContain("Ctrl+O expand")
     expect(recoollapsed).not.toContain("Recovered auth flow")
   } finally {
     harness.destroy()
@@ -131,15 +197,16 @@ test("post-compaction presentation keeps the marker at the transcript tail", asy
     await harness.setup.flush()
     const frame = harness.setup.captureCharFrame()
     expect(frame).toContain("old work that stays in the exact tail")
-    expect(frame).toContain("[compaction]")
-    expect(frame).toContain("Compacted from 89,000 tokens")
-    expect(frame.indexOf("[compaction]")).toBeGreaterThan(frame.indexOf("old work that stays in the exact tail"))
+    expect(frame).toContain("Conversation compacted • 89k → ~21k • Ctrl+O expand")
+    expect(frame.indexOf("Conversation compacted")).toBeGreaterThan(
+      frame.indexOf("old work that stays in the exact tail")
+    )
   } finally {
     harness.destroy()
   }
 })
 
-test("branch summaries use the same expandable labelled chrome as compaction", async () => {
+test("branch summaries keep their expandable panel chrome", async () => {
   const setup = await createTestRenderer({ width: 56, height: 10, useThread: false })
   const syntaxStyle = createSyntaxStyle(defaultTheme)
   const item = createMessageItemView(
