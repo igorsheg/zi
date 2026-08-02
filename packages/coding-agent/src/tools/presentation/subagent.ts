@@ -60,7 +60,7 @@ export function projectSubagent(source: ToolPresentationSource): ToolPresentatio
     case "continue": {
       const agent = singleAgent(details)
       return detailOnlyPresentation({
-        label: source.status === "done" ? "Continued" : "Continue",
+        label: source.status === "done" ? "Assigned follow-up" : "Assign follow-up",
         subject: agentSubject(agent, stringValue(args?.name)),
         details: agent?.workCycle === undefined ? [] : [`cycle ${agent.workCycle}`],
         body: stringValue(args?.text),
@@ -155,7 +155,7 @@ function waitPresentation(
       ? agentSubject(agents[0])
       : requestedNames.length === 1
         ? agentSubject(undefined, requestedNames[0])
-        : { type: "text" as const, text: `${count || "…"} agents` }
+        : { type: "text" as const, text: count === 0 && details ? "No agents" : `${count || "…"} agents` }
   const summaries = agents.map(waitSummaryLine)
   const evidence = agents.flatMap(waitEvidenceSections)
   const body =
@@ -406,7 +406,7 @@ function failedLabel(operation: SubagentToolDetails["operation"]): string {
     case "send":
       return "Message"
     case "continue":
-      return "Continue"
+      return "Assign follow-up"
     case "wait":
       return "Wait for"
     case "interrupt":

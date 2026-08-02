@@ -146,6 +146,25 @@ test("expanded wait presentation retains full bounded multiline completion evide
   expect(presentation.body?.text).toContain("Final evidence: terminal restoration precedes settlement.")
 })
 
+test("targetless wait reports an empty collection without a placeholder count", () => {
+  const presentation = projectToolPresentation({
+    status: "done",
+    name: "wait_subagents",
+    args: {},
+    result: {
+      content: [{ type: "text", text: '{"subagents":[],"all_completed":true,"omitted_bytes":0}' }],
+      details: { type: "subagent", outcome: "success", operation: "wait", agents: [] }
+    }
+  })
+
+  expect(presentation.header).toEqual({
+    label: "Finished waiting",
+    subject: { type: "text", text: "No agents" },
+    details: []
+  })
+  expect(presentation.body).toBeUndefined()
+})
+
 test("wait does not present an earlier cycle as completion of current work", () => {
   const presentation = projectToolPresentation({
     status: "done",
@@ -168,7 +187,7 @@ test("wait does not present an earlier cycle as completion of current work", () 
 test("administrative subagent successes remain header-only in compact mode", () => {
   const cases = [
     ["send_subagent", "send", "Messaged"],
-    ["continue_subagent", "continue", "Continued"],
+    ["continue_subagent", "continue", "Assigned follow-up"],
     ["interrupt_subagent", "interrupt", "Interrupted"],
     ["close_subagent", "close", "Closed"]
   ] as const

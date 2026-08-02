@@ -89,6 +89,12 @@ A non-empty catalog activates:
 
 `spawn_subagent` selects a profile and supplies a separate unique runtime name. The selected profile's instructions are prepended to the task, and its model and thinking selection are applied before the session-owned supervisor admits the child.
 
+`send_subagent` queues information without starting an idle turn. `continue_subagent` assigns follow-up work: it starts an idle turn or extends the current turn. Their successful model-facing results are concise text; typed semantic details remain authoritative for client presentation.
+
+`wait_subagents` accepts 1–16 explicit runtime names. Omitting `names` collects up to 16 children that are working or have an uncollected result when the call begins. The extension API retains explicit-name waits so custom orchestration controls its collection set.
+
+This message/follow-up distinction and targetless standard wait are adapted from Codex MultiAgentV2's `send_message`, `followup_task`, and mailbox wait. Zi deliberately keeps completion collection explicit instead of injecting child completion into parent context.
+
 A session with no admitted profiles exposes none of these tools. Depth-one child sessions cannot recursively create subagents.
 
 ## Optional custom orchestration

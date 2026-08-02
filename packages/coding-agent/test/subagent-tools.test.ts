@@ -77,6 +77,7 @@ test("standard subagent tools exist only for an admitted profile catalog", async
       undefined
     )
     expect(isSubagentToolDetails(sent.details)).toBe(true)
+    expect(resultText(sent)).toBe("Queued message for finder-1.")
 
     const continued = await requireTool(tools, "continue_subagent").execute(
       "continue",
@@ -84,7 +85,12 @@ test("standard subagent tools exist only for an admitted profile catalog", async
       undefined
     )
     expect(isSubagentToolDetails(continued.details)).toBe(true)
-    await wait.execute("wait-again", { names: ["finder-1"], timeout_ms: 5_000 }, undefined)
+    expect(resultText(continued)).toBe("Started follow-up for finder-1.")
+    await waitFor(() => harness.supervisor.status().readyNames.includes("finder-1"), 5_000)
+    const waitedAgain = await wait.execute("wait-again", { timeout_ms: 5_000 }, undefined)
+    expect(JSON.parse(resultText(waitedAgain)).subagents).toEqual([
+      expect.objectContaining({ name: "finder-1", completion: expect.objectContaining({ status: "completed" }) })
+    ])
 
     const interrupted = await requireTool(tools, "interrupt_subagent").execute(
       "interrupt",
@@ -175,6 +181,16 @@ function requireTool(tools: readonly AgentTool[], name: string): AgentTool {
   const tool = tools.find(candidate => candidate.name === name)
   if (!tool) throw new Error(`Expected ${name}`)
   return tool
+}
+
+async function waitFor(predicate: () => boolean, timeoutMs: number): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (predicate()) return
+    // oxlint-disable-next-line no-await-in-loop -- bounded test poll
+    await Bun.sleep(10)
+  }
+  throw new Error("condition not met before deadline")
 }
 
 function resultText(result: {

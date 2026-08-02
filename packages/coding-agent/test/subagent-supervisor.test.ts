@@ -78,6 +78,56 @@ test("wait holds until every requested subagent has completed", async () => {
   }
 }, 15_000)
 
+test("shutdown wins the spawn admission race without appending late ready work", async () => {
+  const harness = await createHarness("shutdown-spawn-admission", { delayMs: 300 })
+  let shutdown: Promise<void> | undefined
+  const unsubscribe = harness.supervisor.subscribe(event => {
+    if (
+      event.type === "changed" &&
+      harness.supervisor.snapshots().some(snapshot => snapshot.name === "racing-child" && snapshot.lifecycle === "idle")
+    ) {
+      shutdown = harness.supervisor.shutdown()
+    }
+  })
+
+  try {
+    expect(harness.supervisor.spawn("racing-child", "race shutdown")).rejects.toThrow("Subagent supervisor is stopping")
+    await shutdown
+    expect(harness.supervisor.state).toEqual({ type: "closed" })
+    expect(harness.sessionManager.subagentEntries().map(entry => entry.event)).not.toContain("ready")
+    expect(harness.sessionManager.subagentEntries().map(entry => entry.event)).not.toContain("work_cycle_started")
+  } finally {
+    unsubscribe()
+    await harness.dispose()
+  }
+}, 15_000)
+
+test("shutdown before spawn ownership transfer rejects the admitted child", async () => {
+  const harness = await createHarness("shutdown-spawn-transfer", { delayMs: 300 })
+  let shutdown: Promise<void> | undefined
+  const unsubscribe = harness.supervisor.subscribe(event => {
+    if (
+      event.type === "changed" &&
+      harness.supervisor
+        .snapshots()
+        .some(snapshot => snapshot.name === "racing-child" && snapshot.lifecycle === "running")
+    ) {
+      shutdown = harness.supervisor.shutdown()
+    }
+  })
+
+  try {
+    expect(harness.supervisor.spawn("racing-child", "race shutdown")).rejects.toThrow("Subagent supervisor is stopping")
+    await shutdown
+    expect(harness.supervisor.state).toEqual({ type: "closed" })
+    expect(harness.supervisor.capacity()).toEqual({ live: 0, maximum: 4 })
+    expect(harness.supervisor.snapshots()[0]).toMatchObject({ name: "racing-child", lifecycle: "exited" })
+  } finally {
+    unsubscribe()
+    await harness.dispose()
+  }
+}, 15_000)
+
 test("spawn cancellation before admission closes the starting child", async () => {
   const harness = await createHarness("startup-cancel", { delayMs: 300 })
   try {

@@ -21,11 +21,30 @@ const subagentName = Type.String({
 })
 const messageParameters = Type.Object({
   name: subagentName,
-  text: Type.String({ minLength: 1, maxLength: maxSubagentPromptBytes })
+  text: Type.String({
+    minLength: 1,
+    maxLength: maxSubagentPromptBytes,
+    description: "Information to queue without starting an idle subagent turn."
+  })
+})
+const followupParameters = Type.Object({
+  name: subagentName,
+  text: Type.String({
+    minLength: 1,
+    maxLength: maxSubagentPromptBytes,
+    description: "Follow-up task that starts an idle turn or extends the current turn."
+  })
 })
 const nameParameters = Type.Object({ name: subagentName })
 const waitParameters = Type.Object({
-  names: Type.Array(subagentName, { minItems: 1, maxItems: maxWaitNames, uniqueItems: true }),
+  names: Type.Optional(
+    Type.Array(subagentName, {
+      minItems: 1,
+      maxItems: maxWaitNames,
+      uniqueItems: true,
+      description: `Subagents to wait for. Omit to collect up to ${maxWaitNames} currently working or ready subagents.`
+    })
+  ),
   timeout_ms: Type.Optional(
     Type.Number({
       minimum: 0,
@@ -106,7 +125,7 @@ export function createSubagentTools(
     executionMode: "parallel",
     async execute(_id, input) {
       await supervisor.send(input.name, input.text)
-      return textResult(JSON.stringify({ name: input.name, accepted: true, started_turn: false }), {
+      return textResult(`Queued message for ${input.name}.`, {
         type: "subagent",
         outcome: "success",
         operation: "send",
@@ -114,17 +133,19 @@ export function createSubagentTools(
       })
     }
   }
-  const continueTool: AgentTool<typeof messageParameters, SubagentToolDetails> = {
+  const continueTool: AgentTool<typeof followupParameters, SubagentToolDetails> = {
     name: "continue_subagent",
     label: "continue_subagent",
     description:
       "Assign follow-up work to a subagent. Starts a turn when it is idle; otherwise delivers the task to its current turn.",
-    parameters: messageParameters,
+    parameters: followupParameters,
     executionMode: "parallel",
     async execute(_id, input) {
       const delivery = await supervisor.continue(input.name, input.text)
       return textResult(
-        JSON.stringify({ name: input.name, accepted: true, started_turn: delivery === "started_turn" }),
+        delivery === "started_turn"
+          ? `Started follow-up for ${input.name}.`
+          : `Delivered follow-up to ${input.name}'s current turn.`,
         {
           type: "subagent",
           outcome: "success",
@@ -137,12 +158,13 @@ export function createSubagentTools(
   const wait: AgentTool<typeof waitParameters, SubagentToolDetails> = {
     name: "wait_subagents",
     label: "wait_subagents",
-    description:
-      "Wait for all requested current subagent tasks. Returns each completion, or current status on timeout, without cancelling subagents.",
+    description: `Wait for requested subagent tasks, or omit names to collect up to ${maxWaitNames} currently working or ready subagents. Returns completions or current status without cancelling subagents.`,
     parameters: waitParameters,
     executionMode: "parallel",
     async execute(_id, input, signal) {
-      const snapshots = await supervisor.wait(input.names, input.timeout_ms ?? supervisor.waitTimeoutMs, signal)
+      const names = input.names ?? collectableNames(supervisor.status())
+      const snapshots =
+        names.length === 0 ? [] : await supervisor.wait(names, input.timeout_ms ?? supervisor.waitTimeoutMs, signal)
       return textResult(JSON.stringify(projectWaitResult(snapshots)), {
         type: "subagent",
         outcome: "success",
@@ -321,6 +343,10 @@ function projectListSnapshot(snapshot: SubagentSnapshot) {
       ? { result_ready: { status: snapshot.completion.status } }
       : {})
   }
+}
+
+function collectableNames(status: ReturnType<SubagentSupervisor["status"]>): readonly string[] {
+  return Object.freeze([...new Set([...status.workingNames, ...status.readyNames])].slice(0, maxWaitNames))
 }
 
 function requireSnapshot(supervisor: SubagentSupervisor, name: string): SubagentSnapshot {

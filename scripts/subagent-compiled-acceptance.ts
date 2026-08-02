@@ -356,9 +356,7 @@ class SubagentProvider {
       )
     }
     if (!outputs.has("acceptance_wait_second")) {
-      return eventStreamResponse(
-        toolEvents("wait_subagents", "acceptance_wait_second", { names: [name], timeout_ms: 25_000 })
-      )
+      return eventStreamResponse(toolEvents("wait_subagents", "acceptance_wait_second", { timeout_ms: 25_000 }))
     }
     assertWaitCompletion(outputs.get("acceptance_wait_second")!, {
       status: "completed",

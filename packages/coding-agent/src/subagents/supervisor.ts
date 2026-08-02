@@ -228,15 +228,25 @@ export class SubagentSupervisor {
     signal?.addEventListener("abort", abort, { once: true })
     try {
       await child.start()
+      this.#assertSpawnAdmission(name, record, signal)
       const sessionId = child.snapshot().sessionId
       this.#append({ event: "ready", name, ...(sessionId ? { sessionId } : {}) })
       this.#append({ event: "work_cycle_started", name, workCycle: 1 })
       await child.spawnAdmit(prompt)
+      this.#assertSpawnAdmission(name, record, signal)
       signal?.removeEventListener("abort", abort)
       return name
     } catch (cause) {
       signal?.removeEventListener("abort", abort)
-      await this.close(name, "startup_failed").catch(() => {})
+      if (
+        this.#state.type === "open" &&
+        !signal?.aborted &&
+        this.#live.get(name) === record &&
+        record.child.state.type !== "closing" &&
+        record.child.state.type !== "exited"
+      ) {
+        await this.close(name, "startup_failed").catch(() => {})
+      }
       if (!this.#mailbox.has(reservationKey)) this.#completionReservations.delete(reservationKey)
       throw cause
     }
@@ -568,6 +578,18 @@ export class SubagentSupervisor {
     const entry = this.#sessionManager.appendSubagent(data)
     this.#emit({ type: "entry_appended", entry })
     return entry
+  }
+
+  #assertSpawnAdmission(name: string, record: LiveRecord, signal?: AbortSignal): void {
+    this.#assertOpen()
+    if (
+      signal?.aborted ||
+      this.#live.get(name) !== record ||
+      record.child.state.type === "closing" ||
+      record.child.state.type === "exited"
+    ) {
+      throw new Error(`Subagent ${name} spawn admission was cancelled`)
+    }
   }
 
   #requireLive(name: string): LiveRecord {
