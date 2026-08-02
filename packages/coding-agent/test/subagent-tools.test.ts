@@ -19,6 +19,28 @@ const pathfinderProfile = Object.freeze({
   instructions: "Return concrete paths."
 })
 
+test("spawn profile schema exposes bounded purpose summaries without requiring catalog listing", async () => {
+  const harness = await createHarness("profile-schema", "unused")
+  try {
+    const profiles = Array.from({ length: 64 }, (_, index) => ({
+      name: `p${index.toString(36).padStart(2, "0")}${"x".repeat(60)}`,
+      description: `Purpose ${index} ${"detail ".repeat(800)}`,
+      instructions: `Handle profile ${index}.`
+    }))
+    const spawn = requireTool(createSubagentTools(profiles, harness.supervisor, harness.spawn), "spawn_subagent")
+    const properties = requireRecord(Reflect.get(spawn.parameters, "properties"), "spawn properties")
+    const profile = requireRecord(properties.profile, "profile parameter")
+    const description = requireString(profile.description, "profile description")
+
+    expect(profile.enum).toEqual(profiles.map(candidate => candidate.name))
+    expect(Buffer.byteLength(description)).toBeLessThanOrEqual(8 * 1024)
+    expect(description).toContain(`${profiles[0]?.name}: Purpose 0`)
+    expect(description).toContain(`${profiles[63]?.name}: Purpose 63`)
+  } finally {
+    await harness.dispose()
+  }
+})
+
 test("standard subagent tools exist only for an admitted profile catalog", async () => {
   const harness = await createHarness("catalog", "found")
   try {
@@ -45,7 +67,7 @@ test("standard subagent tools exist only for an admitted profile catalog", async
       throw new Error("Expected profile parameter")
     }
     expect(Reflect.get(profileParameter, "enum")).toEqual(["pathfinder"])
-    expect(Reflect.get(profileParameter, "description")).toContain("pathfinder")
+    expect(Reflect.get(profileParameter, "description")).toContain("pathfinder: Find implementation evidence")
 
     const spawned = await spawn.execute(
       "spawn",
@@ -175,6 +197,20 @@ async function createHarness(name: string, reply: string) {
       await rm(root, { recursive: true, force: true })
     }
   }
+}
+
+function requireRecord(value: unknown, label: string): Record<string, unknown> {
+  if (!isRecord(value)) throw new Error(`Expected ${label}`)
+  return value
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+}
+
+function requireString(value: unknown, label: string): string {
+  if (typeof value !== "string") throw new Error(`Expected ${label}`)
+  return value
 }
 
 function requireTool(tools: readonly AgentTool[], name: string): AgentTool {

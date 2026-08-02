@@ -56,6 +56,8 @@ const waitParameters = Type.Object({
 const emptyParameters = Type.Object({})
 
 export const maxSubagentToolResultBytes = 64 * 1024
+const maxSpawnProfileCatalogDescriptionBytes = 8 * 1024
+const maxSpawnProfilePurposeBytes = 256
 
 type SpawnProfile = (profile: string, name: string, prompt: string, signal?: AbortSignal) => Promise<string>
 
@@ -68,10 +70,7 @@ export function createSubagentTools(
 
   const profileNames = profiles.map(profile => profile.name)
   const spawnParameters = Type.Object({
-    profile: Type.String({
-      enum: profileNames,
-      description: `Admitted profile name. Available profiles: ${profileNames.join(", ")}`
-    }),
+    profile: Type.String({ enum: profileNames, description: spawnProfileDescription(profiles) }),
     name: subagentName,
     prompt: Type.String({
       minLength: 1,
@@ -82,7 +81,8 @@ export function createSubagentTools(
   const listProfiles: AgentTool<typeof emptyParameters, SubagentToolDetails> = {
     name: "list_subagent_profiles",
     label: "list_subagent_profiles",
-    description: "List the admitted subagent profiles and their purposes before selecting one for spawn_subagent.",
+    description:
+      "Inspect the full admitted subagent profile catalog when the bounded spawn_subagent summaries are insufficient.",
     parameters: emptyParameters,
     executionMode: "parallel",
     execute() {
@@ -343,6 +343,26 @@ function projectListSnapshot(snapshot: SubagentSnapshot) {
       ? { result_ready: { status: snapshot.completion.status } }
       : {})
   }
+}
+
+function spawnProfileDescription(profiles: readonly ExtensionSubagentProfile[]): string {
+  const heading = "Admitted profile. Choose by purpose:\n"
+  const structuralBytes =
+    Buffer.byteLength(heading) +
+    profiles.reduce((total, profile) => total + Buffer.byteLength(profile.name) + Buffer.byteLength(": \n"), 0)
+  const purposeBytes = Math.min(
+    maxSpawnProfilePurposeBytes,
+    Math.max(0, Math.floor((maxSpawnProfileCatalogDescriptionBytes - structuralBytes) / profiles.length))
+  )
+  const lines = profiles.map(profile => {
+    if (purposeBytes === 0) return profile.name
+    const purpose = profile.description.replace(/\s+/g, " ").trim()
+    const clipped = clipUtf8(purpose, purposeBytes)
+    if (clipped.omittedBytes === 0) return `${profile.name}: ${clipped.text}`
+    if (purposeBytes < 3) return `${profile.name}: ${clipped.text}`
+    return `${profile.name}: ${clipUtf8(purpose, purposeBytes - 3).text}…`
+  })
+  return `${heading}${lines.join("\n")}`
 }
 
 function collectableNames(status: ReturnType<SubagentSupervisor["status"]>): readonly string[] {

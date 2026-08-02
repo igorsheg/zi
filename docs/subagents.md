@@ -87,7 +87,7 @@ A non-empty catalog activates:
 - `interrupt_subagent`;
 - `close_subagent`.
 
-`spawn_subagent` selects a profile and supplies a separate unique runtime name. The selected profile's instructions are prepended to the task, and its model and thinking selection are applied before the session-owned supervisor admits the child.
+`spawn_subagent` selects a profile and supplies a separate unique runtime name. Its profile parameter includes bounded purpose summaries for the admitted catalog, so normal selection does not require a preliminary tool call. `list_subagent_profiles` remains available when the full structured catalog is useful. The selected profile's instructions are prepended to the task, and its model and thinking selection are applied before the session-owned supervisor admits the child.
 
 `send_subagent` queues information without starting an idle turn. `continue_subagent` assigns follow-up work: it starts an idle turn or extends the current turn. Their successful model-facing results are concise text; typed semantic details remain authoritative for client presentation.
 
