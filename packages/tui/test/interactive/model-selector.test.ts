@@ -271,7 +271,7 @@ test("cancelled model selection rejects stale completion", async () => {
     selection.reject(new Error("stale selection failed"))
     await settle()
 
-    expect(prompt.$state.get()).toMatchObject({ feedback: { type: "none" }, workflow: { type: "idle" } })
+    expect(prompt.$state.get()).toMatchObject({ workflow: { type: "idle" } })
   } finally {
     prompt.dispose()
     interactive.dispose()

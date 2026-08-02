@@ -11,12 +11,6 @@ import type {
   ThinkingLevel
 } from "@with-zi/coding-agent"
 
-export type PromptFeedback =
-  | { readonly type: "none" }
-  | { readonly type: "status"; readonly message: string }
-  | { readonly type: "warning"; readonly message: string }
-  | { readonly type: "error"; readonly message: string }
-
 /** Sticky OAuth/API-key ceremony retained above the composer while login runs. */
 export interface AuthCeremony {
   readonly providerName: string
@@ -158,7 +152,6 @@ export type PromptInputEdit =
     }
 
 export interface PromptState {
-  readonly feedback: PromptFeedback
   readonly authCeremony: AuthCeremony | undefined
   readonly images: readonly ImageContent[]
   readonly workflow: PromptWorkflow
@@ -166,7 +159,6 @@ export interface PromptState {
 }
 
 export const initialPromptState: PromptState = {
-  feedback: { type: "none" },
   authCeremony: undefined,
   images: [],
   workflow: { type: "idle" },

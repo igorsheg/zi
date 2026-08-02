@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test"
 
 import { BoxRenderable, TextRenderable } from "@opentui/core"
-import { createTestRenderer } from "@opentui/core/testing"
+import { createTestRenderer, ManualClock } from "@opentui/core/testing"
 import { createModels, createTestAgentRuntime as createAgentRuntime, fauxProvider } from "@with-zi/coding-agent/testing"
 
 import { InteractiveMode } from "../../src/interactive/interactive-mode.js"
@@ -231,6 +231,31 @@ test("finite ttl owns one balanced renderer live request", async () => {
   } finally {
     center.dispose()
     expect(setup.renderer.liveRequestCount).toBe(baseline)
+    setup.renderer.destroy()
+  }
+})
+
+test("expiry paints the cleared surface after releasing the renderer", async () => {
+  const clock = new ManualClock()
+  const setup = await createTestRenderer({ width: 40, height: 8, useThread: false, clock })
+  const center = new NotificationCenter(setup.renderer, defaultTheme, { now: () => clock.now() / 1_000 })
+  const host = new BoxRenderable(setup.renderer, { width: "100%", height: "100%", position: "relative" })
+  setup.renderer.root.add(host)
+  center.attach(host)
+
+  try {
+    center.notify("finite", 2, { ttl: 0.05 })
+    clock.advance(40)
+    await Promise.resolve()
+    expect(setup.captureCharFrame()).toContain("finite INFO")
+
+    clock.runAll()
+    await setup.renderer.idle()
+
+    expect(setup.renderer.liveRequestCount).toBe(0)
+    expect(setup.captureCharFrame()).not.toContain("finite INFO")
+  } finally {
+    center.dispose()
     setup.renderer.destroy()
   }
 })

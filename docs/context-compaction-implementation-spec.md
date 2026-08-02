@@ -190,7 +190,7 @@ Reject for this milestone:
 | Context/status text and cancellation key routing                                                | `PromptView`                                               |
 | Final session disposal and bounded shutdown settlement                                          | Existing runtime/CLI owners                                |
 
-There is no mutable compaction store in the TUI. `PromptStore` may retain only its admitted command operation and feedback. It does not retain the summary, active context, token timeline, or a second compaction state.
+There is no mutable compaction store in the TUI. `PromptStore` may retain only its admitted command operation and project one-line outcomes through the notification owner. It does not retain the summary, active context, token timeline, a notice item, or a second compaction state.
 
 # 4. Session state and transitions
 
@@ -921,7 +921,7 @@ No provider call or TUI change lands in this slice.
 
 - add flat settings and mutation;
 - add `/compact` intent/workflow;
-- render status, context usage, feedback, and authoritative transcript reset;
+- render activity status, context usage, workflow notices, and authoritative transcript reset;
 - fix constrained and cancellation fixtures.
 
 ## Slice 6 — modes and evidence

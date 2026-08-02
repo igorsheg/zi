@@ -142,7 +142,7 @@ Use a distinct transition:
 3. `Composer` selects the entire native buffer and deletes the selection as one native edit. It does not copy text into store state.
 4. The existing marker notification synchronizes the now-empty image list.
 5. Native undo restores text, cursor-relevant editor history, paste extmarks, and image identity; marker notification restores the store's attachment references.
-6. Prompt feedback says `Input cleared · Ctrl+- to undo` using the effective semantic/native hint.
+6. A built-in prompt notice says `Input cleared · Ctrl+- to undo` using the effective semantic/native hint.
 
 Submission, session replacement, authentication transitions, and initial input still use hard-reset replacement. A submitted prompt must not reappear through textarea undo; submitted-turn undo is a different session operation.
 

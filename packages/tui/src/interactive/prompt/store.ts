@@ -19,6 +19,7 @@ import type {
 import { atom, type ReadableAtom } from "nanostores"
 
 import { promptTextWidth } from "../../components/cell-text.js"
+import type { BuiltInNoticeActions, ReloadNoticeOutcome } from "../built-in-notifications.js"
 import {
   detectClipboardImageMimeType,
   maxClipboardImageBytes,
@@ -28,7 +29,6 @@ import {
 } from "../clipboard.js"
 import type { InteractiveStore } from "../interactive-store.js"
 import type { InteractiveCommand, SlashController } from "../slash-controller.js"
-import type { ReloadNoticeOutcome, SystemNoticeActions } from "../system-notifications.js"
 import { FileCompletionController, type FileCompletionInput, type FileCompletionRangeEdit } from "./file-completion.js"
 import {
   authenticationMethodId,
@@ -57,7 +57,6 @@ import {
   type AuthCeremony,
   type EditableSetting,
   type EditableSettingValue,
-  type PromptFeedback,
   type PromptState,
   type PromptWorkflow
 } from "./state.js"
@@ -78,7 +77,6 @@ export interface PromptStore {
   pasteClipboard(): Promise<string | undefined>
   attachImage(image: Extract<ClipboardContent, { type: "image" }>): boolean
   imageMarkersChanged(images: readonly ImageContent[]): void
-  reportFeedback(feedback: PromptFeedback): void
   clear(): void
   dispose(): void
 }
@@ -103,7 +101,12 @@ export const maxPromptClipboardImages = 8
 export const maxPromptClipboardEncodedBytes = 8 * 1024 * 1024
 
 const unavailableClipboard: ClipboardReader = { read: async () => undefined }
-const unavailableSystemNotices: SystemNoticeActions = {
+const unavailableNotices: BuiltInNoticeActions = {
+  promptProgress() {},
+  promptInfo() {},
+  promptWarning() {},
+  promptError() {},
+  clearPrompt() {},
   backgroundTaskCapacityExceeded() {},
   reloadCompleted() {},
   reloadFailed() {}
@@ -123,9 +126,9 @@ export function createPromptStore(
   slash: SlashController,
   sessionActions?: PromptSessionActions,
   clipboard: ClipboardReader = unavailableClipboard,
-  systemNotices: SystemNoticeActions = unavailableSystemNotices
+  notices: BuiltInNoticeActions = unavailableNotices
 ): PromptStore {
-  return new PromptController(interactive, slash, sessionActions, clipboard, systemNotices)
+  return new PromptController(interactive, slash, sessionActions, clipboard, notices)
 }
 
 class PromptController implements PromptStore {
@@ -136,7 +139,7 @@ class PromptController implements PromptStore {
   readonly #slash: SlashController
   readonly #sessionActions: PromptSessionActions | undefined
   readonly #clipboard: ClipboardReader
-  readonly #systemNotices: SystemNoticeActions
+  readonly #notices: BuiltInNoticeActions
   readonly #fileCompletion: FileCompletionController
   #clipboardRead: ClipboardReadState = { type: "idle" }
   #draftRevision = 0
@@ -152,13 +155,13 @@ class PromptController implements PromptStore {
     slash: SlashController,
     sessionActions: PromptSessionActions | undefined,
     clipboard: ClipboardReader,
-    systemNotices: SystemNoticeActions
+    notices: BuiltInNoticeActions
   ) {
     this.#interactive = interactive
     this.#slash = slash
     this.#sessionActions = sessionActions
     this.#clipboard = clipboard
-    this.#systemNotices = systemNotices
+    this.#notices = notices
     this.#fileCompletion = new FileCompletionController(this.picker, edit => this.#requestRange(edit))
   }
 
@@ -177,7 +180,7 @@ class PromptController implements PromptStore {
     try {
       const model = this.#interactive.getSession().modelState
       if (state.images.length > 0 && (model.type !== "selected" || !model.model.input.includes("image"))) {
-        this.reportFeedback({ type: "warning", message: "The current model does not accept image input" })
+        this.#warn("The current model does not accept image input")
         return false
       }
       const settled = this.#interactive.submit({ text: trimmed, images: state.images, delivery })
@@ -187,6 +190,7 @@ class PromptController implements PromptStore {
         ...initialPromptState,
         inputEdit: { type: "replace", revision: state.inputEdit.revision + 1, text: "", cursorOffset: 0 }
       })
+      this.#notices.clearPrompt()
       void settled.catch(cause => this.#showError(cause))
       return true
     } catch (cause) {
@@ -311,7 +315,8 @@ class PromptController implements PromptStore {
     if (workflow.type === "choosing_project_trust") {
       this.picker.close()
       this.#sessionActions?.dismissProjectTrust()
-      this.$state.set({ ...this.$state.get(), feedback: { type: "none" }, workflow: { type: "idle" } })
+      this.$state.set({ ...this.$state.get(), workflow: { type: "idle" } })
+      this.#notices.clearPrompt()
       this.#requestInput("")
       return true
     }
@@ -405,11 +410,8 @@ class PromptController implements PromptStore {
     const session = this.#interactive.getSession()
     const operationId = ++this.#nextOperationId
     this.picker.open(projectTrustFrame(cwd))
-    this.$state.set({
-      ...this.$state.get(),
-      feedback: { type: "none" },
-      workflow: { type: "choosing_project_trust", operationId, session, cwd }
-    })
+    this.$state.set({ ...this.$state.get(), workflow: { type: "choosing_project_trust", operationId, session, cwd } })
+    this.#notices.clearPrompt()
     this.#requestInput("")
   }
 
@@ -472,7 +474,7 @@ class PromptController implements PromptStore {
     if (!this.#finishClipboardRead(reading)) return undefined
 
     if (!content) {
-      this.reportFeedback({ type: "warning", message: "Clipboard is empty or unavailable" })
+      this.#warn("Clipboard is empty or unavailable")
       return undefined
     }
     if (content.type === "image") {
@@ -480,7 +482,7 @@ class PromptController implements PromptStore {
       return undefined
     }
     if (Buffer.byteLength(content.text) > maxPastedTextBytes) {
-      this.reportFeedback({ type: "error", message: "Clipboard text exceeds the 1 MiB paste limit" })
+      this.#error("Clipboard text exceeds the 1 MiB paste limit")
       return undefined
     }
     return content.text
@@ -490,7 +492,7 @@ class PromptController implements PromptStore {
     if (this.#disposed) return false
     const state = this.$state.get()
     if (state.workflow.type !== "idle") {
-      this.reportFeedback({ type: "warning", message: "Images cannot be attached during the active prompt workflow" })
+      this.#warn("Images cannot be attached during the active prompt workflow")
       return false
     }
 
@@ -502,43 +504,34 @@ class PromptController implements PromptStore {
       return false
     }
     if (session.modelState.type !== "selected" || !session.modelState.model.input.includes("image")) {
-      this.reportFeedback({ type: "warning", message: "The current model does not accept image input" })
+      this.#warn("The current model does not accept image input")
       return false
     }
     if (image.bytes.byteLength === 0 || image.bytes.byteLength > maxClipboardImageBytes) {
-      this.reportFeedback({ type: "error", message: "Clipboard image exceeds the 4.5 MiB encoded image limit" })
+      this.#error("Clipboard image exceeds the 4.5 MiB encoded image limit")
       return false
     }
 
     const mimeType = detectClipboardImageMimeType(image.bytes)
     if (!mimeType) {
-      this.reportFeedback({ type: "warning", message: "Clipboard image must be PNG, JPEG, WebP, or GIF" })
+      this.#warn("Clipboard image must be PNG, JPEG, WebP, or GIF")
       return false
     }
     if (state.images.length >= maxPromptClipboardImages) {
-      this.reportFeedback({
-        type: "error",
-        message: `A prompt cannot contain more than ${maxPromptClipboardImages} pasted images`
-      })
+      this.#error(`A prompt cannot contain more than ${maxPromptClipboardImages} pasted images`)
       return false
     }
 
     const data = Buffer.from(image.bytes).toString("base64")
     const retainedBytes = state.images.reduce((bytes, entry) => bytes + Buffer.byteLength(entry.data), 0)
     if (retainedBytes + Buffer.byteLength(data) > maxPromptClipboardEncodedBytes) {
-      this.reportFeedback({ type: "error", message: "Pasted images exceed the 8 MiB prompt attachment limit" })
+      this.#error("Pasted images exceed the 8 MiB prompt attachment limit")
       return false
     }
 
     const images = [...state.images, { type: "image" as const, data, mimeType }]
-    this.$state.set({
-      ...state,
-      images,
-      feedback: {
-        type: "status",
-        message: `Attached image ${images.length} (${mimeType.slice("image/".length).toUpperCase()})`
-      }
-    })
+    this.$state.set({ ...state, images })
+    this.#notices.promptInfo(`Attached image ${images.length} (${mimeType.slice("image/".length).toUpperCase()})`)
     return true
   }
 
@@ -553,18 +546,20 @@ class PromptController implements PromptStore {
     }
     if (images.length === state.images.length && images.every((image, index) => image === state.images[index])) return
 
-    const feedback: PromptFeedback =
-      images.length < state.images.length
-        ? imageMarkerFeedback("Removed", state.images.length - images.length)
-        : images.length > state.images.length
-          ? imageMarkerFeedback("Restored", images.length - state.images.length)
-          : state.feedback
-    this.$state.set({ ...state, images: [...images], feedback })
+    this.$state.set({ ...state, images: [...images] })
+    if (images.length < state.images.length) {
+      this.#notices.promptInfo(imageMarkerNotice("Removed", state.images.length - images.length))
+    } else if (images.length > state.images.length) {
+      this.#notices.promptInfo(imageMarkerNotice("Restored", images.length - state.images.length))
+    }
   }
 
-  reportFeedback(feedback: PromptFeedback): void {
-    if (this.#disposed) return
-    this.$state.set({ ...this.$state.get(), feedback })
+  #warn(message: string): void {
+    if (!this.#disposed) this.#notices.promptWarning(message)
+  }
+
+  #error(message: string): void {
+    if (!this.#disposed) this.#notices.promptError(message)
   }
 
   clear(): void {
@@ -584,16 +579,17 @@ class PromptController implements PromptStore {
       ...initialPromptState,
       inputEdit: { type: "replace", revision: state.inputEdit.revision + 1, text: "", cursorOffset: 0 }
     })
+    this.#notices.clearPrompt()
   }
 
   dispose(): void {
     if (this.#disposed) return
+    this.#disposed = true
     this.#cancelClipboardRead()
     this.#cancelAuthentication()
     this.#cancelCompaction()
     this.#cancelExtensionCommand()
     this.#cancelSessionReplacement()
-    this.#disposed = true
     this.#fileCompletion.dispose()
     this.picker.dispose()
   }
@@ -652,17 +648,12 @@ class PromptController implements PromptStore {
     if (!this.#accepts(workflow.operationId, workflow.session)) return false
 
     this.picker.close()
-    this.$state.set({
-      ...this.$state.get(),
-      feedback: {
-        type: "status",
-        message:
-          mutation.requested === mutation.effective
-            ? `Codex Fast mode: ${settingValueLabel(mutation.effective)}`
-            : `Codex Fast mode saved as ${settingValueLabel(mutation.requested)}; project settings keep ${settingValueLabel(mutation.effective)} effective`
-      },
-      workflow: { type: "idle" }
-    })
+    this.$state.set({ ...this.$state.get(), workflow: { type: "idle" } })
+    this.#notices.promptInfo(
+      mutation.requested === mutation.effective
+        ? `Codex Fast mode: ${settingValueLabel(mutation.effective)}`
+        : `Codex Fast mode saved as ${settingValueLabel(mutation.requested)}; project settings keep ${settingValueLabel(mutation.effective)} effective`
+    )
     this.#requestInput("")
     return true
   }
@@ -813,11 +804,8 @@ class PromptController implements PromptStore {
     if (!selected) return false
     if (selected.path === workflow.session.sessionManager.file) {
       this.picker.close()
-      this.$state.set({
-        ...this.$state.get(),
-        feedback: { type: "status", message: "Session already active" },
-        workflow: { type: "idle" }
-      })
+      this.$state.set({ ...this.$state.get(), workflow: { type: "idle" } })
+      this.#notices.promptInfo("Session already active")
       this.#requestInput("")
       return true
     }
@@ -829,9 +817,9 @@ class PromptController implements PromptStore {
 
     this.$state.set({
       ...this.$state.get(),
-      feedback: { type: "status", message: "Resuming session…" },
       workflow: { type: "resuming_session", operationId: workflow.operationId, session: workflow.session }
     })
+    this.#notices.clearPrompt()
     this.picker.replaceTop({ ...presentation.frame, footer: "Resuming session…" }, "")
     this.#requestInput("")
 
@@ -841,12 +829,14 @@ class PromptController implements PromptStore {
       } catch (cause) {
         if (!this.#accepts(workflow.operationId, workflow.session)) return
         this.picker.replaceTop(sessionFrame(workflow.sessions, workflow.session.sessionManager.file), "")
-        this.$state.set({ ...this.$state.get(), feedback: { type: "error", message: errorMessage(cause) }, workflow })
+        this.$state.set({ ...this.$state.get(), workflow })
+        this.#notices.promptError(errorMessage(cause))
         return
       }
       if (!this.#accepts(workflow.operationId, workflow.session)) return
       this.picker.close()
-      this.$state.set({ ...this.$state.get(), feedback: { type: "none" }, workflow: { type: "idle" } })
+      this.$state.set({ ...this.$state.get(), workflow: { type: "idle" } })
+      this.#notices.clearPrompt()
       this.#requestInput("")
     }
     void resume()
@@ -869,7 +859,6 @@ class PromptController implements PromptStore {
 
     this.$state.set({
       ...this.$state.get(),
-      feedback: { type: "status", message: "Applying project trust…" },
       workflow: {
         type: "saving_project_trust",
         operationId: workflow.operationId,
@@ -879,6 +868,7 @@ class PromptController implements PromptStore {
       }
     })
     this.picker.replaceTop(projectTrustFrame(workflow.cwd, selected.id, true), "")
+    this.#notices.clearPrompt()
     this.#requestInput("")
 
     const apply = async () => {
@@ -887,12 +877,14 @@ class PromptController implements PromptStore {
       } catch (cause) {
         if (!this.#accepts(workflow.operationId, workflow.session)) return
         this.picker.replaceTop(projectTrustFrame(workflow.cwd, selected.id), "")
-        this.$state.set({ ...this.$state.get(), feedback: { type: "error", message: errorMessage(cause) }, workflow })
+        this.$state.set({ ...this.$state.get(), workflow })
+        this.#notices.promptError(errorMessage(cause))
         return
       }
       if (!this.#accepts(workflow.operationId, workflow.session)) return
       this.picker.close()
-      this.$state.set({ ...this.$state.get(), feedback: { type: "none" }, workflow: { type: "idle" } })
+      this.$state.set({ ...this.$state.get(), workflow: { type: "idle" } })
+      this.#notices.clearPrompt()
       this.#requestInput("")
     }
     void apply()
@@ -943,11 +935,8 @@ class PromptController implements PromptStore {
     const operationId = ++this.#nextOperationId
     this.#cancelledCompactionOperationId = undefined
     this.picker.close()
-    this.$state.set({
-      ...this.$state.get(),
-      feedback: { type: "none" },
-      workflow: { type: "compacting", operationId, session }
-    })
+    this.$state.set({ ...this.$state.get(), workflow: { type: "compacting", operationId, session } })
+    this.#notices.clearPrompt()
     this.#requestInput("")
 
     const compact = async () => {
@@ -955,23 +944,17 @@ class PromptController implements PromptStore {
         const result = await session.compact(instructions || undefined)
         if (!this.#accepts(operationId, session)) return
         this.#cancelledCompactionOperationId = undefined
-        this.$state.set({
-          ...this.$state.get(),
-          feedback: {
-            type: "status",
-            message: `Compacted ${formatTokens(result.tokensBefore)} → ~${formatTokens(result.estimatedTokensAfter)} context tokens.`
-          },
-          workflow: { type: "idle" }
-        })
+        this.$state.set({ ...this.$state.get(), workflow: { type: "idle" } })
+        this.#notices.promptInfo(
+          `Compacted ${formatTokens(result.tokensBefore)} → ~${formatTokens(result.estimatedTokensAfter)} context tokens.`
+        )
       } catch (cause) {
         if (!this.#accepts(operationId, session)) return
         const cancelled = this.#cancelledCompactionOperationId === operationId
         this.#cancelledCompactionOperationId = undefined
-        this.$state.set({
-          ...this.$state.get(),
-          feedback: cancelled ? { type: "none" } : { type: "error", message: errorMessage(cause) },
-          workflow: { type: "idle" }
-        })
+        this.$state.set({ ...this.$state.get(), workflow: { type: "idle" } })
+        if (cancelled) this.#notices.clearPrompt()
+        else this.#notices.promptError(errorMessage(cause))
       }
     }
     void compact()
@@ -980,7 +963,7 @@ class PromptController implements PromptStore {
   #runExtensionCommand(name: string, arguments_: string): void {
     const session = this.#interactive.getSession()
     if (session.isStreaming || session.isAborting) {
-      this.reportFeedback({ type: "warning", message: "Wait for the current response before running a command" })
+      this.#warn("Wait for the current response before running a command")
       return
     }
     const operationId = ++this.#nextOperationId
@@ -988,9 +971,9 @@ class PromptController implements PromptStore {
     this.picker.close()
     this.$state.set({
       ...this.$state.get(),
-      feedback: { type: "status", message: `Running /${name}…` },
       workflow: { type: "running_extension_command", operationId, session, name }
     })
+    this.#notices.promptProgress(`Running /${name}…`)
     this.#requestInput("")
 
     const run = async () => {
@@ -998,20 +981,16 @@ class PromptController implements PromptStore {
         const message = await session.invokeExtensionCommand(name, arguments_)
         if (!this.#accepts(operationId, session)) return
         this.#cancelledExtensionCommandOperationId = undefined
-        this.$state.set({
-          ...this.$state.get(),
-          feedback: message === undefined || message.length === 0 ? { type: "none" } : { type: "status", message },
-          workflow: { type: "idle" }
-        })
+        this.$state.set({ ...this.$state.get(), workflow: { type: "idle" } })
+        if (message === undefined || message.length === 0) this.#notices.clearPrompt()
+        else this.#notices.promptInfo(message)
       } catch (cause) {
         if (!this.#accepts(operationId, session)) return
         const cancelled = this.#cancelledExtensionCommandOperationId === operationId
         this.#cancelledExtensionCommandOperationId = undefined
-        this.$state.set({
-          ...this.$state.get(),
-          feedback: cancelled ? { type: "none" } : { type: "error", message: errorMessage(cause) },
-          workflow: { type: "idle" }
-        })
+        this.$state.set({ ...this.$state.get(), workflow: { type: "idle" } })
+        if (cancelled) this.#notices.clearPrompt()
+        else this.#notices.promptError(errorMessage(cause))
       }
     }
     void run()
@@ -1020,16 +999,13 @@ class PromptController implements PromptStore {
   #reload(): void {
     const session = this.#interactive.getSession()
     if (session.isStreaming) {
-      this.reportFeedback({ type: "warning", message: "Wait for the current response before reloading" })
+      this.#warn("Wait for the current response before reloading")
       return
     }
     const operationId = ++this.#nextOperationId
     this.picker.close()
-    this.$state.set({
-      ...this.$state.get(),
-      feedback: { type: "status", message: "Reloading…" },
-      workflow: { type: "reloading", operationId, session }
-    })
+    this.$state.set({ ...this.$state.get(), workflow: { type: "reloading", operationId, session } })
+    this.#notices.promptProgress("Reloading…")
     this.#requestInput("")
 
     const reload = async () => {
@@ -1038,16 +1014,16 @@ class PromptController implements PromptStore {
         result = await session.reload()
       } catch (cause) {
         if (!this.#accepts(operationId, session)) return
-        this.$state.set({ ...this.$state.get(), feedback: { type: "none" }, workflow: { type: "idle" } })
-        this.#systemNotices.reloadFailed(errorMessage(cause))
+        this.$state.set({ ...this.$state.get(), workflow: { type: "idle" } })
+        this.#notices.reloadFailed(errorMessage(cause))
         return
       }
       if (!this.#accepts(operationId, session)) return
       this.#slash.invalidateCatalog()
       const outcome = reloadNoticeOutcome(result)
-      const message = reloadStatusMessage(result)
-      this.$state.set({ ...this.$state.get(), feedback: { type: "none" }, workflow: { type: "idle" } })
-      this.#systemNotices.reloadCompleted(outcome, message)
+      const message = reloadNoticeMessage(result)
+      this.$state.set({ ...this.$state.get(), workflow: { type: "idle" } })
+      this.#notices.reloadCompleted(outcome, message)
     }
     void reload()
   }
@@ -1061,11 +1037,8 @@ class PromptController implements PromptStore {
     const session = this.#interactive.getSession()
     const operationId = ++this.#nextOperationId
     this.picker.close()
-    this.$state.set({
-      ...this.$state.get(),
-      feedback: { type: "status", message: "Starting new session…" },
-      workflow: { type: "starting_session", operationId, session }
-    })
+    this.$state.set({ ...this.$state.get(), workflow: { type: "starting_session", operationId, session } })
+    this.#notices.promptProgress("Starting new session…")
     this.#requestInput("")
 
     const start = async () => {
@@ -1073,16 +1046,14 @@ class PromptController implements PromptStore {
         await actions.startNewSession()
       } catch (cause) {
         if (this.#accepts(operationId, session)) {
-          this.$state.set({
-            ...this.$state.get(),
-            feedback: { type: "error", message: errorMessage(cause) },
-            workflow: { type: "idle" }
-          })
+          this.$state.set({ ...this.$state.get(), workflow: { type: "idle" } })
+          this.#notices.promptError(errorMessage(cause))
         }
         return
       }
       if (!this.#accepts(operationId, session)) return
-      this.$state.set({ ...this.$state.get(), feedback: { type: "none" }, workflow: { type: "idle" } })
+      this.$state.set({ ...this.$state.get(), workflow: { type: "idle" } })
+      this.#notices.clearPrompt()
       this.#requestInput("")
     }
     void start()
@@ -1099,11 +1070,8 @@ class PromptController implements PromptStore {
     const loading = sessionFrame([], session.sessionManager.file, { emptyText: "Loading sessions…" })
     if (parentFilter === undefined) this.picker.open(loading)
     else this.picker.push(loading, parentFilter)
-    this.$state.set({
-      ...this.$state.get(),
-      feedback: { type: "none" },
-      workflow: { type: "loading_sessions", operationId, session }
-    })
+    this.$state.set({ ...this.$state.get(), workflow: { type: "loading_sessions", operationId, session } })
+    this.#notices.clearPrompt()
     this.#requestInput("")
 
     const load = async () => {
@@ -1138,11 +1106,8 @@ class PromptController implements PromptStore {
   #openModels(initialSearch: string, parentFilter?: string): void {
     const session = this.#interactive.getSession()
     const operationId = ++this.#nextOperationId
-    this.$state.set({
-      ...this.$state.get(),
-      feedback: { type: "none" },
-      workflow: { type: "loading_models", operationId, session }
-    })
+    this.$state.set({ ...this.$state.get(), workflow: { type: "loading_models", operationId, session } })
+    this.#notices.clearPrompt()
     const current = session.modelState.type === "selected" ? session.modelState.model : undefined
     const loading = modelFrame([], current, "Loading models…")
     if (parentFilter === undefined) this.picker.open(loading)
@@ -1193,21 +1158,20 @@ class PromptController implements PromptStore {
         await session.setModel(choice.model)
       } catch (cause) {
         if (this.#accepts(operationId, session)) {
-          this.#closeModelPicker({ type: "error", message: errorMessage(cause) })
+          this.picker.close()
+          this.$state.set({ ...this.$state.get(), workflow: { type: "idle" } })
+          this.#notices.promptError(errorMessage(cause))
+          this.#requestInput("")
         }
         return
       }
       if (!this.#accepts(operationId, session)) return
-      this.#closeModelPicker({ type: "status", message: `Model: ${choice.model.id}` })
+      this.picker.close()
+      this.$state.set({ ...this.$state.get(), workflow: { type: "idle" } })
+      this.#notices.promptInfo(`Model: ${choice.model.id}`)
+      this.#requestInput("")
     }
     void apply()
-  }
-
-  #closeModelPicker(feedback: PromptFeedback): void {
-    if (this.#disposed) return
-    this.picker.close()
-    this.$state.set({ ...this.$state.get(), feedback, workflow: { type: "idle" } })
-    this.#requestInput("")
   }
 
   #openLogin(provider: string, parentFilter?: string): void {
@@ -1231,9 +1195,9 @@ class PromptController implements PromptStore {
       else this.picker.push(frame, parentFilter)
       this.$state.set({
         ...this.$state.get(),
-        feedback: { type: "none" },
         workflow: { type: "choosing_auth_method", operationId, session, methods: exact }
       })
+      this.#notices.clearPrompt()
       this.#requestInput("")
       return
     }
@@ -1243,9 +1207,9 @@ class PromptController implements PromptStore {
     else this.picker.push(frame, parentFilter)
     this.$state.set({
       ...this.$state.get(),
-      feedback: { type: "none" },
       workflow: { type: "choosing_auth_provider", operationId, session, methods }
     })
+    this.#notices.clearPrompt()
     this.#requestInput(provider)
   }
 
@@ -1255,10 +1219,10 @@ class PromptController implements PromptStore {
     this.picker.close()
     this.$state.set({
       ...this.$state.get(),
-      feedback: { type: "none" },
       authCeremony: { providerName: method.providerName, methodName: method.name, status: `Starting ${method.name}…` },
       workflow: { type: "authenticating", operationId, session, providerId: method.providerId }
     })
+    this.#notices.clearPrompt()
     this.#requestInput("")
 
     const prompt = (authPrompt: AuthenticationPrompt): Promise<string> => {
@@ -1337,12 +1301,12 @@ class PromptController implements PromptStore {
         })
       } catch (cause) {
         if (this.#accepts(operationId, session)) {
-          this.#finishAuthentication({ type: "error", message: errorMessage(cause) })
+          this.#finishAuthentication("error", errorMessage(cause))
         }
         return
       }
       if (!this.#accepts(operationId, session)) return
-      this.#finishAuthentication({ type: "status", message: `Logged in to ${method.providerName}` })
+      this.#finishAuthentication("info", `Logged in to ${method.providerName}`)
     }
     void authenticate()
   }
@@ -1381,12 +1345,8 @@ class PromptController implements PromptStore {
     this.#pendingAuthPrompt?.cleanup()
     this.#pendingAuthPrompt?.reject(new Error("Authentication cancelled"))
     this.#pendingAuthPrompt = undefined
-    this.$state.set({
-      ...this.$state.get(),
-      feedback: { type: "none" },
-      authCeremony: undefined,
-      workflow: { type: "idle" }
-    })
+    this.$state.set({ ...this.$state.get(), authCeremony: undefined, workflow: { type: "idle" } })
+    this.#notices.clearPrompt()
     this.#requestInput("")
     try {
       void workflow.session.abort().catch(cause => this.#showError(cause))
@@ -1438,14 +1398,18 @@ class PromptController implements PromptStore {
     }
     const cancellation = this.#sessionActions?.cancelReplacement()
     if (!cancellation || cancellation.type !== "cancelled") return true
+    if (this.#disposed) {
+      void cancellation.settled.catch(() => {})
+      return true
+    }
 
     const operationId = ++this.#nextOperationId
     this.picker.close()
     this.$state.set({
       ...this.$state.get(),
-      feedback: { type: "status", message: "Cancelling session change…" },
       workflow: { type: "cancelling_session", operationId, session: workflow.session }
     })
+    this.#notices.promptProgress("Cancelling session change…")
     this.#requestInput("")
     const settleCancellation = async () => {
       try {
@@ -1455,29 +1419,29 @@ class PromptController implements PromptStore {
         return
       }
       if (!this.#accepts(operationId, workflow.session)) return
-      this.$state.set({ ...this.$state.get(), feedback: { type: "none" }, workflow: { type: "idle" } })
+      this.$state.set({ ...this.$state.get(), workflow: { type: "idle" } })
+      this.#notices.clearPrompt()
     }
     void settleCancellation()
     return true
   }
 
-  #finishAuthentication(feedback: PromptFeedback): void {
+  #finishAuthentication(outcome: "info" | "error", message: string): void {
     if (this.#disposed) return
     this.#pendingAuthPrompt?.cleanup()
     this.#pendingAuthPrompt = undefined
     this.picker.close()
-    this.$state.set({ ...this.$state.get(), feedback, authCeremony: undefined, workflow: { type: "idle" } })
+    this.$state.set({ ...this.$state.get(), authCeremony: undefined, workflow: { type: "idle" } })
+    if (outcome === "info") this.#notices.promptInfo(message)
+    else this.#notices.promptError(message)
     this.#requestInput("")
   }
 
   #logout(): void {
     const session = this.#interactive.getSession()
     const operationId = ++this.#nextOperationId
-    this.$state.set({
-      ...this.$state.get(),
-      feedback: { type: "status", message: "Loading stored credentials…" },
-      workflow: { type: "loading_logout", operationId, session }
-    })
+    this.$state.set({ ...this.$state.get(), workflow: { type: "loading_logout", operationId, session } })
+    this.#notices.promptProgress("Loading stored credentials…")
     this.#requestInput("")
 
     const load = async () => {
@@ -1486,13 +1450,13 @@ class PromptController implements PromptStore {
         stored = await session.storedCredentials()
       } catch (cause) {
         if (this.#accepts(operationId, session)) {
-          this.#finishAuthentication({ type: "error", message: errorMessage(cause) })
+          this.#finishAuthentication("error", errorMessage(cause))
         }
         return
       }
       if (!this.#accepts(operationId, session)) return
       if (stored.length === 0) {
-        this.#finishAuthentication({ type: "status", message: "No stored credentials to remove" })
+        this.#finishAuthentication("info", "No stored credentials to remove")
         return
       }
       if (stored.length === 1) {
@@ -1502,9 +1466,9 @@ class PromptController implements PromptStore {
       this.picker.open(logoutFrame(stored))
       this.$state.set({
         ...this.$state.get(),
-        feedback: { type: "none" },
         workflow: { type: "choosing_logout", operationId, session, credentials: stored }
       })
+      this.#notices.clearPrompt()
     }
     void load()
   }
@@ -1512,11 +1476,8 @@ class PromptController implements PromptStore {
   #logoutProvider(operationId: number, session: AgentSession, providerId: string): void {
     if (!this.#accepts(operationId, session)) return
     this.picker.close()
-    this.$state.set({
-      ...this.$state.get(),
-      feedback: { type: "status", message: `Removing stored credentials for ${providerId}…` },
-      workflow: { type: "logging_out", operationId, session, providerId }
-    })
+    this.$state.set({ ...this.$state.get(), workflow: { type: "logging_out", operationId, session, providerId } })
+    this.#notices.promptProgress(`Removing stored credentials for ${providerId}…`)
     this.#requestInput("")
 
     const apply = async () => {
@@ -1524,15 +1485,15 @@ class PromptController implements PromptStore {
         await session.logout(providerId)
       } catch (cause) {
         if (this.#accepts(operationId, session)) {
-          this.#finishAuthentication({ type: "error", message: errorMessage(cause) })
+          this.#finishAuthentication("error", errorMessage(cause))
         }
         return
       }
       if (!this.#accepts(operationId, session)) return
-      this.#finishAuthentication({
-        type: "status",
-        message: `Logged out of ${providerId}; environment and external configuration remain available`
-      })
+      this.#finishAuthentication(
+        "info",
+        `Logged out of ${providerId}; environment and external configuration remain available`
+      )
     }
     void apply()
   }
@@ -1543,11 +1504,8 @@ class PromptController implements PromptStore {
     const frame = codexSettingsFrame(session)
     if (parentFilter === undefined) this.picker.open(frame)
     else this.picker.push(frame, parentFilter)
-    this.$state.set({
-      ...this.$state.get(),
-      feedback: { type: "none" },
-      workflow: { type: "choosing_codex_setting", operationId, session }
-    })
+    this.$state.set({ ...this.$state.get(), workflow: { type: "choosing_codex_setting", operationId, session } })
+    this.#notices.clearPrompt()
     this.#requestInput("")
   }
 
@@ -1557,11 +1515,8 @@ class PromptController implements PromptStore {
     const frame = settingsScopeFrame()
     if (parentFilter === undefined) this.picker.open(frame)
     else this.picker.push(frame, parentFilter)
-    this.$state.set({
-      ...this.$state.get(),
-      feedback: { type: "none" },
-      workflow: { type: "choosing_settings_scope", operationId, session }
-    })
+    this.$state.set({ ...this.$state.get(), workflow: { type: "choosing_settings_scope", operationId, session } })
+    this.#notices.clearPrompt()
     this.#requestInput("")
   }
 
@@ -1601,16 +1556,12 @@ class PromptController implements PromptStore {
 
     this.picker.close()
     const shadowed = mutation.requested !== mutation.effective
-    this.$state.set({
-      ...this.$state.get(),
-      feedback: {
-        type: "status",
-        message: shadowed
-          ? `${settingLabel(workflow.setting)} saved as ${settingValueLabel(mutation.requested)}; project override keeps ${settingValueLabel(mutation.effective)} effective`
-          : `${settingLabel(workflow.setting)}: ${settingValueLabel(mutation.effective)} (${workflow.scope})`
-      },
-      workflow: { type: "idle" }
-    })
+    this.$state.set({ ...this.$state.get(), workflow: { type: "idle" } })
+    this.#notices.promptInfo(
+      shadowed
+        ? `${settingLabel(workflow.setting)} saved as ${settingValueLabel(mutation.requested)}; project override keeps ${settingValueLabel(mutation.effective)} effective`
+        : `${settingLabel(workflow.setting)}: ${settingValueLabel(mutation.effective)} (${workflow.scope})`
+    )
     this.#requestInput("")
     return true
   }
@@ -1635,26 +1586,23 @@ class PromptController implements PromptStore {
     reading.controller.abort()
   }
 
-  #mergeQueue(queue: QueuedInputs, currentText: string, showStatus: boolean): string {
+  #mergeQueue(queue: QueuedInputs, currentText: string, showNotice: boolean): string {
     const entries = [...queue.steering, ...queue.followUp]
     const texts = entries.map(entry => entry.text)
     const images = entries.flatMap(entry => entry.images)
     const state = this.$state.get()
-    this.$state.set({
-      ...state,
-      feedback: showStatus
-        ? {
-            type: "status",
-            message:
-              texts.length === 0
-                ? "No queued messages to restore"
-                : `Restored ${texts.length} queued message${texts.length === 1 ? "" : "s"} to editor${
-                    images.length === 0 ? "" : ` with ${images.length} image${images.length === 1 ? "" : "s"}`
-                  }`
-          }
-        : { type: "none" },
-      images: images.length === 0 ? state.images : [...images, ...state.images]
-    })
+    this.$state.set({ ...state, images: images.length === 0 ? state.images : [...images, ...state.images] })
+    if (showNotice) {
+      this.#notices.promptInfo(
+        texts.length === 0
+          ? "No queued messages to restore"
+          : `Restored ${texts.length} queued message${texts.length === 1 ? "" : "s"} to editor${
+              images.length === 0 ? "" : ` with ${images.length} image${images.length === 1 ? "" : "s"}`
+            }`
+      )
+    } else {
+      this.#notices.clearPrompt()
+    }
     return [...texts, currentText].filter(value => value.length > 0).join("\n\n")
   }
 
@@ -1700,16 +1648,16 @@ class PromptController implements PromptStore {
 
   #setIdle(): void {
     this.$state.set({ ...this.$state.get(), workflow: { type: "idle" } })
+    this.#notices.clearPrompt()
   }
 
   #showError(cause: unknown): void {
-    if (this.#disposed) return
-    this.$state.set({ ...this.$state.get(), feedback: { type: "error", message: errorMessage(cause) } })
+    if (!this.#disposed) this.#notices.promptError(errorMessage(cause))
   }
 }
 
-function imageMarkerFeedback(action: "Removed" | "Restored", count: number): PromptFeedback {
-  return { type: "status", message: `${action} ${count} attached image${count === 1 ? "" : "s"}` }
+function imageMarkerNotice(action: "Removed" | "Restored", count: number): string {
+  return `${action} ${count} attached image${count === 1 ? "" : "s"}`
 }
 
 function applyAuthenticationEvent(ceremony: AuthCeremony, event: AuthenticationEvent, requestId: number): AuthCeremony {
@@ -1827,7 +1775,7 @@ function reloadNoticeOutcome(result: SessionReloadResult): ReloadNoticeOutcome {
   return "success"
 }
 
-function reloadStatusMessage(result: SessionReloadResult): string {
+function reloadNoticeMessage(result: SessionReloadResult): string {
   const outcome = result.extensions?.outcome
   const base =
     outcome === "replaced"

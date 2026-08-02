@@ -10,6 +10,7 @@ import type {
 
 import { createSyntaxStyle, defaultTheme, type Theme } from "../theme.js"
 import { type BrowserOpener, SystemBrowserOpener } from "./browser-opener.js"
+import { BuiltInNotificationPresenter, type BuiltInNoticeActions } from "./built-in-notifications.js"
 import {
   type ClipboardReader,
   type ClipboardWriter,
@@ -38,7 +39,6 @@ import type { PromptSessionActions } from "./prompt/store.js"
 import { SessionScreen } from "./screen.js"
 import { SelectionCopyController } from "./selection-copy.js"
 import { SlashController } from "./slash-controller.js"
-import { SystemNotificationPresenter, type SystemNoticeActions } from "./system-notifications.js"
 import type { TranscriptDiagnostics } from "./transcript/view.js"
 
 type InitialProjectTrustState =
@@ -82,7 +82,7 @@ export class InteractiveMode {
   readonly #diagnosticFlags: TuiDiagnosticFlags
   readonly #diagnostics: TuiDiagnosticsOverlay | undefined
   readonly #notifications: NotificationCenter
-  readonly #systemNotifications: SystemNotificationPresenter
+  readonly #builtInNotifications: BuiltInNotificationPresenter
   #initialProjectTrust = createInitialProjectTrustState()
   #screen: SessionScreen
   #releaseGeneration: () => void
@@ -126,7 +126,7 @@ export class InteractiveMode {
           },
           dismissProjectTrust: () => {
             if (!this.#disposed) {
-              this.#systemNotifications.setProjectTrust("Project .zi configuration remains disabled for this session")
+              this.#builtInNotifications.setProjectTrust("Project .zi configuration remains disabled for this session")
             }
             this.#settleInitialProjectTrust()
           },
@@ -151,8 +151,8 @@ export class InteractiveMode {
       this.#keybindings,
       this.#clipboardWriter,
       () => this.#exitGestures.consume(),
-      () => this.#systemNotifications.copySucceeded(),
-      message => this.#systemNotifications.copyFailed(message)
+      () => this.#builtInNotifications.copySucceeded(),
+      message => this.#builtInNotifications.copyFailed(message)
     )
     this.#diagnosticFlags = diagnostics
     this.root = new BoxRenderable(renderer, {
@@ -163,18 +163,18 @@ export class InteractiveMode {
       backgroundColor: theme.surface.app
     })
     const notifications = new NotificationCenter(renderer, theme, notificationOptions)
-    let systemNotifications: SystemNotificationPresenter
+    let builtInNotifications: BuiltInNotificationPresenter
     try {
-      systemNotifications = new SystemNotificationPresenter(this.store, notifications)
+      builtInNotifications = new BuiltInNotificationPresenter(this.store, notifications)
     } catch (cause) {
       notifications.dispose()
       throw cause
     }
     let screen: SessionScreen
     try {
-      screen = this.#createScreen(systemNotifications)
+      screen = this.#createScreen(builtInNotifications)
     } catch (cause) {
-      systemNotifications.dispose()
+      builtInNotifications.dispose()
       notifications.dispose()
       throw cause
     }
@@ -183,13 +183,13 @@ export class InteractiveMode {
       notifications.attach(screen.transcript.root)
     } catch (cause) {
       screen.destroy()
-      systemNotifications.dispose()
+      builtInNotifications.dispose()
       notifications.dispose()
       throw cause
     }
     this.#notifications = notifications
     this.notifications = notifications
-    this.#systemNotifications = systemNotifications
+    this.#builtInNotifications = builtInNotifications
     this.#screen = screen
     this.#diagnostics =
       diagnostics.showTimeToFirstDraw || diagnostics.showStats || diagnostics.showMemory
@@ -246,7 +246,7 @@ export class InteractiveMode {
     this.#selectionCopy.dispose()
     this.#renderer.off(CliRenderEvents.SELECTION, this.#preservePromptFocus)
     this.#diagnostics?.destroy()
-    this.#systemNotifications.dispose()
+    this.#builtInNotifications.dispose()
     this.#notifications.dispose()
     this.#screen.destroy()
     this.#externalEditor.dispose()
@@ -261,44 +261,46 @@ export class InteractiveMode {
   }
 
   #showBootstrapWarning(diagnostic: SessionBootstrapDiagnostic | undefined): void {
-    this.#systemNotifications.setBootstrap(diagnostic?.message)
+    this.#builtInNotifications.setBootstrap(diagnostic?.message)
   }
 
   #showExtensionWarning(session: AgentSession): void {
     const snapshot = session.extensionHostSnapshot
     if (!snapshot) {
-      this.#systemNotifications.setExtension(undefined)
+      this.#builtInNotifications.setExtension(undefined)
       return
     }
     const diagnostic = snapshot.diagnostics[0] ?? snapshot.failure
     if (!diagnostic) {
-      this.#systemNotifications.setExtension(undefined)
+      this.#builtInNotifications.setExtension(undefined)
       return
     }
     const source = diagnostic.path ? `${basename(diagnostic.path)}: ` : ""
     const omitted = snapshot.omittedDiagnostics + Math.max(0, snapshot.diagnostics.length - 1)
     const suffix = omitted > 0 ? ` (${omitted} additional diagnostics)` : ""
-    this.#systemNotifications.setExtension(`Extension ${source}${diagnostic.message.replace(/[\r\n]+/g, " ")}${suffix}`)
+    this.#builtInNotifications.setExtension(
+      `Extension ${source}${diagnostic.message.replace(/[\r\n]+/g, " ")}${suffix}`
+    )
   }
 
   #presentProjectTrust(trust: ProjectTrustResolution | undefined): void {
     if (!trust) {
-      this.#systemNotifications.setProjectTrust(undefined)
+      this.#builtInNotifications.setProjectTrust(undefined)
       this.#settleInitialProjectTrust()
       return
     }
     switch (trust.type) {
       case "unresolved":
-        this.#systemNotifications.setProjectTrust(undefined)
+        this.#builtInNotifications.setProjectTrust(undefined)
         this.#screen.prompt.requestProjectTrust(trust.cwd)
         return
       case "untrusted":
-        this.#systemNotifications.setProjectTrust(trust.diagnostic?.message)
+        this.#builtInNotifications.setProjectTrust(trust.diagnostic?.message)
         this.#settleInitialProjectTrust()
         return
       case "trusted":
       case "not_required":
-        this.#systemNotifications.setProjectTrust(undefined)
+        this.#builtInNotifications.setProjectTrust(undefined)
         this.#settleInitialProjectTrust()
         return
       default:
@@ -316,13 +318,13 @@ export class InteractiveMode {
   #replaceScreen(): void {
     this.#notifications.detach()
     this.#screen.destroy()
-    this.#screen = this.#createScreen(this.#systemNotifications)
+    this.#screen = this.#createScreen(this.#builtInNotifications)
     this.root.add(this.#screen.root)
     this.#notifications.attach(this.#screen.transcript.root)
     this.#screen.prompt.focus()
   }
 
-  #createScreen(systemNotices: SystemNoticeActions): SessionScreen {
+  #createScreen(notices: BuiltInNoticeActions): SessionScreen {
     return new SessionScreen(
       this.#renderer,
       this.store,
@@ -335,7 +337,7 @@ export class InteractiveMode {
       this.#theme,
       this.#syntaxStyle,
       this.#diagnosticFlags.showTimeToFirstDraw || this.#diagnosticFlags.showStats || this.#diagnosticFlags.showMemory,
-      systemNotices,
+      notices,
       this.#sessionActions
     )
   }

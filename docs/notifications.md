@@ -80,18 +80,23 @@ History filters support `group_key`, `before`, `since`, `include_removed`, and `
 
 Fidget's Neovim-specific `show_history()` echo integration is intentionally not copied. Clients consume `get_history()` and choose their own history screen.
 
-## System notices
+## Built-in notices
 
-`SystemNotificationPresenter` exclusively claims the bounded `zi.system` group, displayed as `System ❰❰`. It receives narrow typed operations rather than exposing the unrestricted public notification API to prompt components. The group currently owns:
+`BuiltInNotificationPresenter` exclusively claims the bounded, headerless `zi.system` group. It receives narrow typed operations rather than exposing the unrestricted public notification API to prompt components. The group currently owns:
 
 - persistent bootstrap, extension, and project-trust diagnostics;
 - persistent automatic-compaction failures, removed after the next successful compaction;
 - finite selection-copy failures, removed immediately after a successful copy;
 - finite background-shell capacity refusals;
-- keyed `/reload` success, warning, and failure outcomes.
+- keyed `/reload` success, warning, and failure outcomes;
+- one stable `prompt` key for one-line prompt-workflow progress and outcomes.
 
-Session replacement clears every system key before the new session's authoritative diagnostics are projected. `Reloading…` remains foreground prompt status; only its settled outcome becomes a notice. Authentication ceremonies, picker errors, draft validation, and other focused workflows remain prompt feedback. System notices never submit input, wake the model, or copy transcript content.
+Prompt progress and errors persist until an admitted transition replaces or removes them. Prompt information and warnings are finite. In-flight progress skips removed history; settled information, warnings, and errors remain history-eligible. `/reload` replaces `Reloading…` on the `prompt` key with its separately keyed settled outcome. Session replacement clears every built-in key before the new session's authoritative diagnostics are projected.
+
+The animated `Working…`, `Retrying…`, `Compacting…`, and `Cancelling…` row remains above the composer and is not a notification item. Authentication ceremonies, picker guidance and errors, inline tool state, queued inputs, composer metadata, and the transcript's `New output` hint remain with their contextual owners. Built-in notices never submit input, wake the model, or copy transcript content.
+
+There is no extension-facing `zi.notify(...)` API. Adding one requires a separate client-independent event contract; extensions do not receive `NotificationCenter` or the presenter's private producer capability.
 
 ## Ownership
 
-`InteractiveMode` creates and disposes one notification owner plus its system presenter. It temporarily detaches the surface while replacing a session screen, preserving active notifications and history without allowing the destroyed screen to dispose a resource it did not create. Internal producers claim one group through a private center capability and release that claim on disposal; unscoped public lifecycle operations affect only unclaimed groups. Finite TTLs hold one renderer live request and expire from renderer frames; the owner releases that request when no finite items remain or on disposal.
+`InteractiveMode` creates and disposes one `NotificationCenter` plus its built-in presenter. It temporarily detaches the surface while replacing a session screen, preserving active notifications and history without allowing the destroyed screen to dispose a resource it did not create. Internal producers claim one group through a private center capability and release that claim on disposal; unscoped public lifecycle operations affect only unclaimed groups. Finite TTLs hold one renderer live request and expire from renderer frames; after expiry removes the last finite item, the owner requests the final cleared paint and releases that live request. Disposal releases it immediately.

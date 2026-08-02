@@ -12,7 +12,7 @@ import {
 import { truncateToCells } from "../../components/cell-text.js"
 import type { Theme } from "../../theme.js"
 import type { BrowserOpener } from "../browser-opener.js"
-import type { AuthCeremony, PromptFeedback } from "./state.js"
+import type { AuthCeremony } from "./state.js"
 
 export const maxAuthCeremonyRows = 8
 
@@ -25,7 +25,7 @@ type CeremonyLine = {
   readonly requestId?: number
 }
 
-export class PromptFeedbackView {
+export class AuthCeremonyView {
   readonly root: BoxRenderable
 
   readonly #renderer: CliRenderer
@@ -41,25 +41,28 @@ export class PromptFeedbackView {
   }
 
   /** Occupied rows; 0 when hidden. */
-  update(feedback: PromptFeedback, ceremony: AuthCeremony | undefined, width: number): number {
+  update(ceremony: AuthCeremony | undefined, width: number): number {
     clear(this.root)
     const innerWidth = Math.max(0, width - 2)
-    const lines = ceremony
-      ? ceremonyLines(ceremony, innerWidth, this.#theme)
-      : feedbackLines(feedback, innerWidth, this.#theme)
+    const lines = ceremony ? ceremonyLines(ceremony, innerWidth, this.#theme) : []
     if (lines.length === 0) {
       this.root.visible = false
       return 0
     }
 
     this.root.visible = true
-    for (const [index, line] of lines.entries()) {
-      this.root.add(this.#row(`feedback-${index}`, line))
-      if (line.openUrl && line.requestId !== undefined && line.requestId > this.#openedRequestId) {
-        this.#openedRequestId = line.requestId
-        // The OSC 8 link remains usable when the bounded platform opener fails.
-        void this.#browserOpener.open(line.openUrl).catch(() => {})
-      }
+    for (const [index, line] of lines.entries()) this.root.add(this.#row(`auth-ceremony-${index}`, line))
+
+    const pendingOpen = lines
+      .filter(
+        (line): line is CeremonyLine & { readonly openUrl: string; readonly requestId: number } =>
+          line.openUrl !== undefined && line.requestId !== undefined && line.requestId > this.#openedRequestId
+      )
+      .toSorted((left, right) => left.requestId - right.requestId)
+    for (const line of pendingOpen) {
+      this.#openedRequestId = line.requestId
+      // The OSC 8 link remains usable when the bounded platform opener fails.
+      void this.#browserOpener.open(line.openUrl).catch(() => {})
     }
     return lines.length
   }
@@ -73,13 +76,6 @@ export class PromptFeedbackView {
     row.add(new TextRenderable(this.#renderer, { wrapMode: "none", content: line.content }))
     return row
   }
-}
-
-function feedbackLines(feedback: PromptFeedback, width: number, theme: Theme): CeremonyLine[] {
-  if (feedback.type === "none") return []
-  const color =
-    feedback.type === "error" ? theme.text.error : feedback.type === "warning" ? theme.text.warning : theme.text.muted
-  return [{ kind: "status", content: textLine(color, feedback.message, width) }]
 }
 
 function ceremonyLines(ceremony: AuthCeremony, width: number, theme: Theme): CeremonyLine[] {

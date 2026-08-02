@@ -3,15 +3,16 @@ import { expect, test } from "bun:test"
 import { createTestRenderer } from "@opentui/core/testing"
 import { atom } from "nanostores"
 
+import { BuiltInNotificationPresenter } from "../../src/interactive/built-in-notifications.js"
 import type { AutomaticCompactionNoticeEvent } from "../../src/interactive/interactive-store.js"
 import {
   maxNotificationMessageBytes,
   NotificationCenter,
+  type NotificationGroupConfig,
   type NotificationGroupProducer,
   type NotificationLevel,
   type NotificationOptions
 } from "../../src/interactive/notifications.js"
-import { SystemNotificationPresenter } from "../../src/interactive/system-notifications.js"
 import { defaultTheme } from "../../src/theme.js"
 
 interface PublishedNotice {
@@ -21,9 +22,9 @@ interface PublishedNotice {
   readonly options: Omit<NotificationOptions, "key" | "group"> | undefined
 }
 
-test("system notifications own keyed passive outcomes and clear session state on recovery or replacement", () => {
+test("built-in notifications own keyed passive outcomes and clear session state on recovery or replacement", () => {
   const fixture = createFixture()
-  const presenter = new SystemNotificationPresenter(fixture.source, fixture.owner)
+  const presenter = new BuiltInNotificationPresenter(fixture.source, fixture.owner)
   fixture.removed.length = 0
 
   presenter.setBootstrap("Saved model unavailable")
@@ -36,17 +37,21 @@ test("system notifications own keyed passive outcomes and clear session state on
   fixture.emitCompaction({ type: "failed", message: "Compaction produced an empty summary" })
   fixture.emitCompaction({ type: "completed" })
 
-  expect(fixture.claim).toEqual({ key: "zi.system", capacity: 7 })
+  expect(fixture.claim).toEqual({
+    key: "zi.system",
+    capacity: 8,
+    config: { name: false, icon: false, ttl: 5, priority: 20 }
+  })
   expect(fixture.published).toEqual([
     persistentNotice("bootstrap", "Saved model unavailable"),
     persistentNotice("extensions", "Extension bad.ts: Cannot find module"),
     persistentNotice("project-trust", "Project configuration is disabled"),
-    finiteNotice("copy", "Copy failed; the selection was preserved", 3, 5),
-    finiteNotice("shell-capacity", "Background task capacity exceeded", 3, 5),
+    finiteNotice("copy", "Copy failed; the selection was preserved", 3, 5, false),
+    finiteNotice("shell-capacity", "Background task capacity exceeded", 3, 5, false),
     finiteNotice("reload", "Reloaded with one diagnostic", 3, Infinity),
     finiteNotice("automatic-compaction", "Compaction produced an empty summary", 4, Infinity)
   ])
-  expect(fixture.removed).toEqual(["copy", "extensions", "reload", "automatic-compaction"])
+  expect(fixture.removed).toEqual(["copy", "prompt", "extensions", "reload", "automatic-compaction"])
 
   fixture.removed.length = 0
   fixture.generation.set(1)
@@ -57,7 +62,8 @@ test("system notifications own keyed passive outcomes and clear session state on
     "automatic-compaction",
     "copy",
     "shell-capacity",
-    "reload"
+    "reload",
+    "prompt"
   ])
 
   presenter.dispose()
@@ -67,9 +73,51 @@ test("system notifications own keyed passive outcomes and clear session state on
   expect(fixture.published).toHaveLength(7)
 })
 
-test("system diagnostics are bounded before notification admission", () => {
+test("prompt notices replace one stable key with policy-specific lifetimes", () => {
   const fixture = createFixture()
-  const presenter = new SystemNotificationPresenter(fixture.source, fixture.owner)
+  const presenter = new BuiltInNotificationPresenter(fixture.source, fixture.owner)
+  fixture.removed.length = 0
+
+  presenter.promptProgress("Running command…")
+  presenter.promptInfo("Command completed")
+  presenter.promptWarning("Command needs attention")
+  presenter.promptError("Command failed")
+  presenter.clearPrompt()
+
+  expect(fixture.published).toEqual([
+    { key: "prompt", message: "Running command…", level: 2, options: { ttl: Infinity, skip_history: true } },
+    finiteNotice("prompt", "Command completed", 2, 4, false),
+    finiteNotice("prompt", "Command needs attention", 3, 5, false),
+    finiteNotice("prompt", "Command failed", 4, Infinity, false)
+  ])
+  expect(fixture.removed).toEqual(["prompt"])
+  presenter.dispose()
+})
+
+test("settled prompt outcomes re-enter history after in-flight progress", async () => {
+  const setup = await createTestRenderer({ width: 40, height: 8, useThread: false })
+  const center = new NotificationCenter(setup.renderer, defaultTheme)
+  const source = { $generation: atom(0), subscribeAutomaticCompaction: () => () => {} }
+  const presenter = new BuiltInNotificationPresenter(source, center)
+
+  try {
+    presenter.promptProgress("Running command…")
+    presenter.promptError("Command failed")
+    presenter.clearPrompt()
+
+    expect(center.get_history({ group_key: "zi.system", include_active: false }).map(item => item.message)).toEqual([
+      "Command failed"
+    ])
+  } finally {
+    presenter.dispose()
+    center.dispose()
+    setup.renderer.destroy()
+  }
+})
+
+test("built-in diagnostics are bounded before notification admission", () => {
+  const fixture = createFixture()
+  const presenter = new BuiltInNotificationPresenter(fixture.source, fixture.owner)
 
   presenter.setBootstrap("é".repeat(maxNotificationMessageBytes))
 
@@ -82,12 +130,12 @@ test("system diagnostics are bounded before notification admission", () => {
 
 test("successful reload notices are finite informational outcomes", () => {
   const fixture = createFixture()
-  const presenter = new SystemNotificationPresenter(fixture.source, fixture.owner)
+  const presenter = new BuiltInNotificationPresenter(fixture.source, fixture.owner)
   fixture.removed.length = 0
 
   presenter.reloadCompleted("success", "Reloaded settings, resources, and extensions")
 
-  expect(fixture.removed).toEqual(["extensions", "reload"])
+  expect(fixture.removed).toEqual(["prompt", "extensions", "reload"])
   expect(fixture.published).toEqual([finiteNotice("reload", "Reloaded settings, resources, and extensions", 2, 4)])
   presenter.dispose()
 })
@@ -96,7 +144,7 @@ test("filtered reload recovery removes a persistent error before publishing succ
   const setup = await createTestRenderer({ width: 40, height: 8, useThread: false })
   const center = new NotificationCenter(setup.renderer, defaultTheme, { filter: 3 })
   const source = { $generation: atom(0), subscribeAutomaticCompaction: () => () => {} }
-  const presenter = new SystemNotificationPresenter(source, center)
+  const presenter = new BuiltInNotificationPresenter(source, center)
 
   try {
     presenter.reloadFailed("Reload failed")
@@ -113,13 +161,13 @@ test("filtered reload recovery removes a persistent error before publishing succ
 
 test("a thrown reload preserves the still-authoritative extension diagnostic", () => {
   const fixture = createFixture()
-  const presenter = new SystemNotificationPresenter(fixture.source, fixture.owner)
+  const presenter = new BuiltInNotificationPresenter(fixture.source, fixture.owner)
   fixture.removed.length = 0
 
   presenter.setExtension("Existing extension diagnostic")
   presenter.reloadFailed("Reload failed before replacement")
 
-  expect(fixture.removed).toEqual(["reload"])
+  expect(fixture.removed).toEqual(["prompt", "reload"])
   expect(fixture.published).toEqual([
     persistentNotice("extensions", "Existing extension diagnostic"),
     finiteNotice("reload", "Reload failed before replacement", 4, Infinity)
@@ -127,7 +175,7 @@ test("a thrown reload preserves the still-authoritative extension diagnostic", (
   presenter.dispose()
 })
 
-test("system notification construction releases its claim when subscription fails", () => {
+test("built-in notification construction releases its claim when subscription fails", () => {
   const fixture = createFixture()
   const source = {
     $generation: fixture.generation,
@@ -136,7 +184,7 @@ test("system notification construction releases its claim when subscription fail
     }
   }
 
-  expect(() => new SystemNotificationPresenter(source, fixture.owner)).toThrow("subscription failed")
+  expect(() => new BuiltInNotificationPresenter(source, fixture.owner)).toThrow("subscription failed")
   expect(fixture.producerDisposed).toBe(true)
 })
 
@@ -147,7 +195,7 @@ function createFixture() {
   let compactionListener: ((event: AutomaticCompactionNoticeEvent) => void) | undefined
   let released = false
   let producerDisposed = false
-  let claim: { key: string | number; capacity: number } | undefined
+  let claim: { key: string | number; capacity: number; config: NotificationGroupConfig } | undefined
   const producer: NotificationGroupProducer = {
     notify: (key, message, level, options) => published.push({ key, message, level, options }),
     remove: key => {
@@ -159,8 +207,8 @@ function createFixture() {
     }
   }
   const owner: Pick<NotificationCenter, "claimGroup"> = {
-    claimGroup(key, _config, capacity) {
-      claim = { key, capacity }
+    claimGroup(key, config, capacity) {
+      claim = { key, capacity, config }
       return producer
     }
   }
@@ -197,6 +245,12 @@ function persistentNotice(key: string, message: string): PublishedNotice {
   return { key, message, level: 3, options: { ttl: Infinity, skip_history: true } }
 }
 
-function finiteNotice(key: string, message: string, level: NotificationLevel, ttl: number): PublishedNotice {
-  return { key, message, level, options: { ttl } }
+function finiteNotice(
+  key: string,
+  message: string,
+  level: NotificationLevel,
+  ttl: number,
+  skipHistory?: boolean
+): PublishedNotice {
+  return { key, message, level, options: skipHistory === undefined ? { ttl } : { ttl, skip_history: skipHistory } }
 }

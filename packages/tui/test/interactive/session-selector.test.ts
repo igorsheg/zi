@@ -74,7 +74,7 @@ test("/resume loads a bounded current-project catalog and replaces the whole ses
     expect(setup.mode.store.getSession()).toBe(runtime.session)
     expect(setup.captureCharFrame()).toContain("older answer")
     expect(setup.captureCharFrame()).toContain("Could not restore model removed/old-model. Using resume-pick")
-    expect(setup.captureCharFrame()).toContain("System ❰❰")
+    expect(setup.captureCharFrame()).not.toContain("System ❰❰")
     expect(promptInput(setup).focused).toBe(true)
     expect(() => previous.prompt("disposed")).toThrow("AgentSession is disposed")
   } finally {

@@ -374,7 +374,7 @@ Keep Composer mounted (picker-stack rules). Do not replace the editor with a for
 Preferred Zi shape:
 
 1. admit locally from prompt store / mode (optional early warning);
-2. set prompt status to reloading;
+2. publish the keyed `Reloading…` prompt notice;
 3. `await session.reload()`;
 4. call an explicit `SlashController.invalidateCatalog()` after the session returns, because session generation remains stable while resources changed;
 5. let the next completion read slash/skill/template commands from current `session` getters;

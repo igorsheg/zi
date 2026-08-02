@@ -6,7 +6,7 @@ Accepted
 
 ## Context
 
-Zi needs passive, updateable notices for long-running work and completion events without turning those notices into transcript messages or triggering model turns. The desired interaction follows Fidget: keyed replacement, grouped severity annotations, finite or persistent lifetimes, bottom-right upward stacking, suppression, and bounded history.
+Zi needs passive, updateable notices for workflow progress, completion events, and application diagnostics without turning those notices into transcript messages or triggering model turns. The desired interaction follows Fidget: keyed replacement, grouped severity annotations, finite or persistent lifetimes, bottom-right upward stacking, suppression, and bounded history.
 
 The notification surface is terminal-specific. `AgentSession` must not import OpenTUI or retain presentation state. A session screen is also too short-lived: interactive session replacement destroys and recreates it, while application notices may remain relevant across that replacement.
 
@@ -30,14 +30,17 @@ Zi bounds active items, visible items, history, text, keys, and attached JSON da
 
 An internal presenter may claim one notification group through a private center capability and an explicit capacity. The claim is the exclusive mutation authority for that group and is released by the presenter that acquired it. Public clear, reset, removal, and configuration operations cannot mutate claimed groups. Caller-owned items and producer-owned items occupy separate bounded partitions, so generic eviction cannot silently diverge a durable internal projection from a presenter's retained signature. Claimed capacities sum to at most 128; together with the maximum caller partition, the center retains at most 256 active items.
 
-`SystemNotificationPresenter` claims `zi.system` for passive mode and session outcomes. Persistent startup/configuration diagnostics are replaced or removed when their authoritative condition changes; all system keys are cleared at session generation changes before the new session is projected. Automatic-compaction failure persists until successful compaction, selection-copy failure is removed by successful delivery, and background-shell capacity refusal is finite. `/reload` keeps its admitted `Reloading…` transition in prompt status and publishes only the settled outcome. Prompt components receive only the narrow operations they need, never the unrestricted notification API.
+`BuiltInNotificationPresenter` claims `zi.system` for Zi-owned diagnostics, workflow progress, and outcomes. Persistent startup/configuration diagnostics are replaced or removed when their authoritative condition changes; all built-in keys are cleared at session generation changes before the new session is projected. Automatic-compaction failure persists until successful compaction, selection-copy failure is removed by successful delivery, and background-shell capacity refusal is finite. Prompt workflows replace one stable `prompt` key through narrow progress, information, warning, error, and removal operations. Progress and errors persist until an admitted transition replaces or removes them; information and warnings are finite. `/reload` replaces its `Reloading…` prompt notice with the separately keyed settled reload outcome.
+
+The animated `Working…`, `Retrying…`, `Compacting…`, and `Cancelling…` row remains in `PromptView` above the composer. It is continuously derived activity presentation, not a notification item. Authentication ceremonies, picker guidance and errors, inline tool state, queued inputs, composer metadata, and the transcript's `New output` hint remain with their contextual owners.
 
 ## Consequences
 
 - Notifications remain passive presentation and cannot autonomously start a model turn.
 - Keyed progress can update without transcript churn or renderable replacement.
-- A mode-owned presenter projects passive system outcomes into one producer-owned bounded group without copying transcript content.
-- Prompt feedback remains the foreground workflow channel; passive diagnostics no longer overwrite it.
+- A mode-owned presenter projects Zi-owned diagnostics and workflow notices into one producer-owned bounded group without copying transcript content.
+- `NotificationCenter` is the only owner of one-line notice state; prompt workflow and session state remain authoritative sources rather than mirrored presentation state.
+- The dedicated working row and contextual interactive surfaces remain separate from notification items.
 - Session-screen replacement preserves notification state without split ownership.
 - Other clients may define their own notification transport later; this ADR does not add presentation state to `AgentSession` or the extension protocol.
 - Extension-facing notifications require a separate client-independent event contract before they can use this surface.

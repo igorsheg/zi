@@ -213,16 +213,20 @@ The instance-scoped terminal owner of semantic action IDs, effective key overrid
 _Avoid_: Global keymap, raw product chords in components, command bus
 
 **Notification center**:
-The `InteractiveMode`-owned controller of active notification groups, exclusive internal group claims, keyed item replacement, finite expiry, close and suppression state, bounded removed history, and the retained bottom-right transcript surface. It remains passive presentation, survives session-screen replacement, and never starts a model turn.
+The `InteractiveMode`-owned controller of active notification groups, exclusive internal group claims, keyed item replacement, finite expiry, close and suppression state, bounded removed history, and the retained bottom-right transcript surface. It presents passive notices, including workflow progress and outcomes, survives session-screen replacement, and never starts a model turn.
 _Avoid_: Toast store, transcript message, session notification state
 
-**System notification presenter**:
-The `InteractiveMode`-owned producer for the exclusive bounded `zi.system` group. It translates passive bootstrap, extension, project-trust, compaction, copy, shell-capacity, and reload outcomes into keyed notices, and removes them when their authoritative condition or session generation changes.
-_Avoid_: Prompt feedback proxy, public notification API in components, session state
+**Built-in notification presenter**:
+The `InteractiveMode`-owned producer for the exclusive bounded `zi.system` group. It translates Zi-owned bootstrap, extension, project-trust, compaction, copy, shell-capacity, reload, and prompt-workflow conditions into keyed notices, and removes them when their authoritative condition or session generation changes.
+_Avoid_: Prompt-status owner, public notification API in components, session state
+
+**Working status**:
+The dedicated `PromptView` activity row derived from provider runs, compaction, cancellation, and retry backoff. It remains separate from `NotificationCenter` because it is continuously animated layout status rather than a notification item.
+_Avoid_: Workflow notice, transcript message, copied session state
 
 **Notification item**:
 One bounded active notice identified optionally by a key within a group. It retains message, annotation, severity, expiry, visibility, history policy, and immutable JSON data until expiry or explicit removal moves it to bounded history.
-_Avoid_: Transcript row, prompt feedback, subagent result
+_Avoid_: Transcript row, working status, subagent result
 
 **Imperative TUI component**:
 An owner of one OpenTUI renderable subtree and its direct updates. It exposes concrete renderables and explicit disposal; it may compose product presentation but does not decide coding-agent policy.

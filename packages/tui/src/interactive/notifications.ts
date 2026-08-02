@@ -673,7 +673,7 @@ export class NotificationCenter implements NotificationAPI {
     this.#render()
   }
 
-  #syncClock(): void {
+  #syncClock(): ClockState {
     const needsClock = this.#groups.some(group => group.items.some(item => item.expiresAt !== null))
     if (needsClock && this.#clock.type === "idle") {
       this.#clock = { type: "live" }
@@ -681,6 +681,7 @@ export class NotificationCenter implements NotificationAPI {
     } else if (!needsClock) {
       this.#stopClock()
     }
+    return this.#clock
   }
 
   #stopClock(): void {
@@ -744,8 +745,10 @@ export class NotificationCenter implements NotificationAPI {
     if (this.#disposed || this.#clock.type === "idle") return
     const before = this.#activeCount()
     this.#expire(this.#now())
-    if (before !== this.#activeCount()) this.#render()
-    this.#syncClock()
+    const changed = before !== this.#activeCount()
+    if (changed) this.#render()
+    const clock = this.#syncClock()
+    if (changed && clock.type === "idle") this.#renderer.requestRender()
   }
 
   #onResize = (): void => {

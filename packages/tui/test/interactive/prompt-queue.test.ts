@@ -126,7 +126,7 @@ test("a maximum queue preserves the constrained composer and Ctrl+C leaves pendi
     expect(session.queuedInputs.steering).toHaveLength(32)
     const overflowFrame = setup.captureCharFrame()
     expect(overflowFrame).toContain("Queue capacity exceeded")
-    expect(overflowFrame).toContain("… 32 more queued")
+    expect(overflowFrame).toContain("… 31 more queued")
     expect(overflowFrame).toContain("keep this exact draft")
     expect(setup.renderer.currentFocusedRenderable).toBe(input)
     expect(

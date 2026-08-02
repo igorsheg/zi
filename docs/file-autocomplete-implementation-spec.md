@@ -371,7 +371,7 @@ Escape closes a file frame and leaves the exact draft, cursor, markers, and sele
 
 A successful empty result closes the frame. Refinements that append to both the raw query and its canonical matcher query start no redundant search. Backspacing—including `empty/` to `empty`—rewriting, or canonicalization that removes/reinterprets matcher text admits search again. A current exact unquoted file path at the end of its token also closes the frame without editing the draft. Exact directories remain visible for drill-down, while quoted references close naturally when their closing quote ends the context. The typed `@query` always remains ordinary text.
 
-Filesystem failures are silent optional-completion failures unless they violate an Zi invariant. They close the frame without modifying the draft. Cancellation and stale completion never produce prompt feedback.
+Filesystem failures are silent optional-completion failures unless they violate a Zi invariant. They close the frame without modifying the draft. Cancellation and stale completion never produce a workflow notice.
 
 # 4. Owners and data flow
 

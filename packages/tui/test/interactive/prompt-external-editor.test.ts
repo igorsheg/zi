@@ -89,7 +89,7 @@ test("external editor admission is single-flight and stale completion cannot cro
   }
 })
 
-test("external editor failure preserves the draft and reports feedback", async () => {
+test("external editor failure preserves the draft and reports a notice", async () => {
   const models = createModels()
   models.setProvider(fauxProvider().provider)
   const { session } = await createTestAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })

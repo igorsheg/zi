@@ -13,14 +13,14 @@ import { composerGeometry, createComposer, type Composer, type ComposerSlots } f
 import { ShimmerTextView } from "../../components/shimmer-text.js"
 import type { Theme } from "../../theme.js"
 import type { BrowserOpener } from "../browser-opener.js"
+import type { BuiltInNoticeActions } from "../built-in-notifications.js"
 import { maxPastedTextBytes, type ClipboardReader } from "../clipboard.js"
 import type { ExitGestureController } from "../exit-gesture.js"
 import type { ExternalEditor } from "../external-editor.js"
 import type { InteractiveKeybindings, PromptKeyAction } from "../interactive-keybindings.js"
 import type { InteractiveStore } from "../interactive-store.js"
 import type { SlashController } from "../slash-controller.js"
-import type { SystemNoticeActions } from "../system-notifications.js"
-import { PromptFeedbackView } from "./feedback-view.js"
+import { AuthCeremonyView } from "./auth-ceremony-view.js"
 import { captureFileCompletionInput } from "./file-completion.js"
 import { SessionGreeterView } from "./greeter-view.js"
 import { PickerStackView } from "./picker-view.js"
@@ -41,10 +41,10 @@ export class PromptView {
   readonly #keybindings: InteractiveKeybindings
   readonly #exitGestures: ExitGestureController
   readonly #externalEditor: ExternalEditor
-  readonly #systemNotices: SystemNoticeActions
+  readonly #notices: BuiltInNoticeActions
   readonly #store: PromptStore
   readonly #working: ShimmerTextView
-  readonly #feedback: PromptFeedbackView
+  readonly #authCeremony: AuthCeremonyView
   readonly #queue: QueuedInputsView
   readonly #greeter: SessionGreeterView
   readonly #composer: Composer
@@ -66,7 +66,7 @@ export class PromptView {
     clipboard: ClipboardReader,
     externalEditor: ExternalEditor,
     theme: Theme,
-    systemNotices: SystemNoticeActions,
+    notices: BuiltInNoticeActions,
     sessionActions?: PromptSessionActions
   ) {
     this.#renderer = renderer
@@ -74,13 +74,13 @@ export class PromptView {
     this.#keybindings = keybindings
     this.#exitGestures = exitGestures
     this.#externalEditor = externalEditor
-    this.#systemNotices = systemNotices
-    this.#store = createPromptStore(interactive, slash, sessionActions, clipboard, systemNotices)
+    this.#notices = notices
+    this.#store = createPromptStore(interactive, slash, sessionActions, clipboard, notices)
     this.root = new BoxRenderable(renderer, { flexDirection: "column", flexShrink: 0 })
     this.root.onLifecyclePass = this.#refreshWorkingStatus
 
     this.#working = new ShimmerTextView(renderer, "Working…", theme.text.muted, theme.text.primary)
-    this.#feedback = new PromptFeedbackView(renderer, browserOpener, theme)
+    this.#authCeremony = new AuthCeremonyView(renderer, browserOpener, theme)
     this.#queue = new QueuedInputsView(renderer, keybindings, theme)
     this.#greeter = new SessionGreeterView(renderer, theme)
 
@@ -105,7 +105,7 @@ export class PromptView {
 
     // Transient status stays above stable session metadata; PickerStack is the only below-input choice surface.
     this.root.add(this.#working.root)
-    this.root.add(this.#feedback.root)
+    this.root.add(this.#authCeremony.root)
     this.root.add(this.#queue.root)
     this.root.add(this.#greeter.root)
     this.root.add(this.#composer.root)
@@ -137,7 +137,7 @@ export class PromptView {
     for (const release of this.#release.splice(0)) release()
     this.root.onLifecyclePass = null
     this.#working.destroy()
-    this.#feedback.destroy()
+    this.#authCeremony.destroy()
     this.#queue.destroy()
     this.#greeter.destroy()
     this.#store.dispose()
@@ -157,7 +157,7 @@ export class PromptView {
     this.#input.attributes = secretInput ? TextAttributes.HIDDEN : 0
     this.#input.selectable = !secretInput
     if (secretInput) this.#renderer.clearSelection()
-    const feedbackRows = this.#feedback.update(prompt.feedback, prompt.authCeremony, this.#renderer.width)
+    const authCeremonyRows = this.#authCeremony.update(prompt.authCeremony, this.#renderer.width)
     const working = session.isStreaming || session.compactionStatus.type === "running"
     const pickerOpen = Boolean(this.#store.picker.presentation(this.#input.plainText))
     const greeterRows = this.#greeter.update(
@@ -166,7 +166,7 @@ export class PromptView {
       this.#renderer.height,
       pickerOpen
     )
-    const fixedRows = geometry.protectedRows + greeterRows + (working ? 1 : 0) + feedbackRows
+    const fixedRows = geometry.protectedRows + greeterRows + (working ? 1 : 0) + authCeremonyRows
     const pickerVisible = this.#pickerStack.update(Math.max(0, this.#renderer.height - fixedRows))
 
     this.#working.setText(workingStatusText(session, this.#keybindings.getHint("app.interrupt"), Date.now()))
@@ -198,11 +198,11 @@ export class PromptView {
       return
     }
     if (event.metadata?.kind === "binary") {
-      this.#store.reportFeedback({ type: "warning", message: "Unsupported binary clipboard content" })
+      this.#notices.promptWarning("Unsupported binary clipboard content")
       return
     }
     if (event.bytes.byteLength > maxPastedTextBytes) {
-      this.#store.reportFeedback({ type: "error", message: "Pasted text exceeds the 1 MiB limit" })
+      this.#notices.promptError("Pasted text exceeds the 1 MiB limit")
       return
     }
 
@@ -234,10 +234,7 @@ export class PromptView {
         return
       case "range":
         if (this.#composer.replaceRange(edit) === "unavailable") {
-          this.#store.reportFeedback({
-            type: "warning",
-            message: "File completion could not replace this marked range"
-          })
+          this.#notices.promptWarning("File completion could not replace this marked range")
         }
         this.#syncedImages = this.#composer.activeImages()
         this.#input.focus()
@@ -322,7 +319,7 @@ export class PromptView {
       case "background_task": {
         consume(key)
         const result = this.#interactive.backgroundForegroundShellTask()
-        if (result.type === "capacity_exceeded") this.#systemNotices.backgroundTaskCapacityExceeded()
+        if (result.type === "capacity_exceeded") this.#notices.backgroundTaskCapacityExceeded()
         return
       }
       case "external_editor":
@@ -382,7 +379,7 @@ export class PromptView {
     if (state.type !== "editing" || state.operationId !== operationId) return
     this.#externalEditorState = { type: "idle" }
     if (result.type === "complete") this.#replaceInput(result.content)
-    else this.#store.reportFeedback({ type: "warning", message: result.message })
+    else this.#notices.promptWarning(result.message)
   }
 
   #handleHistoryKey(key: KeyEvent, result: ReturnType<Composer["historyPrevious"]>): void {

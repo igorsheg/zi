@@ -4,46 +4,54 @@ import type { AutomaticCompactionNoticeEvent } from "./interactive-store.js"
 import {
   maxNotificationMessageBytes,
   type NotificationCenter,
-  type NotificationGroupProducer
+  type NotificationGroupProducer,
+  type NotificationLevel
 } from "./notifications.js"
 
 export type ReloadNoticeOutcome = "success" | "warning" | "error"
 
-export interface SystemNoticeActions {
+export interface BuiltInNoticeActions {
+  promptProgress(message: string): void
+  promptInfo(message: string): void
+  promptWarning(message: string): void
+  promptError(message: string): void
+  clearPrompt(): void
   backgroundTaskCapacityExceeded(): void
   reloadCompleted(outcome: ReloadNoticeOutcome, message: string): void
   reloadFailed(message: string): void
 }
 
-interface SystemNoticeSource {
+interface BuiltInNoticeSource {
   readonly $generation: ReadableAtom<number>
   subscribeAutomaticCompaction(listener: (event: AutomaticCompactionNoticeEvent) => void): () => void
 }
 
-type SystemNoticeOwner = Pick<NotificationCenter, "claimGroup">
-type SystemNoticeKey = (typeof systemNoticeKeys)[number]
+type BuiltInNoticeOwner = Pick<NotificationCenter, "claimGroup">
+type BuiltInNoticeKey = (typeof builtInNoticeKeys)[number]
 
-const systemNoticeKeys = [
+const promptNoticeKey = "prompt"
+const builtInNoticeKeys = [
   "bootstrap",
   "extensions",
   "project-trust",
   "automatic-compaction",
   "copy",
   "shell-capacity",
-  "reload"
+  "reload",
+  promptNoticeKey
 ] as const
 
-/** Owns passive mode and session notices that must not compete with prompt feedback. */
-export class SystemNotificationPresenter implements SystemNoticeActions {
+/** Projects Zi-owned one-line notices through one bounded Fidget group. */
+export class BuiltInNotificationPresenter implements BuiltInNoticeActions {
   readonly #notifications: NotificationGroupProducer
   readonly #release: readonly (() => void)[]
   #disposed = false
 
-  constructor(source: SystemNoticeSource, notifications: SystemNoticeOwner) {
+  constructor(source: BuiltInNoticeSource, notifications: BuiltInNoticeOwner) {
     this.#notifications = notifications.claimGroup(
       "zi.system",
-      { name: "System", icon: "❰❰", ttl: 5, priority: 20 },
-      systemNoticeKeys.length
+      { name: false, icon: false, ttl: 5, priority: 20 },
+      builtInNoticeKeys.length
     )
     const release: (() => void)[] = []
     try {
@@ -81,21 +89,40 @@ export class SystemNotificationPresenter implements SystemNoticeActions {
   }
 
   copyFailed(message: string): void {
-    if (this.#disposed) return
-    this.#notifications.notify("copy", boundedNoticeMessage(message), 3, { ttl: 5 })
+    this.#notify("copy", message, 3, 5)
   }
 
   copySucceeded(): void {
     if (!this.#disposed) this.#notifications.remove("copy")
   }
 
+  promptProgress(message: string): void {
+    this.#notify(promptNoticeKey, message, 2, Infinity, true)
+  }
+
+  promptInfo(message: string): void {
+    this.#notify(promptNoticeKey, message, 2, 4)
+  }
+
+  promptWarning(message: string): void {
+    this.#notify(promptNoticeKey, message, 3, 5)
+  }
+
+  promptError(message: string): void {
+    this.#notify(promptNoticeKey, message, 4, Infinity)
+  }
+
+  clearPrompt(): void {
+    if (!this.#disposed) this.#notifications.remove(promptNoticeKey)
+  }
+
   backgroundTaskCapacityExceeded(): void {
-    if (this.#disposed) return
-    this.#notifications.notify("shell-capacity", "Background task capacity exceeded", 3, { ttl: 5 })
+    this.#notify("shell-capacity", "Background task capacity exceeded", 3, 5)
   }
 
   reloadCompleted(outcome: ReloadNoticeOutcome, message: string): void {
     if (this.#disposed) return
+    this.#notifications.remove(promptNoticeKey)
     this.#notifications.remove("extensions")
     this.#notifications.remove("reload")
     this.#publishReload(outcome, message)
@@ -103,6 +130,7 @@ export class SystemNotificationPresenter implements SystemNoticeActions {
 
   reloadFailed(message: string): void {
     if (this.#disposed) return
+    this.#notifications.remove(promptNoticeKey)
     this.#notifications.remove("reload")
     this.#publishReload("error", message)
   }
@@ -121,7 +149,12 @@ export class SystemNotificationPresenter implements SystemNoticeActions {
     })
   }
 
-  #setPersistent(key: SystemNoticeKey, message: string | undefined): void {
+  #notify(key: BuiltInNoticeKey, message: string, level: NotificationLevel, ttl: number, skipHistory = false): void {
+    if (this.#disposed) return
+    this.#notifications.notify(key, boundedNoticeMessage(message), level, { ttl, skip_history: skipHistory })
+  }
+
+  #setPersistent(key: BuiltInNoticeKey, message: string | undefined): void {
     if (this.#disposed) return
     if (message === undefined) {
       this.#notifications.remove(key)
@@ -132,7 +165,7 @@ export class SystemNotificationPresenter implements SystemNoticeActions {
 
   #clearSessionNotices = (): void => {
     if (this.#disposed) return
-    for (const key of systemNoticeKeys) this.#notifications.remove(key)
+    for (const key of builtInNoticeKeys) this.#notifications.remove(key)
   }
 }
 

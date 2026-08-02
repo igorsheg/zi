@@ -185,7 +185,7 @@ Also recorded in [`pi-mono-extension-api-reference.md`](pi-mono-extension-api-re
 - not a transcript identity
 - lifetime is the current process/screen
 
-Zi already has the analogous prompt feedback path (`PromptStore` status/error/warning). Compaction success feedback (`Compacted 123k → ~24k…`) belongs here unless the product explicitly wants a durable row.
+Zi already has the analogous built-in workflow-notice path. The finite compaction-success notice (`Compacted 123k → ~24k…`) belongs here unless the product explicitly wants a durable row.
 
 ### `type: "custom"` — durable state entry
 
@@ -326,7 +326,7 @@ Default custom-message UI is a labelled panel (`[customType]` + markdown body). 
 | TUI custom panel when `display: true`   | `transcript/message-view.ts`                  | no `customType` label chrome yet                                |
 | bash `excludeFromContext`               | context projection                            | presentation retains it                                         |
 | Compaction marker → `compactionSummary` | session projection + TUI panel                | durable transcript item already exists                          |
-| Ephemeral compaction feedback           | `PromptStore`                                 | not JSONL                                                       |
+| Ephemeral compaction notice             | `BuiltInNotificationPresenter`                | not JSONL                                                       |
 | Extension host lifecycle/tools          | coding-agent extensions                       | custom messages/entries explicitly deferred                     |
 
 ## 2.2 Missing for Pi alignment
@@ -582,7 +582,7 @@ Remain client-local:
 
 - compact success toast
 - extension `notify`-style warnings once that API exists
-- auth/copy/paste feedback
+- auth/copy/paste notices
 
 ## 3.7 Alignment choices where Zi should tighten Pi
 

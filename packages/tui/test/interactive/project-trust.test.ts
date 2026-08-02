@@ -61,7 +61,7 @@ test("dismissing project trust reports passive configuration exclusion", async (
     const frame = await waitForFrame(setup, "Project .zi configuration remains disabled")
 
     expect(runtime.projectTrust.type).toBe("unresolved")
-    expect(frame).toContain("System ❰❰")
+    expect(frame).not.toContain("System ❰❰")
     expect(runtime.session.messages).toEqual([])
   } finally {
     setup.destroy()
