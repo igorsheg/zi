@@ -329,9 +329,17 @@ class SubagentProvider {
           )
         }
       }
-      if (++this.#resultProbeCount > 40)
-        throw new Error("Compiled completion did not become durable during result probe")
-      await Bun.sleep(25)
+      if (this.#resultProbeCount === 0) {
+        await waitFor(
+          () => this.#childInitialReplySent,
+          10_000,
+          "Compiled child did not finish its initial provider response before result probing"
+        )
+      }
+      if (++this.#resultProbeCount > 100) {
+        throw new Error(`Compiled completion did not become durable during result probe (${this.diagnostic()})`)
+      }
+      await Bun.sleep(100)
       this.#resultProbeId = `acceptance_result_probe_${this.#resultProbeCount}`
       return eventStreamResponse(toolEvents("list_subagents", this.#resultProbeId, {}))
     }
