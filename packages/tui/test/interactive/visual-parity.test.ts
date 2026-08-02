@@ -73,7 +73,7 @@ test("representative session keeps the accepted visual hierarchy at normal and c
       "",
       "",
       "",
-      "╭─/workspace/zi─────────────────────────────────────ctx 15%/247k faux-1 (high)─╮",
+      "╭─/workspace/zi───────────────────────────────────ctx 15%/247k • faux-1 (high)─╮",
       "│                                                                              │",
       "╰──────────────────────────────────────────────────────────────────────────────╯"
     ])

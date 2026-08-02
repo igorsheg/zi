@@ -439,19 +439,21 @@ export function createComposer(ctx: RenderContext, options: ComposerOptions): Co
   }
 }
 
+const railItemSeparator = " • "
+
 function layoutRail(geometry: ComposerGeometry, slots: ComposerSlots): RailLayout {
   if (!geometry.bordered || slots.topRight.length === 0) return { topRightText: "", topRightWidth: 0 }
   const available = geometry.columns - 4 - textWidth(slots.topLeft) - (slots.topLeft ? 1 : 0)
-  let topRightText = ""
+  const separatorWidth = textWidth(railItemSeparator)
+  const visibleItems: string[] = []
   let topRightWidth = 0
   for (const item of slots.topRight) {
-    const itemWidth = textWidth(item)
-    const nextWidth = topRightWidth + (topRightText ? 1 : 0) + itemWidth
+    const nextWidth = topRightWidth + (visibleItems.length === 0 ? 0 : separatorWidth) + textWidth(item)
     if (nextWidth > available) break
-    topRightText += `${topRightText ? " " : ""}${item}`
+    visibleItems.push(item)
     topRightWidth = nextWidth
   }
-  return { topRightText, topRightWidth }
+  return { topRightText: visibleItems.join(railItemSeparator), topRightWidth }
 }
 
 function drawTopRightSlot(
