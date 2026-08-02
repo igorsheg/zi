@@ -289,7 +289,7 @@ function agentNotices(): readonly ToolNotice[] {
 
 function waitSummaryLine(agent: SubagentToolAgentDetails): string {
   const label = agentNameLabel(agent.name)
-  const completion = currentCompletion(agent)
+  const completion = waitCompletion(agent)
   if (!completion) return `${label} ${lifecycleLabel(agent.lifecycle)}`
   const evidence = completion.error || completion.reason || completion.text
   return `${label} ${completionLabel(completion.status)} · ${formatDuration(completion.durationMs)}${
@@ -298,7 +298,7 @@ function waitSummaryLine(agent: SubagentToolAgentDetails): string {
 }
 
 function waitEvidenceSections(agent: SubagentToolAgentDetails): string[] {
-  const completion = currentCompletion(agent)
+  const completion = waitCompletion(agent)
   if (!completion) return []
   const fields = [
     ...(completion.error ? [{ label: "error", text: completion.error }] : []),
@@ -324,11 +324,12 @@ function waitEvidenceSections(agent: SubagentToolAgentDetails): string[] {
   return sections
 }
 
-function currentCompletion(
+function waitCompletion(
   agent: SubagentToolAgentDetails
 ): NonNullable<SubagentToolAgentDetails["completion"]> | undefined {
   const completion = agent.completion
-  return !completion || (agent.workCycle !== undefined && completion.workCycle !== agent.workCycle)
+  const capturedWorkCycle = agent.capturedWorkCycle ?? agent.workCycle
+  return !completion || (capturedWorkCycle !== undefined && completion.workCycle !== capturedWorkCycle)
     ? undefined
     : completion
 }

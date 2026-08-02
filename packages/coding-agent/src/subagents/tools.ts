@@ -5,7 +5,13 @@ import type { ExtensionSubagentProfile } from "@with-zi/extension-api"
 import type { SubagentCompletion } from "./child-process.js"
 import { clipUtf8 } from "./child-process.js"
 import type { SubagentSupervisor, SubagentSnapshot } from "./supervisor.js"
-import { maxSubagentNameBytes, maxSubagentPromptBytes, maxWaitNames, maxWaitTimeoutMs } from "./supervisor.js"
+import {
+  maxLiveChildren,
+  maxSubagentNameBytes,
+  maxSubagentPromptBytes,
+  maxWaitNames,
+  maxWaitTimeoutMs
+} from "./supervisor.js"
 import {
   maxProjectedSubagentProfileDetailsBytes,
   projectSubagentToolAgent,
@@ -17,14 +23,15 @@ const subagentName = Type.String({
   minLength: 1,
   maxLength: maxSubagentNameBytes,
   pattern: "^[a-z][a-z0-9_-]*$",
-  description: "Unique runtime name. Use lowercase letters, numbers, _ or -."
+  description:
+    "Runtime routing name assigned by spawn_subagent; separate from the profile name. Reuse it for later operations. Use lowercase letters, numbers, _ or -."
 })
 const messageParameters = Type.Object({
   name: subagentName,
   text: Type.String({
     minLength: 1,
     maxLength: maxSubagentPromptBytes,
-    description: "Information to queue without starting an idle subagent turn."
+    description: "Context or information for the current or next task; not a new task. Never starts an idle turn."
   })
 })
 const followupParameters = Type.Object({
@@ -32,7 +39,7 @@ const followupParameters = Type.Object({
   text: Type.String({
     minLength: 1,
     maxLength: maxSubagentPromptBytes,
-    description: "Follow-up task that starts an idle turn or extends the current turn."
+    description: "Task to perform. Starts an idle subagent turn or extends its current work cycle."
   })
 })
 const nameParameters = Type.Object({ name: subagentName })
@@ -42,7 +49,7 @@ const waitParameters = Type.Object({
       minItems: 1,
       maxItems: maxWaitNames,
       uniqueItems: true,
-      description: `Subagents to wait for. Omit to collect up to ${maxWaitNames} currently working or ready subagents.`
+      description: `Runtime names to wait for. Omit to capture the bounded eligible set of up to ${maxWaitNames} subagents once when the call begins.`
     })
   ),
   timeout_ms: Type.Optional(
@@ -101,8 +108,7 @@ export function createSubagentTools(
   const spawn: AgentTool<typeof spawnParameters, SubagentToolDetails> = {
     name: "spawn_subagent",
     label: "spawn_subagent",
-    description:
-      "Start one background Zi subagent from an admitted profile. Returns its runtime name after admission; use wait_subagents for output.",
+    description: `Start one background Zi subagent from an admitted profile under a new parent-session-unique runtime name. Returns after admission, not completion; use wait_subagents to collect output. A parent may have at most ${maxLiveChildren} live subagents.`,
     parameters: spawnParameters,
     executionMode: "parallel",
     async execute(_id, input, signal) {
@@ -120,7 +126,7 @@ export function createSubagentTools(
     name: "send_subagent",
     label: "send_subagent",
     description:
-      "Deliver information without starting a subagent turn. An idle subagent retains it for its next task; a running subagent receives it as follow-up.",
+      "Queue context or information for an existing subagent. This never starts an idle turn; use continue_subagent to assign work or wake an idle subagent.",
     parameters: messageParameters,
     executionMode: "parallel",
     async execute(_id, input) {
@@ -137,7 +143,7 @@ export function createSubagentTools(
     name: "continue_subagent",
     label: "continue_subagent",
     description:
-      "Assign follow-up work to a subagent. Starts a turn when it is idle; otherwise delivers the task to its current turn.",
+      "Assign follow-up work to an existing subagent. Starts a new turn when idle; while running, adds the task to the current work cycle.",
     parameters: followupParameters,
     executionMode: "parallel",
     async execute(_id, input) {
@@ -158,7 +164,7 @@ export function createSubagentTools(
   const wait: AgentTool<typeof waitParameters, SubagentToolDetails> = {
     name: "wait_subagents",
     label: "wait_subagents",
-    description: `Wait for requested subagent tasks, or omit names to collect up to ${maxWaitNames} currently working or ready subagents. Returns completions or current status without cancelling subagents.`,
+    description: `Wait for current work of named subagents. With names omitted, capture up to ${maxWaitNames} subagents that are working or have an uncollected result when the call begins; later changes do not join the wait. An empty capture returns immediately. Timeout never cancels work, and all_completed describes only the captured set.`,
     parameters: waitParameters,
     executionMode: "parallel",
     async execute(_id, input, signal) {
@@ -193,7 +199,7 @@ export function createSubagentTools(
   const close: AgentTool<typeof nameParameters, SubagentToolDetails> = {
     name: "close_subagent",
     label: "close_subagent",
-    description: "Close one subagent process and release its live-child capacity.",
+    description: `Close a subagent process if it is still live. Idle subagents still occupy one of ${maxLiveChildren} live-child slots; closing one releases its slot. The runtime name remains reserved.`,
     parameters: nameParameters,
     executionMode: "parallel",
     async execute(_id, input) {
@@ -317,9 +323,7 @@ function largestWaitEvidence(
 
 function projectSnapshot(snapshot: SubagentSnapshot): WaitSubagent {
   const completion = snapshot.completion
-  if (!completion || completion.workCycle !== snapshot.workCycle) {
-    return { name: snapshot.name, status: snapshot.lifecycle }
-  }
+  if (!completion) return { name: snapshot.name, status: snapshot.lifecycle }
   return {
     name: snapshot.name,
     completion: {
@@ -346,7 +350,7 @@ function projectListSnapshot(snapshot: SubagentSnapshot) {
 }
 
 function spawnProfileDescription(profiles: readonly ExtensionSubagentProfile[]): string {
-  const heading = "Admitted profile. Choose by purpose:\n"
+  const heading = "Admitted profile (reusable configuration, not a runtime name). Choose by purpose:\n"
   const structuralBytes =
     Buffer.byteLength(heading) +
     profiles.reduce((total, profile) => total + Buffer.byteLength(profile.name) + Buffer.byteLength(": \n"), 0)

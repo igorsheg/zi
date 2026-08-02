@@ -18,6 +18,7 @@ export interface SubagentToolAgentDetails {
   readonly name: string
   readonly lifecycle: ChildLifecycleState["type"]
   readonly workCycle?: number
+  readonly capturedWorkCycle?: number
   readonly completionDelivery?: CompletionDelivery["type"]
   readonly completion?: SubagentToolCompletionDetails
 }
@@ -163,6 +164,7 @@ interface MutableAgentDetails {
   name: string
   lifecycle: ChildLifecycleState["type"]
   workCycle?: number
+  capturedWorkCycle?: number
   completionDelivery?: CompletionDelivery["type"]
   completion?: MutableCompletionDetails
 }
@@ -203,6 +205,7 @@ function projectAgent(snapshot: SubagentSnapshot): SubagentToolAgentDetails {
     name: snapshot.name,
     lifecycle: snapshot.lifecycle,
     ...(snapshot.workCycle !== undefined ? { workCycle: snapshot.workCycle } : {}),
+    ...(snapshot.capturedWorkCycle !== undefined ? { capturedWorkCycle: snapshot.capturedWorkCycle } : {}),
     ...(snapshot.completionDelivery ? { completionDelivery: snapshot.completionDelivery } : {}),
     ...(snapshot.completion ? { completion: projectCompletion(snapshot.completion) } : {})
   }
@@ -268,6 +271,7 @@ function isAgent(value: unknown): value is SubagentToolAgentDetails {
     return false
   }
   if (value.workCycle !== undefined && !isNonNegativeInteger(value.workCycle)) return false
+  if (value.capturedWorkCycle !== undefined && !isNonNegativeInteger(value.capturedWorkCycle)) return false
   if (value.completionDelivery !== undefined && !isCompletionDelivery(value.completionDelivery)) return false
   return value.completion === undefined || isCompletion(value.completion)
 }

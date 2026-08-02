@@ -42,7 +42,7 @@ test("spawn profile schema exposes bounded purpose summaries without requiring c
 })
 
 test("standard subagent tools exist only for an admitted profile catalog", async () => {
-  const harness = await createHarness("catalog", "found")
+  const harness = await createHarness("catalog", "found", 100)
   try {
     expect(createSubagentTools([], harness.supervisor, harness.spawn)).toEqual([])
 
@@ -67,7 +67,24 @@ test("standard subagent tools exist only for an admitted profile catalog", async
       throw new Error("Expected profile parameter")
     }
     expect(Reflect.get(profileParameter, "enum")).toEqual(["pathfinder"])
+    expect(Reflect.get(profileParameter, "description")).toContain("reusable configuration, not a runtime name")
     expect(Reflect.get(profileParameter, "description")).toContain("pathfinder: Find implementation evidence")
+    const runtimeNameParameter = requireRecord(Reflect.get(parameters, "name"), "runtime name parameter")
+    expect(requireString(runtimeNameParameter.description, "runtime name description")).toContain(
+      "separate from the profile name"
+    )
+    expect(spawn.description).toContain("Returns after admission, not completion")
+    expect(spawn.description).toContain("at most 4 live subagents")
+    expect(requireTool(tools, "send_subagent").description).toContain("never starts an idle turn")
+    expect(requireTool(tools, "continue_subagent").description).toContain("Starts a new turn when idle")
+    const waitTool = requireTool(tools, "wait_subagents")
+    expect(waitTool.description).toContain("later changes do not join the wait")
+    const waitSchema = requireRecord(waitTool.parameters, "wait schema")
+    expect(Array.isArray(waitSchema.required) ? waitSchema.required : []).not.toContain("names")
+    const waitProperties = requireRecord(waitSchema.properties, "wait properties")
+    const waitNames = requireRecord(waitProperties.names, "wait names parameter")
+    expect(requireString(waitNames.description, "wait names description")).toContain("once when the call begins")
+    expect(requireTool(tools, "close_subagent").description).toContain("runtime name remains reserved")
 
     const spawned = await spawn.execute(
       "spawn",
@@ -100,6 +117,7 @@ test("standard subagent tools exist only for an admitted profile catalog", async
     )
     expect(isSubagentToolDetails(sent.details)).toBe(true)
     expect(resultText(sent)).toBe("Queued message for finder-1.")
+    expect(harness.supervisor.snapshots()[0]).toMatchObject({ lifecycle: "idle", workCycle: 1 })
 
     const continued = await requireTool(tools, "continue_subagent").execute(
       "continue",
@@ -108,6 +126,7 @@ test("standard subagent tools exist only for an admitted profile catalog", async
     )
     expect(isSubagentToolDetails(continued.details)).toBe(true)
     expect(resultText(continued)).toBe("Started follow-up for finder-1.")
+    expect(harness.supervisor.snapshots()[0]).toMatchObject({ lifecycle: "running", workCycle: 2 })
     await waitFor(() => harness.supervisor.status().readyNames.includes("finder-1"), 5_000)
     const waitedAgain = await wait.execute("wait-again", { timeout_ms: 5_000 }, undefined)
     expect(JSON.parse(resultText(waitedAgain)).subagents).toEqual([
@@ -126,6 +145,65 @@ test("standard subagent tools exist only for an admitted profile catalog", async
 
     const closed = await requireTool(tools, "close_subagent").execute("close", { name: "finder-1" }, undefined)
     expect(isSubagentToolDetails(closed.details)).toBe(true)
+  } finally {
+    await harness.dispose()
+  }
+}, 15_000)
+
+test("targetless wait captures the eligible set once at call start", async () => {
+  const harness = await createHarness("targetless-capture", "capture-ok", 400)
+  try {
+    const tools = createSubagentTools([pathfinderProfile], harness.supervisor, harness.spawn)
+    const wait = requireTool(tools, "wait_subagents")
+    const empty = await wait.execute("empty-wait", { timeout_ms: 5_000 }, undefined)
+    expect(JSON.parse(resultText(empty))).toEqual({ subagents: [], all_completed: true, omitted_bytes: 0 })
+
+    await harness.spawn("pathfinder", "captured-worker", "captured")
+    const waiting = wait.execute("captured-wait", { timeout_ms: 5_000 }, undefined)
+    await harness.spawn("pathfinder", "later-worker", "not captured")
+
+    expect(JSON.parse(resultText(await waiting)).subagents).toEqual([
+      expect.objectContaining({ name: "captured-worker", completion: expect.objectContaining({ status: "completed" }) })
+    ])
+  } finally {
+    await harness.dispose()
+  }
+}, 15_000)
+
+test("partial wait timeout exposes only exact captured completions", async () => {
+  const harness = await createHarness("partial-timeout", "cycle-ok", 300)
+  try {
+    const tools = createSubagentTools([pathfinderProfile], harness.supervisor, harness.spawn)
+    await harness.spawn("pathfinder", "running-worker", "first cycle")
+    await harness.spawn("pathfinder", "completed-worker", "only cycle")
+    await waitFor(() => harness.supervisor.status().readyNames.length === 2, 5_000)
+    await harness.supervisor.continue("running-worker", "second cycle")
+
+    const waited = await requireTool(tools, "wait_subagents").execute(
+      "partial-wait",
+      { names: ["running-worker", "completed-worker"], timeout_ms: 0 },
+      undefined
+    )
+    expect(JSON.parse(resultText(waited))).toEqual({
+      subagents: [
+        { name: "running-worker", status: "running" },
+        expect.objectContaining({
+          name: "completed-worker",
+          completion: expect.objectContaining({ status: "completed" })
+        })
+      ],
+      all_completed: false,
+      omitted_bytes: 0
+    })
+    const details = requireRecord(waited.details, "wait details")
+    const agents = requireArray(details.agents, "wait agents")
+    expect(requireRecord(agents[0], "running agent")).toMatchObject({ capturedWorkCycle: 2 })
+    expect(requireRecord(agents[0], "running agent").completion).toBeUndefined()
+    expect(requireRecord(agents[1], "completed agent")).toMatchObject({ capturedWorkCycle: 1 })
+    expect(requireRecord(agents[1], "completed agent").completion).toEqual(
+      expect.objectContaining({ status: "completed", workCycle: 1 })
+    )
+    expect(harness.supervisor.status()).toEqual({ workingNames: ["running-worker"], readyNames: ["running-worker"] })
   } finally {
     await harness.dispose()
   }
@@ -172,14 +250,14 @@ test("profile and wait projections remain bounded", async () => {
   }
 }, 15_000)
 
-async function createHarness(name: string, reply: string) {
+async function createHarness(name: string, reply: string, delayMs = 30) {
   const root = await mkdtemp(join(tmpdir(), `zi-subagent-tools-${name}-`))
   const cwd = join(root, "project")
   await mkdir(cwd)
   const supervisor = new SubagentSupervisor({
     command: [process.execPath, mockChild],
     cwd,
-    env: { ...process.env, MOCK_RPC_REPLY: reply },
+    env: { ...process.env, MOCK_RPC_REPLY: reply, MOCK_RPC_DELAY_MS: String(delayMs) },
     selection: () => ({ model: "faux/faux-1", thinkingLevel: "off" }),
     sessionManager: SessionManager.inMemory(cwd),
     processTreeTracker: createProcessTreeTracker()
@@ -206,6 +284,11 @@ function requireRecord(value: unknown, label: string): Record<string, unknown> {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)
+}
+
+function requireArray(value: unknown, label: string): unknown[] {
+  if (!Array.isArray(value)) throw new Error(`Expected ${label}`)
+  return value
 }
 
 function requireString(value: unknown, label: string): string {

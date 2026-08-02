@@ -165,7 +165,26 @@ test("targetless wait reports an empty collection without a placeholder count", 
   expect(presentation.body).toBeUndefined()
 })
 
-test("wait does not present an earlier cycle as completion of current work", () => {
+test("timed-out wait presents current status without stale completion", () => {
+  const presentation = projectToolPresentation({
+    status: "done",
+    name: "wait_subagents",
+    args: { names: [agent.name] },
+    result: {
+      content: [{ type: "text", text: "snapshot" }],
+      details: {
+        type: "subagent",
+        outcome: "success",
+        operation: "wait",
+        agents: [{ name: agent.name, lifecycle: "running", workCycle: 2 }]
+      }
+    }
+  })
+
+  expect(presentation.body).toEqual({ type: "text", text: "Shutdown reviewer working", tone: "muted" })
+})
+
+test("persisted wait details do not present an unmatched completion", () => {
   const presentation = projectToolPresentation({
     status: "done",
     name: "wait_subagents",
@@ -182,6 +201,29 @@ test("wait does not present an earlier cycle as completion of current work", () 
   })
 
   expect(presentation.body).toEqual({ type: "text", text: "Shutdown reviewer working", tone: "muted" })
+})
+
+test("wait presents its exact captured completion after the child advances", () => {
+  const presentation = projectToolPresentation({
+    status: "done",
+    name: "wait_subagents",
+    args: { names: [agent.name] },
+    result: {
+      content: [{ type: "text", text: "snapshot" }],
+      details: {
+        type: "subagent",
+        outcome: "success",
+        operation: "wait",
+        agents: [{ ...agent, lifecycle: "running", workCycle: 2, capturedWorkCycle: 1 }]
+      }
+    }
+  })
+
+  expect(presentation.body).toEqual({
+    type: "text",
+    text: "Shutdown reviewer completed · 4.5s — No shutdown leaks found.",
+    tone: "muted"
+  })
 })
 
 test("administrative subagent successes remain header-only in compact mode", () => {

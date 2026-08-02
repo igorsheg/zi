@@ -7,7 +7,7 @@ import { join, resolve } from "node:path"
 import { ZiPaths } from "../src/paths.js"
 import { createProcessTreeTracker } from "../src/processes/process-tree.js"
 import { SessionManager } from "../src/session-manager.js"
-import { SubagentSupervisor } from "../src/subagents/supervisor.js"
+import { maxRetainedSubagents, SubagentSupervisor } from "../src/subagents/supervisor.js"
 
 const mockChild = resolve(import.meta.dir, "fixtures/mock-rpc-child.ts")
 
@@ -73,6 +73,29 @@ test("wait holds until every requested subagent has completed", async () => {
       expect.objectContaining({ name: first, completion: expect.objectContaining({ status: "completed" }) }),
       expect.objectContaining({ name: second, completion: expect.objectContaining({ status: "completed" }) })
     ])
+  } finally {
+    await harness.dispose()
+  }
+}, 15_000)
+
+test("observer failure cannot interrupt a wait delivery commit", async () => {
+  const harness = await createHarness("wait-observer-failure", { reply: "observer-ok", delayMs: 100 })
+  try {
+    const first = await harness.supervisor.spawn("first-worker", "first")
+    const second = await harness.supervisor.spawn("second-worker", "second")
+    await waitFor(() => harness.supervisor.status().readyNames.length === 2, 5_000)
+    const unsubscribe = harness.supervisor.subscribe(() => {
+      throw new Error("observer failed")
+    })
+
+    const waited = await harness.supervisor.wait([first, second], 5_000)
+    unsubscribe()
+
+    expect(waited).toEqual([
+      expect.objectContaining({ name: first, completion: expect.objectContaining({ status: "completed" }) }),
+      expect.objectContaining({ name: second, completion: expect.objectContaining({ status: "completed" }) })
+    ])
+    expect(harness.supervisor.status()).toEqual({ workingNames: [], readyNames: [] })
   } finally {
     await harness.dispose()
   }
@@ -158,6 +181,78 @@ test("shutdown before spawn ownership transfer rejects the admitted child", asyn
   }
 }, 15_000)
 
+test("synchronous child construction failure retains an addressable exited snapshot", async () => {
+  const harness = await createHarness("construction-failure")
+  try {
+    await rm(harness.cwd, { recursive: true, force: true })
+
+    const outcome = harness.supervisor.spawn("broken-worker", "cannot start").then(
+      () => ({ type: "resolved" as const }),
+      (cause: unknown) => ({ type: "rejected" as const, cause })
+    )
+
+    expect(await outcome).toEqual({ type: "rejected", cause: expect.any(Error) })
+    expect(harness.supervisor.capacity()).toEqual({ live: 0, maximum: 4 })
+    expect(harness.supervisor.status()).toEqual({ workingNames: [], readyNames: [] })
+    expect(harness.supervisor.snapshots()).toEqual([
+      expect.objectContaining({ name: "broken-worker", lifecycle: "exited" })
+    ])
+    expect(await harness.supervisor.wait(["broken-worker"], 5_000)).toEqual([
+      expect.objectContaining({ name: "broken-worker", lifecycle: "exited" })
+    ])
+    expect(await harness.supervisor.close("broken-worker")).toMatchObject({
+      name: "broken-worker",
+      lifecycle: "exited"
+    })
+    expect(harness.supervisor.spawn("broken-worker", "retry reserved name")).rejects.toThrow(
+      "Subagent name already in use"
+    )
+    expect(harness.sessionManager.subagentEntries()).toEqual([
+      expect.objectContaining({ event: "starting", name: "broken-worker" }),
+      expect.objectContaining({ event: "exited", name: "broken-worker", outcome: expect.any(String) })
+    ])
+
+    const failures = await Promise.all(
+      Array.from({ length: maxRetainedSubagents }, (_, index) =>
+        harness.supervisor.spawn(`broken-${index}`, "cannot start").then(
+          () => "resolved" as const,
+          () => "rejected" as const
+        )
+      )
+    )
+    expect(failures.every(result => result === "rejected")).toBe(true)
+    expect(harness.supervisor.snapshots()).toHaveLength(maxRetainedSubagents)
+    expect(harness.supervisor.snapshots().some(snapshot => snapshot.name === "broken-worker")).toBe(false)
+    expect(harness.supervisor.spawn("broken-worker", "still reserved")).rejects.toThrow("Subagent name already in use")
+  } finally {
+    await harness.dispose()
+  }
+}, 15_000)
+
+test("an admitted wait retains a terminal target through snapshot eviction", async () => {
+  const harness = await createHarness("wait-target-eviction", { reply: "working-done", delayMs: 600 })
+  try {
+    const working = await harness.supervisor.spawn("working-child", "finish later")
+    await rm(harness.cwd, { recursive: true, force: true })
+    await harness.supervisor.spawn("evicted-child", "cannot start").catch(() => {})
+
+    const waiting = harness.supervisor.wait(["evicted-child", working], 5_000)
+    await Promise.all(
+      Array.from({ length: maxRetainedSubagents }, (_, index) =>
+        harness.supervisor.spawn(`later-failure-${index}`, "cannot start").catch(() => undefined)
+      )
+    )
+    expect(harness.supervisor.snapshots().some(snapshot => snapshot.name === "evicted-child")).toBe(false)
+
+    expect(await waiting).toEqual([
+      expect.objectContaining({ name: "evicted-child", lifecycle: "exited" }),
+      expect.objectContaining({ name: working, completion: expect.objectContaining({ status: "completed" }) })
+    ])
+  } finally {
+    await harness.dispose()
+  }
+}, 15_000)
+
 test("spawn cancellation before admission closes the starting child", async () => {
   const harness = await createHarness("startup-cancel", { delayMs: 300 })
   try {
@@ -225,6 +320,33 @@ test("ready results remain visible while the same child starts another cycle", a
     expect(harness.supervisor.status()).toEqual({ workingNames: [name], readyNames: [name] })
 
     await harness.supervisor.wait([name], 5_000)
+    expect(harness.supervisor.status()).toEqual({ workingNames: [], readyNames: [] })
+  } finally {
+    await harness.dispose()
+  }
+}, 15_000)
+
+test("a partial later-cycle timeout delivers only exact captured completions", async () => {
+  const harness = await createHarness("later-cycle-timeout", { reply: "cycle-ok", delayMs: 300 })
+  try {
+    const running = await harness.supervisor.spawn("cycle-worker", "first cycle")
+    const completed = await harness.supervisor.spawn("completed-worker", "only cycle")
+    await waitFor(() => harness.supervisor.status().readyNames.length === 2, 5_000)
+
+    await harness.supervisor.continue(running, "second cycle")
+    const timedOut = await harness.supervisor.wait([running, completed], 0)
+
+    expect(timedOut[0]).toMatchObject({ name: running, lifecycle: "running", workCycle: 2 })
+    expect(timedOut[0]?.completion).toBeUndefined()
+    expect(timedOut[1]).toMatchObject({
+      name: completed,
+      lifecycle: "idle",
+      workCycle: 1,
+      completion: { workCycle: 1, status: "completed" }
+    })
+    expect(harness.supervisor.status()).toEqual({ workingNames: [running], readyNames: [running] })
+
+    await harness.supervisor.wait([running], 5_000)
     expect(harness.supervisor.status()).toEqual({ workingNames: [], readyNames: [] })
   } finally {
     await harness.dispose()
@@ -309,7 +431,7 @@ test("SubagentSupervisor admits four live children and rejects a fifth", async (
     expect(harness.supervisor.snapshots()).toHaveLength(4)
     expect(harness.supervisor.capacity()).toEqual({ live: 4, maximum: 4 })
     expect(harness.supervisor.spawn("extra-worker", "one too many")).rejects.toThrow(
-      "Subagent capacity exceeded: at most 4 live children"
+      "Subagent capacity exceeded: at most 4 live children. Close a child you no longer need before spawning another."
     )
     await harness.supervisor.close(names[0]!)
     expect(harness.supervisor.capacity()).toEqual({ live: 3, maximum: 4 })
@@ -497,6 +619,7 @@ async function createHarness(
 ): Promise<{
   readonly supervisor: SubagentSupervisor
   readonly sessionManager: SessionManager
+  readonly cwd: string
   readonly descendantMarker?: string
   dispose(): Promise<void>
 }> {
@@ -524,6 +647,7 @@ async function createHarness(
   return {
     supervisor,
     sessionManager,
+    cwd: paths.cwd,
     ...(descendantMarker ? { descendantMarker } : {}),
     async dispose() {
       await supervisor.shutdown()

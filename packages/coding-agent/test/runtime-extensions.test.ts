@@ -628,6 +628,76 @@ test("a Markdown profile activates the standard subagent tools without an extens
   }
 }, 15_000)
 
+test("subagent completion remains passive until a later parent turn collects it", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-runtime-subagent-passive-completion-"))
+  const cwd = join(root, "project")
+  const agentDir = join(root, "agent")
+  await mkdir(cwd, { recursive: true })
+  await mkdir(join(agentDir, "subagents"), { recursive: true })
+  await writeFile(
+    join(agentDir, "subagents", "pathfinder.md"),
+    `---\ndescription: Find implementation evidence\n---\nReturn concrete evidence.\n`
+  )
+  const models = createModels()
+  const faux = fauxProvider()
+  models.setProvider(faux.provider)
+  faux.setResponses([
+    fauxAssistantMessage(
+      fauxToolCall(
+        "spawn_subagent",
+        { profile: "pathfinder", name: "passive-worker", prompt: "Find one fact." },
+        { id: "spawn-passive-1" }
+      ),
+      { stopReason: "toolUse" }
+    ),
+    fauxAssistantMessage("The child is working in the background."),
+    fauxAssistantMessage(
+      fauxToolCall("wait_subagents", { names: ["passive-worker"], timeout_ms: 5_000 }, { id: "wait-passive-1" }),
+      { stopReason: "toolUse" }
+    ),
+    fauxAssistantMessage("Collected the child result.")
+  ])
+  const runtime = await createAgentRuntime({
+    cwd,
+    agentDir,
+    model: "faux/faux-1",
+    modelFactory: () => models,
+    session: { type: "new", persist: false },
+    extensionWorkerCommand: workerCommand,
+    subagentCommand: [process.execPath, mockChild],
+    internalSubagentEnvironment: { MOCK_RPC_REPLY: "passive-result", MOCK_RPC_DELAY_MS: "150" }
+  })
+  try {
+    await runtime.session.prompt("Start the background investigation.")
+    const settledMessages = runtime.session.messages.length
+    expect(faux.state.callCount).toBe(2)
+
+    await waitForCondition(
+      () => runtime.session.sessionManager.subagentEntries().some(entry => entry.event === "work_cycle_finished"),
+      5_000
+    )
+    expect(faux.state.callCount).toBe(2)
+    expect(runtime.session.messages).toHaveLength(settledMessages)
+    expect(
+      runtime.session.messages.some(message => message.role === "toolResult" && message.toolName === "wait_subagents")
+    ).toBe(false)
+
+    await runtime.session.prompt("Collect the completed investigation.")
+    expect(faux.state.callCount).toBe(4)
+    expect(runtime.session.messages).toContainEqual(
+      expect.objectContaining({
+        role: "toolResult",
+        toolName: "wait_subagents",
+        content: [expect.objectContaining({ text: expect.stringContaining("passive-result") })]
+      })
+    )
+  } finally {
+    runtime.session.dispose()
+    await runtime.session.waitForIdle()
+    await rm(root, { recursive: true, force: true })
+  }
+}, 15_000)
+
 test("a programmatic profile activates the same standard subagent tools", async () => {
   const root = await mkdtemp(join(tmpdir(), "zi-runtime-subagent-programmatic-tools-"))
   const cwd = join(root, "project")
@@ -1316,6 +1386,16 @@ test("whole-runtime replacement starts the candidate only after retiring the cur
   expect(await readFile(fixture.lifecycle, "utf8")).toBe("start:startup\nstop:new\nstart:new\nstop:quit\n")
   await rm(fixture.root, { recursive: true, force: true })
 }, 10_000)
+
+async function waitForCondition(predicate: () => boolean, timeoutMs: number): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (predicate()) return
+    // oxlint-disable-next-line no-await-in-loop -- bounded test poll of authoritative state
+    await Bun.sleep(10)
+  }
+  throw new Error("Condition was not met before timeout")
+}
 
 async function waitForFile(path: string): Promise<void> {
   for (let attempt = 0; attempt < 1_000; attempt++) {
