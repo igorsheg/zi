@@ -25,7 +25,7 @@ import {
   type ExtensionSource
 } from "./discovery.js"
 
-export const extensionProtocolVersion = 6
+export const extensionProtocolVersion = 7
 export const maxExtensionProtocolFrameBytes = 4 * 1024 * 1024
 export const maxExtensionPendingRequests = 128
 export const maxExtensionQueuedWriteBytes = 8 * 1024 * 1024
@@ -50,8 +50,10 @@ export const maxExtensionCommandArgumentsBytes = 256 * 1024
 export const maxExtensionCommandResultBytes = 16 * 1024
 export const extensionToolTimeoutMs = 30_000
 export const extensionToolCancellationTimeoutMs = 1_000
-export const maxExtensionTools = 64
-export const maxExtensionToolCatalogBytes = 512 * 1024
+export const maxExtensionTools = 256
+export const maxExtensionToolCatalogBytes = 2 * 1024 * 1024
+export const maxActiveExtensionTools = 64
+export const maxActiveExtensionToolCatalogBytes = 512 * 1024
 export const maxExtensionToolNameBytes = 64
 export const maxExtensionToolLabelBytes = 256
 export const maxExtensionToolDescriptionBytes = 4 * 1024
@@ -104,7 +106,7 @@ export interface ExtensionLoadResult {
 export type HostMessage =
   | {
       readonly type: "initialize"
-      readonly protocolVersion: 6
+      readonly protocolVersion: 7
       readonly generation: number
       readonly plan: ExtensionLoadPlan
       readonly subagentsAvailable?: boolean
@@ -150,6 +152,12 @@ export type HostMessage =
       readonly entry: ExtensionCustomEntry
     }
   | { readonly type: "custom_message_result"; readonly generation: number; readonly requestId: number }
+  | {
+      readonly type: "active_tools_result"
+      readonly generation: number
+      readonly requestId: number
+      readonly names: readonly string[]
+    }
   | {
       readonly type: "subagent_profiles_result"
       readonly generation: number
@@ -203,7 +211,7 @@ export type HostMessage =
 export type WorkerMessage =
   | {
       readonly type: "ready"
-      readonly protocolVersion: 6
+      readonly protocolVersion: 7
       readonly generation: number
       readonly extensions: readonly ExtensionLoadResult[]
       readonly commands: readonly ExtensionCommandRegistration[]
@@ -249,6 +257,19 @@ export type WorkerMessage =
       readonly extensionId: string
       readonly message: ExtensionCustomMessage
       readonly delivery: ExtensionMessageDelivery
+    }
+  | {
+      readonly type: "active_tools_get"
+      readonly generation: number
+      readonly requestId: number
+      readonly extensionId: string
+    }
+  | {
+      readonly type: "active_tools_set"
+      readonly generation: number
+      readonly requestId: number
+      readonly extensionId: string
+      readonly names: readonly string[]
     }
   | {
       readonly type: "subagent_profiles_get"
@@ -346,6 +367,7 @@ export interface ExtensionToolRegistration {
   readonly name: string
   readonly label: string
   readonly description: string
+  readonly active: boolean
   readonly parameters: Readonly<Record<string, JsonValue>>
   readonly outputSchema: Readonly<Record<string, JsonValue>>
 }
@@ -623,6 +645,13 @@ export function validateHostMessage(value: unknown): HostMessage {
         requestId: positiveInteger(message.requestId, "requestId"),
         entry: extensionCustomEntry(message.entry)
       })
+    case "active_tools_result":
+      return Object.freeze({
+        type: "active_tools_result",
+        generation: positiveInteger(message.generation, "generation"),
+        requestId: positiveInteger(message.requestId, "requestId"),
+        names: activeToolNames(message.names)
+      })
     case "subagent_profiles_result":
       return Object.freeze({
         type: "subagent_profiles_result",
@@ -770,6 +799,21 @@ export function validateWorkerMessage(value: unknown): WorkerMessage {
         message: extensionCustomMessage(message.message),
         delivery: extensionMessageDelivery(message.delivery)
       })
+    case "active_tools_get":
+      return Object.freeze({
+        type: "active_tools_get",
+        generation: positiveInteger(message.generation, "generation"),
+        requestId: positiveInteger(message.requestId, "requestId"),
+        extensionId: boundedRequiredText(message.extensionId, "extension id", maxExtensionIdBytes)
+      })
+    case "active_tools_set":
+      return Object.freeze({
+        type: "active_tools_set",
+        generation: positiveInteger(message.generation, "generation"),
+        requestId: positiveInteger(message.requestId, "requestId"),
+        extensionId: boundedRequiredText(message.extensionId, "extension id", maxExtensionIdBytes),
+        names: activeToolNames(message.names)
+      })
     case "subagent_profiles_get":
     case "subagent_list":
       return Object.freeze({
@@ -877,7 +921,24 @@ export function validateExtensionToolCatalog(value: unknown): readonly Extension
   if (Buffer.byteLength(JSON.stringify(admitted)) > maxExtensionToolCatalogBytes) {
     throw new ExtensionProtocolError(`Extension tool catalog cannot exceed ${maxExtensionToolCatalogBytes} bytes`)
   }
+  validateActiveExtensionToolCatalog(admitted.filter(tool => tool.active))
   return Object.freeze(admitted)
+}
+
+export function validateActiveExtensionToolCatalog(tools: readonly ExtensionToolRegistration[]): void {
+  if (tools.length > maxActiveExtensionTools) {
+    throw new ExtensionProtocolError(`Active extension tools cannot exceed ${maxActiveExtensionTools}`)
+  }
+  const providerCatalog = tools.map(tool => ({
+    name: tool.name,
+    description: tool.description,
+    parameters: tool.parameters
+  }))
+  if (Buffer.byteLength(JSON.stringify(providerCatalog)) > maxActiveExtensionToolCatalogBytes) {
+    throw new ExtensionProtocolError(
+      `Active extension tool catalog cannot exceed ${maxActiveExtensionToolCatalogBytes} bytes`
+    )
+  }
 }
 
 export function validateExtensionSubagentCatalog(value: unknown): readonly ExtensionSubagentRegistration[] {
@@ -1137,6 +1198,7 @@ function extensionToolRegistration(value: unknown): ExtensionToolRegistration {
   const name = toolName(tool.name)
   const label = boundedRequiredText(tool.label, "tool label", maxExtensionToolLabelBytes)
   const description = boundedRequiredText(tool.description, "tool description", maxExtensionToolDescriptionBytes)
+  const active = tool.active === undefined ? true : requiredBoolean(tool.active, "tool active")
   const parameters = jsonRecord(tool.parameters, "tool parameters", maxExtensionToolSchemaBytes)
   if (parameters.type !== "object") {
     throw new ExtensionProtocolError("Extension tool parameters must be an object schema")
@@ -1144,7 +1206,15 @@ function extensionToolRegistration(value: unknown): ExtensionToolRegistration {
   const outputSchema = jsonRecord(tool.outputSchema, "tool output schema", maxExtensionToolSchemaBytes)
   validateToolSchema(parameters, "parameters")
   validateToolSchema(outputSchema, "outputSchema")
-  return Object.freeze({ source: extensionSource(tool.source), name, label, description, parameters, outputSchema })
+  return Object.freeze({
+    source: extensionSource(tool.source),
+    name,
+    label,
+    description,
+    active,
+    parameters,
+    outputSchema
+  })
 }
 
 function validateToolSchema(value: JsonValue, path: string): void {
@@ -1306,6 +1376,18 @@ function toolName(value: unknown): string {
   return name
 }
 
+function activeToolNames(value: unknown): readonly string[] {
+  const names = protocolArray(value, "active tool names")
+  if (names.length > maxActiveExtensionTools) {
+    throw new ExtensionProtocolError(`Active tool names cannot exceed ${maxActiveExtensionTools}`)
+  }
+  const admitted = names.map(toolName)
+  if (new Set(admitted).size !== admitted.length) {
+    throw new ExtensionProtocolError("Active tool names must be unique")
+  }
+  return Object.freeze(admitted)
+}
+
 function jsonRecord(value: unknown, field: string, maxBytes: number): Readonly<Record<string, JsonValue>> {
   const admitted = jsonValue(value, field, maxBytes)
   if (!isProtocolRecord(admitted)) throw new ExtensionProtocolError(`Extension protocol ${field} must be an object`)
@@ -1410,7 +1492,7 @@ function protocolArray(value: unknown, field: string): readonly unknown[] {
   return value
 }
 
-function protocolVersion(value: unknown): 6 {
+function protocolVersion(value: unknown): 7 {
   if (value !== extensionProtocolVersion) throw new ExtensionProtocolError("Unsupported extension protocol version")
   return extensionProtocolVersion
 }

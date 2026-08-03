@@ -14,7 +14,8 @@ export interface ExtensionToolDetails {
 
 export function admitExtensionTools(
   builtInTools: readonly AgentTool[],
-  host: ExtensionHost | undefined
+  host: ExtensionHost | undefined,
+  activeTools: ReadonlySet<ExtensionToolRegistration>
 ): readonly AgentTool[] {
   if (builtInTools.some(tool => tool.name === "code" || tool.name === "then")) {
     throw new Error("The tool names code and then are reserved for native code mode")
@@ -31,6 +32,7 @@ export function admitExtensionTools(
       )
       continue
     }
+    if (!activeTools.has(registration)) continue
     names.add(registration.name)
     const parameters = Type.Unsafe(registration.parameters)
     const invoke = async (

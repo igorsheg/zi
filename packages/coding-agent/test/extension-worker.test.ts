@@ -423,6 +423,7 @@ export default function (zi): void {
     zi.registerTool({
       name: "catalog_tool_" + index,
       description: "d".repeat(${maxExtensionToolDescriptionBytes}),
+      active: false,
       parameters: Schema.object({}, { description: "s".repeat(8_000) }),
       execute: () => "done"
     })
@@ -451,6 +452,32 @@ export default zi => zi.registerTool({
   expect(generation.tools.map(tool => tool.name)).toEqual(["valid_tool"])
 })
 
+test("a dormant catalog can use the registered-tool bound", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-extension-worker-dormant-tool-bound-"))
+  const extension = await writeExtension(
+    root,
+    "dormant.ts",
+    `import { Schema } from ${JSON.stringify(extensionApi)}
+export default function (zi): void {
+  for (let index = 0; index < ${maxExtensionTools}; index++) {
+    zi.registerTool({
+      name: "dormant_tool_" + index,
+      description: "Dormant tool",
+      active: false,
+      parameters: Schema.object({}),
+      execute: () => "done"
+    })
+  }
+}
+`
+  )
+
+  const generation = await loadExtensionGeneration(extensionPlan(root, [extension]), 1)
+  expect(generation.results).toMatchObject([{ status: "loaded" }])
+  expect(generation.tools).toHaveLength(maxExtensionTools)
+  expect(generation.tools.every(tool => !tool.active)).toBe(true)
+})
+
 test("failed registrations cannot consume the generation tool bound", async () => {
   const root = await mkdtemp(join(tmpdir(), "zi-extension-worker-tool-bound-"))
   const excessive = await writeExtension(
@@ -462,6 +489,7 @@ export default function (zi): void {
     zi.registerTool({
       name: "tool_" + index,
       description: "Bounded tool",
+      active: false,
       parameters: Schema.object({}),
       execute: () => "done"
     })

@@ -214,6 +214,7 @@ interface ExtensionToolDefinitionBase<TParameters extends TObject> {
   readonly name: string
   readonly label?: string
   readonly description: string
+  readonly active?: boolean
   readonly parameters: TParameters
 }
 
@@ -294,6 +295,8 @@ export interface ExtensionAPI {
   registerTool<TParameters extends TObject, TOutputSchema extends TSchema | undefined = undefined>(
     tool: ExtensionToolDefinition<TParameters, TOutputSchema>
   ): void
+  getActiveTools(): Promise<readonly string[]>
+  setActiveTools(names: readonly string[]): Promise<void>
   registerSubagentProfile(profile: ExtensionSubagentProfile): void
   getSessionEntries(customType: string): Promise<readonly ExtensionCustomEntry[]>
   appendEntry(customType: string, data?: JsonValue): Promise<ExtensionCustomEntry>

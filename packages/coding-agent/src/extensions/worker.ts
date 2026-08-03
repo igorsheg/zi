@@ -127,6 +127,8 @@ type WorkerSessionRequest =
   | { readonly type: "custom_entries_get"; readonly settled: Deferred<readonly ExtensionCustomEntry[]> }
   | { readonly type: "custom_entry_append"; readonly settled: Deferred<ExtensionCustomEntry> }
   | { readonly type: "custom_message_send"; readonly settled: VoidDeferred }
+  | { readonly type: "active_tools_get"; readonly settled: Deferred<readonly string[]> }
+  | { readonly type: "active_tools_set"; readonly settled: VoidDeferred }
   | { readonly type: "subagent_profiles_get"; readonly settled: Deferred<readonly ExtensionSubagentProfile[]> }
   | { readonly type: "subagent_spawn"; readonly settled: Deferred<string> }
   | { readonly type: "subagent_send"; readonly settled: VoidDeferred }
@@ -151,6 +153,8 @@ export interface WorkerSessionOperations {
     message: ExtensionCustomMessage,
     delivery: ExtensionMessageDelivery
   ): Promise<void>
+  getActiveTools(source: ExtensionSource): Promise<readonly string[]>
+  setActiveTools(source: ExtensionSource, names: readonly string[]): Promise<void>
   listSubagentProfiles(source: ExtensionSource): Promise<readonly ExtensionSubagentProfile[]>
   spawnSubagent(
     source: ExtensionSource,
@@ -340,6 +344,7 @@ class ExtensionWorkerProcess {
       message.type === "custom_entries_result" ||
       message.type === "custom_entry_result" ||
       message.type === "custom_message_result" ||
+      message.type === "active_tools_result" ||
       message.type === "subagent_profiles_result" ||
       message.type === "subagent_spawn_result" ||
       message.type === "subagent_send_result" ||
@@ -534,6 +539,24 @@ class ExtensionWorkerProcess {
         )
         return settled.promise
       },
+      getActiveTools: source => {
+        const settled = deferred<readonly string[]>()
+        this.#requestSessionOperation(
+          generation,
+          { type: "active_tools_get", settled },
+          { type: "active_tools_get", extensionId: source.id }
+        )
+        return settled.promise
+      },
+      setActiveTools: (source, names) => {
+        const settled = deferred<void>()
+        this.#requestSessionOperation(
+          generation,
+          { type: "active_tools_set", settled },
+          { type: "active_tools_set", extensionId: source.id, names }
+        )
+        return settled.promise
+      },
       listSubagentProfiles: source => {
         const settled = deferred<readonly ExtensionSubagentProfile[]>()
         this.#requestSessionOperation(
@@ -696,6 +719,14 @@ class ExtensionWorkerProcess {
       return
     }
     if (request.type === "custom_message_send" && response.type === "custom_message_result") {
+      request.settled.resolve()
+      return
+    }
+    if (request.type === "active_tools_get" && response.type === "active_tools_result") {
+      request.settled.resolve(response.names)
+      return
+    }
+    if (request.type === "active_tools_set" && response.type === "active_tools_result") {
       request.settled.resolve()
       return
     }
@@ -999,6 +1030,8 @@ const unavailableSessionOperations: WorkerSessionOperations = Object.freeze({
   getEntries: unavailableOperation,
   appendEntry: unavailableOperation,
   sendMessage: unavailableOperation,
+  getActiveTools: unavailableOperation,
+  setActiveTools: unavailableOperation,
   listSubagentProfiles: unavailableOperation,
   spawnSubagent: unavailableOperation,
   sendSubagent: unavailableOperation,
@@ -1125,6 +1158,12 @@ export async function loadExtensionGeneration(
         localToolNames.add(name)
         localTools.push(registered)
       },
+      getActiveTools() {
+        return sessionOperations.getActiveTools(source)
+      },
+      setActiveTools(names: readonly string[]) {
+        return sessionOperations.setActiveTools(source, names)
+      },
       registerSubagentProfile(value: ExtensionSubagentProfile): void {
         if (!acceptingRegistrations) {
           throw new ExtensionRegistrationError("Extension registration closed after factory settlement")
@@ -1235,6 +1274,7 @@ function registerTool(source: ExtensionSource, value: unknown): RegisteredTool {
       name: value.name,
       label: value.label ?? value.name,
       description: value.description,
+      active: value.active ?? true,
       parameters: value.parameters,
       outputSchema: value.outputSchema ?? Type.String()
     })

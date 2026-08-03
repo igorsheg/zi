@@ -24,7 +24,7 @@ Zi discovers entry points in deterministic order:
 
 A directory entry may use `index.ts`; a direct `.ts` file also works. TypeScript and relative imports load without a build. Install third-party dependencies in the extension's own package hierarchy so normal bare-module resolution can find them.
 
-Start with [`examples/extensions/custom-tool/index.ts`](../examples/extensions/custom-tool/index.ts). For session persistence and custom messages, see [`examples/extensions/durable-counter/index.ts`](../examples/extensions/durable-counter/index.ts). For programmatic subagent profiles, see [`examples/extensions/subagents/index.ts`](../examples/extensions/subagents/index.ts).
+Start with [`examples/extensions/custom-tool/index.ts`](../examples/extensions/custom-tool/index.ts). For a dormant catalog, see [`examples/extensions/deferred-tools/index.ts`](../examples/extensions/deferred-tools/index.ts). For session persistence and custom messages, see [`examples/extensions/durable-counter/index.ts`](../examples/extensions/durable-counter/index.ts). For programmatic subagent profiles, see [`examples/extensions/subagents/index.ts`](../examples/extensions/subagents/index.ts).
 
 ## Public API
 
@@ -80,6 +80,37 @@ Tool names use lowercase letters, numbers, and underscores and must begin with a
 Without `outputSchema`, a tool returns one bounded string. Declaring `outputSchema` lets it return a matching bounded JSON value. Zi validates that value in the extension worker, renders it as JSON for direct model calls, and delivers it as an already-decoded JavaScript value in Code Mode. Tools throw errors for failed operations. Built-in Zi tool names take precedence over extension registrations.
 
 `execute` receives an invocation-scoped `AbortSignal`. Cancellation is cooperative: pass the signal to subprocess or I/O APIs and stop owned work promptly. Zi rejects late completion and terminates a worker that misses execution or cancellation deadlines.
+
+Large catalogs can register dormant tools with `active: false`, then replace that extension's model-visible subset at runtime:
+
+```ts
+zi.registerTool({
+  name: "catalog_search",
+  description: "Find an operational tool",
+  parameters: Schema.object({ query: Schema.string() }),
+  async execute({ query }) {
+    const selected = query === "grafana" ? ["catalog_search", "oncall_grafana_query"] : ["catalog_search"]
+    await zi.setActiveTools(selected)
+    return `Active tools: ${selected.join(", ")}`
+  }
+})
+
+zi.registerTool({
+  name: "oncall_grafana_query",
+  description: "Run one reviewed Grafana query",
+  active: false,
+  parameters: Schema.object({ expression: Schema.string() }),
+  async execute({ expression }) {
+    return `Reviewed query: ${expression}`
+  }
+})
+```
+
+`getActiveTools()` returns only the calling extension's active, admitted registrations. `setActiveTools(names)` replaces that set; it cannot disable built-ins or tools owned by another extension, and it rejects unknown or unadmitted names. The current provider tool-call batch and an already-running Code Mode invocation retain their admitted snapshot. The new selection is used by both direct calls and Code Mode before the next provider step.
+
+Registration remains factory-time and statically reviewable. `active` defaults to `true`. Reload creates a new generation and restores each registration's `active` default. An extension that wants durable selection can read custom entries and call `setActiveTools(...)` from `session_start`.
+
+A generation may register up to 256 tools in a 2 MiB catalog. At most 64 extension tools and 512 KiB of their provider-facing definitions may be active. Per-tool names are limited to 64 bytes, descriptions to 4 KiB, schemas to 16 KiB, invocation arguments to 256 KiB, and results to 256 KiB.
 
 ### Programmatic subagent profiles
 

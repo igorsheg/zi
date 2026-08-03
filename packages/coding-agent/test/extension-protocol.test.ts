@@ -9,6 +9,8 @@ import {
   ExtensionProtocolDecoder,
   ExtensionProtocolWriter,
   extensionProtocolVersion,
+  maxActiveExtensionToolCatalogBytes,
+  maxActiveExtensionTools,
   maxExtensionCommandArgumentsBytes,
   maxExtensionCommandCatalogBytes,
   maxExtensionCommandDescriptionBytes,
@@ -295,7 +297,7 @@ test("tool protocol validation closes registration, arguments, results, and corr
     commands: [],
     tools: [registration]
   })
-  expect(ready).toMatchObject({ type: "ready", tools: [{ name: "echo_message" }] })
+  expect(ready).toMatchObject({ type: "ready", tools: [{ name: "echo_message", active: true }] })
   expect(Object.isFrozen(ready.type === "ready" ? ready.tools[0]?.parameters.properties : undefined)).toBe(true)
 
   const invoke = validateHostMessage({
@@ -355,6 +357,46 @@ test("tool protocol validation closes registration, arguments, results, and corr
       tools: [registration, registration]
     })
   ).toThrow("unique")
+  expect(
+    validateWorkerMessage({
+      type: "ready",
+      protocolVersion: extensionProtocolVersion,
+      generation: 1,
+      extensions: [{ source, status: "loaded" }],
+      commands: [],
+      tools: [{ ...registration, active: false }]
+    })
+  ).toMatchObject({ type: "ready", tools: [{ active: false }] })
+  expect(() =>
+    validateWorkerMessage({
+      type: "ready",
+      protocolVersion: extensionProtocolVersion,
+      generation: 1,
+      extensions: [{ source, status: "loaded" }],
+      commands: [],
+      tools: Array.from({ length: maxActiveExtensionTools + 1 }, (_, index) => ({
+        ...registration,
+        name: `active_tool_${index}`
+      }))
+    })
+  ).toThrow(`cannot exceed ${maxActiveExtensionTools}`)
+  expect(() =>
+    validateWorkerMessage({
+      type: "ready",
+      protocolVersion: extensionProtocolVersion,
+      generation: 1,
+      extensions: [{ source, status: "loaded" }],
+      commands: [],
+      tools: Array.from(
+        { length: Math.floor(maxActiveExtensionToolCatalogBytes / (maxExtensionToolSchemaBytes - 64)) + 1 },
+        (_, index) => ({
+          ...registration,
+          name: `large_active_tool_${index}`,
+          parameters: { type: "object", description: "s".repeat(maxExtensionToolSchemaBytes - 64), properties: {} }
+        })
+      )
+    })
+  ).toThrow(`catalog cannot exceed ${maxActiveExtensionToolCatalogBytes} bytes`)
   expect(() =>
     validateWorkerMessage({
       type: "tool_result",
@@ -397,6 +439,25 @@ test("session-operation protocol validates source, values, delivery, and bounded
       delivery: "follow_up"
     })
   ).toMatchObject({ type: "custom_message_send", delivery: "follow_up", message: { display: false } })
+  const setActive = validateWorkerMessage({
+    type: "active_tools_set",
+    generation: 1,
+    requestId: 9,
+    extensionId: source.id,
+    names: ["catalog_search", "grafana_query"]
+  })
+  expect(setActive).toMatchObject({ type: "active_tools_set", names: ["catalog_search", "grafana_query"] })
+  expect(Object.isFrozen(setActive.type === "active_tools_set" ? setActive.names : undefined)).toBe(true)
+  expect(
+    validateWorkerMessage({ type: "active_tools_get", generation: 1, requestId: 10, extensionId: source.id })
+  ).toMatchObject({ type: "active_tools_get", extensionId: source.id })
+  expect(() => validateWorkerMessage({ ...setActive, names: ["catalog_search", "catalog_search"] })).toThrow("unique")
+  expect(() =>
+    validateWorkerMessage({
+      ...setActive,
+      names: Array.from({ length: maxActiveExtensionTools + 1 }, (_, index) => `tool_${index}`)
+    })
+  ).toThrow(`cannot exceed ${maxActiveExtensionTools}`)
   expect(() => validateWorkerMessage({ ...append, customType: "Invalid Type" })).toThrow("custom type")
   expect(() =>
     validateWorkerMessage({
@@ -409,6 +470,14 @@ test("session-operation protocol validates source, values, delivery, and bounded
     })
   ).toThrow("delivery")
 
+  expect(
+    validateHostMessage({
+      type: "active_tools_result",
+      generation: 1,
+      requestId: 9,
+      names: ["catalog_search", "grafana_query"]
+    })
+  ).toMatchObject({ type: "active_tools_result", names: ["catalog_search", "grafana_query"] })
   const entry = { id: "entry", timestamp: new Date(0).toISOString(), customType: "example.counter", data: null }
   expect(validateHostMessage({ type: "custom_entries_result", generation: 1, requestId: 7, entries: [entry] })).toEqual(
     { type: "custom_entries_result", generation: 1, requestId: 7, entries: [entry] }
@@ -570,6 +639,7 @@ test("tool catalogs have one aggregate ready-frame budget", () => {
     name: `tool_${index}`,
     label: `Tool ${index}`,
     description: "d".repeat(maxExtensionToolDescriptionBytes),
+    active: false,
     parameters: { type: "object", description: "s".repeat(maxExtensionToolSchemaBytes - 64), properties: {} },
     outputSchema: { type: "string" }
   }))
@@ -605,6 +675,7 @@ test("ready-frame validation bounds combined source, tool, and subagent catalogs
     name: `tool_${index}`,
     label: `Tool ${index}`,
     description: '"'.repeat(3_000),
+    active: false,
     parameters: { type: "object", properties: {} },
     outputSchema: { type: "string" }
   }))

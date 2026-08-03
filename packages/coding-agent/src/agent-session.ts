@@ -60,6 +60,7 @@ import type { StoredCredential } from "./credential-store.js"
 import { DEFAULT_THINKING_LEVEL } from "./defaults.js"
 import { discoverExtensionLoadPlan, extensionDiscoveryDiagnostic } from "./extensions/discovery.js"
 import type { ExtensionHost, ExtensionHostSnapshot, ExtensionReloadResult } from "./extensions/host.js"
+import { validateActiveExtensionToolCatalog, type ExtensionToolRegistration } from "./extensions/protocol.js"
 import { admitExtensionTools } from "./extensions/tools.js"
 import { isZiAgentMessage, type AgentMessage } from "./messages.js"
 import type { ModelRegistry } from "./model-registry.js"
@@ -447,6 +448,11 @@ export interface ExtensionCommand extends SlashCommand {
   readonly extensionId: string
 }
 
+interface ExtensionToolSelection {
+  readonly registrations: readonly ExtensionToolRegistration[]
+  readonly active: ReadonlySet<ExtensionToolRegistration>
+}
+
 export class AgentSession {
   readonly sessionManager: SessionManager
   readonly settingsManager: SettingsManager
@@ -470,6 +476,7 @@ export class AgentSession {
   readonly #unbindExtensionSessionOperations: (() => void) | undefined
   #resources: SessionResources
   #baseTools: readonly AgentTool[]
+  #extensionToolSelection: ExtensionToolSelection = { registrations: Object.freeze([]), active: new Set() }
   #activity: Activity = { type: "idle" }
   #extensionLifecycle: ExtensionLifecycleState
   #pending: PendingInput[] = []
@@ -519,6 +526,8 @@ export class AgentSession {
       sendMessage: (message, delivery) => {
         this.#sendExtensionCustomMessage(message, delivery)
       },
+      getActiveTools: extensionId => this.#getExtensionActiveTools(extensionId),
+      setActiveTools: (extensionId, names) => this.#setExtensionActiveTools(extensionId, names),
       ...(this.#subagents
         ? {
             subagents: {
@@ -1514,6 +1523,16 @@ export class AgentSession {
 
   #applyExtensionCatalog(): void {
     const host = this.#extensionHost
+    const tools = host?.toolCatalog() ?? Object.freeze([])
+    // Pi 73414d08 owns active selection in AgentSession. Registration identity lets Zi
+    // preserve admission changes within a generation while reload restores new defaults.
+    const previous = this.#extensionToolSelection
+    const previousTools = new Set(previous.registrations)
+    const activeTools = new Set<ExtensionToolRegistration>()
+    for (const tool of tools) {
+      if (previousTools.has(tool) ? previous.active.has(tool) : tool.active) activeTools.add(tool)
+    }
+    this.#extensionToolSelection = { registrations: tools, active: activeTools }
     if (host) {
       const rejectedCommands = host
         .commandCatalog()
@@ -1528,6 +1547,33 @@ export class AgentSession {
     this.#applyActiveTools()
   }
 
+  #getExtensionActiveTools(extensionId: string): readonly string[] {
+    const selection = this.#extensionToolSelection
+    return Object.freeze(
+      selection.registrations
+        .filter(tool => tool.source.id === extensionId && selection.active.has(tool))
+        .map(tool => tool.name)
+    )
+  }
+
+  #setExtensionActiveTools(extensionId: string, names: readonly string[]): void {
+    const selection = this.#extensionToolSelection
+    const byName = new Map(
+      selection.registrations.filter(tool => tool.source.id === extensionId).map(tool => [tool.name, tool] as const)
+    )
+    const next = new Set(
+      selection.registrations.filter(tool => tool.source.id !== extensionId && selection.active.has(tool))
+    )
+    for (const name of names) {
+      const tool = byName.get(name)
+      if (!tool) throw new Error(`Unknown or unadmitted extension tool: ${name}`)
+      next.add(tool)
+    }
+    validateActiveExtensionToolCatalog([...next])
+    this.#extensionToolSelection = { registrations: selection.registrations, active: next }
+    this.#applyActiveTools()
+  }
+
   #applyActiveTools(): void {
     const profiles = this.#subagentProfiles()
     const subagentTools = this.#subagents
@@ -1535,7 +1581,11 @@ export class AgentSession {
           this.#spawnSubagentFromProfile(profile, name, prompt, signal)
         )
       : []
-    const tools = admitExtensionTools([...this.#baseTools, ...subagentTools], this.#extensionHost)
+    const tools = admitExtensionTools(
+      [...this.#baseTools, ...subagentTools],
+      this.#extensionHost,
+      this.#extensionToolSelection.active
+    )
     this.#agent.state.tools = this.#codeMode ? [...tools, this.#codeMode.createTool(tools)] : [...tools]
     this.#agent.state.systemPrompt = buildSystemPrompt(
       this.sessionManager.header.cwd,

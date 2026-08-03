@@ -296,6 +296,265 @@ export default function (zi: ExtensionAPI): void {
   }
 }, 10_000)
 
+test("extension tools replace an extension-scoped catalog at provider-step boundaries", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-runtime-extension-active-tools-"))
+  const cwd = join(root, "project")
+  const agentDir = join(root, "agent")
+  const extensionDir = join(agentDir, "extensions")
+  await mkdir(cwd, { recursive: true })
+  await mkdir(extensionDir, { recursive: true })
+  await writeFile(
+    join(extensionDir, "active-tools.ts"),
+    `import { Schema, type ExtensionAPI } from "@with-zi/extension-api"
+export default function (zi: ExtensionAPI): void {
+  zi.registerTool({
+    name: "activate_catalog",
+    description: "Activate the dormant tool",
+    parameters: Schema.object({}),
+    async execute() {
+      const before = await zi.getActiveTools()
+      let crossExtensionRefused = false
+      try {
+        await zi.setActiveTools(["other_extension_tool"])
+      } catch {
+        crossExtensionRefused = true
+      }
+      await zi.setActiveTools(["activate_catalog", "deactivate_catalog", "dormant_echo"])
+      const after = await zi.getActiveTools()
+      return JSON.stringify({ before, crossExtensionRefused, after })
+    }
+  })
+  zi.registerTool({
+    name: "deactivate_catalog",
+    description: "Hide the dormant tool",
+    parameters: Schema.object({}),
+    async execute() {
+      await zi.setActiveTools(["activate_catalog"])
+      return "Catalog deactivated"
+    }
+  })
+  zi.registerTool({
+    name: "dormant_echo",
+    description: "Echo one value after activation",
+    active: false,
+    parameters: Schema.object({ value: Schema.string() }),
+    execute: ({ value }) => "dormant:" + value
+  })
+}
+`
+  )
+  await writeFile(
+    join(extensionDir, "other-tools.ts"),
+    `import { Schema, type ExtensionAPI } from "@with-zi/extension-api"
+export default function (zi: ExtensionAPI): void {
+  zi.registerTool({
+    name: "other_extension_tool",
+    description: "A tool owned by another extension",
+    parameters: Schema.object({}),
+    execute: () => "other"
+  })
+}
+`
+  )
+  const models = createModels()
+  const faux = fauxProvider()
+  models.setProvider(faux.provider)
+  faux.setResponses([
+    fauxAssistantMessage(
+      [
+        fauxToolCall("activate_catalog", {}, { id: "activate-catalog" }),
+        fauxToolCall("dormant_echo", { value: "same-batch" }, { id: "dormant-same-batch" }),
+        fauxToolCall(
+          "code",
+          { code: `async () => { await zi.activate_catalog({}); return typeof zi.dormant_echo }` },
+          { id: "code-same-batch" }
+        )
+      ],
+      { stopReason: "toolUse" }
+    ),
+    fauxAssistantMessage(fauxToolCall("dormant_echo", { value: "direct" }, { id: "dormant-direct" }), {
+      stopReason: "toolUse"
+    }),
+    fauxAssistantMessage(fauxToolCall("other_extension_tool", {}, { id: "other-direct" }), { stopReason: "toolUse" }),
+    fauxAssistantMessage(
+      fauxToolCall("code", { code: `async () => await zi.dormant_echo({ value: "nested" })` }, { id: "dormant-code" }),
+      { stopReason: "toolUse" }
+    ),
+    fauxAssistantMessage(
+      [
+        fauxToolCall("deactivate_catalog", {}, { id: "deactivate-catalog" }),
+        fauxToolCall("dormant_echo", { value: "deactivation-batch" }, { id: "dormant-deactivation-batch" })
+      ],
+      { stopReason: "toolUse" }
+    ),
+    fauxAssistantMessage(
+      fauxToolCall("dormant_echo", { value: "after-deactivation" }, { id: "dormant-after-deactivation" }),
+      { stopReason: "toolUse" }
+    ),
+    fauxAssistantMessage("Catalog activated and deactivated.")
+  ])
+  const runtime = await createAgentRuntime({
+    cwd,
+    agentDir,
+    model: "faux/faux-1",
+    modelFactory: () => models,
+    session: { type: "new", persist: false }
+  })
+
+  try {
+    expect(runtime.session.extensionHostSnapshot).toMatchObject({
+      tools: [
+        { name: "activate_catalog", active: true },
+        { name: "deactivate_catalog", active: true },
+        { name: "dormant_echo", active: false },
+        { name: "other_extension_tool", active: true }
+      ]
+    })
+    await runtime.session.prompt("Activate and use the dormant tool.")
+    const results = runtime.session.messages.filter(message => message.role === "toolResult")
+    expect(results).toHaveLength(9)
+    expect(results[0]).toMatchObject({
+      toolCallId: "activate-catalog",
+      content: [
+        {
+          type: "text",
+          text: '{"before":["activate_catalog","deactivate_catalog"],"crossExtensionRefused":true,"after":["activate_catalog","deactivate_catalog","dormant_echo"]}'
+        }
+      ]
+    })
+    expect(results[1]).toMatchObject({
+      toolCallId: "dormant-same-batch",
+      toolName: "dormant_echo",
+      content: [{ type: "text", text: "Tool dormant_echo not found" }],
+      isError: true
+    })
+    expect(results[2]).toMatchObject({
+      toolCallId: "code-same-batch",
+      content: [{ type: "text", text: "undefined" }],
+      details: { type: "code_mode", outcome: "success" }
+    })
+    expect(results[3]).toMatchObject({
+      toolCallId: "dormant-direct",
+      content: [{ type: "text", text: "dormant:direct" }]
+    })
+    expect(results[4]).toMatchObject({ toolCallId: "other-direct", content: [{ type: "text", text: "other" }] })
+    expect(results[5]).toMatchObject({
+      toolCallId: "dormant-code",
+      content: [{ type: "text", text: "dormant:nested" }],
+      details: { type: "code_mode", outcome: "success" }
+    })
+    expect(results[6]).toMatchObject({
+      toolCallId: "deactivate-catalog",
+      content: [{ type: "text", text: "Catalog deactivated" }]
+    })
+    expect(results[7]).toMatchObject({
+      toolCallId: "dormant-deactivation-batch",
+      content: [{ type: "text", text: "dormant:deactivation-batch" }]
+    })
+    expect(results[8]).toMatchObject({
+      toolCallId: "dormant-after-deactivation",
+      content: [{ type: "text", text: "Tool dormant_echo not found" }],
+      isError: true
+    })
+    faux.setResponses([
+      fauxAssistantMessage(fauxToolCall("dormant_echo", { value: "after-reload" }, { id: "dormant-after-reload" }), {
+        stopReason: "toolUse"
+      }),
+      fauxAssistantMessage("Catalog reset.")
+    ])
+    expect(await runtime.session.reload()).toMatchObject({ extensions: { outcome: "replaced" } })
+    await runtime.session.prompt("Try the dormant tool after reload.")
+    expect(
+      runtime.session.messages.find(
+        message => message.role === "toolResult" && message.toolCallId === "dormant-after-reload"
+      )
+    ).toMatchObject({ content: [{ type: "text", text: "Tool dormant_echo not found" }], isError: true })
+  } finally {
+    runtime.session.dispose()
+    await runtime.session.waitForIdle()
+    await rm(root, { recursive: true, force: true })
+  }
+}, 10_000)
+
+test("session_start can restore durable active tools after reload", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-runtime-extension-active-tools-restore-"))
+  const cwd = join(root, "project")
+  const agentDir = join(root, "agent")
+  const extensionDir = join(agentDir, "extensions")
+  const observed = join(root, "restored.log")
+  await mkdir(cwd, { recursive: true })
+  await mkdir(extensionDir, { recursive: true })
+  await writeFile(
+    join(extensionDir, "durable-active-tools.ts"),
+    `import { appendFileSync } from "node:fs"
+import { Schema, type ExtensionAPI } from "@with-zi/extension-api"
+export default function (zi: ExtensionAPI): void {
+  zi.on("session_start", async () => {
+    const entries = await zi.getSessionEntries("example.active-tools")
+    const latest = entries.at(-1)?.data
+    if (typeof latest === "object" && latest !== null && !Array.isArray(latest) && latest.enabled === true) {
+      await zi.setActiveTools(["enable_durable_tool", "durable_echo"])
+      appendFileSync(${JSON.stringify(observed)}, "restored\\n")
+    }
+  })
+  zi.registerTool({
+    name: "enable_durable_tool",
+    description: "Persist and activate the durable tool",
+    parameters: Schema.object({}),
+    async execute() {
+      await zi.appendEntry("example.active-tools", { enabled: true })
+      await zi.setActiveTools(["enable_durable_tool", "durable_echo"])
+      return "enabled"
+    }
+  })
+  zi.registerTool({
+    name: "durable_echo",
+    description: "Echo after durable restoration",
+    active: false,
+    parameters: Schema.object({ value: Schema.string() }),
+    execute: ({ value }) => "durable:" + value
+  })
+}
+`
+  )
+  const models = createModels()
+  const faux = fauxProvider()
+  models.setProvider(faux.provider)
+  faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("enable_durable_tool", {}, { id: "enable-durable" }), { stopReason: "toolUse" }),
+    fauxAssistantMessage("Enabled.")
+  ])
+  const runtime = await createAgentRuntime({
+    cwd,
+    agentDir,
+    model: "faux/faux-1",
+    modelFactory: () => models,
+    session: { type: "new", persist: false }
+  })
+
+  try {
+    await runtime.session.prompt("Enable the durable tool.")
+    faux.setResponses([
+      fauxAssistantMessage(fauxToolCall("durable_echo", { value: "restored" }, { id: "durable-restored" }), {
+        stopReason: "toolUse"
+      }),
+      fauxAssistantMessage("Restored.")
+    ])
+    expect(await runtime.session.reload()).toMatchObject({ extensions: { outcome: "replaced" } })
+    expect(await readFile(observed, "utf8")).toBe("restored\n")
+    await runtime.session.prompt("Use the restored tool.")
+    expect(
+      runtime.session.messages.find(
+        message => message.role === "toolResult" && message.toolCallId === "durable-restored"
+      )
+    ).toMatchObject({ content: [{ type: "text", text: "durable:restored" }] })
+  } finally {
+    runtime.session.dispose()
+    await runtime.session.waitForIdle()
+    await rm(root, { recursive: true, force: true })
+  }
+}, 10_000)
+
 test("extension lifecycle and tools can read, append, and message through nested session operations", async () => {
   const root = await mkdtemp(join(tmpdir(), "zi-runtime-extension-session-"))
   const cwd = join(root, "project")
