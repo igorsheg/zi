@@ -5,6 +5,7 @@ import { basename, join, resolve } from "node:path"
 
 import { runCodeModeAcceptance } from "./code-mode-acceptance.js"
 import { compileZi } from "./compile-zi.js"
+import { copyDistributionDocumentation } from "./distribution-documentation.js"
 import { runExtensionCustomToolAcceptance } from "./extension-custom-tool-acceptance.js"
 import { runSubagentCompiledAcceptance } from "./subagent-compiled-acceptance.js"
 
@@ -83,7 +84,13 @@ async function buildRelease(options: ReleaseBuildOptions): Promise<void> {
   try {
     await compileZi({ outfile: executable, version: options.version })
     if (process.platform !== "win32") await chmod(executable, 0o755)
-    await runExtensionCustomToolAcceptance({ executable })
+    await copyDistributionDocumentation(root, packageDirectory)
+    await runExtensionCustomToolAcceptance({
+      executable,
+      documentationRoot: packageDirectory,
+      extensionSource: join(packageDirectory, "examples", "extensions", "custom-tool", "index.ts"),
+      durableExtensionSource: join(packageDirectory, "examples", "extensions", "durable-counter", "index.ts")
+    })
     await runCodeModeAcceptance({ executable, cwd: packageDirectory })
     await runSubagentCompiledAcceptance({ executable })
     await run(["tar", "-czf", archive, "-C", outputDirectory, packageName], {

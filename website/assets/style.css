@@ -532,7 +532,8 @@
   .manual dl,
   .manual pre,
   .manual blockquote,
-  .manual-code {
+  .manual-code,
+  .manual-table {
     margin-block-start: var(--prose-gap);
   }
 
@@ -561,6 +562,30 @@
 
   .manual li + li {
     margin-block-start: var(--space-2);
+  }
+
+  .manual-table {
+    max-inline-size: 100%;
+    overflow-x: auto;
+  }
+
+  .manual table {
+    inline-size: 100%;
+    border-collapse: collapse;
+    color: var(--color-muted);
+  }
+
+  .manual th,
+  .manual td {
+    padding: var(--space-2) var(--space-3);
+    border-block-end: var(--line-width) solid var(--color-rule);
+    text-align: start;
+    vertical-align: top;
+  }
+
+  .manual th {
+    color: var(--color-fg);
+    font-weight: 400;
   }
 
   .manual dl {

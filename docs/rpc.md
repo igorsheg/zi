@@ -1,6 +1,12 @@
+---
+slug: rpc
+title: RPC protocol
+order: 100
+---
+
 # RPC protocol
 
-Zi RPC is a long-lived process protocol over the same authoritative `AgentSession` used by interactive and print modes. Zi v0.1.13 shipped the server and the copyable one-shot implementation in [`examples/rpc/client.ts`](../examples/rpc/client.ts). Its [release workflow](https://github.com/igorsheg/zi/actions/runs/30353017056) accepted the server, client, custom-tool round trip, and npm package shape against compiled executables on all five release targets.
+Zi RPC is a long-lived process protocol over the same authoritative `AgentSession` used by interactive and print modes. Start with the copyable one-shot client in [`examples/rpc/client.ts`](../examples/rpc/client.ts).
 
 ```sh
 zi --mode rpc --no-session
@@ -102,5 +108,3 @@ Message pages are bounded by both count and encoded bytes. A client should retai
 - connection settlement: 5 seconds.
 
 Closing stdin means the client has disconnected. Zi stops admitting requests, discards queued input, interrupts active work, waits boundedly, restores protocol resources, and then lets the CLI dispose the session it created. `SIGHUP`, `SIGINT`, and `SIGTERM` follow the same cancellation path and retain the CLI's established exit codes.
-
-The ownership and compatibility decision is recorded in [ADR 0022](adr/0022-rpc-connections-own-versioned-session-transport.md).

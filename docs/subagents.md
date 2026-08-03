@@ -1,8 +1,12 @@
+---
+slug: subagents
+title: Delegate with subagents
+order: 80
+---
+
 # Profile-driven subagents
 
 Zi admits subagent profiles from Markdown resources and programmatic extension registration. Both declaration paths produce the same session-owned profile catalog and activate the same standard model-facing tools. The parent `AgentSession` owns profile precedence, model and thinking resolution, orchestration tools, child-process mechanics, durable evidence, and shutdown.
-
-See [ADR 0029](adr/0029-subagent-profiles-share-session-owned-orchestration.md) for the ownership decision.
 
 ## Profile contract
 
@@ -44,7 +48,7 @@ thinking: minimal
 Inspect only the requested area. Return concrete file paths and concise findings.
 ```
 
-Saved as `pathfinder.md`, this declares profile `pathfinder`. One valid admitted profile is sufficient to activate the standard tools after startup or `/reload`.
+Saved as `pathfinder.md`, this declares profile `pathfinder`. One valid admitted profile is sufficient to activate the standard tools after startup or `/reload`. Start from the copyable [`examples/subagents/pathfinder.md`](../examples/subagents/pathfinder.md) profile when creating one with Zi.
 
 ## Programmatic declaration
 
@@ -95,7 +99,7 @@ The profile parameter includes bounded purpose summaries for the admitted catalo
 
 `wait_subagents` accepts 1–16 explicit runtime names. Omitting `names` captures once, when the call begins, up to 16 children that are working or have an uncollected result; later changes do not join that wait. If none qualify, the call returns immediately with an empty result, whose `all_completed` value describes that empty captured set and is therefore true. A timeout reports each captured target independently and never cancels child work. A wait returns the captured cycle's completion when durable, otherwise current status at timeout; older and newer completions are never substituted. Returning a captured completion marks it and older completions for that runtime name delivered. A timeout without that completion marks nothing delivered. The extension API retains explicit-name waits so custom orchestration controls its collection set.
 
-This message/follow-up distinction and targetless standard wait are adapted from Codex MultiAgentV2's `send_message`, `followup_task`, and mailbox wait. Zi deliberately keeps completion collection explicit instead of injecting child completion into parent context.
+Zi keeps completion collection explicit instead of injecting child completion into parent context.
 
 A session with no admitted profiles exposes none of these tools. Depth-one child sessions cannot recursively create subagents.
 

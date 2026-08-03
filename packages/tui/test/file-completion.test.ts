@@ -246,13 +246,13 @@ test("file controller closes an exact file path but keeps exact directories avai
   const session = new FakeFileSession()
   const controller = new FileCompletionController(picker, () => {})
 
-  const exactFile = "docs/adr/0011-zi-path-policy.md"
+  const exactFile = "docs/extensions.md"
   controller.update(session, 1, fileCompletionInputFromText(`@${exactFile}`, exactFile.length + 1))
   await Bun.sleep(25)
   session.calls[0]!.resolve({
     matches: [
       { path: exactFile, type: "file" },
-      { path: "docs/adr/0010-interactive-mode-owns-keybindings.md", type: "file" }
+      { path: "docs/subagents.md", type: "file" }
     ],
     truncated: false
   })

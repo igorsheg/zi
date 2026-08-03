@@ -1,3 +1,9 @@
+---
+slug: extensions
+title: Extend Zi
+order: 70
+---
+
 # Extensions
 
 Zi extensions are trusted TypeScript modules that add repository-specific behavior without changing Zi. The supported public surface consists of lifecycle handlers, user-invoked commands, model-callable tools, bounded durable session operations, and optional subagent profiles and operations.

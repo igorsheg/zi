@@ -3,7 +3,7 @@ export interface FuzzyMatch {
   readonly score: number
 }
 
-// Ported from pi-tui fuzzy matching at the repository pin in docs/reference-pins.md.
+// Ported from pi-tui fuzzy matching; local tests define Zi's accepted behavior.
 export function fuzzyMatch(query: string, text: string): FuzzyMatch {
   const queryLower = query.toLowerCase()
   const textLower = text.toLowerCase()

@@ -13,6 +13,7 @@ import {
   releaseTargets,
   type ReleaseTarget
 } from "./build-release.js"
+import { assertDistributionDocumentation } from "./distribution-documentation.js"
 
 export const npmPackageScope = "@with-zi"
 export const npmCliPackageName = `${npmPackageScope}/zi`
@@ -152,15 +153,17 @@ async function buildPlatformPackage(input: {
   await mkdir(extractDir, { recursive: true })
   await run(["tar", "-xzf", archive, "-C", extractDir], input.root)
 
-  const sourceExecutable = join(extractDir, `zi-${input.version}-${input.target}`, platform.executable)
+  const sourceDirectory = join(extractDir, `zi-${input.version}-${input.target}`)
+  const sourceExecutable = join(sourceDirectory, platform.executable)
   if (!existsSync(sourceExecutable))
     throw new Error(`Release archive did not contain ${platform.executable}: ${archive}`)
+  await assertDistributionDocumentation(sourceDirectory)
 
   const packageName = npmPlatformPackageName(input.target)
   const directory = join(input.npmRoot, packageDirectoryName(packageName))
-  await mkdir(join(directory, "bin"), { recursive: true })
+  await mkdir(directory, { recursive: true })
+  await cp(sourceDirectory, join(directory, "bin"), { recursive: true })
   const packagedExecutable = join(directory, "bin", platform.executable)
-  await cp(sourceExecutable, packagedExecutable)
   if (platform.executable === "zi") await chmod(packagedExecutable, 0o755)
 
   await copyReleaseMetadata(input.root, directory)

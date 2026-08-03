@@ -2,11 +2,11 @@
 
 ## Product references
 
-- `pi-coding-agent` is the coding-agent behavior **and architecture** reference, and its interactive mode is the TUI product-behavior reference.
+- `pi-coding-agent` at commit `73414d08b94d7db46d3fa66582c8fe3b02dabf72` is the coding-agent behavior **and architecture** reference, and its interactive mode is the TUI product-behavior reference.
 - `pi-ai` and `pi-agent-core` are dependencies; `pi-coding-agent` and `pi-tui` are not.
 - Imperative `@opentui/core` renderables are the terminal architecture; `@opentui/react` and Pi's TUI implementation are not.
 - OpenCode is a source of proven OpenTUI application patterns, not a template to copy wholesale.
-- `docs/building-block-strategy.md` sets product direction; `docs/roadmap.md` orders current work. `docs/parity-roadmap.md` remains the capability and provenance inventory, not the product priority order.
+- `docs/` is the single source for public consumer guides shipped with Zi and rendered by the website. Do not keep a second Markdown corpus under `website/`; keep architecture decisions, roadmaps, research, implementation plans, and maintainer notes out of `docs/`.
 
 ## Product direction
 
@@ -59,8 +59,6 @@ Explicit-state, data-oriented design is mandatory for stateful behavior.
 - Below-composer choice flows use the instance-scoped `PickerStack`: `Composer` remains the only input and focus owner; the stack owns frames, selection, suspended parent filters, and top-frame filtering; picker views render only the active frame and never create or edit an input.
 - Coding-agent owners do not depend on frontend state libraries. TUI stores use explicit binding and disposal; use Nano Stores `onMount()` only when a terminal resource lifetime genuinely follows observation.
 
-See `docs/adr/0004-explicit-state-and-transitions.md`, `docs/adr/0006-instance-scoped-nano-stores-own-tui-state.md`, `docs/adr/0008-composer-owned-picker-stack.md`, `docs/adr/0009-interruption-and-terminal-shutdown.md`, `docs/adr/0010-interactive-mode-owns-keybindings.md`, `docs/adr/0011-zi-path-policy.md`, `docs/adr/0012-agent-session-runtime-owns-replacement.md`, `docs/adr/0015-context-compaction-is-an-append-only-session-transaction.md`, `docs/adr/0016-session-bootstrap-separates-preferences-context-and-durability.md`, `docs/adr/0017-retry-failures-remain-durable-but-leave-provider-context.md`, `docs/adr/0018-session-memory-follows-active-and-cold-ownership.md`, `docs/adr/0019-opentui-owns-selection-interactive-mode-owns-copy.md`, `docs/adr/0022-rpc-connections-own-versioned-session-transport.md`, `docs/adr/0023-session-journal-separates-custom-state-and-custom-messages.md`, `docs/adr/0024-code-mode-isolates-generated-orchestration.md`, `docs/adr/0025-code-mode-tool-values-are-declared.md`, `docs/adr/0026-subagent-orchestration-supervises-rpc-processes.md`, `docs/adr/0028-interactive-mode-owns-notifications.md`, and `docs/adr/0029-subagent-profiles-share-session-owned-orchestration.md` for the project decisions.
-
 ## TUI hot paths and retained projections
 
 Terminal performance is an ownership and data-flow property, not a late rendering optimization.
@@ -77,8 +75,6 @@ Terminal performance is an ownership and data-flow property, not a late renderin
 - New asynchronous terminal catalogs and history views load from their presenting feature owner after first draw; the authoritative coding-agent owner provides bounded single-flight operations. Do not introduce a generic query cache or preload inactive screens.
 
 Before adding a new retained row or transient workflow, identify its authoritative source, stable key, invalidation boundary, retention bound, disposal path, and structural tests.
-
-See `docs/tui-performance-implementation-spec.md` and `docs/adr/0013-tool-invocations-keep-one-transcript-identity.md` for the current transcript limits, tool lifecycle, diagnostics, and migration sequence.
 
 ## Workspace ownership
 

@@ -1,5 +1,6 @@
 import type { AgentTool } from "@earendil-works/pi-agent-core"
 
+import { getProductDocumentationPaths } from "./product-documentation.js"
 import type { SessionResources } from "./resource-loader.js"
 import { formatSkillsForPrompt } from "./skills.js"
 
@@ -42,6 +43,7 @@ Guidelines:
 - Show file paths clearly`)
 
   const sections = [prompt]
+  if (resources.systemPrompt === undefined) sections.push(productDocumentationPrompt())
   if (resources.appendSystemPrompt.length > 0) sections.push(resources.appendSystemPrompt.join("\n\n"))
   if (resources.contextFiles.length > 0) {
     sections.push(
@@ -56,4 +58,32 @@ Guidelines:
   }
   sections.push(`Current date: ${new Date().toISOString().slice(0, 10)}\nCurrent working directory: ${cwd}`)
   return sections.join("\n\n")
+}
+
+function productDocumentationPrompt(): string {
+  const paths = getProductDocumentationPaths()
+  const readme = promptPath(paths.readme)
+  const docs = promptPath(paths.docs)
+  const examples = promptPath(paths.examples)
+  return `Zi documentation (read only when the user asks about Zi itself, configuration, extensions, skills, prompts, subagents, notifications, JSON, RPC, or the terminal client):
+- Documentation index: ${docs}/index.md
+- Product README: ${readme}
+- Documentation directory: ${docs}
+- Examples: ${examples}
+- When reading Zi docs or examples, resolve links and relative paths from those absolute locations, not from the current working directory
+- When asked about installation or getting started, read ${docs}/index.md
+- When asked about the CLI or terminal client, read ${docs}/cli.md
+- When asked about authentication, settings, or resource locations, read the corresponding guide in ${docs}/
+- When asked about prompts or system instructions, read ${docs}/prompts.md
+- When asked about notifications, read ${docs}/notifications.md
+- When asked about JSON mode, read ${docs}/json-events.md
+- When asked about RPC, read ${docs}/rpc.md and ${examples}/rpc/
+- When asked about extensions, read ${docs}/extensions.md and ${examples}/extensions/
+- When asked about skills, read ${docs}/skills.md and ${examples}/skills/
+- When asked about subagents, read ${docs}/subagents.md and ${examples}/subagents/
+- When working on Zi topics, read the relevant documentation and examples before implementing, and follow Markdown cross-references`
+}
+
+function promptPath(path: string): string {
+  return path.replaceAll("\\", "/")
 }

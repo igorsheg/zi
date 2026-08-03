@@ -4,6 +4,7 @@ import { chmod, rename, rm } from "node:fs/promises"
 import { join, relative, resolve } from "node:path"
 
 import { compileZi } from "./compile-zi.js"
+import { copyDistributionDocumentation } from "./distribution-documentation.js"
 
 export function developmentVersion(commit: string | undefined, dirty: boolean): string {
   return ["0.0.0-dev", commit, dirty ? "dirty" : undefined].filter(part => part !== undefined).join(".")
@@ -21,6 +22,7 @@ async function buildLocal(): Promise<void> {
   try {
     await compileZi({ outfile: pending, version })
     if (process.platform !== "win32") await chmod(pending, 0o755)
+    await copyDistributionDocumentation(root, outputDirectory)
     await rm(executable, { force: true })
     await rename(pending, executable)
   } finally {

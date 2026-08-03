@@ -34,6 +34,7 @@ export interface ExtensionCustomToolAcceptanceOptions {
   readonly executable: string
   readonly extensionSource?: string
   readonly durableExtensionSource?: string
+  readonly documentationRoot?: string
 }
 
 export async function runExtensionCustomToolAcceptance(options: ExtensionCustomToolAcceptanceOptions): Promise<void> {
@@ -58,7 +59,7 @@ export async function runExtensionCustomToolAcceptance(options: ExtensionCustomT
     await writeFile(join(agentDirectory, "trust.json"), JSON.stringify({ [realpathSync.native(project)]: true }))
 
     for (const mode of ["text", "json", "rpc", "interactive"] as const) {
-      const provider = new ToolRoundTripProvider()
+      const provider = new ToolRoundTripProvider(options.documentationRoot)
       try {
         const env = { ...process.env, AZURE_OPENAI_BASE_URL: provider.baseUrl, TERM: "xterm-256color" }
         if (mode === "rpc") {
@@ -232,9 +233,11 @@ class DurableCounterProvider {
 
 class ToolRoundTripProvider {
   readonly #server: ReturnType<typeof Bun.serve>
+  readonly #documentationRoot: string | undefined
   #state: ProviderState = { type: "awaiting_tool_call" }
 
-  constructor() {
+  constructor(documentationRoot: string | undefined) {
+    this.#documentationRoot = documentationRoot
     this.#server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: request => this.#receive(request) })
   }
 
@@ -261,6 +264,7 @@ class ToolRoundTripProvider {
       switch (this.#state.type) {
         case "awaiting_tool_call":
           validateToolRegistration(payload)
+          if (this.#documentationRoot) validateProductDocumentation(payload, this.#documentationRoot)
           this.#state = { type: "awaiting_tool_result" }
           return eventStreamResponse(toolCallEvents())
         case "awaiting_tool_result":
@@ -638,6 +642,21 @@ function validateToolRegistration(value: unknown): void {
   const path = requireRecord(properties.path, "custom tool path parameter")
   if (parameters.type !== "object" || path.type !== "string") {
     throw new Error("First provider request changed the custom tool schema")
+  }
+}
+
+function validateProductDocumentation(value: unknown, root: string): void {
+  const payload = JSON.stringify(value)
+  const normalizedRoot = root.replaceAll("\\", "/")
+  for (const path of [
+    `${normalizedRoot}/docs/extensions.md`,
+    `${normalizedRoot}/docs/skills.md`,
+    `${normalizedRoot}/docs/subagents.md`,
+    `${normalizedRoot}/examples/extensions/`,
+    `${normalizedRoot}/examples/skills/`,
+    `${normalizedRoot}/examples/subagents/`
+  ]) {
+    if (!payload.includes(path)) throw new Error(`Compiled provider prompt omitted packaged documentation: ${path}`)
   }
 }
 

@@ -10,9 +10,12 @@
  *   bun scripts/install-local-zi.ts --build
  *   bun scripts/install-local-zi.ts --bin-dir ~/.local/bin
  */
-import { access, chmod, copyFile, mkdir, rm, symlink, writeFile } from "node:fs/promises"
+import { chmod, copyFile, lstat, mkdir, rename, rm, symlink, writeFile } from "node:fs/promises"
 import { homedir } from "node:os"
-import { join, resolve } from "node:path"
+import { dirname, join, resolve } from "node:path"
+
+import { installedProductDirectoryName } from "../packages/coding-agent/src/product-documentation.js"
+import { assertDistributionDocumentation, copyDistributionDocumentation } from "./distribution-documentation.js"
 
 const root = resolve(import.meta.dirname, "..")
 const defaultBinDir = join(homedir(), ".local", "bin")
@@ -37,25 +40,9 @@ async function main(): Promise<void> {
 
   if (!(await exists(source))) throw new Error(`Built executable not found: ${source}`)
 
-  await mkdir(args.binDir, { recursive: true })
   const destination = join(args.binDir, executableName)
-
-  if (args.link && process.platform !== "win32") {
-    await rm(destination, { force: true })
-    await symlink(source, destination)
-    console.log(`Linked ${destination} -> ${source}`)
-  } else {
-    // Copy so replacing dist/ mid-session cannot yank the PATH binary out from under open processes.
-    const pending = `${destination}.${process.pid}.tmp`
-    await copyFile(source, pending)
-    await chmod(pending, 0o755)
-    await rm(destination, { force: true })
-    // rename over existing can fail across devices; copy+rm already used for payload.
-    await copyFile(pending, destination)
-    await chmod(destination, 0o755)
-    await rm(pending, { force: true })
-    console.log(`Installed ${destination}`)
-  }
+  const mode = await installLocalDistribution({ source, destination, link: args.link, platform: process.platform })
+  console.log(mode === "linked" ? `Linked ${destination} -> ${source}` : `Installed ${destination}`)
 
   const pathEntries = (process.env.PATH ?? "").split(delimiter())
   const onPath = pathEntries.some(entry => resolve(entry || ".") === resolve(args.binDir))
@@ -91,6 +78,108 @@ async function main(): Promise<void> {
   if (version.exitCode === 0) {
     console.log(version.stdout.toString().trim() || version.stderr.toString().trim())
   }
+}
+
+export async function installLocalDistribution(input: {
+  readonly source: string
+  readonly destination: string
+  readonly link: boolean
+  readonly platform: NodeJS.Platform
+}): Promise<"copied" | "linked"> {
+  await mkdir(dirname(input.destination), { recursive: true })
+  const installedProductDirectory = join(dirname(input.destination), installedProductDirectoryName)
+
+  const pendingExecutable = `${input.destination}.${process.pid}.tmp`
+  await rm(pendingExecutable, { force: true })
+
+  if (input.link && input.platform !== "win32") {
+    try {
+      await assertDistributionDocumentation(dirname(input.source))
+      await symlink(input.source, pendingExecutable)
+      await rename(pendingExecutable, input.destination)
+      await rm(installedProductDirectory, { recursive: true, force: true })
+      return "linked"
+    } finally {
+      await rm(pendingExecutable, { force: true })
+    }
+  }
+
+  const pendingProductDirectory = `${installedProductDirectory}.${process.pid}.tmp`
+  const previousExecutable = `${input.destination}.${process.pid}.previous`
+  const previousProductDirectory = `${installedProductDirectory}.${process.pid}.previous`
+  await Promise.all([
+    rm(pendingProductDirectory, { recursive: true, force: true }),
+    rm(previousExecutable, { force: true }),
+    rm(previousProductDirectory, { recursive: true, force: true })
+  ])
+
+  let productCommit: InstallPathCommit | undefined
+  try {
+    await mkdir(pendingProductDirectory)
+    await copyDistributionDocumentation(dirname(input.source), pendingProductDirectory)
+    await copyFile(input.source, pendingExecutable)
+    await chmod(pendingExecutable, 0o755)
+
+    productCommit = await commitInstallPath(
+      pendingProductDirectory,
+      installedProductDirectory,
+      previousProductDirectory
+    )
+    try {
+      await commitInstallPath(pendingExecutable, input.destination, previousExecutable)
+    } catch (cause) {
+      try {
+        await rollbackInstallPath(productCommit, installedProductDirectory, true)
+      } catch (rollbackCause) {
+        throw new Error(
+          `Local Zi install failed (${errorMessage(cause)}) and rollback did not complete: ${errorMessage(rollbackCause)}`,
+          { cause: rollbackCause }
+        )
+      }
+      throw cause
+    }
+  } finally {
+    await Promise.all([
+      rm(pendingExecutable, { force: true }),
+      rm(pendingProductDirectory, { recursive: true, force: true })
+    ])
+  }
+
+  await Promise.all([
+    rm(previousExecutable, { force: true }),
+    rm(previousProductDirectory, { recursive: true, force: true })
+  ])
+  return "copied"
+}
+
+type InstallPathCommit = { readonly type: "created" } | { readonly type: "replaced"; readonly previous: string }
+
+async function commitInstallPath(pending: string, current: string, previous: string): Promise<InstallPathCommit> {
+  if (!(await exists(current))) {
+    await rename(pending, current)
+    return { type: "created" }
+  }
+
+  await rename(current, previous)
+  try {
+    await rename(pending, current)
+    return { type: "replaced", previous }
+  } catch (cause) {
+    try {
+      await rename(previous, current)
+    } catch (rollbackCause) {
+      throw new Error(
+        `Local Zi install path failed (${errorMessage(cause)}) and rollback did not complete: ${errorMessage(rollbackCause)}`,
+        { cause: rollbackCause }
+      )
+    }
+    throw cause
+  }
+}
+
+async function rollbackInstallPath(commit: InstallPathCommit, current: string, recursive: boolean): Promise<void> {
+  await rm(current, recursive ? { recursive: true, force: true } : { force: true })
+  if (commit.type === "replaced") await rename(commit.previous, current)
 }
 
 async function maybeRetargetBunGlobalZi(destination: string): Promise<void> {
@@ -165,11 +254,15 @@ function shellQuote(value: string): string {
 
 async function exists(path: string): Promise<boolean> {
   try {
-    await access(path)
+    await lstat(path)
     return true
   } catch {
     return false
   }
+}
+
+function errorMessage(cause: unknown): string {
+  return cause instanceof Error ? cause.message : String(cause)
 }
 
 if (import.meta.main) {

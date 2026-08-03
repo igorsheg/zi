@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url"
 
 export interface WebsiteBuildOptions {
   readonly rootDir?: string
+  readonly docsDir?: string
   readonly outDir?: string
 }
 
@@ -29,32 +30,36 @@ type MarkdownNode =
   | { readonly type: "bullet_list"; readonly items: readonly string[] }
   | { readonly type: "ordered_list"; readonly items: readonly string[] }
   | { readonly type: "definition"; readonly term: string; readonly description: string }
+  | { readonly type: "table"; readonly headers: readonly string[]; readonly rows: readonly (readonly string[])[] }
 
 const scriptDir = dirname(fileURLToPath(import.meta.url))
 const repositoryRoot = resolve(scriptDir, "..")
 const defaultWebsiteRoot = join(repositoryRoot, "website")
+const defaultDocsDir = join(repositoryRoot, "docs")
 const defaultOutDir = join(repositoryRoot, "dist", "website")
 const maxManualPages = 64
 const maxWebsiteSourceBytes = 1024 * 1024
 
 export async function buildWebsite(options: WebsiteBuildOptions = {}): Promise<WebsiteBuildResult> {
   const rootDir = resolve(options.rootDir ?? defaultWebsiteRoot)
+  const docsDir = resolve(options.docsDir ?? defaultDocsDir)
   const outDir = resolve(options.outDir ?? defaultOutDir)
   await rm(outDir, { recursive: true, force: true })
   await mkdir(outDir, { recursive: true })
 
   await copyAssets(rootDir, outDir)
   await copyOptional(join(rootDir, "_redirects"), join(outDir, "_redirects"))
+  await cp(join(dirname(docsDir), "examples"), join(outDir, "examples"), { recursive: true })
   await writeFile(join(outDir, "index.html"), renderHomePage())
 
-  const pages = await loadManualPages(join(rootDir, "docs", "man"))
+  const pages = await loadManualPages(docsDir)
   const manDir = join(outDir, "man")
   await mkdir(manDir, { recursive: true })
   const written: string[] = ["index.html"]
 
   const pageWrites = pages.flatMap((page, index) => {
     const htmlName = page.slug === "intro" ? "index.html" : `${page.slug}.html`
-    const markdownName = page.slug === "intro" ? "index.md" : `${page.slug}.md`
+    const markdownName = page.markdownName
     written.push(`man/${htmlName}`, `man/${markdownName}`)
     return [
       writeFile(join(manDir, htmlName), renderManualPage(pages, index)),
@@ -67,13 +72,17 @@ export async function buildWebsite(options: WebsiteBuildOptions = {}): Promise<W
 }
 
 export function parseWebsiteBuildOptions(argv: readonly string[]): WebsiteBuildOptions {
-  const options: { rootDir?: string; outDir?: string } = {}
+  const options: { rootDir?: string; docsDir?: string; outDir?: string } = {}
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]
     if (arg === "--root-dir") {
       const value = argv[++i]
       if (!value) throw new Error("--root-dir requires a value")
       options.rootDir = value
+    } else if (arg === "--docs-dir") {
+      const value = argv[++i]
+      if (!value) throw new Error("--docs-dir requires a value")
+      options.docsDir = value
     } else if (arg === "--out-dir") {
       const value = argv[++i]
       if (!value) throw new Error("--out-dir requires a value")
@@ -133,6 +142,11 @@ async function loadManualPages(directory: string): Promise<readonly ManualPage[]
       }
     })
   )
+  const slugs = new Set<string>()
+  for (const page of pages) {
+    if (slugs.has(page.slug)) throw new Error(`Duplicate website manual slug: ${page.slug}`)
+    slugs.add(page.slug)
+  }
   return Object.freeze(pages.toSorted((left, right) => left.order - right.order || left.slug.localeCompare(right.slug)))
 }
 
@@ -150,8 +164,9 @@ function parseManualSource(source: string, path: string): Pick<ManualPage, "slug
   if (!/^[a-z0-9-]+$/.test(slug)) throw new Error(`Invalid manual slug in ${path}`)
   const title = stringField(frontmatter, "title", path)
   const orderText = stringField(frontmatter, "order", path)
-  const order = Number.parseInt(orderText, 10)
-  if (!Number.isSafeInteger(order) || order < 0) throw new Error(`Invalid manual order in ${path}`)
+  if (!/^\d+$/.test(orderText)) throw new Error(`Invalid manual order in ${path}`)
+  const order = Number(orderText)
+  if (!Number.isSafeInteger(order)) throw new Error(`Invalid manual order in ${path}`)
   return { slug, title, order, body: match[2] ?? "" }
 }
 
@@ -200,6 +215,19 @@ function parseMarkdown(source: string): readonly MarkdownNode[] {
       continue
     }
 
+    if (isTableStart(lines, i)) {
+      const headers = tableCells(line)
+      const rows: string[][] = []
+      i += 2
+      while (i < lines.length && (lines[i] ?? "").trimStart().startsWith("|")) {
+        const cells = tableCells(lines[i++] ?? "")
+        if (cells.length !== headers.length) throw new Error("Website manual table rows must match their header")
+        rows.push(cells)
+      }
+      nodes.push({ type: "table", headers, rows })
+      continue
+    }
+
     if (line.startsWith("- ")) {
       const items: string[] = []
       while (i < lines.length && (lines[i] ?? "").startsWith("- ")) items.push((lines[i++] ?? "").slice(2))
@@ -238,10 +266,57 @@ function isBlockStart(lines: readonly string[], index: number): boolean {
     line.trim() === "" ||
     /^(#{1,3})\s+/.test(line) ||
     line.startsWith("```") ||
+    isTableStart(lines, index) ||
     line.startsWith("- ") ||
     /^\d+\.\s+/.test(line) ||
     isDefinitionStart(lines, index)
   )
+}
+
+function isTableStart(lines: readonly string[], index: number): boolean {
+  const line = lines[index] ?? ""
+  const separator = lines[index + 1] ?? ""
+  if (!line.trimStart().startsWith("|") || !separator.trimStart().startsWith("|")) return false
+  const headers = tableCells(line)
+  const separators = tableCells(separator)
+  return (
+    headers.length > 0 && headers.length === separators.length && separators.every(cell => /^:?-{3,}:?$/.test(cell))
+  )
+}
+
+function tableCells(line: string): string[] {
+  const trimmed = line.trim()
+  const body = trimmed.slice(trimmed.startsWith("|") ? 1 : 0, trimmed.endsWith("|") ? -1 : undefined)
+  const cells: string[] = []
+  let cell = ""
+  let codeFence = 0
+
+  for (let index = 0; index < body.length; index++) {
+    const character = body[index] ?? ""
+    if (character === "\\" && body[index + 1] === "|") {
+      cell += "|"
+      index++
+      continue
+    }
+    if (character === "`") {
+      let fenceLength = 1
+      while (body[index + fenceLength] === "`") fenceLength++
+      if (codeFence === 0) codeFence = fenceLength
+      else if (codeFence === fenceLength) codeFence = 0
+      cell += "`".repeat(fenceLength)
+      index += fenceLength - 1
+      continue
+    }
+    if (character === "|" && codeFence === 0) {
+      cells.push(cell.trim())
+      cell = ""
+      continue
+    }
+    cell += character
+  }
+
+  cells.push(cell.trim())
+  return cells
 }
 
 function isDefinitionStart(lines: readonly string[], index: number): boolean {
@@ -279,8 +354,8 @@ function renderManualPage(pages: readonly ManualPage[], index: number): string {
   const prev = pages[index - 1]
   const next = pages[index + 1]
   const pagePath = page.slug === "intro" ? "/man/" : `/man/${page.slug}.html`
-  const markdownUrl = page.slug === "intro" ? "index.md" : `${page.slug}.md`
-  const content = page.nodes.map(renderNode).join("")
+  const markdownUrl = page.markdownName
+  const content = page.nodes.map(node => renderNode(node, pages)).join("")
   const toc = page.nodes
     .filter(isTocHeading)
     .map(node => `<li><a href="#${slugify(node.text)}">${escapeHtml(inlineText(node.text))}</a></li>`)
@@ -313,15 +388,15 @@ function isTocHeading(
   return node.type === "heading" && node.level > 1
 }
 
-function renderNode(node: MarkdownNode): string {
+function renderNode(node: MarkdownNode, pages: readonly ManualPage[]): string {
   switch (node.type) {
     case "heading": {
       const tag = node.level === 1 ? "h1" : node.level === 2 ? "h2" : "h3"
       const id = slugify(node.text)
-      return `<${tag} id="${id}"><a class="manual-anchor" href="#${id}">${renderInline(node.text)}<span aria-hidden="true">#</span></a></${tag}>\n`
+      return `<${tag} id="${id}"><a class="manual-anchor" href="#${id}">${renderInline(node.text, pages)}<span aria-hidden="true">#</span></a></${tag}>\n`
     }
     case "paragraph":
-      return `<p>${renderInline(node.text)}</p>\n`
+      return `<p>${renderInline(node.text, pages)}</p>\n`
     case "code": {
       const language = node.language ? safeToken(node.language) : undefined
       const caption = language ? `<figcaption>${escapeHtml(language)}</figcaption>` : ""
@@ -329,11 +404,13 @@ function renderNode(node: MarkdownNode): string {
       return `<figure class="manual-code">${caption}<pre tabindex="0"><code${className}>${escapeHtml(node.content)}</code></pre></figure>\n`
     }
     case "bullet_list":
-      return `<ul>\n${node.items.map(item => `  <li>${renderInline(item)}</li>`).join("\n")}\n</ul>\n`
+      return `<ul>\n${node.items.map(item => `  <li>${renderInline(item, pages)}</li>`).join("\n")}\n</ul>\n`
     case "ordered_list":
-      return `<ol>\n${node.items.map(item => `  <li>${renderInline(item)}</li>`).join("\n")}\n</ol>\n`
+      return `<ol>\n${node.items.map(item => `  <li>${renderInline(item, pages)}</li>`).join("\n")}\n</ol>\n`
     case "definition":
-      return `<dl>\n  <dt>${renderInline(node.term)}</dt>\n  <dd>${renderInline(node.description)}</dd>\n</dl>\n`
+      return `<dl>\n  <dt>${renderInline(node.term, pages)}</dt>\n  <dd>${renderInline(node.description, pages)}</dd>\n</dl>\n`
+    case "table":
+      return `<div class="manual-table" tabindex="0"><table>\n<thead><tr>${node.headers.map(cell => `<th scope="col">${renderInline(cell, pages)}</th>`).join("")}</tr></thead>\n<tbody>\n${node.rows.map(row => `<tr>${row.map(cell => `<td>${renderInline(cell, pages)}</td>`).join("")}</tr>`).join("\n")}\n</tbody>\n</table></div>\n`
   }
   return unexpectedNode(node)
 }
@@ -394,7 +471,7 @@ function htmlPage(input: {
 `
 }
 
-function renderInline(source: string): string {
+function renderInline(source: string, pages: readonly ManualPage[]): string {
   let output = ""
   let i = 0
   while (i < source.length) {
@@ -428,8 +505,8 @@ function renderInline(source: string): string {
         const closeUrl = source.indexOf(")", closeText + 2)
         if (closeUrl !== -1) {
           const text = source.slice(i + 1, closeText)
-          const url = source.slice(closeText + 2, closeUrl)
-          output += `<a href="${escapeAttribute(url)}">${escapeHtml(text)}</a>`
+          const url = manualLink(source.slice(closeText + 2, closeUrl), pages)
+          output += `<a href="${escapeAttribute(url)}">${renderInline(text, pages)}</a>`
           i = closeUrl + 1
           continue
         }
@@ -439,6 +516,14 @@ function renderInline(source: string): string {
     i++
   }
   return output
+}
+
+function manualLink(url: string, pages: readonly ManualPage[]): string {
+  const fragmentStart = url.indexOf("#")
+  const path = fragmentStart === -1 ? url : url.slice(0, fragmentStart)
+  const fragment = fragmentStart === -1 ? "" : url.slice(fragmentStart)
+  const page = pages.find(candidate => candidate.markdownName === path)
+  return page ? `${manualHref(page)}${fragment}` : url
 }
 
 function inlineText(source: string): string {
@@ -463,7 +548,7 @@ function escapeHtml(source: string): string {
 }
 
 function escapeAttribute(source: string): string {
-  if (/^https?:\/\//.test(source) || source.startsWith("/") || /^[a-z0-9._/-]+$/i.test(source)) {
+  if (/^https?:\/\//.test(source) || source.startsWith("/") || /^[a-z0-9._/#-]+$/i.test(source)) {
     return escapeHtml(source)
   }
   throw new Error(`Unsafe URL in website markdown: ${source}`)

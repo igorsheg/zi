@@ -1,3 +1,9 @@
+---
+slug: notifications
+title: Terminal notifications
+order: 110
+---
+
 # Notifications
 
 Zi's interactive client provides a Fidget-style notification surface through each `InteractiveMode` instance.
