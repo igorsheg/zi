@@ -5,6 +5,9 @@ import { delimiter, isAbsolute, join } from "node:path"
 import { Readable, Writable } from "node:stream"
 
 import type {
+  ExtensionAgentSettledEvent,
+  ExtensionAgentStartEvent,
+  ExtensionContext,
   ExtensionCustomEntry,
   ExtensionCustomMessage,
   ExtensionMessageDelivery,
@@ -20,6 +23,7 @@ import type { ExtensionLoadPlan } from "./discovery.js"
 import {
   boundedExtensionDiagnostic,
   boundedExtensionSessionOperationError,
+  extensionAgentEventTimeoutMs,
   extensionCommandCancellationTimeoutMs,
   extensionCommandTimeoutMs,
   extensionLifecycleTimeoutMs,
@@ -33,6 +37,7 @@ import {
   maxExtensionDiagnostics,
   maxExtensionLogBytesPerStream,
   maxExtensionPendingRequests,
+  maxExtensionQueuedAgentEvents,
   type ExtensionCommandRegistration,
   type ExtensionDiagnostic,
   type ExtensionLoadResult,
@@ -103,6 +108,7 @@ const noExtensionHostCapabilities: ExtensionHostCapabilities = Object.freeze({ s
 export interface ExtensionHostTimeouts {
   readonly startupMs: number
   readonly lifecycleMs: number
+  readonly agentEventMs: number
   readonly shutdownMs: number
   readonly commandMs: number
   readonly commandCancellationMs: number
@@ -113,6 +119,7 @@ export interface ExtensionHostTimeouts {
 export const defaultExtensionHostTimeouts: ExtensionHostTimeouts = Object.freeze({
   startupMs: extensionStartupTimeoutMs,
   lifecycleMs: extensionLifecycleTimeoutMs,
+  agentEventMs: extensionAgentEventTimeoutMs,
   shutdownMs: extensionShutdownTimeoutMs,
   commandMs: extensionCommandTimeoutMs,
   commandCancellationMs: extensionCommandCancellationTimeoutMs,
@@ -379,11 +386,13 @@ class ExtensionGeneration {
   readonly #commandInvocations = new Map<number, GenerationCommandInvocation>()
   readonly #toolInvocations = new Map<number, GenerationToolInvocation>()
   readonly #sessionResponses = new Set<number>()
+  readonly #pendingAgentEvents = new Map<number, ReturnType<typeof setTimeout>>()
   readonly #sessionOperations = new Map<
     number,
     { readonly extensionId: string; readonly controller: AbortController }
   >()
   #lastSessionRequestId = 0
+  #nextAgentEventSequence = 1
   #commands: readonly ExtensionCommandRegistration[] = Object.freeze([])
   #tools: readonly ExtensionToolRegistration[] = Object.freeze([])
   #subagents: readonly ExtensionSubagentRegistration[] = Object.freeze([])
@@ -492,10 +501,10 @@ class ExtensionGeneration {
     }
   }
 
-  async requestStart(reason: ExtensionStartReason): Promise<void> {
+  async requestStart(reason: ExtensionStartReason, context: ExtensionContext): Promise<void> {
     const admitted = this.#admitRequest("session_start")
     void this.#runRequest(
-      { type: "session_start", generation: this.id, requestId: admitted.requestId, reason },
+      { type: "session_start", generation: this.id, requestId: admitted.requestId, reason, context },
       admitted.settled
     )
     return admitted.settled.promise
@@ -508,6 +517,29 @@ class ExtensionGeneration {
       admitted.settled
     )
     return admitted.settled.promise
+  }
+
+  publishAgentEvent(type: ExtensionAgentStartEvent["type"] | ExtensionAgentSettledEvent["type"]): void {
+    const state = this.#state
+    if (state.type !== "ready" || state.lifecycle !== "started") return
+    if (this.#pendingAgentEvents.size >= maxExtensionQueuedAgentEvents) {
+      this.#fail("event", `Extension agent event queue exceeded ${maxExtensionQueuedAgentEvents} entries`)
+      return
+    }
+    const sequence = this.#nextAgentEventSequence
+    if (!Number.isSafeInteger(sequence)) {
+      this.#fail("event", "Extension agent event sequence is exhausted")
+      return
+    }
+    this.#nextAgentEventSequence++
+    const timeout = setTimeout(() => {
+      if (!this.#pendingAgentEvents.delete(sequence)) return
+      this.#fail("event", `Extension agent event did not settle within ${this.#timeouts.agentEventMs}ms`)
+    }, this.#timeouts.agentEventMs)
+    this.#pendingAgentEvents.set(sequence, timeout)
+    void this.#writer.send({ type, generation: this.id, sequence }).catch(cause => {
+      this.#fail("protocol", "Extension agent event delivery failed", cause)
+    })
   }
 
   requestCommand(name: string, arguments_: string, signal?: AbortSignal): Promise<string | undefined> {
@@ -852,6 +884,16 @@ class ExtensionGeneration {
           subagents
         })
         return
+      case "agent_event_settled": {
+        const timeout = this.#pendingAgentEvents.get(message.sequence)
+        if (!timeout) {
+          this.#fail("protocol", "Extension worker settled an unknown agent event")
+          return
+        }
+        clearTimeout(timeout)
+        this.#pendingAgentEvents.delete(message.sequence)
+        return
+      }
       case "settled":
         if (state.type === "requesting" && state.requestId === message.requestId) {
           const lifecycle = state.request === "session_start" ? "started" : "stopped"
@@ -1070,6 +1112,7 @@ class ExtensionGeneration {
     for (const operation of this.#sessionOperations.values()) operation.controller.abort()
     this.#sessionOperations.clear()
     this.#sessionResponses.clear()
+    this.#clearPendingAgentEvents()
 
     if (state.type === "disposing_stopping") {
       state.settled.reject(error)
@@ -1091,6 +1134,11 @@ class ExtensionGeneration {
     )
   }
 
+  #clearPendingAgentEvents(): void {
+    for (const timeout of this.#pendingAgentEvents.values()) clearTimeout(timeout)
+    this.#pendingAgentEvents.clear()
+  }
+
   #takeRequestId(): number {
     const requestId = this.#nextRequestId
     if (!Number.isSafeInteger(requestId)) throw new Error("Extension request IDs are exhausted")
@@ -1109,6 +1157,7 @@ class ExtensionGeneration {
     for (const operation of this.#sessionOperations.values()) operation.controller.abort()
     this.#sessionOperations.clear()
     this.#sessionResponses.clear()
+    this.#clearPendingAgentEvents()
     this.#writer.dispose()
     this.#process.protocol.off("data", this.#onProtocolData)
     this.#process.protocol.off("end", this.#onProtocolEnd)
@@ -1245,6 +1294,14 @@ export class ExtensionHost {
     }
   }
 
+  publishAgentStart(): void {
+    this.#publishAgentEvent("agent_start")
+  }
+
+  publishAgentSettled(): void {
+    this.#publishAgentEvent("agent_settled")
+  }
+
   invokeCommand(name: string, arguments_: unknown, signal?: AbortSignal): Promise<string | undefined> {
     const state = this.#state
     if (state.type !== "ready" || state.lifecycle !== "started") {
@@ -1317,7 +1374,13 @@ export class ExtensionHost {
     )
   }
 
-  async sessionStart(reason: ExtensionStartReason): Promise<void> {
+  #publishAgentEvent(type: ExtensionAgentStartEvent["type"] | ExtensionAgentSettledEvent["type"]): void {
+    const state = this.#state
+    if (state.type !== "ready" || state.lifecycle !== "started") return
+    state.current.publishAgentEvent(type)
+  }
+
+  async sessionStart(reason: ExtensionStartReason, context: ExtensionContext): Promise<void> {
     const state = this.#state
     if (state.type === "disabled") {
       if (state.lifecycle !== "unbound") throw new Error(`Extension host cannot start while ${state.lifecycle}`)
@@ -1340,7 +1403,7 @@ export class ExtensionHost {
     }
     this.#state = dispatching
     try {
-      await state.current.requestStart(reason)
+      await state.current.requestStart(reason, context)
       if (this.#state === dispatching) {
         this.#state = { type: "ready", lifecycle: "started", current: state.current }
       }
@@ -1387,7 +1450,8 @@ export class ExtensionHost {
 
   async reload(
     request: ExtensionReloadRequest,
-    reason: ExtensionReplacementReason = "reload"
+    reason: ExtensionReplacementReason,
+    context: ExtensionContext
   ): Promise<ExtensionReloadResult> {
     if (this.#reloadAttempt) throw new Error("Extension host cannot reload while reloading")
     const state = this.#state
@@ -1419,7 +1483,7 @@ export class ExtensionHost {
         this.#setCatalog(Object.freeze([]), Object.freeze([]))
         return this.#finishReloadAttempt("disabled")
       }
-      await this.#startPlan(plan, state.lifecycle, reason)
+      await this.#startPlan(plan, state.lifecycle, reason, context)
       return this.#finishReloadAttempt(reloadOutcomeAfterStart(this.#state))
     }
 
@@ -1501,7 +1565,7 @@ export class ExtensionHost {
       }
       this.#state = dispatching
       try {
-        await candidate.requestStart(reason)
+        await candidate.requestStart(reason, context)
         if (this.#state !== dispatching) return this.#finishReloadAttempt("superseded")
         this.#state = { type: "ready", lifecycle: "started", current: candidate }
         return this.#finishReloadAttempt("replaced")
@@ -1555,7 +1619,8 @@ export class ExtensionHost {
   async #startPlan(
     plan: ExtensionLoadPlan,
     lifecycle: ExtensionHostLifecycle,
-    startReason?: ExtensionReplacementReason
+    startReason?: ExtensionReplacementReason,
+    context?: ExtensionContext
   ): Promise<void> {
     if (plan.sources.length === 0) {
       this.#state = { type: "disabled", lifecycle }
@@ -1621,7 +1686,8 @@ export class ExtensionHost {
       }
       this.#state = dispatching
       try {
-        await candidate.requestStart(startReason ?? "reload")
+        if (!context) throw new Error("Starting an already-bound extension host requires its context")
+        await candidate.requestStart(startReason ?? "reload", context)
         if (this.#state === dispatching) {
           this.#state = { type: "ready", lifecycle: "started", current: candidate }
         }

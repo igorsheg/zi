@@ -1,5 +1,6 @@
 import { Agent, type AgentTool, type ThinkingLevel } from "@earendil-works/pi-agent-core"
 import { clampThinkingLevel, type Api, type Model } from "@earendil-works/pi-ai"
+import type { ExtensionContext, ExtensionMode, ExtensionSession } from "@with-zi/extension-api"
 
 import { AgentSession, type SessionReloadDeps } from "./agent-session.js"
 import { Authentication } from "./authentication.js"
@@ -70,6 +71,7 @@ export interface CreateAgentSessionOptions {
   readonly tools: readonly AgentTool[]
   readonly shell?: SessionShell
   readonly extensionHost?: ExtensionHost
+  readonly extensionMode?: ExtensionMode
   readonly resources?: SessionResources
   readonly codeMode?: CodeMode
   readonly project?: ProjectConfigurationAdmission
@@ -207,12 +209,24 @@ export async function createAgentSessionWithProcessTreeTracker(
     ...(subagents ? { subagentSupervisor: subagents } : {}),
     ...(options.codeMode ? { codeMode: options.codeMode } : {}),
     ...(options.extensionHost ? { extensionHost: options.extensionHost } : {}),
+    extensionContext: createExtensionContext(options.extensionMode ?? "embedded", services, sessionManager),
     processTreeTracker,
     ...(options.shell ? { shell: options.shell } : {}),
     ...(model ? { model } : {}),
     ...(options.apiKey && model ? { apiKeyProvider: model.provider } : {})
   })
   return Object.freeze({ session, ...(bootstrapDiagnostic ? { bootstrapDiagnostic } : {}) })
+}
+
+function createExtensionContext(
+  mode: ExtensionMode,
+  services: AgentSessionServices,
+  sessionManager: SessionManager
+): ExtensionContext {
+  const session: ExtensionSession = sessionManager.file
+    ? Object.freeze({ type: "journal", id: sessionManager.sessionId, file: sessionManager.file })
+    : Object.freeze({ type: "memory", id: sessionManager.sessionId })
+  return Object.freeze({ mode, cwd: services.paths.cwd, session })
 }
 
 function createBootstrapDiagnostic(

@@ -36,6 +36,7 @@ import {
   validateWorkerMessage
 } from "../src/extensions/protocol.js"
 import { maxCustomStateEntries } from "../src/session-manager.js"
+import { testExtensionContext } from "./extension-context.js"
 
 const source: ExtensionSource = Object.freeze({
   id: "extension-fixture",
@@ -49,7 +50,13 @@ const plan: ExtensionLoadPlan = Object.freeze({ cwd: resolve("project"), sources
 test("protocol decoding accepts partial frames and multiple messages per read", () => {
   const decoder = new ExtensionProtocolDecoder(validateHostMessage)
   const initialize: HostMessage = { type: "initialize", protocolVersion: extensionProtocolVersion, generation: 1, plan }
-  const start: HostMessage = { type: "session_start", generation: 1, requestId: 3, reason: "startup" }
+  const start: HostMessage = {
+    type: "session_start",
+    generation: 1,
+    requestId: 3,
+    reason: "startup",
+    context: testExtensionContext
+  }
   const bytes = Buffer.concat([encodeExtensionProtocolFrame(initialize), encodeExtensionProtocolFrame(start)])
   const messages = []
 
@@ -63,6 +70,9 @@ test("protocol decoding accepts partial frames and multiple messages per read", 
   expect(messages).toEqual([initialize, start])
   if (messages[0]?.type !== "initialize") throw new Error("Initialize frame was not decoded first")
   expect(Object.isFrozen(messages[0].plan.sources)).toBe(true)
+  if (messages[1]?.type !== "session_start") throw new Error("Session start frame was not decoded second")
+  expect(Object.isFrozen(messages[1].context)).toBe(true)
+  expect(Object.isFrozen(messages[1].context.session)).toBe(true)
 })
 
 test("protocol decoding rejects malformed framing, UTF-8, JSON, and closed messages", () => {
@@ -127,6 +137,41 @@ test("host protocol validation bounds and freezes the complete load plan", () =>
   expect(() => validateHostMessage({ type: "session_start", generation: 1, requestId: 1, reason: "later" })).toThrow(
     "start reason"
   )
+  expect(() =>
+    validateHostMessage({
+      type: "session_start",
+      generation: 1,
+      requestId: 1,
+      reason: "startup",
+      context: { ...testExtensionContext, mode: "terminal" }
+    })
+  ).toThrow("extension mode")
+  expect(() =>
+    validateHostMessage({
+      type: "session_start",
+      generation: 1,
+      requestId: 1,
+      reason: "startup",
+      context: { ...testExtensionContext, cwd: "relative" }
+    })
+  ).toThrow("context cwd must be absolute")
+  expect(() =>
+    validateHostMessage({
+      type: "session_start",
+      generation: 1,
+      requestId: 1,
+      reason: "startup",
+      context: { ...testExtensionContext, session: { type: "journal", id: "session", file: "relative" } }
+    })
+  ).toThrow("session file must be absolute")
+  expect(validateHostMessage({ type: "agent_start", generation: 1, sequence: 1 })).toEqual({
+    type: "agent_start",
+    generation: 1,
+    sequence: 1
+  })
+  expect(() => validateHostMessage({ type: "agent_settled", generation: 1, sequence: 0 })).toThrow(
+    "agent event sequence"
+  )
 })
 
 test("worker protocol validation keeps source-attributed load and lifecycle results closed", () => {
@@ -168,6 +213,11 @@ test("worker protocol validation keeps source-attributed load and lifecycle resu
     })
   ).toThrow(`${maxExtensionDiagnosticMessageBytes} bytes`)
   expect(() => validateWorkerMessage({ type: "settled", generation: 1, requestId: -1 })).toThrow("requestId")
+  expect(validateWorkerMessage({ type: "agent_event_settled", generation: 1, sequence: 2 })).toEqual({
+    type: "agent_event_settled",
+    generation: 1,
+    sequence: 2
+  })
 })
 
 test("command protocol validates catalogs, raw arguments, feedback, and correlation", () => {

@@ -20,6 +20,7 @@ import {
   type Model
 } from "@earendil-works/pi-ai"
 import type {
+  ExtensionContext,
   ExtensionCustomEntry,
   ExtensionMessageDelivery,
   ExtensionShutdownReason,
@@ -281,6 +282,7 @@ interface AgentSessionConfig {
   reload: SessionReloadDeps
   codeMode?: CodeMode
   extensionHost?: ExtensionHost
+  extensionContext: ExtensionContext
   shell?: SessionShell
   subagentSupervisor?: SubagentSupervisor
   processTreeTracker?: ProcessTreeTracker
@@ -464,6 +466,7 @@ export class AgentSession {
   readonly #projectFileSearch: ProjectFileSearch
   readonly #codeMode: CodeMode | undefined
   readonly #extensionHost: ExtensionHost | undefined
+  readonly #extensionContext: ExtensionContext
   readonly #shell: SessionShell | undefined
   readonly #subagents: SubagentSupervisor | undefined
   readonly #processTreeTracker: ProcessTreeTracker | undefined
@@ -505,6 +508,7 @@ export class AgentSession {
     this.#projectFileSearch = config.projectFileSearch
     this.#codeMode = config.codeMode
     this.#extensionHost = config.extensionHost
+    this.#extensionContext = config.extensionContext
     this.#baseTools = Object.freeze([...config.tools])
     this.#extensionLifecycle = config.extensionHost
       ? { type: "unbound", host: config.extensionHost }
@@ -1100,7 +1104,8 @@ export class AgentSession {
             diagnostics: discovery.diagnostics.map(extensionDiscoveryDiagnostic),
             omittedDiagnostics: discovery.omittedDiagnostics
           },
-          "reload"
+          "reload",
+          this.#extensionContext
         )
       }
 
@@ -1358,7 +1363,7 @@ export class AgentSession {
     const operation = createSettlement()
     const starting: ExtensionLifecycleState = { type: "starting", host: state.host, settled: operation.promise }
     this.#extensionLifecycle = starting
-    void state.host.sessionStart(reason).then(
+    void state.host.sessionStart(reason, this.#extensionContext).then(
       () => {
         if (this.#extensionLifecycle === starting) {
           this.#extensionLifecycle = { type: "started", host: state.host }
@@ -1758,6 +1763,7 @@ export class AgentSession {
           this.#activity = { type: "idle" }
         }
         if (failure) this.#agent.clearAllQueues()
+        this.#extensionHost?.publishAgentSettled()
         this.#emit({ type: "agent_settled" })
       }
     } catch (cause) {
@@ -2642,6 +2648,7 @@ export class AgentSession {
         this.#emit({ type: "entry_appended", entry })
       }
     }
+    if (event.type === "agent_start") this.#extensionHost?.publishAgentStart()
     if (event.type === "agent_end") {
       const messages: AgentMessage[] = []
       for (const message of event.messages) {

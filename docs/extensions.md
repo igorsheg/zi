@@ -6,7 +6,7 @@ order: 70
 
 # Extensions
 
-Zi extensions are trusted TypeScript modules that add repository-specific behavior without changing Zi. The supported public surface consists of lifecycle handlers, user-invoked commands, model-callable tools, bounded durable session operations, and optional subagent profiles and operations.
+Zi extensions are trusted TypeScript modules that add repository-specific behavior without changing Zi. The supported public surface consists of lifecycle and agent-activity handlers, user-invoked commands, model-callable tools, bounded durable session operations, and optional subagent profiles and operations.
 
 ## Trust and authority
 
@@ -24,7 +24,7 @@ Zi discovers entry points in deterministic order:
 
 A directory entry may use `index.ts`; a direct `.ts` file also works. TypeScript and relative imports load without a build. Install third-party dependencies in the extension's own package hierarchy so normal bare-module resolution can find them.
 
-Start with [`examples/extensions/custom-tool/index.ts`](../examples/extensions/custom-tool/index.ts). For a dormant catalog, see [`examples/extensions/deferred-tools/index.ts`](../examples/extensions/deferred-tools/index.ts). For session persistence and custom messages, see [`examples/extensions/durable-counter/index.ts`](../examples/extensions/durable-counter/index.ts). For programmatic subagent profiles, see [`examples/extensions/subagents/index.ts`](../examples/extensions/subagents/index.ts).
+Start with [`examples/extensions/custom-tool/index.ts`](../examples/extensions/custom-tool/index.ts). For a dormant catalog, see [`examples/extensions/deferred-tools/index.ts`](../examples/extensions/deferred-tools/index.ts). For session persistence and custom messages, see [`examples/extensions/durable-counter/index.ts`](../examples/extensions/durable-counter/index.ts). For programmatic subagent profiles, see [`examples/extensions/subagents/index.ts`](../examples/extensions/subagents/index.ts). For an observational terminal integration, see [`examples/extensions/herdr-agent-state/index.ts`](../examples/extensions/herdr-agent-state/index.ts).
 
 ## Public API
 
@@ -47,7 +47,32 @@ export default function (zi: ExtensionAPI): void {
 }
 ```
 
-The default factory may be synchronous or asynchronous. Registration is allowed only while that factory runs. A failure rolls back registrations from that source without preventing other extensions or Zi from starting.
+The default factory may be synchronous or asynchronous. Registration is allowed only while that factory runs. A failure rolls back registrations from that source without preventing other extensions or Zi from starting. Session context does not exist at factory time.
+
+### Callback context
+
+Every handler and command or tool invocation in one extension generation receives the same frozen session identity:
+
+```ts
+interface ExtensionContext {
+  readonly mode: "interactive" | "text" | "json" | "rpc" | "embedded"
+  readonly cwd: string
+  readonly session:
+    | { readonly type: "memory"; readonly id: string }
+    | { readonly type: "journal"; readonly id: string; readonly file: string }
+}
+```
+
+`interactive` is Zi's visible terminal client. `text`, `json`, and `rpc` are the corresponding CLI protocols. `embedded` is the default for direct SDK/runtime construction unless the embedding client supplies a more specific mode. `cwd` is the runtime's absolute working directory. A journal path is absolute; a memory session has no resumable file.
+
+Lifecycle and agent-activity handlers receive `(event, context)`. Command and tool execution contexts extend this value with their invocation-scoped `signal`. The context is an immutable value captured when the session is constructed, not a live session API; extensions do not receive `AgentSession`, terminal UI objects, or session-manager authority.
+
+```ts
+zi.on("session_start", (event, context) => {
+  if (context.mode !== "interactive") return
+  console.error(`Started ${context.session.id} from ${event.reason}`)
+})
+```
 
 ### User commands
 
@@ -140,7 +165,11 @@ Custom types use lowercase ASCII names beginning with a letter. They may contain
 
 ## Lifecycle and resources
 
-Use `zi.on("session_start", handler)` to create long-lived resources and `zi.on("session_shutdown", handler)` to stop them. Shutdown handlers may read custom entries and append final custom state until all handlers settle; conversation delivery is closed once session disposal begins. Zi then removes the session-operation binding before disposing the worker. The extension that creates a subprocess, listener, or other resource owns its cleanup. Shutdown waits are bounded, and Zi cannot clean up detached descendants.
+Use `zi.on("session_start", handler)` to create long-lived resources and `zi.on("session_shutdown", handler)` to stop them. Shutdown handlers may read custom entries and append final custom state until all handlers settle; conversation delivery is closed once session disposal begins. Zi then removes the session-operation binding before disposing the worker. The extension that creates a subprocess, listener, socket, or other resource owns its cleanup. Shutdown waits are bounded, and Zi cannot clean up detached descendants.
+
+Use `zi.on("agent_start", handler)` for the start of underlying agent activity and `zi.on("agent_settled", handler)` for the final transition back to logical idle. Settlement occurs only after retries, compaction recovery, and admitted queued continuation have finished. Zi intentionally does not expose `agent_end` as an idle signal.
+
+Agent-activity handlers are observational. Zi publishes them without awaiting them in `AgentSession`; one slow extension cannot enter agent-run settlement. A worker delivers them in order through a 32-event queue, gives each event one second across its registered handlers, and fails only that extension generation on timeout or overflow. Reload, session replacement, and shutdown close the old generation so stale completion cannot cross into the new session. Use `session_shutdown`—not an activity handler—to release resources.
 
 Edit trusted extensions, skills, prompts, settings, or context files, then run `/reload` in interactive mode (or call `AgentSession.reload()` from a client). Reload keeps the same session identity and journal, rereads settings and resources under the current project-trust admission, replaces the extension generation in place, and emits `session_shutdown` / `session_start` with reason `"reload"`. Candidate `session_start` may append custom state and append-only custom messages; turn-triggering delivery stays closed until reload settles. A failed candidate before commit retains the previous generation. A worker crash leaves the session usable without extensions until an explicit reload recovers it. Subagent profiles registered by the old generation are replaced with the generation, while already admitted child work remains owned by the session.
 

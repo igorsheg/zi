@@ -2,9 +2,14 @@ import { isAbsolute } from "node:path"
 import type { Writable } from "node:stream"
 
 import type {
+  ExtensionAgentSettledEvent,
+  ExtensionAgentStartEvent,
+  ExtensionContext,
   ExtensionCustomEntry,
   ExtensionCustomMessage,
   ExtensionMessageDelivery,
+  ExtensionMode,
+  ExtensionSession,
   ExtensionShutdownReason,
   ExtensionStartReason,
   ExtensionThinkingLevel,
@@ -25,7 +30,7 @@ import {
   type ExtensionSource
 } from "./discovery.js"
 
-export const extensionProtocolVersion = 7
+export const extensionProtocolVersion = 8
 export const maxExtensionProtocolFrameBytes = 4 * 1024 * 1024
 export const maxExtensionPendingRequests = 128
 export const maxExtensionQueuedWriteBytes = 8 * 1024 * 1024
@@ -38,6 +43,8 @@ export const maxExtensionIdBytes = 256
 export const maxExtensionLogBytesPerStream = 256 * 1024
 export const extensionStartupTimeoutMs = 30_000
 export const extensionLifecycleTimeoutMs = 10_000
+export const extensionAgentEventTimeoutMs = 1_000
+export const maxExtensionQueuedAgentEvents = 32
 export const extensionShutdownTimeoutMs = 3_000
 export const extensionCommandTimeoutMs = 30_000
 export const extensionCommandCancellationTimeoutMs = 1_000
@@ -88,6 +95,7 @@ export interface ExtensionDiagnostic {
     | "factory"
     | "registration"
     | "lifecycle"
+    | "event"
     | "command"
     | "tool"
     | "protocol"
@@ -106,7 +114,7 @@ export interface ExtensionLoadResult {
 export type HostMessage =
   | {
       readonly type: "initialize"
-      readonly protocolVersion: 7
+      readonly protocolVersion: 8
       readonly generation: number
       readonly plan: ExtensionLoadPlan
       readonly subagentsAvailable?: boolean
@@ -116,6 +124,7 @@ export type HostMessage =
       readonly generation: number
       readonly requestId: number
       readonly reason: ExtensionStartReason
+      readonly context: ExtensionContext
     }
   | {
       readonly type: "session_shutdown"
@@ -123,6 +132,8 @@ export type HostMessage =
       readonly requestId: number
       readonly reason: ExtensionShutdownReason
     }
+  | { readonly type: ExtensionAgentStartEvent["type"]; readonly generation: number; readonly sequence: number }
+  | { readonly type: ExtensionAgentSettledEvent["type"]; readonly generation: number; readonly sequence: number }
   | {
       readonly type: "command_invoke"
       readonly generation: number
@@ -211,7 +222,7 @@ export type HostMessage =
 export type WorkerMessage =
   | {
       readonly type: "ready"
-      readonly protocolVersion: 7
+      readonly protocolVersion: 8
       readonly generation: number
       readonly extensions: readonly ExtensionLoadResult[]
       readonly commands: readonly ExtensionCommandRegistration[]
@@ -219,6 +230,7 @@ export type WorkerMessage =
       readonly subagents?: readonly ExtensionSubagentRegistration[]
     }
   | { readonly type: "settled"; readonly generation: number; readonly requestId: number }
+  | { readonly type: "agent_event_settled"; readonly generation: number; readonly sequence: number }
   | {
       readonly type: "command_result"
       readonly generation: number
@@ -592,7 +604,8 @@ export function validateHostMessage(value: unknown): HostMessage {
         type: "session_start",
         generation: positiveInteger(message.generation, "generation"),
         requestId: positiveInteger(message.requestId, "requestId"),
-        reason: startReason(message.reason)
+        reason: startReason(message.reason),
+        context: extensionContext(message.context)
       })
     case "session_shutdown":
       return Object.freeze({
@@ -600,6 +613,13 @@ export function validateHostMessage(value: unknown): HostMessage {
         generation: positiveInteger(message.generation, "generation"),
         requestId: positiveInteger(message.requestId, "requestId"),
         reason: shutdownReason(message.reason)
+      })
+    case "agent_start":
+    case "agent_settled":
+      return Object.freeze({
+        type: message.type,
+        generation: positiveInteger(message.generation, "generation"),
+        sequence: positiveInteger(message.sequence, "agent event sequence")
       })
     case "command_invoke":
       return Object.freeze({
@@ -733,6 +753,12 @@ export function validateWorkerMessage(value: unknown): WorkerMessage {
       }
       return admitted
     }
+    case "agent_event_settled":
+      return Object.freeze({
+        type: "agent_event_settled",
+        generation: positiveInteger(message.generation, "generation"),
+        sequence: positiveInteger(message.sequence, "agent event sequence")
+      })
     case "settled":
     case "command_cancelled":
     case "tool_cancelled":
@@ -1451,6 +1477,7 @@ function extensionDiagnostic(value: unknown): ExtensionDiagnostic {
     phase !== "factory" &&
     phase !== "registration" &&
     phase !== "lifecycle" &&
+    phase !== "event" &&
     phase !== "command" &&
     phase !== "tool" &&
     phase !== "protocol" &&
@@ -1492,7 +1519,7 @@ function protocolArray(value: unknown, field: string): readonly unknown[] {
   return value
 }
 
-function protocolVersion(value: unknown): 7 {
+function protocolVersion(value: unknown): 8 {
   if (value !== extensionProtocolVersion) throw new ExtensionProtocolError("Unsupported extension protocol version")
   return extensionProtocolVersion
 }
@@ -1540,6 +1567,30 @@ function boundedText(value: string, maxBytes: number): string {
   let end = maxBytes
   while (end > 0 && (buffer[end]! & 0xc0) === 0x80) end--
   return buffer.toString("utf8", 0, end)
+}
+
+function extensionContext(value: unknown): ExtensionContext {
+  const context = protocolRecord(value)
+  const cwd = pathText(context.cwd, "extension context cwd")
+  if (!isAbsolute(cwd)) throw new ExtensionProtocolError("Extension context cwd must be absolute")
+  return Object.freeze({ mode: extensionMode(context.mode), cwd, session: extensionSession(context.session) })
+}
+
+function extensionMode(value: unknown): ExtensionMode {
+  if (value !== "interactive" && value !== "text" && value !== "json" && value !== "rpc" && value !== "embedded") {
+    throw new ExtensionProtocolError("Unknown extension mode")
+  }
+  return value
+}
+
+function extensionSession(value: unknown): ExtensionSession {
+  const session = protocolRecord(value)
+  const id = boundedRequiredText(session.id, "extension session id", maxExtensionIdBytes)
+  if (session.type === "memory") return Object.freeze({ type: "memory", id })
+  if (session.type !== "journal") throw new ExtensionProtocolError("Unknown extension session type")
+  const file = pathText(session.file, "extension session file")
+  if (!isAbsolute(file)) throw new ExtensionProtocolError("Extension session file must be absolute")
+  return Object.freeze({ type: "journal", id, file })
 }
 
 function startReason(value: unknown): ExtensionStartReason {

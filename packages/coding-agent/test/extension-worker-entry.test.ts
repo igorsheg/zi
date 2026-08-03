@@ -15,6 +15,7 @@ import {
   validateWorkerMessage
 } from "../src/extensions/protocol.js"
 import { extensionWorkerArgument } from "../src/extensions/worker-entry.js"
+import { testExtensionContext } from "./extension-context.js"
 
 test("the CLI internal mode runs one external TypeScript worker generation on its dedicated pipe", async () => {
   const root = await mkdtemp(join(tmpdir(), "zi-extension-worker-entry-"))
@@ -62,7 +63,13 @@ export default async function (zi: ExtensionAPI): Promise<void> {
   try {
     send(child.stdin, { type: "initialize", protocolVersion: extensionProtocolVersion, generation: 1, plan })
     expect(await messages.next()).toMatchObject({ type: "ready", extensions: [{ status: "loaded" }] })
-    send(child.stdin, { type: "session_start", generation: 1, requestId: 1, reason: "startup" })
+    send(child.stdin, {
+      type: "session_start",
+      generation: 1,
+      requestId: 1,
+      reason: "startup",
+      context: testExtensionContext
+    })
     expect(await messages.next()).toEqual({ type: "settled", generation: 1, requestId: 1 })
     send(child.stdin, { type: "session_shutdown", generation: 1, requestId: 2, reason: "quit" })
     expect(await messages.next()).toEqual({ type: "settled", generation: 1, requestId: 2 })

@@ -43,7 +43,9 @@ import type { ExtensionAPI } from "@with-zi/extension-api"
 export default function (zi: ExtensionAPI): void {
   console.log("compiled worker stdout")
   console.error("compiled worker stderr")
-  zi.on("session_start", event => appendFileSync(${JSON.stringify(lifecycle)}, "start:" + event.reason + "\\n"))
+  zi.on("session_start", (event, context) => appendFileSync(${JSON.stringify(lifecycle)}, "start:" + event.reason + ":" + context.mode + "\\n"))
+  zi.on("agent_start", event => appendFileSync(${JSON.stringify(lifecycle)}, event.type + "\\n"))
+  zi.on("agent_settled", event => appendFileSync(${JSON.stringify(lifecycle)}, event.type + "\\n"))
   zi.on("session_shutdown", event => appendFileSync(${JSON.stringify(lifecycle)}, "stop:" + event.reason + "\\n"))
 }
 `
@@ -107,7 +109,13 @@ export default function (zi: ExtensionAPI): void {
             return
           }
           child!.stdin!.write(
-            encodeExtensionProtocolFrame({ type: "session_start", generation: 1, requestId: 1, reason: "startup" })
+            encodeExtensionProtocolFrame({
+              type: "session_start",
+              generation: 1,
+              requestId: 1,
+              reason: "startup",
+              context: { mode: "embedded", cwd: temporary, session: { type: "memory", id: "compiled-session" } }
+            })
           )
           return
         }
@@ -123,6 +131,14 @@ export default function (zi: ExtensionAPI): void {
           return
         }
         if (message.type === "settled" && message.requestId === 1) {
+          child!.stdin!.write(encodeExtensionProtocolFrame({ type: "agent_start", generation: 1, sequence: 1 }))
+          return
+        }
+        if (message.type === "agent_event_settled" && message.sequence === 1) {
+          child!.stdin!.write(encodeExtensionProtocolFrame({ type: "agent_settled", generation: 1, sequence: 2 }))
+          return
+        }
+        if (message.type === "agent_event_settled" && message.sequence === 2) {
           child!.stdin!.write(
             encodeExtensionProtocolFrame({
               type: "command_invoke",
@@ -254,6 +270,8 @@ export default function (zi: ExtensionAPI): void {
       "ready",
       "custom_entries_get",
       "settled",
+      "agent_event_settled",
+      "agent_event_settled",
       "command_result",
       "custom_entry_append",
       "custom_message_send",
@@ -266,7 +284,7 @@ export default function (zi: ExtensionAPI): void {
     expect(compiledCounterResult).toBe("1")
     expect(compiledCustomMessage).toBe("Counter: 1")
     expect(JSON.stringify(compiledToolResult)).toContain("zi")
-    expect(await Bun.file(lifecycle).text()).toBe("start:startup\nstop:quit\n")
+    expect(await Bun.file(lifecycle).text()).toBe("start:startup:embedded\nagent_start\nagent_settled\nstop:quit\n")
 
     await Bun.write(lifecycle, "")
     await Bun.write(

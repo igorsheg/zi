@@ -227,7 +227,11 @@ test("text mode writes final output without loading the TUI and disposes its run
     host
   )
   expect({ exitCode, output, errors }).toEqual({ exitCode: 0, output: ["done\n"], errors: [] })
-  expect(receivedOptions).toMatchObject({ session: { type: "new", persist: false }, apiKey: "cli-secret" })
+  expect(receivedOptions).toMatchObject({
+    session: { type: "new", persist: false },
+    apiKey: "cli-secret",
+    extensionMode: "text"
+  })
   expect(output.join("")).not.toContain("cli-secret")
   expect(interactiveLoads).toBe(0)
   expect(() => runtime?.session.prompt("disposed")).toThrow("AgentSession is disposed")
@@ -445,10 +449,14 @@ test("JSON mode emits only parseable JSONL without loading the TUI", async () =>
   const output: string[] = []
   const errors: string[] = []
   let interactiveLoads = 0
+  let receivedOptions: CreateAgentRuntimeOptions | undefined
   const host = testHost({
     output,
     errors,
-    createRuntime: options => createTestAgentRuntime({ ...options, models }),
+    createRuntime: options => {
+      receivedOptions = options
+      return createTestAgentRuntime({ ...options, models })
+    },
     async runInteractive() {
       interactiveLoads++
     }
@@ -461,6 +469,7 @@ test("JSON mode emits only parseable JSONL without loading the TUI", async () =>
   expect(exitCode).toBe(0)
   expect(errors).toEqual([])
   expect(interactiveLoads).toBe(0)
+  expect(receivedOptions?.extensionMode).toBe("json")
   expect(output.length).toBeGreaterThan(1)
   expect(output.every(line => line.endsWith("\n") && JSON.parse(line) !== undefined)).toBe(true)
 })
@@ -601,11 +610,13 @@ test("TTY mode delegates positional prompts only to the dynamic interactive load
   const errors: string[] = []
   let initialMessages: readonly string[] = []
   let sessionRuntime: AgentSessionRuntime | undefined
+  let receivedOptions: CreateAgentRuntimeOptions | undefined
   const host = testHost({
     output,
     errors,
     createRuntime: options => createTestAgentRuntime({ ...options, models }),
     async createSessionRuntime(options) {
+      receivedOptions = options
       sessionRuntime = await createTestAgentSessionRuntime({ ...options, models })
       return sessionRuntime
     },
@@ -620,6 +631,7 @@ test("TTY mode delegates positional prompts only to the dynamic interactive load
   )
   expect(exitCode).toBe(0)
   expect(initialMessages).toEqual(["interactive prompt"])
+  expect(receivedOptions?.extensionMode).toBe("interactive")
   expect(() => sessionRuntime?.session).toThrow("AgentSessionRuntime is disposed")
   expect(output).toEqual([])
   expect(errors).toEqual([])
@@ -632,6 +644,7 @@ test("RPC mode delegates protocol input without reading it as a prompt", async (
   let stdinReads = 0
   let rpcRuns = 0
   let runtime: AgentRuntime | undefined
+  let receivedOptions: CreateAgentRuntimeOptions | undefined
   const host = testHost({
     output,
     errors,
@@ -641,6 +654,7 @@ test("RPC mode delegates protocol input without reading it as a prompt", async (
       stdinReads++
     },
     async createRuntime(options) {
+      receivedOptions = options
       runtime = await createTestAgentRuntime({ ...options, models })
       return runtime
     },
@@ -653,6 +667,7 @@ test("RPC mode delegates protocol input without reading it as a prompt", async (
 
   expect(await runCli(["--mode", "rpc", "--no-session"], host)).toBe(0)
   expect({ stdinReads, rpcRuns }).toEqual({ stdinReads: 0, rpcRuns: 1 })
+  expect(receivedOptions?.extensionMode).toBe("rpc")
   expect(() => runtime?.session.prompt("disposed")).toThrow("AgentSession is disposed")
   expect(output).toEqual([])
   expect(errors).toEqual([])

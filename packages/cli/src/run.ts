@@ -114,12 +114,12 @@ export async function runCli(argv: readonly string[], host: CliHost): Promise<nu
   try {
     if (mode === "interactive") {
       sessionRuntime = await host.createSessionRuntime(
-        runtimeOptions(args, host.extensionWorkerCommand, host.codeModeWorkerCommand, host.env)
+        runtimeOptions(args, mode, host.extensionWorkerCommand, host.codeModeWorkerCommand, host.env)
       )
       runtime = sessionRuntime
     } else {
       runtime = await host.createRuntime(
-        runtimeOptions(args, host.extensionWorkerCommand, host.codeModeWorkerCommand, host.env)
+        runtimeOptions(args, mode, host.extensionWorkerCommand, host.codeModeWorkerCommand, host.env)
       )
     }
   } catch (cause) {
@@ -186,6 +186,7 @@ export async function runCli(argv: readonly string[], host: CliHost): Promise<nu
 
 function runtimeOptions(
   args: CliInvocation,
+  mode: AppMode,
   extensionWorkerCommand: readonly string[],
   codeModeWorkerCommand: readonly string[],
   environment: Readonly<Record<string, string | undefined>>
@@ -196,6 +197,7 @@ function runtimeOptions(
     cwd: args.cwd,
     agentDir: args.agentDir,
     extensionPaths: args.extensionPaths,
+    extensionMode: mode,
     extensionWorkerCommand,
     codeModeWorkerCommand,
     subagentCommand: extensionWorkerCommand,

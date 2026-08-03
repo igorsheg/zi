@@ -125,6 +125,7 @@ export async function createUnboundAgentRuntime(requested: CreateAgentRuntimeOpt
         sessionManager,
         shell,
         extensionHost,
+        extensionMode: options.extensionMode ?? "embedded",
         codeMode,
         project,
         extensionPaths: options.extensionPaths ?? [],

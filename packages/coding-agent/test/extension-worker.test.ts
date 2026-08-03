@@ -10,7 +10,8 @@ import {
   maxExtensionToolDescriptionBytes,
   maxExtensionTools
 } from "../src/extensions/protocol.js"
-import { loadExtensionGeneration, maxExtensionLifecycleHandlers } from "../src/extensions/worker.js"
+import { loadExtensionGeneration, maxExtensionEventHandlers } from "../src/extensions/worker.js"
+import { testExtensionContext } from "./extension-context.js"
 
 const extensionApi = pathToFileURL(resolve(import.meta.dirname, "../../extension-api/src/index.ts")).href
 
@@ -50,7 +51,7 @@ export default function (zi: ExtensionAPI): void {
   const generation = await loadExtensionGeneration(extensionPlan(root, [first, second]), 1)
   expect(generation.results.map(result => result.status)).toEqual(["loaded", "loaded"])
 
-  expect(await generation.dispatch({ type: "session_start", reason: "startup" })).toEqual({
+  expect(await generation.dispatch({ type: "session_start", reason: "startup" }, testExtensionContext)).toEqual({
     diagnostics: [],
     omittedDiagnostics: 0
   })
@@ -61,9 +62,69 @@ export default function (zi: ExtensionAPI): void {
   expect(await readFile(log, "utf8")).toBe(
     "first:fixture value:local dependency\nfirst-second\nsecond:startup\nfirst-stop\nsecond-stop:quit\n"
   )
-  expect(generation.dispatch({ type: "session_start", reason: "reload" })).rejects.toThrow(
+  expect(generation.dispatch({ type: "session_start", reason: "reload" }, testExtensionContext)).rejects.toThrow(
     "while extension lifecycle is stopped"
   )
+})
+
+test("worker callbacks share one immutable session context", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-extension-worker-context-"))
+  const log = join(root, "context.log")
+  const extension = await writeExtension(
+    root,
+    "context.ts",
+    `import { appendFileSync } from "node:fs"
+import { Schema } from ${JSON.stringify(extensionApi)}
+function record(label, context): void {
+  appendFileSync(${JSON.stringify(log)}, JSON.stringify({
+    label,
+    mode: context.mode,
+    cwd: context.cwd,
+    session: context.session,
+    frozen: Object.isFrozen(context) && Object.isFrozen(context.session)
+  }) + "\\n")
+}
+export default function (zi): void {
+  zi.on("session_start", (_event, context) => record("start", context))
+  zi.on("agent_start", (_event, context) => record("working", context))
+  zi.on("agent_settled", (_event, context) => record("idle", context))
+  zi.on("session_shutdown", (_event, context) => record("shutdown", context))
+  zi.registerCommand({
+    name: "context",
+    description: "Report context",
+    execute: (_arguments, context) => { record("command", context); return context.mode }
+  })
+  zi.registerTool({
+    name: "context_tool",
+    description: "Report context",
+    parameters: Schema.object({}),
+    execute: (_parameters, context) => { record("tool", context); return context.session.type }
+  })
+}
+`
+  )
+  const generation = await loadExtensionGeneration(extensionPlan(root, [extension]), 1)
+
+  await generation.dispatch({ type: "session_start", reason: "startup" }, testExtensionContext)
+  await generation.dispatchAgentEvent({ type: "agent_start" })
+  await generation.dispatchAgentEvent({ type: "agent_settled" })
+  expect(await generation.invokeCommand("context", "", new AbortController().signal)).toBe("embedded")
+  expect(await generation.invoke("context_tool", {}, new AbortController().signal)).toBe("memory")
+  await generation.dispatch({ type: "session_shutdown", reason: "quit" })
+
+  const records = (await readFile(log, "utf8"))
+    .trim()
+    .split("\n")
+    .map(line => JSON.parse(line))
+  expect(records.map(record => record.label)).toEqual(["start", "working", "idle", "command", "tool", "shutdown"])
+  for (const record of records) {
+    expect(record).toMatchObject({
+      mode: "embedded",
+      cwd: testExtensionContext.cwd,
+      session: { type: "memory", id: "extension-test" },
+      frozen: true
+    })
+  }
 })
 
 test("worker registration exposes commands with raw arguments and local feedback", async () => {
@@ -97,7 +158,7 @@ export default function (zi): void {
       argumentHint: "[show|increment]"
     }
   ])
-  await generation.dispatch({ type: "session_start", reason: "startup" })
+  await generation.dispatch({ type: "session_start", reason: "startup" }, testExtensionContext)
 
   expect(await generation.invokeCommand("counter", "increment", new AbortController().signal)).toBe("Counter: 1")
   expect(await generation.invokeCommand("counter", "show", new AbortController().signal)).toBeUndefined()
@@ -170,7 +231,7 @@ export default function (zi): void {
       outputSchema: { type: "string" }
     }
   ])
-  await generation.dispatch({ type: "session_start", reason: "startup" })
+  await generation.dispatch({ type: "session_start", reason: "startup" }, testExtensionContext)
 
   expect(await generation.invoke("echo_message", { message: "hello" }, new AbortController().signal)).toBe("HELLO")
   expect(generation.invoke("echo_message", { message: 42 }, new AbortController().signal)).rejects.toThrow(
@@ -210,7 +271,7 @@ export default function (zi): void {
     { name: "structured_result", outputSchema: { type: "object" } },
     { name: "invalid_result", outputSchema: { type: "object" } }
   ])
-  await generation.dispatch({ type: "session_start", reason: "startup" })
+  await generation.dispatch({ type: "session_start", reason: "startup" }, testExtensionContext)
 
   expect(await generation.invoke("structured_result", { count: 3 }, new AbortController().signal)).toEqual({
     count: 3,
@@ -330,7 +391,7 @@ export default function (zi): never {
     ["failed", "factory", "factory exploded"],
     ["loaded", undefined, undefined]
   ])
-  await generation.dispatch({ type: "session_start", reason: "startup" })
+  await generation.dispatch({ type: "session_start", reason: "startup" }, testExtensionContext)
   expect(readFile(log, "utf8")).rejects.toThrow()
 })
 
@@ -372,14 +433,14 @@ export default function (zi): void {
   )
   const generation = await loadExtensionGeneration(extensionPlan(root, [extension]), 1)
 
-  const started = await generation.dispatch({ type: "session_start", reason: "startup" }, 100)
+  const started = await generation.dispatch({ type: "session_start", reason: "startup" }, testExtensionContext, 100)
   expect(started).toMatchObject({
     diagnostics: [{ extensionId: extension.id, phase: "lifecycle", message: "first failed" }],
     omittedDiagnostics: 0
   })
   expect(await readFile(log, "utf8")).toBe("second ran\n")
 
-  const shutdown = await generation.dispatch({ type: "session_shutdown", reason: "quit" }, 20)
+  const shutdown = await generation.dispatch({ type: "session_shutdown", reason: "quit" }, undefined, 20)
   expect(shutdown.fatal).toMatchObject({
     extensionId: extension.id,
     phase: "lifecycle",
@@ -405,8 +466,8 @@ test("worker lifecycle admission rejects concurrent and out-of-order transitions
   expect(generation.dispatch({ type: "session_shutdown", reason: "quit" })).rejects.toThrow(
     "while extension lifecycle is loaded"
   )
-  const start = generation.dispatch({ type: "session_start", reason: "startup" }, 20)
-  expect(generation.dispatch({ type: "session_start", reason: "reload" })).rejects.toThrow(
+  const start = generation.dispatch({ type: "session_start", reason: "startup" }, testExtensionContext, 20)
+  expect(generation.dispatch({ type: "session_start", reason: "reload" }, testExtensionContext)).rejects.toThrow(
     "while extension lifecycle is starting"
   )
   expect((await start).fatal?.phase).toBe("lifecycle")
@@ -518,13 +579,13 @@ export default zi => zi.registerTool({
   expect(generation.tools.map(tool => tool.name)).toEqual(["valid_tool"])
 })
 
-test("failed factories cannot consume the generation lifecycle-handler bound", async () => {
+test("failed factories cannot consume the generation event-handler bound", async () => {
   const root = await mkdtemp(join(tmpdir(), "zi-extension-worker-handler-bound-"))
   const excessive = await writeExtension(
     root,
     "excessive.ts",
     `export default function (zi): void {
-  for (let index = 0; index <= ${maxExtensionLifecycleHandlers}; index++) zi.on("session_start", () => {})
+  for (let index = 0; index <= ${maxExtensionEventHandlers}; index++) zi.on("session_start", () => {})
 }
 `
   )
@@ -536,10 +597,12 @@ test("failed factories cannot consume the generation lifecycle-handler bound", a
 
   const generation = await loadExtensionGeneration(extensionPlan(root, [excessive, valid]), 1)
   expect(generation.results.map(result => [result.status, result.diagnostic?.message])).toEqual([
-    ["failed", `Extension generations cannot register more than ${maxExtensionLifecycleHandlers} lifecycle handlers`],
+    ["failed", `Extension generations cannot register more than ${maxExtensionEventHandlers} event handlers`],
     ["loaded", undefined]
   ])
-  expect((await generation.dispatch({ type: "session_start", reason: "startup" })).diagnostics).toEqual([])
+  expect(
+    (await generation.dispatch({ type: "session_start", reason: "startup" }, testExtensionContext)).diagnostics
+  ).toEqual([])
 })
 
 async function writeExtension(root: string, name: string, source: string): Promise<ExtensionSource> {
