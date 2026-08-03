@@ -89,6 +89,8 @@ export interface ExtensionSessionOperations {
   getEntries(customType: string): readonly ExtensionCustomEntry[]
   appendEntry(customType: string, data?: ExtensionJsonValue): ExtensionCustomEntry
   sendMessage(message: ExtensionCustomMessage, delivery: ExtensionMessageDelivery): void
+  getActiveTools(extensionId: string): readonly string[]
+  setActiveTools(extensionId: string, names: readonly string[]): void
   readonly subagents?: ExtensionSubagentSessionOperations
 }
 
@@ -287,6 +289,7 @@ type ExtensionSessionRequestOutcome =
   | { readonly type: "custom_entries_result"; readonly entries: readonly ExtensionCustomEntry[] }
   | { readonly type: "custom_entry_result"; readonly entry: ExtensionCustomEntry }
   | { readonly type: "custom_message_result" }
+  | { readonly type: "active_tools_result"; readonly names: readonly string[] }
   | { readonly type: "subagent_profiles_result"; readonly profiles: readonly ExtensionSubagentProfile[] }
   | { readonly type: "subagent_spawn_result"; readonly name: string }
   | { readonly type: "subagent_send_result" }
@@ -799,6 +802,8 @@ class ExtensionGeneration {
       case "custom_entries_get":
       case "custom_entry_append":
       case "custom_message_send":
+      case "active_tools_get":
+      case "active_tools_set":
       case "subagent_profiles_get":
       case "subagent_spawn":
       case "subagent_send":
@@ -1662,6 +1667,9 @@ export class ExtensionHost {
         message: `Extension session operation has unknown source: ${request.extensionId}`
       }
     }
+    if (request.type === "active_tools_set" && phase !== "full") {
+      return { type: "session_operation_error", message: "Active tool selection is closed during extension shutdown" }
+    }
     const operations = this.#sessionOperations
     if (!operations) {
       return { type: "session_operation_error", message: "Extension session operations are not bound" }
@@ -1691,6 +1699,11 @@ export class ExtensionHost {
         case "custom_message_send":
           operations.sendMessage(request.message, request.delivery)
           return { type: "custom_message_result" }
+        case "active_tools_get":
+          return { type: "active_tools_result", names: operations.getActiveTools(request.extensionId) }
+        case "active_tools_set":
+          operations.setActiveTools(request.extensionId, request.names)
+          return { type: "active_tools_result", names: operations.getActiveTools(request.extensionId) }
         case "subagent_profiles_get":
           if (!operations.subagents) throw new Error("Subagent session operations are not bound")
           return { type: "subagent_profiles_result", profiles: operations.subagents.listProfiles(request.extensionId) }

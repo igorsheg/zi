@@ -210,7 +210,9 @@ test("worker session requests are source-attributed and domain refusals keep the
       customType,
       ...(data === undefined ? {} : { data })
     }),
-    sendMessage: () => {}
+    sendMessage: () => {},
+    getActiveTools: () => [],
+    setActiveTools: () => []
   })
   await host.sessionStart("startup")
   const worker = workers.processes[0]!
@@ -255,6 +257,80 @@ test("worker session requests are source-attributed and domain refusals keep the
   await Bun.sleep(0)
   expect(worker.messages).toContainEqual(expect.objectContaining({ type: "session_operation_error", requestId: 43 }))
   expect(host.snapshot()).toMatchObject({ status: "ready", lifecycle: "started" })
+  await host.dispose()
+})
+
+test("active tool requests are source-attributed session operations", async () => {
+  const workers = new TestWorkerSpawner()
+  workers.behaviors.push({ type: "active_tools" })
+  const host = await ExtensionHost.create(planOne, workers.spawn, testTimeouts)
+  let active = ["echo_message"]
+  const selected: Array<{ readonly extensionId: string; readonly names: readonly string[] }> = []
+  host.bindSessionOperations({
+    getEntries: () => [],
+    appendEntry: customType => ({ id: "entry", timestamp: new Date(0).toISOString(), customType }),
+    sendMessage: () => {},
+    getActiveTools: () => active,
+    setActiveTools: (extensionId, names) => {
+      selected.push({ extensionId, names })
+      if (names.includes("other_extension_tool")) throw new Error("Unknown or unadmitted extension tool")
+      active = [...names]
+    }
+  })
+  await host.sessionStart("startup")
+  const worker = workers.processes[0]!
+
+  worker.send({
+    type: "active_tools_set",
+    generation: 1,
+    requestId: 44,
+    extensionId: sourceOne.id,
+    names: ["dormant_echo"]
+  })
+  await Bun.sleep(0)
+  expect(selected).toEqual([{ extensionId: sourceOne.id, names: ["dormant_echo"] }])
+  expect(worker.messages).toContainEqual({
+    type: "active_tools_result",
+    generation: 1,
+    requestId: 44,
+    names: ["dormant_echo"]
+  })
+
+  worker.send({
+    type: "active_tools_set",
+    generation: 1,
+    requestId: 45,
+    extensionId: sourceOne.id,
+    names: ["other_extension_tool"]
+  })
+  await Bun.sleep(0)
+  expect(worker.messages).toContainEqual(expect.objectContaining({ type: "session_operation_error", requestId: 45 }))
+  expect(host.snapshot()).toMatchObject({ status: "ready", lifecycle: "started" })
+  await host.dispose()
+})
+
+test("active tool updates are rejected during extension shutdown", async () => {
+  const workers = new TestWorkerSpawner()
+  workers.behaviors.push({ type: "shutdown_active_set" })
+  const host = await ExtensionHost.create(planOne, workers.spawn, testTimeouts)
+  let updates = 0
+  host.bindSessionOperations({
+    getEntries: () => [],
+    appendEntry: customType => ({ id: "entry", timestamp: new Date(0).toISOString(), customType }),
+    sendMessage: () => {},
+    getActiveTools: () => [],
+    setActiveTools: () => {
+      updates++
+    }
+  })
+  await host.sessionStart("startup")
+  await host.sessionShutdown("quit")
+
+  expect(updates).toBe(0)
+  expect(workers.processes[0]!.messages).toContainEqual(
+    expect.objectContaining({ type: "session_operation_error", requestId: 1 })
+  )
+  expect(host.snapshot()).toMatchObject({ status: "ready", lifecycle: "stopped" })
   await host.dispose()
 })
 
@@ -550,7 +626,9 @@ test("replacement disposal authorizes shutdown state operations from the current
         ...(data === undefined ? {} : { data })
       }
     },
-    sendMessage: () => {}
+    sendMessage: () => {},
+    getActiveTools: () => [],
+    setActiveTools: () => []
   })
   await host.sessionStart("startup")
   const current = workers.processes[0]!
@@ -613,11 +691,20 @@ type TestWorkerBehavior =
   | { readonly type: "ready" }
   | { readonly type: "wrong_ready" }
   | { readonly type: "fatal_start" }
-  | { readonly type: "commands" | "command_hang" | "tools" | "tool_hang" | "tool_cancel_crossing" | "malformed_tool" }
+  | {
+      readonly type:
+        | "commands"
+        | "command_hang"
+        | "tools"
+        | "active_tools"
+        | "tool_hang"
+        | "tool_cancel_crossing"
+        | "malformed_tool"
+    }
   | { readonly type: "spawn_error"; readonly message: string }
   | { readonly type: "fatal"; readonly message: string }
   | { readonly type: "pending" }
-  | { readonly type: "shutdown_append" }
+  | { readonly type: "shutdown_append" | "shutdown_active_set" }
   | { readonly type: "resist_terminate" }
 
 class TestWorkerProcess implements ExtensionWorkerProcess {
@@ -689,9 +776,13 @@ class TestWorkerProcess implements ExtensionWorkerProcess {
       message.type === "custom_entries_result" ||
       message.type === "custom_entry_result" ||
       message.type === "custom_message_result" ||
+      message.type === "active_tools_result" ||
       message.type === "session_operation_error"
     ) {
-      if (this.#behavior.type === "shutdown_append" && this.#shutdownRequestId !== undefined) {
+      if (
+        (this.#behavior.type === "shutdown_append" || this.#behavior.type === "shutdown_active_set") &&
+        this.#shutdownRequestId !== undefined
+      ) {
         const requestId = this.#shutdownRequestId
         this.#shutdownRequestId = undefined
         this.send({ type: "settled", generation: this.#generation, requestId })
@@ -720,12 +811,17 @@ class TestWorkerProcess implements ExtensionWorkerProcess {
             ? [commandRegistration(this.#plan.sources[0]!)]
             : [],
         tools:
-          this.#behavior.type === "tools" ||
-          this.#behavior.type === "tool_hang" ||
-          this.#behavior.type === "tool_cancel_crossing" ||
-          this.#behavior.type === "malformed_tool"
-            ? [toolRegistration(this.#plan.sources[0]!)]
-            : []
+          this.#behavior.type === "active_tools"
+            ? [
+                toolRegistration(this.#plan.sources[0]!),
+                { ...toolRegistration(this.#plan.sources[0]!), name: "dormant_echo", active: false }
+              ]
+            : this.#behavior.type === "tools" ||
+                this.#behavior.type === "tool_hang" ||
+                this.#behavior.type === "tool_cancel_crossing" ||
+                this.#behavior.type === "malformed_tool"
+              ? [toolRegistration(this.#plan.sources[0]!)]
+              : []
       })
       return
     }
@@ -810,6 +906,17 @@ class TestWorkerProcess implements ExtensionWorkerProcess {
       })
       return
     }
+    if (message.type === "session_shutdown" && this.#behavior.type === "shutdown_active_set") {
+      this.#shutdownRequestId = message.requestId
+      this.send({
+        type: "active_tools_set",
+        generation: message.generation,
+        requestId: 1,
+        extensionId: this.#plan.sources[0]!.id,
+        names: []
+      })
+      return
+    }
     if (message.type === "stop" && this.#behavior.type === "resist_terminate") return
     this.send({ type: "settled", generation: message.generation, requestId: message.requestId })
     if (message.type === "stop") queueMicrotask(() => this.#finish({ code: 0, signal: null }))
@@ -835,6 +942,7 @@ function toolRegistration(source: ExtensionSource) {
     name: "echo_message",
     label: "Echo",
     description: "Echo a message",
+    active: true,
     parameters: { type: "object", required: ["message"], properties: { message: { type: "string" } } },
     outputSchema: { type: "string" }
   } as const

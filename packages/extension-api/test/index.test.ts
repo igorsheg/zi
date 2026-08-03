@@ -15,6 +15,10 @@ async function sessionOperations(api: ExtensionAPI): Promise<void> {
     { customType: appended.customType, content: "updated", display: true, details: appended.data ?? null },
     "follow_up"
   )
+  const activeTools = await api.getActiveTools()
+  await api.setActiveTools(activeTools)
+  // @ts-expect-error active tool names must be strings
+  await api.setActiveTools([1])
   // @ts-expect-error session values must be JSON
   await api.appendEntry("example.counter", { count: 1n })
   // @ts-expect-error delivery is a closed contract
@@ -34,6 +38,7 @@ function registerStructuredTool(api: ExtensionAPI): void {
   api.registerTool({
     name: "double_value",
     description: "Double one value",
+    active: false,
     parameters: Schema.object({ value: Schema.integer() }),
     outputSchema: Schema.object({ doubled: Schema.integer() }),
     execute: ({ value }) => ({ doubled: value * 2 })

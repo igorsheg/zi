@@ -19,13 +19,24 @@ export default function (zi: ExtensionAPI): void {
   zi.registerTool({
     name: "repository_rule",
     description: "Look up one repository rule",
+    active: false,
     parameters: Schema.object({ topic: Schema.string() }),
     outputSchema: Schema.object({ topic: Schema.string(), rule: Schema.string() }),
     execute: ({ topic }) => ({ topic, rule: `Rule for ${topic}` })
+  })
+
+  zi.registerTool({
+    name: "enable_repository_rules",
+    description: "Expose the repository rule catalog",
+    parameters: Schema.object({}),
+    async execute() {
+      await zi.setActiveTools(["enable_repository_rules", "repository_rule"])
+      return "Repository rules enabled"
+    }
   })
 }
 ```
 
 Zi provides this module to extension workers at runtime. Install it as a development dependency when authoring or type-checking an extension. Extensions execute with the current user's authority; the worker is fault containment, not a security sandbox.
 
-See the [extension author guide](https://github.com/igorsheg/zi/blob/main/docs/extensions.md), [custom-tool example](https://github.com/igorsheg/zi/tree/main/examples/extensions/custom-tool), [durable-counter example](https://github.com/igorsheg/zi/tree/main/examples/extensions/durable-counter), and [programmatic subagent-profile example](https://github.com/igorsheg/zi/tree/main/examples/extensions/subagents).
+See the [extension author guide](https://github.com/igorsheg/zi/blob/main/docs/extensions.md), [custom-tool example](https://github.com/igorsheg/zi/tree/main/examples/extensions/custom-tool), [deferred-tools example](https://github.com/igorsheg/zi/tree/main/examples/extensions/deferred-tools), [durable-counter example](https://github.com/igorsheg/zi/tree/main/examples/extensions/durable-counter), and [programmatic subagent-profile example](https://github.com/igorsheg/zi/tree/main/examples/extensions/subagents).
