@@ -101,6 +101,7 @@ export const maxPromptClipboardImages = 8
 export const maxPromptClipboardEncodedBytes = 8 * 1024 * 1024
 
 const unavailableClipboard: ClipboardReader = { read: async () => undefined }
+const unavailableMessageCopy: PromptMessageCopy = { copyLastAssistant() {} }
 const unavailableNotices: BuiltInNoticeActions = {
   promptProgress() {},
   promptInfo() {},
@@ -110,6 +111,10 @@ const unavailableNotices: BuiltInNoticeActions = {
   backgroundTaskCapacityExceeded() {},
   reloadCompleted() {},
   reloadFailed() {}
+}
+
+export interface PromptMessageCopy {
+  copyLastAssistant(session: Pick<AgentSession, "getLastAssistantText">): void
 }
 
 export interface PromptSessionActions {
@@ -126,9 +131,10 @@ export function createPromptStore(
   slash: SlashController,
   sessionActions?: PromptSessionActions,
   clipboard: ClipboardReader = unavailableClipboard,
-  notices: BuiltInNoticeActions = unavailableNotices
+  notices: BuiltInNoticeActions = unavailableNotices,
+  messageCopy: PromptMessageCopy = unavailableMessageCopy
 ): PromptStore {
-  return new PromptController(interactive, slash, sessionActions, clipboard, notices)
+  return new PromptController(interactive, slash, sessionActions, clipboard, notices, messageCopy)
 }
 
 class PromptController implements PromptStore {
@@ -140,6 +146,7 @@ class PromptController implements PromptStore {
   readonly #sessionActions: PromptSessionActions | undefined
   readonly #clipboard: ClipboardReader
   readonly #notices: BuiltInNoticeActions
+  readonly #messageCopy: PromptMessageCopy
   readonly #fileCompletion: FileCompletionController
   #clipboardRead: ClipboardReadState = { type: "idle" }
   #draftRevision = 0
@@ -155,13 +162,15 @@ class PromptController implements PromptStore {
     slash: SlashController,
     sessionActions: PromptSessionActions | undefined,
     clipboard: ClipboardReader,
-    notices: BuiltInNoticeActions
+    notices: BuiltInNoticeActions,
+    messageCopy: PromptMessageCopy
   ) {
     this.#interactive = interactive
     this.#slash = slash
     this.#sessionActions = sessionActions
     this.#clipboard = clipboard
     this.#notices = notices
+    this.#messageCopy = messageCopy
     this.#fileCompletion = new FileCompletionController(this.picker, edit => this.#requestRange(edit))
   }
 
@@ -912,6 +921,11 @@ class PromptController implements PromptStore {
         return true
       case "compact":
         this.#compact(command.instructions)
+        return true
+      case "copy":
+        this.picker.close()
+        this.#messageCopy.copyLastAssistant(this.#interactive.getSession())
+        this.#requestInput("")
         return true
       case "extension_command":
         this.#runExtensionCommand(command.name, command.arguments)

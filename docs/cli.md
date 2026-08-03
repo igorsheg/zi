@@ -83,6 +83,10 @@ The last session selector chooses exactly one intent:
 
 In interactive mode, `/resume` opens the bounded current-project session picker and `/new` starts a fresh session.
 
+## Copy the last assistant message
+
+Use `/copy` in interactive mode to copy the latest committed assistant message to the clipboard. Zi copies its Markdown source text, excluding thinking and tool calls. An in-progress streaming message is not included.
+
 ## Models and credentials
 
 ```sh

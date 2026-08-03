@@ -141,6 +141,27 @@ test("compact command forwards focus without creating a user message", async () 
   }
 })
 
+test("copy command delegates the active session without creating a user message", async () => {
+  const session = await createSession("copy-store")
+  const mode = createInteractiveStore(session)
+  const copied: Array<Pick<AgentSession, "getLastAssistantText">> = []
+  const prompt = createPromptStore(mode, new SlashController(), undefined, undefined, undefined, {
+    copyLastAssistant: current => copied.push(current)
+  })
+
+  try {
+    expect(prompt.submit("/copy", "steer")).toBe(true)
+    expect(copied).toEqual([session])
+    expect(session.messages).toEqual([])
+    expect(prompt.$state.get().inputEdit).toMatchObject({ type: "replace", text: "" })
+    expect(prompt.$state.get().workflow).toEqual({ type: "idle" })
+  } finally {
+    prompt.dispose()
+    mode.dispose()
+    session.dispose()
+  }
+})
+
 test("reload command awaits session reload, invalidates slash catalog, and reports outcome", async () => {
   const session = await createSession("reload-store")
   const mode = createInteractiveStore(session)

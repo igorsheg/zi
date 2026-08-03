@@ -120,6 +120,10 @@ _Avoid_: Copy buffer, transcript cursor, selected message
 The explicit terminal interaction that delivers the current non-empty native text selection to a clipboard. Selecting text alone never performs this operation, and failure preserves the selection for retry.
 _Avoid_: Copy-on-select, message export, clipboard paste
 
+**Assistant message copy**:
+The explicit `/copy` interaction that delivers source text from the latest committed assistant message. It excludes thinking, tool calls, and the current streaming message, and is distinct from copying a native terminal selection.
+_Avoid_: Selection copy, transcript export, rendered Markdown copy
+
 **Clipboard delivery**:
 The bounded attempt to make copied text available through one or more terminal or local-system routes. Delivery outcome is distinct from the selected text and from clipboard input.
 _Avoid_: Selection state, paste handling, guaranteed remote clipboard

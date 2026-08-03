@@ -11,6 +11,7 @@ import type {
 import { createSyntaxStyle, defaultTheme, type Theme } from "../theme.js"
 import { type BrowserOpener, SystemBrowserOpener } from "./browser-opener.js"
 import { BuiltInNotificationPresenter, type BuiltInNoticeActions } from "./built-in-notifications.js"
+import { ClipboardCopyController } from "./clipboard-copy.js"
 import {
   type ClipboardReader,
   type ClipboardWriter,
@@ -37,7 +38,6 @@ import {
 } from "./notifications.js"
 import type { PromptSessionActions } from "./prompt/store.js"
 import { SessionScreen } from "./screen.js"
-import { SelectionCopyController } from "./selection-copy.js"
 import { SlashController } from "./slash-controller.js"
 import type { TranscriptDiagnostics } from "./transcript/view.js"
 
@@ -78,7 +78,7 @@ export class InteractiveMode {
   readonly #syntaxStyle: SyntaxStyle
   readonly #slash: SlashController
   readonly #keybindings: InteractiveKeybindings
-  readonly #selectionCopy: SelectionCopyController
+  readonly #clipboardCopy: ClipboardCopyController
   readonly #diagnosticFlags: TuiDiagnosticFlags
   readonly #diagnostics: TuiDiagnosticsOverlay | undefined
   readonly #notifications: NotificationCenter
@@ -146,12 +146,13 @@ export class InteractiveMode {
       () => this.store.$generation.get()
     )
     this.#keybindings = new InteractiveKeybindings(keybindingOverrides)
-    this.#selectionCopy = new SelectionCopyController(
+    this.#clipboardCopy = new ClipboardCopyController(
       renderer,
       this.#keybindings,
       this.#clipboardWriter,
       () => this.#exitGestures.consume(),
       () => this.#builtInNotifications.copySucceeded(),
+      () => this.#builtInNotifications.copySucceeded("Copied last assistant message to clipboard"),
       message => this.#builtInNotifications.copyFailed(message)
     )
     this.#diagnosticFlags = diagnostics
@@ -243,7 +244,7 @@ export class InteractiveMode {
     this.#disposed = true
     this.#settleInitialProjectTrust()
     this.#releaseGeneration()
-    this.#selectionCopy.dispose()
+    this.#clipboardCopy.dispose()
     this.#renderer.off(CliRenderEvents.SELECTION, this.#preservePromptFocus)
     this.#diagnostics?.destroy()
     this.#builtInNotifications.dispose()
@@ -316,6 +317,7 @@ export class InteractiveMode {
   }
 
   #replaceScreen(): void {
+    this.#clipboardCopy.cancel()
     this.#notifications.detach()
     this.#screen.destroy()
     this.#screen = this.#createScreen(this.#builtInNotifications)
@@ -333,6 +335,7 @@ export class InteractiveMode {
       this.#exitGestures,
       this.#browserOpener,
       this.#clipboardReader,
+      this.#clipboardCopy,
       this.#externalEditor,
       this.#theme,
       this.#syntaxStyle,

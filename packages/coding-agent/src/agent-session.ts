@@ -575,6 +575,21 @@ export class AgentSession {
     return message
   }
 
+  getLastAssistantText(): string | undefined {
+    // Behavioral provenance: pi-coding-agent 73414d08, AgentSession.getLastAssistantText().
+    const message = this.messages.findLast((candidate): candidate is AssistantMessage => {
+      if (candidate.role !== "assistant") return false
+      return candidate.stopReason !== "aborted" || candidate.content.length > 0
+    })
+    if (!message) return undefined
+
+    let text = ""
+    for (const content of message.content) {
+      if (content.type === "text") text += content.text
+    }
+    return text.trim() || undefined
+  }
+
   get modelState(): SessionModelState {
     return this.#modelState
   }

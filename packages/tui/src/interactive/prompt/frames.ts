@@ -15,7 +15,7 @@ import { sameModel } from "./model-choices.js"
 import type { PickerFrame, PickerStackRow } from "./picker.js"
 import type { EditableSetting, EditableSettingValue } from "./state.js"
 
-export const projectFilePickerHeight = 7
+export const promptCompletionPickerHeight = 7
 
 export const promptPickerFrameIds = {
   commands: "commands",
@@ -39,6 +39,7 @@ export function commandFrame(commands: readonly SlashCommand[]): PickerFrame {
     id: promptPickerFrameIds.commands,
     title: "",
     filter: "none",
+    height: promptCompletionPickerHeight,
     rows: commands.map(command => ({
       id: command.name,
       label: `/${command.name}`,
@@ -61,7 +62,7 @@ export function fileFrame(result: ProjectFileSearchResult, query: string, previo
     id: promptPickerFrameIds.files,
     title: "",
     filter: "none",
-    height: projectFilePickerHeight,
+    height: promptCompletionPickerHeight,
     rows,
     ...(selectedId ? { selectedId } : {}),
     ...(result.truncated ? { footer: `Search limited; refine @${query}` } : {})

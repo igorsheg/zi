@@ -19,6 +19,7 @@ test("SlashController aggregates a session catalog with deterministic built-in p
     "settings",
     "codex-settings",
     "compact",
+    "copy",
     "reload",
     "new",
     "resume",
@@ -52,6 +53,7 @@ test("SlashController gives extension commands precedence over resources and ret
     "settings",
     "codex-settings",
     "compact",
+    "copy",
     "reload",
     "new",
     "resume",
@@ -162,6 +164,7 @@ test("SlashController resolves selection into typed intents or resource edits", 
     type: "intent",
     command: { type: "login", provider: "provider" }
   })
+  expect(slash.activate("/cop", 4, "copy")).toEqual({ type: "intent", command: { type: "copy" } })
   expect(slash.activate("/rev", 4, "review")).toEqual({ type: "edit", text: "/review ", cursorOffset: 8 })
 
   session = commandSession([{ name: "deploy", description: "Deploy current project" }])
@@ -179,6 +182,7 @@ test("SlashController parses only supported built-in invocations", () => {
     type: "compact",
     instructions: "preserve exact paths"
   })
+  expect(slash.parse("/copy")).toEqual({ type: "copy" })
   expect(slash.parse("/reload")).toEqual({ type: "reload" })
   expect(slash.parse("/new")).toEqual({ type: "new_session" })
   expect(slash.parse("/resume")).toEqual({ type: "resume_session" })
