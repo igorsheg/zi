@@ -1,10 +1,11 @@
 import { expect, test } from "bun:test"
 
-import { TextareaRenderable } from "@opentui/core"
+import { BoxRenderable, TextareaRenderable } from "@opentui/core"
 import { createModels, createTestAgentRuntime as createAgentRuntime, fauxProvider } from "@with-zi/coding-agent/testing"
 
 import { createInteractiveStore } from "../../src/interactive/interactive-store.js"
 import { fileCompletionInputFromText } from "../../src/interactive/prompt/file-completion.js"
+import { promptCompletionPickerHeight } from "../../src/interactive/prompt/frames.js"
 import { createPromptStore } from "../../src/interactive/prompt/store.js"
 import { SlashController } from "../../src/interactive/slash-controller.js"
 import { createInteractiveTest, renderSettled } from "./harness.js"
@@ -30,6 +31,25 @@ test("slash completion admits /model through the prompt workflow", async () => {
     expect(prompt.plainText).toBe("")
     expect(prompt.focused).toBe(true)
     expect(setup.captureCharFrame()).toContain("current  [select]  ✓")
+  } finally {
+    session.dispose()
+    setup.destroy()
+  }
+})
+
+test("slash completion keeps a fixed picker height while filtering", async () => {
+  const { session, setup } = await createModelFixture()
+
+  try {
+    await setup.mockInput.typeText("/", 0)
+    await setup.renderOnce()
+    const picker = setup.renderer.root.findDescendantById("picker-list")
+    if (!(picker instanceof BoxRenderable)) throw new Error("Slash picker not found")
+    expect(picker.height).toBe(promptCompletionPickerHeight)
+
+    await setup.mockInput.typeText("m", 0)
+    await setup.renderOnce()
+    expect(picker.height).toBe(promptCompletionPickerHeight)
   } finally {
     session.dispose()
     setup.destroy()

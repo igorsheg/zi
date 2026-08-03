@@ -92,8 +92,12 @@ export class BuiltInNotificationPresenter implements BuiltInNoticeActions {
     this.#notify("copy", message, 3, 5)
   }
 
-  copySucceeded(): void {
-    if (!this.#disposed) this.#notifications.remove("copy")
+  copySucceeded(message?: string): void {
+    if (message === undefined) {
+      if (!this.#disposed) this.#notifications.remove("copy")
+      return
+    }
+    this.#notify("copy", message, 2, 4)
   }
 
   promptProgress(message: string): void {

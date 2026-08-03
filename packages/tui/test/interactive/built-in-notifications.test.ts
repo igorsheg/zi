@@ -32,6 +32,7 @@ test("built-in notifications own keyed passive outcomes and clear session state 
   presenter.setProjectTrust("Project configuration is disabled")
   presenter.copyFailed("Copy failed; the selection was preserved")
   presenter.copySucceeded()
+  presenter.copySucceeded("Copied last assistant message to clipboard")
   presenter.backgroundTaskCapacityExceeded()
   presenter.reloadCompleted("warning", "Reloaded with one diagnostic")
   fixture.emitCompaction({ type: "failed", message: "Compaction produced an empty summary" })
@@ -47,6 +48,7 @@ test("built-in notifications own keyed passive outcomes and clear session state 
     persistentNotice("extensions", "Extension bad.ts: Cannot find module"),
     persistentNotice("project-trust", "Project configuration is disabled"),
     finiteNotice("copy", "Copy failed; the selection was preserved", 3, 5, false),
+    finiteNotice("copy", "Copied last assistant message to clipboard", 2, 4, false),
     finiteNotice("shell-capacity", "Background task capacity exceeded", 3, 5, false),
     finiteNotice("reload", "Reloaded with one diagnostic", 3, Infinity),
     finiteNotice("automatic-compaction", "Compaction produced an empty summary", 4, Infinity)
@@ -70,7 +72,7 @@ test("built-in notifications own keyed passive outcomes and clear session state 
   expect(fixture.released).toBe(true)
   expect(fixture.producerDisposed).toBe(true)
   fixture.emitCompaction({ type: "failed", message: "stale" })
-  expect(fixture.published).toHaveLength(7)
+  expect(fixture.published).toHaveLength(8)
 })
 
 test("prompt notices replace one stable key with policy-specific lifetimes", () => {

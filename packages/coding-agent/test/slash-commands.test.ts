@@ -14,6 +14,7 @@ test("coding-agent owns descriptors for supported built-in slash commands", () =
       description: "Compact context, optionally preserving a specified focus",
       argumentHint: "[focus]"
     },
+    { name: "copy", description: "Copy last assistant message to clipboard" },
     {
       name: "reload",
       description: "Reload settings, extensions, skills, prompts, subagent profiles, and context files"

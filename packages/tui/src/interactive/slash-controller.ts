@@ -14,6 +14,7 @@ export type InteractiveCommand =
   | { readonly type: "settings" }
   | { readonly type: "codex_settings" }
   | { readonly type: "compact"; readonly instructions: string }
+  | { readonly type: "copy" }
   | { readonly type: "extension_command"; readonly name: string; readonly arguments: string }
   | { readonly type: "reload" }
   | { readonly type: "new_session" }
@@ -203,6 +204,8 @@ function builtinIntent(name: BuiltinSlashCommandName, args: string): Interactive
       return { type: "codex_settings" }
     case "compact":
       return { type: "compact", instructions: args.trim() }
+    case "copy":
+      return { type: "copy" }
     case "reload":
       return { type: "reload" }
     case "new":

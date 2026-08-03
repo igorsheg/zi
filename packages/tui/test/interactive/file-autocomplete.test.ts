@@ -12,7 +12,7 @@ import {
   maxFileCompletionContextCells,
   parseFileCompletionContext
 } from "../../src/interactive/prompt/file-completion.js"
-import { projectFilePickerHeight } from "../../src/interactive/prompt/frames.js"
+import { promptCompletionPickerHeight } from "../../src/interactive/prompt/frames.js"
 import { createInteractiveTest, renderSettled, type InteractiveTestSetup } from "./harness.js"
 
 test("interactive @ completion uses the below-composer picker and distinguishes directory continuation from files", async () => {
@@ -38,13 +38,13 @@ test("interactive @ completion uses the below-composer picker and distinguishes 
       throw new Error("File picker not found")
     }
     expect(pickerStack.visible).toBe(true)
-    expect(pickerList.height).toBe(projectFilePickerHeight)
+    expect(pickerList.height).toBe(promptCompletionPickerHeight)
     expect(input.focused).toBe(true)
 
     await setup.mockInput.typeText("r")
     await renderSettled(setup)
     expect(pickerStack.visible).toBe(true)
-    expect(pickerList.height).toBe(projectFilePickerHeight)
+    expect(pickerList.height).toBe(promptCompletionPickerHeight)
     await waitForFrame(setup, "@src/")
 
     setup.mockInput.pressEnter()

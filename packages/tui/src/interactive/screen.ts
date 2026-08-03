@@ -3,6 +3,7 @@ import { BoxRenderable, type CliRenderer, type SyntaxStyle } from "@opentui/core
 import type { Theme } from "../theme.js"
 import type { BrowserOpener } from "./browser-opener.js"
 import type { BuiltInNoticeActions } from "./built-in-notifications.js"
+import type { ClipboardCopyController } from "./clipboard-copy.js"
 import type { ClipboardReader } from "./clipboard.js"
 import type { ExitGestureController } from "./exit-gesture.js"
 import type { ExternalEditor } from "./external-editor.js"
@@ -26,6 +27,7 @@ export class SessionScreen {
     exitGestures: ExitGestureController,
     browserOpener: BrowserOpener,
     clipboard: ClipboardReader,
+    clipboardCopy: ClipboardCopyController,
     externalEditor: ExternalEditor,
     theme: Theme,
     syntaxStyle: SyntaxStyle,
@@ -45,6 +47,7 @@ export class SessionScreen {
       exitGestures,
       browserOpener,
       clipboard,
+      clipboardCopy,
       externalEditor,
       theme,
       notices,

@@ -14,6 +14,7 @@ import { ShimmerTextView } from "../../components/shimmer-text.js"
 import type { Theme } from "../../theme.js"
 import type { BrowserOpener } from "../browser-opener.js"
 import type { BuiltInNoticeActions } from "../built-in-notifications.js"
+import type { ClipboardCopyController } from "../clipboard-copy.js"
 import { maxPastedTextBytes, type ClipboardReader } from "../clipboard.js"
 import type { ExitGestureController } from "../exit-gesture.js"
 import type { ExternalEditor } from "../external-editor.js"
@@ -64,6 +65,7 @@ export class PromptView {
     exitGestures: ExitGestureController,
     browserOpener: BrowserOpener,
     clipboard: ClipboardReader,
+    clipboardCopy: ClipboardCopyController,
     externalEditor: ExternalEditor,
     theme: Theme,
     notices: BuiltInNoticeActions,
@@ -75,7 +77,7 @@ export class PromptView {
     this.#exitGestures = exitGestures
     this.#externalEditor = externalEditor
     this.#notices = notices
-    this.#store = createPromptStore(interactive, slash, sessionActions, clipboard, notices)
+    this.#store = createPromptStore(interactive, slash, sessionActions, clipboard, notices, clipboardCopy)
     this.root = new BoxRenderable(renderer, { flexDirection: "column", flexShrink: 0 })
     this.root.onLifecyclePass = this.#refreshWorkingStatus
 
