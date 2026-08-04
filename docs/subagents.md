@@ -105,7 +105,7 @@ A session with no admitted profiles exposes none of these tools. Depth-one child
 
 ## Optional custom orchestration
 
-Extensions may provide specialized tools or workflows over the same substrate. `zi.subagents` exists only when the runtime can create child sessions and provides bounded operations for profile listing, spawn, send, continue, wait, list, interrupt, and close. Runtime names follow the profile-name syntax, prompt and message inputs retain at most 8 MiB, waits accept 1–16 unique names and at most one hour, and result projections are bounded. Custom orchestration is optional; it is not required to use Markdown or programmatically registered profiles.
+Extensions may provide specialized tools or workflows over the same substrate. `zi.subagents` exists only when the runtime can create child sessions and provides bounded operations for profile listing, spawn, send, continue, wait, list, interrupt, and close. Runtime names follow the profile-name syntax, prompt and message inputs retain at most 8 MiB, waits accept 1–16 unique names and at most one hour, and result projections are bounded. A wait started by an extension command or tool must fit that invocation's remaining deadline and is cancelled when its owner is cancelled or settles. Custom orchestration is optional; it is not required to use Markdown or programmatically registered profiles.
 
 Extensions never receive `SubagentSupervisor` or child-process handles. Extension reload may replace programmatic registrations and custom tools without terminating already admitted children.
 

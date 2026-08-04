@@ -11,6 +11,7 @@ import {
   type SpawnExtensionWorker
 } from "../src/extensions/host.js"
 import { createProcessTreeTracker } from "../src/processes/process-tree.js"
+import { testExtensionContext } from "./extension-context.js"
 
 function createExtensionWorkerSpawner(
   command: readonly string[],
@@ -48,7 +49,7 @@ export default function (zi: ExtensionAPI): void {
 
   try {
     expect(host.snapshot()).toMatchObject({ status: "ready", extensions: [{ status: "loaded" }] })
-    await host.sessionStart("startup")
+    await host.sessionStart("startup", testExtensionContext)
     await host.sessionShutdown("quit")
     await host.dispose()
 
@@ -83,8 +84,10 @@ export default function (zi: ExtensionAPI): void {
       mode: Schema.literal("loud"),
       note: Schema.optional(Schema.string())
     }),
-    execute: ({ message, amount, count, enabled, tags, mode, note }) =>
-      [message.toUpperCase(), amount, count, enabled, tags.join(","), mode, note ?? "none"].join(":")
+    execute: ({ message, amount, count, enabled, tags, mode, note }, { reportProgress }) => {
+      reportProgress("Formatting " + message)
+      return [message.toUpperCase(), amount, count, enabled, tags.join(","), mode, note ?? "none"].join(":")
+    }
   })
 }
 `
@@ -102,17 +105,17 @@ export default function (zi: ExtensionAPI): void {
 
   try {
     expect(host.toolCatalog()).toMatchObject([{ name: "echo_message", source: { id: source.id } }])
-    await host.sessionStart("startup")
+    await host.sessionStart("startup", testExtensionContext)
+    const progress: string[] = []
     expect(
-      await host.invokeTool("echo_message", {
-        message: "external",
-        amount: 1.5,
-        count: 2,
-        enabled: true,
-        tags: ["a", "b"],
-        mode: "loud"
-      })
+      await host.invokeTool(
+        "echo_message",
+        { message: "external", amount: 1.5, count: 2, enabled: true, tags: ["a", "b"], mode: "loud" },
+        undefined,
+        message => progress.push(message)
+      )
     ).toBe("EXTERNAL:1.5:2:true:a,b:loud:none")
+    expect(progress).toEqual(["Formatting external"])
   } finally {
     await host.dispose()
     await rm(root, { recursive: true, force: true })
@@ -154,7 +157,7 @@ export default function (zi: ExtensionAPI): void {
 
   try {
     expect(host.commandCatalog()).toMatchObject([{ name: "echo", source: { id: source.id } }])
-    await host.sessionStart("startup")
+    await host.sessionStart("startup", testExtensionContext)
     expect(await host.invokeCommand("echo", "external")).toBe("EXTERNAL")
     const controller = new AbortController()
     const cancelled = host.invokeCommand("echo", "wait", controller.signal)
@@ -192,7 +195,7 @@ export default zi => zi.registerTool({
   const host = await ExtensionHost.create(plan, createExtensionWorkerSpawner([process.execPath, cli]))
 
   try {
-    await host.sessionStart("startup")
+    await host.sessionStart("startup", testExtensionContext)
     expect(host.invokeTool("crash_tool", {})).rejects.toThrow("unexpectedly")
     await Bun.sleep(10)
     expect(host.snapshot()).toMatchObject({ status: "failed", lifecycle: "started", failure: { phase: "protocol" } })
@@ -228,6 +231,7 @@ export default zi => zi.registerTool({
   const timeouts: ExtensionHostTimeouts = {
     startupMs: 2_000,
     lifecycleMs: 100,
+    agentEventMs: 100,
     shutdownMs: 300,
     commandMs: 2_000,
     commandCancellationMs: 25,
@@ -237,7 +241,7 @@ export default zi => zi.registerTool({
   const host = await ExtensionHost.create(plan, createExtensionWorkerSpawner([process.execPath, cli]), timeouts)
 
   try {
-    await host.sessionStart("startup")
+    await host.sessionStart("startup", testExtensionContext)
     const invocation = host.invokeTool("pending_tool", {})
     const disposal = host.dispose()
     expect(invocation).rejects.toThrow("disposed during invocation")
@@ -270,7 +274,7 @@ test("ExtensionHost settles when temporary public API cleanup fails", async () =
   const host = await ExtensionHost.create(plan, spawner)
 
   try {
-    await host.sessionStart("startup")
+    await host.sessionStart("startup", testExtensionContext)
     await host.dispose()
     expect(host.snapshot()).toMatchObject({
       status: "disposed",
@@ -310,6 +314,45 @@ test("ExtensionHost contains a real worker crash during startup", async () => {
   }
 }, 10_000)
 
+test("ExtensionHost fails a generation whose agent event blocks JavaScript", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-extension-host-blocked-event-"))
+  const extensionPath = join(root, "blocked-event.ts")
+  await writeFile(extensionPath, `export default zi => zi.on("agent_start", () => { while (true) {} })\n`)
+  const source: ExtensionSource = Object.freeze({
+    id: "host-blocked-event-fixture",
+    declaredPath: extensionPath,
+    entryPath: extensionPath,
+    scope: "temporary",
+    origin: "cli"
+  })
+  const plan: ExtensionLoadPlan = Object.freeze({ cwd: root, sources: Object.freeze([source]) })
+  const cli = resolve(import.meta.dirname, "../../cli/src/main.ts")
+  const timeouts: ExtensionHostTimeouts = {
+    startupMs: 2_000,
+    lifecycleMs: 100,
+    agentEventMs: 50,
+    shutdownMs: 300,
+    commandMs: 100,
+    commandCancellationMs: 25,
+    toolMs: 100,
+    toolCancellationMs: 25
+  }
+  const host = await ExtensionHost.create(plan, createExtensionWorkerSpawner([process.execPath, cli]), timeouts)
+
+  try {
+    await host.sessionStart("startup", testExtensionContext)
+    host.publishAgentStart()
+    await waitForHostStatus(host, "failed")
+    expect(host.snapshot()).toMatchObject({
+      status: "failed",
+      failure: { phase: "event", message: "Extension agent event did not settle within 50ms" }
+    })
+  } finally {
+    await host.dispose()
+    await rm(root, { recursive: true, force: true })
+  }
+}, 10_000)
+
 test("ExtensionHost terminates a real worker blocked by extension JavaScript", async () => {
   const root = await mkdtemp(join(tmpdir(), "zi-extension-host-blocked-"))
   const extensionPath = join(root, "blocked.ts")
@@ -326,6 +369,7 @@ test("ExtensionHost terminates a real worker blocked by extension JavaScript", a
   const timeouts: ExtensionHostTimeouts = {
     startupMs: 2_000,
     lifecycleMs: 100,
+    agentEventMs: 100,
     shutdownMs: 300,
     commandMs: 100,
     commandCancellationMs: 25,
@@ -347,3 +391,12 @@ test("ExtensionHost terminates a real worker blocked by extension JavaScript", a
     await rm(root, { recursive: true, force: true })
   }
 }, 10_000)
+
+async function waitForHostStatus(host: ExtensionHost, status: string): Promise<void> {
+  for (let attempt = 0; attempt < 1_000; attempt++) {
+    if (host.snapshot().status === status) return
+    // oxlint-disable-next-line no-await-in-loop -- bounded poll of the host's authoritative transition
+    await Bun.sleep(1)
+  }
+  throw new Error(`Extension host did not reach ${status}`)
+}

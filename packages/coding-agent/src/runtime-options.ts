@@ -1,5 +1,6 @@
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core"
 import type { CredentialStore, Models } from "@earendil-works/pi-ai"
+import type { ExtensionMode } from "@with-zi/extension-api"
 
 import { maxExplicitExtensionPaths } from "./extensions/discovery.js"
 import type { ProjectTrustDecision } from "./project-trust.js"
@@ -24,6 +25,7 @@ export interface CreateAgentRuntimeOptions {
   readonly projectTrust?: ProjectTrustDecision
   readonly settings?: Readonly<Partial<AgentSettings>>
   readonly extensionPaths?: readonly string[]
+  readonly extensionMode?: ExtensionMode
   readonly extensionWorkerCommand?: readonly string[]
   readonly codeModeWorkerCommand?: readonly string[]
   readonly subagentCommand?: readonly string[]
@@ -44,6 +46,7 @@ export function snapshotAgentRuntimeOptions(options: CreateAgentRuntimeOptions):
     ...(options.extensionPaths === undefined
       ? {}
       : { extensionPaths: snapshotStrings(options.extensionPaths, maxExplicitExtensionPaths, "Extension paths") }),
+    ...(options.extensionMode === undefined ? {} : { extensionMode: snapshotExtensionMode(options.extensionMode) }),
     ...(options.extensionWorkerCommand === undefined
       ? {}
       : { extensionWorkerCommand: snapshotStrings(options.extensionWorkerCommand, 16, "Extension worker command") }),
@@ -79,6 +82,19 @@ function snapshotEnvironment(
     }
   }
   return Object.freeze(Object.fromEntries(entries))
+}
+
+function snapshotExtensionMode(value: unknown): ExtensionMode {
+  switch (value) {
+    case "interactive":
+    case "text":
+    case "json":
+    case "rpc":
+    case "embedded":
+      return value
+    default:
+      throw new Error(`Unknown extension mode: ${String(value)}`)
+  }
 }
 
 function snapshotSubagentDepth(value: unknown): 0 | 1 {

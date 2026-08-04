@@ -52,6 +52,195 @@ test("AgentSession owns one discovered extension lifecycle through final disposa
   await rm(fixture.root, { recursive: true, force: true })
 }, 10_000)
 
+test("AgentSession publishes one final settled notification after a turn", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-runtime-extension-agent-events-"))
+  const cwd = join(root, "project")
+  const agentDir = join(root, "agent")
+  const extensionDir = join(agentDir, "extensions")
+  const log = join(root, "events.log")
+  await mkdir(cwd, { recursive: true })
+  await mkdir(extensionDir, { recursive: true })
+  await writeFile(
+    join(extensionDir, "events.ts"),
+    `import { appendFileSync } from "node:fs"
+import type { ExtensionAPI } from "@with-zi/extension-api"
+export default function (zi: ExtensionAPI): void {
+  zi.on("agent_start", (event, context) => appendFileSync(${JSON.stringify(log)}, event.type + ":" + context.mode + "\\n"))
+  zi.on("agent_settled", (event, context) => appendFileSync(${JSON.stringify(log)}, event.type + ":" + context.mode + "\\n"))
+}
+`
+  )
+  const models = createModels()
+  const faux = fauxProvider()
+  models.setProvider(faux.provider)
+  faux.setResponses([fauxAssistantMessage(fauxText("Done."))])
+  const runtime = await createAgentRuntime({
+    cwd,
+    agentDir,
+    model: "faux/faux-1",
+    modelFactory: () => models,
+    session: { type: "new", persist: false },
+    extensionWorkerCommand: workerCommand
+  })
+
+  try {
+    await runtime.session.prompt("Complete the task.")
+    await waitForCondition(() => existsSync(log) && Bun.file(log).size > 0, 1_000)
+    await waitForCondition(() => {
+      if (!existsSync(log)) return false
+      return Bun.file(log)
+        .text()
+        .then(text => text.endsWith("agent_settled:embedded\n"))
+    }, 1_000)
+    expect(await readFile(log, "utf8")).toBe("agent_start:embedded\nagent_settled:embedded\n")
+  } finally {
+    runtime.session.dispose()
+    await runtime.session.waitForIdle()
+    await rm(root, { recursive: true, force: true })
+  }
+}, 10_000)
+
+test("agent retry publishes one final extension settlement", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-runtime-extension-retry-event-"))
+  const cwd = join(root, "project")
+  const agentDir = join(root, "agent")
+  const extensionDir = join(agentDir, "extensions")
+  const log = join(root, "events.log")
+  await mkdir(cwd, { recursive: true })
+  await mkdir(extensionDir, { recursive: true })
+  await writeFile(
+    join(extensionDir, "events.ts"),
+    `import { appendFileSync } from "node:fs"
+export default function (zi): void {
+  zi.on("agent_start", event => appendFileSync(${JSON.stringify(log)}, event.type + "\\n"))
+  zi.on("agent_settled", event => appendFileSync(${JSON.stringify(log)}, event.type + "\\n"))
+}
+`
+  )
+  const models = createModels()
+  const faux = fauxProvider()
+  models.setProvider(faux.provider)
+  faux.setResponses([
+    fauxAssistantMessage("", { stopReason: "error", errorMessage: "overloaded_error" }),
+    fauxAssistantMessage(fauxText("Recovered."))
+  ])
+  const runtime = await createAgentRuntime({
+    cwd,
+    agentDir,
+    model: "faux/faux-1",
+    modelFactory: () => models,
+    session: { type: "new", persist: false },
+    settings: { retryEnabled: true, retryMaxRetries: 1, retryBaseDelayMs: 0 },
+    extensionWorkerCommand: workerCommand
+  })
+
+  try {
+    await runtime.session.prompt("Retry once.")
+    await waitForCondition(
+      async () => existsSync(log) && (await Bun.file(log).text()).endsWith("agent_settled\n"),
+      1_000
+    )
+    const events = (await readFile(log, "utf8")).trim().split("\n")
+    expect(events.filter(event => event === "agent_start").length).toBeGreaterThanOrEqual(1)
+    expect(events.filter(event => event === "agent_settled")).toHaveLength(1)
+    expect(events.at(-1)).toBe("agent_settled")
+  } finally {
+    runtime.session.dispose()
+    await runtime.session.waitForIdle()
+    await rm(root, { recursive: true, force: true })
+  }
+}, 10_000)
+
+test("a blocked agent event handler cannot delay AgentSession settlement", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-runtime-extension-blocked-event-"))
+  const cwd = join(root, "project")
+  const agentDir = join(root, "agent")
+  const extensionDir = join(agentDir, "extensions")
+  await mkdir(cwd, { recursive: true })
+  await mkdir(extensionDir, { recursive: true })
+  await writeFile(
+    join(extensionDir, "blocked.ts"),
+    `export default zi => zi.on("agent_start", () => { while (true) {} })\n`
+  )
+  const models = createModels()
+  const faux = fauxProvider()
+  models.setProvider(faux.provider)
+  faux.setResponses([fauxAssistantMessage(fauxText("Settled independently."))])
+  const runtime = await createAgentRuntime({
+    cwd,
+    agentDir,
+    model: "faux/faux-1",
+    modelFactory: () => models,
+    session: { type: "new", persist: false },
+    extensionWorkerCommand: workerCommand
+  })
+
+  try {
+    await runtime.session.prompt("Complete without the observer.")
+    expect(runtime.session.messages.at(-1)).toMatchObject({ role: "assistant" })
+    await waitForCondition(() => runtime.session.extensionHostSnapshot?.status === "failed", 2_000)
+    expect(runtime.session.extensionHostSnapshot).toMatchObject({
+      failure: { phase: "event", message: "Extension agent event did not settle within 1000ms" }
+    })
+  } finally {
+    runtime.session.dispose()
+    await runtime.session.waitForIdle()
+    await rm(root, { recursive: true, force: true })
+  }
+}, 10_000)
+
+test("runtime freezes memory and journal extension identities", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-runtime-extension-context-"))
+  const cwd = join(root, "project")
+  const agentDir = join(root, "agent")
+  const extensionDir = join(agentDir, "extensions")
+  const log = join(root, "contexts.log")
+  await mkdir(cwd, { recursive: true })
+  await mkdir(extensionDir, { recursive: true })
+  await writeFile(
+    join(extensionDir, "context.ts"),
+    `import { appendFileSync } from "node:fs"
+export default zi => zi.on("session_start", (_event, context) => {
+  appendFileSync(${JSON.stringify(log)}, JSON.stringify({
+    ...context,
+    frozen: Object.isFrozen(context) && Object.isFrozen(context.session)
+  }) + "\\n")
+})
+`
+  )
+
+  const memory = await createAgentRuntime({
+    cwd,
+    agentDir,
+    session: { type: "new", persist: false },
+    extensionWorkerCommand: workerCommand
+  })
+  const memoryId = memory.session.sessionManager.sessionId
+  memory.session.dispose()
+  await memory.session.waitForIdle()
+
+  const journal = await createAgentRuntime({
+    cwd,
+    agentDir,
+    session: { type: "new", persist: true },
+    extensionWorkerCommand: workerCommand
+  })
+  const journalId = journal.session.sessionManager.sessionId
+  const journalFile = journal.session.sessionManager.file
+  journal.session.dispose()
+  await journal.session.waitForIdle()
+
+  const contexts = (await readFile(log, "utf8"))
+    .trim()
+    .split("\n")
+    .map(line => JSON.parse(line))
+  expect(contexts).toEqual([
+    { mode: "embedded", cwd, session: { type: "memory", id: memoryId }, frozen: true },
+    { mode: "embedded", cwd, session: { type: "journal", id: journalId, file: journalFile }, frozen: true }
+  ])
+  await rm(root, { recursive: true, force: true })
+}, 10_000)
+
 test("session shutdown handlers can commit final extension state before operations unbind", async () => {
   const root = await mkdtemp(join(tmpdir(), "zi-runtime-extension-shutdown-state-"))
   const cwd = join(root, "project")
@@ -238,7 +427,10 @@ export default function (zi: ExtensionAPI): void {
     description: "Echo a repository value",
     parameters: Schema.object({ value: Schema.string() }),
     outputSchema: Schema.object({ prefix: Schema.string(), value: Schema.string() }),
-    execute: ({ value }) => ({ prefix, value })
+    execute: ({ value }, { reportProgress }) => {
+      reportProgress("Resolving " + value)
+      return { prefix, value }
+    }
   })
 }
 `
@@ -250,15 +442,22 @@ export default function (zi: ExtensionAPI): void {
     fauxAssistantMessage(fauxToolCall("repository_echo", { value: "accepted" }, { id: "extension-tool-1" }), {
       stopReason: "toolUse"
     }),
-    fauxAssistantMessage(
-      fauxToolCall(
-        "code",
-        { code: `async () => (await zi.repository_echo({ value: "nested" })).value` },
-        { id: "extension-code-1" }
-      ),
-      { stopReason: "toolUse" }
-    ),
-    fauxAssistantMessage(fauxText("Extension completed."))
+    context => {
+      expect(JSON.stringify(context)).not.toContain("Resolving accepted")
+      return fauxAssistantMessage(
+        fauxToolCall(
+          "code",
+          { code: `async () => (await zi.repository_echo({ value: "nested" })).value` },
+          { id: "extension-code-1" }
+        ),
+        { stopReason: "toolUse" }
+      )
+    },
+    context => {
+      expect(JSON.stringify(context)).not.toContain("Resolving accepted")
+      expect(JSON.stringify(context)).not.toContain("Resolving nested")
+      return fauxAssistantMessage(fauxText("Extension completed."))
+    }
   ])
   const runtime = await createAgentRuntime({
     cwd,
@@ -266,6 +465,15 @@ export default function (zi: ExtensionAPI): void {
     model: "faux/faux-1",
     modelFactory: () => models,
     session: { type: "new", persist: true }
+  })
+
+  const progress: Array<{ readonly toolCallId: string; readonly text: string; readonly details: unknown }> = []
+  const unsubscribe = runtime.session.subscribe(event => {
+    if (event.type !== "tool_execution_update") return
+    const content = event.partialResult.content[0]
+    if (content?.type === "text") {
+      progress.push({ toolCallId: event.toolCallId, text: content.text, details: event.partialResult.details })
+    }
   })
 
   try {
@@ -288,8 +496,26 @@ export default function (zi: ExtensionAPI): void {
         calls: [expect.objectContaining({ name: "repository_echo", state: "succeeded" })]
       }
     })
+    expect(progress).toContainEqual({
+      toolCallId: "extension-tool-1",
+      text: "Resolving accepted",
+      details: expect.objectContaining({ type: "extension", toolName: "repository_echo", outcome: "progress" })
+    })
+    expect(progress).toContainEqual({
+      toolCallId: "extension-code-1",
+      text: "Running repository_echo",
+      details: expect.objectContaining({
+        type: "code_mode",
+        outcome: "progress",
+        calls: [expect.objectContaining({ name: "repository_echo", preview: "Resolving nested" })]
+      })
+    })
+    const journal = await readFile(runtime.session.sessionManager.file!, "utf8")
+    expect(journal).not.toContain("Resolving accepted")
+    expect(journal).not.toContain("Resolving nested")
     expect(runtime.session.extensionHostSnapshot).toMatchObject({ status: "ready", lifecycle: "started" })
   } finally {
+    unsubscribe()
     runtime.session.dispose()
     await runtime.session.waitForIdle()
     await rm(root, { recursive: true, force: true })
@@ -1738,10 +1964,11 @@ test("whole-runtime replacement starts the candidate only after retiring the cur
   await rm(fixture.root, { recursive: true, force: true })
 }, 10_000)
 
-async function waitForCondition(predicate: () => boolean, timeoutMs: number): Promise<void> {
+async function waitForCondition(predicate: () => boolean | Promise<boolean>, timeoutMs: number): Promise<void> {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
-    if (predicate()) return
+    // oxlint-disable-next-line no-await-in-loop -- bounded test poll of authoritative state
+    if (await predicate()) return
     // oxlint-disable-next-line no-await-in-loop -- bounded test poll of authoritative state
     await Bun.sleep(10)
   }

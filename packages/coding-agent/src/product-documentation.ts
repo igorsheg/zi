@@ -23,6 +23,8 @@ export const productDocumentationContractPaths = Object.freeze([
   "examples/extensions/custom-tool/index.ts",
   "examples/extensions/durable-counter/README.md",
   "examples/extensions/durable-counter/index.ts",
+  "examples/extensions/herdr-agent-state/README.md",
+  "examples/extensions/herdr-agent-state/index.ts",
   "examples/extensions/subagents/README.md",
   "examples/extensions/subagents/index.ts",
   "examples/rpc/README.md",

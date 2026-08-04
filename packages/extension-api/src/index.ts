@@ -158,6 +158,18 @@ function object<TProperties extends SchemaProperties>(
 
 export const Schema = Object.freeze({ string, number, integer, boolean, literal, array, optional, object })
 
+export type ExtensionMode = "interactive" | "text" | "json" | "rpc" | "embedded"
+
+export type ExtensionSession =
+  | { readonly type: "memory"; readonly id: string }
+  | { readonly type: "journal"; readonly id: string; readonly file: string }
+
+export interface ExtensionContext {
+  readonly mode: ExtensionMode
+  readonly cwd: string
+  readonly session: ExtensionSession
+}
+
 export type ExtensionStartReason = "startup" | "reload" | "new" | "resume" | "fork"
 export type ExtensionShutdownReason = "quit" | "reload" | "new" | "resume" | "fork"
 
@@ -167,6 +179,16 @@ export type ExtensionLifecycleEvent =
 
 export type ExtensionStartEvent = Extract<ExtensionLifecycleEvent, { type: "session_start" }>
 export type ExtensionShutdownEvent = Extract<ExtensionLifecycleEvent, { type: "session_shutdown" }>
+
+export interface ExtensionAgentStartEvent {
+  readonly type: "agent_start"
+}
+
+export interface ExtensionAgentSettledEvent {
+  readonly type: "agent_settled"
+}
+
+export type ExtensionEvent = ExtensionLifecycleEvent | ExtensionAgentStartEvent | ExtensionAgentSettledEvent
 
 export interface ExtensionTextContent {
   readonly type: "text"
@@ -195,7 +217,7 @@ export interface ExtensionCustomMessage {
 
 export type ExtensionMessageDelivery = "append" | "trigger_turn" | "steer" | "follow_up" | "next_turn"
 
-export interface ExtensionCommandContext {
+export interface ExtensionCommandContext extends ExtensionContext {
   readonly signal: AbortSignal
 }
 
@@ -206,8 +228,9 @@ export interface ExtensionCommandDefinition {
   execute(arguments_: string, context: ExtensionCommandContext): void | string | Promise<void | string>
 }
 
-export interface ExtensionToolContext {
+export interface ExtensionToolContext extends ExtensionContext {
   readonly signal: AbortSignal
+  reportProgress(message: string): void
 }
 
 interface ExtensionToolDefinitionBase<TParameters extends TObject> {
@@ -215,6 +238,7 @@ interface ExtensionToolDefinitionBase<TParameters extends TObject> {
   readonly label?: string
   readonly description: string
   readonly active?: boolean
+  readonly timeoutMs?: number
   readonly parameters: TParameters
 }
 
@@ -289,8 +313,22 @@ export interface ExtensionSubagentAPI {
 
 export interface ExtensionAPI {
   readonly subagents?: ExtensionSubagentAPI
-  on(event: "session_start", handler: (event: ExtensionStartEvent) => void | Promise<void>): void
-  on(event: "session_shutdown", handler: (event: ExtensionShutdownEvent) => void | Promise<void>): void
+  on(
+    event: "session_start",
+    handler: (event: ExtensionStartEvent, context: ExtensionContext) => void | Promise<void>
+  ): void
+  on(
+    event: "session_shutdown",
+    handler: (event: ExtensionShutdownEvent, context: ExtensionContext) => void | Promise<void>
+  ): void
+  on(
+    event: "agent_start",
+    handler: (event: ExtensionAgentStartEvent, context: ExtensionContext) => void | Promise<void>
+  ): void
+  on(
+    event: "agent_settled",
+    handler: (event: ExtensionAgentSettledEvent, context: ExtensionContext) => void | Promise<void>
+  ): void
   registerCommand(command: ExtensionCommandDefinition): void
   registerTool<TParameters extends TObject, TOutputSchema extends TSchema | undefined = undefined>(
     tool: ExtensionToolDefinition<TParameters, TOutputSchema>

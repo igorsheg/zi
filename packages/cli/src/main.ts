@@ -1,5 +1,6 @@
 #!/usr/bin/env bun
 
+import { setMaxListeners } from "node:events"
 import { homedir } from "node:os"
 import { resolve } from "node:path"
 
@@ -25,11 +26,23 @@ export { defaultCliArgv } from "./bootstrap.js"
 
 export const interactiveAcceptanceArgument = "--zi-internal-interactive-acceptance"
 
+export function bunWindowsDefaultMaxListeners(
+  platform: NodeJS.Platform = process.platform,
+  bunVersion: string | undefined = process.versions.bun
+): number | undefined {
+  // Bun 1.3.14 can retain internal connect listeners on ended Windows TCP sockets.
+  // Keep its false warning out of text and JSON stderr until the pinned runtime advances.
+  return platform === "win32" && bunVersion === "1.3.14" ? 32 : undefined
+}
+
 export async function main(argv: readonly string[] = defaultCliArgv()): Promise<number> {
   return runCli(argv, createProcessHost(false))
 }
 
 export async function runEntrypoint(argv: readonly string[] = defaultCliArgv()): Promise<number> {
+  const listenerLimit = bunWindowsDefaultMaxListeners()
+  if (listenerLimit !== undefined) setMaxListeners(listenerLimit)
+
   if (argv.length === 1 && argv[0] === codeModeWorkerArgument) {
     const { runCodeModeWorkerFromStdio } = await import("@with-zi/coding-agent/internal/code-mode-worker")
     await runCodeModeWorkerFromStdio()

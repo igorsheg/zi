@@ -16,14 +16,17 @@ import {
   extensionProtocolVersion,
   maxExtensionDiagnostics,
   maxExtensionLogBytesPerStream,
+  maxExtensionQueuedAgentEvents,
   type HostMessage,
   type WorkerMessage,
   validateHostMessage
 } from "../src/extensions/protocol.js"
+import { testExtensionContext } from "./extension-context.js"
 
 const testTimeouts: ExtensionHostTimeouts = Object.freeze({
   startupMs: 100,
   lifecycleMs: 100,
+  agentEventMs: 100,
   shutdownMs: 90,
   commandMs: 100,
   commandCancellationMs: 20,
@@ -48,9 +51,11 @@ test("empty extension plans stay lazy through lifecycle and disposal", async () 
 
   expect(host.snapshot()).toMatchObject({ status: "disabled", lifecycle: "unbound", extensions: [] })
   expect(workers.processes).toHaveLength(0)
-  await host.sessionStart("startup")
+  await host.sessionStart("startup", testExtensionContext)
   expect(host.snapshot()).toMatchObject({ status: "disabled", lifecycle: "started" })
-  expect(await host.reload(reloadRequest(emptyPlan))).toMatchObject({ outcome: "disabled" })
+  expect(await host.reload(reloadRequest(emptyPlan), "reload", testExtensionContext)).toMatchObject({
+    outcome: "disabled"
+  })
   expect(workers.processes).toHaveLength(0)
   await host.dispose()
   await host.dispose()
@@ -63,9 +68,9 @@ test("host startup owns lifecycle requests, bounded logs, and process cleanup", 
   const worker = workers.processes[0]!
 
   expect(host.snapshot()).toMatchObject({ status: "ready", lifecycle: "unbound" })
-  await host.sessionStart("startup")
+  await host.sessionStart("startup", testExtensionContext)
   expect(worker.messages.map(message => message.type)).toEqual(["initialize", "session_start"])
-  expect(host.sessionStart("startup")).rejects.toThrow("cannot start while started")
+  expect(host.sessionStart("startup", testExtensionContext)).rejects.toThrow("cannot start while started")
 
   worker.stdout.write(Buffer.alloc(maxExtensionLogBytesPerStream + 17, 0x61))
   worker.stderr.write("stderr evidence")
@@ -90,6 +95,7 @@ test("startup and teardown deadlines terminate unresponsive workers", async () =
   const timeouts: ExtensionHostTimeouts = {
     startupMs: 10,
     lifecycleMs: 10,
+    agentEventMs: 10,
     shutdownMs: 9,
     commandMs: 10,
     commandCancellationMs: 5,
@@ -143,9 +149,9 @@ test("fatal startup failure leaves a diagnosable retryable host", async () => {
   expect(workers.processes[0]!.terminated).toEqual(["SIGTERM"])
   expect(workers.processes[0]!.disposed).toBe(true)
 
-  await host.sessionStart("startup")
+  await host.sessionStart("startup", testExtensionContext)
   workers.behaviors.push({ type: "ready" })
-  await host.reload(reloadRequest(planTwo))
+  await host.reload(reloadRequest(planTwo), "reload", testExtensionContext)
   expect(host.snapshot()).toMatchObject({ status: "ready", lifecycle: "started" })
   expect(workers.processes[1]!.messages.map(message => message.type)).toEqual(["initialize", "session_start"])
   await host.dispose()
@@ -156,7 +162,7 @@ test("failed lifecycle requests preserve the session's desired lifecycle", async
   workers.behaviors.push({ type: "fatal_start" })
   const host = await ExtensionHost.create(planOne, workers.spawn, testTimeouts)
 
-  await host.sessionStart("startup")
+  await host.sessionStart("startup", testExtensionContext)
   expect(host.snapshot()).toMatchObject({ status: "failed", lifecycle: "started" })
   await host.dispose()
 })
@@ -165,7 +171,7 @@ test("host command invocation is correlated, cancellable, and generation-reusabl
   const workers = new TestWorkerSpawner()
   workers.behaviors.push({ type: "commands" })
   const host = await ExtensionHost.create(planOne, workers.spawn, testTimeouts)
-  await host.sessionStart("startup")
+  await host.sessionStart("startup", testExtensionContext)
 
   expect(host.commandCatalog()).toMatchObject([{ name: "echo", source: { id: sourceOne.id } }])
   expect(await host.invokeCommand("echo", "hello")).toBe("HELLO")
@@ -180,14 +186,62 @@ test("host command invocation is correlated, cancellable, and generation-reusabl
   await host.dispose()
 })
 
+test("agent event notifications stay ordered without blocking invocations", async () => {
+  const workers = new TestWorkerSpawner()
+  workers.behaviors.push({ type: "commands" })
+  const host = await ExtensionHost.create(planOne, workers.spawn, testTimeouts)
+  await host.sessionStart("startup", testExtensionContext)
+
+  host.publishAgentStart()
+  host.publishAgentSettled()
+  expect(await host.invokeCommand("echo", "ready")).toBe("READY")
+  expect(workers.processes[0]!.messages.map(message => message.type)).toEqual([
+    "initialize",
+    "session_start",
+    "agent_start",
+    "agent_settled",
+    "command_invoke"
+  ])
+
+  await host.dispose()
+})
+
+test("agent event queue overflow fails only the extension generation", async () => {
+  const workers = new TestWorkerSpawner()
+  workers.behaviors.push({ type: "agent_hang" })
+  const host = await ExtensionHost.create(planOne, workers.spawn, testTimeouts)
+  await host.sessionStart("startup", testExtensionContext)
+
+  for (let event = 0; event <= maxExtensionQueuedAgentEvents; event++) host.publishAgentStart()
+  expect(host.snapshot()).toMatchObject({
+    status: "failed",
+    failure: {
+      phase: "event",
+      message: `Extension agent event queue exceeded ${maxExtensionQueuedAgentEvents} entries`
+    }
+  })
+
+  await host.dispose()
+})
+
 test("host tool invocation is correlated, cancellable, and generation-reusable", async () => {
   const workers = new TestWorkerSpawner()
   workers.behaviors.push({ type: "tools" })
   const host = await ExtensionHost.create(planOne, workers.spawn, testTimeouts)
-  await host.sessionStart("startup")
+  await host.sessionStart("startup", testExtensionContext)
 
   expect(host.toolCatalog()).toMatchObject([{ name: "echo_message", source: { id: sourceOne.id } }])
-  expect(await host.invokeTool("echo_message", { message: "hello" })).toBe("HELLO")
+  const progress: string[] = []
+  expect(
+    await host.invokeTool("echo_message", { message: "hello" }, undefined, message => progress.push(message))
+  ).toBe("HELLO")
+  expect(progress).toEqual(["Processing hello"])
+  const worker = workers.processes[0]!
+  const completed = worker.messages.find(message => message.type === "tool_invoke")
+  if (!completed || completed.type !== "tool_invoke") throw new Error("Expected a completed tool invocation")
+  worker.send({ type: "tool_progress", generation: 1, requestId: completed.requestId, message: "late progress" })
+  await Bun.sleep(0)
+  expect(progress).toEqual(["Processing hello"])
   expect(host.invokeTool("echo_message", { message: "error" })).rejects.toThrow("tool failed")
 
   const controller = new AbortController()
@@ -214,7 +268,7 @@ test("worker session requests are source-attributed and domain refusals keep the
     getActiveTools: () => [],
     setActiveTools: () => []
   })
-  await host.sessionStart("startup")
+  await host.sessionStart("startup", testExtensionContext)
   const worker = workers.processes[0]!
 
   worker.send({
@@ -260,6 +314,134 @@ test("worker session requests are source-attributed and domain refusals keep the
   await host.dispose()
 })
 
+test("subagent waits are bounded by their owning extension invocation", async () => {
+  const workers = new TestWorkerSpawner()
+  workers.behaviors.push({ type: "tools", timeoutMs: 5_000 })
+  const timeouts = { ...testTimeouts, toolMs: 1_000 }
+  const host = await ExtensionHost.create(planOne, workers.spawn, timeouts)
+  const observedTimeouts: number[] = []
+  let abortedWaits = 0
+  host.bindSessionOperations({
+    getEntries: () => [],
+    appendEntry: customType => ({ id: "entry", timestamp: new Date(0).toISOString(), customType }),
+    sendMessage: () => {},
+    getActiveTools: () => [],
+    setActiveTools: () => {},
+    subagents: {
+      waitTimeoutMs: 5_000,
+      listProfiles: () => [],
+      spawn: async () => "unused",
+      send: async () => {},
+      continue: async () => "started_turn",
+      wait: async (_extensionId, _names, timeoutMs, signal) => {
+        observedTimeouts.push(timeoutMs ?? -1)
+        await new Promise<void>((_resolve, reject) => {
+          signal.addEventListener(
+            "abort",
+            () => {
+              abortedWaits++
+              reject(new Error("owned wait aborted"))
+            },
+            { once: true }
+          )
+        })
+        return []
+      },
+      interrupt: async () => "already_idle",
+      close: async () => ({ name: "unused", lifecycle: "exited", resultReady: false }),
+      list: () => []
+    }
+  })
+  await host.sessionStart("startup", testExtensionContext)
+  const worker = workers.processes[0]!
+  const controller = new AbortController()
+  const invocation = host.invokeTool("echo_message", { message: "pending" }, controller.signal)
+  await Bun.sleep(0)
+  const owner = worker.messages.find(message => message.type === "tool_invoke")
+  if (!owner || owner.type !== "tool_invoke") throw new Error("Expected a tool invocation")
+
+  worker.send({
+    type: "subagent_wait",
+    generation: 1,
+    requestId: 41,
+    extensionId: sourceOne.id,
+    ownerRequestId: owner.requestId,
+    names: ["finder-1"]
+  })
+  await Bun.sleep(0)
+  expect(observedTimeouts).toHaveLength(0)
+  expect(worker.messages).toContainEqual(expect.objectContaining({ type: "session_operation_error", requestId: 41 }))
+
+  worker.send({
+    type: "subagent_wait",
+    generation: 1,
+    requestId: 42,
+    extensionId: sourceOne.id,
+    ownerRequestId: owner.requestId,
+    names: ["finder-1"],
+    timeoutMs: 3_600_000
+  })
+  await Bun.sleep(0)
+  expect(observedTimeouts).toHaveLength(0)
+  expect(worker.messages).toContainEqual(expect.objectContaining({ type: "session_operation_error", requestId: 42 }))
+
+  worker.send({
+    type: "subagent_wait",
+    generation: 1,
+    requestId: 43,
+    extensionId: sourceOne.id,
+    ownerRequestId: owner.requestId,
+    names: ["finder-1"],
+    timeoutMs: 2_000
+  })
+  await Bun.sleep(0)
+  expect(observedTimeouts).toEqual([2_000])
+  controller.abort()
+  expect(invocation).rejects.toMatchObject({ name: "AbortError" })
+  await Bun.sleep(0)
+  expect(abortedWaits).toBe(1)
+
+  worker.send({
+    type: "subagent_wait",
+    generation: 1,
+    requestId: 44,
+    extensionId: sourceOne.id,
+    ownerRequestId: owner.requestId,
+    names: ["finder-1"],
+    timeoutMs: 100
+  })
+  await Bun.sleep(0)
+  expect(observedTimeouts).toEqual([2_000])
+  expect(worker.messages).toContainEqual(expect.objectContaining({ type: "session_operation_error", requestId: 44 }))
+  expect(await host.invokeTool("echo_message", { message: "again" })).toBe("AGAIN")
+
+  const completing = host.invokeTool("echo_message", { message: "pending" })
+  await Bun.sleep(0)
+  const completingOwner = worker.messages.findLast(
+    message => message.type === "tool_invoke" && message.arguments.message === "pending"
+  )
+  if (!completingOwner || completingOwner.type !== "tool_invoke") {
+    throw new Error("Expected a completing tool invocation")
+  }
+  worker.send({
+    type: "subagent_wait",
+    generation: 1,
+    requestId: 45,
+    extensionId: sourceOne.id,
+    ownerRequestId: completingOwner.requestId,
+    names: ["finder-2"],
+    timeoutMs: 100
+  })
+  await Bun.sleep(0)
+  expect(observedTimeouts).toEqual([2_000, 100])
+  worker.send({ type: "tool_result", generation: 1, requestId: completingOwner.requestId, value: "COMPLETED" })
+  expect(await completing).toBe("COMPLETED")
+  await Bun.sleep(0)
+  expect(abortedWaits).toBe(2)
+  expect(host.snapshot()).toMatchObject({ status: "ready", lifecycle: "started" })
+  await host.dispose()
+})
+
 test("active tool requests are source-attributed session operations", async () => {
   const workers = new TestWorkerSpawner()
   workers.behaviors.push({ type: "active_tools" })
@@ -277,7 +459,7 @@ test("active tool requests are source-attributed session operations", async () =
       active = [...names]
     }
   })
-  await host.sessionStart("startup")
+  await host.sessionStart("startup", testExtensionContext)
   const worker = workers.processes[0]!
 
   worker.send({
@@ -323,7 +505,7 @@ test("active tool updates are rejected during extension shutdown", async () => {
       updates++
     }
   })
-  await host.sessionStart("startup")
+  await host.sessionStart("startup", testExtensionContext)
   await host.sessionShutdown("quit")
 
   expect(updates).toBe(0)
@@ -338,7 +520,7 @@ test("a tool result crossing host cancellation settles as cancellation", async (
   const workers = new TestWorkerSpawner()
   workers.behaviors.push({ type: "tool_cancel_crossing" })
   const host = await ExtensionHost.create(planOne, workers.spawn, testTimeouts)
-  await host.sessionStart("startup")
+  await host.sessionStart("startup", testExtensionContext)
   const controller = new AbortController()
   const invocation = host.invokeTool("echo_message", { message: "pending" }, controller.signal)
 
@@ -352,7 +534,7 @@ test("a malformed tool result fails its generation without escaping the host", a
   const workers = new TestWorkerSpawner()
   workers.behaviors.push({ type: "malformed_tool" })
   const host = await ExtensionHost.create(planOne, workers.spawn, testTimeouts)
-  await host.sessionStart("startup")
+  await host.sessionStart("startup", testExtensionContext)
 
   expect(host.invokeTool("echo_message", { message: "invalid" })).rejects.toThrow("tool result")
   await Bun.sleep(0)
@@ -365,7 +547,7 @@ test("a cancellation deadline fails a command generation with source attribution
   workers.behaviors.push({ type: "command_hang" })
   const timeouts = { ...testTimeouts, commandMs: 1_000, commandCancellationMs: 10 }
   const host = await ExtensionHost.create(planOne, workers.spawn, timeouts)
-  await host.sessionStart("startup")
+  await host.sessionStart("startup", testExtensionContext)
   const controller = new AbortController()
   const invocation = host.invokeCommand("echo", "pending", controller.signal)
 
@@ -385,7 +567,7 @@ test("a cancellation deadline fails a tool generation with source attribution", 
   workers.behaviors.push({ type: "tool_hang" })
   const timeouts = { ...testTimeouts, toolMs: 1_000, toolCancellationMs: 10 }
   const host = await ExtensionHost.create(planOne, workers.spawn, timeouts)
-  await host.sessionStart("startup")
+  await host.sessionStart("startup", testExtensionContext)
   const controller = new AbortController()
   const invocation = host.invokeTool("echo_message", { message: "pending" }, controller.signal)
 
@@ -405,7 +587,7 @@ test("a command deadline fails, clears the catalog, and terminates its generatio
   workers.behaviors.push({ type: "command_hang" })
   const timeouts = { ...testTimeouts, commandMs: 10 }
   const host = await ExtensionHost.create(planOne, workers.spawn, timeouts)
-  await host.sessionStart("startup")
+  await host.sessionStart("startup", testExtensionContext)
 
   expect(host.invokeCommand("echo", "pending")).rejects.toThrow("deadline exceeded")
   await Bun.sleep(15)
@@ -424,7 +606,7 @@ test("a tool deadline fails and terminates its generation", async () => {
   workers.behaviors.push({ type: "tool_hang" })
   const timeouts = { ...testTimeouts, toolMs: 10 }
   const host = await ExtensionHost.create(planOne, workers.spawn, timeouts)
-  await host.sessionStart("startup")
+  await host.sessionStart("startup", testExtensionContext)
 
   expect(host.invokeTool("echo_message", { message: "pending" })).rejects.toThrow("deadline exceeded")
   await Bun.sleep(15)
@@ -436,15 +618,31 @@ test("a tool deadline fails and terminates its generation", async () => {
   await host.dispose()
 })
 
+test("a declared tool timeout overrides the host default deadline", async () => {
+  const workers = new TestWorkerSpawner()
+  workers.behaviors.push({ type: "tools", timeoutMs: 1_000 })
+  const host = await ExtensionHost.create(planOne, workers.spawn, { ...testTimeouts, toolMs: 10 })
+  await host.sessionStart("startup", testExtensionContext)
+
+  const invocation = host.invokeTool("echo_message", { message: "pending" })
+  await Bun.sleep(20)
+  expect(host.snapshot()).toMatchObject({ status: "ready", lifecycle: "started" })
+  const request = workers.processes[0]!.messages.find(message => message.type === "tool_invoke")
+  if (!request || request.type !== "tool_invoke") throw new Error("Expected a tool invocation")
+  workers.processes[0]!.send({ type: "tool_result", generation: 1, requestId: request.requestId, value: "COMPLETED" })
+  expect(await invocation).toBe("COMPLETED")
+  await host.dispose()
+})
+
 test("command completion from a retired generation cannot cross replacement", async () => {
   const workers = new TestWorkerSpawner()
   workers.behaviors.push({ type: "commands" }, { type: "commands" })
   const host = await ExtensionHost.create(planOne, workers.spawn, testTimeouts)
   const retired = workers.processes[0]!
-  await host.sessionStart("startup")
+  await host.sessionStart("startup", testExtensionContext)
   const invocation = host.invokeCommand("echo", "pending")
 
-  await host.reload(reloadRequest(planTwo))
+  await host.reload(reloadRequest(planTwo), "reload", testExtensionContext)
   expect(invocation).rejects.toThrow("disposed during invocation")
   retired.send({ type: "command_result", generation: 1, requestId: 2, message: "stale" })
   expect(host.snapshot()).toMatchObject({
@@ -461,10 +659,10 @@ test("tool completion from a retired generation cannot cross replacement", async
   workers.behaviors.push({ type: "tools" }, { type: "tools" })
   const host = await ExtensionHost.create(planOne, workers.spawn, testTimeouts)
   const retired = workers.processes[0]!
-  await host.sessionStart("startup")
+  await host.sessionStart("startup", testExtensionContext)
   const invocation = host.invokeTool("echo_message", { message: "pending" })
 
-  await host.reload(reloadRequest(planTwo))
+  await host.reload(reloadRequest(planTwo), "reload", testExtensionContext)
   expect(invocation).rejects.toThrow("disposed during invocation")
   retired.send({ type: "tool_result", generation: 1, requestId: 2, value: "stale" })
   expect(host.snapshot()).toMatchObject({
@@ -480,10 +678,10 @@ test("candidate session_start failure after retirement returns failed", async ()
   const workers = new TestWorkerSpawner()
   const host = await ExtensionHost.create(planOne, workers.spawn, testTimeouts)
   const current = workers.processes[0]!
-  await host.sessionStart("startup")
+  await host.sessionStart("startup", testExtensionContext)
 
   workers.behaviors.push({ type: "fatal_start" })
-  expect(await host.reload(reloadRequest(planTwo))).toMatchObject({
+  expect(await host.reload(reloadRequest(planTwo), "reload", testExtensionContext)).toMatchObject({
     outcome: "failed",
     diagnostics: [expect.objectContaining({ phase: "lifecycle", message: "start failed" })]
   })
@@ -503,13 +701,15 @@ test("failed-host recovery rejects a concurrent reload while the first attempt o
   const workers = new TestWorkerSpawner()
   workers.behaviors.push({ type: "fatal_start" })
   const host = await ExtensionHost.create(planOne, workers.spawn, testTimeouts)
-  await host.sessionStart("startup")
+  await host.sessionStart("startup", testExtensionContext)
   expect(host.snapshot().status).toBe("failed")
 
   workers.behaviors.push({ type: "pending" })
-  const first = host.reload(reloadRequest(planTwo))
+  const first = host.reload(reloadRequest(planTwo), "reload", testExtensionContext)
   await Promise.resolve()
-  expect(host.reload(reloadRequest(planTwo))).rejects.toThrow("cannot reload while reloading")
+  expect(host.reload(reloadRequest(planTwo), "reload", testExtensionContext)).rejects.toThrow(
+    "cannot reload while reloading"
+  )
 
   workers.processes[1]!.failStartup("candidate abandoned")
   expect(await first).toMatchObject({ outcome: "failed" })
@@ -520,15 +720,19 @@ test("replacement preserves current on candidate failure and commits one success
   const workers = new TestWorkerSpawner()
   const host = await ExtensionHost.create(planOne, workers.spawn, testTimeouts)
   const current = workers.processes[0]!
-  await host.sessionStart("startup")
+  await host.sessionStart("startup", testExtensionContext)
 
   workers.behaviors.push({ type: "spawn_error", message: "candidate spawn failed" })
-  expect(await host.reload(reloadRequest(planTwo))).toMatchObject({ outcome: "retained" })
+  expect(await host.reload(reloadRequest(planTwo), "reload", testExtensionContext)).toMatchObject({
+    outcome: "retained"
+  })
   expect(host.snapshot()).toMatchObject({ status: "ready", lifecycle: "started" })
   expect(current.messages.map(message => message.type)).toEqual(["initialize", "session_start"])
 
   workers.behaviors.push({ type: "fatal", message: "candidate failed" })
-  expect(await host.reload(reloadRequest(planTwo))).toMatchObject({ outcome: "retained" })
+  expect(await host.reload(reloadRequest(planTwo), "reload", testExtensionContext)).toMatchObject({
+    outcome: "retained"
+  })
   expect(host.snapshot()).toMatchObject({
     status: "ready",
     lifecycle: "started",
@@ -537,7 +741,9 @@ test("replacement preserves current on candidate failure and commits one success
   expect(current.messages.map(message => message.type)).toEqual(["initialize", "session_start"])
 
   workers.behaviors.push({ type: "ready" })
-  expect(await host.reload(reloadRequest(planTwo))).toMatchObject({ outcome: "replaced" })
+  expect(await host.reload(reloadRequest(planTwo), "reload", testExtensionContext)).toMatchObject({
+    outcome: "replaced"
+  })
   const candidate = workers.processes[2]!
   expect(host.snapshot()).toMatchObject({
     status: "ready",
@@ -565,11 +771,11 @@ test("replacement preserves current on candidate failure and commits one success
 test("replacement fails instead of restoring a current generation that crashed with its candidate", async () => {
   const workers = new TestWorkerSpawner()
   const host = await ExtensionHost.create(planOne, workers.spawn, testTimeouts)
-  await host.sessionStart("startup")
+  await host.sessionStart("startup", testExtensionContext)
   const current = workers.processes[0]!
 
   workers.behaviors.push({ type: "pending" })
-  const replacement = host.reload(reloadRequest(planTwo))
+  const replacement = host.reload(reloadRequest(planTwo), "reload", testExtensionContext)
   await Promise.resolve()
   const candidate = workers.processes[1]!
   current.crash(new Error("current crashed"))
@@ -596,11 +802,13 @@ test("final disposal supersedes startup and replacement without leaking either p
 
   const replacementWorkers = new TestWorkerSpawner()
   const replacingHost = await ExtensionHost.create(planOne, replacementWorkers.spawn, testTimeouts)
-  await replacingHost.sessionStart("startup")
+  await replacingHost.sessionStart("startup", testExtensionContext)
   replacementWorkers.behaviors.push({ type: "pending" })
-  const replacement = replacingHost.reload(reloadRequest(planTwo))
+  const replacement = replacingHost.reload(reloadRequest(planTwo), "reload", testExtensionContext)
   await Promise.resolve()
-  expect(replacingHost.reload(reloadRequest(planTwo))).rejects.toThrow("cannot reload while reloading")
+  expect(replacingHost.reload(reloadRequest(planTwo), "reload", testExtensionContext)).rejects.toThrow(
+    "cannot reload while reloading"
+  )
   const replacementDisposal = replacingHost.dispose()
   const [reloadResult] = await Promise.all([replacement, replacementDisposal])
   expect(reloadResult).toMatchObject({ outcome: "superseded" })
@@ -630,11 +838,11 @@ test("replacement disposal authorizes shutdown state operations from the current
     getActiveTools: () => [],
     setActiveTools: () => []
   })
-  await host.sessionStart("startup")
+  await host.sessionStart("startup", testExtensionContext)
   const current = workers.processes[0]!
 
   workers.behaviors.push({ type: "pending" })
-  const replacement = host.reload(reloadRequest(planTwo))
+  const replacement = host.reload(reloadRequest(planTwo), "reload", testExtensionContext)
   await Promise.resolve()
   const candidate = workers.processes[1]!
   const disposal = host.dispose()
@@ -652,7 +860,7 @@ test("current crashes fail closed, retain bounded diagnostics, and remain dispos
   const workers = new TestWorkerSpawner()
   const host = await ExtensionHost.create(planOne, workers.spawn, testTimeouts)
   const worker = workers.processes[0]!
-  await host.sessionStart("startup")
+  await host.sessionStart("startup", testExtensionContext)
 
   for (let index = 0; index < maxExtensionDiagnostics + 10; index++) {
     worker.send({
@@ -691,11 +899,11 @@ type TestWorkerBehavior =
   | { readonly type: "ready" }
   | { readonly type: "wrong_ready" }
   | { readonly type: "fatal_start" }
+  | { readonly type: "tools"; readonly timeoutMs?: number }
   | {
       readonly type:
         | "commands"
         | "command_hang"
-        | "tools"
         | "active_tools"
         | "tool_hang"
         | "tool_cancel_crossing"
@@ -703,7 +911,7 @@ type TestWorkerBehavior =
     }
   | { readonly type: "spawn_error"; readonly message: string }
   | { readonly type: "fatal"; readonly message: string }
-  | { readonly type: "pending" }
+  | { readonly type: "pending" | "agent_hang" }
   | { readonly type: "shutdown_append" | "shutdown_active_set" }
   | { readonly type: "resist_terminate" }
 
@@ -820,7 +1028,12 @@ class TestWorkerProcess implements ExtensionWorkerProcess {
                 this.#behavior.type === "tool_hang" ||
                 this.#behavior.type === "tool_cancel_crossing" ||
                 this.#behavior.type === "malformed_tool"
-              ? [toolRegistration(this.#plan.sources[0]!)]
+              ? [
+                  toolRegistration(
+                    this.#plan.sources[0]!,
+                    this.#behavior.type === "tools" ? this.#behavior.timeoutMs : undefined
+                  )
+                ]
               : []
       })
       return
@@ -879,6 +1092,12 @@ class TestWorkerProcess implements ExtensionWorkerProcess {
       const content = message.arguments.message
       if (typeof content !== "string") throw new Error("Test tool expected a string message")
       this.send({
+        type: "tool_progress",
+        generation: message.generation,
+        requestId: message.requestId,
+        message: `Processing ${content}`
+      })
+      this.send({
         type: "tool_result",
         generation: message.generation,
         requestId: message.requestId,
@@ -917,6 +1136,11 @@ class TestWorkerProcess implements ExtensionWorkerProcess {
       })
       return
     }
+    if (message.type === "agent_start" || message.type === "agent_settled") {
+      if (this.#behavior.type === "agent_hang") return
+      this.send({ type: "agent_event_settled", generation: message.generation, sequence: message.sequence })
+      return
+    }
     if (message.type === "stop" && this.#behavior.type === "resist_terminate") return
     this.send({ type: "settled", generation: message.generation, requestId: message.requestId })
     if (message.type === "stop") queueMicrotask(() => this.#finish({ code: 0, signal: null }))
@@ -936,13 +1160,14 @@ function commandRegistration(source: ExtensionSource) {
   return { source, name: "echo", description: "Echo command arguments", argumentHint: "[text]" } as const
 }
 
-function toolRegistration(source: ExtensionSource) {
+function toolRegistration(source: ExtensionSource, timeoutMs?: number) {
   return {
     source,
     name: "echo_message",
     label: "Echo",
     description: "Echo a message",
     active: true,
+    ...(timeoutMs === undefined ? {} : { timeoutMs }),
     parameters: { type: "object", required: ["message"], properties: { message: { type: "string" } } },
     outputSchema: { type: "string" }
   } as const

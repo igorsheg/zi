@@ -6,6 +6,10 @@ Public TypeScript contract for trusted [Zi](https://github.com/igorsheg/zi) exte
 import { Schema, type ExtensionAPI } from "@with-zi/extension-api"
 
 export default function (zi: ExtensionAPI): void {
+  zi.on("agent_settled", (_event, context) => {
+    console.error(`Session ${context.session.id} is idle in ${context.mode} mode`)
+  })
+
   zi.registerCommand({
     name: "repository-check",
     description: "Run one local repository check",
@@ -20,9 +24,13 @@ export default function (zi: ExtensionAPI): void {
     name: "repository_rule",
     description: "Look up one repository rule",
     active: false,
+    timeoutMs: 2 * 60_000,
     parameters: Schema.object({ topic: Schema.string() }),
     outputSchema: Schema.object({ topic: Schema.string(), rule: Schema.string() }),
-    execute: ({ topic }) => ({ topic, rule: `Rule for ${topic}` })
+    execute: ({ topic }, context) => {
+      context.reportProgress(`Looking up ${topic}`)
+      return { topic, rule: `Rule for ${topic}` }
+    }
   })
 
   zi.registerTool({
@@ -39,4 +47,6 @@ export default function (zi: ExtensionAPI): void {
 
 Zi provides this module to extension workers at runtime. Install it as a development dependency when authoring or type-checking an extension. Extensions execute with the current user's authority; the worker is fault containment, not a security sandbox.
 
-See the [extension author guide](https://github.com/igorsheg/zi/blob/main/docs/extensions.md), [custom-tool example](https://github.com/igorsheg/zi/tree/main/examples/extensions/custom-tool), [deferred-tools example](https://github.com/igorsheg/zi/tree/main/examples/extensions/deferred-tools), [durable-counter example](https://github.com/igorsheg/zi/tree/main/examples/extensions/durable-counter), and [programmatic subagent-profile example](https://github.com/igorsheg/zi/tree/main/examples/extensions/subagents).
+Each callback receives one frozen context containing the runtime mode, absolute working directory, and memory or journal session identity. `agent_start` and `agent_settled` are ordered observational notifications; commands and tools receive the same context plus an invocation-scoped `AbortSignal`. Tool contexts also expose `reportProgress(message)` for bounded, transient invocation updates. Tools default to 30 seconds and may declare a bounded `timeoutMs` of at most one hour.
+
+See the [extension author guide](https://github.com/igorsheg/zi/blob/main/docs/extensions.md), [custom-tool example](https://github.com/igorsheg/zi/tree/main/examples/extensions/custom-tool), [deferred-tools example](https://github.com/igorsheg/zi/tree/main/examples/extensions/deferred-tools), [durable-counter example](https://github.com/igorsheg/zi/tree/main/examples/extensions/durable-counter), [Herdr agent-state example](https://github.com/igorsheg/zi/tree/main/examples/extensions/herdr-agent-state), and [programmatic subagent-profile example](https://github.com/igorsheg/zi/tree/main/examples/extensions/subagents).

@@ -5,6 +5,9 @@ import { delimiter, isAbsolute, join } from "node:path"
 import { Readable, Writable } from "node:stream"
 
 import type {
+  ExtensionAgentSettledEvent,
+  ExtensionAgentStartEvent,
+  ExtensionContext,
   ExtensionCustomEntry,
   ExtensionCustomMessage,
   ExtensionMessageDelivery,
@@ -20,6 +23,7 @@ import type { ExtensionLoadPlan } from "./discovery.js"
 import {
   boundedExtensionDiagnostic,
   boundedExtensionSessionOperationError,
+  extensionAgentEventTimeoutMs,
   extensionCommandCancellationTimeoutMs,
   extensionCommandTimeoutMs,
   extensionLifecycleTimeoutMs,
@@ -33,6 +37,7 @@ import {
   maxExtensionDiagnostics,
   maxExtensionLogBytesPerStream,
   maxExtensionPendingRequests,
+  maxExtensionQueuedAgentEvents,
   type ExtensionCommandRegistration,
   type ExtensionDiagnostic,
   type ExtensionLoadResult,
@@ -70,6 +75,7 @@ export interface ExtensionWorkerProcess {
 export type SpawnExtensionWorker = (plan: ExtensionLoadPlan) => ExtensionWorkerProcess
 
 export interface ExtensionSubagentSessionOperations {
+  readonly waitTimeoutMs: number
   listProfiles(extensionId: string): readonly ExtensionSubagentProfile[]
   spawn(extensionId: string, profile: string, name: string, prompt: string, signal: AbortSignal): Promise<string>
   send(extensionId: string, name: string, text: string): Promise<void>
@@ -103,6 +109,7 @@ const noExtensionHostCapabilities: ExtensionHostCapabilities = Object.freeze({ s
 export interface ExtensionHostTimeouts {
   readonly startupMs: number
   readonly lifecycleMs: number
+  readonly agentEventMs: number
   readonly shutdownMs: number
   readonly commandMs: number
   readonly commandCancellationMs: number
@@ -110,9 +117,12 @@ export interface ExtensionHostTimeouts {
   readonly toolCancellationMs: number
 }
 
+const extensionOwnedWaitSettlementMarginMs = 100
+
 export const defaultExtensionHostTimeouts: ExtensionHostTimeouts = Object.freeze({
   startupMs: extensionStartupTimeoutMs,
   lifecycleMs: extensionLifecycleTimeoutMs,
+  agentEventMs: extensionAgentEventTimeoutMs,
   shutdownMs: extensionShutdownTimeoutMs,
   commandMs: extensionCommandTimeoutMs,
   commandCancellationMs: extensionCommandCancellationTimeoutMs,
@@ -232,6 +242,8 @@ type GenerationCommandInvocation =
       readonly settled: Deferred<string | undefined>
       readonly signal?: AbortSignal
       readonly onAbort?: () => void
+      readonly deadlineAt: number
+      readonly timeoutMs: number
       readonly timeout: ReturnType<typeof setTimeout>
     }
   | {
@@ -241,6 +253,8 @@ type GenerationCommandInvocation =
       readonly settled: Deferred<string | undefined>
       readonly signal: AbortSignal
       readonly onAbort: () => void
+      readonly deadlineAt: number
+      readonly timeoutMs: number
       readonly timeout: ReturnType<typeof setTimeout>
     }
 
@@ -252,6 +266,9 @@ type GenerationToolInvocation =
       readonly settled: Deferred<JsonValue>
       readonly signal?: AbortSignal
       readonly onAbort?: () => void
+      readonly onProgress?: (message: string) => void
+      readonly deadlineAt: number
+      readonly timeoutMs: number
       readonly timeout: ReturnType<typeof setTimeout>
     }
   | {
@@ -261,6 +278,9 @@ type GenerationToolInvocation =
       readonly settled: Deferred<JsonValue>
       readonly signal: AbortSignal
       readonly onAbort: () => void
+      readonly onProgress?: (message: string) => void
+      readonly deadlineAt: number
+      readonly timeoutMs: number
       readonly timeout: ReturnType<typeof setTimeout>
     }
 
@@ -379,11 +399,13 @@ class ExtensionGeneration {
   readonly #commandInvocations = new Map<number, GenerationCommandInvocation>()
   readonly #toolInvocations = new Map<number, GenerationToolInvocation>()
   readonly #sessionResponses = new Set<number>()
+  readonly #pendingAgentEvents = new Map<number, ReturnType<typeof setTimeout>>()
   readonly #sessionOperations = new Map<
     number,
-    { readonly extensionId: string; readonly controller: AbortController }
+    { readonly extensionId: string; readonly ownerRequestId?: number; readonly controller: AbortController }
   >()
   #lastSessionRequestId = 0
+  #nextAgentEventSequence = 1
   #commands: readonly ExtensionCommandRegistration[] = Object.freeze([])
   #tools: readonly ExtensionToolRegistration[] = Object.freeze([])
   #subagents: readonly ExtensionSubagentRegistration[] = Object.freeze([])
@@ -492,10 +514,10 @@ class ExtensionGeneration {
     }
   }
 
-  async requestStart(reason: ExtensionStartReason): Promise<void> {
+  async requestStart(reason: ExtensionStartReason, context: ExtensionContext): Promise<void> {
     const admitted = this.#admitRequest("session_start")
     void this.#runRequest(
-      { type: "session_start", generation: this.id, requestId: admitted.requestId, reason },
+      { type: "session_start", generation: this.id, requestId: admitted.requestId, reason, context },
       admitted.settled
     )
     return admitted.settled.promise
@@ -508,6 +530,29 @@ class ExtensionGeneration {
       admitted.settled
     )
     return admitted.settled.promise
+  }
+
+  publishAgentEvent(type: ExtensionAgentStartEvent["type"] | ExtensionAgentSettledEvent["type"]): void {
+    const state = this.#state
+    if (state.type !== "ready" || state.lifecycle !== "started") return
+    if (this.#pendingAgentEvents.size >= maxExtensionQueuedAgentEvents) {
+      this.#fail("event", `Extension agent event queue exceeded ${maxExtensionQueuedAgentEvents} entries`)
+      return
+    }
+    const sequence = this.#nextAgentEventSequence
+    if (!Number.isSafeInteger(sequence)) {
+      this.#fail("event", "Extension agent event sequence is exhausted")
+      return
+    }
+    this.#nextAgentEventSequence++
+    const timeout = setTimeout(() => {
+      if (!this.#pendingAgentEvents.delete(sequence)) return
+      this.#fail("event", `Extension agent event did not settle within ${this.#timeouts.agentEventMs}ms`)
+    }, this.#timeouts.agentEventMs)
+    this.#pendingAgentEvents.set(sequence, timeout)
+    void this.#writer.send({ type, generation: this.id, sequence }).catch(cause => {
+      this.#fail("protocol", "Extension agent event delivery failed", cause)
+    })
   }
 
   requestCommand(name: string, arguments_: string, signal?: AbortSignal): Promise<string | undefined> {
@@ -527,9 +572,11 @@ class ExtensionGeneration {
     const requestId = this.#takeRequestId()
     const settled = deferred<string | undefined>()
     const onAbort = signal ? () => this.#cancelCommandInvocation(requestId) : undefined
+    const timeoutMs = this.#timeouts.commandMs
+    const deadlineAt = Date.now() + timeoutMs
     const timeout = setTimeout(
       () => this.#commandInvocationTimedOut(requestId, "Extension command deadline exceeded"),
-      this.#timeouts.commandMs
+      timeoutMs
     )
     timeout.unref?.()
     const invocation: GenerationCommandInvocation = {
@@ -539,6 +586,8 @@ class ExtensionGeneration {
       settled,
       ...(signal ? { signal } : {}),
       ...(onAbort ? { onAbort } : {}),
+      deadlineAt,
+      timeoutMs,
       timeout
     }
     this.#commandInvocations.set(requestId, invocation)
@@ -552,7 +601,12 @@ class ExtensionGeneration {
     return settled.promise
   }
 
-  requestTool(name: string, arguments_: Readonly<Record<string, JsonValue>>, signal?: AbortSignal): Promise<JsonValue> {
+  requestTool(
+    name: string,
+    arguments_: Readonly<Record<string, JsonValue>>,
+    signal?: AbortSignal,
+    onProgress?: (message: string) => void
+  ): Promise<JsonValue> {
     const state = this.#state
     if (state.type !== "ready" || state.lifecycle !== "started") {
       return Promise.reject(new Error(`Extension generation cannot invoke tools while ${state.type}`))
@@ -569,9 +623,11 @@ class ExtensionGeneration {
     const requestId = this.#takeRequestId()
     const settled = deferred<JsonValue>()
     const onAbort = signal ? () => this.#cancelToolInvocation(requestId) : undefined
+    const timeoutMs = registration.timeoutMs ?? this.#timeouts.toolMs
+    const deadlineAt = Date.now() + timeoutMs
     const timeout = setTimeout(
       () => this.#toolInvocationTimedOut(requestId, "Extension tool deadline exceeded"),
-      this.#timeouts.toolMs
+      timeoutMs
     )
     timeout.unref?.()
     const invocation: GenerationToolInvocation = {
@@ -581,6 +637,9 @@ class ExtensionGeneration {
       settled,
       ...(signal ? { signal } : {}),
       ...(onAbort ? { onAbort } : {}),
+      ...(onProgress ? { onProgress } : {}),
+      deadlineAt,
+      timeoutMs,
       timeout
     }
     this.#toolInvocations.set(requestId, invocation)
@@ -592,6 +651,36 @@ class ExtensionGeneration {
         this.#fail("tool", message, cause, this.#toolDiagnostic(registration, message))
       })
     return settled.promise
+  }
+
+  admitSubagentWait(
+    extensionId: string,
+    ownerRequestId: number | undefined,
+    requestedTimeoutMs: number | undefined,
+    defaultTimeoutMs: number
+  ): number | undefined {
+    if (ownerRequestId === undefined) return requestedTimeoutMs
+    const command = this.#commandInvocations.get(ownerRequestId)
+    const tool = this.#toolInvocations.get(ownerRequestId)
+    const invocation = command ?? tool
+    if (!invocation || invocation.type !== "running") {
+      throw new Error("Extension subagent wait owner is no longer active")
+    }
+    if (invocation.registration.source.id !== extensionId) {
+      throw new Error("Extension subagent wait owner belongs to another extension")
+    }
+    const timeoutMs = requestedTimeoutMs ?? defaultTimeoutMs
+    const settlementMarginMs = Math.min(
+      extensionOwnedWaitSettlementMarginMs,
+      Math.max(1, Math.floor(invocation.timeoutMs / 10))
+    )
+    const remainingMs = Math.max(0, invocation.deadlineAt - Date.now() - settlementMarginMs)
+    if (timeoutMs > remainingMs) {
+      throw new Error(
+        `Extension subagent wait timeout ${timeoutMs}ms exceeds its owning invocation budget of ${remainingMs}ms`
+      )
+    }
+    return timeoutMs
   }
 
   dispose(): Promise<void> {
@@ -681,8 +770,11 @@ class ExtensionGeneration {
       settled: invocation.settled,
       signal: invocation.signal,
       onAbort: invocation.onAbort,
+      deadlineAt: invocation.deadlineAt,
+      timeoutMs: invocation.timeoutMs,
       timeout
     }
+    this.#abortOwnedSessionOperations(requestId)
     this.#commandInvocations.set(requestId, cancelling)
     void this.#writer.send({ type: "cancel", generation: this.id, requestId }).catch(cause => {
       const message = errorMessage(cause, "Extension command cancellation failed")
@@ -712,6 +804,7 @@ class ExtensionGeneration {
   ): void {
     if (this.#commandInvocations.get(invocation.requestId) !== invocation) return
     this.#commandInvocations.delete(invocation.requestId)
+    this.#abortOwnedSessionOperations(invocation.requestId)
     clearTimeout(invocation.timeout)
     if (invocation.signal && invocation.onAbort) {
       invocation.signal.removeEventListener("abort", invocation.onAbort)
@@ -736,8 +829,12 @@ class ExtensionGeneration {
       settled: invocation.settled,
       signal: invocation.signal,
       onAbort: invocation.onAbort,
+      ...(invocation.onProgress ? { onProgress: invocation.onProgress } : {}),
+      deadlineAt: invocation.deadlineAt,
+      timeoutMs: invocation.timeoutMs,
       timeout
     }
+    this.#abortOwnedSessionOperations(requestId)
     this.#toolInvocations.set(requestId, cancelling)
     void this.#writer.send({ type: "cancel", generation: this.id, requestId }).catch(cause => {
       const message = errorMessage(cause, "Extension tool cancellation failed")
@@ -764,12 +861,19 @@ class ExtensionGeneration {
   #finishToolInvocation(invocation: GenerationToolInvocation, outcome: { value: JsonValue } | { error: Error }): void {
     if (this.#toolInvocations.get(invocation.requestId) !== invocation) return
     this.#toolInvocations.delete(invocation.requestId)
+    this.#abortOwnedSessionOperations(invocation.requestId)
     clearTimeout(invocation.timeout)
     if (invocation.signal && invocation.onAbort) {
       invocation.signal.removeEventListener("abort", invocation.onAbort)
     }
     if ("value" in outcome) invocation.settled.resolve(outcome.value)
     else invocation.settled.reject(outcome.error)
+  }
+
+  #abortOwnedSessionOperations(ownerRequestId: number): void {
+    for (const operation of this.#sessionOperations.values()) {
+      if (operation.ownerRequestId === ownerRequestId) operation.controller.abort()
+    }
   }
 
   async #runRequest(message: HostMessage, settled: VoidDeferred): Promise<void> {
@@ -852,6 +956,16 @@ class ExtensionGeneration {
           subagents
         })
         return
+      case "agent_event_settled": {
+        const timeout = this.#pendingAgentEvents.get(message.sequence)
+        if (!timeout) {
+          this.#fail("protocol", "Extension worker settled an unknown agent event")
+          return
+        }
+        clearTimeout(timeout)
+        this.#pendingAgentEvents.delete(message.sequence)
+        return
+      }
       case "settled":
         if (state.type === "requesting" && state.requestId === message.requestId) {
           const lifecycle = state.request === "session_start" ? "started" : "stopped"
@@ -887,6 +1001,16 @@ class ExtensionGeneration {
           return
         }
         this.#fail("protocol", "Extension worker cancelled a command request that was not cancelling")
+        return
+      }
+      case "tool_progress": {
+        const invocation = this.#toolInvocations.get(message.requestId)
+        if (invocation?.type !== "running" || !invocation.onProgress) return
+        try {
+          invocation.onProgress(message.message)
+        } catch {
+          // Presentation observers cannot fail the extension generation.
+        }
         return
       }
       case "tool_result":
@@ -933,7 +1057,13 @@ class ExtensionGeneration {
     }
     this.#lastSessionRequestId = request.requestId
     const controller = new AbortController()
-    this.#sessionOperations.set(request.requestId, { extensionId: request.extensionId, controller })
+    this.#sessionOperations.set(request.requestId, {
+      extensionId: request.extensionId,
+      ...(request.type === "subagent_wait" && request.ownerRequestId !== undefined
+        ? { ownerRequestId: request.ownerRequestId }
+        : {}),
+      controller
+    })
     void this.#settleSessionRequest(request, controller)
   }
 
@@ -1070,6 +1200,7 @@ class ExtensionGeneration {
     for (const operation of this.#sessionOperations.values()) operation.controller.abort()
     this.#sessionOperations.clear()
     this.#sessionResponses.clear()
+    this.#clearPendingAgentEvents()
 
     if (state.type === "disposing_stopping") {
       state.settled.reject(error)
@@ -1091,6 +1222,11 @@ class ExtensionGeneration {
     )
   }
 
+  #clearPendingAgentEvents(): void {
+    for (const timeout of this.#pendingAgentEvents.values()) clearTimeout(timeout)
+    this.#pendingAgentEvents.clear()
+  }
+
   #takeRequestId(): number {
     const requestId = this.#nextRequestId
     if (!Number.isSafeInteger(requestId)) throw new Error("Extension request IDs are exhausted")
@@ -1109,6 +1245,7 @@ class ExtensionGeneration {
     for (const operation of this.#sessionOperations.values()) operation.controller.abort()
     this.#sessionOperations.clear()
     this.#sessionResponses.clear()
+    this.#clearPendingAgentEvents()
     this.#writer.dispose()
     this.#process.protocol.off("data", this.#onProtocolData)
     this.#process.protocol.off("end", this.#onProtocolEnd)
@@ -1245,6 +1382,14 @@ export class ExtensionHost {
     }
   }
 
+  publishAgentStart(): void {
+    this.#publishAgentEvent("agent_start")
+  }
+
+  publishAgentSettled(): void {
+    this.#publishAgentEvent("agent_settled")
+  }
+
   invokeCommand(name: string, arguments_: unknown, signal?: AbortSignal): Promise<string | undefined> {
     const state = this.#state
     if (state.type !== "ready" || state.lifecycle !== "started") {
@@ -1262,7 +1407,12 @@ export class ExtensionHost {
     return state.current.requestCommand(name, admittedArguments, signal)
   }
 
-  invokeTool(name: string, arguments_: unknown, signal?: AbortSignal): Promise<JsonValue> {
+  invokeTool(
+    name: string,
+    arguments_: unknown,
+    signal?: AbortSignal,
+    onProgress?: (message: string) => void
+  ): Promise<JsonValue> {
     const state = this.#state
     if (state.type !== "ready" || state.lifecycle !== "started") {
       return Promise.reject(new Error(`Extension host cannot invoke tools while ${state.type}`))
@@ -1276,7 +1426,7 @@ export class ExtensionHost {
     } catch (cause) {
       return Promise.reject(cause)
     }
-    return state.current.requestTool(name, parameters, signal)
+    return state.current.requestTool(name, parameters, signal, onProgress)
   }
 
   rejectCommands(
@@ -1317,7 +1467,13 @@ export class ExtensionHost {
     )
   }
 
-  async sessionStart(reason: ExtensionStartReason): Promise<void> {
+  #publishAgentEvent(type: ExtensionAgentStartEvent["type"] | ExtensionAgentSettledEvent["type"]): void {
+    const state = this.#state
+    if (state.type !== "ready" || state.lifecycle !== "started") return
+    state.current.publishAgentEvent(type)
+  }
+
+  async sessionStart(reason: ExtensionStartReason, context: ExtensionContext): Promise<void> {
     const state = this.#state
     if (state.type === "disabled") {
       if (state.lifecycle !== "unbound") throw new Error(`Extension host cannot start while ${state.lifecycle}`)
@@ -1340,7 +1496,7 @@ export class ExtensionHost {
     }
     this.#state = dispatching
     try {
-      await state.current.requestStart(reason)
+      await state.current.requestStart(reason, context)
       if (this.#state === dispatching) {
         this.#state = { type: "ready", lifecycle: "started", current: state.current }
       }
@@ -1387,7 +1543,8 @@ export class ExtensionHost {
 
   async reload(
     request: ExtensionReloadRequest,
-    reason: ExtensionReplacementReason = "reload"
+    reason: ExtensionReplacementReason,
+    context: ExtensionContext
   ): Promise<ExtensionReloadResult> {
     if (this.#reloadAttempt) throw new Error("Extension host cannot reload while reloading")
     const state = this.#state
@@ -1419,7 +1576,7 @@ export class ExtensionHost {
         this.#setCatalog(Object.freeze([]), Object.freeze([]))
         return this.#finishReloadAttempt("disabled")
       }
-      await this.#startPlan(plan, state.lifecycle, reason)
+      await this.#startPlan(plan, state.lifecycle, reason, context)
       return this.#finishReloadAttempt(reloadOutcomeAfterStart(this.#state))
     }
 
@@ -1501,7 +1658,7 @@ export class ExtensionHost {
       }
       this.#state = dispatching
       try {
-        await candidate.requestStart(reason)
+        await candidate.requestStart(reason, context)
         if (this.#state !== dispatching) return this.#finishReloadAttempt("superseded")
         this.#state = { type: "ready", lifecycle: "started", current: candidate }
         return this.#finishReloadAttempt("replaced")
@@ -1555,7 +1712,8 @@ export class ExtensionHost {
   async #startPlan(
     plan: ExtensionLoadPlan,
     lifecycle: ExtensionHostLifecycle,
-    startReason?: ExtensionReplacementReason
+    startReason?: ExtensionReplacementReason,
+    context?: ExtensionContext
   ): Promise<void> {
     if (plan.sources.length === 0) {
       this.#state = { type: "disabled", lifecycle }
@@ -1621,7 +1779,8 @@ export class ExtensionHost {
       }
       this.#state = dispatching
       try {
-        await candidate.requestStart(startReason ?? "reload")
+        if (!context) throw new Error("Starting an already-bound extension host requires its context")
+        await candidate.requestStart(startReason ?? "reload", context)
         if (this.#state === dispatching) {
           this.#state = { type: "ready", lifecycle: "started", current: candidate }
         }
@@ -1729,12 +1888,19 @@ export class ExtensionHost {
             type: "subagent_continue_result",
             delivery: await operations.subagents.continue(request.extensionId, request.name, request.text)
           }
-        case "subagent_wait":
+        case "subagent_wait": {
           if (!operations.subagents) throw new Error("Subagent session operations are not bound")
+          const timeoutMs = generation.admitSubagentWait(
+            request.extensionId,
+            request.ownerRequestId,
+            request.timeoutMs,
+            operations.subagents.waitTimeoutMs
+          )
           return {
             type: "subagent_wait_result",
-            snapshots: await operations.subagents.wait(request.extensionId, request.names, request.timeoutMs, signal)
+            snapshots: await operations.subagents.wait(request.extensionId, request.names, timeoutMs, signal)
           }
+        }
         case "subagent_interrupt":
           if (!operations.subagents) throw new Error("Subagent session operations are not bound")
           return {

@@ -1,9 +1,13 @@
+import { AsyncLocalStorage } from "node:async_hooks"
 import type { Readable, Writable } from "node:stream"
 import { pathToFileURL } from "node:url"
 
 import type {
+  ExtensionAgentSettledEvent,
+  ExtensionAgentStartEvent,
   ExtensionAPI,
   ExtensionCommandContext,
+  ExtensionContext,
   ExtensionCustomEntry,
   ExtensionCustomMessage,
   ExtensionLifecycleEvent,
@@ -25,6 +29,7 @@ import {
   boundedExtensionDiagnostic,
   boundedExtensionLoadDiagnostic,
   boundedExtensionToolError,
+  extensionAgentEventTimeoutMs,
   extensionLifecycleTimeoutMs,
   ExtensionProtocolDecoder,
   ExtensionProtocolError,
@@ -33,6 +38,7 @@ import {
   extensionStartupTimeoutMs,
   maxExtensionCommands,
   maxExtensionDiagnostics,
+  maxExtensionQueuedAgentEvents,
   maxExtensionPendingRequests,
   maxExtensionSubagentProfiles,
   maxExtensionTools,
@@ -59,12 +65,29 @@ import {
   validateWorkerMessage
 } from "./protocol.js"
 
-export const maxExtensionLifecycleHandlers = 1024
+export const maxExtensionEventHandlers = 1024
 
 interface WorkerOperation {
   readonly generation: number
   readonly settled: Promise<void>
 }
+
+interface WorkerAgentEvent {
+  readonly sequence: number
+  readonly event: ExtensionAgentEvent
+}
+
+type WorkerAgentEventDelivery =
+  | { readonly type: "open" }
+  | {
+      readonly type: "delivering"
+      readonly generation: number
+      readonly extensions: LoadedExtensionGeneration
+      readonly pending: WorkerAgentEvent[]
+      readonly settled: VoidDeferred
+    }
+  | { readonly type: "closing"; readonly active: VoidDeferred }
+  | { readonly type: "closed" }
 
 type WorkerProcessState =
   | { readonly type: "awaiting_initialize" }
@@ -81,12 +104,19 @@ type WorkerProcessState =
 
 interface StartHandler {
   readonly source: ExtensionSource
-  readonly handler: (event: ExtensionStartEvent) => void | Promise<void>
+  readonly handler: (event: ExtensionStartEvent, context: ExtensionContext) => void | Promise<void>
 }
 
 interface ShutdownHandler {
   readonly source: ExtensionSource
-  readonly handler: (event: ExtensionShutdownEvent) => void | Promise<void>
+  readonly handler: (event: ExtensionShutdownEvent, context: ExtensionContext) => void | Promise<void>
+}
+
+type ExtensionAgentEvent = ExtensionAgentStartEvent | ExtensionAgentSettledEvent
+
+interface AgentEventHandler<Event extends ExtensionAgentEvent> {
+  readonly source: ExtensionSource
+  readonly handler: (event: Event, context: ExtensionContext) => void | Promise<void>
 }
 
 interface RegisteredCommand {
@@ -185,8 +215,8 @@ export interface ExtensionLifecycleResult {
 type LifecycleState =
   | { readonly type: "loaded" }
   | { readonly type: "starting" }
-  | { readonly type: "started" }
-  | { readonly type: "shutting_down" }
+  | { readonly type: "started"; readonly context: ExtensionContext }
+  | { readonly type: "shutting_down"; readonly context: ExtensionContext }
   | { readonly type: "stopped" }
   | { readonly type: "failed"; readonly diagnostic: ExtensionDiagnostic }
 
@@ -197,6 +227,8 @@ export class LoadedExtensionGeneration {
   readonly subagents: readonly ExtensionSubagentRegistration[]
   readonly #startHandlers: readonly StartHandler[]
   readonly #shutdownHandlers: readonly ShutdownHandler[]
+  readonly #agentStartHandlers: readonly AgentEventHandler<ExtensionAgentStartEvent>[]
+  readonly #agentSettledHandlers: readonly AgentEventHandler<ExtensionAgentSettledEvent>[]
   readonly #commandsByName: ReadonlyMap<string, RegisteredCommand>
   readonly #toolsByName: ReadonlyMap<string, RegisteredTool>
   #state: LifecycleState = { type: "loaded" }
@@ -205,6 +237,8 @@ export class LoadedExtensionGeneration {
     results: readonly ExtensionLoadResult[],
     startHandlers: readonly StartHandler[],
     shutdownHandlers: readonly ShutdownHandler[],
+    agentStartHandlers: readonly AgentEventHandler<ExtensionAgentStartEvent>[],
+    agentSettledHandlers: readonly AgentEventHandler<ExtensionAgentSettledEvent>[],
     commands: readonly RegisteredCommand[],
     tools: readonly RegisteredTool[],
     subagents: readonly ExtensionSubagentRegistration[]
@@ -215,8 +249,15 @@ export class LoadedExtensionGeneration {
     this.subagents = Object.freeze([...subagents])
     this.#startHandlers = Object.freeze([...startHandlers])
     this.#shutdownHandlers = Object.freeze([...shutdownHandlers])
+    this.#agentStartHandlers = Object.freeze([...agentStartHandlers])
+    this.#agentSettledHandlers = Object.freeze([...agentSettledHandlers])
     this.#commandsByName = new Map(commands.map(command => [command.registration.name, command]))
     this.#toolsByName = new Map(tools.map(tool => [tool.registration.name, tool]))
+  }
+
+  #startedContext(): ExtensionContext {
+    if (this.#state.type !== "started") throw new Error(`Extension generation is ${this.#state.type}`)
+    return this.#state.context
   }
 
   invokeCommand(name: string, arguments_: string, signal: AbortSignal): Promise<string | undefined> {
@@ -225,13 +266,18 @@ export class LoadedExtensionGeneration {
     }
     const command = this.#commandsByName.get(name)
     if (!command) return Promise.reject(new Error(`Unknown extension command: ${name}`))
-    const context = Object.freeze({ signal })
+    const context = Object.freeze({ ...this.#startedContext(), signal })
     return Promise.resolve()
       .then(() => command.execute(arguments_, context))
       .then(validateExtensionCommandResult)
   }
 
-  invoke(name: string, parameters: Readonly<Record<string, JsonValue>>, signal: AbortSignal): Promise<JsonValue> {
+  invoke(
+    name: string,
+    parameters: Readonly<Record<string, JsonValue>>,
+    signal: AbortSignal,
+    reportProgress: (message: string) => void = () => {}
+  ): Promise<JsonValue> {
     if (this.#state.type !== "started") {
       return Promise.reject(new Error(`Cannot invoke extension tools while lifecycle is ${this.#state.type}`))
     }
@@ -240,7 +286,7 @@ export class LoadedExtensionGeneration {
     if (!tool.inputChecker.Check(parameters)) {
       return Promise.reject(new Error(`Invalid arguments for extension tool ${name}`))
     }
-    const context = Object.freeze({ signal })
+    const context = Object.freeze({ ...this.#startedContext(), signal, reportProgress })
     return Promise.resolve()
       .then(() => tool.execute(parameters, context))
       .then(value => {
@@ -252,21 +298,94 @@ export class LoadedExtensionGeneration {
       })
   }
 
-  dispatch(event: ExtensionLifecycleEvent, timeoutMs = extensionLifecycleTimeoutMs): Promise<ExtensionLifecycleResult> {
+  dispatchAgentEvent(
+    event: ExtensionAgentEvent,
+    timeoutMs = extensionAgentEventTimeoutMs
+  ): Promise<ExtensionLifecycleResult> {
+    validateTimeout(timeoutMs)
+    if (this.#state.type !== "started") return Promise.reject(forbiddenAgentEvent(this.#state, event.type))
+    if (event.type === "agent_start") {
+      return this.#runAgentEvent(event, this.#state.context, this.#agentStartHandlers, timeoutMs)
+    }
+    return this.#runAgentEvent(event, this.#state.context, this.#agentSettledHandlers, timeoutMs)
+  }
+
+  dispatch(
+    event: ExtensionLifecycleEvent,
+    context?: ExtensionContext,
+    timeoutMs = extensionLifecycleTimeoutMs
+  ): Promise<ExtensionLifecycleResult> {
     validateTimeout(timeoutMs)
     if (event.type === "session_start") {
       if (this.#state.type !== "loaded") return Promise.reject(forbiddenLifecycle(this.#state, event.type))
+      if (!context) return Promise.reject(new Error("session_start requires an extension context"))
       this.#state = { type: "starting" }
-      return this.#run(event, this.#startHandlers, timeoutMs, { type: "started" })
+      return this.#run(event, context, this.#startHandlers, timeoutMs, { type: "started", context })
     }
     if (this.#state.type !== "started") return Promise.reject(forbiddenLifecycle(this.#state, event.type))
-    this.#state = { type: "shutting_down" }
-    return this.#run(event, this.#shutdownHandlers, timeoutMs, { type: "stopped" })
+    const current = this.#state.context
+    this.#state = { type: "shutting_down", context: current }
+    return this.#run(event, current, this.#shutdownHandlers, timeoutMs, { type: "stopped" })
+  }
+
+  async #runAgentEvent<Event extends ExtensionAgentEvent>(
+    event: Event,
+    context: ExtensionContext,
+    handlers: readonly AgentEventHandler<Event>[],
+    timeoutMs: number
+  ): Promise<ExtensionLifecycleResult> {
+    const diagnostics: ExtensionDiagnostic[] = []
+    let omittedDiagnostics = 0
+    const deadline = Date.now() + timeoutMs
+    const immutableEvent: Event = Object.freeze(event)
+
+    for (const registered of handlers) {
+      const remaining = deadline - Date.now()
+      if (remaining <= 0) return this.#fatalAgentEvent(registered.source, diagnostics, omittedDiagnostics)
+      try {
+        // Event order is part of the extension contract.
+        // oxlint-disable-next-line eslint/no-await-in-loop
+        await settleWithin(
+          Promise.resolve().then(() => registered.handler(immutableEvent, context)),
+          remaining,
+          "Extension agent event deadline exceeded"
+        )
+      } catch (cause) {
+        if (cause instanceof ExtensionDeadlineError) {
+          return this.#fatalAgentEvent(registered.source, diagnostics, omittedDiagnostics)
+        }
+        const diagnostic = diagnosticFor(registered.source, "event", cause)
+        if (diagnostics.length < maxExtensionDiagnostics) diagnostics.push(diagnostic)
+        else omittedDiagnostics++
+      }
+    }
+
+    return Object.freeze({ diagnostics: Object.freeze(diagnostics), omittedDiagnostics })
+  }
+
+  #fatalAgentEvent(
+    source: ExtensionSource,
+    diagnostics: readonly ExtensionDiagnostic[],
+    omittedDiagnostics: number
+  ): ExtensionLifecycleResult {
+    const fatal = boundedExtensionDiagnostic({
+      extensionId: source.id,
+      path: source.entryPath,
+      phase: "event",
+      severity: "error",
+      message: "Extension agent event deadline exceeded"
+    })
+    this.#state = { type: "failed", diagnostic: fatal }
+    return Object.freeze({ diagnostics: Object.freeze([...diagnostics]), omittedDiagnostics, fatal })
   }
 
   async #run<Event extends ExtensionLifecycleEvent>(
     event: Event,
-    handlers: readonly { readonly source: ExtensionSource; readonly handler: (event: Event) => void | Promise<void> }[],
+    context: ExtensionContext,
+    handlers: readonly {
+      readonly source: ExtensionSource
+      readonly handler: (event: Event, context: ExtensionContext) => void | Promise<void>
+    }[],
     timeoutMs: number,
     completed: LifecycleState
   ): Promise<ExtensionLifecycleResult> {
@@ -284,7 +403,7 @@ export class LoadedExtensionGeneration {
         // Lifecycle order is part of the extension contract.
         // oxlint-disable-next-line eslint/no-await-in-loop
         await settleWithin(
-          Promise.resolve().then(() => registered.handler(immutableEvent)),
+          Promise.resolve().then(() => registered.handler(immutableEvent, context)),
           remaining,
           "Extension lifecycle deadline exceeded"
         )
@@ -322,12 +441,15 @@ export class LoadedExtensionGeneration {
 class ExtensionWorkerProcess {
   readonly #writer: ExtensionProtocolWriter
   readonly #terminal = deferred()
+  readonly #invocationOwner = new AsyncLocalStorage<number>()
   readonly #invocations = new Map<number, WorkerInvocation>()
   readonly #settledInvocationRequests = new Set<number>()
   readonly #settledInvocationRequestOrder: number[] = []
   readonly #sessionRequests = new Map<number, WorkerSessionRequest>()
   #lastInvocationRequestId = 0
+  #lastAgentEventSequence = 0
   #nextSessionRequestId = 1
+  #agentEvents: WorkerAgentEventDelivery = { type: "open" }
   #state: WorkerProcessState = { type: "awaiting_initialize" }
 
   constructor(output: Writable) {
@@ -401,6 +523,18 @@ class ExtensionWorkerProcess {
       return
     }
 
+    if (message.type === "agent_start" || message.type === "agent_settled") {
+      if (message.sequence <= this.#lastAgentEventSequence) {
+        this.#protocolFailure("Extension worker received a replayed agent event")
+        return
+      }
+      this.#lastAgentEventSequence = message.sequence
+      this.#enqueueAgentEvent(state.generation, state.extensions, {
+        sequence: message.sequence,
+        event: { type: message.type }
+      })
+      return
+    }
     if (message.type === "command_invoke" || message.type === "tool_invoke") {
       if (this.#invocations.size >= maxExtensionPendingRequests) {
         this.#protocolFailure(`Extension worker cannot run more than ${maxExtensionPendingRequests} invocations`)
@@ -596,10 +730,17 @@ class ExtensionWorkerProcess {
       },
       waitSubagents: (source, names, timeoutMs, signal) => {
         const settled = deferred<readonly ExtensionSubagentSnapshot[]>()
+        const ownerRequestId = this.#invocationOwner.getStore()
         this.#requestSessionOperation(
           generation,
           { type: "subagent_wait", settled },
-          { type: "subagent_wait", extensionId: source.id, names, ...(timeoutMs === undefined ? {} : { timeoutMs }) },
+          {
+            type: "subagent_wait",
+            extensionId: source.id,
+            ...(ownerRequestId === undefined ? {} : { ownerRequestId }),
+            names,
+            ...(timeoutMs === undefined ? {} : { timeoutMs })
+          },
           signal
         )
         return settled.promise
@@ -788,7 +929,9 @@ class ExtensionWorkerProcess {
       | { readonly type: "error"; readonly message: string }
     try {
       const commandArguments = validateExtensionCommandArguments(message.arguments)
-      const result = await extensions.invokeCommand(message.name, commandArguments, invocation.controller.signal)
+      const result = await this.#invocationOwner.run(message.requestId, () =>
+        extensions.invokeCommand(message.name, commandArguments, invocation.controller.signal)
+      )
       outcome = { type: "result", message: result }
     } catch (cause) {
       outcome = { type: "error", message: boundedExtensionCommandError(cause) }
@@ -824,7 +967,29 @@ class ExtensionWorkerProcess {
       | { readonly type: "error"; readonly message: string }
     try {
       const parameters = validateExtensionToolArguments(message.arguments)
-      const value = await extensions.invoke(message.name, parameters, invocation.controller.signal)
+      const value = await this.#invocationOwner.run(message.requestId, () =>
+        extensions.invoke(message.name, parameters, invocation.controller.signal, progress => {
+          const current = this.#invocations.get(message.requestId)
+          if (
+            !current ||
+            current.type !== "running" ||
+            current.controller !== invocation.controller ||
+            current.controller.signal.aborted
+          ) {
+            return
+          }
+          void this.#writer
+            .send(
+              validateWorkerMessage({
+                type: "tool_progress",
+                generation: message.generation,
+                requestId: message.requestId,
+                message: progress
+              })
+            )
+            .catch(cause => this.#fail(cause))
+        })
+      )
       outcome = { type: "result", value }
     } catch (cause) {
       outcome = { type: "error", message: boundedExtensionToolError(cause) }
@@ -881,17 +1046,114 @@ class ExtensionWorkerProcess {
     if (evicted !== undefined) this.#settledInvocationRequests.delete(evicted)
   }
 
+  #enqueueAgentEvent(generation: number, extensions: LoadedExtensionGeneration, event: WorkerAgentEvent): void {
+    const state = this.#agentEvents
+    if (state.type === "open") {
+      const settled = deferred()
+      const delivery: WorkerAgentEventDelivery = { type: "delivering", generation, extensions, pending: [], settled }
+      this.#agentEvents = delivery
+      void this.#deliverAgentEvents(delivery, event)
+      return
+    }
+    if (state.type !== "delivering") {
+      this.#protocolFailure("Extension worker received an agent event after event delivery closed")
+      return
+    }
+    if (state.extensions !== extensions) {
+      this.#protocolFailure("Extension worker received an agent event for a stale generation")
+      return
+    }
+    if (state.pending.length >= maxExtensionQueuedAgentEvents - 1) {
+      this.#protocolFailure(`Extension worker cannot queue more than ${maxExtensionQueuedAgentEvents} agent events`)
+      return
+    }
+    state.pending.push(event)
+  }
+
+  async #deliverAgentEvents(
+    delivery: Extract<WorkerAgentEventDelivery, { type: "delivering" }>,
+    first: WorkerAgentEvent
+  ): Promise<void> {
+    let current: WorkerAgentEvent | undefined = first
+    try {
+      while (current) {
+        // Events are observational but preserve host publication order.
+        // oxlint-disable-next-line no-await-in-loop
+        const result = await delivery.extensions.dispatchAgentEvent(current.event)
+        for (const diagnostic of result.diagnostics) {
+          // Keep bounded diagnostics ordered without filling the writer queue at once.
+          // oxlint-disable-next-line eslint/no-await-in-loop
+          await this.#writer.send({ type: "diagnostic", generation: delivery.generation, diagnostic })
+        }
+        if (result.omittedDiagnostics > 0) {
+          // oxlint-disable-next-line no-await-in-loop
+          await this.#writer.send({
+            type: "diagnostic",
+            generation: delivery.generation,
+            diagnostic: boundedExtensionDiagnostic({
+              phase: "event",
+              severity: "warning",
+              message: `${result.omittedDiagnostics} additional extension event diagnostics were omitted`
+            })
+          })
+        }
+        if (result.fatal) {
+          this.#fatal(delivery.generation, result.fatal, new Error(result.fatal.message))
+          return
+        }
+        // oxlint-disable-next-line no-await-in-loop
+        await this.#writer.send({
+          type: "agent_event_settled",
+          generation: delivery.generation,
+          sequence: current.sequence
+        })
+        if (this.#agentEvents !== delivery) return
+        current = delivery.pending.shift()
+      }
+      if (this.#agentEvents === delivery) this.#agentEvents = { type: "open" }
+    } catch (cause) {
+      this.#fail(cause)
+    } finally {
+      delivery.settled.resolve()
+    }
+  }
+
+  async #closeAgentEvents(): Promise<void> {
+    const state = this.#agentEvents
+    if (state.type === "closed") return
+    if (state.type === "open") {
+      this.#agentEvents = { type: "closed" }
+      return
+    }
+    if (state.type === "closing") {
+      await state.active.promise
+      return
+    }
+    const dropped = state.pending.splice(0)
+    this.#agentEvents = { type: "closing", active: state.settled }
+    for (const event of dropped) {
+      // Closed generations acknowledge dropped observations so host deadlines do not outlive shutdown.
+      // oxlint-disable-next-line no-await-in-loop
+      await this.#writer.send({ type: "agent_event_settled", generation: state.generation, sequence: event.sequence })
+    }
+    await state.settled.promise
+    if (this.#agentEvents.type === "closing" && this.#agentEvents.active === state.settled) {
+      this.#agentEvents = { type: "closed" }
+    }
+  }
+
   async #dispatch(
     extensions: LoadedExtensionGeneration,
     message: Extract<HostMessage, { type: "session_start" | "session_shutdown" }>,
     operation: VoidDeferred
   ): Promise<void> {
     try {
+      if (message.type === "session_shutdown") await this.#closeAgentEvents()
       const event: ExtensionLifecycleEvent =
         message.type === "session_start"
           ? { type: "session_start", reason: message.reason }
           : { type: "session_shutdown", reason: message.reason }
-      const result = await extensions.dispatch(event)
+      const result = await extensions.dispatch(event, message.type === "session_start" ? message.context : undefined)
       const state = this.#state
       if ((state.type !== "dispatching" && state.type !== "cancelling") || state.requestId !== message.requestId) return
       for (const diagnostic of result.diagnostics) {
@@ -931,6 +1193,7 @@ class ExtensionWorkerProcess {
 
   async #stop(message: Extract<HostMessage, { type: "stop" }>, operation: VoidDeferred): Promise<void> {
     try {
+      await this.#closeAgentEvents()
       const state = this.#state
       await this.#writer.send({ type: "settled", generation: message.generation, requestId: message.requestId })
       if (this.#state === state) {
@@ -1056,6 +1319,8 @@ export async function loadExtensionGeneration(
   const results: ExtensionLoadResult[] = []
   const startHandlers: StartHandler[] = []
   const shutdownHandlers: ShutdownHandler[] = []
+  const agentStartHandlers: AgentEventHandler<ExtensionAgentStartEvent>[] = []
+  const agentSettledHandlers: AgentEventHandler<ExtensionAgentSettledEvent>[] = []
   const commands: RegisteredCommand[] = []
   const commandNames = new Set<string>()
   const tools: RegisteredTool[] = []
@@ -1066,6 +1331,8 @@ export async function loadExtensionGeneration(
   for (const source of plan.sources) {
     const localStart: StartHandler[] = []
     const localShutdown: ShutdownHandler[] = []
+    const localAgentStart: AgentEventHandler<ExtensionAgentStartEvent>[] = []
+    const localAgentSettled: AgentEventHandler<ExtensionAgentSettledEvent>[] = []
     const localCommands: RegisteredCommand[] = []
     const localCommandNames = new Set<string>()
     const localTools: RegisteredTool[] = []
@@ -1092,28 +1359,49 @@ export async function loadExtensionGeneration(
         if (!acceptingRegistrations) throw new Error("Extension registration closed after factory settlement")
         if (typeof handler !== "function") throw new Error("Extension lifecycle handlers must be functions")
         if (
-          startHandlers.length + shutdownHandlers.length + localStart.length + localShutdown.length >=
-          maxExtensionLifecycleHandlers
+          startHandlers.length +
+            shutdownHandlers.length +
+            agentStartHandlers.length +
+            agentSettledHandlers.length +
+            localStart.length +
+            localShutdown.length +
+            localAgentStart.length +
+            localAgentSettled.length >=
+          maxExtensionEventHandlers
         ) {
-          throw new Error(
-            `Extension generations cannot register more than ${maxExtensionLifecycleHandlers} lifecycle handlers`
-          )
+          throw new Error(`Extension generations cannot register more than ${maxExtensionEventHandlers} event handlers`)
         }
         if (registeredEvent === "session_start") {
           localStart.push({
             source,
-            handler: lifecycleEvent => Promise.resolve(handler(lifecycleEvent)).then(() => undefined)
+            handler: (lifecycleEvent, context) =>
+              Promise.resolve(handler(lifecycleEvent, context)).then(() => undefined)
           })
           return
         }
         if (registeredEvent === "session_shutdown") {
           localShutdown.push({
             source,
-            handler: lifecycleEvent => Promise.resolve(handler(lifecycleEvent)).then(() => undefined)
+            handler: (lifecycleEvent, context) =>
+              Promise.resolve(handler(lifecycleEvent, context)).then(() => undefined)
           })
           return
         }
-        throw new Error(`Unknown extension lifecycle event: ${String(registeredEvent)}`)
+        if (registeredEvent === "agent_start") {
+          localAgentStart.push({
+            source,
+            handler: (agentEvent, context) => Promise.resolve(handler(agentEvent, context)).then(() => undefined)
+          })
+          return
+        }
+        if (registeredEvent === "agent_settled") {
+          localAgentSettled.push({
+            source,
+            handler: (agentEvent, context) => Promise.resolve(handler(agentEvent, context)).then(() => undefined)
+          })
+          return
+        }
+        throw new Error(`Unknown extension event: ${String(registeredEvent)}`)
       },
       registerCommand(value: unknown): void {
         if (!acceptingRegistrations) {
@@ -1221,6 +1509,8 @@ export async function loadExtensionGeneration(
       acceptingRegistrations = false
       startHandlers.push(...localStart)
       shutdownHandlers.push(...localShutdown)
+      agentStartHandlers.push(...localAgentStart)
+      agentSettledHandlers.push(...localAgentSettled)
       commands.push(...localCommands)
       for (const name of localCommandNames) commandNames.add(name)
       tools.push(...localTools)
@@ -1236,7 +1526,16 @@ export async function loadExtensionGeneration(
     }
   }
 
-  return new LoadedExtensionGeneration(results, startHandlers, shutdownHandlers, commands, tools, subagents)
+  return new LoadedExtensionGeneration(
+    results,
+    startHandlers,
+    shutdownHandlers,
+    agentStartHandlers,
+    agentSettledHandlers,
+    commands,
+    tools,
+    subagents
+  )
 }
 
 function registerCommand(source: ExtensionSource, value: unknown): RegisteredCommand {
@@ -1275,6 +1574,7 @@ function registerTool(source: ExtensionSource, value: unknown): RegisteredTool {
       label: value.label ?? value.name,
       description: value.description,
       active: value.active ?? true,
+      ...(value.timeoutMs === undefined ? {} : { timeoutMs: value.timeoutMs }),
       parameters: value.parameters,
       outputSchema: value.outputSchema ?? Type.String()
     })
@@ -1318,7 +1618,7 @@ function failedResult(
 
 function diagnosticFor(
   source: ExtensionSource,
-  phase: "import" | "factory" | "registration" | "lifecycle",
+  phase: "import" | "factory" | "registration" | "lifecycle" | "event",
   cause: unknown
 ): ExtensionDiagnostic {
   const error = cause instanceof Error ? cause : new Error(String(cause))
@@ -1330,7 +1630,9 @@ function diagnosticFor(
     message: error.message || error.name || "Unknown extension error",
     ...(error.stack ? { stack: error.stack } : {})
   }
-  return phase === "lifecycle" ? boundedExtensionDiagnostic(diagnostic) : boundedExtensionLoadDiagnostic(diagnostic)
+  return phase === "lifecycle" || phase === "event"
+    ? boundedExtensionDiagnostic(diagnostic)
+    : boundedExtensionLoadDiagnostic(diagnostic)
 }
 
 interface Deferred<T> {
@@ -1403,6 +1705,10 @@ function validateTimeout(timeoutMs: number): void {
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > 300_000) {
     throw new Error("Extension deadlines must contain 1 to 300000 milliseconds")
   }
+}
+
+function forbiddenAgentEvent(state: LifecycleState, event: ExtensionAgentEvent["type"]): Error {
+  return new Error(`Cannot dispatch ${event} while extension lifecycle is ${state.type}`)
 }
 
 function forbiddenLifecycle(state: LifecycleState, event: ExtensionLifecycleEvent["type"]): Error {

@@ -11,12 +11,13 @@ export default function (zi: ExtensionAPI): void {
       status: Schema.string({ description: "Concise Git status output" }),
       clean: Schema.boolean({ description: "Whether the selected worktree is clean" })
     }),
-    async execute({ path }, { signal }) {
+    async execute({ path }, context) {
+      context.reportProgress(path ? `Checking Git status for ${path}` : "Checking Git status")
       const child = Bun.spawn(["git", "status", "--short", ...(path ? ["--", path] : [])], {
         cwd: process.cwd(),
         stdout: "pipe",
         stderr: "pipe",
-        signal
+        signal: context.signal
       })
       const [exitCode, stdout, stderr] = await Promise.all([
         child.exited,
