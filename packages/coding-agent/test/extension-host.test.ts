@@ -316,7 +316,7 @@ test("worker session requests are source-attributed and domain refusals keep the
 
 test("subagent waits are bounded by their owning extension invocation", async () => {
   const workers = new TestWorkerSpawner()
-  workers.behaviors.push({ type: "tools" })
+  workers.behaviors.push({ type: "tools", timeoutMs: 5_000 })
   const timeouts = { ...testTimeouts, toolMs: 1_000 }
   const host = await ExtensionHost.create(planOne, workers.spawn, timeouts)
   const observedTimeouts: number[] = []
@@ -392,10 +392,10 @@ test("subagent waits are bounded by their owning extension invocation", async ()
     extensionId: sourceOne.id,
     ownerRequestId: owner.requestId,
     names: ["finder-1"],
-    timeoutMs: 100
+    timeoutMs: 2_000
   })
   await Bun.sleep(0)
-  expect(observedTimeouts).toEqual([100])
+  expect(observedTimeouts).toEqual([2_000])
   controller.abort()
   expect(invocation).rejects.toMatchObject({ name: "AbortError" })
   await Bun.sleep(0)
@@ -411,7 +411,7 @@ test("subagent waits are bounded by their owning extension invocation", async ()
     timeoutMs: 100
   })
   await Bun.sleep(0)
-  expect(observedTimeouts).toEqual([100])
+  expect(observedTimeouts).toEqual([2_000])
   expect(worker.messages).toContainEqual(expect.objectContaining({ type: "session_operation_error", requestId: 44 }))
   expect(await host.invokeTool("echo_message", { message: "again" })).toBe("AGAIN")
 
@@ -433,7 +433,7 @@ test("subagent waits are bounded by their owning extension invocation", async ()
     timeoutMs: 100
   })
   await Bun.sleep(0)
-  expect(observedTimeouts).toEqual([100, 100])
+  expect(observedTimeouts).toEqual([2_000, 100])
   worker.send({ type: "tool_result", generation: 1, requestId: completingOwner.requestId, value: "COMPLETED" })
   expect(await completing).toBe("COMPLETED")
   await Bun.sleep(0)
@@ -615,6 +615,22 @@ test("a tool deadline fails and terminates its generation", async () => {
     failure: { phase: "tool", extensionId: sourceOne.id, path: sourceOne.entryPath }
   })
   expect(workers.processes[0]!.terminated).toEqual(["SIGTERM"])
+  await host.dispose()
+})
+
+test("a declared tool timeout overrides the host default deadline", async () => {
+  const workers = new TestWorkerSpawner()
+  workers.behaviors.push({ type: "tools", timeoutMs: 1_000 })
+  const host = await ExtensionHost.create(planOne, workers.spawn, { ...testTimeouts, toolMs: 10 })
+  await host.sessionStart("startup", testExtensionContext)
+
+  const invocation = host.invokeTool("echo_message", { message: "pending" })
+  await Bun.sleep(20)
+  expect(host.snapshot()).toMatchObject({ status: "ready", lifecycle: "started" })
+  const request = workers.processes[0]!.messages.find(message => message.type === "tool_invoke")
+  if (!request || request.type !== "tool_invoke") throw new Error("Expected a tool invocation")
+  workers.processes[0]!.send({ type: "tool_result", generation: 1, requestId: request.requestId, value: "COMPLETED" })
+  expect(await invocation).toBe("COMPLETED")
   await host.dispose()
 })
 
@@ -883,11 +899,11 @@ type TestWorkerBehavior =
   | { readonly type: "ready" }
   | { readonly type: "wrong_ready" }
   | { readonly type: "fatal_start" }
+  | { readonly type: "tools"; readonly timeoutMs?: number }
   | {
       readonly type:
         | "commands"
         | "command_hang"
-        | "tools"
         | "active_tools"
         | "tool_hang"
         | "tool_cancel_crossing"
@@ -1012,7 +1028,12 @@ class TestWorkerProcess implements ExtensionWorkerProcess {
                 this.#behavior.type === "tool_hang" ||
                 this.#behavior.type === "tool_cancel_crossing" ||
                 this.#behavior.type === "malformed_tool"
-              ? [toolRegistration(this.#plan.sources[0]!)]
+              ? [
+                  toolRegistration(
+                    this.#plan.sources[0]!,
+                    this.#behavior.type === "tools" ? this.#behavior.timeoutMs : undefined
+                  )
+                ]
               : []
       })
       return
@@ -1139,13 +1160,14 @@ function commandRegistration(source: ExtensionSource) {
   return { source, name: "echo", description: "Echo command arguments", argumentHint: "[text]" } as const
 }
 
-function toolRegistration(source: ExtensionSource) {
+function toolRegistration(source: ExtensionSource, timeoutMs?: number) {
   return {
     source,
     name: "echo_message",
     label: "Echo",
     description: "Echo a message",
     active: true,
+    ...(timeoutMs === undefined ? {} : { timeoutMs }),
     parameters: { type: "object", required: ["message"], properties: { message: { type: "string" } } },
     outputSchema: { type: "string" }
   } as const

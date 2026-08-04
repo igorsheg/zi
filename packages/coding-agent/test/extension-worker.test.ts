@@ -209,6 +209,7 @@ export default function (zi): void {
     name: "echo_message",
     label: "Echo",
     description: "Echo one message",
+    timeoutMs: 5 * 60_000,
     parameters: Schema.object({ message: Schema.string() }),
     execute: ({ message }, { signal }) => {
       appendFileSync(${JSON.stringify(log)}, message + ":" + signal.aborted + "\\n")
@@ -227,6 +228,7 @@ export default function (zi): void {
       name: "echo_message",
       label: "Echo",
       description: "Echo one message",
+      timeoutMs: 5 * 60_000,
       parameters: { type: "object", properties: { message: { type: "string" } } },
       outputSchema: { type: "string" }
     }

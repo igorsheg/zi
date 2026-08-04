@@ -1574,6 +1574,7 @@ function registerTool(source: ExtensionSource, value: unknown): RegisteredTool {
       label: value.label ?? value.name,
       description: value.description,
       active: value.active ?? true,
+      ...(value.timeoutMs === undefined ? {} : { timeoutMs: value.timeoutMs }),
       parameters: value.parameters,
       outputSchema: value.outputSchema ?? Type.String()
     })

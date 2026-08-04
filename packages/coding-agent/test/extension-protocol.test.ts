@@ -31,6 +31,7 @@ import {
   maxExtensionToolProgressBytes,
   maxExtensionToolResultBytes,
   maxExtensionToolSchemaBytes,
+  maxExtensionToolTimeoutMs,
   maxExtensionTools,
   type HostMessage,
   validateHostMessage,
@@ -350,6 +351,36 @@ test("tool protocol validation closes registration, arguments, results, and corr
   })
   expect(ready).toMatchObject({ type: "ready", tools: [{ name: "echo_message", active: true }] })
   expect(Object.isFrozen(ready.type === "ready" ? ready.tools[0]?.parameters.properties : undefined)).toBe(true)
+  expect(
+    validateWorkerMessage({
+      type: "ready",
+      protocolVersion: extensionProtocolVersion,
+      generation: 1,
+      extensions: [{ source, status: "loaded" }],
+      commands: [],
+      tools: [{ ...registration, timeoutMs: 5 * 60_000 }]
+    })
+  ).toMatchObject({ tools: [{ timeoutMs: 5 * 60_000 }] })
+  expect(() =>
+    validateWorkerMessage({
+      type: "ready",
+      protocolVersion: extensionProtocolVersion,
+      generation: 1,
+      extensions: [{ source, status: "loaded" }],
+      commands: [],
+      tools: [{ ...registration, timeoutMs: 0 }]
+    })
+  ).toThrow("positive")
+  expect(() =>
+    validateWorkerMessage({
+      type: "ready",
+      protocolVersion: extensionProtocolVersion,
+      generation: 1,
+      extensions: [{ source, status: "loaded" }],
+      commands: [],
+      tools: [{ ...registration, timeoutMs: maxExtensionToolTimeoutMs + 1 }]
+    })
+  ).toThrow(`${maxExtensionToolTimeoutMs}ms`)
 
   const invoke = validateHostMessage({
     type: "tool_invoke",

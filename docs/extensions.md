@@ -107,7 +107,7 @@ Without `outputSchema`, a tool returns one bounded string. Declaring `outputSche
 
 `execute` receives an invocation-scoped `AbortSignal` and `reportProgress(message)`. Progress is bounded text for the current invocation: Zi forwards it through normal tool updates for terminal and embedding clients, including Code Mode calls. It is transient, does not enter provider context or the session journal, and is ignored after cancellation or settlement. Progress reporting does not extend the invocation deadline.
 
-Cancellation is cooperative: pass the signal to subprocess or I/O APIs and stop owned work promptly. Zi rejects late completion and terminates a worker that misses execution or cancellation deadlines.
+Tools default to a 30-second execution deadline. A tool with legitimately longer work may declare `timeoutMs` from 1 millisecond through one hour; this changes only that registration's absolute deadline and is not exposed to the model. Cancellation is cooperative: pass the signal to subprocess or I/O APIs and stop owned work promptly. Zi rejects late completion and terminates a worker that misses its declared execution or cancellation deadline.
 
 Large catalogs can register dormant tools with `active: false`, then replace that extension's model-visible subset at runtime:
 
@@ -138,7 +138,7 @@ zi.registerTool({
 
 Registration remains factory-time and statically reviewable. `active` defaults to `true`. Reload creates a new generation and restores each registration's `active` default. An extension that wants durable selection can read custom entries and call `setActiveTools(...)` from `session_start`.
 
-A generation may register up to 256 tools in a 2 MiB catalog. At most 64 extension tools and 512 KiB of their provider-facing definitions may be active. Per-tool names are limited to 64 bytes, descriptions to 4 KiB, schemas to 16 KiB, invocation arguments to 256 KiB, progress messages to 16 KiB, and results to 256 KiB.
+A generation may register up to 256 tools in a 2 MiB catalog. At most 64 extension tools and 512 KiB of their provider-facing definitions may be active. Per-tool names are limited to 64 bytes, descriptions to 4 KiB, schemas to 16 KiB, invocation arguments to 256 KiB, progress messages to 16 KiB, results to 256 KiB, and declared execution time to one hour.
 
 ### Programmatic subagent profiles
 

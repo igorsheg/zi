@@ -30,7 +30,7 @@ import {
   type ExtensionSource
 } from "./discovery.js"
 
-export const extensionProtocolVersion = 9
+export const extensionProtocolVersion = 10
 export const maxExtensionProtocolFrameBytes = 4 * 1024 * 1024
 export const maxExtensionPendingRequests = 128
 export const maxExtensionQueuedWriteBytes = 8 * 1024 * 1024
@@ -56,6 +56,7 @@ export const maxExtensionCommandArgumentHintBytes = 1024
 export const maxExtensionCommandArgumentsBytes = 256 * 1024
 export const maxExtensionCommandResultBytes = 16 * 1024
 export const extensionToolTimeoutMs = 30_000
+export const maxExtensionToolTimeoutMs = 60 * 60 * 1000
 export const extensionToolCancellationTimeoutMs = 1_000
 export const maxExtensionTools = 256
 export const maxExtensionToolCatalogBytes = 2 * 1024 * 1024
@@ -75,7 +76,7 @@ export const maxExtensionSubagentModelBytes = 4 * 1024
 export const maxExtensionSubagentInstructionsBytes = 8 * 1024
 export const maxExtensionSubagentTextBytes = 8 * 1024 * 1024 - maxExtensionSubagentInstructionsBytes - 16
 export const maxExtensionSubagentCompletionBytes = 64 * 1024
-export const maxExtensionSubagentWaitMs = 60 * 60 * 1000
+export const maxExtensionSubagentWaitMs = maxExtensionToolTimeoutMs
 export const maxExtensionSubagentCatalogBytes = 2 * 1024 * 1024
 export const maxExtensionJsonDepth = 32
 export const maxExtensionJsonNodes = 4096
@@ -115,7 +116,7 @@ export interface ExtensionLoadResult {
 export type HostMessage =
   | {
       readonly type: "initialize"
-      readonly protocolVersion: 9
+      readonly protocolVersion: 10
       readonly generation: number
       readonly plan: ExtensionLoadPlan
       readonly subagentsAvailable?: boolean
@@ -223,7 +224,7 @@ export type HostMessage =
 export type WorkerMessage =
   | {
       readonly type: "ready"
-      readonly protocolVersion: 9
+      readonly protocolVersion: 10
       readonly generation: number
       readonly extensions: readonly ExtensionLoadResult[]
       readonly commands: readonly ExtensionCommandRegistration[]
@@ -388,6 +389,7 @@ export interface ExtensionToolRegistration {
   readonly label: string
   readonly description: string
   readonly active: boolean
+  readonly timeoutMs?: number
   readonly parameters: Readonly<Record<string, JsonValue>>
   readonly outputSchema: Readonly<Record<string, JsonValue>>
 }
@@ -1243,6 +1245,7 @@ function extensionToolRegistration(value: unknown): ExtensionToolRegistration {
   const label = boundedRequiredText(tool.label, "tool label", maxExtensionToolLabelBytes)
   const description = boundedRequiredText(tool.description, "tool description", maxExtensionToolDescriptionBytes)
   const active = tool.active === undefined ? true : requiredBoolean(tool.active, "tool active")
+  const timeoutMs = tool.timeoutMs === undefined ? undefined : extensionToolTimeout(tool.timeoutMs)
   const parameters = jsonRecord(tool.parameters, "tool parameters", maxExtensionToolSchemaBytes)
   if (parameters.type !== "object") {
     throw new ExtensionProtocolError("Extension tool parameters must be an object schema")
@@ -1256,6 +1259,7 @@ function extensionToolRegistration(value: unknown): ExtensionToolRegistration {
     label,
     description,
     active,
+    ...(timeoutMs === undefined ? {} : { timeoutMs }),
     parameters,
     outputSchema
   })
@@ -1380,6 +1384,14 @@ function thinkingLevel(value: unknown): ExtensionThinkingLevel {
     throw new ExtensionProtocolError("Unknown subagent thinking level")
   }
   return value
+}
+
+function extensionToolTimeout(value: unknown): number {
+  const timeoutMs = positiveInteger(value, "tool timeoutMs")
+  if (timeoutMs > maxExtensionToolTimeoutMs) {
+    throw new ExtensionProtocolError(`Extension tool timeout cannot exceed ${maxExtensionToolTimeoutMs}ms`)
+  }
+  return timeoutMs
 }
 
 function subagentWaitTimeout(value: unknown): number {
@@ -1537,7 +1549,7 @@ function protocolArray(value: unknown, field: string): readonly unknown[] {
   return value
 }
 
-function protocolVersion(value: unknown): 9 {
+function protocolVersion(value: unknown): 10 {
   if (value !== extensionProtocolVersion) throw new ExtensionProtocolError("Unsupported extension protocol version")
   return extensionProtocolVersion
 }

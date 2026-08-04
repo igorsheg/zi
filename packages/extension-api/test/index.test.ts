@@ -135,6 +135,7 @@ test("tool schemas infer parameters and expose invocation-scoped progress", asyn
   const tool: ExtensionToolDefinition<typeof parameters> = {
     name: "echo_message",
     description: "Echo one message",
+    timeoutMs: 5 * 60_000,
     parameters,
     execute: async ({ message, suffix }, toolContext) => {
       toolContext.reportProgress(`Echoing ${message}`)
@@ -152,6 +153,7 @@ test("tool schemas infer parameters and expose invocation-scoped progress", asyn
     })
   ).toBe("hello")
   expect(progress).toEqual(["Echoing hello"])
+  expect(tool.timeoutMs).toBe(5 * 60_000)
 })
 
 test("tool output schemas infer structured execution results", async () => {

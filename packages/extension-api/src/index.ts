@@ -238,6 +238,7 @@ interface ExtensionToolDefinitionBase<TParameters extends TObject> {
   readonly label?: string
   readonly description: string
   readonly active?: boolean
+  readonly timeoutMs?: number
   readonly parameters: TParameters
 }
 

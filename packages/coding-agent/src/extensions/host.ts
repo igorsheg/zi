@@ -243,6 +243,7 @@ type GenerationCommandInvocation =
       readonly signal?: AbortSignal
       readonly onAbort?: () => void
       readonly deadlineAt: number
+      readonly timeoutMs: number
       readonly timeout: ReturnType<typeof setTimeout>
     }
   | {
@@ -253,6 +254,7 @@ type GenerationCommandInvocation =
       readonly signal: AbortSignal
       readonly onAbort: () => void
       readonly deadlineAt: number
+      readonly timeoutMs: number
       readonly timeout: ReturnType<typeof setTimeout>
     }
 
@@ -266,6 +268,7 @@ type GenerationToolInvocation =
       readonly onAbort?: () => void
       readonly onProgress?: (message: string) => void
       readonly deadlineAt: number
+      readonly timeoutMs: number
       readonly timeout: ReturnType<typeof setTimeout>
     }
   | {
@@ -277,6 +280,7 @@ type GenerationToolInvocation =
       readonly onAbort: () => void
       readonly onProgress?: (message: string) => void
       readonly deadlineAt: number
+      readonly timeoutMs: number
       readonly timeout: ReturnType<typeof setTimeout>
     }
 
@@ -568,10 +572,11 @@ class ExtensionGeneration {
     const requestId = this.#takeRequestId()
     const settled = deferred<string | undefined>()
     const onAbort = signal ? () => this.#cancelCommandInvocation(requestId) : undefined
-    const deadlineAt = Date.now() + this.#timeouts.commandMs
+    const timeoutMs = this.#timeouts.commandMs
+    const deadlineAt = Date.now() + timeoutMs
     const timeout = setTimeout(
       () => this.#commandInvocationTimedOut(requestId, "Extension command deadline exceeded"),
-      this.#timeouts.commandMs
+      timeoutMs
     )
     timeout.unref?.()
     const invocation: GenerationCommandInvocation = {
@@ -582,6 +587,7 @@ class ExtensionGeneration {
       ...(signal ? { signal } : {}),
       ...(onAbort ? { onAbort } : {}),
       deadlineAt,
+      timeoutMs,
       timeout
     }
     this.#commandInvocations.set(requestId, invocation)
@@ -617,10 +623,11 @@ class ExtensionGeneration {
     const requestId = this.#takeRequestId()
     const settled = deferred<JsonValue>()
     const onAbort = signal ? () => this.#cancelToolInvocation(requestId) : undefined
-    const deadlineAt = Date.now() + this.#timeouts.toolMs
+    const timeoutMs = registration.timeoutMs ?? this.#timeouts.toolMs
+    const deadlineAt = Date.now() + timeoutMs
     const timeout = setTimeout(
       () => this.#toolInvocationTimedOut(requestId, "Extension tool deadline exceeded"),
-      this.#timeouts.toolMs
+      timeoutMs
     )
     timeout.unref?.()
     const invocation: GenerationToolInvocation = {
@@ -632,6 +639,7 @@ class ExtensionGeneration {
       ...(onAbort ? { onAbort } : {}),
       ...(onProgress ? { onProgress } : {}),
       deadlineAt,
+      timeoutMs,
       timeout
     }
     this.#toolInvocations.set(requestId, invocation)
@@ -662,10 +670,9 @@ class ExtensionGeneration {
       throw new Error("Extension subagent wait owner belongs to another extension")
     }
     const timeoutMs = requestedTimeoutMs ?? defaultTimeoutMs
-    const invocationTimeoutMs = command ? this.#timeouts.commandMs : this.#timeouts.toolMs
     const settlementMarginMs = Math.min(
       extensionOwnedWaitSettlementMarginMs,
-      Math.max(1, Math.floor(invocationTimeoutMs / 10))
+      Math.max(1, Math.floor(invocation.timeoutMs / 10))
     )
     const remainingMs = Math.max(0, invocation.deadlineAt - Date.now() - settlementMarginMs)
     if (timeoutMs > remainingMs) {
@@ -764,6 +771,7 @@ class ExtensionGeneration {
       signal: invocation.signal,
       onAbort: invocation.onAbort,
       deadlineAt: invocation.deadlineAt,
+      timeoutMs: invocation.timeoutMs,
       timeout
     }
     this.#abortOwnedSessionOperations(requestId)
@@ -823,6 +831,7 @@ class ExtensionGeneration {
       onAbort: invocation.onAbort,
       ...(invocation.onProgress ? { onProgress: invocation.onProgress } : {}),
       deadlineAt: invocation.deadlineAt,
+      timeoutMs: invocation.timeoutMs,
       timeout
     }
     this.#abortOwnedSessionOperations(requestId)
