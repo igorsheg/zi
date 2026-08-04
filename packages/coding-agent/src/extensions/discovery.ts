@@ -5,6 +5,8 @@ import { isAbsolute, join, resolve } from "node:path"
 import type { ZiPaths } from "../paths.js"
 import type { ProjectConfigurationAdmission } from "../project-trust.js"
 import { canonicalResourcePath, readResourceDirectory } from "../resource-files.js"
+import { resolveResourceRoots } from "../resource-roots.js"
+import type { SettingsManager } from "../settings-manager.js"
 import type { ExtensionDiagnostic } from "./protocol.js"
 
 export const maxExtensionSources = 128
@@ -17,7 +19,7 @@ export interface ExtensionSource {
   readonly declaredPath: string
   readonly entryPath: string
   readonly scope: "global" | "project" | "temporary"
-  readonly origin: "directory" | "package" | "cli"
+  readonly origin: "directory" | "settings" | "package" | "cli"
 }
 
 export interface ExtensionLoadPlan {
@@ -51,7 +53,10 @@ class Discovery {
   readonly #diagnostics: ExtensionDiscoveryDiagnostic[] = []
   #omittedDiagnostics = 0
 
-  constructor(readonly paths: ZiPaths) {}
+  constructor(
+    readonly paths: ZiPaths,
+    readonly settings: SettingsManager | undefined
+  ) {}
 
   run(project: ProjectConfigurationAdmission, explicitPaths: readonly string[]): ExtensionDiscoveryResult {
     if (project !== "trusted" && project !== "untrusted" && project !== "absent") {
@@ -69,10 +74,10 @@ class Discovery {
       })
     }
 
-    if (project === "trusted" && !this.paths.projectConfigIsGlobal) {
-      this.#discoverDirectory(this.paths.projectResourceDir("extensions"), "project", "directory")
+    for (const root of resolveResourceRoots(this.paths, this.settings, project, "extensions")) {
+      if (root.source === "settings") this.#discoverConfigured(root.path, root.scope)
+      else this.#discoverDirectory(root.path, root.scope, "directory")
     }
-    this.#discoverDirectory(this.paths.globalResourceDir("extensions"), "global", "directory")
 
     const sources = Object.freeze([...this.#sources])
     return Object.freeze({
@@ -135,6 +140,57 @@ class Discovery {
     }
     if (this.#discoverDirectory(path, "temporary", "cli") === 0) {
       this.#diagnose({ type: "unsupported", path, message: "Extension directory has no supported entry points" })
+    }
+  }
+
+  #discoverConfigured(path: string, scope: "global" | "project"): void {
+    const inspection = inspectExtensionPath(path)
+    if (inspection.type === "missing") {
+      this.#diagnose({ type: "missing", path, message: "Configured extension path does not exist" })
+      return
+    }
+    if (inspection.type === "unreadable") {
+      this.#diagnose({ type: "unreadable", path, message: inspection.message })
+      return
+    }
+    if (inspection.type === "unsupported") {
+      this.#diagnose({ type: "unsupported", path, message: "Configured extension path is not a file or directory" })
+      return
+    }
+    if (inspection.type === "file") {
+      if (!isExtensionFile(path)) {
+        this.#diagnose({ type: "unsupported", path, message: "Extension files must end in .ts or .js" })
+        return
+      }
+      if (!this.#add({ declaredPath: path, entryPath: path, scope, origin: "settings" })) {
+        this.#diagnose({
+          type: "limit",
+          path,
+          message: `Extension sources cannot exceed ${maxExtensionSources}`,
+          omitted: 1
+        })
+      }
+      return
+    }
+
+    const entry = this.#directoryEntry(path)
+    if (entry) {
+      if (!this.#add({ declaredPath: path, entryPath: entry, scope, origin: "settings" })) {
+        this.#diagnose({
+          type: "limit",
+          path,
+          message: `Extension sources cannot exceed ${maxExtensionSources}`,
+          omitted: 1
+        })
+      }
+      return
+    }
+    if (this.#discoverDirectory(path, scope, "settings") === 0) {
+      this.#diagnose({
+        type: "unsupported",
+        path,
+        message: "Configured extension directory has no supported entry points"
+      })
     }
   }
 
@@ -303,9 +359,10 @@ class Discovery {
 export function discoverExtensionLoadPlan(
   paths: ZiPaths,
   project: ProjectConfigurationAdmission,
-  explicitPaths: readonly string[] = []
+  explicitPaths: readonly string[] = [],
+  settings?: SettingsManager
 ): ExtensionDiscoveryResult {
-  return new Discovery(paths).run(project, explicitPaths)
+  return new Discovery(paths, settings).run(project, explicitPaths)
 }
 
 export function extensionDiscoveryDiagnostic(value: ExtensionDiscoveryDiagnostic): ExtensionDiagnostic {

@@ -69,7 +69,8 @@ export async function createUnboundAgentRuntime(requested: CreateAgentRuntimeOpt
   const paths = new ZiPaths(cwd, agentDir, sessionDir)
   const projectTrust = await resolveProjectTrust(paths, options.projectTrust)
   const project = projectConfigurationAdmission(projectTrust)
-  const extensions = discoverExtensionLoadPlan(paths, project, options.extensionPaths ?? [])
+  const settingsManager = SettingsManager.create(paths, project, options.settings ?? {})
+  const extensions = discoverExtensionLoadPlan(paths, project, options.extensionPaths ?? [], settingsManager)
   const processTreeTracker = createProcessTreeTracker()
   const extensionHost = new ExtensionHost(
     createExtensionWorkerSpawner(options.extensionWorkerCommand ?? defaultExtensionWorkerCommand, processTreeTracker),
@@ -83,13 +84,13 @@ export async function createUnboundAgentRuntime(requested: CreateAgentRuntimeOpt
       extensions.omittedDiagnostics
     )
     await extensionHost.start(extensions.plan)
-    const settingsManager = SettingsManager.create(paths, project, options.settings ?? {})
     const credentialStore = new FileCredentialStore(paths)
     const models = options.modelFactory?.(credentialStore) ?? builtinModels({ credentials: credentialStore })
     const modelRegistry = new ModelRegistry(models)
     const resourceLoader = new ResourceLoader({
       paths,
       project,
+      settingsManager,
       ...(options.systemPrompt === undefined ? {} : { systemPrompt: options.systemPrompt }),
       ...(options.appendSystemPrompt === undefined ? {} : { appendSystemPrompt: options.appendSystemPrompt })
     })

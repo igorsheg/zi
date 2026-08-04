@@ -141,11 +141,10 @@ export async function resolveProjectTrust(
       throw new Error(`Project trust decision for ${decisionCwd} does not match runtime cwd ${cwd}`)
     }
   }
-  if (paths.projectConfigIsGlobal) {
+  const hasProjectConfiguration = hasTrustRequiringProjectConfiguration(paths)
+  if (paths.projectConfigIsGlobal && !hasProjectConfiguration) {
     return Object.freeze({ type: "not_required", cwd, reason: "project_configuration_is_global" })
   }
-
-  const hasProjectConfiguration = hasTrustRequiringProjectConfiguration(paths)
   if (decision !== undefined) {
     if (decision.type === "trusted") {
       return Object.freeze({ type: "trusted", cwd, source: decision.source })
@@ -197,17 +196,7 @@ export function projectConfigurationAdmission(trust: ProjectTrustResolution): Pr
 }
 
 export function hasTrustRequiringProjectConfiguration(paths: ZiPaths): boolean {
-  if (paths.projectConfigIsGlobal) return false
-  return [
-    paths.projectSettingsFile,
-    paths.projectSystemPromptFile,
-    paths.projectAppendSystemPromptFile,
-    paths.projectResourceDir("extensions"),
-    paths.projectResourceDir("skills"),
-    paths.projectResourceDir("prompts"),
-    paths.projectResourceDir("subagents"),
-    paths.projectResourceDir("themes")
-  ].some(existsSync)
+  return trustRequiringProjectConfigurationPath(paths) !== undefined
 }
 
 function validateProjectTrustDecision(decision: unknown): asserts decision is ProjectTrustDecision {
@@ -222,19 +211,28 @@ function validateProjectTrustDecision(decision: unknown): asserts decision is Pr
 }
 
 function untrustedDiagnostic(paths: ZiPaths, cwd: string): ProjectTrustDiagnostic {
-  return Object.freeze({
-    cwd,
-    path: paths.projectDir,
-    message: `Project configuration is not trusted and was ignored: ${paths.projectDir}`
-  })
+  const path = trustRequiringProjectConfigurationPath(paths) ?? paths.projectDir
+  return Object.freeze({ cwd, path, message: `Project configuration is not trusted and was ignored: ${path}` })
 }
 
 function unresolvedDiagnostic(paths: ZiPaths, cwd: string): ProjectTrustDiagnostic {
-  return Object.freeze({
-    cwd,
-    path: paths.projectDir,
-    message: `Project configuration trust is unresolved and was ignored: ${paths.projectDir}`
-  })
+  const path = trustRequiringProjectConfigurationPath(paths) ?? paths.projectDir
+  return Object.freeze({ cwd, path, message: `Project configuration trust is unresolved and was ignored: ${path}` })
+}
+
+function trustRequiringProjectConfigurationPath(paths: ZiPaths): string | undefined {
+  const projectDirectoryConfiguration = [
+    paths.projectSettingsFile,
+    paths.projectSystemPromptFile,
+    paths.projectAppendSystemPromptFile,
+    paths.projectResourceDir("extensions"),
+    paths.projectResourceDir("skills"),
+    paths.projectResourceDir("prompts"),
+    paths.projectResourceDir("subagents"),
+    paths.projectResourceDir("themes")
+  ]
+  if (!paths.projectConfigIsGlobal && projectDirectoryConfiguration.some(existsSync)) return paths.projectDir
+  return paths.projectAgentsSkillDirs.find(existsSync)
 }
 
 function canonicalProjectPath(path: string): string {

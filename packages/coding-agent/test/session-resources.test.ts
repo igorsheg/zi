@@ -82,6 +82,31 @@ test("AgentSession owns resource catalogs, prompt construction, and command expa
   }
 })
 
+test("runtime resource assembly consumes configured settings paths", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "zi-session-configured-resources-"))
+  const globalDir = join(cwd, "global")
+  const skillPath = join(globalDir, "configured-skills", "review", "SKILL.md")
+  await mkdir(join(globalDir, "configured-skills", "review"), { recursive: true })
+  await writeFile(join(globalDir, "settings.json"), JSON.stringify({ skills: ["configured-skills"] }))
+  await writeFile(
+    skillPath,
+    "---\nname: configured\ndescription: Configured runtime skill\n---\nUse the configured skill."
+  )
+
+  const { session } = await createAgentRuntime({
+    cwd,
+    agentDir: globalDir,
+    models: createModels(),
+    session: { type: "new", persist: false }
+  })
+
+  try {
+    expect(session.skills.map(skill => [skill.name, skill.filePath])).toEqual([["configured", skillPath]])
+  } finally {
+    session.dispose()
+  }
+})
+
 test("steering and follow-up queues retain expanded resource input", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "zi-queued-resources-"))
   const paths = new ZiPaths(cwd, join(cwd, "global"))

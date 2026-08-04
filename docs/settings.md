@@ -48,11 +48,28 @@ Its two-step picker exposes Fast Mode. On sends `text.verbosity: "low"` and `ser
   "retryBaseDelayMs": 2000,
   "compactionEnabled": true,
   "compactionReserveTokens": 16384,
-  "compactionKeepRecentTokens": 20000
+  "compactionKeepRecentTokens": 20000,
+  "skills": ["~/.codex/skills"]
 }
 ```
 
 Provider and model should move together. If a project needs a different model, set both `defaultProvider` and `defaultModel` in the project settings file.
+
+## Resource paths
+
+Use typed arrays to add local resource files or directories:
+
+```json
+{
+  "extensions": ["~/agent-resources/extensions"],
+  "skills": ["~/.codex/skills", "~/agent-resources/skills"],
+  "prompts": ["~/agent-resources/prompts"]
+}
+```
+
+These paths are additive; conventional `.zi` locations continue to load. Paths in global settings resolve relative to `$HOME/.zi/agent/`. Paths in project settings resolve relative to `<cwd>/.zi/`. Absolute paths and leading `~` are supported. Project entries load only after project trust and precede conventional project resources with the same name.
+
+Each array accepts at most 128 file or directory paths, with each path bounded at 4096 bytes.
 
 ## Fields
 
@@ -97,6 +114,15 @@ Provider and model should move together. If a project needs a different model, s
 
 `compactionKeepRecentTokens`
 : Recent context preserved around a compaction boundary.
+
+`extensions`
+: Additional extension files or directories.
+
+`skills`
+: Additional skill files or directories.
+
+`prompts`
+: Additional prompt-template files or directories.
 
 ## Invalid settings
 

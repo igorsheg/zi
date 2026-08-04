@@ -1113,7 +1113,7 @@ function extensionSource(value: unknown): ExtensionSource {
     throw new ExtensionProtocolError("Unknown extension scope")
   }
   const origin = source.origin
-  if (origin !== "directory" && origin !== "package" && origin !== "cli") {
+  if (origin !== "directory" && origin !== "settings" && origin !== "package" && origin !== "cli") {
     throw new ExtensionProtocolError("Unknown extension origin")
   }
   return Object.freeze({ id, declaredPath, entryPath, scope, origin })

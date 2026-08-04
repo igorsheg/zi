@@ -54,6 +54,44 @@ test("AgentSession owns one discovered extension lifecycle through final disposa
   await rm(fixture.root, { recursive: true, force: true })
 }, 10_000)
 
+test("runtime extension discovery consumes configured settings paths", async () => {
+  const fixture = await extensionFixture("settings-path")
+  const configured = join(fixture.agentDir, "configured", "lifecycle.ts")
+  await mkdir(join(fixture.agentDir, "configured"), { recursive: true })
+  await copyFile(join(fixture.agentDir, "extensions", "lifecycle.ts"), configured)
+  await rm(join(fixture.agentDir, "extensions"), { recursive: true })
+  await writeFile(join(fixture.agentDir, "settings.json"), JSON.stringify({ extensions: ["configured/lifecycle.ts"] }))
+
+  const runtime = await createAgentRuntime({
+    cwd: fixture.cwd,
+    agentDir: fixture.agentDir,
+    session: { type: "new", persist: false },
+    extensionWorkerCommand: workerCommand
+  })
+
+  try {
+    expect(runtime.session.extensionHostSnapshot).toMatchObject({
+      status: "ready",
+      extensions: [{ status: "loaded", source: { declaredPath: configured, origin: "settings" } }]
+    })
+    await waitForFile(fixture.lifecycle)
+
+    const reloaded = join(fixture.agentDir, "configured", "reloaded.ts")
+    await copyFile(configured, reloaded)
+    await writeFile(join(fixture.agentDir, "settings.json"), JSON.stringify({ extensions: ["configured/reloaded.ts"] }))
+
+    expect(await runtime.session.reload()).toMatchObject({ extensions: { outcome: "replaced" } })
+    expect(runtime.session.extensionHostSnapshot).toMatchObject({
+      status: "ready",
+      extensions: [{ status: "loaded", source: { declaredPath: reloaded, origin: "settings" } }]
+    })
+  } finally {
+    runtime.session.dispose()
+    await runtime.session.waitForIdle()
+    await rm(fixture.root, { recursive: true, force: true })
+  }
+}, 10_000)
+
 test("AgentSession publishes one final settled notification after a turn", async () => {
   const root = await mkdtemp(join(tmpdir(), "zi-runtime-extension-agent-events-"))
   const cwd = join(root, "project")

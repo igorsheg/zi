@@ -174,7 +174,7 @@ export function projectTrustFrame(
   return {
     id: promptPickerFrameIds.projectTrust,
     title: "Project trust",
-    hint: "Project .zi settings, prompts, skills, subagent profiles, themes, and executable extensions are currently ignored.",
+    hint: "Project .zi configuration and ancestor .agents skills are currently ignored.",
     footer: disabled ? "Applying project trust…" : cwd,
     filter: "none",
     disabled,

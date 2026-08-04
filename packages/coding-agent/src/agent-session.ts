@@ -1108,7 +1108,8 @@ export class AgentSession {
         const discovery = discoverExtensionLoadPlan(
           this.#reload.paths,
           this.#reload.project,
-          this.#reload.extensionPaths
+          this.#reload.extensionPaths,
+          this.settingsManager
         )
         extensions = await this.#extensionHost.reload(
           {

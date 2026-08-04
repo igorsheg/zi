@@ -30,6 +30,7 @@ export interface Skill {
 export interface SkillRoot {
   readonly path: string
   readonly scope: ResourceScope
+  readonly includeRootFiles?: boolean
 }
 
 export function loadSkills(
@@ -150,8 +151,13 @@ export function loadSkills(
 
   for (const root of roots) {
     if (skillLimitReached) break
-    if (resourcePathType(root.path) !== "directory") continue
-    scan(root.path, root.scope, true, new ResourceIgnore(root.path))
+    const type = resourcePathType(root.path)
+    if (type === "file") {
+      if (root.path.endsWith(".md")) addSkill(root.path, root.scope)
+      continue
+    }
+    if (type !== "directory") continue
+    scan(root.path, root.scope, root.includeRootFiles ?? true, new ResourceIgnore(root.path))
   }
   return [...skills.values()]
 }

@@ -27,15 +27,21 @@ Global skills load from:
 
 ```text
 $HOME/.zi/agent/skills/
+$HOME/.agents/skills/
 ```
 
 Trusted project skills load from:
 
 ```text
 <cwd>/.zi/skills/
+<cwd-or-ancestor>/.agents/skills/
 ```
 
-Project skills precede global skills with the same name. Zi visits bounded resource trees, ignores hidden directories and `node_modules`, and honors resource ignore files. Run `/reload` after adding or changing a skill in an active interactive session.
+Zi checks `.agents/skills/` from the working directory upward to the Git repository root, or to the filesystem root outside Git. These shared Agent Skills locations discover directories containing `SKILL.md`; direct root Markdown files there are ignored.
+
+Additional files or directories can be listed in the [`skills` settings array](settings.md#resource-paths). Precedence is project settings, project `.zi`, nearest project `.agents`, global settings, global `.zi`, then global `.agents`. The first valid skill with a given name wins.
+
+Project resources precede global skills with the same name. Zi visits bounded resource trees, ignores hidden directories and `node_modules`, and honors resource ignore files. Run `/reload` after adding or changing a skill in an active interactive session.
 
 A skill may be a root Markdown file such as `skills/review.md`, but a directory with `SKILL.md` is preferred when the skill includes supporting references, scripts, or examples:
 

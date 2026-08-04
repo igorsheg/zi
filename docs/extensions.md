@@ -19,10 +19,12 @@ Extensions run as the current user. They can read files and environment variable
 Zi discovers entry points in deterministic order:
 
 1. repeated `--extension <path>` arguments;
-2. `<cwd>/.zi/extensions/`, when trusted;
-3. `$HOME/.zi/agent/extensions/`.
+2. the project [`extensions` settings array](settings.md#resource-paths), when trusted;
+3. `<cwd>/.zi/extensions/`, when trusted;
+4. the global `extensions` settings array;
+5. `$HOME/.zi/agent/extensions/`.
 
-A directory entry may use `index.ts`; a direct `.ts` file also works. TypeScript and relative imports load without a build. Install third-party dependencies in the extension's own package hierarchy so normal bare-module resolution can find them.
+Settings paths may name one extension file or a directory. A directory entry may use `index.ts`; a direct `.ts` file also works. TypeScript and relative imports load without a build. Install third-party dependencies in the extension's own package hierarchy so normal bare-module resolution can find them.
 
 Start with [`examples/extensions/custom-tool/index.ts`](../examples/extensions/custom-tool/index.ts). For a dormant catalog, see [`examples/extensions/deferred-tools/index.ts`](../examples/extensions/deferred-tools/index.ts). For session persistence and custom messages, see [`examples/extensions/durable-counter/index.ts`](../examples/extensions/durable-counter/index.ts). For programmatic subagent profiles, see [`examples/extensions/subagents/index.ts`](../examples/extensions/subagents/index.ts). For an observational terminal integration, see [`examples/extensions/herdr-agent-state/index.ts`](../examples/extensions/herdr-agent-state/index.ts).
 

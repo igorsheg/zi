@@ -4,7 +4,7 @@ import type { ExtensionMode } from "@with-zi/extension-api"
 
 import { maxExplicitExtensionPaths } from "./extensions/discovery.js"
 import type { ProjectTrustDecision } from "./project-trust.js"
-import type { AgentSettings } from "./settings-manager.js"
+import { maxConfiguredResourcePaths, type AgentSettings } from "./settings-manager.js"
 
 export type AgentRuntimeSessionIntent =
   | { readonly type: "new"; readonly persist: boolean }
@@ -42,7 +42,7 @@ export function snapshotAgentRuntimeOptions(options: CreateAgentRuntimeOptions):
     ...(options.appendSystemPrompt === undefined
       ? {}
       : { appendSystemPrompt: Object.freeze([...options.appendSystemPrompt]) }),
-    ...(options.settings === undefined ? {} : { settings: Object.freeze({ ...options.settings }) }),
+    ...(options.settings === undefined ? {} : { settings: snapshotSettings(options.settings) }),
     ...(options.extensionPaths === undefined
       ? {}
       : { extensionPaths: snapshotStrings(options.extensionPaths, maxExplicitExtensionPaths, "Extension paths") }),
@@ -62,6 +62,21 @@ export function snapshotAgentRuntimeOptions(options: CreateAgentRuntimeOptions):
     ...(options.internalSubagentEnvironment === undefined
       ? {}
       : { internalSubagentEnvironment: snapshotEnvironment(options.internalSubagentEnvironment) })
+  })
+}
+
+function snapshotSettings(settings: Readonly<Partial<AgentSettings>>): Readonly<Partial<AgentSettings>> {
+  return Object.freeze({
+    ...settings,
+    ...(settings.extensions === undefined
+      ? {}
+      : { extensions: snapshotStrings(settings.extensions, maxConfiguredResourcePaths, "Extension settings paths") }),
+    ...(settings.skills === undefined
+      ? {}
+      : { skills: snapshotStrings(settings.skills, maxConfiguredResourcePaths, "Skill settings paths") }),
+    ...(settings.prompts === undefined
+      ? {}
+      : { prompts: snapshotStrings(settings.prompts, maxConfiguredResourcePaths, "Prompt settings paths") })
   })
 }
 

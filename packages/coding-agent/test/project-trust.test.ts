@@ -151,6 +151,22 @@ test("coincident global and project configuration is already user-admitted", asy
   expect(projectConfigurationAdmission(trust)).toBe("trusted")
 })
 
+test("coincident .zi roots do not implicitly admit separate project .agents skills", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-project-trust-global-agents-"))
+  const home = join(root, "home")
+  const cwd = join(root, "repository")
+  await mkdir(join(cwd, ".git"), { recursive: true })
+  await mkdir(join(cwd, ".agents", "skills"), { recursive: true })
+  const paths = new ZiPaths(cwd, join(cwd, ".zi"), undefined, home)
+
+  expect(paths.projectConfigIsGlobal).toBe(true)
+  expect(hasTrustRequiringProjectConfiguration(paths)).toBe(true)
+  expect(await resolveProjectTrust(paths)).toMatchObject({
+    type: "unresolved",
+    diagnostic: { path: join(cwd, ".agents", "skills") }
+  })
+})
+
 test("a project without protected configuration remains absent until an explicit write", async () => {
   const root = await mkdtemp(join(tmpdir(), "zi-project-trust-absent-"))
   const cwd = join(root, "project")
@@ -160,6 +176,27 @@ test("a project without protected configuration remains absent until an explicit
   const trust = await resolveProjectTrust(paths)
   expect(trust).toEqual({ type: "not_required", cwd: await realpath(cwd), reason: "no_project_configuration" })
   expect(projectConfigurationAdmission(trust)).toBe("absent")
+})
+
+test("project .agents skills require trust while the global .agents location remains admitted", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-project-trust-agents-"))
+  const home = join(root, "home")
+  const repository = join(root, "repository")
+  const cwd = join(repository, "packages", "app")
+  await mkdir(join(repository, ".git"), { recursive: true })
+  await mkdir(cwd, { recursive: true })
+  const paths = new ZiPaths(cwd, join(home, ".zi", "agent"), undefined, home)
+
+  await mkdir(paths.globalAgentsSkillsDir, { recursive: true })
+  expect(hasTrustRequiringProjectConfiguration(paths)).toBe(false)
+
+  const projectAgentsSkills = join(repository, ".agents", "skills")
+  await mkdir(projectAgentsSkills, { recursive: true })
+  expect(hasTrustRequiringProjectConfiguration(paths)).toBe(true)
+  expect(await resolveProjectTrust(paths)).toMatchObject({
+    type: "unresolved",
+    diagnostic: { path: projectAgentsSkills, message: expect.stringContaining(projectAgentsSkills) }
+  })
 })
 
 test("project trust detects only exact project configuration that requires admission", async () => {

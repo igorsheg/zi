@@ -37,9 +37,62 @@ export function loadPromptTemplates(
   const templates = new Map<string, PromptTemplate>()
   const files = new Set<string>()
   let limitReported = false
+  let limitReached = false
+
+  const addTemplate = (filePath: string, scope: ResourceScope): void => {
+    const canonical = canonicalResourcePath(filePath)
+    if (files.has(canonical)) return
+    files.add(canonical)
+
+    const loaded = loadPromptTemplate(filePath, scope, diagnostics)
+    if (!loaded) return
+    const winner = templates.get(loaded.template.name)
+    if (winner) {
+      diagnostics.add({
+        type: "collision",
+        resource: "prompt-template",
+        name: loaded.template.name,
+        winnerPath: winner.filePath,
+        loserPath: loaded.template.filePath
+      })
+      return
+    }
+    if (templates.size === maxPromptTemplateCount) {
+      if (!limitReported) {
+        limitReported = true
+        diagnostics.add({
+          type: "limit",
+          resource: "prompt-template",
+          limit: maxPromptTemplateCount,
+          path: filePath,
+          message: `At most ${maxPromptTemplateCount} prompt templates can be loaded`
+        })
+      }
+      limitReached = true
+      return
+    }
+    if (!budget.retain(loaded.bytes)) {
+      diagnostics.add({
+        type: "limit",
+        resource: "prompt-template",
+        limit: budget.limit,
+        path: filePath,
+        message: `Session resources cannot retain more than ${budget.limit} bytes`
+      })
+      return
+    }
+    templates.set(loaded.template.name, loaded.template)
+  }
 
   for (const root of roots) {
-    if (resourcePathType(root.path) !== "directory") continue
+    if (limitReached) break
+    const type = resourcePathType(root.path)
+    if (type === "file") {
+      if (root.path.endsWith(".md")) addTemplate(root.path, root.scope)
+      continue
+    }
+    if (type !== "directory") continue
+
     let directory: ReturnType<typeof readResourceDirectory>
     try {
       directory = readResourceDirectory(root.path)
@@ -60,49 +113,11 @@ export function loadPromptTemplates(
     const ignored = new ResourceIgnore(root.path)
     ignored.enter(root.path)
     for (const entry of directory.entries) {
+      if (limitReached) break
       if (entry.name.startsWith(".") || !entry.name.endsWith(".md")) continue
       const filePath = join(root.path, entry.name)
       if (resourcePathType(filePath) !== "file" || ignored.ignores(filePath)) continue
-      const canonical = canonicalResourcePath(filePath)
-      if (files.has(canonical)) continue
-      files.add(canonical)
-      const loaded = loadPromptTemplate(filePath, root.scope, diagnostics)
-      if (!loaded) continue
-      const winner = templates.get(loaded.template.name)
-      if (winner) {
-        diagnostics.add({
-          type: "collision",
-          resource: "prompt-template",
-          name: loaded.template.name,
-          winnerPath: winner.filePath,
-          loserPath: loaded.template.filePath
-        })
-        continue
-      }
-      if (templates.size === maxPromptTemplateCount) {
-        if (!limitReported) {
-          limitReported = true
-          diagnostics.add({
-            type: "limit",
-            resource: "prompt-template",
-            limit: maxPromptTemplateCount,
-            path: filePath,
-            message: `At most ${maxPromptTemplateCount} prompt templates can be loaded`
-          })
-        }
-        break
-      }
-      if (!budget.retain(loaded.bytes)) {
-        diagnostics.add({
-          type: "limit",
-          resource: "prompt-template",
-          limit: budget.limit,
-          path: filePath,
-          message: `Session resources cannot retain more than ${budget.limit} bytes`
-        })
-        continue
-      }
-      templates.set(loaded.template.name, loaded.template)
+      addTemplate(filePath, root.scope)
     }
   }
   return [...templates.values()]

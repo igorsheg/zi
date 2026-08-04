@@ -99,7 +99,7 @@ When profile-driven subagents are active, an ephemeral parent override is forwar
 
 ## Project trust
 
-When protected project `.zi` configuration exists without a stored decision, interactive mode opens a project-trust picker before running positional prompts. Its safe default keeps project configuration disabled. Trust or rejection may apply only to the current session or be saved for the canonical working directory; a saved parent decision is inherited.
+When protected project `.zi` configuration or ancestor `.agents/skills/` exists without a stored decision, interactive mode opens a project-trust picker before running positional prompts. Its safe default keeps project configuration disabled. Trust or rejection may apply only to the current session or be saved for the canonical working directory; a saved parent decision is inherited.
 
 Applying a choice replaces the complete working-directory-bound runtime so settings, prompts, skills, subagent profiles, and extensions share one admission decision. Text, JSON, and RPC modes never prompt and continue with unresolved project configuration excluded.
 

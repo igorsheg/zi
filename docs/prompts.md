@@ -22,7 +22,9 @@ $HOME/.zi/agent/prompts/
 <cwd>/.zi/prompts/
 ```
 
-Project templates load only when project configuration is trusted. A file named `review.md` creates `/review`:
+Additional files or directories can be listed in the [`prompts` settings array](settings.md#resource-paths). Project settings paths load first and only when project configuration is trusted; global settings paths load before `$HOME/.zi/agent/prompts/`.
+
+A file named `review.md` creates `/review`:
 
 ```markdown
 ---

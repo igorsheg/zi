@@ -13,6 +13,8 @@ global:  $HOME/.zi/agent/
 project: <cwd>/.zi/
 ```
 
+For Agent Skills interoperability, Zi also discovers `$HOME/.agents/skills/` and trusted `.agents/skills/` directories from the working directory to the repository boundary.
+
 Global configuration is personal. Project configuration travels with the repository and is admitted only after project trust is resolved.
 
 ## Global files
@@ -54,7 +56,7 @@ Only you need it?           $HOME/.zi/agent/
 Everyone on the repository? <cwd>/.zi/
 ```
 
-Interactive mode asks before loading protected project configuration. Text, JSON, and RPC modes never prompt and exclude unresolved project configuration.
+Interactive mode asks before loading protected project configuration, including ancestor `.agents/skills/`. Text, JSON, and RPC modes never prompt and exclude unresolved project configuration.
 
 ## Sessions
 
@@ -76,6 +78,10 @@ CLAUDE.md
 ```
 
 It checks from the filesystem root to the effective working directory, plus global `$HOME/.zi/agent/AGENTS.md`. Use these files for instructions that should apply every time Zi works in that tree.
+
+## Additional resource paths
+
+Global and project settings can add extension, skill, and prompt files or directories through typed arrays. These sources are additive and retain their settings scope. See [Settings](settings.md#resource-paths).
 
 ## Resource directories
 

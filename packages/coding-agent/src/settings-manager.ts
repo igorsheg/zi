@@ -26,10 +26,15 @@ export interface AgentSettings {
   compactionEnabled: boolean
   compactionReserveTokens: number
   compactionKeepRecentTokens: number
+  extensions?: readonly string[]
+  skills?: readonly string[]
+  prompts?: readonly string[]
 }
 
 export const maxSettingsFileBytes = 1024 * 1024
 export const maxExternalEditorCommandLength = 16 * 1024
+export const maxConfiguredResourcePaths = 128
+export const maxConfiguredResourcePathBytes = 4096
 
 const defaults: AgentSettings = {
   steeringMode: "one-at-a-time",
@@ -71,10 +76,11 @@ export class SettingsManager {
 
   constructor(settings: Partial<AgentSettings> = {}) {
     validateSettingsPatch(settings)
+    const admitted = normalizeSettingsPatch(settings)
     this.#externalEditorFallback = resolveExternalEditorFallback(process.env, process.platform)
-    this.#global = { type: "loaded", path: "<memory>", settings: { ...settings } }
+    this.#global = { type: "loaded", path: "<memory>", settings: admitted }
     this.#project = { type: "missing", path: "<memory>" }
-    this.#settings = mergeSettings(settings)
+    this.#settings = mergeSettings(admitted)
   }
 
   static create(
@@ -95,7 +101,7 @@ export class SettingsManager {
       : projectAdmission === "trusted"
         ? loadScope(paths.projectSettingsFile)
         : { type: projectAdmission === "absent" ? "absent" : "excluded", path: paths.projectSettingsFile }
-    manager.#overrides = { ...overrides }
+    manager.#overrides = normalizeSettingsPatch(overrides)
     manager.#recordLoadError("global", manager.#global)
     manager.#recordLoadError("project", manager.#project)
     manager.#recompute()
@@ -112,6 +118,10 @@ export class SettingsManager {
 
   getProject(): Readonly<Partial<AgentSettings>> {
     return Object.freeze({ ...scopeSettings(this.#project) })
+  }
+
+  getOverrides(): Readonly<Partial<AgentSettings>> {
+    return Object.freeze({ ...this.#overrides })
   }
 
   getDefaultProvider(): string | undefined {
@@ -181,14 +191,15 @@ export class SettingsManager {
 
   #updateScope(scope: SettingsScope, state: SettingsScopeState, patch: Partial<AgentSettings>): SettingsScopeState {
     validateSettingsPatch(patch)
+    const admitted = normalizeSettingsPatch(patch)
     if (state.type === "invalid") {
       throw new Error(`Cannot update invalid ${scope} settings: ${state.path}`, { cause: state.error })
     }
     if (this.#paths) {
-      if (state.type === "absent") persistNewProjectSettings(state.path, patch)
-      else persistSettings(state.path, patch)
+      if (state.type === "absent") persistNewProjectSettings(state.path, admitted)
+      else persistSettings(state.path, admitted)
     }
-    return { type: "loaded", path: state.path, settings: { ...scopeSettings(state), ...patch } }
+    return { type: "loaded", path: state.path, settings: { ...scopeSettings(state), ...admitted } }
   }
 
   #recordLoadError(scope: SettingsScope, state: SettingsScopeState): void {
@@ -243,6 +254,15 @@ function validateSettingsPatch(patch: Partial<AgentSettings>): void {
   if ("compactionKeepRecentTokens" in patch && !isCompactionTokenSetting(patch.compactionKeepRecentTokens)) {
     throw new Error("Invalid compactionKeepRecentTokens setting")
   }
+  if ("extensions" in patch && !isConfiguredResourcePaths(patch.extensions)) {
+    throw new Error("Invalid extensions setting")
+  }
+  if ("skills" in patch && !isConfiguredResourcePaths(patch.skills)) {
+    throw new Error("Invalid skills setting")
+  }
+  if ("prompts" in patch && !isConfiguredResourcePaths(patch.prompts)) {
+    throw new Error("Invalid prompts setting")
+  }
 }
 
 function loadScope(path: string): SettingsScopeState {
@@ -278,6 +298,9 @@ function clearOverrides(overrides: Partial<AgentSettings>, patch: Partial<AgentS
   if ("compactionEnabled" in patch) delete overrides.compactionEnabled
   if ("compactionReserveTokens" in patch) delete overrides.compactionReserveTokens
   if ("compactionKeepRecentTokens" in patch) delete overrides.compactionKeepRecentTokens
+  if ("extensions" in patch) delete overrides.extensions
+  if ("skills" in patch) delete overrides.skills
+  if ("prompts" in patch) delete overrides.prompts
 }
 
 function persistNewProjectSettings(path: string, patch: Partial<AgentSettings>): void {
@@ -417,6 +440,18 @@ function loadSettings(path: string): Partial<AgentSettings> {
     }
     settings.compactionKeepRecentTokens = value.compactionKeepRecentTokens
   }
+  if (value.extensions !== undefined) {
+    if (!isConfiguredResourcePaths(value.extensions)) throw invalidSetting(path, "extensions")
+    settings.extensions = freezeResourcePaths(value.extensions)
+  }
+  if (value.skills !== undefined) {
+    if (!isConfiguredResourcePaths(value.skills)) throw invalidSetting(path, "skills")
+    settings.skills = freezeResourcePaths(value.skills)
+  }
+  if (value.prompts !== undefined) {
+    if (!isConfiguredResourcePaths(value.prompts)) throw invalidSetting(path, "prompts")
+    settings.prompts = freezeResourcePaths(value.prompts)
+  }
   return settings
 }
 
@@ -461,6 +496,33 @@ function isQueueMode(value: unknown): value is AgentSettings["steeringMode"] {
 
 function isCompactionTokenSetting(value: unknown): value is number {
   return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 1_000_000
+}
+
+function isConfiguredResourcePaths(value: unknown): value is readonly string[] {
+  return (
+    Array.isArray(value) &&
+    value.length <= maxConfiguredResourcePaths &&
+    value.every(
+      path =>
+        typeof path === "string" &&
+        path.trim().length > 0 &&
+        !path.includes("\0") &&
+        Buffer.byteLength(path) <= maxConfiguredResourcePathBytes
+    )
+  )
+}
+
+function normalizeSettingsPatch(patch: Partial<AgentSettings>): Partial<AgentSettings> {
+  return {
+    ...patch,
+    ...(patch.extensions === undefined ? {} : { extensions: freezeResourcePaths(patch.extensions) }),
+    ...(patch.skills === undefined ? {} : { skills: freezeResourcePaths(patch.skills) }),
+    ...(patch.prompts === undefined ? {} : { prompts: freezeResourcePaths(patch.prompts) })
+  }
+}
+
+function freezeResourcePaths(paths: readonly string[]): readonly string[] {
+  return Object.freeze(paths.map(path => path.trim()))
 }
 
 function isThinkingLevel(value: unknown): value is ThinkingLevel {

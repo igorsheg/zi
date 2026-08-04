@@ -10,6 +10,7 @@ import {
 } from "../src/extensions/discovery.js"
 import { ZiPaths } from "../src/paths.js"
 import { maxResourceDirectoryEntries } from "../src/resource-files.js"
+import { SettingsManager } from "../src/settings-manager.js"
 
 test("extension discovery orders explicit, trusted project, and global sources deterministically", async () => {
   const root = await mkdtemp(join(tmpdir(), "zi-extension-discovery-"))
@@ -38,6 +39,51 @@ test("extension discovery orders explicit, trusted project, and global sources d
   expect(Object.isFrozen(result.plan)).toBe(true)
   expect(Object.isFrozen(result.plan.sources)).toBe(true)
   expect(result.plan.sources.every(Object.isFrozen)).toBe(true)
+})
+
+test("settings extension paths are additive, scoped, and precede automatic roots", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-extension-settings-"))
+  const paths = new ZiPaths(join(root, "project"), join(root, "global"))
+  const projectConfigured = join(paths.cwd, "configured.ts")
+  const globalConfigured = join(paths.globalDir, "configured.ts")
+  const projectAutomatic = join(paths.projectResourceDir("extensions"), "automatic.ts")
+  const globalAutomatic = join(paths.globalResourceDir("extensions"), "automatic.ts")
+  await mkdir(paths.projectDir, { recursive: true })
+  await mkdir(paths.globalDir, { recursive: true })
+  await mkdir(paths.projectResourceDir("extensions"), { recursive: true })
+  await mkdir(paths.globalResourceDir("extensions"), { recursive: true })
+  await writeFile(paths.projectSettingsFile, JSON.stringify({ extensions: ["../configured.ts"] }))
+  await writeFile(paths.globalSettingsFile, JSON.stringify({ extensions: ["configured.ts"] }))
+  await Promise.all(
+    [projectConfigured, globalConfigured, projectAutomatic, globalAutomatic].map(path =>
+      writeFile(path, "export default () => {}")
+    )
+  )
+
+  const settings = SettingsManager.create(paths, "trusted")
+  const result = discoverExtensionLoadPlan(paths, "trusted", [], settings)
+
+  expect(result.plan.sources.map(source => [source.scope, source.origin, source.declaredPath])).toEqual([
+    ["project", "settings", projectConfigured],
+    ["project", "directory", projectAutomatic],
+    ["global", "settings", globalConfigured],
+    ["global", "directory", globalAutomatic]
+  ])
+})
+
+test("untrusted project settings cannot contribute extension paths", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-extension-settings-untrusted-"))
+  const paths = new ZiPaths(join(root, "project"), join(root, "global"))
+  const projectConfigured = join(paths.cwd, "configured.ts")
+  await mkdir(paths.projectDir, { recursive: true })
+  await writeFile(paths.projectSettingsFile, JSON.stringify({ extensions: ["../configured.ts"] }))
+  await writeFile(projectConfigured, "export default () => {}")
+
+  const settings = SettingsManager.create(paths, "untrusted")
+  const result = discoverExtensionLoadPlan(paths, "untrusted", [], settings)
+
+  expect(result.plan.sources).toEqual([])
+  expect(result.diagnostics.some(diagnostic => diagnostic.path === projectConfigured)).toBe(false)
 })
 
 test("extension directory resolution falls back when index.ts is not a file", async () => {

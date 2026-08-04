@@ -4,7 +4,13 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 
 import { ZiPaths } from "../src/paths.js"
-import { maxExternalEditorCommandLength, maxSettingsFileBytes, SettingsManager } from "../src/settings-manager.js"
+import {
+  maxConfiguredResourcePathBytes,
+  maxConfiguredResourcePaths,
+  maxExternalEditorCommandLength,
+  maxSettingsFileBytes,
+  SettingsManager
+} from "../src/settings-manager.js"
 
 test("settings resolve global, then project, then construction overrides", async () => {
   const root = await mkdtemp(join(tmpdir(), "zi-settings-"))
@@ -50,6 +56,32 @@ test("settings resolve global, then project, then construction overrides", async
     compactionKeepRecentTokens: 20_000
   })
   expect(settings.getExternalEditorCommand()).toBe("project-editor")
+})
+
+test("resource path settings are scoped, trimmed, immutable, and bounded", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-settings-resources-"))
+  const paths = new ZiPaths(join(root, "project"), join(root, "global"))
+  await mkdir(paths.projectDir, { recursive: true })
+  await mkdir(paths.globalDir, { recursive: true })
+  await writeFile(
+    paths.globalSettingsFile,
+    JSON.stringify({ extensions: [" extensions "], skills: ["skills"], prompts: ["prompts"] })
+  )
+  await writeFile(paths.projectSettingsFile, JSON.stringify({ skills: ["../project-skills"] }))
+
+  const settings = SettingsManager.create(paths, "trusted")
+
+  expect(settings.getGlobal()).toMatchObject({ extensions: ["extensions"], skills: ["skills"], prompts: ["prompts"] })
+  expect(settings.getProject()).toMatchObject({ skills: ["../project-skills"] })
+  expect(settings.get().skills).toEqual(["../project-skills"])
+  expect(Object.isFrozen(settings.getGlobal().extensions)).toBe(true)
+  expect(
+    () => new SettingsManager({ skills: Array.from({ length: maxConfiguredResourcePaths + 1 }, () => "x") })
+  ).toThrow("Invalid skills")
+  expect(() => new SettingsManager({ prompts: ["x".repeat(maxConfiguredResourcePathBytes + 1)] })).toThrow(
+    "Invalid prompts"
+  )
+  expect(() => new SettingsManager({ extensions: ["bad\0path"] })).toThrow("Invalid extensions")
 })
 
 test("external editor resolution follows configured, VISUAL, EDITOR, then platform fallback", () => {

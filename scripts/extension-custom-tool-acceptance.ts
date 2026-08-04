@@ -40,28 +40,39 @@ export interface ExtensionCustomToolAcceptanceOptions {
 export async function runExtensionCustomToolAcceptance(options: ExtensionCustomToolAcceptanceOptions): Promise<void> {
   const temporary = await mkdtemp(join(tmpdir(), "zi-extension-acceptance-"))
   const project = join(temporary, "project")
+  const home = join(temporary, "home")
   const agentDirectory = join(temporary, "agent")
-  const projectExtension = join(project, ".zi", "extensions", "repository-status", "index.ts")
+  const projectExtension = join(project, "resource-catalog", "extensions", "repository-status", "index.ts")
   const durableProjectExtension = join(project, ".zi", "extensions", "durable-counter", "index.ts")
+  const agentsSkill = join(home, ".agents", "skills", "compiled-agents-skill", "SKILL.md")
   const extensionSource =
     options.extensionSource ?? resolve(import.meta.dirname, "../examples/extensions/custom-tool/index.ts")
   const durableExtensionSource =
     options.durableExtensionSource ?? resolve(import.meta.dirname, "../examples/extensions/durable-counter/index.ts")
 
   try {
-    await mkdir(join(project, ".zi", "extensions", "repository-status"), { recursive: true })
+    await mkdir(join(project, "resource-catalog", "extensions", "repository-status"), { recursive: true })
     await mkdir(join(project, ".zi", "extensions", "durable-counter"), { recursive: true })
+    await mkdir(join(home, ".agents", "skills", "compiled-agents-skill"), { recursive: true })
     await mkdir(agentDirectory, { recursive: true })
     await copyFile(extensionSource, projectExtension)
     await copyFile(durableExtensionSource, durableProjectExtension)
+    await writeFile(
+      join(project, ".zi", "settings.json"),
+      JSON.stringify({ extensions: ["../resource-catalog/extensions/repository-status"] })
+    )
+    await writeFile(
+      agentsSkill,
+      "---\nname: compiled-agents-skill\ndescription: Verify compiled .agents skill discovery.\n---\nAcceptance.\n"
+    )
     await writeFile(join(project, "acceptance.txt"), "extension acceptance\n")
     initializeRepository(project)
     await writeFile(join(agentDirectory, "trust.json"), JSON.stringify({ [realpathSync.native(project)]: true }))
 
     for (const mode of ["text", "json", "rpc", "interactive"] as const) {
-      const provider = new ToolRoundTripProvider(options.documentationRoot)
+      const provider = new ToolRoundTripProvider(options.documentationRoot, agentsSkill)
       try {
-        const env = { ...process.env, AZURE_OPENAI_BASE_URL: provider.baseUrl, TERM: "xterm-256color" }
+        const env = { ...process.env, HOME: home, AZURE_OPENAI_BASE_URL: provider.baseUrl, TERM: "xterm-256color" }
         if (mode === "rpc") {
           // The copyable client owns correlation, event sequencing, paging, and process settlement.
           const controller = new AbortController()
@@ -234,10 +245,12 @@ class DurableCounterProvider {
 class ToolRoundTripProvider {
   readonly #server: ReturnType<typeof Bun.serve>
   readonly #documentationRoot: string | undefined
+  readonly #agentsSkill: string
   #state: ProviderState = { type: "awaiting_tool_call" }
 
-  constructor(documentationRoot: string | undefined) {
+  constructor(documentationRoot: string | undefined, agentsSkill: string) {
     this.#documentationRoot = documentationRoot
+    this.#agentsSkill = agentsSkill
     this.#server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: request => this.#receive(request) })
   }
 
@@ -264,6 +277,7 @@ class ToolRoundTripProvider {
       switch (this.#state.type) {
         case "awaiting_tool_call":
           validateToolRegistration(payload)
+          validateAgentsSkill(payload, this.#agentsSkill)
           if (this.#documentationRoot) validateProductDocumentation(payload, this.#documentationRoot)
           this.#state = { type: "awaiting_tool_result" }
           return eventStreamResponse(toolCallEvents())
@@ -642,6 +656,13 @@ function validateToolRegistration(value: unknown): void {
   const path = requireRecord(properties.path, "custom tool path parameter")
   if (parameters.type !== "object" || path.type !== "string") {
     throw new Error("First provider request changed the custom tool schema")
+  }
+}
+
+function validateAgentsSkill(value: unknown, skillPath: string): void {
+  const payload = JSON.stringify(value)
+  if (!payload.includes("<name>compiled-agents-skill</name>") || !payload.includes(skillPath)) {
+    throw new Error("Compiled provider prompt omitted the global .agents skill")
   }
 }
 

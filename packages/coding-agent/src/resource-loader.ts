@@ -13,6 +13,8 @@ import {
   ResourceFileLimitError,
   SessionResourceBudget
 } from "./resource-files.js"
+import { resolveResourceRoots } from "./resource-roots.js"
+import type { SettingsManager } from "./settings-manager.js"
 import { loadSkills, type Skill } from "./skills.js"
 import { loadSubagentProfiles, type SubagentProfile } from "./subagent-profiles.js"
 
@@ -47,13 +49,16 @@ export interface CreateSessionResourcesOptions {
 export interface ResourceLoaderOptions {
   readonly paths: ZiPaths
   readonly project: ProjectConfigurationAdmission
+  readonly settingsManager?: SettingsManager
   readonly systemPrompt?: string
   readonly appendSystemPrompt?: readonly string[]
 }
 
 export class ResourceLoader {
   readonly #paths: ZiPaths
+  readonly #project: ProjectConfigurationAdmission
   readonly #projectConfigurationAdmitted: boolean
+  readonly #settingsManager: SettingsManager | undefined
   readonly #systemPrompt: string | undefined
   readonly #appendSystemPrompt: readonly string[] | undefined
 
@@ -62,7 +67,9 @@ export class ResourceLoader {
       throw new Error(`Unknown project configuration admission: ${String(options.project)}`)
     }
     this.#paths = options.paths
+    this.#project = options.project
     this.#projectConfigurationAdmitted = options.project === "trusted" && !options.paths.projectConfigIsGlobal
+    this.#settingsManager = options.settingsManager
     this.#systemPrompt = options.systemPrompt
     this.#appendSystemPrompt = options.appendSystemPrompt ? [...options.appendSystemPrompt] : undefined
   }
@@ -96,20 +103,13 @@ export class ResourceLoader {
             return admitted === undefined ? [] : [admitted]
           })
     const contextFiles = loadContextFiles(this.#paths, budget, diagnostics)
-    const roots = [
-      ...(this.#projectConfigurationAdmitted
-        ? [{ path: this.#paths.projectResourceDir("skills"), scope: "project" as const }]
-        : []),
-      { path: this.#paths.globalResourceDir("skills"), scope: "global" as const }
-    ]
-    const skills = loadSkills(roots, budget, diagnostics)
+    const skills = loadSkills(
+      resolveResourceRoots(this.#paths, this.#settingsManager, this.#project, "skills"),
+      budget,
+      diagnostics
+    )
     const promptTemplates = loadPromptTemplates(
-      [
-        ...(this.#projectConfigurationAdmitted
-          ? [{ path: this.#paths.projectResourceDir("prompts"), scope: "project" as const }]
-          : []),
-        { path: this.#paths.globalResourceDir("prompts"), scope: "global" as const }
-      ],
+      resolveResourceRoots(this.#paths, this.#settingsManager, this.#project, "prompts"),
       budget,
       diagnostics
     )

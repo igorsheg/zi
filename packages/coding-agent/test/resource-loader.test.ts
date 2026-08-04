@@ -6,6 +6,7 @@ import { dirname, join } from "node:path"
 import { ZiPaths } from "../src/paths.js"
 import { maxResourceFileBytes } from "../src/resource-files.js"
 import { maxSessionResourceBytes, ResourceLoader } from "../src/resource-loader.js"
+import { SettingsManager } from "../src/settings-manager.js"
 
 test("session resources follow cwd-bound Pi discovery and precedence", async () => {
   const root = await mkdtemp(join(tmpdir(), "zi-resources-"))
@@ -65,6 +66,132 @@ test("session resources follow cwd-bound Pi discovery and precedence", async () 
   expect(Object.isFrozen(resources)).toBe(true)
   expect(Object.isFrozen(resources.skills)).toBe(true)
   expect(Object.isFrozen(resources.skills[0])).toBe(true)
+})
+
+test("settings add file and directory resource roots with scoped precedence", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-configured-resources-"))
+  const paths = new ZiPaths(join(root, "project"), join(root, "global"))
+  const projectSkills = join(paths.cwd, "catalog", "skills")
+  const projectPrompt = join(paths.cwd, "catalog", "review.md")
+  const globalSkills = join(paths.globalDir, "catalog", "skills")
+  const globalPrompt = join(paths.globalDir, "catalog", "global.md")
+  await mkdir(paths.projectDir, { recursive: true })
+  await mkdir(paths.globalDir, { recursive: true })
+  await writeFile(
+    paths.projectSettingsFile,
+    JSON.stringify({ skills: ["../catalog/skills"], prompts: ["../catalog/review.md"] })
+  )
+  await writeFile(
+    paths.globalSettingsFile,
+    JSON.stringify({ skills: ["catalog/skills"], prompts: ["catalog/global.md"] })
+  )
+  await writeSkill(join(projectSkills, "review", "SKILL.md"), "review", "Configured project review")
+  await writeSkill(join(paths.projectResourceDir("skills"), "review", "SKILL.md"), "review", "Automatic project review")
+  await writeSkill(join(globalSkills, "global-custom", "SKILL.md"), "global-custom", "Configured global skill")
+  await writeFile(projectPrompt, "Configured project prompt")
+  await writeFile(globalPrompt, "Configured global prompt")
+  await mkdir(paths.projectResourceDir("prompts"), { recursive: true })
+  await writeFile(join(paths.projectResourceDir("prompts"), "review.md"), "Automatic project prompt")
+
+  const settingsManager = SettingsManager.create(paths, "trusted")
+  const resources = await new ResourceLoader({ paths, project: "trusted", settingsManager }).load()
+
+  expect(resources.skills.map(skill => [skill.name, skill.description, skill.scope])).toEqual([
+    ["review", "Configured project review", "project"],
+    ["global-custom", "Configured global skill", "global"]
+  ])
+  expect(resources.promptTemplates.map(prompt => [prompt.name, prompt.content, prompt.scope])).toEqual([
+    ["review", "Configured project prompt", "project"],
+    ["global", "Configured global prompt", "global"]
+  ])
+  expect(resources.diagnostics).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({ type: "collision", resource: "skill", name: "review" }),
+      expect.objectContaining({ type: "collision", resource: "prompt-template", name: "review" })
+    ])
+  )
+})
+
+test("resource loading follows settings path changes after reload", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-resource-settings-reload-"))
+  const paths = new ZiPaths(join(root, "project"), join(root, "global"))
+  await mkdir(paths.globalDir, { recursive: true })
+  await writeSkill(join(paths.globalDir, "first", "review", "SKILL.md"), "first", "First skill")
+  await writeSkill(join(paths.globalDir, "second", "review", "SKILL.md"), "second", "Second skill")
+  await writeFile(paths.globalSettingsFile, JSON.stringify({ skills: ["first"] }))
+  const settingsManager = SettingsManager.create(paths, "absent")
+  const loader = new ResourceLoader({ paths, project: "absent", settingsManager })
+
+  expect((await loader.load()).skills.map(skill => skill.name)).toEqual(["first"])
+
+  await writeFile(paths.globalSettingsFile, JSON.stringify({ skills: ["second"] }))
+  settingsManager.reload()
+
+  expect((await loader.load()).skills.map(skill => skill.name)).toEqual(["second"])
+})
+
+test(".agents skill discovery is trust-gated, Git-bounded, and keeps the global location user-scoped", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-agents-skills-"))
+  const home = join(root, "home")
+  const repository = join(root, "workspace", "repository")
+  const cwd = join(repository, "packages", "app")
+  await mkdir(join(repository, ".git"), { recursive: true })
+  await mkdir(cwd, { recursive: true })
+  const paths = new ZiPaths(cwd, join(home, ".zi", "agent"), undefined, home)
+
+  await writeSkill(join(paths.globalAgentsSkillsDir, "global-agent", "SKILL.md"), "global-agent", "Global agent skill")
+  await writeFile(
+    join(paths.globalAgentsSkillsDir, "direct.md"),
+    "---\nname: direct\ndescription: Must not load\n---\nBody"
+  )
+  await writeSkill(
+    join(repository, "packages", ".agents", "skills", "review", "SKILL.md"),
+    "review",
+    "Nearest project skill"
+  )
+  await writeSkill(join(repository, ".agents", "skills", "review", "SKILL.md"), "review", "Repository project skill")
+  await writeSkill(
+    join(root, "workspace", ".agents", "skills", "above-repository", "SKILL.md"),
+    "above-repository",
+    "Must not load"
+  )
+
+  const trusted = await new ResourceLoader({ paths, project: "trusted" }).load()
+  const untrusted = await new ResourceLoader({ paths, project: "untrusted" }).load()
+
+  expect(trusted.skills.map(skill => [skill.name, skill.description, skill.scope])).toEqual([
+    ["review", "Nearest project skill", "project"],
+    ["global-agent", "Global agent skill", "global"]
+  ])
+  expect(untrusted.skills.map(skill => [skill.name, skill.scope])).toEqual([["global-agent", "global"]])
+  expect(trusted.skills.some(skill => skill.name === "direct" || skill.name === "above-repository")).toBe(false)
+})
+
+test("trusted .agents skills remain project-scoped when the .zi root is globally admitted", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-agents-skills-global-project-"))
+  const home = join(root, "home")
+  const cwd = join(root, "repository")
+  await mkdir(join(cwd, ".git"), { recursive: true })
+  const paths = new ZiPaths(cwd, join(cwd, ".zi"), undefined, home)
+  await writeSkill(join(cwd, ".agents", "skills", "project", "SKILL.md"), "project", "Project skill")
+
+  const trusted = await new ResourceLoader({ paths, project: "trusted" }).load()
+  const untrusted = await new ResourceLoader({ paths, project: "untrusted" }).load()
+
+  expect(trusted.skills.map(skill => [skill.name, skill.scope])).toEqual([["project", "project"]])
+  expect(untrusted.skills).toEqual([])
+})
+
+test("non-Git projects discover .agents skills through the filesystem ancestry", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-agents-skills-non-git-"))
+  const cwd = join(root, "work", "nested")
+  await mkdir(cwd, { recursive: true })
+  const paths = new ZiPaths(cwd, join(root, "home", ".zi", "agent"), undefined, join(root, "home"))
+  await writeSkill(join(root, ".agents", "skills", "workspace", "SKILL.md"), "workspace", "Workspace skill")
+
+  const resources = await new ResourceLoader({ paths, project: "trusted" }).load()
+
+  expect(resources.skills.map(skill => [skill.name, skill.scope])).toEqual([["workspace", "project"]])
 })
 
 test("subagent profiles load from global and trusted project resources with project precedence", async () => {
