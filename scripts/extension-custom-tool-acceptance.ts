@@ -702,7 +702,9 @@ function validateToolResult(value: unknown): void {
 
 function eventStreamResponse(events: readonly Record<string, unknown>[]): Response {
   const body = `${events.map(event => `data: ${JSON.stringify(event)}\n\n`).join("")}data: [DONE]\n\n`
-  return new Response(body, { headers: { "content-type": "text/event-stream" } })
+  // Bun 1.3.14 on Windows retains OpenAI SDK stream listeners on reused test sockets.
+  // Keep-alive is outside this extension acceptance, and warnings would corrupt CLI protocol stderr.
+  return new Response(body, { headers: { connection: "close", "content-type": "text/event-stream" } })
 }
 
 function toolCallEvents(): readonly Record<string, unknown>[] {
