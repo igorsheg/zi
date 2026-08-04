@@ -427,7 +427,10 @@ export default function (zi: ExtensionAPI): void {
     description: "Echo a repository value",
     parameters: Schema.object({ value: Schema.string() }),
     outputSchema: Schema.object({ prefix: Schema.string(), value: Schema.string() }),
-    execute: ({ value }) => ({ prefix, value })
+    execute: ({ value }, { reportProgress }) => {
+      reportProgress("Resolving " + value)
+      return { prefix, value }
+    }
   })
 }
 `
@@ -439,15 +442,22 @@ export default function (zi: ExtensionAPI): void {
     fauxAssistantMessage(fauxToolCall("repository_echo", { value: "accepted" }, { id: "extension-tool-1" }), {
       stopReason: "toolUse"
     }),
-    fauxAssistantMessage(
-      fauxToolCall(
-        "code",
-        { code: `async () => (await zi.repository_echo({ value: "nested" })).value` },
-        { id: "extension-code-1" }
-      ),
-      { stopReason: "toolUse" }
-    ),
-    fauxAssistantMessage(fauxText("Extension completed."))
+    context => {
+      expect(JSON.stringify(context)).not.toContain("Resolving accepted")
+      return fauxAssistantMessage(
+        fauxToolCall(
+          "code",
+          { code: `async () => (await zi.repository_echo({ value: "nested" })).value` },
+          { id: "extension-code-1" }
+        ),
+        { stopReason: "toolUse" }
+      )
+    },
+    context => {
+      expect(JSON.stringify(context)).not.toContain("Resolving accepted")
+      expect(JSON.stringify(context)).not.toContain("Resolving nested")
+      return fauxAssistantMessage(fauxText("Extension completed."))
+    }
   ])
   const runtime = await createAgentRuntime({
     cwd,
@@ -455,6 +465,15 @@ export default function (zi: ExtensionAPI): void {
     model: "faux/faux-1",
     modelFactory: () => models,
     session: { type: "new", persist: true }
+  })
+
+  const progress: Array<{ readonly toolCallId: string; readonly text: string; readonly details: unknown }> = []
+  const unsubscribe = runtime.session.subscribe(event => {
+    if (event.type !== "tool_execution_update") return
+    const content = event.partialResult.content[0]
+    if (content?.type === "text") {
+      progress.push({ toolCallId: event.toolCallId, text: content.text, details: event.partialResult.details })
+    }
   })
 
   try {
@@ -477,8 +496,26 @@ export default function (zi: ExtensionAPI): void {
         calls: [expect.objectContaining({ name: "repository_echo", state: "succeeded" })]
       }
     })
+    expect(progress).toContainEqual({
+      toolCallId: "extension-tool-1",
+      text: "Resolving accepted",
+      details: expect.objectContaining({ type: "extension", toolName: "repository_echo", outcome: "progress" })
+    })
+    expect(progress).toContainEqual({
+      toolCallId: "extension-code-1",
+      text: "Running repository_echo",
+      details: expect.objectContaining({
+        type: "code_mode",
+        outcome: "progress",
+        calls: [expect.objectContaining({ name: "repository_echo", preview: "Resolving nested" })]
+      })
+    })
+    const journal = await readFile(runtime.session.sessionManager.file!, "utf8")
+    expect(journal).not.toContain("Resolving accepted")
+    expect(journal).not.toContain("Resolving nested")
     expect(runtime.session.extensionHostSnapshot).toMatchObject({ status: "ready", lifecycle: "started" })
   } finally {
+    unsubscribe()
     runtime.session.dispose()
     await runtime.session.waitForIdle()
     await rm(root, { recursive: true, force: true })

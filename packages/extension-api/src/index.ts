@@ -230,6 +230,7 @@ export interface ExtensionCommandDefinition {
 
 export interface ExtensionToolContext extends ExtensionContext {
   readonly signal: AbortSignal
+  reportProgress(message: string): void
 }
 
 interface ExtensionToolDefinitionBase<TParameters extends TObject> {

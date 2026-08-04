@@ -1,4 +1,4 @@
-import type { AgentTool } from "@earendil-works/pi-agent-core"
+import type { AgentTool, AgentToolResult, AgentToolUpdateCallback } from "@earendil-works/pi-agent-core"
 import { Type } from "typebox"
 
 import type { CodeModeCapableTool, CodeModeToolInvocation } from "../code-mode/tool-contract.js"
@@ -9,7 +9,7 @@ export interface ExtensionToolDetails {
   readonly type: "extension"
   readonly extensionId: string
   readonly toolName: string
-  readonly outcome: "success"
+  readonly outcome: "progress" | "success"
 }
 
 export function admitExtensionTools(
@@ -38,9 +38,12 @@ export function admitExtensionTools(
     const invoke = async (
       _toolCallId: string,
       arguments_: unknown,
-      signal?: AbortSignal
+      signal?: AbortSignal,
+      onUpdate?: AgentToolUpdateCallback<ExtensionToolDetails>
     ): Promise<CodeModeToolInvocation> => {
-      const value = await host.invokeTool(registration.name, arguments_, signal)
+      const value = await host.invokeTool(registration.name, arguments_, signal, message => {
+        onUpdate?.(extensionToolProgress(registration, message))
+      })
       return { value, result: extensionToolResult(registration, value) }
     }
     const tool: CodeModeCapableTool = {
@@ -49,8 +52,8 @@ export function admitExtensionTools(
       description: registration.description,
       parameters,
       executionMode: "parallel",
-      async execute(toolCallId, arguments_, signal) {
-        return (await invoke(toolCallId, arguments_, signal)).result
+      async execute(toolCallId, arguments_, signal, onUpdate) {
+        return (await invoke(toolCallId, arguments_, signal, onUpdate)).result
       },
       codeMode: { outputSchema: registration.outputSchema, execute: invoke }
     }
@@ -60,7 +63,23 @@ export function admitExtensionTools(
   return Object.freeze(admitted)
 }
 
-function extensionToolResult(registration: ExtensionToolRegistration, value: JsonValue) {
+function extensionToolProgress(
+  registration: ExtensionToolRegistration,
+  message: string
+): AgentToolResult<ExtensionToolDetails> {
+  const details: ExtensionToolDetails = {
+    type: "extension",
+    extensionId: registration.source.id,
+    toolName: registration.name,
+    outcome: "progress"
+  }
+  return { content: [{ type: "text" as const, text: message }], details }
+}
+
+function extensionToolResult(
+  registration: ExtensionToolRegistration,
+  value: JsonValue
+): AgentToolResult<ExtensionToolDetails> {
   const details: ExtensionToolDetails = {
     type: "extension",
     extensionId: registration.source.id,

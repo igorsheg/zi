@@ -84,8 +84,10 @@ export default function (zi: ExtensionAPI): void {
       mode: Schema.literal("loud"),
       note: Schema.optional(Schema.string())
     }),
-    execute: ({ message, amount, count, enabled, tags, mode, note }) =>
-      [message.toUpperCase(), amount, count, enabled, tags.join(","), mode, note ?? "none"].join(":")
+    execute: ({ message, amount, count, enabled, tags, mode, note }, { reportProgress }) => {
+      reportProgress("Formatting " + message)
+      return [message.toUpperCase(), amount, count, enabled, tags.join(","), mode, note ?? "none"].join(":")
+    }
   })
 }
 `
@@ -104,16 +106,16 @@ export default function (zi: ExtensionAPI): void {
   try {
     expect(host.toolCatalog()).toMatchObject([{ name: "echo_message", source: { id: source.id } }])
     await host.sessionStart("startup", testExtensionContext)
+    const progress: string[] = []
     expect(
-      await host.invokeTool("echo_message", {
-        message: "external",
-        amount: 1.5,
-        count: 2,
-        enabled: true,
-        tags: ["a", "b"],
-        mode: "loud"
-      })
+      await host.invokeTool(
+        "echo_message",
+        { message: "external", amount: 1.5, count: 2, enabled: true, tags: ["a", "b"], mode: "loud" },
+        undefined,
+        message => progress.push(message)
+      )
     ).toBe("EXTERNAL:1.5:2:true:a,b:loud:none")
+    expect(progress).toEqual(["Formatting external"])
   } finally {
     await host.dispose()
     await rm(root, { recursive: true, force: true })

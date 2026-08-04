@@ -39,8 +39,9 @@ export default function (zi: ExtensionAPI): void {
     description: "Look up one repository rule",
     parameters: Schema.object({ topic: Schema.string() }),
     outputSchema: Schema.object({ topic: Schema.string(), rule: Schema.string() }),
-    async execute({ topic }, { signal }) {
-      signal.throwIfAborted()
+    async execute({ topic }, context) {
+      context.signal.throwIfAborted()
+      context.reportProgress(`Looking up ${topic}`)
       return { topic, rule: `Rule for ${topic}` }
     }
   })
@@ -65,7 +66,7 @@ interface ExtensionContext {
 
 `interactive` is Zi's visible terminal client. `text`, `json`, and `rpc` are the corresponding CLI protocols. `embedded` is the default for direct SDK/runtime construction unless the embedding client supplies a more specific mode. `cwd` is the runtime's absolute working directory. A journal path is absolute; a memory session has no resumable file.
 
-Lifecycle and agent-activity handlers receive `(event, context)`. Command and tool execution contexts extend this value with their invocation-scoped `signal`. The context is an immutable value captured when the session is constructed, not a live session API; extensions do not receive `AgentSession`, terminal UI objects, or session-manager authority.
+Lifecycle and agent-activity handlers receive `(event, context)`. Command and tool execution contexts extend this value with their invocation-scoped `signal`; tool contexts also provide `reportProgress(message)`. The context is an immutable value captured when the session is constructed, not a live session API; extensions do not receive `AgentSession`, terminal UI objects, or session-manager authority.
 
 ```ts
 zi.on("session_start", (event, context) => {
@@ -104,7 +105,9 @@ Tool names use lowercase letters, numbers, and underscores and must begin with a
 
 Without `outputSchema`, a tool returns one bounded string. Declaring `outputSchema` lets it return a matching bounded JSON value. Zi validates that value in the extension worker, renders it as JSON for direct model calls, and delivers it as an already-decoded JavaScript value in Code Mode. Tools throw errors for failed operations. Built-in Zi tool names take precedence over extension registrations.
 
-`execute` receives an invocation-scoped `AbortSignal`. Cancellation is cooperative: pass the signal to subprocess or I/O APIs and stop owned work promptly. Zi rejects late completion and terminates a worker that misses execution or cancellation deadlines.
+`execute` receives an invocation-scoped `AbortSignal` and `reportProgress(message)`. Progress is bounded text for the current invocation: Zi forwards it through normal tool updates for terminal and embedding clients, including Code Mode calls. It is transient, does not enter provider context or the session journal, and is ignored after cancellation or settlement. Progress reporting does not extend the invocation deadline.
+
+Cancellation is cooperative: pass the signal to subprocess or I/O APIs and stop owned work promptly. Zi rejects late completion and terminates a worker that misses execution or cancellation deadlines.
 
 Large catalogs can register dormant tools with `active: false`, then replace that extension's model-visible subset at runtime:
 
@@ -135,13 +138,13 @@ zi.registerTool({
 
 Registration remains factory-time and statically reviewable. `active` defaults to `true`. Reload creates a new generation and restores each registration's `active` default. An extension that wants durable selection can read custom entries and call `setActiveTools(...)` from `session_start`.
 
-A generation may register up to 256 tools in a 2 MiB catalog. At most 64 extension tools and 512 KiB of their provider-facing definitions may be active. Per-tool names are limited to 64 bytes, descriptions to 4 KiB, schemas to 16 KiB, invocation arguments to 256 KiB, and results to 256 KiB.
+A generation may register up to 256 tools in a 2 MiB catalog. At most 64 extension tools and 512 KiB of their provider-facing definitions may be active. Per-tool names are limited to 64 bytes, descriptions to 4 KiB, schemas to 16 KiB, invocation arguments to 256 KiB, progress messages to 16 KiB, and results to 256 KiB.
 
 ### Programmatic subagent profiles
 
 `registerSubagentProfile(...)` is the programmatic counterpart to a Markdown profile resource. Both declarations join one `AgentSession`-owned catalog with the same name, description, instructions, optional model, and optional thinking contract. When child execution is available, a programmatic registration alone activates Zi's standard subagent tools; an extension does not need to register a second delegation tool.
 
-Extensions may optionally build specialized orchestration with the bounded `zi.subagents` operations. The parent session retains profile precedence, process, protocol, concurrency, output, cancellation, durable evidence, containment, and shutdown ownership. Extension generation replacement removes its profile registrations without terminating admitted children. Profiles do not claim permissions, read-only behavior, worktrees, tool restrictions, or isolation. See [Profile-driven subagents](subagents.md) for the complete contract and example.
+Extensions may optionally build specialized orchestration with the bounded `zi.subagents` operations. A `wait(...)` started by a command or tool belongs to that invocation: its requested or default timeout must fit the invocation's remaining deadline, and Zi cancels it when the owner is cancelled or settles. Pass a separate signal when the extension also needs to cancel the wait explicitly. The parent session retains profile precedence, process, protocol, concurrency, output, cancellation, durable evidence, containment, and shutdown ownership. Extension generation replacement removes its profile registrations without terminating admitted children. Profiles do not claim permissions, read-only behavior, worktrees, tool restrictions, or isolation. See [Profile-driven subagents](subagents.md) for the complete contract and example.
 
 ### Durable state and custom messages
 

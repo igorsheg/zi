@@ -535,6 +535,7 @@ export class AgentSession {
       ...(this.#subagents
         ? {
             subagents: {
+              waitTimeoutMs: this.#subagents.waitTimeoutMs,
               listProfiles: () => this.#subagentProfiles(),
               spawn: (_extensionId, profile, name, prompt, signal) =>
                 this.#spawnSubagentFromProfile(profile, name, prompt, signal),

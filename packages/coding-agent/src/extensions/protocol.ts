@@ -30,7 +30,7 @@ import {
   type ExtensionSource
 } from "./discovery.js"
 
-export const extensionProtocolVersion = 8
+export const extensionProtocolVersion = 9
 export const maxExtensionProtocolFrameBytes = 4 * 1024 * 1024
 export const maxExtensionPendingRequests = 128
 export const maxExtensionQueuedWriteBytes = 8 * 1024 * 1024
@@ -66,6 +66,7 @@ export const maxExtensionToolLabelBytes = 256
 export const maxExtensionToolDescriptionBytes = 4 * 1024
 export const maxExtensionToolSchemaBytes = 16 * 1024
 export const maxExtensionToolArgumentsBytes = 256 * 1024
+export const maxExtensionToolProgressBytes = 16 * 1024
 export const maxExtensionToolResultBytes = 256 * 1024
 export const maxExtensionSubagentProfiles = 64
 export const maxExtensionSubagentNameBytes = 64
@@ -114,7 +115,7 @@ export interface ExtensionLoadResult {
 export type HostMessage =
   | {
       readonly type: "initialize"
-      readonly protocolVersion: 8
+      readonly protocolVersion: 9
       readonly generation: number
       readonly plan: ExtensionLoadPlan
       readonly subagentsAvailable?: boolean
@@ -222,7 +223,7 @@ export type HostMessage =
 export type WorkerMessage =
   | {
       readonly type: "ready"
-      readonly protocolVersion: 8
+      readonly protocolVersion: 9
       readonly generation: number
       readonly extensions: readonly ExtensionLoadResult[]
       readonly commands: readonly ExtensionCommandRegistration[]
@@ -245,6 +246,12 @@ export type WorkerMessage =
     }
   | { readonly type: "command_cancelled"; readonly generation: number; readonly requestId: number }
   | { readonly type: "tool_result"; readonly generation: number; readonly requestId: number; readonly value: JsonValue }
+  | {
+      readonly type: "tool_progress"
+      readonly generation: number
+      readonly requestId: number
+      readonly message: string
+    }
   | { readonly type: "tool_error"; readonly generation: number; readonly requestId: number; readonly message: string }
   | { readonly type: "tool_cancelled"; readonly generation: number; readonly requestId: number }
   | {
@@ -319,6 +326,7 @@ export type WorkerMessage =
       readonly generation: number
       readonly requestId: number
       readonly extensionId: string
+      readonly ownerRequestId?: number
       readonly names: readonly string[]
       readonly timeoutMs?: number
     }
@@ -790,6 +798,13 @@ export function validateWorkerMessage(value: unknown): WorkerMessage {
         requestId: positiveInteger(message.requestId, "requestId"),
         value: jsonValue(message.value, "tool result", maxExtensionToolResultBytes)
       })
+    case "tool_progress":
+      return Object.freeze({
+        type: "tool_progress",
+        generation: positiveInteger(message.generation, "generation"),
+        requestId: positiveInteger(message.requestId, "requestId"),
+        message: boundedRequiredText(message.message, "tool progress", maxExtensionToolProgressBytes)
+      })
     case "tool_error":
       return Object.freeze({
         type: "tool_error",
@@ -874,6 +889,9 @@ export function validateWorkerMessage(value: unknown): WorkerMessage {
         generation: positiveInteger(message.generation, "generation"),
         requestId: positiveInteger(message.requestId, "requestId"),
         extensionId: boundedRequiredText(message.extensionId, "extension id", maxExtensionIdBytes),
+        ...(message.ownerRequestId === undefined
+          ? {}
+          : { ownerRequestId: positiveInteger(message.ownerRequestId, "owner request id") }),
         names: subagentNames(message.names),
         ...(message.timeoutMs === undefined ? {} : { timeoutMs: subagentWaitTimeout(message.timeoutMs) })
       })
@@ -1519,7 +1537,7 @@ function protocolArray(value: unknown, field: string): readonly unknown[] {
   return value
 }
 
-function protocolVersion(value: unknown): 8 {
+function protocolVersion(value: unknown): 9 {
   if (value !== extensionProtocolVersion) throw new ExtensionProtocolError("Unsupported extension protocol version")
   return extensionProtocolVersion
 }

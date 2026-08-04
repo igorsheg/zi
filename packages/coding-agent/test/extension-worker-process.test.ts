@@ -302,12 +302,14 @@ export default function (zi): void {
     name: "echo_message",
     description: "Echo a message",
     parameters: Schema.object({ message: Schema.string() }),
-    async execute({ message }, { signal }) {
+    async execute({ message }, { signal, reportProgress }) {
       if (message === "throw") throw new Error("tool exploded")
       if (message === "wait") {
         if (!signal.aborted) await new Promise(resolve => signal.addEventListener("abort", resolve, { once: true }))
         return "late"
       }
+      reportProgress("Processing " + message)
+      if (message === "late") setTimeout(() => reportProgress("too late"), 0)
       return message.toUpperCase()
     }
   })
@@ -333,6 +335,12 @@ export default function (zi): void {
     requestId: 2,
     name: "echo_message",
     arguments: { message: "hello" }
+  })
+  expect(await messages.next()).toEqual({
+    type: "tool_progress",
+    generation: 1,
+    requestId: 2,
+    message: "Processing hello"
   })
   expect(await messages.next()).toEqual({ type: "tool_result", generation: 1, requestId: 2, value: "HELLO" })
   send(input, { type: "tool_invoke", generation: 1, requestId: 3, name: "echo_message", arguments: { message: 42 } })
@@ -365,6 +373,12 @@ export default function (zi): void {
     name: "echo_message",
     arguments: { message: "again" }
   })
+  expect(await messages.next()).toEqual({
+    type: "tool_progress",
+    generation: 1,
+    requestId: 6,
+    message: "Processing again"
+  })
   expect(await messages.next()).toEqual({ type: "tool_result", generation: 1, requestId: 6, value: "AGAIN" })
 
   send(input, {
@@ -372,14 +386,131 @@ export default function (zi): void {
     generation: 1,
     requestId: 7,
     name: "echo_message",
+    arguments: { message: "late" }
+  })
+  expect(await messages.next()).toMatchObject({ type: "tool_progress", requestId: 7, message: "Processing late" })
+  expect(await messages.next()).toEqual({ type: "tool_result", generation: 1, requestId: 7, value: "LATE" })
+  await Bun.sleep(10)
+
+  send(input, {
+    type: "tool_invoke",
+    generation: 1,
+    requestId: 8,
+    name: "echo_message",
     arguments: { message: "wait" }
   })
-  send(input, { type: "session_shutdown", generation: 1, requestId: 8, reason: "quit" })
+  send(input, { type: "session_shutdown", generation: 1, requestId: 9, reason: "quit" })
   expect(await messages.next()).toMatchObject({
     type: "fatal",
     diagnostic: { phase: "protocol", message: "Extension worker cannot shut down with active invocations" }
   })
   expect(run).rejects.toThrow("cannot shut down with active invocations")
+  messages.dispose()
+  output.destroy()
+})
+
+test("worker subagent waits inherit their owning invocation", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-extension-worker-owned-wait-"))
+  const extension = await fixture(
+    root,
+    "owned-wait.ts",
+    `import { Schema } from ${JSON.stringify(extensionApi)}
+export default function (zi): void {
+  zi.registerCommand({
+    name: "owned-wait",
+    description: "Wait from a command",
+    async execute() {
+      if (!zi.subagents) throw new Error("subagents unavailable")
+      await zi.subagents.wait(["finder-1"], 1_000)
+      return "command waited"
+    }
+  })
+  zi.registerTool({
+    name: "owned_wait",
+    description: "Wait through the session-owned subagent API",
+    parameters: Schema.object({ cancel: Schema.optional(Schema.boolean()) }),
+    async execute({ cancel }) {
+      if (!zi.subagents) throw new Error("subagents unavailable")
+      if (cancel) {
+        const controller = new AbortController()
+        const waiting = zi.subagents.wait(["finder-1"], 1_000, controller.signal)
+        controller.abort()
+        try {
+          await waiting
+        } catch {
+          return "cancelled"
+        }
+      }
+      await zi.subagents.wait(["finder-1"], 1_000)
+      return "waited"
+    }
+  })
+}
+`
+  )
+  const input = new PassThrough()
+  const output = new PassThrough()
+  const messages = new WorkerMessageQueue(output)
+  const run = runExtensionWorkerProcess(input, output)
+
+  send(input, {
+    type: "initialize",
+    protocolVersion: extensionProtocolVersion,
+    generation: 1,
+    plan: extensionPlan(root, [extension]),
+    subagentsAvailable: true
+  })
+  expect((await messages.next()).type).toBe("ready")
+  send(input, { type: "session_start", generation: 1, requestId: 1, reason: "startup", context: testExtensionContext })
+  expect((await messages.next()).type).toBe("settled")
+  send(input, { type: "tool_invoke", generation: 1, requestId: 2, name: "owned_wait", arguments: {} })
+
+  const wait = await messages.next()
+  expect(wait).toMatchObject({
+    type: "subagent_wait",
+    generation: 1,
+    extensionId: extension.id,
+    ownerRequestId: 2,
+    names: ["finder-1"],
+    timeoutMs: 1_000
+  })
+  if (wait.type !== "subagent_wait") throw new Error("Expected a subagent wait request")
+  send(input, { type: "subagent_wait_result", generation: 1, requestId: wait.requestId, snapshots: [] })
+  expect(await messages.next()).toEqual({ type: "tool_result", generation: 1, requestId: 2, value: "waited" })
+
+  send(input, { type: "tool_invoke", generation: 1, requestId: 3, name: "owned_wait", arguments: { cancel: true } })
+  const cancelledWait = await messages.next()
+  expect(cancelledWait).toMatchObject({ type: "subagent_wait", ownerRequestId: 3, names: ["finder-1"] })
+  if (cancelledWait.type !== "subagent_wait") throw new Error("Expected a cancelled subagent wait request")
+  expect(await messages.next()).toMatchObject({
+    type: "subagent_operation_cancel",
+    targetRequestId: cancelledWait.requestId
+  })
+  send(input, {
+    type: "session_operation_error",
+    generation: 1,
+    requestId: cancelledWait.requestId,
+    message: "Extension subagent operation was cancelled"
+  })
+  expect(await messages.next()).toEqual({ type: "tool_result", generation: 1, requestId: 3, value: "cancelled" })
+
+  send(input, { type: "command_invoke", generation: 1, requestId: 4, name: "owned-wait", arguments: "" })
+  const commandWait = await messages.next()
+  expect(commandWait).toMatchObject({ type: "subagent_wait", ownerRequestId: 4, names: ["finder-1"] })
+  if (commandWait.type !== "subagent_wait") throw new Error("Expected a command-owned subagent wait request")
+  send(input, { type: "subagent_wait_result", generation: 1, requestId: commandWait.requestId, snapshots: [] })
+  expect(await messages.next()).toEqual({
+    type: "command_result",
+    generation: 1,
+    requestId: 4,
+    message: "command waited"
+  })
+
+  send(input, { type: "session_shutdown", generation: 1, requestId: 5, reason: "quit" })
+  expect((await messages.next()).type).toBe("settled")
+  send(input, { type: "stop", generation: 1, requestId: 6 })
+  expect((await messages.next()).type).toBe("settled")
+  await run
   messages.dispose()
   output.destroy()
 })

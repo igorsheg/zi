@@ -130,18 +130,28 @@ test("commands expose bounded raw arguments, cancellation, and optional local fe
   expect(await command.execute("show", { ...context, signal: new AbortController().signal })).toBe("Counter: show")
 })
 
-test("tool schemas infer required and optional execution parameters", () => {
+test("tool schemas infer parameters and expose invocation-scoped progress", async () => {
   const parameters = Schema.object({ message: Schema.string(), suffix: Schema.optional(Schema.string()) })
   const tool: ExtensionToolDefinition<typeof parameters> = {
     name: "echo_message",
     description: "Echo one message",
     parameters,
-    execute: async ({ message, suffix }, { signal }) => (signal.aborted ? "cancelled" : message + (suffix ?? ""))
+    execute: async ({ message, suffix }, toolContext) => {
+      toolContext.reportProgress(`Echoing ${message}`)
+      return toolContext.signal.aborted ? "cancelled" : message + (suffix ?? "")
+    }
   }
   const value: Static<typeof parameters> = { message: "hello" }
+  const progress: string[] = []
 
-  expect(tool.name).toBe("echo_message")
-  expect(value).toEqual({ message: "hello" })
+  expect(
+    await tool.execute(value, {
+      ...context,
+      signal: new AbortController().signal,
+      reportProgress: message => progress.push(message)
+    })
+  ).toBe("hello")
+  expect(progress).toEqual(["Echoing hello"])
 })
 
 test("tool output schemas infer structured execution results", async () => {
@@ -155,10 +165,9 @@ test("tool output schemas infer structured execution results", async () => {
     execute: ({ value }) => ({ doubled: value * 2, label: String(value) })
   }
 
-  expect(await tool.execute({ value: 3 }, { ...context, signal: new AbortController().signal })).toEqual({
-    doubled: 6,
-    label: "3"
-  })
+  expect(
+    await tool.execute({ value: 3 }, { ...context, signal: new AbortController().signal, reportProgress: () => {} })
+  ).toEqual({ doubled: 6, label: "3" })
 })
 
 test("public types reject values outside the worker schema contract", () => {

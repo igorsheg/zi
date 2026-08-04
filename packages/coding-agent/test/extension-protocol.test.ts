@@ -28,6 +28,7 @@ import {
   maxExtensionToolArgumentsBytes,
   maxExtensionToolCatalogBytes,
   maxExtensionToolDescriptionBytes,
+  maxExtensionToolProgressBytes,
   maxExtensionToolResultBytes,
   maxExtensionToolSchemaBytes,
   maxExtensionTools,
@@ -458,6 +459,23 @@ test("tool protocol validation closes registration, arguments, results, and corr
   expect(
     validateWorkerMessage({ type: "tool_result", generation: 1, requestId: 2, value: { echoed: "hello" } })
   ).toEqual({ type: "tool_result", generation: 1, requestId: 2, value: { echoed: "hello" } })
+  expect(validateWorkerMessage({ type: "tool_progress", generation: 1, requestId: 2, message: "Halfway" })).toEqual({
+    type: "tool_progress",
+    generation: 1,
+    requestId: 2,
+    message: "Halfway"
+  })
+  expect(() =>
+    validateWorkerMessage({
+      type: "tool_progress",
+      generation: 1,
+      requestId: 2,
+      message: "x".repeat(maxExtensionToolProgressBytes + 1)
+    })
+  ).toThrow(`${maxExtensionToolProgressBytes} bytes`)
+  expect(() => validateWorkerMessage({ type: "tool_progress", generation: 1, requestId: 2, message: "" })).toThrow(
+    "tool progress"
+  )
 })
 
 test("session-operation protocol validates source, values, delivery, and bounded results", () => {
@@ -637,6 +655,27 @@ test("subagent protocol bounds profiles, operations, snapshots, and cancellation
       prompt: "inspect"
     })
   ).toThrow(`${maxExtensionSubagentNameBytes}`)
+  expect(
+    validateWorkerMessage({
+      type: "subagent_wait",
+      generation: 1,
+      requestId: 2,
+      extensionId: source.id,
+      ownerRequestId: 7,
+      names: ["finder-1"],
+      timeoutMs: 1_000
+    })
+  ).toMatchObject({ type: "subagent_wait", ownerRequestId: 7, timeoutMs: 1_000 })
+  expect(() =>
+    validateWorkerMessage({
+      type: "subagent_wait",
+      generation: 1,
+      requestId: 2,
+      extensionId: source.id,
+      ownerRequestId: 0,
+      names: ["finder-1"]
+    })
+  ).toThrow("owner request")
   expect(
     validateWorkerMessage({
       type: "subagent_operation_cancel",

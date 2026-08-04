@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks"
 import type { Readable, Writable } from "node:stream"
 import { pathToFileURL } from "node:url"
 
@@ -271,7 +272,12 @@ export class LoadedExtensionGeneration {
       .then(validateExtensionCommandResult)
   }
 
-  invoke(name: string, parameters: Readonly<Record<string, JsonValue>>, signal: AbortSignal): Promise<JsonValue> {
+  invoke(
+    name: string,
+    parameters: Readonly<Record<string, JsonValue>>,
+    signal: AbortSignal,
+    reportProgress: (message: string) => void = () => {}
+  ): Promise<JsonValue> {
     if (this.#state.type !== "started") {
       return Promise.reject(new Error(`Cannot invoke extension tools while lifecycle is ${this.#state.type}`))
     }
@@ -280,7 +286,7 @@ export class LoadedExtensionGeneration {
     if (!tool.inputChecker.Check(parameters)) {
       return Promise.reject(new Error(`Invalid arguments for extension tool ${name}`))
     }
-    const context = Object.freeze({ ...this.#startedContext(), signal })
+    const context = Object.freeze({ ...this.#startedContext(), signal, reportProgress })
     return Promise.resolve()
       .then(() => tool.execute(parameters, context))
       .then(value => {
@@ -435,6 +441,7 @@ export class LoadedExtensionGeneration {
 class ExtensionWorkerProcess {
   readonly #writer: ExtensionProtocolWriter
   readonly #terminal = deferred()
+  readonly #invocationOwner = new AsyncLocalStorage<number>()
   readonly #invocations = new Map<number, WorkerInvocation>()
   readonly #settledInvocationRequests = new Set<number>()
   readonly #settledInvocationRequestOrder: number[] = []
@@ -723,10 +730,17 @@ class ExtensionWorkerProcess {
       },
       waitSubagents: (source, names, timeoutMs, signal) => {
         const settled = deferred<readonly ExtensionSubagentSnapshot[]>()
+        const ownerRequestId = this.#invocationOwner.getStore()
         this.#requestSessionOperation(
           generation,
           { type: "subagent_wait", settled },
-          { type: "subagent_wait", extensionId: source.id, names, ...(timeoutMs === undefined ? {} : { timeoutMs }) },
+          {
+            type: "subagent_wait",
+            extensionId: source.id,
+            ...(ownerRequestId === undefined ? {} : { ownerRequestId }),
+            names,
+            ...(timeoutMs === undefined ? {} : { timeoutMs })
+          },
           signal
         )
         return settled.promise
@@ -915,7 +929,9 @@ class ExtensionWorkerProcess {
       | { readonly type: "error"; readonly message: string }
     try {
       const commandArguments = validateExtensionCommandArguments(message.arguments)
-      const result = await extensions.invokeCommand(message.name, commandArguments, invocation.controller.signal)
+      const result = await this.#invocationOwner.run(message.requestId, () =>
+        extensions.invokeCommand(message.name, commandArguments, invocation.controller.signal)
+      )
       outcome = { type: "result", message: result }
     } catch (cause) {
       outcome = { type: "error", message: boundedExtensionCommandError(cause) }
@@ -951,7 +967,29 @@ class ExtensionWorkerProcess {
       | { readonly type: "error"; readonly message: string }
     try {
       const parameters = validateExtensionToolArguments(message.arguments)
-      const value = await extensions.invoke(message.name, parameters, invocation.controller.signal)
+      const value = await this.#invocationOwner.run(message.requestId, () =>
+        extensions.invoke(message.name, parameters, invocation.controller.signal, progress => {
+          const current = this.#invocations.get(message.requestId)
+          if (
+            !current ||
+            current.type !== "running" ||
+            current.controller !== invocation.controller ||
+            current.controller.signal.aborted
+          ) {
+            return
+          }
+          void this.#writer
+            .send(
+              validateWorkerMessage({
+                type: "tool_progress",
+                generation: message.generation,
+                requestId: message.requestId,
+                message: progress
+              })
+            )
+            .catch(cause => this.#fail(cause))
+        })
+      )
       outcome = { type: "result", value }
     } catch (cause) {
       outcome = { type: "error", message: boundedExtensionToolError(cause) }

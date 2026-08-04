@@ -231,7 +231,17 @@ test("host tool invocation is correlated, cancellable, and generation-reusable",
   await host.sessionStart("startup", testExtensionContext)
 
   expect(host.toolCatalog()).toMatchObject([{ name: "echo_message", source: { id: sourceOne.id } }])
-  expect(await host.invokeTool("echo_message", { message: "hello" })).toBe("HELLO")
+  const progress: string[] = []
+  expect(
+    await host.invokeTool("echo_message", { message: "hello" }, undefined, message => progress.push(message))
+  ).toBe("HELLO")
+  expect(progress).toEqual(["Processing hello"])
+  const worker = workers.processes[0]!
+  const completed = worker.messages.find(message => message.type === "tool_invoke")
+  if (!completed || completed.type !== "tool_invoke") throw new Error("Expected a completed tool invocation")
+  worker.send({ type: "tool_progress", generation: 1, requestId: completed.requestId, message: "late progress" })
+  await Bun.sleep(0)
+  expect(progress).toEqual(["Processing hello"])
   expect(host.invokeTool("echo_message", { message: "error" })).rejects.toThrow("tool failed")
 
   const controller = new AbortController()
@@ -300,6 +310,134 @@ test("worker session requests are source-attributed and domain refusals keep the
   })
   await Bun.sleep(0)
   expect(worker.messages).toContainEqual(expect.objectContaining({ type: "session_operation_error", requestId: 43 }))
+  expect(host.snapshot()).toMatchObject({ status: "ready", lifecycle: "started" })
+  await host.dispose()
+})
+
+test("subagent waits are bounded by their owning extension invocation", async () => {
+  const workers = new TestWorkerSpawner()
+  workers.behaviors.push({ type: "tools" })
+  const timeouts = { ...testTimeouts, toolMs: 1_000 }
+  const host = await ExtensionHost.create(planOne, workers.spawn, timeouts)
+  const observedTimeouts: number[] = []
+  let abortedWaits = 0
+  host.bindSessionOperations({
+    getEntries: () => [],
+    appendEntry: customType => ({ id: "entry", timestamp: new Date(0).toISOString(), customType }),
+    sendMessage: () => {},
+    getActiveTools: () => [],
+    setActiveTools: () => {},
+    subagents: {
+      waitTimeoutMs: 5_000,
+      listProfiles: () => [],
+      spawn: async () => "unused",
+      send: async () => {},
+      continue: async () => "started_turn",
+      wait: async (_extensionId, _names, timeoutMs, signal) => {
+        observedTimeouts.push(timeoutMs ?? -1)
+        await new Promise<void>((_resolve, reject) => {
+          signal.addEventListener(
+            "abort",
+            () => {
+              abortedWaits++
+              reject(new Error("owned wait aborted"))
+            },
+            { once: true }
+          )
+        })
+        return []
+      },
+      interrupt: async () => "already_idle",
+      close: async () => ({ name: "unused", lifecycle: "exited", resultReady: false }),
+      list: () => []
+    }
+  })
+  await host.sessionStart("startup", testExtensionContext)
+  const worker = workers.processes[0]!
+  const controller = new AbortController()
+  const invocation = host.invokeTool("echo_message", { message: "pending" }, controller.signal)
+  await Bun.sleep(0)
+  const owner = worker.messages.find(message => message.type === "tool_invoke")
+  if (!owner || owner.type !== "tool_invoke") throw new Error("Expected a tool invocation")
+
+  worker.send({
+    type: "subagent_wait",
+    generation: 1,
+    requestId: 41,
+    extensionId: sourceOne.id,
+    ownerRequestId: owner.requestId,
+    names: ["finder-1"]
+  })
+  await Bun.sleep(0)
+  expect(observedTimeouts).toHaveLength(0)
+  expect(worker.messages).toContainEqual(expect.objectContaining({ type: "session_operation_error", requestId: 41 }))
+
+  worker.send({
+    type: "subagent_wait",
+    generation: 1,
+    requestId: 42,
+    extensionId: sourceOne.id,
+    ownerRequestId: owner.requestId,
+    names: ["finder-1"],
+    timeoutMs: 3_600_000
+  })
+  await Bun.sleep(0)
+  expect(observedTimeouts).toHaveLength(0)
+  expect(worker.messages).toContainEqual(expect.objectContaining({ type: "session_operation_error", requestId: 42 }))
+
+  worker.send({
+    type: "subagent_wait",
+    generation: 1,
+    requestId: 43,
+    extensionId: sourceOne.id,
+    ownerRequestId: owner.requestId,
+    names: ["finder-1"],
+    timeoutMs: 100
+  })
+  await Bun.sleep(0)
+  expect(observedTimeouts).toEqual([100])
+  controller.abort()
+  expect(invocation).rejects.toMatchObject({ name: "AbortError" })
+  await Bun.sleep(0)
+  expect(abortedWaits).toBe(1)
+
+  worker.send({
+    type: "subagent_wait",
+    generation: 1,
+    requestId: 44,
+    extensionId: sourceOne.id,
+    ownerRequestId: owner.requestId,
+    names: ["finder-1"],
+    timeoutMs: 100
+  })
+  await Bun.sleep(0)
+  expect(observedTimeouts).toEqual([100])
+  expect(worker.messages).toContainEqual(expect.objectContaining({ type: "session_operation_error", requestId: 44 }))
+  expect(await host.invokeTool("echo_message", { message: "again" })).toBe("AGAIN")
+
+  const completing = host.invokeTool("echo_message", { message: "pending" })
+  await Bun.sleep(0)
+  const completingOwner = worker.messages.findLast(
+    message => message.type === "tool_invoke" && message.arguments.message === "pending"
+  )
+  if (!completingOwner || completingOwner.type !== "tool_invoke") {
+    throw new Error("Expected a completing tool invocation")
+  }
+  worker.send({
+    type: "subagent_wait",
+    generation: 1,
+    requestId: 45,
+    extensionId: sourceOne.id,
+    ownerRequestId: completingOwner.requestId,
+    names: ["finder-2"],
+    timeoutMs: 100
+  })
+  await Bun.sleep(0)
+  expect(observedTimeouts).toEqual([100, 100])
+  worker.send({ type: "tool_result", generation: 1, requestId: completingOwner.requestId, value: "COMPLETED" })
+  expect(await completing).toBe("COMPLETED")
+  await Bun.sleep(0)
+  expect(abortedWaits).toBe(2)
   expect(host.snapshot()).toMatchObject({ status: "ready", lifecycle: "started" })
   await host.dispose()
 })
@@ -932,6 +1070,12 @@ class TestWorkerProcess implements ExtensionWorkerProcess {
       }
       const content = message.arguments.message
       if (typeof content !== "string") throw new Error("Test tool expected a string message")
+      this.send({
+        type: "tool_progress",
+        generation: message.generation,
+        requestId: message.requestId,
+        message: `Processing ${content}`
+      })
       this.send({
         type: "tool_result",
         generation: message.generation,

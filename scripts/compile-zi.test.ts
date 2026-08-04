@@ -276,6 +276,7 @@ export default function (zi: ExtensionAPI): void {
       "custom_entry_append",
       "custom_message_send",
       "tool_result",
+      "tool_progress",
       "tool_result",
       "settled",
       "settled"
@@ -283,6 +284,9 @@ export default function (zi: ExtensionAPI): void {
     expect(compiledCommandResult).toBe("Counter: 0")
     expect(compiledCounterResult).toBe("1")
     expect(compiledCustomMessage).toBe("Counter: 1")
+    expect(protocolMessages).toContainEqual(
+      expect.objectContaining({ type: "tool_progress", requestId: 4, message: "Checking Git status" })
+    )
     expect(JSON.stringify(compiledToolResult)).toContain("zi")
     expect(await Bun.file(lifecycle).text()).toBe("start:startup:embedded\nagent_start\nagent_settled\nstop:quit\n")
 
