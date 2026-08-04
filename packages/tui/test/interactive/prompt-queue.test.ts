@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test"
 
-import { TextareaRenderable } from "@opentui/core"
+import { BoxRenderable, TextareaRenderable } from "@opentui/core"
 import {
   createModels,
   createTestAgentRuntime as createAgentRuntime,
@@ -128,6 +128,9 @@ test("a maximum queue preserves the constrained composer and Ctrl+C leaves pendi
     expect(overflowFrame).toContain("Queue capacity exceeded")
     expect(overflowFrame).toContain("… 31 more queued")
     expect(overflowFrame).toContain("keep this exact draft")
+    const footer = setup.renderer.root.findDescendantById("prompt-footer")
+    if (!(footer instanceof BoxRenderable)) throw new Error("Prompt footer not found")
+    expect(footer.visible).toBe(false)
     expect(setup.renderer.currentFocusedRenderable).toBe(input)
     expect(
       session.messages.some(message => message.role === "user" && messageText(message) === "keep this exact draft")

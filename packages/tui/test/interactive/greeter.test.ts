@@ -15,7 +15,7 @@ test("a fresh session greets the user immediately above the composer", async () 
   const faux = fauxProvider()
   models.setProvider(faux.provider)
   const { session } = await createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
-  const setup = await createInteractiveTest(session, { width: 40, height: 12 })
+  const setup = await createInteractiveTest(session, { width: 40, height: 13 })
 
   try {
     await setup.renderOnce()
@@ -30,7 +30,10 @@ test("a fresh session greets the user immediately above the composer", async () 
       " ░▀▀▀░▀▀▀",
       ""
     ])
-    expect(rows[start + 4]?.startsWith("╭─/work")).toBe(true)
+    expect(rows[start + 4]?.startsWith("╭─")).toBe(true)
+    expect(rows[start + 7]).toBe("")
+    expect(rows[start + 8]).toContain("/work")
+    expect(rows[start + 9]).toBe("")
 
     await setup.mockInput.typeText("draft")
     await setup.renderOnce()
@@ -51,9 +54,12 @@ test("resizing reuses the greeter and keeps the composer focused", async () => {
   try {
     await setup.renderOnce()
     const greeter = setup.renderer.root.findDescendantById("session-greeter")
+    const footer = setup.renderer.root.findDescendantById("prompt-footer")
     const input = setup.renderer.root.findDescendantById("prompt-input")
     if (!greeter) throw new Error("Session greeter not found")
+    if (!footer) throw new Error("Prompt footer not found")
     if (!(input instanceof TextareaRenderable)) throw new Error("Prompt textarea not found")
+    expect(footer.visible).toBe(false)
 
     setup.resize(20, 12)
     await setup.renderOnce()

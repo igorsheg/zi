@@ -412,9 +412,10 @@ test("interactive notifications anchor to the transcript above the composer", as
     setup.mode.notify("Ready", 2, { ttl: Infinity })
     await setup.renderOnce()
     const rows = setup.captureCharFrame().split("\n")
-    expect(rows[3]).toEndWith(" Ready INFO  ")
-    expect(rows[4]).toEndWith(" Notifications ❰❰  ")
-    expect(rows[5]).toStartWith("╭─/work")
+    expect(rows[0]).toEndWith(" Ready INFO  ")
+    expect(rows[1]).toEndWith(" Notifications ❰❰  ")
+    expect(rows[2]).toStartWith("╭─")
+    expect(rows[6]).toContain("/work")
   } finally {
     session.dispose()
     setup.destroy()

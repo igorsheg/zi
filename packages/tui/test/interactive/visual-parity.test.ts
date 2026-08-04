@@ -70,12 +70,12 @@ test("representative session keeps the accepted visual hierarchy at normal and c
       "",
       "",
       "",
-      "",
-      "",
-      "",
-      "╭─/workspace/zi───────────────────────────────────ctx 15%/247k • faux-1 (high)─╮",
+      "╭──────────────────────────────────────────────────────────────────────────────╮",
       "│                                                                              │",
-      "╰──────────────────────────────────────────────────────────────────────────────╯"
+      "╰──────────────────────────────────────────────────────────────────────────────╯",
+      "",
+      " /workspace/zi                                     ctx 15%/247k • faux-1 (high)",
+      ""
     ])
 
     const spans = setup.captureSpans().lines.flatMap(line => line.spans)
@@ -93,14 +93,14 @@ test("representative session keeps the accepted visual hierarchy at normal and c
     setup.resize(40, 8)
     await setup.renderOnce()
     expect(frameRows(setup.captureCharFrame(), 8)).toEqual([
-      " ╰───",
-      "",
-      " The failed command remains visible",
       " without overwhelming the prompt.",
       "",
-      "╭─/workspace/zi───────────ctx 15%/247k─╮",
+      "╭──────────────────────────────────────╮",
       "│                                      │",
-      "╰──────────────────────────────────────╯"
+      "╰──────────────────────────────────────╯",
+      "",
+      " zi        ctx 15%/247k • faux-1 (high)",
+      ""
     ])
 
     setup.resize(20, 4)
@@ -137,7 +137,7 @@ test("composer distinguishes estimated context after compaction", async () => {
   })
   faux.setResponses([fauxAssistantMessage("checkpoint")])
   await session.compact()
-  const setup = await createInteractiveTest(session, { width: 80, height: 6 })
+  const setup = await createInteractiveTest(session, { width: 80, height: 8 })
 
   try {
     await setup.renderOnce()

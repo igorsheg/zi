@@ -23,6 +23,7 @@ import type { InteractiveStore } from "../interactive-store.js"
 import type { SlashController } from "../slash-controller.js"
 import { AuthCeremonyView } from "./auth-ceremony-view.js"
 import { captureFileCompletionInput } from "./file-completion.js"
+import { layoutPromptFooter, type PromptFooterPresentation, PromptFooterView } from "./footer-view.js"
 import { SessionGreeterView } from "./greeter-view.js"
 import { PickerStackView } from "./picker-view.js"
 import { QueuedInputsView } from "./queue-view.js"
@@ -49,6 +50,7 @@ export class PromptView {
   readonly #queue: QueuedInputsView
   readonly #greeter: SessionGreeterView
   readonly #composer: Composer
+  readonly #footer: PromptFooterView
   readonly #input: Composer["input"]
   readonly #pickerStack: PickerStackView
   readonly #release: Array<() => void> = []
@@ -90,7 +92,7 @@ export class PromptView {
     const geometry = composerGeometry(renderer.width, renderer.height)
     this.#composer = createComposer(renderer, {
       geometry,
-      slots: composerSlots(session),
+      slots: composerSlots(),
       theme,
       historySource: {
         latest: () => session.latestPromptHistoryEntry(),
@@ -103,14 +105,16 @@ export class PromptView {
       onPaste: this.#onPaste
     })
     this.#input = this.#composer.input
+    this.#footer = new PromptFooterView(renderer, theme)
     this.#pickerStack = new PickerStackView(renderer, this.#store.picker, theme, () => this.#input.plainText)
 
-    // Transient status stays above stable session metadata; PickerStack is the only below-input choice surface.
+    // Transient workflows stay above the composer; stable session metadata yields the below-input surface to pickers.
     this.root.add(this.#working.root)
     this.root.add(this.#authCeremony.root)
     this.root.add(this.#queue.root)
     this.root.add(this.#greeter.root)
     this.root.add(this.#composer.root)
+    this.root.add(this.#footer.root)
     this.root.add(this.#pickerStack.root)
 
     const update = () => this.#update()
@@ -142,6 +146,7 @@ export class PromptView {
     this.#authCeremony.destroy()
     this.#queue.destroy()
     this.#greeter.destroy()
+    this.#footer.destroy()
     this.#store.dispose()
     this.#pickerStack.destroy()
     this.root.destroyRecursively()
@@ -168,18 +173,31 @@ export class PromptView {
       this.#renderer.height,
       pickerOpen
     )
-    const fixedRows = geometry.protectedRows + greeterRows + (working ? 1 : 0) + authCeremonyRows
+    const queuedInputs = session.queuedInputs
+    const queueActive = queuedInputs.steering.length > 0 || queuedInputs.followUp.length > 0
+    const fixedRowsWithoutFooter = geometry.protectedRows + greeterRows + (working ? 1 : 0) + authCeremonyRows
+    // The transcript owns one row; an active queue needs one summary row before ambient metadata is admitted.
+    const reservedContentRows = 1 + (queueActive ? 1 : 0)
+    const footerFits =
+      fixedRowsWithoutFooter + PromptFooterView.occupiedRows + reservedContentRows <= this.#renderer.height
+    const footerRows = this.#footer.update(
+      layoutPromptFooter(
+        pickerOpen || !geometry.bordered || !footerFits ? { type: "hidden" } : footerPresentation(session),
+        this.#renderer.width
+      )
+    )
+    const fixedRows = fixedRowsWithoutFooter + footerRows
     const pickerVisible = this.#pickerStack.update(Math.max(0, this.#renderer.height - fixedRows))
 
     this.#working.setText(workingStatusText(session, this.#keybindings.getHint("app.interrupt"), Date.now()))
     this.#working.setActive(working)
     if (pickerVisible) this.#queue.hide()
-    else this.#queue.update(session.queuedInputs, Math.max(0, this.#renderer.height - fixedRows))
+    else this.#queue.update(queuedInputs, Math.max(0, this.#renderer.height - fixedRows))
     if (prompt.images !== this.#syncedImages) {
       this.#syncedImages = prompt.images
       this.#composer.syncImageMarkers(prompt.images)
     }
-    this.#composer.update(geometry, composerSlots(session, prompt.images.length))
+    this.#composer.update(geometry, composerSlots(prompt.images.length))
   }
 
   #refreshWorkingStatus = (): void => {
@@ -436,32 +454,21 @@ function workingStatusText(
   return session.compactionStatus.type === "running" ? "Compacting…" : "Working…"
 }
 
-function composerSlots(session: ReturnType<InteractiveStore["getSession"]>, imageCount = 0): ComposerSlots {
-  const context = session.contextUsage
+function composerSlots(imageCount = 0): ComposerSlots {
+  return { topLeft: "", topRight: imageCount === 0 ? [] : [`${imageCount} image${imageCount === 1 ? "" : "s"}`] }
+}
+
+function footerPresentation(session: ReturnType<InteractiveStore["getSession"]>): PromptFooterPresentation {
+  const model = session.modelState
   return {
-    topLeft: session.sessionManager.header.cwd,
-    topRight: [
-      ...(imageCount === 0 ? [] : [`${imageCount} image${imageCount === 1 ? "" : "s"}`]),
-      ...(context.type === "unavailable" ? [] : [contextTitle(context.type, context.percent, context.contextWindow)]),
-      modelTitle(session)
-    ]
+    type: "session",
+    cwd: session.sessionManager.header.cwd,
+    model:
+      model.type === "unselected"
+        ? { type: "unselected" }
+        : { type: "selected", id: model.model.id, thinking: session.thinkingLevel },
+    context: session.contextUsage
   }
-}
-
-function modelTitle(session: ReturnType<InteractiveStore["getSession"]>): string {
-  const state = session.modelState
-  if (state.type === "unselected") return "No model selected"
-  return session.thinkingLevel === "off" ? state.model.id : `${state.model.id} (${session.thinkingLevel})`
-}
-
-function contextTitle(type: "measured" | "estimated", percent: number, contextWindow: number): string {
-  const window =
-    contextWindow < 1_000
-      ? String(contextWindow)
-      : contextWindow < 1_000_000
-        ? `${Math.round(contextWindow / 1_000)}k`
-        : `${(contextWindow / 1_000_000).toFixed(1).replace(/\.0$/, "")}m`
-  return `ctx ${type === "estimated" ? "~" : ""}${Math.round(percent)}%/${window}`
 }
 
 function normalizePastedText(text: string): string {
