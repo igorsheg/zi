@@ -1257,31 +1257,42 @@ class ExtensionWorkerProcess {
 export async function runExtensionWorkerProcess(input: Readable, output: Writable): Promise<void> {
   const decoder = new ExtensionProtocolDecoder(validateHostMessage)
   const worker = new ExtensionWorkerProcess(output)
-  const iterator = input[Symbol.asyncIterator]()
-  const terminal = worker.terminal.then(
-    () => ({ type: "terminal" as const }),
-    cause => Promise.reject(cause)
-  )
+  let inputEnded = false
+  const onData = (chunk: Buffer): void => {
+    try {
+      for (const message of decoder.push(chunk)) worker.receive(message)
+    } catch (cause) {
+      worker.protocolFailure(cause)
+    }
+  }
+  const onEnd = (): void => {
+    inputEnded = true
+    try {
+      decoder.end()
+      void worker.inputEnded().catch(cause => worker.protocolFailure(cause))
+    } catch (cause) {
+      worker.protocolFailure(cause)
+    }
+  }
+  const onClose = (): void => {
+    if (!inputEnded) worker.protocolFailure("Extension host input closed before the worker stopped")
+  }
+  const onError = (cause: Error): void => worker.protocolFailure(cause)
+
+  // Bun 1.3.14's Windows child-process stdin iterator retains one Socket connect listener per read.
+  // One owned listener set preserves streaming admission without accumulating per-frame resources.
+  input.on("data", onData)
+  input.once("end", onEnd)
+  input.once("close", onClose)
+  input.once("error", onError)
 
   try {
-    while (true) {
-      const read = iterator.next().then(result => ({ type: "read" as const, result }))
-      // The single reader serializes frame admission while dispatched work runs independently.
-      // oxlint-disable-next-line eslint/no-await-in-loop
-      const outcome = await Promise.race([read, terminal])
-      if (outcome.type === "terminal") return
-      if (outcome.result.done) {
-        decoder.end()
-        // oxlint-disable-next-line eslint/no-await-in-loop -- EOF settlement belongs to this reader iteration.
-        await worker.inputEnded()
-        return
-      }
-      for (const message of decoder.push(outcome.result.value)) worker.receive(message)
-    }
-  } catch (cause) {
-    worker.protocolFailure(cause)
-    return await worker.terminal
+    await worker.terminal
   } finally {
+    input.off("data", onData)
+    input.off("end", onEnd)
+    input.off("close", onClose)
+    input.off("error", onError)
     input.destroy()
     worker.dispose()
   }
