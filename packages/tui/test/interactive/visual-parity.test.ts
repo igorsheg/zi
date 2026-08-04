@@ -100,7 +100,7 @@ test("representative session keeps the accepted visual hierarchy at normal and c
       "╭──────────────────────────────────────╮",
       "│                                      │",
       "╰──────────────────────────────────────╯",
-      " zi        ctx 15%/247k • faux-1 (high)"
+      " /w.../zi  ctx 15%/247k • faux-1 (high)"
     ])
 
     setup.resize(20, 4)

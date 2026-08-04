@@ -579,6 +579,10 @@ export class AgentSession {
     })
   }
 
+  get homeDir(): string {
+    return this.#reload.paths.homeDir
+  }
+
   get messages(): readonly AgentMessage[] {
     return this.sessionManager.presentationMessages()
   }

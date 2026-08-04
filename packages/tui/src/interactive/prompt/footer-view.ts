@@ -1,4 +1,4 @@
-import { basename } from "node:path"
+import { basename, isAbsolute, relative, resolve, sep } from "node:path"
 
 import { BoxRenderable, TextRenderable, type CliRenderer } from "@opentui/core"
 import type { ContextUsage, ThinkingLevel } from "@with-zi/coding-agent"
@@ -15,6 +15,7 @@ export type PromptFooterPresentation =
   | {
       readonly type: "session"
       readonly cwd: string
+      readonly homeDir: string
       readonly model: PromptFooterModel
       readonly context: ContextUsage
     }
@@ -26,6 +27,8 @@ export type PromptFooterLayout =
 const horizontalPadding = 2
 const sideGap = 2
 const itemSeparator = " • "
+// OpenTUI's native middle truncation needs this width to preserve a useful prefix and basename.
+const minimumTruncatedPathWidth = 8
 
 export class PromptFooterView {
   static readonly occupiedRows = 1
@@ -41,7 +44,6 @@ export class PromptFooterView {
       id: "prompt-footer",
       height: PromptFooterView.occupiedRows,
       flexDirection: "row",
-      justifyContent: "space-between",
       flexShrink: 0,
       paddingLeft: 1,
       paddingRight: 1,
@@ -52,7 +54,11 @@ export class PromptFooterView {
       height: 1,
       wrapMode: "none",
       selectable: false,
-      flexShrink: 0,
+      flexGrow: 1,
+      flexShrink: 1,
+      minWidth: 0,
+      // OpenTUI 0.4.5 retains both ends with a three-cell middle ellipsis.
+      truncate: true,
       fg: theme.text.muted
     })
     this.#right = new TextRenderable(renderer, {
@@ -79,6 +85,9 @@ export class PromptFooterView {
 
     if (previous.type === "hidden" || previous.left !== layout.left) this.#left.content = layout.left
     if (previous.type === "hidden" || previous.right !== layout.right) this.#right.content = layout.right
+    if (previous.type === "hidden" || hasGap(previous) !== hasGap(layout)) {
+      this.root.columnGap = hasGap(layout) ? sideGap : 0
+    }
     this.root.visible = true
     return PromptFooterView.occupiedRows
   }
@@ -95,7 +104,9 @@ export function layoutPromptFooter(presentation: PromptFooterPresentation, width
   if (available <= 0) return { type: "hidden" }
 
   for (const candidate of footerCandidates(presentation)) {
-    if (lineWidth(candidate) <= available) return { type: "line", ...candidate }
+    if (lineWidth(candidate) <= available) {
+      return { type: "line", left: candidate.left, right: candidate.right }
+    }
   }
   return { type: "hidden" }
 }
@@ -103,17 +114,19 @@ export function layoutPromptFooter(presentation: PromptFooterPresentation, width
 interface FooterLine {
   readonly left: string
   readonly right: string
+  readonly leftWidth: number
 }
 
 function footerCandidates(presentation: Extract<PromptFooterPresentation, { type: "session" }>): FooterLine[] {
-  const fullCwd = presentation.cwd
-  const compactCwd = basename(fullCwd) || fullCwd
+  const displayCwd = formatCwd(presentation.cwd, presentation.homeDir)
+  const compactCwd = basename(displayCwd) || displayCwd
   const model = presentation.model
 
   if (model.type === "unselected") {
     return [
-      line(fullCwd, "No model selected"),
+      pathLine(displayCwd, "No model selected"),
       line(compactCwd, "No model selected"),
+      pathLine(displayCwd, "No model"),
       line(compactCwd, "No model"),
       line("", "No model")
     ]
@@ -122,28 +135,54 @@ function footerCandidates(presentation: Extract<PromptFooterPresentation, { type
   const fullModel = model.thinking === "off" ? model.id : `${model.id} (${model.thinking})`
   const context = presentation.context
   if (context.type === "unavailable") {
-    return [line(fullCwd, fullModel), line(compactCwd, fullModel), line(compactCwd, model.id), line(compactCwd, "")]
+    return [
+      pathLine(displayCwd, fullModel),
+      line(compactCwd, fullModel),
+      pathLine(displayCwd, model.id),
+      line(compactCwd, model.id),
+      pathLine(displayCwd, ""),
+      line(compactCwd, "")
+    ]
   }
 
   const fullContext = contextTitle(context.type, context.percent, context.contextWindow)
   const compactContext = contextPercent(context.type, context.percent)
+  const fullRight = joinItems(fullContext, fullModel)
+  const compactRight = joinItems(compactContext, model.id)
   return [
-    line(fullCwd, joinItems(fullContext, fullModel)),
-    line(compactCwd, joinItems(fullContext, fullModel)),
-    line(compactCwd, joinItems(compactContext, model.id)),
+    pathLine(displayCwd, fullRight),
+    line(compactCwd, fullRight),
+    pathLine(displayCwd, compactRight),
+    line(compactCwd, compactRight),
+    pathLine(displayCwd, compactContext),
     line(compactCwd, compactContext),
     line("", compactContext)
   ]
 }
 
+// Pi provenance: pi-coding-agent footer.ts at 73414d08 contracts only cwd values inside the configured home.
+function formatCwd(cwd: string, homeDir: string): string {
+  const resolvedCwd = resolve(cwd)
+  const resolvedHome = resolve(homeDir)
+  const relativeToHome = relative(resolvedHome, resolvedCwd)
+  const insideHome =
+    relativeToHome === "" ||
+    (relativeToHome !== ".." && !relativeToHome.startsWith(`..${sep}`) && !isAbsolute(relativeToHome))
+  if (!insideHome) return cwd
+  return relativeToHome === "" ? "~" : `~${sep}${relativeToHome}`
+}
+
+function pathLine(left: string, right: string): FooterLine {
+  return { left, right, leftWidth: Math.min(textWidth(left), minimumTruncatedPathWidth) }
+}
+
 function line(left: string, right: string): FooterLine {
-  return { left, right }
+  return { left, right, leftWidth: textWidth(left) }
 }
 
 function lineWidth(candidate: FooterLine): number {
-  const left = textWidth(candidate.left)
   const right = textWidth(candidate.right)
-  return left + right + (left > 0 && right > 0 ? sideGap : 0)
+  return candidate.leftWidth + right + (candidate.leftWidth > 0 && right > 0 ? sideGap : 0)
 }
 
 function joinItems(...items: readonly string[]): string {
@@ -162,6 +201,10 @@ function formatTokenCount(tokens: number): string {
   if (tokens < 1_000) return String(tokens)
   if (tokens < 1_000_000) return `${Math.round(tokens / 1_000)}k`
   return `${(tokens / 1_000_000).toFixed(1).replace(/\.0$/, "")}m`
+}
+
+function hasGap(layout: PromptFooterLayout): boolean {
+  return layout.type === "line" && Boolean(layout.left) && Boolean(layout.right)
 }
 
 function sameLayout(left: PromptFooterLayout, right: PromptFooterLayout): boolean {

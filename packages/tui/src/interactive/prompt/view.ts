@@ -463,6 +463,7 @@ function footerPresentation(session: ReturnType<InteractiveStore["getSession"]>)
   return {
     type: "session",
     cwd: session.sessionManager.header.cwd,
+    homeDir: session.homeDir,
     model:
       model.type === "unselected"
         ? { type: "unselected" }

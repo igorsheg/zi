@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test"
+import { join } from "node:path"
 
 import { BoxRenderable, TextareaRenderable } from "@opentui/core"
 import { createModels, createTestAgentRuntime as createAgentRuntime, fauxProvider } from "@with-zi/coding-agent/testing"
@@ -27,6 +28,26 @@ test("prompt footer yields the below-composer surface to pickers", async () => {
     input.setText("")
     await setup.renderOnce()
     expect(footer.visible).toBe(true)
+  } finally {
+    session.dispose()
+    setup.destroy()
+  }
+})
+
+test("prompt footer reads home contraction from the cwd-bound session paths", async () => {
+  const homeDir = process.env.HOME
+  if (!homeDir) throw new Error("Test home not configured")
+  const models = createModels()
+  const faux = fauxProvider()
+  models.setProvider(faux.provider)
+  const cwd = join(homeDir, "workspace", "dev", "personal", "zi")
+  const { session } = await createAgentRuntime({ cwd, models, session: { type: "new", persist: false } })
+  const setup = await createInteractiveTest(session, { width: 80, height: 12 })
+
+  try {
+    await setup.renderOnce()
+    expect(setup.captureCharFrame()).toContain("~/workspace/dev/personal/zi")
+    expect(setup.captureCharFrame()).not.toContain(homeDir)
   } finally {
     session.dispose()
     setup.destroy()
