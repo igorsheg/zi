@@ -45,7 +45,7 @@ export default function (zi: ExtensionAPI): void {
 }
 ```
 
-Zi provides this module to extension workers at runtime. Install it as a development dependency when authoring or type-checking an extension. Extensions execute with the current user's authority; the worker is fault containment, not a security sandbox.
+Zi provides this module to extension workers at runtime. Install it as a development dependency when authoring or type-checking an extension. Extensions execute with the current user's authority; the worker is fault containment, not a security sandbox. When subagents are available, `zi.subagents.send(...)` supplies context without starting idle work, `continue(...)` assigns work, and `interrupt(...)` returns both its outcome and the exact affected cycle's terminal snapshot.
 
 Each callback receives one frozen context containing the runtime mode, absolute working directory, and memory or journal session identity. `agent_start` and `agent_settled` are ordered observational notifications; commands and tools receive the same context plus an invocation-scoped `AbortSignal`. Tool contexts also expose `reportProgress(message)` for bounded, transient invocation updates. Tools default to 30 seconds and may declare a bounded `timeoutMs` of at most one hour.
 

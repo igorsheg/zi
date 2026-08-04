@@ -15,6 +15,7 @@ import type {
   ExtensionShutdownEvent,
   ExtensionStartEvent,
   ExtensionSubagentAPI,
+  ExtensionSubagentInterruptSettlement,
   ExtensionSubagentProfile,
   ExtensionSubagentSnapshot,
   ExtensionToolContext,
@@ -164,7 +165,7 @@ type WorkerSessionRequest =
   | { readonly type: "subagent_send"; readonly settled: VoidDeferred }
   | { readonly type: "subagent_continue"; readonly settled: Deferred<"started_turn" | "follow_up"> }
   | { readonly type: "subagent_wait"; readonly settled: Deferred<readonly ExtensionSubagentSnapshot[]> }
-  | { readonly type: "subagent_interrupt"; readonly settled: Deferred<"interrupted" | "already_idle"> }
+  | { readonly type: "subagent_interrupt"; readonly settled: Deferred<ExtensionSubagentInterruptSettlement> }
   | { readonly type: "subagent_close"; readonly settled: Deferred<ExtensionSubagentSnapshot> }
   | { readonly type: "subagent_list"; readonly settled: Deferred<readonly ExtensionSubagentSnapshot[]> }
 
@@ -201,7 +202,7 @@ export interface WorkerSessionOperations {
     timeoutMs?: number,
     signal?: AbortSignal
   ): Promise<readonly ExtensionSubagentSnapshot[]>
-  interruptSubagent(source: ExtensionSource, name: string): Promise<"interrupted" | "already_idle">
+  interruptSubagent(source: ExtensionSource, name: string): Promise<ExtensionSubagentInterruptSettlement>
   closeSubagent(source: ExtensionSource, name: string): Promise<ExtensionSubagentSnapshot>
   listSubagents(source: ExtensionSource): Promise<readonly ExtensionSubagentSnapshot[]>
 }
@@ -746,7 +747,7 @@ class ExtensionWorkerProcess {
         return settled.promise
       },
       interruptSubagent: (source, name) => {
-        const settled = deferred<"interrupted" | "already_idle">()
+        const settled = deferred<ExtensionSubagentInterruptSettlement>()
         this.#requestSessionOperation(
           generation,
           { type: "subagent_interrupt", settled },
@@ -892,7 +893,7 @@ class ExtensionWorkerProcess {
       return
     }
     if (request.type === "subagent_interrupt" && response.type === "subagent_interrupt_result") {
-      request.settled.resolve(response.result)
+      request.settled.resolve(response.settlement)
       return
     }
     if (request.type === "subagent_close" && response.type === "subagent_close_result") {

@@ -13,6 +13,7 @@ import type {
   ExtensionMessageDelivery,
   ExtensionShutdownReason,
   ExtensionStartReason,
+  ExtensionSubagentInterruptSettlement,
   ExtensionSubagentProfile,
   ExtensionSubagentSnapshot,
   JsonValue as ExtensionJsonValue
@@ -86,7 +87,7 @@ export interface ExtensionSubagentSessionOperations {
     timeoutMs: number | undefined,
     signal: AbortSignal
   ): Promise<readonly ExtensionSubagentSnapshot[]>
-  interrupt(extensionId: string, name: string): Promise<"interrupted" | "already_idle">
+  interrupt(extensionId: string, name: string): Promise<ExtensionSubagentInterruptSettlement>
   close(extensionId: string, name: string): Promise<ExtensionSubagentSnapshot>
   list(extensionId: string): readonly ExtensionSubagentSnapshot[]
 }
@@ -315,7 +316,7 @@ type ExtensionSessionRequestOutcome =
   | { readonly type: "subagent_send_result" }
   | { readonly type: "subagent_continue_result"; readonly delivery: "started_turn" | "follow_up" }
   | { readonly type: "subagent_wait_result"; readonly snapshots: readonly ExtensionSubagentSnapshot[] }
-  | { readonly type: "subagent_interrupt_result"; readonly result: "interrupted" | "already_idle" }
+  | { readonly type: "subagent_interrupt_result"; readonly settlement: ExtensionSubagentInterruptSettlement }
   | { readonly type: "subagent_close_result"; readonly snapshot: ExtensionSubagentSnapshot }
   | { readonly type: "subagent_list_result"; readonly snapshots: readonly ExtensionSubagentSnapshot[] }
   | { readonly type: "session_operation_error"; readonly message: string }
@@ -1905,7 +1906,7 @@ export class ExtensionHost {
           if (!operations.subagents) throw new Error("Subagent session operations are not bound")
           return {
             type: "subagent_interrupt_result",
-            result: await operations.subagents.interrupt(request.extensionId, request.name)
+            settlement: await operations.subagents.interrupt(request.extensionId, request.name)
           }
         case "subagent_close":
           if (!operations.subagents) throw new Error("Subagent session operations are not bound")

@@ -1,6 +1,12 @@
 import type { ChildLifecycleState, SubagentCompletion, SubagentCompletionStatus } from "./child-process.js"
 import { clipUtf8 } from "./child-process.js"
-import { maxLiveChildren, maxRetainedSubagents, type CompletionDelivery, type SubagentSnapshot } from "./supervisor.js"
+import {
+  maxLiveChildren,
+  maxRetainedSubagents,
+  maxSubagentTaskBytes,
+  type CompletionDelivery,
+  type SubagentSnapshot
+} from "./supervisor.js"
 
 const maxSubagentNameBytes = 64
 const maxProfileDescriptionBytes = 4 * 1024
@@ -19,6 +25,8 @@ export interface SubagentToolAgentDetails {
   readonly lifecycle: ChildLifecycleState["type"]
   readonly workCycle?: number
   readonly capturedWorkCycle?: number
+  readonly task?: string
+  readonly elapsedMs?: number
   readonly completionDelivery?: CompletionDelivery["type"]
   readonly completion?: SubagentToolCompletionDetails
 }
@@ -97,20 +105,26 @@ export function projectSubagentToolAgents(snapshots: readonly SubagentSnapshot[]
 
   while (Buffer.byteLength(JSON.stringify(agents)) > maxProjectedSubagentToolEvidenceBytes) {
     const evidence = completionEvidence(agents)
-    if (evidence.length === 0) {
-      throw new Error(`Subagent tool metadata exceeds ${maxProjectedSubagentToolEvidenceBytes} bytes`)
+    if (evidence.length > 0) {
+      const excess = Buffer.byteLength(JSON.stringify(agents)) - maxProjectedSubagentToolEvidenceBytes
+      const retainedBytes = Math.max(0, evidence.reduce((total, item) => total + item.bytes, 0) - excess)
+      const limit = fairEvidenceLimit(evidence, retainedBytes)
+      for (const item of evidence) {
+        if (item.bytes <= limit) continue
+        const value = item.completion[item.field] ?? ""
+        const clipped = clipUtf8(value, limit)
+        item.completion[item.field] = clipped.text
+        item.completion.omittedBytes += clipped.omittedBytes
+        item.completion.truncated = true
+      }
+      continue
     }
+    const task = largestTask(agents)
+    if (!task) throw new Error(`Subagent tool metadata exceeds ${maxProjectedSubagentToolEvidenceBytes} bytes`)
     const excess = Buffer.byteLength(JSON.stringify(agents)) - maxProjectedSubagentToolEvidenceBytes
-    const retainedBytes = Math.max(0, evidence.reduce((total, item) => total + item.bytes, 0) - excess)
-    const limit = fairEvidenceLimit(evidence, retainedBytes)
-    for (const item of evidence) {
-      if (item.bytes <= limit) continue
-      const value = item.completion[item.field] ?? ""
-      const clipped = clipUtf8(value, limit)
-      item.completion[item.field] = clipped.text
-      item.completion.omittedBytes += clipped.omittedBytes
-      item.completion.truncated = true
-    }
+    const clipped = clipUtf8(task.agent.task ?? "", Math.max(0, task.bytes - excess))
+    if (clipped.text) task.agent.task = clipped.text
+    else delete task.agent.task
   }
 
   return Object.freeze(
@@ -165,6 +179,8 @@ interface MutableAgentDetails {
   lifecycle: ChildLifecycleState["type"]
   workCycle?: number
   capturedWorkCycle?: number
+  task?: string
+  elapsedMs?: number
   completionDelivery?: CompletionDelivery["type"]
   completion?: MutableCompletionDetails
 }
@@ -173,6 +189,18 @@ type CompletionEvidence = {
   readonly completion: MutableCompletionDetails
   readonly field: "text" | "reason" | "error"
   readonly bytes: number
+}
+
+function largestTask(
+  agents: readonly MutableAgentDetails[]
+): { readonly agent: MutableAgentDetails; readonly bytes: number } | undefined {
+  let largest: { readonly agent: MutableAgentDetails; readonly bytes: number } | undefined
+  for (const agent of agents) {
+    if (!agent.task) continue
+    const bytes = Buffer.byteLength(agent.task)
+    if (!largest || bytes > largest.bytes) largest = { agent, bytes }
+  }
+  return largest
 }
 
 function completionEvidence(agents: readonly MutableAgentDetails[]): CompletionEvidence[] {
@@ -206,6 +234,8 @@ function projectAgent(snapshot: SubagentSnapshot): SubagentToolAgentDetails {
     lifecycle: snapshot.lifecycle,
     ...(snapshot.workCycle !== undefined ? { workCycle: snapshot.workCycle } : {}),
     ...(snapshot.capturedWorkCycle !== undefined ? { capturedWorkCycle: snapshot.capturedWorkCycle } : {}),
+    ...(snapshot.task ? { task: snapshot.task } : {}),
+    ...(snapshot.elapsedMs !== undefined ? { elapsedMs: snapshot.elapsedMs } : {}),
     ...(snapshot.completionDelivery ? { completionDelivery: snapshot.completionDelivery } : {}),
     ...(snapshot.completion ? { completion: projectCompletion(snapshot.completion) } : {})
   }
@@ -272,6 +302,8 @@ function isAgent(value: unknown): value is SubagentToolAgentDetails {
   }
   if (value.workCycle !== undefined && !isNonNegativeInteger(value.workCycle)) return false
   if (value.capturedWorkCycle !== undefined && !isNonNegativeInteger(value.capturedWorkCycle)) return false
+  if (value.task !== undefined && !isBoundedText(value.task, maxSubagentTaskBytes)) return false
+  if (value.elapsedMs !== undefined && !isNonNegativeFinite(value.elapsedMs)) return false
   if (value.completionDelivery !== undefined && !isCompletionDelivery(value.completionDelivery)) return false
   return value.completion === undefined || isCompletion(value.completion)
 }
@@ -309,6 +341,10 @@ function isNonNegativeInteger(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
 }
 
+function isNonNegativeFinite(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0
+}
+
 function isLifecycle(value: unknown): value is ChildLifecycleState["type"] {
   return (
     value === "starting" ||
@@ -322,7 +358,7 @@ function isLifecycle(value: unknown): value is ChildLifecycleState["type"] {
 }
 
 function isCompletionDelivery(value: unknown): value is CompletionDelivery["type"] {
-  return value === "pending" || value === "durable" || value === "delivered"
+  return value === "pending" || value === "durable" || value === "claimed" || value === "delivered"
 }
 
 function isCompletionStatus(value: unknown): value is SubagentCompletionStatus {

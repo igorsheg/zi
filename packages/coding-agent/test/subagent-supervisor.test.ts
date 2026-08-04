@@ -7,9 +7,18 @@ import { join, resolve } from "node:path"
 import { ZiPaths } from "../src/paths.js"
 import { createProcessTreeTracker } from "../src/processes/process-tree.js"
 import { SessionManager } from "../src/session-manager.js"
-import { maxRetainedSubagents, SubagentSupervisor } from "../src/subagents/supervisor.js"
+import { clipUtf8 } from "../src/subagents/child-process.js"
+import { durablePreviewBytes, maxRetainedSubagents, SubagentSupervisor } from "../src/subagents/supervisor.js"
 
 const mockChild = resolve(import.meta.dir, "fixtures/mock-rpc-child.ts")
+
+test("UTF-8 clipping handles maximum admitted task text without splitting code points", () => {
+  const clipped = clipUtf8(`${"a".repeat(8 * 1024 * 1024 - 3)}界`, 256)
+  expect(Buffer.byteLength(clipped.text)).toBe(256)
+  expect(clipped.omittedBytes).toBe(clipped.originalBytes - 256)
+  expect(clipped.text).not.toContain("�")
+  expect(clipUtf8(`${"a".repeat(255)}界`, 256).text).toBe("a".repeat(255))
+})
 
 test("SubagentSupervisor spawns, durably publishes completion, waits, and closes", async () => {
   const harness = await createHarness("vertical-slice", { reply: "supervisor-ok", delayMs: 20 })
@@ -55,6 +64,53 @@ test("SubagentSupervisor spawns, durably publishes completion, waits, and closes
     await harness.supervisor.close(name)
     expect(harness.supervisor.snapshots()[0]).toMatchObject({ name, lifecycle: "exited" })
     expect(harness.sessionManager.subagentEntries().at(-1)).toMatchObject({ event: "exited", name })
+  } finally {
+    await harness.dispose()
+  }
+}, 15_000)
+
+test("durable completions can be delivered to parent context exactly once", async () => {
+  const harness = await createHarness("context-delivery", { reply: "context-ok", delayMs: 20 })
+  try {
+    const name = await harness.supervisor.spawn("context-worker", "inspect")
+    await waitFor(() => harness.supervisor.status().readyNames.includes(name), 5_000)
+
+    const delivered: string[] = []
+    harness.supervisor.deliverCompletions(completion => delivered.push(`${completion.workCycle}:${completion.text}`))
+    harness.supervisor.deliverCompletions(completion => delivered.push(`${completion.workCycle}:${completion.text}`))
+
+    await harness.supervisor.continue(name, "second cycle")
+    await waitFor(() => harness.supervisor.status().readyNames.includes(name), 5_000)
+    harness.supervisor.deliverCompletions(completion => delivered.push(`${completion.workCycle}:${completion.text}`))
+
+    expect(delivered).toEqual(["1:context-ok", "2:context-ok"])
+    expect(harness.supervisor.status()).toEqual({ workingNames: [], readyNames: [] })
+    expect(harness.supervisor.snapshots()[0]).toMatchObject({ completionDelivery: "delivered" })
+  } finally {
+    await harness.dispose()
+  }
+}, 15_000)
+
+test("parent evidence remains delivered when its redundant delivery marker cannot persist", async () => {
+  const harness = await createHarness("delivery-marker-failure", { reply: "durable-parent-evidence", delayMs: 20 })
+  try {
+    const name = await harness.supervisor.spawn("context-worker", "inspect")
+    await waitFor(() => harness.supervisor.status().readyNames.includes(name), 5_000)
+    const append = harness.sessionManager.appendSubagent.bind(harness.sessionManager)
+    Object.defineProperty(harness.sessionManager, "appendSubagent", {
+      configurable: true,
+      value(data: Parameters<SessionManager["appendSubagent"]>[0]) {
+        if (data.event === "work_cycle_delivered") throw new Error("journal unavailable")
+        return append(data)
+      }
+    })
+
+    const delivered: string[] = []
+    harness.supervisor.deliverCompletions(completion => delivered.push(completion.text))
+    harness.supervisor.deliverCompletions(completion => delivered.push(completion.text))
+
+    expect(delivered).toEqual(["durable-parent-evidence"])
+    expect(harness.supervisor.status().readyNames).toEqual([])
   } finally {
     await harness.dispose()
   }
@@ -383,6 +439,27 @@ test("concurrent continues serialize work-cycle admission", async () => {
   }
 }, 15_000)
 
+test("a rejected idle assignment publishes terminal evidence and keeps the child reusable", async () => {
+  const harness = await createHarness("rejected-assignment", { reply: "reused-ok", delayMs: 20 })
+  try {
+    const name = await harness.supervisor.spawn("cycle-worker", "first cycle")
+    await harness.supervisor.wait([name], 5_000)
+
+    expect(harness.supervisor.continue(name, "__reject_prompt__")).rejects.toThrow("prompt rejected")
+    const rejected = await harness.supervisor.wait([name], 0)
+    expect(rejected[0]).toMatchObject({
+      capturedWorkCycle: 2,
+      completion: { workCycle: 2, status: "failed", reason: "assignment_failed", error: "prompt rejected" }
+    })
+
+    expect(await harness.supervisor.continue(name, "third cycle")).toBe("started_turn")
+    const reused = await harness.supervisor.wait([name], 5_000)
+    expect(reused[0]).toMatchObject({ completion: { workCycle: 3, status: "completed", text: "reused-ok" } })
+  } finally {
+    await harness.dispose()
+  }
+}, 15_000)
+
 test("shutdown after work-cycle admission publishes terminal evidence", async () => {
   const harness = await createHarness("continue-shutdown-admission", { delayMs: 250 })
   let shutdown: Promise<void> | undefined
@@ -429,7 +506,7 @@ test("shutdown after work-cycle admission publishes terminal evidence", async ()
   }
 }, 15_000)
 
-test("ready results remain visible while the same child starts another cycle", async () => {
+test("wait returns an older pending result before a newer active cycle", async () => {
   const harness = await createHarness("ready-while-working", { reply: "cycle-ok", delayMs: 200 })
   try {
     const name = await harness.supervisor.spawn("cycle-worker", "first cycle")
@@ -438,14 +515,46 @@ test("ready results remain visible while the same child starts another cycle", a
     await harness.supervisor.continue(name, "second cycle")
     expect(harness.supervisor.status()).toEqual({ workingNames: [name], readyNames: [name] })
 
-    await harness.supervisor.wait([name], 5_000)
+    const older = await harness.supervisor.wait([name], 0)
+    expect(older[0]).toMatchObject({
+      lifecycle: "running",
+      capturedWorkCycle: 1,
+      completion: { workCycle: 1, text: "cycle-ok" }
+    })
+    expect(harness.supervisor.status()).toEqual({ workingNames: [name], readyNames: [] })
+
+    const newer = await harness.supervisor.wait([name], 5_000)
+    expect(newer[0]).toMatchObject({ capturedWorkCycle: 2, completion: { workCycle: 2, text: "cycle-ok" } })
     expect(harness.supervisor.status()).toEqual({ workingNames: [], readyNames: [] })
   } finally {
     await harness.dispose()
   }
 }, 15_000)
 
-test("a partial later-cycle timeout delivers only exact captured completions", async () => {
+test("concurrent model waits claim once and nested Code Mode release restores canonical delivery", async () => {
+  const harness = await createHarness("concurrent-wait-claims", { reply: "claimed-once", delayMs: 20 })
+  try {
+    const name = await harness.supervisor.spawn("cycle-worker", "first cycle")
+    await waitFor(() => harness.supervisor.status().readyNames.includes(name), 5_000)
+
+    const waits = await Promise.all([
+      harness.supervisor.waitForTool([name], 0, undefined, "parent:code:0"),
+      harness.supervisor.waitForTool([name], 0, undefined, "direct-tool")
+    ])
+    expect(waits.flat().filter(snapshot => snapshot.completion)).toHaveLength(1)
+    expect(harness.supervisor.status().readyNames).toEqual([])
+
+    harness.supervisor.releaseCompletionClaims("parent:code:")
+    expect(harness.supervisor.status().readyNames).toEqual([name])
+    const delivered: string[] = []
+    harness.supervisor.deliverCompletions(completion => delivered.push(completion.text))
+    expect(delivered).toEqual(["claimed-once"])
+  } finally {
+    await harness.dispose()
+  }
+}, 15_000)
+
+test("a multi-agent wait drains each oldest pending cycle independently", async () => {
   const harness = await createHarness("later-cycle-timeout", { reply: "cycle-ok", delayMs: 300 })
   try {
     const running = await harness.supervisor.spawn("cycle-worker", "first cycle")
@@ -453,39 +562,75 @@ test("a partial later-cycle timeout delivers only exact captured completions", a
     await waitFor(() => harness.supervisor.status().readyNames.length === 2, 5_000)
 
     await harness.supervisor.continue(running, "second cycle")
-    const timedOut = await harness.supervisor.wait([running, completed], 0)
+    const pending = await harness.supervisor.wait([running, completed], 0)
 
-    expect(timedOut[0]).toMatchObject({ name: running, lifecycle: "running", workCycle: 2 })
-    expect(timedOut[0]?.completion).toBeUndefined()
-    expect(timedOut[1]).toMatchObject({
-      name: completed,
-      lifecycle: "idle",
-      workCycle: 1,
+    expect(pending[0]).toMatchObject({
+      name: running,
+      lifecycle: "running",
+      capturedWorkCycle: 1,
       completion: { workCycle: 1, status: "completed" }
     })
-    expect(harness.supervisor.status()).toEqual({ workingNames: [running], readyNames: [running] })
+    expect(pending[1]).toMatchObject({
+      name: completed,
+      lifecycle: "idle",
+      capturedWorkCycle: 1,
+      completion: { workCycle: 1, status: "completed" }
+    })
+    expect(harness.supervisor.status()).toEqual({ workingNames: [running], readyNames: [] })
 
-    await harness.supervisor.wait([running], 5_000)
+    const current = await harness.supervisor.wait([running], 5_000)
+    expect(current[0]).toMatchObject({ capturedWorkCycle: 2, completion: { workCycle: 2 } })
     expect(harness.supervisor.status()).toEqual({ workingNames: [], readyNames: [] })
   } finally {
     await harness.dispose()
   }
 }, 15_000)
 
-test("closing new work synthesizes its failure even when an earlier result remains ready", async () => {
+test("closing new work returns exact terminal evidence while preserving the older result", async () => {
   const harness = await createHarness("close-new-cycle", { reply: "cycle-ok", delayMs: 300 })
   try {
     const name = await harness.supervisor.spawn("cycle-worker", "first cycle")
     await waitFor(() => harness.supervisor.status().readyNames.length === 1, 5_000)
 
     await harness.supervisor.continue(name, "second cycle")
-    await harness.supervisor.close(name)
+    const closed = await harness.supervisor.closeAndDeliver(name)
+    expect(closed).toMatchObject({
+      capturedWorkCycle: 2,
+      completionDelivery: "delivered",
+      completion: { workCycle: 2, status: "failed", reason: "child_exited" }
+    })
 
     expect(harness.supervisor.snapshots()[0]).toMatchObject({
       lifecycle: "exited",
       completionDelivery: "durable",
-      completion: { workCycle: 2, status: "failed", reason: "child_exited" }
+      completion: { workCycle: 1, status: "completed" }
     })
+    const first = await harness.supervisor.wait([name], 0)
+    expect(first[0]).toMatchObject({ completion: { workCycle: 1, status: "completed" } })
+    const second = await harness.supervisor.wait([name], 0)
+    expect(second[0]).toMatchObject({ completion: { workCycle: 2, status: "failed", reason: "child_exited" } })
+  } finally {
+    await harness.dispose()
+  }
+}, 15_000)
+
+test("provider failure metadata is bounded before durable completion admission", async () => {
+  const harness = await createHarness("bounded-provider-error", {
+    reply: "failed-output",
+    error: "x".repeat(64 * 1024),
+    delayMs: 20
+  })
+  try {
+    const name = await harness.supervisor.spawn("failed-worker", "fail with a large provider error")
+    await waitFor(() => harness.supervisor.status().readyNames.includes(name), 5_000)
+    const [snapshot] = await harness.supervisor.wait([name], 0)
+    expect(snapshot?.completion).toMatchObject({ workCycle: 1, status: "failed", text: "failed-output" })
+    expect(Buffer.byteLength(snapshot?.completion?.error ?? "")).toBe(durablePreviewBytes)
+    expect(
+      harness.sessionManager
+        .subagentEntries()
+        .find(entry => entry.event === "work_cycle_finished" && entry.name === name)
+    ).toMatchObject({ error: "x".repeat(durablePreviewBytes) })
   } finally {
     await harness.dispose()
   }
@@ -500,7 +645,9 @@ test("SubagentSupervisor publishes bounded actionable diagnostics when a child p
       lifecycle: "exited",
       completion: { status: "failed", reason: "child_failed", error: "Subagent RPC emitted invalid JSONL" }
     })
-    expect(harness.sessionManager.subagentEntries().at(-2)).toMatchObject({
+    expect(
+      harness.sessionManager.subagentEntries().findLast(entry => entry.event === "work_cycle_finished")
+    ).toMatchObject({
       event: "work_cycle_finished",
       status: "failed",
       reason: "child_failed",
@@ -515,13 +662,10 @@ test("SubagentSupervisor interrupts a child and reuses it for another cycle", as
   const harness = await createHarness("interrupt", { reply: "reused-ok", delayMs: 250 })
   try {
     const name = await harness.supervisor.spawn("reusable-worker", "long first cycle")
-    expect(await harness.supervisor.interrupt(name)).toBe("interrupted")
-
-    const interrupted = await harness.supervisor.wait([name], 5_000)
-    expect(interrupted[0]).toMatchObject({
-      lifecycle: "idle",
-      workCycle: 1,
-      completion: { status: "cancelled", workCycle: 1 }
+    const interrupted = await harness.supervisor.interruptAndWait(name)
+    expect(interrupted).toMatchObject({
+      result: "interrupted",
+      snapshot: { lifecycle: "idle", workCycle: 1, completion: { status: "cancelled", workCycle: 1 } }
     })
 
     await harness.supervisor.continue(name, "reuse child")
@@ -531,6 +675,23 @@ test("SubagentSupervisor interrupts a child and reuses it for another cycle", as
       workCycle: 2,
       completion: { status: "completed", text: "reused-ok", workCycle: 2 }
     })
+  } finally {
+    await harness.dispose()
+  }
+}, 15_000)
+
+test("cancelling interrupt settlement preserves exact cycle evidence", async () => {
+  const harness = await createHarness("interrupt-cancel", { reply: "cancelled", delayMs: 250 })
+  try {
+    const name = await harness.supervisor.spawn("reusable-worker", "long first cycle")
+    const controller = new AbortController()
+    controller.abort()
+    expect(harness.supervisor.interruptAndWaitForTool(name, controller.signal)).rejects.toMatchObject({
+      name: "AbortError"
+    })
+
+    const retained = await harness.supervisor.wait([name], 5_000)
+    expect(retained[0]).toMatchObject({ capturedWorkCycle: 1, completion: { workCycle: 1, status: "cancelled" } })
   } finally {
     await harness.dispose()
   }
@@ -616,7 +777,12 @@ test("recovered completion and exited projections stay bounded", async () => {
   for (let index = 0; index < 40; index++) {
     const workerName = `worker-${index}`
     sessionManager.appendSubagent({ event: "starting", name: workerName })
-    sessionManager.appendSubagent({ event: "work_cycle_started", name: workerName, workCycle: 1 })
+    sessionManager.appendSubagent({
+      event: "work_cycle_started",
+      name: workerName,
+      workCycle: 1,
+      task: `task-${index}`
+    })
     sessionManager.appendSubagent({
       event: "work_cycle_finished",
       name: workerName,
@@ -628,6 +794,7 @@ test("recovered completion and exited projections stay bounded", async () => {
       truncated: false,
       durationMs: 1
     })
+    if (index < 8) sessionManager.appendSubagent({ event: "work_cycle_delivered", name: workerName, workCycle: 1 })
   }
   const supervisor = new SubagentSupervisor({
     command: [join(root, "unused")],
@@ -639,7 +806,7 @@ test("recovered completion and exited projections stay bounded", async () => {
   })
   try {
     expect(supervisor.snapshots()).toHaveLength(32)
-    expect(supervisor.snapshots()[0]?.name).toBe("worker-8")
+    expect(supervisor.snapshots()[0]).toMatchObject({ name: "worker-8", task: "task-8", elapsedMs: 1 })
     expect(supervisor.spawn("worker-0", "duplicate evicted child")).rejects.toThrow(
       "Subagent name already in use: worker-0"
     )
@@ -647,6 +814,97 @@ test("recovered completion and exited projections stay bounded", async () => {
     expect(await supervisor.wait(["worker-39"], 0)).toMatchObject([
       { completion: { text: "result-39" }, completionDelivery: "durable" }
     ])
+  } finally {
+    await supervisor.shutdown()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test("recovery rejects an impossible journal instead of evicting undelivered evidence", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-subagent-recovery-overflow-"))
+  const paths = new ZiPaths(join(root, "project"), join(root, "agent"))
+  await mkdir(paths.cwd, { recursive: true })
+  const sessionManager = SessionManager.create(paths, { persist: false })
+  for (let index = 0; index <= maxRetainedSubagents; index++) {
+    const name = `worker-${index}`
+    sessionManager.appendSubagent({ event: "starting", name })
+    sessionManager.appendSubagent({ event: "work_cycle_started", name, workCycle: 1 })
+    sessionManager.appendSubagent({
+      event: "work_cycle_finished",
+      name,
+      workCycle: 1,
+      status: "completed",
+      preview: `result-${index}`,
+      originalBytes: 9,
+      omittedBytes: 0,
+      truncated: false,
+      durationMs: 1
+    })
+  }
+  try {
+    expect(
+      () =>
+        new SubagentSupervisor({
+          command: [join(root, "unused")],
+          cwd: paths.cwd,
+          env: {},
+          selection: () => ({ model: "faux/faux-1", thinkingLevel: "off" }),
+          sessionManager,
+          processTreeTracker: createProcessTreeTracker()
+        })
+    ).toThrow(`more than ${maxRetainedSubagents} undelivered subagent completions`)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test("restored parent-context evidence suppresses duplicate completion delivery", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-subagent-delivery-recovery-"))
+  const paths = new ZiPaths(join(root, "project"), join(root, "agent"))
+  await mkdir(paths.cwd, { recursive: true })
+  const sessionManager = SessionManager.create(paths, { persist: false })
+  sessionManager.appendSubagent({ event: "starting", name: "restored-worker" })
+  sessionManager.appendSubagent({ event: "work_cycle_started", name: "restored-worker", workCycle: 1 })
+  sessionManager.appendSubagent({
+    event: "work_cycle_finished",
+    name: "restored-worker",
+    workCycle: 1,
+    status: "completed",
+    preview: "restored-result",
+    originalBytes: 15,
+    omittedBytes: 0,
+    truncated: false,
+    durationMs: 1
+  })
+  sessionManager.appendSubagent({
+    event: "work_cycle_finished",
+    name: "restored-worker",
+    workCycle: 1,
+    status: "completed",
+    preview: "duplicate-result",
+    originalBytes: 16,
+    omittedBytes: 0,
+    truncated: false,
+    durationMs: 2
+  })
+  sessionManager.appendSubagent({ event: "work_cycle_delivered", name: "restored-worker", workCycle: 1 })
+  const supervisor = new SubagentSupervisor({
+    command: [join(root, "unused")],
+    cwd: paths.cwd,
+    env: {},
+    selection: () => ({ model: "faux/faux-1", thinkingLevel: "off" }),
+    sessionManager,
+    processTreeTracker: createProcessTreeTracker()
+  })
+  try {
+    const delivered: string[] = []
+    supervisor.deliverCompletions(completion => delivered.push(completion.text))
+    expect(delivered).toEqual([])
+    expect(supervisor.status().readyNames).toEqual([])
+    expect(supervisor.snapshots()[0]).toMatchObject({
+      completionDelivery: "delivered",
+      completion: { text: "restored-result", durationMs: 1 }
+    })
   } finally {
     await supervisor.shutdown()
     await rm(root, { recursive: true, force: true })
@@ -676,6 +934,31 @@ test("SubagentSupervisor resolves the parent's current model selection without e
   } finally {
     await harness.dispose()
     await Promise.all([rm(argvPath, { force: true }), rm(apiKeyPath, { force: true })])
+  }
+}, 15_000)
+
+test("close cleans up and returns terminal evidence when lifecycle journaling fails", async () => {
+  const harness = await createHarness("close-journal-failure", { delayMs: 300 })
+  try {
+    const name = await harness.supervisor.spawn("journal-worker", "active cycle")
+    const append = harness.sessionManager.appendSubagent.bind(harness.sessionManager)
+    Object.defineProperty(harness.sessionManager, "appendSubagent", {
+      configurable: true,
+      value(data: Parameters<SessionManager["appendSubagent"]>[0]) {
+        if (data.event === "closing" || data.event === "exited") throw new Error("journal unavailable")
+        return append(data)
+      }
+    })
+
+    const closed = await harness.supervisor.closeAndDeliver(name)
+    expect(closed).toMatchObject({
+      lifecycle: "exited",
+      capturedWorkCycle: 1,
+      completion: { workCycle: 1, status: "failed", reason: "child_exited" }
+    })
+    expect(harness.supervisor.capacity()).toEqual({ live: 0, maximum: 4 })
+  } finally {
+    await harness.dispose()
   }
 }, 15_000)
 
@@ -724,6 +1007,7 @@ async function createHarness(
   name: string,
   options: {
     readonly reply?: string
+    readonly error?: string
     readonly delayMs?: number
     readonly descendant?: boolean
     readonly argvPath?: string
@@ -754,6 +1038,7 @@ async function createHarness(
       ...process.env,
       MOCK_RPC_REPLY: options.reply ?? "child-done",
       MOCK_RPC_DELAY_MS: String(options.delayMs ?? 30),
+      ...(options.error ? { MOCK_RPC_ERROR: options.error } : {}),
       ...(descendantMarker ? { MOCK_RPC_DESCENDANT_PID: descendantMarker } : {}),
       ...(options.argvPath ? { MOCK_RPC_ARGV: options.argvPath } : {}),
       ...(options.apiKeyPath ? { MOCK_RPC_INTERNAL_API_KEY: options.apiKeyPath } : {}),

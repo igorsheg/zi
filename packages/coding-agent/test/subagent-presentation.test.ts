@@ -228,8 +228,8 @@ test("wait presents its exact captured completion after the child advances", () 
 
 test("administrative subagent successes remain header-only in compact mode", () => {
   const cases = [
-    ["send_subagent", "send", "Messaged"],
-    ["continue_subagent", "continue", "Assigned follow-up"],
+    ["send_subagent_message", "send", "Sent context"],
+    ["assign_subagent_task", "continue", "Assigned task"],
     ["interrupt_subagent", "interrupt", "Interrupted"],
     ["close_subagent", "close", "Closed"]
   ] as const
@@ -268,7 +268,18 @@ test("list presentation reports authoritative working and ready counts", () => {
         type: "subagent",
         outcome: "success",
         operation: "list",
-        agents: [agent, { ...agent, name: "active-worker", lifecycle: "running", completionDelivery: "delivered" }],
+        agents: [
+          agent,
+          {
+            ...agent,
+            name: "active-worker",
+            lifecycle: "running",
+            workCycle: 2,
+            task: "Inspect shutdown ownership",
+            elapsedMs: 12_000,
+            completionDelivery: "delivered"
+          }
+        ],
         workingNames: ["active-worker"],
         readyNames: [agent.name, "active-worker"]
       }
@@ -279,7 +290,7 @@ test("list presentation reports authoritative working and ready counts", () => {
   expect(presentation.preview.compact).toEqual({ type: "hidden" })
   expect(presentation.body).toEqual({
     type: "text",
-    text: "Shutdown reviewer — result ready · wait, continue, or close\nActive worker — working · result ready",
+    text: "Shutdown reviewer — result ready · wait, assign, or close · cycle 1\nActive worker — working · result ready · cycle 2 · 12.0s — Inspect shutdown ownership",
     tone: "muted"
   })
 })
@@ -307,8 +318,8 @@ test("all subagent built-ins keep semantic rows for partial and malformed data",
   for (const name of [
     "list_subagent_profiles",
     "spawn_subagent",
-    "send_subagent",
-    "continue_subagent",
+    "send_subagent_message",
+    "assign_subagent_task",
     "wait_subagents",
     "interrupt_subagent",
     "close_subagent",

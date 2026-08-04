@@ -13,6 +13,7 @@ import type {
   ExtensionShutdownReason,
   ExtensionStartReason,
   ExtensionThinkingLevel,
+  ExtensionSubagentInterruptSettlement,
   ExtensionSubagentProfile,
   ExtensionSubagentSnapshot
 } from "@with-zi/extension-api"
@@ -76,6 +77,7 @@ export const maxExtensionSubagentModelBytes = 4 * 1024
 export const maxExtensionSubagentInstructionsBytes = 8 * 1024
 export const maxExtensionSubagentTextBytes = 8 * 1024 * 1024 - maxExtensionSubagentInstructionsBytes - 16
 export const maxExtensionSubagentCompletionBytes = 64 * 1024
+export const maxExtensionSubagentTaskBytes = 256
 export const maxExtensionSubagentWaitMs = maxExtensionToolTimeoutMs
 export const maxExtensionSubagentCatalogBytes = 2 * 1024 * 1024
 export const maxExtensionJsonDepth = 32
@@ -200,7 +202,7 @@ export type HostMessage =
       readonly type: "subagent_interrupt_result"
       readonly generation: number
       readonly requestId: number
-      readonly result: "interrupted" | "already_idle"
+      readonly settlement: ExtensionSubagentInterruptSettlement
     }
   | {
       readonly type: "subagent_close_result"
@@ -716,7 +718,7 @@ export function validateHostMessage(value: unknown): HostMessage {
         type: "subagent_interrupt_result",
         generation: positiveInteger(message.generation, "generation"),
         requestId: positiveInteger(message.requestId, "requestId"),
-        result: subagentInterruptResult(message.result)
+        settlement: extensionSubagentInterruptSettlement(message.settlement)
       })
     case "subagent_close_result":
       return Object.freeze({
@@ -1197,6 +1199,18 @@ function extensionSubagentSnapshot(value: unknown): ExtensionSubagentSnapshot {
   return Object.freeze({
     name: subagentName(snapshot.name),
     lifecycle,
+    ...(snapshot.workCycle === undefined
+      ? {}
+      : { workCycle: nonNegativeInteger(snapshot.workCycle, "subagent workCycle") }),
+    ...(snapshot.capturedWorkCycle === undefined
+      ? {}
+      : { capturedWorkCycle: nonNegativeInteger(snapshot.capturedWorkCycle, "subagent capturedWorkCycle") }),
+    ...(snapshot.task === undefined
+      ? {}
+      : { task: boundedRequiredText(snapshot.task, "subagent task", maxExtensionSubagentTaskBytes) }),
+    ...(snapshot.elapsedMs === undefined
+      ? {}
+      : { elapsedMs: nonNegativeInteger(snapshot.elapsedMs, "subagent elapsedMs") }),
     resultReady: requiredBoolean(snapshot.resultReady, "subagent resultReady"),
     ...(snapshot.completion === undefined ? {} : { completion: extensionSubagentCompletion(snapshot.completion) })
   })
@@ -1208,6 +1222,7 @@ function extensionSubagentCompletion(value: unknown): NonNullable<ExtensionSubag
     throw new ExtensionProtocolError("Unknown subagent completion status")
   }
   return Object.freeze({
+    workCycle: positiveInteger(completion.workCycle, "subagent completion workCycle"),
     status: completion.status,
     text: boundedTextValue(completion.text, "subagent completion text", maxExtensionSubagentCompletionBytes),
     originalBytes: nonNegativeInteger(completion.originalBytes, "subagent originalBytes"),
@@ -1407,11 +1422,12 @@ function subagentDelivery(value: unknown): "started_turn" | "follow_up" {
   return value
 }
 
-function subagentInterruptResult(value: unknown): "interrupted" | "already_idle" {
-  if (value !== "interrupted" && value !== "already_idle") {
+function extensionSubagentInterruptSettlement(value: unknown): ExtensionSubagentInterruptSettlement {
+  const settlement = protocolRecord(value)
+  if (settlement.result !== "interrupted" && settlement.result !== "already_idle") {
     throw new ExtensionProtocolError("Unknown subagent interrupt result")
   }
-  return value
+  return Object.freeze({ result: settlement.result, snapshot: extensionSubagentSnapshot(settlement.snapshot) })
 }
 
 function commandName(value: unknown): string {

@@ -6,6 +6,7 @@ import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
 
 import { createProcessTreeTracker, type ProcessScope } from "../packages/coding-agent/src/processes/process-tree.js"
+import { SessionManager } from "../packages/coding-agent/src/session-manager.js"
 
 const acceptanceText = "Profile-driven subagent acceptance passed."
 const acceptanceApiKey = "compiled-subagent-private-key"
@@ -13,8 +14,8 @@ const requestLimitBytes = 8 * 1024 * 1024
 const subagentToolNames = Object.freeze([
   "list_subagent_profiles",
   "spawn_subagent",
-  "send_subagent",
-  "continue_subagent",
+  "send_subagent_message",
+  "assign_subagent_task",
   "wait_subagents",
   "interrupt_subagent",
   "close_subagent",
@@ -129,6 +130,11 @@ async function runMode(
       throw new Error(`Compiled ${mode} subagent acceptance failed: ${processFailure}`)
     }
     provider.assertComplete()
+    if (mode === "close") {
+      await runRestorationProbe(executable, project, agentDirectory, markerPath, declaration, provider, 1)
+      await compactDeliveredCompletion(agentDirectory)
+      await runRestorationProbe(executable, project, agentDirectory, markerPath, declaration, provider, 0)
+    }
     await assertNativeJournal(agentDirectory, provider.name, mode)
     marker = { ...(await readProcessMarker(markerPath)), descendantPid: await readPidMarker(descendantMarkerPath) }
     await waitFor(
@@ -159,6 +165,8 @@ class SubagentProvider {
   #childProviderRequests = 0
   #resultProbeId: string | undefined
   #resultProbeCount = 0
+  #initialCompletionDelivered = false
+  #restorationOccurrences: number | undefined
   #name: string | undefined
   #parentPhase = "starting"
   #childPhase = "starting"
@@ -182,6 +190,12 @@ class SubagentProvider {
 
   diagnostic(): string {
     return `parent=${this.#parentPhase}; child=${this.#childPhase}; child requests=${this.#childProviderRequests}; result probes=${this.#resultProbeCount}`
+  }
+
+  beginRestorationProbe(expectedOccurrences: number): void {
+    this.#complete = false
+    this.#restorationOccurrences = expectedOccurrences
+    this.#parentPhase = "restoring"
   }
 
   assertComplete(processFailure?: string): void {
@@ -278,6 +292,17 @@ class SubagentProvider {
 
   async #receiveParent(payloadText: string, outputs: ReadonlyMap<string, string>): Promise<Response> {
     this.#parentPhase = [...outputs.keys()].at(-1) ?? "initial"
+    if (this.#restorationOccurrences !== undefined) {
+      const occurrences = payloadText.split("<subagent_completion>").length - 1
+      if (occurrences !== this.#restorationOccurrences) {
+        throw new Error(
+          `Compiled restoration retained ${occurrences} subagent completions instead of ${this.#restorationOccurrences}`
+        )
+      }
+      this.#restorationOccurrences = undefined
+      this.#complete = true
+      return eventStreamResponse(textEvents(acceptanceText, "restored"))
+    }
     const profileOutput = outputs.get("acceptance_profiles")
     if (!profileOutput) {
       return eventStreamResponse(toolEvents("list_subagent_profiles", "acceptance_profiles", {}))
@@ -315,8 +340,17 @@ class SubagentProvider {
     outputs: ReadonlyMap<string, string>,
     name: string
   ): Promise<Response> {
+    const completionOccurrences = payloadText.split("<subagent_completion>").length - 1
+    if (completionOccurrences > 1) throw new Error("Compiled parent duplicated hidden subagent completion context")
+    if (completionOccurrences === 1) {
+      if (!payloadText.includes("Compiled child completed.")) {
+        throw new Error("Compiled parent hidden completion omitted child evidence")
+      }
+      this.#initialCompletionDelivered = true
+    }
+
     const initialWait = outputs.get("acceptance_wait_initial")
-    if (!initialWait) {
+    if (!initialWait && !this.#initialCompletionDelivered) {
       if (this.#resultProbeId) {
         const probeOutput = outputs.get(this.#resultProbeId)
         if (!probeOutput) throw new Error(`Compiled parent omitted ${this.#resultProbeId} output`)
@@ -343,11 +377,11 @@ class SubagentProvider {
       this.#resultProbeId = `acceptance_result_probe_${this.#resultProbeCount}`
       return eventStreamResponse(toolEvents("list_subagents", this.#resultProbeId, {}))
     }
-    assertWaitCompletion(initialWait, { status: "completed", text: "Compiled child completed." })
+    if (initialWait) assertWaitCompletion(initialWait, { status: "completed", text: "Compiled child completed." })
 
     if (!outputs.has("acceptance_send_idle")) {
       return eventStreamResponse(
-        toolEvents("send_subagent", "acceptance_send_idle", { name: name, text: "Queue this without waking." })
+        toolEvents("send_subagent_message", "acceptance_send_idle", { name: name, text: "Queue this without waking." })
       )
     }
     if (!outputs.has("acceptance_continue_second")) {
@@ -357,7 +391,7 @@ class SubagentProvider {
         throw new Error("Compiled queue-only send woke an idle child")
       }
       return eventStreamResponse(
-        toolEvents("continue_subagent", "acceptance_continue_second", {
+        toolEvents("assign_subagent_task", "acceptance_continue_second", {
           name: name,
           text: "Complete the second cycle."
         })
@@ -373,7 +407,7 @@ class SubagentProvider {
 
     if (!outputs.has("acceptance_continue_interrupt")) {
       return eventStreamResponse(
-        toolEvents("continue_subagent", "acceptance_continue_interrupt", {
+        toolEvents("assign_subagent_task", "acceptance_continue_interrupt", {
           name: name,
           text: "Interrupt the active third cycle."
         })
@@ -388,16 +422,10 @@ class SubagentProvider {
       return eventStreamResponse(toolEvents("interrupt_subagent", "acceptance_interrupt", { name: name }))
     }
     assertInterruptResult(outputs.get("acceptance_interrupt")!, "interrupted")
-    if (!outputs.has("acceptance_wait_interrupt")) {
-      return eventStreamResponse(
-        toolEvents("wait_subagents", "acceptance_wait_interrupt", { names: [name], timeout_ms: 25_000 })
-      )
-    }
-    assertWaitCompletion(outputs.get("acceptance_wait_interrupt")!, { status: "cancelled" })
 
     if (!outputs.has("acceptance_continue_reuse")) {
       return eventStreamResponse(
-        toolEvents("continue_subagent", "acceptance_continue_reuse", {
+        toolEvents("assign_subagent_task", "acceptance_continue_reuse", {
           name: name,
           text: "Reuse after active interruption."
         })
@@ -414,9 +442,10 @@ class SubagentProvider {
       return eventStreamResponse(toolEvents("close_subagent", "acceptance_close", { name }))
     }
     const close = record(JSON.parse(outputs.get("acceptance_close")!), "close result")
-    if (close.name !== name || close.status !== "exited") {
-      throw new Error(`Compiled close result omitted its exited state: ${outputs.get("acceptance_close")}`)
+    if (close.previous_status !== "idle") {
+      throw new Error(`Compiled close result omitted its previous state: ${outputs.get("acceptance_close")}`)
     }
+    assertWaitCompletion(outputs.get("acceptance_close")!, { status: "completed", text: "Compiled child reused." })
     this.#complete = true
     return eventStreamResponse(textEvents(acceptanceText, "close"))
   }
@@ -522,6 +551,9 @@ function assertWaitCompletion(output: string, expected: { readonly status: strin
   if (
     !agent ||
     !completion ||
+    typeof completion.work_cycle !== "number" ||
+    !Number.isSafeInteger(completion.work_cycle) ||
+    completion.work_cycle <= 0 ||
     completion.status !== expected.status ||
     (expected.text !== undefined && completion.text !== expected.text)
   ) {
@@ -531,9 +563,10 @@ function assertWaitCompletion(output: string, expected: { readonly status: strin
 
 function assertInterruptResult(output: string, expected: "interrupted" | "already_idle"): void {
   const result = record(JSON.parse(output), "interrupt result")
-  if (result.outcome !== expected) {
+  if (result.result !== expected) {
     throw new Error(`Compiled subagent interrupt returned ${JSON.stringify(output)} instead of ${expected}`)
   }
+  assertWaitCompletion(output, { status: "cancelled" })
 }
 
 function hasReadyCompletion(output: string): boolean {
@@ -610,6 +643,81 @@ function eventStreamResponse(events: readonly Record<string, unknown>[]): Respon
   })
 }
 
+async function runRestorationProbe(
+  executable: string,
+  project: string,
+  agentDirectory: string,
+  markerPath: string,
+  declaration: Declaration,
+  provider: SubagentProvider,
+  expectedOccurrences: number
+): Promise<void> {
+  provider.beginRestorationProbe(expectedOccurrences)
+  const child = Bun.spawn(
+    [
+      executable,
+      "--mode",
+      "text",
+      "--continue",
+      "--session-dir",
+      join(agentDirectory, "acceptance-sessions"),
+      "--cwd",
+      project,
+      "--agent-dir",
+      agentDirectory,
+      "--model",
+      "azure-openai-responses/gpt-4.1",
+      "--api-key",
+      acceptanceApiKey,
+      "--thinking",
+      "off",
+      "Verify the restored subagent delivery evidence."
+    ],
+    {
+      cwd: project,
+      env: {
+        ...process.env,
+        AZURE_OPENAI_API_KEY: "subagent-acceptance",
+        AZURE_OPENAI_BASE_URL: provider.baseUrl,
+        ZI_AGENT_DIR: agentDirectory,
+        ZI_SUBAGENT_DEPTH: "0",
+        ZI_SUBAGENT_ACCEPTANCE_MARKER: markerPath,
+        ZI_SUBAGENT_PROFILE_DECLARATION: declaration
+      },
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "pipe"
+    }
+  )
+  const [exitCode, stdout, stderr] = await settleProcess(child, "close", () => provider.diagnostic())
+  if (stdout.includes(acceptanceApiKey) || stderr.includes(acceptanceApiKey)) {
+    throw new Error("Compiled restoration exposed the ephemeral API key")
+  }
+  if (exitCode !== 0 || stderr !== "" || stdout.trim() !== acceptanceText) {
+    const failure = `exit=${exitCode} stdout=${JSON.stringify(stdout)} stderr=${JSON.stringify(stderr)}`
+    provider.assertComplete(failure)
+    throw new Error(`Compiled subagent restoration failed: ${failure}`)
+  }
+  provider.assertComplete()
+}
+
+async function compactDeliveredCompletion(agentDirectory: string): Promise<void> {
+  const directory = join(agentDirectory, "acceptance-sessions")
+  const files = (await readdir(directory)).filter(file => file.endsWith(".jsonl"))
+  if (files.length !== 1) throw new Error(`Compiled compaction probe found ${files.length} parent journals`)
+  const session = SessionManager.open(join(directory, files[0]!))
+  const firstKept = session.entries().findLast(entry => entry.type === "message" && entry.message.role === "user")
+  if (!firstKept) throw new Error("Compiled compaction probe found no retained user boundary")
+  session.appendCompaction({
+    reason: "manual",
+    summary: "The compiled subagent acceptance workflow completed.",
+    firstKeptEntryId: firstKept.id,
+    tokensBefore: 100,
+    estimatedTokensAfter: 10,
+    details: { readFiles: [], modifiedFiles: [], omittedReadFiles: 0, omittedModifiedFiles: 0 }
+  })
+}
+
 async function settleProcess(
   child: Bun.Subprocess<"ignore", "pipe", "pipe">,
   mode: Mode,
@@ -658,16 +766,34 @@ async function assertNativeJournal(agentDirectory: string, name: string, mode: M
   if (mode === "dispose") return
 
   assertJournalEntry(entries, { event: "work_cycle_finished", workCycle: 1, status: "completed" }, mode)
+  assertJournalEntryCount(entries, { event: "work_cycle_delivered", workCycle: 1 }, 1, mode)
   assertJournalEntry(entries, { event: "exited" }, mode)
   if (mode === "crash") return
 
   assertJournalEntry(entries, { event: "work_cycle_started", workCycle: 2 }, mode)
   assertJournalEntry(entries, { event: "work_cycle_finished", workCycle: 2, status: "completed" }, mode)
+  assertJournalEntryCount(entries, { event: "work_cycle_delivered", workCycle: 2 }, 1, mode)
   assertJournalEntry(entries, { event: "work_cycle_started", workCycle: 3 }, mode)
   assertJournalEntry(entries, { event: "work_cycle_finished", workCycle: 3, status: "cancelled" }, mode)
+  assertJournalEntryCount(entries, { event: "work_cycle_delivered", workCycle: 3 }, 1, mode)
   assertJournalEntry(entries, { event: "work_cycle_started", workCycle: 4 }, mode)
   assertJournalEntry(entries, { event: "work_cycle_finished", workCycle: 4, status: "completed" }, mode)
+  assertJournalEntryCount(entries, { event: "work_cycle_delivered", workCycle: 4 }, 1, mode)
   assertJournalEntry(entries, { event: "closing", reason: "close" }, mode)
+}
+
+function assertJournalEntryCount(
+  entries: readonly Record<string, unknown>[],
+  expected: Readonly<Record<string, unknown>>,
+  count: number,
+  mode: Mode
+): void {
+  const found = entries.filter(entry => Object.entries(expected).every(([key, value]) => entry[key] === value)).length
+  if (found !== count) {
+    throw new Error(
+      `Compiled ${mode} journal contained ${found} copies of ${JSON.stringify(expected)} instead of ${count}`
+    )
+  }
 }
 
 function assertJournalEntry(

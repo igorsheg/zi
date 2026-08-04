@@ -718,12 +718,75 @@ test("subagent protocol bounds profiles, operations, snapshots, and cancellation
   ).toMatchObject({ type: "subagent_operation_cancel", targetRequestId: 2 })
   expect(
     validateHostMessage({
+      type: "subagent_interrupt_result",
+      generation: 1,
+      requestId: 2,
+      settlement: {
+        result: "interrupted",
+        snapshot: {
+          name: "finder-1",
+          lifecycle: "idle",
+          capturedWorkCycle: 1,
+          resultReady: false,
+          completion: {
+            workCycle: 1,
+            status: "cancelled",
+            text: "",
+            originalBytes: 0,
+            omittedBytes: 0,
+            truncated: false,
+            durationMs: 100
+          }
+        }
+      }
+    })
+  ).toMatchObject({
+    type: "subagent_interrupt_result",
+    settlement: {
+      result: "interrupted",
+      snapshot: { capturedWorkCycle: 1, completion: { workCycle: 1, status: "cancelled" } }
+    }
+  })
+  expect(
+    validateHostMessage({
       type: "subagent_wait_result",
       generation: 1,
       requestId: 2,
-      snapshots: [{ name: "finder-1", lifecycle: "idle", resultReady: false }]
+      snapshots: [
+        {
+          name: "finder-1",
+          lifecycle: "idle",
+          workCycle: 1,
+          capturedWorkCycle: 1,
+          task: "Inspect protocol ownership",
+          elapsedMs: 100,
+          resultReady: false,
+          completion: {
+            workCycle: 1,
+            status: "completed",
+            text: "done",
+            originalBytes: 4,
+            omittedBytes: 0,
+            truncated: false,
+            durationMs: 100
+          }
+        }
+      ]
     })
-  ).toMatchObject({ type: "subagent_wait_result", snapshots: [{ name: "finder-1", lifecycle: "idle" }] })
+  ).toMatchObject({
+    type: "subagent_wait_result",
+    snapshots: [
+      {
+        name: "finder-1",
+        lifecycle: "idle",
+        workCycle: 1,
+        capturedWorkCycle: 1,
+        task: "Inspect protocol ownership",
+        elapsedMs: 100,
+        completion: { workCycle: 1, status: "completed" }
+      }
+    ]
+  })
 })
 
 test("maximum admitted load results fit in one protocol frame", () => {

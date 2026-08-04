@@ -112,6 +112,7 @@ export type SubagentEntryData =
       readonly event: "work_cycle_started"
       readonly name: string
       readonly workCycle: number
+      readonly task?: string
     }
   | {
       readonly type: "subagent"
@@ -126,6 +127,12 @@ export type SubagentEntryData =
       readonly durationMs: number
       readonly reason?: string
       readonly error?: string
+    }
+  | {
+      readonly type: "subagent"
+      readonly event: "work_cycle_delivered"
+      readonly name: string
+      readonly workCycle: number
     }
   | { readonly type: "subagent"; readonly event: "closing"; readonly name: string; readonly reason: string }
   | { readonly type: "subagent"; readonly event: "exited"; readonly name: string; readonly outcome: string }
@@ -1785,7 +1792,7 @@ function isSubagentEntryData(value: unknown): value is SubagentEntryData {
     case "ready":
       return value.sessionId === undefined || boundedString(value.sessionId, 256)
     case "work_cycle_started":
-      return positiveSafeInteger(value.workCycle)
+      return positiveSafeInteger(value.workCycle) && (value.task === undefined || boundedString(value.task, 256))
     case "work_cycle_finished":
       return (
         positiveSafeInteger(value.workCycle) &&
@@ -1798,6 +1805,8 @@ function isSubagentEntryData(value: unknown): value is SubagentEntryData {
         (value.reason === undefined || boundedString(value.reason, maxSubagentJournalTextBytes, true)) &&
         (value.error === undefined || boundedString(value.error, maxSubagentJournalTextBytes, true))
       )
+    case "work_cycle_delivered":
+      return positiveSafeInteger(value.workCycle)
     case "closing":
       return boundedString(value.reason, 256)
     case "exited":

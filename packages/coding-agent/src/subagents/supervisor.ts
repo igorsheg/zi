@@ -17,6 +17,7 @@ export const maxMailboxCompletions = maxSubagentReadyResults
 export const maxWaitNames = 16
 export const maxSubagentPromptBytes = 8 * 1024 * 1024
 export const maxSubagentNameBytes = 64
+export const maxSubagentTaskBytes = 256
 export const durablePreviewBytes = 8 * 1024
 export const subagentShutdownMs = 9_000
 
@@ -25,13 +26,21 @@ export type SupervisorState = { readonly type: "open" } | { readonly type: "stop
 export type CompletionDelivery =
   | { readonly type: "pending"; readonly completion: SubagentCompletion }
   | { readonly type: "durable"; readonly completion: SubagentCompletion; readonly entryId: string }
-  | { readonly type: "delivered"; readonly completion: SubagentCompletion; readonly entryId: string }
+  | {
+      readonly type: "claimed"
+      readonly completion: SubagentCompletion
+      readonly entryId?: string
+      readonly claimId: string
+    }
+  | { readonly type: "delivered"; readonly completion: SubagentCompletion; readonly entryId?: string }
 
 export interface SubagentSnapshot {
   readonly name: string
   readonly lifecycle: ChildSnapshot["lifecycle"]
   readonly workCycle?: number
   readonly capturedWorkCycle?: number
+  readonly task?: string
+  readonly elapsedMs?: number
   readonly sessionId?: string
   readonly completion?: SubagentCompletion
   readonly completionDelivery?: CompletionDelivery["type"]
@@ -47,21 +56,30 @@ export interface SubagentCapacity {
   readonly maximum: number
 }
 
+export interface SubagentInterruptSettlement {
+  readonly result: "interrupted" | "already_idle"
+  readonly snapshot: SubagentSnapshot
+}
+
 interface LiveRecord {
   readonly child: ChildZiProcess
   readonly serial: PromiseQueue
   readonly createdAt: number
   lastWorkCycle: number
+  task: string
+  closing?: Promise<void>
 }
 
 interface ExitedRecord {
   readonly snapshot: ChildSnapshot
   readonly exitedAt: number
+  readonly task?: string
 }
 
 export interface SubagentSpawnSelection {
   readonly model?: string
   readonly thinkingLevel?: ThinkingLevel
+  readonly listedTask?: string
 }
 
 export interface SubagentSupervisorOptions {
@@ -120,8 +138,8 @@ export class SubagentSupervisor {
 
   snapshots(): readonly SubagentSnapshot[] {
     return Object.freeze([
-      ...[...this.#live.values()].map(record => this.#snapshot(record.child.snapshot())),
-      ...this.#exited.map(record => this.#snapshot(record.snapshot))
+      ...[...this.#live.values()].map(record => this.#snapshot(record.child.snapshot(), record.task)),
+      ...this.#exited.map(record => this.#snapshot(record.snapshot, record.task))
     ])
   }
 
@@ -151,6 +169,43 @@ export class SubagentSupervisor {
     return Object.freeze({ workingNames: Object.freeze(workingNames), readyNames: Object.freeze(readyNames) })
   }
 
+  deliverCompletions(deliver: (completion: SubagentCompletion) => void): void {
+    this.#pumpMailbox()
+    for (const delivery of this.#mailbox.values()) {
+      if (delivery.type !== "durable") continue
+      deliver(delivery.completion)
+      this.acknowledgeCompletion(delivery.completion.name, delivery.completion.workCycle)
+    }
+  }
+
+  acknowledgeCompletion(name: string, workCycle: number): void {
+    const key = completionKey(name, workCycle)
+    const delivery = this.#mailbox.get(key)
+    if (delivery?.type !== "pending" && delivery?.type !== "durable" && delivery?.type !== "claimed") return
+    this.#mailbox.set(key, { ...delivery, type: "delivered" })
+    this.#changed(name)
+    try {
+      this.#append({ event: "work_cycle_delivered", name, workCycle })
+    } catch {
+      // Parent evidence is already durable; restoration can infer delivery from that evidence.
+    }
+  }
+
+  releaseCompletionClaims(claimIdPrefix?: string): void {
+    const changed = new Set<string>()
+    for (const [key, delivery] of this.#mailbox) {
+      if (delivery.type !== "claimed" || (claimIdPrefix && !delivery.claimId.startsWith(claimIdPrefix))) continue
+      this.#mailbox.set(
+        key,
+        delivery.entryId
+          ? { type: "durable", completion: delivery.completion, entryId: delivery.entryId }
+          : { type: "pending", completion: delivery.completion }
+      )
+      changed.add(delivery.completion.name)
+    }
+    for (const name of changed) this.#changed(name)
+  }
+
   async spawn(
     name: string,
     prompt: string,
@@ -167,6 +222,9 @@ export class SubagentSupervisor {
     }
     if (this.#names.has(name)) throw new Error(`Subagent name already in use: ${name}`)
     const inheritedSelection = this.#selection()
+    const listedTask = requestedSelection.listedTask ?? prompt
+    validateText(listedTask, "Subagent listed task", maxSubagentPromptBytes)
+    const task = clipUtf8(listedTask, maxSubagentTaskBytes).text
     const selection = {
       model: requestedSelection.model ?? inheritedSelection.model,
       thinkingLevel: requestedSelection.thinkingLevel ?? inheritedSelection.thinkingLevel,
@@ -215,7 +273,7 @@ export class SubagentSupervisor {
       this.#completionReservations.delete(reservationKey)
       const message = cause instanceof Error ? cause.message : String(cause)
       const snapshot = Object.freeze({ name, lifecycle: "exited" as const })
-      this.#retainExited({ snapshot, exitedAt: Date.now() })
+      this.#retainExited({ snapshot, exitedAt: Date.now(), task })
       try {
         this.#append({ event: "exited", name, outcome: clipUtf8(message, durablePreviewBytes).text })
       } finally {
@@ -223,7 +281,7 @@ export class SubagentSupervisor {
       }
       throw cause
     }
-    const record: LiveRecord = { child, serial: new PromiseQueue(), createdAt: Date.now(), lastWorkCycle: 0 }
+    const record: LiveRecord = { child, serial: new PromiseQueue(), createdAt: Date.now(), lastWorkCycle: 0, task }
     this.#live.set(name, record)
     this.#changed(name)
 
@@ -280,11 +338,33 @@ export class SubagentSupervisor {
       const nextCycle = (snapshot.workCycle ?? 0) + 1
       const startedTurn = snapshot.lifecycle === "idle"
       const reservationKey = startedTurn ? this.#reserveCompletion(name, nextCycle) : undefined
+      const previousTask = record.task
+      let cycleStarted = false
       try {
-        if (reservationKey) this.#appendWorkCycleStarted(record, name, nextCycle)
+        if (reservationKey) {
+          record.task = clipUtf8(text, maxSubagentTaskBytes).text
+          this.#appendWorkCycleStarted(record, name, nextCycle)
+          cycleStarted = true
+        }
         await record.child.continueWith(text)
       } catch (cause) {
-        if (reservationKey) this.#completionReservations.delete(reservationKey)
+        if (!cycleStarted) {
+          record.task = previousTask
+          if (reservationKey) this.#completionReservations.delete(reservationKey)
+        } else if (record.child.snapshot().lifecycle === "idle") {
+          this.#completion({
+            name,
+            workCycle: nextCycle,
+            status: "failed",
+            text: "",
+            originalBytes: 0,
+            omittedBytes: 0,
+            truncated: false,
+            durationMs: record.child.snapshot().elapsedMs ?? 0,
+            reason: "assignment_failed",
+            error: clipUtf8(cause instanceof Error ? cause.message : String(cause), durablePreviewBytes).text
+          })
+        }
         throw cause
       }
       return startedTurn ? "started_turn" : "follow_up"
@@ -300,20 +380,57 @@ export class SubagentSupervisor {
     return record.serial.run(() => record.child.interrupt())
   }
 
+  async interruptAndWait(name: string, signal?: AbortSignal): Promise<SubagentInterruptSettlement> {
+    return this.#interruptAndWait(name, signal, "consume")
+  }
+
+  async interruptAndWaitForTool(
+    name: string,
+    signal?: AbortSignal,
+    claimId?: string
+  ): Promise<SubagentInterruptSettlement> {
+    return this.#interruptAndWait(name, signal, "claim", claimId)
+  }
+
   async close(name: string, reason = "close", graceMs?: number, forceMs?: number): Promise<SubagentSnapshot> {
     validateSubagentName(name)
     const record = this.#live.get(name)
     if (!record) return this.#snapshotFor(name)
-    this.#append({ event: "closing", name, reason })
-    await record.child.close(reason, graceMs, forceMs)
-    this.#retainExit(name, record)
+    await this.#closeRecord(name, record, reason, graceMs, forceMs)
     return this.#snapshotFor(name)
+  }
+
+  async closeAndDeliver(name: string): Promise<SubagentSnapshot> {
+    return this.#closeAndDeliver(name, "consume")
+  }
+
+  async closeAndDeliverForTool(name: string, claimId?: string): Promise<SubagentSnapshot> {
+    return this.#closeAndDeliver(name, "claim", claimId)
   }
 
   async wait(
     names: readonly string[],
     timeoutMs = this.waitTimeoutMs,
     signal?: AbortSignal
+  ): Promise<SubagentSnapshot[]> {
+    return this.#wait(names, timeoutMs, signal, "consume")
+  }
+
+  async waitForTool(
+    names: readonly string[],
+    timeoutMs = this.waitTimeoutMs,
+    signal?: AbortSignal,
+    claimId?: string
+  ): Promise<SubagentSnapshot[]> {
+    return this.#wait(names, timeoutMs, signal, "claim", claimId)
+  }
+
+  async #wait(
+    names: readonly string[],
+    timeoutMs: number,
+    signal: AbortSignal | undefined,
+    deliveryMode: "consume" | "claim",
+    claimId?: string
   ): Promise<SubagentSnapshot[]> {
     this.#assertOpen()
     if (names.length === 0 || names.length > maxWaitNames) {
@@ -325,11 +442,15 @@ export class SubagentSupervisor {
       this.#requireKnown(name)
     }
     throwIfWaitCancelled(signal)
-    const targets = names.map(name => ({
-      name,
-      workCycle: this.#currentWorkCycle(name),
-      admittedSnapshot: this.#childSnapshotFor(name)
-    }))
+    const targets = names.map(name => {
+      const workCycle = this.#oldestDurableDelivery(name)?.completion.workCycle ?? this.#currentWorkCycle(name)
+      return {
+        name,
+        workCycle,
+        admittedSnapshot: this.#childSnapshotFor(name),
+        admittedDelivery: this.#delivery(name, workCycle)?.type
+      }
+    })
     const boundedTimeout = Math.min(Math.max(0, timeoutMs), maxWaitTimeoutMs)
     const deadline = Date.now() + boundedTimeout
     this.#pumpMailbox()
@@ -341,15 +462,68 @@ export class SubagentSupervisor {
       this.#pumpMailbox()
       throwIfWaitCancelled(signal)
     }
-    const snapshots: SubagentSnapshot[] = []
-    const deliveredTargets: Array<{ readonly name: string; readonly workCycle: number }> = []
-    for (const target of targets) {
-      const snapshot = this.#waitSnapshotFor(target.name, target.workCycle, target.admittedSnapshot)
-      snapshots.push(snapshot)
-      if (snapshot.completion) deliveredTargets.push({ name: target.name, workCycle: target.workCycle })
-    }
-    for (const target of deliveredTargets) this.#markDeliveredThrough(target.name, target.workCycle)
-    return snapshots
+    return targets.map(target =>
+      this.#settleDelivery(
+        target.name,
+        target.workCycle,
+        target.admittedSnapshot,
+        target.admittedDelivery,
+        deliveryMode,
+        false,
+        claimId
+      )
+    )
+  }
+
+  async #interruptAndWait(
+    name: string,
+    signal: AbortSignal | undefined,
+    deliveryMode: "consume" | "claim",
+    claimId?: string
+  ): Promise<SubagentInterruptSettlement> {
+    this.#assertOpen()
+    validateSubagentName(name)
+    const record = this.#requireLive(name)
+    return record.serial.run(async () => {
+      const admittedSnapshot = record.child.snapshot()
+      const workCycle = admittedSnapshot.workCycle ?? record.lastWorkCycle
+      const admittedDelivery = this.#delivery(name, workCycle)?.type
+      const result = await record.child.interrupt()
+      if (result === "already_idle") {
+        return {
+          result,
+          snapshot: this.#settleDelivery(
+            name,
+            workCycle,
+            admittedSnapshot,
+            admittedDelivery,
+            deliveryMode,
+            true,
+            claimId
+          )
+        }
+      }
+      const snapshot = await this.#waitForWorkCycle(
+        name,
+        workCycle,
+        admittedSnapshot,
+        admittedDelivery,
+        deliveryMode,
+        signal,
+        claimId
+      )
+      return { result, snapshot }
+    })
+  }
+
+  async #closeAndDeliver(name: string, deliveryMode: "consume" | "claim", claimId?: string): Promise<SubagentSnapshot> {
+    validateSubagentName(name)
+    this.#requireKnown(name)
+    const admittedSnapshot = this.#childSnapshotFor(name)
+    const workCycle = this.#currentWorkCycle(name)
+    const admittedDelivery = this.#delivery(name, workCycle)?.type
+    await this.close(name)
+    return this.#settleDelivery(name, workCycle, admittedSnapshot, admittedDelivery, deliveryMode, true, claimId)
   }
 
   shutdown(): Promise<void> {
@@ -374,17 +548,37 @@ export class SubagentSupervisor {
   async #closeImmediately(name: string, reason: string, graceMs: number, forceMs: number): Promise<void> {
     const record = this.#live.get(name)
     if (!record) return
-    this.#append({ event: "closing", name, reason })
-    await record.child.close(reason, graceMs, forceMs)
-    this.#retainExit(name, record)
+    await this.#closeRecord(name, record, reason, graceMs, forceMs)
+  }
+
+  #closeRecord(name: string, record: LiveRecord, reason: string, graceMs?: number, forceMs?: number): Promise<void> {
+    if (record.closing) return record.closing
+    const closing = (async (): Promise<void> => {
+      try {
+        this.#append({ event: "closing", name, reason })
+      } catch {
+        // Process cleanup and in-memory terminal evidence must survive journal failure.
+      }
+      try {
+        await record.child.close(reason, graceMs, forceMs)
+      } finally {
+        this.#retainExit(name, record)
+      }
+    })()
+    record.closing = closing
+    return closing
   }
 
   #completion(completion: SubagentCompletion): void {
     const key = completionKey(completion.name, completion.workCycle)
     this.#completionReservations.delete(key)
-    const current = this.#mailbox.get(key)
-    if (current && current.completion.workCycle > completion.workCycle) return
-    this.#mailbox.set(key, { type: "pending", completion })
+    if (this.#mailbox.has(key)) return
+    const retained = Object.freeze({
+      ...completion,
+      ...(completion.reason !== undefined ? { reason: clipUtf8(completion.reason, durablePreviewBytes).text } : {}),
+      ...(completion.error !== undefined ? { error: clipUtf8(completion.error, durablePreviewBytes).text } : {})
+    })
+    this.#mailbox.set(key, { type: "pending", completion: retained })
     this.#pumpMailbox()
   }
 
@@ -414,13 +608,16 @@ export class SubagentSupervisor {
         break
       }
     }
-    this.#evictMailbox()
+    this.#evictDeliveredCompletions()
     for (const name of changed) this.#changed(name)
     this.#notifyWaiters()
   }
 
   #recover(): void {
     const latest = new Map<string, SubagentEntry>()
+    const tasks = new Map<string, string>()
+    const finishedKeys = new Set<string>()
+    const deliveredKeys = new Set<string>()
     for (const entry of this.#sessionManager.subagentEntries()) {
       latest.delete(entry.name)
       latest.set(entry.name, entry)
@@ -428,12 +625,17 @@ export class SubagentSupervisor {
         const oldest = latest.keys().next().value
         if (oldest === undefined) break
         latest.delete(oldest)
+        tasks.delete(oldest)
       }
       if (entry.event === "starting") {
         if (this.#names.has(entry.name)) throw new Error(`Duplicate subagent name in session journal: ${entry.name}`)
         this.#names.add(entry.name)
       }
+      if (entry.event === "work_cycle_started" && entry.task) tasks.set(entry.name, entry.task)
       if (entry.event === "work_cycle_finished") {
+        const key = completionKey(entry.name, entry.workCycle)
+        if (finishedKeys.has(key)) continue
+        finishedKeys.add(key)
         const completion: SubagentCompletion = {
           name: entry.name,
           workCycle: entry.workCycle,
@@ -446,21 +648,38 @@ export class SubagentSupervisor {
           ...(entry.reason ? { reason: entry.reason } : {}),
           ...(entry.error ? { error: entry.error } : {})
         }
-        this.#mailbox.set(completionKey(entry.name, entry.workCycle), {
-          type: "durable",
-          completion,
-          entryId: entry.id
-        })
-        this.#evictMailbox()
+        if (!this.#mailbox.has(key)) {
+          this.#evictDeliveredCompletions(maxMailboxCompletions - 1)
+          if (this.#mailbox.size >= maxMailboxCompletions) {
+            throw new Error(`Session contains more than ${maxMailboxCompletions} undelivered subagent completions`)
+          }
+          this.#mailbox.set(
+            key,
+            deliveredKeys.has(key)
+              ? { type: "delivered", completion, entryId: entry.id }
+              : { type: "durable", completion, entryId: entry.id }
+          )
+        }
+      }
+      if (entry.event === "work_cycle_delivered") {
+        const key = completionKey(entry.name, entry.workCycle)
+        deliveredKeys.add(key)
+        const delivery = this.#mailbox.get(key)
+        if (delivery?.type === "durable") this.#mailbox.set(key, { ...delivery, type: "delivered" })
       }
     }
     for (const [name, entry] of latest) {
       if (entry.event !== "exited" && entry.event !== "lost") {
         this.#append({ event: "lost", name, reason: "session_restored" })
       }
-      this.#retainExited({ snapshot: { name, lifecycle: "exited" }, exitedAt: Date.parse(entry.timestamp) })
+      const task = tasks.get(name)
+      this.#retainExited({
+        snapshot: { name, lifecycle: "exited" },
+        exitedAt: Date.parse(entry.timestamp),
+        ...(task ? { task } : {})
+      })
     }
-    this.#evictMailbox()
+    this.#evictDeliveredCompletions()
   }
 
   #childChanged(name: string): void {
@@ -496,10 +715,15 @@ export class SubagentSupervisor {
       })
     }
     const snapshot = record.child.snapshot()
-    const outcome = state.type === "exited" ? JSON.stringify(state.outcome) : snapshot.lifecycle
-    this.#append({ event: "exited", name, outcome: clipUtf8(outcome, durablePreviewBytes).text })
-    this.#retainExited({ snapshot, exitedAt: Date.now() })
-    this.#changed(name)
+    this.#retainExited({ snapshot, exitedAt: Date.now(), task: record.task })
+    try {
+      const outcome = state.type === "exited" ? JSON.stringify(state.outcome) : snapshot.lifecycle
+      this.#append({ event: "exited", name, outcome: clipUtf8(outcome, durablePreviewBytes).text })
+    } catch {
+      // The exited snapshot and any pending completion remain addressable in memory.
+    } finally {
+      this.#changed(name)
+    }
   }
 
   #retainExited(record: ExitedRecord): void {
@@ -509,20 +733,29 @@ export class SubagentSupervisor {
     while (this.#exited.length > maxRetainedSubagents) this.#exited.shift()
   }
 
-  #snapshot(snapshot: ChildSnapshot): SubagentSnapshot {
-    const delivery = this.#latestDelivery(snapshot.name)
+  #snapshot(snapshot: ChildSnapshot, task?: string): SubagentSnapshot {
+    const delivery = this.#oldestDurableDelivery(snapshot.name) ?? this.#latestDelivery(snapshot.name)
+    const elapsedMs = snapshot.elapsedMs ?? delivery?.completion.durationMs
     return Object.freeze({
       name: snapshot.name,
       lifecycle: snapshot.lifecycle,
       ...(snapshot.workCycle !== undefined ? { workCycle: snapshot.workCycle } : {}),
+      ...(task ? { task } : {}),
+      ...(elapsedMs !== undefined ? { elapsedMs } : {}),
       ...(snapshot.sessionId ? { sessionId: snapshot.sessionId } : {}),
-      ...(delivery?.type === "durable" || delivery?.type === "delivered" ? { completion: delivery.completion } : {}),
+      ...(delivery?.type === "pending" || delivery?.type === "durable" || delivery?.type === "delivered"
+        ? { completion: delivery.completion }
+        : {}),
       ...(delivery ? { completionDelivery: delivery.type } : {})
     })
   }
 
   #snapshotFor(name: string): SubagentSnapshot {
-    return this.#snapshot(this.#childSnapshotFor(name))
+    const live = this.#live.get(name)
+    if (live) return this.#snapshot(live.child.snapshot(), live.task)
+    const exited = this.#exited.find(value => value.snapshot.name === name)
+    if (!exited) throw new Error(`Unknown subagent: ${name}`)
+    return this.#snapshot(exited.snapshot, exited.task)
   }
 
   #waitSnapshotFor(name: string, workCycle: number, admittedSnapshot: ChildSnapshot): SubagentSnapshot {
@@ -532,16 +765,46 @@ export class SubagentSupervisor {
       live?.child.snapshot() ??
       retained?.snapshot ??
       Object.freeze({ ...admittedSnapshot, lifecycle: "exited" as const })
+    const task = live?.task ?? retained?.task
     const delivery = this.#delivery(name, workCycle)
+    const elapsedMs = snapshot.elapsedMs ?? delivery?.completion.durationMs
     return Object.freeze({
       name,
       lifecycle: snapshot.lifecycle,
       ...(snapshot.workCycle !== undefined ? { workCycle: snapshot.workCycle } : {}),
       capturedWorkCycle: workCycle,
+      ...(task ? { task } : {}),
+      ...(elapsedMs !== undefined ? { elapsedMs } : {}),
       ...(snapshot.sessionId ? { sessionId: snapshot.sessionId } : {}),
-      ...(delivery?.type === "durable" || delivery?.type === "delivered" ? { completion: delivery.completion } : {}),
+      ...(delivery?.type === "pending" || delivery?.type === "durable" || delivery?.type === "delivered"
+        ? { completion: delivery.completion }
+        : {}),
       ...(delivery ? { completionDelivery: delivery.type } : {})
     })
+  }
+
+  #claimedSnapshotFor(
+    name: string,
+    workCycle: number,
+    admittedSnapshot: ChildSnapshot,
+    claimId: string
+  ): SubagentSnapshot {
+    const snapshot = this.#waitSnapshotFor(name, workCycle, admittedSnapshot)
+    const delivery = this.#delivery(name, workCycle)
+    if (delivery?.type !== "claimed" || delivery.claimId !== claimId) return snapshot
+    return Object.freeze({ ...snapshot, completion: delivery.completion, completionDelivery: "claimed" as const })
+  }
+
+  #terminalSnapshotFor(name: string, workCycle: number, admittedSnapshot: ChildSnapshot): SubagentSnapshot {
+    const snapshot = this.#waitSnapshotFor(name, workCycle, admittedSnapshot)
+    const delivery = this.#delivery(name, workCycle)
+    return delivery ? Object.freeze({ ...snapshot, completion: delivery.completion }) : snapshot
+  }
+
+  #waitSnapshotWithoutCompletion(name: string, workCycle: number, admittedSnapshot: ChildSnapshot): SubagentSnapshot {
+    const snapshot = this.#waitSnapshotFor(name, workCycle, admittedSnapshot)
+    const { completion: _completion, completionDelivery: _completionDelivery, ...status } = snapshot
+    return Object.freeze(status)
   }
 
   #childSnapshotFor(name: string): ChildSnapshot {
@@ -556,6 +819,15 @@ export class SubagentSupervisor {
     return this.#mailbox.get(completionKey(name, workCycle))
   }
 
+  #oldestDurableDelivery(name: string): Extract<CompletionDelivery, { type: "durable" }> | undefined {
+    let oldest: Extract<CompletionDelivery, { type: "durable" }> | undefined
+    for (const delivery of this.#mailbox.values()) {
+      if (delivery.type !== "durable" || delivery.completion.name !== name) continue
+      if (!oldest || delivery.completion.workCycle < oldest.completion.workCycle) oldest = delivery
+    }
+    return oldest
+  }
+
   #latestDelivery(name: string): CompletionDelivery | undefined {
     let latest: CompletionDelivery | undefined
     for (const delivery of this.#mailbox.values()) {
@@ -567,8 +839,64 @@ export class SubagentSupervisor {
 
   #waitTargetSettled(name: string, workCycle: number): boolean {
     const delivery = this.#delivery(name, workCycle)
-    if (delivery?.type === "durable" || delivery?.type === "delivered") return true
+    if (delivery) return true
     return workCycle === 0 && !this.#live.has(name)
+  }
+
+  async #waitForWorkCycle(
+    name: string,
+    workCycle: number,
+    admittedSnapshot: ChildSnapshot,
+    admittedDelivery: CompletionDelivery["type"] | undefined,
+    deliveryMode: "consume" | "claim",
+    signal?: AbortSignal,
+    claimId?: string
+  ): Promise<SubagentSnapshot> {
+    const deadline = Date.now() + this.waitTimeoutMs
+    this.#pumpMailbox()
+    throwIfWaitCancelled(signal)
+    while (Date.now() < deadline && !this.#waitTargetSettled(name, workCycle)) {
+      // oxlint-disable-next-line no-await-in-loop -- one bounded semantic wait owner
+      await this.#waitPulse(Math.min(100, deadline - Date.now()), signal)
+      throwIfWaitCancelled(signal)
+      this.#pumpMailbox()
+    }
+    return this.#settleDelivery(name, workCycle, admittedSnapshot, admittedDelivery, deliveryMode, true, claimId)
+  }
+
+  #settleDelivery(
+    name: string,
+    workCycle: number,
+    admittedSnapshot: ChildSnapshot,
+    admittedDelivery: CompletionDelivery["type"] | undefined,
+    deliveryMode: "consume" | "claim",
+    requireTerminalEvidence = false,
+    claimId?: string
+  ): SubagentSnapshot {
+    const delivery = this.#delivery(name, workCycle)
+    if (delivery?.type === "pending" || delivery?.type === "durable") {
+      if (deliveryMode === "consume") {
+        const snapshot = this.#waitSnapshotFor(name, workCycle, admittedSnapshot)
+        if (delivery.type === "durable") {
+          this.#markDelivered(name, workCycle)
+          if (requireTerminalEvidence) return this.#terminalSnapshotFor(name, workCycle, admittedSnapshot)
+        }
+        return snapshot
+      }
+      const owner = claimId ?? crypto.randomUUID()
+      this.#mailbox.set(completionKey(name, workCycle), { ...delivery, type: "claimed", claimId: owner })
+      this.#changed(name)
+      return this.#claimedSnapshotFor(name, workCycle, admittedSnapshot, owner)
+    }
+    if (delivery?.type === "delivered" && !requireTerminalEvidence && admittedDelivery !== "delivered") {
+      return this.#waitSnapshotWithoutCompletion(name, workCycle, admittedSnapshot)
+    }
+    if (delivery?.type === "claimed" && !requireTerminalEvidence) {
+      return this.#waitSnapshotWithoutCompletion(name, workCycle, admittedSnapshot)
+    }
+    return requireTerminalEvidence
+      ? this.#terminalSnapshotFor(name, workCycle, admittedSnapshot)
+      : this.#waitSnapshotFor(name, workCycle, admittedSnapshot)
   }
 
   #currentWorkCycle(name: string): number {
@@ -577,19 +905,13 @@ export class SubagentSupervisor {
     return this.#latestDelivery(name)?.completion.workCycle ?? 0
   }
 
-  #markDeliveredThrough(name: string, workCycle: number): void {
-    let changed = false
-    for (const [key, delivery] of this.#mailbox) {
-      if (
-        delivery.completion.name === name &&
-        delivery.completion.workCycle <= workCycle &&
-        delivery.type === "durable"
-      ) {
-        this.#mailbox.set(key, { ...delivery, type: "delivered" })
-        changed = true
-      }
-    }
-    if (changed) this.#changed(name)
+  #markDelivered(name: string, workCycle: number): void {
+    const key = completionKey(name, workCycle)
+    const delivery = this.#mailbox.get(key)
+    if (delivery?.type !== "durable") return
+    this.#append({ event: "work_cycle_delivered", name, workCycle })
+    this.#mailbox.set(key, { ...delivery, type: "delivered" })
+    this.#changed(name)
   }
 
   #ensureCompletionCapacity(): void {
@@ -610,13 +932,13 @@ export class SubagentSupervisor {
     return key
   }
 
-  #evictMailbox(): void {
-    while (this.#mailbox.size > maxMailboxCompletions) {
-      const entries = [...this.#mailbox.entries()]
-      const evicted =
-        entries.find(([, value]) => value.type === "delivered") ?? entries.find(([, value]) => value.type === "durable")
-      if (!evicted) break
-      this.#mailbox.delete(evicted[0])
+  #evictDeliveredCompletions(maximum = maxMailboxCompletions): void {
+    while (this.#mailbox.size > maximum) {
+      const delivered = [...this.#mailbox.entries()].find(([, value]) => value.type === "delivered")
+      if (!delivered) {
+        throw new Error(`Session contains more than ${maxMailboxCompletions} undelivered subagent completions`)
+      }
+      this.#mailbox.delete(delivered[0])
     }
   }
 
@@ -627,7 +949,12 @@ export class SubagentSupervisor {
   }
 
   #appendWorkCycleStarted(record: LiveRecord, name: string, workCycle: number): void {
-    const entry = this.#sessionManager.appendSubagent({ event: "work_cycle_started", name, workCycle })
+    const entry = this.#sessionManager.appendSubagent({
+      event: "work_cycle_started",
+      name,
+      workCycle,
+      task: record.task
+    })
     record.lastWorkCycle = workCycle
     this.#emit({ type: "entry_appended", entry })
   }

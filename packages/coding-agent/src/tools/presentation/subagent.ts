@@ -48,7 +48,7 @@ export function projectSubagent(source: ToolPresentationSource): ToolPresentatio
     case "send": {
       const agent = singleAgent(details)
       return detailOnlyPresentation({
-        label: source.status === "done" ? "Messaged" : "Message",
+        label: source.status === "done" ? "Sent context" : "Send context",
         subject: agentSubject(agent, stringValue(args?.name)),
         details: [],
         body: stringValue(args?.text),
@@ -60,7 +60,7 @@ export function projectSubagent(source: ToolPresentationSource): ToolPresentatio
     case "continue": {
       const agent = singleAgent(details)
       return detailOnlyPresentation({
-        label: source.status === "done" ? "Assigned follow-up" : "Assign follow-up",
+        label: source.status === "done" ? "Assigned task" : "Assign task",
         subject: agentSubject(agent, stringValue(args?.name)),
         details: agent?.workCycle === undefined ? [] : [`cycle ${agent.workCycle}`],
         body: stringValue(args?.text),
@@ -338,9 +338,14 @@ function listLine(agent: SubagentToolAgentDetails, readyNames: ReadonlySet<strin
   const lifecycle = lifecycleLabel(agent.lifecycle)
   const ready = readyNames.has(agent.name)
   let state = lifecycle
-  if (agent.lifecycle === "idle") state = ready ? "result ready · wait, continue, or close" : "idle · continue or close"
+  if (agent.lifecycle === "idle") state = ready ? "result ready · wait, assign, or close" : "idle · assign or close"
   else if (ready) state = agent.lifecycle === "exited" ? "result ready" : `${lifecycle} · result ready`
-  return `${agentNameLabel(agent.name)} — ${state}`
+  const status = [
+    state,
+    ...(agent.workCycle !== undefined ? [`cycle ${agent.workCycle}`] : []),
+    ...(agent.elapsedMs !== undefined ? [formatDuration(agent.elapsedMs)] : [])
+  ].join(" · ")
+  return `${agentNameLabel(agent.name)} — ${status}${agent.task ? ` — ${summary(agent.task, resultSummaryScalars)}` : ""}`
 }
 
 function lifecycleLabel(lifecycle: SubagentToolAgentDetails["lifecycle"]): string {
@@ -404,9 +409,9 @@ function failedLabel(operation: SubagentToolDetails["operation"]): string {
     case "spawn":
       return "Start"
     case "send":
-      return "Message"
+      return "Send context"
     case "continue":
-      return "Assign follow-up"
+      return "Assign task"
     case "wait":
       return "Wait for"
     case "interrupt":
@@ -427,8 +432,10 @@ function operationForName(name: string): SubagentToolDetails["operation"] {
     case "spawn_subagent":
       return "spawn"
     case "send_subagent":
+    case "send_subagent_message":
       return "send"
     case "continue_subagent":
+    case "assign_subagent_task":
       return "continue"
     case "wait_subagents":
       return "wait"

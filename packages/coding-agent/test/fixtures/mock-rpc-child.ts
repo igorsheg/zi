@@ -16,10 +16,12 @@ import { appendFileSync, writeFileSync } from "node:fs"
  *   MOCK_RPC_INTERNAL_API_KEY — path to write the private child credential value
  *   MOCK_RPC_DESCENDANT_PID — path to write a long-lived descendant PID
  *   MOCK_RPC_PROTOCOL_CRASH — emit a malformed protocol frame after startup
+ *   MOCK_RPC_ERROR — assistant error text and failed stop reason
  */
 let sequence = 0
 const reply = process.env.MOCK_RPC_REPLY ?? "child-done"
 const delayMs = Number(process.env.MOCK_RPC_DELAY_MS ?? "30")
+const errorMessage = process.env.MOCK_RPC_ERROR
 const logPath = process.env.MOCK_RPC_LOG
 const descendantPath = process.env.MOCK_RPC_DESCENDANT_PID
 const argvPath = process.env.MOCK_RPC_ARGV
@@ -41,6 +43,7 @@ type Message =
       readonly role: "assistant"
       readonly stopReason: string
       readonly content: readonly [{ readonly type: "text"; readonly text: string }]
+      readonly errorMessage?: string
     }
 
 type RequestParams = { delivery?: string; text?: string; mode?: string; start?: number; limit?: number }
@@ -109,9 +112,18 @@ async function handle(request: { id: string; method: string; params?: RequestPar
   }
   if (method === "session.prompt") {
     const text = request.params?.text ?? ""
+    if (text === "__reject_prompt__") {
+      send({ type: "response", id, method, ok: false, error: { code: "rejected", message: "prompt rejected" } })
+      return
+    }
     if (text === "__block_prompt__") await Bun.sleep(30_000)
     messages.push({ role: "user", content: [{ type: "text", text }] })
-    messages.push({ role: "assistant", stopReason: "stop", content: [{ type: "text", text: reply }] })
+    messages.push({
+      role: "assistant",
+      stopReason: errorMessage ? "error" : "stop",
+      content: [{ type: "text", text: reply }],
+      ...(errorMessage ? { errorMessage } : {})
+    })
     busy = true
     send({ type: "response", id, method, ok: true, result: { delivery: request.params?.delivery ?? "direct" } })
     return

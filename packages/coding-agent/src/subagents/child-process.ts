@@ -52,6 +52,7 @@ export type ChildSnapshot = {
   readonly name: string
   readonly lifecycle: ChildLifecycleState["type"]
   readonly workCycle?: number | undefined
+  readonly elapsedMs?: number | undefined
   readonly sessionId?: string | undefined
   readonly completion?: SubagentCompletion | undefined
 }
@@ -138,6 +139,12 @@ export class ChildZiProcess {
 
   snapshot(): ChildSnapshot {
     const state = this.#state
+    const activeSince =
+      state.type === "starting" || state.type === "spawn_admitting" || state.type === "running"
+        ? state.startedAt
+        : state.type === "interrupting"
+          ? this.#cycleStartedAt
+          : undefined
     return {
       name: this.name,
       lifecycle: state.type,
@@ -154,6 +161,11 @@ export class ChildZiProcess {
                   : undefined
           }
         : {}),
+      ...(activeSince !== undefined
+        ? { elapsedMs: Math.max(0, Date.now() - activeSince) }
+        : this.#latestCompletion
+          ? { elapsedMs: this.#latestCompletion.durationMs }
+          : {}),
       ...(this.#sessionId ? { sessionId: this.#sessionId } : {}),
       ...(this.#latestCompletion ? { completion: this.#latestCompletion } : {})
     }
@@ -421,6 +433,7 @@ export class ChildZiProcess {
     let start = this.#messageCountAtCycleStart
     let latest: { readonly text: string; readonly stopReason: string; readonly error?: string } | undefined
 
+    let completeSuffix = false
     for (let pageIndex = 0; pageIndex < maxRpcMessagePages; pageIndex++) {
       // Sequential pages keep one cursor for the settled suffix.
       // oxlint-disable-next-line no-await-in-loop
@@ -431,10 +444,14 @@ export class ChildZiProcess {
         const assistant = assistantMessage(message)
         if (assistant) latest = assistant
       }
-      if (page.nextStart === null) break
+      if (page.nextStart === null) {
+        completeSuffix = true
+        break
+      }
       if (page.nextStart <= start) throw new Error("RPC message pagination did not advance")
       start = page.nextStart
     }
+    if (!completeSuffix) throw new Error(`RPC message suffix exceeded ${maxRpcMessagePages} pages`)
 
     if (!latest) {
       return baseCompletion(this.name, workCycle, durationMs, "failed", "", "missing_assistant")
@@ -688,14 +705,13 @@ export function clipUtf8(
   text: string,
   maxBytes: number
 ): { readonly text: string; readonly originalBytes: number; readonly omittedBytes: number } {
-  const originalBytes = Buffer.byteLength(text)
+  const encoded = Buffer.from(text)
+  const originalBytes = encoded.byteLength
   if (originalBytes <= maxBytes) return { text, originalBytes, omittedBytes: 0 }
-  let end = text.length
-  while (end > 0 && Buffer.byteLength(text.slice(0, end)) > maxBytes) end--
-  // Avoid splitting a surrogate pair.
-  if (end > 0 && text.charCodeAt(end - 1) >= 0xd800 && text.charCodeAt(end - 1) <= 0xdbff) end--
-  const clipped = text.slice(0, end)
-  return { text: clipped, originalBytes, omittedBytes: originalBytes - Buffer.byteLength(clipped) }
+  let end = Math.max(0, Math.min(maxBytes, originalBytes))
+  while (end > 0 && (encoded[end]! & 0xc0) === 0x80) end--
+  const clipped = encoded.subarray(0, end).toString("utf8")
+  return { text: clipped, originalBytes, omittedBytes: originalBytes - end }
 }
 
 function messagePage(value: unknown): {

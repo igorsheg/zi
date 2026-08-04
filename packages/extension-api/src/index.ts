@@ -279,6 +279,7 @@ export type ExtensionSubagentLifecycle =
   | "exited"
 
 export interface ExtensionSubagentCompletion {
+  readonly workCycle: number
   readonly status: "completed" | "failed" | "cancelled"
   readonly text: string
   readonly originalBytes: number
@@ -292,8 +293,17 @@ export interface ExtensionSubagentCompletion {
 export interface ExtensionSubagentSnapshot {
   readonly name: string
   readonly lifecycle: ExtensionSubagentLifecycle
+  readonly workCycle?: number
+  readonly capturedWorkCycle?: number
+  readonly task?: string
+  readonly elapsedMs?: number
   readonly resultReady: boolean
   readonly completion?: ExtensionSubagentCompletion
+}
+
+export interface ExtensionSubagentInterruptSettlement {
+  readonly result: "interrupted" | "already_idle"
+  readonly snapshot: ExtensionSubagentSnapshot
 }
 
 export interface ExtensionSubagentAPI {
@@ -306,7 +316,7 @@ export interface ExtensionSubagentAPI {
     timeoutMs?: number,
     signal?: AbortSignal
   ): Promise<readonly ExtensionSubagentSnapshot[]>
-  interrupt(name: string): Promise<"interrupted" | "already_idle">
+  interrupt(name: string): Promise<ExtensionSubagentInterruptSettlement>
   close(name: string): Promise<ExtensionSubagentSnapshot>
   list(): Promise<readonly ExtensionSubagentSnapshot[]>
 }

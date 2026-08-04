@@ -55,7 +55,12 @@ test("subagent substrate journal evidence restores and rejects malformed variant
     "Invalid subagent substrate journal entry"
   )
   session.appendSubagent({ event: "starting", name: "journal-worker" })
-  session.appendSubagent({ event: "work_cycle_started", name: "journal-worker", workCycle: 1 })
+  session.appendSubagent({
+    event: "work_cycle_started",
+    name: "journal-worker",
+    workCycle: 1,
+    task: "Inspect the journal"
+  })
   session.appendSubagent({
     event: "work_cycle_finished",
     name: "journal-worker",
@@ -67,13 +72,16 @@ test("subagent substrate journal evidence restores and rejects malformed variant
     truncated: false,
     durationMs: 10
   })
+  session.appendSubagent({ event: "work_cycle_delivered", name: "journal-worker", workCycle: 1 })
   expect(SessionManager.open(session.file!).subagentEntries()).toMatchObject([
     { event: "starting", name: "journal-worker" },
-    { event: "work_cycle_started", workCycle: 1 },
-    { event: "work_cycle_finished", status: "completed", preview: "done" }
+    { event: "work_cycle_started", workCycle: 1, task: "Inspect the journal" },
+    { event: "work_cycle_finished", status: "completed", preview: "done" },
+    { event: "work_cycle_delivered", workCycle: 1 }
   ])
 
-  const malformed: unknown = JSON.parse((await readFile(session.file!, "utf8")).trim().split("\n").at(-1)!)
+  const journalLines = (await readFile(session.file!, "utf8")).trim().split("\n")
+  const malformed: unknown = JSON.parse(journalLines.at(-2)!)
   if (typeof malformed !== "object" || malformed === null || Array.isArray(malformed)) {
     throw new Error("Expected a journal entry object")
   }

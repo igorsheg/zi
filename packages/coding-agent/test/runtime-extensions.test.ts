@@ -4,6 +4,8 @@ import { access, copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:
 import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
 
+import { Type } from "@earendil-works/pi-ai"
+
 import { createAgentSessionRuntime } from "../src/agent-session-runtime.js"
 import { createAgentRuntime } from "../src/runtime.js"
 import { SessionManager } from "../src/session-manager.js"
@@ -928,18 +930,25 @@ export default function (zi: ExtensionAPI): void {
       const waited = await zi.subagents.wait([name], 5_000, context.signal)
       const started = await zi.subagents.continue(name, "second cycle")
       const interrupted = await zi.subagents.interrupt(name)
-      const cancelled = await zi.subagents.wait([name], 5_000, context.signal)
       const closed = await zi.subagents.close(name)
       return JSON.stringify({
         profiles: profiles.map(profile => profile.name),
         resourceDescription: profiles.find(profile => profile.name === "resource-reviewer")?.description,
         unavailableSource,
-        active: active.map(snapshot => snapshot.name),
+        active: active.map(snapshot => ({
+          name: snapshot.name,
+          task: snapshot.task,
+          workCycle: snapshot.workCycle,
+          elapsed: typeof snapshot.elapsedMs
+        })),
         followed,
+        capturedCycle: waited[0]?.capturedWorkCycle,
+        resultCycle: waited[0]?.completion?.workCycle,
         result: waited[0]?.completion?.text,
         started,
-        interrupted,
-        cancelled: cancelled[0]?.completion?.status,
+        interrupted: interrupted.result,
+        interruptedCycle: interrupted.snapshot.capturedWorkCycle,
+        cancelled: interrupted.snapshot.completion?.status,
         closed: closed.name
       })
     }
@@ -995,11 +1004,14 @@ export default function (zi: ExtensionAPI): void {
             profiles: ["resource-reviewer", "unavailable", "extension-finder"],
             resourceDescription: "Review from a resource",
             unavailableSource: true,
-            active: ["finder-1"],
+            active: [{ name: "finder-1", task: "inspect", workCycle: 1, elapsed: "number" }],
             followed: "follow_up",
+            capturedCycle: 1,
+            resultCycle: 1,
             result: "extension-result",
             started: "started_turn",
             interrupted: "interrupted",
+            interruptedCycle: 2,
             cancelled: "cancelled",
             closed: "finder-1"
           })
@@ -1101,6 +1113,7 @@ test("the canonical programmatic profile example activates standard tools", asyn
   const models = createModels()
   const faux = fauxProvider()
   models.setProvider(faux.provider)
+  let postWaitContext = ""
   faux.setResponses([
     fauxAssistantMessage(
       fauxToolCall(
@@ -1114,7 +1127,10 @@ test("the canonical programmatic profile example activates standard tools", asyn
       fauxToolCall("wait_subagents", { names: ["example-finder"], timeout_ms: 5_000 }, { id: "example-wait-1" }),
       { stopReason: "toolUse" }
     ),
-    fauxAssistantMessage("Example complete.")
+    context => {
+      postWaitContext = JSON.stringify(context.messages)
+      return fauxAssistantMessage("Example complete.")
+    }
   ])
   const runtime = await createAgentRuntime({
     cwd,
@@ -1135,6 +1151,12 @@ test("the canonical programmatic profile example activates standard tools", asyn
         content: [expect.objectContaining({ type: "text", text: expect.stringContaining("example-result") })]
       })
     )
+    expect(postWaitContext).not.toContain("<subagent_completion>")
+    expect(
+      runtime.session.sessionManager
+        .subagentEntries()
+        .filter(entry => entry.event === "work_cycle_delivered" && entry.name === "example-finder")
+    ).toHaveLength(1)
   } finally {
     runtime.session.dispose()
     await runtime.session.waitForIdle()
@@ -1205,8 +1227,141 @@ test("a Markdown profile activates the standard subagent tools without an extens
   }
 }, 15_000)
 
-test("subagent completion remains passive until a later parent turn collects it", async () => {
+test("subagent completion stays passive and joins the next parent model request", async () => {
   const root = await mkdtemp(join(tmpdir(), "zi-runtime-subagent-passive-completion-"))
+  const cwd = join(root, "project")
+  const agentDir = join(root, "agent")
+  await mkdir(cwd, { recursive: true })
+  await mkdir(join(agentDir, "subagents"), { recursive: true })
+  await writeFile(
+    join(agentDir, "subagents", "pathfinder.md"),
+    `---\ndescription: Find implementation evidence\n---\nReturn concrete evidence.\n`
+  )
+  const models = createModels()
+  const faux = fauxProvider()
+  models.setProvider(faux.provider)
+  let completionContext = ""
+  faux.setResponses([
+    fauxAssistantMessage(
+      fauxToolCall(
+        "spawn_subagent",
+        { profile: "pathfinder", name: "passive-worker", prompt: "Find one fact." },
+        { id: "spawn-passive-1" }
+      ),
+      { stopReason: "toolUse" }
+    ),
+    fauxAssistantMessage("The child is working in the background."),
+    context => {
+      completionContext = JSON.stringify(context.messages)
+      return fauxAssistantMessage("Used the delivered child result.")
+    }
+  ])
+  const runtime = await createAgentRuntime({
+    cwd,
+    agentDir,
+    model: "faux/faux-1",
+    modelFactory: () => models,
+    session: { type: "new", persist: false },
+    extensionWorkerCommand: workerCommand,
+    subagentCommand: [process.execPath, mockChild],
+    internalSubagentEnvironment: { MOCK_RPC_REPLY: "passive-result", MOCK_RPC_DELAY_MS: "150" }
+  })
+  try {
+    await runtime.session.prompt("Start the background investigation.")
+    expect(faux.state.callCount).toBe(2)
+
+    await waitForCondition(
+      () => runtime.session.sessionManager.subagentEntries().some(entry => entry.event === "work_cycle_finished"),
+      5_000
+    )
+    expect(faux.state.callCount).toBe(2)
+    expect(runtime.session.messages.some(message => message.role === "custom")).toBe(false)
+
+    await runtime.session.prompt("Use any completed investigation.")
+    expect(faux.state.callCount).toBe(3)
+    expect(completionContext).toContain("<subagent_completion>")
+    expect(completionContext).toContain("passive-result")
+    expect(
+      runtime.session.messages.some(message => message.role === "toolResult" && message.toolName === "wait_subagents")
+    ).toBe(false)
+    expect(runtime.session.sessionManager.retainedEntries()).toContainEqual(
+      expect.objectContaining({ type: "custom_message", customType: "zi.subagent_completion", display: false })
+    )
+  } finally {
+    runtime.session.dispose()
+    await runtime.session.waitForIdle()
+    await rm(root, { recursive: true, force: true })
+  }
+}, 15_000)
+
+test("subagent completion joins the next model step of an active parent turn", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-runtime-subagent-active-completion-"))
+  const cwd = join(root, "project")
+  const agentDir = join(root, "agent")
+  await mkdir(cwd, { recursive: true })
+  await mkdir(join(agentDir, "subagents"), { recursive: true })
+  await writeFile(
+    join(agentDir, "subagents", "pathfinder.md"),
+    `---\ndescription: Find implementation evidence\n---\nReturn concrete evidence.\n`
+  )
+  const models = createModels()
+  const faux = fauxProvider()
+  models.setProvider(faux.provider)
+  let completionContext = ""
+  faux.setResponses([
+    fauxAssistantMessage(
+      fauxToolCall(
+        "spawn_subagent",
+        { profile: "pathfinder", name: "active-worker", prompt: "Find one fact." },
+        { id: "spawn-active-1" }
+      ),
+      { stopReason: "toolUse" }
+    ),
+    fauxAssistantMessage(fauxToolCall("hold", {}, { id: "hold-active-1" }), { stopReason: "toolUse" }),
+    context => {
+      completionContext = JSON.stringify(context.messages)
+      return fauxAssistantMessage("Used the active child result.")
+    }
+  ])
+  const runtime = await createAgentRuntime({
+    cwd,
+    agentDir,
+    model: "faux/faux-1",
+    modelFactory: () => models,
+    session: { type: "new", persist: false },
+    extensionWorkerCommand: workerCommand,
+    subagentCommand: [process.execPath, mockChild],
+    internalSubagentEnvironment: { MOCK_RPC_REPLY: "active-result", MOCK_RPC_DELAY_MS: "100" }
+  })
+  runtime.session.setActiveTools([
+    {
+      name: "hold",
+      label: "hold",
+      description: "Hold the parent turn while child work settles",
+      parameters: Type.Object({}),
+      async execute() {
+        await Bun.sleep(300)
+        return { content: [{ type: "text" as const, text: "released" }], details: undefined }
+      }
+    }
+  ])
+  try {
+    await runtime.session.prompt("Investigate while continuing parent work.")
+    expect(faux.state.callCount).toBe(3)
+    expect(completionContext).toContain("<subagent_completion>")
+    expect(completionContext).toContain("active-result")
+    expect(
+      runtime.session.messages.some(message => message.role === "toolResult" && message.toolName === "wait_subagents")
+    ).toBe(false)
+  } finally {
+    runtime.session.dispose()
+    await runtime.session.waitForIdle()
+    await rm(root, { recursive: true, force: true })
+  }
+}, 15_000)
+
+test("restoration and compaction never redeliver durable child completion evidence", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-runtime-subagent-restored-completion-"))
   const cwd = join(root, "project")
   const agentDir = join(root, "agent")
   await mkdir(cwd, { recursive: true })
@@ -1222,58 +1377,124 @@ test("subagent completion remains passive until a later parent turn collects it"
     fauxAssistantMessage(
       fauxToolCall(
         "spawn_subagent",
-        { profile: "pathfinder", name: "passive-worker", prompt: "Find one fact." },
-        { id: "spawn-passive-1" }
+        { profile: "pathfinder", name: "restored-worker", prompt: "Find one restored fact." },
+        { id: "spawn-restored-1" }
       ),
       { stopReason: "toolUse" }
     ),
-    fauxAssistantMessage("The child is working in the background."),
-    fauxAssistantMessage(
-      fauxToolCall("wait_subagents", { names: ["passive-worker"], timeout_ms: 5_000 }, { id: "wait-passive-1" }),
-      { stopReason: "toolUse" }
-    ),
-    fauxAssistantMessage("Collected the child result.")
+    fauxAssistantMessage("The child is working in the background.")
   ])
-  const runtime = await createAgentRuntime({
+  const first = await createAgentRuntime({
     cwd,
     agentDir,
     model: "faux/faux-1",
     modelFactory: () => models,
-    session: { type: "new", persist: false },
+    session: { type: "new", persist: true },
     extensionWorkerCommand: workerCommand,
     subagentCommand: [process.execPath, mockChild],
-    internalSubagentEnvironment: { MOCK_RPC_REPLY: "passive-result", MOCK_RPC_DELAY_MS: "150" }
+    internalSubagentEnvironment: { MOCK_RPC_REPLY: "restored-result", MOCK_RPC_DELAY_MS: "80" }
   })
+  let second: Awaited<ReturnType<typeof createAgentRuntime>> | undefined
+  let third: Awaited<ReturnType<typeof createAgentRuntime>> | undefined
   try {
-    await runtime.session.prompt("Start the background investigation.")
-    const settledMessages = runtime.session.messages.length
-    expect(faux.state.callCount).toBe(2)
-
+    await first.session.prompt("Start a restorable background investigation.")
     await waitForCondition(
-      () => runtime.session.sessionManager.subagentEntries().some(entry => entry.event === "work_cycle_finished"),
+      () =>
+        first.session.sessionManager
+          .subagentEntries()
+          .some(entry => entry.event === "work_cycle_finished" && entry.name === "restored-worker"),
       5_000
     )
-    expect(faux.state.callCount).toBe(2)
-    expect(runtime.session.messages).toHaveLength(settledMessages)
-    expect(
-      runtime.session.messages.some(message => message.role === "toolResult" && message.toolName === "wait_subagents")
-    ).toBe(false)
+    const sessionFile = first.session.sessionManager.file!
+    first.session.dispose()
+    await first.session.waitForIdle()
 
-    await runtime.session.prompt("Collect the completed investigation.")
-    expect(faux.state.callCount).toBe(4)
-    expect(runtime.session.messages).toContainEqual(
-      expect.objectContaining({
-        role: "toolResult",
-        toolName: "wait_subagents",
-        content: [expect.objectContaining({ text: expect.stringContaining("passive-result") })]
-      })
-    )
+    let restoredOccurrences = 0
+    faux.setResponses([
+      context => {
+        const serialized = JSON.stringify(context.messages)
+        restoredOccurrences = serialized.split("<subagent_completion>").length - 1
+        return fauxAssistantMessage("Used restored child evidence.")
+      }
+    ])
+    second = await createAgentRuntime({
+      cwd,
+      agentDir,
+      model: "faux/faux-1",
+      modelFactory: () => models,
+      session: { type: "resume", file: sessionFile },
+      extensionWorkerCommand: workerCommand,
+      subagentCommand: [process.execPath, mockChild]
+    })
+    await second.session.prompt("Use the restored result.")
+    expect(restoredOccurrences).toBe(1)
+    expect(
+      second.session.sessionManager
+        .entries()
+        .filter(entry => entry.type === "custom_message" && entry.customType === "zi.subagent_completion")
+    ).toHaveLength(1)
+    expect(
+      second.session.sessionManager
+        .subagentEntries()
+        .filter(entry => entry.event === "work_cycle_delivered" && entry.name === "restored-worker")
+    ).toHaveLength(1)
+    second.session.dispose()
+    await second.session.waitForIdle()
+    second = undefined
+
+    const compacted = SessionManager.open(sessionFile)
+    const kept = compacted
+      .entries()
+      .find(
+        entry =>
+          entry.type === "message" &&
+          entry.message.role === "user" &&
+          JSON.stringify(entry.message.content).includes("Use the restored result")
+      )
+    if (!kept) throw new Error("Expected the post-completion user message")
+    compacted.appendCompaction({
+      reason: "manual",
+      summary: "The restored child result was delivered once.",
+      firstKeptEntryId: kept.id,
+      tokensBefore: 100,
+      estimatedTokensAfter: 20,
+      details: { readFiles: [], modifiedFiles: [], omittedReadFiles: 0, omittedModifiedFiles: 0 }
+    })
+
+    let compactedContext = ""
+    faux.setResponses([
+      context => {
+        compactedContext = JSON.stringify(context.messages)
+        return fauxAssistantMessage("Continued after compaction.")
+      }
+    ])
+    third = await createAgentRuntime({
+      cwd,
+      agentDir,
+      model: "faux/faux-1",
+      modelFactory: () => models,
+      session: { type: "resume", file: sessionFile },
+      extensionWorkerCommand: workerCommand,
+      subagentCommand: [process.execPath, mockChild]
+    })
+    await third.session.prompt("Continue after compaction.")
+    expect(compactedContext).toContain("restored child result was delivered once")
+    expect(compactedContext).not.toContain("<subagent_completion>")
+    expect(
+      third.session.sessionManager
+        .entries()
+        .filter(entry => entry.type === "custom_message" && entry.customType === "zi.subagent_completion")
+    ).toHaveLength(1)
   } finally {
-    runtime.session.dispose()
-    await runtime.session.waitForIdle()
+    first.session.dispose()
+    await first.session.waitForIdle()
+    second?.session.dispose()
+    if (second) await second.session.waitForIdle()
+    third?.session.dispose()
+    if (third) await third.session.waitForIdle()
     await rm(root, { recursive: true, force: true })
   }
-}, 15_000)
+}, 20_000)
 
 test("a programmatic profile activates the same standard subagent tools", async () => {
   const root = await mkdtemp(join(tmpdir(), "zi-runtime-subagent-programmatic-tools-"))

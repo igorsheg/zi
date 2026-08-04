@@ -35,7 +35,9 @@ export function projectToolPresentation(source: ToolPresentationSource): ToolPre
     case "list_subagent_profiles":
     case "spawn_subagent":
     case "send_subagent":
+    case "send_subagent_message":
     case "continue_subagent":
+    case "assign_subagent_task":
     case "wait_subagents":
     case "interrupt_subagent":
     case "close_subagent":

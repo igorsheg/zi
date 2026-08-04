@@ -93,7 +93,9 @@ import type { SessionShell, ShellDemotionResult, ShellKillResult, ShellTaskSnaps
 import type { SettingsError, SettingsManager, SettingsScope } from "./settings-manager.js"
 import { expandSkillCommand, type Skill } from "./skills.js"
 import { builtinSlashCommands, type SlashCommand } from "./slash-commands.js"
-import type { SubagentSnapshot, SubagentSupervisor } from "./subagents/supervisor.js"
+import { clipUtf8, type SubagentCompletion } from "./subagents/child-process.js"
+import { durablePreviewBytes, type SubagentSnapshot, type SubagentSupervisor } from "./subagents/supervisor.js"
+import { isSubagentToolDetails, type SubagentToolDetails } from "./subagents/tool-details.js"
 import { createSubagentTools } from "./subagents/tools.js"
 import { buildSystemPrompt } from "./system-prompt.js"
 
@@ -518,6 +520,7 @@ export class AgentSession {
     this.#processTreeTracker = config.processTreeTracker
     this.#apiKeyProvider = config.apiKeyProvider
     this.sessionManager = config.sessionManager
+    this.#restoreSubagentCompletionDeliveries()
     this.settingsManager = config.settingsManager
     this.#modelState = config.model ? { type: "selected", model: config.model } : { type: "unselected" }
     this.#agent.prepareNextTurnWithContext = (context, signal) => this.#prepareNextTurn(context, signal)
@@ -545,8 +548,15 @@ export class AgentSession {
                 this.#requireSubagents()
                   .wait(names, timeoutMs, signal)
                   .then(snapshots => snapshots.map(extensionSubagentSnapshot)),
-              interrupt: (_extensionId, name) => this.#requireSubagents().interrupt(name),
-              close: (_extensionId, name) => this.#requireSubagents().close(name).then(extensionSubagentSnapshot),
+              interrupt: (_extensionId, name) =>
+                this.#requireSubagents()
+                  .interruptAndWait(name)
+                  .then(settlement => ({
+                    result: settlement.result,
+                    snapshot: extensionSubagentSnapshot(settlement.snapshot)
+                  })),
+              close: (_extensionId, name) =>
+                this.#requireSubagents().closeAndDeliver(name).then(extensionSubagentSnapshot),
               list: () => this.#requireSubagents().snapshots().map(extensionSubagentSnapshot)
             }
           }
@@ -1011,7 +1021,8 @@ export class AgentSession {
     const task = `${profile.instructions.trimEnd()}\n\nTask:\n${prompt}`
     return this.#requireSubagents().spawn(name, task, signal, {
       ...(model ? { model } : {}),
-      ...(profile.thinking ? { thinkingLevel: profile.thinking } : {})
+      ...(profile.thinking ? { thinkingLevel: profile.thinking } : {}),
+      listedTask: prompt
     })
   }
 
@@ -1729,6 +1740,7 @@ export class AgentSession {
   async #drive(runId: number, start: RunStart, settlement: Settlement): Promise<void> {
     let failure: { cause: unknown } | undefined
     try {
+      this.#deliverSubagentCompletions()
       await this.#compactBeforeMessages(runId, start.type === "prompt" ? start.messages : [])
       if (this.#activateProviderStart(runId)) {
         if (start.type === "prompt") await this.#runAgent(() => this.#agent.prompt([...start.messages]))
@@ -1772,6 +1784,7 @@ export class AgentSession {
     } finally {
       this.#cancelledPendingMessages.clear()
       this.#queueRestoreCancellation = { type: "none" }
+      this.#subagents?.releaseCompletionClaims()
       if (failure) settlement.reject(failure.cause)
       else settlement.resolve()
     }
@@ -1842,13 +1855,20 @@ export class AgentSession {
     const activity = this.#activity
     if (activity.type !== "running" || activity.phase.type !== "agent" || signal?.aborted) return undefined
 
+    const completionsDelivered = this.#deliverSubagentCompletions()
     const activeTools = this.#agent.state.tools
     const contextTools = context.context.tools ?? []
     const toolsChanged =
       activeTools.length !== contextTools.length || activeTools.some((tool, index) => tool !== contextTools[index])
-    const synchronizedContext = toolsChanged
-      ? { ...context.context, systemPrompt: this.#agent.state.systemPrompt, tools: [...activeTools] }
-      : undefined
+    const synchronizedContext =
+      toolsChanged || completionsDelivered
+        ? {
+            ...context.context,
+            systemPrompt: this.#agent.state.systemPrompt,
+            messages: [...this.#agent.state.messages],
+            tools: [...activeTools]
+          }
+        : undefined
     const synchronized = synchronizedContext ? { context: synchronizedContext } : undefined
 
     if (activity.thresholdSuppressed || !this.settingsManager.get().compactionEnabled) return synchronized
@@ -1861,6 +1881,42 @@ export class AgentSession {
     const outcome = await this.#runAutomaticCompaction(activity.runId, "threshold", undefined, signal)
     if (outcome !== "completed" || !this.#canContinue(activity.runId)) return synchronized
     return { context: { ...(synchronizedContext ?? context.context), messages: [...this.#agent.state.messages] } }
+  }
+
+  // Behavioral provenance: Codex 4c25d6cc forwards each terminal V2 child turn into the
+  // parent's mailbox without starting a parent turn. Zi commits the same bounded context at a provider boundary.
+  #deliverSubagentCompletions(): boolean {
+    let delivered = false
+    this.#subagents?.deliverCompletions(completion => {
+      const committed = this.#appendCustomMessage(subagentCompletionMessage(completion))
+      this.#publishCustomMessage(committed)
+      delivered = true
+    })
+    return delivered
+  }
+
+  #restoreSubagentCompletionDeliveries(): void {
+    if (!this.#subagents) return
+    for (const entry of this.sessionManager.entries()) {
+      if (entry.type === "custom_message" && entry.customType === subagentCompletionCustomType) {
+        const identity = subagentCompletionIdentity(entry.details)
+        if (identity) this.#subagents.acknowledgeCompletion(identity.name, identity.workCycle)
+        continue
+      }
+      if (entry.type === "message") this.#acknowledgeSubagentToolResult(entry.message)
+    }
+  }
+
+  #acknowledgeSubagentToolResult(message: AgentMessage): void {
+    if (!this.#subagents || message.role !== "toolResult") return
+    if (message.toolName === "code") {
+      this.#subagents.releaseCompletionClaims(`${message.toolCallId}:code:`)
+      return
+    }
+    if (!isSubagentToolDetails(message.details)) return
+    for (const identity of subagentToolCompletionIdentities(message.details)) {
+      this.#subagents.acknowledgeCompletion(identity.name, identity.workCycle)
+    }
   }
 
   async #recoverOverflow(runId: number): Promise<"none" | "recovered" | "stop"> {
@@ -2646,7 +2702,11 @@ export class AgentSession {
       } else {
         const entry = this.sessionManager.appendMessage(event.message)
         this.#recordCommittedMessage(entry.message)
-        this.#emit({ type: "entry_appended", entry })
+        try {
+          this.#emit({ type: "entry_appended", entry })
+        } finally {
+          this.#acknowledgeSubagentToolResult(entry.message)
+        }
       }
     }
     if (event.type === "agent_start") this.#extensionHost?.publishAgentStart()
@@ -2930,15 +2990,89 @@ function userMessage(text: string, images: readonly ImageContent[]): AgentMessag
   return { role: "user", content: [{ type: "text", text }, ...images], timestamp: Date.now() }
 }
 
+const subagentCompletionCustomType = "zi.subagent_completion"
+
+function subagentCompletionMessage(completion: SubagentCompletion): CustomMessageInput {
+  const text = clipUtf8(completion.text, durablePreviewBytes)
+  const payload = {
+    name: completion.name,
+    work_cycle: completion.workCycle,
+    status: completion.status,
+    text: text.text,
+    original_bytes: completion.originalBytes,
+    omitted_bytes: completion.omittedBytes + text.omittedBytes,
+    truncated: completion.truncated || text.omittedBytes > 0,
+    duration_ms: completion.durationMs,
+    ...(completion.reason ? { reason: completion.reason } : {}),
+    ...(completion.error ? { error: completion.error } : {})
+  }
+  return {
+    customType: subagentCompletionCustomType,
+    content: `<subagent_completion>\n${JSON.stringify(payload)}\n</subagent_completion>`,
+    display: false,
+    details: {
+      name: completion.name,
+      workCycle: completion.workCycle,
+      status: completion.status,
+      originalBytes: completion.originalBytes,
+      omittedBytes: completion.omittedBytes + text.omittedBytes,
+      truncated: completion.truncated || text.omittedBytes > 0,
+      durationMs: completion.durationMs
+    }
+  }
+}
+
+function subagentCompletionIdentity(
+  value: SessionJson | undefined
+): { readonly name: string; readonly workCycle: number } | undefined {
+  if (!isSessionJsonRecord(value)) return undefined
+  const name = value.name
+  const workCycle = value.workCycle
+  if (
+    typeof name !== "string" ||
+    !/^[a-z][a-z0-9_-]*$/.test(name) ||
+    Buffer.byteLength(name) > 64 ||
+    typeof workCycle !== "number" ||
+    !Number.isSafeInteger(workCycle) ||
+    workCycle <= 0
+  ) {
+    return undefined
+  }
+  return { name, workCycle }
+}
+
+function isSessionJsonRecord(value: SessionJson | undefined): value is { readonly [key: string]: SessionJson } {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+}
+
+function subagentToolCompletionIdentities(
+  details: SubagentToolDetails
+): readonly { readonly name: string; readonly workCycle: number }[] {
+  const agents =
+    details.operation === "wait"
+      ? details.agents
+      : details.operation === "interrupt" || details.operation === "close"
+        ? [details.agent]
+        : []
+  return agents.flatMap(agent =>
+    agent.completion ? [{ name: agent.name, workCycle: agent.completion.workCycle }] : []
+  )
+}
+
 function extensionSubagentSnapshot(snapshot: SubagentSnapshot): ExtensionSubagentSnapshot {
   const completion = snapshot.completion
   return Object.freeze({
     name: snapshot.name,
     lifecycle: snapshot.lifecycle,
+    ...(snapshot.workCycle !== undefined ? { workCycle: snapshot.workCycle } : {}),
+    ...(snapshot.capturedWorkCycle !== undefined ? { capturedWorkCycle: snapshot.capturedWorkCycle } : {}),
+    ...(snapshot.task ? { task: snapshot.task } : {}),
+    ...(snapshot.elapsedMs !== undefined ? { elapsedMs: snapshot.elapsedMs } : {}),
     resultReady: snapshot.completionDelivery === "durable",
     ...(completion
       ? {
           completion: Object.freeze({
+            workCycle: completion.workCycle,
             status: completion.status,
             text: completion.text,
             originalBytes: completion.originalBytes,

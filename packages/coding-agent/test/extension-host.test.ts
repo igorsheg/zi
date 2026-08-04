@@ -347,7 +347,10 @@ test("subagent waits are bounded by their owning extension invocation", async ()
         })
         return []
       },
-      interrupt: async () => "already_idle",
+      interrupt: async () => ({
+        result: "already_idle",
+        snapshot: { name: "unused", lifecycle: "idle", resultReady: false }
+      }),
       close: async () => ({ name: "unused", lifecycle: "exited", resultReady: false }),
       list: () => []
     }
