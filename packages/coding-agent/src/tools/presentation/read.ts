@@ -2,8 +2,9 @@ import { basename, dirname } from "node:path"
 
 import { isReadToolDetails, type ReadToolDetails, type ReadToolErrorReason } from "../read.js"
 import { DEFAULT_MAX_BYTES } from "../truncate.js"
-import { maxExpandedToolRows, type ToolNotice, type ToolPresentation, type ToolPresentationSource } from "./types.js"
+import { splitWindow, type ToolNotice, type ToolPresentation, type ToolPresentationSource } from "./types.js"
 import {
+  assertNever,
   boundHead,
   boundInline,
   formatBytes,
@@ -17,7 +18,6 @@ import {
 } from "./values.js"
 
 const detailedReadHeadRows = 120
-const detailedReadTailRows = maxExpandedToolRows - detailedReadHeadRows - 1
 
 export function projectRead(source: ToolPresentationSource): ToolPresentation {
   const args = recordValue(source.args)
@@ -75,20 +75,19 @@ export function projectRead(source: ToolPresentationSource): ToolPresentation {
         }
       : {}),
     notices: details?.outcome === "success" ? successNotices(details) : [],
-    preview: {
-      compact: { type: "hidden" },
-      detailed: { type: "edges", head: detailedReadHeadRows, tail: detailedReadTailRows }
-    },
+    preview: { compact: { type: "hidden" }, detailed: splitWindow(detailedReadHeadRows) },
     timing: "duration"
   }
 }
 
+// Skill loads are the one target-kind upgrade: the label stays the stable
+// verb, and the skill name takes the subject slot with the path as secondary.
 function readTarget(path: string | undefined) {
   const displayPath = boundInline(path ?? "…")
   const skillName = path === undefined || basename(path) !== "SKILL.md" ? undefined : basename(dirname(path))
   if (!skillName || skillName === ".") return { label: "Read", subject: { type: "path" as const, path: displayPath } }
   return {
-    label: "Skill",
+    label: "Read",
     subject: { type: "text" as const, text: boundInline(skillName) },
     secondary: { type: "path" as const, path: displayPath }
   }
@@ -105,9 +104,7 @@ function completedRange(
 }
 
 function successStatus(details: Extract<ReadToolDetails, { outcome: "success" }>): string | undefined {
-  if (details.truncation.firstLineExceedsLimit) return "line too large"
-  if (details.truncation.outputBytes === 0) return "empty"
-  return details.truncation.truncated ? "truncated" : undefined
+  return details.truncation.outputBytes === 0 && !details.truncation.firstLineExceedsLimit ? "empty" : undefined
 }
 
 function errorStatus(reason: ReadToolErrorReason): string {
@@ -132,10 +129,11 @@ function errorStatus(reason: ReadToolErrorReason): string {
 function successNotices(details: Extract<ReadToolDetails, { outcome: "success" }>): ToolNotice[] {
   const notices: ToolNotice[] = []
   if (details.truncation.firstLineExceedsLimit) {
+    // Always visible: there is no body, so this is the only explanation.
     notices.push({
       type: "message",
       tone: "warning",
-      visibility: "detailed",
+      visibility: "always",
       text: `Line ${details.startLine} exceeds the ${formatBytes(DEFAULT_MAX_BYTES)} read limit`
     })
   } else if (details.truncation.truncated) {
@@ -164,8 +162,4 @@ function selectedText(text: string, bytes: number): string {
 
 function requestedRange(offset: number, limit: number | undefined): string {
   return limit === undefined ? `from line ${offset}` : `lines ${offset}-${offset + limit - 1}`
-}
-
-function assertNever(value: never): never {
-  throw new Error(`Unexpected Read presentation value: ${String(value)}`)
 }

@@ -33,11 +33,13 @@ export function projectTaskOutput(source: ToolPresentationSource): ToolPresentat
   const text = "result" in source ? (resultText(source.result) ?? "") : ""
   const error = details?.outcome === "error" || source.status === "failed"
   const bodyText = details && details.outcome !== "error" ? shellBodyText(text, details.output) : text
+  const settled = details && details.outcome !== "error" ? details : undefined
   return {
     header: {
-      label: "Task output",
+      label: "Output",
       subject: { type: "task", id: boundInline(taskId ?? details?.taskId ?? "…") },
-      details: details && details.outcome !== "error" ? taskDetails(details) : []
+      details: settled ? taskDetails(settled) : [],
+      ...(settled?.finalOutcome ? { status: outcomeLabel(settled.finalOutcome) } : {})
     },
     ...(bodyText
       ? {
@@ -71,7 +73,7 @@ export function projectKillTask(source: ToolPresentationSource): ToolPresentatio
   if (details?.outcome === "error" || (source.status === "failed" && !details)) {
     return {
       header: {
-        label: "Kill task",
+        label: "Kill",
         subject: { type: "task", id: boundInline(taskId ?? (details?.outcome === "error" ? details.taskId : "…")) },
         details: []
       },
@@ -92,14 +94,10 @@ export function projectKillTask(source: ToolPresentationSource): ToolPresentatio
   const degradedText = details ? "" : text
   return {
     header: {
-      label: "Kill task",
+      label: "Kill",
       subject: { type: "task", id: boundInline(taskId ?? details?.taskId ?? "…") },
-      details: details
-        ? [
-            boundInline(stopLabel(details.stop)),
-            ...(details.finalOutcome ? [boundInline(outcomeLabel(details.finalOutcome))] : [])
-          ]
-        : []
+      details: details?.finalOutcome ? [boundInline(outcomeLabel(details.finalOutcome))] : [],
+      ...(details ? { status: stopLabel(details.stop) } : {})
     },
     ...(degradedText ? { body: { type: "text" as const, text: boundHead(degradedText), tone: "muted" as const } } : {}),
     notices: [],
@@ -121,8 +119,7 @@ function taskDetails(details: Exclude<TaskOutputToolDetails, { outcome: "error" 
   return [
     boundInline(details.state),
     ...(details.placement ? [boundInline(details.placement)] : []),
-    ...(details.stopReason ? [boundInline(details.stopReason)] : []),
-    ...(details.finalOutcome ? [boundInline(outcomeLabel(details.finalOutcome))] : [])
+    ...(details.stopReason ? [boundInline(details.stopReason)] : [])
   ]
 }
 
@@ -193,7 +190,7 @@ function outcomeLabel(outcome: ShellTaskOutcome): string {
     case "disposed":
       return "disposed"
     case "failed":
-      return `failed: ${outcome.message}`
+      return boundInline(`failed: ${outcome.message}`)
     default:
       return assertNever(outcome)
   }

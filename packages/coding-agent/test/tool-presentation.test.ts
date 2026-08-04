@@ -84,9 +84,9 @@ test("bash presentation separates bounded output from structured notices", () =>
   expect(presentation.header).toMatchObject({
     label: "Run",
     subject: { type: "text", text: "the test suite" },
-    secondary: { type: "command", text: "bun test", prompt: true },
-    status: "truncated"
+    secondary: { type: "command", text: "bun test", prompt: true }
   })
+  expect(presentation.header.status).toBeUndefined()
   expect(presentation.body).toEqual({ type: "terminal", text: "tail" })
   expect(presentation.preview.compact).toEqual({ type: "tail", rows: 5 })
   expect(presentation.notices).toContainEqual({
@@ -99,7 +99,7 @@ test("bash presentation separates bounded output from structured notices", () =>
   expect(presentation.notices).toContainEqual({
     type: "message",
     tone: "warning",
-    visibility: "detailed",
+    visibility: "always",
     text: "Showing the last 2000 of 3000 lines"
   })
 })
@@ -202,10 +202,11 @@ test("read presentation derives continuation from details instead of model prose
     visibility: "detailed",
     text: "498 lines remain; continue at offset 3"
   })
-  expect(presentation.header).toMatchObject({ label: "Read", details: ["1-2 of 500"], status: "truncated" })
+  expect(presentation.header).toMatchObject({ label: "Read", details: ["1-2 of 500"] })
+  expect(presentation.header.status).toBeUndefined()
   expect(presentation.preview).toEqual({
     compact: { type: "hidden" },
-    detailed: { type: "edges", head: 120, tail: 79 }
+    detailed: { type: "edges", head: 120, tail: 80 }
   })
 })
 
@@ -395,7 +396,8 @@ test("malformed semantic details and lifecycle mismatches degrade within their b
       }
     }
   })
-  expect(impossibleBash.header).toMatchObject({ label: "Run", status: "failed" })
+  expect(impossibleBash.header).toMatchObject({ label: "Run" })
+  expect(impossibleBash.header.status).toBeUndefined()
   expect(impossibleBash.body).toMatchObject({ type: "terminal", text: "impossible" })
 
   const mismatchedLifecycle = projectToolPresentation({

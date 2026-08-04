@@ -1,15 +1,27 @@
-import { maxExpandedToolRows, type ToolPresentation, type ToolPresentationSource } from "./types.js"
-import { boundHead, boundInline, resultText } from "./values.js"
+import { maxExpandedToolRows, type ToolPresentation, type ToolPresentationSource, type ToolSubject } from "./types.js"
+import { boundHead, boundInline, recordValue, resultText, stringValue } from "./values.js"
+
+// Keys that usually name the one thing an unknown tool acts on; the first
+// string-valued match becomes the subject and the tool name drops to details.
+const salientKeys = ["path", "file", "command", "query", "url", "uri", "operation", "name", "id", "key"] as const
+const maxScalarArgEntries = 8
+const maxScalarArgValueScalars = 160
 
 export function projectGeneric(source: ToolPresentationSource): ToolPresentation {
-  const args = serialized(source.args, "unserializable arguments")
+  const name = source.name || "unknown"
+  const salient = salientSubject(recordValue(source.args))
+  const args = argumentsText(source.args)
   const result =
     "result" in source ? (resultText(source.result) ?? serialized(source.result, "unserializable result")) : ""
   const sections = [`Arguments:\n${args || "undefined"}`]
   if (result)
     sections.push(`${source.status === "failed" || source.status === "aborted" ? "Error" : "Result"}:\n${result}`)
   return {
-    header: { label: "Tool", subject: { type: "text", text: boundInline(source.name || "unknown") }, details: [] },
+    header: {
+      label: "Tool",
+      subject: salient ?? { type: "text", text: boundInline(name) },
+      details: salient ? [boundInline(name)] : []
+    },
     body: {
       type: "text",
       text: boundHead(sections.join("\n\n")),
@@ -19,6 +31,41 @@ export function projectGeneric(source: ToolPresentationSource): ToolPresentation
     preview: { compact: { type: "head", rows: 10 }, detailed: { type: "head", rows: maxExpandedToolRows } },
     timing: "duration"
   }
+}
+
+function salientSubject(args: Record<string, unknown> | undefined): ToolSubject | undefined {
+  if (!args) return undefined
+  for (const key of salientKeys) {
+    const value = stringValue(args[key])
+    if (!value) continue
+    const text = boundInline(value, maxScalarArgValueScalars)
+    if (key === "path" || key === "file") return { type: "path", path: text }
+    if (key === "command") return { type: "command", text, prompt: false }
+    return { type: "text", text }
+  }
+  return undefined
+}
+
+// Small all-scalar argument records read far better as `key: value` lines
+// than as JSON; anything larger falls back to the bounded serializer.
+function argumentsText(args: unknown): string {
+  const record = recordValue(args)
+  if (record) {
+    const entries = Object.entries(record)
+    const scalars =
+      entries.length > 0 &&
+      entries.length <= maxScalarArgEntries &&
+      entries.every(([key, value]) => key && scalarArgument(value) !== undefined)
+    if (scalars) return entries.map(([key, value]) => `${key}: ${scalarArgument(value)}`).join("\n")
+  }
+  return serialized(args, "unserializable arguments")
+}
+
+function scalarArgument(value: unknown): string | undefined {
+  if (typeof value === "string") return boundInline(value, maxScalarArgValueScalars)
+  if (typeof value === "number" && Number.isFinite(value)) return String(value)
+  if (typeof value === "boolean" || value === null) return String(value)
+  return undefined
 }
 
 const maxSerializedDepth = 8

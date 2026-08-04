@@ -71,7 +71,7 @@ test("read presents skill definitions by name while retaining their source path"
     const presentation = projectToolPresentation({ status: "done", name: "read", args: { path }, result })
 
     expect(presentation.header).toEqual({
-      label: "Skill",
+      label: "Read",
       subject: { type: "text", text: "review" },
       secondary: { type: "path", path },
       details: []
@@ -123,7 +123,7 @@ test("read exposes empty files and operational failures as semantic states", asy
       result: missingSkill
     })
     expect(missingSkillPresentation.header).toEqual({
-      label: "Skill",
+      label: "Read",
       subject: { type: "text", text: "missing" },
       secondary: { type: "path", path: skillPath },
       details: [],

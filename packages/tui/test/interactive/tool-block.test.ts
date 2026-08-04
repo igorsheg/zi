@@ -90,7 +90,7 @@ test("Bash preserves its tail body and exact command from running through comple
     const rendered = setup.captureCharFrame()
     expect(rendered).toContain("◈ Run unit tests · 0.0s")
     expect(rendered).toContain("$ bun test")
-    expect(rendered).toContain("… earlier output · Ctrl+O details")
+    expect(rendered).toContain("… 1 earlier line · Ctrl+O details")
     expect(rendered).toContain("│ six")
     expect(rendered).toContain("Ctrl+G background · Esc interrupt")
 
@@ -119,7 +119,7 @@ test("Bash preserves its tail body and exact command from running through comple
     const completed = setup.captureCharFrame()
     expect(completed).toContain("◆ Run unit tests")
     expect(completed).toContain("$ bun test")
-    expect(completed).toContain("… earlier output · Ctrl+O details")
+    expect(completed).toContain("… 1 earlier line · Ctrl+O details")
     expect(completed).toContain("│ six")
     expect(completed).not.toContain("background · Esc interrupt")
   } finally {
@@ -159,7 +159,7 @@ test("failed semantic frame keeps first and last output with exact status", asyn
     expect(rendered).toContain("◆ Run bun test · exit 1")
     expect(rendered).toContain("│ one")
     expect(rendered).toContain("│ two")
-    expect(rendered).toContain("… middle output · Ctrl+O details")
+    expect(rendered).toContain("… 2 hidden lines · Ctrl+O details")
     expect(rendered).toContain("│ seven")
     expect(rendered).toContain("Command exited with code 1")
 
@@ -200,7 +200,7 @@ test("detailed previews remain bounded without stale expansion hints", async () 
     const rendered = setup.captureCharFrame()
     expect(rendered).toContain("line 1")
     expect(rendered).toContain("line 250")
-    expect(rendered).toContain("middle output")
+    expect(rendered).toContain("51 hidden lines")
     expect(rendered).not.toContain("Ctrl+O details")
     const body = view.root.getChildren()[1]
     if (!(body instanceof BoxRenderable)) throw new Error("Body not found")
@@ -339,7 +339,7 @@ test("Read stays compact after success and reveals bounded absolute source lines
     expect(detailed).toContain("◆ Read src/long-example.ts · 50-289 of 400")
     expect(detailed).toContain("50 │ line 50")
     expect(detailed).toContain("289 │ line 289")
-    expect(detailed).toContain("middle output")
+    expect(detailed).toContain("40 hidden lines")
     expect(detailed).toContain("111 lines remain; continue at offset 290")
     expect(detailed).not.toContain("continuation footer")
 
@@ -463,8 +463,8 @@ test("Write keeps one root and collapses completed content into a semantic succe
     expect(detailed).toContain(`◆ Write src/generated.ts · 260 lines · ${bytes} bytes`)
     expect(detailed).toContain("1 │ line 1")
     expect(detailed).toContain("199 │ line 199")
-    expect(detailed).toContain("more output")
-    expect(detailed).not.toContain("200 │ line 200")
+    expect(detailed).toContain("60 more lines")
+    expect(detailed).not.toContain("201 │ line 201")
 
     view.setExpanded(false)
     setup.resize(40, 210)
@@ -649,12 +649,12 @@ test("completed Edit keeps a bounded first/last diff review in compact density",
     const compact = setup.captureCharFrame()
     expect(compact).toContain("1 − old 1")
     expect(compact).toContain("5 − old 5")
-    expect(compact).toContain("… middle output · Ctrl+O details")
+    expect(compact).toContain("… 20 hidden lines · Ctrl+O details")
     expect(compact).toContain("15 + new 15")
     expect(compact).not.toContain("old 6")
     const body = toolBody(view.root)
-    expect(body.getChildrenCount()).toBe(11)
-    expect(textWith(body, "… middle output · Ctrl+O details").selectable).toBe(false)
+    expect(body.getChildrenCount()).toBe(10)
+    expect(textWith(view.root, "╰─── … 20 hidden lines · Ctrl+O details").selectable).toBe(false)
   } finally {
     view.destroy()
     setup.renderer.destroy()
@@ -972,14 +972,14 @@ test("skill reads keep their source path and instructions behind details", async
   try {
     await setup.renderOnce()
     const compact = setup.captureCharFrame()
-    expect(compact).toContain("◆ Skill review")
+    expect(compact).toContain("◆ Read review")
     expect(compact).not.toContain(path)
     expect(compact).not.toContain("Review carefully.")
 
     view.setExpanded(true)
     await setup.renderOnce()
     const detailed = setup.captureCharFrame()
-    expect(detailed).toContain("◆ Skill review")
+    expect(detailed).toContain("◆ Read review")
     expect(detailed).toContain(path)
     expect(detailed).toContain("Review carefully.")
   } finally {
@@ -1368,9 +1368,9 @@ test("ordinary tabbed tool evidence uses native cell projection", async () => {
       const body = toolBody(view.root)
       expect(body.getChildrenCount()).toBeLessThanOrEqual(12)
       for (const row of body.getChildren()) expect(textWith(row, "│ ")).toBeDefined()
-      expect(descendants(body).some(row => row instanceof TextRenderable && row.plainText.includes("output"))).toBe(
-        true
-      )
+      expect(
+        descendants(view.root).some(row => row instanceof TextRenderable && row.plainText.includes("more line"))
+      ).toBe(true)
     }
     const secondaryRows = secondary.root.getChildren()[1]
     const noticeRows = notice.root.getChildren()[3]
@@ -1617,7 +1617,7 @@ test("subagent rows stay concise until details are requested", async () => {
   try {
     await setup.renderOnce()
     const compact = setup.captureCharFrame()
-    expect(compact).toContain("◆ Started Shutdown reviewer · Review shutdown behavior")
+    expect(compact).toContain("◆ Spawn Shutdown reviewer · Review shutdown behavior")
     expect(compact).not.toContain('"profile"')
     expect(compact).not.toContain("│ Review shutdown behavior")
     expect(compact).not.toContain("spawn_subagent")

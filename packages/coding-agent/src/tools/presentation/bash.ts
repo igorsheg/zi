@@ -2,6 +2,7 @@ import type { ShellTaskOutcome } from "../../session-shell.js"
 import { isBashToolDetails, type BashToolDetails } from "../bash.js"
 import {
   maxExpandedToolRows,
+  splitWindow,
   type ToolNotice,
   type ToolPresentation,
   type ToolPresentationSource,
@@ -57,13 +58,13 @@ export function projectBash(source: ToolPresentationSource): ToolPresentation {
 
   const result = "result" in source ? (resultText(source.result) ?? "") : ""
   const text = details && details.state !== "rejected" ? shellBodyText(result, details) : details ? "" : result
-  const status = bashStatus(source, details, background)
+  const status = bashStatus(details, background)
   return {
     header: {
       label: "Run",
       subject: primary,
       ...(secondary ? { secondary } : {}),
-      details: timeout === undefined ? [] : [boundInline(`timeout ${timeout}s`)],
+      details: bashDetails(details, timeout),
       ...(status ? { status } : {})
     },
     ...(text ? { body: { type: "terminal" as const, text: boundTail(text) } } : {}),
@@ -92,8 +93,7 @@ function abortedPresentation(
       details: [
         ...(timeout === undefined ? [] : [boundInline(`timeout ${timeout}s`)]),
         ...(background ? ["background"] : [])
-      ],
-      status: "aborted"
+      ]
     },
     ...(body ? { body: { type: "terminal", text: body } } : {}),
     notices: [
@@ -126,33 +126,38 @@ function bashPreview(source: ToolPresentationSource, details: BashToolDetails | 
     return { compact: { type: "tail", rows: compactBashRows }, detailed: { type: "tail", rows: maxExpandedToolRows } }
   }
   if (source.status === "failed" || (details?.outcome === "error" && details.state !== "rejected")) {
-    return { compact: { type: "edges", head: 2, tail: 3 }, detailed: { type: "edges", head: 80, tail: 119 } }
+    return { compact: { type: "edges", head: 2, tail: 3 }, detailed: splitWindow(80) }
   }
   if (details?.outcome === "success" && details.state === "completed" && details.output.truncation.outputBytes > 0) {
-    return { compact: { type: "tail", rows: compactBashRows }, detailed: { type: "edges", head: 80, tail: 119 } }
+    return { compact: { type: "tail", rows: compactBashRows }, detailed: splitWindow(80) }
   }
   if (!details && "result" in source) {
     return { compact: { type: "tail", rows: compactBashRows }, detailed: { type: "tail", rows: maxExpandedToolRows } }
   }
-  return { compact: { type: "hidden" }, detailed: { type: "edges", head: 80, tail: 119 } }
+  return { compact: { type: "hidden" }, detailed: splitWindow(80) }
 }
 
+function bashDetails(details: BashToolDetails | undefined, timeout: number | undefined): string[] {
+  const values: string[] = []
+  if (timeout !== undefined) values.push(boundInline(`timeout ${timeout}s`))
+  if (details?.state === "background") values.push(boundInline(`task ${shortTaskId(details.taskId)}`))
+  return values
+}
+
+/**
+ * The status channel carries exactly one outcome phrase. Tool-side truncation
+ * is an evidence qualifier, so it lives in an always-visible notice instead;
+ * the view adds lifecycle words ("failed", "aborted") itself.
+ */
 function bashStatus(
-  source: ToolPresentationSource,
   details: BashToolDetails | undefined,
   requestedBackground: boolean | undefined
 ): string | undefined {
-  if (!details) {
-    if (source.status === "failed") return "failed"
-    return requestedBackground ? "background" : undefined
-  }
+  if (!details) return requestedBackground ? "background" : undefined
   if (details.state === "rejected") return "rejected"
-
-  const values: string[] = []
-  if (details.state === "background") values.push("background", `task ${shortTaskId(details.taskId)}`)
-  if (details.outcome === "error") values.push(outcomeLabel(details.finalOutcome))
-  if (details.output.truncation.truncated) values.push("truncated")
-  return values.length > 0 ? boundInline(values.join(" · ")) : undefined
+  if (details.state === "background") return "background"
+  if (details.outcome === "error") return outcomeLabel(details.finalOutcome)
+  return undefined
 }
 
 function shellNotices(details: BashToolDetails): ToolNotice[] {
@@ -172,7 +177,9 @@ function shellNotices(details: BashToolDetails): ToolNotice[] {
 
   const truncation = details.output.truncation
   if (truncation.truncated) {
-    notices.push({ type: "message", tone: "warning", visibility: "detailed", text: truncationNotice(truncation) })
+    // Tool-side truncation is always visible: without it the tail body reads
+    // as complete output. The fuller explanations stay detailed-only.
+    notices.push({ type: "message", tone: "warning", visibility: "always", text: truncationNotice(truncation) })
     const full = details.output.fullOutput
     if (full.type === "available") {
       notices.push({

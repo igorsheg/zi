@@ -36,7 +36,7 @@ export function projectSubagent(source: ToolPresentationSource): ToolPresentatio
       const agent = singleAgent(details)
       const prompt = stringValue(args?.prompt)
       return detailOnlyPresentation({
-        label: source.status === "done" ? "Started" : source.status === "running" ? "Starting" : "Start",
+        label: "Spawn",
         subject: agentSubject(agent, stringValue(args?.name)),
         details: prompt ? [summary(prompt, taskSummaryScalars)] : [],
         body: prompt,
@@ -48,7 +48,7 @@ export function projectSubagent(source: ToolPresentationSource): ToolPresentatio
     case "send": {
       const agent = singleAgent(details)
       return detailOnlyPresentation({
-        label: source.status === "done" ? "Sent context" : "Send context",
+        label: "Send",
         subject: agentSubject(agent, stringValue(args?.name)),
         details: [],
         body: stringValue(args?.text),
@@ -60,7 +60,7 @@ export function projectSubagent(source: ToolPresentationSource): ToolPresentatio
     case "continue": {
       const agent = singleAgent(details)
       return detailOnlyPresentation({
-        label: source.status === "done" ? "Assigned task" : "Assign task",
+        label: "Assign",
         subject: agentSubject(agent, stringValue(args?.name)),
         details: agent?.workCycle === undefined ? [] : [`cycle ${agent.workCycle}`],
         body: stringValue(args?.text),
@@ -73,9 +73,8 @@ export function projectSubagent(source: ToolPresentationSource): ToolPresentatio
       return waitPresentation(source, details, args, fallbackText)
     case "interrupt": {
       const agent = singleAgent(details)
-      const interrupted = details?.operation === "interrupt" && details.result === "interrupted"
       return detailOnlyPresentation({
-        label: source.status === "done" && interrupted ? "Interrupted" : "Interrupt",
+        label: "Interrupt",
         subject: agentSubject(agent, stringValue(args?.name)),
         details: details?.operation === "interrupt" && details.result === "already_idle" ? ["already idle"] : [],
         notices: agentNotices(),
@@ -86,7 +85,7 @@ export function projectSubagent(source: ToolPresentationSource): ToolPresentatio
     case "close": {
       const agent = singleAgent(details)
       return detailOnlyPresentation({
-        label: source.status === "done" ? "Closed" : "Close",
+        label: "Close",
         subject: agentSubject(agent, stringValue(args?.name)),
         details: details?.operation === "close" ? [`was ${lifecycleLabel(details.previousStatus)}`] : [],
         notices: agentNotices(),
@@ -112,7 +111,7 @@ function profilesPresentation(
   const omittedBytes = details?.operation === "profiles" ? details.omittedBytes : 0
   return {
     header: {
-      label: source.status === "done" ? "Listed" : source.status === "running" ? "Listing" : "List",
+      label: "List",
       subject: { type: "text", text: `${count || "…"} ${count === 1 ? "profile" : "profiles"}` },
       details: []
     },
@@ -166,11 +165,7 @@ function waitPresentation(
         : fallbackText
   const compactRows = agents.length > 0 ? Math.min(agents.length + (evidence.length > 0 ? 1 : 0), 6) : 6
   return {
-    header: {
-      label: source.status === "done" ? "Finished waiting" : source.status === "running" ? "Waiting for" : "Wait for",
-      subject,
-      details: []
-    },
+    header: { label: "Wait", subject, details: [] },
     ...(body ? { body: { type: "text" as const, text: boundHead(body), tone: "muted" as const } } : {}),
     notices: [],
     preview: {
@@ -199,7 +194,7 @@ function listPresentation(
   const body =
     agents.length > 0 ? agents.map(agent => listLine(agent, readyNames)).join("\n") : details ? "" : fallbackText
   return {
-    header: { label: source.status === "done" ? "Checked agents" : "Check agents", details: counts },
+    header: { label: "List", details: counts },
     ...(body ? { body: { type: "text" as const, text: boundHead(body), tone: "muted" as const } } : {}),
     notices: [],
     preview: {
@@ -226,7 +221,7 @@ function failedPresentation(
             ? undefined
             : agentSubject(undefined, stringValue(args?.name))
   return {
-    header: { label: failedLabel(operation), ...(subject ? { subject } : {}), details: [] },
+    header: { label: operationLabel(operation), ...(subject ? { subject } : {}), details: [] },
     ...(text ? { body: { type: "text" as const, text: boundHead(text), tone: "error" as const } } : {}),
     notices: [],
     preview: {
@@ -402,24 +397,26 @@ function stringArray(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string").slice(0, 16) : []
 }
 
-function failedLabel(operation: SubagentToolDetails["operation"]): string {
+// Labels are stable operation verbs; tense and outcome live in the bullet,
+// rail color, timing, and the view-owned lifecycle status.
+function operationLabel(operation: SubagentToolDetails["operation"]): string {
   switch (operation) {
     case "profiles":
-      return "List profiles"
+      return "List"
     case "spawn":
-      return "Start"
+      return "Spawn"
     case "send":
-      return "Send context"
+      return "Send"
     case "continue":
-      return "Assign task"
+      return "Assign"
     case "wait":
-      return "Wait for"
+      return "Wait"
     case "interrupt":
       return "Interrupt"
     case "close":
       return "Close"
     case "list":
-      return "Check agents"
+      return "List"
     default:
       return assertNever(operation)
   }

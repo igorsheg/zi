@@ -37,7 +37,7 @@ test("profile catalog presentation replaces JSON with bounded semantic rows", ()
     }
   })
 
-  expect(presentation.header).toEqual({ label: "Listed", subject: { type: "text", text: "2 profiles" }, details: [] })
+  expect(presentation.header).toEqual({ label: "List", subject: { type: "text", text: "2 profiles" }, details: [] })
   expect(presentation.body).toEqual({
     type: "text",
     text: "Pathfinder — Locate relevant implementation evidence\nReviewer — Review local changes for regressions",
@@ -58,7 +58,7 @@ test("spawn presentation leads with the delegated task and keeps machinery in de
   })
 
   expect(presentation.header).toEqual({
-    label: "Started",
+    label: "Spawn",
     subject: { type: "text", text: "Shutdown reviewer" },
     details: ["Review native subagent shutdown and report races."]
   })
@@ -104,11 +104,7 @@ test("wait presentation summarizes mixed outcomes without JSON envelopes", () =>
     }
   })
 
-  expect(presentation.header).toEqual({
-    label: "Finished waiting",
-    subject: { type: "text", text: "2 agents" },
-    details: []
-  })
+  expect(presentation.header).toEqual({ label: "Wait", subject: { type: "text", text: "2 agents" }, details: [] })
   expect(presentation.body).toEqual({
     type: "text",
     text: "Shutdown reviewer completed · 4.5s — No shutdown leaks found.\nTest runner failed · 0.9s — tool timeout",
@@ -157,11 +153,7 @@ test("targetless wait reports an empty collection without a placeholder count", 
     }
   })
 
-  expect(presentation.header).toEqual({
-    label: "Finished waiting",
-    subject: { type: "text", text: "No agents" },
-    details: []
-  })
+  expect(presentation.header).toEqual({ label: "Wait", subject: { type: "text", text: "No agents" }, details: [] })
   expect(presentation.body).toBeUndefined()
 })
 
@@ -228,10 +220,10 @@ test("wait presents its exact captured completion after the child advances", () 
 
 test("administrative subagent successes remain header-only in compact mode", () => {
   const cases = [
-    ["send_subagent_message", "send", "Sent context"],
-    ["assign_subagent_task", "continue", "Assigned task"],
-    ["interrupt_subagent", "interrupt", "Interrupted"],
-    ["close_subagent", "close", "Closed"]
+    ["send_subagent_message", "send", "Send"],
+    ["assign_subagent_task", "continue", "Assign"],
+    ["interrupt_subagent", "interrupt", "Interrupt"],
+    ["close_subagent", "close", "Close"]
   ] as const
 
   for (const [name, operation, label] of cases) {
@@ -286,7 +278,7 @@ test("list presentation reports authoritative working and ready counts", () => {
     }
   })
 
-  expect(presentation.header).toEqual({ label: "Checked agents", details: ["1 working", "2 ready"] })
+  expect(presentation.header).toEqual({ label: "List", details: ["1 working", "2 ready"] })
   expect(presentation.preview.compact).toEqual({ type: "hidden" })
   expect(presentation.body).toEqual({
     type: "text",
@@ -307,7 +299,7 @@ test("oversized persisted details degrade inside the semantic subagent row", () 
   })
 
   expect(presentation.header).toEqual({
-    label: "Closed",
+    label: "Close",
     subject: { type: "text", text: "Shutdown reviewer" },
     details: []
   })

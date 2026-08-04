@@ -1,5 +1,5 @@
 import { isEditToolDetails, maxEditChanges, type EditToolDetails, type EditToolErrorReason } from "../edit.js"
-import type { ToolNotice, ToolPresentation, ToolPresentationSource } from "./types.js"
+import { splitWindow, type ToolNotice, type ToolPresentation, type ToolPresentationSource } from "./types.js"
 import {
   assertNever,
   boundHead,
@@ -72,7 +72,7 @@ export function projectEdit(source: ToolPresentationSource): ToolPresentation {
         : {}),
     notices,
     preview: success
-      ? { compact: { type: "edges", head: 5, tail: 5 }, detailed: { type: "edges", head: 120, tail: 79 } }
+      ? { compact: { type: "edges", head: 5, tail: 5 }, detailed: splitWindow(120) }
       : degradedResult
         ? { compact: { type: "hidden" }, detailed: { type: "head", rows: 20 } }
         : { compact: { type: "hidden" }, detailed: { type: "hidden" } },

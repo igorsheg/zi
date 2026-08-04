@@ -65,7 +65,7 @@ export default function (zi: ExtensionAPI): void {
 
     const frame = setup.captureCharFrame()
     expect(frame).toContain("Tool repository_echo")
-    expect(frame).toContain('"value": "visible"')
+    expect(frame).toContain("value: visible")
     expect(frame).toContain("generic:visible")
     expect(frame).toContain("Finished.")
   } finally {

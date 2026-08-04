@@ -81,7 +81,7 @@ test("newline-terminated shell output keeps its semantic presentation", async ()
         args: { taskId: started.details.taskId, timeout: 2 },
         result: completed
       }).header.label
-    ).toBe("Task output")
+    ).toBe("Output")
   } finally {
     await shell.dispose()
     rmSync(cwd, { recursive: true, force: true })

@@ -55,7 +55,7 @@ test("wait rows keep completion evidence concise until expanded", async () => {
   try {
     await setup.renderOnce()
     const compact = setup.captureCharFrame()
-    expect(compact).toContain("◆ Finished waiting Shutdown reviewer")
+    expect(compact).toContain("◆ Wait Shutdown reviewer")
     expect(compact).toContain("Shutdown reviewer completed · 4.5s")
     expect(compact).not.toContain("Final evidence")
 

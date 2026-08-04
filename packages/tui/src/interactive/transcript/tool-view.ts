@@ -57,13 +57,24 @@ interface PresentationLine {
   readonly gutterTone?: LineTone
   readonly marker?: string
   readonly markerTone?: LineTone
-  readonly selectable?: boolean
+}
+
+/** Evidence the preview window cut away; the block cap renders the affordance. */
+interface BodyElision {
+  readonly hidden: number
+  readonly where: "earlier" | "more" | "middle"
+}
+
+interface BodyProjection {
+  readonly lines: readonly PresentationLine[]
+  readonly elision?: BodyElision
 }
 
 interface OwnedToolBodyView {
   readonly root: BoxRenderable
   readonly type: ToolBody["type"]
   readonly hasVisibleRows: boolean
+  readonly elision: string | undefined
   update(body: ToolBody): boolean
   setPreview(preview: ToolPreviewPolicy): boolean
   setExpanded(expanded: boolean): boolean
@@ -93,6 +104,7 @@ export class ToolCallView implements TranscriptItemView {
   #endedAt: number | undefined
   #timingValue: string | undefined
   #chromeStatus: ToolStatus
+  #capElision: string | undefined
 
   constructor(ctx: RenderContext, id: string, frame: ToolViewFrame, theme: Theme, cwd: string, expandHint?: string) {
     this.#ctx = ctx
@@ -247,8 +259,12 @@ export class ToolCallView implements TranscriptItemView {
 
   #syncChrome(): boolean {
     const status = this.#frame.status
+    const elision = this.#body?.elision
     const evidenceVisible =
-      (this.#body?.hasVisibleRows ?? false) || this.#notices.hasVisibleRows || this.#action.hasVisibleRows
+      (this.#body?.hasVisibleRows ?? false) ||
+      elision !== undefined ||
+      this.#notices.hasVisibleRows ||
+      this.#action.hasVisibleRows
     const secondaryVisible =
       this.#frame.presentation.header.secondary !== undefined &&
       (this.#expanded || evidenceVisible || status === "running" || status === "failed" || status === "aborted")
@@ -263,11 +279,15 @@ export class ToolCallView implements TranscriptItemView {
       this.#cap.visible = capVisible
       changed = true
     }
-    if (status !== this.#chromeStatus) {
+    if (status !== this.#chromeStatus || elision !== this.#capElision) {
       const color = railColor(status, this.#theme)
       this.#separator.fg = color
       this.#cap.fg = color
+      this.#cap.content = elision
+        ? new StyledText([fg(color)(glyphs.toolCap), fg(this.#theme.text.muted)(` ${elision}`)])
+        : glyphs.toolCap
       this.#chromeStatus = status
+      this.#capElision = elision
       changed = true
     }
     return changed
@@ -282,6 +302,7 @@ export class ToolCallView implements TranscriptItemView {
     this.#body?.setWidth(width)
     this.#notices.setWidth(width)
     this.#action.setWidth(width)
+    this.#syncChrome()
   }
 
   #trackTiming(previous: ToolStatus | undefined, next: ToolStatus): void {
@@ -303,7 +324,6 @@ export class ToolCallView implements TranscriptItemView {
   #timingText(now: number): string | undefined {
     if (this.#frame.presentation.timing === "hidden" || this.#startedAt === undefined) return undefined
     const running = this.#endedAt === undefined
-    if (!running && !this.#expanded) return undefined
     const elapsed = `${(((this.#endedAt ?? now) - this.#startedAt) / 1_000).toFixed(1)}s`
     return !running && this.#frame.presentation.timing === "started" ? `started in ${elapsed}` : elapsed
   }
@@ -419,25 +439,19 @@ class ToolHeaderView {
   #renderContent(): void {
     const header = this.#header
     const status = header.status ?? lifecycleStatus(this.#toolStatus)
+    const delta = !this.#expanded ? header.delta : undefined
+    const layout = this.#layout(status, delta)
     this.#label.content = new StyledText([
       {
         ...fg(this.#theme.text.primary)(`${header.label}${header.subject ? " " : ""}`),
         attributes: TextAttributes.BOLD
       }
     ])
-    const details = this.#detailsText(status)
     this.#subject.visible = header.subject !== undefined
-    this.#subject.content = subjectContent(
-      header.subject,
-      this.#theme,
-      this.#cwd,
-      this.#subjectWidth(status, details),
-      !this.#expanded
-    )
+    this.#subject.content = subjectContent(header.subject, this.#theme, this.#cwd, layout.subjectWidth, !this.#expanded)
     this.#subject.wrapMode = this.#expanded ? "word" : "none"
-    this.#details.visible = details.length > 0
-    this.#details.content = details
-    const delta = !this.#expanded ? header.delta : undefined
+    this.#details.visible = layout.details.length > 0
+    this.#details.content = layout.details
     this.#delta.visible = delta !== undefined
     if (delta) {
       this.#delta.content = new StyledText([
@@ -449,47 +463,49 @@ class ToolHeaderView {
     this.#status.visible = status !== undefined
     this.#status.content = status === undefined ? "" : ` · ${status}`
     this.#status.fg = statusColor(this.#toolStatus, this.#theme)
-    this.#timing.visible = this.#timingText !== undefined
-    this.#timing.content = this.#timingText === undefined ? "" : ` · ${this.#timingText}`
+    this.#timing.visible = layout.showTiming
+    this.#timing.content = layout.showTiming && this.#timingText ? ` · ${this.#timingText}` : ""
   }
 
-  #detailsText(status: string | undefined): string {
+  /**
+   * The single width budget for the header line. Bullet, label, delta, and
+   * status always fit; details fill what remains after reserving the
+   * subject's natural width (capped) and timing. Timing is ambient, so it
+   * yields first when it would push every detail off the line; the subject
+   * takes the rest.
+   */
+  #layout(
+    status: string | undefined,
+    delta: ToolHeader["delta"]
+  ): { readonly details: string; readonly subjectWidth: number; readonly showTiming: boolean } {
     const header = this.#header
-    const minimumSubjectWidth = header.subject ? 16 : 0
-    const reserved =
-      2 +
+    const fixed =
+      textWidth(glyphs.tool) +
       textWidth(header.label) +
       (header.subject ? 1 : 0) +
-      minimumSubjectWidth +
-      this.#deltaWidth() +
-      (status ? textWidth(status) + 3 : 0) +
-      (this.#timingText ? textWidth(this.#timingText) + 3 : 0)
-    const available = Math.max(0, this.#width - reserved)
+      (delta ? textWidth(` +${delta.added}/-${delta.removed}`) : 0) +
+      (status ? textWidth(status) + 3 : 0)
+    const subjectReserve = Math.min(16, naturalSubjectWidth(header.subject))
+    const timingWidth = this.#timingText ? textWidth(this.#timingText) + 3 : 0
+
+    let showTiming = timingWidth > 0
+    let details = this.#fitDetails(Math.max(0, this.#width - fixed - subjectReserve - timingWidth))
+    if (showTiming && details === "" && header.details.length > 0) {
+      showTiming = false
+      details = this.#fitDetails(Math.max(0, this.#width - fixed - subjectReserve))
+    }
+    const subjectWidth = Math.max(1, this.#width - fixed - (showTiming ? timingWidth : 0) - textWidth(details))
+    return { details, subjectWidth, showTiming }
+  }
+
+  #fitDetails(budget: number): string {
     let details = ""
-    for (const detail of header.details) {
+    for (const detail of this.#header.details) {
       const next = `${details} · ${detail}`
-      if (textWidth(next) > available) break
+      if (textWidth(next) > budget) break
       details = next
     }
     return details
-  }
-
-  #subjectWidth(status: string | undefined, details: string): number {
-    const header = this.#header
-    const fixed =
-      3 +
-      textWidth(header.label) +
-      (header.subject ? 1 : 0) +
-      textWidth(details) +
-      this.#deltaWidth() +
-      (status ? textWidth(status) + 3 : 0) +
-      (this.#timingText ? textWidth(this.#timingText) + 3 : 0)
-    return Math.max(1, this.#width - fixed)
-  }
-
-  #deltaWidth(): number {
-    const delta = !this.#expanded ? this.#header.delta : undefined
-    return delta ? textWidth(` +${delta.added}/-${delta.removed}`) : 0
   }
 }
 
@@ -837,6 +853,7 @@ abstract class RowBodyView implements OwnedToolBodyView {
   #status: ToolStatus
   #expanded = false
   #width = 76
+  #elisionText: string | undefined
 
   constructor(
     ctx: RenderContext,
@@ -903,24 +920,27 @@ abstract class RowBodyView implements OwnedToolBodyView {
     return this.#body
   }
 
+  get elision(): string | undefined {
+    return this.#elisionText
+  }
+
   protected abstract projectLines(
     width: number,
-    policy: Exclude<ToolPreviewWindow, { readonly type: "hidden" }>,
-    expandHint: string | undefined
-  ): PresentationLine[]
+    policy: Exclude<ToolPreviewWindow, { readonly type: "hidden" }>
+  ): BodyProjection
 
   #render(): void {
     const policy = this.#expanded ? this.#preview.detailed : this.#preview.compact
     if (policy.type === "hidden") {
+      this.#elisionText = undefined
       this.#reconcile([])
       return
     }
-    const lines = this.projectLines(
-      Math.max(1, this.#width - textWidth(glyphs.toolRail)),
-      policy,
-      this.#expanded ? undefined : this.#expandHint
-    )
-    this.#reconcile(lines)
+    const projection = this.projectLines(Math.max(1, this.#width - textWidth(glyphs.toolRail)), policy)
+    this.#elisionText = projection.elision
+      ? elisionText(projection.elision, this.#expanded ? undefined : this.#expandHint)
+      : undefined
+    this.#reconcile(projection.lines)
   }
 
   #reconcile(lines: readonly PresentationLine[]): void {
@@ -981,7 +1001,6 @@ class PresentationRowView {
     this.#marker.fg = lineColor(line.markerTone ?? "muted", this.#theme)
     this.#content.content = line.text
     this.#content.fg = lineColor(line.tone, this.#theme)
-    this.#content.selectable = line.selectable !== false
   }
 
   setStatus(status: ToolStatus): void {
@@ -999,8 +1018,7 @@ function samePresentationLine(left: PresentationLine, right: PresentationLine | 
     left.gutter === right.gutter &&
     left.gutterTone === right.gutterTone &&
     left.marker === right.marker &&
-    left.markerTone === right.markerTone &&
-    left.selectable === right.selectable
+    left.markerTone === right.markerTone
   )
 }
 
@@ -1009,13 +1027,12 @@ export class TerminalBodyView extends RowBodyView {
 
   protected projectLines(
     width: number,
-    policy: Exclude<ToolPreviewWindow, { readonly type: "hidden" }>,
-    expandHint: string | undefined
-  ): PresentationLine[] {
+    policy: Exclude<ToolPreviewWindow, { readonly type: "hidden" }>
+  ): BodyProjection {
     const body = this.body
     return body.type === "terminal"
-      ? applyDirectionalPreview(textLineSource(body.text, width, "output"), policy, expandHint)
-      : []
+      ? applyDirectionalPreview(textLineSource(body.text, width, "output"), policy)
+      : { lines: [] }
   }
 }
 
@@ -1024,11 +1041,10 @@ export class SourceBodyView extends RowBodyView {
 
   protected projectLines(
     width: number,
-    policy: Exclude<ToolPreviewWindow, { readonly type: "hidden" }>,
-    expandHint: string | undefined
-  ): PresentationLine[] {
+    policy: Exclude<ToolPreviewWindow, { readonly type: "hidden" }>
+  ): BodyProjection {
     const body = this.body
-    if (body.type !== "source") return []
+    if (body.type !== "source") return { lines: [] }
     const source = splitTextLines(body.text)
     const startLine = body.startLine ?? 1
     const digits = String(startLine + Math.max(0, source.length - 1)).length
@@ -1040,8 +1056,7 @@ export class SourceBodyView extends RowBodyView {
           return sourceLine(source[index]!, startLine + index, digits, contentWidth, direction, limit)
         }
       },
-      policy,
-      expandHint
+      policy
     )
   }
 }
@@ -1051,11 +1066,10 @@ export class DiffBodyView extends RowBodyView {
 
   protected projectLines(
     width: number,
-    policy: Exclude<ToolPreviewWindow, { readonly type: "hidden" }>,
-    expandHint: string | undefined
-  ): PresentationLine[] {
+    policy: Exclude<ToolPreviewWindow, { readonly type: "hidden" }>
+  ): BodyProjection {
     const body = this.body
-    return body.type === "diff" ? applyDirectionalPreview(diffLineSource(body.text, width), policy, expandHint) : []
+    return body.type === "diff" ? applyDirectionalPreview(diffLineSource(body.text, width), policy) : { lines: [] }
   }
 }
 
@@ -1064,13 +1078,12 @@ export class TextBodyView extends RowBodyView {
 
   protected projectLines(
     width: number,
-    policy: Exclude<ToolPreviewWindow, { readonly type: "hidden" }>,
-    expandHint: string | undefined
-  ): PresentationLine[] {
+    policy: Exclude<ToolPreviewWindow, { readonly type: "hidden" }>
+  ): BodyProjection {
     const body = this.body
-    if (body.type !== "text") return []
+    if (body.type !== "text") return { lines: [] }
     const tone = body.tone === "normal" ? "output" : body.tone
-    return applyDirectionalPreview(textLineSource(body.text, width, tone), policy, expandHint)
+    return applyDirectionalPreview(textLineSource(body.text, width, tone), policy)
   }
 }
 
@@ -1375,6 +1388,28 @@ function createBodyView(
   }
 }
 
+/**
+ * Compact natural width of a subject, so the layout never reserves more
+ * subject space than the content can use. Paths mirror the compact
+ * `displayPath` form (basename); commands flatten newlines the same way
+ * `subjectContent` does.
+ */
+function naturalSubjectWidth(subject: ToolHeader["subject"]): number {
+  if (!subject) return 0
+  switch (subject.type) {
+    case "text":
+      return textWidth(subject.text.replace(/\s*\n\s*/g, " "))
+    case "command":
+      return textWidth(subject.text.replace(/\s*\n\s*/g, " ")) + (subject.prompt ? 2 : 0)
+    case "path":
+      return textWidth(basename(subject.path) || subject.path)
+    case "task":
+      return textWidth(subject.id)
+    default:
+      return assertNever(subject)
+  }
+}
+
 function subjectContent(
   subject: ToolHeader["subject"],
   theme: Theme,
@@ -1453,12 +1488,19 @@ function fileUrl(cwd: string, path: string): string {
 
 interface DirectionalLineSource {
   readonly length: number
-  line(index: number, direction: "head" | "tail", limit: number): CollectedLines
+  line(index: number, direction: "head" | "tail", limit: number): LineWindow
+}
+
+interface LineWindow {
+  readonly lines: readonly PresentationLine[]
+  readonly hasMore: boolean
 }
 
 interface CollectedLines {
   readonly lines: readonly PresentationLine[]
   readonly hasMore: boolean
+  /** Logical lines touched from the collection side; partially wrapped lines count. */
+  readonly consumed: number
 }
 
 function textLineSource(text: string, width: number, tone: LineTone): DirectionalLineSource {
@@ -1482,7 +1524,7 @@ function sourceLine(
   width: number,
   direction: "head" | "tail",
   limit: number
-): CollectedLines {
+): LineWindow {
   const wrapped = direction === "head" ? wrapHeadToCells(text, width, limit) : wrapTailToCells(text, width, limit)
   const firstLineVisible = direction === "head" || !wrapped.hasMore
   return {
@@ -1496,65 +1538,71 @@ function sourceLine(
   }
 }
 
+/**
+ * Windows never spend content rows on elision markers: the cut is reported as
+ * a counted elision that the block cap renders (`╰─── … 42 more lines`).
+ */
 function applyDirectionalPreview(
   source: DirectionalLineSource,
-  policy: Exclude<ToolPreviewWindow, { readonly type: "hidden" }>,
-  expandHint: string | undefined
-): PresentationLine[] {
+  policy: Exclude<ToolPreviewWindow, { readonly type: "hidden" }>
+): BodyProjection {
   if (policy.type === "head") {
     const sample = collectHead(source, policy.rows)
-    if (!sample.hasMore) return [...sample.lines]
-    if (policy.rows <= 1) return [omissionLine("more output", expandHint)]
-    return [...sample.lines.slice(0, policy.rows - 1), omissionLine("more output", expandHint)]
+    if (!sample.hasMore) return { lines: sample.lines }
+    return { lines: sample.lines, elision: { hidden: source.length - sample.consumed, where: "more" } }
   }
   if (policy.type === "tail") {
     const sample = collectTail(source, policy.rows)
-    if (!sample.hasMore) return [...sample.lines]
-    if (policy.rows <= 1) return [omissionLine("earlier output", expandHint)]
-    return [omissionLine("earlier output", expandHint), ...sample.lines.slice(-(policy.rows - 1))]
+    if (!sample.hasMore) return { lines: sample.lines }
+    return { lines: sample.lines, elision: { hidden: source.length - sample.consumed, where: "earlier" } }
   }
 
   const retained = policy.head + policy.tail
   const sample = collectHead(source, retained)
-  if (!sample.hasMore) return [...sample.lines]
-  if (retained === 0) return [omissionLine("middle output", expandHint)]
-  return [
-    ...sample.lines.slice(0, policy.head),
-    omissionLine("middle output", expandHint),
-    ...collectTail(source, policy.tail).lines
-  ]
+  if (!sample.hasMore) return { lines: sample.lines }
+  const head = collectHead(source, policy.head)
+  const tail = collectTail(source, policy.tail)
+  const hidden = Math.max(0, source.length - head.consumed - tail.consumed)
+  return {
+    lines: [...head.lines, ...tail.lines],
+    ...(hidden > 0 ? { elision: { hidden, where: "middle" as const } } : {})
+  }
 }
 
 function collectHead(source: DirectionalLineSource, limit: number): CollectedLines {
   const lines: PresentationLine[] = []
+  let consumed = 0
   for (let index = 0; index < source.length; index++) {
+    if (lines.length === limit) return { lines, hasMore: true, consumed }
     const wrapped = source.line(index, "head", limit - lines.length)
     lines.push(...wrapped.lines)
-    if (wrapped.hasMore || (lines.length === limit && index < source.length - 1)) {
-      return { lines, hasMore: true }
-    }
+    if (wrapped.lines.length > 0) consumed = index + 1
+    if (wrapped.hasMore) return { lines, hasMore: true, consumed }
   }
-  return { lines, hasMore: false }
+  return { lines, hasMore: false, consumed }
 }
 
 function collectTail(source: DirectionalLineSource, limit: number): CollectedLines {
   const lines: PresentationLine[] = []
+  let consumed = 0
   for (let index = source.length - 1; index >= 0; index--) {
+    if (lines.length === limit) return { lines, hasMore: true, consumed }
     const wrapped = source.line(index, "tail", limit - lines.length)
     lines.unshift(...wrapped.lines)
-    if (wrapped.hasMore || (lines.length === limit && index > 0)) {
-      return { lines, hasMore: true }
-    }
+    if (wrapped.lines.length > 0) consumed = source.length - index
+    if (wrapped.hasMore) return { lines, hasMore: true, consumed }
   }
-  return { lines, hasMore: false }
+  return { lines, hasMore: false, consumed }
+}
+
+function elisionText(elision: BodyElision, expandHint: string | undefined): string {
+  const noun = elision.hidden === 1 ? "line" : "lines"
+  const where = elision.where === "middle" ? "hidden" : elision.where
+  return `… ${elision.hidden} ${where} ${noun}${expandHint ? ` · ${expandHint} details` : ""}`
 }
 
 function densityOmission(label: string, expanded: boolean, expandHint: string | undefined): string {
   return `… ${label}${!expanded && expandHint ? ` · ${expandHint} details` : ""}`
-}
-
-function omissionLine(label: string, expandHint: string | undefined): PresentationLine {
-  return { text: densityOmission(label, false, expandHint), tone: "muted", selectable: false }
 }
 
 interface ParsedHunkHeader {
@@ -1562,6 +1610,8 @@ interface ParsedHunkHeader {
   readonly oldLines: number
   readonly newStart: number
   readonly newLines: number
+  /** Trailing context after the second `@@` (usually the enclosing symbol). */
+  readonly context: string
 }
 
 function diffLineSource(diff: string, width: number): DirectionalLineSource {
@@ -1579,7 +1629,7 @@ function presentationLineWindow(
   width: number,
   direction: "head" | "tail",
   limit: number
-): CollectedLines {
+): LineWindow {
   const prefixWidth = textWidth(line.gutter ?? "") + textWidth(line.marker ?? "")
   const contentWidth = Math.max(1, width - prefixWidth)
   const wrapped =
@@ -1625,7 +1675,10 @@ function diffLogicalLines(diff: string): PresentationLine[] {
     if (header) {
       const nextGap = previousNewEnd === undefined ? 0 : Math.max(0, header.newStart - previousNewEnd - 1)
       if (nextGap > 0) {
-        output.push({ text: `… ${nextGap} unchanged ${nextGap === 1 ? "line" : "lines"}`, tone: "muted" })
+        // Gap lines carry the following hunk's context so a windowed diff
+        // stays anchored to its enclosing symbol.
+        const context = header.context ? ` · ${header.context}` : ""
+        output.push({ text: `… ${nextGap} unchanged ${nextGap === 1 ? "line" : "lines"}${context}`, tone: "muted" })
       }
       oldLine = header.oldStart
       newLine = header.newStart
@@ -1661,7 +1714,7 @@ function diffLogicalLines(diff: string): PresentationLine[] {
 }
 
 function parseHunkHeader(line: string): ParsedHunkHeader | undefined {
-  const match = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/.exec(line)
+  const match = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@\s?(.*)$/.exec(line)
   if (!match) return undefined
   const values = [
     Number(match[1]),
@@ -1670,7 +1723,13 @@ function parseHunkHeader(line: string): ParsedHunkHeader | undefined {
     match[4] === undefined ? 1 : Number(match[4])
   ]
   if (values.some(value => !Number.isSafeInteger(value))) return undefined
-  return { oldStart: values[0]!, oldLines: values[1]!, newStart: values[2]!, newLines: values[3]! }
+  return {
+    oldStart: values[0]!,
+    oldLines: values[1]!,
+    newStart: values[2]!,
+    newLines: values[3]!,
+    context: match[5]!.trim()
+  }
 }
 
 function numberedDiffLine(

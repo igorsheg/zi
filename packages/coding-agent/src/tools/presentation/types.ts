@@ -14,6 +14,21 @@ export interface ToolPresentation {
   readonly timing: ToolTimingPolicy
 }
 
+/**
+ * Header slots form a single grammar, rendered left to right:
+ * `bullet Label subject · details +added/-removed · status · timing`.
+ * Each slot has exactly one job; projectors must not leak one channel into
+ * another:
+ * - label: stable operation verb ("Run", "Edit", "Spawn"). Never shifts tense
+ *   with lifecycle; the bullet, rail color, and view-owned lifecycle words
+ *   carry that.
+ * - subject: the target acted on. At most one per tool.
+ * - details: auxiliary facts (timeouts, task ids, ranges, counts). Pure
+ *   decoration; the view drops them first under width pressure.
+ * - status: a single outcome phrase ("exit 1", "timed out", "match not
+ *   found"). Never lifecycle ("failed"/"aborted" — the view adds those) and
+ *   never evidence qualifiers explained by notices ("truncated").
+ */
 export interface ToolHeader {
   readonly label: string
   readonly subject?: ToolSubject
@@ -66,3 +81,12 @@ export const maxToolInlineScalars = 4_096
 export const maxToolNotices = 8
 export const maxToolPreviewRows = 12
 export const maxExpandedToolRows = 200
+
+/**
+ * Expanded evidence that keeps both ends splits the expanded row budget
+ * between head and tail; the cap carries the elision count, so no row is
+ * reserved for an in-body marker.
+ */
+export function splitWindow(head: number): ToolPreviewWindow {
+  return { type: "edges", head, tail: Math.max(0, maxExpandedToolRows - head) }
+}

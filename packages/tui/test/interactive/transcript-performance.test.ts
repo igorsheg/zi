@@ -689,9 +689,7 @@ test("visible running tools refresh their marker and elapsed time from the rende
     harness.tools.set(new Map([[done.id, done]]))
     harness.revision.set(1)
     await harness.setup.flush()
-    expect(harness.setup.captureCharFrame()).not.toContain("1.3s")
-    harness.setup.mockInput.pressKey("o", { ctrl: true })
-    await harness.setup.flush()
+    // Duration stays visible after completion; only the live refresh stops.
     expect(harness.setup.captureCharFrame()).toContain("1.3s")
     expect(harness.setup.renderer.liveRequestCount).toBe(0)
   } finally {

@@ -47,7 +47,7 @@ test("edit applies disjoint replacements and returns a context-rich authoritativ
     expect(presentation.body).toEqual({ type: "diff", text: result.details.diff, path })
     expect(presentation.preview).toEqual({
       compact: { type: "edges", head: 5, tail: 5 },
-      detailed: { type: "edges", head: 120, tail: 79 }
+      detailed: { type: "edges", head: 120, tail: 80 }
     })
 
     const restoredResult = JSON.parse(JSON.stringify(result))

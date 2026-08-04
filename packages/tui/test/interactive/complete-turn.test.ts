@@ -119,7 +119,9 @@ test("Ctrl+G demotes the session-owned foreground shell task", async () => {
     expect(session.shellTasks).toHaveLength(1)
     expect(session.shellTasks[0]).toMatchObject({ type: "completed", outcome: { type: "exited", exitCode: 0 } })
     await setup.renderOnce()
-    expect(setup.captureCharFrame()).toContain("background · task")
+    const frame = setup.captureCharFrame()
+    expect(frame).toContain("· task")
+    expect(frame).toContain("· background")
   } finally {
     session.dispose()
     setup.destroy()
