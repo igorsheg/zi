@@ -54,39 +54,6 @@ export default function (zi): void {
   output.destroy()
 })
 
-test("worker process retains one listener set instead of iterating the Windows protocol pipe", async () => {
-  const input = new PassThrough()
-  let iteratorRequested = false
-  Object.defineProperty(input, Symbol.asyncIterator, {
-    value: () => {
-      iteratorRequested = true
-      throw new Error("Protocol input must not allocate a per-read iterator")
-    }
-  })
-  const output = new PassThrough()
-  const messages = new WorkerMessageQueue(output)
-  const run = runExtensionWorkerProcess(input, output)
-
-  expect(input.listenerCount("data")).toBe(1)
-  send(input, initialize(extensionPlan(process.cwd(), [])))
-  expect(await messages.next()).toMatchObject({ type: "ready", generation: 1, extensions: [] })
-  send(input, { type: "session_start", generation: 1, requestId: 1, reason: "startup", context: testExtensionContext })
-  expect(await messages.next()).toEqual({ type: "settled", generation: 1, requestId: 1 })
-  send(input, { type: "session_shutdown", generation: 1, requestId: 2, reason: "quit" })
-  expect(await messages.next()).toEqual({ type: "settled", generation: 1, requestId: 2 })
-  send(input, { type: "stop", generation: 1, requestId: 3 })
-  expect(await messages.next()).toEqual({ type: "settled", generation: 1, requestId: 3 })
-
-  await run
-  expect(iteratorRequested).toBe(false)
-  expect(input.listenerCount("data")).toBe(0)
-  expect(input.listenerCount("end")).toBe(0)
-  expect(input.listenerCount("close")).toBe(0)
-  expect(input.listenerCount("error")).toBe(0)
-  messages.dispose()
-  output.destroy()
-})
-
 test("worker process serializes bounded agent event notifications", async () => {
   const root = await mkdtemp(join(tmpdir(), "zi-extension-worker-agent-events-"))
   const log = join(root, "events.log")

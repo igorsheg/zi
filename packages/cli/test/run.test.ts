@@ -20,7 +20,13 @@ import {
   fauxToolCall
 } from "@with-zi/coding-agent/testing"
 
-import { createProcessHost, currentZiCommand, defaultCliArgv, interactiveAcceptanceArgument } from "../src/main.js"
+import {
+  bunWindowsDefaultMaxListeners,
+  createProcessHost,
+  currentZiCommand,
+  defaultCliArgv,
+  interactiveAcceptanceArgument
+} from "../src/main.js"
 import {
   helpText,
   maxCliStdinBytes,
@@ -156,6 +162,12 @@ test("CLI argument defaults handle Bun scripts and compiled executables", () => 
   ])
   expect(currentZiCommand([process.execPath, "/$bunfs/root/standalone"])).toEqual([process.execPath])
   expect(currentZiCommand([process.execPath, "B:\\~BUN\\root\\standalone.ts"])).toEqual([process.execPath])
+})
+
+test("the pinned Bun runtime raises only the Windows listener warning threshold", () => {
+  expect(bunWindowsDefaultMaxListeners("win32", "1.3.14")).toBe(32)
+  expect(bunWindowsDefaultMaxListeners("win32", "1.3.15")).toBeUndefined()
+  expect(bunWindowsDefaultMaxListeners("linux", "1.3.14")).toBeUndefined()
 })
 
 test("the internal acceptance host changes only CLI TTY admission facts", () => {
