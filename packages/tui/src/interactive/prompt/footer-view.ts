@@ -28,7 +28,7 @@ const sideGap = 2
 const itemSeparator = " • "
 
 export class PromptFooterView {
-  static readonly occupiedRows = 3
+  static readonly occupiedRows = 1
 
   readonly root: BoxRenderable
 
@@ -43,8 +43,6 @@ export class PromptFooterView {
       flexDirection: "row",
       justifyContent: "space-between",
       flexShrink: 0,
-      paddingTop: 1,
-      paddingBottom: 1,
       paddingLeft: 1,
       paddingRight: 1,
       visible: false

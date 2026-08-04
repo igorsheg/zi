@@ -77,12 +77,12 @@ test("footer keeps native rows stable and skips identical assignments", async ()
   const layout = layoutPromptFooter(sessionFooter, 40)
 
   try {
-    expect(footer.update(layout)).toBe(3)
+    expect(footer.update(layout)).toBe(1)
     await setup.waitForVisualIdle()
     const children = [...footer.root.getChildren()]
     expect(setup.renderer.getSchedulerState().hasScheduledRender).toBe(false)
 
-    expect(footer.update({ ...layout })).toBe(3)
+    expect(footer.update({ ...layout })).toBe(1)
     expect([...footer.root.getChildren()]).toEqual(children)
     expect(setup.renderer.getSchedulerState().hasScheduledRender).toBe(false)
 

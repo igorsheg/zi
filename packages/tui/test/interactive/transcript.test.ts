@@ -280,7 +280,7 @@ test("native wheel and resize mechanics preserve detached intent until all conte
 
 test("native selection mouse-down detaches before its first drag event", async () => {
   const session = await createTranscriptSession(1)
-  const setup = await createInteractiveTest(session, { width: 48, height: 14, kittyKeyboard: true })
+  const setup = await createInteractiveTest(session, { width: 48, height: 12, kittyKeyboard: true })
 
   try {
     await renderSettled(setup)
@@ -323,7 +323,7 @@ test("native selection mouse-down detaches before its first drag event", async (
 
 test("native selection edge-scrolls in visual order and detaches before streamed output", async () => {
   const session = await createTranscriptSession(1)
-  const setup = await createInteractiveTest(session, { width: 48, height: 15, kittyKeyboard: true })
+  const setup = await createInteractiveTest(session, { width: 48, height: 13, kittyKeyboard: true })
 
   try {
     await renderSettled(setup)

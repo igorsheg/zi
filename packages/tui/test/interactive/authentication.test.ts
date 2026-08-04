@@ -42,7 +42,7 @@ test("exact /login uses hidden composer input and selects the provider model wit
       return models
     }
   })
-  const setup = await createInteractiveTest(runtime.session, { width: 52, height: 13 })
+  const setup = await createInteractiveTest(runtime.session, { width: 52, height: 12 })
 
   try {
     const input = promptInput(setup)
@@ -179,7 +179,7 @@ test("session replacement cancels pending authentication and cannot accept stale
       return models
     }
   })
-  const setup = await createInteractiveTest(oldRuntime.session, { width: 52, height: 13, kittyKeyboard: true })
+  const setup = await createInteractiveTest(oldRuntime.session, { width: 52, height: 12, kittyKeyboard: true })
 
   try {
     const input = promptInput(setup)

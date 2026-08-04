@@ -10,7 +10,7 @@ test("prompt footer yields the below-composer surface to pickers", async () => {
   const faux = fauxProvider()
   models.setProvider(faux.provider)
   const { session } = await createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
-  const setup = await createInteractiveTest(session, { width: 48, height: 13 })
+  const setup = await createInteractiveTest(session, { width: 48, height: 12 })
 
   try {
     await setup.renderOnce()
@@ -39,7 +39,7 @@ test("prompt footer derives metadata from the replacement session", async () => 
   models.setProvider(faux.provider)
   const first = await createAgentRuntime({ cwd: "/first", models, session: { type: "new", persist: false } })
   const second = await createAgentRuntime({ cwd: "/second", models, session: { type: "new", persist: false } })
-  const setup = await createInteractiveTest(first.session, { width: 48, height: 13 })
+  const setup = await createInteractiveTest(first.session, { width: 48, height: 12 })
 
   try {
     await setup.renderOnce()
@@ -71,11 +71,11 @@ test("prompt footer preserves a transcript row and follows compact composer geom
 
     setup.resize(40, 6)
     await setup.renderOnce()
-    expect(footer.visible).toBe(false)
+    expect(footer.visible).toBe(true)
 
     setup.resize(40, 7)
     await setup.renderOnce()
-    expect(footer.visible).toBe(false)
+    expect(footer.visible).toBe(true)
 
     setup.resize(40, 8)
     await setup.renderOnce()

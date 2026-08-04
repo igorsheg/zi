@@ -126,11 +126,11 @@ test("a maximum queue preserves the constrained composer and Ctrl+C leaves pendi
     expect(session.queuedInputs.steering).toHaveLength(32)
     const overflowFrame = setup.captureCharFrame()
     expect(overflowFrame).toContain("Queue capacity exceeded")
-    expect(overflowFrame).toContain("… 31 more queued")
+    expect(overflowFrame).toContain("… 32 more queued")
     expect(overflowFrame).toContain("keep this exact draft")
     const footer = setup.renderer.root.findDescendantById("prompt-footer")
     if (!(footer instanceof BoxRenderable)) throw new Error("Prompt footer not found")
-    expect(footer.visible).toBe(false)
+    expect(footer.visible).toBe(true)
     expect(setup.renderer.currentFocusedRenderable).toBe(input)
     expect(
       session.messages.some(message => message.role === "user" && messageText(message) === "keep this exact draft")
@@ -140,7 +140,7 @@ test("a maximum queue preserves the constrained composer and Ctrl+C leaves pendi
     expect(input.plainText).toBe("")
     expect(session.queuedInputs.steering).toHaveLength(32)
     await setup.renderOnce()
-    expect(setup.captureCharFrame()).toContain("Steering: queued-0")
+    expect(setup.captureCharFrame()).toContain("… 32 more queued")
 
     session.takeQueuedInputs()
     release.resolve()
