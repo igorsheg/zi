@@ -841,11 +841,6 @@ export class ChildZiProcess {
     this.#clearInterruptDeadline()
     if (this.#state.type === "starting") this.#ready.reject(error)
     this.#rejectPending(error)
-    try {
-      this.#onFatal?.(error)
-    } catch {
-      // Process ownership cannot cross into an observer.
-    }
     const settlement = Promise.resolve().then(() => this.#settleClose(rpcCloseForceMs, rpcCloseForceMs, error))
     this.#closeSettlement = settlement
     this.#transition({ type: "closing", reason: "fatal", requestedAt: Date.now() })
@@ -853,6 +848,11 @@ export class ChildZiProcess {
       this.#child.kill("SIGKILL")
     } catch {
       // already dead
+    }
+    try {
+      this.#onFatal?.(error)
+    } catch {
+      // Process ownership cannot cross into an observer.
     }
     void settlement
   }

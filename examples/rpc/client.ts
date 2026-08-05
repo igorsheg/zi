@@ -352,7 +352,8 @@ class RpcClient {
     if (exitCode === timeoutValue) throw new Error(`Zi RPC did not exit within ${rpcClientCloseTimeoutMs}ms`)
     if (!streamsSettled) throw new Error(`Zi RPC output did not settle within ${rpcClientCloseTimeoutMs}ms`)
     if (typeof exitCode !== "number") throw new Error("Zi RPC returned an invalid exit status")
-    if (!ignoreExitFailure && !forced && exitCode !== 0) {
+    const forceKilled = forced && this.#child.signalCode === "SIGKILL"
+    if (!ignoreExitFailure && !forceKilled && exitCode !== 0) {
       const detail = this.#stderr.trim()
       throw new Error(`Zi RPC exited with ${exitCode}${detail ? `: ${detail}` : ""}`)
     }

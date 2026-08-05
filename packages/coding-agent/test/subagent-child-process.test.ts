@@ -533,16 +533,22 @@ test("ChildZiProcess protocol failure terminates a long-lived descendant", async
   const marker = join(root, "descendant.pid")
   let descendantPid: number | undefined
   try {
-    const child = new ChildZiProcess({
+    let reentrantClose: Promise<void> | undefined
+    let child!: ChildZiProcess
+    child = new ChildZiProcess({
       name: "agent-descendant-crash",
       command: [process.execPath, mockChild],
       cwd: root,
       processTreeTracker: createProcessTreeTracker(),
-      env: { ...process.env, MOCK_RPC_DESCENDANT_PID: marker, MOCK_RPC_PROTOCOL_CRASH: "1" }
+      env: { ...process.env, MOCK_RPC_DESCENDANT_PID: marker, MOCK_RPC_PROTOCOL_CRASH: "1" },
+      onFatal() {
+        reentrantClose = child.close()
+      }
     })
     await child.start()
     descendantPid = await readPid(marker)
     await waitFor(() => child.state.type === "exited", 5_000)
+    await reentrantClose
     await waitFor(() => !processAlive(descendantPid!), 5_000)
     expect(child.snapshot().lifecycle).toBe("exited")
   } finally {
