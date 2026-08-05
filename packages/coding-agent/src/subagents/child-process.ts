@@ -858,20 +858,21 @@ export class ChildZiProcess {
   }
 
   async #settleClose(graceMs: number, forceMs: number, failure?: Error): Promise<void> {
-    await settleWithin(
-      Promise.allSettled([this.#writeTail]).then(() => undefined),
-      graceMs
-    )
+    const gracefulEndsAt = Date.now() + graceMs
     if (!failure) {
+      await settleWithin(
+        Promise.allSettled([this.#writeTail]).then(() => undefined),
+        deadlineRemainingMs(gracefulEndsAt)
+      )
       await settleWithin(
         Promise.resolve()
           .then(() => this.#child.stdin.end())
           .then(() => undefined)
           .catch(() => undefined),
-        graceMs
+        deadlineRemainingMs(gracefulEndsAt)
       )
     }
-    let exitCode = await settleValueWithin(this.#exited, graceMs)
+    let exitCode = await settleValueWithin(this.#exited, failure ? forceMs : deadlineRemainingMs(gracefulEndsAt))
     if (exitCode === timeoutValue) {
       try {
         this.#child.kill("SIGKILL")
@@ -1109,6 +1110,10 @@ class JsonLineDecoder {
     if (this.#bufferBytes > maxRpcFrameBytes) throw new Error(`RPC frame exceeds ${maxRpcFrameBytes} bytes`)
     return lines
   }
+}
+
+function deadlineRemainingMs(endsAt: number): number {
+  return Math.max(0, endsAt - Date.now())
 }
 
 function isPositiveTimeout(value: unknown): value is number {

@@ -321,19 +321,21 @@ class RpcClient {
   async #closeConnection(ignoreExitFailure: boolean): Promise<void> {
     this.#removeAbort()
     this.#rejectPending(new Error("RPC client closed"))
+    const gracefulEndsAt = Date.now() + rpcClientCloseTimeoutMs
     await settleWithin(
       Promise.allSettled([this.#writeTail]).then(() => undefined),
-      rpcClientCloseTimeoutMs
+      remainingMs(gracefulEndsAt)
     )
     await settleWithin(
       Promise.resolve()
         .then(() => this.#child.stdin.end())
         .then(() => undefined)
         .catch(() => undefined),
-      rpcClientCloseTimeoutMs
+      remainingMs(gracefulEndsAt)
     )
     let forced = false
-    let exitCode = await settleValueWithin(this.#exited, rpcClientCloseTimeoutMs)
+    let exitCode = await settleValueWithin(this.#exited, remainingMs(gracefulEndsAt))
+    const forceEndsAt = Date.now() + rpcClientCloseTimeoutMs
     if (exitCode === timeoutValue) {
       forced = true
       try {
@@ -341,11 +343,11 @@ class RpcClient {
       } catch {
         // The process exited at the force boundary.
       }
-      exitCode = await settleValueWithin(this.#exited, rpcClientCloseTimeoutMs)
+      exitCode = await settleValueWithin(this.#exited, remainingMs(forceEndsAt))
     }
     const streamsSettled = await settleWithin(
       Promise.allSettled([this.#stdoutSettlement, this.#stderrSettlement]).then(() => undefined),
-      rpcClientCloseTimeoutMs
+      remainingMs(forceEndsAt)
     )
     this.#state = { type: "closed" }
 
@@ -528,6 +530,10 @@ function settleValueWithin<T>(operation: Promise<T>, timeoutMs: number): Promise
   ]).finally(() => {
     if (timeout) clearTimeout(timeout)
   })
+}
+
+function remainingMs(endsAt: number): number {
+  return Math.max(0, endsAt - Date.now())
 }
 
 function listenForAbort(signal: AbortSignal | undefined, listener: () => void): () => void {
