@@ -12,6 +12,27 @@ test("RPC request decoding admits only the versioned closed command catalog", ()
     })
   ).toEqual({ version: 1, id: "prompt-1", method: "session.prompt", params: { delivery: "steer", text: "next" } })
   expect(
+    decodeRpcRequest({
+      version: 1,
+      id: "prompt-completion",
+      method: "session.prompt",
+      params: { delivery: "direct", text: "work", completionId: "cycle-1" }
+    })
+  ).toEqual({
+    version: 1,
+    id: "prompt-completion",
+    method: "session.prompt",
+    params: { delivery: "direct", text: "work", completionId: "cycle-1" }
+  })
+  expect(
+    decodeRpcRequest({
+      version: 1,
+      id: "idle-completion",
+      method: "session.await_idle",
+      params: { completionId: "cycle-1" }
+    })
+  ).toEqual({ version: 1, id: "idle-completion", method: "session.await_idle", params: { completionId: "cycle-1" } })
+  expect(
     decodeRpcRequest({ version: 1, id: "thinking-1", method: "thinking.select", params: { level: "high" } })
   ).toEqual({ version: 1, id: "thinking-1", method: "thinking.select", params: { level: "high", scope: "global" } })
   expect(decodeRpcRequest({ version: 1, id: "messages-default", method: "session.get_messages" })).toEqual({
@@ -60,6 +81,10 @@ test("RPC request decoding admits only the versioned closed command catalog", ()
 
   expectRequestError(
     { version: 1, id: "x", method: "session.prompt", params: { delivery: "later", text: "hello" } },
+    "invalid_request"
+  )
+  expectRequestError(
+    { version: 1, id: "x", method: "session.await_idle", params: { completionId: "" } },
     "invalid_request"
   )
   expectRequestError(

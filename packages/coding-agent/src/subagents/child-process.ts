@@ -13,11 +13,10 @@ export const maxRpcFrameBytes = 16 * 1024 * 1024
 export const maxRpcPendingRequests = 32
 export const maxRpcPendingWriteBytes = 16 * 1024 * 1024
 export const maxRpcStderrBytes = 64 * 1024
-export const maxRpcMessagePages = 1_024
-export const maxCompletionBytes = 50 * 1024
 export const rpcReadyTimeoutMs = 10_000
 export const rpcResponseTimeoutMs = 30_000
 export const workTimeoutSettlementMs = 10_000
+export const interruptSettlementMs = 10_000
 export const rpcCloseGraceMs = 5_000
 export const rpcCloseForceMs = 5_000
 
@@ -76,6 +75,10 @@ type WorkDeadlineState =
   | { readonly type: "running"; readonly workCycle: number; readonly timer: ReturnType<typeof setTimeout> }
   | { readonly type: "settling"; readonly workCycle: number; readonly timer: ReturnType<typeof setTimeout> }
 
+type InterruptDeadlineState =
+  | { readonly type: "none" }
+  | { readonly type: "settling"; readonly workCycle: number; readonly timer: ReturnType<typeof setTimeout> }
+
 type IdleWatchState = {
   readonly token: object
   readonly revision: number
@@ -92,6 +95,7 @@ export type ChildZiProcessOptions = {
   readonly workTimeoutMs?: number
   readonly responseTimeoutMs?: number
   readonly workTimeoutSettlementMs?: number
+  readonly interruptSettlementMs?: number
   readonly onStateChange?: () => void
   readonly onCompletion?: (completion: SubagentCompletion) => void
   readonly onFatal?: (error: Error) => void
@@ -106,6 +110,7 @@ export class ChildZiProcess {
   readonly #workTimeoutMs: number
   readonly #responseTimeoutMs: number
   readonly #workTimeoutSettlementMs: number
+  readonly #interruptSettlementMs: number
   readonly #ready = deferred<void>()
   readonly #pending = new Map<string, PendingRequest>()
   readonly #stdoutSettlement: Promise<void>
@@ -113,7 +118,8 @@ export class ChildZiProcess {
   readonly #processScope: ProcessScope
   #state: ChildLifecycleState
   #sessionId: string | undefined
-  #messageCountAtCycleStart = 0
+  #completionId: string | undefined
+  #completionRevision = 0
   #admissionRevision = 0
   #pendingCycleAdmission = 0
   #idleWatch: IdleWatchState | undefined
@@ -126,6 +132,7 @@ export class ChildZiProcess {
   #latestCompletion: SubagentCompletion | undefined
   #cycleStartedAt = 0
   #workDeadline: WorkDeadlineState = { type: "none" }
+  #interruptDeadline: InterruptDeadlineState = { type: "none" }
 
   constructor(options: ChildZiProcessOptions) {
     this.name = options.name
@@ -135,9 +142,11 @@ export class ChildZiProcess {
     this.#workTimeoutMs = options.workTimeoutMs ?? defaultSubagentWorkTimeoutMs
     this.#responseTimeoutMs = options.responseTimeoutMs ?? rpcResponseTimeoutMs
     this.#workTimeoutSettlementMs = options.workTimeoutSettlementMs ?? workTimeoutSettlementMs
+    this.#interruptSettlementMs = options.interruptSettlementMs ?? interruptSettlementMs
     if (!isSubagentWorkTimeout(this.#workTimeoutMs)) throw new Error("Invalid subagent work timeout")
     if (!isPositiveTimeout(this.#responseTimeoutMs)) throw new Error("Invalid RPC response timeout")
     if (!isPositiveTimeout(this.#workTimeoutSettlementMs)) throw new Error("Invalid work-timeout settlement bound")
+    if (!isPositiveTimeout(this.#interruptSettlementMs)) throw new Error("Invalid interrupt settlement bound")
     this.#state = { type: "starting", startedAt: Date.now() }
     this.#child = Bun.spawn([...options.command], {
       cwd: options.cwd,
@@ -213,12 +222,9 @@ export class ChildZiProcess {
       this.#fail(error)
       throw error
     }
-    await this.request("connection.set_events", { mode: "none" })
-    const state = await this.request("session.get_state")
-    if (isRecord(state)) {
-      if (typeof state.sessionId === "string") this.#sessionId = state.sessionId
-      if (typeof state.messageCount === "number") this.#messageCountAtCycleStart = state.messageCount
-    }
+    await this.#request("connection.set_events", { mode: "none" }, this.#responseTimeoutMs)
+    const state = await this.#request("session.get_state", undefined, this.#responseTimeoutMs)
+    if (isRecord(state) && typeof state.sessionId === "string") this.#sessionId = state.sessionId
     this.#transition({ type: "idle", nextWorkCycle: 1 })
   }
 
@@ -227,15 +233,30 @@ export class ChildZiProcess {
     if (state.type !== "idle") throw new Error(`Subagent ${this.name} cannot spawn-admit while ${state.type}`)
     const workCycle = state.nextWorkCycle
     this.#transition({ type: "spawn_admitting", workCycle, startedAt: Date.now() })
-    this.#messageCountAtCycleStart = await this.#currentMessageCount()
+    this.#completionId = String(workCycle)
+    this.#completionRevision = 0
     this.#beginCycleAdmission()
     try {
-      await this.request("session.prompt", { delivery: "direct", text: prompt })
+      const result = await this.#request(
+        "session.prompt",
+        { delivery: "direct", text: prompt, completionId: this.#completionId },
+        this.#responseTimeoutMs
+      )
+      this.#acceptCompletionAdmission(result)
     } catch (cause) {
       this.#endCycleAdmission()
       throw cause
     }
     this.#endCycleAdmission()
+    const admitted = this.#state
+    if (admitted.type === "idle" && admitted.nextWorkCycle === workCycle + 1) return
+    if (admitted.type === "interrupting" && admitted.workCycle === workCycle) {
+      this.#watchIdle(this.#admissionRevision)
+      return
+    }
+    if (admitted.type !== "spawn_admitting" || admitted.workCycle !== workCycle) {
+      throw new Error(`Subagent ${this.name} changed state during spawn admission`)
+    }
     this.#cycleStartedAt = Date.now()
     this.#transition({ type: "running", workCycle, startedAt: this.#cycleStartedAt })
     this.#armWorkDeadline(workCycle)
@@ -256,7 +277,12 @@ export class ChildZiProcess {
     const running = state.type === "running"
     if (running) this.#beginCycleAdmission()
     try {
-      await this.request("session.prompt", { delivery: "follow_up", text })
+      const result = await this.#request(
+        "session.prompt",
+        { delivery: "follow_up", text, ...(running && this.#completionId ? { completionId: this.#completionId } : {}) },
+        this.#responseTimeoutMs
+      )
+      if (running) this.#acceptCompletionAdmission(result, true)
     } catch (cause) {
       if (running) {
         this.#endCycleAdmission()
@@ -278,10 +304,16 @@ export class ChildZiProcess {
     if (state.type === "idle") {
       const workCycle = state.nextWorkCycle
       this.#transition({ type: "running", workCycle, startedAt: Date.now() })
-      this.#messageCountAtCycleStart = await this.#currentMessageCount()
+      this.#completionId = String(workCycle)
+      this.#completionRevision = 0
       this.#beginCycleAdmission()
       try {
-        await this.request("session.prompt", { delivery: "continue", text })
+        const result = await this.#request(
+          "session.prompt",
+          { delivery: "continue", text, completionId: this.#completionId },
+          this.#responseTimeoutMs
+        )
+        this.#acceptCompletionAdmission(result)
       } catch (cause) {
         this.#endCycleAdmission()
         // Failed continue after idle transition: recover via get_state.
@@ -299,7 +331,12 @@ export class ChildZiProcess {
     }
     this.#beginCycleAdmission()
     try {
-      await this.request("session.prompt", { delivery: "continue", text })
+      const result = await this.#request(
+        "session.prompt",
+        { delivery: "continue", text, ...(this.#completionId ? { completionId: this.#completionId } : {}) },
+        this.#responseTimeoutMs
+      )
+      this.#acceptCompletionAdmission(result)
     } catch (cause) {
       this.#endCycleAdmission()
       this.#watchIdle(this.#admissionRevision)
@@ -318,20 +355,27 @@ export class ChildZiProcess {
     }
     if (this.#interruptInFlight) return "interrupted"
     const workCycle = state.workCycle
+    if (state.type === "spawn_admitting") this.#cycleStartedAt = Date.now()
     this.#clearWorkDeadline(workCycle)
     this.#transition({ type: "interrupting", workCycle, requestedAt: Date.now(), reason: "requested" })
+    this.#armInterruptDeadline(workCycle)
     this.#beginCycleAdmission()
     this.#interruptInFlight = true
     try {
-      await this.request("session.interrupt")
+      await this.#request("session.interrupt", undefined, undefined)
     } catch (cause) {
       this.#interruptInFlight = false
       this.#endCycleAdmission()
+      this.#clearInterruptDeadline(workCycle)
       const current = this.#state
       if (current.type === "interrupting" && current.workCycle === workCycle && current.reason === "requested") {
-        this.#transition({ type: "running", workCycle, startedAt: this.#cycleStartedAt })
-        this.#armWorkDeadline(workCycle)
-        this.#watchIdle(this.#admissionRevision)
+        if (state.type === "spawn_admitting") {
+          this.#transition(state)
+        } else {
+          this.#transition({ type: "running", workCycle, startedAt: this.#cycleStartedAt })
+          this.#armWorkDeadline(workCycle)
+          this.#watchIdle(this.#admissionRevision)
+        }
       }
       throw cause
     }
@@ -350,6 +394,7 @@ export class ChildZiProcess {
       )
     }
     this.#clearWorkDeadline()
+    this.#clearInterruptDeadline()
     if (state.type === "exited") return
     if (state.type === "closing") {
       await this.#waitExit()
@@ -392,7 +437,11 @@ export class ChildZiProcess {
     })
   }
 
-  request(method: string, params?: Readonly<Record<string, unknown>>): Promise<unknown> {
+  #request(
+    method: string,
+    params: Readonly<Record<string, unknown>> | undefined,
+    timeoutMs: number | undefined
+  ): Promise<unknown> {
     if (this.#state.type === "closing" || this.#state.type === "exited") {
       return Promise.reject(new Error(`Subagent ${this.name} is ${this.#state.type}`))
     }
@@ -413,7 +462,7 @@ export class ChildZiProcess {
     }
     const settlement = deferred<unknown>()
     const timeout =
-      method === "session.await_idle"
+      timeoutMs === undefined
         ? undefined
         : setTimeout(() => {
             const pending = this.#pending.get(id)
@@ -422,7 +471,7 @@ export class ChildZiProcess {
             const error = new Error(`RPC request ${method} timed out`)
             pending.reject(error)
             this.#fail(error)
-          }, this.#responseTimeoutMs)
+          }, timeoutMs)
     timeout?.unref?.()
     this.#pending.set(id, {
       method,
@@ -434,10 +483,20 @@ export class ChildZiProcess {
     return settlement.promise
   }
 
-  async #currentMessageCount(): Promise<number> {
-    const state = await this.request("session.get_state")
-    if (isRecord(state) && typeof state.messageCount === "number") return state.messageCount
-    return this.#messageCountAtCycleStart
+  #acceptCompletionAdmission(value: unknown, allowUnchanged = false): void {
+    const revision = isRecord(value) ? value.completionRevision : undefined
+    if (typeof revision !== "number" || !Number.isSafeInteger(revision)) {
+      const error = new Error("Invalid RPC completion admission")
+      this.#fail(error)
+      throw error
+    }
+    if (allowUnchanged && revision === this.#completionRevision) return
+    if (revision !== this.#completionRevision + 1) {
+      const error = new Error("RPC completion admission revision did not advance")
+      this.#fail(error)
+      throw error
+    }
+    this.#completionRevision = revision
   }
 
   #beginCycleAdmission(): void {
@@ -485,7 +544,7 @@ export class ChildZiProcess {
     this.#beginCycleAdmission()
     const revision = this.#admissionRevision
     this.#interruptInFlight = true
-    void this.request("session.interrupt").then(
+    void this.#request("session.interrupt", undefined, undefined).then(
       () => {
         this.#interruptInFlight = false
         this.#endCycleAdmission()
@@ -517,6 +576,28 @@ export class ChildZiProcess {
     this.#workDeadline = { type: "none" }
   }
 
+  #armInterruptDeadline(workCycle: number): void {
+    this.#clearInterruptDeadline()
+    const timer = setTimeout(() => {
+      const state = this.#state
+      if (state.type !== "interrupting" || state.reason !== "requested" || state.workCycle !== workCycle) return
+      const error = new Error(
+        `Subagent ${this.name} interruption did not settle within ${this.#interruptSettlementMs}ms`
+      )
+      this.#publishInterruptSettlementFailure(workCycle, error, "interrupt_settlement_timeout")
+      this.#fail(error)
+    }, this.#interruptSettlementMs)
+    timer.unref?.()
+    this.#interruptDeadline = { type: "settling", workCycle, timer }
+  }
+
+  #clearInterruptDeadline(workCycle?: number): void {
+    const deadline = this.#interruptDeadline
+    if (deadline.type === "none" || (workCycle !== undefined && deadline.workCycle !== workCycle)) return
+    clearTimeout(deadline.timer)
+    this.#interruptDeadline = { type: "none" }
+  }
+
   #watchIdle(revision: number): void {
     const current = this.#idleWatch
     if (current?.phase === "waiting") {
@@ -524,12 +605,17 @@ export class ChildZiProcess {
       return
     }
     const token = {}
-    const promise = this.request("session.await_idle")
-      .then((): Promise<void> => {
+    const completionId = this.#completionId
+    if (!completionId) {
+      this.#fail(new Error(`Subagent ${this.name} has no active completion watch`))
+      return
+    }
+    const promise = this.#request("session.await_idle", { completionId }, undefined)
+      .then((result): Promise<void> => {
         const watch = this.#idleWatch
         if (!watch || watch.token !== token) return Promise.resolve()
         this.#idleWatch = { ...watch, phase: "resolved" }
-        return this.#onIdle(this.#idleWatch.revision)
+        return this.#onIdle(this.#idleWatch.revision, result)
       })
       .catch(cause => {
         if (this.#state.type === "closing" || this.#state.type === "exited") return
@@ -538,32 +624,40 @@ export class ChildZiProcess {
     this.#idleWatch = { token, revision, phase: "waiting", promise }
   }
 
-  async #onIdle(revision: number): Promise<void> {
+  async #onIdle(revision: number, result: unknown): Promise<void> {
     if (this.#idleWatch?.revision !== revision) return
     if (this.#pendingCycleAdmission > 0) return
     if (this.#admissionRevision !== revision) return
     const state = this.#state
     if (state.type !== "running" && state.type !== "interrupting") return
     const workCycle = state.workCycle
-    this.#clearWorkDeadline(workCycle)
+    const durationMs = Math.max(0, Date.now() - this.#cycleStartedAt)
+    const observed = completionFromIdleResult(this.name, workCycle, durationMs, result)
+    if (observed.completionRevision !== this.#completionRevision) {
+      this.#idleWatch = undefined
+      this.#watchIdle(this.#admissionRevision)
+      return
+    }
+    if (state.type === "running") this.#clearWorkDeadline(workCycle)
 
     // Settled work is a containment admission barrier for background processes started during the cycle.
     if ((await this.#processScope.refresh()).type === "overflow") {
       throw new Error("Subagent process scope exceeded tracked descendant capacity")
     }
     if (!this.#ownsIdleCompletion(revision, workCycle)) return
-    const observed = await this.#readCompletion(workCycle)
     if (!this.#ownsIdleCompletion(revision, workCycle)) return
+    this.#clearWorkDeadline(workCycle)
+    this.#clearInterruptDeadline(workCycle)
     const terminal = this.#state
     const timedOut = terminal.type === "interrupting" && terminal.reason === "work_timeout"
     const completion = timedOut
       ? {
-          ...observed,
+          ...observed.completion,
           status: "failed" as const,
           reason: "work_cycle_timeout",
           error: `Subagent work cycle exceeded ${this.#workTimeoutMs}ms`
         }
-      : observed
+      : observed.completion
     this.#publishCompletion(completion)
     this.#idleWatch = undefined
     this.#transition({ type: "idle", nextWorkCycle: workCycle + 1 })
@@ -593,6 +687,15 @@ export class ChildZiProcess {
     this.#publishCompletion(completion)
   }
 
+  #publishInterruptSettlementFailure(workCycle: number, error: Error, reason: string): void {
+    if (this.#latestCompletion?.workCycle === workCycle) return
+    this.#clearInterruptDeadline(workCycle)
+    this.#publishCompletion({
+      ...baseCompletion(this.name, workCycle, Math.max(0, Date.now() - this.#cycleStartedAt), "failed", "", reason),
+      error: error.message
+    })
+  }
+
   #publishCompletion(completion: SubagentCompletion): void {
     this.#latestCompletion = completion
     try {
@@ -604,7 +707,7 @@ export class ChildZiProcess {
 
   async #recoverAfterFailedContinue(): Promise<void> {
     try {
-      const state = await this.request("session.get_state")
+      const state = await this.#request("session.get_state", undefined, this.#responseTimeoutMs)
       const activity = isRecord(state) && isRecord(state.activity) ? state.activity.type : undefined
       if (activity === "idle") {
         const current = this.#state
@@ -619,66 +722,6 @@ export class ChildZiProcess {
       this.#watchIdle(this.#admissionRevision)
     } catch (cause) {
       this.#fail(cause)
-    }
-  }
-
-  async #readCompletion(workCycle: number): Promise<SubagentCompletion> {
-    const durationMs = Math.max(0, Date.now() - this.#cycleStartedAt)
-    let start = this.#messageCountAtCycleStart
-    let latest: { readonly text: string; readonly stopReason: string; readonly error?: string } | undefined
-
-    let completeSuffix = false
-    for (let pageIndex = 0; pageIndex < maxRpcMessagePages; pageIndex++) {
-      // Sequential pages keep one cursor for the settled suffix.
-      // oxlint-disable-next-line no-await-in-loop
-      const result = await this.request("session.get_messages", { start, limit: 100 })
-      const page = messagePage(result)
-      if (page.start !== start) throw new Error("RPC message page start mismatch")
-      for (const message of page.messages) {
-        const assistant = assistantMessage(message)
-        if (assistant) latest = assistant
-      }
-      if (page.nextStart === null) {
-        completeSuffix = true
-        break
-      }
-      if (page.nextStart <= start) throw new Error("RPC message pagination did not advance")
-      start = page.nextStart
-    }
-    if (!completeSuffix) throw new Error(`RPC message suffix exceeded ${maxRpcMessagePages} pages`)
-
-    if (!latest) {
-      return baseCompletion(this.name, workCycle, durationMs, "failed", "", "missing_assistant")
-    }
-    const clipped = clipUtf8(latest.text, maxCompletionBytes)
-    if (latest.stopReason === "aborted") {
-      return {
-        ...baseCompletion(this.name, workCycle, durationMs, "cancelled", clipped.text),
-        originalBytes: clipped.originalBytes,
-        omittedBytes: clipped.omittedBytes,
-        truncated: clipped.omittedBytes > 0
-      }
-    }
-    if (latest.stopReason === "error") {
-      return {
-        ...baseCompletion(this.name, workCycle, durationMs, "failed", clipped.text, "provider_error"),
-        ...(latest.error !== undefined ? { error: latest.error } : {}),
-        originalBytes: clipped.originalBytes,
-        omittedBytes: clipped.omittedBytes,
-        truncated: clipped.omittedBytes > 0
-      }
-    }
-    if (latest.stopReason === "toolUse") {
-      return baseCompletion(this.name, workCycle, durationMs, "failed", clipped.text, "missing_final_answer")
-    }
-    if (latest.stopReason === "pending") {
-      return baseCompletion(this.name, workCycle, durationMs, "failed", clipped.text, "incomplete_final_answer")
-    }
-    return {
-      ...baseCompletion(this.name, workCycle, durationMs, "completed", clipped.text),
-      originalBytes: clipped.originalBytes,
-      omittedBytes: clipped.omittedBytes,
-      truncated: latest.stopReason === "length" || clipped.omittedBytes > 0
     }
   }
 
@@ -741,7 +784,6 @@ export class ChildZiProcess {
           throw new Error("Subagent RPC emitted an invalid ready frame")
         }
         if (typeof frame.state.sessionId === "string") this.#sessionId = frame.state.sessionId
-        if (typeof frame.state.messageCount === "number") this.#messageCountAtCycleStart = frame.state.messageCount
         this.#ready.resolve()
         return
       case "session_event":
@@ -804,16 +846,25 @@ export class ChildZiProcess {
     const state = this.#state
     if (state.type === "exited" || state.type === "closing") return
     const error = cause instanceof Error ? cause : new Error(String(cause))
-    if (state.type === "interrupting" && state.reason === "work_timeout") {
-      this.#publishWorkTimeoutFailure(
-        state.workCycle,
-        new Error(
-          `Subagent ${this.name} work cycle ${state.workCycle} exceeded ${this.#workTimeoutMs}ms; settlement failed: ${error.message}`,
-          { cause: error }
+    if (state.type === "interrupting") {
+      if (state.reason === "work_timeout") {
+        this.#publishWorkTimeoutFailure(
+          state.workCycle,
+          new Error(
+            `Subagent ${this.name} work cycle ${state.workCycle} exceeded ${this.#workTimeoutMs}ms; settlement failed: ${error.message}`,
+            { cause: error }
+          )
         )
-      )
+      } else {
+        this.#publishInterruptSettlementFailure(
+          state.workCycle,
+          new Error(`Subagent ${this.name} interruption settlement failed: ${error.message}`, { cause: error }),
+          "interrupt_settlement_failed"
+        )
+      }
     }
     this.#clearWorkDeadline()
+    this.#clearInterruptDeadline()
     if (this.#state.type === "starting") this.#ready.reject(error)
     this.#rejectPending(error)
     try {
@@ -919,42 +970,89 @@ export function clipUtf8(
   return { text: clipped, originalBytes, omittedBytes: originalBytes - end }
 }
 
-function messagePage(value: unknown): {
-  readonly start: number
-  readonly total: number
-  readonly nextStart: number | null
-  readonly messages: readonly unknown[]
-} {
+function completionFromIdleResult(
+  name: string,
+  workCycle: number,
+  durationMs: number,
+  value: unknown
+): { readonly completionRevision: number; readonly completion: SubagentCompletion } {
   if (
     !isRecord(value) ||
-    !Number.isSafeInteger(value.start) ||
-    !Number.isSafeInteger(value.total) ||
-    (value.nextStart !== null && !Number.isSafeInteger(value.nextStart)) ||
-    !Array.isArray(value.messages)
+    !Number.isSafeInteger(value.completionRevision) ||
+    !Number.isSafeInteger(value.messageCount)
   ) {
-    throw new Error("Invalid RPC message page")
+    throw new Error("Invalid RPC idle completion result")
   }
-  const start = value.start
-  const total = value.total
-  const nextStart = value.nextStart
-  if (typeof start !== "number" || typeof total !== "number") throw new Error("Invalid RPC message page")
-  if (nextStart !== null && typeof nextStart !== "number") throw new Error("Invalid RPC message page")
-  return { start, total, nextStart, messages: value.messages }
-}
-
-function assistantMessage(
-  value: unknown
-): { readonly text: string; readonly stopReason: string; readonly error?: string } | undefined {
-  if (!isRecord(value) || value.role !== "assistant" || !Array.isArray(value.content)) return undefined
-  let text = ""
-  for (const part of value.content) {
-    if (!isRecord(part) || part.type !== "text" || typeof part.text !== "string") continue
-    text += part.text
+  const completionRevision = value.completionRevision
+  if (typeof completionRevision !== "number" || completionRevision < 1) {
+    throw new Error("Invalid RPC idle completion result")
+  }
+  if (value.completion === null) {
+    return {
+      completionRevision,
+      completion: baseCompletion(name, workCycle, durationMs, "failed", "", "missing_assistant")
+    }
+  }
+  if (!isRecord(value.completion)) throw new Error("Invalid RPC idle completion result")
+  const completion = value.completion
+  if (
+    typeof completion.text !== "string" ||
+    typeof completion.stopReason !== "string" ||
+    !Number.isSafeInteger(completion.originalBytes) ||
+    !Number.isSafeInteger(completion.omittedBytes)
+  ) {
+    throw new Error("Invalid RPC idle completion result")
+  }
+  const originalBytes = completion.originalBytes
+  const omittedBytes = completion.omittedBytes
+  if (
+    typeof originalBytes !== "number" ||
+    typeof omittedBytes !== "number" ||
+    originalBytes < 0 ||
+    omittedBytes < 0 ||
+    Buffer.byteLength(completion.text) + omittedBytes !== originalBytes ||
+    (completion.error !== undefined && typeof completion.error !== "string")
+  ) {
+    throw new Error("Invalid RPC idle completion result")
+  }
+  const fields = { originalBytes, omittedBytes, truncated: completion.stopReason === "length" || omittedBytes > 0 }
+  if (completion.stopReason === "aborted") {
+    return {
+      completionRevision,
+      completion: { ...baseCompletion(name, workCycle, durationMs, "cancelled", completion.text), ...fields }
+    }
+  }
+  if (completion.stopReason === "error") {
+    return {
+      completionRevision,
+      completion: {
+        ...baseCompletion(name, workCycle, durationMs, "failed", completion.text, "provider_error"),
+        ...(typeof completion.error === "string" ? { error: completion.error } : {}),
+        ...fields
+      }
+    }
+  }
+  if (completion.stopReason === "toolUse") {
+    return {
+      completionRevision,
+      completion: {
+        ...baseCompletion(name, workCycle, durationMs, "failed", completion.text, "missing_final_answer"),
+        ...fields
+      }
+    }
+  }
+  if (completion.stopReason === "pending") {
+    return {
+      completionRevision,
+      completion: {
+        ...baseCompletion(name, workCycle, durationMs, "failed", completion.text, "incomplete_final_answer"),
+        ...fields
+      }
+    }
   }
   return {
-    text,
-    stopReason: typeof value.stopReason === "string" ? value.stopReason : "unknown",
-    ...(typeof value.errorMessage === "string" ? { error: value.errorMessage } : {})
+    completionRevision,
+    completion: { ...baseCompletion(name, workCycle, durationMs, "completed", completion.text), ...fields }
   }
 }
 

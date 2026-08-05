@@ -40,23 +40,50 @@ test("RPC mode sequences authoritative events, concurrent interruption, and page
     })
     expect(JSON.stringify(ready)).not.toContain("baseUrl")
 
-    input.send({ version: 1, id: "prompt", method: "session.prompt", params: { delivery: "direct", text: "start" } })
+    input.send({
+      version: 1,
+      id: "prompt",
+      method: "session.prompt",
+      params: { delivery: "direct", text: "start", completionId: "work-1" }
+    })
     await providerStarted.promise
     await output.response("prompt")
 
     input.send(
-      { version: 1, id: "steer", method: "session.prompt", params: { delivery: "steer", text: "steer" } },
-      { version: 1, id: "follow", method: "session.prompt", params: { delivery: "follow_up", text: "follow" } }
+      {
+        version: 1,
+        id: "steer",
+        method: "session.prompt",
+        params: { delivery: "steer", text: "steer", completionId: "work-1" }
+      },
+      {
+        version: 1,
+        id: "follow",
+        method: "session.prompt",
+        params: { delivery: "follow_up", text: "follow", completionId: "work-1" }
+      }
     )
     expect((await output.response("steer")).ok).toBe(true)
     expect((await output.response("follow")).ok).toBe(true)
 
     input.send(
-      { version: 1, id: "idle", method: "session.await_idle" },
+      { version: 1, id: "idle", method: "session.await_idle", params: { completionId: "work-1" } },
       { version: 1, id: "interrupt", method: "session.interrupt" }
     )
     expect((await output.response("interrupt")).ok).toBe(true)
-    expect((await output.response("idle")).ok).toBe(true)
+    expect(await output.response("idle")).toMatchObject({
+      ok: true,
+      result: {
+        completionRevision: 3,
+        messageCount: expect.any(Number),
+        completion: {
+          text: expect.any(String),
+          stopReason: expect.any(String),
+          originalBytes: expect.any(Number),
+          omittedBytes: expect.any(Number)
+        }
+      }
+    })
 
     input.send({ version: 1, id: "state", method: "session.get_state" })
     const state = await output.response("state")
@@ -84,6 +111,112 @@ test("RPC mode sequences authoritative events, concurrent interruption, and page
     expect(output.frames).toContainEqual(
       expect.objectContaining({ type: "session_event", event: expect.objectContaining({ type: "agent_settled" }) })
     )
+  } finally {
+    input.close()
+    runtime.session.dispose()
+    await runtime.session.waitForIdle()
+  }
+})
+
+test("RPC completion watches return bounded terminal evidence with the admitted revision", async () => {
+  const models = createModels()
+  const faux = fauxProvider({ provider: "rpc", models: [{ id: "model", name: "RPC Model", reasoning: false }] })
+  models.setProvider(faux.provider)
+  const fullCompletion = "x".repeat(60 * 1024)
+  const secondStarted = deferred<void>()
+  const finishSecond = deferred<void>()
+  faux.setResponses([
+    fauxAssistantMessage(fullCompletion),
+    async () => {
+      secondStarted.resolve()
+      await finishSecond.promise
+      return fauxAssistantMessage("second completion")
+    },
+    fauxAssistantMessage("untracked completion")
+  ])
+  const runtime = await createTestAgentRuntime({
+    cwd: "/work",
+    model: "rpc/model",
+    apiKey: "test",
+    models,
+    session: { type: "new", persist: false }
+  })
+  const input = new RpcTestInput()
+  const output = new RpcTestOutput()
+  const running = runRpcMode(runtime.session, { input, writer: output })
+
+  try {
+    await output.frame(frame => frame.type === "ready")
+    input.send({
+      version: 1,
+      id: "prompt",
+      method: "session.prompt",
+      params: { delivery: "direct", text: "start", completionId: "cycle-1" }
+    })
+    expect(await output.response("prompt")).toMatchObject({
+      ok: true,
+      result: { delivery: "direct", completionRevision: 1 }
+    })
+
+    input.send({ version: 1, id: "idle", method: "session.await_idle", params: { completionId: "cycle-1" } })
+    expect(await output.response("idle")).toMatchObject({
+      ok: true,
+      result: {
+        completionRevision: 1,
+        completion: {
+          text: "x".repeat(50 * 1024),
+          stopReason: "stop",
+          originalBytes: 60 * 1024,
+          omittedBytes: 10 * 1024
+        }
+      }
+    })
+
+    input.send({
+      version: 1,
+      id: "continue",
+      method: "session.prompt",
+      params: { delivery: "continue", text: "continue", completionId: "cycle-1" }
+    })
+    expect(await output.response("continue")).toMatchObject({
+      ok: true,
+      result: { delivery: "continue", completionRevision: 2 }
+    })
+    await secondStarted.promise
+    input.send({
+      version: 1,
+      id: "rejected-direct",
+      method: "session.prompt",
+      params: { delivery: "direct", text: "reject while running", completionId: "cycle-1" }
+    })
+    expect(await output.response("rejected-direct")).toMatchObject({ ok: false })
+    finishSecond.resolve()
+
+    input.send({ version: 1, id: "idle-2", method: "session.await_idle", params: { completionId: "cycle-1" } })
+    expect(await output.response("idle-2")).toMatchObject({
+      ok: true,
+      result: { completionRevision: 2, completion: { text: "second completion", stopReason: "stop" } }
+    })
+
+    input.send({
+      version: 1,
+      id: "untracked",
+      method: "session.prompt",
+      params: { delivery: "direct", text: "untracked" }
+    })
+    expect(await output.response("untracked")).toMatchObject({ ok: true })
+    input.send({ version: 1, id: "untracked-idle", method: "session.await_idle" })
+    expect(await output.response("untracked-idle")).toMatchObject({ ok: true })
+    input.send({
+      version: 1,
+      id: "invalidated-watch",
+      method: "session.await_idle",
+      params: { completionId: "cycle-1" }
+    })
+    expect(await output.response("invalidated-watch")).toMatchObject({ ok: false })
+
+    input.close()
+    expect(await running).toEqual({ type: "eof" })
   } finally {
     input.close()
     runtime.session.dispose()

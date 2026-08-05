@@ -8,6 +8,9 @@ export const maxRpcInputTextBytes = 8 * 1024 * 1024
 export const maxRpcRequestIdBytes = 256
 export const maxRpcMessagePageCount = 100
 export const maxRpcMessagePageBytes = 8 * 1024 * 1024
+export const maxRpcCompletionIdBytes = 256
+export const maxRpcCompletionTextBytes = 50 * 1024
+export const maxRpcCompletionErrorBytes = 8 * 1024
 export const maxRpcCommandNameBytes = 64
 export const maxRpcCommandArgumentsBytes = 256 * 1024
 
@@ -26,10 +29,15 @@ export type RpcRequest =
       readonly version: 1
       readonly id: string
       readonly method: "session.prompt"
-      readonly params: { readonly delivery: RpcInputDelivery; readonly text: string }
+      readonly params: { readonly delivery: RpcInputDelivery; readonly text: string; readonly completionId?: string }
     }
   | { readonly version: 1; readonly id: string; readonly method: "session.interrupt" }
-  | { readonly version: 1; readonly id: string; readonly method: "session.await_idle" }
+  | {
+      readonly version: 1
+      readonly id: string
+      readonly method: "session.await_idle"
+      readonly params?: { readonly completionId: string }
+    }
   | {
       readonly version: 1
       readonly id: string
@@ -164,7 +172,6 @@ export function decodeRpcRequest(value: unknown): RpcRequest {
   switch (value.method) {
     case "session.get_state":
     case "session.interrupt":
-    case "session.await_idle":
     case "command.list":
     case "model.list":
     case "thinking.list":
@@ -189,10 +196,18 @@ export function decodeRpcRequest(value: unknown): RpcRequest {
       }
       return { version: 1, id: requestId, method: "session.get_messages", params: { start, limit } }
     }
+    case "session.await_idle": {
+      requireKeys(value, ["version", "id", "method", "params"], requestId, true)
+      if (value.params === undefined) return { version: 1, id: requestId, method: "session.await_idle" }
+      const params = requireRecord(value.params, "session.await_idle params", requestId)
+      requireKeys(params, ["completionId"], requestId)
+      const completionId = boundedString(params.completionId, "Completion id", maxRpcCompletionIdBytes, requestId, true)
+      return { version: 1, id: requestId, method: "session.await_idle", params: { completionId } }
+    }
     case "session.prompt": {
       requireKeys(value, ["version", "id", "method", "params"], requestId)
       const params = requireRecord(value.params, "session.prompt params", requestId)
-      requireKeys(params, ["delivery", "text"], requestId)
+      requireKeys(params, ["delivery", "text", "completionId"], requestId, true)
       if (
         params.delivery !== "direct" &&
         params.delivery !== "steer" &&
@@ -206,7 +221,16 @@ export function decodeRpcRequest(value: unknown): RpcRequest {
         )
       }
       const text = boundedString(params.text, "Prompt text", maxRpcInputTextBytes, requestId)
-      return { version: 1, id: requestId, method: "session.prompt", params: { delivery: params.delivery, text } }
+      const completionId =
+        params.completionId === undefined
+          ? undefined
+          : boundedString(params.completionId, "Completion id", maxRpcCompletionIdBytes, requestId, true)
+      return {
+        version: 1,
+        id: requestId,
+        method: "session.prompt",
+        params: { delivery: params.delivery, text, ...(completionId ? { completionId } : {}) }
+      }
     }
     case "command.invoke": {
       requireKeys(value, ["version", "id", "method", "params"], requestId)

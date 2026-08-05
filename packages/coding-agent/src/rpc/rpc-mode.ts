@@ -10,6 +10,8 @@ import type { AgentMessage } from "../messages.js"
 import type { CustomEntry, CustomMessageEntry, SessionEntry } from "../session-manager.js"
 import {
   decodeRpcRequest,
+  maxRpcCompletionErrorBytes,
+  maxRpcCompletionTextBytes,
   maxRpcFrameBytes,
   maxRpcMessagePageBytes,
   rpcProtocolVersion,
@@ -129,6 +131,23 @@ export type RpcServerFrame =
       readonly error: { readonly code: "capacity" | "not_found" | "operation_failed"; readonly message: string }
     })
 
+type RpcAssistantMessage = Extract<AgentMessage, { readonly role: "assistant" }>
+
+type CompletionObservation = {
+  readonly revision: number
+  readonly latest: RpcAssistantMessage | undefined
+  readonly messageCount: number
+}
+
+type CompletionWatch = {
+  readonly id: string
+  revision: number
+  latest: RpcAssistantMessage | undefined
+  settled: CompletionObservation | undefined
+}
+
+type RpcConnection = { eventMode: "all" | "none"; completion: CompletionWatch | undefined }
+
 type ConnectionState =
   | { readonly type: "open" }
   | { readonly type: "stopping"; readonly reason: Exclude<RpcModeResult, { type: "settlement_error" }> }
@@ -166,13 +185,14 @@ export async function runRpcMode(session: AgentSession, transport: RpcModeTransp
   let interruptActive = false
   // Connection-owned event projection. Default remains "all" for compatibility.
   let eventMode: "all" | "none" = "all"
-  const connection = {
+  const connection: RpcConnection = {
     get eventMode() {
       return eventMode
     },
     set eventMode(mode: "all" | "none") {
       eventMode = mode
-    }
+    },
+    completion: undefined
   }
   const operations = new Set<Promise<void>>()
   const stopped = deferred<void>()
@@ -191,6 +211,16 @@ export async function runRpcMode(session: AgentSession, transport: RpcModeTransp
   }
 
   const unsubscribe = session.subscribe(event => {
+    if (event.type === "message_end" && event.message.role === "assistant" && connection.completion) {
+      connection.completion.latest = event.message
+    }
+    if (event.type === "agent_settled" && connection.completion) {
+      connection.completion.settled = {
+        revision: connection.completion.revision,
+        latest: connection.completion.latest,
+        messageCount: session.messages.length
+      }
+    }
     if (state.type === "open" && eventMode === "all") send({ type: "session_event", event: projectEvent(event) })
   })
   const removeAbort = listenForAbort(transport.signal, () => stop({ type: "cancelled" }))
@@ -354,36 +384,58 @@ export async function runRpcMode(session: AgentSession, transport: RpcModeTransp
   }
 }
 
-async function handleRequest(
-  session: AgentSession,
-  request: RpcRequest,
-  connection: { eventMode: "all" | "none" }
-): Promise<unknown> {
+async function handleRequest(session: AgentSession, request: RpcRequest, connection: RpcConnection): Promise<unknown> {
   switch (request.method) {
     case "session.get_state":
       return sessionState(session)
     case "session.get_messages":
       return messagePage(session, request.params.start, request.params.limit)
-    case "session.prompt":
-      if (request.params.delivery === "direct") {
-        const settlement = session.prompt(request.params.text)
-        void settlement.catch(() => {})
-      } else if (request.params.delivery === "steer") {
-        session.steer(request.params.text)
-      } else if (request.params.delivery === "follow_up") {
-        session.followUp(request.params.text)
-      } else {
-        // continue: child AgentSession decides idle->direct vs running->follow-up atomically.
-        const settlement = session.prompt(request.params.text, { streamingBehavior: "followUp" })
-        void settlement.catch(() => {})
+    case "session.prompt": {
+      const completionId = request.params.completionId
+      const participatesInWork =
+        request.params.delivery === "direct" || request.params.delivery === "continue" || session.isStreaming
+      const tracksCompletion = completionId !== undefined && participatesInWork
+      const previousCompletion = connection.completion ? { ...connection.completion } : undefined
+      if (completionId === undefined && participatesInWork) connection.completion = undefined
+      if (tracksCompletion && previousCompletion?.id !== completionId) {
+        connection.completion = { id: completionId, revision: 0, latest: undefined, settled: undefined }
       }
-      return { delivery: request.params.delivery }
+      if (tracksCompletion && connection.completion?.id === completionId) {
+        connection.completion.revision++
+        connection.completion.settled = undefined
+      }
+      try {
+        if (request.params.delivery === "direct") {
+          const settlement = session.prompt(request.params.text)
+          void settlement.catch(() => {})
+        } else if (request.params.delivery === "steer") {
+          session.steer(request.params.text)
+        } else if (request.params.delivery === "follow_up") {
+          session.followUp(request.params.text)
+        } else {
+          // continue: child AgentSession decides idle->direct vs running->follow-up atomically.
+          const settlement = session.prompt(request.params.text, { streamingBehavior: "followUp" })
+          void settlement.catch(() => {})
+        }
+      } catch (cause) {
+        connection.completion = previousCompletion
+        throw cause
+      }
+      const completionRevision =
+        completionId !== undefined && connection.completion?.id === completionId
+          ? connection.completion.revision
+          : undefined
+      return { delivery: request.params.delivery, ...(completionRevision !== undefined ? { completionRevision } : {}) }
+    }
     case "session.interrupt":
       await session.abort()
       return {}
     case "session.await_idle":
-      await session.waitForIdle()
-      return {}
+      if (!request.params) {
+        await session.waitForIdle()
+        return {}
+      }
+      return awaitCompletion(session, connection, request.params.completionId)
     case "connection.set_events":
       // Applied synchronously in input order before the response is emitted.
       connection.eventMode = request.params.mode
@@ -455,6 +507,50 @@ function sessionState(session: AgentSession): RpcSessionState {
   }
 }
 
+async function awaitCompletion(
+  session: AgentSession,
+  connection: RpcConnection,
+  completionId: string
+): Promise<unknown> {
+  while (true) {
+    // A newer admission can cross an earlier idle observation before this continuation runs.
+    // The synchronous agent_settled snapshot keeps text and revision from different runs from mixing.
+    // oxlint-disable-next-line no-await-in-loop
+    await session.waitForIdle()
+    const watch = connection.completion
+    if (watch?.id !== completionId) throw new Error(`Completion watch is not active: ${completionId}`)
+    if (watch.settled) return completionResult(watch.settled)
+    if (!session.isStreaming) throw new Error(`Completion watch has no settled observation: ${completionId}`)
+  }
+}
+
+function completionResult(observation: CompletionObservation): unknown {
+  const message = observation.latest
+  if (!message) {
+    return { completionRevision: observation.revision, messageCount: observation.messageCount, completion: null }
+  }
+  let text = ""
+  for (const part of message.content) {
+    if (part.type === "text") text += part.text
+  }
+  const clipped = clipUtf8(text, maxRpcCompletionTextBytes)
+  const error =
+    typeof message.errorMessage === "string"
+      ? clipUtf8(message.errorMessage, maxRpcCompletionErrorBytes).text
+      : undefined
+  return {
+    completionRevision: observation.revision,
+    messageCount: observation.messageCount,
+    completion: {
+      text: clipped.text,
+      stopReason: message.stopReason,
+      originalBytes: clipped.originalBytes,
+      omittedBytes: clipped.omittedBytes,
+      ...(error !== undefined ? { error } : {})
+    }
+  }
+}
+
 function messagePage(session: AgentSession, start: number, limit: number): RpcMessagePage {
   const all = session.messages
   const messages: AgentMessage[] = []
@@ -474,6 +570,18 @@ function messagePage(session: AgentSession, start: number, limit: number): RpcMe
   }
   const nextStart = start + messages.length
   return { start, total: all.length, nextStart: nextStart < all.length ? nextStart : null, messages }
+}
+
+function clipUtf8(
+  text: string,
+  maxBytes: number
+): { readonly text: string; readonly originalBytes: number; readonly omittedBytes: number } {
+  const encoded = Buffer.from(text)
+  const originalBytes = encoded.byteLength
+  if (originalBytes <= maxBytes) return { text, originalBytes, omittedBytes: 0 }
+  let end = maxBytes
+  while (end > 0 && (encoded[end]! & 0xc0) === 0x80) end--
+  return { text: encoded.subarray(0, end).toString("utf8"), originalBytes, omittedBytes: originalBytes - end }
 }
 
 function projectEvent(event: AgentSessionEvent): RpcSessionEvent {
