@@ -79,7 +79,7 @@ test("representative session keeps the accepted visual hierarchy at normal and c
     ])
 
     const spans = setup.captureSpans().lines.flatMap(line => line.spans)
-    expect(span(spans, "Inspect the session UI.").bg.toInts()).toEqual([13, 18, 24, 255])
+    expect(span(spans, "Inspect the session UI.").bg.toInts()).toEqual([34, 38, 45, 255])
     expect(span(spans, "Checking ").attributes).toBe(TextAttributes.ITALIC)
     expect(span(spans, "spacing").attributes).toBe(TextAttributes.BOLD | TextAttributes.ITALIC)
     expect(span(spans, "spacing").fg.toInts()).toEqual([127, 131, 129, 255])

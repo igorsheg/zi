@@ -43,7 +43,7 @@ export interface Theme {
 }
 
 export const defaultTheme: Theme = {
-  surface: { app: "#090E13", panel: "#0D1218", userMessage: "#0D1218", composer: "#090E13" },
+  surface: { app: "#090E13", panel: "#0D1218", userMessage: "#22262D", composer: "#090E13" },
   text: {
     primary: "#C5C9C7",
     muted: "#7F8381",
