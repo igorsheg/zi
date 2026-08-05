@@ -48,6 +48,7 @@ test("settings resolve global, then project, then construction overrides", async
     followUpMode: "one-at-a-time",
     codexFastMode: false,
     subagentWaitTimeoutMs: 30_000,
+    subagentWorkTimeoutMs: 900_000,
     retryEnabled: true,
     retryMaxRetries: 3,
     retryBaseDelayMs: 2_000,
@@ -128,6 +129,23 @@ test("subagent wait timeout is configurable within the one-hour hard bound", asy
   expect(settings.get().subagentWaitTimeoutMs).toBe(30_000)
   expect(settings.drainErrors()[0]?.error.message).toContain("subagentWaitTimeoutMs")
   expect(() => new SettingsManager({ subagentWaitTimeoutMs: 1.5 })).toThrow("Invalid subagentWaitTimeoutMs")
+})
+
+test("subagent work timeout is configurable within the one-hour hard bound", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-settings-subagent-work-"))
+  const paths = new ZiPaths(join(root, "project"), join(root, "global"))
+  await mkdir(paths.globalDir, { recursive: true })
+  await writeFile(paths.globalSettingsFile, JSON.stringify({ subagentWorkTimeoutMs: 1_200_000 }))
+
+  const settings = SettingsManager.create(paths, "absent")
+  expect(settings.get().subagentWorkTimeoutMs).toBe(1_200_000)
+
+  await writeFile(paths.globalSettingsFile, JSON.stringify({ subagentWorkTimeoutMs: 3_600_001 }))
+  settings.reload()
+  expect(settings.get().subagentWorkTimeoutMs).toBe(900_000)
+  expect(settings.drainErrors()[0]?.error.message).toContain("subagentWorkTimeoutMs")
+  expect(() => new SettingsManager({ subagentWorkTimeoutMs: 0 })).toThrow("Invalid subagentWorkTimeoutMs")
+  expect(() => new SettingsManager({ subagentWorkTimeoutMs: 1.5 })).toThrow("Invalid subagentWorkTimeoutMs")
 })
 
 test("retry settings layer and reject unbounded backoff", async () => {
@@ -365,6 +383,7 @@ test("oversized settings are bounded and reported without entering effective sta
     followUpMode: "one-at-a-time",
     codexFastMode: false,
     subagentWaitTimeoutMs: 30_000,
+    subagentWorkTimeoutMs: 900_000,
     retryEnabled: true,
     retryMaxRetries: 3,
     retryBaseDelayMs: 2_000,

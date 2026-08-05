@@ -11,21 +11,25 @@ import { appendFileSync, writeFileSync } from "node:fs"
  * Optional env:
  *   MOCK_RPC_REPLY — assistant text (default "child-done")
  *   MOCK_RPC_DELAY_MS — delay before await_idle settles (default 30)
+ *   MOCK_RPC_MESSAGES_DELAY_MS — delay before get_messages responds
  *   MOCK_RPC_LOG — path to append received methods
  *   MOCK_RPC_ARGV — path to write the child CLI arguments
  *   MOCK_RPC_INTERNAL_API_KEY — path to write the private child credential value
  *   MOCK_RPC_DESCENDANT_PID — path to write a long-lived descendant PID
  *   MOCK_RPC_PROTOCOL_CRASH — emit a malformed protocol frame after startup
+ *   MOCK_RPC_IGNORE_INTERRUPT — acknowledge interruption without settling work
  *   MOCK_RPC_ERROR — assistant error text and failed stop reason
  */
 let sequence = 0
 const reply = process.env.MOCK_RPC_REPLY ?? "child-done"
 const delayMs = Number(process.env.MOCK_RPC_DELAY_MS ?? "30")
+const messagesDelayMs = Number(process.env.MOCK_RPC_MESSAGES_DELAY_MS ?? "0")
 const errorMessage = process.env.MOCK_RPC_ERROR
 const logPath = process.env.MOCK_RPC_LOG
 const descendantPath = process.env.MOCK_RPC_DESCENDANT_PID
 const argvPath = process.env.MOCK_RPC_ARGV
 const internalApiKeyPath = process.env.MOCK_RPC_INTERNAL_API_KEY
+const ignoreInterrupt = process.env.MOCK_RPC_IGNORE_INTERRUPT === "1"
 
 if (argvPath) writeFileSync(argvPath, JSON.stringify(process.argv.slice(2)))
 if (internalApiKeyPath) writeFileSync(internalApiKeyPath, process.env.ZI_INTERNAL_SUBAGENT_API_KEY ?? "")
@@ -50,6 +54,7 @@ type RequestParams = { delivery?: string; text?: string; mode?: string; start?: 
 
 const messages: Message[] = []
 let busy = false
+let activeDelayMs = delayMs
 let writeTail = Promise.resolve()
 
 const send = (value: Record<string, unknown>): void => {
@@ -117,6 +122,8 @@ async function handle(request: { id: string; method: string; params?: RequestPar
       return
     }
     if (text === "__block_prompt__") await Bun.sleep(30_000)
+    if (text === "__delay_prompt__") await Bun.sleep(150)
+    activeDelayMs = text === "__long_work__" ? 30_000 : delayMs
     messages.push({ role: "user", content: [{ type: "text", text }] })
     messages.push({
       role: "assistant",
@@ -129,7 +136,7 @@ async function handle(request: { id: string; method: string; params?: RequestPar
     return
   }
   if (method === "session.await_idle") {
-    const wait = Number.isFinite(delayMs) ? delayMs : 30
+    const wait = Number.isFinite(activeDelayMs) ? activeDelayMs : 30
     const deadline = Date.now() + wait
     while (Date.now() < deadline) {
       if (!busy) break
@@ -141,6 +148,7 @@ async function handle(request: { id: string; method: string; params?: RequestPar
     return
   }
   if (method === "session.get_messages") {
+    if (messagesDelayMs > 0) await Bun.sleep(messagesDelayMs)
     const start = Math.max(0, request.params?.start ?? 0)
     const limit = Math.max(1, request.params?.limit ?? 100)
     const page = messages.slice(start, start + limit)
@@ -156,10 +164,10 @@ async function handle(request: { id: string; method: string; params?: RequestPar
   }
   if (method === "session.interrupt") {
     const latest = messages.at(-1)
-    if (busy && latest && latest.role === "assistant") {
+    if (!ignoreInterrupt && busy && latest && latest.role === "assistant") {
       messages[messages.length - 1] = { role: "assistant", stopReason: "aborted", content: latest.content }
     }
-    busy = false
+    if (!ignoreInterrupt) busy = false
     send({ type: "response", id, method, ok: true, result: {} })
     return
   }

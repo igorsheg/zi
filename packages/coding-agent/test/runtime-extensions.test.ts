@@ -1265,6 +1265,58 @@ test("a Markdown profile activates the standard subagent tools without an extens
   }
 }, 15_000)
 
+test("runtime settings wire the subagent work deadline into accepted child cycles", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-runtime-subagent-work-timeout-"))
+  const cwd = join(root, "project")
+  const agentDir = join(root, "agent")
+  await mkdir(cwd, { recursive: true })
+  await mkdir(join(agentDir, "subagents"), { recursive: true })
+  await writeFile(
+    join(agentDir, "subagents", "pathfinder.md"),
+    `---\ndescription: Find authoritative implementation paths\n---\nReturn concrete file paths.\n`
+  )
+  const models = createModels()
+  const faux = fauxProvider()
+  models.setProvider(faux.provider)
+  faux.setResponses([
+    fauxAssistantMessage(
+      fauxToolCall(
+        "spawn_subagent",
+        { profile: "pathfinder", name: "timed-worker", prompt: "Keep searching." },
+        { id: "spawn-timeout-1" }
+      ),
+      { stopReason: "toolUse" }
+    ),
+    fauxAssistantMessage(
+      fauxToolCall("wait_subagents", { names: ["timed-worker"], timeout_ms: 5_000 }, { id: "wait-timeout-1" }),
+      { stopReason: "toolUse" }
+    ),
+    fauxAssistantMessage("Timeout observed.")
+  ])
+  const runtime = await createAgentRuntime({
+    cwd,
+    agentDir,
+    model: "faux/faux-1",
+    modelFactory: () => models,
+    settings: { subagentWorkTimeoutMs: 30 },
+    session: { type: "new", persist: false },
+    extensionWorkerCommand: workerCommand,
+    subagentCommand: [process.execPath, mockChild],
+    internalSubagentEnvironment: { MOCK_RPC_DELAY_MS: "30000" }
+  })
+  try {
+    await runtime.session.prompt("Delegate bounded work.")
+    const waited = runtime.session.messages.find(
+      message => message.role === "toolResult" && message.toolName === "wait_subagents"
+    )
+    expect(waited).toMatchObject({ content: [{ type: "text", text: expect.stringContaining("work_cycle_timeout") }] })
+  } finally {
+    runtime.session.dispose()
+    await runtime.session.waitForIdle()
+    await rm(root, { recursive: true, force: true })
+  }
+}, 15_000)
+
 test("subagent completion stays passive and joins the next parent model request", async () => {
   const root = await mkdtemp(join(tmpdir(), "zi-runtime-subagent-passive-completion-"))
   const cwd = join(root, "project")

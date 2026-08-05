@@ -7,8 +7,10 @@ import type { SessionEntry, SessionManager, SubagentEntry, SubagentEntryInput } 
 import { ChildZiProcess, clipUtf8, type ChildSnapshot, type SubagentCompletion } from "./child-process.js"
 import { internalSubagentApiKeyEnvironment } from "./invocation.js"
 import { defaultWaitTimeoutMs, isSubagentWaitTimeout, maxWaitTimeoutMs } from "./wait-policy.js"
+import { defaultSubagentWorkTimeoutMs, isSubagentWorkTimeout } from "./work-policy.js"
 
 export { defaultWaitTimeoutMs, maxWaitTimeoutMs } from "./wait-policy.js"
+export { defaultSubagentWorkTimeoutMs, maxSubagentWorkTimeoutMs } from "./work-policy.js"
 
 export const maxLiveChildren = 4
 export const maxRetainedSubagents = 32
@@ -90,6 +92,7 @@ export interface SubagentSupervisorOptions {
   readonly sessionManager: SessionManager
   readonly processTreeTracker: ProcessTreeTracker
   readonly waitTimeoutMs?: number
+  readonly workTimeoutMs?: number
 }
 
 export type SubagentSupervisorEvent =
@@ -111,6 +114,7 @@ export class SubagentSupervisor {
   readonly #completionReservations = new Set<string>()
   readonly #waiters = new Set<() => void>()
   readonly waitTimeoutMs: number
+  readonly workTimeoutMs: number
   #state: SupervisorState = { type: "open" }
   #shutdown: Promise<void> | undefined
 
@@ -124,6 +128,8 @@ export class SubagentSupervisor {
     this.#processTreeTracker = options.processTreeTracker
     this.waitTimeoutMs = options.waitTimeoutMs ?? defaultWaitTimeoutMs
     if (!isSubagentWaitTimeout(this.waitTimeoutMs)) throw new Error("Invalid subagent wait timeout")
+    this.workTimeoutMs = options.workTimeoutMs ?? defaultSubagentWorkTimeoutMs
+    if (!isSubagentWorkTimeout(this.workTimeoutMs)) throw new Error("Invalid subagent work timeout")
     this.#recover()
   }
 
@@ -266,6 +272,7 @@ export class SubagentSupervisor {
         cwd: this.#cwd,
         env: environment,
         processTreeTracker: this.#processTreeTracker,
+        workTimeoutMs: this.workTimeoutMs,
         onStateChange: () => this.#childChanged(name),
         onCompletion: completion => this.#completion(completion)
       })

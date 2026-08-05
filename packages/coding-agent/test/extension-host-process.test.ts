@@ -370,7 +370,8 @@ test("ExtensionHost terminates a real worker blocked by extension JavaScript", a
     startupMs: 2_000,
     lifecycleMs: 100,
     agentEventMs: 100,
-    shutdownMs: 300,
+    // Process-tree containment settles retained descendants within its own one-second bound.
+    shutdownMs: 1_800,
     commandMs: 100,
     commandCancellationMs: 25,
     toolMs: 100,

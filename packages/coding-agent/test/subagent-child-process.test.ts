@@ -50,6 +50,190 @@ test("ChildZiProcess spawn/wait/close vertical slice against a mock RPC child", 
   }
 }, 15_000)
 
+test("ChildZiProcess await-idle watch outlives ordinary RPC response deadlines", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-child-await-idle-deadline-"))
+  try {
+    const child = new ChildZiProcess({
+      name: "agent-await-idle",
+      command: [process.execPath, mockChild],
+      cwd: root,
+      processTreeTracker: createProcessTreeTracker(),
+      responseTimeoutMs: 100,
+      workTimeoutMs: 1_000,
+      env: { ...process.env, MOCK_RPC_DELAY_MS: "250" }
+    })
+
+    await child.start()
+    await child.spawnAdmit("longer than an ordinary response")
+    await waitFor(() => child.state.type === "idle", 5_000)
+    expect(child.snapshot().completion).toMatchObject({ status: "completed", workCycle: 1 })
+    await child.close()
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+}, 15_000)
+
+test("ChildZiProcess gives each work cycle a fresh deadline and remains reusable after timeout", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-child-work-timeout-"))
+  try {
+    const completions: Array<{ workCycle: number; status: string; reason?: string }> = []
+    const child = new ChildZiProcess({
+      name: "agent-work-timeout",
+      command: [process.execPath, mockChild],
+      cwd: root,
+      processTreeTracker: createProcessTreeTracker(),
+      responseTimeoutMs: 1_000,
+      workTimeoutMs: 40,
+      workTimeoutSettlementMs: 500,
+      env: { ...process.env, MOCK_RPC_DELAY_MS: "30000" },
+      onCompletion(completion) {
+        completions.push({
+          workCycle: completion.workCycle,
+          status: completion.status,
+          ...(completion.reason ? { reason: completion.reason } : {})
+        })
+      }
+    })
+
+    await child.start()
+    await child.spawnAdmit("first timeout")
+    await waitFor(() => child.state.type === "idle", 5_000)
+    await child.continueWith("second timeout")
+    await waitFor(() => child.state.type === "idle", 5_000)
+
+    expect(completions).toEqual([
+      { workCycle: 1, status: "failed", reason: "work_cycle_timeout" },
+      { workCycle: 2, status: "failed", reason: "work_cycle_timeout" }
+    ])
+    expect(child.snapshot().completion?.error).toBe("Subagent work cycle exceeded 40ms")
+    await child.close()
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+}, 15_000)
+
+test("ChildZiProcess force-closes work and its descendants when timeout interruption is ignored", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-child-work-timeout-force-"))
+  const marker = join(root, "descendant.pid")
+  let descendantPid: number | undefined
+  try {
+    const failures: string[] = []
+    const child = new ChildZiProcess({
+      name: "agent-work-timeout-force",
+      command: [process.execPath, mockChild],
+      cwd: root,
+      processTreeTracker: createProcessTreeTracker(),
+      responseTimeoutMs: 1_000,
+      workTimeoutMs: 30,
+      workTimeoutSettlementMs: 50,
+      env: {
+        ...process.env,
+        MOCK_RPC_DELAY_MS: "30000",
+        MOCK_RPC_IGNORE_INTERRUPT: "1",
+        MOCK_RPC_DESCENDANT_PID: marker
+      },
+      onFatal(error) {
+        failures.push(error.message)
+      }
+    })
+
+    await child.start()
+    descendantPid = await readPid(marker)
+    expect(processAlive(descendantPid)).toBe(true)
+    await child.spawnAdmit("ignore interruption")
+    await waitFor(() => child.state.type === "exited", 5_000)
+    await waitFor(() => !processAlive(descendantPid!), 5_000)
+    expect(failures).toEqual([
+      "Subagent agent-work-timeout-force work cycle 1 exceeded 30ms and did not settle within 50ms"
+    ])
+    expect(child.snapshot().completion).toMatchObject({ workCycle: 1, status: "failed", reason: "work_cycle_timeout" })
+  } finally {
+    if (descendantPid && processAlive(descendantPid)) {
+      try {
+        process.kill(descendantPid, "SIGKILL")
+      } catch {
+        // already dead
+      }
+    }
+    await rm(root, { recursive: true, force: true })
+  }
+}, 15_000)
+
+test("closing timeout settlement preserves work-cycle timeout evidence", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-child-close-timeout-settlement-"))
+  try {
+    const child = new ChildZiProcess({
+      name: "agent-close-timeout-settlement",
+      command: [process.execPath, mockChild],
+      cwd: root,
+      processTreeTracker: createProcessTreeTracker(),
+      workTimeoutMs: 30,
+      workTimeoutSettlementMs: 1_000,
+      env: { ...process.env, MOCK_RPC_DELAY_MS: "30000", MOCK_RPC_IGNORE_INTERRUPT: "1" }
+    })
+
+    await child.start()
+    await child.spawnAdmit("expire then close")
+    await waitFor(() => child.state.type === "interrupting" && child.state.reason === "work_timeout", 5_000)
+    await child.close("test", 20, 20)
+
+    expect(child.snapshot().completion).toMatchObject({ workCycle: 1, status: "failed", reason: "work_cycle_timeout" })
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+}, 15_000)
+
+test("timeout evidence survives completion-enrichment failure", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-child-timeout-enrichment-failure-"))
+  try {
+    const child = new ChildZiProcess({
+      name: "agent-timeout-enrichment-failure",
+      command: [process.execPath, mockChild],
+      cwd: root,
+      processTreeTracker: createProcessTreeTracker(),
+      responseTimeoutMs: 60,
+      workTimeoutMs: 30,
+      workTimeoutSettlementMs: 500,
+      env: { ...process.env, MOCK_RPC_DELAY_MS: "30000", MOCK_RPC_MESSAGES_DELAY_MS: "200" }
+    })
+
+    await child.start()
+    await child.spawnAdmit("expire before enrichment")
+    await waitFor(() => child.state.type === "exited", 5_000)
+
+    expect(child.snapshot().completion).toMatchObject({ workCycle: 1, status: "failed", reason: "work_cycle_timeout" })
+    expect(child.snapshot().completion?.error).toContain("settlement failed")
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+}, 15_000)
+
+test("an idle child receives a fresh deadline after time spent between successful cycles", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-child-fresh-work-deadline-"))
+  try {
+    const child = new ChildZiProcess({
+      name: "agent-fresh-work-deadline",
+      command: [process.execPath, mockChild],
+      cwd: root,
+      processTreeTracker: createProcessTreeTracker(),
+      workTimeoutMs: 100,
+      env: { ...process.env, MOCK_RPC_DELAY_MS: "20" }
+    })
+
+    await child.start()
+    await child.spawnAdmit("first")
+    await waitFor(() => child.state.type === "idle", 5_000)
+    await Bun.sleep(150)
+    await child.continueWith("__delay_prompt__")
+    await waitFor(() => child.state.type === "idle", 5_000)
+
+    expect(child.snapshot().completion).toMatchObject({ workCycle: 2, status: "completed" })
+    await child.close()
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+}, 15_000)
+
 test("ChildZiProcess continue wakes an idle child for a second work cycle", async () => {
   const root = await mkdtemp(join(tmpdir(), "zi-child-continue-"))
   try {
@@ -152,6 +336,125 @@ test("ChildZiProcess continue extends a running work cycle", async () => {
   }
 }, 15_000)
 
+test("running follow-ups reuse one idle watch and cannot exhaust RPC capacity", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-child-idle-watch-reuse-"))
+  const logPath = join(root, "methods.log")
+  try {
+    const child = new ChildZiProcess({
+      name: "agent-idle-watch-reuse",
+      command: [process.execPath, mockChild],
+      cwd: root,
+      processTreeTracker: createProcessTreeTracker(),
+      workTimeoutMs: 2_000,
+      env: { ...process.env, MOCK_RPC_DELAY_MS: "500", MOCK_RPC_LOG: logPath }
+    })
+
+    await child.start()
+    await child.spawnAdmit("first")
+    for (let index = 0; index < 40; index++) {
+      // oxlint-disable-next-line no-await-in-loop -- sequential delivery is the production supervisor contract
+      await child.continueWith(`follow-up ${index}`)
+    }
+    await waitFor(() => child.state.type === "idle", 5_000)
+
+    const methods = (await Bun.file(logPath).text()).trim().split("\n")
+    expect(methods.filter(method => method === "session.await_idle")).toHaveLength(1)
+    expect(child.snapshot().completion).toMatchObject({ workCycle: 1, status: "completed" })
+    await child.close()
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+}, 15_000)
+
+test("a follow-up during completion retrieval invalidates stale idle evidence", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-child-stale-idle-"))
+  const logPath = join(root, "methods.log")
+  try {
+    const completions: number[] = []
+    const child = new ChildZiProcess({
+      name: "agent-stale-idle",
+      command: [process.execPath, mockChild],
+      cwd: root,
+      processTreeTracker: createProcessTreeTracker(),
+      workTimeoutMs: 1_000,
+      env: { ...process.env, MOCK_RPC_DELAY_MS: "20", MOCK_RPC_MESSAGES_DELAY_MS: "150", MOCK_RPC_LOG: logPath },
+      onCompletion(completion) {
+        completions.push(completion.workCycle)
+      }
+    })
+
+    await child.start()
+    await child.spawnAdmit("first")
+    await waitFor(() => readFileSync(logPath, "utf8").includes("session.get_messages"), 5_000)
+    await child.continueWith("arrived during completion retrieval")
+    await Bun.sleep(30)
+    expect(child.state.type).toBe("running")
+    expect(completions).toEqual([])
+
+    await waitFor(() => child.state.type === "idle", 5_000)
+    expect(completions).toEqual([1])
+    expect(child.snapshot().completion).toMatchObject({ workCycle: 1, status: "completed" })
+    await child.close()
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+}, 15_000)
+
+test("a follow-up during completion retrieval rearms the remaining cycle deadline", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-child-stale-idle-deadline-"))
+  const logPath = join(root, "methods.log")
+  try {
+    const child = new ChildZiProcess({
+      name: "agent-stale-idle-deadline",
+      command: [process.execPath, mockChild],
+      cwd: root,
+      processTreeTracker: createProcessTreeTracker(),
+      workTimeoutMs: 200,
+      workTimeoutSettlementMs: 500,
+      env: { ...process.env, MOCK_RPC_DELAY_MS: "20", MOCK_RPC_MESSAGES_DELAY_MS: "100", MOCK_RPC_LOG: logPath }
+    })
+
+    await child.start()
+    await child.spawnAdmit("first")
+    await waitFor(() => readFileSync(logPath, "utf8").includes("session.get_messages"), 5_000)
+    await child.continueWith("__long_work__")
+    await waitFor(() => child.state.type === "idle", 5_000)
+
+    expect(child.snapshot().completion).toMatchObject({ workCycle: 1, status: "failed", reason: "work_cycle_timeout" })
+    expect(child.snapshot().completion?.durationMs).toBeLessThan(300)
+    await child.close()
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+}, 15_000)
+
+test("a running follow-up does not reset the current work deadline", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-child-nonreset-work-deadline-"))
+  try {
+    const child = new ChildZiProcess({
+      name: "agent-nonreset-work-deadline",
+      command: [process.execPath, mockChild],
+      cwd: root,
+      processTreeTracker: createProcessTreeTracker(),
+      workTimeoutMs: 100,
+      workTimeoutSettlementMs: 500,
+      env: { ...process.env, MOCK_RPC_DELAY_MS: "30000" }
+    })
+
+    await child.start()
+    await child.spawnAdmit("first")
+    await Bun.sleep(60)
+    await child.continueWith("must keep the original deadline")
+    await waitFor(() => child.state.type === "idle", 5_000)
+
+    expect(child.snapshot().completion).toMatchObject({ workCycle: 1, status: "failed", reason: "work_cycle_timeout" })
+    expect(child.snapshot().completion?.durationMs).toBeLessThan(160)
+    await child.close()
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+}, 15_000)
+
 test("ChildZiProcess explicit close terminates a long-lived descendant", async () => {
   const root = await mkdtemp(join(tmpdir(), "zi-child-descendant-close-"))
   const marker = join(root, "descendant.pid")
@@ -231,8 +534,10 @@ test("ChildZiProcess interrupt leaves the process reusable", async () => {
     await child.start()
     await child.spawnAdmit("long work")
     expect(child.state.type).toBe("running")
-    const result = await child.interrupt()
-    expect(result).toBe("interrupted")
+    const interruption = child.interrupt()
+    expect(child.continueWith("forbidden during interruption")).rejects.toThrow("cannot continue while interrupting")
+    expect(child.sendFollowUp("also forbidden")).rejects.toThrow("cannot accept send while interrupting")
+    expect(await interruption).toBe("interrupted")
     await waitFor(() => child.state.type === "idle" || child.state.type === "exited", 5_000)
     expect(child.state.type).toBe("idle")
     expect(child.snapshot().completion?.status).toBe("cancelled")

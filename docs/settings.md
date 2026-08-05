@@ -43,6 +43,7 @@ Its two-step picker exposes Fast Mode. On sends `text.verbosity: "low"` and `ser
   "followUpMode": "one-at-a-time",
   "codexFastMode": false,
   "subagentWaitTimeoutMs": 30000,
+  "subagentWorkTimeoutMs": 900000,
   "retryEnabled": true,
   "retryMaxRetries": 3,
   "retryBaseDelayMs": 2000,
@@ -95,7 +96,10 @@ Each array accepts at most 128 file or directory paths, with each path bounded a
 : Send low text verbosity and the priority service tier to OpenAI Codex. When false, Zi removes both request fields.
 
 `subagentWaitTimeoutMs`
-: Default subagent wait timeout in milliseconds, from `0` through one hour.
+: Default observation timeout for `wait_subagents`, in milliseconds from `0` through one hour. A wait timeout never cancels child work.
+
+`subagentWorkTimeoutMs`
+: Deadline for each subagent work cycle, in milliseconds from `1` through one hour. The default is 15 minutes. An accepted initial spawn prompt and each accepted task assigned to an idle child start a fresh deadline; context or tasks delivered while running remain in the current cycle. On expiry Zi interrupts the child, retains timeout evidence, and force-closes it only if bounded interruption settlement fails. A new session is required after changing this setting.
 
 `retryEnabled`
 : Turn automatic retry on or off.

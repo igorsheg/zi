@@ -187,6 +187,25 @@ test("cancelling wait rejects only the waiter and preserves uncollected results"
   }
 }, 15_000)
 
+test("wait observation timeout leaves the independent work cycle running", async () => {
+  const harness = await createHarness("wait-timeout-independent", { reply: "later", delayMs: 250 })
+  try {
+    const name = await harness.supervisor.spawn("slow-worker", "keep working")
+
+    const observed = await harness.supervisor.wait([name], 20)
+    expect(observed).toEqual([expect.objectContaining({ name, lifecycle: "running", capturedWorkCycle: 1 })])
+    expect(observed[0]?.completion).toBeUndefined()
+    expect(harness.supervisor.status()).toEqual({ workingNames: [name], readyNames: [] })
+
+    const completed = await harness.supervisor.wait([name], 5_000)
+    expect(completed).toEqual([
+      expect.objectContaining({ name, completion: expect.objectContaining({ workCycle: 1, status: "completed" }) })
+    ])
+  } finally {
+    await harness.dispose()
+  }
+}, 15_000)
+
 test("shutdown wins the spawn admission race without appending late ready work", async () => {
   const harness = await createHarness("shutdown-spawn-admission", { delayMs: 300 })
   let shutdown: Promise<void> | undefined
@@ -769,6 +788,59 @@ test("SubagentSupervisor recovers journal evidence without recreating a process"
   }
 })
 
+test("work-cycle timeout evidence survives supervisor restoration", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-subagent-timeout-recovery-"))
+  const paths = new ZiPaths(join(root, "project"), join(root, "agent"))
+  await mkdir(paths.cwd, { recursive: true })
+  const sessionManager = SessionManager.create(paths, { persist: false })
+  sessionManager.appendSubagent({ event: "starting", name: "timed-out-worker" })
+  sessionManager.appendSubagent({
+    event: "work_cycle_started",
+    name: "timed-out-worker",
+    workCycle: 1,
+    task: "bounded work"
+  })
+  sessionManager.appendSubagent({
+    event: "work_cycle_finished",
+    name: "timed-out-worker",
+    workCycle: 1,
+    status: "failed",
+    preview: "",
+    originalBytes: 0,
+    omittedBytes: 0,
+    truncated: false,
+    durationMs: 900_000,
+    reason: "work_cycle_timeout",
+    error: "Subagent work cycle exceeded 900000ms"
+  })
+
+  const supervisor = new SubagentSupervisor({
+    command: [join(root, "unused")],
+    cwd: paths.cwd,
+    env: {},
+    selection: () => ({ model: "faux/faux-1", thinkingLevel: "off" }),
+    sessionManager,
+    processTreeTracker: createProcessTreeTracker()
+  })
+  try {
+    expect(await supervisor.wait(["timed-out-worker"], 0)).toEqual([
+      expect.objectContaining({
+        name: "timed-out-worker",
+        completionDelivery: "durable",
+        completion: expect.objectContaining({
+          status: "failed",
+          reason: "work_cycle_timeout",
+          error: "Subagent work cycle exceeded 900000ms"
+        })
+      })
+    ])
+    expect(supervisor.status().readyNames).toEqual([])
+  } finally {
+    await supervisor.shutdown()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 test("recovered completion and exited projections stay bounded", async () => {
   const root = await mkdtemp(join(tmpdir(), "zi-subagent-recovery-bounds-"))
   const paths = new ZiPaths(join(root, "project"), join(root, "agent"))
@@ -982,6 +1054,36 @@ test("SubagentSupervisor shutdown preempts a blocked serialized child command", 
   }
 }, 15_000)
 
+test("SubagentSupervisor durably reports work-cycle timeout and keeps the child reusable", async () => {
+  const harness = await createHarness("work-timeout", { delayMs: 30_000, workTimeoutMs: 40 })
+  try {
+    const name = await harness.supervisor.spawn("timeout-worker", "take too long")
+    await waitFor(() => harness.supervisor.snapshots()[0]?.lifecycle === "idle", 5_000)
+
+    expect(harness.supervisor.snapshots()[0]).toMatchObject({
+      name,
+      lifecycle: "idle",
+      completion: { workCycle: 1, status: "failed", reason: "work_cycle_timeout" }
+    })
+    expect(
+      harness.sessionManager
+        .subagentEntries()
+        .find(entry => entry.event === "work_cycle_finished" && entry.name === name && entry.workCycle === 1)
+    ).toMatchObject({ status: "failed", reason: "work_cycle_timeout" })
+    await harness.supervisor.wait([name], 0)
+
+    await harness.supervisor.continue(name, "another bounded cycle")
+    await waitFor(() => harness.supervisor.snapshots()[0]?.completion?.workCycle === 2, 5_000)
+    expect(harness.supervisor.snapshots()[0]).toMatchObject({
+      lifecycle: "idle",
+      completion: { workCycle: 2, status: "failed", reason: "work_cycle_timeout" }
+    })
+    await harness.supervisor.close(name)
+  } finally {
+    await harness.dispose()
+  }
+}, 15_000)
+
 test("SubagentSupervisor shutdown disposes its live children and descendants and closes admission", async () => {
   const harness = await createHarness("shutdown", { delayMs: 400, descendant: true })
   try {
@@ -1009,6 +1111,7 @@ async function createHarness(
     readonly reply?: string
     readonly error?: string
     readonly delayMs?: number
+    readonly workTimeoutMs?: number
     readonly descendant?: boolean
     readonly argvPath?: string
     readonly apiKeyPath?: string
@@ -1046,7 +1149,8 @@ async function createHarness(
     },
     selection: options.selection ?? (() => ({ model: "faux/faux-1", thinkingLevel: "off" })),
     sessionManager,
-    processTreeTracker: createProcessTreeTracker()
+    processTreeTracker: createProcessTreeTracker(),
+    ...(options.workTimeoutMs ? { workTimeoutMs: options.workTimeoutMs } : {})
   })
   return {
     supervisor,

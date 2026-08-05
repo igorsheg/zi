@@ -20,7 +20,7 @@ export interface PosixProcessRow {
   readonly startIdentity: string
 }
 
-export type ProcessTableReader = () => Promise<readonly PosixProcessRow[]>
+export type ProcessTableReader = (signal: AbortSignal) => Promise<readonly PosixProcessRow[]>
 
 export type ProcessIdentity = { readonly pid: number; readonly startIdentity: string; readonly pgid: number }
 
@@ -50,8 +50,12 @@ export interface ProcessTreeTracker {
 
 type TrackerState =
   | { readonly type: "open" }
+  | { readonly type: "recovering"; readonly error: Error; readonly settled: Promise<void> }
   | { readonly type: "failed"; readonly error: Error }
+  | { readonly type: "disposing"; readonly settled: Promise<void> }
   | { readonly type: "disposed" }
+
+class ProcessTableScanStalledError extends Error {}
 
 type PosixTrackingState = {
   readonly type: "tracking"
@@ -80,10 +84,7 @@ interface TrackedScope {
 export function createProcessTreeTracker(): ProcessTreeTracker {
   return process.platform === "win32"
     ? new WindowsProcessTreeTracker()
-    : new PosixProcessTreeTracker(
-        () => settleValueWithin(readPosixProcessTable(), processTreeScanTimeoutMs, "Process-table scan timed out"),
-        processTreeRefreshMs
-      )
+    : new PosixProcessTreeTracker(readPosixProcessTable, processTreeRefreshMs)
 }
 
 export class PosixProcessTreeTracker implements ProcessTreeTracker {
@@ -91,28 +92,47 @@ export class PosixProcessTreeTracker implements ProcessTreeTracker {
   readonly #refreshMs: number
   readonly #signalGroup: (pgid: number, signal: NodeJS.Signals) => boolean
   readonly #sleep: (ms: number) => Promise<void>
+  readonly #scanTimeoutMs: number
+  readonly #scanCancellationMs: number
   readonly #scopes = new Map<PosixProcessScope, TrackedScope>()
   readonly #terminations = new Map<PosixProcessScope, Promise<ProcessScopeTerminateResult>>()
   #state: TrackerState = { type: "open" }
   #refresh: Promise<readonly PosixProcessRow[]> | undefined
-  #rawScan: Promise<readonly PosixProcessRow[]> | undefined
+  #rawScan: { readonly promise: Promise<readonly PosixProcessRow[]>; readonly controller: AbortController } | undefined
   #timer: ReturnType<typeof setTimeout> | undefined
 
   constructor(
     read: ProcessTableReader,
     refreshMs = processTreeRefreshMs,
     signalGroup = signalProcessGroup,
-    sleep = (ms: number) => Bun.sleep(ms)
+    sleep = (ms: number) => Bun.sleep(ms),
+    scanTimeoutMs = processTreeScanTimeoutMs,
+    scanCancellationMs = processTreeSettleMs
   ) {
     if (!Number.isFinite(refreshMs) || refreshMs <= 0) throw new Error("Process-tree refresh interval must be positive")
+    if (!Number.isFinite(scanTimeoutMs) || scanTimeoutMs <= 0) {
+      throw new Error("Process-tree scan timeout must be positive")
+    }
+    if (!Number.isFinite(scanCancellationMs) || scanCancellationMs <= 0) {
+      throw new Error("Process-tree scan cancellation bound must be positive")
+    }
     this.#read = read
     this.#refreshMs = refreshMs
     this.#signalGroup = signalGroup
     this.#sleep = sleep
+    this.#scanTimeoutMs = scanTimeoutMs
+    this.#scanCancellationMs = scanCancellationMs
   }
 
   track(workerPid: number, onFailure?: (error: Error) => void): ProcessScope {
-    if (this.#state.type !== "open") throw new Error("Process-tree tracker is not open")
+    const state = this.#state
+    if (state.type === "recovering") {
+      throw new Error(`Process-tree tracker is recovering after: ${state.error.message}`, { cause: state.error })
+    }
+    if (state.type === "failed") {
+      throw new Error(`Process-tree tracker failed after: ${state.error.message}`, { cause: state.error })
+    }
+    if (state.type !== "open") throw new Error("Process-tree tracker is disposed")
     if (this.#scopes.size >= maxTrackedProcessScopes) {
       throw new Error(`Process-tree scope capacity exceeded (maximum ${maxTrackedProcessScopes})`)
     }
@@ -122,14 +142,21 @@ export class PosixProcessTreeTracker implements ProcessTreeTracker {
     return scope
   }
 
-  async refresh(): Promise<readonly PosixProcessRow[]> {
-    if (this.#state.type === "failed") throw this.#state.error
-    if (this.#state.type === "disposed") throw new Error("Process-tree tracker is disposed")
+  refresh(): Promise<readonly PosixProcessRow[]> {
+    return this.#refreshScopes(false)
+  }
+
+  async #refreshScopes(duringDisposal: boolean): Promise<readonly PosixProcessRow[]> {
+    const state = this.#state
+    if (state.type === "recovering" || state.type === "failed") throw state.error
+    if (state.type === "disposed" || (state.type === "disposing" && !duringDisposal)) {
+      throw new Error("Process-tree tracker is disposed")
+    }
     if (this.#refresh) return this.#refresh
 
     const refresh = this.#readRows().then(
       rows => {
-        if (this.#state.type !== "open") return rows
+        if (this.#state.type !== "open" && this.#state.type !== "disposing") return rows
         for (const record of this.#scopes.values()) {
           const result = record.scope.apply(rows)
           if (result === "missing") {
@@ -155,7 +182,9 @@ export class PosixProcessTreeTracker implements ProcessTreeTracker {
       },
       cause => {
         const error = cause instanceof Error ? cause : new Error(String(cause))
-        this.#fail(error)
+        if (this.#state.type === "disposing") this.#failTrackedScopes(error)
+        else if (error instanceof ProcessTableScanStalledError) this.#fail(error)
+        else this.#recover(error)
         throw error
       }
     )
@@ -198,36 +227,105 @@ export class PosixProcessTreeTracker implements ProcessTreeTracker {
     return result
   }
 
-  async dispose(): Promise<void> {
-    if (this.#state.type === "disposed") return
-    if (this.#state.type === "open" && this.#scopes.size > 0) {
-      try {
-        await this.refresh()
-      } catch {
-        // The failure path already closed every tracked scope.
-      }
-    }
-    this.#state = { type: "disposed" }
+  dispose(): Promise<void> {
+    const state = this.#state
+    if (state.type === "disposed") return Promise.resolve()
+    if (state.type === "disposing") return state.settled
+
+    let resolve!: () => void
+    let reject!: (cause: unknown) => void
+    const settled = new Promise<void>((complete, fail) => {
+      resolve = complete
+      reject = fail
+    })
+    const recovery = state.type === "recovering" ? state.settled : Promise.resolve()
+    this.#state = { type: "disposing", settled }
     if (this.#timer) clearTimeout(this.#timer)
     this.#timer = undefined
+    void this.#dispose(recovery).then(
+      () => {
+        this.#state = { type: "disposed" }
+        resolve()
+        return undefined
+      },
+      cause => {
+        this.#state = { type: "disposed" }
+        reject(cause)
+        return undefined
+      }
+    )
+    return settled
+  }
+
+  async #dispose(recovery: Promise<void>): Promise<void> {
+    if (this.#scopes.size > 0) {
+      try {
+        await this.#refreshScopes(true)
+      } catch {
+        // Known process groups are still terminated below when the final scan fails.
+      }
+    } else if (this.#refresh) {
+      await this.#refresh.catch(() => undefined)
+    }
     const scopes = [...this.#scopes.keys()]
     this.#scopes.clear()
     for (const scope of scopes) scope.close(this.#signalGroup)
     await Promise.all(scopes.map(scope => this.#settle(scope)))
-    await Promise.allSettled(this.#terminations.values())
+    await Promise.allSettled([recovery, ...this.#terminations.values()])
   }
 
   async #readRows(): Promise<readonly PosixProcessRow[]> {
-    if (this.#rawScan) return this.#rawScan
-    const scan = this.#read()
-    this.#rawScan = scan
+    if (this.#rawScan) return this.#rawScan.promise
+    const controller = new AbortController()
+    let abortTimer: ReturnType<typeof setTimeout> | undefined
+    let forceTimer: ReturnType<typeof setTimeout> | undefined
+    // Give cancellable readers a bounded cleanup window, then reject even if a backend violates cancellation.
+    const deadline = new Promise<never>((_, reject) => {
+      abortTimer = setTimeout(() => {
+        const error = new Error("Process-table scan timed out")
+        controller.abort(error)
+        forceTimer = setTimeout(
+          () =>
+            reject(
+              new ProcessTableScanStalledError(
+                `Process-table scan timed out and did not settle within ${this.#scanCancellationMs}ms`
+              )
+            ),
+          this.#scanCancellationMs
+        )
+        forceTimer.unref?.()
+      }, this.#scanTimeoutMs)
+      abortTimer.unref?.()
+    })
+    let operation: Promise<readonly PosixProcessRow[]>
+    try {
+      operation = this.#read(controller.signal)
+    } catch (cause) {
+      operation = Promise.reject(cause)
+    }
+    const cancellable = operation.then(
+      rows => {
+        throwIfAborted(controller.signal)
+        return rows
+      },
+      cause => {
+        throwIfAborted(controller.signal)
+        throw cause
+      }
+    )
+    const scan = Promise.race([cancellable, deadline]).finally(() => {
+      if (abortTimer) clearTimeout(abortTimer)
+      if (forceTimer) clearTimeout(forceTimer)
+    })
+    const active = { promise: scan, controller }
+    this.#rawScan = active
     void scan.then(
       () => {
-        if (this.#rawScan === scan) this.#rawScan = undefined
+        if (this.#rawScan === active) this.#rawScan = undefined
         return undefined
       },
       () => {
-        if (this.#rawScan === scan) this.#rawScan = undefined
+        if (this.#rawScan === active) this.#rawScan = undefined
         return undefined
       }
     )
@@ -256,6 +354,28 @@ export class PosixProcessTreeTracker implements ProcessTreeTracker {
     this.#state = { type: "failed", error }
     if (this.#timer) clearTimeout(this.#timer)
     this.#timer = undefined
+    this.#failTrackedScopes(error)
+  }
+
+  #recover(error: Error): void {
+    if (this.#state.type !== "open") return
+    // Lost visibility fails current scopes closed, but it is not terminal owner disposal.
+    let complete!: () => void
+    const settled = new Promise<void>(resolve => {
+      complete = resolve
+    })
+    const recovery = { type: "recovering" as const, error, settled }
+    this.#state = recovery
+    if (this.#timer) clearTimeout(this.#timer)
+    this.#timer = undefined
+    this.#failTrackedScopes(error)
+    queueMicrotask(() => {
+      if (this.#state === recovery) this.#state = { type: "open" }
+      complete()
+    })
+  }
+
+  #failTrackedScopes(error: Error): void {
     const records = [...this.#scopes.values()]
     this.#scopes.clear()
     for (const record of records) this.#closeFailedScope(record, error)
@@ -267,7 +387,7 @@ export class PosixProcessTreeTracker implements ProcessTreeTracker {
   }
 
   #closeFailedScope(record: TrackedScope, error: Error): void {
-    record.scope.close(this.#signalGroup)
+    record.scope.close(this.#signalGroup, error)
     try {
       record.onFailure?.(error)
     } catch {
@@ -359,10 +479,15 @@ class PosixProcessScope implements ProcessScope {
     return identities.overflow ? "overflow" : "ok"
   }
 
-  close(signalGroup: (pgid: number, signal: NodeJS.Signals) => boolean): ProcessScopeTerminateResult {
+  close(
+    signalGroup: (pgid: number, signal: NodeJS.Signals) => boolean,
+    admissionFailure?: Error
+  ): ProcessScopeTerminateResult {
     const state = this.#state
     if (state.type === "closed") return { type: "closed" }
-    if (state.type === "admitting") this.#rejectAdmission(new Error(`Could not admit process scope ${this.workerPid}`))
+    if (state.type === "admitting") {
+      this.#rejectAdmission(admissionFailure ?? new Error(`Could not admit process scope ${this.workerPid}`))
+    }
     const workerPgid = state.type === "tracking" ? state.workerPgid : this.workerPid
     const identities = state.type === "tracking" ? [...state.identities.values()] : []
     const overflow = state.type === "tracking" && state.overflow
@@ -503,16 +628,18 @@ function discoverIdentities(
   return { values, overflow: false }
 }
 
-async function readPosixProcessTable(): Promise<readonly PosixProcessRow[]> {
-  return process.platform === "linux" ? readLinuxProcessTable() : readPsProcessTable()
+async function readPosixProcessTable(signal: AbortSignal): Promise<readonly PosixProcessRow[]> {
+  return process.platform === "linux" ? readLinuxProcessTable(signal) : readPsProcessTable(signal)
 }
 
-async function readLinuxProcessTable(): Promise<readonly PosixProcessRow[]> {
+async function readLinuxProcessTable(signal: AbortSignal): Promise<readonly PosixProcessRow[]> {
+  throwIfAborted(signal)
   let entries: string[]
   try {
     entries = await readdir("/proc")
   } catch {
-    return readPsProcessTable()
+    if (signal.aborted) throw abortReason(signal)
+    return readPsProcessTable(signal)
   }
   const pids = entries.filter(entry => /^\d+$/.test(entry))
   if (pids.length > maxProcessTableEntries) throw new Error("Process table exceeded entry capacity")
@@ -520,13 +647,15 @@ async function readLinuxProcessTable(): Promise<readonly PosixProcessRow[]> {
   const rows: PosixProcessRow[] = []
   const concurrency = 64
   for (let offset = 0; offset < pids.length; offset += concurrency) {
+    throwIfAborted(signal)
     const chunk = pids.slice(offset, offset + concurrency)
     // oxlint-disable-next-line no-await-in-loop -- bounded batches cap open procfs files
     const parsed = await Promise.all(
       chunk.map(async entry => {
         try {
-          return parseLinuxProcessStat(await readFile(`/proc/${entry}/stat`, "utf8"))
+          return parseLinuxProcessStat(await readFile(`/proc/${entry}/stat`, { encoding: "utf8", signal }))
         } catch {
+          if (signal.aborted) throw abortReason(signal)
           return undefined
         }
       })
@@ -550,19 +679,37 @@ function parseLinuxProcessStat(stat: string): PosixProcessRow | undefined {
     : undefined
 }
 
-async function readPsProcessTable(): Promise<readonly PosixProcessRow[]> {
+async function readPsProcessTable(signal: AbortSignal): Promise<readonly PosixProcessRow[]> {
+  throwIfAborted(signal)
   const child = Bun.spawn(["ps", "-axo", "pid=,ppid=,pgid=,lstart="], {
     stdin: "ignore",
     stdout: "pipe",
     stderr: "ignore"
   })
-  const output = await readBoundedText(child.stdout, maxProcessTableBytes).catch(cause => {
-    child.kill()
+  const abort = (): void => {
+    try {
+      child.kill()
+    } catch {
+      // The process exited as the scan was cancelled.
+    }
+  }
+  signal.addEventListener("abort", abort, { once: true })
+  try {
+    const output = await readBoundedText(child.stdout, maxProcessTableBytes)
+    const exitCode = await child.exited
+    if (signal.aborted) throw abortReason(signal)
+    if (exitCode !== 0) throw new Error(`Process-table scan exited with code ${exitCode}`)
+    return parsePsProcessTable(output)
+  } catch (cause) {
+    abort()
+    await settleValueWithin(child.exited, processTreeSettleMs, "Process-table process cleanup timed out").catch(
+      () => undefined
+    )
+    if (signal.aborted) throw abortReason(signal)
     throw cause
-  })
-  const exitCode = await child.exited
-  if (exitCode !== 0) throw new Error(`Process-table scan exited with code ${exitCode}`)
-  return parsePsProcessTable(output)
+  } finally {
+    signal.removeEventListener("abort", abort)
+  }
 }
 
 function parsePsProcessTable(output: string): readonly PosixProcessRow[] {
@@ -602,6 +749,14 @@ function processIdentity(row: PosixProcessRow): ProcessIdentity {
 
 function identityKey(identity: { readonly pid: number; readonly startIdentity: string }): string {
   return `${identity.pid}:${identity.startIdentity}`
+}
+
+function throwIfAborted(signal: AbortSignal): void {
+  if (signal.aborted) throw abortReason(signal)
+}
+
+function abortReason(signal: AbortSignal): Error {
+  return signal.reason instanceof Error ? signal.reason : new Error("Process-table scan cancelled")
 }
 
 function signalProcessGroup(pgid: number, signal: NodeJS.Signals): boolean {

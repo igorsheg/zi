@@ -81,7 +81,7 @@ Operation failures use `ok: false` with `capacity`, `not_found`, or `operation_f
 | `thinking.list`         | none                                                              | Levels supported by the selected model               |
 | `thinking.select`       | `level`; optional `scope`: `global` or `project`                  | Requested, effective, and persisted scope            |
 
-A direct prompt response means the input was admitted, not that provider work completed. Use ordered session events or `session.await_idle` for completion. Steering and follow-up input retain `AgentSession` queue semantics and may be queued before the next direct prompt.
+A direct prompt response means the input was admitted, not that provider work completed. Use ordered session events or `session.await_idle` for completion. `session.await_idle` follows the current session operation and is not an ordinary short request-response deadline; clients that need a work budget must own that policy separately and interrupt the session when it expires. Steering and follow-up input retain `AgentSession` queue semantics and may be queued before the next direct prompt.
 
 `delivery: "continue"` is decided inside the child `AgentSession`: idle starts a direct run; running queues follow-up into the active run. Aborting, compacting, reloading, failed, and disposed states reject the operation. The response reports only that the continue input was admitted, not that its resulting work settled.
 

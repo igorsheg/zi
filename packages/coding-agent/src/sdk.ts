@@ -135,7 +135,8 @@ export async function createAgentSessionWithProcessTreeTracker(
           },
           sessionManager,
           processTreeTracker,
-          waitTimeoutMs: settings.subagentWaitTimeoutMs
+          waitTimeoutMs: settings.subagentWaitTimeoutMs,
+          workTimeoutMs: settings.subagentWorkTimeoutMs
         })
       : undefined
   const agent = new Agent({
