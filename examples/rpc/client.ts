@@ -1,4 +1,6 @@
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process"
 import { resolve as resolvePath } from "node:path"
+import type { Writable } from "node:stream"
 
 export const rpcClientProtocolVersion = 1 as const
 export const maxRpcClientFrameBytes = 16 * 1024 * 1024
@@ -84,7 +86,7 @@ export async function runRpcCommand(options: RpcCommandClientOptions): Promise<s
 }
 
 class RpcClient {
-  readonly #child: Bun.Subprocess<"pipe", "pipe", "pipe">
+  readonly #child: ChildProcessWithoutNullStreams
   readonly #exited: Promise<number>
   readonly #onEvent: RpcClientOptions["onEvent"]
   readonly #ready = deferred<void>()
@@ -97,22 +99,28 @@ class RpcClient {
   #nextSequence = 1
   #writeTail = Promise.resolve()
   #pendingWriteBytes = 0
+  #exitSignal: string | null = null
   #stderr = ""
 
   constructor(options: RpcClientOptions) {
     this.#onEvent = options.onEvent
-    this.#child = Bun.spawn([...options.command, "--mode", "rpc"], {
+    const executable = options.command[0]
+    if (!executable) throw new Error("RPC client command cannot be empty")
+    this.#child = spawn(executable, [...options.command.slice(1), "--mode", "rpc"], {
       ...(options.cwd ? { cwd: options.cwd } : {}),
-      ...(options.env ? { env: options.env } : {}),
-      stdin: "pipe",
-      stdout: "pipe",
-      stderr: "pipe",
+      ...(options.env ? { env: { ...options.env } } : {}),
+      stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true
     })
-    // Bun's exited accessor can touch released OS handles, so capture it before shutdown starts.
-    this.#exited = this.#child.exited
+    this.#exited = new Promise(resolveExit => {
+      this.#child.once("close", (code, signal) => {
+        this.#exitSignal = signal
+        resolveExit(code ?? 1)
+      })
+    })
     this.#stdoutSettlement = this.#consumeStdout().catch(cause => this.#fail(cause))
     this.#stderrSettlement = this.#consumeStderr().catch(cause => this.#fail(cause))
+    this.#child.on("error", cause => this.#fail(cause))
     this.#removeAbort = listenForAbort(options.signal, () => this.#fail(new Error("RPC client was cancelled")))
   }
 
@@ -191,47 +199,31 @@ class RpcClient {
   }
 
   async #consumeStdout(): Promise<void> {
-    const reader = this.#child.stdout.getReader()
     const decoder = new JsonLineDecoder()
-    try {
-      while (true) {
-        // One reader owns frame order and the connection byte bound.
-        // oxlint-disable-next-line no-await-in-loop
-        const next = await reader.read()
-        if (next.done) break
-        for (const line of decoder.push(next.value)) this.#receive(line)
-      }
-      for (const line of decoder.finish()) this.#receive(line)
-      if (this.#state.type === "starting" || this.#state.type === "ready") {
-        throw new Error("Zi RPC stdout closed before the client")
-      }
-    } finally {
-      reader.releaseLock()
+    for await (const chunk of this.#child.stdout) {
+      for (const line of decoder.push(chunk)) this.#receive(line)
+    }
+    for (const line of decoder.finish()) this.#receive(line)
+    if (this.#state.type === "starting" || this.#state.type === "ready") {
+      throw new Error("Zi RPC stdout closed before the client")
     }
   }
 
   async #consumeStderr(): Promise<void> {
-    const reader = this.#child.stderr.getReader()
     const decoder = new TextDecoder("utf-8", { fatal: true })
     let bytes = 0
     try {
-      while (true) {
-        // One reader owns the bounded diagnostic tail.
-        // oxlint-disable-next-line no-await-in-loop
-        const next = await reader.read()
-        if (next.done) break
-        bytes += next.value.byteLength
+      for await (const chunk of this.#child.stderr) {
+        bytes += chunk.byteLength
         if (bytes > maxRpcClientStderrBytes) {
           throw new Error(`Zi RPC stderr cannot exceed ${maxRpcClientStderrBytes} bytes`)
         }
-        this.#stderr += decoder.decode(next.value, { stream: true })
+        this.#stderr += decoder.decode(chunk, { stream: true })
       }
       this.#stderr += decoder.decode()
     } catch (cause) {
       if (cause instanceof TypeError) throw new Error("Zi RPC stderr must be valid UTF-8", { cause })
       throw cause
-    } finally {
-      reader.releaseLock()
     }
   }
 
@@ -301,8 +293,7 @@ class RpcClient {
     this.#pendingWriteBytes += bytes
     const write = this.#writeTail.then(async () => {
       if (this.#state.type !== "ready") throw this.#notReadyError()
-      await this.#child.stdin.write(line)
-      await this.#child.stdin.flush()
+      await writeNodeInput(this.#child.stdin, line)
       return undefined
     })
     this.#writeTail = write.then(
@@ -328,7 +319,7 @@ class RpcClient {
     )
     await settleWithin(
       Promise.resolve()
-        .then(() => this.#child.stdin.end())
+        .then(() => endNodeInput(this.#child.stdin))
         .then(() => undefined)
         .catch(() => undefined),
       remainingMs(gracefulEndsAt)
@@ -354,7 +345,7 @@ class RpcClient {
     if (exitCode === timeoutValue) throw new Error(`Zi RPC did not exit within ${rpcClientCloseTimeoutMs}ms`)
     if (!streamsSettled) throw new Error(`Zi RPC output did not settle within ${rpcClientCloseTimeoutMs}ms`)
     if (typeof exitCode !== "number") throw new Error("Zi RPC returned an invalid exit status")
-    const forceKilled = forced && this.#child.signalCode === "SIGKILL"
+    const forceKilled = forced && this.#exitSignal === "SIGKILL"
     if (!ignoreExitFailure && !forceKilled && exitCode !== 0) {
       const detail = this.#stderr.trim()
       throw new Error(`Zi RPC exited with ${exitCode}${detail ? `: ${detail}` : ""}`)
@@ -529,6 +520,29 @@ function settleValueWithin<T>(operation: Promise<T>, timeoutMs: number): Promise
     })
   ]).finally(() => {
     if (timeout) clearTimeout(timeout)
+  })
+}
+
+function writeNodeInput(input: Writable, chunk: string): Promise<void> {
+  return new Promise((resolveWrite, rejectWrite) => {
+    input.write(chunk, cause => {
+      if (cause) rejectWrite(cause)
+      else resolveWrite()
+    })
+  })
+}
+
+function endNodeInput(input: Writable): Promise<void> {
+  return new Promise((resolveEnd, rejectEnd) => {
+    const onError = (cause: Error): void => {
+      input.off("error", onError)
+      rejectEnd(cause)
+    }
+    input.once("error", onError)
+    input.end(() => {
+      input.off("error", onError)
+      resolveEnd()
+    })
   })
 }
 
