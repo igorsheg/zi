@@ -1,4 +1,4 @@
-import { basename, isAbsolute, relative, resolve } from "node:path"
+import { basename, isAbsolute, relative, resolve, sep } from "node:path"
 import { pathToFileURL } from "node:url"
 
 import { BoxRenderable, fg, link, StyledText, TextAttributes, TextRenderable, type RenderContext } from "@opentui/core"
@@ -362,7 +362,8 @@ class ToolHeaderView {
       fg: theme.text.primary,
       wrapMode: "none",
       tabIndicator: openTuiTabIndicator,
-      flexShrink: 1
+      flexShrink: 1,
+      truncate: true
     })
     this.#details = new TextRenderable(ctx, {
       selectable: false,
@@ -449,7 +450,7 @@ class ToolHeaderView {
     ])
     this.#subject.visible = header.subject !== undefined
     this.#subject.content = subjectContent(header.subject, this.#theme, this.#cwd, layout.subjectWidth, !this.#expanded)
-    this.#subject.wrapMode = this.#expanded ? "word" : "none"
+    this.#subject.wrapMode = this.#expanded && header.subject?.type !== "path" ? "word" : "none"
     this.#details.visible = layout.details.length > 0
     this.#details.content = layout.details
     this.#delta.visible = delta !== undefined
@@ -485,7 +486,7 @@ class ToolHeaderView {
       (header.subject ? 1 : 0) +
       (delta ? textWidth(` +${delta.added}/-${delta.removed}`) : 0) +
       (status ? textWidth(status) + 3 : 0)
-    const subjectReserve = Math.min(16, naturalSubjectWidth(header.subject))
+    const subjectReserve = Math.min(16, naturalSubjectWidth(header.subject, this.#cwd))
     const timingWidth = this.#timingText ? textWidth(this.#timingText) + 3 : 0
 
     let showTiming = timingWidth > 0
@@ -717,7 +718,12 @@ class SecondaryRowView {
       wrapMode: "none",
       flexShrink: 0
     })
-    this.#content = new TextRenderable(ctx, { wrapMode: "none", tabIndicator: openTuiTabIndicator, flexShrink: 1 })
+    this.#content = new TextRenderable(ctx, {
+      wrapMode: "none",
+      tabIndicator: openTuiTabIndicator,
+      flexShrink: 1,
+      truncate: true
+    })
     this.root.add(this.#rail)
     this.root.add(this.#content)
   }
@@ -800,7 +806,7 @@ function secondaryLines(
   const available = Math.max(1, width - textWidth(glyphs.toolRail))
   switch (subject.type) {
     case "path":
-      return [{ type: "path", text: displayPath(cwd, subject.path, available, false), linkPath: subject.path }]
+      return [{ type: "path", text: displayPath(cwd, subject.path, false), linkPath: subject.path }]
     case "task":
       return boundedSecondaryLines("task", subject.id, available, limit, omission)
     case "text":
@@ -1391,10 +1397,10 @@ function createBodyView(
 /**
  * Compact natural width of a subject, so the layout never reserves more
  * subject space than the content can use. Paths mirror the compact
- * `displayPath` form (basename); commands flatten newlines the same way
+ * `displayPath` form; commands flatten newlines the same way
  * `subjectContent` does.
  */
-function naturalSubjectWidth(subject: ToolHeader["subject"]): number {
+function naturalSubjectWidth(subject: ToolHeader["subject"], cwd: string): number {
   if (!subject) return 0
   switch (subject.type) {
     case "text":
@@ -1402,7 +1408,7 @@ function naturalSubjectWidth(subject: ToolHeader["subject"]): number {
     case "command":
       return textWidth(subject.text.replace(/\s*\n\s*/g, " ")) + (subject.prompt ? 2 : 0)
     case "path":
-      return textWidth(basename(subject.path) || subject.path)
+      return textWidth(displayPath(cwd, subject.path, true))
     case "task":
       return textWidth(subject.id)
     default:
@@ -1422,7 +1428,7 @@ function subjectContent(
     case "command":
       return commandContent(subject.text, subject.prompt, theme, width, compact)
     case "path": {
-      const display = displayPath(cwd, subject.path, width, compact)
+      const display = displayPath(cwd, subject.path, compact)
       return new StyledText([fg(theme.text.primary)(link(fileUrl(cwd, subject.path))(display))])
     }
     case "task":
@@ -1462,24 +1468,17 @@ function commandContent(text: string, prompt: boolean, theme: Theme, width: numb
   return new StyledText(chunks)
 }
 
-function displayPath(cwd: string, path: string, width: number, compact: boolean): string {
-  const absolute = resolve(cwd || ".", path)
-  const relativePath = isAbsolute(path) ? relative(cwd || ".", absolute) || "." : path
-  const candidate = compact ? basename(relativePath) || relativePath : relativePath
-  if (textWidth(candidate) <= width) return candidate
-  const tailWidth = Math.max(1, width - 1)
-  const tail = truncateFromLeft(candidate, tailWidth)
-  return `…${tail}`
-}
+// Pi 73414d0 applies this containment rule to compact resource reads; Zi uses it for every semantic path subject.
+function displayPath(cwd: string, path: string, compact: boolean): string {
+  const root = resolve(cwd || ".")
+  const absolute = resolve(root, path)
+  const relativePath = relative(root, absolute)
+  const insideCwd =
+    relativePath === "" || (!isAbsolute(relativePath) && relativePath !== ".." && !relativePath.startsWith(`..${sep}`))
+  if (!insideCwd) return absolute
 
-function truncateFromLeft(value: string, width: number): string {
-  if (textWidth(value) <= width) return value
-  let output = ""
-  for (const scalar of Array.from(value).toReversed()) {
-    if (textWidth(`${scalar}${output}`) > width) break
-    output = scalar + output
-  }
-  return output || truncateToCells(value, width)
+  const localPath = isAbsolute(path) ? relativePath || "." : path
+  return compact ? basename(localPath) || localPath : localPath
 }
 
 function fileUrl(cwd: string, path: string): string {

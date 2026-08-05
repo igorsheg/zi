@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test"
+import { basename, join, resolve } from "node:path"
 
 import { BoxRenderable, type RenderContext, type Renderable, TextRenderable } from "@opentui/core"
 import { createTestRenderer } from "@opentui/core/testing"
@@ -610,6 +611,71 @@ test("Edit stays header-only in flight and reveals only the successful authorita
   }
 })
 
+test("path subjects stay relative inside cwd and identify external files with absolute paths", async () => {
+  const setup = await createTestRenderer({ width: 160, height: 8, useThread: false })
+  const cwd = resolve("work", "project")
+  const presentationFor = (path: string) =>
+    frame("preparing", projectToolPresentation({ status: "preparing", name: "edit", args: { path, edits: [] } }))
+  const view = new ToolCallView(
+    setup.renderer,
+    "edit-path-scope",
+    presentationFor(join(cwd, "src", "file.ts")),
+    defaultTheme,
+    cwd
+  )
+  setup.renderer.root.add(view.root)
+
+  try {
+    await setup.renderOnce()
+    expect(setup.captureCharFrame()).toContain("◇ Edit file.ts")
+
+    view.setExpanded(true)
+    await setup.renderOnce()
+    expect(setup.captureCharFrame()).toContain(`◇ Edit ${join("src", "file.ts")}`)
+
+    view.setExpanded(false)
+    const escaping = join("..", "..", "shared", "file.ts")
+    const escapedAbsolute = resolve(cwd, escaping)
+    view.update(presentationFor(escaping))
+    await setup.renderOnce()
+    expect(setup.captureCharFrame()).toContain(`◇ Edit ${escapedAbsolute}`)
+
+    const sibling = join(`${cwd}-other`, "file.ts")
+    view.update(presentationFor(sibling))
+    await setup.renderOnce()
+    expect(setup.captureCharFrame()).toContain(`◇ Edit ${sibling}`)
+
+    const external = resolve(cwd, "..", "..", "shared", "organization", "platform", "generated", "settings.ts")
+    view.update(presentationFor(external))
+    await setup.renderOnce()
+    expect(setup.captureCharFrame()).toContain(`◇ Edit ${external}`)
+
+    setup.resize(38, 8)
+    await setup.renderOnce()
+    await setup.renderOnce()
+    const narrow = setup.captureCharFrame()
+    const header =
+      narrow
+        .split("\n")
+        .find(line => line.includes("◇ Edit"))
+        ?.trim() ?? ""
+    expectMiddleTruncatedPath(header, "◇ Edit", external)
+
+    view.setExpanded(true)
+    await setup.renderOnce()
+    const detailedHeader =
+      setup
+        .captureCharFrame()
+        .split("\n")
+        .find(line => line.includes("◇ Edit"))
+        ?.trim() ?? ""
+    expectMiddleTruncatedPath(detailedHeader, "◇ Edit", external)
+  } finally {
+    view.destroy()
+    setup.renderer.destroy()
+  }
+})
+
 test("completed Edit keeps a bounded first/last diff review in compact density", async () => {
   const setup = await createTestRenderer({ width: 48, height: 20, useThread: false })
   const removed = Array.from({ length: 15 }, (_, index) => `-old ${index + 1}`)
@@ -938,8 +1004,9 @@ test("tool chrome uses lifecycle-only glyphs, tones, and stable transparent rows
 })
 
 test("skill reads keep their source path and instructions behind details", async () => {
-  const setup = await createTestRenderer({ width: 56, height: 14, useThread: false })
-  const path = "/home/user/.zi/skills/review/SKILL.md"
+  const setup = await createTestRenderer({ width: 160, height: 14, useThread: false })
+  const cwd = resolve("work")
+  const path = resolve(cwd, "..", "user", ".zi", "skills", "review", "SKILL.md")
   const result = {
     content: [{ type: "text", text: "Review carefully." }],
     details: {
@@ -964,7 +1031,7 @@ test("skill reads keep their source path and instructions behind details", async
     "read-skill",
     frame("done", projectToolPresentation({ status: "done", name: "read", args: { path }, result })),
     defaultTheme,
-    "/work",
+    cwd,
     "Ctrl+O"
   )
   setup.renderer.root.add(view.root)
@@ -982,6 +1049,17 @@ test("skill reads keep their source path and instructions behind details", async
     expect(detailed).toContain("◆ Read review")
     expect(detailed).toContain(path)
     expect(detailed).toContain("Review carefully.")
+
+    setup.resize(28, 14)
+    await setup.renderOnce()
+    await setup.renderOnce()
+    const narrow = setup.captureCharFrame()
+    const source =
+      narrow
+        .split("\n")
+        .find(line => line.includes("│ "))
+        ?.trim() ?? ""
+    expectMiddleTruncatedPath(source, "│", path)
   } finally {
     view.destroy()
     setup.renderer.destroy()
@@ -1632,6 +1710,18 @@ test("subagent rows stay concise until details are requested", async () => {
     setup.renderer.destroy()
   }
 })
+
+function expectMiddleTruncatedPath(row: string, label: string, path: string): void {
+  const prefix = `${label} `
+  expect(row.startsWith(prefix)).toBe(true)
+  const displayed = row.slice(prefix.length)
+  const ellipsis = displayed.indexOf("...")
+  expect(displayed.startsWith(path.slice(0, 4))).toBe(true)
+  expect(ellipsis).toBeGreaterThan(0)
+  expect(ellipsis).toBeLessThan(displayed.length - basename(path).length)
+  expect(displayed.endsWith(basename(path))).toBe(true)
+  expect(displayed).not.toBe(path)
+}
 
 function descendants(root: Renderable): Renderable[] {
   const result: Renderable[] = []
