@@ -16,7 +16,11 @@ on:
       - "examples/rpc/**"
       - "packages/cli/**"
       - "packages/coding-agent/src/agent-session*.ts"
+      - "packages/coding-agent/src/code-mode/**"
       - "packages/coding-agent/src/extensions/**"
+      - "packages/coding-agent/src/processes/**"
+      - "packages/coding-agent/src/rpc/**"
+      - "packages/coding-agent/src/subagents/**"
       - "packages/extension-api/**"
       - "packages/tui/src/interactive/**"
 
