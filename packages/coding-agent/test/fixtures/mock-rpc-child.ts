@@ -20,6 +20,7 @@ import { appendFileSync, writeFileSync } from "node:fs"
  *   MOCK_RPC_INTERNAL_API_KEY — path to write the private child credential value
  *   MOCK_RPC_DESCENDANT_PID — path to write a long-lived descendant PID
  *   MOCK_RPC_PROTOCOL_CRASH — emit a malformed protocol frame after startup
+ *   MOCK_RPC_EXIT_ON_PROMPT — exit while requests may still be queued on stdin
  *   MOCK_RPC_IGNORE_INTERRUPT — acknowledge interruption without settling work
  *   MOCK_RPC_DROP_INTERRUPT — neither acknowledge nor settle interruption
  *   MOCK_RPC_ERROR — assistant error text and failed stop reason
@@ -133,6 +134,7 @@ async function handle(request: { id: string; method: string; params?: RequestPar
     return
   }
   if (method === "session.prompt") {
+    if (process.env.MOCK_RPC_EXIT_ON_PROMPT === "1") process.exit(7)
     const text = request.params?.text ?? ""
     if (text === "__reject_prompt__") {
       send({ type: "response", id, method, ok: false, error: { code: "rejected", message: "prompt rejected" } })

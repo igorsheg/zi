@@ -5,6 +5,9 @@
  * Adapted from examples/rpc/client.ts; no private Zi imports.
  */
 
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process"
+import type { Writable } from "node:stream"
+
 import type { ProcessScope, ProcessTreeTracker } from "../processes/process-tree.js"
 import { defaultSubagentWorkTimeoutMs, isSubagentWorkTimeout } from "./work-policy.js"
 
@@ -86,6 +89,8 @@ type IdleWatchState = {
   readonly promise: Promise<void>
 }
 
+type ProcessExit = { readonly code: number | null; readonly signal: NodeJS.Signals | null }
+
 export type ChildZiProcessOptions = {
   readonly name: string
   readonly command: readonly string[]
@@ -103,8 +108,8 @@ export type ChildZiProcessOptions = {
 
 export class ChildZiProcess {
   readonly name: string
-  readonly #child: Bun.Subprocess<"pipe", "pipe", "pipe">
-  readonly #exited: Promise<number>
+  readonly #child: ChildProcessWithoutNullStreams
+  readonly #exited: Promise<ProcessExit>
   readonly #onStateChange: (() => void) | undefined
   readonly #onCompletion: ((completion: SubagentCompletion) => void) | undefined
   readonly #onFatal: ((error: Error) => void) | undefined
@@ -150,28 +155,39 @@ export class ChildZiProcess {
     if (!isPositiveTimeout(this.#workTimeoutSettlementMs)) throw new Error("Invalid work-timeout settlement bound")
     if (!isPositiveTimeout(this.#interruptSettlementMs)) throw new Error("Invalid interrupt settlement bound")
     this.#state = { type: "starting", startedAt: Date.now() }
-    this.#child = Bun.spawn([...options.command], {
+    const executable = options.command[0]
+    if (!executable) throw new Error("Subagent command cannot be empty")
+    const child = spawn(executable, options.command.slice(1), {
       cwd: options.cwd,
-      env: options.env,
-      stdin: "pipe",
-      stdout: "pipe",
-      stderr: "pipe",
+      env: { ...options.env },
+      stdio: ["pipe", "pipe", "pipe"],
       detached: process.platform !== "win32",
       windowsHide: true
     })
-    // Bun's exited accessor can touch released OS handles, so capture it before shutdown starts.
-    this.#exited = this.#child.exited
-    this.#processScope = createChildProcessScope(this.#child, options.processTreeTracker, cause => this.#fail(cause))
+    const workerPid = child.pid
+    if (workerPid === undefined) {
+      child.once("error", () => {})
+      throw new Error(`Subagent ${this.name} process did not start`)
+    }
+    this.#child = child
+    this.#child.on("error", cause => this.#fail(cause))
+    this.#child.stdin.on("error", ignoreStreamError)
+    this.#child.stdin.once("close", () => this.#child.stdin.off("error", ignoreStreamError))
+    this.#exited = new Promise(resolveExit => {
+      this.#child.once("close", (code, signal) => resolveExit({ code, signal }))
+    })
+    this.#processScope = createChildProcessScope(workerPid, this.#child, options.processTreeTracker, cause =>
+      this.#fail(cause)
+    )
     this.#stdoutSettlement = this.#consumeStdout().catch(cause => this.#fail(cause))
     this.#stderrSettlement = this.#consumeStderr().catch(cause => this.#fail(cause))
-    void this.#exited.then(async code => {
+    void this.#exited.then(async exit => {
       await settleWithin(this.#stderrSettlement, 1_000)
       if (this.#state.type !== "closing" && this.#state.type !== "exited") {
         const diagnostic = this.#stderr.trim()
+        const status = exit.signal ? `signal ${exit.signal}` : `code ${String(exit.code)}`
         this.#fail(
-          new Error(
-            `Subagent ${this.name} exited unexpectedly with code ${String(code)}${diagnostic ? `: ${diagnostic}` : ""}`
-          )
+          new Error(`Subagent ${this.name} exited unexpectedly with ${status}${diagnostic ? `: ${diagnostic}` : ""}`)
         )
       }
       return undefined
@@ -700,40 +716,26 @@ export class ChildZiProcess {
   }
 
   async #consumeStdout(): Promise<void> {
-    const reader = this.#child.stdout.getReader()
     const decoder = new JsonLineDecoder()
-    try {
-      while (true) {
-        // oxlint-disable-next-line no-await-in-loop
-        const next = await reader.read()
-        if (next.done) break
-        for (const line of decoder.push(next.value)) this.#receive(line)
-      }
-      for (const line of decoder.finish()) this.#receive(line)
-    } finally {
-      reader.releaseLock()
+    for await (const chunk of this.#child.stdout) {
+      for (const line of decoder.push(chunk)) this.#receive(line)
     }
+    for (const line of decoder.finish()) this.#receive(line)
   }
 
   async #consumeStderr(): Promise<void> {
-    const reader = this.#child.stderr.getReader()
     const decoder = new TextDecoder("utf-8", { fatal: true })
     let bytes = 0
     try {
-      while (true) {
-        // oxlint-disable-next-line no-await-in-loop
-        const next = await reader.read()
-        if (next.done) break
-        bytes += next.value.byteLength
+      for await (const chunk of this.#child.stderr) {
+        bytes += chunk.byteLength
         if (bytes > maxRpcStderrBytes) throw new Error(`Subagent stderr exceeded ${maxRpcStderrBytes} bytes`)
-        this.#stderr += decoder.decode(next.value, { stream: true })
+        this.#stderr += decoder.decode(chunk, { stream: true })
       }
       this.#stderr += decoder.decode()
     } catch (cause) {
       if (cause instanceof TypeError) throw new Error("Subagent stderr must be valid UTF-8", { cause })
       throw cause
-    } finally {
-      reader.releaseLock()
     }
   }
 
@@ -798,11 +800,7 @@ export class ChildZiProcess {
 
   #enqueueWrite(line: string, bytes: number): void {
     this.#pendingWriteBytes += bytes
-    const write = this.#writeTail.then(async () => {
-      await this.#child.stdin.write(line)
-      await this.#child.stdin.flush()
-      return undefined
-    })
+    const write = this.#writeTail.then(() => writeNodeInput(this.#child.stdin, line))
     this.#writeTail = write.then(
       () => {
         this.#pendingWriteBytes -= bytes
@@ -866,7 +864,7 @@ export class ChildZiProcess {
       )
       await settleWithin(
         Promise.resolve()
-          .then(() => this.#child.stdin.end())
+          .then(() => endNodeInput(this.#child.stdin))
           .then(() => undefined)
           .catch(() => undefined),
         deadlineRemainingMs(gracefulEndsAt)
@@ -883,14 +881,14 @@ export class ChildZiProcess {
     }
     await this.#processScope.terminate().catch(() => {})
     await settleWithin(
-      Promise.allSettled([this.#stdoutSettlement, this.#stderrSettlement]).then(() => undefined),
+      Promise.allSettled([this.#writeTail, this.#stdoutSettlement, this.#stderrSettlement]).then(() => undefined),
       1_000
     )
     if (this.#state.type === "exited") return
     if (failure) {
       this.#transition({
         type: "exited",
-        outcome: { type: "failed", message: failure.message, code: typeof exitCode === "number" ? exitCode : null }
+        outcome: { type: "failed", message: failure.message, code: exitCode === timeoutValue ? null : exitCode.code }
       })
       return
     }
@@ -901,11 +899,17 @@ export class ChildZiProcess {
       })
       return
     }
-    const code = typeof exitCode === "number" ? exitCode : null
+    if (exitCode.signal) {
+      this.#transition({
+        type: "exited",
+        outcome: { type: "killed", message: `Subagent ${this.name} exited after ${exitCode.signal}` }
+      })
+      return
+    }
+    const code = exitCode.code
     this.#transition({
       type: "exited",
-      outcome:
-        code === 0 || code === null ? { type: "closed", code } : { type: "failed", message: this.#stderr.trim(), code }
+      outcome: code === 0 ? { type: "closed", code } : { type: "failed", message: this.#stderr.trim(), code }
     })
   }
 
@@ -928,12 +932,13 @@ export class ChildZiProcess {
 }
 
 function createChildProcessScope(
-  child: Bun.Subprocess<"pipe", "pipe", "pipe">,
+  workerPid: number,
+  child: ChildProcessWithoutNullStreams,
   processTreeTracker: ProcessTreeTracker,
   onFailure: (error: Error) => void
 ): ProcessScope {
   try {
-    return processTreeTracker.track(child.pid, onFailure)
+    return processTreeTracker.track(workerPid, onFailure)
   } catch (cause) {
     try {
       child.kill("SIGKILL")
@@ -1110,6 +1115,31 @@ class JsonLineDecoder {
     if (this.#bufferBytes > maxRpcFrameBytes) throw new Error(`RPC frame exceeds ${maxRpcFrameBytes} bytes`)
     return lines
   }
+}
+
+function ignoreStreamError(): void {}
+
+function writeNodeInput(input: Writable, chunk: string): Promise<void> {
+  return new Promise((resolveWrite, rejectWrite) => {
+    input.write(chunk, cause => {
+      if (cause) rejectWrite(cause)
+      else resolveWrite()
+    })
+  })
+}
+
+function endNodeInput(input: Writable): Promise<void> {
+  return new Promise((resolveEnd, rejectEnd) => {
+    const onError = (cause: Error): void => {
+      input.off("error", onError)
+      rejectEnd(cause)
+    }
+    input.once("error", onError)
+    input.end(() => {
+      input.off("error", onError)
+      resolveEnd()
+    })
+  })
 }
 
 function deadlineRemainingMs(endsAt: number): number {

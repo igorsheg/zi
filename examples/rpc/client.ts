@@ -118,6 +118,8 @@ class RpcClient {
         resolveExit(code ?? 1)
       })
     })
+    this.#child.stdin.on("error", ignoreStreamError)
+    this.#child.stdin.once("close", () => this.#child.stdin.off("error", ignoreStreamError))
     this.#stdoutSettlement = this.#consumeStdout().catch(cause => this.#fail(cause))
     this.#stderrSettlement = this.#consumeStderr().catch(cause => this.#fail(cause))
     this.#child.on("error", cause => this.#fail(cause))
@@ -522,6 +524,8 @@ function settleValueWithin<T>(operation: Promise<T>, timeoutMs: number): Promise
     if (timeout) clearTimeout(timeout)
   })
 }
+
+function ignoreStreamError(): void {}
 
 function writeNodeInput(input: Writable, chunk: string): Promise<void> {
   return new Promise((resolveWrite, rejectWrite) => {

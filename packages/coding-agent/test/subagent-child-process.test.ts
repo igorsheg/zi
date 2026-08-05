@@ -563,6 +563,34 @@ test("ChildZiProcess protocol failure terminates a long-lived descendant", async
   }
 }, 15_000)
 
+test("ChildZiProcess contains stdin errors when a child exits with queued requests", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-child-stdin-exit-race-"))
+  try {
+    const failures: string[] = []
+    const child = new ChildZiProcess({
+      name: "agent-stdin-exit-race",
+      command: [process.execPath, mockChild],
+      cwd: root,
+      processTreeTracker: createProcessTreeTracker(),
+      env: { ...process.env, MOCK_RPC_EXIT_ON_PROMPT: "1" },
+      onFatal(error) {
+        failures.push(error.message)
+      }
+    })
+    await child.start()
+
+    const text = "x".repeat(512 * 1024)
+    const requests = Array.from({ length: 8 }, () => child.sendFollowUp(text))
+    const results = await Promise.allSettled(requests)
+    await waitFor(() => child.state.type === "exited", 5_000)
+
+    expect(results.every(result => result.status === "rejected")).toBe(true)
+    expect(failures).toHaveLength(1)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+}, 15_000)
+
 test("ChildZiProcess interruption during spawn admission cannot return to running", async () => {
   const root = await mkdtemp(join(tmpdir(), "zi-child-interrupt-admission-"))
   try {
