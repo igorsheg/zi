@@ -2,7 +2,10 @@ import { expect, test } from "bun:test"
 
 import { BoxRenderable } from "@opentui/core"
 import { createTestRenderer } from "@opentui/core/testing"
+import { createModels, createTestAgentRuntime, fauxProvider } from "@with-zi/coding-agent/testing"
 
+import { InteractiveKeybindings } from "../../src/interactive/interactive-keybindings.js"
+import { sessionFrame } from "../../src/interactive/prompt/frames.js"
 import { PickerStackView } from "../../src/interactive/prompt/picker-view.js"
 import {
   createPickerStack,
@@ -95,7 +98,7 @@ test("picker stack rejects unbounded and forbidden transitions", () => {
 test("picker view keeps a preferred total height while optional chrome changes", async () => {
   const setup = await createTestRenderer({ width: 40, height: 10, useThread: false })
   const stack = createPickerStack()
-  const view = new PickerStackView(setup.renderer, stack, defaultTheme, () => "")
+  const view = new PickerStackView(setup.renderer, stack, defaultTheme, new InteractiveKeybindings(), () => "")
   setup.renderer.root.add(view.root)
   const frame = { ...boundedFrame("stable", 20), title: "", height: 7 }
 
@@ -120,7 +123,7 @@ test("picker view keeps a preferred total height while optional chrome changes",
   }
 })
 
-test("picker stack wraps top-frame selection without owning the filter input", () => {
+test("changed fuzzy queries select the best match without disturbing navigation for the same query", () => {
   const stack = createPickerStack()
 
   try {
@@ -129,19 +132,75 @@ test("picker stack wraps top-frame selection without owning the filter input", (
       title: "Models",
       filter: "fuzzy",
       height: 7,
-      selectedId: "current",
       rows: [
-        { id: "current", label: "Current", searchText: "current provider" },
-        { id: "target", label: "Target", searchText: "target provider" }
+        { id: "alpha", label: "Alpha", searchText: "provider alpha" },
+        { id: "beta", label: "Beta", searchText: "provider beta" },
+        { id: "gamma", label: "Gamma", searchText: "provider gamma" }
       ]
     })
     stack.move("", -1)
-    expect(stack.presentation("")).toMatchObject({ frame: { height: 7 }, selectedId: "target" })
-    stack.queryChanged("curr")
-    expect(stack.presentation("curr")?.selectedId).toBe("current")
+    expect(stack.presentation("")?.selectedId).toBe("gamma")
+
+    stack.queryChanged("provider")
+    expect(stack.presentation("provider")?.selectedId).toBe("alpha")
+    stack.move("provider", 1)
+    stack.queryChanged("provider")
+    expect(stack.presentation("provider")?.selectedId).toBe("beta")
   } finally {
     stack.dispose()
   }
+})
+
+test("back reveals the parent frame and its owning workflow together", async () => {
+  const stack = createPickerStack()
+  const models = createModels()
+  const provider = fauxProvider({ provider: "picker-stack", models: [{ id: "model" }] })
+  models.setProvider(provider.provider)
+  const { session } = await createTestAgentRuntime({
+    cwd: process.cwd(),
+    model: "picker-stack/model",
+    models,
+    projectTrust: { type: "trusted", cwd: process.cwd(), source: "runtime" },
+    session: { type: "new", persist: false }
+  })
+  const rootWorkflow = { type: "choosing_settings_scope", operationId: 1, session } as const
+  const childWorkflow = { type: "choosing_setting", operationId: 1, session, scope: "global" } as const
+
+  try {
+    stack.open(boundedFrame("scopes"), rootWorkflow)
+    stack.push(boundedFrame("settings"), "glob", childWorkflow)
+    expect(stack.presentation("")?.workflow).toBe(childWorkflow)
+    expect(stack.back()).toEqual({ type: "revealed", filter: "glob", workflow: rootWorkflow })
+    expect(stack.presentation("glob")?.workflow).toBe(rootWorkflow)
+  } finally {
+    stack.dispose()
+    session.dispose()
+  }
+})
+
+test("session rows expose relative recency and a bounded cwd", () => {
+  const now = Date.parse("2026-08-05T12:00:00.000Z")
+  const frame = sessionFrame(
+    [
+      {
+        path: "/sessions/one.jsonl",
+        id: "one",
+        cwd: "/very/long/workspace/teams/zi",
+        createdAt: "2026-08-05T09:00:00.000Z",
+        modifiedAt: "2026-08-05T10:00:00.000Z",
+        firstMessage: "Polish the picker"
+      }
+    ],
+    undefined,
+    {},
+    now
+  )
+
+  expect(frame.rows[0]).toMatchObject({
+    label: "Polish the picker",
+    detail: "[2h ago]",
+    metadata: "…/workspace/teams/zi"
+  })
 })
 
 function boundedFrame(id: string, rows = 1) {

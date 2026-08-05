@@ -106,7 +106,13 @@ export class PromptView {
     })
     this.#input = this.#composer.input
     this.#footer = new PromptFooterView(renderer, theme)
-    this.#pickerStack = new PickerStackView(renderer, this.#store.picker, theme, () => this.#input.plainText)
+    this.#pickerStack = new PickerStackView(
+      renderer,
+      this.#store.picker,
+      theme,
+      keybindings,
+      () => this.#input.plainText
+    )
 
     // Transient workflows stay above the composer; stable session metadata yields the below-input surface to pickers.
     this.root.add(this.#working.root)
@@ -307,7 +313,10 @@ export class PromptView {
         return
       case "picker_complete":
         consume(key)
-        this.#store.completePicker(this.#input.plainText, captureFileCompletionInput(this.#input))
+        // Completion popups insert the candidate; deliberate pickers cycle.
+        if (!this.#store.completePicker(this.#input.plainText, captureFileCompletionInput(this.#input))) {
+          this.#store.movePicker(this.#input.plainText, 1)
+        }
         return
       case "picker_cancel":
         consume(key)

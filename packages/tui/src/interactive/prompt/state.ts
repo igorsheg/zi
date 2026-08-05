@@ -140,6 +140,14 @@ export type PromptWorkflow =
       readonly setting: EditableSetting
     }
 
+/**
+ * Workflows admitted by a picker frame. Each PickerStack frame carries its
+ * own, so the stack is the transition owner: activation dispatches on the
+ * presented frame's workflow and `back()` reveals the parent frame's, with no
+ * reverse derivation in the store.
+ */
+export type PickerWorkflow = Extract<PromptWorkflow, { type: `choosing_${string}` }>
+
 export type PromptInputEdit =
   | { readonly type: "replace"; readonly revision: number; readonly text: string; readonly cursorOffset: number }
   | {

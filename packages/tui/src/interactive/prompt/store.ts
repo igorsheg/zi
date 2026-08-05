@@ -51,12 +51,13 @@ import {
   settingValuesFrame
 } from "./frames.js"
 import { configuredModelChoices, exactModelChoice } from "./model-choices.js"
-import { createPickerStack, type PickerPresentation, type PickerStack } from "./picker.js"
+import { createPickerStack, type PickerFrame, type PickerPresentation, type PickerStack } from "./picker.js"
 import {
   initialPromptState,
   type AuthCeremony,
   type EditableSetting,
   type EditableSettingValue,
+  type PickerWorkflow,
   type PromptState,
   type PromptWorkflow
 } from "./state.js"
@@ -242,16 +243,22 @@ class PromptController implements PromptStore {
     const presentation = this.picker.presentation(text)
     if (!presentation?.selectedId || presentation.frame.disabled) return false
 
-    const workflow = this.$state.get().workflow
+    // The presented frame carries its choosing workflow; frames without one
+    // are transient (completion popups, loading and progress rows) and admit
+    // interaction only while the prompt is idle.
+    const workflow = presentation.workflow
+    if (!workflow) {
+      if (this.$state.get().workflow.type !== "idle") return false
+      if (presentation.frame.id === promptPickerFrameIds.commands) {
+        return this.#activateCommand(presentation, text, input.cursorOffset)
+      }
+      if (presentation.frame.id === promptPickerFrameIds.files) {
+        return this.#fileCompletion.complete(presentation.selectedId, input)
+      }
+      return false
+    }
+
     switch (workflow.type) {
-      case "idle":
-        if (presentation.frame.id === promptPickerFrameIds.commands) {
-          return this.#activateCommand(presentation, text, input.cursorOffset)
-        }
-        if (presentation.frame.id === promptPickerFrameIds.files) {
-          return this.#fileCompletion.complete(presentation.selectedId, input)
-        }
-        return false
       case "choosing_codex_setting":
         return this.#activateCodexSetting(workflow, presentation, text)
       case "choosing_codex_fast_mode":
@@ -276,21 +283,6 @@ class PromptController implements PromptStore {
         return this.#activateSession(workflow, presentation)
       case "choosing_project_trust":
         return this.#activateProjectTrust(workflow, presentation)
-      case "loading_models":
-      case "selecting_model":
-      case "authenticating":
-      case "auth_prompt":
-      case "loading_logout":
-      case "logging_out":
-      case "compacting":
-      case "running_extension_command":
-      case "reloading":
-      case "starting_session":
-      case "loading_sessions":
-      case "resuming_session":
-      case "cancelling_session":
-      case "saving_project_trust":
-        return false
       default:
         return assertNever(workflow)
     }
@@ -331,85 +323,13 @@ class PromptController implements PromptStore {
     }
 
     const result = this.picker.back()
-    switch (workflow.type) {
-      case "choosing_codex_fast_mode":
-        if (result.type === "revealed") {
-          this.$state.set({
-            ...this.$state.get(),
-            workflow: { type: "choosing_codex_setting", operationId: workflow.operationId, session: workflow.session }
-          })
-        } else {
-          this.#setIdle()
-        }
-        break
-      case "choosing_setting_value":
-        if (result.type === "revealed") {
-          this.$state.set({
-            ...this.$state.get(),
-            workflow: {
-              type: "choosing_setting",
-              operationId: workflow.operationId,
-              session: workflow.session,
-              scope: workflow.scope
-            }
-          })
-        } else {
-          this.#setIdle()
-        }
-        break
-      case "choosing_setting":
-        if (result.type === "revealed") {
-          this.$state.set({
-            ...this.$state.get(),
-            workflow: { type: "choosing_settings_scope", operationId: workflow.operationId, session: workflow.session }
-          })
-        } else {
-          this.#setIdle()
-        }
-        break
-      case "running_extension_command":
-        this.#cancelExtensionCommand()
-        break
-      case "choosing_auth_method": {
-        const providerFrame =
-          result.type === "revealed" &&
-          this.picker.presentation(result.filter)?.frame.id === promptPickerFrameIds.authProviders
-        this.$state.set({
-          ...this.$state.get(),
-          workflow: providerFrame
-            ? {
-                type: "choosing_auth_provider",
-                operationId: workflow.operationId,
-                session: workflow.session,
-                methods: workflow.session.authenticationMethods()
-              }
-            : { type: "idle" }
-        })
-        break
-      }
-      case "idle":
-      case "loading_models":
-      case "choosing_model":
-      case "selecting_model":
-      case "choosing_auth_provider":
-      case "authenticating":
-      case "auth_prompt":
-      case "loading_logout":
-      case "choosing_logout":
-      case "logging_out":
-      case "compacting":
-      case "reloading":
-      case "starting_session":
-      case "loading_sessions":
-      case "choosing_session":
-      case "choosing_codex_setting":
-      case "choosing_settings_scope":
-        this.#setIdle()
-        break
-      default:
-        assertNever(workflow)
+    if (result.type === "revealed" && result.workflow) {
+      // The revealed frame restores its own choosing workflow; transient
+      // frames (completion popups, loading rows) leave the prompt idle.
+      this.$state.set({ ...this.$state.get(), workflow: result.workflow })
+    } else {
+      this.#setIdle()
     }
-
     this.#requestInput(result.type === "revealed" ? result.filter : "")
     return true
   }
@@ -418,9 +338,7 @@ class PromptController implements PromptStore {
     if (this.#disposed || this.$state.get().workflow.type !== "idle") return
     const session = this.#interactive.getSession()
     const operationId = ++this.#nextOperationId
-    this.picker.open(projectTrustFrame(cwd))
-    this.$state.set({ ...this.$state.get(), workflow: { type: "choosing_project_trust", operationId, session, cwd } })
-    this.#notices.clearPrompt()
+    this.#admitChoosing(projectTrustFrame(cwd), { type: "choosing_project_trust", operationId, session, cwd })
     this.#requestInput("")
   }
 
@@ -626,15 +544,13 @@ class PromptController implements PromptStore {
     presentation: PickerPresentation,
     text: string
   ): boolean {
-    if (presentation.frame.id !== promptPickerFrameIds.codexSettings || presentation.selectedId !== "fast-mode") {
-      return false
-    }
+    if (presentation.selectedId !== "fast-mode") return false
     if (!this.#accepts(workflow.operationId, workflow.session)) return false
-    this.picker.push(codexFastModeValuesFrame(workflow.session), text || presentation.selectedId)
-    this.$state.set({
-      ...this.$state.get(),
-      workflow: { type: "choosing_codex_fast_mode", operationId: workflow.operationId, session: workflow.session }
-    })
+    this.#admitChoosing(
+      codexFastModeValuesFrame(workflow.session),
+      { type: "choosing_codex_fast_mode", operationId: workflow.operationId, session: workflow.session },
+      text
+    )
     this.#requestInput("")
     return true
   }
@@ -643,7 +559,7 @@ class PromptController implements PromptStore {
     workflow: Extract<PromptWorkflow, { type: "choosing_codex_fast_mode" }>,
     presentation: PickerPresentation
   ): boolean {
-    if (presentation.frame.id !== promptPickerFrameIds.codexSettingValues || !presentation.selectedId) return false
+    if (!presentation.selectedId) return false
     if (!this.#accepts(workflow.operationId, workflow.session)) return false
     if (presentation.selectedId !== "true" && presentation.selectedId !== "false") return false
 
@@ -656,14 +572,12 @@ class PromptController implements PromptStore {
     }
     if (!this.#accepts(workflow.operationId, workflow.session)) return false
 
-    this.picker.close()
-    this.$state.set({ ...this.$state.get(), workflow: { type: "idle" } })
     this.#notices.promptInfo(
       mutation.requested === mutation.effective
         ? `Codex Fast mode: ${settingValueLabel(mutation.effective)}`
         : `Codex Fast mode saved as ${settingValueLabel(mutation.requested)}; project settings keep ${settingValueLabel(mutation.effective)} effective`
     )
-    this.#requestInput("")
+    this.#returnToParentChooser()
     return true
   }
 
@@ -672,15 +586,15 @@ class PromptController implements PromptStore {
     presentation: PickerPresentation,
     text: string
   ): boolean {
-    if (presentation.frame.id !== promptPickerFrameIds.settingsScopes || !presentation.selectedId) return false
+    if (!presentation.selectedId) return false
     if (!this.#accepts(workflow.operationId, workflow.session)) return false
     const scope = settingsScope(presentation.selectedId)
     if (!scope) return false
-    this.picker.push(settingsFrame(workflow.session, scope), text || presentation.selectedId)
-    this.$state.set({
-      ...this.$state.get(),
-      workflow: { type: "choosing_setting", operationId: workflow.operationId, session: workflow.session, scope }
-    })
+    this.#admitChoosing(
+      settingsFrame(workflow.session, scope),
+      { type: "choosing_setting", operationId: workflow.operationId, session: workflow.session, scope },
+      text
+    )
     this.#requestInput("")
     return true
   }
@@ -690,21 +604,21 @@ class PromptController implements PromptStore {
     presentation: PickerPresentation,
     text: string
   ): boolean {
-    if (presentation.frame.id !== promptPickerFrameIds.settings || !presentation.selectedId) return false
+    if (!presentation.selectedId) return false
     if (!this.#accepts(workflow.operationId, workflow.session)) return false
     const setting = editableSetting(presentation.selectedId)
     if (!setting) return false
-    this.picker.push(settingValuesFrame(workflow.session, workflow.scope, setting), text || presentation.selectedId)
-    this.$state.set({
-      ...this.$state.get(),
-      workflow: {
+    this.#admitChoosing(
+      settingValuesFrame(workflow.session, workflow.scope, setting),
+      {
         type: "choosing_setting_value",
         operationId: workflow.operationId,
         session: workflow.session,
         scope: workflow.scope,
         setting
-      }
-    })
+      },
+      text
+    )
     this.#requestInput("")
     return true
   }
@@ -713,7 +627,7 @@ class PromptController implements PromptStore {
     workflow: Extract<PromptWorkflow, { type: "choosing_setting_value" }>,
     presentation: PickerPresentation
   ): boolean {
-    if (presentation.frame.id !== promptPickerFrameIds.settingValues || !presentation.selectedId) return false
+    if (!presentation.selectedId) return false
     return this.#applySetting(workflow, presentation.selectedId)
   }
 
@@ -721,7 +635,7 @@ class PromptController implements PromptStore {
     workflow: Extract<PromptWorkflow, { type: "choosing_model" }>,
     presentation: PickerPresentation
   ): boolean {
-    if (presentation.frame.id !== promptPickerFrameIds.models || !presentation.selectedId) return false
+    if (!presentation.selectedId) return false
     const choice = workflow.choices.find(candidate => modelChoiceId(candidate) === presentation.selectedId)
     if (!choice) return false
     this.#selectModel(workflow.operationId, workflow.session, choice)
@@ -733,7 +647,7 @@ class PromptController implements PromptStore {
     presentation: PickerPresentation,
     text: string
   ): boolean {
-    if (presentation.frame.id !== promptPickerFrameIds.authProviders || !presentation.selectedId) return false
+    if (!presentation.selectedId) return false
     if (!this.#accepts(workflow.operationId, workflow.session)) return false
     const methods = workflow.methods.filter(method => method.providerId === presentation.selectedId)
     if (methods.length === 1) {
@@ -741,11 +655,11 @@ class PromptController implements PromptStore {
       return true
     }
     if (methods.length === 0) return false
-    this.picker.push(authMethodFrame(methods), text || presentation.selectedId)
-    this.$state.set({
-      ...this.$state.get(),
-      workflow: { type: "choosing_auth_method", operationId: workflow.operationId, session: workflow.session, methods }
-    })
+    this.#admitChoosing(
+      authMethodFrame(methods),
+      { type: "choosing_auth_method", operationId: workflow.operationId, session: workflow.session, methods },
+      text
+    )
     this.#requestInput("")
     return true
   }
@@ -754,7 +668,7 @@ class PromptController implements PromptStore {
     workflow: Extract<PromptWorkflow, { type: "choosing_auth_method" }>,
     presentation: PickerPresentation
   ): boolean {
-    if (presentation.frame.id !== promptPickerFrameIds.authMethods || !presentation.selectedId) return false
+    if (!presentation.selectedId) return false
     if (!this.#accepts(workflow.operationId, workflow.session)) return false
     const method = workflow.methods.find(candidate => authenticationMethodId(candidate) === presentation.selectedId)
     if (!method) return false
@@ -766,7 +680,7 @@ class PromptController implements PromptStore {
     workflow: Extract<PromptWorkflow, { type: "choosing_auth_option" }>,
     presentation: PickerPresentation
   ): boolean {
-    if (presentation.frame.id !== promptPickerFrameIds.authOptions || !presentation.selectedId) return false
+    if (!presentation.selectedId) return false
     if (!this.#accepts(workflow.operationId, workflow.session)) return false
     if (this.#pendingAuthPrompt?.operationId !== workflow.operationId) return false
     const option = workflow.options.find(candidate => candidate.id === presentation.selectedId)
@@ -796,7 +710,7 @@ class PromptController implements PromptStore {
     workflow: Extract<PromptWorkflow, { type: "choosing_logout" }>,
     presentation: PickerPresentation
   ): boolean {
-    if (presentation.frame.id !== promptPickerFrameIds.logoutProviders || !presentation.selectedId) return false
+    if (!presentation.selectedId) return false
     const credential = workflow.credentials.find(candidate => candidate.providerId === presentation.selectedId)
     if (!credential) return false
     this.#logoutProvider(workflow.operationId, workflow.session, credential.providerId)
@@ -807,7 +721,7 @@ class PromptController implements PromptStore {
     workflow: Extract<PromptWorkflow, { type: "choosing_session" }>,
     presentation: PickerPresentation
   ): boolean {
-    if (presentation.frame.id !== promptPickerFrameIds.sessions || !presentation.selectedId) return false
+    if (!presentation.selectedId) return false
     if (!this.#accepts(workflow.operationId, workflow.session)) return false
     const selected = workflow.sessions.find(session => session.path === presentation.selectedId)
     if (!selected) return false
@@ -837,8 +751,7 @@ class PromptController implements PromptStore {
         await actions.resumeSession(selected.path)
       } catch (cause) {
         if (!this.#accepts(workflow.operationId, workflow.session)) return
-        this.picker.replaceTop(sessionFrame(workflow.sessions, workflow.session.sessionManager.file), "")
-        this.$state.set({ ...this.$state.get(), workflow })
+        this.#replaceChoosing(sessionFrame(workflow.sessions, workflow.session.sessionManager.file), "", workflow)
         this.#notices.promptError(errorMessage(cause))
         return
       }
@@ -856,7 +769,7 @@ class PromptController implements PromptStore {
     workflow: Extract<PromptWorkflow, { type: "choosing_project_trust" }>,
     presentation: PickerPresentation
   ): boolean {
-    if (presentation.frame.id !== promptPickerFrameIds.projectTrust || !presentation.selectedId) return false
+    if (!presentation.selectedId) return false
     if (!this.#accepts(workflow.operationId, workflow.session)) return false
     const selected = projectTrustSelection(presentation.selectedId)
     if (!selected) return false
@@ -885,8 +798,7 @@ class PromptController implements PromptStore {
         await actions.decideProjectTrust(selected.selection)
       } catch (cause) {
         if (!this.#accepts(workflow.operationId, workflow.session)) return
-        this.picker.replaceTop(projectTrustFrame(workflow.cwd, selected.id), "")
-        this.$state.set({ ...this.$state.get(), workflow })
+        this.#replaceChoosing(projectTrustFrame(workflow.cwd, selected.id), "", workflow)
         this.#notices.promptError(errorMessage(cause))
         return
       }
@@ -1094,25 +1006,24 @@ class PromptController implements PromptStore {
         listed = await actions.listSessions()
       } catch (cause) {
         if (!this.#accepts(operationId, session)) return
-        this.picker.replaceTop(sessionFrame([], session.sessionManager.file, { emptyText: errorMessage(cause) }), "")
-        this.$state.set({
-          ...this.$state.get(),
-          workflow: { type: "choosing_session", operationId, session, sessions: [] }
-        })
+        const choosing: PickerWorkflow = { type: "choosing_session", operationId, session, sessions: [] }
+        this.#replaceChoosing(
+          sessionFrame([], session.sessionManager.file, { emptyText: errorMessage(cause) }),
+          "",
+          choosing
+        )
         return
       }
       if (!this.#accepts(operationId, session)) return
-      this.picker.replaceTop(
+      const choosing: PickerWorkflow = { type: "choosing_session", operationId, session, sessions: listed.sessions }
+      this.#replaceChoosing(
         sessionFrame(listed.sessions, session.sessionManager.file, {
           invalid: listed.invalid,
           omitted: listed.omitted
         }),
-        ""
+        "",
+        choosing
       )
-      this.$state.set({
-        ...this.$state.get(),
-        workflow: { type: "choosing_session", operationId, session, sessions: listed.sessions }
-      })
     }
     void load()
   }
@@ -1134,11 +1045,8 @@ class PromptController implements PromptStore {
         loaded = await session.listModelChoices()
       } catch (cause) {
         if (!this.#accepts(operationId, session)) return
-        this.picker.replaceTop({ ...loading, emptyText: errorMessage(cause) }, initialSearch)
-        this.$state.set({
-          ...this.$state.get(),
-          workflow: { type: "choosing_model", operationId, session, choices: [] }
-        })
+        const choosing: PickerWorkflow = { type: "choosing_model", operationId, session, choices: [] }
+        this.#replaceChoosing({ ...loading, emptyText: errorMessage(cause) }, initialSearch, choosing)
         return
       }
 
@@ -1149,8 +1057,8 @@ class PromptController implements PromptStore {
         this.#selectModel(operationId, session, exact)
         return
       }
-      this.picker.replaceTop(modelFrame(choices, current), initialSearch)
-      this.$state.set({ ...this.$state.get(), workflow: { type: "choosing_model", operationId, session, choices } })
+      const choosing: PickerWorkflow = { type: "choosing_model", operationId, session, choices }
+      this.#replaceChoosing(modelFrame(choices, current), initialSearch, choosing)
     }
     void load()
   }
@@ -1204,26 +1112,20 @@ class PromptController implements PromptStore {
       return
     }
     if (exact.length > 1) {
-      const frame = authMethodFrame(exact)
-      if (parentFilter === undefined) this.picker.open(frame)
-      else this.picker.push(frame, parentFilter)
-      this.$state.set({
-        ...this.$state.get(),
-        workflow: { type: "choosing_auth_method", operationId, session, methods: exact }
-      })
-      this.#notices.clearPrompt()
+      this.#admitChoosing(
+        authMethodFrame(exact),
+        { type: "choosing_auth_method", operationId, session, methods: exact },
+        parentFilter
+      )
       this.#requestInput("")
       return
     }
 
-    const frame = authProviderFrame(methods)
-    if (parentFilter === undefined) this.picker.open(frame)
-    else this.picker.push(frame, parentFilter)
-    this.$state.set({
-      ...this.$state.get(),
-      workflow: { type: "choosing_auth_provider", operationId, session, methods }
-    })
-    this.#notices.clearPrompt()
+    this.#admitChoosing(
+      authProviderFrame(methods),
+      { type: "choosing_auth_provider", operationId, session, methods },
+      parentFilter
+    )
     this.#requestInput(provider)
   }
 
@@ -1266,7 +1168,13 @@ class PromptController implements PromptStore {
         const state = this.$state.get()
         const ceremony = state.authCeremony ?? { providerName: method.providerName, methodName: method.name }
         if (authPrompt.type === "select") {
-          this.picker.open(authOptionFrame(authPrompt.options))
+          this.picker.open(authOptionFrame(authPrompt.options), {
+            type: "choosing_auth_option",
+            operationId,
+            session,
+            providerId: method.providerId,
+            options: authPrompt.options
+          })
           this.$state.set({
             ...state,
             authCeremony: withCeremonyStatus(clearCeremonyPrompt(ceremony) ?? ceremony, authPrompt.message),
@@ -1477,12 +1385,7 @@ class PromptController implements PromptStore {
         this.#logoutProvider(operationId, session, stored[0]!.providerId)
         return
       }
-      this.picker.open(logoutFrame(stored))
-      this.$state.set({
-        ...this.$state.get(),
-        workflow: { type: "choosing_logout", operationId, session, credentials: stored }
-      })
-      this.#notices.clearPrompt()
+      this.#admitChoosing(logoutFrame(stored), { type: "choosing_logout", operationId, session, credentials: stored })
     }
     void load()
   }
@@ -1515,22 +1418,18 @@ class PromptController implements PromptStore {
   #openCodexSettings(parentFilter?: string): void {
     const session = this.#interactive.getSession()
     const operationId = ++this.#nextOperationId
-    const frame = codexSettingsFrame(session)
-    if (parentFilter === undefined) this.picker.open(frame)
-    else this.picker.push(frame, parentFilter)
-    this.$state.set({ ...this.$state.get(), workflow: { type: "choosing_codex_setting", operationId, session } })
-    this.#notices.clearPrompt()
+    this.#admitChoosing(
+      codexSettingsFrame(session),
+      { type: "choosing_codex_setting", operationId, session },
+      parentFilter
+    )
     this.#requestInput("")
   }
 
   #openSettings(parentFilter?: string): void {
     const session = this.#interactive.getSession()
     const operationId = ++this.#nextOperationId
-    const frame = settingsScopeFrame()
-    if (parentFilter === undefined) this.picker.open(frame)
-    else this.picker.push(frame, parentFilter)
-    this.$state.set({ ...this.$state.get(), workflow: { type: "choosing_settings_scope", operationId, session } })
-    this.#notices.clearPrompt()
+    this.#admitChoosing(settingsScopeFrame(), { type: "choosing_settings_scope", operationId, session }, parentFilter)
     this.#requestInput("")
   }
 
@@ -1568,15 +1467,15 @@ class PromptController implements PromptStore {
     }
     if (!this.#accepts(workflow.operationId, workflow.session)) return false
 
-    this.picker.close()
     const shadowed = mutation.requested !== mutation.effective
-    this.$state.set({ ...this.$state.get(), workflow: { type: "idle" } })
     this.#notices.promptInfo(
       shadowed
         ? `${settingLabel(workflow.setting)} saved as ${settingValueLabel(mutation.requested)}; project override keeps ${settingValueLabel(mutation.effective)} effective`
         : `${settingLabel(workflow.setting)}: ${settingValueLabel(mutation.effective)} (${workflow.scope})`
     )
-    this.#requestInput("")
+    // Settings are a batch-edit surface: a committed value returns to the
+    // parent list with its filter and selection intact.
+    this.#returnToParentChooser()
     return true
   }
 
@@ -1663,6 +1562,43 @@ class PromptController implements PromptStore {
   #setIdle(): void {
     this.$state.set({ ...this.$state.get(), workflow: { type: "idle" } })
     this.#notices.clearPrompt()
+  }
+
+  #admitChoosing(frame: PickerFrame, workflow: PickerWorkflow, parentFilter?: string): void {
+    if (parentFilter === undefined) this.picker.open(frame, workflow)
+    else this.picker.push(frame, parentFilter, workflow)
+    this.$state.set({ ...this.$state.get(), workflow })
+    this.#notices.clearPrompt()
+  }
+
+  #replaceChoosing(frame: PickerFrame, filter: string, workflow: PickerWorkflow): void {
+    this.picker.replaceTop(frame, filter, workflow)
+    this.$state.set({ ...this.$state.get(), workflow })
+  }
+
+  #returnToParentChooser(): void {
+    const result = this.picker.back()
+    if (result.type === "revealed" && result.workflow) {
+      const selectedId = this.picker.presentation(result.filter)?.selectedId
+      let frame: PickerFrame | undefined
+      switch (result.workflow.type) {
+        case "choosing_codex_setting":
+          frame = codexSettingsFrame(result.workflow.session)
+          break
+        case "choosing_setting":
+          frame = settingsFrame(result.workflow.session, result.workflow.scope)
+          break
+      }
+      if (frame) {
+        this.#replaceChoosing({ ...frame, ...(selectedId ? { selectedId } : {}) }, result.filter, result.workflow)
+      } else {
+        this.$state.set({ ...this.$state.get(), workflow: result.workflow })
+      }
+      this.#requestInput(result.filter)
+      return
+    }
+    this.$state.set({ ...this.$state.get(), workflow: { type: "idle" } })
+    this.#requestInput("")
   }
 
   #showError(cause: unknown): void {

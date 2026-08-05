@@ -107,6 +107,7 @@ test("picker navigation follows mode-owned keybinding overrides", async () => {
     setup.mockInput.pressEnter()
     await renderSettled(setup)
 
+    expect(setup.captureCharFrame()).toContain("↑/Ctrl+N select")
     setup.mockInput.pressArrow("down")
     setup.mockInput.pressEnter()
     await renderSettled(setup)
@@ -137,7 +138,8 @@ test("picker selection pushes a frame and Escape restores the parent filter", as
 
     expect(prompt.plainText).toBe("")
     expect(prompt.focused).toBe(true)
-    expect(setup.captureCharFrame()).toContain("Models · 2")
+    expect(setup.captureCharFrame()).toContain("Models")
+    expect(setup.captureCharFrame()).toContain("↑/↓ select · enter confirm · esc back")
 
     setup.mockInput.pressEscape()
     await setup.renderOnce()
@@ -168,7 +170,14 @@ test("composer remains the focused filter while the model frame changes below it
     expect(prompt.focused).toBe(true)
     expect(setup.renderer.root.findDescendantById("model-search-input")).toBeUndefined()
     expect(promptInput(setup) === prompt).toBe(true)
-    expect(setup.captureCharFrame()).toContain("current  [select]  ✓")
+    expect(setup.captureCharFrame()).toContain("› current  [select]  ✓")
+
+    setup.mockInput.pressTab()
+    await setup.renderOnce()
+    expect(setup.captureCharFrame()).toContain("› target  [select]")
+    setup.mockInput.pressTab()
+    await setup.renderOnce()
+    expect(setup.captureCharFrame()).toContain("› current  [select]  ✓")
 
     await setup.mockInput.typeText("targ", 0)
     await setup.renderOnce()

@@ -1,3 +1,5 @@
+import { homedir } from "node:os"
+
 import type {
   AgentSession,
   AuthenticationMethod,
@@ -140,7 +142,8 @@ export function logoutFrame(credentials: readonly StoredCredential[]): PickerFra
 export function sessionFrame(
   sessions: readonly SessionInfo[],
   currentPath: string | undefined,
-  options: { readonly emptyText?: string; readonly invalid?: number; readonly omitted?: number } = {}
+  options: { readonly emptyText?: string; readonly invalid?: number; readonly omitted?: number } = {},
+  now = Date.now()
 ): PickerFrame {
   const selected = currentPath && sessions.some(session => session.path === currentPath) ? currentPath : undefined
   const notices = [
@@ -155,8 +158,8 @@ export function sessionFrame(
     rows: sessions.map(session => ({
       id: session.path,
       label: session.firstMessage || "Empty session",
-      detail: `[${sessionDate(session.modifiedAt)}]`,
-      ...(session.path === currentPath ? { metadata: glyphs.check } : {}),
+      detail: `[${relativeTime(session.modifiedAt, now)}]`,
+      metadata: `${shortenPath(session.cwd)}${session.path === currentPath ? ` ${glyphs.check}` : ""}`,
       searchText: `${session.id} ${session.cwd} ${session.firstMessage}`
     })),
     ...(selected ? { selectedId: selected } : {}),
@@ -175,6 +178,7 @@ export function projectTrustFrame(
     id: promptPickerFrameIds.projectTrust,
     title: "Project trust",
     hint: "Project .zi configuration and ancestor .agents skills are currently ignored.",
+    hintTone: "warning",
     footer: disabled ? "Applying project trust…" : cwd,
     filter: "none",
     disabled,
@@ -250,7 +254,7 @@ export function codexFastModeValuesFrame(session: AgentSession): PickerFrame {
     id: promptPickerFrameIds.codexSettingValues,
     title: "Fast mode · OpenAI Codex",
     hint: "On sends low text verbosity and the priority service tier. Off sends neither.",
-    filter: "fuzzy",
+    filter: "none",
     rows: [true, false].map(value => settingValueRow(value, saved, effective)),
     selectedId: settingValueId(effective),
     ...(session.settingsManager.getProject().codexFastMode !== undefined
@@ -263,7 +267,7 @@ export function settingsScopeFrame(): PickerFrame {
   return {
     id: promptPickerFrameIds.settingsScopes,
     title: "Settings scope",
-    filter: "fuzzy",
+    filter: "none",
     rows: [
       {
         id: "global",
@@ -312,11 +316,14 @@ export function settingValuesFrame(session: AgentSession, scope: SettingsScope, 
   return {
     id: promptPickerFrameIds.settingValues,
     title: `${settingLabel(setting)} · ${scopeLabel(scope)}`,
-    filter: "fuzzy",
+    filter: values.length > 3 ? "fuzzy" : "none",
     rows: values.map(value => settingValueRow(value, saved, effective)),
     selectedId,
     ...(scope === "global" && session.settingsManager.getProject()[setting] !== undefined
-      ? { hint: `Project override keeps the effective value at ${settingValueLabel(effective)}.` }
+      ? {
+          hint: `Project override keeps the effective value at ${settingValueLabel(effective)}.`,
+          hintTone: "warning" as const
+        }
       : {})
   }
 }
@@ -415,8 +422,26 @@ function effectiveSetting(session: AgentSession, setting: EditableSetting): Edit
   }
 }
 
-function sessionDate(timestamp: string): string {
-  return timestamp.slice(0, 16).replace("T", " ")
+function relativeTime(timestamp: string, now: number): string {
+  const elapsed = Math.max(0, now - Date.parse(timestamp))
+  const minutes = Math.floor(elapsed / 60_000)
+  if (minutes < 1) return "just now"
+  if (minutes < 60) return `${minutes}m ago`
+  const hours = Math.floor(minutes / 60)
+  if (hours < 24) return `${hours}h ago`
+  const days = Math.floor(hours / 24)
+  if (days < 7) return `${days}d ago`
+  return timestamp.slice(0, 10)
+}
+
+function shortenPath(path: string): string {
+  const home = homedir()
+  const display = home && (path === home || path.startsWith(`${home}/`)) ? `~${path.slice(home.length)}` : path
+  const parts = display
+    .replace(/^(?:~\/|\/)/, "")
+    .split("/")
+    .filter(Boolean)
+  return parts.length <= 3 ? display : `…/${parts.slice(-3).join("/")}`
 }
 
 function scopeLabel(scope: SettingsScope): string {

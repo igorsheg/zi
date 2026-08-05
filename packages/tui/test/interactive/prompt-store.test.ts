@@ -460,17 +460,21 @@ test("Codex settings use two picker frames and persist Fast Mode through AgentSe
     })
 
     expect(prompt.backPicker()).toBe(true)
-    expect(prompt.$state.get().inputEdit).toMatchObject({ type: "replace", text: "fast-mode" })
-    expect(prompt.picker.presentation("fast-mode")?.frame.id).toBe("codex-settings")
-    expect(prompt.activatePicker("fast-mode", fileCompletionInputFromText("fast-mode", 9))).toBe(true)
+    expect(prompt.$state.get().inputEdit).toMatchObject({ type: "replace", text: "" })
+    expect(prompt.picker.presentation("")?.frame.id).toBe("codex-settings")
+    expect(prompt.activatePicker("", fileCompletionInputFromText("", 0))).toBe(true)
     prompt.movePicker("", 1)
     expect(prompt.activatePicker("", fileCompletionInputFromText("", 0))).toBe(true)
 
     expect(session.settingsManager.getGlobal().codexFastMode).toBe(true)
     expect(session.settingsManager.get().codexFastMode).toBe(true)
-    expect(prompt.$state.get().workflow).toEqual({ type: "idle" })
+    expect(prompt.$state.get().workflow).toMatchObject({ type: "choosing_codex_setting" })
+    expect(prompt.$state.get().inputEdit).toMatchObject({ type: "replace", text: "" })
     expect(notices.prompt.at(-1)).toEqual({ type: "info", message: "Codex Fast mode: On" })
-    expect(prompt.picker.presentation("")).toBeUndefined()
+    expect(prompt.picker.presentation("")).toMatchObject({
+      frame: { id: "codex-settings" },
+      rows: [{ id: "fast-mode", detail: "[On]" }]
+    })
   } finally {
     prompt.dispose()
     mode.dispose()
@@ -478,7 +482,7 @@ test("Codex settings use two picker frames and persist Fast Mode through AgentSe
   }
 })
 
-test("settings workflow restores suspended filters until a value closes the stack", async () => {
+test("settings workflow restores suspended filters after a value commits", async () => {
   const session = await createSession("settings-store")
   const mode = createInteractiveStore(session)
   const prompt = createPromptStore(mode, new SlashController())
@@ -497,8 +501,13 @@ test("settings workflow restores suspended filters until a value closes the stac
     prompt.movePicker("", 1)
     expect(prompt.activatePicker("", fileCompletionInputFromText("", 0))).toBe(true)
     expect(session.steeringMode).toBe("all")
-    expect(prompt.$state.get().inputEdit).toMatchObject({ type: "replace", text: "" })
-    expect(prompt.picker.presentation("")).toBeUndefined()
+    expect(prompt.$state.get().workflow).toMatchObject({ type: "choosing_setting", scope: "global" })
+    expect(prompt.$state.get().inputEdit).toMatchObject({ type: "replace", text: "steer" })
+    expect(prompt.picker.presentation("steer")).toMatchObject({
+      frame: { id: "settings" },
+      rows: [{ id: "steeringMode", detail: "[all]", metadata: "Effective: all" }],
+      selectedId: "steeringMode"
+    })
   } finally {
     mode.dispose()
     session.dispose()

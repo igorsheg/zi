@@ -36,7 +36,8 @@ test("/codex-settings toggles Fast Mode through two focused picker frames", asyn
 
     expect(session.settingsManager.getGlobal().codexFastMode).toBe(true)
     expect(setup.captureCharFrame()).toContain("Codex Fast mode: On")
-    expect(setup.captureCharFrame()).not.toContain("OpenAI Codex settings")
+    expect(prompt.plainText).toBe("")
+    expect(setup.captureCharFrame()).toContain("OpenAI Codex settings")
   } finally {
     session.dispose()
     setup.destroy()
@@ -92,9 +93,9 @@ test("/settings keeps the composer focused through scoped nested selection", asy
     await renderSettled(setup)
     expect(session.steeringMode).toBe("all")
     expect(session.settingsManager.getGlobal().steeringMode).toBe("all")
-    expect(prompt.plainText).toBe("")
+    expect(prompt.plainText).toBe("steer")
     expect(setup.captureCharFrame()).toContain("Steering mode: all (global)")
-    expect(setup.captureCharFrame()).not.toContain("Settings · Global")
+    expect(setup.captureCharFrame()).toContain("Settings · Global")
   } finally {
     session.dispose()
     setup.destroy()
@@ -190,7 +191,7 @@ test("thinking values come from the model and persist through AgentSession", asy
     expect(session.settingsManager.getProject().defaultThinkingLevel).toBe("low")
     expect(prompt.plainText).toBe("")
     expect(setup.captureCharFrame()).toContain("Thinking level: low (project)")
-    expect(setup.captureCharFrame()).not.toContain("Settings · Project")
+    expect(setup.captureCharFrame()).toContain("Settings · Project")
   } finally {
     session.dispose()
     setup.destroy()
@@ -224,9 +225,9 @@ test("global settings explain an effective project override", async () => {
     await renderSettled(setup)
 
     expect(session.steeringMode).toBe("all")
-    expect(prompt.plainText).toBe("")
+    expect(prompt.plainText).toBe("steer")
     expect(setup.captureCharFrame()).toContain("project override keeps all effective")
-    expect(setup.captureCharFrame()).not.toContain("Settings · Global")
+    expect(setup.captureCharFrame()).toContain("Settings · Global")
     expect(JSON.parse(await readFile(join(agentDir, "settings.json"), "utf8"))).toEqual({
       steeringMode: "one-at-a-time"
     })

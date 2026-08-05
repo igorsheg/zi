@@ -2,6 +2,7 @@ import { atom, type ReadableAtom } from "nanostores"
 
 import { maxPickerListRows, type PickerRow } from "../../components/picker-list.js"
 import { fuzzyMatch } from "../fuzzy-match.js"
+import type { PickerWorkflow } from "./state.js"
 
 export const maxPickerDepth = 8
 export const maxPickerRows = 2048
@@ -22,12 +23,18 @@ export interface PickerFrame {
   readonly disabled?: boolean
   readonly selectedId?: string
   readonly hint?: string
+  /** Hints are informational by default; genuine cautions opt into "warning". */
+  readonly hintTone?: "warning"
   readonly emptyText?: string
   readonly footer?: string
 }
 
 export interface PickerStackFrameState extends PickerFrame {
   readonly selectedIndex: number
+  /** The choosing workflow this frame admits; activation dispatches on it. */
+  readonly workflow?: PickerWorkflow
+  /** The last query admitted through queryChanged; selection resets when it changes. */
+  readonly query: string
   readonly parentFilter?: string
 }
 
@@ -42,15 +49,18 @@ export interface PickerPresentation {
   readonly frame: PickerFrame
   readonly rows: readonly PickerStackRow[]
   readonly selectedId?: string
+  readonly workflow?: PickerWorkflow
 }
 
-export type PickerBack = { readonly type: "closed" } | { readonly type: "revealed"; readonly filter: string }
+export type PickerBack =
+  | { readonly type: "closed" }
+  | { readonly type: "revealed"; readonly filter: string; readonly workflow?: PickerWorkflow }
 
 export interface PickerStack {
   readonly $state: ReadableAtom<PickerStackState>
-  open(frame: PickerFrame): void
-  push(frame: PickerFrame, parentFilter: string): void
-  replaceTop(frame: PickerFrame, filter: string): void
+  open(frame: PickerFrame, workflow?: PickerWorkflow): void
+  push(frame: PickerFrame, parentFilter: string, workflow?: PickerWorkflow): void
+  replaceTop(frame: PickerFrame, filter: string, workflow?: PickerWorkflow): void
   queryChanged(filter: string): void
   move(filter: string, direction: -1 | 1): void
   presentation(filter: string): PickerPresentation | undefined
@@ -88,11 +98,12 @@ export function createPickerStack(): PickerStack {
       depth: state.frames.length,
       frame: pickerFrame(frame),
       rows,
-      ...(selected ? { selectedId: selected.id } : {})
+      ...(selected ? { selectedId: selected.id } : {}),
+      ...(frame.workflow ? { workflow: frame.workflow } : {})
     }
   }
 
-  const pushFrame = (frame: PickerFrame, parentFilter: string): void => {
+  const pushFrame = (frame: PickerFrame, parentFilter: string, workflow?: PickerWorkflow): void => {
     const state = current()
     if (state.type === "closed") throw new Error("Cannot push a picker frame onto a closed stack")
     if (state.frames.length === maxPickerDepth) {
@@ -102,13 +113,19 @@ export function createPickerStack(): PickerStack {
       throw new Error(`Suspended picker filters cannot exceed ${maxSuspendedFilterLength} characters`)
     }
     validateFrame(frame)
-    $state.set({ type: "open", frames: [...state.frames, activate(frame, parentFilter)] })
+    // The suspended parent keeps the query it will be revealed with.
+    const [first, ...rest] = state.frames
+    const parent = { ...(rest.at(-1) ?? first), query: parentFilter }
+    const child = activate(frame, "", parentFilter, workflow)
+    const frames: NonEmptyPickerFrames =
+      rest.length === 0 ? [parent, child] : [first, ...rest.slice(0, -1), parent, child]
+    $state.set({ type: "open", frames })
   }
 
-  const replaceFrame = (frame: PickerFrame, filter: string): void => {
+  const replaceFrame = (frame: PickerFrame, filter: string, workflow?: PickerWorkflow): void => {
     current()
     validateFrame(frame)
-    updateTop(currentFrame => activate(frame, currentFrame.parentFilter, filter))
+    updateTop(currentFrame => activate(frame, filter, currentFrame.parentFilter, workflow))
   }
 
   const goBack = (): PickerBack => {
@@ -121,27 +138,37 @@ export function createPickerStack(): PickerStack {
     }
     const remaining = state.frames.slice(0, -1)
     $state.set({ type: "open", frames: [remaining[0]!, ...remaining.slice(1)] })
-    return { type: "revealed", filter: top.parentFilter ?? "" }
+    const revealed = remaining.at(-1)!
+    return {
+      type: "revealed",
+      filter: top.parentFilter ?? "",
+      ...(revealed.workflow ? { workflow: revealed.workflow } : {})
+    }
   }
 
   return {
     $state,
-    open(frame) {
+    open(frame, workflow) {
       current()
       validateFrame(frame)
-      $state.set({ type: "open", frames: [activate(frame)] })
+      $state.set({ type: "open", frames: [activate(frame, "", undefined, workflow)] })
     },
     push: pushFrame,
-    replaceTop(frame, filter) {
+    replaceTop(frame, filter, workflow) {
       const state = current()
       if (state.type === "closed") throw new Error("Cannot replace a picker frame on a closed stack")
-      replaceFrame(frame, filter)
+      replaceFrame(frame, filter, workflow)
     },
     queryChanged(filter) {
       updateTop(frame => {
+        // A changed query re-ranks rows, so the selection returns to the best
+        // match; an unchanged one only clamps after row replacement. Frames
+        // without filtering never move the selection under the user's cursor.
+        const reset = frame.query !== filter && frame.filter !== "none"
         const rows = filteredRows(frame, filter)
-        const selectedIndex = Math.min(frame.selectedIndex, Math.max(0, rows.length - 1))
-        return selectedIndex === frame.selectedIndex ? frame : { ...frame, selectedIndex }
+        const selectedIndex = reset ? 0 : Math.min(frame.selectedIndex, Math.max(0, rows.length - 1))
+        if (!reset && selectedIndex === frame.selectedIndex) return frame
+        return { ...frame, query: filter, selectedIndex }
       })
     },
     move(filter, direction) {
@@ -199,18 +226,26 @@ function pickerFrame(frame: PickerStackFrameState): PickerFrame {
     ...(frame.disabled ? { disabled: true } : {}),
     ...(frame.selectedId ? { selectedId: frame.selectedId } : {}),
     ...(frame.hint ? { hint: frame.hint } : {}),
+    ...(frame.hintTone ? { hintTone: frame.hintTone } : {}),
     ...(frame.emptyText ? { emptyText: frame.emptyText } : {}),
     ...(frame.footer ? { footer: frame.footer } : {})
   }
 }
 
-function activate(frame: PickerFrame, parentFilter?: string, filter = ""): PickerStackFrameState {
+function activate(
+  frame: PickerFrame,
+  filter: string,
+  parentFilter?: string,
+  workflow?: PickerWorkflow
+): PickerStackFrameState {
   const rows = filteredRows(frame, filter)
   const selectedIndex = frame.selectedId ? rows.findIndex(row => row.id === frame.selectedId) : 0
   return {
     ...frame,
+    query: filter,
     selectedIndex: selectedIndex < 0 ? 0 : selectedIndex,
-    ...(parentFilter === undefined ? {} : { parentFilter })
+    ...(parentFilter === undefined ? {} : { parentFilter }),
+    ...(workflow ? { workflow } : {})
   }
 }
 
