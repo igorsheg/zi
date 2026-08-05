@@ -104,6 +104,7 @@ export type ChildZiProcessOptions = {
 export class ChildZiProcess {
   readonly name: string
   readonly #child: Bun.Subprocess<"pipe", "pipe", "pipe">
+  readonly #exited: Promise<number>
   readonly #onStateChange: (() => void) | undefined
   readonly #onCompletion: ((completion: SubagentCompletion) => void) | undefined
   readonly #onFatal: ((error: Error) => void) | undefined
@@ -157,10 +158,12 @@ export class ChildZiProcess {
       detached: process.platform !== "win32",
       windowsHide: true
     })
+    // Bun's exited accessor can touch released OS handles, so capture it before shutdown starts.
+    this.#exited = this.#child.exited
     this.#processScope = createChildProcessScope(this.#child, options.processTreeTracker, cause => this.#fail(cause))
     this.#stdoutSettlement = this.#consumeStdout().catch(cause => this.#fail(cause))
     this.#stderrSettlement = this.#consumeStderr().catch(cause => this.#fail(cause))
-    void this.#child.exited.then(async code => {
+    void this.#exited.then(async code => {
       await settleWithin(this.#stderrSettlement, 1_000)
       if (this.#state.type !== "closing" && this.#state.type !== "exited") {
         const diagnostic = this.#stderr.trim()
@@ -408,14 +411,14 @@ export class ChildZiProcess {
     } catch {
       // already closed
     }
-    let exitCode = await settleValueWithin(this.#child.exited, graceMs)
+    let exitCode = await settleValueWithin(this.#exited, graceMs)
     if (exitCode === timeoutValue) {
       try {
         this.#child.kill()
       } catch {
         // already dead
       }
-      exitCode = await settleValueWithin(this.#child.exited, forceMs)
+      exitCode = await settleValueWithin(this.#exited, forceMs)
     }
     await this.#processScope.terminate()
     await settleWithin(
@@ -891,7 +894,7 @@ export class ChildZiProcess {
   }
 
   async #waitExit(): Promise<number | null> {
-    const code = await this.#child.exited
+    const code = await this.#exited
     await settleWithin(
       Promise.allSettled([this.#stdoutSettlement, this.#stderrSettlement]).then(() => undefined),
       1_000

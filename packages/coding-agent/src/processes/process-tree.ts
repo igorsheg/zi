@@ -686,6 +686,8 @@ async function readPsProcessTable(signal: AbortSignal): Promise<readonly PosixPr
     stdout: "pipe",
     stderr: "ignore"
   })
+  // Capture before cancellation can release the subprocess handles behind Bun's accessor.
+  const exited = child.exited
   const abort = (): void => {
     try {
       child.kill()
@@ -696,13 +698,13 @@ async function readPsProcessTable(signal: AbortSignal): Promise<readonly PosixPr
   signal.addEventListener("abort", abort, { once: true })
   try {
     const output = await readBoundedText(child.stdout, maxProcessTableBytes)
-    const exitCode = await child.exited
+    const exitCode = await exited
     if (signal.aborted) throw abortReason(signal)
     if (exitCode !== 0) throw new Error(`Process-table scan exited with code ${exitCode}`)
     return parsePsProcessTable(output)
   } catch (cause) {
     abort()
-    await settleValueWithin(child.exited, processTreeSettleMs, "Process-table process cleanup timed out").catch(
+    await settleValueWithin(exited, processTreeSettleMs, "Process-table process cleanup timed out").catch(
       () => undefined
     )
     if (signal.aborted) throw abortReason(signal)

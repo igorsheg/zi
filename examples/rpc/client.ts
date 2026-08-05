@@ -85,6 +85,7 @@ export async function runRpcCommand(options: RpcCommandClientOptions): Promise<s
 
 class RpcClient {
   readonly #child: Bun.Subprocess<"pipe", "pipe", "pipe">
+  readonly #exited: Promise<number>
   readonly #onEvent: RpcClientOptions["onEvent"]
   readonly #ready = deferred<void>()
   readonly #removeAbort: () => void
@@ -108,6 +109,8 @@ class RpcClient {
       stderr: "pipe",
       windowsHide: true
     })
+    // Bun's exited accessor can touch released OS handles, so capture it before shutdown starts.
+    this.#exited = this.#child.exited
     this.#stdoutSettlement = this.#consumeStdout().catch(cause => this.#fail(cause))
     this.#stderrSettlement = this.#consumeStderr().catch(cause => this.#fail(cause))
     this.#removeAbort = listenForAbort(options.signal, () => this.#fail(new Error("RPC client was cancelled")))
@@ -320,10 +323,10 @@ class RpcClient {
     this.#rejectPending(new Error("RPC client closed"))
     await this.#writeTail
     await this.#child.stdin.end()
-    let exitCode = await settleValueWithin(this.#child.exited, rpcClientCloseTimeoutMs)
+    let exitCode = await settleValueWithin(this.#exited, rpcClientCloseTimeoutMs)
     if (exitCode === timeoutValue) {
       this.#child.kill()
-      exitCode = await settleValueWithin(this.#child.exited, rpcClientCloseTimeoutMs)
+      exitCode = await settleValueWithin(this.#exited, rpcClientCloseTimeoutMs)
     }
     await Promise.allSettled([this.#stdoutSettlement, this.#stderrSettlement])
     this.#state = { type: "closed" }
