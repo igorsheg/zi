@@ -661,7 +661,8 @@ function validateToolRegistration(value: unknown): void {
 
 function validateAgentsSkill(value: unknown, skillPath: string): void {
   const payload = JSON.stringify(value)
-  if (!payload.includes("<name>compiled-agents-skill</name>") || !payload.includes(skillPath)) {
+  const serializedSkillPath = JSON.stringify(skillPath).slice(1, -1)
+  if (!payload.includes("<name>compiled-agents-skill</name>") || !payload.includes(serializedSkillPath)) {
     throw new Error("Compiled provider prompt omitted the global .agents skill")
   }
 }
