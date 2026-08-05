@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process"
 import { isAbsolute } from "node:path"
-import { Readable, type Writable } from "node:stream"
+import { Readable, Writable } from "node:stream"
 
 export interface CodeModeWorkerExit {
   readonly code: number | null
@@ -19,6 +19,10 @@ export interface CodeModeWorkerProcess {
   dispose(): void
 }
 
+type SpawnedChild =
+  | { readonly type: "bun"; readonly process: Bun.Subprocess<"pipe", "pipe", "pipe"> }
+  | { readonly type: "node"; readonly process: ReturnType<typeof spawn> }
+
 export function createCodeModeWorkerSpawner(command: readonly string[]): (cwd: string) => CodeModeWorkerProcess {
   if (
     command.length === 0 ||
@@ -31,28 +35,64 @@ export function createCodeModeWorkerSpawner(command: readonly string[]): (cwd: s
   const admitted = Object.freeze([...command])
   const environment = codeModeEnvironment()
   return cwd => {
-    const child = spawn(admitted[0]!, [...admitted.slice(1), "--zi-internal-code-mode-worker"], {
-      cwd,
-      env: environment,
-      stdio: ["pipe", "pipe", "pipe", "pipe"],
-      windowsHide: true
-    })
-    const protocol = child.stdio[3]
-    if (!child.stdin || !child.stdout || !child.stderr || !(protocol instanceof Readable)) {
-      child.once("error", ignoreStreamError)
-      child.kill("SIGKILL")
-      child.unref()
-      throw new Error("Code-mode worker did not expose all required pipes")
+    const args = [...admitted.slice(1), "--zi-internal-code-mode-worker"]
+    const child: SpawnedChild =
+      process.platform === "win32"
+        ? {
+            type: "node",
+            process: spawn(admitted[0]!, args, {
+              cwd,
+              env: environment,
+              stdio: ["pipe", "pipe", "pipe", "pipe"],
+              windowsHide: true
+            })
+          }
+        : {
+            type: "bun",
+            process: Bun.spawn([admitted[0]!, ...args], {
+              cwd,
+              env: environment,
+              stdio: ["pipe", "pipe", "pipe", "pipe"],
+              windowsHide: true
+            })
+          }
+
+    let input: Writable
+    let stdout: Readable
+    let stderr: Readable
+    let protocol: Readable
+    try {
+      if (child.type === "bun") {
+        const descriptor = child.process.stdio[3]
+        if (typeof descriptor !== "number") throw new Error("Code-mode worker did not expose its protocol pipe")
+        input = bunInput(child.process.stdin)
+        stdout = Readable.from(child.process.stdout)
+        stderr = Readable.from(child.process.stderr)
+        protocol = Readable.from(Bun.file(descriptor).stream())
+      } else {
+        const descriptor = child.process.stdio[3]
+        if (
+          !child.process.stdin ||
+          !child.process.stdout ||
+          !child.process.stderr ||
+          !(descriptor instanceof Readable)
+        ) {
+          throw new Error("Code-mode worker did not expose all required pipes")
+        }
+        input = child.process.stdin
+        stdout = child.process.stdout
+        stderr = child.process.stderr
+        protocol = descriptor
+      }
+    } catch (cause) {
+      if (child.type === "node") child.process.once("error", ignoreStreamError)
+      child.process.kill("SIGKILL")
+      child.process.unref()
+      throw cause
     }
 
-    const input = child.stdin
-    const stdout = child.stdout
-    const stderr = child.stderr
-    const releaseInputError = (): void => {
-      input.off("error", ignoreStreamError)
-    }
     input.on("error", ignoreStreamError)
-    input.once("close", releaseInputError)
+    input.once("close", () => input.off("error", ignoreStreamError))
 
     let settled = false
     let processError: Error | undefined
@@ -65,15 +105,20 @@ export function createCodeModeWorkerSpawner(command: readonly string[]): (cwd: s
       settled = true
       resolveExit({ code, signal, ...(processError ? { error: processError } : {}) })
     }
-    const onError = (cause: Error): void => {
-      processError = cause
-    }
-    const onClose = (code: number | null, signal: NodeJS.Signals | null): void => finish(code, signal)
-    child.on("error", onError)
-    child.on("close", onClose)
-    const stopObserving = (): void => {
-      child.off("error", onError)
-      child.off("close", onClose)
+    let stopObserving: (() => void) | undefined
+    if (child.type === "bun") {
+      void observeBunExit(child.process).then(exit => finish(exit.code, exit.signal))
+    } else {
+      const onError = (cause: Error): void => {
+        processError = cause
+      }
+      const onClose = (code: number | null, signal: NodeJS.Signals | null): void => finish(code, signal)
+      child.process.on("error", onError)
+      child.process.on("close", onClose)
+      stopObserving = () => {
+        child.process.off("error", onError)
+        child.process.off("close", onClose)
+      }
     }
 
     return {
@@ -86,7 +131,7 @@ export function createCodeModeWorkerSpawner(command: readonly string[]): (cwd: s
         input.end()
       },
       terminate(force) {
-        if (!settled) child.kill(force ? "SIGKILL" : "SIGTERM")
+        if (!settled) child.process.kill(force ? "SIGKILL" : "SIGTERM")
       },
       dispose() {
         input.destroy()
@@ -94,17 +139,79 @@ export function createCodeModeWorkerSpawner(command: readonly string[]): (cwd: s
         stderr.destroy()
         protocol.destroy()
         if (settled) {
-          stopObserving()
+          stopObserving?.()
           return
         }
-        child.unref()
-        child.once("error", ignoreStreamError)
+        child.process.unref()
+        if (child.type === "node") child.process.once("error", ignoreStreamError)
         processError ??= new Error("Code-mode process ownership ended before exit observation")
-        finish(child.exitCode, child.signalCode)
-        stopObserving()
+        finish(child.process.exitCode, child.process.signalCode)
+        stopObserving?.()
       }
     }
   }
+}
+
+async function observeBunExit(child: Bun.Subprocess<"pipe", "pipe", "pipe">): Promise<CodeModeWorkerExit> {
+  while (child.exitCode === null && child.signalCode === null) {
+    // Bun's exited accessor can touch released OS handles after pipe shutdown.
+    // oxlint-disable-next-line no-await-in-loop
+    await sleep(10)
+  }
+  return { code: child.exitCode, signal: child.signalCode }
+}
+
+function bunInput(sink: Bun.FileSink): Writable {
+  let ended = false
+  return new Writable({
+    write(chunk: Buffer, _encoding, callback) {
+      void writeBunInput(sink, chunk, callback)
+    },
+    final(callback) {
+      ended = true
+      void closeBunInput(sink, undefined, callback)
+    },
+    destroy(cause, callback) {
+      if (ended) {
+        callback(cause)
+        return
+      }
+      ended = true
+      void closeBunInput(sink, cause ?? undefined, callback)
+    }
+  })
+}
+
+async function writeBunInput(
+  sink: Bun.FileSink,
+  chunk: Buffer,
+  callback: (error?: Error | null) => void
+): Promise<void> {
+  try {
+    await sink.write(chunk)
+    await sink.flush()
+    callback()
+  } catch (cause) {
+    callback(cause instanceof Error ? cause : new Error("Could not write code-mode worker input"))
+  }
+}
+
+async function closeBunInput(
+  sink: Bun.FileSink,
+  cause: Error | undefined,
+  callback: (error?: Error | null) => void
+): Promise<void> {
+  try {
+    await sink.end()
+    callback(cause)
+  } catch (closeCause) {
+    const closeError = closeCause instanceof Error ? closeCause : new Error("Could not close code-mode worker input")
+    callback(cause ? new Error(`${cause.message}; ${closeError.message}`, { cause }) : closeError)
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms))
 }
 
 function ignoreStreamError(): void {}
