@@ -74,6 +74,7 @@ export default function (zi: ExtensionAPI): void {
       stdio: ["pipe", "pipe", "pipe", "pipe"],
       windowsHide: true
     })
+    const workerExit = childExit(child)
     const protocolOutput = child.stdio[3]
     if (!child.stdin || !child.stdout || !child.stderr || !protocolOutput) {
       throw new Error("Compiled extension worker did not expose its protocol and log pipes")
@@ -262,7 +263,12 @@ export default function (zi: ExtensionAPI): void {
       })
     )
 
-    const [exitCode, capturedStdout, capturedStderr] = await Promise.all([childExit(child), stdout, stderr, protocol])
+    const [exitCode, capturedStdout, capturedStderr] = await settleNodeProcess(
+      child,
+      workerExit,
+      [stdout, stderr, protocol] as const,
+      "Compiled extension worker"
+    )
     expect(exitCode).toBe(0)
     expect(capturedStdout).toBe("compiled worker stdout\n")
     expect(capturedStderr).toBe("compiled worker stderr\n")
@@ -325,12 +331,14 @@ export default function (zi: ExtensionAPI): void {
       ],
       { cwd: temporary, env: providerFreeEnvironment(temporary), stdio: ["pipe", "pipe", "pipe"], windowsHide: true }
     )
+    const productExitSettlement = childExit(child)
     child.stdin!.end()
-    const [productExit, productStdout, productStderr] = await Promise.all([
-      childExit(child),
-      readNodeStream(child.stdout!),
-      readNodeStream(child.stderr!)
-    ])
+    const [productExit, productStdout, productStderr] = await settleNodeProcess(
+      child,
+      productExitSettlement,
+      [readNodeStream(child.stdout!), readNodeStream(child.stderr!)] as const,
+      "Compiled text mode"
+    )
     expect(productExit).toBe(1)
     expect(productStdout).not.toContain("compiled worker stdout")
     expect(productStderr).not.toContain("compiled worker stderr")
@@ -341,12 +349,14 @@ export default function (zi: ExtensionAPI): void {
       ["--cwd", temporary, "--agent-dir", join(temporary, "rpc-agent"), "--no-session", "--mode", "rpc"],
       { cwd: temporary, env: providerFreeEnvironment(temporary), stdio: ["pipe", "pipe", "pipe"], windowsHide: true }
     )
+    const rpcExitSettlement = childExit(child)
     child.stdin!.end(`${JSON.stringify({ version: 1, id: "state", method: "session.get_state" })}\n`)
-    const [rpcExit, rpcStdout, rpcStderr] = await Promise.all([
-      childExit(child),
-      readNodeStream(child.stdout!),
-      readNodeStream(child.stderr!)
-    ])
+    const [rpcExit, rpcStdout, rpcStderr] = await settleNodeProcess(
+      child,
+      rpcExitSettlement,
+      [readNodeStream(child.stdout!), readNodeStream(child.stderr!)] as const,
+      "Compiled RPC mode"
+    )
     expect(rpcExit).toBe(0)
     expect(rpcStderr).toBe("")
     expect(parseJsonLines(rpcStdout)).toMatchObject([
@@ -519,6 +529,7 @@ await compileZi({ outfile: process.env.ZI_COMPILED_TEST_OUTFILE, version: "compi
     stdio: ["ignore", "pipe", "pipe"],
     windowsHide: true
   })
+  const compilerExit = childExit(compiler)
   let timedOut = false
   const timeout = setTimeout(() => {
     timedOut = true
@@ -526,7 +537,7 @@ await compileZi({ outfile: process.env.ZI_COMPILED_TEST_OUTFILE, version: "compi
   }, 30_000)
   try {
     const [exitCode, stdout, stderr] = await Promise.all([
-      childExit(compiler),
+      compilerExit,
       readNodeStream(compiler.stdout),
       readNodeStream(compiler.stderr)
     ])
@@ -558,6 +569,45 @@ async function readNodeStream(stream: NodeJS.ReadableStream): Promise<string> {
   let text = ""
   for await (const chunk of stream) text += Buffer.from(chunk).toString("utf8")
   return text
+}
+
+async function settleNodeProcess<T extends readonly unknown[]>(
+  child: ReturnType<typeof spawn>,
+  exited: Promise<number | null>,
+  operations: { readonly [K in keyof T]: Promise<T[K]> },
+  name: string
+): Promise<[number | null, ...T]> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const settlement = Promise.all([exited, ...operations]) as Promise<[number | null, ...T]>
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      child.kill("SIGKILL")
+      reject(new Error(`${name} did not settle within 30000ms`))
+    }, 30_000)
+  })
+  try {
+    return await Promise.race([settlement, timeout])
+  } catch (cause) {
+    child.kill("SIGKILL")
+    await settleWithin(
+      Promise.allSettled([exited, ...operations]).then(() => undefined),
+      5_000
+    )
+    throw cause
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
+async function settleWithin(operation: Promise<void>, timeoutMs: number): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  await Promise.race([
+    operation,
+    new Promise<void>(resolveTimeout => {
+      timer = setTimeout(resolveTimeout, timeoutMs)
+    })
+  ])
+  if (timer) clearTimeout(timer)
 }
 
 function childExit(child: ReturnType<typeof spawn>): Promise<number | null> {
