@@ -513,20 +513,29 @@ async function compileZiInSubprocess(outfile: string): Promise<void> {
 const { compileZi } = await import(${JSON.stringify(compilerSource)})
 await compileZi({ outfile: process.env.ZI_COMPILED_TEST_OUTFILE, version: "compiled-extension-worker-test" })
 `
-  const compiler = Bun.spawn([process.execPath, "-e", code], {
+  const compiler = spawn(process.execPath, ["-e", code], {
     cwd: resolve(import.meta.dirname, ".."),
     env: { ...process.env, ZI_COMPILED_TEST_OUTFILE: outfile },
-    stdin: "ignore",
-    stdout: "pipe",
-    stderr: "pipe"
+    stdio: ["ignore", "pipe", "pipe"],
+    windowsHide: true
   })
-  const [exitCode, stdout, stderr] = await Promise.all([
-    compiler.exited,
-    new Response(compiler.stdout).text(),
-    new Response(compiler.stderr).text()
-  ])
-  if (exitCode !== 0) {
-    throw new Error(`Compiled Zi build failed: stdout=${JSON.stringify(stdout)} stderr=${JSON.stringify(stderr)}`)
+  let timedOut = false
+  const timeout = setTimeout(() => {
+    timedOut = true
+    compiler.kill("SIGKILL")
+  }, 30_000)
+  try {
+    const [exitCode, stdout, stderr] = await Promise.all([
+      childExit(compiler),
+      readNodeStream(compiler.stdout),
+      readNodeStream(compiler.stderr)
+    ])
+    if (timedOut) throw new Error("Compiled Zi build did not settle within 30000ms")
+    if (exitCode !== 0) {
+      throw new Error(`Compiled Zi build failed: stdout=${JSON.stringify(stdout)} stderr=${JSON.stringify(stderr)}`)
+    }
+  } finally {
+    clearTimeout(timeout)
   }
 }
 
