@@ -26,6 +26,21 @@ test("the reference RPC client completes a prompt through correlated ordered fra
   }
 })
 
+test("the reference RPC client force-bounds a server that ignores graceful shutdown", async () => {
+  const temporary = await mkdtemp(join(tmpdir(), "zi-rpc-client-force-close-"))
+  const server = join(temporary, "server.ts")
+  const requests = join(temporary, "requests.jsonl")
+
+  try {
+    await Bun.write(server, mockServer(requests, false, true))
+    expect(
+      await runRpcPrompt({ command: [process.execPath, server], cwd: temporary, env: process.env, prompt: "hello" })
+    ).toBe("done")
+  } finally {
+    await rm(temporary, { recursive: true, force: true })
+  }
+}, 15_000)
+
 test("the reference RPC client cancellation owns its child process", async () => {
   const temporary = await mkdtemp(join(tmpdir(), "zi-rpc-client-cancel-"))
   const server = join(temporary, "server.ts")
@@ -68,8 +83,9 @@ test("the reference RPC client rejects a server sequence gap", async () => {
   }
 })
 
-function mockServer(requests: string, sequenceGap: boolean): string {
+function mockServer(requests: string, sequenceGap: boolean, resistShutdown = false): string {
   return `import { appendFileSync } from "node:fs"
+${resistShutdown ? 'process.on("SIGTERM", () => {})\nsetInterval(() => {}, 1000)' : ""}
 let sequence = 0
 const send = value => process.stdout.write(JSON.stringify({ version: 1, sequence: ++sequence, ...value }) + "\\n")
 send({ type: "ready", state: { sessionId: "test" } })

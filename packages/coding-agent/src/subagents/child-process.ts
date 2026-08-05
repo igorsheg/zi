@@ -128,6 +128,7 @@ export class ChildZiProcess {
   #nextRequestId = 0
   #nextSequence = 1
   #writeTail = Promise.resolve()
+  #closeSettlement: Promise<void> | undefined
   #pendingWriteBytes = 0
   #stderr = ""
   #latestCompletion: SubagentCompletion | undefined
@@ -399,45 +400,15 @@ export class ChildZiProcess {
     this.#clearWorkDeadline()
     this.#clearInterruptDeadline()
     if (state.type === "exited") return
-    if (state.type === "closing") {
-      await this.#waitExit()
+    if (this.#closeSettlement) {
+      await this.#closeSettlement
       return
     }
+    const settlement = Promise.resolve().then(() => this.#settleClose(graceMs, forceMs))
+    this.#closeSettlement = settlement
     this.#transition({ type: "closing", reason, requestedAt: Date.now() })
     this.#rejectPending(new Error(`Subagent ${this.name} is closing`))
-    await this.#writeTail.catch(() => {})
-    try {
-      await this.#child.stdin.end()
-    } catch {
-      // already closed
-    }
-    let exitCode = await settleValueWithin(this.#exited, graceMs)
-    if (exitCode === timeoutValue) {
-      try {
-        this.#child.kill()
-      } catch {
-        // already dead
-      }
-      exitCode = await settleValueWithin(this.#exited, forceMs)
-    }
-    await this.#processScope.terminate()
-    await settleWithin(
-      Promise.allSettled([this.#stdoutSettlement, this.#stderrSettlement]).then(() => undefined),
-      1_000
-    )
-    if (exitCode === timeoutValue) {
-      this.#transition({
-        type: "exited",
-        outcome: { type: "killed", message: `Subagent ${this.name} did not exit within close bounds` }
-      })
-      return
-    }
-    const code = typeof exitCode === "number" ? exitCode : null
-    this.#transition({
-      type: "exited",
-      outcome:
-        code === 0 || code === null ? { type: "closed", code } : { type: "failed", message: this.#stderr.trim(), code }
-    })
+    await settlement
   }
 
   #request(
@@ -875,32 +846,66 @@ export class ChildZiProcess {
     } catch {
       // Process ownership cannot cross into an observer.
     }
+    const settlement = Promise.resolve().then(() => this.#settleClose(rpcCloseForceMs, rpcCloseForceMs, error))
+    this.#closeSettlement = settlement
     this.#transition({ type: "closing", reason: "fatal", requestedAt: Date.now() })
-    void this.#processScope.terminate().catch(() => {})
     try {
-      this.#child.kill()
+      this.#child.kill("SIGKILL")
     } catch {
       // already dead
     }
-    void this.#waitExit()
-      .then(code => {
-        this.#transition({ type: "exited", outcome: { type: "failed", message: error.message, code } })
-        return undefined
-      })
-      .catch(() => {
-        this.#transition({ type: "exited", outcome: { type: "failed", message: error.message, code: null } })
-        return undefined
-      })
+    void settlement
   }
 
-  async #waitExit(): Promise<number | null> {
-    const code = await this.#exited
+  async #settleClose(graceMs: number, forceMs: number, failure?: Error): Promise<void> {
+    await settleWithin(
+      Promise.allSettled([this.#writeTail]).then(() => undefined),
+      graceMs
+    )
+    if (!failure) {
+      await settleWithin(
+        Promise.resolve()
+          .then(() => this.#child.stdin.end())
+          .then(() => undefined)
+          .catch(() => undefined),
+        graceMs
+      )
+    }
+    let exitCode = await settleValueWithin(this.#exited, graceMs)
+    if (exitCode === timeoutValue) {
+      try {
+        this.#child.kill("SIGKILL")
+      } catch {
+        // The process exited at the force boundary.
+      }
+      exitCode = await settleValueWithin(this.#exited, forceMs)
+    }
+    await this.#processScope.terminate().catch(() => {})
     await settleWithin(
       Promise.allSettled([this.#stdoutSettlement, this.#stderrSettlement]).then(() => undefined),
       1_000
     )
-    await this.#processScope.terminate()
-    return typeof code === "number" ? code : null
+    if (this.#state.type === "exited") return
+    if (failure) {
+      this.#transition({
+        type: "exited",
+        outcome: { type: "failed", message: failure.message, code: typeof exitCode === "number" ? exitCode : null }
+      })
+      return
+    }
+    if (exitCode === timeoutValue) {
+      this.#transition({
+        type: "exited",
+        outcome: { type: "killed", message: `Subagent ${this.name} did not exit within close bounds` }
+      })
+      return
+    }
+    const code = typeof exitCode === "number" ? exitCode : null
+    this.#transition({
+      type: "exited",
+      outcome:
+        code === 0 || code === null ? { type: "closed", code } : { type: "failed", message: this.#stderr.trim(), code }
+    })
   }
 
   #rejectPending(cause: Error): void {
@@ -930,7 +935,7 @@ function createChildProcessScope(
     return processTreeTracker.track(child.pid, onFailure)
   } catch (cause) {
     try {
-      child.kill()
+      child.kill("SIGKILL")
     } catch {
       // The process already exited while containment was being admitted.
     }

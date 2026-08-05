@@ -321,19 +321,38 @@ class RpcClient {
   async #closeConnection(ignoreExitFailure: boolean): Promise<void> {
     this.#removeAbort()
     this.#rejectPending(new Error("RPC client closed"))
-    await this.#writeTail
-    await this.#child.stdin.end()
+    await settleWithin(
+      Promise.allSettled([this.#writeTail]).then(() => undefined),
+      rpcClientCloseTimeoutMs
+    )
+    await settleWithin(
+      Promise.resolve()
+        .then(() => this.#child.stdin.end())
+        .then(() => undefined)
+        .catch(() => undefined),
+      rpcClientCloseTimeoutMs
+    )
+    let forced = false
     let exitCode = await settleValueWithin(this.#exited, rpcClientCloseTimeoutMs)
     if (exitCode === timeoutValue) {
-      this.#child.kill()
+      forced = true
+      try {
+        this.#child.kill("SIGKILL")
+      } catch {
+        // The process exited at the force boundary.
+      }
       exitCode = await settleValueWithin(this.#exited, rpcClientCloseTimeoutMs)
     }
-    await Promise.allSettled([this.#stdoutSettlement, this.#stderrSettlement])
+    const streamsSettled = await settleWithin(
+      Promise.allSettled([this.#stdoutSettlement, this.#stderrSettlement]).then(() => undefined),
+      rpcClientCloseTimeoutMs
+    )
     this.#state = { type: "closed" }
 
     if (exitCode === timeoutValue) throw new Error(`Zi RPC did not exit within ${rpcClientCloseTimeoutMs}ms`)
+    if (!streamsSettled) throw new Error(`Zi RPC output did not settle within ${rpcClientCloseTimeoutMs}ms`)
     if (typeof exitCode !== "number") throw new Error("Zi RPC returned an invalid exit status")
-    if (!ignoreExitFailure && exitCode !== 0) {
+    if (!ignoreExitFailure && !forced && exitCode !== 0) {
       const detail = this.#stderr.trim()
       throw new Error(`Zi RPC exited with ${exitCode}${detail ? `: ${detail}` : ""}`)
     }
@@ -347,7 +366,7 @@ class RpcClient {
     if (wasStarting) this.#ready.reject(error)
     this.#rejectPending(error)
     try {
-      this.#child.kill()
+      this.#child.kill("SIGKILL")
     } catch {}
   }
 
