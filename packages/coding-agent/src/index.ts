@@ -65,5 +65,6 @@ export {
   type Skill
 } from "./skills.js"
 export * from "./slash-commands.js"
+export type { SubagentSessionEvents, SubagentSnapshot } from "./subagents/supervisor.js"
 export * from "./system-prompt.js"
 export * from "./tools/index.js"

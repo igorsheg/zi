@@ -28,7 +28,7 @@ import { SessionGreeterView } from "./greeter-view.js"
 import { PickerStackView } from "./picker-view.js"
 import { QueuedInputsView } from "./queue-view.js"
 import { promptInputIsSecret, type PromptInputEdit, type PromptWorkflow } from "./state.js"
-import { createPromptStore, type PromptSessionActions, type PromptStore } from "./store.js"
+import { createPromptStore, type PromptModalActions, type PromptSessionActions, type PromptStore } from "./store.js"
 
 type ExternalEditorState =
   | { readonly type: "idle" }
@@ -71,7 +71,8 @@ export class PromptView {
     externalEditor: ExternalEditor,
     theme: Theme,
     notices: BuiltInNoticeActions,
-    sessionActions?: PromptSessionActions
+    sessionActions?: PromptSessionActions,
+    modals?: PromptModalActions
   ) {
     this.#renderer = renderer
     this.#interactive = interactive
@@ -79,7 +80,7 @@ export class PromptView {
     this.#exitGestures = exitGestures
     this.#externalEditor = externalEditor
     this.#notices = notices
-    this.#store = createPromptStore(interactive, slash, sessionActions, clipboard, notices, clipboardCopy)
+    this.#store = createPromptStore(interactive, slash, sessionActions, clipboard, notices, clipboardCopy, modals)
     this.root = new BoxRenderable(renderer, { flexDirection: "column", flexShrink: 0 })
     this.root.onLifecyclePass = this.#refreshWorkingStatus
 
@@ -288,6 +289,7 @@ export class PromptView {
   }
 
   #onKeyPress = (key: KeyEvent): void => {
+    if (key.defaultPrevented || key.propagationStopped) return
     const session = this.#interactive.getSession()
     const prompt = this.#store.$state.get()
     const pickerOpen = Boolean(this.#store.picker.presentation(this.#input.plainText))

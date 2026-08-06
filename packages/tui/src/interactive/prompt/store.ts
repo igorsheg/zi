@@ -46,6 +46,7 @@ import {
   promptPickerFrameIds,
   sessionFrame,
   settingLabel,
+  subagentFrame,
   settingsFrame,
   settingsScopeFrame,
   settingValuesFrame
@@ -127,15 +128,22 @@ export interface PromptSessionActions {
   cancelReplacement(): SessionReplacementCancellation
 }
 
+export interface PromptModalActions {
+  openSubagentActivity(name: string): boolean
+}
+
+const unavailableModals: PromptModalActions = { openSubagentActivity: () => false }
+
 export function createPromptStore(
   interactive: InteractiveStore,
   slash: SlashController,
   sessionActions?: PromptSessionActions,
   clipboard: ClipboardReader = unavailableClipboard,
   notices: BuiltInNoticeActions = unavailableNotices,
-  messageCopy: PromptMessageCopy = unavailableMessageCopy
+  messageCopy: PromptMessageCopy = unavailableMessageCopy,
+  modals: PromptModalActions = unavailableModals
 ): PromptStore {
-  return new PromptController(interactive, slash, sessionActions, clipboard, notices, messageCopy)
+  return new PromptController(interactive, slash, sessionActions, clipboard, notices, messageCopy, modals)
 }
 
 class PromptController implements PromptStore {
@@ -148,6 +156,7 @@ class PromptController implements PromptStore {
   readonly #clipboard: ClipboardReader
   readonly #notices: BuiltInNoticeActions
   readonly #messageCopy: PromptMessageCopy
+  readonly #modals: PromptModalActions
   readonly #fileCompletion: FileCompletionController
   #clipboardRead: ClipboardReadState = { type: "idle" }
   #draftRevision = 0
@@ -164,7 +173,8 @@ class PromptController implements PromptStore {
     sessionActions: PromptSessionActions | undefined,
     clipboard: ClipboardReader,
     notices: BuiltInNoticeActions,
-    messageCopy: PromptMessageCopy
+    messageCopy: PromptMessageCopy,
+    modals: PromptModalActions
   ) {
     this.#interactive = interactive
     this.#slash = slash
@@ -172,6 +182,7 @@ class PromptController implements PromptStore {
     this.#clipboard = clipboard
     this.#notices = notices
     this.#messageCopy = messageCopy
+    this.#modals = modals
     this.#fileCompletion = new FileCompletionController(this.picker, edit => this.#requestRange(edit))
   }
 
@@ -281,6 +292,8 @@ class PromptController implements PromptStore {
         return this.#activateLogout(workflow, presentation)
       case "choosing_session":
         return this.#activateSession(workflow, presentation)
+      case "choosing_subagent":
+        return this.#activateSubagent(workflow, presentation)
       case "choosing_project_trust":
         return this.#activateProjectTrust(workflow, presentation)
       default:
@@ -765,6 +778,24 @@ class PromptController implements PromptStore {
     return true
   }
 
+  #activateSubagent(
+    workflow: Extract<PromptWorkflow, { type: "choosing_subagent" }>,
+    presentation: PickerPresentation
+  ): boolean {
+    if (!presentation.selectedId) return false
+    if (!this.#accepts(workflow.operationId, workflow.session)) return false
+    const snapshot = workflow.snapshots.find(candidate => candidate.name === presentation.selectedId)
+    if (!snapshot) return false
+    this.picker.close()
+    this.$state.set({ ...this.$state.get(), workflow: { type: "idle" } })
+    this.#requestInput("")
+    if (!this.#modals.openSubagentActivity(snapshot.name)) {
+      this.#notices.promptWarning(`Subagent ${snapshot.name} is no longer available`)
+      return false
+    }
+    return true
+  }
+
   #activateProjectTrust(
     workflow: Extract<PromptWorkflow, { type: "choosing_project_trust" }>,
     presentation: PickerPresentation
@@ -850,6 +881,9 @@ class PromptController implements PromptStore {
         return true
       case "resume_session":
         this.#openSessions(parentFilter)
+        return true
+      case "subagents":
+        this.#openSubagents(parentFilter)
         return true
       default:
         return assertNever(command)
@@ -983,6 +1017,18 @@ class PromptController implements PromptStore {
       this.#requestInput("")
     }
     void start()
+  }
+
+  #openSubagents(parentFilter?: string): void {
+    const session = this.#interactive.getSession()
+    const operationId = ++this.#nextOperationId
+    const snapshots = session.subagentSnapshots()
+    this.#admitChoosing(
+      subagentFrame(snapshots),
+      { type: "choosing_subagent", operationId, session, snapshots },
+      parentFilter
+    )
+    this.#requestInput("")
   }
 
   #openSessions(parentFilter?: string): void {

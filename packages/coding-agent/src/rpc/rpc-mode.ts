@@ -146,7 +146,7 @@ type CompletionWatch = {
   settled: CompletionObservation | undefined
 }
 
-type RpcConnection = { eventMode: "all" | "none"; completion: CompletionWatch | undefined }
+type RpcConnection = { eventMode: "all" | "none" | "activity"; completion: CompletionWatch | undefined }
 
 type ConnectionState =
   | { readonly type: "open" }
@@ -184,12 +184,12 @@ export async function runRpcMode(session: AgentSession, transport: RpcModeTransp
   let normalOperations = 0
   let interruptActive = false
   // Connection-owned event projection. Default remains "all" for compatibility.
-  let eventMode: "all" | "none" = "all"
+  let eventMode: "all" | "none" | "activity" = "all"
   const connection: RpcConnection = {
     get eventMode() {
       return eventMode
     },
-    set eventMode(mode: "all" | "none") {
+    set eventMode(mode: "all" | "none" | "activity") {
       eventMode = mode
     },
     completion: undefined
@@ -199,10 +199,12 @@ export async function runRpcMode(session: AgentSession, transport: RpcModeTransp
   const currentState = (): ConnectionState => state
   const output = new RpcOutput(transport.writer, message => stop({ type: "output_error", message }))
 
-  const send = (body: FrameBody): void => {
+  const send = (body: FrameBody, droppable = false): void => {
     if (state.type === "closed") return
     sequence++
-    output.enqueue({ version: rpcProtocolVersion, sequence, ...body })
+    const frame = { version: rpcProtocolVersion, sequence, ...body }
+    if (droppable) output.enqueueDroppable(frame)
+    else output.enqueue(frame)
   }
   const stop = (reason: Exclude<RpcModeResult, { type: "settlement_error" }>): void => {
     if (state.type !== "open") return
@@ -221,7 +223,9 @@ export async function runRpcMode(session: AgentSession, transport: RpcModeTransp
         messageCount: session.messages.length
       }
     }
-    if (state.type === "open" && eventMode === "all") send({ type: "session_event", event: projectEvent(event) })
+    if (state.type === "open" && eventMode !== "none") {
+      send({ type: "session_event", event: projectEvent(event) }, eventMode === "activity")
+    }
   })
   const removeAbort = listenForAbort(transport.signal, () => stop({ type: "cancelled" }))
   const decoder = new RpcLineDecoder()
@@ -643,24 +647,32 @@ class RpcOutput {
   }
 
   enqueue(frame: RpcServerFrame): void {
+    this.#enqueue(frame, "required")
+  }
+
+  enqueueDroppable(frame: RpcServerFrame): void {
+    this.#enqueue(frame, "droppable")
+  }
+
+  #enqueue(frame: RpcServerFrame, mode: "required" | "droppable"): void {
     if (this.#closed || this.#failure) return
     let line: string
     try {
       line = `${JSON.stringify(frame)}\n`
     } catch {
-      this.#fail("Could not serialize RPC output")
+      if (mode === "required") this.#fail("Could not serialize RPC output")
       return
     }
     const bytes = Buffer.byteLength(line)
     if (bytes > maxRpcFrameBytes) {
-      this.#fail(`RPC output records cannot exceed ${maxRpcFrameBytes} bytes`)
+      if (mode === "required") this.#fail(`RPC output records cannot exceed ${maxRpcFrameBytes} bytes`)
       return
     }
     if (
       this.#queue.length - this.#head >= maxRpcPendingOutputRecords ||
       this.#pendingBytes + bytes > maxRpcPendingOutputBytes
     ) {
-      this.#fail("RPC output exceeded its pending-write bound")
+      if (mode === "required") this.#fail("RPC output exceeded its pending-write bound")
       return
     }
     this.#queue.push({ line, bytes })

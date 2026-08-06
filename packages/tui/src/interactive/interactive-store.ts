@@ -257,6 +257,8 @@ export function transitionInteractiveState(state: InteractiveState, event: Agent
     case "shell_task_changed":
       promptRevision++
       break
+    case "subagent_changed":
+      break
     case "turn_start":
     case "turn_end":
     case "entry_appended":

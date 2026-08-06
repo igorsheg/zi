@@ -50,6 +50,39 @@ test("ChildZiProcess spawn/wait/close vertical slice against a mock RPC child", 
   }
 }, 15_000)
 
+test("ChildZiProcess retains bounded child session events admitted from RPC", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-child-session-events-"))
+  try {
+    let updates = 0
+    const child = new ChildZiProcess({
+      name: "agent-events",
+      command: [process.execPath, mockChild],
+      cwd: root,
+      processTreeTracker: createProcessTreeTracker(),
+      env: { ...process.env, MOCK_RPC_REPLY: "event-stream-ok", MOCK_RPC_DELAY_MS: "20" },
+      onSessionEvent() {
+        updates++
+      }
+    })
+
+    await child.start()
+    await child.spawnAdmit("retain events")
+    await waitFor(() => child.state.type === "idle", 5_000)
+
+    const retained = child.sessionEvents()
+    expect(updates).toBeGreaterThan(0)
+    expect(retained.name).toBe("agent-events")
+    expect(retained.omittedEvents).toBe(0)
+    expect(retained.events.map(entry => entry.event.type)).toEqual(["message_start", "message_update"])
+    expect(retained.events.map(entry => entry.workCycle)).toEqual([1, 1])
+    expect(retained.events.map(entry => entry.sequence)).toEqual([1, 2])
+
+    await child.close("test")
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+}, 15_000)
+
 test("ChildZiProcess await-idle watch outlives ordinary RPC response deadlines", async () => {
   const root = await mkdtemp(join(tmpdir(), "zi-child-await-idle-deadline-"))
   try {

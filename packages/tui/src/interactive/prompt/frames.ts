@@ -9,7 +9,8 @@ import type {
   SessionInfo,
   SlashCommand,
   SettingsScope,
-  StoredCredential
+  StoredCredential,
+  SubagentSnapshot
 } from "@with-zi/coding-agent"
 
 import { glyphs } from "../../glyphs.js"
@@ -33,6 +34,7 @@ export const promptPickerFrameIds = {
   settings: "settings",
   settingValues: "setting-values",
   sessions: "sessions",
+  subagents: "subagents",
   projectTrust: "project-trust"
 } as const
 
@@ -168,6 +170,23 @@ export function sessionFrame(
 }
 
 export type ProjectTrustSelectionId = "untrusted-session" | "trusted-session" | "trusted-saved" | "untrusted-saved"
+
+export function subagentFrame(snapshots: readonly SubagentSnapshot[]): PickerFrame {
+  return {
+    id: promptPickerFrameIds.subagents,
+    title: "Subagents",
+    filter: "fuzzy",
+    emptyText: "No subagents have been started in this session",
+    rows: snapshots.map(snapshot => ({
+      id: snapshot.name,
+      label: snapshot.name,
+      detail: `[${subagentStatusLabel(snapshot)}]`,
+      ...(snapshot.task ? { metadata: snapshot.task } : {}),
+      searchText: `${snapshot.name} ${snapshot.lifecycle} ${snapshot.task ?? ""} ${snapshot.completion?.status ?? ""}`
+    })),
+    footer: "Enter open live activity · Esc close"
+  }
+}
 
 export function projectTrustFrame(
   cwd: string,
@@ -419,6 +438,30 @@ function effectiveSetting(session: AgentSession, setting: EditableSetting): Edit
       return session.settingsManager.get().retryEnabled
     default:
       return assertNever(setting)
+  }
+}
+
+function subagentStatusLabel(snapshot: SubagentSnapshot): string {
+  const cycle = snapshot.workCycle ?? snapshot.capturedWorkCycle
+  const suffix = cycle === undefined ? "" : ` #${cycle}`
+  if (snapshot.completion) return `${snapshot.completion.status}${suffix}`
+  switch (snapshot.lifecycle) {
+    case "starting":
+      return `starting${suffix}`
+    case "idle":
+      return `idle${suffix}`
+    case "spawn_admitting":
+      return `starting work${suffix}`
+    case "running":
+      return `running${suffix}`
+    case "interrupting":
+      return `interrupting${suffix}`
+    case "closing":
+      return `closing${suffix}`
+    case "exited":
+      return `exited${suffix}`
+    default:
+      return assertNever(snapshot.lifecycle)
   }
 }
 

@@ -9,7 +9,7 @@ import type { ExitGestureController } from "./exit-gesture.js"
 import type { ExternalEditor } from "./external-editor.js"
 import type { InteractiveKeybindings } from "./interactive-keybindings.js"
 import type { InteractiveStore } from "./interactive-store.js"
-import type { PromptSessionActions } from "./prompt/store.js"
+import type { PromptModalActions, PromptSessionActions } from "./prompt/store.js"
 import { PromptView } from "./prompt/view.js"
 import type { SlashController } from "./slash-controller.js"
 import { TranscriptView } from "./transcript/view.js"
@@ -33,7 +33,8 @@ export class SessionScreen {
     syntaxStyle: SyntaxStyle,
     measureTranscriptSync: boolean,
     notices: BuiltInNoticeActions,
-    sessionActions?: PromptSessionActions
+    sessionActions?: PromptSessionActions,
+    modals?: PromptModalActions
   ) {
     this.root = new BoxRenderable(renderer, { flexDirection: "column", flexGrow: 1, minHeight: 0 })
     this.transcript = new TranscriptView(renderer, interactive, keybindings, theme, syntaxStyle, {
@@ -51,7 +52,8 @@ export class SessionScreen {
       externalEditor,
       theme,
       notices,
-      sessionActions
+      sessionActions,
+      modals
     )
     this.root.add(this.transcript.root)
     this.root.add(this.prompt.root)

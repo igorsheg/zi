@@ -94,7 +94,12 @@ import type { SettingsError, SettingsManager, SettingsScope } from "./settings-m
 import { expandSkillCommand, type Skill } from "./skills.js"
 import { builtinSlashCommands, type SlashCommand } from "./slash-commands.js"
 import { clipUtf8, type SubagentCompletion } from "./subagents/child-process.js"
-import { durablePreviewBytes, type SubagentSnapshot, type SubagentSupervisor } from "./subagents/supervisor.js"
+import {
+  durablePreviewBytes,
+  type SubagentSessionEvents,
+  type SubagentSnapshot,
+  type SubagentSupervisor
+} from "./subagents/supervisor.js"
 import { isSubagentToolDetails, type SubagentToolDetails } from "./subagents/tool-details.js"
 import { createSubagentTools } from "./subagents/tools.js"
 import { buildSystemPrompt } from "./system-prompt.js"
@@ -202,6 +207,7 @@ export type AgentSessionEvent =
   | { type: "steering_mode_changed"; mode: QueueMode }
   | { type: "follow_up_mode_changed"; mode: QueueMode }
   | { type: "shell_task_changed"; taskId: string }
+  | { type: "subagent_changed"; name: string }
   | {
       type: "authentication_changed"
       status: "logged_in" | "logged_out"
@@ -563,9 +569,18 @@ export class AgentSession {
         : {})
     })
     this.#unsubscribeSubagents = this.#subagents?.subscribe(event => {
-      if (event.type !== "entry_appended") return
       try {
-        this.#emit({ type: "entry_appended", entry: event.entry })
+        switch (event.type) {
+          case "changed":
+            this.#emit({ type: "subagent_changed", name: event.name })
+            return
+          case "entry_appended":
+            this.#emit({ type: "entry_appended", entry: event.entry })
+            return
+          default:
+            assertNever(event)
+            return
+        }
       } catch {
         // Process ownership cannot cross into an observer.
       }
@@ -703,6 +718,18 @@ export class AgentSession {
 
   get shellTasks(): readonly ShellTaskSnapshot[] {
     return this.#shell?.snapshots() ?? []
+  }
+
+  subagentSnapshots(): readonly SubagentSnapshot[] {
+    return this.#subagents?.snapshots() ?? []
+  }
+
+  subagentSnapshot(name: string): SubagentSnapshot | undefined {
+    return this.subagentSnapshots().find(snapshot => snapshot.name === name)
+  }
+
+  subagentSessionEvents(name: string): SubagentSessionEvents | undefined {
+    return this.#subagents?.sessionEvents(name)
   }
 
   demoteForegroundShellTask(): ShellDemotionResult {

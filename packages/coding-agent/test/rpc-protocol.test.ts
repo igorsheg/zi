@@ -60,6 +60,9 @@ test("RPC request decoding admits only the versioned closed command catalog", ()
   expect(
     decodeRpcRequest({ version: 1, id: "events-1", method: "connection.set_events", params: { mode: "none" } })
   ).toEqual({ version: 1, id: "events-1", method: "connection.set_events", params: { mode: "none" } })
+  expect(
+    decodeRpcRequest({ version: 1, id: "events-2", method: "connection.set_events", params: { mode: "activity" } })
+  ).toEqual({ version: 1, id: "events-2", method: "connection.set_events", params: { mode: "activity" } })
   expect(decodeRpcRequest({ version: 1, id: "commands-1", method: "command.list" })).toEqual({
     version: 1,
     id: "commands-1",

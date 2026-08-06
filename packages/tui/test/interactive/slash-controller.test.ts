@@ -23,6 +23,7 @@ test("SlashController aggregates a session catalog with deterministic built-in p
     "reload",
     "new",
     "resume",
+    "agent",
     "review",
     "skill:pdf"
   ])
@@ -57,6 +58,7 @@ test("SlashController gives extension commands precedence over resources and ret
     "reload",
     "new",
     "resume",
+    "agent",
     "counter",
     "review"
   ])
@@ -165,6 +167,7 @@ test("SlashController resolves selection into typed intents or resource edits", 
     command: { type: "login", provider: "provider" }
   })
   expect(slash.activate("/cop", 4, "copy")).toEqual({ type: "intent", command: { type: "copy" } })
+  expect(slash.activate("/age", 4, "agent")).toEqual({ type: "intent", command: { type: "subagents" } })
   expect(slash.activate("/rev", 4, "review")).toEqual({ type: "edit", text: "/review ", cursorOffset: 8 })
 
   session = commandSession([{ name: "deploy", description: "Deploy current project" }])
@@ -186,6 +189,7 @@ test("SlashController parses only supported built-in invocations", () => {
   expect(slash.parse("/reload")).toEqual({ type: "reload" })
   expect(slash.parse("/new")).toEqual({ type: "new_session" })
   expect(slash.parse("/resume")).toEqual({ type: "resume_session" })
+  expect(slash.parse("/agent")).toEqual({ type: "subagents" })
 })
 
 test("SlashController invalidates a cached catalog without a session generation change", () => {

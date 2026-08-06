@@ -28,6 +28,7 @@ import { ExitGestureController } from "./exit-gesture.js"
 import { type ExternalEditor, SystemExternalEditor } from "./external-editor.js"
 import { InteractiveKeybindings, type InteractiveKeybindingOverrides } from "./interactive-keybindings.js"
 import { createInteractiveStore, type InteractiveStore } from "./interactive-store.js"
+import { ModalLayer } from "./modal-layer.js"
 import {
   NotificationCenter,
   type NotificationAPI,
@@ -81,6 +82,7 @@ export class InteractiveMode {
   readonly #clipboardCopy: ClipboardCopyController
   readonly #diagnosticFlags: TuiDiagnosticFlags
   readonly #diagnostics: TuiDiagnosticsOverlay | undefined
+  readonly #modalLayer: ModalLayer
   readonly #notifications: NotificationCenter
   readonly #builtInNotifications: BuiltInNotificationPresenter
   #initialProjectTrust = createInitialProjectTrustState()
@@ -146,6 +148,7 @@ export class InteractiveMode {
       () => this.store.$generation.get()
     )
     this.#keybindings = new InteractiveKeybindings(keybindingOverrides)
+    this.#modalLayer = new ModalLayer(renderer, this.store, this.#keybindings, theme)
     this.#clipboardCopy = new ClipboardCopyController(
       renderer,
       this.#keybindings,
@@ -160,6 +163,7 @@ export class InteractiveMode {
       id: "interactive-mode",
       width: "100%",
       height: "100%",
+      position: "relative",
       flexDirection: "column",
       backgroundColor: theme.surface.app
     })
@@ -203,6 +207,7 @@ export class InteractiveMode {
           )
         : undefined
     if (this.#diagnostics) this.root.add(this.#diagnostics.root)
+    this.root.add(this.#modalLayer.root)
     renderer.root.add(this.root)
     this.#screen.prompt.focus()
     renderer.on(CliRenderEvents.SELECTION, this.#preservePromptFocus)
@@ -225,6 +230,7 @@ export class InteractiveMode {
     if (this.#sessionRuntime && this.#sessionRuntime.session !== session) {
       throw new Error("InteractiveMode can only bind the current session runtime session")
     }
+    this.#modalLayer.close("session_replaced")
     this.store.replaceSession(session)
     this.#showBootstrapWarning(diagnostic)
     this.#showExtensionWarning(session)
@@ -245,6 +251,7 @@ export class InteractiveMode {
     this.#settleInitialProjectTrust()
     this.#releaseGeneration()
     this.#clipboardCopy.dispose()
+    this.#modalLayer.dispose()
     this.#renderer.off(CliRenderEvents.SELECTION, this.#preservePromptFocus)
     this.#diagnostics?.destroy()
     this.#builtInNotifications.dispose()
@@ -258,7 +265,7 @@ export class InteractiveMode {
   }
 
   #preservePromptFocus = (): void => {
-    this.#screen.prompt.focus()
+    if (!this.#modalLayer.isOpen()) this.#screen.prompt.focus()
   }
 
   #showBootstrapWarning(diagnostic: SessionBootstrapDiagnostic | undefined): void {
@@ -341,7 +348,8 @@ export class InteractiveMode {
       this.#syntaxStyle,
       this.#diagnosticFlags.showTimeToFirstDraw || this.#diagnosticFlags.showStats || this.#diagnosticFlags.showMemory,
       notices,
-      this.#sessionActions
+      this.#sessionActions,
+      { openSubagentActivity: name => this.#modalLayer.openSubagentActivity(name) }
     )
   }
 }

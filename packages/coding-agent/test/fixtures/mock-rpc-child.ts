@@ -70,6 +70,7 @@ type RequestParams = {
 
 const messages: Message[] = []
 let busy = false
+let eventMode: "all" | "none" = "all"
 let activeDelayMs = delayMs
 let activeCompletionId: string | undefined
 let completionRevision = 0
@@ -87,6 +88,10 @@ const send = (value: Record<string, unknown>): void => {
 const log = (method: string): void => {
   if (!logPath) return
   appendFileSync(logPath, `${method}\n`)
+}
+
+const sendEvent = (event: Record<string, unknown>): void => {
+  if (eventMode === "all") send({ type: "session_event", event })
 }
 
 send({
@@ -116,7 +121,8 @@ async function handle(request: { id: string; method: string; params?: RequestPar
   log(method)
 
   if (method === "connection.set_events") {
-    send({ type: "response", id, method, ok: true, result: { mode: request.params?.mode ?? "all" } })
+    eventMode = request.params?.mode === "none" ? "none" : "all"
+    send({ type: "response", id, method, ok: true, result: { mode: eventMode } })
     return
   }
   if (method === "session.get_state") {
@@ -167,6 +173,8 @@ async function handle(request: { id: string; method: string; params?: RequestPar
       content: [{ type: "text", text: text === "__second_evidence__" ? "second-cycle-evidence" : reply }],
       ...(errorMessage ? { errorMessage } : {})
     })
+    sendEvent({ type: "message_start", message: messages.at(-1) })
+    sendEvent({ type: "message_update", message: messages.at(-1) })
     busy = true
     if (promptResponseDelayMs > 0) await Bun.sleep(promptResponseDelayMs)
     send({

@@ -1007,6 +1007,7 @@ export class TranscriptView {
   }
 
   #onKeyPress = (key: KeyEvent): void => {
+    if (key.defaultPrevented || key.propagationStopped) return
     const action = this.#keybindings.transcriptAction(key)
     if (!action) return
     key.preventDefault()

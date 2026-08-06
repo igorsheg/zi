@@ -15,7 +15,7 @@ export const maxRpcCommandNameBytes = 64
 export const maxRpcCommandArgumentsBytes = 256 * 1024
 
 export type RpcInputDelivery = "direct" | "steer" | "follow_up" | "continue"
-export type RpcEventMode = "all" | "none"
+export type RpcEventMode = "all" | "none" | "activity"
 
 export type RpcRequest =
   | { readonly version: 1; readonly id: string; readonly method: "session.get_state" }
@@ -252,8 +252,8 @@ export function decodeRpcRequest(value: unknown): RpcRequest {
       requireKeys(value, ["version", "id", "method", "params"], requestId)
       const params = requireRecord(value.params, "connection.set_events params", requestId)
       requireKeys(params, ["mode"], requestId)
-      if (params.mode !== "all" && params.mode !== "none") {
-        throw new RpcRequestError("invalid_request", "Event mode must be all or none", requestId)
+      if (params.mode !== "all" && params.mode !== "none" && params.mode !== "activity") {
+        throw new RpcRequestError("invalid_request", "Event mode must be all, none, or activity", requestId)
       }
       return { version: 1, id: requestId, method: "connection.set_events", params: { mode: params.mode } }
     }

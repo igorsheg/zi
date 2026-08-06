@@ -70,6 +70,7 @@ export class ClipboardCopyController {
   }
 
   #onKeyPress = (key: KeyEvent): void => {
+    if (key.defaultPrevented || key.propagationStopped) return
     if (!this.#keybindings.matches(key, "app.selection.copy")) return
     const selection = this.#renderer.getSelection()
     const text = selection?.getSelectedText()

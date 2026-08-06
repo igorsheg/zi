@@ -8,7 +8,8 @@ const definitions = [
   { name: "copy", description: "Copy last assistant message to clipboard" },
   { name: "reload", description: "Reload settings, extensions, skills, prompts, subagent profiles, and context files" },
   { name: "new", description: "Start a new session" },
-  { name: "resume", description: "Browse and resume saved sessions" }
+  { name: "resume", description: "Browse and resume saved sessions" },
+  { name: "agent", description: "Browse subagents and open live activity" }
 ] as const
 
 export type BuiltinSlashCommandName = (typeof definitions)[number]["name"]

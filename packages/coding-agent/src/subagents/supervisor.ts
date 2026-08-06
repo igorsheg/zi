@@ -4,7 +4,13 @@ import type { ThinkingLevel } from "@earendil-works/pi-agent-core"
 
 import type { ProcessTreeTracker } from "../processes/process-tree.js"
 import type { SessionEntry, SessionManager, SubagentEntry, SubagentEntryInput } from "../session-manager.js"
-import { ChildZiProcess, clipUtf8, type ChildSnapshot, type SubagentCompletion } from "./child-process.js"
+import {
+  ChildZiProcess,
+  clipUtf8,
+  type ChildSessionEventsSnapshot,
+  type ChildSnapshot,
+  type SubagentCompletion
+} from "./child-process.js"
 import { internalSubagentApiKeyEnvironment } from "./invocation.js"
 import { defaultWaitTimeoutMs, isSubagentWaitTimeout, maxWaitTimeoutMs } from "./wait-policy.js"
 import { defaultSubagentWorkTimeoutMs, isSubagentWorkTimeout } from "./work-policy.js"
@@ -48,6 +54,8 @@ export interface SubagentSnapshot {
   readonly completionDelivery?: CompletionDelivery["type"]
 }
 
+export type SubagentSessionEvents = ChildSessionEventsSnapshot
+
 export interface SubagentStatus {
   readonly workingNames: readonly string[]
   readonly readyNames: readonly string[]
@@ -74,6 +82,7 @@ interface LiveRecord {
 
 interface ExitedRecord {
   readonly snapshot: ChildSnapshot
+  readonly sessionEvents?: SubagentSessionEvents
   readonly exitedAt: number
   readonly task?: string
 }
@@ -147,6 +156,13 @@ export class SubagentSupervisor {
       ...[...this.#live.values()].map(record => this.#snapshot(record.child.snapshot(), record.task)),
       ...this.#exited.map(record => this.#snapshot(record.snapshot, record.task))
     ])
+  }
+
+  sessionEvents(name: string): SubagentSessionEvents | undefined {
+    validateSubagentName(name)
+    const live = this.#live.get(name)
+    if (live) return live.child.sessionEvents()
+    return this.#exited.find(record => record.snapshot.name === name)?.sessionEvents
   }
 
   capacity(): SubagentCapacity {
@@ -274,7 +290,8 @@ export class SubagentSupervisor {
         processTreeTracker: this.#processTreeTracker,
         workTimeoutMs: this.workTimeoutMs,
         onStateChange: () => this.#childChanged(name),
-        onCompletion: completion => this.#completion(completion)
+        onCompletion: completion => this.#completion(completion),
+        onSessionEvent: () => this.#presentationChanged(name)
       })
     } catch (cause) {
       this.#completionReservations.delete(reservationKey)
@@ -722,7 +739,12 @@ export class SubagentSupervisor {
       })
     }
     const snapshot = record.child.snapshot()
-    this.#retainExited({ snapshot, exitedAt: Date.now(), task: record.task })
+    this.#retainExited({
+      snapshot,
+      sessionEvents: record.child.sessionEvents(),
+      exitedAt: Date.now(),
+      task: record.task
+    })
     try {
       const outcome = state.type === "exited" ? JSON.stringify(state.outcome) : snapshot.lifecycle
       this.#append({ event: "exited", name, outcome: clipUtf8(outcome, durablePreviewBytes).text })
@@ -997,6 +1019,10 @@ export class SubagentSupervisor {
   #changed(name: string): void {
     this.#emit({ type: "changed", name })
     this.#notifyWaiters()
+  }
+
+  #presentationChanged(name: string): void {
+    this.#emit({ type: "changed", name })
   }
 
   #emit(event: SubagentSupervisorEvent): void {

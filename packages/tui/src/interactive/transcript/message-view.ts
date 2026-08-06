@@ -17,6 +17,12 @@ import stringWidth from "string-width"
 
 import type { Theme } from "../../theme.js"
 import type { ActiveTool } from "../interactive-store.js"
+import {
+  visibleAssistantParts,
+  type AssistantMessage,
+  type AssistantProjectionPart as StreamingPart,
+  type AssistantToolInclusion
+} from "./assistant-projection.js"
 import type { TranscriptItemView } from "./item.js"
 import { ToolCallView, type ToolViewFrame } from "./tool-view.js"
 
@@ -118,12 +124,6 @@ function createUserMessage(ctx: RenderContext, content: string, theme: Theme): B
   return root
 }
 
-type AssistantMessage = Extract<AgentMessage, { role: "assistant" }>
-type StreamingPart =
-  | { readonly kind: "thinking"; readonly content: string }
-  | { readonly kind: "answer"; readonly content: string }
-  | { readonly kind: "tool"; readonly tool: ActiveTool }
-  | { readonly kind: "omitted-tools"; readonly count: number }
 type StreamingPartView =
   | { readonly kind: "thinking"; readonly root: BoxRenderable; readonly content: MarkdownRenderable; value: string }
   | { readonly kind: "answer"; readonly root: BoxRenderable; readonly content: MarkdownRenderable; value: string }
@@ -136,7 +136,7 @@ type StreamingPartView =
     }
   | { readonly kind: "omitted-tools"; readonly root: TextRenderable; count: number }
 
-export interface AssistantToolViewOwner {
+export interface AssistantToolViewOwner extends AssistantToolInclusion {
   includes(id: string): boolean
   create(owner: StreamingAssistantView, tool: ActiveTool): ToolCallView
   update(view: ToolCallView, tool: ActiveTool): boolean
@@ -221,7 +221,7 @@ export class StreamingAssistantView {
   }
 
   update(message: AssistantMessage): boolean {
-    const parts = visibleStreamingParts(message, this.#toolViews)
+    const parts = visibleAssistantParts(message, this.#toolViews)
     const error = message.errorMessage || undefined
     let firstChangedKind = Math.min(parts.length, this.#parts.length)
     for (let index = 0; index < firstChangedKind; index++) {
@@ -394,84 +394,6 @@ function createMarkdown(
     tableOptions: { style: "grid" },
     renderNode: renderMarkdownNode
   })
-}
-
-const maxAssistantToolCalls = 64
-
-function visibleStreamingParts(message: AssistantMessage, toolViews?: AssistantToolViewOwner): StreamingPart[] {
-  const parts: StreamingPart[] = []
-  let directToolCount = 0
-  let omittedIndex: number | undefined
-  for (const part of message.content) {
-    if (part.type === "thinking") {
-      if (part.thinking.trim() || parts.at(-1)?.kind === "thinking") {
-        appendAssistantText(parts, "thinking", part.thinking)
-      }
-      continue
-    }
-    if (part.type === "text" && (part.text.trim() || parts.at(-1)?.kind === "answer")) {
-      appendAssistantText(parts, "answer", part.text)
-    } else if (part.type === "toolCall" && part.id) {
-      const included = toolViews ? toolViews.includes(part.id) : directToolCount < maxAssistantToolCalls
-      directToolCount++
-      if (included) {
-        parts.push({ kind: "tool", tool: toolFromMessage(message, part) })
-      } else if (omittedIndex === undefined) {
-        omittedIndex = parts.length
-        parts.push({ kind: "omitted-tools", count: 1 })
-      } else {
-        const omitted = parts[omittedIndex]
-        if (omitted?.kind === "omitted-tools") parts[omittedIndex] = { ...omitted, count: omitted.count + 1 }
-      }
-    }
-  }
-  const visible: StreamingPart[] = []
-  for (const part of parts) {
-    if (part.kind === "thinking") {
-      const content = part.content.trimEnd()
-      if (content.trim()) visible.push({ kind: "thinking", content })
-    } else if (part.kind === "answer") {
-      const content = part.content.trim()
-      if (content) visible.push({ kind: "answer", content })
-    } else {
-      visible.push(part)
-    }
-  }
-  return visible
-}
-
-function appendAssistantText(parts: StreamingPart[], kind: "thinking" | "answer", content: string): void {
-  const previous = parts.at(-1)
-  if (previous?.kind === kind) {
-    parts[parts.length - 1] = { kind, content: previous.content + content }
-  } else {
-    parts.push({ kind, content })
-  }
-}
-
-function toolFromMessage(
-  message: AssistantMessage,
-  part: Extract<AssistantMessage["content"][number], { type: "toolCall" }>
-): ActiveTool {
-  if (message.stopReason === "aborted") {
-    return {
-      id: part.id,
-      name: part.name,
-      args: part.arguments,
-      status: "aborted",
-      result: { content: [{ type: "text", text: "Operation aborted" }] }
-    }
-  }
-  if (message.stopReason === "error") {
-    return {
-      id: part.id,
-      name: part.name,
-      args: part.arguments,
-      status: "failed",
-      result: { content: [{ type: "text", text: message.errorMessage || "Error" }] }
-    }
-  }
-  return { id: part.id, name: part.name, args: part.arguments, status: "preparing" }
 }
 
 function omittedToolsText(count: number): string {

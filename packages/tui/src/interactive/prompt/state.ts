@@ -8,6 +8,7 @@ import type {
   SettingsScope,
   SessionInfo,
   StoredCredential,
+  SubagentSnapshot,
   ThinkingLevel
 } from "@with-zi/coding-agent"
 
@@ -107,6 +108,12 @@ export type PromptWorkflow =
       readonly operationId: number
       readonly session: AgentSession
       readonly sessions: readonly SessionInfo[]
+    }
+  | {
+      readonly type: "choosing_subagent"
+      readonly operationId: number
+      readonly session: AgentSession
+      readonly snapshots: readonly SubagentSnapshot[]
     }
   | { readonly type: "resuming_session"; readonly operationId: number; readonly session: AgentSession }
   | { readonly type: "cancelling_session"; readonly operationId: number; readonly session: AgentSession }

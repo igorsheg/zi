@@ -22,6 +22,9 @@ export const workTimeoutSettlementMs = 10_000
 export const interruptSettlementMs = 10_000
 export const rpcCloseGraceMs = 5_000
 export const rpcCloseForceMs = 5_000
+export const maxChildSessionEvents = 256
+export const maxChildSessionEventBytes = 256 * 1024
+export const maxChildSessionEventBufferBytes = 1024 * 1024
 
 export type ChildLifecycleState =
   | { readonly type: "starting"; readonly startedAt: number }
@@ -64,6 +67,23 @@ export type ChildSnapshot = {
   readonly elapsedMs?: number | undefined
   readonly sessionId?: string | undefined
   readonly completion?: SubagentCompletion | undefined
+}
+
+export type ChildSerializableSessionEvent = Readonly<Record<string, unknown>> & { readonly type: string }
+
+export type ChildSessionEvent = {
+  readonly sequence: number
+  readonly rpcSequence: number
+  readonly receivedAt: number
+  readonly workCycle?: number | undefined
+  readonly event: ChildSerializableSessionEvent
+}
+
+export type ChildSessionEventsSnapshot = {
+  readonly name: string
+  readonly events: readonly ChildSessionEvent[]
+  readonly omittedEvents: number
+  readonly omittedBytes: number
 }
 
 type PendingRequest = {
@@ -112,6 +132,7 @@ export type ChildZiProcessOptions = {
   readonly interruptSettlementMs?: number
   readonly onStateChange?: () => void
   readonly onCompletion?: (completion: SubagentCompletion) => void
+  readonly onSessionEvent?: () => void
   readonly onFatal?: (error: Error) => void
 }
 
@@ -121,6 +142,7 @@ export class ChildZiProcess {
   readonly #exited: Promise<ProcessExit>
   readonly #onStateChange: (() => void) | undefined
   readonly #onCompletion: ((completion: SubagentCompletion) => void) | undefined
+  readonly #onSessionEvent: (() => void) | undefined
   readonly #onFatal: ((error: Error) => void) | undefined
   readonly #workTimeoutMs: number
   readonly #responseTimeoutMs: number
@@ -146,6 +168,11 @@ export class ChildZiProcess {
   #pendingWriteBytes = 0
   #stderr = ""
   #latestCompletion: SubagentCompletion | undefined
+  #sessionEvents: ChildSessionEvent[] = []
+  #sessionEventBytes = 0
+  #omittedSessionEvents = 0
+  #omittedSessionEventBytes = 0
+  #nextSessionEventSequence = 1
   #cycleStartedAt = 0
   #workDeadline: WorkDeadlineState = { type: "none" }
   #interruptDeadline: InterruptDeadlineState = { type: "none" }
@@ -154,6 +181,7 @@ export class ChildZiProcess {
     this.name = options.name
     this.#onStateChange = options.onStateChange
     this.#onCompletion = options.onCompletion
+    this.#onSessionEvent = options.onSessionEvent
     this.#onFatal = options.onFatal
     this.#workTimeoutMs = options.workTimeoutMs ?? defaultSubagentWorkTimeoutMs
     this.#responseTimeoutMs = options.responseTimeoutMs ?? rpcResponseTimeoutMs
@@ -226,6 +254,15 @@ export class ChildZiProcess {
     }
   }
 
+  sessionEvents(): ChildSessionEventsSnapshot {
+    return Object.freeze({
+      name: this.name,
+      events: Object.freeze([...this.#sessionEvents]),
+      omittedEvents: this.#omittedSessionEvents,
+      omittedBytes: this.#omittedSessionEventBytes
+    })
+  }
+
   async start(): Promise<void> {
     const reached = await settleWithin(
       Promise.all([this.#ready.promise, this.#processScope.admitted]).then(() => undefined),
@@ -236,7 +273,7 @@ export class ChildZiProcess {
       this.#fail(error)
       throw error
     }
-    await this.#request("connection.set_events", { mode: "none" }, this.#responseTimeoutMs)
+    await this.#request("connection.set_events", { mode: "activity" }, this.#responseTimeoutMs)
     const state = await this.#request("session.get_state", undefined, this.#responseTimeoutMs)
     if (isRecord(state) && typeof state.sessionId === "string") this.#sessionId = state.sessionId
     this.#transition({ type: "idle", nextWorkCycle: 1 })
@@ -757,7 +794,7 @@ export class ChildZiProcess {
         this.#ready.resolve()
         return
       case "session_event":
-        // Events should be suppressed after startup; ignore any that race the mode change.
+        this.#receiveSessionEvent(frame)
         return
       case "response":
         this.#receiveResponse(frame)
@@ -768,6 +805,50 @@ export class ChildZiProcess {
         )
       default:
         throw new Error(`Subagent RPC unknown frame type: ${String(frame.type)}`)
+    }
+  }
+
+  #receiveSessionEvent(frame: Record<string, unknown>): void {
+    const event = cloneRpcSessionEvent(frame.event)
+    const rpcSequence = frame.sequence
+    if (typeof rpcSequence !== "number" || !Number.isSafeInteger(rpcSequence) || !event) {
+      throw new Error("Subagent RPC emitted an invalid session event")
+    }
+    const serialized = JSON.stringify(event)
+    const bytes = Buffer.byteLength(serialized)
+    if (bytes > maxChildSessionEventBytes) {
+      this.#omittedSessionEvents++
+      this.#omittedSessionEventBytes += bytes
+      this.#notifySessionEvent()
+      return
+    }
+    this.#sessionEvents.push({
+      sequence: this.#nextSessionEventSequence++,
+      rpcSequence,
+      receivedAt: Date.now(),
+      ...currentWorkCycle(this.#state),
+      event
+    })
+    this.#sessionEventBytes += bytes
+    while (
+      this.#sessionEvents.length > maxChildSessionEvents ||
+      this.#sessionEventBytes > maxChildSessionEventBufferBytes
+    ) {
+      const removed = this.#sessionEvents.shift()
+      if (!removed) break
+      const removedBytes = Buffer.byteLength(JSON.stringify(removed.event))
+      this.#sessionEventBytes = Math.max(0, this.#sessionEventBytes - removedBytes)
+      this.#omittedSessionEvents++
+      this.#omittedSessionEventBytes += removedBytes
+    }
+    this.#notifySessionEvent()
+  }
+
+  #notifySessionEvent(): void {
+    try {
+      this.#onSessionEvent?.()
+    } catch {
+      // Process ownership cannot cross into an observer.
     }
   }
 
@@ -1262,12 +1343,55 @@ function deadlineRemainingMs(endsAt: number): number {
   return Math.max(0, endsAt - Date.now())
 }
 
+function currentWorkCycle(state: ChildLifecycleState): { readonly workCycle?: number } {
+  switch (state.type) {
+    case "spawn_admitting":
+    case "running":
+    case "interrupting":
+      return { workCycle: state.workCycle }
+    case "idle":
+      return { workCycle: Math.max(0, state.nextWorkCycle - 1) }
+    case "starting":
+    case "closing":
+    case "exited":
+      return {}
+    default:
+      return assertNever(state)
+  }
+}
+
 function isPositiveTimeout(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)
+}
+
+function cloneRpcSessionEvent(value: unknown): ChildSerializableSessionEvent | undefined {
+  if (!isRecord(value) || typeof value.type !== "string") return undefined
+  try {
+    const copy: unknown = JSON.parse(JSON.stringify(value))
+    if (!isRecord(copy) || typeof copy.type !== "string") return undefined
+    const event: ChildSerializableSessionEvent = { ...copy, type: copy.type }
+    return deepFreeze(event)
+  } catch {
+    return undefined
+  }
+}
+
+function deepFreeze<T>(value: T): T {
+  if (Array.isArray(value)) {
+    for (const item of value) deepFreeze(item)
+    return Object.freeze(value)
+  }
+  if (!isRecord(value)) return value
+  for (const item of Object.values(value)) deepFreeze(item)
+  return Object.freeze(value)
+}
+
+function assertNever(value: never): never {
+  throw new Error(`Unexpected child lifecycle: ${String(value)}`)
 }
 
 function deferred<T>() {
