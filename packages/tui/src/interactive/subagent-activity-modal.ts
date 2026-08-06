@@ -172,10 +172,9 @@ const hiddenRowKey = "hidden"
  * readable from the frame alone.
  */
 export function activityStatus(snapshot: SubagentSnapshot): ActivityStatus {
-  const elapsedMs = snapshot.elapsedMs ?? snapshot.completion?.durationMs
+  const completion = presentedCompletion(snapshot)
+  const elapsedMs = snapshot.elapsedMs ?? completion?.durationMs
   const elapsed = elapsedMs === undefined ? "" : formatDuration(elapsedMs)
-  const completion = snapshot.completion
-  if (completion) return { label: completion.status, elapsed }
   switch (snapshot.lifecycle) {
     case "starting":
       return { label: "starting", elapsed }
@@ -187,9 +186,9 @@ export function activityStatus(snapshot: SubagentSnapshot): ActivityStatus {
     case "closing":
       return { label: "closing", elapsed }
     case "idle":
-      return { label: "idle", elapsed }
+      return { label: completion?.status ?? "idle", elapsed }
     case "exited":
-      return { label: "exited", elapsed }
+      return { label: completion?.status ?? "exited", elapsed }
     default:
       return assertNever(snapshot.lifecycle)
   }
@@ -229,7 +228,7 @@ function activityBlocks(
   const reverseBlocks: ActivityBlock[] = []
   const actionOutcomes = new Map<string, "done" | "failed">()
   const seenActions = new Set<string>()
-  const completion = snapshot.completion
+  const completion = presentedCompletion(snapshot)
   let assistantProjected = false
 
   if (completion) {
@@ -242,7 +241,9 @@ function activityBlocks(
   const events = sessionEvents?.events ?? []
   let index = events.length - 1
   for (; index >= 0 && reverseBlocks.length < maxBlocks; index--) {
-    const event = events[index]?.event
+    const retained = events[index]
+    if (snapshot.workCycle !== undefined && retained?.workCycle !== snapshot.workCycle) continue
+    const event = retained?.event
     if (!event) continue
     switch (event.type) {
       case "tool_execution_end": {
@@ -466,6 +467,11 @@ function formatDuration(ms: number): string {
   const minutes = Math.floor(seconds / 60)
   if (minutes < 60) return `${minutes}m ${seconds % 60}s`
   return `${Math.floor(minutes / 60)}h ${minutes % 60}m`
+}
+
+function presentedCompletion(snapshot: SubagentSnapshot): SubagentSnapshot["completion"] {
+  if (snapshot.lifecycle !== "idle" && snapshot.lifecycle !== "exited") return undefined
+  return snapshot.completion?.workCycle === snapshot.workCycle ? snapshot.completion : undefined
 }
 
 function assertNever(value: never): never {

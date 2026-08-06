@@ -640,6 +640,7 @@ export class SubagentSupervisor {
   #recover(): void {
     const latest = new Map<string, SubagentEntry>()
     const tasks = new Map<string, string>()
+    const workCycles = new Map<string, number>()
     const finishedKeys = new Set<string>()
     const deliveredKeys = new Set<string>()
     for (const entry of this.#sessionManager.subagentEntries()) {
@@ -650,12 +651,16 @@ export class SubagentSupervisor {
         if (oldest === undefined) break
         latest.delete(oldest)
         tasks.delete(oldest)
+        workCycles.delete(oldest)
       }
       if (entry.event === "starting") {
         if (this.#names.has(entry.name)) throw new Error(`Duplicate subagent name in session journal: ${entry.name}`)
         this.#names.add(entry.name)
       }
-      if (entry.event === "work_cycle_started" && entry.task) tasks.set(entry.name, entry.task)
+      if (entry.event === "work_cycle_started") {
+        workCycles.set(entry.name, entry.workCycle)
+        if (entry.task) tasks.set(entry.name, entry.task)
+      }
       if (entry.event === "work_cycle_finished") {
         const key = completionKey(entry.name, entry.workCycle)
         if (finishedKeys.has(key)) continue
@@ -697,8 +702,9 @@ export class SubagentSupervisor {
         this.#append({ event: "lost", name, reason: "session_restored" })
       }
       const task = tasks.get(name)
+      const workCycle = workCycles.get(name)
       this.#retainExited({
-        snapshot: { name, lifecycle: "exited" },
+        snapshot: { name, lifecycle: "exited", ...(workCycle !== undefined ? { workCycle } : {}) },
         exitedAt: Date.parse(entry.timestamp),
         ...(task ? { task } : {})
       })
@@ -740,7 +746,10 @@ export class SubagentSupervisor {
     }
     const snapshot = record.child.snapshot()
     this.#retainExited({
-      snapshot,
+      snapshot:
+        snapshot.workCycle === undefined && record.lastWorkCycle > 0
+          ? { ...snapshot, workCycle: record.lastWorkCycle }
+          : snapshot,
       sessionEvents: record.child.sessionEvents(),
       exitedAt: Date.now(),
       task: record.task

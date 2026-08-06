@@ -62,7 +62,7 @@ test("SubagentSupervisor spawns, durably publishes completion, waits, and closes
     expect(harness.supervisor.status()).toEqual({ workingNames: [], readyNames: [] })
 
     await harness.supervisor.close(name)
-    expect(harness.supervisor.snapshots()[0]).toMatchObject({ name, lifecycle: "exited" })
+    expect(harness.supervisor.snapshots()[0]).toMatchObject({ name, lifecycle: "exited", workCycle: 1 })
     expect(harness.sessionManager.subagentEntries().at(-1)).toMatchObject({ event: "exited", name })
   } finally {
     await harness.dispose()
@@ -85,7 +85,10 @@ test("durable completions can be delivered to parent context exactly once", asyn
 
     expect(delivered).toEqual(["1:context-ok", "2:context-ok"])
     expect(harness.supervisor.status()).toEqual({ workingNames: [], readyNames: [] })
-    expect(harness.supervisor.snapshots()[0]).toMatchObject({ completionDelivery: "delivered" })
+    expect(harness.supervisor.snapshots()[0]).toMatchObject({ workCycle: 2, completionDelivery: "delivered" })
+
+    await harness.supervisor.close(name)
+    expect(harness.supervisor.snapshots()[0]).toMatchObject({ lifecycle: "exited", workCycle: 2 })
   } finally {
     await harness.dispose()
   }
@@ -826,6 +829,7 @@ test("work-cycle timeout evidence survives supervisor restoration", async () => 
     expect(await supervisor.wait(["timed-out-worker"], 0)).toEqual([
       expect.objectContaining({
         name: "timed-out-worker",
+        workCycle: 1,
         completionDelivery: "durable",
         completion: expect.objectContaining({
           status: "failed",
@@ -878,7 +882,7 @@ test("recovered completion and exited projections stay bounded", async () => {
   })
   try {
     expect(supervisor.snapshots()).toHaveLength(32)
-    expect(supervisor.snapshots()[0]).toMatchObject({ name: "worker-8", task: "task-8", elapsedMs: 1 })
+    expect(supervisor.snapshots()[0]).toMatchObject({ name: "worker-8", workCycle: 1, task: "task-8", elapsedMs: 1 })
     expect(supervisor.spawn("worker-0", "duplicate evicted child")).rejects.toThrow(
       "Subagent name already in use: worker-0"
     )

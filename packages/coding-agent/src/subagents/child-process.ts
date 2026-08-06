@@ -666,7 +666,6 @@ export class ChildZiProcess {
       throw new Error("Subagent process scope exceeded tracked descendant capacity")
     }
     if (!this.#ownsIdleCompletion(revision, workCycle)) return
-    if (!this.#ownsIdleCompletion(revision, workCycle)) return
     this.#clearWorkDeadline(workCycle)
     this.#clearInterruptDeadline(workCycle)
     const terminal = this.#state

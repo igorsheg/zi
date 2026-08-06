@@ -146,7 +146,10 @@ export class ModalLayer {
     const state = this.#state
     if (state.type !== "subagent_activity") return
     const snapshot = this.#interactive.getSession().subagentSnapshot(state.name)
-    if (!snapshot) return
+    if (!snapshot) {
+      this.close("subagent_unavailable")
+      return
+    }
     this.#view.tick(snapshot)
     this.#setLive(needsElapsedTick(snapshot))
   }
@@ -191,7 +194,7 @@ function hasCursorVisibility(value: unknown): value is CursorRenderable {
 }
 
 function needsElapsedTick(snapshot: SubagentSnapshot): boolean {
-  if (snapshot.completion || snapshot.elapsedMs === undefined) return false
+  if (snapshot.elapsedMs === undefined) return false
   switch (snapshot.lifecycle) {
     case "starting":
     case "spawn_admitting":

@@ -230,6 +230,66 @@ test("the dialog title owns lifecycle and duration wording", () => {
     label: "cancelled",
     elapsed: "1m 5s"
   })
+
+  const previous = completedSnapshot({ status: "completed", text: "Previous result." })
+  expect(activityStatus({ ...previous, lifecycle: "interrupting", workCycle: 2, elapsedMs: 3_000 })).toEqual({
+    label: "interrupting",
+    elapsed: "3s"
+  })
+  expect(activityStatus({ ...previous, lifecycle: "closing", workCycle: 2, elapsedMs: 4_000 })).toEqual({
+    label: "closing",
+    elapsed: "4s"
+  })
+})
+
+test("a reused child presents its active cycle instead of an older pending completion", () => {
+  const previous = completedSnapshot({ status: "completed", text: "First cycle result." })
+  const snapshot: SubagentSnapshot = {
+    ...previous,
+    lifecycle: "running",
+    workCycle: 2,
+    task: "Review the updated implementation.",
+    elapsedMs: 3_000
+  }
+  const history: SubagentSessionEvents = {
+    name: snapshot.name,
+    omittedEvents: 0,
+    omittedBytes: 0,
+    events: [
+      ...events(
+        [{ type: "tool_execution_start", toolCallId: "old", toolName: "bash", args: { command: "old check" } }],
+        1
+      ).events,
+      ...events(
+        [{ type: "tool_execution_start", toolCallId: "new", toolName: "bash", args: { command: "new check" } }],
+        2
+      ).events
+    ]
+  }
+
+  expect(activityStatus(snapshot)).toEqual({ label: "working", elapsed: "3s" })
+  expect(subagentActivityRows(snapshot, history, { width: 80, maxRows: 12 })).toEqual([
+    { kind: "action", status: "running", text: "Run new check" }
+  ])
+})
+
+test("an exited reused child keeps the terminal cycle separate from older completion evidence", () => {
+  const previous = completedSnapshot({ status: "completed", text: "First cycle result." })
+  const snapshot: SubagentSnapshot = { ...previous, lifecycle: "exited", workCycle: 2 }
+  const history: SubagentSessionEvents = {
+    name: snapshot.name,
+    omittedEvents: 0,
+    omittedBytes: 0,
+    events: [
+      ...events([{ type: "message_end", message: assistantMessage("First cycle result.") }], 1).events,
+      ...events([{ type: "message_end", message: assistantMessage("Second cycle terminal activity.") }], 2).events
+    ]
+  }
+
+  expect(activityStatus(snapshot)).toEqual({ label: "exited", elapsed: "" })
+  expect(subagentActivityRows(snapshot, history, { width: 80, maxRows: 12 })).toEqual([
+    { kind: "prose", text: "Second cycle terminal activity." }
+  ])
 })
 
 test("the dialog keeps a stable share of the terminal instead of following its content", () => {
@@ -475,7 +535,12 @@ test("the modal owner restores focus and closes when its retained subagent is ev
   models.setProvider(provider.provider)
   const runtime = await createTestAgentRuntime({ cwd: "/repo", models, session: { type: "new", persist: false } })
   const setup = await createInteractiveTest(runtime.session, { width: 46, height: 25 })
-  const snapshot = runningSnapshot()
+  const snapshot: SubagentSnapshot = {
+    ...completedSnapshot({ status: "completed", text: "Previous cycle result." }),
+    lifecycle: "running",
+    workCycle: 2,
+    elapsedMs: 12_000
+  }
   let available = true
   let modalSubscriber: ((event: AgentSessionEvent) => void) | undefined
 
@@ -510,6 +575,7 @@ test("the modal owner restores focus and closes when its retained subagent is ev
     }
     expect(layer.visible).toBe(true)
     expect(modal.focused).toBe(true)
+    expect(setup.renderer.liveRequestCount).toBe(1)
     expect(prompt.focused).toBe(false)
     expect(prompt.showCursor).toBe(false)
 
@@ -522,6 +588,7 @@ test("the modal owner restores focus and closes when its retained subagent is ev
     await setup.renderOnce()
 
     expect(layer.visible).toBe(false)
+    expect(setup.renderer.liveRequestCount).toBe(0)
     expect(prompt.focused).toBe(true)
     expect(prompt.showCursor).toBe(true)
   } finally {
@@ -584,7 +651,7 @@ function assistantMessage(text: string): Record<string, unknown> {
   return { role: "assistant", content: [{ type: "text", text }] }
 }
 
-function events(payloads: readonly Record<string, unknown>[]): SubagentSessionEvents {
+function events(payloads: readonly Record<string, unknown>[], workCycle = 1): SubagentSessionEvents {
   return {
     name: "review-risk",
     omittedEvents: 0,
@@ -593,7 +660,7 @@ function events(payloads: readonly Record<string, unknown>[]): SubagentSessionEv
       sequence: index + 1,
       rpcSequence: index + 1,
       receivedAt: index + 1,
-      workCycle: 1,
+      workCycle,
       event: Object.freeze({ ...payload, type: String(payload.type) })
     }))
   }
