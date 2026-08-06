@@ -1,4 +1,4 @@
-import { basename, isAbsolute, relative, resolve, sep } from "node:path"
+import { resolve } from "node:path"
 import { pathToFileURL } from "node:url"
 
 import { BoxRenderable, fg, link, StyledText, TextAttributes, TextRenderable, type RenderContext } from "@opentui/core"
@@ -28,6 +28,7 @@ import { createColorRamp } from "../../components/color-ramp.js"
 import { glyphs } from "../../glyphs.js"
 import type { Theme } from "../../theme.js"
 import type { TranscriptItemView } from "./item.js"
+import { displayToolPath } from "./tool-subject.js"
 
 export type ToolStatus = ToolPresentationSource["status"]
 
@@ -806,7 +807,7 @@ function secondaryLines(
   const available = Math.max(1, width - textWidth(glyphs.toolRail))
   switch (subject.type) {
     case "path":
-      return [{ type: "path", text: displayPath(cwd, subject.path, false), linkPath: subject.path }]
+      return [{ type: "path", text: displayToolPath(cwd, subject.path, false), linkPath: subject.path }]
     case "task":
       return boundedSecondaryLines("task", subject.id, available, limit, omission)
     case "text":
@@ -1397,7 +1398,7 @@ function createBodyView(
 /**
  * Compact natural width of a subject, so the layout never reserves more
  * subject space than the content can use. Paths mirror the compact
- * `displayPath` form; commands flatten newlines the same way
+ * `displayToolPath` form; commands flatten newlines the same way
  * `subjectContent` does.
  */
 function naturalSubjectWidth(subject: ToolHeader["subject"], cwd: string): number {
@@ -1408,7 +1409,7 @@ function naturalSubjectWidth(subject: ToolHeader["subject"], cwd: string): numbe
     case "command":
       return textWidth(subject.text.replace(/\s*\n\s*/g, " ")) + (subject.prompt ? 2 : 0)
     case "path":
-      return textWidth(displayPath(cwd, subject.path, true))
+      return textWidth(displayToolPath(cwd, subject.path, true))
     case "task":
       return textWidth(subject.id)
     default:
@@ -1428,7 +1429,7 @@ function subjectContent(
     case "command":
       return commandContent(subject.text, subject.prompt, theme, width, compact)
     case "path": {
-      const display = displayPath(cwd, subject.path, compact)
+      const display = displayToolPath(cwd, subject.path, compact)
       return new StyledText([fg(theme.text.primary)(link(fileUrl(cwd, subject.path))(display))])
     }
     case "task":
@@ -1466,19 +1467,6 @@ function commandContent(text: string, prompt: boolean, theme: Theme, width: numb
     expectsCommand = false
   }
   return new StyledText(chunks)
-}
-
-// Pi 73414d0 applies this containment rule to compact resource reads; Zi uses it for every semantic path subject.
-function displayPath(cwd: string, path: string, compact: boolean): string {
-  const root = resolve(cwd || ".")
-  const absolute = resolve(root, path)
-  const relativePath = relative(root, absolute)
-  const insideCwd =
-    relativePath === "" || (!isAbsolute(relativePath) && relativePath !== ".." && !relativePath.startsWith(`..${sep}`))
-  if (!insideCwd) return absolute
-
-  const localPath = isAbsolute(path) ? relativePath || "." : path
-  return compact ? basename(localPath) || localPath : localPath
 }
 
 function fileUrl(cwd: string, path: string): string {

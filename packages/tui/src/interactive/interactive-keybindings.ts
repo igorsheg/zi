@@ -26,7 +26,6 @@ export type PromptKeyAction =
   | "consume"
 
 export type TranscriptKeyAction = "page_up" | "page_down" | "line_up" | "line_down" | "tail" | "toggle_tools"
-export type ModalKeyAction = "close" | "line_up" | "line_down" | "page_up" | "page_down" | "top" | "bottom"
 
 export interface PromptKeyContext {
   readonly pickerOpen: boolean
@@ -82,13 +81,7 @@ const defaultBindingEntries = [
   ["app.transcript.lineUp", ["ctrl+alt+up"], "Scroll transcript up one line", "overridable"],
   ["app.transcript.lineDown", ["ctrl+alt+down"], "Scroll transcript down one line", "overridable"],
   ["app.transcript.tail", ["ctrl+end"], "Jump to the transcript tail", "overridable"],
-  ["app.modal.close", ["escape", "q"], "Close modal", "overridable"],
-  ["app.modal.lineUp", ["up"], "Scroll modal up one line", "overridable"],
-  ["app.modal.lineDown", ["down"], "Scroll modal down one line", "overridable"],
-  ["app.modal.pageUp", ["pageup"], "Scroll modal up one page", "overridable"],
-  ["app.modal.pageDown", ["pagedown"], "Scroll modal down one page", "overridable"],
-  ["app.modal.top", ["home"], "Jump modal to top", "overridable"],
-  ["app.modal.bottom", ["end"], "Jump modal to bottom", "overridable"]
+  ["app.modal.close", ["escape", "q"], "Close modal", "overridable"]
 ] as const
 
 export type InteractiveKeybinding = (typeof defaultBindingEntries)[number][0]
@@ -200,15 +193,8 @@ export class InteractiveKeybindings {
     return undefined
   }
 
-  modalAction(event: InteractiveKeyEvent): ModalKeyAction | undefined {
-    if (this.matches(event, "app.modal.close")) return "close"
-    if (this.matches(event, "app.modal.lineUp")) return "line_up"
-    if (this.matches(event, "app.modal.lineDown")) return "line_down"
-    if (this.matches(event, "app.modal.pageUp")) return "page_up"
-    if (this.matches(event, "app.modal.pageDown")) return "page_down"
-    if (this.matches(event, "app.modal.top")) return "top"
-    if (this.matches(event, "app.modal.bottom")) return "bottom"
-    return undefined
+  closesModal(event: InteractiveKeyEvent): boolean {
+    return this.matches(event, "app.modal.close")
   }
 }
 

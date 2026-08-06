@@ -1,4 +1,4 @@
-import { BoxRenderable, type CliRenderer, type KeyEvent, type Renderable } from "@opentui/core"
+import { BoxRenderable, CliRenderEvents, RGBA, type CliRenderer, type KeyEvent, type Renderable } from "@opentui/core"
 import type { AgentSessionEvent, SubagentSnapshot } from "@with-zi/coding-agent"
 
 import type { Theme } from "../theme.js"
@@ -6,7 +6,7 @@ import type { InteractiveKeybindings } from "./interactive-keybindings.js"
 import type { InteractiveStore } from "./interactive-store.js"
 import { SubagentActivityModalView } from "./subagent-activity-modal.js"
 
-export type ModalCloseReason = "escape" | "session_replaced" | "disposed"
+export type ModalCloseReason = "escape" | "session_replaced" | "subagent_unavailable" | "disposed"
 
 type CursorRestore = { readonly target: CursorRenderable; readonly showCursor: boolean }
 
@@ -39,6 +39,9 @@ export class ModalLayer {
     this.#renderer = renderer
     this.#interactive = interactive
     this.#keybindings = keybindings
+    // The layer is the backdrop: a translucent fill dims the session behind the
+    // dialog without touching it, because a background alpha blends only the
+    // fill this box draws while opaque children paint over it.
     this.root = new BoxRenderable(renderer, {
       id: "modal-layer",
       position: "absolute",
@@ -52,16 +55,14 @@ export class ModalLayer {
       visible: false,
       alignItems: "stretch",
       justifyContent: "flex-end",
-      paddingX: 0,
-      paddingBottom: 0,
-      shouldFill: false,
-      backgroundColor: theme.surface.app
+      shouldFill: true,
+      backgroundColor: scrimColor(theme.surface.app)
     })
-    this.#view = new SubagentActivityModalView(renderer, theme)
-    this.#view.setControls(modalControls(keybindings))
+    this.#view = new SubagentActivityModalView(renderer, keybindings, theme)
     this.root.add(this.#view.root)
     this.root.onLifecyclePass = this.#tick
     renderer.keyInput.on("keypress", this.#onKeyPress)
+    renderer.on(CliRenderEvents.RESIZE, this.#onResize)
   }
 
   isOpen(): boolean {
@@ -80,7 +81,7 @@ export class ModalLayer {
     this.#releaseSubagentUpdates?.()
     this.#releaseSubagentUpdates = session.subscribe(event => this.#onSessionEvent(event))
     this.#state = { type: "subagent_activity", name, previousFocus, cursorRestore }
-    this.#view.update(snapshot, session.subagentSessionEvents(name))
+    this.#view.update(snapshot, session.subagentSessionEvents(name), session.sessionManager.header.cwd)
     this.#setLive(needsElapsedTick(snapshot))
     this.root.visible = true
     if (cursorRestore) cursorRestore.target.showCursor = false
@@ -111,29 +112,48 @@ export class ModalLayer {
     this.#disposed = true
     this.root.onLifecyclePass = null
     this.#renderer.keyInput.off("keypress", this.#onKeyPress)
+    this.#renderer.off(CliRenderEvents.RESIZE, this.#onResize)
     this.#view.destroy()
     this.root.destroyRecursively()
   }
 
   #onSessionEvent(event: AgentSessionEvent): void {
     const state = this.#state
-    if (state.type !== "subagent_activity" || event.type !== "subagent_changed" || event.name !== state.name) return
-    const session = this.#interactive.getSession()
-    const snapshot = session.subagentSnapshot(state.name)
-    if (!snapshot) return
-    this.#view.update(snapshot, session.subagentSessionEvents(state.name), { preserveScroll: true })
-    this.#setLive(needsElapsedTick(snapshot))
-    this.#renderer.requestRender()
+    if (state.type !== "subagent_activity" || event.type !== "subagent_changed") return
+    if (event.name === state.name) {
+      if (this.#refresh()) this.#renderer.requestRender()
+      return
+    }
+    if (!this.#interactive.getSession().subagentSnapshot(state.name)) this.close("subagent_unavailable")
   }
 
+  #refresh(): boolean {
+    const state = this.#state
+    if (state.type !== "subagent_activity") return false
+    const session = this.#interactive.getSession()
+    const snapshot = session.subagentSnapshot(state.name)
+    if (!snapshot) {
+      this.close("subagent_unavailable")
+      return false
+    }
+    this.#view.update(snapshot, session.subagentSessionEvents(state.name), session.sessionManager.header.cwd)
+    this.#setLive(needsElapsedTick(snapshot))
+    return true
+  }
+
+  /** Live frames advance the elapsed clock only; activity arrives as events. */
   #tick = (): void => {
     const state = this.#state
     if (state.type !== "subagent_activity") return
-    const session = this.#interactive.getSession()
-    const snapshot = session.subagentSnapshot(state.name)
+    const snapshot = this.#interactive.getSession().subagentSnapshot(state.name)
     if (!snapshot) return
-    this.#view.update(snapshot, session.subagentSessionEvents(state.name), { preserveScroll: true })
+    this.#view.tick(snapshot)
     this.#setLive(needsElapsedTick(snapshot))
+  }
+
+  /** A resized terminal changes the dialog's row budget, so the body reprojects. */
+  #onResize = (): void => {
+    this.#refresh()
   }
 
   #setLive(live: boolean): void {
@@ -146,34 +166,7 @@ export class ModalLayer {
   #onKeyPress = (key: KeyEvent): void => {
     if (this.#state.type === "closed") return
     this.#consume(key)
-    const action = this.#keybindings.modalAction(key)
-    switch (action) {
-      case "close":
-        this.close("escape")
-        return
-      case "line_up":
-        this.#view.scrollLines(-1)
-        return
-      case "line_down":
-        this.#view.scrollLines(1)
-        return
-      case "page_up":
-        this.#view.scrollPages(-1)
-        return
-      case "page_down":
-        this.#view.scrollPages(1)
-        return
-      case "top":
-        this.#view.jump("top")
-        return
-      case "bottom":
-        this.#view.jump("bottom")
-        return
-      case undefined:
-        return
-      default:
-        return assertNever(action)
-    }
+    if (this.#keybindings.closesModal(key)) this.close("escape")
   }
 
   #consume(key: KeyEvent): void {
@@ -182,15 +175,10 @@ export class ModalLayer {
   }
 }
 
-function modalControls(keybindings: InteractiveKeybindings): string {
-  const close = keybindings.getHint("app.modal.close") ?? "Esc"
-  const up = keybindings.getHint("app.modal.lineUp") ?? "↑"
-  const down = keybindings.getHint("app.modal.lineDown") ?? "↓"
-  const pageUp = keybindings.getHint("app.modal.pageUp") ?? "PgUp"
-  const pageDown = keybindings.getHint("app.modal.pageDown") ?? "PgDn"
-  const top = keybindings.getHint("app.modal.top") ?? "Home"
-  const bottom = keybindings.getHint("app.modal.bottom") ?? "End"
-  return ` ${close} close · ${up}/${down} scroll · ${pageUp}/${pageDown} page · ${top}/${bottom} jump `
+/** Dim enough that the session behind reads as suspended, not as content. */
+export function scrimColor(surface: string): RGBA {
+  const base = RGBA.fromHex(surface)
+  return RGBA.fromValues(base.r, base.g, base.b, 0.6)
 }
 
 function cursorRestoreFor(renderable: Renderable | undefined): CursorRestore | undefined {
