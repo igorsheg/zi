@@ -1,6 +1,6 @@
 import { expect, spyOn, test } from "bun:test"
 
-import { TextareaRenderable } from "@opentui/core"
+import { ScrollBoxRenderable, TextareaRenderable } from "@opentui/core"
 import { createModels, createTestAgentRuntime as createAgentRuntime, fauxProvider } from "@with-zi/coding-agent/testing"
 
 import { createInteractiveTest, renderSettled } from "./harness.js"
@@ -168,6 +168,9 @@ test("provider failures paint after settlement without keyboard input", async ()
     await providerStarted.promise
     await setup.renderOnce()
     expect(setup.captureCharFrame()).toContain("Working…")
+    const transcript = setup.renderer.root.findDescendantById("transcript-scroll")
+    if (!(transcript instanceof ScrollBoxRenderable)) throw new Error("Transcript scrollbox not found")
+    const workingViewportHeight = transcript.viewport.height
 
     releaseFailure.resolve()
     await session.waitForIdle()
@@ -176,6 +179,7 @@ test("provider failures paint after settlement without keyboard input", async ()
     const frame = setup.captureCharFrame()
     expect(frame).toContain("provider failed")
     expect(frame).not.toContain("Working…")
+    expect(transcript.viewport.height).toBe(workingViewportHeight)
     expect(input.focused).toBe(true)
   } finally {
     session.dispose()

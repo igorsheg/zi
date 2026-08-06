@@ -43,17 +43,17 @@ test("manual page and line navigation detaches, coalesces unseen output, and ret
     session.setThinkingLevel("low")
     await renderSettled(setup)
     expect(scroll.scrollTop).toBe(detachedTop)
-    expect(setup.captureCharFrame()).not.toContain("New output · Ctrl+End to jump")
+    expect(setup.captureCharFrame()).not.toContain("New output (Ctrl+End to jump)")
 
     await promptAndRender(session, setup, "first update")
     expect(scroll.scrollTop).toBe(detachedTop)
     expect(scroll.viewport.height).toBe(detachedViewportHeight)
     expect(scroll.stickyScroll).toBe(false)
-    expect(occurrences(setup.captureCharFrame(), "New output · Ctrl+End to jump")).toBe(1)
+    expect(occurrences(setup.captureCharFrame(), "New output (Ctrl+End to jump)")).toBe(1)
 
     await promptAndRender(session, setup, "second update")
     expect(scroll.scrollTop).toBe(detachedTop)
-    expect(occurrences(setup.captureCharFrame(), "New output · Ctrl+End to jump")).toBe(1)
+    expect(occurrences(setup.captureCharFrame(), "New output (Ctrl+End to jump)")).toBe(1)
 
     const pageDownStart = scroll.scrollTop
     const pageDownMaximum = maximumScroll(scroll)
@@ -64,13 +64,52 @@ test("manual page and line navigation detaches, coalesces unseen output, and ret
     }
     expect(scroll.scrollTop).toBe(maximumScroll(scroll))
     expect(scroll.stickyScroll).toBe(true)
-    expect(setup.captureCharFrame()).not.toContain("New output · Ctrl+End to jump")
+    expect(setup.captureCharFrame()).not.toContain("New output (Ctrl+End to jump)")
 
     await promptAndRender(session, setup, "following update")
     expect(scroll.scrollTop).toBe(maximumScroll(scroll))
     expect(scroll.stickyScroll).toBe(true)
   } finally {
     session.dispose()
+    setup.destroy()
+  }
+})
+
+test("detached streaming composes one stable activity and unseen-output row", async () => {
+  const pending = await createPendingTranscriptSession()
+  const setup = await createInteractiveTest(pending.session, { width: 60, height: 12, kittyKeyboard: true })
+
+  try {
+    await renderSettled(setup)
+    const scroll = transcriptScroll(setup.renderer)
+    await pressRaw(setup, "\x1b[5~")
+    const detachedTop = scroll.scrollTop
+    const idleViewportHeight = scroll.viewport.height
+
+    const completion = pending.session.prompt("stream while detached")
+    await pending.providerStarted.promise
+    await renderSettled(setup)
+
+    expect(setup.captureCharFrame()).toContain("Working… • New output (Ctrl+End to jump)")
+    expect(scroll.scrollTop).toBe(detachedTop)
+    expect(scroll.viewport.height).toBe(idleViewportHeight)
+
+    pending.releaseProvider.resolve()
+    await completion
+    await renderSettled(setup)
+
+    expect(setup.captureCharFrame()).not.toContain("Working…")
+    expect(setup.captureCharFrame()).toContain("New output (Ctrl+End to jump)")
+    expect(scroll.scrollTop).toBe(detachedTop)
+    expect(scroll.viewport.height).toBe(idleViewportHeight)
+
+    setup.mockInput.pressKey("END", { ctrl: true })
+    await renderSettled(setup)
+    expect(setup.captureCharFrame()).not.toContain("New output (Ctrl+End to jump)")
+    expect(scroll.viewport.height).toBe(idleViewportHeight)
+  } finally {
+    pending.releaseProvider.resolve()
+    pending.session.dispose()
     setup.destroy()
   }
 })
@@ -120,7 +159,7 @@ test("one line above the tail stays detached when output commits", async () => {
     expect(scroll.scrollTop).toBe(detachedTop)
     expect(scroll.scrollTop).toBeLessThan(maximumScroll(scroll))
     expect(scroll.stickyScroll).toBe(false)
-    expect(setup.captureCharFrame()).toContain("New output · Ctrl+End to jump")
+    expect(setup.captureCharFrame()).toContain("New output (Ctrl+End to jump)")
   } finally {
     session.dispose()
     setup.destroy()
@@ -146,12 +185,12 @@ test("unseen status yields to a one-row transcript viewport", async () => {
     await promptAndRender(session, setup, "constrained unseen output")
     expect(scroll.scrollTop).toBe(detachedTop)
     expect((setup.captureCharFrame().split("\n")[0] ?? "").trimEnd()).toBe(visibleRow)
-    expect(setup.captureCharFrame()).not.toContain("New output · Ctrl+End to jump")
+    expect(setup.captureCharFrame()).not.toContain("New output (Ctrl+End to jump)")
 
     setup.resize(48, 12)
     await renderSettled(setup)
     expect(scroll.stickyScroll).toBe(false)
-    expect(setup.captureCharFrame()).toContain("New output · Ctrl+End to jump")
+    expect(setup.captureCharFrame()).toContain("New output (Ctrl+End to jump)")
   } finally {
     session.dispose()
     setup.destroy()
@@ -180,11 +219,11 @@ test("Ctrl+End jumps to the tail and a later manual operation cancels a queued j
     expect(scroll.stickyScroll).toBe(false)
 
     await promptAndRender(session, setup, "unseen before jump")
-    expect(setup.captureCharFrame()).toContain("New output · Ctrl+End to jump")
+    expect(setup.captureCharFrame()).toContain("New output (Ctrl+End to jump)")
     await pressKey(setup, "END", { ctrl: true })
     expect(scroll.scrollTop).toBe(maximumScroll(scroll))
     expect(scroll.stickyScroll).toBe(true)
-    expect(setup.captureCharFrame()).not.toContain("New output · Ctrl+End to jump")
+    expect(setup.captureCharFrame()).not.toContain("New output (Ctrl+End to jump)")
 
     await pressRaw(setup, "\x1b[5~")
     const detachedTop = scroll.scrollTop
@@ -242,7 +281,7 @@ test("native wheel and resize mechanics preserve detached intent until all conte
     expect(scroll.stickyScroll).toBe(false)
 
     await promptAndRender(session, setup, "unseen through resize")
-    expect(setup.captureCharFrame()).toContain("New output · Ctrl+End to jump")
+    expect(setup.captureCharFrame()).toContain("New output (Ctrl+End to jump)")
 
     const status = transcriptStatus(setup.renderer)
     const beforeHintWheel = scroll.scrollTop
@@ -255,18 +294,18 @@ test("native wheel and resize mechanics preserve detached intent until all conte
     setup.resize(36, 9)
     await renderSettled(setup)
     expect(scroll.stickyScroll).toBe(false)
-    expect(setup.captureCharFrame()).toContain("New output · Ctrl+End to jump")
+    expect(setup.captureCharFrame()).toContain("New output (Ctrl+End to jump)")
 
     setup.resize(52, 14)
     await renderSettled(setup)
     expect(scroll.stickyScroll).toBe(false)
-    expect(setup.captureCharFrame()).toContain("New output · Ctrl+End to jump")
+    expect(setup.captureCharFrame()).toContain("New output (Ctrl+End to jump)")
 
     setup.resize(52, 80)
     await renderSettled(setup)
     expect(scroll.scrollHeight).toBeLessThanOrEqual(scroll.viewport.height)
     expect(scroll.stickyScroll).toBe(true)
-    expect(setup.captureCharFrame()).not.toContain("New output · Ctrl+End to jump")
+    expect(setup.captureCharFrame()).not.toContain("New output (Ctrl+End to jump)")
 
     setup.resize(48, 10)
     await renderSettled(setup)
@@ -304,7 +343,7 @@ test("native selection mouse-down detaches before its first drag event", async (
     await promptAndRender(session, setup, "output before selection drag")
     expect(scroll.scrollTop).toBe(detachedTop)
     expect(scroll.scrollTop).toBeLessThan(maximumScroll(scroll))
-    expect(setup.captureCharFrame()).toContain("New output · Ctrl+End to jump")
+    expect(setup.captureCharFrame()).toContain("New output (Ctrl+End to jump)")
 
     await setup.mockMouse.moveTo(x + "history".length, y)
     await setup.mockMouse.release(x + "history".length, y)
@@ -323,7 +362,7 @@ test("native selection mouse-down detaches before its first drag event", async (
 
 test("native selection edge-scrolls in visual order and detaches before streamed output", async () => {
   const session = await createTranscriptSession(1)
-  const setup = await createInteractiveTest(session, { width: 48, height: 13, kittyKeyboard: true })
+  const setup = await createInteractiveTest(session, { width: 48, height: 14, kittyKeyboard: true })
 
   try {
     await renderSettled(setup)
@@ -347,7 +386,7 @@ test("native selection edge-scrolls in visual order and detaches before streamed
     await promptAndRender(session, setup, "output during selection")
     expect(scroll.scrollTop).toBe(detachedTop)
     expect(scroll.scrollTop).toBeLessThan(maximumScroll(scroll))
-    expect(setup.captureCharFrame()).toContain("New output · Ctrl+End to jump")
+    expect(setup.captureCharFrame()).toContain("New output (Ctrl+End to jump)")
 
     await setup.mockMouse.release(13, startY)
     await Promise.resolve()
@@ -408,7 +447,7 @@ test("streamed tool execution leaves a detached native viewport anchored", async
     )
     expect(scroll.scrollTop).toBe(detachedTop)
     expect(scroll.stickyScroll).toBe(false)
-    expect(occurrences(setup.captureCharFrame(), "New output · Ctrl+End to jump")).toBe(1)
+    expect(occurrences(setup.captureCharFrame(), "New output (Ctrl+End to jump)")).toBe(1)
   } finally {
     session.dispose()
     setup.destroy()
@@ -438,13 +477,40 @@ test("queued native callbacks cannot leak across a session replacement", async (
     expect(newScroll === oldScroll).toBe(false)
     expect(newScroll.scrollTop).toBe(maximumScroll(newScroll))
     expect(newScroll.stickyScroll).toBe(true)
-    expect(setup.captureCharFrame()).not.toContain("New output · Ctrl+End to jump")
+    expect(setup.captureCharFrame()).not.toContain("New output (Ctrl+End to jump)")
   } finally {
     first.dispose()
     second.dispose()
     setup.destroy()
   }
 })
+
+async function createPendingTranscriptSession(): Promise<{
+  readonly session: AgentSession
+  readonly providerStarted: ReturnType<typeof deferred<void>>
+  readonly releaseProvider: ReturnType<typeof deferred<void>>
+}> {
+  const models = createModels()
+  const faux = fauxProvider()
+  const providerStarted = deferred<void>()
+  const releaseProvider = deferred<void>()
+  models.setProvider(faux.provider)
+  faux.setResponses([
+    async () => {
+      providerStarted.resolve()
+      await releaseProvider.promise
+      return fauxAssistantMessage(fauxThinking("streamed thought"))
+    }
+  ])
+  const bootstrap = await createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
+  const model = bootstrap.session.model
+  bootstrap.session.dispose()
+
+  const sessionManager = SessionManager.inMemory("/work")
+  for (const message of transcriptMessages()) sessionManager.appendMessage(message)
+  const session = (await createAgentSession({ services: bootstrap.services, sessionManager, model, tools: [] })).session
+  return { session, providerStarted, releaseProvider }
+}
 
 async function createTranscriptSession(responseCount: number): Promise<AgentSession> {
   const models = createModels()

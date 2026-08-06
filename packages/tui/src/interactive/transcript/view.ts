@@ -8,7 +8,7 @@ import {
   type SyntaxStyle,
   TextRenderable
 } from "@opentui/core"
-import { projectToolPresentation, type AgentMessage } from "@with-zi/coding-agent"
+import { projectToolPresentation, type AgentMessage, type AgentSession } from "@with-zi/coding-agent"
 import type { ReadableAtom } from "nanostores"
 
 import { createThinkingSyntaxStyle, type Theme } from "../../theme.js"
@@ -21,17 +21,20 @@ import {
   type AssistantToolViewOwner,
   type ToolCallPresentation
 } from "./message-view.js"
-import { createTranscriptStore, type TranscriptStore } from "./navigation.js"
+import { createTranscriptStore, type TranscriptNavigation, type TranscriptStore } from "./navigation.js"
+import { transcriptStatusRows, TranscriptStatusView, type TranscriptStatusPresentation } from "./status-view.js"
 import { ToolCallView, type ToolViewFrame } from "./tool-view.js"
 
-interface TranscriptSession {
-  readonly messages: readonly AgentMessage[]
-  readonly streamingMessage: AgentMessage | undefined
+interface TranscriptSession extends Pick<
+  AgentSession,
+  "messages" | "streamingMessage" | "isStreaming" | "isAborting" | "retryStatus" | "compactionStatus"
+> {
   readonly sessionManager?: { readonly header: { readonly cwd: string } }
   readonly shellTasks?: readonly { readonly type: string; readonly toolCallId: string }[]
 }
 
 interface TranscriptSource {
+  readonly $promptRevision: ReadableAtom<number>
   readonly $transcriptRevision: ReadableAtom<number>
   readonly $activeTools: ReadableAtom<ReadonlyMap<string, ActiveTool>>
   getSession(): TranscriptSession
@@ -98,6 +101,7 @@ const maxPendingToolCalls = 64
 
 export class TranscriptView {
   readonly root: BoxRenderable
+  readonly notificationHost: BoxRenderable
   readonly scroll: ScrollBoxRenderable
 
   readonly #renderer: CliRenderer
@@ -107,7 +111,7 @@ export class TranscriptView {
   readonly #syntaxStyle: SyntaxStyle
   readonly #thinkingSyntaxStyle: SyntaxStyle
   readonly #navigation: TranscriptStore
-  readonly #status: BoxRenderable
+  readonly #status: TranscriptStatusView
   readonly #measureSync: boolean
   readonly #requestFrame: typeof requestAnimationFrame
   readonly #cancelFrame: typeof cancelAnimationFrame
@@ -218,11 +222,17 @@ export class TranscriptView {
 
     this.root = new BoxRenderable(renderer, {
       id: "transcript-region",
-      position: "relative",
+      flexDirection: "column",
       flexGrow: 1,
       minHeight: 1
     })
     this.root.onLifecyclePass = this.#syncFrame
+    this.notificationHost = new BoxRenderable(renderer, {
+      id: "transcript-viewport",
+      position: "relative",
+      flexGrow: 1,
+      minHeight: 1
+    })
     this.scroll = new ScrollBoxRenderable(renderer, {
       id: "transcript-scroll",
       flexGrow: 1,
@@ -235,29 +245,10 @@ export class TranscriptView {
     })
     this.scroll.verticalScrollBar.visible = false
     this.scroll.horizontalScrollBar.visible = false
-    this.#status = new BoxRenderable(renderer, {
-      id: "transcript-status",
-      position: "absolute",
-      left: 0,
-      right: 0,
-      bottom: 0,
-      zIndex: 1,
-      height: 1,
-      visible: false,
-      paddingLeft: 1,
-      backgroundColor: theme.surface.app
-    })
-    this.#status.add(
-      new TextRenderable(renderer, {
-        selectable: false,
-        fg: theme.text.accent,
-        bg: theme.surface.app,
-        wrapMode: "none",
-        content: transcriptHint(keybindings)
-      })
-    )
-    this.root.add(this.scroll)
-    this.root.add(this.#status)
+    this.#status = new TranscriptStatusView(renderer, keybindings, theme)
+    this.notificationHost.add(this.scroll)
+    this.root.add(this.notificationHost)
+    this.root.add(this.#status.root)
 
     this.scroll.onMouseScroll = () => this.#queueNativeRead("manual")
     this.scroll.onMouseDown = () => {
@@ -267,11 +258,12 @@ export class TranscriptView {
     this.scroll.onSizeChange = () => {
       if (this.#navigation.$navigation.get().type === "detached") this.#queueNativeRead("resize")
     }
-    this.root.onSizeChange = this.#syncStatus
-    this.#status.onMouseScroll = event => {
+    this.root.onSizeChange = this.#syncStatusGeometry
+    this.#status.root.onMouseScroll = event => {
       if (!this.scroll.isDestroyed) this.scroll.processMouseEvent(event)
     }
 
+    this.#release.push(interactive.$promptRevision.subscribe(this.#syncStatus))
     this.#release.push(interactive.$transcriptRevision.subscribe(this.#requestSync))
     this.#release.push(this.#navigation.$navigation.subscribe(this.#syncNavigation))
     renderer.keyInput.on("keypress", this.#onKeyPress)
@@ -307,6 +299,7 @@ export class TranscriptView {
     this.#cancelAnchorFrame()
     for (const release of this.#release.splice(0)) release()
     this.#clearContent()
+    this.#status.destroy()
     this.root.destroyRecursively()
     this.#thinkingSyntaxStyle.destroy()
   }
@@ -329,6 +322,7 @@ export class TranscriptView {
       this.#syncContent()
     }
     this.#refreshRunningTools()
+    if (this.#interactive.getSession().retryStatus.type === "waiting") this.#syncStatus()
   }
 
   #syncContent(): void {
@@ -941,9 +935,19 @@ export class TranscriptView {
     this.#syncStatus()
   }
 
+  #syncStatusGeometry = (): void => {
+    this.#status.setAvailable(this.root.height > transcriptStatusRows)
+  }
+
   #syncStatus = (): void => {
-    const navigation = this.#navigation.$navigation.get()
-    this.#status.visible = navigation.type === "detached" && navigation.unseenOutput && this.root.height > 1
+    this.#status.update(
+      transcriptStatusPresentation(
+        this.#interactive.getSession(),
+        this.#navigation.$navigation.get(),
+        this.#keybindings.getHint("app.interrupt"),
+        Date.now()
+      )
+    )
   }
 
   #queueNativeRead(kind: "manual" | "resize"): void {
@@ -1057,9 +1061,29 @@ function sameOrder(left: readonly string[], right: readonly string[]): boolean {
   return left.length === right.length && left.every((value, index) => value === right[index])
 }
 
-function transcriptHint(keybindings: InteractiveKeybindings): string {
-  const tailHint = keybindings.getHint("app.transcript.tail")
-  return `New output${tailHint ? ` · ${tailHint} to jump` : ""}`
+function transcriptStatusPresentation(
+  session: TranscriptSession,
+  navigation: TranscriptNavigation,
+  interruptHint: string | undefined,
+  now: number
+): TranscriptStatusPresentation {
+  const working = session.isStreaming || session.compactionStatus.type === "running"
+  const unseenOutput = navigation.type === "detached" && navigation.unseenOutput
+  if (!working) return unseenOutput ? { type: "unseen_output" } : { type: "empty" }
+
+  const text = workingStatusText(session, interruptHint, now)
+  return unseenOutput ? { type: "working_with_unseen_output", text } : { type: "working", text }
+}
+
+function workingStatusText(session: TranscriptSession, interruptHint: string | undefined, now: number): string {
+  if (session.isAborting) return "Cancelling…"
+  const retry = session.retryStatus
+  if (retry.type === "waiting") {
+    const seconds = Math.max(0, Math.ceil((retry.retryAt - now) / 1_000))
+    const cancel = interruptHint ? `${interruptHint} to cancel` : "interrupt to cancel"
+    return `Retrying (${retry.attempt}/${retry.maxAttempts}) in ${seconds}s… (${cancel})`
+  }
+  return session.compactionStatus.type === "running" ? "Compacting…" : "Working…"
 }
 
 function assertNever(value: never): never {

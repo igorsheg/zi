@@ -10,7 +10,6 @@ import {
 } from "@opentui/core"
 
 import { composerGeometry, createComposer, type Composer, type ComposerSlots } from "../../components/composer.js"
-import { ShimmerTextView } from "../../components/shimmer-text.js"
 import type { Theme } from "../../theme.js"
 import type { BrowserOpener } from "../browser-opener.js"
 import type { BuiltInNoticeActions } from "../built-in-notifications.js"
@@ -21,6 +20,7 @@ import type { ExternalEditor } from "../external-editor.js"
 import type { InteractiveKeybindings, PromptKeyAction } from "../interactive-keybindings.js"
 import type { InteractiveStore } from "../interactive-store.js"
 import type { SlashController } from "../slash-controller.js"
+import { transcriptStatusRows } from "../transcript/status-view.js"
 import { AuthCeremonyView } from "./auth-ceremony-view.js"
 import { captureFileCompletionInput } from "./file-completion.js"
 import { layoutPromptFooter, type PromptFooterPresentation, PromptFooterView } from "./footer-view.js"
@@ -45,7 +45,6 @@ export class PromptView {
   readonly #externalEditor: ExternalEditor
   readonly #notices: BuiltInNoticeActions
   readonly #store: PromptStore
-  readonly #working: ShimmerTextView
   readonly #authCeremony: AuthCeremonyView
   readonly #queue: QueuedInputsView
   readonly #greeter: SessionGreeterView
@@ -82,9 +81,7 @@ export class PromptView {
     this.#notices = notices
     this.#store = createPromptStore(interactive, slash, sessionActions, clipboard, notices, clipboardCopy, modals)
     this.root = new BoxRenderable(renderer, { flexDirection: "column", flexShrink: 0 })
-    this.root.onLifecyclePass = this.#refreshWorkingStatus
 
-    this.#working = new ShimmerTextView(renderer, "Working…", theme.text.muted, theme.text.primary)
     this.#authCeremony = new AuthCeremonyView(renderer, browserOpener, theme)
     this.#queue = new QueuedInputsView(renderer, keybindings, theme)
     this.#greeter = new SessionGreeterView(renderer, theme)
@@ -116,7 +113,6 @@ export class PromptView {
     )
 
     // Transient workflows stay above the composer; stable session metadata yields the below-input surface to pickers.
-    this.root.add(this.#working.root)
     this.root.add(this.#authCeremony.root)
     this.root.add(this.#queue.root)
     this.root.add(this.#greeter.root)
@@ -148,8 +144,6 @@ export class PromptView {
   destroy(): void {
     this.#externalEditorState = { type: "disposed" }
     for (const release of this.#release.splice(0)) release()
-    this.root.onLifecyclePass = null
-    this.#working.destroy()
     this.#authCeremony.destroy()
     this.#queue.destroy()
     this.#greeter.destroy()
@@ -172,7 +166,6 @@ export class PromptView {
     this.#input.selectable = !secretInput
     if (secretInput) this.#renderer.clearSelection()
     const authCeremonyRows = this.#authCeremony.update(prompt.authCeremony, this.#renderer.width)
-    const working = session.isStreaming || session.compactionStatus.type === "running"
     const pickerOpen = Boolean(this.#store.picker.presentation(this.#input.plainText))
     const greeterRows = this.#greeter.update(
       session.messages.length === 0,
@@ -182,7 +175,7 @@ export class PromptView {
     )
     const queuedInputs = session.queuedInputs
     const queueActive = queuedInputs.steering.length > 0 || queuedInputs.followUp.length > 0
-    const fixedRowsWithoutFooter = geometry.protectedRows + greeterRows + (working ? 1 : 0) + authCeremonyRows
+    const fixedRowsWithoutFooter = geometry.protectedRows + greeterRows + transcriptStatusRows + authCeremonyRows
     // The transcript owns one row; an active queue needs one summary row before ambient metadata is admitted.
     const reservedContentRows = 1 + (queueActive ? 1 : 0)
     const footerFits =
@@ -196,8 +189,6 @@ export class PromptView {
     const fixedRows = fixedRowsWithoutFooter + footerRows
     const pickerVisible = this.#pickerStack.update(Math.max(0, this.#renderer.height - fixedRows))
 
-    this.#working.setText(workingStatusText(session, this.#keybindings.getHint("app.interrupt"), Date.now()))
-    this.#working.setActive(working)
     if (pickerVisible) this.#queue.hide()
     else this.#queue.update(queuedInputs, Math.max(0, this.#renderer.height - fixedRows))
     if (prompt.images !== this.#syncedImages) {
@@ -205,12 +196,6 @@ export class PromptView {
       this.#composer.syncImageMarkers(prompt.images)
     }
     this.#composer.update(geometry, composerSlots(prompt.images.length))
-  }
-
-  #refreshWorkingStatus = (): void => {
-    const session = this.#interactive.getSession()
-    if (session.retryStatus.type !== "waiting") return
-    this.#working.setText(workingStatusText(session, this.#keybindings.getHint("app.interrupt"), Date.now()))
   }
 
   #submit(delivery: "steer" | "followUp"): void {
@@ -448,21 +433,6 @@ function authenticationActive(workflow: PromptWorkflow): boolean {
   return (
     workflow.type === "authenticating" || workflow.type === "auth_prompt" || workflow.type === "choosing_auth_option"
   )
-}
-
-function workingStatusText(
-  session: ReturnType<InteractiveStore["getSession"]>,
-  interruptHint: string | undefined,
-  now: number
-): string {
-  if (session.isAborting) return "Cancelling…"
-  const retry = session.retryStatus
-  if (retry.type === "waiting") {
-    const seconds = Math.max(0, Math.ceil((retry.retryAt - now) / 1_000))
-    const cancel = interruptHint ? `${interruptHint} to cancel` : "interrupt to cancel"
-    return `Retrying (${retry.attempt}/${retry.maxAttempts}) in ${seconds}s… (${cancel})`
-  }
-  return session.compactionStatus.type === "running" ? "Compacting…" : "Working…"
 }
 
 function composerSlots(imageCount = 0): ComposerSlots {

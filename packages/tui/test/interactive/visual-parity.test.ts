@@ -93,9 +93,9 @@ test("representative session keeps the accepted visual hierarchy at normal and c
     setup.resize(40, 8)
     await setup.renderOnce()
     expect(frameRows(setup.captureCharFrame(), 8)).toEqual([
-      "",
       " The failed command remains visible",
       " without overwhelming the prompt.",
+      "",
       "",
       "╭──────────────────────────────────────╮",
       "│                                      │",

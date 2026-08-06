@@ -1020,11 +1020,21 @@ async function createTranscriptHarness(
     },
     get streamingMessage() {
       return state.streamingMessage
-    }
+    },
+    isStreaming: false,
+    isAborting: false,
+    retryStatus: { type: "idle" } as const,
+    compactionStatus: { type: "idle" } as const
   }
   const revision = atom(0)
+  const promptRevision = atom(0)
   const tools = atom<ReadonlyMap<string, ActiveTool>>(options.tools ?? new Map())
-  const interactive = { $transcriptRevision: revision, $activeTools: tools, getSession: () => session }
+  const interactive = {
+    $promptRevision: promptRevision,
+    $transcriptRevision: revision,
+    $activeTools: tools,
+    getSession: () => session
+  }
   const syntaxStyle = createSyntaxStyle(defaultTheme)
   const view = new TranscriptView(setup.renderer, interactive, new InteractiveKeybindings(), defaultTheme, syntaxStyle)
   setup.renderer.root.add(view.root)

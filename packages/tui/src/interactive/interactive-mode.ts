@@ -185,7 +185,7 @@ export class InteractiveMode {
     }
     try {
       this.root.add(screen.root)
-      notifications.attach(screen.transcript.root)
+      notifications.attach(screen.transcript.notificationHost)
     } catch (cause) {
       screen.destroy()
       builtInNotifications.dispose()
@@ -329,7 +329,7 @@ export class InteractiveMode {
     this.#screen.destroy()
     this.#screen = this.#createScreen(this.#builtInNotifications)
     this.root.add(this.#screen.root)
-    this.#notifications.attach(this.#screen.transcript.root)
+    this.#notifications.attach(this.#screen.transcript.notificationHost)
     this.#screen.prompt.focus()
   }
 
