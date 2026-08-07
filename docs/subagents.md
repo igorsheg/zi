@@ -103,7 +103,20 @@ The standard model-facing flow admits each durable `{runtime name, work cycle}` 
 
 `list_subagents` reports a bounded current-task summary, lifecycle, work cycle, elapsed milliseconds, and result-ready status without copying conversations. `interrupt_subagent` waits within the supervisor's bound for terminal evidence from the exact interrupted cycle and returns that evidence directly. `close_subagent` likewise returns the child's bounded terminal evidence. Neither successful operation requires a follow-up wait.
 
-A session with no admitted profiles exposes none of these tools. Depth-one child sessions cannot recursively create subagents.
+A session with no admitted profiles exposes none of these parent orchestration tools. Depth-one child sessions cannot recursively create subagents.
+
+## Peer messaging
+
+Depth-one child sessions expose two narrow collaboration tools:
+
+- `list_peer_subagents` lists the other live children owned by the same parent session;
+- `send_peer_message` sends context to one live sibling through the parent-owned relay.
+
+Peer runtime names remain scoped to their common parent. The parent derives the sender identity from the child process that issued the request, validates the target against its authoritative live-child catalog, and serializes delivery through the target child. A child cannot claim another sender, message itself, address an exited child, or acquire spawn, interrupt, close, wait, or process-handle authority through this channel.
+
+Peer delivery is queue-only. It joins active sibling work through the same safe follow-up path as `send_subagent_message`, but never starts an idle sibling turn. The receiving child sees an attributed `[Peer message from <runtime-name>]` envelope. Final work-cycle evidence continues to flow to the parent; peer messages do not replace parent completion delivery.
+
+The child-to-parent request and parent-to-child acknowledgement are correlated and bounded. A peer message retains at most 64 KiB, each child may have at most eight peer requests in flight, and the parent exposes at most its four live-child slots. Once the child emits a relay request, cancellation stops the sender from waiting but does not retract that request; delivery may still complete.
 
 ## Optional custom orchestration
 

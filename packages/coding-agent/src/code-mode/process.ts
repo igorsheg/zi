@@ -2,6 +2,8 @@ import { spawn } from "node:child_process"
 import { isAbsolute } from "node:path"
 import { Readable, Writable } from "node:stream"
 
+import type { ProcessScope, ProcessTreeTracker } from "../processes/process-tree.js"
+
 export interface CodeModeWorkerExit {
   readonly code: number | null
   readonly signal: NodeJS.Signals | null
@@ -9,13 +11,17 @@ export interface CodeModeWorkerExit {
 }
 
 export interface CodeModeWorkerProcess {
+  readonly pid: number
   readonly input: Writable
   readonly stdout: Readable
   readonly stderr: Readable
   readonly protocol: Readable
   readonly exited: Promise<CodeModeWorkerExit>
+  readonly admitted: Promise<void>
+  readonly containmentFailure: Promise<never>
   closeInput(): void
   terminate(force: boolean): void
+  terminateTree(): Promise<void>
   dispose(): void
 }
 
@@ -23,7 +29,10 @@ type SpawnedChild =
   | { readonly type: "bun"; readonly process: Bun.Subprocess<"pipe", "pipe", "pipe"> }
   | { readonly type: "node"; readonly process: ReturnType<typeof spawn> }
 
-export function createCodeModeWorkerSpawner(command: readonly string[]): (cwd: string) => CodeModeWorkerProcess {
+export function createCodeModeWorkerSpawner(
+  command: readonly string[],
+  processTreeTracker?: ProcessTreeTracker
+): (cwd: string) => CodeModeWorkerProcess {
   if (
     command.length === 0 ||
     command.length > 16 ||
@@ -33,7 +42,7 @@ export function createCodeModeWorkerSpawner(command: readonly string[]): (cwd: s
     throw new Error("Code-mode worker commands require an absolute executable and at most 15 bounded arguments")
   }
   const admitted = Object.freeze([...command])
-  const environment = codeModeEnvironment()
+  const environment = Object.freeze({ ...process.env })
   return cwd => {
     const args = [...admitted.slice(1), "--zi-internal-code-mode-worker"]
     const child: SpawnedChild =
@@ -53,9 +62,31 @@ export function createCodeModeWorkerSpawner(command: readonly string[]): (cwd: s
               cwd,
               env: environment,
               stdio: ["pipe", "pipe", "pipe", "pipe"],
+              detached: true,
               windowsHide: true
             })
           }
+
+    const workerPid = child.process.pid
+    if (typeof workerPid !== "number" || !Number.isInteger(workerPid) || workerPid <= 0) {
+      child.process.kill("SIGKILL")
+      throw new Error("Code-mode worker did not expose a valid process ID")
+    }
+    const pid = workerPid
+    let processScope: ProcessScope | undefined
+    let rejectContainment!: (error: Error) => void
+    const containmentFailure = new Promise<never>((_, reject) => {
+      rejectContainment = reject
+    })
+    void containmentFailure.catch(() => {})
+    try {
+      processScope = processTreeTracker?.track(pid, rejectContainment)
+    } catch (cause) {
+      if (child.type === "node") child.process.once("error", ignoreStreamError)
+      child.process.kill("SIGKILL")
+      child.process.unref()
+      throw cause
+    }
 
     let input: Writable
     let stdout: Readable
@@ -88,6 +119,7 @@ export function createCodeModeWorkerSpawner(command: readonly string[]): (cwd: s
       if (child.type === "node") child.process.once("error", ignoreStreamError)
       child.process.kill("SIGKILL")
       child.process.unref()
+      void processScope?.dispose().catch(() => {})
       throw cause
     }
 
@@ -122,16 +154,23 @@ export function createCodeModeWorkerSpawner(command: readonly string[]): (cwd: s
     }
 
     return {
+      pid,
       input,
       stdout,
       stderr,
       protocol,
       exited,
+      admitted: processScope?.admitted ?? Promise.resolve(),
+      containmentFailure,
       closeInput() {
         input.end()
       },
       terminate(force) {
         if (!settled) child.process.kill(force ? "SIGKILL" : "SIGTERM")
+      },
+      async terminateTree() {
+        if (processScope) await processScope.terminate()
+        else if (!settled) child.process.kill("SIGKILL")
       },
       dispose() {
         input.destroy()
@@ -215,12 +254,3 @@ function sleep(ms: number): Promise<void> {
 }
 
 function ignoreStreamError(): void {}
-
-function codeModeEnvironment(): Readonly<NodeJS.ProcessEnv> {
-  const environment: NodeJS.ProcessEnv = {}
-  for (const name of ["PATH", "SystemRoot", "WINDIR", "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL"]) {
-    const value = process.env[name]
-    if (value !== undefined) environment[name] = value
-  }
-  return Object.freeze(environment)
-}

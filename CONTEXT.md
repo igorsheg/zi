@@ -37,19 +37,19 @@ The bounded JSON-compatible operational result that one admitted tool returns to
 _Avoid_: Tool result details, presentation envelope, encoded JSON response
 
 **Code mode**:
-The default additive Zi tool for executing generated JavaScript that orchestrates an immutable admitted catalog of direct and extension tools. It is for data-dependent loops, branching, filtering, aggregation, and multi-call workflows; ordinary coding keeps direct tools.
-_Avoid_: Tool replacement, feature flag, script runner, shell alias
+The default additive Zi tool for executing generated JavaScript in the session's programmatic runtime. It is for data-dependent loops, branching, filtering, aggregation, and multi-call workflows; ordinary coding keeps direct tools.
+_Avoid_: Tool replacement, feature flag, shell alias, security sandbox
 
-**Code execution**:
-One stateless `code` invocation and its single owner of child-process lifetime, VM limits, deadline, cancellation, serialized nested calls, bounded trace, outcome, and cleanup. It is the only transcript tool identity for its nested work.
-_Avoid_: Agent turn, transaction, reusable sandbox, nested session
+**Code cell**:
+One ordinary JavaScript async function admitted to the programmatic runtime with an immutable tool-catalog snapshot. Its nested calls share one transcript tool identity, cancellation scope, bounded trace, and outcome. Tool side effects are not transactional.
+_Avoid_: Agent turn, lexical REPL input, nested session, transaction
 
-**Code worker**:
-The isolated child process that owns one bounded QuickJS runtime and exchanges versioned framed messages with its host. Generated code receives only `console` and a frozen non-thenable `zi` catalog; session effects remain host-owned and the guest has no ambient process, module, filesystem, credential, or network authority. The worker is fault containment, not a security boundary against a QuickJS escape.
-_Avoid_: Extension worker, coding-agent process, security approval boundary
+**Programmatic runtime**:
+The session-scoped full-authority JavaScript environment behind Code Mode. It preserves arbitrary volatile `scratch` values across ordinary cell failures and host-owned bounded JSON `state` across successful cells, worker restart, and session resume. A failed cell rolls back `state` but not tool side effects or `scratch`; a worker restart clears `scratch`. Full local process, module, filesystem, environment, and network authority is intentional, so the runtime is fault containment rather than a security sandbox.
+_Avoid_: Code worker, reusable sandbox, extension worker, credential boundary
 
 **Nested tool trace**:
-The bounded durable evidence projected from calls made during one code execution: admitted arguments such as paths, commands, or operations; current activity; outcomes; durations; short result/error previews; and console logs. Full nested results remain transient protocol data.
+The bounded durable evidence projected from calls made during one code cell: admitted arguments such as paths, commands, or operations; current activity; outcomes; durations; short result/error previews; and console logs. Full nested results remain transient protocol data.
 _Avoid_: Nested transcript, replay log, rollback journal, copied tool timeline
 
 **Tool presentation**:
@@ -185,7 +185,7 @@ Static configuration for delegated work: a profile name, description, instructio
 _Avoid_: Subagent, role, agent type, permission profile
 
 **Subagent**:
-One runtime child Zi agent session created from a subagent profile whose conversation remains authoritative in that child. Subagents are direct children of one parent session and do not form a peer network.
+One runtime child Zi agent session created from a subagent profile whose conversation remains authoritative in that child. Subagents remain direct children of one parent session; sibling collaboration is routed by that parent rather than by a separate peer network.
 _Avoid_: Subagent profile, worker, tool call, copied parent agent
 
 **Subagent name**:
@@ -195,6 +195,10 @@ _Avoid_: Subagent type, role, operational ID
 **Subagent supervisor**:
 The `AgentSession`-owned controller of direct-child names, admission, process lifetimes, work cycles, bounded completion retention, durable evidence, and shutdown. `AgentSession` derives standard orchestration from its admitted profile catalog; extensions may reach the same mechanics only through bounded session operations for optional custom workflows.
 _Avoid_: Extension generation, agent coordinator, extension API object, session registry
+
+**Peer message**:
+Bounded context sent from one subagent to a live sibling through their common parent supervisor. The parent derives the sender identity, validates the sibling target, and admits the message queue-only; a peer message neither assigns a work cycle nor replaces parent completion delivery.
+_Avoid_: Subagent task, completion, direct process message, peer network event
 
 **Subagent completion**:
 The bounded result projected when admitted subagent work settles, including identity, status, final text, duration, and omission facts. It is not a copied child transcript.

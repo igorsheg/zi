@@ -1,6 +1,6 @@
 import type { Writable } from "node:stream"
 
-export const codeModeProtocolVersion = 2
+export const codeModeProtocolVersion = 3
 export const codeModeWorkerArgument = "--zi-internal-code-mode-worker"
 
 export const maxCodeBytes = 256 * 1024
@@ -14,6 +14,7 @@ export const maxCodeModeLogs = 32
 export const maxCodeModeLogBytes = 16 * 1024
 export const maxCodeModeJsonDepth = 32
 export const maxCodeModeJsonNodes = 16_384
+export const maxCodeModeStateBytes = 256 * 1024
 
 export type CodeModeJson =
   | null
@@ -23,33 +24,54 @@ export type CodeModeJson =
   | readonly CodeModeJson[]
   | { readonly [key: string]: CodeModeJson }
 
+export type CodeModeState = { readonly [key: string]: CodeModeJson }
+
+interface Correlation {
+  readonly generation: number
+  readonly executionId: number
+}
+
 export type CodeModeHostMessage =
-  | { readonly version: 2; readonly type: "start"; readonly code: string; readonly tools: readonly string[] }
-  | {
-      readonly version: 2
+  | { readonly version: 3; readonly type: "initialize"; readonly generation: number }
+  | ({
+      readonly version: 3
+      readonly type: "execute"
+      readonly code: string
+      readonly tools: readonly string[]
+      readonly state: CodeModeState
+    } & Correlation)
+  | ({
+      readonly version: 3
       readonly type: "tool_result"
       readonly id: number
       readonly value: CodeModeJson
       readonly terminate?: boolean
-    }
-  | { readonly version: 2; readonly type: "tool_error"; readonly id: number; readonly error: string }
+    } & Correlation)
+  | ({ readonly version: 3; readonly type: "tool_error"; readonly id: number; readonly error: string } & Correlation)
 
 export type CodeModeWorkerMessage =
-  | { readonly version: 2; readonly type: "ready" }
-  | {
-      readonly version: 2
+  | { readonly version: 3; readonly type: "ready"; readonly generation: number }
+  | ({
+      readonly version: 3
       readonly type: "tool_call"
       readonly id: number
       readonly name: string
       readonly arguments: CodeModeJson
-    }
-  | {
-      readonly version: 2
+    } & Correlation)
+  | ({
+      readonly version: 3
       readonly type: "completed"
       readonly result?: CodeModeJson
+      readonly state: CodeModeState
       readonly logs: readonly string[]
-    }
-  | { readonly version: 2; readonly type: "failed"; readonly error: string; readonly logs: readonly string[] }
+    } & Correlation)
+  | ({
+      readonly version: 3
+      readonly type: "failed"
+      readonly error: string
+      readonly logs: readonly string[]
+      readonly reset?: boolean
+    } & Correlation)
 
 export class CodeModeProtocolError extends Error {
   constructor(message: string, options?: ErrorOptions) {
@@ -141,8 +163,9 @@ export class CodeModeProtocolWriter {
 
   send(value: CodeModeHostMessage): Promise<void> {
     if (this.#state.type === "failed") return Promise.reject(this.#state.error)
-    if (this.#state.type === "disposed")
+    if (this.#state.type === "disposed") {
       return Promise.reject(new CodeModeProtocolError("Code-mode writer is disposed"))
+    }
 
     let frame: Buffer
     try {
@@ -225,7 +248,11 @@ export function encodeCodeModeFrame(value: unknown): Buffer {
 
 export function validateHostMessage(value: unknown): CodeModeHostMessage {
   const message = messageRecord(value)
-  if (message.type === "start") {
+  if (message.type === "initialize") {
+    return { version: 3, type: "initialize", generation: generation(message.generation) }
+  }
+  const correlated = correlation(message)
+  if (message.type === "execute") {
     if (typeof message.code !== "string" || Buffer.byteLength(message.code) > maxCodeBytes) {
       throw new CodeModeProtocolError(`Code must not exceed ${maxCodeBytes} bytes`)
     }
@@ -235,41 +262,47 @@ export function validateHostMessage(value: unknown): CodeModeHostMessage {
       !message.tools.every(name => typeof name === "string" && isCodeModeToolName(name)) ||
       new Set(message.tools).size !== message.tools.length
     ) {
-      throw new CodeModeProtocolError("Code-mode start requires unique bounded tool names")
-    }
-    return { version: 2, type: "start", code: message.code, tools: Object.freeze([...message.tools]) }
-  }
-  if (message.type === "tool_result") {
-    let result: CodeModeJson
-    try {
-      result = validateCodeModeJson(message.value)
-    } catch (cause) {
-      throw new CodeModeProtocolError("Code-mode tool results require a JSON-compatible value", { cause })
+      throw new CodeModeProtocolError("Code-mode execution requires unique bounded tool names")
     }
     return {
-      version: 2,
+      version: 3,
+      type: "execute",
+      ...correlated,
+      code: message.code,
+      tools: Object.freeze([...message.tools]),
+      state: validateCodeModeState(message.state)
+    }
+  }
+  if (message.type === "tool_result") {
+    return {
+      version: 3,
       type: "tool_result",
+      ...correlated,
       id: callId(message.id),
-      value: result,
+      value: validateCodeModeJson(message.value),
       ...(message.terminate === true ? { terminate: true } : {})
     }
   }
   if (message.type === "tool_error") {
-    return { version: 2, type: "tool_error", id: callId(message.id), error: boundedError(message.error) }
+    return { version: 3, type: "tool_error", ...correlated, id: callId(message.id), error: boundedError(message.error) }
   }
   throw new CodeModeProtocolError(`Unknown code-mode host message: ${String(message.type)}`)
 }
 
 export function validateWorkerMessage(value: unknown): CodeModeWorkerMessage {
   const message = messageRecord(value)
-  if (message.type === "ready") return { version: 2, type: "ready" }
+  if (message.type === "ready") {
+    return { version: 3, type: "ready", generation: generation(message.generation) }
+  }
+  const correlated = correlation(message)
   if (message.type === "tool_call") {
     if (typeof message.name !== "string" || !isCodeModeToolName(message.name)) {
       throw new CodeModeProtocolError("Code-mode tool calls require a valid tool name")
     }
     return {
-      version: 2,
+      version: 3,
       type: "tool_call",
+      ...correlated,
       id: callId(message.id),
       name: message.name,
       arguments: validateCodeModeJson(message.arguments)
@@ -278,21 +311,76 @@ export function validateWorkerMessage(value: unknown): CodeModeWorkerMessage {
   const logs = logValues(message.logs)
   if (message.type === "completed") {
     return {
-      version: 2,
+      version: 3,
       type: "completed",
+      ...correlated,
       ...(message.result === undefined ? {} : { result: validateCodeModeJson(message.result) }),
+      state: validateCodeModeState(message.state),
       logs
     }
   }
   if (message.type === "failed") {
-    return { version: 2, type: "failed", error: boundedError(message.error), logs }
+    return {
+      version: 3,
+      type: "failed",
+      ...correlated,
+      error: boundedError(message.error),
+      logs,
+      ...(message.reset === true ? { reset: true } : {})
+    }
   }
   throw new CodeModeProtocolError(`Unknown code-mode worker message: ${String(message.type)}`)
+}
+
+export function validateCodeModeState(value: unknown): CodeModeState {
+  const state = validateCodeModeJson(value)
+  if (!isRecord(state)) throw new CodeModeProtocolError("Code-mode state must be an object")
+  if (Buffer.byteLength(JSON.stringify(state)) > maxCodeModeStateBytes) {
+    throw new CodeModeProtocolError(`Code-mode state must not exceed ${maxCodeModeStateBytes} bytes`)
+  }
+  return state
+}
+
+export function validateCodeModeJson(value: unknown): CodeModeJson {
+  let nodes = 0
+  const visit = (current: unknown, depth: number): CodeModeJson => {
+    nodes++
+    if (nodes > maxCodeModeJsonNodes || depth > maxCodeModeJsonDepth) {
+      throw new CodeModeProtocolError("Code-mode JSON exceeded its structural bound")
+    }
+    if (current === null || typeof current === "boolean" || typeof current === "string") return current
+    if (typeof current === "number") {
+      if (!Number.isFinite(current)) throw new CodeModeProtocolError("Code-mode JSON numbers must be finite")
+      return current
+    }
+    if (Array.isArray(current)) return current.map(item => visit(item, depth + 1))
+    if (!isRecord(current)) throw new CodeModeProtocolError("Code-mode values must be JSON compatible")
+    return Object.fromEntries(Object.entries(current).map(([key, item]) => [key, visit(item, depth + 1)]))
+  }
+  return visit(value, 0)
 }
 
 function messageRecord(value: unknown): Record<string, unknown> {
   if (!isRecord(value) || value.version !== codeModeProtocolVersion || typeof value.type !== "string") {
     throw new CodeModeProtocolError("Invalid code-mode protocol message")
+  }
+  return value
+}
+
+function correlation(value: Record<string, unknown>): Correlation {
+  return { generation: generation(value.generation), executionId: executionId(value.executionId) }
+}
+
+function generation(value: unknown): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1) {
+    throw new CodeModeProtocolError("Invalid code-mode generation")
+  }
+  return value
+}
+
+function executionId(value: unknown): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+    throw new CodeModeProtocolError("Invalid code-mode execution ID")
   }
   return value
 }
@@ -314,25 +402,6 @@ function logValues(value: unknown): readonly string[] {
 function boundedError(value: unknown): string {
   if (typeof value !== "string") throw new CodeModeProtocolError("Code-mode errors must be strings")
   return utf8Prefix(value, maxCodeModeErrorBytes)
-}
-
-export function validateCodeModeJson(value: unknown): CodeModeJson {
-  let nodes = 0
-  const visit = (current: unknown, depth: number): CodeModeJson => {
-    nodes++
-    if (nodes > maxCodeModeJsonNodes || depth > maxCodeModeJsonDepth) {
-      throw new CodeModeProtocolError("Code-mode JSON exceeded its structural bound")
-    }
-    if (current === null || typeof current === "boolean" || typeof current === "string") return current
-    if (typeof current === "number") {
-      if (!Number.isFinite(current)) throw new CodeModeProtocolError("Code-mode JSON numbers must be finite")
-      return current
-    }
-    if (Array.isArray(current)) return current.map(item => visit(item, depth + 1))
-    if (!isRecord(current)) throw new CodeModeProtocolError("Code-mode values must be JSON compatible")
-    return Object.fromEntries(Object.entries(current).map(([key, item]) => [key, visit(item, depth + 1)]))
-  }
-  return visit(value, 0)
 }
 
 function utf8Prefix(value: string, limit: number): string {

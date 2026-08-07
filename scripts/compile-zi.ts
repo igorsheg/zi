@@ -12,8 +12,10 @@ export async function compileZi(options: CompileZiOptions): Promise<void> {
   }
 
   const root = resolve(import.meta.dirname, "..")
+  const codeRealmSource = await bundleCodeRealm(resolve(root, "packages/coding-agent/src/code-mode/worker.ts"))
   await compileStandalone(resolve(root, "packages/cli/src/standalone.ts"), options.outfile, {
-    "process.env.ZI_BUILD_VERSION": JSON.stringify(options.version)
+    "process.env.ZI_BUILD_VERSION": JSON.stringify(options.version),
+    ziCodeRealmSource: JSON.stringify(codeRealmSource)
   })
   await verifyZi(options.outfile, options.version)
 }
@@ -47,6 +49,21 @@ export async function compileStandalone(
       autoloadPackageJson: false
     }
   })
+}
+
+async function bundleCodeRealm(entrypoint: string): Promise<string> {
+  const result = await Bun.build({
+    entrypoints: [entrypoint],
+    target: "bun",
+    format: "cjs",
+    minify: { syntax: true, whitespace: true, identifiers: false },
+    packages: "bundle",
+    conditions: ["bun", "node"]
+  })
+  if (!result.success || result.outputs.length !== 1) {
+    throw new Error(`Could not bundle the code realm: ${result.logs.map(String).join("\n")}`)
+  }
+  return result.outputs[0]!.text()
 }
 
 export function assertPinnedBunVersion(actual: string, packageManager: unknown): void {

@@ -1,7 +1,119 @@
 import { expect, test } from "bun:test"
 
 import { runRpcMode, type RpcMessagePage, type RpcServerFrame } from "../src/rpc/rpc-mode.js"
-import { createModels, createTestAgentRuntime, fauxAssistantMessage, fauxProvider } from "../src/testing.js"
+import {
+  createModels,
+  createTestAgentRuntime,
+  fauxAssistantMessage,
+  fauxProvider,
+  fauxToolCall
+} from "../src/testing.js"
+
+test("depth-one RPC sessions relay correlated peer requests through the parent connection", async () => {
+  const models = createModels()
+  const faux = fauxProvider({ provider: "rpc", models: [{ id: "model", name: "RPC Model", reasoning: true }] })
+  models.setProvider(faux.provider)
+  faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("list_peer_subagents", {}, { id: "list-peers" }), { stopReason: "toolUse" }),
+    fauxAssistantMessage(
+      fauxToolCall("send_peer_message", { name: "worker-b", text: "Use the parser result." }, { id: "send-peer" }),
+      { stopReason: "toolUse" }
+    ),
+    fauxAssistantMessage("peer coordination complete")
+  ])
+  const runtime = await createTestAgentRuntime({
+    cwd: "/work",
+    model: "rpc/model",
+    apiKey: "test",
+    models,
+    internalSubagentDepth: 1,
+    session: { type: "new", persist: false }
+  })
+  const input = new RpcTestInput()
+  const output = new RpcTestOutput()
+  const running = runRpcMode(runtime.session, { input, writer: output })
+
+  try {
+    await output.frame(frame => frame.type === "ready")
+    input.send({
+      version: 1,
+      id: "prompt",
+      method: "session.prompt",
+      params: { delivery: "direct", text: "coordinate", completionId: "work-1" }
+    })
+    await output.response("prompt")
+
+    const list = await output.frame(
+      (frame): frame is Extract<RpcServerFrame, { type: "peer_request" }> =>
+        frame.type === "peer_request" && frame.operation === "list"
+    )
+    input.send({
+      version: 1,
+      type: "peer_response",
+      id: list.id,
+      operation: "list",
+      ok: true,
+      result: { peers: [{ name: "worker-b", lifecycle: "running" }] }
+    })
+
+    const send = await output.frame(
+      (frame): frame is Extract<RpcServerFrame, { type: "peer_request" }> =>
+        frame.type === "peer_request" && frame.operation === "send"
+    )
+    expect(send).toMatchObject({ target: "worker-b", text: "Use the parser result." })
+    expect(send).not.toHaveProperty("sender")
+    input.send({
+      version: 1,
+      type: "peer_response",
+      id: send.id,
+      operation: "send",
+      ok: true,
+      result: { delivered: true }
+    })
+    input.send({ version: 1, id: "idle", method: "session.await_idle", params: { completionId: "work-1" } })
+    expect(await output.response("idle")).toMatchObject({
+      ok: true,
+      result: { completion: { text: "peer coordination complete" } }
+    })
+  } finally {
+    input.close()
+    await running
+    runtime.session.dispose()
+    await runtime.session.waitForIdle()
+  }
+}, 15_000)
+
+test("queue-only RPC delivery remains pending without waking an idle child session", async () => {
+  const models = createModels()
+  const runtime = await createTestAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
+  const input = new RpcTestInput()
+  const output = new RpcTestOutput()
+  const running = runRpcMode(runtime.session, { input, writer: output })
+
+  try {
+    await output.frame(frame => frame.type === "ready")
+    input.send({
+      version: 1,
+      id: "peer-context",
+      method: "session.prompt",
+      params: { delivery: "follow_up", text: "[Peer message from worker-a]\ncontext" }
+    })
+    expect(await output.response("peer-context")).toMatchObject({ ok: true, result: { delivery: "follow_up" } })
+    input.send({ version: 1, id: "state", method: "session.get_state" })
+    expect(await output.response("state")).toMatchObject({
+      ok: true,
+      result: {
+        activity: { type: "idle" },
+        queuedInputs: { followUp: [{ text: "[Peer message from worker-a]\ncontext" }] }
+      }
+    })
+  } finally {
+    input.close()
+    await running
+    runtime.session.dispose()
+    await runtime.session.waitForIdle()
+  }
+})
 
 test("RPC mode sequences authoritative events, concurrent interruption, and paged session state", async () => {
   const models = createModels()
@@ -708,6 +820,7 @@ function isServerFrame(value: unknown): value is RpcServerFrame {
     value.version === 1 &&
     typeof value.sequence === "number" &&
     (value.type === "ready" ||
+      value.type === "peer_request" ||
       value.type === "session_event" ||
       value.type === "protocol_error" ||
       value.type === "response")

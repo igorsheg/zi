@@ -50,6 +50,69 @@ test("ChildZiProcess spawn/wait/close vertical slice against a mock RPC child", 
   }
 }, 15_000)
 
+test("ChildZiProcess validates child-originated peer requests and returns correlated responses", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-child-peer-request-"))
+  const responsePath = join(root, "peer-response.json")
+  const requests: unknown[] = []
+  const child = new ChildZiProcess({
+    name: "worker-a",
+    command: [process.execPath, mockChild],
+    cwd: root,
+    processTreeTracker: createProcessTreeTracker(),
+    env: { ...process.env, MOCK_RPC_PEER_RESPONSE: responsePath },
+    async onPeerRequest(request) {
+      requests.push(request)
+      return { delivered: true }
+    }
+  })
+
+  try {
+    await child.start()
+    await child.spawnAdmit("__peer_send__")
+    await waitFor(() => Bun.file(responsePath).size > 0, 5_000)
+    expect(requests).toEqual([{ id: "mock-peer-1", operation: "send", target: "worker-b", text: "peer evidence" }])
+    expect(JSON.parse(await Bun.file(responsePath).text())).toEqual({
+      version: 1,
+      type: "peer_response",
+      id: "mock-peer-1",
+      operation: "send",
+      ok: true,
+      result: { delivered: true }
+    })
+  } finally {
+    await child.close("test")
+    await rm(root, { recursive: true, force: true })
+  }
+}, 15_000)
+
+test("ChildZiProcess fails closed on duplicate active peer request ids", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-child-peer-duplicate-"))
+  const responsePath = join(root, "peer-response.json")
+  let resolveFatal!: (error: Error) => void
+  const fatal = new Promise<Error>(accept => {
+    resolveFatal = accept
+  })
+  const child = new ChildZiProcess({
+    name: "worker-a",
+    command: [process.execPath, mockChild],
+    cwd: root,
+    processTreeTracker: createProcessTreeTracker(),
+    env: { ...process.env, MOCK_RPC_PEER_RESPONSE: responsePath, MOCK_RPC_DUPLICATE_PEER_REQUEST: "1" },
+    onPeerRequest: () => new Promise(() => {}),
+    onFatal: resolveFatal
+  })
+
+  try {
+    await child.start()
+    void child.spawnAdmit("__peer_send__").catch(() => undefined)
+    expect((await fatal).message).toContain("Duplicate peer request id")
+    await waitFor(() => child.state.type === "exited", 5_000)
+  } finally {
+    await child.close("test").catch(() => undefined)
+    await rm(root, { recursive: true, force: true })
+  }
+}, 15_000)
+
 test("ChildZiProcess retains bounded child session events admitted from RPC", async () => {
   const root = await mkdtemp(join(tmpdir(), "zi-child-session-events-"))
   try {

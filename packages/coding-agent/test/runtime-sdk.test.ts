@@ -83,7 +83,8 @@ test("runtime invocation prompts override discovered system prompt inputs", asyn
 
   try {
     await runtime.session.prompt("start")
-    expect(systemPrompt).toContain("Invocation system prompt\n\nFirst addition\n\nSecond addition")
+    expect(systemPrompt).toStartWith("Invocation system prompt")
+    expect(systemPrompt).toContain("First addition\n\nSecond addition")
     expect(systemPrompt).not.toContain("Discovered addition")
   } finally {
     runtime.session.dispose()

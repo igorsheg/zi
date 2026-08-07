@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test"
+import { afterEach, expect, test } from "bun:test"
 import { mkdtemp } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -8,7 +8,11 @@ import type { AgentTool } from "@earendil-works/pi-agent-core"
 import { Type } from "@earendil-works/pi-ai"
 
 import { CodeMode, isCodeModeDetails } from "../src/code-mode/code-mode.js"
+import { maxCodeModeStateBytes } from "../src/code-mode/protocol.js"
 import type { CodeModeCapableTool } from "../src/code-mode/tool-contract.js"
+import { ZiPaths } from "../src/paths.js"
+import { createProcessTreeTracker, type ProcessScope, type ProcessTreeTracker } from "../src/processes/process-tree.js"
+import { SessionManager } from "../src/session-manager.js"
 import { createModels, createTestAgentRuntime, fauxAssistantMessage, fauxProvider } from "../src/testing.js"
 import { createReadTool } from "../src/tools/read.js"
 
@@ -16,6 +20,36 @@ const workerCommand = Object.freeze([
   process.execPath,
   fileURLToPath(new URL("../src/code-mode/worker-entry.ts", import.meta.url))
 ])
+const codeModes = new Set<CodeMode>()
+
+function createCodeMode(cwd: string): CodeMode {
+  const codeMode = new CodeMode(cwd, workerCommand)
+  codeModes.add(codeMode)
+  return codeMode
+}
+
+afterEach(async () => {
+  await Promise.all([...codeModes].map(codeMode => codeMode.dispose()))
+  codeModes.clear()
+})
+
+function processExists(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch {
+    return false
+  }
+}
+
+async function rejectionMessage(operation: Promise<unknown>): Promise<string> {
+  try {
+    await operation
+    throw new Error("Expected operation to reject")
+  } catch (cause) {
+    return cause instanceof Error ? cause.message : String(cause)
+  }
+}
 
 const echoParameters = Type.Object({ value: Type.String() })
 
@@ -55,12 +89,13 @@ test("new Zi sessions expose direct coding tools and code by default", async () 
     expect(catalog).toEqual(["read", "bash", "edit", "write", "task_output", "kill_task", "code"])
   } finally {
     runtime.session.dispose()
+    await runtime.session.waitForIdle()
   }
 })
 
 test("code executes serial nested calls in an isolated worker", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "zi-code-mode-execute-"))
-  const tool = new CodeMode(cwd, workerCommand).createTool([echoTool])
+  const tool = createCodeMode(cwd).createTool([echoTool])
   const result = await tool.execute(
     "outer",
     {
@@ -99,9 +134,12 @@ test("code exposes declared native values instead of presentation envelopes", as
       }
     }
   }
-  const tool = new CodeMode(cwd, workerCommand).createTool([statsTool])
+  const tool = createCodeMode(cwd).createTool([statsTool])
 
   expect(tool.description).toContain("stats: (input: {  }) => Promise<{ files: number; lines: number }>")
+  expect(tool.description).toContain("scratch holds arbitrary volatile JavaScript")
+  expect(tool.description).toContain("Tool calls and ambient effects are not transactional")
+  expect(tool.description).toContain("A cell may make at most 64 zi calls")
   expect(tool.description).not.toContain("ZiToolResult")
   expect(tool.description).not.toContain("JSON.parse(response.text)")
 
@@ -134,7 +172,7 @@ test("code serializes guest-created calls for deterministic mutation order", asy
       return { content: [{ type: "text", text: String(value) }], details: {} }
     }
   }
-  const tool = new CodeMode(cwd, workerCommand).createTool([serialTool])
+  const tool = createCodeMode(cwd).createTool([serialTool])
   const result = await tool.execute(
     "outer",
     { code: `async () => Promise.all([1, 2, 3].map(value => zi.serial({ value })))` },
@@ -148,7 +186,7 @@ test("code serializes guest-created calls for deterministic mutation order", asy
 
 test("code preserves nested schema failures as bounded trace evidence", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "zi-code-mode-schema-"))
-  const tool = new CodeMode(cwd, workerCommand).createTool([echoTool])
+  const tool = createCodeMode(cwd).createTool([echoTool])
   const result = await tool.execute("outer", { code: `async () => zi.echo({})` }, undefined)
 
   expect(isCodeModeDetails(result.details)).toBe(true)
@@ -169,7 +207,7 @@ test("code exposes a closed non-thenable guest tool catalog", async () => {
       return echoTool.execute(...arguments_)
     }
   }
-  const tool = new CodeMode(cwd, workerCommand).createTool([countedEcho])
+  const tool = createCodeMode(cwd).createTool([countedEcho])
   const controller = new AbortController()
   const timeout = setTimeout(() => controller.abort(new Error("guest proxy remained thenable")), 250)
   try {
@@ -205,9 +243,9 @@ test("code exposes a closed non-thenable guest tool catalog", async () => {
   }
 })
 
-test("code guest has no ambient process, filesystem, module, credential, or network authority", async () => {
+test("code cells have full ambient Node-compatible authority", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "zi-code-mode-isolation-"))
-  const tool = new CodeMode(cwd, workerCommand).createTool([echoTool])
+  const tool = createCodeMode(cwd).createTool([echoTool])
   const result = await tool.execute(
     "outer",
     {
@@ -216,7 +254,8 @@ test("code guest has no ambient process, filesystem, module, credential, or netw
   bun: typeof Bun,
   require: typeof require,
   fetch: typeof fetch,
-  bridge: typeof __ziHostCall
+  bridge: typeof __ziHostCall,
+  imported: typeof (await project.import("node:path")).join
 })`
     },
     undefined
@@ -225,14 +264,250 @@ test("code guest has no ambient process, filesystem, module, credential, or netw
   expect(result.content).toEqual([
     {
       type: "text",
-      text: '{\n  "process": "undefined",\n  "bun": "undefined",\n  "require": "undefined",\n  "fetch": "undefined",\n  "bridge": "undefined"\n}'
+      text: '{\n  "process": "object",\n  "bun": "object",\n  "require": "undefined",\n  "fetch": "function",\n  "bridge": "undefined",\n  "imported": "function"\n}'
     }
   ])
 })
 
+test("code keeps arbitrary scratch while committing JSON state only on success", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "zi-code-mode-memory-tiers-"))
+  const tool = createCodeMode(cwd).createTool([echoTool])
+
+  const initialized = await tool.execute(
+    "initialize",
+    {
+      code: `async () => {
+  scratch.marker = new Map([["ready", 1]]);
+  state.count = 1;
+  return scratch.marker instanceof Map;
+}`
+    },
+    undefined
+  )
+  expect(initialized.content).toEqual([{ type: "text", text: "true" }])
+
+  const failed = await tool.execute(
+    "fail",
+    {
+      code: `async () => {
+  state.count = 2;
+  scratch.failures = (scratch.failures ?? 0) + 1;
+  throw new Error("rollback");
+}`
+    },
+    undefined
+  )
+  expect(isCodeModeDetails(failed.details) && failed.details.outcome).toBe("error")
+
+  const observed = await tool.execute(
+    "observe",
+    {
+      code: `async () => ({
+  count: state.count,
+  marker: scratch.marker instanceof Map && scratch.marker.get("ready"),
+  failures: scratch.failures
+})`
+    },
+    undefined
+  )
+  expect(observed.content).toEqual([{ type: "text", text: '{\n  "count": 1,\n  "marker": 1,\n  "failures": 1\n}' }])
+})
+
+test("code restores committed state for a replacement runtime", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "zi-code-mode-resume-"))
+  const sessionManager = SessionManager.create(new ZiPaths(cwd, join(cwd, "agent")))
+  const first = new CodeMode(cwd, workerCommand, sessionManager)
+  codeModes.add(first)
+  const firstTool = first.createTool([echoTool])
+  await firstTool.execute("commit", { code: `async () => { state.answer = 42; scratch.onlyHere = true; }` }, undefined)
+  await first.dispose()
+  codeModes.delete(first)
+
+  if (!sessionManager.file) throw new Error("Expected durable session file")
+  const restoredSession = SessionManager.open(sessionManager.file)
+  const replacement = new CodeMode(cwd, workerCommand, restoredSession)
+  codeModes.add(replacement)
+  const result = await replacement
+    .createTool([echoTool])
+    .execute(
+      "restore",
+      { code: `async () => ({ answer: state.answer, scratch: scratch.onlyHere ?? null })` },
+      undefined
+    )
+
+  expect(result.content).toEqual([{ type: "text", text: '{\n  "answer": 42,\n  "scratch": null\n}' }])
+})
+
+test("code rejects invalid state commits, rolls back state, and remains reusable", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "zi-code-mode-invalid-state-"))
+  const tool = createCodeMode(cwd).createTool([echoTool])
+  await tool.execute("commit", { code: `async () => { state.value = "committed"; }` }, undefined)
+
+  const cyclic = await tool.execute(
+    "cyclic",
+    { code: `async () => { state.value = "lost"; state.loop = state; scratch.failure = "preserved"; }` },
+    undefined
+  )
+  expect(isCodeModeDetails(cyclic.details) && cyclic.details.outcome).toBe("error")
+
+  const oversized = await tool.execute(
+    "oversized",
+    { code: `async () => { state.payload = "x".repeat(${maxCodeModeStateBytes}); }` },
+    undefined
+  )
+  expect(isCodeModeDetails(oversized.details) && oversized.details.outcome).toBe("error")
+
+  const recovered = await tool.execute(
+    "recovered",
+    { code: `async () => ({ value: state.value, payload: state.payload ?? null, scratch: scratch.failure })` },
+    undefined
+  )
+  expect(recovered.content).toEqual([
+    { type: "text", text: '{\n  "value": "committed",\n  "payload": null,\n  "scratch": "preserved"\n}' }
+  ])
+})
+
+test("persistent runtime admits a fresh immutable tool catalog for each cell", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "zi-code-mode-catalog-snapshot-"))
+  const codeMode = createCodeMode(cwd)
+  const first = codeMode.createTool([echoTool])
+  await first.execute(
+    "first",
+    { code: `async () => { state.shared = 1; scratch.shared = new Set(["ready"]); }` },
+    undefined
+  )
+
+  const renamed: typeof echoTool = { ...echoTool, name: "renamed" }
+  const second = codeMode.createTool([renamed])
+  const result = await second.execute(
+    "second",
+    {
+      code: `async () => ({
+  old: typeof zi.echo,
+  current: typeof zi.renamed,
+  state: state.shared,
+  scratch: scratch.shared.has("ready")
+})`
+    },
+    undefined
+  )
+  expect(result.content).toEqual([
+    { type: "text", text: '{\n  "old": "undefined",\n  "current": "function",\n  "state": 1,\n  "scratch": true\n}' }
+  ])
+})
+
+test("code mode releases its tracked worker process tree on disposal", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "zi-code-mode-process-tree-"))
+  let trackedPid = 0
+  let terminations = 0
+  const tracker: ProcessTreeTracker = {
+    track(pid): ProcessScope {
+      trackedPid = pid
+      return {
+        platform: "posix",
+        workerPid: pid,
+        admitted: Promise.resolve(),
+        snapshot: () => ({ workerPid: pid, identities: [] }),
+        refresh: async () => ({ type: "ok" }),
+        terminate: async () => {
+          terminations++
+          return { type: "terminated", signaledGroups: 1 }
+        },
+        dispose: async () => {}
+      }
+    },
+    dispose: async () => {}
+  }
+  const codeMode = new CodeMode(cwd, workerCommand, undefined, tracker)
+  codeModes.add(codeMode)
+  const result = await codeMode.createTool([echoTool]).execute("tracked", { code: `async () => "ready"` }, undefined)
+  expect(result.content).toEqual([{ type: "text", text: "ready" }])
+  expect(trackedPid).toBeGreaterThan(0)
+
+  await codeMode.dispose()
+  codeModes.delete(codeMode)
+  expect(terminations).toBe(1)
+})
+
+test("disposing code mode kills a long-lived subprocess created by a cell", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "zi-code-mode-descendant-"))
+  const tracker = createProcessTreeTracker()
+  const codeMode = new CodeMode(cwd, workerCommand, undefined, tracker)
+  codeModes.add(codeMode)
+  let pid = 0
+  try {
+    const result = await codeMode.createTool([]).execute(
+      "spawn",
+      {
+        code: `async () => {
+  const child = Bun.spawn([process.execPath, "-e", "setInterval(() => {}, 1000)"], {
+    stdout: "ignore",
+    stderr: "ignore"
+  });
+  child.unref();
+  return child.pid;
+}`
+      },
+      undefined
+    )
+    pid = Number(result.content[0]?.type === "text" ? result.content[0].text : "")
+    expect(Number.isInteger(pid) && pid > 0).toBe(true)
+    expect(processExists(pid)).toBe(true)
+
+    await codeMode.dispose()
+    codeModes.delete(codeMode)
+    expect(processExists(pid)).toBe(false)
+  } finally {
+    await codeMode.dispose().catch(() => undefined)
+    codeModes.delete(codeMode)
+    await tracker.dispose()
+    if (pid > 0 && processExists(pid)) process.kill(pid, "SIGKILL")
+  }
+})
+
+test("disposing code mode during blocked worker admission releases the process scope", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "zi-code-mode-startup-dispose-"))
+  let terminations = 0
+  let rejectAdmission!: (cause: unknown) => void
+  const admitted = new Promise<void>((_, reject) => {
+    rejectAdmission = reject
+  })
+  void admitted.catch(() => {})
+  const tracker: ProcessTreeTracker = {
+    track(pid): ProcessScope {
+      return {
+        platform: "posix",
+        workerPid: pid,
+        admitted,
+        snapshot: () => ({ workerPid: pid, identities: [] }),
+        refresh: async () => ({ type: "ok" }),
+        terminate: async () => {
+          terminations++
+          rejectAdmission(new Error("admission interrupted by disposal"))
+          return { type: "terminated", signaledGroups: 1 }
+        },
+        dispose: async () => {}
+      }
+    },
+    dispose: async () => {}
+  }
+  const codeMode = new CodeMode(cwd, workerCommand, undefined, tracker)
+  codeModes.add(codeMode)
+  const execution = codeMode.createTool([echoTool]).execute("starting", { code: `async () => "ready"` }, undefined)
+  const settledExecution = execution.catch(cause => cause)
+  await Bun.sleep(0)
+
+  await codeMode.dispose()
+  codeModes.delete(codeMode)
+  const result = await settledExecution
+  if (result instanceof Error) throw result
+  expect(isCodeModeDetails(result.details) && result.details.outcome).toBe("error")
+  expect(terminations).toBe(1)
+})
+
 test("code enforces its nested call bound", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "zi-code-mode-call-bound-"))
-  const tool = new CodeMode(cwd, workerCommand).createTool([echoTool])
+  const tool = createCodeMode(cwd).createTool([echoTool])
   const result = await tool.execute(
     "outer",
     { code: `async () => { for (let index = 0; index < 65; index++) await zi.echo({ value: String(index) }); }` },
@@ -248,7 +523,7 @@ test("code enforces its nested call bound", async () => {
 
 test("code guest can catch built-in expected errors and uncaught failures settle the outer tool", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "zi-code-mode-expected-error-"))
-  const tool = new CodeMode(cwd, workerCommand).createTool([createReadTool(cwd)])
+  const tool = createCodeMode(cwd).createTool([createReadTool(cwd)])
   const caught = await tool.execute(
     "caught",
     {
@@ -289,7 +564,7 @@ test("code durable traces redact built-in write and edit payloads", async () => 
     }),
     execute: async () => ({ content: [{ type: "text", text: "Edited secret.txt" }], details: { outcome: "success" } })
   }
-  const tool = new CodeMode(cwd, workerCommand).createTool([writeTool, editTool])
+  const tool = createCodeMode(cwd).createTool([writeTool, editTool])
   const result = await tool.execute(
     "outer",
     {
@@ -315,7 +590,7 @@ test("code durable traces redact built-in write and edit payloads", async () => 
 test("code supports punctuation in extension tool names", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "zi-code-mode-tool-name-"))
   const namedTool: typeof echoTool = { ...echoTool, name: "api.search-v2" }
-  const tool = new CodeMode(cwd, workerCommand).createTool([namedTool])
+  const tool = createCodeMode(cwd).createTool([namedTool])
   const result = await tool.execute("outer", { code: `async () => zi["api.search-v2"]({ value: "found" })` }, undefined)
 
   expect(result.content).toEqual([{ type: "text", text: "found" }])
@@ -330,7 +605,7 @@ test("code propagates nested turn termination and rejects later calls", async ()
     parameters: Type.Object({}),
     execute: async () => ({ content: [{ type: "text", text: "stopped" }], details: {}, terminate: true })
   }
-  const tool = new CodeMode(cwd, workerCommand).createTool([stopTool, echoTool])
+  const tool = createCodeMode(cwd).createTool([stopTool, echoTool])
   const result = await tool.execute(
     "outer",
     { code: `async () => { await zi.stop({}); return zi.echo({ value: "too late" }); }` },
@@ -373,25 +648,86 @@ test("cancelling code aborts its active nested tool and worker", async () => {
       throw new Error("Unreachable waiting tool completion")
     }
   }
-  const tool = new CodeMode(cwd, workerCommand).createTool([waitingTool])
+  const tool = createCodeMode(cwd).createTool([waitingTool])
   const controller = new AbortController()
   const execution = tool.execute("outer", { code: `async () => zi.wait({})` }, controller.signal)
   await active
   controller.abort(new Error("cancelled by test"))
 
-  expect(execution).rejects.toThrow("cancelled by test")
+  expect(await rejectionMessage(execution)).toContain("cancelled by test")
   expect(nestedAborted).toBe(true)
 })
 
+test("late nested completion cannot cross a cancelled worker generation", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "zi-code-mode-stale-completion-"))
+  let markStarted!: () => void
+  const started = new Promise<void>(resolve => {
+    markStarted = resolve
+  })
+  let release!: () => void
+  const late = new Promise<void>(resolve => {
+    release = resolve
+  })
+  const holdTool: AgentTool = {
+    name: "hold",
+    label: "hold",
+    description: "Ignore cancellation until released",
+    parameters: Type.Object({}),
+    execute: async () => {
+      markStarted()
+      await late
+      return { content: [{ type: "text", text: "late" }], details: {} }
+    }
+  }
+  const tool = createCodeMode(cwd).createTool([holdTool])
+  const controller = new AbortController()
+  const cancelled = tool.execute(
+    "cancelled",
+    {
+      code: `async () => {
+  state.generation = "cancelled";
+  scratch.generation = "cancelled";
+  await zi.hold({});
+}`
+    },
+    controller.signal
+  )
+  await started
+  controller.abort(new Error("replace generation"))
+  expect(await rejectionMessage(cancelled)).toContain("replace generation")
+
+  const recovered = await tool.execute(
+    "recovered",
+    {
+      code: `async () => {
+  state.generation = "current";
+  scratch.generation = "current";
+  return { state: state.generation, scratch: scratch.generation };
+}`
+    },
+    undefined
+  )
+  release()
+  await Bun.sleep(10)
+  expect(recovered.content).toEqual([{ type: "text", text: '{\n  "state": "current",\n  "scratch": "current"\n}' }])
+  const observed = await tool.execute(
+    "observed",
+    { code: `async () => ({ state: state.generation, scratch: scratch.generation })` },
+    undefined
+  )
+  expect(observed.content).toEqual(recovered.content)
+}, 7_000)
+
 test("cancelling code terminates a guest that cannot yield to protocol input", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "zi-code-mode-hard-cancel-"))
-  const tool = new CodeMode(cwd, workerCommand).createTool([echoTool])
+  const tool = createCodeMode(cwd).createTool([echoTool])
+  await tool.execute("warmup", { code: `async () => "ready"` }, undefined)
   const controller = new AbortController()
   const execution = tool.execute("outer", { code: `async () => { while (true) {} }` }, controller.signal)
   await Bun.sleep(50)
   controller.abort(new Error("hard cancellation"))
 
-  expect(execution).rejects.toThrow("hard cancellation")
+  expect(await rejectionMessage(execution)).toContain("hard cancellation")
 })
 
 test("code rejects unawaited nested calls and cancels their admitted work", async () => {
@@ -407,7 +743,7 @@ test("code rejects unawaited nested calls and cancels their admitted work", asyn
       return { content: [{ type: "text", text: "mutated" }], details: {} }
     }
   }
-  const tool = new CodeMode(cwd, workerCommand).createTool([mutatingTool])
+  const tool = createCodeMode(cwd).createTool([mutatingTool])
   const result = await tool.execute(
     "outer",
     { code: `async () => { zi.mutate({ value: 1 }); zi.mutate({ value: 2 }); return "early"; }` },
@@ -424,7 +760,7 @@ test("code rejects unawaited nested calls and cancels their admitted work", asyn
 
 test("code contains guest memory exhaustion in its worker", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "zi-code-mode-memory-"))
-  const tool = new CodeMode(cwd, workerCommand).createTool([echoTool])
+  const tool = createCodeMode(cwd).createTool([echoTool])
   const result = await tool.execute(
     "outer",
     {
@@ -440,15 +776,28 @@ test("code contains guest memory exhaustion in its worker", async () => {
     throw new Error("Expected code-mode memory error")
   }
   expect(result.details.error.toLowerCase()).toContain("memory")
+  expect(result.content[0]).toEqual({
+    type: "text",
+    text: expect.stringContaining(
+      "The programmatic worker was replaced. Volatile scratch was cleared; committed state was preserved."
+    )
+  })
 })
 
-test("code interrupts an infinite guest loop", async () => {
+test("code restarts cleanly after interrupting an infinite cell", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "zi-code-mode-loop-"))
-  const tool = new CodeMode(cwd, workerCommand).createTool([echoTool])
-  const result = await tool.execute("outer", { code: `async () => { while (true) {} }` }, undefined)
+  const tool = createCodeMode(cwd).createTool([echoTool])
+  await tool.execute("warmup", { code: `async () => { state.saved = 7; scratch.volatile = "old worker"; }` }, undefined)
+  const controller = new AbortController()
+  const blocked = tool.execute("blocked", { code: `async () => { while (true) {} }` }, controller.signal)
+  await Bun.sleep(50)
+  controller.abort(new Error("interrupt infinite cell"))
 
-  expect(isCodeModeDetails(result.details)).toBe(true)
-  if (!isCodeModeDetails(result.details)) throw new Error("Expected code-mode details")
-  if (result.details.outcome !== "error") throw new Error("Expected code-mode error")
-  expect(result.details.error.length).toBeGreaterThan(0)
+  expect(await rejectionMessage(blocked)).toContain("interrupt infinite cell")
+  const recovered = await tool.execute(
+    "recovered",
+    { code: `async () => ({ saved: state.saved, scratch: scratch.volatile ?? null })` },
+    undefined
+  )
+  expect(recovered.content).toEqual([{ type: "text", text: '{\n  "saved": 7,\n  "scratch": null\n}' }])
 })

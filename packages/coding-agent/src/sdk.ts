@@ -21,6 +21,7 @@ import { createSessionResources, type ResourceLoader, type SessionResources } fr
 import type { SessionManager, SessionModel } from "./session-manager.js"
 import type { SessionShell } from "./session-shell.js"
 import type { SettingsManager } from "./settings-manager.js"
+import { PeerMessenger } from "./subagents/peer-messenger.js"
 import { SubagentSupervisor } from "./subagents/supervisor.js"
 import { buildSystemPrompt } from "./system-prompt.js"
 import { isBuiltInToolError } from "./tools/index.js"
@@ -118,6 +119,9 @@ export async function createAgentSessionWithProcessTreeTracker(
   const thinkingLevel = model ? clampThinkingLevel(model, preferredThinking) : "off"
   const bootstrapDiagnostic = createBootstrapDiagnostic(unavailableSessionModel, model)
   let session: AgentSession | undefined
+  const peerMessenger = options.internalSubagentDepth === 1 ? new PeerMessenger() : undefined
+  const peerTools = peerMessenger?.createTools() ?? []
+  const sessionTools = Object.freeze([...options.tools, ...peerTools])
   const subagents =
     options.subagentCommand && options.internalSubagentDepth !== 1
       ? new SubagentSupervisor({
@@ -144,12 +148,12 @@ export async function createAgentSessionWithProcessTreeTracker(
       systemPrompt: buildSystemPrompt(
         sessionManager.header.cwd,
         resources,
-        options.tools,
+        sessionTools,
         options.codeMode !== undefined
       ),
       ...(model ? { model } : {}),
       thinkingLevel,
-      tools: [...options.tools],
+      tools: [...sessionTools],
       messages: [...bootstrap.messages]
     },
     convertToLlm,
@@ -205,9 +209,10 @@ export async function createAgentSessionWithProcessTreeTracker(
     modelRegistry: services.modelRegistry,
     resources,
     projectFileSearch: new ProjectFileSearch(services.paths),
-    tools: options.tools,
+    tools: sessionTools,
     reload,
     ...(subagents ? { subagentSupervisor: subagents } : {}),
+    ...(peerMessenger ? { peerMessenger } : {}),
     ...(options.codeMode ? { codeMode: options.codeMode } : {}),
     ...(options.extensionHost ? { extensionHost: options.extensionHost } : {}),
     extensionContext: createExtensionContext(options.extensionMode ?? "embedded", services, sessionManager),

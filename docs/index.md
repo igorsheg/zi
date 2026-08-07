@@ -57,6 +57,7 @@ That last step is the important one. Zi gets better when you stop retyping instr
 - [Prompts](prompts.md) — add reusable slash prompts or system instructions.
 - [Skills](skills.md) — teach Zi reusable workflows.
 - [Extensions](extensions.md) — add trusted commands, tools, state, and orchestration.
+- [Code Mode](code-mode.md) — understand generated JavaScript, persistent memory, and local authority.
 - [Subagents](subagents.md) — define reusable delegated roles.
 - [JSON events](json-events.md) — consume a finite run as JSONL.
 - [RPC](rpc.md) — control a long-lived Zi process.

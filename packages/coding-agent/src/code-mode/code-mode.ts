@@ -2,6 +2,8 @@ import type { AgentTool, AgentToolResult, AgentToolUpdateCallback } from "@earen
 import { Type } from "@earendil-works/pi-ai"
 import { validateToolArguments } from "@earendil-works/pi-ai/compat"
 
+import type { ProcessTreeTracker } from "../processes/process-tree.js"
+import type { SessionManager } from "../session-manager.js"
 import { isBuiltInToolError } from "../tools/outcome.js"
 import { createCodeModeWorkerSpawner, type CodeModeWorkerExit, type CodeModeWorkerProcess } from "./process.js"
 import {
@@ -10,12 +12,16 @@ import {
   codeModeProtocolVersion,
   isCodeModeToolName,
   maxCodeBytes,
+  maxCodeModeCalls,
   maxCodeModeErrorBytes,
+  maxCodeModeStateBytes,
   maxCodeModeToolNames,
   validateCodeModeJson,
+  validateCodeModeState,
   validateWorkerMessage,
   type CodeModeHostMessage,
   type CodeModeJson,
+  type CodeModeState,
   type CodeModeWorkerMessage
 } from "./protocol.js"
 import { codeModeToolContract } from "./tool-contract.js"
@@ -56,35 +62,59 @@ const defaultTimeouts: CodeModeTimeouts = Object.freeze({
 interface CodeExecutionResult {
   readonly type: "completed" | "failed"
   readonly result?: CodeModeJson
+  readonly state?: CodeModeState
   readonly error?: string
   readonly calls: readonly CodeModeCall[]
   readonly logs: readonly string[]
   readonly terminate: boolean
+  readonly recoverWorker: boolean
 }
 
-type ExecutionState =
+type ExecutionState = { readonly type: "running" } | { readonly type: "final" } | { readonly type: "settled" }
+
+type WorkerState =
   | { readonly type: "starting" }
-  | { readonly type: "running" }
-  | { readonly type: "final" }
-  | { readonly type: "settled" }
+  | { readonly type: "ready" }
+  | {
+      readonly type: "running"
+      readonly executionId: number
+      readonly accept: (message: Extract<CodeModeWorkerMessage, { type: "tool_call" }>) => void
+      readonly final: ReturnType<typeof deferred<Extract<CodeModeWorkerMessage, { type: "completed" | "failed" }>>>
+    }
+  | { readonly type: "disposed" }
 
 export class CodeMode {
   readonly #spawn: () => CodeModeWorkerProcess
-  readonly #timeouts: CodeModeTimeouts
+  readonly #sessionManager: SessionManager | undefined
+  #worker: CodeWorker | undefined
+  #startingWorker: CodeWorker | undefined
+  #workerStart: Promise<CodeWorker> | undefined
+  #workerReset: Promise<void> | undefined
+  #generation = 0
+  #executionId = 0
+  #state: CodeModeState
+  #disposed = false
+  #disposal: Promise<void> | undefined
 
-  constructor(cwd: string, workerCommand: readonly string[]) {
-    const spawn = createCodeModeWorkerSpawner(workerCommand)
+  constructor(
+    cwd: string,
+    workerCommand: readonly string[],
+    sessionManager?: SessionManager,
+    processTreeTracker?: ProcessTreeTracker
+  ) {
+    const spawn = createCodeModeWorkerSpawner(workerCommand, processTreeTracker)
     this.#spawn = () => spawn(cwd)
-    this.#timeouts = defaultTimeouts
+    this.#sessionManager = sessionManager
+    const restored = sessionManager?.latestActiveProgramState()?.data
+    this.#state = restored === undefined ? {} : validateCodeModeState(restored)
   }
 
   createTool(tools: readonly AgentTool[]): AgentTool<typeof parameters, CodeModeDetails> {
     if (tools.some(tool => tool.name === "code" || tool.name === "then")) {
       throw new Error("The tool names code and then are reserved for native code mode")
     }
-    if (tools.length > maxCodeModeToolNames) {
+    if (tools.length > maxCodeModeToolNames)
       throw new Error(`Code mode cannot admit more than ${maxCodeModeToolNames} tools`)
-    }
     if (tools.some(tool => !isCodeModeToolName(tool.name))) {
       throw new Error("Code mode requires non-empty bounded tool names without control characters")
     }
@@ -100,33 +130,39 @@ export class CodeMode {
       parameters,
       executionMode: "sequential",
       execute: async (toolCallId, input, signal, onUpdate) => {
-        if (Buffer.byteLength(input.code) > maxCodeBytes) {
-          const error = `Code must not exceed ${maxCodeBytes} bytes`
-          return {
-            content: [{ type: "text", text: `Code execution failed: ${error}` }],
-            details: { type: "code_mode", outcome: "error", error, calls: [], logs: [] }
-          }
-        }
-        let process: CodeModeWorkerProcess
+        if (Buffer.byteLength(input.code) > maxCodeBytes)
+          return codeFailure(`Code must not exceed ${maxCodeBytes} bytes`)
+        if (this.#disposed) return codeFailure("Programmatic runtime is disposed")
+        let worker: CodeWorker
         try {
-          process = this.#spawn()
+          worker = await this.#ensureWorker(signal)
         } catch (cause) {
           if (signal?.aborted) throw cause
-          const error = boundedErrorText(errorMessage(cause))
-          return {
-            content: [{ type: "text", text: `Code execution failed: ${error}` }],
-            details: { type: "code_mode", outcome: "error", error, calls: [], logs: [] }
-          }
+          return codeFailure(errorMessage(cause))
         }
-        const execution = new CodeExecution(process, this.#timeouts, toolCallId, input.code, byName, signal, onUpdate)
-        const result = await execution.run()
-        if (result.type === "failed") {
-          const error = boundedErrorText(result.error ?? "Code execution failed")
-          return {
-            content: [{ type: "text", text: `Code execution failed: ${error}` }],
-            details: { type: "code_mode", outcome: "error", error, calls: result.calls, logs: result.logs },
-            ...(result.terminate ? { terminate: true } : {})
-          }
+        const execution = new CodeExecution(
+          worker,
+          toolCallId,
+          this.#executionId++,
+          input.code,
+          byName,
+          this.#state,
+          signal,
+          onUpdate
+        )
+        let result: CodeExecutionResult
+        try {
+          result = await execution.run()
+        } catch (cause) {
+          await this.#resetWorker(worker)
+          throw cause
+        }
+        if (result.recoverWorker) await this.#resetWorker(worker)
+        if (result.type === "failed") return resultFailure(result)
+        try {
+          if (result.state) this.#commitState(result.state)
+        } catch (cause) {
+          return stateCommitFailure(result, cause)
         }
         return {
           content: [{ type: "text", text: formatResult(result.result, result.logs) }],
@@ -136,43 +172,264 @@ export class CodeMode {
       }
     }
   }
+
+  dispose(): Promise<void> {
+    if (this.#disposal) return this.#disposal
+    this.#disposed = true
+    const disposal = this.#disposeOwnedWorker()
+    this.#disposal = disposal
+    return disposal
+  }
+
+  async #disposeOwnedWorker(): Promise<void> {
+    const starting = this.#workerStart
+    const worker = this.#worker ?? this.#startingWorker
+    this.#worker = undefined
+    this.#startingWorker = undefined
+    this.#workerStart = undefined
+    if (worker) await worker.dispose()
+    await starting?.catch(() => undefined)
+    await this.#workerReset?.catch(() => undefined)
+  }
+
+  async #ensureWorker(signal?: AbortSignal): Promise<CodeWorker> {
+    if (this.#disposed) throw new Error("Programmatic runtime is disposed")
+    await this.#workerReset
+    if (this.#disposed) throw new Error("Programmatic runtime is disposed")
+    if (this.#worker) return this.#worker
+    if (!this.#workerStart) {
+      const worker = new CodeWorker(this.#spawn(), ++this.#generation)
+      this.#startingWorker = worker
+      const start = worker
+        .start()
+        .then(() => {
+          if (this.#disposed) throw new Error("Programmatic runtime was disposed during startup")
+          this.#worker = worker
+          return worker
+        })
+        .catch(async cause => {
+          await worker.dispose()
+          throw cause
+        })
+      this.#workerStart = start
+      void start
+        .finally(() => {
+          if (this.#startingWorker === worker) this.#startingWorker = undefined
+          if (this.#workerStart === start) this.#workerStart = undefined
+        })
+        .catch(() => {})
+    }
+    return raceWithAbort(this.#workerStart, signal)
+  }
+
+  async #resetWorker(worker: CodeWorker): Promise<void> {
+    if (this.#worker === worker) this.#worker = undefined
+    const reset = worker.dispose()
+    this.#workerReset = reset
+    try {
+      await reset
+    } finally {
+      if (this.#workerReset === reset) this.#workerReset = undefined
+    }
+  }
+
+  #commitState(state: CodeModeState): void {
+    const next = validateCodeModeState(state)
+    if (JSON.stringify(next) === JSON.stringify(this.#state)) return
+    this.#sessionManager?.appendProgramState(next)
+    this.#state = next
+  }
+}
+
+class CodeWorker {
+  readonly #process: CodeModeWorkerProcess
+  readonly #generation: number
+  readonly #writer: CodeModeProtocolWriter
+  readonly #ready = deferred<void>()
+  readonly #failure = deferred<never>()
+  readonly #stdout: BoundedOutput
+  readonly #stderr: BoundedOutput
+  readonly #protocol: Promise<void>
+  #state: WorkerState = { type: "starting" }
+
+  constructor(process: CodeModeWorkerProcess, generation: number) {
+    this.#process = process
+    this.#generation = generation
+    this.#writer = new CodeModeProtocolWriter(process.input)
+    this.#stdout = new BoundedOutput(process.stdout)
+    this.#stderr = new BoundedOutput(process.stderr)
+    this.#protocol = this.#readProtocol()
+  }
+
+  async start(): Promise<void> {
+    const startupDeadline = createDeadline(defaultTimeouts.startupMs, "Code-mode worker startup timed out")
+    try {
+      await Promise.race([
+        this.#process.admitted,
+        this.#process.containmentFailure,
+        processExited(this.#process.exited),
+        startupDeadline.promise
+      ])
+      await this.#writer.send({ version: codeModeProtocolVersion, type: "initialize", generation: this.#generation })
+      await Promise.race([
+        this.#ready.promise,
+        this.#failure.promise,
+        this.#process.containmentFailure,
+        processExited(this.#process.exited),
+        startupDeadline.promise
+      ])
+      if (this.#state.type !== "ready") throw new Error("Code-mode worker did not become ready")
+    } finally {
+      startupDeadline.dispose()
+    }
+  }
+
+  execute(
+    executionId: number,
+    code: string,
+    tools: readonly string[],
+    state: CodeModeState,
+    accept: (message: Extract<CodeModeWorkerMessage, { type: "tool_call" }>) => void
+  ): Promise<Extract<CodeModeWorkerMessage, { type: "completed" | "failed" }>> {
+    if (this.#state.type !== "ready") return Promise.reject(new Error("Code-mode worker is not ready"))
+    const final = deferred<Extract<CodeModeWorkerMessage, { type: "completed" | "failed" }>>()
+    this.#state = { type: "running", executionId, accept, final }
+    return this.#writer
+      .send({
+        version: codeModeProtocolVersion,
+        type: "execute",
+        generation: this.#generation,
+        executionId,
+        code,
+        tools,
+        state
+      })
+      .then(() => Promise.race([final.promise, this.#failure.promise, this.#process.containmentFailure]))
+  }
+
+  send(message: Extract<CodeModeHostMessage, { type: "tool_result" | "tool_error" }>): Promise<void> {
+    if (
+      this.#state.type !== "running" ||
+      message.generation !== this.#generation ||
+      message.executionId !== this.#state.executionId
+    )
+      return Promise.reject(new Error("Stale code-mode tool response"))
+    return this.#writer.send(message)
+  }
+
+  get diagnostic(): string {
+    return this.#stderr.text || this.#stdout.text
+  }
+
+  async settledDiagnostic(): Promise<string> {
+    await settle(
+      Promise.allSettled([this.#stdout.settled, this.#stderr.settled]),
+      100,
+      "Code-mode worker diagnostics did not settle"
+    ).catch(() => undefined)
+    return this.diagnostic
+  }
+
+  async dispose(): Promise<void> {
+    if (this.#state.type === "disposed") return
+    this.#state = { type: "disposed" }
+    this.#failure.reject(new Error("Code-mode worker disposed"))
+    this.#writer.dispose()
+    this.#process.closeInput()
+    this.#process.terminate(false)
+    if (!(await exitsWithin(this.#process.exited, defaultTimeouts.shutdownMs))) this.#process.terminate(true)
+    let treeFailure: unknown
+    try {
+      await this.#process.terminateTree()
+    } catch (cause) {
+      treeFailure = cause
+    }
+    const exited = await exitsWithin(this.#process.exited, defaultTimeouts.shutdownMs)
+    this.#process.dispose()
+    let streamFailure: unknown
+    try {
+      await settle(
+        Promise.allSettled([this.#protocol, this.#stdout.settled, this.#stderr.settled]),
+        defaultTimeouts.shutdownMs,
+        "Code-mode worker streams did not settle"
+      )
+    } catch (cause) {
+      streamFailure = cause
+    }
+    if (treeFailure) throw treeFailure
+    if (!exited) throw new Error(`Code-mode worker process ${this.#process.pid} did not exit during disposal`)
+    if (streamFailure) throw streamFailure
+  }
+
+  async #readProtocol(): Promise<void> {
+    const decoder = new CodeModeProtocolDecoder(validateWorkerMessage)
+    try {
+      for await (const chunk of this.#process.protocol) {
+        for (const message of decoder.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))) this.#accept(message)
+      }
+      decoder.end()
+      if (this.#state.type !== "disposed") this.#failure.reject(new Error("Code-mode worker protocol ended"))
+    } catch (cause) {
+      this.#failure.reject(cause)
+    }
+  }
+
+  #accept(message: CodeModeWorkerMessage): void {
+    if (message.generation !== this.#generation) throw new Error("Stale code-mode worker generation")
+    if (message.type === "ready") {
+      if (this.#state.type !== "starting") throw new Error("Unexpected code-mode ready message")
+      this.#state = { type: "ready" }
+      this.#ready.resolve()
+      return
+    }
+    if (message.type === "tool_call") {
+      if (this.#state.type !== "running" || message.executionId !== this.#state.executionId) {
+        throw new Error("Code-mode tool call arrived outside execution")
+      }
+      this.#state.accept(message)
+      return
+    }
+    if (this.#state.type !== "running" || message.executionId !== this.#state.executionId) {
+      throw new Error("Code-mode result arrived outside execution")
+    }
+    const final = this.#state.final
+    this.#state = { type: "ready" }
+    final.resolve(message)
+  }
 }
 
 class CodeExecution {
-  readonly #process: CodeModeWorkerProcess
-  readonly #writer: CodeModeProtocolWriter
-  readonly #timeouts: CodeModeTimeouts
+  readonly #worker: CodeWorker
   readonly #toolCallId: string
+  readonly #executionId: number
   readonly #code: string
   readonly #tools: ReadonlyMap<string, AgentTool>
+  readonly #programState: CodeModeState
   readonly #parentSignal: AbortSignal | undefined
   readonly #onUpdate: AgentToolUpdateCallback<CodeModeDetails> | undefined
   readonly #controller = new AbortController()
   readonly #calls: CodeModeCall[] = []
   readonly #callIds = new Set<number>()
-  readonly #ready = deferred<void>()
-  readonly #final = deferred<Extract<CodeModeWorkerMessage, { type: "completed" | "failed" }>>()
-  readonly #failure = deferred<never>()
-  readonly #timers = new Set<ReturnType<typeof setTimeout>>()
-  #state: ExecutionState = { type: "starting" }
+  #state: ExecutionState = { type: "running" }
   #dispatchQueue = Promise.resolve()
   #terminate = false
 
   constructor(
-    process: CodeModeWorkerProcess,
-    timeouts: CodeModeTimeouts,
+    worker: CodeWorker,
     toolCallId: string,
+    executionId: number,
     code: string,
     tools: ReadonlyMap<string, AgentTool>,
+    programState: CodeModeState,
     parentSignal: AbortSignal | undefined,
     onUpdate: AgentToolUpdateCallback<CodeModeDetails> | undefined
   ) {
-    this.#process = process
-    this.#writer = new CodeModeProtocolWriter(process.input)
-    this.#timeouts = timeouts
+    this.#worker = worker
     this.#toolCallId = toolCallId
+    this.#executionId = executionId
     this.#code = code
     this.#tools = tools
+    this.#programState = programState
     this.#parentSignal = parentSignal
     this.#onUpdate = onUpdate
   }
@@ -181,156 +438,62 @@ class CodeExecution {
     const abort = () => this.#controller.abort(this.#parentSignal?.reason ?? new Error("Code execution aborted"))
     if (this.#parentSignal?.aborted) abort()
     else this.#parentSignal?.addEventListener("abort", abort, { once: true })
-
-    const stdout = new BoundedOutput(this.#process.stdout)
-    const stderr = new BoundedOutput(this.#process.stderr)
-    const protocol = this.#readProtocol()
-    const exit = this.#process.exited
-    let outcome: CodeExecutionResult | undefined
-    let cancellation: Error | undefined
+    const executionDeadline = createDeadline(defaultTimeouts.executionMs, "Code execution timed out")
     try {
-      const start: CodeModeHostMessage = {
-        version: codeModeProtocolVersion,
-        type: "start",
-        code: this.#code,
-        tools: Object.freeze([...this.#tools.keys()])
-      }
-      await this.#writer.send(start)
-      await Promise.race([
-        this.#ready.promise,
-        this.#failure.promise,
-        processExited(exit),
-        aborted(this.#controller.signal),
-        this.#deadline(this.#timeouts.startupMs, "Code-mode worker startup timed out")
-      ])
-      if (this.#state.type !== "running") throw new Error("Code-mode worker did not enter running state")
-
       const final = await Promise.race([
-        this.#final.promise,
-        this.#failure.promise,
-        processExited(exit),
+        this.#worker.execute(this.#executionId, this.#code, [...this.#tools.keys()], this.#programState, message =>
+          this.#queueCall(message)
+        ),
         aborted(this.#controller.signal),
-        this.#deadline(this.#timeouts.executionMs, "Code execution timed out")
+        executionDeadline.promise
       ])
-      await settle(this.#dispatchQueue, this.#timeouts.nestedSettlementMs, "Nested code-mode tools did not settle")
-      const calls = snapshotCalls(this.#calls)
-      outcome =
-        final.type === "failed"
-          ? { type: "failed", error: final.error, calls, logs: final.logs, terminate: this.#terminate }
-          : {
-              type: "completed",
-              ...(final.result === undefined ? {} : { result: final.result }),
-              calls,
-              logs: final.logs,
-              terminate: this.#terminate
-            }
+      this.#state = { type: "final" }
+      if (final.type === "failed") this.#controller.abort(new Error(final.error))
+      await settle(this.#dispatchQueue, defaultTimeouts.nestedSettlementMs, "Nested code-mode tools did not settle")
+      const common = {
+        calls: snapshotCalls(this.#calls),
+        logs: final.logs,
+        terminate: this.#terminate,
+        recoverWorker: false
+      }
+      if (final.type === "failed") {
+        return { type: "failed", error: final.error, ...common, recoverWorker: final.reset === true }
+      }
+      return {
+        type: "completed",
+        ...(final.result === undefined ? {} : { result: final.result }),
+        state: final.state,
+        ...common
+      }
     } catch (cause) {
       this.#controller.abort(cause)
       await settle(
         this.#dispatchQueue,
-        this.#timeouts.nestedSettlementMs,
+        defaultTimeouts.nestedSettlementMs,
         "Nested code-mode tools did not settle"
       ).catch(() => undefined)
       this.#abortCalls()
-      if (this.#parentSignal?.aborted) cancellation = abortError(this.#controller.signal)
-      else {
-        outcome = {
-          type: "failed",
-          error: boundedErrorText(errorMessage(cause)),
-          calls: snapshotCalls(this.#calls),
-          logs: [],
-          terminate: this.#terminate
-        }
+      if (this.#parentSignal?.aborted) throw abortError(this.#controller.signal)
+      const diagnostic = await this.#worker.settledDiagnostic()
+      return {
+        type: "failed",
+        error: boundedErrorText(`${errorMessage(cause)}${diagnostic ? `\nWorker: ${diagnostic}` : ""}`),
+        calls: snapshotCalls(this.#calls),
+        logs: [],
+        terminate: this.#terminate,
+        recoverWorker: true
       }
     } finally {
-      const workerFinished = this.#state.type === "final"
       this.#state = { type: "settled" }
-      for (const timer of this.#timers) clearTimeout(timer)
-      this.#timers.clear()
+      executionDeadline.dispose()
       this.#controller.abort()
       this.#parentSignal?.removeEventListener("abort", abort)
-      this.#writer.dispose()
-      this.#process.closeInput()
-      if (!workerFinished) this.#process.terminate(false)
-      if (!(await exitsWithin(exit, this.#timeouts.shutdownMs))) {
-        this.#process.terminate(true)
-        await exitsWithin(exit, this.#timeouts.shutdownMs)
-      }
-      this.#process.dispose()
-      await settle(
-        Promise.allSettled([protocol, stdout.settled, stderr.settled]),
-        this.#timeouts.shutdownMs,
-        "Code-mode streams did not settle"
-      ).catch(() => undefined)
-    }
-
-    if (cancellation) throw cancellation
-    if (!outcome) throw new Error("Code execution settled without an outcome")
-    const diagnostic = stderr.text || stdout.text
-    if (outcome.type === "failed" && diagnostic) {
-      return {
-        ...outcome,
-        error: boundedErrorText(`${outcome.error ?? "Code execution failed"}\nWorker: ${diagnostic}`)
-      }
-    }
-    return outcome
-  }
-
-  #deadline(milliseconds: number, message: string): Promise<never> {
-    return new Promise<never>((_, reject) => {
-      const timer = setTimeout(() => {
-        this.#timers.delete(timer)
-        reject(new Error(message))
-      }, milliseconds)
-      this.#timers.add(timer)
-    })
-  }
-
-  async #readProtocol(): Promise<void> {
-    const decoder = new CodeModeProtocolDecoder(validateWorkerMessage)
-    try {
-      for await (const chunk of this.#process.protocol) {
-        for (const message of decoder.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))) {
-          this.#accept(message)
-        }
-      }
-      decoder.end()
-      if (this.#state.type === "starting" || this.#state.type === "running") {
-        this.#failure.reject(new Error("Code-mode worker protocol ended before execution completed"))
-      }
-    } catch (cause) {
-      this.#failure.reject(cause)
-    }
-  }
-
-  #accept(message: CodeModeWorkerMessage): void {
-    switch (message.type) {
-      case "ready":
-        if (this.#state.type !== "starting") throw new Error("Unexpected code-mode ready message")
-        this.#state = { type: "running" }
-        this.#ready.resolve()
-        break
-      case "tool_call":
-        if (this.#state.type !== "running") throw new Error("Code-mode tool call arrived outside execution")
-        this.#queueCall(message)
-        break
-      case "completed":
-      case "failed":
-        if (this.#state.type !== "running") throw new Error("Code-mode result arrived outside execution")
-        this.#state = { type: "final" }
-        if (message.type === "failed") this.#controller.abort(new Error(message.error))
-        this.#final.resolve(message)
-        break
-      default:
-        assertNever(message)
     }
   }
 
   #queueCall(message: Extract<CodeModeWorkerMessage, { type: "tool_call" }>): void {
-    if (this.#callIds.has(message.id)) {
-      this.#failure.reject(new Error(`Duplicate code-mode call ID: ${message.id}`))
-      return
-    }
+    if (this.#state.type !== "running") return
+    if (this.#callIds.has(message.id)) throw new Error(`Duplicate code-mode call ID: ${message.id}`)
     this.#callIds.add(message.id)
     const startedAt = Date.now()
     const traceArguments = projectTraceArguments(message.name, message.arguments)
@@ -338,7 +501,6 @@ class CodeExecution {
       this.#calls.push({ state: "running", id: message.id, name: message.name, arguments: traceArguments, startedAt }) -
       1
     this.#publishProgress()
-
     const operation = this.#dispatchQueue.then(async () => {
       if (this.#controller.signal.aborted) throw abortError(this.#controller.signal)
       const tool = this.#tools.get(message.name)
@@ -357,17 +519,17 @@ class CodeExecution {
         this.#calls[callIndex] = { ...call, preview: boundedText(toolResultText(partial)) }
         this.#publishProgress()
       }
-      const toolCallId = `${this.#toolCallId}:code:${message.id}`
+      const nestedId = `${this.#toolCallId}:code:${message.id}`
       const contract = codeModeToolContract(tool)
       const invocation = contract
-        ? await contract.execute(toolCallId, validated, this.#controller.signal, onUpdate)
-        : { result: await tool.execute(toolCallId, validated, this.#controller.signal, onUpdate), value: undefined }
+        ? await contract.execute(nestedId, validated, this.#controller.signal, onUpdate)
+        : { result: await tool.execute(nestedId, validated, this.#controller.signal, onUpdate), value: undefined }
       const text = toolResultText(invocation.result)
       if (isBuiltInToolError(message.name, invocation.result.details)) throw new Error(text)
       if (invocation.result.terminate) this.#terminate = true
       return {
         text,
-        value: contract ? validateCodeModeJson(invocation.value) : text,
+        value: validateCodeModeJson(contract ? invocation.value : text),
         terminate: invocation.result.terminate === true
       }
     })
@@ -377,7 +539,7 @@ class CodeExecution {
     )
     void operation.then(
       async result => {
-        if (this.#state.type === "settled") return undefined
+        if (this.#state.type !== "running") return undefined
         this.#calls[callIndex] = {
           state: "succeeded",
           id: message.id,
@@ -388,22 +550,21 @@ class CodeExecution {
           result: boundedText(result.text)
         }
         this.#publishProgress()
-        if (this.#state.type !== "running") return undefined
-        try {
-          await this.#writer.send({
+        await this.#worker
+          .send({
             version: codeModeProtocolVersion,
             type: "tool_result",
+            generation: message.generation,
+            executionId: message.executionId,
             id: message.id,
             value: result.value,
             ...(result.terminate ? { terminate: true } : {})
           })
-        } catch (cause) {
-          await this.#sendCallError(message.id, errorMessage(cause))
-        }
+          .catch(() => undefined)
         return undefined
       },
       async cause => {
-        if (this.#state.type === "settled") return undefined
+        if (this.#state.type !== "running") return undefined
         const error = boundedErrorText(errorMessage(cause))
         const common = {
           id: message.id,
@@ -416,24 +577,19 @@ class CodeExecution {
           ? { state: "aborted", ...common }
           : { state: "failed", ...common, error }
         this.#publishProgress()
-        await this.#sendCallError(message.id, error)
+        await this.#worker
+          .send({
+            version: codeModeProtocolVersion,
+            type: "tool_error",
+            generation: message.generation,
+            executionId: message.executionId,
+            id: message.id,
+            error
+          })
+          .catch(() => undefined)
         return undefined
       }
     )
-  }
-
-  async #sendCallError(id: number, error: string): Promise<void> {
-    if (this.#state.type !== "running") return
-    try {
-      await this.#writer.send({
-        version: codeModeProtocolVersion,
-        type: "tool_error",
-        id,
-        error: boundedErrorText(error)
-      })
-    } catch (cause) {
-      this.#failure.reject(cause)
-    }
   }
 
   #publishProgress(): void {
@@ -462,6 +618,70 @@ class CodeExecution {
   }
 }
 
+function resultFailure(result: CodeExecutionResult): AgentToolResult<CodeModeDetails> {
+  const error = boundedErrorText(result.error ?? "Code execution failed")
+  const recovery = result.recoverWorker
+    ? "\nThe programmatic worker was replaced. Volatile scratch was cleared; committed state was preserved."
+    : ""
+  return {
+    content: [{ type: "text", text: `Code execution failed: ${error}${recovery}` }],
+    details: { type: "code_mode", outcome: "error", error, calls: result.calls, logs: result.logs },
+    ...(result.terminate ? { terminate: true } : {})
+  }
+}
+
+function stateCommitFailure(result: CodeExecutionResult, cause: unknown): AgentToolResult<CodeModeDetails> {
+  const causeText = boundedErrorText(errorMessage(cause))
+  const error = boundedErrorText(`Could not commit program state: ${causeText}`)
+  return {
+    content: [
+      {
+        type: "text",
+        text: `Code cell completed, but program state was not committed: ${causeText}\nTool and ambient effects and scratch changes may already have occurred.`
+      }
+    ],
+    details: { type: "code_mode", outcome: "error", error, calls: result.calls, logs: result.logs },
+    ...(result.terminate ? { terminate: true } : {})
+  }
+}
+
+function codeFailure(error: string): AgentToolResult<CodeModeDetails> {
+  return resultFailure({ type: "failed", error, calls: [], logs: [], terminate: false, recoverWorker: false })
+}
+
+async function raceWithAbort<T>(operation: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return operation
+  if (signal.aborted) throw abortError(signal)
+  let rejectAbort!: (cause: unknown) => void
+  const cancellation = new Promise<never>((_, reject) => {
+    rejectAbort = reject
+  })
+  const abort = () => rejectAbort(abortError(signal))
+  signal.addEventListener("abort", abort, { once: true })
+  try {
+    return await Promise.race([operation, cancellation])
+  } finally {
+    signal.removeEventListener("abort", abort)
+  }
+}
+
+function createDeadline(milliseconds: number, message: string): { readonly promise: Promise<never>; dispose(): void } {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const promise = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      timer = undefined
+      reject(new Error(message))
+    }, milliseconds)
+    timer.unref?.()
+  })
+  return {
+    promise,
+    dispose() {
+      if (timer) clearTimeout(timer)
+      timer = undefined
+    }
+  }
+}
 function toolResultText(result: AgentToolResult<unknown>): string {
   return result.content.map(part => (part.type === "text" ? part.text : `[image: ${part.mimeType}]`)).join("\n")
 }
@@ -469,15 +689,22 @@ function toolResultText(result: AgentToolResult<unknown>): string {
 function codeToolDescription(tools: readonly AgentTool[]): string {
   const prefix = `Execute JavaScript that orchestrates the other Zi tools.
 
+Each cell is an ordinary JavaScript async arrow function with full Node-compatible process authority. This is not a security sandbox.
 Every direct tool is also available as zi.<tool>(input) with the same input fields; use zi["tool-name"] for punctuation.
 Successful calls return the declared JSON-compatible JavaScript value directly; values are already decoded.
 Tool failures throw Error and may be handled with try/catch. Console logs are retained when execution completes, not streamed live.
-Use code for data-dependent loops, filtering, branching, aggregation, and multi-call extension/API workflows.
-Prefer direct read, edit, write, and bash calls for ordinary coding operations that do not benefit from orchestration.
-Await every zi tool call before returning. Unawaited calls fail the execution.
-Do not use TypeScript syntax, imports, fetch, process, Bun, require, or ambient filesystem APIs.
+scratch holds arbitrary volatile JavaScript and survives successful and ordinarily failed cells. It is cleared when the worker is replaced or the session resumes.
+state holds bounded JSON, commits only when a cell succeeds, and survives worker replacement, compaction, and session resume.
+Tool calls and ambient effects are not transactional when a cell or state commit fails.
+Use project.import(specifier) to resolve packages and project files from the session working directory. Native fetch, process, Bun, and dynamic import are also available.
+Prefer zi tools where tracing and cancellation matter. Await every zi tool call before returning; unawaited calls fail the cell.
+A cell may make at most ${maxCodeModeCalls} zi calls and commit at most ${maxCodeModeStateBytes} bytes of state.
+Do not use TypeScript syntax.
 
 Available APIs:
+declare const scratch: Record<string, unknown>;
+declare const state: Record<string, null | boolean | number | string | unknown[] | Record<string, unknown>>;
+declare const project: { import(specifier: string): Promise<unknown> };
 declare const zi: {
 `
   const suffix = "\n};"
@@ -726,6 +953,7 @@ function deferred<T>() {
       rejectPromise(cause)
     }
   })
+  void promise.catch(() => {})
   return { promise, resolve, reject }
 }
 
@@ -743,8 +971,4 @@ function isString(value: unknown): value is string {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)
-}
-
-function assertNever(value: never): never {
-  throw new Error(`Unknown code-mode state: ${String(value)}`)
 }

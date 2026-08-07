@@ -112,7 +112,12 @@ export async function createUnboundAgentRuntime(requested: CreateAgentRuntimeOpt
     const sessionManager =
       selected.type === "resumed" ? selected.manager : SessionManager.create(paths, { persist: selected.persist })
     shell = new SessionShell({ cwd: paths.cwd, sessionId: sessionManager.sessionId })
-    const codeMode = new CodeMode(paths.cwd, options.codeModeWorkerCommand ?? defaultCodeModeWorkerCommand)
+    const codeMode = new CodeMode(
+      paths.cwd,
+      options.codeModeWorkerCommand ?? defaultCodeModeWorkerCommand,
+      sessionManager,
+      processTreeTracker
+    )
     const subagentEnvironment: Record<string, string | undefined> = {
       ...(options.internalSubagentEnvironment ?? process.env),
       ZI_AGENT_DIR: paths.globalDir,

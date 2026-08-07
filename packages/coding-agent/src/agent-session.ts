@@ -94,6 +94,8 @@ import type { SettingsError, SettingsManager, SettingsScope } from "./settings-m
 import { expandSkillCommand, type Skill } from "./skills.js"
 import { builtinSlashCommands, type SlashCommand } from "./slash-commands.js"
 import { clipUtf8, type SubagentCompletion } from "./subagents/child-process.js"
+import type { PeerMessenger } from "./subagents/peer-messenger.js"
+import type { PeerRequest, PeerResponse } from "./subagents/peer-protocol.js"
 import {
   durablePreviewBytes,
   type SubagentSessionEvents,
@@ -293,6 +295,7 @@ interface AgentSessionConfig {
   extensionContext: ExtensionContext
   shell?: SessionShell
   subagentSupervisor?: SubagentSupervisor
+  peerMessenger?: PeerMessenger
   processTreeTracker?: ProcessTreeTracker
   model?: Model<Api>
   apiKeyProvider?: string
@@ -477,6 +480,7 @@ export class AgentSession {
   readonly #extensionContext: ExtensionContext
   readonly #shell: SessionShell | undefined
   readonly #subagents: SubagentSupervisor | undefined
+  readonly #peerMessenger: PeerMessenger | undefined
   readonly #processTreeTracker: ProcessTreeTracker | undefined
   readonly #apiKeyProvider: string | undefined
   readonly #listeners = new Set<(event: AgentSessionEvent) => void>()
@@ -523,6 +527,7 @@ export class AgentSession {
       : { type: "absent" }
     this.#shell = config.shell
     this.#subagents = config.subagentSupervisor
+    this.#peerMessenger = config.peerMessenger
     this.#processTreeTracker = config.processTreeTracker
     this.#apiKeyProvider = config.apiKeyProvider
     this.sessionManager = config.sessionManager
@@ -592,6 +597,14 @@ export class AgentSession {
         // Process ownership cannot cross into an observer.
       }
     })
+  }
+
+  bindInternalPeerTransport(transport: (request: PeerRequest) => void): () => void {
+    return this.#peerMessenger?.bind(transport) ?? (() => {})
+  }
+
+  acceptInternalPeerResponse(response: PeerResponse): boolean {
+    return this.#peerMessenger?.accept(response) ?? false
   }
 
   get homeDir(): string {
@@ -1685,10 +1698,15 @@ export class AgentSession {
       }
     }
     this.#agent.abort()
+    this.#peerMessenger?.dispose()
     this.#unbindExtensionCatalog?.()
     const processOwners = (async (): Promise<void> => {
       try {
-        await settleAll([this.#subagents?.shutdown() ?? Promise.resolve(), this.#disposeExtensions(reason)])
+        await settleAll([
+          this.#codeMode?.dispose() ?? Promise.resolve(),
+          this.#subagents?.shutdown() ?? Promise.resolve(),
+          this.#disposeExtensions(reason)
+        ])
       } finally {
         await this.#processTreeTracker?.dispose()
       }

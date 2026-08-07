@@ -1,8 +1,10 @@
 import type { AgentTool } from "@earendil-works/pi-agent-core"
 
+import { codeModeDoctrine } from "./code-mode/prompt.js"
 import { getProductDocumentationPaths } from "./product-documentation.js"
 import type { SessionResources } from "./resource-loader.js"
 import { formatSkillsForPrompt } from "./skills.js"
+import { peerMessagingDoctrine } from "./subagents/peer-messenger.js"
 
 export function buildSystemPrompt(
   cwd: string,
@@ -23,9 +25,8 @@ Available tools:
 - code: Orchestrate data-dependent multi-tool workflows in JavaScript
 
 Guidelines:
-- Use direct read, edit, write, and bash calls for ordinary coding operations
-- Use code for loops, filtering, branching, aggregation, and multi-call extension or API workflows
-- Use read instead of bash with cat or sed
+- Use read to inspect files instead of shelling out to cat or sed
+- Use edit for precise changes and write for new files or complete rewrites
 - Be concise
 - Show file paths clearly`
       : `You are an expert coding assistant operating inside Zi.
@@ -43,6 +44,8 @@ Guidelines:
 - Show file paths clearly`)
 
   const sections = [prompt]
+  if (codeMode) sections.push(codeModeDoctrine())
+  if (tools.some(tool => tool.name === "send_peer_message")) sections.push(peerMessagingDoctrine())
   if (resources.systemPrompt === undefined) sections.push(productDocumentationPrompt())
   if (resources.appendSystemPrompt.length > 0) sections.push(resources.appendSystemPrompt.join("\n\n"))
   if (resources.contextFiles.length > 0) {
@@ -65,7 +68,7 @@ function productDocumentationPrompt(): string {
   const readme = promptPath(paths.readme)
   const docs = promptPath(paths.docs)
   const examples = promptPath(paths.examples)
-  return `Zi documentation (read only when the user asks about Zi itself, configuration, extensions, skills, prompts, subagents, notifications, JSON, RPC, or the terminal client):
+  return `Zi documentation (read only when the user asks about Zi itself, configuration, extensions, skills, prompts, Code Mode, subagents, notifications, JSON, RPC, or the terminal client):
 - Documentation index: ${docs}/index.md
 - Product README: ${readme}
 - Documentation directory: ${docs}
@@ -79,6 +82,7 @@ function productDocumentationPrompt(): string {
 - When asked about JSON mode, read ${docs}/json-events.md
 - When asked about RPC, read ${docs}/rpc.md and ${examples}/rpc/
 - When asked about extensions, read ${docs}/extensions.md and ${examples}/extensions/
+- When asked about Code Mode or the programmatic runtime, read ${docs}/code-mode.md
 - When asked about skills, read ${docs}/skills.md and ${examples}/skills/
 - When asked about subagents, read ${docs}/subagents.md and ${examples}/subagents/
 - When working on Zi topics, read the relevant documentation and examples before implementing, and follow Markdown cross-references`

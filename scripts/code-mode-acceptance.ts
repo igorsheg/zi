@@ -16,6 +16,7 @@ export async function runCodeModeAcceptance(options: {
   const cwd = options.cwd ?? import.meta.dirname
   const input = join(cwd, ".zi-code-mode-acceptance")
   await Bun.write(input, "compiled\nisolated\nbounded\n")
+  let codeMode: CodeMode | undefined
   try {
     const readTool = createReadTool(cwd)
     const statsTool: CodeModeCapableTool = {
@@ -35,7 +36,8 @@ export async function runCodeModeAcceptance(options: {
         }
       }
     }
-    const tool = new CodeMode(cwd, [options.executable]).createTool([readTool, statsTool])
+    codeMode = new CodeMode(cwd, [options.executable])
+    const tool = codeMode.createTool([readTool, statsTool])
     const result = await tool.execute(
       "compiled-acceptance",
       {
@@ -55,7 +57,8 @@ export async function runCodeModeAcceptance(options: {
     bun: typeof Bun,
     require: typeof require,
     fetch: typeof fetch,
-    bridge: typeof __ziHostCall
+    bridge: typeof __ziHostCall,
+    imported: typeof (await project.import("node:path")).join
   };
 }`
       },
@@ -77,17 +80,61 @@ export async function runCodeModeAcceptance(options: {
       !text.includes('"keys": [') ||
       !text.includes('"read"') ||
       !text.includes('"frozen": true') ||
-      !text.includes('"process": "undefined"') ||
-      !text.includes('"bridge": "undefined"')
+      !text.includes('"process": "object"') ||
+      !text.includes('"bun": "object"') ||
+      !text.includes('"fetch": "function"') ||
+      !text.includes('"bridge": "undefined"') ||
+      !text.includes('"imported": "function"')
     ) {
-      throw new Error(`Compiled code mode leaked ambient authority or lost its result: ${text}`)
+      throw new Error(`Compiled code mode lost ambient authority or its result: ${text}`)
     }
 
-    const interrupted = await tool.execute("compiled-interrupt", { code: `async () => { while (true) {} }` }, undefined)
-    if (!isCodeModeDetails(interrupted.details) || interrupted.details.outcome !== "error") {
-      throw new Error(`Compiled code mode did not interrupt a busy guest: ${JSON.stringify(interrupted)}`)
+    await tool.execute(
+      "compiled-state",
+      { code: `async () => { state.compiled = true; scratch.marker = new Map([["ready", 1]]); }` },
+      undefined
+    )
+    const retained = await tool.execute(
+      "compiled-retained",
+      { code: `async () => ({ state: state.compiled, scratch: scratch.marker.get("ready") })` },
+      undefined
+    )
+    if (
+      retained.content[0]?.type !== "text" ||
+      !retained.content[0].text.includes('"state": true') ||
+      !retained.content[0].text.includes('"scratch": 1')
+    ) {
+      throw new Error(`Compiled code mode did not retain cell memory: ${JSON.stringify(retained)}`)
+    }
+
+    const controller = new AbortController()
+    const interrupted = tool.execute(
+      "compiled-interrupt",
+      { code: `async () => { while (true) {} }` },
+      controller.signal
+    )
+    await Bun.sleep(50)
+    controller.abort(new Error("compiled interrupt"))
+    try {
+      await interrupted
+      throw new Error("Compiled code mode did not interrupt a busy cell")
+    } catch (cause) {
+      if (!(cause instanceof Error) || !cause.message.includes("compiled interrupt")) throw cause
+    }
+    const recovered = await tool.execute(
+      "compiled-recovered",
+      { code: `async () => ({ state: state.compiled, scratch: scratch.marker ?? null })` },
+      undefined
+    )
+    if (
+      recovered.content[0]?.type !== "text" ||
+      !recovered.content[0].text.includes('"state": true') ||
+      !recovered.content[0].text.includes('"scratch": null')
+    ) {
+      throw new Error(`Compiled code mode did not recover after interruption: ${JSON.stringify(recovered)}`)
     }
   } finally {
+    await codeMode?.dispose()
     await rm(input, { force: true })
   }
 }

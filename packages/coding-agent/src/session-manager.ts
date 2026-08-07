@@ -186,9 +186,12 @@ export const maxCustomJsonBytes = 256 * 1024
 export const maxCustomMessageBytes = 1024 * 1024
 export const maxCustomStateEntries = 2048
 export const maxCustomStateBytes = 2 * 1024 * 1024
+export const maxProgramStateEntries = 2048
+export const maxProgramStateBytes = 8 * 1024 * 1024
 export const maxSubagentJournalTextBytes = 8 * 1024
 
 const customTypePattern = /^[a-z][a-z0-9._:/-]*$/
+const programStateCustomType = "zi.programmatic-state.v1"
 
 const currentSessionFormat: SessionFormatVersion = 2
 const sessionReadBufferBytes = 64 * 1024
@@ -322,6 +325,8 @@ interface LoadedJournal {
   readonly imageBlobBytes: number
   readonly customEntries: CustomEntry[]
   readonly customStateBytes: number
+  readonly programStateEntries: number
+  readonly programStateBytes: number
   readonly appendRepair?: { readonly type: "truncate"; readonly offset: number } | { readonly type: "newline" }
 }
 
@@ -339,6 +344,13 @@ export class CustomStateCapacityError extends Error {
   }
 }
 
+export class ProgramStateCapacityError extends Error {
+  constructor() {
+    super(`Program state history cannot exceed ${maxProgramStateEntries} entries or ${maxProgramStateBytes} bytes`)
+    this.name = "ProgramStateCapacityError"
+  }
+}
+
 export class SessionManager {
   readonly header: SessionHeader
   #persistence: SessionPersistence
@@ -351,6 +363,8 @@ export class SessionManager {
   readonly #imageBlobs = new Map<string, number>()
   #promptHistoryBytes = 0
   #customStateBytes = 0
+  #programStateEntries = 0
+  #programStateBytes = 0
   #leafId: string | null = null
   #entryCount = 0
   #journalBytes: number
@@ -407,6 +421,8 @@ export class SessionManager {
     manager.#imageBlobBytes = loaded.imageBlobBytes
     manager.#customEntries.push(...loaded.customEntries)
     manager.#customStateBytes = loaded.customStateBytes
+    manager.#programStateEntries = loaded.programStateEntries
+    manager.#programStateBytes = loaded.programStateBytes
     for (const [digest, bytes] of loaded.imageBlobs) manager.#imageBlobs.set(digest, bytes)
     manager.#model = loaded.model
     manager.#thinkingLevel = loaded.thinkingLevel
@@ -498,8 +514,13 @@ export class SessionManager {
 
   appendCustomEntry(customType: string, data?: SessionJson): CustomEntry {
     validateCustomType(customType)
+    if (customType === programStateCustomType) throw new Error("Custom type is reserved for program state")
     if (data === undefined) return this.#append({ type: "custom", customType })
     return this.#append({ type: "custom", customType, data: snapshotSessionJson(data) })
+  }
+
+  appendProgramState(data: SessionJson): CustomEntry {
+    return this.#append({ type: "custom", customType: programStateCustomType, data: snapshotSessionJson(data) })
   }
 
   appendCustomMessage(message: CustomMessageInput): CustomMessageEntry {
@@ -595,6 +616,18 @@ export class SessionManager {
     return this.#customEntries.filter(entry => entry.customType === customType)
   }
 
+  latestActiveProgramState(): CustomEntry | undefined {
+    const byId = new Map(this.entries().map(entry => [entry.id, entry]))
+    let entryId = this.#leafId
+    while (entryId) {
+      const entry = byId.get(entryId)
+      if (!entry) throw new Error(`Active session branch references missing entry ${entryId}`)
+      if (entry.type === "custom" && entry.customType === programStateCustomType) return entry
+      entryId = entry.parentId
+    }
+    return undefined
+  }
+
   latestCompaction(): CompactionEntry | undefined {
     return this.#entries.findLast((entry): entry is CompactionEntry => entry.type === "compaction")
   }
@@ -664,13 +697,23 @@ export class SessionManager {
     if (next.type === "custom") freezeCustomEntry(next)
     else if (next.type === "custom_message") freezeCustomMessageEntry(next)
 
-    const customStateBytes = next.type === "custom" ? serializedCustomStateBytes(next) : 0
+    const isProgramStateEntry = next.type === "custom" && next.customType === programStateCustomType
+    const isPublicCustomEntry = next.type === "custom" && !isProgramStateEntry
+    const customStateBytes = isPublicCustomEntry ? serializedCustomStateBytes(next) : 0
+    const programStateBytes = isProgramStateEntry ? serializedCustomStateBytes(next) : 0
     if (
-      next.type === "custom" &&
+      isPublicCustomEntry &&
       (this.#customEntries.length === maxCustomStateEntries ||
         this.#customStateBytes + customStateBytes > maxCustomStateBytes)
     ) {
       throw new CustomStateCapacityError()
+    }
+    if (
+      isProgramStateEntry &&
+      (this.#programStateEntries === maxProgramStateEntries ||
+        this.#programStateBytes + programStateBytes > maxProgramStateBytes)
+    ) {
+      throw new ProgramStateCapacityError()
     }
 
     const prepared = prepareRecord(next, this.header.version, this.#persistence.type !== "memory")
@@ -693,9 +736,12 @@ export class SessionManager {
       this.#imageBlobs.set(blob.sha256, blob.bytes)
       this.#imageBlobBytes += blob.bytes
     }
-    if (next.type === "custom") {
+    if (isPublicCustomEntry) {
       this.#customEntries.push(next)
       this.#customStateBytes += customStateBytes
+    } else if (isProgramStateEntry) {
+      this.#programStateEntries++
+      this.#programStateBytes += programStateBytes
     }
     this.#updatePresentationMessages(next)
     this.#considerPromptHistoryEntry(next)
@@ -878,6 +924,8 @@ function loadJournal(file: string, retention: "active" | "all"): LoadedJournal {
   let imageBlobBytes = 0
   const customEntries: CustomEntry[] = []
   let customStateBytes = 0
+  let programStateEntries = 0
+  let programStateBytes = 0
   let previous: EntryReference | undefined
   let entryCount = 0
   let latestBoundaryId: string | undefined
@@ -914,10 +962,19 @@ function loadJournal(file: string, retention: "active" | "all"): LoadedJournal {
 
       if (entry.type === "compaction") latestBoundaryId = entry.firstKeptEntryId
       if (entry.type === "custom") {
-        customEntries.push(freezeCustomEntry(entry))
-        customStateBytes += serializedCustomStateBytes(entry)
-        if (customEntries.length > maxCustomStateEntries || customStateBytes > maxCustomStateBytes) {
-          throw new CustomStateCapacityError()
+        const customEntry = freezeCustomEntry(entry)
+        if (entry.customType === programStateCustomType) {
+          programStateEntries++
+          programStateBytes += serializedCustomStateBytes(entry)
+          if (programStateEntries > maxProgramStateEntries || programStateBytes > maxProgramStateBytes) {
+            throw new ProgramStateCapacityError()
+          }
+        } else {
+          customEntries.push(customEntry)
+          customStateBytes += serializedCustomStateBytes(entry)
+          if (customEntries.length > maxCustomStateEntries || customStateBytes > maxCustomStateBytes) {
+            throw new CustomStateCapacityError()
+          }
         }
       }
       if (entry.type === "model_change") model = { provider: entry.provider, modelId: entry.modelId }
@@ -999,6 +1056,8 @@ function loadJournal(file: string, retention: "active" | "all"): LoadedJournal {
       imageBlobBytes,
       customEntries,
       customStateBytes,
+      programStateEntries,
+      programStateBytes,
       ...(repair === "truncate"
         ? { appendRepair: { type: "truncate" as const, offset: validBytes } }
         : repair === "newline"

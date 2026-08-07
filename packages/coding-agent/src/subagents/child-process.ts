@@ -9,6 +9,14 @@ import { spawn } from "node:child_process"
 import { Readable, Writable } from "node:stream"
 
 import type { ProcessScope, ProcessTreeTracker } from "../processes/process-tree.js"
+import {
+  decodePeerRequestFrame,
+  maxPeerRequests,
+  peerFailureFrame,
+  peerResponseFrame,
+  type PeerRequest,
+  type PeerResult
+} from "./peer-protocol.js"
 import { defaultSubagentWorkTimeoutMs, isSubagentWorkTimeout } from "./work-policy.js"
 
 export const rpcProtocolVersion = 1 as const
@@ -133,6 +141,7 @@ export type ChildZiProcessOptions = {
   readonly onStateChange?: () => void
   readonly onCompletion?: (completion: SubagentCompletion) => void
   readonly onSessionEvent?: () => void
+  readonly onPeerRequest?: (request: PeerRequest) => Promise<PeerResult>
   readonly onFatal?: (error: Error) => void
 }
 
@@ -143,6 +152,7 @@ export class ChildZiProcess {
   readonly #onStateChange: (() => void) | undefined
   readonly #onCompletion: ((completion: SubagentCompletion) => void) | undefined
   readonly #onSessionEvent: (() => void) | undefined
+  readonly #onPeerRequest: ((request: PeerRequest) => Promise<PeerResult>) | undefined
   readonly #onFatal: ((error: Error) => void) | undefined
   readonly #workTimeoutMs: number
   readonly #responseTimeoutMs: number
@@ -173,6 +183,8 @@ export class ChildZiProcess {
   #omittedSessionEvents = 0
   #omittedSessionEventBytes = 0
   #nextSessionEventSequence = 1
+  readonly #peerRequests = new Set<Promise<void>>()
+  readonly #peerRequestIds = new Set<string>()
   #cycleStartedAt = 0
   #workDeadline: WorkDeadlineState = { type: "none" }
   #interruptDeadline: InterruptDeadlineState = { type: "none" }
@@ -182,6 +194,7 @@ export class ChildZiProcess {
     this.#onStateChange = options.onStateChange
     this.#onCompletion = options.onCompletion
     this.#onSessionEvent = options.onSessionEvent
+    this.#onPeerRequest = options.onPeerRequest
     this.#onFatal = options.onFatal
     this.#workTimeoutMs = options.workTimeoutMs ?? defaultSubagentWorkTimeoutMs
     this.#responseTimeoutMs = options.responseTimeoutMs ?? rpcResponseTimeoutMs
@@ -454,6 +467,8 @@ export class ChildZiProcess {
     const settlement = Promise.resolve().then(() => this.#settleClose(graceMs, forceMs))
     this.#closeSettlement = settlement
     this.#transition({ type: "closing", reason, requestedAt: Date.now() })
+    this.#peerRequests.clear()
+    this.#peerRequestIds.clear()
     this.#rejectPending(new Error(`Subagent ${this.name} is closing`))
     await settlement
   }
@@ -795,6 +810,9 @@ export class ChildZiProcess {
       case "session_event":
         this.#receiveSessionEvent(frame)
         return
+      case "peer_request":
+        this.#receivePeerRequest(frame)
+        return
       case "response":
         this.#receiveResponse(frame)
         return
@@ -841,6 +859,46 @@ export class ChildZiProcess {
       this.#omittedSessionEventBytes += removedBytes
     }
     this.#notifySessionEvent()
+  }
+
+  #receivePeerRequest(frame: Record<string, unknown>): void {
+    const request = decodePeerRequestFrame(frame)
+    if (this.#state.type === "starting" || this.#state.type === "closing" || this.#state.type === "exited") {
+      throw new Error(`Subagent ${this.name} emitted a peer request while ${this.#state.type}`)
+    }
+    if (this.#peerRequestIds.has(request.id)) throw new Error(`Duplicate peer request id: ${request.id}`)
+    const handler = this.#onPeerRequest
+    if (!handler) {
+      this.#sendPeerFrame(peerFailureFrame(request, "Peer messaging is unavailable"))
+      return
+    }
+    if (this.#peerRequests.size >= maxPeerRequests) {
+      this.#sendPeerFrame(peerFailureFrame(request, `At most ${maxPeerRequests} peer requests may be active`))
+      return
+    }
+    this.#peerRequestIds.add(request.id)
+    const operation = handler(request)
+      .then(
+        result => this.#sendPeerFrame(peerResponseFrame(request, result)),
+        cause => this.#sendPeerFrame(peerFailureFrame(request, cause instanceof Error ? cause.message : String(cause)))
+      )
+      .catch(cause => this.#fail(cause))
+      .finally(() => {
+        this.#peerRequests.delete(operation)
+        this.#peerRequestIds.delete(request.id)
+      })
+    this.#peerRequests.add(operation)
+  }
+
+  #sendPeerFrame(frame: Readonly<Record<string, unknown>>): void {
+    if (this.#state.type === "closing" || this.#state.type === "exited") return
+    const line = `${JSON.stringify(frame)}\n`
+    const bytes = Buffer.byteLength(line)
+    if (bytes > maxRpcFrameBytes) throw new Error(`Peer response exceeds ${maxRpcFrameBytes} bytes`)
+    if (this.#pendingWriteBytes + bytes > maxRpcPendingWriteBytes) {
+      throw new Error(`RPC pending writes exceed ${maxRpcPendingWriteBytes} bytes`)
+    }
+    this.#enqueueWrite(line, bytes)
   }
 
   #notifySessionEvent(): void {

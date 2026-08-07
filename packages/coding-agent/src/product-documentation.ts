@@ -5,6 +5,7 @@ export const installedProductDirectoryName = ".zi-package"
 export const publicProductDocumentationFiles = Object.freeze([
   "authentication.md",
   "cli.md",
+  "code-mode.md",
   "extensions.md",
   "index.md",
   "json-events.md",

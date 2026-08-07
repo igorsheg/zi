@@ -8,6 +8,7 @@ import type {
 } from "../agent-session.js"
 import type { AgentMessage } from "../messages.js"
 import type { CustomEntry, CustomMessageEntry, SessionEntry } from "../session-manager.js"
+import { decodePeerResponse, type PeerRequest } from "../subagents/peer-protocol.js"
 import {
   decodeRpcRequest,
   maxRpcCompletionErrorBytes,
@@ -109,6 +110,7 @@ interface RpcFrameBase {
 
 export type RpcServerFrame =
   | (RpcFrameBase & { readonly type: "ready"; readonly state: RpcSessionState })
+  | (RpcFrameBase & { readonly type: "peer_request" } & PeerRequest)
   | (RpcFrameBase & { readonly type: "session_event"; readonly event: RpcSessionEvent })
   | (RpcFrameBase & {
       readonly type: "protocol_error"
@@ -155,6 +157,7 @@ type ConnectionState =
 
 type FrameBody =
   | { readonly type: "ready"; readonly state: RpcSessionState }
+  | ({ readonly type: "peer_request" } & PeerRequest)
   | { readonly type: "session_event"; readonly event: RpcSessionEvent }
   | {
       readonly type: "protocol_error"
@@ -211,6 +214,9 @@ export async function runRpcMode(session: AgentSession, transport: RpcModeTransp
     state = { type: "stopping", reason }
     stopped.resolve()
   }
+  const unbindPeerTransport = session.bindInternalPeerTransport(request => {
+    send({ type: "peer_request", ...request })
+  })
 
   const unsubscribe = session.subscribe(event => {
     if (event.type === "message_end" && event.message.role === "assistant" && connection.completion) {
@@ -262,6 +268,7 @@ export async function runRpcMode(session: AgentSession, transport: RpcModeTransp
     stop({ type: "input_error", message: errorMessage(cause, "Could not read RPC input") })
   } finally {
     removeAbort()
+    unbindPeerTransport()
     inputRelease = releaseInput(iterator)
   }
 
@@ -320,6 +327,23 @@ export async function runRpcMode(session: AgentSession, transport: RpcModeTransp
       value = JSON.parse(line)
     } catch {
       send({ type: "protocol_error", code: "invalid_json", message: "RPC input must contain one JSON object per line" })
+      return
+    }
+
+    try {
+      const peerResponse = decodePeerResponse(value)
+      if (peerResponse) {
+        if (!session.acceptInternalPeerResponse(peerResponse)) {
+          send({ type: "protocol_error", code: "invalid_request", message: "Unknown peer response id" })
+        }
+        return
+      }
+    } catch (cause) {
+      send({
+        type: "protocol_error",
+        code: "invalid_request",
+        message: cause instanceof Error ? cause.message : "Invalid peer response"
+      })
       return
     }
 

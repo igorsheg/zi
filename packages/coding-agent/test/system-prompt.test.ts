@@ -15,6 +15,8 @@ const spawnSubagent = {
   execute: () => Promise.resolve({ content: [], details: undefined })
 } satisfies AgentTool
 
+const sendPeerMessage = { ...spawnSubagent, name: "send_peer_message", label: "send_peer_message" } satisfies AgentTool
+
 test("the default prompt routes Zi customization work to shipped documentation", () => {
   const paths = getProductDocumentationPaths()
   const readme = paths.readme.replaceAll("\\", "/")
@@ -32,6 +34,7 @@ test("the default prompt routes Zi customization work to shipped documentation",
   expect(prompt).toContain(`${docs}/json-events.md`)
   expect(prompt).toContain(`${docs}/rpc.md`)
   expect(prompt).toContain(`${docs}/extensions.md`)
+  expect(prompt).toContain(`${docs}/code-mode.md`)
   expect(prompt).toContain(`${docs}/skills.md`)
   expect(prompt).toContain(`${docs}/subagents.md`)
 })
@@ -40,6 +43,31 @@ test("a custom system prompt owns its product documentation policy", () => {
   const prompt = buildSystemPrompt("/work", createSessionResources({ systemPrompt: "Custom prompt" }), [])
 
   expect(prompt).not.toContain("Zi documentation")
+})
+
+test("Code Mode adds programmatic-runtime doctrine to the default prompt", () => {
+  const prompt = buildSystemPrompt("/work", createSessionResources(), [], true)
+
+  expect(prompt).toContain("# Programmatic runtime")
+  expect(prompt).toContain("Use direct tools for one ordinary read, edit, write, or command")
+  expect(prompt).toContain("The runtime coordinates work")
+  expect(prompt).toContain("Tool and ambient process effects are not rolled back")
+})
+
+test("Code Mode doctrine remains active with a custom system prompt", () => {
+  const prompt = buildSystemPrompt("/work", createSessionResources({ systemPrompt: "Custom prompt" }), [], true)
+
+  expect(prompt).toContain("Custom prompt")
+  expect(prompt).toContain("# Programmatic runtime")
+  expect(prompt).not.toContain("Zi documentation")
+})
+
+test("peer messaging tools add child-team doctrine", () => {
+  const prompt = buildSystemPrompt("/work", createSessionResources({ systemPrompt: "Child prompt" }), [sendPeerMessage])
+
+  expect(prompt).toContain("# Peer subagents")
+  expect(prompt).toContain("do not start an idle sibling turn")
+  expect(prompt).toContain("final response is still delivered to your parent")
 })
 
 test("tool names do not activate native subagent prompt policy", () => {

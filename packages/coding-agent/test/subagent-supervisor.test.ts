@@ -1088,6 +1088,78 @@ test("SubagentSupervisor durably reports work-cycle timeout and keeps the child 
   }
 }, 15_000)
 
+test("SubagentSupervisor relays authenticated queue-only messages between sibling children", async () => {
+  const harness = await createHarness("peer-relay", { delayMs: 20, peerRelay: true })
+  try {
+    await harness.supervisor.spawn("worker-b", "wait for peer context")
+    await waitFor(() => harness.supervisor.snapshots()[0]?.lifecycle === "idle", 5_000)
+    await harness.supervisor.spawn("worker-a", "__peer_send__")
+    await waitFor(() => Bun.file(harness.peerResponsePath!).size > 0, 5_000)
+    await waitFor(() => {
+      try {
+        return readFileSync(harness.promptsLogPath!, "utf8").includes("[Peer message from worker-a]\\npeer evidence")
+      } catch {
+        return false
+      }
+    }, 5_000)
+
+    expect(JSON.parse(await Bun.file(harness.peerResponsePath!).text())).toMatchObject({
+      type: "peer_response",
+      id: "mock-peer-1",
+      operation: "send",
+      ok: true,
+      result: { delivered: true }
+    })
+    expect(harness.supervisor.snapshots().find(snapshot => snapshot.name === "worker-b")?.lifecycle).toBe("idle")
+  } finally {
+    await harness.dispose()
+  }
+}, 15_000)
+
+test("SubagentSupervisor lists live siblings without exposing the authenticated sender", async () => {
+  const harness = await createHarness("peer-list", { delayMs: 20, peerRelay: true, peerOperation: "list" })
+  try {
+    await harness.supervisor.spawn("worker-b", "wait")
+    await waitFor(() => harness.supervisor.snapshots()[0]?.lifecycle === "idle", 5_000)
+    await harness.supervisor.spawn("worker-a", "__peer_send__")
+    await waitFor(() => Bun.file(harness.peerResponsePath!).size > 0, 5_000)
+
+    expect(JSON.parse(await Bun.file(harness.peerResponsePath!).text())).toEqual({
+      version: 1,
+      type: "peer_response",
+      id: "mock-peer-1",
+      operation: "list",
+      ok: true,
+      result: { peers: [{ name: "worker-b", lifecycle: "idle" }] }
+    })
+  } finally {
+    await harness.dispose()
+  }
+}, 15_000)
+
+test("SubagentSupervisor rejects self-addressed peer messages", async () => {
+  const harness = await createHarness("peer-self", {
+    delayMs: 20,
+    peerRelay: true,
+    peerOperation: "send",
+    peerTarget: "worker-a"
+  })
+  try {
+    await harness.supervisor.spawn("worker-a", "__peer_send__")
+    await waitFor(() => Bun.file(harness.peerResponsePath!).size > 0, 5_000)
+
+    expect(JSON.parse(await Bun.file(harness.peerResponsePath!).text())).toMatchObject({
+      type: "peer_response",
+      id: "mock-peer-1",
+      operation: "send",
+      ok: false,
+      error: expect.stringContaining("cannot send a peer message to itself")
+    })
+  } finally {
+    await harness.dispose()
+  }
+}, 15_000)
+
 test("SubagentSupervisor shutdown disposes its live children and descendants and closes admission", async () => {
   const harness = await createHarness("shutdown", { delayMs: 400, descendant: true })
   try {
@@ -1120,6 +1192,9 @@ async function createHarness(
     readonly argvPath?: string
     readonly apiKeyPath?: string
     readonly protocolCrash?: boolean
+    readonly peerRelay?: boolean
+    readonly peerOperation?: "list" | "send"
+    readonly peerTarget?: string
     readonly selection?: () => {
       readonly model: string
       readonly thinkingLevel: "off" | "high"
@@ -1131,6 +1206,8 @@ async function createHarness(
   readonly sessionManager: SessionManager
   readonly cwd: string
   readonly descendantMarker?: string
+  readonly peerResponsePath?: string
+  readonly promptsLogPath?: string
   dispose(): Promise<void>
 }> {
   const root = await mkdtemp(join(tmpdir(), `zi-subagent-${name}-`))
@@ -1138,6 +1215,8 @@ async function createHarness(
   await mkdir(paths.cwd, { recursive: true })
   const sessionManager = SessionManager.create(paths, { persist: false })
   const descendantMarker = options.descendant ? join(root, "descendant.pid") : undefined
+  const peerResponsePath = options.peerRelay ? join(root, "peer-response.json") : undefined
+  const promptsLogPath = options.peerRelay ? join(root, "prompts.log") : undefined
   const supervisor = new SubagentSupervisor({
     command: [process.execPath, mockChild],
     cwd: paths.cwd,
@@ -1149,7 +1228,11 @@ async function createHarness(
       ...(descendantMarker ? { MOCK_RPC_DESCENDANT_PID: descendantMarker } : {}),
       ...(options.argvPath ? { MOCK_RPC_ARGV: options.argvPath } : {}),
       ...(options.apiKeyPath ? { MOCK_RPC_INTERNAL_API_KEY: options.apiKeyPath } : {}),
-      ...(options.protocolCrash ? { MOCK_RPC_PROTOCOL_CRASH: "1" } : {})
+      ...(options.protocolCrash ? { MOCK_RPC_PROTOCOL_CRASH: "1" } : {}),
+      ...(peerResponsePath ? { MOCK_RPC_PEER_RESPONSE: peerResponsePath } : {}),
+      ...(promptsLogPath ? { MOCK_RPC_PROMPTS_LOG: promptsLogPath } : {}),
+      ...(options.peerOperation ? { MOCK_RPC_PEER_OPERATION: options.peerOperation } : {}),
+      ...(options.peerTarget ? { MOCK_RPC_PEER_TARGET: options.peerTarget } : {})
     },
     selection: options.selection ?? (() => ({ model: "faux/faux-1", thinkingLevel: "off" })),
     sessionManager,
@@ -1161,6 +1244,8 @@ async function createHarness(
     sessionManager,
     cwd: paths.cwd,
     ...(descendantMarker ? { descendantMarker } : {}),
+    ...(peerResponsePath ? { peerResponsePath } : {}),
+    ...(promptsLogPath ? { promptsLogPath } : {}),
     async dispose() {
       await supervisor.shutdown()
       await rm(root, { recursive: true, force: true })

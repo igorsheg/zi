@@ -280,6 +280,53 @@ test("custom state and messages keep durability, context, and presentation indep
   ).toThrow("appendCustomMessage")
 })
 
+test("internal program state does not consume extension custom-state capacity", () => {
+  const session = SessionManager.inMemory("/work")
+  for (let revision = 0; revision < 40; revision++) {
+    session.appendProgramState({ revision, value: "x".repeat(200 * 1024) })
+  }
+  expect(() => session.appendProgramState({ revision: 40, value: "x".repeat(200 * 1024) })).toThrow(
+    "Program state history"
+  )
+  const extensionState = session.appendCustomEntry("example.state", { ready: true })
+  session.appendMessage({ role: "user", content: "session remains writable", timestamp: 1 })
+
+  expect(session.latestActiveProgramState()?.data).toMatchObject({ revision: 39 })
+  expect(session.customEntries("zi.programmatic-state.v1")).toEqual([])
+  expect(session.customEntries("example.state")).toEqual([extensionState])
+  expect(() => session.appendCustomEntry("zi.programmatic-state.v1", {})).toThrow("reserved")
+})
+
+test("program state restores after compaction evicts its resident entry", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-program-state-compaction-"))
+  const session = SessionManager.create(new ZiPaths(join(root, "project"), join(root, "agent")))
+  session.appendProgramState({ answer: 42 })
+  const user = session.appendMessage({ role: "user", content: "keep", timestamp: 1 })
+  session.appendMessage({
+    role: "assistant",
+    content: [],
+    api: "test",
+    provider: "test",
+    model: "test",
+    usage: emptyUsage(),
+    stopReason: "stop",
+    timestamp: 2
+  })
+  session.appendCompaction({
+    reason: "manual",
+    summary: "summary",
+    firstKeptEntryId: user.id,
+    tokensBefore: 100,
+    estimatedTokensAfter: 20,
+    details: emptyCompactionDetails()
+  })
+
+  expect(session.retainedEntries().some(entry => entry.type === "custom")).toBe(false)
+  const restored = SessionManager.open(session.file!)
+  expect(restored.retainedEntries().some(entry => entry.type === "custom")).toBe(false)
+  expect(restored.latestActiveProgramState()?.data).toEqual({ answer: 42 })
+})
+
 test("journal-owned custom values cannot be mutated through entries or projections", async () => {
   const root = await mkdtemp(join(tmpdir(), "zi-session-custom-immutable-"))
   const paths = new ZiPaths(join(root, "project"), join(root, "global"))

@@ -24,6 +24,9 @@ import { appendFileSync, writeFileSync } from "node:fs"
  *   MOCK_RPC_IGNORE_INTERRUPT — acknowledge interruption without settling work
  *   MOCK_RPC_DROP_INTERRUPT — neither acknowledge nor settle interruption
  *   MOCK_RPC_ERROR — assistant error text and failed stop reason
+ *   MOCK_RPC_PEER_RESPONSE — path to write one host peer response after the __peer_send__ prompt
+ *   MOCK_RPC_PROMPTS_LOG — path to append admitted prompt text
+ *   MOCK_RPC_DUPLICATE_PEER_REQUEST — emit the peer request twice
  */
 let sequence = 0
 const reply = process.env.MOCK_RPC_REPLY ?? "child-done"
@@ -39,6 +42,12 @@ const argvPath = process.env.MOCK_RPC_ARGV
 const internalApiKeyPath = process.env.MOCK_RPC_INTERNAL_API_KEY
 const ignoreInterrupt = process.env.MOCK_RPC_IGNORE_INTERRUPT === "1"
 const dropInterrupt = process.env.MOCK_RPC_DROP_INTERRUPT === "1"
+const peerResponsePath = process.env.MOCK_RPC_PEER_RESPONSE
+const promptsLogPath = process.env.MOCK_RPC_PROMPTS_LOG
+const duplicatePeerRequest = process.env.MOCK_RPC_DUPLICATE_PEER_REQUEST === "1"
+const peerOperation = process.env.MOCK_RPC_PEER_OPERATION === "list" ? "list" : "send"
+const peerTarget = process.env.MOCK_RPC_PEER_TARGET ?? "worker-b"
+let peerRequestScheduled = false
 
 if (argvPath) writeFileSync(argvPath, JSON.stringify(process.argv.slice(2)))
 if (internalApiKeyPath) writeFileSync(internalApiKeyPath, process.env.ZI_INTERNAL_SUBAGENT_API_KEY ?? "")
@@ -142,6 +151,18 @@ async function handle(request: { id: string; method: string; params?: RequestPar
   if (method === "session.prompt") {
     if (process.env.MOCK_RPC_EXIT_ON_PROMPT === "1") process.exit(7)
     const text = request.params?.text ?? ""
+    if (promptsLogPath) appendFileSync(promptsLogPath, `${JSON.stringify(text)}\n`)
+    if (peerResponsePath && text === "__peer_send__" && !peerRequestScheduled) {
+      peerRequestScheduled = true
+      setTimeout(() => {
+        const peerRequest =
+          peerOperation === "list"
+            ? { type: "peer_request", id: "mock-peer-1", operation: "list" }
+            : { type: "peer_request", id: "mock-peer-1", operation: "send", target: peerTarget, text: "peer evidence" }
+        send(peerRequest)
+        if (duplicatePeerRequest) send(peerRequest)
+      }, 20)
+    }
     if (text === "__reject_prompt__") {
       send({ type: "response", id, method, ok: false, error: { code: "rejected", message: "prompt rejected" } })
       return
@@ -281,11 +302,24 @@ for await (const chunk of process.stdin) {
     const line = buffer.slice(0, newline)
     buffer = buffer.slice(newline + 1)
     if (!line.trim()) continue
-    let request: { id?: string; method?: string; params?: RequestParams }
+    let request: {
+      id?: string
+      method?: string
+      type?: string
+      operation?: string
+      ok?: boolean
+      result?: unknown
+      error?: string
+      params?: RequestParams
+    }
     try {
       request = JSON.parse(line)
     } catch {
       send({ type: "protocol_error", code: "invalid_json", message: "invalid json" })
+      continue
+    }
+    if (request.type === "peer_response" && typeof request.id === "string") {
+      if (peerResponsePath) writeFileSync(peerResponsePath, JSON.stringify(request))
       continue
     }
     if (typeof request.id !== "string" || typeof request.method !== "string") {

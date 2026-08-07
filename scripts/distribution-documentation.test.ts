@@ -18,6 +18,7 @@ test("distribution documentation ships self-customization guides and examples", 
     expect((await readdir(join(destination, "docs"))).toSorted()).toEqual([
       "authentication.md",
       "cli.md",
+      "code-mode.md",
       "extensions.md",
       "index.md",
       "json-events.md",
@@ -30,6 +31,7 @@ test("distribution documentation ships self-customization guides and examples", 
       "subagents.md"
     ])
     expect(existsSync(join(destination, "docs", "index.md"))).toBe(true)
+    expect(existsSync(join(destination, "docs", "code-mode.md"))).toBe(true)
     expect(existsSync(join(destination, "docs", "extensions.md"))).toBe(true)
     expect(existsSync(join(destination, "docs", "notifications.md"))).toBe(true)
     expect(existsSync(join(destination, "docs", "prompts.md"))).toBe(true)

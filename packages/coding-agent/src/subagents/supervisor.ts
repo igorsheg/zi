@@ -12,6 +12,7 @@ import {
   type SubagentCompletion
 } from "./child-process.js"
 import { internalSubagentApiKeyEnvironment } from "./invocation.js"
+import type { PeerAgent, PeerRequest, PeerResult } from "./peer-protocol.js"
 import { defaultWaitTimeoutMs, isSubagentWaitTimeout, maxWaitTimeoutMs } from "./wait-policy.js"
 import { defaultSubagentWorkTimeoutMs, isSubagentWorkTimeout } from "./work-policy.js"
 
@@ -291,7 +292,8 @@ export class SubagentSupervisor {
         workTimeoutMs: this.workTimeoutMs,
         onStateChange: () => this.#childChanged(name),
         onCompletion: completion => this.#completion(completion),
-        onSessionEvent: () => this.#presentationChanged(name)
+        onSessionEvent: () => this.#presentationChanged(name),
+        onPeerRequest: request => this.#routePeerRequest(name, request)
       })
     } catch (cause) {
       this.#completionReservations.delete(reservationKey)
@@ -341,6 +343,29 @@ export class SubagentSupervisor {
       if (!this.#mailbox.has(reservationKey)) this.#completionReservations.delete(reservationKey)
       throw cause
     }
+  }
+
+  // Behavioral provenance: Codex 0bdce9f4 derives the sender from the active session and lets the
+  // shared control owner route queue-only mail. Zi keeps that invariant in the parent supervisor.
+  async #routePeerRequest(sender: string, request: PeerRequest): Promise<PeerResult> {
+    this.#assertOpen()
+    if (!this.#live.has(sender)) throw new Error(`Unknown peer sender: ${sender}`)
+    if (request.operation === "list") {
+      const peers: PeerAgent[] = []
+      for (const [name, record] of this.#live) {
+        if (name === sender) continue
+        const lifecycle = record.child.state.type
+        if (lifecycle === "closing" || lifecycle === "exited") continue
+        peers.push(Object.freeze({ name, lifecycle }))
+      }
+      return Object.freeze({ peers: Object.freeze(peers) })
+    }
+    if (request.target === sender) throw new Error("A subagent cannot send a peer message to itself")
+    const target = this.#requireLive(request.target)
+    const message = `[Peer message from ${sender}]\n${request.text}`
+    await target.serial.run(() => target.child.sendFollowUp(message))
+    this.#pumpMailbox()
+    return Object.freeze({ delivered: true })
   }
 
   async send(name: string, text: string): Promise<void> {
