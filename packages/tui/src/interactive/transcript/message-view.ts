@@ -75,9 +75,24 @@ export function createMessageItemView(
     case "user":
       return ownItem(ctx, createUserMessage(ctx, userContent(message.content), options.theme))
     case "toolResult":
-      return createToolResultView(ctx, message, options.toolCall, options.theme, options.cwd ?? "", options.expandHint)
+      return createToolResultView(
+        ctx,
+        message,
+        options.toolCall,
+        options.theme,
+        options.syntaxStyle,
+        options.cwd ?? "",
+        options.expandHint
+      )
     case "bashExecution":
-      return createBashExecutionView(ctx, message, options.theme, options.cwd ?? "", options.expandHint)
+      return createBashExecutionView(
+        ctx,
+        message,
+        options.theme,
+        options.syntaxStyle,
+        options.cwd ?? "",
+        options.expandHint
+      )
     case "custom":
       return message.display
         ? ownItem(ctx, createPanelMessage(ctx, customPanelContent(message), options.theme.text.custom, options.theme))
@@ -368,7 +383,7 @@ export class StreamingAssistantView {
     const tool = part.tool
     const view =
       this.#toolViews?.create(this, tool) ??
-      new ToolCallView(this.#ctx, tool.id, toolFrame(tool), this.#theme, this.#cwd)
+      new ToolCallView(this.#ctx, tool.id, toolFrame(tool), this.#theme, this.#syntaxStyle, this.#cwd)
     if (this.#toolViews) this.#toolViews.update(view, tool)
     return { kind: "tool", root: view.root, id: tool.id, view, tool }
   }
@@ -415,6 +430,7 @@ function createToolResultView(
   message: ToolResultMessage,
   call: ToolCallPresentation | undefined,
   theme: Theme,
+  syntaxStyle: SyntaxStyle,
   cwd: string,
   expandHint?: string
 ): ToolCallView {
@@ -425,13 +441,14 @@ function createToolResultView(
     result: { content: message.content, details: message.details },
     status: message.isError ? "failed" : "done"
   }
-  return new ToolCallView(ctx, source.id, toolFrame(source), theme, cwd, expandHint)
+  return new ToolCallView(ctx, source.id, toolFrame(source), theme, syntaxStyle, cwd, expandHint)
 }
 
 function createBashExecutionView(
   ctx: RenderContext,
   message: Extract<AgentMessage, { role: "bashExecution" }>,
   theme: Theme,
+  syntaxStyle: SyntaxStyle,
   cwd: string,
   expandHint?: string
 ): ToolCallView {
@@ -458,6 +475,7 @@ function createBashExecutionView(
       }
     },
     theme,
+    syntaxStyle,
     cwd,
     expandHint
   )

@@ -143,6 +143,7 @@ export class TranscriptView {
         tool.id,
         this.#projectTool(tool),
         this.#theme,
+        this.#syntaxStyle,
         sessionCwd(this.#session),
         this.#keybindings.getHint("app.tools.expand")
       )
@@ -481,6 +482,7 @@ export class TranscriptView {
         tool.id,
         this.#projectTool(tool),
         this.#theme,
+        this.#syntaxStyle,
         sessionCwd(this.#session),
         this.#keybindings.getHint("app.tools.expand")
       )
@@ -794,6 +796,7 @@ export class TranscriptView {
         tool.id,
         this.#projectTool(tool),
         this.#theme,
+        this.#syntaxStyle,
         sessionCwd(this.#session),
         this.#keybindings.getHint("app.tools.expand")
       )

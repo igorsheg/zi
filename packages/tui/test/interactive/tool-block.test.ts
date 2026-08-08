@@ -1,12 +1,23 @@
-import { expect, test } from "bun:test"
+import { afterAll, expect, test } from "bun:test"
 import { basename, join, resolve } from "node:path"
 
-import { BoxRenderable, type RenderContext, type Renderable, TextRenderable } from "@opentui/core"
+import {
+  BoxRenderable,
+  CodeRenderable,
+  parseColor,
+  type RenderContext,
+  type Renderable,
+  TextRenderable
+} from "@opentui/core"
 import { createTestRenderer } from "@opentui/core/testing"
 import { projectToolPresentation, type ToolPresentation } from "@with-zi/coding-agent"
 
 import { ToolCallView, type ToolViewFrame } from "../../src/interactive/transcript/tool-view.js"
-import { defaultTheme } from "../../src/theme.js"
+import { createSyntaxStyle, defaultTheme } from "../../src/theme.js"
+import { renderMarkdownSettled } from "./harness.js"
+
+const syntaxStyle = createSyntaxStyle(defaultTheme)
+afterAll(() => syntaxStyle.destroy())
 
 test("completed Bash keeps compact evidence and details reveal bounded context and notices", async () => {
   const setup = await createTestRenderer({ width: 54, height: 16, useThread: false })
@@ -30,6 +41,7 @@ test("completed Bash keeps compact evidence and details reveal bounded context a
       })
     ),
     defaultTheme,
+    syntaxStyle,
     "/work",
     "Ctrl+O"
   )
@@ -59,7 +71,7 @@ test("completed Bash keeps compact evidence and details reveal bounded context a
   }
 })
 
-test("Code replaces bounded source with activity while retaining one native body through settlement", async () => {
+test("Code highlights bounded source before replacing it with activity", async () => {
   const setup = await createTestRenderer({ width: 72, height: 28, useThread: false })
   const code = Array.from({ length: 10 }, (_, index) => `const value${index + 1} = ${index + 1}`).join("\n")
   const view = new ToolCallView(
@@ -67,6 +79,7 @@ test("Code replaces bounded source with activity while retaining one native body
     "code-running",
     frame("ready", projectToolPresentation({ status: "ready", name: "code", args: { code } })),
     defaultTheme,
+    syntaxStyle,
     "/work",
     "Ctrl+O"
   )
@@ -75,13 +88,45 @@ test("Code replaces bounded source with activity while retaining one native body
   try {
     const root = view.root
     const body = toolBody(root)
-    await setup.renderOnce()
+    await renderMarkdownSettled(setup)
     const ready = setup.captureCharFrame()
     expect(ready).toContain("Code · 10 lines · waiting")
     expect(ready).toContain("1  const value1 = 1")
     expect(ready).toContain("8  const value8 = 8")
     expect(ready).not.toContain("9  const value9 = 9")
     expect(ready).toContain("2 more lines · Ctrl+O details")
+    const codeRenderable = descendants(body).find(candidate => candidate instanceof CodeRenderable)
+    if (!(codeRenderable instanceof CodeRenderable)) throw new Error("Highlighted code renderable not found")
+    const keyword = setup
+      .captureSpans()
+      .lines.flatMap(line => line.spans)
+      .find(span => span.text === "const")
+    expect(keyword?.fg.toInts()).toEqual(parseColor(defaultTheme.syntax.keyword).toInts())
+    setup.renderer.startSelection(codeRenderable, codeRenderable.x, codeRenderable.y)
+    setup.renderer.updateSelection(codeRenderable, codeRenderable.x + codeRenderable.width, codeRenderable.y, {
+      finishDragging: true
+    })
+    expect(setup.renderer.getSelection()?.getSelectedText()).toBe("const value1 = 1")
+    setup.renderer.clearSelection()
+
+    expect(view.setExpanded(true)).toBe(true)
+    await renderMarkdownSettled(setup)
+    expect(toolBody(root)).toBe(body)
+    expect(descendants(body).find(candidate => candidate instanceof CodeRenderable)).toBe(codeRenderable)
+    expect(setup.captureCharFrame()).toContain("10  const value10 = 10")
+
+    setup.resize(24, 28)
+    await renderMarkdownSettled(setup)
+    expect(toolBody(root)).toBe(body)
+    expect(body.height).toBeLessThanOrEqual(200)
+    expect(view.setExpanded(false)).toBe(true)
+    await setup.renderOnce()
+    expect(body.height).toBeLessThanOrEqual(8)
+    const highlightSettlement = codeRenderable.highlightingDone
+    setup.renderer.startSelection(codeRenderable, codeRenderable.x, codeRenderable.y)
+    setup.renderer.updateSelection(codeRenderable, codeRenderable.x + codeRenderable.width, codeRenderable.y, {
+      finishDragging: true
+    })
 
     expect(
       view.update(
@@ -120,8 +165,14 @@ test("Code replaces bounded source with activity while retaining one native body
       )
     ).toBe(true)
     expect(view.root).toBe(root)
-    expect(toolBody(root)).toBe(body)
+    expect(setup.renderer.getSelection()).toBeNull()
+    const activityBody = toolBody(root)
+    expect(activityBody).not.toBe(body)
+    expect(body.isDestroyed).toBe(true)
+    await highlightSettlement
 
+    setup.resize(72, 28)
+    await setup.renderOnce()
     await setup.renderOnce()
     const compact = setup.captureCharFrame()
     expect(compact).toContain("Code bash · 5/6 calls · 1 failed")
@@ -178,7 +229,7 @@ test("Code replaces bounded source with activity while retaining one native body
       )
     ).toBe(true)
     expect(view.root).toBe(root)
-    expect(toolBody(root)).toBe(body)
+    expect(toolBody(root)).toBe(activityBody)
 
     await setup.renderOnce()
     const settled = setup.captureCharFrame()
@@ -212,6 +263,7 @@ test("Bash preserves its tail body and exact command from running through comple
       })
     ),
     defaultTheme,
+    syntaxStyle,
     "/work",
     "Ctrl+O"
   )
@@ -283,6 +335,7 @@ test("failed semantic frame keeps first and last output with exact status", asyn
       })
     ),
     defaultTheme,
+    syntaxStyle,
     "/work",
     "Ctrl+O"
   )
@@ -324,6 +377,7 @@ test("detailed previews remain bounded without stale expansion hints", async () 
       })
     ),
     defaultTheme,
+    syntaxStyle,
     "/work",
     "Ctrl+O"
   )
@@ -360,6 +414,7 @@ test("collapsing details clears native selection before removing rows", async ()
       })
     ),
     defaultTheme,
+    syntaxStyle,
     "/work"
   )
   setup.renderer.root.add(view.root)
@@ -390,7 +445,7 @@ test("body-kind replacement clears selection and preserves the tool root", async
       preview: { compact: { type: "head", rows: 12 }, detailed: { type: "head", rows: 200 } }
     })
   )
-  const view = new ToolCallView(setup.renderer, "edit-replace", initial, defaultTheme, "/work")
+  const view = new ToolCallView(setup.renderer, "edit-replace", initial, defaultTheme, syntaxStyle, "/work")
   setup.renderer.root.add(view.root)
 
   try {
@@ -453,6 +508,7 @@ test("Read stays compact after success and reveals bounded absolute source lines
       })
     ),
     defaultTheme,
+    syntaxStyle,
     "/work",
     "Ctrl+O"
   )
@@ -492,7 +548,14 @@ test("Read stays compact after success and reveals bounded absolute source lines
 test("Read keeps one root from streamed path through numbered completion", async () => {
   const setup = await createTestRenderer({ width: 44, height: 12, useThread: false })
   const preparing = projectToolPresentation({ status: "preparing", name: "read", args: {} })
-  const view = new ToolCallView(setup.renderer, "read-lifecycle", frame("preparing", preparing), defaultTheme, "/work")
+  const view = new ToolCallView(
+    setup.renderer,
+    "read-lifecycle",
+    frame("preparing", preparing),
+    defaultTheme,
+    syntaxStyle,
+    "/work"
+  )
   setup.renderer.root.add(view.root)
 
   try {
@@ -548,6 +611,7 @@ test("Write keeps one root and collapses completed content into a semantic succe
     "write-lifecycle",
     frame("preparing", projectToolPresentation({ status: "preparing", name: "write", args: {} })),
     defaultTheme,
+    syntaxStyle,
     "/work",
     "Ctrl+O"
   )
@@ -626,6 +690,7 @@ test("Edit stays header-only in flight and reveals only the successful authorita
     "edit-lifecycle",
     frame("preparing", projectToolPresentation({ status: "preparing", name: "edit", args: partialArgs })),
     defaultTheme,
+    syntaxStyle,
     "/work",
     "Ctrl+O"
   )
@@ -755,6 +820,7 @@ test("path subjects stay relative inside cwd and identify external files with ab
     "edit-path-scope",
     presentationFor(join(cwd, "src", "file.ts")),
     defaultTheme,
+    syntaxStyle,
     cwd
   )
   setup.renderer.root.add(view.root)
@@ -839,6 +905,7 @@ test("completed Edit keeps a bounded first/last diff review in compact density",
       })
     ),
     defaultTheme,
+    syntaxStyle,
     "/work",
     "Ctrl+O"
   )
@@ -895,6 +962,7 @@ test("oversized Edit lines retain explicit changed-line evidence", async () => {
       })
     ),
     defaultTheme,
+    syntaxStyle,
     "/work",
     "Ctrl+O"
   )
@@ -931,6 +999,7 @@ test("failed Edit exposes one bounded semantic error", async () => {
       })
     ),
     defaultTheme,
+    syntaxStyle,
     "/work",
     "Ctrl+O"
   )
@@ -974,6 +1043,7 @@ test("failed Write uses semantic status and never echoes attempted content", asy
       })
     ),
     defaultTheme,
+    syntaxStyle,
     "/work",
     "Ctrl+O"
   )
@@ -1018,6 +1088,7 @@ test("failed Read uses semantic status and one bounded error body", async () => 
       })
     ),
     defaultTheme,
+    syntaxStyle,
     "/work",
     "Ctrl+O"
   )
@@ -1043,7 +1114,14 @@ test("running marker uses a stepped dim-to-accent pulse while its rail stays sta
     preview: { compact: { type: "head", rows: 12 }, detailed: { type: "head", rows: 200 } },
     timing: "hidden"
   })
-  const view = new ToolCallView(setup.renderer, "running-pulse", frame("running", running), defaultTheme, "/work")
+  const view = new ToolCallView(
+    setup.renderer,
+    "running-pulse",
+    frame("running", running),
+    defaultTheme,
+    syntaxStyle,
+    "/work"
+  )
   setup.renderer.root.add(view.root)
 
   const colorOf = (text: string) =>
@@ -1092,7 +1170,7 @@ test("tool chrome uses lifecycle-only glyphs, tones, and stable transparent rows
         preview: { compact: { type: "head", rows: 12 }, detailed: { type: "head", rows: 200 } }
       })
     )
-  const view = new ToolCallView(setup.renderer, "chrome", makeFrame("preparing"), defaultTheme, "/work")
+  const view = new ToolCallView(setup.renderer, "chrome", makeFrame("preparing"), defaultTheme, syntaxStyle, "/work")
   setup.renderer.root.add(view.root)
 
   try {
@@ -1165,6 +1243,7 @@ test("skill reads keep their source path and instructions behind details", async
     "read-skill",
     frame("done", projectToolPresentation({ status: "done", name: "read", args: { path }, result })),
     defaultTheme,
+    syntaxStyle,
     cwd,
     "Ctrl+O"
   )
@@ -1213,6 +1292,7 @@ test("header-only, notices-only, and action-only tools share the open-rail gramm
       })
     ),
     defaultTheme,
+    syntaxStyle,
     "/work"
   )
   const noticesOnly = new ToolCallView(
@@ -1227,6 +1307,7 @@ test("header-only, notices-only, and action-only tools share the open-rail gramm
       })
     ),
     defaultTheme,
+    syntaxStyle,
     "/work"
   )
   const actionOnly = new ToolCallView(
@@ -1240,6 +1321,7 @@ test("header-only, notices-only, and action-only tools share the open-rail gramm
       })
     ),
     defaultTheme,
+    syntaxStyle,
     "/work"
   )
   actionOnly.setActionHint("Esc interrupt")
@@ -1287,6 +1369,7 @@ test("wrapped secondary commands copy exactly without decorative prompts or visu
       })
     ),
     defaultTheme,
+    syntaxStyle,
     "/work"
   )
   setup.renderer.root.add(view.root)
@@ -1323,6 +1406,7 @@ test("wrapped path notices preserve exact selection and reserve visible path cel
       })
     ),
     defaultTheme,
+    syntaxStyle,
     "/work",
     "Ctrl+O"
   )
@@ -1367,7 +1451,14 @@ test("hiding a secondary command clears its native selection", async () => {
     body: { type: "terminal", text: "running" },
     preview: { compact: { type: "head", rows: 12 }, detailed: { type: "head", rows: 200 } }
   })
-  const view = new ToolCallView(setup.renderer, "hide-command", frame("running", withCommand), defaultTheme, "/work")
+  const view = new ToolCallView(
+    setup.renderer,
+    "hide-command",
+    frame("running", withCommand),
+    defaultTheme,
+    syntaxStyle,
+    "/work"
+  )
   setup.renderer.root.add(view.root)
 
   try {
@@ -1410,6 +1501,7 @@ test("trailing-LF commands keep a rail on every bounded visual row", async () =>
     "trailing-lf",
     frame("done", presentationFor(command)),
     defaultTheme,
+    syntaxStyle,
     "/work",
     "Ctrl+O"
   )
@@ -1457,6 +1549,7 @@ test("tab-heavy commands and paths stay inside projected rail bounds", async () 
       })
     ),
     defaultTheme,
+    syntaxStyle,
     "/work",
     "Ctrl+O"
   )
@@ -1472,6 +1565,7 @@ test("tab-heavy commands and paths stay inside projected rail bounds", async () 
       })
     ),
     defaultTheme,
+    syntaxStyle,
     "/work",
     "Ctrl+O"
   )
@@ -1535,6 +1629,7 @@ test("ordinary tabbed tool evidence uses native cell projection", async () => {
       id,
       frame("done", presentation({ header: { label: "Tool", details: [] }, body, preview })),
       defaultTheme,
+      syntaxStyle,
       "/work",
       "Ctrl+O"
     )
@@ -1553,6 +1648,7 @@ test("ordinary tabbed tool evidence uses native cell projection", async () => {
       })
     ),
     defaultTheme,
+    syntaxStyle,
     "/work",
     "Ctrl+O"
   )
@@ -1568,6 +1664,7 @@ test("ordinary tabbed tool evidence uses native cell projection", async () => {
       })
     ),
     defaultTheme,
+    syntaxStyle,
     "/work",
     "Ctrl+O"
   )
@@ -1628,6 +1725,7 @@ test("secondary context and notices retain bounded visual rows", async () => {
       })
     ),
     defaultTheme,
+    syntaxStyle,
     "/work",
     "Ctrl+O"
   )
@@ -1648,6 +1746,7 @@ test("secondary context and notices retain bounded visual rows", async () => {
       })
     ),
     defaultTheme,
+    syntaxStyle,
     "/work",
     "Ctrl+O"
   )
@@ -1701,6 +1800,7 @@ test("source, diff, terminal, and command selection excludes structural chrome",
       })
     ),
     defaultTheme,
+    syntaxStyle,
     "/work"
   )
   const terminal = new ToolCallView(
@@ -1715,6 +1815,7 @@ test("source, diff, terminal, and command selection excludes structural chrome",
       })
     ),
     defaultTheme,
+    syntaxStyle,
     "/work"
   )
   const source = new ToolCallView(
@@ -1729,6 +1830,7 @@ test("source, diff, terminal, and command selection excludes structural chrome",
       })
     ),
     defaultTheme,
+    syntaxStyle,
     "/work"
   )
   setup.renderer.root.add(view.root)
@@ -1784,6 +1886,7 @@ test("source bodies keep semantic starting line numbers in the lightweight panel
       })
     ),
     defaultTheme,
+    syntaxStyle,
     "/work"
   )
   setup.renderer.root.add(view.root)
@@ -1821,6 +1924,7 @@ test("subagent rows stay concise until details are requested", async () => {
     "spawn-agent",
     frame("done", projected),
     defaultTheme,
+    syntaxStyle,
     "/work",
     "Ctrl+O"
   )

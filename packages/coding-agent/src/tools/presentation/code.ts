@@ -45,11 +45,14 @@ export function projectCodeTool(source: ToolPresentationSource): ToolPresentatio
     },
     ...(body
       ? {
-          body: {
-            type: "text" as const,
-            text: body,
-            tone: source.status === "failed" || trace?.outcome === "error" ? ("error" as const) : ("normal" as const)
-          }
+          body: activity
+            ? {
+                type: "text" as const,
+                text: body,
+                tone:
+                  source.status === "failed" || trace?.outcome === "error" ? ("error" as const) : ("normal" as const)
+              }
+            : { type: "code" as const, text: body, language: "javascript" as const, startLine: 1 }
         }
       : {}),
     notices: [],
@@ -77,12 +80,9 @@ function traceDetails(calls: readonly CodeModeTraceCall[], outcome: "progress" |
 function formatSource(code: string): { text: string; lines: number } {
   const normalized = normalizeToolText(code)
   const bounded = boundHead(normalized)
-  const sourceLines = bounded ? bounded.split("\n") : []
-  const lines = normalized.split("\n").length
-  const numberWidth = String(Math.max(1, lines)).length
-  const output = sourceLines.map((line, index) => `${String(index + 1).padStart(numberWidth, " ")}  ${line || " "}`)
-  if (bounded !== normalized) output.push("… source truncated")
-  return { text: output.join("\n"), lines }
+  const output = bounded ? bounded.split("\n") : []
+  if (bounded !== normalized) output.push("// … source truncated")
+  return { text: output.join("\n"), lines: normalized.split("\n").length }
 }
 
 function formatTrace(

@@ -3,25 +3,27 @@ import { expect, test } from "bun:test"
 import { createEditTool } from "../src/tools/edit.js"
 import { projectToolPresentation } from "../src/tools/presentation/project.js"
 
-test("code presentation numbers source and admits a bounded call preview before execution", () => {
+test("code presentation emits JavaScript source and admits a bounded call preview before execution", () => {
   const code = Array.from({ length: 10 }, (_, index) => `const value${index + 1} = ${index + 1}`).join("\n")
   const presentation = projectToolPresentation({ status: "ready", name: "code", args: { code } })
 
   expect(presentation.header).toEqual({ label: "Code", details: ["10 lines"] })
   expect(presentation.preview).toEqual({ compact: { type: "head", rows: 8 }, detailed: { type: "head", rows: 200 } })
-  if (presentation.body?.type !== "text") throw new Error("Expected code source body")
-  expect(presentation.body.text).toStartWith(" 1  const value1 = 1\n 2  const value2 = 2")
-  expect(presentation.body.text).toEndWith("10  const value10 = 10")
+  if (presentation.body?.type !== "code") throw new Error("Expected code source body")
+  expect(presentation.body.language).toBe("javascript")
+  expect(presentation.body.startLine).toBe(1)
+  expect(presentation.body.text).toStartWith("const value1 = 1\nconst value2 = 2")
+  expect(presentation.body.text).toEndWith("const value10 = 10")
 })
 
-test("code presentation bounds retained numbered source before execution", () => {
+test("code presentation bounds retained source before execution", () => {
   const code = Array.from({ length: 2_100 }, (_, index) => `line ${index + 1} ${"x".repeat(24)}`).join("\n")
   const presentation = projectToolPresentation({ status: "ready", name: "code", args: { code } })
 
   expect(presentation.header).toEqual({ label: "Code", details: ["2100 lines"] })
-  if (presentation.body?.type !== "text") throw new Error("Expected bounded code source body")
-  expect(presentation.body.text).toStartWith(`   1  line 1 ${"x".repeat(24)}`)
-  expect(presentation.body.text).toEndWith("… source truncated")
+  if (presentation.body?.type !== "code") throw new Error("Expected bounded code source body")
+  expect(presentation.body.text).toStartWith(`line 1 ${"x".repeat(24)}`)
+  expect(presentation.body.text).toEndWith("// … source truncated")
   expect(presentation.body.text).not.toContain("line 2100")
   expect(Buffer.byteLength(presentation.body.text)).toBeLessThan(70 * 1024)
 })

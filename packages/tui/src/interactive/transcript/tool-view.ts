@@ -1,7 +1,17 @@
 import { resolve } from "node:path"
 import { pathToFileURL } from "node:url"
 
-import { BoxRenderable, fg, link, StyledText, TextAttributes, TextRenderable, type RenderContext } from "@opentui/core"
+import {
+  BoxRenderable,
+  CodeRenderable,
+  fg,
+  link,
+  StyledText,
+  TextAttributes,
+  TextRenderable,
+  type RenderContext,
+  type SyntaxStyle
+} from "@opentui/core"
 import {
   maxExpandedToolRows,
   maxToolPreviewRows,
@@ -95,6 +105,7 @@ export class ToolCallView implements TranscriptItemView {
   readonly #action: ToolActionHintView
   readonly #cap: TextRenderable
   readonly #theme: Theme
+  readonly #syntaxStyle: SyntaxStyle
   readonly #expandHint: string | undefined
   #frame: ToolViewFrame
   #body: OwnedToolBodyView | undefined
@@ -107,11 +118,20 @@ export class ToolCallView implements TranscriptItemView {
   #chromeStatus: ToolStatus
   #capElision: string | undefined
 
-  constructor(ctx: RenderContext, id: string, frame: ToolViewFrame, theme: Theme, cwd: string, expandHint?: string) {
+  constructor(
+    ctx: RenderContext,
+    id: string,
+    frame: ToolViewFrame,
+    theme: Theme,
+    syntaxStyle: SyntaxStyle,
+    cwd: string,
+    expandHint?: string
+  ) {
     this.#ctx = ctx
     this.#frame = frame
     this.#chromeStatus = frame.status
     this.#theme = theme
+    this.#syntaxStyle = syntaxStyle
     this.#expandHint = expandHint
     this.root = new BoxRenderable(ctx, {
       id: `active-tool:${id}`,
@@ -152,7 +172,15 @@ export class ToolCallView implements TranscriptItemView {
     this.root.add(this.#secondary.root)
     this.root.add(this.#separator)
     this.#body = frame.presentation.body
-      ? createBodyView(ctx, frame.presentation.body, frame.presentation.preview, frame.status, theme, expandHint)
+      ? createBodyView(
+          ctx,
+          frame.presentation.body,
+          frame.presentation.preview,
+          frame.status,
+          theme,
+          syntaxStyle,
+          expandHint
+        )
       : undefined
     this.#contentWidth = Math.max(1, ctx.width - 2)
     this.#header.setWidth(this.#contentWidth)
@@ -245,7 +273,7 @@ export class ToolCallView implements TranscriptItemView {
         this.root.remove(this.#body.root)
         this.#body.destroy()
       }
-      this.#body = createBodyView(this.#ctx, body, preview, status, this.#theme, this.#expandHint)
+      this.#body = createBodyView(this.#ctx, body, preview, status, this.#theme, this.#syntaxStyle, this.#expandHint)
       this.#body.setExpanded(this.#expanded)
       this.#body.setWidth(this.#contentWidth)
       this.root.insertBefore(this.#body.root, this.#notices.root)
@@ -1068,6 +1096,155 @@ export class SourceBodyView extends RowBodyView {
   }
 }
 
+export class CodeBodyView implements OwnedToolBodyView {
+  readonly type = "code" as const
+  readonly root: BoxRenderable
+
+  readonly #ctx: RenderContext
+  readonly #theme: Theme
+  readonly #expandHint: string | undefined
+  readonly #rail: TextRenderable
+  readonly #gutter: TextRenderable
+  readonly #code: CodeRenderable
+  #body: Extract<ToolBody, { readonly type: "code" }>
+  #preview: ToolPreviewPolicy
+  #status: ToolStatus
+  #expanded = false
+  #width = 76
+  #gutters: readonly string[] = []
+  #elisionText: string | undefined
+  #rendered = false
+  #railText = ""
+  #gutterText = ""
+  #codeText = ""
+
+  constructor(
+    ctx: RenderContext,
+    body: Extract<ToolBody, { readonly type: "code" }>,
+    preview: ToolPreviewPolicy,
+    status: ToolStatus,
+    theme: Theme,
+    syntaxStyle: SyntaxStyle,
+    expandHint?: string
+  ) {
+    this.#ctx = ctx
+    this.#body = body
+    this.#preview = preview
+    this.#status = status
+    this.#theme = theme
+    this.#expandHint = expandHint
+    this.root = new BoxRenderable(ctx, { flexDirection: "row", flexShrink: 0 })
+    this.#rail = new TextRenderable(ctx, {
+      selectable: false,
+      fg: railColor(status, theme),
+      wrapMode: "none",
+      flexShrink: 0
+    })
+    this.#gutter = new TextRenderable(ctx, { selectable: false, fg: theme.text.muted, wrapMode: "none", flexShrink: 0 })
+    this.#code = new CodeRenderable(ctx, {
+      content: "",
+      filetype: body.language,
+      syntaxStyle,
+      conceal: false,
+      drawUnstyledText: true,
+      wrapMode: "none",
+      tabIndicator: openTuiTabIndicator,
+      fg: theme.text.toolOutput,
+      flexShrink: 1
+    })
+    this.root.add(this.#rail)
+    this.root.add(this.#gutter)
+    this.root.add(this.#code)
+    this.#render()
+  }
+
+  get hasVisibleRows(): boolean {
+    return this.#gutters.length > 0
+  }
+
+  get elision(): string | undefined {
+    return this.#elisionText
+  }
+
+  update(body: ToolBody): boolean {
+    if (body.type !== "code") throw new Error(`Code body cannot render ${body.type}`)
+    if (sameBody(this.#body, body)) return false
+    this.#body = body
+    this.#code.filetype = body.language
+    this.#render()
+    return true
+  }
+
+  setPreview(preview: ToolPreviewPolicy): boolean {
+    if (samePreview(this.#preview, preview)) return false
+    this.#preview = preview
+    this.#render()
+    return true
+  }
+
+  setExpanded(expanded: boolean): boolean {
+    if (expanded === this.#expanded) return false
+    this.#expanded = expanded
+    this.#render()
+    return true
+  }
+
+  setStatus(status: ToolStatus): boolean {
+    if (status === this.#status) return false
+    this.#status = status
+    this.#rail.fg = railColor(status, this.#theme)
+    return true
+  }
+
+  setWidth(width: number): boolean {
+    if (width === this.#width) return false
+    this.#width = width
+    this.#render()
+    return true
+  }
+
+  destroy(): void {
+    // Invalidate pending parser work before renderer shutdown turns cancellation into a fallback warning.
+    if (this.#code.isHighlighting) this.#code.content = ""
+    this.root.destroyRecursively()
+  }
+
+  #render(): void {
+    const policy = this.#expanded ? this.#preview.detailed : this.#preview.compact
+    const projection =
+      policy.type === "hidden"
+        ? { lines: [] as readonly PresentationLine[] }
+        : codeBodyProjection(this.#body, Math.max(1, this.#width - textWidth(glyphs.toolRail)), policy)
+    this.#elisionText = projection.elision
+      ? elisionText(projection.elision, this.#expanded ? undefined : this.#expandHint)
+      : undefined
+    this.#gutters = projection.lines.map(line => line.gutter ?? "")
+    const railText = projection.lines.map(() => glyphs.toolRail).join("\n")
+    const gutterText = this.#gutters.join("\n")
+    const codeText = projection.lines.map(line => line.text).join("\n")
+    const codeWidth = Math.max(
+      1,
+      this.#width - textWidth(glyphs.toolRail) - textWidth(projection.lines[0]?.gutter ?? "")
+    )
+    if (
+      this.#rendered &&
+      this.#ctx.hasSelection &&
+      (railText !== this.#railText || gutterText !== this.#gutterText || codeText !== this.#codeText)
+    ) {
+      this.#ctx.clearSelection()
+    }
+    this.root.visible = projection.lines.length > 0
+    if (railText !== this.#railText) this.#rail.content = railText
+    if (gutterText !== this.#gutterText) this.#gutter.content = gutterText
+    if (codeWidth !== this.#code.width) this.#code.width = codeWidth
+    if (codeText !== this.#codeText) this.#code.content = codeText
+    this.#railText = railText
+    this.#gutterText = gutterText
+    this.#codeText = codeText
+    this.#rendered = true
+  }
+}
+
 export class DiffBodyView extends RowBodyView {
   readonly type = "diff" as const
 
@@ -1379,6 +1556,7 @@ function createBodyView(
   preview: ToolPreviewPolicy,
   status: ToolStatus,
   theme: Theme,
+  syntaxStyle: SyntaxStyle,
   expandHint?: string
 ): OwnedToolBodyView {
   switch (body.type) {
@@ -1386,6 +1564,8 @@ function createBodyView(
       return new TerminalBodyView(ctx, body, preview, status, theme, expandHint)
     case "source":
       return new SourceBodyView(ctx, body, preview, status, theme, expandHint)
+    case "code":
+      return new CodeBodyView(ctx, body, preview, status, theme, syntaxStyle, expandHint)
     case "diff":
       return new DiffBodyView(ctx, body, preview, status, theme, expandHint)
     case "text":
@@ -1519,6 +1699,48 @@ function sourceLine(
       text: value,
       tone: "output",
       gutter: `${index === 0 && firstLineVisible ? String(line).padStart(digits) : " ".repeat(digits)} │ `,
+      gutterTone: "muted"
+    })),
+    hasMore: wrapped.hasMore
+  }
+}
+
+/** Highlight only the admitted visual window; a collapsed cell never parses its retained 50 KiB source. */
+function codeBodyProjection(
+  body: Extract<ToolBody, { readonly type: "code" }>,
+  width: number,
+  policy: Exclude<ToolPreviewWindow, { readonly type: "hidden" }>
+): BodyProjection {
+  const source = splitTextLines(body.text)
+  const startLine = body.startLine ?? 1
+  const digits = String(startLine + Math.max(0, source.length - 1)).length
+  const contentWidth = Math.max(1, width - digits - 2)
+  return applyDirectionalPreview(
+    {
+      length: source.length,
+      line(index, direction, limit) {
+        return codeLine(source[index]!, startLine + index, digits, contentWidth, direction, limit)
+      }
+    },
+    policy
+  )
+}
+
+function codeLine(
+  text: string,
+  line: number,
+  digits: number,
+  width: number,
+  direction: "head" | "tail",
+  limit: number
+): LineWindow {
+  const wrapped = direction === "head" ? wrapHeadToCells(text, width, limit) : wrapTailToCells(text, width, limit)
+  const firstLineVisible = direction === "head" || !wrapped.hasMore
+  return {
+    lines: wrapped.lines.map((value, index) => ({
+      text: value,
+      tone: "output",
+      gutter: `${index === 0 && firstLineVisible ? String(line).padStart(digits) : " ".repeat(digits)}  `,
       gutterTone: "muted"
     })),
     hasMore: wrapped.hasMore
@@ -1827,6 +2049,13 @@ function sameBody(left: ToolBody, right: ToolBody): boolean {
         right.type === "source" &&
         left.text === right.text &&
         left.path === right.path &&
+        left.startLine === right.startLine
+      )
+    case "code":
+      return (
+        right.type === "code" &&
+        left.text === right.text &&
+        left.language === right.language &&
         left.startLine === right.startLine
       )
     case "diff":

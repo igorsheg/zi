@@ -4,10 +4,11 @@ import { createTestRenderer } from "@opentui/core/testing"
 import { projectToolPresentation } from "@with-zi/coding-agent"
 
 import { ToolCallView } from "../../src/interactive/transcript/tool-view.js"
-import { defaultTheme } from "../../src/theme.js"
+import { createSyntaxStyle, defaultTheme } from "../../src/theme.js"
 
 test("wait rows keep completion evidence concise until expanded", async () => {
   const setup = await createTestRenderer({ width: 72, height: 30, useThread: false })
+  const syntaxStyle = createSyntaxStyle(defaultTheme)
   const name = "shutdown-reviewer"
   const evidence = [
     "Checked interruption ownership.",
@@ -47,6 +48,7 @@ test("wait rows keep completion evidence concise until expanded", async () => {
     "wait-agent",
     { status: "done", presentation },
     defaultTheme,
+    syntaxStyle,
     "/work",
     "Ctrl+O"
   )
@@ -66,6 +68,7 @@ test("wait rows keep completion evidence concise until expanded", async () => {
     expect(expanded).toContain("Final evidence: terminal restoration precedes settlement.")
   } finally {
     view.destroy()
+    syntaxStyle.destroy()
     setup.renderer.destroy()
   }
 })
