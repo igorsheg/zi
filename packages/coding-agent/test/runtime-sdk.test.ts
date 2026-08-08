@@ -19,6 +19,7 @@ import {
   type AgentSessionServices
 } from "../src/index.js"
 import { createModels, createTestAgentRuntime, fauxAssistantMessage, fauxProvider } from "../src/testing.js"
+import { snapshotToolSurface } from "../src/tool-surface.js"
 
 test("the high-level runtime is a frozen caller-owned SDK shell", async () => {
   const models = createModels()
@@ -56,6 +57,7 @@ test("runtime session intents validate external resume input", async () => {
   expect(createTestAgentRuntime({ cwd: "/work", models, session: { type: "resume", file: " " } })).rejects.toThrow(
     "Resumed runtime session requires a file"
   )
+  expect(() => snapshotToolSurface("invalid")).toThrow("Unknown tool surface: invalid")
 })
 
 test("runtime invocation prompts override discovered system prompt inputs", async () => {
@@ -211,6 +213,29 @@ test("caller-supplied services keep a low-level session in memory", async () => 
   } finally {
     session.dispose()
   }
+})
+
+test("low-level code-only sessions require a Code Mode owner", async () => {
+  const cwd = "/work"
+  const paths = new ZiPaths(cwd, "/unused-global")
+  const models = createModels()
+  const services: AgentSessionServices = Object.freeze({
+    paths,
+    settingsManager: new SettingsManager(),
+    credentialStore: new FileCredentialStore(paths),
+    modelRegistry: new ModelRegistry(models),
+    resourceLoader: new ResourceLoader({ paths, project: "trusted" })
+  })
+
+  expect(
+    createAgentSession({
+      services,
+      sessionManager: SessionManager.inMemory(cwd),
+      tools: [],
+      resources: createSessionResources(),
+      toolSurface: "code-only"
+    })
+  ).rejects.toThrow("Tool surface selection requires Code Mode")
 })
 
 test("two runtimes isolate paths, settings, credentials, models, sessions, and cancellation", async () => {

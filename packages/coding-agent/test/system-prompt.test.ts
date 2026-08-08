@@ -46,20 +46,37 @@ test("a custom system prompt owns its product documentation policy", () => {
 })
 
 test("Code Mode adds programmatic-runtime doctrine to the default prompt", () => {
-  const prompt = buildSystemPrompt("/work", createSessionResources(), [], true)
+  const prompt = buildSystemPrompt("/work", createSessionResources(), [], "direct-and-code")
 
   expect(prompt).toContain("# Programmatic runtime")
   expect(prompt).toContain("Use direct tools for one ordinary read, edit, write, or command")
+  expect(prompt).toContain("including calls created with Promise.all")
   expect(prompt).toContain("The runtime coordinates work")
   expect(prompt).toContain("Tool and ambient process effects are not rolled back")
 })
 
 test("Code Mode doctrine remains active with a custom system prompt", () => {
-  const prompt = buildSystemPrompt("/work", createSessionResources({ systemPrompt: "Custom prompt" }), [], true)
+  const prompt = buildSystemPrompt(
+    "/work",
+    createSessionResources({ systemPrompt: "Custom prompt" }),
+    [],
+    "direct-and-code"
+  )
 
   expect(prompt).toContain("Custom prompt")
   expect(prompt).toContain("# Programmatic runtime")
   expect(prompt).not.toContain("Zi documentation")
+})
+
+test("code-only doctrine remains factual with a custom system prompt", () => {
+  const prompt = buildSystemPrompt("/work", createSessionResources({ systemPrompt: "Custom prompt" }), [], "code-only")
+
+  expect(prompt).toContain("Custom prompt")
+  expect(prompt).toContain("The only model-facing tool is code")
+  expect(prompt).toContain("through zi.* inside code cells")
+  expect(prompt).toContain("group a short related sequence")
+  expect(prompt).toContain("Promise.allSettled")
+  expect(prompt).not.toContain("Use direct tools for one ordinary read")
 })
 
 test("peer messaging tools add child-team doctrine", () => {

@@ -105,6 +105,7 @@ import {
 import { isSubagentToolDetails, type SubagentToolDetails } from "./subagents/tool-details.js"
 import { createSubagentTools } from "./subagents/tools.js"
 import { buildSystemPrompt } from "./system-prompt.js"
+import type { ToolSurface } from "./tool-surface.js"
 
 export type { ContextUsage } from "./context-usage.js"
 
@@ -289,6 +290,7 @@ interface AgentSessionConfig {
   resources: SessionResources
   projectFileSearch: ProjectFileSearch
   tools: readonly AgentTool[]
+  toolSurface: ToolSurface | undefined
   reload: SessionReloadDeps
   codeMode?: CodeMode
   extensionHost?: ExtensionHost
@@ -476,6 +478,7 @@ export class AgentSession {
   readonly #reload: SessionReloadDeps
   readonly #projectFileSearch: ProjectFileSearch
   readonly #codeMode: CodeMode | undefined
+  readonly #toolSurface: ToolSurface | undefined
   readonly #extensionHost: ExtensionHost | undefined
   readonly #extensionContext: ExtensionContext
   readonly #shell: SessionShell | undefined
@@ -519,6 +522,7 @@ export class AgentSession {
     this.#resources = config.resources
     this.#projectFileSearch = config.projectFileSearch
     this.#codeMode = config.codeMode
+    this.#toolSurface = config.toolSurface
     this.#extensionHost = config.extensionHost
     this.#extensionContext = config.extensionContext
     this.#baseTools = Object.freeze([...config.tools])
@@ -1663,12 +1667,15 @@ export class AgentSession {
       this.#extensionHost,
       this.#extensionToolSelection.active
     )
-    this.#agent.state.tools = this.#codeMode ? [...tools, this.#codeMode.createTool(tools)] : [...tools]
+    const codeTool = this.#codeMode?.createTool(tools)
+    if (!codeTool) this.#agent.state.tools = [...tools]
+    else if (this.#toolSurface === "code-only") this.#agent.state.tools = [codeTool]
+    else this.#agent.state.tools = [...tools, codeTool]
     this.#agent.state.systemPrompt = buildSystemPrompt(
       this.sessionManager.header.cwd,
       this.#resources,
       tools,
-      this.#codeMode !== undefined
+      this.#toolSurface
     )
   }
 

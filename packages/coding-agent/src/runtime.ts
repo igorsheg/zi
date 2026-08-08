@@ -35,6 +35,7 @@ import { internalSubagentApiKeyEnvironment, internalSubagentDepthEnvironment } f
 import { createCodingTools } from "./tools/index.js"
 
 export type { AgentRuntimeSessionIntent, CreateAgentRuntimeOptions } from "./runtime-options.js"
+export type { ToolSurface } from "./tool-surface.js"
 
 export type AgentRuntimeServices = AgentSessionServices
 
@@ -138,6 +139,7 @@ export async function createUnboundAgentRuntime(requested: CreateAgentRuntimeOpt
         ...(options.subagentCommand ? { subagentCommand: options.subagentCommand } : {}),
         subagentEnvironment: Object.freeze(subagentEnvironment),
         internalSubagentDepth: options.internalSubagentDepth ?? 0,
+        toolSurface: options.toolSurface ?? "direct-and-code",
         ...(model ? { model } : {}),
         ...(options.thinkingLevel ? { thinkingLevel: options.thinkingLevel } : {}),
         ...(options.apiKey ? { apiKey: options.apiKey } : {}),

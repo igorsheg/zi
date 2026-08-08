@@ -34,6 +34,15 @@ const maxImportSpecifierBytes = 4_096
 
 class RealmResetError extends Error {}
 
+class NestedToolError extends Error {
+  readonly callId: number
+
+  constructor(callId: number, message: string) {
+    super(message)
+    this.callId = callId
+  }
+}
+
 interface RealmWorkerData {
   readonly type: typeof realmMarker
   readonly generation: number
@@ -278,6 +287,7 @@ class CellExecution {
         executionId: this.#executionId,
         error: errorMessage(cause),
         logs: this.#logs,
+        ...(cause instanceof NestedToolError ? { toolCallId: cause.callId } : {}),
         ...(cause instanceof RealmResetError ? { reset: true } : {})
       })
     }
@@ -292,7 +302,7 @@ class CellExecution {
       if (message.terminate) this.#terminateRequested = true
       pending.resolve(message.value)
     } else {
-      pending.reject(new Error(message.error))
+      pending.reject(new NestedToolError(message.id, message.error))
     }
   }
 

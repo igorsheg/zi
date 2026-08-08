@@ -45,7 +45,8 @@ export type {
   AgentRuntime,
   AgentRuntimeServices,
   AgentRuntimeSessionIntent,
-  CreateAgentRuntimeOptions
+  CreateAgentRuntimeOptions,
+  ToolSurface
 } from "./runtime.js"
 export { createAgentSession } from "./sdk.js"
 export type {

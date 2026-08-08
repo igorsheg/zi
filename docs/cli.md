@@ -35,6 +35,8 @@ zi --mode rpc --no-session              # versioned JSONL process protocol
 
 Diagnostics and failures go to stderr, preserving stdout for text, JSON, and RPC consumers. Explicit extensions load in every mode. Text and JSON modes do not dispatch interactive or extension commands; prompt-template and skill expansion still apply to admitted input.
 
+`--code-only` is an invocation policy available in every mode. It exposes only the `code` tool to the model while retaining the normal admitted tools inside each cell's `zi` catalog. Interactive commands remain available because they are client operations rather than model tools. Spawned Zi subagents inherit the policy. See [Code Mode](code-mode.md#code-only-invocations).
+
 See [JSON events](json-events.md) for the finite event stream and [RPC](rpc.md) for request framing, methods, bounds, and lifecycle.
 
 ## Invocation resolution

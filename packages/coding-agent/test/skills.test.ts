@@ -23,6 +23,7 @@ test("skill metadata uses progressive disclosure and XML escaping", () => {
   expect(prompt).toContain("/skills/pdf/SKILL.md")
   expect(prompt).not.toContain("<name>manual</name>")
   expect(prompt).not.toContain("Skill body")
+  expect(formatSkillsForPrompt([skill()], "code")).toContain("Use zi.read from a code cell")
 })
 
 test("explicit skill commands read current bounded content and append arguments", async () => {

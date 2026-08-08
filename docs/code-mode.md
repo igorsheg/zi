@@ -35,7 +35,19 @@ The runtime APIs are available as cell globals.
 - `project.import(specifier)` resolves packages and project files from the session working directory. Native dynamic import remains available.
 - `console.log`, `console.warn`, and `console.error` are retained as bounded cell logs.
 
-Every `zi` call must be awaited before the cell returns. Calls are serialized by Zi, even when the cell creates them concurrently.
+Every `zi` call must be awaited before the cell returns. Calls are serialized by Zi, even when the cell creates them concurrently. `Promise.all` does not add tool concurrency; use `Promise.allSettled` only when independent failures should remain available to the cell.
+
+## Code-only invocations
+
+Use `--code-only` to expose only the `code` tool to the model:
+
+```sh
+zi --code-only
+zi --code-only -p "inspect this repository"
+zi --code-only --mode json "implement the requested change"
+```
+
+The cell's `zi` snapshot still contains the same admitted built-in, extension, subagent, and peer tools that an ordinary invocation exposes directly. This changes the model's control surface, not Zi's authority. TUI commands remain available, and spawned Zi subagents inherit the policy. The flag applies to the invocation and is not persisted in a session journal.
 
 ## Memory and failure semantics
 

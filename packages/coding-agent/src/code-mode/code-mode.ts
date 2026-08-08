@@ -59,16 +59,21 @@ const defaultTimeouts: CodeModeTimeouts = Object.freeze({
   nestedSettlementMs: 2_000
 })
 
-interface CodeExecutionResult {
-  readonly type: "completed" | "failed"
-  readonly result?: CodeModeJson
-  readonly state?: CodeModeState
-  readonly error?: string
+type CodeExecutionFailure =
+  | { readonly kind: "cell"; readonly error: string }
+  | { readonly kind: "nested_tool"; readonly tool: string; readonly error: string }
+  | { readonly kind: "nested_settlement"; readonly error: string }
+  | { readonly kind: "runtime"; readonly error: string }
+
+type CodeExecutionResult = {
   readonly calls: readonly CodeModeCall[]
   readonly logs: readonly string[]
   readonly terminate: boolean
   readonly recoverWorker: boolean
-}
+} & (
+  | { readonly type: "completed"; readonly result?: CodeModeJson; readonly state?: CodeModeState }
+  | { readonly type: "failed"; readonly failure: CodeExecutionFailure }
+)
 
 type ExecutionState = { readonly type: "running" } | { readonly type: "final" } | { readonly type: "settled" }
 
@@ -440,24 +445,34 @@ class CodeExecution {
     else this.#parentSignal?.addEventListener("abort", abort, { once: true })
     const executionDeadline = createDeadline(defaultTimeouts.executionMs, "Code execution timed out")
     try {
-      const final = await Promise.race([
-        this.#worker.execute(this.#executionId, this.#code, [...this.#tools.keys()], this.#programState, message =>
-          this.#queueCall(message)
-        ),
-        aborted(this.#controller.signal),
-        executionDeadline.promise
-      ])
+      let final: Extract<CodeModeWorkerMessage, { type: "completed" | "failed" }>
+      try {
+        final = await Promise.race([
+          this.#worker.execute(this.#executionId, this.#code, [...this.#tools.keys()], this.#programState, message =>
+            this.#queueCall(message)
+          ),
+          aborted(this.#controller.signal),
+          executionDeadline.promise
+        ])
+      } catch (cause) {
+        return await this.#recoverFailure("runtime", cause)
+      }
       this.#state = { type: "final" }
       if (final.type === "failed") this.#controller.abort(new Error(final.error))
-      await settle(this.#dispatchQueue, defaultTimeouts.nestedSettlementMs, "Nested code-mode tools did not settle")
-      const common = {
-        calls: snapshotCalls(this.#calls),
-        logs: final.logs,
-        terminate: this.#terminate,
-        recoverWorker: false
+      try {
+        await settle(this.#dispatchQueue, defaultTimeouts.nestedSettlementMs, "Nested code-mode tools did not settle")
+      } catch (cause) {
+        return await this.#recoverFailure("nested_settlement", cause)
       }
+      if (final.type === "failed") this.#abortCalls()
+      const calls = snapshotCalls(this.#calls)
+      const common = { calls, logs: final.logs, terminate: this.#terminate, recoverWorker: false }
       if (final.type === "failed") {
-        return { type: "failed", error: final.error, ...common, recoverWorker: final.reset === true }
+        const nested = final.toolCallId === undefined ? undefined : calls.find(call => call.id === final.toolCallId)
+        const failure: CodeExecutionFailure = nested
+          ? { kind: "nested_tool", tool: nested.name, error: final.error }
+          : { kind: "cell", error: final.error }
+        return { type: "failed", failure, ...common, recoverWorker: final.reset === true }
       }
       return {
         type: "completed",
@@ -465,29 +480,39 @@ class CodeExecution {
         state: final.state,
         ...common
       }
-    } catch (cause) {
-      this.#controller.abort(cause)
-      await settle(
-        this.#dispatchQueue,
-        defaultTimeouts.nestedSettlementMs,
-        "Nested code-mode tools did not settle"
-      ).catch(() => undefined)
-      this.#abortCalls()
-      if (this.#parentSignal?.aborted) throw abortError(this.#controller.signal)
-      const diagnostic = await this.#worker.settledDiagnostic()
-      return {
-        type: "failed",
-        error: boundedErrorText(`${errorMessage(cause)}${diagnostic ? `\nWorker: ${diagnostic}` : ""}`),
-        calls: snapshotCalls(this.#calls),
-        logs: [],
-        terminate: this.#terminate,
-        recoverWorker: true
-      }
     } finally {
       this.#state = { type: "settled" }
       executionDeadline.dispose()
       this.#controller.abort()
       this.#parentSignal?.removeEventListener("abort", abort)
+    }
+  }
+
+  async #recoverFailure(
+    kind: Extract<CodeExecutionFailure, { kind: "runtime" | "nested_settlement" }>["kind"],
+    cause: unknown
+  ): Promise<CodeExecutionResult> {
+    this.#controller.abort(cause)
+    if (kind === "runtime") {
+      await settle(
+        this.#dispatchQueue,
+        defaultTimeouts.nestedSettlementMs,
+        "Nested code-mode tools did not settle"
+      ).catch(() => undefined)
+    }
+    this.#abortCalls()
+    if (this.#parentSignal?.aborted) throw abortError(this.#controller.signal)
+    const diagnostic = await this.#worker.settledDiagnostic()
+    return {
+      type: "failed",
+      failure: {
+        kind,
+        error: boundedErrorText(`${errorMessage(cause)}${diagnostic ? `\nWorker: ${diagnostic}` : ""}`)
+      },
+      calls: snapshotCalls(this.#calls),
+      logs: [],
+      terminate: this.#terminate,
+      recoverWorker: true
     }
   }
 
@@ -618,16 +643,31 @@ class CodeExecution {
   }
 }
 
-function resultFailure(result: CodeExecutionResult): AgentToolResult<CodeModeDetails> {
-  const error = boundedErrorText(result.error ?? "Code execution failed")
+function resultFailure(result: Extract<CodeExecutionResult, { type: "failed" }>): AgentToolResult<CodeModeDetails> {
+  const error = boundedErrorText(result.failure.error)
   const recovery = result.recoverWorker
     ? "\nThe programmatic worker was replaced. Volatile scratch was cleared; committed state was preserved."
     : ""
   return {
-    content: [{ type: "text", text: `Code execution failed: ${error}${recovery}` }],
+    content: [{ type: "text", text: `${failureLabel(result.failure)}: ${error}${recovery}` }],
     details: { type: "code_mode", outcome: "error", error, calls: result.calls, logs: result.logs },
     ...(result.terminate ? { terminate: true } : {})
   }
+}
+
+function failureLabel(failure: CodeExecutionFailure): string {
+  switch (failure.kind) {
+    case "cell":
+      return "Code cell failed"
+    case "nested_tool":
+      return `Nested Zi tool ${failure.tool} failed`
+    case "nested_settlement":
+      return "Nested Zi tool settlement failed"
+    case "runtime":
+      return "Code runtime failed"
+  }
+  const unreachable: never = failure
+  return unreachable
 }
 
 function stateCommitFailure(result: CodeExecutionResult, cause: unknown): AgentToolResult<CodeModeDetails> {
@@ -646,7 +686,14 @@ function stateCommitFailure(result: CodeExecutionResult, cause: unknown): AgentT
 }
 
 function codeFailure(error: string): AgentToolResult<CodeModeDetails> {
-  return resultFailure({ type: "failed", error, calls: [], logs: [], terminate: false, recoverWorker: false })
+  return resultFailure({
+    type: "failed",
+    failure: { kind: "runtime", error },
+    calls: [],
+    logs: [],
+    terminate: false,
+    recoverWorker: false
+  })
 }
 
 async function raceWithAbort<T>(operation: Promise<T>, signal?: AbortSignal): Promise<T> {
@@ -693,6 +740,7 @@ Each cell is an ordinary JavaScript async arrow function with full Node-compatib
 Every direct tool is also available as zi.<tool>(input) with the same input fields; use zi["tool-name"] for punctuation.
 Successful calls return the declared JSON-compatible JavaScript value directly; values are already decoded.
 Tool failures throw Error and may be handled with try/catch. Console logs are retained when execution completes, not streamed live.
+Zi executes tool calls serially, including calls created with Promise.all; Promise.allSettled retains independent failures but does not add concurrency.
 scratch holds arbitrary volatile JavaScript and survives successful and ordinarily failed cells. It is cleared when the worker is replaced or the session resumes.
 state holds bounded JSON, commits only when a cell succeeds, and survives worker replacement, compaction, and session resume.
 Tool calls and ambient effects are not transactional when a cell or state commit fails.

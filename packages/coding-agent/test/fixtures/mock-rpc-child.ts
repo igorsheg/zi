@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process"
-import { appendFileSync, writeFileSync } from "node:fs"
+import { appendFileSync, existsSync, writeFileSync } from "node:fs"
 
 /**
  * Minimal Zi RPC child for subagent vertical-slice tests.
@@ -23,6 +23,7 @@ import { appendFileSync, writeFileSync } from "node:fs"
  *   MOCK_RPC_EXIT_ON_PROMPT — exit while requests may still be queued on stdin
  *   MOCK_RPC_IGNORE_INTERRUPT — acknowledge interruption without settling work
  *   MOCK_RPC_DROP_INTERRUPT — neither acknowledge nor settle interruption
+ *   MOCK_RPC_INTERRUPT_RELEASE — wait for this file before acknowledging interruption
  *   MOCK_RPC_ERROR — assistant error text and failed stop reason
  *   MOCK_RPC_PEER_RESPONSE — path to write one host peer response after the __peer_send__ prompt
  *   MOCK_RPC_PROMPTS_LOG — path to append admitted prompt text
@@ -42,6 +43,7 @@ const argvPath = process.env.MOCK_RPC_ARGV
 const internalApiKeyPath = process.env.MOCK_RPC_INTERNAL_API_KEY
 const ignoreInterrupt = process.env.MOCK_RPC_IGNORE_INTERRUPT === "1"
 const dropInterrupt = process.env.MOCK_RPC_DROP_INTERRUPT === "1"
+const interruptReleasePath = process.env.MOCK_RPC_INTERRUPT_RELEASE
 const peerResponsePath = process.env.MOCK_RPC_PEER_RESPONSE
 const promptsLogPath = process.env.MOCK_RPC_PROMPTS_LOG
 const duplicatePeerRequest = process.env.MOCK_RPC_DUPLICATE_PEER_REQUEST === "1"
@@ -186,7 +188,7 @@ async function handle(request: { id: string; method: string; params?: RequestPar
     }
     if (text === "__block_prompt__") await Bun.sleep(30_000)
     if (text === "__delay_prompt__") await Bun.sleep(150)
-    activeDelayMs = text === "__long_work__" ? 30_000 : delayMs
+    activeDelayMs = text === "__long_work__" ? 30_000 : text === "__short_work__" ? 30 : delayMs
     messages.push({ role: "user", content: [{ type: "text", text }] })
     messages.push({
       role: "assistant",
@@ -282,6 +284,13 @@ async function handle(request: { id: string; method: string; params?: RequestPar
   }
   if (method === "session.interrupt") {
     if (dropInterrupt) return
+    if (interruptReleasePath) {
+      for (;;) {
+        if (existsSync(interruptReleasePath)) break
+        // oxlint-disable-next-line no-await-in-loop -- deterministic test barrier.
+        await Bun.sleep(5)
+      }
+    }
     const latest = messages.at(-1)
     if (!ignoreInterrupt && busy && latest && latest.role === "assistant") {
       messages[messages.length - 1] = { role: "assistant", stopReason: "aborted", content: latest.content }

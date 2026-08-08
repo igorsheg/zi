@@ -5,46 +5,18 @@ import { getProductDocumentationPaths } from "./product-documentation.js"
 import type { SessionResources } from "./resource-loader.js"
 import { formatSkillsForPrompt } from "./skills.js"
 import { peerMessagingDoctrine } from "./subagents/peer-messenger.js"
+import type { ToolSurface } from "./tool-surface.js"
 
 export function buildSystemPrompt(
   cwd: string,
   resources: SessionResources,
   tools: readonly AgentTool[],
-  codeMode = false
+  toolSurface?: ToolSurface
 ): string {
-  const prompt =
-    resources.systemPrompt ??
-    (codeMode
-      ? `You are an expert coding assistant operating inside Zi.
-
-Available tools:
-- read: Read file contents
-- bash: Execute shell commands
-- edit: Make exact text replacements
-- write: Create or overwrite files
-- code: Orchestrate data-dependent multi-tool workflows in JavaScript
-
-Guidelines:
-- Use read to inspect files instead of shelling out to cat or sed
-- Use edit for precise changes and write for new files or complete rewrites
-- Be concise
-- Show file paths clearly`
-      : `You are an expert coding assistant operating inside Zi.
-
-Available tools:
-- read: Read file contents
-- bash: Execute shell commands
-- edit: Make exact text replacements
-- write: Create or overwrite files
-
-Guidelines:
-- Use read to inspect files instead of shelling out to cat or sed
-- Use edit for precise changes and write for new files or complete rewrites
-- Be concise
-- Show file paths clearly`)
+  const prompt = resources.systemPrompt ?? defaultSystemPrompt(toolSurface)
 
   const sections = [prompt]
-  if (codeMode) sections.push(codeModeDoctrine())
+  if (toolSurface) sections.push(codeModeDoctrine(toolSurface))
   if (tools.some(tool => tool.name === "send_peer_message")) sections.push(peerMessagingDoctrine())
   if (resources.systemPrompt === undefined) sections.push(productDocumentationPrompt())
   if (resources.appendSystemPrompt.length > 0) sections.push(resources.appendSystemPrompt.join("\n\n"))
@@ -56,11 +28,43 @@ Guidelines:
     )
   }
   if (tools.some(tool => tool.name === "read")) {
-    const skills = formatSkillsForPrompt(resources.skills)
+    const skills = formatSkillsForPrompt(resources.skills, toolSurface === "code-only" ? "code" : "direct")
     if (skills.length > 0) sections.push(skills)
   }
   sections.push(`Current date: ${new Date().toISOString().slice(0, 10)}\nCurrent working directory: ${cwd}`)
   return sections.join("\n\n")
+}
+
+function defaultSystemPrompt(toolSurface: ToolSurface | undefined): string {
+  if (toolSurface === "code-only") {
+    return `You are an expert coding assistant operating inside Zi.
+
+Available tools:
+- code: Execute JavaScript that orchestrates Zi tools and other runtime APIs
+
+The code cell's zi catalog provides the admitted file, shell, extension, and subagent tools.
+
+Guidelines:
+- Perform tool-backed operations through zi.* inside code cells
+- Keep cells cohesive: group short related operations, and use JavaScript for data-dependent workflows
+- Be concise
+- Show file paths clearly`
+  }
+  const code =
+    toolSurface === "direct-and-code" ? "\n- code: Orchestrate data-dependent multi-tool workflows in JavaScript" : ""
+  return `You are an expert coding assistant operating inside Zi.
+
+Available tools:
+- read: Read file contents
+- bash: Execute shell commands
+- edit: Make exact text replacements
+- write: Create or overwrite files${code}
+
+Guidelines:
+- Use read to inspect files instead of shelling out to cat or sed
+- Use edit for precise changes and write for new files or complete rewrites
+- Be concise
+- Show file paths clearly`
 }
 
 function productDocumentationPrompt(): string {

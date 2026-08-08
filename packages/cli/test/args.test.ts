@@ -41,6 +41,7 @@ test("CLI parses runtime overrides, prompts, and long-option equals syntax", () 
     extensionPaths: [join(context.cwd, "extension.ts"), join(context.home, "global.ts")],
     session: { type: "new", persist: false },
     mode: "auto",
+    toolSurface: "direct-and-code",
     messages: ["first", "second"]
   })
 })
@@ -124,6 +125,7 @@ test("environment values provide invocation defaults", () => {
     extensionPaths: [],
     session: { type: "new", persist: true },
     mode: "interactive",
+    toolSurface: "direct-and-code",
     messages: []
   })
 })
@@ -203,6 +205,11 @@ test("help and version are parse-time intents", () => {
 
 test("RPC is an explicit protocol mode", () => {
   expect(resolveCliInvocation(parseArgs(["--mode", "rpc"]), context).mode).toBe("rpc")
+})
+
+test("code-only is an explicit invocation tool surface", () => {
+  expect(resolveCliInvocation(parseArgs(["--code-only"]), context).toolSurface).toBe("code-only")
+  expect(() => parseArgs(["--code-only=true"])).toThrow("--code-only does not take a value")
 })
 
 test("values and environment defaults are validated at their boundary", () => {

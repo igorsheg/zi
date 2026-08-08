@@ -4,6 +4,7 @@ import type { ThinkingLevel } from "@earendil-works/pi-agent-core"
 
 import type { ProcessTreeTracker } from "../processes/process-tree.js"
 import type { SessionEntry, SessionManager, SubagentEntry, SubagentEntryInput } from "../session-manager.js"
+import type { ToolSurface } from "../tool-surface.js"
 import {
   ChildZiProcess,
   clipUtf8,
@@ -103,6 +104,7 @@ export interface SubagentSupervisorOptions {
   readonly processTreeTracker: ProcessTreeTracker
   readonly waitTimeoutMs?: number
   readonly workTimeoutMs?: number
+  readonly toolSurface?: ToolSurface
 }
 
 export type SubagentSupervisorEvent =
@@ -116,6 +118,7 @@ export class SubagentSupervisor {
   readonly #selection: () => { readonly model: string; readonly thinkingLevel: ThinkingLevel; readonly apiKey?: string }
   readonly #sessionManager: SessionManager
   readonly #processTreeTracker: ProcessTreeTracker
+  readonly #toolSurface: ToolSurface
   readonly #listeners = new Set<(event: SubagentSupervisorEvent) => void>()
   readonly #names = new Set<string>()
   readonly #live = new Map<string, LiveRecord>()
@@ -136,6 +139,7 @@ export class SubagentSupervisor {
     this.#selection = options.selection
     this.#sessionManager = options.sessionManager
     this.#processTreeTracker = options.processTreeTracker
+    this.#toolSurface = options.toolSurface ?? "direct-and-code"
     this.waitTimeoutMs = options.waitTimeoutMs ?? defaultWaitTimeoutMs
     if (!isSubagentWaitTimeout(this.waitTimeoutMs)) throw new Error("Invalid subagent wait timeout")
     this.workTimeoutMs = options.workTimeoutMs ?? defaultSubagentWorkTimeoutMs
@@ -276,7 +280,8 @@ export class SubagentSupervisor {
       "--model",
       selection.model,
       "--thinking",
-      selection.thinkingLevel
+      selection.thinkingLevel,
+      ...(this.#toolSurface === "code-only" ? ["--code-only"] : [])
     ]
     const environment = selection.apiKey
       ? Object.freeze({ ...this.#env, [internalSubagentApiKeyEnvironment]: selection.apiKey })
@@ -533,11 +538,12 @@ export class SubagentSupervisor {
     this.#assertOpen()
     validateSubagentName(name)
     const record = this.#requireLive(name)
-    return record.serial.run(async () => {
+    const settlement = record.serial.run(async () => {
       const admittedSnapshot = record.child.snapshot()
       const workCycle = admittedSnapshot.workCycle ?? record.lastWorkCycle
       const admittedDelivery = this.#delivery(name, workCycle)?.type
       const result = await record.child.interrupt()
+      throwIfWaitCancelled(signal)
       if (result === "already_idle") {
         return {
           result,
@@ -563,6 +569,7 @@ export class SubagentSupervisor {
       )
       return { result, snapshot }
     })
+    return raceWithWaitCancellation(settlement, signal)
   }
 
   async #closeAndDeliver(name: string, deliveryMode: "consume" | "claim", claimId?: string): Promise<SubagentSnapshot> {
@@ -1161,11 +1168,30 @@ function deferredVoid(): { readonly promise: Promise<void>; resolve(): void } {
   }
 }
 
+async function raceWithWaitCancellation<T>(operation: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return operation
+  if (signal.aborted) throw waitCancellationError()
+  let rejectCancellation!: (cause: Error) => void
+  const cancellation = new Promise<never>((_, reject) => {
+    rejectCancellation = reject
+  })
+  const abort = (): void => rejectCancellation(waitCancellationError())
+  signal.addEventListener("abort", abort, { once: true })
+  try {
+    return await Promise.race([operation, cancellation])
+  } finally {
+    signal.removeEventListener("abort", abort)
+  }
+}
+
 function throwIfWaitCancelled(signal?: AbortSignal): void {
-  if (!signal?.aborted) return
+  if (signal?.aborted) throw waitCancellationError()
+}
+
+function waitCancellationError(): Error {
   const error = new Error("Subagent wait was cancelled")
   error.name = "AbortError"
-  throw error
+  return error
 }
 
 function completionKey(name: string, workCycle: number): string {

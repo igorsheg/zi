@@ -108,6 +108,7 @@ test("session runtime owns invocation prompt arrays across replacements", async 
     cwd: "/work",
     model: "runtime-options/model",
     session: { type: "new", persist: false },
+    toolSurface: "code-only",
     appendSystemPrompt,
     modelFactory: () => models
   }
@@ -124,6 +125,7 @@ test("session runtime owns invocation prompt arrays across replacements", async 
 
     expect(replacementOptions?.appendSystemPrompt).toEqual(["Original"])
     expect(Object.isFrozen(replacementOptions?.appendSystemPrompt)).toBe(true)
+    expect(replacementOptions?.toolSurface).toBe("code-only")
   } finally {
     runtime.dispose()
     await runtime.waitForIdle()

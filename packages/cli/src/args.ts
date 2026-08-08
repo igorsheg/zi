@@ -1,6 +1,6 @@
 import { isAbsolute } from "node:path"
 
-import { getDefaultAgentDir, resolveZiPath, type ThinkingLevel } from "@with-zi/coding-agent"
+import { getDefaultAgentDir, resolveZiPath, type ThinkingLevel, type ToolSurface } from "@with-zi/coding-agent"
 
 export type CliOutputMode = "text" | "json"
 export type CliMode = "auto" | "interactive" | "rpc" | CliOutputMode
@@ -23,6 +23,7 @@ export interface ParsedArgs {
   readonly extensionPaths?: readonly string[]
   readonly session?: CliSession
   readonly mode?: CliMode
+  readonly toolSurface?: ToolSurface
   readonly messages: readonly string[]
   readonly help: boolean
   readonly version: boolean
@@ -40,6 +41,7 @@ export interface CliInvocation {
   readonly extensionPaths: readonly string[]
   readonly session: CliSession
   readonly mode: CliMode
+  readonly toolSurface: ToolSurface
   readonly messages: readonly string[]
 }
 
@@ -63,6 +65,7 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
   let extensionPaths: string[] | undefined
   let session: CliSession | undefined
   let mode: CliMode | undefined
+  let toolSurface: ToolSurface | undefined
   let help = false
   let version = false
   const messages: string[] = []
@@ -137,6 +140,9 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
       const [value, nextIndex] = requiredValue(argv, index, flag, inlineValue)
       mode = parseMode(value, flag)
       index = nextIndex
+    } else if (flag === "--code-only") {
+      rejectInlineValue(flag, inlineValue)
+      toolSurface = "code-only"
     } else if (flag === "--help" || flag === "-h") {
       rejectInlineValue(flag, inlineValue)
       help = true
@@ -164,7 +170,8 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
     ...(appendSystemPrompt === undefined ? {} : { appendSystemPrompt: Object.freeze(appendSystemPrompt) }),
     ...(extensionPaths === undefined ? {} : { extensionPaths: Object.freeze(extensionPaths) }),
     ...(session === undefined ? {} : { session }),
-    ...(mode === undefined ? {} : { mode })
+    ...(mode === undefined ? {} : { mode }),
+    ...(toolSurface === undefined ? {} : { toolSurface })
   })
 }
 
@@ -181,6 +188,7 @@ export function resolveCliInvocation(parsed: ParsedArgs, context: CliResolutionC
   const thinkingLevel = parsed.thinkingLevel ?? environmentThinkingLevel(context.env)
   const mode = parsed.mode ?? environmentMode(context.env) ?? "auto"
   const session = resolveSession(parsed.session, context)
+  const toolSurface = parsed.toolSurface ?? "direct-and-code"
   const extensionPaths = Object.freeze(
     (parsed.extensionPaths ?? []).map(path => resolveZiPath(path, context.cwd, context.home))
   )
@@ -191,6 +199,7 @@ export function resolveCliInvocation(parsed: ParsedArgs, context: CliResolutionC
     extensionPaths,
     session,
     mode,
+    toolSurface,
     messages: parsed.messages,
     ...(sessionDir === undefined ? {} : { sessionDir }),
     ...(model === undefined ? {} : { model }),

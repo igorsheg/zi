@@ -162,13 +162,17 @@ export function loadSkills(
   return [...skills.values()]
 }
 
-export function formatSkillsForPrompt(skills: readonly Skill[]): string {
+export function formatSkillsForPrompt(skills: readonly Skill[], readSurface: "direct" | "code" = "direct"): string {
   const visible = skills.filter(skill => !skill.disableModelInvocation)
   if (visible.length === 0) return ""
 
+  const readInstruction =
+    readSurface === "code"
+      ? "Use zi.read from a code cell to load a skill's file when the task matches its description."
+      : "Use the read tool to load a skill's file when the task matches its description."
   const lines = [
     "The following skills provide specialized instructions for specific tasks.",
-    "Use the read tool to load a skill's file when the task matches its description.",
+    readInstruction,
     "When a skill file references a relative path, resolve it against the skill directory (parent of SKILL.md / dirname of the path) and use that absolute path in tool commands.",
     "",
     "<available_skills>"

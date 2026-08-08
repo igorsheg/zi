@@ -93,6 +93,44 @@ test("new Zi sessions expose direct coding tools and code by default", async () 
   }
 })
 
+test("code-only sessions expose one model tool backed by the complete Zi catalog", async () => {
+  const faux = fauxProvider()
+  let catalog: readonly string[] = []
+  let description = ""
+  let systemPrompt = ""
+  faux.setResponses([
+    context => {
+      catalog = (context.tools ?? []).map(tool => tool.name)
+      description = context.tools?.[0]?.description ?? ""
+      systemPrompt = context.systemPrompt ?? ""
+      return fauxAssistantMessage("done")
+    }
+  ])
+  const models = createModels()
+  models.setProvider(faux.provider)
+  const runtime = await createTestAgentRuntime({
+    cwd: await mkdtemp(join(tmpdir(), "zi-code-only-catalog-")),
+    models,
+    model: "faux/faux-1",
+    toolSurface: "code-only",
+    session: { type: "new", persist: false }
+  })
+
+  try {
+    await runtime.session.prompt("inspect tools")
+    expect(catalog).toEqual(["code"])
+    expect(description).toContain("read: (input:")
+    expect(description).toContain("bash: (input:")
+    expect(description).toContain("including calls created with Promise.all")
+    expect(systemPrompt).toContain("The only model-facing tool is code")
+    expect(systemPrompt).toContain("Promise.allSettled")
+    expect(systemPrompt).not.toContain("Use direct tools for one ordinary read")
+  } finally {
+    runtime.session.dispose()
+    await runtime.session.waitForIdle()
+  }
+})
+
 test("code executes serial nested calls in an isolated worker", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "zi-code-mode-execute-"))
   const tool = createCodeMode(cwd).createTool([echoTool])
@@ -194,8 +232,57 @@ test("code preserves nested schema failures as bounded trace evidence", async ()
   expect(result.details.outcome).toBe("error")
   expect(result.details.calls).toHaveLength(1)
   expect(result.details.calls[0]?.state).toBe("failed")
-  expect(result.content[0]).toMatchObject({ type: "text" })
+  expect(result.content[0]).toEqual({ type: "text", text: expect.stringContaining("Nested Zi tool echo failed") })
 })
+
+test("code distinguishes cell failures from nested tool failures", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "zi-code-mode-failure-source-"))
+  const tool = createCodeMode(cwd).createTool([echoTool])
+  const syntax = await tool.execute("syntax", { code: `async () => {` }, undefined)
+
+  expect(isCodeModeDetails(syntax.details) && syntax.details.outcome).toBe("error")
+  expect(syntax.content[0]).toEqual({ type: "text", text: expect.stringContaining("Code cell failed") })
+
+  const collision = await tool.execute(
+    "collision",
+    {
+      code: `async () => {
+  try { await zi.echo({}); }
+  catch (error) { throw new Error(error instanceof Error ? error.message : String(error)); }
+}`
+    },
+    undefined
+  )
+  expect(isCodeModeDetails(collision.details) && collision.details.outcome).toBe("error")
+  expect(collision.content[0]).toEqual({ type: "text", text: expect.stringContaining("Code cell failed") })
+})
+
+test("code replaces a worker when cancelled nested work cannot settle", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "zi-code-mode-nested-settlement-"))
+  const blockedTool: AgentTool = {
+    name: "blocked",
+    label: "blocked",
+    description: "Never settle",
+    parameters: Type.Object({}),
+    execute: () => new Promise<never>(() => {})
+  }
+  const tool = createCodeMode(cwd).createTool([blockedTool])
+  const failed = await tool.execute(
+    "blocked",
+    { code: `async () => { zi.blocked({}); return "too early"; }` },
+    undefined
+  )
+
+  expect(isCodeModeDetails(failed.details)).toBe(true)
+  if (!isCodeModeDetails(failed.details) || failed.details.outcome !== "error") {
+    throw new Error("Expected nested settlement error")
+  }
+  expect(failed.details.calls).toEqual([expect.objectContaining({ name: "blocked", state: "aborted" })])
+  expect(failed.content[0]).toEqual({ type: "text", text: expect.stringContaining("Nested Zi tool settlement failed") })
+
+  const recovered = await tool.execute("recovered", { code: `async () => "ready"` }, undefined)
+  expect(recovered.content).toEqual([{ type: "text", text: "ready" }])
+}, 7_000)
 
 test("code exposes a closed non-thenable guest tool catalog", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "zi-code-mode-proxy-"))
@@ -543,6 +630,7 @@ test("code guest can catch built-in expected errors and uncaught failures settle
     throw new Error("Expected uncaught nested failure")
   }
   expect(uncaught.details.calls[0]?.state).toBe("failed")
+  expect(uncaught.content[0]).toEqual({ type: "text", text: expect.stringContaining("Nested Zi tool read failed") })
 })
 
 test("code durable traces redact built-in write and edit payloads", async () => {
@@ -758,13 +846,28 @@ test("code rejects unawaited nested calls and cancels their admitted work", asyn
   expect(result.details.calls.every(call => call.state !== "running")).toBe(true)
 })
 
-test("code contains guest memory exhaustion in its worker", async () => {
+test("code contains guest memory exhaustion and aborts active nested work", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "zi-code-mode-memory-"))
-  const tool = createCodeMode(cwd).createTool([echoTool])
+  const waitingTool: AgentTool = {
+    name: "wait",
+    label: "wait",
+    description: "Wait for cancellation",
+    parameters: Type.Object({}),
+    execute: async (_id, _input, signal) => {
+      await new Promise<never>((_, reject) => {
+        const abort = (): void => reject(signal?.reason ?? new Error("nested work aborted"))
+        if (signal?.aborted) abort()
+        else signal?.addEventListener("abort", abort, { once: true })
+      })
+      throw new Error("Unreachable nested completion")
+    }
+  }
+  const tool = createCodeMode(cwd).createTool([waitingTool])
   const result = await tool.execute(
     "outer",
     {
       code: `async () => {
+  zi.wait({});
   const values = new Array(100_000_000).fill(1);
 }`
     },
@@ -776,12 +879,17 @@ test("code contains guest memory exhaustion in its worker", async () => {
     throw new Error("Expected code-mode memory error")
   }
   expect(result.details.error.toLowerCase()).toContain("memory")
+  expect(result.details.calls.every(call => call.state !== "running")).toBe(true)
+  expect(result.content[0]).toEqual({ type: "text", text: expect.stringContaining("Code runtime failed") })
   expect(result.content[0]).toEqual({
     type: "text",
     text: expect.stringContaining(
       "The programmatic worker was replaced. Volatile scratch was cleared; committed state was preserved."
     )
   })
+
+  const recovered = await tool.execute("recovered", { code: `async () => "ready"` }, undefined)
+  expect(recovered.content).toEqual([{ type: "text", text: "ready" }])
 })
 
 test("code restarts cleanly after interrupting an infinite cell", async () => {

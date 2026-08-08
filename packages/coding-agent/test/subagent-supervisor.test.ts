@@ -1,16 +1,26 @@
 import { expect, test } from "bun:test"
 import { readFileSync } from "node:fs"
-import { mkdir, mkdtemp, rm } from "node:fs/promises"
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
+import { fileURLToPath } from "node:url"
 
+import type { AgentTool } from "@earendil-works/pi-agent-core"
+import { Type } from "@earendil-works/pi-ai"
+
+import { CodeMode, isCodeModeDetails } from "../src/code-mode/code-mode.js"
 import { ZiPaths } from "../src/paths.js"
 import { createProcessTreeTracker } from "../src/processes/process-tree.js"
 import { SessionManager } from "../src/session-manager.js"
 import { clipUtf8 } from "../src/subagents/child-process.js"
 import { durablePreviewBytes, maxRetainedSubagents, SubagentSupervisor } from "../src/subagents/supervisor.js"
+import { createSubagentTools } from "../src/subagents/tools.js"
 
 const mockChild = resolve(import.meta.dir, "fixtures/mock-rpc-child.ts")
+const codeModeWorkerCommand = Object.freeze([
+  process.execPath,
+  fileURLToPath(new URL("../src/code-mode/worker-entry.ts", import.meta.url))
+])
 
 test("UTF-8 clipping handles maximum admitted task text without splitting code points", () => {
   const clipped = clipUtf8(`${"a".repeat(8 * 1024 * 1024 - 3)}界`, 256)
@@ -719,6 +729,103 @@ test("cancelling interrupt settlement preserves exact cycle evidence", async () 
   }
 }, 15_000)
 
+test("interrupt observation cancels while the admitted RPC command settles independently", async () => {
+  const harness = await createHarness("interrupt-observation-cancel", {
+    reply: "cancelled",
+    delayMs: 30_000,
+    interruptBarrier: true
+  })
+  try {
+    const name = await harness.supervisor.spawn("reusable-worker", "long first cycle")
+    const controller = new AbortController()
+    let outcome: { readonly type: "resolved" } | { readonly type: "rejected"; readonly cause: unknown } | undefined
+    void harness.supervisor.interruptAndWaitForTool(name, controller.signal).then(
+      () => {
+        outcome = { type: "resolved" }
+        return undefined
+      },
+      cause => {
+        outcome = { type: "rejected", cause }
+        return undefined
+      }
+    )
+    await waitFor(() => harness.supervisor.snapshots()[0]?.lifecycle === "interrupting", 5_000)
+
+    controller.abort()
+    await Bun.sleep(0)
+    expect(outcome).toEqual({ type: "rejected", cause: expect.objectContaining({ name: "AbortError" }) })
+
+    await writeFile(harness.interruptReleasePath!, "release")
+    const retained = await harness.supervisor.wait([name], 5_000)
+    expect(retained[0]).toMatchObject({ capturedWorkCycle: 1, completion: { workCycle: 1, status: "cancelled" } })
+  } finally {
+    await harness.dispose()
+  }
+}, 15_000)
+
+test("Code Mode cancels sibling subagent observation after a nested failure", async () => {
+  const harness = await createHarness("code-mode-interrupt-cancel", {
+    reply: "cancelled",
+    delayMs: 30_000,
+    interruptBarrier: true
+  })
+  const codeMode = new CodeMode(harness.cwd, codeModeWorkerCommand)
+  try {
+    const name = await harness.supervisor.spawn("reusable-worker", "long first cycle")
+    const subagentTools = createSubagentTools(
+      [{ name: "pathfinder", description: "Find paths", instructions: "Return evidence." }],
+      harness.supervisor,
+      (_profile, runtimeName, prompt, signal) => harness.supervisor.spawn(runtimeName, prompt, signal)
+    )
+    const interrupt = subagentTools.find(tool => tool.name === "interrupt_subagent")
+    if (!interrupt) throw new Error("Expected interrupt_subagent tool")
+    const fail: AgentTool = {
+      name: "fail",
+      label: "fail",
+      description: "Fail immediately",
+      parameters: Type.Object({}),
+      execute: async () => {
+        throw new Error("first nested failure")
+      }
+    }
+    const tool = codeMode.createTool([fail, interrupt])
+    const result = await tool.execute(
+      "outer",
+      {
+        code: `async () => Promise.all([
+  zi.fail({}),
+  zi.interrupt_subagent({ name: "${name}" })
+])`
+      },
+      undefined
+    )
+
+    expect(isCodeModeDetails(result.details)).toBe(true)
+    if (!isCodeModeDetails(result.details) || result.details.outcome !== "error") {
+      throw new Error("Expected nested tool failure")
+    }
+    expect(result.content[0]).toEqual({ type: "text", text: expect.stringContaining("Nested Zi tool fail failed") })
+    expect(result.details.calls).toEqual([
+      expect.objectContaining({ name: "fail", state: "failed" }),
+      expect.objectContaining({ name: "interrupt_subagent", state: "aborted" })
+    ])
+
+    const recovered = await tool.execute("recovered", { code: `async () => "ready"` }, undefined)
+    expect(recovered.content).toEqual([{ type: "text", text: "ready" }])
+
+    await writeFile(harness.interruptReleasePath!, "release")
+    const retained = await harness.supervisor.wait([name], 5_000)
+    expect(retained[0]).toMatchObject({ capturedWorkCycle: 1, completion: { workCycle: 1, status: "cancelled" } })
+
+    await harness.supervisor.continue(name, "__short_work__")
+    const reused = await harness.supervisor.wait([name], 5_000)
+    expect(reused[0]).toMatchObject({ capturedWorkCycle: 2, completion: { workCycle: 2, status: "completed" } })
+  } finally {
+    await codeMode.dispose()
+    await harness.dispose()
+  }
+}, 15_000)
+
 test("SubagentSupervisor admits four live children and rejects a fifth", async () => {
   const harness = await createHarness("capacity", { delayMs: 20 })
   try {
@@ -1013,6 +1120,20 @@ test("SubagentSupervisor resolves the parent's current model selection without e
   }
 }, 15_000)
 
+test("SubagentSupervisor propagates the code-only tool surface to child sessions", async () => {
+  const argvPath = join(tmpdir(), `zi-subagent-code-only-${crypto.randomUUID()}.json`)
+  const harness = await createHarness("code-only", { argvPath, toolSurface: "code-only" })
+  try {
+    const name = await harness.supervisor.spawn("programmatic-worker", "inspect programmatically")
+    const argv: unknown = JSON.parse(readFileSync(argvPath, "utf8"))
+    expect(argv).toEqual(expect.arrayContaining(["--mode", "rpc", "--code-only"]))
+    await harness.supervisor.close(name)
+  } finally {
+    await harness.dispose()
+    await rm(argvPath, { force: true })
+  }
+}, 15_000)
+
 test("close cleans up and returns terminal evidence when lifecycle journaling fails", async () => {
   const harness = await createHarness("close-journal-failure", { delayMs: 300 })
   try {
@@ -1195,6 +1316,8 @@ async function createHarness(
     readonly peerRelay?: boolean
     readonly peerOperation?: "list" | "send"
     readonly peerTarget?: string
+    readonly interruptBarrier?: boolean
+    readonly toolSurface?: "code-only"
     readonly selection?: () => {
       readonly model: string
       readonly thinkingLevel: "off" | "high"
@@ -1208,6 +1331,7 @@ async function createHarness(
   readonly descendantMarker?: string
   readonly peerResponsePath?: string
   readonly promptsLogPath?: string
+  readonly interruptReleasePath?: string
   dispose(): Promise<void>
 }> {
   const root = await mkdtemp(join(tmpdir(), `zi-subagent-${name}-`))
@@ -1217,6 +1341,7 @@ async function createHarness(
   const descendantMarker = options.descendant ? join(root, "descendant.pid") : undefined
   const peerResponsePath = options.peerRelay ? join(root, "peer-response.json") : undefined
   const promptsLogPath = options.peerRelay ? join(root, "prompts.log") : undefined
+  const interruptReleasePath = options.interruptBarrier ? join(root, "interrupt.release") : undefined
   const supervisor = new SubagentSupervisor({
     command: [process.execPath, mockChild],
     cwd: paths.cwd,
@@ -1232,12 +1357,14 @@ async function createHarness(
       ...(peerResponsePath ? { MOCK_RPC_PEER_RESPONSE: peerResponsePath } : {}),
       ...(promptsLogPath ? { MOCK_RPC_PROMPTS_LOG: promptsLogPath } : {}),
       ...(options.peerOperation ? { MOCK_RPC_PEER_OPERATION: options.peerOperation } : {}),
-      ...(options.peerTarget ? { MOCK_RPC_PEER_TARGET: options.peerTarget } : {})
+      ...(options.peerTarget ? { MOCK_RPC_PEER_TARGET: options.peerTarget } : {}),
+      ...(interruptReleasePath ? { MOCK_RPC_INTERRUPT_RELEASE: interruptReleasePath } : {})
     },
     selection: options.selection ?? (() => ({ model: "faux/faux-1", thinkingLevel: "off" })),
     sessionManager,
     processTreeTracker: createProcessTreeTracker(),
-    ...(options.workTimeoutMs ? { workTimeoutMs: options.workTimeoutMs } : {})
+    ...(options.workTimeoutMs ? { workTimeoutMs: options.workTimeoutMs } : {}),
+    ...(options.toolSurface ? { toolSurface: options.toolSurface } : {})
   })
   return {
     supervisor,
@@ -1246,6 +1373,7 @@ async function createHarness(
     ...(descendantMarker ? { descendantMarker } : {}),
     ...(peerResponsePath ? { peerResponsePath } : {}),
     ...(promptsLogPath ? { promptsLogPath } : {}),
+    ...(interruptReleasePath ? { interruptReleasePath } : {}),
     async dispose() {
       await supervisor.shutdown()
       await rm(root, { recursive: true, force: true })

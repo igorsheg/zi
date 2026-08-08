@@ -5,6 +5,7 @@ import type { ExtensionMode } from "@with-zi/extension-api"
 import { maxExplicitExtensionPaths } from "./extensions/discovery.js"
 import type { ProjectTrustDecision } from "./project-trust.js"
 import { maxConfiguredResourcePaths, type AgentSettings } from "./settings-manager.js"
+import { snapshotToolSurface, type ToolSurface } from "./tool-surface.js"
 
 export type AgentRuntimeSessionIntent =
   | { readonly type: "new"; readonly persist: boolean }
@@ -29,6 +30,7 @@ export interface CreateAgentRuntimeOptions {
   readonly extensionWorkerCommand?: readonly string[]
   readonly codeModeWorkerCommand?: readonly string[]
   readonly subagentCommand?: readonly string[]
+  readonly toolSurface?: ToolSurface
   /** Private invocation marker used by Zi child sessions to prevent recursive delegation. */
   readonly internalSubagentDepth?: 0 | 1
   readonly internalSubagentEnvironment?: Readonly<Record<string, string | undefined>>
@@ -56,6 +58,7 @@ export function snapshotAgentRuntimeOptions(options: CreateAgentRuntimeOptions):
     ...(options.subagentCommand === undefined
       ? {}
       : { subagentCommand: snapshotStrings(options.subagentCommand, 16, "Subagent command") }),
+    ...(options.toolSurface === undefined ? {} : { toolSurface: snapshotToolSurface(options.toolSurface) }),
     ...(options.internalSubagentDepth === undefined
       ? {}
       : { internalSubagentDepth: snapshotSubagentDepth(options.internalSubagentDepth) }),

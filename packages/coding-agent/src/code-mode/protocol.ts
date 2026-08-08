@@ -1,6 +1,6 @@
 import type { Writable } from "node:stream"
 
-export const codeModeProtocolVersion = 3
+export const codeModeProtocolVersion = 4
 export const codeModeWorkerArgument = "--zi-internal-code-mode-worker"
 
 export const maxCodeBytes = 256 * 1024
@@ -32,44 +32,50 @@ interface Correlation {
 }
 
 export type CodeModeHostMessage =
-  | { readonly version: 3; readonly type: "initialize"; readonly generation: number }
+  | { readonly version: typeof codeModeProtocolVersion; readonly type: "initialize"; readonly generation: number }
   | ({
-      readonly version: 3
+      readonly version: typeof codeModeProtocolVersion
       readonly type: "execute"
       readonly code: string
       readonly tools: readonly string[]
       readonly state: CodeModeState
     } & Correlation)
   | ({
-      readonly version: 3
+      readonly version: typeof codeModeProtocolVersion
       readonly type: "tool_result"
       readonly id: number
       readonly value: CodeModeJson
       readonly terminate?: boolean
     } & Correlation)
-  | ({ readonly version: 3; readonly type: "tool_error"; readonly id: number; readonly error: string } & Correlation)
+  | ({
+      readonly version: typeof codeModeProtocolVersion
+      readonly type: "tool_error"
+      readonly id: number
+      readonly error: string
+    } & Correlation)
 
 export type CodeModeWorkerMessage =
-  | { readonly version: 3; readonly type: "ready"; readonly generation: number }
+  | { readonly version: typeof codeModeProtocolVersion; readonly type: "ready"; readonly generation: number }
   | ({
-      readonly version: 3
+      readonly version: typeof codeModeProtocolVersion
       readonly type: "tool_call"
       readonly id: number
       readonly name: string
       readonly arguments: CodeModeJson
     } & Correlation)
   | ({
-      readonly version: 3
+      readonly version: typeof codeModeProtocolVersion
       readonly type: "completed"
       readonly result?: CodeModeJson
       readonly state: CodeModeState
       readonly logs: readonly string[]
     } & Correlation)
   | ({
-      readonly version: 3
+      readonly version: typeof codeModeProtocolVersion
       readonly type: "failed"
       readonly error: string
       readonly logs: readonly string[]
+      readonly toolCallId?: number
       readonly reset?: boolean
     } & Correlation)
 
@@ -249,7 +255,7 @@ export function encodeCodeModeFrame(value: unknown): Buffer {
 export function validateHostMessage(value: unknown): CodeModeHostMessage {
   const message = messageRecord(value)
   if (message.type === "initialize") {
-    return { version: 3, type: "initialize", generation: generation(message.generation) }
+    return { version: codeModeProtocolVersion, type: "initialize", generation: generation(message.generation) }
   }
   const correlated = correlation(message)
   if (message.type === "execute") {
@@ -265,7 +271,7 @@ export function validateHostMessage(value: unknown): CodeModeHostMessage {
       throw new CodeModeProtocolError("Code-mode execution requires unique bounded tool names")
     }
     return {
-      version: 3,
+      version: codeModeProtocolVersion,
       type: "execute",
       ...correlated,
       code: message.code,
@@ -275,7 +281,7 @@ export function validateHostMessage(value: unknown): CodeModeHostMessage {
   }
   if (message.type === "tool_result") {
     return {
-      version: 3,
+      version: codeModeProtocolVersion,
       type: "tool_result",
       ...correlated,
       id: callId(message.id),
@@ -284,7 +290,13 @@ export function validateHostMessage(value: unknown): CodeModeHostMessage {
     }
   }
   if (message.type === "tool_error") {
-    return { version: 3, type: "tool_error", ...correlated, id: callId(message.id), error: boundedError(message.error) }
+    return {
+      version: codeModeProtocolVersion,
+      type: "tool_error",
+      ...correlated,
+      id: callId(message.id),
+      error: boundedError(message.error)
+    }
   }
   throw new CodeModeProtocolError(`Unknown code-mode host message: ${String(message.type)}`)
 }
@@ -292,7 +304,7 @@ export function validateHostMessage(value: unknown): CodeModeHostMessage {
 export function validateWorkerMessage(value: unknown): CodeModeWorkerMessage {
   const message = messageRecord(value)
   if (message.type === "ready") {
-    return { version: 3, type: "ready", generation: generation(message.generation) }
+    return { version: codeModeProtocolVersion, type: "ready", generation: generation(message.generation) }
   }
   const correlated = correlation(message)
   if (message.type === "tool_call") {
@@ -300,7 +312,7 @@ export function validateWorkerMessage(value: unknown): CodeModeWorkerMessage {
       throw new CodeModeProtocolError("Code-mode tool calls require a valid tool name")
     }
     return {
-      version: 3,
+      version: codeModeProtocolVersion,
       type: "tool_call",
       ...correlated,
       id: callId(message.id),
@@ -311,7 +323,7 @@ export function validateWorkerMessage(value: unknown): CodeModeWorkerMessage {
   const logs = logValues(message.logs)
   if (message.type === "completed") {
     return {
-      version: 3,
+      version: codeModeProtocolVersion,
       type: "completed",
       ...correlated,
       ...(message.result === undefined ? {} : { result: validateCodeModeJson(message.result) }),
@@ -321,11 +333,12 @@ export function validateWorkerMessage(value: unknown): CodeModeWorkerMessage {
   }
   if (message.type === "failed") {
     return {
-      version: 3,
+      version: codeModeProtocolVersion,
       type: "failed",
       ...correlated,
       error: boundedError(message.error),
       logs,
+      ...(message.toolCallId === undefined ? {} : { toolCallId: callId(message.toolCallId) }),
       ...(message.reset === true ? { reset: true } : {})
     }
   }

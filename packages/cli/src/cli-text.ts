@@ -12,6 +12,7 @@ Runtime:
       --session-dir path      Set session storage for this invocation
       --model provider/model  Select a model
       --thinking level        off, minimal, low, medium, high, xhigh, or max
+      --code-only             Expose only Code Mode to the model
       --api-key key           Use a memory-only key for the selected provider
       --system-prompt text    Replace the built-in system prompt
       --append-system-prompt text

@@ -56,6 +56,7 @@ test("spawned help stays stdout-clean and never initializes a terminal", async (
   expect(stderr).toBe("")
   expect(stdout).not.toContain("\u001b")
   expect(stdout).not.toContain("      --session file")
+  expect(stdout).toContain("--code-only")
 })
 
 test("spawned version stays stdout-clean and never initializes a terminal", async () => {
@@ -232,6 +233,7 @@ test("text mode writes final output without loading the TUI and disposes its run
       "--no-session",
       "--api-key",
       "cli-secret",
+      "--code-only",
       "--model",
       `${faux.getModel().provider}/${faux.getModel().id}`,
       "start"
@@ -242,7 +244,8 @@ test("text mode writes final output without loading the TUI and disposes its run
   expect(receivedOptions).toMatchObject({
     session: { type: "new", persist: false },
     apiKey: "cli-secret",
-    extensionMode: "text"
+    extensionMode: "text",
+    toolSurface: "code-only"
   })
   expect(output.join("")).not.toContain("cli-secret")
   expect(interactiveLoads).toBe(0)

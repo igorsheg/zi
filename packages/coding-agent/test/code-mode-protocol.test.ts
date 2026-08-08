@@ -75,6 +75,39 @@ test("code-mode protocol fails closed on partial, oversized, and structurally un
   expect(() => validateCodeModeJson(value)).toThrow("structural bound")
 })
 
+test("code-mode worker failures carry bounded nested-tool provenance", () => {
+  const message = validateWorkerMessage({
+    version: codeModeProtocolVersion,
+    type: "failed",
+    generation: 2,
+    executionId: 7,
+    error: "nested failure",
+    logs: [],
+    toolCallId: 3
+  })
+
+  expect(message).toEqual({
+    version: codeModeProtocolVersion,
+    type: "failed",
+    generation: 2,
+    executionId: 7,
+    error: "nested failure",
+    logs: [],
+    toolCallId: 3
+  })
+  expect(() =>
+    validateWorkerMessage({
+      version: codeModeProtocolVersion,
+      type: "failed",
+      generation: 2,
+      executionId: 7,
+      error: "nested failure",
+      logs: [],
+      toolCallId: 64
+    })
+  ).toThrow("call ID")
+})
+
 test("code-mode host results carry native values without presentation details", () => {
   const message = validateHostMessage({
     version: codeModeProtocolVersion,

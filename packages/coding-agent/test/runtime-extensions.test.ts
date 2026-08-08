@@ -1783,6 +1783,56 @@ test("reload adds and removes standard tools with Markdown profiles", async () =
   }
 })
 
+test("code-only reload keeps one outer tool while refreshing its nested catalog", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-runtime-code-only-reload-"))
+  const cwd = join(root, "project")
+  const agentDir = join(root, "agent")
+  const profileDir = join(agentDir, "subagents")
+  await mkdir(cwd, { recursive: true })
+  const catalogs: string[][] = []
+  const descriptions: string[] = []
+  const models = createModels()
+  const faux = fauxProvider()
+  models.setProvider(faux.provider)
+  faux.setResponses(
+    ["before", "added", "removed"].map(label => context => {
+      catalogs.push((context.tools ?? []).map(tool => tool.name))
+      descriptions.push(context.tools?.[0]?.description ?? "")
+      return fauxAssistantMessage(label)
+    })
+  )
+  const runtime = await createAgentRuntime({
+    cwd,
+    agentDir,
+    model: "faux/faux-1",
+    modelFactory: () => models,
+    session: { type: "new", persist: false },
+    extensionWorkerCommand: workerCommand,
+    subagentCommand: [process.execPath, mockChild],
+    toolSurface: "code-only"
+  })
+  try {
+    await runtime.session.prompt("Inspect tools before the profile exists.")
+    await mkdir(profileDir, { recursive: true })
+    const profilePath = join(profileDir, "finder.md")
+    await writeFile(profilePath, "---\ndescription: Find evidence\n---\nReturn paths.\n")
+    await runtime.session.reload()
+    await runtime.session.prompt("Inspect tools after adding the profile.")
+    await rm(profilePath)
+    await runtime.session.reload()
+    await runtime.session.prompt("Inspect tools after removing the profile.")
+
+    expect(catalogs).toEqual([["code"], ["code"], ["code"]])
+    expect(descriptions[0]).not.toContain("spawn_subagent: (input:")
+    expect(descriptions[1]).toContain("spawn_subagent: (input:")
+    expect(descriptions[2]).not.toContain("spawn_subagent: (input:")
+  } finally {
+    runtime.session.dispose()
+    await runtime.session.waitForIdle()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 test("reload replaces programmatic profiles in the canonical catalog", async () => {
   const root = await mkdtemp(join(tmpdir(), "zi-runtime-subagent-profile-generation-"))
   const cwd = join(root, "project")

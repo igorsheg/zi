@@ -202,6 +202,7 @@ function runtimeOptions(
     codeModeWorkerCommand,
     subagentCommand: extensionWorkerCommand,
     internalSubagentDepth: internalSubagent ? 1 : 0,
+    toolSurface: args.toolSurface,
     session: args.session,
     ...(args.sessionDir === undefined ? {} : { sessionDir: args.sessionDir }),
     ...(args.model === undefined ? {} : { model: args.model }),

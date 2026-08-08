@@ -18,7 +18,7 @@ A subagent profile contains:
 - `model`: optional non-blank `provider/model-id` selection of at most 4 KiB;
 - `thinking`: optional `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`.
 
-Omitted model and thinking values inherit the parent's current selection. An unavailable explicit model fails with profile source attribution; Zi does not silently fall back.
+Omitted model and thinking values inherit the parent's current selection. An unavailable explicit model fails with profile source attribution; Zi does not silently fall back. Children also inherit the parent's invocation-only `--code-only` tool surface when it is active.
 
 Profiles do not claim permissions, read-only behavior, worktrees, tool restrictions, budgets, or filesystem isolation. Child Zi processes retain the current user's authority unless a future enforceable mechanism says otherwise.
 

@@ -24,6 +24,7 @@ import type { SettingsManager } from "./settings-manager.js"
 import { PeerMessenger } from "./subagents/peer-messenger.js"
 import { SubagentSupervisor } from "./subagents/supervisor.js"
 import { buildSystemPrompt } from "./system-prompt.js"
+import { snapshotToolSurface, type ToolSurface } from "./tool-surface.js"
 import { isBuiltInToolError } from "./tools/index.js"
 
 export interface AgentSessionServices {
@@ -80,6 +81,7 @@ export interface CreateAgentSessionOptions {
   readonly subagentCommand?: readonly string[]
   readonly subagentEnvironment?: Readonly<Record<string, string | undefined>>
   readonly internalSubagentDepth?: 0 | 1
+  readonly toolSurface?: ToolSurface
 }
 
 /** Build one session from caller-owned services. The caller owns the returned session's disposal. */
@@ -92,6 +94,8 @@ export async function createAgentSessionWithProcessTreeTracker(
   processTreeTracker: ProcessTreeTracker
 ): Promise<CreateAgentSessionResult> {
   const { services, sessionManager } = options
+  if (options.toolSurface && !options.codeMode) throw new Error("Tool surface selection requires Code Mode")
+  const toolSurface = options.codeMode ? snapshotToolSurface(options.toolSurface ?? "direct-and-code") : undefined
   const resources = options.resources ? createSessionResources(options.resources) : await services.resourceLoader.load()
   const settings = services.settingsManager.get()
   const context = sessionManager.buildSessionContext()
@@ -140,17 +144,13 @@ export async function createAgentSessionWithProcessTreeTracker(
           sessionManager,
           processTreeTracker,
           waitTimeoutMs: settings.subagentWaitTimeoutMs,
-          workTimeoutMs: settings.subagentWorkTimeoutMs
+          workTimeoutMs: settings.subagentWorkTimeoutMs,
+          toolSurface: toolSurface ?? "direct-and-code"
         })
       : undefined
   const agent = new Agent({
     initialState: {
-      systemPrompt: buildSystemPrompt(
-        sessionManager.header.cwd,
-        resources,
-        sessionTools,
-        options.codeMode !== undefined
-      ),
+      systemPrompt: buildSystemPrompt(sessionManager.header.cwd, resources, sessionTools, toolSurface),
       ...(model ? { model } : {}),
       thinkingLevel,
       tools: [...sessionTools],
@@ -210,6 +210,7 @@ export async function createAgentSessionWithProcessTreeTracker(
     resources,
     projectFileSearch: new ProjectFileSearch(services.paths),
     tools: sessionTools,
+    toolSurface,
     reload,
     ...(subagents ? { subagentSupervisor: subagents } : {}),
     ...(peerMessenger ? { peerMessenger } : {}),
