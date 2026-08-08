@@ -59,6 +59,140 @@ test("completed Bash keeps compact evidence and details reveal bounded context a
   }
 })
 
+test("Code replaces bounded source with activity while retaining one native body through settlement", async () => {
+  const setup = await createTestRenderer({ width: 72, height: 28, useThread: false })
+  const code = Array.from({ length: 10 }, (_, index) => `const value${index + 1} = ${index + 1}`).join("\n")
+  const view = new ToolCallView(
+    setup.renderer,
+    "code-running",
+    frame("ready", projectToolPresentation({ status: "ready", name: "code", args: { code } })),
+    defaultTheme,
+    "/work",
+    "Ctrl+O"
+  )
+  setup.renderer.root.add(view.root)
+
+  try {
+    const root = view.root
+    const body = toolBody(root)
+    await setup.renderOnce()
+    const ready = setup.captureCharFrame()
+    expect(ready).toContain("Code · 10 lines · waiting")
+    expect(ready).toContain("1  const value1 = 1")
+    expect(ready).toContain("8  const value8 = 8")
+    expect(ready).not.toContain("9  const value9 = 9")
+    expect(ready).toContain("2 more lines · Ctrl+O details")
+
+    expect(
+      view.update(
+        frame(
+          "running",
+          projectToolPresentation({
+            status: "running",
+            name: "code",
+            args: { code },
+            result: {
+              content: [{ type: "text", text: "Running bash" }],
+              details: {
+                type: "code_mode",
+                version: 1,
+                outcome: "progress",
+                calls: [
+                  succeededCall(0, "read", { path: "src/a.ts" }),
+                  failedCall(1, "edit", { path: "src/b.ts" }),
+                  succeededCall(2, "read", { path: "src/c.ts" }),
+                  succeededCall(3, "write", { path: "src/d.ts" }),
+                  succeededCall(4, "read", { path: "src/e.ts" }),
+                  {
+                    state: "running",
+                    id: 5,
+                    name: "bash",
+                    arguments: { command: "bun test" },
+                    startedAt: 6,
+                    preview: "42 tests passed"
+                  }
+                ],
+                logs: ["checking generated types"]
+              }
+            }
+          })
+        )
+      )
+    ).toBe(true)
+    expect(view.root).toBe(root)
+    expect(toolBody(root)).toBe(body)
+
+    await setup.renderOnce()
+    const compact = setup.captureCharFrame()
+    expect(compact).toContain("Code bash · 5/6 calls · 1 failed")
+    expect(compact).toContain("… bash $ bun test — 42 tests passed")
+    expect(compact).toContain("… checking generated types")
+    expect(compact).not.toContain("const value1")
+
+    expect(view.setExpanded(true)).toBe(true)
+    await setup.renderOnce()
+    const expanded = setup.captureCharFrame()
+    expect(expanded).not.toContain("const value1")
+    expect(expanded).toContain("× edit src/b.ts — invalid arguments")
+    expect(expanded).toContain("… bash $ bun test — 42 tests passed")
+
+    expect(
+      view.update(
+        frame(
+          "done",
+          projectToolPresentation({
+            status: "done",
+            name: "code",
+            args: { code },
+            result: {
+              content: [{ type: "text", text: "done" }],
+              details: {
+                type: "code_mode",
+                version: 1,
+                outcome: "success",
+                calls: [
+                  {
+                    state: "succeeded",
+                    id: 0,
+                    name: "read",
+                    arguments: { path: "src/a.ts" },
+                    startedAt: 1,
+                    durationMs: 1
+                  },
+                  {
+                    state: "failed",
+                    id: 1,
+                    name: "edit",
+                    arguments: { path: "src/b.ts" },
+                    startedAt: 2,
+                    durationMs: 1,
+                    stage: "validate"
+                  },
+                  { state: "aborted", id: 2, name: "bash", arguments: {}, startedAt: 3, durationMs: 1 }
+                ],
+                logs: []
+              }
+            }
+          })
+        )
+      )
+    ).toBe(true)
+    expect(view.root).toBe(root)
+    expect(toolBody(root)).toBe(body)
+
+    await setup.renderOnce()
+    const settled = setup.captureCharFrame()
+    expect(settled).toContain("Code · 3 calls · 1 failed · 1 aborted")
+    expect(settled).toContain("× edit src/b.ts — argument validation failed")
+    expect(settled).toContain("■ bash — aborted")
+    expect(settled).toContain("→ done")
+    expect(settled).not.toContain("checking generated types")
+  } finally {
+    view.destroy()
+    setup.renderer.destroy()
+  }
+})
+
 test("Bash preserves its tail body and exact command from running through completion", async () => {
   const setup = await createTestRenderer({ width: 48, height: 14, useThread: false })
   const view = new ToolCallView(
@@ -1721,6 +1855,31 @@ function expectMiddleTruncatedPath(row: string, label: string, path: string): vo
   expect(ellipsis).toBeLessThan(displayed.length - basename(path).length)
   expect(displayed.endsWith(basename(path))).toBe(true)
   expect(displayed).not.toBe(path)
+}
+
+function succeededCall(id: number, name: string, argumentsValue: Record<string, unknown>) {
+  return {
+    state: "succeeded" as const,
+    id,
+    name,
+    arguments: argumentsValue,
+    startedAt: id + 1,
+    durationMs: 1,
+    result: "completed"
+  }
+}
+
+function failedCall(id: number, name: string, argumentsValue: Record<string, unknown>) {
+  return {
+    state: "failed" as const,
+    id,
+    name,
+    arguments: argumentsValue,
+    startedAt: id + 1,
+    durationMs: 1,
+    stage: "validate" as const,
+    error: "invalid arguments"
+  }
 }
 
 function descendants(root: Renderable): Renderable[] {

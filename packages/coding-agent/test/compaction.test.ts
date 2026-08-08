@@ -153,7 +153,7 @@ test("repeated planning carries only the latest previous summary", () => {
   expect(preparation.plan.sourceMessages.map(message => message.role)).toEqual(["user", "assistant"])
 })
 
-test("file details include only successful discarded tool operations", () => {
+test("file details accept legacy code traces and include only successful discarded tool operations", () => {
   const session = SessionManager.inMemory("/work")
   session.appendMessage({ role: "user", content: "old", timestamp: 1 })
   session.appendMessage(
@@ -235,6 +235,81 @@ test("file details include only successful discarded tool operations", () => {
   expect(preparation.plan.details).toEqual({
     readFiles: ["nested-read.ts", "z.ts"],
     modifiedFiles: ["a.ts", "nested-edit.ts"],
+    omittedReadFiles: 0,
+    omittedModifiedFiles: 0
+  })
+})
+
+test("file details collect safe paths from versioned terminal code traces", () => {
+  const session = SessionManager.inMemory("/work")
+  session.appendMessage({ role: "user", content: "old", timestamp: 1 })
+  session.appendMessage(
+    fauxAssistantMessage(
+      { type: "toolCall", id: "code", name: "code", arguments: { code: "async () => {}" } },
+      { stopReason: "toolUse" }
+    )
+  )
+  session.appendMessage({
+    role: "toolResult",
+    toolCallId: "code",
+    toolName: "code",
+    content: [{ type: "text", text: "nested result" }],
+    details: {
+      type: "code_mode",
+      version: 1,
+      outcome: "success",
+      calls: [
+        {
+          state: "succeeded",
+          id: 0,
+          name: "read",
+          arguments: { path: "versioned-read.ts", offset: 1, limit: 20 },
+          startedAt: 1,
+          durationMs: 1
+        },
+        {
+          state: "succeeded",
+          id: 1,
+          name: "write",
+          arguments: { path: "versioned-write.ts", contentBytes: 40 },
+          startedAt: 2,
+          durationMs: 1
+        },
+        {
+          state: "succeeded",
+          id: 2,
+          name: "edit",
+          arguments: { path: "versioned-edit.ts", operations: 2 },
+          startedAt: 3,
+          durationMs: 1
+        },
+        {
+          state: "failed",
+          id: 3,
+          name: "write",
+          arguments: { path: "failed-write.ts", contentBytes: 10 },
+          startedAt: 4,
+          durationMs: 1,
+          stage: "invoke"
+        }
+      ],
+      logs: []
+    },
+    isError: false,
+    timestamp: 3
+  })
+  session.appendMessage({ role: "user", content: "recent", timestamp: 4 })
+  session.appendMessage(fauxAssistantMessage("done"))
+  const settings = effectiveCompactionSettings(
+    { contextWindow: 100, maxTokens: 20 },
+    { reserveTokens: 20, keepRecentTokens: 1 }
+  )!
+
+  const preparation = prepareCompaction(session.entries(), settings, { tokens: 80, quality: "estimated" })
+  if (preparation.type !== "ready") throw new Error("Expected compaction plan")
+  expect(preparation.plan.details).toEqual({
+    readFiles: ["versioned-read.ts"],
+    modifiedFiles: ["versioned-edit.ts", "versioned-write.ts"],
     omittedReadFiles: 0,
     omittedModifiedFiles: 0
   })

@@ -3,7 +3,30 @@ import { expect, test } from "bun:test"
 import { createEditTool } from "../src/tools/edit.js"
 import { projectToolPresentation } from "../src/tools/presentation/project.js"
 
-test("code presentation retains bounded nested activity and outcomes", () => {
+test("code presentation numbers source and admits a bounded call preview before execution", () => {
+  const code = Array.from({ length: 10 }, (_, index) => `const value${index + 1} = ${index + 1}`).join("\n")
+  const presentation = projectToolPresentation({ status: "ready", name: "code", args: { code } })
+
+  expect(presentation.header).toEqual({ label: "Code", details: ["10 lines"] })
+  expect(presentation.preview).toEqual({ compact: { type: "head", rows: 8 }, detailed: { type: "head", rows: 200 } })
+  if (presentation.body?.type !== "text") throw new Error("Expected code source body")
+  expect(presentation.body.text).toStartWith(" 1  const value1 = 1\n 2  const value2 = 2")
+  expect(presentation.body.text).toEndWith("10  const value10 = 10")
+})
+
+test("code presentation bounds retained numbered source before execution", () => {
+  const code = Array.from({ length: 2_100 }, (_, index) => `line ${index + 1} ${"x".repeat(24)}`).join("\n")
+  const presentation = projectToolPresentation({ status: "ready", name: "code", args: { code } })
+
+  expect(presentation.header).toEqual({ label: "Code", details: ["2100 lines"] })
+  if (presentation.body?.type !== "text") throw new Error("Expected bounded code source body")
+  expect(presentation.body.text).toStartWith(`   1  line 1 ${"x".repeat(24)}`)
+  expect(presentation.body.text).toEndWith("… source truncated")
+  expect(presentation.body.text).not.toContain("line 2100")
+  expect(Buffer.byteLength(presentation.body.text)).toBeLessThan(70 * 1024)
+})
+
+test("code presentation accepts legacy traces with bounded nested activity and outcomes", () => {
   const presentation = projectToolPresentation({
     status: "running",
     name: "code",
@@ -32,7 +55,7 @@ test("code presentation retains bounded nested activity and outcomes", () => {
             preview: "Writing"
           }
         ],
-        logs: []
+        logs: ["loaded input", "writing output"]
       }
     }
   })
@@ -40,14 +63,54 @@ test("code presentation retains bounded nested activity and outcomes", () => {
   expect(presentation.header).toEqual({
     label: "Code",
     subject: { type: "text", text: "write" },
-    details: ["write · 1/2"]
+    details: ["1/2 calls"]
   })
   expect(presentation.body).toEqual({
     type: "text",
-    text: "✓ read src/index.ts — file contents\n… write src/output.ts — Writing",
+    text: "✓ read src/index.ts — file contents\n… write src/output.ts — Writing\n… writing output",
     tone: "normal"
   })
-  expect(presentation.preview.compact).toEqual({ type: "tail", rows: 5 })
+  expect(presentation.preview).toEqual({ compact: { type: "tail", rows: 5 }, detailed: { type: "head", rows: 200 } })
+})
+
+test("code presentation renders versioned terminal metadata without private results or causes", () => {
+  const presentation = projectToolPresentation({
+    status: "done",
+    name: "code",
+    args: { code: "async () => zi.read({ path: 'src/index.ts' })" },
+    result: {
+      content: [{ type: "text", text: "done" }],
+      details: {
+        type: "code_mode",
+        version: 1,
+        outcome: "success",
+        calls: [
+          {
+            state: "succeeded",
+            id: 0,
+            name: "read",
+            arguments: { path: "src/index.ts", offset: 1, limit: 20 },
+            startedAt: 1,
+            durationMs: 2
+          },
+          {
+            state: "failed",
+            id: 1,
+            name: "extension.private",
+            arguments: {},
+            startedAt: 3,
+            durationMs: 1,
+            stage: "invoke"
+          }
+        ],
+        logs: []
+      }
+    }
+  })
+
+  expect(presentation.header).toEqual({ label: "Code", details: ["2 calls", "1 failed"] })
+  if (presentation.body?.type !== "text") throw new Error("Expected code trace body")
+  expect(presentation.body.text).toBe("✓ read src/index.ts\n× extension.private — invoke failed\n→ done")
 })
 
 test("bash presentation separates bounded output from structured notices", () => {

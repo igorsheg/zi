@@ -1,6 +1,17 @@
-import { isCodeModeDetails, type CodeModeCall } from "../../code-mode/trace.js"
+import { isCodeModeDetails, type CodeModeFailureStage, type CodeModeTraceCall } from "../../code-mode/trace.js"
 import { maxExpandedToolRows, type ToolPresentation, type ToolPresentationSource } from "./types.js"
-import { boundHead, boundInline, matchesToolOutcome, recordValue, resultDetails, resultText } from "./values.js"
+import {
+  boundHead,
+  boundInline,
+  matchesToolOutcome,
+  normalizeToolText,
+  recordValue,
+  resultDetails,
+  resultText
+} from "./values.js"
+
+// Pi Fabric v0.40.3 (08019b61) previews eight source lines. Zi replaces source with activity after the first trace so live updates never reproject unchanged code.
+const compactCodeRows = 8
 
 export function projectCodeTool(source: ToolPresentationSource): ToolPresentation {
   const args = recordValue(source.args)
@@ -8,26 +19,29 @@ export function projectCodeTool(source: ToolPresentationSource): ToolPresentatio
   const detailValue = "result" in source ? resultDetails(source.result) : undefined
   const trace =
     isCodeModeDetails(detailValue) && matchesToolOutcome(source, detailValue.outcome) ? detailValue : undefined
+  const sourcePreview = !trace && code ? formatSource(code) : undefined
   const running = trace?.calls.findLast(call => call.state === "running")
-  const completed = trace?.calls.filter(call => call.state !== "running").length ?? 0
-  const total = trace?.calls.length ?? 0
-  const summary = running
-    ? `${running.name} · ${completed}/${total}`
-    : total > 0
-      ? `${total} ${total === 1 ? "call" : "calls"}`
-      : undefined
+  const details = trace
+    ? traceDetails(trace.calls, trace.outcome)
+    : sourcePreview
+      ? [lineLabel(sourcePreview.lines)]
+      : []
   const terminal =
     trace?.outcome === "error"
       ? `× ${boundInline(trace.error, 160)}`
       : trace?.outcome === "success" && "result" in source
         ? `→ ${boundInline(resultText(source.result) ?? "completed", 160)}`
         : undefined
-  const body = trace ? formatTrace(trace.calls, trace.logs, terminal) : code ? boundHead(code) : undefined
+  const activity = trace
+    ? formatTrace(trace.calls, trace.outcome === "progress" ? trace.logs : [], terminal)
+    : undefined
+  const body = activity ?? sourcePreview?.text
+
   return {
     header: {
       label: "Code",
       ...(running ? { subject: { type: "text", text: boundInline(running.name) } as const } : {}),
-      details: summary ? [summary] : []
+      details
     },
     ...(body
       ? {
@@ -39,13 +53,40 @@ export function projectCodeTool(source: ToolPresentationSource): ToolPresentatio
         }
       : {}),
     notices: [],
-    preview: { compact: { type: "tail", rows: 5 }, detailed: { type: "head", rows: maxExpandedToolRows } },
+    preview: trace
+      ? { compact: { type: "tail", rows: 5 }, detailed: { type: "head", rows: maxExpandedToolRows } }
+      : { compact: { type: "head", rows: compactCodeRows }, detailed: { type: "head", rows: maxExpandedToolRows } },
     timing: "duration"
   }
 }
 
+function traceDetails(calls: readonly CodeModeTraceCall[], outcome: "progress" | "success" | "error"): string[] {
+  const completed = calls.filter(call => call.state !== "running").length
+  const failed = calls.filter(call => call.state === "failed").length
+  const aborted = calls.filter(call => call.state === "aborted").length
+  const details: string[] = []
+
+  if (calls.length > 0) {
+    details.push(outcome === "progress" ? `${completed}/${calls.length} calls` : callLabel(calls.length))
+  }
+  if (failed > 0) details.push(`${failed} failed`)
+  if (aborted > 0) details.push(`${aborted} aborted`)
+  return details
+}
+
+function formatSource(code: string): { text: string; lines: number } {
+  const normalized = normalizeToolText(code)
+  const bounded = boundHead(normalized)
+  const sourceLines = bounded ? bounded.split("\n") : []
+  const lines = normalized.split("\n").length
+  const numberWidth = String(Math.max(1, lines)).length
+  const output = sourceLines.map((line, index) => `${String(index + 1).padStart(numberWidth, " ")}  ${line || " "}`)
+  if (bounded !== normalized) output.push("… source truncated")
+  return { text: output.join("\n"), lines }
+}
+
 function formatTrace(
-  calls: readonly CodeModeCall[],
+  calls: readonly CodeModeTraceCall[],
   logs: readonly string[],
   terminal: string | undefined
 ): string | undefined {
@@ -54,28 +95,55 @@ function formatTrace(
     switch (call.state) {
       case "running":
         return `… ${call.name}${detail ? ` ${detail}` : ""}${call.preview ? ` — ${boundInline(call.preview, 160)}` : ""}`
-      case "succeeded":
-        return `✓ ${call.name}${detail ? ` ${detail}` : ""} — ${boundInline(call.result, 160)}`
-      case "failed":
-        return `× ${call.name}${detail ? ` ${detail}` : ""} — ${boundInline(call.error, 160)}`
+      case "succeeded": {
+        const result = "result" in call ? ` — ${boundInline(call.result, 160)}` : ""
+        return `✓ ${call.name}${detail ? ` ${detail}` : ""}${result}`
+      }
+      case "failed": {
+        const error = "error" in call ? boundInline(call.error, 160) : failureStageLabel(call.stage)
+        return `× ${call.name}${detail ? ` ${detail}` : ""} — ${error}`
+      }
       case "aborted":
         return `■ ${call.name}${detail ? ` ${detail}` : ""} — aborted`
       default:
         return assertNever(call)
     }
   })
-  for (const log of logs) lines.push(`│ ${boundInline(log, 160)}`)
+  const progress = logs.findLast(log => log.trim().length > 0)
+  if (progress) lines.push(`… ${boundInline(progress, 160)}`)
   if (terminal) lines.push(terminal)
   return lines.length > 0 ? lines.join("\n") : undefined
 }
 
-function callDetail(call: CodeModeCall): string | undefined {
+function failureStageLabel(stage: CodeModeFailureStage | undefined): string {
+  if (stage === undefined) return "failed"
+  switch (stage) {
+    case "prepare":
+      return "argument preparation failed"
+    case "validate":
+      return "argument validation failed"
+    case "invoke":
+      return "invoke failed"
+    default:
+      return assertNever(stage)
+  }
+}
+
+function callDetail(call: CodeModeTraceCall): string | undefined {
   const input = call.arguments
   if (!isRecord(input)) return undefined
   if (typeof input.path === "string") return boundInline(input.path)
-  if (typeof input.command === "string") return boundInline(input.command)
+  if (typeof input.command === "string") return `$ ${boundInline(input.command)}`
   if (typeof input.operation === "string") return boundInline(input.operation)
   return undefined
+}
+
+function callLabel(calls: number): string {
+  return `${calls} ${calls === 1 ? "call" : "calls"}`
+}
+
+function lineLabel(lines: number): string {
+  return `${lines} ${lines === 1 ? "line" : "lines"}`
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

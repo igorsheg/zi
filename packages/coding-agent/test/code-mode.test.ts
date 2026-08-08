@@ -10,6 +10,7 @@ import { Type } from "@earendil-works/pi-ai"
 import { CodeMode, isCodeModeDetails } from "../src/code-mode/code-mode.js"
 import { maxCodeModeStateBytes } from "../src/code-mode/protocol.js"
 import type { CodeModeCapableTool } from "../src/code-mode/tool-contract.js"
+import { maxCodeModeTerminalDetailsBytes } from "../src/code-mode/trace.js"
 import { ZiPaths } from "../src/paths.js"
 import { createProcessTreeTracker, type ProcessScope, type ProcessTreeTracker } from "../src/processes/process-tree.js"
 import { SessionManager } from "../src/session-manager.js"
@@ -604,8 +605,41 @@ test("code enforces its nested call bound", async () => {
   expect(isCodeModeDetails(result.details)).toBe(true)
   if (!isCodeModeDetails(result.details)) throw new Error("Expected code-mode details")
   if (result.details.outcome !== "error") throw new Error("Expected code-mode error")
+  expect(result.details.version).toBe(1)
   expect(result.details.calls).toHaveLength(64)
-  expect(result.details.error).toContain("64 tool calls")
+  expect(result.content[0]).toEqual({ type: "text", text: expect.stringContaining("64 tool calls") })
+  expect(Buffer.byteLength(JSON.stringify(result.details))).toBeLessThanOrEqual(maxCodeModeTerminalDetailsBytes)
+})
+
+test("code terminal traces enforce their aggregate serialized bound", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "zi-code-mode-trace-bound-"))
+  const readTool: AgentTool = {
+    name: "read",
+    label: "read",
+    description: "Read a path",
+    parameters: Type.Object({ path: Type.String() }),
+    execute: async () => ({ content: [{ type: "text", text: "read" }], details: {} })
+  }
+  const result = await createCodeMode(cwd)
+    .createTool([readTool])
+    .execute(
+      "outer",
+      {
+        code: `async () => {
+  const path = "\\u0000".repeat(4096);
+  for (let index = 0; index < 64; index++) await zi.read({ path });
+}`
+      },
+      undefined
+    )
+
+  expect(isCodeModeDetails(result.details)).toBe(true)
+  if (!isCodeModeDetails(result.details) || result.details.version !== 1) {
+    throw new Error("Expected bounded versioned code-mode details")
+  }
+  expect(result.details.calls).toHaveLength(64)
+  expect(result.details.calls.some(call => JSON.stringify(call.arguments) === "{}")).toBe(true)
+  expect(Buffer.byteLength(JSON.stringify(result.details))).toBeLessThanOrEqual(maxCodeModeTerminalDetailsBytes)
 })
 
 test("code guest can catch built-in expected errors and uncaught failures settle the outer tool", async () => {
@@ -633,7 +667,126 @@ test("code guest can catch built-in expected errors and uncaught failures settle
   expect(uncaught.content[0]).toEqual({ type: "text", text: expect.stringContaining("Nested Zi tool read failed") })
 })
 
-test("code durable traces redact built-in write and edit payloads", async () => {
+test("code durable failed calls retain only their fixed failure stage", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "zi-code-mode-failure-trace-"))
+  const secret = "raw-failure-secret"
+  const parameters = Type.Object({ token: Type.String() })
+  const prepareFailure: AgentTool = {
+    name: "prepare_failure",
+    label: "prepare failure",
+    description: "Fail while preparing arguments",
+    parameters,
+    prepareArguments: () => {
+      throw new Error(`prepare:${secret}`)
+    },
+    execute: async () => {
+      throw new Error("unreachable")
+    }
+  }
+  const validateFailure: AgentTool = {
+    name: "validate_failure",
+    label: "validate failure",
+    description: "Fail while validating arguments",
+    parameters,
+    execute: async () => {
+      throw new Error("unreachable")
+    }
+  }
+  const invokeFailure: AgentTool = {
+    name: "invoke_failure",
+    label: "invoke failure",
+    description: "Fail while invoking the tool",
+    parameters,
+    execute: async () => {
+      throw new Error(`invoke:${secret}`)
+    }
+  }
+  const tool = createCodeMode(cwd).createTool([prepareFailure, validateFailure, invokeFailure])
+  const result = await tool.execute(
+    "outer",
+    {
+      code: `async () => {
+  for (const call of [
+    () => zi.prepare_failure({ token: "${secret}" }),
+    () => zi.validate_failure({}),
+    () => zi.invoke_failure({ token: "${secret}" })
+  ]) {
+    try { await call(); } catch {}
+  }
+  return "caught";
+}`
+    },
+    undefined
+  )
+
+  expect(isCodeModeDetails(result.details)).toBe(true)
+  if (!isCodeModeDetails(result.details)) throw new Error("Expected code-mode details")
+  expect(result.details.outcome).toBe("success")
+  expect(result.details.calls).toEqual([
+    expect.objectContaining({ state: "failed", name: "prepare_failure", arguments: {}, stage: "prepare" }),
+    expect.objectContaining({ state: "failed", name: "validate_failure", arguments: {}, stage: "validate" }),
+    expect.objectContaining({ state: "failed", name: "invoke_failure", arguments: {}, stage: "invoke" })
+  ])
+  expect(result.details.calls.every(call => !("error" in call))).toBe(true)
+  expect(JSON.stringify(result.details)).not.toContain(secret)
+
+  const uncaught = await tool.execute(
+    "uncaught",
+    { code: `async () => zi.invoke_failure({ token: "${secret}" })` },
+    undefined
+  )
+  expect(isCodeModeDetails(uncaught.details)).toBe(true)
+  if (!isCodeModeDetails(uncaught.details) || uncaught.details.outcome !== "error") {
+    throw new Error("Expected uncaught code-mode failure")
+  }
+  expect(uncaught.details.error).toBe("Nested Zi tool invoke_failure failed")
+  expect(JSON.stringify(uncaught.details)).not.toContain(secret)
+  expect(uncaught.content[0]).toEqual({ type: "text", text: expect.stringContaining(secret) })
+})
+
+test("code durable traces omit arbitrary arguments and successful intermediate results", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "zi-code-mode-private-trace-"))
+  const secret = "extension-secret-value"
+  const hugePreview = `live-preview:${secret}:${"x".repeat(100_000)}`
+  const updates: { readonly details?: unknown }[] = []
+  const privateTool: AgentTool = {
+    name: "extension.private",
+    label: "private",
+    description: "Exercise private trace values",
+    parameters: Type.Object({ token: Type.String() }),
+    execute: async (_id, _input, _signal, onUpdate) => {
+      onUpdate?.({ content: [{ type: "text", text: hugePreview }], details: { secret } })
+      return { content: [{ type: "text", text: `successful-result:${secret}` }], details: { secret } }
+    }
+  }
+  const result = await createCodeMode(cwd)
+    .createTool([privateTool])
+    .execute(
+      "outer",
+      { code: `async () => { await zi["extension.private"]({ token: "${secret}" }); return "done"; }` },
+      undefined,
+      update => updates.push(update)
+    )
+
+  expect(isCodeModeDetails(result.details)).toBe(true)
+  if (!isCodeModeDetails(result.details)) throw new Error("Expected code-mode details")
+  expect(result.details.outcome).toBe("success")
+  expect(result.details.calls).toEqual([expect.objectContaining({ state: "succeeded", name: "extension.private" })])
+  expect(JSON.stringify(result.details)).not.toContain(secret)
+
+  const liveCall = updates
+    .flatMap(update =>
+      isCodeModeDetails(update.details) && update.details.version === 1 && update.details.outcome === "progress"
+        ? update.details.calls
+        : []
+    )
+    .find(call => call.state === "running" && call.preview?.startsWith(`live-preview:${secret}`))
+  expect(liveCall?.state).toBe("running")
+  if (!liveCall || liveCall.state !== "running") throw new Error("Expected live nested-tool preview")
+  expect(liveCall.preview?.length).toBeLessThan(hugePreview.length)
+})
+
+test("code durable traces retain safe built-in file metadata without payloads", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "zi-code-mode-trace-redaction-"))
   const writeTool: AgentTool = {
     name: "write",
@@ -705,7 +858,7 @@ test("code propagates nested turn termination and rejects later calls", async ()
   if (!isCodeModeDetails(result.details) || result.details.outcome !== "error") {
     throw new Error("Expected terminating code-mode error")
   }
-  expect(result.details.error).toContain("turn termination")
+  expect(result.content[0]).toEqual({ type: "text", text: expect.stringContaining("turn termination") })
   expect(result.details.calls.map(call => call.name)).toEqual(["stop"])
 })
 
@@ -756,14 +909,16 @@ test("late nested completion cannot cross a cancelled worker generation", async 
   const late = new Promise<void>(resolve => {
     release = resolve
   })
+  const updates: string[] = []
   const holdTool: AgentTool = {
     name: "hold",
     label: "hold",
     description: "Ignore cancellation until released",
     parameters: Type.Object({}),
-    execute: async () => {
+    execute: async (_id, _input, _signal, onUpdate) => {
       markStarted()
       await late
+      onUpdate?.({ content: [{ type: "text", text: "stale-preview-secret" }], details: {} })
       return { content: [{ type: "text", text: "late" }], details: {} }
     }
   }
@@ -778,7 +933,8 @@ test("late nested completion cannot cross a cancelled worker generation", async 
   await zi.hold({});
 }`
     },
-    controller.signal
+    controller.signal,
+    update => updates.push(JSON.stringify(update.details))
   )
   await started
   controller.abort(new Error("replace generation"))
@@ -797,6 +953,7 @@ test("late nested completion cannot cross a cancelled worker generation", async 
   )
   release()
   await Bun.sleep(10)
+  expect(updates.join("\n")).not.toContain("stale-preview-secret")
   expect(recovered.content).toEqual([{ type: "text", text: '{\n  "state": "current",\n  "scratch": "current"\n}' }])
   const observed = await tool.execute(
     "observed",
@@ -841,7 +998,7 @@ test("code rejects unawaited nested calls and cancels their admitted work", asyn
   expect(isCodeModeDetails(result.details)).toBe(true)
   if (!isCodeModeDetails(result.details)) throw new Error("Expected code-mode details")
   if (result.details.outcome !== "error") throw new Error("Expected code-mode error")
-  expect(result.details.error).toContain("unawaited")
+  expect(result.content[0]).toEqual({ type: "text", text: expect.stringContaining("unawaited") })
   expect(executions).toBeLessThanOrEqual(2)
   expect(result.details.calls.every(call => call.state !== "running")).toBe(true)
 })
@@ -878,7 +1035,7 @@ test("code contains guest memory exhaustion and aborts active nested work", asyn
   if (!isCodeModeDetails(result.details) || result.details.outcome !== "error") {
     throw new Error("Expected code-mode memory error")
   }
-  expect(result.details.error.toLowerCase()).toContain("memory")
+  expect(result.details.error).toBe("Code runtime failed")
   expect(result.details.calls.every(call => call.state !== "running")).toBe(true)
   expect(result.content[0]).toEqual({ type: "text", text: expect.stringContaining("Code runtime failed") })
   expect(result.content[0]).toEqual({

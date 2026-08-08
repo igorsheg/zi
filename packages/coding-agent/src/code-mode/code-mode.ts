@@ -25,7 +25,16 @@ import {
   type CodeModeWorkerMessage
 } from "./protocol.js"
 import { codeModeToolContract } from "./tool-contract.js"
-import { type CodeModeCall, type CodeModeDetails } from "./trace.js"
+import {
+  codeModeTraceVersion,
+  maxCodeModeTerminalDetailsBytes,
+  maxCodeModeTracePathBytes,
+  type CodeModeDetails,
+  type CodeModeFailureStage,
+  type CodeModeLiveCall,
+  type CodeModeTerminalCall,
+  type CodeModeTerminalDetails
+} from "./trace.js"
 
 export { isCodeModeDetails, type CodeModeCall, type CodeModeDetails } from "./trace.js"
 
@@ -65,8 +74,10 @@ type CodeExecutionFailure =
   | { readonly kind: "nested_settlement"; readonly error: string }
   | { readonly kind: "runtime"; readonly error: string }
 
+type CodeExecutionCall = CodeModeLiveCall
+
 type CodeExecutionResult = {
-  readonly calls: readonly CodeModeCall[]
+  readonly calls: readonly CodeExecutionCall[]
   readonly logs: readonly string[]
   readonly terminate: boolean
   readonly recoverWorker: boolean
@@ -76,6 +87,15 @@ type CodeExecutionResult = {
 )
 
 type ExecutionState = { readonly type: "running" } | { readonly type: "final" } | { readonly type: "settled" }
+
+class NestedToolFailure extends Error {
+  constructor(
+    readonly stage: CodeModeFailureStage,
+    cause: unknown
+  ) {
+    super(errorMessage(cause), { cause })
+  }
+}
 
 type WorkerState =
   | { readonly type: "starting" }
@@ -171,7 +191,7 @@ export class CodeMode {
         }
         return {
           content: [{ type: "text", text: formatResult(result.result, result.logs) }],
-          details: { type: "code_mode", outcome: "success", calls: result.calls, logs: result.logs },
+          details: terminalDetails("success", result.calls),
           ...(result.terminate ? { terminate: true } : {})
         }
       }
@@ -413,7 +433,7 @@ class CodeExecution {
   readonly #parentSignal: AbortSignal | undefined
   readonly #onUpdate: AgentToolUpdateCallback<CodeModeDetails> | undefined
   readonly #controller = new AbortController()
-  readonly #calls: CodeModeCall[] = []
+  readonly #calls: CodeExecutionCall[] = []
   readonly #callIds = new Set<number>()
   #state: ExecutionState = { type: "running" }
   #dispatchQueue = Promise.resolve()
@@ -527,35 +547,42 @@ class CodeExecution {
       1
     this.#publishProgress()
     const operation = this.#dispatchQueue.then(async () => {
-      if (this.#controller.signal.aborted) throw abortError(this.#controller.signal)
-      const tool = this.#tools.get(message.name)
-      if (!tool) throw new Error(`Tool ${message.name} not found`)
-      const prepared = tool.prepareArguments ? tool.prepareArguments(message.arguments) : message.arguments
-      if (!isRecord(prepared)) throw new Error(`Tool ${message.name} requires object arguments`)
-      const validated = validateToolArguments(tool, {
-        type: "toolCall",
-        id: `${this.#toolCallId}:code:${message.id}`,
-        name: message.name,
-        arguments: prepared
-      })
-      const onUpdate: AgentToolUpdateCallback<unknown> = partial => {
-        const call = this.#calls[callIndex]
-        if (!call || call.state !== "running") return
-        this.#calls[callIndex] = { ...call, preview: boundedText(toolResultText(partial)) }
-        this.#publishProgress()
-      }
-      const nestedId = `${this.#toolCallId}:code:${message.id}`
-      const contract = codeModeToolContract(tool)
-      const invocation = contract
-        ? await contract.execute(nestedId, validated, this.#controller.signal, onUpdate)
-        : { result: await tool.execute(nestedId, validated, this.#controller.signal, onUpdate), value: undefined }
-      const text = toolResultText(invocation.result)
-      if (isBuiltInToolError(message.name, invocation.result.details)) throw new Error(text)
-      if (invocation.result.terminate) this.#terminate = true
-      return {
-        text,
-        value: validateCodeModeJson(contract ? invocation.value : text),
-        terminate: invocation.result.terminate === true
+      let stage: CodeModeFailureStage = "prepare"
+      try {
+        if (this.#controller.signal.aborted) throw abortError(this.#controller.signal)
+        const tool = this.#tools.get(message.name)
+        if (!tool) throw new Error(`Tool ${message.name} not found`)
+        const prepared = tool.prepareArguments ? tool.prepareArguments(message.arguments) : message.arguments
+        if (!isRecord(prepared)) throw new Error(`Tool ${message.name} requires object arguments`)
+        stage = "validate"
+        const validated = validateToolArguments(tool, {
+          type: "toolCall",
+          id: `${this.#toolCallId}:code:${message.id}`,
+          name: message.name,
+          arguments: prepared
+        })
+        stage = "invoke"
+        const onUpdate: AgentToolUpdateCallback<unknown> = partial => {
+          const call = this.#calls[callIndex]
+          if (!call || call.state !== "running") return
+          this.#calls[callIndex] = { ...call, preview: boundedText(toolResultText(partial)) }
+          this.#publishProgress()
+        }
+        const nestedId = `${this.#toolCallId}:code:${message.id}`
+        const contract = codeModeToolContract(tool)
+        const invocation = contract
+          ? await contract.execute(nestedId, validated, this.#controller.signal, onUpdate)
+          : { result: await tool.execute(nestedId, validated, this.#controller.signal, onUpdate), value: undefined }
+        const text = toolResultText(invocation.result)
+        if (isBuiltInToolError(message.name, invocation.result.details)) throw new Error(text)
+        if (invocation.result.terminate) this.#terminate = true
+        return {
+          text,
+          value: validateCodeModeJson(contract ? invocation.value : text),
+          terminate: invocation.result.terminate === true
+        }
+      } catch (cause) {
+        throw new NestedToolFailure(stage, cause)
       }
     })
     this.#dispatchQueue = operation.then(
@@ -590,7 +617,8 @@ class CodeExecution {
       },
       async cause => {
         if (this.#state.type !== "running") return undefined
-        const error = boundedErrorText(errorMessage(cause))
+        const failure = cause instanceof NestedToolFailure ? cause : new NestedToolFailure("invoke", cause)
+        const error = boundedErrorText(failure.message)
         const common = {
           id: message.id,
           name: message.name,
@@ -600,7 +628,7 @@ class CodeExecution {
         }
         this.#calls[callIndex] = this.#controller.signal.aborted
           ? { state: "aborted", ...common }
-          : { state: "failed", ...common, error }
+          : { state: "failed", ...common, stage: failure.stage, error }
         this.#publishProgress()
         await this.#worker
           .send({
@@ -622,7 +650,13 @@ class CodeExecution {
     const running = this.#calls.findLast(call => call.state === "running")
     this.#onUpdate({
       content: [{ type: "text", text: running ? `Running ${running.name}` : "Running code" }],
-      details: { type: "code_mode", outcome: "progress", calls: snapshotCalls(this.#calls), logs: [] }
+      details: {
+        type: "code_mode",
+        version: codeModeTraceVersion,
+        outcome: "progress",
+        calls: snapshotCalls(this.#calls),
+        logs: []
+      }
     })
   }
 
@@ -648,9 +682,10 @@ function resultFailure(result: Extract<CodeExecutionResult, { type: "failed" }>)
   const recovery = result.recoverWorker
     ? "\nThe programmatic worker was replaced. Volatile scratch was cleared; committed state was preserved."
     : ""
+  const label = failureLabel(result.failure)
   return {
-    content: [{ type: "text", text: `${failureLabel(result.failure)}: ${error}${recovery}` }],
-    details: { type: "code_mode", outcome: "error", error, calls: result.calls, logs: result.logs },
+    content: [{ type: "text", text: `${label}: ${error}${recovery}` }],
+    details: terminalDetails("error", result.calls, label),
     ...(result.terminate ? { terminate: true } : {})
   }
 }
@@ -672,7 +707,6 @@ function failureLabel(failure: CodeExecutionFailure): string {
 
 function stateCommitFailure(result: CodeExecutionResult, cause: unknown): AgentToolResult<CodeModeDetails> {
   const causeText = boundedErrorText(errorMessage(cause))
-  const error = boundedErrorText(`Could not commit program state: ${causeText}`)
   return {
     content: [
       {
@@ -680,7 +714,7 @@ function stateCommitFailure(result: CodeExecutionResult, cause: unknown): AgentT
         text: `Code cell completed, but program state was not committed: ${causeText}\nTool and ambient effects and scratch changes may already have occurred.`
       }
     ],
-    details: { type: "code_mode", outcome: "error", error, calls: result.calls, logs: result.logs },
+    details: terminalDetails("error", result.calls, "Could not commit program state"),
     ...(result.terminate ? { terminate: true } : {})
   }
 }
@@ -865,8 +899,95 @@ function traceJson(value: unknown, budget: { nodes: number; scalars: number }, d
   return Object.freeze(output)
 }
 
-function snapshotCalls(calls: readonly CodeModeCall[]): readonly CodeModeCall[] {
+function snapshotCalls(calls: readonly CodeExecutionCall[]): readonly CodeExecutionCall[] {
   return Object.freeze(calls.map(call => Object.freeze({ ...call })))
+}
+
+function terminalDetails(
+  outcome: "success" | "error",
+  calls: readonly CodeExecutionCall[],
+  error?: string
+): CodeModeTerminalDetails {
+  const projected = [...terminalCalls(calls)]
+  let details = createTerminalDetails(outcome, projected, error)
+  for (
+    let index = projected.length - 1;
+    serializedBytes(details) > maxCodeModeTerminalDetailsBytes && index >= 0;
+    index--
+  ) {
+    const call = projected[index]
+    if (!call || !isRecord(call.arguments) || Object.keys(call.arguments).length === 0) continue
+    projected[index] = Object.freeze({ ...call, arguments: Object.freeze({}) })
+    details = createTerminalDetails(outcome, projected, error)
+  }
+  if (serializedBytes(details) > maxCodeModeTerminalDetailsBytes) {
+    throw new Error("Code-mode terminal details exceeded their aggregate bound")
+  }
+  return details
+}
+
+function createTerminalDetails(
+  outcome: "success" | "error",
+  calls: readonly CodeModeTerminalCall[],
+  error?: string
+): CodeModeTerminalDetails {
+  const logs: readonly [] = Object.freeze([])
+  const common = { type: "code_mode", version: codeModeTraceVersion, calls: Object.freeze([...calls]), logs } as const
+  return outcome === "success"
+    ? Object.freeze({ ...common, outcome })
+    : Object.freeze({ ...common, outcome, error: error ?? "Code execution failed" })
+}
+
+function terminalCalls(calls: readonly CodeExecutionCall[]): readonly CodeModeTerminalCall[] {
+  return Object.freeze(
+    calls.map(call => {
+      const common = {
+        id: call.id,
+        name: call.name,
+        arguments: terminalArguments(call.name, call.arguments),
+        startedAt: call.startedAt
+      }
+      switch (call.state) {
+        case "running":
+          throw new Error("Cannot persist a running code-mode call")
+        case "succeeded":
+          return Object.freeze({ state: "succeeded" as const, ...common, durationMs: call.durationMs })
+        case "failed":
+          return Object.freeze({ state: "failed" as const, ...common, durationMs: call.durationMs, stage: call.stage })
+        case "aborted":
+          return Object.freeze({ state: "aborted" as const, ...common, durationMs: call.durationMs })
+        default:
+          return assertNever(call)
+      }
+    })
+  )
+}
+
+function terminalArguments(name: string, value: CodeModeJson): CodeModeJson {
+  if (!isRecord(value)) return Object.freeze({})
+  const output: Record<string, CodeModeJson> = {}
+  if (name === "read" || name === "write" || name === "edit") {
+    if (typeof value.path === "string" && Buffer.byteLength(value.path) <= maxCodeModeTracePathBytes) {
+      output.path = value.path
+    }
+  }
+  if (name === "read") {
+    if (traceNumber(value.offset)) output.offset = value.offset
+    if (traceNumber(value.limit)) output.limit = value.limit
+  } else if (name === "write") {
+    if (traceNumber(value.contentBytes)) output.contentBytes = value.contentBytes
+  } else if (name === "edit" && traceNumber(value.operations)) {
+    output.operations = value.operations
+  }
+  return Object.freeze(output)
+}
+
+function traceNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 && value <= 1_000_000_000
+}
+
+function serializedBytes(value: unknown): number {
+  return Buffer.byteLength(JSON.stringify(value))
 }
 
 function formatResult(result: CodeModeJson | undefined, logs: readonly string[]): string {
@@ -1011,6 +1132,10 @@ function typescriptProperty(value: string): string {
 
 function errorMessage(cause: unknown): string {
   return cause instanceof Error ? cause.message : String(cause)
+}
+
+function assertNever(value: never): never {
+  throw new Error(`Unexpected code-mode call: ${String(value)}`)
 }
 
 function isString(value: unknown): value is string {
