@@ -17,6 +17,7 @@ export class ZiPaths {
   readonly globalSettingsFile: string
   readonly projectSettingsFile: string
   readonly authFile: string
+  readonly modelsStoreFile: string
   readonly trustFile: string
   readonly globalSystemPromptFile: string
   readonly projectSystemPromptFile: string
@@ -36,6 +37,7 @@ export class ZiPaths {
     this.globalSettingsFile = join(this.globalDir, "settings.json")
     this.projectSettingsFile = join(this.projectDir, "settings.json")
     this.authFile = join(this.globalDir, "auth.json")
+    this.modelsStoreFile = join(this.globalDir, "models-store.json")
     this.trustFile = join(this.globalDir, "trust.json")
     this.globalSystemPromptFile = join(this.globalDir, "SYSTEM.md")
     this.projectSystemPromptFile = join(this.projectDir, "SYSTEM.md")

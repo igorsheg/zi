@@ -111,6 +111,9 @@ export type { ContextUsage } from "./context-usage.js"
 
 export const maxPendingInputCount = 32
 export const maxPendingInputBytes = 8 * 1024 * 1024
+export const maxModelCatalogRefreshMs = 15_000
+export const maxModelCatalogSettlementMs = 3_000
+export const maxModelCatalogSettlements = 4
 export { maxRetryDelayMs, maxRetryErrorBytes } from "./retry.js"
 
 export type PendingInputDelivery = "steer" | "followUp"
@@ -222,6 +225,10 @@ export interface ModelChoice {
   readonly model: Model<Api>
   readonly configured: boolean
 }
+
+export type ModelCatalogRefreshResult =
+  | { readonly type: "complete"; readonly choices: readonly ModelChoice[]; readonly failedProviders: readonly string[] }
+  | { readonly type: "aborted"; readonly reason: "cancelled" | "timeout" }
 
 export interface PromptOptions {
   images?: ImageContent[]
@@ -381,6 +388,14 @@ type ExtensionLifecycleState =
 
 type ModelMutationState = { type: "none" } | { type: "validating"; operationId: number }
 
+type ModelCatalogRefreshState =
+  | { readonly type: "idle" }
+  | {
+      readonly type: "refreshing"
+      readonly controller: AbortController
+      readonly settled: Promise<ModelCatalogRefreshResult>
+    }
+
 export type SessionModelState =
   | { readonly type: "unselected" }
   | { readonly type: "selected"; readonly model: Model<Api> }
@@ -508,6 +523,8 @@ export class AgentSession {
   #nextExtensionCommandOperationId = 0
   #nextReloadOperationId = 0
   #modelMutation: ModelMutationState = { type: "none" }
+  #modelCatalogRefresh: ModelCatalogRefreshState = { type: "idle" }
+  readonly #modelCatalogSettlements = new Set<Promise<void>>()
   #modelState: SessionModelState
   #modelChoicesPromise: Promise<readonly ModelChoice[]> | undefined
   #committedMessageMemory: CommittedMessageMemory | undefined
@@ -930,27 +947,43 @@ export class AgentSession {
 
   listModelChoices(): Promise<readonly ModelChoice[]> {
     this.#assertOpen()
-    if (this.#modelChoicesPromise) return this.#modelChoicesPromise
+    return this.#loadModelChoices()
+  }
 
-    const models = [...this.#modelRegistry.list()]
-    const unresolved = models.filter(model => model.provider !== this.#apiKeyProvider)
-    const load = this.#modelRegistry.resolveConfiguration(unresolved).then(configured => {
-      let unresolvedIndex = 0
-      return Object.freeze(
-        models.map(model => {
-          if (model.provider === this.#apiKeyProvider) return Object.freeze({ model, configured: true })
-          const available = configured[unresolvedIndex] ?? false
-          unresolvedIndex++
-          return Object.freeze({ model, configured: available })
-        })
-      )
-    })
-    this.#modelChoicesPromise = load
-    void load.then(
-      () => this.#clearModelChoices(load),
-      () => this.#clearModelChoices(load)
+  refreshModelChoices(signal?: AbortSignal): Promise<ModelCatalogRefreshResult> {
+    this.#assertOpen()
+    const current = this.#modelCatalogRefresh
+    if (current.type === "refreshing" && !current.controller.signal.aborted) {
+      this.#bindModelCatalogRefreshSignal(current, signal)
+      return current.settled
+    }
+    if (current.type === "refreshing") this.#modelCatalogRefresh = { type: "idle" }
+    if (this.#modelCatalogSettlements.size >= maxModelCatalogSettlements) {
+      return Promise.resolve(Object.freeze({ type: "aborted", reason: "timeout" }))
+    }
+
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(modelCatalogTimeoutReason), maxModelCatalogRefreshMs)
+    timeout.unref()
+    const operation = this.#modelRegistry.refresh({ allowNetwork: true, signal: controller.signal })
+    const settlement = operation.then(
+      () => undefined,
+      () => undefined
     )
-    return load
+    this.#modelCatalogSettlements.add(settlement)
+    void settlement.then(() => {
+      this.#modelCatalogSettlements.delete(settlement)
+      return undefined
+    })
+    const settled = this.#driveModelCatalogRefresh(controller, operation)
+    const refresh: ModelCatalogRefreshState = { type: "refreshing", controller, settled }
+    this.#modelCatalogRefresh = refresh
+    this.#bindModelCatalogRefreshSignal(refresh, signal)
+    void settled.then(
+      () => this.#finishModelCatalogRefresh(refresh, timeout),
+      () => this.#finishModelCatalogRefresh(refresh, timeout)
+    )
+    return settled
   }
 
   authenticationMethods(): readonly AuthenticationMethod[] {
@@ -1451,6 +1484,7 @@ export class AgentSession {
   waitForIdle(): Promise<void> {
     const searchSettled = this.#projectFileSearch.waitForIdle()
     const extensionsSettled = this.#extensionSettlement()
+    const catalogSettled = this.#modelCatalogSettlementWithinDeadline()
     switch (this.#activity.type) {
       case "running":
       case "aborting":
@@ -1459,10 +1493,16 @@ export class AgentSession {
       case "extension_command":
       case "reloading":
       case "disposed":
-        return settleAll([this.#activity.settled, this.#authentication.waitForIdle(), searchSettled, extensionsSettled])
+        return settleAll([
+          this.#activity.settled,
+          this.#authentication.waitForIdle(),
+          searchSettled,
+          extensionsSettled,
+          catalogSettled
+        ])
       case "idle":
       case "failed":
-        return settleAll([this.#authentication.waitForIdle(), searchSettled, extensionsSettled])
+        return settleAll([this.#authentication.waitForIdle(), searchSettled, extensionsSettled, catalogSettled])
       default:
         return assertNever(this.#activity)
     }
@@ -1683,6 +1723,9 @@ export class AgentSession {
     if (this.#activity.type === "disposed") return
     this.#modelMutation = { type: "none" }
     const currentActivity = this.#activity
+    const catalogRefresh = this.#modelCatalogRefresh
+    const catalogSettled = this.#modelCatalogSettlementWithinDeadline()
+    if (catalogRefresh.type === "refreshing") catalogRefresh.controller.abort(modelCatalogCancellationReason)
     const activeSettled =
       currentActivity.type === "running" ||
       currentActivity.type === "aborting" ||
@@ -1723,6 +1766,7 @@ export class AgentSession {
       this.#authentication.dispose(),
       this.#projectFileSearch.dispose(),
       this.#shell?.dispose() ?? Promise.resolve(),
+      catalogSettled,
       processOwners
     ])
     this.#activity = { type: "disposed", settled }
@@ -2885,6 +2929,73 @@ export class AgentSession {
     return Object.freeze({ steering: Object.freeze(steering), followUp: Object.freeze(followUp) })
   }
 
+  #loadModelChoices(): Promise<readonly ModelChoice[]> {
+    if (this.#modelChoicesPromise) return this.#modelChoicesPromise
+
+    const models = [...this.#modelRegistry.list()]
+    const unresolved = models.filter(model => model.provider !== this.#apiKeyProvider)
+    const load = this.#modelRegistry.resolveConfiguration(unresolved).then(configured => {
+      let unresolvedIndex = 0
+      return Object.freeze(
+        models.map(model => {
+          if (model.provider === this.#apiKeyProvider) return Object.freeze({ model, configured: true })
+          const available = configured[unresolvedIndex] ?? false
+          unresolvedIndex++
+          return Object.freeze({ model, configured: available })
+        })
+      )
+    })
+    this.#modelChoicesPromise = load
+    void load.then(
+      () => this.#clearModelChoices(load),
+      () => this.#clearModelChoices(load)
+    )
+    return load
+  }
+
+  async #driveModelCatalogRefresh(
+    controller: AbortController,
+    operation: ReturnType<ModelRegistry["refresh"]>
+  ): Promise<ModelCatalogRefreshResult> {
+    const refreshed = await settleModelCatalogOperation(operation, controller.signal)
+    if (!refreshed || controller.signal.aborted || refreshed.aborted) {
+      return abortedModelCatalogRefresh(controller.signal)
+    }
+
+    this.#modelChoicesPromise = undefined
+    const choices = await settleModelCatalogOperation(this.#loadModelChoices(), controller.signal)
+    if (!choices || controller.signal.aborted) return abortedModelCatalogRefresh(controller.signal)
+    return Object.freeze({ type: "complete", choices, failedProviders: Object.freeze([...refreshed.errors.keys()]) })
+  }
+
+  #bindModelCatalogRefreshSignal(
+    state: Extract<ModelCatalogRefreshState, { type: "refreshing" }>,
+    signal?: AbortSignal
+  ): void {
+    if (!signal) return
+    if (signal.aborted) {
+      state.controller.abort(modelCatalogCancellationReason)
+      return
+    }
+    const cancel = () => state.controller.abort(modelCatalogCancellationReason)
+    const unbind = () => signal.removeEventListener("abort", cancel)
+    signal.addEventListener("abort", cancel, { once: true })
+    void state.settled.then(unbind, unbind)
+  }
+
+  #finishModelCatalogRefresh(
+    refresh: Extract<ModelCatalogRefreshState, { type: "refreshing" }>,
+    timeout: ReturnType<typeof setTimeout>
+  ): void {
+    clearTimeout(timeout)
+    if (this.#modelCatalogRefresh === refresh) this.#modelCatalogRefresh = { type: "idle" }
+  }
+
+  #modelCatalogSettlementWithinDeadline(): Promise<void> {
+    if (this.#modelCatalogSettlements.size === 0) return Promise.resolve()
+    return settleModelCatalogWithin(settleAll([...this.#modelCatalogSettlements]), maxModelCatalogSettlementMs)
+  }
+
   #clearModelChoices(load: Promise<readonly ModelChoice[]>): void {
     if (this.#modelChoicesPromise === load) this.#modelChoicesPromise = undefined
   }
@@ -3001,6 +3112,49 @@ export class AgentSession {
     this.#assertIdle(action)
     if (this.#modelMutation.type !== "none") throw new Error(`Cannot ${action} while a model change is active`)
   }
+}
+
+const modelCatalogTimeoutReason = Object.freeze({ type: "model_catalog_timeout" })
+const modelCatalogCancellationReason = Object.freeze({ type: "model_catalog_cancelled" })
+
+function abortedModelCatalogRefresh(signal: AbortSignal): ModelCatalogRefreshResult {
+  return Object.freeze({
+    type: "aborted",
+    reason: signal.reason === modelCatalogTimeoutReason ? "timeout" : "cancelled"
+  })
+}
+
+function settleModelCatalogOperation<T>(operation: Promise<T>, signal: AbortSignal): Promise<T | undefined> {
+  if (signal.aborted) return Promise.resolve(undefined)
+  return new Promise((resolve, reject) => {
+    const onAbort = () => {
+      signal.removeEventListener("abort", onAbort)
+      resolve(undefined)
+    }
+    signal.addEventListener("abort", onAbort, { once: true })
+    void operation.then(
+      value => {
+        signal.removeEventListener("abort", onAbort)
+        resolve(value)
+        return undefined
+      },
+      cause => {
+        signal.removeEventListener("abort", onAbort)
+        reject(cause)
+        return undefined
+      }
+    )
+  })
+}
+
+async function settleModelCatalogWithin(operation: Promise<void>, timeoutMs: number): Promise<void> {
+  let timeout: ReturnType<typeof setTimeout> | undefined
+  const deadline = new Promise<void>(resolve => {
+    timeout = setTimeout(resolve, timeoutMs)
+    timeout.unref()
+  })
+  await Promise.race([operation, deadline])
+  if (timeout) clearTimeout(timeout)
 }
 
 function settleBeforeAbort<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {

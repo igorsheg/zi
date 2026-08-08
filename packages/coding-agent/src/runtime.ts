@@ -2,8 +2,9 @@ import { fileURLToPath } from "node:url"
 
 // Pi AI keeps OAuth flows behind dynamic imports for browser bundlers. Standalone
 // Bun binaries register the static loaders so /login can open subscription flows.
+import { createModels, type Models } from "@earendil-works/pi-ai"
 import { registerBunOAuthFlows } from "@earendil-works/pi-ai/bun-oauth"
-import { builtinModels } from "@earendil-works/pi-ai/providers/all"
+import { builtinProviders, getBuiltinModelDataGeneratedAt } from "@earendil-works/pi-ai/providers/all"
 
 registerBunOAuthFlows()
 
@@ -12,11 +13,13 @@ import { CodeMode } from "./code-mode/code-mode.js"
 import { FileCredentialStore } from "./credential-store.js"
 import { discoverExtensionLoadPlan, extensionDiscoveryDiagnostic } from "./extensions/discovery.js"
 import { createExtensionWorkerSpawner, ExtensionHost } from "./extensions/host.js"
+import { FileModelCatalogStore } from "./model-catalog-store.js"
 import { ModelRegistry } from "./model-registry.js"
 import { resolveRequestedModel } from "./model-resolver.js"
 import { getAgentDir, ZiPaths } from "./paths.js"
 import { createProcessTreeTracker } from "./processes/process-tree.js"
 import { projectConfigurationAdmission, resolveProjectTrust, type ProjectTrustResolution } from "./project-trust.js"
+import { withRemoteModelCatalog } from "./remote-model-catalog.js"
 import { ResourceLoader } from "./resource-loader.js"
 import {
   snapshotAgentRuntimeOptions,
@@ -86,8 +89,16 @@ export async function createUnboundAgentRuntime(requested: CreateAgentRuntimeOpt
     )
     await extensionHost.start(extensions.plan)
     const credentialStore = new FileCredentialStore(paths)
-    const models = options.modelFactory?.(credentialStore) ?? builtinModels({ credentials: credentialStore })
+    let models: Models
+    let modelCatalogStore: FileModelCatalogStore | undefined
+    if (options.modelFactory) {
+      models = options.modelFactory(credentialStore)
+    } else {
+      modelCatalogStore = new FileModelCatalogStore(paths)
+      models = createProductionModels(credentialStore, modelCatalogStore)
+    }
     const modelRegistry = new ModelRegistry(models)
+    if (modelCatalogStore) await modelRegistry.refresh({ allowNetwork: false })
     const resourceLoader = new ResourceLoader({
       paths,
       project,
@@ -158,6 +169,23 @@ export async function createUnboundAgentRuntime(requested: CreateAgentRuntimeOpt
     await processTreeTracker.dispose()
     throw cause
   }
+}
+
+function createProductionModels(credentials: FileCredentialStore, modelsStore: FileModelCatalogStore) {
+  const models = createModels({ credentials, modelsStore })
+  const localGeneratedAt = getBuiltinModelDataGeneratedAt()
+  const userAgent = `zi/${process.env.ZI_BUILD_VERSION ?? "dev"}`
+  for (const provider of builtinProviders()) {
+    models.setProvider(
+      provider.id === "radius"
+        ? provider
+        : withRemoteModelCatalog(provider, {
+            userAgent,
+            ...(localGeneratedAt === undefined ? {} : { localGeneratedAt })
+          })
+    )
+  }
+  return models
 }
 
 const defaultRuntimeSession: AgentRuntimeSessionIntent = Object.freeze({ type: "new", persist: true })

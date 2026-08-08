@@ -367,7 +367,8 @@ export function settingLabel(setting: EditableSetting): string {
 export function modelFrame(
   choices: readonly ModelChoice[],
   current: ModelChoice["model"] | undefined,
-  emptyText = "No matching models"
+  emptyText = "No matching models",
+  footer?: string
 ): PickerFrame {
   return {
     id: promptPickerFrameIds.models,
@@ -382,7 +383,8 @@ export function modelFrame(
       ...(sameModel(choice.model, current) ? { metadata: glyphs.check } : {}),
       searchText: modelSearchText(choice)
     })),
-    ...(current && choices.some(choice => sameModel(choice.model, current)) ? { selectedId: modelId(current) } : {})
+    ...(current && choices.some(choice => sameModel(choice.model, current)) ? { selectedId: modelId(current) } : {}),
+    ...(footer ? { footer } : {})
   }
 }
 

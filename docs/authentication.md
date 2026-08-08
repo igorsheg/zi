@@ -40,9 +40,9 @@ Logout removes stored credentials for the selected provider. It does not remove 
 /model model-id
 ```
 
-`/model` lists models from configured providers. A fully qualified `provider/model-id` selects directly when it matches. A bare model ID selects directly only when it is unambiguous.
+`/model` lists models from configured providers. It shows the last known catalog immediately, then refreshes configured provider catalogs in the background. Refreshed catalogs are retained in `$HOME/.zi/agent/models-store.json`; packaged models remain available when refresh fails or Zi is offline.
 
-The selected provider and model are persisted together so Zi does not combine a project model with the wrong global provider.
+A fully qualified `provider/model-id` selects directly when it matches. A bare model ID selects directly only when it is unambiguous. The selected provider and model are persisted together so Zi does not combine a project model with the wrong global provider.
 
 ## One-process credentials
 

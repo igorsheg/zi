@@ -99,6 +99,15 @@ type ClipboardReadState =
       readonly controller: AbortController
     }
 
+type ModelRefreshState =
+  | { readonly type: "idle" }
+  | {
+      readonly type: "refreshing"
+      readonly operationId: number
+      readonly session: AgentSession
+      readonly controller: AbortController
+    }
+
 export const maxPromptClipboardImages = 8
 export const maxPromptClipboardEncodedBytes = 8 * 1024 * 1024
 
@@ -159,6 +168,7 @@ class PromptController implements PromptStore {
   readonly #modals: PromptModalActions
   readonly #fileCompletion: FileCompletionController
   #clipboardRead: ClipboardReadState = { type: "idle" }
+  #modelRefresh: ModelRefreshState = { type: "idle" }
   #draftRevision = 0
   #disposed = false
   #nextOperationId = 0
@@ -335,6 +345,7 @@ class PromptController implements PromptStore {
       return true
     }
 
+    this.#cancelModelRefresh()
     const result = this.picker.back()
     if (result.type === "revealed" && result.workflow) {
       // The revealed frame restores its own choosing workflow; transient
@@ -504,6 +515,7 @@ class PromptController implements PromptStore {
 
   clear(): void {
     this.#cancelClipboardRead()
+    this.#cancelModelRefresh()
     if (
       this.#cancelAuthentication() ||
       this.#cancelCompaction() ||
@@ -526,6 +538,7 @@ class PromptController implements PromptStore {
     if (this.#disposed) return
     this.#disposed = true
     this.#cancelClipboardRead()
+    this.#cancelModelRefresh()
     this.#cancelAuthentication()
     this.#cancelCompaction()
     this.#cancelExtensionCommand()
@@ -1075,6 +1088,7 @@ class PromptController implements PromptStore {
   }
 
   #openModels(initialSearch: string, parentFilter?: string): void {
+    this.#cancelModelRefresh()
     const session = this.#interactive.getSession()
     const operationId = ++this.#nextOperationId
     this.$state.set({ ...this.$state.get(), workflow: { type: "loading_models", operationId, session } })
@@ -1104,13 +1118,93 @@ class PromptController implements PromptStore {
         return
       }
       const choosing: PickerWorkflow = { type: "choosing_model", operationId, session, choices }
-      this.#replaceChoosing(modelFrame(choices, current), initialSearch, choosing)
+      this.#replaceChoosing(
+        modelFrame(choices, current, "No matching models", "Refreshing model catalogs…"),
+        initialSearch,
+        choosing
+      )
+      this.#startModelRefresh(operationId, session)
     }
     void load()
   }
 
+  #startModelRefresh(operationId: number, session: AgentSession): void {
+    const refresh: Extract<ModelRefreshState, { type: "refreshing" }> = {
+      type: "refreshing",
+      operationId,
+      session,
+      controller: new AbortController()
+    }
+    this.#modelRefresh = refresh
+
+    const run = async () => {
+      try {
+        const result = await session.refreshModelChoices(refresh.controller.signal)
+        const workflow = this.#finishModelRefresh(refresh)
+        if (!workflow) return
+        if (result.type === "complete") {
+          this.#replaceRefreshedModels(workflow, result.choices, modelRefreshCompletionFooter(result.failedProviders))
+        } else {
+          this.#replaceRefreshedModels(
+            workflow,
+            workflow.choices,
+            result.reason === "timeout"
+              ? "Model refresh timed out; showing cached models."
+              : "Model refresh cancelled; showing cached models."
+          )
+        }
+      } catch {
+        const workflow = this.#finishModelRefresh(refresh)
+        if (!workflow) return
+        this.#replaceRefreshedModels(
+          workflow,
+          workflow.choices,
+          "Could not refresh model catalogs; showing cached models."
+        )
+      }
+    }
+    void run()
+  }
+
+  #finishModelRefresh(
+    refresh: Extract<ModelRefreshState, { type: "refreshing" }>
+  ): Extract<PromptWorkflow, { type: "choosing_model" }> | undefined {
+    const workflow = this.$state.get().workflow
+    const accepted =
+      !this.#disposed &&
+      this.#modelRefresh === refresh &&
+      this.#interactive.getSession() === refresh.session &&
+      workflow.type === "choosing_model" &&
+      workflow.operationId === refresh.operationId &&
+      workflow.session === refresh.session
+    if (this.#modelRefresh === refresh) this.#modelRefresh = { type: "idle" }
+    if (accepted) return workflow
+    refresh.controller.abort()
+    return undefined
+  }
+
+  #replaceRefreshedModels(
+    workflow: Extract<PromptWorkflow, { type: "choosing_model" }>,
+    loaded: readonly ModelChoice[],
+    footer: string | undefined
+  ): void {
+    const current = workflow.session.modelState.type === "selected" ? workflow.session.modelState.model : undefined
+    const choices = configuredModelChoices(loaded, current)
+    const choosing: PickerWorkflow = { ...workflow, choices }
+    this.picker.replaceTopRetainingQuery(modelFrame(choices, current, "No matching models", footer), choosing)
+    this.$state.set({ ...this.$state.get(), workflow: choosing })
+  }
+
+  #cancelModelRefresh(): void {
+    const refresh = this.#modelRefresh
+    if (refresh.type === "idle") return
+    this.#modelRefresh = { type: "idle" }
+    refresh.controller.abort()
+  }
+
   #selectModel(operationId: number, session: AgentSession, choice: ModelChoice): void {
     if (!this.#accepts(operationId, session)) return
+    this.#cancelModelRefresh()
     this.$state.set({ ...this.$state.get(), workflow: { type: "selecting_model", operationId, session } })
     const presentation = this.picker.presentation("")
     if (presentation) {
@@ -1526,9 +1620,25 @@ class PromptController implements PromptStore {
   }
 
   #accepts(operationId: number, session: AgentSession): boolean {
+    this.#cancelStaleModelRefresh()
     if (this.#disposed || this.#interactive.getSession() !== session) return false
     const workflow = this.$state.get().workflow
     return workflow.type !== "idle" && workflow.operationId === operationId && workflow.session === session
+  }
+
+  #cancelStaleModelRefresh(): void {
+    const refresh = this.#modelRefresh
+    if (refresh.type === "idle" || this.#disposed) return
+    const workflow = this.$state.get().workflow
+    if (
+      this.#interactive.getSession() === refresh.session &&
+      workflow.type === "choosing_model" &&
+      workflow.operationId === refresh.operationId &&
+      workflow.session === refresh.session
+    ) {
+      return
+    }
+    this.#cancelModelRefresh()
   }
 
   #finishClipboardRead(reading: Extract<ClipboardReadState, { type: "reading" }>): boolean {
@@ -1606,6 +1716,7 @@ class PromptController implements PromptStore {
   }
 
   #setIdle(): void {
+    this.#cancelModelRefresh()
     this.$state.set({ ...this.$state.get(), workflow: { type: "idle" } })
     this.#notices.clearPrompt()
   }
@@ -1650,6 +1761,14 @@ class PromptController implements PromptStore {
   #showError(cause: unknown): void {
     if (!this.#disposed) this.#notices.promptError(errorMessage(cause))
   }
+}
+
+function modelRefreshCompletionFooter(failedProviders: readonly string[]): string {
+  if (failedProviders.length === 0) return "Model catalogs refreshed."
+  if (failedProviders.length === 1) {
+    return `Could not refresh ${failedProviders[0]}; showing cached models.`
+  }
+  return `Could not refresh ${failedProviders.length} model catalogs; showing cached models.`
 }
 
 function imageMarkerNotice(action: "Removed" | "Restored", count: number): string {

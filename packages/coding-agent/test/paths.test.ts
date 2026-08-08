@@ -27,6 +27,7 @@ test("one cwd-bound policy resolves global, project, auth, resource, and session
   expect(paths.globalSettingsFile).toBe(join(agentDir, "settings.json"))
   expect(paths.projectSettingsFile).toBe(join(cwd, ".zi", "settings.json"))
   expect(paths.authFile).toBe(join(agentDir, "auth.json"))
+  expect(paths.modelsStoreFile).toBe(join(agentDir, "models-store.json"))
   expect(paths.trustFile).toBe(join(agentDir, "trust.json"))
   expect(paths.globalSystemPromptFile).toBe(join(agentDir, "SYSTEM.md"))
   expect(paths.projectSystemPromptFile).toBe(join(cwd, ".zi", "SYSTEM.md"))

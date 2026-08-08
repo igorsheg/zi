@@ -1,4 +1,4 @@
-import type { Api, Model, Models } from "@earendil-works/pi-ai"
+import type { Api, Model, Models, ModelsRefreshOptions, ModelsRefreshResult } from "@earendil-works/pi-ai"
 
 const maxConfigurationLookups = 4
 
@@ -22,6 +22,10 @@ export class ModelRegistry {
 
   list(): readonly Model<Api>[] {
     return this.models.getModels()
+  }
+
+  refresh(options?: ModelsRefreshOptions): Promise<ModelsRefreshResult> {
+    return this.models.refresh(options)
   }
 
   isConfigured(model: Model<Api>): Promise<boolean> {

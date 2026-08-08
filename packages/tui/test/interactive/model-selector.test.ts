@@ -383,6 +383,69 @@ test("model picker omits unconfigured providers, sorts like Pi, and wraps select
   }
 })
 
+test("model picker refreshes catalogs in the background without resetting its filter", async () => {
+  const { session } = await createModelSession()
+  const interactive = createInteractiveStore(session)
+  const prompt = createPromptStore(interactive, new SlashController())
+  const initial = await session.listModelChoices()
+  const refreshed = deferred<Awaited<ReturnType<typeof session.refreshModelChoices>>>()
+  session.refreshModelChoices = () => refreshed.promise
+
+  try {
+    expect(prompt.submit("/model", "steer")).toBe(true)
+    await waitFor(() => prompt.$state.get().workflow.type === "choosing_model")
+    expect(prompt.picker.presentation("")?.frame.footer).toBe("Refreshing model catalogs…")
+
+    prompt.draftChanged("fresh", fileCompletionInputFromText("fresh", 5))
+    const current = initial[0]
+    if (!current) throw new Error("Initial model choice missing")
+    const fresh = { ...current.model, id: "fresh", name: "Fresh model" }
+    refreshed.resolve({
+      type: "complete",
+      choices: [...initial, { model: fresh, configured: true }],
+      failedProviders: []
+    })
+    await settle()
+
+    const presentation = prompt.picker.presentation("fresh")
+    expect(presentation?.rows.map(row => row.id)).toEqual([`${fresh.provider}/${fresh.id}`])
+    expect(presentation?.frame.footer).toBe("Model catalogs refreshed.")
+  } finally {
+    prompt.dispose()
+    interactive.dispose()
+    session.dispose()
+  }
+})
+
+test("closing the model picker cancels its catalog refresh and rejects stale completion", async () => {
+  const { session } = await createModelSession()
+  const interactive = createInteractiveStore(session)
+  const prompt = createPromptStore(interactive, new SlashController())
+  const initial = await session.listModelChoices()
+  const refreshed = deferred<Awaited<ReturnType<typeof session.refreshModelChoices>>>()
+  let refreshSignal: AbortSignal | undefined
+  session.refreshModelChoices = signal => {
+    refreshSignal = signal
+    return refreshed.promise
+  }
+
+  try {
+    expect(prompt.submit("/model", "steer")).toBe(true)
+    await waitFor(() => prompt.$state.get().workflow.type === "choosing_model")
+    expect(prompt.backPicker()).toBe(true)
+    expect(refreshSignal?.aborted).toBe(true)
+
+    refreshed.resolve({ type: "complete", choices: initial, failedProviders: [] })
+    await settle()
+    expect(prompt.$state.get().workflow.type).toBe("idle")
+    expect(prompt.picker.$state.get().type).toBe("closed")
+  } finally {
+    prompt.dispose()
+    interactive.dispose()
+    session.dispose()
+  }
+})
+
 test("/model opens configured models and selects through the terminal picker", async () => {
   const { session, setup } = await createModelFixture()
 

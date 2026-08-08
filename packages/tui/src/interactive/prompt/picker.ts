@@ -61,6 +61,7 @@ export interface PickerStack {
   open(frame: PickerFrame, workflow?: PickerWorkflow): void
   push(frame: PickerFrame, parentFilter: string, workflow?: PickerWorkflow): void
   replaceTop(frame: PickerFrame, filter: string, workflow?: PickerWorkflow): void
+  replaceTopRetainingQuery(frame: PickerFrame, workflow?: PickerWorkflow): void
   queryChanged(filter: string): void
   move(filter: string, direction: -1 | 1): void
   presentation(filter: string): PickerPresentation | undefined
@@ -158,6 +159,19 @@ export function createPickerStack(): PickerStack {
       const state = current()
       if (state.type === "closed") throw new Error("Cannot replace a picker frame on a closed stack")
       replaceFrame(frame, filter, workflow)
+    },
+    replaceTopRetainingQuery(frame, workflow) {
+      const state = current()
+      if (state.type === "closed") throw new Error("Cannot replace a picker frame on a closed stack")
+      validateFrame(frame)
+      updateTop(currentFrame => {
+        const currentRows = filteredRows(currentFrame, currentFrame.query)
+        const selectedId = currentRows[currentFrame.selectedIndex]?.id
+        const replacement = activate(frame, currentFrame.query, currentFrame.parentFilter, workflow)
+        if (!selectedId) return replacement
+        const selectedIndex = filteredRows(replacement, replacement.query).findIndex(row => row.id === selectedId)
+        return selectedIndex < 0 ? replacement : { ...replacement, selectedIndex }
+      })
     },
     queryChanged(filter) {
       updateTop(frame => {
