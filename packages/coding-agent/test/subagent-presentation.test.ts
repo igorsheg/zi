@@ -157,7 +157,7 @@ test("targetless wait reports an empty collection without a placeholder count", 
   expect(presentation.body).toBeUndefined()
 })
 
-test("timed-out wait presents current status without stale completion", () => {
+test("timed-out mailbox receive keeps pending work concise", () => {
   const presentation = projectToolPresentation({
     status: "done",
     name: "wait_subagents",
@@ -168,12 +168,19 @@ test("timed-out wait presents current status without stale completion", () => {
         type: "subagent",
         outcome: "success",
         operation: "wait",
-        agents: [{ name: agent.name, lifecycle: "running", workCycle: 2 }]
+        agents: [],
+        pendingNames: [agent.name],
+        timedOut: true
       }
     }
   })
 
-  expect(presentation.body).toEqual({ type: "text", text: "Shutdown reviewer working", tone: "muted" })
+  expect(presentation.header).toEqual({
+    label: "Wait",
+    subject: { type: "text", text: "Shutdown reviewer" },
+    details: ["timed out", "1 still running"]
+  })
+  expect(presentation.body).toBeUndefined()
 })
 
 test("persisted wait details do not present an unmatched completion", () => {

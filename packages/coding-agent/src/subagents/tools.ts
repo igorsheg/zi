@@ -50,7 +50,7 @@ const waitParameters = Type.Object({
       minItems: 1,
       maxItems: maxWaitNames,
       uniqueItems: true,
-      description: `Runtime names to wait for. Omit to capture the bounded eligible set of up to ${maxWaitNames} subagents once when the call begins.`
+      description: `Runtime names whose captured work cycles may wake this receive. Omit to capture up to ${maxWaitNames} working or ready subagents once when the call begins.`
     })
   ),
   timeout_ms: Type.Optional(
@@ -165,7 +165,7 @@ export function createSubagentTools(
   const wait: AgentTool<typeof waitParameters, SubagentToolDetails> = {
     name: "wait_subagents",
     label: "wait_subagents",
-    description: `Wait for named subagents when synchronization is needed. For each name, an older pending completion is returned before current work; otherwise the current work cycle is captured. With names omitted, capture up to ${maxWaitNames} working or pending subagents once. Completion delivery to parent context does not depend on this tool.`,
+    description: `Receive the next completion from captured subagents when synchronization is needed. Returns after any captured work cycle completes and coalesces other completions ready at that instant; remaining children keep running. For each name, an older pending completion is returned before current work. With names omitted, capture up to ${maxWaitNames} working or ready subagents once. Completion delivery to parent context does not depend on this tool.`,
     parameters: waitParameters,
     executionMode: "parallel",
     async execute(id, input, signal) {
@@ -174,11 +174,17 @@ export function createSubagentTools(
         names.length === 0
           ? []
           : await supervisor.waitForTool(names, input.timeout_ms ?? supervisor.waitTimeoutMs, signal, id)
-      return textResult(JSON.stringify(projectWaitResult(snapshots)), {
+      const status = supervisor.status()
+      const pending = new Set([...status.workingNames, ...status.readyNames])
+      const pendingNames = names.filter(name => pending.has(name))
+      const timedOut = names.length > 0 && snapshots.length === 0
+      return textResult(JSON.stringify(projectReceiveResult(snapshots, pendingNames, timedOut)), {
         type: "subagent",
         outcome: "success",
         operation: "wait",
-        agents: projectSubagentToolAgents(snapshots)
+        agents: projectSubagentToolAgents(snapshots),
+        pendingNames,
+        timedOut
       })
     }
   }
@@ -284,6 +290,42 @@ function projectWaitResult(snapshots: readonly SubagentSnapshot[], maximumBytes 
     omitted_bytes: omittedBytes
   }
 
+  clipWaitEvidence(projected, subagents, maximumBytes, nextOmittedBytes => {
+    projected.omitted_bytes = nextOmittedBytes
+  })
+  return projected
+}
+
+function projectReceiveResult(
+  snapshots: readonly SubagentSnapshot[],
+  pendingNames: readonly string[],
+  timedOut: boolean,
+  maximumBytes = maxSubagentToolResultBytes
+) {
+  const subagents: WaitSubagent[] = snapshots.map(projectSnapshot)
+  let omittedBytes = subagents.reduce(
+    (total, subagent) => total + ("completion" in subagent ? subagent.completion.omitted_bytes : 0),
+    0
+  )
+  const projected = { subagents, pending_names: [...pendingNames], timed_out: timedOut, omitted_bytes: omittedBytes }
+
+  clipWaitEvidence(projected, subagents, maximumBytes, next => {
+    omittedBytes = next
+    projected.omitted_bytes = omittedBytes
+  })
+  return projected
+}
+
+function clipWaitEvidence(
+  projected: object,
+  subagents: readonly WaitSubagent[],
+  maximumBytes: number,
+  setOmittedBytes: (value: number) => void
+): void {
+  let omittedBytes = subagents.reduce(
+    (total, subagent) => total + ("completion" in subagent ? subagent.completion.omitted_bytes : 0),
+    0
+  )
   while (Buffer.byteLength(JSON.stringify(projected)) > maximumBytes) {
     const evidence = largestWaitEvidence(subagents)
     if (!evidence) throw new Error(`Subagent wait metadata exceeds ${maximumBytes} bytes`)
@@ -293,10 +335,8 @@ function projectWaitResult(snapshots: readonly SubagentSnapshot[], maximumBytes 
     evidence.completion.omitted_bytes += clipped.omittedBytes
     evidence.completion.truncated = true
     omittedBytes += clipped.omittedBytes
-    projected.omitted_bytes = omittedBytes
+    setOmittedBytes(omittedBytes)
   }
-
-  return projected
 }
 
 function projectProfileCatalog(profiles: readonly ExtensionSubagentProfile[]) {

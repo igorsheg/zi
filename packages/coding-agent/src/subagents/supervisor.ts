@@ -80,6 +80,13 @@ interface ExitedRecord {
   readonly task?: string
 }
 
+interface WaitTarget {
+  readonly name: string
+  readonly workCycle: number
+  readonly admittedSnapshot: ChildSnapshot
+  readonly admittedDelivery: CompletionDelivery["type"] | undefined
+}
+
 export interface SubagentSpawnSelection {
   readonly model?: string
   readonly thinkingLevel?: ThinkingLevel
@@ -450,7 +457,36 @@ export class SubagentSupervisor {
     signal?: AbortSignal,
     claimId?: string
   ): Promise<SubagentSnapshot[]> {
-    return this.#wait(names, timeoutMs, signal, "claim", claimId)
+    this.#validateWaitNames(names, signal)
+    this.#pumpMailbox()
+    throwIfWaitCancelled(signal)
+    const targets = this.#captureWaitTargets(names, "ready")
+    const boundedTimeout = Math.min(Math.max(0, timeoutMs), maxWaitTimeoutMs)
+    const deadline = Date.now() + boundedTimeout
+
+    while (true) {
+      this.#pumpMailbox()
+      throwIfWaitCancelled(signal)
+      const received = targets
+        .filter(target => this.#waitTargetReady(target.name, target.workCycle))
+        .map(target =>
+          this.#settleDelivery(
+            target.name,
+            target.workCycle,
+            target.admittedSnapshot,
+            target.admittedDelivery,
+            "claim",
+            false,
+            claimId
+          )
+        )
+        .filter(snapshot => snapshot.completion !== undefined)
+      if (received.length > 0 || Date.now() >= deadline) return received
+
+      // oxlint-disable-next-line no-await-in-loop -- one bounded mailbox receive owner
+      await this.#waitPulse(Math.min(100, deadline - Date.now()), signal)
+      throwIfWaitCancelled(signal)
+    }
   }
 
   async #wait(
@@ -460,25 +496,8 @@ export class SubagentSupervisor {
     deliveryMode: "consume" | "claim",
     claimId?: string
   ): Promise<SubagentSnapshot[]> {
-    this.#assertOpen()
-    if (names.length === 0 || names.length > maxWaitNames) {
-      throw new Error(`Subagent wait requires 1 through ${maxWaitNames} names`)
-    }
-    if (new Set(names).size !== names.length) throw new Error("Subagent wait rejects duplicate names")
-    for (const name of names) {
-      validateSubagentName(name)
-      this.#requireKnown(name)
-    }
-    throwIfWaitCancelled(signal)
-    const targets = names.map(name => {
-      const workCycle = this.#oldestDurableDelivery(name)?.completion.workCycle ?? this.#currentWorkCycle(name)
-      return {
-        name,
-        workCycle,
-        admittedSnapshot: this.#childSnapshotFor(name),
-        admittedDelivery: this.#delivery(name, workCycle)?.type
-      }
-    })
+    this.#validateWaitNames(names, signal)
+    const targets = this.#captureWaitTargets(names, "durable")
     const boundedTimeout = Math.min(Math.max(0, timeoutMs), maxWaitTimeoutMs)
     const deadline = Date.now() + boundedTimeout
     this.#pumpMailbox()
@@ -501,6 +520,32 @@ export class SubagentSupervisor {
         claimId
       )
     )
+  }
+
+  #validateWaitNames(names: readonly string[], signal?: AbortSignal): void {
+    this.#assertOpen()
+    if (names.length === 0 || names.length > maxWaitNames) {
+      throw new Error(`Subagent wait requires 1 through ${maxWaitNames} names`)
+    }
+    if (new Set(names).size !== names.length) throw new Error("Subagent wait rejects duplicate names")
+    for (const name of names) {
+      validateSubagentName(name)
+      this.#requireKnown(name)
+    }
+    throwIfWaitCancelled(signal)
+  }
+
+  #captureWaitTargets(names: readonly string[], availability: "ready" | "durable"): readonly WaitTarget[] {
+    return names.map(name => {
+      const available = availability === "ready" ? this.#oldestReadyDelivery(name) : this.#oldestDurableDelivery(name)
+      const workCycle = available?.completion.workCycle ?? this.#currentWorkCycle(name)
+      return {
+        name,
+        workCycle,
+        admittedSnapshot: this.#childSnapshotFor(name),
+        admittedDelivery: this.#delivery(name, workCycle)?.type
+      }
+    })
   }
 
   async #interruptAndWait(
@@ -824,12 +869,21 @@ export class SubagentSupervisor {
     return this.#ledger.delivery(name, workCycle)
   }
 
+  #oldestReadyDelivery(name: string): Extract<CompletionDelivery, { type: "pending" | "durable" }> | undefined {
+    return this.#ledger.oldestReady(name)
+  }
+
   #oldestDurableDelivery(name: string): Extract<CompletionDelivery, { type: "durable" }> | undefined {
     return this.#ledger.oldestDurable(name)
   }
 
   #latestDelivery(name: string): CompletionDelivery | undefined {
     return this.#ledger.latest(name)
+  }
+
+  #waitTargetReady(name: string, workCycle: number): boolean {
+    const delivery = this.#delivery(name, workCycle)
+    return delivery?.type === "pending" || delivery?.type === "durable"
   }
 
   #waitTargetSettled(name: string, workCycle: number): boolean {

@@ -146,9 +146,11 @@ function waitPresentation(
   args: Record<string, unknown> | undefined,
   fallbackText: string
 ): ToolPresentation {
-  const agents = details?.operation === "wait" ? details.agents : []
+  const wait = details?.operation === "wait" ? details : undefined
+  const agents = wait?.agents ?? []
   const requestedNames = stringArray(args?.names)
-  const count = agents.length || requestedNames.length
+  const observedNames = new Set([...agents.map(agent => agent.name), ...(wait?.pendingNames ?? [])])
+  const count = requestedNames.length || observedNames.size
   const subject =
     agents.length === 1
       ? agentSubject(agents[0])
@@ -164,8 +166,12 @@ function waitPresentation(
         ? ""
         : fallbackText
   const compactRows = agents.length > 0 ? Math.min(agents.length + (evidence.length > 0 ? 1 : 0), 6) : 6
+  const headerDetails = [
+    ...(wait?.timedOut ? ["timed out"] : []),
+    ...(wait?.pendingNames && wait.pendingNames.length > 0 ? [`${wait.pendingNames.length} still running`] : [])
+  ]
   return {
-    header: { label: "Wait", subject, details: [] },
+    header: { label: "Wait", subject, details: headerDetails },
     ...(body ? { body: { type: "text" as const, text: boundHead(body), tone: "muted" as const } } : {}),
     notices: [],
     preview: {

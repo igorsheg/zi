@@ -114,8 +114,13 @@ test("CompletionLedger rejects stale and duplicate admission without disturbing 
   expect(ledger.admit(second)).toBe("accepted")
   expect(ledger.admit(first)).toBe("accepted")
   expect(ledger.admit(first)).toBe("duplicate")
+  expect(ledger.oldestReady("worker")?.completion.workCycle).toBe(1)
   ledger.commitPersistence(second.name, second.workCycle, "entry-second")
+  expect(ledger.oldestReady("worker")?.completion.workCycle).toBe(1)
   ledger.commitPersistence(first.name, first.workCycle, "entry-first")
+  expect(ledger.claim(first.name, first.workCycle, "mailbox:first")).toBe(true)
+  expect(ledger.oldestReady("worker")?.completion.workCycle).toBe(2)
+  expect(ledger.releaseClaims("mailbox:")).toEqual(["worker"])
 
   expect(ledger.deliveries().map(delivery => delivery.completion.workCycle)).toEqual([2, 1])
   expect(ledger.oldestDurable("worker")?.completion.workCycle).toBe(1)

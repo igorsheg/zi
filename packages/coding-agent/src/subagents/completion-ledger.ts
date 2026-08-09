@@ -169,6 +169,19 @@ export class CompletionLedger {
     )
   }
 
+  oldestReady(name: string): Extract<CompletionDelivery, { type: "pending" | "durable" }> | undefined {
+    let oldest: Extract<CompletionDelivery, { type: "pending" | "durable" }> | undefined
+    for (const state of this.#states.values()) {
+      if ((state.type !== "pending" && state.type !== "durable") || state.completion.name !== name) continue
+      if (oldest && state.completion.workCycle >= oldest.completion.workCycle) continue
+      oldest =
+        state.type === "pending"
+          ? { type: "pending", completion: state.completion }
+          : { type: "durable", completion: state.completion, entryId: state.entryId }
+    }
+    return oldest
+  }
+
   oldestDurable(name: string): Extract<CompletionDelivery, { type: "durable" }> | undefined {
     let oldest: Extract<CompletionDelivery, { type: "durable" }> | undefined
     for (const state of this.#states.values()) {

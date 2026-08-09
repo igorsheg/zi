@@ -147,6 +147,91 @@ test("wait holds until every requested subagent has completed", async () => {
   }
 }, 15_000)
 
+test("extension wait keeps its current-cycle barrier when older completion persistence is pending", async () => {
+  const harness = await createHarness("extension-wait-pending", { reply: "cycle-ok", delayMs: 100 })
+  const append = harness.sessionManager.appendSubagent.bind(harness.sessionManager)
+  Object.defineProperty(harness.sessionManager, "appendSubagent", {
+    configurable: true,
+    value(data: Parameters<SessionManager["appendSubagent"]>[0]) {
+      if (data.event === "work_cycle_finished" && data.workCycle === 1) throw new Error("journal unavailable")
+      return append(data)
+    }
+  })
+
+  try {
+    const name = await harness.supervisor.spawn("cycle-worker", "first cycle")
+    await waitFor(() => harness.supervisor.snapshots()[0]?.lifecycle === "idle", 5_000)
+    await harness.supervisor.continue(name, "second cycle")
+
+    const waited = await harness.supervisor.wait([name], 5_000)
+    expect(waited).toEqual([
+      expect.objectContaining({
+        name,
+        capturedWorkCycle: 2,
+        completion: expect.objectContaining({ workCycle: 2, status: "completed" })
+      })
+    ])
+
+    const received = await harness.supervisor.waitForTool([name], 0, undefined, "mailbox-pending")
+    expect(received).toEqual([
+      expect.objectContaining({
+        name,
+        capturedWorkCycle: 1,
+        completion: expect.objectContaining({ workCycle: 1, status: "completed" })
+      })
+    ])
+  } finally {
+    Object.defineProperty(harness.sessionManager, "appendSubagent", { configurable: true, value: append })
+    await harness.dispose()
+  }
+}, 15_000)
+
+test("model wait receives the first completion while other captured work keeps running", async () => {
+  const harness = await createHarness("wait-mailbox", { reply: "mailbox-ok", delayMs: 300 })
+  try {
+    const first = await harness.supervisor.spawn("first-worker", "first")
+    await Bun.sleep(100)
+    const second = await harness.supervisor.spawn("second-worker", "second")
+
+    const received = await harness.supervisor.waitForTool([first, second], 5_000, undefined, "first-receive")
+    expect(received).toEqual([
+      expect.objectContaining({ name: first, completion: expect.objectContaining({ status: "completed" }) })
+    ])
+    expect(harness.supervisor.status()).toEqual({ workingNames: [second], readyNames: [] })
+
+    const remaining = await harness.supervisor.waitForTool([first, second], 5_000, undefined, "second-receive")
+    expect(remaining).toEqual([
+      expect.objectContaining({ name: second, completion: expect.objectContaining({ status: "completed" }) })
+    ])
+  } finally {
+    await harness.dispose()
+  }
+}, 15_000)
+
+test("cancelling a model mailbox receive preserves later completion delivery", async () => {
+  const harness = await createHarness("mailbox-cancel", { reply: "receive-later", delayMs: 300 })
+  try {
+    const name = await harness.supervisor.spawn("slow-worker", "keep working")
+    const controller = new AbortController()
+    const outcome = harness.supervisor.waitForTool([name], 5_000, controller.signal, "cancelled-receive").then(
+      () => ({ type: "resolved" as const }),
+      (cause: unknown) => ({ type: "rejected" as const, cause })
+    )
+    controller.abort()
+
+    expect(await outcome).toEqual({
+      type: "rejected",
+      cause: expect.objectContaining({ name: "AbortError", message: "Subagent wait was cancelled" })
+    })
+    await waitFor(() => harness.supervisor.status().readyNames.includes(name), 5_000)
+    expect(await harness.supervisor.waitForTool([name], 0, undefined, "later-receive")).toEqual([
+      expect.objectContaining({ name, completion: expect.objectContaining({ text: "receive-later" }) })
+    ])
+  } finally {
+    await harness.dispose()
+  }
+}, 15_000)
+
 test("observer failure cannot interrupt a wait delivery commit", async () => {
   const harness = await createHarness("wait-observer-failure", { reply: "observer-ok", delayMs: 100 })
   try {

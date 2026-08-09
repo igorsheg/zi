@@ -118,7 +118,8 @@ test("standard subagent tools exist only for an admitted profile catalog", async
     const waited = await wait.execute("wait", { names: ["finder-1"], timeout_ms: 5_000 }, undefined)
     expect(JSON.parse(resultText(waited))).toMatchObject({
       subagents: [{ name: "finder-1", completion: { work_cycle: 1, status: "completed", text: "found" } }],
-      all_completed: true
+      pending_names: [],
+      timed_out: false
     })
     expect(isSubagentToolDetails(waited.details)).toBe(true)
 
@@ -189,7 +190,12 @@ test("targetless wait captures the eligible set once at call start", async () =>
     const tools = createSubagentTools([pathfinderProfile], harness.supervisor, harness.spawn)
     const wait = requireTool(tools, "wait_subagents")
     const empty = await wait.execute("empty-wait", { timeout_ms: 5_000 }, undefined)
-    expect(JSON.parse(resultText(empty))).toEqual({ subagents: [], all_completed: true, omitted_bytes: 0 })
+    expect(JSON.parse(resultText(empty))).toEqual({
+      subagents: [],
+      pending_names: [],
+      timed_out: false,
+      omitted_bytes: 0
+    })
 
     await harness.spawn("pathfinder", "captured-worker", "captured")
     const waiting = wait.execute("captured-wait", { timeout_ms: 5_000 }, undefined)
@@ -198,6 +204,43 @@ test("targetless wait captures the eligible set once at call start", async () =>
     expect(JSON.parse(resultText(await waiting)).subagents).toEqual([
       expect.objectContaining({ name: "captured-worker", completion: expect.objectContaining({ status: "completed" }) })
     ])
+  } finally {
+    await harness.dispose()
+  }
+}, 15_000)
+
+test("wait returns the first mailbox completion and leaves captured peers running", async () => {
+  const harness = await createHarness("receive-first", "mailbox-ok", 300)
+  try {
+    const tools = createSubagentTools([pathfinderProfile], harness.supervisor, harness.spawn)
+    await harness.spawn("pathfinder", "first-worker", "first")
+    await Bun.sleep(100)
+    await harness.spawn("pathfinder", "second-worker", "second")
+
+    const waited = await requireTool(tools, "wait_subagents").execute(
+      "receive-first",
+      { names: ["first-worker", "second-worker"], timeout_ms: 5_000 },
+      undefined
+    )
+    expect(JSON.parse(resultText(waited))).toMatchObject({
+      subagents: [{ name: "first-worker", completion: { status: "completed" } }],
+      pending_names: ["second-worker"],
+      timed_out: false
+    })
+    expect(waited.details).toMatchObject({ operation: "wait", pendingNames: ["second-worker"], timedOut: false })
+    expect(harness.supervisor.status()).toEqual({ workingNames: ["second-worker"], readyNames: [] })
+
+    const timedOut = await requireTool(tools, "wait_subagents").execute(
+      "receive-timeout",
+      { names: ["second-worker"], timeout_ms: 0 },
+      undefined
+    )
+    expect(JSON.parse(resultText(timedOut))).toEqual({
+      subagents: [],
+      pending_names: ["second-worker"],
+      timed_out: true,
+      omitted_bytes: 0
+    })
   } finally {
     await harness.dispose()
   }
@@ -228,7 +271,8 @@ test("wait projects the oldest pending completion before active work", async () 
           completion: expect.objectContaining({ status: "completed" })
         })
       ],
-      all_completed: true,
+      pending_names: ["running-worker"],
+      timed_out: false,
       omitted_bytes: 0
     })
     const details = requireRecord(waited.details, "wait details")
@@ -274,6 +318,7 @@ test("profile and wait projections remain bounded", async () => {
 
     await harness.spawn("profile-1", "first", "inspect")
     await harness.spawn("profile-2", "second", "inspect")
+    await waitFor(() => harness.supervisor.status().readyNames.length === 2, 5_000)
     const waited = await requireTool(tools, "wait_subagents").execute(
       "wait",
       { names: ["first", "second"], timeout_ms: 5_000 },

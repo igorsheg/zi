@@ -84,6 +84,8 @@ export type SubagentToolDetails =
       readonly outcome: "success"
       readonly operation: "wait"
       readonly agents: readonly SubagentToolAgentDetails[]
+      readonly pendingNames?: readonly string[]
+      readonly timedOut?: boolean
     }
   | {
       readonly type: "subagent"
@@ -159,7 +161,7 @@ export function isSubagentToolDetails(value: unknown): value is SubagentToolDeta
     case "interrupt":
       return isAgent(value.agent) && (value.result === "interrupted" || value.result === "already_idle")
     case "wait":
-      return isAgentArray(value.agents) && serializedBytes(value.agents) <= maxProjectedSubagentToolEvidenceBytes
+      return isWaitDetails(value.agents, value.pendingNames, value.timedOut)
     case "list":
       return (
         isAgentArray(value.agents) &&
@@ -276,6 +278,12 @@ function isAgentArray(value: unknown): value is readonly SubagentToolAgentDetail
     value.every(isAgent) &&
     new Set(value.map(agent => agent.name)).size === value.length
   )
+}
+
+function isWaitDetails(agentsValue: unknown, pendingValue: unknown, timedOutValue: unknown): boolean {
+  if (!isAgentArray(agentsValue) || serializedBytes(agentsValue) > maxProjectedSubagentToolEvidenceBytes) return false
+  if (pendingValue !== undefined && !isNameArray(pendingValue)) return false
+  return timedOutValue === undefined || typeof timedOutValue === "boolean"
 }
 
 function isStatusNames(
