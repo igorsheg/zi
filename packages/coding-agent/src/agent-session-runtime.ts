@@ -2,6 +2,7 @@ import { existsSync } from "node:fs"
 
 import type { Api, Model } from "@earendil-works/pi-ai"
 
+import { isRecord } from "./guards.js"
 import { resolveZiPath } from "./paths.js"
 import { ProjectTrustStore, type ProjectTrustSelection } from "./project-trust.js"
 import {
@@ -397,10 +398,6 @@ function validateProjectTrustSelection(selection: unknown): asserts selection is
   if (selection.persistence !== "session" && selection.persistence !== "saved") {
     throw new Error(`Unknown project trust persistence: ${String(selection.persistence)}`)
   }
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
 }
 
 function replacementModel(options: CreateAgentRuntimeOptions, current: AgentRuntime): string | undefined {

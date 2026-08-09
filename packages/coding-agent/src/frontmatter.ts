@@ -1,5 +1,7 @@
 import { parse } from "yaml"
 
+import { isRecord } from "./guards.js"
+
 export interface ParsedFrontmatter {
   readonly frontmatter: Readonly<Record<string, unknown>>
   readonly body: string
@@ -24,8 +26,4 @@ function extractFrontmatter(content: string): { readonly source?: string; readon
   const end = normalized.indexOf("\n---", 3)
   if (end < 0) return { body: normalized }
   return { source: normalized.slice(4, end), body: normalized.slice(end + 4).trim() }
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
 }

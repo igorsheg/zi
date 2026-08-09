@@ -1,5 +1,6 @@
 import type { Api, Model, ModelsStoreEntry, Provider, RefreshModelsContext } from "@earendil-works/pi-ai"
 
+import { isRecord } from "./guards.js"
 import { admitCatalogModel, maxCatalogModelsPerProvider, maxCatalogProviderIdLength } from "./model-catalog-store.js"
 
 const defaultCatalogBaseUrl = "https://pi.dev"
@@ -175,8 +176,4 @@ async function readBoundedResponse(response: Response): Promise<string> {
     reader.releaseLock()
   }
   return new TextDecoder("utf-8", { fatal: true }).decode(content.subarray(0, bytes))
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
 }

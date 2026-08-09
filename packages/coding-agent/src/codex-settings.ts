@@ -1,5 +1,7 @@
 import type { Api, Model, SimpleStreamOptions } from "@earendil-works/pi-ai"
 
+import { isRecord } from "./guards.js"
+
 export async function applyCodexRequestSettings(
   payload: unknown,
   model: Model<Api>,
@@ -25,8 +27,4 @@ export async function applyCodexRequestSettings(
     else delete next.text
   }
   return next
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
 }

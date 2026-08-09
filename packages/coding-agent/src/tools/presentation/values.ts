@@ -1,3 +1,4 @@
+import { isRecord } from "../../guards.js"
 import { DEFAULT_MAX_BYTES, truncateHead, truncateTail } from "../truncate.js"
 import { maxToolInlineScalars } from "./types.js"
 
@@ -186,8 +187,4 @@ function utf8ScalarBytes(scalar: string): number {
   if (code <= 0x7f) return 1
   if (code <= 0x7ff) return 2
   return code <= 0xffff ? 3 : 4
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
 }

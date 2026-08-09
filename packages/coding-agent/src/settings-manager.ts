@@ -4,6 +4,7 @@ import { basename, dirname, join } from "node:path"
 import type { QueueMode, ThinkingLevel } from "@earendil-works/pi-agent-core"
 import lockfile from "proper-lockfile"
 
+import { isRecord } from "./guards.js"
 import type { ZiPaths } from "./paths.js"
 import type { ProjectConfigurationAdmission } from "./project-trust.js"
 import { isRetryCount, isRetryDelay } from "./retry.js"
@@ -546,10 +547,6 @@ function isThinkingLevel(value: unknown): value is ThinkingLevel {
     value === "xhigh" ||
     value === "max"
   )
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
 }
 
 function hasCode(error: unknown, code: string): boolean {

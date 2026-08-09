@@ -5,6 +5,7 @@ import { join, resolve } from "node:path"
 
 import type { AgentTool } from "@earendil-works/pi-agent-core"
 
+import { isRecord } from "../src/guards.js"
 import { createProcessTreeTracker } from "../src/processes/process-tree.js"
 import { SessionManager } from "../src/session-manager.js"
 import { SubagentSupervisor } from "../src/subagents/supervisor.js"
@@ -326,10 +327,6 @@ async function createHarness(name: string, reply: string, delayMs = 30) {
 function requireRecord(value: unknown, label: string): Record<string, unknown> {
   if (!isRecord(value)) throw new Error(`Expected ${label}`)
   return value
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
 }
 
 function requireArray(value: unknown, label: string): unknown[] {

@@ -18,6 +18,7 @@ import type {
   ExtensionSubagentSnapshot
 } from "@with-zi/extension-api"
 
+import { isRecord } from "../guards.js"
 import {
   maxCustomJsonBytes,
   maxCustomStateEntries,
@@ -1281,7 +1282,7 @@ function extensionToolRegistration(value: unknown): ExtensionToolRegistration {
 }
 
 function validateToolSchema(value: JsonValue, path: string): void {
-  if (!isProtocolRecord(value)) throw new ExtensionProtocolError(`Extension tool schema ${path} must be an object`)
+  if (!isRecord(value)) throw new ExtensionProtocolError(`Extension tool schema ${path} must be an object`)
   if (Object.hasOwn(value, "const")) return
   const type = value.type
   if (type === "string" || type === "number" || type === "integer" || type === "boolean") return
@@ -1292,7 +1293,7 @@ function validateToolSchema(value: JsonValue, path: string): void {
   }
   if (type === "object") {
     const properties = value.properties
-    if (!isProtocolRecord(properties)) {
+    if (!isRecord(properties)) {
       throw new ExtensionProtocolError(`Extension tool object schema ${path} requires properties`)
     }
     for (const [name, property] of Object.entries(properties)) {
@@ -1462,7 +1463,7 @@ function activeToolNames(value: unknown): readonly string[] {
 
 function jsonRecord(value: unknown, field: string, maxBytes: number): Readonly<Record<string, JsonValue>> {
   const admitted = jsonValue(value, field, maxBytes)
-  if (!isProtocolRecord(admitted)) throw new ExtensionProtocolError(`Extension protocol ${field} must be an object`)
+  if (!isRecord(admitted)) throw new ExtensionProtocolError(`Extension protocol ${field} must be an object`)
   return admitted
 }
 
@@ -1496,7 +1497,7 @@ function copyJsonValue(value: unknown, field: string, depth: number, state: { no
   if (Array.isArray(value)) {
     return Object.freeze(value.map(item => copyJsonValue(item, field, depth + 1, state)))
   }
-  if (isProtocolRecord(value)) {
+  if (isRecord(value)) {
     const entries = Object.entries(value).map(([key, item]) => {
       if (Buffer.byteLength(key) > maxExtensionJsonKeyBytes) {
         throw new ExtensionProtocolError(
@@ -1552,12 +1553,8 @@ function extensionDiagnostic(value: unknown): ExtensionDiagnostic {
 }
 
 function protocolRecord(value: unknown): Record<string, unknown> {
-  if (!isProtocolRecord(value)) throw new ExtensionProtocolError("Extension protocol messages must be objects")
+  if (!isRecord(value)) throw new ExtensionProtocolError("Extension protocol messages must be objects")
   return value
-}
-
-function isProtocolRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
 }
 
 function protocolArray(value: unknown, field: string): readonly unknown[] {

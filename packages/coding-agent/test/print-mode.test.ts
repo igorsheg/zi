@@ -2,6 +2,7 @@ import { expect, test } from "bun:test"
 
 import { Type } from "@earendil-works/pi-ai"
 
+import { isRecord } from "../src/guards.js"
 import {
   maxPendingJsonlRecords,
   maxPrintOutputBytes,
@@ -772,10 +773,6 @@ function isUserMessageStart(value: unknown): boolean {
   return (
     recordType(value) === "message_start" && isRecord(value) && isRecord(value.message) && value.message.role === "user"
   )
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
 }
 
 function deferred<T>() {

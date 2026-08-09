@@ -1,5 +1,5 @@
 import type { TextareaRenderable } from "@opentui/core"
-import { maxSessionPromptHistoryEntries } from "@with-zi/coding-agent"
+import { isRecord, maxSessionPromptHistoryEntries } from "@with-zi/coding-agent"
 
 const maxComposerHistoryReplacementSlots = maxSessionPromptHistoryEntries * 2 + 1
 
@@ -210,10 +210,6 @@ function isOpenTuiRenderLibMemory(value: unknown): value is OpenTuiRenderLibMemo
 
 function isByteList(value: unknown): value is Uint8Array[] {
   return Array.isArray(value) && value.every(item => item instanceof Uint8Array)
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null
 }
 
 function incompatibleOpenTui(): Error {

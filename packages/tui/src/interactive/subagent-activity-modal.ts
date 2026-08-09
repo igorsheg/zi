@@ -1,5 +1,6 @@
 import { BoxRenderable, fg, StyledText, TextRenderable, type CliRenderer } from "@opentui/core"
 import {
+  isRecord,
   projectToolPresentation,
   type SubagentSessionEvents,
   type SubagentSnapshot,
@@ -451,10 +452,6 @@ function stringField(value: Readonly<Record<string, unknown>>, field: string): s
 function numberField(value: Readonly<Record<string, unknown>>, field: string): number | undefined {
   const fieldValue = value[field]
   return typeof fieldValue === "number" && Number.isFinite(fieldValue) ? fieldValue : undefined
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
 }
 
 function inlineText(text: string): string {

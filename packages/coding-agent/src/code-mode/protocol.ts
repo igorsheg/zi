@@ -1,5 +1,7 @@
 import type { Writable } from "node:stream"
 
+import { isRecord } from "../guards.js"
+
 export const codeModeProtocolVersion = 4
 export const codeModeWorkerArgument = "--zi-internal-code-mode-worker"
 
@@ -450,8 +452,4 @@ function protocolError(cause: unknown): CodeModeProtocolError {
   return cause instanceof CodeModeProtocolError
     ? cause
     : new CodeModeProtocolError(cause instanceof Error ? cause.message : "Code-mode protocol failed", { cause })
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
 }

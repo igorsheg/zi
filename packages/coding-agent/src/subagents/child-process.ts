@@ -8,6 +8,7 @@
 import { spawn } from "node:child_process"
 import { Readable, Writable } from "node:stream"
 
+import { isRecord } from "../guards.js"
 import type { ProcessScope, ProcessTreeTracker } from "../processes/process-tree.js"
 import {
   decodePeerRequestFrame,
@@ -1419,10 +1420,6 @@ function currentWorkCycle(state: ChildLifecycleState): { readonly workCycle?: nu
 
 function isPositiveTimeout(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
 }
 
 function cloneRpcSessionEvent(value: unknown): ChildSerializableSessionEvent | undefined {

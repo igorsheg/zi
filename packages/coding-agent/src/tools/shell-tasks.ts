@@ -1,6 +1,7 @@
 import type { AgentTool } from "@earendil-works/pi-agent-core"
 import { Type } from "@earendil-works/pi-ai"
 
+import { isNonNegativeInteger, isRecord } from "../guards.js"
 import type {
   SessionShell,
   ShellFullOutput,
@@ -285,16 +286,8 @@ function isTaskState(value: unknown): value is ShellTaskSnapshot["type"] {
   )
 }
 
-function isNonNegativeInteger(value: unknown): value is number {
-  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
-}
-
 function isBoundedString(value: unknown): value is string {
   return isBoundedToolText(value)
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
 }
 
 function assertNever(value: never): never {

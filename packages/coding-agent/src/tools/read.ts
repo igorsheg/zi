@@ -3,6 +3,7 @@ import { readFile, stat } from "node:fs/promises"
 import type { AgentTool } from "@earendil-works/pi-agent-core"
 import { Type } from "@earendil-works/pi-ai"
 
+import { isPositiveInteger, isRecord } from "../guards.js"
 import { splitTextLines } from "./lines.js"
 import { resolveToolPath } from "./path.js"
 import { boundToolText, isBoundedToolText } from "./text.js"
@@ -177,14 +178,6 @@ function throwIfAborted(signal?: AbortSignal): void {
   if (signal?.aborted) throw new Error("Operation aborted")
 }
 
-function isPositiveInteger(value: unknown): value is number {
-  return typeof value === "number" && Number.isSafeInteger(value) && value > 0
-}
-
 function isBoundedString(value: unknown): value is string {
   return isBoundedToolText(value)
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
 }

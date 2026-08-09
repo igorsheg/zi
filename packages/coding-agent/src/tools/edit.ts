@@ -4,6 +4,7 @@ import type { AgentTool } from "@earendil-works/pi-agent-core"
 import { Type } from "@earendil-works/pi-ai"
 import { FILE_HEADERS_ONLY, formatPatch, structuredPatch, type StructuredPatch } from "diff"
 
+import { isNonNegativeInteger, isPositiveInteger, isRecord } from "../guards.js"
 import { withFileMutation } from "./mutation-queue.js"
 import { resolveToolPath } from "./path.js"
 import { boundToolText, isBoundedToolText } from "./text.js"
@@ -362,16 +363,4 @@ function errorMessage(cause: unknown): string {
 
 function throwIfAborted(signal?: AbortSignal): void {
   if (signal?.aborted) throw new Error("Operation aborted")
-}
-
-function isPositiveInteger(value: unknown): value is number {
-  return typeof value === "number" && Number.isSafeInteger(value) && value > 0
-}
-
-function isNonNegativeInteger(value: unknown): value is number {
-  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
 }

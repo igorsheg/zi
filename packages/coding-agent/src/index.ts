@@ -1,3 +1,11 @@
+export {
+  isFiniteNumber,
+  isNonNegativeFinite,
+  isNonNegativeInteger,
+  isPositiveInteger,
+  isRecord,
+  isStringRecord
+} from "./guards.js"
 export type { AgentTool, QueueMode, ThinkingLevel } from "@earendil-works/pi-agent-core"
 export type { AgentMessage, CompactionSummaryMessage } from "./messages.js"
 export type { Api, ImageContent, Model } from "@earendil-works/pi-ai"

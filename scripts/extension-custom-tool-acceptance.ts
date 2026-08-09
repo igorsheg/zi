@@ -5,6 +5,7 @@ import { join, resolve } from "node:path"
 
 import { runRpcCommand, runRpcPrompt } from "../examples/rpc/client.js"
 import { interactiveAcceptanceArgument } from "../packages/cli/src/main.js"
+import { isRecord } from "../packages/coding-agent/src/guards.js"
 
 const acceptancePrompt = "Call repository_status once, then report success."
 const acceptanceResult = "Extension acceptance passed."
@@ -888,10 +889,6 @@ function requireRecord(value: unknown, name: string): Record<string, unknown> {
 function requireArray(value: unknown, name: string): unknown[] {
   if (!Array.isArray(value)) throw new Error(`${name} must be an array`)
   return value
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
 }
 
 function assertNever(value: never): never {

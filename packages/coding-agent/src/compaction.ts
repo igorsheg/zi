@@ -2,6 +2,7 @@ import type { ThinkingLevel } from "@earendil-works/pi-agent-core"
 import { isContextOverflow, type Api, type AssistantMessage, type Context, type Model } from "@earendil-works/pi-ai"
 
 import { isCodeModeDetails } from "./code-mode/trace.js"
+import { isRecord } from "./guards.js"
 import { formatCompactionSummary, type AgentMessage } from "./messages.js"
 import {
   maxCompactionFilePaths,
@@ -597,10 +598,6 @@ function boundedCompactionErrorMessage(cause: unknown, prefix = ""): string {
 
 function cancellationError(message = "Compaction cancelled"): Error {
   return new Error(boundedCompactionErrorMessage(message), { cause: "cancelled" })
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
 }
 
 function assertNever(value: never): never {

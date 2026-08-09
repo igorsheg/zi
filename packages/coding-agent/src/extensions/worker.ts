@@ -24,6 +24,7 @@ import type {
 import { Type } from "typebox"
 import { Compile, type Validator } from "typebox/compile"
 
+import { isRecord } from "../guards.js"
 import type { ExtensionLoadPlan, ExtensionSource } from "./discovery.js"
 import {
   boundedExtensionCommandError,
@@ -1714,10 +1715,6 @@ function forbiddenAgentEvent(state: LifecycleState, event: ExtensionAgentEvent["
 
 function forbiddenLifecycle(state: LifecycleState, event: ExtensionLifecycleEvent["type"]): Error {
   return new Error(`Cannot dispatch ${event} while extension lifecycle is ${state.type}`)
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
 }
 
 function isCallable(value: unknown): value is (...arguments_: unknown[]) => unknown {

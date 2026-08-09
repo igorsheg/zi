@@ -5,6 +5,7 @@ import { chmod, cp, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { basename, dirname, join, resolve } from "node:path"
 
+import { isRecord } from "../packages/coding-agent/src/guards.js"
 import {
   currentReleaseTarget,
   normalizeVersion,
@@ -276,7 +277,6 @@ function cliResolverSource(): string {
 import { spawnSync } from "node:child_process"
 import { createRequire } from "node:module"
 import { dirname, join } from "node:path"
-
 const require = createRequire(import.meta.url)
 const target = targetFor(process.platform, process.arch)
 const packageName = ${JSON.stringify(npmPackageScope)} + "/zi-" + target
@@ -410,10 +410,6 @@ function packageDirectoryName(packageName: string): string {
 function required(value: string | undefined, flag: string): string {
   if (!value) throw new Error(`${flag} requires a value`)
   return value
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
 }
 
 if (import.meta.main) {

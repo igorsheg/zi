@@ -1,3 +1,4 @@
+import { isNonNegativeFinite, isNonNegativeInteger, isRecord } from "../guards.js"
 import type { ChildLifecycleState, SubagentCompletion, SubagentCompletionStatus } from "./child-process.js"
 import { clipUtf8 } from "./child-process.js"
 import {
@@ -337,14 +338,6 @@ function isBoundedText(value: unknown, maxBytes: number, allowEmpty = false): va
   )
 }
 
-function isNonNegativeInteger(value: unknown): value is number {
-  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
-}
-
-function isNonNegativeFinite(value: unknown): value is number {
-  return typeof value === "number" && Number.isFinite(value) && value >= 0
-}
-
 function isLifecycle(value: unknown): value is ChildLifecycleState["type"] {
   return (
     value === "starting" ||
@@ -367,8 +360,4 @@ function isCompletionStatus(value: unknown): value is SubagentCompletionStatus {
 
 function serializedBytes(value: unknown): number {
   return Buffer.byteLength(JSON.stringify(value))
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
 }

@@ -1,6 +1,7 @@
 import type { AgentTool } from "@earendil-works/pi-agent-core"
 import { Type } from "@earendil-works/pi-ai"
 
+import { isRecord } from "../guards.js"
 import {
   ShellRunAdmissionError,
   type SessionShell,
@@ -230,10 +231,6 @@ function isExpectedShellErrorOutcome(value: unknown): value is ShellTaskOutcome 
     value.type === "disposed" ||
     value.type === "failed"
   )
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
 }
 
 function assertNever(value: never): never {

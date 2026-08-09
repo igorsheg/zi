@@ -18,6 +18,7 @@ import { dirname, join } from "node:path"
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core"
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai"
 
+import { isNonNegativeInteger, isRecord } from "./guards.js"
 import { formatCompactionSummary, type AgentMessage, type CompactionSummaryMessage } from "./messages.js"
 import { type ZiPaths, resolveZiPath } from "./paths.js"
 import { maxRetryCount } from "./retry.js"
@@ -1922,10 +1923,6 @@ function isBoundedPathList(value: unknown): value is string[] {
   )
 }
 
-function isNonNegativeInteger(value: unknown): value is number {
-  return typeof value === "number" && Number.isFinite(value) && Number.isInteger(value) && value >= 0
-}
-
 function validateJournal(entries: readonly SessionEntry[], file: string): void {
   const ids = new Set<string>()
   for (let index = 0; index < entries.length; index++) {
@@ -2104,10 +2101,6 @@ function lineBytes(lineWithoutNewline: string): number {
 
 function isValidTimestamp(value: unknown): value is string {
   return typeof value === "string" && Number.isFinite(Date.parse(value))
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
 }
 
 function assertNever(value: never): never {

@@ -1,3 +1,4 @@
+import { isNonNegativeFinite, isRecord } from "../guards.js"
 import {
   maxCodeModeCalls,
   maxCodeModeErrorBytes,
@@ -118,19 +119,20 @@ function isLiveCodeModeCall(value: unknown): value is CodeModeLiveCall {
     case "succeeded":
       return (
         hasOnlyKeys(value, "state", "id", "name", "arguments", "startedAt", "durationMs", "result") &&
-        duration(value.durationMs) &&
+        isNonNegativeFinite(value.durationMs) &&
         boundedString(value.result, maxCodeModeErrorBytes)
       )
     case "failed":
       return (
         hasOnlyKeys(value, "state", "id", "name", "arguments", "startedAt", "durationMs", "stage", "error") &&
-        duration(value.durationMs) &&
+        isNonNegativeFinite(value.durationMs) &&
         isCodeModeFailureStage(value.stage) &&
         boundedString(value.error, maxCodeModeErrorBytes)
       )
     case "aborted":
       return (
-        hasOnlyKeys(value, "state", "id", "name", "arguments", "startedAt", "durationMs") && duration(value.durationMs)
+        hasOnlyKeys(value, "state", "id", "name", "arguments", "startedAt", "durationMs") &&
+        isNonNegativeFinite(value.durationMs)
       )
     default:
       return false
@@ -143,15 +145,15 @@ function isLegacyCodeModeCall(value: unknown): value is CodeModeCall {
     case "running":
       return value.preview === undefined || boundedString(value.preview, maxCodeModeErrorBytes)
     case "succeeded":
-      return duration(value.durationMs) && boundedString(value.result, maxCodeModeErrorBytes)
+      return isNonNegativeFinite(value.durationMs) && boundedString(value.result, maxCodeModeErrorBytes)
     case "failed":
       return (
-        duration(value.durationMs) &&
+        isNonNegativeFinite(value.durationMs) &&
         (value.stage === undefined || isCodeModeFailureStage(value.stage)) &&
         boundedString(value.error, maxCodeModeErrorBytes)
       )
     case "aborted":
-      return duration(value.durationMs)
+      return isNonNegativeFinite(value.durationMs)
     default:
       return false
   }
@@ -164,17 +166,19 @@ function isTerminalCodeModeCall(value: unknown): value is CodeModeTerminalCall {
       return false
     case "succeeded":
       return (
-        hasOnlyKeys(value, "state", "id", "name", "arguments", "startedAt", "durationMs") && duration(value.durationMs)
+        hasOnlyKeys(value, "state", "id", "name", "arguments", "startedAt", "durationMs") &&
+        isNonNegativeFinite(value.durationMs)
       )
     case "failed":
       return (
         hasOnlyKeys(value, "state", "id", "name", "arguments", "startedAt", "durationMs", "stage") &&
-        duration(value.durationMs) &&
+        isNonNegativeFinite(value.durationMs) &&
         isCodeModeFailureStage(value.stage)
       )
     case "aborted":
       return (
-        hasOnlyKeys(value, "state", "id", "name", "arguments", "startedAt", "durationMs") && duration(value.durationMs)
+        hasOnlyKeys(value, "state", "id", "name", "arguments", "startedAt", "durationMs") &&
+        isNonNegativeFinite(value.durationMs)
       )
     default:
       return false
@@ -291,12 +295,4 @@ function isCodeModeJson(value: unknown): value is CodeModeJson {
 
 function boundedString(value: unknown, bytes: number): value is string {
   return typeof value === "string" && Buffer.byteLength(value) <= bytes
-}
-
-function duration(value: unknown): value is number {
-  return typeof value === "number" && Number.isFinite(value) && value >= 0
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
 }

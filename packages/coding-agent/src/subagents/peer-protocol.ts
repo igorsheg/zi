@@ -1,3 +1,5 @@
+import { isRecord } from "../guards.js"
+
 export const maxPeerMessageBytes = 64 * 1024
 export const maxPeerRequests = 8
 export const maxPeerRequestIdBytes = 64
@@ -147,8 +149,4 @@ function requireKeys(value: Record<string, unknown>, keys: readonly string[], op
   for (const key of keys) {
     if (!(key in value)) throw new Error(`Missing peer protocol field: ${key}`)
   }
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
 }

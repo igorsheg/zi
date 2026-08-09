@@ -1,4 +1,5 @@
 import { isCodeModeDetails, type CodeModeFailureStage, type CodeModeTraceCall } from "../../code-mode/trace.js"
+import { isRecord } from "../../guards.js"
 import { maxExpandedToolRows, type ToolPresentation, type ToolPresentationSource } from "./types.js"
 import {
   boundHead,
@@ -144,10 +145,6 @@ function callLabel(calls: number): string {
 
 function lineLabel(lines: number): string {
   return `${lines} ${lines === 1 ? "line" : "lines"}`
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
 }
 
 function assertNever(value: never): never {

@@ -14,6 +14,7 @@ import {
 } from "../packages/coding-agent/src/extensions/protocol.js"
 import { extensionApiModuleSource } from "../packages/coding-agent/src/extensions/public-api-module.js"
 import { extensionWorkerArgument } from "../packages/coding-agent/src/extensions/worker-entry.js"
+import { isRecord } from "../packages/coding-agent/src/guards.js"
 import { runCodeModeAcceptance } from "./code-mode-acceptance.js"
 import { assertPinnedBunVersion, compileStandalone } from "./compile-zi.js"
 import { runExtensionCustomToolAcceptance } from "./extension-custom-tool-acceptance.js"
@@ -559,10 +560,6 @@ function parseJsonLines(output: string): Record<string, unknown>[] {
       if (!isRecord(value)) throw new Error("Compiled RPC output must contain JSON objects")
       return value
     })
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
 }
 
 async function readNodeStream(stream: NodeJS.ReadableStream): Promise<string> {

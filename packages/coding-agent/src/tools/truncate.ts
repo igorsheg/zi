@@ -1,3 +1,4 @@
+import { isNonNegativeInteger, isRecord } from "../guards.js"
 import { countTextLines, splitTextLines } from "./lines.js"
 
 export const DEFAULT_MAX_LINES = 2_000
@@ -141,12 +142,4 @@ function tailBytes(text: string, maxBytes: number): string {
   let start = Math.max(0, buffer.length - maxBytes)
   while (start < buffer.length && (buffer[start]! & 0xc0) === 0x80) start++
   return buffer.subarray(start).toString()
-}
-
-function isNonNegativeInteger(value: unknown): value is number {
-  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
 }

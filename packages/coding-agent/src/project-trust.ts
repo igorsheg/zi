@@ -14,6 +14,7 @@ import { basename, dirname, isAbsolute, join, resolve } from "node:path"
 
 import lockfile from "proper-lockfile"
 
+import { isRecord } from "./guards.js"
 import type { ZiPaths } from "./paths.js"
 
 export const maxProjectTrustFileBytes = 1024 * 1024
@@ -311,10 +312,6 @@ function writeTrustFile(path: string, decisions: Record<string, boolean>): void 
   } finally {
     if (existsSync(temporary)) unlinkSync(temporary)
   }
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
 }
 
 function hasCode(error: unknown, code: string): boolean {

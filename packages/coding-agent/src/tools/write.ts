@@ -4,6 +4,7 @@ import { dirname } from "node:path"
 import type { AgentTool } from "@earendil-works/pi-agent-core"
 import { Type } from "@earendil-works/pi-ai"
 
+import { isNonNegativeInteger, isRecord } from "../guards.js"
 import { countTextLines } from "./lines.js"
 import { withFileMutation } from "./mutation-queue.js"
 import { resolveToolPath } from "./path.js"
@@ -131,12 +132,4 @@ function errorMessage(cause: unknown): string {
 
 function throwIfAborted(signal?: AbortSignal): void {
   if (signal?.aborted) throw new Error("Operation aborted")
-}
-
-function isNonNegativeInteger(value: unknown): value is number {
-  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
 }

@@ -2,6 +2,7 @@ import type { AgentTool, AgentToolResult, AgentToolUpdateCallback } from "@earen
 import { Type } from "@earendil-works/pi-ai"
 import { validateToolArguments } from "@earendil-works/pi-ai/compat"
 
+import { isRecord } from "../guards.js"
 import type { ProcessTreeTracker } from "../processes/process-tree.js"
 import type { SessionManager } from "../session-manager.js"
 import { isBuiltInToolError } from "../tools/outcome.js"
@@ -1140,8 +1141,4 @@ function assertNever(value: never): never {
 
 function isString(value: unknown): value is string {
   return typeof value === "string"
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
 }

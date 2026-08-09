@@ -15,6 +15,7 @@ import { basename, dirname, join } from "node:path"
 import type { Api, Model, ModelsStore, ModelsStoreEntry } from "@earendil-works/pi-ai"
 import lockfile from "proper-lockfile"
 
+import { isFiniteNumber, isNonNegativeFinite, isRecord } from "./guards.js"
 import type { ZiPaths } from "./paths.js"
 
 export const maxModelsStoreBytes = 32 * 1024 * 1024
@@ -306,20 +307,8 @@ function isThinkingLevelMap(value: unknown): boolean {
   )
 }
 
-function isFiniteNumber(value: unknown): value is number {
-  return typeof value === "number" && Number.isFinite(value)
-}
-
-function isNonNegativeFinite(value: unknown): value is number {
-  return isFiniteNumber(value) && value >= 0
-}
-
 function isPositiveFinite(value: unknown): value is number {
   return isFiniteNumber(value) && value > 0
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
 }
 
 function hasCode(error: unknown, code: string): boolean {

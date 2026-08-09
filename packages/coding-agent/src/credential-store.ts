@@ -14,6 +14,7 @@ import { basename, dirname, join } from "node:path"
 import type { Credential, CredentialStore } from "@earendil-works/pi-ai"
 import lockfile from "proper-lockfile"
 
+import { isRecord, isStringRecord } from "./guards.js"
 import type { ZiPaths } from "./paths.js"
 
 export const maxAuthFileBytes = 1024 * 1024
@@ -187,14 +188,6 @@ function isCredential(value: unknown): value is Credential {
     typeof value.expires === "number" &&
     Number.isFinite(value.expires)
   )
-}
-
-function isStringRecord(value: unknown): value is Record<string, string> {
-  return isRecord(value) && Object.values(value).every(item => typeof item === "string")
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
 }
 
 function hasCode(error: unknown, code: string): boolean {

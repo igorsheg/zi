@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test"
 
+import { isRecord } from "../src/guards.js"
 import { runRpcMode, type RpcMessagePage, type RpcServerFrame } from "../src/rpc/rpc-mode.js"
 import {
   createModels,
@@ -825,10 +826,6 @@ function isServerFrame(value: unknown): value is RpcServerFrame {
       value.type === "protocol_error" ||
       value.type === "response")
   )
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
 }
 
 function deferred<T>() {

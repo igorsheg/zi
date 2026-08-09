@@ -5,6 +5,7 @@ import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promis
 import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
 
+import { isRecord } from "../packages/coding-agent/src/guards.js"
 import { createProcessTreeTracker, type ProcessScope } from "../packages/coding-agent/src/processes/process-tree.js"
 import { SessionManager } from "../packages/coding-agent/src/session-manager.js"
 
@@ -901,10 +902,6 @@ function processAlive(pid: number): boolean {
 function record(value: unknown, label: string): Record<string, unknown> {
   if (!isRecord(value)) throw new Error(`${label} must be an object`)
   return value
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
 }
 
 if (import.meta.main) {

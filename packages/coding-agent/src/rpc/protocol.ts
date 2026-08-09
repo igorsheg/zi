@@ -1,5 +1,6 @@
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core"
 
+import { isRecord } from "../guards.js"
 import type { SettingsScope } from "../settings-manager.js"
 
 export const rpcProtocolVersion = 1 as const
@@ -341,8 +342,4 @@ function stripCarriageReturn(value: string): string {
 
 function oversizedFrame(): RpcFramingError {
   return new RpcFramingError(`RPC input records cannot exceed ${maxRpcFrameBytes} bytes`)
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
 }
