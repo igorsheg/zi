@@ -28,6 +28,7 @@ Legibility, local reasoning, and ease of change are the top priorities. Do not e
 - Do not mirror state between layers. Derive cheap values where they are rendered.
 - Do not add defensive branches for states made impossible by the types or owner.
 - Do validate external input, persisted data, provider data, and process boundaries.
+- Validate runtime JSON with the compiled TypeBox guards in `packages/coding-agent/src/guards.ts`; reach for that owner before writing another inline `isRecord` or sibling primitive guard, and extend it when a primitive check repeats. Byte-length, cross-field, cycle, and exact-message checks stay with their owning domain module instead of becoming schema indirection.
 - Bound queues, output, retries, subprocesses, retained UI data, and shutdown waits.
 - Treat interruption, cancellation, shutdown, and disposal as distinct owner transitions. Restore terminal resources before bounded settlement waits; only the layer that created a session disposes it.
 - Derive global `$HOME/.zi/agent` and exact `<cwd>/.zi` configuration through the immutable coding-agent `ZiPaths` owner. Settings, credentials, resources, and persistent session creation consume that cwd-bound value; do not join `.zi` or re-read process cwd inside those owners.
