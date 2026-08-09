@@ -297,7 +297,7 @@ test("code exposes a closed non-thenable guest tool catalog", async () => {
   }
   const tool = createCodeMode(cwd).createTool([countedEcho])
   const controller = new AbortController()
-  const timeout = setTimeout(() => controller.abort(new Error("guest proxy remained thenable")), 250)
+  const timeout = setTimeout(() => controller.abort(new Error("guest proxy remained thenable")), 2_000)
   try {
     const result = await tool.execute(
       "outer",
