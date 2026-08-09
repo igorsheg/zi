@@ -15,6 +15,7 @@ import {
 import { projectToolPresentation, type AgentMessage } from "@with-zi/coding-agent"
 import stringWidth from "string-width"
 
+import { createUserMessageSurface, formatUserMessageContent } from "../../components/user-message.js"
 import type { Theme } from "../../theme.js"
 import type { ActiveTool } from "../interactive-store.js"
 import {
@@ -73,7 +74,7 @@ export function createMessageItemView(
 ): TranscriptItemView | undefined {
   switch (message.role) {
     case "user":
-      return ownItem(ctx, createUserMessage(ctx, userContent(message.content), options.theme))
+      return ownItem(ctx, createUserMessage(ctx, formatUserMessageContent(message.content), options.theme))
     case "toolResult":
       return createToolResultView(
         ctx,
@@ -124,17 +125,7 @@ function ownItem(ctx: RenderContext, root: Renderable): TranscriptItemView {
 }
 
 function createUserMessage(ctx: RenderContext, content: string, theme: Theme): BoxRenderable {
-  const root = new BoxRenderable(ctx, {
-    width: "100%",
-    paddingTop: 1,
-    paddingBottom: 1,
-    paddingLeft: 1,
-    paddingRight: 1,
-    marginTop: 0,
-    marginBottom: 1,
-    backgroundColor: theme.surface.userMessage,
-    flexShrink: 0
-  })
+  const root = createUserMessageSurface(ctx, theme)
   root.add(new TextRenderable(ctx, { fg: theme.text.primary, content }))
   return root
 }
@@ -729,26 +720,6 @@ function createPanelMessage(ctx: RenderContext, content: string, color: string, 
   })
   root.add(new TextRenderable(ctx, { fg: color, content }))
   return root
-}
-
-function userContent(content: string | readonly { type: string; text?: string; mimeType?: string }[]): string {
-  if (typeof content === "string") return content
-  let output = ""
-  let imageCount = 0
-  let previousWasImage = false
-  for (const part of content) {
-    if (part.text !== undefined) {
-      if (previousWasImage && output && !/\s$/.test(output) && !/^\s/.test(part.text)) output += " "
-      output += part.text
-      previousWasImage = false
-      continue
-    }
-    if (!part.mimeType) continue
-    if (output && !/\s$/.test(output)) output += " "
-    output += `[image #${++imageCount}]`
-    previousWasImage = true
-  }
-  return output
 }
 
 function customPanelContent(message: Extract<AgentMessage, { role: "custom" }>): string {

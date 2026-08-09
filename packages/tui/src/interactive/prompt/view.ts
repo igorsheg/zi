@@ -165,6 +165,11 @@ export class PromptView {
     this.#input.attributes = secretInput ? TextAttributes.HIDDEN : 0
     this.#input.selectable = !secretInput
     if (secretInput) this.#renderer.clearSelection()
+    if (prompt.images !== this.#syncedImages) {
+      this.#syncedImages = prompt.images
+      this.#composer.syncImageMarkers(prompt.images)
+    }
+    const composerRows = this.#composer.update(geometry, composerSlots(prompt.images.length))
     const authCeremonyRows = this.#authCeremony.update(prompt.authCeremony, this.#renderer.width)
     const pickerOpen = Boolean(this.#store.picker.presentation(this.#input.plainText))
     const greeterRows = this.#greeter.update(
@@ -175,7 +180,8 @@ export class PromptView {
     )
     const queuedInputs = session.queuedInputs
     const queueActive = queuedInputs.steering.length > 0 || queuedInputs.followUp.length > 0
-    const fixedRowsWithoutFooter = geometry.protectedRows + greeterRows + transcriptStatusRows + authCeremonyRows
+    const otherFixedRows = greeterRows + transcriptStatusRows + authCeremonyRows
+    const fixedRowsWithoutFooter = geometry.protectedRows + otherFixedRows
     // The transcript owns one row; an active queue needs one summary row before ambient metadata is admitted.
     const reservedContentRows = 1 + (queueActive ? 1 : 0)
     const footerFits =
@@ -190,12 +196,8 @@ export class PromptView {
     const pickerVisible = this.#pickerStack.update(Math.max(0, this.#renderer.height - fixedRows))
 
     if (pickerVisible) this.#queue.hide()
-    else this.#queue.update(queuedInputs, Math.max(0, this.#renderer.height - fixedRows))
-    if (prompt.images !== this.#syncedImages) {
-      this.#syncedImages = prompt.images
-      this.#composer.syncImageMarkers(prompt.images)
-    }
-    this.#composer.update(geometry, composerSlots(prompt.images.length))
+    else
+      this.#queue.update(queuedInputs, Math.max(0, this.#renderer.height - composerRows - otherFixedRows - footerRows))
   }
 
   #submit(delivery: "steer" | "followUp"): void {

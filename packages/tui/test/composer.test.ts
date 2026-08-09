@@ -697,6 +697,27 @@ function fakeHistory(texts: readonly string[]): ComposerHistorySource & { append
   }
 }
 
+test("composer reports its current visual row occupancy", async () => {
+  const setup = await createTestRenderer({ width: 20, height: 20, useThread: false })
+  const geometry = composerGeometry(20, 20)
+  const slots = { topLeft: "", topRight: [] }
+  const composer = createComposer(setup.renderer, { geometry, slots, theme: defaultTheme, onSubmit() {} })
+  setup.renderer.root.add(composer.root)
+
+  try {
+    expect(composer.update(geometry, slots)).toBe(3)
+
+    composer.input.setText("one\ntwo\nthree")
+    expect(composer.update(geometry, slots)).toBe(5)
+
+    composer.input.setText("x".repeat(100))
+    expect(composer.update(geometry, slots)).toBe(7)
+  } finally {
+    composer.destroy()
+    if (!setup.renderer.isDestroyed) setup.renderer.destroy()
+  }
+})
+
 test("reapplying the same composer presentation does not schedule another frame", async () => {
   const setup = await createTestRenderer({ width: 40, height: 8, useThread: false })
   const geometry = composerGeometry(40, 8)

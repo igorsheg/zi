@@ -66,7 +66,7 @@ export interface Composer {
   historyNext(): ComposerHistoryResult
   replaceText(text: string, cursorOffset?: number): void
   replaceRange(edit: ComposerRangeEdit): ComposerRangeReplacementResult
-  update(geometry: ComposerGeometry, slots: ComposerSlots): void
+  update(geometry: ComposerGeometry, slots: ComposerSlots): number
   destroy(): void
 }
 
@@ -411,7 +411,7 @@ export function createComposer(ctx: RenderContext, options: ComposerOptions): Co
     update(nextGeometry, nextSlots) {
       const geometryChanged = !sameGeometry(geometry, nextGeometry)
       const slotsChanged = !sameSlots(slots, nextSlots)
-      if (!geometryChanged && !slotsChanged) return
+      if (!geometryChanged && !slotsChanged) return occupiedRows(input, geometry)
       const retainedSlots = slotsChanged ? retainSlots(nextSlots) : slots
 
       const borderChanged = geometry.bordered !== nextGeometry.bordered
@@ -431,6 +431,7 @@ export function createComposer(ctx: RenderContext, options: ComposerOptions): Co
       if (geometry.bordered && (borderChanged || topLeftChanged)) root.title = slots.topLeft
       if (editorRowsChanged) input.maxHeight = geometry.editorRows
       if (railChanged) root.requestRender()
+      return occupiedRows(input, geometry)
     },
     destroy() {
       historyState = { type: "idle" }
@@ -441,6 +442,14 @@ export function createComposer(ctx: RenderContext, options: ComposerOptions): Co
 }
 
 const railItemSeparator = " • "
+
+function occupiedRows(input: TextareaRenderable, geometry: ComposerGeometry): number {
+  const borderRows = geometry.bordered ? 2 : 0
+  const editorColumns = Math.max(1, geometry.columns - (geometry.bordered ? 2 : 0))
+  const measured = input.editorView.measureForDimensions(editorColumns, geometry.editorRows)
+  const editorRows = Math.max(1, Math.min(geometry.editorRows, measured?.lineCount ?? input.lineCount))
+  return editorRows + borderRows
+}
 
 function layoutRail(geometry: ComposerGeometry, slots: ComposerSlots): RailLayout {
   if (!geometry.bordered || slots.topRight.length === 0) return { topRightText: "", topRightWidth: 0 }

@@ -1,6 +1,8 @@
 import { expect, test } from "bun:test"
 
 import { BoxRenderable, TextareaRenderable } from "@opentui/core"
+import { createTestRenderer } from "@opentui/core/testing"
+import type { QueuedInput } from "@with-zi/coding-agent"
 import {
   createModels,
   createTestAgentRuntime as createAgentRuntime,
@@ -10,6 +12,9 @@ import {
 } from "@with-zi/coding-agent/testing"
 
 import type { ClipboardWriter, ClipboardWriteResult } from "../../src/interactive/clipboard.js"
+import { InteractiveKeybindings } from "../../src/interactive/interactive-keybindings.js"
+import { QueuedInputsView } from "../../src/interactive/prompt/queue-view.js"
+import { defaultTheme } from "../../src/theme.js"
 import { createInteractiveTest } from "./harness.js"
 
 test("real prompt keys admit, present, and restore steering and follow-up queues", async () => {
@@ -26,7 +31,7 @@ test("real prompt keys admit, present, and restore steering and follow-up queues
     }
   ])
   const { session } = await createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
-  const setup = await createInteractiveTest(session, { width: 48, height: 14, kittyKeyboard: true })
+  const setup = await createInteractiveTest(session, { width: 60, height: 24, kittyKeyboard: true })
 
   try {
     await setup.renderOnce()
@@ -62,10 +67,24 @@ test("real prompt keys admit, present, and restore steering and follow-up queues
     expect(session.queuedInputs.followUp.map(entry => entry.text)).toEqual(["follow-up"])
     expect(session.latestPromptHistoryEntry()?.text).toBe("start")
     const queuedFrame = setup.captureCharFrame()
-    expect(queuedFrame).toContain("Steering: steering first line")
-    expect(queuedFrame).not.toContain("second line")
-    expect(queuedFrame).toContain("Follow-up: follow-up")
-    expect(queuedFrame).toContain("↳ Alt+Up to edit all queued messages")
+    expect(queuedFrame).toContain("Steering")
+    expect(queuedFrame).toContain("steering first line")
+    expect(queuedFrame).toContain("second line")
+    expect(queuedFrame).toContain("Follow-up")
+    expect(queuedFrame).toContain("follow-up")
+    expect(queuedFrame).toContain("Alt+Up to edit all queued messages")
+    // Pending and committed user messages share geometry while pending delivery
+    // remains visually distinct through its transparent surface and dim label.
+    const queueSpans = setup.captureSpans().lines.flatMap(line => line.spans)
+    expect(queueSpans.find(span => span.text === "Steering")?.fg.toInts()).toEqual([106, 110, 108, 255])
+    expect(queueSpans.find(span => span.text === "steering first line")?.fg.toInts()).toEqual([197, 201, 199, 255])
+    expect(queueSpans.find(span => span.text === "Follow-up")?.fg.toInts()).toEqual([106, 110, 108, 255])
+    expect(queueSpans.find(span => span.text === "follow-up")?.fg.toInts()).toEqual([197, 201, 199, 255])
+    const steeringBlock = setup.renderer.root.findDescendantById(`queued-${session.queuedInputs.steering[0]?.id}`)
+    if (!(steeringBlock instanceof BoxRenderable)) throw new Error("Steering block not found")
+    const steeringSurface = steeringBlock.getChildren()[0]
+    if (!(steeringSurface instanceof BoxRenderable)) throw new Error("Steering surface not found")
+    expect(steeringSurface.backgroundColor.toInts()[3]).toBe(0)
 
     input.setText("draft")
     input.gotoBufferEnd()
@@ -91,6 +110,55 @@ test("real prompt keys admit, present, and restore steering and follow-up queues
   } finally {
     session.dispose()
     setup.destroy()
+  }
+})
+
+test("queued message blocks never exceed their assigned rows", async () => {
+  const setup = await createTestRenderer({ width: 24, height: 12, useThread: false })
+  const view = new QueuedInputsView(setup.renderer, new InteractiveKeybindings(), defaultTheme)
+  setup.renderer.root.add(view.root)
+
+  try {
+    view.update(
+      {
+        steering: [queuedInput(1, "steer", Array.from({ length: 40 }, (_, index) => `line-${index}`).join("\n"))],
+        followUp: []
+      },
+      6
+    )
+    await setup.renderOnce()
+
+    expect(view.root.height).toBe(6)
+    expect(setup.captureCharFrame()).toContain("line-0")
+    expect(setup.captureCharFrame()).toContain("…")
+
+    view.update({ steering: [queuedInput(2, "steer", "界界界界界界界界界界界界")], followUp: [] }, 6)
+    await setup.renderOnce()
+
+    expect(view.root.height).toBeLessThanOrEqual(6)
+    const cjkRows = setup
+      .captureCharFrame()
+      .split("\n")
+      .filter(row => row.includes("界"))
+    expect(cjkRows).toEqual([expect.stringContaining("界界界界界界界界界界"), expect.stringContaining("界界")])
+    expect(setup.renderer.root.findDescendantById("queued-1")).toBeUndefined()
+
+    view.update({ steering: [queuedInput(3, "steer", "first"), queuedInput(4, "steer", "later")], followUp: [] }, 6)
+    await setup.renderOnce()
+    expect(setup.captureCharFrame()).toContain("… 1 more queued")
+
+    view.update(
+      {
+        steering: [],
+        followUp: [queuedInput(5, "followUp", "", [{ type: "image", mimeType: "image/png", data: "AAAA" }])]
+      },
+      6
+    )
+    await setup.renderOnce()
+    expect(setup.captureCharFrame()).toContain("[image #1]")
+  } finally {
+    view.destroy()
+    if (!setup.renderer.isDestroyed) setup.renderer.destroy()
   }
 })
 
@@ -126,7 +194,9 @@ test("a maximum queue preserves the constrained composer and Ctrl+C leaves pendi
     expect(session.queuedInputs.steering).toHaveLength(32)
     const overflowFrame = setup.captureCharFrame()
     expect(overflowFrame).toContain("Queue capacity exceeded")
-    expect(overflowFrame).toContain("… 32 more queued")
+    // A constrained composer yields the compact summary rather than blocks.
+    expect(overflowFrame).toContain("32 queued")
+    expect(overflowFrame).toContain("Alt+Up to edit all")
     expect(overflowFrame).toContain("keep this exact draft")
     const footer = setup.renderer.root.findDescendantById("prompt-footer")
     if (!(footer instanceof BoxRenderable)) throw new Error("Prompt footer not found")
@@ -140,7 +210,7 @@ test("a maximum queue preserves the constrained composer and Ctrl+C leaves pendi
     expect(input.plainText).toBe("")
     expect(session.queuedInputs.steering).toHaveLength(32)
     await setup.renderOnce()
-    expect(setup.captureCharFrame()).toContain("… 32 more queued")
+    expect(setup.captureCharFrame()).toContain("32 queued")
 
     session.takeQueuedInputs()
     release.resolve()
@@ -151,7 +221,75 @@ test("a maximum queue preserves the constrained composer and Ctrl+C leaves pendi
   }
 })
 
-test("Escape restores grouped duplicates immediately and queue rows truncate as dim single lines", async () => {
+test("a multiline draft and pending block share one terminal row budget", async () => {
+  const models = createModels()
+  const faux = fauxProvider()
+  models.setProvider(faux.provider)
+  const providerStarted = deferred<void>()
+  const release = deferred<void>()
+  faux.setResponses([
+    async () => {
+      providerStarted.resolve()
+      await release.promise
+      return fauxAssistantMessage("done")
+    }
+  ])
+  const { session } = await createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
+  const setup = await createInteractiveTest(session, { width: 30, height: 14, kittyKeyboard: true })
+
+  try {
+    await setup.renderOnce()
+    const input = setup.renderer.root.findDescendantById("prompt-input")
+    if (!(input instanceof TextareaRenderable)) throw new Error("Prompt textarea not found")
+    input.setText("start")
+    setup.mockInput.pressEnter()
+    await providerStarted.promise
+
+    session.steer("queued first\nqueued second")
+    input.setText("draft one\ndraft two\ndraft three\ndraft four")
+    await setup.renderOnce()
+
+    const block = setup.renderer.root.findDescendantById(`queued-${session.queuedInputs.steering[0]?.id}`)
+    const composer = setup.renderer.root.findDescendantById("prompt-composer")
+    if (!(block instanceof BoxRenderable) || !(composer instanceof BoxRenderable)) {
+      throw new Error("Prompt layout not found")
+    }
+    expect(block.screenY + block.height).toBeLessThanOrEqual(composer.screenY)
+    expect(composer.height).toBe(6)
+    expect(composer.screenY + composer.height).toBeLessThanOrEqual(setup.renderer.height)
+    expect(setup.captureCharFrame()).toContain("queued second")
+    expect(setup.captureCharFrame()).toContain("draft four")
+
+    const footer = setup.renderer.root.findDescendantById("prompt-footer")
+    const oldEntryId = session.queuedInputs.steering[0]?.id
+    if (!(footer instanceof BoxRenderable) || oldEntryId === undefined) throw new Error("Prompt footer not found")
+    input.setText("")
+    await setup.mockInput.typeText("/m", 0)
+    await setup.renderOnce()
+    expect(setup.captureCharFrame()).not.toContain("queued second")
+    expect(footer.visible).toBe(false)
+
+    session.takeQueuedInputs()
+    session.steer("replacement queue message")
+    const replacementId = session.queuedInputs.steering[0]?.id
+    input.setText("")
+    await setup.renderOnce()
+    expect(setup.captureCharFrame()).toContain("replacement queue message")
+    expect(setup.captureCharFrame()).not.toContain("queued second")
+    expect(setup.renderer.root.findDescendantById(`queued-${oldEntryId}`)).toBeUndefined()
+    expect(setup.renderer.root.findDescendantById(`queued-${replacementId}`)).toBeInstanceOf(BoxRenderable)
+    expect(footer.visible).toBe(true)
+
+    session.takeQueuedInputs()
+    release.resolve()
+    await session.waitForIdle()
+  } finally {
+    session.dispose()
+    setup.destroy()
+  }
+})
+
+test("Escape restores grouped duplicates after presenting multiline queue bodies", async () => {
   const models = createModels()
   const faux = fauxProvider()
   models.setProvider(faux.provider)
@@ -181,10 +319,13 @@ test("Escape restores grouped duplicates immediately and queue rows truncate as 
     await setup.renderOnce()
 
     const queuedFrame = setup.captureCharFrame()
-    expect(queuedFrame).toContain("Steering: 界界界界界界界...")
-    expect(queuedFrame).not.toContain("hidden")
+    expect(queuedFrame).toContain("Steering")
+    expect(queuedFrame).toContain("界界界界界界界界界界界界")
+    expect(queuedFrame).toContain("hidden")
     const queueSpans = setup.captureSpans().lines.flatMap(line => line.spans)
-    expect(queueSpans.find(span => span.text.includes("Steering:"))?.fg.toInts()).toEqual([106, 110, 108, 255])
+    // The pending body carries the user-message primary text; the label stays dim.
+    expect(queueSpans.find(span => span.text === "Steering")?.fg.toInts()).toEqual([106, 110, 108, 255])
+    expect(queueSpans.find(span => span.text === "hidden")?.fg.toInts()).toEqual([197, 201, 199, 255])
 
     setup.mockInput.pressEscape()
     expect(input.plainText).toBe("界界界界界界界界界界界界\nhidden\n\nduplicate\n\nduplicate\n\nexisting draft")
@@ -228,6 +369,9 @@ test("restored queued images remain attached when the draft is resubmitted", asy
     setup.mockInput.pressEnter()
     await providerStarted.promise
     session.followUp("with image", [image])
+    await setup.renderOnce()
+    expect(setup.captureCharFrame()).toContain("with image [image #1]")
+
     setup.mockInput.pressArrow("up", { meta: true })
     await setup.renderOnce()
 
@@ -356,6 +500,15 @@ function messageText(message: { role: string; content?: unknown }): string {
       return part.text
     })
     .join("\n")
+}
+
+function queuedInput(
+  id: number,
+  delivery: QueuedInput["delivery"],
+  text: string,
+  images: QueuedInput["images"] = []
+): QueuedInput {
+  return { id, delivery, text, images, bytes: Buffer.byteLength(text) }
 }
 
 function deferred<T>() {
