@@ -4,7 +4,7 @@ import { mkdtemp, readFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
-import { defaultShellLimits, SessionShell, type ShellLimits } from "../src/session-shell.js"
+import { defaultShellLimits, SessionShell, ShellRunAdmissionError, type ShellLimits } from "../src/session-shell.js"
 import { createBashTool, isBashToolDetails } from "../src/tools/bash.js"
 import { projectToolPresentation } from "../src/tools/presentation/project.js"
 import { createKillTaskTool, createTaskOutputTool, isTaskOutputToolDetails } from "../src/tools/shell-tasks.js"
@@ -350,6 +350,70 @@ test("aggregate output retention evicts the oldest completed spill before admitt
     expect(existsSync(firstOutput.path)).toBe(false)
     expect(second.task.output.fullOutput).toMatchObject({ type: "available", bytes: 800 })
   } finally {
+    await shell.dispose()
+    rmSync(cwd, { recursive: true, force: true })
+  }
+})
+
+test("starting foreground admission rejects a reentrant foreground run", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "zi-bash-reentrant-"))
+  const shell = createShell(cwd)
+  let attempted = false
+  let rejection: unknown
+  const unsubscribe = shell.subscribe(taskId => {
+    const task = shell.snapshot(taskId)
+    if (attempted || task?.type !== "starting" || task.placement !== "foreground") return
+    attempted = true
+    try {
+      void shell.run("bash-reentrant-second", { command: "printf second", timeoutMs: 2_000, background: false })
+    } catch (cause) {
+      rejection = cause
+    }
+  })
+
+  try {
+    const first = await shell.run("bash-reentrant-first", {
+      command: "printf first",
+      timeoutMs: 2_000,
+      background: false
+    })
+    expect(first).toMatchObject({ type: "completed", task: { output: { text: "first" } } })
+    expect(rejection).toBeInstanceOf(ShellRunAdmissionError)
+    expect(rejection).toMatchObject({ reason: "foreground-busy" })
+    expect(shell.snapshots()).toHaveLength(1)
+  } finally {
+    unsubscribe()
+    await shell.dispose()
+    rmSync(cwd, { recursive: true, force: true })
+  }
+})
+
+test("completed eviction forgets scheduled updates and retained output", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "zi-bash-forget-"))
+  const shell = createShell(cwd, { maxCompletedTasks: 1 })
+  const updates: string[] = []
+  const unsubscribe = shell.subscribe(taskId => updates.push(taskId))
+
+  try {
+    const first = await shell.run("bash-forget-first", {
+      command: `node -e "process.stdout.write('first');setTimeout(()=>process.stdout.write('second'),10)"`,
+      timeoutMs: 2_000,
+      background: false
+    })
+    if (first.type !== "completed") throw new Error("Expected completed first task")
+    const firstOutput = first.task.output.fullOutput
+    if (firstOutput.type !== "available") throw new Error("Expected retained first output")
+
+    await shell.run("bash-forget-second", { command: "printf replacement", timeoutMs: 2_000, background: false })
+    expect(shell.snapshot(first.task.taskId)).toBeUndefined()
+    expect(existsSync(firstOutput.path)).toBe(false)
+    expect(shell.snapshots()).toHaveLength(1)
+
+    const updateCount = updates.filter(taskId => taskId === first.task.taskId).length
+    await Bun.sleep(150)
+    expect(updates.filter(taskId => taskId === first.task.taskId)).toHaveLength(updateCount)
+  } finally {
+    unsubscribe()
     await shell.dispose()
     rmSync(cwd, { recursive: true, force: true })
   }

@@ -586,6 +586,39 @@ test("concurrent model waits claim once and nested Code Mode release restores ca
   }
 }, 15_000)
 
+test("completion durability commits before entry observers can claim it", async () => {
+  const harness = await createHarness("completion-commit-order", { reply: "claimed-after-commit", delayMs: 20 })
+  let claimed: ReturnType<SubagentSupervisor["waitForTool"]> | undefined
+  const unsubscribe = harness.supervisor.subscribe(event => {
+    if (
+      event.type === "entry_appended" &&
+      event.entry.type === "subagent" &&
+      event.entry.event === "work_cycle_finished"
+    ) {
+      claimed ??= harness.supervisor.waitForTool(["cycle-worker"], 0, undefined, "entry-observer")
+    }
+  })
+  try {
+    await harness.supervisor.spawn("cycle-worker", "first cycle")
+    await waitFor(() => claimed !== undefined, 5_000)
+    if (!claimed) throw new Error("Expected the completion entry observer to claim the result")
+
+    expect(await claimed).toEqual([
+      expect.objectContaining({
+        name: "cycle-worker",
+        completionDelivery: "claimed",
+        completion: expect.objectContaining({ text: "claimed-after-commit" })
+      })
+    ])
+    expect(harness.supervisor.status().readyNames).toEqual([])
+    harness.supervisor.releaseCompletionClaims("entry-observer")
+    expect(harness.supervisor.status().readyNames).toEqual(["cycle-worker"])
+  } finally {
+    unsubscribe()
+    await harness.dispose()
+  }
+}, 15_000)
+
 test("a multi-agent wait drains each oldest pending cycle independently", async () => {
   const harness = await createHarness("later-cycle-timeout", { reply: "cycle-ok", delayMs: 300 })
   try {

@@ -234,7 +234,7 @@ export class SessionShell {
     this.#evictExpired()
     assertRunRequest(request, this.limits)
     if (signal?.aborted) throw new Error("Command aborted")
-    if (!request.background && this.#foregroundTask()) {
+    if (!request.background && this.#hasForegroundAdmission()) {
       throw new ShellRunAdmissionError("foreground-busy", "Another foreground shell command is running")
     }
     if (request.background && this.#backgroundCount() >= this.limits.maxBackgroundTasks) {
@@ -258,7 +258,7 @@ export class SessionShell {
       path: this.#outputPath(taskId),
       maxBytes: this.limits.maxOutputFileBytes,
       reserve: bytes => this.#reserveOutput(bytes),
-      release: bytes => (this.#retainedOutputBytes -= bytes),
+      release: bytes => this.#releaseOutput(bytes),
       changed: () => this.#scheduleUpdate(taskId),
       limitReached: () => this.#stop(taskId, "output-limit"),
       failed: cause => this.#stop(taskId, "output-error", cause.message)
@@ -273,7 +273,12 @@ export class SessionShell {
       onUpdate
     }
     this.#tasks.set(taskId, starting)
+    this.#assertStableInvariants()
     this.#emit(taskId)
+    if (this.#state.type !== "open") {
+      this.#beginSettlement(starting, { type: "disposed" })
+      return toolSettled.promise
+    }
 
     let child: ChildProcessWithoutNullStreams
     try {
@@ -299,6 +304,7 @@ export class SessionShell {
         }
       : { ...identity, type: "foreground", child, timeout, removeAbort, output, processSettled, toolSettled, onUpdate }
     this.#tasks.set(taskId, running)
+    this.#assertStableInvariants()
     output.pipe(child.stdout)
     output.pipe(child.stderr)
     child.once("error", cause => this.#onProcessError(taskId, cause))
@@ -323,6 +329,7 @@ export class SessionShell {
     task.removeAbort?.()
     const background: BackgroundTask = { ...task, type: "background", removeAbort: undefined }
     this.#tasks.set(task.taskId, background)
+    this.#assertStableInvariants()
     const snapshot = this.#snapshot(background)
     task.toolSettled.resolve({ type: "backgrounded", task: snapshot })
     this.#emit(task.taskId)
@@ -403,11 +410,19 @@ export class SessionShell {
       }
     }
 
-    for (const task of this.#tasks.values()) task.output.evict()
-    this.#tasks.clear()
+    for (const taskId of this.#tasks.keys()) this.#forgetTask(taskId)
     if (this.#outputDir) rmSync(this.#outputDir, { recursive: true, force: true })
+    this.#outputDir = undefined
     this.#listeners.clear()
+    this.#assertTerminalCleanup()
     if (failure) throw failure
+  }
+
+  #hasForegroundAdmission(): boolean {
+    for (const task of this.#tasks.values()) {
+      if (task.type === "foreground" || (task.type === "starting" && task.placement === "foreground")) return true
+    }
+    return false
   }
 
   #foregroundTask(): ForegroundTask | undefined {
@@ -432,6 +447,7 @@ export class SessionShell {
     const killTimer = setTimeout(() => kill(task.child, "SIGKILL"), this.limits.killGraceMs)
     const stopping: StoppingTask = { ...task, type: "stopping", reason, failure, killTimer }
     this.#tasks.set(taskId, stopping)
+    this.#assertStableInvariants()
     this.#emit(taskId)
     return true
   }
@@ -463,6 +479,7 @@ export class SessionShell {
     }
     const settling: SettlingTask = { ...task, type: "settling", outcome }
     this.#tasks.set(task.taskId, settling)
+    this.#assertStableInvariants()
     this.#emit(task.taskId)
     void this.#finishSettlement(settling)
   }
@@ -520,11 +537,12 @@ export class SessionShell {
       expiresAt: completedAt + this.limits.completedTaskTtlMs
     }
     this.#tasks.set(task.taskId, completed)
+    this.#enforceCompletedLimit()
+    this.#scheduleEviction()
+    this.#assertStableInvariants()
     const snapshot = this.#snapshot(completed)
     task.processSettled.resolve(snapshot)
     task.toolSettled.resolve({ type: "completed", task: snapshot })
-    this.#enforceCompletedLimit()
-    this.#scheduleEviction()
     this.#emit(task.taskId)
   }
 
@@ -603,6 +621,7 @@ export class SessionShell {
   }
 
   #reserveOutput(requested: number): number {
+    this.#assertRetainedOutputBound()
     if (requested <= 0) return 0
     if (this.#retainedOutputBytes + requested > this.limits.maxRetainedOutputBytes) {
       for (const task of this.#completedByAge()) {
@@ -616,7 +635,14 @@ export class SessionShell {
     const available = Math.max(0, this.limits.maxRetainedOutputBytes - this.#retainedOutputBytes)
     const admitted = Math.min(requested, available)
     this.#retainedOutputBytes += admitted
+    this.#assertRetainedOutputBound()
     return admitted
+  }
+
+  #releaseOutput(bytes: number): void {
+    invariant(bytes <= this.#retainedOutputBytes, "released output exceeds the retained total")
+    this.#retainedOutputBytes -= bytes
+    this.#assertRetainedOutputBound()
   }
 
   #completedByAge(): CompletedTask[] {
@@ -628,22 +654,20 @@ export class SessionShell {
   #enforceCompletedLimit(): void {
     const completed = this.#completedByAge()
     for (const task of completed.slice(0, Math.max(0, completed.length - this.limits.maxCompletedTasks))) {
-      task.output.evict()
-      this.#tasks.delete(task.taskId)
-      this.#emit(task.taskId)
+      this.#forgetTask(task.taskId)
     }
   }
 
   #evictExpired(): void {
     if (this.#state.type !== "open") return
     const now = Date.now()
+    let evicted = false
     for (const task of this.#completedByAge()) {
       if (task.expiresAt > now) break
-      task.output.evict()
-      this.#tasks.delete(task.taskId)
-      this.#emit(task.taskId)
+      evicted = this.#forgetTask(task.taskId) || evicted
     }
     this.#scheduleEviction()
+    if (evicted) this.#assertStableInvariants()
   }
 
   #scheduleEviction(): void {
@@ -654,6 +678,65 @@ export class SessionShell {
     if (!next) return
     this.#evictionTimer = setTimeout(() => this.#evictExpired(), Math.max(0, next.expiresAt - Date.now()))
     this.#evictionTimer.unref?.()
+  }
+
+  #forgetTask(taskId: string): boolean {
+    const task = this.#tasks.get(taskId)
+    if (!task) return false
+    const updateTimer = this.#updateTimers.get(taskId)
+    if (updateTimer) clearTimeout(updateTimer)
+    this.#updateTimers.delete(taskId)
+    this.#lastUpdates.delete(taskId)
+    task.output.evict()
+    this.#tasks.delete(taskId)
+    this.#emit(taskId)
+    return true
+  }
+
+  #assertRetainedOutputBound(): void {
+    invariant(
+      this.#retainedOutputBytes >= 0 && this.#retainedOutputBytes <= this.limits.maxRetainedOutputBytes,
+      "retained output exceeds its session bound"
+    )
+  }
+
+  #assertStableInvariants(): void {
+    let foregroundAdmissions = 0
+    let backgroundTasks = 0
+    let completedTasks = 0
+    let retainedOutputBytes = 0
+    for (const task of this.#tasks.values()) {
+      if (task.type === "foreground" || (task.type === "starting" && task.placement === "foreground")) {
+        foregroundAdmissions++
+      }
+      if (task.type === "background" || (task.type === "starting" && task.placement === "background")) {
+        backgroundTasks++
+      }
+      if (task.type === "completed") completedTasks++
+      else invariant(task.output.available, `active task ${task.taskId} has no retained output`)
+      retainedOutputBytes += task.output.retainedBytes
+    }
+    invariant(foregroundAdmissions <= 1, "multiple foreground tasks were admitted")
+    invariant(backgroundTasks <= this.limits.maxBackgroundTasks, "background task capacity was exceeded")
+    invariant(completedTasks <= this.limits.maxCompletedTasks, "completed task capacity was exceeded")
+    invariant(retainedOutputBytes === this.#retainedOutputBytes, "retained output accounting diverged")
+    this.#assertRetainedOutputBound()
+    for (const taskId of this.#updateTimers.keys()) {
+      invariant(this.#tasks.has(taskId), `forgotten task ${taskId} retains an update timer`)
+    }
+    for (const taskId of this.#lastUpdates.keys()) {
+      invariant(this.#tasks.has(taskId), `forgotten task ${taskId} retains update history`)
+    }
+  }
+
+  #assertTerminalCleanup(): void {
+    invariant(this.#tasks.size === 0, "disposed shell retains tasks")
+    invariant(this.#updateTimers.size === 0, "disposed shell retains update timers")
+    invariant(this.#lastUpdates.size === 0, "disposed shell retains update history")
+    invariant(this.#retainedOutputBytes === 0, "disposed shell retains output")
+    invariant(this.#evictionTimer === undefined, "disposed shell retains its eviction timer")
+    invariant(this.#outputDir === undefined, "disposed shell retains its output directory")
+    invariant(this.#listeners.size === 0, "disposed shell retains listeners")
   }
 
   #outputPath(taskId: string): string {
@@ -754,6 +837,10 @@ class TaskOutput {
     return !this.#evicted
   }
 
+  get retainedBytes(): number {
+    return this.#evicted ? 0 : this.#retainedBytes
+  }
+
   pipe(source: NodeJS.ReadableStream): void {
     const listener = (chunk: Buffer) => {
       this.#totalBytes += chunk.length
@@ -770,6 +857,7 @@ class TaskOutput {
           this.#file.once("drain", () => source.resume())
         }
       }
+      this.#assertLocalBounds()
       if (admitted < chunk.length && !this.#limitNotified) {
         this.#limitNotified = true
         this.#limitReached()
@@ -820,6 +908,11 @@ class TaskOutput {
     this.#detachSources()
     this.#file.destroy()
     this.evict()
+  }
+
+  #assertLocalBounds(): void {
+    invariant(this.#retainedBytes >= 0 && this.#retainedBytes <= this.#maxBytes, "task output exceeds its file bound")
+    invariant(this.#retainedBytes <= this.#totalBytes, "task output retention exceeds observed output")
   }
 
   #detachSources(): void {
@@ -957,6 +1050,10 @@ function countByte(buffer: Buffer, byte: number): number {
 
 function errorMessage(cause: unknown): string {
   return cause instanceof Error ? cause.message : String(cause)
+}
+
+function invariant(condition: boolean, message: string): asserts condition {
+  if (!condition) throw new Error(`SessionShell invariant failed: ${message}`)
 }
 
 function assertNever(value: never): never {

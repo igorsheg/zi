@@ -379,6 +379,173 @@ test("RPC lists and invokes extension commands without slash parsing", async () 
   }
 })
 
+test("RPC rejects duplicate in-flight request IDs across ordinary and interruption slots", async () => {
+  const runtime = await createTestAgentRuntime({
+    cwd: "/work",
+    models: createModels(),
+    session: { type: "new", persist: false }
+  })
+  const input = new RpcTestInput()
+  const output = new RpcTestOutput()
+  const gates = [deferred<void>(), deferred<void>()]
+  let invocationCount = 0
+  runtime.session.listExtensionCommands = () => [
+    { name: "blocking", description: "Block", argumentHint: "", extensionId: "blocking" }
+  ]
+  runtime.session.invokeExtensionCommand = async () => {
+    const gate = gates[invocationCount]
+    invocationCount++
+    if (!gate) throw new Error("Unexpected invocation")
+    await gate.promise
+    return `Invocation ${invocationCount}`
+  }
+  const running = runRpcMode(runtime.session, { input, writer: output })
+
+  try {
+    await output.frame(frame => frame.type === "ready")
+    input.send(blockingCommandRequest("ordinary-duplicate"), blockingCommandRequest("ordinary-duplicate"))
+    expect(
+      await output.frame(frame => frame.type === "protocol_error" && frame.id === "ordinary-duplicate")
+    ).toMatchObject({ code: "invalid_request", id: "ordinary-duplicate" })
+    expect(invocationCount).toBe(1)
+    gates[0]!.resolve()
+    expect(await output.response("ordinary-duplicate")).toMatchObject({ ok: true })
+    expect(output.frames.filter(frame => frame.type === "response" && frame.id === "ordinary-duplicate")).toHaveLength(
+      1
+    )
+
+    input.send(blockingCommandRequest("cross-slot"), { version: 1, id: "cross-slot", method: "session.interrupt" })
+    expect(await output.frame(frame => frame.type === "protocol_error" && frame.id === "cross-slot")).toMatchObject({
+      code: "invalid_request",
+      id: "cross-slot"
+    })
+    expect(invocationCount).toBe(2)
+    gates[1]!.resolve()
+    expect(await output.response("cross-slot")).toMatchObject({ ok: true, method: "command.invoke" })
+    expect(output.frames.filter(frame => frame.type === "response" && frame.id === "cross-slot")).toHaveLength(1)
+
+    input.close()
+    expect(await running).toEqual({ type: "eof" })
+  } finally {
+    for (const gate of gates) gate.resolve()
+    input.close()
+    runtime.session.dispose()
+    await runtime.session.waitForIdle()
+  }
+})
+
+test("RPC retains request IDs until their correlated response is written", async () => {
+  const runtime = await createTestAgentRuntime({
+    cwd: "/work",
+    models: createModels(),
+    session: { type: "new", persist: false }
+  })
+  const input = new RpcTestInput()
+  const output = new RpcTestOutput()
+  const responseWriteStarted = deferred<void>()
+  const releaseResponseWrite = deferred<void>()
+  const secondInvocation = deferred<void>()
+  let heldResponse = false
+  let invocationCount = 0
+  runtime.session.listExtensionCommands = () => [
+    { name: "blocking", description: "Block", argumentHint: "", extensionId: "blocking" }
+  ]
+  runtime.session.invokeExtensionCommand = async () => {
+    invocationCount++
+    if (invocationCount === 2) secondInvocation.resolve()
+    return `Invocation ${invocationCount}`
+  }
+  const running = runRpcMode(runtime.session, {
+    input,
+    writer: {
+      write: async line => {
+        const frame: unknown = JSON.parse(line)
+        if (isRecord(frame) && frame.type === "response" && frame.id === "held" && !heldResponse) {
+          heldResponse = true
+          responseWriteStarted.resolve()
+          await releaseResponseWrite.promise
+        }
+        output.write(line)
+      }
+    }
+  })
+
+  try {
+    await output.frame(frame => frame.type === "ready")
+    input.send(blockingCommandRequest("held"))
+    await responseWriteStarted.promise
+
+    input.send(blockingCommandRequest("held"), blockingCommandRequest("probe"))
+    await secondInvocation.promise
+    expect(invocationCount).toBe(2)
+
+    releaseResponseWrite.resolve()
+    expect(await output.response("held")).toMatchObject({ ok: true })
+    expect(await output.frame(frame => frame.type === "protocol_error" && frame.id === "held")).toMatchObject({
+      code: "invalid_request"
+    })
+    expect(await output.response("probe")).toMatchObject({ ok: true })
+
+    input.close()
+    expect(await running).toEqual({ type: "eof" })
+  } finally {
+    releaseResponseWrite.resolve()
+    input.close()
+    runtime.session.dispose()
+    await runtime.session.waitForIdle()
+  }
+})
+
+test("RPC releases request IDs after failed and successful settlement", async () => {
+  const runtime = await createTestAgentRuntime({
+    cwd: "/work",
+    models: createModels(),
+    session: { type: "new", persist: false }
+  })
+  const input = new RpcTestInput()
+  const output = new RpcTestOutput()
+  let invocationCount = 0
+  runtime.session.listExtensionCommands = () => [
+    { name: "reusable", description: "Reuse", argumentHint: "", extensionId: "reusable" }
+  ]
+  runtime.session.invokeExtensionCommand = async () => {
+    invocationCount++
+    if (invocationCount === 1) throw new Error("First invocation failed")
+    return `Invocation ${invocationCount}`
+  }
+  const running = runRpcMode(runtime.session, { input, writer: output })
+  const request = { version: 1, id: "reusable", method: "command.invoke", params: { name: "reusable", arguments: "" } }
+
+  try {
+    await output.frame(frame => frame.type === "ready")
+    input.send(request)
+    const failed = await output.response("reusable")
+    expect(failed).toMatchObject({ ok: false, error: { code: "operation_failed" } })
+
+    input.send(request)
+    const succeeded = await output.frame(
+      (frame): frame is Extract<RpcServerFrame, { type: "response" }> =>
+        frame.type === "response" && frame.id === "reusable" && frame.sequence > failed.sequence
+    )
+    expect(succeeded).toMatchObject({ ok: true, result: { message: "Invocation 2" } })
+
+    input.send(request)
+    const reused = await output.frame(
+      (frame): frame is Extract<RpcServerFrame, { type: "response" }> =>
+        frame.type === "response" && frame.id === "reusable" && frame.sequence > succeeded.sequence
+    )
+    expect(reused).toMatchObject({ ok: true, result: { message: "Invocation 3" } })
+    expect(invocationCount).toBe(3)
+
+    input.close()
+    expect(await running).toEqual({ type: "eof" })
+  } finally {
+    input.close()
+    runtime.session.dispose()
+    await runtime.session.waitForIdle()
+  }
+})
+
 test("RPC exposes committed custom entries while message pages retain presentation policy", async () => {
   const models = createModels()
   const runtime = await createTestAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
@@ -456,12 +623,17 @@ test("RPC mode bounds concurrent waits while reserving interruption capacity", a
     await output.response("prompt")
 
     input.send(
-      ...Array.from({ length: 33 }, (_, index) => ({ version: 1, id: `wait-${index}`, method: "session.await_idle" })),
-      { version: 1, id: "interrupt", method: "session.interrupt" }
+      ...Array.from({ length: 33 }, (_, index) => ({ version: 1, id: `wait-${index}`, method: "session.await_idle" }))
     )
 
     expect(await output.response("wait-32")).toMatchObject({ ok: false, error: { code: "capacity" } })
-    expect(await output.response("interrupt")).toMatchObject({ ok: true })
+    input.send({ version: 1, id: "wait-32", method: "session.interrupt" })
+    expect(
+      await output.frame(
+        (frame): frame is Extract<RpcServerFrame, { type: "response" }> =>
+          frame.type === "response" && frame.id === "wait-32" && frame.method === "session.interrupt"
+      )
+    ).toMatchObject({ ok: true })
     expect(
       (await Promise.all(Array.from({ length: 32 }, (_, index) => output.response(`wait-${index}`)))).every(
         frame => frame.ok
@@ -730,6 +902,10 @@ test("delivery continue rejects non-runnable session states without mutation", a
     input.close()
   }
 })
+
+function blockingCommandRequest(id: string) {
+  return { version: 1, id, method: "command.invoke", params: { name: "blocking", arguments: "" } }
+}
 
 class RpcTestInput implements AsyncIterable<Uint8Array> {
   readonly #chunks: Uint8Array[] = []

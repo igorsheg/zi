@@ -198,16 +198,20 @@ export async function runRpcMode(session: AgentSession, transport: RpcModeTransp
     completion: undefined
   }
   const operations = new Set<Promise<void>>()
+  const admittedRequestIds = new Set<string>()
   const stopped = deferred<void>()
   const currentState = (): ConnectionState => state
   const output = new RpcOutput(transport.writer, message => stop({ type: "output_error", message }))
 
-  const send = (body: FrameBody, droppable = false): void => {
-    if (state.type === "closed") return
+  const send = (body: FrameBody, droppable = false, onSettled?: () => void): void => {
+    if (state.type === "closed") {
+      onSettled?.()
+      return
+    }
     sequence++
     const frame = { version: rpcProtocolVersion, sequence, ...body }
     if (droppable) output.enqueueDroppable(frame)
-    else output.enqueue(frame)
+    else output.enqueue(frame, onSettled)
   }
   const stop = (reason: Exclude<RpcModeResult, { type: "settlement_error" }>): void => {
     if (state.type !== "open") return
@@ -281,6 +285,7 @@ export async function runRpcMode(session: AgentSession, transport: RpcModeTransp
   const settlement = Promise.allSettled([inputRelease, shutdown, ...operations]).then(() => undefined)
   const settled = await settleWithin(settlement, rpcModeSettlementTimeoutMs)
   unsubscribe()
+  admittedRequestIds.clear()
 
   if (!settled) {
     output.close()
@@ -364,6 +369,16 @@ export async function runRpcMode(session: AgentSession, transport: RpcModeTransp
       return
     }
 
+    if (admittedRequestIds.has(request.id)) {
+      send({
+        type: "protocol_error",
+        code: "invalid_request",
+        message: "RPC request id is already in flight",
+        id: request.id
+      })
+      return
+    }
+
     if (request.method === "session.interrupt") {
       if (interruptActive) {
         sendFailure(request, "capacity", "An interruption request is already active")
@@ -382,23 +397,46 @@ export async function runRpcMode(session: AgentSession, transport: RpcModeTransp
   }
 
   function launch(request: RpcRequest, isInterruption: boolean): void {
+    admittedRequestIds.add(request.id)
+    let slotReleased = false
+    const releaseSlot = (): void => {
+      if (slotReleased) return
+      slotReleased = true
+      admittedRequestIds.delete(request.id)
+      if (isInterruption) interruptActive = false
+      else normalOperations--
+    }
+    const settleResponse = (completion: ReturnType<typeof deferred<void>>): void => {
+      releaseSlot()
+      completion.resolve()
+    }
     const operation = handleRequest(session, request, connection)
-      .then(operationResult => {
+      .then(async operationResult => {
+        const responseSettled = deferred<void>()
         if (state.type === "open" || state.type === "stopping") {
-          send({ type: "response", id: request.id, method: request.method, ok: true, result: operationResult })
+          send(
+            { type: "response", id: request.id, method: request.method, ok: true, result: operationResult },
+            false,
+            () => settleResponse(responseSettled)
+          )
+        } else {
+          settleResponse(responseSettled)
+        }
+        await responseSettled.promise
+        return undefined
+      })
+      .catch(async cause => {
+        if (state.type !== "closed") {
+          const failure = operationFailure(cause)
+          const responseSettled = deferred<void>()
+          sendFailure(request, failure.code, failure.message, () => settleResponse(responseSettled))
+          await responseSettled.promise
         }
         return undefined
       })
-      .catch(cause => {
-        if (state.type !== "closed") {
-          const failure = operationFailure(cause)
-          sendFailure(request, failure.code, failure.message)
-        }
-      })
       .finally(() => {
         operations.delete(operation)
-        if (isInterruption) interruptActive = false
-        else normalOperations--
+        releaseSlot()
       })
     operations.add(operation)
   }
@@ -406,9 +444,14 @@ export async function runRpcMode(session: AgentSession, transport: RpcModeTransp
   function sendFailure(
     request: RpcRequest,
     code: "capacity" | "not_found" | "operation_failed",
-    message: string
+    message: string,
+    onSettled?: () => void
   ): void {
-    send({ type: "response", id: request.id, method: request.method, ok: false, error: { code, message } })
+    send(
+      { type: "response", id: request.id, method: request.method, ok: false, error: { code, message } },
+      false,
+      onSettled
+    )
   }
 }
 
@@ -658,7 +701,7 @@ class RpcOperationError extends Error {
 class RpcOutput {
   readonly #writer: RpcWriter
   readonly #onFailure: (message: string) => void
-  #queue: Array<{ readonly line: string; readonly bytes: number }> = []
+  #queue: Array<{ readonly line: string; readonly bytes: number; readonly settle?: () => void }> = []
   #head = 0
   #pendingBytes = 0
   #running: Promise<void> | undefined
@@ -670,26 +713,31 @@ class RpcOutput {
     this.#onFailure = onFailure
   }
 
-  enqueue(frame: RpcServerFrame): void {
-    this.#enqueue(frame, "required")
+  enqueue(frame: RpcServerFrame, settle?: () => void): void {
+    this.#enqueue(frame, "required", settle)
   }
 
   enqueueDroppable(frame: RpcServerFrame): void {
     this.#enqueue(frame, "droppable")
   }
 
-  #enqueue(frame: RpcServerFrame, mode: "required" | "droppable"): void {
-    if (this.#closed || this.#failure) return
+  #enqueue(frame: RpcServerFrame, mode: "required" | "droppable", settle?: () => void): void {
+    if (this.#closed || this.#failure) {
+      settle?.()
+      return
+    }
     let line: string
     try {
       line = `${JSON.stringify(frame)}\n`
     } catch {
       if (mode === "required") this.#fail("Could not serialize RPC output")
+      settle?.()
       return
     }
     const bytes = Buffer.byteLength(line)
     if (bytes > maxRpcFrameBytes) {
       if (mode === "required") this.#fail(`RPC output records cannot exceed ${maxRpcFrameBytes} bytes`)
+      settle?.()
       return
     }
     if (
@@ -697,11 +745,12 @@ class RpcOutput {
       this.#pendingBytes + bytes > maxRpcPendingOutputBytes
     ) {
       if (mode === "required") this.#fail("RPC output exceeded its pending-write bound")
+      settle?.()
       return
     }
-    this.#queue.push({ line, bytes })
+    this.#queue.push({ line, bytes, ...(settle ? { settle } : {}) })
     this.#pendingBytes += bytes
-    this.#running ??= this.#drain()
+    this.#running ??= Promise.resolve().then(() => this.#drain())
   }
 
   async settle(): Promise<string | undefined> {
@@ -711,6 +760,7 @@ class RpcOutput {
 
   close(): void {
     this.#closed = true
+    this.#settlePending()
     this.#queue = []
     this.#head = 0
     this.#pendingBytes = 0
@@ -722,13 +772,15 @@ class RpcOutput {
       if (!item) break
       try {
         // One drain owns total protocol order and bounds outstanding writes.
+        const write = this.#writer.write(item.line)
         // oxlint-disable-next-line no-await-in-loop
-        await this.#writer.write(item.line)
+        if (write) await write
       } catch {
         this.#fail("Could not write RPC output")
         break
       }
       if (this.#closed) break
+      item.settle?.()
       this.#head++
       this.#pendingBytes -= item.bytes
       if (this.#head === this.#queue.length) {
@@ -745,10 +797,15 @@ class RpcOutput {
   #fail(message: string): void {
     if (this.#failure) return
     this.#failure = message
+    this.#settlePending()
     this.#queue = []
     this.#head = 0
     this.#pendingBytes = 0
     this.#onFailure(message)
+  }
+
+  #settlePending(): void {
+    for (let index = this.#head; index < this.#queue.length; index++) this.#queue[index]?.settle?.()
   }
 }
 

@@ -62,6 +62,8 @@ A successful request receives a correlated response:
 
 Operation failures use `ok: false` with `capacity`, `not_found`, or `operation_failed`. Invalid JSON and rejected request shapes produce `protocol_error` frames and do not close the connection. Invalid UTF-8 and oversized framing are fatal after one `invalid_framing` frame.
 
+A request ID is connection-local and may identify only one admitted, unsettled operation. Reusing an in-flight ID produces a recoverable `protocol_error` with code `invalid_request` and the matching ID; the duplicate record is not launched, including when it requests the reserved interruption slot. An ID may be reused only after its prior correlated response. Reuse always denotes a new request rather than a replay of the prior result.
+
 `session_event` frames contain source-ordered `AgentSessionEvent` values. Model-change events use the public model projection described below instead of exposing provider configuration or credentials. `entry_appended` explicitly includes `custom`, `custom_message`, and substrate `subagent` journal variants. Message pages include displayed custom messages and omit hidden ones; a hidden custom message's committed entry event remains observable to the trusted process client. Child mechanics add no separate semantic session event.
 
 ## Methods
@@ -88,6 +90,14 @@ A client that needs atomic terminal evidence may attach one stable `completionId
 `delivery: "continue"` is decided inside the child `AgentSession`: idle starts a direct run; running queues follow-up into the active run. Aborting, compacting, reloading, failed, and disposed states reject the operation. The response reports only that the continue input was admitted, not that its resulting work settled. Clients using completion watches keep the same `completionId` when a continue belongs to the current logical cycle and choose a new ID when starting a new cycle.
 
 `command.invoke` addresses an admitted extension command directly; it does not parse slash text. Commands are idle-only `AgentSession` operations. Their optional feedback is returned as `{ "message": "…" }` (or `{}`), remains outside the journal and provider context, and may be interrupted with `session.interrupt`. Unknown names return `not_found`. The copyable client exposes `runRpcCommand(...)`, which checks `command.list` before invoking the exact name.
+
+## Application and retry semantics
+
+Rejection before launch is definite non-application. This includes malformed requests, duplicate in-flight IDs, and `capacity` responses. A `command.invoke` response with `not_found` also means no extension command was invoked. These outcomes do not affect an already admitted operation that happens to use the duplicated ID.
+
+Once a valid request is admitted, failure is not an idempotency guarantee. If the connection closes before its correlated response, the client cannot tell whether the operation was applied. An `operation_failed` response says that the operation did not complete normally; it does not promise rollback of effects that occurred before the failure. In particular, a `session.prompt` may have started work or queued input before its response is lost, and an extension behind `command.invoke` may perform external side effects before it throws or before its response is lost. Retrying either operation can therefore apply it again.
+
+RPC has no response cache or persisted idempotency storage. Clients must use domain evidence such as completion watches, session events, messages, or extension-owned operation keys when they need reconciliation. Reusing the same request ID after any correlated response, including a failure response, starts a new operation and does not retrieve the old response.
 
 `connection.set_events` is owned by the RPC connection, not `AgentSession`. Admission applies the mode synchronously in input order before its response is emitted. Mode `none` suppresses only `session_event` frames; `ready`, `response`, and `protocol_error` are never suppressed. The compatibility default remains `all`.
 

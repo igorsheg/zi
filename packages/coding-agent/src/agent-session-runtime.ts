@@ -164,7 +164,7 @@ export class AgentSessionRuntime {
   cancelReplacement(): SessionReplacementCancellation {
     const state = this.#state
     if (state.type === "replacing") {
-      this.#state = { ...state, type: "cancelling" }
+      this.#transition({ ...state, type: "cancelling" })
       return { type: "cancelled", settled: state.settled }
     }
     if (state.type === "cancelling") return { type: "cancelled", settled: state.settled }
@@ -182,7 +182,7 @@ export class AgentSessionRuntime {
     const operations = [this.#cleanupSettlement(), this.#sessionListTail, this.#retired, current.session.waitForIdle()]
     if (state.type !== "ready") operations.push(state.settled)
     const settled = settleAll(operations)
-    this.#state = { type: "disposed", settled }
+    this.#transition({ type: "disposed", settled })
     void settled.catch(() => {})
   }
 
@@ -216,7 +216,7 @@ export class AgentSessionRuntime {
     current.session.assertReplaceable()
     const operationId = ++this.#nextOperationId
     const operation = deferred()
-    this.#state = { type: "replacing", current, operationId, settled: operation.settled }
+    this.#transition({ type: "replacing", current, operationId, settled: operation.settled })
 
     let next: AgentRuntime
     try {
@@ -230,7 +230,7 @@ export class AgentSessionRuntime {
       next = await this.#createRuntime(options)
     } catch (cause) {
       const state = this.#readState()
-      if (isOperation(state, operationId)) this.#state = { type: "ready", current }
+      if (isOperation(state, operationId)) this.#transition({ type: "ready", current })
       operation.resolve()
       if (state.type === "cancelling") throw new Error("Session replacement was cancelled", { cause })
       if (state.type === "disposed") throw new Error("AgentSessionRuntime is disposed", { cause })
@@ -240,7 +240,7 @@ export class AgentSessionRuntime {
     const state = this.#readState()
     if (state.type === "disposed" || !isOperation(state, operationId) || state.type === "cancelling") {
       await this.#discard(next, discardFile, reason)
-      if (isOperation(this.#readState(), operationId)) this.#state = { type: "ready", current }
+      if (isOperation(this.#readState(), operationId)) this.#transition({ type: "ready", current })
       operation.resolve()
       throw new Error(
         state.type === "disposed" ? "AgentSessionRuntime is disposed" : "Session replacement was cancelled"
@@ -251,7 +251,7 @@ export class AgentSessionRuntime {
       next.session.assertExtensionLifecycleUnbound()
     } catch (cause) {
       await this.#discard(next, discardFile, reason)
-      this.#state = { type: "ready", current }
+      if (isOperation(this.#readState(), operationId)) this.#transition({ type: "ready", current })
       operation.resolve()
       throw cause
     }
@@ -260,14 +260,14 @@ export class AgentSessionRuntime {
       current.session.assertReplaceable()
     } catch (cause) {
       await this.#discard(next, discardFile, reason)
-      if (isOperation(this.#readState(), operationId)) this.#state = { type: "ready", current }
+      if (isOperation(this.#readState(), operationId)) this.#transition({ type: "ready", current })
       operation.resolve()
       throw cause
     }
 
     current.session.dispose(reason)
     this.#retire(current.session.waitForIdle())
-    this.#state = { type: "settling", current: next, operationId, settled: operation.settled }
+    this.#transition({ type: "settling", current: next, operationId, settled: operation.settled })
     await this.#finishRetired()
 
     const settled = this.#readState()
@@ -290,7 +290,7 @@ export class AgentSessionRuntime {
       operation.resolve()
       throw new Error("Session replacement was superseded")
     }
-    this.#state = { type: "ready", current: next }
+    this.#transition({ type: "ready", current: next })
     operation.resolve()
     return next
   }
@@ -333,6 +333,24 @@ export class AgentSessionRuntime {
 
   #readState(): RuntimeState {
     return this.#state
+  }
+
+  #transition(next: RuntimeState): void {
+    const current = this.#state
+    if (!isRuntimeTransition(current, next)) {
+      throw new Error(`Invalid AgentSessionRuntime transition: ${current.type} -> ${next.type}`)
+    }
+    if ("operationId" in next && next.operationId !== this.#nextOperationId) {
+      throw new Error("AgentSessionRuntime transition has a stale operation id")
+    }
+    if (
+      "operationId" in current &&
+      "operationId" in next &&
+      (current.operationId !== next.operationId || current.settled !== next.settled)
+    ) {
+      throw new Error("AgentSessionRuntime transition changed active operation identity")
+    }
+    this.#state = next
   }
 
   #current(): AgentRuntime {
@@ -415,6 +433,29 @@ function isOperation(
   operationId: number
 ): state is Extract<RuntimeState, { operationId: number }> {
   return "operationId" in state && state.operationId === operationId
+}
+
+function isRuntimeTransition(current: RuntimeState, next: RuntimeState): boolean {
+  if (next.type === "disposed") return current.type !== "disposed"
+  switch (current.type) {
+    case "ready":
+      return next.type === "replacing" && next.current === current.current
+    case "replacing":
+      if (next.type === "settling") return next.current !== current.current
+      return (next.type === "cancelling" || next.type === "ready") && next.current === current.current
+    case "cancelling":
+      return next.type === "ready" && next.current === current.current
+    case "settling":
+      return next.type === "ready" && next.current === current.current
+    case "disposed":
+      return false
+    default:
+      return assertNever(current)
+  }
+}
+
+function assertNever(value: never): never {
+  throw new Error(`Unexpected AgentSessionRuntime state: ${String(value)}`)
 }
 
 function deferred(): { readonly settled: Promise<void>; resolve(): void } {
