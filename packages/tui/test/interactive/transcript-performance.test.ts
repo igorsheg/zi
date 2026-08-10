@@ -1024,7 +1024,8 @@ async function createTranscriptHarness(
     isStreaming: false,
     isAborting: false,
     retryStatus: { type: "idle" } as const,
-    compactionStatus: { type: "idle" } as const
+    compactionStatus: { type: "idle" } as const,
+    workPlan: { revision: 0, steps: [] } as const
   }
   const revision = atom(0)
   const promptRevision = atom(0)

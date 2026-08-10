@@ -130,6 +130,20 @@ test("clipboard images stay outside textarea state, prevent empty exit, and subm
 
     expect(input.plainText).toBe("[image #1] ")
     expect(setup.captureCharFrame()).toContain("1 image")
+
+    setup.mockInput.pressCtrlC()
+    await setup.renderOnce()
+    expect(input.plainText).toBe("")
+    expect(setup.captureCharFrame()).toContain("Input cleared · Ctrl+Z to undo")
+    expect(session.queuedInputs).toEqual({ steering: [], followUp: [] })
+
+    setup.mockInput.pressKey("z", { ctrl: true })
+    await Bun.sleep(0)
+    await setup.renderOnce()
+    expect(input.plainText).toBe("[image #1] ")
+    expect(setup.captureCharFrame()).toContain("1 image")
+    expect(session.queuedInputs).toEqual({ steering: [], followUp: [] })
+
     setup.mockInput.pressBackspace()
     setup.mockInput.pressEnter()
     await Bun.sleep(0)

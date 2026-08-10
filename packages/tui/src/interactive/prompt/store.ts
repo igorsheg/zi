@@ -63,10 +63,12 @@ import {
   type PromptWorkflow
 } from "./state.js"
 
+export type PromptSubmissionIntent = PendingInputDelivery | "interrupt"
+
 export interface PromptStore {
   readonly $state: ReadableAtom<PromptState>
   readonly picker: PickerStack
-  submit(text: string, delivery: PendingInputDelivery): boolean
+  submit(text: string, delivery: PromptSubmissionIntent): boolean
   draftChanged(text: string, input: FileCompletionInput): void
   cursorChanged(text: string, input: FileCompletionInput): void
   completePicker(text: string, input: FileCompletionInput): boolean
@@ -79,7 +81,7 @@ export interface PromptStore {
   pasteClipboard(): Promise<string | undefined>
   attachImage(image: Extract<ClipboardContent, { type: "image" }>): boolean
   imageMarkersChanged(images: readonly ImageContent[]): void
-  clear(): void
+  clear(): boolean
   dispose(): void
 }
 
@@ -196,7 +198,7 @@ class PromptController implements PromptStore {
     this.#fileCompletion = new FileCompletionController(this.picker, edit => this.#requestRange(edit))
   }
 
-  submit(text: string, delivery: PendingInputDelivery): boolean {
+  submit(text: string, delivery: PromptSubmissionIntent): boolean {
     const workflow = this.$state.get().workflow
     if (workflow.type === "auth_prompt") return this.#submitAuthenticationPrompt(text, workflow)
 
@@ -214,7 +216,10 @@ class PromptController implements PromptStore {
         this.#warn("The current model does not accept image input")
         return false
       }
-      const settled = this.#interactive.submit({ text: trimmed, images: state.images, delivery })
+      const settled =
+        delivery === "interrupt"
+          ? this.#interactive.interruptAndSubmit({ text: trimmed, images: state.images })
+          : this.#interactive.submit({ text: trimmed, images: state.images, delivery })
       this.#cancelClipboardRead()
       this.picker.close()
       this.$state.set({
@@ -513,7 +518,7 @@ class PromptController implements PromptStore {
     if (!this.#disposed) this.#notices.promptError(message)
   }
 
-  clear(): void {
+  clear(): boolean {
     this.#cancelClipboardRead()
     this.#cancelModelRefresh()
     if (
@@ -522,16 +527,14 @@ class PromptController implements PromptStore {
       this.#cancelExtensionCommand() ||
       this.#cancelSessionReplacement()
     ) {
-      return
+      return false
     }
     this.#fileCompletion.close()
     this.picker.close()
     const state = this.$state.get()
-    this.$state.set({
-      ...initialPromptState,
-      inputEdit: { type: "replace", revision: state.inputEdit.revision + 1, text: "", cursorOffset: 0 }
-    })
+    this.$state.set({ ...initialPromptState, inputEdit: { type: "clear", revision: state.inputEdit.revision + 1 } })
     this.#notices.clearPrompt()
+    return true
   }
 
   dispose(): void {

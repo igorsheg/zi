@@ -62,6 +62,7 @@ export interface Composer {
   syncImageMarkers(images: readonly ImageContent[]): void
   activeImages(): readonly ImageContent[]
   expandedText(): string
+  clearDraft(): boolean
   historyPrevious(): ComposerHistoryResult
   historyNext(): ComposerHistoryResult
   replaceText(text: string, cursorOffset?: number): void
@@ -369,6 +370,12 @@ export function createComposer(ctx: RenderContext, options: ComposerOptions): Co
     },
     expandedText() {
       return expandMarkerRanges(input.plainText, composerMarkers(input, markerTypeId))
+    },
+    clearDraft() {
+      if (input.plainText.length === 0 && composerMarkers(input, markerTypeId).length === 0) return false
+      input.clearSelection()
+      input.replaceText("")
+      return true
     },
     historyPrevious() {
       if (input.hasSelection()) return "native_fallthrough"

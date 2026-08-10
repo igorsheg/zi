@@ -157,6 +157,7 @@ export type PickerWorkflow = Extract<PromptWorkflow, { type: `choosing_${string}
 
 export type PromptInputEdit =
   | { readonly type: "replace"; readonly revision: number; readonly text: string; readonly cursorOffset: number }
+  | { readonly type: "clear"; readonly revision: number }
   | {
       readonly type: "range"
       readonly revision: number

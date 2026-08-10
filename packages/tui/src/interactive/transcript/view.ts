@@ -8,7 +8,13 @@ import {
   type SyntaxStyle,
   TextRenderable
 } from "@opentui/core"
-import { projectToolPresentation, type AgentMessage, type AgentSession } from "@with-zi/coding-agent"
+import {
+  projectToolPresentation,
+  type AgentMessage,
+  type AgentSession,
+  type ShellTaskSnapshot,
+  type SubagentSnapshot
+} from "@with-zi/coding-agent"
 import type { ReadableAtom } from "nanostores"
 
 import { createThinkingSyntaxStyle, type Theme } from "../../theme.js"
@@ -27,10 +33,11 @@ import { ToolCallView, type ToolViewFrame } from "./tool-view.js"
 
 interface TranscriptSession extends Pick<
   AgentSession,
-  "messages" | "streamingMessage" | "isStreaming" | "isAborting" | "retryStatus" | "compactionStatus"
+  "messages" | "streamingMessage" | "isStreaming" | "isAborting" | "retryStatus" | "compactionStatus" | "workPlan"
 > {
   readonly sessionManager?: { readonly header: { readonly cwd: string } }
-  readonly shellTasks?: readonly { readonly type: string; readonly toolCallId: string }[]
+  readonly shellTasks?: readonly ShellTaskSnapshot[]
+  subagentSnapshots?(): readonly SubagentSnapshot[]
 }
 
 interface TranscriptSource {
@@ -93,6 +100,7 @@ export interface TranscriptDiagnostics {
 
 export interface TranscriptViewOptions {
   readonly measureSync?: boolean
+  readonly availableHeight?: () => number
 }
 
 const maxProjectedMessages = 200
@@ -113,6 +121,7 @@ export class TranscriptView {
   readonly #navigation: TranscriptStore
   readonly #status: TranscriptStatusView
   readonly #measureSync: boolean
+  readonly #availableHeight: () => number
   readonly #requestFrame: typeof requestAnimationFrame
   readonly #cancelFrame: typeof cancelAnimationFrame
   readonly #release: Array<() => void> = []
@@ -196,6 +205,8 @@ export class TranscriptView {
   #pendingNativeRead: PendingNativeRead | undefined
   #transcriptRevision: number
   #toolsExpanded = false
+  #statusHeight = -1
+  #statusWidth = -1
   #runningLive = false
   #destroyed = false
 
@@ -214,6 +225,7 @@ export class TranscriptView {
     this.#syntaxStyle = syntaxStyle
     this.#thinkingSyntaxStyle = createThinkingSyntaxStyle(theme)
     this.#measureSync = options.measureSync ?? false
+    this.#availableHeight = options.availableHeight ?? (() => this.root.height || renderer.height)
     this.#requestFrame = globalThis.requestAnimationFrame.bind(globalThis)
     this.#cancelFrame = globalThis.cancelAnimationFrame.bind(globalThis)
     this.#session = interactive.getSession()
@@ -318,6 +330,7 @@ export class TranscriptView {
 
   #syncFrame = (): void => {
     if (this.#destroyed) return
+    this.#syncStatusGeometry()
     if (this.#dirty) {
       this.#dirty = false
       this.#syncContent()
@@ -939,7 +952,13 @@ export class TranscriptView {
   }
 
   #syncStatusGeometry = (): void => {
-    this.#status.setAvailable(this.root.height > transcriptStatusRows)
+    const height = Math.max(0, Math.floor(this.#availableHeight()))
+    const width = this.#renderer.width
+    if (height === this.#statusHeight && width === this.#statusWidth) return
+    this.#statusHeight = height
+    this.#statusWidth = width
+    this.#status.setAvailable(height > transcriptStatusRows)
+    this.#syncStatus()
   }
 
   #syncStatus = (): void => {
@@ -949,7 +968,9 @@ export class TranscriptView {
         this.#navigation.$navigation.get(),
         this.#keybindings.getHint("app.interrupt"),
         Date.now()
-      )
+      ),
+      this.#renderer.width,
+      Math.max(0, Math.floor(this.#availableHeight()) - transcriptStatusRows - 1)
     )
   }
 
@@ -1016,7 +1037,7 @@ export class TranscriptView {
   #onKeyPress = (key: KeyEvent): void => {
     if (key.defaultPrevented || key.propagationStopped) return
     const action = this.#keybindings.transcriptAction(key)
-    if (!action) return
+    if (!action || (action === "toggle_plan" && !this.#status.canTogglePlan)) return
     key.preventDefault()
     key.stopPropagation()
     this.#handleKeyAction(action)
@@ -1046,6 +1067,10 @@ export class TranscriptView {
         if (this.#streaming?.type === "static") this.#streaming.item?.setExpanded?.(this.#toolsExpanded)
         this.#renderer.requestRender()
         return
+      case "toggle_plan":
+        this.#status.togglePlan()
+        this.#renderer.requestRender()
+        return
       default:
         return assertNever(action)
     }
@@ -1070,27 +1095,112 @@ function transcriptStatusPresentation(
   interruptHint: string | undefined,
   now: number
 ): TranscriptStatusPresentation {
-  const working = session.isStreaming || session.compactionStatus.type === "running"
-  const unseenOutput = navigation.type === "detached" && navigation.unseenOutput
-  if (!working) return unseenOutput ? { type: "unseen_output" } : { type: "empty" }
-
-  const text = workingStatusText(session, interruptHint, now)
-  return unseenOutput ? { type: "working_with_unseen_output", text } : { type: "working", text }
+  return {
+    activity: transcriptActivityStatus(session, interruptHint, now),
+    background: projectTranscriptBackgroundStatus(session.shellTasks, session.subagentSnapshots?.()),
+    workPlan: transcriptWorkPlanStatus(session.workPlan),
+    unseenOutput: navigation.type === "detached" && navigation.unseenOutput
+  }
 }
 
-function workingStatusText(session: TranscriptSession, interruptHint: string | undefined, now: number): string {
-  if (session.isAborting) return "Cancelling…"
+function transcriptActivityStatus(
+  session: TranscriptSession,
+  interruptHint: string | undefined,
+  now: number
+): TranscriptStatusPresentation["activity"] {
+  const working = session.isStreaming || session.compactionStatus.type === "running"
+  if (!working) return { type: "idle" }
+  if (session.isAborting) return { type: "working_with_lifecycle", text: "Cancelling…" }
   const retry = session.retryStatus
   if (retry.type === "waiting") {
     const seconds = Math.max(0, Math.ceil((retry.retryAt - now) / 1_000))
     const cancel = interruptHint ? `${interruptHint} to cancel` : "interrupt to cancel"
-    return `Retrying (${retry.attempt}/${retry.maxAttempts}) in ${seconds}s… (${cancel})`
+    return {
+      type: "working_with_lifecycle",
+      text: `Retrying (${retry.attempt}/${retry.maxAttempts}) in ${seconds}s… (${cancel})`
+    }
   }
-  return session.compactionStatus.type === "running" ? "Compacting…" : "Working…"
+  if (session.compactionStatus.type === "running") {
+    return { type: "working_with_lifecycle", text: "Compacting…" }
+  }
+  return { type: "working" }
+}
+
+export interface TranscriptShellActivity {
+  readonly type: ShellTaskSnapshot["type"]
+  readonly placement?: Extract<ShellTaskSnapshot, { readonly type: "starting" }>["placement"]
+}
+
+export interface TranscriptSubagentActivity {
+  readonly lifecycle: SubagentSnapshot["lifecycle"]
+}
+
+export function projectTranscriptBackgroundStatus(
+  shellTasks: readonly TranscriptShellActivity[] = [],
+  subagents: readonly TranscriptSubagentActivity[] = []
+): TranscriptStatusPresentation["background"] {
+  let shellCommands = 0
+  for (const task of shellTasks) {
+    if (task.type === "background" || (task.type === "starting" && task.placement === "background")) shellCommands++
+  }
+
+  let activeSubagents = 0
+  for (const snapshot of subagents) {
+    if (isActiveSubagent(snapshot.lifecycle)) activeSubagents++
+  }
+
+  return shellCommands === 0 && activeSubagents === 0
+    ? { type: "idle" }
+    : { type: "running", shellCommands, subagents: activeSubagents }
+}
+
+function isActiveSubagent(lifecycle: SubagentSnapshot["lifecycle"]): boolean {
+  switch (lifecycle) {
+    case "starting":
+    case "spawn_admitting":
+    case "running":
+    case "interrupting":
+    case "closing":
+      return true
+    case "idle":
+    case "exited":
+      return false
+    default:
+      return assertNeverLifecycle(lifecycle)
+  }
+}
+
+function transcriptWorkPlanStatus(plan: TranscriptSession["workPlan"]): TranscriptStatusPresentation["workPlan"] {
+  let completed = 0
+  let total = 0
+  let pendingIndex = -1
+  let activeIndex = -1
+  for (let index = 0; index < plan.steps.length; index++) {
+    const status = plan.steps[index]!.status
+    if (status === "cancelled") continue
+    total++
+    if (status === "completed") completed++
+    else if (status === "in_progress") activeIndex = index
+    else if (pendingIndex === -1) pendingIndex = index
+  }
+  const currentIndex = activeIndex === -1 ? pendingIndex : activeIndex
+  if (currentIndex === -1) return { type: "absent" }
+  return {
+    type: "present",
+    plan,
+    completed,
+    total,
+    currentIndex,
+    currentStatus: activeIndex === -1 ? "pending" : "in_progress"
+  }
 }
 
 function assertNever(value: never): never {
   throw new Error(`Unhandled transcript key action: ${String(value)}`)
+}
+
+function assertNeverLifecycle(value: never): never {
+  throw new Error(`Unhandled subagent lifecycle: ${String(value)}`)
 }
 
 function isAtTail(scroll: ScrollBoxRenderable): boolean {

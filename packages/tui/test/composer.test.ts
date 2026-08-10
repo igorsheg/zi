@@ -32,6 +32,86 @@ test("composer cursor does not blink", async () => {
   }
 })
 
+test("composer clears its draft as one undo point and restores owned markers plus prior history", async () => {
+  const setup = await createTestRenderer({ width: 60, height: 8, useThread: false })
+  const paste = "x".repeat(compactPasteCharacterThreshold + 1)
+  const image = { type: "image" as const, mimeType: "image/png", data: "AAAA" }
+  const imageChanges: unknown[][] = []
+  const composer = createComposer(setup.renderer, {
+    geometry: composerGeometry(60, 8),
+    slots: { topLeft: "/work", topRight: [] },
+    theme: defaultTheme,
+    onSubmit() {},
+    onImageMarkersChange: images => imageChanges.push([...images])
+  })
+  setup.renderer.root.add(composer.root)
+
+  try {
+    composer.input.insertText("a")
+    composer.input.insertText("b")
+    composer.insertPastedText(paste)
+    composer.syncImageMarkers([image])
+    const draft = composer.input.plainText
+    const markerPayloads = composer.input.extmarks.getAll().map(marker => marker.data)
+    composer.input.setSelection(0, 2)
+
+    expect(composer.clearDraft()).toBe(true)
+    expect(composer.clearDraft()).toBe(false)
+    await Bun.sleep(0)
+    expect(composer.input.plainText).toBe("")
+    expect(composer.input.getSelection()).toBeNull()
+    expect(composer.input.extmarks.getAll()).toEqual([])
+    expect(imageChanges.at(-1)).toEqual([])
+
+    composer.input.undo()
+    await Bun.sleep(0)
+    expect(composer.input.plainText).toBe(draft)
+    expect(composer.expandedText()).toBe(`ab${paste}`)
+    expect(composer.input.extmarks.getAll()[0]!.data).toBe(markerPayloads[0])
+    expect(composer.input.extmarks.getAll()[1]!.data).toBe(markerPayloads[1])
+    expect(composer.activeImages()[0]).toBe(image)
+    expect(imageChanges.at(-1)).toEqual([image])
+
+    composer.input.redo()
+    expect(composer.input.plainText).toBe("")
+    composer.input.undo()
+    expect(composer.input.plainText).toBe(draft)
+    composer.input.undo()
+    expect(composer.input.plainText).toBe("ab[paste #1 1001 chars]")
+    composer.input.undo()
+    expect(composer.input.plainText).toBe("ab")
+    composer.input.undo()
+    expect(composer.input.plainText).toBe("a")
+  } finally {
+    composer.destroy()
+    if (!setup.renderer.isDestroyed) setup.renderer.destroy()
+  }
+})
+
+test("composer clears and restores an image-only draft", async () => {
+  const setup = await createTestRenderer({ width: 60, height: 8, useThread: false })
+  const image = { type: "image" as const, mimeType: "image/png", data: "AAAA" }
+  const composer = createComposer(setup.renderer, {
+    geometry: composerGeometry(60, 8),
+    slots: { topLeft: "/work", topRight: [] },
+    theme: defaultTheme,
+    onSubmit() {}
+  })
+  setup.renderer.root.add(composer.root)
+
+  try {
+    composer.syncImageMarkers([image])
+    expect(composer.clearDraft()).toBe(true)
+    composer.input.undo()
+    await Bun.sleep(0)
+    expect(composer.input.plainText).toBe("[image #1] ")
+    expect(composer.activeImages()).toEqual([image])
+  } finally {
+    composer.destroy()
+    if (!setup.renderer.isDestroyed) setup.renderer.destroy()
+  }
+})
+
 test("composer range replacement is one undo point and preserves prior native history", async () => {
   const setup = await createTestRenderer({ width: 60, height: 8, useThread: false })
   const composer = createComposer(setup.renderer, {

@@ -48,6 +48,13 @@ Zi works best when you ask for a small, inspectable piece of real work and let t
 
 That last step is the important one. Zi gets better when you stop retyping instructions and start teaching the repository.
 
+## Interactive controls
+
+- `Enter` sends a prompt. During an active turn it queues steering input; `Alt+Enter` queues a follow-up.
+- `Ctrl+Enter` interrupts only the active parent turn and sends the current draft immediately. Existing queues, background commands, and subagents continue.
+- `Esc` cancels the active parent turn and restores queued input to the composer.
+- `Ctrl+C` clears a non-empty draft. Zi shows `Ctrl+Z` recovery guidance, and undo restores text and image markers together.
+
 ## What to read next
 
 - [CLI](cli.md) — choose interactive, text, JSON, or RPC mode.

@@ -356,10 +356,20 @@ type RunningActivity = {
   readonly settled: Promise<void>
 }
 
+type InterruptingActivity = {
+  readonly type: "interrupting"
+  readonly runId: number
+  readonly interruptedSettled: Promise<void>
+  readonly prompt: { readonly text: string; readonly images: readonly ImageContent[] }
+  readonly settlement: Settlement
+  readonly settled: Promise<void>
+}
+
 type Activity =
   | { type: "idle" }
   | RunningActivity
   | { type: "aborting"; runId: number; settled: Promise<void> }
+  | InterruptingActivity
   | {
       type: "compacting"
       operationId: number
@@ -443,7 +453,7 @@ type QueueRestoreCancellationState =
 type RuntimeCustomMessage = Extract<AgentMessage, { role: "custom" }> & { readonly details?: SessionJson }
 
 type RunStart =
-  | { readonly type: "prompt"; readonly messages: readonly AgentMessage[] }
+  | { readonly type: "prompt"; readonly messages: readonly AgentMessage[]; readonly restorePendingAfterPrompt: boolean }
   | { readonly type: "continuation" }
 
 interface CommittedMessageMemory {
@@ -746,12 +756,15 @@ export class AgentSession {
   }
 
   get isStreaming(): boolean {
-    return this.#activity.type === "running" || this.#activity.type === "aborting"
+    return (
+      this.#activity.type === "running" || this.#activity.type === "aborting" || this.#activity.type === "interrupting"
+    )
   }
 
   get isAborting(): boolean {
     return (
       this.#activity.type === "aborting" ||
+      this.#activity.type === "interrupting" ||
       (this.#activity.type === "compacting" && this.#activity.controller.signal.aborted) ||
       (this.#activity.type === "extension_command" && this.#activity.controller.signal.aborted) ||
       (this.#activity.type === "running" &&
@@ -1269,7 +1282,7 @@ export class AgentSession {
         const expandedText = this.#expandResourceInput(text)
         const run = this.#beginRun()
         const messages = [...this.#nextTurnCustomMessages(), userMessage(expandedText, options.images ?? [])]
-        void this.#drive(run.runId, { type: "prompt", messages }, run.settlement)
+        void this.#drive(run.runId, { type: "prompt", messages, restorePendingAfterPrompt: false }, run.settlement)
         return run.settlement.promise
       }
       case "running":
@@ -1277,6 +1290,7 @@ export class AgentSession {
         this.#enqueueUser(options.streamingBehavior, text, options.images)
         return Promise.resolve()
       case "aborting":
+      case "interrupting":
         throw new Error("Cannot prompt while the agent is aborting")
       case "compacting":
       case "compaction_committed":
@@ -1294,6 +1308,61 @@ export class AgentSession {
     }
   }
 
+  interruptAndPrompt(text: string, images?: ImageContent[]): Promise<void> {
+    this.#assertOpen()
+    if (text.trim().length === 0 && (images?.length ?? 0) === 0) {
+      throw new Error("Interrupt prompt cannot be empty")
+    }
+    if (this.#modelState.type === "unselected") throw new Error("No model selected. Use /login, then /model.")
+    if (!this.#authentication.isIdle) throw new Error("Cannot interrupt and prompt while authentication is active")
+
+    const activity = this.#activity
+    switch (activity.type) {
+      case "running": {
+        if (activity.phase.type === "compacting" || activity.phase.type === "compaction_committed") {
+          throw new Error("Cannot interrupt and prompt while context compaction is active")
+        }
+        const prompt = { text: this.#expandResourceInput(text), images: Object.freeze((images ?? []).map(cloneImage)) }
+        const settlement = createSettlement()
+        const settled = settleAll([activity.settled, settlement.promise])
+        // waitForIdle can observe this combined settlement, but interruptAndPrompt returns only the replacement run.
+        void settled.catch(() => {})
+        const interrupting: InterruptingActivity = {
+          type: "interrupting",
+          runId: activity.runId,
+          interruptedSettled: activity.settled,
+          prompt,
+          settlement,
+          settled
+        }
+        this.#activity = interrupting
+        this.#agent.clearAllQueues()
+        if (activity.providerStart.type === "pending") activity.providerStart.controller.abort()
+        if (activity.phase.type === "retry_wait") activity.phase.controller.abort()
+        this.#agent.abort()
+        return settlement.promise
+      }
+      case "idle":
+        throw new Error("Cannot interrupt and prompt while the agent is idle")
+      case "aborting":
+      case "interrupting":
+        throw new Error("Cannot interrupt and prompt while the agent is aborting")
+      case "compacting":
+      case "compaction_committed":
+        throw new Error("Cannot interrupt and prompt while context compaction is active")
+      case "extension_command":
+        throw new Error("Cannot interrupt and prompt while an extension command is active")
+      case "reloading":
+        throw new Error("Cannot interrupt and prompt while reload is active")
+      case "failed":
+        throw new Error("Restore or discard queued inputs from the failed run before interrupting again")
+      case "disposed":
+        throw new Error("AgentSession is disposed")
+      default:
+        return assertNever(activity)
+    }
+  }
+
   steer(text: string, images?: ImageContent[]): void {
     this.#enqueueUser("steer", text, images)
   }
@@ -1304,7 +1373,9 @@ export class AgentSession {
 
   takeQueuedInputs(): QueuedInputs {
     this.#assertOpen()
-    if (this.#activity.type === "aborting") throw new Error("Cannot restore queued inputs while the agent is aborting")
+    if (this.#activity.type === "aborting" || this.#activity.type === "interrupting") {
+      throw new Error("Cannot restore queued inputs while the agent is aborting")
+    }
     if (this.#activity.type === "compacting" || this.#activity.type === "compaction_committed") {
       throw new Error("Cannot restore queued inputs while context compaction is active")
     }
@@ -1352,6 +1423,20 @@ export class AgentSession {
         return {
           ...emptyQueue(),
           settled: authenticationWasIdle ? settled : settleTogether(settled, authenticationSettled)
+        }
+      }
+      case "interrupting": {
+        const { runId, interruptedSettled, settlement } = this.#activity
+        const queued = this.#detachQueuedInputs("interrupt")
+        this.#activity = { type: "aborting", runId, settled: interruptedSettled }
+        settlement.reject(new Error("Interrupt prompt was cancelled"))
+        this.#emitQueue()
+        this.#agent.abort()
+        return {
+          ...queued,
+          settled: authenticationWasIdle
+            ? interruptedSettled
+            : settleTogether(interruptedSettled, authenticationSettled)
         }
       }
       case "aborting":
@@ -1427,6 +1512,13 @@ export class AgentSession {
       case "compaction_committed": {
         const { settled } = this.#activity
         return authenticationWasIdle ? settled : settleTogether(settled, authenticationSettled)
+      }
+      case "interrupting": {
+        const { runId, interruptedSettled, settlement } = this.#activity
+        this.#activity = { type: "aborting", runId, settled: interruptedSettled }
+        settlement.reject(new Error("Interrupt prompt was cancelled"))
+        this.#agent.abort()
+        return authenticationWasIdle ? interruptedSettled : settleTogether(interruptedSettled, authenticationSettled)
       }
       case "aborting": {
         const { settled } = this.#activity
@@ -1506,6 +1598,7 @@ export class AgentSession {
     switch (this.#activity.type) {
       case "running":
       case "aborting":
+      case "interrupting":
       case "compacting":
       case "compaction_committed":
       case "extension_command":
@@ -1747,12 +1840,16 @@ export class AgentSession {
     const activeSettled =
       currentActivity.type === "running" ||
       currentActivity.type === "aborting" ||
+      currentActivity.type === "interrupting" ||
       currentActivity.type === "compacting" ||
       currentActivity.type === "compaction_committed" ||
       currentActivity.type === "extension_command" ||
       currentActivity.type === "reloading"
         ? currentActivity.settled
         : Promise.resolve()
+    if (currentActivity.type === "interrupting") {
+      currentActivity.settlement.reject(new Error("AgentSession was disposed before the interrupt prompt could start"))
+    }
     this.#pending = []
     this.#pendingBytes = 0
     this.#agent.clearAllQueues()
@@ -1859,12 +1956,17 @@ export class AgentSession {
 
   async #drive(runId: number, start: RunStart, settlement: Settlement): Promise<void> {
     let failure: { cause: unknown } | undefined
+    let interrupted: InterruptingActivity | undefined
     try {
       this.#deliverSubagentCompletions()
       await this.#compactBeforeMessages(runId, start.type === "prompt" ? start.messages : [])
       if (this.#activateProviderStart(runId)) {
-        if (start.type === "prompt") await this.#runAgent(() => this.#agent.prompt([...start.messages]))
-        else await this.#runAgent(() => this.#agent.continue())
+        if (start.type === "prompt") {
+          await this.#runAgent(() => this.#agent.prompt([...start.messages]))
+          if (start.restorePendingAfterPrompt && this.#canContinue(runId)) this.#restorePendingInputs(runId)
+        } else {
+          await this.#runAgent(() => this.#agent.continue())
+        }
       }
       while (this.#canContinue(runId)) {
         // Core runs are sequential: overflow recovery and each queued continuation own one run at a time.
@@ -1890,14 +1992,19 @@ export class AgentSession {
     try {
       if (failure) this.#finishExceptionalRetry(runId, failure.cause)
       if (this.#isCurrentRun(runId)) {
-        if (failure && this.#pending.some(entry => "runId" in entry && entry.runId === runId)) {
-          this.#activity = { type: "failed", runId, cause: failure.cause }
+        const activity = this.#activity
+        if (activity.type === "interrupting") {
+          interrupted = activity
         } else {
-          this.#activity = { type: "idle" }
+          if (failure && this.#pending.some(entry => "runId" in entry && entry.runId === runId)) {
+            this.#activity = { type: "failed", runId, cause: failure.cause }
+          } else {
+            this.#activity = { type: "idle" }
+          }
+          this.#extensionHost?.publishAgentSettled()
+          this.#emit({ type: "agent_settled" })
         }
         if (failure) this.#agent.clearAllQueues()
-        this.#extensionHost?.publishAgentSettled()
-        this.#emit({ type: "agent_settled" })
       }
     } catch (cause) {
       failure ??= { cause }
@@ -1907,6 +2014,7 @@ export class AgentSession {
       this.#subagents?.releaseCompletionClaims()
       if (failure) settlement.reject(failure.cause)
       else settlement.resolve()
+      if (interrupted) this.#startInterruptPrompt(interrupted)
     }
   }
 
@@ -2506,7 +2614,12 @@ export class AgentSession {
   }
 
   #isCurrentRun(runId: number): boolean {
-    return (this.#activity.type === "running" || this.#activity.type === "aborting") && this.#activity.runId === runId
+    return (
+      (this.#activity.type === "running" ||
+        this.#activity.type === "aborting" ||
+        this.#activity.type === "interrupting") &&
+      this.#activity.runId === runId
+    )
   }
 
   #activateProviderStart(runId: number): boolean {
@@ -2527,10 +2640,24 @@ export class AgentSession {
     }
   }
 
-  #beginRun(): { readonly runId: number; readonly settlement: Settlement } {
+  #startInterruptPrompt(interrupting: InterruptingActivity): void {
+    if (this.#activity !== interrupting) {
+      interrupting.settlement.reject(new Error("Interrupt prompt was superseded before it could start"))
+      return
+    }
+
+    const run = this.#beginRun(interrupting.settlement)
+    this.#retargetPendingInputs(interrupting.runId, run.runId)
+    const messages = [
+      ...this.#nextTurnCustomMessages(),
+      userMessage(interrupting.prompt.text, interrupting.prompt.images)
+    ]
+    void this.#drive(run.runId, { type: "prompt", messages, restorePendingAfterPrompt: true }, run.settlement)
+  }
+
+  #beginRun(settlement = createSettlement()): { readonly runId: number; readonly settlement: Settlement } {
     this.#modelMutation = { type: "none" }
     const runId = ++this.#nextRunId
-    const settlement = createSettlement()
     this.#activity = {
       type: "running",
       runId,
@@ -2543,6 +2670,23 @@ export class AgentSession {
       settled: settlement.promise
     }
     return { runId, settlement }
+  }
+
+  #retargetPendingInputs(fromRunId: number, toRunId: number): void {
+    this.#pending = this.#pending.map(entry => {
+      if (entry.type === "custom" && entry.delivery === "nextTurn") return entry
+      if (entry.runId !== fromRunId) return entry
+      return { ...entry, runId: toRunId }
+    })
+  }
+
+  #restorePendingInputs(runId: number): void {
+    for (const entry of this.#pending) {
+      if (entry.type === "custom" && entry.delivery === "nextTurn") continue
+      if (entry.runId !== runId) continue
+      if (entry.delivery === "steer") this.#agent.steer(entry.message)
+      else this.#agent.followUp(entry.message)
+    }
   }
 
   #appendCustomMessage(input: CustomMessageInput): {
@@ -2690,6 +2834,7 @@ export class AgentSession {
       case "idle":
         return this.#nextRunId + 1
       case "aborting":
+      case "interrupting":
         throw new Error("Cannot queue input while the agent is aborting")
       case "compacting":
       case "compaction_committed":
@@ -3060,6 +3205,7 @@ export class AgentSession {
         }
         return
       case "aborting":
+      case "interrupting":
         throw new Error("Cannot append custom state while the agent is aborting")
       case "compacting":
       case "compaction_committed":

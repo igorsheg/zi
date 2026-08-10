@@ -29,6 +29,8 @@ export interface PromptSubmission {
   readonly delivery: PendingInputDelivery
 }
 
+export type InterruptSubmission = Omit<PromptSubmission, "delivery">
+
 export type AutomaticCompactionNoticeEvent =
   | { readonly type: "failed"; readonly message: string }
   | { readonly type: "completed" }
@@ -50,6 +52,7 @@ export interface InteractiveStore {
   getSession(): AgentSession
   replaceSession(session: AgentSession): void
   submit(submission: PromptSubmission): Promise<void>
+  interruptAndSubmit(submission: InterruptSubmission): Promise<void>
   restoreQueuedInputs(): QueuedInputs
   abortAndRestoreQueuedInputs(): AbortedQueuedInputs
   backgroundForegroundShellTask(): ShellDemotionResult
@@ -125,6 +128,9 @@ export function createInteractiveStore(session: AgentSession): InteractiveStore 
         ...(images.length === 0 ? {} : { images: [...images] }),
         ...(activeSession.isStreaming ? { streamingBehavior: delivery } : {})
       })
+    },
+    interruptAndSubmit({ text, images }) {
+      return currentSession().interruptAndPrompt(text, images.length === 0 ? undefined : [...images])
     },
     restoreQueuedInputs() {
       return currentSession().takeQueuedInputs()
@@ -255,10 +261,9 @@ export function transitionInteractiveState(state: InteractiveState, event: Agent
     case "steering_mode_changed":
     case "follow_up_mode_changed":
     case "shell_task_changed":
+    case "subagent_changed":
     case "work_plan_changed":
       promptRevision++
-      break
-    case "subagent_changed":
       break
     case "turn_start":
     case "turn_end":

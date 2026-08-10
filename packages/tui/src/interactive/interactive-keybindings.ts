@@ -13,6 +13,7 @@ export type PromptKeyAction =
   | "picker_down"
   | "submit"
   | "follow_up"
+  | "interrupt_send"
   | "background_task"
   | "external_editor"
   | "paste_clipboard"
@@ -21,17 +22,26 @@ export type PromptKeyAction =
   | "history_next"
   | "restore_queue"
   | "interrupt"
+  | "undo"
   | "clear"
   | "exit"
   | "consume"
 
-export type TranscriptKeyAction = "page_up" | "page_down" | "line_up" | "line_down" | "tail" | "toggle_tools"
+export type TranscriptKeyAction =
+  | "page_up"
+  | "page_down"
+  | "line_up"
+  | "line_down"
+  | "tail"
+  | "toggle_tools"
+  | "toggle_plan"
 
 export interface PromptKeyContext {
   readonly pickerOpen: boolean
   readonly editorEmpty: boolean
   readonly hasImages: boolean
   readonly streaming: boolean
+  readonly interruptible: boolean
   readonly foregroundShellTask: boolean
   readonly externalEditorEnabled: boolean
   readonly historyEnabled: boolean
@@ -51,9 +61,11 @@ const defaultBindingEntries = [
   ["app.clear", ["ctrl+c"], "Clear editor or exit on a second press", "reserved"],
   ["app.exit", ["ctrl+d"], "Exit when the editor is empty", "reserved"],
   ["app.message.followUp", ["alt+return"], "Queue a follow-up message", "reserved"],
+  ["app.message.interruptAndSend", ["ctrl+return"], "Interrupt the active turn and send input", "reserved"],
   ["app.message.dequeue", ["alt+up"], "Restore queued messages", "overridable"],
   ["app.task.background", ["ctrl+g"], "Move the foreground shell task to the background", "overridable"],
   ["app.editor.external", ["ctrl+g"], "Open the prompt in an external editor", "overridable"],
+  ["app.editor.undo", ["ctrl+z"], "Undo the last prompt edit", "overridable"],
   [
     "app.clipboard.paste",
     process.platform === "win32" ? ["alt+v"] : ["ctrl+v"],
@@ -76,6 +88,7 @@ const defaultBindingEntries = [
   ["tui.select.confirm", ["return"], "Confirm selection", "reserved"],
   ["tui.select.cancel", ["escape", "ctrl+c"], "Cancel selection", "reserved"],
   ["app.tools.expand", ["ctrl+o"], "Expand or collapse tool details", "overridable"],
+  ["app.plan.toggle", ["alt+p"], "Expand or collapse the work plan", "overridable"],
   ["app.transcript.pageUp", ["pageup"], "Scroll transcript up half a page", "overridable"],
   ["app.transcript.pageDown", ["pagedown"], "Scroll transcript down half a page", "overridable"],
   ["app.transcript.lineUp", ["ctrl+alt+up"], "Scroll transcript up one line", "overridable"],
@@ -117,16 +130,18 @@ export class InteractiveKeybindings {
       if (!supported.has(id)) throw new Error(`Unknown interactive keybinding: ${id}`)
     }
 
-    const userClaims = new Map<string, InteractiveKeybinding[]>()
+    const claims = new Map<string, InteractiveKeybinding[]>()
+    const overridden = new Set(Object.keys(overrides))
     for (const [id, defaultKeys, description, extension] of defaultBindingEntries) {
       const parsed = parseKeys(overrides[id] ?? defaultKeys)
       const keys = parsed.map(formatKey)
       this.#bindings.set(id, { keys, parsed, description, extension })
-      if (overrides[id] === undefined) continue
-      for (const key of keys) userClaims.set(key, [...(userClaims.get(key) ?? []), id])
+      for (const key of keys) claims.set(key, [...(claims.get(key) ?? []), id])
     }
-    for (const [key, keybindings] of userClaims) {
-      if (keybindings.length > 1) this.#conflicts.push({ key, keybindings })
+    for (const [key, keybindings] of claims) {
+      if (keybindings.length > 1 && keybindings.some(id => overridden.has(id))) {
+        this.#conflicts.push({ key, keybindings })
+      }
     }
   }
 
@@ -171,6 +186,14 @@ export class InteractiveKeybindings {
     if (context.externalEditorEnabled && this.matches(event, "app.editor.external")) return "external_editor"
     if (this.matches(event, "app.clipboard.paste")) return "paste_clipboard"
     if (context.streaming && this.matches(event, "app.interrupt")) return "interrupt"
+    if (
+      context.interruptible &&
+      (!context.editorEmpty || context.hasImages) &&
+      this.matches(event, "app.message.interruptAndSend")
+    ) {
+      return "interrupt_send"
+    }
+    if (this.matches(event, "app.editor.undo")) return "undo"
     if (this.matches(event, "app.clear")) return "clear"
     if (context.editorEmpty && !context.hasImages && this.matches(event, "app.exit")) return "exit"
     if (this.matches(event, "app.message.followUp")) return "follow_up"
@@ -190,7 +213,17 @@ export class InteractiveKeybindings {
     if (this.matches(event, "app.transcript.lineUp")) return "line_up"
     if (this.matches(event, "app.transcript.lineDown")) return "line_down"
     if (this.matches(event, "app.transcript.tail")) return "tail"
+    if (this.matches(event, "app.plan.toggle") && !this.#hasCompetingBinding(event, "app.plan.toggle")) {
+      return "toggle_plan"
+    }
     return undefined
+  }
+
+  #hasCompetingBinding(event: InteractiveKeyEvent, id: InteractiveKeybinding): boolean {
+    for (const [candidate, binding] of this.#bindings) {
+      if (candidate !== id && binding.parsed.some(key => matches(event, key))) return true
+    }
+    return false
   }
 
   closesModal(event: InteractiveKeyEvent): boolean {

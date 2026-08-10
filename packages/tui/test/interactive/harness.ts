@@ -24,7 +24,7 @@ export async function createInteractiveTest(
   clipboardWriter?: ClipboardWriter,
   externalEditor?: ExternalEditor
 ): Promise<InteractiveTestSetup> {
-  const setup = await createTestRenderer({ ...options, useThread: false })
+  const setup = await createTestRenderer({ ...options, useThread: false, exitOnCtrlC: false })
   const mode = new InteractiveMode({
     renderer: setup.renderer,
     session,

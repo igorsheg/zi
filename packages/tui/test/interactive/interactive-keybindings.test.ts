@@ -12,6 +12,15 @@ test("interactive keybindings resolve semantic prompt and transcript actions", (
   expect(keybindings.promptAction(key("return"), context())).toBe("submit")
   expect(keybindings.promptAction(key("return", { meta: true }), context())).toBe("follow_up")
   expect(keybindings.promptAction(key("return", { ctrl: true }), context())).toBe("consume")
+  expect(keybindings.promptAction(key("return", { ctrl: true }), { ...context(), editorEmpty: false })).toBe(
+    "interrupt_send"
+  )
+  expect(keybindings.promptAction(key("return", { ctrl: true }), { ...context(), hasImages: true })).toBe(
+    "interrupt_send"
+  )
+  expect(
+    keybindings.promptAction(key("return", { ctrl: true }), { ...context(), editorEmpty: false, interruptible: false })
+  ).toBe("consume")
   expect(keybindings.promptAction(key("escape"), context())).toBe("interrupt")
   expect(keybindings.promptAction(key("g", { ctrl: true }), context())).toBe("background_task")
   expect(
@@ -27,6 +36,7 @@ test("interactive keybindings resolve semantic prompt and transcript actions", (
       externalEditorEnabled: false
     })
   ).toBeUndefined()
+  expect(keybindings.promptAction(key("z", { ctrl: true }), context())).toBe("undo")
   expect(keybindings.promptAction(key("c", { ctrl: true }), context())).toBe("clear")
   expect(keybindings.promptAction(key("d", { ctrl: true }), { ...context(), editorEmpty: false })).toBeUndefined()
   expect(keybindings.promptAction(key("d", { ctrl: true }), { ...context(), hasImages: true })).toBeUndefined()
@@ -47,6 +57,7 @@ test("interactive keybindings resolve semantic prompt and transcript actions", (
   expect(keybindings.transcriptAction(key("pageup"))).toBe("page_up")
   expect(keybindings.transcriptAction(key("up", { ctrl: true, meta: true }))).toBe("line_up")
   expect(keybindings.transcriptAction(key("end", { ctrl: true }))).toBe("tail")
+  expect(keybindings.transcriptAction(key("p", { meta: true }))).toBe("toggle_plan")
 })
 
 test("interactive keybinding overrides rebind and disable semantic actions per mode", () => {
@@ -54,6 +65,8 @@ test("interactive keybinding overrides rebind and disable semantic actions per m
     "app.clear": ["ctrl+x"],
     "app.exit": [],
     "app.editor.external": ["ctrl+e"],
+    "app.editor.undo": ["ctrl+u"],
+    "app.plan.toggle": ["alt+x"],
     "tui.input.historyPrevious": ["ctrl+p"],
     "tui.input.historyNext": []
   })
@@ -64,9 +77,13 @@ test("interactive keybinding overrides rebind and disable semantic actions per m
   expect(keybindings.promptAction(key("e", { ctrl: true }), { ...context(), foregroundShellTask: false })).toBe(
     "external_editor"
   )
+  expect(keybindings.promptAction(key("z", { ctrl: true }), context())).toBeUndefined()
+  expect(keybindings.promptAction(key("u", { ctrl: true }), context())).toBe("undo")
   expect(keybindings.promptAction(key("up"), context())).toBeUndefined()
   expect(keybindings.promptAction(key("p", { ctrl: true }), context())).toBe("history_previous")
   expect(keybindings.promptAction(key("down"), context())).toBeUndefined()
+  expect(keybindings.transcriptAction(key("p", { meta: true }))).toBeUndefined()
+  expect(keybindings.transcriptAction(key("x", { meta: true }))).toBe("toggle_plan")
   expect(keybindings.getKeys("app.clear")).toEqual(["ctrl+x"])
   expect(() => new InteractiveKeybindings({ "app.clear": ["wat+ctrl+x"] })).toThrow("Unknown key modifier")
 })
@@ -93,7 +110,10 @@ test("interactive keybindings expose resolved metadata for help and future short
   )
   expect(keybindings.getHint("app.selection.copy")).toBe(process.platform === "darwin" ? "Cmd+C" : "Ctrl+C")
   expect(keybindings.getHint("app.tools.expand")).toBe("Ctrl+O")
+  expect(keybindings.getHint("app.plan.toggle")).toBe("Alt+P")
   expect(keybindings.getHint("app.editor.external")).toBe("Ctrl+G")
+  expect(keybindings.getHint("app.editor.undo")).toBe("Ctrl+Z")
+  expect(keybindings.getHint("app.message.interruptAndSend")).toBe("Ctrl+Enter")
   expect(keybindings.getHint("app.transcript.tail")).toBe("Ctrl+End")
   expect(keybindings.getHint("tui.select.confirm")).toBe("Enter")
   expect(keybindings.getConflicts()).toEqual([])
@@ -110,6 +130,15 @@ test("interactive keybindings normalize duplicates and report override conflicts
 
   expect(keybindings.getKeys("app.clear")).toEqual(["ctrl+x"])
   expect(keybindings.getConflicts()).toEqual([{ key: "ctrl+x", keybindings: ["app.clear", "app.exit"] }])
+
+  const defaultConflict = new InteractiveKeybindings({ "app.plan.toggle": ["return"] })
+  expect(defaultConflict.getConflicts()).toEqual([
+    { key: "return", keybindings: ["tui.input.submit", "tui.select.confirm", "app.plan.toggle"] }
+  ])
+  expect(defaultConflict.transcriptAction(key("return"))).toBeUndefined()
+
+  const transcriptConflict = new InteractiveKeybindings({ "app.plan.toggle": ["ctrl+end"] })
+  expect(transcriptConflict.transcriptAction(key("end", { ctrl: true }))).toBe("tail")
 })
 
 test("interactive keybinding overrides reject unknown actions and unbounded key lists", () => {
@@ -126,6 +155,7 @@ function context(pickerOpen = false) {
     editorEmpty: true,
     hasImages: false,
     streaming: true,
+    interruptible: true,
     foregroundShellTask: true,
     externalEditorEnabled: true,
     historyEnabled: !pickerOpen

@@ -37,10 +37,12 @@ export class SessionScreen {
     modals?: PromptModalActions
   ) {
     this.root = new BoxRenderable(renderer, { flexDirection: "column", flexGrow: 1, minHeight: 0 })
+    let prompt: PromptView | undefined
     this.transcript = new TranscriptView(renderer, interactive, keybindings, theme, syntaxStyle, {
-      measureSync: measureTranscriptSync
+      measureSync: measureTranscriptSync,
+      availableHeight: () => renderer.height - (prompt?.root.height ?? 0)
     })
-    this.prompt = new PromptView(
+    this.prompt = prompt = new PromptView(
       renderer,
       interactive,
       slash,

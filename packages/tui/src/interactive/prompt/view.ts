@@ -28,8 +28,13 @@ import { SessionGreeterView } from "./greeter-view.js"
 import { PickerStackView } from "./picker-view.js"
 import { QueuedInputsView } from "./queue-view.js"
 import { promptInputIsSecret, type PromptInputEdit, type PromptWorkflow } from "./state.js"
-import { createPromptStore, type PromptModalActions, type PromptSessionActions, type PromptStore } from "./store.js"
-import { WorkPlanView } from "./work-plan-view.js"
+import {
+  createPromptStore,
+  type PromptModalActions,
+  type PromptSessionActions,
+  type PromptStore,
+  type PromptSubmissionIntent
+} from "./store.js"
 
 type ExternalEditorState =
   | { readonly type: "idle" }
@@ -48,7 +53,6 @@ export class PromptView {
   readonly #store: PromptStore
   readonly #authCeremony: AuthCeremonyView
   readonly #queue: QueuedInputsView
-  readonly #workPlan: WorkPlanView
   readonly #greeter: SessionGreeterView
   readonly #composer: Composer
   readonly #footer: PromptFooterView
@@ -86,7 +90,6 @@ export class PromptView {
 
     this.#authCeremony = new AuthCeremonyView(renderer, browserOpener, theme)
     this.#queue = new QueuedInputsView(renderer, keybindings, theme)
-    this.#workPlan = new WorkPlanView(renderer, theme)
     this.#greeter = new SessionGreeterView(renderer, theme)
 
     const session = interactive.getSession()
@@ -119,7 +122,6 @@ export class PromptView {
     this.root.add(this.#authCeremony.root)
     this.root.add(this.#queue.root)
     this.root.add(this.#greeter.root)
-    this.root.add(this.#workPlan.root)
     this.root.add(this.#composer.root)
     this.root.add(this.#footer.root)
     this.root.add(this.#pickerStack.root)
@@ -150,7 +152,6 @@ export class PromptView {
     for (const release of this.#release.splice(0)) release()
     this.#authCeremony.destroy()
     this.#queue.destroy()
-    this.#workPlan.destroy()
     this.#greeter.destroy()
     this.#footer.destroy()
     this.#store.dispose()
@@ -202,23 +203,20 @@ export class PromptView {
 
     if (pickerVisible) {
       this.#queue.hide()
-      this.#workPlan.update(session.workPlan, this.#renderer.width, 0)
     } else {
-      const workPlanRows = this.#workPlan.update(
-        session.workPlan,
-        this.#renderer.width,
-        Math.max(0, this.#renderer.height - composerRows - otherFixedRows - footerRows - reservedContentRows)
-      )
-      this.#queue.update(
-        queuedInputs,
-        Math.max(0, this.#renderer.height - composerRows - otherFixedRows - footerRows - workPlanRows)
-      )
+      this.#queue.update(queuedInputs, Math.max(0, this.#renderer.height - composerRows - otherFixedRows - footerRows))
     }
   }
 
-  #submit(delivery: "steer" | "followUp"): void {
+  #submit(delivery: PromptSubmissionIntent): void {
+    const session = this.#interactive.getSession()
+    const queuedBefore = queuedInputCount(session)
     this.#store.imageMarkersChanged(this.#composer.activeImages())
-    this.#store.submit(this.#composer.expandedText(), delivery)
+    const admitted = this.#store.submit(this.#composer.expandedText(), delivery)
+    if (!admitted || delivery === "interrupt" || queuedInputCount(session) <= queuedBefore) return
+
+    const hint = this.#keybindings.getHint("app.message.interruptAndSend")
+    if (hint) this.#notices.promptInfo(`Queued · ${hint} to interrupt with a new prompt`)
   }
 
   #onPaste = (event: PasteEvent): void => {
@@ -262,6 +260,11 @@ export class PromptView {
       case "replace":
         this.#replaceInput(edit.text, edit.cursorOffset)
         return
+      case "clear":
+        this.#composer.clearDraft()
+        this.#syncedImages = this.#store.$state.get().images
+        this.#input.focus()
+        return
       case "range":
         if (this.#composer.replaceRange(edit) === "unavailable") {
           this.#notices.promptWarning("File completion could not replace this marked range")
@@ -302,6 +305,7 @@ export class PromptView {
       hasImages: prompt.images.length > 0,
       streaming:
         session.isStreaming || session.compactionStatus.type === "running" || authenticationActive(prompt.workflow),
+      interruptible: session.isStreaming && !session.isAborting && session.compactionStatus.type !== "running",
       foregroundShellTask: session.shellTasks.some(task => task.type === "foreground"),
       externalEditorEnabled: prompt.workflow.type === "idle",
       historyEnabled: prompt.workflow.type === "idle" && !pickerOpen
@@ -350,6 +354,10 @@ export class PromptView {
         consume(key)
         this.#submit("followUp")
         return
+      case "interrupt_send":
+        consume(key)
+        this.#submit("interrupt")
+        return
       case "background_task": {
         consume(key)
         const result = this.#interactive.backgroundForegroundShellTask()
@@ -376,10 +384,19 @@ export class PromptView {
         consume(key)
         this.#restore(true)
         return
-      case "clear":
+      case "undo":
         consume(key)
-        if (this.#exitGestures.clear() === "armed") this.#store.clear()
+        this.#input.undo()
         return
+      case "clear": {
+        consume(key)
+        const hadDraft = this.#input.plainText.length > 0 || this.#store.$state.get().images.length > 0
+        if (this.#exitGestures.clear() === "armed" && this.#store.clear() && hadDraft) {
+          const undo = this.#keybindings.getHint("app.editor.undo")
+          this.#notices.promptInfo(undo ? `Input cleared · ${undo} to undo` : "Input cleared")
+        }
+        return
+      }
       case "exit":
         consume(key)
         this.#exitGestures.exit()
@@ -455,6 +472,10 @@ function authenticationActive(workflow: PromptWorkflow): boolean {
 
 function composerSlots(imageCount = 0): ComposerSlots {
   return { topLeft: "", topRight: imageCount === 0 ? [] : [`${imageCount} image${imageCount === 1 ? "" : "s"}`] }
+}
+
+function queuedInputCount(session: ReturnType<InteractiveStore["getSession"]>): number {
+  return session.queuedInputs.steering.length + session.queuedInputs.followUp.length
 }
 
 function footerPresentation(session: ReturnType<InteractiveStore["getSession"]>): PromptFooterPresentation {

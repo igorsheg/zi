@@ -73,6 +73,7 @@ test("real prompt keys admit, present, and restore steering and follow-up queues
     expect(queuedFrame).toContain("Follow-up")
     expect(queuedFrame).toContain("follow-up")
     expect(queuedFrame).toContain("Alt+Up to edit all queued messages")
+    expect(queuedFrame).toContain("Queued · Ctrl+Enter to interrupt with a new prompt")
     // Pending and committed user messages share geometry while pending delivery
     // remains visually distinct through its transparent surface and dim label.
     const queueSpans = setup.captureSpans().lines.flatMap(line => line.spans)
@@ -106,6 +107,59 @@ test("real prompt keys admit, present, and restore steering and follow-up queues
     expect(setup.captureCharFrame()).toContain("No queued messages to restore")
 
     release.resolve()
+    await session.waitForIdle()
+  } finally {
+    session.dispose()
+    setup.destroy()
+  }
+})
+
+test("Ctrl+Enter interrupts the parent turn and sends the current draft", async () => {
+  const models = createModels()
+  const faux = fauxProvider()
+  models.setProvider(faux.provider)
+  const firstStarted = deferred<void>()
+  const replacementStarted = deferred<void>()
+  const replacementRelease = deferred<void>()
+  faux.setResponses([
+    async (_context, options) => {
+      firstStarted.resolve()
+      await new Promise<void>(resolve => {
+        if (options?.signal?.aborted) resolve()
+        else options?.signal?.addEventListener("abort", () => resolve(), { once: true })
+      })
+      return fauxAssistantMessage("interrupted", { stopReason: "aborted" })
+    },
+    async () => {
+      replacementStarted.resolve()
+      await replacementRelease.promise
+      return fauxAssistantMessage("replacement complete")
+    }
+  ])
+  const { session } = await createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
+  const setup = await createInteractiveTest(session, { width: 60, height: 16, kittyKeyboard: true })
+
+  try {
+    await setup.renderOnce()
+    const input = setup.renderer.root.findDescendantById("prompt-input")
+    if (!(input instanceof TextareaRenderable)) throw new Error("Prompt textarea not found")
+
+    input.setText("start")
+    setup.mockInput.pressEnter()
+    await firstStarted.promise
+
+    input.setText("replace the active request")
+    setup.mockInput.pressEnter({ ctrl: true })
+    await replacementStarted.promise
+    await setup.renderOnce()
+
+    expect(input.plainText).toBe("")
+    expect(session.isStreaming).toBe(true)
+    expect(session.isAborting).toBe(false)
+    expect(session.messages.some(message => messageText(message) === "replace the active request")).toBe(true)
+    expect(setup.captureCharFrame()).toContain("Working…")
+
+    replacementRelease.resolve()
     await session.waitForIdle()
   } finally {
     session.dispose()
@@ -211,6 +265,12 @@ test("a maximum queue preserves the constrained composer and Ctrl+C leaves pendi
     expect(session.queuedInputs.steering).toHaveLength(32)
     await setup.renderOnce()
     expect(setup.captureCharFrame()).toContain("32 queued")
+    expect(setup.captureCharFrame()).toContain("Input cleared · Ctrl+Z to undo")
+
+    setup.mockInput.pressKey("z", { ctrl: true })
+    await Promise.resolve()
+    expect(input.plainText).toBe("keep this exact draft")
+    expect(session.queuedInputs.steering).toHaveLength(32)
 
     session.takeQueuedInputs()
     release.resolve()

@@ -114,6 +114,42 @@ test("detached streaming composes one stable activity and unseen-output row", as
   }
 })
 
+test("background shell events live-update the idle transcript status", async () => {
+  const models = createModels()
+  const faux = fauxProvider()
+  models.setProvider(faux.provider)
+  faux.setResponses([
+    fauxAssistantMessage(
+      fauxToolCall(
+        "bash",
+        { command: `node -e "setTimeout(() => {}, 30000)"`, background: true },
+        { id: "background-status" }
+      ),
+      { stopReason: "toolUse" }
+    ),
+    fauxAssistantMessage(fauxThinking("Background command admitted"))
+  ])
+  const { session } = await createAgentRuntime({ cwd: process.cwd(), models, session: { type: "new", persist: false } })
+  const setup = await createInteractiveTest(session, { width: 60, height: 12, kittyKeyboard: true })
+
+  try {
+    await session.prompt("start background work")
+    await renderSettled(setup)
+
+    const task = session.shellTasks.find(candidate => candidate.type === "background")
+    expect(task).toBeDefined()
+    expect(setup.captureCharFrame()).toContain("◎ 1 command still running")
+    expect(setup.captureCharFrame()).not.toContain("Working…")
+
+    if (task) await session.killShellTask(task.taskId)
+    await renderSettled(setup)
+    expect(setup.captureCharFrame()).not.toContain("still running")
+  } finally {
+    session.dispose()
+    setup.destroy()
+  }
+})
+
 test("transcript navigation follows mode-owned keybinding overrides", async () => {
   const session = await createTranscriptSession(4)
   const setup = await createInteractiveTest(session, { width: 48, height: 12, kittyKeyboard: true }, undefined, {

@@ -507,6 +507,7 @@ test("queue operations enforce activity transitions and Escape abort shares sett
   expect(firstAbort.steering.map(entry => entry.text)).toEqual(["restore me"])
   expect(secondAbort.settled).toBe(firstAbort.settled)
   expect(() => session.followUp("too late")).toThrow("Cannot queue input while the agent is aborting")
+  expect(() => session.interruptAndPrompt("too late")).toThrow("while the agent is aborting")
   response.resolve(fauxAssistantMessage("aborted", { stopReason: "aborted" }))
   await firstAbort.settled
   await run
@@ -514,6 +515,7 @@ test("queue operations enforce activity transitions and Escape abort shares sett
 
   session.dispose()
   expect(() => session.prompt("disposed")).toThrow("AgentSession is disposed")
+  expect(() => session.interruptAndPrompt("disposed")).toThrow("AgentSession is disposed")
   expect(() => session.takeQueuedInputs()).toThrow("AgentSession is disposed")
   expect(() => session.setSteeringMode("all", "global")).toThrow("AgentSession is disposed")
   expect(() => session.setFollowUpMode("all", "project")).toThrow("AgentSession is disposed")
@@ -699,6 +701,224 @@ test("public abort preserves queued work and continues it after the aborted core
   session.dispose()
 })
 
+test("interrupt and prompt preserves queue order and settles with the replacement run", async () => {
+  const models = createModels()
+  const faux = fauxProvider()
+  models.setProvider(faux.provider)
+  const firstStarted = deferred<void>()
+  const replacementStarted = deferred<void>()
+  const replacementRelease = deferred<void>()
+  const requests: string[] = []
+  const record = (context: Context) => requests.push(userTexts(context).at(-1) ?? "")
+  faux.setResponses([
+    async (context, options) => {
+      record(context)
+      firstStarted.resolve()
+      await new Promise<void>(resolve => {
+        if (options?.signal?.aborted) resolve()
+        else options?.signal?.addEventListener("abort", () => resolve(), { once: true })
+      })
+      return fauxAssistantMessage("interrupted", { stopReason: "aborted" })
+    },
+    async context => {
+      record(context)
+      replacementStarted.resolve()
+      await replacementRelease.promise
+      return fauxAssistantMessage("replacement response")
+    },
+    context => {
+      record(context)
+      return fauxAssistantMessage("first steering response")
+    },
+    context => {
+      record(context)
+      return fauxAssistantMessage("second steering response")
+    },
+    context => {
+      record(context)
+      return fauxAssistantMessage("first follow-up response")
+    },
+    context => {
+      record(context)
+      return fauxAssistantMessage("second follow-up response")
+    }
+  ])
+  const { session } = await createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
+  let settledEvents = 0
+  const activityEvents: string[] = []
+  const unsubscribe = session.subscribe(event => {
+    if (event.type === "agent_start" || event.type === "agent_settled") activityEvents.push(event.type)
+    if (event.type === "agent_settled") settledEvents++
+  })
+  expect(() => session.interruptAndPrompt("   ")).toThrow("Interrupt prompt cannot be empty")
+  expect(() => session.interruptAndPrompt("idle replacement")).toThrow("while the agent is idle")
+
+  const firstRun = session.prompt("start")
+  await firstStarted.promise
+  session.followUp("follow-1")
+  session.steer("steer-1")
+  session.followUp("follow-2")
+  session.steer("steer-2")
+  const queued = session.queuedInputs
+  const replacementImage: ImageContent = { type: "image", mimeType: "image/png", data: "replacement" }
+
+  let replacementSettled = false
+  const replacement = session.interruptAndPrompt("replacement", [replacementImage])
+  void replacement.then(() => {
+    replacementSettled = true
+    return undefined
+  })
+  expect(session.isAborting).toBe(true)
+  expect(session.queuedInputs).toEqual(queued)
+  expect(() => session.interruptAndPrompt("second replacement")).toThrow("while the agent is aborting")
+
+  await replacementStarted.promise
+  await firstRun
+  expect(settledEvents).toBe(0)
+  expect(activityEvents).toEqual(["agent_start", "agent_start"])
+  expect(replacementSettled).toBe(false)
+  expect(requests).toEqual(["start", "replacement"])
+  replacementRelease.resolve()
+  await replacement
+
+  expect(settledEvents).toBe(1)
+  expect(activityEvents.at(-1)).toBe("agent_settled")
+  expect(activityEvents.join(",")).not.toContain("agent_settled,agent_start")
+  expect(requests).toEqual(["start", "replacement", "steer-1", "steer-2", "follow-1", "follow-2"])
+  expect(session.queuedInputs).toEqual({ steering: [], followUp: [] })
+  const replacementMessage = session.messages.find(
+    message => message.role === "user" && messageText(message) === "replacement"
+  )
+  expect(replacementMessage).toMatchObject({ content: [{ type: "text", text: "replacement" }, replacementImage] })
+  unsubscribe()
+  session.dispose()
+})
+
+test("aborting an interrupt before parent settlement rejects the replacement and prevents stale launch", async () => {
+  const models = createModels()
+  const faux = fauxProvider()
+  models.setProvider(faux.provider)
+  const providerStarted = deferred<void>()
+  const providerRelease = deferred<void>()
+  faux.setResponses([
+    async (_context, options) => {
+      providerStarted.resolve()
+      await new Promise<void>(resolve => {
+        const aborted = () => void providerRelease.promise.then(() => resolve())
+        if (options?.signal?.aborted) aborted()
+        else options?.signal?.addEventListener("abort", aborted, { once: true })
+      })
+      return fauxAssistantMessage("interrupted", { stopReason: "aborted" })
+    },
+    fauxAssistantMessage("must not launch")
+  ])
+  const { session } = await createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
+  let settledEvents = 0
+  session.subscribe(event => {
+    if (event.type === "agent_settled") settledEvents++
+  })
+
+  const firstRun = session.prompt("start")
+  await providerStarted.promise
+  session.steer("restore me")
+  const replacement = session.interruptAndPrompt("must be cancelled")
+  let rejectionCount = 0
+  const replacementFailure = replacement.then(
+    () => undefined,
+    cause => {
+      rejectionCount++
+      return cause
+    }
+  )
+  const aborted = session.takeQueuedInputsAndAbort()
+
+  expect(aborted.steering.map(entry => entry.text)).toEqual(["restore me"])
+  expect(await replacementFailure).toEqual(new Error("Interrupt prompt was cancelled"))
+  expect(rejectionCount).toBe(1)
+  expect(settledEvents).toBe(0)
+
+  providerRelease.resolve()
+  await aborted.settled
+  await firstRun
+
+  expect(faux.state.callCount).toBe(1)
+  expect(settledEvents).toBe(1)
+  expect(session.queuedInputs).toEqual({ steering: [], followUp: [] })
+  expect(userTextsFromMessages(session.messages)).not.toContain("must be cancelled")
+  session.dispose()
+})
+
+test("interrupting the parent run preserves background shell tasks", async () => {
+  const models = createModels()
+  const faux = fauxProvider()
+  models.setProvider(faux.provider)
+  const providerStarted = deferred<void>()
+  faux.setResponses([
+    fauxAssistantMessage(
+      fauxToolCall(
+        "bash",
+        { command: `node -e "setTimeout(() => {}, 30_000)"`, description: "Hold a background task", background: true },
+        { id: "background-before-interrupt" }
+      ),
+      { stopReason: "toolUse" }
+    ),
+    async (_context, options) => {
+      providerStarted.resolve()
+      await new Promise<void>(resolve => {
+        if (options?.signal?.aborted) resolve()
+        else options?.signal?.addEventListener("abort", () => resolve(), { once: true })
+      })
+      return fauxAssistantMessage("interrupted", { stopReason: "aborted" })
+    },
+    fauxAssistantMessage("replacement response")
+  ])
+  const { session } = await createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
+  const firstRun = session.prompt("start background work")
+  await providerStarted.promise
+  const background = session.shellTasks.find(task => task.type === "background")
+  if (!background) throw new Error("Background shell task did not start")
+
+  await session.interruptAndPrompt("replacement")
+  await firstRun
+
+  expect(session.shellTasks.find(task => task.taskId === background.taskId)?.type).toBe("background")
+  await session.killShellTask(background.taskId)
+  session.dispose()
+})
+
+test("disposed interrupt settlement cannot start a stale replacement run", async () => {
+  const models = createModels()
+  const faux = fauxProvider()
+  models.setProvider(faux.provider)
+  const providerStarted = deferred<void>()
+  const providerRelease = deferred<void>()
+  faux.setResponses([
+    async (_context, options) => {
+      providerStarted.resolve()
+      await new Promise<void>(resolve => {
+        const aborted = () => void providerRelease.promise.then(() => resolve())
+        if (options?.signal?.aborted) aborted()
+        else options?.signal?.addEventListener("abort", aborted, { once: true })
+      })
+      return fauxAssistantMessage("interrupted", { stopReason: "aborted" })
+    },
+    fauxAssistantMessage("stale replacement")
+  ])
+  const { session } = await createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
+  const firstRun = session.prompt("start")
+  await providerStarted.promise
+  const replacement = session.interruptAndPrompt("must not start")
+
+  session.dispose()
+  expect((await rejection(replacement)).message).toContain("disposed before the interrupt prompt could start")
+  providerRelease.resolve()
+  await firstRun
+  await session.waitForIdle().catch(() => {})
+
+  expect(faux.state.callCount).toBe(1)
+  expect(userTextsFromMessages(session.messages)).not.toContain("must not start")
+})
+
 test("shutdown abort discards queued work before cancelling the active run", async () => {
   const models = createModels()
   const faux = fauxProvider()
@@ -797,6 +1017,7 @@ test("a failed run detaches the core queue and requires explicit recovery before
 
   expect(session.queuedInputs.steering.map(entry => entry.text)).toEqual(["stale queued"])
   expect(() => session.prompt("second fresh")).toThrow("Restore or discard queued inputs")
+  expect(() => session.interruptAndPrompt("second fresh")).toThrow("Restore or discard queued inputs")
   failPersistence = false
   const recovered = session.takeQueuedInputs()
   expect(recovered.steering.map(entry => entry.text)).toEqual(["stale queued"])

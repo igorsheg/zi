@@ -25,7 +25,22 @@ A plan is bounded to 32 steps. Each trimmed, non-empty step is at most 512 UTF-8
 
 ## Terminal presentation
 
-The interactive terminal shows incomplete steps immediately above the composer. Completed and cancelled steps are omitted. The panel uses at most eight rows, reserves its last row for an omission count when needed, and hides automatically when no incomplete work remains. There is no separate toggle or editable checklist input.
+The interactive terminal shows incomplete plans in the transcript status row:
+
+```text
+◉ Plan · 1/4 · Implement status composition               Alt+P to expand
+```
+
+While the parent agent is running, the `Working…` shimmer always remains visible. The row then composes detached-transcript attention (`New output`), independent background ownership (`◎ 1 command · 2 subagents still running`), and plan progress in that priority order. Exceptional lifecycle states such as cancellation, retry, and compaction appear beside `Working…` instead of replacing it.
+
+By default, press `Alt+P` to expand or collapse the complete plan. Expanded details grow upward into transcript space without changing the composer, and use:
+
+- `✓` completed
+- `◉` in progress
+- `○` pending
+- `–` cancelled
+
+Expanded details are bounded to seven rows plus the status anchor. Long plans show an omission row and keep the current step visible. The expansion preference survives incomplete plan revisions; the status disappears and resets when the plan is completed or cleared.
 
 ## Code Mode and RPC
 

@@ -96,6 +96,21 @@ test("interactive store owns bounded transient tools", async () => {
   }
 })
 
+test("background ownership events invalidate status without rebuilding the transcript", async () => {
+  const session = await createSession("background-status")
+  try {
+    let state = initialInteractiveState(session)
+    state = transitionInteractiveState(state, { type: "shell_task_changed", taskId: "shell-1" })
+    state = transitionInteractiveState(state, { type: "subagent_changed", name: "reviewer" })
+
+    expect(state.promptRevision).toBe(2)
+    expect(state.transcriptRevision).toBe(0)
+    expect(state.tools).toHaveLength(0)
+  } finally {
+    session.dispose()
+  }
+})
+
 test("tool arguments stream through preparing, ready, and running states", async () => {
   const session = await createSession("argument-stream")
   try {
