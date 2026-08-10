@@ -192,7 +192,12 @@ function productDocumentationPrompt(): string {
   const examples = promptPath(paths.examples)
   return `# Zi documentation
 
-For questions or work about Zi itself, read ${docs}/index.md and the relevant linked guides first. Resolve documentation links from ${docs} and example links from ${examples}. Product overview: ${readme}.`
+For questions or work about Zi itself, read ${docs}/index.md and the relevant linked guides first. Resolve documentation links from ${docs} and example links from ${examples}. Product overview: ${readme}.
+
+Customization guides and examples:
+- Extensions: ${docs}/extensions.md and ${examples}/extensions/
+- Skills: ${docs}/skills.md and ${examples}/skills/
+- Subagents: ${docs}/subagents.md and ${examples}/subagents/`
 }
 
 function projectInstructionsPrompt(resources: SessionResources): string {

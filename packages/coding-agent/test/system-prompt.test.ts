@@ -136,6 +136,9 @@ test("the default prompt routes Zi customization work to shipped documentation",
   expect(documentation).toContain(`Resolve documentation links from ${docs}`)
   expect(documentation).toContain(`example links from ${examples}`)
   expect(documentation).toContain(`Product overview: ${readme}`)
+  expect(documentation).toContain(`${docs}/extensions.md and ${examples}/extensions/`)
+  expect(documentation).toContain(`${docs}/skills.md and ${examples}/skills/`)
+  expect(documentation).toContain(`${docs}/subagents.md and ${examples}/subagents/`)
 })
 
 test("a custom prompt owns base and product documentation policy without suppressing other sections", () => {
