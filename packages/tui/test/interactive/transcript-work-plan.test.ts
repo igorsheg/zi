@@ -72,7 +72,7 @@ test("the work plan shares the transcript status slot and expands upward", async
     const composerHeight = composer.height
     const composerY = composer.screenY
     let frame = setup.captureCharFrame()
-    expect(frame).toContain("◉ Plan · 1/3 · Implement status composition (Alt+X to expand)")
+    expect(frame).toContain("Plan (1/3) — Implement status composition (Alt+X to expand)")
     expect(frame).not.toContain("Already done")
     expect(frame).not.toContain("Obsolete path")
 
@@ -80,14 +80,14 @@ test("the work plan shares the transcript status slot and expands upward", async
     await workingStarted.promise
     await setup.renderOnce()
     expect(setup.captureCharFrame()).toContain("Working…")
-    expect(setup.captureCharFrame()).toContain("Plan ·")
+    expect(setup.captureCharFrame()).toContain("Plan (")
     setup.resize(20, 18)
     await setup.renderOnce()
     expect(setup.captureCharFrame()).toContain("Working…")
-    expect(setup.captureCharFrame()).not.toContain("Plan ·")
+    expect(setup.captureCharFrame()).not.toContain("Plan (")
     setup.resize(80, 18)
     await setup.renderOnce()
-    expect(setup.captureCharFrame()).toContain("Plan ·")
+    expect(setup.captureCharFrame()).toContain("Plan (")
     workingRelease.resolve()
     await activeRun
 
@@ -99,7 +99,7 @@ test("the work plan shares the transcript status slot and expands upward", async
     expect(frame).toContain("  ◉ Implement status composition")
     expect(frame).toContain("  ○ Verify layout")
     expect(frame).toContain("  – Obsolete path")
-    expect(frame).toContain("▾ Plan · 1/3 (Alt+X to collapse)")
+    expect(frame).toContain("Plan (1/3) (Alt+X to collapse)")
     expect(composer.height).toBe(composerHeight)
     expect(composer.screenY).toBe(composerY)
 
@@ -114,12 +114,12 @@ test("the work plan shares the transcript status slot and expands upward", async
     await setup.renderOnce()
     expect(status.visible).toBe(true)
     expect(status.height).toBe(5)
-    expect(setup.captureCharFrame()).toContain("▾ Plan · 1/3 (Alt+X to collapse)")
+    expect(setup.captureCharFrame()).toContain("Plan (1/3) (Alt+X to collapse)")
 
     await session.prompt("Finish the work.")
     await setup.renderOnce()
     expect(status.height).toBe(1)
-    expect(setup.captureCharFrame()).not.toContain("Plan ·")
+    expect(setup.captureCharFrame()).not.toContain("Plan (")
   } finally {
     setup.destroy()
   }

@@ -40,11 +40,11 @@ test("retry countdown is visible and the semantic interrupt cancels its backoff"
     await retryStarted.promise
     await setup.renderOnce()
 
-    expect(setup.captureCharFrame()).toContain("Retrying (1/3) in 15s… (Esc to cancel)")
+    expect(setup.captureCharFrame()).toContain("Working… (Retrying 1/3 in 15s…; Esc to cancel)")
     expect(setup.renderer.liveRequestCount).toBe(1)
     now = 3_000
     await setup.renderOnce()
-    expect(setup.captureCharFrame()).toContain("Retrying (1/3) in 13s… (Esc to cancel)")
+    expect(setup.captureCharFrame()).toContain("Working… (Retrying 1/3 in 13s…; Esc to cancel)")
 
     setup.mockInput.pressEscape()
     await session.waitForIdle()

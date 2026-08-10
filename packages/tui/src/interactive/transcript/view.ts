@@ -1117,7 +1117,7 @@ function transcriptActivityStatus(
     const cancel = interruptHint ? `${interruptHint} to cancel` : "interrupt to cancel"
     return {
       type: "working_with_lifecycle",
-      text: `Retrying (${retry.attempt}/${retry.maxAttempts}) in ${seconds}s… (${cancel})`
+      text: `Retrying ${retry.attempt}/${retry.maxAttempts} in ${seconds}s…; ${cancel}`
     }
   }
   if (session.compactionStatus.type === "running") {

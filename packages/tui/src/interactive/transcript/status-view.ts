@@ -69,7 +69,7 @@ export class TranscriptStatusView {
     this.#details = new WorkPlanDetailsView(renderer, theme)
     this.#line = new BoxRenderable(renderer, { height: 1, flexDirection: "row", flexShrink: 0 })
     this.#working = new ShimmerTextView(renderer, "Working…", theme.text.muted, theme.text.primary)
-    this.#workingLifecycleSeparator = statusText(renderer, theme.text.muted, " • ")
+    this.#workingLifecycleSeparator = statusText(renderer, theme.text.muted, " ")
     this.#lifecycle = shrinkingStatusText(renderer, theme.text.primary)
     this.#unseenSeparator = statusText(renderer, theme.text.muted, " • ")
     const tailHint = keybindings.getHint("app.transcript.tail")
@@ -166,11 +166,11 @@ export class TranscriptStatusView {
     const showUnseen = this.#available && presentation.unseenOutput
     const showBackground = this.#available && presentation.background.type === "running"
     const disclosureExpanded = this.#disclosure.type === "expanded" && this.#detailRows > 0
-    const planLabel = plan ? `${disclosureExpanded ? "▾" : plan.currentStatus === "in_progress" ? "◉" : "○"} Plan` : ""
-    const planProgress = plan ? ` · ${plan.completed}/${plan.total}` : ""
+    const planLabel = plan ? "Plan" : ""
+    const planProgress = plan ? ` (${plan.completed}/${plan.total})` : ""
     const planCurrent =
       plan && !disclosureExpanded
-        ? ` · ${plan.currentStatus === "pending" ? "Next: " : ""}${plan.plan.steps[plan.currentIndex]!.text}`
+        ? ` — ${plan.currentStatus === "pending" ? "Next: " : ""}${plan.plan.steps[plan.currentIndex]!.text}`
         : ""
     const planHint = this.#toggleHint
       ? ` (${this.#toggleHint} to ${this.#disclosure.type === "expanded" ? "collapse" : "expand"})`
@@ -202,7 +202,9 @@ export class TranscriptStatusView {
     this.#working.setActive(showWorking)
     this.#workingLifecycleSeparator.visible = showLifecycle
     this.#lifecycle.visible = showLifecycle
-    if (presentation.activity.type === "working_with_lifecycle") this.#lifecycle.content = presentation.activity.text
+    if (presentation.activity.type === "working_with_lifecycle") {
+      this.#lifecycle.content = `(${presentation.activity.text})`
+    }
     this.#unseenSeparator.visible = showWorking && showUnseen
     this.#unseenLabel.visible = showUnseen
     this.#unseenHint.visible = showUnseen && !showBackground && !showPlan

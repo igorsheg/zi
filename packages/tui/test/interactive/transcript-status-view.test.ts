@@ -86,7 +86,7 @@ test("an active plan composes without replacing the working shimmer", async () =
     await setup.renderOnce()
     const frame = setup.captureCharFrame()
     expect(frame).toContain("Working… • New output")
-    expect(frame).toContain("◉ Plan · 1/3")
+    expect(frame).toContain("Plan (1/3)")
     expect(frame).toContain("Alt+P to expand")
     expect(view.canTogglePlan).toBe(true)
     expect(setup.renderer.liveRequestCount).toBe(1)
@@ -110,7 +110,7 @@ test("a pending plan composes its next step with ordinary working activity", asy
     )
     await setup.renderOnce()
     expect(setup.captureCharFrame()).toContain(
-      "Working… • ○ Plan · 0/2 · Next: Inspect status ownership (Alt+P to expand)"
+      "Working… • Plan (0/2) — Next: Inspect status ownership (Alt+P to expand)"
     )
     expect(setup.renderer.liveRequestCount).toBe(1)
   } finally {
@@ -161,7 +161,7 @@ test("background work composes counts without displacing activity, attention, or
     )
     await setup.renderOnce()
     expect(setup.captureCharFrame()).toContain(
-      "Working… • Compacting… • New output • ◎ 2 commands · 1 subagent still running • ◉ Plan · 0/2"
+      "Working… (Compacting…) • New output • ◎ 2 commands · 1 subagent still running • Plan (0/2)"
     )
 
     view.update(presentation({ background: background(1, 2) }), setup.renderer.width, 3)
@@ -221,7 +221,7 @@ test("special activity remains visible and an expanded plan grows above its anch
       4
     )
     await setup.renderOnce()
-    expect(setup.captureCharFrame()).toContain("Working… • Compacting… • ◉ Plan · 1/3 · Implement (Alt+P to expand)")
+    expect(setup.captureCharFrame()).toContain("Working… (Compacting…) • Plan (1/3) — Implement (Alt+P to expand)")
 
     expect(view.togglePlan()).toBe(true)
     await setup.renderOnce()
@@ -231,7 +231,7 @@ test("special activity remains visible and an expanded plan grows above its anch
     expect(frame).toContain("  ◉ Implement")
     expect(frame).toContain("  ○ Verify")
     expect(frame).toContain("  – Discard prototype")
-    expect(frame).toContain("Working… • Compacting… • ▾ Plan · 1/3 (Alt+P to collapse)")
+    expect(frame).toContain("Working… (Compacting…) • Plan (1/3) (Alt+P to collapse)")
 
     expect(view.togglePlan()).toBe(true)
     await setup.renderOnce()
@@ -256,13 +256,13 @@ test("plan disclosure survives revisions and resets after the plan clears", asyn
     view.update(presentation({ workPlan: present(revised, 1) }), setup.renderer.width, 4)
     await setup.renderOnce()
     expect(view.root.height).toBe(3)
-    expect(setup.captureCharFrame()).toContain("▾ Plan · 1/2 (Alt+P to collapse)")
+    expect(setup.captureCharFrame()).toContain("Plan (1/2) (Alt+P to collapse)")
 
     view.update(presentation(), setup.renderer.width, 4)
     view.update(presentation({ workPlan: present(revised, 1) }), setup.renderer.width, 4)
     await setup.renderOnce()
     expect(view.root.height).toBe(1)
-    expect(setup.captureCharFrame()).toContain("◉ Plan · 1/2 · Verify (Alt+P to expand)")
+    expect(setup.captureCharFrame()).toContain("Plan (1/2) — Verify (Alt+P to expand)")
   } finally {
     view.destroy()
     if (!setup.renderer.isDestroyed) setup.renderer.destroy()

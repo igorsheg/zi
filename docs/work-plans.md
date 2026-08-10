@@ -28,7 +28,7 @@ A plan is bounded to 32 steps. Each trimmed, non-empty step is at most 512 UTF-8
 The interactive terminal shows incomplete plans in the transcript status row:
 
 ```text
-◉ Plan · 1/4 · Implement status composition               Alt+P to expand
+Working… • Plan (1/4) — Implement status composition       Alt+P to expand
 ```
 
 While the parent agent is running, the `Working…` shimmer always remains visible. The row then composes detached-transcript attention (`New output`), independent background ownership (`◎ 1 command · 2 subagents still running`), and plan progress in that priority order. Exceptional lifecycle states such as cancellation, retry, and compaction appear beside `Working…` instead of replacing it.
