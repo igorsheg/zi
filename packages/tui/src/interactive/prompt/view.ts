@@ -29,6 +29,7 @@ import { PickerStackView } from "./picker-view.js"
 import { QueuedInputsView } from "./queue-view.js"
 import { promptInputIsSecret, type PromptInputEdit, type PromptWorkflow } from "./state.js"
 import { createPromptStore, type PromptModalActions, type PromptSessionActions, type PromptStore } from "./store.js"
+import { WorkPlanView } from "./work-plan-view.js"
 
 type ExternalEditorState =
   | { readonly type: "idle" }
@@ -47,6 +48,7 @@ export class PromptView {
   readonly #store: PromptStore
   readonly #authCeremony: AuthCeremonyView
   readonly #queue: QueuedInputsView
+  readonly #workPlan: WorkPlanView
   readonly #greeter: SessionGreeterView
   readonly #composer: Composer
   readonly #footer: PromptFooterView
@@ -84,6 +86,7 @@ export class PromptView {
 
     this.#authCeremony = new AuthCeremonyView(renderer, browserOpener, theme)
     this.#queue = new QueuedInputsView(renderer, keybindings, theme)
+    this.#workPlan = new WorkPlanView(renderer, theme)
     this.#greeter = new SessionGreeterView(renderer, theme)
 
     const session = interactive.getSession()
@@ -116,6 +119,7 @@ export class PromptView {
     this.root.add(this.#authCeremony.root)
     this.root.add(this.#queue.root)
     this.root.add(this.#greeter.root)
+    this.root.add(this.#workPlan.root)
     this.root.add(this.#composer.root)
     this.root.add(this.#footer.root)
     this.root.add(this.#pickerStack.root)
@@ -146,6 +150,7 @@ export class PromptView {
     for (const release of this.#release.splice(0)) release()
     this.#authCeremony.destroy()
     this.#queue.destroy()
+    this.#workPlan.destroy()
     this.#greeter.destroy()
     this.#footer.destroy()
     this.#store.dispose()
@@ -195,9 +200,20 @@ export class PromptView {
     const fixedRows = fixedRowsWithoutFooter + footerRows
     const pickerVisible = this.#pickerStack.update(Math.max(0, this.#renderer.height - fixedRows))
 
-    if (pickerVisible) this.#queue.hide()
-    else
-      this.#queue.update(queuedInputs, Math.max(0, this.#renderer.height - composerRows - otherFixedRows - footerRows))
+    if (pickerVisible) {
+      this.#queue.hide()
+      this.#workPlan.update(session.workPlan, this.#renderer.width, 0)
+    } else {
+      const workPlanRows = this.#workPlan.update(
+        session.workPlan,
+        this.#renderer.width,
+        Math.max(0, this.#renderer.height - composerRows - otherFixedRows - footerRows - reservedContentRows)
+      )
+      this.#queue.update(
+        queuedInputs,
+        Math.max(0, this.#renderer.height - composerRows - otherFixedRows - footerRows - workPlanRows)
+      )
+    }
   }
 
   #submit(delivery: "steer" | "followUp"): void {

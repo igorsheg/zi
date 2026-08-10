@@ -395,6 +395,36 @@ test("all built-ins accept streamed partial arguments with one semantic placehol
   }
 })
 
+test("work plan presentation summarizes status without repeating step text", () => {
+  const presentation = projectToolPresentation({
+    status: "done",
+    name: "update_plan",
+    args: {},
+    result: {
+      content: [{ type: "text", text: "Plan updated to revision 3." }],
+      details: {
+        revision: 3,
+        explanation: "Adjusted after inspection",
+        steps: [
+          { text: "Inspect", status: "completed" },
+          { text: "Implement", status: "in_progress" },
+          { text: "Verify", status: "pending" },
+          { text: "Obsolete", status: "cancelled" }
+        ]
+      }
+    }
+  })
+
+  expect(presentation.header).toEqual({
+    label: "Plan",
+    subject: { type: "text", text: "4 steps" },
+    details: ["1 pending", "1 completed", "1 cancelled"],
+    status: "in progress"
+  })
+  expect(presentation.body).toEqual({ type: "text", text: "Adjusted after inspection", tone: "muted" })
+  expect(JSON.stringify(presentation)).not.toContain("Obsolete")
+})
+
 test("malformed terminal built-ins stay semantic while unknown tools use the bounded generic projection", () => {
   const malformed = projectToolPresentation({
     status: "done",

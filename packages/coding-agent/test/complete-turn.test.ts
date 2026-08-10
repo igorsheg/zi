@@ -62,6 +62,90 @@ test("built-in expected failures keep typed details and are finalized as Pi erro
   }
 })
 
+test("update_plan changes the authoritative session plan and emits journal evidence", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-work-plan-turn-"))
+  const models = createModels()
+  const faux = fauxProvider({ tokensPerSecond: 10_000 })
+  models.setProvider(faux.provider)
+  faux.setResponses([
+    fauxAssistantMessage(
+      fauxToolCall(
+        "update_plan",
+        {
+          explanation: "Starting implementation",
+          steps: [
+            { text: "Inspect", status: "completed" },
+            { text: "Implement", status: "in_progress" },
+            { text: "Verify", status: "pending" }
+          ]
+        },
+        { id: "plan-1" }
+      ),
+      { stopReason: "toolUse" }
+    ),
+    fauxAssistantMessage("Implementation started.")
+  ])
+  const { session } = await createAgentRuntime({
+    cwd: root,
+    model: "faux/faux-1",
+    models,
+    session: { type: "new", persist: true }
+  })
+  const events: string[] = []
+  let workPlanEntries = 0
+  session.subscribe(event => {
+    events.push(event.type)
+    if (event.type === "entry_appended" && event.entry.type === "work_plan") workPlanEntries++
+  })
+
+  try {
+    await session.prompt("Implement the change.")
+    expect(session.workPlan).toEqual({
+      revision: 1,
+      explanation: "Starting implementation",
+      steps: [
+        { text: "Inspect", status: "completed" },
+        { text: "Implement", status: "in_progress" },
+        { text: "Verify", status: "pending" }
+      ]
+    })
+    expect(
+      session.messages.find(message => message.role === "toolResult" && message.toolCallId === "plan-1")
+    ).toMatchObject({ isError: false, details: { revision: 1 } })
+    expect(events.filter(event => event === "work_plan_changed")).toHaveLength(1)
+    expect(workPlanEntries).toBe(1)
+
+    const file = session.sessionManager.file
+    if (!file) throw new Error("Expected persistent work plan journal")
+    session.dispose()
+    faux.setResponses([
+      fauxAssistantMessage(
+        fauxToolCall("update_plan", { steps: [{ text: "Verify", status: "completed" }] }, { id: "plan-2" }),
+        { stopReason: "toolUse" }
+      ),
+      fauxAssistantMessage("Verified.")
+    ])
+    const resumed = await createAgentRuntime({
+      cwd: "/ignored-on-resume",
+      model: "faux/faux-1",
+      models,
+      session: { type: "resume", file }
+    })
+    try {
+      expect(resumed.session.workPlan).toEqual(session.workPlan)
+      const resumedEvents: string[] = []
+      resumed.session.subscribe(event => resumedEvents.push(event.type))
+      await resumed.session.prompt("Finish verification.")
+      expect(resumed.session.workPlan).toEqual({ revision: 2, steps: [{ text: "Verify", status: "completed" }] })
+      expect(resumedEvents.filter(event => event === "work_plan_changed")).toHaveLength(1)
+    } finally {
+      resumed.session.dispose()
+    }
+  } finally {
+    session.dispose()
+  }
+})
+
 test("code runs through the normal turn lifecycle with durable nested evidence", async () => {
   const root = await mkdtemp(join(tmpdir(), "zi-code-turn-"))
   await writeFile(join(root, "input.txt"), "needle\n")

@@ -116,6 +116,66 @@ test("queue-only RPC delivery remains pending without waking an idle child sessi
   }
 })
 
+test("RPC mode projects work plan state and its ordered durable events", async () => {
+  const models = createModels()
+  const faux = fauxProvider()
+  models.setProvider(faux.provider)
+  faux.setResponses([
+    fauxAssistantMessage(
+      fauxToolCall("update_plan", { steps: [{ text: "Verify RPC", status: "in_progress" }] }, { id: "rpc-plan" }),
+      { stopReason: "toolUse" }
+    ),
+    fauxAssistantMessage("Plan visible.")
+  ])
+  const runtime = await createTestAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
+  const input = new RpcTestInput()
+  const output = new RpcTestOutput()
+  const running = runRpcMode(runtime.session, { input, writer: output })
+
+  try {
+    await output.frame(frame => frame.type === "ready")
+    input.send({
+      version: 1,
+      id: "prompt-plan",
+      method: "session.prompt",
+      params: { delivery: "direct", text: "Plan the RPC test.", completionId: "rpc-plan-cycle" }
+    })
+    await output.response("prompt-plan")
+    input.send({
+      version: 1,
+      id: "idle-plan",
+      method: "session.await_idle",
+      params: { completionId: "rpc-plan-cycle" }
+    })
+    await output.response("idle-plan")
+
+    const workEvents = output.frames.filter(
+      (frame): frame is Extract<RpcServerFrame, { type: "session_event" }> =>
+        frame.type === "session_event" &&
+        (frame.event.type === "work_plan_changed" ||
+          (frame.event.type === "entry_appended" && frame.event.entry.type === "work_plan"))
+    )
+    expect(workEvents.map(frame => frame.event.type)).toEqual(["entry_appended", "work_plan_changed"])
+    expect(workEvents[1]).toMatchObject({
+      event: {
+        type: "work_plan_changed",
+        plan: { revision: 1, steps: [{ text: "Verify RPC", status: "in_progress" }] }
+      }
+    })
+
+    input.send({ version: 1, id: "state-plan", method: "session.get_state" })
+    expect(await output.response("state-plan")).toMatchObject({
+      ok: true,
+      result: { workPlan: { revision: 1, steps: [{ text: "Verify RPC", status: "in_progress" }] } }
+    })
+  } finally {
+    input.close()
+    await running
+    runtime.session.dispose()
+    await runtime.session.waitForIdle()
+  }
+})
+
 test("RPC mode sequences authoritative events, concurrent interruption, and paged session state", async () => {
   const models = createModels()
   const faux = fauxProvider({ provider: "rpc", models: [{ id: "model", name: "RPC Model", reasoning: true }] })
@@ -148,6 +208,7 @@ test("RPC mode sequences authoritative events, concurrent interruption, and page
       state: {
         sessionId: runtime.session.sessionId,
         activity: { type: "idle" },
+        workPlan: { revision: 0, steps: [] },
         model: { type: "selected", model: { provider: "rpc", id: "model", name: "RPC Model" } }
       }
     })

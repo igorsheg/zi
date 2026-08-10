@@ -16,6 +16,8 @@ import { createProcessTreeTracker, type ProcessScope, type ProcessTreeTracker } 
 import { SessionManager } from "../src/session-manager.js"
 import { createModels, createTestAgentRuntime, fauxAssistantMessage, fauxProvider } from "../src/testing.js"
 import { createReadTool } from "../src/tools/read.js"
+import { createUpdatePlanTool } from "../src/tools/work-plan.js"
+import { WorkPlan } from "../src/work-plan.js"
 
 const workerCommand = Object.freeze([
   process.execPath,
@@ -87,7 +89,7 @@ test("new Zi sessions expose direct coding tools and code by default", async () 
 
   try {
     await runtime.session.prompt("inspect tools")
-    expect(catalog).toEqual(["read", "bash", "edit", "write", "task_output", "kill_task", "code"])
+    expect(catalog).toEqual(["read", "bash", "edit", "write", "task_output", "kill_task", "update_plan", "code"])
   } finally {
     runtime.session.dispose()
     await runtime.session.waitForIdle()
@@ -189,6 +191,36 @@ test("code exposes declared native values instead of presentation envelopes", as
   )
 
   expect(result.content).toEqual([{ type: "text", text: "12" }])
+})
+
+test("code updates the authoritative work plan through its native JSON contract", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "zi-code-mode-work-plan-"))
+  const manager = SessionManager.inMemory(cwd)
+  const workPlan = new WorkPlan(manager)
+  const tool = createCodeMode(cwd).createTool([createUpdatePlanTool(workPlan)])
+  const result = await tool.execute(
+    "outer",
+    {
+      code: `async () => zi.update_plan({
+  explanation: "From Code Mode",
+  steps: [{ text: "Verify", status: "in_progress" }]
+})`
+    },
+    undefined
+  )
+
+  if (result.content[0]?.type !== "text") throw new Error("Expected Code Mode JSON result")
+  expect(JSON.parse(result.content[0].text)).toEqual({
+    revision: 1,
+    explanation: "From Code Mode",
+    steps: [{ text: "Verify", status: "in_progress" }]
+  })
+  expect(workPlan.snapshot).toEqual({
+    revision: 1,
+    explanation: "From Code Mode",
+    steps: [{ text: "Verify", status: "in_progress" }]
+  })
+  expect(manager.latestWorkPlan()).toMatchObject({ type: "work_plan", revision: 1 })
 })
 
 test("code serializes guest-created calls for deterministic mutation order", async () => {

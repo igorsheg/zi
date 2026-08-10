@@ -17,6 +17,7 @@ export function buildSystemPrompt(
 
   const sections = [prompt]
   if (toolSurface) sections.push(codeModeDoctrine(toolSurface))
+  if (tools.some(tool => tool.name === "update_plan")) sections.push(workPlanDoctrine())
   if (tools.some(tool => tool.name === "send_peer_message")) sections.push(peerMessagingDoctrine())
   if (resources.systemPrompt === undefined) sections.push(productDocumentationPrompt())
   if (resources.appendSystemPrompt.length > 0) sections.push(resources.appendSystemPrompt.join("\n\n"))
@@ -67,12 +68,22 @@ Guidelines:
 - Show file paths clearly`
 }
 
+function workPlanDoctrine(): string {
+  return `## Work plans
+Use update_plan to keep a concise work plan for non-trivial work with at least three distinct steps.
+- Skip the plan for simple, single-step requests.
+- Keep at most one step in_progress while work remains.
+- Mark a step completed only after its result is verified.
+- Mark obsolete or deliberately skipped steps cancelled.
+- Replace the complete plan when priorities or scope change; do not repeat the plan in prose after updating it.`
+}
+
 function productDocumentationPrompt(): string {
   const paths = getProductDocumentationPaths()
   const readme = promptPath(paths.readme)
   const docs = promptPath(paths.docs)
   const examples = promptPath(paths.examples)
-  return `Zi documentation (read only when the user asks about Zi itself, configuration, extensions, skills, prompts, Code Mode, subagents, notifications, JSON, RPC, or the terminal client):
+  return `Zi documentation (read only when the user asks about Zi itself, configuration, extensions, skills, prompts, Code Mode, work plans, subagents, notifications, JSON, RPC, or the terminal client):
 - Documentation index: ${docs}/index.md
 - Product README: ${readme}
 - Documentation directory: ${docs}
@@ -87,6 +98,7 @@ function productDocumentationPrompt(): string {
 - When asked about RPC, read ${docs}/rpc.md and ${examples}/rpc/
 - When asked about extensions, read ${docs}/extensions.md and ${examples}/extensions/
 - When asked about Code Mode or the programmatic runtime, read ${docs}/code-mode.md
+- When asked about work plans, read ${docs}/work-plans.md
 - When asked about skills, read ${docs}/skills.md and ${examples}/skills/
 - When asked about subagents, read ${docs}/subagents.md and ${examples}/subagents/
 - When working on Zi topics, read the relevant documentation and examples before implementing, and follow Markdown cross-references`

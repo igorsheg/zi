@@ -588,7 +588,7 @@ test("threshold failure keeps the original tool-loop context and suppresses repe
 })
 
 test("Codex context-window failure stays durable while one compact-and-continue recovery succeeds", async () => {
-  const setup = await compactionSession({ oldTextBytes: 100, contextWindow: 1_000 })
+  const setup = await compactionSession({ oldTextBytes: 100, contextWindow: 4_000 })
   setup.faux.setResponses([
     fauxAssistantMessage("", {
       stopReason: "error",

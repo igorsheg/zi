@@ -26,6 +26,8 @@ import { SubagentSupervisor } from "./subagents/supervisor.js"
 import { buildSystemPrompt } from "./system-prompt.js"
 import { snapshotToolSurface, type ToolSurface } from "./tool-surface.js"
 import { isBuiltInToolError } from "./tools/index.js"
+import { createUpdatePlanTool } from "./tools/work-plan.js"
+import { WorkPlan } from "./work-plan.js"
 
 export interface AgentSessionServices {
   readonly paths: ZiPaths
@@ -125,7 +127,11 @@ export async function createAgentSessionWithProcessTreeTracker(
   let session: AgentSession | undefined
   const peerMessenger = options.internalSubagentDepth === 1 ? new PeerMessenger() : undefined
   const peerTools = peerMessenger?.createTools() ?? []
-  const sessionTools = Object.freeze([...options.tools, ...peerTools])
+  if (options.tools.some(tool => tool.name === "update_plan")) {
+    throw new Error("The tool name update_plan is reserved for the native work plan")
+  }
+  const workPlan = new WorkPlan(sessionManager)
+  const sessionTools = Object.freeze([...options.tools, createUpdatePlanTool(workPlan), ...peerTools])
   const subagents =
     options.subagentCommand && options.internalSubagentDepth !== 1
       ? new SubagentSupervisor({
@@ -218,6 +224,7 @@ export async function createAgentSessionWithProcessTreeTracker(
     ...(options.extensionHost ? { extensionHost: options.extensionHost } : {}),
     extensionContext: createExtensionContext(options.extensionMode ?? "embedded", services, sessionManager),
     processTreeTracker,
+    workPlan,
     ...(options.shell ? { shell: options.shell } : {}),
     ...(model ? { model } : {}),
     ...(options.apiKey && model ? { apiKeyProvider: model.provider } : {})

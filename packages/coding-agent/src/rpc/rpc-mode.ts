@@ -74,6 +74,7 @@ export interface RpcSessionState {
   readonly steeringMode: AgentSession["steeringMode"]
   readonly followUpMode: AgentSession["followUpMode"]
   readonly queuedInputs: QueuedInputs
+  readonly workPlan: AgentSession["workPlan"]
   readonly messageCount: number
   readonly streamingMessage?: AgentMessage
   readonly compaction: CompactionStatus
@@ -95,6 +96,7 @@ export type RpcSessionEntry =
   | Extract<SessionEntry, { readonly type: "retry" }>
   | Extract<SessionEntry, { readonly type: "compaction" }>
   | Extract<SessionEntry, { readonly type: "subagent" }>
+  | Extract<SessionEntry, { readonly type: "work_plan" }>
   | CustomEntry
   | CustomMessageEntry
 
@@ -570,6 +572,7 @@ function sessionState(session: AgentSession): RpcSessionState {
     steeringMode: session.steeringMode,
     followUpMode: session.followUpMode,
     queuedInputs: session.queuedInputs,
+    workPlan: session.workPlan,
     messageCount: session.messages.length,
     ...(streamingMessage ? { streamingMessage } : {}),
     compaction,

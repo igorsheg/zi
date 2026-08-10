@@ -29,6 +29,7 @@ import {
   type SessionColdBlock,
   visitSessionColdLines
 } from "./session-cold-history.js"
+import { isWorkPlanSnapshot, type WorkPlanSnapshot, type WorkPlanStep } from "./work-plan.js"
 
 export type SessionFormatVersion = 1 | 2
 
@@ -103,6 +104,13 @@ export interface CustomMessageInput {
   readonly details?: SessionJson
 }
 
+export interface WorkPlanEntryData {
+  readonly type: "work_plan"
+  readonly revision: number
+  readonly explanation?: string
+  readonly steps: readonly WorkPlanStep[]
+}
+
 export type SubagentCompletionStatus = "completed" | "failed" | "cancelled"
 
 export type SubagentEntryData =
@@ -153,6 +161,7 @@ export type SessionEntryData =
   | CompactionEntryData
   | CustomEntryData
   | CustomMessageEntryData
+  | WorkPlanEntryData
   | SubagentEntryData
 
 export type SessionEntry = SessionEntryBase & SessionEntryData
@@ -161,6 +170,7 @@ export type RetryEntry = SessionEntryBase & RetryEntryData
 export type CompactionEntry = SessionEntryBase & CompactionEntryData
 export type CustomEntry = SessionEntryBase & CustomEntryData
 export type CustomMessageEntry = SessionEntryBase & CustomMessageEntryData
+export type WorkPlanEntry = SessionEntryBase & WorkPlanEntryData
 export type SubagentEntry = SessionEntryBase & SubagentEntryData
 
 export interface NewSessionOptions {
@@ -328,6 +338,7 @@ interface LoadedJournal {
   readonly customStateBytes: number
   readonly programStateEntries: number
   readonly programStateBytes: number
+  readonly workPlan: WorkPlanEntry | undefined
   readonly appendRepair?: { readonly type: "truncate"; readonly offset: number } | { readonly type: "newline" }
 }
 
@@ -372,6 +383,7 @@ export class SessionManager {
   #imageBlobBytes = 0
   #model: SessionModel | undefined
   #thinkingLevel: ThinkingLevel | undefined
+  #workPlan: WorkPlanEntry | undefined
 
   private constructor(
     cwd: string,
@@ -424,6 +436,7 @@ export class SessionManager {
     manager.#customStateBytes = loaded.customStateBytes
     manager.#programStateEntries = loaded.programStateEntries
     manager.#programStateBytes = loaded.programStateBytes
+    manager.#workPlan = loaded.workPlan
     for (const [digest, bytes] of loaded.imageBlobs) manager.#imageBlobs.set(digest, bytes)
     manager.#model = loaded.model
     manager.#thinkingLevel = loaded.thinkingLevel
@@ -558,6 +571,22 @@ export class SessionManager {
 
   appendCompaction(data: Omit<CompactionEntryData, "type">): CompactionEntry {
     return this.#append({ type: "compaction", ...data })
+  }
+
+  appendWorkPlan(plan: WorkPlanSnapshot): WorkPlanEntry {
+    if (!isWorkPlanSnapshot(plan) || plan.revision !== (this.#workPlan?.revision ?? 0) + 1) {
+      throw new Error("Invalid work plan")
+    }
+    return this.#append({
+      type: "work_plan",
+      revision: plan.revision,
+      ...(plan.explanation === undefined ? {} : { explanation: plan.explanation }),
+      steps: plan.steps.map(step => ({ ...step }))
+    })
+  }
+
+  latestWorkPlan(): WorkPlanEntry | undefined {
+    return this.#workPlan
   }
 
   appendSubagent(data: SubagentEntryInput): SubagentEntry {
@@ -697,6 +726,7 @@ export class SessionManager {
     validateNextEntry(next, this.#entries, this.file ?? "<memory>")
     if (next.type === "custom") freezeCustomEntry(next)
     else if (next.type === "custom_message") freezeCustomMessageEntry(next)
+    else if (next.type === "work_plan") freezeWorkPlanEntry(next)
 
     const isProgramStateEntry = next.type === "custom" && next.customType === programStateCustomType
     const isPublicCustomEntry = next.type === "custom" && !isProgramStateEntry
@@ -747,6 +777,7 @@ export class SessionManager {
     this.#updatePresentationMessages(next)
     this.#considerPromptHistoryEntry(next)
     this.#considerSessionContextEntry(next)
+    if (next.type === "work_plan") this.#workPlan = next
     this.#leafId = next.id
     if (preparedCompaction) this.#pruneCompactedPrefix(preparedCompaction)
     return next
@@ -932,6 +963,7 @@ function loadJournal(file: string, retention: "active" | "all"): LoadedJournal {
   let latestBoundaryId: string | undefined
   let model: SessionModel | undefined
   let thinkingLevel: ThinkingLevel | undefined
+  let workPlan: WorkPlanEntry | undefined
 
   try {
     let firstRecord = true
@@ -980,7 +1012,10 @@ function loadJournal(file: string, retention: "active" | "all"): LoadedJournal {
       }
       if (entry.type === "model_change") model = { provider: entry.provider, modelId: entry.modelId }
       else if (entry.type === "thinking_level_change") thinkingLevel = entry.thinkingLevel
-      else if (entry.type === "message") {
+      else if (entry.type === "work_plan") {
+        if (entry.revision !== (workPlan?.revision ?? 0) + 1) throw new Error(`Invalid work plan revision: ${file}`)
+        workPlan = freezeWorkPlanEntry(entry)
+      } else if (entry.type === "message") {
         if (entry.message.role === "assistant") {
           model = { provider: String(entry.message.provider), modelId: String(entry.message.model) }
         } else if (entry.message.role === "user") {
@@ -1059,6 +1094,7 @@ function loadJournal(file: string, retention: "active" | "all"): LoadedJournal {
       customStateBytes,
       programStateEntries,
       programStateBytes,
+      workPlan,
       ...(repair === "truncate"
         ? { appendRepair: { type: "truncate" as const, offset: validBytes } }
         : repair === "newline"
@@ -1181,6 +1217,15 @@ function parseStoredEntry(line: string, file: string, version: SessionFormatVers
       ...(value.details === undefined ? {} : { details: value.details })
     }
   }
+  if (value.type === "work_plan" && isStoredWorkPlanEntry(value)) {
+    return {
+      ...base,
+      type: value.type,
+      revision: value.revision,
+      ...(value.explanation === undefined ? {} : { explanation: value.explanation }),
+      steps: value.steps
+    }
+  }
   if (value.type === "subagent" && isSubagentEntryData(value)) {
     return { ...base, ...value }
   }
@@ -1208,6 +1253,7 @@ function hydrateStoredEntry(entry: StoredSessionEntry, file: string | undefined)
     return { ...entry, message }
   }
   if (entry.type === "custom") return freezeCustomEntry(entry)
+  if (entry.type === "work_plan") return freezeWorkPlanEntry(entry)
   if (entry.type === "custom_message") {
     const content = hydrateStoredContent(entry.content, file)
     if (!isRuntimeCustomMessageContent(content)) {
@@ -1564,6 +1610,12 @@ function freezeCustomMessageEntry(entry: CustomMessageEntry): CustomMessageEntry
   return Object.freeze(entry)
 }
 
+function freezeWorkPlanEntry(entry: WorkPlanEntry): WorkPlanEntry {
+  for (const step of entry.steps) Object.freeze(step)
+  Object.freeze(entry.steps)
+  return Object.freeze(entry)
+}
+
 function freezeSessionJson(value: SessionJson): void {
   if (value === null || typeof value !== "object") return
   const pending: object[] = [value]
@@ -1640,6 +1692,21 @@ function isStoredCustomMessageEntry(
     typeof value.display === "boolean" &&
     (value.details === undefined || isSessionJson(value.details))
   )
+}
+
+function isStoredWorkPlanEntry(value: unknown): value is WorkPlanEntry {
+  if (
+    !isRecord(value) ||
+    !hasOnlyKeys(value, ["type", "id", "parentId", "timestamp", "revision", "explanation", "steps"])
+  ) {
+    return false
+  }
+  const snapshot = {
+    revision: value.revision,
+    ...(value.explanation === undefined ? {} : { explanation: value.explanation }),
+    steps: value.steps
+  }
+  return value.type === "work_plan" && isWorkPlanSnapshot(snapshot) && snapshot.revision >= 1
 }
 
 function isRuntimeCustomMessageContent(value: unknown): value is CustomMessageContent {
@@ -1925,12 +1992,17 @@ function isBoundedPathList(value: unknown): value is string[] {
 
 function validateJournal(entries: readonly SessionEntry[], file: string): void {
   const ids = new Set<string>()
+  let workPlanRevision = 0
   for (let index = 0; index < entries.length; index++) {
     const entry = entries[index]!
     if (ids.has(entry.id) || entry.parentId !== (entries[index - 1]?.id ?? null)) {
       throw new Error(`Invalid session entry: ${file}`)
     }
     validateNextEntry(entry, entries.slice(0, index), file)
+    if (entry.type === "work_plan") {
+      if (entry.revision !== workPlanRevision + 1) throw new Error(`Invalid work plan revision: ${file}`)
+      workPlanRevision = entry.revision
+    }
     ids.add(entry.id)
   }
 }
@@ -1946,6 +2018,10 @@ function validateNextEntry(next: SessionEntry, preceding: readonly SessionEntry[
   }
   if (next.type === "subagent") {
     if (!isSubagentEntryData(next)) throw new Error(`Invalid session entry: ${file}`)
+    return
+  }
+  if (next.type === "work_plan") {
+    if (!isStoredWorkPlanEntry(next)) throw new Error(`Invalid session entry: ${file}`)
     return
   }
   if (next.type === "retry") {
@@ -2035,6 +2111,7 @@ export function sessionEntryToContextMessage(entry: SessionEntry): AgentMessage 
     case "thinking_level_change":
     case "retry":
     case "subagent":
+    case "work_plan":
       return undefined
     default:
       return assertNever(entry)
@@ -2054,6 +2131,7 @@ function sessionEntryToPresentationMessage(entry: SessionEntry): AgentMessage | 
     case "thinking_level_change":
     case "retry":
     case "subagent":
+    case "work_plan":
       return undefined
     default:
       return assertNever(entry)

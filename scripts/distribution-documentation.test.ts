@@ -28,7 +28,8 @@ test("distribution documentation ships self-customization guides and examples", 
       "rpc.md",
       "settings.md",
       "skills.md",
-      "subagents.md"
+      "subagents.md",
+      "work-plans.md"
     ])
     expect(existsSync(join(destination, "docs", "index.md"))).toBe(true)
     expect(existsSync(join(destination, "docs", "code-mode.md"))).toBe(true)
@@ -37,6 +38,7 @@ test("distribution documentation ships self-customization guides and examples", 
     expect(existsSync(join(destination, "docs", "prompts.md"))).toBe(true)
     expect(existsSync(join(destination, "docs", "skills.md"))).toBe(true)
     expect(existsSync(join(destination, "docs", "subagents.md"))).toBe(true)
+    expect(existsSync(join(destination, "docs", "work-plans.md"))).toBe(true)
     expect(existsSync(join(destination, "examples", "extensions", "custom-tool", "index.ts"))).toBe(true)
     expect(existsSync(join(destination, "examples", "extensions", "durable-counter", "index.ts"))).toBe(true)
     expect(existsSync(join(destination, "examples", "extensions", "herdr-agent-state", "index.ts"))).toBe(true)

@@ -6,6 +6,7 @@ import { projectRead } from "./read.js"
 import { projectKillTask, projectTaskOutput } from "./shell-task.js"
 import { projectSubagent } from "./subagent.js"
 import type { ToolPresentation, ToolPresentationSource } from "./types.js"
+import { projectWorkPlan } from "./work-plan.js"
 import { projectWrite } from "./write.js"
 
 export function projectToolPresentation(source: ToolPresentationSource): ToolPresentation {
@@ -31,6 +32,9 @@ export function projectToolPresentation(source: ToolPresentationSource): ToolPre
       break
     case "kill_task":
       presentation = projectKillTask(source)
+      break
+    case "update_plan":
+      presentation = projectWorkPlan(source)
       break
     case "list_subagent_profiles":
     case "spawn_subagent":

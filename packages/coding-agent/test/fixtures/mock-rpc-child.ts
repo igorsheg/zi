@@ -116,6 +116,7 @@ send({
     steeringMode: "one-at-a-time",
     followUpMode: "one-at-a-time",
     queuedInputs: { steering: [], followUp: [] },
+    workPlan: { revision: 0, steps: [] },
     messageCount: 0,
     compaction: { type: "idle" },
     retry: { type: "idle" },
@@ -145,6 +146,7 @@ async function handle(request: { id: string; method: string; params?: RequestPar
       result: {
         sessionId: "mock-child-session",
         activity: { type: busy ? "running" : "idle" },
+        workPlan: { revision: 0, steps: [] },
         messageCount: messages.length
       }
     })

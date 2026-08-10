@@ -607,6 +607,50 @@ test("persisted compaction markers restore the same active projection", async ()
   expect(restored.entries()).toHaveLength(4)
 })
 
+test("work plans restore from cold journal history and keep revisions append-only", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-session-work-plan-"))
+  const paths = new ZiPaths(join(root, "project"), join(root, "global"))
+  const session = SessionManager.create(paths)
+  const first = session.appendWorkPlan({
+    revision: 1,
+    explanation: "Initial approach",
+    steps: [{ text: "Inspect", status: "in_progress" }]
+  })
+  session.appendMessage({ role: "user", content: "old", timestamp: 1 })
+  const kept = session.appendMessage({ role: "user", content: "kept", timestamp: 2 })
+  session.appendMessage(assistantMessage(3))
+  session.appendCompaction({
+    reason: "manual",
+    summary: "restored summary",
+    firstKeptEntryId: kept.id,
+    tokensBefore: 100,
+    estimatedTokensAfter: 10,
+    details: emptyCompactionDetails()
+  })
+
+  const restored = SessionManager.open(session.file!)
+  expect(restored.latestWorkPlan()).toEqual(first)
+  expect(Object.isFrozen(restored.latestWorkPlan())).toBe(true)
+  expect(restored.activeMessages().some(message => message.role === "custom")).toBe(false)
+  const second = restored.appendWorkPlan({ revision: 2, steps: [{ text: "Verify", status: "pending" }] })
+  expect(SessionManager.open(session.file!).latestWorkPlan()).toEqual(second)
+  expect(() => restored.appendWorkPlan({ revision: 4, steps: [] })).toThrow("Invalid work plan")
+
+  await appendFile(
+    session.file!,
+    `${JSON.stringify({
+      type: "work_plan",
+      id: crypto.randomUUID(),
+      parentId: second.id,
+      timestamp: new Date().toISOString(),
+      revision: 4,
+      steps: []
+    })}\n`
+  )
+  expect(() => SessionManager.open(session.file!)).toThrow("Invalid work plan revision")
+  await rm(root, { recursive: true, force: true })
+})
+
 test("overflow failures remain durable but are omitted from active context", () => {
   const session = SessionManager.inMemory("/work")
   const prompt = session.appendMessage({ role: "user", content: "retry me", timestamp: 1 })

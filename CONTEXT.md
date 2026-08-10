@@ -12,6 +12,10 @@ _Avoid_: Pi coding agent, runtime
 One coding conversation and its policy: active model, session resources, tools, durable history, queueing, compaction, retries, and its bound extension lifecycle.
 _Avoid_: Chat, agent core
 
+**Work plan**:
+The session-scoped ordered checklist for non-trivial work. It is a complete bounded snapshot of concise steps and their `pending`, `in_progress`, `completed`, or `cancelled` status, with at most one step in progress. Replacements are appended to the session journal, projected by `AgentSession`, and rendered without a second mutable copy.
+_Avoid_: Task list, project plan, backlog, shell task
+
 **Session journal**:
 The append-only JSONL authority for one agent session's durable history. Format 2 stores image bytes in content-addressed session image blobs while journal records retain validated references. The session journal owns aggregate storage admission, transactional appends, torn-tail repair on the next append, streaming restore, and deletion of its blob directory.
 _Avoid_: Transcript cache, provider context, message database

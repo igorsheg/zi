@@ -106,6 +106,7 @@ import { isSubagentToolDetails, type SubagentToolDetails } from "./subagents/too
 import { createSubagentTools } from "./subagents/tools.js"
 import { buildSystemPrompt } from "./system-prompt.js"
 import type { ToolSurface } from "./tool-surface.js"
+import { type WorkPlan, type WorkPlanSnapshot } from "./work-plan.js"
 
 export type { ContextUsage } from "./context-usage.js"
 
@@ -213,6 +214,7 @@ export type AgentSessionEvent =
   | { type: "steering_mode_changed"; mode: QueueMode }
   | { type: "follow_up_mode_changed"; mode: QueueMode }
   | { type: "shell_task_changed"; taskId: string }
+  | { type: "work_plan_changed"; plan: WorkPlanSnapshot }
   | { type: "subagent_changed"; name: string }
   | {
       type: "authentication_changed"
@@ -303,6 +305,7 @@ interface AgentSessionConfig {
   extensionHost?: ExtensionHost
   extensionContext: ExtensionContext
   shell?: SessionShell
+  workPlan: WorkPlan
   subagentSupervisor?: SubagentSupervisor
   peerMessenger?: PeerMessenger
   processTreeTracker?: ProcessTreeTracker
@@ -497,6 +500,7 @@ export class AgentSession {
   readonly #extensionHost: ExtensionHost | undefined
   readonly #extensionContext: ExtensionContext
   readonly #shell: SessionShell | undefined
+  readonly #workPlan: WorkPlan
   readonly #subagents: SubagentSupervisor | undefined
   readonly #peerMessenger: PeerMessenger | undefined
   readonly #processTreeTracker: ProcessTreeTracker | undefined
@@ -504,6 +508,7 @@ export class AgentSession {
   readonly #listeners = new Set<(event: AgentSessionEvent) => void>()
   readonly #unsubscribeAgent: () => void
   readonly #unsubscribeShell: (() => void) | undefined
+  readonly #unsubscribeWorkPlan: () => void
   readonly #unsubscribeSubagents: (() => void) | undefined
   readonly #unbindExtensionCatalog: (() => void) | undefined
   readonly #unbindExtensionSessionOperations: (() => void) | undefined
@@ -547,6 +552,7 @@ export class AgentSession {
       ? { type: "unbound", host: config.extensionHost }
       : { type: "absent" }
     this.#shell = config.shell
+    this.#workPlan = config.workPlan
     this.#subagents = config.subagentSupervisor
     this.#peerMessenger = config.peerMessenger
     this.#processTreeTracker = config.processTreeTracker
@@ -617,6 +623,14 @@ export class AgentSession {
       } catch {
         // Process ownership cannot cross into an observer.
       }
+    })
+    this.#unsubscribeWorkPlan = this.#workPlan.subscribe(plan => {
+      const entry = this.sessionManager.latestWorkPlan()
+      if (!entry || entry.revision !== plan.revision) return
+      this.#emitAll([
+        { type: "entry_appended", entry },
+        { type: "work_plan_changed", plan }
+      ])
     })
   }
 
@@ -752,6 +766,10 @@ export class AgentSession {
 
   get shellTasks(): readonly ShellTaskSnapshot[] {
     return this.#shell?.snapshots() ?? []
+  }
+
+  get workPlan(): WorkPlanSnapshot {
+    return this.#workPlan.snapshot
   }
 
   subagentSnapshots(): readonly SubagentSnapshot[] {
@@ -1772,6 +1790,7 @@ export class AgentSession {
     this.#activity = { type: "disposed", settled }
     this.#unsubscribeAgent()
     this.#unsubscribeShell?.()
+    this.#unsubscribeWorkPlan()
     this.#unsubscribeSubagents?.()
     this.#listeners.clear()
     cleanupSessionResources(this.sessionId)

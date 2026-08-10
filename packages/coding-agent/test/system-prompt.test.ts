@@ -16,6 +16,7 @@ const spawnSubagent = {
 } satisfies AgentTool
 
 const sendPeerMessage = { ...spawnSubagent, name: "send_peer_message", label: "send_peer_message" } satisfies AgentTool
+const updatePlan = { ...spawnSubagent, name: "update_plan", label: "update_plan" } satisfies AgentTool
 
 test("the default prompt routes Zi customization work to shipped documentation", () => {
   const paths = getProductDocumentationPaths()
@@ -35,6 +36,7 @@ test("the default prompt routes Zi customization work to shipped documentation",
   expect(prompt).toContain(`${docs}/rpc.md`)
   expect(prompt).toContain(`${docs}/extensions.md`)
   expect(prompt).toContain(`${docs}/code-mode.md`)
+  expect(prompt).toContain(`${docs}/work-plans.md`)
   expect(prompt).toContain(`${docs}/skills.md`)
   expect(prompt).toContain(`${docs}/subagents.md`)
 })
@@ -77,6 +79,15 @@ test("code-only doctrine remains factual with a custom system prompt", () => {
   expect(prompt).toContain("group a short related sequence")
   expect(prompt).toContain("Promise.allSettled")
   expect(prompt).not.toContain("Use direct tools for one ordinary read")
+})
+
+test("work plan tools add concise checklist doctrine", () => {
+  const prompt = buildSystemPrompt("/work", createSessionResources({ systemPrompt: "Custom prompt" }), [updatePlan])
+
+  expect(prompt).toContain("at least three distinct steps")
+  expect(prompt).toContain("at most one step in_progress")
+  expect(prompt).toContain("only after its result is verified")
+  expect(prompt).toContain("Replace the complete plan")
 })
 
 test("peer messaging tools add child-team doctrine", () => {
