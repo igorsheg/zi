@@ -33,6 +33,13 @@ export interface SkillRoot {
   readonly includeRootFiles?: boolean
 }
 
+export interface SkillCatalogResult {
+  readonly text: string
+  readonly includedCount: number
+  readonly omittedCount: number
+  readonly utf8Bytes: number
+}
+
 export function loadSkills(
   roots: readonly SkillRoot[],
   budget: SessionResourceBudget,
@@ -162,9 +169,12 @@ export function loadSkills(
   return [...skills.values()]
 }
 
-export function formatSkillsForPrompt(skills: readonly Skill[], readSurface: "direct" | "code" = "direct"): string {
+export function buildSkillPromptCatalog(
+  skills: readonly Skill[],
+  readSurface: "direct" | "code" = "direct"
+): SkillCatalogResult {
   const visible = skills.filter(skill => !skill.disableModelInvocation)
-  if (visible.length === 0) return ""
+  if (visible.length === 0) return Object.freeze({ text: "", includedCount: 0, omittedCount: 0, utf8Bytes: 0 })
 
   const readInstruction =
     readSurface === "code"
@@ -185,7 +195,12 @@ export function formatSkillsForPrompt(skills: readonly Skill[], readSurface: "di
     lines.push("  </skill>")
   }
   lines.push("</available_skills>")
-  return lines.join("\n")
+  const text = lines.join("\n")
+  return Object.freeze({ text, includedCount: visible.length, omittedCount: 0, utf8Bytes: Buffer.byteLength(text) })
+}
+
+export function formatSkillsForPrompt(skills: readonly Skill[], readSurface: "direct" | "code" = "direct"): string {
+  return buildSkillPromptCatalog(skills, readSurface).text
 }
 
 export function expandSkillCommand(text: string, skills: readonly Skill[]): string {

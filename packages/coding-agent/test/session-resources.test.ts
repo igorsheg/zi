@@ -44,7 +44,15 @@ test("AgentSession owns resource catalogs, prompt construction, and command expa
     },
     context => {
       contexts.push(context)
+      return fauxAssistantMessage("resources reloaded")
+    },
+    context => {
+      contexts.push(context)
       return fauxAssistantMessage("tools changed")
+    },
+    context => {
+      contexts.push(context)
+      return fauxAssistantMessage("tools stable")
     }
   ])
   const { session } = await createAgentRuntime({
@@ -74,9 +82,19 @@ test("AgentSession owns resource catalogs, prompt construction, and command expa
     expect(contexts[0]!.systemPrompt).toContain(skillPath)
     expect(contexts[0]!.systemPrompt).not.toContain("Use the private skill body.")
 
+    await writeFile(paths.projectAppendSystemPromptFile, "Reloaded policy")
+    await session.reload()
+    await session.prompt("continue after reload")
+    expect(contexts[2]!.systemPrompt).toContain("Reloaded policy")
+
     session.setActiveTools([])
     await session.prompt("continue without tools")
-    expect(contexts[2]!.systemPrompt).not.toContain("<available_skills>")
+    await session.prompt("continue with stable tools")
+    expect(contexts[3]!.systemPrompt).not.toContain("<available_skills>")
+    expect(contexts[3]!.systemPrompt).not.toBe(contexts[2]!.systemPrompt)
+    expect(toolSchemas(contexts[3]!)).not.toEqual(toolSchemas(contexts[2]!))
+    expect(contexts[4]!.systemPrompt).toBe(contexts[3]!.systemPrompt)
+    expect(toolSchemas(contexts[4]!)).toEqual(toolSchemas(contexts[3]!))
   } finally {
     session.dispose()
   }
@@ -148,6 +166,10 @@ test("steering and follow-up queues retain expanded resource input", async () =>
     session.dispose()
   }
 })
+
+function toolSchemas(context: Context) {
+  return context.tools?.map(tool => ({ name: tool.name, description: tool.description, parameters: tool.parameters }))
+}
 
 function latestUserText(context: Context): string {
   const message = context.messages.findLast(candidate => candidate.role === "user")

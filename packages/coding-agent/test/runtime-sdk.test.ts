@@ -16,7 +16,8 @@ import {
   SettingsManager,
   type AgentRuntime,
   type AgentSession,
-  type AgentSessionServices
+  type AgentSessionServices,
+  type SessionResources
 } from "../src/index.js"
 import { createModels, createTestAgentRuntime, fauxAssistantMessage, fauxProvider } from "../src/testing.js"
 import { snapshotToolSurface } from "../src/tool-surface.js"
@@ -213,6 +214,42 @@ test("caller-supplied services keep a low-level session in memory", async () => 
   } finally {
     session.dispose()
   }
+})
+
+test("a disposed session rejects stale resource reload completion", async () => {
+  const cwd = "/work"
+  const paths = new ZiPaths(cwd, "/unused-global")
+  const models = createModels()
+  const loaded = deferred<SessionResources>()
+  const resourceLoader = new (class extends ResourceLoader {
+    override load(): Promise<SessionResources> {
+      return loaded.promise
+    }
+  })({ paths, project: "trusted" })
+  const services: AgentSessionServices = Object.freeze({
+    paths,
+    settingsManager: new SettingsManager(),
+    credentialStore: new FileCredentialStore(paths),
+    modelRegistry: new ModelRegistry(models),
+    resourceLoader
+  })
+  const initial = createSessionResources({ appendSystemPrompt: ["Initial policy"] })
+  const replacement = createSessionResources({ appendSystemPrompt: ["Stale policy"] })
+  const { session } = await createAgentSession({
+    services,
+    sessionManager: SessionManager.inMemory(cwd),
+    tools: [],
+    resources: initial
+  })
+
+  const reload = session.reload()
+  session.dispose()
+  loaded.resolve(replacement)
+
+  expect((await reload).resources).toBe(replacement)
+  expect(session.resources.appendSystemPrompt).toEqual(["Initial policy"])
+  expect(session.resources).not.toBe(replacement)
+  await session.waitForIdle()
 })
 
 test("low-level code-only sessions require a Code Mode owner", async () => {

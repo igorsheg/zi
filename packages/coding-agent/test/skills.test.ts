@@ -3,7 +3,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
-import { expandSkillCommand, formatSkillsForPrompt, type Skill } from "../src/skills.js"
+import { buildSkillPromptCatalog, expandSkillCommand, formatSkillsForPrompt, type Skill } from "../src/skills.js"
 
 const skill = (overrides: Partial<Skill> = {}): Skill => ({
   name: "pdf-tools",
@@ -24,6 +24,25 @@ test("skill metadata uses progressive disclosure and XML escaping", () => {
   expect(prompt).not.toContain("<name>manual</name>")
   expect(prompt).not.toContain("Skill body")
   expect(formatSkillsForPrompt([skill()], "code")).toContain("Use zi.read from a code cell")
+})
+
+test("skill catalog reports included skills and UTF-8 size without omitting entries", () => {
+  const skills = [
+    skill({ description: "Work with café PDFs" }),
+    skill({ name: "manual", disableModelInvocation: true })
+  ]
+  const catalog = buildSkillPromptCatalog(skills)
+
+  expect(Object.isFrozen(catalog)).toBe(true)
+  expect(catalog.includedCount).toBe(1)
+  expect(catalog.omittedCount).toBe(0)
+  expect(catalog.utf8Bytes).toBe(Buffer.byteLength(catalog.text))
+  expect(catalog.utf8Bytes).toBeGreaterThan(catalog.text.length)
+  expect(formatSkillsForPrompt(skills)).toBe(catalog.text)
+
+  const emptyCatalog = buildSkillPromptCatalog([skill({ disableModelInvocation: true })])
+  expect(Object.isFrozen(emptyCatalog)).toBe(true)
+  expect(emptyCatalog).toEqual({ text: "", includedCount: 0, omittedCount: 0, utf8Bytes: 0 })
 })
 
 test("explicit skill commands read current bounded content and append arguments", async () => {

@@ -3,9 +3,108 @@ import type { AgentTool } from "@earendil-works/pi-agent-core"
 import { codeModeDoctrine } from "./code-mode/prompt.js"
 import { getProductDocumentationPaths } from "./product-documentation.js"
 import type { SessionResources } from "./resource-loader.js"
-import { formatSkillsForPrompt } from "./skills.js"
+import { buildSkillPromptCatalog } from "./skills.js"
 import { peerMessagingDoctrine } from "./subagents/peer-messenger.js"
 import type { ToolSurface } from "./tool-surface.js"
+
+// Regression budget for Zi-authored sections; loaded resources and caller-provided paths are measured separately.
+export const maxCoreSystemPromptRegressionBytes = 4096
+
+type SystemPromptSectionMetadata =
+  | { readonly kind: "base"; readonly source: "default" | "custom" }
+  | { readonly kind: "code-mode"; readonly surface: ToolSurface }
+  | { readonly kind: "work-plan" }
+  | { readonly kind: "peer-messaging" }
+  | { readonly kind: "product-documentation" }
+  | { readonly kind: "appended-instructions"; readonly index: number }
+  | { readonly kind: "project-instructions"; readonly files: readonly string[] }
+  | { readonly kind: "skills"; readonly includedCount: number; readonly omittedCount: number }
+  | { readonly kind: "environment" }
+
+export type SystemPromptSection = SystemPromptSectionMetadata & {
+  readonly start: number
+  readonly end: number
+  readonly utf8Bytes: number
+}
+
+export interface SystemPromptCapabilities {
+  readonly toolSurface: ToolSurface | undefined
+  readonly readFiles: boolean
+  readonly editFiles: boolean
+  readonly writeFiles: boolean
+  readonly shell: boolean
+  readonly codeMode: boolean
+  readonly workPlan: boolean
+  readonly peerMessaging: boolean
+  readonly skillReadSurface: "direct" | "code" | undefined
+}
+
+export interface SystemPromptSnapshot {
+  readonly text: string
+  readonly utf8Bytes: number
+  readonly sections: readonly SystemPromptSection[]
+  readonly capabilities: SystemPromptCapabilities
+}
+
+type PromptSection = SystemPromptSectionMetadata & { readonly text: string }
+
+export function compileSystemPrompt(
+  cwd: string,
+  resources: SessionResources,
+  tools: readonly AgentTool[],
+  toolSurface?: ToolSurface
+): SystemPromptSnapshot {
+  const capabilities = deriveCapabilities(tools, toolSurface)
+  const sections: PromptSection[] = [
+    {
+      kind: "base",
+      source: resources.systemPrompt === undefined ? "default" : "custom",
+      text: resources.systemPrompt ?? defaultSystemPrompt(capabilities)
+    }
+  ]
+
+  if (toolSurface) sections.push({ kind: "code-mode", surface: toolSurface, text: codeModeDoctrine(toolSurface) })
+  if (capabilities.workPlan) sections.push({ kind: "work-plan", text: workPlanDoctrine() })
+  if (capabilities.peerMessaging) sections.push({ kind: "peer-messaging", text: peerMessagingDoctrine() })
+  if (resources.systemPrompt === undefined) {
+    sections.push({ kind: "product-documentation", text: productDocumentationPrompt() })
+  }
+  resources.appendSystemPrompt.forEach((text, index) => {
+    sections.push({ kind: "appended-instructions", index, text })
+  })
+  if (resources.contextFiles.length > 0) {
+    sections.push({
+      kind: "project-instructions",
+      files: Object.freeze(resources.contextFiles.map(file => file.path)),
+      text: projectInstructionsPrompt(resources)
+    })
+  }
+
+  const skillCatalog = capabilities.skillReadSurface
+    ? buildSkillPromptCatalog(resources.skills, capabilities.skillReadSurface)
+    : buildSkillPromptCatalog([])
+  if (skillCatalog.text.length > 0) {
+    sections.push({
+      kind: "skills",
+      includedCount: skillCatalog.includedCount,
+      omittedCount: skillCatalog.omittedCount,
+      text: skillCatalog.text
+    })
+  }
+
+  sections.push({
+    kind: "environment",
+    text: `Current date: ${new Date().toISOString().slice(0, 10)}\nCurrent working directory: ${cwd}`
+  })
+
+  const compiled = compileSections(sections)
+  return Object.freeze({
+    text: compiled.text,
+    utf8Bytes: Buffer.byteLength(compiled.text),
+    sections: compiled.sections,
+    capabilities
+  })
+}
 
 export function buildSystemPrompt(
   cwd: string,
@@ -13,59 +112,67 @@ export function buildSystemPrompt(
   tools: readonly AgentTool[],
   toolSurface?: ToolSurface
 ): string {
-  const prompt = resources.systemPrompt ?? defaultSystemPrompt(toolSurface)
-
-  const sections = [prompt]
-  if (toolSurface) sections.push(codeModeDoctrine(toolSurface))
-  if (tools.some(tool => tool.name === "update_plan")) sections.push(workPlanDoctrine())
-  if (tools.some(tool => tool.name === "send_peer_message")) sections.push(peerMessagingDoctrine())
-  if (resources.systemPrompt === undefined) sections.push(productDocumentationPrompt())
-  if (resources.appendSystemPrompt.length > 0) sections.push(resources.appendSystemPrompt.join("\n\n"))
-  if (resources.contextFiles.length > 0) {
-    sections.push(
-      `<project_context>\n${resources.contextFiles
-        .map(file => `<project_instructions path="${file.path}">\n${file.content}\n</project_instructions>`)
-        .join("\n\n")}\n</project_context>`
-    )
-  }
-  if (tools.some(tool => tool.name === "read")) {
-    const skills = formatSkillsForPrompt(resources.skills, toolSurface === "code-only" ? "code" : "direct")
-    if (skills.length > 0) sections.push(skills)
-  }
-  sections.push(`Current date: ${new Date().toISOString().slice(0, 10)}\nCurrent working directory: ${cwd}`)
-  return sections.join("\n\n")
+  return compileSystemPrompt(cwd, resources, tools, toolSurface).text
 }
 
-function defaultSystemPrompt(toolSurface: ToolSurface | undefined): string {
-  if (toolSurface === "code-only") {
-    return `You are an expert coding assistant operating inside Zi.
+function deriveCapabilities(
+  tools: readonly AgentTool[],
+  toolSurface: ToolSurface | undefined
+): SystemPromptCapabilities {
+  const toolNames = new Set(tools.map(tool => tool.name))
+  const skillReadSurface = !toolNames.has("read") ? undefined : toolSurface === "code-only" ? "code" : "direct"
+  return Object.freeze({
+    toolSurface,
+    readFiles: toolNames.has("read"),
+    editFiles: toolNames.has("edit"),
+    writeFiles: toolNames.has("write"),
+    shell: toolNames.has("bash"),
+    codeMode: toolSurface !== undefined,
+    workPlan: toolNames.has("update_plan"),
+    peerMessaging: toolNames.has("send_peer_message"),
+    skillReadSurface
+  })
+}
 
-Available tools:
-- code: Execute JavaScript that orchestrates Zi tools and other runtime APIs
-
-The code cell's zi catalog provides the admitted file, shell, extension, and subagent tools.
-
-Guidelines:
-- Perform tool-backed operations through zi.* inside code cells
-- Keep cells cohesive: group short related operations, and use JavaScript for data-dependent workflows
-- Be concise
-- Show file paths clearly`
+function compileSections(sections: readonly PromptSection[]): {
+  readonly text: string
+  readonly sections: readonly SystemPromptSection[]
+} {
+  const chunks: string[] = []
+  const compiled: SystemPromptSection[] = []
+  let cursor = 0
+  for (const section of sections) {
+    if (chunks.length > 0) {
+      chunks.push("\n\n")
+      cursor += 2
+    }
+    const { text, ...metadata } = section
+    const start = cursor
+    chunks.push(text)
+    cursor += text.length
+    compiled.push(Object.freeze({ ...metadata, start, end: cursor, utf8Bytes: Buffer.byteLength(text) }))
   }
-  const code =
-    toolSurface === "direct-and-code" ? "\n- code: Orchestrate data-dependent multi-tool workflows in JavaScript" : ""
+  return Object.freeze({ text: chunks.join(""), sections: Object.freeze(compiled) })
+}
+
+function defaultSystemPrompt(capabilities: SystemPromptCapabilities): string {
+  const guidelines = [
+    ...(capabilities.readFiles || capabilities.editFiles || capabilities.writeFiles
+      ? ["- Prefer dedicated file tools over shell equivalents when available."]
+      : []),
+    ...(capabilities.readFiles && (capabilities.editFiles || capabilities.writeFiles)
+      ? ["- Read files before changing them and prefer focused edits."]
+      : []),
+    ...(capabilities.shell ? ["- Use shell execution for project commands and processes."] : []),
+    "- Keep changes within the requested scope.",
+    "- Be concise and show file paths clearly."
+  ]
   return `You are an expert coding assistant operating inside Zi.
 
-Available tools:
-- read: Read file contents
-- bash: Execute shell commands
-- edit: Make exact text replacements
-- write: Create or overwrite files${code}
+Use the admitted tools to complete the user's request.
 
 Guidelines:
-- Use read to inspect files instead of shelling out to cat or sed
-- Use edit for precise changes and write for new files or complete rewrites
-- Be concise
-- Show file paths clearly`
+${guidelines.join("\n")}`
 }
 
 function workPlanDoctrine(): string {
@@ -83,25 +190,37 @@ function productDocumentationPrompt(): string {
   const readme = promptPath(paths.readme)
   const docs = promptPath(paths.docs)
   const examples = promptPath(paths.examples)
-  return `Zi documentation (read only when the user asks about Zi itself, configuration, extensions, skills, prompts, Code Mode, work plans, subagents, notifications, JSON, RPC, or the terminal client):
-- Documentation index: ${docs}/index.md
-- Product README: ${readme}
-- Documentation directory: ${docs}
-- Examples: ${examples}
-- When reading Zi docs or examples, resolve links and relative paths from those absolute locations, not from the current working directory
-- When asked about installation or getting started, read ${docs}/index.md
-- When asked about the CLI or terminal client, read ${docs}/cli.md
-- When asked about authentication, settings, or resource locations, read the corresponding guide in ${docs}/
-- When asked about prompts or system instructions, read ${docs}/prompts.md
-- When asked about notifications, read ${docs}/notifications.md
-- When asked about JSON mode, read ${docs}/json-events.md
-- When asked about RPC, read ${docs}/rpc.md and ${examples}/rpc/
-- When asked about extensions, read ${docs}/extensions.md and ${examples}/extensions/
-- When asked about Code Mode or the programmatic runtime, read ${docs}/code-mode.md
-- When asked about work plans, read ${docs}/work-plans.md
-- When asked about skills, read ${docs}/skills.md and ${examples}/skills/
-- When asked about subagents, read ${docs}/subagents.md and ${examples}/subagents/
-- When working on Zi topics, read the relevant documentation and examples before implementing, and follow Markdown cross-references`
+  return `# Zi documentation
+
+For questions or work about Zi itself, read ${docs}/index.md and the relevant linked guides first. Resolve documentation links from ${docs} and example links from ${examples}. Product overview: ${readme}.`
+}
+
+function projectInstructionsPrompt(resources: SessionResources): string {
+  const files = resources.contextFiles
+    .map(file => {
+      const path = escapeXmlAttribute(file.path)
+      const content = neutralizeProjectEnvelope(file.content)
+      return `<project_instructions path="${path}">\n${content}\n</project_instructions>`
+    })
+    .join("\n\n")
+  return `# Project instructions
+
+Direct user instructions take precedence over the project instructions below. The files are ordered from broadest to most specific; when they conflict, the later file takes precedence.
+
+<project_context>\n${files}\n</project_context>`
+}
+
+function neutralizeProjectEnvelope(value: string): string {
+  return value.replace(/<(?=\/?project_(?:context|instructions)(?:\s|\/?>))/gi, "&lt;")
+}
+
+function escapeXmlAttribute(value: string): string {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&apos;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
 }
 
 function promptPath(path: string): string {
