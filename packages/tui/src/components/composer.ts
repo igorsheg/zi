@@ -10,7 +10,7 @@ import {
 import { maxSessionPromptHistoryEntries, type ImageContent } from "@with-zi/coding-agent"
 
 import type { Theme } from "../theme.js"
-import { promptTextSlice, promptTextWidth, textWidth } from "./cell-text.js"
+import { promptTextSlice, promptTextWidth, textWidth, truncateMiddleToCells } from "./cell-text.js"
 import { createComposerHistoryReplacement } from "./composer-history-replacement.js"
 import {
   replaceComposerRange,
@@ -26,9 +26,9 @@ export interface ComposerGeometry {
 }
 
 export interface ComposerSlots {
-  readonly topLeft: string
   /** Ordered most important first. Only the largest fitting prefix is rendered. */
   readonly topRight: readonly string[]
+  readonly bottomRight: string
 }
 
 export interface ComposerHistoryEntry {
@@ -71,9 +71,14 @@ export interface Composer {
   destroy(): void
 }
 
+interface RailSlot {
+  readonly text: string
+  readonly width: number
+}
+
 interface RailLayout {
-  readonly topRightText: string
-  readonly topRightWidth: number
+  readonly topRight: RailSlot
+  readonly bottomRight: RailSlot
 }
 
 type ComposerMarkerData =
@@ -112,11 +117,9 @@ export function createComposer(ctx: RenderContext, options: ComposerOptions): Co
     borderStyle: "rounded",
     borderColor: options.theme.border.default,
     backgroundColor: options.theme.surface.composer,
-    ...(geometry.bordered ? { title: slots.topLeft } : {}),
-    titleColor: options.theme.text.muted,
     flexShrink: 0,
     renderAfter(buffer) {
-      drawTopRightSlot(buffer, this, geometry.bordered, rail, railColor, railBackground)
+      drawRailSlots(buffer, this, geometry.bordered, rail, railColor, railBackground)
     }
   })
   let historyState: ComposerHistoryState = { type: "idle" }
@@ -423,19 +426,18 @@ export function createComposer(ctx: RenderContext, options: ComposerOptions): Co
 
       const borderChanged = geometry.bordered !== nextGeometry.bordered
       const editorRowsChanged = geometry.editorRows !== nextGeometry.editorRows
-      const topLeftChanged = slots.topLeft !== retainedSlots.topLeft
       const nextRail =
         geometry.columns !== nextGeometry.columns || borderChanged || slotsChanged
           ? layoutRail(nextGeometry, retainedSlots)
           : rail
-      const railChanged = rail.topRightText !== nextRail.topRightText
+      const railChanged =
+        rail.topRight.text !== nextRail.topRight.text || rail.bottomRight.text !== nextRail.bottomRight.text
 
       geometry = nextGeometry
       slots = retainedSlots
       rail = nextRail
 
       if (borderChanged) root.border = geometry.bordered
-      if (geometry.bordered && (borderChanged || topLeftChanged)) root.title = slots.topLeft
       if (editorRowsChanged) input.maxHeight = geometry.editorRows
       if (railChanged) root.requestRender()
       return occupiedRows(input, geometry)
@@ -449,6 +451,8 @@ export function createComposer(ctx: RenderContext, options: ComposerOptions): Co
 }
 
 const railItemSeparator = " • "
+const railSlotPadding = 1
+const railReservedColumns = 5
 
 function occupiedRows(input: TextareaRenderable, geometry: ComposerGeometry): number {
   const borderRows = geometry.bordered ? 2 : 0
@@ -459,8 +463,10 @@ function occupiedRows(input: TextareaRenderable, geometry: ComposerGeometry): nu
 }
 
 function layoutRail(geometry: ComposerGeometry, slots: ComposerSlots): RailLayout {
-  if (!geometry.bordered || slots.topRight.length === 0) return { topRightText: "", topRightWidth: 0 }
-  const available = geometry.columns - 4 - textWidth(slots.topLeft) - (slots.topLeft ? 1 : 0)
+  const hidden = { text: "", width: 0 }
+  if (!geometry.bordered) return { topRight: hidden, bottomRight: hidden }
+
+  const available = Math.max(0, geometry.columns - railReservedColumns)
   const separatorWidth = textWidth(railItemSeparator)
   const visibleItems: string[] = []
   let topRightWidth = 0
@@ -470,10 +476,14 @@ function layoutRail(geometry: ComposerGeometry, slots: ComposerSlots): RailLayou
     visibleItems.push(item)
     topRightWidth = nextWidth
   }
-  return { topRightText: visibleItems.join(railItemSeparator), topRightWidth }
+  const bottomRightText = truncateMiddleToCells(slots.bottomRight, available)
+  return {
+    topRight: { text: visibleItems.join(railItemSeparator), width: topRightWidth },
+    bottomRight: { text: bottomRightText, width: textWidth(bottomRightText) }
+  }
 }
 
-function drawTopRightSlot(
+function drawRailSlots(
   buffer: OptimizedBuffer,
   root: BoxRenderable,
   bordered: boolean,
@@ -481,18 +491,27 @@ function drawTopRightSlot(
   color: RGBA,
   background: RGBA
 ): void {
-  if (!bordered || !rail.topRightText) return
-  buffer.drawText(
-    rail.topRightText,
-    root.screenX + root.width - rail.topRightWidth - 2,
-    root.screenY,
-    color,
-    background
-  )
+  if (!bordered) return
+  drawRailSlot(buffer, root, rail.topRight, root.screenY, color, background)
+  drawRailSlot(buffer, root, rail.bottomRight, root.screenY + root.height - 1, color, background)
+}
+
+function drawRailSlot(
+  buffer: OptimizedBuffer,
+  root: BoxRenderable,
+  slot: RailSlot,
+  y: number,
+  color: RGBA,
+  background: RGBA
+): void {
+  if (!slot.text) return
+  const padding = " ".repeat(railSlotPadding)
+  const text = `${padding}${slot.text}${padding}`
+  buffer.drawText(text, root.screenX + root.width - slot.width - railSlotPadding * 2 - 1, y, color, background)
 }
 
 function retainSlots(slots: ComposerSlots): ComposerSlots {
-  return { topLeft: slots.topLeft, topRight: [...slots.topRight] }
+  return { topRight: [...slots.topRight], bottomRight: slots.bottomRight }
 }
 
 function sameGeometry(left: ComposerGeometry, right: ComposerGeometry): boolean {
@@ -506,7 +525,7 @@ function sameGeometry(left: ComposerGeometry, right: ComposerGeometry): boolean 
 
 function sameSlots(left: ComposerSlots, right: ComposerSlots): boolean {
   return (
-    left.topLeft === right.topLeft &&
+    left.bottomRight === right.bottomRight &&
     left.topRight.length === right.topRight.length &&
     left.topRight.every((item, index) => item === right.topRight[index])
   )

@@ -2,6 +2,7 @@ import { expect, test } from "bun:test"
 
 import {
   textWidth,
+  truncateMiddleToCells,
   truncateToCells,
   wrapHeadToCells,
   wrapTailToCells,
@@ -21,6 +22,8 @@ test("native cell measurement and truncation count tabs as two cells", () => {
   expect(textWidth("a\tb")).toBe(4)
   expect(truncateToCells("a\tbc", 4)).toBe("a...")
   expect(truncateToCells("a\tbc", 5)).toBe("a\tbc")
+  expect(truncateMiddleToCells("~/workspace/zi", 8)).toBe("~/.../zi")
+  expect(truncateMiddleToCells("/工作/项目", 9)).toBe("/工...目")
   expect(wrapHeadToCells("a\t\tb", 3, 3)).toEqual({ lines: ["a\t", "\tb"], hasMore: false })
 })
 

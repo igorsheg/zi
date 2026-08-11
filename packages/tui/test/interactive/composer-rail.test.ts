@@ -1,12 +1,12 @@
 import { expect, test } from "bun:test"
 import { join } from "node:path"
 
-import { BoxRenderable, TextareaRenderable } from "@opentui/core"
+import { BoxRenderable } from "@opentui/core"
 import { createModels, createTestAgentRuntime as createAgentRuntime, fauxProvider } from "@with-zi/coding-agent/testing"
 
 import { createInteractiveTest } from "./harness.js"
 
-test("prompt footer yields the below-composer surface to pickers", async () => {
+test("session metadata stays on the composer rail while a picker is open", async () => {
   const models = createModels()
   const faux = fauxProvider()
   models.setProvider(faux.provider)
@@ -15,26 +15,25 @@ test("prompt footer yields the below-composer surface to pickers", async () => {
 
   try {
     await setup.renderOnce()
-    const footer = setup.renderer.root.findDescendantById("prompt-footer")
-    if (!(footer instanceof BoxRenderable)) throw new Error("Prompt footer not found")
-    expect(footer.visible).toBe(true)
+    const composer = setup.renderer.root.findDescendantById("prompt-composer")
+    if (!(composer instanceof BoxRenderable)) throw new Error("Prompt composer not found")
+    expect(setup.renderer.root.findDescendantById("prompt-footer")).toBeUndefined()
+    expect(composerRows(setup.captureCharFrame(), composer)).toEqual(
+      expect.arrayContaining([expect.stringContaining("faux-1"), expect.stringContaining("/work")])
+    )
 
     await setup.mockInput.typeText("/m", 0)
     await setup.renderOnce()
-    expect(footer.visible).toBe(false)
-
-    const input = setup.renderer.root.findDescendantById("prompt-input")
-    if (!(input instanceof TextareaRenderable)) throw new Error("Prompt textarea not found")
-    input.setText("")
-    await setup.renderOnce()
-    expect(footer.visible).toBe(true)
+    expect(composerRows(setup.captureCharFrame(), composer)).toEqual(
+      expect.arrayContaining([expect.stringContaining("faux-1"), expect.stringContaining("/work")])
+    )
   } finally {
     session.dispose()
     setup.destroy()
   }
 })
 
-test("prompt footer reads home contraction from the cwd-bound session paths", async () => {
+test("composer rail reads home contraction from the cwd-bound session paths", async () => {
   const homeDir = process.env.HOME
   if (!homeDir) throw new Error("Test home not configured")
   const models = createModels()
@@ -54,7 +53,7 @@ test("prompt footer reads home contraction from the cwd-bound session paths", as
   }
 })
 
-test("prompt footer derives metadata from the replacement session", async () => {
+test("composer rail derives metadata from the replacement session", async () => {
   const models = createModels()
   const faux = fauxProvider()
   models.setProvider(faux.provider)
@@ -77,7 +76,7 @@ test("prompt footer derives metadata from the replacement session", async () => 
   }
 })
 
-test("prompt footer preserves a transcript row and follows compact composer geometry", async () => {
+test("composer rail follows bordered composer geometry without occupying another row", async () => {
   const models = createModels()
   const faux = fauxProvider()
   models.setProvider(faux.provider)
@@ -86,27 +85,21 @@ test("prompt footer preserves a transcript row and follows compact composer geom
 
   try {
     await setup.renderOnce()
-    const footer = setup.renderer.root.findDescendantById("prompt-footer")
-    if (!(footer instanceof BoxRenderable)) throw new Error("Prompt footer not found")
-    expect(footer.visible).toBe(true)
-
-    setup.resize(40, 6)
-    await setup.renderOnce()
-    expect(footer.visible).toBe(true)
-
-    setup.resize(40, 7)
-    await setup.renderOnce()
-    expect(footer.visible).toBe(true)
-
-    setup.resize(40, 8)
-    await setup.renderOnce()
-    expect(footer.visible).toBe(true)
+    const composer = setup.renderer.root.findDescendantById("prompt-composer")
+    if (!(composer instanceof BoxRenderable)) throw new Error("Prompt composer not found")
+    expect(composer.border).toBe(true)
+    expect(composerRows(setup.captureCharFrame(), composer).at(-1)).toContain("/work")
 
     setup.resize(20, 4)
     await setup.renderOnce()
-    expect(footer.visible).toBe(false)
+    expect(composer.border).toBe(false)
+    expect(composer.height).toBe(1)
   } finally {
     session.dispose()
     setup.destroy()
   }
 })
+
+function composerRows(frame: string, composer: BoxRenderable): string[] {
+  return frame.split("\n").slice(composer.screenY, composer.screenY + composer.height)
+}

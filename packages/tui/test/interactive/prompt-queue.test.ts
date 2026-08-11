@@ -252,9 +252,6 @@ test("a maximum queue preserves the constrained composer and Ctrl+C leaves pendi
     expect(overflowFrame).toContain("32 queued")
     expect(overflowFrame).toContain("Alt+Up to edit all")
     expect(overflowFrame).toContain("keep this exact draft")
-    const footer = setup.renderer.root.findDescendantById("prompt-footer")
-    if (!(footer instanceof BoxRenderable)) throw new Error("Prompt footer not found")
-    expect(footer.visible).toBe(true)
     expect(setup.renderer.currentFocusedRenderable).toBe(input)
     expect(
       session.messages.some(message => message.role === "user" && messageText(message) === "keep this exact draft")
@@ -320,14 +317,12 @@ test("a multiline draft and pending block share one terminal row budget", async 
     expect(setup.captureCharFrame()).toContain("queued second")
     expect(setup.captureCharFrame()).toContain("draft four")
 
-    const footer = setup.renderer.root.findDescendantById("prompt-footer")
     const oldEntryId = session.queuedInputs.steering[0]?.id
-    if (!(footer instanceof BoxRenderable) || oldEntryId === undefined) throw new Error("Prompt footer not found")
+    if (oldEntryId === undefined) throw new Error("Queued input not found")
     input.setText("")
     await setup.mockInput.typeText("/m", 0)
     await setup.renderOnce()
     expect(setup.captureCharFrame()).not.toContain("queued second")
-    expect(footer.visible).toBe(false)
 
     session.takeQueuedInputs()
     session.steer("replacement queue message")
@@ -338,7 +333,6 @@ test("a multiline draft and pending block share one terminal row budget", async 
     expect(setup.captureCharFrame()).not.toContain("queued second")
     expect(setup.renderer.root.findDescendantById(`queued-${oldEntryId}`)).toBeUndefined()
     expect(setup.renderer.root.findDescendantById(`queued-${replacementId}`)).toBeInstanceOf(BoxRenderable)
-    expect(footer.visible).toBe(true)
 
     session.takeQueuedInputs()
     release.resolve()

@@ -398,7 +398,7 @@ test("native selection mouse-down detaches before its first drag event", async (
 
 test("native selection edge-scrolls in visual order and detaches before streamed output", async () => {
   const session = await createTranscriptSession(1)
-  const setup = await createInteractiveTest(session, { width: 48, height: 14, kittyKeyboard: true })
+  const setup = await createInteractiveTest(session, { width: 48, height: 13, kittyKeyboard: true })
 
   try {
     await renderSettled(setup)

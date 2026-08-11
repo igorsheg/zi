@@ -31,7 +31,7 @@ test("a fresh session greets the user immediately above the composer", async () 
       ""
     ])
     expect(rows[start + 4]?.startsWith("╭─")).toBe(true)
-    expect(rows[start + 7]).toContain("/work")
+    expect(rows[start + 6]).toContain("/work")
 
     await setup.mockInput.typeText("draft")
     await setup.renderOnce()
@@ -52,12 +52,9 @@ test("resizing reuses the greeter and keeps the composer focused", async () => {
   try {
     await setup.renderOnce()
     const greeter = setup.renderer.root.findDescendantById("session-greeter")
-    const footer = setup.renderer.root.findDescendantById("prompt-footer")
     const input = setup.renderer.root.findDescendantById("prompt-input")
     if (!greeter) throw new Error("Session greeter not found")
-    if (!footer) throw new Error("Prompt footer not found")
     if (!(input instanceof TextareaRenderable)) throw new Error("Prompt textarea not found")
-    expect(footer.visible).toBe(true)
 
     setup.resize(20, 12)
     await setup.renderOnce()

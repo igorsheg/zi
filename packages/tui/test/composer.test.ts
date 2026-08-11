@@ -19,7 +19,7 @@ test("composer cursor does not blink", async () => {
   const setup = await createTestRenderer({ width: 60, height: 8, useThread: false })
   const composer = createComposer(setup.renderer, {
     geometry: composerGeometry(60, 8),
-    slots: { topLeft: "/work", topRight: [] },
+    slots: { topRight: [], bottomRight: "/work" },
     theme: defaultTheme,
     onSubmit() {}
   })
@@ -39,7 +39,7 @@ test("composer clears its draft as one undo point and restores owned markers plu
   const imageChanges: unknown[][] = []
   const composer = createComposer(setup.renderer, {
     geometry: composerGeometry(60, 8),
-    slots: { topLeft: "/work", topRight: [] },
+    slots: { topRight: [], bottomRight: "/work" },
     theme: defaultTheme,
     onSubmit() {},
     onImageMarkersChange: images => imageChanges.push([...images])
@@ -93,7 +93,7 @@ test("composer clears and restores an image-only draft", async () => {
   const image = { type: "image" as const, mimeType: "image/png", data: "AAAA" }
   const composer = createComposer(setup.renderer, {
     geometry: composerGeometry(60, 8),
-    slots: { topLeft: "/work", topRight: [] },
+    slots: { topRight: [], bottomRight: "/work" },
     theme: defaultTheme,
     onSubmit() {}
   })
@@ -116,7 +116,7 @@ test("composer range replacement is one undo point and preserves prior native hi
   const setup = await createTestRenderer({ width: 60, height: 8, useThread: false })
   const composer = createComposer(setup.renderer, {
     geometry: composerGeometry(60, 8),
-    slots: { topLeft: "/work", topRight: [] },
+    slots: { topRight: [], bottomRight: "/work" },
     theme: defaultTheme,
     onSubmit() {}
   })
@@ -156,7 +156,7 @@ test("composer range replacement shifts owned markers and preserves payload iden
   const image = { type: "image" as const, mimeType: "image/png", data: "AAAA" }
   const composer = createComposer(setup.renderer, {
     geometry: composerGeometry(80, 8),
-    slots: { topLeft: "/work", topRight: [] },
+    slots: { topRight: [], bottomRight: "/work" },
     theme: defaultTheme,
     onSubmit() {}
   })
@@ -207,7 +207,7 @@ test("composer range replacement refuses marker overlap without changing selecti
   const setup = await createTestRenderer({ width: 60, height: 8, useThread: false })
   const composer = createComposer(setup.renderer, {
     geometry: composerGeometry(60, 8),
-    slots: { topLeft: "/work", topRight: [] },
+    slots: { topRight: [], bottomRight: "/work" },
     theme: defaultTheme,
     onSubmit() {}
   })
@@ -232,7 +232,7 @@ test("composer owned range replacements do not consume OpenTUI replacement regis
   const setup = await createTestRenderer({ width: 40, height: 8, useThread: false })
   const composer = createComposer(setup.renderer, {
     geometry: composerGeometry(40, 8),
-    slots: { topLeft: "/work", topRight: [] },
+    slots: { topRight: [], bottomRight: "/work" },
     theme: defaultTheme,
     onSubmit() {}
   })
@@ -266,7 +266,7 @@ test("composer history traverses stable entries and restores the native draft", 
   let changes = 0
   const composer = createComposer(setup.renderer, {
     geometry: composerGeometry(40, 8),
-    slots: { topLeft: "/work", topRight: [] },
+    slots: { topRight: [], bottomRight: "/work" },
     theme: defaultTheme,
     historySource: history,
     onSubmit() {},
@@ -318,7 +318,7 @@ test("composer history traverses immediately from horizontal positions on bounda
   const setup = await createTestRenderer({ width: 40, height: 8, useThread: false })
   const composer = createComposer(setup.renderer, {
     geometry: composerGeometry(40, 8),
-    slots: { topLeft: "/work", topRight: [] },
+    slots: { topRight: [], bottomRight: "/work" },
     theme: defaultTheme,
     historySource: fakeHistory(["oldest", "界x"]),
     onSubmit() {}
@@ -352,7 +352,7 @@ test("composer history replacement remains bounded across repeated complete trav
   const history = fakeHistory(Array.from({ length: 100 }, (_, index) => `entry-${index}`))
   const composer = createComposer(setup.renderer, {
     geometry: composerGeometry(40, 8),
-    slots: { topLeft: "/work", topRight: [] },
+    slots: { topRight: [], bottomRight: "/work" },
     theme: defaultTheme,
     historySource: history,
     onSubmit() {}
@@ -398,7 +398,7 @@ test("composer history reuses pinned stable IDs across repeated abandoned browse
   const history = fakeHistory(Array.from({ length: 100 }, (_, index) => `entry-${index}`))
   const composer = createComposer(setup.renderer, {
     geometry: composerGeometry(40, 8),
-    slots: { topLeft: "/work", topRight: [] },
+    slots: { topRight: [], bottomRight: "/work" },
     theme: defaultTheme,
     historySource: history,
     onSubmit() {}
@@ -428,7 +428,7 @@ test("composer history does not recycle replacements retained by ordinary native
   const history = fakeHistory(["historical"])
   const composer = createComposer(setup.renderer, {
     geometry: composerGeometry(40, 8),
-    slots: { topLeft: "/work", topRight: [] },
+    slots: { topRight: [], bottomRight: "/work" },
     theme: defaultTheme,
     historySource: history,
     onSubmit() {}
@@ -460,7 +460,7 @@ test("composer history restores its previous transition when native replacement 
   const setup = await createTestRenderer({ width: 40, height: 8, useThread: false })
   const composer = createComposer(setup.renderer, {
     geometry: composerGeometry(40, 8),
-    slots: { topLeft: "/work", topRight: [] },
+    slots: { topRight: [], bottomRight: "/work" },
     theme: defaultTheme,
     historySource: fakeHistory(["older", "newest"]),
     onSubmit() {}
@@ -490,7 +490,7 @@ test("composer history detaches on editing or external replacement and ignores l
   const history = fakeHistory(["older", "newest"])
   const composer = createComposer(setup.renderer, {
     geometry: composerGeometry(40, 8),
-    slots: { topLeft: "/work", topRight: [] },
+    slots: { topRight: [], bottomRight: "/work" },
     theme: defaultTheme,
     historySource: history,
     onSubmit() {}
@@ -535,7 +535,7 @@ test("composer history preserves compact paste and image extmarks plus prior und
   const paste = "x".repeat(compactPasteCharacterThreshold + 1)
   const composer = createComposer(setup.renderer, {
     geometry: composerGeometry(60, 8),
-    slots: { topLeft: "/work", topRight: [] },
+    slots: { topRight: [], bottomRight: "/work" },
     theme: defaultTheme,
     historySource: fakeHistory(["historical"]),
     onSubmit() {}
@@ -578,7 +578,7 @@ test("composer history respects multiline, wrapped, selection, and display-width
   const setup = await createTestRenderer({ width: 16, height: 8, useThread: false })
   const composer = createComposer(setup.renderer, {
     geometry: composerGeometry(16, 8),
-    slots: { topLeft: "", topRight: [] },
+    slots: { topRight: [], bottomRight: "" },
     theme: defaultTheme,
     historySource: fakeHistory(["界"]),
     onSubmit() {}
@@ -624,7 +624,7 @@ test("composer history admits at most the coding-agent history bound", async () 
   const history = fakeHistory(Array.from({ length: 101 }, (_, index) => `entry-${index}`))
   const composer = createComposer(setup.renderer, {
     geometry: composerGeometry(40, 8),
-    slots: { topLeft: "/work", topRight: [] },
+    slots: { topRight: [], bottomRight: "/work" },
     theme: defaultTheme,
     historySource: history,
     onSubmit() {}
@@ -647,7 +647,7 @@ test("composer collapses only Pi-sized pastes and expands exact content for subm
   const setup = await createTestRenderer({ width: 60, height: 8, useThread: false })
   const composer = createComposer(setup.renderer, {
     geometry: composerGeometry(60, 8),
-    slots: { topLeft: "/work", topRight: [] },
+    slots: { topRight: [], bottomRight: "/work" },
     theme: defaultTheme,
     onSubmit() {}
   })
@@ -699,7 +699,7 @@ test("composer bounds retained compact paste markers and falls back to full text
   const setup = await createTestRenderer({ width: 60, height: 8, useThread: false })
   const composer = createComposer(setup.renderer, {
     geometry: composerGeometry(60, 8),
-    slots: { topLeft: "/work", topRight: [] },
+    slots: { topRight: [], bottomRight: "/work" },
     theme: defaultTheme,
     onSubmit() {}
   })
@@ -732,7 +732,7 @@ test("composer image markers and pasted payloads follow native deletion and undo
   const changes: unknown[][] = []
   const composer = createComposer(setup.renderer, {
     geometry: composerGeometry(60, 8),
-    slots: { topLeft: "/work", topRight: [] },
+    slots: { topRight: [], bottomRight: "/work" },
     theme: defaultTheme,
     onSubmit() {},
     onImageMarkersChange: images => changes.push([...images])
@@ -780,7 +780,7 @@ function fakeHistory(texts: readonly string[]): ComposerHistorySource & { append
 test("composer reports its current visual row occupancy", async () => {
   const setup = await createTestRenderer({ width: 20, height: 20, useThread: false })
   const geometry = composerGeometry(20, 20)
-  const slots = { topLeft: "", topRight: [] }
+  const slots = { topRight: [], bottomRight: "" }
   const composer = createComposer(setup.renderer, { geometry, slots, theme: defaultTheme, onSubmit() {} })
   setup.renderer.root.add(composer.root)
 
@@ -798,10 +798,28 @@ test("composer reports its current visual row occupancy", async () => {
   }
 })
 
+test("composer rail places padded metadata on the right edges", async () => {
+  const setup = await createTestRenderer({ width: 40, height: 8, useThread: false })
+  const geometry = composerGeometry(40, 8)
+  const slots = { topRight: ["ctx 15%/247k", "model (high)"], bottomRight: "/workspace/zi" }
+  const composer = createComposer(setup.renderer, { geometry, slots, theme: defaultTheme, onSubmit() {} })
+  setup.renderer.root.add(composer.root)
+
+  try {
+    await setup.waitForVisualIdle()
+    const rows = setup.captureCharFrame().split("\n")
+    expect(rows[0]).toBe("╭───────── ctx 15%/247k • model (high) ╮")
+    expect(rows[2]).toBe("╰─────────────────────── /workspace/zi ╯")
+  } finally {
+    composer.destroy()
+    if (!setup.renderer.isDestroyed) setup.renderer.destroy()
+  }
+})
+
 test("reapplying the same composer presentation does not schedule another frame", async () => {
   const setup = await createTestRenderer({ width: 40, height: 8, useThread: false })
   const geometry = composerGeometry(40, 8)
-  const slots = { topLeft: "/workspace/zi", topRight: ["ctx 15%/247k", "model (high)"] }
+  const slots = { topRight: ["ctx 15%/247k", "model (high)"], bottomRight: "/workspace/zi" }
   const composer = createComposer(setup.renderer, { geometry, slots, theme: defaultTheme, onSubmit() {} })
   setup.renderer.root.add(composer.root)
 
@@ -809,7 +827,10 @@ test("reapplying the same composer presentation does not schedule another frame"
     await setup.waitForVisualIdle()
     expect(setup.renderer.getSchedulerState().hasScheduledRender).toBe(false)
 
-    composer.update(composerGeometry(40, 8), { topLeft: "/workspace/zi", topRight: ["ctx 15%/247k", "model (high)"] })
+    composer.update(composerGeometry(40, 8), {
+      topRight: ["ctx 15%/247k", "model (high)"],
+      bottomRight: "/workspace/zi"
+    })
 
     expect(setup.renderer.getSchedulerState().hasScheduledRender).toBe(false)
   } finally {

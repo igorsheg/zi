@@ -23,6 +23,38 @@ export function truncateToCells(text: string, maxWidth: number): string {
   return `${result}...`
 }
 
+export function truncateMiddleToCells(text: string, maxWidth: number): string {
+  if (maxWidth <= 0) return ""
+  if (textWidth(text) <= maxWidth) return text
+  if (maxWidth <= 3) return ".".repeat(maxWidth)
+
+  const parts = [...graphemes.segment(text)]
+  const contentWidth = maxWidth - 3
+  const headTarget = Math.floor(contentWidth / 2)
+  let head = ""
+  let headWidth = 0
+  let headEnd = 0
+  while (headEnd < parts.length) {
+    const segment = parts[headEnd]!.segment
+    const width = cellWidth(segment)
+    if (headWidth + width > headTarget) break
+    head += segment
+    headWidth += width
+    headEnd++
+  }
+
+  let tail = ""
+  let tailWidth = 0
+  for (let index = parts.length - 1; index >= headEnd; index--) {
+    const segment = parts[index]!.segment
+    const width = cellWidth(segment)
+    if (headWidth + tailWidth + width > contentWidth) break
+    tail = segment + tail
+    tailWidth += width
+  }
+  return `${head}...${tail}`
+}
+
 export interface CellLineWindow {
   readonly lines: readonly string[]
   readonly hasMore: boolean

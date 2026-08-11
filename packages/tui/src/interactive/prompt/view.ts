@@ -1,3 +1,5 @@
+import { isAbsolute, relative, resolve, sep } from "node:path"
+
 import {
   BoxRenderable,
   CliRenderEvents,
@@ -23,7 +25,6 @@ import type { SlashController } from "../slash-controller.js"
 import { transcriptStatusRows } from "../transcript/status-view.js"
 import { AuthCeremonyView } from "./auth-ceremony-view.js"
 import { captureFileCompletionInput } from "./file-completion.js"
-import { layoutPromptFooter, type PromptFooterPresentation, PromptFooterView } from "./footer-view.js"
 import { SessionGreeterView } from "./greeter-view.js"
 import { PickerStackView } from "./picker-view.js"
 import { QueuedInputsView } from "./queue-view.js"
@@ -55,7 +56,6 @@ export class PromptView {
   readonly #queue: QueuedInputsView
   readonly #greeter: SessionGreeterView
   readonly #composer: Composer
-  readonly #footer: PromptFooterView
   readonly #input: Composer["input"]
   readonly #pickerStack: PickerStackView
   readonly #release: Array<() => void> = []
@@ -96,7 +96,7 @@ export class PromptView {
     const geometry = composerGeometry(renderer.width, renderer.height)
     this.#composer = createComposer(renderer, {
       geometry,
-      slots: composerSlots(),
+      slots: composerSlots(session),
       theme,
       historySource: {
         latest: () => session.latestPromptHistoryEntry(),
@@ -109,7 +109,6 @@ export class PromptView {
       onPaste: this.#onPaste
     })
     this.#input = this.#composer.input
-    this.#footer = new PromptFooterView(renderer, theme)
     this.#pickerStack = new PickerStackView(
       renderer,
       this.#store.picker,
@@ -118,12 +117,10 @@ export class PromptView {
       () => this.#input.plainText
     )
 
-    // Transient workflows stay above the composer; stable session metadata yields the below-input surface to pickers.
     this.root.add(this.#authCeremony.root)
     this.root.add(this.#queue.root)
     this.root.add(this.#greeter.root)
     this.root.add(this.#composer.root)
-    this.root.add(this.#footer.root)
     this.root.add(this.#pickerStack.root)
 
     const update = () => this.#update()
@@ -153,7 +150,6 @@ export class PromptView {
     this.#authCeremony.destroy()
     this.#queue.destroy()
     this.#greeter.destroy()
-    this.#footer.destroy()
     this.#store.dispose()
     this.#pickerStack.destroy()
     this.root.destroyRecursively()
@@ -175,7 +171,7 @@ export class PromptView {
       this.#syncedImages = prompt.images
       this.#composer.syncImageMarkers(prompt.images)
     }
-    const composerRows = this.#composer.update(geometry, composerSlots(prompt.images.length))
+    const composerRows = this.#composer.update(geometry, composerSlots(session, prompt.images.length))
     const authCeremonyRows = this.#authCeremony.update(prompt.authCeremony, this.#renderer.width)
     const pickerOpen = Boolean(this.#store.picker.presentation(this.#input.plainText))
     const greeterRows = this.#greeter.update(
@@ -185,26 +181,14 @@ export class PromptView {
       pickerOpen
     )
     const queuedInputs = session.queuedInputs
-    const queueActive = queuedInputs.steering.length > 0 || queuedInputs.followUp.length > 0
     const otherFixedRows = greeterRows + transcriptStatusRows + authCeremonyRows
-    const fixedRowsWithoutFooter = geometry.protectedRows + otherFixedRows
-    // The transcript owns one row; an active queue needs one summary row before ambient metadata is admitted.
-    const reservedContentRows = 1 + (queueActive ? 1 : 0)
-    const footerFits =
-      fixedRowsWithoutFooter + PromptFooterView.occupiedRows + reservedContentRows <= this.#renderer.height
-    const footerRows = this.#footer.update(
-      layoutPromptFooter(
-        pickerOpen || !geometry.bordered || !footerFits ? { type: "hidden" } : footerPresentation(session),
-        this.#renderer.width
-      )
-    )
-    const fixedRows = fixedRowsWithoutFooter + footerRows
+    const fixedRows = geometry.protectedRows + otherFixedRows
     const pickerVisible = this.#pickerStack.update(Math.max(0, this.#renderer.height - fixedRows))
 
     if (pickerVisible) {
       this.#queue.hide()
     } else {
-      this.#queue.update(queuedInputs, Math.max(0, this.#renderer.height - composerRows - otherFixedRows - footerRows))
+      this.#queue.update(queuedInputs, Math.max(0, this.#renderer.height - composerRows - otherFixedRows))
     }
   }
 
@@ -470,26 +454,47 @@ function authenticationActive(workflow: PromptWorkflow): boolean {
   )
 }
 
-function composerSlots(imageCount = 0): ComposerSlots {
-  return { topLeft: "", topRight: imageCount === 0 ? [] : [`${imageCount} image${imageCount === 1 ? "" : "s"}`] }
+function composerSlots(session: ReturnType<InteractiveStore["getSession"]>, imageCount = 0): ComposerSlots {
+  const context = session.contextUsage
+  const model = session.modelState
+  return {
+    topRight: [
+      imageCount === 0 ? "" : `${imageCount} image${imageCount === 1 ? "" : "s"}`,
+      context.type === "unavailable" ? "" : contextTitle(context.type, context.percent, context.contextWindow),
+      model.type === "unselected"
+        ? "No model selected"
+        : session.thinkingLevel === "off"
+          ? model.model.id
+          : `${model.model.id} (${session.thinkingLevel})`
+    ].filter(Boolean),
+    bottomRight: formatCwd(session.sessionManager.header.cwd, session.homeDir)
+  }
 }
 
 function queuedInputCount(session: ReturnType<InteractiveStore["getSession"]>): number {
   return session.queuedInputs.steering.length + session.queuedInputs.followUp.length
 }
 
-function footerPresentation(session: ReturnType<InteractiveStore["getSession"]>): PromptFooterPresentation {
-  const model = session.modelState
-  return {
-    type: "session",
-    cwd: session.sessionManager.header.cwd,
-    homeDir: session.homeDir,
-    model:
-      model.type === "unselected"
-        ? { type: "unselected" }
-        : { type: "selected", id: model.model.id, thinking: session.thinkingLevel },
-    context: session.contextUsage
-  }
+// Pi provenance: pi-coding-agent footer.ts at 73414d08 contracts only cwd values inside the configured home.
+function formatCwd(cwd: string, homeDir: string): string {
+  const resolvedCwd = resolve(cwd)
+  const resolvedHome = resolve(homeDir)
+  const relativeToHome = relative(resolvedHome, resolvedCwd)
+  const insideHome =
+    relativeToHome === "" ||
+    (relativeToHome !== ".." && !relativeToHome.startsWith(`..${sep}`) && !isAbsolute(relativeToHome))
+  if (!insideHome) return cwd
+  return relativeToHome === "" ? "~" : `~${sep}${relativeToHome}`
+}
+
+function contextTitle(type: "measured" | "estimated", percent: number, contextWindow: number): string {
+  return `ctx ${type === "estimated" ? "~" : ""}${Math.round(percent)}%/${formatTokenCount(contextWindow)}`
+}
+
+function formatTokenCount(tokens: number): string {
+  if (tokens < 1_000) return String(tokens)
+  if (tokens < 1_000_000) return `${Math.round(tokens / 1_000)}k`
+  return `${(tokens / 1_000_000).toFixed(1).replace(/\.0$/, "")}m`
 }
 
 function normalizePastedText(text: string): string {
