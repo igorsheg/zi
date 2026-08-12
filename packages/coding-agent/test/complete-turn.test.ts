@@ -13,6 +13,7 @@ import {
 } from "@earendil-works/pi-ai"
 
 import { createTestAgentRuntime as createAgentRuntime } from "../src/testing.js"
+import { isBashToolDetails } from "../src/tools/bash.js"
 
 test("built-in expected failures keep typed details and are finalized as Pi errors once", async () => {
   const root = await mkdtemp(join(tmpdir(), "zi-tool-errors-"))
@@ -203,6 +204,7 @@ test("background shell settlement appends one durable operation outcome", async 
   const models = createModels()
   const faux = fauxProvider({ tokensPerSecond: 10_000 })
   models.setProvider(faux.provider)
+  let completionContext = ""
   faux.setResponses([
     fauxAssistantMessage(
       fauxToolCall(
@@ -212,7 +214,11 @@ test("background shell settlement appends one durable operation outcome", async 
       ),
       { stopReason: "toolUse" }
     ),
-    fauxAssistantMessage("Background work admitted.")
+    fauxAssistantMessage("Background work admitted."),
+    context => {
+      completionContext = JSON.stringify(context.messages)
+      return fauxAssistantMessage("Used the background completion.")
+    }
   ])
   const { session } = await createAgentRuntime({
     cwd: root,
@@ -251,6 +257,66 @@ test("background shell settlement appends one durable operation outcome", async 
     expect(appended).toEqual([outcome!.id])
     expect(JSON.stringify(outcome)).not.toContain("private output")
     expect(JSON.stringify(outcome)).not.toContain("node -e")
+    expect(faux.state.callCount).toBe(2)
+    expect(session.messages.some(message => message.role === "custom")).toBe(false)
+    if (!outcome || outcome.capability !== "shell") throw new Error("Expected shell background outcome")
+
+    await session.prompt("Use completed background work.")
+    expect(completionContext).toContain("<shell_task_completion>")
+    expect(completionContext).toContain(outcome.taskId)
+    const completion = session.sessionManager
+      .retainedEntries()
+      .find(entry => entry.type === "custom_message" && entry.customType === "zi.shell_task_completion")
+    expect(completion).toMatchObject({ type: "custom_message", display: false })
+    expect(completion && "content" in completion ? completion.content : "").not.toContain("private output")
+  } finally {
+    session.dispose()
+  }
+})
+
+test("terminal task_output evidence suppresses duplicate completion delivery", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-background-output-delivery-"))
+  const models = createModels()
+  const faux = fauxProvider({ tokensPerSecond: 10_000 })
+  models.setProvider(faux.provider)
+  let finalContext = ""
+  faux.setResponses([
+    fauxAssistantMessage(
+      fauxToolCall(
+        "bash",
+        { command: `node -e "setTimeout(() => console.log('done'), 30)"`, background: true },
+        { id: "background-output-1" }
+      ),
+      { stopReason: "toolUse" }
+    ),
+    context => {
+      const started = context.messages.find(
+        message => message.role === "toolResult" && message.toolCallId === "background-output-1"
+      )
+      if (!started || started.role !== "toolResult" || !isBashToolDetails(started.details)) {
+        throw new Error("Expected background Bash result")
+      }
+      if (started.details.state === "rejected") throw new Error("Expected admitted background task")
+      return fauxAssistantMessage(
+        fauxToolCall("task_output", { taskId: started.details.taskId, timeout: 2 }, { id: "task-output-1" }),
+        { stopReason: "toolUse" }
+      )
+    },
+    context => {
+      finalContext = JSON.stringify(context.messages)
+      return fauxAssistantMessage("Observed terminal output.")
+    }
+  ])
+  const { session } = await createAgentRuntime({ cwd: root, model: "faux/faux-1", models })
+
+  try {
+    await session.prompt("Run and observe background work.")
+    expect(finalContext).not.toContain("<shell_task_completion>")
+    expect(
+      session.sessionManager
+        .retainedEntries()
+        .filter(entry => entry.type === "custom_message" && entry.customType === "zi.shell_task_completion")
+    ).toEqual([])
   } finally {
     session.dispose()
   }

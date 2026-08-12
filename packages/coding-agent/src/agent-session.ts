@@ -65,6 +65,7 @@ import { validateActiveExtensionToolCatalog, type ExtensionToolRegistration } fr
 import { admitExtensionTools } from "./extensions/tools.js"
 import { isZiAgentMessage, type AgentMessage } from "./messages.js"
 import type { ModelRegistry } from "./model-registry.js"
+import { shellBackgroundTaskOperationId, type ShellBackgroundTaskOperationOutcomeInput } from "./operation-outcomes.js"
 import type { ZiPaths } from "./paths.js"
 import type { ProcessTreeTracker } from "./processes/process-tree.js"
 import { type ProjectFileSearch, type ProjectFileSearchResult } from "./project-file-search.js"
@@ -83,6 +84,7 @@ import {
   type CustomEntry,
   type CustomMessageEntry,
   type CustomMessageInput,
+  type OperationOutcomeEntry,
   type SessionEntry,
   type SessionJournalMemoryDiagnostics,
   type SessionJson,
@@ -107,6 +109,7 @@ import { isSubagentToolDetails, type SubagentToolDetails } from "./subagents/too
 import { createSubagentTools } from "./subagents/tools.js"
 import { buildSystemPrompt } from "./system-prompt.js"
 import type { ToolSurface } from "./tool-surface.js"
+import { isTaskOutputToolDetails } from "./tools/shell-tasks.js"
 import { type WorkPlan, type WorkPlanSnapshot } from "./work-plan.js"
 
 export type { ContextUsage } from "./context-usage.js"
@@ -517,6 +520,7 @@ export class AgentSession {
   readonly #processTreeTracker: ProcessTreeTracker | undefined
   readonly #apiKeyProvider: string | undefined
   readonly #listeners = new Set<(event: AgentSessionEvent) => void>()
+  readonly #pendingShellCompletions = new Map<string, ShellBackgroundTaskOperationOutcomeInput>()
   readonly #unsubscribeAgent: () => void
   readonly #unsubscribeShell: (() => void) | undefined
   readonly #unsubscribeWorkPlan: () => void
@@ -570,10 +574,17 @@ export class AgentSession {
     this.#apiKeyProvider = config.apiKeyProvider
     this.sessionManager = config.sessionManager
     this.#shell?.bindOperationOutcomeSink(outcome => {
-      const entry = this.sessionManager.appendOperationOutcome(outcome)
+      this.#admitShellCompletion(outcome)
+      let entry: OperationOutcomeEntry
+      try {
+        entry = this.sessionManager.appendOperationOutcome(outcome)
+      } catch (cause) {
+        this.#pendingShellCompletions.delete(outcome.operationId)
+        throw cause
+      }
       this.#emitAll([{ type: "entry_appended", entry }])
     })
-    this.#restoreSubagentCompletionDeliveries()
+    this.#restoreCompletionDeliveries()
     this.settingsManager = config.settingsManager
     this.#modelState = config.model ? { type: "selected", model: config.model } : { type: "unselected" }
     this.#agent.prepareNextTurnWithContext = (context, signal) => this.#prepareNextTurn(context, signal)
@@ -1968,7 +1979,7 @@ export class AgentSession {
     let failure: { cause: unknown } | undefined
     let interrupted: InterruptingActivity | undefined
     try {
-      this.#deliverSubagentCompletions()
+      this.#deliverCompletions()
       await this.#compactBeforeMessages(runId, start.type === "prompt" ? start.messages : [])
       if (this.#activateProviderStart(runId)) {
         if (start.type === "prompt") {
@@ -2093,7 +2104,7 @@ export class AgentSession {
     const activity = this.#activity
     if (activity.type !== "running" || activity.phase.type !== "agent" || signal?.aborted) return undefined
 
-    const completionsDelivered = this.#deliverSubagentCompletions()
+    const completionsDelivered = this.#deliverCompletions()
     const activeTools = this.#agent.state.tools
     const contextTools = context.context.tools ?? []
     const toolsChanged =
@@ -2121,6 +2132,12 @@ export class AgentSession {
     return { context: { ...(synchronizedContext ?? context.context), messages: [...this.#agent.state.messages] } }
   }
 
+  #deliverCompletions(): boolean {
+    const subagent = this.#deliverSubagentCompletions()
+    const shell = this.#deliverShellCompletions()
+    return subagent || shell
+  }
+
   // Behavioral provenance: Codex 4c25d6cc forwards each terminal V2 child turn into the
   // parent's mailbox without starting a parent turn. Zi commits the same bounded context at a provider boundary.
   #deliverSubagentCompletions(): boolean {
@@ -2133,20 +2150,56 @@ export class AgentSession {
     return delivered
   }
 
-  #restoreSubagentCompletionDeliveries(): void {
-    if (!this.#subagents) return
+  #deliverShellCompletions(): boolean {
+    this.#shell?.retryPendingOutcomes()
+    let delivered = false
+    for (const completion of this.#pendingShellCompletions.values()) {
+      const committed = this.#appendCustomMessage(shellCompletionMessage(completion))
+      this.#publishCustomMessage(committed)
+      this.#pendingShellCompletions.delete(completion.operationId)
+      delivered = true
+    }
+    return delivered
+  }
+
+  #restoreCompletionDeliveries(): void {
     for (const entry of this.sessionManager.entries()) {
-      if (entry.type === "custom_message" && entry.customType === subagentCompletionCustomType) {
-        const identity = subagentCompletionIdentity(entry.details)
-        if (identity) this.#subagents.acknowledgeCompletion(identity.name, identity.workCycle)
+      if (entry.type === "operation_outcome" && entry.capability === "shell") {
+        this.#admitShellCompletion(entry)
         continue
       }
-      if (entry.type === "message") this.#acknowledgeSubagentToolResult(entry.message)
+      if (entry.type === "custom_message") {
+        if (entry.customType === subagentCompletionCustomType) {
+          const identity = subagentCompletionIdentity(entry.details)
+          if (identity) this.#subagents?.acknowledgeCompletion(identity.name, identity.workCycle)
+        } else if (entry.customType === shellCompletionCustomType) {
+          const operationId = shellCompletionIdentity(entry.details)
+          if (operationId) this.#pendingShellCompletions.delete(operationId)
+        }
+        continue
+      }
+      if (entry.type === "message") this.#acknowledgeCompletionToolResult(entry.message)
     }
   }
 
-  #acknowledgeSubagentToolResult(message: AgentMessage): void {
-    if (!this.#subagents || message.role !== "toolResult") return
+  #admitShellCompletion(completion: ShellBackgroundTaskOperationOutcomeInput): void {
+    if (this.#pendingShellCompletions.has(completion.operationId)) return
+    const maximum = this.#shell?.limits.maxCompletedTasks ?? 100
+    if (this.#pendingShellCompletions.size >= maximum) {
+      throw new Error(`Shell completion capacity exceeded: more than ${maximum} outcomes await delivery`)
+    }
+    this.#pendingShellCompletions.set(completion.operationId, completion)
+  }
+
+  #acknowledgeCompletionToolResult(message: AgentMessage): void {
+    if (message.role !== "toolResult") return
+    if (message.toolName === "task_output" && isTaskOutputToolDetails(message.details)) {
+      if (message.details.outcome === "success" && message.details.state === "completed") {
+        this.#pendingShellCompletions.delete(shellBackgroundTaskOperationId(message.details.taskId))
+      }
+      return
+    }
+    if (!this.#subagents) return
     if (message.toolName === "code") {
       this.#subagents.releaseCompletionClaims(`${message.toolCallId}:code:`)
       return
@@ -2989,7 +3042,7 @@ export class AgentSession {
         try {
           this.#emit({ type: "entry_appended", entry })
         } finally {
-          this.#acknowledgeSubagentToolResult(entry.message)
+          this.#acknowledgeCompletionToolResult(entry.message)
         }
       }
     }
@@ -3386,6 +3439,54 @@ function userMessage(text: string, images: readonly ImageContent[]): AgentMessag
 }
 
 const subagentCompletionCustomType = "zi.subagent_completion"
+const shellCompletionCustomType = "zi.shell_task_completion"
+
+function shellCompletionMessage(completion: ShellBackgroundTaskOperationOutcomeInput): CustomMessageInput {
+  const payload = {
+    task_id: completion.taskId,
+    origin: completion.origin,
+    result: completion.result,
+    duration_ms: completion.durationMs,
+    output_bytes: completion.outputBytes,
+    ...shellCompletionResult(completion)
+  }
+  return {
+    customType: shellCompletionCustomType,
+    content: `<shell_task_completion>\n${JSON.stringify(payload)}\n</shell_task_completion>`,
+    display: false,
+    details: { operationId: completion.operationId, taskId: completion.taskId, result: completion.result }
+  }
+}
+
+function shellCompletionResult(completion: ShellBackgroundTaskOperationOutcomeInput): {
+  readonly [key: string]: SessionJson
+} {
+  if (completion.result === "succeeded") return { exit_code: completion.exitCode }
+  if (completion.result === "cancelled") return { cancellation_code: completion.cancellationCode }
+  switch (completion.errorCode) {
+    case "exit_nonzero":
+      return { error_code: completion.errorCode, exit_code: completion.exitCode }
+    case "signaled":
+      return { error_code: completion.errorCode, signal: completion.signal }
+    case "timed_out":
+    case "output_limit":
+    case "execution_failed":
+      return { error_code: completion.errorCode }
+    default:
+      return assertNever(completion)
+  }
+}
+
+function shellCompletionIdentity(value: SessionJson | undefined): string | undefined {
+  if (!isSessionJsonRecord(value)) return undefined
+  const operationId = value.operationId
+  const taskId = value.taskId
+  return typeof operationId === "string" &&
+    typeof taskId === "string" &&
+    operationId === shellBackgroundTaskOperationId(taskId)
+    ? operationId
+    : undefined
+}
 
 function subagentCompletionMessage(completion: SubagentCompletion): CustomMessageInput {
   const text = clipUtf8(completion.text, durablePreviewBytes)

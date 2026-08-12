@@ -89,7 +89,17 @@ test("new Zi sessions expose direct coding tools and code by default", async () 
 
   try {
     await runtime.session.prompt("inspect tools")
-    expect(catalog).toEqual(["read", "bash", "edit", "write", "task_output", "kill_task", "update_plan", "code"])
+    expect(catalog).toEqual([
+      "read",
+      "bash",
+      "edit",
+      "write",
+      "list_tasks",
+      "task_output",
+      "kill_task",
+      "update_plan",
+      "code"
+    ])
   } finally {
     runtime.session.dispose()
     await runtime.session.waitForIdle()

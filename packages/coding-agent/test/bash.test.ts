@@ -8,7 +8,13 @@ import type { ShellBackgroundTaskOperationOutcomeInput } from "../src/operation-
 import { defaultShellLimits, SessionShell, ShellRunAdmissionError, type ShellLimits } from "../src/session-shell.js"
 import { createBashTool, isBashToolDetails } from "../src/tools/bash.js"
 import { projectToolPresentation } from "../src/tools/presentation/project.js"
-import { createKillTaskTool, createTaskOutputTool, isTaskOutputToolDetails } from "../src/tools/shell-tasks.js"
+import {
+  createKillTaskTool,
+  createListTasksTool,
+  createTaskOutputTool,
+  isTaskListToolDetails,
+  isTaskOutputToolDetails
+} from "../src/tools/shell-tasks.js"
 import { DEFAULT_MAX_BYTES } from "../src/tools/truncate.js"
 
 test("bash bounds model output and preserves the full stream for the session lifetime", async () => {
@@ -29,6 +35,14 @@ test("bash bounds model output and preserves the full stream for the session lif
     expect(result.details.output.truncation.truncated).toBe(true)
     const fullOutput = result.details.output.fullOutput
     expect(fullOutput.type === "available" && existsSync(fullOutput.path)).toBe(true)
+
+    const incremental = await createTaskOutputTool(shell).execute("bash-1-output", {
+      taskId: result.details.taskId,
+      cursor: 0
+    })
+    if (incremental.details.outcome === "error") throw new Error("Expected incremental output")
+    expect(incremental.details.output).toMatchObject({ cursor: 0, nextCursor: DEFAULT_MAX_BYTES + 4096 })
+    expect(incremental.details.output.omittedBytes).toBeGreaterThan(0)
   } finally {
     await shell.dispose()
     rmSync(cwd, { recursive: true, force: true })
@@ -386,6 +400,197 @@ test("background timeout, output limit, and disposal retain distinct outcomes", 
     ])
   )
   rmSync(cwd, { recursive: true, force: true })
+})
+
+test("operation outcome binding rejects background work admitted before session ownership", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "zi-bash-late-outcome-binding-"))
+  const shell = createShell(cwd)
+
+  try {
+    const started = await shell.run("background", { command: "printf done", timeoutMs: 2_000, background: true })
+    if (started.type !== "backgrounded") throw new Error("Expected background task")
+    expect(() => shell.bindOperationOutcomeSink(() => {})).toThrow(
+      "Shell operation outcome sink must be bound before background work"
+    )
+  } finally {
+    await shell.dispose()
+    rmSync(cwd, { recursive: true, force: true })
+  }
+})
+
+test("background outcome persistence retries at the next delivery boundary", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "zi-bash-outcome-retry-"))
+  const shell = createShell(cwd)
+  const outcomes: ShellBackgroundTaskOperationOutcomeInput[] = []
+  let attempts = 0
+  shell.bindOperationOutcomeSink(outcome => {
+    attempts++
+    if (attempts === 1) throw new Error("journal unavailable")
+    outcomes.push(outcome)
+  })
+
+  try {
+    const first = await shell.run("first", { command: "printf first", timeoutMs: 2_000, background: true })
+    if (first.type !== "backgrounded") throw new Error("Expected first background task")
+    await shell.wait(first.task.taskId, 2_000)
+    expect(outcomes).toEqual([])
+
+    shell.retryPendingOutcomes()
+    expect(outcomes.map(outcome => outcome.taskId)).toEqual([first.task.taskId])
+
+    const second = await shell.run("second", { command: "printf second", timeoutMs: 2_000, background: true })
+    if (second.type !== "backgrounded") throw new Error("Expected second background task")
+    await shell.wait(second.task.taskId, 2_000)
+
+    expect(outcomes.map(outcome => outcome.taskId)).toEqual([first.task.taskId, second.task.taskId])
+  } finally {
+    await shell.dispose()
+    rmSync(cwd, { recursive: true, force: true })
+  }
+})
+
+test("an unpersisted background outcome bounds later admission and preserves cleanup", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "zi-bash-outcome-backlog-"))
+  const outputRoot = join(cwd, "output")
+  const shell = new SessionShell({
+    cwd,
+    sessionId: crypto.randomUUID(),
+    outputRoot,
+    limits: { ...defaultShellLimits, maxBackgroundTasks: 2, maxCompletedTasks: 1 }
+  })
+  shell.bindOperationOutcomeSink(() => {
+    throw new Error("journal unavailable")
+  })
+
+  const first = await shell.run("first", {
+    command: `node -e "setInterval(() => {}, 1000)"`,
+    timeoutMs: 2_000,
+    background: true
+  })
+  if (first.type !== "backgrounded") throw new Error("Expected first background task")
+  const output = first.task.output.fullOutput
+  if (output.type !== "available") throw new Error("Expected retained output")
+
+  expect(() => shell.run("second", { command: "printf second", timeoutMs: 2_000, background: true })).toThrow(
+    ShellRunAdmissionError
+  )
+  await shell.kill(first.task.taskId)
+  await shell.wait(first.task.taskId, 2_000)
+  expect(() => shell.run("third", { command: "printf third", timeoutMs: 2_000, background: true })).toThrow(
+    ShellRunAdmissionError
+  )
+  expect(
+    await shell.dispose().then(
+      () => "",
+      cause => (cause instanceof Error ? cause.message : String(cause))
+    )
+  ).toBe("Could not persist shell operation outcomes")
+  expect(shell.snapshots()).toEqual([])
+  expect(existsSync(output.path)).toBe(false)
+  rmSync(cwd, { recursive: true, force: true })
+})
+
+test("task_output cursors return only newly observed output", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "zi-bash-cursor-"))
+  const shell = createShell(cwd)
+  const bash = createBashTool(shell)
+  const output = createTaskOutputTool(shell)
+
+  try {
+    const started = await bash.execute("bash-cursor", {
+      command: `node -e "process.stdout.write('alpha\\n'); setTimeout(() => process.stdout.write('beta\\n'), 500)"`,
+      background: true
+    })
+    if (started.details.state === "rejected") throw new Error("Expected background task")
+    const taskId = started.details.taskId
+
+    await waitUntil(() => shell.snapshot(taskId)?.output.text.includes("alpha") === true)
+    const first = await output.execute("task-cursor-first", { taskId })
+    if (first.details.outcome === "error") throw new Error("Expected task output")
+    const cursor = first.details.output.nextCursor
+    if (cursor === undefined) throw new Error("Expected task output cursor")
+
+    const second = await output.execute("task-cursor-second", { taskId, timeout: 2, cursor })
+    expect(second.content[0]).toMatchObject({ type: "text", text: expect.stringContaining("beta") })
+    expect(second.content[0]).not.toMatchObject({ type: "text", text: expect.stringContaining("alpha") })
+    expect(second.details).toMatchObject({
+      outcome: "success",
+      state: "completed",
+      output: { cursor, omittedBytes: 0 }
+    })
+    expect(isTaskOutputToolDetails(second.details)).toBe(true)
+
+    if (second.details.outcome === "error") throw new Error("Expected completed task output")
+    const settledCursor = second.details.output.nextCursor
+    if (settledCursor === undefined) throw new Error("Expected settled task output cursor")
+    const empty = await output.execute("task-cursor-empty", { taskId, cursor: settledCursor })
+    expect(empty.content[0]).toMatchObject({ type: "text", text: expect.stringContaining("(no new output)") })
+    expect(empty.details).toMatchObject({ output: { cursor: settledCursor, nextCursor: settledCursor } })
+
+    const invalid = await output.execute("task-cursor-invalid", { taskId, cursor: settledCursor + 1 })
+    expect(invalid.details).toMatchObject({ outcome: "error", error: expect.stringContaining("cursor") })
+  } finally {
+    await shell.dispose()
+    rmSync(cwd, { recursive: true, force: true })
+  }
+})
+
+test("cursor-aware waits retain settlement output when the completed task is evicted", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "zi-bash-cursor-eviction-"))
+  const shell = createShell(cwd, { maxCompletedTasks: 2 })
+  shell.bindOperationOutcomeSink(() => {})
+  const now = Date.now
+  Date.now = () => 1_000
+
+  try {
+    const delayed = await shell.run("delayed", {
+      command: `node -e "setTimeout(() => process.stdout.write('late'), 100)"`,
+      timeoutMs: 2_000,
+      background: true
+    })
+    if (delayed.type !== "backgrounded") throw new Error("Expected delayed background task")
+    const waiting = shell.wait(delayed.task.taskId, 2_000, undefined, 0)
+
+    const quick = await shell.run("quick", { command: "printf quick", timeoutMs: 2_000, background: true })
+    if (quick.type !== "backgrounded") throw new Error("Expected quick background task")
+    await shell.wait(quick.task.taskId, 2_000)
+    await shell.run("foreground", { command: "printf foreground", timeoutMs: 2_000, background: false })
+
+    const completed = await waiting
+    expect(completed).toMatchObject({
+      type: "completed",
+      output: { text: "late", cursor: 0, nextCursor: 4, fullOutput: { type: "evicted" } }
+    })
+    expect(shell.snapshot(delayed.task.taskId)).toBeUndefined()
+  } finally {
+    Date.now = now
+    await shell.dispose()
+    rmSync(cwd, { recursive: true, force: true })
+  }
+})
+
+test("list_tasks returns bounded recent task summaries without output", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "zi-bash-list-"))
+  const shell = createShell(cwd)
+  const bash = createBashTool(shell)
+  const list = createListTasksTool(shell)
+
+  try {
+    await bash.execute("bash-list-first", { command: "printf first-output" })
+    await bash.execute("bash-list-second", { command: "printf second-output" })
+    const result = await list.execute("list-tasks", { limit: 1 })
+
+    expect(result.content[0]).toMatchObject({ type: "text", text: expect.stringContaining("printf second-output") })
+    expect(result.details).toMatchObject({
+      outcome: "success",
+      tasks: [{ state: "completed", command: "printf second-output", finalOutcome: { type: "exited", exitCode: 0 } }],
+      omitted: 1
+    })
+    expect(isTaskListToolDetails(result.details)).toBe(true)
+  } finally {
+    await shell.dispose()
+    rmSync(cwd, { recursive: true, force: true })
+  }
 })
 
 test("bash, task_output, and kill_task adapt one session task owner", async () => {

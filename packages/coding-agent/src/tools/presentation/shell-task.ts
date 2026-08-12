@@ -1,9 +1,11 @@
 import type { ShellTaskOutcome } from "../../session-shell.js"
 import {
   isKillTaskToolDetails,
+  isTaskListToolDetails,
   isTaskOutputToolDetails,
   type KillTaskToolDetails,
   type ShellOutputDetails,
+  type TaskListToolDetails,
   type TaskOutputToolDetails
 } from "../shell-tasks.js"
 import { maxExpandedToolRows, type ToolNotice, type ToolPresentation, type ToolPresentationSource } from "./types.js"
@@ -19,6 +21,30 @@ import {
   stringValue,
   utf8Prefix
 } from "./values.js"
+
+export function projectListTasks(source: ToolPresentationSource): ToolPresentation {
+  let details: TaskListToolDetails | undefined
+  if ("result" in source && source.result !== undefined) {
+    const value = resultDetails(source.result)
+    if (isTaskListToolDetails(value) && matchesToolOutcome(source, value.outcome)) details = value
+  }
+  const text = "result" in source ? (resultText(source.result) ?? "") : ""
+  const error = details?.outcome === "error" || source.status === "failed"
+  return {
+    header: {
+      label: "Tasks",
+      subject: { type: "text", text: details?.outcome === "success" ? `${details.tasks.length} recent` : "…" },
+      details: details?.outcome === "success" ? [`${details.omitted} omitted`] : []
+    },
+    ...(text ? { body: { type: "text" as const, text: boundHead(text), tone: error ? "error" : "normal" } } : {}),
+    notices:
+      details?.outcome === "error"
+        ? [{ type: "message", tone: "error", visibility: "always", text: boundInline(details.error) }]
+        : [],
+    preview: { compact: { type: "head", rows: 8 }, detailed: { type: "head", rows: maxExpandedToolRows } },
+    timing: "duration"
+  }
+}
 
 export function projectTaskOutput(source: ToolPresentationSource): ToolPresentation {
   const args = recordValue(source.args)
@@ -119,20 +145,28 @@ function taskDetails(details: Exclude<TaskOutputToolDetails, { outcome: "error" 
   return [
     boundInline(details.state),
     ...(details.placement ? [boundInline(details.placement)] : []),
-    ...(details.stopReason ? [boundInline(details.stopReason)] : [])
+    ...(details.stopReason ? [boundInline(details.stopReason)] : []),
+    ...(details.output.nextCursor === undefined ? [] : [`cursor ${details.output.nextCursor}`])
   ]
 }
 
 function shellOutputNotices(output: ShellOutputDetails): ToolNotice[] {
-  if (!output.truncation.truncated) return []
-  const notices: ToolNotice[] = [
-    {
+  const notices: ToolNotice[] = []
+  if ((output.omittedBytes ?? 0) > 0) {
+    notices.push({
       type: "message",
       tone: "warning",
       visibility: "always",
-      text: `Output truncated to ${output.truncation.outputLines} lines (${formatBytes(output.truncation.outputBytes)})`
-    }
-  ]
+      text: `${formatBytes(output.omittedBytes ?? 0)} before cursor ${output.nextCursor ?? 0} was omitted`
+    })
+  }
+  if (!output.truncation.truncated) return notices
+  notices.push({
+    type: "message",
+    tone: "warning",
+    visibility: "always",
+    text: `Output truncated to ${output.truncation.outputLines} lines (${formatBytes(output.truncation.outputBytes)})`
+  })
   if (output.fullOutput.type === "available") {
     notices.push({
       type: "path",

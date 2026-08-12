@@ -15,7 +15,7 @@ import type { SessionShell } from "../session-shell.js"
 import { createBashTool } from "./bash.js"
 import { createEditTool } from "./edit.js"
 import { createReadTool } from "./read.js"
-import { createKillTaskTool, createTaskOutputTool } from "./shell-tasks.js"
+import { createKillTaskTool, createListTasksTool, createTaskOutputTool } from "./shell-tasks.js"
 import { createWriteTool } from "./write.js"
 
 export interface CreateCodingToolsOptions {
@@ -29,6 +29,7 @@ export function createCodingTools({ cwd, shell }: CreateCodingToolsOptions): Age
     createBashTool(shell),
     createEditTool(cwd),
     createWriteTool(cwd),
+    createListTasksTool(shell),
     createTaskOutputTool(shell),
     createKillTaskTool(shell)
   ]

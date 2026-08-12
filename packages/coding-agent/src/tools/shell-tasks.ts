@@ -8,17 +8,31 @@ import type {
   ShellKillResult,
   ShellTaskOutcome,
   ShellTaskOutputSnapshot,
-  ShellTaskSnapshot
+  ShellTaskSnapshot,
+  ShellTaskSummary,
+  ShellStopReason
 } from "../session-shell.js"
 import { boundToolText, isBoundedToolText, maxToolErrorScalars } from "./text.js"
 import { isTruncationDetails, truncationDetails, type TruncationDetails } from "./truncate.js"
 
 const maxTaskIdLength = 4_096
+const maxTaskListResults = 100
+const defaultTaskListResults = 20
+const maxTaskCommandPreviewScalars = 160
 
 const outputParameters = Type.Object({
   taskId: Type.String({ maxLength: maxTaskIdLength, description: "Background task ID returned by bash" }),
   timeout: Type.Optional(
     Type.Number({ minimum: 0, description: "Seconds to wait for completion; omit or use 0 to poll" })
+  ),
+  cursor: Type.Optional(
+    Type.Integer({ minimum: 0, description: "Byte cursor returned by a previous task_output call" })
+  )
+})
+
+const listParameters = Type.Object({
+  limit: Type.Optional(
+    Type.Integer({ minimum: 1, maximum: maxTaskListResults, description: "Maximum recent tasks to return" })
   )
 })
 
@@ -29,6 +43,9 @@ const killParameters = Type.Object({
 export interface ShellOutputDetails {
   readonly truncation: TruncationDetails
   readonly fullOutput: ShellFullOutput
+  readonly cursor?: number
+  readonly nextCursor?: number
+  readonly omittedBytes?: number
 }
 
 interface TaskOutputBase {
@@ -44,6 +61,27 @@ export type TaskOutputToolDetails =
   | (TaskOutputBase & { readonly outcome: "progress" })
   | (TaskOutputBase & { readonly outcome: "success" })
   | { readonly outcome: "error"; readonly taskId: string; readonly error: string }
+
+interface TaskListItemBase {
+  readonly taskId: string
+  readonly command: string
+  readonly startedAt: number
+}
+
+export type TaskListItemDetails =
+  | (TaskListItemBase & { readonly state: "starting"; readonly placement: "foreground" | "background" })
+  | (TaskListItemBase & { readonly state: "foreground" | "background" })
+  | (TaskListItemBase & { readonly state: "stopping"; readonly stopReason: ShellStopReason })
+  | (TaskListItemBase & { readonly state: "settling"; readonly finalOutcome: ShellTaskOutcome })
+  | (TaskListItemBase & {
+      readonly state: "completed"
+      readonly finalOutcome: ShellTaskOutcome
+      readonly completedAt: number
+    })
+
+export type TaskListToolDetails =
+  | { readonly outcome: "success"; readonly tasks: readonly TaskListItemDetails[]; readonly omitted: number }
+  | { readonly outcome: "error"; readonly error: string }
 
 interface KillTaskBase {
   readonly taskId: string
@@ -65,13 +103,35 @@ export function createTaskOutputTool(shell: SessionShell): AgentTool<typeof outp
     async execute(_id, input, signal) {
       let task: ShellTaskSnapshot | undefined
       try {
-        task = await shell.wait(input.taskId, (input.timeout ?? 0) * 1_000, signal)
+        task = await shell.wait(input.taskId, (input.timeout ?? 0) * 1_000, signal, input.cursor)
       } catch (cause) {
         if (signal?.aborted) throw cause
         return errorResult(input.taskId, errorMessage(cause))
       }
       if (!task) return errorResult(input.taskId, `Shell task not found: ${input.taskId}`)
       return { content: [{ type: "text", text: formatTask(task) }], details: taskOutputDetails(task) }
+    }
+  }
+}
+
+export function createListTasksTool(shell: SessionShell): AgentTool<typeof listParameters, TaskListToolDetails> {
+  return {
+    name: "list_tasks",
+    label: "list tasks",
+    description: "List recent shell tasks owned by this agent session without reading their output.",
+    parameters: listParameters,
+    async execute(_id, input) {
+      try {
+        const listed = shell.list(Math.min(input.limit ?? defaultTaskListResults, shell.limits.maxCompletedTasks))
+        const tasks = listed.tasks.map(taskListItem)
+        return {
+          content: [{ type: "text", text: formatTaskList(tasks, listed.omitted) }],
+          details: { outcome: "success", tasks, omitted: listed.omitted }
+        }
+      } catch (cause) {
+        const error = boundToolText(errorMessage(cause))
+        return { content: [{ type: "text", text: error }], details: { outcome: "error", error } }
+      }
     }
   }
 }
@@ -111,7 +171,13 @@ export function createKillTaskTool(shell: SessionShell): AgentTool<typeof killPa
 }
 
 export function shellOutputDetails(output: ShellTaskOutputSnapshot): ShellOutputDetails {
-  return { truncation: truncationDetails(output.truncation), fullOutput: boundedFullOutput(output.fullOutput) }
+  return {
+    truncation: truncationDetails(output.truncation),
+    fullOutput: boundedFullOutput(output.fullOutput),
+    ...(output.cursor === undefined ? {} : { cursor: output.cursor }),
+    nextCursor: output.nextCursor,
+    omittedBytes: output.omittedBytes
+  }
 }
 
 export function isTaskOutputToolDetails(value: unknown): value is TaskOutputToolDetails {
@@ -135,6 +201,17 @@ export function isTaskOutputToolDetails(value: unknown): value is TaskOutputTool
   return value.outcome !== "progress" || value.state !== "completed"
 }
 
+export function isTaskListToolDetails(value: unknown): value is TaskListToolDetails {
+  if (!isRecord(value) || (value.outcome !== "success" && value.outcome !== "error")) return false
+  if (value.outcome === "error") return isBoundedToolText(value.error)
+  return (
+    Array.isArray(value.tasks) &&
+    value.tasks.length <= maxTaskListResults &&
+    value.tasks.every(isTaskListItemDetails) &&
+    isNonNegativeInteger(value.omitted)
+  )
+}
+
 export function isKillTaskToolDetails(value: unknown): value is KillTaskToolDetails {
   if (!isRecord(value) || !isBoundedString(value.taskId)) return false
   if (value.outcome === "error") return isBoundedString(value.error)
@@ -145,13 +222,19 @@ export function isKillTaskToolDetails(value: unknown): value is KillTaskToolDeta
 
 export function isShellOutputDetails(value: unknown): value is ShellOutputDetails {
   if (!isRecord(value) || !isTruncationDetails(value.truncation) || !isRecord(value.fullOutput)) return false
+  if (!isNonNegativeInteger(value.fullOutput.bytes) || typeof value.fullOutput.truncated !== "boolean") return false
+  const hasCursorDetails =
+    value.nextCursor !== undefined || value.omittedBytes !== undefined || value.cursor !== undefined
   if (
-    !isNonNegativeInteger(value.fullOutput.bytes) ||
-    value.fullOutput.bytes > value.truncation.totalBytes ||
-    typeof value.fullOutput.truncated !== "boolean"
+    hasCursorDetails &&
+    ((value.cursor !== undefined && !isNonNegativeInteger(value.cursor)) ||
+      !isNonNegativeInteger(value.nextCursor) ||
+      !isNonNegativeInteger(value.omittedBytes) ||
+      (value.cursor ?? 0) + value.omittedBytes + value.truncation.outputBytes !== value.nextCursor)
   ) {
     return false
   }
+  if (!hasCursorDetails && value.fullOutput.bytes > value.truncation.totalBytes) return false
   if (value.fullOutput.type === "evicted") return true
   return value.fullOutput.type === "available" && isBoundedString(value.fullOutput.path)
 }
@@ -173,6 +256,79 @@ export function isShellTaskOutcome(value: unknown): value is ShellTaskOutcome {
       return true
     default:
       return false
+  }
+}
+
+function taskListItem(task: ShellTaskSummary): TaskListItemDetails {
+  const base = {
+    taskId: task.taskId,
+    command: boundToolText(task.command, maxTaskCommandPreviewScalars),
+    startedAt: task.startedAt
+  }
+  switch (task.type) {
+    case "starting":
+      return { ...base, state: task.type, placement: task.placement }
+    case "foreground":
+    case "background":
+      return { ...base, state: task.type }
+    case "stopping":
+      return { ...base, state: task.type, stopReason: task.reason }
+    case "settling":
+      return { ...base, state: task.type, finalOutcome: boundedOutcome(task.outcome) }
+    case "completed":
+      return { ...base, state: task.type, finalOutcome: boundedOutcome(task.outcome), completedAt: task.completedAt }
+    default:
+      return assertNever(task)
+  }
+}
+
+function isTaskListItemDetails(value: unknown): value is TaskListItemDetails {
+  if (
+    !isRecord(value) ||
+    !isBoundedString(value.taskId) ||
+    !isTaskState(value.state) ||
+    !isBoundedToolText(value.command, maxTaskCommandPreviewScalars) ||
+    !isNonNegativeInteger(value.startedAt)
+  ) {
+    return false
+  }
+  if (
+    value.state === "starting"
+      ? value.placement !== "foreground" && value.placement !== "background"
+      : value.placement !== undefined
+  ) {
+    return false
+  }
+  if (value.state === "stopping" ? !isStopReason(value.stopReason) : value.stopReason !== undefined) return false
+  if (value.state === "settling" || value.state === "completed") {
+    if (!isShellTaskOutcome(value.finalOutcome)) return false
+  } else if (value.finalOutcome !== undefined) {
+    return false
+  }
+  return value.state === "completed" ? isNonNegativeInteger(value.completedAt) : value.completedAt === undefined
+}
+
+function formatTaskList(tasks: readonly TaskListItemDetails[], omitted: number): string {
+  if (tasks.length === 0) return "No shell tasks."
+  const lines = tasks.map(task => `${task.taskId}  ${taskStateText(task)}  ${task.command}`)
+  if (omitted > 0) lines.push(`\n${omitted} older task${omitted === 1 ? "" : "s"} omitted.`)
+  return lines.join("\n")
+}
+
+function taskStateText(task: TaskListItemDetails): string {
+  switch (task.state) {
+    case "starting":
+      return `starting (${task.placement})`
+    case "foreground":
+    case "background":
+      return task.state
+    case "stopping":
+      return `stopping (${task.stopReason})`
+    case "settling":
+    case "completed":
+      return formatOutcome(task.finalOutcome)
+    default:
+      return assertNever(task)
   }
 }
 
@@ -202,7 +358,8 @@ function formatTask(task: ShellTaskSnapshot): string {
         : task.type === "starting"
           ? `starting (${task.placement})`
           : task.type
-  let text = `${task.output.text}\n\nTask ${task.taskId}: ${status}`
+  let text = `${task.output.text}\n\nTask ${task.taskId}: ${status}\nNext cursor: ${task.output.nextCursor}`
+  if (task.output.omittedBytes > 0) text += `\n[${task.output.omittedBytes} earlier output bytes omitted.]`
   if (task.output.truncation.truncated && task.output.fullOutput.type === "available") {
     text += `\n\n[Output truncated. Full output: ${task.output.fullOutput.path}]`
   }

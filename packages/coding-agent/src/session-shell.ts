@@ -67,6 +67,9 @@ export interface ShellTaskOutputSnapshot {
   readonly text: string
   readonly truncation: TruncationResult
   readonly fullOutput: ShellFullOutput
+  readonly cursor?: number
+  readonly nextCursor: number
+  readonly omittedBytes: number
 }
 
 type ShellBackgroundOwnership =
@@ -114,6 +117,23 @@ export type ShellTaskSnapshot =
 export type ShellRunResult =
   | { readonly type: "completed"; readonly task: Extract<ShellTaskSnapshot, { type: "completed" }> }
   | { readonly type: "backgrounded"; readonly task: Extract<ShellTaskSnapshot, { type: "background" }> }
+
+export type ShellTaskSummary =
+  | (ShellTaskIdentity & { readonly type: "starting"; readonly placement: "foreground" | "background" })
+  | (ShellTaskIdentity & { readonly type: "foreground" | "background" })
+  | (ShellTaskIdentity & { readonly type: "stopping"; readonly reason: ShellStopReason })
+  | (ShellTaskIdentity & { readonly type: "settling"; readonly outcome: ShellTaskOutcome })
+  | (ShellTaskIdentity & {
+      readonly type: "completed"
+      readonly outcome: ShellTaskOutcome
+      readonly completedAt: number
+      readonly expiresAt: number
+    })
+
+export interface ShellTaskListSnapshot {
+  readonly tasks: readonly ShellTaskSummary[]
+  readonly omitted: number
+}
 
 export class ShellRunAdmissionError extends Error {
   constructor(
@@ -226,9 +246,11 @@ export class SessionShell {
   bindOperationOutcomeSink(sink: (outcome: ShellBackgroundTaskOperationOutcomeInput) => void): void {
     this.#assertOpen()
     if (this.#outcomeSinkBound) throw new Error("Shell operation outcome sink is already bound")
+    if ([...this.#tasks.values()].some(task => task.background.type === "owned")) {
+      throw new Error("Shell operation outcome sink must be bound before background work")
+    }
     this.#outcomeSinkBound = true
     this.#outcomeSink = sink
-    this.#flushPendingOutcomes()
   }
 
   subscribe(listener: (taskId: string) => void): () => void {
@@ -248,6 +270,25 @@ export class SessionShell {
     return task ? Object.freeze(this.#snapshot(task)) : undefined
   }
 
+  retryPendingOutcomes(): void {
+    this.#assertOpen()
+    this.#flushPendingOutcomes()
+  }
+
+  list(limit: number): ShellTaskListSnapshot {
+    this.#assertOpen()
+    this.#evictExpired()
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > this.limits.maxCompletedTasks) {
+      throw new Error(`Task list limit must be between 1 and ${this.limits.maxCompletedTasks}`)
+    }
+    const tasks = [...this.#tasks.values()]
+    const selected = tasks.slice(Math.max(0, tasks.length - limit)).toReversed()
+    return Object.freeze({
+      tasks: Object.freeze(selected.map(task => Object.freeze(this.#summary(task)))),
+      omitted: tasks.length - selected.length
+    })
+  }
+
   run(
     toolCallId: string,
     request: ShellRunRequest,
@@ -264,7 +305,7 @@ export class SessionShell {
     }
     if (
       request.background &&
-      (this.#backgroundCount() >= this.limits.maxBackgroundTasks || this.#backgroundOutcomeBacklogFull())
+      (this.#backgroundCount() >= this.limits.maxBackgroundTasks || this.#backgroundOutcomeCapacityFull())
     ) {
       throw new ShellRunAdmissionError(
         "background-capacity",
@@ -355,7 +396,7 @@ export class SessionShell {
     this.#flushPendingOutcomes()
     const task = this.#foregroundTask()
     if (!task) return { type: "none" }
-    if (this.#backgroundCount() >= this.limits.maxBackgroundTasks || this.#backgroundOutcomeBacklogFull()) {
+    if (this.#backgroundCount() >= this.limits.maxBackgroundTasks || this.#backgroundOutcomeCapacityFull()) {
       return { type: "capacity_exceeded" }
     }
 
@@ -374,15 +415,21 @@ export class SessionShell {
     return { type: "backgrounded", task: snapshot }
   }
 
-  async wait(taskId: string, timeoutMs: number, signal?: AbortSignal): Promise<ShellTaskSnapshot | undefined> {
+  async wait(
+    taskId: string,
+    timeoutMs: number,
+    signal?: AbortSignal,
+    cursor?: number
+  ): Promise<ShellTaskSnapshot | undefined> {
     this.#assertOpen()
     if (!Number.isFinite(timeoutMs) || timeoutMs < 0 || timeoutMs > this.limits.maxRuntimeMs) {
       throw new Error(`Task wait must be between 0 and ${this.limits.maxRuntimeMs} milliseconds`)
     }
     const task = this.#tasks.get(taskId)
     if (!task) return undefined
-    if (task.type === "completed" || timeoutMs === 0) return this.#snapshot(task)
-    return waitForTask(task.processSettled.promise, timeoutMs, signal)
+    if (task.type === "completed" || timeoutMs === 0) return this.#snapshot(task, cursor)
+    const completed = await waitForTask(task.processSettled.promise, timeoutMs, signal)
+    return cursor === undefined ? completed : { ...completed, output: task.output.snapshot(cursor) }
   }
 
   async kill(taskId: string): Promise<ShellKillResult> {
@@ -472,8 +519,16 @@ export class SessionShell {
     return undefined
   }
 
-  #backgroundOutcomeBacklogFull(): boolean {
-    return this.#pendingOutcomes.size >= this.limits.maxCompletedTasks
+  #backgroundOutcomeCapacityFull(): boolean {
+    return this.#backgroundOutcomeObligations() >= this.limits.maxCompletedTasks
+  }
+
+  #backgroundOutcomeObligations(): number {
+    let obligations = this.#pendingOutcomes.size
+    for (const task of this.#tasks.values()) {
+      if (task.background.type === "owned" && task.type !== "completed") obligations++
+    }
+    return obligations
   }
 
   #backgroundCount(): number {
@@ -618,21 +673,24 @@ export class SessionShell {
     }
   }
 
-  #snapshot(task: StartingTask): Extract<ShellTaskSnapshot, { type: "starting" }>
-  #snapshot(task: ForegroundTask): Extract<ShellTaskSnapshot, { type: "foreground" }>
-  #snapshot(task: BackgroundTask): Extract<ShellTaskSnapshot, { type: "background" }>
-  #snapshot(task: StoppingTask): Extract<ShellTaskSnapshot, { type: "stopping" }>
-  #snapshot(task: SettlingTask): Extract<ShellTaskSnapshot, { type: "settling" }>
-  #snapshot(task: CompletedTask): Extract<ShellTaskSnapshot, { type: "completed" }>
-  #snapshot(task: ShellTask): ShellTaskSnapshot
-  #snapshot(task: ShellTask): ShellTaskSnapshot {
+  #snapshot(task: StartingTask, cursor?: number): Extract<ShellTaskSnapshot, { type: "starting" }>
+  #snapshot(task: ForegroundTask, cursor?: number): Extract<ShellTaskSnapshot, { type: "foreground" }>
+  #snapshot(task: BackgroundTask, cursor?: number): Extract<ShellTaskSnapshot, { type: "background" }>
+  #snapshot(task: StoppingTask, cursor?: number): Extract<ShellTaskSnapshot, { type: "stopping" }>
+  #snapshot(task: SettlingTask, cursor?: number): Extract<ShellTaskSnapshot, { type: "settling" }>
+  #snapshot(task: CompletedTask, cursor?: number): Extract<ShellTaskSnapshot, { type: "completed" }>
+  #snapshot(task: ShellTask, cursor?: number): ShellTaskSnapshot
+  #snapshot(task: ShellTask, cursor?: number): ShellTaskSnapshot {
+    return { ...this.#summary(task), output: task.output.snapshot(cursor) }
+  }
+
+  #summary(task: ShellTask): ShellTaskSummary {
     const identity = {
       taskId: task.taskId,
       toolCallId: task.toolCallId,
       command: task.command,
       cwd: task.cwd,
-      startedAt: task.startedAt,
-      output: task.output.snapshot()
+      startedAt: task.startedAt
     }
     switch (task.type) {
       case "starting":
@@ -791,7 +849,10 @@ export class SessionShell {
     invariant(foregroundAdmissions <= 1, "multiple foreground tasks were admitted")
     invariant(backgroundTasks <= this.limits.maxBackgroundTasks, "background task capacity was exceeded")
     invariant(completedTasks <= this.limits.maxCompletedTasks, "completed task capacity was exceeded")
-    invariant(this.#pendingOutcomes.size <= this.limits.maxCompletedTasks, "shell outcome backlog was exceeded")
+    invariant(
+      this.#backgroundOutcomeObligations() <= this.limits.maxCompletedTasks,
+      "shell outcome capacity was exceeded"
+    )
     invariant(retainedOutputBytes === this.#retainedOutputBytes, "retained output accounting diverged")
     this.#assertRetainedOutputBound()
     for (const taskId of this.#updateTimers.keys()) {
@@ -854,13 +915,26 @@ class Utf8TailBuffer {
     this.#length += chunk.copy(this.#buffer, this.#length)
   }
 
-  toString(): string {
-    return this.#buffer.toString("utf8", 0, this.#length)
+  get length(): number {
+    return this.#length
+  }
+
+  bytes(): Buffer {
+    return this.#buffer.subarray(0, this.#length)
   }
 }
 
 function isUtf8Continuation(byte: number): boolean {
   return (byte & 0xc0) === 0x80
+}
+
+function completeUtf8PrefixLength(buffer: Buffer): number {
+  if (buffer.length === 0) return 0
+  let lead = buffer.length - 1
+  while (lead > 0 && isUtf8Continuation(buffer[lead]!)) lead--
+  const first = buffer[lead]!
+  const width = first < 0x80 ? 1 : first < 0xe0 ? 2 : first < 0xf0 ? 3 : first < 0xf8 ? 4 : 1
+  return buffer.length - lead >= width ? buffer.length : lead
 }
 
 interface TaskOutputOptions {
@@ -943,9 +1017,29 @@ class TaskOutput {
     source.on("data", listener)
   }
 
-  snapshot(): ShellTaskOutputSnapshot {
+  snapshot(cursor?: number): ShellTaskOutputSnapshot {
+    const tail = this.#tail.bytes()
+    const tailStart = this.#totalBytes - tail.length
+    const completeLength = completeUtf8PrefixLength(tail)
+    const nextCursor = tailStart + completeLength
+    if (cursor !== undefined && (!Number.isSafeInteger(cursor) || cursor < 0 || cursor > nextCursor)) {
+      throw new Error(`Task output cursor must be between 0 and ${nextCursor}`)
+    }
+
+    const fullOutput = this.#evicted
+      ? ({ type: "evicted", bytes: this.#retainedBytes, truncated: this.#limitNotified } as const)
+      : ({ type: "available", path: this.path, bytes: this.#retainedBytes, truncated: this.#limitNotified } as const)
+    if (cursor !== undefined) {
+      let start = Math.max(cursor, tailStart)
+      while (start < nextCursor && isUtf8Continuation(tail[start - tailStart]!)) start++
+      const available = tail.subarray(start - tailStart, completeLength).toString()
+      const truncation = truncateTail(available, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES)
+      const omittedBytes = start - cursor + truncation.totalBytes - truncation.outputBytes
+      return { text: truncation.content || "(no new output)", truncation, fullOutput, cursor, nextCursor, omittedBytes }
+    }
+
     const totalLines = this.#totalBytes === 0 ? 0 : this.#newlines + (this.#endsWithNewline ? 0 : 1)
-    const base = truncateTail(this.#tail.toString(), DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES)
+    const base = truncateTail(tail.subarray(0, completeLength).toString(), DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES)
     const truncated = this.#totalBytes > DEFAULT_MAX_BYTES || totalLines > DEFAULT_MAX_LINES
     const truncation: TruncationResult = {
       ...base,
@@ -954,10 +1048,13 @@ class TaskOutput {
       totalBytes: this.#totalBytes,
       totalLines
     }
-    const fullOutput = this.#evicted
-      ? ({ type: "evicted", bytes: this.#retainedBytes, truncated: this.#limitNotified } as const)
-      : ({ type: "available", path: this.path, bytes: this.#retainedBytes, truncated: this.#limitNotified } as const)
-    return { text: truncation.content || "(no output)", truncation, fullOutput }
+    return {
+      text: truncation.content || "(no output)",
+      truncation,
+      fullOutput,
+      nextCursor,
+      omittedBytes: Math.max(0, nextCursor - truncation.outputBytes)
+    }
   }
 
   finish(): Promise<void> {

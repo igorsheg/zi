@@ -3,7 +3,7 @@ import { projectCodeTool } from "./code.js"
 import { projectEdit } from "./edit.js"
 import { projectGeneric } from "./generic.js"
 import { projectRead } from "./read.js"
-import { projectKillTask, projectTaskOutput } from "./shell-task.js"
+import { projectKillTask, projectListTasks, projectTaskOutput } from "./shell-task.js"
 import { projectSubagent } from "./subagent.js"
 import type { ToolPresentation, ToolPresentationSource } from "./types.js"
 import { projectWorkPlan } from "./work-plan.js"
@@ -26,6 +26,9 @@ export function projectToolPresentation(source: ToolPresentationSource): ToolPre
       break
     case "edit":
       presentation = projectEdit(source)
+      break
+    case "list_tasks":
+      presentation = projectListTasks(source)
       break
     case "task_output":
       presentation = projectTaskOutput(source)

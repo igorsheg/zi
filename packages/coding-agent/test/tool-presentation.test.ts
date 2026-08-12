@@ -388,7 +388,7 @@ test("write, edit, task-output, and kill-task project only semantic primitives",
 })
 
 test("all built-ins accept streamed partial arguments with one semantic placeholder", () => {
-  for (const name of ["bash", "read", "write", "edit", "task_output", "kill_task"]) {
+  for (const name of ["bash", "read", "write", "edit", "list_tasks", "task_output", "kill_task"]) {
     const presentation = projectToolPresentation({ status: "preparing", name, args: {} })
     expect(presentation.header.label).not.toBe("Tool")
     expect(JSON.stringify(presentation.header.subject)).toContain("…")
