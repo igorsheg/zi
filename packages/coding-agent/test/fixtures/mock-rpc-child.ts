@@ -62,11 +62,20 @@ if (descendantPath) {
 }
 
 type Message =
-  | { readonly role: "user"; readonly content: readonly [{ readonly type: "text"; readonly text: string }] }
+  | {
+      readonly role: "user"
+      readonly content: readonly [{ readonly type: "text"; readonly text: string }]
+      readonly timestamp: number
+    }
   | {
       readonly role: "assistant"
-      readonly stopReason: string
+      readonly stopReason: "stop" | "error" | "aborted"
       readonly content: readonly [{ readonly type: "text"; readonly text: string }]
+      readonly api: string
+      readonly provider: string
+      readonly model: string
+      readonly usage: Record<string, unknown>
+      readonly timestamp: number
       readonly errorMessage?: string
     }
 
@@ -190,16 +199,52 @@ async function handle(request: { id: string; method: string; params?: RequestPar
     }
     if (text === "__block_prompt__") await Bun.sleep(30_000)
     if (text === "__delay_prompt__") await Bun.sleep(150)
-    activeDelayMs = text === "__long_work__" ? 30_000 : text === "__short_work__" ? 30 : delayMs
-    messages.push({ role: "user", content: [{ type: "text", text }] })
+    activeDelayMs =
+      text === "__long_work__" || text === "__many_tools__" ? 30_000 : text === "__short_work__" ? 30 : delayMs
+    if (text === "__many_messages__") {
+      for (let index = 0; index < 210; index++) {
+        messages.push({ role: "user", content: [{ type: "text", text: `archived-${index}` }], timestamp: index })
+      }
+    }
+    if (text === "__large_messages__") {
+      for (let index = 0; index < 180; index++) {
+        messages.push({
+          role: "user",
+          content: [{ type: "text", text: `archived-${index}-${"x".repeat(60_000)}` }],
+          timestamp: index
+        })
+      }
+    }
+    messages.push({ role: "user", content: [{ type: "text", text }], timestamp: Date.now() })
     messages.push({
       role: "assistant",
       stopReason: errorMessage ? "error" : "stop",
       content: [{ type: "text", text: text === "__second_evidence__" ? "second-cycle-evidence" : reply }],
+      api: "mock",
+      provider: "mock",
+      model: "mock",
+      usage: {},
+      timestamp: Date.now(),
       ...(errorMessage ? { errorMessage } : {})
     })
     sendEvent({ type: "message_start", message: messages.at(-1) })
     sendEvent({ type: "message_update", message: messages.at(-1) })
+    if (text === "__many_tools__") {
+      sendEvent({
+        type: "tool_execution_start",
+        toolCallId: "oversized-tool",
+        toolName: "bash",
+        args: { command: "x".repeat(300_000) }
+      })
+      for (let index = 0; index < 70; index++) {
+        sendEvent({
+          type: "tool_execution_start",
+          toolCallId: `tool-${index}`,
+          toolName: "bash",
+          args: { command: `echo ${index}` }
+        })
+      }
+    }
     busy = true
     if (promptResponseDelayMs > 0) await Bun.sleep(promptResponseDelayMs)
     send({
@@ -227,6 +272,10 @@ async function handle(request: { id: string; method: string; params?: RequestPar
     const observedLatest = messages.findLast((message): message is Extract<Message, { role: "assistant" }> => {
       return message.role === "assistant"
     })
+    if (observedLatest) {
+      sendEvent({ type: "message_end", message: observedLatest })
+      sendEvent({ type: "agent_end", messages: messages.slice(-2) })
+    }
     if (logPath) appendFileSync(logPath, "session.await_idle:completion\n")
     if (completionDelayMs > 0) await Bun.sleep(completionDelayMs)
     if (!request.params?.completionId) {
@@ -295,7 +344,16 @@ async function handle(request: { id: string; method: string; params?: RequestPar
     }
     const latest = messages.at(-1)
     if (!ignoreInterrupt && busy && latest && latest.role === "assistant") {
-      messages[messages.length - 1] = { role: "assistant", stopReason: "aborted", content: latest.content }
+      messages[messages.length - 1] = {
+        role: "assistant",
+        stopReason: "aborted",
+        content: latest.content,
+        api: latest.api,
+        provider: latest.provider,
+        model: latest.model,
+        usage: latest.usage,
+        timestamp: latest.timestamp
+      }
     }
     if (!ignoreInterrupt) busy = false
     send({ type: "response", id, method, ok: true, result: {} })

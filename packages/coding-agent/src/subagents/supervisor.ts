@@ -10,6 +10,7 @@ import {
   clipUtf8,
   type ChildSessionEventsSnapshot,
   type ChildSnapshot,
+  type ChildTranscriptSnapshot,
   type SubagentCompletion
 } from "./child-process.js"
 import { CompletionLedger, maxCompletionLedgerEntries, type CompletionDelivery } from "./completion-ledger.js"
@@ -32,6 +33,7 @@ export const maxSubagentNameBytes = 64
 export const maxSubagentTaskBytes = 256
 export const durablePreviewBytes = 8 * 1024
 export const subagentShutdownMs = 9_000
+export const maxRetainedExitedTranscriptBytes = 16 * 1024 * 1024
 
 export type SupervisorState = { readonly type: "open" } | { readonly type: "stopping" } | { readonly type: "closed" }
 
@@ -48,6 +50,7 @@ export interface SubagentSnapshot {
 }
 
 export type SubagentSessionEvents = ChildSessionEventsSnapshot
+export type SubagentTranscriptSnapshot = ChildTranscriptSnapshot
 
 export interface SubagentStatus {
   readonly workingNames: readonly string[]
@@ -76,6 +79,7 @@ interface LiveRecord {
 interface ExitedRecord {
   readonly snapshot: ChildSnapshot
   readonly sessionEvents?: SubagentSessionEvents
+  readonly transcript?: SubagentTranscriptSnapshot
   readonly exitedAt: number
   readonly task?: string
 }
@@ -167,6 +171,13 @@ export class SubagentSupervisor {
     const live = this.#live.get(name)
     if (live) return live.child.sessionEvents()
     return this.#exited.find(record => record.snapshot.name === name)?.sessionEvents
+  }
+
+  transcript(name: string): SubagentTranscriptSnapshot | undefined {
+    validateSubagentName(name)
+    const live = this.#live.get(name)
+    if (live) return live.child.transcript()
+    return this.#exited.find(record => record.snapshot.name === name)?.transcript
   }
 
   capacity(): SubagentCapacity {
@@ -763,6 +774,7 @@ export class SubagentSupervisor {
           ? { ...snapshot, workCycle: record.lastWorkCycle }
           : snapshot,
       sessionEvents: record.child.sessionEvents(),
+      transcript: record.child.transcript(),
       exitedAt: Date.now(),
       task: record.task
     })
@@ -781,6 +793,26 @@ export class SubagentSupervisor {
     if (existing >= 0) this.#exited.splice(existing, 1)
     this.#exited.push(record)
     while (this.#exited.length > maxRetainedSubagents) this.#exited.shift()
+    this.#boundExitedTranscripts()
+  }
+
+  #boundExitedTranscripts(): void {
+    let retainedBytes = 0
+    for (let index = this.#exited.length - 1; index >= 0; index--) {
+      const record = this.#exited[index]
+      if (!record?.transcript) continue
+      const bytes = Buffer.byteLength(JSON.stringify(record.transcript))
+      if (retainedBytes + bytes <= maxRetainedExitedTranscriptBytes) {
+        retainedBytes += bytes
+        continue
+      }
+      this.#exited[index] = {
+        snapshot: record.snapshot,
+        ...(record.sessionEvents ? { sessionEvents: record.sessionEvents } : {}),
+        exitedAt: record.exitedAt,
+        ...(record.task ? { task: record.task } : {})
+      }
+    }
   }
 
   #snapshot(snapshot: ChildSnapshot, task?: string): SubagentSnapshot {

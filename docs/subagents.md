@@ -107,6 +107,14 @@ The standard model-facing flow admits each durable `{runtime name, work cycle}` 
 
 A session with no admitted profiles exposes none of these parent orchestration tools. Depth-one child sessions cannot recursively create subagents.
 
+## Inspecting transcripts
+
+In the terminal client, `/agent` lists running subagents by default and opens the selected child's bounded transcript in a read-only companion pane. Press `Tab` in the picker to switch between running subagents and all retained subagents; the picker title and footer show the active scope and the available toggle. Selecting another child retargets the companion. The pane uses the same message and tool presentation as the primary transcript; it does not create another child session or copy transcript state into the TUI.
+
+Press `Ctrl+W`, then `h/j/k/l` to move between panes. `Esc` returns from the companion to the primary composer, and `q` closes the active read-only pane. On narrow terminals, Zi keeps the same workspace topology but shows only the active pane. Closing or hiding a pane never interrupts or closes its subagent.
+
+Live child events provide streaming updates. After a work cycle settles, Zi independently refreshes at most the newest 200 authoritative messages and retains at most 8 MiB per child transcript. Exited transcripts share a 16 MiB retained bound. A child recovered from journal evidence after restart has no fabricated transcript and cannot be opened unless live transcript evidence is available.
+
 ## Peer messaging
 
 Depth-one child sessions expose two narrow collaboration tools:
@@ -130,7 +138,7 @@ Extensions never receive `SubagentSupervisor` or child-process handles. Extensio
 
 The parent `AgentSession` owns admitted child processes. Zi enforces child concurrency, runtime names, RPC framing, output retention, cancellation, work and wait bounds, credential and cwd propagation, process-tree containment, durable journal evidence, and forced cleanup. A parent owns at most four live children and retains at most 32 completed cycles; new work is refused rather than evicting undelivered evidence. Completion output is clipped to 50 KiB, durable previews to 8 KiB, listed task summaries to 256 bytes, and shutdown settlement to a fixed bound.
 
-Each accepted initial spawn prompt and accepted task assigned to an idle child starts a separately bounded work cycle using `subagentWorkTimeoutMs`. Assignments made while the child is already working join its current cycle and do not reset that deadline. `session.await_idle` is a semantic completion watch rather than an ordinary RPC response deadline. The child gives every admitted prompt in one cycle the same completion ID; the RPC session accumulates the latest assistant completion event and returns one bounded terminal projection with its admission revision when idle. This avoids treating transcript paging as part of lifecycle settlement and lets a newer admission reject a stale idle observation.
+Each accepted initial spawn prompt and accepted task assigned to an idle child starts a separately bounded work cycle using `subagentWorkTimeoutMs`. Assignments made while the child is already working join its current cycle and do not reset that deadline. `session.await_idle` is a semantic completion watch rather than an ordinary RPC response deadline. The child gives every admitted prompt in one cycle the same completion ID; the RPC session accumulates the latest assistant completion event and returns one bounded terminal projection with its admission revision when idle. Lifecycle settlement never waits on transcript paging. A separate bounded message-tail refresh may enrich presentation after the child becomes idle, and a newer admission rejects that refresh as stale.
 
 When work expires, the child owner interrupts it, waits within a separate settlement bound, records `work_cycle_timeout` evidence, and keeps a successfully settled child reusable. Requested interruption has its own bounded settlement deadline; a child that acknowledges interruption but never becomes idle is force-cleaned with durable `interrupt_settlement_timeout` evidence. This work deadline is independent of `wait_subagents`: observation timeouts never cancel child work.
 

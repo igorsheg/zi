@@ -2,7 +2,6 @@ import {
   BoxRenderable,
   CliRenderEvents,
   type CliRenderer,
-  type KeyEvent,
   type Renderable,
   ScrollBoxRenderable,
   type SyntaxStyle,
@@ -11,15 +10,14 @@ import {
 import {
   projectToolPresentation,
   type AgentMessage,
-  type AgentSession,
   type ShellTaskSnapshot,
   type SubagentSnapshot
 } from "@with-zi/coding-agent"
-import type { ReadableAtom } from "nanostores"
 
 import { createThinkingSyntaxStyle, type Theme } from "../../theme.js"
 import type { InteractiveKeybindings, TranscriptKeyAction } from "../interactive-keybindings.js"
 import type { ActiveTool } from "../interactive-store.js"
+import { isActiveSubagentLifecycle } from "../subagent-activity.js"
 import type { TranscriptItemView } from "./item.js"
 import {
   createMessageItemView,
@@ -28,24 +26,9 @@ import {
   type ToolCallPresentation
 } from "./message-view.js"
 import { createTranscriptStore, type TranscriptNavigation, type TranscriptStore } from "./navigation.js"
+import type { TranscriptSession, TranscriptSource } from "./source.js"
 import { transcriptStatusRows, TranscriptStatusView, type TranscriptStatusPresentation } from "./status-view.js"
 import { ToolCallView, type ToolViewFrame } from "./tool-view.js"
-
-interface TranscriptSession extends Pick<
-  AgentSession,
-  "messages" | "streamingMessage" | "isStreaming" | "isAborting" | "retryStatus" | "compactionStatus" | "workPlan"
-> {
-  readonly sessionManager?: { readonly header: { readonly cwd: string } }
-  readonly shellTasks?: readonly ShellTaskSnapshot[]
-  subagentSnapshots?(): readonly SubagentSnapshot[]
-}
-
-interface TranscriptSource {
-  readonly $promptRevision: ReadableAtom<number>
-  readonly $transcriptRevision: ReadableAtom<number>
-  readonly $activeTools: ReadableAtom<ReadonlyMap<string, ActiveTool>>
-  getSession(): TranscriptSession
-}
 
 interface PendingNativeRead {
   readonly target: ScrollBoxRenderable
@@ -101,6 +84,7 @@ export interface TranscriptDiagnostics {
 export interface TranscriptViewOptions {
   readonly measureSync?: boolean
   readonly availableHeight?: () => number
+  readonly idPrefix?: string
 }
 
 const maxProjectedMessages = 200
@@ -233,21 +217,22 @@ export class TranscriptView {
     this.#transcriptRevision = interactive.$transcriptRevision.get()
     this.#navigation = createTranscriptStore()
 
+    const idPrefix = options.idPrefix ? `${options.idPrefix}-` : ""
     this.root = new BoxRenderable(renderer, {
-      id: "transcript-region",
+      id: `${idPrefix}transcript-region`,
       flexDirection: "column",
       flexGrow: 1,
       minHeight: 1
     })
     this.root.onLifecyclePass = this.#syncFrame
     this.notificationHost = new BoxRenderable(renderer, {
-      id: "transcript-viewport",
+      id: `${idPrefix}transcript-viewport`,
       position: "relative",
       flexGrow: 1,
       minHeight: 1
     })
     this.scroll = new ScrollBoxRenderable(renderer, {
-      id: "transcript-scroll",
+      id: `${idPrefix}transcript-scroll`,
       flexGrow: 1,
       minHeight: 1,
       focusable: false,
@@ -279,9 +264,7 @@ export class TranscriptView {
     this.#release.push(interactive.$promptRevision.subscribe(this.#syncStatus))
     this.#release.push(interactive.$transcriptRevision.subscribe(this.#requestSync))
     this.#release.push(this.#navigation.$navigation.subscribe(this.#syncNavigation))
-    renderer.keyInput.on("keypress", this.#onKeyPress)
     renderer.on(CliRenderEvents.SELECTION, this.#onSelection)
-    this.#release.push(() => renderer.keyInput.off("keypress", this.#onKeyPress))
     this.#release.push(() => renderer.off(CliRenderEvents.SELECTION, this.#onSelection))
   }
 
@@ -953,7 +936,7 @@ export class TranscriptView {
 
   #syncStatusGeometry = (): void => {
     const height = Math.max(0, Math.floor(this.#availableHeight()))
-    const width = this.#renderer.width
+    const width = Math.max(0, Math.floor(this.root.width || this.#renderer.width))
     if (height === this.#statusHeight && width === this.#statusWidth) return
     this.#statusHeight = height
     this.#statusWidth = width
@@ -969,8 +952,7 @@ export class TranscriptView {
         this.#keybindings.getHint("app.interrupt"),
         Date.now()
       ),
-      this.#renderer.width,
-      Math.max(0, Math.floor(this.#availableHeight()) - transcriptStatusRows - 1)
+      Math.max(0, Math.floor(this.root.width || this.#renderer.width))
     )
   }
 
@@ -1034,43 +1016,30 @@ export class TranscriptView {
     this.#queueNativeRead("manual")
   }
 
-  #onKeyPress = (key: KeyEvent): void => {
-    if (key.defaultPrevented || key.propagationStopped) return
-    const action = this.#keybindings.transcriptAction(key)
-    if (!action || (action === "toggle_plan" && !this.#status.canTogglePlan)) return
-    key.preventDefault()
-    key.stopPropagation()
-    this.#handleKeyAction(action)
-  }
-
-  #handleKeyAction(action: TranscriptKeyAction): void {
+  handleAction(action: TranscriptKeyAction): boolean {
     switch (action) {
       case "page_up":
         this.#manualScroll(-0.5, "viewport")
-        return
+        return true
       case "page_down":
         this.#manualScroll(0.5, "viewport")
-        return
+        return true
       case "line_up":
         this.#manualScroll(-1, "absolute")
-        return
+        return true
       case "line_down":
         this.#manualScroll(1, "absolute")
-        return
+        return true
       case "tail":
         this.#jumpToTail()
-        return
+        return true
       case "toggle_tools":
         this.#toolsExpanded = !this.#toolsExpanded
         for (const { view } of this.#toolViews.values()) view.setExpanded(this.#toolsExpanded)
         for (const committed of this.#committed) committed.item?.setExpanded?.(this.#toolsExpanded)
         if (this.#streaming?.type === "static") this.#streaming.item?.setExpanded?.(this.#toolsExpanded)
         this.#renderer.requestRender()
-        return
-      case "toggle_plan":
-        this.#status.togglePlan()
-        this.#renderer.requestRender()
-        return
+        return true
       default:
         return assertNever(action)
     }
@@ -1146,28 +1115,12 @@ export function projectTranscriptBackgroundStatus(
 
   let activeSubagents = 0
   for (const snapshot of subagents) {
-    if (isActiveSubagent(snapshot.lifecycle)) activeSubagents++
+    if (isActiveSubagentLifecycle(snapshot.lifecycle)) activeSubagents++
   }
 
   return shellCommands === 0 && activeSubagents === 0
     ? { type: "idle" }
     : { type: "running", shellCommands, subagents: activeSubagents }
-}
-
-function isActiveSubagent(lifecycle: SubagentSnapshot["lifecycle"]): boolean {
-  switch (lifecycle) {
-    case "starting":
-    case "spawn_admitting":
-    case "running":
-    case "interrupting":
-    case "closing":
-      return true
-    case "idle":
-    case "exited":
-      return false
-    default:
-      return assertNeverLifecycle(lifecycle)
-  }
 }
 
 function transcriptWorkPlanStatus(plan: TranscriptSession["workPlan"]): TranscriptStatusPresentation["workPlan"] {
@@ -1197,10 +1150,6 @@ function transcriptWorkPlanStatus(plan: TranscriptSession["workPlan"]): Transcri
 
 function assertNever(value: never): never {
   throw new Error(`Unhandled transcript key action: ${String(value)}`)
-}
-
-function assertNeverLifecycle(value: never): never {
-  throw new Error(`Unhandled subagent lifecycle: ${String(value)}`)
 }
 
 function isAtTail(scroll: ScrollBoxRenderable): boolean {

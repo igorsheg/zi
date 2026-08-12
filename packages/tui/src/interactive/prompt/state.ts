@@ -38,6 +38,8 @@ export type EditableSetting =
   | "retryEnabled"
 export type EditableSettingValue = ThinkingLevel | QueueMode | boolean
 
+export type SubagentPickerScope = "running" | "all"
+
 export type PromptWorkflow =
   | { readonly type: "idle" }
   | { readonly type: "loading_models"; readonly operationId: number; readonly session: AgentSession }
@@ -114,6 +116,7 @@ export type PromptWorkflow =
       readonly operationId: number
       readonly session: AgentSession
       readonly snapshots: readonly SubagentSnapshot[]
+      readonly scope: SubagentPickerScope
     }
   | { readonly type: "resuming_session"; readonly operationId: number; readonly session: AgentSession }
   | { readonly type: "cancelling_session"; readonly operationId: number; readonly session: AgentSession }

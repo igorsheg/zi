@@ -4,6 +4,7 @@ import {
   BoxRenderable,
   CliRenderEvents,
   MarkdownRenderable,
+  type KeyEvent,
   type Renderable,
   TextAttributes,
   TextRenderable
@@ -1037,7 +1038,16 @@ async function createTranscriptHarness(
     getSession: () => session
   }
   const syntaxStyle = createSyntaxStyle(defaultTheme)
-  const view = new TranscriptView(setup.renderer, interactive, new InteractiveKeybindings(), defaultTheme, syntaxStyle)
+  const keybindings = new InteractiveKeybindings()
+  const view = new TranscriptView(setup.renderer, interactive, keybindings, defaultTheme, syntaxStyle)
+  const onKeyPress = (key: KeyEvent) => {
+    if (key.defaultPrevented || key.propagationStopped) return
+    const action = keybindings.transcriptAction(key)
+    if (!action || !view.handleAction(action)) return
+    key.preventDefault()
+    key.stopPropagation()
+  }
+  setup.renderer.keyInput.on("keypress", onKeyPress)
   setup.renderer.root.add(view.root)
   let destroyed = false
 
@@ -1050,6 +1060,7 @@ async function createTranscriptHarness(
     destroy() {
       if (destroyed) return
       destroyed = true
+      setup.renderer.keyInput.off("keypress", onKeyPress)
       view.destroy()
       syntaxStyle.destroy()
       if (!setup.renderer.isDestroyed) setup.renderer.destroy()

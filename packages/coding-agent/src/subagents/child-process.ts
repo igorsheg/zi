@@ -8,7 +8,8 @@
 import { spawn } from "node:child_process"
 import { Readable, Writable } from "node:stream"
 
-import { isRecord } from "../guards.js"
+import { isAgentMessage, isRecord } from "../guards.js"
+import type { AgentMessage } from "../messages.js"
 import type { ProcessScope, ProcessTreeTracker } from "../processes/process-tree.js"
 import {
   decodePeerRequestFrame,
@@ -34,6 +35,11 @@ export const rpcCloseForceMs = 5_000
 export const maxChildSessionEvents = 256
 export const maxChildSessionEventBytes = 256 * 1024
 export const maxChildSessionEventBufferBytes = 1024 * 1024
+export const maxChildTranscriptMessages = 200
+export const maxChildTranscriptBytes = 8 * 1024 * 1024
+export const maxChildTranscriptTools = 64
+export const maxChildTranscriptToolBytes = 256 * 1024
+export const maxChildTranscriptToolsBytes = 1024 * 1024
 
 export type ChildLifecycleState =
   | { readonly type: "starting"; readonly startedAt: number }
@@ -92,6 +98,23 @@ export type ChildSessionEventsSnapshot = {
   readonly name: string
   readonly events: readonly ChildSessionEvent[]
   readonly omittedEvents: number
+  readonly omittedBytes: number
+}
+
+export type ChildTranscriptTool = {
+  readonly id: string
+  readonly name: string
+  readonly args: unknown
+  readonly status: "running" | "done" | "failed"
+  readonly result?: unknown
+}
+
+export type ChildTranscriptSnapshot = {
+  readonly name: string
+  readonly messages: readonly AgentMessage[]
+  readonly streamingMessage?: AgentMessage
+  readonly activeTools: readonly ChildTranscriptTool[]
+  readonly omittedMessages: number
   readonly omittedBytes: number
 }
 
@@ -184,6 +207,13 @@ export class ChildZiProcess {
   #omittedSessionEvents = 0
   #omittedSessionEventBytes = 0
   #nextSessionEventSequence = 1
+  #transcriptMessages: AgentMessage[] = []
+  #transcriptMessageBytes = 0
+  #transcriptRevision = 0
+  #transcriptStreamingMessage: AgentMessage | undefined
+  #transcriptTools = new Map<string, ChildTranscriptTool>()
+  #omittedTranscriptMessages = 0
+  #omittedTranscriptBytes = 0
   readonly #peerRequests = new Set<Promise<void>>()
   readonly #peerRequestIds = new Set<string>()
   #cycleStartedAt = 0
@@ -277,6 +307,17 @@ export class ChildZiProcess {
     })
   }
 
+  transcript(): ChildTranscriptSnapshot {
+    return Object.freeze({
+      name: this.name,
+      messages: this.#transcriptMessages,
+      ...(this.#transcriptStreamingMessage ? { streamingMessage: this.#transcriptStreamingMessage } : {}),
+      activeTools: Object.freeze([...this.#transcriptTools.values()].map(tool => Object.freeze({ ...tool }))),
+      omittedMessages: this.#omittedTranscriptMessages,
+      omittedBytes: this.#omittedTranscriptBytes
+    })
+  }
+
   async start(): Promise<void> {
     const reached = await settleWithin(
       Promise.all([this.#ready.promise, this.#processScope.admitted]).then(() => undefined),
@@ -308,6 +349,7 @@ export class ChildZiProcess {
         this.#responseTimeoutMs
       )
       this.#acceptCompletionAdmission(result)
+      this.#appendTranscriptPrompt(prompt)
     } catch (cause) {
       this.#endCycleAdmission()
       throw cause
@@ -348,6 +390,7 @@ export class ChildZiProcess {
         this.#responseTimeoutMs
       )
       if (running) this.#acceptCompletionAdmission(result, true)
+      this.#appendTranscriptPrompt(text)
     } catch (cause) {
       if (running) {
         this.#endCycleAdmission()
@@ -379,6 +422,7 @@ export class ChildZiProcess {
           this.#responseTimeoutMs
         )
         this.#acceptCompletionAdmission(result)
+        this.#appendTranscriptPrompt(text)
       } catch (cause) {
         this.#endCycleAdmission()
         // Failed continue after idle transition: recover via get_state.
@@ -402,6 +446,7 @@ export class ChildZiProcess {
         this.#responseTimeoutMs
       )
       this.#acceptCompletionAdmission(result)
+      this.#appendTranscriptPrompt(text)
     } catch (cause) {
       this.#endCycleAdmission()
       this.#watchIdle(this.#admissionRevision)
@@ -697,6 +742,57 @@ export class ChildZiProcess {
     this.#publishCompletion(completion)
     this.#idleWatch = undefined
     this.#transition({ type: "idle", nextWorkCycle: workCycle + 1 })
+    if (this.#omittedTranscriptMessages + this.#transcriptMessages.length === observed.messageCount) return
+    void this.#refreshTranscript(revision, observed.messageCount, this.#transcriptRevision)
+  }
+
+  async #refreshTranscript(revision: number, total: number, transcriptRevision: number): Promise<void> {
+    try {
+      const start = Math.max(0, total - maxChildTranscriptMessages)
+      const messages: AgentMessage[] = []
+      for (let offset = start; offset < total;) {
+        const limit = Math.min(100, total - offset)
+        // Transcript enrichment is independent of work-cycle settlement and remains bounded to two pages.
+        // oxlint-disable-next-line no-await-in-loop
+        const value = await this.#request("session.get_messages", { start: offset, limit }, this.#responseTimeoutMs)
+        if (!isRecord(value) || value.start !== offset || value.total !== total || !Array.isArray(value.messages)) {
+          throw new Error("Subagent RPC emitted an invalid transcript page")
+        }
+        if (value.messages.length < 1 || value.messages.length > limit) {
+          throw new Error("Subagent RPC emitted an invalid transcript page")
+        }
+        for (const message of value.messages) {
+          if (!isAgentMessage(message)) throw new Error("Subagent RPC emitted an invalid transcript message")
+          messages.push(message)
+        }
+        offset += value.messages.length
+      }
+      if (
+        this.#admissionRevision !== revision ||
+        this.#transcriptRevision !== transcriptRevision ||
+        this.#state.type !== "idle"
+      ) {
+        return
+      }
+      const previousMessages = this.#transcriptMessages
+      this.#transcriptMessages = []
+      this.#transcriptMessageBytes = 0
+      this.#transcriptStreamingMessage = undefined
+      this.#transcriptTools.clear()
+      this.#omittedTranscriptMessages = start
+      this.#omittedTranscriptBytes = 0
+      for (const message of messages) this.#appendTranscriptMessage(message)
+      const sequenceChanged =
+        previousMessages.length !== this.#transcriptMessages.length ||
+        this.#transcriptMessages.some(
+          (message, index) => JSON.stringify(message) !== JSON.stringify(previousMessages[index])
+        )
+      if (!sequenceChanged) this.#transcriptMessages = previousMessages
+      this.#transcriptRevision++
+      this.#notifySessionEvent()
+    } catch {
+      // Completion delivery does not depend on optional transcript enrichment.
+    }
   }
 
   #ownsIdleCompletion(revision: number, workCycle: number): boolean {
@@ -840,6 +936,7 @@ export class ChildZiProcess {
       this.#notifySessionEvent()
       return
     }
+    this.#projectTranscriptEvent(event)
     this.#sessionEvents.push({
       sequence: this.#nextSessionEventSequence++,
       rpcSequence,
@@ -860,6 +957,107 @@ export class ChildZiProcess {
       this.#omittedSessionEventBytes += removedBytes
     }
     this.#notifySessionEvent()
+  }
+
+  #projectTranscriptEvent(event: ChildSerializableSessionEvent): void {
+    this.#transcriptRevision++
+    switch (event.type) {
+      case "message_start":
+      case "message_update": {
+        const message = isAgentMessage(event.message) ? event.message : undefined
+        if (message) this.#transcriptStreamingMessage = message
+        return
+      }
+      case "message_end": {
+        const message = isAgentMessage(event.message) ? event.message : undefined
+        if (!message) return
+        this.#transcriptStreamingMessage = undefined
+        this.#appendTranscriptMessage(message)
+        if (message.role === "toolResult") this.#transcriptTools.delete(message.toolCallId)
+        return
+      }
+      case "agent_end":
+        this.#transcriptStreamingMessage = undefined
+        return
+      case "tool_execution_start": {
+        if (typeof event.toolCallId !== "string" || typeof event.toolName !== "string") return
+        this.#setTranscriptTool({ id: event.toolCallId, name: event.toolName, args: event.args, status: "running" })
+        return
+      }
+      case "tool_execution_update": {
+        if (typeof event.toolCallId !== "string") return
+        const tool = this.#transcriptTools.get(event.toolCallId)
+        if (tool?.status === "running") {
+          this.#setTranscriptTool({ ...tool, result: event.partialResult })
+        }
+        return
+      }
+      case "tool_execution_end": {
+        if (typeof event.toolCallId !== "string") return
+        const tool = this.#transcriptTools.get(event.toolCallId)
+        if (!tool) return
+        this.#setTranscriptTool({ ...tool, result: event.result, status: event.isError === true ? "failed" : "done" })
+        return
+      }
+      default:
+        return
+    }
+  }
+
+  #setTranscriptTool(tool: ChildTranscriptTool): void {
+    if (Buffer.byteLength(JSON.stringify(tool)) > maxChildTranscriptToolBytes) {
+      this.#transcriptTools.delete(tool.id)
+      return
+    }
+    this.#transcriptTools.set(tool.id, tool)
+    while (
+      this.#transcriptTools.size > maxChildTranscriptTools ||
+      this.#transcriptToolBytes() > maxChildTranscriptToolsBytes
+    ) {
+      const oldest = this.#transcriptTools.keys().next().value
+      if (typeof oldest !== "string") break
+      this.#transcriptTools.delete(oldest)
+    }
+  }
+
+  #transcriptToolBytes(): number {
+    let bytes = 0
+    for (const tool of this.#transcriptTools.values()) bytes += Buffer.byteLength(JSON.stringify(tool))
+    return bytes
+  }
+
+  #appendTranscriptPrompt(text: string): void {
+    this.#transcriptRevision++
+    this.#appendTranscriptMessage({ role: "user", content: [{ type: "text", text }], timestamp: Date.now() })
+  }
+
+  #appendTranscriptMessage(message: AgentMessage): void {
+    const retained = deepFreeze(message)
+    const serialized = JSON.stringify(retained)
+    const bytes = Buffer.byteLength(serialized)
+    if (bytes > maxChildTranscriptBytes) {
+      this.#omittedTranscriptMessages++
+      this.#omittedTranscriptBytes += bytes
+      return
+    }
+    const previous = this.#transcriptMessages.at(-1)
+    if (previous && JSON.stringify(previous) === serialized) return
+    this.#transcriptMessages.push(retained)
+    this.#transcriptMessageBytes += bytes
+    let evicted = false
+    while (
+      this.#transcriptMessages.length > maxChildTranscriptMessages ||
+      this.#transcriptMessageBytes > maxChildTranscriptBytes
+    ) {
+      const removed = this.#transcriptMessages.shift()
+      if (!removed) break
+      const removedBytes = Buffer.byteLength(JSON.stringify(removed))
+      this.#transcriptMessageBytes = Math.max(0, this.#transcriptMessageBytes - removedBytes)
+      this.#omittedTranscriptMessages++
+      this.#omittedTranscriptBytes += removedBytes
+      evicted = true
+    }
+    if (evicted) this.#transcriptMessages = [...this.#transcriptMessages]
   }
 
   #receivePeerRequest(frame: Record<string, unknown>): void {
@@ -1244,7 +1442,7 @@ function completionFromIdleResult(
   workCycle: number,
   durationMs: number,
   value: unknown
-): { readonly completionRevision: number; readonly completion: SubagentCompletion } {
+): { readonly completionRevision: number; readonly messageCount: number; readonly completion: SubagentCompletion } {
   if (
     !isRecord(value) ||
     !Number.isSafeInteger(value.completionRevision) ||
@@ -1253,12 +1451,19 @@ function completionFromIdleResult(
     throw new Error("Invalid RPC idle completion result")
   }
   const completionRevision = value.completionRevision
-  if (typeof completionRevision !== "number" || completionRevision < 1) {
+  const messageCount = value.messageCount
+  if (
+    typeof completionRevision !== "number" ||
+    completionRevision < 1 ||
+    typeof messageCount !== "number" ||
+    messageCount < 0
+  ) {
     throw new Error("Invalid RPC idle completion result")
   }
   if (value.completion === null) {
     return {
       completionRevision,
+      messageCount,
       completion: baseCompletion(name, workCycle, durationMs, "failed", "", "missing_assistant")
     }
   }
@@ -1288,12 +1493,14 @@ function completionFromIdleResult(
   if (completion.stopReason === "aborted") {
     return {
       completionRevision,
+      messageCount,
       completion: { ...baseCompletion(name, workCycle, durationMs, "cancelled", completion.text), ...fields }
     }
   }
   if (completion.stopReason === "error") {
     return {
       completionRevision,
+      messageCount,
       completion: {
         ...baseCompletion(name, workCycle, durationMs, "failed", completion.text, "provider_error"),
         ...(typeof completion.error === "string" ? { error: completion.error } : {}),
@@ -1304,6 +1511,7 @@ function completionFromIdleResult(
   if (completion.stopReason === "toolUse") {
     return {
       completionRevision,
+      messageCount,
       completion: {
         ...baseCompletion(name, workCycle, durationMs, "failed", completion.text, "missing_final_answer"),
         ...fields
@@ -1313,6 +1521,7 @@ function completionFromIdleResult(
   if (completion.stopReason === "pending") {
     return {
       completionRevision,
+      messageCount,
       completion: {
         ...baseCompletion(name, workCycle, durationMs, "failed", completion.text, "incomplete_final_answer"),
         ...fields
@@ -1321,6 +1530,7 @@ function completionFromIdleResult(
   }
   return {
     completionRevision,
+    messageCount,
     completion: { ...baseCompletion(name, workCycle, durationMs, "completed", completion.text), ...fields }
   }
 }

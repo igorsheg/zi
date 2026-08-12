@@ -4,8 +4,14 @@ import { mkdtemp, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
 
+import type { AgentMessage } from "../src/messages.js"
 import { createProcessTreeTracker } from "../src/processes/process-tree.js"
-import { ChildZiProcess } from "../src/subagents/child-process.js"
+import {
+  ChildZiProcess,
+  maxChildTranscriptBytes,
+  maxChildTranscriptMessages,
+  maxChildTranscriptTools
+} from "../src/subagents/child-process.js"
 
 const mockChild = resolve(import.meta.dir, "fixtures/mock-rpc-child.ts")
 
@@ -36,6 +42,14 @@ test("ChildZiProcess spawn/wait/close vertical slice against a mock RPC child", 
     expect(child.state.type).toBe("idle")
     expect(completions).toEqual([{ status: "completed", text: "vertical-slice-ok" }])
     expect(child.snapshot().completion).toMatchObject({ status: "completed", text: "vertical-slice-ok", workCycle: 1 })
+    expect(child.transcript()).toMatchObject({
+      name: "agent-1",
+      omittedMessages: 0,
+      messages: [
+        { role: "user", content: [{ type: "text", text: "do the work" }] },
+        { role: "assistant", content: [{ type: "text", text: "vertical-slice-ok" }] }
+      ]
+    })
 
     await child.close("test")
     expect(child.state.type).toBe("exited")
@@ -46,6 +60,174 @@ test("ChildZiProcess spawn/wait/close vertical slice against a mock RPC child", 
     expect(methods).toContain("session.await_idle")
     expect(methods).not.toContain("session.get_messages")
   } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+}, 15_000)
+
+test("ChildZiProcess retains its transcript array across an ordinary settled cycle", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-child-transcript-identity-"))
+  const logPath = join(root, "methods.log")
+  const eventMessageReferences: Array<readonly AgentMessage[]> = []
+  let child!: ChildZiProcess
+  child = new ChildZiProcess({
+    name: "stable-transcript",
+    command: [process.execPath, mockChild],
+    cwd: root,
+    processTreeTracker: createProcessTreeTracker(),
+    env: { ...process.env, MOCK_RPC_REPLY: "identity-ok", MOCK_RPC_DELAY_MS: "20", MOCK_RPC_LOG: logPath },
+    onSessionEvent() {
+      eventMessageReferences.push(child.transcript().messages)
+    }
+  })
+  try {
+    await child.start()
+    const messages = child.transcript().messages
+
+    await child.spawnAdmit("preserve identity")
+    expect(eventMessageReferences).toHaveLength(2)
+    expect(eventMessageReferences.every(reference => reference === messages)).toBe(true)
+    expect(child.transcript().messages).toBe(messages)
+    expect(messages.at(-1)).toMatchObject({ role: "user", content: [{ text: "preserve identity" }] })
+
+    await waitFor(() => child.state.type === "idle", 5_000)
+    expect(eventMessageReferences).toHaveLength(4)
+    expect(eventMessageReferences.every(reference => reference === messages)).toBe(true)
+    expect(child.transcript().messages).toBe(messages)
+    expect(messages.at(-1)).toMatchObject({ role: "assistant", content: [{ text: "identity-ok" }] })
+    expect(readFileSync(logPath, "utf8")).not.toContain("session.get_messages")
+  } finally {
+    await child.close("test")
+    await rm(root, { recursive: true, force: true })
+  }
+}, 15_000)
+
+test("ChildZiProcess refreshes the authoritative transcript tail within its message bound", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-child-transcript-bound-"))
+  const logPath = join(root, "methods.log")
+  const child = new ChildZiProcess({
+    name: "bounded-transcript",
+    command: [process.execPath, mockChild],
+    cwd: root,
+    processTreeTracker: createProcessTreeTracker(),
+    env: { ...process.env, MOCK_RPC_REPLY: "bounded-ok", MOCK_RPC_DELAY_MS: "20", MOCK_RPC_LOG: logPath }
+  })
+  try {
+    await child.start()
+    const liveMessages = child.transcript().messages
+    await child.spawnAdmit("__many_messages__")
+    await waitFor(() => child.state.type === "idle", 5_000)
+    await waitFor(() => child.transcript().omittedMessages > 0, 5_000)
+
+    const transcript = child.transcript()
+    expect(transcript.messages).not.toBe(liveMessages)
+    expect(transcript.messages).toHaveLength(maxChildTranscriptMessages)
+    expect(transcript.omittedMessages).toBe(12)
+    expect(transcript.messages[0]).toMatchObject({ role: "user", content: [{ text: "archived-12" }] })
+    expect(transcript.messages.at(-1)).toMatchObject({ role: "assistant", content: [{ text: "bounded-ok" }] })
+    const refreshes = readFileSync(logPath, "utf8")
+      .split("\n")
+      .filter(method => method === "session.get_messages").length
+
+    await child.continueWith("after archive")
+    await waitFor(() => child.state.type === "idle", 5_000)
+    expect(child.transcript().messages).not.toBe(transcript.messages)
+    expect(child.transcript().omittedMessages).toBe(14)
+    expect(
+      readFileSync(logPath, "utf8")
+        .split("\n")
+        .filter(method => method === "session.get_messages")
+    ).toHaveLength(refreshes)
+  } finally {
+    await child.close("test")
+    await rm(root, { recursive: true, force: true })
+  }
+}, 15_000)
+
+test("ChildZiProcess bounds authoritative transcript bytes independently of message count", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-child-transcript-bytes-"))
+  const child = new ChildZiProcess({
+    name: "byte-bounded-transcript",
+    command: [process.execPath, mockChild],
+    cwd: root,
+    processTreeTracker: createProcessTreeTracker(),
+    env: { ...process.env, MOCK_RPC_REPLY: "bounded-ok", MOCK_RPC_DELAY_MS: "20" }
+  })
+  try {
+    await child.start()
+    await child.spawnAdmit("__large_messages__")
+    await waitFor(() => child.state.type === "idle", 5_000)
+    await waitFor(() => child.transcript().omittedBytes > 0, 5_000)
+
+    const transcript = child.transcript()
+    const retainedBytes = transcript.messages.reduce(
+      (bytes, message) => bytes + Buffer.byteLength(JSON.stringify(message)),
+      0
+    )
+    expect(retainedBytes).toBeLessThanOrEqual(maxChildTranscriptBytes)
+    expect(transcript.messages.length).toBeLessThan(182)
+    expect(transcript.omittedBytes).toBeGreaterThan(0)
+    expect(transcript.messages.at(-1)).toMatchObject({ role: "assistant", content: [{ text: "bounded-ok" }] })
+  } finally {
+    await child.close("test")
+    await rm(root, { recursive: true, force: true })
+  }
+}, 20_000)
+
+test("a stale authoritative transcript refresh cannot replace a newer idle queued prompt", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-child-transcript-stale-"))
+  const logPath = join(root, "methods.log")
+  const child = new ChildZiProcess({
+    name: "stale-transcript",
+    command: [process.execPath, mockChild],
+    cwd: root,
+    processTreeTracker: createProcessTreeTracker(),
+    env: {
+      ...process.env,
+      MOCK_RPC_REPLY: "first-cycle",
+      MOCK_RPC_DELAY_MS: "20",
+      MOCK_RPC_MESSAGES_DELAY_MS: "200",
+      MOCK_RPC_LOG: logPath
+    }
+  })
+  try {
+    await child.start()
+    await child.spawnAdmit("__many_messages__")
+    await waitFor(() => child.state.type === "idle", 5_000)
+    await child.sendFollowUp("queued context")
+    await Bun.sleep(300)
+
+    expect(readFileSync(logPath, "utf8")).toContain("session.get_messages")
+    expect(child.state.type).toBe("idle")
+    expect(child.transcript().messages.at(-1)).toMatchObject({ role: "user", content: [{ text: "queued context" }] })
+  } finally {
+    await child.close("test")
+    await rm(root, { recursive: true, force: true })
+  }
+}, 15_000)
+
+test("ChildZiProcess bounds active transcript tools and ignores oversized tool events", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-child-transcript-tools-"))
+  const child = new ChildZiProcess({
+    name: "tool-bounded-transcript",
+    command: [process.execPath, mockChild],
+    cwd: root,
+    processTreeTracker: createProcessTreeTracker(),
+    env: { ...process.env }
+  })
+  try {
+    await child.start()
+    await child.spawnAdmit("__many_tools__")
+    await waitFor(() => child.transcript().activeTools.length === maxChildTranscriptTools, 5_000)
+
+    const transcript = child.transcript()
+    expect(transcript.activeTools).toHaveLength(maxChildTranscriptTools)
+    expect(transcript.activeTools[0]?.id).toBe("tool-6")
+    expect(transcript.activeTools.at(-1)?.id).toBe("tool-69")
+    expect(transcript.activeTools.some(tool => tool.id === "oversized-tool")).toBe(false)
+    expect(child.sessionEvents().omittedEvents).toBeGreaterThan(0)
+    await child.interrupt()
+  } finally {
+    await child.close("test")
     await rm(root, { recursive: true, force: true })
   }
 }, 15_000)
@@ -136,9 +318,14 @@ test("ChildZiProcess retains bounded child session events admitted from RPC", as
     expect(updates).toBeGreaterThan(0)
     expect(retained.name).toBe("agent-events")
     expect(retained.omittedEvents).toBe(0)
-    expect(retained.events.map(entry => entry.event.type)).toEqual(["message_start", "message_update"])
-    expect(retained.events.map(entry => entry.workCycle)).toEqual([1, 1])
-    expect(retained.events.map(entry => entry.sequence)).toEqual([1, 2])
+    expect(retained.events.map(entry => entry.event.type)).toEqual([
+      "message_start",
+      "message_update",
+      "message_end",
+      "agent_end"
+    ])
+    expect(retained.events.map(entry => entry.workCycle)).toEqual([1, 1, 1, 1])
+    expect(retained.events.map(entry => entry.sequence)).toEqual([1, 2, 3, 4])
 
     await child.close("test")
   } finally {

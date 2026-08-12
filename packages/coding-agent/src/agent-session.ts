@@ -100,7 +100,8 @@ import {
   durablePreviewBytes,
   type SubagentSessionEvents,
   type SubagentSnapshot,
-  type SubagentSupervisor
+  type SubagentSupervisor,
+  type SubagentTranscriptSnapshot
 } from "./subagents/supervisor.js"
 import { isSubagentToolDetails, type SubagentToolDetails } from "./subagents/tool-details.js"
 import { createSubagentTools } from "./subagents/tools.js"
@@ -476,7 +477,7 @@ interface Settlement<T = void> {
 interface PreparedCompaction {
   readonly model: Model<Api>
   readonly settings: EffectiveCompactionSettings
-  readonly leafId: string | undefined
+  readonly activeEntryIds: readonly string[]
   readonly plan: CompactionPlan
 }
 
@@ -795,6 +796,10 @@ export class AgentSession {
 
   subagentSessionEvents(name: string): SubagentSessionEvents | undefined {
     return this.#subagents?.sessionEvents(name)
+  }
+
+  subagentTranscript(name: string): SubagentTranscriptSnapshot | undefined {
+    return this.#subagents?.transcript(name)
   }
 
   demoteForegroundShellTask(): ShellDemotionResult {
@@ -2390,7 +2395,12 @@ export class AgentSession {
       excludedFailureEntryId
     )
     if (preparation.type === "nothing_to_compact") return undefined
-    return { model, settings, leafId: this.sessionManager.retainedEntries().at(-1)?.id, plan: preparation.plan }
+    return {
+      model,
+      settings,
+      activeEntryIds: this.sessionManager.activeEntries().map(entry => entry.id),
+      plan: preparation.plan
+    }
   }
 
   #effectiveCompactionSettings(): EffectiveCompactionSettings | undefined {
@@ -2571,7 +2581,11 @@ export class AgentSession {
     if (this.#modelState.type !== "selected" || this.#modelState.model !== prepared.model) {
       throw new Error("Compaction model changed before commit")
     }
-    if (this.sessionManager.retainedEntries().at(-1)?.id !== prepared.leafId) {
+    const activeEntryIds = this.sessionManager.activeEntries().map(entry => entry.id)
+    if (
+      activeEntryIds.length !== prepared.activeEntryIds.length ||
+      activeEntryIds.some((entryId, index) => entryId !== prepared.activeEntryIds[index])
+    ) {
       throw new Error("Session changed before compaction could commit")
     }
   }

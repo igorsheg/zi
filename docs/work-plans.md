@@ -28,19 +28,19 @@ A plan is bounded to 32 steps. Each trimmed, non-empty step is at most 512 UTF-8
 The interactive terminal shows incomplete plans in the transcript status row:
 
 ```text
-Working… • Plan (1/4) — Implement status composition       Alt+P to expand
+Working… • Plan (1/4) — Implement status composition       (Ctrl+P)
 ```
 
 While the parent agent is running, the `Working…` shimmer always remains visible. The row then composes detached-transcript attention (`New output`), independent background ownership (`◎ 1 command · 2 subagents still running`), and plan progress in that priority order. Exceptional lifecycle states such as cancellation, retry, and compaction appear beside `Working…` instead of replacing it.
 
-By default, press `Alt+P` to expand or collapse the complete plan. Expanded details grow upward into transcript space without changing the composer, and use:
+Press `Ctrl+P` to open or close the complete plan in a read-only workspace pane. The pane shows every bounded step and uses:
 
 - `✓` completed
 - `◉` in progress
 - `○` pending
 - `–` cancelled
 
-Expanded details are bounded to seven rows plus the status anchor. Long plans show an omission row and keep the current step visible. The expansion preference survives incomplete plan revisions; the status disappears and resets when the plan is completed or cleared.
+The work-plan pane can remain open alongside a subagent transcript. Zi keeps the main agent on the left and stacks the subagent and work plan in the right column. Use the ordinary workspace focus controls to move between them; `q` closes the active read-only pane. Completing or clearing the plan closes its pane automatically.
 
 ## Code Mode and RPC
 

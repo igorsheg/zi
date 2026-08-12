@@ -46,6 +46,65 @@ test("manual compaction samples, commits, replaces active context, and orders li
   session.dispose()
 })
 
+test("manual compaction preserves subagent metadata appended while summary sampling is pending", async () => {
+  const setup = await compactionSession()
+  const started = deferred<void>()
+  const release = deferred<void>()
+  setup.faux.setResponses([
+    async () => {
+      started.resolve()
+      await release.promise
+      return fauxAssistantMessage("checkpoint with concurrent metadata")
+    }
+  ])
+
+  const compacting = setup.session.compact()
+  await started.promise
+  const metadata = setup.session.sessionManager.appendSubagent({
+    event: "ready",
+    name: "background-reviewer",
+    sessionId: "child-session"
+  })
+  release.resolve()
+
+  const result = await compacting
+
+  expect(result.summary).toBe("checkpoint with concurrent metadata")
+  expect(setup.session.sessionManager.retainedEntries()).toContain(metadata)
+  expect(setup.session.sessionManager.subagentEntries()).toEqual([metadata])
+  expect(setup.session.sessionManager.latestCompaction()).toBeDefined()
+  setup.session.dispose()
+})
+
+test("manual compaction rejects active context appended while summary sampling is pending", async () => {
+  const setup = await compactionSession()
+  const started = deferred<void>()
+  const release = deferred<void>()
+  setup.faux.setResponses([
+    async () => {
+      started.resolve()
+      await release.promise
+      return fauxAssistantMessage("stale checkpoint")
+    }
+  ])
+
+  const compacting = setup.session.compact()
+  await started.promise
+  const appended = setup.session.sessionManager.appendMessage({
+    role: "user",
+    content: "new active context",
+    timestamp: 4
+  })
+  release.resolve()
+
+  const failure = await rejection(compacting)
+
+  expect(failure.message).toContain("Session changed before compaction could commit")
+  expect(setup.session.sessionManager.activeEntries()).toContain(appended)
+  expect(setup.session.sessionManager.latestCompaction()).toBeUndefined()
+  setup.session.dispose()
+})
+
 test("manual compaction retries a transient summary failure inside one isolated request session", async () => {
   const setup = await compactionSession({ retryBaseDelayMs: 0 })
   const requests: StreamOptions[] = []

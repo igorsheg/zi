@@ -1,6 +1,7 @@
 import type { KeyEvent } from "@opentui/core"
 
-export type InteractiveKeyEvent = Pick<KeyEvent, "name" | "ctrl" | "meta" | "shift" | "super" | "hyper">
+export type InteractiveKeyEvent = Pick<KeyEvent, "name" | "ctrl" | "meta" | "shift" | "super" | "hyper"> &
+  Partial<Pick<KeyEvent, "option">>
 
 export const maxKeysPerBinding = 16
 const maxKeyIdLength = 128
@@ -27,14 +28,9 @@ export type PromptKeyAction =
   | "exit"
   | "consume"
 
-export type TranscriptKeyAction =
-  | "page_up"
-  | "page_down"
-  | "line_up"
-  | "line_down"
-  | "tail"
-  | "toggle_tools"
-  | "toggle_plan"
+export type WorkspaceKeyAction = "focus_left" | "focus_down" | "focus_up" | "focus_right" | "close" | "primary"
+
+export type TranscriptKeyAction = "page_up" | "page_down" | "line_up" | "line_down" | "tail" | "toggle_tools"
 
 export interface PromptKeyContext {
   readonly pickerOpen: boolean
@@ -88,13 +84,15 @@ const defaultBindingEntries = [
   ["tui.select.confirm", ["return"], "Confirm selection", "reserved"],
   ["tui.select.cancel", ["escape", "ctrl+c"], "Cancel selection", "reserved"],
   ["app.tools.expand", ["ctrl+o"], "Expand or collapse tool details", "overridable"],
-  ["app.plan.toggle", ["alt+p"], "Expand or collapse the work plan", "overridable"],
+  ["app.plan.toggle", ["ctrl+p"], "Open or close the work plan pane", "overridable"],
   ["app.transcript.pageUp", ["pageup"], "Scroll transcript up half a page", "overridable"],
   ["app.transcript.pageDown", ["pagedown"], "Scroll transcript down half a page", "overridable"],
   ["app.transcript.lineUp", ["ctrl+alt+up"], "Scroll transcript up one line", "overridable"],
   ["app.transcript.lineDown", ["ctrl+alt+down"], "Scroll transcript down one line", "overridable"],
   ["app.transcript.tail", ["ctrl+end"], "Jump to the transcript tail", "overridable"],
-  ["app.modal.close", ["escape", "q"], "Close modal", "overridable"]
+  ["app.workspace.prefix", ["ctrl+w"], "Start a workspace focus command", "overridable"],
+  ["app.workspace.close", ["q"], "Close the active read-only pane", "overridable"],
+  ["app.workspace.primary", ["escape"], "Return to the primary pane", "overridable"]
 ] as const
 
 export type InteractiveKeybinding = (typeof defaultBindingEntries)[number][0]
@@ -206,6 +204,29 @@ export class InteractiveKeybindings {
     return undefined
   }
 
+  workspaceContextAction(event: InteractiveKeyEvent, readOnlyPaneActive: boolean): WorkspaceKeyAction | undefined {
+    if (!readOnlyPaneActive) return undefined
+    if (this.matches(event, "app.workspace.primary")) return "primary"
+    if (this.matches(event, "app.workspace.close")) return "close"
+    return undefined
+  }
+
+  workspaceChordAction(event: InteractiveKeyEvent): WorkspaceKeyAction | undefined {
+    if (event.ctrl || event.meta || event.option || event.shift || event.super || event.hyper) return undefined
+    switch (normalizeName(event.name)) {
+      case "h":
+        return "focus_left"
+      case "j":
+        return "focus_down"
+      case "k":
+        return "focus_up"
+      case "l":
+        return "focus_right"
+      default:
+        return undefined
+    }
+  }
+
   transcriptAction(event: InteractiveKeyEvent): TranscriptKeyAction | undefined {
     if (this.matches(event, "app.tools.expand")) return "toggle_tools"
     if (this.matches(event, "app.transcript.pageUp")) return "page_up"
@@ -213,10 +234,11 @@ export class InteractiveKeybindings {
     if (this.matches(event, "app.transcript.lineUp")) return "line_up"
     if (this.matches(event, "app.transcript.lineDown")) return "line_down"
     if (this.matches(event, "app.transcript.tail")) return "tail"
-    if (this.matches(event, "app.plan.toggle") && !this.#hasCompetingBinding(event, "app.plan.toggle")) {
-      return "toggle_plan"
-    }
     return undefined
+  }
+
+  togglesWorkPlan(event: InteractiveKeyEvent): boolean {
+    return this.matches(event, "app.plan.toggle") && !this.#hasCompetingBinding(event, "app.plan.toggle")
   }
 
   #hasCompetingBinding(event: InteractiveKeyEvent, id: InteractiveKeybinding): boolean {
@@ -224,10 +246,6 @@ export class InteractiveKeybindings {
       if (candidate !== id && binding.parsed.some(key => matches(event, key))) return true
     }
     return false
-  }
-
-  closesModal(event: InteractiveKeyEvent): boolean {
-    return this.matches(event, "app.modal.close")
   }
 }
 
@@ -334,7 +352,7 @@ function matches(event: InteractiveKeyEvent, key: ParsedKey): boolean {
   return (
     normalizeName(event.name) === key.name &&
     event.ctrl === key.ctrl &&
-    event.meta === key.meta &&
+    (event.meta || Boolean(event.option)) === key.meta &&
     event.shift === key.shift &&
     Boolean(event.super) === key.super &&
     Boolean(event.hyper) === key.hyper

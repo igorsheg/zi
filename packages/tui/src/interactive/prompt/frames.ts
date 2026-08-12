@@ -14,9 +14,10 @@ import type {
 } from "@with-zi/coding-agent"
 
 import { glyphs } from "../../glyphs.js"
+import { isActiveSubagentLifecycle } from "../subagent-activity.js"
 import { sameModel } from "./model-choices.js"
 import type { PickerFrame, PickerStackRow } from "./picker.js"
-import type { EditableSetting, EditableSettingValue } from "./state.js"
+import type { EditableSetting, EditableSettingValue, SubagentPickerScope } from "./state.js"
 
 export const promptCompletionPickerHeight = 7
 
@@ -171,20 +172,19 @@ export function sessionFrame(
 
 export type ProjectTrustSelectionId = "untrusted-session" | "trusted-session" | "trusted-saved" | "untrusted-saved"
 
-export function subagentFrame(snapshots: readonly SubagentSnapshot[]): PickerFrame {
+export function subagentFrame(snapshots: readonly SubagentSnapshot[], scope: SubagentPickerScope): PickerFrame {
+  const visible =
+    scope === "running" ? snapshots.filter(snapshot => isActiveSubagentLifecycle(snapshot.lifecycle)) : snapshots
   return {
     id: promptPickerFrameIds.subagents,
-    title: "Subagents",
+    title: scope === "running" ? "Subagents · Running" : "Subagents · All",
     filter: "fuzzy",
-    emptyText: "No subagents have been started in this session",
-    rows: snapshots.map(snapshot => ({
-      id: snapshot.name,
-      label: snapshot.name,
-      detail: `[${subagentStatusLabel(snapshot)}]`,
-      ...(snapshot.task ? { metadata: snapshot.task } : {}),
-      searchText: `${snapshot.name} ${snapshot.lifecycle} ${snapshot.task ?? ""} ${snapshot.completion?.status ?? ""}`
-    })),
-    footer: "Enter open live activity · Esc close"
+    emptyText: scope === "running" ? "No subagents are running" : "No subagents have been started in this session",
+    rows: visible.map(subagentRow),
+    footer:
+      scope === "running"
+        ? "Tab show all · Enter open transcript · Esc close"
+        : "Tab show running · Enter open transcript · Esc close"
   }
 }
 
@@ -440,6 +440,16 @@ function effectiveSetting(session: AgentSession, setting: EditableSetting): Edit
       return session.settingsManager.get().retryEnabled
     default:
       return assertNever(setting)
+  }
+}
+
+function subagentRow(snapshot: SubagentSnapshot): PickerStackRow {
+  return {
+    id: snapshot.name,
+    label: snapshot.name,
+    detail: `[${subagentStatusLabel(snapshot)}]`,
+    ...(snapshot.task ? { metadata: snapshot.task } : {}),
+    searchText: `${snapshot.name} ${snapshot.lifecycle} ${snapshot.task ?? ""} ${snapshot.completion?.status ?? ""}`
   }
 }
 

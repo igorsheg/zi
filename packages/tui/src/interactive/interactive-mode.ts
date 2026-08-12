@@ -28,7 +28,6 @@ import { ExitGestureController } from "./exit-gesture.js"
 import { type ExternalEditor, SystemExternalEditor } from "./external-editor.js"
 import { InteractiveKeybindings, type InteractiveKeybindingOverrides } from "./interactive-keybindings.js"
 import { createInteractiveStore, type InteractiveStore } from "./interactive-store.js"
-import { ModalLayer } from "./modal-layer.js"
 import {
   NotificationCenter,
   type NotificationAPI,
@@ -39,6 +38,7 @@ import {
 } from "./notifications.js"
 import type { PromptSessionActions } from "./prompt/store.js"
 import { SessionScreen } from "./screen.js"
+import { SessionWorkspace } from "./session-workspace.js"
 import { SlashController } from "./slash-controller.js"
 import type { TranscriptDiagnostics } from "./transcript/view.js"
 
@@ -82,11 +82,11 @@ export class InteractiveMode {
   readonly #clipboardCopy: ClipboardCopyController
   readonly #diagnosticFlags: TuiDiagnosticFlags
   readonly #diagnostics: TuiDiagnosticsOverlay | undefined
-  readonly #modalLayer: ModalLayer
   readonly #notifications: NotificationCenter
   readonly #builtInNotifications: BuiltInNotificationPresenter
   #initialProjectTrust = createInitialProjectTrustState()
   #screen: SessionScreen
+  #workspace: SessionWorkspace
   #releaseGeneration: () => void
   #disposed = false
 
@@ -148,7 +148,6 @@ export class InteractiveMode {
       () => this.store.$generation.get()
     )
     this.#keybindings = new InteractiveKeybindings(keybindingOverrides)
-    this.#modalLayer = new ModalLayer(renderer, this.store, this.#keybindings, theme)
     this.#clipboardCopy = new ClipboardCopyController(
       renderer,
       this.#keybindings,
@@ -183,8 +182,10 @@ export class InteractiveMode {
       notifications.dispose()
       throw cause
     }
+    let workspace: SessionWorkspace
     try {
-      this.root.add(screen.root)
+      workspace = new SessionWorkspace(renderer, this.store, this.#keybindings, screen, theme, this.#syntaxStyle)
+      this.root.add(workspace.root)
       notifications.attach(screen.transcript.notificationHost)
     } catch (cause) {
       screen.destroy()
@@ -196,6 +197,7 @@ export class InteractiveMode {
     this.notifications = notifications
     this.#builtInNotifications = builtInNotifications
     this.#screen = screen
+    this.#workspace = workspace
     this.#diagnostics =
       diagnostics.showTimeToFirstDraw || diagnostics.showStats || diagnostics.showMemory
         ? new TuiDiagnosticsOverlay(
@@ -207,7 +209,6 @@ export class InteractiveMode {
           )
         : undefined
     if (this.#diagnostics) this.root.add(this.#diagnostics.root)
-    this.root.add(this.#modalLayer.root)
     renderer.root.add(this.root)
     this.#screen.prompt.focus()
     renderer.on(CliRenderEvents.SELECTION, this.#preservePromptFocus)
@@ -230,7 +231,6 @@ export class InteractiveMode {
     if (this.#sessionRuntime && this.#sessionRuntime.session !== session) {
       throw new Error("InteractiveMode can only bind the current session runtime session")
     }
-    this.#modalLayer.close("session_replaced")
     this.store.replaceSession(session)
     this.#showBootstrapWarning(diagnostic)
     this.#showExtensionWarning(session)
@@ -251,11 +251,11 @@ export class InteractiveMode {
     this.#settleInitialProjectTrust()
     this.#releaseGeneration()
     this.#clipboardCopy.dispose()
-    this.#modalLayer.dispose()
     this.#renderer.off(CliRenderEvents.SELECTION, this.#preservePromptFocus)
     this.#diagnostics?.destroy()
     this.#builtInNotifications.dispose()
     this.#notifications.dispose()
+    this.#workspace.destroy()
     this.#screen.destroy()
     this.#externalEditor.dispose()
     this.#browserOpener.dispose()
@@ -265,7 +265,7 @@ export class InteractiveMode {
   }
 
   #preservePromptFocus = (): void => {
-    if (!this.#modalLayer.isOpen()) this.#screen.prompt.focus()
+    this.#workspace.preserveFocus()
   }
 
   #showBootstrapWarning(diagnostic: SessionBootstrapDiagnostic | undefined): void {
@@ -326,9 +326,18 @@ export class InteractiveMode {
   #replaceScreen(): void {
     this.#clipboardCopy.cancel()
     this.#notifications.detach()
+    this.#workspace.destroy()
     this.#screen.destroy()
     this.#screen = this.#createScreen(this.#builtInNotifications)
-    this.root.add(this.#screen.root)
+    this.#workspace = new SessionWorkspace(
+      this.#renderer,
+      this.store,
+      this.#keybindings,
+      this.#screen,
+      this.#theme,
+      this.#syntaxStyle
+    )
+    this.root.add(this.#workspace.root)
     this.#notifications.attach(this.#screen.transcript.notificationHost)
     this.#screen.prompt.focus()
   }
@@ -349,7 +358,7 @@ export class InteractiveMode {
       this.#diagnosticFlags.showTimeToFirstDraw || this.#diagnosticFlags.showStats || this.#diagnosticFlags.showMemory,
       notices,
       this.#sessionActions,
-      { openSubagentActivity: name => this.#modalLayer.openSubagentActivity(name) }
+      { openTranscript: name => this.#workspace.openSubagent(name) }
     )
   }
 }

@@ -5,7 +5,6 @@ import { textWidth } from "../../components/cell-text.js"
 import { ShimmerTextView } from "../../components/shimmer-text.js"
 import type { Theme } from "../../theme.js"
 import type { InteractiveKeybindings } from "../interactive-keybindings.js"
-import { WorkPlanDetailsView } from "./work-plan-details-view.js"
 
 export const transcriptStatusRows = 1
 
@@ -36,13 +35,10 @@ export interface TranscriptStatusPresentation {
   readonly unseenOutput: boolean
 }
 
-type WorkPlanDisclosure = { readonly type: "collapsed" } | { readonly type: "expanded" }
-
 export class TranscriptStatusView {
   readonly root: BoxRenderable
 
   readonly #working: ShimmerTextView
-  readonly #details: WorkPlanDetailsView
   readonly #line: BoxRenderable
   readonly #workingLifecycleSeparator: TextRenderable
   readonly #lifecycle: TextRenderable
@@ -58,15 +54,11 @@ export class TranscriptStatusView {
   readonly #planHint: TextRenderable
   readonly #toggleHint: string | undefined
   #presentation: TranscriptStatusPresentation = emptyPresentation
-  #disclosure: WorkPlanDisclosure = { type: "collapsed" }
   #width = 0
-  #detailRows = 0
   #available = true
-  #renderedPlan = false
 
   constructor(renderer: CliRenderer, keybindings: InteractiveKeybindings, theme: Theme) {
     this.root = new BoxRenderable(renderer, { id: "transcript-status", flexDirection: "column", flexShrink: 0 })
-    this.#details = new WorkPlanDetailsView(renderer, theme)
     this.#line = new BoxRenderable(renderer, { height: 1, flexDirection: "row", flexShrink: 0 })
     this.#working = new ShimmerTextView(renderer, "Working…", theme.text.muted, theme.text.primary)
     this.#workingLifecycleSeparator = statusText(renderer, theme.text.muted, " ")
@@ -101,7 +93,6 @@ export class TranscriptStatusView {
       fg: theme.text.muted,
       content: ""
     })
-    this.root.add(this.#details.root)
     this.root.add(this.#line)
     this.#line.add(this.#working.root)
     this.#line.add(this.#workingLifecycleSeparator)
@@ -119,30 +110,11 @@ export class TranscriptStatusView {
     this.#render()
   }
 
-  get canTogglePlan(): boolean {
-    return this.#available && this.#detailRows > 0 && this.#renderedPlan
-  }
-
-  update(presentation: TranscriptStatusPresentation, width: number, detailRows: number): void {
-    if (presentation.workPlan.type === "absent") this.#disclosure = { type: "collapsed" }
-    if (
-      samePresentation(this.#presentation, presentation) &&
-      this.#width === width &&
-      this.#detailRows === detailRows
-    ) {
-      return
-    }
+  update(presentation: TranscriptStatusPresentation, width: number): void {
+    if (samePresentation(this.#presentation, presentation) && this.#width === width) return
     this.#presentation = presentation
     this.#width = width
-    this.#detailRows = detailRows
     this.#render()
-  }
-
-  togglePlan(): boolean {
-    if (!this.canTogglePlan) return false
-    this.#disclosure = this.#disclosure.type === "collapsed" ? { type: "expanded" } : { type: "collapsed" }
-    this.#render()
-    return true
   }
 
   setAvailable(available: boolean): void {
@@ -154,7 +126,6 @@ export class TranscriptStatusView {
 
   destroy(): void {
     this.#working.destroy()
-    this.#details.destroy()
     this.root.destroyRecursively()
   }
 
@@ -165,16 +136,12 @@ export class TranscriptStatusView {
     const showLifecycle = this.#available && presentation.activity.type === "working_with_lifecycle"
     const showUnseen = this.#available && presentation.unseenOutput
     const showBackground = this.#available && presentation.background.type === "running"
-    const disclosureExpanded = this.#disclosure.type === "expanded" && this.#detailRows > 0
     const planLabel = plan ? "Plan" : ""
     const planProgress = plan ? ` (${plan.completed}/${plan.total})` : ""
-    const planCurrent =
-      plan && !disclosureExpanded
-        ? ` — ${plan.currentStatus === "pending" ? "Next: " : ""}${plan.plan.steps[plan.currentIndex]!.text}`
-        : ""
-    const planHint = this.#toggleHint
-      ? ` (${this.#toggleHint} to ${this.#disclosure.type === "expanded" ? "collapse" : "expand"})`
+    const planCurrent = plan
+      ? ` — ${plan.currentStatus === "pending" ? "Next: " : ""}${plan.plan.steps[plan.currentIndex]!.text}`
       : ""
+    const planHint = this.#toggleHint ? ` (${this.#toggleHint})` : ""
     const fullBackgroundText =
       presentation.background.type === "running" ? runningBackgroundText(presentation.background) : ""
     const activityWidth = showWorking
@@ -196,9 +163,6 @@ export class TranscriptStatusView {
             Math.max(1, this.#width - activityWidth - unseenWidth - backgroundSeparatorWidth - planWidth)
           )
         : ""
-    const expanded = showPlan && disclosureExpanded
-    this.#renderedPlan = showPlan
-
     this.#working.setActive(showWorking)
     this.#workingLifecycleSeparator.visible = showLifecycle
     this.#lifecycle.visible = showLifecycle
@@ -214,28 +178,18 @@ export class TranscriptStatusView {
     this.#planSeparator.visible = showPlan && (showWorking || showUnseen || showBackground)
     this.#planLabel.visible = showPlan
     this.#planProgress.visible = showPlan
-    this.#planCurrent.visible = showPlan && !expanded
+    this.#planCurrent.visible = showPlan
     this.#planHint.visible =
-      showPlan &&
-      this.#detailRows > 0 &&
-      Boolean(planHint) &&
-      fixedPlanWidth + textWidth(planCurrent) + textWidth(planHint) <= this.#width
+      showPlan && Boolean(planHint) && fixedPlanWidth + textWidth(planCurrent) + textWidth(planHint) <= this.#width
 
-    if (!plan) {
-      this.#details.update(emptyPlan, 0, 0, 0)
-      return
-    }
-
+    if (!plan) return
     this.#planLabel.content = planLabel
     this.#planProgress.content = planProgress
     this.#planCurrent.content = planCurrent
     this.#planHint.content = planHint
-    if (expanded) this.#details.update(plan.plan, this.#width, this.#detailRows, plan.currentIndex)
-    else this.#details.hide()
   }
 }
 
-const emptyPlan: WorkPlanSnapshot = Object.freeze({ revision: 0, steps: Object.freeze([]) })
 const emptyPresentation: TranscriptStatusPresentation = Object.freeze({
   activity: Object.freeze({ type: "idle" }),
   background: Object.freeze({ type: "idle" }),

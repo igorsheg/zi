@@ -31,8 +31,8 @@ import { QueuedInputsView } from "./queue-view.js"
 import { promptInputIsSecret, type PromptInputEdit, type PromptWorkflow } from "./state.js"
 import {
   createPromptStore,
-  type PromptModalActions,
   type PromptSessionActions,
+  type PromptSubagentActions,
   type PromptStore,
   type PromptSubmissionIntent
 } from "./store.js"
@@ -63,6 +63,7 @@ export class PromptView {
   #syncedImages: ReturnType<Composer["activeImages"]> = []
   #externalEditorState: ExternalEditorState = { type: "idle" }
   #nextExternalEditorOperationId = 0
+  #inputActive = true
 
   constructor(
     renderer: CliRenderer,
@@ -77,7 +78,7 @@ export class PromptView {
     theme: Theme,
     notices: BuiltInNoticeActions,
     sessionActions?: PromptSessionActions,
-    modals?: PromptModalActions
+    subagentActions?: PromptSubagentActions
   ) {
     this.#renderer = renderer
     this.#interactive = interactive
@@ -85,7 +86,15 @@ export class PromptView {
     this.#exitGestures = exitGestures
     this.#externalEditor = externalEditor
     this.#notices = notices
-    this.#store = createPromptStore(interactive, slash, sessionActions, clipboard, notices, clipboardCopy, modals)
+    this.#store = createPromptStore(
+      interactive,
+      slash,
+      sessionActions,
+      clipboard,
+      notices,
+      clipboardCopy,
+      subagentActions
+    )
     this.root = new BoxRenderable(renderer, { flexDirection: "column", flexShrink: 0 })
 
     this.#authCeremony = new AuthCeremonyView(renderer, browserOpener, theme)
@@ -129,15 +138,20 @@ export class PromptView {
       this.#store.picker.$state.subscribe(update),
       interactive.$promptRevision.subscribe(update)
     )
-    renderer.keyInput.on("keypress", this.#onKeyPress)
     renderer.on(CliRenderEvents.RESIZE, update)
-    this.#release.push(() => renderer.keyInput.off("keypress", this.#onKeyPress))
     this.#release.push(() => renderer.off(CliRenderEvents.RESIZE, update))
     this.#input.focus()
   }
 
   focus(): void {
-    this.#input.focus()
+    if (this.#inputActive) this.#input.focus()
+  }
+
+  setInputActive(active: boolean): void {
+    if (this.#inputActive === active) return
+    this.#inputActive = active
+    if (active) this.#input.focus()
+    else this.#input.blur()
   }
 
   requestProjectTrust(cwd: string): void {
@@ -247,14 +261,14 @@ export class PromptView {
       case "clear":
         this.#composer.clearDraft()
         this.#syncedImages = this.#store.$state.get().images
-        this.#input.focus()
+        this.focus()
         return
       case "range":
         if (this.#composer.replaceRange(edit) === "unavailable") {
           this.#notices.promptWarning("File completion could not replace this marked range")
         }
         this.#syncedImages = this.#composer.activeImages()
-        this.#input.focus()
+        this.focus()
         return
       default:
         return assertNever(edit)
@@ -266,7 +280,7 @@ export class PromptView {
     const images = this.#store.$state.get().images
     this.#syncedImages = images
     this.#composer.syncImageMarkers(images)
-    this.#input.focus()
+    this.focus()
   }
 
   #restore(abort: boolean): void {
@@ -278,8 +292,8 @@ export class PromptView {
     if (text !== currentText) this.#replaceInput(text)
   }
 
-  #onKeyPress = (key: KeyEvent): void => {
-    if (key.defaultPrevented || key.propagationStopped) return
+  handleKeyPress(key: KeyEvent): boolean {
+    if (!this.#inputActive || key.defaultPrevented || key.propagationStopped) return false
     const session = this.#interactive.getSession()
     const prompt = this.#store.$state.get()
     const pickerOpen = Boolean(this.#store.picker.presentation(this.#input.plainText))
@@ -294,8 +308,9 @@ export class PromptView {
       externalEditorEnabled: prompt.workflow.type === "idle",
       historyEnabled: prompt.workflow.type === "idle" && !pickerOpen
     })
-    if (!action) return
+    if (!action) return false
     this.#handleKeyAction(key, action)
+    return key.defaultPrevented || key.propagationStopped
   }
 
   #handleKeyAction(key: KeyEvent, action: PromptKeyAction): void {
@@ -306,8 +321,8 @@ export class PromptView {
         return
       case "picker_complete":
         consume(key)
-        // Completion popups insert the candidate; deliberate pickers cycle.
-        if (!this.#store.completePicker(this.#input.plainText, captureFileCompletionInput(this.#input))) {
+        // Completion and feature pickers may own Tab; other deliberate pickers cycle.
+        if (!this.#store.handlePickerTab(this.#input.plainText, captureFileCompletionInput(this.#input))) {
           this.#store.movePicker(this.#input.plainText, 1)
         }
         return

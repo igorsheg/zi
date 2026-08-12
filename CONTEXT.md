@@ -116,6 +116,18 @@ _Avoid_: Draft clearing, revision-scoped cancellation
 A revisioned one-shot request to replace one display-offset range in the native Composer with an explicit cursor target. It is not a copied draft; OpenTUI remains authoritative for text, markers, selection, and undo.
 _Avoid_: Prompt model, frontend draft state, delete-then-insert
 
+**Session workspace**:
+The terminal owner of pane topology, pane resources, active-pane focus, compact-mode presentation, semantic workspace keys, and disposal for one interactive session. Its secondary panes are read-only and may compose a subagent transcript with the active work plan; closing presentation never interrupts or closes the represented subagent.
+_Avoid_: Window manager, root store, session layout model
+
+**Workspace layout**:
+A bounded binary tree of stable pane and split identities, axes, sides, and ratios. Zi owns this topology while OpenTUI/Yoga owns settled geometry; narrow terminals retain the tree and present only its active pane.
+_Avoid_: Pixel geometry, tab model, persisted layout, floating window
+
+**Child transcript projection**:
+The coding-agent-owned bounded projection of a live subagent's messages, streaming message, and active tools. Activity events provide live deltas; an independent bounded message-tail refresh restores authoritative settled history. Restored children without live transcript evidence remain unavailable rather than receiving fabricated messages.
+_Avoid_: Activity log, TUI message cache, child session journal
+
 **Native text selection**:
 The current terminal-highlighted text range across the composer or transcript. It is an ephemeral interaction surface, not conversation state or a selected transcript item.
 _Avoid_: Copy buffer, transcript cursor, selected message

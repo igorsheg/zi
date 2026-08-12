@@ -53,11 +53,25 @@ test("interactive keybindings resolve semantic prompt and transcript actions", (
   expect(keybindings.promptAction(key("up"), context(true))).toBe("picker_up")
   expect(keybindings.promptAction(key("down"), context(true))).toBe("picker_down")
   expect(keybindings.promptAction(key("up", { meta: true }), context(true))).toBe("consume")
+  expect(keybindings.promptAction(key("return", { option: true }), context())).toBe("follow_up")
 
   expect(keybindings.transcriptAction(key("pageup"))).toBe("page_up")
   expect(keybindings.transcriptAction(key("up", { ctrl: true, meta: true }))).toBe("line_up")
   expect(keybindings.transcriptAction(key("end", { ctrl: true }))).toBe("tail")
-  expect(keybindings.transcriptAction(key("p", { meta: true }))).toBe("toggle_plan")
+  expect(keybindings.transcriptAction(key("p", { ctrl: true }))).toBeUndefined()
+  expect(keybindings.togglesWorkPlan(key("p", { ctrl: true }))).toBe(true)
+  expect(keybindings.togglesWorkPlan(key("p", { meta: true }))).toBe(false)
+
+  expect(keybindings.workspaceContextAction(key("escape"), true)).toBe("primary")
+  expect(keybindings.workspaceContextAction(key("q"), true)).toBe("close")
+  expect(keybindings.workspaceContextAction(key("q"), false)).toBeUndefined()
+  expect(keybindings.matches(key("w", { ctrl: true }), "app.workspace.prefix")).toBe(true)
+  expect(keybindings.workspaceChordAction(key("h"))).toBe("focus_left")
+  expect(keybindings.workspaceChordAction(key("j"))).toBe("focus_down")
+  expect(keybindings.workspaceChordAction(key("k"))).toBe("focus_up")
+  expect(keybindings.workspaceChordAction(key("l"))).toBe("focus_right")
+  expect(keybindings.workspaceChordAction(key("right"))).toBeUndefined()
+  expect(keybindings.workspaceChordAction(key("q"))).toBeUndefined()
 })
 
 test("interactive keybinding overrides rebind and disable semantic actions per mode", () => {
@@ -66,7 +80,9 @@ test("interactive keybinding overrides rebind and disable semantic actions per m
     "app.exit": [],
     "app.editor.external": ["ctrl+e"],
     "app.editor.undo": ["ctrl+u"],
-    "app.plan.toggle": ["alt+x"],
+    "app.plan.toggle": ["ctrl+y"],
+    "app.workspace.prefix": ["ctrl+b"],
+    "app.workspace.close": [],
     "tui.input.historyPrevious": ["ctrl+p"],
     "tui.input.historyNext": []
   })
@@ -82,8 +98,11 @@ test("interactive keybinding overrides rebind and disable semantic actions per m
   expect(keybindings.promptAction(key("up"), context())).toBeUndefined()
   expect(keybindings.promptAction(key("p", { ctrl: true }), context())).toBe("history_previous")
   expect(keybindings.promptAction(key("down"), context())).toBeUndefined()
-  expect(keybindings.transcriptAction(key("p", { meta: true }))).toBeUndefined()
-  expect(keybindings.transcriptAction(key("x", { meta: true }))).toBe("toggle_plan")
+  expect(keybindings.togglesWorkPlan(key("p", { ctrl: true }))).toBe(false)
+  expect(keybindings.togglesWorkPlan(key("y", { ctrl: true }))).toBe(true)
+  expect(keybindings.matches(key("w", { ctrl: true }), "app.workspace.prefix")).toBe(false)
+  expect(keybindings.matches(key("b", { ctrl: true }), "app.workspace.prefix")).toBe(true)
+  expect(keybindings.workspaceContextAction(key("q"), true)).toBeUndefined()
   expect(keybindings.getKeys("app.clear")).toEqual(["ctrl+x"])
   expect(() => new InteractiveKeybindings({ "app.clear": ["wat+ctrl+x"] })).toThrow("Unknown key modifier")
 })
@@ -110,7 +129,8 @@ test("interactive keybindings expose resolved metadata for help and future short
   )
   expect(keybindings.getHint("app.selection.copy")).toBe(process.platform === "darwin" ? "Cmd+C" : "Ctrl+C")
   expect(keybindings.getHint("app.tools.expand")).toBe("Ctrl+O")
-  expect(keybindings.getHint("app.plan.toggle")).toBe("Alt+P")
+  expect(keybindings.getHint("app.plan.toggle")).toBe("Ctrl+P")
+  expect(keybindings.getHint("app.workspace.prefix")).toBe("Ctrl+W")
   expect(keybindings.getHint("app.editor.external")).toBe("Ctrl+G")
   expect(keybindings.getHint("app.editor.undo")).toBe("Ctrl+Z")
   expect(keybindings.getHint("app.message.interruptAndSend")).toBe("Ctrl+Enter")
@@ -164,7 +184,7 @@ function context(pickerOpen = false) {
 
 function key(
   name: string,
-  modifiers: Partial<Pick<InteractiveKeyEvent, "ctrl" | "meta" | "shift" | "super" | "hyper">> = {}
+  modifiers: Partial<Pick<InteractiveKeyEvent, "ctrl" | "meta" | "option" | "shift" | "super" | "hyper">> = {}
 ): InteractiveKeyEvent {
-  return { name, ctrl: false, meta: false, shift: false, super: false, hyper: false, ...modifiers }
+  return { name, ctrl: false, meta: false, option: false, shift: false, super: false, hyper: false, ...modifiers }
 }

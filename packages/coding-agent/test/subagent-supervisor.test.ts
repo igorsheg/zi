@@ -70,14 +70,41 @@ test("SubagentSupervisor spawns, durably publishes completion, waits, and closes
     })
     expect(harness.supervisor.snapshots()[0]).toMatchObject({ completionDelivery: "delivered" })
     expect(harness.supervisor.status()).toEqual({ workingNames: [], readyNames: [] })
+    expect(harness.supervisor.transcript(name)?.messages.map(message => message.role)).toEqual(["user", "assistant"])
 
     await harness.supervisor.close(name)
     expect(harness.supervisor.snapshots()[0]).toMatchObject({ name, lifecycle: "exited", workCycle: 1 })
+    expect(harness.supervisor.transcript(name)?.messages.at(-1)).toMatchObject({ role: "assistant" })
     expect(harness.sessionManager.subagentEntries().at(-1)).toMatchObject({ event: "exited", name })
   } finally {
     await harness.dispose()
   }
 }, 15_000)
+
+test("exited transcript retention drops older payloads without losing child records", async () => {
+  const harness = await createHarness("exited-transcript-bound", { reply: "bounded", delayMs: 20 })
+  const names: string[] = []
+  try {
+    for (let index = 0; index < 3; index++) {
+      // oxlint-disable-next-line no-await-in-loop -- each close must release the live-child slot.
+      const name = await harness.supervisor.spawn(`bounded-${index}`, "__large_messages__")
+      names.push(name)
+      // oxlint-disable-next-line no-await-in-loop -- each close must release the live-child slot.
+      await waitFor(() => harness.supervisor.transcript(name)?.omittedBytes !== 0, 10_000)
+      // oxlint-disable-next-line no-await-in-loop -- retention is admitted in close order.
+      await harness.supervisor.close(name)
+    }
+
+    expect(harness.supervisor.transcript(names[0]!)).toBeUndefined()
+    expect(harness.supervisor.transcript(names.at(-1)!)).toBeDefined()
+    for (const name of names) {
+      expect(harness.supervisor.snapshots()).toContainEqual(expect.objectContaining({ name, lifecycle: "exited" }))
+      expect(harness.supervisor.sessionEvents(name)).toBeDefined()
+    }
+  } finally {
+    await harness.dispose()
+  }
+}, 45_000)
 
 test("durable completions can be delivered to parent context exactly once", async () => {
   const harness = await createHarness("context-delivery", { reply: "context-ok", delayMs: 20 })
@@ -1004,6 +1031,7 @@ test("SubagentSupervisor recovers journal evidence without recreating a process"
   try {
     expect(supervisor.runningCount()).toBe(0)
     expect(supervisor.snapshots()).toEqual([expect.objectContaining({ name: "orphaned-worker", lifecycle: "exited" })])
+    expect(supervisor.transcript("orphaned-worker")).toBeUndefined()
     expect(sessionManager.subagentEntries().map(entry => entry.event)).toEqual(["starting", "lost"])
     expect(sessionManager.subagentEntries().at(-1)).toMatchObject({
       event: "lost",

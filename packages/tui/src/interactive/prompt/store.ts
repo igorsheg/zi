@@ -71,7 +71,7 @@ export interface PromptStore {
   submit(text: string, delivery: PromptSubmissionIntent): boolean
   draftChanged(text: string, input: FileCompletionInput): void
   cursorChanged(text: string, input: FileCompletionInput): void
-  completePicker(text: string, input: FileCompletionInput): boolean
+  handlePickerTab(text: string, input: FileCompletionInput): boolean
   activatePicker(text: string, input: FileCompletionInput): boolean
   movePicker(filter: string, direction: -1 | 1): void
   backPicker(): boolean
@@ -139,11 +139,11 @@ export interface PromptSessionActions {
   cancelReplacement(): SessionReplacementCancellation
 }
 
-export interface PromptModalActions {
-  openSubagentActivity(name: string): boolean
+export interface PromptSubagentActions {
+  openTranscript(name: string): boolean
 }
 
-const unavailableModals: PromptModalActions = { openSubagentActivity: () => false }
+const unavailableSubagentActions: PromptSubagentActions = { openTranscript: () => false }
 
 export function createPromptStore(
   interactive: InteractiveStore,
@@ -152,9 +152,9 @@ export function createPromptStore(
   clipboard: ClipboardReader = unavailableClipboard,
   notices: BuiltInNoticeActions = unavailableNotices,
   messageCopy: PromptMessageCopy = unavailableMessageCopy,
-  modals: PromptModalActions = unavailableModals
+  subagentActions: PromptSubagentActions = unavailableSubagentActions
 ): PromptStore {
-  return new PromptController(interactive, slash, sessionActions, clipboard, notices, messageCopy, modals)
+  return new PromptController(interactive, slash, sessionActions, clipboard, notices, messageCopy, subagentActions)
 }
 
 class PromptController implements PromptStore {
@@ -167,7 +167,7 @@ class PromptController implements PromptStore {
   readonly #clipboard: ClipboardReader
   readonly #notices: BuiltInNoticeActions
   readonly #messageCopy: PromptMessageCopy
-  readonly #modals: PromptModalActions
+  readonly #subagentActions: PromptSubagentActions
   readonly #fileCompletion: FileCompletionController
   #clipboardRead: ClipboardReadState = { type: "idle" }
   #modelRefresh: ModelRefreshState = { type: "idle" }
@@ -186,7 +186,7 @@ class PromptController implements PromptStore {
     clipboard: ClipboardReader,
     notices: BuiltInNoticeActions,
     messageCopy: PromptMessageCopy,
-    modals: PromptModalActions
+    subagentActions: PromptSubagentActions
   ) {
     this.#interactive = interactive
     this.#slash = slash
@@ -194,7 +194,7 @@ class PromptController implements PromptStore {
     this.#clipboard = clipboard
     this.#notices = notices
     this.#messageCopy = messageCopy
-    this.#modals = modals
+    this.#subagentActions = subagentActions
     this.#fileCompletion = new FileCompletionController(this.picker, edit => this.#requestRange(edit))
   }
 
@@ -244,9 +244,13 @@ class PromptController implements PromptStore {
     this.#completionContextChanged(text, input, false)
   }
 
-  completePicker(text: string, input: FileCompletionInput): boolean {
+  handlePickerTab(text: string, input: FileCompletionInput): boolean {
     const presentation = this.picker.presentation(text)
-    if (!presentation?.selectedId || presentation.frame.disabled) return false
+    if (!presentation || presentation.frame.disabled) return false
+    if (presentation.workflow?.type === "choosing_subagent") {
+      return this.#toggleSubagentScope(presentation.workflow)
+    }
+    if (!presentation.selectedId) return false
     if (presentation.frame.id === promptPickerFrameIds.files) {
       return this.#fileCompletion.complete(presentation.selectedId, input)
     }
@@ -794,6 +798,17 @@ class PromptController implements PromptStore {
     return true
   }
 
+  #toggleSubagentScope(workflow: Extract<PromptWorkflow, { type: "choosing_subagent" }>): boolean {
+    if (!this.#accepts(workflow.operationId, workflow.session)) return false
+    const next: Extract<PromptWorkflow, { type: "choosing_subagent" }> = {
+      ...workflow,
+      scope: workflow.scope === "running" ? "all" : "running"
+    }
+    this.picker.replaceTopRetainingQuery(subagentFrame(next.snapshots, next.scope), next)
+    this.$state.set({ ...this.$state.get(), workflow: next })
+    return true
+  }
+
   #activateSubagent(
     workflow: Extract<PromptWorkflow, { type: "choosing_subagent" }>,
     presentation: PickerPresentation
@@ -805,7 +820,7 @@ class PromptController implements PromptStore {
     this.picker.close()
     this.$state.set({ ...this.$state.get(), workflow: { type: "idle" } })
     this.#requestInput("")
-    if (!this.#modals.openSubagentActivity(snapshot.name)) {
+    if (!this.#subagentActions.openTranscript(snapshot.name)) {
       this.#notices.promptWarning(`Subagent ${snapshot.name} is no longer available`)
       return false
     }
@@ -1040,8 +1055,8 @@ class PromptController implements PromptStore {
     const operationId = ++this.#nextOperationId
     const snapshots = session.subagentSnapshots()
     this.#admitChoosing(
-      subagentFrame(snapshots),
-      { type: "choosing_subagent", operationId, session, snapshots },
+      subagentFrame(snapshots, "running"),
+      { type: "choosing_subagent", operationId, session, snapshots, scope: "running" },
       parentFilter
     )
     this.#requestInput("")
