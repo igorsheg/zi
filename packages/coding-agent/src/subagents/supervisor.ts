@@ -2,6 +2,11 @@ import { isAbsolute } from "node:path"
 
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core"
 
+import {
+  projectSessionOutcomes,
+  subagentWorkCycleOperationId,
+  type OperationOutcomeEntryInput
+} from "../operation-outcomes.js"
 import type { ProcessTreeTracker } from "../processes/process-tree.js"
 import type { SessionEntry, SessionManager, SubagentEntry, SubagentEntryInput } from "../session-manager.js"
 import type { ToolSurface } from "../tool-surface.js"
@@ -92,6 +97,7 @@ interface WaitTarget {
 }
 
 export interface SubagentSpawnSelection {
+  readonly profile?: string
   readonly model?: string
   readonly thinkingLevel?: ThinkingLevel
   readonly listedTask?: string
@@ -123,6 +129,7 @@ export class SubagentSupervisor {
   readonly #toolSurface: ToolSurface
   readonly #listeners = new Set<(event: SubagentSupervisorEvent) => void>()
   readonly #names = new Set<string>()
+  readonly #profiles = new Map<string, string>()
   readonly #live = new Map<string, LiveRecord>()
   readonly #exited: ExitedRecord[] = []
   readonly #ledger: CompletionLedger
@@ -139,7 +146,13 @@ export class SubagentSupervisor {
     this.#env = validateEnvironment(options.env)
     this.#selection = options.selection
     this.#sessionManager = options.sessionManager
-    this.#ledger = CompletionLedger.restore(this.#sessionManager.subagentEntries(), maxMailboxCompletions)
+    const outcomes = projectSessionOutcomes(this.#sessionManager.entries()).filter(
+      outcome => outcome.capability === "subagent"
+    )
+    this.#ledger = CompletionLedger.restore(outcomes, this.#sessionManager.subagentEntries(), maxMailboxCompletions)
+    for (const outcome of outcomes) {
+      if (outcome.profile) this.#profiles.set(outcome.name, outcome.profile)
+    }
     this.#processTreeTracker = options.processTreeTracker
     this.#toolSurface = options.toolSurface ?? "direct-and-code"
     this.waitTimeoutMs = options.waitTimeoutMs ?? defaultWaitTimeoutMs
@@ -258,6 +271,7 @@ export class SubagentSupervisor {
       throw cause
     }
     this.#names.add(name)
+    if (requestedSelection.profile) this.#profiles.set(name, requestedSelection.profile)
 
     const command = [
       ...this.#command,
@@ -657,11 +671,7 @@ export class SubagentSupervisor {
   }
 
   #completion(completion: SubagentCompletion): void {
-    const retained = Object.freeze({
-      ...completion,
-      ...(completion.reason !== undefined ? { reason: clipUtf8(completion.reason, durablePreviewBytes).text } : {}),
-      ...(completion.error !== undefined ? { error: clipUtf8(completion.error, durablePreviewBytes).text } : {})
-    })
+    const retained = retainCompletion(completion)
     if (this.#ledger.admit(retained) !== "accepted") return
     this.#pumpMailbox()
   }
@@ -674,19 +684,9 @@ export class SubagentSupervisor {
       const completion = pending.completion
       const preview = clipUtf8(completion.text, durablePreviewBytes)
       try {
-        const entry = this.#sessionManager.appendSubagent({
-          event: "work_cycle_finished",
-          name: completion.name,
-          workCycle: completion.workCycle,
-          status: completion.status,
-          preview: preview.text,
-          originalBytes: completion.originalBytes,
-          omittedBytes: completion.omittedBytes + preview.omittedBytes,
-          truncated: completion.truncated || preview.omittedBytes > 0,
-          durationMs: completion.durationMs,
-          ...(completion.reason ? { reason: completion.reason } : {}),
-          ...(completion.error ? { error: completion.error } : {})
-        })
+        const entry = this.#sessionManager.appendOperationOutcome(
+          subagentOutcome(completion, this.#profiles.get(completion.name), preview)
+        )
         this.#ledger.commitPersistence(completion.name, completion.workCycle, entry.id)
         changed.add(completion.name)
         this.#emit({ type: "entry_appended", entry })
@@ -751,10 +751,10 @@ export class SubagentSupervisor {
       const failure =
         state.type === "exited" && state.outcome.type !== "closed"
           ? {
-              reason: state.outcome.type === "killed" ? "child_killed" : "child_failed",
+              reason: state.outcome.type === "killed" ? ("child_killed" as const) : ("child_failed" as const),
               error: clipUtf8(state.outcome.message, durablePreviewBytes).text
             }
-          : { reason: "child_exited" }
+          : { reason: "child_exited" as const }
       this.#completion({
         name,
         workCycle: record.lastWorkCycle,
@@ -1162,6 +1162,44 @@ function validateEnvironment(
     }
   }
   return Object.freeze(Object.fromEntries(entries))
+}
+
+function retainCompletion(completion: SubagentCompletion): SubagentCompletion {
+  if (completion.status !== "failed") return Object.freeze({ ...completion })
+  return Object.freeze({
+    ...completion,
+    ...(completion.error ? { error: clipUtf8(completion.error, durablePreviewBytes).text } : {})
+  })
+}
+
+function subagentOutcome(
+  completion: SubagentCompletion,
+  profile: string | undefined,
+  preview: ReturnType<typeof clipUtf8>
+): OperationOutcomeEntryInput {
+  const common = {
+    capability: "subagent" as const,
+    operation: "work_cycle" as const,
+    operationId: subagentWorkCycleOperationId(completion.name, completion.workCycle),
+    name: completion.name,
+    workCycle: completion.workCycle,
+    ...(profile ? { profile } : {}),
+    preview: preview.text,
+    originalBytes: completion.originalBytes,
+    omittedBytes: completion.omittedBytes + preview.omittedBytes,
+    truncated: completion.truncated || preview.omittedBytes > 0,
+    durationMs: completion.durationMs
+  }
+  if (completion.status === "failed") {
+    if (completion.reason === "legacy_failure") throw new Error("Cannot append a projected legacy outcome")
+    return {
+      ...common,
+      result: "failed",
+      errorCode: completion.reason,
+      ...(completion.error ? { errorMessage: completion.error } : {})
+    }
+  }
+  return { ...common, result: completion.status === "completed" ? "succeeded" : "cancelled" }
 }
 
 function deferredVoid(): { readonly promise: Promise<void>; resolve(): void } {

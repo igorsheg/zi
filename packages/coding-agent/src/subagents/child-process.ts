@@ -10,6 +10,7 @@ import { Readable, Writable } from "node:stream"
 
 import { isAgentMessage, isRecord } from "../guards.js"
 import type { AgentMessage } from "../messages.js"
+import type { SubagentWorkCycleErrorCode } from "../operation-outcomes.js"
 import type { ProcessScope, ProcessTreeTracker } from "../processes/process-tree.js"
 import {
   decodePeerRequestFrame,
@@ -62,18 +63,22 @@ export type ChildExitOutcome =
 
 export type SubagentCompletionStatus = "completed" | "failed" | "cancelled"
 
-export type SubagentCompletion = {
+interface SubagentCompletionBase {
   readonly name: string
   readonly workCycle: number
-  readonly status: SubagentCompletionStatus
   readonly text: string
   readonly originalBytes: number
   readonly omittedBytes: number
   readonly truncated: boolean
   readonly durationMs: number
-  readonly reason?: string | undefined
-  readonly error?: string | undefined
 }
+
+export type SubagentCompletion = SubagentCompletionBase &
+  (
+    | { readonly status: "completed"; readonly reason?: never; readonly error?: never }
+    | { readonly status: "cancelled"; readonly reason?: never; readonly error?: never }
+    | { readonly status: "failed"; readonly reason: SubagentWorkCycleErrorCode; readonly error?: string | undefined }
+  )
 
 export type ChildSnapshot = {
   readonly name: string
@@ -733,9 +738,15 @@ export class ChildZiProcess {
     const timedOut = terminal.type === "interrupting" && terminal.reason === "work_timeout"
     const completion = timedOut
       ? {
-          ...observed.completion,
+          name: observed.completion.name,
+          workCycle: observed.completion.workCycle,
           status: "failed" as const,
-          reason: "work_cycle_timeout",
+          text: observed.completion.text,
+          originalBytes: observed.completion.originalBytes,
+          omittedBytes: observed.completion.omittedBytes,
+          truncated: observed.completion.truncated,
+          durationMs: observed.completion.durationMs,
+          reason: "work_cycle_timeout" as const,
           error: `Subagent work cycle exceeded ${this.#workTimeoutMs}ms`
         }
       : observed.completion
@@ -819,7 +830,7 @@ export class ChildZiProcess {
     this.#publishCompletion(completion)
   }
 
-  #publishInterruptSettlementFailure(workCycle: number, error: Error, reason: string): void {
+  #publishInterruptSettlementFailure(workCycle: number, error: Error, reason: SubagentWorkCycleErrorCode): void {
     if (this.#latestCompletion?.workCycle === workCycle) return
     this.#clearInterruptDeadline(workCycle)
     this.#publishCompletion({
@@ -1162,7 +1173,7 @@ export class ChildZiProcess {
         this.#publishInterruptSettlementFailure(
           state.workCycle,
           new Error(`Subagent ${this.name} interruption settlement failed: ${error.message}`, { cause: error }),
-          "interrupt_settlement_failed"
+          "child_failed"
         )
       }
     }
@@ -1406,22 +1417,39 @@ function baseCompletion(
   name: string,
   workCycle: number,
   durationMs: number,
+  status: "completed" | "cancelled",
+  text: string
+): Extract<SubagentCompletion, { readonly status: "completed" | "cancelled" }>
+function baseCompletion(
+  name: string,
+  workCycle: number,
+  durationMs: number,
+  status: "failed",
+  text: string,
+  reason: SubagentWorkCycleErrorCode
+): Extract<SubagentCompletion, { readonly status: "failed" }>
+function baseCompletion(
+  name: string,
+  workCycle: number,
+  durationMs: number,
   status: SubagentCompletionStatus,
   text: string,
-  reason?: string
+  reason?: SubagentWorkCycleErrorCode
 ): SubagentCompletion {
-  const originalBytes = Buffer.byteLength(text)
-  return {
+  const common = {
     name,
     workCycle,
-    status,
     text,
-    originalBytes,
+    originalBytes: Buffer.byteLength(text),
     omittedBytes: 0,
     truncated: false,
-    durationMs,
-    ...(reason ? { reason } : {})
+    durationMs
   }
+  if (status === "failed") {
+    if (!reason) throw new Error("Failed subagent completion requires an error code")
+    return { ...common, status, reason }
+  }
+  return { ...common, status }
 }
 
 export function clipUtf8(

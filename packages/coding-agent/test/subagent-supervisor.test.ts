@@ -9,6 +9,7 @@ import type { AgentTool } from "@earendil-works/pi-agent-core"
 import { Type } from "@earendil-works/pi-ai"
 
 import { CodeMode, isCodeModeDetails } from "../src/code-mode/code-mode.js"
+import { projectSessionOutcomes } from "../src/operation-outcomes.js"
 import { ZiPaths } from "../src/paths.js"
 import { createProcessTreeTracker } from "../src/processes/process-tree.js"
 import { SessionManager } from "../src/session-manager.js"
@@ -46,11 +47,12 @@ test("SubagentSupervisor spawns, durably publishes completion, waits, and closes
 
     await waitFor(() => harness.supervisor.status().readyNames.length > 0, 5_000)
     expect(harness.supervisor.status()).toEqual({ workingNames: [], readyNames: [name] })
-    expect(harness.sessionManager.subagentEntries().at(-1)).toMatchObject({
-      event: "work_cycle_finished",
+    expect(projectSessionOutcomes(harness.sessionManager.entries()).at(-1)).toMatchObject({
+      capability: "subagent",
+      operation: "work_cycle",
       name,
       workCycle: 1,
-      status: "completed",
+      result: "succeeded",
       preview: "supervisor-ok"
     })
 
@@ -176,11 +178,11 @@ test("wait holds until every requested subagent has completed", async () => {
 
 test("extension wait keeps its current-cycle barrier when older completion persistence is pending", async () => {
   const harness = await createHarness("extension-wait-pending", { reply: "cycle-ok", delayMs: 100 })
-  const append = harness.sessionManager.appendSubagent.bind(harness.sessionManager)
-  Object.defineProperty(harness.sessionManager, "appendSubagent", {
+  const append = harness.sessionManager.appendOperationOutcome.bind(harness.sessionManager)
+  Object.defineProperty(harness.sessionManager, "appendOperationOutcome", {
     configurable: true,
-    value(data: Parameters<SessionManager["appendSubagent"]>[0]) {
-      if (data.event === "work_cycle_finished" && data.workCycle === 1) throw new Error("journal unavailable")
+    value(data: Parameters<SessionManager["appendOperationOutcome"]>[0]) {
+      if (data.capability === "subagent" && data.workCycle === 1) throw new Error("journal unavailable")
       return append(data)
     }
   })
@@ -208,7 +210,7 @@ test("extension wait keeps its current-cycle barrier when older completion persi
       })
     ])
   } finally {
-    Object.defineProperty(harness.sessionManager, "appendSubagent", { configurable: true, value: append })
+    Object.defineProperty(harness.sessionManager, "appendOperationOutcome", { configurable: true, value: append })
     await harness.dispose()
   }
 }, 15_000)
@@ -378,14 +380,8 @@ test("shutdown after initial cycle admission publishes terminal evidence", async
     expect(await outcome).toBe("rejected")
     expect(shutdown).toBeDefined()
     await shutdown
-    expect(harness.sessionManager.subagentEntries()).toContainEqual(
-      expect.objectContaining({
-        event: "work_cycle_finished",
-        name: "cycle-worker",
-        workCycle: 1,
-        status: "failed",
-        reason: "child_exited"
-      })
+    expect(projectSessionOutcomes(harness.sessionManager.entries())).toContainEqual(
+      expect.objectContaining({ name: "cycle-worker", workCycle: 1, result: "failed", errorCode: "child_exited" })
     )
     expect(harness.supervisor.snapshots()[0]).toMatchObject({
       name: "cycle-worker",
@@ -631,14 +627,8 @@ test("shutdown after work-cycle admission publishes terminal evidence", async ()
     await shutdown
     unsubscribe()
 
-    expect(harness.sessionManager.subagentEntries()).toContainEqual(
-      expect.objectContaining({
-        event: "work_cycle_finished",
-        name,
-        workCycle: 2,
-        status: "failed",
-        reason: "child_exited"
-      })
+    expect(projectSessionOutcomes(harness.sessionManager.entries())).toContainEqual(
+      expect.objectContaining({ name, workCycle: 2, result: "failed", errorCode: "child_exited" })
     )
     expect(harness.supervisor.snapshots()[0]).toMatchObject({
       name,
@@ -704,8 +694,8 @@ test("completion durability commits before entry observers can claim it", async 
   const unsubscribe = harness.supervisor.subscribe(event => {
     if (
       event.type === "entry_appended" &&
-      event.entry.type === "subagent" &&
-      event.entry.event === "work_cycle_finished"
+      event.entry.type === "operation_outcome" &&
+      event.entry.capability === "subagent"
     ) {
       claimed ??= harness.supervisor.waitForTool(["cycle-worker"], 0, undefined, "entry-observer")
     }
@@ -804,10 +794,10 @@ test("provider failure metadata is bounded before durable completion admission",
     expect(snapshot?.completion).toMatchObject({ workCycle: 1, status: "failed", text: "failed-output" })
     expect(Buffer.byteLength(snapshot?.completion?.error ?? "")).toBe(durablePreviewBytes)
     expect(
-      harness.sessionManager
-        .subagentEntries()
-        .find(entry => entry.event === "work_cycle_finished" && entry.name === name)
-    ).toMatchObject({ error: "x".repeat(durablePreviewBytes) })
+      projectSessionOutcomes(harness.sessionManager.entries()).find(
+        outcome => outcome.capability === "subagent" && outcome.name === name
+      )
+    ).toMatchObject({ errorMessage: "x".repeat(durablePreviewBytes) })
   } finally {
     await harness.dispose()
   }
@@ -822,13 +812,10 @@ test("SubagentSupervisor publishes bounded actionable diagnostics when a child p
       lifecycle: "exited",
       completion: { status: "failed", reason: "child_failed", error: "Subagent RPC emitted invalid JSONL" }
     })
-    expect(
-      harness.sessionManager.subagentEntries().findLast(entry => entry.event === "work_cycle_finished")
-    ).toMatchObject({
-      event: "work_cycle_finished",
-      status: "failed",
-      reason: "child_failed",
-      error: "Subagent RPC emitted invalid JSONL"
+    expect(projectSessionOutcomes(harness.sessionManager.entries()).at(-1)).toMatchObject({
+      result: "failed",
+      errorCode: "child_failed",
+      errorMessage: "Subagent RPC emitted invalid JSONL"
     })
   } finally {
     await harness.dispose()
@@ -1337,10 +1324,10 @@ test("SubagentSupervisor durably reports work-cycle timeout and keeps the child 
       completion: { workCycle: 1, status: "failed", reason: "work_cycle_timeout" }
     })
     expect(
-      harness.sessionManager
-        .subagentEntries()
-        .find(entry => entry.event === "work_cycle_finished" && entry.name === name && entry.workCycle === 1)
-    ).toMatchObject({ status: "failed", reason: "work_cycle_timeout" })
+      projectSessionOutcomes(harness.sessionManager.entries()).find(
+        outcome => outcome.capability === "subagent" && outcome.name === name && outcome.workCycle === 1
+      )
+    ).toMatchObject({ result: "failed", errorCode: "work_cycle_timeout" })
     await harness.supervisor.wait([name], 0)
 
     await harness.supervisor.continue(name, "another bounded cycle")

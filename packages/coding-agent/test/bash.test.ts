@@ -4,6 +4,7 @@ import { mkdtemp, readFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
+import type { ShellBackgroundTaskOperationOutcomeInput } from "../src/operation-outcomes.js"
 import { defaultShellLimits, SessionShell, ShellRunAdmissionError, type ShellLimits } from "../src/session-shell.js"
 import { createBashTool, isBashToolDetails } from "../src/tools/bash.js"
 import { projectToolPresentation } from "../src/tools/presentation/project.js"
@@ -267,6 +268,124 @@ test("explicit background execution survives its tool signal and can be awaited"
     await shell.dispose()
     rmSync(cwd, { recursive: true, force: true })
   }
+})
+
+test("background task settlement emits one closed operation outcome", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "zi-bash-outcomes-"))
+  const shell = createShell(cwd)
+  const outcomes: ShellBackgroundTaskOperationOutcomeInput[] = []
+  shell.bindOperationOutcomeSink(outcome => outcomes.push(outcome))
+
+  try {
+    await shell.run("foreground", { command: "printf foreground", timeoutMs: 2_000, background: false })
+    expect(outcomes).toEqual([])
+
+    const started = await shell.run("background", {
+      command: "printf background; exit 7",
+      timeoutMs: 2_000,
+      background: true
+    })
+    if (started.type !== "backgrounded") throw new Error("Expected background task")
+    const completed = await shell.wait(started.task.taskId, 2_000)
+    expect(completed).toMatchObject({ type: "completed", outcome: { type: "exited", exitCode: 7 } })
+    expect(outcomes).toEqual([
+      expect.objectContaining({
+        capability: "shell",
+        operation: "background_task",
+        taskId: started.task.taskId,
+        origin: "requested",
+        result: "failed",
+        errorCode: "exit_nonzero",
+        exitCode: 7,
+        outputBytes: 10
+      })
+    ])
+    expect(JSON.stringify(outcomes)).not.toContain("printf background")
+
+    await shell.wait(started.task.taskId, 0)
+    await shell.kill(started.task.taskId)
+    expect(outcomes).toHaveLength(1)
+  } finally {
+    await shell.dispose()
+    rmSync(cwd, { recursive: true, force: true })
+  }
+})
+
+test("demotion and task control preserve one background operation identity", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "zi-bash-demoted-outcome-"))
+  const shell = createShell(cwd)
+  const outcomes: ShellBackgroundTaskOperationOutcomeInput[] = []
+  shell.bindOperationOutcomeSink(outcome => outcomes.push(outcome))
+  const started = deferred<void>()
+  const running = shell.run(
+    "demoted",
+    { command: `node -e "console.log('ready'); setInterval(() => {}, 1000)"`, timeoutMs: 2_000, background: false },
+    undefined,
+    task => {
+      if (task.output.text.includes("ready")) started.resolve()
+    }
+  )
+
+  try {
+    await started.promise
+    const demoted = shell.demoteForeground()
+    if (demoted.type !== "backgrounded") throw new Error("Expected demoted task")
+    await running
+    await shell.kill(demoted.task.taskId)
+    await shell.wait(demoted.task.taskId, 2_000)
+
+    expect(outcomes).toEqual([
+      expect.objectContaining({
+        taskId: demoted.task.taskId,
+        origin: "demoted",
+        result: "cancelled",
+        cancellationCode: "killed"
+      })
+    ])
+  } finally {
+    await shell.dispose()
+    rmSync(cwd, { recursive: true, force: true })
+  }
+})
+
+test("background timeout, output limit, and disposal retain distinct outcomes", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "zi-bash-terminal-outcomes-"))
+  const shell = createShell(cwd, { maxOutputFileBytes: 1_024 })
+  const outcomes: ShellBackgroundTaskOperationOutcomeInput[] = []
+  shell.bindOperationOutcomeSink(outcome => outcomes.push(outcome))
+
+  const timed = await shell.run("timed", {
+    command: `node -e "setInterval(() => {}, 1000)"`,
+    timeoutMs: 20,
+    background: true
+  })
+  if (timed.type !== "backgrounded") throw new Error("Expected timed background task")
+  await shell.wait(timed.task.taskId, 2_000)
+
+  const limited = await shell.run("limited", {
+    command: `node -e "process.stdout.write('x'.repeat(8192)); setInterval(() => {}, 1000)"`,
+    timeoutMs: 2_000,
+    background: true
+  })
+  if (limited.type !== "backgrounded") throw new Error("Expected limited background task")
+  await shell.wait(limited.task.taskId, 2_000)
+
+  const disposed = await shell.run("disposed", {
+    command: `node -e "setInterval(() => {}, 1000)"`,
+    timeoutMs: 2_000,
+    background: true
+  })
+  if (disposed.type !== "backgrounded") throw new Error("Expected disposable background task")
+  await shell.dispose()
+
+  expect(outcomes).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({ taskId: timed.task.taskId, result: "failed", errorCode: "timed_out" }),
+      expect.objectContaining({ taskId: limited.task.taskId, result: "failed", errorCode: "output_limit" }),
+      expect.objectContaining({ taskId: disposed.task.taskId, result: "cancelled", cancellationCode: "disposed" })
+    ])
+  )
+  rmSync(cwd, { recursive: true, force: true })
 })
 
 test("bash, task_output, and kill_task adapt one session task owner", async () => {

@@ -1,3 +1,4 @@
+import type { ProjectedSubagentWorkCycleOutcome } from "../operation-outcomes.js"
 import type { SubagentEntry } from "../session-manager.js"
 import type { SubagentCompletion } from "./child-process.js"
 
@@ -45,41 +46,47 @@ export class CompletionLedger {
     this.#maximum = maximum
   }
 
-  static restore(entries: Iterable<SubagentEntry>, maximum = maxCompletionLedgerEntries): CompletionLedger {
-    const replay = [...entries].filter(
-      (entry): entry is Extract<SubagentEntry, { event: "work_cycle_finished" | "work_cycle_delivered" }> =>
-        entry.event === "work_cycle_finished" || entry.event === "work_cycle_delivered"
-    )
+  static restore(
+    outcomes: Iterable<ProjectedSubagentWorkCycleOutcome>,
+    entries: Iterable<SubagentEntry>,
+    maximum = maxCompletionLedgerEntries
+  ): CompletionLedger {
     const delivered = new Set(
-      replay
+      [...entries]
         .filter(entry => entry.event === "work_cycle_delivered")
         .map(entry => completionKey(entry.name, entry.workCycle))
     )
     const ledger = new CompletionLedger(maximum)
-    const finished = new Set<string>()
-    for (const entry of replay) {
-      if (entry.event !== "work_cycle_finished") continue
-      const key = completionKey(entry.name, entry.workCycle)
-      if (finished.has(key)) continue
-      finished.add(key)
+    const restored = new Set<string>()
+    for (const outcome of outcomes) {
+      const key = completionKey(outcome.name, outcome.workCycle)
+      if (restored.has(key)) continue
+      restored.add(key)
       ledger.#makeSpace(`Session contains more than ${maximum} undelivered subagent completions`)
-      const completion: SubagentCompletion = Object.freeze({
-        name: entry.name,
-        workCycle: entry.workCycle,
-        status: entry.status,
-        text: entry.preview,
-        originalBytes: entry.originalBytes,
-        omittedBytes: entry.omittedBytes,
-        truncated: entry.truncated,
-        durationMs: entry.durationMs,
-        ...(entry.reason ? { reason: entry.reason } : {}),
-        ...(entry.error ? { error: entry.error } : {})
-      })
+      const common = {
+        name: outcome.name,
+        workCycle: outcome.workCycle,
+        text: outcome.preview,
+        originalBytes: outcome.originalBytes,
+        omittedBytes: outcome.omittedBytes,
+        truncated: outcome.truncated,
+        durationMs: outcome.durationMs
+      }
+      const completion: SubagentCompletion = Object.freeze(
+        outcome.result === "failed"
+          ? {
+              ...common,
+              status: "failed",
+              reason: outcome.errorCode,
+              ...(outcome.errorMessage ? { error: outcome.errorMessage } : {})
+            }
+          : { ...common, status: outcome.result === "succeeded" ? "completed" : "cancelled" }
+      )
       ledger.#states.set(
         key,
         delivered.has(key)
-          ? { type: "delivered_durable", completion, entryId: entry.id }
-          : { type: "durable", completion, entryId: entry.id }
+          ? { type: "delivered_durable", completion, entryId: outcome.sourceEntryId }
+          : { type: "durable", completion, entryId: outcome.sourceEntryId }
       )
     }
     ledger.assertInvariants()

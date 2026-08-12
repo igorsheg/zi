@@ -2,6 +2,7 @@ import { closeSync, writeSync } from "node:fs"
 import { createRequire } from "node:module"
 import { isAbsolute, join, resolve as resolvePath } from "node:path"
 import { pathToFileURL } from "node:url"
+import { inspect } from "node:util"
 import { isMainThread, parentPort, Worker, workerData } from "node:worker_threads"
 
 import { normalizeCode } from "./normalize.js"
@@ -31,6 +32,16 @@ const realmStackMb = 8
 const maxRealmRetainedBytes = 160 * 1024 * 1024
 const maxRealmRssBytes = 256 * 1024 * 1024
 const maxImportSpecifierBytes = 4_096
+const consoleInspectOptions = Object.freeze({
+  breakLength: Infinity,
+  colors: false,
+  compact: true,
+  customInspect: false,
+  depth: 6,
+  getters: false,
+  maxArrayLength: 100,
+  maxStringLength: 4_096
+})
 
 class RealmResetError extends Error {}
 
@@ -235,9 +246,9 @@ class CellExecution {
   async run(): Promise<void> {
     const zi = this.#createZi()
     const cellConsole = Object.freeze({
-      log: (...values: unknown[]) => this.#log(values.map(String).join(" ")),
-      warn: (...values: unknown[]) => this.#log(`[warn] ${values.map(String).join(" ")}`),
-      error: (...values: unknown[]) => this.#log(`[error] ${values.map(String).join(" ")}`)
+      log: (...values: unknown[]) => this.#log(formatConsoleArguments(values)),
+      warn: (...values: unknown[]) => this.#log(`[warn] ${formatConsoleArguments(values)}`),
+      error: (...values: unknown[]) => this.#log(`[error] ${formatConsoleArguments(values)}`)
     })
     try {
       // Full-authority generated cells intentionally use the host runtime's compiler.
@@ -356,6 +367,21 @@ class CellExecution {
     this.#pending.clear()
     this.#send(message)
   }
+}
+
+function formatConsoleArguments(values: readonly unknown[]): string {
+  return values.map(formatConsoleValue).join(" ")
+}
+
+function formatConsoleValue(value: unknown): string {
+  if (typeof value === "string") return value
+  if (value instanceof Error) {
+    const stack = Object.getOwnPropertyDescriptor(value, "stack")
+    if (typeof stack?.value === "string") return stack.value
+    const message = Object.getOwnPropertyDescriptor(value, "message")
+    return typeof message?.value === "string" ? `Error: ${message.value}` : "Error"
+  }
+  return inspect(value, consoleInspectOptions)
 }
 
 function createProjectApi(cwd: string): Readonly<{ import(specifier: string): Promise<unknown> }> {

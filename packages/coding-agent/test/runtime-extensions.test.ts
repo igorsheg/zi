@@ -1360,12 +1360,12 @@ test("subagent completion stays passive and joins the next parent model request"
     await runtime.session.prompt("Start the background investigation.")
     expect(faux.state.callCount).toBe(2)
 
-    await waitForCondition(
-      () => runtime.session.sessionManager.subagentEntries().some(entry => entry.event === "work_cycle_finished"),
-      5_000
-    )
+    await waitForCondition(() => runtime.session.sessionManager.operationOutcomeEntries().length > 0, 5_000)
     expect(faux.state.callCount).toBe(2)
     expect(runtime.session.messages.some(message => message.role === "custom")).toBe(false)
+    expect(runtime.session.sessionManager.operationOutcomeEntries()).toContainEqual(
+      expect.objectContaining({ capability: "subagent", profile: "pathfinder", name: "passive-worker" })
+    )
 
     await runtime.session.prompt("Use any completed investigation.")
     expect(faux.state.callCount).toBe(3)
@@ -1491,8 +1491,8 @@ test("restoration and compaction never redeliver durable child completion eviden
     await waitForCondition(
       () =>
         first.session.sessionManager
-          .subagentEntries()
-          .some(entry => entry.event === "work_cycle_finished" && entry.name === "restored-worker"),
+          .operationOutcomeEntries()
+          .some(entry => entry.capability === "subagent" && entry.name === "restored-worker"),
       5_000
     )
     const sessionFile = first.session.sessionManager.file!

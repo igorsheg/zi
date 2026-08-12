@@ -28,6 +28,14 @@ _Avoid_: Deleted history, compacted journal, TUI message cache
 A SHA-256-addressed raw image file owned by one format-2 session journal. Active messages hydrate the provider's base64 image value on demand; compacted cold history retains only its journal reference. Blob bytes and journal bytes share one session storage limit.
 _Avoid_: Attachment upload, global media cache, inline base64 journal
 
+**Operation outcome**:
+The bounded durable terminal record for one admitted session operation. It carries a deterministic operation identity, a common result, domain-owned stable error codes, safe evidence, and source chronology. Operation outcomes are model- and presentation-invisible; delivery messages and tool results may project the same result but are not additional outcomes. Optional runtime telemetry may correlate through the same operation identity but is not durable session state.
+_Avoid_: Error event, telemetry span, delivery receipt, generic log envelope
+
+**Operation outcome report**:
+The bounded read-only analysis projection of durable operation outcomes. Common result, duration, chronology, and capability facts remain separate from capability-owned evidence and comparisons; a new capability extends the closed outcome and report variants instead of adding optional universal fields.
+_Avoid_: Generic analytics envelope, telemetry index, copied session history
+
 **Session shell**:
 The session-scoped coding-agent owner of shell task identity, foreground/background transitions, subprocess groups, bounded output files and previews, completion, retention, and disposal. Its Bash and task tools are adapters over the same task state. Run interruption stops foreground work; demoted or explicitly backgrounded work survives until completion, explicit kill, timeout, output bounds, or final session disposal.
 _Avoid_: Global process manager, TUI task registry, detached Bash process
@@ -217,8 +225,8 @@ Bounded context sent from one subagent to a live sibling through their common pa
 _Avoid_: Subagent task, completion, direct process message, peer network event
 
 **Subagent completion**:
-The bounded result projected when admitted subagent work settles, including identity, status, final text, duration, and omission facts. It is not a copied child transcript.
-_Avoid_: Child stdout, event stream, transcript snapshot
+The bounded result projected when admitted subagent work settles, including identity, status, final text, duration, and omission facts. Its subagent work-cycle operation outcome is the canonical durable evidence; hidden context and orchestration tool results are delivery projections, not additional completions. It is not a copied child transcript.
+_Avoid_: Child stdout, event stream, transcript snapshot, delivery message
 
 **CLI invocation**:
 One immutable startup intent resolved before runtime construction from arguments, supported Zi environment defaults, and captured process facts. Arguments outrank environment defaults; cwd and session selection remain explicit invocation operations rather than ambient configuration.

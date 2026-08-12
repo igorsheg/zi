@@ -33,7 +33,7 @@ The runtime APIs are available as cell globals.
 - `scratch` holds arbitrary volatile JavaScript values, including maps, functions, and imported modules.
 - `state` is bounded JSON owned by the host.
 - `project.import(specifier)` resolves packages and project files from the session working directory. Native dynamic import remains available.
-- `console.log`, `console.warn`, and `console.error` are retained as bounded cell logs.
+- `console.log`, `console.warn`, and `console.error` use bounded Node-style value inspection. Logs are returned with both successful and failed cell results.
 
 Every `zi` call must be awaited before the cell returns. Calls are serialized by Zi, even when the cell creates them concurrently. `Promise.all` does not add tool concurrency; use `Promise.allSettled` only when independent failures should remain available to the cell.
 

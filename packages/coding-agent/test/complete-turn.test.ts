@@ -198,6 +198,64 @@ test("code runs through the normal turn lifecycle with durable nested evidence",
   }
 })
 
+test("background shell settlement appends one durable operation outcome", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-background-outcome-turn-"))
+  const models = createModels()
+  const faux = fauxProvider({ tokensPerSecond: 10_000 })
+  models.setProvider(faux.provider)
+  faux.setResponses([
+    fauxAssistantMessage(
+      fauxToolCall(
+        "bash",
+        { command: `node -e "setTimeout(() => console.log('private output'), 30)"`, background: true },
+        { id: "background-1" }
+      ),
+      { stopReason: "toolUse" }
+    ),
+    fauxAssistantMessage("Background work admitted.")
+  ])
+  const { session } = await createAgentRuntime({
+    cwd: root,
+    model: "faux/faux-1",
+    models,
+    session: { type: "new", persist: true }
+  })
+  const appended: string[] = []
+  let resolveOutcome!: () => void
+  const outcomeAppended = new Promise<void>(resolve => {
+    resolveOutcome = resolve
+  })
+  session.subscribe(event => {
+    if (event.type !== "entry_appended" || event.entry.type !== "operation_outcome") return
+    appended.push(event.entry.id)
+    resolveOutcome()
+  })
+
+  try {
+    await session.prompt("Start background work.")
+    await Promise.race([
+      outcomeAppended,
+      Bun.sleep(2_000).then(() => {
+        throw new Error("Background outcome did not persist")
+      })
+    ])
+    const [outcome] = session.sessionManager.operationOutcomeEntries()
+    expect(outcome).toMatchObject({
+      capability: "shell",
+      operation: "background_task",
+      origin: "requested",
+      result: "succeeded",
+      exitCode: 0
+    })
+    expect(outcome).toBeDefined()
+    expect(appended).toEqual([outcome!.id])
+    expect(JSON.stringify(outcome)).not.toContain("private output")
+    expect(JSON.stringify(outcome)).not.toContain("node -e")
+  } finally {
+    session.dispose()
+  }
+})
+
 test("one turn can write, read, edit, execute, stream, and persist", async () => {
   const root = await mkdtemp(join(tmpdir(), "zi-turn-"))
   const sessions = join(root, "sessions")

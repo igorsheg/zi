@@ -8,7 +8,7 @@ import type { AgentTool } from "@earendil-works/pi-agent-core"
 import { Type } from "@earendil-works/pi-ai"
 
 import { CodeMode, isCodeModeDetails } from "../src/code-mode/code-mode.js"
-import { maxCodeModeStateBytes } from "../src/code-mode/protocol.js"
+import { maxCodeModeLogBytes, maxCodeModeStateBytes } from "../src/code-mode/protocol.js"
 import type { CodeModeCapableTool } from "../src/code-mode/tool-contract.js"
 import { maxCodeModeTerminalDetailsBytes } from "../src/code-mode/trace.js"
 import { ZiPaths } from "../src/paths.js"
@@ -387,6 +387,97 @@ test("code cells have full ambient Node-compatible authority", async () => {
       text: '{\n  "process": "object",\n  "bun": "object",\n  "require": "undefined",\n  "fetch": "function",\n  "bridge": "undefined",\n  "imported": "function"\n}'
     }
   ])
+})
+
+test("code formats bounded console diagnostics for JavaScript values", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "zi-code-mode-console-"))
+  const tool = createCodeMode(cwd).createTool([])
+  const result = await tool.execute(
+    "console",
+    {
+      code: `async () => {
+  const circular = { answer: 42 };
+  circular.self = circular;
+  const guarded = {
+    get secret() { throw new Error("getter invoked"); },
+    [Symbol.for("nodejs.util.inspect.custom")]() { throw new Error("custom inspect invoked"); }
+  };
+  const guardedError = new Error("guarded");
+  Object.defineProperty(guardedError, "stack", {
+    get() { throw new Error("stack getter invoked"); }
+  });
+  console.log(
+    circular,
+    7n,
+    new Error("boom"),
+    guarded,
+    guardedError,
+    new Map([["a", 1]]),
+    new Set(["x", "y"]),
+    new Date("2020-01-02T03:04:05.000Z"),
+    /zi/gi,
+    { payload: "x".repeat(100_000) }
+  );
+  return "done";
+}`
+    },
+    undefined
+  )
+
+  expect(result.content[0]?.type).toBe("text")
+  if (result.content[0]?.type !== "text") throw new Error("Expected text diagnostics")
+  expect(result.content[0].text).toContain("answer: 42")
+  expect(result.content[0].text).toContain("[Circular")
+  expect(result.content[0].text).toContain("7n")
+  expect(result.content[0].text).toContain("Error: boom")
+  expect(result.content[0].text).toContain("secret: [Getter]")
+  expect(result.content[0].text).toContain("Error: guarded")
+  expect(result.content[0].text).toContain("Map(1) { 'a' => 1 }")
+  expect(result.content[0].text).toContain("Set(2) { 'x', 'y' }")
+  expect(result.content[0].text).toContain("2020-01-02T03:04:05.000Z")
+  expect(result.content[0].text).toContain("/zi/gi")
+  expect(result.content[0].text).toContain("Result:\ndone")
+  expect(Buffer.byteLength(result.content[0].text)).toBeLessThan(maxCodeModeLogBytes)
+})
+
+test("code preserves console diagnostics when cells and nested tools fail", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "zi-code-mode-failure-console-"))
+  const tool = createCodeMode(cwd).createTool([echoTool])
+
+  const cellFailure = await tool.execute(
+    "cell",
+    {
+      code: `async () => {
+  console.log({ phase: "cell" });
+  for (let index = 0; index < 4; index++) console.log("x".repeat(${maxCodeModeLogBytes}));
+  throw new Error("cell boom");
+}`
+    },
+    undefined
+  )
+  expect(cellFailure.content[0]).toEqual({
+    type: "text",
+    text: expect.stringContaining("Console output:\n{ phase: 'cell' }")
+  })
+  expect(cellFailure.content[0]).toEqual({
+    type: "text",
+    text: expect.stringContaining("\n\nError:\nCode cell failed: Error: cell boom")
+  })
+
+  const nestedFailure = await tool.execute(
+    "nested",
+    {
+      code: `async () => {
+  console.warn({ phase: "nested" });
+  await zi.echo({});
+}`
+    },
+    undefined
+  )
+  expect(nestedFailure.content[0]).toEqual({
+    type: "text",
+    text: expect.stringContaining("Console output:\n[warn] { phase: 'nested' }\n\nError:\nNested Zi tool echo failed:")
+  })
 })
 
 test("code keeps arbitrary scratch while committing JSON state only on success", async () => {

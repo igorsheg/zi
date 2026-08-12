@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test"
 
+import { subagentWorkCycleOperationId, type ProjectedSubagentWorkCycleOutcome } from "../src/operation-outcomes.js"
 import type { SubagentEntry } from "../src/session-manager.js"
 import type { SubagentCompletion } from "../src/subagents/child-process.js"
 import { CompletionLedger } from "../src/subagents/completion-ledger.js"
@@ -136,13 +137,18 @@ test("CompletionLedger replay preserves markers, first finished evidence, bounds
     finished("kept-c", 1, "result-c"),
     finished("evicted-worker", 1, "duplicate-result")
   ]
-  const ledger = CompletionLedger.restore(entries, 2)
+  const ledger = CompletionLedger.restore(
+    entries.filter((entry): entry is ProjectedSubagentWorkCycleOutcome => "operationId" in entry),
+    entries.filter((entry): entry is SubagentEntry => "event" in entry),
+    2
+  )
 
   expect(ledger.deliveries().map(delivery => delivery.completion.name)).toEqual(["kept-b", "kept-c"])
   expect(ledger.readyNames()).toEqual(["kept-b", "kept-c"])
 
   const duplicate = CompletionLedger.restore(
     [finished("duplicate-worker", 1, "first-result"), finished("duplicate-worker", 1, "later-result")],
+    [],
     2
   )
   expect(duplicate.delivery("duplicate-worker", 1)?.completion.text).toBe("first-result")
@@ -150,6 +156,7 @@ test("CompletionLedger replay preserves markers, first finished evidence, bounds
   expect(() =>
     CompletionLedger.restore(
       [finished("worker-a", 1, "a"), finished("worker-b", 1, "b"), finished("worker-c", 1, "c")],
+      [],
       2
     )
   ).toThrow("more than 2 undelivered subagent completions")
@@ -170,16 +177,17 @@ function completion(name: string, workCycle: number, text = `${name}-result`): S
 
 let entrySequence = 0
 
-function finished(name: string, workCycle: number, preview: string): SubagentEntry {
+function finished(name: string, workCycle: number, preview: string): ProjectedSubagentWorkCycleOutcome {
   return {
-    id: `entry-${++entrySequence}`,
-    parentId: null,
+    sourceEntryId: `entry-${++entrySequence}`,
     timestamp: "2026-08-09T00:00:00.000Z",
-    type: "subagent",
-    event: "work_cycle_finished",
+    type: "operation_outcome",
+    capability: "subagent",
+    operation: "work_cycle",
+    operationId: subagentWorkCycleOperationId(name, workCycle),
+    result: "succeeded",
     name,
     workCycle,
-    status: "completed",
     preview,
     originalBytes: Buffer.byteLength(preview),
     omittedBytes: 0,

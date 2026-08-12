@@ -685,7 +685,7 @@ function resultFailure(result: Extract<CodeExecutionResult, { type: "failed" }>)
     : ""
   const label = failureLabel(result.failure)
   return {
-    content: [{ type: "text", text: `${label}: ${error}${recovery}` }],
+    content: [{ type: "text", text: formatOutput("Error", `${label}: ${error}${recovery}`, result.logs) }],
     details: terminalDetails("error", result.calls, label),
     ...(result.terminate ? { terminate: true } : {})
   }
@@ -708,13 +708,9 @@ function failureLabel(failure: CodeExecutionFailure): string {
 
 function stateCommitFailure(result: CodeExecutionResult, cause: unknown): AgentToolResult<CodeModeDetails> {
   const causeText = boundedErrorText(errorMessage(cause))
+  const message = `Code cell completed, but program state was not committed: ${causeText}\nTool and ambient effects and scratch changes may already have occurred.`
   return {
-    content: [
-      {
-        type: "text",
-        text: `Code cell completed, but program state was not committed: ${causeText}\nTool and ambient effects and scratch changes may already have occurred.`
-      }
-    ],
+    content: [{ type: "text", text: formatOutput("Error", message, result.logs) }],
     details: terminalDetails("error", result.calls, "Could not commit program state"),
     ...(result.terminate ? { terminate: true } : {})
   }
@@ -774,7 +770,7 @@ function codeToolDescription(tools: readonly AgentTool[]): string {
 Each cell is an ordinary JavaScript async arrow function with full Node-compatible process authority. This is not a security sandbox.
 Every direct tool is also available as zi.<tool>(input) with the same input fields; use zi["tool-name"] for punctuation.
 Successful calls return the declared JSON-compatible JavaScript value directly; values are already decoded.
-Tool failures throw Error and may be handled with try/catch. Console logs are retained when execution completes, not streamed live.
+Tool failures throw Error and may be handled with try/catch. Console arguments use bounded Node-style inspection. Logs are retained in successful and failed cell results, not streamed live.
 Zi executes tool calls serially, including calls created with Promise.all; Promise.allSettled retains independent failures but does not add concurrency.
 scratch holds arbitrary volatile JavaScript and survives successful and ordinarily failed cells. It is cleared when the worker is replaced or the session resumes.
 state holds bounded JSON, commits only when a cell succeeds, and survives worker replacement, compaction, and session resume.
@@ -998,8 +994,18 @@ function formatResult(result: CodeModeJson | undefined, logs: readonly string[])
       : result === undefined
         ? "Code completed without a result."
         : JSON.stringify(result, null, 2)
-  const output = logs.length > 0 ? `Console output:\n${logs.join("\n")}\n\nResult:\n${text}` : text
-  return boundedScalars(output, maxResultScalars, false).text
+  return formatOutput("Result", text, logs)
+}
+
+function formatOutput(label: "Error" | "Result", text: string, logs: readonly string[]): string {
+  if (logs.length === 0) return boundedScalars(text, maxResultScalars, false).text
+  const frame = `Console output:\n\n\n${label}:\n`
+  const bodyBudget = maxResultScalars - boundedScalars(frame, maxResultScalars, false).scalars
+  const logText = logs.join("\n")
+  const reservedLogs = boundedScalars(logText, Math.floor(bodyBudget / 2), false)
+  const boundedBody = boundedScalars(text, bodyBudget - reservedLogs.scalars, false)
+  const boundedLogs = boundedScalars(logText, bodyBudget - boundedBody.scalars, false).text
+  return `Console output:\n${boundedLogs}\n\n${label}:\n${boundedBody.text}`
 }
 
 function boundedText(value: string): string {

@@ -20,6 +20,12 @@ import type { ImageContent, TextContent } from "@earendil-works/pi-ai"
 
 import { isNonNegativeInteger, isRecord } from "./guards.js"
 import { formatCompactionSummary, type AgentMessage, type CompactionSummaryMessage } from "./messages.js"
+import {
+  isOperationOutcomeEntry,
+  maxOperationOutcomeTextBytes,
+  type OperationOutcomeEntryData,
+  type OperationOutcomeEntryInput
+} from "./operation-outcomes.js"
 import { type ZiPaths, resolveZiPath } from "./paths.js"
 import { maxRetryCount } from "./retry.js"
 import {
@@ -163,6 +169,7 @@ export type SessionEntryData =
   | CustomMessageEntryData
   | WorkPlanEntryData
   | SubagentEntryData
+  | OperationOutcomeEntryData
 
 export type SessionEntry = SessionEntryBase & SessionEntryData
 export type MessageEntry = SessionEntryBase & Extract<SessionEntryData, { type: "message" }>
@@ -172,6 +179,7 @@ export type CustomEntry = SessionEntryBase & CustomEntryData
 export type CustomMessageEntry = SessionEntryBase & CustomMessageEntryData
 export type WorkPlanEntry = SessionEntryBase & WorkPlanEntryData
 export type SubagentEntry = SessionEntryBase & SubagentEntryData
+export type OperationOutcomeEntry = SessionEntryBase & OperationOutcomeEntryData
 
 export interface NewSessionOptions {
   sessionId?: string
@@ -199,7 +207,7 @@ export const maxCustomStateEntries = 2048
 export const maxCustomStateBytes = 2 * 1024 * 1024
 export const maxProgramStateEntries = 2048
 export const maxProgramStateBytes = 8 * 1024 * 1024
-export const maxSubagentJournalTextBytes = 8 * 1024
+export const maxSubagentJournalTextBytes = maxOperationOutcomeTextBytes
 
 const customTypePattern = /^[a-z][a-z0-9._:/-]*$/
 const programStateCustomType = "zi.programmatic-state.v1"
@@ -336,6 +344,7 @@ interface LoadedJournal {
   readonly imageBlobBytes: number
   readonly customEntries: CustomEntry[]
   readonly customStateBytes: number
+  readonly operationOutcomeIds: Set<string>
   readonly programStateEntries: number
   readonly programStateBytes: number
   readonly workPlan: WorkPlanEntry | undefined
@@ -373,6 +382,7 @@ export class SessionManager {
   readonly #customEntries: CustomEntry[] = []
   #coldMemory: readonly SessionColdBlock[] = []
   readonly #imageBlobs = new Map<string, number>()
+  readonly #operationOutcomeIds = new Set<string>()
   #promptHistoryBytes = 0
   #customStateBytes = 0
   #programStateEntries = 0
@@ -434,6 +444,7 @@ export class SessionManager {
     manager.#imageBlobBytes = loaded.imageBlobBytes
     manager.#customEntries.push(...loaded.customEntries)
     manager.#customStateBytes = loaded.customStateBytes
+    for (const id of loaded.operationOutcomeIds) manager.#operationOutcomeIds.add(id)
     manager.#programStateEntries = loaded.programStateEntries
     manager.#programStateBytes = loaded.programStateBytes
     manager.#workPlan = loaded.workPlan
@@ -599,6 +610,17 @@ export class SessionManager {
     return this.entries().filter((entry): entry is SubagentEntry => entry.type === "subagent")
   }
 
+  appendOperationOutcome(data: OperationOutcomeEntryInput): OperationOutcomeEntry {
+    if (this.#operationOutcomeIds.has(data.operationId)) {
+      throw new Error(`Operation outcome already exists: ${data.operationId}`)
+    }
+    return this.#append({ type: "operation_outcome", ...data })
+  }
+
+  operationOutcomeEntries(): readonly OperationOutcomeEntry[] {
+    return this.entries().filter((entry): entry is OperationOutcomeEntry => entry.type === "operation_outcome")
+  }
+
   /** Materializes the complete journal. Runtime policy should consume retainedEntries(). */
   entries(): readonly SessionEntry[] {
     if (this.#entryCount === this.#entries.length) return this.#entries
@@ -719,7 +741,7 @@ export class SessionManager {
   #append<Entry extends SessionEntryData>(entry: Entry): SessionEntryBase & Entry {
     const next = {
       ...entry,
-      id: crypto.randomUUID(),
+      id: entry.type === "operation_outcome" ? entry.operationId : crypto.randomUUID(),
       parentId: this.#leafId,
       timestamp: new Date().toISOString()
     } as SessionEntryBase & Entry
@@ -774,6 +796,7 @@ export class SessionManager {
       this.#programStateEntries++
       this.#programStateBytes += programStateBytes
     }
+    if (next.type === "operation_outcome") this.#operationOutcomeIds.add(next.operationId)
     this.#updatePresentationMessages(next)
     this.#considerPromptHistoryEntry(next)
     this.#considerSessionContextEntry(next)
@@ -859,6 +882,7 @@ export class SessionManager {
       next.type !== "custom" &&
       next.type !== "custom_message" &&
       next.type !== "subagent" &&
+      next.type !== "operation_outcome" &&
       (next.type !== "message" || next.message.role !== "assistant")
     ) {
       return
@@ -956,6 +980,7 @@ function loadJournal(file: string, retention: "active" | "all"): LoadedJournal {
   let imageBlobBytes = 0
   const customEntries: CustomEntry[] = []
   let customStateBytes = 0
+  const operationOutcomeIds = new Set<string>()
   let programStateEntries = 0
   let programStateBytes = 0
   let previous: EntryReference | undefined
@@ -994,6 +1019,7 @@ function loadJournal(file: string, retention: "active" | "all"): LoadedJournal {
       entryCount++
 
       if (entry.type === "compaction") latestBoundaryId = entry.firstKeptEntryId
+      else if (entry.type === "operation_outcome") operationOutcomeIds.add(entry.operationId)
       if (entry.type === "custom") {
         const customEntry = freezeCustomEntry(entry)
         if (entry.customType === programStateCustomType) {
@@ -1092,6 +1118,7 @@ function loadJournal(file: string, retention: "active" | "all"): LoadedJournal {
       imageBlobBytes,
       customEntries,
       customStateBytes,
+      operationOutcomeIds,
       programStateEntries,
       programStateBytes,
       workPlan,
@@ -1227,6 +1254,9 @@ function parseStoredEntry(line: string, file: string, version: SessionFormatVers
     }
   }
   if (value.type === "subagent" && isSubagentEntryData(value)) {
+    return { ...base, ...value }
+  }
+  if (value.type === "operation_outcome" && isOperationOutcomeEntry(value)) {
     return { ...base, ...value }
   }
   if (value.type === "compaction" && isCompactionEntryData(value)) {
@@ -2020,6 +2050,10 @@ function validateNextEntry(next: SessionEntry, preceding: readonly SessionEntry[
     if (!isSubagentEntryData(next)) throw new Error(`Invalid session entry: ${file}`)
     return
   }
+  if (next.type === "operation_outcome") {
+    if (!isOperationOutcomeEntry(next)) throw new Error(`Invalid session entry: ${file}`)
+    return
+  }
   if (next.type === "work_plan") {
     if (!isStoredWorkPlanEntry(next)) throw new Error(`Invalid session entry: ${file}`)
     return
@@ -2111,6 +2145,7 @@ export function sessionEntryToContextMessage(entry: SessionEntry): AgentMessage 
     case "thinking_level_change":
     case "retry":
     case "subagent":
+    case "operation_outcome":
     case "work_plan":
       return undefined
     default:
@@ -2131,6 +2166,7 @@ function sessionEntryToPresentationMessage(entry: SessionEntry): AgentMessage | 
     case "thinking_level_change":
     case "retry":
     case "subagent":
+    case "operation_outcome":
     case "work_plan":
       return undefined
     default:

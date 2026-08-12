@@ -569,6 +569,10 @@ export class AgentSession {
     this.#processTreeTracker = config.processTreeTracker
     this.#apiKeyProvider = config.apiKeyProvider
     this.sessionManager = config.sessionManager
+    this.#shell?.bindOperationOutcomeSink(outcome => {
+      const entry = this.sessionManager.appendOperationOutcome(outcome)
+      this.#emitAll([{ type: "entry_appended", entry }])
+    })
     this.#restoreSubagentCompletionDeliveries()
     this.settingsManager = config.settingsManager
     this.#modelState = config.model ? { type: "selected", model: config.model } : { type: "unselected" }
@@ -1137,6 +1141,7 @@ export class AgentSession {
     }
     const task = `${profile.instructions.trimEnd()}\n\nTask:\n${prompt}`
     return this.#requireSubagents().spawn(name, task, signal, {
+      profile: profileName,
       ...(model ? { model } : {}),
       ...(profile.thinking ? { thinkingLevel: profile.thinking } : {}),
       listedTask: prompt

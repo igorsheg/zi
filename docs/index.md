@@ -67,6 +67,7 @@ That last step is the important one. Zi gets better when you stop retyping instr
 - [Code Mode](code-mode.md) — understand generated JavaScript, persistent memory, and local authority.
 - [Work plans](work-plans.md) — track bounded session work from planning through verification.
 - [Subagents](subagents.md) — define reusable delegated roles.
+- [Operation outcomes](operation-outcomes.md) — consume canonical durable terminal operation records.
 - [JSON events](json-events.md) — consume a finite run as JSONL.
 - [RPC](rpc.md) — control a long-lived Zi process.
 - [Notifications](notifications.md) — use the terminal client's notification API.

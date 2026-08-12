@@ -3,6 +3,11 @@ import { createWriteStream, mkdirSync, mkdtempSync, rmSync, type WriteStream } f
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
+import {
+  shellBackgroundTaskOperationId,
+  type ShellBackgroundTaskOperationOutcomeInput,
+  type ShellBackgroundTaskOrigin
+} from "./operation-outcomes.js"
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncateTail, type TruncationResult } from "./tools/truncate.js"
 
 export const defaultShellLimits: ShellLimits = Object.freeze({
@@ -64,12 +69,20 @@ export interface ShellTaskOutputSnapshot {
   readonly fullOutput: ShellFullOutput
 }
 
+type ShellBackgroundOwnership =
+  | { readonly type: "none" }
+  | { readonly type: "owned"; readonly origin: ShellBackgroundTaskOrigin; readonly startedAt: number }
+
 interface ShellTaskIdentity {
   readonly taskId: string
   readonly toolCallId: string
   readonly command: string
   readonly cwd: string
   readonly startedAt: number
+}
+
+interface OwnedShellTaskIdentity extends ShellTaskIdentity {
+  readonly background: ShellBackgroundOwnership
 }
 
 export type ShellTaskSnapshot =
@@ -141,10 +154,10 @@ interface TaskResources {
   readonly onUpdate: ((task: ShellTaskSnapshot) => void) | undefined
 }
 
-type StartingTask = ShellTaskIdentity &
+type StartingTask = OwnedShellTaskIdentity &
   TaskResources & { readonly type: "starting"; readonly placement: "foreground" | "background" }
 
-type ForegroundTask = ShellTaskIdentity &
+type ForegroundTask = OwnedShellTaskIdentity &
   TaskResources & {
     readonly type: "foreground"
     readonly child: ChildProcessWithoutNullStreams
@@ -152,7 +165,7 @@ type ForegroundTask = ShellTaskIdentity &
     readonly removeAbort: (() => void) | undefined
   }
 
-type BackgroundTask = ShellTaskIdentity &
+type BackgroundTask = OwnedShellTaskIdentity &
   TaskResources & {
     readonly type: "background"
     readonly child: ChildProcessWithoutNullStreams
@@ -162,7 +175,7 @@ type BackgroundTask = ShellTaskIdentity &
 
 type RunningTask = ForegroundTask | BackgroundTask
 
-type StoppingTask = ShellTaskIdentity &
+type StoppingTask = OwnedShellTaskIdentity &
   TaskResources & {
     readonly type: "stopping"
     readonly child: ChildProcessWithoutNullStreams
@@ -171,10 +184,10 @@ type StoppingTask = ShellTaskIdentity &
     readonly killTimer: ReturnType<typeof setTimeout>
   }
 
-type SettlingTask = ShellTaskIdentity &
+type SettlingTask = OwnedShellTaskIdentity &
   TaskResources & { readonly type: "settling"; readonly outcome: ShellTaskOutcome }
 
-type CompletedTask = ShellTaskIdentity & {
+type CompletedTask = OwnedShellTaskIdentity & {
   readonly type: "completed"
   readonly output: TaskOutput
   readonly outcome: ShellTaskOutcome
@@ -194,6 +207,9 @@ export class SessionShell {
   readonly #listeners = new Set<(taskId: string) => void>()
   readonly #updateTimers = new Map<string, ReturnType<typeof setTimeout>>()
   readonly #lastUpdates = new Map<string, number>()
+  readonly #pendingOutcomes = new Map<string, ShellBackgroundTaskOperationOutcomeInput>()
+  #outcomeSink: ((outcome: ShellBackgroundTaskOperationOutcomeInput) => void) | undefined
+  #outcomeSinkBound = false
   #state: ShellOwnerState = { type: "open" }
   #outputDir: string | undefined
   #retainedOutputBytes = 0
@@ -205,6 +221,14 @@ export class SessionShell {
     this.sessionId = sessionId
     this.limits = limits
     this.#outputRoot = outputRoot
+  }
+
+  bindOperationOutcomeSink(sink: (outcome: ShellBackgroundTaskOperationOutcomeInput) => void): void {
+    this.#assertOpen()
+    if (this.#outcomeSinkBound) throw new Error("Shell operation outcome sink is already bound")
+    this.#outcomeSinkBound = true
+    this.#outcomeSink = sink
+    this.#flushPendingOutcomes()
   }
 
   subscribe(listener: (taskId: string) => void): () => void {
@@ -232,12 +256,16 @@ export class SessionShell {
   ): Promise<ShellRunResult> {
     this.#assertOpen()
     this.#evictExpired()
+    this.#flushPendingOutcomes()
     assertRunRequest(request, this.limits)
     if (signal?.aborted) throw new Error("Command aborted")
     if (!request.background && this.#hasForegroundAdmission()) {
       throw new ShellRunAdmissionError("foreground-busy", "Another foreground shell command is running")
     }
-    if (request.background && this.#backgroundCount() >= this.limits.maxBackgroundTasks) {
+    if (
+      request.background &&
+      (this.#backgroundCount() >= this.limits.maxBackgroundTasks || this.#backgroundOutcomeBacklogFull())
+    ) {
       throw new ShellRunAdmissionError(
         "background-capacity",
         `Background task capacity exceeded (maximum ${this.limits.maxBackgroundTasks})`
@@ -245,12 +273,14 @@ export class SessionShell {
     }
 
     const taskId = crypto.randomUUID()
-    const identity: ShellTaskIdentity = {
+    const startedAt = Date.now()
+    const identity: OwnedShellTaskIdentity = {
       taskId,
       toolCallId,
       command: request.command,
       cwd: this.cwd,
-      startedAt: Date.now()
+      startedAt,
+      background: request.background ? { type: "owned", origin: "requested", startedAt } : { type: "none" }
     }
     const processSettled = createDeferred<Extract<ShellTaskSnapshot, { type: "completed" }>>()
     const toolSettled = createDeferred<ShellRunResult>()
@@ -322,12 +352,20 @@ export class SessionShell {
 
   demoteForeground(): ShellDemotionResult {
     this.#assertOpen()
+    this.#flushPendingOutcomes()
     const task = this.#foregroundTask()
     if (!task) return { type: "none" }
-    if (this.#backgroundCount() >= this.limits.maxBackgroundTasks) return { type: "capacity_exceeded" }
+    if (this.#backgroundCount() >= this.limits.maxBackgroundTasks || this.#backgroundOutcomeBacklogFull()) {
+      return { type: "capacity_exceeded" }
+    }
 
     task.removeAbort?.()
-    const background: BackgroundTask = { ...task, type: "background", removeAbort: undefined }
+    const background: BackgroundTask = {
+      ...task,
+      type: "background",
+      background: { type: "owned", origin: "demoted", startedAt: Date.now() },
+      removeAbort: undefined
+    }
     this.#tasks.set(task.taskId, background)
     this.#assertStableInvariants()
     const snapshot = this.#snapshot(background)
@@ -410,6 +448,10 @@ export class SessionShell {
       }
     }
 
+    this.#flushPendingOutcomes()
+    if (this.#pendingOutcomes.size > 0) failure ??= new Error("Could not persist shell operation outcomes")
+    this.#pendingOutcomes.clear()
+    this.#outcomeSink = undefined
     for (const taskId of this.#tasks.keys()) this.#forgetTask(taskId)
     if (this.#outputDir) rmSync(this.#outputDir, { recursive: true, force: true })
     this.#outputDir = undefined
@@ -428,6 +470,10 @@ export class SessionShell {
   #foregroundTask(): ForegroundTask | undefined {
     for (const task of this.#tasks.values()) if (task.type === "foreground") return task
     return undefined
+  }
+
+  #backgroundOutcomeBacklogFull(): boolean {
+    return this.#pendingOutcomes.size >= this.limits.maxCompletedTasks
   }
 
   #backgroundCount(): number {
@@ -501,6 +547,7 @@ export class SessionShell {
       command: task.command,
       cwd: task.cwd,
       startedAt: task.startedAt,
+      background: task.background,
       type: "completed",
       output: task.output,
       outcome: { type: "disposed" },
@@ -508,6 +555,7 @@ export class SessionShell {
       expiresAt: completedAt
     }
     this.#tasks.set(task.taskId, completed)
+    this.#recordBackgroundOutcome(completed)
     const snapshot = this.#snapshot(completed)
     task.processSettled.resolve(snapshot)
     task.toolSettled.resolve({ type: "completed", task: snapshot })
@@ -530,6 +578,7 @@ export class SessionShell {
       command: task.command,
       cwd: task.cwd,
       startedAt: task.startedAt,
+      background: task.background,
       type: "completed",
       output: task.output,
       outcome,
@@ -537,6 +586,7 @@ export class SessionShell {
       expiresAt: completedAt + this.limits.completedTaskTtlMs
     }
     this.#tasks.set(task.taskId, completed)
+    this.#recordBackgroundOutcome(completed)
     this.#enforceCompletedLimit()
     this.#scheduleEviction()
     this.#assertStableInvariants()
@@ -544,6 +594,28 @@ export class SessionShell {
     task.processSettled.resolve(snapshot)
     task.toolSettled.resolve({ type: "completed", task: snapshot })
     this.#emit(task.taskId)
+  }
+
+  #recordBackgroundOutcome(task: CompletedTask): void {
+    if (task.background.type === "none" || !this.#outcomeSink) return
+    const outcome = backgroundTaskOutcome(task)
+    try {
+      this.#outcomeSink(outcome)
+    } catch {
+      this.#pendingOutcomes.set(task.taskId, outcome)
+    }
+  }
+
+  #flushPendingOutcomes(): void {
+    if (!this.#outcomeSink) return
+    for (const [taskId, outcome] of this.#pendingOutcomes) {
+      try {
+        this.#outcomeSink(outcome)
+        this.#pendingOutcomes.delete(taskId)
+      } catch {
+        break
+      }
+    }
   }
 
   #snapshot(task: StartingTask): Extract<ShellTaskSnapshot, { type: "starting" }>
@@ -719,6 +791,7 @@ export class SessionShell {
     invariant(foregroundAdmissions <= 1, "multiple foreground tasks were admitted")
     invariant(backgroundTasks <= this.limits.maxBackgroundTasks, "background task capacity was exceeded")
     invariant(completedTasks <= this.limits.maxCompletedTasks, "completed task capacity was exceeded")
+    invariant(this.#pendingOutcomes.size <= this.limits.maxCompletedTasks, "shell outcome backlog was exceeded")
     invariant(retainedOutputBytes === this.#retainedOutputBytes, "retained output accounting diverged")
     this.#assertRetainedOutputBound()
     for (const taskId of this.#updateTimers.keys()) {
@@ -737,6 +810,8 @@ export class SessionShell {
     invariant(this.#evictionTimer === undefined, "disposed shell retains its eviction timer")
     invariant(this.#outputDir === undefined, "disposed shell retains its output directory")
     invariant(this.#listeners.size === 0, "disposed shell retains listeners")
+    invariant(this.#pendingOutcomes.size === 0, "disposed shell retains operation outcomes")
+    invariant(this.#outcomeSink === undefined, "disposed shell retains its operation outcome sink")
   }
 
   #outputPath(taskId: string): string {
@@ -918,6 +993,41 @@ class TaskOutput {
   #detachSources(): void {
     for (const [source, listener] of this.#sources) source.off("data", listener)
     this.#sources.clear()
+  }
+}
+
+function backgroundTaskOutcome(task: CompletedTask): ShellBackgroundTaskOperationOutcomeInput {
+  if (task.background.type !== "owned") throw new Error("Foreground shell task has no background outcome")
+  const evidence = {
+    capability: "shell" as const,
+    operation: "background_task" as const,
+    operationId: shellBackgroundTaskOperationId(task.taskId),
+    taskId: task.taskId,
+    origin: task.background.origin,
+    durationMs: Math.max(0, task.completedAt - task.background.startedAt),
+    outputBytes: task.output.snapshot().truncation.totalBytes
+  }
+  switch (task.outcome.type) {
+    case "exited":
+      return task.outcome.exitCode === 0
+        ? { ...evidence, result: "succeeded", exitCode: 0 }
+        : { ...evidence, result: "failed", errorCode: "exit_nonzero", exitCode: task.outcome.exitCode }
+    case "signaled":
+      return { ...evidence, result: "failed", errorCode: "signaled", signal: task.outcome.signal }
+    case "timed_out":
+      return { ...evidence, result: "failed", errorCode: "timed_out" }
+    case "output_limit":
+      return { ...evidence, result: "failed", errorCode: "output_limit" }
+    case "failed":
+      return { ...evidence, result: "failed", errorCode: "execution_failed" }
+    case "killed":
+      return { ...evidence, result: "cancelled", cancellationCode: "killed" }
+    case "disposed":
+      return { ...evidence, result: "cancelled", cancellationCode: "disposed" }
+    case "aborted":
+      throw new Error("Background shell task cannot settle as aborted")
+    default:
+      return assertNever(task.outcome)
   }
 }
 
