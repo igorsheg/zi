@@ -25,30 +25,51 @@ import {
   type AssistantToolInclusion
 } from "./assistant-projection.js"
 import type { TranscriptItemView } from "./item.js"
+import { createMermaidMarkdownRenderer } from "./mermaid/markdown.js"
 import { ToolCallView, type ToolViewFrame } from "./tool-view.js"
 
 // OpenTUI 0.4.5 drops Markdown blocks from the immediate frame when streaming is false.
 const markdownStreamingWorkaround = true
-const renderMarkdownNode: NonNullable<MarkdownOptions["renderNode"]> = (token, context) => {
-  if (token.type !== "heading") return null
-  const renderable = context.defaultRender()
-  if (!(renderable instanceof CodeRenderable)) return renderable
-  const style = context.syntaxStyle.getStyle("markup.heading")
-  renderable.initialStyledText = new StyledText([
-    {
-      __isChunk: true,
-      text: token.text,
-      ...(style?.fg === undefined ? {} : { fg: style.fg }),
-      ...(style?.bg === undefined ? {} : { bg: style.bg }),
-      attributes: createTextAttributes({
-        bold: true,
-        italic: style?.italic ?? false,
-        underline: style?.underline ?? false,
-        dim: style?.dim ?? false
-      })
+
+function createMarkdownNodeRenderer(ctx: RenderContext, theme: Theme): NonNullable<MarkdownOptions["renderNode"]> {
+  const mermaid = createMermaidMarkdownRenderer(ctx, {
+    compact: true,
+    colors: {
+      text: theme.text.primary,
+      primary: theme.text.primary,
+      secondary: theme.text.muted,
+      muted: theme.border.default,
+      warning: theme.text.warning,
+      background: theme.surface.app,
+      request: theme.text.success,
+      response: theme.text.warning,
+      note: theme.text.primary,
+      noteBackground: theme.surface.panel
     }
-  ])
-  return renderable
+  })
+  return (token, context) => {
+    const diagram = mermaid(token, context)
+    if (diagram) return diagram
+    if (token.type !== "heading") return null
+    const renderable = context.defaultRender()
+    if (!(renderable instanceof CodeRenderable)) return renderable
+    const style = context.syntaxStyle.getStyle("markup.heading")
+    renderable.initialStyledText = new StyledText([
+      {
+        __isChunk: true,
+        text: token.text,
+        ...(style?.fg === undefined ? {} : { fg: style.fg }),
+        ...(style?.bg === undefined ? {} : { bg: style.bg }),
+        attributes: createTextAttributes({
+          bold: true,
+          italic: style?.italic ?? false,
+          underline: style?.underline ?? false,
+          dim: style?.dim ?? false
+        })
+      }
+    ])
+    return renderable
+  }
 }
 
 export interface MessageRenderOptions {
@@ -398,7 +419,7 @@ function createMarkdown(
     streaming,
     internalBlockMode: "top-level",
     tableOptions: { style: "grid" },
-    renderNode: renderMarkdownNode
+    renderNode: createMarkdownNodeRenderer(ctx, theme)
   })
 }
 

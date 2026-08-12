@@ -11,9 +11,14 @@ Zi bundles or depends on third-party software. Each dependency remains under its
 - `string-width` — MIT — Copyright Sindre Sorhus and contributors
 - `typebox` — MIT — Copyright Haydn Paterson
 - `diff` — BSD-3-Clause — Copyright Kevin Decker and contributors
+- `entities` — BSD-2-Clause — Copyright Felix Böhm and contributors
 - `ignore` — MIT — Copyright Kael Zhang and contributors
 - `proper-lockfile` — MIT — Copyright Moxystudio and contributors
 - `yaml` — ISC — Copyright Eemeli Aro
+
+## Bundled source
+
+- OpenCode Merman terminal Mermaid renderer — MIT — Copyright OpenCode contributors — ported from <https://github.com/anomalyco/opencode>; source provenance and license are retained in `packages/tui/src/interactive/transcript/mermaid/`.
 
 ## Transitive runtime dependencies
 

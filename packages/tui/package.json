@@ -20,6 +20,7 @@
   "dependencies": {
     "@opentui/core": "catalog:",
     "@with-zi/coding-agent": "workspace:*",
+    "entities": "catalog:",
     "nanostores": "catalog:",
     "string-width": "catalog:"
   },

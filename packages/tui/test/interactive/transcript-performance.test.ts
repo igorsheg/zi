@@ -3,13 +3,14 @@ import { expect, spyOn, test } from "bun:test"
 import {
   BoxRenderable,
   CliRenderEvents,
+  CodeRenderable,
   MarkdownRenderable,
   type KeyEvent,
   type Renderable,
   TextAttributes,
   TextRenderable
 } from "@opentui/core"
-import { createTestRenderer, type TestRendererSetup } from "@opentui/core/testing"
+import { createMockMouse, createTestRenderer, type TestRendererSetup } from "@opentui/core/testing"
 import type { AgentMessage } from "@with-zi/coding-agent"
 import { fauxAssistantMessage, fauxText, fauxThinking, fauxToolCall } from "@with-zi/coding-agent/testing"
 import { atom, type WritableAtom } from "nanostores"
@@ -398,6 +399,187 @@ test("displayed custom messages use labelled default chrome while hidden message
   } finally {
     displayed.destroy()
     syntaxStyle.destroy()
+    setup.renderer.destroy()
+  }
+})
+
+test("assistant Mermaid fences render flowchart, sequence, and state diagrams", async () => {
+  const setup = await createTestRenderer({ width: 80, height: 60, useThread: false })
+  const syntaxStyle = createSyntaxStyle(defaultTheme)
+  const thinkingSyntaxStyle = createThinkingSyntaxStyle(defaultTheme)
+  const view = new StreamingAssistantView(
+    setup.renderer,
+    fauxAssistantMessage(`Before
+
+\`\`\`mermaid
+flowchart LR
+  User --> Agent
+  Agent --> Tools
+\`\`\`
+
+\`\`\`mermaid
+sequenceDiagram
+  participant Browser
+  participant Server
+  Browser->>Server: Request
+  Server-->>Browser: Response
+\`\`\`
+
+\`\`\`mermaid
+stateDiagram-v2
+  [*] --> Idle
+  Idle --> Working
+  Working --> [*]
+\`\`\`
+
+After`),
+    defaultTheme,
+    syntaxStyle,
+    thinkingSyntaxStyle
+  )
+  setup.renderer.root.add(view.root)
+
+  try {
+    await renderMarkdownSettled(setup)
+    const frame = setup.captureCharFrame()
+    expect(frame).toContain("Before")
+    expect(frame).toContain("User")
+    expect(frame).toContain("Agent")
+    expect(frame).toContain("Tools")
+    expect(frame).toContain("Browser")
+    expect(frame).toContain("Server")
+    expect(frame).toContain("Request")
+    expect(frame).toContain("Idle")
+    expect(frame).toContain("Working")
+    expect(frame).toContain("After")
+    expect(frame).not.toContain("flowchart LR")
+    expect(frame).not.toContain("sequenceDiagram")
+    expect(frame).not.toContain("stateDiagram-v2")
+    expect(descendantsOfType(view.root, TextRenderable)).toHaveLength(3)
+  } finally {
+    view.destroy()
+    syntaxStyle.destroy()
+    thinkingSyntaxStyle.destroy()
+    setup.renderer.destroy()
+  }
+})
+
+test("wide Mermaid diagrams scroll horizontally by pointer drag", async () => {
+  const setup = await createTestRenderer({ width: 32, height: 18, useThread: false })
+  const syntaxStyle = createSyntaxStyle(defaultTheme)
+  const thinkingSyntaxStyle = createThinkingSyntaxStyle(defaultTheme)
+  const view = new StreamingAssistantView(
+    setup.renderer,
+    fauxAssistantMessage(`\`\`\`mermaid
+flowchart LR
+  Alpha[Alpha node] --> Beta[Beta node] --> Gamma[Gamma node]
+\`\`\``),
+    defaultTheme,
+    syntaxStyle,
+    thinkingSyntaxStyle
+  )
+  setup.renderer.root.add(view.root)
+
+  try {
+    await renderMarkdownSettled(setup)
+    const diagram = descendant(view.root, TextRenderable)
+    expect(diagram.maxScrollX).toBeGreaterThan(0)
+    const mouse = createMockMouse(setup.renderer)
+    await mouse.drag(diagram.x + 20, diagram.y + 1, diagram.x + 4, diagram.y + 1)
+    expect(diagram.scrollX).toBeGreaterThan(0)
+  } finally {
+    view.destroy()
+    syntaxStyle.destroy()
+    thinkingSyntaxStyle.destroy()
+    setup.renderer.destroy()
+  }
+})
+
+test("assistant Mermaid rendering falls back for unsupported and bounded diagrams", async () => {
+  const setup = await createTestRenderer({ width: 64, height: 18, useThread: false })
+  const syntaxStyle = createSyntaxStyle(defaultTheme)
+  const thinkingSyntaxStyle = createThinkingSyntaxStyle(defaultTheme)
+  const oversized = "A".repeat(16 * 1024)
+  const view = new StreamingAssistantView(
+    setup.renderer,
+    fauxAssistantMessage(`\`\`\`mermaid
+classDiagram
+  Animal <|-- Duck
+\`\`\`
+
+\`\`\`mermaid
+flowchart LR
+  A[${oversized}] --> B
+\`\`\``),
+    defaultTheme,
+    syntaxStyle,
+    thinkingSyntaxStyle
+  )
+  setup.renderer.root.add(view.root)
+
+  try {
+    await renderMarkdownSettled(setup)
+    const frame = setup.captureCharFrame()
+    expect(frame).toContain("classDiagram")
+    expect(descendantsOfType(view.root, CodeRenderable).some(code => code.content.includes("flowchart LR"))).toBe(true)
+  } finally {
+    view.destroy()
+    syntaxStyle.destroy()
+    thinkingSyntaxStyle.destroy()
+    setup.renderer.destroy()
+  }
+})
+
+test("streaming Mermaid keeps the last valid diagram until the fence becomes valid again", async () => {
+  const setup = await createTestRenderer({ width: 64, height: 18, useThread: false })
+  const syntaxStyle = createSyntaxStyle(defaultTheme)
+  const thinkingSyntaxStyle = createThinkingSyntaxStyle(defaultTheme)
+  const view = new StreamingAssistantView(
+    setup.renderer,
+    fauxAssistantMessage(`\`\`\`mermaid
+flowchart LR
+  A[Stable] --> B[Previous]
+\`\`\``),
+    defaultTheme,
+    syntaxStyle,
+    thinkingSyntaxStyle
+  )
+  setup.renderer.root.add(view.root)
+
+  try {
+    await renderMarkdownSettled(setup)
+    expect(setup.captureCharFrame()).toContain("Previous")
+    const firstDiagram = descendant(view.root, TextRenderable)
+
+    view.update(
+      fauxAssistantMessage(`\`\`\`mermaid
+flowchart LR
+  A[Stable] --> B[Previous]
+  B -->
+\`\`\``)
+    )
+    await renderMarkdownSettled(setup)
+    const retainedDiagram = descendant(view.root, TextRenderable)
+    expect(firstDiagram.isDestroyed).toBe(true)
+    expect(retainedDiagram).not.toBe(firstDiagram)
+    expect(setup.captureCharFrame()).toContain("Previous")
+    expect(setup.captureCharFrame()).not.toContain("flowchart LR")
+
+    view.update(
+      fauxAssistantMessage(`\`\`\`mermaid
+flowchart LR
+  A[Stable] --> B[Previous]
+  B --> C[Current]
+\`\`\``)
+    )
+    await renderMarkdownSettled(setup)
+    expect(setup.captureCharFrame()).toContain("Current")
+  } finally {
+    const diagram = descendantsOfType(view.root, TextRenderable)[0]
+    view.destroy()
+    expect(diagram?.isDestroyed).toBe(true)
+    syntaxStyle.destroy()
+    thinkingSyntaxStyle.destroy()
     setup.renderer.destroy()
   }
 })

@@ -12,5 +12,17 @@
     "typescript/no-floating-promises": "error",
     "typescript/no-misused-promises": "error"
   },
+  "overrides": [
+    {
+      "files": ["packages/tui/src/interactive/transcript/mermaid/**/*.ts"],
+      "rules": {
+        "eslint/no-shadow": "off",
+        "oxc/no-map-spread": "off",
+        "typescript/consistent-return": "off",
+        "typescript/no-unnecessary-type-assertion": "off",
+        "typescript/no-unsafe-type-assertion": "off"
+      }
+    }
+  ],
   "settings": { "react": { "version": "19.2.7" } }
 }
