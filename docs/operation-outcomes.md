@@ -1,12 +1,14 @@
 ---
 slug: operation-outcomes
 title: Operation outcomes
-order: 79
+order: 75
 ---
 
 # Operation outcomes
 
-An operation outcome is Zi's canonical durable terminal record for one admitted session operation. The session journal owns these records. They are not conversation messages, tool results, delivery receipts, logs, or telemetry events.
+You ran Zi in automation. Something spawned subagents and background shell tasks, and afterwards you need to know what actually happened: what ran, whether it succeeded, how long it took. Scraping a transcript, parsing prose, and trusting a log line are all bad answers to that question.
+
+So Zi records a durable, [bounded](vocabulary.md), machine-readable terminal record for one admitted session operation. Not every operation has a producer, and the ones that do are listed below. The session journal owns these records, and they never enter the model's context. They are not conversation messages, tool results, delivery receipts, logs, or telemetry events.
 
 Every outcome uses one open envelope:
 
@@ -27,7 +29,9 @@ Every outcome uses one open envelope:
 
 `result` is `succeeded`, `failed`, or `cancelled`. `id`, `parentId`, and `timestamp` place the outcome in journal chronology. `operationId` identifies the admitted operation; Zi rejects a second outcome with the same operation ID.
 
-The core validates the common envelope and its bounds. Capability and operation names are lowercase identifiers of at most 64 bytes, operation IDs fit in 256 bytes, and durations are non-negative integer milliseconds. `evidence` is bounded `SessionJson`: `null`, a boolean, a finite number, a string, an array, or an object composed recursively from those values. Outcome evidence is limited to 8 KiB of encoded JSON, 32 levels, and 4,096 values.
+The core validates the common envelope and its bounds. Capability and operation names are lowercase identifiers of at most 64 bytes, operation IDs fit in 256 bytes, and durations are non-negative integer milliseconds.
+
+`evidence` is bounded `SessionJson`: `null`, a boolean, a finite number, a string, an array, or an object composed recursively from those values. Outcome evidence is limited to 8 KiB of encoded JSON, 32 levels, and 4,096 values, so one verbose producer cannot make a long session's journal expensive to retain or decode.
 
 The producer owns the capability and operation names, the deterministic operation ID, the evidence schema, and the meaning of that evidence. It must exclude secrets and unnecessary user content, choose fields consumers can safely retain, and document any producer-specific interpretation. Adding a producer does not extend a central capability union or the common envelope.
 
@@ -46,13 +50,25 @@ The outcome carried by `operation_outcome` has the same shape as an item returne
 
 Zi currently records outcomes for settled subagent work cycles, parent-owned subagent control operations, and background-owned shell tasks. Each producer derives its operation ID from its own stable admission identity and places only bounded, privacy-reviewed facts in `evidence`.
 
+### Subagent work cycles
+
 A subagent work-cycle outcome is recorded when the supervisor's admitted child cycle settles. Hidden completion context and orchestration tool results may deliver the same completion evidence without creating another outcome.
 
-The parent supervisor also records terminal `spawn`, `message_delivery`, `task_assignment`, `interrupt`, and `close` operations. This includes host-to-subagent delivery and peer-to-peer delivery routed through the common parent. A successful message delivery means the target child RPC session accepted the queue-only message; it does not mean the target model consumed the message or that its work cycle succeeded. `wait_subagents`, `list_subagents`, and sibling-list queries are observations and do not create outcomes.
+### Subagent control operations
 
-Subagent control evidence contains routing names, channel or delivery classification, correlated work-cycle numbers, byte counts, and stable failure codes. It never contains prompt, task, message, or diagnostic text. Peer-generated control outcomes are bounded per sender work cycle; exceeding the admission bound rejects further peer delivery without consuming cleanup capacity. Child sessions remain non-persistent: the parent supervisor observes the process boundary and appends these outcomes to the parent journal.
+The parent supervisor also records terminal `spawn`, `message_delivery`, `task_assignment`, `interrupt`, and `close` operations. This includes host-to-subagent delivery and peer-to-peer delivery routed through the common parent. `wait_subagents`, `list_subagents`, and sibling-list queries are observations and do not create outcomes.
 
-A shell outcome is recorded after a background-owned process and its bounded output settle. Foreground-only commands are not recorded. Observing a task with `list_tasks` or `task_output`, or requesting cancellation with `kill_task`, does not create another outcome. Shell evidence excludes command text, output text, working directories, spill-file paths, and tool-call IDs.
+A successful message delivery means the target child RPC session accepted the queue-only message; it does not mean the target model consumed the message or that its work cycle succeeded.
+
+Subagent control evidence contains routing names, channel or delivery classification, correlated work-cycle numbers, byte counts, and stable failure codes. It never contains prompt, task, message, or diagnostic text.
+
+Peer-generated control outcomes are bounded per sender work cycle; exceeding the admission bound rejects further peer delivery without consuming cleanup capacity. Child sessions remain non-persistent: the parent supervisor observes the process boundary and appends these outcomes to the parent journal.
+
+### Background shell tasks
+
+A shell outcome is recorded after a background-owned process and its bounded output settle. Foreground-only commands are not recorded. Observing a task with `list_tasks` or `task_output`, or requesting cancellation with `kill_task`, does not create another outcome.
+
+Shell evidence excludes command text, output text, working directories, spill-file paths, and tool-call IDs.
 
 ## Local reports
 
@@ -65,3 +81,12 @@ bun run outcomes
 JSON is the default, scriptable format. Use `--format text` for a concise terminal report, `--days <count>` or `--since <timestamp>` to select a range, and `--cwd <path>` to inspect another project. Run `bun run outcomes --help` for all bounds and options.
 
 Reports aggregate only common envelope fields such as result, duration, chronology, capability, and operation. Evidence remains producer-owned opaque `SessionJson`; generic reports do not interpret it or create capability-specific schemas. Reports read session journals locally and never index prompt, completion, command, or shell-output text.
+
+## What this does not do
+
+- Outcomes never reach provider context or transcript presentation.
+- Observations create nothing: `wait_subagents`, `list_subagents`, sibling-list queries, `list_tasks`, `task_output`, and `kill_task`.
+- A second outcome with the same operation ID is rejected rather than merged or appended.
+- Foreground-only shell commands leave no outcome.
+- Generic reports do not interpret producer evidence or create capability-specific schemas.
+- Telemetry correlated through `operationId` is not durable session state.

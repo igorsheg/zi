@@ -1,18 +1,20 @@
 ---
 slug: json-events
 title: JSON event stream
-order: 90
+order: 100
 ---
 
 # JSON event stream
 
-Use JSON mode when one finite Zi invocation needs machine-readable progress and settlement:
+You want one finite Zi run inside a script or a CI job, and you need to read its progress and its settlement from a program rather than from prose on a terminal.
+
+JSON mode gives you that run as a stream of records:
 
 ```sh
 zi --mode json "inspect this repo"
 ```
 
-JSON mode writes UTF-8 JSONL to stdout: one complete object and one LF per record. Human-readable diagnostics use stderr. It requires a selected authenticated model and never opens an interactive login flow.
+It writes UTF-8 JSONL to stdout: one complete object and one LF per record. Human-readable diagnostics use stderr. It requires a selected authenticated model and never opens an interactive login flow.
 
 For a long-lived, bidirectional process connection, use the [RPC protocol](rpc.md) instead.
 

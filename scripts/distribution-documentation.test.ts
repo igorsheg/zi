@@ -30,6 +30,7 @@ test("distribution documentation ships self-customization guides and examples", 
       "settings.md",
       "skills.md",
       "subagents.md",
+      "vocabulary.md",
       "work-plans.md"
     ])
     expect(existsSync(join(destination, "docs", "index.md"))).toBe(true)

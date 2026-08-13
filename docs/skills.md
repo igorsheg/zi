@@ -21,7 +21,7 @@ When asked to commit, stage files explicitly.  -> skill
 
 That split keeps the base prompt small while making specialized behavior available.
 
-## Locations and precedence
+## Where skills load from
 
 Global skills load from:
 
@@ -30,7 +30,7 @@ $HOME/.zi/agent/skills/
 $HOME/.agents/skills/
 ```
 
-Trusted project skills load from:
+[Trusted](vocabulary.md) project skills load from:
 
 ```text
 <cwd>/.zi/skills/
@@ -39,9 +39,24 @@ Trusted project skills load from:
 
 Zi checks `.agents/skills/` from the working directory upward to the Git repository root, or to the filesystem root outside Git. These shared Agent Skills locations discover directories containing `SKILL.md`; direct root Markdown files there are ignored.
 
-Additional files or directories can be listed in the [`skills` settings array](settings.md#resource-paths). Precedence is project settings, project `.zi`, nearest project `.agents`, global settings, global `.zi`, then global `.agents`. The first valid skill with a given name wins.
+Additional files or directories can be listed in the [`skills` settings array](settings.md#resource-paths).
 
-Project resources precede global skills with the same name. Zi visits bounded resource trees, ignores hidden directories and `node_modules`, and honors resource ignore files. Run `/reload` after adding or changing a skill in an active interactive session.
+Zi visits bounded resource trees, ignores hidden directories and `node_modules`, and honors resource ignore files. Run `/reload` after adding or changing a skill in an active interactive session.
+
+## Precedence
+
+The first valid skill with a given name wins. Zi searches in this order:
+
+1. project settings paths
+2. project `.zi`
+3. nearest project `.agents`
+4. global settings paths
+5. global `.zi`
+6. global `.agents`
+
+Project resources precede global skills with the same name.
+
+## Skill layout
 
 A skill may be a root Markdown file such as `skills/review.md`, but a directory with `SKILL.md` is preferred when the skill includes supporting references, scripts, or examples:
 

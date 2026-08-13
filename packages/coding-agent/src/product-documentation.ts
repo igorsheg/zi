@@ -17,6 +17,7 @@ export const publicProductDocumentationFiles = Object.freeze([
   "settings.md",
   "skills.md",
   "subagents.md",
+  "vocabulary.md",
   "work-plans.md"
 ] as const)
 export const productDocumentationContractPaths = Object.freeze([

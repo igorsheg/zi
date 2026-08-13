@@ -6,9 +6,11 @@ order: 0
 
 # Start here
 
-Zi is a coding agent you can build with.
+You ask an agent for a change. It edits six files, runs something, and reports success. Now you are reading a diff, trying to reconstruct what it actually did — and deciding how much of the part you did not watch you are willing to trust.
 
-It runs in your repository, keeps the work visible, and gives the model a small set of tools for reading, editing, writing, and running commands. Start with a concrete task, watch the tool calls, then resume the session when the work continues.
+Zi is a coding agent built the other way around. It runs in your repository, shows every tool call as it happens, writes the session to disk, and puts a hard limit on everything it retains. Work in Zi stays visible, bounded, and resumable.
+
+Not unconditionally. A `--no-session` run is ephemeral by design and resumes nothing. Subagent children are never persisted; only their evidence reaches the parent journal. Where Zi cannot keep that promise, the guide for that feature says so.
 
 ## Install
 
@@ -54,20 +56,52 @@ That last step is the important one. Zi gets better when you stop retyping instr
 - `Ctrl+Enter` interrupts only the active parent turn and sends the current draft immediately. Existing queues, background commands, and subagents continue.
 - `Esc` cancels the active parent turn and restores queued input to the composer.
 - `Ctrl+C` clears a non-empty draft. Zi shows `Ctrl+Z` recovery guidance, and undo restores text and image markers together.
+- `/copy` copies the latest committed assistant message to the clipboard as its Markdown source, excluding thinking and tool calls. An in-progress streaming message is not included.
 
-## What to read next
+## Choose your level
 
-- [CLI](cli.md) — choose interactive, text, JSON, or RPC mode.
-- [Authentication](authentication.md) — configure providers and models.
-- [Settings](settings.md) — set defaults for models, queues, retry, and compaction.
-- [Resources](resources.md) — see where Zi stores state and discovers configuration.
-- [Prompts](prompts.md) — add reusable slash prompts or system instructions.
-- [Skills](skills.md) — teach Zi reusable workflows.
-- [Extensions](extensions.md) — add trusted commands, tools, state, and orchestration.
-- [Code Mode](code-mode.md) — understand generated JavaScript, persistent memory, and local authority.
-- [Work plans](work-plans.md) — track bounded session work from planning through verification.
-- [Subagents](subagents.md) — define reusable delegated roles.
-- [Operation outcomes](operation-outcomes.md) — consume canonical durable terminal operation records.
-- [JSON events](json-events.md) — consume a finite run as JSONL.
-- [RPC](rpc.md) — control a long-lived Zi process.
-- [Notifications](notifications.md) — use the terminal client's notification API.
+Most of what people want from a coding agent is a customization, not a code change. Zi has one for every level, and the cheapest one that works is the right one:
+
+```text
+A rule that always applies?           AGENTS.md
+Instructions for one kind of task?    a skill
+A command you invoke by name?         a prompt template
+The same flags on every run?          settings
+Behavior Zi must execute?             an extension
+Another application driving Zi?       RPC
+A different interaction model?        your own client
+```
+
+Work down that list rather than up. Each rung costs more to maintain than the one above it, and a surprising amount of what people reach for an extension to do is a skill that nobody wrote down.
+
+## The manual
+
+Start with [Know the vocabulary](vocabulary.md) if the later pages read as jargon; ten words carry most of this manual.
+
+### Run it
+
+- [Choose a run mode](cli.md) — interactive, text, JSON, or RPC, plus how one invocation resolves.
+- [Authenticate and choose a model](authentication.md) — providers, credentials, and model selection.
+- [Set defaults](settings.md) — persist models, queues, retry, compaction, and resource paths.
+- [Know where Zi stores things](resources.md) — the global and project directories, and project trust.
+
+### Teach it
+
+- [Add prompts and system instructions](prompts.md) — slash commands and base-prompt policy.
+- [Stop repeating instructions](skills.md) — reusable workflows the model loads when they apply.
+
+### Watch it work
+
+- [Work plans](work-plans.md) — the ordered checklist Zi keeps for non-trivial work.
+- [Code Mode](code-mode.md) — the `code` tool, its authority, and its memory.
+- [Operation outcomes](operation-outcomes.md) — the durable record a settled operation leaves behind.
+
+### Build on it
+
+- [Extensions](extensions.md) — trusted TypeScript that adds commands, tools, state, and profiles.
+- [Delegate with subagents](subagents.md) — reusable delegated roles and their orchestration tools.
+- [JSON event stream](json-events.md) — consume one finite run as JSONL.
+- [RPC protocol](rpc.md) — drive and observe a long-lived Zi process.
+- [Terminal notifications](notifications.md) — the reference client's own notification surface.
+
+Read the tier you need. Every page assumes you arrived from a real problem, states what Zi does about it, and then tells you where the mechanism stops — because work you cannot see, bound, or resume is work you cannot trust.

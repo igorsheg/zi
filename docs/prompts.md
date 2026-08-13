@@ -6,7 +6,9 @@ order: 50
 
 # Add prompts and system instructions
 
-There are two prompt customizations:
+You keep pasting the same review instruction into the composer, or the same commit rules, at the start of every session. Put the instruction in a file once and invoke it by name.
+
+Zi has two prompt customizations:
 
 - prompt templates for repeatable slash commands;
 - system prompt files for changing the assistant's base instructions.
@@ -22,7 +24,7 @@ $HOME/.zi/agent/prompts/
 <cwd>/.zi/prompts/
 ```
 
-Additional files or directories can be listed in the [`prompts` settings array](settings.md#resource-paths). Project settings paths load first and only when project configuration is trusted; global settings paths load before `$HOME/.zi/agent/prompts/`.
+Additional files or directories can be listed in the [`prompts` settings array](settings.md#resource-paths). Project settings paths load first, and only when project configuration is [trusted](vocabulary.md). Global settings paths load before `$HOME/.zi/agent/prompts/`.
 
 A file named `review.md` creates `/review`:
 

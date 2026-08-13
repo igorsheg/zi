@@ -6,14 +6,16 @@ order: 30
 
 # Set defaults
 
-Zi reads settings from two scopes:
+You keep passing the same flags on every run, or this repository needs a different model than your personal default. Settings hold those defaults so the command line stays short.
+
+Zi reads them from two scopes:
 
 ```text
 $HOME/.zi/agent/settings.json
 <cwd>/.zi/settings.json
 ```
 
-Global settings are your preferences. Project settings belong to the repository and load only when project configuration is trusted. Runtime flags such as `--model` and `--api-key` are applied after both.
+Global settings are your preferences. Project settings belong to the repository and load only when project configuration is [trusted](vocabulary.md). Runtime flags such as `--model` and `--api-key` are applied after both.
 
 ## Edit settings in the terminal
 
@@ -68,9 +70,11 @@ Use typed arrays to add local resource files or directories:
 }
 ```
 
-These paths are additive; conventional `.zi` locations continue to load. Paths in global settings resolve relative to `$HOME/.zi/agent/`. Paths in project settings resolve relative to `<cwd>/.zi/`. Absolute paths and leading `~` are supported. Project entries load only after project trust and precede conventional project resources with the same name.
+These paths are additive; conventional `.zi` locations continue to load. Absolute paths and leading `~` are supported.
 
-Each array accepts at most 128 file or directory paths, with each path bounded at 4096 bytes.
+Paths in global settings resolve relative to `$HOME/.zi/agent/`. Paths in project settings resolve relative to `<cwd>/.zi/`. Project entries load only after project trust and precede conventional project resources with the same name.
+
+Each array accepts at most 128 file or directory paths, with each path bounded at 4096 bytes, keeping resource discovery bounded no matter what a repository adds.
 
 ## Fields
 
@@ -99,7 +103,7 @@ Each array accepts at most 128 file or directory paths, with each path bounded a
 : Default observation timeout for `wait_subagents`, in milliseconds from `0` through one hour. A wait timeout never cancels child work.
 
 `subagentWorkTimeoutMs`
-: Deadline for each subagent work cycle, in milliseconds from `1` through one hour. The default is 15 minutes. An accepted initial spawn prompt and each accepted task assigned to an idle child start a fresh deadline; context or tasks delivered while running remain in the current cycle. On expiry Zi interrupts the child, retains timeout evidence, and force-closes it only if bounded interruption settlement fails. A new session is required after changing this setting.
+: Deadline for each subagent work cycle, in milliseconds from `1` through one hour, defaulting to 15 minutes.
 
 `retryEnabled`
 : Turn automatic retry on or off.
@@ -128,8 +132,10 @@ Each array accepts at most 128 file or directory paths, with each path bounded a
 `prompts`
 : Additional prompt-template files or directories.
 
+A changed `subagentWorkTimeoutMs` applies to new sessions, not the running one. See [Subagents](subagents.md) for which work starts a fresh deadline, what Zi records when one expires, and how bounded interruption settlement ends a child.
+
 ## Invalid settings
 
 Settings files are bounded and validated as operational input. If a file is missing, malformed, unreadable, or too large, Zi reports a diagnostic and falls back to valid layers. Zi refuses to overwrite an invalid settings file until you correct it.
 
-See [Resources](resources.md) for configuration locations and trust behavior.
+See [Resources](resources.md) for where these files live and how project trust admits the project scope.

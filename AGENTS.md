@@ -8,6 +8,18 @@
 - OpenCode is a source of proven OpenTUI application patterns, not a template to copy wholesale.
 - `docs/` is the single source for public consumer guides shipped with Zi and rendered by the website. Do not keep a second Markdown corpus under `website/`; keep architecture decisions, roadmaps, research, implementation plans, and maintainer notes out of `docs/`.
 
+## Documentation voice
+
+`docs/` is a man page written by the person who built it. It ships inside the npm tarball and is read by Zi itself as agent context, so density is a feature and narrative padding is a cost.
+
+- Open every page on the reader's situation, then what Zi does about it, then the smallest working example. Never open with a noun-phrase definition of the feature.
+- State the failure a bound or rule prevents where it is not self-evident. Bounds must read as design, not legislation.
+- Say plainly where Zi chose among alternatives or deliberately refuses to do something. A contract page with real non-numeric limits carries a `## What this does not do` section; that section is not a roadmap.
+- One idea per paragraph, two to four sentences, varied sentence length. Do not chain more than two semicolon clauses.
+- Keep Zi's ubiquitous language—admitted, settled, bounded, owner, evidence, projection, generation, trusted, journal—and define it only in `docs/vocabulary.md`.
+- Titles are imperative and goal-shaped for guide pages, noun-shaped for reference pages. Cross-references state why you would follow them.
+- The website Markdown subset is heading, paragraph, code, flat list, single-line definition, and table. Blockquotes and nested lists do not parse, mismatched table rows fail the build, and doc links are not validated. Use `text` fences for figures.
+
 ## Product direction
 
 - Zi is a dependable coding-agent substrate with an opinionated reference terminal client. Optimize supported surfaces for downstream configuration, extension, process composition, and eventually deliberate embedding—not for exporting internal modules.

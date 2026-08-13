@@ -6,7 +6,9 @@ order: 20
 
 # Authenticate and choose a model
 
-Zi can start without configured credentials. No model is selected until a configured provider is available or you provide a runtime override.
+You have just installed Zi and nothing is configured yet. Zi can start without configured credentials; no model is selected until a configured provider is available or you provide a runtime override.
+
+Log in first, then pick a model.
 
 ## Login in the terminal
 
@@ -40,7 +42,9 @@ Logout removes stored credentials for the selected provider. It does not remove 
 /model model-id
 ```
 
-`/model` lists models from configured providers. It shows the last known catalog immediately, then refreshes configured provider catalogs in the background. Refreshed catalogs are retained in `$HOME/.zi/agent/models-store.json`; packaged models remain available when refresh fails or Zi is offline.
+`/model` lists models from configured providers. It shows the last known catalog immediately, then refreshes configured provider catalogs in the background.
+
+Refreshed catalogs are retained in `$HOME/.zi/agent/models-store.json`; packaged models remain available when refresh fails or Zi is offline.
 
 A fully qualified `provider/model-id` selects directly when it matches. A bare model ID selects directly only when it is unambiguous. The selected provider and model are persisted together so Zi does not combine a project model with the wrong global provider.
 
@@ -60,4 +64,4 @@ If Zi can infer one configured default, it selects it. Otherwise interactive mod
 
 Headless modes require enough configuration to run. Missing-model and authentication diagnostics go to stderr, not stdout.
 
-See [CLI](cli.md) for invocation overrides and [Settings](settings.md) for persisted defaults.
+See [CLI](cli.md) for the flags that override a single run and [Settings](settings.md) for the defaults Zi keeps between runs.

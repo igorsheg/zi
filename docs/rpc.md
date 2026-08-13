@@ -1,10 +1,12 @@
 ---
 slug: rpc
 title: RPC protocol
-order: 100
+order: 110
 ---
 
 # RPC protocol
+
+You are building an application or a long-running process that must drive Zi and observe it: send prompts, follow events, page messages and outcomes, select a model, invoke an extension command. One-shot invocations stop being enough once your process needs to stay attached and correlate its own requests against what Zi actually [admitted](vocabulary.md). See [JSON event stream](json-events.md) for the one-shot alternative when a finite invocation is still enough.
 
 Zi RPC is a long-lived process protocol over the same authoritative `AgentSession` used by interactive and print modes. Start with the copyable one-shot client in [`examples/rpc/client.ts`](../examples/rpc/client.ts).
 
@@ -65,7 +67,11 @@ Operation failures use `ok: false` with `capacity`, `not_found`, or `operation_f
 
 A request ID is connection-local and may identify only one admitted, unsettled operation. Reusing an in-flight ID produces a recoverable `protocol_error` with code `invalid_request` and the matching ID; the duplicate record is not launched, including when it requests the reserved interruption slot. An ID may be reused only after its prior correlated response. Reuse always denotes a new request rather than a replay of the prior result.
 
-`session_event` frames contain source-ordered `AgentSessionEvent` values. Model-change events use the public model projection described below instead of exposing provider configuration or credentials. `entry_appended` is the raw all-journal event and includes `custom`, `custom_message`, `work_plan`, `operation_outcome`, and substrate `subagent` entries. Appending an outcome also emits the semantic `operation_outcome` event, so clients that subscribe to all events receive both. The semantic event and `session.get_outcomes` items use the same open outcome envelope: journal `id`, `parentId`, and `timestamp`, plus `operationId`, `capability`, `operation`, `result`, `durationMs`, and bounded producer-owned `evidence`. Delivery messages and tool results are not additional outcomes. Work plan replacements also emit `work_plan_changed`; see [Work plans](work-plans.md). Message pages include displayed custom messages and omit hidden ones; a hidden custom message's committed entry event remains observable to the trusted process client.
+`session_event` frames contain source-ordered `AgentSessionEvent` values. Model-change events use the public model projection described below instead of exposing provider configuration or credentials. `entry_appended` is the raw all-journal event and includes `custom`, `custom_message`, `work_plan`, `operation_outcome`, and substrate `subagent` entries.
+
+Appending an outcome also emits the semantic `operation_outcome` event, so clients that subscribe to all events receive both. The semantic event and `session.get_outcomes` items use the same open outcome envelope: journal `id`, `parentId`, and `timestamp`, plus `operationId`, `capability`, `operation`, `result`, `durationMs`, and bounded producer-owned `evidence`. Delivery messages and tool results are not additional outcomes.
+
+Work plan replacements also emit `work_plan_changed`; see [Work plans](work-plans.md) for the replacement and persistence rules. Message pages include displayed custom messages and omit hidden ones; a hidden custom message's committed entry event remains observable to the trusted process client.
 
 ## Methods
 
@@ -89,7 +95,11 @@ A request ID is connection-local and may identify only one admitted, unsettled o
 
 A direct prompt response means the input was admitted, not that provider work completed. Use ordered session events or `session.await_idle` for completion. `session.await_idle` follows the current session operation and is not an ordinary short request-response deadline; clients that need a work budget must own that policy separately and interrupt the session when it expires. Steering and follow-up input retain `AgentSession` queue semantics and may be queued before the next direct prompt.
 
-A client that needs atomic terminal evidence may attach one stable `completionId` to every prompt admitted into the same logical work cycle, then pass that ID to `session.await_idle`. Each prompt joined to active work advances `completionRevision`; `steer` or `follow_up` input admitted while already idle remains queued for a future turn and keeps the settled revision. The idle response returns the observed revision, final message count, and the latest assistant `message_end` captured for that cycle. Completion text is clipped to 50 KiB and provider error text to 8 KiB. If input was admitted after an earlier idle observation, its newer admission revision tells the client to issue another idle watch; no transcript paging is needed to recover completion evidence. Omitting `completionId` preserves the generic empty idle response. A no-ID prompt that starts or joins work invalidates any earlier completion watch so unrelated assistant output cannot be attributed to it.
+A client that needs atomic terminal evidence may attach one stable `completionId` to every prompt admitted into the same logical work cycle, then pass that ID to `session.await_idle`. Each prompt joined to active work advances `completionRevision`; `steer` or `follow_up` input admitted while already idle remains queued for a future turn and keeps the settled revision.
+
+The idle response returns the observed revision, final message count, and the latest assistant `message_end` captured for that cycle. Completion text is clipped to 50 KiB and provider error text to 8 KiB.
+
+If input was admitted after an earlier idle observation, its newer admission revision tells the client to issue another idle watch; no transcript paging is needed to recover completion evidence. Omitting `completionId` preserves the generic empty idle response. A no-ID prompt that starts or joins work invalidates any earlier completion watch so unrelated assistant output cannot be attributed to it.
 
 `delivery: "continue"` is decided inside the child `AgentSession`: idle starts a direct run; running queues follow-up into the active run. Aborting, compacting, reloading, failed, and disposed states reject the operation. The response reports only that the continue input was admitted, not that its resulting work settled. Clients using completion watches keep the same `completionId` when a continue belongs to the current logical cycle and choose a new ID when starting a new cycle.
 
@@ -99,7 +109,9 @@ A client that needs atomic terminal evidence may attach one stable `completionId
 
 Rejection before launch is definite non-application. This includes malformed requests, duplicate in-flight IDs, and `capacity` responses. A `command.invoke` response with `not_found` also means no extension command was invoked. These outcomes do not affect an already admitted operation that happens to use the duplicated ID.
 
-Once a valid request is admitted, failure is not an idempotency guarantee. If the connection closes before its correlated response, the client cannot tell whether the operation was applied. An `operation_failed` response says that the operation did not complete normally; it does not promise rollback of effects that occurred before the failure. In particular, a `session.prompt` may have started work or queued input before its response is lost, and an extension behind `command.invoke` may perform external side effects before it throws or before its response is lost. Retrying either operation can therefore apply it again.
+Once a valid request is admitted, failure is not an idempotency guarantee. If the connection closes before its correlated response, the client cannot tell whether the operation was applied. An `operation_failed` response says that the operation did not complete normally; it does not promise rollback of effects that occurred before the failure.
+
+In particular, a `session.prompt` may have started work or queued input before its response is lost, and an extension behind `command.invoke` may perform external side effects before it throws or before its response is lost. Retrying either operation can therefore apply it again.
 
 RPC has no response cache or persisted idempotency storage. Clients must use domain evidence such as completion watches, session events, messages, or extension-owned operation keys when they need reconciliation. Reusing the same request ID after any correlated response, including a failure response, starts a new operation and does not retrieve the old response.
 
