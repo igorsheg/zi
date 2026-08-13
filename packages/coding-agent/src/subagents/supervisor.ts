@@ -2,11 +2,7 @@ import { isAbsolute } from "node:path"
 
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core"
 
-import {
-  projectSessionOutcomes,
-  subagentWorkCycleOperationId,
-  type OperationOutcomeEntryInput
-} from "../operation-outcomes.js"
+import { maxOperationOutcomeEvidenceBytes, type OperationOutcome } from "../operation-outcomes.js"
 import type { ProcessTreeTracker } from "../processes/process-tree.js"
 import type { SessionEntry, SessionManager, SubagentEntry, SubagentEntryInput } from "../session-manager.js"
 import type { ToolSurface } from "../tool-surface.js"
@@ -20,6 +16,11 @@ import {
 } from "./child-process.js"
 import { CompletionLedger, maxCompletionLedgerEntries, type CompletionDelivery } from "./completion-ledger.js"
 import { internalSubagentApiKeyEnvironment } from "./invocation.js"
+import {
+  isSubagentWorkCycleOutcome,
+  subagentWorkCycleOperationId,
+  type SubagentWorkCycleOutcomeInput
+} from "./outcome.js"
 import type { PeerAgent, PeerRequest, PeerResult } from "./peer-protocol.js"
 import { defaultWaitTimeoutMs, isSubagentWaitTimeout, maxWaitTimeoutMs } from "./wait-policy.js"
 import { defaultSubagentWorkTimeoutMs, isSubagentWorkTimeout } from "./work-policy.js"
@@ -37,6 +38,7 @@ export const maxSubagentPromptBytes = 8 * 1024 * 1024
 export const maxSubagentNameBytes = 64
 export const maxSubagentTaskBytes = 256
 export const durablePreviewBytes = 8 * 1024
+const maxSubagentOutcomeTextJsonBytes = (maxOperationOutcomeEvidenceBytes - 2 * 1024) / 2
 export const subagentShutdownMs = 9_000
 export const maxRetainedExitedTranscriptBytes = 16 * 1024 * 1024
 
@@ -134,6 +136,9 @@ export class SubagentSupervisor {
   readonly #exited: ExitedRecord[] = []
   readonly #ledger: CompletionLedger
   readonly #waiters = new Set<() => void>()
+  #outcomeSink:
+    | ((outcome: SubagentWorkCycleOutcomeInput, persisted: (outcome: OperationOutcome) => void) => OperationOutcome)
+    | undefined
   readonly waitTimeoutMs: number
   readonly workTimeoutMs: number
   #state: SupervisorState = { type: "open" }
@@ -146,12 +151,10 @@ export class SubagentSupervisor {
     this.#env = validateEnvironment(options.env)
     this.#selection = options.selection
     this.#sessionManager = options.sessionManager
-    const outcomes = projectSessionOutcomes(this.#sessionManager.entries()).filter(
-      outcome => outcome.capability === "subagent"
-    )
+    const outcomes = this.#sessionManager.operationOutcomes().filter(isSubagentWorkCycleOutcome)
     this.#ledger = CompletionLedger.restore(outcomes, this.#sessionManager.subagentEntries(), maxMailboxCompletions)
     for (const outcome of outcomes) {
-      if (outcome.profile) this.#profiles.set(outcome.name, outcome.profile)
+      if (outcome.evidence.profile) this.#profiles.set(outcome.evidence.name, outcome.evidence.profile)
     }
     this.#processTreeTracker = options.processTreeTracker
     this.#toolSurface = options.toolSurface ?? "direct-and-code"
@@ -165,6 +168,14 @@ export class SubagentSupervisor {
 
   get state(): SupervisorState {
     return this.#state
+  }
+
+  bindOperationOutcomeSink(
+    sink: (outcome: SubagentWorkCycleOutcomeInput, persisted: (outcome: OperationOutcome) => void) => OperationOutcome
+  ): void {
+    if (this.#outcomeSink) throw new Error("Subagent operation outcome sink is already bound")
+    this.#outcomeSink = sink
+    this.#pumpMailbox()
   }
 
   subscribe(listener: (event: SubagentSupervisorEvent) => void): () => void {
@@ -684,12 +695,11 @@ export class SubagentSupervisor {
       const completion = pending.completion
       const preview = clipUtf8(completion.text, durablePreviewBytes)
       try {
-        const entry = this.#sessionManager.appendOperationOutcome(
-          subagentOutcome(completion, this.#profiles.get(completion.name), preview)
-        )
-        this.#ledger.commitPersistence(completion.name, completion.workCycle, entry.id)
-        changed.add(completion.name)
-        this.#emit({ type: "entry_appended", entry })
+        if (!this.#outcomeSink) break
+        this.#outcomeSink(subagentOutcome(completion, this.#profiles.get(completion.name), preview), entry => {
+          this.#ledger.commitPersistence(completion.name, completion.workCycle, entry.id)
+          changed.add(completion.name)
+        })
       } catch {
         break
       }
@@ -1176,30 +1186,46 @@ function subagentOutcome(
   completion: SubagentCompletion,
   profile: string | undefined,
   preview: ReturnType<typeof clipUtf8>
-): OperationOutcomeEntryInput {
+): SubagentWorkCycleOutcomeInput {
   const common = {
-    capability: "subagent" as const,
-    operation: "work_cycle" as const,
+    capability: "subagent",
+    operation: "work_cycle",
     operationId: subagentWorkCycleOperationId(completion.name, completion.workCycle),
+    durationMs: completion.durationMs
+  } as const
+  const outcomePreview = clipJsonString(preview.text, maxSubagentOutcomeTextJsonBytes)
+  const evidence = {
     name: completion.name,
     workCycle: completion.workCycle,
     ...(profile ? { profile } : {}),
-    preview: preview.text,
+    preview: outcomePreview.text,
     originalBytes: completion.originalBytes,
-    omittedBytes: completion.omittedBytes + preview.omittedBytes,
-    truncated: completion.truncated || preview.omittedBytes > 0,
-    durationMs: completion.durationMs
+    omittedBytes: completion.omittedBytes + preview.omittedBytes + outcomePreview.omittedBytes,
+    truncated: completion.truncated || preview.omittedBytes > 0 || outcomePreview.omittedBytes > 0
   }
   if (completion.status === "failed") {
-    if (completion.reason === "legacy_failure") throw new Error("Cannot append a projected legacy outcome")
+    const errorMessage = completion.error
+      ? clipJsonString(completion.error, maxSubagentOutcomeTextJsonBytes).text
+      : undefined
     return {
       ...common,
       result: "failed",
-      errorCode: completion.reason,
-      ...(completion.error ? { errorMessage: completion.error } : {})
+      evidence: { ...evidence, errorCode: completion.reason, ...(errorMessage ? { errorMessage } : {}) }
     }
   }
-  return { ...common, result: completion.status === "completed" ? "succeeded" : "cancelled" }
+  return { ...common, result: completion.status === "completed" ? "succeeded" : "cancelled", evidence }
+}
+
+function clipJsonString(value: string, maximumBytes: number): ReturnType<typeof clipUtf8> {
+  let low = 0
+  let high = Math.min(Buffer.byteLength(value), maximumBytes)
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2)
+    const candidate = clipUtf8(value, middle)
+    if (Buffer.byteLength(JSON.stringify(candidate.text)) <= maximumBytes) low = middle
+    else high = middle - 1
+  }
+  return clipUtf8(value, low)
 }
 
 function deferredVoid(): { readonly promise: Promise<void>; resolve(): void } {

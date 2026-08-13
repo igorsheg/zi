@@ -7,6 +7,7 @@ import type {
   ContextUsage
 } from "../agent-session.js"
 import type { AgentMessage } from "../messages.js"
+import type { OperationOutcome } from "../operation-outcomes.js"
 import type { CustomEntry, CustomMessageEntry, SessionEntry } from "../session-manager.js"
 import { decodePeerResponse, type PeerRequest } from "../subagents/peer-protocol.js"
 import {
@@ -87,6 +88,13 @@ export interface RpcMessagePage {
   readonly total: number
   readonly nextStart: number | null
   readonly messages: readonly AgentMessage[]
+}
+
+export interface RpcOutcomePage {
+  readonly start: number
+  readonly total: number
+  readonly nextStart: number | null
+  readonly outcomes: readonly OperationOutcome[]
 }
 
 export type RpcSessionEntry =
@@ -464,6 +472,8 @@ async function handleRequest(session: AgentSession, request: RpcRequest, connect
       return sessionState(session)
     case "session.get_messages":
       return messagePage(session, request.params.start, request.params.limit)
+    case "session.get_outcomes":
+      return outcomePage(session, request.params.start, request.params.limit)
     case "session.prompt": {
       const completionId = request.params.completionId
       const participatesInWork =
@@ -645,6 +655,13 @@ function messagePage(session: AgentSession, start: number, limit: number): RpcMe
   }
   const nextStart = start + messages.length
   return { start, total: all.length, nextStart: nextStart < all.length ? nextStart : null, messages }
+}
+
+function outcomePage(session: AgentSession, start: number, limit: number): RpcOutcomePage {
+  const all = session.sessionManager.operationOutcomes()
+  const outcomes = all.slice(start, start + limit)
+  const nextStart = start + outcomes.length
+  return { start, total: all.length, nextStart: nextStart < all.length ? nextStart : null, outcomes }
 }
 
 function clipUtf8(

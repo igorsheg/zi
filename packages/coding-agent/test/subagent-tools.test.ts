@@ -346,13 +346,19 @@ async function createHarness(name: string, reply: string, delayMs = 30) {
   const root = await mkdtemp(join(tmpdir(), `zi-subagent-tools-${name}-`))
   const cwd = join(root, "project")
   await mkdir(cwd)
+  const sessionManager = SessionManager.inMemory(cwd)
   const supervisor = new SubagentSupervisor({
     command: [process.execPath, mockChild],
     cwd,
     env: { ...process.env, MOCK_RPC_REPLY: reply, MOCK_RPC_DELAY_MS: String(delayMs) },
     selection: () => ({ model: "faux/faux-1", thinkingLevel: "off" }),
-    sessionManager: SessionManager.inMemory(cwd),
+    sessionManager,
     processTreeTracker: createProcessTreeTracker()
+  })
+  supervisor.bindOperationOutcomeSink((outcome, persisted) => {
+    const entry = sessionManager.appendOperationOutcome(outcome)
+    persisted(entry)
+    return entry
   })
   const admissions: Array<{ profile: string; name: string; prompt: string }> = []
   return {

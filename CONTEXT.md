@@ -29,12 +29,12 @@ A SHA-256-addressed raw image file owned by one format-2 session journal. Active
 _Avoid_: Attachment upload, global media cache, inline base64 journal
 
 **Operation outcome**:
-The bounded durable terminal record for one admitted session operation. It carries a deterministic operation identity, a common result, domain-owned stable error codes, safe evidence, and source chronology. Operation outcomes are model- and presentation-invisible; delivery messages and tool results may project the same result but are not additional outcomes. Optional runtime telemetry may correlate through the same operation identity but is not durable session state.
-_Avoid_: Error event, telemetry span, delivery receipt, generic log envelope
+The open bounded durable terminal envelope for one admitted session operation: deterministic operation ID, capability, operation, `succeeded`, `failed`, or `cancelled` result, duration, producer-owned `SessionJson` evidence, and source journal chronology. The core validates the shared envelope; each producer owns its evidence schema, privacy, interpretation, and deterministic identity. Operation outcomes are model- and presentation-invisible; delivery messages and tool results may project the same result but are not additional outcomes.
+_Avoid_: Telemetry event, log record, delivery receipt, tool result
 
 **Operation outcome report**:
-The bounded read-only analysis projection of durable operation outcomes. Common result, duration, chronology, and capability facts remain separate from capability-owned evidence and comparisons; a new capability extends the closed outcome and report variants instead of adding optional universal fields.
-_Avoid_: Generic analytics envelope, telemetry index, copied session history
+The bounded read-only analysis projection of durable operation outcomes. It aggregates common envelope fields and treats producer-owned evidence as opaque `SessionJson`; generic reports do not interpret or classify evidence by capability.
+_Avoid_: Evidence schema registry, telemetry index, copied session history
 
 **Session shell**:
 The session-scoped coding-agent owner of shell task identity, foreground/background transitions, subprocess groups, bounded output files and previews, completion, retention, and disposal. Its Bash and task tools are adapters over the same task state. Run interruption stops foreground work; demoted or explicitly backgrounded work survives until completion, explicit kill, timeout, output bounds, or final session disposal.

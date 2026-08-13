@@ -61,31 +61,19 @@ test("subagent substrate journal evidence restores and rejects malformed variant
     workCycle: 1,
     task: "Inspect the journal"
   })
-  session.appendSubagent({
-    event: "work_cycle_finished",
-    name: "journal-worker",
-    workCycle: 1,
-    status: "completed",
-    preview: "done",
-    originalBytes: 4,
-    omittedBytes: 0,
-    truncated: false,
-    durationMs: 10
-  })
   session.appendSubagent({ event: "work_cycle_delivered", name: "journal-worker", workCycle: 1 })
   expect(SessionManager.open(session.file!).subagentEntries()).toMatchObject([
     { event: "starting", name: "journal-worker" },
     { event: "work_cycle_started", workCycle: 1, task: "Inspect the journal" },
-    { event: "work_cycle_finished", status: "completed", preview: "done" },
     { event: "work_cycle_delivered", workCycle: 1 }
   ])
 
   const journalLines = (await readFile(session.file!, "utf8")).trim().split("\n")
-  const malformed: unknown = JSON.parse(journalLines.at(-2)!)
+  const malformed: unknown = JSON.parse(journalLines.at(-1)!)
   if (typeof malformed !== "object" || malformed === null || Array.isArray(malformed)) {
     throw new Error("Expected a journal entry object")
   }
-  Reflect.set(malformed, "status", "unknown")
+  Reflect.set(malformed, "workCycle", 0)
   await appendFile(
     session.file!,
     `${JSON.stringify({ ...malformed, id: crypto.randomUUID(), parentId: Reflect.get(malformed, "id") })}\n`

@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test"
 
-import type { ProjectedOperationOutcome } from "../packages/coding-agent/src/operation-outcomes.js"
+import type { OperationOutcome } from "../packages/coding-agent/src/operation-outcomes.js"
 import { buildOperationOutcomeReport } from "./operation-outcome-report.js"
 import {
   parseOperationOutcomeScriptOptions,
@@ -56,12 +56,37 @@ test("operation outcome script options resolve scope and bounded report controls
   )
 })
 
-test("operation outcome script emits lossless JSON and capability-owned text evidence", () => {
+test("operation outcome script emits lossless JSON and generic text rows", () => {
   const report = buildOperationOutcomeReport(
     [
       {
         id: "session-a",
-        outcomes: [subagentOutcome(), backgroundTaskOutcome()] satisfies readonly ProjectedOperationOutcome[]
+        outcomes: [
+          {
+            type: "operation_outcome",
+            id: "deploy-entry",
+            parentId: null,
+            operationId: "deploy/release/42",
+            timestamp: "2026-08-12T11:00:00.000Z",
+            capability: "release_pipeline",
+            operation: "deploy",
+            result: "failed",
+            durationMs: 1200,
+            evidence: { region: "eu-west", attempt: 2 }
+          },
+          {
+            type: "operation_outcome",
+            id: "cache-entry",
+            parentId: null,
+            operationId: "cache/warm/42",
+            timestamp: "2026-08-12T10:00:00.000Z",
+            capability: "cache",
+            operation: "warm",
+            result: "cancelled",
+            durationMs: 800,
+            evidence: "superseded"
+          }
+        ] satisfies readonly OperationOutcome[]
       }
     ],
     { cwd: "/workspace/project", generatedAt }
@@ -69,12 +94,15 @@ test("operation outcome script emits lossless JSON and capability-owned text evi
 
   expect(JSON.parse(renderOperationOutcomeScriptReport(report, "json"))).toEqual(report)
   const text = renderOperationOutcomeScriptReport(report, "text")
-  expect(text).toContain("subagent/work_cycle")
-  expect(text).toContain("provider_error")
-  expect(text).toContain("shell/background_task")
-  expect(text).toContain("exit_nonzero")
-  expect(text).toContain("operation=subagent/reviewer/work_cycle/1")
-  expect(text).not.toContain("private prompt")
+  expect(text).toContain("release_pipeline/deploy")
+  expect(text).toContain('evidence={"region":"eu-west","attempt":2}')
+  expect(text).toContain("cache/warm")
+  expect(text).toContain('evidence="superseded"')
+  expect(text).toContain("operation=deploy/release/42")
+  expect(text).toContain("session=session-a")
+  expect(text).toContain("Daily trend")
+  expect(text).not.toContain("Subagent work cycles")
+  expect(text).not.toContain("Background tasks")
 })
 
 test("operation outcome script keeps help on stdout and failures on stderr", async () => {
@@ -92,43 +120,3 @@ test("operation outcome script keeps help on stdout and failures on stderr", asy
   expect(stdout).toBe("")
   expect(stderr).toContain("Unable to report operation outcomes: --recent must be an integer")
 })
-
-function subagentOutcome(): ProjectedOperationOutcome {
-  return {
-    type: "operation_outcome",
-    capability: "subagent",
-    operation: "work_cycle",
-    operationId: "subagent/reviewer/work_cycle/1",
-    sourceEntryId: "subagent-entry",
-    timestamp: "2026-08-12T11:00:00.000Z",
-    durationMs: 1200,
-    name: "reviewer",
-    workCycle: 1,
-    profile: "reviewer",
-    preview: "safe evidence",
-    originalBytes: 13,
-    omittedBytes: 0,
-    truncated: false,
-    result: "failed",
-    errorCode: "provider_error",
-    errorMessage: "provider unavailable"
-  }
-}
-
-function backgroundTaskOutcome(): ProjectedOperationOutcome {
-  return {
-    type: "operation_outcome",
-    capability: "shell",
-    operation: "background_task",
-    operationId: "shell/background_task/11111111-1111-4111-8111-111111111111",
-    sourceEntryId: "shell-entry",
-    timestamp: "2026-08-12T10:00:00.000Z",
-    durationMs: 800,
-    taskId: "11111111-1111-4111-8111-111111111111",
-    origin: "requested",
-    outputBytes: 2048,
-    result: "failed",
-    errorCode: "exit_nonzero",
-    exitCode: 2
-  }
-}

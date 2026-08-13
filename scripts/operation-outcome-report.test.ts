@@ -3,19 +3,13 @@ import { mkdtemp, rm, utimes, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
-import {
-  projectSessionOutcomes,
-  shellBackgroundTaskOperationId,
-  subagentWorkCycleOperationId,
-  type OperationResult
-} from "../packages/coding-agent/src/operation-outcomes.js"
+import type { OperationOutcome, OperationResult } from "../packages/coding-agent/src/operation-outcomes.js"
 import { ZiPaths } from "../packages/coding-agent/src/paths.js"
-import { SessionManager, type SessionEntry } from "../packages/coding-agent/src/session-manager.js"
+import { SessionManager, type SessionJson } from "../packages/coding-agent/src/session-manager.js"
 import {
   buildOperationOutcomeReport,
-  legacySubagentWorkCycleProfileLabel,
   loadOperationOutcomeReport,
-  maxSubagentWorkCycleReportProfiles,
+  maxOperationOutcomeReportCapabilities,
   maxOperationOutcomeReportRecentRows,
   maxOperationOutcomeReportTrendDays
 } from "./operation-outcome-report.js"
@@ -23,51 +17,59 @@ import {
 const generatedAt = "2026-03-10T12:00:00.000Z"
 
 interface OutcomeSpec {
-  readonly name: string
-  readonly workCycle: number
+  readonly id: string
   readonly timestamp: string
+  readonly capability: string
+  readonly operation: string
   readonly result: OperationResult
   readonly durationMs: number
-  readonly profile?: string
-  readonly truncated?: boolean
-  readonly errorCode?: "assignment_failed" | "provider_error"
-  readonly errorMessage?: string
+  readonly evidence: SessionJson
 }
 
-test("report aggregates mixed outcomes with nearest-rank percentiles and UTC days", () => {
+test("report aggregates generic outcomes with nearest-rank percentiles and UTC days", () => {
+  const structuredEvidence = { target: "users", metrics: [3, true] } as const
   const report = buildOperationOutcomeReport(
     [
       reportSession("session-a", [
         outcome({
-          name: "alpha",
-          workCycle: 1,
+          id: "database-snapshot-1",
           timestamp: "2026-03-01T08:00:00.000Z",
+          capability: "database",
+          operation: "snapshot",
           result: "succeeded",
           durationMs: 10,
-          profile: "profile-a"
+          evidence: structuredEvidence
         }),
         outcome({
-          name: "alpha",
-          workCycle: 2,
+          id: "database-snapshot-2",
           timestamp: "2026-03-02T08:00:00.000Z",
+          capability: "database",
+          operation: "snapshot",
           result: "failed",
           durationMs: 30,
-          profile: "profile-a",
-          errorCode: "assignment_failed"
+          evidence: "connection refused"
         }),
         outcome({
-          name: "zeta",
-          workCycle: 1,
+          id: "index-refresh-1",
           timestamp: "2026-03-01T23:30:00.000-01:00",
+          capability: "search_index",
+          operation: "refresh",
           result: "failed",
           durationMs: 40,
-          profile: "profile-z",
-          truncated: true,
-          errorCode: "provider_error",
-          errorMessage: "provider unavailable"
+          evidence: { shard: 7 }
         })
       ]),
-      reportSession("session-b", [legacyOutcome("legacy", 1, "2026-03-01T12:00:00.000Z", 20)])
+      reportSession("session-b", [
+        outcome({
+          id: "index-refresh-2",
+          timestamp: "2026-03-01T12:00:00.000Z",
+          capability: "search_index",
+          operation: "refresh",
+          result: "cancelled",
+          durationMs: 20,
+          evidence: "operator request"
+        })
+      ])
     ],
     { cwd: "/work", generatedAt, invalid: 2, omitted: 3 }
   )
@@ -84,77 +86,41 @@ test("report aggregates mixed outcomes with nearest-rank percentiles and UTC day
   })
   expect(report.capabilities).toEqual([
     {
-      capability: "subagent",
-      operation: "work_cycle",
-      total: 4,
-      succeeded: 1,
-      failed: 2,
-      cancelled: 1,
-      successRate: 0.25,
-      p50DurationMs: 20,
-      p95DurationMs: 40
-    }
-  ])
-  expect(report.subagentWorkCycles.overview).toEqual({ ...report.overview, truncated: 1, truncatedRate: 0.25 })
-  expect(report.dailyTrend).toEqual([
-    { date: "2026-03-01", succeeded: 1, failed: 0, cancelled: 1, p95DurationMs: 20 },
-    { date: "2026-03-02", succeeded: 0, failed: 2, cancelled: 0, p95DurationMs: 40 }
-  ])
-  expect(report.subagentWorkCycles.failureGroups).toEqual([
-    { errorCode: "assignment_failed", count: 1, share: 0.5, affectedProfileCount: 1 },
-    { errorCode: "provider_error", count: 1, share: 0.5, affectedProfileCount: 1 }
-  ])
-  expect(report.subagentWorkCycles.profiles).toEqual([
-    {
-      profile: "profile-a",
+      capability: "database",
+      operation: "snapshot",
       total: 2,
       succeeded: 1,
       failed: 1,
       cancelled: 0,
       successRate: 0.5,
       p50DurationMs: 10,
-      p95DurationMs: 30,
-      truncated: 0
+      p95DurationMs: 30
     },
     {
-      profile: legacySubagentWorkCycleProfileLabel,
-      total: 1,
+      capability: "search_index",
+      operation: "refresh",
+      total: 2,
       succeeded: 0,
-      failed: 0,
+      failed: 1,
       cancelled: 1,
       successRate: 0,
       p50DurationMs: 20,
-      p95DurationMs: 20,
-      truncated: 0
-    },
-    {
-      profile: "profile-z",
-      total: 1,
-      succeeded: 0,
-      failed: 1,
-      cancelled: 0,
-      successRate: 0,
-      p50DurationMs: 40,
-      p95DurationMs: 40,
-      truncated: 1
+      p95DurationMs: 40
     }
   ])
-  expect(report.recent.find(row => row.capability === "subagent" && row.runtimeName === "zeta")).toEqual(
-    expect.objectContaining({
-      sessionId: "session-a",
-      profile: "profile-z",
-      errorCode: "provider_error",
-      errorMessage: "provider unavailable"
-    })
+  expect(report.dailyTrend).toEqual([
+    { date: "2026-03-01", succeeded: 1, failed: 0, cancelled: 1, p95DurationMs: 20 },
+    { date: "2026-03-02", succeeded: 0, failed: 2, cancelled: 0, p95DurationMs: 40 }
+  ])
+  expect(report.recent.find(row => row.id === "database-snapshot-2")).toEqual(
+    expect.objectContaining({ sessionId: "session-a", evidence: "connection refused" })
   )
+  expect(report.recent.find(row => row.id === "database-snapshot-1")?.evidence).toBe(structuredEvidence)
   expect(Object.isFrozen(report)).toBe(true)
   expect(Object.isFrozen(report.scope)).toBe(true)
   expect(Object.isFrozen(report.dailyTrend)).toBe(true)
   expect(Object.isFrozen(report.dailyTrend[0])).toBe(true)
   expect(Object.isFrozen(report.capabilities[0])).toBe(true)
-  expect(Object.isFrozen(report.subagentWorkCycles)).toBe(true)
-  expect(Object.isFrozen(report.subagentWorkCycles.failureGroups[0])).toBe(true)
-  expect(Object.isFrozen(report.subagentWorkCycles.profiles[0])).toBe(true)
   expect(Object.isFrozen(report.recent[0])).toBe(true)
 })
 
@@ -172,128 +138,7 @@ test("empty reports use null rates and duration percentiles", () => {
   })
   expect(report.capabilities).toEqual([])
   expect(report.dailyTrend).toEqual([])
-  expect(report.subagentWorkCycles).toEqual({
-    overview: { ...report.overview, truncated: 0, truncatedRate: null },
-    failureGroups: [],
-    profiles: []
-  })
-  expect(report.backgroundTasks).toEqual({
-    overview: report.overview,
-    failureGroups: [],
-    cancellationGroups: [],
-    origins: [],
-    output: { totalBytes: 0, p50Bytes: null, p95Bytes: null }
-  })
   expect(report.recent).toEqual([])
-})
-
-test("report keeps background task evidence in its closed capability section", () => {
-  const report = buildOperationOutcomeReport(
-    [
-      reportSession("session", [
-        outcome({
-          name: "worker",
-          workCycle: 1,
-          timestamp: "2026-03-02T00:00:00.000Z",
-          result: "succeeded",
-          durationMs: 10,
-          profile: "reviewer"
-        }),
-        shellOutcome({
-          taskId: "11111111-1111-4111-8111-111111111111",
-          timestamp: "2026-03-02T01:00:00.000Z",
-          origin: "requested",
-          result: "failed",
-          durationMs: 20,
-          outputBytes: 100,
-          errorCode: "exit_nonzero",
-          exitCode: 7
-        }),
-        shellOutcome({
-          taskId: "22222222-2222-4222-8222-222222222222",
-          timestamp: "2026-03-02T02:00:00.000Z",
-          origin: "demoted",
-          result: "cancelled",
-          durationMs: 30,
-          outputBytes: 300,
-          cancellationCode: "killed"
-        })
-      ])
-    ],
-    { cwd: "/work", generatedAt }
-  )
-
-  expect(report.overview).toEqual({
-    total: 3,
-    succeeded: 1,
-    failed: 1,
-    cancelled: 1,
-    successRate: 1 / 3,
-    p50DurationMs: 20,
-    p95DurationMs: 30
-  })
-  expect(report.capabilities).toEqual([
-    {
-      capability: "shell",
-      operation: "background_task",
-      total: 2,
-      succeeded: 0,
-      failed: 1,
-      cancelled: 1,
-      successRate: 0,
-      p50DurationMs: 20,
-      p95DurationMs: 30
-    },
-    {
-      capability: "subagent",
-      operation: "work_cycle",
-      total: 1,
-      succeeded: 1,
-      failed: 0,
-      cancelled: 0,
-      successRate: 1,
-      p50DurationMs: 10,
-      p95DurationMs: 10
-    }
-  ])
-  expect(report.backgroundTasks).toEqual({
-    overview: { total: 2, succeeded: 0, failed: 1, cancelled: 1, successRate: 0, p50DurationMs: 20, p95DurationMs: 30 },
-    failureGroups: [{ errorCode: "exit_nonzero", count: 1, share: 1 }],
-    cancellationGroups: [{ cancellationCode: "killed", count: 1, share: 1 }],
-    origins: [
-      {
-        origin: "demoted",
-        total: 1,
-        succeeded: 0,
-        failed: 0,
-        cancelled: 1,
-        successRate: 0,
-        p50DurationMs: 30,
-        p95DurationMs: 30
-      },
-      {
-        origin: "requested",
-        total: 1,
-        succeeded: 0,
-        failed: 1,
-        cancelled: 0,
-        successRate: 0,
-        p50DurationMs: 20,
-        p95DurationMs: 20
-      }
-    ],
-    output: { totalBytes: 400, p50Bytes: 100, p95Bytes: 300 }
-  })
-  expect(report.recent[0]).toEqual(
-    expect.objectContaining({
-      capability: "shell",
-      taskId: "22222222-2222-4222-8222-222222222222",
-      cancellationCode: "killed"
-    })
-  )
-  const serialized = JSON.stringify(report)
-  expect(serialized).not.toContain("command")
-  expect(serialized).not.toContain("output text")
 })
 
 test("report applies since before aggregation and sorts recent ties deterministically", () => {
@@ -301,18 +146,34 @@ test("report applies since before aggregation and sorts recent ties deterministi
   const report = buildOperationOutcomeReport(
     [
       reportSession("session-z", [
-        outcome({ name: "worker-z", workCycle: 1, timestamp, result: "succeeded", durationMs: 3, profile: "same" })
+        outcome({
+          id: "z-entry",
+          timestamp,
+          capability: "novel",
+          operation: "execute",
+          result: "succeeded",
+          durationMs: 3,
+          evidence: null
+        })
       ]),
       reportSession("session-a", [
-        outcome({ name: "worker-a", workCycle: 1, timestamp, result: "succeeded", durationMs: 2, profile: "same" }),
         outcome({
-          name: "worker-a",
-          workCycle: 2,
+          id: "a-entry",
+          timestamp,
+          capability: "novel",
+          operation: "execute",
+          result: "succeeded",
+          durationMs: 2,
+          evidence: false
+        }),
+        outcome({
+          id: "old-entry",
           timestamp: "2026-03-01T23:59:59.999Z",
+          capability: "novel",
+          operation: "execute",
           result: "failed",
           durationMs: 1,
-          profile: "same",
-          errorCode: "provider_error"
+          evidence: "old"
         })
       ])
     ],
@@ -322,85 +183,56 @@ test("report applies since before aggregation and sorts recent ties deterministi
   expect(report.since).toBe(timestamp)
   expect(report.scope.sessionsWithOutcomes).toBe(2)
   expect(report.overview.total).toBe(2)
-  expect(report.subagentWorkCycles.failureGroups).toEqual([])
   expect(report.recent.map(row => row.sessionId)).toEqual(["session-a", "session-z"])
 })
 
-test("recent outcomes are newest-first and UTC trend days stay bounded", () => {
+test("recent outcomes, trend days, and capability rows stay bounded", () => {
   const count = maxOperationOutcomeReportTrendDays + 1
   const entries = Array.from({ length: count }, (_, index) =>
     outcome({
-      name: "worker",
-      workCycle: index + 1,
+      id: `entry-${index}`,
       timestamp: new Date(Date.UTC(2026, 0, 1) + index * 86_400_000).toISOString(),
+      capability: `cap_${String(index % (maxOperationOutcomeReportCapabilities + 1)).padStart(2, "0")}`,
+      operation: "execute",
       result: "succeeded",
       durationMs: index,
-      profile: `profile-${index.toString().padStart(3, "0")}`
+      evidence: index
     })
   )
   const report = buildOperationOutcomeReport([reportSession("session", entries)], { cwd: "/work", generatedAt })
 
   expect(report.overview.total).toBe(count)
   expect(report.recent).toHaveLength(maxOperationOutcomeReportRecentRows)
-  expect(report.recent[0]?.capability === "subagent" ? report.recent[0].workCycle : undefined).toBe(count)
-  const oldestRecent = report.recent.at(-1)
-  expect(oldestRecent?.capability === "subagent" ? oldestRecent.workCycle : undefined).toBe(
-    count - maxOperationOutcomeReportRecentRows + 1
-  )
+  expect(report.recent[0]?.evidence).toBe(count - 1)
+  expect(report.recent.at(-1)?.evidence).toBe(count - maxOperationOutcomeReportRecentRows)
   expect(report.dailyTrend).toHaveLength(maxOperationOutcomeReportTrendDays)
   expect(report.dailyTrend[0]?.date).toBe("2026-01-02")
-  expect(report.subagentWorkCycles.profiles).toHaveLength(maxSubagentWorkCycleReportProfiles)
-  expect(report.subagentWorkCycles.profiles[0]?.profile).toBe("profile-000")
-  expect(report.subagentWorkCycles.profiles.at(-1)?.profile).toBe("profile-099")
+  expect(report.capabilities).toHaveLength(maxOperationOutcomeReportCapabilities)
 })
 
-test("loader deduplicates legacy and native outcomes and accounts for invalid and omitted journals", async () => {
+test("loader reads canonical outcomes and accounts for invalid and omitted journals", async () => {
   const root = await mkdtemp(join(tmpdir(), "zi-operation-report-"))
   const paths = new ZiPaths(join(root, "project"), join(root, "agent"))
   try {
-    const deduplicated = SessionManager.create(paths)
-    deduplicated.appendMessage({ role: "user", content: "private task", timestamp: 1 })
-    deduplicated.appendSubagent({
-      event: "work_cycle_finished",
-      name: "worker",
-      workCycle: 1,
-      status: "failed",
-      preview: "legacy",
-      originalBytes: 6,
-      omittedBytes: 0,
-      truncated: false,
-      durationMs: 5,
-      reason: "provider_error"
-    })
-    deduplicated.appendOperationOutcome({
-      capability: "subagent",
-      operation: "work_cycle",
-      operationId: subagentWorkCycleOperationId("worker", 1),
-      name: "worker",
-      workCycle: 1,
-      profile: "native-profile",
+    const included = SessionManager.create(paths)
+    included.appendMessage({ role: "user", content: "private task", timestamp: 1 })
+    included.appendOperationOutcome({
+      operationId: "workflow/run/included",
+      capability: "workflow",
+      operation: "run",
       result: "succeeded",
-      preview: "native",
-      originalBytes: 6,
-      omittedBytes: 0,
-      truncated: false,
-      durationMs: 10
+      durationMs: 10,
+      evidence: { label: "included", metrics: [1, true] }
     })
 
     const omitted = SessionManager.create(paths)
     omitted.appendOperationOutcome({
-      capability: "subagent",
-      operation: "work_cycle",
-      operationId: subagentWorkCycleOperationId("omitted", 1),
-      name: "omitted",
-      workCycle: 1,
-      profile: "omitted-profile",
+      operationId: "workflow/run/omitted",
+      capability: "workflow",
+      operation: "run",
       result: "succeeded",
-      preview: "omitted",
-      originalBytes: 7,
-      omittedBytes: 0,
-      truncated: false,
-      durationMs: 1
+      durationMs: 1,
+      evidence: "omitted evidence"
     })
 
     const invalidPath = join(paths.sessionDir, "invalid-after-preview.jsonl")
@@ -422,7 +254,7 @@ test("loader deduplicates legacy and native outcomes and accounts for invalid an
 
     await utimes(omitted.file!, new Date(1000), new Date(1000))
     await utimes(invalidPath, new Date(2000), new Date(2000))
-    await utimes(deduplicated.file!, new Date(3000), new Date(3000))
+    await utimes(included.file!, new Date(3000), new Date(3000))
 
     const report = await loadOperationOutcomeReport(paths, { generatedAt, sessionLimit: 2 })
 
@@ -430,10 +262,11 @@ test("loader deduplicates legacy and native outcomes and accounts for invalid an
     expect(report.overview.total).toBe(1)
     expect(report.recent).toEqual([
       expect.objectContaining({
-        sessionId: deduplicated.sessionId,
+        sessionId: included.sessionId,
+        operationId: "workflow/run/included",
         result: "succeeded",
-        profile: "native-profile",
-        durationMs: 10
+        durationMs: 10,
+        evidence: { label: "included", metrics: [1, true] }
       })
     ])
     const serialized = JSON.stringify(report)
@@ -446,88 +279,21 @@ test("loader deduplicates legacy and native outcomes and accounts for invalid an
   }
 })
 
-function reportSession(id: string, entries: readonly SessionEntry[]) {
-  return { id, outcomes: projectSessionOutcomes(entries) }
+function reportSession(id: string, outcomes: readonly OperationOutcome[]) {
+  return { id, outcomes }
 }
 
-function outcome(spec: OutcomeSpec): SessionEntry {
-  const operationId = subagentWorkCycleOperationId(spec.name, spec.workCycle)
-  const evidence = {
-    type: "operation_outcome" as const,
-    id: operationId,
-    parentId: null,
-    timestamp: spec.timestamp,
-    capability: "subagent" as const,
-    operation: "work_cycle" as const,
-    operationId,
-    name: spec.name,
-    workCycle: spec.workCycle,
-    ...(spec.profile === undefined ? {} : { profile: spec.profile }),
-    preview: "",
-    originalBytes: 0,
-    omittedBytes: 0,
-    truncated: spec.truncated ?? false,
-    durationMs: spec.durationMs
-  }
-  if (spec.result === "failed") {
-    return {
-      ...evidence,
-      result: spec.result,
-      errorCode: spec.errorCode ?? "provider_error",
-      ...(spec.errorMessage === undefined ? {} : { errorMessage: spec.errorMessage })
-    }
-  }
-  return { ...evidence, result: spec.result }
-}
-
-type ShellOutcomeSpec = {
-  readonly taskId: string
-  readonly timestamp: string
-  readonly origin: "requested" | "demoted"
-  readonly durationMs: number
-  readonly outputBytes: number
-} & (
-  | { readonly result: "succeeded" }
-  | { readonly result: "cancelled"; readonly cancellationCode: "killed" | "disposed" }
-  | { readonly result: "failed"; readonly errorCode: "exit_nonzero"; readonly exitCode: number }
-)
-
-function shellOutcome(spec: ShellOutcomeSpec): SessionEntry {
-  const operationId = shellBackgroundTaskOperationId(spec.taskId)
-  const evidence = {
-    type: "operation_outcome" as const,
-    id: operationId,
-    parentId: null,
-    timestamp: spec.timestamp,
-    capability: "shell" as const,
-    operation: "background_task" as const,
-    operationId,
-    taskId: spec.taskId,
-    origin: spec.origin,
-    durationMs: spec.durationMs,
-    outputBytes: spec.outputBytes
-  }
-  if (spec.result === "succeeded") return { ...evidence, result: spec.result, exitCode: 0 }
-  if (spec.result === "cancelled") {
-    return { ...evidence, result: spec.result, cancellationCode: spec.cancellationCode }
-  }
-  return { ...evidence, result: spec.result, errorCode: spec.errorCode, exitCode: spec.exitCode }
-}
-
-function legacyOutcome(name: string, workCycle: number, timestamp: string, durationMs: number): SessionEntry {
+function outcome(spec: OutcomeSpec): OperationOutcome {
   return {
-    type: "subagent",
-    event: "work_cycle_finished",
-    id: `legacy-${name}-${workCycle}`,
+    type: "operation_outcome",
+    id: spec.id,
     parentId: null,
-    timestamp,
-    name,
-    workCycle,
-    status: "cancelled",
-    preview: "",
-    originalBytes: 0,
-    omittedBytes: 0,
-    truncated: false,
-    durationMs
+    timestamp: spec.timestamp,
+    operationId: `operation/${spec.id}`,
+    capability: spec.capability,
+    operation: spec.operation,
+    result: spec.result,
+    durationMs: spec.durationMs,
+    evidence: spec.evidence
   }
 }

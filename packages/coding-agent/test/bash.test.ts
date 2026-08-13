@@ -4,7 +4,7 @@ import { mkdtemp, readFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
-import type { ShellBackgroundTaskOperationOutcomeInput } from "../src/operation-outcomes.js"
+import type { ShellBackgroundTaskOperationOutcomeInput } from "../src/session-shell.js"
 import { defaultShellLimits, SessionShell, ShellRunAdmissionError, type ShellLimits } from "../src/session-shell.js"
 import { createBashTool, isBashToolDetails } from "../src/tools/bash.js"
 import { projectToolPresentation } from "../src/tools/presentation/project.js"
@@ -306,12 +306,14 @@ test("background task settlement emits one closed operation outcome", async () =
       expect.objectContaining({
         capability: "shell",
         operation: "background_task",
-        taskId: started.task.taskId,
-        origin: "requested",
         result: "failed",
-        errorCode: "exit_nonzero",
-        exitCode: 7,
-        outputBytes: 10
+        evidence: expect.objectContaining({
+          taskId: started.task.taskId,
+          origin: "requested",
+          errorCode: "exit_nonzero",
+          exitCode: 7,
+          outputBytes: 10
+        })
       })
     ])
     expect(JSON.stringify(outcomes)).not.toContain("printf background")
@@ -350,10 +352,12 @@ test("demotion and task control preserve one background operation identity", asy
 
     expect(outcomes).toEqual([
       expect.objectContaining({
-        taskId: demoted.task.taskId,
-        origin: "demoted",
         result: "cancelled",
-        cancellationCode: "killed"
+        evidence: expect.objectContaining({
+          taskId: demoted.task.taskId,
+          origin: "demoted",
+          cancellationCode: "killed"
+        })
       })
     ])
   } finally {
@@ -394,9 +398,18 @@ test("background timeout, output limit, and disposal retain distinct outcomes", 
 
   expect(outcomes).toEqual(
     expect.arrayContaining([
-      expect.objectContaining({ taskId: timed.task.taskId, result: "failed", errorCode: "timed_out" }),
-      expect.objectContaining({ taskId: limited.task.taskId, result: "failed", errorCode: "output_limit" }),
-      expect.objectContaining({ taskId: disposed.task.taskId, result: "cancelled", cancellationCode: "disposed" })
+      expect.objectContaining({
+        result: "failed",
+        evidence: expect.objectContaining({ taskId: timed.task.taskId, errorCode: "timed_out" })
+      }),
+      expect.objectContaining({
+        result: "failed",
+        evidence: expect.objectContaining({ taskId: limited.task.taskId, errorCode: "output_limit" })
+      }),
+      expect.objectContaining({
+        result: "cancelled",
+        evidence: expect.objectContaining({ taskId: disposed.task.taskId, cancellationCode: "disposed" })
+      })
     ])
   )
   rmSync(cwd, { recursive: true, force: true })
@@ -436,13 +449,13 @@ test("background outcome persistence retries at the next delivery boundary", asy
     expect(outcomes).toEqual([])
 
     shell.retryPendingOutcomes()
-    expect(outcomes.map(outcome => outcome.taskId)).toEqual([first.task.taskId])
+    expect(outcomes.map(outcome => outcome.evidence.taskId)).toEqual([first.task.taskId])
 
     const second = await shell.run("second", { command: "printf second", timeoutMs: 2_000, background: true })
     if (second.type !== "backgrounded") throw new Error("Expected second background task")
     await shell.wait(second.task.taskId, 2_000)
 
-    expect(outcomes.map(outcome => outcome.taskId)).toEqual([first.task.taskId, second.task.taskId])
+    expect(outcomes.map(outcome => outcome.evidence.taskId)).toEqual([first.task.taskId, second.task.taskId])
   } finally {
     await shell.dispose()
     rmSync(cwd, { recursive: true, force: true })

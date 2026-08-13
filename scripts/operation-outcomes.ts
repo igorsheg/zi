@@ -166,74 +166,23 @@ function renderTextReport(report: OperationOutcomeReport): string {
   if (report.capabilities.length === 0) lines.push("  None")
   for (const row of report.capabilities) lines.push(`  ${row.capability}/${row.operation}: ${overviewValues(row)}`)
 
-  lines.push("", "Subagent work cycles", `  ${overviewValues(report.subagentWorkCycles.overview)}`)
-  lines.push(
-    `  Evidence truncated: ${report.subagentWorkCycles.overview.truncated} (${percentage(report.subagentWorkCycles.overview.truncatedRate)})`
-  )
-  if (report.subagentWorkCycles.failureGroups.length > 0) {
-    lines.push("  Failure codes:")
-    for (const group of report.subagentWorkCycles.failureGroups) {
-      lines.push(
-        `    ${group.errorCode}: ${group.count} (${percentage(group.share)} of failures), ${group.affectedProfileCount} profiles`
-      )
-    }
-  }
-  if (report.subagentWorkCycles.profiles.length > 0) {
-    lines.push("  Profiles:")
-    for (const profile of report.subagentWorkCycles.profiles) {
-      lines.push(`    ${profile.profile}: ${overviewValues(profile)}, truncated=${profile.truncated}`)
-    }
-  }
-
-  lines.push("", "Background tasks", `  ${overviewValues(report.backgroundTasks.overview)}`)
-  lines.push(
-    `  Output bytes: total=${report.backgroundTasks.output.totalBytes}, p50=${nullableInteger(report.backgroundTasks.output.p50Bytes)}, p95=${nullableInteger(report.backgroundTasks.output.p95Bytes)}`
-  )
-  if (report.backgroundTasks.failureGroups.length > 0) {
-    lines.push("  Failure codes:")
-    for (const group of report.backgroundTasks.failureGroups) {
-      lines.push(`    ${group.errorCode}: ${group.count} (${percentage(group.share)} of failures)`)
-    }
-  }
-  if (report.backgroundTasks.cancellationGroups.length > 0) {
-    lines.push("  Cancellation codes:")
-    for (const group of report.backgroundTasks.cancellationGroups) {
-      lines.push(`    ${group.cancellationCode}: ${group.count} (${percentage(group.share)} of cancellations)`)
-    }
-  }
-  if (report.backgroundTasks.origins.length > 0) {
-    lines.push("  Origins:")
-    for (const origin of report.backgroundTasks.origins) lines.push(`    ${origin.origin}: ${overviewValues(origin)}`)
+  lines.push("", "Daily trend")
+  if (report.dailyTrend.length === 0) lines.push("  None")
+  for (const day of report.dailyTrend) {
+    lines.push(
+      `  ${day.date}: succeeded=${day.succeeded}, failed=${day.failed}, cancelled=${day.cancelled}, p95=${duration(day.p95DurationMs)}`
+    )
   }
 
   lines.push("", `Recent outcomes (${report.recent.length})`)
   if (report.recent.length === 0) lines.push("  None")
   for (const outcome of report.recent) {
-    const evidence =
-      outcome.capability === "subagent"
-        ? `${outcome.profile}/${outcome.runtimeName}#${outcome.workCycle}${outcome.truncated ? " truncated" : ""}`
-        : `${outcome.origin}/${outcome.taskId} output=${outcome.outputBytes}B`
-    const terminal = terminalEvidence(outcome)
     lines.push(
-      `  ${outcome.timestamp} ${outcome.capability}/${outcome.operation} ${outcome.result}${terminal} ${duration(outcome.durationMs)} ${evidence} operation=${outcome.operationId} session=${outcome.sessionId}`
+      `  ${outcome.timestamp} ${outcome.capability}/${outcome.operation} ${outcome.result} ${duration(outcome.durationMs)} operation=${outcome.operationId} entry=${outcome.id} session=${outcome.sessionId} evidence=${JSON.stringify(outcome.evidence)}`
     )
   }
 
   return lines.join("\n")
-}
-
-function terminalEvidence(outcome: OperationOutcomeReport["recent"][number]): string {
-  if (outcome.result === "cancelled") {
-    return outcome.capability === "shell" ? ` cancellation=${outcome.cancellationCode}` : ""
-  }
-  if (outcome.result !== "failed") return ""
-  if (outcome.capability === "shell" && outcome.errorCode === "exit_nonzero") {
-    return ` error=${outcome.errorCode} exit=${outcome.exitCode}`
-  }
-  if (outcome.capability === "shell" && outcome.errorCode === "signaled") {
-    return ` error=${outcome.errorCode} signal=${outcome.signal}`
-  }
-  return ` error=${outcome.errorCode}`
 }
 
 function overviewLine(label: string, overview: OperationOutcomeOverview): string {
@@ -250,10 +199,6 @@ function percentage(value: number | null): string {
 
 function duration(value: number | null): string {
   return value === null ? "n/a" : `${value}ms`
-}
-
-function nullableInteger(value: number | null): string {
-  return value === null ? "n/a" : String(value)
 }
 
 function parseSince(value: string): string {

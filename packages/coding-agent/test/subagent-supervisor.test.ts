@@ -9,11 +9,17 @@ import type { AgentTool } from "@earendil-works/pi-agent-core"
 import { Type } from "@earendil-works/pi-ai"
 
 import { CodeMode, isCodeModeDetails } from "../src/code-mode/code-mode.js"
-import { projectSessionOutcomes } from "../src/operation-outcomes.js"
+import { isRecord } from "../src/guards.js"
+import { maxOperationOutcomeEvidenceBytes } from "../src/operation-outcomes.js"
 import { ZiPaths } from "../src/paths.js"
 import { createProcessTreeTracker } from "../src/processes/process-tree.js"
 import { SessionManager } from "../src/session-manager.js"
 import { clipUtf8 } from "../src/subagents/child-process.js"
+import {
+  isSubagentWorkCycleOutcome,
+  subagentWorkCycleOperationId,
+  type SubagentWorkCycleOutcome
+} from "../src/subagents/outcome.js"
 import { durablePreviewBytes, maxRetainedSubagents, SubagentSupervisor } from "../src/subagents/supervisor.js"
 import { createSubagentTools } from "../src/subagents/tools.js"
 
@@ -22,6 +28,41 @@ const codeModeWorkerCommand = Object.freeze([
   process.execPath,
   fileURLToPath(new URL("../src/code-mode/worker-entry.ts", import.meta.url))
 ])
+
+function subagentOutcomes(sessionManager: SessionManager): readonly SubagentWorkCycleOutcome[] {
+  return sessionManager.operationOutcomes().filter(isSubagentWorkCycleOutcome)
+}
+
+function appendSubagentOutcome(
+  sessionManager: SessionManager,
+  input: {
+    readonly name: string
+    readonly workCycle: number
+    readonly result: "succeeded" | "failed" | "cancelled"
+    readonly preview: string
+    readonly durationMs: number
+    readonly errorCode?: "work_cycle_timeout"
+    readonly errorMessage?: string
+  }
+): void {
+  sessionManager.appendOperationOutcome({
+    capability: "subagent",
+    operation: "work_cycle",
+    operationId: subagentWorkCycleOperationId(input.name, input.workCycle),
+    result: input.result,
+    durationMs: input.durationMs,
+    evidence: {
+      name: input.name,
+      workCycle: input.workCycle,
+      preview: input.preview,
+      originalBytes: Buffer.byteLength(input.preview),
+      omittedBytes: 0,
+      truncated: false,
+      ...(input.errorCode ? { errorCode: input.errorCode } : {}),
+      ...(input.errorMessage ? { errorMessage: input.errorMessage } : {})
+    }
+  })
+}
 
 test("UTF-8 clipping handles maximum admitted task text without splitting code points", () => {
   const clipped = clipUtf8(`${"a".repeat(8 * 1024 * 1024 - 3)}界`, 256)
@@ -47,13 +88,11 @@ test("SubagentSupervisor spawns, durably publishes completion, waits, and closes
 
     await waitFor(() => harness.supervisor.status().readyNames.length > 0, 5_000)
     expect(harness.supervisor.status()).toEqual({ workingNames: [], readyNames: [name] })
-    expect(projectSessionOutcomes(harness.sessionManager.entries()).at(-1)).toMatchObject({
+    expect(subagentOutcomes(harness.sessionManager).at(-1)).toMatchObject({
       capability: "subagent",
       operation: "work_cycle",
-      name,
-      workCycle: 1,
       result: "succeeded",
-      preview: "supervisor-ok"
+      evidence: { name, workCycle: 1, preview: "supervisor-ok" }
     })
 
     const deliveryEvents: string[] = []
@@ -182,7 +221,9 @@ test("extension wait keeps its current-cycle barrier when older completion persi
   Object.defineProperty(harness.sessionManager, "appendOperationOutcome", {
     configurable: true,
     value(data: Parameters<SessionManager["appendOperationOutcome"]>[0]) {
-      if (data.capability === "subagent" && data.workCycle === 1) throw new Error("journal unavailable")
+      if (data.capability === "subagent" && isRecord(data.evidence) && data.evidence.workCycle === 1) {
+        throw new Error("journal unavailable")
+      }
       return append(data)
     }
   })
@@ -380,8 +421,11 @@ test("shutdown after initial cycle admission publishes terminal evidence", async
     expect(await outcome).toBe("rejected")
     expect(shutdown).toBeDefined()
     await shutdown
-    expect(projectSessionOutcomes(harness.sessionManager.entries())).toContainEqual(
-      expect.objectContaining({ name: "cycle-worker", workCycle: 1, result: "failed", errorCode: "child_exited" })
+    expect(subagentOutcomes(harness.sessionManager)).toContainEqual(
+      expect.objectContaining({
+        result: "failed",
+        evidence: expect.objectContaining({ name: "cycle-worker", workCycle: 1, errorCode: "child_exited" })
+      })
     )
     expect(harness.supervisor.snapshots()[0]).toMatchObject({
       name: "cycle-worker",
@@ -627,8 +671,11 @@ test("shutdown after work-cycle admission publishes terminal evidence", async ()
     await shutdown
     unsubscribe()
 
-    expect(projectSessionOutcomes(harness.sessionManager.entries())).toContainEqual(
-      expect.objectContaining({ name, workCycle: 2, result: "failed", errorCode: "child_exited" })
+    expect(subagentOutcomes(harness.sessionManager)).toContainEqual(
+      expect.objectContaining({
+        result: "failed",
+        evidence: expect.objectContaining({ name, workCycle: 2, errorCode: "child_exited" })
+      })
     )
     expect(harness.supervisor.snapshots()[0]).toMatchObject({
       name,
@@ -693,9 +740,9 @@ test("completion durability commits before entry observers can claim it", async 
   let claimed: ReturnType<SubagentSupervisor["waitForTool"]> | undefined
   const unsubscribe = harness.supervisor.subscribe(event => {
     if (
-      event.type === "entry_appended" &&
-      event.entry.type === "operation_outcome" &&
-      event.entry.capability === "subagent"
+      event.type === "changed" &&
+      event.name === "cycle-worker" &&
+      subagentOutcomes(harness.sessionManager).length > 0
     ) {
       claimed ??= harness.supervisor.waitForTool(["cycle-worker"], 0, undefined, "entry-observer")
     }
@@ -793,11 +840,13 @@ test("provider failure metadata is bounded before durable completion admission",
     const [snapshot] = await harness.supervisor.wait([name], 0)
     expect(snapshot?.completion).toMatchObject({ workCycle: 1, status: "failed", text: "failed-output" })
     expect(Buffer.byteLength(snapshot?.completion?.error ?? "")).toBe(durablePreviewBytes)
-    expect(
-      projectSessionOutcomes(harness.sessionManager.entries()).find(
-        outcome => outcome.capability === "subagent" && outcome.name === name
-      )
-    ).toMatchObject({ errorMessage: "x".repeat(durablePreviewBytes) })
+    const outcome = subagentOutcomes(harness.sessionManager).find(candidate => candidate.evidence.name === name)
+    if (!outcome || outcome.result !== "failed") throw new Error("Expected failed work-cycle outcome")
+    const errorMessage = outcome.evidence.errorMessage
+    expect(typeof errorMessage).toBe("string")
+    if (typeof errorMessage !== "string") throw new Error("Expected bounded provider error evidence")
+    expect(Buffer.byteLength(errorMessage)).toBeLessThan(durablePreviewBytes)
+    expect(Buffer.byteLength(JSON.stringify(outcome.evidence))).toBeLessThanOrEqual(maxOperationOutcomeEvidenceBytes)
   } finally {
     await harness.dispose()
   }
@@ -812,10 +861,9 @@ test("SubagentSupervisor publishes bounded actionable diagnostics when a child p
       lifecycle: "exited",
       completion: { status: "failed", reason: "child_failed", error: "Subagent RPC emitted invalid JSONL" }
     })
-    expect(projectSessionOutcomes(harness.sessionManager.entries()).at(-1)).toMatchObject({
+    expect(subagentOutcomes(harness.sessionManager).at(-1)).toMatchObject({
       result: "failed",
-      errorCode: "child_failed",
-      errorMessage: "Subagent RPC emitted invalid JSONL"
+      evidence: { errorCode: "child_failed", errorMessage: "Subagent RPC emitted invalid JSONL" }
     })
   } finally {
     await harness.dispose()
@@ -1043,18 +1091,14 @@ test("work-cycle timeout evidence survives supervisor restoration", async () => 
     workCycle: 1,
     task: "bounded work"
   })
-  sessionManager.appendSubagent({
-    event: "work_cycle_finished",
+  appendSubagentOutcome(sessionManager, {
     name: "timed-out-worker",
     workCycle: 1,
-    status: "failed",
+    result: "failed",
     preview: "",
-    originalBytes: 0,
-    omittedBytes: 0,
-    truncated: false,
     durationMs: 900_000,
-    reason: "work_cycle_timeout",
-    error: "Subagent work cycle exceeded 900000ms"
+    errorCode: "work_cycle_timeout",
+    errorMessage: "Subagent work cycle exceeded 900000ms"
   })
 
   const supervisor = new SubagentSupervisor({
@@ -1099,15 +1143,11 @@ test("recovered completion and exited projections stay bounded", async () => {
       workCycle: 1,
       task: `task-${index}`
     })
-    sessionManager.appendSubagent({
-      event: "work_cycle_finished",
+    appendSubagentOutcome(sessionManager, {
       name: workerName,
       workCycle: 1,
-      status: "completed",
+      result: "succeeded",
       preview: `result-${index}`,
-      originalBytes: 9,
-      omittedBytes: 0,
-      truncated: false,
       durationMs: 1
     })
     if (index < 8) sessionManager.appendSubagent({ event: "work_cycle_delivered", name: workerName, workCycle: 1 })
@@ -1145,15 +1185,11 @@ test("recovery rejects an impossible journal instead of evicting undelivered evi
     const name = `worker-${index}`
     sessionManager.appendSubagent({ event: "starting", name })
     sessionManager.appendSubagent({ event: "work_cycle_started", name, workCycle: 1 })
-    sessionManager.appendSubagent({
-      event: "work_cycle_finished",
+    appendSubagentOutcome(sessionManager, {
       name,
       workCycle: 1,
-      status: "completed",
+      result: "succeeded",
       preview: `result-${index}`,
-      originalBytes: 9,
-      omittedBytes: 0,
-      truncated: false,
       durationMs: 1
     })
   }
@@ -1181,27 +1217,12 @@ test("restored parent-context evidence suppresses duplicate completion delivery"
   const sessionManager = SessionManager.create(paths, { persist: false })
   sessionManager.appendSubagent({ event: "starting", name: "restored-worker" })
   sessionManager.appendSubagent({ event: "work_cycle_started", name: "restored-worker", workCycle: 1 })
-  sessionManager.appendSubagent({
-    event: "work_cycle_finished",
+  appendSubagentOutcome(sessionManager, {
     name: "restored-worker",
     workCycle: 1,
-    status: "completed",
+    result: "succeeded",
     preview: "restored-result",
-    originalBytes: 15,
-    omittedBytes: 0,
-    truncated: false,
     durationMs: 1
-  })
-  sessionManager.appendSubagent({
-    event: "work_cycle_finished",
-    name: "restored-worker",
-    workCycle: 1,
-    status: "completed",
-    preview: "duplicate-result",
-    originalBytes: 16,
-    omittedBytes: 0,
-    truncated: false,
-    durationMs: 2
   })
   sessionManager.appendSubagent({ event: "work_cycle_delivered", name: "restored-worker", workCycle: 1 })
   const supervisor = new SubagentSupervisor({
@@ -1324,10 +1345,10 @@ test("SubagentSupervisor durably reports work-cycle timeout and keeps the child 
       completion: { workCycle: 1, status: "failed", reason: "work_cycle_timeout" }
     })
     expect(
-      projectSessionOutcomes(harness.sessionManager.entries()).find(
-        outcome => outcome.capability === "subagent" && outcome.name === name && outcome.workCycle === 1
+      subagentOutcomes(harness.sessionManager).find(
+        outcome => outcome.evidence.name === name && outcome.evidence.workCycle === 1
       )
-    ).toMatchObject({ result: "failed", errorCode: "work_cycle_timeout" })
+    ).toMatchObject({ result: "failed", evidence: { errorCode: "work_cycle_timeout" } })
     await harness.supervisor.wait([name], 0)
 
     await harness.supervisor.continue(name, "another bounded cycle")
@@ -1498,6 +1519,11 @@ async function createHarness(
     processTreeTracker: createProcessTreeTracker(),
     ...(options.workTimeoutMs ? { workTimeoutMs: options.workTimeoutMs } : {}),
     ...(options.toolSurface ? { toolSurface: options.toolSurface } : {})
+  })
+  supervisor.bindOperationOutcomeSink((outcome, persisted) => {
+    const entry = sessionManager.appendOperationOutcome(outcome)
+    persisted(entry)
+    return entry
   })
   return {
     supervisor,

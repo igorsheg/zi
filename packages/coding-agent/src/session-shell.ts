@@ -3,11 +3,8 @@ import { createWriteStream, mkdirSync, mkdtempSync, rmSync, type WriteStream } f
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
-import {
-  shellBackgroundTaskOperationId,
-  type ShellBackgroundTaskOperationOutcomeInput,
-  type ShellBackgroundTaskOrigin
-} from "./operation-outcomes.js"
+import { isNonNegativeInteger, isRecord } from "./guards.js"
+import type { OperationOutcome } from "./operation-outcomes.js"
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncateTail, type TruncationResult } from "./tools/truncate.js"
 
 export const defaultShellLimits: ShellLimits = Object.freeze({
@@ -48,6 +45,133 @@ export interface ShellRunRequest {
 }
 
 export type ShellStopReason = "abort" | "timeout" | "killed" | "output-limit" | "output-error" | "dispose"
+
+export type ShellBackgroundTaskOrigin = "requested" | "demoted"
+export type ShellBackgroundTaskErrorCode =
+  | "exit_nonzero"
+  | "signaled"
+  | "timed_out"
+  | "output_limit"
+  | "execution_failed"
+export type ShellBackgroundTaskCancellationCode = "killed" | "disposed"
+
+type ShellBackgroundTaskEvidenceBase = {
+  readonly taskId: string
+  readonly origin: ShellBackgroundTaskOrigin
+  readonly outputBytes: number
+}
+
+interface ShellOutcomeInputBase {
+  readonly operationId: string
+  readonly capability: "shell"
+  readonly operation: "background_task"
+  readonly durationMs: number
+}
+
+type ShellOutcomeBase = ShellOutcomeInputBase & {
+  readonly type: "operation_outcome"
+  readonly id: string
+  readonly parentId: string | null
+  readonly timestamp: string
+}
+
+export type ShellBackgroundTaskOperationOutcomeInput =
+  | (ShellOutcomeInputBase & {
+      readonly result: "succeeded"
+      readonly evidence: ShellBackgroundTaskEvidenceBase & { readonly exitCode: 0 }
+    })
+  | (ShellOutcomeInputBase & {
+      readonly result: "cancelled"
+      readonly evidence: ShellBackgroundTaskEvidenceBase & {
+        readonly cancellationCode: ShellBackgroundTaskCancellationCode
+      }
+    })
+  | (ShellOutcomeInputBase & {
+      readonly result: "failed"
+      readonly evidence: ShellBackgroundTaskEvidenceBase & {
+        readonly errorCode: "exit_nonzero"
+        readonly exitCode: number
+      }
+    })
+  | (ShellOutcomeInputBase & {
+      readonly result: "failed"
+      readonly evidence: ShellBackgroundTaskEvidenceBase & { readonly errorCode: "signaled"; readonly signal: string }
+    })
+  | (ShellOutcomeInputBase & {
+      readonly result: "failed"
+      readonly evidence: ShellBackgroundTaskEvidenceBase & {
+        readonly errorCode: Exclude<ShellBackgroundTaskErrorCode, "exit_nonzero" | "signaled">
+      }
+    })
+
+export type ShellBackgroundTaskOperationOutcome = ShellOutcomeBase & ShellBackgroundTaskOperationOutcomeInput
+
+export function shellBackgroundTaskOperationId(taskId: string): string {
+  return `shell/background_task/${taskId}`
+}
+
+export function isShellBackgroundTaskOperationOutcome(
+  outcome: OperationOutcome
+): outcome is ShellBackgroundTaskOperationOutcome {
+  if (outcome.capability !== "shell" || outcome.operation !== "background_task" || !isRecord(outcome.evidence)) {
+    return false
+  }
+  const evidence = outcome.evidence
+  if (
+    !hasOnlyOutcomeFields(evidence) ||
+    typeof evidence.taskId !== "string" ||
+    outcome.operationId !== shellBackgroundTaskOperationId(evidence.taskId) ||
+    (evidence.origin !== "requested" && evidence.origin !== "demoted") ||
+    !isNonNegativeInteger(evidence.outputBytes)
+  ) {
+    return false
+  }
+  if (outcome.result === "succeeded") {
+    return (
+      evidence.exitCode === 0 &&
+      evidence.errorCode === undefined &&
+      evidence.signal === undefined &&
+      evidence.cancellationCode === undefined
+    )
+  }
+  if (outcome.result === "cancelled") {
+    return (
+      (evidence.cancellationCode === "killed" || evidence.cancellationCode === "disposed") &&
+      evidence.errorCode === undefined &&
+      evidence.exitCode === undefined &&
+      evidence.signal === undefined
+    )
+  }
+  if (evidence.cancellationCode !== undefined) return false
+  if (evidence.errorCode === "exit_nonzero") {
+    return (
+      typeof evidence.exitCode === "number" &&
+      Number.isSafeInteger(evidence.exitCode) &&
+      evidence.exitCode > 0 &&
+      evidence.signal === undefined
+    )
+  }
+  if (evidence.errorCode === "signaled") {
+    return (
+      typeof evidence.signal === "string" &&
+      /^SIG[A-Z0-9]+$/u.test(evidence.signal) &&
+      Buffer.byteLength(evidence.signal) <= 32 &&
+      evidence.exitCode === undefined
+    )
+  }
+  return (
+    (evidence.errorCode === "timed_out" ||
+      evidence.errorCode === "output_limit" ||
+      evidence.errorCode === "execution_failed") &&
+    evidence.exitCode === undefined &&
+    evidence.signal === undefined
+  )
+}
+
+function hasOnlyOutcomeFields(value: Record<string, unknown>): boolean {
+  const fields = new Set(["taskId", "origin", "outputBytes", "errorCode", "exitCode", "signal", "cancellationCode"])
+  return Object.keys(value).every(field => fields.has(field))
+}
 
 export type ShellTaskOutcome =
   | { readonly type: "exited"; readonly exitCode: number }
@@ -1095,32 +1219,42 @@ class TaskOutput {
 
 function backgroundTaskOutcome(task: CompletedTask): ShellBackgroundTaskOperationOutcomeInput {
   if (task.background.type !== "owned") throw new Error("Foreground shell task has no background outcome")
-  const evidence = {
-    capability: "shell" as const,
-    operation: "background_task" as const,
+  const common = {
+    capability: "shell",
+    operation: "background_task",
     operationId: shellBackgroundTaskOperationId(task.taskId),
+    durationMs: Math.max(0, task.completedAt - task.background.startedAt)
+  } as const
+  const evidence = {
     taskId: task.taskId,
     origin: task.background.origin,
-    durationMs: Math.max(0, task.completedAt - task.background.startedAt),
     outputBytes: task.output.snapshot().truncation.totalBytes
-  }
+  } as const
   switch (task.outcome.type) {
     case "exited":
       return task.outcome.exitCode === 0
-        ? { ...evidence, result: "succeeded", exitCode: 0 }
-        : { ...evidence, result: "failed", errorCode: "exit_nonzero", exitCode: task.outcome.exitCode }
+        ? { ...common, result: "succeeded", evidence: { ...evidence, exitCode: 0 } }
+        : {
+            ...common,
+            result: "failed",
+            evidence: { ...evidence, errorCode: "exit_nonzero", exitCode: task.outcome.exitCode }
+          }
     case "signaled":
-      return { ...evidence, result: "failed", errorCode: "signaled", signal: task.outcome.signal }
+      return {
+        ...common,
+        result: "failed",
+        evidence: { ...evidence, errorCode: "signaled", signal: task.outcome.signal }
+      }
     case "timed_out":
-      return { ...evidence, result: "failed", errorCode: "timed_out" }
+      return { ...common, result: "failed", evidence: { ...evidence, errorCode: "timed_out" } }
     case "output_limit":
-      return { ...evidence, result: "failed", errorCode: "output_limit" }
+      return { ...common, result: "failed", evidence: { ...evidence, errorCode: "output_limit" } }
     case "failed":
-      return { ...evidence, result: "failed", errorCode: "execution_failed" }
+      return { ...common, result: "failed", evidence: { ...evidence, errorCode: "execution_failed" } }
     case "killed":
-      return { ...evidence, result: "cancelled", cancellationCode: "killed" }
+      return { ...common, result: "cancelled", evidence: { ...evidence, cancellationCode: "killed" } }
     case "disposed":
-      return { ...evidence, result: "cancelled", cancellationCode: "disposed" }
+      return { ...common, result: "cancelled", evidence: { ...evidence, cancellationCode: "disposed" } }
     case "aborted":
       throw new Error("Background shell task cannot settle as aborted")
     default:

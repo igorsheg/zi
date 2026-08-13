@@ -6,46 +6,49 @@ order: 79
 
 # Operation outcomes
 
-An operation outcome is Zi's canonical durable terminal record for one admitted session operation. The session journal owns these records. They are not conversation messages, tool results, delivery receipts, or telemetry events.
+An operation outcome is Zi's canonical durable terminal record for one admitted session operation. The session journal owns these records. They are not conversation messages, tool results, delivery receipts, logs, or telemetry events.
 
-Zi records every terminal result—`succeeded`, `failed`, or `cancelled`—through a closed capability-specific variant. A failed result carries a stable low-cardinality error code and may include bounded safe diagnostic text. Successful and cancelled results cannot carry failure fields. Capability variants use named evidence fields rather than an open details object.
+Every outcome uses one open envelope:
 
-Each outcome has a deterministic operation ID. Repeating the same admitted operation cannot append a second native outcome. Normalized projections retain the source journal entry ID and timestamp so analytics can preserve chronology. Optional runtime telemetry may correlate through the operation ID, but telemetry is not durable session state.
+```json
+{
+  "type": "operation_outcome",
+  "id": "journal-entry-id",
+  "parentId": "previous-journal-entry-id",
+  "timestamp": "2026-08-12T12:00:00.000Z",
+  "operationId": "shell/background_task/task-1",
+  "capability": "shell",
+  "operation": "background_task",
+  "result": "succeeded",
+  "durationMs": 1250,
+  "evidence": { "taskId": "task-1" }
+}
+```
 
-Operation outcomes are omitted from provider context and transcript presentation. A hidden context message or an orchestration tool result may deliver evidence derived from an outcome; those projections do not count as additional outcomes.
+`result` is `succeeded`, `failed`, or `cancelled`. `id`, `parentId`, and `timestamp` place the outcome in journal chronology. `operationId` identifies the admitted operation; Zi rejects a second outcome with the same operation ID.
 
-## Subagent work cycles
+The core validates the common envelope and its bounds. Capability and operation names are lowercase identifiers of at most 64 bytes, operation IDs fit in 256 bytes, and durations are non-negative integer milliseconds. `evidence` is bounded `SessionJson`: `null`, a boolean, a finite number, a string, an array, or an object composed recursively from those values. Outcome evidence is limited to 8 KiB of encoded JSON, 32 levels, and 4,096 values.
 
-The initial variant records terminal subagent work cycles:
+The producer owns the capability and operation names, the deterministic operation ID, the evidence schema, and the meaning of that evidence. It must exclude secrets and unnecessary user content, choose fields consumers can safely retain, and document any producer-specific interpretation. Adding a producer does not extend a central capability union or the common envelope.
 
-- capability: `subagent`
-- operation: `work_cycle`
-- identity: runtime name plus positive work-cycle number
-- evidence: optional profile, bounded preview, original and omitted byte counts, truncation, and duration
-- failures: a closed subagent work-cycle error code
+Operation outcomes are omitted from provider context and transcript presentation. A hidden context message or tool result may deliver evidence derived from an outcome; those deliveries do not create another outcome. Runtime telemetry may correlate through `operationId`, but telemetry is not durable session state.
 
-The operation ID is deterministically derived from the runtime name and work-cycle number. The subagent supervisor constructs the outcome when its owned child cycle settles, and `SessionManager` validates and appends it before completion delivery is claimable.
+## Events and history
 
-Zi still reads legacy `subagent/work_cycle_finished` journal entries. `projectSessionOutcomes(entries)` normalizes both formats, maps unknown legacy failure reasons to `legacy_failure`, and emits at most one outcome per operation ID. A native `operation_outcome` wins when both native and legacy evidence exist. `legacy_failure` is migration-only and cannot be appended as a native failure code.
+An appended outcome emits both session events:
 
-## Shell background tasks
+- `entry_appended` is the raw all-journal event. Its `entry` contains the `operation_outcome` journal entry, just as it contains every other admitted journal entry.
+- `operation_outcome` is the semantic terminal event for consumers that only need outcomes.
 
-Zi records a shell task after it enters background ownership, either because `bash` admitted it with `background: true` or because an active foreground command was demoted. Foreground-only commands are not part of this variant.
+The outcome carried by `operation_outcome` has the same shape as an item returned by RPC `session.get_outcomes`. Consumers can therefore use one decoder for live and historical outcomes. See [RPC](rpc.md) for paging and protocol bounds.
 
-- capability: `shell`
-- operation: `background_task`
-- identity: the session shell's generated task ID
-- evidence: requested or demoted origin, background-owned duration, and observed output byte count
-- failures: non-zero exit, signal, timeout, output limit, or execution failure
-- cancellations: explicit kill or session disposal
+## Current producers
 
-The operation ID is `shell/background_task/<task-id>`. `SessionShell` constructs exactly one outcome only after process and output settlement; `bash`, `list_tasks`, `task_output`, and `kill_task` do not append outcomes. This prevents repeated observation or a stop request from being counted as another terminal operation.
+Zi currently records outcomes for settled subagent work cycles and background-owned shell tasks. Each producer derives its operation ID from its own stable identity and places only bounded, privacy-reviewed facts in `evidence`.
 
-Background-task outcomes never contain command text, output text, the working directory, spill-file paths, or tool-call IDs. Exit codes and signals appear only in the terminal variants that require them.
+A subagent outcome is recorded when the supervisor's admitted work cycle settles. Hidden completion context and orchestration tool results may deliver the same completion evidence without creating another outcome.
 
-Completion delivery is passive: settlement never wakes the model. Zi adds one bounded hidden completion message before the next parent model request unless a committed terminal `task_output` result already delivered the same task evidence. The message carries status, duration, and output-byte metadata—not command or output text—and is durable so resume and compaction do not inject it again.
-
-Use `list_tasks` to recover bounded recent task identities and states without reading their output. `task_output` returns `nextCursor`; pass it back as `cursor` to receive only subsequently observed output. If output advanced beyond the retained preview window, `omittedBytes` reports the gap. These observations and `kill_task` do not append additional operation outcomes.
+A shell outcome is recorded after a background-owned process and its bounded output settle. Foreground-only commands are not recorded. Observing a task with `list_tasks` or `task_output`, or requesting cancellation with `kill_task`, does not create another outcome. Shell evidence excludes command text, output text, working directories, spill-file paths, and tool-call IDs.
 
 ## Local reports
 
@@ -57,4 +60,4 @@ bun run outcomes
 
 JSON is the default, scriptable format. Use `--format text` for a concise terminal report, `--days <count>` or `--since <timestamp>` to select a range, and `--cwd <path>` to inspect another project. Run `bun run outcomes --help` for all bounds and options.
 
-Reports keep result counts, durations, chronology, and capability rows common. Profile, truncation, and subagent failure evidence remains under `subagentWorkCycles`; background-task origins, output-byte summaries, failures, and cancellations remain under `backgroundTasks`. Reports read session journals locally and never index prompt, completion, command, or shell-output text.
+Reports aggregate only common envelope fields such as result, duration, chronology, capability, and operation. Evidence remains producer-owned opaque `SessionJson`; generic reports do not interpret it or create capability-specific schemas. Reports read session journals locally and never index prompt, completion, command, or shell-output text.

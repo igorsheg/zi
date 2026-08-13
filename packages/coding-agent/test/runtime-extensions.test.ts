@@ -7,6 +7,7 @@ import { join, resolve } from "node:path"
 import { Type } from "@earendil-works/pi-ai"
 
 import { createAgentSessionRuntime } from "../src/agent-session-runtime.js"
+import { isRecord } from "../src/guards.js"
 import { createAgentRuntime } from "../src/runtime.js"
 import { SessionManager } from "../src/session-manager.js"
 import { createModels, fauxAssistantMessage, fauxProvider, fauxText, fauxToolCall } from "../src/testing.js"
@@ -1360,11 +1361,14 @@ test("subagent completion stays passive and joins the next parent model request"
     await runtime.session.prompt("Start the background investigation.")
     expect(faux.state.callCount).toBe(2)
 
-    await waitForCondition(() => runtime.session.sessionManager.operationOutcomeEntries().length > 0, 5_000)
+    await waitForCondition(() => runtime.session.sessionManager.operationOutcomes().length > 0, 5_000)
     expect(faux.state.callCount).toBe(2)
     expect(runtime.session.messages.some(message => message.role === "custom")).toBe(false)
-    expect(runtime.session.sessionManager.operationOutcomeEntries()).toContainEqual(
-      expect.objectContaining({ capability: "subagent", profile: "pathfinder", name: "passive-worker" })
+    expect(runtime.session.sessionManager.operationOutcomes()).toContainEqual(
+      expect.objectContaining({
+        capability: "subagent",
+        evidence: expect.objectContaining({ profile: "pathfinder", name: "passive-worker" })
+      })
     )
 
     await runtime.session.prompt("Use any completed investigation.")
@@ -1491,8 +1495,11 @@ test("restoration and compaction never redeliver durable child completion eviden
     await waitForCondition(
       () =>
         first.session.sessionManager
-          .operationOutcomeEntries()
-          .some(entry => entry.capability === "subagent" && entry.name === "restored-worker"),
+          .operationOutcomes()
+          .some(
+            entry =>
+              entry.capability === "subagent" && isRecord(entry.evidence) && entry.evidence.name === "restored-worker"
+          ),
       5_000
     )
     const sessionFile = first.session.sessionManager.file!

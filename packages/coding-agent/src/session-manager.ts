@@ -21,10 +21,12 @@ import type { ImageContent, TextContent } from "@earendil-works/pi-ai"
 import { isNonNegativeInteger, isRecord } from "./guards.js"
 import { formatCompactionSummary, type AgentMessage, type CompactionSummaryMessage } from "./messages.js"
 import {
-  isOperationOutcomeEntry,
-  maxOperationOutcomeTextBytes,
+  isOperationOutcomeClassifier,
+  isOperationOutcomeId,
+  maxOperationOutcomeEvidenceBytes,
+  type OperationOutcome,
   type OperationOutcomeEntryData,
-  type OperationOutcomeEntryInput
+  type OperationOutcomeInput
 } from "./operation-outcomes.js"
 import { type ZiPaths, resolveZiPath } from "./paths.js"
 import { maxRetryCount } from "./retry.js"
@@ -47,10 +49,10 @@ export interface SessionHeader {
   cwd: string
 }
 
-interface SessionEntryBase {
-  id: string
-  parentId: string | null
-  timestamp: string
+export interface SessionEntryBase {
+  readonly id: string
+  readonly parentId: string | null
+  readonly timestamp: string
 }
 
 export type CompactionReason = "manual" | "threshold" | "overflow"
@@ -117,8 +119,6 @@ export interface WorkPlanEntryData {
   readonly steps: readonly WorkPlanStep[]
 }
 
-export type SubagentCompletionStatus = "completed" | "failed" | "cancelled"
-
 export type SubagentEntryData =
   | { readonly type: "subagent"; readonly event: "starting"; readonly name: string }
   | { readonly type: "subagent"; readonly event: "ready"; readonly name: string; readonly sessionId?: string }
@@ -128,20 +128,6 @@ export type SubagentEntryData =
       readonly name: string
       readonly workCycle: number
       readonly task?: string
-    }
-  | {
-      readonly type: "subagent"
-      readonly event: "work_cycle_finished"
-      readonly name: string
-      readonly workCycle: number
-      readonly status: SubagentCompletionStatus
-      readonly preview: string
-      readonly originalBytes: number
-      readonly omittedBytes: number
-      readonly truncated: boolean
-      readonly durationMs: number
-      readonly reason?: string
-      readonly error?: string
     }
   | {
       readonly type: "subagent"
@@ -179,8 +165,6 @@ export type CustomEntry = SessionEntryBase & CustomEntryData
 export type CustomMessageEntry = SessionEntryBase & CustomMessageEntryData
 export type WorkPlanEntry = SessionEntryBase & WorkPlanEntryData
 export type SubagentEntry = SessionEntryBase & SubagentEntryData
-export type OperationOutcomeEntry = SessionEntryBase & OperationOutcomeEntryData
-
 export interface NewSessionOptions {
   sessionId?: string
   persist?: boolean
@@ -207,7 +191,7 @@ export const maxCustomStateEntries = 2048
 export const maxCustomStateBytes = 2 * 1024 * 1024
 export const maxProgramStateEntries = 2048
 export const maxProgramStateBytes = 8 * 1024 * 1024
-export const maxSubagentJournalTextBytes = maxOperationOutcomeTextBytes
+export const maxSubagentJournalTextBytes = 8 * 1024
 
 const customTypePattern = /^[a-z][a-z0-9._:/-]*$/
 const programStateCustomType = "zi.programmatic-state.v1"
@@ -610,15 +594,17 @@ export class SessionManager {
     return this.entries().filter((entry): entry is SubagentEntry => entry.type === "subagent")
   }
 
-  appendOperationOutcome(data: OperationOutcomeEntryInput): OperationOutcomeEntry {
+  appendOperationOutcome<Evidence extends SessionJson>(
+    data: OperationOutcomeInput<Evidence>
+  ): OperationOutcome<Evidence> {
     if (this.#operationOutcomeIds.has(data.operationId)) {
       throw new Error(`Operation outcome already exists: ${data.operationId}`)
     }
-    return this.#append({ type: "operation_outcome", ...data })
+    return this.#append({ type: "operation_outcome", ...data, evidence: snapshotSessionJson(data.evidence) })
   }
 
-  operationOutcomeEntries(): readonly OperationOutcomeEntry[] {
-    return this.entries().filter((entry): entry is OperationOutcomeEntry => entry.type === "operation_outcome")
+  operationOutcomes(): readonly OperationOutcome[] {
+    return this.entries().filter((entry): entry is OperationOutcome => entry.type === "operation_outcome")
   }
 
   /** Materializes the complete journal. Runtime policy should consume retainedEntries(). */
@@ -741,7 +727,7 @@ export class SessionManager {
   #append<Entry extends SessionEntryData>(entry: Entry): SessionEntryBase & Entry {
     const next = {
       ...entry,
-      id: entry.type === "operation_outcome" ? entry.operationId : crypto.randomUUID(),
+      id: crypto.randomUUID(),
       parentId: this.#leafId,
       timestamp: new Date().toISOString()
     } as SessionEntryBase & Entry
@@ -749,6 +735,7 @@ export class SessionManager {
     if (next.type === "custom") freezeCustomEntry(next)
     else if (next.type === "custom_message") freezeCustomMessageEntry(next)
     else if (next.type === "work_plan") freezeWorkPlanEntry(next)
+    else if (next.type === "operation_outcome") freezeOperationOutcome(next)
 
     const isProgramStateEntry = next.type === "custom" && next.customType === programStateCustomType
     const isPublicCustomEntry = next.type === "custom" && !isProgramStateEntry
@@ -1013,6 +1000,9 @@ function loadJournal(file: string, retention: "active" | "all"): LoadedJournal {
       }
 
       if (!record.terminated && record.end === metadata.size) repair = "newline"
+      if (entry.type === "operation_outcome" && operationOutcomeIds.has(entry.operationId)) {
+        throw new Error(`Duplicate operation outcome: ${file}`)
+      }
       const reference = validateStoredJournalEntry(entry, entryCount, previous, references, retryFailures, file)
       references.set(entry.id, reference)
       previous = reference
@@ -1256,7 +1246,7 @@ function parseStoredEntry(line: string, file: string, version: SessionFormatVers
   if (value.type === "subagent" && isSubagentEntryData(value)) {
     return { ...base, ...value }
   }
-  if (value.type === "operation_outcome" && isOperationOutcomeEntry(value)) {
+  if (value.type === "operation_outcome" && isStoredOperationOutcome(value)) {
     return { ...base, ...value }
   }
   if (value.type === "compaction" && isCompactionEntryData(value)) {
@@ -1284,6 +1274,7 @@ function hydrateStoredEntry(entry: StoredSessionEntry, file: string | undefined)
   }
   if (entry.type === "custom") return freezeCustomEntry(entry)
   if (entry.type === "work_plan") return freezeWorkPlanEntry(entry)
+  if (entry.type === "operation_outcome") return freezeOperationOutcome(entry)
   if (entry.type === "custom_message") {
     const content = hydrateStoredContent(entry.content, file)
     if (!isRuntimeCustomMessageContent(content)) {
@@ -1646,6 +1637,13 @@ function freezeWorkPlanEntry(entry: WorkPlanEntry): WorkPlanEntry {
   return Object.freeze(entry)
 }
 
+function freezeOperationOutcome<Evidence extends SessionJson>(
+  outcome: OperationOutcome<Evidence>
+): OperationOutcome<Evidence> {
+  freezeSessionJson(outcome.evidence)
+  return Object.freeze(outcome)
+}
+
 function freezeSessionJson(value: SessionJson): void {
   if (value === null || typeof value !== "object") return
   const pending: object[] = [value]
@@ -1669,8 +1667,8 @@ function snapshotCustomMessage(value: unknown): CustomMessageInput {
   return snapshot
 }
 
-function snapshotSessionJson(value: unknown): SessionJson {
-  let snapshot: unknown
+function snapshotSessionJson<Value extends SessionJson>(value: Value): Value {
+  let snapshot: Value
   try {
     snapshot = structuredClone(value)
   } catch {
@@ -1930,6 +1928,35 @@ function isRetryAttempt(value: unknown): value is number {
   return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= maxRetryCount
 }
 
+function isStoredOperationOutcome(value: unknown): value is OperationOutcome {
+  return (
+    isRecord(value) &&
+    hasOnlyKeys(value, [
+      "type",
+      "id",
+      "parentId",
+      "timestamp",
+      "operationId",
+      "capability",
+      "operation",
+      "result",
+      "durationMs",
+      "evidence"
+    ]) &&
+    value.type === "operation_outcome" &&
+    typeof value.id === "string" &&
+    (value.parentId === null || typeof value.parentId === "string") &&
+    isValidTimestamp(value.timestamp) &&
+    isOperationOutcomeId(value.operationId) &&
+    isOperationOutcomeClassifier(value.capability) &&
+    isOperationOutcomeClassifier(value.operation) &&
+    (value.result === "succeeded" || value.result === "failed" || value.result === "cancelled") &&
+    isNonNegativeInteger(value.durationMs) &&
+    isSessionJson(value.evidence) &&
+    serializedBytesAtMost(value.evidence, maxOperationOutcomeEvidenceBytes)
+  )
+}
+
 function validateSubagentEntryData(value: unknown): asserts value is SubagentEntryData {
   if (!isSubagentEntryData(value)) throw new Error("Invalid subagent substrate journal entry")
 }
@@ -1950,18 +1977,6 @@ function isSubagentEntryData(value: unknown): value is SubagentEntryData {
       return value.sessionId === undefined || boundedString(value.sessionId, 256)
     case "work_cycle_started":
       return positiveSafeInteger(value.workCycle) && (value.task === undefined || boundedString(value.task, 256))
-    case "work_cycle_finished":
-      return (
-        positiveSafeInteger(value.workCycle) &&
-        (value.status === "completed" || value.status === "failed" || value.status === "cancelled") &&
-        boundedString(value.preview, maxSubagentJournalTextBytes, true) &&
-        isNonNegativeInteger(value.originalBytes) &&
-        isNonNegativeInteger(value.omittedBytes) &&
-        typeof value.truncated === "boolean" &&
-        isNonNegativeInteger(value.durationMs) &&
-        (value.reason === undefined || boundedString(value.reason, maxSubagentJournalTextBytes, true)) &&
-        (value.error === undefined || boundedString(value.error, maxSubagentJournalTextBytes, true))
-      )
     case "work_cycle_delivered":
       return positiveSafeInteger(value.workCycle)
     case "closing":
@@ -2051,7 +2066,12 @@ function validateNextEntry(next: SessionEntry, preceding: readonly SessionEntry[
     return
   }
   if (next.type === "operation_outcome") {
-    if (!isOperationOutcomeEntry(next)) throw new Error(`Invalid session entry: ${file}`)
+    if (
+      !isStoredOperationOutcome(next) ||
+      preceding.some(entry => entry.type === "operation_outcome" && entry.operationId === next.operationId)
+    ) {
+      throw new Error(`Invalid session entry: ${file}`)
+    }
     return
   }
   if (next.type === "work_plan") {

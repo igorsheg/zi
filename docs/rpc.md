@@ -65,7 +65,7 @@ Operation failures use `ok: false` with `capacity`, `not_found`, or `operation_f
 
 A request ID is connection-local and may identify only one admitted, unsettled operation. Reusing an in-flight ID produces a recoverable `protocol_error` with code `invalid_request` and the matching ID; the duplicate record is not launched, including when it requests the reserved interruption slot. An ID may be reused only after its prior correlated response. Reuse always denotes a new request rather than a replay of the prior result.
 
-`session_event` frames contain source-ordered `AgentSessionEvent` values. Model-change events use the public model projection described below instead of exposing provider configuration or credentials. `entry_appended` explicitly includes `custom`, `custom_message`, `work_plan`, `operation_outcome`, and substrate `subagent` journal variants. Operation outcomes are bounded model-invisible terminal evidence with deterministic operation identities; delivery messages and tool results are not additional outcomes. Work plan replacements also emit `work_plan_changed`; see [Work plans](work-plans.md). Message pages include displayed custom messages and omit hidden ones; a hidden custom message's committed entry event remains observable to the trusted process client. Child mechanics add no separate semantic session event.
+`session_event` frames contain source-ordered `AgentSessionEvent` values. Model-change events use the public model projection described below instead of exposing provider configuration or credentials. `entry_appended` is the raw all-journal event and includes `custom`, `custom_message`, `work_plan`, `operation_outcome`, and substrate `subagent` entries. Appending an outcome also emits the semantic `operation_outcome` event, so clients that subscribe to all events receive both. The semantic event and `session.get_outcomes` items use the same open outcome envelope: journal `id`, `parentId`, and `timestamp`, plus `operationId`, `capability`, `operation`, `result`, `durationMs`, and bounded producer-owned `evidence`. Delivery messages and tool results are not additional outcomes. Work plan replacements also emit `work_plan_changed`; see [Work plans](work-plans.md). Message pages include displayed custom messages and omit hidden ones; a hidden custom message's committed entry event remains observable to the trusted process client.
 
 ## Methods
 
@@ -73,6 +73,7 @@ A request ID is connection-local and may identify only one admitted, unsettled o
 | ----------------------- | ---------------------------------------------------------- | ---------------------------------------------------- |
 | `session.get_state`     | none                                                       | Current session snapshot                             |
 | `session.get_messages`  | `start` defaults to `0`; `limit` defaults to and maxes 100 | Indexed message page, total count, and next start    |
+| `session.get_outcomes`  | `start` defaults to `0`; `limit` defaults to and maxes 100 | Indexed outcome page, total count, and next start    |
 | `session.prompt`        | `delivery`, `text`; optional `completionId`                | Admitted delivery and optional completion revision   |
 | `session.interrupt`     | none                                                       | Empty object after interruption settles              |
 | `session.await_idle`    | optional `completionId`                                    | Idle settlement and optional bounded completion      |
@@ -83,6 +84,8 @@ A request ID is connection-local and may identify only one admitted, unsettled o
 | `model.select`          | `provider`, `id`                                           | Selected public model descriptor                     |
 | `thinking.list`         | none                                                       | Levels supported by the selected model               |
 | `thinking.select`       | `level`; optional `scope`: `global` or `project`           | Requested, effective, and persisted scope            |
+
+`session.get_outcomes` returns `{ start, total, nextStart, outcomes }` in journal order. Follow `nextStart` until it is `null`. Each item has exactly the same shape as the `outcome` carried by a live `operation_outcome` event, so clients can use one decoder and producer-specific evidence policy for history and streaming updates.
 
 A direct prompt response means the input was admitted, not that provider work completed. Use ordered session events or `session.await_idle` for completion. `session.await_idle` follows the current session operation and is not an ordinary short request-response deadline; clients that need a work budget must own that policy separately and interrupt the session when it expires. Steering and follow-up input retain `AgentSession` queue semantics and may be queued before the next direct prompt.
 
@@ -115,6 +118,7 @@ Message pages are bounded by both count and encoded bytes. A client should retai
 - completion ID: 256 bytes;
 - completion text/error projection: 50 KiB / 8 KiB;
 - message page: 100 messages and 8 MiB;
+- outcome page: 100 outcomes; evidence is at most 8 KiB per outcome;
 - request ID, model provider, or model ID: 256 bytes;
 - command name: 64 bytes; command arguments: 256 KiB;
 - ordinary in-flight operations: 32;

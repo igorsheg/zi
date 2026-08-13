@@ -8,6 +8,7 @@ export const maxRpcFrameBytes = 16 * 1024 * 1024
 export const maxRpcInputTextBytes = 8 * 1024 * 1024
 export const maxRpcRequestIdBytes = 256
 export const maxRpcMessagePageCount = 100
+export const maxRpcOutcomePageCount = 100
 export const maxRpcMessagePageBytes = 8 * 1024 * 1024
 export const maxRpcCompletionIdBytes = 256
 export const maxRpcCompletionTextBytes = 50 * 1024
@@ -24,6 +25,12 @@ export type RpcRequest =
       readonly version: 1
       readonly id: string
       readonly method: "session.get_messages"
+      readonly params: { readonly start: number; readonly limit: number }
+    }
+  | {
+      readonly version: 1
+      readonly id: string
+      readonly method: "session.get_outcomes"
       readonly params: { readonly start: number; readonly limit: number }
     }
   | {
@@ -179,23 +186,12 @@ export function decodeRpcRequest(value: unknown): RpcRequest {
       requireKeys(value, ["version", "id", "method"], requestId)
       return { version: 1, id: requestId, method: value.method }
     case "session.get_messages": {
-      requireKeys(value, ["version", "id", "method", "params"], requestId, true)
-      const params =
-        value.params === undefined ? {} : requireRecord(value.params, "session.get_messages params", requestId)
-      requireKeys(params, ["start", "limit"], requestId, true)
-      const start = params.start ?? 0
-      const limit = params.limit ?? maxRpcMessagePageCount
-      if (!isSafeInteger(start) || start < 0) {
-        throw new RpcRequestError("invalid_request", "Message start must be a non-negative integer", requestId)
-      }
-      if (!isSafeInteger(limit) || limit < 1 || limit > maxRpcMessagePageCount) {
-        throw new RpcRequestError(
-          "invalid_request",
-          `Message limit must be an integer from 1 through ${maxRpcMessagePageCount}`,
-          requestId
-        )
-      }
-      return { version: 1, id: requestId, method: "session.get_messages", params: { start, limit } }
+      const params = pageParams(value, "session.get_messages", "Message", maxRpcMessagePageCount, requestId)
+      return { version: 1, id: requestId, method: "session.get_messages", params }
+    }
+    case "session.get_outcomes": {
+      const params = pageParams(value, "session.get_outcomes", "Outcome", maxRpcOutcomePageCount, requestId)
+      return { version: 1, id: requestId, method: "session.get_outcomes", params }
     }
     case "session.await_idle": {
       requireKeys(value, ["version", "id", "method", "params"], requestId, true)
@@ -280,6 +276,31 @@ export function decodeRpcRequest(value: unknown): RpcRequest {
     default:
       throw new RpcRequestError("unknown_method", `Unknown RPC method: ${value.method}`, requestId)
   }
+}
+
+function pageParams(
+  request: Record<string, unknown>,
+  method: "session.get_messages" | "session.get_outcomes",
+  noun: "Message" | "Outcome",
+  maxCount: number,
+  requestId: string
+): { readonly start: number; readonly limit: number } {
+  requireKeys(request, ["version", "id", "method", "params"], requestId, true)
+  const params = request.params === undefined ? {} : requireRecord(request.params, `${method} params`, requestId)
+  requireKeys(params, ["start", "limit"], requestId, true)
+  const start = params.start ?? 0
+  const limit = params.limit ?? maxCount
+  if (!isSafeInteger(start) || start < 0) {
+    throw new RpcRequestError("invalid_request", `${noun} start must be a non-negative integer`, requestId)
+  }
+  if (!isSafeInteger(limit) || limit < 1 || limit > maxCount) {
+    throw new RpcRequestError(
+      "invalid_request",
+      `${noun} limit must be an integer from 1 through ${maxCount}`,
+      requestId
+    )
+  }
+  return { start, limit }
 }
 
 function requireRecord(value: unknown, name: string, requestId: string): Record<string, unknown> {

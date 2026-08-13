@@ -1,9 +1,9 @@
 import { expect, test } from "bun:test"
 
-import { subagentWorkCycleOperationId, type ProjectedSubagentWorkCycleOutcome } from "../src/operation-outcomes.js"
 import type { SubagentEntry } from "../src/session-manager.js"
 import type { SubagentCompletion } from "../src/subagents/child-process.js"
 import { CompletionLedger } from "../src/subagents/completion-ledger.js"
+import { subagentWorkCycleOperationId, type SubagentWorkCycleOutcome } from "../src/subagents/outcome.js"
 
 test("CompletionLedger preserves claim and acknowledgement state across persistence", () => {
   const ledger = new CompletionLedger(4)
@@ -138,7 +138,7 @@ test("CompletionLedger replay preserves markers, first finished evidence, bounds
     finished("evicted-worker", 1, "duplicate-result")
   ]
   const ledger = CompletionLedger.restore(
-    entries.filter((entry): entry is ProjectedSubagentWorkCycleOutcome => "operationId" in entry),
+    entries.filter((entry): entry is SubagentWorkCycleOutcome => "operationId" in entry),
     entries.filter((entry): entry is SubagentEntry => "event" in entry),
     2
   )
@@ -177,22 +177,18 @@ function completion(name: string, workCycle: number, text = `${name}-result`): S
 
 let entrySequence = 0
 
-function finished(name: string, workCycle: number, preview: string): ProjectedSubagentWorkCycleOutcome {
+function finished(name: string, workCycle: number, preview: string): SubagentWorkCycleOutcome {
   return {
-    sourceEntryId: `entry-${++entrySequence}`,
+    id: `entry-${++entrySequence}`,
+    parentId: null,
     timestamp: "2026-08-09T00:00:00.000Z",
     type: "operation_outcome",
     capability: "subagent",
     operation: "work_cycle",
     operationId: subagentWorkCycleOperationId(name, workCycle),
     result: "succeeded",
-    name,
-    workCycle,
-    preview,
-    originalBytes: Buffer.byteLength(preview),
-    omittedBytes: 0,
-    truncated: false,
-    durationMs: workCycle
+    durationMs: workCycle,
+    evidence: { name, workCycle, preview, originalBytes: Buffer.byteLength(preview), omittedBytes: 0, truncated: false }
   }
 }
 

@@ -65,7 +65,7 @@ import { validateActiveExtensionToolCatalog, type ExtensionToolRegistration } fr
 import { admitExtensionTools } from "./extensions/tools.js"
 import { isZiAgentMessage, type AgentMessage } from "./messages.js"
 import type { ModelRegistry } from "./model-registry.js"
-import { shellBackgroundTaskOperationId, type ShellBackgroundTaskOperationOutcomeInput } from "./operation-outcomes.js"
+import type { OperationOutcome, OperationOutcomeInput } from "./operation-outcomes.js"
 import type { ZiPaths } from "./paths.js"
 import type { ProcessTreeTracker } from "./processes/process-tree.js"
 import { type ProjectFileSearch, type ProjectFileSearchResult } from "./project-file-search.js"
@@ -84,14 +84,21 @@ import {
   type CustomEntry,
   type CustomMessageEntry,
   type CustomMessageInput,
-  type OperationOutcomeEntry,
   type SessionEntry,
   type SessionJournalMemoryDiagnostics,
   type SessionJson,
   type SessionManager,
   type SessionPromptHistoryEntry
 } from "./session-manager.js"
-import type { SessionShell, ShellDemotionResult, ShellKillResult, ShellTaskSnapshot } from "./session-shell.js"
+import {
+  isShellBackgroundTaskOperationOutcome,
+  shellBackgroundTaskOperationId,
+  type SessionShell,
+  type ShellBackgroundTaskOperationOutcomeInput,
+  type ShellDemotionResult,
+  type ShellKillResult,
+  type ShellTaskSnapshot
+} from "./session-shell.js"
 import type { SettingsError, SettingsManager, SettingsScope } from "./settings-manager.js"
 import { expandSkillCommand, type Skill } from "./skills.js"
 import { builtinSlashCommands, type SlashCommand } from "./slash-commands.js"
@@ -213,6 +220,7 @@ export type AgentSessionEvent =
   | { type: "codex_fast_mode_changed"; enabled: boolean }
   | ({ type: "queue_update" } & QueuedInputs)
   | { type: "entry_appended"; entry: SessionEntry }
+  | { type: "operation_outcome"; outcome: OperationOutcome }
   | { type: "model_changed"; model: Model<Api> }
   | { type: "thinking_level_changed"; level: ThinkingLevel }
   | { type: "steering_mode_changed"; mode: QueueMode }
@@ -575,15 +583,14 @@ export class AgentSession {
     this.sessionManager = config.sessionManager
     this.#shell?.bindOperationOutcomeSink(outcome => {
       this.#admitShellCompletion(outcome)
-      let entry: OperationOutcomeEntry
       try {
-        entry = this.sessionManager.appendOperationOutcome(outcome)
+        return this.#recordOutcome(outcome)
       } catch (cause) {
         this.#pendingShellCompletions.delete(outcome.operationId)
         throw cause
       }
-      this.#emitAll([{ type: "entry_appended", entry }])
     })
+    this.#subagents?.bindOperationOutcomeSink((outcome, persisted) => this.#recordOutcome(outcome, persisted))
     this.#restoreCompletionDeliveries()
     this.settingsManager = config.settingsManager
     this.#modelState = config.model ? { type: "selected", model: config.model } : { type: "unselected" }
@@ -2164,7 +2171,7 @@ export class AgentSession {
 
   #restoreCompletionDeliveries(): void {
     for (const entry of this.sessionManager.entries()) {
-      if (entry.type === "operation_outcome" && entry.capability === "shell") {
+      if (entry.type === "operation_outcome" && isShellBackgroundTaskOperationOutcome(entry)) {
         this.#admitShellCompletion(entry)
         continue
       }
@@ -3236,6 +3243,16 @@ export class AgentSession {
     if (this.#modelChoicesPromise === load) this.#modelChoicesPromise = undefined
   }
 
+  #recordOutcome(input: OperationOutcomeInput, persisted?: (outcome: OperationOutcome) => void): OperationOutcome {
+    const outcome = this.sessionManager.appendOperationOutcome(input)
+    persisted?.(outcome)
+    this.#emitAll([
+      { type: "entry_appended", entry: outcome },
+      { type: "operation_outcome", outcome }
+    ])
+    return outcome
+  }
+
   #emitQueue(): void {
     this.#emit({ type: "queue_update", ...this.#queueSnapshot() })
   }
@@ -3442,38 +3459,39 @@ const subagentCompletionCustomType = "zi.subagent_completion"
 const shellCompletionCustomType = "zi.shell_task_completion"
 
 function shellCompletionMessage(completion: ShellBackgroundTaskOperationOutcomeInput): CustomMessageInput {
+  const evidence = completion.evidence
   const payload = {
-    task_id: completion.taskId,
-    origin: completion.origin,
+    task_id: evidence.taskId,
+    origin: evidence.origin,
     result: completion.result,
     duration_ms: completion.durationMs,
-    output_bytes: completion.outputBytes,
+    output_bytes: evidence.outputBytes,
     ...shellCompletionResult(completion)
   }
   return {
     customType: shellCompletionCustomType,
     content: `<shell_task_completion>\n${JSON.stringify(payload)}\n</shell_task_completion>`,
     display: false,
-    details: { operationId: completion.operationId, taskId: completion.taskId, result: completion.result }
+    details: { operationId: completion.operationId, taskId: evidence.taskId, result: completion.result }
   }
 }
 
 function shellCompletionResult(completion: ShellBackgroundTaskOperationOutcomeInput): {
   readonly [key: string]: SessionJson
 } {
-  if (completion.result === "succeeded") return { exit_code: completion.exitCode }
-  if (completion.result === "cancelled") return { cancellation_code: completion.cancellationCode }
-  switch (completion.errorCode) {
+  if (completion.result === "succeeded") return { exit_code: completion.evidence.exitCode }
+  if (completion.result === "cancelled") return { cancellation_code: completion.evidence.cancellationCode }
+  switch (completion.evidence.errorCode) {
     case "exit_nonzero":
-      return { error_code: completion.errorCode, exit_code: completion.exitCode }
+      return { error_code: completion.evidence.errorCode, exit_code: completion.evidence.exitCode }
     case "signaled":
-      return { error_code: completion.errorCode, signal: completion.signal }
+      return { error_code: completion.evidence.errorCode, signal: completion.evidence.signal }
     case "timed_out":
     case "output_limit":
     case "execution_failed":
-      return { error_code: completion.errorCode }
+      return { error_code: completion.evidence.errorCode }
     default:
-      return assertNever(completion)
+      return assertNever(completion.evidence)
   }
 }
 

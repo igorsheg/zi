@@ -12,6 +12,7 @@ import {
   fauxToolCall
 } from "@earendil-works/pi-ai"
 
+import { isShellBackgroundTaskOperationOutcome } from "../src/session-shell.js"
 import { createTestAgentRuntime as createAgentRuntime } from "../src/testing.js"
 import { isBashToolDetails } from "../src/tools/bash.js"
 
@@ -245,13 +246,12 @@ test("background shell settlement appends one durable operation outcome", async 
         throw new Error("Background outcome did not persist")
       })
     ])
-    const [outcome] = session.sessionManager.operationOutcomeEntries()
+    const [outcome] = session.sessionManager.operationOutcomes()
     expect(outcome).toMatchObject({
       capability: "shell",
       operation: "background_task",
-      origin: "requested",
       result: "succeeded",
-      exitCode: 0
+      evidence: { origin: "requested", exitCode: 0 }
     })
     expect(outcome).toBeDefined()
     expect(appended).toEqual([outcome!.id])
@@ -259,11 +259,13 @@ test("background shell settlement appends one durable operation outcome", async 
     expect(JSON.stringify(outcome)).not.toContain("node -e")
     expect(faux.state.callCount).toBe(2)
     expect(session.messages.some(message => message.role === "custom")).toBe(false)
-    if (!outcome || outcome.capability !== "shell") throw new Error("Expected shell background outcome")
+    if (!outcome || !isShellBackgroundTaskOperationOutcome(outcome)) {
+      throw new Error("Expected shell background outcome")
+    }
 
     await session.prompt("Use completed background work.")
     expect(completionContext).toContain("<shell_task_completion>")
-    expect(completionContext).toContain(outcome.taskId)
+    expect(completionContext).toContain(outcome.evidence.taskId)
     const completion = session.sessionManager
       .retainedEntries()
       .find(entry => entry.type === "custom_message" && entry.customType === "zi.shell_task_completion")

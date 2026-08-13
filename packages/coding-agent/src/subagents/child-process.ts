@@ -10,7 +10,6 @@ import { Readable, Writable } from "node:stream"
 
 import { isAgentMessage, isRecord } from "../guards.js"
 import type { AgentMessage } from "../messages.js"
-import type { SubagentWorkCycleErrorCode } from "../operation-outcomes.js"
 import type { ProcessScope, ProcessTreeTracker } from "../processes/process-tree.js"
 import {
   decodePeerRequestFrame,
@@ -62,6 +61,18 @@ export type ChildExitOutcome =
   | { readonly type: "killed"; readonly message: string }
 
 export type SubagentCompletionStatus = "completed" | "failed" | "cancelled"
+
+export type SubagentWorkCycleErrorCode =
+  | "assignment_failed"
+  | "work_cycle_timeout"
+  | "interrupt_settlement_timeout"
+  | "missing_assistant"
+  | "provider_error"
+  | "missing_final_answer"
+  | "incomplete_final_answer"
+  | "child_killed"
+  | "child_failed"
+  | "child_exited"
 
 interface SubagentCompletionBase {
   readonly name: string
