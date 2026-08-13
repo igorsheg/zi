@@ -51,6 +51,7 @@ export function createReadTool(cwd: string): AgentTool<typeof parameters, ReadTo
     description:
       "Read text file contents. Output is truncated to 2,000 lines or 50 KiB. Use offset and limit to continue through large files.",
     parameters,
+    executionMode: "parallel",
     async execute(_id, input, signal) {
       throwIfAborted(signal)
       const path = resolveToolPath(input.path, cwd)

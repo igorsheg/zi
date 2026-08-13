@@ -48,7 +48,7 @@ The pane can stay open alongside a subagent transcript. Zi keeps the main agent 
 
 `update_plan` is also available inside [Code Mode](code-mode.md):
 
-```js
+```ts
 await zi.update_plan({
   explanation: "Implementation started",
   steps: [

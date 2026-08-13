@@ -8,18 +8,18 @@ order: 70
 
 A model that answers one question through ten separate tool calls re-reads the same files, loses every intermediate result between calls, and spends your context on data it only needed in order to filter something. Code Mode gives it a loop and a place to keep intermediate values.
 
-Code Mode is Zi's built-in `code` tool. It lets the model use ordinary JavaScript for data-dependent loops, filtering, aggregation, and multi-tool workflows while keeping direct tools available for routine work.
+Code Mode is Zi's built-in `code` tool. It gives the model an erasable-TypeScript function body for data-dependent loops, filtering, aggregation, and multi-tool workflows while keeping direct tools available for routine work.
 
-A cell is an ordinary JavaScript async arrow function:
+Each call supplies a short active-voice `description` and the function `code`. Top-level `await` and `return` work directly:
 
-```js
-;async () => {
-  const files = await zi.read({ path: "package.json" })
-  state.runs = (state.runs ?? 0) + 1
-  scratch.lastPackage = files
-  return { runs: state.runs }
-}
+```ts
+const files = await zi.read({ path: "package.json" })
+state.runs = ((state.runs as number | undefined) ?? 0) + 1
+scratch.lastPackage = files
+return { runs: state.runs }
 ```
+
+Zi strips types before execution. Syntax that emits JavaScript, including enums, namespaces, parameter properties, import aliases, and export assignments, is rejected instead of being transformed into hidden runtime behavior.
 
 ## Authority
 
@@ -37,7 +37,9 @@ The runtime APIs are available as cell globals.
 - `project.import(specifier)` resolves packages and project files from the session working directory. Native dynamic import remains available.
 - `console.log`, `console.warn`, and `console.error` use bounded Node-style value inspection. Logs are returned with both successful and failed cell results.
 
-Every `zi` call must be awaited before the cell returns. Calls are serialized by Zi, even when the cell creates them concurrently. `Promise.all` does not add tool concurrency; use `Promise.allSettled` only when independent failures should remain available to the cell.
+Every `zi` call must be awaited before the cell returns. Zi starts calls in submission order: tools declared parallel may overlap in a four-call pool, while sequential tools wait for earlier parallel work and then run alone. A sequential call is also a barrier for later parallel calls.
+
+Tool failures reject with `ZiToolError`. Its `toolName` identifies the failed tool, so a cell can catch one expected failure without parsing presentation text; `Promise.allSettled` retains independent failures.
 
 ## Code-only invocations
 
@@ -66,15 +68,17 @@ A cancelled, timed-out, crashed, or over-limit worker is replaced only after its
 
 Each bound protects something the session needs in order to survive a bad cell.
 
-A cell may contain at most 256 KiB of code, make at most 64 `zi` calls, and commit at most 256 KiB of structurally bounded JSON state, so one cell cannot take over the turn or the state store. The default execution deadline is 120 seconds, which bounds a cell that never returns.
+A cell may contain at most 256 KiB of code, make at most 64 `zi` calls, and commit at most 256 KiB of structurally bounded JSON state, so one cell cannot take over the turn or the state store. The runtime separately admits at most 60 seconds of worker-process compute and 120 seconds of wall time; waiting on a legitimate tool consumes wall time without materially spending the compute budget.
 
-Program-state history has its own 2,048-entry and 8 MiB admission limit, reserving the rest of the session [journal](vocabulary.md) for conversation and extension state. Protocol queues, tool traces, errors, console logs, worker output, retained memory, and shutdown waits are bounded for the same reason.
+Values crossing from the cell are snapshotted through captured intrinsics. The boundary accepts only finite, lossless JSON in plain objects and dense undecorated arrays, with at most 32 levels and 16,384 nodes; it does not invoke getters, `toJSON`, or guest-replaced JSON methods.
+
+Logs and the terminal result or error share an exact 512 KiB serialized UTF-8 budget. Program-state history has its own 2,048-entry and 8 MiB admission limit, reserving the rest of the session [journal](vocabulary.md) for conversation and extension state. Protocol queues, tool traces, retained memory, and shutdown waits are bounded for the same reason.
 
 ## What this does not do
 
 Code Mode is not a security or credential boundary. A cell runs with the authority you gave Zi.
 
-It does not add tool concurrency. `zi` calls are serialized, and `Promise.all` does not change that.
+It does not make every tool concurrent. Only tools whose owner declares parallel execution may overlap, and the pool remains bounded; sequential tools retain an exclusive ordering barrier.
 
 `scratch` does not survive worker replacement or session resume. Only committed `state` crosses those transitions.
 

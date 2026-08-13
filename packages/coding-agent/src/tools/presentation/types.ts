@@ -47,7 +47,12 @@ export type ToolSubject =
 export type ToolBody =
   | { readonly type: "terminal"; readonly text: string }
   | { readonly type: "source"; readonly text: string; readonly path: string; readonly startLine?: number }
-  | { readonly type: "code"; readonly text: string; readonly language: "javascript"; readonly startLine?: number }
+  | {
+      readonly type: "code"
+      readonly text: string
+      readonly language: "javascript" | "typescript"
+      readonly startLine?: number
+    }
   | { readonly type: "diff"; readonly text: string; readonly path?: string }
   | { readonly type: "text"; readonly text: string; readonly tone: "normal" | "muted" | "error" }
 

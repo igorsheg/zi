@@ -8,7 +8,7 @@ import type { AgentTool } from "@earendil-works/pi-agent-core"
 import { Type } from "@earendil-works/pi-ai"
 
 import { CodeMode, isCodeModeDetails } from "../src/code-mode/code-mode.js"
-import { maxCodeModeLogBytes, maxCodeModeStateBytes } from "../src/code-mode/protocol.js"
+import { maxCodeModeLogBytes, maxCodeModeOutputBytes, maxCodeModeStateBytes } from "../src/code-mode/protocol.js"
 import type { CodeModeCapableTool } from "../src/code-mode/tool-contract.js"
 import { maxCodeModeTerminalDetailsBytes } from "../src/code-mode/trace.js"
 import { ZiPaths } from "../src/paths.js"
@@ -22,6 +22,10 @@ import { WorkPlan } from "../src/work-plan.js"
 const workerCommand = Object.freeze([
   process.execPath,
   fileURLToPath(new URL("../src/code-mode/worker-entry.ts", import.meta.url))
+])
+const computeWorkerCommand = Object.freeze([
+  process.execPath,
+  fileURLToPath(new URL("./fixtures/code-mode-compute-worker.ts", import.meta.url))
 ])
 const codeModes = new Set<CodeMode>()
 
@@ -134,7 +138,7 @@ test("code-only sessions expose one model tool backed by the complete Zi catalog
     expect(catalog).toEqual(["code"])
     expect(description).toContain("read: (input:")
     expect(description).toContain("bash: (input:")
-    expect(description).toContain("including calls created with Promise.all")
+    expect(description).toContain("Tools declared parallel may overlap up to 4 at once")
     expect(systemPrompt).toContain("The only model-facing tool is code")
     expect(systemPrompt).toContain("Promise.allSettled")
     expect(systemPrompt).not.toContain("Use direct tools for one ordinary read")
@@ -150,11 +154,12 @@ test("code executes serial nested calls in an isolated worker", async () => {
   const result = await tool.execute(
     "outer",
     {
-      code: `async () => {
+      description: "Test code",
+      code: `
   const output = [];
   for (const value of ["a", "b", "c"]) output.push(await zi.echo({ value }));
   return output.join(",");
-}`
+`
     },
     undefined
   )
@@ -196,7 +201,7 @@ test("code exposes declared native values instead of presentation envelopes", as
 
   const result = await tool.execute(
     "outer",
-    { code: `async () => { const stats = await zi.stats({}); return stats.lines; }` },
+    { description: "Test code", code: ` const stats = await zi.stats({}); return stats.lines; ` },
     undefined
   )
 
@@ -211,7 +216,8 @@ test("code updates the authoritative work plan through its native JSON contract"
   const result = await tool.execute(
     "outer",
     {
-      code: `async () => zi.update_plan({
+      description: "Test code",
+      code: `return zi.update_plan({
   explanation: "From Code Mode",
   steps: [{ text: "Verify", status: "in_progress" }]
 })`
@@ -256,7 +262,7 @@ test("code serializes guest-created calls for deterministic mutation order", asy
   const tool = createCodeMode(cwd).createTool([serialTool])
   const result = await tool.execute(
     "outer",
-    { code: `async () => Promise.all([1, 2, 3].map(value => zi.serial({ value })))` },
+    { description: "Test code", code: `return Promise.all([1, 2, 3].map(value => zi.serial({ value })))` },
     undefined
   )
 
@@ -265,10 +271,153 @@ test("code serializes guest-created calls for deterministic mutation order", asy
   expect(order).toEqual([1, 2, 3])
 })
 
+test("code runs parallel tools in a bounded pool and preserves exclusive barriers", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "zi-code-mode-parallel-"))
+  let activeParallel = 0
+  let maximumParallel = 0
+  let exclusiveActive = false
+  const events: string[] = []
+  const parallelTool: AgentTool = {
+    name: "parallel",
+    label: "parallel",
+    description: "Exercise parallel scheduling",
+    parameters: Type.Object({ value: Type.Number() }),
+    executionMode: "parallel",
+    execute: async (_id, input) => {
+      const value = typeof input === "object" && input !== null && "value" in input ? Number(input.value) : -1
+      expect(exclusiveActive).toBe(false)
+      activeParallel++
+      maximumParallel = Math.max(maximumParallel, activeParallel)
+      events.push(`parallel-${value}-start`)
+      await Bun.sleep(20)
+      events.push(`parallel-${value}-end`)
+      activeParallel--
+      return { content: [{ type: "text", text: String(value) }], details: {} }
+    }
+  }
+  const exclusiveTool: AgentTool = {
+    name: "exclusive",
+    label: "exclusive",
+    description: "Exercise an exclusive scheduling barrier",
+    parameters: Type.Object({}),
+    executionMode: "sequential",
+    execute: async () => {
+      expect(activeParallel).toBe(0)
+      exclusiveActive = true
+      events.push("exclusive-start")
+      await Bun.sleep(10)
+      events.push("exclusive-end")
+      exclusiveActive = false
+      return { content: [{ type: "text", text: "exclusive" }], details: {} }
+    }
+  }
+  const tool = createCodeMode(cwd).createTool([parallelTool, exclusiveTool])
+  const result = await tool.execute(
+    "outer",
+    {
+      description: "Exercise nested scheduling",
+      code: `
+const first = [1, 2, 3, 4, 5, 6].map(value => zi.parallel({ value }))
+const barrier = zi.exclusive({})
+const last = zi.parallel({ value: 7 })
+return Promise.all([...first, barrier, last])`
+    },
+    undefined
+  )
+
+  expect(isCodeModeDetails(result.details) && result.details.outcome).toBe("success")
+  expect(maximumParallel).toBe(4)
+  expect(events.indexOf("exclusive-start")).toBeGreaterThan(events.indexOf("parallel-6-end"))
+  expect(events.indexOf("parallel-7-start")).toBeGreaterThan(events.indexOf("exclusive-end"))
+})
+
+test("code accepts erasable TypeScript bodies and rejects runtime-emitting and legacy wrappers", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "zi-code-mode-typescript-"))
+  const tool = createCodeMode(cwd).createTool([])
+  const success = await tool.execute(
+    "typed",
+    {
+      description: "Exercise erasable TypeScript",
+      code: `type Pair = { left: number; right: number }\nconst pair: Pair = { left: 2, right: 3 }\nreturn pair.left + pair.right`
+    },
+    undefined
+  )
+  const forbidden = [
+    ["enum", `enum Value { Ready }\nreturn Value.Ready`, "TypeScript enums"],
+    ["namespace", `namespace Value { export const ready = true }\nreturn Value.ready`, "TypeScript namespaces"],
+    [
+      "parameter-property",
+      `class Value { constructor(public ready: boolean) {} }\nreturn new Value(true).ready`,
+      "parameter properties"
+    ],
+    ["import-alias", `import Value = require("value")\nreturn Value`, "import = require()"],
+    ["export-assignment", `export = 1`, "export ="]
+  ] as const
+  const forbiddenResults = []
+  for (const [name, code] of forbidden) {
+    // CodeMode owns one active cell and deliberately rejects overlapping execution.
+    // eslint-disable-next-line no-await-in-loop
+    forbiddenResults.push(await tool.execute(name, { description: "Reject runtime TypeScript", code }, undefined))
+  }
+  const legacy = await tool.execute(
+    "legacy",
+    { description: "Reject the legacy wrapper", code: `(async () => { return 1 })` },
+    undefined
+  )
+
+  expect(success.content).toEqual([{ type: "text", text: "5" }])
+  for (let index = 0; index < forbidden.length; index++) {
+    expect(forbiddenResults[index]?.content[0]).toEqual({
+      type: "text",
+      text: expect.stringContaining(forbidden[index]![2])
+    })
+  }
+  expect(legacy.content[0]).toEqual({ type: "text", text: expect.stringContaining("async function body") })
+})
+
+test("nested failures expose a stable ZiToolError with the failed tool name", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "zi-code-mode-tool-error-"))
+  const tool = createCodeMode(cwd).createTool([echoTool])
+  const result = await tool.execute(
+    "outer",
+    {
+      description: "Inspect a nested failure",
+      code: `
+try {
+  await zi.echo({})
+} catch (error) {
+  return { typed: error instanceof ZiToolError, name: error.name, toolName: error.toolName }
+}`
+    },
+    undefined
+  )
+
+  if (result.content[0]?.type !== "text") throw new Error("Expected typed error result")
+  expect(JSON.parse(result.content[0].text)).toEqual({ typed: true, name: "ZiToolError", toolName: "echo" })
+})
+
+test("code snapshots returned values without consulting guest-replaced JSON intrinsics", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "zi-code-mode-json-intrinsics-"))
+  const tool = createCodeMode(cwd).createTool([])
+  const result = await tool.execute(
+    "outer",
+    {
+      description: "Replace guest JSON intrinsics",
+      code: `
+JSON.stringify = () => '"spoofed"'
+Object.getPrototypeOf = () => null
+return { real: true }`
+    },
+    undefined
+  )
+
+  expect(result.content).toEqual([{ type: "text", text: '{\n  "real": true\n}' }])
+})
+
 test("code preserves nested schema failures as bounded trace evidence", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "zi-code-mode-schema-"))
   const tool = createCodeMode(cwd).createTool([echoTool])
-  const result = await tool.execute("outer", { code: `async () => zi.echo({})` }, undefined)
+  const result = await tool.execute("outer", { description: "Test code", code: `return zi.echo({})` }, undefined)
 
   expect(isCodeModeDetails(result.details)).toBe(true)
   if (!isCodeModeDetails(result.details)) throw new Error("Expected code-mode details")
@@ -281,7 +430,7 @@ test("code preserves nested schema failures as bounded trace evidence", async ()
 test("code distinguishes cell failures from nested tool failures", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "zi-code-mode-failure-source-"))
   const tool = createCodeMode(cwd).createTool([echoTool])
-  const syntax = await tool.execute("syntax", { code: `async () => {` }, undefined)
+  const syntax = await tool.execute("syntax", { description: "Test code", code: `return {` }, undefined)
 
   expect(isCodeModeDetails(syntax.details) && syntax.details.outcome).toBe("error")
   expect(syntax.content[0]).toEqual({ type: "text", text: expect.stringContaining("Code cell failed") })
@@ -289,10 +438,11 @@ test("code distinguishes cell failures from nested tool failures", async () => {
   const collision = await tool.execute(
     "collision",
     {
-      code: `async () => {
+      description: "Test code",
+      code: `
   try { await zi.echo({}); }
   catch (error) { throw new Error(error instanceof Error ? error.message : String(error)); }
-}`
+`
     },
     undefined
   )
@@ -312,7 +462,7 @@ test("code replaces a worker when cancelled nested work cannot settle", async ()
   const tool = createCodeMode(cwd).createTool([blockedTool])
   const failed = await tool.execute(
     "blocked",
-    { code: `async () => { zi.blocked({}); return "too early"; }` },
+    { description: "Test code", code: ` zi.blocked({}); return "too early"; ` },
     undefined
   )
 
@@ -323,7 +473,7 @@ test("code replaces a worker when cancelled nested work cannot settle", async ()
   expect(failed.details.calls).toEqual([expect.objectContaining({ name: "blocked", state: "aborted" })])
   expect(failed.content[0]).toEqual({ type: "text", text: expect.stringContaining("Nested Zi tool settlement failed") })
 
-  const recovered = await tool.execute("recovered", { code: `async () => "ready"` }, undefined)
+  const recovered = await tool.execute("recovered", { description: "Test code", code: `return "ready"` }, undefined)
   expect(recovered.content).toEqual([{ type: "text", text: "ready" }])
 }, 7_000)
 
@@ -344,7 +494,8 @@ test("code exposes a closed non-thenable guest tool catalog", async () => {
     const result = await tool.execute(
       "outer",
       {
-        code: `async () => {
+        description: "Test code",
+        code: `
   const resolved = await Promise.resolve(zi);
   return {
     same: resolved === zi,
@@ -355,7 +506,7 @@ test("code exposes a closed non-thenable guest tool catalog", async () => {
     frozen: Object.isFrozen(zi),
     string: String(zi)
   };
-}`
+`
       },
       controller.signal
     )
@@ -379,7 +530,8 @@ test("code cells have full ambient Node-compatible authority", async () => {
   const result = await tool.execute(
     "outer",
     {
-      code: `async () => ({
+      description: "Test code",
+      code: `return ({
   process: typeof process,
   bun: typeof Bun,
   require: typeof require,
@@ -405,7 +557,8 @@ test("code formats bounded console diagnostics for JavaScript values", async () 
   const result = await tool.execute(
     "console",
     {
-      code: `async () => {
+      description: "Test code",
+      code: `
   const circular = { answer: 42 };
   circular.self = circular;
   const guarded = {
@@ -429,7 +582,7 @@ test("code formats bounded console diagnostics for JavaScript values", async () 
     { payload: "x".repeat(100_000) }
   );
   return "done";
-}`
+`
     },
     undefined
   )
@@ -457,11 +610,12 @@ test("code preserves console diagnostics when cells and nested tools fail", asyn
   const cellFailure = await tool.execute(
     "cell",
     {
-      code: `async () => {
+      description: "Test code",
+      code: `
   console.log({ phase: "cell" });
   for (let index = 0; index < 4; index++) console.log("x".repeat(${maxCodeModeLogBytes}));
   throw new Error("cell boom");
-}`
+`
     },
     undefined
   )
@@ -477,10 +631,11 @@ test("code preserves console diagnostics when cells and nested tools fail", asyn
   const nestedFailure = await tool.execute(
     "nested",
     {
-      code: `async () => {
+      description: "Test code",
+      code: `
   console.warn({ phase: "nested" });
   await zi.echo({});
-}`
+`
     },
     undefined
   )
@@ -497,11 +652,12 @@ test("code keeps arbitrary scratch while committing JSON state only on success",
   const initialized = await tool.execute(
     "initialize",
     {
-      code: `async () => {
+      description: "Test code",
+      code: `
   scratch.marker = new Map([["ready", 1]]);
   state.count = 1;
   return scratch.marker instanceof Map;
-}`
+`
     },
     undefined
   )
@@ -510,11 +666,12 @@ test("code keeps arbitrary scratch while committing JSON state only on success",
   const failed = await tool.execute(
     "fail",
     {
-      code: `async () => {
+      description: "Test code",
+      code: `
   state.count = 2;
   scratch.failures = (scratch.failures ?? 0) + 1;
   throw new Error("rollback");
-}`
+`
     },
     undefined
   )
@@ -523,7 +680,8 @@ test("code keeps arbitrary scratch while committing JSON state only on success",
   const observed = await tool.execute(
     "observe",
     {
-      code: `async () => ({
+      description: "Test code",
+      code: `return ({
   count: state.count,
   marker: scratch.marker instanceof Map && scratch.marker.get("ready"),
   failures: scratch.failures
@@ -540,7 +698,11 @@ test("code restores committed state for a replacement runtime", async () => {
   const first = new CodeMode(cwd, workerCommand, sessionManager)
   codeModes.add(first)
   const firstTool = first.createTool([echoTool])
-  await firstTool.execute("commit", { code: `async () => { state.answer = 42; scratch.onlyHere = true; }` }, undefined)
+  await firstTool.execute(
+    "commit",
+    { description: "Test code", code: ` state.answer = 42; scratch.onlyHere = true; ` },
+    undefined
+  )
   await first.dispose()
   codeModes.delete(first)
 
@@ -552,7 +714,7 @@ test("code restores committed state for a replacement runtime", async () => {
     .createTool([echoTool])
     .execute(
       "restore",
-      { code: `async () => ({ answer: state.answer, scratch: scratch.onlyHere ?? null })` },
+      { description: "Test code", code: `return ({ answer: state.answer, scratch: scratch.onlyHere ?? null })` },
       undefined
     )
 
@@ -562,25 +724,28 @@ test("code restores committed state for a replacement runtime", async () => {
 test("code rejects invalid state commits, rolls back state, and remains reusable", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "zi-code-mode-invalid-state-"))
   const tool = createCodeMode(cwd).createTool([echoTool])
-  await tool.execute("commit", { code: `async () => { state.value = "committed"; }` }, undefined)
+  await tool.execute("commit", { description: "Test code", code: ` state.value = "committed"; ` }, undefined)
 
   const cyclic = await tool.execute(
     "cyclic",
-    { code: `async () => { state.value = "lost"; state.loop = state; scratch.failure = "preserved"; }` },
+    { description: "Test code", code: ` state.value = "lost"; state.loop = state; scratch.failure = "preserved"; ` },
     undefined
   )
   expect(isCodeModeDetails(cyclic.details) && cyclic.details.outcome).toBe("error")
 
   const oversized = await tool.execute(
     "oversized",
-    { code: `async () => { state.payload = "x".repeat(${maxCodeModeStateBytes}); }` },
+    { description: "Test code", code: ` state.payload = "x".repeat(${maxCodeModeStateBytes}); ` },
     undefined
   )
   expect(isCodeModeDetails(oversized.details) && oversized.details.outcome).toBe("error")
 
   const recovered = await tool.execute(
     "recovered",
-    { code: `async () => ({ value: state.value, payload: state.payload ?? null, scratch: scratch.failure })` },
+    {
+      description: "Test code",
+      code: `return ({ value: state.value, payload: state.payload ?? null, scratch: scratch.failure })`
+    },
     undefined
   )
   expect(recovered.content).toEqual([
@@ -594,7 +759,7 @@ test("persistent runtime admits a fresh immutable tool catalog for each cell", a
   const first = codeMode.createTool([echoTool])
   await first.execute(
     "first",
-    { code: `async () => { state.shared = 1; scratch.shared = new Set(["ready"]); }` },
+    { description: "Test code", code: ` state.shared = 1; scratch.shared = new Set(["ready"]); ` },
     undefined
   )
 
@@ -603,7 +768,8 @@ test("persistent runtime admits a fresh immutable tool catalog for each cell", a
   const result = await second.execute(
     "second",
     {
-      code: `async () => ({
+      description: "Test code",
+      code: `return ({
   old: typeof zi.echo,
   current: typeof zi.renamed,
   state: state.shared,
@@ -641,7 +807,9 @@ test("code mode releases its tracked worker process tree on disposal", async () 
   }
   const codeMode = new CodeMode(cwd, workerCommand, undefined, tracker)
   codeModes.add(codeMode)
-  const result = await codeMode.createTool([echoTool]).execute("tracked", { code: `async () => "ready"` }, undefined)
+  const result = await codeMode
+    .createTool([echoTool])
+    .execute("tracked", { description: "Test code", code: `return "ready"` }, undefined)
   expect(result.content).toEqual([{ type: "text", text: "ready" }])
   expect(trackedPid).toBeGreaterThan(0)
 
@@ -660,14 +828,15 @@ test("disposing code mode kills a long-lived subprocess created by a cell", asyn
     const result = await codeMode.createTool([]).execute(
       "spawn",
       {
-        code: `async () => {
+        description: "Test code",
+        code: `
   const child = Bun.spawn([process.execPath, "-e", "setInterval(() => {}, 1000)"], {
     stdout: "ignore",
     stderr: "ignore"
   });
   child.unref();
   return child.pid;
-}`
+`
       },
       undefined
     )
@@ -714,7 +883,9 @@ test("disposing code mode during blocked worker admission releases the process s
   }
   const codeMode = new CodeMode(cwd, workerCommand, undefined, tracker)
   codeModes.add(codeMode)
-  const execution = codeMode.createTool([echoTool]).execute("starting", { code: `async () => "ready"` }, undefined)
+  const execution = codeMode
+    .createTool([echoTool])
+    .execute("starting", { description: "Test code", code: `return "ready"` }, undefined)
   const settledExecution = execution.catch(cause => cause)
   await Bun.sleep(0)
 
@@ -731,7 +902,10 @@ test("code enforces its nested call bound", async () => {
   const tool = createCodeMode(cwd).createTool([echoTool])
   const result = await tool.execute(
     "outer",
-    { code: `async () => { for (let index = 0; index < 65; index++) await zi.echo({ value: String(index) }); }` },
+    {
+      description: "Test code",
+      code: ` for (let index = 0; index < 65; index++) await zi.echo({ value: String(index) }); `
+    },
     undefined
   )
 
@@ -742,6 +916,25 @@ test("code enforces its nested call bound", async () => {
   expect(result.details.calls).toHaveLength(64)
   expect(result.content[0]).toEqual({ type: "text", text: expect.stringContaining("64 tool calls") })
   expect(Buffer.byteLength(JSON.stringify(result.details))).toBeLessThanOrEqual(maxCodeModeTerminalDetailsBytes)
+})
+
+test("code applies one aggregate serialized budget to console logs and the terminal result", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "zi-code-mode-output-bound-"))
+  const tool = createCodeMode(cwd).createTool([])
+  const result = await tool.execute(
+    "outer",
+    {
+      description: "Exceed aggregate output accounting",
+      code: `for (let index = 0; index < 32; index++) console.log("x".repeat(${maxCodeModeLogBytes})); return "done"`
+    },
+    undefined
+  )
+
+  expect(isCodeModeDetails(result.details) && result.details.outcome).toBe("error")
+  expect(result.content[0]).toEqual({
+    type: "text",
+    text: expect.stringContaining(`Code-mode output exceeded ${maxCodeModeOutputBytes} bytes`)
+  })
 })
 
 test("code terminal traces enforce their aggregate serialized bound", async () => {
@@ -758,10 +951,11 @@ test("code terminal traces enforce their aggregate serialized bound", async () =
     .execute(
       "outer",
       {
-        code: `async () => {
+        description: "Test code",
+        code: `
   const path = "\\u0000".repeat(4096);
   for (let index = 0; index < 64; index++) await zi.read({ path });
-}`
+`
       },
       undefined
     )
@@ -781,17 +975,22 @@ test("code guest can catch built-in expected errors and uncaught failures settle
   const caught = await tool.execute(
     "caught",
     {
-      code: `async () => {
+      description: "Test code",
+      code: `
   try { await zi.read({ path: "missing.txt" }); }
   catch (error) { return String(error).includes("missing.txt"); }
-}`
+`
     },
     undefined
   )
   expect(caught.content).toEqual([{ type: "text", text: "true" }])
   expect(isCodeModeDetails(caught.details) && caught.details.calls[0]?.state).toBe("failed")
 
-  const uncaught = await tool.execute("uncaught", { code: `async () => zi.read({ path: "missing.txt" })` }, undefined)
+  const uncaught = await tool.execute(
+    "uncaught",
+    { description: "Test code", code: `return zi.read({ path: "missing.txt" })` },
+    undefined
+  )
   expect(isCodeModeDetails(uncaught.details)).toBe(true)
   if (!isCodeModeDetails(uncaught.details) || uncaught.details.outcome !== "error") {
     throw new Error("Expected uncaught nested failure")
@@ -838,7 +1037,8 @@ test("code durable failed calls retain only their fixed failure stage", async ()
   const result = await tool.execute(
     "outer",
     {
-      code: `async () => {
+      description: "Test code",
+      code: `
   for (const call of [
     () => zi.prepare_failure({ token: "${secret}" }),
     () => zi.validate_failure({}),
@@ -847,7 +1047,7 @@ test("code durable failed calls retain only their fixed failure stage", async ()
     try { await call(); } catch {}
   }
   return "caught";
-}`
+`
     },
     undefined
   )
@@ -865,7 +1065,7 @@ test("code durable failed calls retain only their fixed failure stage", async ()
 
   const uncaught = await tool.execute(
     "uncaught",
-    { code: `async () => zi.invoke_failure({ token: "${secret}" })` },
+    { description: "Test code", code: `return zi.invoke_failure({ token: "${secret}" })` },
     undefined
   )
   expect(isCodeModeDetails(uncaught.details)).toBe(true)
@@ -896,7 +1096,7 @@ test("code durable traces omit arbitrary arguments and successful intermediate r
     .createTool([privateTool])
     .execute(
       "outer",
-      { code: `async () => { await zi["extension.private"]({ token: "${secret}" }); return "done"; }` },
+      { description: "Test code", code: ` await zi["extension.private"]({ token: "${secret}" }); return "done"; ` },
       undefined,
       update => updates.push(update)
     )
@@ -942,10 +1142,11 @@ test("code durable traces retain safe built-in file metadata without payloads", 
   const result = await tool.execute(
     "outer",
     {
-      code: `async () => {
+      description: "Test code",
+      code: `
   await zi.write({ path: "secret.txt", content: "write-secret-payload" });
   await zi.edit({ path: "secret.txt", edits: [{ oldText: "old-secret", newText: "new-secret" }] });
-}`
+`
     },
     undefined
   )
@@ -965,7 +1166,11 @@ test("code supports punctuation in extension tool names", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "zi-code-mode-tool-name-"))
   const namedTool: typeof echoTool = { ...echoTool, name: "api.search-v2" }
   const tool = createCodeMode(cwd).createTool([namedTool])
-  const result = await tool.execute("outer", { code: `async () => zi["api.search-v2"]({ value: "found" })` }, undefined)
+  const result = await tool.execute(
+    "outer",
+    { description: "Test code", code: `return zi["api.search-v2"]({ value: "found" })` },
+    undefined
+  )
 
   expect(result.content).toEqual([{ type: "text", text: "found" }])
 })
@@ -982,7 +1187,7 @@ test("code propagates nested turn termination and rejects later calls", async ()
   const tool = createCodeMode(cwd).createTool([stopTool, echoTool])
   const result = await tool.execute(
     "outer",
-    { code: `async () => { await zi.stop({}); return zi.echo({ value: "too late" }); }` },
+    { description: "Test code", code: ` await zi.stop({}); return zi.echo({ value: "too late" }); ` },
     undefined
   )
 
@@ -1024,7 +1229,7 @@ test("cancelling code aborts its active nested tool and worker", async () => {
   }
   const tool = createCodeMode(cwd).createTool([waitingTool])
   const controller = new AbortController()
-  const execution = tool.execute("outer", { code: `async () => zi.wait({})` }, controller.signal)
+  const execution = tool.execute("outer", { description: "Test code", code: `return zi.wait({})` }, controller.signal)
   await active
   controller.abort(new Error("cancelled by test"))
 
@@ -1060,11 +1265,12 @@ test("late nested completion cannot cross a cancelled worker generation", async 
   const cancelled = tool.execute(
     "cancelled",
     {
-      code: `async () => {
+      description: "Test code",
+      code: `
   state.generation = "cancelled";
   scratch.generation = "cancelled";
   await zi.hold({});
-}`
+`
     },
     controller.signal,
     update => updates.push(JSON.stringify(update.details))
@@ -1076,11 +1282,12 @@ test("late nested completion cannot cross a cancelled worker generation", async 
   const recovered = await tool.execute(
     "recovered",
     {
-      code: `async () => {
+      description: "Test code",
+      code: `
   state.generation = "current";
   scratch.generation = "current";
   return { state: state.generation, scratch: scratch.generation };
-}`
+`
     },
     undefined
   )
@@ -1090,7 +1297,7 @@ test("late nested completion cannot cross a cancelled worker generation", async 
   expect(recovered.content).toEqual([{ type: "text", text: '{\n  "state": "current",\n  "scratch": "current"\n}' }])
   const observed = await tool.execute(
     "observed",
-    { code: `async () => ({ state: state.generation, scratch: scratch.generation })` },
+    { description: "Test code", code: `return ({ state: state.generation, scratch: scratch.generation })` },
     undefined
   )
   expect(observed.content).toEqual(recovered.content)
@@ -1099,9 +1306,9 @@ test("late nested completion cannot cross a cancelled worker generation", async 
 test("cancelling code terminates a guest that cannot yield to protocol input", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "zi-code-mode-hard-cancel-"))
   const tool = createCodeMode(cwd).createTool([echoTool])
-  await tool.execute("warmup", { code: `async () => "ready"` }, undefined)
+  await tool.execute("warmup", { description: "Test code", code: `return "ready"` }, undefined)
   const controller = new AbortController()
-  const execution = tool.execute("outer", { code: `async () => { while (true) {} }` }, controller.signal)
+  const execution = tool.execute("outer", { description: "Test code", code: ` while (true) {} ` }, controller.signal)
   await Bun.sleep(50)
   controller.abort(new Error("hard cancellation"))
 
@@ -1124,7 +1331,7 @@ test("code rejects unawaited nested calls and cancels their admitted work", asyn
   const tool = createCodeMode(cwd).createTool([mutatingTool])
   const result = await tool.execute(
     "outer",
-    { code: `async () => { zi.mutate({ value: 1 }); zi.mutate({ value: 2 }); return "early"; }` },
+    { description: "Test code", code: ` zi.mutate({ value: 1 }); zi.mutate({ value: 2 }); return "early"; ` },
     undefined
   )
 
@@ -1156,10 +1363,11 @@ test("code contains guest memory exhaustion and aborts active nested work", asyn
   const result = await tool.execute(
     "outer",
     {
-      code: `async () => {
+      description: "Test code",
+      code: `
   zi.wait({});
   const values = new Array(100_000_000).fill(1);
-}`
+`
     },
     undefined
   )
@@ -1178,23 +1386,48 @@ test("code contains guest memory exhaustion and aborts active nested work", asyn
     )
   })
 
-  const recovered = await tool.execute("recovered", { code: `async () => "ready"` }, undefined)
+  const recovered = await tool.execute("recovered", { description: "Test code", code: `return "ready"` }, undefined)
+  expect(recovered.content).toEqual([{ type: "text", text: "ready" }])
+})
+
+test("code enforces compute independently from the wall-clock deadline", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "zi-code-mode-compute-"))
+  const codeMode = new CodeMode(cwd, computeWorkerCommand)
+  codeModes.add(codeMode)
+  const tool = codeMode.createTool([])
+  const exhausted = await tool.execute(
+    "compute",
+    { description: "Exhaust the compute budget", code: `while (true) {}` },
+    undefined
+  )
+
+  expect(isCodeModeDetails(exhausted.details) && exhausted.details.outcome).toBe("error")
+  expect(exhausted.content[0]).toEqual({ type: "text", text: expect.stringContaining("compute budget exhausted") })
+  const recovered = await tool.execute(
+    "recovered",
+    { description: "Verify compute-budget recovery", code: `return "ready"` },
+    undefined
+  )
   expect(recovered.content).toEqual([{ type: "text", text: "ready" }])
 })
 
 test("code restarts cleanly after interrupting an infinite cell", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "zi-code-mode-loop-"))
   const tool = createCodeMode(cwd).createTool([echoTool])
-  await tool.execute("warmup", { code: `async () => { state.saved = 7; scratch.volatile = "old worker"; }` }, undefined)
+  await tool.execute(
+    "warmup",
+    { description: "Test code", code: ` state.saved = 7; scratch.volatile = "old worker"; ` },
+    undefined
+  )
   const controller = new AbortController()
-  const blocked = tool.execute("blocked", { code: `async () => { while (true) {} }` }, controller.signal)
+  const blocked = tool.execute("blocked", { description: "Test code", code: ` while (true) {} ` }, controller.signal)
   await Bun.sleep(50)
   controller.abort(new Error("interrupt infinite cell"))
 
   expect(await rejectionMessage(blocked)).toContain("interrupt infinite cell")
   const recovered = await tool.execute(
     "recovered",
-    { code: `async () => ({ saved: state.saved, scratch: scratch.volatile ?? null })` },
+    { description: "Test code", code: `return ({ saved: state.saved, scratch: scratch.volatile ?? null })` },
     undefined
   )
   expect(recovered.content).toEqual([{ type: "text", text: '{\n  "saved": 7,\n  "scratch": null\n}' }])

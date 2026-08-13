@@ -967,7 +967,8 @@ test("Code Mode cancels sibling subagent observation after a nested failure", as
     const result = await tool.execute(
       "outer",
       {
-        code: `async () => Promise.all([
+        description: "Test code",
+        code: `return Promise.all([
   zi.fail({}),
   zi.interrupt_subagent({ name: "${name}" })
 ])`
@@ -985,7 +986,7 @@ test("Code Mode cancels sibling subagent observation after a nested failure", as
       expect.objectContaining({ name: "interrupt_subagent", state: "aborted" })
     ])
 
-    const recovered = await tool.execute("recovered", { code: `async () => "ready"` }, undefined)
+    const recovered = await tool.execute("recovered", { description: "Test code", code: `return "ready"` }, undefined)
     expect(recovered.content).toEqual([{ type: "text", text: "ready" }])
 
     await writeFile(harness.interruptReleasePath!, "release")

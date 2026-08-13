@@ -7,11 +7,11 @@ export function codeModeDoctrine(toolSurface: ToolSurface = "direct-and-code"): 
       : "Use direct tools for one ordinary read, edit, write, or command. Use code when work benefits from loops, branching, filtering, aggregation, reusable intermediate values, or multiple dependent tool calls."
   return `# Programmatic runtime
 
-Treat Code Mode as the session's JavaScript control environment for retaining intermediate data, transforming results, and orchestrating data-dependent workflows.
+Treat Code Mode as the session's erasable-TypeScript control environment for retaining intermediate data, transforming results, and orchestrating data-dependent workflows.
 
 ${toolGuidance}
 
-Zi executes zi.* calls serially, including calls created with Promise.all. Use Promise.allSettled only to retain independent failures, not to add concurrency.
+Zi starts zi.* calls in submission order. Calls declared parallel may overlap within a bounded pool; other calls run exclusively. Use Promise.allSettled when independent failures should remain available to the cell.
 
 The runtime coordinates work; it is not necessarily the target project's native environment. Run project tests, scripts, CLIs, and dependency checks through the project's normal commands and environment.
 

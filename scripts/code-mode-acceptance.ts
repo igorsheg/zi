@@ -41,8 +41,9 @@ export async function runCodeModeAcceptance(options: {
     const result = await tool.execute(
       "compiled-acceptance",
       {
-        code: `async () => {
-  const catalog = await Promise.resolve(zi);
+        description: "Inspect the compiled Code Mode runtime",
+        code: `
+  const catalog: typeof zi = await Promise.resolve(zi);
   const file = await zi.read({ path: ".zi-code-mode-acceptance" });
   const stats = await zi.acceptance_stats({ path: ".zi-code-mode-acceptance" });
   return {
@@ -60,7 +61,7 @@ export async function runCodeModeAcceptance(options: {
     bridge: typeof __ziHostCall,
     imported: typeof (await project.import("node:path")).join
   };
-}`
+`
       },
       undefined
     )
@@ -91,12 +92,18 @@ export async function runCodeModeAcceptance(options: {
 
     await tool.execute(
       "compiled-state",
-      { code: `async () => { state.compiled = true; scratch.marker = new Map([["ready", 1]]); }` },
+      {
+        description: "Persist compiled runtime state",
+        code: `state.compiled = true; scratch.marker = new Map([["ready", 1]]);`
+      },
       undefined
     )
     const retained = await tool.execute(
       "compiled-retained",
-      { code: `async () => ({ state: state.compiled, scratch: scratch.marker.get("ready") })` },
+      {
+        description: "Read retained compiled runtime state",
+        code: `return { state: state.compiled, scratch: scratch.marker.get("ready") }`
+      },
       undefined
     )
     if (
@@ -110,7 +117,7 @@ export async function runCodeModeAcceptance(options: {
     const controller = new AbortController()
     const interrupted = tool.execute(
       "compiled-interrupt",
-      { code: `async () => { while (true) {} }` },
+      { description: "Exercise compiled runtime interruption", code: `while (true) {}` },
       controller.signal
     )
     await Bun.sleep(50)
@@ -123,7 +130,10 @@ export async function runCodeModeAcceptance(options: {
     }
     const recovered = await tool.execute(
       "compiled-recovered",
-      { code: `async () => ({ state: state.compiled, scratch: scratch.marker ?? null })` },
+      {
+        description: "Verify compiled runtime recovery",
+        code: `return { state: state.compiled, scratch: scratch.marker ?? null }`
+      },
       undefined
     )
     if (

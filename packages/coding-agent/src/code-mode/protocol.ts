@@ -19,6 +19,7 @@ export const codeModeFramingLabel = "Code-mode protocol"
 export const maxCodeModeErrorBytes = 16 * 1024
 export const maxCodeModeLogs = 32
 export const maxCodeModeLogBytes = 16 * 1024
+export const maxCodeModeOutputBytes = maxCodeModeLogs * maxCodeModeLogBytes
 export const maxCodeModeJsonDepth = 32
 export const maxCodeModeJsonNodes = 16_384
 export const maxCodeModeStateBytes = 256 * 1024

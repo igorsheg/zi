@@ -47,12 +47,18 @@ const maxTraceNodes = 128
 const maxTraceDepth = 8
 const maxDescriptionBytes = 64 * 1024
 const maxWorkerOutputBytes = 64 * 1024
+const maxParallelNestedCalls = 4
 
 const parameters = Type.Object({
   code: Type.String({
     minLength: 1,
     maxLength: maxCodeBytes,
-    description: "JavaScript async arrow function to execute"
+    description: "Body of an async function written in erasable TypeScript"
+  }),
+  description: Type.String({
+    minLength: 1,
+    maxLength: 160,
+    description: "Short active-voice description of what the program does"
   })
 })
 
@@ -170,6 +176,7 @@ export class CodeMode {
       execute: async (toolCallId, input, signal, onUpdate) => {
         if (Buffer.byteLength(input.code) > maxCodeBytes)
           return codeFailure(`Code must not exceed ${maxCodeBytes} bytes`)
+        if (input.description.trim().length === 0) return codeFailure("Code description must not be blank")
         if (this.#disposed) return codeFailure("Programmatic runtime is disposed")
         let worker: CodeWorker
         try {
@@ -446,10 +453,10 @@ class CodeExecution {
   readonly #parentSignal: AbortSignal | undefined
   readonly #onUpdate: AgentToolUpdateCallback<CodeModeDetails> | undefined
   readonly #controller = new AbortController()
+  readonly #scheduler = new NestedToolScheduler(maxParallelNestedCalls)
   readonly #calls: CodeExecutionCall[] = []
   readonly #callIds = new Set<number>()
   #state: ExecutionState = { type: "running" }
-  #dispatchQueue = Promise.resolve()
   #terminate = false
 
   constructor(
@@ -491,9 +498,17 @@ class CodeExecution {
         return await this.#recoverFailure("runtime", cause)
       }
       this.#state = { type: "final" }
-      if (final.type === "failed") this.#controller.abort(new Error(final.error))
+      if (final.type === "failed") {
+        const cause = new Error(final.error)
+        this.#controller.abort(cause)
+        this.#scheduler.abort(cause)
+      }
       try {
-        await settle(this.#dispatchQueue, defaultTimeouts.nestedSettlementMs, "Nested code-mode tools did not settle")
+        await settle(
+          this.#scheduler.drain(),
+          defaultTimeouts.nestedSettlementMs,
+          "Nested code-mode tools did not settle"
+        )
       } catch (cause) {
         return await this.#recoverFailure("nested_settlement", cause)
       }
@@ -517,6 +532,7 @@ class CodeExecution {
       this.#state = { type: "settled" }
       executionDeadline.dispose()
       this.#controller.abort()
+      this.#scheduler.abort(this.#controller.signal.reason)
       this.#parentSignal?.removeEventListener("abort", abort)
     }
   }
@@ -526,9 +542,10 @@ class CodeExecution {
     cause: unknown
   ): Promise<CodeExecutionResult> {
     this.#controller.abort(cause)
+    this.#scheduler.abort(cause)
     if (kind === "runtime") {
       await settle(
-        this.#dispatchQueue,
+        this.#scheduler.drain(),
         defaultTimeouts.nestedSettlementMs,
         "Nested code-mode tools did not settle"
       ).catch(() => undefined)
@@ -559,11 +576,12 @@ class CodeExecution {
       this.#calls.push({ state: "running", id: message.id, name: message.name, arguments: traceArguments, startedAt }) -
       1
     this.#publishProgress()
-    const operation = this.#dispatchQueue.then(async () => {
+    const tool = this.#tools.get(message.name)
+    const mode = tool?.executionMode === "parallel" ? "parallel" : "exclusive"
+    const operation = this.#scheduler.submit(mode, async () => {
       let stage: CodeModeFailureStage = "prepare"
       try {
         if (this.#controller.signal.aborted) throw abortError(this.#controller.signal)
-        const tool = this.#tools.get(message.name)
         if (!tool) throw new Error(`Tool ${message.name} not found`)
         const prepared = tool.prepareArguments ? tool.prepareArguments(message.arguments) : message.arguments
         if (!isRecord(prepared)) throw new Error(`Tool ${message.name} requires object arguments`)
@@ -598,10 +616,6 @@ class CodeExecution {
         throw new NestedToolFailure(stage, cause)
       }
     })
-    this.#dispatchQueue = operation.then(
-      () => undefined,
-      () => undefined
-    )
     void operation.then(
       async result => {
         if (this.#state.type !== "running") return undefined
@@ -687,6 +701,93 @@ class CodeExecution {
         durationMs: Math.max(0, now - call.startedAt)
       }
     }
+  }
+}
+
+type NestedCallMode = "parallel" | "exclusive"
+
+type ScheduledNestedCall = {
+  readonly mode: NestedCallMode
+  readonly run: () => Promise<void>
+  readonly abort: (cause: unknown) => void
+}
+
+type NestedSchedulerState = { readonly type: "accepting" } | { readonly type: "aborted"; readonly cause: unknown }
+
+class NestedToolScheduler {
+  readonly #maxParallel: number
+  readonly #queue: ScheduledNestedCall[] = []
+  readonly #drainWaiters = new Set<() => void>()
+  #running = 0
+  #exclusive = false
+  #state: NestedSchedulerState = { type: "accepting" }
+
+  constructor(maxParallel: number) {
+    this.#maxParallel = maxParallel
+  }
+
+  submit<T>(mode: NestedCallMode, execute: () => Promise<T>): Promise<T> {
+    if (this.#state.type === "aborted") return Promise.reject(this.#state.cause)
+    const promise = new Promise<T>((resolve, reject) => {
+      this.#queue.push({
+        mode,
+        abort: reject,
+        async run() {
+          try {
+            resolve(await execute())
+          } catch (cause) {
+            reject(cause)
+          }
+        }
+      })
+    })
+    this.#drive()
+    return promise
+  }
+
+  abort(cause: unknown): void {
+    if (this.#state.type === "aborted") return
+    this.#state = { type: "aborted", cause: cause ?? new Error("Code execution ended") }
+    for (const call of this.#queue.splice(0)) call.abort(this.#state.cause)
+    this.#settleDrain()
+  }
+
+  drain(): Promise<void> {
+    if (this.#queue.length === 0 && this.#running === 0) return Promise.resolve()
+    return new Promise(resolve => this.#drainWaiters.add(resolve))
+  }
+
+  #drive(): void {
+    if (this.#exclusive || this.#state.type === "aborted") return
+    while (this.#queue.length > 0) {
+      const call = this.#queue[0]!
+      if (call.mode === "exclusive") {
+        if (this.#running > 0) return
+        this.#queue.shift()
+        this.#exclusive = true
+        this.#start(call)
+        return
+      }
+      if (this.#running === this.#maxParallel) return
+      this.#queue.shift()
+      this.#start(call)
+    }
+  }
+
+  #start(call: ScheduledNestedCall): void {
+    this.#running++
+    void call.run().finally(() => {
+      this.#running--
+      if (call.mode === "exclusive") this.#exclusive = false
+      this.#drive()
+      this.#settleDrain()
+    })
+  }
+
+  #settleDrain(): void {
+    if (this.#queue.length > 0 || this.#running > 0) return
+    for (const resolve of this.#drainWaiters) resolve()
+    this.#drainWaiters.clear()
   }
 }
 
@@ -777,22 +878,23 @@ function toolResultText(result: AgentToolResult<unknown>): string {
 }
 
 function codeToolDescription(tools: readonly AgentTool[]): string {
-  const prefix = `Execute JavaScript that orchestrates the other Zi tools.
+  const prefix = `Execute erasable TypeScript that orchestrates the other Zi tools.
 
-Each cell is an ordinary JavaScript async arrow function with full Node-compatible process authority. This is not a security sandbox.
+Each cell is the body of an async function written in erasable TypeScript, with full Node-compatible process authority. Top-level await and return work; enums, namespaces, parameter properties, import aliases, and export assignments do not. This is not a security sandbox.
 Every direct tool is also available as zi.<tool>(input) with the same input fields; use zi["tool-name"] for punctuation.
 Successful calls return the declared JSON-compatible JavaScript value directly; values are already decoded.
-Tool failures throw Error and may be handled with try/catch. Console arguments use bounded Node-style inspection. Logs are retained in successful and failed cell results, not streamed live.
-Zi executes tool calls serially, including calls created with Promise.all; Promise.allSettled retains independent failures but does not add concurrency.
+Tool failures throw ZiToolError with toolName and may be handled with try/catch. Console arguments use bounded Node-style inspection. Logs are retained in successful and failed cell results, not streamed live.
+Zi starts calls in submission order. Tools declared parallel may overlap up to ${maxParallelNestedCalls} at once; every other tool runs exclusively after earlier calls settle. Promise.allSettled retains independent failures.
 scratch holds arbitrary volatile JavaScript and survives successful and ordinarily failed cells. It is cleared when the worker is replaced or the session resumes.
 state holds bounded JSON, commits only when a cell succeeds, and survives worker replacement, compaction, and session resume.
 Tool calls and ambient effects are not transactional when a cell or state commit fails.
 Use project.import(specifier) to resolve packages and project files from the session working directory. Native fetch, process, Bun, and dynamic import are also available.
 Prefer zi tools where tracing and cancellation matter. Await every zi tool call before returning; unawaited calls fail the cell.
 A cell may make at most ${maxCodeModeCalls} zi calls and commit at most ${maxCodeModeStateBytes} bytes of state.
-Do not use TypeScript syntax.
+Use types only where they improve the program; Zi strips them before execution.
 
 Available APIs:
+declare class ZiToolError extends Error { readonly name: "ZiToolError"; readonly toolName: keyof typeof zi; }
 declare const scratch: Record<string, unknown>;
 declare const state: Record<string, null | boolean | number | string | unknown[] | Record<string, unknown>>;
 declare const project: { import(specifier: string): Promise<unknown> };

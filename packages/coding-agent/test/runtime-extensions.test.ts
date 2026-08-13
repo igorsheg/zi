@@ -487,7 +487,10 @@ export default function (zi: ExtensionAPI): void {
       return fauxAssistantMessage(
         fauxToolCall(
           "code",
-          { code: `async () => (await zi.repository_echo({ value: "nested" })).value` },
+          {
+            description: "Call the repository echo extension",
+            code: `return (await zi.repository_echo({ value: "nested" })).value`
+          },
           { id: "extension-code-1" }
         ),
         { stopReason: "toolUse" }
@@ -632,7 +635,10 @@ export default function (zi: ExtensionAPI): void {
         fauxToolCall("dormant_echo", { value: "same-batch" }, { id: "dormant-same-batch" }),
         fauxToolCall(
           "code",
-          { code: `async () => { await zi.activate_catalog({}); return typeof zi.dormant_echo }` },
+          {
+            description: "Activate the extension catalog",
+            code: `await zi.activate_catalog({}); return typeof zi.dormant_echo`
+          },
           { id: "code-same-batch" }
         )
       ],
@@ -643,7 +649,11 @@ export default function (zi: ExtensionAPI): void {
     }),
     fauxAssistantMessage(fauxToolCall("other_extension_tool", {}, { id: "other-direct" }), { stopReason: "toolUse" }),
     fauxAssistantMessage(
-      fauxToolCall("code", { code: `async () => await zi.dormant_echo({ value: "nested" })` }, { id: "dormant-code" }),
+      fauxToolCall(
+        "code",
+        { description: "Call the activated extension", code: `return zi.dormant_echo({ value: "nested" })` },
+        { id: "dormant-code" }
+      ),
       { stopReason: "toolUse" }
     ),
     fauxAssistantMessage(

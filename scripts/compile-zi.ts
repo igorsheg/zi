@@ -1,6 +1,8 @@
 import { mkdir, readFile } from "node:fs/promises"
 import { dirname, resolve } from "node:path"
 
+import type { BunPlugin } from "bun"
+
 export interface CompileZiOptions {
   readonly outfile: string
   readonly version: string
@@ -40,6 +42,7 @@ export async function compileStandalone(
     minify: { syntax: true, whitespace: true, identifiers: false },
     packages: "bundle",
     conditions: ["bun", "node"],
+    plugins: [staticYukuBindings()],
     define: { ...define },
     compile: {
       outfile,
@@ -64,6 +67,37 @@ async function bundleCodeRealm(entrypoint: string): Promise<string> {
     throw new Error(`Could not bundle the code realm: ${result.logs.map(String).join("\n")}`)
   }
   return result.outputs[0]!.text()
+}
+
+function staticYukuBindings(): BunPlugin {
+  // Yuku selects its native module through a computed require, so standalone builds must make the host binding static.
+  const codingAgent = resolve(import.meta.dirname, "../packages/coding-agent/src")
+  const suffix = yukuBindingSuffix()
+  const parserPackage = dirname(Bun.resolveSync("yuku-parser", codingAgent))
+  const codegenPackage = dirname(Bun.resolveSync("yuku-codegen", codingAgent))
+  const parser = resolve(dirname(parserPackage), `@yuku-parser/binding-${suffix}/yuku-parser.node`)
+  const codegen = resolve(dirname(codegenPackage), `@yuku-codegen/binding-${suffix}/yuku-codegen.node`)
+  return {
+    name: "static-yuku-bindings",
+    setup(build) {
+      build.onLoad({ filter: /[\\/]yuku-parser[\\/]binding\.js$/ }, () => ({
+        contents: `const binding = require(${JSON.stringify(parser)}); export default binding`,
+        loader: "js"
+      }))
+      build.onLoad({ filter: /[\\/]yuku-codegen[\\/]binding\.js$/ }, () => ({
+        contents: `const binding = require(${JSON.stringify(codegen)}); export default binding`,
+        loader: "js"
+      }))
+    }
+  }
+}
+
+function yukuBindingSuffix(): string {
+  if (process.platform !== "linux") return `${process.platform}-${process.arch}`
+  const report = process.report?.getReport()
+  const header = typeof report === "object" && report !== null ? Reflect.get(report, "header") : undefined
+  const glibc = typeof header === "object" && header !== null ? Reflect.get(header, "glibcVersionRuntime") : undefined
+  return `linux-${process.arch}-${glibc ? "gnu" : "musl"}`
 }
 
 export function assertPinnedBunVersion(actual: string, packageManager: unknown): void {

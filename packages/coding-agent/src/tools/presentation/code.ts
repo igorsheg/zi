@@ -17,11 +17,13 @@ const compactCodeRows = 8
 export function projectCodeTool(source: ToolPresentationSource): ToolPresentation {
   const args = recordValue(source.args)
   const code = typeof args?.code === "string" ? args.code : ""
+  const description = typeof args?.description === "string" ? boundInline(args.description, 160) : undefined
   const detailValue = "result" in source ? resultDetails(source.result) : undefined
   const trace =
     isCodeModeDetails(detailValue) && matchesToolOutcome(source, detailValue.outcome) ? detailValue : undefined
   const sourcePreview = !trace && code ? formatSource(code) : undefined
   const running = trace?.calls.findLast(call => call.state === "running")
+  const subject = description ?? (running ? boundInline(running.name) : undefined)
   const details = trace
     ? traceDetails(trace.calls, trace.outcome)
     : sourcePreview
@@ -39,11 +41,7 @@ export function projectCodeTool(source: ToolPresentationSource): ToolPresentatio
   const body = activity ?? sourcePreview?.text
 
   return {
-    header: {
-      label: "Code",
-      ...(running ? { subject: { type: "text", text: boundInline(running.name) } as const } : {}),
-      details
-    },
+    header: { label: "Code", ...(subject ? { subject: { type: "text", text: subject } as const } : {}), details },
     ...(body
       ? {
           body: activity
@@ -53,7 +51,7 @@ export function projectCodeTool(source: ToolPresentationSource): ToolPresentatio
                 tone:
                   source.status === "failed" || trace?.outcome === "error" ? ("error" as const) : ("normal" as const)
               }
-            : { type: "code" as const, text: body, language: "javascript" as const, startLine: 1 }
+            : { type: "code" as const, text: body, language: "typescript" as const, startLine: 1 }
         }
       : {}),
     notices: [],

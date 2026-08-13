@@ -162,7 +162,12 @@ test("file details accept legacy code traces and include only successful discard
         { type: "toolCall", id: "read", name: "read", arguments: { path: "z.ts" } },
         { type: "toolCall", id: "write", name: "write", arguments: { path: "a.ts" } },
         { type: "toolCall", id: "failed", name: "edit", arguments: { path: "failed.ts" } },
-        { type: "toolCall", id: "code", name: "code", arguments: { code: "async () => {}" } }
+        {
+          type: "toolCall",
+          id: "code",
+          name: "code",
+          arguments: { description: "Inspect files", code: "return undefined" }
+        }
       ],
       { stopReason: "toolUse" }
     )
@@ -245,7 +250,12 @@ test("file details collect safe paths from versioned terminal code traces", () =
   session.appendMessage({ role: "user", content: "old", timestamp: 1 })
   session.appendMessage(
     fauxAssistantMessage(
-      { type: "toolCall", id: "code", name: "code", arguments: { code: "async () => {}" } },
+      {
+        type: "toolCall",
+        id: "code",
+        name: "code",
+        arguments: { description: "Inspect files", code: "return undefined" }
+      },
       { stopReason: "toolUse" }
     )
   )

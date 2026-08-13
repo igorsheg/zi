@@ -6,7 +6,8 @@ import { inspect } from "node:util"
 import { isMainThread, parentPort, Worker, workerData } from "node:worker_threads"
 
 import { encodeFramedJson, FramedJsonDecoder } from "../processes/framed-json.js"
-import { normalizeCode } from "./normalize.js"
+import { snapshotCodeModeJson } from "./json-boundary.js"
+import { boundCodeModeOutput } from "./output-ledger.js"
 import {
   codeModeFramingLabel,
   codeModeFramingLimits,
@@ -14,7 +15,7 @@ import {
   maxCodeModeCalls,
   maxCodeModeLogBytes,
   maxCodeModeLogs,
-  validateCodeModeJson,
+  maxCodeModeOutputBytes,
   validateCodeModeState,
   validateHostMessage,
   validateWorkerMessage,
@@ -27,6 +28,8 @@ import {
 declare const ziCodeRealmSource: string
 
 const realmMarker = "zi-code-mode-realm-v1"
+const realmComputeMs = 60_000
+const realmMeterIntervalMs = 25
 const realmOldGenerationMb = 128
 const realmYoungGenerationMb = 16
 const realmStackMb = 8
@@ -46,12 +49,15 @@ const consoleInspectOptions = Object.freeze({
 
 class RealmResetError extends Error {}
 
-class NestedToolError extends Error {
+class ZiToolError extends Error {
   readonly callId: number
+  readonly toolName: string
 
-  constructor(callId: number, message: string) {
+  constructor(callId: number, toolName: string, message: string) {
     super(message)
+    this.name = "ZiToolError"
     this.callId = callId
+    this.toolName = toolName
   }
 }
 
@@ -66,7 +72,13 @@ type RealmInput = Exclude<CodeModeHostMessage, { type: "initialize" }>
 type OuterState =
   | { readonly type: "awaiting_initialize" }
   | { readonly type: "idle"; readonly generation: number; readonly realm: Worker }
-  | { readonly type: "running"; readonly generation: number; readonly executionId: number; readonly realm: Worker }
+  | {
+      readonly type: "running"
+      readonly generation: number
+      readonly executionId: number
+      readonly realm: Worker
+      readonly cpuUsage: NodeJS.CpuUsage
+    }
   | { readonly type: "disposed" }
 
 type RealmState =
@@ -75,6 +87,8 @@ type RealmState =
   | { readonly type: "disposed" }
 
 export async function runCodeModeWorkerFromStdio(): Promise<void> {
+  // TODO: Split the protocol worker and realm entrypoints so Yuku can be imported statically without entering the realm bundle.
+  const { transpileCodeBody } = await import("./transpile.js")
   const decoder = new FramedJsonDecoder(validateHostMessage, codeModeFramingLimits, codeModeFramingLabel)
   let state: OuterState = { type: "awaiting_initialize" }
 
@@ -84,12 +98,29 @@ export async function runCodeModeWorkerFromStdio(): Promise<void> {
     state = { type: "disposed" }
     process.exit(1)
   }
-  const memoryWatchdog = setInterval(() => {
-    if (state.type === "running" && process.memoryUsage().rss > maxRealmRssBytes) {
+  const realmMeter = setInterval(() => {
+    if (state.type !== "running") return
+    if (process.memoryUsage().rss > maxRealmRssBytes) {
       fail(new Error(`Code realm memory exceeded ${maxRealmRssBytes} bytes`))
+      return
     }
-  }, 50)
-  memoryWatchdog.unref?.()
+    // Bun 1.3.14 reports zero for Worker ELU; this dedicated process includes realm-thread CPU in process.cpuUsage().
+    const cpu = process.cpuUsage(state.cpuUsage)
+    if ((cpu.user + cpu.system) / 1_000 <= realmComputeMs) return
+    const running = state
+    state = { type: "disposed" }
+    send({
+      version: codeModeProtocolVersion,
+      type: "failed",
+      generation: running.generation,
+      executionId: running.executionId,
+      error: `Code compute budget exhausted (${realmComputeMs}ms busy)`,
+      logs: [],
+      reset: true
+    })
+    void running.realm.terminate().finally(() => process.exit(0))
+  }, realmMeterIntervalMs)
+  realmMeter.unref?.()
 
   try {
     for await (const chunk of process.stdin) {
@@ -131,14 +162,29 @@ export async function runCodeModeWorkerFromStdio(): Promise<void> {
         if (message.generation !== state.generation) throw new Error("Stale code host generation")
         if (message.type === "execute") {
           if (state.type !== "idle") throw new Error("Code worker already has an active execution")
+          let code: string
+          try {
+            code = transpileCodeBody(message.code)
+          } catch (cause) {
+            send({
+              version: codeModeProtocolVersion,
+              type: "failed",
+              generation: state.generation,
+              executionId: message.executionId,
+              error: errorMessage(cause),
+              logs: []
+            })
+            continue
+          }
           // Node worker messages do not have a browser target origin.
           // eslint-disable-next-line unicorn/require-post-message-target-origin
-          state.realm.postMessage(message)
+          state.realm.postMessage({ ...message, code })
           state = {
             type: "running",
             generation: state.generation,
             executionId: message.executionId,
-            realm: state.realm
+            realm: state.realm,
+            cpuUsage: process.cpuUsage()
           }
           continue
         }
@@ -152,7 +198,7 @@ export async function runCodeModeWorkerFromStdio(): Promise<void> {
     }
     decoder.end()
   } finally {
-    clearInterval(memoryWatchdog)
+    clearInterval(realmMeter)
     if (state.type === "idle" || state.type === "running") await state.realm.terminate()
     state = { type: "disposed" }
     closeSync(3)
@@ -222,7 +268,10 @@ class CellExecution {
   readonly #scratch: Record<string, unknown>
   readonly #project: Readonly<{ import(specifier: string): Promise<unknown> }>
   readonly #send: (message: CodeModeWorkerMessage) => void
-  readonly #pending = new Map<number, ReturnType<typeof deferred<CodeModeJson>>>()
+  readonly #pending = new Map<
+    number,
+    { readonly name: string; readonly settlement: ReturnType<typeof deferred<CodeModeJson>> }
+  >()
   readonly #logs: string[] = []
   #nextCallId = 0
   #terminateRequested = false
@@ -260,9 +309,10 @@ class CellExecution {
         "state",
         "project",
         "console",
-        `return (${normalizeCode(this.#code)})`
+        "ZiToolError",
+        `return (${this.#code})`
       )
-      const programValue = instantiate(zi, this.#scratch, this.#state, this.#project, cellConsole)
+      const programValue = instantiate(zi, this.#scratch, this.#state, this.#project, cellConsole, ZiToolError)
       if (typeof programValue !== "function") throw new Error("Code must evaluate to a function")
       const value: unknown = await programValue({
         zi,
@@ -280,26 +330,35 @@ class CellExecution {
           `Code returned with ${this.#pending.size} unawaited tool ${this.#pending.size === 1 ? "call" : "calls"}`
         )
       }
-      const result = value === undefined ? undefined : jsonValue(value)
+      const result = value === undefined ? undefined : snapshotCodeModeJson(value)
+      const output = boundCodeModeOutput(maxCodeModeOutputBytes, this.#logs, {
+        type: "result",
+        ...(result === undefined ? {} : { result })
+      })
+      if (output.type === "output-limit") throw new Error(output.error)
       const state = stateValue(this.#state)
       this.#finish({
         version: codeModeProtocolVersion,
         type: "completed",
         generation: this.#generation,
         executionId: this.#executionId,
-        ...(result === undefined ? {} : { result }),
+        ...(output.result === undefined ? {} : { result: output.result }),
         state,
-        logs: this.#logs
+        logs: output.logs
       })
     } catch (cause) {
+      const output = boundCodeModeOutput(maxCodeModeOutputBytes, this.#logs, {
+        type: "error",
+        error: errorMessage(cause)
+      })
       this.#finish({
         version: codeModeProtocolVersion,
         type: "failed",
         generation: this.#generation,
         executionId: this.#executionId,
-        error: errorMessage(cause),
-        logs: this.#logs,
-        ...(cause instanceof NestedToolError ? { toolCallId: cause.callId } : {}),
+        error: output.error,
+        logs: output.logs,
+        ...(cause instanceof ZiToolError ? { toolCallId: cause.callId } : {}),
         ...(cause instanceof RealmResetError ? { reset: true } : {})
       })
     }
@@ -312,9 +371,9 @@ class CellExecution {
     this.#pending.delete(message.id)
     if (message.type === "tool_result") {
       if (message.terminate) this.#terminateRequested = true
-      pending.resolve(message.value)
+      pending.settlement.resolve(message.value)
     } else {
-      pending.reject(new NestedToolError(message.id, message.error))
+      pending.settlement.reject(new ZiToolError(message.id, pending.name, message.error))
     }
   }
 
@@ -337,13 +396,13 @@ class CellExecution {
     }
     let toolArguments: CodeModeJson
     try {
-      toolArguments = validateCodeModeJson(input ?? {})
+      toolArguments = snapshotCodeModeJson(input ?? {})
     } catch (cause) {
       return Promise.reject(cause)
     }
     const id = this.#nextCallId++
     const pending = deferred<CodeModeJson>()
-    this.#pending.set(id, pending)
+    this.#pending.set(id, { name, settlement: pending })
     this.#send({
       version: codeModeProtocolVersion,
       type: "tool_call",
@@ -364,7 +423,7 @@ class CellExecution {
   #finish(message: Extract<CodeModeWorkerMessage, { type: "completed" | "failed" }>): void {
     if (this.#settled) return
     this.#settled = true
-    for (const pending of this.#pending.values()) pending.reject(new Error("Code execution ended"))
+    for (const pending of this.#pending.values()) pending.settlement.reject(new Error("Code execution ended"))
     this.#pending.clear()
     this.#send(message)
   }
@@ -405,14 +464,8 @@ function createProjectApi(cwd: string): Readonly<{ import(specifier: string): Pr
   })
 }
 
-function jsonValue(value: unknown): CodeModeJson {
-  const decoded: unknown = JSON.parse(JSON.stringify(value))
-  return validateCodeModeJson(decoded)
-}
-
 function stateValue(value: unknown): CodeModeState {
-  const decoded: unknown = JSON.parse(JSON.stringify(value))
-  return validateCodeModeState(decoded)
+  return validateCodeModeState(snapshotCodeModeJson(value))
 }
 
 function send(message: CodeModeWorkerMessage): void {

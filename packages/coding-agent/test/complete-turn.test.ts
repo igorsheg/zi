@@ -33,7 +33,11 @@ test("built-in expected failures keep typed details and are finalized as Pi erro
         ),
         fauxToolCall("task_output", { taskId: "missing-task" }, { id: "output-error" }),
         fauxToolCall("kill_task", { taskId: "missing-task" }, { id: "kill-error" }),
-        fauxToolCall("code", { code: `async () => { throw new Error("expected code failure") }` }, { id: "code-error" })
+        fauxToolCall(
+          "code",
+          { description: "Exercise a code failure", code: `throw new Error("expected code failure")` },
+          { id: "code-error" }
+        )
       ],
       { stopReason: "toolUse" }
     ),
@@ -158,10 +162,8 @@ test("code runs through the normal turn lifecycle with durable nested evidence",
       fauxToolCall(
         "code",
         {
-          code: `async () => {
-  const file = await zi.read({ path: "input.txt" });
-  return file.includes("needle");
-}`
+          description: "Inspect the input file",
+          code: `const file = await zi.read({ path: "input.txt" }); return file.includes("needle")`
         },
         { id: "code-1" }
       ),

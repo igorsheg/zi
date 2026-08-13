@@ -3,14 +3,22 @@ import { expect, test } from "bun:test"
 import { createEditTool } from "../src/tools/edit.js"
 import { projectToolPresentation } from "../src/tools/presentation/project.js"
 
-test("code presentation emits JavaScript source and admits a bounded call preview before execution", () => {
+test("code presentation emits TypeScript source, its description, and a bounded preview before execution", () => {
   const code = Array.from({ length: 10 }, (_, index) => `const value${index + 1} = ${index + 1}`).join("\n")
-  const presentation = projectToolPresentation({ status: "ready", name: "code", args: { code } })
+  const presentation = projectToolPresentation({
+    status: "ready",
+    name: "code",
+    args: { code, description: "Inspect generated values" }
+  })
 
-  expect(presentation.header).toEqual({ label: "Code", details: ["10 lines"] })
+  expect(presentation.header).toEqual({
+    label: "Code",
+    subject: { type: "text", text: "Inspect generated values" },
+    details: ["10 lines"]
+  })
   expect(presentation.preview).toEqual({ compact: { type: "head", rows: 8 }, detailed: { type: "head", rows: 200 } })
   if (presentation.body?.type !== "code") throw new Error("Expected code source body")
-  expect(presentation.body.language).toBe("javascript")
+  expect(presentation.body.language).toBe("typescript")
   expect(presentation.body.startLine).toBe(1)
   expect(presentation.body.text).toStartWith("const value1 = 1\nconst value2 = 2")
   expect(presentation.body.text).toEndWith("const value10 = 10")
@@ -32,7 +40,7 @@ test("code presentation accepts legacy traces with bounded nested activity and o
   const presentation = projectToolPresentation({
     status: "running",
     name: "code",
-    args: { code: "async () => zi.read({ path: 'src/index.ts' })" },
+    args: { code: "return zi.read({ path: 'src/index.ts' })" },
     result: {
       content: [{ type: "text", text: "Running write" }],
       details: {
@@ -79,7 +87,7 @@ test("code presentation renders versioned terminal metadata without private resu
   const presentation = projectToolPresentation({
     status: "done",
     name: "code",
-    args: { code: "async () => zi.read({ path: 'src/index.ts' })" },
+    args: { code: "return zi.read({ path: 'src/index.ts' })" },
     result: {
       content: [{ type: "text", text: "done" }],
       details: {
