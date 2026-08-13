@@ -50,6 +50,20 @@ test("report aggregates generic outcomes with nearest-rank percentiles and UTC d
           evidence: "connection refused"
         }),
         outcome({
+          id: "subagent-control-1",
+          timestamp: "2026-03-02T09:00:00.000Z",
+          capability: "subagent",
+          operation: "message_delivery",
+          result: "succeeded",
+          durationMs: 5,
+          evidence: {
+            commandId: "0a8ab7a4-28d1-4f22-a020-8977a9212bda",
+            channel: "host_to_subagent",
+            target: "worker-a",
+            messageBytes: 12
+          }
+        }),
+        outcome({
           id: "index-refresh-1",
           timestamp: "2026-03-01T23:30:00.000-01:00",
           capability: "search_index",
@@ -76,11 +90,11 @@ test("report aggregates generic outcomes with nearest-rank percentiles and UTC d
 
   expect(report.scope).toEqual({ cwd: "/work", scanned: 2, sessionsWithOutcomes: 2, invalid: 2, omitted: 3 })
   expect(report.overview).toEqual({
-    total: 4,
-    succeeded: 1,
+    total: 5,
+    succeeded: 2,
     failed: 2,
     cancelled: 1,
-    successRate: 0.25,
+    successRate: 0.4,
     p50DurationMs: 20,
     p95DurationMs: 40
   })
@@ -106,16 +120,33 @@ test("report aggregates generic outcomes with nearest-rank percentiles and UTC d
       successRate: 0,
       p50DurationMs: 20,
       p95DurationMs: 40
+    },
+    {
+      capability: "subagent",
+      operation: "message_delivery",
+      total: 1,
+      succeeded: 1,
+      failed: 0,
+      cancelled: 0,
+      successRate: 1,
+      p50DurationMs: 5,
+      p95DurationMs: 5
     }
   ])
   expect(report.dailyTrend).toEqual([
     { date: "2026-03-01", succeeded: 1, failed: 0, cancelled: 1, p95DurationMs: 20 },
-    { date: "2026-03-02", succeeded: 0, failed: 2, cancelled: 0, p95DurationMs: 40 }
+    { date: "2026-03-02", succeeded: 1, failed: 2, cancelled: 0, p95DurationMs: 40 }
   ])
   expect(report.recent.find(row => row.id === "database-snapshot-2")).toEqual(
     expect.objectContaining({ sessionId: "session-a", evidence: "connection refused" })
   )
   expect(report.recent.find(row => row.id === "database-snapshot-1")?.evidence).toBe(structuredEvidence)
+  expect(report.recent.find(row => row.id === "subagent-control-1")?.evidence).toEqual({
+    commandId: "0a8ab7a4-28d1-4f22-a020-8977a9212bda",
+    channel: "host_to_subagent",
+    target: "worker-a",
+    messageBytes: 12
+  })
   expect(Object.isFrozen(report)).toBe(true)
   expect(Object.isFrozen(report.scope)).toBe(true)
   expect(Object.isFrozen(report.dailyTrend)).toBe(true)

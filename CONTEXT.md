@@ -217,11 +217,11 @@ The parent-session-unique runtime identity chosen when a subagent is spawned. It
 _Avoid_: Subagent type, role, operational ID
 
 **Subagent supervisor**:
-The `AgentSession`-owned controller of direct-child names, admission, process lifetimes, work cycles, bounded completion retention, durable evidence, and shutdown. `AgentSession` derives standard orchestration from its admitted profile catalog; extensions may reach the same mechanics only through bounded session operations for optional custom workflows.
+The `AgentSession`-owned controller of direct-child names, admission, process lifetimes, work cycles, bounded completion retention, durable evidence, and shutdown. It appends parent-owned outcomes for work cycles and terminal spawn, message-delivery, task-assignment, interruption, and close operations. `AgentSession` derives standard orchestration from its admitted profile catalog; extensions may reach the same mechanics only through bounded session operations for optional custom workflows.
 _Avoid_: Extension generation, agent coordinator, extension API object, session registry
 
 **Peer message**:
-Bounded context sent from one subagent to a live sibling through their common parent supervisor. The parent derives the sender identity, validates the sibling target, and admits the message queue-only; a peer message neither assigns a work cycle nor replaces parent completion delivery.
+Bounded context sent from one subagent to a live sibling through their common parent supervisor. The parent derives the sender identity, validates the sibling target, admits the message queue-only, and records its terminal message-delivery outcome without retaining message text. A peer message neither assigns a work cycle nor replaces parent completion delivery.
 _Avoid_: Subagent task, completion, direct process message, peer network event
 
 **Subagent completion**:

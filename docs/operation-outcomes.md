@@ -44,9 +44,13 @@ The outcome carried by `operation_outcome` has the same shape as an item returne
 
 ## Current producers
 
-Zi currently records outcomes for settled subagent work cycles and background-owned shell tasks. Each producer derives its operation ID from its own stable identity and places only bounded, privacy-reviewed facts in `evidence`.
+Zi currently records outcomes for settled subagent work cycles, parent-owned subagent control operations, and background-owned shell tasks. Each producer derives its operation ID from its own stable admission identity and places only bounded, privacy-reviewed facts in `evidence`.
 
-A subagent outcome is recorded when the supervisor's admitted work cycle settles. Hidden completion context and orchestration tool results may deliver the same completion evidence without creating another outcome.
+A subagent work-cycle outcome is recorded when the supervisor's admitted child cycle settles. Hidden completion context and orchestration tool results may deliver the same completion evidence without creating another outcome.
+
+The parent supervisor also records terminal `spawn`, `message_delivery`, `task_assignment`, `interrupt`, and `close` operations. This includes host-to-subagent delivery and peer-to-peer delivery routed through the common parent. A successful message delivery means the target child RPC session accepted the queue-only message; it does not mean the target model consumed the message or that its work cycle succeeded. `wait_subagents`, `list_subagents`, and sibling-list queries are observations and do not create outcomes.
+
+Subagent control evidence contains routing names, channel or delivery classification, correlated work-cycle numbers, byte counts, and stable failure codes. It never contains prompt, task, message, or diagnostic text. Peer-generated control outcomes are bounded per sender work cycle; exceeding the admission bound rejects further peer delivery without consuming cleanup capacity. Child sessions remain non-persistent: the parent supervisor observes the process boundary and appends these outcomes to the parent journal.
 
 A shell outcome is recorded after a background-owned process and its bounded output settle. Foreground-only commands are not recorded. Observing a task with `list_tasks` or `task_output`, or requesting cancellation with `kill_task`, does not create another outcome. Shell evidence excludes command text, output text, working directories, spill-file paths, and tool-call IDs.
 

@@ -7,7 +7,7 @@ import type { AgentTool } from "@earendil-works/pi-agent-core"
 
 import { isRecord } from "../src/guards.js"
 import { createProcessTreeTracker } from "../src/processes/process-tree.js"
-import { SessionManager } from "../src/session-manager.js"
+import { SessionManager, type SessionJson } from "../src/session-manager.js"
 import { SubagentSupervisor } from "../src/subagents/supervisor.js"
 import {
   isSubagentToolDetails,
@@ -356,8 +356,8 @@ async function createHarness(name: string, reply: string, delayMs = 30) {
     processTreeTracker: createProcessTreeTracker()
   })
   supervisor.bindOperationOutcomeSink((outcome, persisted) => {
-    const entry = sessionManager.appendOperationOutcome(outcome)
-    persisted(entry)
+    const entry = sessionManager.appendOperationOutcome<SessionJson>(outcome)
+    persisted?.(entry)
     return entry
   })
   const admissions: Array<{ profile: string; name: string; prompt: string }> = []

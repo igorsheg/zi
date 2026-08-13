@@ -760,30 +760,61 @@ async function assertNativeJournal(agentDirectory: string, name: string, mode: M
     .split("\n")
     .map((line, index) => record(JSON.parse(line), `journal line ${index + 1}`))
   const entries = lines.filter(entry => entry.type === "subagent" && entry.name === name)
-  const outcomes = lines.filter(
-    entry => entry.type === "operation_outcome" && entry.capability === "subagent" && entry.operation === "work_cycle"
-  )
+  const outcomes = lines.filter(entry => entry.type === "operation_outcome" && entry.capability === "subagent")
+  const workCycleOutcomes = outcomes.filter(entry => entry.operation === "work_cycle")
 
   assertJournalEntry(entries, { event: "starting", name: "acceptance-worker" }, mode)
   assertJournalEntry(entries, { event: "ready" }, mode)
   assertJournalEntry(entries, { event: "work_cycle_started", workCycle: 1 }, mode)
+  assertSubagentControlOutcome(outcomes, "spawn", "succeeded", { source: "host", name }, 1, mode)
   if (mode === "dispose") return
 
-  assertSubagentOutcome(outcomes, name, 1, "succeeded", mode)
+  assertSubagentOutcome(workCycleOutcomes, name, 1, "succeeded", mode)
   assertJournalEntryCount(entries, { event: "work_cycle_delivered", workCycle: 1 }, 1, mode)
   assertJournalEntry(entries, { event: "exited" }, mode)
   if (mode === "crash") return
 
   assertJournalEntry(entries, { event: "work_cycle_started", workCycle: 2 }, mode)
-  assertSubagentOutcome(outcomes, name, 2, "succeeded", mode)
+  assertSubagentOutcome(workCycleOutcomes, name, 2, "succeeded", mode)
   assertJournalEntryCount(entries, { event: "work_cycle_delivered", workCycle: 2 }, 1, mode)
   assertJournalEntry(entries, { event: "work_cycle_started", workCycle: 3 }, mode)
-  assertSubagentOutcome(outcomes, name, 3, "cancelled", mode)
+  assertSubagentOutcome(workCycleOutcomes, name, 3, "cancelled", mode)
   assertJournalEntryCount(entries, { event: "work_cycle_delivered", workCycle: 3 }, 1, mode)
   assertJournalEntry(entries, { event: "work_cycle_started", workCycle: 4 }, mode)
-  assertSubagentOutcome(outcomes, name, 4, "succeeded", mode)
+  assertSubagentOutcome(workCycleOutcomes, name, 4, "succeeded", mode)
   assertJournalEntryCount(entries, { event: "work_cycle_delivered", workCycle: 4 }, 1, mode)
   assertJournalEntry(entries, { event: "closing", reason: "close" }, mode)
+  assertSubagentControlOutcome(
+    outcomes,
+    "message_delivery",
+    "succeeded",
+    { channel: "host_to_subagent", target: name },
+    1,
+    mode
+  )
+  assertSubagentControlOutcome(outcomes, "task_assignment", "succeeded", { source: "host", target: name }, 3, mode)
+  assertSubagentControlOutcome(outcomes, "interrupt", "succeeded", { source: "host", target: name }, 1, mode)
+  assertSubagentControlOutcome(outcomes, "close", "succeeded", { source: "host", target: name }, 1, mode)
+}
+
+function assertSubagentControlOutcome(
+  outcomes: readonly Record<string, unknown>[],
+  operation: string,
+  result: string,
+  expectedEvidence: Readonly<Record<string, unknown>>,
+  count: number,
+  mode: Mode
+): void {
+  const found = outcomes.filter(entry => {
+    if (entry.operation !== operation || entry.result !== result) return false
+    const evidence = record(entry.evidence, "subagent control outcome evidence")
+    return Object.entries(expectedEvidence).every(([key, value]) => evidence[key] === value)
+  }).length
+  if (found !== count) {
+    throw new Error(
+      `Compiled ${mode} journal contained ${found} ${operation}/${result} outcomes instead of ${count}: ${JSON.stringify(outcomes)}`
+    )
+  }
 }
 
 function assertSubagentOutcome(

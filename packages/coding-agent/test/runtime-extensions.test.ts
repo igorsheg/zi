@@ -1060,6 +1060,20 @@ export default function (zi: ExtensionAPI): void {
     expect(JSON.parse(await readFile(childArgv, "utf8"))).toEqual(
       expect.arrayContaining(["--model", "faux/faux-1", "--thinking", "high"])
     )
+    const controlOutcomes = runtime.session.sessionManager
+      .operationOutcomes()
+      .filter(outcome => outcome.capability === "subagent" && outcome.operation !== "work_cycle")
+    expect(controlOutcomes.map(outcome => [outcome.operation, outcome.result])).toEqual([
+      ["spawn", "succeeded"],
+      ["message_delivery", "succeeded"],
+      ["task_assignment", "succeeded"],
+      ["task_assignment", "succeeded"],
+      ["interrupt", "succeeded"],
+      ["close", "succeeded"]
+    ])
+    expect(JSON.stringify(controlOutcomes)).not.toContain("context")
+    expect(JSON.stringify(controlOutcomes)).not.toContain("follow up")
+    expect(JSON.stringify(controlOutcomes)).not.toContain("second cycle")
   } finally {
     runtime.session.dispose()
     await runtime.session.waitForIdle()
@@ -1361,12 +1375,16 @@ test("subagent completion stays passive and joins the next parent model request"
     await runtime.session.prompt("Start the background investigation.")
     expect(faux.state.callCount).toBe(2)
 
-    await waitForCondition(() => runtime.session.sessionManager.operationOutcomes().length > 0, 5_000)
+    await waitForCondition(
+      () => runtime.session.sessionManager.operationOutcomes().some(outcome => outcome.operation === "work_cycle"),
+      5_000
+    )
     expect(faux.state.callCount).toBe(2)
     expect(runtime.session.messages.some(message => message.role === "custom")).toBe(false)
     expect(runtime.session.sessionManager.operationOutcomes()).toContainEqual(
       expect.objectContaining({
         capability: "subagent",
+        operation: "work_cycle",
         evidence: expect.objectContaining({ profile: "pathfinder", name: "passive-worker" })
       })
     )

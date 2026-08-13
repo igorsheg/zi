@@ -6,6 +6,7 @@ import { join } from "node:path"
 import { maxOperationOutcomeEvidenceBytes, type OperationOutcomeInput } from "../src/operation-outcomes.js"
 import { ZiPaths } from "../src/paths.js"
 import { SessionManager } from "../src/session-manager.js"
+import { isSubagentControlOutcome } from "../src/subagents/outcome.js"
 
 const succeeded = (operationId = "subagent/reviewer/work_cycle/1"): OperationOutcomeInput => ({
   capability: "subagent",
@@ -86,6 +87,96 @@ test("operation outcomes accept string and snapshot callsite-owned structured ev
   expect(Object.isFrozen(structured)).toBe(true)
   expect(Object.isFrozen(structured.evidence)).toBe(true)
   expect(Object.isFrozen(structured.evidence.output)).toBe(true)
+})
+
+test("subagent control outcomes validate operation-specific evidence", () => {
+  const session = SessionManager.inMemory("/work")
+  const commandId = crypto.randomUUID()
+  const valid = session.appendOperationOutcome({
+    capability: "subagent",
+    operation: "message_delivery",
+    operationId: `subagent/control/${commandId}`,
+    result: "succeeded",
+    durationMs: 3,
+    evidence: {
+      commandId,
+      channel: "peer_to_peer",
+      sender: "worker-a",
+      target: "worker-b",
+      messageBytes: 0,
+      peerRequestId: "peer-1",
+      senderWorkCycle: 1,
+      targetWorkCycle: 2
+    }
+  })
+  const wrongChannelCommandId = crypto.randomUUID()
+  const wrongChannel = session.appendOperationOutcome({
+    capability: "subagent",
+    operation: "message_delivery",
+    operationId: `subagent/control/${wrongChannelCommandId}`,
+    result: "succeeded",
+    durationMs: 3,
+    evidence: {
+      commandId: wrongChannelCommandId,
+      channel: "host_to_subagent",
+      sender: "worker-a",
+      target: "worker-b",
+      messageBytes: 12
+    }
+  })
+  const impossibleSelfDeliverySuccessCommandId = crypto.randomUUID()
+  const impossibleSelfDeliverySuccess = session.appendOperationOutcome({
+    capability: "subagent",
+    operation: "message_delivery",
+    operationId: `subagent/control/${impossibleSelfDeliverySuccessCommandId}`,
+    result: "succeeded",
+    durationMs: 3,
+    evidence: {
+      commandId: impossibleSelfDeliverySuccessCommandId,
+      channel: "peer_to_peer",
+      sender: "worker-a",
+      target: "worker-a",
+      messageBytes: 12,
+      peerRequestId: "peer-self"
+    }
+  })
+  const impossibleSelfDeliveryCommandId = crypto.randomUUID()
+  const impossibleSelfDelivery = session.appendOperationOutcome({
+    capability: "subagent",
+    operation: "message_delivery",
+    operationId: `subagent/control/${impossibleSelfDeliveryCommandId}`,
+    result: "failed",
+    durationMs: 3,
+    evidence: {
+      commandId: impossibleSelfDeliveryCommandId,
+      channel: "host_to_subagent",
+      target: "worker-b",
+      messageBytes: 12,
+      errorCode: "self_delivery"
+    }
+  })
+  const leakedTextCommandId = crypto.randomUUID()
+  const leakedText = session.appendOperationOutcome({
+    capability: "subagent",
+    operation: "task_assignment",
+    operationId: `subagent/control/${leakedTextCommandId}`,
+    result: "failed",
+    durationMs: 3,
+    evidence: {
+      commandId: leakedTextCommandId,
+      source: "host",
+      target: "worker-b",
+      taskBytes: 12,
+      errorCode: "assignment_failed",
+      errorMessage: "task text"
+    }
+  })
+
+  expect(isSubagentControlOutcome(valid)).toBe(true)
+  expect(isSubagentControlOutcome(wrongChannel)).toBe(false)
+  expect(isSubagentControlOutcome(impossibleSelfDeliverySuccess)).toBe(false)
+  expect(isSubagentControlOutcome(impossibleSelfDelivery)).toBe(false)
+  expect(isSubagentControlOutcome(leakedText)).toBe(false)
 })
 
 test("operation outcomes validate only the shared envelope and JSON bounds", () => {

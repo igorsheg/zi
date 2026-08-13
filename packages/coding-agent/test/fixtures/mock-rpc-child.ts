@@ -28,6 +28,7 @@ import { appendFileSync, existsSync, writeFileSync } from "node:fs"
  *   MOCK_RPC_PEER_RESPONSE — path to write one host peer response after the __peer_send__ prompt
  *   MOCK_RPC_PROMPTS_LOG — path to append admitted prompt text
  *   MOCK_RPC_DUPLICATE_PEER_REQUEST — emit the peer request twice
+ *   MOCK_RPC_PEER_REQUEST_COUNT — emit this many uniquely identified peer requests
  */
 let sequence = 0
 const reply = process.env.MOCK_RPC_REPLY ?? "child-done"
@@ -49,6 +50,7 @@ const promptsLogPath = process.env.MOCK_RPC_PROMPTS_LOG
 const duplicatePeerRequest = process.env.MOCK_RPC_DUPLICATE_PEER_REQUEST === "1"
 const peerOperation = process.env.MOCK_RPC_PEER_OPERATION === "list" ? "list" : "send"
 const peerTarget = process.env.MOCK_RPC_PEER_TARGET ?? "worker-b"
+const peerRequestCount = Number(process.env.MOCK_RPC_PEER_REQUEST_COUNT ?? "1")
 let peerRequestScheduled = false
 
 if (argvPath) writeFileSync(argvPath, JSON.stringify(process.argv.slice(2)))
@@ -167,14 +169,22 @@ async function handle(request: { id: string; method: string; params?: RequestPar
     if (promptsLogPath) appendFileSync(promptsLogPath, `${JSON.stringify(text)}\n`)
     if (peerResponsePath && text === "__peer_send__" && !peerRequestScheduled) {
       peerRequestScheduled = true
-      setTimeout(() => {
-        const peerRequest =
-          peerOperation === "list"
-            ? { type: "peer_request", id: "mock-peer-1", operation: "list" }
-            : { type: "peer_request", id: "mock-peer-1", operation: "send", target: peerTarget, text: "peer evidence" }
-        send(peerRequest)
-        if (duplicatePeerRequest) send(peerRequest)
-      }, 20)
+      for (let index = 1; index <= peerRequestCount; index++) {
+        setTimeout(() => {
+          const peerRequest =
+            peerOperation === "list"
+              ? { type: "peer_request", id: `mock-peer-${index}`, operation: "list" }
+              : {
+                  type: "peer_request",
+                  id: `mock-peer-${index}`,
+                  operation: "send",
+                  target: peerTarget,
+                  text: "peer evidence"
+                }
+          send(peerRequest)
+          if (duplicatePeerRequest) send(peerRequest)
+        }, index * 20)
+      }
     }
     if (text === "__reject_prompt__") {
       send({ type: "response", id, method, ok: false, error: { code: "rejected", message: "prompt rejected" } })
