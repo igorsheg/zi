@@ -12,7 +12,6 @@ import {
   fauxToolCall
 } from "@earendil-works/pi-ai"
 
-import { isShellBackgroundTaskOperationOutcome } from "../src/session-shell.js"
 import { createTestAgentRuntime as createAgentRuntime } from "../src/testing.js"
 import { isBashToolDetails } from "../src/tools/bash.js"
 
@@ -200,7 +199,7 @@ test("code runs through the normal turn lifecycle with durable nested evidence",
   }
 })
 
-test("background shell settlement appends one durable operation outcome", async () => {
+test("background shell settlement appends one durable result", async () => {
   const root = await mkdtemp(join(tmpdir(), "zi-background-outcome-turn-"))
   const models = createModels()
   const faux = fauxProvider({ tokensPerSecond: 10_000 })
@@ -228,44 +227,37 @@ test("background shell settlement appends one durable operation outcome", async 
     session: { type: "new", persist: true }
   })
   const appended: string[] = []
-  let resolveOutcome!: () => void
-  const outcomeAppended = new Promise<void>(resolve => {
-    resolveOutcome = resolve
+  let resolveResult!: () => void
+  const resultAppended = new Promise<void>(resolve => {
+    resolveResult = resolve
   })
   session.subscribe(event => {
-    if (event.type !== "entry_appended" || event.entry.type !== "operation_outcome") return
+    if (event.type !== "entry_appended" || event.entry.type !== "background_task_result") return
     appended.push(event.entry.id)
-    resolveOutcome()
+    resolveResult()
   })
 
   try {
     await session.prompt("Start background work.")
     await Promise.race([
-      outcomeAppended,
+      resultAppended,
       Bun.sleep(2_000).then(() => {
-        throw new Error("Background outcome did not persist")
+        throw new Error("Background result did not persist")
       })
     ])
-    const [outcome] = session.sessionManager.operationOutcomes()
-    expect(outcome).toMatchObject({
-      capability: "shell",
-      operation: "background_task",
-      result: "succeeded",
-      evidence: { origin: "requested", exitCode: 0 }
-    })
-    expect(outcome).toBeDefined()
-    expect(appended).toEqual([outcome!.id])
-    expect(JSON.stringify(outcome)).not.toContain("private output")
-    expect(JSON.stringify(outcome)).not.toContain("node -e")
+    const [result] = session.sessionManager.backgroundTaskResults()
+    expect(result).toMatchObject({ result: "succeeded", origin: "requested", exitCode: 0 })
+    expect(result).toBeDefined()
+    expect(appended).toEqual([result!.id])
+    expect(JSON.stringify(result)).not.toContain("private output")
+    expect(JSON.stringify(result)).not.toContain("node -e")
     expect(faux.state.callCount).toBe(2)
     expect(session.messages.some(message => message.role === "custom")).toBe(false)
-    if (!outcome || !isShellBackgroundTaskOperationOutcome(outcome)) {
-      throw new Error("Expected shell background outcome")
-    }
+    if (!result) throw new Error("Expected shell background result")
 
     await session.prompt("Use completed background work.")
     expect(completionContext).toContain("<shell_task_completion>")
-    expect(completionContext).toContain(outcome.evidence.taskId)
+    expect(completionContext).toContain(result.taskId)
     const completion = session.sessionManager
       .retainedEntries()
       .find(entry => entry.type === "custom_message" && entry.customType === "zi.shell_task_completion")

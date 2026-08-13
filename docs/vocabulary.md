@@ -16,7 +16,7 @@ These guides borrow their vocabulary from Zi's own source, on purpose. Ten words
 : One unit of work: a conversation, the resources loaded for it, its work plan, and everything Zi did while it ran. A session is either a journal session on disk or a memory session that vanishes when the process exits.
 
 `journal`
-: The append-only file that makes a session durable. Zi appends messages, work plans, extension state, and operation outcomes to it, so a resumed session can rebuild what it knew instead of guessing.
+: The append-only file that makes a session durable. Zi appends messages, work plans, extension state, and bounded results for meaningful background work, so a resumed session can rebuild what it knew instead of guessing.
 
 `admitted`
 : Zi checked an input or operation against its type, its bounds, and the current state, and accepted it. Admission is the moment a request becomes real, and it is deliberately separate from the work finishing.
@@ -51,8 +51,8 @@ Admitted   Zi accepted the request.          The response tells you.
 Settled    The work reached a terminal end.  The evidence tells you.
 ```
 
-An RPC `session.prompt` response means your text was admitted, not that the model did anything with it. A successful subagent message delivery means the child's session accepted it, not that the child read it. An operation outcome exists only after the work settled, which is exactly why it is trustworthy after the fact.
+An RPC `session.prompt` response means your text was admitted, not that the model did anything with it. A successful subagent message delivery means the child's session accepted it, not that the child read it. A durable work result exists only after that work settled, which is exactly why it is trustworthy after the fact.
 
 Keeping the two apart is what lets Zi answer immediately, refuse early when something is out of bounds, and still give you one durable answer later.
 
-See [RPC](rpc.md) for how admission and settlement are framed on the wire, [Operation outcomes](operation-outcomes.md) for the durable record a settled operation leaves, and [Delegate with subagents](subagents.md) for what delivery does and does not promise.
+See [RPC](rpc.md) for how admission and settlement are framed on the wire and [Delegate with subagents](subagents.md) for the durable result a child work cycle leaves and what message delivery does not promise.

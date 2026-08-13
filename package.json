@@ -30,7 +30,6 @@
     "install:local": "bun scripts/install-local-zi.ts",
     "lint": "oxlint .",
     "lint:fix": "oxlint --fix .",
-    "outcomes": "bun scripts/operation-outcomes.ts",
     "package:npm": "bun scripts/build-npm-packages.ts",
     "prepare": "lefthook install",
     "release:build": "bun scripts/build-release.ts",

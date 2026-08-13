@@ -8,7 +8,6 @@ export const maxRpcFrameBytes = 16 * 1024 * 1024
 export const maxRpcInputTextBytes = 8 * 1024 * 1024
 export const maxRpcRequestIdBytes = 256
 export const maxRpcMessagePageCount = 100
-export const maxRpcOutcomePageCount = 100
 export const maxRpcMessagePageBytes = 8 * 1024 * 1024
 export const maxRpcCompletionIdBytes = 256
 export const maxRpcCompletionTextBytes = 50 * 1024
@@ -25,12 +24,6 @@ export type RpcRequest =
       readonly version: 1
       readonly id: string
       readonly method: "session.get_messages"
-      readonly params: { readonly start: number; readonly limit: number }
-    }
-  | {
-      readonly version: 1
-      readonly id: string
-      readonly method: "session.get_outcomes"
       readonly params: { readonly start: number; readonly limit: number }
     }
   | {
@@ -189,10 +182,6 @@ export function decodeRpcRequest(value: unknown): RpcRequest {
       const params = pageParams(value, "session.get_messages", "Message", maxRpcMessagePageCount, requestId)
       return { version: 1, id: requestId, method: "session.get_messages", params }
     }
-    case "session.get_outcomes": {
-      const params = pageParams(value, "session.get_outcomes", "Outcome", maxRpcOutcomePageCount, requestId)
-      return { version: 1, id: requestId, method: "session.get_outcomes", params }
-    }
     case "session.await_idle": {
       requireKeys(value, ["version", "id", "method", "params"], requestId, true)
       if (value.params === undefined) return { version: 1, id: requestId, method: "session.await_idle" }
@@ -280,8 +269,8 @@ export function decodeRpcRequest(value: unknown): RpcRequest {
 
 function pageParams(
   request: Record<string, unknown>,
-  method: "session.get_messages" | "session.get_outcomes",
-  noun: "Message" | "Outcome",
+  method: "session.get_messages",
+  noun: "Message",
   maxCount: number,
   requestId: string
 ): { readonly start: number; readonly limit: number } {

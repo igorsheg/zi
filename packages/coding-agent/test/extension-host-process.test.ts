@@ -4,20 +4,17 @@ import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
 
 import type { ExtensionLoadPlan, ExtensionSource } from "../src/extensions/discovery.js"
-import {
-  createExtensionWorkerSpawner as createProductionExtensionWorkerSpawner,
-  ExtensionHost,
-  type ExtensionHostTimeouts,
-  type SpawnExtensionWorker
-} from "../src/extensions/host.js"
+import { ExtensionHost, type ExtensionHostTimeouts } from "../src/extensions/host.js"
+import { spawnExtensionWorker, type SpawnExtensionWorker } from "../src/extensions/process.js"
 import { createProcessTreeTracker } from "../src/processes/process-tree.js"
 import { testExtensionContext } from "./extension-context.js"
 
-function createExtensionWorkerSpawner(
+function extensionWorker(
   command: readonly string[],
   removePublicApiDirectory?: (path: string) => void
 ): SpawnExtensionWorker {
-  return createProductionExtensionWorkerSpawner(command, createProcessTreeTracker(), removePublicApiDirectory)
+  const tracker = createProcessTreeTracker()
+  return plan => spawnExtensionWorker(plan, command, tracker, removePublicApiDirectory)
 }
 
 test("ExtensionHost supervises the CLI worker over dedicated process pipes", async () => {
@@ -45,7 +42,7 @@ export default function (zi: ExtensionAPI): void {
   })
   const plan: ExtensionLoadPlan = Object.freeze({ cwd: root, sources: Object.freeze([source]) })
   const cli = resolve(import.meta.dirname, "../../cli/src/main.ts")
-  const host = await ExtensionHost.create(plan, createExtensionWorkerSpawner([process.execPath, cli]))
+  const host = await ExtensionHost.create(plan, extensionWorker([process.execPath, cli]))
 
   try {
     expect(host.snapshot()).toMatchObject({ status: "ready", extensions: [{ status: "loaded" }] })
@@ -101,7 +98,7 @@ export default function (zi: ExtensionAPI): void {
   })
   const plan: ExtensionLoadPlan = Object.freeze({ cwd: root, sources: Object.freeze([source]) })
   const cli = resolve(import.meta.dirname, "../../cli/src/main.ts")
-  const host = await ExtensionHost.create(plan, createExtensionWorkerSpawner([process.execPath, cli]))
+  const host = await ExtensionHost.create(plan, extensionWorker([process.execPath, cli]))
 
   try {
     expect(host.toolCatalog()).toMatchObject([{ name: "echo_message", source: { id: source.id } }])
@@ -153,7 +150,7 @@ export default function (zi: ExtensionAPI): void {
   })
   const plan: ExtensionLoadPlan = Object.freeze({ cwd: root, sources: Object.freeze([source]) })
   const cli = resolve(import.meta.dirname, "../../cli/src/main.ts")
-  const host = await ExtensionHost.create(plan, createExtensionWorkerSpawner([process.execPath, cli]))
+  const host = await ExtensionHost.create(plan, extensionWorker([process.execPath, cli]))
 
   try {
     expect(host.commandCatalog()).toMatchObject([{ name: "echo", source: { id: source.id } }])
@@ -192,7 +189,7 @@ export default zi => zi.registerTool({
   })
   const plan: ExtensionLoadPlan = Object.freeze({ cwd: root, sources: Object.freeze([source]) })
   const cli = resolve(import.meta.dirname, "../../cli/src/main.ts")
-  const host = await ExtensionHost.create(plan, createExtensionWorkerSpawner([process.execPath, cli]))
+  const host = await ExtensionHost.create(plan, extensionWorker([process.execPath, cli]))
 
   try {
     await host.sessionStart("startup", testExtensionContext)
@@ -238,7 +235,7 @@ export default zi => zi.registerTool({
     toolMs: 2_000,
     toolCancellationMs: 25
   }
-  const host = await ExtensionHost.create(plan, createExtensionWorkerSpawner([process.execPath, cli]), timeouts)
+  const host = await ExtensionHost.create(plan, extensionWorker([process.execPath, cli]), timeouts)
 
   try {
     await host.sessionStart("startup", testExtensionContext)
@@ -267,7 +264,7 @@ test("ExtensionHost settles when temporary public API cleanup fails", async () =
   const plan: ExtensionLoadPlan = Object.freeze({ cwd: root, sources: Object.freeze([source]) })
   const cli = resolve(import.meta.dirname, "../../cli/src/main.ts")
   let publicApiRoot: string | undefined
-  const spawner = createExtensionWorkerSpawner([process.execPath, cli], path => {
+  const spawner = extensionWorker([process.execPath, cli], path => {
     publicApiRoot = path
     throw new Error("public API cleanup denied")
   })
@@ -300,7 +297,7 @@ test("ExtensionHost contains a real worker crash during startup", async () => {
   })
   const plan: ExtensionLoadPlan = Object.freeze({ cwd: root, sources: Object.freeze([source]) })
   const cli = resolve(import.meta.dirname, "../../cli/src/main.ts")
-  const host = await ExtensionHost.create(plan, createExtensionWorkerSpawner([process.execPath, cli]))
+  const host = await ExtensionHost.create(plan, extensionWorker([process.execPath, cli]))
 
   try {
     expect(host.snapshot()).toMatchObject({
@@ -337,7 +334,7 @@ test("ExtensionHost fails a generation whose agent event blocks JavaScript", asy
     toolMs: 100,
     toolCancellationMs: 25
   }
-  const host = await ExtensionHost.create(plan, createExtensionWorkerSpawner([process.execPath, cli]), timeouts)
+  const host = await ExtensionHost.create(plan, extensionWorker([process.execPath, cli]), timeouts)
 
   try {
     await host.sessionStart("startup", testExtensionContext)
@@ -377,7 +374,7 @@ test("ExtensionHost terminates a real worker blocked by extension JavaScript", a
     toolMs: 100,
     toolCancellationMs: 25
   }
-  const host = await ExtensionHost.create(plan, createExtensionWorkerSpawner([process.execPath, cli]), timeouts)
+  const host = await ExtensionHost.create(plan, extensionWorker([process.execPath, cli]), timeouts)
 
   try {
     expect(host.snapshot()).toMatchObject({

@@ -7,15 +7,20 @@ import { Readable } from "node:stream"
 
 import type { ExtensionLoadPlan, ExtensionSource } from "../src/extensions/discovery.js"
 import {
-  encodeExtensionProtocolFrame,
-  ExtensionProtocolDecoder,
+  extensionFramingLabel,
+  extensionFramingLimits,
   extensionProtocolVersion,
   type HostMessage,
   type WorkerMessage,
   validateWorkerMessage
 } from "../src/extensions/protocol.js"
 import { extensionWorkerArgument } from "../src/extensions/worker-entry.js"
+import { encodeFramedJson, FramedJsonDecoder } from "../src/processes/framed-json.js"
 import { testExtensionContext } from "./extension-context.js"
+
+function frame(value: unknown): Buffer {
+  return encodeFramedJson(value, extensionFramingLimits, extensionFramingLabel)
+}
 
 test("the CLI internal mode runs one external TypeScript worker generation on its dedicated pipe", async () => {
   const root = await mkdtemp(join(tmpdir(), "zi-extension-worker-entry-"))
@@ -89,7 +94,7 @@ export default async function (zi: ExtensionAPI): Promise<void> {
 
 class WorkerMessageQueue {
   readonly #stream: Readable
-  readonly #decoder = new ExtensionProtocolDecoder(validateWorkerMessage)
+  readonly #decoder = new FramedJsonDecoder(validateWorkerMessage, extensionFramingLimits, extensionFramingLabel)
   readonly #messages: WorkerMessage[] = []
   readonly #waiters: Array<(message: WorkerMessage) => void> = []
   readonly #onData: (chunk: Buffer) => void
@@ -119,7 +124,7 @@ class WorkerMessageQueue {
 }
 
 function send(stream: NodeJS.WritableStream, message: HostMessage): void {
-  stream.write(encodeExtensionProtocolFrame(message))
+  stream.write(frame(message))
 }
 
 async function readStream(stream: Readable): Promise<string> {

@@ -5,11 +5,12 @@ import { pathToFileURL } from "node:url"
 import { inspect } from "node:util"
 import { isMainThread, parentPort, Worker, workerData } from "node:worker_threads"
 
+import { encodeFramedJson, FramedJsonDecoder } from "../processes/framed-json.js"
 import { normalizeCode } from "./normalize.js"
 import {
-  CodeModeProtocolDecoder,
+  codeModeFramingLabel,
+  codeModeFramingLimits,
   codeModeProtocolVersion,
-  encodeCodeModeFrame,
   maxCodeModeCalls,
   maxCodeModeLogBytes,
   maxCodeModeLogs,
@@ -74,7 +75,7 @@ type RealmState =
   | { readonly type: "disposed" }
 
 export async function runCodeModeWorkerFromStdio(): Promise<void> {
-  const decoder = new CodeModeProtocolDecoder(validateHostMessage)
+  const decoder = new FramedJsonDecoder(validateHostMessage, codeModeFramingLimits, codeModeFramingLabel)
   let state: OuterState = { type: "awaiting_initialize" }
 
   const fail = (cause: unknown): void => {
@@ -415,7 +416,7 @@ function stateValue(value: unknown): CodeModeState {
 }
 
 function send(message: CodeModeWorkerMessage): void {
-  const frame = encodeCodeModeFrame(message)
+  const frame = encodeFramedJson(message, codeModeFramingLimits, codeModeFramingLabel)
   let offset = 0
   while (offset < frame.byteLength) {
     const written = writeSync(3, frame, offset)

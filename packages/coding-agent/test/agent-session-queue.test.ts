@@ -872,7 +872,7 @@ test("interrupting the parent run preserves background shell tasks", async () =>
     },
     fauxAssistantMessage("replacement response")
   ])
-  const { session } = await createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
+  const { session } = await createAgentRuntime({ cwd: process.cwd(), models, session: { type: "new", persist: false } })
   const firstRun = session.prompt("start background work")
   await providerStarted.promise
   const background = session.shellTasks.find(task => task.type === "background")

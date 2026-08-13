@@ -94,7 +94,6 @@ Start with [Know the vocabulary](vocabulary.md) if the later pages read as jargo
 
 - [Work plans](work-plans.md) — the ordered checklist Zi keeps for non-trivial work.
 - [Code Mode](code-mode.md) — the `code` tool, its authority, and its memory.
-- [Operation outcomes](operation-outcomes.md) — the durable record a settled operation leaves behind.
 
 ### Build on it
 

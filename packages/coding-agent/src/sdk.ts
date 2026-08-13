@@ -1,7 +1,9 @@
 import { Agent, type AgentTool, type ThinkingLevel } from "@earendil-works/pi-agent-core"
 import { clampThinkingLevel, type Api, type Model } from "@earendil-works/pi-ai"
 import type { ExtensionContext, ExtensionMode, ExtensionSession } from "@with-zi/extension-api"
+import { InvariantRegistry, type InvariantRegistryOptions } from "@with-zi/invariants"
 
+import { AgentSessionInvariant } from "./agent-session-invariant.js"
 import { AgentSession, type SessionReloadDeps } from "./agent-session.js"
 import { Authentication } from "./authentication.js"
 import type { CodeMode } from "./code-mode/code-mode.js"
@@ -84,6 +86,7 @@ export interface CreateAgentSessionOptions {
   readonly subagentEnvironment?: Readonly<Record<string, string | undefined>>
   readonly internalSubagentDepth?: 0 | 1
   readonly toolSurface?: ToolSurface
+  readonly invariants?: InvariantRegistryOptions
 }
 
 /** Build one session from caller-owned services. The caller owns the returned session's disposal. */
@@ -97,6 +100,7 @@ export async function createAgentSessionWithProcessTreeTracker(
 ): Promise<CreateAgentSessionResult> {
   const { services, sessionManager } = options
   if (options.toolSurface && !options.codeMode) throw new Error("Tool surface selection requires Code Mode")
+  const invariantRegistry = new InvariantRegistry(options.invariants)
   const toolSurface = options.codeMode ? snapshotToolSurface(options.toolSurface ?? "direct-and-code") : undefined
   const resources = options.resources ? createSessionResources(options.resources) : await services.resourceLoader.load()
   const settings = services.settingsManager.get()
@@ -149,6 +153,7 @@ export async function createAgentSessionWithProcessTreeTracker(
           },
           sessionManager,
           processTreeTracker,
+          invariantRegistry,
           waitTimeoutMs: settings.subagentWaitTimeoutMs,
           workTimeoutMs: settings.subagentWorkTimeoutMs,
           toolSurface: toolSurface ?? "direct-and-code"
@@ -207,28 +212,37 @@ export async function createAgentSessionWithProcessTreeTracker(
     project: options.project ?? "absent",
     extensionPaths: Object.freeze([...(options.extensionPaths ?? [])])
   })
-  session = new AgentSession({
-    agent,
-    sessionManager,
-    settingsManager: services.settingsManager,
-    authentication: new Authentication(services.modelRegistry.models, services.credentialStore),
-    modelRegistry: services.modelRegistry,
-    resources,
-    projectFileSearch: new ProjectFileSearch(services.paths),
-    tools: sessionTools,
-    toolSurface,
-    reload,
-    ...(subagents ? { subagentSupervisor: subagents } : {}),
-    ...(peerMessenger ? { peerMessenger } : {}),
-    ...(options.codeMode ? { codeMode: options.codeMode } : {}),
-    ...(options.extensionHost ? { extensionHost: options.extensionHost } : {}),
-    extensionContext: createExtensionContext(options.extensionMode ?? "embedded", services, sessionManager),
-    processTreeTracker,
-    workPlan,
-    ...(options.shell ? { shell: options.shell } : {}),
-    ...(model ? { model } : {}),
-    ...(options.apiKey && model ? { apiKeyProvider: model.provider } : {})
-  })
+  const agentSessionInvariant = new AgentSessionInvariant(invariantRegistry)
+  try {
+    session = new AgentSession({
+      agent,
+      sessionManager,
+      settingsManager: services.settingsManager,
+      authentication: new Authentication(services.modelRegistry.models, services.credentialStore),
+      modelRegistry: services.modelRegistry,
+      resources,
+      projectFileSearch: new ProjectFileSearch(services.paths),
+      tools: sessionTools,
+      toolSurface,
+      reload,
+      invariantRegistry,
+      agentSessionInvariant,
+      ...(subagents ? { subagentSupervisor: subagents } : {}),
+      ...(peerMessenger ? { peerMessenger } : {}),
+      ...(options.codeMode ? { codeMode: options.codeMode } : {}),
+      ...(options.extensionHost ? { extensionHost: options.extensionHost } : {}),
+      extensionContext: createExtensionContext(options.extensionMode ?? "embedded", services, sessionManager),
+      processTreeTracker,
+      workPlan,
+      ...(options.shell ? { shell: options.shell } : {}),
+      ...(model ? { model } : {}),
+      ...(options.apiKey && model ? { apiKeyProvider: model.provider } : {})
+    })
+  } catch (cause) {
+    agentSessionInvariant.dispose()
+    invariantRegistry.dispose()
+    throw cause
+  }
   return Object.freeze({ session, ...(bootstrapDiagnostic ? { bootstrapDiagnostic } : {}) })
 }
 

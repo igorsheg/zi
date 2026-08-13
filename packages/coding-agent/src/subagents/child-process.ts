@@ -5,12 +5,13 @@
  * Adapted from examples/rpc/client.ts; no private Zi imports.
  */
 
-import { spawn } from "node:child_process"
-import { Readable, Writable } from "node:stream"
+import type { Writable } from "node:stream"
 
 import { isAgentMessage, isRecord } from "../guards.js"
 import type { AgentMessage } from "../messages.js"
-import type { ProcessScope, ProcessTreeTracker } from "../processes/process-tree.js"
+import { spawnOwnedProcess, type OwnedProcessExit, type RawOwnedProcess } from "../processes/owned-process.js"
+import type { ProcessTreeTracker } from "../processes/process-tree.js"
+import { maxRpcFrameBytes, rpcProtocolVersion, RpcLineDecoder } from "../rpc/protocol.js"
 import {
   decodePeerRequestFrame,
   maxPeerRequests,
@@ -21,8 +22,6 @@ import {
 } from "./peer-protocol.js"
 import { defaultSubagentWorkTimeoutMs, isSubagentWorkTimeout } from "./work-policy.js"
 
-export const rpcProtocolVersion = 1 as const
-export const maxRpcFrameBytes = 16 * 1024 * 1024
 export const maxRpcPendingRequests = 32
 export const maxRpcPendingWriteBytes = 16 * 1024 * 1024
 export const maxRpcStderrBytes = 64 * 1024
@@ -157,17 +156,6 @@ type IdleWatchState = {
   readonly promise: Promise<void>
 }
 
-type ProcessExit = { readonly code: number | null; readonly signal: NodeJS.Signals | null }
-
-type SpawnedRpcProcess = {
-  readonly pid: number
-  readonly input: Writable
-  readonly stdout: Readable
-  readonly stderr: Readable
-  readonly exited: Promise<ProcessExit>
-  kill(signal: NodeJS.Signals): void
-}
-
 export type ChildZiProcessOptions = {
   readonly name: string
   readonly command: readonly string[]
@@ -187,8 +175,8 @@ export type ChildZiProcessOptions = {
 
 export class ChildZiProcess {
   readonly name: string
-  readonly #child: SpawnedRpcProcess
-  readonly #exited: Promise<ProcessExit>
+  readonly #child: RawOwnedProcess
+  readonly #exited: Promise<OwnedProcessExit>
   readonly #onStateChange: (() => void) | undefined
   readonly #onCompletion: ((completion: SubagentCompletion) => void) | undefined
   readonly #onSessionEvent: (() => void) | undefined
@@ -202,7 +190,6 @@ export class ChildZiProcess {
   readonly #pending = new Map<string, PendingRequest>()
   readonly #stdoutSettlement: Promise<void>
   readonly #stderrSettlement: Promise<void>
-  readonly #processScope: ProcessScope
   #state: ChildLifecycleState
   #sessionId: string | undefined
   #completionId: string | undefined
@@ -252,15 +239,16 @@ export class ChildZiProcess {
     if (!isPositiveTimeout(this.#workTimeoutSettlementMs)) throw new Error("Invalid work-timeout settlement bound")
     if (!isPositiveTimeout(this.#interruptSettlementMs)) throw new Error("Invalid interrupt settlement bound")
     this.#state = { type: "starting", startedAt: Date.now() }
-    const executable = options.command[0]
-    if (!executable) throw new Error("Subagent command cannot be empty")
-    this.#child = spawnRpcProcess(executable, options.command.slice(1), options.cwd, options.env, cause =>
-      this.#fail(cause)
-    )
+    this.#child = spawnOwnedProcess({
+      type: "raw",
+      pipeAdapter: "direct",
+      command: options.command,
+      cwd: options.cwd,
+      env: options.env,
+      processTreeTracker: options.processTreeTracker
+    })
     this.#exited = this.#child.exited
-    this.#processScope = createChildProcessScope(this.#child.pid, this.#child, options.processTreeTracker, cause =>
-      this.#fail(cause)
-    )
+    void this.#child.containmentFailure.catch(cause => this.#fail(cause))
     this.#stdoutSettlement = this.#consumeStdout().catch(cause => this.#fail(cause))
     this.#stderrSettlement = this.#consumeStderr().catch(cause => this.#fail(cause))
     void this.#exited.then(async exit => {
@@ -336,7 +324,7 @@ export class ChildZiProcess {
 
   async start(): Promise<void> {
     const reached = await settleWithin(
-      Promise.all([this.#ready.promise, this.#processScope.admitted]).then(() => undefined),
+      Promise.all([this.#ready.promise, this.#child.admitted]).then(() => undefined),
       rpcReadyTimeoutMs
     )
     if (!reached) {
@@ -739,7 +727,7 @@ export class ChildZiProcess {
     if (state.type === "running") this.#clearWorkDeadline(workCycle)
 
     // Settled work is a containment admission barrier for background processes started during the cycle.
-    if ((await this.#processScope.refresh()).type === "overflow") {
+    if ((await this.#child.refreshTree()).type === "overflow") {
       throw new Error("Subagent process scope exceeded tracked descendant capacity")
     }
     if (!this.#ownsIdleCompletion(revision, workCycle)) return
@@ -880,7 +868,7 @@ export class ChildZiProcess {
   }
 
   async #consumeStdout(): Promise<void> {
-    const decoder = new JsonLineDecoder()
+    const decoder = new RpcLineDecoder()
     for await (const chunk of this.#child.stdout) {
       for (const line of decoder.push(chunk)) this.#receive(line)
     }
@@ -1195,11 +1183,7 @@ export class ChildZiProcess {
     const settlement = Promise.resolve().then(() => this.#settleClose(rpcCloseForceMs, rpcCloseForceMs, error))
     this.#closeSettlement = settlement
     this.#transition({ type: "closing", reason: "fatal", requestedAt: Date.now() })
-    try {
-      this.#child.kill("SIGKILL")
-    } catch {
-      // already dead
-    }
+    this.#child.terminate(true)
     try {
       this.#onFatal?.(error)
     } catch {
@@ -1217,26 +1201,22 @@ export class ChildZiProcess {
       )
       await settleWithin(
         Promise.resolve()
-          .then(() => endNodeInput(this.#child.input))
-          .then(() => undefined)
+          .then(() => this.#child.closeInput())
           .catch(() => undefined),
         deadlineRemainingMs(gracefulEndsAt)
       )
     }
     let exitCode = await settleValueWithin(this.#exited, failure ? forceMs : deadlineRemainingMs(gracefulEndsAt))
     if (exitCode === timeoutValue) {
-      try {
-        this.#child.kill("SIGKILL")
-      } catch {
-        // The process exited at the force boundary.
-      }
+      this.#child.terminate(true)
       exitCode = await settleValueWithin(this.#exited, forceMs)
     }
-    await this.#processScope.terminate().catch(() => {})
+    await this.#child.terminateTree().catch(() => {})
     await settleWithin(
       Promise.allSettled([this.#writeTail, this.#stdoutSettlement, this.#stderrSettlement]).then(() => undefined),
       1_000
     )
+    await this.#child.dispose().catch(() => {})
     if (this.#state.type === "exited") return
     if (failure) {
       this.#transition({
@@ -1281,146 +1261,6 @@ export class ChildZiProcess {
     } catch {
       // Process ownership cannot cross into an observer.
     }
-  }
-}
-
-function spawnRpcProcess(
-  executable: string,
-  args: readonly string[],
-  cwd: string,
-  env: Readonly<Record<string, string | undefined>>,
-  onFailure: (error: Error) => void
-): SpawnedRpcProcess {
-  if (process.platform === "win32") {
-    const child = spawn(executable, args, { cwd, env: { ...env }, stdio: ["pipe", "pipe", "pipe"], windowsHide: true })
-    const pid = child.pid
-    if (pid === undefined || !child.stdin || !child.stdout || !child.stderr) {
-      child.once("error", ignoreStreamError)
-      child.kill("SIGKILL")
-      throw new Error("Subagent process did not expose all required pipes")
-    }
-    const input = child.stdin
-    input.on("error", ignoreStreamError)
-    input.once("close", () => input.off("error", ignoreStreamError))
-    child.on("error", onFailure)
-    const exited = new Promise<ProcessExit>(resolveExit => {
-      child.once("close", (code, signal) => resolveExit({ code, signal }))
-    })
-    return {
-      pid,
-      input,
-      stdout: child.stdout,
-      stderr: child.stderr,
-      exited,
-      kill(signal) {
-        child.kill(signal)
-      }
-    }
-  }
-
-  // Bun's Node adapter can fail while materializing pipes under Linux load. Direct Bun pipes are stable on POSIX,
-  // but its exited accessor can touch released handles, so status polling owns exit observation instead.
-  const child = Bun.spawn([executable, ...args], {
-    cwd,
-    env,
-    stdin: "pipe",
-    stdout: "pipe",
-    stderr: "pipe",
-    detached: true,
-    windowsHide: true
-  })
-  const input = bunProcessInput(child.stdin)
-  input.on("error", ignoreStreamError)
-  input.once("close", () => input.off("error", ignoreStreamError))
-  return {
-    pid: child.pid,
-    input,
-    stdout: Readable.from(child.stdout),
-    stderr: Readable.from(child.stderr),
-    exited: observeBunExit(child),
-    kill(signal) {
-      child.kill(signal)
-    }
-  }
-}
-
-async function observeBunExit(child: Bun.Subprocess<"pipe", "pipe", "pipe">): Promise<ProcessExit> {
-  while (child.exitCode === null && child.signalCode === null) {
-    // Exit status has no event API independent of Bun's unsafe exited accessor.
-    // oxlint-disable-next-line no-await-in-loop
-    await sleep(10)
-  }
-  return { code: child.exitCode, signal: child.signalCode }
-}
-
-function bunProcessInput(sink: Bun.FileSink): Writable {
-  let ended = false
-  return new Writable({
-    write(chunk: Buffer, _encoding, callback) {
-      void writeBunSink(sink, chunk, callback)
-    },
-    final(callback) {
-      ended = true
-      void closeBunSink(sink, undefined, callback)
-    },
-    destroy(cause, callback) {
-      if (ended) {
-        callback(cause)
-        return
-      }
-      ended = true
-      void closeBunSink(sink, cause ?? undefined, callback)
-    }
-  })
-}
-
-async function writeBunSink(
-  sink: Bun.FileSink,
-  chunk: Buffer,
-  callback: (error?: Error | null) => void
-): Promise<void> {
-  try {
-    await sink.write(chunk)
-    await sink.flush()
-    callback()
-  } catch (cause) {
-    callback(cause instanceof Error ? cause : new Error("Could not write subagent input"))
-  }
-}
-
-async function closeBunSink(
-  sink: Bun.FileSink,
-  cause: Error | undefined,
-  callback: (error?: Error | null) => void
-): Promise<void> {
-  try {
-    await sink.end()
-    callback(cause)
-  } catch (closeCause) {
-    const closeError = closeCause instanceof Error ? closeCause : new Error("Could not close subagent input")
-    callback(cause ? new Error(`${cause.message}; ${closeError.message}`, { cause }) : closeError)
-  }
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms))
-}
-
-function createChildProcessScope(
-  workerPid: number,
-  child: SpawnedRpcProcess,
-  processTreeTracker: ProcessTreeTracker,
-  onFailure: (error: Error) => void
-): ProcessScope {
-  try {
-    return processTreeTracker.track(workerPid, onFailure)
-  } catch (cause) {
-    try {
-      child.kill("SIGKILL")
-    } catch {
-      // The process already exited while containment was being admitted.
-    }
-    throw cause
   }
 }
 
@@ -1574,74 +1414,11 @@ function completionFromIdleResult(
   }
 }
 
-class JsonLineDecoder {
-  readonly #decoder = new TextDecoder("utf-8", { fatal: true })
-  #buffer = ""
-  #bufferBytes = 0
-
-  push(chunk: Uint8Array): string[] {
-    try {
-      this.#buffer += this.#decoder.decode(chunk, { stream: true })
-    } catch {
-      throw new Error("Subagent RPC stdout must be valid UTF-8")
-    }
-    this.#bufferBytes += chunk.byteLength
-    return this.#takeLines()
-  }
-
-  finish(): string[] {
-    try {
-      this.#buffer += this.#decoder.decode()
-    } catch {
-      throw new Error("Subagent RPC stdout must be valid UTF-8")
-    }
-    const lines = this.#takeLines()
-    if (this.#buffer.length > 0) {
-      lines.push(this.#buffer.endsWith("\r") ? this.#buffer.slice(0, -1) : this.#buffer)
-      this.#buffer = ""
-      this.#bufferBytes = 0
-    }
-    return lines
-  }
-
-  #takeLines(): string[] {
-    const lines: string[] = []
-    while (true) {
-      const newline = this.#buffer.indexOf("\n")
-      if (newline === -1) break
-      const line = this.#buffer.slice(0, newline)
-      const bytes = Buffer.byteLength(line)
-      if (bytes > maxRpcFrameBytes) throw new Error(`RPC frame exceeds ${maxRpcFrameBytes} bytes`)
-      lines.push(line.endsWith("\r") ? line.slice(0, -1) : line)
-      this.#buffer = this.#buffer.slice(newline + 1)
-      this.#bufferBytes -= bytes + 1
-    }
-    if (this.#bufferBytes > maxRpcFrameBytes) throw new Error(`RPC frame exceeds ${maxRpcFrameBytes} bytes`)
-    return lines
-  }
-}
-
-function ignoreStreamError(): void {}
-
 function writeNodeInput(input: Writable, chunk: string): Promise<void> {
   return new Promise((resolveWrite, rejectWrite) => {
     input.write(chunk, cause => {
       if (cause) rejectWrite(cause)
       else resolveWrite()
-    })
-  })
-}
-
-function endNodeInput(input: Writable): Promise<void> {
-  return new Promise((resolveEnd, rejectEnd) => {
-    const onError = (cause: Error): void => {
-      input.off("error", onError)
-      rejectEnd(cause)
-    }
-    input.once("error", onError)
-    input.end(() => {
-      input.off("error", onError)
-      resolveEnd()
     })
   })
 }

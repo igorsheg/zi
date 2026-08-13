@@ -5,9 +5,8 @@ import { Writable } from "node:stream"
 import { maxExtensionSources, type ExtensionLoadPlan, type ExtensionSource } from "../src/extensions/discovery.js"
 import {
   boundedExtensionDiagnostic,
-  encodeExtensionProtocolFrame,
-  ExtensionProtocolDecoder,
-  ExtensionProtocolWriter,
+  extensionFramingLabel,
+  extensionFramingLimits,
   extensionProtocolVersion,
   maxActiveExtensionToolCatalogBytes,
   maxActiveExtensionTools,
@@ -37,6 +36,7 @@ import {
   validateHostMessage,
   validateWorkerMessage
 } from "../src/extensions/protocol.js"
+import { encodeFramedJson, FramedJsonDecoder, FramedJsonWriter } from "../src/processes/framed-json.js"
 import { maxCustomStateEntries } from "../src/session-manager.js"
 import { testExtensionContext } from "./extension-context.js"
 
@@ -50,7 +50,7 @@ const source: ExtensionSource = Object.freeze({
 const plan: ExtensionLoadPlan = Object.freeze({ cwd: resolve("project"), sources: Object.freeze([source]) })
 
 test("protocol decoding accepts partial frames and multiple messages per read", () => {
-  const decoder = new ExtensionProtocolDecoder(validateHostMessage)
+  const decoder = new FramedJsonDecoder(validateHostMessage, extensionFramingLimits, extensionFramingLabel)
   const initialize: HostMessage = { type: "initialize", protocolVersion: extensionProtocolVersion, generation: 1, plan }
   const start: HostMessage = {
     type: "session_start",
@@ -59,7 +59,7 @@ test("protocol decoding accepts partial frames and multiple messages per read", 
     reason: "startup",
     context: testExtensionContext
   }
-  const bytes = Buffer.concat([encodeExtensionProtocolFrame(initialize), encodeExtensionProtocolFrame(start)])
+  const bytes = Buffer.concat([encodedFrame(initialize), encodedFrame(start)])
   const messages = []
 
   for (let offset = 0; offset < bytes.byteLength;) {
@@ -78,22 +78,32 @@ test("protocol decoding accepts partial frames and multiple messages per read", 
 })
 
 test("protocol decoding rejects malformed framing, UTF-8, JSON, and closed messages", () => {
-  expect(() => new ExtensionProtocolDecoder(validateHostMessage).push(frameWithLength(0))).toThrow("cannot be empty")
   expect(() =>
-    new ExtensionProtocolDecoder(validateHostMessage).push(frameWithLength(maxExtensionProtocolFrameBytes + 1))
+    new FramedJsonDecoder(validateHostMessage, extensionFramingLimits, extensionFramingLabel).push(frameWithLength(0))
+  ).toThrow("must contain 1 to")
+  expect(() =>
+    new FramedJsonDecoder(validateHostMessage, extensionFramingLimits, extensionFramingLabel).push(
+      frameWithLength(maxExtensionProtocolFrameBytes + 1)
+    )
   ).toThrow(`${maxExtensionProtocolFrameBytes} bytes`)
-  expect(() => new ExtensionProtocolDecoder(validateHostMessage).push(rawFrame(Buffer.from([0xff])))).toThrow(
-    "not valid UTF-8"
-  )
-  expect(() => new ExtensionProtocolDecoder(validateHostMessage).push(rawFrame(Buffer.from("{")))).toThrow(
-    "not valid JSON"
-  )
   expect(() =>
-    new ExtensionProtocolDecoder(validateHostMessage).push(encodeExtensionProtocolFrame({ type: "future" }))
+    new FramedJsonDecoder(validateHostMessage, extensionFramingLimits, extensionFramingLabel).push(
+      rawFrame(Buffer.from([0xff]))
+    )
+  ).toThrow("not valid UTF-8")
+  expect(() =>
+    new FramedJsonDecoder(validateHostMessage, extensionFramingLimits, extensionFramingLabel).push(
+      rawFrame(Buffer.from("{"))
+    )
+  ).toThrow("not valid JSON")
+  expect(() =>
+    new FramedJsonDecoder(validateHostMessage, extensionFramingLimits, extensionFramingLabel).push(
+      encodedFrame({ type: "future" })
+    )
   ).toThrow("Unknown host protocol message")
 
-  const partial = new ExtensionProtocolDecoder(validateHostMessage)
-  partial.push(encodeExtensionProtocolFrame({ type: "stop", generation: 1, requestId: 1 }).subarray(0, 5))
+  const partial = new FramedJsonDecoder(validateHostMessage, extensionFramingLimits, extensionFramingLabel)
+  partial.push(encodedFrame({ type: "stop", generation: 1, requestId: 1 }).subarray(0, 5))
   expect(() => partial.end()).toThrow("partial frame")
   expect(() => partial.push(Buffer.from([0]))).toThrow("partial frame")
 })
@@ -812,7 +822,7 @@ test("maximum admitted load results fit in one protocol frame", () => {
     tools: []
   })
 
-  expect(encodeExtensionProtocolFrame(message).byteLength).toBeLessThanOrEqual(maxExtensionProtocolFrameBytes + 4)
+  expect(encodedFrame(message).byteLength).toBeLessThanOrEqual(maxExtensionProtocolFrameBytes + 4)
 })
 
 test("tool catalogs have one aggregate ready-frame budget", () => {
@@ -890,9 +900,7 @@ test("ready-frame validation bounds combined source, tool, and subagent catalogs
     tools: [],
     subagents
   })
-  expect(encodeExtensionProtocolFrame(maximumProfiles).byteLength).toBeLessThanOrEqual(
-    maxExtensionProtocolFrameBytes + 4
-  )
+  expect(encodedFrame(maximumProfiles).byteLength).toBeLessThanOrEqual(maxExtensionProtocolFrameBytes + 4)
 })
 
 test("diagnostic construction truncates UTF-8 on a complete code point", () => {
@@ -913,7 +921,7 @@ test("protocol writer serializes writes and releases its owned listener", async 
       callbacks.push(callback)
     }
   })
-  const writer = new ExtensionProtocolWriter(sink)
+  const writer = new FramedJsonWriter(sink, extensionFramingLimits, extensionFramingLabel)
   const first = writer.send({ sequence: 1 })
   const second = writer.send({ sequence: 2 })
 
@@ -931,7 +939,7 @@ test("protocol writer serializes writes and releases its owned listener", async 
 
 test("protocol writer bounds queued frames and bytes and rejects all work on failure", async () => {
   const sink = new Writable({ write(_chunk, _encoding, _callback) {} })
-  const writer = new ExtensionProtocolWriter(sink)
+  const writer = new FramedJsonWriter(sink, extensionFramingLimits, extensionFramingLabel)
   const writes = Array.from({ length: maxExtensionQueuedWrites }, (_, index) => writer.send({ index }))
   expect(writer.send({ overflow: true })).rejects.toThrow(`${maxExtensionQueuedWrites} frames`)
   writer.fail(new Error("pipe failed"))
@@ -941,7 +949,7 @@ test("protocol writer bounds queued frames and bytes and rejects all work on fai
   writer.dispose()
 
   const byteSink = new Writable({ write(_chunk, _encoding, _callback) {} })
-  const byteWriter = new ExtensionProtocolWriter(byteSink)
+  const byteWriter = new FramedJsonWriter(byteSink, extensionFramingLimits, extensionFramingLabel)
   const payload = "x".repeat(900_000)
   const byteWrites: Promise<void>[] = []
   let overflow: Promise<void> | undefined
@@ -950,7 +958,7 @@ test("protocol writer bounds queued frames and bytes and rejects all work on fai
     if (index === 9) overflow = write
     else byteWrites.push(write)
   }
-  expect(overflow!).rejects.toThrow("queue more than")
+  expect(overflow!).rejects.toThrow("queue cannot exceed")
   byteWriter.dispose()
   await Promise.allSettled(byteWrites)
 })
@@ -958,12 +966,14 @@ test("protocol writer bounds queued frames and bytes and rejects all work on fai
 test("protocol encoding rejects non-JSON and oversized values", () => {
   const circular: Record<string, unknown> = {}
   circular.self = circular
-  expect(() => encodeExtensionProtocolFrame(circular)).toThrow("could not be serialized")
-  expect(() => encodeExtensionProtocolFrame(undefined)).toThrow("must be JSON values")
-  expect(() => encodeExtensionProtocolFrame("x".repeat(maxExtensionProtocolFrameBytes))).toThrow(
-    `${maxExtensionProtocolFrameBytes}`
-  )
+  expect(() => encodedFrame(circular)).toThrow("could not be serialized")
+  expect(() => encodedFrame(undefined)).toThrow("must be JSON values")
+  expect(() => encodedFrame("x".repeat(maxExtensionProtocolFrameBytes))).toThrow(`${maxExtensionProtocolFrameBytes}`)
 })
+
+function encodedFrame(value: unknown): Buffer {
+  return encodeFramedJson(value, extensionFramingLimits, extensionFramingLabel)
+}
 
 function rawFrame(payload: Buffer): Buffer {
   const frame = Buffer.alloc(4 + payload.byteLength)

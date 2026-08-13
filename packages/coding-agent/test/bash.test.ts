@@ -4,8 +4,10 @@ import { mkdtemp, readFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
-import type { ShellBackgroundTaskOperationOutcomeInput } from "../src/session-shell.js"
+import { InvariantRegistry } from "@with-zi/invariants"
+
 import { defaultShellLimits, SessionShell, ShellRunAdmissionError, type ShellLimits } from "../src/session-shell.js"
+import type { BackgroundTaskResultInput } from "../src/shell-result.js"
 import { createBashTool, isBashToolDetails } from "../src/tools/bash.js"
 import { projectToolPresentation } from "../src/tools/presentation/project.js"
 import {
@@ -284,15 +286,14 @@ test("explicit background execution survives its tool signal and can be awaited"
   }
 })
 
-test("background task settlement emits one closed operation outcome", async () => {
-  const cwd = await mkdtemp(join(tmpdir(), "zi-bash-outcomes-"))
-  const shell = createShell(cwd)
-  const outcomes: ShellBackgroundTaskOperationOutcomeInput[] = []
-  shell.bindOperationOutcomeSink(outcome => outcomes.push(outcome))
+test("background task settlement emits one closed result", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "zi-bash-results-"))
+  const results: BackgroundTaskResultInput[] = []
+  const shell = createShell(cwd, {}, result => results.push(result))
 
   try {
     await shell.run("foreground", { command: "printf foreground", timeoutMs: 2_000, background: false })
-    expect(outcomes).toEqual([])
+    expect(results).toEqual([])
 
     const started = await shell.run("background", {
       command: "printf background; exit 7",
@@ -302,36 +303,31 @@ test("background task settlement emits one closed operation outcome", async () =
     if (started.type !== "backgrounded") throw new Error("Expected background task")
     const completed = await shell.wait(started.task.taskId, 2_000)
     expect(completed).toMatchObject({ type: "completed", outcome: { type: "exited", exitCode: 7 } })
-    expect(outcomes).toEqual([
+    expect(results).toEqual([
       expect.objectContaining({
-        capability: "shell",
-        operation: "background_task",
+        taskId: started.task.taskId,
+        origin: "requested",
         result: "failed",
-        evidence: expect.objectContaining({
-          taskId: started.task.taskId,
-          origin: "requested",
-          errorCode: "exit_nonzero",
-          exitCode: 7,
-          outputBytes: 10
-        })
+        errorCode: "exit_nonzero",
+        exitCode: 7,
+        outputBytes: 10
       })
     ])
-    expect(JSON.stringify(outcomes)).not.toContain("printf background")
+    expect(JSON.stringify(results)).not.toContain("printf background")
 
     await shell.wait(started.task.taskId, 0)
     await shell.kill(started.task.taskId)
-    expect(outcomes).toHaveLength(1)
+    expect(results).toHaveLength(1)
   } finally {
     await shell.dispose()
     rmSync(cwd, { recursive: true, force: true })
   }
 })
 
-test("demotion and task control preserve one background operation identity", async () => {
+test("demotion and task control preserve one background result identity", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "zi-bash-demoted-outcome-"))
-  const shell = createShell(cwd)
-  const outcomes: ShellBackgroundTaskOperationOutcomeInput[] = []
-  shell.bindOperationOutcomeSink(outcome => outcomes.push(outcome))
+  const results: BackgroundTaskResultInput[] = []
+  const shell = createShell(cwd, {}, result => results.push(result))
   const started = deferred<void>()
   const running = shell.run(
     "demoted",
@@ -350,14 +346,12 @@ test("demotion and task control preserve one background operation identity", asy
     await shell.kill(demoted.task.taskId)
     await shell.wait(demoted.task.taskId, 2_000)
 
-    expect(outcomes).toEqual([
+    expect(results).toEqual([
       expect.objectContaining({
         result: "cancelled",
-        evidence: expect.objectContaining({
-          taskId: demoted.task.taskId,
-          origin: "demoted",
-          cancellationCode: "killed"
-        })
+        taskId: demoted.task.taskId,
+        origin: "demoted",
+        cancellationCode: "killed"
       })
     ])
   } finally {
@@ -366,11 +360,10 @@ test("demotion and task control preserve one background operation identity", asy
   }
 })
 
-test("background timeout, output limit, and disposal retain distinct outcomes", async () => {
-  const cwd = await mkdtemp(join(tmpdir(), "zi-bash-terminal-outcomes-"))
-  const shell = createShell(cwd, { maxOutputFileBytes: 1_024 })
-  const outcomes: ShellBackgroundTaskOperationOutcomeInput[] = []
-  shell.bindOperationOutcomeSink(outcome => outcomes.push(outcome))
+test("background timeout, output limit, and disposal retain distinct results", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "zi-bash-terminal-results-"))
+  const results: BackgroundTaskResultInput[] = []
+  const shell = createShell(cwd, { maxOutputFileBytes: 1_024 }, result => results.push(result))
 
   const timed = await shell.run("timed", {
     command: `node -e "setInterval(() => {}, 1000)"`,
@@ -396,34 +389,25 @@ test("background timeout, output limit, and disposal retain distinct outcomes", 
   if (disposed.type !== "backgrounded") throw new Error("Expected disposable background task")
   await shell.dispose()
 
-  expect(outcomes).toEqual(
+  expect(results).toEqual(
     expect.arrayContaining([
-      expect.objectContaining({
-        result: "failed",
-        evidence: expect.objectContaining({ taskId: timed.task.taskId, errorCode: "timed_out" })
-      }),
-      expect.objectContaining({
-        result: "failed",
-        evidence: expect.objectContaining({ taskId: limited.task.taskId, errorCode: "output_limit" })
-      }),
-      expect.objectContaining({
-        result: "cancelled",
-        evidence: expect.objectContaining({ taskId: disposed.task.taskId, cancellationCode: "disposed" })
-      })
+      expect.objectContaining({ result: "failed", taskId: timed.task.taskId, errorCode: "timed_out" }),
+      expect.objectContaining({ result: "failed", taskId: limited.task.taskId, errorCode: "output_limit" }),
+      expect.objectContaining({ result: "cancelled", taskId: disposed.task.taskId, cancellationCode: "disposed" })
     ])
   )
   rmSync(cwd, { recursive: true, force: true })
 })
 
-test("operation outcome binding rejects background work admitted before session ownership", async () => {
+test("result binding rejects background work admitted before session ownership", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "zi-bash-late-outcome-binding-"))
-  const shell = createShell(cwd)
+  const shell = new SessionShell({ cwd, sessionId: crypto.randomUUID() })
 
   try {
     const started = await shell.run("background", { command: "printf done", timeoutMs: 2_000, background: true })
     if (started.type !== "backgrounded") throw new Error("Expected background task")
-    expect(() => shell.bindOperationOutcomeSink(() => {})).toThrow(
-      "Shell operation outcome sink must be bound before background work"
+    expect(() => shell.bindBackgroundTaskResultSink(() => {})).toThrow(
+      "Shell background-task result sink must be bound before background work"
     )
   } finally {
     await shell.dispose()
@@ -431,38 +415,56 @@ test("operation outcome binding rejects background work admitted before session 
   }
 })
 
-test("background outcome persistence retries at the next delivery boundary", async () => {
+test("invariant binding is one-shot and must precede shell work", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "zi-bash-invariant-binding-"))
+  const bound = new SessionShell({ cwd, sessionId: crypto.randomUUID() })
+  bound.bindInvariants(new InvariantRegistry())
+  expect(() => bound.bindInvariants(new InvariantRegistry())).toThrow("Shell invariants are already bound")
+  await bound.dispose()
+
+  const late = new SessionShell({ cwd, sessionId: crypto.randomUUID() })
+  try {
+    await late.run("foreground", { command: "printf done", timeoutMs: 2_000, background: false })
+    expect(() => late.bindInvariants(new InvariantRegistry())).toThrow(
+      "Shell invariants must be bound before shell work"
+    )
+  } finally {
+    await late.dispose()
+    rmSync(cwd, { recursive: true, force: true })
+  }
+})
+
+test("background result persistence retries at the next delivery boundary", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "zi-bash-outcome-retry-"))
-  const shell = createShell(cwd)
-  const outcomes: ShellBackgroundTaskOperationOutcomeInput[] = []
+  const results: BackgroundTaskResultInput[] = []
   let attempts = 0
-  shell.bindOperationOutcomeSink(outcome => {
+  const shell = createShell(cwd, {}, result => {
     attempts++
     if (attempts === 1) throw new Error("journal unavailable")
-    outcomes.push(outcome)
+    results.push(result)
   })
 
   try {
     const first = await shell.run("first", { command: "printf first", timeoutMs: 2_000, background: true })
     if (first.type !== "backgrounded") throw new Error("Expected first background task")
     await shell.wait(first.task.taskId, 2_000)
-    expect(outcomes).toEqual([])
+    expect(results).toEqual([])
 
-    shell.retryPendingOutcomes()
-    expect(outcomes.map(outcome => outcome.evidence.taskId)).toEqual([first.task.taskId])
+    shell.retryPendingResults()
+    expect(results.map(result => result.taskId)).toEqual([first.task.taskId])
 
     const second = await shell.run("second", { command: "printf second", timeoutMs: 2_000, background: true })
     if (second.type !== "backgrounded") throw new Error("Expected second background task")
     await shell.wait(second.task.taskId, 2_000)
 
-    expect(outcomes.map(outcome => outcome.evidence.taskId)).toEqual([first.task.taskId, second.task.taskId])
+    expect(results.map(result => result.taskId)).toEqual([first.task.taskId, second.task.taskId])
   } finally {
     await shell.dispose()
     rmSync(cwd, { recursive: true, force: true })
   }
 })
 
-test("an unpersisted background outcome bounds later admission and preserves cleanup", async () => {
+test("an unpersisted background result bounds later admission and preserves cleanup", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "zi-bash-outcome-backlog-"))
   const outputRoot = join(cwd, "output")
   const shell = new SessionShell({
@@ -471,7 +473,8 @@ test("an unpersisted background outcome bounds later admission and preserves cle
     outputRoot,
     limits: { ...defaultShellLimits, maxBackgroundTasks: 2, maxCompletedTasks: 1 }
   })
-  shell.bindOperationOutcomeSink(() => {
+  shell.bindInvariants(new InvariantRegistry())
+  shell.bindBackgroundTaskResultSink(() => {
     throw new Error("journal unavailable")
   })
 
@@ -497,7 +500,7 @@ test("an unpersisted background outcome bounds later admission and preserves cle
       () => "",
       cause => (cause instanceof Error ? cause.message : String(cause))
     )
-  ).toBe("Could not persist shell operation outcomes")
+  ).toBe("Could not persist shell background-task results")
   expect(shell.snapshots()).toEqual([])
   expect(existsSync(output.path)).toBe(false)
   rmSync(cwd, { recursive: true, force: true })
@@ -551,7 +554,6 @@ test("task_output cursors return only newly observed output", async () => {
 test("cursor-aware waits retain settlement output when the completed task is evicted", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "zi-bash-cursor-eviction-"))
   const shell = createShell(cwd, { maxCompletedTasks: 2 })
-  shell.bindOperationOutcomeSink(() => {})
   const now = Date.now
   Date.now = () => 1_000
 
@@ -811,8 +813,19 @@ test("session shell disposal kills background work and removes retained output",
   rmSync(cwd, { recursive: true, force: true })
 })
 
-function createShell(cwd: string, overrides: Partial<ShellLimits> = {}): SessionShell {
-  return new SessionShell({ cwd, sessionId: crypto.randomUUID(), limits: { ...defaultShellLimits, ...overrides } })
+function createShell(
+  cwd: string,
+  overrides: Partial<ShellLimits> = {},
+  resultSink: (result: BackgroundTaskResultInput) => void = () => {}
+): SessionShell {
+  const shell = new SessionShell({
+    cwd,
+    sessionId: crypto.randomUUID(),
+    limits: { ...defaultShellLimits, ...overrides }
+  })
+  shell.bindInvariants(new InvariantRegistry())
+  shell.bindBackgroundTaskResultSink(resultSink)
+  return shell
 }
 
 async function waitUntil(condition: () => boolean): Promise<void> {

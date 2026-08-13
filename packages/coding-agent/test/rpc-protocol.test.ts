@@ -44,16 +44,6 @@ test("RPC request decoding admits only the versioned closed command catalog", ()
   expect(
     decodeRpcRequest({ version: 1, id: "messages-1", method: "session.get_messages", params: { start: 2 } })
   ).toEqual({ version: 1, id: "messages-1", method: "session.get_messages", params: { start: 2, limit: 100 } })
-  expect(decodeRpcRequest({ version: 1, id: "outcomes-default", method: "session.get_outcomes" })).toEqual({
-    version: 1,
-    id: "outcomes-default",
-    method: "session.get_outcomes",
-    params: { start: 0, limit: 100 }
-  })
-  expect(
-    decodeRpcRequest({ version: 1, id: "outcomes-1", method: "session.get_outcomes", params: { start: 2, limit: 3 } })
-  ).toEqual({ version: 1, id: "outcomes-1", method: "session.get_outcomes", params: { start: 2, limit: 3 } })
-
   expectRequestError({ version: 2, id: "x", method: "session.get_state" }, "unsupported_version")
   expectRequestError({ version: 1, id: "", method: "session.get_state" }, "invalid_request")
   expectRequestError({ version: 1, id: "x", method: "session.get_state", extra: true }, "invalid_request")
@@ -109,10 +99,6 @@ test("RPC request decoding admits only the versioned closed command catalog", ()
   )
   expectRequestError(
     { version: 1, id: "x", method: "session.get_messages", params: { start: -1, limit: 101 } },
-    "invalid_request"
-  )
-  expectRequestError(
-    { version: 1, id: "x", method: "session.get_outcomes", params: { start: 0, limit: 101 } },
     "invalid_request"
   )
   expectRequestError(

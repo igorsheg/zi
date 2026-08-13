@@ -1,10 +1,12 @@
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process"
 import { createWriteStream, mkdirSync, mkdtempSync, rmSync, type WriteStream } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
-import { isNonNegativeInteger, isRecord } from "./guards.js"
-import type { OperationOutcome } from "./operation-outcomes.js"
+import type { InvariantRegistry } from "@with-zi/invariants"
+
+import { spawnOwnedProcess, type RawOwnedProcess } from "./processes/owned-process.js"
+import { SessionShellInvariant } from "./session-shell-invariant.js"
+import type { BackgroundTaskOrigin, BackgroundTaskResultInput } from "./shell-result.js"
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncateTail, type TruncationResult } from "./tools/truncate.js"
 
 export const defaultShellLimits: ShellLimits = Object.freeze({
@@ -46,133 +48,6 @@ export interface ShellRunRequest {
 
 export type ShellStopReason = "abort" | "timeout" | "killed" | "output-limit" | "output-error" | "dispose"
 
-export type ShellBackgroundTaskOrigin = "requested" | "demoted"
-export type ShellBackgroundTaskErrorCode =
-  | "exit_nonzero"
-  | "signaled"
-  | "timed_out"
-  | "output_limit"
-  | "execution_failed"
-export type ShellBackgroundTaskCancellationCode = "killed" | "disposed"
-
-type ShellBackgroundTaskEvidenceBase = {
-  readonly taskId: string
-  readonly origin: ShellBackgroundTaskOrigin
-  readonly outputBytes: number
-}
-
-interface ShellOutcomeInputBase {
-  readonly operationId: string
-  readonly capability: "shell"
-  readonly operation: "background_task"
-  readonly durationMs: number
-}
-
-type ShellOutcomeBase = ShellOutcomeInputBase & {
-  readonly type: "operation_outcome"
-  readonly id: string
-  readonly parentId: string | null
-  readonly timestamp: string
-}
-
-export type ShellBackgroundTaskOperationOutcomeInput =
-  | (ShellOutcomeInputBase & {
-      readonly result: "succeeded"
-      readonly evidence: ShellBackgroundTaskEvidenceBase & { readonly exitCode: 0 }
-    })
-  | (ShellOutcomeInputBase & {
-      readonly result: "cancelled"
-      readonly evidence: ShellBackgroundTaskEvidenceBase & {
-        readonly cancellationCode: ShellBackgroundTaskCancellationCode
-      }
-    })
-  | (ShellOutcomeInputBase & {
-      readonly result: "failed"
-      readonly evidence: ShellBackgroundTaskEvidenceBase & {
-        readonly errorCode: "exit_nonzero"
-        readonly exitCode: number
-      }
-    })
-  | (ShellOutcomeInputBase & {
-      readonly result: "failed"
-      readonly evidence: ShellBackgroundTaskEvidenceBase & { readonly errorCode: "signaled"; readonly signal: string }
-    })
-  | (ShellOutcomeInputBase & {
-      readonly result: "failed"
-      readonly evidence: ShellBackgroundTaskEvidenceBase & {
-        readonly errorCode: Exclude<ShellBackgroundTaskErrorCode, "exit_nonzero" | "signaled">
-      }
-    })
-
-export type ShellBackgroundTaskOperationOutcome = ShellOutcomeBase & ShellBackgroundTaskOperationOutcomeInput
-
-export function shellBackgroundTaskOperationId(taskId: string): string {
-  return `shell/background_task/${taskId}`
-}
-
-export function isShellBackgroundTaskOperationOutcome(
-  outcome: OperationOutcome
-): outcome is ShellBackgroundTaskOperationOutcome {
-  if (outcome.capability !== "shell" || outcome.operation !== "background_task" || !isRecord(outcome.evidence)) {
-    return false
-  }
-  const evidence = outcome.evidence
-  if (
-    !hasOnlyOutcomeFields(evidence) ||
-    typeof evidence.taskId !== "string" ||
-    outcome.operationId !== shellBackgroundTaskOperationId(evidence.taskId) ||
-    (evidence.origin !== "requested" && evidence.origin !== "demoted") ||
-    !isNonNegativeInteger(evidence.outputBytes)
-  ) {
-    return false
-  }
-  if (outcome.result === "succeeded") {
-    return (
-      evidence.exitCode === 0 &&
-      evidence.errorCode === undefined &&
-      evidence.signal === undefined &&
-      evidence.cancellationCode === undefined
-    )
-  }
-  if (outcome.result === "cancelled") {
-    return (
-      (evidence.cancellationCode === "killed" || evidence.cancellationCode === "disposed") &&
-      evidence.errorCode === undefined &&
-      evidence.exitCode === undefined &&
-      evidence.signal === undefined
-    )
-  }
-  if (evidence.cancellationCode !== undefined) return false
-  if (evidence.errorCode === "exit_nonzero") {
-    return (
-      typeof evidence.exitCode === "number" &&
-      Number.isSafeInteger(evidence.exitCode) &&
-      evidence.exitCode > 0 &&
-      evidence.signal === undefined
-    )
-  }
-  if (evidence.errorCode === "signaled") {
-    return (
-      typeof evidence.signal === "string" &&
-      /^SIG[A-Z0-9]+$/u.test(evidence.signal) &&
-      Buffer.byteLength(evidence.signal) <= 32 &&
-      evidence.exitCode === undefined
-    )
-  }
-  return (
-    (evidence.errorCode === "timed_out" ||
-      evidence.errorCode === "output_limit" ||
-      evidence.errorCode === "execution_failed") &&
-    evidence.exitCode === undefined &&
-    evidence.signal === undefined
-  )
-}
-
-function hasOnlyOutcomeFields(value: Record<string, unknown>): boolean {
-  const fields = new Set(["taskId", "origin", "outputBytes", "errorCode", "exitCode", "signal", "cancellationCode"])
-  return Object.keys(value).every(field => fields.has(field))
-}
-
 export type ShellTaskOutcome =
   | { readonly type: "exited"; readonly exitCode: number }
   | { readonly type: "signaled"; readonly signal: string }
@@ -198,7 +73,7 @@ export interface ShellTaskOutputSnapshot {
 
 type ShellBackgroundOwnership =
   | { readonly type: "none" }
-  | { readonly type: "owned"; readonly origin: ShellBackgroundTaskOrigin; readonly startedAt: number }
+  | { readonly type: "owned"; readonly origin: BackgroundTaskOrigin; readonly startedAt: number }
 
 interface ShellTaskIdentity {
   readonly taskId: string
@@ -304,7 +179,7 @@ type StartingTask = OwnedShellTaskIdentity &
 type ForegroundTask = OwnedShellTaskIdentity &
   TaskResources & {
     readonly type: "foreground"
-    readonly child: ChildProcessWithoutNullStreams
+    readonly child: RawOwnedProcess
     readonly timeout: ReturnType<typeof setTimeout>
     readonly removeAbort: (() => void) | undefined
   }
@@ -312,7 +187,7 @@ type ForegroundTask = OwnedShellTaskIdentity &
 type BackgroundTask = OwnedShellTaskIdentity &
   TaskResources & {
     readonly type: "background"
-    readonly child: ChildProcessWithoutNullStreams
+    readonly child: RawOwnedProcess
     readonly timeout: ReturnType<typeof setTimeout>
     readonly removeAbort: undefined
   }
@@ -322,14 +197,18 @@ type RunningTask = ForegroundTask | BackgroundTask
 type StoppingTask = OwnedShellTaskIdentity &
   TaskResources & {
     readonly type: "stopping"
-    readonly child: ChildProcessWithoutNullStreams
+    readonly child: RawOwnedProcess
     readonly reason: ShellStopReason
     readonly failure: string | undefined
     readonly killTimer: ReturnType<typeof setTimeout>
   }
 
 type SettlingTask = OwnedShellTaskIdentity &
-  TaskResources & { readonly type: "settling"; readonly outcome: ShellTaskOutcome }
+  TaskResources & {
+    readonly type: "settling"
+    readonly child: RawOwnedProcess | undefined
+    readonly outcome: ShellTaskOutcome
+  }
 
 type CompletedTask = OwnedShellTaskIdentity & {
   readonly type: "completed"
@@ -351,9 +230,11 @@ export class SessionShell {
   readonly #listeners = new Set<(taskId: string) => void>()
   readonly #updateTimers = new Map<string, ReturnType<typeof setTimeout>>()
   readonly #lastUpdates = new Map<string, number>()
-  readonly #pendingOutcomes = new Map<string, ShellBackgroundTaskOperationOutcomeInput>()
-  #outcomeSink: ((outcome: ShellBackgroundTaskOperationOutcomeInput) => void) | undefined
-  #outcomeSinkBound = false
+  readonly #pendingResults = new Map<string, BackgroundTaskResultInput>()
+  #resultSink: ((result: BackgroundTaskResultInput) => void) | undefined
+  #resultSinkBound = false
+  #sessionShellInvariant: SessionShellInvariant | undefined
+  #taskAdmissionStarted = false
   #state: ShellOwnerState = { type: "open" }
   #outputDir: string | undefined
   #retainedOutputBytes = 0
@@ -367,14 +248,21 @@ export class SessionShell {
     this.#outputRoot = outputRoot
   }
 
-  bindOperationOutcomeSink(sink: (outcome: ShellBackgroundTaskOperationOutcomeInput) => void): void {
+  bindInvariants(registry: InvariantRegistry): void {
     this.#assertOpen()
-    if (this.#outcomeSinkBound) throw new Error("Shell operation outcome sink is already bound")
+    if (this.#sessionShellInvariant) throw new Error("Shell invariants are already bound")
+    if (this.#taskAdmissionStarted) throw new Error("Shell invariants must be bound before shell work")
+    this.#sessionShellInvariant = new SessionShellInvariant(registry)
+  }
+
+  bindBackgroundTaskResultSink(sink: (result: BackgroundTaskResultInput) => void): void {
+    this.#assertOpen()
+    if (this.#resultSinkBound) throw new Error("Shell background-task result sink is already bound")
     if ([...this.#tasks.values()].some(task => task.background.type === "owned")) {
-      throw new Error("Shell operation outcome sink must be bound before background work")
+      throw new Error("Shell background-task result sink must be bound before background work")
     }
-    this.#outcomeSinkBound = true
-    this.#outcomeSink = sink
+    this.#resultSinkBound = true
+    this.#resultSink = sink
   }
 
   subscribe(listener: (taskId: string) => void): () => void {
@@ -394,9 +282,9 @@ export class SessionShell {
     return task ? Object.freeze(this.#snapshot(task)) : undefined
   }
 
-  retryPendingOutcomes(): void {
+  retryPendingResults(): void {
     this.#assertOpen()
-    this.#flushPendingOutcomes()
+    this.#flushPendingResults()
   }
 
   list(limit: number): ShellTaskListSnapshot {
@@ -421,7 +309,7 @@ export class SessionShell {
   ): Promise<ShellRunResult> {
     this.#assertOpen()
     this.#evictExpired()
-    this.#flushPendingOutcomes()
+    this.#flushPendingResults()
     assertRunRequest(request, this.limits)
     if (signal?.aborted) throw new Error("Command aborted")
     if (!request.background && this.#hasForegroundAdmission()) {
@@ -429,7 +317,7 @@ export class SessionShell {
     }
     if (
       request.background &&
-      (this.#backgroundCount() >= this.limits.maxBackgroundTasks || this.#backgroundOutcomeCapacityFull())
+      (this.#backgroundCount() >= this.limits.maxBackgroundTasks || this.#backgroundResultCapacityFull())
     ) {
       throw new ShellRunAdmissionError(
         "background-capacity",
@@ -437,6 +325,7 @@ export class SessionShell {
       )
     }
 
+    this.#taskAdmissionStarted = true
     const taskId = crypto.randomUUID()
     const startedAt = Date.now()
     const identity: OwnedShellTaskIdentity = {
@@ -468,6 +357,10 @@ export class SessionShell {
       onUpdate
     }
     this.#tasks.set(taskId, starting)
+    this.#sessionShellInvariant?.taskIntroduced(taskId)
+    if (identity.background.type === "owned") {
+      this.#sessionShellInvariant?.backgroundOwned(taskId, identity.background.origin, identity.background.startedAt)
+    }
     this.#assertStableInvariants()
     this.#emit(taskId)
     if (this.#state.type !== "open") {
@@ -475,9 +368,19 @@ export class SessionShell {
       return toolSettled.promise
     }
 
-    let child: ChildProcessWithoutNullStreams
+    let child: RawOwnedProcess
     try {
-      child = spawnShell(request.command, this.cwd)
+      child = spawnOwnedProcess({
+        type: "raw",
+        pipeAdapter: "node",
+        command:
+          process.platform === "win32"
+            ? [process.env.ComSpec ?? "C:\\Windows\\System32\\cmd.exe", "/d", "/s", "/c", request.command]
+            : [process.env.SHELL ?? "/bin/bash", "-lc", request.command],
+        cwd: this.cwd,
+        env: process.env,
+        signalUntrackedProcessGroup: true
+      })
     } catch (cause) {
       this.#beginSettlement(starting, { type: "failed", message: errorMessage(cause) })
       return toolSettled.promise
@@ -500,10 +403,20 @@ export class SessionShell {
       : { ...identity, type: "foreground", child, timeout, removeAbort, output, processSettled, toolSettled, onUpdate }
     this.#tasks.set(taskId, running)
     this.#assertStableInvariants()
+    const outputSettled = Promise.all([streamSettled(child.stdout), streamSettled(child.stderr)])
     output.pipe(child.stdout)
     output.pipe(child.stderr)
-    child.once("error", cause => this.#onProcessError(taskId, cause))
-    child.once("close", (code, processSignal) => this.#onProcessClose(taskId, code, processSignal))
+    void Promise.all([child.exited, outputSettled]).then(
+      ([exit]) => {
+        if (exit.error) this.#onProcessError(taskId, exit.error)
+        else this.#onProcessClose(taskId, exit.code, exit.signal)
+        return undefined
+      },
+      cause => {
+        this.#onProcessError(taskId, cause instanceof Error ? cause : new Error("Shell output failed"))
+        return undefined
+      }
+    )
 
     if (running.type === "background") {
       toolSettled.resolve({ type: "backgrounded", task: this.#snapshot(running) })
@@ -517,21 +430,23 @@ export class SessionShell {
 
   demoteForeground(): ShellDemotionResult {
     this.#assertOpen()
-    this.#flushPendingOutcomes()
+    this.#flushPendingResults()
     const task = this.#foregroundTask()
     if (!task) return { type: "none" }
-    if (this.#backgroundCount() >= this.limits.maxBackgroundTasks || this.#backgroundOutcomeCapacityFull()) {
+    if (this.#backgroundCount() >= this.limits.maxBackgroundTasks || this.#backgroundResultCapacityFull()) {
       return { type: "capacity_exceeded" }
     }
 
     task.removeAbort?.()
+    const startedAt = Date.now()
     const background: BackgroundTask = {
       ...task,
       type: "background",
-      background: { type: "owned", origin: "demoted", startedAt: Date.now() },
+      background: { type: "owned", origin: "demoted", startedAt },
       removeAbort: undefined
     }
     this.#tasks.set(task.taskId, background)
+    this.#sessionShellInvariant?.backgroundOwned(task.taskId, "demoted", startedAt)
     this.#assertStableInvariants()
     const snapshot = this.#snapshot(background)
     task.toolSettled.resolve({ type: "backgrounded", task: snapshot })
@@ -613,21 +528,28 @@ export class SessionShell {
       )
       if (!completed) {
         failure = new Error("Shell process shutdown timed out")
+        const releases: Promise<void>[] = []
         for (const task of this.#tasks.values()) {
-          if (task.type !== "completed") this.#forceDisposed(task)
+          if (task.type !== "completed") releases.push(this.#forceDisposed(task))
         }
+        await Promise.allSettled(releases)
       }
     }
 
-    this.#flushPendingOutcomes()
-    if (this.#pendingOutcomes.size > 0) failure ??= new Error("Could not persist shell operation outcomes")
-    this.#pendingOutcomes.clear()
-    this.#outcomeSink = undefined
+    this.#flushPendingResults()
+    if (this.#pendingResults.size > 0) failure ??= new Error("Could not persist shell background-task results")
+    this.#pendingResults.clear()
+    this.#resultSink = undefined
     for (const taskId of this.#tasks.keys()) this.#forgetTask(taskId)
     if (this.#outputDir) rmSync(this.#outputDir, { recursive: true, force: true })
     this.#outputDir = undefined
     this.#listeners.clear()
     this.#assertTerminalCleanup()
+    try {
+      if (!failure) this.#sessionShellInvariant?.disposed()
+    } finally {
+      this.#sessionShellInvariant?.dispose()
+    }
     if (failure) throw failure
   }
 
@@ -643,12 +565,12 @@ export class SessionShell {
     return undefined
   }
 
-  #backgroundOutcomeCapacityFull(): boolean {
-    return this.#backgroundOutcomeObligations() >= this.limits.maxCompletedTasks
+  #backgroundResultCapacityFull(): boolean {
+    return this.#backgroundResultObligations() >= this.limits.maxCompletedTasks
   }
 
-  #backgroundOutcomeObligations(): number {
-    let obligations = this.#pendingOutcomes.size
+  #backgroundResultObligations(): number {
+    let obligations = this.#pendingResults.size
     for (const task of this.#tasks.values()) {
       if (task.background.type === "owned" && task.type !== "completed") obligations++
     }
@@ -668,8 +590,8 @@ export class SessionShell {
     if (!task || (task.type !== "foreground" && task.type !== "background")) return false
     clearTimeout(task.timeout)
     task.removeAbort?.()
-    kill(task.child, "SIGTERM")
-    const killTimer = setTimeout(() => kill(task.child, "SIGKILL"), this.limits.killGraceMs)
+    task.child.terminate(false)
+    const killTimer = setTimeout(() => task.child.terminate(true), this.limits.killGraceMs)
     const stopping: StoppingTask = { ...task, type: "stopping", reason, failure, killTimer }
     this.#tasks.set(taskId, stopping)
     this.#assertStableInvariants()
@@ -702,23 +624,31 @@ export class SessionShell {
     } else if (task.type === "stopping") {
       clearTimeout(task.killTimer)
     }
-    const settling: SettlingTask = { ...task, type: "settling", outcome }
+    const settling: SettlingTask = {
+      ...task,
+      type: "settling",
+      child: "child" in task ? task.child : undefined,
+      outcome
+    }
     this.#tasks.set(task.taskId, settling)
     this.#assertStableInvariants()
     this.#emit(task.taskId)
     void this.#finishSettlement(settling)
   }
 
-  #forceDisposed(task: Exclude<ShellTask, CompletedTask>): void {
+  async #forceDisposed(task: Exclude<ShellTask, CompletedTask>): Promise<void> {
     if (task.type === "foreground" || task.type === "background") {
       clearTimeout(task.timeout)
       task.removeAbort?.()
-      kill(task.child, "SIGKILL")
+      task.child.terminate(true)
     } else if (task.type === "stopping") {
       clearTimeout(task.killTimer)
-      kill(task.child, "SIGKILL")
+      task.child.terminate(true)
     }
     task.output.abandon()
+    if ("child" in task) await task.child?.dispose()
+    if (this.#tasks.get(task.taskId) !== task) return
+
     const completedAt = Date.now()
     const completed: CompletedTask = {
       taskId: task.taskId,
@@ -734,7 +664,8 @@ export class SessionShell {
       expiresAt: completedAt
     }
     this.#tasks.set(task.taskId, completed)
-    this.#recordBackgroundOutcome(completed)
+    this.#observeSettlement(completed)
+    this.#recordBackgroundResult(completed)
     const snapshot = this.#snapshot(completed)
     task.processSettled.resolve(snapshot)
     task.toolSettled.resolve({ type: "completed", task: snapshot })
@@ -747,6 +678,7 @@ export class SessionShell {
     } catch (cause) {
       outcome = { type: "failed", message: errorMessage(cause) }
     }
+    await task.child?.dispose()
     const current = this.#tasks.get(task.taskId)
     if (current !== task) return
 
@@ -765,7 +697,8 @@ export class SessionShell {
       expiresAt: completedAt + this.limits.completedTaskTtlMs
     }
     this.#tasks.set(task.taskId, completed)
-    this.#recordBackgroundOutcome(completed)
+    this.#observeSettlement(completed)
+    this.#recordBackgroundResult(completed)
     this.#enforceCompletedLimit()
     this.#scheduleEviction()
     this.#assertStableInvariants()
@@ -775,25 +708,37 @@ export class SessionShell {
     this.#emit(task.taskId)
   }
 
-  #recordBackgroundOutcome(task: CompletedTask): void {
-    if (task.background.type === "none" || !this.#outcomeSink) return
-    const outcome = backgroundTaskOutcome(task)
-    try {
-      this.#outcomeSink(outcome)
-    } catch {
-      this.#pendingOutcomes.set(task.taskId, outcome)
-    }
+  #observeSettlement(task: CompletedTask): void {
+    this.#sessionShellInvariant?.taskSettled(
+      task.taskId,
+      task.outcome,
+      task.completedAt,
+      task.output.snapshot().truncation.totalBytes
+    )
   }
 
-  #flushPendingOutcomes(): void {
-    if (!this.#outcomeSink) return
-    for (const [taskId, outcome] of this.#pendingOutcomes) {
+  #recordBackgroundResult(task: CompletedTask): void {
+    if (task.background.type === "none" || !this.#resultSink) return
+    const result = backgroundTaskResult(task)
+    try {
+      this.#resultSink(result)
+    } catch {
+      this.#pendingResults.set(task.taskId, result)
+      return
+    }
+    this.#sessionShellInvariant?.backgroundResult(result)
+  }
+
+  #flushPendingResults(): void {
+    if (!this.#resultSink) return
+    for (const [taskId, result] of this.#pendingResults) {
       try {
-        this.#outcomeSink(outcome)
-        this.#pendingOutcomes.delete(taskId)
+        this.#resultSink(result)
       } catch {
         break
       }
+      this.#pendingResults.delete(taskId)
+      this.#sessionShellInvariant?.backgroundResult(result)
     }
   }
 
@@ -974,8 +919,8 @@ export class SessionShell {
     invariant(backgroundTasks <= this.limits.maxBackgroundTasks, "background task capacity was exceeded")
     invariant(completedTasks <= this.limits.maxCompletedTasks, "completed task capacity was exceeded")
     invariant(
-      this.#backgroundOutcomeObligations() <= this.limits.maxCompletedTasks,
-      "shell outcome capacity was exceeded"
+      this.#backgroundResultObligations() <= this.limits.maxCompletedTasks,
+      "shell background-task result capacity was exceeded"
     )
     invariant(retainedOutputBytes === this.#retainedOutputBytes, "retained output accounting diverged")
     this.#assertRetainedOutputBound()
@@ -995,8 +940,8 @@ export class SessionShell {
     invariant(this.#evictionTimer === undefined, "disposed shell retains its eviction timer")
     invariant(this.#outputDir === undefined, "disposed shell retains its output directory")
     invariant(this.#listeners.size === 0, "disposed shell retains listeners")
-    invariant(this.#pendingOutcomes.size === 0, "disposed shell retains operation outcomes")
-    invariant(this.#outcomeSink === undefined, "disposed shell retains its operation outcome sink")
+    invariant(this.#pendingResults.size === 0, "disposed shell retains background-task results")
+    invariant(this.#resultSink === undefined, "disposed shell retains its background-task result sink")
   }
 
   #outputPath(taskId: string): string {
@@ -1217,44 +1162,31 @@ class TaskOutput {
   }
 }
 
-function backgroundTaskOutcome(task: CompletedTask): ShellBackgroundTaskOperationOutcomeInput {
-  if (task.background.type !== "owned") throw new Error("Foreground shell task has no background outcome")
+function backgroundTaskResult(task: CompletedTask): BackgroundTaskResultInput {
+  if (task.background.type !== "owned") throw new Error("Foreground shell task has no background result")
   const common = {
-    capability: "shell",
-    operation: "background_task",
-    operationId: shellBackgroundTaskOperationId(task.taskId),
-    durationMs: Math.max(0, task.completedAt - task.background.startedAt)
-  } as const
-  const evidence = {
     taskId: task.taskId,
     origin: task.background.origin,
+    durationMs: Math.max(0, task.completedAt - task.background.startedAt),
     outputBytes: task.output.snapshot().truncation.totalBytes
   } as const
   switch (task.outcome.type) {
     case "exited":
       return task.outcome.exitCode === 0
-        ? { ...common, result: "succeeded", evidence: { ...evidence, exitCode: 0 } }
-        : {
-            ...common,
-            result: "failed",
-            evidence: { ...evidence, errorCode: "exit_nonzero", exitCode: task.outcome.exitCode }
-          }
+        ? { ...common, result: "succeeded", exitCode: 0 }
+        : { ...common, result: "failed", errorCode: "exit_nonzero", exitCode: task.outcome.exitCode }
     case "signaled":
-      return {
-        ...common,
-        result: "failed",
-        evidence: { ...evidence, errorCode: "signaled", signal: task.outcome.signal }
-      }
+      return { ...common, result: "failed", errorCode: "signaled", signal: task.outcome.signal }
     case "timed_out":
-      return { ...common, result: "failed", evidence: { ...evidence, errorCode: "timed_out" } }
+      return { ...common, result: "failed", errorCode: "timed_out" }
     case "output_limit":
-      return { ...common, result: "failed", evidence: { ...evidence, errorCode: "output_limit" } }
+      return { ...common, result: "failed", errorCode: "output_limit" }
     case "failed":
-      return { ...common, result: "failed", evidence: { ...evidence, errorCode: "execution_failed" } }
+      return { ...common, result: "failed", errorCode: "execution_failed" }
     case "killed":
-      return { ...common, result: "cancelled", evidence: { ...evidence, cancellationCode: "killed" } }
+      return { ...common, result: "cancelled", cancellationCode: "killed" }
     case "disposed":
-      return { ...common, result: "cancelled", evidence: { ...evidence, cancellationCode: "disposed" } }
+      return { ...common, result: "cancelled", cancellationCode: "disposed" }
     case "aborted":
       throw new Error("Background shell task cannot settle as aborted")
     default:
@@ -1281,22 +1213,25 @@ function stopOutcome(task: StoppingTask): ShellTaskOutcome {
   }
 }
 
-function spawnShell(command: string, cwd: string): ChildProcessWithoutNullStreams {
-  if (process.platform === "win32") {
-    return spawn(process.env.ComSpec ?? "cmd.exe", ["/d", "/s", "/c", command], { cwd, windowsHide: true })
-  }
-  return spawn(process.env.SHELL ?? "/bin/bash", ["-lc", command], { cwd, detached: true })
-}
-
-function kill(child: ChildProcessWithoutNullStreams, signal: NodeJS.Signals): void {
-  if (!child.pid) return
-  if (process.platform === "win32") {
-    spawn("taskkill", ["/pid", String(child.pid), "/t", "/f"], { stdio: "ignore", windowsHide: true })
-    return
-  }
-  try {
-    process.kill(-child.pid, signal)
-  } catch {}
+function streamSettled(stream: NodeJS.ReadableStream): Promise<void> {
+  if ("readableEnded" in stream && stream.readableEnded === true) return Promise.resolve()
+  return new Promise((resolve, reject) => {
+    const settle = (): void => {
+      stream.removeListener("end", settle)
+      stream.removeListener("close", settle)
+      stream.removeListener("error", fail)
+      resolve()
+    }
+    const fail = (cause: Error): void => {
+      stream.removeListener("end", settle)
+      stream.removeListener("close", settle)
+      stream.removeListener("error", fail)
+      reject(cause)
+    }
+    stream.once("end", settle)
+    stream.once("close", settle)
+    stream.once("error", fail)
+  })
 }
 
 function bindAbort(signal: AbortSignal, abort: () => void): () => void {

@@ -3,16 +3,11 @@ import { resolve } from "node:path"
 import { PassThrough, Writable } from "node:stream"
 
 import type { ExtensionLoadPlan, ExtensionSource } from "../src/extensions/discovery.js"
+import { ExtensionHost, type ExtensionHostTimeouts } from "../src/extensions/host.js"
+import type { ExtensionWorkerExit, ExtensionWorkerProcess, SpawnExtensionWorker } from "../src/extensions/process.js"
 import {
-  ExtensionHost,
-  type ExtensionHostTimeouts,
-  type ExtensionWorkerExit,
-  type ExtensionWorkerProcess,
-  type SpawnExtensionWorker
-} from "../src/extensions/host.js"
-import {
-  encodeExtensionProtocolFrame,
-  ExtensionProtocolDecoder,
+  extensionFramingLabel,
+  extensionFramingLimits,
   extensionProtocolVersion,
   maxExtensionDiagnostics,
   maxExtensionLogBytesPerStream,
@@ -21,7 +16,12 @@ import {
   type WorkerMessage,
   validateHostMessage
 } from "../src/extensions/protocol.js"
+import { encodeFramedJson, FramedJsonDecoder } from "../src/processes/framed-json.js"
 import { testExtensionContext } from "./extension-context.js"
+
+function frame(value: unknown): Buffer {
+  return encodeFramedJson(value, extensionFramingLimits, extensionFramingLabel)
+}
 
 const testTimeouts: ExtensionHostTimeouts = Object.freeze({
   startupMs: 100,
@@ -929,7 +929,7 @@ class TestWorkerProcess implements ExtensionWorkerProcess {
   disposed = false
   readonly #plan: ExtensionLoadPlan
   readonly #behavior: TestWorkerBehavior
-  readonly #decoder = new ExtensionProtocolDecoder(validateHostMessage)
+  readonly #decoder = new FramedJsonDecoder(validateHostMessage, extensionFramingLimits, extensionFramingLabel)
   readonly #resolveExit: (exit: ExtensionWorkerExit) => void
   #generation = 0
   #shutdownRequestId: number | undefined
@@ -956,7 +956,7 @@ class TestWorkerProcess implements ExtensionWorkerProcess {
   }
 
   send(message: WorkerMessage): void {
-    if (!this.#exited) this.protocol.write(encodeExtensionProtocolFrame(message))
+    if (!this.#exited) this.protocol.write(frame(message))
   }
 
   failStartup(message: string): void {
@@ -1073,7 +1073,7 @@ class TestWorkerProcess implements ExtensionWorkerProcess {
     if (message.type === "tool_invoke") {
       if (this.#behavior.type === "malformed_tool") {
         this.protocol.write(
-          encodeExtensionProtocolFrame({
+          frame({
             type: "tool_result",
             generation: message.generation,
             requestId: message.requestId,

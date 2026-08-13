@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test"
 
 import { isRecord } from "../src/guards.js"
-import { runRpcMode, type RpcMessagePage, type RpcOutcomePage, type RpcServerFrame } from "../src/rpc/rpc-mode.js"
+import { runRpcMode, type RpcMessagePage, type RpcServerFrame } from "../src/rpc/rpc-mode.js"
 import {
   createModels,
   createTestAgentRuntime,
@@ -607,93 +607,6 @@ test("RPC releases request IDs after failed and successful settlement", async ()
   }
 })
 
-test("RPC exposes canonical operation outcomes through matching live events and bounded pages", async () => {
-  const models = createModels()
-  const faux = fauxProvider()
-  models.setProvider(faux.provider)
-  faux.setResponses([
-    fauxAssistantMessage(
-      fauxToolCall(
-        "bash",
-        { command: `node -e "setTimeout(() => {}, 20)"`, background: true },
-        { id: "rpc-background-1" }
-      ),
-      { stopReason: "toolUse" }
-    ),
-    fauxAssistantMessage(
-      fauxToolCall(
-        "bash",
-        { command: `node -e "setTimeout(() => {}, 40)"`, background: true },
-        { id: "rpc-background-2" }
-      ),
-      { stopReason: "toolUse" }
-    ),
-    fauxAssistantMessage("Background work admitted.")
-  ])
-  const runtime = await createTestAgentRuntime({ cwd: process.cwd(), models, session: { type: "new", persist: false } })
-  const input = new RpcTestInput()
-  const output = new RpcTestOutput()
-  const running = runRpcMode(runtime.session, { input, writer: output })
-
-  try {
-    await output.frame(frame => frame.type === "ready")
-    input.send({
-      version: 1,
-      id: "outcome-prompt",
-      method: "session.prompt",
-      params: { delivery: "direct", text: "Start two background tasks." }
-    })
-    expect(await output.response("outcome-prompt")).toMatchObject({ ok: true })
-    await Promise.race([
-      output.frame(
-        frame =>
-          frame.type === "session_event" &&
-          frame.event.type === "operation_outcome" &&
-          output.frames.filter(
-            candidate => candidate.type === "session_event" && candidate.event.type === "operation_outcome"
-          ).length === 2
-      ),
-      Bun.sleep(2_000).then(() => {
-        const types = output.frames.map(frame => (frame.type === "session_event" ? frame.event.type : frame.type))
-        throw new Error(`Expected two live operation outcomes; received ${types.join(", ")}`)
-      })
-    ])
-
-    const live = output.frames.flatMap(frame =>
-      frame.type === "session_event" && frame.event.type === "operation_outcome" ? [frame.event.outcome] : []
-    )
-    const appended = output.frames.filter(
-      frame =>
-        frame.type === "session_event" &&
-        frame.event.type === "entry_appended" &&
-        frame.event.entry.type === "operation_outcome"
-    )
-    expect(live).toHaveLength(2)
-    expect(appended).toHaveLength(2)
-
-    input.send({ version: 1, id: "outcomes-1", method: "session.get_outcomes", params: { start: 0, limit: 1 } })
-    const first = await output.response("outcomes-1")
-    expect(first).toMatchObject({ ok: true, result: { start: 0, total: 2, nextStart: 1 } })
-    if (!first.ok || !isOutcomePage(first.result)) throw new Error("Expected first outcome page")
-
-    input.send({ version: 1, id: "outcomes-2", method: "session.get_outcomes", params: { start: 1 } })
-    const second = await output.response("outcomes-2")
-    expect(second).toMatchObject({ ok: true, result: { start: 1, total: 2, nextStart: null } })
-    if (!second.ok || !isOutcomePage(second.result)) throw new Error("Expected second outcome page")
-    expect([...first.result.outcomes, ...second.result.outcomes]).toEqual(live)
-
-    input.send({ version: 1, id: "outcome-idle", method: "session.await_idle" })
-    expect(await output.response("outcome-idle")).toMatchObject({ ok: true })
-
-    input.close()
-    expect(await running).toEqual({ type: "eof" })
-  } finally {
-    input.close()
-    runtime.session.dispose()
-    await runtime.session.waitForIdle()
-  }
-}, 15_000)
-
 test("RPC exposes committed custom entries while message pages retain presentation policy", async () => {
   const models = createModels()
   const runtime = await createTestAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
@@ -1136,16 +1049,6 @@ function isMessagePage(value: unknown): value is RpcMessagePage {
     typeof value.total === "number" &&
     (value.nextStart === null || typeof value.nextStart === "number") &&
     Array.isArray(value.messages)
-  )
-}
-
-function isOutcomePage(value: unknown): value is RpcOutcomePage {
-  return (
-    isRecord(value) &&
-    typeof value.start === "number" &&
-    typeof value.total === "number" &&
-    (value.nextStart === null || typeof value.nextStart === "number") &&
-    Array.isArray(value.outcomes)
   )
 }
 

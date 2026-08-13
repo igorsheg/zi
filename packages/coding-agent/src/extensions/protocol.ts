@@ -1,5 +1,4 @@
 import { isAbsolute } from "node:path"
-import type { Writable } from "node:stream"
 
 import type {
   ExtensionAgentSettledEvent,
@@ -19,6 +18,7 @@ import type {
 } from "@with-zi/extension-api"
 
 import { isRecord } from "../guards.js"
+import type { FramedJsonLimits } from "../processes/framed-json.js"
 import {
   maxCustomJsonBytes,
   maxCustomStateEntries,
@@ -37,6 +37,12 @@ export const maxExtensionProtocolFrameBytes = 4 * 1024 * 1024
 export const maxExtensionPendingRequests = 128
 export const maxExtensionQueuedWriteBytes = 8 * 1024 * 1024
 export const maxExtensionQueuedWrites = 1024
+export const extensionFramingLimits: FramedJsonLimits = Object.freeze({
+  maxFrameBytes: maxExtensionProtocolFrameBytes,
+  maxQueuedFrames: maxExtensionQueuedWrites,
+  maxQueuedBytes: maxExtensionQueuedWriteBytes
+})
+export const extensionFramingLabel = "Extension protocol"
 export const maxExtensionDiagnostics = 256
 export const maxExtensionDiagnosticMessageBytes = 16 * 1024
 export const maxExtensionDiagnosticStackBytes = 64 * 1024
@@ -402,201 +408,6 @@ export class ExtensionProtocolError extends Error {
     super(message, options)
     this.name = "ExtensionProtocolError"
   }
-}
-
-type DecoderState =
-  | { readonly type: "open" }
-  | { readonly type: "failed"; readonly error: Error }
-  | { readonly type: "ended" }
-
-export class ExtensionProtocolDecoder<T> {
-  readonly #validate: (value: unknown) => T
-  #state: DecoderState = { type: "open" }
-  #buffer = Buffer.alloc(0)
-
-  constructor(validate: (value: unknown) => T) {
-    this.#validate = validate
-  }
-
-  push(chunk: Uint8Array): readonly T[] {
-    if (this.#state.type === "failed") throw this.#state.error
-    if (this.#state.type === "ended") throw new ExtensionProtocolError("Cannot decode after protocol input ended")
-    if (chunk.byteLength === 0) return []
-
-    try {
-      const incoming = Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength)
-      const data = this.#buffer.byteLength === 0 ? incoming : Buffer.concat([this.#buffer, incoming])
-      const messages: T[] = []
-      let offset = 0
-
-      while (data.byteLength - offset >= 4) {
-        const length = data.readUInt32BE(offset)
-        if (length === 0) throw new ExtensionProtocolError("Extension protocol frames cannot be empty")
-        if (length > maxExtensionProtocolFrameBytes) {
-          throw new ExtensionProtocolError(
-            `Extension protocol frames cannot exceed ${maxExtensionProtocolFrameBytes} bytes`
-          )
-        }
-        if (data.byteLength - offset - 4 < length) break
-        const payload = data.subarray(offset + 4, offset + 4 + length)
-        messages.push(this.#validate(parsePayload(payload)))
-        offset += 4 + length
-      }
-
-      this.#buffer = offset === data.byteLength ? Buffer.alloc(0) : Buffer.from(data.subarray(offset))
-      return messages
-    } catch (cause) {
-      const error = protocolError(cause)
-      this.#buffer = Buffer.alloc(0)
-      this.#state = { type: "failed", error }
-      throw error
-    }
-  }
-
-  end(): void {
-    if (this.#state.type === "failed") throw this.#state.error
-    if (this.#state.type === "ended") return
-    if (this.#buffer.byteLength !== 0) {
-      const error = new ExtensionProtocolError("Extension protocol input ended with a partial frame")
-      this.#buffer = Buffer.alloc(0)
-      this.#state = { type: "failed", error }
-      throw error
-    }
-    this.#state = { type: "ended" }
-  }
-}
-
-interface QueuedWrite {
-  readonly frame: Buffer
-  resolve(): void
-  reject(cause: unknown): void
-}
-
-type WriterState =
-  | { readonly type: "idle" }
-  | { readonly type: "writing"; readonly write: QueuedWrite }
-  | { readonly type: "failed"; readonly error: Error }
-  | { readonly type: "disposed" }
-
-export class ExtensionProtocolWriter {
-  readonly #sink: Writable
-  readonly #queue: QueuedWrite[] = []
-  readonly #onError: (cause: Error) => void
-  readonly #onFailure: ((cause: Error) => void) | undefined
-  #state: WriterState = { type: "idle" }
-  #queuedBytes = 0
-
-  constructor(sink: Writable, onFailure?: (cause: Error) => void) {
-    this.#sink = sink
-    this.#onFailure = onFailure
-    this.#onError = cause => this.#fail(cause)
-    sink.on("error", this.#onError)
-  }
-
-  send(value: unknown): Promise<void> {
-    if (this.#state.type === "failed") return Promise.reject(this.#state.error)
-    if (this.#state.type === "disposed")
-      return Promise.reject(new ExtensionProtocolError("Protocol writer is disposed"))
-
-    let frame: Buffer
-    try {
-      frame = encodeExtensionProtocolFrame(value)
-    } catch (cause) {
-      return Promise.reject(cause)
-    }
-    const writeCount = this.#queue.length + (this.#state.type === "writing" ? 1 : 0)
-    if (writeCount >= maxExtensionQueuedWrites) {
-      return Promise.reject(
-        new ExtensionProtocolError(
-          `Extension protocol writers cannot queue more than ${maxExtensionQueuedWrites} frames`
-        )
-      )
-    }
-    if (frame.byteLength > maxExtensionQueuedWriteBytes - this.#queuedBytes) {
-      return Promise.reject(
-        new ExtensionProtocolError(
-          `Extension protocol writers cannot queue more than ${maxExtensionQueuedWriteBytes} bytes`
-        )
-      )
-    }
-
-    const promise = new Promise<void>((resolve, reject) => {
-      this.#queue.push({ frame, resolve, reject })
-    })
-    this.#queuedBytes += frame.byteLength
-    if (this.#state.type === "idle") this.#writeNext()
-    return promise
-  }
-
-  fail(cause: unknown): void {
-    this.#fail(cause)
-  }
-
-  dispose(): void {
-    if (this.#state.type === "disposed") return
-    const error = new ExtensionProtocolError("Protocol writer was disposed before queued output settled")
-    const active = this.#state.type === "writing" ? this.#state.write : undefined
-    this.#state = { type: "disposed" }
-    this.#queuedBytes = 0
-    active?.reject(error)
-    for (const write of this.#queue.splice(0)) write.reject(error)
-    this.#sink.off("error", this.#onError)
-  }
-
-  #writeNext(): void {
-    const write = this.#queue.shift()
-    if (!write) {
-      this.#state = { type: "idle" }
-      return
-    }
-    this.#state = { type: "writing", write }
-    try {
-      this.#sink.write(write.frame, error => {
-        if (this.#state.type !== "writing" || this.#state.write !== write) return
-        if (error) {
-          this.#fail(error)
-          return
-        }
-        this.#queuedBytes -= write.frame.byteLength
-        this.#state = { type: "idle" }
-        write.resolve()
-        this.#writeNext()
-      })
-    } catch (cause) {
-      this.#fail(cause)
-    }
-  }
-
-  #fail(cause: unknown): void {
-    if (this.#state.type === "failed" || this.#state.type === "disposed") return
-    const error = protocolError(cause)
-    const active = this.#state.type === "writing" ? this.#state.write : undefined
-    this.#state = { type: "failed", error }
-    this.#queuedBytes = 0
-    active?.reject(error)
-    for (const write of this.#queue.splice(0)) write.reject(error)
-    this.#onFailure?.(error)
-  }
-}
-
-export function encodeExtensionProtocolFrame(value: unknown): Buffer {
-  let serialized: string | undefined
-  try {
-    serialized = JSON.stringify(value)
-  } catch (cause) {
-    throw new ExtensionProtocolError("Extension protocol message could not be serialized", { cause })
-  }
-  if (serialized === undefined) throw new ExtensionProtocolError("Extension protocol messages must be JSON values")
-  const payload = Buffer.from(serialized)
-  if (payload.byteLength === 0 || payload.byteLength > maxExtensionProtocolFrameBytes) {
-    throw new ExtensionProtocolError(
-      `Extension protocol frames must contain 1 to ${maxExtensionProtocolFrameBytes} bytes`
-    )
-  }
-  const frame = Buffer.allocUnsafe(4 + payload.byteLength)
-  frame.writeUInt32BE(payload.byteLength, 0)
-  payload.copy(frame, 4)
-  return frame
 }
 
 export function validateHostMessage(value: unknown): HostMessage {
@@ -1074,20 +885,6 @@ export function boundedExtensionLoadDiagnostic(diagnostic: ExtensionDiagnostic):
     severity: diagnostic.severity,
     message: boundedText(diagnostic.message, maxExtensionLoadDiagnosticMessageBytes)
   })
-}
-
-function parsePayload(payload: Buffer): unknown {
-  let text: string
-  try {
-    text = new TextDecoder("utf-8", { fatal: true }).decode(payload)
-  } catch (cause) {
-    throw new ExtensionProtocolError("Extension protocol payload is not valid UTF-8", { cause })
-  }
-  try {
-    return JSON.parse(text)
-  } catch (cause) {
-    throw new ExtensionProtocolError("Extension protocol payload is not valid JSON", { cause })
-  }
 }
 
 function extensionLoadPlan(value: unknown): ExtensionLoadPlan {
@@ -1648,9 +1445,4 @@ function shutdownReason(value: unknown): ExtensionShutdownReason {
     throw new ExtensionProtocolError("Unknown extension shutdown reason")
   }
   return value
-}
-
-function protocolError(cause: unknown): ExtensionProtocolError {
-  if (cause instanceof ExtensionProtocolError) return cause
-  return new ExtensionProtocolError(cause instanceof Error ? cause.message : String(cause), { cause })
 }

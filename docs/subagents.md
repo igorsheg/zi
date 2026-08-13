@@ -165,9 +165,9 @@ Custom orchestration is optional; it is not required to use Markdown or programm
 
 ## Lifetime and safety
 
-The parent `AgentSession` owns admitted child processes. Zi enforces child concurrency, runtime names, RPC framing, output retention, cancellation, work and wait bounds, credential and cwd propagation, process-tree containment, durable operation outcomes, and forced cleanup.
+The parent `AgentSession` owns admitted child processes. Zi enforces child concurrency, runtime names, RPC framing, output retention, cancellation, work and wait bounds, credential and cwd propagation, process-tree containment, durable work results, and forced cleanup.
 
-Each settled work cycle records one model-invisible outcome keyed by its runtime name and work-cycle number, including the selected profile when available, result, duration, omission facts, and a stable failure code. Hidden completion context and orchestration tool results deliver that evidence without creating additional outcomes.
+Each settled work cycle records one model-invisible `subagent_work_result` keyed by its runtime name and work-cycle number. It retains the selected profile when available, result, duration, omission facts, and a stable failure code. Spawn, send, assignment, interrupt, and close are control operations; they do not become journal records. Hidden completion context and orchestration tool results deliver work-cycle evidence without creating another result.
 
 A parent owns at most four live children and retains at most 32 completed cycles; new work is refused rather than evicting undelivered evidence. Completion output is clipped to 50 KiB, durable previews to 8 KiB, listed task summaries to 256 bytes, and shutdown settlement to a fixed bound.
 
@@ -190,5 +190,3 @@ Delivery follows the parent's own turn boundary. If the parent still has an acti
 - Once the child emits a relay request, cancellation stops the sender from waiting but does not retract that request; delivery may still complete.
 - Child sessions are not persistent; only their bounded evidence reaches the parent journal.
 - A child recovered from journal evidence after restart has no fabricated transcript and cannot be opened unless live transcript evidence is available.
-
-See [Operation outcomes](operation-outcomes.md) for the recorded shape of subagent work-cycle and control evidence.

@@ -28,7 +28,9 @@ import type {
   ExtensionSubagentProfile,
   ExtensionSubagentSnapshot
 } from "@with-zi/extension-api"
+import type { InvariantRegistry } from "@with-zi/invariants"
 
+import type { AgentSessionInvariant } from "./agent-session-invariant.js"
 import type {
   Authentication,
   AuthenticationInteraction,
@@ -65,7 +67,6 @@ import { validateActiveExtensionToolCatalog, type ExtensionToolRegistration } fr
 import { admitExtensionTools } from "./extensions/tools.js"
 import { isZiAgentMessage, type AgentMessage } from "./messages.js"
 import type { ModelRegistry } from "./model-registry.js"
-import type { OperationOutcome, OperationOutcomeInput } from "./operation-outcomes.js"
 import type { ZiPaths } from "./paths.js"
 import type { ProcessTreeTracker } from "./processes/process-tree.js"
 import { type ProjectFileSearch, type ProjectFileSearchResult } from "./project-file-search.js"
@@ -84,6 +85,7 @@ import {
   type CustomEntry,
   type CustomMessageEntry,
   type CustomMessageInput,
+  type MessageEntry,
   type SessionEntry,
   type SessionJournalMemoryDiagnostics,
   type SessionJson,
@@ -91,15 +93,13 @@ import {
   type SessionPromptHistoryEntry
 } from "./session-manager.js"
 import {
-  isShellBackgroundTaskOperationOutcome,
-  shellBackgroundTaskOperationId,
   type SessionShell,
-  type ShellBackgroundTaskOperationOutcomeInput,
   type ShellDemotionResult,
   type ShellKillResult,
   type ShellTaskSnapshot
 } from "./session-shell.js"
 import type { SettingsError, SettingsManager, SettingsScope } from "./settings-manager.js"
+import type { BackgroundTaskResultInput } from "./shell-result.js"
 import { expandSkillCommand, type Skill } from "./skills.js"
 import { builtinSlashCommands, type SlashCommand } from "./slash-commands.js"
 import { clipUtf8, type SubagentCompletion } from "./subagents/child-process.js"
@@ -220,7 +220,6 @@ export type AgentSessionEvent =
   | { type: "codex_fast_mode_changed"; enabled: boolean }
   | ({ type: "queue_update" } & QueuedInputs)
   | { type: "entry_appended"; entry: SessionEntry }
-  | { type: "operation_outcome"; outcome: OperationOutcome }
   | { type: "model_changed"; model: Model<Api> }
   | { type: "thinking_level_changed"; level: ThinkingLevel }
   | { type: "steering_mode_changed"; mode: QueueMode }
@@ -313,6 +312,8 @@ interface AgentSessionConfig {
   tools: readonly AgentTool[]
   toolSurface: ToolSurface | undefined
   reload: SessionReloadDeps
+  invariantRegistry: InvariantRegistry
+  agentSessionInvariant: AgentSessionInvariant
   codeMode?: CodeMode
   extensionHost?: ExtensionHost
   extensionContext: ExtensionContext
@@ -513,6 +514,8 @@ export class AgentSession {
   readonly settingsManager: SettingsManager
 
   readonly #agent: Agent
+  readonly #invariantRegistry: InvariantRegistry
+  readonly #agentSessionInvariant: AgentSessionInvariant
   readonly #authentication: Authentication
   readonly #modelRegistry: ModelRegistry
   readonly #reload: SessionReloadDeps
@@ -528,7 +531,7 @@ export class AgentSession {
   readonly #processTreeTracker: ProcessTreeTracker | undefined
   readonly #apiKeyProvider: string | undefined
   readonly #listeners = new Set<(event: AgentSessionEvent) => void>()
-  readonly #pendingShellCompletions = new Map<string, ShellBackgroundTaskOperationOutcomeInput>()
+  readonly #pendingShellCompletions = new Map<string, BackgroundTaskResultInput>()
   readonly #unsubscribeAgent: () => void
   readonly #unsubscribeShell: (() => void) | undefined
   readonly #unsubscribeWorkPlan: () => void
@@ -561,6 +564,8 @@ export class AgentSession {
 
   constructor(config: AgentSessionConfig) {
     this.#agent = config.agent
+    this.#invariantRegistry = config.invariantRegistry
+    this.#agentSessionInvariant = config.agentSessionInvariant
     this.#authentication = config.authentication
     this.#modelRegistry = config.modelRegistry
     this.#reload = config.reload
@@ -581,16 +586,23 @@ export class AgentSession {
     this.#processTreeTracker = config.processTreeTracker
     this.#apiKeyProvider = config.apiKeyProvider
     this.sessionManager = config.sessionManager
-    this.#shell?.bindOperationOutcomeSink(outcome => {
-      this.#admitShellCompletion(outcome)
+    this.#shell?.bindInvariants(this.#invariantRegistry)
+    this.#shell?.bindBackgroundTaskResultSink(input => {
+      this.#admitShellCompletion(input)
       try {
-        return this.#recordOutcome(outcome)
+        const result = this.sessionManager.appendBackgroundTaskResult(input)
+        this.#emitAll([{ type: "entry_appended", entry: result }])
       } catch (cause) {
-        this.#pendingShellCompletions.delete(outcome.operationId)
+        this.#pendingShellCompletions.delete(input.taskId)
         throw cause
       }
     })
-    this.#subagents?.bindOperationOutcomeSink((outcome, persisted) => this.#recordOutcome(outcome, persisted))
+    this.#subagents?.bindSubagentWorkResultSink((input, persisted) => {
+      const result = this.sessionManager.appendSubagentWorkResult(input)
+      persisted(result)
+      this.#emitAll([{ type: "entry_appended", entry: result }])
+      return result
+    })
     this.#restoreCompletionDeliveries()
     this.settingsManager = config.settingsManager
     this.#modelState = config.model ? { type: "selected", model: config.model } : { type: "unselected" }
@@ -1918,6 +1930,8 @@ export class AgentSession {
     this.#unsubscribeWorkPlan()
     this.#unsubscribeSubagents?.()
     this.#listeners.clear()
+    this.#agentSessionInvariant.dispose()
+    this.#invariantRegistry.dispose()
     cleanupSessionResources(this.sessionId)
     void settled.catch(() => {})
   }
@@ -2158,12 +2172,12 @@ export class AgentSession {
   }
 
   #deliverShellCompletions(): boolean {
-    this.#shell?.retryPendingOutcomes()
+    this.#shell?.retryPendingResults()
     let delivered = false
     for (const completion of this.#pendingShellCompletions.values()) {
       const committed = this.#appendCustomMessage(shellCompletionMessage(completion))
       this.#publishCustomMessage(committed)
-      this.#pendingShellCompletions.delete(completion.operationId)
+      this.#pendingShellCompletions.delete(completion.taskId)
       delivered = true
     }
     return delivered
@@ -2171,7 +2185,7 @@ export class AgentSession {
 
   #restoreCompletionDeliveries(): void {
     for (const entry of this.sessionManager.entries()) {
-      if (entry.type === "operation_outcome" && isShellBackgroundTaskOperationOutcome(entry)) {
+      if (entry.type === "background_task_result") {
         this.#admitShellCompletion(entry)
         continue
       }
@@ -2180,8 +2194,8 @@ export class AgentSession {
           const identity = subagentCompletionIdentity(entry.details)
           if (identity) this.#subagents?.acknowledgeCompletion(identity.name, identity.workCycle)
         } else if (entry.customType === shellCompletionCustomType) {
-          const operationId = shellCompletionIdentity(entry.details)
-          if (operationId) this.#pendingShellCompletions.delete(operationId)
+          const taskId = shellCompletionIdentity(entry.details)
+          if (taskId) this.#pendingShellCompletions.delete(taskId)
         }
         continue
       }
@@ -2189,20 +2203,20 @@ export class AgentSession {
     }
   }
 
-  #admitShellCompletion(completion: ShellBackgroundTaskOperationOutcomeInput): void {
-    if (this.#pendingShellCompletions.has(completion.operationId)) return
+  #admitShellCompletion(completion: BackgroundTaskResultInput): void {
+    if (this.#pendingShellCompletions.has(completion.taskId)) return
     const maximum = this.#shell?.limits.maxCompletedTasks ?? 100
     if (this.#pendingShellCompletions.size >= maximum) {
-      throw new Error(`Shell completion capacity exceeded: more than ${maximum} outcomes await delivery`)
+      throw new Error(`Shell completion capacity exceeded: more than ${maximum} results await delivery`)
     }
-    this.#pendingShellCompletions.set(completion.operationId, completion)
+    this.#pendingShellCompletions.set(completion.taskId, completion)
   }
 
   #acknowledgeCompletionToolResult(message: AgentMessage): void {
     if (message.role !== "toolResult") return
     if (message.toolName === "task_output" && isTaskOutputToolDetails(message.details)) {
       if (message.details.outcome === "success" && message.details.state === "completed") {
-        this.#pendingShellCompletions.delete(shellBackgroundTaskOperationId(message.details.taskId))
+        this.#pendingShellCompletions.delete(message.details.taskId)
       }
       return
     }
@@ -2974,6 +2988,14 @@ export class AgentSession {
   async #handleAgentEvent(event: AgentEvent): Promise<void> {
     const queueRestore = this.#queueRestoreCancellation
     if (
+      event.type === "message_start" &&
+      event.message.role === "assistant" &&
+      (event.message.stopReason === "aborted" || event.message.stopReason === "error") &&
+      this.#agent.state.streamingMessage?.role === "assistant"
+    ) {
+      this.#agentSessionInvariant.interruptMessage()
+    }
+    if (
       queueRestore.type === "awaiting_synthetic_failure" &&
       event.type === "message_start" &&
       event.message.role === "assistant"
@@ -3032,6 +3054,7 @@ export class AgentSession {
         try {
           entry = this.sessionManager.appendCustomMessage(input)
         } catch (cause) {
+          this.#agentSessionInvariant.interruptMessage()
           this.#removeRuntimeMessage(event.message)
           throw cause
         }
@@ -3042,9 +3065,16 @@ export class AgentSession {
         this.#replaceRuntimeMessage(event.message, message)
         this.#recordCommittedMessage(message)
         this.#emit({ type: "entry_appended", entry })
+        this.#agentSessionInvariant.projectMessage(event.message, message)
         committedCustomEvent = { ...event, message }
       } else {
-        const entry = this.sessionManager.appendMessage(event.message)
+        let entry: MessageEntry
+        try {
+          entry = this.sessionManager.appendMessage(event.message)
+        } catch (cause) {
+          this.#agentSessionInvariant.interruptMessage()
+          throw cause
+        }
         this.#recordCommittedMessage(entry.message)
         try {
           this.#emit({ type: "entry_appended", entry })
@@ -3243,21 +3273,27 @@ export class AgentSession {
     if (this.#modelChoicesPromise === load) this.#modelChoicesPromise = undefined
   }
 
-  #recordOutcome(input: OperationOutcomeInput, persisted?: (outcome: OperationOutcome) => void): OperationOutcome {
-    const outcome = this.sessionManager.appendOperationOutcome(input)
-    persisted?.(outcome)
-    this.#emitAll([
-      { type: "entry_appended", entry: outcome },
-      { type: "operation_outcome", outcome }
-    ])
-    return outcome
-  }
-
   #emitQueue(): void {
     this.#emit({ type: "queue_update", ...this.#queueSnapshot() })
   }
 
   #emit(event: AgentSessionEvent): void {
+    this.#agentSessionInvariant.accept(event)
+    this.#publish(event)
+  }
+
+  #emitAll(events: readonly AgentSessionEvent[]): void {
+    for (const event of events) {
+      this.#agentSessionInvariant.accept(event)
+      try {
+        this.#publish(event)
+      } catch {
+        // The model transaction is already durable; one observer cannot turn a committed change into a failed operation.
+      }
+    }
+  }
+
+  #publish(event: AgentSessionEvent): void {
     let failure: { cause: unknown } | undefined
     for (const listener of this.#listeners) {
       try {
@@ -3267,16 +3303,6 @@ export class AgentSession {
       }
     }
     if (failure) throw failure.cause
-  }
-
-  #emitAll(events: readonly AgentSessionEvent[]): void {
-    for (const event of events) {
-      try {
-        this.#emit(event)
-      } catch {
-        // The model transaction is already durable; one observer cannot turn a committed change into a failed operation.
-      }
-    }
   }
 
   #assertOpen(): void {
@@ -3458,52 +3484,43 @@ function userMessage(text: string, images: readonly ImageContent[]): AgentMessag
 const subagentCompletionCustomType = "zi.subagent_completion"
 const shellCompletionCustomType = "zi.shell_task_completion"
 
-function shellCompletionMessage(completion: ShellBackgroundTaskOperationOutcomeInput): CustomMessageInput {
-  const evidence = completion.evidence
+function shellCompletionMessage(completion: BackgroundTaskResultInput): CustomMessageInput {
   const payload = {
-    task_id: evidence.taskId,
-    origin: evidence.origin,
+    task_id: completion.taskId,
+    origin: completion.origin,
     result: completion.result,
     duration_ms: completion.durationMs,
-    output_bytes: evidence.outputBytes,
+    output_bytes: completion.outputBytes,
     ...shellCompletionResult(completion)
   }
   return {
     customType: shellCompletionCustomType,
     content: `<shell_task_completion>\n${JSON.stringify(payload)}\n</shell_task_completion>`,
     display: false,
-    details: { operationId: completion.operationId, taskId: evidence.taskId, result: completion.result }
+    details: { taskId: completion.taskId, result: completion.result }
   }
 }
 
-function shellCompletionResult(completion: ShellBackgroundTaskOperationOutcomeInput): {
-  readonly [key: string]: SessionJson
-} {
-  if (completion.result === "succeeded") return { exit_code: completion.evidence.exitCode }
-  if (completion.result === "cancelled") return { cancellation_code: completion.evidence.cancellationCode }
-  switch (completion.evidence.errorCode) {
+function shellCompletionResult(completion: BackgroundTaskResultInput): { readonly [key: string]: SessionJson } {
+  if (completion.result === "succeeded") return { exit_code: completion.exitCode }
+  if (completion.result === "cancelled") return { cancellation_code: completion.cancellationCode }
+  switch (completion.errorCode) {
     case "exit_nonzero":
-      return { error_code: completion.evidence.errorCode, exit_code: completion.evidence.exitCode }
+      return { error_code: completion.errorCode, exit_code: completion.exitCode }
     case "signaled":
-      return { error_code: completion.evidence.errorCode, signal: completion.evidence.signal }
+      return { error_code: completion.errorCode, signal: completion.signal }
     case "timed_out":
     case "output_limit":
     case "execution_failed":
-      return { error_code: completion.evidence.errorCode }
+      return { error_code: completion.errorCode }
     default:
-      return assertNever(completion.evidence)
+      return assertNever(completion)
   }
 }
 
 function shellCompletionIdentity(value: SessionJson | undefined): string | undefined {
   if (!isSessionJsonRecord(value)) return undefined
-  const operationId = value.operationId
-  const taskId = value.taskId
-  return typeof operationId === "string" &&
-    typeof taskId === "string" &&
-    operationId === shellBackgroundTaskOperationId(taskId)
-    ? operationId
-    : undefined
+  return typeof value.taskId === "string" ? value.taskId : undefined
 }
 
 function subagentCompletionMessage(completion: SubagentCompletion): CustomMessageInput {

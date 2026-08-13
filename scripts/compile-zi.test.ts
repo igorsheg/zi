@@ -6,15 +6,16 @@ import { delimiter, join, resolve } from "node:path"
 import { pathToFileURL } from "node:url"
 
 import {
-  ExtensionProtocolDecoder,
+  extensionFramingLabel,
+  extensionFramingLimits,
   type WorkerMessage,
-  encodeExtensionProtocolFrame,
   extensionProtocolVersion,
   validateWorkerMessage
 } from "../packages/coding-agent/src/extensions/protocol.js"
 import { extensionApiModuleSource } from "../packages/coding-agent/src/extensions/public-api-module.js"
 import { extensionWorkerArgument } from "../packages/coding-agent/src/extensions/worker-entry.js"
 import { isRecord } from "../packages/coding-agent/src/guards.js"
+import { encodeFramedJson, FramedJsonDecoder } from "../packages/coding-agent/src/processes/framed-json.js"
 import { runCodeModeAcceptance } from "./code-mode-acceptance.js"
 import { assertPinnedBunVersion, compileStandalone } from "./compile-zi.js"
 import { runExtensionCustomToolAcceptance } from "./extension-custom-tool-acceptance.js"
@@ -90,7 +91,7 @@ export default function (zi: ExtensionAPI): void {
     let compiledCustomMessage: string | undefined
     const protocol = new Promise<void>((resolveProtocol, rejectProtocol) => {
       let completed = false
-      const decoder = new ExtensionProtocolDecoder(validateWorkerMessage)
+      const decoder = new FramedJsonDecoder(validateWorkerMessage, extensionFramingLimits, extensionFramingLabel)
       const receive = (message: WorkerMessage): void => {
         protocolMessages.push(message)
         if (message.type === "fatal") {
@@ -111,7 +112,7 @@ export default function (zi: ExtensionAPI): void {
             return
           }
           child!.stdin!.write(
-            encodeExtensionProtocolFrame({
+            extensionFrame({
               type: "session_start",
               generation: 1,
               requestId: 1,
@@ -123,39 +124,28 @@ export default function (zi: ExtensionAPI): void {
         }
         if (message.type === "custom_entries_get") {
           child!.stdin!.write(
-            encodeExtensionProtocolFrame({
-              type: "custom_entries_result",
-              generation: 1,
-              requestId: message.requestId,
-              entries: []
-            })
+            extensionFrame({ type: "custom_entries_result", generation: 1, requestId: message.requestId, entries: [] })
           )
           return
         }
         if (message.type === "settled" && message.requestId === 1) {
-          child!.stdin!.write(encodeExtensionProtocolFrame({ type: "agent_start", generation: 1, sequence: 1 }))
+          child!.stdin!.write(extensionFrame({ type: "agent_start", generation: 1, sequence: 1 }))
           return
         }
         if (message.type === "agent_event_settled" && message.sequence === 1) {
-          child!.stdin!.write(encodeExtensionProtocolFrame({ type: "agent_settled", generation: 1, sequence: 2 }))
+          child!.stdin!.write(extensionFrame({ type: "agent_settled", generation: 1, sequence: 2 }))
           return
         }
         if (message.type === "agent_event_settled" && message.sequence === 2) {
           child!.stdin!.write(
-            encodeExtensionProtocolFrame({
-              type: "command_invoke",
-              generation: 1,
-              requestId: 2,
-              name: "counter",
-              arguments: "show"
-            })
+            extensionFrame({ type: "command_invoke", generation: 1, requestId: 2, name: "counter", arguments: "show" })
           )
           return
         }
         if (message.type === "command_result" && message.requestId === 2) {
           compiledCommandResult = message.message
           child!.stdin!.write(
-            encodeExtensionProtocolFrame({
+            extensionFrame({
               type: "tool_invoke",
               generation: 1,
               requestId: 3,
@@ -167,7 +157,7 @@ export default function (zi: ExtensionAPI): void {
         }
         if (message.type === "custom_entry_append") {
           child!.stdin!.write(
-            encodeExtensionProtocolFrame({
+            extensionFrame({
               type: "custom_entry_result",
               generation: 1,
               requestId: message.requestId,
@@ -184,14 +174,14 @@ export default function (zi: ExtensionAPI): void {
         if (message.type === "custom_message_send") {
           compiledCustomMessage = typeof message.message.content === "string" ? message.message.content : undefined
           child!.stdin!.write(
-            encodeExtensionProtocolFrame({ type: "custom_message_result", generation: 1, requestId: message.requestId })
+            extensionFrame({ type: "custom_message_result", generation: 1, requestId: message.requestId })
           )
           return
         }
         if (message.type === "tool_result" && message.requestId === 3) {
           compiledCounterResult = message.value
           child!.stdin!.write(
-            encodeExtensionProtocolFrame({
+            extensionFrame({
               type: "tool_invoke",
               generation: 1,
               requestId: 4,
@@ -203,13 +193,11 @@ export default function (zi: ExtensionAPI): void {
         }
         if (message.type === "tool_result" && message.requestId === 4) {
           compiledToolResult = message.value
-          child!.stdin!.write(
-            encodeExtensionProtocolFrame({ type: "session_shutdown", generation: 1, requestId: 5, reason: "quit" })
-          )
+          child!.stdin!.write(extensionFrame({ type: "session_shutdown", generation: 1, requestId: 5, reason: "quit" }))
           return
         }
         if (message.type === "settled" && message.requestId === 5) {
-          child!.stdin!.write(encodeExtensionProtocolFrame({ type: "stop", generation: 1, requestId: 6 }))
+          child!.stdin!.write(extensionFrame({ type: "stop", generation: 1, requestId: 6 }))
           return
         }
         if (message.type === "settled" && message.requestId === 6) {
@@ -231,7 +219,7 @@ export default function (zi: ExtensionAPI): void {
     })
 
     child.stdin.write(
-      encodeExtensionProtocolFrame({
+      extensionFrame({
         type: "initialize",
         protocolVersion: extensionProtocolVersion,
         generation: 1,
@@ -505,6 +493,10 @@ try {
     await rm(temporary, { recursive: true, force: true })
   }
 }, 60_000)
+
+function extensionFrame(value: unknown): Buffer {
+  return encodeFramedJson(value, extensionFramingLimits, extensionFramingLabel)
+}
 
 function providerFreeEnvironment(home: string): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {}

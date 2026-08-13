@@ -7,8 +7,8 @@ import { pathToFileURL } from "node:url"
 
 import type { ExtensionLoadPlan, ExtensionSource } from "../src/extensions/discovery.js"
 import {
-  encodeExtensionProtocolFrame,
-  ExtensionProtocolDecoder,
+  extensionFramingLabel,
+  extensionFramingLimits,
   extensionProtocolVersion,
   maxExtensionPendingRequests,
   type HostMessage,
@@ -16,9 +16,14 @@ import {
   validateWorkerMessage
 } from "../src/extensions/protocol.js"
 import { runExtensionWorkerProcess } from "../src/extensions/worker.js"
+import { encodeFramedJson, FramedJsonDecoder } from "../src/processes/framed-json.js"
 import { testExtensionContext } from "./extension-context.js"
 
 const extensionApi = pathToFileURL(resolve(import.meta.dirname, "../../extension-api/src/index.ts")).href
+
+function frame(value: unknown): Buffer {
+  return encodeFramedJson(value, extensionFramingLimits, extensionFramingLabel)
+}
 
 test("worker process decodes requests without stdout and settles one lifecycle", async () => {
   const root = await mkdtemp(join(tmpdir(), "zi-extension-worker-process-"))
@@ -743,9 +748,9 @@ test("worker process reports malformed input as fatal after initialization", asy
 
   expect(await messages.next()).toMatchObject({
     type: "fatal",
-    diagnostic: { phase: "protocol", message: "Extension protocol frames cannot be empty" }
+    diagnostic: { phase: "protocol", message: "Extension protocol frames must contain 1 to 4194304 bytes" }
   })
-  expect(run).rejects.toThrow("frames cannot be empty")
+  expect(run).rejects.toThrow("frames must contain 1 to")
   messages.dispose()
   output.destroy()
 })
@@ -758,12 +763,12 @@ test("worker process rejects malformed input before initialization", async () =>
   malformed.writeUInt32BE(0)
   input.end(malformed)
 
-  expect(run).rejects.toThrow("frames cannot be empty")
+  expect(run).rejects.toThrow("frames must contain 1 to")
   output.destroy()
 })
 
 class ControlledWorkerOutput extends Writable {
-  readonly #decoder = new ExtensionProtocolDecoder(validateWorkerMessage)
+  readonly #decoder = new FramedJsonDecoder(validateWorkerMessage, extensionFramingLimits, extensionFramingLabel)
   readonly #messages: WorkerMessage[] = []
   readonly #waiters: Array<(message: WorkerMessage) => void> = []
   readonly #writes: Array<() => void> = []
@@ -796,7 +801,7 @@ class ControlledWorkerOutput extends Writable {
 
 class WorkerMessageQueue {
   readonly #stream: PassThrough
-  readonly #decoder = new ExtensionProtocolDecoder(validateWorkerMessage)
+  readonly #decoder = new FramedJsonDecoder(validateWorkerMessage, extensionFramingLimits, extensionFramingLabel)
   readonly #messages: WorkerMessage[] = []
   readonly #waiters: Array<(message: WorkerMessage) => void> = []
   readonly #onData: (chunk: Buffer) => void
@@ -826,7 +831,7 @@ class WorkerMessageQueue {
 }
 
 function send(input: PassThrough, message: HostMessage): void {
-  input.write(encodeExtensionProtocolFrame(message))
+  input.write(frame(message))
 }
 
 function initialize(plan: ExtensionLoadPlan): HostMessage {

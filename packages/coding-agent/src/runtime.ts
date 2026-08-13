@@ -12,7 +12,8 @@ import type { AgentSession } from "./agent-session.js"
 import { CodeMode } from "./code-mode/code-mode.js"
 import { FileCredentialStore } from "./credential-store.js"
 import { discoverExtensionLoadPlan, extensionDiscoveryDiagnostic } from "./extensions/discovery.js"
-import { createExtensionWorkerSpawner, ExtensionHost } from "./extensions/host.js"
+import { ExtensionHost } from "./extensions/host.js"
+import { spawnExtensionWorker } from "./extensions/process.js"
 import { FileModelCatalogStore } from "./model-catalog-store.js"
 import { ModelRegistry } from "./model-registry.js"
 import { resolveRequestedModel } from "./model-resolver.js"
@@ -76,8 +77,9 @@ export async function createUnboundAgentRuntime(requested: CreateAgentRuntimeOpt
   const settingsManager = SettingsManager.create(paths, project, options.settings ?? {})
   const extensions = discoverExtensionLoadPlan(paths, project, options.extensionPaths ?? [], settingsManager)
   const processTreeTracker = createProcessTreeTracker()
+  const extensionWorkerCommand = options.extensionWorkerCommand ?? defaultExtensionWorkerCommand
   const extensionHost = new ExtensionHost(
-    createExtensionWorkerSpawner(options.extensionWorkerCommand ?? defaultExtensionWorkerCommand, processTreeTracker),
+    plan => spawnExtensionWorker(plan, extensionWorkerCommand, processTreeTracker),
     undefined,
     { subagents: options.subagentCommand !== undefined && options.internalSubagentDepth !== 1 }
   )

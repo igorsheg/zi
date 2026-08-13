@@ -4,10 +4,11 @@ import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
 
 import type { AgentTool } from "@earendil-works/pi-agent-core"
+import { InvariantRegistry } from "@with-zi/invariants"
 
 import { isRecord } from "../src/guards.js"
 import { createProcessTreeTracker } from "../src/processes/process-tree.js"
-import { SessionManager, type SessionJson } from "../src/session-manager.js"
+import { SessionManager } from "../src/session-manager.js"
 import { SubagentSupervisor } from "../src/subagents/supervisor.js"
 import {
   isSubagentToolDetails,
@@ -353,11 +354,12 @@ async function createHarness(name: string, reply: string, delayMs = 30) {
     env: { ...process.env, MOCK_RPC_REPLY: reply, MOCK_RPC_DELAY_MS: String(delayMs) },
     selection: () => ({ model: "faux/faux-1", thinkingLevel: "off" }),
     sessionManager,
-    processTreeTracker: createProcessTreeTracker()
+    processTreeTracker: createProcessTreeTracker(),
+    invariantRegistry: new InvariantRegistry()
   })
-  supervisor.bindOperationOutcomeSink((outcome, persisted) => {
-    const entry = sessionManager.appendOperationOutcome<SessionJson>(outcome)
-    persisted?.(entry)
+  supervisor.bindSubagentWorkResultSink((result, persisted) => {
+    const entry = sessionManager.appendSubagentWorkResult(result)
+    persisted(entry)
     return entry
   })
   const admissions: Array<{ profile: string; name: string; prompt: string }> = []

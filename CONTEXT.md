@@ -28,17 +28,25 @@ _Avoid_: Deleted history, compacted journal, TUI message cache
 A SHA-256-addressed raw image file owned by one format-2 session journal. Active messages hydrate the provider's base64 image value on demand; compacted cold history retains only its journal reference. Blob bytes and journal bytes share one session storage limit.
 _Avoid_: Attachment upload, global media cache, inline base64 journal
 
-**Operation outcome**:
-The open bounded durable terminal envelope for one admitted session operation: deterministic operation ID, capability, operation, `succeeded`, `failed`, or `cancelled` result, duration, producer-owned `SessionJson` evidence, and source journal chronology. The core validates the shared envelope; each producer owns its evidence schema, privacy, interpretation, and deterministic identity. Operation outcomes are model- and presentation-invisible; delivery messages and tool results may project the same result but are not additional outcomes.
-_Avoid_: Telemetry event, log record, delivery receipt, tool result
+**Work result**:
+The bounded durable terminal record for one meaningful piece of background work. Each owner defines a closed result with its natural identity, terminal state, duration, and domain evidence; control-plane requests do not become work results. Work results are model- and presentation-invisible, while completion messages and tool results may project the same evidence for delivery.
+_Avoid_: Generic operation envelope, telemetry event, control receipt, tool result
 
-**Operation outcome report**:
-The bounded read-only analysis projection of durable operation outcomes. It aggregates common envelope fields and treats producer-owned evidence as opaque `SessionJson`; generic reports do not interpret or classify evidence by capability.
-_Avoid_: Evidence schema registry, telemetry index, copied session history
+**Runtime invariant**:
+A package-owned relationship over runtime observations or mutable state that must always hold. Invariants independently verify lifecycle, ordering, identity, conservation, and durable-result correspondence; they do not validate external input or become journal records.
+_Avoid_: Input validation, type assertion, unit-test expectation, telemetry alert
 
 **Session shell**:
 The session-scoped coding-agent owner of shell task identity, foreground/background transitions, subprocess groups, bounded output files and previews, completion, retention, and disposal. Its Bash and task tools are adapters over the same task state. Run interruption stops foreground work; demoted or explicitly backgrounded work survives until completion, explicit kill, timeout, output bounds, or final session disposal.
 _Avoid_: Global process manager, TUI task registry, detached Bash process
+
+**Owned process substrate**:
+The private coding-agent owner of local child-process launch adaptation, pipe identity, exit observation, containment admission, tree termination, and stream release. Session shell, code mode, extension host, and subagent supervisor retain their distinct domain admission, state, deadlines, cancellation, output, evidence, and shutdown policy.
+_Avoid_: Process core, execution manager, universal task envelope
+
+**Framed JSON channel**:
+A bounded internal byte transport for isolated workers that owns length-prefixed JSON framing, partial-frame decoding, write ordering, backpressure, and transport disposal. The capability protocol still owns message types, correlation, versions, validation, and lifecycle semantics; Zi RPC remains a separate JSONL transport for full agent sessions.
+_Avoid_: Universal worker protocol, RPC connection, work result
 
 **Tool result details**:
 The bounded, typed, client-neutral facts a built-in tool returns separately from model-facing content. They describe progress or outcome without requiring a client to parse explanatory prose.
@@ -217,15 +225,15 @@ The parent-session-unique runtime identity chosen when a subagent is spawned. It
 _Avoid_: Subagent type, role, operational ID
 
 **Subagent supervisor**:
-The `AgentSession`-owned controller of direct-child names, admission, process lifetimes, work cycles, bounded completion retention, durable evidence, and shutdown. It appends parent-owned outcomes for work cycles and terminal spawn, message-delivery, task-assignment, interruption, and close operations. `AgentSession` derives standard orchestration from its admitted profile catalog; extensions may reach the same mechanics only through bounded session operations for optional custom workflows.
+The `AgentSession`-owned controller of direct-child names, admission, process lifetimes, work cycles, bounded completion retention, durable evidence, and shutdown. It appends one parent-owned work result for each settled work cycle; spawn, message delivery, task assignment, interruption, and close remain transient control operations. `AgentSession` derives standard orchestration from its admitted profile catalog; extensions may reach the same mechanics only through bounded session operations for optional custom workflows.
 _Avoid_: Extension generation, agent coordinator, extension API object, session registry
 
 **Peer message**:
-Bounded context sent from one subagent to a live sibling through their common parent supervisor. The parent derives the sender identity, validates the sibling target, admits the message queue-only, and records its terminal message-delivery outcome without retaining message text. A peer message neither assigns a work cycle nor replaces parent completion delivery.
+Bounded context sent from one subagent to a live sibling through their common parent supervisor. The parent derives the sender identity, validates the sibling target, and admits the message queue-only without making delivery a durable session artifact. A peer message neither assigns a work cycle nor replaces parent completion delivery.
 _Avoid_: Subagent task, completion, direct process message, peer network event
 
 **Subagent completion**:
-The bounded result projected when admitted subagent work settles, including identity, status, final text, duration, and omission facts. Its subagent work-cycle operation outcome is the canonical durable evidence; hidden context and orchestration tool results are delivery projections, not additional completions. It is not a copied child transcript.
+The bounded result projected when admitted subagent work settles, including identity, status, final text, duration, and omission facts. Its subagent work result is the canonical durable evidence; hidden context and orchestration tool results are delivery projections, not additional completions. It is not a copied child transcript.
 _Avoid_: Child stdout, event stream, transcript snapshot, delivery message
 
 **CLI invocation**:

@@ -1,6 +1,5 @@
-import type { Writable } from "node:stream"
-
 import { isRecord } from "../guards.js"
+import type { FramedJsonLimits } from "../processes/framed-json.js"
 
 export const codeModeProtocolVersion = 4
 export const codeModeWorkerArgument = "--zi-internal-code-mode-worker"
@@ -11,6 +10,12 @@ export const maxCodeModeToolNames = 128
 export const maxCodeModeFrameBytes = 9 * 1024 * 1024
 export const maxCodeModeQueuedFrames = 128
 export const maxCodeModeQueuedBytes = 18 * 1024 * 1024
+export const codeModeFramingLimits: FramedJsonLimits = Object.freeze({
+  maxFrameBytes: maxCodeModeFrameBytes,
+  maxQueuedFrames: maxCodeModeQueuedFrames,
+  maxQueuedBytes: maxCodeModeQueuedBytes
+})
+export const codeModeFramingLabel = "Code-mode protocol"
 export const maxCodeModeErrorBytes = 16 * 1024
 export const maxCodeModeLogs = 32
 export const maxCodeModeLogBytes = 16 * 1024
@@ -86,172 +91,6 @@ export class CodeModeProtocolError extends Error {
     super(message, options)
     this.name = "CodeModeProtocolError"
   }
-}
-
-type DecoderState =
-  | { readonly type: "open" }
-  | { readonly type: "failed"; readonly error: CodeModeProtocolError }
-  | { readonly type: "ended" }
-
-export class CodeModeProtocolDecoder<T> {
-  readonly #validate: (value: unknown) => T
-  #state: DecoderState = { type: "open" }
-  #buffer = Buffer.alloc(0)
-
-  constructor(validate: (value: unknown) => T) {
-    this.#validate = validate
-  }
-
-  push(chunk: Uint8Array): readonly T[] {
-    if (this.#state.type === "failed") throw this.#state.error
-    if (this.#state.type === "ended") throw new CodeModeProtocolError("Cannot decode after code-mode input ended")
-    if (chunk.byteLength === 0) return []
-
-    try {
-      const incoming = Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength)
-      const data = this.#buffer.byteLength === 0 ? incoming : Buffer.concat([this.#buffer, incoming])
-      const messages: T[] = []
-      let offset = 0
-      while (data.byteLength - offset >= 4) {
-        const length = data.readUInt32BE(offset)
-        if (length === 0 || length > maxCodeModeFrameBytes) {
-          throw new CodeModeProtocolError(`Code-mode frames must contain 1 to ${maxCodeModeFrameBytes} bytes`)
-        }
-        if (data.byteLength - offset - 4 < length) break
-        messages.push(this.#validate(parsePayload(data.subarray(offset + 4, offset + 4 + length))))
-        offset += 4 + length
-      }
-      this.#buffer = offset === data.byteLength ? Buffer.alloc(0) : Buffer.from(data.subarray(offset))
-      return messages
-    } catch (cause) {
-      const error = protocolError(cause)
-      this.#state = { type: "failed", error }
-      this.#buffer = Buffer.alloc(0)
-      throw error
-    }
-  }
-
-  end(): void {
-    if (this.#state.type === "failed") throw this.#state.error
-    if (this.#state.type === "ended") return
-    if (this.#buffer.byteLength !== 0) {
-      const error = new CodeModeProtocolError("Code-mode input ended with a partial frame")
-      this.#state = { type: "failed", error }
-      this.#buffer = Buffer.alloc(0)
-      throw error
-    }
-    this.#state = { type: "ended" }
-  }
-}
-
-interface QueuedFrame {
-  readonly frame: Buffer
-  resolve(): void
-  reject(cause: unknown): void
-}
-
-type WriterState =
-  | { readonly type: "idle" }
-  | { readonly type: "writing"; readonly current: QueuedFrame }
-  | { readonly type: "failed"; readonly error: CodeModeProtocolError }
-  | { readonly type: "disposed" }
-
-export class CodeModeProtocolWriter {
-  readonly #sink: Writable
-  readonly #queue: QueuedFrame[] = []
-  readonly #onError: (cause: Error) => void
-  #state: WriterState = { type: "idle" }
-  #queuedBytes = 0
-
-  constructor(sink: Writable) {
-    this.#sink = sink
-    this.#onError = cause => this.#fail(cause)
-    sink.on("error", this.#onError)
-  }
-
-  send(value: CodeModeHostMessage): Promise<void> {
-    if (this.#state.type === "failed") return Promise.reject(this.#state.error)
-    if (this.#state.type === "disposed") {
-      return Promise.reject(new CodeModeProtocolError("Code-mode writer is disposed"))
-    }
-
-    let frame: Buffer
-    try {
-      frame = encodeCodeModeFrame(value)
-    } catch (cause) {
-      return Promise.reject(cause)
-    }
-    const count = this.#queue.length + (this.#state.type === "writing" ? 1 : 0)
-    if (count >= maxCodeModeQueuedFrames || frame.byteLength > maxCodeModeQueuedBytes - this.#queuedBytes) {
-      return Promise.reject(new CodeModeProtocolError("Code-mode output queue exceeded its bound"))
-    }
-    const promise = new Promise<void>((resolve, reject) => this.#queue.push({ frame, resolve, reject }))
-    this.#queuedBytes += frame.byteLength
-    if (this.#state.type === "idle") this.#writeNext()
-    return promise
-  }
-
-  dispose(): void {
-    if (this.#state.type === "disposed") return
-    const error = new CodeModeProtocolError("Code-mode writer disposed before output settled")
-    const current = this.#state.type === "writing" ? this.#state.current : undefined
-    this.#state = { type: "disposed" }
-    current?.reject(error)
-    for (const frame of this.#queue.splice(0)) frame.reject(error)
-    this.#queuedBytes = 0
-    this.#sink.off("error", this.#onError)
-  }
-
-  #writeNext(): void {
-    const next = this.#queue.shift()
-    if (!next) {
-      this.#state = { type: "idle" }
-      return
-    }
-    this.#state = { type: "writing", current: next }
-    try {
-      this.#sink.write(next.frame, error => {
-        if (this.#state.type !== "writing" || this.#state.current !== next) return
-        if (error) {
-          this.#fail(error)
-          return
-        }
-        this.#queuedBytes -= next.frame.byteLength
-        this.#state = { type: "idle" }
-        next.resolve()
-        this.#writeNext()
-      })
-    } catch (cause) {
-      this.#fail(cause)
-    }
-  }
-
-  #fail(cause: unknown): void {
-    if (this.#state.type === "failed" || this.#state.type === "disposed") return
-    const error = protocolError(cause)
-    const current = this.#state.type === "writing" ? this.#state.current : undefined
-    this.#state = { type: "failed", error }
-    current?.reject(error)
-    for (const frame of this.#queue.splice(0)) frame.reject(error)
-    this.#queuedBytes = 0
-  }
-}
-
-export function encodeCodeModeFrame(value: unknown): Buffer {
-  let json: string
-  try {
-    json = JSON.stringify(value)
-  } catch (cause) {
-    throw new CodeModeProtocolError("Code-mode frame is not JSON serializable", { cause })
-  }
-  const payload = Buffer.from(json)
-  if (payload.byteLength === 0 || payload.byteLength > maxCodeModeFrameBytes) {
-    throw new CodeModeProtocolError(`Code-mode frames must contain 1 to ${maxCodeModeFrameBytes} bytes`)
-  }
-  const frame = Buffer.allocUnsafe(4 + payload.byteLength)
-  frame.writeUInt32BE(payload.byteLength)
-  payload.copy(frame, 4)
-  return frame
 }
 
 export function validateHostMessage(value: unknown): CodeModeHostMessage {
@@ -438,18 +277,4 @@ export function isCodeModeToolName(value: string): boolean {
     if (code === undefined || code <= 0x1f || code === 0x7f) return false
   }
   return true
-}
-
-function parsePayload(payload: Uint8Array): unknown {
-  try {
-    return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(payload))
-  } catch (cause) {
-    throw new CodeModeProtocolError("Code-mode frame contains invalid JSON or UTF-8", { cause })
-  }
-}
-
-function protocolError(cause: unknown): CodeModeProtocolError {
-  return cause instanceof CodeModeProtocolError
-    ? cause
-    : new CodeModeProtocolError(cause instanceof Error ? cause.message : "Code-mode protocol failed", { cause })
 }

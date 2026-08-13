@@ -1,10 +1,16 @@
 import { isAbsolute } from "node:path"
 
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core"
+import { InvariantError, type InvariantRegistry } from "@with-zi/invariants"
 
-import { maxOperationOutcomeEvidenceBytes, type OperationOutcome } from "../operation-outcomes.js"
 import type { ProcessTreeTracker } from "../processes/process-tree.js"
-import type { SessionEntry, SessionManager, SubagentEntry, SubagentEntryInput } from "../session-manager.js"
+import type {
+  SessionEntry,
+  SessionManager,
+  SubagentEntry,
+  SubagentEntryInput,
+  SubagentWorkResultEntry
+} from "../session-manager.js"
 import type { ToolSurface } from "../tool-surface.js"
 import {
   ChildZiProcess,
@@ -15,17 +21,10 @@ import {
   type SubagentCompletion
 } from "./child-process.js"
 import { CompletionLedger, maxCompletionLedgerEntries, type CompletionDelivery } from "./completion-ledger.js"
+import { SubagentInvariant } from "./invariant.js"
 import { internalSubagentApiKeyEnvironment } from "./invocation.js"
-import {
-  admitSubagentControlOperation,
-  isSubagentWorkCycleOutcome,
-  subagentWorkCycleOperationId,
-  type SubagentControlAdmission,
-  type SubagentControlOutcomeInput,
-  type SubagentOutcomeInput,
-  type SubagentWorkCycleOutcomeInput
-} from "./outcome.js"
 import type { PeerAgent, PeerRequest, PeerResult } from "./peer-protocol.js"
+import { maxSubagentWorkResultEntryBytes, type SubagentWorkResultInput } from "./result.js"
 import { defaultWaitTimeoutMs, isSubagentWaitTimeout, maxWaitTimeoutMs } from "./wait-policy.js"
 import { defaultSubagentWorkTimeoutMs, isSubagentWorkTimeout } from "./work-policy.js"
 
@@ -37,13 +36,12 @@ export const maxLiveChildren = 4
 export const maxRetainedSubagents = 32
 export const maxSubagentReadyResults = maxCompletionLedgerEntries
 export const maxMailboxCompletions = maxSubagentReadyResults
-export const maxSubagentControlOutcomesPerWorkCycle = maxCompletionLedgerEntries
 export const maxWaitNames = 16
 export const maxSubagentPromptBytes = 8 * 1024 * 1024
 export const maxSubagentNameBytes = 64
 export const maxSubagentTaskBytes = 256
 export const durablePreviewBytes = 8 * 1024
-const maxSubagentOutcomeTextJsonBytes = (maxOperationOutcomeEvidenceBytes - 2 * 1024) / 2
+const maxSubagentResultTextJsonBytes = (maxSubagentWorkResultEntryBytes - 2 * 1024) / 2
 export const subagentShutdownMs = 9_000
 export const maxRetainedExitedTranscriptBytes = 16 * 1024 * 1024
 
@@ -96,11 +94,6 @@ interface ExitedRecord {
   readonly task?: string
 }
 
-interface ControlOutcomeQuota {
-  readonly workCycle: number
-  admitted: number
-}
-
 interface WaitTarget {
   readonly name: string
   readonly workCycle: number
@@ -122,6 +115,7 @@ export interface SubagentSupervisorOptions {
   readonly selection: () => { readonly model: string; readonly thinkingLevel: ThinkingLevel; readonly apiKey?: string }
   readonly sessionManager: SessionManager
   readonly processTreeTracker: ProcessTreeTracker
+  readonly invariantRegistry: InvariantRegistry
   readonly waitTimeoutMs?: number
   readonly workTimeoutMs?: number
   readonly toolSurface?: ToolSurface
@@ -145,10 +139,13 @@ export class SubagentSupervisor {
   readonly #live = new Map<string, LiveRecord>()
   readonly #exited: ExitedRecord[] = []
   readonly #ledger: CompletionLedger
-  readonly #peerOutcomeQuotas = new Map<string, ControlOutcomeQuota>()
+  readonly #invariant: SubagentInvariant
   readonly #waiters = new Set<() => void>()
-  #outcomeSink:
-    | ((outcome: SubagentOutcomeInput, persisted?: (outcome: OperationOutcome) => void) => OperationOutcome)
+  #resultSink:
+    | ((
+        result: SubagentWorkResultInput,
+        persisted: (result: SubagentWorkResultEntry) => void
+      ) => SubagentWorkResultEntry)
     | undefined
   readonly waitTimeoutMs: number
   readonly workTimeoutMs: number
@@ -162,10 +159,10 @@ export class SubagentSupervisor {
     this.#env = validateEnvironment(options.env)
     this.#selection = options.selection
     this.#sessionManager = options.sessionManager
-    const outcomes = this.#sessionManager.operationOutcomes().filter(isSubagentWorkCycleOutcome)
-    this.#ledger = CompletionLedger.restore(outcomes, this.#sessionManager.subagentEntries(), maxMailboxCompletions)
-    for (const outcome of outcomes) {
-      if (outcome.evidence.profile) this.#profiles.set(outcome.evidence.name, outcome.evidence.profile)
+    const results = this.#sessionManager.subagentWorkResults()
+    this.#ledger = CompletionLedger.restore(results, this.#sessionManager.subagentEntries(), maxMailboxCompletions)
+    for (const result of results) {
+      if (result.profile) this.#profiles.set(result.name, result.profile)
     }
     this.#processTreeTracker = options.processTreeTracker
     this.#toolSurface = options.toolSurface ?? "direct-and-code"
@@ -174,6 +171,7 @@ export class SubagentSupervisor {
     this.workTimeoutMs = options.workTimeoutMs ?? defaultSubagentWorkTimeoutMs
     if (!isSubagentWorkTimeout(this.workTimeoutMs)) throw new Error("Invalid subagent work timeout")
     this.#recover()
+    this.#invariant = new SubagentInvariant(options.invariantRegistry)
     this.#assertInvariants()
   }
 
@@ -181,11 +179,14 @@ export class SubagentSupervisor {
     return this.#state
   }
 
-  bindOperationOutcomeSink(
-    sink: (outcome: SubagentOutcomeInput, persisted?: (outcome: OperationOutcome) => void) => OperationOutcome
+  bindSubagentWorkResultSink(
+    sink: (
+      result: SubagentWorkResultInput,
+      persisted: (result: SubagentWorkResultEntry) => void
+    ) => SubagentWorkResultEntry
   ): void {
-    if (this.#outcomeSink) throw new Error("Subagent operation outcome sink is already bound")
-    this.#outcomeSink = sink
+    if (this.#resultSink) throw new Error("Subagent work result sink is already bound")
+    this.#resultSink = sink
     this.#pumpMailbox()
   }
 
@@ -249,7 +250,7 @@ export class SubagentSupervisor {
     try {
       this.#append({ event: "work_cycle_delivered", name, workCycle })
     } catch {
-      // Parent evidence is already durable; restoration can infer delivery from that evidence.
+      // The parent result is already durable; restoration can infer delivery from it.
     }
   }
 
@@ -266,6 +267,12 @@ export class SubagentSupervisor {
     this.#assertOpen()
     validateSubagentName(name)
     validateText(prompt, "Subagent prompt", maxSubagentPromptBytes)
+    if (this.#live.size >= maxLiveChildren) {
+      throw new Error(
+        `Subagent capacity exceeded: at most ${maxLiveChildren} live children. Close a child you no longer need before spawning another.`
+      )
+    }
+    if (this.#names.has(name)) throw new Error(`Subagent name already in use: ${name}`)
     const inheritedSelection = this.#selection()
     const listedTask = requestedSelection.listedTask ?? prompt
     validateText(listedTask, "Subagent listed task", maxSubagentPromptBytes)
@@ -279,52 +286,15 @@ export class SubagentSupervisor {
     }
     validateText(selection.model, "Subagent model", 4_096)
     if (selection.apiKey) validateText(selection.apiKey, "Subagent API key", 64 * 1024)
-    const admitted = admitSubagentControlOperation()
-    const controlEvidence = {
-      commandId: admitted.commandId,
-      source: "host" as const,
-      name,
-      ...(requestedSelection.profile ? { profile: requestedSelection.profile } : {}),
-      promptBytes: Buffer.byteLength(prompt)
-    }
-    if (this.#live.size >= maxLiveChildren) {
-      const cause = new Error(
-        `Subagent capacity exceeded: at most ${maxLiveChildren} live children. Close a child you no longer need before spawning another.`
-      )
-      this.#recordControlOutcome({
-        ...controlOutcomeFields(admitted),
-        operation: "spawn",
-        result: "failed",
-        evidence: { ...controlEvidence, errorCode: "spawn_failed" }
-      })
-      throw cause
-    }
-    if (this.#names.has(name)) {
-      const cause = new Error(`Subagent name already in use: ${name}`)
-      this.#recordControlOutcome({
-        ...controlOutcomeFields(admitted),
-        operation: "spawn",
-        result: "failed",
-        evidence: { ...controlEvidence, errorCode: "spawn_failed" }
-      })
-      throw cause
-    }
-    let completionReserved = false
+    this.#reserveCompletion(name, 1)
     try {
-      this.#reserveCompletion(name, 1)
-      completionReserved = true
       this.#append({ event: "starting", name })
     } catch (cause) {
-      if (completionReserved) this.#ledger.cancelReservation(name, 1)
-      this.#recordControlOutcome({
-        ...controlOutcomeFields(admitted),
-        operation: "spawn",
-        result: "failed",
-        evidence: { ...controlEvidence, errorCode: "spawn_failed" }
-      })
+      this.#ledger.cancelReservation(name, 1)
       throw cause
     }
     this.#names.add(name)
+    this.#invariant.introduce(name)
     if (requestedSelection.profile) this.#profiles.set(name, requestedSelection.profile)
 
     const command = [
@@ -362,19 +332,12 @@ export class SubagentSupervisor {
       const message = cause instanceof Error ? cause.message : String(cause)
       const snapshot = Object.freeze({ name, lifecycle: "exited" as const })
       this.#retainExited({ snapshot, exitedAt: Date.now(), task })
+      this.#invariant.exit(name)
       try {
         this.#append({ event: "exited", name, outcome: clipUtf8(message, durablePreviewBytes).text })
-      } catch {
-        // The retained exit and canonical control outcome survive auxiliary lifecycle journal failure.
       } finally {
         this.#changed(name)
       }
-      this.#recordControlOutcome({
-        ...controlOutcomeFields(admitted),
-        operation: "spawn",
-        result: "failed",
-        evidence: { ...controlEvidence, errorCode: "spawn_failed" }
-      })
       throw cause
     }
     const record: LiveRecord = { child, serial: new PromiseQueue(), createdAt: Date.now(), lastWorkCycle: 0, task }
@@ -382,15 +345,14 @@ export class SubagentSupervisor {
     this.#changed(name)
 
     const abort = (): void => {
-      const current = this.#live.get(name)
-      if (current) void this.#closeRecord(name, current, "startup_cancelled").catch(() => {})
+      void this.close(name, "startup_cancelled").catch(() => {})
+    }
+    if (signal?.aborted) {
+      abort()
+      throw new Error(`Subagent ${name} spawn was cancelled`)
     }
     signal?.addEventListener("abort", abort, { once: true })
     try {
-      if (signal?.aborted) {
-        abort()
-        throw new Error(`Subagent ${name} spawn was cancelled`)
-      }
       await child.start()
       this.#assertSpawnAdmission(name, record, signal)
       const sessionId = child.snapshot().sessionId
@@ -400,6 +362,7 @@ export class SubagentSupervisor {
       this.#assertSpawnAdmission(name, record, signal)
       signal?.removeEventListener("abort", abort)
       this.#assertInvariants()
+      return name
     } catch (cause) {
       signal?.removeEventListener("abort", abort)
       if (
@@ -409,33 +372,11 @@ export class SubagentSupervisor {
         record.child.state.type !== "closing" &&
         record.child.state.type !== "exited"
       ) {
-        await this.#closeRecord(name, record, "startup_failed").catch(() => {})
+        await this.close(name, "startup_failed").catch(() => {})
       }
       if (record.lastWorkCycle === 0) this.#ledger.cancelReservation(name, 1)
-      this.#recordControlOutcome(
-        signal?.aborted
-          ? {
-              ...controlOutcomeFields(admitted),
-              operation: "spawn",
-              result: "cancelled",
-              evidence: { ...controlEvidence, cancellationCode: "cancelled" }
-            }
-          : {
-              ...controlOutcomeFields(admitted),
-              operation: "spawn",
-              result: "failed",
-              evidence: { ...controlEvidence, errorCode: "spawn_failed" }
-            }
-      )
       throw cause
     }
-    this.#recordControlOutcome({
-      ...controlOutcomeFields(admitted),
-      operation: "spawn",
-      result: "succeeded",
-      evidence: controlEvidence
-    })
-    return name
   }
 
   // Behavioral provenance: Codex 0bdce9f4 derives the sender from the active session and lets the
@@ -453,66 +394,10 @@ export class SubagentSupervisor {
       }
       return Object.freeze({ peers: Object.freeze(peers) })
     }
-    const currentWorkCycle = this.#currentWorkCycle(sender)
-    this.#admitPeerControlOutcome(sender, currentWorkCycle)
-    const senderWorkCycle = currentWorkCycle > 0 ? currentWorkCycle : undefined
-    const admitted = admitSubagentControlOperation()
-    const evidence = {
-      commandId: admitted.commandId,
-      channel: "peer_to_peer" as const,
-      sender,
-      target: request.target,
-      messageBytes: Buffer.byteLength(request.text),
-      peerRequestId: request.id,
-      ...(senderWorkCycle === undefined ? {} : { senderWorkCycle })
-    }
-    if (request.target === sender) {
-      this.#recordControlOutcome({
-        ...controlOutcomeFields(admitted),
-        operation: "message_delivery",
-        result: "failed",
-        evidence: { ...evidence, errorCode: "self_delivery" }
-      })
-      throw new Error("A subagent cannot send a peer message to itself")
-    }
-    let target: LiveRecord
-    try {
-      target = this.#requireLive(request.target)
-    } catch (cause) {
-      this.#recordControlOutcome({
-        ...controlOutcomeFields(admitted),
-        operation: "message_delivery",
-        result: "failed",
-        evidence: { ...evidence, errorCode: "target_not_live" }
-      })
-      throw cause
-    }
-    let targetWorkCycle: number | undefined
-    try {
-      const message = `[Peer message from ${sender}]\n${request.text}`
-      await target.serial.run(() => {
-        targetWorkCycle = target.child.snapshot().workCycle
-        return target.child.sendFollowUp(message)
-      })
-    } catch (cause) {
-      this.#recordControlOutcome({
-        ...controlOutcomeFields(admitted),
-        operation: "message_delivery",
-        result: "failed",
-        evidence: {
-          ...evidence,
-          ...(targetWorkCycle === undefined ? {} : { targetWorkCycle }),
-          errorCode: "delivery_failed"
-        }
-      })
-      throw cause
-    }
-    this.#recordControlOutcome({
-      ...controlOutcomeFields(admitted),
-      operation: "message_delivery",
-      result: "succeeded",
-      evidence: { ...evidence, ...(targetWorkCycle === undefined ? {} : { targetWorkCycle }) }
-    })
+    if (request.target === sender) throw new Error("A subagent cannot send a peer message to itself")
+    const target = this.#requireLive(request.target)
+    const message = `[Peer message from ${sender}]\n${request.text}`
+    await target.serial.run(() => target.child.sendFollowUp(message))
     this.#pumpMailbox()
     return Object.freeze({ delivered: true })
   }
@@ -521,50 +406,8 @@ export class SubagentSupervisor {
     this.#assertOpen()
     validateSubagentName(name)
     validateText(text, "Subagent message", maxSubagentPromptBytes)
-    const admitted = admitSubagentControlOperation()
-    const evidence = {
-      commandId: admitted.commandId,
-      channel: "host_to_subagent" as const,
-      target: name,
-      messageBytes: Buffer.byteLength(text)
-    }
-    let record: LiveRecord
-    try {
-      record = this.#requireLive(name)
-    } catch (cause) {
-      this.#recordControlOutcome({
-        ...controlOutcomeFields(admitted),
-        operation: "message_delivery",
-        result: "failed",
-        evidence: { ...evidence, errorCode: "target_not_live" }
-      })
-      throw cause
-    }
-    let targetWorkCycle: number | undefined
-    try {
-      await record.serial.run(() => {
-        targetWorkCycle = record.child.snapshot().workCycle
-        return record.child.sendFollowUp(text)
-      })
-    } catch (cause) {
-      this.#recordControlOutcome({
-        ...controlOutcomeFields(admitted),
-        operation: "message_delivery",
-        result: "failed",
-        evidence: {
-          ...evidence,
-          ...(targetWorkCycle === undefined ? {} : { targetWorkCycle }),
-          errorCode: "delivery_failed"
-        }
-      })
-      throw cause
-    }
-    this.#recordControlOutcome({
-      ...controlOutcomeFields(admitted),
-      operation: "message_delivery",
-      result: "succeeded",
-      evidence: { ...evidence, ...(targetWorkCycle === undefined ? {} : { targetWorkCycle }) }
-    })
+    const record = this.#requireLive(name)
+    await record.serial.run(() => record.child.sendFollowUp(text))
     this.#pumpMailbox()
   }
 
@@ -572,78 +415,42 @@ export class SubagentSupervisor {
     this.#assertOpen()
     validateSubagentName(name)
     validateText(text, "Subagent message", maxSubagentPromptBytes)
-    const admitted = admitSubagentControlOperation()
-    const evidence = {
-      commandId: admitted.commandId,
-      source: "host" as const,
-      target: name,
-      taskBytes: Buffer.byteLength(text)
-    }
-    let record: LiveRecord
-    try {
-      record = this.#requireLive(name)
-    } catch (cause) {
-      this.#recordControlOutcome({
-        ...controlOutcomeFields(admitted),
-        operation: "task_assignment",
-        result: "failed",
-        evidence: { ...evidence, errorCode: "target_not_live" }
-      })
-      throw cause
-    }
-    let delivery: "started_turn" | "follow_up"
-    try {
-      delivery = await record.serial.run(async () => {
-        const snapshot = record.child.snapshot()
-        const nextCycle = (snapshot.workCycle ?? 0) + 1
-        const startedTurn = snapshot.lifecycle === "idle"
-        if (startedTurn) this.#reserveCompletion(name, nextCycle)
-        const previousTask = record.task
-        let cycleStarted = false
-        try {
-          if (startedTurn) {
-            record.task = clipUtf8(text, maxSubagentTaskBytes).text
-            this.#appendWorkCycleStarted(record, name, nextCycle)
-            cycleStarted = true
-          }
-          await record.child.continueWith(text)
-        } catch (cause) {
-          if (!cycleStarted) {
-            record.task = previousTask
-            if (startedTurn) this.#ledger.cancelReservation(name, nextCycle)
-          } else if (record.child.snapshot().lifecycle === "idle") {
-            this.#completion({
-              name,
-              workCycle: nextCycle,
-              status: "failed",
-              text: "",
-              originalBytes: 0,
-              omittedBytes: 0,
-              truncated: false,
-              durationMs: record.child.snapshot().elapsedMs ?? 0,
-              reason: "assignment_failed",
-              error: clipUtf8(cause instanceof Error ? cause.message : String(cause), durablePreviewBytes).text
-            })
-          }
-          throw cause
+    const record = this.#requireLive(name)
+    const delivery = await record.serial.run(async () => {
+      const snapshot = record.child.snapshot()
+      const nextCycle = (snapshot.workCycle ?? 0) + 1
+      const startedTurn = snapshot.lifecycle === "idle"
+      if (startedTurn) this.#reserveCompletion(name, nextCycle)
+      const previousTask = record.task
+      let cycleStarted = false
+      try {
+        if (startedTurn) {
+          record.task = clipUtf8(text, maxSubagentTaskBytes).text
+          this.#appendWorkCycleStarted(record, name, nextCycle)
+          cycleStarted = true
         }
-        return startedTurn ? "started_turn" : "follow_up"
-      })
-    } catch (cause) {
-      this.#recordControlOutcome({
-        ...controlOutcomeFields(admitted),
-        operation: "task_assignment",
-        result: "failed",
-        evidence: { ...evidence, errorCode: "assignment_failed" }
-      })
-      throw cause
-    }
-    const targetWorkCycle = record.child.snapshot().workCycle ?? record.lastWorkCycle
-    this.#recordControlOutcome({
-      ...controlOutcomeFields(admitted),
-      operation: "task_assignment",
-      result: "succeeded",
-      evidence: { ...evidence, delivery: delivery === "started_turn" ? "started_cycle" : delivery, targetWorkCycle }
+        await record.child.continueWith(text)
+      } catch (cause) {
+        if (!cycleStarted) {
+          record.task = previousTask
+          if (startedTurn) this.#ledger.cancelReservation(name, nextCycle)
+        } else if (record.child.snapshot().lifecycle === "idle") {
+          this.#completion({
+            name,
+            workCycle: nextCycle,
+            status: "failed",
+            text: "",
+            originalBytes: 0,
+            omittedBytes: 0,
+            truncated: false,
+            durationMs: record.child.snapshot().elapsedMs ?? 0,
+            reason: "assignment_failed",
+            error: clipUtf8(cause instanceof Error ? cause.message : String(cause), durablePreviewBytes).text
+          })
+        }
+        throw cause
+      }
+      return startedTurn ? "started_turn" : "follow_up"
     })
     this.#pumpMailbox()
     this.#assertInvariants()
@@ -653,15 +460,8 @@ export class SubagentSupervisor {
   async interrupt(name: string): Promise<"interrupted" | "already_idle"> {
     this.#assertOpen()
     validateSubagentName(name)
-    const admitted = admitSubagentControlOperation()
-    let record: LiveRecord
-    try {
-      record = this.#requireLive(name)
-    } catch (cause) {
-      this.#recordInterruptFailure(admitted, name, "target_not_live")
-      throw cause
-    }
-    return record.serial.run(() => this.#interruptRecord(admitted, name, record))
+    const record = this.#requireLive(name)
+    return record.serial.run(() => this.#interruptRecord(name, record))
   }
 
   async interruptAndWait(name: string, signal?: AbortSignal): Promise<SubagentInterruptSettlement> {
@@ -678,39 +478,11 @@ export class SubagentSupervisor {
 
   async close(name: string, reason = "close", graceMs?: number, forceMs?: number): Promise<SubagentSnapshot> {
     validateSubagentName(name)
-    const admitted = admitSubagentControlOperation()
     const record = this.#live.get(name)
-    const targetWorkCycle = record?.child.snapshot().workCycle
-    let snapshot: SubagentSnapshot
-    if (!record) {
-      try {
-        snapshot = this.#snapshotFor(name)
-      } catch (cause) {
-        this.#recordCloseFailure(admitted, name, "target_not_live")
-        throw cause
-      }
-    } else {
-      try {
-        await this.#closeRecord(name, record, reason, graceMs, forceMs)
-        this.#assertInvariants()
-        snapshot = this.#snapshotFor(name)
-      } catch (cause) {
-        this.#recordCloseFailure(admitted, name, "close_failed", targetWorkCycle)
-        throw cause
-      }
-    }
-    this.#recordControlOutcome({
-      ...controlOutcomeFields(admitted),
-      operation: "close",
-      result: "succeeded",
-      evidence: {
-        commandId: admitted.commandId,
-        source: "host",
-        target: name,
-        ...(targetWorkCycle === undefined ? {} : { targetWorkCycle })
-      }
-    })
-    return snapshot
+    if (!record) return this.#snapshotFor(name)
+    await this.#closeRecord(name, record, reason, graceMs, forceMs)
+    this.#assertInvariants()
+    return this.#snapshotFor(name)
   }
 
   async closeAndDeliver(name: string): Promise<SubagentSnapshot> {
@@ -834,20 +606,12 @@ export class SubagentSupervisor {
   ): Promise<SubagentInterruptSettlement> {
     this.#assertOpen()
     validateSubagentName(name)
-    throwIfWaitCancelled(signal)
-    const admitted = admitSubagentControlOperation()
-    let record: LiveRecord
-    try {
-      record = this.#requireLive(name)
-    } catch (cause) {
-      this.#recordInterruptFailure(admitted, name, "target_not_live")
-      throw cause
-    }
+    const record = this.#requireLive(name)
     const settlement = record.serial.run(async () => {
       const admittedSnapshot = record.child.snapshot()
       const workCycle = admittedSnapshot.workCycle ?? record.lastWorkCycle
       const admittedDelivery = this.#delivery(name, workCycle)?.type
-      const result = await this.#interruptRecord(admitted, name, record)
+      const result = await this.#interruptRecord(name, record)
       throwIfWaitCancelled(signal)
       if (result === "already_idle") {
         return {
@@ -877,74 +641,6 @@ export class SubagentSupervisor {
     return raceWithWaitCancellation(settlement, signal)
   }
 
-  async #interruptRecord(
-    admitted: SubagentControlAdmission,
-    name: string,
-    record: LiveRecord
-  ): Promise<"interrupted" | "already_idle"> {
-    const targetWorkCycle = record.child.snapshot().workCycle
-    let result: "interrupted" | "already_idle"
-    try {
-      result = await record.child.interrupt()
-    } catch (cause) {
-      this.#recordInterruptFailure(admitted, name, "interrupt_failed", targetWorkCycle)
-      throw cause
-    }
-    this.#recordControlOutcome({
-      ...controlOutcomeFields(admitted),
-      operation: "interrupt",
-      result: "succeeded",
-      evidence: {
-        commandId: admitted.commandId,
-        source: "host",
-        target: name,
-        disposition: result,
-        ...(targetWorkCycle === undefined ? {} : { targetWorkCycle })
-      }
-    })
-    return result
-  }
-
-  #recordInterruptFailure(
-    admitted: SubagentControlAdmission,
-    name: string,
-    errorCode: "target_not_live" | "interrupt_failed",
-    targetWorkCycle?: number
-  ): void {
-    this.#recordControlOutcome({
-      ...controlOutcomeFields(admitted),
-      operation: "interrupt",
-      result: "failed",
-      evidence: {
-        commandId: admitted.commandId,
-        source: "host",
-        target: name,
-        ...(targetWorkCycle === undefined ? {} : { targetWorkCycle }),
-        errorCode
-      }
-    })
-  }
-
-  #recordCloseFailure(
-    admitted: SubagentControlAdmission,
-    name: string,
-    errorCode: "target_not_live" | "close_failed",
-    targetWorkCycle?: number
-  ): void {
-    this.#recordControlOutcome({
-      ...controlOutcomeFields(admitted),
-      operation: "close",
-      result: "failed",
-      evidence: {
-        commandId: admitted.commandId,
-        source: "host",
-        target: name,
-        ...(targetWorkCycle === undefined ? {} : { targetWorkCycle }),
-        errorCode
-      }
-    })
-  }
-
   async #closeAndDeliver(name: string, deliveryMode: "consume" | "claim", claimId?: string): Promise<SubagentSnapshot> {
     validateSubagentName(name)
     this.#requireKnown(name)
@@ -966,10 +662,16 @@ export class SubagentSupervisor {
       closeAll.then(() => undefined),
       subagentShutdownMs
     ).then(() => {
-      this.#state = { type: "closed" }
+      this.#pumpMailbox()
       this.#assertInvariants()
+      if (this.#ledger.pendingPersistence().length > 0) {
+        throw new Error("Could not persist subagent work results")
+      }
+      this.#invariant.shutdownSucceeded()
+      this.#state = { type: "closed" }
       this.#notifyWaiters()
       this.#listeners.clear()
+      this.#invariant.dispose()
       return undefined
     })
     return this.#shutdown
@@ -987,7 +689,7 @@ export class SubagentSupervisor {
       try {
         this.#append({ event: "closing", name, reason })
       } catch {
-        // Process cleanup and in-memory terminal evidence must survive journal failure.
+        // Process cleanup and the in-memory terminal result must survive journal failure.
       }
       try {
         await record.child.close(reason, graceMs, forceMs)
@@ -999,25 +701,9 @@ export class SubagentSupervisor {
     return closing
   }
 
-  #admitPeerControlOutcome(sender: string, workCycle: number): void {
-    const current = this.#peerOutcomeQuotas.get(sender)
-    const quota = current?.workCycle === workCycle ? current : { workCycle, admitted: 0 }
-    if (quota.admitted === maxSubagentControlOutcomesPerWorkCycle) {
-      throw new Error(
-        `Subagent ${sender} exceeded ${maxSubagentControlOutcomesPerWorkCycle} durable control outcomes for work cycle ${workCycle}`
-      )
-    }
-    quota.admitted++
-    this.#peerOutcomeQuotas.set(sender, quota)
-  }
-
-  #recordControlOutcome(outcome: SubagentControlOutcomeInput): void {
-    if (!this.#outcomeSink) throw new Error("Subagent operation outcome sink is not bound")
-    this.#outcomeSink(outcome)
-  }
-
   #completion(completion: SubagentCompletion): void {
     const retained = retainCompletion(completion)
+    this.#invariant.settleWork(retained.name, retained.workCycle)
     if (this.#ledger.admit(retained) !== "accepted") return
     this.#pumpMailbox()
   }
@@ -1030,12 +716,14 @@ export class SubagentSupervisor {
       const completion = pending.completion
       const preview = clipUtf8(completion.text, durablePreviewBytes)
       try {
-        if (!this.#outcomeSink) break
-        this.#outcomeSink(subagentOutcome(completion, this.#profiles.get(completion.name), preview), entry => {
+        if (!this.#resultSink) break
+        this.#resultSink(subagentResult(completion, this.#profiles.get(completion.name), preview), entry => {
           this.#ledger.commitPersistence(completion.name, completion.workCycle, entry.id)
+          this.#invariant.persistResult(completion.name, completion.workCycle)
           changed.add(completion.name)
         })
-      } catch {
+      } catch (cause) {
+        if (cause instanceof InvariantError) throw cause
         break
       }
     }
@@ -1091,7 +779,6 @@ export class SubagentSupervisor {
   #retainExit(name: string, record: LiveRecord): void {
     if (this.#live.get(name) !== record) return
     this.#live.delete(name)
-    this.#peerOutcomeQuotas.delete(name)
     const state = record.child.state
     if (record.lastWorkCycle > 0 && !this.#delivery(name, record.lastWorkCycle)) {
       const failure =
@@ -1124,9 +811,10 @@ export class SubagentSupervisor {
       exitedAt: Date.now(),
       task: record.task
     })
+    this.#invariant.exit(name)
     try {
-      const outcome = state.type === "exited" ? JSON.stringify(state.outcome) : snapshot.lifecycle
-      this.#append({ event: "exited", name, outcome: clipUtf8(outcome, durablePreviewBytes).text })
+      const exitDescription = state.type === "exited" ? JSON.stringify(state.outcome) : snapshot.lifecycle
+      this.#append({ event: "exited", name, outcome: clipUtf8(exitDescription, durablePreviewBytes).text })
     } catch {
       // The exited snapshot and any pending completion remain addressable in memory.
     } finally {
@@ -1360,7 +1048,28 @@ export class SubagentSupervisor {
       task: record.task
     })
     record.lastWorkCycle = workCycle
+    this.#invariant.startWork(name, workCycle)
     this.#emit({ type: "entry_appended", entry })
+  }
+
+  async #interruptRecord(name: string, record: LiveRecord): Promise<"interrupted" | "already_idle"> {
+    const snapshot = record.child.snapshot()
+    const workCycle = snapshot.workCycle
+    const admitted =
+      workCycle !== undefined && (snapshot.lifecycle === "running" || snapshot.lifecycle === "spawn_admitting")
+    if (admitted) this.#invariant.admitInterrupt(name, workCycle)
+    try {
+      const result = await record.child.interrupt()
+      this.#assertInvariants()
+      return result
+    } catch (cause) {
+      const state = record.child.state
+      if (admitted && (state.type === "running" || state.type === "spawn_admitting")) {
+        this.#invariant.rejectInterrupt(name, workCycle)
+      }
+      this.#assertInvariants()
+      throw cause
+    }
   }
 
   #assertSpawnAdmission(name: string, record: LiveRecord, signal?: AbortSignal): void {
@@ -1393,11 +1102,7 @@ export class SubagentSupervisor {
 
   #assertInvariants(): void {
     this.#ledger.assertInvariants()
-    if (
-      this.#live.size > maxLiveChildren ||
-      this.#exited.length > maxRetainedSubagents ||
-      this.#peerOutcomeQuotas.size > maxLiveChildren
-    ) {
+    if (this.#live.size > maxLiveChildren || this.#exited.length > maxRetainedSubagents) {
       throw new Error("Subagent supervisor invariant violated: retained state exceeds its bound")
     }
     const retained = new Set<string>()
@@ -1514,18 +1219,6 @@ function validateEnvironment(
   return Object.freeze(Object.fromEntries(entries))
 }
 
-function controlOutcomeFields(admitted: SubagentControlAdmission): {
-  readonly capability: "subagent"
-  readonly operationId: string
-  readonly durationMs: number
-} {
-  return {
-    capability: "subagent",
-    operationId: admitted.operationId,
-    durationMs: Math.max(0, Date.now() - admitted.startedAt)
-  }
-}
-
 function retainCompletion(completion: SubagentCompletion): SubagentCompletion {
   if (completion.status !== "failed") return Object.freeze({ ...completion })
   return Object.freeze({
@@ -1534,38 +1227,29 @@ function retainCompletion(completion: SubagentCompletion): SubagentCompletion {
   })
 }
 
-function subagentOutcome(
+function subagentResult(
   completion: SubagentCompletion,
   profile: string | undefined,
   preview: ReturnType<typeof clipUtf8>
-): SubagentWorkCycleOutcomeInput {
+): SubagentWorkResultInput {
+  const boundedPreview = clipJsonString(preview.text, maxSubagentResultTextJsonBytes)
   const common = {
-    capability: "subagent",
-    operation: "work_cycle",
-    operationId: subagentWorkCycleOperationId(completion.name, completion.workCycle),
-    durationMs: completion.durationMs
-  } as const
-  const outcomePreview = clipJsonString(preview.text, maxSubagentOutcomeTextJsonBytes)
-  const evidence = {
     name: completion.name,
     workCycle: completion.workCycle,
     ...(profile ? { profile } : {}),
-    preview: outcomePreview.text,
+    durationMs: completion.durationMs,
+    preview: boundedPreview.text,
     originalBytes: completion.originalBytes,
-    omittedBytes: completion.omittedBytes + preview.omittedBytes + outcomePreview.omittedBytes,
-    truncated: completion.truncated || preview.omittedBytes > 0 || outcomePreview.omittedBytes > 0
+    omittedBytes: completion.omittedBytes + preview.omittedBytes + boundedPreview.omittedBytes,
+    truncated: completion.truncated || preview.omittedBytes > 0 || boundedPreview.omittedBytes > 0
   }
   if (completion.status === "failed") {
     const errorMessage = completion.error
-      ? clipJsonString(completion.error, maxSubagentOutcomeTextJsonBytes).text
+      ? clipJsonString(completion.error, maxSubagentResultTextJsonBytes).text
       : undefined
-    return {
-      ...common,
-      result: "failed",
-      evidence: { ...evidence, errorCode: completion.reason, ...(errorMessage ? { errorMessage } : {}) }
-    }
+    return { ...common, result: "failed", errorCode: completion.reason, ...(errorMessage ? { errorMessage } : {}) }
   }
-  return { ...common, result: completion.status === "completed" ? "succeeded" : "cancelled", evidence }
+  return { ...common, result: completion.status === "completed" ? "succeeded" : "cancelled" }
 }
 
 function clipJsonString(value: string, maximumBytes: number): ReturnType<typeof clipUtf8> {

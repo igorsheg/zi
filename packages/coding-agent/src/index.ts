@@ -33,7 +33,6 @@ export type {
 export * from "./extensions/discovery.js"
 export * from "./model-registry.js"
 export * from "./model-resolver.js"
-export * from "./operation-outcomes.js"
 export * from "./paths.js"
 export * from "./print-mode.js"
 export * from "./project-file-search.js"

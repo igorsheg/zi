@@ -3,13 +3,14 @@ import { Type } from "@earendil-works/pi-ai"
 import { validateToolArguments } from "@earendil-works/pi-ai/compat"
 
 import { isRecord } from "../guards.js"
+import { FramedJsonDecoder, FramedJsonWriter } from "../processes/framed-json.js"
+import { spawnOwnedProcess, type OwnedProcessExit, type ProtocolOwnedProcess } from "../processes/owned-process.js"
 import type { ProcessTreeTracker } from "../processes/process-tree.js"
 import type { SessionManager } from "../session-manager.js"
 import { isBuiltInToolError } from "../tools/outcome.js"
-import { createCodeModeWorkerSpawner, type CodeModeWorkerExit, type CodeModeWorkerProcess } from "./process.js"
 import {
-  CodeModeProtocolDecoder,
-  CodeModeProtocolWriter,
+  codeModeFramingLabel,
+  codeModeFramingLimits,
   codeModeProtocolVersion,
   isCodeModeToolName,
   maxCodeBytes,
@@ -110,7 +111,7 @@ type WorkerState =
   | { readonly type: "disposed" }
 
 export class CodeMode {
-  readonly #spawn: () => CodeModeWorkerProcess
+  readonly #spawn: () => ProtocolOwnedProcess
   readonly #sessionManager: SessionManager | undefined
   #worker: CodeWorker | undefined
   #startingWorker: CodeWorker | undefined
@@ -128,8 +129,19 @@ export class CodeMode {
     sessionManager?: SessionManager,
     processTreeTracker?: ProcessTreeTracker
   ) {
-    const spawn = createCodeModeWorkerSpawner(workerCommand, processTreeTracker)
-    this.#spawn = () => spawn(cwd)
+    const command = Object.freeze([...workerCommand, "--zi-internal-code-mode-worker"])
+    const env = Object.freeze({ ...process.env })
+    this.#spawn = () => {
+      const worker = spawnOwnedProcess({
+        type: "protocol",
+        pipeAdapter: "direct",
+        command,
+        cwd,
+        env,
+        ...(processTreeTracker ? { processTreeTracker } : {})
+      })
+      return worker
+    }
     this.#sessionManager = sessionManager
     const restored = sessionManager?.latestActiveProgramState()?.data
     this.#state = restored === undefined ? {} : validateCodeModeState(restored)
@@ -268,9 +280,9 @@ export class CodeMode {
 }
 
 class CodeWorker {
-  readonly #process: CodeModeWorkerProcess
+  readonly #process: ProtocolOwnedProcess
   readonly #generation: number
-  readonly #writer: CodeModeProtocolWriter
+  readonly #writer: FramedJsonWriter<CodeModeHostMessage>
   readonly #ready = deferred<void>()
   readonly #failure = deferred<never>()
   readonly #stdout: BoundedOutput
@@ -278,10 +290,10 @@ class CodeWorker {
   readonly #protocol: Promise<void>
   #state: WorkerState = { type: "starting" }
 
-  constructor(process: CodeModeWorkerProcess, generation: number) {
+  constructor(process: ProtocolOwnedProcess, generation: number) {
     this.#process = process
     this.#generation = generation
-    this.#writer = new CodeModeProtocolWriter(process.input)
+    this.#writer = new FramedJsonWriter(process.input, codeModeFramingLimits, codeModeFramingLabel)
     this.#stdout = new BoundedOutput(process.stdout)
     this.#stderr = new BoundedOutput(process.stderr)
     this.#protocol = this.#readProtocol()
@@ -371,7 +383,7 @@ class CodeWorker {
       treeFailure = cause
     }
     const exited = await exitsWithin(this.#process.exited, defaultTimeouts.shutdownMs)
-    this.#process.dispose()
+    await this.#process.dispose()
     let streamFailure: unknown
     try {
       await settle(
@@ -388,7 +400,7 @@ class CodeWorker {
   }
 
   async #readProtocol(): Promise<void> {
-    const decoder = new CodeModeProtocolDecoder(validateWorkerMessage)
+    const decoder = new FramedJsonDecoder(validateWorkerMessage, codeModeFramingLimits, codeModeFramingLabel)
     try {
       for await (const chunk of this.#process.protocol) {
         for (const message of decoder.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))) this.#accept(message)
@@ -1067,7 +1079,7 @@ class BoundedOutput {
   }
 }
 
-function processExited(exit: Promise<CodeModeWorkerExit>): Promise<never> {
+function processExited(exit: Promise<OwnedProcessExit>): Promise<never> {
   return exit.then(value => {
     const detail = value.error?.message ?? `exit ${value.code ?? "null"}${value.signal ? ` (${value.signal})` : ""}`
     throw new Error(`Code-mode worker exited before completion: ${detail}`)
@@ -1085,7 +1097,7 @@ function abortError(signal: AbortSignal): Error {
   return signal.reason instanceof Error ? signal.reason : new Error("Code execution aborted")
 }
 
-async function exitsWithin(exit: Promise<CodeModeWorkerExit>, milliseconds: number): Promise<boolean> {
+async function exitsWithin(exit: Promise<OwnedProcessExit>, milliseconds: number): Promise<boolean> {
   let timer: ReturnType<typeof setTimeout> | undefined
   try {
     return await Promise.race([

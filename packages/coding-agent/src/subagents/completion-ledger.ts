@@ -1,6 +1,5 @@
-import type { SubagentEntry } from "../session-manager.js"
+import type { SubagentEntry, SubagentWorkResultEntry } from "../session-manager.js"
 import type { SubagentCompletion } from "./child-process.js"
-import type { SubagentWorkCycleOutcome } from "./outcome.js"
 
 export const maxCompletionLedgerEntries = 32
 
@@ -47,7 +46,7 @@ export class CompletionLedger {
   }
 
   static restore(
-    outcomes: Iterable<SubagentWorkCycleOutcome>,
+    results: Iterable<SubagentWorkResultEntry>,
     entries: Iterable<SubagentEntry>,
     maximum = maxCompletionLedgerEntries
   ): CompletionLedger {
@@ -58,36 +57,35 @@ export class CompletionLedger {
     )
     const ledger = new CompletionLedger(maximum)
     const restored = new Set<string>()
-    for (const outcome of outcomes) {
-      const evidence = outcome.evidence
-      const key = completionKey(evidence.name, evidence.workCycle)
+    for (const result of results) {
+      const key = completionKey(result.name, result.workCycle)
       if (restored.has(key)) continue
       restored.add(key)
       ledger.#makeSpace(`Session contains more than ${maximum} undelivered subagent completions`)
       const common = {
-        name: evidence.name,
-        workCycle: evidence.workCycle,
-        text: evidence.preview,
-        originalBytes: evidence.originalBytes,
-        omittedBytes: evidence.omittedBytes,
-        truncated: evidence.truncated,
-        durationMs: outcome.durationMs
+        name: result.name,
+        workCycle: result.workCycle,
+        text: result.preview,
+        originalBytes: result.originalBytes,
+        omittedBytes: result.omittedBytes,
+        truncated: result.truncated,
+        durationMs: result.durationMs
       }
       const completion: SubagentCompletion = Object.freeze(
-        outcome.result === "failed"
+        result.result === "failed"
           ? {
               ...common,
               status: "failed",
-              reason: outcome.evidence.errorCode,
-              ...(outcome.evidence.errorMessage ? { error: outcome.evidence.errorMessage } : {})
+              reason: result.errorCode,
+              ...(result.errorMessage ? { error: result.errorMessage } : {})
             }
-          : { ...common, status: outcome.result === "succeeded" ? "completed" : "cancelled" }
+          : { ...common, status: result.result === "succeeded" ? "completed" : "cancelled" }
       )
       ledger.#states.set(
         key,
         delivered.has(key)
-          ? { type: "delivered_durable", completion, entryId: outcome.id }
-          : { type: "durable", completion, entryId: outcome.id }
+          ? { type: "delivered_durable", completion, entryId: result.id }
+          : { type: "durable", completion, entryId: result.id }
       )
     }
     ledger.assertInvariants()

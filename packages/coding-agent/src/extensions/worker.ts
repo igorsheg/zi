@@ -25,6 +25,7 @@ import { Type } from "typebox"
 import { Compile, type Validator } from "typebox/compile"
 
 import { isRecord } from "../guards.js"
+import { FramedJsonDecoder, FramedJsonWriter } from "../processes/framed-json.js"
 import type { ExtensionLoadPlan, ExtensionSource } from "./discovery.js"
 import {
   boundedExtensionCommandError,
@@ -32,10 +33,10 @@ import {
   boundedExtensionLoadDiagnostic,
   boundedExtensionToolError,
   extensionAgentEventTimeoutMs,
+  extensionFramingLabel,
+  extensionFramingLimits,
   extensionLifecycleTimeoutMs,
-  ExtensionProtocolDecoder,
   ExtensionProtocolError,
-  ExtensionProtocolWriter,
   extensionProtocolVersion,
   extensionStartupTimeoutMs,
   maxExtensionCommands,
@@ -441,7 +442,7 @@ export class LoadedExtensionGeneration {
 }
 
 class ExtensionWorkerProcess {
-  readonly #writer: ExtensionProtocolWriter
+  readonly #writer: FramedJsonWriter<WorkerMessage>
   readonly #terminal = deferred()
   readonly #invocationOwner = new AsyncLocalStorage<number>()
   readonly #invocations = new Map<number, WorkerInvocation>()
@@ -455,7 +456,9 @@ class ExtensionWorkerProcess {
   #state: WorkerProcessState = { type: "awaiting_initialize" }
 
   constructor(output: Writable) {
-    this.#writer = new ExtensionProtocolWriter(output, cause => this.#fail(cause))
+    this.#writer = new FramedJsonWriter(output, extensionFramingLimits, extensionFramingLabel, cause =>
+      this.#fail(cause)
+    )
   }
 
   get terminal(): Promise<void> {
@@ -1257,7 +1260,7 @@ class ExtensionWorkerProcess {
 }
 
 export async function runExtensionWorkerProcess(input: Readable, output: Writable): Promise<void> {
-  const decoder = new ExtensionProtocolDecoder(validateHostMessage)
+  const decoder = new FramedJsonDecoder(validateHostMessage, extensionFramingLimits, extensionFramingLabel)
   const worker = new ExtensionWorkerProcess(output)
   const iterator = input[Symbol.asyncIterator]()
   const terminal = worker.terminal.then(

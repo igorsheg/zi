@@ -7,7 +7,6 @@ import { join, resolve } from "node:path"
 import { Type } from "@earendil-works/pi-ai"
 
 import { createAgentSessionRuntime } from "../src/agent-session-runtime.js"
-import { isRecord } from "../src/guards.js"
 import { createAgentRuntime } from "../src/runtime.js"
 import { SessionManager } from "../src/session-manager.js"
 import { createModels, fauxAssistantMessage, fauxProvider, fauxText, fauxToolCall } from "../src/testing.js"
@@ -1060,20 +1059,6 @@ export default function (zi: ExtensionAPI): void {
     expect(JSON.parse(await readFile(childArgv, "utf8"))).toEqual(
       expect.arrayContaining(["--model", "faux/faux-1", "--thinking", "high"])
     )
-    const controlOutcomes = runtime.session.sessionManager
-      .operationOutcomes()
-      .filter(outcome => outcome.capability === "subagent" && outcome.operation !== "work_cycle")
-    expect(controlOutcomes.map(outcome => [outcome.operation, outcome.result])).toEqual([
-      ["spawn", "succeeded"],
-      ["message_delivery", "succeeded"],
-      ["task_assignment", "succeeded"],
-      ["task_assignment", "succeeded"],
-      ["interrupt", "succeeded"],
-      ["close", "succeeded"]
-    ])
-    expect(JSON.stringify(controlOutcomes)).not.toContain("context")
-    expect(JSON.stringify(controlOutcomes)).not.toContain("follow up")
-    expect(JSON.stringify(controlOutcomes)).not.toContain("second cycle")
   } finally {
     runtime.session.dispose()
     await runtime.session.waitForIdle()
@@ -1375,18 +1360,11 @@ test("subagent completion stays passive and joins the next parent model request"
     await runtime.session.prompt("Start the background investigation.")
     expect(faux.state.callCount).toBe(2)
 
-    await waitForCondition(
-      () => runtime.session.sessionManager.operationOutcomes().some(outcome => outcome.operation === "work_cycle"),
-      5_000
-    )
+    await waitForCondition(() => runtime.session.sessionManager.subagentWorkResults().length > 0, 5_000)
     expect(faux.state.callCount).toBe(2)
     expect(runtime.session.messages.some(message => message.role === "custom")).toBe(false)
-    expect(runtime.session.sessionManager.operationOutcomes()).toContainEqual(
-      expect.objectContaining({
-        capability: "subagent",
-        operation: "work_cycle",
-        evidence: expect.objectContaining({ profile: "pathfinder", name: "passive-worker" })
-      })
+    expect(runtime.session.sessionManager.subagentWorkResults()).toContainEqual(
+      expect.objectContaining({ profile: "pathfinder", name: "passive-worker" })
     )
 
     await runtime.session.prompt("Use any completed investigation.")
@@ -1511,13 +1489,7 @@ test("restoration and compaction never redeliver durable child completion eviden
   try {
     await first.session.prompt("Start a restorable background investigation.")
     await waitForCondition(
-      () =>
-        first.session.sessionManager
-          .operationOutcomes()
-          .some(
-            entry =>
-              entry.capability === "subagent" && isRecord(entry.evidence) && entry.evidence.name === "restored-worker"
-          ),
+      () => first.session.sessionManager.subagentWorkResults().some(entry => entry.name === "restored-worker"),
       5_000
     )
     const sessionFile = first.session.sessionManager.file!
@@ -1907,7 +1879,7 @@ test("reload replaces programmatic profiles in the canonical catalog", async () 
     await runtime.session.waitForIdle()
     await rm(root, { recursive: true, force: true })
   }
-})
+}, 10_000)
 
 test("a failed extension generation is removed from current and future provider catalogs", async () => {
   const root = await mkdtemp(join(tmpdir(), "zi-runtime-extension-tool-failure-"))

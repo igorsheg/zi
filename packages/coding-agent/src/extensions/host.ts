@@ -1,9 +1,3 @@
-import { spawn } from "node:child_process"
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
-import { tmpdir } from "node:os"
-import { delimiter, isAbsolute, join } from "node:path"
-import { Readable, Writable } from "node:stream"
-
 import type {
   ExtensionAgentSettledEvent,
   ExtensionAgentStartEvent,
@@ -19,17 +13,18 @@ import type {
   JsonValue as ExtensionJsonValue
 } from "@with-zi/extension-api"
 
-import type { ProcessScope, ProcessTreeTracker } from "../processes/process-tree.js"
+import { FramedJsonDecoder, FramedJsonWriter } from "../processes/framed-json.js"
 import type { ExtensionLoadPlan } from "./discovery.js"
+import type { ExtensionWorkerExit, ExtensionWorkerProcess, SpawnExtensionWorker } from "./process.js"
 import {
   boundedExtensionDiagnostic,
   boundedExtensionSessionOperationError,
   extensionAgentEventTimeoutMs,
   extensionCommandCancellationTimeoutMs,
   extensionCommandTimeoutMs,
+  extensionFramingLabel,
+  extensionFramingLimits,
   extensionLifecycleTimeoutMs,
-  ExtensionProtocolDecoder,
-  ExtensionProtocolWriter,
   extensionProtocolVersion,
   extensionShutdownTimeoutMs,
   extensionStartupTimeoutMs,
@@ -53,27 +48,6 @@ import {
   validateExtensionToolArguments,
   validateWorkerMessage
 } from "./protocol.js"
-import { extensionApiModuleSource } from "./public-api-module.js"
-import { extensionWorkerArgument } from "./worker-mode.js"
-
-export interface ExtensionWorkerExit {
-  readonly code: number | null
-  readonly signal: NodeJS.Signals | null
-  readonly error?: Error
-}
-
-export interface ExtensionWorkerProcess {
-  readonly input: Writable
-  readonly stdout: Readable
-  readonly stderr: Readable
-  readonly protocol: Readable
-  readonly admitted?: Promise<void>
-  readonly exited: Promise<ExtensionWorkerExit>
-  terminate(force: boolean): void
-  dispose(): void | Promise<void>
-}
-
-export type SpawnExtensionWorker = (plan: ExtensionLoadPlan) => ExtensionWorkerProcess
 
 export interface ExtensionSubagentSessionOperations {
   readonly waitTimeoutMs: number
@@ -384,8 +358,8 @@ class ExtensionGeneration {
   readonly id: number
   readonly plan: ExtensionLoadPlan
   readonly #process: ExtensionWorkerProcess
-  readonly #writer: ExtensionProtocolWriter
-  readonly #decoder = new ExtensionProtocolDecoder(validateWorkerMessage)
+  readonly #writer: FramedJsonWriter<HostMessage>
+  readonly #decoder = new FramedJsonDecoder(validateWorkerMessage, extensionFramingLimits, extensionFramingLabel)
   readonly #timeouts: ExtensionHostTimeouts
   readonly #onDiagnostic: (diagnostic: ExtensionDiagnostic) => void
   readonly #onFailure: (generation: ExtensionGeneration, diagnostic: ExtensionDiagnostic) => void
@@ -445,7 +419,7 @@ class ExtensionGeneration {
     this.#onStaleFrame = onStaleFrame
     this.#onSessionRequest = onSessionRequest
     this.#state = { type: "starting", ready: deferred<ExtensionGenerationReady>() }
-    this.#writer = new ExtensionProtocolWriter(process.input, cause =>
+    this.#writer = new FramedJsonWriter(process.input, extensionFramingLimits, extensionFramingLabel, cause =>
       this.#fail("protocol", "Extension worker protocol output failed", cause)
     )
     this.#onProtocolData = chunk => this.#receiveBytes(chunk)
@@ -2126,333 +2100,6 @@ function reloadOutcomeAfterStart(state: ExtensionHostState): ExtensionReloadOutc
       return "superseded"
     default:
       return "superseded"
-  }
-}
-
-type SpawnedExtensionChild =
-  | { readonly type: "bun"; readonly process: Bun.Subprocess<"pipe", "pipe", "pipe"> }
-  | { readonly type: "node"; readonly process: ReturnType<typeof spawn> }
-
-export function createExtensionWorkerSpawner(
-  command: readonly string[],
-  processTreeTracker: ProcessTreeTracker,
-  removePublicApiDirectory: (path: string) => void = path => rmSync(path, { recursive: true, force: true })
-): SpawnExtensionWorker {
-  if (
-    command.length === 0 ||
-    command.length > 16 ||
-    !isAbsolute(command[0]!) ||
-    command.some(part => part.length === 0 || part.includes("\0") || Buffer.byteLength(part) > 4096)
-  ) {
-    throw new Error(
-      "Extension worker commands require an absolute executable and at most 15 non-empty 4096-byte prefix arguments"
-    )
-  }
-  const admitted = Object.freeze([...command])
-  const inheritedEnvironment = Object.freeze({ ...process.env })
-  return plan => {
-    const publicApi = createPublicApiModule(removePublicApiDirectory)
-    const args = [...admitted.slice(1), extensionWorkerArgument]
-    const env = {
-      ...inheritedEnvironment,
-      NODE_PATH: inheritedEnvironment.NODE_PATH
-        ? `${publicApi.nodeModules}${delimiter}${inheritedEnvironment.NODE_PATH}`
-        : publicApi.nodeModules
-    }
-    let child: SpawnedExtensionChild
-    try {
-      // Bun owns POSIX pipe creation because its node adapter can fail while materializing fd 3 under Linux load.
-      // The node adapter remains required on Windows, where Bun's direct fd 3 transport is not connected.
-      // POSIX workers start a dedicated session/process group so hard containment can signal
-      // the whole group. Windows workers join a kill-on-close Job Object after spawn.
-      child =
-        process.platform === "win32"
-          ? {
-              type: "node",
-              process: spawn(admitted[0]!, args, {
-                cwd: plan.cwd,
-                env,
-                stdio: ["pipe", "pipe", "pipe", "pipe"],
-                windowsHide: true
-              })
-            }
-          : {
-              type: "bun",
-              process: Bun.spawn([admitted[0]!, ...args], {
-                cwd: plan.cwd,
-                env,
-                stdio: ["pipe", "pipe", "pipe", "pipe"],
-                detached: true,
-                windowsHide: true
-              })
-            }
-    } catch (cause) {
-      publicApi.dispose()
-      throw cause
-    }
-    let input: Writable
-    let stdout: Readable
-    let stderr: Readable
-    let protocol: Readable
-    try {
-      if (child.type === "bun") {
-        const protocolDescriptor = child.process.stdio[3]
-        if (typeof protocolDescriptor !== "number") {
-          throw new Error("Extension worker process did not expose all required pipes")
-        }
-        input = createBunProcessInput(child.process.stdin)
-        stdout = Readable.from(child.process.stdout)
-        stderr = Readable.from(child.process.stderr)
-        protocol = Readable.from(Bun.file(protocolDescriptor).stream())
-      } else {
-        const protocolStream = child.process.stdio[3]
-        if (
-          !child.process.stdin ||
-          !child.process.stdout ||
-          !child.process.stderr ||
-          !(protocolStream instanceof Readable)
-        ) {
-          throw new Error("Extension worker process did not expose all required pipes")
-        }
-        input = child.process.stdin
-        stdout = child.process.stdout
-        stderr = child.process.stderr
-        protocol = protocolStream
-      }
-    } catch (cause) {
-      if (child.type === "node") child.process.once("error", () => {})
-      killSpawnedExtensionChild(child, "SIGKILL")
-      unrefSpawnedExtensionChild(child)
-      const cleanupError = publicApi.dispose()
-      if (cleanupError) {
-        throw new Error(`${errorMessage(cause, "Could not connect extension worker pipes")}; ${cleanupError.message}`, {
-          cause
-        })
-      }
-      throw cause
-    }
-
-    let settled = false
-    let finishSettlement: Promise<void> | undefined
-    let processError: Error | undefined
-    let resolveExit!: (exit: ExtensionWorkerExit) => void
-    const exited = new Promise<ExtensionWorkerExit>(resolve => {
-      resolveExit = resolve
-    })
-    const workerPid = child.process.pid
-    if (typeof workerPid !== "number" || workerPid <= 0) {
-      killSpawnedExtensionChild(child, "SIGKILL")
-      unrefSpawnedExtensionChild(child)
-      publicApi.dispose()
-      throw new Error("Extension worker did not expose a process id")
-    }
-    let processScope: ProcessScope
-    try {
-      processScope = processTreeTracker.track(workerPid, error => {
-        processError ??= error
-        killSpawnedExtensionChild(child, "SIGKILL")
-      })
-    } catch (cause) {
-      processError = cause instanceof Error ? cause : new Error("Could not create extension worker process scope")
-      killSpawnedExtensionChild(child, "SIGKILL")
-      unrefSpawnedExtensionChild(child)
-      const cleanupError = publicApi.dispose()
-      if (cleanupError) {
-        throw new Error(`${processError.message}; ${cleanupError.message}`, { cause })
-      }
-      throw processError
-    }
-    const finish = (code: number | null, signal: NodeJS.Signals | null): Promise<void> => {
-      if (finishSettlement) return finishSettlement
-      settled = true
-      finishSettlement = (async () => {
-        try {
-          await processScope.terminate()
-        } catch (cause) {
-          processError = processError
-            ? new Error(`${processError.message}; process scope cleanup failed: ${errorMessage(cause, "unknown")}`, {
-                cause: processError
-              })
-            : cause instanceof Error
-              ? cause
-              : new Error(errorMessage(cause, "process scope cleanup failed"))
-        }
-        const cleanupError = publicApi.dispose()
-        if (cleanupError) {
-          processError = processError
-            ? new Error(`${processError.message}; public API cleanup failed: ${cleanupError.message}`, {
-                cause: processError
-              })
-            : cleanupError
-        }
-        resolveExit({ code, signal, ...(processError ? { error: processError } : {}) })
-      })()
-      return finishSettlement
-    }
-    let stopObservingExit: (() => void) | undefined
-    if (child.type === "bun") {
-      const childProcess = child.process
-      void childProcess.exited.then(
-        code => finish(code, childProcess.signalCode),
-        cause => {
-          processError = cause instanceof Error ? cause : new Error("Extension worker process failed")
-          void finish(childProcess.exitCode, childProcess.signalCode)
-        }
-      )
-    } else {
-      const childProcess = child.process
-      const onError = (cause: Error): void => {
-        processError = cause
-      }
-      const onClose = (code: number | null, signal: NodeJS.Signals | null): void => {
-        void finish(code, signal)
-      }
-      childProcess.on("error", onError)
-      childProcess.on("close", onClose)
-      stopObservingExit = () => {
-        childProcess.off("error", onError)
-        childProcess.off("close", onClose)
-      }
-    }
-
-    return {
-      input,
-      stdout,
-      stderr,
-      protocol,
-      admitted: processScope.admitted,
-      exited,
-      terminate(force) {
-        if (settled) return
-        if (force) {
-          killSpawnedExtensionChild(child, "SIGKILL")
-          void processScope.terminate().catch(cause => {
-            processError ??=
-              cause instanceof Error ? cause : new Error(errorMessage(cause, "process scope cleanup failed"))
-          })
-          return
-        }
-        killSpawnedExtensionChild(child, "SIGTERM")
-      },
-      async dispose() {
-        stopObservingExit?.()
-        if (finishSettlement) {
-          await finishSettlement
-          return
-        }
-        await processScope.terminate()
-        unrefSpawnedExtensionChild(child)
-        processError ??= new Error("Extension worker process ownership ended before exit observation")
-        const exit = spawnedExtensionChildExit(child)
-        await finish(exit.code, exit.signal)
-      }
-    }
-  }
-}
-
-function killSpawnedExtensionChild(child: SpawnedExtensionChild, signal: NodeJS.Signals): void {
-  child.process.kill(signal)
-}
-
-function unrefSpawnedExtensionChild(child: SpawnedExtensionChild): void {
-  child.process.unref()
-}
-
-function spawnedExtensionChildExit(child: SpawnedExtensionChild): Pick<ExtensionWorkerExit, "code" | "signal"> {
-  return { code: child.process.exitCode, signal: child.process.signalCode }
-}
-
-function createBunProcessInput(sink: Bun.FileSink): Writable {
-  let ended = false
-  return new Writable({
-    write(chunk: Buffer, _encoding, callback) {
-      void writeBunProcessInput(sink, chunk, callback)
-    },
-    final(callback) {
-      ended = true
-      void closeBunProcessInput(sink, null, callback)
-    },
-    destroy(cause, callback) {
-      if (ended) {
-        callback(cause)
-        return
-      }
-      ended = true
-      void closeBunProcessInput(sink, cause, callback)
-    }
-  })
-}
-
-async function writeBunProcessInput(
-  sink: Bun.FileSink,
-  chunk: Buffer,
-  callback: (error?: Error | null) => void
-): Promise<void> {
-  try {
-    await sink.write(chunk)
-    await sink.flush()
-    callback()
-  } catch (cause) {
-    callback(processStreamError(cause))
-  }
-}
-
-async function closeBunProcessInput(
-  sink: Bun.FileSink,
-  cause: Error | null,
-  callback: (error: Error | null) => void
-): Promise<void> {
-  try {
-    await sink.end(cause ?? undefined)
-    callback(cause)
-  } catch (failure) {
-    callback(cause ?? processStreamError(failure))
-  }
-}
-
-function processStreamError(cause: unknown): Error {
-  return cause instanceof Error ? cause : new Error("Extension worker process stream failed")
-}
-
-function createPublicApiModule(removeDirectory: (path: string) => void): {
-  readonly nodeModules: string
-  dispose(): Error | undefined
-} {
-  const root = mkdtempSync(join(tmpdir(), "zi-extension-api-"))
-  const nodeModules = join(root, "node_modules")
-  const packageDirectory = join(nodeModules, "@with-zi", "extension-api")
-  try {
-    mkdirSync(packageDirectory, { recursive: true, mode: 0o700 })
-    writeFileSync(
-      join(packageDirectory, "package.json"),
-      `${JSON.stringify({ name: "@with-zi/extension-api", type: "module", exports: "./index.js" })}\n`,
-      { mode: 0o600 }
-    )
-    writeFileSync(join(packageDirectory, "index.js"), extensionApiModuleSource, { mode: 0o600 })
-  } catch (cause) {
-    try {
-      removeDirectory(root)
-    } catch (cleanupCause) {
-      throw new Error(
-        `${errorMessage(cause, "Could not create extension public API module")}; cleanup failed: ${errorMessage(cleanupCause, "unknown cleanup error")}`,
-        { cause: cleanupCause }
-      )
-    }
-    throw cause
-  }
-  let disposed = false
-  return {
-    nodeModules,
-    dispose() {
-      if (disposed) return undefined
-      disposed = true
-      try {
-        removeDirectory(root)
-        return undefined
-      } catch (cause) {
-        return cause instanceof Error ? cause : new Error(String(cause))
-      }
-    }
   }
 }
 
