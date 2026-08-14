@@ -5,6 +5,7 @@ import { join } from "node:path"
 import type { InvariantRegistry } from "@with-zi/invariants"
 
 import { spawnOwnedProcess, type RawOwnedProcess } from "./processes/owned-process.js"
+import { createProcessTreeTracker, type ProcessTreeTracker } from "./processes/process-tree.js"
 import { SessionShellInvariant } from "./session-shell-invariant.js"
 import type { BackgroundTaskOrigin, BackgroundTaskResultInput } from "./shell-result.js"
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncateTail, type TruncationResult } from "./tools/truncate.js"
@@ -21,6 +22,8 @@ export const defaultShellLimits: ShellLimits = Object.freeze({
 })
 
 const outputUpdateIntervalMs = 100
+// Behavioral provenance: DeepSeek Harness 47f9438 disables terminal decoration and pagers for model-facing commands.
+const shellEnvironment = Object.freeze({ NO_COLOR: "1", TERM: "dumb", PAGER: "cat", GIT_PAGER: "cat" })
 
 export interface ShellLimits {
   readonly maxOutputFileBytes: number
@@ -38,6 +41,7 @@ export interface SessionShellOptions {
   readonly sessionId: string
   readonly limits?: ShellLimits
   readonly outputRoot?: string
+  readonly processTreeTracker?: ProcessTreeTracker
 }
 
 export interface ShellRunRequest {
@@ -226,6 +230,8 @@ export class SessionShell {
   readonly limits: ShellLimits
 
   readonly #outputRoot: string
+  readonly #processTreeTracker: ProcessTreeTracker
+  readonly #ownsProcessTreeTracker: boolean
   readonly #tasks = new Map<string, ShellTask>()
   readonly #listeners = new Set<(taskId: string) => void>()
   readonly #updateTimers = new Map<string, ReturnType<typeof setTimeout>>()
@@ -240,12 +246,20 @@ export class SessionShell {
   #retainedOutputBytes = 0
   #evictionTimer: ReturnType<typeof setTimeout> | undefined
 
-  constructor({ cwd, sessionId, limits = defaultShellLimits, outputRoot = tmpdir() }: SessionShellOptions) {
+  constructor({
+    cwd,
+    sessionId,
+    limits = defaultShellLimits,
+    outputRoot = tmpdir(),
+    processTreeTracker
+  }: SessionShellOptions) {
     assertLimits(limits)
     this.cwd = cwd
     this.sessionId = sessionId
     this.limits = limits
     this.#outputRoot = outputRoot
+    this.#processTreeTracker = processTreeTracker ?? createProcessTreeTracker()
+    this.#ownsProcessTreeTracker = processTreeTracker === undefined
   }
 
   bindInvariants(registry: InvariantRegistry): void {
@@ -378,8 +392,8 @@ export class SessionShell {
             ? [process.env.ComSpec ?? "C:\\Windows\\System32\\cmd.exe", "/d", "/s", "/c", request.command]
             : [process.env.SHELL ?? "/bin/bash", "-lc", request.command],
         cwd: this.cwd,
-        env: process.env,
-        signalUntrackedProcessGroup: true
+        env: { ...process.env, ...shellEnvironment },
+        processTreeTracker: this.#processTreeTracker
       })
     } catch (cause) {
       this.#beginSettlement(starting, { type: "failed", message: errorMessage(cause) })
@@ -403,20 +417,24 @@ export class SessionShell {
       : { ...identity, type: "foreground", child, timeout, removeAbort, output, processSettled, toolSettled, onUpdate }
     this.#tasks.set(taskId, running)
     this.#assertStableInvariants()
-    const outputSettled = Promise.all([streamSettled(child.stdout), streamSettled(child.stderr)])
+    const outputSettled = Promise.all([streamSettled(child.stdout), streamSettled(child.stderr)]).then(() => undefined)
     output.pipe(child.stdout)
     output.pipe(child.stderr)
-    void Promise.all([child.exited, outputSettled]).then(
-      ([exit]) => {
-        if (exit.error) this.#onProcessError(taskId, exit.error)
-        else this.#onProcessClose(taskId, exit.code, exit.signal)
-        return undefined
-      },
-      cause => {
-        this.#onProcessError(taskId, cause instanceof Error ? cause : new Error("Shell output failed"))
-        return undefined
+    void (async () => {
+      const exit = await child.exit
+      const drained = await settleWithin(outputSettled, this.limits.killGraceMs)
+      if (!drained) {
+        child.stdout.destroy()
+        child.stderr.destroy()
+        if (!(await settleWithin(outputSettled, this.limits.killGraceMs))) {
+          throw new Error("Shell output pipes did not close within the drain bound")
+        }
       }
-    )
+      if (exit.error) this.#onProcessError(taskId, exit.error)
+      else this.#onProcessClose(taskId, exit.code, exit.signal)
+    })().catch(cause => {
+      this.#onProcessError(taskId, cause instanceof Error ? cause : new Error("Shell output failed"))
+    })
 
     if (running.type === "background") {
       toolSettled.resolve({ type: "backgrounded", task: this.#snapshot(running) })
@@ -541,6 +559,13 @@ export class SessionShell {
     this.#pendingResults.clear()
     this.#resultSink = undefined
     for (const taskId of this.#tasks.keys()) this.#forgetTask(taskId)
+    if (this.#ownsProcessTreeTracker) {
+      try {
+        await this.#processTreeTracker.dispose()
+      } catch (cause) {
+        failure ??= cause instanceof Error ? cause : new Error("Could not dispose shell process containment")
+      }
+    }
     if (this.#outputDir) rmSync(this.#outputDir, { recursive: true, force: true })
     this.#outputDir = undefined
     this.#listeners.clear()
@@ -555,7 +580,7 @@ export class SessionShell {
 
   #hasForegroundAdmission(): boolean {
     for (const task of this.#tasks.values()) {
-      if (task.type === "foreground" || (task.type === "starting" && task.placement === "foreground")) return true
+      if (task.background.type === "none" && task.type !== "completed") return true
     }
     return false
   }
@@ -580,7 +605,7 @@ export class SessionShell {
   #backgroundCount(): number {
     let count = 0
     for (const task of this.#tasks.values()) {
-      if (task.type === "background" || (task.type === "starting" && task.placement === "background")) count++
+      if (task.background.type === "owned" && task.type !== "completed") count++
     }
     return count
   }
@@ -678,7 +703,11 @@ export class SessionShell {
     } catch (cause) {
       outcome = { type: "failed", message: errorMessage(cause) }
     }
-    await task.child?.dispose()
+    try {
+      await task.child?.dispose()
+    } catch (cause) {
+      outcome = { type: "failed", message: errorMessage(cause) }
+    }
     const current = this.#tasks.get(task.taskId)
     if (current !== task) return
 
@@ -905,12 +934,8 @@ export class SessionShell {
     let completedTasks = 0
     let retainedOutputBytes = 0
     for (const task of this.#tasks.values()) {
-      if (task.type === "foreground" || (task.type === "starting" && task.placement === "foreground")) {
-        foregroundAdmissions++
-      }
-      if (task.type === "background" || (task.type === "starting" && task.placement === "background")) {
-        backgroundTasks++
-      }
+      if (task.background.type === "none" && task.type !== "completed") foregroundAdmissions++
+      if (task.background.type === "owned" && task.type !== "completed") backgroundTasks++
       if (task.type === "completed") completedTasks++
       else invariant(task.output.available, `active task ${task.taskId} has no retained output`)
       retainedOutputBytes += task.output.retainedBytes

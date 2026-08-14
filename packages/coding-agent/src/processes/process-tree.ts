@@ -3,7 +3,8 @@ import { readdir, readFile } from "node:fs/promises"
 import { loadWindowsJobNative, type WindowsHandle, type WindowsJobNative } from "./process-tree-windows.js"
 
 export const maxTrackedProcessIdentities = 256
-export const maxTrackedProcessScopes = 8
+// Nine shell commands, four subagents, code mode, extensions, and their bounded replacement overlap fit concurrently.
+export const maxTrackedProcessScopes = 20
 
 const processTreeRefreshMs = 250
 const processTreeScanTimeoutMs = 2_000

@@ -20,7 +20,7 @@ Zi bundles or depends on third-party software. Each dependency remains under its
 ## Bundled source
 
 - OpenCode Merman terminal Mermaid renderer — MIT — Copyright OpenCode contributors — ported from <https://github.com/anomalyco/opencode>; source provenance and license are retained in `packages/tui/src/interactive/transcript/mermaid/`.
-- DeepSeek Harness Code Mode JSON snapshot and output-accounting logic — MIT — Copyright (c) 2026 DeepSeek — adapted from <https://github.com/deepseek-ai/deepseek-harness> at commit `47f943859bef60e4160492346772ded9b24f765a`.
+- DeepSeek Harness Code Mode logic, subprocess behavior, and shell environment defaults — MIT — Copyright (c) 2026 DeepSeek — adapted from <https://github.com/deepseek-ai/deepseek-harness> at commit `47f943859bef60e4160492346772ded9b24f765a`.
 
 DeepSeek Harness MIT notice:
 

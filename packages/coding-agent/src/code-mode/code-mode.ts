@@ -5,7 +5,7 @@ import { validateToolArguments } from "@earendil-works/pi-ai/compat"
 import { isRecord } from "../guards.js"
 import { FramedJsonDecoder, FramedJsonWriter } from "../processes/framed-json.js"
 import { spawnOwnedProcess, type OwnedProcessExit, type ProtocolOwnedProcess } from "../processes/owned-process.js"
-import type { ProcessTreeTracker } from "../processes/process-tree.js"
+import { createProcessTreeTracker, type ProcessTreeTracker } from "../processes/process-tree.js"
 import type { SessionManager } from "../session-manager.js"
 import { isBuiltInToolError } from "../tools/outcome.js"
 import {
@@ -118,6 +118,7 @@ type WorkerState =
 
 export class CodeMode {
   readonly #spawn: () => ProtocolOwnedProcess
+  readonly #ownedProcessTreeTracker: ProcessTreeTracker | undefined
   readonly #sessionManager: SessionManager | undefined
   #worker: CodeWorker | undefined
   #startingWorker: CodeWorker | undefined
@@ -137,6 +138,8 @@ export class CodeMode {
   ) {
     const command = Object.freeze([...workerCommand, "--zi-internal-code-mode-worker"])
     const env = Object.freeze({ ...process.env })
+    const tracker = processTreeTracker ?? createProcessTreeTracker()
+    this.#ownedProcessTreeTracker = processTreeTracker === undefined ? tracker : undefined
     this.#spawn = () => {
       const worker = spawnOwnedProcess({
         type: "protocol",
@@ -144,7 +147,7 @@ export class CodeMode {
         command,
         cwd,
         env,
-        ...(processTreeTracker ? { processTreeTracker } : {})
+        processTreeTracker: tracker
       })
       return worker
     }
@@ -235,6 +238,7 @@ export class CodeMode {
     if (worker) await worker.dispose()
     await starting?.catch(() => undefined)
     await this.#workerReset?.catch(() => undefined)
+    await this.#ownedProcessTreeTracker?.dispose()
   }
 
   async #ensureWorker(signal?: AbortSignal): Promise<CodeWorker> {
@@ -312,7 +316,7 @@ class CodeWorker {
       await Promise.race([
         this.#process.admitted,
         this.#process.containmentFailure,
-        processExited(this.#process.exited),
+        processExited(this.#process.exit),
         startupDeadline.promise
       ])
       await this.#writer.send({ version: codeModeProtocolVersion, type: "initialize", generation: this.#generation })
@@ -320,7 +324,7 @@ class CodeWorker {
         this.#ready.promise,
         this.#failure.promise,
         this.#process.containmentFailure,
-        processExited(this.#process.exited),
+        processExited(this.#process.exit),
         startupDeadline.promise
       ])
       if (this.#state.type !== "ready") throw new Error("Code-mode worker did not become ready")
@@ -382,14 +386,14 @@ class CodeWorker {
     this.#writer.dispose()
     this.#process.closeInput()
     this.#process.terminate(false)
-    if (!(await exitsWithin(this.#process.exited, defaultTimeouts.shutdownMs))) this.#process.terminate(true)
+    if (!(await exitsWithin(this.#process.exit, defaultTimeouts.shutdownMs))) this.#process.terminate(true)
     let treeFailure: unknown
     try {
       await this.#process.terminateTree()
     } catch (cause) {
       treeFailure = cause
     }
-    const exited = await exitsWithin(this.#process.exited, defaultTimeouts.shutdownMs)
+    const exited = await exitsWithin(this.#process.exit, defaultTimeouts.shutdownMs)
     await this.#process.dispose()
     let streamFailure: unknown
     try {

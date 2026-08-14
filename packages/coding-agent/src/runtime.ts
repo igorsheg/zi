@@ -125,7 +125,7 @@ export async function createUnboundAgentRuntime(requested: CreateAgentRuntimeOpt
         : undefined
     const sessionManager =
       selected.type === "resumed" ? selected.manager : SessionManager.create(paths, { persist: selected.persist })
-    shell = new SessionShell({ cwd: paths.cwd, sessionId: sessionManager.sessionId })
+    shell = new SessionShell({ cwd: paths.cwd, sessionId: sessionManager.sessionId, processTreeTracker })
     const codeMode = new CodeMode(
       paths.cwd,
       options.codeModeWorkerCommand ?? defaultCodeModeWorkerCommand,

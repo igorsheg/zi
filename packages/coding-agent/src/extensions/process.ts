@@ -76,7 +76,7 @@ export function spawnExtensionWorker(
     return cleanup
   }
 
-  const exited = worker.exited.then(async exit => {
+  const exited = worker.exit.then(async exit => {
     const cleanupError = await cleanupProcess()
     const error = combineErrors(combineErrors(exit.error, containmentError), cleanupError)
     return { code: exit.code, signal: exit.signal, ...(error ? { error } : {}) }

@@ -228,6 +228,78 @@ test("bash cancellation kills a SIGTERM-resistant descendant before settling", a
   }
 })
 
+test("shell settlement bounds inherited-pipe drainage after the command leader exits", async () => {
+  if (process.platform === "win32") return
+  const cwd = await mkdtemp(join(tmpdir(), "zi-bash-pipe-drain-"))
+  const pidPath = join(cwd, "helper.pid")
+  const shell = createShell(cwd, { killGraceMs: 50 })
+  const helper = `setTimeout(() => {}, 5000)`
+  const parent = `const {spawn}=require('node:child_process');const {writeFileSync}=require('node:fs');const child=spawn(process.execPath,['-e',${JSON.stringify(
+    helper
+  )}],{detached:true,stdio:['ignore',1,2]});writeFileSync(${JSON.stringify(pidPath)},String(child.pid));child.unref()`
+
+  let pid = 0
+  try {
+    const startedAt = Date.now()
+    const result = await shell.run("bash-pipe-drain", {
+      command: `node -e ${JSON.stringify(parent)}`,
+      timeoutMs: 2_000,
+      background: false
+    })
+    if (result.type !== "completed") throw new Error("Expected foreground completion")
+    expect(result.task.outcome).toEqual({ type: "exited", exitCode: 0 })
+    expect(Date.now() - startedAt).toBeLessThan(2_000)
+    pid = Number(await readFile(pidPath, "utf8"))
+  } finally {
+    if (pid > 0 && processRunning(pid)) process.kill(pid, "SIGKILL")
+    await shell.dispose()
+    rmSync(cwd, { recursive: true, force: true })
+  }
+})
+
+test("shell settlement terminates a same-group survivor after the command leader exits", async () => {
+  if (process.platform === "win32") return
+  const cwd = await mkdtemp(join(tmpdir(), "zi-bash-tree-settlement-"))
+  const pidPath = join(cwd, "helper.pid")
+  const shell = createShell(cwd)
+  const helper = `setInterval(() => {}, 1000)`
+  const parent = `const {spawn}=require('node:child_process');const {writeFileSync}=require('node:fs');const child=spawn(process.execPath,['-e',${JSON.stringify(
+    helper
+  )}],{stdio:'ignore'});writeFileSync(${JSON.stringify(pidPath)},String(child.pid));child.unref()`
+
+  try {
+    const result = await shell.run("bash-tree-settlement", {
+      command: `node -e ${JSON.stringify(parent)}`,
+      timeoutMs: 2_000,
+      background: false
+    })
+    if (result.type !== "completed") throw new Error("Expected foreground completion")
+    const pid = Number(await readFile(pidPath, "utf8"))
+    expect(result.task.outcome).toEqual({ type: "exited", exitCode: 0 })
+    await waitUntil(() => !processRunning(pid))
+  } finally {
+    await shell.dispose()
+    rmSync(cwd, { recursive: true, force: true })
+  }
+})
+
+test("model-facing shell commands disable colors and pagers", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "zi-bash-environment-"))
+  const shell = createShell(cwd)
+
+  try {
+    const result = await shell.run("bash-environment", {
+      command: `printf '%s|%s|%s|%s' "$NO_COLOR" "$TERM" "$PAGER" "$GIT_PAGER"`,
+      timeoutMs: 2_000,
+      background: false
+    })
+    expect(result.task.output.text).toBe("1|dumb|cat|cat")
+  } finally {
+    await shell.dispose()
+    rmSync(cwd, { recursive: true, force: true })
+  }
+})
+
 test("foreground execution can be demoted without tying the process to turn cancellation", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "zi-bash-demote-"))
   const shell = createShell(cwd)
@@ -758,7 +830,7 @@ test("completed eviction forgets scheduled updates and retained output", async (
   }
 })
 
-test("background capacity rejects new and demoted work until a task starts stopping", async () => {
+test("background capacity rejects new and demoted work until a stopping task settles", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "zi-bash-capacity-"))
   const shell = createShell(cwd, { maxBackgroundTasks: 1 })
 
@@ -780,6 +852,8 @@ test("background capacity rejects new and demoted work until a task starts stopp
     })
     expect(shell.demoteForeground()).toEqual({ type: "capacity_exceeded" })
     expect((await shell.kill(first.task.taskId)).type).toBe("stopping")
+    expect(shell.demoteForeground()).toEqual({ type: "capacity_exceeded" })
+    await shell.wait(first.task.taskId, 2_000)
     expect(shell.demoteForeground().type).toBe("backgrounded")
     expect((await foreground).type).toBe("backgrounded")
   } finally {

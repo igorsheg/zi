@@ -1910,7 +1910,8 @@ export class AgentSession {
         await settleAll([
           this.#codeMode?.dispose() ?? Promise.resolve(),
           this.#subagents?.shutdown() ?? Promise.resolve(),
-          this.#disposeExtensions(reason)
+          this.#disposeExtensions(reason),
+          this.#shell?.dispose() ?? Promise.resolve()
         ])
       } finally {
         await this.#processTreeTracker?.dispose()
@@ -1920,7 +1921,6 @@ export class AgentSession {
       activeSettled,
       this.#authentication.dispose(),
       this.#projectFileSearch.dispose(),
-      this.#shell?.dispose() ?? Promise.resolve(),
       catalogSettled,
       processOwners
     ])

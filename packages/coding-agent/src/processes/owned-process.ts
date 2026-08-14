@@ -7,6 +7,7 @@ import type { ProcessScope, ProcessScopeRefreshResult, ProcessTreeTracker } from
 const maxCommandParts = 32
 const maxCommandPartBytes = 4_096
 const bunExitPollMs = 10
+const processExitSettleMs = 1_000
 
 export interface OwnedProcessExit {
   readonly code: number | null
@@ -19,7 +20,7 @@ interface OwnedProcessBase {
   readonly input: Writable
   readonly stdout: Readable
   readonly stderr: Readable
-  readonly exited: Promise<OwnedProcessExit>
+  readonly exit: Promise<OwnedProcessExit>
   readonly admitted: Promise<void>
   readonly containmentFailure: Promise<never>
   refreshTree(): Promise<ProcessScopeRefreshResult>
@@ -45,8 +46,7 @@ interface OwnedProcessRequestBase {
   readonly command: readonly string[]
   readonly cwd: string
   readonly env: Readonly<Record<string, string | undefined>>
-  readonly processTreeTracker?: ProcessTreeTracker
-  readonly signalUntrackedProcessGroup?: boolean
+  readonly processTreeTracker: ProcessTreeTracker
 }
 
 export type OwnedProcessRequest =
@@ -113,9 +113,9 @@ export function spawnOwnedProcess(request: OwnedProcessRequest): OwnedProcess {
   })
   void containmentFailure.catch(ignoreStreamError)
 
-  let scope: ProcessScope | undefined
+  let scope: ProcessScope
   try {
-    scope = request.processTreeTracker?.track(pid, rejectContainment)
+    scope = request.processTreeTracker.track(pid, rejectContainment)
   } catch (cause) {
     input.destroy()
     stdout.destroy()
@@ -128,7 +128,7 @@ export function spawnOwnedProcess(request: OwnedProcessRequest): OwnedProcess {
   let settled = false
   let processError: Error | undefined
   let resolveExit!: (exit: OwnedProcessExit) => void
-  const exited = new Promise<OwnedProcessExit>(resolve => {
+  const exit = new Promise<OwnedProcessExit>(resolve => {
     resolveExit = resolve
   })
   const finish = (code: number | null, signal: NodeJS.Signals | null): void => {
@@ -143,36 +143,22 @@ export function spawnOwnedProcess(request: OwnedProcessRequest): OwnedProcess {
     },
     finish
   )
-
   let disposal: Promise<void> | undefined
   const base: OwnedProcessBase = {
     pid,
     input,
     stdout,
     stderr,
-    exited,
-    admitted: scope?.admitted ?? Promise.resolve(),
+    exit,
+    admitted: scope.admitted,
     containmentFailure,
-    refreshTree: () => scope?.refresh() ?? Promise.resolve({ type: "ok" }),
+    refreshTree: () => scope.refresh(),
     terminate(force) {
       if (settled) return
-      const signal = force ? "SIGKILL" : "SIGTERM"
-      if (!scope && request.signalUntrackedProcessGroup) {
-        signalUntrackedTree(child, pid, signal)
-        return
-      }
-      child.process.kill(signal)
+      signalTree(child, pid, force ? "SIGKILL" : "SIGTERM")
     },
     async terminateTree() {
-      if (scope) {
-        await scope.terminate()
-        return
-      }
-      if (request.signalUntrackedProcessGroup) {
-        await terminateUntrackedTree(child, pid)
-        return
-      }
-      if (!settled) child.process.kill("SIGKILL")
+      await scope.terminate()
     },
     closeInput() {
       input.end()
@@ -182,7 +168,7 @@ export function spawnOwnedProcess(request: OwnedProcessRequest): OwnedProcess {
       disposal = (async () => {
         let scopeFailure: unknown
         try {
-          await scope?.dispose()
+          await scope.dispose()
         } catch (cause) {
           scopeFailure = cause
         }
@@ -190,7 +176,7 @@ export function spawnOwnedProcess(request: OwnedProcessRequest): OwnedProcess {
         stdout.destroy()
         stderr.destroy()
         protocol?.destroy()
-        if (!settled) {
+        if (!settled && !(await settlesWithin(exit, processExitSettleMs))) {
           child.process.unref()
           if (child.type === "node") child.process.once("error", ignoreStreamError)
           processError ??= new Error("Process ownership ended before exit observation")
@@ -243,12 +229,16 @@ function observeExit(
   finish: (code: number | null, signal: NodeJS.Signals | null) => void
 ): () => void {
   if (child.type === "node") {
-    const onClose = (code: number | null, signal: NodeJS.Signals | null): void => finish(code, signal)
-    child.process.on("error", onError)
-    child.process.on("close", onClose)
+    const onNodeError = (error: Error): void => {
+      onError(error)
+      finish(child.process.exitCode, child.process.signalCode)
+    }
+    const onExit = (code: number | null, signal: NodeJS.Signals | null): void => finish(code, signal)
+    child.process.on("error", onNodeError)
+    child.process.on("exit", onExit)
     return () => {
-      child.process.off("error", onError)
-      child.process.off("close", onClose)
+      child.process.off("error", onNodeError)
+      child.process.off("exit", onExit)
     }
   }
 
@@ -316,7 +306,7 @@ async function closeBunInput(
   }
 }
 
-function signalUntrackedTree(child: SpawnedChild, pid: number, signal: NodeJS.Signals): void {
+function signalTree(child: SpawnedChild, pid: number, signal: NodeJS.Signals): void {
   if (process.platform === "win32") {
     void taskkill(pid)
     return
@@ -326,14 +316,6 @@ function signalUntrackedTree(child: SpawnedChild, pid: number, signal: NodeJS.Si
   } catch {
     if (child.process.exitCode === null && child.process.signalCode === null) child.process.kill(signal)
   }
-}
-
-async function terminateUntrackedTree(child: SpawnedChild, pid: number): Promise<void> {
-  if (process.platform === "win32") {
-    await taskkill(pid)
-    return
-  }
-  signalUntrackedTree(child, pid, "SIGKILL")
 }
 
 function taskkill(pid: number): Promise<void> {
@@ -348,6 +330,19 @@ function releaseFailedSpawn(child: SpawnedChild): void {
   if (child.type === "node") child.process.once("error", ignoreStreamError)
   child.process.kill("SIGKILL")
   child.process.unref()
+}
+
+function settlesWithin<T>(operation: Promise<T>, timeoutMs: number): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  return Promise.race([
+    operation.then(() => true),
+    new Promise<boolean>(resolve => {
+      timer = setTimeout(() => resolve(false), timeoutMs)
+      timer.unref?.()
+    })
+  ]).finally(() => {
+    if (timer) clearTimeout(timer)
+  })
 }
 
 function ignoreStreamError(): void {}

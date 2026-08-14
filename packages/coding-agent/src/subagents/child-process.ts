@@ -247,7 +247,7 @@ export class ChildZiProcess {
       env: options.env,
       processTreeTracker: options.processTreeTracker
     })
-    this.#exited = this.#child.exited
+    this.#exited = this.#child.exit
     void this.#child.containmentFailure.catch(cause => this.#fail(cause))
     this.#stdoutSettlement = this.#consumeStdout().catch(cause => this.#fail(cause))
     this.#stderrSettlement = this.#consumeStderr().catch(cause => this.#fail(cause))
