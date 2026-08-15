@@ -378,6 +378,8 @@ test("the standalone bundle resolves OAuth and settles highlighted Markdown", as
   const providers = Bun.resolveSync("@earendil-works/pi-ai/providers/all", codingAgentSource)
   const bunOauth = Bun.resolveSync("@earendil-works/pi-ai/bun-oauth", codingAgentSource)
   const tuiSource = resolve(import.meta.dirname, "../packages/tui/src")
+  const markdownViewSource = resolve(tuiSource, "interactive/transcript/markdown-view.ts")
+  const themeSource = resolve(tuiSource, "theme.ts")
   const openTuiCore = Bun.resolveSync("@opentui/core", tuiSource)
   const openTuiTesting = Bun.resolveSync("@opentui/core/testing", tuiSource)
   const markdownFixture = [
@@ -394,13 +396,10 @@ test("the standalone bundle resolves OAuth and settles highlighted Markdown", as
       entrypoint,
       `
 import { builtinModels } from ${JSON.stringify(providers)}
-import {
-  CodeRenderable,
-  MarkdownRenderable,
-  SyntaxStyle,
-  destroyTreeSitterClient
-} from ${JSON.stringify(openTuiCore)}
+import { CodeRenderable, destroyTreeSitterClient } from ${JSON.stringify(openTuiCore)}
 import { createTestRenderer } from ${JSON.stringify(openTuiTesting)}
+import { MarkdownView } from ${JSON.stringify(markdownViewSource)}
+import { createSyntaxStyle, defaultTheme } from ${JSON.stringify(themeSource)}
 
 import { registerBunOAuthFlows } from ${JSON.stringify(bunOauth)}
 registerBunOAuthFlows()
@@ -432,21 +431,11 @@ for (const providerId of providerIds) {
 }
 
 const setup = await createTestRenderer({ width: 72, height: 12, useThread: false })
-const syntaxStyle = SyntaxStyle.fromStyles({
-  default: { fg: "#ffffff" },
-  conceal: { fg: "#777777" },
-  "markup.heading": { fg: "#ffff00", bold: true },
-  "markup.heading.2": { fg: "#ffff00", bold: true },
-  "markup.strong": { fg: "#ffffff", bold: true },
-  "markup.raw": { fg: "#00ffff" },
-  "markup.raw.block": { fg: "#aaaaaa" }
-})
-const markdown = new MarkdownRenderable(setup.renderer, {
+const syntaxStyle = createSyntaxStyle(defaultTheme)
+const markdown = new MarkdownView(setup.renderer, {
   content: ${JSON.stringify(markdownFixture)},
-  syntaxStyle,
-  conceal: true,
-  streaming: true,
-  internalBlockMode: "top-level"
+  theme: defaultTheme,
+  syntaxStyle
 })
 setup.renderer.root.add(markdown)
 

@@ -21,6 +21,7 @@
     "@opentui/core": "catalog:",
     "@with-zi/coding-agent": "workspace:*",
     "entities": "catalog:",
+    "md4x": "0.0.27",
     "nanostores": "catalog:",
     "string-width": "catalog:"
   },

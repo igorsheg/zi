@@ -1,10 +1,6 @@
 import {
   BoxRenderable,
-  CodeRenderable,
-  createTextAttributes,
   fg,
-  MarkdownRenderable,
-  type MarkdownOptions,
   type Renderable,
   StyledText,
   type SyntaxStyle,
@@ -25,52 +21,8 @@ import {
   type AssistantToolInclusion
 } from "./assistant-projection.js"
 import type { TranscriptItemView } from "./item.js"
-import { createMermaidMarkdownRenderer } from "./mermaid/markdown.js"
+import { MarkdownView } from "./markdown-view.js"
 import { ToolCallView, type ToolViewFrame } from "./tool-view.js"
-
-// OpenTUI 0.4.5 drops Markdown blocks from the immediate frame when streaming is false.
-const markdownStreamingWorkaround = true
-
-function createMarkdownNodeRenderer(ctx: RenderContext, theme: Theme): NonNullable<MarkdownOptions["renderNode"]> {
-  const mermaid = createMermaidMarkdownRenderer(ctx, {
-    compact: true,
-    colors: {
-      text: theme.text.primary,
-      primary: theme.text.primary,
-      secondary: theme.text.muted,
-      muted: theme.border.default,
-      warning: theme.text.warning,
-      background: theme.surface.app,
-      request: theme.text.success,
-      response: theme.text.warning,
-      note: theme.text.primary,
-      noteBackground: theme.surface.panel
-    }
-  })
-  return (token, context) => {
-    const diagram = mermaid(token, context)
-    if (diagram) return diagram
-    if (token.type !== "heading") return null
-    const renderable = context.defaultRender()
-    if (!(renderable instanceof CodeRenderable)) return renderable
-    const style = context.syntaxStyle.getStyle("markup.heading")
-    renderable.initialStyledText = new StyledText([
-      {
-        __isChunk: true,
-        text: token.text,
-        ...(style?.fg === undefined ? {} : { fg: style.fg }),
-        ...(style?.bg === undefined ? {} : { bg: style.bg }),
-        attributes: createTextAttributes({
-          bold: true,
-          italic: style?.italic ?? false,
-          underline: style?.underline ?? false,
-          dim: style?.dim ?? false
-        })
-      }
-    ])
-    return renderable
-  }
-}
 
 export interface MessageRenderOptions {
   readonly theme: Theme
@@ -152,8 +104,8 @@ function createUserMessage(ctx: RenderContext, content: string, theme: Theme): B
 }
 
 type StreamingPartView =
-  | { readonly kind: "thinking"; readonly root: BoxRenderable; readonly content: MarkdownRenderable; value: string }
-  | { readonly kind: "answer"; readonly root: BoxRenderable; readonly content: MarkdownRenderable; value: string }
+  | { readonly kind: "thinking"; readonly root: BoxRenderable; readonly content: MarkdownView; value: string }
+  | { readonly kind: "answer"; readonly root: BoxRenderable; readonly content: MarkdownView; value: string }
   | {
       readonly kind: "tool"
       readonly root: BoxRenderable
@@ -357,26 +309,14 @@ export class StreamingAssistantView {
   #createPart(part: StreamingPart): StreamingPartView {
     if (part.kind === "thinking") {
       const root = new BoxRenderable(this.#ctx, { flexShrink: 0, marginTop: 0, marginBottom: 1 })
-      const content = createMarkdown(
-        this.#ctx,
-        part.content,
-        this.#theme,
-        this.#thinkingSyntaxStyle,
-        markdownStreamingWorkaround
-      )
+      const content = createMarkdown(this.#ctx, part.content, this.#theme, this.#thinkingSyntaxStyle)
       root.add(content)
       return { kind: "thinking", root, content, value: part.content }
     }
 
     if (part.kind === "answer") {
       const root = new BoxRenderable(this.#ctx, { flexShrink: 0, marginTop: 0, marginBottom: 1 })
-      const content = createMarkdown(
-        this.#ctx,
-        part.content,
-        this.#theme,
-        this.#syntaxStyle,
-        markdownStreamingWorkaround
-      )
+      const content = createMarkdown(this.#ctx, part.content, this.#theme, this.#syntaxStyle)
       root.add(content)
       return { kind: "answer", root, content, value: part.content }
     }
@@ -406,21 +346,10 @@ function createMarkdown(
   content: string,
   theme: Theme,
   syntaxStyle: SyntaxStyle,
-  streaming: boolean,
   fgColor: string = theme.text.primary,
   bgColor: string = theme.surface.app
-): MarkdownRenderable {
-  return new MarkdownRenderable(ctx, {
-    content,
-    syntaxStyle,
-    fg: fgColor,
-    bg: bgColor,
-    conceal: true,
-    streaming,
-    internalBlockMode: "top-level",
-    tableOptions: { style: "grid" },
-    renderNode: createMarkdownNodeRenderer(ctx, theme)
-  })
+): MarkdownView {
+  return new MarkdownView(ctx, { content, theme, syntaxStyle, fg: fgColor, bg: bgColor })
 }
 
 function omittedToolsText(count: number): string {
@@ -586,7 +515,6 @@ class CompactionSummaryView implements TranscriptItemView {
       this.#message.summary,
       this.#theme,
       this.#syntaxStyle,
-      markdownStreamingWorkaround,
       this.#theme.text.custom,
       "transparent"
     )
@@ -706,7 +634,6 @@ class ExpandableSummaryView implements TranscriptItemView {
           this.#expandedMarkdown,
           this.#theme,
           this.#syntaxStyle,
-          markdownStreamingWorkaround,
           this.#theme.text.custom,
           this.#theme.surface.panel
         )

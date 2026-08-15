@@ -1,11 +1,8 @@
 import {
-  createMarkdownCodeBlockRenderer,
   parseColor,
   RenderableEvents,
   TextRenderable,
   type ColorInput,
-  type MarkdownCodeBlockRenderer,
-  type MarkdownOptions,
   type MouseEvent,
   type RenderContext,
   type RGBA,
@@ -39,7 +36,7 @@ interface PreparedDiagram {
   readonly height: number
 }
 
-export interface MermaidMarkdownRendererOptions {
+export interface MermaidRendererOptions {
   compact?: boolean
   colors?: {
     text?: ColorInput
@@ -122,7 +119,7 @@ class StaticDiagramRenderable extends TextRenderable {
   }
 }
 
-function prepareDiagram(kind: DiagramKind, source: string, options: MermaidMarkdownRendererOptions): PreparedDiagram {
+function prepareDiagram(kind: DiagramKind, source: string, options: MermaidRendererOptions): PreparedDiagram {
   const colors = options.colors ?? {}
   switch (kind) {
     case "flowchart": {
@@ -220,43 +217,42 @@ function enforceSize(size: { readonly width: number; readonly height: number }):
   if (size.width > maxDiagramColumns || size.height > maxDiagramRows) throw new MermaidLimitError()
 }
 
-export function createMermaidMarkdownRenderer(
-  ctx: RenderContext,
-  input: MermaidMarkdownRendererOptions | (() => MermaidMarkdownRendererOptions) = {}
-): NonNullable<MarkdownOptions["renderNode"]> {
-  return createMarkdownCodeBlockRenderer({ mermaid: createMermaidCodeBlockRenderer(ctx, input) })!
+export interface MermaidRenderer {
+  render(key: string, source: string): TextRenderable | undefined
+  release(key: string): void
 }
 
-export function createMermaidCodeBlockRenderer(
+export function createMermaidRenderer(
   ctx: RenderContext,
-  input: MermaidMarkdownRendererOptions | (() => MermaidMarkdownRendererOptions) = {}
-): MarkdownCodeBlockRenderer {
+  input: MermaidRendererOptions | (() => MermaidRendererOptions) = {}
+): MermaidRenderer {
   const lastGood = new Map<string, PreparedDiagram>()
-  return (token, context) => {
-    if (!sourceWithinBounds(token.text)) return undefined
-    const kind = detectMermaidDiagram(token.text)
-    if (!kind) return undefined
+  return {
+    render(key, source) {
+      if (!sourceWithinBounds(source)) return undefined
+      const kind = detectMermaidDiagram(source)
+      if (!kind || (!lastGood.has(key) && lastGood.size >= maxDiagramsPerMarkdown)) return undefined
+      const options = typeof input === "function" ? input() : input
 
-    // OpenTUI reconciles a streaming fence through this stable default block identity.
-    const key = context.defaultRender()?.id
-    if (!key || (!lastGood.has(key) && lastGood.size >= maxDiagramsPerMarkdown)) return undefined
-    const options = typeof input === "function" ? input() : input
-
-    try {
-      const prepared = prepareDiagram(kind, token.text, options)
-      const diagram = new StaticDiagramRenderable(ctx, prepared)
-      claimLastGood(key, prepared, diagram, lastGood)
-      return diagram
-    } catch (error) {
-      if (error instanceof MermaidSyntaxError) {
-        const previous = lastGood.get(key)
-        if (!previous || previous.kind !== kind) return undefined
-        const diagram = new StaticDiagramRenderable(ctx, previous)
-        claimLastGood(key, previous, diagram, lastGood)
+      try {
+        const prepared = prepareDiagram(kind, source, options)
+        const diagram = new StaticDiagramRenderable(ctx, prepared)
+        claimLastGood(key, prepared, diagram, lastGood)
         return diagram
+      } catch (error) {
+        if (error instanceof MermaidSyntaxError) {
+          const previous = lastGood.get(key)
+          if (!previous || previous.kind !== kind) return undefined
+          const diagram = new StaticDiagramRenderable(ctx, previous)
+          claimLastGood(key, previous, diagram, lastGood)
+          return diagram
+        }
+        if (error instanceof DiagramCanvasSizeError || error instanceof MermaidLimitError) return undefined
+        throw error
       }
-      if (error instanceof DiagramCanvasSizeError || error instanceof MermaidLimitError) return undefined
-      throw error
+    },
+    release(key) {
+      lastGood.delete(key)
     }
   }
 }

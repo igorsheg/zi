@@ -4,11 +4,11 @@ import {
   BoxRenderable,
   CliRenderEvents,
   CodeRenderable,
-  MarkdownRenderable,
   type KeyEvent,
   type Renderable,
   TextAttributes,
-  TextRenderable
+  TextRenderable,
+  TextTableRenderable
 } from "@opentui/core"
 import { createMockMouse, createTestRenderer, type TestRendererSetup } from "@opentui/core/testing"
 import type { AgentMessage } from "@with-zi/coding-agent"
@@ -18,6 +18,7 @@ import { atom, type WritableAtom } from "nanostores"
 import { TuiDiagnosticsOverlay } from "../../src/interactive/diagnostics.js"
 import { InteractiveKeybindings } from "../../src/interactive/interactive-keybindings.js"
 import type { ActiveTool } from "../../src/interactive/interactive-store.js"
+import { MarkdownView } from "../../src/interactive/transcript/markdown-view.js"
 import { createMessageItemView, StreamingAssistantView } from "../../src/interactive/transcript/message-view.js"
 import { TranscriptView } from "../../src/interactive/transcript/view.js"
 import { createSyntaxStyle, createThinkingSyntaxStyle, defaultTheme } from "../../src/theme.js"
@@ -112,7 +113,7 @@ test("compaction summaries render as full-width custom-color dividers without pa
 
     expect(item.setExpanded?.(true)).toBe(true)
     await renderMarkdownSettled(setup)
-    const expandedBackground = descendant(item.root, MarkdownRenderable).bg
+    const expandedBackground = descendant(descendant(item.root, MarkdownView), TextRenderable).bg
     if (!expandedBackground) throw new Error("Expanded compaction background not found")
     expect(expandedBackground.toInts()[3]).toBe(0)
   } finally {
@@ -309,7 +310,7 @@ test("assistant sequences coalesce adjacent semantic parts and give every item o
     await setup.renderOnce()
     const items = view.root.getChildren()
     expect(items).toHaveLength(5)
-    expect(descendantsOfType(view.root, MarkdownRenderable)).toHaveLength(3)
+    expect(descendantsOfType(view.root, MarkdownView)).toHaveLength(3)
     const rows = setup
       .captureCharFrame()
       .split("\n")
@@ -455,7 +456,7 @@ After`),
     expect(frame).not.toContain("flowchart LR")
     expect(frame).not.toContain("sequenceDiagram")
     expect(frame).not.toContain("stateDiagram-v2")
-    expect(descendantsOfType(view.root, TextRenderable)).toHaveLength(3)
+    expect(descendantsOfType(view.root, TextRenderable).filter(text => !text.selectable)).toHaveLength(3)
   } finally {
     view.destroy()
     syntaxStyle.destroy()
@@ -584,35 +585,253 @@ flowchart LR
   }
 })
 
+test("Mermaid suffix rebuilds release bounded last-good claims before new diagrams render", async () => {
+  const setup = await createTestRenderer({ width: 80, height: 200, useThread: false })
+  const syntaxStyle = createSyntaxStyle(defaultTheme)
+  const thinkingSyntaxStyle = createThinkingSyntaxStyle(defaultTheme)
+  const diagrams = Array.from(
+    { length: 16 },
+    (_, index) => `\`\`\`mermaid\nflowchart LR\n  A${index}[A${index}] --> B${index}[B${index}]\n\`\`\``
+  ).join("\n\n")
+  const view = new StreamingAssistantView(
+    setup.renderer,
+    fauxAssistantMessage(`Before\n\n${diagrams}`),
+    defaultTheme,
+    syntaxStyle,
+    thinkingSyntaxStyle
+  )
+  setup.renderer.root.add(view.root)
+
+  try {
+    await renderMarkdownSettled(setup)
+    expect(descendantsOfType(view.root, CodeRenderable)).toHaveLength(0)
+    expect(descendantsOfType(view.root, TextRenderable).filter(text => !text.selectable)).toHaveLength(16)
+
+    view.update(fauxAssistantMessage(`Changed\n\n${diagrams}`))
+    await renderMarkdownSettled(setup)
+    expect(descendantsOfType(view.root, CodeRenderable)).toHaveLength(0)
+    expect(descendantsOfType(view.root, TextRenderable).filter(text => !text.selectable)).toHaveLength(16)
+  } finally {
+    view.destroy()
+    syntaxStyle.destroy()
+    thinkingSyntaxStyle.destroy()
+    setup.renderer.destroy()
+  }
+})
+
+test("md4x healing keeps incomplete streaming markup out of the frame", async () => {
+  const setup = await createTestRenderer({ width: 60, height: 16, useThread: false })
+  const syntaxStyle = createSyntaxStyle(defaultTheme)
+  const thinkingSyntaxStyle = createThinkingSyntaxStyle(defaultTheme)
+  const view = new StreamingAssistantView(
+    setup.renderer,
+    fauxAssistantMessage("Before **incomplete"),
+    defaultTheme,
+    syntaxStyle,
+    thinkingSyntaxStyle
+  )
+  setup.renderer.root.add(view.root)
+
+  try {
+    await setup.renderOnce()
+    expect(setup.captureCharFrame()).toContain("Before incomplete")
+    expect(setup.captureCharFrame()).not.toContain("**")
+
+    view.update(fauxAssistantMessage("Before **complete**\n\n```ts\nconst value = 42"))
+    await renderMarkdownSettled(setup)
+    const frame = setup.captureCharFrame()
+    expect(frame).toContain("Before complete")
+    expect(frame).toContain("const value = 42")
+    expect(frame).not.toContain("```")
+    const code = descendant(view.root, CodeRenderable)
+    expect(code.filetype).toBe("ts")
+    expect(code.content).toBe("const value = 42")
+  } finally {
+    view.destroy()
+    syntaxStyle.destroy()
+    thinkingSyntaxStyle.destroy()
+    setup.renderer.destroy()
+  }
+})
+
+test("md4x GFM lists and tables remain native semantic blocks", async () => {
+  const setup = await createTestRenderer({ width: 60, height: 16, useThread: false })
+  const syntaxStyle = createSyntaxStyle(defaultTheme)
+  const thinkingSyntaxStyle = createThinkingSyntaxStyle(defaultTheme)
+  const view = new StreamingAssistantView(
+    setup.renderer,
+    fauxAssistantMessage(
+      "- first paragraph\n\n  second paragraph\n\n  > quoted block\n\n  ```ts\n  nested()\n  ```\n\n- [x] parsed\n- [ ] rendered\n\n| Layer | Owner |\n| --- | --- |\n| Grammar | md4x |"
+    ),
+    defaultTheme,
+    syntaxStyle,
+    thinkingSyntaxStyle
+  )
+  setup.renderer.root.add(view.root)
+
+  try {
+    await setup.renderOnce()
+    const frame = setup.captureCharFrame()
+    expect(frame).toContain("first paragraph")
+    expect(frame).toContain("second paragraph")
+    expect(frame).not.toContain("first paragraphsecond paragraph")
+    expect(frame).toContain("quoted block")
+    expect(frame).toContain("nested()")
+    expect(frame).not.toContain("second paragraphquoted block")
+    expect(frame).not.toContain("quoted blocknested()")
+    expect(frame).toContain("☑ parsed")
+    expect(frame).toContain("☐ rendered")
+    expect(frame).toContain("Grammar")
+    expect(frame).toContain("md4x")
+    expect(descendantsOfType(view.root, TextTableRenderable)).toHaveLength(1)
+  } finally {
+    view.destroy()
+    syntaxStyle.destroy()
+    thinkingSyntaxStyle.destroy()
+    setup.renderer.destroy()
+  }
+})
+
+test("Zi Markdown preserves nested list order, footnote labels, and hidden comments", async () => {
+  const setup = await createTestRenderer({ width: 60, height: 20, useThread: false })
+  const syntaxStyle = createSyntaxStyle(defaultTheme)
+  const thinkingSyntaxStyle = createThinkingSyntaxStyle(defaultTheme)
+  const view = new StreamingAssistantView(
+    setup.renderer,
+    fauxAssistantMessage("- before\n  - nested\n\n  after\n\nSee note[^1]\n\n[^1]: definition\n\n<!-- secret -->"),
+    defaultTheme,
+    syntaxStyle,
+    thinkingSyntaxStyle
+  )
+  setup.renderer.root.add(view.root)
+
+  try {
+    await setup.renderOnce()
+    const frame = setup.captureCharFrame()
+    expect(frame.indexOf("before")).toBeLessThan(frame.indexOf("nested"))
+    expect(frame.indexOf("nested")).toBeLessThan(frame.indexOf("after"))
+    expect(frame).toContain("See note[^1]")
+    expect(frame).toContain("[^1]: definition")
+    expect(frame).not.toContain("secret")
+  } finally {
+    view.destroy()
+    syntaxStyle.destroy()
+    thinkingSyntaxStyle.destroy()
+    setup.renderer.destroy()
+  }
+})
+
+test("Zi Markdown preserves inline presentation and links", async () => {
+  const setup = await createTestRenderer({ width: 60, height: 20, useThread: false })
+  const syntaxStyle = createSyntaxStyle(defaultTheme)
+  const thinkingSyntaxStyle = createThinkingSyntaxStyle(defaultTheme)
+  const view = new StreamingAssistantView(
+    setup.renderer,
+    fauxAssistantMessage(
+      "## Heading\n\n[linked](https://example.com), ~~removed~~, `code`, and ![image alt](image.png).\n\nbefore <b>inside</b> after\n\n---\n\n> [!WARNING]\n> quoted"
+    ),
+    defaultTheme,
+    syntaxStyle,
+    thinkingSyntaxStyle
+  )
+  setup.renderer.root.add(view.root)
+
+  try {
+    await setup.renderOnce()
+    const frame = setup.captureCharFrame()
+    expect(frame).toContain("Heading")
+    expect(frame).toContain("linked, removed, code, and image alt.")
+    expect(frame).toContain("before inside after")
+    expect(frame).toContain("────────────────")
+    expect(frame).toContain("│ WARNING")
+    expect(frame).toContain("│ quoted")
+    expect(frame).not.toContain("https://example.com")
+    expect(frame).not.toContain("<b>")
+
+    const chunks = descendantsOfType(view.root, TextRenderable).flatMap(text => text.chunks)
+    expect(chunks.find(chunk => chunk.text === "linked")?.link?.url).toBe("https://example.com")
+    const removed = chunks.find(chunk => chunk.text === "removed")
+    expect((removed?.attributes ?? TextAttributes.NONE) & TextAttributes.STRIKETHROUGH).not.toBe(0)
+  } finally {
+    view.destroy()
+    syntaxStyle.destroy()
+    thinkingSyntaxStyle.destroy()
+    setup.renderer.destroy()
+  }
+})
+
 test("streaming assistant and markdown roots keep identity across deltas", async () => {
   const harness = await createTranscriptHarness([], {
-    streamingMessage: fauxAssistantMessage([fauxThinking("first **thought**"), fauxText("first")])
+    streamingMessage: fauxAssistantMessage([fauxThinking("first **thought**"), fauxText("stable\n\nfirst")])
   })
   try {
     await harness.setup.flush()
     const root = harness.setup.renderer.root.findDescendantById("streaming-assistant")
     if (!root) throw new Error("Streaming assistant root not found")
-    const [thinkingMarkdown, answerMarkdown] = descendantsOfType(root, MarkdownRenderable)
+    const [thinkingMarkdown, answerMarkdown] = descendantsOfType(root, MarkdownView)
     if (!thinkingMarkdown || !answerMarkdown) throw new Error("Assistant Markdown roots not found")
+    const thinkingBlock = thinkingMarkdown.getChildren()[0]
+    const [stableAnswerBlock, streamingAnswerBlock] = answerMarkdown.getChildren()
+    if (!thinkingBlock || !stableAnswerBlock || !streamingAnswerBlock) throw new Error("Markdown blocks not found")
 
     harness.state.streamingMessage = fauxAssistantMessage([
       fauxThinking("first **thought** and second"),
-      fauxText("first and second")
+      fauxText("stable\n\nfirst and second")
     ])
     harness.revision.set(1)
     await harness.setup.flush()
 
     expect(harness.setup.renderer.root.findDescendantById("streaming-assistant")).toBe(root)
-    const updatedMarkdown = descendantsOfType(root, MarkdownRenderable)
+    const updatedMarkdown = descendantsOfType(root, MarkdownView)
     expect(updatedMarkdown).toEqual([thinkingMarkdown, answerMarkdown])
     expect(thinkingMarkdown.content).toBe("first **thought** and second")
-    expect(answerMarkdown.content).toBe("first and second")
+    expect(answerMarkdown.content).toBe("stable\n\nfirst and second")
+    expect(thinkingMarkdown.getChildren()[0]).toBe(thinkingBlock)
+    expect(answerMarkdown.getChildren()).toEqual([stableAnswerBlock, streamingAnswerBlock])
     expect(thinkingMarkdown.streaming).toBe(true)
     expect(answerMarkdown.streaming).toBe(true)
     expect(harness.view.diagnostics).toMatchObject({ streamingCreates: 1, streamingUpdates: 1 })
     await renderMarkdownSettled(harness.setup)
   } finally {
     harness.destroy()
+  }
+})
+
+test("Markdown clears owned selection before mutation and recursive destruction", async () => {
+  const setup = await createTestRenderer({ width: 40, height: 10, useThread: false })
+  const syntaxStyle = createSyntaxStyle(defaultTheme)
+  const thinkingSyntaxStyle = createThinkingSyntaxStyle(defaultTheme)
+  const view = new StreamingAssistantView(
+    setup.renderer,
+    fauxAssistantMessage("before"),
+    defaultTheme,
+    syntaxStyle,
+    thinkingSyntaxStyle
+  )
+  setup.renderer.root.add(view.root)
+
+  try {
+    const markdown = descendant(view.root, MarkdownView)
+    const text = descendant(markdown, TextRenderable)
+    let selected = true
+    const clearSelection = spyOn(setup.renderer, "clearSelection").mockImplementation(() => {
+      selected = false
+    })
+    spyOn(text, "hasSelection").mockImplementation(() => selected)
+
+    view.update(fauxAssistantMessage("after"))
+    expect(clearSelection).toHaveBeenCalledTimes(1)
+
+    selected = true
+    spyOn(markdown, "hasSelection").mockImplementation(() => selected)
+    markdown.destroyRecursively()
+    expect(clearSelection).toHaveBeenCalledTimes(2)
+    expect(text.isDestroyed).toBe(true)
+  } finally {
+    view.destroy()
+    syntaxStyle.destroy()
+    thinkingSyntaxStyle.destroy()
+    setup.renderer.destroy()
   }
 })
 
@@ -623,7 +842,7 @@ test("committing a streamed assistant keeps Markdown visible without replacing t
     await harness.setup.renderOnce()
     const root = harness.setup.renderer.root.findDescendantById("streaming-assistant")
     if (!root) throw new Error("Streaming assistant root not found")
-    const markdown = descendant(root, MarkdownRenderable)
+    const markdown = descendant(root, MarkdownView)
 
     harness.state.messages.push(message)
     harness.state.streamingMessage = undefined
@@ -631,7 +850,7 @@ test("committing a streamed assistant keeps Markdown visible without replacing t
     await harness.setup.renderOnce()
 
     expect(harness.setup.renderer.root.findDescendantById("assistant-message:0")).toBe(root)
-    expect(descendant(root, MarkdownRenderable)).toBe(markdown)
+    expect(descendant(root, MarkdownView)).toBe(markdown)
     expect(markdown.streaming).toBe(true)
     const frame = harness.setup.captureCharFrame()
     expect(frame).toContain("Done")
@@ -650,7 +869,7 @@ test("restored assistant Markdown is visible on its first frame", async () => {
     await harness.setup.renderOnce()
     const root = harness.setup.renderer.root.findDescendantById("assistant-message:0")
     if (!root) throw new Error("Committed assistant root not found")
-    expect(descendant(root, MarkdownRenderable).streaming).toBe(true)
+    expect(descendant(root, MarkdownView).streaming).toBe(true)
     const frame = harness.setup.captureCharFrame()
     expect(frame).toContain("Restored")
     expect(frame).toContain("Final answer.")

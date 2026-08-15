@@ -14,6 +14,8 @@ test("distribution documentation ships self-customization guides and examples", 
     await copyDistributionDocumentation(resolve(import.meta.dirname, ".."), destination)
     await assertDistributionDocumentation(destination)
 
+    expect(existsSync(join(destination, "LICENSE"))).toBe(true)
+    expect(existsSync(join(destination, "THIRD_PARTY_NOTICES.md"))).toBe(true)
     expect(existsSync(join(destination, "docs", "stale.md"))).toBe(false)
     expect((await readdir(join(destination, "docs"))).toSorted()).toEqual([
       "authentication.md",

@@ -6,7 +6,13 @@ import {
   publicProductDocumentationFiles
 } from "../packages/coding-agent/src/product-documentation.js"
 
-export const distributionDocumentationEntries = Object.freeze(["README.md", "docs", "examples"] as const)
+export const distributionDocumentationEntries = Object.freeze([
+  "README.md",
+  "LICENSE",
+  "THIRD_PARTY_NOTICES.md",
+  "docs",
+  "examples"
+] as const)
 
 export async function copyDistributionDocumentation(root: string, destination: string): Promise<void> {
   for (const entry of distributionDocumentationEntries) {
@@ -22,9 +28,11 @@ export async function copyDistributionDocumentation(root: string, destination: s
 
 export async function assertDistributionDocumentation(root: string): Promise<void> {
   const readme = await lstat(join(root, "README.md"))
+  const license = await lstat(join(root, "LICENSE"))
+  const notices = await lstat(join(root, "THIRD_PARTY_NOTICES.md"))
   const docs = await lstat(join(root, "docs"))
   const examples = await lstat(join(root, "examples"))
-  if (!readme.isFile() || !docs.isDirectory() || !examples.isDirectory()) {
+  if (!readme.isFile() || !license.isFile() || !notices.isFile() || !docs.isDirectory() || !examples.isDirectory()) {
     throw new Error(`Zi distribution documentation is incomplete: ${root}`)
   }
 
