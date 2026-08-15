@@ -72,8 +72,10 @@ test("real prompt keys admit, present, and restore steering and follow-up queues
     expect(queuedFrame).toContain("second line")
     expect(queuedFrame).toContain("Follow-up")
     expect(queuedFrame).toContain("follow-up")
-    expect(queuedFrame).toContain("Alt+Up to edit all queued messages")
-    expect(queuedFrame).toContain("Queued · Ctrl+Enter to interrupt with a new prompt")
+    expect(queuedFrame).toContain("↳ Alt+Up to edit all · Ctrl+Enter to interrupt")
+    expect(setup.mode.notifications.get_history().some(item => item.message.includes("Ctrl+Enter to interrupt"))).toBe(
+      false
+    )
     // Pending and committed user messages share geometry while pending delivery
     // remains visually distinct through its transparent surface and dim label.
     const queueSpans = setup.captureSpans().lines.flatMap(line => line.spans)
@@ -210,6 +212,10 @@ test("queued message blocks never exceed their assigned rows", async () => {
     )
     await setup.renderOnce()
     expect(setup.captureCharFrame()).toContain("[image #1]")
+
+    view.update({ steering: [queuedInput(6, "steer", "narrow")], followUp: [] }, 7, true)
+    await setup.renderOnce()
+    expect(setup.captureCharFrame()).toContain("↳ Alt+Up")
   } finally {
     view.destroy()
     if (!setup.renderer.isDestroyed) setup.renderer.destroy()

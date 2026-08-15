@@ -28,7 +28,7 @@ export class QueuedInputsView {
     this.root.visible = false
   }
 
-  update(queue: QueuedInputs, maxRows: number): void {
+  update(queue: QueuedInputs, maxRows: number, interruptible = false): void {
     clear(this.root)
     const entries = queuedEntries(queue)
     if (entries.length === 0 || maxRows <= 0) {
@@ -52,9 +52,9 @@ export class QueuedInputsView {
       this.root.add(this.#metaRow(`… ${layout.omitted} more queued`, width))
       usedRows++
     }
-    if (dequeueHint && usedRows < maxRows) {
-      this.root.add(this.#metaRow(`${dequeueHint} to edit all queued messages`, width))
-    }
+    const interruptHint = interruptible ? this.#keybindings.getHint("app.message.interruptAndSend") : undefined
+    const actionHint = queuedActionHint(interruptHint, dequeueHint)
+    if (actionHint && usedRows < maxRows) this.root.add(this.#metaRow(actionHint, width))
   }
 
   destroy(): void {
@@ -120,6 +120,13 @@ export class QueuedInputsView {
     )
     return row
   }
+}
+
+function queuedActionHint(interruptHint: string | undefined, dequeueHint: string | undefined): string | undefined {
+  if (interruptHint && dequeueHint) return `↳ ${dequeueHint} to edit all · ${interruptHint} to interrupt`
+  if (interruptHint) return `↳ ${interruptHint} to interrupt with a new prompt`
+  if (dequeueHint) return `↳ ${dequeueHint} to edit all queued messages`
+  return undefined
 }
 
 const maxPendingContentRows = 24

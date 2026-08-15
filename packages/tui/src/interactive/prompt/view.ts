@@ -202,19 +202,17 @@ export class PromptView {
     if (pickerVisible) {
       this.#queue.hide()
     } else {
-      this.#queue.update(queuedInputs, Math.max(0, this.#renderer.height - composerRows - otherFixedRows))
+      this.#queue.update(
+        queuedInputs,
+        Math.max(0, this.#renderer.height - composerRows - otherFixedRows),
+        canInterrupt(session)
+      )
     }
   }
 
   #submit(delivery: PromptSubmissionIntent): void {
-    const session = this.#interactive.getSession()
-    const queuedBefore = queuedInputCount(session)
     this.#store.imageMarkersChanged(this.#composer.activeImages())
-    const admitted = this.#store.submit(this.#composer.expandedText(), delivery)
-    if (!admitted || delivery === "interrupt" || queuedInputCount(session) <= queuedBefore) return
-
-    const hint = this.#keybindings.getHint("app.message.interruptAndSend")
-    if (hint) this.#notices.promptInfo(`Queued · ${hint} to interrupt with a new prompt`)
+    this.#store.submit(this.#composer.expandedText(), delivery)
   }
 
   #onPaste = (event: PasteEvent): void => {
@@ -303,7 +301,7 @@ export class PromptView {
       hasImages: prompt.images.length > 0,
       streaming:
         session.isStreaming || session.compactionStatus.type === "running" || authenticationActive(prompt.workflow),
-      interruptible: session.isStreaming && !session.isAborting && session.compactionStatus.type !== "running",
+      interruptible: canInterrupt(session),
       foregroundShellTask: session.shellTasks.some(task => task.type === "foreground"),
       externalEditorEnabled: prompt.workflow.type === "idle",
       historyEnabled: prompt.workflow.type === "idle" && !pickerOpen
@@ -469,6 +467,10 @@ function authenticationActive(workflow: PromptWorkflow): boolean {
   )
 }
 
+function canInterrupt(session: ReturnType<InteractiveStore["getSession"]>): boolean {
+  return session.isStreaming && !session.isAborting && session.compactionStatus.type !== "running"
+}
+
 function composerSlots(session: ReturnType<InteractiveStore["getSession"]>, imageCount = 0): ComposerSlots {
   const context = session.contextUsage
   const model = session.modelState
@@ -484,10 +486,6 @@ function composerSlots(session: ReturnType<InteractiveStore["getSession"]>, imag
     ].filter(Boolean),
     bottomRight: formatCwd(session.sessionManager.header.cwd, session.homeDir)
   }
-}
-
-function queuedInputCount(session: ReturnType<InteractiveStore["getSession"]>): number {
-  return session.queuedInputs.steering.length + session.queuedInputs.followUp.length
 }
 
 // Pi provenance: pi-coding-agent footer.ts at 73414d08 contracts only cwd values inside the configured home.
