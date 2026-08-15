@@ -103,7 +103,7 @@ Each array accepts at most 128 file or directory paths, with each path bounded a
 : Default observation timeout for `wait_subagents`, in milliseconds from `0` through one hour. A wait timeout never cancels child work.
 
 `subagentWorkTimeoutMs`
-: Deadline for each subagent work cycle, in milliseconds from `1` through one hour, defaulting to 15 minutes.
+: Running deadline for each subagent work cycle, in milliseconds from `1` through one hour, defaulting to 15 minutes. A queued cycle starts this deadline only when FIFO admission moves it to running.
 
 `retryEnabled`
 : Turn automatic retry on or off.

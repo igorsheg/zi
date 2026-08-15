@@ -9,11 +9,31 @@ import { Type } from "@earendil-works/pi-ai"
 import { createAgentSessionRuntime } from "../src/agent-session-runtime.js"
 import { createAgentRuntime } from "../src/runtime.js"
 import { SessionManager } from "../src/session-manager.js"
-import { createModels, fauxAssistantMessage, fauxProvider, fauxText, fauxToolCall } from "../src/testing.js"
+import {
+  createModels,
+  fauxAssistantMessage,
+  fauxProvider,
+  fauxText,
+  fauxToolCall,
+  type FauxResponseStep
+} from "../src/testing.js"
 
 const cli = resolve(import.meta.dirname, "../../cli/src/main.ts")
-const mockChild = resolve(import.meta.dirname, "fixtures/mock-rpc-child.ts")
 const workerCommand = Object.freeze([process.execPath, cli])
+
+function delayedReply(text: string, delayMs: number): FauxResponseStep {
+  return async () => {
+    await Bun.sleep(delayMs)
+    return fauxAssistantMessage(text)
+  }
+}
+
+function interruptedReply(): FauxResponseStep {
+  return async (_context, options) => {
+    await new Promise<void>(settle => options?.signal?.addEventListener("abort", () => settle(), { once: true }))
+    return fauxAssistantMessage("", { stopReason: "aborted" })
+  }
+}
 
 function programmaticProfileSource(name: string): string {
   return `import type { ExtensionAPI } from "@with-zi/extension-api"
@@ -930,7 +950,6 @@ test("custom extension orchestration shares session-owned profile mechanics", as
   const root = await mkdtemp(join(tmpdir(), "zi-runtime-extension-subagent-"))
   const cwd = join(root, "project")
   const agentDir = join(root, "agent")
-  const childArgv = join(root, "child-argv.json")
   await mkdir(cwd, { recursive: true })
   await mkdir(join(agentDir, "extensions"), { recursive: true })
   await mkdir(join(agentDir, "subagents"), { recursive: true })
@@ -1009,6 +1028,10 @@ export default function (zi: ExtensionAPI): void {
   models.setProvider(faux.provider)
   faux.setResponses([
     fauxAssistantMessage(fauxToolCall("delegate_once", {}, { id: "delegate-1" }), { stopReason: "toolUse" }),
+    delayedReply("working", 100),
+    fauxAssistantMessage("context received"),
+    fauxAssistantMessage("extension-result"),
+    interruptedReply(),
     fauxAssistantMessage("Delegation complete.")
   ])
   const runtime = await createAgentRuntime({
@@ -1017,13 +1040,7 @@ export default function (zi: ExtensionAPI): void {
     model: "faux/faux-1",
     modelFactory: () => models,
     session: { type: "new", persist: false },
-    extensionWorkerCommand: workerCommand,
-    subagentCommand: [process.execPath, mockChild],
-    internalSubagentEnvironment: {
-      MOCK_RPC_REPLY: "extension-result",
-      MOCK_RPC_DELAY_MS: "100",
-      MOCK_RPC_ARGV: childArgv
-    }
+    extensionWorkerCommand: workerCommand
   })
   try {
     expect(runtime.session.extensionHostSnapshot).toMatchObject({
@@ -1066,9 +1083,6 @@ export default function (zi: ExtensionAPI): void {
         }
       ]
     })
-    expect(JSON.parse(await readFile(childArgv, "utf8"))).toEqual(
-      expect.arrayContaining(["--model", "faux/faux-1", "--thinking", "high"])
-    )
   } finally {
     runtime.session.dispose()
     await runtime.session.waitForIdle()
@@ -1116,6 +1130,7 @@ export default function (zi: ExtensionAPI): void {
   models.setProvider(faux.provider)
   faux.setResponses([
     fauxAssistantMessage(fauxToolCall("begin_background", {}, { id: "begin-1" }), { stopReason: "toolUse" }),
+    delayedReply("survived-reload", 1_000),
     fauxAssistantMessage("Started."),
     fauxAssistantMessage(fauxToolCall("collect_background", {}, { id: "collect-1" }), { stopReason: "toolUse" }),
     fauxAssistantMessage("Collected.")
@@ -1126,9 +1141,7 @@ export default function (zi: ExtensionAPI): void {
     model: "faux/faux-1",
     modelFactory: () => models,
     session: { type: "new", persist: false },
-    extensionWorkerCommand: workerCommand,
-    subagentCommand: [process.execPath, mockChild],
-    internalSubagentEnvironment: { MOCK_RPC_REPLY: "survived-reload", MOCK_RPC_DELAY_MS: "400" }
+    extensionWorkerCommand: workerCommand
   })
   try {
     await runtime.session.prompt("Start background work.")
@@ -1171,6 +1184,7 @@ test("the canonical programmatic profile example activates standard tools", asyn
       ),
       { stopReason: "toolUse" }
     ),
+    fauxAssistantMessage("example-result"),
     fauxAssistantMessage(
       fauxToolCall("wait_subagents", { names: ["example-finder"], timeout_ms: 5_000 }, { id: "example-wait-1" }),
       { stopReason: "toolUse" }
@@ -1186,9 +1200,7 @@ test("the canonical programmatic profile example activates standard tools", asyn
     model: "faux/faux-1",
     modelFactory: () => models,
     session: { type: "new", persist: false },
-    extensionWorkerCommand: workerCommand,
-    subagentCommand: [process.execPath, mockChild],
-    internalSubagentEnvironment: { MOCK_RPC_REPLY: "example-result" }
+    extensionWorkerCommand: workerCommand
   })
   try {
     await runtime.session.prompt("Use the example.")
@@ -1216,7 +1228,6 @@ test("a Markdown profile activates the standard subagent tools without an extens
   const root = await mkdtemp(join(tmpdir(), "zi-runtime-subagent-resource-tools-"))
   const cwd = join(root, "project")
   const agentDir = join(root, "agent")
-  const childArgv = join(root, "child-argv.json")
   await mkdir(cwd, { recursive: true })
   await mkdir(join(agentDir, "subagents"), { recursive: true })
   await writeFile(
@@ -1239,6 +1250,7 @@ test("a Markdown profile activates the standard subagent tools without an extens
         { stopReason: "toolUse" }
       )
     },
+    fauxAssistantMessage("resource-profile-result"),
     fauxAssistantMessage(
       fauxToolCall("wait_subagents", { names: ["finder-1"], timeout_ms: 5_000 }, { id: "wait-standard-1" }),
       { stopReason: "toolUse" }
@@ -1251,9 +1263,7 @@ test("a Markdown profile activates the standard subagent tools without an extens
     model: "faux/faux-1",
     modelFactory: () => models,
     session: { type: "new", persist: false },
-    extensionWorkerCommand: workerCommand,
-    subagentCommand: [process.execPath, mockChild],
-    internalSubagentEnvironment: { MOCK_RPC_REPLY: "resource-profile-result", MOCK_RPC_ARGV: childArgv }
+    extensionWorkerCommand: workerCommand
   })
   try {
     await runtime.session.prompt("Delegate this search.")
@@ -1265,9 +1275,6 @@ test("a Markdown profile activates the standard subagent tools without an extens
     expect(waited).toMatchObject({
       content: [{ type: "text", text: expect.stringContaining("resource-profile-result") }]
     })
-    expect(JSON.parse(await readFile(childArgv, "utf8"))).toEqual(
-      expect.arrayContaining(["--model", "faux/faux-1", "--thinking", "off"])
-    )
   } finally {
     runtime.session.dispose()
     await runtime.session.waitForIdle()
@@ -1297,6 +1304,7 @@ test("runtime settings wire the subagent work deadline into accepted child cycle
       ),
       { stopReason: "toolUse" }
     ),
+    interruptedReply(),
     fauxAssistantMessage(
       fauxToolCall("wait_subagents", { names: ["timed-worker"], timeout_ms: 5_000 }, { id: "wait-timeout-1" }),
       { stopReason: "toolUse" }
@@ -1310,9 +1318,7 @@ test("runtime settings wire the subagent work deadline into accepted child cycle
     modelFactory: () => models,
     settings: { subagentWorkTimeoutMs: 30 },
     session: { type: "new", persist: false },
-    extensionWorkerCommand: workerCommand,
-    subagentCommand: [process.execPath, mockChild],
-    internalSubagentEnvironment: { MOCK_RPC_DELAY_MS: "30000" }
+    extensionWorkerCommand: workerCommand
   })
   try {
     await runtime.session.prompt("Delegate bounded work.")
@@ -1350,6 +1356,7 @@ test("subagent completion stays passive and joins the next parent model request"
       ),
       { stopReason: "toolUse" }
     ),
+    delayedReply("passive-result", 150),
     fauxAssistantMessage("The child is working in the background."),
     context => {
       completionContext = JSON.stringify(context.messages)
@@ -1362,23 +1369,21 @@ test("subagent completion stays passive and joins the next parent model request"
     model: "faux/faux-1",
     modelFactory: () => models,
     session: { type: "new", persist: false },
-    extensionWorkerCommand: workerCommand,
-    subagentCommand: [process.execPath, mockChild],
-    internalSubagentEnvironment: { MOCK_RPC_REPLY: "passive-result", MOCK_RPC_DELAY_MS: "150" }
+    extensionWorkerCommand: workerCommand
   })
   try {
     await runtime.session.prompt("Start the background investigation.")
-    expect(faux.state.callCount).toBe(2)
+    expect(faux.state.callCount).toBe(3)
 
     await waitForCondition(() => runtime.session.sessionManager.subagentWorkResults().length > 0, 5_000)
-    expect(faux.state.callCount).toBe(2)
+    expect(faux.state.callCount).toBe(3)
     expect(runtime.session.messages.some(message => message.role === "custom")).toBe(false)
     expect(runtime.session.sessionManager.subagentWorkResults()).toContainEqual(
       expect.objectContaining({ profile: "pathfinder", name: "passive-worker" })
     )
 
     await runtime.session.prompt("Use any completed investigation.")
-    expect(faux.state.callCount).toBe(3)
+    expect(faux.state.callCount).toBe(4)
     expect(completionContext).toContain("<subagent_completion>")
     expect(completionContext).toContain("passive-result")
     expect(
@@ -1417,6 +1422,7 @@ test("subagent completion joins the next model step of an active parent turn", a
       ),
       { stopReason: "toolUse" }
     ),
+    delayedReply("active-result", 100),
     fauxAssistantMessage(fauxToolCall("hold", {}, { id: "hold-active-1" }), { stopReason: "toolUse" }),
     context => {
       completionContext = JSON.stringify(context.messages)
@@ -1429,9 +1435,7 @@ test("subagent completion joins the next model step of an active parent turn", a
     model: "faux/faux-1",
     modelFactory: () => models,
     session: { type: "new", persist: false },
-    extensionWorkerCommand: workerCommand,
-    subagentCommand: [process.execPath, mockChild],
-    internalSubagentEnvironment: { MOCK_RPC_REPLY: "active-result", MOCK_RPC_DELAY_MS: "100" }
+    extensionWorkerCommand: workerCommand
   })
   runtime.session.setActiveTools([
     {
@@ -1447,7 +1451,7 @@ test("subagent completion joins the next model step of an active parent turn", a
   ])
   try {
     await runtime.session.prompt("Investigate while continuing parent work.")
-    expect(faux.state.callCount).toBe(3)
+    expect(faux.state.callCount).toBe(4)
     expect(completionContext).toContain("<subagent_completion>")
     expect(completionContext).toContain("active-result")
     expect(
@@ -1482,6 +1486,7 @@ test("restoration and compaction never redeliver durable child completion eviden
       ),
       { stopReason: "toolUse" }
     ),
+    delayedReply("restored-result", 80),
     fauxAssistantMessage("The child is working in the background.")
   ])
   const first = await createAgentRuntime({
@@ -1490,9 +1495,7 @@ test("restoration and compaction never redeliver durable child completion eviden
     model: "faux/faux-1",
     modelFactory: () => models,
     session: { type: "new", persist: true },
-    extensionWorkerCommand: workerCommand,
-    subagentCommand: [process.execPath, mockChild],
-    internalSubagentEnvironment: { MOCK_RPC_REPLY: "restored-result", MOCK_RPC_DELAY_MS: "80" }
+    extensionWorkerCommand: workerCommand
   })
   let second: Awaited<ReturnType<typeof createAgentRuntime>> | undefined
   let third: Awaited<ReturnType<typeof createAgentRuntime>> | undefined
@@ -1520,8 +1523,7 @@ test("restoration and compaction never redeliver durable child completion eviden
       model: "faux/faux-1",
       modelFactory: () => models,
       session: { type: "resume", file: sessionFile },
-      extensionWorkerCommand: workerCommand,
-      subagentCommand: [process.execPath, mockChild]
+      extensionWorkerCommand: workerCommand
     })
     await second.session.prompt("Use the restored result.")
     expect(restoredOccurrences).toBe(1)
@@ -1571,8 +1573,7 @@ test("restoration and compaction never redeliver durable child completion eviden
       model: "faux/faux-1",
       modelFactory: () => models,
       session: { type: "resume", file: sessionFile },
-      extensionWorkerCommand: workerCommand,
-      subagentCommand: [process.execPath, mockChild]
+      extensionWorkerCommand: workerCommand
     })
     await third.session.prompt("Continue after compaction.")
     expect(compactedContext).toContain("restored child result was delivered once")
@@ -1627,6 +1628,7 @@ export default function (zi: ExtensionAPI): void {
         { stopReason: "toolUse" }
       )
     },
+    fauxAssistantMessage("programmatic-profile-result"),
     fauxAssistantMessage(
       fauxToolCall("wait_subagents", { names: ["reviewer-1"], timeout_ms: 5_000 }, { id: "wait-programmatic-1" }),
       { stopReason: "toolUse" }
@@ -1639,9 +1641,7 @@ export default function (zi: ExtensionAPI): void {
     model: "faux/faux-1",
     modelFactory: () => models,
     session: { type: "new", persist: false },
-    extensionWorkerCommand: workerCommand,
-    subagentCommand: [process.execPath, mockChild],
-    internalSubagentEnvironment: { MOCK_RPC_REPLY: "programmatic-profile-result" }
+    extensionWorkerCommand: workerCommand
   })
   try {
     expect(runtime.session.extensionHostSnapshot).toMatchObject({ tools: [] })
@@ -1682,8 +1682,7 @@ test("subagent mechanics expose no model-facing tools without admitted profiles"
     model: "faux/faux-1",
     modelFactory: () => models,
     session: { type: "new", persist: false },
-    extensionWorkerCommand: workerCommand,
-    subagentCommand: [process.execPath, mockChild]
+    extensionWorkerCommand: workerCommand
   })
   try {
     await runtime.session.prompt("Inspect available tools.")
@@ -1696,45 +1695,81 @@ test("subagent mechanics expose no model-facing tools without admitted profiles"
   }
 })
 
-test("a depth-one child does not activate recursive subagent tools", async () => {
+test("production child sessions are structurally depth one and use RPC extension context", async () => {
   const root = await mkdtemp(join(tmpdir(), "zi-runtime-subagent-depth-one-"))
   const cwd = join(root, "project")
   const agentDir = join(root, "agent")
+  const modes = join(root, "modes.log")
   await mkdir(cwd, { recursive: true })
   await mkdir(join(agentDir, "subagents"), { recursive: true })
+  await mkdir(join(agentDir, "extensions"), { recursive: true })
   await writeFile(
     join(agentDir, "subagents", "nested.md"),
-    "---\ndescription: Must not activate recursively\n---\nWork.\n"
+    "---\ndescription: Inspect a depth-one child\n---\nInspect the admitted tools.\n"
+  )
+  await writeFile(
+    join(agentDir, "extensions", "context.ts"),
+    `import { appendFileSync } from "node:fs"
+export default zi => zi.on("agent_start", (_event, context) => appendFileSync(${JSON.stringify(modes)}, context.mode + "\\n"))
+`
   )
   const models = createModels()
   const faux = fauxProvider()
   models.setProvider(faux.provider)
-  let admittedTools: readonly string[] = []
+  let childTools: readonly string[] = []
+  let childToolDescription = ""
+  let childApiKey: string | undefined
+  let childModel = ""
   faux.setResponses([
-    context => {
-      admittedTools = (context.tools ?? []).map(tool => tool.name)
+    fauxAssistantMessage(
+      fauxToolCall(
+        "spawn_subagent",
+        { profile: "nested", name: "depth-one", prompt: "Inspect tools." },
+        { id: "spawn-depth-one" }
+      ),
+      { stopReason: "toolUse" }
+    ),
+    (context, options, _state, model) => {
+      childTools = (context.tools ?? []).map(tool => tool.name)
+      childToolDescription = context.tools?.[0]?.description ?? ""
+      childApiKey = options?.apiKey
+      childModel = `${model.provider}/${model.id}`
       return fauxAssistantMessage("No recursive delegation.")
-    }
+    },
+    fauxAssistantMessage(
+      fauxToolCall("wait_subagents", { names: ["depth-one"], timeout_ms: 5_000 }, { id: "wait-depth-one" }),
+      { stopReason: "toolUse" }
+    ),
+    fauxAssistantMessage("Depth one verified.")
   ])
   const runtime = await createAgentRuntime({
     cwd,
     agentDir,
     model: "faux/faux-1",
+    apiKey: "runtime-key",
+    thinkingLevel: "high",
     modelFactory: () => models,
     session: { type: "new", persist: false },
-    subagentCommand: [process.execPath, mockChild],
-    internalSubagentDepth: 1
+    extensionMode: "interactive",
+    extensionWorkerCommand: workerCommand,
+    toolSurface: "direct-and-code"
   })
   try {
-    await runtime.session.prompt("Inspect tools.")
-    expect(admittedTools).not.toContain("list_subagent_profiles")
-    expect(admittedTools).not.toContain("spawn_subagent")
+    await runtime.session.prompt("Spawn the child.")
+    expect(childTools).toContain("read")
+    expect(childTools).toContain("code")
+    expect(childTools).not.toContain("list_subagent_profiles")
+    expect(childTools).not.toContain("spawn_subagent")
+    expect(childToolDescription).not.toContain("spawn_subagent")
+    expect(childApiKey).toBe("runtime-key")
+    expect(childModel).toBe("faux/faux-1")
+    expect(await readFile(modes, "utf8")).toBe("interactive\nrpc\n")
   } finally {
     runtime.session.dispose()
     await runtime.session.waitForIdle()
     await rm(root, { recursive: true, force: true })
   }
-})
+}, 15_000)
 
 test("reload adds and removes standard tools with Markdown profiles", async () => {
   const root = await mkdtemp(join(tmpdir(), "zi-runtime-subagent-resource-reload-"))
@@ -1766,8 +1801,7 @@ test("reload adds and removes standard tools with Markdown profiles", async () =
     model: "faux/faux-1",
     modelFactory: () => models,
     session: { type: "new", persist: false },
-    extensionWorkerCommand: workerCommand,
-    subagentCommand: [process.execPath, mockChild]
+    extensionWorkerCommand: workerCommand
   })
   try {
     await runtime.session.prompt("Inspect tools before the profile exists.")
@@ -1815,7 +1849,6 @@ test("code-only reload keeps one outer tool while refreshing its nested catalog"
     modelFactory: () => models,
     session: { type: "new", persist: false },
     extensionWorkerCommand: workerCommand,
-    subagentCommand: [process.execPath, mockChild],
     toolSurface: "code-only"
   })
   try {
@@ -1868,8 +1901,7 @@ test("reload replaces programmatic profiles in the canonical catalog", async () 
     model: "faux/faux-1",
     modelFactory: () => models,
     session: { type: "new", persist: false },
-    extensionWorkerCommand: workerCommand,
-    subagentCommand: [process.execPath, mockChild]
+    extensionWorkerCommand: workerCommand
   })
   try {
     await runtime.session.prompt("List profiles.")
@@ -1940,8 +1972,7 @@ export default function (zi: ExtensionAPI): void {
     model: "faux/faux-1",
     modelFactory: () => models,
     session: { type: "new", persist: false },
-    extensionWorkerCommand: workerCommand,
-    subagentCommand: [process.execPath, mockChild]
+    extensionWorkerCommand: workerCommand
   })
 
   try {
@@ -1986,12 +2017,7 @@ export default function (zi: ExtensionAPI): void {
 }
 `
   )
-  const runtime = await createAgentRuntime({
-    cwd,
-    agentDir,
-    session: { type: "new", persist: false },
-    subagentCommand: [process.execPath, mockChild]
-  })
+  const runtime = await createAgentRuntime({ cwd, agentDir, session: { type: "new", persist: false } })
 
   try {
     expect(runtime.session.extensionHostSnapshot).toMatchObject({

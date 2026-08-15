@@ -25,8 +25,7 @@ test("background projection counts only independently running shell tasks and su
     { type: "settling" }
   ]
   const subagents: readonly TranscriptSubagentActivity[] = [
-    { lifecycle: "starting" },
-    { lifecycle: "spawn_admitting" },
+    { lifecycle: "queued" },
     { lifecycle: "running" },
     { lifecycle: "interrupting" },
     { lifecycle: "closing" },
@@ -37,7 +36,7 @@ test("background projection counts only independently running shell tasks and su
   expect(projectTranscriptBackgroundStatus(shellTasks, subagents)).toEqual({
     type: "running",
     shellCommands: 2,
-    subagents: 5
+    subagents: 4
   })
   expect(
     projectTranscriptBackgroundStatus([{ type: "foreground" }], [{ lifecycle: "idle" }, { lifecycle: "exited" }])

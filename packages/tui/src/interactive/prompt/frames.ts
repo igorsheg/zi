@@ -458,12 +458,10 @@ function subagentStatusLabel(snapshot: SubagentSnapshot): string {
   const suffix = cycle === undefined ? "" : ` #${cycle}`
   if (snapshot.completion) return `${snapshot.completion.status}${suffix}`
   switch (snapshot.lifecycle) {
-    case "starting":
-      return `starting${suffix}`
     case "idle":
       return `idle${suffix}`
-    case "spawn_admitting":
-      return `starting work${suffix}`
+    case "queued":
+      return `queued${suffix}`
     case "running":
       return `running${suffix}`
     case "interrupting":

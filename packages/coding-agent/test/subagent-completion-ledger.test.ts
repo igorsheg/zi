@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test"
 
 import type { SubagentEntry, SubagentWorkResultEntry } from "../src/session-manager.js"
-import type { SubagentCompletion } from "../src/subagents/child-process.js"
+import type { SubagentCompletion } from "../src/subagents/child.js"
 import { CompletionLedger } from "../src/subagents/completion-ledger.js"
 
 test("CompletionLedger preserves claim and acknowledgement state across persistence", () => {

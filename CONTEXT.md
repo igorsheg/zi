@@ -41,7 +41,7 @@ The session-scoped coding-agent owner of shell task identity, foreground/backgro
 _Avoid_: Global process manager, TUI task registry, detached Bash process
 
 **Owned process substrate**:
-The private coding-agent owner of local child-process launch adaptation, pipe identity, exit observation, containment admission, tree termination, and stream release. Session shell, code mode, extension host, and subagent supervisor retain their distinct domain admission, state, deadlines, cancellation, output, evidence, and shutdown policy.
+The private coding-agent owner of local child-process launch adaptation, pipe identity, exit observation, containment admission, tree termination, and stream release. It serves session shell, code mode, and extension host executable work; in-process subagent sessions do not enter this substrate, though their shell, Code Mode, and extension workers do.
 _Avoid_: Process core, execution manager, universal task envelope
 
 **Framed JSON channel**:
@@ -217,7 +217,7 @@ Static configuration for delegated work: a profile name, description, instructio
 _Avoid_: Subagent, role, agent type, permission profile
 
 **Subagent**:
-One runtime child Zi agent session created from a subagent profile whose conversation remains authoritative in that child. Subagents remain direct children of one parent session; sibling collaboration is routed by that parent rather than by a separate peer network.
+One in-process child `AgentSession` created from a subagent profile whose conversation remains authoritative in that child. Subagents remain direct depth-one children of one parent session; sibling collaboration is routed by that parent rather than by a separate peer network.
 _Avoid_: Subagent profile, worker, tool call, copied parent agent
 
 **Subagent name**:
@@ -225,8 +225,8 @@ The parent-session-unique runtime identity chosen when a subagent is spawned. It
 _Avoid_: Subagent type, role, operational ID
 
 **Subagent supervisor**:
-The `AgentSession`-owned controller of direct-child names, admission, process lifetimes, work cycles, bounded completion retention, durable evidence, and shutdown. It appends one parent-owned work result for each settled work cycle; spawn, message delivery, task assignment, interruption, and close remain transient control operations. `AgentSession` derives standard orchestration from its admitted profile catalog; extensions may reach the same mechanics only through bounded session operations for optional custom workflows.
-_Avoid_: Extension generation, agent coordinator, extension API object, session registry
+The parent `AgentSession`-owned controller of direct-child names, four-live admission, two-running FIFO work admission, child-session lifetimes, bounded completion retention, durable evidence, and shutdown. It appends one parent-owned work result for each settled work cycle; spawn, message delivery, task assignment, interruption, and close remain transient control operations. `AgentSession` derives standard orchestration from its admitted profile catalog; extensions may reach the same mechanics only through bounded session operations for optional custom workflows.
+_Avoid_: Extension generation, agent coordinator, extension API object, session registry, child-process supervisor
 
 **Peer message**:
 Bounded context sent from one subagent to a live sibling through their common parent supervisor. The parent derives the sender identity, validates the sibling target, and admits the message queue-only without making delivery a durable session artifact. A peer message neither assigns a work cycle nor replaces parent completion delivery.

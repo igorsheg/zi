@@ -269,14 +269,7 @@ export interface ExtensionSubagentProfile {
   readonly thinking?: ExtensionThinkingLevel
 }
 
-export type ExtensionSubagentLifecycle =
-  | "starting"
-  | "idle"
-  | "spawn_admitting"
-  | "running"
-  | "interrupting"
-  | "closing"
-  | "exited"
+export type ExtensionSubagentLifecycle = "idle" | "queued" | "running" | "interrupting" | "closing" | "exited"
 
 export interface ExtensionSubagentCompletion {
   readonly workCycle: number

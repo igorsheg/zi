@@ -102,16 +102,14 @@ import type { SettingsError, SettingsManager, SettingsScope } from "./settings-m
 import type { BackgroundTaskResultInput } from "./shell-result.js"
 import { expandSkillCommand, type Skill } from "./skills.js"
 import { builtinSlashCommands, type SlashCommand } from "./slash-commands.js"
-import { clipUtf8, type SubagentCompletion } from "./subagents/child-process.js"
-import type { PeerMessenger } from "./subagents/peer-messenger.js"
-import type { PeerRequest, PeerResponse } from "./subagents/peer-protocol.js"
+import type { SubagentCompletion } from "./subagents/child.js"
 import {
   durablePreviewBytes,
-  type SubagentSessionEvents,
   type SubagentSnapshot,
   type SubagentSupervisor,
   type SubagentTranscriptSnapshot
 } from "./subagents/supervisor.js"
+import { clipUtf8 } from "./subagents/text.js"
 import { isSubagentToolDetails, type SubagentToolDetails } from "./subagents/tool-details.js"
 import { createSubagentTools } from "./subagents/tools.js"
 import { buildSystemPrompt } from "./system-prompt.js"
@@ -320,8 +318,7 @@ interface AgentSessionConfig {
   shell?: SessionShell
   workPlan: WorkPlan
   subagentSupervisor?: SubagentSupervisor
-  peerMessenger?: PeerMessenger
-  processTreeTracker?: ProcessTreeTracker
+  ownedProcessTreeTracker?: ProcessTreeTracker
   model?: Model<Api>
   apiKeyProvider?: string
 }
@@ -527,8 +524,7 @@ export class AgentSession {
   readonly #shell: SessionShell | undefined
   readonly #workPlan: WorkPlan
   readonly #subagents: SubagentSupervisor | undefined
-  readonly #peerMessenger: PeerMessenger | undefined
-  readonly #processTreeTracker: ProcessTreeTracker | undefined
+  readonly #ownedProcessTreeTracker: ProcessTreeTracker | undefined
   readonly #apiKeyProvider: string | undefined
   readonly #listeners = new Set<(event: AgentSessionEvent) => void>()
   readonly #pendingShellCompletions = new Map<string, BackgroundTaskResultInput>()
@@ -582,8 +578,7 @@ export class AgentSession {
     this.#shell = config.shell
     this.#workPlan = config.workPlan
     this.#subagents = config.subagentSupervisor
-    this.#peerMessenger = config.peerMessenger
-    this.#processTreeTracker = config.processTreeTracker
+    this.#ownedProcessTreeTracker = config.ownedProcessTreeTracker
     this.#apiKeyProvider = config.apiKeyProvider
     this.sessionManager = config.sessionManager
     this.#shell?.bindInvariants(this.#invariantRegistry)
@@ -677,14 +672,6 @@ export class AgentSession {
         { type: "work_plan_changed", plan }
       ])
     })
-  }
-
-  bindInternalPeerTransport(transport: (request: PeerRequest) => void): () => void {
-    return this.#peerMessenger?.bind(transport) ?? (() => {})
-  }
-
-  acceptInternalPeerResponse(response: PeerResponse): boolean {
-    return this.#peerMessenger?.accept(response) ?? false
   }
 
   get homeDir(): string {
@@ -826,10 +813,6 @@ export class AgentSession {
 
   subagentSnapshot(name: string): SubagentSnapshot | undefined {
     return this.subagentSnapshots().find(snapshot => snapshot.name === name)
-  }
-
-  subagentSessionEvents(name: string): SubagentSessionEvents | undefined {
-    return this.#subagents?.sessionEvents(name)
   }
 
   subagentTranscript(name: string): SubagentTranscriptSnapshot | undefined {
@@ -1903,7 +1886,6 @@ export class AgentSession {
       }
     }
     this.#agent.abort()
-    this.#peerMessenger?.dispose()
     this.#unbindExtensionCatalog?.()
     const processOwners = (async (): Promise<void> => {
       try {
@@ -1914,7 +1896,7 @@ export class AgentSession {
           this.#shell?.dispose() ?? Promise.resolve()
         ])
       } finally {
-        await this.#processTreeTracker?.dispose()
+        await this.#ownedProcessTreeTracker?.dispose()
       }
     })()
     const settled = settleAll([

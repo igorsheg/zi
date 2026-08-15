@@ -6,7 +6,6 @@ import type { ProcessScope, ProcessScopeRefreshResult, ProcessTreeTracker } from
 
 const maxCommandParts = 32
 const maxCommandPartBytes = 4_096
-const bunExitPollMs = 10
 const processExitSettleMs = 1_000
 
 export interface OwnedProcessExit {
@@ -177,12 +176,14 @@ export function spawnOwnedProcess(request: OwnedProcessRequest): OwnedProcess {
         stderr.destroy()
         protocol?.destroy()
         if (!settled && !(await settlesWithin(exit, processExitSettleMs))) {
+          stopObserving()
           child.process.unref()
           if (child.type === "node") child.process.once("error", ignoreStreamError)
           processError ??= new Error("Process ownership ended before exit observation")
           finish(child.process.exitCode, child.process.signalCode)
+        } else {
+          stopObserving()
         }
-        stopObserving()
         if (scopeFailure) throw scopeFailure
       })()
       return disposal
@@ -242,18 +243,21 @@ function observeExit(
     }
   }
 
-  let timer: ReturnType<typeof setTimeout> | undefined
-  const poll = (): void => {
-    if (child.process.exitCode !== null || child.process.signalCode !== null) {
+  let observing = true
+  void child.process.exited.then(
+    () => {
+      if (observing) finish(child.process.exitCode, child.process.signalCode)
+      return undefined
+    },
+    cause => {
+      if (!observing) return undefined
+      onError(cause instanceof Error ? cause : new Error("Could not observe owned process exit"))
       finish(child.process.exitCode, child.process.signalCode)
-      return
+      return undefined
     }
-    timer = setTimeout(poll, bunExitPollMs)
-    timer.unref?.()
-  }
-  poll()
+  )
   return () => {
-    if (timer) clearTimeout(timer)
+    observing = false
   }
 }
 

@@ -10,7 +10,7 @@ You have a task with two or three independent lanes: map the storage layer while
 
 Zi runs a lane in a child session that has its own transcript, model, and thinking level, and returns bounded evidence to the parent rather than the child's whole conversation.
 
-Profiles come from Markdown resources or from programmatic extension registration. Both declaration paths produce the same session-owned profile catalog and activate the same standard model-facing tools. The parent `AgentSession` is the [owner](vocabulary.md) of profile precedence, model and thinking resolution, orchestration tools, child-process mechanics, durable evidence, and shutdown.
+Profiles come from Markdown resources or from programmatic extension registration. Both declaration paths produce the same session-owned profile catalog and activate the same standard model-facing tools. The parent `AgentSession` owns profile precedence, model and thinking resolution, and orchestration policy; its subagent supervisor owns child-session admission, durable evidence, and shutdown.
 
 ## Your first delegation
 
@@ -32,8 +32,8 @@ A profile is reusable behavior configuration; a runtime name is a parent-session
 
 ## Four rules to know first
 
-- At most four live children per parent. The bound keeps a fan-out from becoming an unbounded set of child processes and retained transcripts on one machine.
-- Idle children still consume a slot. Close children that will not be reused; a finished lane left open is what leaves you without capacity for the next one.
+- At most four children are live per parent, and at most two work cycles run at once. Extra admitted cycles wait in explicit FIFO order, bounding simultaneous model and executable work without discarding reusable child conversations.
+- Idle and queued children still consume a live slot. Close children that will not be reused; a finished lane left open is what leaves you without capacity for the next one.
 - Subagent completion never wakes the parent model automatically. A child that finishes mid-turn cannot inject itself into unrelated work, so its evidence waits for the parent's next model request.
 - `wait_subagents` is a bounded receive, not an all-child barrier and not the delivery mechanism. Treat it as a barrier and you block on lanes you never meant to wait for; treat it as delivery and you poll for evidence that arrives anyway.
 
@@ -49,7 +49,7 @@ A subagent profile contains:
 
 Omitted model and thinking values inherit the parent's current selection. An unavailable explicit model fails with profile source attribution; Zi does not silently fall back. Children also inherit the parent's invocation-only `--code-only` tool surface when it is active.
 
-Profiles do not claim permissions, read-only behavior, worktrees, tool restrictions, budgets, or filesystem isolation. Child Zi processes retain the current user's authority unless a future enforceable mechanism says otherwise.
+Profiles do not claim permissions, read-only behavior, worktrees, tool restrictions, budgets, or filesystem isolation. Child sessions and their executable tools retain the current user's authority unless an enforceable mechanism says otherwise.
 
 ## Markdown declaration
 
@@ -108,7 +108,7 @@ A non-empty catalog activates:
 - `interrupt_subagent`;
 - `close_subagent`.
 
-The profile parameter includes bounded purpose summaries for the admitted catalog, so normal selection does not require a preliminary tool call. `list_subagent_profiles` remains available when the full structured catalog is useful. The selected profile's instructions are prepended to the task, and its model and thinking selection are applied before the session-owned supervisor admits the child. Each parent may own at most four live children.
+The profile parameter includes bounded purpose summaries for the admitted catalog, so normal selection does not require a preliminary tool call. `list_subagent_profiles` remains available when the full structured catalog is useful. The selected profile's instructions are prepended to the task, and its model and thinking selection are applied before the session-owned supervisor admits the child. Each parent may own at most four live children while the supervisor starts at most two work cycles concurrently.
 
 `send_subagent_message` delivers context without assigning work and never starts an idle turn. `assign_subagent_task` starts a work cycle when idle or delivers the task to the active cycle. If the task must be a separate cycle, wait for the child to become idle before assigning it. Their successful model-facing results are concise text; typed semantic details remain authoritative for client presentation.
 
@@ -147,11 +147,11 @@ Depth-one child sessions expose two narrow collaboration tools:
 - `list_peer_subagents` lists the other live children owned by the same parent session;
 - `send_peer_message` sends context to one live sibling through the parent-owned relay.
 
-Peer runtime names remain scoped to their common parent. The parent derives the sender identity from the child process that issued the request, validates the target against its authoritative live-child catalog, and serializes delivery through the target child. A child cannot claim another sender, message itself, address an exited child, or acquire spawn, interrupt, close, wait, or process-handle authority through this channel.
+Peer runtime names remain scoped to their common parent. A direct parent-owned relay captures the sender when the child session is constructed, validates the target against the authoritative live-child catalog, and serializes delivery through the target child. There is no peer RPC framing or process identity for a child to supply, so sender identity remains unforgeable.
 
 Peer delivery is queue-only. It joins active sibling work through the same safe follow-up path as `send_subagent_message`, but never starts an idle sibling turn. The receiving child sees an attributed `[Peer message from <runtime-name>]` envelope. Final work-cycle evidence continues to flow to the parent; peer messages do not replace parent completion delivery.
 
-The child-to-parent request and parent-to-child acknowledgement are correlated and bounded. A peer message retains at most 64 KiB, each child may have at most eight peer requests in flight, and the parent exposes at most its four live-child slots. Once the child emits a relay request, cancellation stops the sender from waiting but does not retract that request; delivery may still complete.
+A peer message retains at most 64 KiB, each child may have at most eight direct relay operations pending, and the parent exposes at most its four live-child slots. Cancellation stops the sender from waiting but does not retract a direct relay call already admitted; delivery may still complete.
 
 ## Optional custom orchestration
 
@@ -165,17 +165,21 @@ Custom orchestration is optional; it is not required to use Markdown or programm
 
 ## Lifetime and safety
 
-The parent `AgentSession` owns admitted child processes. Zi enforces child concurrency, runtime names, RPC framing, output retention, cancellation, work and wait bounds, credential and cwd propagation, process-tree containment, durable work results, and forced cleanup.
+The parent supervisor owns in-process, depth-one child `AgentSession` lifetimes. It admits at most four live children, starts at most two work cycles, and starts queued cycles in FIFO order whenever a running cycle settles or is cancelled.
+
+Each child independently owns its conversation, ephemeral session manager, session shell, Code Mode runtime, and extension host with its workers. The parent runtime shares admitted configuration, models, credentials, resources, worker commands, and one process tracker with those sessions; a child borrows that tracker and cannot dispose the parent runtime or tracker when it closes.
+
+A child session itself is in process, but executable work is not collapsed into the parent. Extension handlers run in child-scoped extension workers, Code Mode runs in its programmatic worker, and shell commands retain process-group and process-tree containment. Parent shutdown first settles child-session owners, then disposes the shared process tracker so descendant executable work cannot outlive the runtime.
 
 Each settled work cycle records one model-invisible `subagent_work_result` keyed by its runtime name and work-cycle number. It retains the selected profile when available, result, duration, omission facts, and a stable failure code. Spawn, send, assignment, interrupt, and close are control operations; they do not become journal records. Hidden completion context and orchestration tool results deliver work-cycle evidence without creating another result.
 
-A parent owns at most four live children and retains at most 32 completed cycles; new work is refused rather than evicting undelivered evidence. Completion output is clipped to 50 KiB, durable previews to 8 KiB, listed task summaries to 256 bytes, and shutdown settlement to a fixed bound.
+A parent retains at most 32 completed cycles; new work is refused rather than evicting undelivered evidence. Completion output is clipped to 50 KiB, durable previews to 8 KiB, listed task summaries to 256 bytes, and shutdown settlement to a fixed bound.
 
-Each accepted initial spawn prompt and accepted task assigned to an idle child starts a separately bounded work cycle using `subagentWorkTimeoutMs`. Assignments made while the child is already working join its current cycle and do not reset that deadline.
+Each accepted initial spawn prompt and accepted task assigned to an idle child reserves a separately bounded work cycle using `subagentWorkTimeoutMs`. A queued cycle's deadline starts only when FIFO admission moves it to running, so time spent waiting behind the two-running bound does not consume its work budget. Assignments made while the child is queued or running join that same cycle and do not reset its deadline.
 
-`session.await_idle` is a semantic completion watch rather than an ordinary RPC response deadline. The child gives every admitted prompt in one cycle the same completion ID; the RPC session accumulates the latest assistant completion event and returns one bounded terminal projection with its admission revision when idle.
+When a cycle settles, the child owner folds the latest typed assistant message into one bounded completion. An aborted message is cancellation, provider error is failure, and a tool-use or pending assistant without a final answer is incomplete; completion does not depend on an RPC idle projection.
 
-Lifecycle settlement never waits on transcript paging. A separate bounded message-tail refresh may enrich presentation after the child becomes idle, and a newer admission rejects that refresh as stale.
+Lifecycle settlement never waits on transcript presentation. The live projection keeps a bounded array of references to authoritative child-session messages plus streaming and active-tool facts; it neither pages a child transport nor copies message text into another timeline.
 
 When work expires, the child owner interrupts it, waits within a separate settlement bound, records `work_cycle_timeout` evidence, and keeps a successfully settled child reusable. Requested interruption has its own bounded settlement deadline; a child that acknowledges interruption but never becomes idle is force-cleaned with durable `interrupt_settlement_timeout` evidence. This work deadline is independent of `wait_subagents`: observation timeouts never cancel child work.
 
@@ -185,8 +189,9 @@ Delivery follows the parent's own turn boundary. If the parent still has an acti
 
 - A session with no admitted profiles exposes none of these parent orchestration tools.
 - Depth-one child sessions cannot recursively create subagents, so a fan-out stays one level wide.
-- Extensions never receive `SubagentSupervisor` or child-process handles.
-- A child cannot claim another sender, message itself, address an exited child, or acquire spawn, interrupt, close, wait, or process-handle authority through the peer channel.
+- Extensions never receive `SubagentSupervisor`, child-session owners, or process handles.
+- A child cannot claim another sender, message itself, address an exited child, or acquire spawn, interrupt, close, wait, or process authority through the peer channel.
 - Once the child emits a relay request, cancellation stops the sender from waiting but does not retract that request; delivery may still complete.
+- Profiles do not enforce permissions. Child sessions, extension workers, Code Mode, and shell commands are not security sandboxes.
 - Child sessions are not persistent; only their bounded evidence reaches the parent journal.
 - A child recovered from journal evidence after restart has no fabricated transcript and cannot be opened unless live transcript evidence is available.

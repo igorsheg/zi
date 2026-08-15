@@ -9,10 +9,6 @@ import {
   type PrintModeResult,
   type RpcModeResult
 } from "@with-zi/coding-agent"
-import {
-  internalSubagentApiKeyEnvironment,
-  internalSubagentDepthEnvironment
-} from "@with-zi/coding-agent/internal/subagent-invocation"
 
 import { parseArgs, resolveCliInvocation, type CliInvocation, type CliMode, type ParsedArgs } from "./args.js"
 import { helpText, versionText } from "./cli-text.js"
@@ -114,12 +110,12 @@ export async function runCli(argv: readonly string[], host: CliHost): Promise<nu
   try {
     if (mode === "interactive") {
       sessionRuntime = await host.createSessionRuntime(
-        runtimeOptions(args, mode, host.extensionWorkerCommand, host.codeModeWorkerCommand, host.env)
+        runtimeOptions(args, mode, host.extensionWorkerCommand, host.codeModeWorkerCommand)
       )
       runtime = sessionRuntime
     } else {
       runtime = await host.createRuntime(
-        runtimeOptions(args, mode, host.extensionWorkerCommand, host.codeModeWorkerCommand, host.env)
+        runtimeOptions(args, mode, host.extensionWorkerCommand, host.codeModeWorkerCommand)
       )
     }
   } catch (cause) {
@@ -188,11 +184,8 @@ function runtimeOptions(
   args: CliInvocation,
   mode: AppMode,
   extensionWorkerCommand: readonly string[],
-  codeModeWorkerCommand: readonly string[],
-  environment: Readonly<Record<string, string | undefined>>
+  codeModeWorkerCommand: readonly string[]
 ): CreateAgentRuntimeOptions {
-  const internalSubagent = environment[internalSubagentDepthEnvironment] === "1"
-  const apiKey = args.apiKey ?? (internalSubagent ? environment[internalSubagentApiKeyEnvironment] : undefined)
   return {
     cwd: args.cwd,
     agentDir: args.agentDir,
@@ -200,14 +193,12 @@ function runtimeOptions(
     extensionMode: mode,
     extensionWorkerCommand,
     codeModeWorkerCommand,
-    subagentCommand: extensionWorkerCommand,
-    internalSubagentDepth: internalSubagent ? 1 : 0,
     toolSurface: args.toolSurface,
     session: args.session,
     ...(args.sessionDir === undefined ? {} : { sessionDir: args.sessionDir }),
     ...(args.model === undefined ? {} : { model: args.model }),
     ...(args.thinkingLevel === undefined ? {} : { thinkingLevel: args.thinkingLevel }),
-    ...(apiKey === undefined ? {} : { apiKey }),
+    ...(args.apiKey === undefined ? {} : { apiKey: args.apiKey }),
     ...(args.systemPrompt === undefined ? {} : { systemPrompt: args.systemPrompt }),
     ...(args.appendSystemPrompt === undefined ? {} : { appendSystemPrompt: args.appendSystemPrompt })
   }

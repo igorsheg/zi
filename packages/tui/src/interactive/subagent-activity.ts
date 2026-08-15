@@ -2,8 +2,7 @@ import type { SubagentSnapshot } from "@with-zi/coding-agent"
 
 export function isActiveSubagentLifecycle(lifecycle: SubagentSnapshot["lifecycle"]): boolean {
   switch (lifecycle) {
-    case "starting":
-    case "spawn_admitting":
+    case "queued":
     case "running":
     case "interrupting":
     case "closing":

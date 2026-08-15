@@ -1,13 +1,13 @@
 import { expect, test } from "bun:test"
 import { mkdir, mkdtemp, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
-import { join, resolve } from "node:path"
+import { join } from "node:path"
 
 import type { AgentTool } from "@earendil-works/pi-agent-core"
 import { InvariantRegistry } from "@with-zi/invariants"
 
 import { isRecord } from "../src/guards.js"
-import { createProcessTreeTracker } from "../src/processes/process-tree.js"
+import { ZiPaths } from "../src/paths.js"
 import { SessionManager } from "../src/session-manager.js"
 import { SubagentSupervisor } from "../src/subagents/supervisor.js"
 import {
@@ -18,8 +18,7 @@ import {
 } from "../src/subagents/tool-details.js"
 import { createSubagentTools, maxSubagentToolResultBytes } from "../src/subagents/tools.js"
 import { projectToolPresentation } from "../src/tools/presentation/project.js"
-
-const mockChild = resolve(import.meta.dir, "fixtures/mock-rpc-child.ts")
+import { createTestChildSessionFactory } from "./subagent-harness.js"
 const pathfinderProfile = Object.freeze({
   name: "pathfinder",
   description: "Find implementation evidence",
@@ -345,16 +344,13 @@ test("profile and wait projections remain bounded", async () => {
 
 async function createHarness(name: string, reply: string, delayMs = 30) {
   const root = await mkdtemp(join(tmpdir(), `zi-subagent-tools-${name}-`))
-  const cwd = join(root, "project")
-  await mkdir(cwd)
-  const sessionManager = SessionManager.inMemory(cwd)
+  const paths = new ZiPaths(join(root, "project"), join(root, "agent"))
+  await mkdir(paths.cwd)
+  const sessionManager = SessionManager.inMemory(paths.cwd)
   const supervisor = new SubagentSupervisor({
-    command: [process.execPath, mockChild],
-    cwd,
-    env: { ...process.env, MOCK_RPC_REPLY: reply, MOCK_RPC_DELAY_MS: String(delayMs) },
+    createChildSession: createTestChildSessionFactory(paths, { reply, delayMs }),
     selection: () => ({ model: "faux/faux-1", thinkingLevel: "off" }),
     sessionManager,
-    processTreeTracker: createProcessTreeTracker(),
     invariantRegistry: new InvariantRegistry()
   })
   supervisor.bindSubagentWorkResultSink((result, persisted) => {

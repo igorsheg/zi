@@ -351,9 +351,8 @@ function listLine(agent: SubagentToolAgentDetails, readyNames: ReadonlySet<strin
 
 function lifecycleLabel(lifecycle: SubagentToolAgentDetails["lifecycle"]): string {
   switch (lifecycle) {
-    case "starting":
-    case "spawn_admitting":
-      return "starting"
+    case "queued":
+      return "queued"
     case "running":
       return "working"
     case "interrupting":

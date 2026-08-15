@@ -9,7 +9,7 @@ import {
 
 test("live process containment has no synchronous OS scans or per-scope intervals", async () => {
   const sources = await Promise.all(
-    ["../src/processes/process-tree.ts", "../src/extensions/host.ts", "../src/subagents/child-process.ts"].map(path =>
+    ["../src/processes/process-tree.ts", "../src/extensions/host.ts", "../src/subagents/child.ts"].map(path =>
       Bun.file(new URL(path, import.meta.url)).text()
     )
   )

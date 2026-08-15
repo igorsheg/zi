@@ -26,8 +26,9 @@ const readTool = { ...spawnSubagent, name: "read", label: "read" } satisfies Age
 const editTool = { ...spawnSubagent, name: "edit", label: "edit" } satisfies AgentTool
 const writeTool = { ...spawnSubagent, name: "write", label: "write" } satisfies AgentTool
 const bashTool = { ...spawnSubagent, name: "bash", label: "bash" } satisfies AgentTool
-const sendPeerMessage = { ...spawnSubagent, name: "send_peer_message", label: "send_peer_message" } satisfies AgentTool
 const updatePlan = { ...spawnSubagent, name: "update_plan", label: "update_plan" } satisfies AgentTool
+const listPeers = { ...spawnSubagent, name: "list_peer_subagents", label: "list_peer_subagents" } satisfies AgentTool
+const sendPeer = { ...spawnSubagent, name: "send_peer_message", label: "send_peer_message" } satisfies AgentTool
 const reviewSkill = {
   name: "review",
   description: "Review a change",
@@ -51,7 +52,7 @@ test("compiled prompt snapshots are deterministic and immutable", () => {
       contextFiles: [{ path: "/work/AGENTS.md", content: "Project policy" }],
       skills: [reviewSkill]
     })
-    const tools = [readTool, updatePlan, sendPeerMessage]
+    const tools = [readTool, updatePlan]
 
     const first = compileSystemPrompt("/work", resources, tools, "direct-and-code")
     const second = compileSystemPrompt("/work", resources, tools, "direct-and-code")
@@ -78,7 +79,7 @@ test("compiled sections have an exact order and contiguous valid spans", () => {
       contextFiles: [{ path: "/work/AGENTS.md", content: "Project policy" }],
       skills: [reviewSkill]
     }),
-    [readTool, updatePlan, sendPeerMessage],
+    [readTool, updatePlan],
     "direct-and-code"
   )
 
@@ -86,7 +87,6 @@ test("compiled sections have an exact order and contiguous valid spans", () => {
     "base",
     "code-mode",
     "work-plan",
-    "peer-messaging",
     "product-documentation",
     "appended-instructions",
     "project-instructions",
@@ -116,7 +116,7 @@ test("compiled sections have an exact order and contiguous valid spans", () => {
 
 test("the maximal built-in core stays within its UTF-8 regression budget", () => {
   const resources = createSessionResources()
-  const tools = [readTool, editTool, writeTool, bashTool, updatePlan, sendPeerMessage]
+  const tools = [readTool, editTool, writeTool, bashTool, updatePlan]
   const directAndCodeBytes = compileSystemPrompt("/work", resources, tools, "direct-and-code").utf8Bytes
   const codeOnlyBytes = compileSystemPrompt("/work", resources, tools, "code-only").utf8Bytes
 
@@ -150,7 +150,7 @@ test("a custom prompt owns base and product documentation policy without suppres
       contextFiles: [{ path: "/work/AGENTS.md", content: "Project policy" }],
       skills: [reviewSkill]
     }),
-    [readTool, editTool, writeTool, bashTool, updatePlan, sendPeerMessage],
+    [readTool, editTool, writeTool, bashTool, updatePlan],
     "direct-and-code"
   )
 
@@ -158,7 +158,6 @@ test("a custom prompt owns base and product documentation policy without suppres
     "base",
     "code-mode",
     "work-plan",
-    "peer-messaging",
     "appended-instructions",
     "project-instructions",
     "skills",
@@ -168,7 +167,6 @@ test("a custom prompt owns base and product documentation policy without suppres
   expect(sectionText(snapshot, "base")).toBe("Custom prompt")
   expect(sectionText(snapshot, "code-mode")).toContain("# Programmatic runtime")
   expect(sectionText(snapshot, "work-plan")).toContain("at least three distinct steps")
-  expect(sectionText(snapshot, "peer-messaging")).toContain("# Peer subagents")
   expect(sectionText(snapshot, "appended-instructions")).toBe("Appended policy")
   expect(sectionText(snapshot, "project-instructions")).toContain("Project policy")
   expect(sectionText(snapshot, "skills")).toContain("<name>review</name>")
@@ -197,14 +195,14 @@ test("sections and skill instructions follow derived capabilities", () => {
     shell: false,
     codeMode: false,
     workPlan: false,
-    peerMessaging: false,
+    peerSubagents: false,
     skillReadSurface: undefined
   })
   expect(bare.sections.map(section => section.kind)).toEqual(["base", "product-documentation", "environment"])
   expect(sectionText(bare, "base")).not.toContain("file tools")
   expect(sectionText(bare, "base")).not.toContain("shell execution")
 
-  const direct = compileSystemPrompt("/work", resources, [readTool, updatePlan, sendPeerMessage])
+  const direct = compileSystemPrompt("/work", resources, [readTool, updatePlan])
   expect(direct.capabilities).toEqual({
     toolSurface: undefined,
     readFiles: true,
@@ -213,13 +211,12 @@ test("sections and skill instructions follow derived capabilities", () => {
     shell: false,
     codeMode: false,
     workPlan: true,
-    peerMessaging: true,
+    peerSubagents: false,
     skillReadSurface: "direct"
   })
   expect(direct.sections.map(section => section.kind)).toEqual([
     "base",
     "work-plan",
-    "peer-messaging",
     "product-documentation",
     "skills",
     "environment"
@@ -254,14 +251,6 @@ test("work plan tools add concise checklist doctrine", () => {
   expect(prompt).toContain("at most one step in_progress")
   expect(prompt).toContain("only after its result is verified")
   expect(prompt).toContain("Replace the complete plan")
-})
-
-test("peer messaging tools add child-team doctrine", () => {
-  const prompt = buildSystemPrompt("/work", createSessionResources({ systemPrompt: "Child prompt" }), [sendPeerMessage])
-
-  expect(prompt).toContain("# Peer subagents")
-  expect(prompt).toContain("do not start an idle sibling turn")
-  expect(prompt).toContain("final response is still delivered to your parent")
 })
 
 test("project instructions preserve broad-to-specific precedence", () => {
@@ -315,10 +304,21 @@ test("project instruction envelopes neutralize every injected tag form", () => {
   for (const tag of injected) expect(project).toContain(tag.replace("<", "&lt;"))
 })
 
+test("peer doctrine is admitted only with both direct relay tools", () => {
+  const child = compileSystemPrompt("/work", createSessionResources(), [listPeers, sendPeer])
+  expect(child.capabilities.peerSubagents).toBe(true)
+  expect(sectionText(child, "peer-subagents")).toContain("Peer messages are context-only")
+  expect(sectionText(child, "peer-subagents")).toContain("final response is still delivered to your parent")
+
+  for (const tools of [[], [listPeers], [sendPeer], [spawnSubagent]]) {
+    const parent = compileSystemPrompt("/work", createSessionResources(), tools)
+    expect(parent.capabilities.peerSubagents).toBe(false)
+    expect(parent.sections.map(section => section.kind)).not.toContain("peer-subagents")
+  }
+})
+
 test("tool names do not activate native subagent prompt policy", () => {
   const snapshot = compileSystemPrompt("/work", createSessionResources(), [spawnSubagent])
 
-  expect(snapshot.capabilities.peerMessaging).toBe(false)
-  expect(snapshot.sections.map(section => section.kind)).not.toContain("peer-messaging")
   expect(snapshot.text).not.toContain("wait_subagents")
 })

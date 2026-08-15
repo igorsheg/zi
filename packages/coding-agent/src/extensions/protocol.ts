@@ -984,9 +984,8 @@ function extensionSubagentSnapshot(value: unknown): ExtensionSubagentSnapshot {
   const snapshot = protocolRecord(value)
   const lifecycle = snapshot.lifecycle
   if (
-    lifecycle !== "starting" &&
     lifecycle !== "idle" &&
-    lifecycle !== "spawn_admitting" &&
+    lifecycle !== "queued" &&
     lifecycle !== "running" &&
     lifecycle !== "interrupting" &&
     lifecycle !== "closing" &&

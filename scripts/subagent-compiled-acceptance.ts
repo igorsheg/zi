@@ -27,8 +27,9 @@ type Mode = "close" | "crash" | "dispose"
 type Declaration = "markdown" | "programmatic"
 
 interface ProcessMarker {
-  readonly childPid: number
+  readonly agentPid: number
   readonly workerPid: number
+  readonly apiKeyVisible: false
 }
 
 interface Marker extends ProcessMarker {
@@ -107,7 +108,6 @@ async function runMode(
           AZURE_OPENAI_API_KEY: "subagent-acceptance",
           AZURE_OPENAI_BASE_URL: provider.baseUrl,
           ZI_AGENT_DIR: agentDirectory,
-          ZI_SUBAGENT_DEPTH: "0",
           ZI_SUBAGENT_ACCEPTANCE_MARKER: markerPath,
           ZI_SUBAGENT_PROFILE_DECLARATION: declaration
         },
@@ -138,8 +138,11 @@ async function runMode(
     }
     await assertNativeJournal(agentDirectory, provider.name, mode)
     marker = { ...(await readProcessMarker(markerPath)), descendantPid: await readPidMarker(descendantMarkerPath) }
+    if (marker.agentPid !== parent.pid) {
+      throw new Error(`Compiled ${mode} extension marker named agent PID ${marker.agentPid} instead of ${parent.pid}`)
+    }
     await waitFor(
-      () => !processAlive(marker!.childPid) && !processAlive(marker!.workerPid) && !processAlive(marker!.descendantPid),
+      () => !processAlive(marker!.agentPid) && !processAlive(marker!.workerPid) && !processAlive(marker!.descendantPid),
       10_000
     )
   } finally {
@@ -148,7 +151,7 @@ async function runMode(
     if (parent && processAlive(parent.pid)) terminateProcess(parent.pid)
     await provider.dispose()
     if (marker) {
-      terminateProcess(marker.childPid)
+      terminateProcess(marker.agentPid)
       terminateProcess(marker.workerPid)
       terminateProcess(marker.descendantPid)
     }
@@ -190,7 +193,7 @@ class SubagentProvider {
   }
 
   diagnostic(): string {
-    return `parent=${this.#parentPhase}; child=${this.#childPhase}; child requests=${this.#childProviderRequests}; result probes=${this.#resultProbeCount}`
+    return `parent=${this.#parentPhase}; child=${this.#childPhase}; child requests=${this.#childProviderRequests}; result probes=${this.#resultProbeCount}; failure=${this.#failed ?? "none"}`
   }
 
   beginRestorationProbe(expectedOccurrences: number): void {
@@ -214,11 +217,18 @@ class SubagentProvider {
       if (request.method !== "POST" || new URL(request.url).pathname !== "/v1/responses") {
         throw new Error(`Unexpected provider request: ${request.method} ${request.url}`)
       }
+      const requestApiKey =
+        request.headers.get("api-key") ?? request.headers.get("authorization")?.replace(/^Bearer /, "")
       const payloadText = await readBoundedRequest(request)
       if (payloadText.includes(acceptanceApiKey)) throw new Error("Provider payload exposed the ephemeral API key")
       const payload = record(JSON.parse(payloadText), "provider payload")
       const tools = Array.isArray(payload.tools) ? payload.tools : []
       const isParent = tools.some(tool => record(tool, "tool").name === "spawn_subagent")
+      const expectedApiKey = isParent ? acceptanceApiKey : "subagent-acceptance"
+      if (requestApiKey !== expectedApiKey) {
+        throw new Error(`Provider ${isParent ? "parent" : "child"} request used the wrong API key`)
+      }
+      assertProviderSelection(payload, isParent)
       const outputs = functionOutputs(payload.input)
       if (!isParent) return this.#receiveChild(payloadText, tools, outputs)
       return await this.#receiveParent(payloadText, outputs)
@@ -241,6 +251,15 @@ class SubagentProvider {
       }
     }
 
+    if (this.#mode === "crash" && outputs.has("acceptance_crash")) {
+      if (tools.some(tool => record(tool, "child tool").name === "acceptance_crash")) {
+        throw new Error("Compiled child retained tools from its crashed extension worker")
+      }
+      const marker = await readProcessMarker(this.#markerPath)
+      await waitFor(() => !processAlive(marker.workerPid), 5_000, "Crashed child extension worker did not exit")
+      this.#childInitialReplySent = true
+      return eventStreamResponse(textEvents("Compiled child survived its extension worker crash.", "child-crash"))
+    }
     if (payloadText.includes("Reuse after active interruption.")) {
       if (
         !payloadText.includes("Queue this without waking.") ||
@@ -287,6 +306,9 @@ class SubagentProvider {
     }
     if (!processAlive(descendantPid)) throw new Error("Compiled subagent descendant exited before cleanup")
     this.#descendantStarted = true
+    if (this.#mode === "crash") {
+      return eventStreamResponse(toolEvents("acceptance_crash", "acceptance_crash", {}))
+    }
     this.#childInitialReplySent = true
     return eventStreamResponse(textEvents("Compiled child completed.", "child"))
   }
@@ -455,13 +477,27 @@ class SubagentProvider {
     if (!outputs.has("acceptance_wait")) {
       return eventStreamResponse(toolEvents("wait_subagents", "acceptance_wait", { names: [name], timeout_ms: 25_000 }))
     }
-    assertWaitCompletion(outputs.get("acceptance_wait")!, { status: "completed" })
+    assertWaitCompletion(outputs.get("acceptance_wait")!, {
+      status: "completed",
+      text: "Compiled child survived its extension worker crash."
+    })
     if (!outputs.has("acceptance_list")) {
-      const marker = await readProcessMarker(this.#markerPath)
-      process.kill(marker.childPid, "SIGKILL")
-      await waitFor(() => !processAlive(marker.childPid), 5_000, "Forced subagent child did not exit")
       return eventStreamResponse(toolEvents("list_subagents", "acceptance_list", {}))
     }
+    assertListedLifecycle(outputs.get("acceptance_list")!, name, "idle")
+    if (!outputs.has("acceptance_close_crashed_worker")) {
+      return eventStreamResponse(toolEvents("close_subagent", "acceptance_close_crashed_worker", { name }))
+    }
+    const close = record(JSON.parse(outputs.get("acceptance_close_crashed_worker")!), "crash close result")
+    if (close.previous_status !== "idle") {
+      throw new Error(
+        `Compiled crash close result omitted its previous state: ${outputs.get("acceptance_close_crashed_worker")}`
+      )
+    }
+    assertWaitCompletion(outputs.get("acceptance_close_crashed_worker")!, {
+      status: "completed",
+      text: "Compiled child survived its extension worker crash."
+    })
     this.#complete = true
     return eventStreamResponse(textEvents(acceptanceText, "crash"))
   }
@@ -470,25 +506,27 @@ class SubagentProvider {
 function acceptanceExtension(): string {
   return `import { Schema, type ExtensionFactory } from "@with-zi/extension-api"
 
+const marker = process.env.ZI_SUBAGENT_ACCEPTANCE_MARKER
+if (!marker) throw new Error("missing subagent acceptance marker")
+
 const extension: ExtensionFactory = zi => {
-  if (process.env.ZI_SUBAGENT_DEPTH !== "1") {
+  if (zi.subagents) {
     if (process.env.ZI_SUBAGENT_PROFILE_DECLARATION === "programmatic") {
       zi.registerSubagentProfile({
         name: "acceptance",
         description: "Exercise the compiled profile-driven subagent system",
         instructions: "Complete the acceptance task and return bounded evidence.",
-        model: "azure-openai-responses/gpt-4.1",
-        thinking: "off"
+        model: "azure-openai-responses/gpt-5.4",
+        thinking: "high"
       })
     }
     return
   }
-  const marker = process.env.ZI_SUBAGENT_ACCEPTANCE_MARKER
-  if (!marker) throw new Error("missing subagent acceptance marker")
-  if (process.env.ZI_INTERNAL_SUBAGENT_API_KEY !== undefined) {
-    throw new Error("private subagent API key reached the extension worker")
-  }
-  Bun.write(marker, JSON.stringify({ childPid: process.ppid, workerPid: process.pid }))
+  zi.on("session_start", async (_event, context) => {
+    if (context.mode !== "rpc") return
+    const apiKeyVisible = Object.values(process.env).includes(${JSON.stringify(acceptanceApiKey)})
+    await Bun.write(marker, JSON.stringify({ agentPid: process.ppid, workerPid: process.pid, apiKeyVisible }))
+  })
   zi.registerTool({
     name: "acceptance_hang",
     description: "Wait until the acceptance run interrupts this tool.",
@@ -503,6 +541,12 @@ const extension: ExtensionFactory = zi => {
       return { settled: false }
     }
   })
+  zi.registerTool({
+    name: "acceptance_crash",
+    description: "Crash this child session's extension worker.",
+    parameters: Schema.object({}),
+    execute: () => process.exit(17)
+  })
 }
 
 export default extension
@@ -512,8 +556,8 @@ export default extension
 function acceptanceMarkdownProfile(): string {
   return `---
 description: Exercise the compiled profile-driven subagent system
-model: azure-openai-responses/gpt-4.1
-thinking: off
+model: azure-openai-responses/gpt-5.4
+thinking: high
 ---
 Complete the acceptance task and return bounded evidence.
 `
@@ -545,6 +589,21 @@ function assertProfileCatalog(output: string): void {
   }
 }
 
+function assertProviderSelection(payload: Record<string, unknown>, isParent: boolean): void {
+  const expectedModel = isParent ? "gpt-4.1" : "gpt-5.4"
+  if (payload.model !== expectedModel) {
+    throw new Error(
+      `Compiled ${isParent ? "parent" : "child"} selected ${String(payload.model)} instead of ${expectedModel}`
+    )
+  }
+  if (isParent) {
+    if (payload.reasoning !== undefined) throw new Error("Compiled parent did not retain thinking off")
+    return
+  }
+  const reasoning = record(payload.reasoning, "child reasoning")
+  if (reasoning.effort !== "high") throw new Error("Compiled child did not select profile thinking high")
+}
+
 function assertWaitCompletion(output: string, expected: { readonly status: string; readonly text?: string }): void {
   const result = record(JSON.parse(output), "wait result")
   const agent = Array.isArray(result.subagents) ? result.subagents.find(isRecord) : undefined
@@ -559,6 +618,14 @@ function assertWaitCompletion(output: string, expected: { readonly status: strin
     (expected.text !== undefined && completion.text !== expected.text)
   ) {
     throw new Error(`Compiled subagent wait did not return ${expected.status}: ${JSON.stringify(output)}`)
+  }
+}
+
+function assertListedLifecycle(output: string, name: string, lifecycle: string): void {
+  const result = record(JSON.parse(output), "list result")
+  const agents = Array.isArray(result.subagents) ? result.subagents : []
+  if (!agents.some(agent => isRecord(agent) && agent.name === name && agent.status === lifecycle)) {
+    throw new Error(`Compiled subagent list omitted ${name} in ${lifecycle}: ${JSON.stringify(output)}`)
   }
 }
 
@@ -654,7 +721,7 @@ async function runRestorationProbe(
   expectedOccurrences: number
 ): Promise<void> {
   provider.beginRestorationProbe(expectedOccurrences)
-  const child = Bun.spawn(
+  const probe = Bun.spawn(
     [
       executable,
       "--mode",
@@ -681,7 +748,6 @@ async function runRestorationProbe(
         AZURE_OPENAI_API_KEY: "subagent-acceptance",
         AZURE_OPENAI_BASE_URL: provider.baseUrl,
         ZI_AGENT_DIR: agentDirectory,
-        ZI_SUBAGENT_DEPTH: "0",
         ZI_SUBAGENT_ACCEPTANCE_MARKER: markerPath,
         ZI_SUBAGENT_PROFILE_DECLARATION: declaration
       },
@@ -690,7 +756,7 @@ async function runRestorationProbe(
       stderr: "pipe"
     }
   )
-  const [exitCode, stdout, stderr] = await settleProcess(child, "close", () => provider.diagnostic())
+  const [exitCode, stdout, stderr] = await settleProcess(probe, "close", () => provider.diagnostic())
   if (stdout.includes(acceptanceApiKey) || stderr.includes(acceptanceApiKey)) {
     throw new Error("Compiled restoration exposed the ephemeral API key")
   }
@@ -770,7 +836,10 @@ async function assertNativeJournal(agentDirectory: string, name: string, mode: M
   assertSubagentResult(results, name, 1, "succeeded", mode)
   assertJournalEntryCount(entries, { event: "work_cycle_delivered", workCycle: 1 }, 1, mode)
   assertJournalEntry(entries, { event: "exited" }, mode)
-  if (mode === "crash") return
+  if (mode === "crash") {
+    assertJournalEntry(entries, { event: "closing", reason: "close" }, mode)
+    return
+  }
 
   assertJournalEntry(entries, { event: "work_cycle_started", workCycle: 2 }, mode)
   assertSubagentResult(results, name, 2, "succeeded", mode)
@@ -828,8 +897,14 @@ async function readProcessMarker(path: string): Promise<ProcessMarker> {
     () => {
       try {
         const value = record(JSON.parse(readFileSync(path, "utf8")), "marker")
-        if (typeof value.childPid !== "number" || typeof value.workerPid !== "number") return false
-        marker = { childPid: value.childPid, workerPid: value.workerPid }
+        if (
+          typeof value.agentPid !== "number" ||
+          typeof value.workerPid !== "number" ||
+          value.apiKeyVisible !== false
+        ) {
+          return false
+        }
+        marker = { agentPid: value.agentPid, workerPid: value.workerPid, apiKeyVisible: false }
         return true
       } catch {
         return false

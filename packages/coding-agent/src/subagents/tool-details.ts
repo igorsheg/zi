@@ -1,6 +1,5 @@
 import { isNonNegativeFinite, isNonNegativeInteger, isRecord } from "../guards.js"
-import type { ChildLifecycleState, SubagentCompletion, SubagentCompletionStatus } from "./child-process.js"
-import { clipUtf8 } from "./child-process.js"
+import type { SubagentCompletion, SubagentCompletionStatus } from "./child.js"
 import {
   maxLiveChildren,
   maxRetainedSubagents,
@@ -8,6 +7,7 @@ import {
   type CompletionDelivery,
   type SubagentSnapshot
 } from "./supervisor.js"
+import { clipUtf8 } from "./text.js"
 
 const maxSubagentNameBytes = 64
 const maxProfileDescriptionBytes = 4 * 1024
@@ -23,7 +23,7 @@ export interface SubagentToolProfileDetails {
 
 export interface SubagentToolAgentDetails {
   readonly name: string
-  readonly lifecycle: ChildLifecycleState["type"]
+  readonly lifecycle: SubagentSnapshot["lifecycle"]
   readonly workCycle?: number
   readonly capturedWorkCycle?: number
   readonly task?: string
@@ -69,7 +69,7 @@ export type SubagentToolDetails =
       readonly outcome: "success"
       readonly operation: "close"
       readonly agent: SubagentToolAgentDetails
-      readonly previousStatus: ChildLifecycleState["type"]
+      readonly previousStatus: SubagentSnapshot["lifecycle"]
       readonly previousCompletionStatus?: SubagentCompletion["status"]
     }
   | {
@@ -179,7 +179,7 @@ type MutableCompletionDetails = {
 
 interface MutableAgentDetails {
   name: string
-  lifecycle: ChildLifecycleState["type"]
+  lifecycle: SubagentSnapshot["lifecycle"]
   workCycle?: number
   capturedWorkCycle?: number
   task?: string
@@ -346,11 +346,10 @@ function isBoundedText(value: unknown, maxBytes: number, allowEmpty = false): va
   )
 }
 
-function isLifecycle(value: unknown): value is ChildLifecycleState["type"] {
+function isLifecycle(value: unknown): value is SubagentSnapshot["lifecycle"] {
   return (
-    value === "starting" ||
     value === "idle" ||
-    value === "spawn_admitting" ||
+    value === "queued" ||
     value === "running" ||
     value === "interrupting" ||
     value === "closing" ||

@@ -1,5 +1,5 @@
 import type { SubagentEntry, SubagentWorkResultEntry } from "../session-manager.js"
-import type { SubagentCompletion } from "./child-process.js"
+import type { SubagentCompletion } from "./child.js"
 
 export const maxCompletionLedgerEntries = 32
 

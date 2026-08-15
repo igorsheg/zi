@@ -1,6 +1,6 @@
 import { isNonNegativeInteger, isPositiveInteger, isRecord } from "../guards.js"
 import { maxSubagentProfileNameBytes } from "../subagent-profiles.js"
-import type { SubagentWorkCycleErrorCode } from "./child-process.js"
+import type { SubagentWorkCycleErrorCode } from "./child.js"
 
 export const maxSubagentWorkResultEntryBytes = 8 * 1024
 
@@ -97,7 +97,7 @@ function isSubagentWorkCycleErrorCode(value: unknown): value is SubagentWorkCycl
     value === "provider_error" ||
     value === "missing_final_answer" ||
     value === "incomplete_final_answer" ||
-    value === "child_killed" ||
+    value === "child_forced_settlement" ||
     value === "child_failed" ||
     value === "child_exited"
   )

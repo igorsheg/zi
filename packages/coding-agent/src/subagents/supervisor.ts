@@ -1,9 +1,6 @@
-import { isAbsolute } from "node:path"
-
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core"
 import { InvariantError, type InvariantRegistry } from "@with-zi/invariants"
 
-import type { ProcessTreeTracker } from "../processes/process-tree.js"
 import type {
   SessionEntry,
   SessionManager,
@@ -13,18 +10,19 @@ import type {
 } from "../session-manager.js"
 import type { ToolSurface } from "../tool-surface.js"
 import {
-  ChildZiProcess,
-  clipUtf8,
-  type ChildSessionEventsSnapshot,
+  childCloseSettlementMs,
+  SubagentChild,
+  type ChildLifecycleState,
   type ChildSnapshot,
   type ChildTranscriptSnapshot,
+  type CreateSubagentChildSession,
   type SubagentCompletion
-} from "./child-process.js"
+} from "./child.js"
 import { CompletionLedger, maxCompletionLedgerEntries, type CompletionDelivery } from "./completion-ledger.js"
 import { SubagentInvariant } from "./invariant.js"
-import { internalSubagentApiKeyEnvironment } from "./invocation.js"
-import type { PeerAgent, PeerRequest, PeerResult } from "./peer-protocol.js"
+import { maxPeerAgents, maxPeerMessageBytes, type PeerAgent, type PeerRelay } from "./peer.js"
 import { maxSubagentWorkResultEntryBytes, type SubagentWorkResultInput } from "./result.js"
+import { clipUtf8 } from "./text.js"
 import { defaultWaitTimeoutMs, isSubagentWaitTimeout, maxWaitTimeoutMs } from "./wait-policy.js"
 import { defaultSubagentWorkTimeoutMs, isSubagentWorkTimeout } from "./work-policy.js"
 
@@ -33,6 +31,7 @@ export { defaultWaitTimeoutMs, maxWaitTimeoutMs } from "./wait-policy.js"
 export { defaultSubagentWorkTimeoutMs, maxSubagentWorkTimeoutMs } from "./work-policy.js"
 
 export const maxLiveChildren = 4
+export const maxRunningChildren = 2
 export const maxRetainedSubagents = 32
 export const maxSubagentReadyResults = maxCompletionLedgerEntries
 export const maxMailboxCompletions = maxSubagentReadyResults
@@ -59,7 +58,6 @@ export interface SubagentSnapshot {
   readonly completionDelivery?: CompletionDelivery["type"]
 }
 
-export type SubagentSessionEvents = ChildSessionEventsSnapshot
 export type SubagentTranscriptSnapshot = ChildTranscriptSnapshot
 
 export interface SubagentStatus {
@@ -78,7 +76,7 @@ export interface SubagentInterruptSettlement {
 }
 
 interface LiveRecord {
-  readonly child: ChildZiProcess
+  readonly child: SubagentChild
   readonly serial: PromiseQueue
   readonly createdAt: number
   lastWorkCycle: number
@@ -88,17 +86,22 @@ interface LiveRecord {
 
 interface ExitedRecord {
   readonly snapshot: ChildSnapshot
-  readonly sessionEvents?: SubagentSessionEvents
   readonly transcript?: SubagentTranscriptSnapshot
   readonly exitedAt: number
   readonly task?: string
+}
+
+interface UnpublishedCreation {
+  readonly name: string
+  readonly controller: AbortController
+  readonly settlement: ReturnType<typeof deferredVoid>
+  readonly externalCancellation?: { readonly signal: AbortSignal; readonly abort: () => void }
 }
 
 interface WaitTarget {
   readonly name: string
   readonly workCycle: number
   readonly admittedSnapshot: ChildSnapshot
-  readonly admittedDelivery: CompletionDelivery["type"] | undefined
 }
 
 export interface SubagentSpawnSelection {
@@ -109,15 +112,13 @@ export interface SubagentSpawnSelection {
 }
 
 export interface SubagentSupervisorOptions {
-  readonly command: readonly string[]
-  readonly cwd: string
-  readonly env: Readonly<Record<string, string | undefined>>
+  readonly createChildSession: CreateSubagentChildSession
   readonly selection: () => { readonly model: string; readonly thinkingLevel: ThinkingLevel; readonly apiKey?: string }
   readonly sessionManager: SessionManager
-  readonly processTreeTracker: ProcessTreeTracker
   readonly invariantRegistry: InvariantRegistry
   readonly waitTimeoutMs?: number
   readonly workTimeoutMs?: number
+  readonly closeSettlementMs?: number
   readonly toolSurface?: ToolSurface
 }
 
@@ -126,17 +127,16 @@ export type SubagentSupervisorEvent =
   | { readonly type: "entry_appended"; readonly entry: SessionEntry }
 
 export class SubagentSupervisor {
-  readonly #command: readonly string[]
-  readonly #cwd: string
-  readonly #env: Readonly<Record<string, string | undefined>>
+  readonly #createChildSession: CreateSubagentChildSession
   readonly #selection: () => { readonly model: string; readonly thinkingLevel: ThinkingLevel; readonly apiKey?: string }
   readonly #sessionManager: SessionManager
-  readonly #processTreeTracker: ProcessTreeTracker
   readonly #toolSurface: ToolSurface
+  readonly #creations = new Map<string, UnpublishedCreation>()
   readonly #listeners = new Set<(event: SubagentSupervisorEvent) => void>()
   readonly #names = new Set<string>()
   readonly #profiles = new Map<string, string>()
   readonly #live = new Map<string, LiveRecord>()
+  readonly #queuedNames: string[] = []
   readonly #exited: ExitedRecord[] = []
   readonly #ledger: CompletionLedger
   readonly #invariant: SubagentInvariant
@@ -149,14 +149,12 @@ export class SubagentSupervisor {
     | undefined
   readonly waitTimeoutMs: number
   readonly workTimeoutMs: number
+  readonly closeSettlementMs: number
   #state: SupervisorState = { type: "open" }
   #shutdown: Promise<void> | undefined
 
   constructor(options: SubagentSupervisorOptions) {
-    this.#command = validateCommand(options.command)
-    if (!isAbsolute(options.cwd)) throw new Error("Subagent cwd must be absolute")
-    this.#cwd = options.cwd
-    this.#env = validateEnvironment(options.env)
+    this.#createChildSession = options.createChildSession
     this.#selection = options.selection
     this.#sessionManager = options.sessionManager
     const results = this.#sessionManager.subagentWorkResults()
@@ -164,12 +162,19 @@ export class SubagentSupervisor {
     for (const result of results) {
       if (result.profile) this.#profiles.set(result.name, result.profile)
     }
-    this.#processTreeTracker = options.processTreeTracker
     this.#toolSurface = options.toolSurface ?? "direct-and-code"
     this.waitTimeoutMs = options.waitTimeoutMs ?? defaultWaitTimeoutMs
     if (!isSubagentWaitTimeout(this.waitTimeoutMs)) throw new Error("Invalid subagent wait timeout")
     this.workTimeoutMs = options.workTimeoutMs ?? defaultSubagentWorkTimeoutMs
     if (!isSubagentWorkTimeout(this.workTimeoutMs)) throw new Error("Invalid subagent work timeout")
+    this.closeSettlementMs = options.closeSettlementMs ?? childCloseSettlementMs
+    if (
+      !Number.isSafeInteger(this.closeSettlementMs) ||
+      this.closeSettlementMs <= 0 ||
+      this.closeSettlementMs >= subagentShutdownMs
+    ) {
+      throw new Error("Invalid child close settlement bound")
+    }
     this.#recover()
     this.#invariant = new SubagentInvariant(options.invariantRegistry)
     this.#assertInvariants()
@@ -202,13 +207,6 @@ export class SubagentSupervisor {
     ])
   }
 
-  sessionEvents(name: string): SubagentSessionEvents | undefined {
-    validateSubagentName(name)
-    const live = this.#live.get(name)
-    if (live) return live.child.sessionEvents()
-    return this.#exited.find(record => record.snapshot.name === name)?.sessionEvents
-  }
-
   transcript(name: string): SubagentTranscriptSnapshot | undefined {
     validateSubagentName(name)
     const live = this.#live.get(name)
@@ -217,13 +215,13 @@ export class SubagentSupervisor {
   }
 
   capacity(): SubagentCapacity {
-    return Object.freeze({ live: this.#live.size, maximum: maxLiveChildren })
+    return Object.freeze({ live: this.#live.size + this.#creations.size, maximum: maxLiveChildren })
   }
 
   runningCount(): number {
     let count = 0
     for (const record of this.#live.values()) {
-      if (record.child.state.type !== "idle" && record.child.state.type !== "exited") count++
+      if (record.child.state.type === "running" || record.child.state.type === "interrupting") count++
     }
     return count
   }
@@ -267,7 +265,7 @@ export class SubagentSupervisor {
     this.#assertOpen()
     validateSubagentName(name)
     validateText(prompt, "Subagent prompt", maxSubagentPromptBytes)
-    if (this.#live.size >= maxLiveChildren) {
+    if (this.#live.size + this.#creations.size >= maxLiveChildren) {
       throw new Error(
         `Subagent capacity exceeded: at most ${maxLiveChildren} live children. Close a child you no longer need before spawning another.`
       )
@@ -287,119 +285,106 @@ export class SubagentSupervisor {
     validateText(selection.model, "Subagent model", 4_096)
     if (selection.apiKey) validateText(selection.apiKey, "Subagent API key", 64 * 1024)
     this.#reserveCompletion(name, 1)
+    const creation = this.#beginCreation(name, signal)
+    this.#names.add(name)
     try {
       this.#append({ event: "starting", name })
     } catch (cause) {
       this.#ledger.cancelReservation(name, 1)
+      this.#names.delete(name)
+      this.#finishCreation(creation)
       throw cause
     }
-    this.#names.add(name)
     this.#invariant.introduce(name)
     if (requestedSelection.profile) this.#profiles.set(name, requestedSelection.profile)
 
-    const command = [
-      ...this.#command,
-      "--mode",
-      "rpc",
-      "--no-session",
-      "--cwd",
-      this.#cwd,
-      "--model",
-      selection.model,
-      "--thinking",
-      selection.thinkingLevel,
-      ...(this.#toolSurface === "code-only" ? ["--code-only"] : [])
-    ]
-    const environment = selection.apiKey
-      ? Object.freeze({ ...this.#env, [internalSubagentApiKeyEnvironment]: selection.apiKey })
-      : this.#env
-    let child: ChildZiProcess
+    let owner: Awaited<ReturnType<CreateSubagentChildSession>>
     try {
-      child = new ChildZiProcess({
+      owner = await this.#createChildSession({
         name,
-        command,
-        cwd: this.#cwd,
-        env: environment,
-        processTreeTracker: this.#processTreeTracker,
-        workTimeoutMs: this.workTimeoutMs,
-        onStateChange: () => this.#childChanged(name),
-        onCompletion: completion => this.#completion(completion),
-        onSessionEvent: () => this.#presentationChanged(name),
-        onPeerRequest: request => this.#routePeerRequest(name, request)
+        model: selection.model,
+        thinkingLevel: selection.thinkingLevel,
+        ...(selection.apiKey ? { apiKey: selection.apiKey } : {}),
+        toolSurface: this.#toolSurface,
+        peerRelay: this.#peerRelay(name),
+        signal: creation.controller.signal
       })
     } catch (cause) {
-      this.#ledger.cancelReservation(name, 1)
-      const message = cause instanceof Error ? cause.message : String(cause)
-      const snapshot = Object.freeze({ name, lifecycle: "exited" as const })
-      this.#retainExited({ snapshot, exitedAt: Date.now(), task })
-      this.#invariant.exit(name)
       try {
-        this.#append({ event: "exited", name, outcome: clipUtf8(message, durablePreviewBytes).text })
+        this.#retainCreationFailure(name, task, cause)
       } finally {
-        this.#changed(name)
+        this.#finishCreation(creation)
       }
       throw cause
+    }
+    if (this.#state.type !== "open" || creation.controller.signal.aborted) {
+      let cause: Error = spawnCancellation(name)
+      try {
+        await owner.dispose("quit")
+      } catch (cleanupCause) {
+        const cleanupMessage = cleanupCause instanceof Error ? cleanupCause.message : String(cleanupCause)
+        cause = new Error(`${cause.message}; cleanup failed: ${cleanupMessage}`, { cause: cleanupCause })
+      }
+      try {
+        this.#retainCreationFailure(name, task, cause)
+      } finally {
+        this.#finishCreation(creation)
+      }
+      throw cause
+    }
+
+    let child: SubagentChild
+    try {
+      child = new SubagentChild({
+        name,
+        owner,
+        workTimeoutMs: this.workTimeoutMs,
+        closeSettlementMs: this.closeSettlementMs,
+        onStateChange: () => this.#childChanged(name),
+        onCompletion: completion => this.#completion(completion),
+        onPresentationChange: () => this.#presentationChanged(name)
+      })
+    } catch (cause) {
+      let failure = cause
+      try {
+        await owner.dispose("quit")
+      } catch (cleanupCause) {
+        const message = cause instanceof Error ? cause.message : String(cause)
+        const cleanupMessage = cleanupCause instanceof Error ? cleanupCause.message : String(cleanupCause)
+        failure = new Error(`${message}; cleanup failed: ${cleanupMessage}`, { cause: cleanupCause })
+      }
+      try {
+        this.#retainCreationFailure(name, task, failure)
+      } finally {
+        this.#finishCreation(creation)
+      }
+      throw failure
     }
     const record: LiveRecord = { child, serial: new PromiseQueue(), createdAt: Date.now(), lastWorkCycle: 0, task }
     this.#live.set(name, record)
-    this.#changed(name)
-
     const abort = (): void => {
       void this.close(name, "startup_cancelled").catch(() => {})
     }
-    if (signal?.aborted) {
-      abort()
-      throw new Error(`Subagent ${name} spawn was cancelled`)
-    }
     signal?.addEventListener("abort", abort, { once: true })
+    this.#finishCreation(creation)
+    this.#changed(name)
     try {
-      await child.start()
       this.#assertSpawnAdmission(name, record, signal)
-      const sessionId = child.snapshot().sessionId
-      this.#append({ event: "ready", name, ...(sessionId ? { sessionId } : {}) })
+      this.#append({ event: "ready", name, sessionId: owner.session.sessionId })
       this.#appendWorkCycleStarted(record, name, 1)
-      await child.spawnAdmit(prompt)
+      child.queueCycle(prompt)
+      this.#queuedNames.push(name)
+      this.#pumpQueued()
       this.#assertSpawnAdmission(name, record, signal)
-      signal?.removeEventListener("abort", abort)
       this.#assertInvariants()
       return name
     } catch (cause) {
-      signal?.removeEventListener("abort", abort)
-      if (
-        this.#state.type === "open" &&
-        !signal?.aborted &&
-        this.#live.get(name) === record &&
-        record.child.state.type !== "closing" &&
-        record.child.state.type !== "exited"
-      ) {
-        await this.close(name, "startup_failed").catch(() => {})
-      }
+      if (this.#live.get(name) === record) await this.close(name, "startup_failed").catch(() => {})
       if (record.lastWorkCycle === 0) this.#ledger.cancelReservation(name, 1)
       throw cause
+    } finally {
+      signal?.removeEventListener("abort", abort)
     }
-  }
-
-  // Behavioral provenance: Codex 0bdce9f4 derives the sender from the active session and lets the
-  // shared control owner route queue-only mail. Zi keeps that invariant in the parent supervisor.
-  async #routePeerRequest(sender: string, request: PeerRequest): Promise<PeerResult> {
-    this.#assertOpen()
-    if (!this.#live.has(sender)) throw new Error(`Unknown peer sender: ${sender}`)
-    if (request.operation === "list") {
-      const peers: PeerAgent[] = []
-      for (const [name, record] of this.#live) {
-        if (name === sender) continue
-        const lifecycle = record.child.state.type
-        if (lifecycle === "closing" || lifecycle === "exited") continue
-        peers.push(Object.freeze({ name, lifecycle }))
-      }
-      return Object.freeze({ peers: Object.freeze(peers) })
-    }
-    if (request.target === sender) throw new Error("A subagent cannot send a peer message to itself")
-    const target = this.#requireLive(request.target)
-    const message = `[Peer message from ${sender}]\n${request.text}`
-    await target.serial.run(() => target.child.sendFollowUp(message))
-    this.#pumpMailbox()
-    return Object.freeze({ delivered: true })
   }
 
   async send(name: string, text: string): Promise<void> {
@@ -407,7 +392,7 @@ export class SubagentSupervisor {
     validateSubagentName(name)
     validateText(text, "Subagent message", maxSubagentPromptBytes)
     const record = this.#requireLive(name)
-    await record.serial.run(() => record.child.sendFollowUp(text))
+    await record.serial.run(() => record.child.send(text))
     this.#pumpMailbox()
   }
 
@@ -429,7 +414,11 @@ export class SubagentSupervisor {
           this.#appendWorkCycleStarted(record, name, nextCycle)
           cycleStarted = true
         }
-        await record.child.continueWith(text)
+        const admission = record.child.assign(text)
+        if (admission === "queued") {
+          this.#queuedNames.push(name)
+          this.#pumpQueued()
+        }
       } catch (cause) {
         if (!cycleStarted) {
           record.task = previousTask
@@ -476,11 +465,11 @@ export class SubagentSupervisor {
     return this.#interruptAndWait(name, signal, "claim", claimId)
   }
 
-  async close(name: string, reason = "close", graceMs?: number, forceMs?: number): Promise<SubagentSnapshot> {
+  async close(name: string, reason = "close"): Promise<SubagentSnapshot> {
     validateSubagentName(name)
     const record = this.#live.get(name)
     if (!record) return this.#snapshotFor(name)
-    await this.#closeRecord(name, record, reason, graceMs, forceMs)
+    await this.#closeRecord(name, record, reason)
     this.#assertInvariants()
     return this.#snapshotFor(name)
   }
@@ -520,15 +509,7 @@ export class SubagentSupervisor {
       const received = targets
         .filter(target => this.#waitTargetReady(target.name, target.workCycle))
         .map(target =>
-          this.#settleDelivery(
-            target.name,
-            target.workCycle,
-            target.admittedSnapshot,
-            target.admittedDelivery,
-            "claim",
-            false,
-            claimId
-          )
+          this.#settleDelivery(target.name, target.workCycle, target.admittedSnapshot, "claim", false, claimId)
         )
         .filter(snapshot => snapshot.completion !== undefined)
       if (received.length > 0 || Date.now() >= deadline) return received
@@ -560,15 +541,7 @@ export class SubagentSupervisor {
       throwIfWaitCancelled(signal)
     }
     return targets.map(target =>
-      this.#settleDelivery(
-        target.name,
-        target.workCycle,
-        target.admittedSnapshot,
-        target.admittedDelivery,
-        deliveryMode,
-        false,
-        claimId
-      )
+      this.#settleDelivery(target.name, target.workCycle, target.admittedSnapshot, deliveryMode, false, claimId)
     )
   }
 
@@ -589,12 +562,7 @@ export class SubagentSupervisor {
     return names.map(name => {
       const available = availability === "ready" ? this.#oldestReadyDelivery(name) : this.#oldestDurableDelivery(name)
       const workCycle = available?.completion.workCycle ?? this.#currentWorkCycle(name)
-      return {
-        name,
-        workCycle,
-        admittedSnapshot: this.#childSnapshotFor(name),
-        admittedDelivery: this.#delivery(name, workCycle)?.type
-      }
+      return { name, workCycle, admittedSnapshot: this.#childSnapshotFor(name) }
     })
   }
 
@@ -610,32 +578,15 @@ export class SubagentSupervisor {
     const settlement = record.serial.run(async () => {
       const admittedSnapshot = record.child.snapshot()
       const workCycle = admittedSnapshot.workCycle ?? record.lastWorkCycle
-      const admittedDelivery = this.#delivery(name, workCycle)?.type
       const result = await this.#interruptRecord(name, record)
       throwIfWaitCancelled(signal)
       if (result === "already_idle") {
         return {
           result,
-          snapshot: this.#settleDelivery(
-            name,
-            workCycle,
-            admittedSnapshot,
-            admittedDelivery,
-            deliveryMode,
-            true,
-            claimId
-          )
+          snapshot: this.#settleDelivery(name, workCycle, admittedSnapshot, deliveryMode, true, claimId)
         }
       }
-      const snapshot = await this.#waitForWorkCycle(
-        name,
-        workCycle,
-        admittedSnapshot,
-        admittedDelivery,
-        deliveryMode,
-        signal,
-        claimId
-      )
+      const snapshot = await this.#waitForWorkCycle(name, workCycle, admittedSnapshot, deliveryMode, signal, claimId)
       return { result, snapshot }
     })
     return raceWithWaitCancellation(settlement, signal)
@@ -646,18 +597,20 @@ export class SubagentSupervisor {
     this.#requireKnown(name)
     const admittedSnapshot = this.#childSnapshotFor(name)
     const workCycle = this.#currentWorkCycle(name)
-    const admittedDelivery = this.#delivery(name, workCycle)?.type
     await this.close(name)
-    return this.#settleDelivery(name, workCycle, admittedSnapshot, admittedDelivery, deliveryMode, true, claimId)
+    return this.#settleDelivery(name, workCycle, admittedSnapshot, deliveryMode, true, claimId)
   }
 
   shutdown(): Promise<void> {
     if (this.#shutdown) return this.#shutdown
     if (this.#state.type === "closed") return Promise.resolve()
     this.#state = { type: "stopping" }
-    const closeAll = Promise.all(
-      [...this.#live.keys()].map(name => this.#closeImmediately(name, "session_disposed", 3_500, 3_500).catch(() => {}))
-    )
+    const creations = [...this.#creations.values()]
+    for (const creation of creations) creation.controller.abort(spawnCancellation(creation.name))
+    const closeAll = Promise.all([
+      ...[...this.#live.keys()].map(name => this.#closeImmediately(name, "session_disposed").catch(() => {})),
+      ...creations.map(creation => creation.settlement.promise)
+    ])
     this.#shutdown = settleWithin(
       closeAll.then(() => undefined),
       subagentShutdownMs
@@ -677,28 +630,63 @@ export class SubagentSupervisor {
     return this.#shutdown
   }
 
-  async #closeImmediately(name: string, reason: string, graceMs: number, forceMs: number): Promise<void> {
+  async #closeImmediately(name: string, reason: string): Promise<void> {
     const record = this.#live.get(name)
     if (!record) return
-    await this.#closeRecord(name, record, reason, graceMs, forceMs)
+    if (record.child.state.type === "queued") await record.child.interrupt()
+    await this.#closeRecord(name, record, reason)
   }
 
-  #closeRecord(name: string, record: LiveRecord, reason: string, graceMs?: number, forceMs?: number): Promise<void> {
+  #closeRecord(name: string, record: LiveRecord, reason: string): Promise<void> {
     if (record.closing) return record.closing
     const closing = (async (): Promise<void> => {
       try {
         this.#append({ event: "closing", name, reason })
       } catch {
-        // Process cleanup and the in-memory terminal result must survive journal failure.
+        // Child cleanup and the in-memory terminal result must survive journal failure.
       }
       try {
-        await record.child.close(reason, graceMs, forceMs)
+        await record.child.close(reason)
       } finally {
         this.#retainExit(name, record)
       }
     })()
     record.closing = closing
     return closing
+  }
+
+  #beginCreation(name: string, signal?: AbortSignal): UnpublishedCreation {
+    const controller = new AbortController()
+    const externalAbort = (): void => controller.abort(spawnCancellation(name))
+    const creation: UnpublishedCreation = {
+      name,
+      controller,
+      settlement: deferredVoid(),
+      ...(signal ? { externalCancellation: { signal, abort: externalAbort } } : {})
+    }
+    this.#creations.set(name, creation)
+    if (signal?.aborted) externalAbort()
+    else signal?.addEventListener("abort", externalAbort, { once: true })
+    return creation
+  }
+
+  #finishCreation(creation: UnpublishedCreation): void {
+    if (this.#creations.get(creation.name) === creation) this.#creations.delete(creation.name)
+    const externalCancellation = creation.externalCancellation
+    externalCancellation?.signal.removeEventListener("abort", externalCancellation.abort)
+    creation.settlement.resolve()
+  }
+
+  #retainCreationFailure(name: string, task: string, cause: unknown): void {
+    this.#ledger.cancelReservation(name, 1)
+    const message = cause instanceof Error ? cause.message : String(cause)
+    this.#retainExited({ snapshot: { name, lifecycle: "exited" }, exitedAt: Date.now(), task })
+    this.#invariant.exit(name)
+    try {
+      this.#append({ event: "exited", name, outcome: clipUtf8(message, durablePreviewBytes).text })
+    } finally {
+      this.#changed(name)
+    }
   }
 
   #completion(completion: SubagentCompletion): void {
@@ -773,18 +761,22 @@ export class SubagentSupervisor {
     const snapshot = record?.child.snapshot()
     if (record && snapshot?.workCycle !== undefined) record.lastWorkCycle = snapshot.workCycle
     if (record?.child.state.type === "exited") this.#retainExit(name, record)
+    this.#removeQueuedNameUnlessQueued(name)
     this.#changed(name)
+    this.#pumpQueued()
   }
 
   #retainExit(name: string, record: LiveRecord): void {
     if (this.#live.get(name) !== record) return
     this.#live.delete(name)
+    this.#removeQueuedName(name)
     const state = record.child.state
     if (record.lastWorkCycle > 0 && !this.#delivery(name, record.lastWorkCycle)) {
       const failure =
         state.type === "exited" && state.outcome.type !== "closed"
           ? {
-              reason: state.outcome.type === "killed" ? ("child_killed" as const) : ("child_failed" as const),
+              reason:
+                state.outcome.type === "forced" ? ("child_forced_settlement" as const) : ("child_failed" as const),
               error: clipUtf8(state.outcome.message, durablePreviewBytes).text
             }
           : { reason: "child_exited" as const }
@@ -806,7 +798,6 @@ export class SubagentSupervisor {
         snapshot.workCycle === undefined && record.lastWorkCycle > 0
           ? { ...snapshot, workCycle: record.lastWorkCycle }
           : snapshot,
-      sessionEvents: record.child.sessionEvents(),
       transcript: record.child.transcript(),
       exitedAt: Date.now(),
       task: record.task
@@ -842,7 +833,6 @@ export class SubagentSupervisor {
       }
       this.#exited[index] = {
         snapshot: record.snapshot,
-        ...(record.sessionEvents ? { sessionEvents: record.sessionEvents } : {}),
         exitedAt: record.exitedAt,
         ...(record.task ? { task: record.task } : {})
       }
@@ -962,7 +952,6 @@ export class SubagentSupervisor {
     name: string,
     workCycle: number,
     admittedSnapshot: ChildSnapshot,
-    admittedDelivery: CompletionDelivery["type"] | undefined,
     deliveryMode: "consume" | "claim",
     signal?: AbortSignal,
     claimId?: string
@@ -976,14 +965,13 @@ export class SubagentSupervisor {
       throwIfWaitCancelled(signal)
       this.#pumpMailbox()
     }
-    return this.#settleDelivery(name, workCycle, admittedSnapshot, admittedDelivery, deliveryMode, true, claimId)
+    return this.#settleDelivery(name, workCycle, admittedSnapshot, deliveryMode, true, claimId)
   }
 
   #settleDelivery(
     name: string,
     workCycle: number,
     admittedSnapshot: ChildSnapshot,
-    admittedDelivery: CompletionDelivery["type"] | undefined,
     deliveryMode: "consume" | "claim",
     requireTerminalEvidence = false,
     claimId?: string
@@ -1004,7 +992,7 @@ export class SubagentSupervisor {
         return this.#claimedSnapshotFor(name, workCycle, admittedSnapshot, owner)
       }
     }
-    if (delivery?.type === "delivered" && !requireTerminalEvidence && admittedDelivery !== "delivered") {
+    if (delivery?.type === "delivered" && !requireTerminalEvidence) {
       return this.#waitSnapshotWithoutCompletion(name, workCycle, admittedSnapshot)
     }
     if (delivery?.type === "claimed" && !requireTerminalEvidence) {
@@ -1055,21 +1043,87 @@ export class SubagentSupervisor {
   async #interruptRecord(name: string, record: LiveRecord): Promise<"interrupted" | "already_idle"> {
     const snapshot = record.child.snapshot()
     const workCycle = snapshot.workCycle
-    const admitted =
-      workCycle !== undefined && (snapshot.lifecycle === "running" || snapshot.lifecycle === "spawn_admitting")
+    const admitted = workCycle !== undefined && snapshot.lifecycle === "running"
     if (admitted) this.#invariant.admitInterrupt(name, workCycle)
     try {
       const result = await record.child.interrupt()
+      this.#removeQueuedNameUnlessQueued(name)
+      this.#pumpQueued()
       this.#assertInvariants()
       return result
     } catch (cause) {
       const state = record.child.state
-      if (admitted && (state.type === "running" || state.type === "spawn_admitting")) {
+      if (admitted && state.type === "running") {
         this.#invariant.rejectInterrupt(name, workCycle)
       }
       this.#assertInvariants()
       throw cause
     }
+  }
+
+  #pumpQueued(): void {
+    if (this.#state.type !== "open") return
+    while (this.runningCount() < maxRunningChildren) {
+      const name = this.#queuedNames.shift()
+      if (!name) return
+      const record = this.#live.get(name)
+      if (!record || record.child.state.type !== "queued") continue
+      record.child.startQueuedCycle()
+    }
+  }
+
+  #removeQueuedNameUnlessQueued(name: string): void {
+    if (this.#live.get(name)?.child.state.type === "queued") return
+    this.#removeQueuedName(name)
+  }
+
+  #removeQueuedName(name: string): void {
+    const index = this.#queuedNames.indexOf(name)
+    if (index >= 0) this.#queuedNames.splice(index, 1)
+  }
+
+  #peerRelay(sender: string): PeerRelay {
+    return this.#relayPeer.bind(this, sender)
+  }
+
+  async #relayPeer(
+    sender: string,
+    request:
+      | { readonly operation: "list" }
+      | { readonly operation: "send"; readonly target: string; readonly text: string },
+    signal?: AbortSignal
+  ): Promise<{ readonly peers: readonly PeerAgent[] } | { readonly delivered: true }> {
+    this.#assertOpen()
+    throwIfPeerCancelled(signal)
+    this.#requirePeerSender(sender)
+    if (request.operation === "list") {
+      const peers: PeerAgent[] = []
+      for (const [name, record] of this.#live) {
+        if (name === sender || record.child.state.type === "closing" || record.child.state.type === "exited") continue
+        const lifecycle = record.child.state.type
+        if (lifecycle !== "idle" && lifecycle !== "queued" && lifecycle !== "running" && lifecycle !== "interrupting") {
+          continue
+        }
+        peers.push(Object.freeze({ name, lifecycle }))
+        if (peers.length === maxPeerAgents) break
+      }
+      return Object.freeze({ peers: Object.freeze(peers) })
+    }
+    validateSubagentName(request.target)
+    validateText(request.text, "Peer message", maxPeerMessageBytes)
+    if (request.target === sender) throw new Error("A subagent cannot send a peer message to itself")
+    const target = this.#live.get(request.target)
+    if (!target || target.child.state.type === "closing" || target.child.state.type === "exited") {
+      throw new Error(`Unknown live peer subagent: ${request.target}`)
+    }
+    await target.serial.run(async () => {
+      this.#requirePeerSender(sender)
+      if (this.#live.get(request.target) !== target || !isPeerLifecycle(target.child.state.type)) {
+        throw new Error(`Unknown live peer subagent: ${request.target}`)
+      }
+      await target.child.send(`[Peer message from ${sender}]\n${request.text}`)
+    })
+    return Object.freeze({ delivered: true })
   }
 
   #assertSpawnAdmission(name: string, record: LiveRecord, signal?: AbortSignal): void {
@@ -1081,6 +1135,13 @@ export class SubagentSupervisor {
       record.child.state.type === "exited"
     ) {
       throw new Error(`Subagent ${name} spawn admission was cancelled`)
+    }
+  }
+
+  #requirePeerSender(name: string): void {
+    const record = this.#live.get(name)
+    if (!record || !isPeerLifecycle(record.child.state.type)) {
+      throw new Error(`Unknown live peer sender: ${name}`)
     }
   }
 
@@ -1102,7 +1163,12 @@ export class SubagentSupervisor {
 
   #assertInvariants(): void {
     this.#ledger.assertInvariants()
-    if (this.#live.size > maxLiveChildren || this.#exited.length > maxRetainedSubagents) {
+    if (
+      this.#live.size + this.#creations.size > maxLiveChildren ||
+      this.#exited.length > maxRetainedSubagents ||
+      this.runningCount() > maxRunningChildren ||
+      this.#queuedNames.length > maxLiveChildren
+    ) {
       throw new Error("Subagent supervisor invariant violated: retained state exceeds its bound")
     }
     const retained = new Set<string>()
@@ -1113,6 +1179,12 @@ export class SubagentSupervisor {
       }
       retained.add(record.snapshot.name)
     }
+    for (const creation of this.#creations.values()) {
+      if (retained.has(creation.name)) {
+        throw new Error("Subagent supervisor invariant violated: subagent has multiple lifecycle owners")
+      }
+      retained.add(creation.name)
+    }
     for (const name of retained) {
       if (!this.#names.has(name))
         throw new Error("Subagent supervisor invariant violated: retained subagent is unnamed")
@@ -1120,6 +1192,18 @@ export class SubagentSupervisor {
     for (const completion of this.#ledger.identities()) {
       if (!this.#names.has(completion.name)) {
         throw new Error("Subagent supervisor invariant violated: completion belongs to an unknown subagent")
+      }
+    }
+    const queued = new Set<string>()
+    for (const name of this.#queuedNames) {
+      if (queued.has(name) || this.#live.get(name)?.child.state.type !== "queued") {
+        throw new Error("Subagent supervisor invariant violated: FIFO does not name unique queued children")
+      }
+      queued.add(name)
+    }
+    for (const [name, record] of this.#live) {
+      if (record.child.state.type === "queued" && !queued.has(name)) {
+        throw new Error("Subagent supervisor invariant violated: queued child is absent from FIFO")
       }
     }
   }
@@ -1189,36 +1273,6 @@ function validateText(value: string, label: string, maxBytes: number): void {
   }
 }
 
-function validateCommand(command: readonly string[]): readonly string[] {
-  if (
-    command.length === 0 ||
-    command.length > 16 ||
-    !isAbsolute(command[0]!) ||
-    command.some(part => part.length === 0 || part.includes("\0") || Buffer.byteLength(part) > 4096)
-  ) {
-    throw new Error("Subagent commands require an absolute executable and at most 15 bounded prefix arguments")
-  }
-  return Object.freeze([...command])
-}
-
-function validateEnvironment(
-  environment: Readonly<Record<string, string | undefined>>
-): Readonly<Record<string, string | undefined>> {
-  const entries = Object.entries(environment)
-  if (entries.length > 4096) throw new Error("Subagent environment cannot exceed 4096 entries")
-  for (const [name, value] of entries) {
-    if (
-      name.length === 0 ||
-      name.includes("\0") ||
-      Buffer.byteLength(name) > 4096 ||
-      (value !== undefined && (value.includes("\0") || Buffer.byteLength(value) > 64 * 1024))
-    ) {
-      throw new Error("Subagent environment contains an invalid entry")
-    }
-  }
-  return Object.freeze(Object.fromEntries(entries))
-}
-
 function retainCompletion(completion: SubagentCompletion): SubagentCompletion {
   if (completion.status !== "failed") return Object.freeze({ ...completion })
   return Object.freeze({
@@ -1264,6 +1318,10 @@ function clipJsonString(value: string, maximumBytes: number): ReturnType<typeof 
   return clipUtf8(value, low)
 }
 
+function spawnCancellation(name: string): Error {
+  return new Error(`Subagent ${name} spawn was cancelled`)
+}
+
 function deferredVoid(): { readonly promise: Promise<void>; resolve(): void } {
   let settled = false
   let resolvePromise!: () => void
@@ -1300,19 +1358,26 @@ function throwIfWaitCancelled(signal?: AbortSignal): void {
   if (signal?.aborted) throw waitCancellationError()
 }
 
+function throwIfPeerCancelled(signal?: AbortSignal): void {
+  if (!signal?.aborted) return
+  if (signal.reason instanceof Error) throw signal.reason
+  const error = new Error("Peer operation was cancelled")
+  error.name = "AbortError"
+  throw error
+}
+
 function waitCancellationError(): Error {
   const error = new Error("Subagent wait was cancelled")
   error.name = "AbortError"
   return error
 }
 
-function isWorkingLifecycle(lifecycle: ChildSnapshot["lifecycle"]): boolean {
-  return (
-    lifecycle === "starting" ||
-    lifecycle === "spawn_admitting" ||
-    lifecycle === "running" ||
-    lifecycle === "interrupting"
-  )
+function isWorkingLifecycle(lifecycle: ChildLifecycleState["type"]): boolean {
+  return lifecycle === "queued" || lifecycle === "running" || lifecycle === "interrupting"
+}
+
+function isPeerLifecycle(lifecycle: ChildLifecycleState["type"]): lifecycle is PeerAgent["lifecycle"] {
+  return lifecycle === "idle" || lifecycle === "queued" || lifecycle === "running" || lifecycle === "interrupting"
 }
 
 async function settleWithin(operation: Promise<void>, timeoutMs: number): Promise<void> {

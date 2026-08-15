@@ -35,7 +35,7 @@ import {
 import { SessionManager } from "./session-manager.js"
 import { SessionShell } from "./session-shell.js"
 import { SettingsManager } from "./settings-manager.js"
-import { internalSubagentApiKeyEnvironment, internalSubagentDepthEnvironment } from "./subagents/invocation.js"
+import { createSubagentSessionFactory } from "./subagents/session.js"
 import { createCodingTools } from "./tools/index.js"
 
 export type { AgentRuntimeSessionIntent, CreateAgentRuntimeOptions } from "./runtime-options.js"
@@ -81,7 +81,7 @@ export async function createUnboundAgentRuntime(requested: CreateAgentRuntimeOpt
   const extensionHost = new ExtensionHost(
     plan => spawnExtensionWorker(plan, extensionWorkerCommand, processTreeTracker),
     undefined,
-    { subagents: options.subagentCommand !== undefined && options.internalSubagentDepth !== 1 }
+    { subagents: true }
   )
   let shell: SessionShell | undefined
   try {
@@ -132,13 +132,14 @@ export async function createUnboundAgentRuntime(requested: CreateAgentRuntimeOpt
       sessionManager,
       processTreeTracker
     )
-    const subagentEnvironment: Record<string, string | undefined> = {
-      ...(options.internalSubagentEnvironment ?? process.env),
-      ZI_AGENT_DIR: paths.globalDir,
-      [internalSubagentDepthEnvironment]: "1"
-    }
-    delete subagentEnvironment.ZI_SUBAGENT_EXECUTABLE
-    delete subagentEnvironment[internalSubagentApiKeyEnvironment]
+    const createSubagentChildSession = createSubagentSessionFactory({
+      services,
+      project,
+      processTreeTracker,
+      extensionWorkerCommand,
+      codeModeWorkerCommand: options.codeModeWorkerCommand ?? defaultCodeModeWorkerCommand,
+      extensionMode: "rpc"
+    })
     const created = await createAgentSessionWithProcessTreeTracker(
       {
         services,
@@ -149,16 +150,14 @@ export async function createUnboundAgentRuntime(requested: CreateAgentRuntimeOpt
         codeMode,
         project,
         extensionPaths: options.extensionPaths ?? [],
-        ...(options.subagentCommand ? { subagentCommand: options.subagentCommand } : {}),
-        subagentEnvironment: Object.freeze(subagentEnvironment),
-        internalSubagentDepth: options.internalSubagentDepth ?? 0,
+        createSubagentChildSession,
         toolSurface: options.toolSurface ?? "direct-and-code",
         ...(model ? { model } : {}),
         ...(options.thinkingLevel ? { thinkingLevel: options.thinkingLevel } : {}),
         ...(options.apiKey ? { apiKey: options.apiKey } : {}),
         tools: createCodingTools({ cwd: paths.cwd, shell })
       },
-      processTreeTracker
+      { type: "owned", tracker: processTreeTracker }
     )
     return Object.freeze({
       session: created.session,

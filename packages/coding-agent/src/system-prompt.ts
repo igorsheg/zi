@@ -4,7 +4,7 @@ import { codeModeDoctrine } from "./code-mode/prompt.js"
 import { getProductDocumentationPaths } from "./product-documentation.js"
 import type { SessionResources } from "./resource-loader.js"
 import { buildSkillPromptCatalog } from "./skills.js"
-import { peerMessagingDoctrine } from "./subagents/peer-messenger.js"
+import { peerMessagingDoctrine } from "./subagents/peer.js"
 import type { ToolSurface } from "./tool-surface.js"
 
 // Regression budget for Zi-authored sections; loaded resources and caller-provided paths are measured separately.
@@ -14,7 +14,7 @@ type SystemPromptSectionMetadata =
   | { readonly kind: "base"; readonly source: "default" | "custom" }
   | { readonly kind: "code-mode"; readonly surface: ToolSurface }
   | { readonly kind: "work-plan" }
-  | { readonly kind: "peer-messaging" }
+  | { readonly kind: "peer-subagents" }
   | { readonly kind: "product-documentation" }
   | { readonly kind: "appended-instructions"; readonly index: number }
   | { readonly kind: "project-instructions"; readonly files: readonly string[] }
@@ -35,7 +35,7 @@ export interface SystemPromptCapabilities {
   readonly shell: boolean
   readonly codeMode: boolean
   readonly workPlan: boolean
-  readonly peerMessaging: boolean
+  readonly peerSubagents: boolean
   readonly skillReadSurface: "direct" | "code" | undefined
 }
 
@@ -65,7 +65,7 @@ export function compileSystemPrompt(
 
   if (toolSurface) sections.push({ kind: "code-mode", surface: toolSurface, text: codeModeDoctrine(toolSurface) })
   if (capabilities.workPlan) sections.push({ kind: "work-plan", text: workPlanDoctrine() })
-  if (capabilities.peerMessaging) sections.push({ kind: "peer-messaging", text: peerMessagingDoctrine() })
+  if (capabilities.peerSubagents) sections.push({ kind: "peer-subagents", text: peerMessagingDoctrine() })
   if (resources.systemPrompt === undefined) {
     sections.push({ kind: "product-documentation", text: productDocumentationPrompt() })
   }
@@ -129,7 +129,7 @@ function deriveCapabilities(
     shell: toolNames.has("bash"),
     codeMode: toolSurface !== undefined,
     workPlan: toolNames.has("update_plan"),
-    peerMessaging: toolNames.has("send_peer_message"),
+    peerSubagents: toolNames.has("list_peer_subagents") && toolNames.has("send_peer_message"),
     skillReadSurface
   })
 }

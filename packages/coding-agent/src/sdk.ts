@@ -23,7 +23,8 @@ import { createSessionResources, type ResourceLoader, type SessionResources } fr
 import type { SessionManager, SessionModel } from "./session-manager.js"
 import type { SessionShell } from "./session-shell.js"
 import type { SettingsManager } from "./settings-manager.js"
-import { PeerMessenger } from "./subagents/peer-messenger.js"
+import type { CreateSubagentChildSession } from "./subagents/child.js"
+import { createPeerTools, type PeerRelay } from "./subagents/peer.js"
 import { SubagentSupervisor } from "./subagents/supervisor.js"
 import { buildSystemPrompt } from "./system-prompt.js"
 import { snapshotToolSurface, type ToolSurface } from "./tool-surface.js"
@@ -82,21 +83,24 @@ export interface CreateAgentSessionOptions {
   readonly codeMode?: CodeMode
   readonly project?: ProjectConfigurationAdmission
   readonly extensionPaths?: readonly string[]
-  readonly subagentCommand?: readonly string[]
-  readonly subagentEnvironment?: Readonly<Record<string, string | undefined>>
-  readonly internalSubagentDepth?: 0 | 1
+  readonly createSubagentChildSession?: CreateSubagentChildSession
+  readonly peerRelay?: PeerRelay
   readonly toolSurface?: ToolSurface
   readonly invariants?: InvariantRegistryOptions
 }
 
+export type AgentSessionProcessTree =
+  | { readonly type: "owned"; readonly tracker: ProcessTreeTracker }
+  | { readonly type: "borrowed"; readonly tracker: ProcessTreeTracker }
+
 /** Build one session from caller-owned services. The caller owns the returned session's disposal. */
 export function createAgentSession(options: CreateAgentSessionOptions): Promise<CreateAgentSessionResult> {
-  return createAgentSessionWithProcessTreeTracker(options, createProcessTreeTracker())
+  return createAgentSessionWithProcessTreeTracker(options, { type: "owned", tracker: createProcessTreeTracker() })
 }
 
 export async function createAgentSessionWithProcessTreeTracker(
   options: CreateAgentSessionOptions,
-  processTreeTracker: ProcessTreeTracker
+  processTree: AgentSessionProcessTree
 ): Promise<CreateAgentSessionResult> {
   const { services, sessionManager } = options
   if (options.toolSurface && !options.codeMode) throw new Error("Tool surface selection requires Code Mode")
@@ -129,36 +133,34 @@ export async function createAgentSessionWithProcessTreeTracker(
   const thinkingLevel = model ? clampThinkingLevel(model, preferredThinking) : "off"
   const bootstrapDiagnostic = createBootstrapDiagnostic(unavailableSessionModel, model)
   let session: AgentSession | undefined
-  const peerMessenger = options.internalSubagentDepth === 1 ? new PeerMessenger() : undefined
-  const peerTools = peerMessenger?.createTools() ?? []
   if (options.tools.some(tool => tool.name === "update_plan")) {
     throw new Error("The tool name update_plan is reserved for the native work plan")
   }
+  if (options.tools.some(tool => tool.name === "list_peer_subagents" || tool.name === "send_peer_message")) {
+    throw new Error("Peer tool names are reserved for the parent-owned relay")
+  }
   const workPlan = new WorkPlan(sessionManager)
-  const sessionTools = Object.freeze([...options.tools, createUpdatePlanTool(workPlan), ...peerTools])
-  const subagents =
-    options.subagentCommand && options.internalSubagentDepth !== 1
-      ? new SubagentSupervisor({
-          command: options.subagentCommand,
-          cwd: sessionManager.header.cwd,
-          env: options.subagentEnvironment ?? {},
-          selection: () => {
-            const selected = session?.model ?? model
-            if (!selected) throw new Error("No model selected. Use /login, then /model.")
-            return {
-              model: `${selected.provider}/${selected.id}`,
-              thinkingLevel: session?.thinkingLevel ?? thinkingLevel,
-              ...(options.apiKey ? { apiKey: options.apiKey } : {})
-            }
-          },
-          sessionManager,
-          processTreeTracker,
-          invariantRegistry,
-          waitTimeoutMs: settings.subagentWaitTimeoutMs,
-          workTimeoutMs: settings.subagentWorkTimeoutMs,
-          toolSurface: toolSurface ?? "direct-and-code"
-        })
-      : undefined
+  const peerTools = options.peerRelay ? createPeerTools(options.peerRelay) : []
+  const sessionTools = Object.freeze([...options.tools, ...peerTools, createUpdatePlanTool(workPlan)])
+  const subagents = options.createSubagentChildSession
+    ? new SubagentSupervisor({
+        createChildSession: options.createSubagentChildSession,
+        selection: () => {
+          const selected = session?.model ?? model
+          if (!selected) throw new Error("No model selected. Use /login, then /model.")
+          return {
+            model: `${selected.provider}/${selected.id}`,
+            thinkingLevel: session?.thinkingLevel ?? thinkingLevel,
+            ...(options.apiKey ? { apiKey: options.apiKey } : {})
+          }
+        },
+        sessionManager,
+        invariantRegistry,
+        waitTimeoutMs: settings.subagentWaitTimeoutMs,
+        workTimeoutMs: settings.subagentWorkTimeoutMs,
+        toolSurface: toolSurface ?? "direct-and-code"
+      })
+    : undefined
   const agent = new Agent({
     initialState: {
       systemPrompt: buildSystemPrompt(sessionManager.header.cwd, resources, sessionTools, toolSurface),
@@ -228,11 +230,10 @@ export async function createAgentSessionWithProcessTreeTracker(
       invariantRegistry,
       agentSessionInvariant,
       ...(subagents ? { subagentSupervisor: subagents } : {}),
-      ...(peerMessenger ? { peerMessenger } : {}),
       ...(options.codeMode ? { codeMode: options.codeMode } : {}),
       ...(options.extensionHost ? { extensionHost: options.extensionHost } : {}),
       extensionContext: createExtensionContext(options.extensionMode ?? "embedded", services, sessionManager),
-      processTreeTracker,
+      ...(processTree.type === "owned" ? { ownedProcessTreeTracker: processTree.tracker } : {}),
       workPlan,
       ...(options.shell ? { shell: options.shell } : {}),
       ...(model ? { model } : {}),

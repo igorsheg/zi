@@ -20,7 +20,16 @@ test("owned raw processes expose bounded stdio and one terminal exit", async () 
   const [stdout, stderr, exit] = await Promise.all([readText(child.stdout), readText(child.stderr), child.exit])
   expect({ stdout, stderr, exit }).toEqual({ stdout: "out", stderr: "err", exit: { code: 0, signal: null } })
   await child.dispose()
+  expect(await child.exit).toBe(exit)
   await tracker.dispose()
+})
+
+test("Bun exit observation is event-driven without a polling timer", async () => {
+  const source = await Bun.file(new URL("../src/processes/owned-process.ts", import.meta.url)).text()
+  const observation = source.slice(source.indexOf("function observeExit("), source.indexOf("function bunInput("))
+
+  expect(observation).toContain("child.process.exited.then(")
+  expect(observation).not.toMatch(/\b(?:setTimeout|setInterval)\b|\bpoll\b/)
 })
 
 test("owned process exit is independent from inherited output-pipe closure", async () => {

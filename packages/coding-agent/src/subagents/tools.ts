@@ -2,8 +2,7 @@ import type { AgentTool } from "@earendil-works/pi-agent-core"
 import { Type } from "@earendil-works/pi-ai"
 import type { ExtensionSubagentProfile } from "@with-zi/extension-api"
 
-import type { SubagentCompletion } from "./child-process.js"
-import { clipUtf8 } from "./child-process.js"
+import type { SubagentCompletion } from "./child.js"
 import type { SubagentSupervisor, SubagentSnapshot } from "./supervisor.js"
 import {
   maxLiveChildren,
@@ -12,6 +11,7 @@ import {
   maxWaitNames,
   maxWaitTimeoutMs
 } from "./supervisor.js"
+import { clipUtf8 } from "./text.js"
 import {
   maxProjectedSubagentProfileDetailsBytes,
   projectSubagentToolAgent,
@@ -192,7 +192,7 @@ export function createSubagentTools(
     name: "interrupt_subagent",
     label: "interrupt_subagent",
     description:
-      "Interrupt current subagent work, wait for bounded terminal evidence from that exact work cycle, and keep the process reusable.",
+      "Interrupt current subagent work, wait for bounded terminal evidence from that exact work cycle, and keep the child reusable.",
     parameters: nameParameters,
     executionMode: "parallel",
     async execute(id, input, signal) {
@@ -215,7 +215,7 @@ export function createSubagentTools(
   const close: AgentTool<typeof nameParameters, SubagentToolDetails> = {
     name: "close_subagent",
     label: "close_subagent",
-    description: `Close a subagent process, return its bounded terminal evidence, and release its live-child slot. Idle subagents still occupy one of ${maxLiveChildren} slots. The runtime name remains reserved.`,
+    description: `Close a subagent, return its bounded terminal evidence, and release its live-child slot. Idle subagents still occupy one of ${maxLiveChildren} slots. The runtime name remains reserved.`,
     parameters: nameParameters,
     executionMode: "parallel",
     async execute(id, input) {
