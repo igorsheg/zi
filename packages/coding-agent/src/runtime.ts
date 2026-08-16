@@ -9,6 +9,7 @@ import { builtinProviders, getBuiltinModelDataGeneratedAt } from "@earendil-work
 registerBunOAuthFlows()
 
 import type { AgentSession } from "./agent-session.js"
+import { createAgentTeamSessionFactory } from "./agent-team/session-factory.js"
 import { CodeMode } from "./code-mode/code-mode.js"
 import { FileCredentialStore } from "./credential-store.js"
 import { discoverExtensionLoadPlan, extensionDiscoveryDiagnostic } from "./extensions/discovery.js"
@@ -35,7 +36,6 @@ import {
 import { SessionManager } from "./session-manager.js"
 import { SessionShell } from "./session-shell.js"
 import { SettingsManager } from "./settings-manager.js"
-import { createSubagentSessionFactory } from "./subagents/session.js"
 import { createCodingTools } from "./tools/index.js"
 
 export type { AgentRuntimeSessionIntent, CreateAgentRuntimeOptions } from "./runtime-options.js"
@@ -132,13 +132,15 @@ export async function createUnboundAgentRuntime(requested: CreateAgentRuntimeOpt
       sessionManager,
       processTreeTracker
     )
-    const createSubagentChildSession = createSubagentSessionFactory({
+    const extensionMode = options.extensionMode ?? "embedded"
+    const createAgentTeamSession = createAgentTeamSessionFactory({
       services,
       project,
       processTreeTracker,
       extensionWorkerCommand,
       codeModeWorkerCommand: options.codeModeWorkerCommand ?? defaultCodeModeWorkerCommand,
-      extensionMode: "rpc"
+      extensionMode,
+      toolSurface: options.toolSurface ?? "direct-and-code"
     })
     const created = await createAgentSessionWithProcessTreeTracker(
       {
@@ -146,11 +148,11 @@ export async function createUnboundAgentRuntime(requested: CreateAgentRuntimeOpt
         sessionManager,
         shell,
         extensionHost,
-        extensionMode: options.extensionMode ?? "embedded",
+        extensionMode,
         codeMode,
         project,
         extensionPaths: options.extensionPaths ?? [],
-        createSubagentChildSession,
+        agentTeam: { type: "root", createChildSession: createAgentTeamSession },
         toolSurface: options.toolSurface ?? "direct-and-code",
         ...(model ? { model } : {}),
         ...(options.thinkingLevel ? { thinkingLevel: options.thinkingLevel } : {}),

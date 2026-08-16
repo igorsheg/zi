@@ -74,6 +74,8 @@ export {
   type Skill
 } from "./skills.js"
 export * from "./slash-commands.js"
+export type { AgentSnapshot, AgentTeamChange } from "./agent-team/agent-team.js"
+export type { AgentPath } from "./agent-team/path.js"
 export type { SubagentSnapshot, SubagentTranscriptSnapshot } from "./subagents/supervisor.js"
 export * from "./system-prompt.js"
 export * from "./tools/index.js"

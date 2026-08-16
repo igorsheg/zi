@@ -6,10 +6,9 @@ const definitions = [
   { name: "codex-settings", description: "Open OpenAI Codex settings" },
   { name: "compact", description: "Compact context, optionally preserving a specified focus", argumentHint: "[focus]" },
   { name: "copy", description: "Copy last assistant message to clipboard" },
-  { name: "reload", description: "Reload settings, extensions, skills, prompts, subagent profiles, and context files" },
+  { name: "reload", description: "Reload settings, extensions, skills, prompts, agent roles, and context files" },
   { name: "new", description: "Start a new session" },
-  { name: "resume", description: "Browse and resume saved sessions" },
-  { name: "agent", description: "Browse subagents and open live activity" }
+  { name: "resume", description: "Browse and resume saved sessions" }
 ] as const
 
 export type BuiltinSlashCommandName = (typeof definitions)[number]["name"]

@@ -56,8 +56,18 @@ test("depth-zero production runtimes enable in-process subagents without a subpr
   })
   try {
     await runtime.session.prompt("inspect tools")
-    expect(tools).toContain("spawn_subagent")
-    expect(tools).toContain("wait_subagents")
+    expect(tools).toEqual(
+      expect.arrayContaining([
+        "spawn_agent",
+        "send_message",
+        "followup_task",
+        "wait_agent",
+        "list_agents",
+        "interrupt_agent"
+      ])
+    )
+    expect(tools).not.toContain("spawn_subagent")
+    expect(tools).not.toContain("wait_subagents")
     expect(tools).not.toContain("list_peer_subagents")
     expect(tools).not.toContain("send_peer_message")
   } finally {

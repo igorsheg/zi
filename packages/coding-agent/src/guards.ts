@@ -1,6 +1,7 @@
 import { Type } from "typebox"
 import { Compile } from "typebox/compile"
 
+import type { AgentTeamToolDetails } from "./agent-team/tool-details.js"
 import type { AgentMessage } from "./messages.js"
 
 /**
@@ -30,6 +31,64 @@ const toolCallContent = Type.Object({
 const userContent = Type.Union([Type.String(), Type.Array(Type.Union([textContent, imageContent]))])
 const assistantContent = Type.Array(Type.Union([textContent, thinkingContent, toolCallContent]))
 const toolResultContent = Type.Array(Type.Union([textContent, imageContent]))
+const agentTeamPath = Type.String({ minLength: 5, maxLength: 512, pattern: "^/root(?:/[a-z][a-z0-9_-]*)*$" })
+const agentTeamToolAgent = Type.Object({
+  path: agentTeamPath,
+  parentPath: agentTeamPath,
+  taskName: Type.String({ minLength: 1, maxLength: 64, pattern: "^[a-z][a-z0-9_-]*$" }),
+  agentType: Type.Optional(Type.String({ minLength: 1, maxLength: 64, pattern: "^[a-z][a-z0-9_-]*$" })),
+  residency: Type.Union([Type.Literal("unloaded"), Type.Literal("loading"), Type.Literal("resident")]),
+  turnState: Type.Union([
+    Type.Literal("idle"),
+    Type.Literal("starting"),
+    Type.Literal("running"),
+    Type.Literal("interrupting")
+  ]),
+  turnNumber: Type.Integer({ minimum: 0 }),
+  settledStatus: Type.Union([
+    Type.Literal("not_started"),
+    Type.Literal("completed"),
+    Type.Literal("interrupted"),
+    Type.Literal("failed")
+  ])
+})
+const agentTeamToolBase = { type: Type.Literal("agent_team"), outcome: Type.Literal("success") }
+const agentTeamToolDetails = Compile(
+  Type.Union([
+    Type.Object({ ...agentTeamToolBase, operation: Type.Literal("spawn"), agent: agentTeamToolAgent }),
+    Type.Object({ ...agentTeamToolBase, operation: Type.Literal("send"), target: agentTeamPath }),
+    Type.Object({
+      ...agentTeamToolBase,
+      operation: Type.Literal("followup"),
+      target: agentTeamPath,
+      delivery: Type.Union([Type.Literal("started"), Type.Literal("joined")])
+    }),
+    Type.Object({
+      ...agentTeamToolBase,
+      operation: Type.Literal("wait"),
+      activity: Type.Union([Type.Literal("mailbox"), Type.Literal("steered"), Type.Literal("timed_out")]),
+      timedOut: Type.Boolean()
+    }),
+    Type.Object({
+      ...agentTeamToolBase,
+      operation: Type.Literal("list"),
+      agents: Type.Array(agentTeamToolAgent, { maxItems: 64 })
+    }),
+    Type.Object({
+      ...agentTeamToolBase,
+      operation: Type.Literal("interrupt"),
+      target: agentTeamPath,
+      previousTurn: Type.Union([
+        Type.Literal("idle"),
+        Type.Literal("starting"),
+        Type.Literal("running"),
+        Type.Literal("interrupting")
+      ]),
+      result: Type.Union([Type.Literal("interrupted"), Type.Literal("idle")])
+    })
+  ])
+)
+
 const agentMessage = Compile(
   Type.Union([
     Type.Object({ role: Type.Literal("user"), content: userContent, timestamp: Type.Number() }),
@@ -115,4 +174,21 @@ export function isNonNegativeFinite(value: unknown): value is number {
 
 export function isAgentMessage(value: unknown): value is AgentMessage {
   return agentMessage.Check(value)
+}
+
+export function isAgentTeamToolDetailsShape(value: unknown): value is AgentTeamToolDetails {
+  if (!agentTeamToolDetails.Check(value)) return false
+  switch (value.operation) {
+    case "spawn":
+      return Number.isSafeInteger(value.agent.turnNumber)
+    case "list":
+      return value.agents.every(agent => Number.isSafeInteger(agent.turnNumber))
+    case "send":
+    case "followup":
+    case "wait":
+    case "interrupt":
+      return true
+    default:
+      return false
+  }
 }

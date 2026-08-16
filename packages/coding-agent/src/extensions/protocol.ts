@@ -32,7 +32,7 @@ import {
   type ExtensionSource
 } from "./discovery.js"
 
-export const extensionProtocolVersion = 10
+export const extensionProtocolVersion = 11
 export const maxExtensionProtocolFrameBytes = 4 * 1024 * 1024
 export const maxExtensionPendingRequests = 128
 export const maxExtensionQueuedWriteBytes = 8 * 1024 * 1024
@@ -125,7 +125,7 @@ export interface ExtensionLoadResult {
 export type HostMessage =
   | {
       readonly type: "initialize"
-      readonly protocolVersion: 10
+      readonly protocolVersion: 11
       readonly generation: number
       readonly plan: ExtensionLoadPlan
       readonly subagentsAvailable?: boolean
@@ -181,44 +181,44 @@ export type HostMessage =
       readonly names: readonly string[]
     }
   | {
-      readonly type: "subagent_profiles_result"
+      readonly type: "agent_roles_result"
       readonly generation: number
       readonly requestId: number
       readonly profiles: readonly ExtensionSubagentProfile[]
     }
   | {
-      readonly type: "subagent_spawn_result"
+      readonly type: "agent_spawn_result"
       readonly generation: number
       readonly requestId: number
       readonly name: string
     }
-  | { readonly type: "subagent_send_result"; readonly generation: number; readonly requestId: number }
+  | { readonly type: "agent_send_result"; readonly generation: number; readonly requestId: number }
   | {
-      readonly type: "subagent_continue_result"
+      readonly type: "agent_followup_result"
       readonly generation: number
       readonly requestId: number
       readonly delivery: "started_turn" | "follow_up"
     }
   | {
-      readonly type: "subagent_wait_result"
+      readonly type: "agent_wait_result"
       readonly generation: number
       readonly requestId: number
       readonly snapshots: readonly ExtensionSubagentSnapshot[]
     }
   | {
-      readonly type: "subagent_interrupt_result"
+      readonly type: "agent_interrupt_result"
       readonly generation: number
       readonly requestId: number
       readonly settlement: ExtensionSubagentInterruptSettlement
     }
   | {
-      readonly type: "subagent_close_result"
+      readonly type: "agent_close_result"
       readonly generation: number
       readonly requestId: number
       readonly snapshot: ExtensionSubagentSnapshot
     }
   | {
-      readonly type: "subagent_list_result"
+      readonly type: "agent_list_result"
       readonly generation: number
       readonly requestId: number
       readonly snapshots: readonly ExtensionSubagentSnapshot[]
@@ -233,7 +233,7 @@ export type HostMessage =
 export type WorkerMessage =
   | {
       readonly type: "ready"
-      readonly protocolVersion: 10
+      readonly protocolVersion: 11
       readonly generation: number
       readonly extensions: readonly ExtensionLoadResult[]
       readonly commands: readonly ExtensionCommandRegistration[]
@@ -301,13 +301,13 @@ export type WorkerMessage =
       readonly names: readonly string[]
     }
   | {
-      readonly type: "subagent_profiles_get"
+      readonly type: "agent_roles_get"
       readonly generation: number
       readonly requestId: number
       readonly extensionId: string
     }
   | {
-      readonly type: "subagent_spawn"
+      readonly type: "agent_spawn"
       readonly generation: number
       readonly requestId: number
       readonly extensionId: string
@@ -316,7 +316,7 @@ export type WorkerMessage =
       readonly prompt: string
     }
   | {
-      readonly type: "subagent_send"
+      readonly type: "agent_send"
       readonly generation: number
       readonly requestId: number
       readonly extensionId: string
@@ -324,7 +324,7 @@ export type WorkerMessage =
       readonly text: string
     }
   | {
-      readonly type: "subagent_continue"
+      readonly type: "agent_followup"
       readonly generation: number
       readonly requestId: number
       readonly extensionId: string
@@ -332,7 +332,7 @@ export type WorkerMessage =
       readonly text: string
     }
   | {
-      readonly type: "subagent_wait"
+      readonly type: "agent_wait"
       readonly generation: number
       readonly requestId: number
       readonly extensionId: string
@@ -341,27 +341,27 @@ export type WorkerMessage =
       readonly timeoutMs?: number
     }
   | {
-      readonly type: "subagent_interrupt"
+      readonly type: "agent_interrupt"
       readonly generation: number
       readonly requestId: number
       readonly extensionId: string
       readonly name: string
     }
   | {
-      readonly type: "subagent_close"
+      readonly type: "agent_close"
       readonly generation: number
       readonly requestId: number
       readonly extensionId: string
       readonly name: string
     }
   | {
-      readonly type: "subagent_list"
+      readonly type: "agent_list"
       readonly generation: number
       readonly requestId: number
       readonly extensionId: string
     }
   | {
-      readonly type: "subagent_operation_cancel"
+      readonly type: "agent_operation_cancel"
       readonly generation: number
       readonly requestId: number
       readonly extensionId: string
@@ -374,7 +374,7 @@ export type JsonValue = null | boolean | number | string | readonly JsonValue[] 
 
 export type ExtensionSessionRequest = Exclude<
   Extract<WorkerMessage, { readonly requestId: number; readonly extensionId: string }>,
-  { readonly type: "subagent_operation_cancel" }
+  { readonly type: "agent_operation_cancel" }
 >
 export type ExtensionSessionResponse = Extract<
   HostMessage,
@@ -464,7 +464,7 @@ export function validateHostMessage(value: unknown): HostMessage {
     case "stop":
     case "cancel":
     case "custom_message_result":
-    case "subagent_send_result":
+    case "agent_send_result":
       return Object.freeze({
         type: message.type,
         generation: positiveInteger(message.generation, "generation"),
@@ -496,45 +496,45 @@ export function validateHostMessage(value: unknown): HostMessage {
         requestId: positiveInteger(message.requestId, "requestId"),
         names: activeToolNames(message.names)
       })
-    case "subagent_profiles_result":
+    case "agent_roles_result":
       return Object.freeze({
-        type: "subagent_profiles_result",
+        type: "agent_roles_result",
         generation: positiveInteger(message.generation, "generation"),
         requestId: positiveInteger(message.requestId, "requestId"),
         profiles: extensionSubagentProfiles(message.profiles)
       })
-    case "subagent_spawn_result":
+    case "agent_spawn_result":
       return Object.freeze({
-        type: "subagent_spawn_result",
+        type: "agent_spawn_result",
         generation: positiveInteger(message.generation, "generation"),
         requestId: positiveInteger(message.requestId, "requestId"),
         name: subagentName(message.name)
       })
-    case "subagent_continue_result":
+    case "agent_followup_result":
       return Object.freeze({
-        type: "subagent_continue_result",
+        type: "agent_followup_result",
         generation: positiveInteger(message.generation, "generation"),
         requestId: positiveInteger(message.requestId, "requestId"),
         delivery: subagentDelivery(message.delivery)
       })
-    case "subagent_wait_result":
-    case "subagent_list_result":
+    case "agent_wait_result":
+    case "agent_list_result":
       return Object.freeze({
         type: message.type,
         generation: positiveInteger(message.generation, "generation"),
         requestId: positiveInteger(message.requestId, "requestId"),
         snapshots: extensionSubagentSnapshots(message.snapshots)
       })
-    case "subagent_interrupt_result":
+    case "agent_interrupt_result":
       return Object.freeze({
-        type: "subagent_interrupt_result",
+        type: "agent_interrupt_result",
         generation: positiveInteger(message.generation, "generation"),
         requestId: positiveInteger(message.requestId, "requestId"),
         settlement: extensionSubagentInterruptSettlement(message.settlement)
       })
-    case "subagent_close_result":
+    case "agent_close_result":
       return Object.freeze({
-        type: "subagent_close_result",
+        type: "agent_close_result",
         generation: positiveInteger(message.generation, "generation"),
         requestId: positiveInteger(message.requestId, "requestId"),
         snapshot: extensionSubagentSnapshot(message.snapshot)
@@ -671,17 +671,17 @@ export function validateWorkerMessage(value: unknown): WorkerMessage {
         extensionId: boundedRequiredText(message.extensionId, "extension id", maxExtensionIdBytes),
         names: activeToolNames(message.names)
       })
-    case "subagent_profiles_get":
-    case "subagent_list":
+    case "agent_roles_get":
+    case "agent_list":
       return Object.freeze({
         type: message.type,
         generation: positiveInteger(message.generation, "generation"),
         requestId: positiveInteger(message.requestId, "requestId"),
         extensionId: boundedRequiredText(message.extensionId, "extension id", maxExtensionIdBytes)
       })
-    case "subagent_spawn":
+    case "agent_spawn":
       return Object.freeze({
-        type: "subagent_spawn",
+        type: "agent_spawn",
         generation: positiveInteger(message.generation, "generation"),
         requestId: positiveInteger(message.requestId, "requestId"),
         extensionId: boundedRequiredText(message.extensionId, "extension id", maxExtensionIdBytes),
@@ -689,8 +689,8 @@ export function validateWorkerMessage(value: unknown): WorkerMessage {
         name: subagentName(message.name),
         prompt: boundedRequiredText(message.prompt, "subagent prompt", maxExtensionSubagentTextBytes)
       })
-    case "subagent_send":
-    case "subagent_continue":
+    case "agent_send":
+    case "agent_followup":
       return Object.freeze({
         type: message.type,
         generation: positiveInteger(message.generation, "generation"),
@@ -699,9 +699,9 @@ export function validateWorkerMessage(value: unknown): WorkerMessage {
         name: subagentName(message.name),
         text: boundedRequiredText(message.text, "subagent text", maxExtensionSubagentTextBytes)
       })
-    case "subagent_wait":
+    case "agent_wait":
       return Object.freeze({
-        type: "subagent_wait",
+        type: "agent_wait",
         generation: positiveInteger(message.generation, "generation"),
         requestId: positiveInteger(message.requestId, "requestId"),
         extensionId: boundedRequiredText(message.extensionId, "extension id", maxExtensionIdBytes),
@@ -711,8 +711,8 @@ export function validateWorkerMessage(value: unknown): WorkerMessage {
         names: subagentNames(message.names),
         ...(message.timeoutMs === undefined ? {} : { timeoutMs: subagentWaitTimeout(message.timeoutMs) })
       })
-    case "subagent_interrupt":
-    case "subagent_close":
+    case "agent_interrupt":
+    case "agent_close":
       return Object.freeze({
         type: message.type,
         generation: positiveInteger(message.generation, "generation"),
@@ -720,9 +720,9 @@ export function validateWorkerMessage(value: unknown): WorkerMessage {
         extensionId: boundedRequiredText(message.extensionId, "extension id", maxExtensionIdBytes),
         name: subagentName(message.name)
       })
-    case "subagent_operation_cancel":
+    case "agent_operation_cancel":
       return Object.freeze({
-        type: "subagent_operation_cancel",
+        type: "agent_operation_cancel",
         generation: positiveInteger(message.generation, "generation"),
         requestId: positiveInteger(message.requestId, "requestId"),
         extensionId: boundedRequiredText(message.extensionId, "extension id", maxExtensionIdBytes),
@@ -1176,8 +1176,7 @@ function subagentProfileText(value: unknown, field: string, maxBytes: number): s
 
 function subagentNames(value: unknown): readonly string[] {
   const names = protocolArray(value, "subagent names")
-  if (names.length === 0 || names.length > 16)
-    throw new ExtensionProtocolError("Subagent names must contain 1 to 16 items")
+  if (names.length > 16) throw new ExtensionProtocolError("Subagent names cannot contain more than 16 items")
   const admitted = names.map(subagentName)
   if (new Set(admitted).size !== admitted.length) throw new ExtensionProtocolError("Subagent names must be unique")
   return Object.freeze(admitted)
@@ -1358,7 +1357,7 @@ function protocolArray(value: unknown, field: string): readonly unknown[] {
   return value
 }
 
-function protocolVersion(value: unknown): 10 {
+function protocolVersion(value: unknown): 11 {
   if (value !== extensionProtocolVersion) throw new ExtensionProtocolError("Unsupported extension protocol version")
   return extensionProtocolVersion
 }

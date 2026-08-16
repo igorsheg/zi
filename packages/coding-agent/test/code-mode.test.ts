@@ -102,6 +102,12 @@ test("new Zi sessions expose direct coding tools and code by default", async () 
       "task_output",
       "kill_task",
       "update_plan",
+      "spawn_agent",
+      "send_message",
+      "followup_task",
+      "wait_agent",
+      "list_agents",
+      "interrupt_agent",
       "code"
     ])
   } finally {

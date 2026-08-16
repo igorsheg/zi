@@ -5,6 +5,9 @@ import { InvariantRegistry, type InvariantRegistryOptions } from "@with-zi/invar
 
 import { AgentSessionInvariant } from "./agent-session-invariant.js"
 import { AgentSession, type SessionReloadDeps } from "./agent-session.js"
+import { AgentTeam, type CreateAgentTeamSession } from "./agent-team/agent-team.js"
+import { rootAgentPath, type AgentPath } from "./agent-team/path.js"
+import { createAgentTeamRoot } from "./agent-team/session.js"
 import { Authentication } from "./authentication.js"
 import type { CodeMode } from "./code-mode/code-mode.js"
 import { isCodeModeDetails } from "./code-mode/trace.js"
@@ -23,9 +26,7 @@ import { createSessionResources, type ResourceLoader, type SessionResources } fr
 import type { SessionManager, SessionModel } from "./session-manager.js"
 import type { SessionShell } from "./session-shell.js"
 import type { SettingsManager } from "./settings-manager.js"
-import type { CreateSubagentChildSession } from "./subagents/child.js"
 import { createPeerTools, type PeerRelay } from "./subagents/peer.js"
-import { SubagentSupervisor } from "./subagents/supervisor.js"
 import { buildSystemPrompt } from "./system-prompt.js"
 import { snapshotToolSurface, type ToolSurface } from "./tool-surface.js"
 import { isBuiltInToolError } from "./tools/index.js"
@@ -83,11 +84,15 @@ export interface CreateAgentSessionOptions {
   readonly codeMode?: CodeMode
   readonly project?: ProjectConfigurationAdmission
   readonly extensionPaths?: readonly string[]
-  readonly createSubagentChildSession?: CreateSubagentChildSession
+  readonly agentTeam?: AgentTeamMembership
   readonly peerRelay?: PeerRelay
   readonly toolSurface?: ToolSurface
   readonly invariants?: InvariantRegistryOptions
 }
+
+export type AgentTeamMembership =
+  | { readonly type: "root"; readonly createChildSession: CreateAgentTeamSession }
+  | { readonly type: "member"; readonly team: AgentTeam; readonly path: AgentPath }
 
 export type AgentSessionProcessTree =
   | { readonly type: "owned"; readonly tracker: ProcessTreeTracker }
@@ -133,34 +138,37 @@ export async function createAgentSessionWithProcessTreeTracker(
   const thinkingLevel = model ? clampThinkingLevel(model, preferredThinking) : "off"
   const bootstrapDiagnostic = createBootstrapDiagnostic(unavailableSessionModel, model)
   let session: AgentSession | undefined
+  let ownedTeam: AgentTeam | undefined
   if (options.tools.some(tool => tool.name === "update_plan")) {
     throw new Error("The tool name update_plan is reserved for the native work plan")
   }
-  if (options.tools.some(tool => tool.name === "list_peer_subagents" || tool.name === "send_peer_message")) {
-    throw new Error("Peer tool names are reserved for the parent-owned relay")
+  const reservedAgentTools = new Set([
+    "spawn_agent",
+    "send_message",
+    "followup_task",
+    "wait_agent",
+    "list_agents",
+    "interrupt_agent"
+  ])
+  if (options.tools.some(tool => reservedAgentTools.has(tool.name))) {
+    throw new Error("Agent collaboration tool names are reserved for AgentTeam")
   }
+  const membership = options.agentTeam
+  const team =
+    membership?.type === "root"
+      ? await AgentTeam.create({
+          paths: services.paths,
+          rootSessionManager: sessionManager,
+          createSession: membership.createChildSession,
+          turnTimeoutMs: settings.subagentWorkTimeoutMs,
+          shutdownTimeoutMs: 9_000
+        })
+      : membership?.team
+  if (membership?.type === "root") ownedTeam = team
+  const agentPath = membership?.type === "member" ? membership.path : rootAgentPath
   const workPlan = new WorkPlan(sessionManager)
   const peerTools = options.peerRelay ? createPeerTools(options.peerRelay) : []
   const sessionTools = Object.freeze([...options.tools, ...peerTools, createUpdatePlanTool(workPlan)])
-  const subagents = options.createSubagentChildSession
-    ? new SubagentSupervisor({
-        createChildSession: options.createSubagentChildSession,
-        selection: () => {
-          const selected = session?.model ?? model
-          if (!selected) throw new Error("No model selected. Use /login, then /model.")
-          return {
-            model: `${selected.provider}/${selected.id}`,
-            thinkingLevel: session?.thinkingLevel ?? thinkingLevel,
-            ...(options.apiKey ? { apiKey: options.apiKey } : {})
-          }
-        },
-        sessionManager,
-        invariantRegistry,
-        waitTimeoutMs: settings.subagentWaitTimeoutMs,
-        workTimeoutMs: settings.subagentWorkTimeoutMs,
-        toolSurface: toolSurface ?? "direct-and-code"
-      })
-    : undefined
   const agent = new Agent({
     initialState: {
       systemPrompt: buildSystemPrompt(sessionManager.header.cwd, resources, sessionTools, toolSurface),
@@ -229,7 +237,7 @@ export async function createAgentSessionWithProcessTreeTracker(
       reload,
       invariantRegistry,
       agentSessionInvariant,
-      ...(subagents ? { subagentSupervisor: subagents } : {}),
+      ...(team ? { agentTeam: { team, path: agentPath, owned: ownedTeam === team } } : {}),
       ...(options.codeMode ? { codeMode: options.codeMode } : {}),
       ...(options.extensionHost ? { extensionHost: options.extensionHost } : {}),
       extensionContext: createExtensionContext(options.extensionMode ?? "embedded", services, sessionManager),
@@ -239,9 +247,19 @@ export async function createAgentSessionWithProcessTreeTracker(
       ...(model ? { model } : {}),
       ...(options.apiKey && model ? { apiKeyProvider: model.provider } : {})
     })
+    if (ownedTeam) await ownedTeam.bindRoot(createAgentTeamRoot(session))
   } catch (cause) {
-    agentSessionInvariant.dispose()
-    invariantRegistry.dispose()
+    if (session) {
+      session.dispose()
+      await session.waitForIdle()
+    } else if (ownedTeam) {
+      await ownedTeam.shutdown().catch(() => {})
+      agentSessionInvariant.dispose()
+      invariantRegistry.dispose()
+    } else {
+      agentSessionInvariant.dispose()
+      invariantRegistry.dispose()
+    }
     throw cause
   }
   return Object.freeze({ session, ...(bootstrapDiagnostic ? { bootstrapDiagnostic } : {}) })

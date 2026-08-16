@@ -1,10 +1,10 @@
+import { projectAgentTeam } from "./agent-team.js"
 import { projectBash } from "./bash.js"
 import { projectCodeTool } from "./code.js"
 import { projectEdit } from "./edit.js"
 import { projectGeneric } from "./generic.js"
 import { projectRead } from "./read.js"
 import { projectKillTask, projectListTasks, projectTaskOutput } from "./shell-task.js"
-import { projectSubagent } from "./subagent.js"
 import type { ToolPresentation, ToolPresentationSource } from "./types.js"
 import { projectWorkPlan } from "./work-plan.js"
 import { projectWrite } from "./write.js"
@@ -39,17 +39,13 @@ export function projectToolPresentation(source: ToolPresentationSource): ToolPre
     case "update_plan":
       presentation = projectWorkPlan(source)
       break
-    case "list_subagent_profiles":
-    case "spawn_subagent":
-    case "send_subagent":
-    case "send_subagent_message":
-    case "continue_subagent":
-    case "assign_subagent_task":
-    case "wait_subagents":
-    case "interrupt_subagent":
-    case "close_subagent":
-    case "list_subagents":
-      presentation = projectSubagent(source)
+    case "spawn_agent":
+    case "send_message":
+    case "followup_task":
+    case "wait_agent":
+    case "list_agents":
+    case "interrupt_agent":
+      presentation = projectAgentTeam(source)
       break
     default:
       break

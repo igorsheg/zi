@@ -687,7 +687,7 @@ test("subagent protocol bounds profiles, operations, snapshots, and cancellation
   ).toMatchObject({ subagents: [{ name: "finder" }] })
   expect(() =>
     validateWorkerMessage({
-      type: "subagent_spawn",
+      type: "agent_spawn",
       generation: 1,
       requestId: 2,
       extensionId: source.id,
@@ -698,7 +698,7 @@ test("subagent protocol bounds profiles, operations, snapshots, and cancellation
   ).toThrow(`${maxExtensionSubagentNameBytes}`)
   expect(
     validateWorkerMessage({
-      type: "subagent_wait",
+      type: "agent_wait",
       generation: 1,
       requestId: 2,
       extensionId: source.id,
@@ -706,10 +706,10 @@ test("subagent protocol bounds profiles, operations, snapshots, and cancellation
       names: ["finder-1"],
       timeoutMs: 1_000
     })
-  ).toMatchObject({ type: "subagent_wait", ownerRequestId: 7, timeoutMs: 1_000 })
+  ).toMatchObject({ type: "agent_wait", ownerRequestId: 7, timeoutMs: 1_000 })
   expect(() =>
     validateWorkerMessage({
-      type: "subagent_wait",
+      type: "agent_wait",
       generation: 1,
       requestId: 2,
       extensionId: source.id,
@@ -719,16 +719,16 @@ test("subagent protocol bounds profiles, operations, snapshots, and cancellation
   ).toThrow("owner request")
   expect(
     validateWorkerMessage({
-      type: "subagent_operation_cancel",
+      type: "agent_operation_cancel",
       generation: 1,
       requestId: 2,
       extensionId: source.id,
       targetRequestId: 2
     })
-  ).toMatchObject({ type: "subagent_operation_cancel", targetRequestId: 2 })
+  ).toMatchObject({ type: "agent_operation_cancel", targetRequestId: 2 })
   expect(
     validateHostMessage({
-      type: "subagent_interrupt_result",
+      type: "agent_interrupt_result",
       generation: 1,
       requestId: 2,
       settlement: {
@@ -751,7 +751,7 @@ test("subagent protocol bounds profiles, operations, snapshots, and cancellation
       }
     })
   ).toMatchObject({
-    type: "subagent_interrupt_result",
+    type: "agent_interrupt_result",
     settlement: {
       result: "interrupted",
       snapshot: { capturedWorkCycle: 1, completion: { workCycle: 1, status: "cancelled" } }
@@ -759,7 +759,7 @@ test("subagent protocol bounds profiles, operations, snapshots, and cancellation
   })
   expect(
     validateHostMessage({
-      type: "subagent_wait_result",
+      type: "agent_wait_result",
       generation: 1,
       requestId: 2,
       snapshots: [
@@ -784,7 +784,7 @@ test("subagent protocol bounds profiles, operations, snapshots, and cancellation
       ]
     })
   ).toMatchObject({
-    type: "subagent_wait_result",
+    type: "agent_wait_result",
     snapshots: [
       {
         name: "finder-1",

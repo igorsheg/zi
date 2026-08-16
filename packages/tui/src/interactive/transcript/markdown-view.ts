@@ -298,7 +298,7 @@ function blockKind(node: MarkdownNode): BlockKind {
 
 function blockSpec(node: MarkdownNode, syntaxStyle: SyntaxStyle): BodySpec {
   if (typeof node === "string") {
-    return { kind: "text", content: new StyledText(inlineChunks([node], syntaxStyle, plainFormat)) }
+    return { kind: "text", content: new StyledText([styledChunk(node, syntaxStyle, [], false)]) }
   }
   const [tag, attributes, ...children] = node
   if (tag === null) return { kind: "text", content: new StyledText([]) }
@@ -360,7 +360,7 @@ function inlineChunks(nodes: readonly MarkdownNode[], syntaxStyle: SyntaxStyle, 
   const chunks: TextChunk[] = []
   for (const node of nodes) {
     if (typeof node === "string") {
-      chunks.push(styledChunk(node, syntaxStyle, format.styles, format.strikethrough, format.href))
+      chunks.push(styledChunk(softBreaks(node), syntaxStyle, format.styles, format.strikethrough, format.href))
       continue
     }
     const [tag, attributes, ...children] = node
@@ -421,6 +421,10 @@ function addStyle(format: InlineFormat, style: string): InlineFormat {
   return { ...format, styles: [...format.styles, style] }
 }
 
+function softBreaks(text: string): string {
+  return text.replaceAll("\n", " ")
+}
+
 function styledChunk(
   text: string,
   syntaxStyle: SyntaxStyle,
@@ -455,7 +459,7 @@ function blockTextChunks(
     if (typeof node !== "string" && (node[0] === "ul" || node[0] === "ol")) {
       appendList(node, 0, chunks, syntaxStyle, styles)
     } else if (typeof node === "string") {
-      chunks.push(styledChunk(node, syntaxStyle, styles, false))
+      chunks.push(styledChunk(softBreaks(node), syntaxStyle, styles, false))
     } else {
       chunks.push(...inlineChunks(elementChildren(node), syntaxStyle, { styles, strikethrough: false }))
     }
@@ -509,7 +513,7 @@ function appendList(
         chunks.push(plainChunk("\n"))
         appendList(child, depth + 1, chunks, syntaxStyle, inheritedStyles)
       } else {
-        if (hasContent) chunks.push(plainChunk(`\n${"  ".repeat(depth + 1)}`))
+        if (hasContent && isListItemBlock(child)) chunks.push(plainChunk(`\n${"  ".repeat(depth + 1)}`))
         const content = hasTag(child, "p") ? elementChildren(child) : [child]
         chunks.push(...inlineChunks(content, syntaxStyle, { styles: inheritedStyles, strikethrough: false }))
       }
@@ -558,6 +562,10 @@ function elementChildren([_tag, _attributes, ...children]: MarkdownElement): Mar
 
 function hasTag(node: MarkdownNode, tag: string): node is MarkdownElement {
   return typeof node !== "string" && node[0] === tag
+}
+
+function isListItemBlock(node: MarkdownNode): boolean {
+  return typeof node !== "string" && (blockKind(node) !== "text" || node[1].block === true)
 }
 
 function textContent(nodes: readonly MarkdownNode[]): string {

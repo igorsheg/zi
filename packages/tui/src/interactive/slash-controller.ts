@@ -213,8 +213,6 @@ function builtinIntent(name: BuiltinSlashCommandName, args: string): Interactive
       return { type: "new_session" }
     case "resume":
       return { type: "resume_session" }
-    case "agent":
-      return { type: "subagents" }
     default:
       return assertNever(name)
   }

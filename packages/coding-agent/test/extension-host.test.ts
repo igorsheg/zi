@@ -364,7 +364,7 @@ test("subagent waits are bounded by their owning extension invocation", async ()
   if (!owner || owner.type !== "tool_invoke") throw new Error("Expected a tool invocation")
 
   worker.send({
-    type: "subagent_wait",
+    type: "agent_wait",
     generation: 1,
     requestId: 41,
     extensionId: sourceOne.id,
@@ -376,7 +376,7 @@ test("subagent waits are bounded by their owning extension invocation", async ()
   expect(worker.messages).toContainEqual(expect.objectContaining({ type: "session_operation_error", requestId: 41 }))
 
   worker.send({
-    type: "subagent_wait",
+    type: "agent_wait",
     generation: 1,
     requestId: 42,
     extensionId: sourceOne.id,
@@ -389,7 +389,7 @@ test("subagent waits are bounded by their owning extension invocation", async ()
   expect(worker.messages).toContainEqual(expect.objectContaining({ type: "session_operation_error", requestId: 42 }))
 
   worker.send({
-    type: "subagent_wait",
+    type: "agent_wait",
     generation: 1,
     requestId: 43,
     extensionId: sourceOne.id,
@@ -405,7 +405,7 @@ test("subagent waits are bounded by their owning extension invocation", async ()
   expect(abortedWaits).toBe(1)
 
   worker.send({
-    type: "subagent_wait",
+    type: "agent_wait",
     generation: 1,
     requestId: 44,
     extensionId: sourceOne.id,
@@ -427,7 +427,7 @@ test("subagent waits are bounded by their owning extension invocation", async ()
     throw new Error("Expected a completing tool invocation")
   }
   worker.send({
-    type: "subagent_wait",
+    type: "agent_wait",
     generation: 1,
     requestId: 45,
     extensionId: sourceOne.id,

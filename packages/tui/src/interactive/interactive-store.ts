@@ -262,6 +262,7 @@ export function transitionInteractiveState(state: InteractiveState, event: Agent
     case "follow_up_mode_changed":
     case "shell_task_changed":
     case "subagent_changed":
+    case "agent_changed":
     case "work_plan_changed":
       promptRevision++
       break

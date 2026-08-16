@@ -261,13 +261,15 @@ export type ExtensionToolDefinition<
 
 export type ExtensionThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
 
-export interface ExtensionSubagentProfile {
+export interface ExtensionAgentRole {
   readonly name: string
   readonly description: string
   readonly instructions: string
   readonly model?: string
   readonly thinking?: ExtensionThinkingLevel
 }
+
+export type ExtensionSubagentProfile = ExtensionAgentRole
 
 export type ExtensionSubagentLifecycle = "idle" | "queued" | "running" | "interrupting" | "closing" | "exited"
 
@@ -314,8 +316,32 @@ export interface ExtensionSubagentAPI {
   list(): Promise<readonly ExtensionSubagentSnapshot[]>
 }
 
+export interface ExtensionAgentSnapshot {
+  readonly path: string
+  readonly parentPath: string
+  readonly taskName: string
+  readonly sessionId?: string
+  readonly residency: "unloaded" | "loading" | "resident"
+  readonly turn: "idle" | "starting" | "running" | "interrupting"
+  readonly turnNumber: number
+  readonly status: "not_started" | "completed" | "interrupted" | "failed"
+}
+
+export interface ExtensionAgentAPI {
+  spawn(
+    taskName: string,
+    message: string,
+    options?: { readonly agentType?: string; readonly forkTurns?: "all" }
+  ): Promise<string>
+  send(target: string, message: string): Promise<void>
+  followup(target: string, message: string): Promise<"started" | "joined">
+  wait(timeoutMs?: number, signal?: AbortSignal): Promise<readonly ExtensionAgentSnapshot[]>
+  list(pathPrefix?: string): Promise<readonly ExtensionAgentSnapshot[]>
+  interrupt(target: string): Promise<"interrupted" | "idle">
+}
+
 export interface ExtensionAPI {
-  readonly subagents?: ExtensionSubagentAPI
+  readonly agents?: ExtensionAgentAPI
   on(
     event: "session_start",
     handler: (event: ExtensionStartEvent, context: ExtensionContext) => void | Promise<void>
@@ -338,7 +364,7 @@ export interface ExtensionAPI {
   ): void
   getActiveTools(): Promise<readonly string[]>
   setActiveTools(names: readonly string[]): Promise<void>
-  registerSubagentProfile(profile: ExtensionSubagentProfile): void
+  registerAgentRole(role: ExtensionAgentRole): void
   getSessionEntries(customType: string): Promise<readonly ExtensionCustomEntry[]>
   appendEntry(customType: string, data?: JsonValue): Promise<ExtensionCustomEntry>
   sendMessage(message: ExtensionCustomMessage, delivery: ExtensionMessageDelivery): Promise<void>

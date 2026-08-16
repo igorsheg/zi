@@ -1902,53 +1902,6 @@ test("source bodies keep semantic starting line numbers in the lightweight panel
   }
 })
 
-test("subagent rows stay concise until details are requested", async () => {
-  const setup = await createTestRenderer({ width: 72, height: 12, useThread: false })
-  const projected = projectToolPresentation({
-    status: "done",
-    name: "spawn_subagent",
-    args: { profile: "reviewer", name: "shutdown-reviewer", prompt: "Review shutdown behavior" },
-    result: {
-      content: [{ type: "text", text: JSON.stringify({ name: "shutdown-reviewer", profile: "reviewer" }) }],
-      details: {
-        type: "subagent",
-        outcome: "success",
-        operation: "spawn",
-        profile: "reviewer",
-        agent: { name: "shutdown-reviewer", lifecycle: "running", workCycle: 1 }
-      }
-    }
-  })
-  const view = new ToolCallView(
-    setup.renderer,
-    "spawn-agent",
-    frame("done", projected),
-    defaultTheme,
-    syntaxStyle,
-    "/work",
-    "Ctrl+O"
-  )
-  setup.renderer.root.add(view.root)
-
-  try {
-    await setup.renderOnce()
-    const compact = setup.captureCharFrame()
-    expect(compact).toContain("◆ Spawn Shutdown reviewer · Review shutdown behavior")
-    expect(compact).not.toContain('"profile"')
-    expect(compact).not.toContain("│ Review shutdown behavior")
-    expect(compact).not.toContain("spawn_subagent")
-
-    view.setExpanded(true)
-    await setup.renderOnce()
-    const detailed = setup.captureCharFrame()
-    expect(detailed).toContain("│ Review shutdown behavior")
-    expect(detailed).toContain("╰───")
-  } finally {
-    view.destroy()
-    setup.renderer.destroy()
-  }
-})
-
 function expectMiddleTruncatedPath(row: string, label: string, path: string): void {
   const prefix = `${label} `
   expect(row.startsWith(prefix)).toBe(true)

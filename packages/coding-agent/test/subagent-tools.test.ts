@@ -17,7 +17,6 @@ import {
   projectSubagentToolAgents
 } from "../src/subagents/tool-details.js"
 import { createSubagentTools, maxSubagentToolResultBytes } from "../src/subagents/tools.js"
-import { projectToolPresentation } from "../src/tools/presentation/project.js"
 import { createTestChildSessionFactory } from "./subagent-harness.js"
 const pathfinderProfile = Object.freeze({
   name: "pathfinder",
@@ -291,7 +290,7 @@ test("wait projects the oldest pending completion before active work", async () 
   }
 }, 15_000)
 
-test("profile and wait projections remain bounded", async () => {
+test("profile and wait details remain bounded", async () => {
   const taskAgents = projectSubagentToolAgents(
     Array.from({ length: 36 }, (_, index) => ({
       name: `task-${index}`,
@@ -329,14 +328,6 @@ test("profile and wait projections remain bounded", async () => {
     expect(JSON.parse(text).omitted_bytes).toBeGreaterThan(0)
     expect(Buffer.byteLength(JSON.stringify(waited.details))).toBeLessThanOrEqual(maxSubagentToolDetailsBytes)
     expect(isSubagentToolDetails(waited.details)).toBe(true)
-    const presentation = projectToolPresentation({
-      status: "done",
-      name: "wait_subagents",
-      args: { names: ["first", "second"] },
-      result: waited
-    })
-    expect(presentation.body?.text).toContain("First output:")
-    expect(presentation.body?.text).toContain("Second output:")
   } finally {
     await harness.dispose()
   }

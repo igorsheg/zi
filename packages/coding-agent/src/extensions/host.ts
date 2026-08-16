@@ -285,14 +285,14 @@ type ExtensionSessionRequestOutcome =
   | { readonly type: "custom_entry_result"; readonly entry: ExtensionCustomEntry }
   | { readonly type: "custom_message_result" }
   | { readonly type: "active_tools_result"; readonly names: readonly string[] }
-  | { readonly type: "subagent_profiles_result"; readonly profiles: readonly ExtensionSubagentProfile[] }
-  | { readonly type: "subagent_spawn_result"; readonly name: string }
-  | { readonly type: "subagent_send_result" }
-  | { readonly type: "subagent_continue_result"; readonly delivery: "started_turn" | "follow_up" }
-  | { readonly type: "subagent_wait_result"; readonly snapshots: readonly ExtensionSubagentSnapshot[] }
-  | { readonly type: "subagent_interrupt_result"; readonly settlement: ExtensionSubagentInterruptSettlement }
-  | { readonly type: "subagent_close_result"; readonly snapshot: ExtensionSubagentSnapshot }
-  | { readonly type: "subagent_list_result"; readonly snapshots: readonly ExtensionSubagentSnapshot[] }
+  | { readonly type: "agent_roles_result"; readonly profiles: readonly ExtensionSubagentProfile[] }
+  | { readonly type: "agent_spawn_result"; readonly name: string }
+  | { readonly type: "agent_send_result" }
+  | { readonly type: "agent_followup_result"; readonly delivery: "started_turn" | "follow_up" }
+  | { readonly type: "agent_wait_result"; readonly snapshots: readonly ExtensionSubagentSnapshot[] }
+  | { readonly type: "agent_interrupt_result"; readonly settlement: ExtensionSubagentInterruptSettlement }
+  | { readonly type: "agent_close_result"; readonly snapshot: ExtensionSubagentSnapshot }
+  | { readonly type: "agent_list_result"; readonly snapshots: readonly ExtensionSubagentSnapshot[] }
   | { readonly type: "session_operation_error"; readonly message: string }
 
 type ProcessStatus = { readonly type: "running" } | { readonly type: "exited"; readonly exit: ExtensionWorkerExit }
@@ -883,17 +883,17 @@ class ExtensionGeneration {
       case "custom_message_send":
       case "active_tools_get":
       case "active_tools_set":
-      case "subagent_profiles_get":
-      case "subagent_spawn":
-      case "subagent_send":
-      case "subagent_continue":
-      case "subagent_wait":
-      case "subagent_interrupt":
-      case "subagent_close":
-      case "subagent_list":
+      case "agent_roles_get":
+      case "agent_spawn":
+      case "agent_send":
+      case "agent_followup":
+      case "agent_wait":
+      case "agent_interrupt":
+      case "agent_close":
+      case "agent_list":
         this.#respondToSessionRequest(message)
         return
-      case "subagent_operation_cancel": {
+      case "agent_operation_cancel": {
         const operation = this.#sessionOperations.get(message.targetRequestId)
         if (operation?.extensionId === message.extensionId) operation.controller.abort()
         return
@@ -1034,7 +1034,7 @@ class ExtensionGeneration {
     const controller = new AbortController()
     this.#sessionOperations.set(request.requestId, {
       extensionId: request.extensionId,
-      ...(request.type === "subagent_wait" && request.ownerRequestId !== undefined
+      ...(request.type === "agent_wait" && request.ownerRequestId !== undefined
         ? { ownerRequestId: request.ownerRequestId }
         : {}),
       controller
@@ -1813,7 +1813,7 @@ export class ExtensionHost {
     }
     if (
       phase === "state_only" &&
-      (request.type === "subagent_spawn" || request.type === "subagent_send" || request.type === "subagent_continue")
+      (request.type === "agent_spawn" || request.type === "agent_send" || request.type === "agent_followup")
     ) {
       return { type: "session_operation_error", message: "New subagent work is closed during extension shutdown" }
     }
@@ -1838,13 +1838,13 @@ export class ExtensionHost {
         case "active_tools_set":
           operations.setActiveTools(request.extensionId, request.names)
           return { type: "active_tools_result", names: operations.getActiveTools(request.extensionId) }
-        case "subagent_profiles_get":
+        case "agent_roles_get":
           if (!operations.subagents) throw new Error("Subagent session operations are not bound")
-          return { type: "subagent_profiles_result", profiles: operations.subagents.listProfiles(request.extensionId) }
-        case "subagent_spawn":
+          return { type: "agent_roles_result", profiles: operations.subagents.listProfiles(request.extensionId) }
+        case "agent_spawn":
           if (!operations.subagents) throw new Error("Subagent session operations are not bound")
           return {
-            type: "subagent_spawn_result",
+            type: "agent_spawn_result",
             name: await operations.subagents.spawn(
               request.extensionId,
               request.profile,
@@ -1853,17 +1853,17 @@ export class ExtensionHost {
               signal
             )
           }
-        case "subagent_send":
+        case "agent_send":
           if (!operations.subagents) throw new Error("Subagent session operations are not bound")
           await operations.subagents.send(request.extensionId, request.name, request.text)
-          return { type: "subagent_send_result" }
-        case "subagent_continue":
+          return { type: "agent_send_result" }
+        case "agent_followup":
           if (!operations.subagents) throw new Error("Subagent session operations are not bound")
           return {
-            type: "subagent_continue_result",
+            type: "agent_followup_result",
             delivery: await operations.subagents.continue(request.extensionId, request.name, request.text)
           }
-        case "subagent_wait": {
+        case "agent_wait": {
           if (!operations.subagents) throw new Error("Subagent session operations are not bound")
           const timeoutMs = generation.admitSubagentWait(
             request.extensionId,
@@ -1872,25 +1872,25 @@ export class ExtensionHost {
             operations.subagents.waitTimeoutMs
           )
           return {
-            type: "subagent_wait_result",
+            type: "agent_wait_result",
             snapshots: await operations.subagents.wait(request.extensionId, request.names, timeoutMs, signal)
           }
         }
-        case "subagent_interrupt":
+        case "agent_interrupt":
           if (!operations.subagents) throw new Error("Subagent session operations are not bound")
           return {
-            type: "subagent_interrupt_result",
+            type: "agent_interrupt_result",
             settlement: await operations.subagents.interrupt(request.extensionId, request.name)
           }
-        case "subagent_close":
+        case "agent_close":
           if (!operations.subagents) throw new Error("Subagent session operations are not bound")
           return {
-            type: "subagent_close_result",
+            type: "agent_close_result",
             snapshot: await operations.subagents.close(request.extensionId, request.name)
           }
-        case "subagent_list":
+        case "agent_list":
           if (!operations.subagents) throw new Error("Subagent session operations are not bound")
-          return { type: "subagent_list_result", snapshots: operations.subagents.list(request.extensionId) }
+          return { type: "agent_list_result", snapshots: operations.subagents.list(request.extensionId) }
         default:
           return assertNever(request)
       }

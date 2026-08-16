@@ -7,7 +7,7 @@ import type {
   ContextUsage
 } from "../agent-session.js"
 import type { AgentMessage } from "../messages.js"
-import type { CustomEntry, CustomMessageEntry, SessionEntry } from "../session-manager.js"
+import type { AgentTeamEntry, CustomEntry, CustomMessageEntry, SessionEntry } from "../session-manager.js"
 import {
   decodeRpcRequest,
   maxRpcCompletionErrorBytes,
@@ -94,6 +94,7 @@ export type RpcSessionEntry =
   | Extract<SessionEntry, { readonly type: "thinking_level_change" }>
   | Extract<SessionEntry, { readonly type: "retry" }>
   | Extract<SessionEntry, { readonly type: "compaction" }>
+  | AgentTeamEntry
   | Extract<SessionEntry, { readonly type: "subagent" }>
   | Extract<SessionEntry, { readonly type: "subagent_work_result" }>
   | Extract<SessionEntry, { readonly type: "background_task_result" }>

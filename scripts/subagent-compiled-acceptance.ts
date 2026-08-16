@@ -12,15 +12,13 @@ import { SessionManager } from "../packages/coding-agent/src/session-manager.js"
 const acceptanceText = "Profile-driven subagent acceptance passed."
 const acceptanceApiKey = "compiled-subagent-private-key"
 const requestLimitBytes = 8 * 1024 * 1024
-const subagentToolNames = Object.freeze([
-  "list_subagent_profiles",
-  "spawn_subagent",
-  "send_subagent_message",
-  "assign_subagent_task",
-  "wait_subagents",
-  "interrupt_subagent",
-  "close_subagent",
-  "list_subagents"
+const agentToolNames = Object.freeze([
+  "spawn_agent",
+  "send_message",
+  "followup_task",
+  "wait_agent",
+  "list_agents",
+  "interrupt_agent"
 ])
 
 type Mode = "close" | "crash" | "dispose"
@@ -167,9 +165,7 @@ class SubagentProvider {
   #descendantStarted = false
   #childInitialReplySent = false
   #childProviderRequests = 0
-  #resultProbeId: string | undefined
   #resultProbeCount = 0
-  #initialCompletionDelivered = false
   #restorationOccurrences: number | undefined
   #name: string | undefined
   #parentPhase = "starting"
@@ -223,7 +219,7 @@ class SubagentProvider {
       if (payloadText.includes(acceptanceApiKey)) throw new Error("Provider payload exposed the ephemeral API key")
       const payload = record(JSON.parse(payloadText), "provider payload")
       const tools = Array.isArray(payload.tools) ? payload.tools : []
-      const isParent = tools.some(tool => record(tool, "tool").name === "spawn_subagent")
+      const isParent = payload.model === "gpt-4.1"
       const expectedApiKey = isParent ? acceptanceApiKey : "subagent-acceptance"
       if (requestApiKey !== expectedApiKey) {
         throw new Error(`Provider ${isParent ? "parent" : "child"} request used the wrong API key`)
@@ -245,9 +241,9 @@ class SubagentProvider {
   ): Promise<Response> {
     this.#childProviderRequests++
     this.#childPhase = [...outputs.keys()].at(-1) ?? "initial"
-    for (const name of subagentToolNames) {
-      if (tools.some(tool => record(tool, "child tool").name === name)) {
-        throw new Error(`Compiled direct child unexpectedly exposed ${name}`)
+    for (const name of agentToolNames) {
+      if (!tools.some(tool => record(tool, "child tool").name === name)) {
+        throw new Error(`Compiled direct child omitted collaboration tool ${name}`)
       }
     }
 
@@ -315,35 +311,33 @@ class SubagentProvider {
 
   async #receiveParent(payloadText: string, outputs: ReadonlyMap<string, string>): Promise<Response> {
     this.#parentPhase = [...outputs.keys()].at(-1) ?? "initial"
+    const completionMarker = "Agent completion from /root/acceptance-worker:"
+    const completionOccurrences = payloadText.split(completionMarker).length - 1
+
     if (this.#restorationOccurrences !== undefined) {
-      const occurrences = payloadText.split("<subagent_completion>").length - 1
-      if (occurrences !== this.#restorationOccurrences) {
+      if (completionOccurrences !== this.#restorationOccurrences) {
         throw new Error(
-          `Compiled restoration retained ${occurrences} subagent completions instead of ${this.#restorationOccurrences}`
+          `Compiled restoration retained ${completionOccurrences} agent completions instead of ${this.#restorationOccurrences}`
         )
       }
       this.#restorationOccurrences = undefined
       this.#complete = true
       return eventStreamResponse(textEvents(acceptanceText, "restored"))
     }
-    const profileOutput = outputs.get("acceptance_profiles")
-    if (!profileOutput) {
-      return eventStreamResponse(toolEvents("list_subagent_profiles", "acceptance_profiles", {}))
-    }
-    assertProfileCatalog(profileOutput)
+
     const spawnOutput = outputs.get("acceptance_spawn")
     if (!spawnOutput) {
       return eventStreamResponse(
-        toolEvents("spawn_subagent", "acceptance_spawn", {
-          profile: "acceptance",
-          name: "acceptance-worker",
-          prompt: "Return one sentence."
+        toolEvents("spawn_agent", "acceptance_spawn", {
+          task_name: "acceptance-worker",
+          message: "Return one sentence.",
+          agent_type: "acceptance"
         })
       )
     }
-    const name = parseName(spawnOutput)
-    this.#name ??= name
-    if (this.#name !== name) throw new Error("Compiled parent changed the subagent name")
+    const path = parseAgentPathResult(spawnOutput)
+    this.#name ??= path
+    if (this.#name !== path) throw new Error("Compiled parent changed the agent path")
 
     if (this.#mode === "dispose") {
       await waitFor(
@@ -354,152 +348,27 @@ class SubagentProvider {
       this.#complete = true
       return eventStreamResponse(textEvents(acceptanceText, "dispose"))
     }
-    if (this.#mode === "crash") return await this.#receiveCrashParent(outputs, name)
-    return await this.#receiveCloseParent(payloadText, outputs, name)
-  }
 
-  async #receiveCloseParent(
-    payloadText: string,
-    outputs: ReadonlyMap<string, string>,
-    name: string
-  ): Promise<Response> {
-    const completionOccurrences = payloadText.split("<subagent_completion>").length - 1
-    if (completionOccurrences > 1) throw new Error("Compiled parent duplicated hidden subagent completion context")
+    if (completionOccurrences > 1) throw new Error("Compiled parent duplicated passive agent completion context")
     if (completionOccurrences === 1) {
-      if (!payloadText.includes("Compiled child completed.")) {
-        throw new Error("Compiled parent hidden completion omitted child evidence")
-      }
-      this.#initialCompletionDelivered = true
+      const expected =
+        this.#mode === "crash" ? "Compiled child survived its extension worker crash." : "Compiled child completed."
+      if (!payloadText.includes(expected)) throw new Error("Compiled passive completion omitted child evidence")
+      this.#complete = true
+      return eventStreamResponse(textEvents(acceptanceText, this.#mode))
     }
 
-    const initialWait = outputs.get("acceptance_wait_initial")
-    if (!initialWait && !this.#initialCompletionDelivered) {
-      if (this.#resultProbeId) {
-        const probeOutput = outputs.get(this.#resultProbeId)
-        if (!probeOutput) throw new Error(`Compiled parent omitted ${this.#resultProbeId} output`)
-        if (hasReadyCompletion(probeOutput)) {
-          if (payloadText.includes("Subagents completed:")) {
-            throw new Error("Compiled parent injected an unsolicited subagent completion message")
-          }
-          return eventStreamResponse(
-            toolEvents("wait_subagents", "acceptance_wait_initial", { names: [name], timeout_ms: 25_000 })
-          )
-        }
-      }
-      if (this.#resultProbeCount === 0) {
-        await waitFor(
-          () => this.#childInitialReplySent,
-          10_000,
-          "Compiled child did not finish its initial provider response before result probing"
-        )
-      }
-      if (++this.#resultProbeCount > 100) {
-        throw new Error(`Compiled completion did not become durable during result probe (${this.diagnostic()})`)
-      }
-      await Bun.sleep(100)
-      this.#resultProbeId = `acceptance_result_probe_${this.#resultProbeCount}`
-      return eventStreamResponse(toolEvents("list_subagents", this.#resultProbeId, {}))
+    await waitFor(
+      () => this.#childInitialReplySent,
+      10_000,
+      "Compiled child did not finish before completion observation"
+    )
+    if (++this.#resultProbeCount > 100) {
+      throw new Error(`Compiled completion did not become durable during revision wait (${this.diagnostic()})`)
     }
-    if (initialWait) assertWaitCompletion(initialWait, { status: "completed", text: "Compiled child completed." })
-
-    if (!outputs.has("acceptance_send_idle")) {
-      return eventStreamResponse(
-        toolEvents("send_subagent_message", "acceptance_send_idle", { name: name, text: "Queue this without waking." })
-      )
-    }
-    if (!outputs.has("acceptance_continue_second")) {
-      const childRequests = this.#childProviderRequests
-      await Bun.sleep(150)
-      if (this.#childProviderRequests !== childRequests || !this.#childInitialReplySent) {
-        throw new Error("Compiled queue-only send woke an idle child")
-      }
-      return eventStreamResponse(
-        toolEvents("assign_subagent_task", "acceptance_continue_second", {
-          name: name,
-          text: "Complete the second cycle."
-        })
-      )
-    }
-    if (!outputs.has("acceptance_wait_second")) {
-      return eventStreamResponse(toolEvents("wait_subagents", "acceptance_wait_second", { timeout_ms: 25_000 }))
-    }
-    assertWaitCompletion(outputs.get("acceptance_wait_second")!, {
-      status: "completed",
-      text: "Compiled second cycle completed."
-    })
-
-    if (!outputs.has("acceptance_continue_interrupt")) {
-      return eventStreamResponse(
-        toolEvents("assign_subagent_task", "acceptance_continue_interrupt", {
-          name: name,
-          text: "Interrupt the active third cycle."
-        })
-      )
-    }
-    if (!outputs.has("acceptance_interrupt")) {
-      await waitFor(
-        () => markerExists(`${this.#markerPath}.tool`),
-        5_000,
-        "Compiled child extension tool did not start before interruption"
-      )
-      return eventStreamResponse(toolEvents("interrupt_subagent", "acceptance_interrupt", { name: name }))
-    }
-    assertInterruptResult(outputs.get("acceptance_interrupt")!, "interrupted")
-
-    if (!outputs.has("acceptance_continue_reuse")) {
-      return eventStreamResponse(
-        toolEvents("assign_subagent_task", "acceptance_continue_reuse", {
-          name: name,
-          text: "Reuse after active interruption."
-        })
-      )
-    }
-    if (!outputs.has("acceptance_wait_reuse")) {
-      return eventStreamResponse(
-        toolEvents("wait_subagents", "acceptance_wait_reuse", { names: [name], timeout_ms: 25_000 })
-      )
-    }
-    assertWaitCompletion(outputs.get("acceptance_wait_reuse")!, { status: "completed", text: "Compiled child reused." })
-
-    if (!outputs.has("acceptance_close")) {
-      return eventStreamResponse(toolEvents("close_subagent", "acceptance_close", { name }))
-    }
-    const close = record(JSON.parse(outputs.get("acceptance_close")!), "close result")
-    if (close.previous_status !== "idle") {
-      throw new Error(`Compiled close result omitted its previous state: ${outputs.get("acceptance_close")}`)
-    }
-    assertWaitCompletion(outputs.get("acceptance_close")!, { status: "completed", text: "Compiled child reused." })
-    this.#complete = true
-    return eventStreamResponse(textEvents(acceptanceText, "close"))
-  }
-
-  async #receiveCrashParent(outputs: ReadonlyMap<string, string>, name: string): Promise<Response> {
-    if (!outputs.has("acceptance_wait")) {
-      return eventStreamResponse(toolEvents("wait_subagents", "acceptance_wait", { names: [name], timeout_ms: 25_000 }))
-    }
-    assertWaitCompletion(outputs.get("acceptance_wait")!, {
-      status: "completed",
-      text: "Compiled child survived its extension worker crash."
-    })
-    if (!outputs.has("acceptance_list")) {
-      return eventStreamResponse(toolEvents("list_subagents", "acceptance_list", {}))
-    }
-    assertListedLifecycle(outputs.get("acceptance_list")!, name, "idle")
-    if (!outputs.has("acceptance_close_crashed_worker")) {
-      return eventStreamResponse(toolEvents("close_subagent", "acceptance_close_crashed_worker", { name }))
-    }
-    const close = record(JSON.parse(outputs.get("acceptance_close_crashed_worker")!), "crash close result")
-    if (close.previous_status !== "idle") {
-      throw new Error(
-        `Compiled crash close result omitted its previous state: ${outputs.get("acceptance_close_crashed_worker")}`
-      )
-    }
-    assertWaitCompletion(outputs.get("acceptance_close_crashed_worker")!, {
-      status: "completed",
-      text: "Compiled child survived its extension worker crash."
-    })
-    this.#complete = true
-    return eventStreamResponse(textEvents(acceptanceText, "crash"))
+    return eventStreamResponse(
+      toolEvents("wait_agent", `acceptance_wait_${this.#resultProbeCount}`, { timeout_ms: 1_000 })
+    )
   }
 }
 
@@ -510,20 +379,17 @@ const marker = process.env.ZI_SUBAGENT_ACCEPTANCE_MARKER
 if (!marker) throw new Error("missing subagent acceptance marker")
 
 const extension: ExtensionFactory = zi => {
-  if (zi.subagents) {
-    if (process.env.ZI_SUBAGENT_PROFILE_DECLARATION === "programmatic") {
-      zi.registerSubagentProfile({
-        name: "acceptance",
-        description: "Exercise the compiled profile-driven subagent system",
-        instructions: "Complete the acceptance task and return bounded evidence.",
-        model: "azure-openai-responses/gpt-5.4",
-        thinking: "high"
-      })
-    }
-    return
+  if (process.env.ZI_SUBAGENT_PROFILE_DECLARATION === "programmatic") {
+    zi.registerAgentRole({
+      name: "acceptance",
+      description: "Exercise the compiled profile-driven subagent system",
+      instructions: "Complete the acceptance task and return bounded evidence.",
+      model: "azure-openai-responses/gpt-5.4",
+      thinking: "high"
+    })
   }
   zi.on("session_start", async (_event, context) => {
-    if (context.mode !== "rpc") return
+    if (context.session.type !== "journal" || !/[\\\\/]agents[\\\\/]/.test(context.session.file)) return
     const apiKeyVisible = Object.values(process.env).includes(${JSON.stringify(acceptanceApiKey)})
     await Bun.write(marker, JSON.stringify({ agentPid: process.ppid, workerPid: process.pid, apiKeyVisible }))
   })
@@ -575,18 +441,11 @@ function functionOutputs(input: unknown): Map<string, string> {
   return outputs
 }
 
-function parseName(output: string): string {
-  const match = /"name"\s*:\s*"([^"]+)"/.exec(output)
-  if (!match?.[1]) throw new Error(`Spawn output omitted name: ${JSON.stringify(output)}`)
-  return match[1]
-}
-
-function assertProfileCatalog(output: string): void {
-  const result = record(JSON.parse(output), "profile catalog")
-  const profiles = Array.isArray(result.profiles) ? result.profiles : []
-  if (!profiles.some(profile => isRecord(profile) && profile.name === "acceptance")) {
-    throw new Error(`Compiled parent omitted the acceptance profile: ${JSON.stringify(output)}`)
-  }
+function parseAgentPathResult(output: string): string {
+  const result = record(JSON.parse(output), "spawn result")
+  const agent = record(result.agent, "spawned agent")
+  if (typeof agent.path !== "string") throw new Error(`Spawn output omitted agent path: ${JSON.stringify(output)}`)
+  return agent.path
 }
 
 function assertProviderSelection(payload: Record<string, unknown>, isParent: boolean): void {
@@ -602,45 +461,6 @@ function assertProviderSelection(payload: Record<string, unknown>, isParent: boo
   }
   const reasoning = record(payload.reasoning, "child reasoning")
   if (reasoning.effort !== "high") throw new Error("Compiled child did not select profile thinking high")
-}
-
-function assertWaitCompletion(output: string, expected: { readonly status: string; readonly text?: string }): void {
-  const result = record(JSON.parse(output), "wait result")
-  const agent = Array.isArray(result.subagents) ? result.subagents.find(isRecord) : undefined
-  const completion = agent && isRecord(agent.completion) ? agent.completion : undefined
-  if (
-    !agent ||
-    !completion ||
-    typeof completion.work_cycle !== "number" ||
-    !Number.isSafeInteger(completion.work_cycle) ||
-    completion.work_cycle <= 0 ||
-    completion.status !== expected.status ||
-    (expected.text !== undefined && completion.text !== expected.text)
-  ) {
-    throw new Error(`Compiled subagent wait did not return ${expected.status}: ${JSON.stringify(output)}`)
-  }
-}
-
-function assertListedLifecycle(output: string, name: string, lifecycle: string): void {
-  const result = record(JSON.parse(output), "list result")
-  const agents = Array.isArray(result.subagents) ? result.subagents : []
-  if (!agents.some(agent => isRecord(agent) && agent.name === name && agent.status === lifecycle)) {
-    throw new Error(`Compiled subagent list omitted ${name} in ${lifecycle}: ${JSON.stringify(output)}`)
-  }
-}
-
-function assertInterruptResult(output: string, expected: "interrupted" | "already_idle"): void {
-  const result = record(JSON.parse(output), "interrupt result")
-  if (result.result !== expected) {
-    throw new Error(`Compiled subagent interrupt returned ${JSON.stringify(output)} instead of ${expected}`)
-  }
-  assertWaitCompletion(output, { status: "cancelled" })
-}
-
-function hasReadyCompletion(output: string): boolean {
-  const result = record(JSON.parse(output), "list result")
-  if (!Array.isArray(result.subagents)) return false
-  return result.subagents.some(agent => isRecord(agent) && isRecord(agent.result_ready))
 }
 
 function toolEvents(name: string, callId: string, args: Record<string, unknown>): readonly Record<string, unknown>[] {
@@ -815,79 +635,30 @@ async function readBoundedRequest(request: Request): Promise<string> {
   return text
 }
 
-async function assertNativeJournal(agentDirectory: string, name: string, mode: Mode): Promise<void> {
+async function assertNativeJournal(agentDirectory: string, path: string, mode: Mode): Promise<void> {
   const directory = join(agentDirectory, "acceptance-sessions")
   const files = (await readdir(directory)).filter(file => file.endsWith(".jsonl"))
-  if (files.length !== 1) throw new Error(`Compiled ${mode} acceptance wrote ${files.length} parent journals`)
+  if (files.length !== 1) throw new Error(`Compiled ${mode} acceptance wrote ${files.length} root journals`)
   const journal = await readFile(join(directory, files[0]!), "utf8")
   if (journal.includes(acceptanceApiKey)) throw new Error(`Compiled ${mode} journal exposed the ephemeral API key`)
-  const lines = journal
+  const entries = journal
     .trim()
     .split("\n")
     .map((line, index) => record(JSON.parse(line), `journal line ${index + 1}`))
-  const entries = lines.filter(entry => entry.type === "subagent" && entry.name === name)
-  const results = lines.filter(entry => entry.type === "subagent_work_result")
 
-  assertJournalEntry(entries, { event: "starting", name: "acceptance-worker" }, mode)
-  assertJournalEntry(entries, { event: "ready" }, mode)
-  assertJournalEntry(entries, { event: "work_cycle_started", workCycle: 1 }, mode)
+  const reserved = entries.filter(entry => entry.type === "agent_spawn_reserved" && entry.path === path)
+  const committed = entries.filter(entry => entry.type === "agent_spawn_committed")
+  if (reserved.length !== 1 || committed.length !== 1) {
+    throw new Error(`Compiled ${mode} journal omitted one committed AgentTeam spawn`)
+  }
   if (mode === "dispose") return
 
-  assertSubagentResult(results, name, 1, "succeeded", mode)
-  assertJournalEntryCount(entries, { event: "work_cycle_delivered", workCycle: 1 }, 1, mode)
-  assertJournalEntry(entries, { event: "exited" }, mode)
-  if (mode === "crash") {
-    assertJournalEntry(entries, { event: "closing", reason: "close" }, mode)
-    return
-  }
-
-  assertJournalEntry(entries, { event: "work_cycle_started", workCycle: 2 }, mode)
-  assertSubagentResult(results, name, 2, "succeeded", mode)
-  assertJournalEntryCount(entries, { event: "work_cycle_delivered", workCycle: 2 }, 1, mode)
-  assertJournalEntry(entries, { event: "work_cycle_started", workCycle: 3 }, mode)
-  assertSubagentResult(results, name, 3, "cancelled", mode)
-  assertJournalEntryCount(entries, { event: "work_cycle_delivered", workCycle: 3 }, 1, mode)
-  assertJournalEntry(entries, { event: "work_cycle_started", workCycle: 4 }, mode)
-  assertSubagentResult(results, name, 4, "succeeded", mode)
-  assertJournalEntryCount(entries, { event: "work_cycle_delivered", workCycle: 4 }, 1, mode)
-  assertJournalEntry(entries, { event: "closing", reason: "close" }, mode)
-}
-
-function assertSubagentResult(
-  results: readonly Record<string, unknown>[],
-  name: string,
-  workCycle: number,
-  result: "succeeded" | "failed" | "cancelled",
-  mode: Mode
-): void {
-  const found = results.some(entry => entry.result === result && entry.name === name && entry.workCycle === workCycle)
-  if (!found) {
-    throw new Error(`Compiled ${mode} journal omitted ${result} work cycle ${workCycle}: ${JSON.stringify(results)}`)
-  }
-}
-
-function assertJournalEntryCount(
-  entries: readonly Record<string, unknown>[],
-  expected: Readonly<Record<string, unknown>>,
-  count: number,
-  mode: Mode
-): void {
-  const found = entries.filter(entry => Object.entries(expected).every(([key, value]) => entry[key] === value)).length
-  if (found !== count) {
+  const settled = entries.filter(entry => entry.type === "agent_turn_settled" && entry.path === path)
+  const delivered = entries.filter(entry => entry.type === "agent_completion_delivered" && entry.path === path)
+  if (settled.length !== 1 || delivered.length !== 1) {
     throw new Error(
-      `Compiled ${mode} journal contained ${found} copies of ${JSON.stringify(expected)} instead of ${count}`
+      `Compiled ${mode} journal retained settled=${settled.length} delivered=${delivered.length} instead of one each`
     )
-  }
-}
-
-function assertJournalEntry(
-  entries: readonly Record<string, unknown>[],
-  expected: Readonly<Record<string, unknown>>,
-  mode: Mode
-): void {
-  const found = entries.some(entry => Object.entries(expected).every(([key, value]) => entry[key] === value))
-  if (!found) {
-    throw new Error(`Compiled ${mode} journal omitted ${JSON.stringify(expected)}: ${JSON.stringify(entries)}`)
   }
 }
 
@@ -968,14 +739,6 @@ function terminateProcess(pid: number): void {
     process.kill(pid, "SIGKILL")
   } catch {
     // already dead
-  }
-}
-
-function markerExists(path: string): boolean {
-  try {
-    return readFileSync(path, "utf8") === "started"
-  } catch {
-    return false
   }
 }
 

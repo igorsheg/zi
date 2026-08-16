@@ -31,6 +31,17 @@ import type {
 import type { InvariantRegistry } from "@with-zi/invariants"
 
 import type { AgentSessionInvariant } from "./agent-session-invariant.js"
+import type { AgentSnapshot, AgentTeam } from "./agent-team/agent-team.js"
+import {
+  agentMailDeliveryId,
+  agentMailMessage,
+  isAgentMailEntry,
+  type AgentMailInput,
+  type AgentMailPublication
+} from "./agent-team/mail.js"
+import { resolveAgentPath, type AgentPath } from "./agent-team/path.js"
+import { createAgentTeamTools } from "./agent-team/tools.js"
+import { type AgentWaitActivity, resolveAgentWaitTimeout } from "./agent-team/wait.js"
 import type {
   Authentication,
   AuthenticationInteraction,
@@ -102,16 +113,7 @@ import type { SettingsError, SettingsManager, SettingsScope } from "./settings-m
 import type { BackgroundTaskResultInput } from "./shell-result.js"
 import { expandSkillCommand, type Skill } from "./skills.js"
 import { builtinSlashCommands, type SlashCommand } from "./slash-commands.js"
-import type { SubagentCompletion } from "./subagents/child.js"
-import {
-  durablePreviewBytes,
-  type SubagentSnapshot,
-  type SubagentSupervisor,
-  type SubagentTranscriptSnapshot
-} from "./subagents/supervisor.js"
-import { clipUtf8 } from "./subagents/text.js"
-import { isSubagentToolDetails, type SubagentToolDetails } from "./subagents/tool-details.js"
-import { createSubagentTools } from "./subagents/tools.js"
+import type { SubagentSnapshot, SubagentTranscriptSnapshot } from "./subagents/supervisor.js"
 import { buildSystemPrompt } from "./system-prompt.js"
 import type { ToolSurface } from "./tool-surface.js"
 import { isTaskOutputToolDetails } from "./tools/shell-tasks.js"
@@ -124,6 +126,15 @@ export const maxPendingInputBytes = 8 * 1024 * 1024
 export const maxModelCatalogRefreshMs = 15_000
 export const maxModelCatalogSettlementMs = 3_000
 export const maxModelCatalogSettlements = 4
+
+const agentTeamToolNames = new Set([
+  "spawn_agent",
+  "send_message",
+  "followup_task",
+  "wait_agent",
+  "list_agents",
+  "interrupt_agent"
+])
 export { maxRetryDelayMs, maxRetryErrorBytes } from "./retry.js"
 
 export type PendingInputDelivery = "steer" | "followUp"
@@ -139,6 +150,17 @@ export type CustomMessageAdmission =
   | { readonly type: "appended"; readonly entry: CustomMessageEntry }
   | { readonly type: "queued"; readonly delivery: "steer" | "follow_up" | "next_turn" }
   | { readonly type: "turn_started"; readonly entry: CustomMessageEntry; readonly settled: Promise<void> }
+
+export interface AgentMailAdmission {
+  readonly entry: CustomMessageEntry
+  readonly duplicate: boolean
+  readonly publication: AgentMailPublication
+}
+
+export interface AgentTurnAdmission {
+  readonly entry: CustomMessageEntry
+  readonly settled: Promise<void>
+}
 
 export interface QueuedInput {
   readonly id: number
@@ -224,6 +246,7 @@ export type AgentSessionEvent =
   | { type: "follow_up_mode_changed"; mode: QueueMode }
   | { type: "shell_task_changed"; taskId: string }
   | { type: "work_plan_changed"; plan: WorkPlanSnapshot }
+  | { type: "agent_changed"; path: AgentPath }
   | { type: "subagent_changed"; name: string }
   | {
       type: "authentication_changed"
@@ -299,6 +322,12 @@ export interface SessionReloadResult {
   readonly settingsErrors: readonly SettingsError[]
 }
 
+interface AgentTeamBinding {
+  readonly team: AgentTeam
+  readonly path: AgentPath
+  readonly owned: boolean
+}
+
 interface AgentSessionConfig {
   agent: Agent
   sessionManager: SessionManager
@@ -317,7 +346,7 @@ interface AgentSessionConfig {
   extensionContext: ExtensionContext
   shell?: SessionShell
   workPlan: WorkPlan
-  subagentSupervisor?: SubagentSupervisor
+  agentTeam?: AgentTeamBinding
   ownedProcessTreeTracker?: ProcessTreeTracker
   model?: Model<Api>
   apiKeyProvider?: string
@@ -442,6 +471,7 @@ type PendingCustomInput =
       readonly delivery: PendingInputDelivery
       readonly bytes: number
       readonly message: RuntimeCustomMessage
+      readonly committedEntry?: CustomMessageEntry
     }
   | {
       readonly type: "custom"
@@ -449,9 +479,19 @@ type PendingCustomInput =
       readonly delivery: "nextTurn"
       readonly bytes: number
       readonly message: RuntimeCustomMessage
+      readonly committedEntry?: CustomMessageEntry
     }
 
 type PendingInput = PendingUserInput | PendingCustomInput
+
+interface AgentActivityWaiter {
+  readonly runId: number
+  readonly resolve: (activity: AgentWaitActivity) => void
+  readonly reject: (cause: unknown) => void
+  readonly timeout: ReturnType<typeof setTimeout>
+  readonly signal: AbortSignal | undefined
+  readonly abort: (() => void) | undefined
+}
 
 type PendingMessageCancellation = "interrupt" | "restore"
 
@@ -523,7 +563,7 @@ export class AgentSession {
   readonly #extensionContext: ExtensionContext
   readonly #shell: SessionShell | undefined
   readonly #workPlan: WorkPlan
-  readonly #subagents: SubagentSupervisor | undefined
+  readonly #agentTeam: AgentTeamBinding | undefined
   readonly #ownedProcessTreeTracker: ProcessTreeTracker | undefined
   readonly #apiKeyProvider: string | undefined
   readonly #listeners = new Set<(event: AgentSessionEvent) => void>()
@@ -531,7 +571,7 @@ export class AgentSession {
   readonly #unsubscribeAgent: () => void
   readonly #unsubscribeShell: (() => void) | undefined
   readonly #unsubscribeWorkPlan: () => void
-  readonly #unsubscribeSubagents: (() => void) | undefined
+  readonly #unsubscribeAgentTeam: (() => void) | undefined
   readonly #unbindExtensionCatalog: (() => void) | undefined
   readonly #unbindExtensionSessionOperations: (() => void) | undefined
   #resources: SessionResources
@@ -542,6 +582,8 @@ export class AgentSession {
   #pending: PendingInput[] = []
   #pendingBytes = 0
   readonly #cancelledPendingMessages = new Map<PiAgentMessage, PendingMessageCancellation>()
+  readonly #committedPendingMessages = new Map<RuntimeCustomMessage, CustomMessageEntry>()
+  readonly #agentActivityWaiters = new Set<AgentActivityWaiter>()
   #queueRestoreCancellation: QueueRestoreCancellationState = { type: "none" }
   #nextRunId = 0
   #nextEntryId = 0
@@ -577,7 +619,7 @@ export class AgentSession {
       : { type: "absent" }
     this.#shell = config.shell
     this.#workPlan = config.workPlan
-    this.#subagents = config.subagentSupervisor
+    this.#agentTeam = config.agentTeam
     this.#ownedProcessTreeTracker = config.ownedProcessTreeTracker
     this.#apiKeyProvider = config.apiKeyProvider
     this.sessionManager = config.sessionManager
@@ -591,12 +633,6 @@ export class AgentSession {
         this.#pendingShellCompletions.delete(input.taskId)
         throw cause
       }
-    })
-    this.#subagents?.bindSubagentWorkResultSink((input, persisted) => {
-      const result = this.sessionManager.appendSubagentWorkResult(input)
-      persisted(result)
-      this.#emitAll([{ type: "entry_appended", entry: result }])
-      return result
     })
     this.#restoreCompletionDeliveries()
     this.settingsManager = config.settingsManager
@@ -613,48 +649,52 @@ export class AgentSession {
       },
       getActiveTools: extensionId => this.#getExtensionActiveTools(extensionId),
       setActiveTools: (extensionId, names) => this.#setExtensionActiveTools(extensionId, names),
-      ...(this.#subagents
+      ...(this.#agentTeam
         ? {
             subagents: {
-              waitTimeoutMs: this.#subagents.waitTimeoutMs,
-              listProfiles: () => this.#subagentProfiles(),
-              spawn: (_extensionId, profile, name, prompt, signal) =>
-                this.#spawnSubagentFromProfile(profile, name, prompt, signal),
-              send: (_extensionId, name, text) => this.#requireSubagents().send(name, text),
-              continue: (_extensionId, name, text) => this.#requireSubagents().continue(name, text),
-              wait: (_extensionId, names, timeoutMs, signal) =>
-                this.#requireSubagents()
-                  .wait(names, timeoutMs, signal)
-                  .then(snapshots => snapshots.map(extensionSubagentSnapshot)),
-              interrupt: (_extensionId, name) =>
-                this.#requireSubagents()
-                  .interruptAndWait(name)
-                  .then(settlement => ({
-                    result: settlement.result,
-                    snapshot: extensionSubagentSnapshot(settlement.snapshot)
-                  })),
-              close: (_extensionId, name) =>
-                this.#requireSubagents().closeAndDeliver(name).then(extensionSubagentSnapshot),
-              list: () => this.#requireSubagents().snapshots().map(extensionSubagentSnapshot)
+              waitTimeoutMs: this.settingsManager?.get().subagentWaitTimeoutMs ?? 30_000,
+              listProfiles: () => this.#agentRoles(),
+              spawn: (_extensionId, profile, name, prompt) => this.#spawnExtensionAgent(profile, name, prompt),
+              send: (_extensionId, target, text) =>
+                this.#agentTeam!.team.sendMessage(
+                  this.#agentTeam!.path,
+                  resolveAgentPath(this.#agentTeam!.path, target),
+                  text
+                ),
+              continue: (_extensionId, target, text) =>
+                this.#agentTeam!.team
+                  .followupTask(this.#agentTeam!.path, resolveAgentPath(this.#agentTeam!.path, target), text)
+                  .then(result => (result === "started" ? "started_turn" : "follow_up")),
+              wait: async (_extensionId, _names, timeoutMs, signal) => {
+                await this.waitForAgentActivity(
+                  resolveAgentWaitTimeout(timeoutMs, this.settingsManager.get().subagentWaitTimeoutMs),
+                  signal
+                )
+                return this.#agentTeam!.team.snapshots().map(extensionAgentAsLegacy)
+              },
+              interrupt: async (_extensionId, target) => {
+                const path = resolveAgentPath(this.#agentTeam!.path, target)
+                const result = await this.#agentTeam!.team.interrupt(path)
+                const snapshot = this.#agentTeam!.team.snapshots(path).find(candidate => candidate.path === path)
+                if (!snapshot) throw new Error(`Unknown agent path: ${path}`)
+                return {
+                  result: result === "interrupted" ? "interrupted" : "already_idle",
+                  snapshot: extensionAgentAsLegacy(snapshot)
+                }
+              },
+              close: () => Promise.reject(new Error("AgentTeam does not close durable identities")),
+              list: () => this.#agentTeam!.team.snapshots().map(extensionAgentAsLegacy)
             }
           }
         : {})
     })
-    this.#unsubscribeSubagents = this.#subagents?.subscribe(event => {
-      try {
-        switch (event.type) {
-          case "changed":
-            this.#emit({ type: "subagent_changed", name: event.name })
-            return
-          case "entry_appended":
-            this.#emit({ type: "entry_appended", entry: event.entry })
-            return
-          default:
-            assertNever(event)
-            return
-        }
-      } catch {
-        // Process ownership cannot cross into an observer.
+    this.#unsubscribeAgentTeam = this.#agentTeam?.team.subscribe(change => {
+      for (const path of change.paths) {
+        const snapshot = this.#agentTeam?.team.snapshots(path).find(candidate => candidate.path === path)
+        this.#emitAll([
+          { type: "agent_changed", path },
+          ...(snapshot ? [{ type: "subagent_changed" as const, name: snapshot.taskName }] : [])
+        ])
       }
     })
     this.#unsubscribeShell = this.#shell?.subscribe(taskId => {
@@ -807,16 +847,21 @@ export class AgentSession {
     return this.#workPlan.snapshot
   }
 
+  agentSnapshots(): readonly AgentSnapshot[] {
+    return this.#agentTeam?.team.snapshots() ?? []
+  }
+
+  // Temporary presentation adapter until the deferred /agent TUI replaces the flat picker.
   subagentSnapshots(): readonly SubagentSnapshot[] {
-    return this.#subagents?.snapshots() ?? []
+    return this.agentSnapshots().map(agentSnapshotAsLegacy)
   }
 
   subagentSnapshot(name: string): SubagentSnapshot | undefined {
     return this.subagentSnapshots().find(snapshot => snapshot.name === name)
   }
 
-  subagentTranscript(name: string): SubagentTranscriptSnapshot | undefined {
-    return this.#subagents?.transcript(name)
+  subagentTranscript(_name: string): SubagentTranscriptSnapshot | undefined {
+    return undefined
   }
 
   demoteForegroundShellTask(): ShellDemotionResult {
@@ -1111,59 +1156,38 @@ export class AgentSession {
     return this.appendCustomEntry(customType, data)
   }
 
-  #subagentProfiles(): readonly ExtensionSubagentProfile[] {
-    const profiles = new Map<string, ExtensionSubagentProfile>()
-    for (const resource of this.#resources.subagentProfiles) profiles.set(resource.name, resource)
+  #agentRoles(): readonly ExtensionSubagentProfile[] {
+    const roles = new Map<string, ExtensionSubagentProfile>()
+    for (const resource of this.#resources.subagentProfiles) roles.set(resource.name, resource)
     for (const registered of this.#extensionHost?.subagentCatalog() ?? []) {
-      if (!profiles.has(registered.name)) profiles.set(registered.name, registered)
+      if (!roles.has(registered.name)) roles.set(registered.name, registered)
     }
-    return Object.freeze([...profiles.values()])
+    return Object.freeze([...roles.values()])
   }
 
-  async #spawnSubagentFromProfile(
-    profileName: string,
-    name: string,
-    prompt: string,
-    signal?: AbortSignal
-  ): Promise<string> {
-    const resource = this.#resources.subagentProfiles.find(candidate => candidate.name === profileName)
-    const registered = this.#extensionHost?.subagentCatalog().find(candidate => candidate.name === profileName)
-    const profile = resource ?? registered
-    if (!profile) throw new Error(`Unknown subagent profile: ${profileName}`)
-    const source = resource?.filePath ?? registered?.source.entryPath
-    let model: string | undefined
-    if (profile.model) {
-      const resolved = this.#modelRegistry.find(profile.model)
-      let available = false
-      try {
-        available =
-          resolved !== undefined &&
-          (resolved.provider === this.#apiKeyProvider || (await this.#modelRegistry.isConfigured(resolved)))
-      } catch (cause) {
-        throw new Error(
-          `Subagent profile ${profileName}${source ? ` from ${source}` : ""} requests unavailable model: ${profile.model}`,
-          { cause }
-        )
-      }
-      if (!resolved || !available) {
-        throw new Error(
-          `Subagent profile ${profileName}${source ? ` from ${source}` : ""} requests unavailable model: ${profile.model}`
-        )
-      }
-      model = `${resolved.provider}/${resolved.id}`
-    }
-    const task = `${profile.instructions.trimEnd()}\n\nTask:\n${prompt}`
-    return this.#requireSubagents().spawn(name, task, signal, {
-      profile: profileName,
-      ...(model ? { model } : {}),
-      ...(profile.thinking ? { thinkingLevel: profile.thinking } : {}),
-      listedTask: prompt
+  async #spawnExtensionAgent(agentType: string, taskName: string, message: string): Promise<string> {
+    if (!this.#agentTeam) throw new Error("AgentTeam is unavailable")
+    const role =
+      agentType === "default" ? undefined : this.#agentRoles().find(candidate => candidate.name === agentType)
+    if (agentType !== "default" && !role) throw new Error(`Unknown agent role: ${agentType}`)
+    const task = role ? `${role.instructions.trimEnd()}\n\nTask:\n${message}` : message
+    const snapshot = await this.#agentTeam.team.spawn({
+      sender: this.#agentTeam.path,
+      taskName,
+      message: task,
+      forkTurns: "all",
+      ...(role
+        ? {
+            role: role.name,
+            roleSelection: {
+              name: role.name,
+              ...(role.model === undefined ? {} : { model: role.model }),
+              ...(role.thinking === undefined ? {} : { thinking: role.thinking })
+            }
+          }
+        : {})
     })
-  }
-
-  #requireSubagents(): SubagentSupervisor {
-    if (!this.#subagents) throw new Error("Subagent session operations are unavailable")
-    return this.#subagents
+    return snapshot.taskName
   }
 
   #sendExtensionCustomMessage(message: CustomMessageInput, delivery: ExtensionMessageDelivery): void {
@@ -1210,6 +1234,117 @@ export class AgentSession {
       default:
         return assertNever(delivery)
     }
+  }
+
+  admitAgentMail(input: AgentMailInput, publication: AgentMailPublication): AgentMailAdmission {
+    this.#assertOpen()
+    const message = agentMailMessage(input)
+    const existing = this.#agentMailEntry(input.deliveryId)
+    if (existing) {
+      if (!isAgentMailEntry(existing, input)) throw new Error(`Agent mail identity conflict: ${input.deliveryId}`)
+      return { entry: existing, duplicate: true, publication }
+    }
+
+    if (publication === "append") {
+      if (this.#activity.type !== "idle") throw new Error("Agent mail can append only while the session is idle")
+      const committed = this.#appendCriticalCustomMessage(message)
+      this.#installCustomMessage(committed.message)
+      this.#publishCustomMessage(committed)
+      return { entry: committed.entry, duplicate: false, publication }
+    }
+
+    const activity = this.#activity
+    const runtime = runtimeCustomMessage(message)
+    const bytes = serializedMessageBytes(runtime)
+    this.#assertQueueCapacity(bytes)
+    if (activity.type === "aborting" || activity.type === "interrupting") {
+      const committed = this.#appendCriticalCustomMessage(message)
+      const pending: PendingCustomInput = {
+        type: "custom",
+        id: ++this.#nextEntryId,
+        delivery: "nextTurn",
+        bytes,
+        message: committed.message,
+        committedEntry: committed.entry
+      }
+      this.#pending.push(pending)
+      this.#pendingBytes += bytes
+      this.#committedPendingMessages.set(committed.message, committed.entry)
+      this.#emitAll([
+        { type: "entry_appended", entry: committed.entry },
+        { type: "queue_update", ...this.#queueSnapshot() }
+      ])
+      return { entry: committed.entry, duplicate: false, publication }
+    }
+    if (activity.type !== "running" || activity.phase.type === "compaction_committed") {
+      throw new Error("Agent mail boundary delivery requires an active run")
+    }
+    const committed = this.#appendCriticalCustomMessage(message)
+    const pending: PendingCustomInput = {
+      type: "custom",
+      id: ++this.#nextEntryId,
+      runId: activity.runId,
+      delivery: "steer",
+      bytes,
+      message: committed.message,
+      committedEntry: committed.entry
+    }
+    this.#pending.push(pending)
+    this.#pendingBytes += bytes
+    this.#committedPendingMessages.set(committed.message, committed.entry)
+    this.#agent.steer(committed.message)
+    this.#publishAgentActivity(activity.runId, "mailbox")
+    this.#emitAll([
+      { type: "entry_appended", entry: committed.entry },
+      { type: "queue_update", ...this.#queueSnapshot() }
+    ])
+    return { entry: committed.entry, duplicate: false, publication }
+  }
+
+  waitForAgentActivity(timeoutMs: number, signal?: AbortSignal): Promise<AgentWaitActivity> {
+    this.#assertOpen()
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 0) throw new Error("Invalid agent wait timeout")
+    if (signal?.aborted) return Promise.reject(signal.reason)
+    const activity = this.#activity
+    if (activity.type !== "running") throw new Error("Agent activity waits require an active run")
+    if (this.#agentActivityWaiters.size === maxPendingInputCount)
+      throw new Error("Agent activity waiter capacity reached")
+
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => this.#settleAgentActivityWaiter(waiter, "timed_out"), timeoutMs)
+      timeout.unref()
+      const abort = signal ? () => this.#rejectAgentActivityWaiter(waiter, signal.reason) : undefined
+      const waiter: AgentActivityWaiter = { runId: activity.runId, resolve, reject, timeout, signal, abort }
+      this.#agentActivityWaiters.add(waiter)
+      signal?.addEventListener("abort", abort!, { once: true })
+      const pending = this.#pendingAgentActivity(activity.runId)
+      if (pending) this.#settleAgentActivityWaiter(waiter, pending)
+    })
+  }
+
+  startAgentTurn(input: AgentMailInput, commit: (entry: CustomMessageEntry) => void): AgentTurnAdmission {
+    this.#assertOpen()
+    if (input.kind !== "task") throw new Error("Only task mail can start an agent turn")
+    if (this.#activity.type !== "idle") throw new Error("Agent turns can start only while the session is idle")
+    if (this.#modelState.type === "unselected") throw new Error("No model selected. Use /login, then /model.")
+    if (!this.#authentication.isIdle) throw new Error("Cannot start an agent turn while authentication is active")
+    if (this.#agentMailEntry(input.deliveryId)) throw new Error(`Agent turn input already exists: ${input.deliveryId}`)
+
+    const committed = this.#appendCriticalCustomMessage(agentMailMessage(input))
+    try {
+      commit(committed.entry)
+    } catch (cause) {
+      this.#installCustomMessage(committed.message)
+      this.#publishCustomMessage(committed)
+      throw cause
+    }
+
+    this.#publishCommittedNextTurnMessages()
+    this.#installCustomMessage(committed.message)
+    const run = this.#beginRun()
+    this.#publishCustomMessage(committed)
+    void this.#drive(run.runId, { type: "continuation" }, run.settlement)
+    return { entry: committed.entry, settled: run.settlement.promise }
   }
 
   async reload(): Promise<SessionReloadResult> {
@@ -1830,14 +1965,18 @@ export class AgentSession {
   }
 
   #applyActiveTools(): void {
-    const profiles = this.#subagentProfiles()
-    const subagentTools = this.#subagents
-      ? createSubagentTools(profiles, this.#subagents, (profile, name, prompt, signal) =>
-          this.#spawnSubagentFromProfile(profile, name, prompt, signal)
+    const baseTools = this.#baseTools.filter(tool => !agentTeamToolNames.has(tool.name))
+    const agentTools = this.#agentTeam
+      ? createAgentTeamTools(
+          this.#agentTeam.team,
+          this.#agentTeam.path,
+          this.#agentRoles(),
+          (timeoutMs, signal) => this.waitForAgentActivity(timeoutMs, signal),
+          this.settingsManager.get().subagentWaitTimeoutMs
         )
       : []
     const tools = admitExtensionTools(
-      [...this.#baseTools, ...subagentTools],
+      [...baseTools, ...agentTools],
       this.#extensionHost,
       this.#extensionToolSelection.active
     )
@@ -1873,8 +2012,12 @@ export class AgentSession {
     if (currentActivity.type === "interrupting") {
       currentActivity.settlement.reject(new Error("AgentSession was disposed before the interrupt prompt could start"))
     }
+    for (const waiter of this.#agentActivityWaiters) {
+      this.#rejectAgentActivityWaiter(waiter, new Error("AgentSession was disposed during an agent activity wait"))
+    }
     this.#pending = []
     this.#pendingBytes = 0
+    this.#committedPendingMessages.clear()
     this.#agent.clearAllQueues()
     if (currentActivity.type === "compacting" || currentActivity.type === "extension_command") {
       currentActivity.controller.abort()
@@ -1891,7 +2034,7 @@ export class AgentSession {
       try {
         await settleAll([
           this.#codeMode?.dispose() ?? Promise.resolve(),
-          this.#subagents?.shutdown() ?? Promise.resolve(),
+          this.#agentTeam?.owned ? this.#agentTeam.team.shutdown() : Promise.resolve(),
           this.#disposeExtensions(reason),
           this.#shell?.dispose() ?? Promise.resolve()
         ])
@@ -1910,7 +2053,7 @@ export class AgentSession {
     this.#unsubscribeAgent()
     this.#unsubscribeShell?.()
     this.#unsubscribeWorkPlan()
-    this.#unsubscribeSubagents?.()
+    this.#unsubscribeAgentTeam?.()
     this.#listeners.clear()
     this.#agentSessionInvariant.dispose()
     this.#invariantRegistry.dispose()
@@ -2035,7 +2178,6 @@ export class AgentSession {
     } finally {
       this.#cancelledPendingMessages.clear()
       this.#queueRestoreCancellation = { type: "none" }
-      this.#subagents?.releaseCompletionClaims()
       if (failure) settlement.reject(failure.cause)
       else settlement.resolve()
       if (interrupted) this.#startInterruptPrompt(interrupted)
@@ -2136,21 +2278,7 @@ export class AgentSession {
   }
 
   #deliverCompletions(): boolean {
-    const subagent = this.#deliverSubagentCompletions()
-    const shell = this.#deliverShellCompletions()
-    return subagent || shell
-  }
-
-  // Behavioral provenance: Codex 4c25d6cc forwards each terminal V2 child turn into the
-  // parent's mailbox without starting a parent turn. Zi commits the same bounded context at a provider boundary.
-  #deliverSubagentCompletions(): boolean {
-    let delivered = false
-    this.#subagents?.deliverCompletions(completion => {
-      const committed = this.#appendCustomMessage(subagentCompletionMessage(completion))
-      this.#publishCustomMessage(committed)
-      delivered = true
-    })
-    return delivered
+    return this.#deliverShellCompletions()
   }
 
   #deliverShellCompletions(): boolean {
@@ -2172,10 +2300,7 @@ export class AgentSession {
         continue
       }
       if (entry.type === "custom_message") {
-        if (entry.customType === subagentCompletionCustomType) {
-          const identity = subagentCompletionIdentity(entry.details)
-          if (identity) this.#subagents?.acknowledgeCompletion(identity.name, identity.workCycle)
-        } else if (entry.customType === shellCompletionCustomType) {
+        if (entry.customType === shellCompletionCustomType) {
           const taskId = shellCompletionIdentity(entry.details)
           if (taskId) this.#pendingShellCompletions.delete(taskId)
         }
@@ -2201,15 +2326,6 @@ export class AgentSession {
         this.#pendingShellCompletions.delete(message.details.taskId)
       }
       return
-    }
-    if (!this.#subagents) return
-    if (message.toolName === "code") {
-      this.#subagents.releaseCompletionClaims(`${message.toolCallId}:code:`)
-      return
-    }
-    if (!isSubagentToolDetails(message.details)) return
-    for (const identity of subagentToolCompletionIdentities(message.details)) {
-      this.#subagents.acknowledgeCompletion(identity.name, identity.workCycle)
     }
   }
 
@@ -2769,14 +2885,37 @@ export class AgentSession {
     readonly message: RuntimeCustomMessage
   } {
     const retained = customMessageInput(runtimeCustomMessage(input))
-    const entry = this.sessionManager.appendCustomMessage(retained)
+    const committed = this.#projectCustomMessage(this.sessionManager.appendCustomMessage(retained))
+    this.#installCustomMessage(committed.message)
+    return committed
+  }
+
+  #appendCriticalCustomMessage(input: CustomMessageInput): {
+    readonly entry: CustomMessageEntry
+    readonly message: RuntimeCustomMessage
+  } {
+    const retained = customMessageInput(runtimeCustomMessage(input))
+    return this.#projectCustomMessage(this.sessionManager.appendCriticalCustomMessage(retained))
+  }
+
+  #projectCustomMessage(entry: CustomMessageEntry): {
+    readonly entry: CustomMessageEntry
+    readonly message: RuntimeCustomMessage
+  } {
     const message = sessionEntryToContextMessage(entry)
     if (message?.role !== "custom" || !isRuntimeCustomMessage(message)) {
       throw new Error("Custom message projection is invalid")
     }
+    return { entry, message }
+  }
+
+  #installCustomMessage(message: RuntimeCustomMessage): void {
     this.#agent.state.messages = [...this.#ownedMessages(), message]
     this.#recordCommittedMessage(message)
-    return { entry, message }
+  }
+
+  #agentMailEntry(deliveryId: string): CustomMessageEntry | undefined {
+    return this.sessionManager.customMessageEntries().find(entry => agentMailDeliveryId(entry) === deliveryId)
   }
 
   #publishCustomMessage(committed: {
@@ -2809,8 +2948,10 @@ export class AgentSession {
     }
     this.#pending.push(entry)
     this.#pendingBytes += bytes
-    if (delivery === "steer") this.#agent.steer(message)
-    else this.#agent.followUp(message)
+    if (delivery === "steer") {
+      this.#agent.steer(message)
+      this.#publishAgentActivity(runId, "steered")
+    } else this.#agent.followUp(message)
     this.#emitQueue()
   }
 
@@ -2840,17 +2981,74 @@ export class AgentSession {
       this.#pending.push({ type: "custom", id, delivery: "nextTurn", bytes, message })
     } else {
       this.#pending.push({ type: "custom", id, runId: target.runId, delivery: target.delivery, bytes, message })
-      if (target.delivery === "steer") this.#agent.steer(message)
-      else this.#agent.followUp(message)
+      if (target.delivery === "steer") {
+        this.#agent.steer(message)
+        this.#publishAgentActivity(target.runId, "steered")
+      } else this.#agent.followUp(message)
     }
     this.#pendingBytes += bytes
     this.#emitQueue()
+  }
+
+  #pendingAgentActivity(runId: number): Exclude<AgentWaitActivity, "timed_out"> | undefined {
+    if (this.#pending.some(entry => entry.type === "user" && entry.runId === runId && entry.delivery === "steer")) {
+      return "steered"
+    }
+    const custom = this.#pending.flatMap(entry =>
+      entry.type === "custom" && "runId" in entry && entry.runId === runId && entry.delivery === "steer" ? [entry] : []
+    )
+    if (
+      custom.some(
+        entry => entry.committedEntry === undefined || agentMailDeliveryId(entry.committedEntry) === undefined
+      )
+    ) {
+      return "steered"
+    }
+    return custom.length > 0 ? "mailbox" : undefined
+  }
+
+  #publishAgentActivity(runId: number, activity: Exclude<AgentWaitActivity, "timed_out">): void {
+    for (const waiter of this.#agentActivityWaiters) {
+      if (waiter.runId === runId) this.#settleAgentActivityWaiter(waiter, activity)
+    }
+  }
+
+  #settleAgentActivityWaiter(waiter: AgentActivityWaiter, activity: AgentWaitActivity): void {
+    if (!this.#agentActivityWaiters.delete(waiter)) return
+    clearTimeout(waiter.timeout)
+    if (waiter.abort) waiter.signal?.removeEventListener("abort", waiter.abort)
+    waiter.resolve(activity)
+  }
+
+  #rejectAgentActivityWaiter(waiter: AgentActivityWaiter, cause: unknown): void {
+    if (!this.#agentActivityWaiters.delete(waiter)) return
+    clearTimeout(waiter.timeout)
+    if (waiter.abort) waiter.signal?.removeEventListener("abort", waiter.abort)
+    waiter.reject(cause)
   }
 
   #assertQueueCapacity(bytes: number): void {
     if (this.#pending.length === maxPendingInputCount || this.#pendingBytes + bytes > maxPendingInputBytes) {
       throw new QueueCapacityError()
     }
+  }
+
+  #publishCommittedNextTurnMessages(): void {
+    const retained: PendingInput[] = []
+    const published: RuntimeCustomMessage[] = []
+    for (const entry of this.#pending) {
+      if (entry.type === "custom" && entry.delivery === "nextTurn" && entry.committedEntry) {
+        this.#pendingBytes -= entry.bytes
+        this.#committedPendingMessages.delete(entry.message)
+        this.#installCustomMessage(entry.message)
+        published.push(entry.message)
+      } else {
+        retained.push(entry)
+      }
+    }
+    if (published.length === 0) return
+    this.#pending = retained
+    this.#emitAll([{ type: "queue_update", ...this.#queueSnapshot() }])
   }
 
   #nextTurnCustomMessages(): readonly RuntimeCustomMessage[] {
@@ -2871,6 +3069,17 @@ export class AgentSession {
     const retained: PendingInput[] = []
     for (const entry of this.#pending) {
       if (entry.type === "custom") {
+        if (entry.committedEntry) {
+          retained.push({
+            type: "custom",
+            id: entry.id,
+            delivery: "nextTurn",
+            bytes: entry.bytes,
+            message: entry.message,
+            committedEntry: entry.committedEntry
+          })
+          continue
+        }
         customRemoved = true
         this.#pendingBytes -= entry.bytes
         if (runId !== undefined && this.#activity.type !== "idle") {
@@ -3031,24 +3240,32 @@ export class AgentSession {
     if (event.type === "message_end") {
       if (!isZiAgentMessage(event.message)) throw new Error("Invalid Zi agent message")
       if (event.message.role === "custom") {
-        const input = customMessageInput(event.message)
-        let entry: CustomMessageEntry
-        try {
-          entry = this.sessionManager.appendCustomMessage(input)
-        } catch (cause) {
-          this.#agentSessionInvariant.interruptMessage()
-          this.#removeRuntimeMessage(event.message)
-          throw cause
+        if (!isRuntimeCustomMessage(event.message)) throw new Error("Invalid custom message")
+        const committedEntry = this.#committedPendingMessages.get(event.message)
+        if (committedEntry) {
+          this.#committedPendingMessages.delete(event.message)
+          this.#recordCommittedMessage(event.message)
+          committedCustomEvent = event
+        } else {
+          const input = customMessageInput(event.message)
+          let entry: CustomMessageEntry
+          try {
+            entry = this.sessionManager.appendCustomMessage(input)
+          } catch (cause) {
+            this.#agentSessionInvariant.interruptMessage()
+            this.#removeRuntimeMessage(event.message)
+            throw cause
+          }
+          const message = sessionEntryToContextMessage(entry)
+          if (message?.role !== "custom" || !isRuntimeCustomMessage(message)) {
+            throw new Error("Custom message projection is invalid")
+          }
+          this.#replaceRuntimeMessage(event.message, message)
+          this.#recordCommittedMessage(message)
+          this.#emit({ type: "entry_appended", entry })
+          this.#agentSessionInvariant.projectMessage(event.message, message)
+          committedCustomEvent = { ...event, message }
         }
-        const message = sessionEntryToContextMessage(entry)
-        if (message?.role !== "custom" || !isRuntimeCustomMessage(message)) {
-          throw new Error("Custom message projection is invalid")
-        }
-        this.#replaceRuntimeMessage(event.message, message)
-        this.#recordCommittedMessage(message)
-        this.#emit({ type: "entry_appended", entry })
-        this.#agentSessionInvariant.projectMessage(event.message, message)
-        committedCustomEvent = { ...event, message }
       } else {
         let entry: MessageEntry
         try {
@@ -3157,11 +3374,24 @@ export class AgentSession {
 
   #detachQueuedInputs(cancellation: PendingMessageCancellation): QueuedInputs {
     const queued = this.#queueSnapshot()
-    if (this.#activity.type === "running" || this.#activity.type === "aborting") {
-      for (const entry of this.#pending) this.#cancelledPendingMessages.set(entry.message, cancellation)
+    const active = this.#activity.type === "running" || this.#activity.type === "aborting"
+    const retained: PendingCustomInput[] = []
+    for (const entry of this.#pending) {
+      if (entry.type === "custom" && entry.committedEntry) {
+        retained.push({
+          type: "custom",
+          id: entry.id,
+          delivery: "nextTurn",
+          bytes: entry.bytes,
+          message: entry.message,
+          committedEntry: entry.committedEntry
+        })
+      } else if (active) {
+        this.#cancelledPendingMessages.set(entry.message, cancellation)
+      }
     }
-    this.#pending = []
-    this.#pendingBytes = 0
+    this.#pending = retained
+    this.#pendingBytes = retained.reduce((bytes, entry) => bytes + entry.bytes, 0)
     this.#agent.clearAllQueues()
     return queued
   }
@@ -3463,7 +3693,6 @@ function userMessage(text: string, images: readonly ImageContent[]): AgentMessag
   return { role: "user", content: [{ type: "text", text }, ...images], timestamp: Date.now() }
 }
 
-const subagentCompletionCustomType = "zi.subagent_completion"
 const shellCompletionCustomType = "zi.shell_task_completion"
 
 function shellCompletionMessage(completion: BackgroundTaskResultInput): CustomMessageInput {
@@ -3505,98 +3734,50 @@ function shellCompletionIdentity(value: SessionJson | undefined): string | undef
   return typeof value.taskId === "string" ? value.taskId : undefined
 }
 
-function subagentCompletionMessage(completion: SubagentCompletion): CustomMessageInput {
-  const text = clipUtf8(completion.text, durablePreviewBytes)
-  const payload = {
-    name: completion.name,
-    work_cycle: completion.workCycle,
-    status: completion.status,
-    text: text.text,
-    original_bytes: completion.originalBytes,
-    omitted_bytes: completion.omittedBytes + text.omittedBytes,
-    truncated: completion.truncated || text.omittedBytes > 0,
-    duration_ms: completion.durationMs,
-    ...(completion.reason ? { reason: completion.reason } : {}),
-    ...(completion.error ? { error: completion.error } : {})
-  }
-  return {
-    customType: subagentCompletionCustomType,
-    content: `<subagent_completion>\n${JSON.stringify(payload)}\n</subagent_completion>`,
-    display: false,
-    details: {
-      name: completion.name,
-      workCycle: completion.workCycle,
-      status: completion.status,
-      originalBytes: completion.originalBytes,
-      omittedBytes: completion.omittedBytes + text.omittedBytes,
-      truncated: completion.truncated || text.omittedBytes > 0,
-      durationMs: completion.durationMs
-    }
-  }
-}
-
-function subagentCompletionIdentity(
-  value: SessionJson | undefined
-): { readonly name: string; readonly workCycle: number } | undefined {
-  if (!isSessionJsonRecord(value)) return undefined
-  const name = value.name
-  const workCycle = value.workCycle
-  if (
-    typeof name !== "string" ||
-    !/^[a-z][a-z0-9_-]*$/.test(name) ||
-    Buffer.byteLength(name) > 64 ||
-    typeof workCycle !== "number" ||
-    !Number.isSafeInteger(workCycle) ||
-    workCycle <= 0
-  ) {
-    return undefined
-  }
-  return { name, workCycle }
-}
-
 function isSessionJsonRecord(value: SessionJson | undefined): value is { readonly [key: string]: SessionJson } {
   return typeof value === "object" && value !== null && !Array.isArray(value)
 }
 
-function subagentToolCompletionIdentities(
-  details: SubagentToolDetails
-): readonly { readonly name: string; readonly workCycle: number }[] {
-  const agents =
-    details.operation === "wait"
-      ? details.agents
-      : details.operation === "interrupt" || details.operation === "close"
-        ? [details.agent]
-        : []
-  return agents.flatMap(agent =>
-    agent.completion ? [{ name: agent.name, workCycle: agent.completion.workCycle }] : []
-  )
-}
-
-function extensionSubagentSnapshot(snapshot: SubagentSnapshot): ExtensionSubagentSnapshot {
-  const completion = snapshot.completion
+function extensionAgentAsLegacy(snapshot: AgentSnapshot): ExtensionSubagentSnapshot {
+  const lifecycle =
+    snapshot.residency === "unloaded"
+      ? "exited"
+      : snapshot.turn === "starting"
+        ? "queued"
+        : snapshot.turn === "idle"
+          ? "idle"
+          : snapshot.turn
+  const settled = snapshot.status !== "not_started"
   return Object.freeze({
-    name: snapshot.name,
-    lifecycle: snapshot.lifecycle,
-    ...(snapshot.workCycle !== undefined ? { workCycle: snapshot.workCycle } : {}),
-    ...(snapshot.capturedWorkCycle !== undefined ? { capturedWorkCycle: snapshot.capturedWorkCycle } : {}),
-    ...(snapshot.task ? { task: snapshot.task } : {}),
-    ...(snapshot.elapsedMs !== undefined ? { elapsedMs: snapshot.elapsedMs } : {}),
-    resultReady: snapshot.completionDelivery === "durable",
-    ...(completion
+    name: snapshot.taskName,
+    lifecycle,
+    workCycle: snapshot.turnNumber,
+    task: snapshot.taskName,
+    resultReady: settled,
+    ...(settled
       ? {
-          completion: Object.freeze({
-            workCycle: completion.workCycle,
-            status: completion.status,
-            text: completion.text,
-            originalBytes: completion.originalBytes,
-            omittedBytes: completion.omittedBytes,
-            truncated: completion.truncated,
-            durationMs: completion.durationMs,
-            ...(completion.reason ? { reason: completion.reason } : {}),
-            ...(completion.error ? { error: completion.error } : {})
-          })
+          completion: {
+            workCycle: snapshot.turnNumber,
+            status: snapshot.status === "interrupted" ? ("cancelled" as const) : snapshot.status,
+            text: "",
+            originalBytes: 0,
+            omittedBytes: 0,
+            truncated: false,
+            durationMs: 0
+          }
         }
       : {})
+  })
+}
+
+function agentSnapshotAsLegacy(snapshot: AgentSnapshot): SubagentSnapshot {
+  const lifecycle = snapshot.turn === "starting" ? "queued" : snapshot.turn === "idle" ? "idle" : snapshot.turn
+  return Object.freeze({
+    name: snapshot.taskName,
+    lifecycle,
+    workCycle: snapshot.turnNumber,
+    task: snapshot.taskName,
+    sessionId: snapshot.sessionId
   })
 }
 

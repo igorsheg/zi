@@ -2,10 +2,12 @@ import { createHash } from "node:crypto"
 import {
   appendFileSync,
   closeSync,
+  fsyncSync,
   linkSync,
   mkdirSync,
   openSync,
   readFileSync,
+  readdirSync,
   readSync,
   rmSync,
   statSync,
@@ -18,7 +20,14 @@ import { dirname, join } from "node:path"
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core"
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai"
 
-import { isNonNegativeInteger, isRecord } from "./guards.js"
+import {
+  isAgentTeamEntryData,
+  replayAgentTeamJournal,
+  type AgentTeamEntry,
+  type AgentTeamEntryData
+} from "./agent-team/journal.js"
+import { parseAgentPath, type AgentPath } from "./agent-team/path.js"
+import { isNonNegativeInteger, isPositiveInteger, isRecord } from "./guards.js"
 import { formatCompactionSummary, type AgentMessage, type CompactionSummaryMessage } from "./messages.js"
 import { type ZiPaths, resolveZiPath } from "./paths.js"
 import { maxRetryCount } from "./retry.js"
@@ -43,12 +52,21 @@ import { isWorkPlanSnapshot, type WorkPlanSnapshot, type WorkPlanStep } from "./
 
 export type SessionFormatVersion = 1 | 2
 
+export interface AgentSessionLineage {
+  readonly rootSessionId: string
+  readonly parentSessionId: string
+  readonly parentEntryId: string | null
+  readonly path: AgentPath
+  readonly generation: number
+}
+
 export interface SessionHeader {
-  type: "session"
-  version: SessionFormatVersion
-  id: string
-  timestamp: string
-  cwd: string
+  readonly type: "session"
+  readonly version: SessionFormatVersion
+  readonly id: string
+  readonly timestamp: string
+  readonly cwd: string
+  readonly agent?: AgentSessionLineage
 }
 
 export interface SessionEntryBase {
@@ -156,6 +174,7 @@ export type SessionEntryData =
   | CustomEntryData
   | CustomMessageEntryData
   | WorkPlanEntryData
+  | AgentTeamEntryData
   | SubagentEntryData
   | SubagentWorkResultEntryData
   | BackgroundTaskResultEntryData
@@ -167,6 +186,7 @@ export type CompactionEntry = SessionEntryBase & CompactionEntryData
 export type CustomEntry = SessionEntryBase & CustomEntryData
 export type CustomMessageEntry = SessionEntryBase & CustomMessageEntryData
 export type WorkPlanEntry = SessionEntryBase & WorkPlanEntryData
+export type { AgentTeamEntry }
 export type SubagentEntry = SessionEntryBase & SubagentEntryData
 export type SubagentWorkResultEntry = SessionEntryBase & SubagentWorkResultEntryData
 export type BackgroundTaskResultEntry = SessionEntryBase & BackgroundTaskResultEntryData
@@ -239,6 +259,13 @@ export interface SessionContext {
   readonly messages: readonly AgentMessage[]
   readonly model?: SessionModel
   readonly thinkingLevel?: ThinkingLevel
+}
+
+export interface SessionForkCheckpoint extends SessionContext {
+  readonly sessionId: string
+  readonly leafId: string | null
+  readonly entries: readonly SessionEntry[]
+  readonly lineage?: AgentSessionLineage
 }
 
 export interface SessionJournalMemoryDiagnostics {
@@ -385,6 +412,7 @@ export class SessionManager {
   #model: SessionModel | undefined
   #thinkingLevel: ThinkingLevel | undefined
   #workPlan: WorkPlanEntry | undefined
+  #criticalPersistenceFailure: Error | undefined
 
   private constructor(
     cwd: string,
@@ -408,6 +436,32 @@ export class SessionManager {
 
   static inMemory(cwd = process.cwd(), sessionId?: string): SessionManager {
     return new SessionManager(resolveZiPath(cwd), "", sessionId, false)
+  }
+
+  static createAgentFork(
+    paths: ZiPaths,
+    sessionId: string,
+    lineage: AgentSessionLineage,
+    context: SessionContext,
+    persist: boolean
+  ): SessionManager {
+    validateSessionId(sessionId)
+    validateAgentSessionLineage(lineage)
+    const directory = agentSessionDirectory(paths, lineage.rootSessionId)
+    const header: SessionHeader = {
+      type: "session",
+      version: currentSessionFormat,
+      id: sessionId,
+      timestamp: new Date().toISOString(),
+      cwd: paths.cwd,
+      agent: snapshotAgentSessionLineage(lineage)
+    }
+    const manager = new SessionManager(paths.cwd, directory, sessionId, false, header)
+    for (const message of context.messages) manager.#appendForkMessage(message)
+    if (context.model) manager.appendModelChange(context.model.provider, context.model.modelId)
+    if (context.thinkingLevel) manager.appendThinkingLevelChange(context.thinkingLevel)
+    if (persist) manager.#commitAgentFork(join(directory, `${sessionId}.jsonl`))
+    return manager
   }
 
   static open(file: string): SessionManager {
@@ -444,6 +498,41 @@ export class SessionManager {
     manager.#model = loaded.model
     manager.#thinkingLevel = loaded.thinkingLevel
     manager.#rebuildPresentationMessages()
+    return manager
+  }
+
+  static discardAgentFork(paths: ZiPaths, rootSessionId: string, sessionId: string): void {
+    validateSessionId(sessionId)
+    const directory = agentSessionDirectory(paths, rootSessionId)
+    const file = join(directory, `${sessionId}.jsonl`)
+    rmSync(file, { force: true })
+    rmSync(blobDirectory(file), { recursive: true, force: true })
+    try {
+      for (const name of readdirSync(directory)) {
+        if (name.startsWith(`${sessionId}.jsonl.`) && name.endsWith(".tmp")) {
+          rmSync(join(directory, name), { force: true })
+        }
+      }
+      fsyncDirectory(directory)
+    } catch (cause) {
+      if (!isMissingFile(cause)) throw cause
+    }
+  }
+
+  static openAgent(paths: ZiPaths, sessionId: string, expected: AgentSessionLineage): SessionManager {
+    validateSessionId(sessionId)
+    validateAgentSessionLineage(expected)
+    const manager = SessionManager.open(
+      join(agentSessionDirectory(paths, expected.rootSessionId), `${sessionId}.jsonl`)
+    )
+    if (
+      manager.sessionId !== sessionId ||
+      manager.header.cwd !== paths.cwd ||
+      !manager.header.agent ||
+      !sameAgentSessionLineage(manager.header.agent, expected)
+    ) {
+      throw new Error("Agent session lineage does not match its durable graph record")
+    }
     return manager
   }
 
@@ -529,6 +618,14 @@ export class SessionManager {
     return this.#append({ type: "message", message })
   }
 
+  #appendForkMessage(message: AgentMessage): void {
+    if (message.role === "custom") {
+      this.appendCustomMessage({ customType: message.customType, content: message.content, display: message.display })
+      return
+    }
+    this.appendMessage(message)
+  }
+
   appendCustomEntry(customType: string, data?: SessionJson): CustomEntry {
     validateCustomType(customType)
     if (customType === programStateCustomType) throw new Error("Custom type is reserved for program state")
@@ -541,6 +638,14 @@ export class SessionManager {
   }
 
   appendCustomMessage(message: CustomMessageInput): CustomMessageEntry {
+    return this.#appendCustomMessage(message, false)
+  }
+
+  appendCriticalCustomMessage(message: CustomMessageInput): CustomMessageEntry {
+    return this.#appendCustomMessage(message, true)
+  }
+
+  #appendCustomMessage(message: CustomMessageInput, critical: boolean): CustomMessageEntry {
     const snapshot = snapshotCustomMessage(message)
     return this.#append(
       snapshot.details === undefined
@@ -556,7 +661,8 @@ export class SessionManager {
             content: snapshot.content,
             display: snapshot.display,
             details: snapshot.details
-          }
+          },
+      critical
     )
   }
 
@@ -590,6 +696,22 @@ export class SessionManager {
 
   latestWorkPlan(): WorkPlanEntry | undefined {
     return this.#workPlan
+  }
+
+  appendAgentTeam(data: AgentTeamEntryData): AgentTeamEntry {
+    if (!isAgentTeamEntryData(data)) throw new Error("Invalid agent-team journal entry")
+    const candidate = {
+      ...data,
+      id: crypto.randomUUID(),
+      parentId: this.#leafId,
+      timestamp: new Date().toISOString()
+    } as AgentTeamEntry
+    replayAgentTeamJournal([...this.agentTeamEntries(), candidate])
+    return this.#append(data, true)
+  }
+
+  agentTeamEntries(): readonly AgentTeamEntry[] {
+    return this.entries().filter(isAgentTeamStoredEntry)
   }
 
   appendSubagent(data: SubagentEntryInput): SubagentEntry {
@@ -655,6 +777,19 @@ export class SessionManager {
     }
   }
 
+  captureForkCheckpoint(): SessionForkCheckpoint {
+    const entries = freezeSnapshot(this.activeEntries())
+    return Object.freeze({
+      sessionId: this.sessionId,
+      leafId: this.#leafId,
+      entries,
+      messages: Object.freeze(projectMessages(entries, "context")),
+      ...(this.#model ? { model: Object.freeze({ ...this.#model }) } : {}),
+      ...(this.#thinkingLevel ? { thinkingLevel: this.#thinkingLevel } : {}),
+      ...(this.header.agent ? { lineage: snapshotAgentSessionLineage(this.header.agent) } : {})
+    })
+  }
+
   activeEntries(): readonly SessionEntry[] {
     return projectSessionEntries(this.#entries, "context")
   }
@@ -670,6 +805,10 @@ export class SessionManager {
   customEntries(customType: string): readonly CustomEntry[] {
     validateCustomType(customType)
     return this.#customEntries.filter(entry => entry.customType === customType)
+  }
+
+  customMessageEntries(): readonly CustomMessageEntry[] {
+    return this.entries().filter((entry): entry is CustomMessageEntry => entry.type === "custom_message")
   }
 
   latestActiveProgramState(): CustomEntry | undefined {
@@ -742,7 +881,12 @@ export class SessionManager {
     if (failure && !isMissingFile(failure.reason)) throw failure.reason
   }
 
-  #append<Entry extends SessionEntryData>(entry: Entry): SessionEntryBase & Entry {
+  #append<Entry extends SessionEntryData>(entry: Entry, critical = false): SessionEntryBase & Entry {
+    if (this.#criticalPersistenceFailure) {
+      throw new Error("Session journal must be reopened after a critical persistence failure", {
+        cause: this.#criticalPersistenceFailure
+      })
+    }
     const next = {
       ...entry,
       id: crypto.randomUUID(),
@@ -784,7 +928,7 @@ export class SessionManager {
     }
 
     const preparedCompaction = next.type === "compaction" ? this.#prepareCompaction(next) : undefined
-    this.#persist(next, prepared)
+    this.#persist(next, prepared, critical)
     this.#entries.push(next)
     this.#residentRecordBytes.push(prepared.bytes)
     this.#entryCount++
@@ -869,7 +1013,51 @@ export class SessionManager {
     this.#residentRecordBytes.splice(0, compaction.boundary)
   }
 
-  #persist(next: SessionEntry, prepared: PreparedRecord): void {
+  #commitAgentFork(file: string): void {
+    const records = this.#entries.map(entry => prepareRecord(entry, this.header.version, true))
+    const blobs = mergePreparedBlobs(records)
+    const journalBytes =
+      lineBytes(JSON.stringify(this.header)) + records.reduce((total, record) => total + record.bytes, 0)
+    const imageBlobBytes = [...blobs.values()].reduce((total, blob) => total + blob.bytes, 0)
+    if (journalBytes > maxSessionFileBytes || journalBytes + imageBlobBytes > maxSessionStorageBytes) {
+      throw new SessionCapacityError()
+    }
+
+    const directory = dirname(file)
+    mkdirDurable(directory)
+    const created = writeBlobs(blobDirectory(file), blobs, new Map(), true)
+    const pending = `${file}.${process.pid}.${crypto.randomUUID()}.tmp`
+    let published = false
+    try {
+      const handle = openSync(pending, "wx", 0o600)
+      try {
+        writeFileSync(handle, `${JSON.stringify(this.header)}\n`)
+        for (const record of records) writeFileSync(handle, record.line)
+        fsyncSync(handle)
+      } finally {
+        closeSync(handle)
+      }
+      linkSync(pending, file)
+      published = true
+      fsyncDirectory(directory)
+    } catch (cause) {
+      if (published) rmSync(file, { force: true })
+      for (const path of created) rmSync(path, { force: true })
+      throw cause
+    } finally {
+      rmSync(pending, { force: true })
+    }
+
+    this.#persistence = { type: "durable", file }
+    this.#journalBytes = journalBytes
+    this.#residentRecordBytes.length = 0
+    this.#residentRecordBytes.push(...records.map(record => record.bytes))
+    this.#imageBlobs.clear()
+    for (const [digest, blob] of blobs) this.#imageBlobs.set(digest, blob.bytes)
+    this.#imageBlobBytes = imageBlobBytes
+  }
+
+  #persist(next: SessionEntry, prepared: PreparedRecord, critical: boolean): void {
     const persistence = this.#persistence
     if (persistence.type === "memory") return
     if (persistence.type === "durable") {
@@ -877,10 +1065,22 @@ export class SessionManager {
       try {
         if (persistence.appendRepair?.type === "truncate")
           truncateSync(persistence.file, persistence.appendRepair.offset)
-        else if (persistence.appendRepair?.type === "newline") appendFileSync(persistence.file, "\n")
-        appendFileSync(persistence.file, prepared.line)
+        if (critical) {
+          const handle = openSync(persistence.file, "a", 0o600)
+          try {
+            if (persistence.appendRepair?.type === "newline") writeFileSync(handle, "\n")
+            writeFileSync(handle, prepared.line)
+            fsyncSync(handle)
+          } finally {
+            closeSync(handle)
+          }
+        } else {
+          if (persistence.appendRepair?.type === "newline") appendFileSync(persistence.file, "\n")
+          appendFileSync(persistence.file, prepared.line)
+        }
       } catch (cause) {
         for (const path of created) rmSync(path, { force: true })
+        if (critical) this.#poisonCriticalPersistence(cause)
         throw cause
       }
       if (persistence.appendRepair) this.#persistence = { type: "durable", file: persistence.file }
@@ -890,6 +1090,7 @@ export class SessionManager {
     if (
       next.type !== "custom" &&
       next.type !== "custom_message" &&
+      !next.type.startsWith("agent_") &&
       next.type !== "subagent" &&
       next.type !== "subagent_work_result" &&
       next.type !== "background_task_result" &&
@@ -907,15 +1108,22 @@ export class SessionManager {
       try {
         writeFileSync(handle, `${JSON.stringify(this.header)}\n`)
         for (const record of records) writeFileSync(handle, record.line)
+        if (critical) fsyncSync(handle)
       } finally {
         closeSync(handle)
       }
+      if (critical) fsyncDirectory(dirname(persistence.file))
     } catch (cause) {
       rmSync(persistence.file, { force: true })
       for (const path of created) rmSync(path, { force: true })
+      if (critical) this.#poisonCriticalPersistence(cause)
       throw cause
     }
     this.#persistence = { type: "durable", file: persistence.file }
+  }
+
+  #poisonCriticalPersistence(cause: unknown): void {
+    this.#criticalPersistenceFailure = cause instanceof Error ? cause : new Error(String(cause))
   }
 }
 
@@ -992,6 +1200,7 @@ function loadJournal(file: string, retention: "active" | "all"): LoadedJournal {
   let customStateBytes = 0
   const subagentWorkResultIds = new Set<string>()
   const backgroundTaskResultIds = new Set<string>()
+  const agentTeamEntries: AgentTeamEntry[] = []
   let programStateEntries = 0
   let programStateBytes = 0
   let previous: EntryReference | undefined
@@ -1039,6 +1248,7 @@ function loadJournal(file: string, retention: "active" | "all"): LoadedJournal {
       entryCount++
 
       if (entry.type === "compaction") latestBoundaryId = entry.firstKeptEntryId
+      else if (isAgentTeamStoredEntry(entry)) agentTeamEntries.push(entry)
       else if (entry.type === "subagent_work_result") {
         subagentWorkResultIds.add(subagentWorkResultIdentity(entry.name, entry.workCycle))
       } else if (entry.type === "background_task_result") backgroundTaskResultIds.add(entry.taskId)
@@ -1096,6 +1306,11 @@ function loadJournal(file: string, retention: "active" | "all"): LoadedJournal {
       }
     }
     if (!header) throw new Error(`Invalid session header: ${file}`)
+    try {
+      replayAgentTeamJournal(agentTeamEntries)
+    } catch (cause) {
+      throw new Error(`Invalid agent-team journal: ${file}`, { cause })
+    }
 
     verifyBlobs(file, imageBlobs)
     if (validBytes + (repair === "newline" ? 1 : 0) + imageBlobBytes > maxSessionStorageBytes) {
@@ -1221,11 +1436,19 @@ function parseHeader(line: string, file: string): SessionHeader {
     (value.version !== 1 && value.version !== 2) ||
     typeof value.id !== "string" ||
     !isValidTimestamp(value.timestamp) ||
-    typeof value.cwd !== "string"
+    typeof value.cwd !== "string" ||
+    (value.agent !== undefined && !isAgentSessionLineage(value.agent))
   ) {
     throw new Error(`Invalid session header: ${file}`)
   }
-  return { type: value.type, version: value.version, id: value.id, timestamp: value.timestamp, cwd: value.cwd }
+  return {
+    type: value.type,
+    version: value.version,
+    id: value.id,
+    timestamp: value.timestamp,
+    cwd: value.cwd,
+    ...(value.agent === undefined ? {} : { agent: snapshotAgentSessionLineage(value.agent) })
+  }
 }
 
 function parseStoredEntry(line: string, file: string, version: SessionFormatVersion): StoredSessionEntry {
@@ -1276,6 +1499,10 @@ function parseStoredEntry(line: string, file: string, version: SessionFormatVers
       steps: value.steps
     }
   }
+  if (typeof value.type === "string" && value.type.startsWith("agent_")) {
+    const { id: _id, parentId: _parentId, timestamp: _timestamp, ...data } = value
+    if (isAgentTeamEntryData(data)) return { ...base, ...data }
+  }
   if (value.type === "subagent" && isSubagentEntryData(value)) {
     return { ...base, ...value }
   }
@@ -1301,6 +1528,12 @@ function parseStoredEntry(line: string, file: string, version: SessionFormatVers
     }
   }
   throw new Error(`Invalid session entry: ${file}`)
+}
+
+function isAgentTeamStoredEntry(entry: SessionEntry | StoredSessionEntry): entry is AgentTeamEntry {
+  if (!entry.type.startsWith("agent_")) return false
+  const { id: _id, parentId: _parentId, timestamp: _timestamp, ...data } = entry
+  return isAgentTeamEntryData(data)
 }
 
 function hydrateStoredEntry(entry: StoredSessionEntry, file: string | undefined): SessionEntry {
@@ -1464,13 +1697,14 @@ function writeBlobs(
 ): string[] {
   const selected = [...blobs.values()].filter(blob => force || !known.has(blob.sha256))
   if (selected.length === 0) return []
-  mkdirSync(directory, { recursive: true, mode: 0o700 })
+  mkdirDurable(directory)
   const created: string[] = []
   try {
     for (const blob of selected) {
       const path = join(directory, blob.sha256)
       if (writeBlob(path, blob)) created.push(path)
     }
+    fsyncDirectory(directory)
     return created
   } catch (cause) {
     for (const path of created) rmSync(path, { force: true })
@@ -1493,7 +1727,13 @@ function writeBlob(path: string, blob: PreparedBlob): boolean {
   }
 
   const pending = `${path}.${process.pid}.${crypto.randomUUID()}.tmp`
-  writeFileSync(pending, blob.data, { flag: "wx", mode: 0o600 })
+  const handle = openSync(pending, "wx", 0o600)
+  try {
+    writeFileSync(handle, blob.data)
+    fsyncSync(handle)
+  } finally {
+    closeSync(handle)
+  }
   try {
     linkSync(pending, path)
     return true
@@ -1542,6 +1782,42 @@ function hashFile(path: string): string {
 
 function blobDirectory(file: string): string {
   return file.endsWith(".jsonl") ? `${file.slice(0, -".jsonl".length)}.blobs` : `${file}.blobs`
+}
+
+function mkdirDurable(path: string): void {
+  const missing: string[] = []
+  let current = path
+  for (;;) {
+    try {
+      if (!statSync(current).isDirectory()) throw new Error(`Session path is not a directory: ${current}`)
+      break
+    } catch (cause) {
+      if (!isMissingFile(cause)) throw cause
+      missing.push(current)
+      const parent = dirname(current)
+      if (parent === current) throw cause
+      current = parent
+    }
+  }
+  for (let index = missing.length - 1; index >= 0; index--) {
+    const directory = missing[index]!
+    try {
+      mkdirSync(directory, { mode: 0o700 })
+    } catch (cause) {
+      if (!isAlreadyExists(cause) || !statSync(directory).isDirectory()) throw cause
+    }
+    fsyncDirectory(dirname(directory))
+  }
+}
+
+function fsyncDirectory(path: string): void {
+  if (process.platform === "win32") return
+  const handle = openSync(path, "r")
+  try {
+    fsyncSync(handle)
+  } finally {
+    closeSync(handle)
+  }
 }
 
 function sha256(data: Uint8Array): string {
@@ -1593,6 +1869,82 @@ function sessionMessageText(content: unknown): string {
 
 function emptySessionList(): SessionListResult {
   return Object.freeze({ sessions: Object.freeze([]), invalid: 0, omitted: 0 })
+}
+
+function agentSessionDirectory(paths: ZiPaths, rootSessionId: string): string {
+  validateSessionId(rootSessionId)
+  return join(paths.sessionDir, "agents", rootSessionId)
+}
+
+function validateSessionId(value: unknown): asserts value is string {
+  if (typeof value !== "string" || !/^[A-Za-z0-9-]+$/u.test(value) || Buffer.byteLength(value) > 128) {
+    throw new Error("Invalid agent session ID")
+  }
+}
+
+function isAgentSessionLineage(value: unknown): value is AgentSessionLineage {
+  if (
+    !isRecord(value) ||
+    !hasOnlyKeys(value, ["rootSessionId", "parentSessionId", "parentEntryId", "path", "generation"])
+  ) {
+    return false
+  }
+  try {
+    validateSessionId(value.rootSessionId)
+    validateSessionId(value.parentSessionId)
+    if (value.parentEntryId !== null) validateSessionId(value.parentEntryId)
+    if (!isPositiveInteger(value.generation) || typeof value.path !== "string") return false
+    const path = parseAgentPath(value.path)
+    return value.generation === path.split("/").length - 2
+  } catch {
+    return false
+  }
+}
+
+function validateAgentSessionLineage(value: unknown): asserts value is AgentSessionLineage {
+  if (!isAgentSessionLineage(value)) throw new Error("Invalid agent session lineage")
+}
+
+function snapshotAgentSessionLineage(value: AgentSessionLineage): AgentSessionLineage {
+  return Object.freeze({
+    rootSessionId: value.rootSessionId,
+    parentSessionId: value.parentSessionId,
+    parentEntryId: value.parentEntryId,
+    path: parseAgentPath(value.path),
+    generation: value.generation
+  })
+}
+
+function sameAgentSessionLineage(left: AgentSessionLineage, right: AgentSessionLineage): boolean {
+  return (
+    left.rootSessionId === right.rootSessionId &&
+    left.parentSessionId === right.parentSessionId &&
+    left.parentEntryId === right.parentEntryId &&
+    left.path === right.path &&
+    left.generation === right.generation
+  )
+}
+
+function freezeSnapshot<Value>(value: Value): Value {
+  let snapshot: Value
+  try {
+    snapshot = structuredClone(value)
+  } catch {
+    throw new Error("Invalid session fork checkpoint")
+  }
+  if (snapshot === null || typeof snapshot !== "object") return snapshot
+  const pending: object[] = [snapshot]
+  const visited = new Set<object>()
+  while (pending.length > 0) {
+    const current = pending.pop()!
+    if (visited.has(current)) continue
+    visited.add(current)
+    for (const child of Object.values(current)) {
+      if (child !== null && typeof child === "object") pending.push(child)
+    }
+    Object.freeze(current)
+  }
+  return snapshot
 }
 
 function isMissingFile(cause: unknown): boolean {
@@ -2108,6 +2460,11 @@ function validateJournal(entries: readonly SessionEntry[], file: string): void {
     }
     ids.add(entry.id)
   }
+  try {
+    replayAgentTeamJournal(entries.filter(isAgentTeamStoredEntry))
+  } catch (cause) {
+    throw new Error(`Invalid agent-team journal: ${file}`, { cause })
+  }
 }
 
 function validateNextEntry(next: SessionEntry, preceding: readonly SessionEntry[], file: string): void {
@@ -2117,6 +2474,11 @@ function validateNextEntry(next: SessionEntry, preceding: readonly SessionEntry[
   }
   if (next.type === "custom_message") {
     if (!isStoredCustomMessageEntry(next, 1)) throw new Error(`Invalid session entry: ${file}`)
+    return
+  }
+  if (next.type.startsWith("agent_")) {
+    const { id: _id, parentId: _parentId, timestamp: _timestamp, ...data } = next
+    if (!isAgentTeamEntryData(data)) throw new Error(`Invalid session entry: ${file}`)
     return
   }
   if (next.type === "subagent") {
@@ -2233,6 +2595,15 @@ export function sessionEntryToContextMessage(entry: SessionEntry): AgentMessage 
     case "model_change":
     case "thinking_level_change":
     case "retry":
+    case "agent_spawn_reserved":
+    case "agent_spawn_committed":
+    case "agent_spawn_aborted":
+    case "agent_turn_reserved":
+    case "agent_turn_started":
+    case "agent_turn_settled":
+    case "agent_mail_queued":
+    case "agent_mail_delivered":
+    case "agent_completion_delivered":
     case "subagent":
     case "subagent_work_result":
     case "background_task_result":
@@ -2255,6 +2626,15 @@ function sessionEntryToPresentationMessage(entry: SessionEntry): AgentMessage | 
     case "model_change":
     case "thinking_level_change":
     case "retry":
+    case "agent_spawn_reserved":
+    case "agent_spawn_committed":
+    case "agent_spawn_aborted":
+    case "agent_turn_reserved":
+    case "agent_turn_started":
+    case "agent_turn_settled":
+    case "agent_mail_queued":
+    case "agent_mail_delivered":
+    case "agent_completion_delivered":
     case "subagent":
     case "subagent_work_result":
     case "background_task_result":

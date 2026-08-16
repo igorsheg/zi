@@ -188,6 +188,7 @@ class AgentSessionTrace {
       case "follow_up_mode_changed":
       case "shell_task_changed":
       case "work_plan_changed":
+      case "agent_changed":
       case "subagent_changed":
       case "authentication_changed":
         return

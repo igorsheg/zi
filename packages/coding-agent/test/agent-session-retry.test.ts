@@ -333,7 +333,7 @@ test("compaction never folds excluded retry failures back into summarized contex
   const models = createModels()
   const faux = fauxProvider({
     provider: "retry-compaction",
-    models: [{ id: "model", contextWindow: 4_000, maxTokens: 500 }]
+    models: [{ id: "model", contextWindow: 8_000, maxTokens: 500 }]
   })
   models.setProvider(faux.provider)
   let summaryInput = ""
