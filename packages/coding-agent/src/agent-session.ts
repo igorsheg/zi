@@ -679,11 +679,7 @@ export class AgentSession {
                 this.#agentTeam!.team.interrupt(resolveAgentPath(this.#agentTeam!.path, target)),
               list: (_extensionId, pathPrefix) =>
                 this.#agentTeam!.team
-                  .snapshots(
-                    pathPrefix === undefined
-                      ? this.#agentTeam!.path
-                      : resolveAgentPath(this.#agentTeam!.path, pathPrefix)
-                  )
+                  .snapshots(pathPrefix === undefined ? undefined : resolveAgentPath(this.#agentTeam!.path, pathPrefix))
                   .map(extensionAgentSnapshot)
             }
           }

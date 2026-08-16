@@ -1033,6 +1033,93 @@ export default function (zi) {
   }
 }, 15_000)
 
+test("descendant extension agent listing defaults to the complete root tree", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-runtime-extension-agent-list-"))
+  const cwd = join(root, "project")
+  const agentDir = join(root, "agent")
+  await mkdir(cwd, { recursive: true })
+  await mkdir(join(agentDir, "extensions"), { recursive: true })
+  await writeFile(
+    join(agentDir, "extensions", "agent-list.ts"),
+    `import { Schema } from "@with-zi/extension-api"
+export default function (zi) {
+  zi.registerTool({
+    name: "list_agent_paths",
+    description: "List durable agent paths through the extension agent capability",
+    parameters: Schema.object({}),
+    outputSchema: Schema.string(),
+    async execute() {
+      if (!zi.agents) throw new Error("AgentTeam API unavailable")
+      return JSON.stringify((await zi.agents.list()).map(agent => agent.path))
+    }
+  })
+}
+`
+  )
+  const models = createModels()
+  const rootProvider = fauxProvider()
+  const branchAProvider = fauxProvider({ provider: "branch-a", models: [{ id: "model", reasoning: true }] })
+  const branchBProvider = fauxProvider({ provider: "branch-b", models: [{ id: "model", reasoning: true }] })
+  models.setProvider(rootProvider.provider)
+  models.setProvider(branchAProvider.provider)
+  models.setProvider(branchBProvider.provider)
+  let observedPaths: string[] = []
+  rootProvider.setResponses([
+    fauxAssistantMessage(
+      fauxToolCall(
+        "spawn_agent",
+        { task_name: "branch_b", message: "finish branch b", model: "branch-b/model" },
+        { id: "spawn-branch-b" }
+      ),
+      { stopReason: "toolUse" }
+    ),
+    fauxAssistantMessage("root after branch b spawn"),
+    fauxAssistantMessage("root received branch b completion"),
+    fauxAssistantMessage(
+      fauxToolCall(
+        "spawn_agent",
+        { task_name: "branch_a", message: "list the tree", model: "branch-a/model" },
+        { id: "spawn-branch-a" }
+      ),
+      { stopReason: "toolUse" }
+    ),
+    fauxAssistantMessage("root after branch a spawn"),
+    fauxAssistantMessage("root received branch a completion")
+  ])
+  branchBProvider.setResponses([fauxAssistantMessage("branch b complete")])
+  branchAProvider.setResponses([
+    fauxAssistantMessage(fauxToolCall("list_agent_paths", {}, { id: "list-agent-paths" }), { stopReason: "toolUse" }),
+    context => {
+      const result = context.messages.findLast(
+        message => message.role === "toolResult" && message.toolName === "list_agent_paths"
+      )
+      const payload = JSON.stringify(result)
+      observedPaths = [...new Set(payload.match(/\/root\/branch_[ab]/g) ?? [])].toSorted()
+      return fauxAssistantMessage("branch a complete")
+    }
+  ])
+  const runtime = await createAgentRuntime({
+    cwd,
+    agentDir,
+    modelFactory: () => models,
+    session: { type: "new", persist: true },
+    extensionWorkerCommand: workerCommand
+  })
+  try {
+    await runtime.session.prompt("Spawn branch b.")
+    await runtime.session.prompt("Spawn branch a and inspect the root tree.")
+    await waitForCondition(() => observedPaths.length > 0, 2_000)
+    expect({
+      observedPaths,
+      snapshots: runtime.session.agentSnapshots().map(snapshot => String(snapshot.path))
+    }).toEqual({ observedPaths: ["/root/branch_a", "/root/branch_b"], snapshots: ["/root/branch_a", "/root/branch_b"] })
+  } finally {
+    runtime.session.dispose()
+    await runtime.session.waitForIdle()
+    await rm(root, { recursive: true, force: true })
+  }
+}, 15_000)
+
 test("a failed extension generation is removed from current and future provider catalogs", async () => {
   const root = await mkdtemp(join(tmpdir(), "zi-runtime-extension-tool-failure-"))
   const cwd = join(root, "project")
