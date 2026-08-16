@@ -6,14 +6,13 @@ export type ResourceKind =
   | "append-system-prompt"
   | "skill"
   | "prompt-template"
-  | "subagent-profile"
   | "discovery"
 
 export type ResourceDiagnostic =
   | { readonly type: "warning"; readonly resource: ResourceKind; readonly path: string; readonly message: string }
   | {
       readonly type: "collision"
-      readonly resource: "skill" | "prompt-template" | "subagent-profile"
+      readonly resource: "skill" | "prompt-template"
       readonly name: string
       readonly winnerPath: string
       readonly loserPath: string

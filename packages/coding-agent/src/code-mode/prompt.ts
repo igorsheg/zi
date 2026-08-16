@@ -3,7 +3,7 @@ import type { ToolSurface } from "../tool-surface.js"
 export function codeModeDoctrine(toolSurface: ToolSurface = "direct-and-code"): string {
   const toolGuidance =
     toolSurface === "code-only"
-      ? "The only model-facing tool is code. Perform ordinary file, shell, extension, and subagent operations through zi.* inside code cells. Keep cells cohesive: group a short related sequence when it avoids model round trips, but do not build a large program around one call. Prefer focused zi.edit calls to embedding large source files in JavaScript template literals."
+      ? "The only model-facing tool is code. Perform ordinary file, shell, extension, and agent collaboration operations through zi.* inside code cells. Keep cells cohesive: group a short related sequence when it avoids model round trips, but do not build a large program around one call. Prefer focused zi.edit calls to embedding large source files in JavaScript template literals."
       : "Use direct tools for one ordinary read, edit, write, or command. Use code when work benefits from loops, branching, filtering, aggregation, reusable intermediate values, or multiple dependent tool calls."
   return `# Programmatic runtime
 
