@@ -4,12 +4,16 @@ import { basename, dirname, join } from "node:path"
 import type { QueueMode, ThinkingLevel } from "@earendil-works/pi-agent-core"
 import lockfile from "proper-lockfile"
 
-import { isRecord } from "./guards.js"
+import {
+  defaultAgentTurnTimeoutMs,
+  defaultAgentWaitTimeoutMs,
+  isAgentTurnTimeout,
+  isAgentWaitTimeout
+} from "./agent-team/timeouts.js"
+import { isRecord, isThinkingLevel } from "./guards.js"
 import type { ZiPaths } from "./paths.js"
 import type { ProjectConfigurationAdmission } from "./project-trust.js"
 import { isRetryCount, isRetryDelay } from "./retry.js"
-import { defaultWaitTimeoutMs, isSubagentWaitTimeout } from "./subagents/wait-policy.js"
-import { defaultSubagentWorkTimeoutMs, isSubagentWorkTimeout } from "./subagents/work-policy.js"
 
 export { maxRetryBaseDelayMs, maxRetryCount } from "./retry.js"
 
@@ -21,8 +25,8 @@ export interface AgentSettings {
   steeringMode: QueueMode
   followUpMode: QueueMode
   codexFastMode: boolean
-  subagentWaitTimeoutMs: number
-  subagentWorkTimeoutMs: number
+  agentWaitTimeoutMs: number
+  agentTurnTimeoutMs: number
   retryEnabled: boolean
   retryMaxRetries: number
   retryBaseDelayMs: number
@@ -43,8 +47,8 @@ const defaults: AgentSettings = {
   steeringMode: "one-at-a-time",
   followUpMode: "one-at-a-time",
   codexFastMode: false,
-  subagentWaitTimeoutMs: defaultWaitTimeoutMs,
-  subagentWorkTimeoutMs: defaultSubagentWorkTimeoutMs,
+  agentWaitTimeoutMs: defaultAgentWaitTimeoutMs,
+  agentTurnTimeoutMs: defaultAgentTurnTimeoutMs,
   retryEnabled: true,
   retryMaxRetries: 3,
   retryBaseDelayMs: 2_000,
@@ -237,11 +241,11 @@ function validateSettingsPatch(patch: Partial<AgentSettings>): void {
   if ("codexFastMode" in patch && typeof patch.codexFastMode !== "boolean") {
     throw new Error("Invalid codexFastMode setting")
   }
-  if ("subagentWaitTimeoutMs" in patch && !isSubagentWaitTimeout(patch.subagentWaitTimeoutMs)) {
-    throw new Error("Invalid subagentWaitTimeoutMs setting")
+  if ("agentWaitTimeoutMs" in patch && !isAgentWaitTimeout(patch.agentWaitTimeoutMs)) {
+    throw new Error("Invalid agentWaitTimeoutMs setting")
   }
-  if ("subagentWorkTimeoutMs" in patch && !isSubagentWorkTimeout(patch.subagentWorkTimeoutMs)) {
-    throw new Error("Invalid subagentWorkTimeoutMs setting")
+  if ("agentTurnTimeoutMs" in patch && !isAgentTurnTimeout(patch.agentTurnTimeoutMs)) {
+    throw new Error("Invalid agentTurnTimeoutMs setting")
   }
   if ("retryEnabled" in patch && typeof patch.retryEnabled !== "boolean") {
     throw new Error("Invalid retryEnabled setting")
@@ -298,8 +302,8 @@ function clearOverrides(overrides: Partial<AgentSettings>, patch: Partial<AgentS
   if ("steeringMode" in patch) delete overrides.steeringMode
   if ("followUpMode" in patch) delete overrides.followUpMode
   if ("codexFastMode" in patch) delete overrides.codexFastMode
-  if ("subagentWaitTimeoutMs" in patch) delete overrides.subagentWaitTimeoutMs
-  if ("subagentWorkTimeoutMs" in patch) delete overrides.subagentWorkTimeoutMs
+  if ("agentWaitTimeoutMs" in patch) delete overrides.agentWaitTimeoutMs
+  if ("agentTurnTimeoutMs" in patch) delete overrides.agentTurnTimeoutMs
   if ("retryEnabled" in patch) delete overrides.retryEnabled
   if ("retryMaxRetries" in patch) delete overrides.retryMaxRetries
   if ("retryBaseDelayMs" in patch) delete overrides.retryBaseDelayMs
@@ -416,13 +420,13 @@ function loadSettings(path: string): Partial<AgentSettings> {
     if (typeof value.codexFastMode !== "boolean") throw invalidSetting(path, "codexFastMode")
     settings.codexFastMode = value.codexFastMode
   }
-  if (value.subagentWaitTimeoutMs !== undefined) {
-    if (!isSubagentWaitTimeout(value.subagentWaitTimeoutMs)) throw invalidSetting(path, "subagentWaitTimeoutMs")
-    settings.subagentWaitTimeoutMs = value.subagentWaitTimeoutMs
+  if (value.agentWaitTimeoutMs !== undefined) {
+    if (!isAgentWaitTimeout(value.agentWaitTimeoutMs)) throw invalidSetting(path, "agentWaitTimeoutMs")
+    settings.agentWaitTimeoutMs = value.agentWaitTimeoutMs
   }
-  if (value.subagentWorkTimeoutMs !== undefined) {
-    if (!isSubagentWorkTimeout(value.subagentWorkTimeoutMs)) throw invalidSetting(path, "subagentWorkTimeoutMs")
-    settings.subagentWorkTimeoutMs = value.subagentWorkTimeoutMs
+  if (value.agentTurnTimeoutMs !== undefined) {
+    if (!isAgentTurnTimeout(value.agentTurnTimeoutMs)) throw invalidSetting(path, "agentTurnTimeoutMs")
+    settings.agentTurnTimeoutMs = value.agentTurnTimeoutMs
   }
   if (value.retryEnabled !== undefined) {
     if (typeof value.retryEnabled !== "boolean") throw invalidSetting(path, "retryEnabled")
@@ -535,18 +539,6 @@ function normalizeSettingsPatch(patch: Partial<AgentSettings>): Partial<AgentSet
 
 function freezeResourcePaths(paths: readonly string[]): readonly string[] {
   return Object.freeze(paths.map(path => path.trim()))
-}
-
-function isThinkingLevel(value: unknown): value is ThinkingLevel {
-  return (
-    value === "off" ||
-    value === "minimal" ||
-    value === "low" ||
-    value === "medium" ||
-    value === "high" ||
-    value === "xhigh" ||
-    value === "max"
-  )
 }
 
 function hasCode(error: unknown, code: string): boolean {

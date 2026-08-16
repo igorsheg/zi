@@ -55,7 +55,7 @@ agent_settled
 
 Retries and automatic compaction can produce multiple `agent_start` through `agent_end` lifecycles for one prompt. `agent_settled` occurs once after retry and compaction policy for that prompt is complete.
 
-Extension tools and profile-driven subagents appear through the same ordinary tool and session event stream. Extension logs never enter protocol stdout.
+Extension tools and recursive agent operations appear through the same ordinary tool and session event stream. Extension logs never enter protocol stdout.
 
 ## Output contract
 

@@ -12,6 +12,7 @@ const agent = {
   path: "/root/durable_probe" as const,
   parentPath: "/root" as const,
   taskName: "durable_probe",
+  agentType: "worker" as const,
   residency: "unloaded" as const,
   turnState: "idle" as const,
   turnNumber: 1,
@@ -67,9 +68,9 @@ test("AgentTeam rows replace JSON envelopes with semantic terminal presentation"
   try {
     await setup.renderOnce()
     const frame = setup.captureCharFrame()
-    expect(frame).toContain("◆ Spawn Durable probe · admitted · working · resident · /root/durable_probe")
+    expect(frame).toContain("◆ Spawn Durable probe · admitted · type worker · working · resident")
     expect(frame).toContain("◆ Agents 1 agent · 1 completed")
-    expect(frame).toContain("Durable probe — completed · unloaded · turn 1 — /root/durable_probe")
+    expect(frame).toContain("Durable probe — type worker · completed · unloaded · turn 1 — /root/durable_probe")
     expect(frame).not.toContain('"agent"')
     expect(frame).not.toContain("Arguments:")
     expect(frame).not.toContain("Result:")

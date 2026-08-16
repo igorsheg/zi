@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test"
 
-import type { AgentSession, AgentSessionEvent } from "@with-zi/coding-agent"
+import { parseAgentPath, type AgentSession, type AgentSessionEvent } from "@with-zi/coding-agent"
 import {
   createModels,
   createTestAgentRuntime as createAgentRuntime,
@@ -101,7 +101,7 @@ test("background ownership events invalidate status without rebuilding the trans
   try {
     let state = initialInteractiveState(session)
     state = transitionInteractiveState(state, { type: "shell_task_changed", taskId: "shell-1" })
-    state = transitionInteractiveState(state, { type: "subagent_changed", name: "reviewer" })
+    state = transitionInteractiveState(state, { type: "agent_changed", path: parseAgentPath("/root/reviewer") })
 
     expect(state.promptRevision).toBe(2)
     expect(state.transcriptRevision).toBe(0)

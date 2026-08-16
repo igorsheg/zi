@@ -6,7 +6,7 @@ const agent = {
   path: "/root/shutdown-reviewer" as const,
   parentPath: "/root" as const,
   taskName: "shutdown-reviewer",
-  agentType: "reviewer",
+  agentType: "worker",
   residency: "unloaded" as const,
   turnState: "idle" as const,
   turnNumber: 1,
@@ -22,7 +22,7 @@ test("spawn presents the delegated task and durable agent identity without JSON"
     args: {
       task_name: "shutdown-reviewer",
       message: "Review AgentTeam shutdown\nand report ownership races.",
-      agent_type: "reviewer"
+      agent_type: "worker"
     },
     result: {
       content: [{ type: "text", text: '{"agent":{"path":"/root/shutdown-reviewer"}}' }],
@@ -33,7 +33,7 @@ test("spawn presents the delegated task and durable agent identity without JSON"
   expect(presentation.header).toEqual({
     label: "Spawn",
     subject: { type: "text", text: "Shutdown reviewer" },
-    details: ["admitted", "role reviewer", "working", "resident", "/root/shutdown-reviewer"]
+    details: ["admitted", "type worker", "working", "resident", "/root/shutdown-reviewer"]
   })
   expect(presentation.body).toEqual({
     type: "text",
@@ -112,7 +112,7 @@ test("list presents bounded semantic agent rows instead of the model JSON envelo
   })
   expect(presentation.body).toEqual({
     type: "text",
-    text: "Shutdown reviewer — role reviewer · completed · unloaded · turn 1 — /root/shutdown-reviewer\nActive worker — role reviewer · working · resident · turn 2 — /root/active-worker",
+    text: "Shutdown reviewer — type worker · completed · unloaded · turn 1 — /root/shutdown-reviewer\nActive worker — type worker · working · resident · turn 2 — /root/active-worker",
     tone: "muted"
   })
   expect(presentation.preview.compact).toEqual({ type: "head", rows: 2 })

@@ -10,14 +10,13 @@ import {
 import {
   projectToolPresentation,
   type AgentMessage,
-  type ShellTaskSnapshot,
-  type SubagentSnapshot
+  type AgentSnapshot,
+  type ShellTaskSnapshot
 } from "@with-zi/coding-agent"
 
 import { createThinkingSyntaxStyle, type Theme } from "../../theme.js"
 import type { InteractiveKeybindings, TranscriptKeyAction } from "../interactive-keybindings.js"
 import type { ActiveTool } from "../interactive-store.js"
-import { isActiveSubagentLifecycle } from "../subagent-activity.js"
 import type { TranscriptItemView } from "./item.js"
 import {
   createMessageItemView,
@@ -1066,7 +1065,7 @@ function transcriptStatusPresentation(
 ): TranscriptStatusPresentation {
   return {
     activity: transcriptActivityStatus(session, interruptHint, now),
-    background: projectTranscriptBackgroundStatus(session.shellTasks, session.subagentSnapshots?.()),
+    background: projectTranscriptBackgroundStatus(session.shellTasks, session.agentSnapshots?.()),
     workPlan: transcriptWorkPlanStatus(session.workPlan),
     unseenOutput: navigation.type === "detached" && navigation.unseenOutput
   }
@@ -1100,27 +1099,27 @@ export interface TranscriptShellActivity {
   readonly placement?: Extract<ShellTaskSnapshot, { readonly type: "starting" }>["placement"]
 }
 
-export interface TranscriptSubagentActivity {
-  readonly lifecycle: SubagentSnapshot["lifecycle"]
+export interface TranscriptAgentActivity {
+  readonly turn: AgentSnapshot["turn"]
 }
 
 export function projectTranscriptBackgroundStatus(
   shellTasks: readonly TranscriptShellActivity[] = [],
-  subagents: readonly TranscriptSubagentActivity[] = []
+  agents: readonly TranscriptAgentActivity[] = []
 ): TranscriptStatusPresentation["background"] {
   let shellCommands = 0
   for (const task of shellTasks) {
     if (task.type === "background" || (task.type === "starting" && task.placement === "background")) shellCommands++
   }
 
-  let activeSubagents = 0
-  for (const snapshot of subagents) {
-    if (isActiveSubagentLifecycle(snapshot.lifecycle)) activeSubagents++
+  let activeAgents = 0
+  for (const snapshot of agents) {
+    if (snapshot.turn !== "idle") activeAgents++
   }
 
-  return shellCommands === 0 && activeSubagents === 0
+  return shellCommands === 0 && activeAgents === 0
     ? { type: "idle" }
-    : { type: "running", shellCommands, subagents: activeSubagents }
+    : { type: "running", shellCommands, agents: activeAgents }
 }
 
 function transcriptWorkPlanStatus(plan: TranscriptSession["workPlan"]): TranscriptStatusPresentation["workPlan"] {

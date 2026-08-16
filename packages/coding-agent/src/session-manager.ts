@@ -43,11 +43,6 @@ import {
   type BackgroundTaskResultEntryData,
   type BackgroundTaskResultInput
 } from "./shell-result.js"
-import {
-  isSubagentWorkResultEntryData,
-  type SubagentWorkResultEntryData,
-  type SubagentWorkResultInput
-} from "./subagents/result.js"
 import { isWorkPlanSnapshot, type WorkPlanSnapshot, type WorkPlanStep } from "./work-plan.js"
 
 export type SessionFormatVersion = 1 | 2
@@ -139,32 +134,6 @@ export interface WorkPlanEntryData {
   readonly steps: readonly WorkPlanStep[]
 }
 
-export type SubagentEntryData =
-  | { readonly type: "subagent"; readonly event: "starting"; readonly name: string }
-  | { readonly type: "subagent"; readonly event: "ready"; readonly name: string; readonly sessionId?: string }
-  | {
-      readonly type: "subagent"
-      readonly event: "work_cycle_started"
-      readonly name: string
-      readonly workCycle: number
-      readonly task?: string
-    }
-  | {
-      readonly type: "subagent"
-      readonly event: "work_cycle_delivered"
-      readonly name: string
-      readonly workCycle: number
-    }
-  | { readonly type: "subagent"; readonly event: "closing"; readonly name: string; readonly reason: string }
-  | { readonly type: "subagent"; readonly event: "exited"; readonly name: string; readonly outcome: string }
-  | { readonly type: "subagent"; readonly event: "lost"; readonly name: string; readonly reason: "session_restored" }
-
-export type SubagentEntryInput = SubagentEntryData extends infer Entry
-  ? Entry extends { readonly type: "subagent" }
-    ? Omit<Entry, "type">
-    : never
-  : never
-
 export type SessionEntryData =
   | { type: "message"; message: AgentMessage }
   | { type: "model_change"; provider: string; modelId: string }
@@ -175,8 +144,6 @@ export type SessionEntryData =
   | CustomMessageEntryData
   | WorkPlanEntryData
   | AgentTeamEntryData
-  | SubagentEntryData
-  | SubagentWorkResultEntryData
   | BackgroundTaskResultEntryData
 
 export type SessionEntry = SessionEntryBase & SessionEntryData
@@ -187,8 +154,6 @@ export type CustomEntry = SessionEntryBase & CustomEntryData
 export type CustomMessageEntry = SessionEntryBase & CustomMessageEntryData
 export type WorkPlanEntry = SessionEntryBase & WorkPlanEntryData
 export type { AgentTeamEntry }
-export type SubagentEntry = SessionEntryBase & SubagentEntryData
-export type SubagentWorkResultEntry = SessionEntryBase & SubagentWorkResultEntryData
 export type BackgroundTaskResultEntry = SessionEntryBase & BackgroundTaskResultEntryData
 export interface NewSessionOptions {
   sessionId?: string
@@ -216,7 +181,6 @@ export const maxCustomStateEntries = 2048
 export const maxCustomStateBytes = 2 * 1024 * 1024
 export const maxProgramStateEntries = 2048
 export const maxProgramStateBytes = 8 * 1024 * 1024
-export const maxSubagentJournalTextBytes = 8 * 1024
 
 const customTypePattern = /^[a-z][a-z0-9._:/-]*$/
 const programStateCustomType = "zi.programmatic-state.v1"
@@ -360,7 +324,6 @@ interface LoadedJournal {
   readonly imageBlobBytes: number
   readonly customEntries: CustomEntry[]
   readonly customStateBytes: number
-  readonly subagentWorkResultIds: Set<string>
   readonly backgroundTaskResultIds: Set<string>
   readonly programStateEntries: number
   readonly programStateBytes: number
@@ -399,7 +362,6 @@ export class SessionManager {
   readonly #customEntries: CustomEntry[] = []
   #coldMemory: readonly SessionColdBlock[] = []
   readonly #imageBlobs = new Map<string, number>()
-  readonly #subagentWorkResultIds = new Set<string>()
   readonly #backgroundTaskResultIds = new Set<string>()
   #promptHistoryBytes = 0
   #customStateBytes = 0
@@ -489,7 +451,6 @@ export class SessionManager {
     manager.#imageBlobBytes = loaded.imageBlobBytes
     manager.#customEntries.push(...loaded.customEntries)
     manager.#customStateBytes = loaded.customStateBytes
-    for (const id of loaded.subagentWorkResultIds) manager.#subagentWorkResultIds.add(id)
     for (const id of loaded.backgroundTaskResultIds) manager.#backgroundTaskResultIds.add(id)
     manager.#programStateEntries = loaded.programStateEntries
     manager.#programStateBytes = loaded.programStateBytes
@@ -714,28 +675,6 @@ export class SessionManager {
     return this.entries().filter(isAgentTeamStoredEntry)
   }
 
-  appendSubagent(data: SubagentEntryInput): SubagentEntry {
-    const entry = { type: "subagent" as const, ...data } as SubagentEntryData
-    validateSubagentEntryData(entry)
-    return this.#append(entry)
-  }
-
-  subagentEntries(): readonly SubagentEntry[] {
-    return this.entries().filter((entry): entry is SubagentEntry => entry.type === "subagent")
-  }
-
-  appendSubagentWorkResult(data: SubagentWorkResultInput): SubagentWorkResultEntry {
-    const identity = subagentWorkResultIdentity(data.name, data.workCycle)
-    if (this.#subagentWorkResultIds.has(identity)) {
-      throw new Error(`Subagent work result already exists: ${data.name}/${data.workCycle}`)
-    }
-    return this.#append({ type: "subagent_work_result", ...data })
-  }
-
-  subagentWorkResults(): readonly SubagentWorkResultEntry[] {
-    return this.entries().filter((entry): entry is SubagentWorkResultEntry => entry.type === "subagent_work_result")
-  }
-
   appendBackgroundTaskResult(data: BackgroundTaskResultInput): BackgroundTaskResultEntry {
     if (this.#backgroundTaskResultIds.has(data.taskId)) {
       throw new Error(`Background task result already exists: ${data.taskId}`)
@@ -897,7 +836,7 @@ export class SessionManager {
     if (next.type === "custom") freezeCustomEntry(next)
     else if (next.type === "custom_message") freezeCustomMessageEntry(next)
     else if (next.type === "work_plan") freezeWorkPlanEntry(next)
-    else if (next.type === "subagent_work_result" || next.type === "background_task_result") Object.freeze(next)
+    else if (next.type === "background_task_result") Object.freeze(next)
 
     const isProgramStateEntry = next.type === "custom" && next.customType === programStateCustomType
     const isPublicCustomEntry = next.type === "custom" && !isProgramStateEntry
@@ -945,9 +884,7 @@ export class SessionManager {
       this.#programStateEntries++
       this.#programStateBytes += programStateBytes
     }
-    if (next.type === "subagent_work_result") {
-      this.#subagentWorkResultIds.add(subagentWorkResultIdentity(next.name, next.workCycle))
-    } else if (next.type === "background_task_result") {
+    if (next.type === "background_task_result") {
       this.#backgroundTaskResultIds.add(next.taskId)
     }
     this.#updatePresentationMessages(next)
@@ -1091,8 +1028,6 @@ export class SessionManager {
       next.type !== "custom" &&
       next.type !== "custom_message" &&
       !next.type.startsWith("agent_") &&
-      next.type !== "subagent" &&
-      next.type !== "subagent_work_result" &&
       next.type !== "background_task_result" &&
       (next.type !== "message" || next.message.role !== "assistant")
     ) {
@@ -1198,7 +1133,6 @@ function loadJournal(file: string, retention: "active" | "all"): LoadedJournal {
   let imageBlobBytes = 0
   const customEntries: CustomEntry[] = []
   let customStateBytes = 0
-  const subagentWorkResultIds = new Set<string>()
   const backgroundTaskResultIds = new Set<string>()
   const agentTeamEntries: AgentTeamEntry[] = []
   let programStateEntries = 0
@@ -1225,20 +1159,18 @@ function loadJournal(file: string, retention: "active" | "all"): LoadedJournal {
         entry = parseStoredEntry(record.line, file, header!.version)
       } catch (cause) {
         if (!record.terminated && record.end === metadata.size) {
-          validBytes = record.start
-          repair = "truncate"
-          break
+          try {
+            JSON.parse(record.line)
+          } catch {
+            validBytes = record.start
+            repair = "truncate"
+            break
+          }
         }
         throw cause
       }
 
       if (!record.terminated && record.end === metadata.size) repair = "newline"
-      if (
-        entry.type === "subagent_work_result" &&
-        subagentWorkResultIds.has(subagentWorkResultIdentity(entry.name, entry.workCycle))
-      ) {
-        throw new Error(`Duplicate subagent work result: ${file}`)
-      }
       if (entry.type === "background_task_result" && backgroundTaskResultIds.has(entry.taskId)) {
         throw new Error(`Duplicate background task result: ${file}`)
       }
@@ -1249,9 +1181,7 @@ function loadJournal(file: string, retention: "active" | "all"): LoadedJournal {
 
       if (entry.type === "compaction") latestBoundaryId = entry.firstKeptEntryId
       else if (isAgentTeamStoredEntry(entry)) agentTeamEntries.push(entry)
-      else if (entry.type === "subagent_work_result") {
-        subagentWorkResultIds.add(subagentWorkResultIdentity(entry.name, entry.workCycle))
-      } else if (entry.type === "background_task_result") backgroundTaskResultIds.add(entry.taskId)
+      else if (entry.type === "background_task_result") backgroundTaskResultIds.add(entry.taskId)
       if (entry.type === "custom") {
         const customEntry = freezeCustomEntry(entry)
         if (entry.customType === programStateCustomType) {
@@ -1355,7 +1285,6 @@ function loadJournal(file: string, retention: "active" | "all"): LoadedJournal {
       imageBlobBytes,
       customEntries,
       customStateBytes,
-      subagentWorkResultIds,
       backgroundTaskResultIds,
       programStateEntries,
       programStateBytes,
@@ -1503,13 +1432,6 @@ function parseStoredEntry(line: string, file: string, version: SessionFormatVers
     const { id: _id, parentId: _parentId, timestamp: _timestamp, ...data } = value
     if (isAgentTeamEntryData(data)) return { ...base, ...data }
   }
-  if (value.type === "subagent" && isSubagentEntryData(value)) {
-    return { ...base, ...value }
-  }
-  if (value.type === "subagent_work_result" && isStoredSubagentWorkResult(value)) {
-    const { id: _id, parentId: _parentId, timestamp: _timestamp, ...data } = value
-    return { ...base, ...data }
-  }
   if (value.type === "background_task_result" && isStoredBackgroundTaskResult(value)) {
     const { id: _id, parentId: _parentId, timestamp: _timestamp, ...data } = value
     return { ...base, ...data }
@@ -1545,7 +1467,7 @@ function hydrateStoredEntry(entry: StoredSessionEntry, file: string | undefined)
   }
   if (entry.type === "custom") return freezeCustomEntry(entry)
   if (entry.type === "work_plan") return freezeWorkPlanEntry(entry)
-  if (entry.type === "subagent_work_result" || entry.type === "background_task_result") return Object.freeze(entry)
+  if (entry.type === "background_task_result") return Object.freeze(entry)
   if (entry.type === "custom_message") {
     const content = hydrateStoredContent(entry.content, file)
     if (!isRuntimeCustomMessageContent(content)) {
@@ -2311,33 +2233,6 @@ function isRetryAttempt(value: unknown): value is number {
   return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= maxRetryCount
 }
 
-function isStoredSubagentWorkResult(value: unknown): value is SubagentWorkResultEntry {
-  if (
-    !isRecord(value) ||
-    !hasOnlyKeys(value, [
-      "type",
-      "id",
-      "parentId",
-      "timestamp",
-      "name",
-      "workCycle",
-      "profile",
-      "result",
-      "durationMs",
-      "preview",
-      "originalBytes",
-      "omittedBytes",
-      "truncated",
-      "errorCode",
-      "errorMessage"
-    ])
-  ) {
-    return false
-  }
-  const { id: _id, parentId: _parentId, timestamp: _timestamp, ...data } = value
-  return isSubagentWorkResultEntryData(data)
-}
-
 function isStoredBackgroundTaskResult(value: unknown): value is BackgroundTaskResultEntry {
   if (
     !isRecord(value) ||
@@ -2361,47 +2256,6 @@ function isStoredBackgroundTaskResult(value: unknown): value is BackgroundTaskRe
   }
   const { id: _id, parentId: _parentId, timestamp: _timestamp, ...data } = value
   return isBackgroundTaskResultEntryData(data)
-}
-
-function validateSubagentEntryData(value: unknown): asserts value is SubagentEntryData {
-  if (!isSubagentEntryData(value)) throw new Error("Invalid subagent substrate journal entry")
-}
-
-function isSubagentEntryData(value: unknown): value is SubagentEntryData {
-  if (
-    !isRecord(value) ||
-    value.type !== "subagent" ||
-    !boundedString(value.name, 64) ||
-    !/^[a-z][a-z0-9_-]*$/.test(value.name)
-  ) {
-    return false
-  }
-  switch (value.event) {
-    case "starting":
-      return true
-    case "ready":
-      return value.sessionId === undefined || boundedString(value.sessionId, 256)
-    case "work_cycle_started":
-      return positiveSafeInteger(value.workCycle) && (value.task === undefined || boundedString(value.task, 256))
-    case "work_cycle_delivered":
-      return positiveSafeInteger(value.workCycle)
-    case "closing":
-      return boundedString(value.reason, 256)
-    case "exited":
-      return boundedString(value.outcome, maxSubagentJournalTextBytes)
-    case "lost":
-      return value.reason === "session_restored"
-    default:
-      return false
-  }
-}
-
-function boundedString(value: unknown, maxBytes: number, allowEmpty = false): value is string {
-  return typeof value === "string" && (allowEmpty || value.length > 0) && Buffer.byteLength(value) <= maxBytes
-}
-
-function positiveSafeInteger(value: unknown): value is number {
-  return typeof value === "number" && Number.isSafeInteger(value) && value > 0
 }
 
 function isCompactionEntryData(value: unknown): value is CompactionEntryData {
@@ -2441,10 +2295,6 @@ function isBoundedPathList(value: unknown): value is string[] {
   )
 }
 
-function subagentWorkResultIdentity(name: string, workCycle: number): string {
-  return `${name}\0${workCycle}`
-}
-
 function validateJournal(entries: readonly SessionEntry[], file: string): void {
   const ids = new Set<string>()
   let workPlanRevision = 0
@@ -2479,21 +2329,6 @@ function validateNextEntry(next: SessionEntry, preceding: readonly SessionEntry[
   if (next.type.startsWith("agent_")) {
     const { id: _id, parentId: _parentId, timestamp: _timestamp, ...data } = next
     if (!isAgentTeamEntryData(data)) throw new Error(`Invalid session entry: ${file}`)
-    return
-  }
-  if (next.type === "subagent") {
-    if (!isSubagentEntryData(next)) throw new Error(`Invalid session entry: ${file}`)
-    return
-  }
-  if (next.type === "subagent_work_result") {
-    if (
-      !isStoredSubagentWorkResult(next) ||
-      preceding.some(
-        entry => entry.type === "subagent_work_result" && entry.name === next.name && entry.workCycle === next.workCycle
-      )
-    ) {
-      throw new Error(`Invalid session entry: ${file}`)
-    }
     return
   }
   if (next.type === "background_task_result") {
@@ -2604,8 +2439,6 @@ export function sessionEntryToContextMessage(entry: SessionEntry): AgentMessage 
     case "agent_mail_queued":
     case "agent_mail_delivered":
     case "agent_completion_delivered":
-    case "subagent":
-    case "subagent_work_result":
     case "background_task_result":
     case "work_plan":
       return undefined
@@ -2635,8 +2468,6 @@ function sessionEntryToPresentationMessage(entry: SessionEntry): AgentMessage | 
     case "agent_mail_queued":
     case "agent_mail_delivered":
     case "agent_completion_delivered":
-    case "subagent":
-    case "subagent_work_result":
     case "background_task_result":
     case "work_plan":
       return undefined

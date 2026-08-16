@@ -51,8 +51,8 @@ Admitted   Zi accepted the request.          The response tells you.
 Settled    The work reached a terminal end.  The evidence tells you.
 ```
 
-An RPC `session.prompt` response means your text was admitted, not that the model did anything with it. A successful subagent message delivery means the child's session accepted it, not that the child read it. A durable work result exists only after that work settled, which is exactly why it is trustworthy after the fact.
+An RPC `session.prompt` response means your text was admitted, not that the model did anything with it. A successful agent message delivery means the target session accepted it, not that the target read it. An AgentTeam turn result becomes durable only after that turn settles, which is exactly why its completion remains trustworthy after restart.
 
 Keeping the two apart is what lets Zi answer immediately, refuse early when something is out of bounds, and still give you one durable answer later.
 
-See [RPC](rpc.md) for how admission and settlement are framed on the wire and [Delegate with subagents](subagents.md) for the durable result a child work cycle leaves and what message delivery does not promise.
+See [RPC](rpc.md) for how admission and settlement are framed on the wire and [Delegate work to agents](subagents.md) for durable turn evidence and what message delivery does not promise.

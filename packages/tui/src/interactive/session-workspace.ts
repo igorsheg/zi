@@ -5,8 +5,6 @@ import type { Theme } from "../theme.js"
 import type { InteractiveKeybindings, TranscriptKeyAction, WorkspaceKeyAction } from "./interactive-keybindings.js"
 import type { InteractiveStore } from "./interactive-store.js"
 import type { SessionScreen } from "./screen.js"
-import { SubagentTranscriptSource } from "./subagent-transcript-source.js"
-import { TranscriptView } from "./transcript/view.js"
 import { WorkPlanPane, workPlanIsActive } from "./work-plan-pane.js"
 import { WorkspaceLayoutView } from "./workspace/layout-view.js"
 import {
@@ -25,7 +23,6 @@ import {
 } from "./workspace/layout.js"
 
 const primaryPaneId = "primary"
-const subagentPaneId = "subagent"
 const workPlanPaneId = "work-plan"
 const primarySecondarySplitId = "primary-secondary"
 const secondaryStackSplitId = "secondary-stack"
@@ -35,15 +32,6 @@ const secondaryMinimum: WorkspaceMinimumSize = { width: 32, height: 8 }
 
 type PrimaryPane = { readonly type: "primary"; readonly frame: BoxRenderable; readonly minimum: WorkspaceMinimumSize }
 
-type SubagentPane = {
-  readonly type: "subagent"
-  readonly name: string
-  readonly frame: BoxRenderable
-  readonly minimum: WorkspaceMinimumSize
-  readonly source: SubagentTranscriptSource
-  readonly transcript: TranscriptView
-}
-
 type PlanPane = {
   readonly type: "work_plan"
   readonly frame: BoxRenderable
@@ -51,7 +39,7 @@ type PlanPane = {
   readonly view: WorkPlanPane
 }
 
-type WorkspacePane = PrimaryPane | SubagentPane | PlanPane
+type WorkspacePane = PrimaryPane | PlanPane
 type SecondaryPane = Exclude<WorkspacePane, PrimaryPane>
 type WorkspaceCommandState = { readonly type: "idle" } | { readonly type: "awaiting_command" }
 
@@ -64,7 +52,6 @@ export class SessionWorkspace {
   readonly #screen: SessionScreen
   readonly #primaryFrame: BoxRenderable
   readonly #theme: Theme
-  readonly #syntaxStyle: SyntaxStyle
   readonly #layoutView: WorkspaceLayoutView
   readonly #panes = new Map<WorkspacePaneId, WorkspacePane>()
   #layout: WorkspaceLayoutState = createWorkspaceLayout(primaryPaneId)
@@ -78,7 +65,7 @@ export class SessionWorkspace {
     keybindings: InteractiveKeybindings,
     screen: SessionScreen,
     theme: Theme,
-    syntaxStyle: SyntaxStyle
+    _syntaxStyle: SyntaxStyle
   ) {
     this.#renderer = renderer
     this.#interactive = interactive
@@ -100,7 +87,6 @@ export class SessionWorkspace {
     this.#primaryFrame.add(screen.root)
     this.#panes.set(primaryPaneId, { type: "primary", frame: this.#primaryFrame, minimum: primaryMinimum })
     this.#theme = theme
-    this.#syntaxStyle = syntaxStyle
     this.#layoutView = new WorkspaceLayoutView(renderer, paneId => this.#pane(paneId).frame)
     this.root = this.#layoutView.root
     this.#layoutView.render(this.#layout.root)
@@ -110,34 +96,6 @@ export class SessionWorkspace {
 
   get primaryActive(): boolean {
     return this.#layout.activePaneId === primaryPaneId
-  }
-
-  openSubagent(name: string): boolean {
-    if (this.#disposed) return false
-    const current = this.#panes.get(subagentPaneId)
-    if (current?.type === "subagent" && current.name === name) {
-      this.#activate(subagentPaneId)
-      return true
-    }
-
-    const pane = this.#createSubagentPane(name)
-    if (!pane) return false
-
-    if (current) {
-      if (current.type !== "subagent") throw new Error("Subagent pane identity is owned by another pane kind")
-      this.#releasePane(subagentPaneId, current)
-      this.#panes.set(subagentPaneId, pane)
-      this.#activate(subagentPaneId)
-      return true
-    }
-
-    this.#panes.set(subagentPaneId, pane)
-    if (!this.#insertSecondary(subagentPaneId)) {
-      this.#releasePane(subagentPaneId, pane)
-      return false
-    }
-    this.#syncPresentation(true)
-    return true
   }
 
   preserveFocus(): void {
@@ -158,30 +116,6 @@ export class SessionWorkspace {
     if (this.#screen.root.parent === this.#primaryFrame) this.#primaryFrame.remove(this.#screen.root)
     this.#primaryFrame.destroyRecursively()
     this.#panes.clear()
-  }
-
-  #createSubagentPane(name: string): SubagentPane | undefined {
-    let source: SubagentTranscriptSource | undefined
-    let transcript: TranscriptView | undefined
-    let frame: BoxRenderable | undefined
-    try {
-      source = new SubagentTranscriptSource(this.#interactive.getSession(), name, () => {
-        const pane = this.#panes.get(subagentPaneId)
-        if (pane?.type === "subagent" && pane.name === name) this.#closePane(subagentPaneId)
-      })
-      transcript = new TranscriptView(this.#renderer, source, this.#keybindings, this.#theme, this.#syntaxStyle, {
-        idPrefix: `subagent-${name}`,
-        availableHeight: () => this.#panes.get(subagentPaneId)?.frame.height ?? this.#renderer.height
-      })
-      frame = this.#secondaryFrame(`subagent-pane-${name}`, ` Subagent ${name} `)
-      frame.add(transcript.root)
-      return { type: "subagent", name, frame, minimum: secondaryMinimum, source, transcript }
-    } catch {
-      transcript?.destroy()
-      source?.dispose()
-      if (frame && !frame.isDestroyed) frame.destroyRecursively()
-      return undefined
-    }
   }
 
   #toggleWorkPlan(): boolean {
@@ -240,7 +174,7 @@ export class SessionWorkspace {
     })
   }
 
-  #insertSecondary(paneId: typeof subagentPaneId | typeof workPlanPaneId): boolean {
+  #insertSecondary(paneId: typeof workPlanPaneId): boolean {
     const existing = [...this.#panes.keys()].filter(candidate => candidate !== primaryPaneId && candidate !== paneId)
     if (existing.length === 0) {
       const split = splitWorkspacePane(this.#layout, {
@@ -263,7 +197,7 @@ export class SessionWorkspace {
       paneId,
       splitId: secondaryStackSplitId,
       axis: "vertical",
-      side: paneId === subagentPaneId ? "first" : "second",
+      side: "second",
       ratio: goldenPrimaryRatio
     })
     if (!split) return false
@@ -284,17 +218,7 @@ export class SessionWorkspace {
   #releasePane(paneId: WorkspacePaneId, pane: SecondaryPane): void {
     this.#renderer.clearSelection()
     if (pane.frame.parent) pane.frame.parent.remove(pane.frame)
-    switch (pane.type) {
-      case "subagent":
-        pane.source.dispose()
-        pane.transcript.destroy()
-        break
-      case "work_plan":
-        pane.view.destroy()
-        break
-      default:
-        assertNever(pane)
-    }
+    pane.view.destroy()
     if (!pane.frame.isDestroyed) pane.frame.destroyRecursively()
     this.#panes.delete(paneId)
     this.#commandState = { type: "idle" }
@@ -408,8 +332,6 @@ export class SessionWorkspace {
     switch (pane.type) {
       case "primary":
         return this.#screen.transcript.handleAction(action)
-      case "subagent":
-        return pane.transcript.handleAction(action)
       case "work_plan":
         return pane.view.handleAction(action)
       default:

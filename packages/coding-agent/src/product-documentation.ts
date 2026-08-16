@@ -33,9 +33,7 @@ export const productDocumentationContractPaths = Object.freeze([
   "examples/rpc/README.md",
   "examples/rpc/client.ts",
   "examples/skills/review/README.md",
-  "examples/skills/review/SKILL.md",
-  "examples/subagents/README.md",
-  "examples/subagents/pathfinder.md"
+  "examples/skills/review/SKILL.md"
 ] as const)
 
 export interface ProductDocumentationPaths {

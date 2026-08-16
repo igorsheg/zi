@@ -47,8 +47,8 @@ test("settings resolve global, then project, then construction overrides", async
     steeringMode: "all",
     followUpMode: "one-at-a-time",
     codexFastMode: false,
-    subagentWaitTimeoutMs: 30_000,
-    subagentWorkTimeoutMs: 900_000,
+    agentWaitTimeoutMs: 30_000,
+    agentTurnTimeoutMs: 900_000,
     retryEnabled: true,
     retryMaxRetries: 3,
     retryBaseDelayMs: 2_000,
@@ -115,37 +115,37 @@ test("external editor resolution follows configured, VISUAL, EDITOR, then platfo
   }
 })
 
-test("subagent wait timeout is configurable within the one-hour hard bound", async () => {
+test("agent wait timeout is configurable within the one-hour hard bound", async () => {
   const root = await mkdtemp(join(tmpdir(), "zi-settings-subagent-wait-"))
   const paths = new ZiPaths(join(root, "project"), join(root, "global"))
   await mkdir(paths.globalDir, { recursive: true })
-  await writeFile(paths.globalSettingsFile, JSON.stringify({ subagentWaitTimeoutMs: 180_000 }))
+  await writeFile(paths.globalSettingsFile, JSON.stringify({ agentWaitTimeoutMs: 180_000 }))
 
   const settings = SettingsManager.create(paths, "absent")
-  expect(settings.get().subagentWaitTimeoutMs).toBe(180_000)
+  expect(settings.get().agentWaitTimeoutMs).toBe(180_000)
 
-  await writeFile(paths.globalSettingsFile, JSON.stringify({ subagentWaitTimeoutMs: 3_600_001 }))
+  await writeFile(paths.globalSettingsFile, JSON.stringify({ agentWaitTimeoutMs: 3_600_001 }))
   settings.reload()
-  expect(settings.get().subagentWaitTimeoutMs).toBe(30_000)
-  expect(settings.drainErrors()[0]?.error.message).toContain("subagentWaitTimeoutMs")
-  expect(() => new SettingsManager({ subagentWaitTimeoutMs: 1.5 })).toThrow("Invalid subagentWaitTimeoutMs")
+  expect(settings.get().agentWaitTimeoutMs).toBe(30_000)
+  expect(settings.drainErrors()[0]?.error.message).toContain("agentWaitTimeoutMs")
+  expect(() => new SettingsManager({ agentWaitTimeoutMs: 1.5 })).toThrow("Invalid agentWaitTimeoutMs")
 })
 
-test("subagent work timeout is configurable within the one-hour hard bound", async () => {
+test("agent turn timeout is configurable within the one-hour hard bound", async () => {
   const root = await mkdtemp(join(tmpdir(), "zi-settings-subagent-work-"))
   const paths = new ZiPaths(join(root, "project"), join(root, "global"))
   await mkdir(paths.globalDir, { recursive: true })
-  await writeFile(paths.globalSettingsFile, JSON.stringify({ subagentWorkTimeoutMs: 1_200_000 }))
+  await writeFile(paths.globalSettingsFile, JSON.stringify({ agentTurnTimeoutMs: 1_200_000 }))
 
   const settings = SettingsManager.create(paths, "absent")
-  expect(settings.get().subagentWorkTimeoutMs).toBe(1_200_000)
+  expect(settings.get().agentTurnTimeoutMs).toBe(1_200_000)
 
-  await writeFile(paths.globalSettingsFile, JSON.stringify({ subagentWorkTimeoutMs: 3_600_001 }))
+  await writeFile(paths.globalSettingsFile, JSON.stringify({ agentTurnTimeoutMs: 3_600_001 }))
   settings.reload()
-  expect(settings.get().subagentWorkTimeoutMs).toBe(900_000)
-  expect(settings.drainErrors()[0]?.error.message).toContain("subagentWorkTimeoutMs")
-  expect(() => new SettingsManager({ subagentWorkTimeoutMs: 0 })).toThrow("Invalid subagentWorkTimeoutMs")
-  expect(() => new SettingsManager({ subagentWorkTimeoutMs: 1.5 })).toThrow("Invalid subagentWorkTimeoutMs")
+  expect(settings.get().agentTurnTimeoutMs).toBe(900_000)
+  expect(settings.drainErrors()[0]?.error.message).toContain("agentTurnTimeoutMs")
+  expect(() => new SettingsManager({ agentTurnTimeoutMs: 0 })).toThrow("Invalid agentTurnTimeoutMs")
+  expect(() => new SettingsManager({ agentTurnTimeoutMs: 1.5 })).toThrow("Invalid agentTurnTimeoutMs")
 })
 
 test("retry settings layer and reject unbounded backoff", async () => {
@@ -382,8 +382,8 @@ test("oversized settings are bounded and reported without entering effective sta
     steeringMode: "one-at-a-time",
     followUpMode: "one-at-a-time",
     codexFastMode: false,
-    subagentWaitTimeoutMs: 30_000,
-    subagentWorkTimeoutMs: 900_000,
+    agentWaitTimeoutMs: 30_000,
+    agentTurnTimeoutMs: 900_000,
     retryEnabled: true,
     retryMaxRetries: 3,
     retryBaseDelayMs: 2_000,

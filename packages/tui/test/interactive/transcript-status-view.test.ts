@@ -11,12 +11,12 @@ import {
 } from "../../src/interactive/transcript/status-view.js"
 import {
   projectTranscriptBackgroundStatus,
-  type TranscriptShellActivity,
-  type TranscriptSubagentActivity
+  type TranscriptAgentActivity,
+  type TranscriptShellActivity
 } from "../../src/interactive/transcript/view.js"
 import { defaultTheme } from "../../src/theme.js"
 
-test("background projection counts only independently running shell tasks and subagents", () => {
+test("background projection counts only independently running shell tasks and agents", () => {
   const shellTasks: readonly TranscriptShellActivity[] = [
     { type: "starting", placement: "background" },
     { type: "background" },
@@ -24,23 +24,19 @@ test("background projection counts only independently running shell tasks and su
     { type: "foreground" },
     { type: "settling" }
   ]
-  const subagents: readonly TranscriptSubagentActivity[] = [
-    { lifecycle: "queued" },
-    { lifecycle: "running" },
-    { lifecycle: "interrupting" },
-    { lifecycle: "closing" },
-    { lifecycle: "idle" },
-    { lifecycle: "exited" }
+  const agents: readonly TranscriptAgentActivity[] = [
+    { turn: "starting" },
+    { turn: "running" },
+    { turn: "interrupting" },
+    { turn: "idle" }
   ]
 
-  expect(projectTranscriptBackgroundStatus(shellTasks, subagents)).toEqual({
+  expect(projectTranscriptBackgroundStatus(shellTasks, agents)).toEqual({
     type: "running",
     shellCommands: 2,
-    subagents: 4
+    agents: 3
   })
-  expect(
-    projectTranscriptBackgroundStatus([{ type: "foreground" }], [{ lifecycle: "idle" }, { lifecycle: "exited" }])
-  ).toEqual({ type: "idle" })
+  expect(projectTranscriptBackgroundStatus([{ type: "foreground" }], [{ turn: "idle" }])).toEqual({ type: "idle" })
 })
 
 test("transcript status preserves working and unseen-output behavior without a plan", async () => {
@@ -152,12 +148,12 @@ test("background work composes counts without displacing activity, attention, or
     )
     await setup.renderOnce()
     expect(setup.captureCharFrame()).toContain(
-      "Working… (Compacting…) • New output • ◎ 2 commands · 1 subagent still running • Plan (0/2)"
+      "Working… (Compacting…) • New output • ◎ 2 commands · 1 agent still running • Plan (0/2)"
     )
 
     view.update(presentation({ background: background(1, 2) }), setup.renderer.width)
     await setup.renderOnce()
-    expect(setup.captureCharFrame()).toContain("◎ 1 command · 2 subagents still running")
+    expect(setup.captureCharFrame()).toContain("◎ 1 command · 2 agents still running")
     expect(setup.captureCharFrame()).not.toContain("Working…")
   } finally {
     view.destroy()
@@ -195,8 +191,8 @@ function presentation(value: Partial<TranscriptStatusPresentation> = {}): Transc
   }
 }
 
-function background(shellCommands: number, subagents: number): TranscriptStatusPresentation["background"] {
-  return { type: "running", shellCommands, subagents }
+function background(shellCommands: number, agents: number): TranscriptStatusPresentation["background"] {
+  return { type: "running", shellCommands, agents }
 }
 
 function active(kind: "ordinary" | "special", text: string): TranscriptStatusPresentation["activity"] {

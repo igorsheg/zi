@@ -48,7 +48,6 @@ test("distribution documentation ships self-customization guides and examples", 
     expect(existsSync(join(destination, "examples", "extensions", "subagents", "index.ts"))).toBe(true)
     expect(existsSync(join(destination, "examples", "rpc", "client.ts"))).toBe(true)
     expect(existsSync(join(destination, "examples", "skills", "review", "SKILL.md"))).toBe(true)
-    expect(existsSync(join(destination, "examples", "subagents", "pathfinder.md"))).toBe(true)
   } finally {
     await rm(destination, { recursive: true, force: true })
   }

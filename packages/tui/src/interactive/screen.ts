@@ -9,7 +9,7 @@ import type { ExitGestureController } from "./exit-gesture.js"
 import type { ExternalEditor } from "./external-editor.js"
 import type { InteractiveKeybindings } from "./interactive-keybindings.js"
 import type { InteractiveStore } from "./interactive-store.js"
-import type { PromptSessionActions, PromptSubagentActions } from "./prompt/store.js"
+import type { PromptSessionActions } from "./prompt/store.js"
 import { PromptView } from "./prompt/view.js"
 import type { SlashController } from "./slash-controller.js"
 import { TranscriptView } from "./transcript/view.js"
@@ -33,8 +33,7 @@ export class SessionScreen {
     syntaxStyle: SyntaxStyle,
     measureTranscriptSync: boolean,
     notices: BuiltInNoticeActions,
-    sessionActions?: PromptSessionActions,
-    subagentActions?: PromptSubagentActions
+    sessionActions?: PromptSessionActions
   ) {
     this.root = new BoxRenderable(renderer, { flexDirection: "column", flexGrow: 1, minHeight: 0 })
     let prompt: PromptView | undefined
@@ -54,8 +53,7 @@ export class SessionScreen {
       externalEditor,
       theme,
       notices,
-      sessionActions,
-      subagentActions
+      sessionActions
     )
     this.root.add(this.transcript.root)
     this.root.add(this.prompt.root)

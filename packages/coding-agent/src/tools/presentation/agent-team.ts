@@ -35,7 +35,7 @@ export function projectAgentTeam(source: ToolPresentationSource): ToolPresentati
         details: agent
           ? [
               "admitted",
-              ...(agent.agentType === undefined ? [] : [`role ${agent.agentType}`]),
+              ...(agent.agentType === undefined ? [] : [`type ${agent.agentType}`]),
               turnLabel(agent.turnState),
               agent.residency,
               agent.path
@@ -215,8 +215,8 @@ function agentLine(agent: AgentTeamToolAgentDetails): string {
     agent.turnState === "idle" && agent.settledStatus !== "not_started"
       ? settledLabel(agent.settledStatus)
       : turnLabel(agent.turnState)
-  const role = agent.agentType === undefined ? "" : `role ${agent.agentType} · `
-  return `${agentNameLabel(agent.taskName)} — ${role}${state} · ${agent.residency} · turn ${agent.turnNumber} — ${agent.path}`
+  const type = agent.agentType === undefined ? "" : `type ${agent.agentType} · `
+  return `${agentNameLabel(agent.taskName)} — ${type}${state} · ${agent.residency} · turn ${agent.turnNumber} — ${agent.path}`
 }
 
 function agentSubject(agent: AgentTeamToolAgentDetails | undefined, fallbackTaskName?: string): ToolSubject {

@@ -111,4 +111,4 @@ A useful skill has:
 
 Avoid a philosophy essay. Write the behavior you wish you did not have to repeat.
 
-Start from [`examples/skills/review/SKILL.md`](../examples/skills/review/SKILL.md). Keep permanent repository policy in `AGENTS.md`, executable specialized behavior in an [extension](extensions.md), and static delegated roles in [subagent profiles](subagents.md).
+Start from [`examples/skills/review/SKILL.md`](../examples/skills/review/SKILL.md). Keep permanent repository policy in `AGENTS.md`, executable specialized behavior in an [extension](extensions.md), and runtime delegated instructions in the `message` passed to [agents](subagents.md).

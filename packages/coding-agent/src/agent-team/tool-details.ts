@@ -1,6 +1,7 @@
 import { isAgentTeamToolDetailsShape } from "../guards.js"
 import type { AgentSnapshot } from "./agent-team.js"
 import type { AgentPath } from "./path.js"
+import type { AgentType } from "./spawn.js"
 
 export const maxAgentTeamToolDetailsBytes = 64 * 1024
 
@@ -8,7 +9,7 @@ export interface AgentTeamToolAgentDetails {
   readonly path: AgentPath
   readonly parentPath: AgentPath
   readonly taskName: string
-  readonly agentType?: string
+  readonly agentType: AgentType
   readonly residency: AgentSnapshot["residency"]
   readonly turnState: AgentSnapshot["turn"]
   readonly turnNumber: number
@@ -57,7 +58,7 @@ export function projectAgentTeamToolAgent(snapshot: AgentSnapshot): AgentTeamToo
     path: snapshot.path,
     parentPath: snapshot.parentPath,
     taskName: snapshot.taskName,
-    ...(snapshot.role === undefined ? {} : { agentType: snapshot.role }),
+    agentType: snapshot.agentType,
     residency: snapshot.residency,
     turnState: snapshot.turn,
     turnNumber: snapshot.turnNumber,

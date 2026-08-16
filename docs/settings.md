@@ -44,8 +44,8 @@ Its two-step picker exposes Fast Mode. On sends `text.verbosity: "low"` and `ser
   "steeringMode": "one-at-a-time",
   "followUpMode": "one-at-a-time",
   "codexFastMode": false,
-  "subagentWaitTimeoutMs": 30000,
-  "subagentWorkTimeoutMs": 900000,
+  "agentWaitTimeoutMs": 30000,
+  "agentTurnTimeoutMs": 900000,
   "retryEnabled": true,
   "retryMaxRetries": 3,
   "retryBaseDelayMs": 2000,
@@ -99,11 +99,11 @@ Each array accepts at most 128 file or directory paths, with each path bounded a
 `codexFastMode`
 : Send low text verbosity and the priority service tier to OpenAI Codex. When false, Zi removes both request fields.
 
-`subagentWaitTimeoutMs`
-: Default observation timeout for `wait_subagents`, in milliseconds from `0` through one hour. A wait timeout never cancels child work.
+`agentWaitTimeoutMs`
+: Default observation timeout for `wait_agent`, in milliseconds from `0` through one hour. A wait timeout never cancels agent work.
 
-`subagentWorkTimeoutMs`
-: Running deadline for each subagent work cycle, in milliseconds from `1` through one hour, defaulting to 15 minutes. A queued cycle starts this deadline only when FIFO admission moves it to running.
+`agentTurnTimeoutMs`
+: Running deadline for each agent turn, in milliseconds from `1` through one hour, defaulting to 15 minutes. The deadline starts after the durable turn reservation and input commit.
 
 `retryEnabled`
 : Turn automatic retry on or off.
@@ -132,7 +132,7 @@ Each array accepts at most 128 file or directory paths, with each path bounded a
 `prompts`
 : Additional prompt-template files or directories.
 
-A changed `subagentWorkTimeoutMs` applies to new sessions, not the running one. See [Subagents](subagents.md) for which work starts a fresh deadline, what Zi records when one expires, and how bounded interruption settlement ends a child.
+A changed `agentTurnTimeoutMs` applies to new sessions, not the running one. See [Agents](subagents.md) for turn admission, timeout evidence, and bounded interruption settlement.
 
 ## Invalid settings
 

@@ -95,8 +95,6 @@ export type RpcSessionEntry =
   | Extract<SessionEntry, { readonly type: "retry" }>
   | Extract<SessionEntry, { readonly type: "compaction" }>
   | AgentTeamEntry
-  | Extract<SessionEntry, { readonly type: "subagent" }>
-  | Extract<SessionEntry, { readonly type: "subagent_work_result" }>
   | Extract<SessionEntry, { readonly type: "background_task_result" }>
   | Extract<SessionEntry, { readonly type: "work_plan" }>
   | CustomEntry

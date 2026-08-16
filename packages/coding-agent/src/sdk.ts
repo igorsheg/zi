@@ -26,7 +26,6 @@ import { createSessionResources, type ResourceLoader, type SessionResources } fr
 import type { SessionManager, SessionModel } from "./session-manager.js"
 import type { SessionShell } from "./session-shell.js"
 import type { SettingsManager } from "./settings-manager.js"
-import { createPeerTools, type PeerRelay } from "./subagents/peer.js"
 import { buildSystemPrompt } from "./system-prompt.js"
 import { snapshotToolSurface, type ToolSurface } from "./tool-surface.js"
 import { isBuiltInToolError } from "./tools/index.js"
@@ -85,7 +84,6 @@ export interface CreateAgentSessionOptions {
   readonly project?: ProjectConfigurationAdmission
   readonly extensionPaths?: readonly string[]
   readonly agentTeam?: AgentTeamMembership
-  readonly peerRelay?: PeerRelay
   readonly toolSurface?: ToolSurface
   readonly invariants?: InvariantRegistryOptions
 }
@@ -160,15 +158,14 @@ export async function createAgentSessionWithProcessTreeTracker(
           paths: services.paths,
           rootSessionManager: sessionManager,
           createSession: membership.createChildSession,
-          turnTimeoutMs: settings.subagentWorkTimeoutMs,
+          turnTimeoutMs: settings.agentTurnTimeoutMs,
           shutdownTimeoutMs: 9_000
         })
       : membership?.team
   if (membership?.type === "root") ownedTeam = team
   const agentPath = membership?.type === "member" ? membership.path : rootAgentPath
   const workPlan = new WorkPlan(sessionManager)
-  const peerTools = options.peerRelay ? createPeerTools(options.peerRelay) : []
-  const sessionTools = Object.freeze([...options.tools, ...peerTools, createUpdatePlanTool(workPlan)])
+  const sessionTools = Object.freeze([...options.tools, createUpdatePlanTool(workPlan)])
   const agent = new Agent({
     initialState: {
       systemPrompt: buildSystemPrompt(sessionManager.header.cwd, resources, sessionTools, toolSurface),

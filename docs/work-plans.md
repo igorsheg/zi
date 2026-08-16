@@ -33,7 +33,7 @@ The interactive terminal shows incomplete plans in the transcript status row:
 Working… • Plan (1/4) — Implement status composition       (Ctrl+P)
 ```
 
-While the parent agent is running, the `Working…` shimmer always remains visible. The row then composes detached-transcript attention (`New output`), independent background ownership (`◎ 1 command · 2 subagents still running`), and plan progress, in that priority order. Exceptional lifecycle states such as cancellation, retry, and compaction appear beside `Working…` instead of replacing it.
+While the root agent is running, the `Working…` shimmer always remains visible. The row then composes detached-transcript attention (`New output`), independent background ownership (`◎ 1 command · 2 agents still running`), and plan progress, in that priority order. Exceptional lifecycle states such as cancellation, retry, and compaction appear beside `Working…` instead of replacing it.
 
 Press `Ctrl+P` to open or close the complete plan in a read-only workspace pane. It shows every bounded step:
 
@@ -42,7 +42,7 @@ Press `Ctrl+P` to open or close the complete plan in a read-only workspace pane.
 - `○` pending
 - `–` cancelled
 
-The pane can stay open alongside a subagent transcript. Zi keeps the main agent on the left and stacks the subagent and work plan in the right column. Move between them with the ordinary workspace focus controls; `q` closes the active read-only pane. Completing or clearing the plan closes its pane automatically.
+Zi keeps the root transcript on the left and opens the plan in a companion pane. Move between them with the ordinary workspace focus controls; `q` closes the active read-only pane. Completing or clearing the plan closes its pane automatically.
 
 ## Code Mode and RPC
 

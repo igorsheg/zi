@@ -1,5 +1,6 @@
 import type {
   AgentSession,
+  AgentSnapshot,
   AuthenticationMethod,
   ImageContent,
   ModelChoice,
@@ -8,7 +9,6 @@ import type {
   SettingsScope,
   SessionInfo,
   StoredCredential,
-  SubagentSnapshot,
   ThinkingLevel
 } from "@with-zi/coding-agent"
 
@@ -38,7 +38,7 @@ export type EditableSetting =
   | "retryEnabled"
 export type EditableSettingValue = ThinkingLevel | QueueMode | boolean
 
-export type SubagentPickerScope = "running" | "all"
+export type AgentPickerScope = "running" | "all"
 
 export type PromptWorkflow =
   | { readonly type: "idle" }
@@ -112,11 +112,11 @@ export type PromptWorkflow =
       readonly sessions: readonly SessionInfo[]
     }
   | {
-      readonly type: "choosing_subagent"
+      readonly type: "choosing_agent"
       readonly operationId: number
       readonly session: AgentSession
-      readonly snapshots: readonly SubagentSnapshot[]
-      readonly scope: SubagentPickerScope
+      readonly snapshots: readonly AgentSnapshot[]
+      readonly scope: AgentPickerScope
     }
   | { readonly type: "resuming_session"; readonly operationId: number; readonly session: AgentSession }
   | { readonly type: "cancelling_session"; readonly operationId: number; readonly session: AgentSession }

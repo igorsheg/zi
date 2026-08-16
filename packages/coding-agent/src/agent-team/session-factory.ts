@@ -5,7 +5,6 @@ import { CodeMode } from "../code-mode/code-mode.js"
 import { discoverExtensionLoadPlan, extensionDiscoveryDiagnostic } from "../extensions/discovery.js"
 import { ExtensionHost } from "../extensions/host.js"
 import { spawnExtensionWorker } from "../extensions/process.js"
-import { resolveRequestedModel } from "../model-resolver.js"
 import type { ProcessTreeTracker } from "../processes/process-tree.js"
 import type { ProjectConfigurationAdmission } from "../project-trust.js"
 import { createAgentSessionWithProcessTreeTracker, type AgentSessionServices } from "../sdk.js"
@@ -32,7 +31,7 @@ export function createAgentTeamSessionFactory(options: AgentTeamSessionFactoryOp
     const extensionHost = new ExtensionHost(
       plan => spawnExtensionWorker(plan, options.extensionWorkerCommand, processTreeTracker),
       undefined,
-      { subagents: false }
+      { agents: true }
     )
     const shell = new SessionShell({
       cwd: services.paths.cwd,
@@ -53,20 +52,15 @@ export function createAgentTeamSessionFactory(options: AgentTeamSessionFactoryOp
       )
       await extensionHost.start(extensions.plan)
       const resources = await services.resourceLoader.load()
-      const role =
-        request.roleSelection ??
-        (request.role === undefined
-          ? undefined
-          : (resources.subagentProfiles.find(item => item.name === request.role) ??
-            extensionHost.subagentCatalog().find(item => item.name === request.role)))
-      if (request.role !== undefined && !role) throw new Error(`Unknown agent role: ${request.role}`)
-      const model = role?.model ? resolveRequestedModel(services.modelRegistry, role.model) : undefined
+      const selected = request.spec.execution.model
+      const model = services.modelRegistry.get(selected.provider, selected.modelId)
+      if (!model) throw new Error(`Unavailable durable agent model: ${selected.provider}/${selected.modelId}`)
       const result = await createAgentSessionWithProcessTreeTracker(
         {
           services,
           sessionManager: request.sessionManager,
-          ...(model ? { model } : {}),
-          ...(role?.thinking ? { thinkingLevel: role.thinking } : {}),
+          model,
+          thinkingLevel: request.spec.execution.thinkingLevel,
           tools: createCodingTools({ cwd: services.paths.cwd, shell }),
           shell,
           extensionHost,

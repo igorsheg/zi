@@ -123,36 +123,6 @@ test("runtime gates every protected project configuration owner through one trus
   }
 })
 
-test("runtime admits project subagent profiles through project trust", async () => {
-  const root = await mkdtemp(join(tmpdir(), "zi-runtime-subagent-trust-"))
-  const cwd = join(root, "project")
-  const agentDir = join(root, "global")
-  const paths = new ZiPaths(cwd, agentDir)
-  const models = createModels()
-  await mkdir(paths.projectResourceDir("subagents"), { recursive: true })
-  await writeFile(
-    join(paths.projectResourceDir("subagents"), "scout.md"),
-    "---\ndescription: Research upstream behavior\n---\nReturn exact source evidence."
-  )
-
-  const excluded = await createTestAgentRuntime({ cwd, agentDir, models, session: { type: "new", persist: false } })
-  try {
-    expect(excluded.projectTrust).toMatchObject({ type: "unresolved", diagnostic: { path: paths.projectDir } })
-    expect(excluded.session.resources.subagentProfiles).toEqual([])
-  } finally {
-    excluded.session.dispose()
-  }
-
-  await new ProjectTrustStore(paths).update([{ type: "trusted", cwd }])
-  const admitted = await createTestAgentRuntime({ cwd, agentDir, models, session: { type: "new", persist: false } })
-  try {
-    expect(admitted.projectTrust).toMatchObject({ type: "trusted", source: "stored" })
-    expect(admitted.session.resources.subagentProfiles).toMatchObject([{ name: "scout", scope: "project" }])
-  } finally {
-    admitted.session.dispose()
-  }
-})
-
 test("runtime continueRecent reuses the newest current-cwd journal", async () => {
   const root = await mkdtemp(join(tmpdir(), "zi-runtime-continue-"))
   const cwd = join(root, "project")

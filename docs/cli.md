@@ -39,7 +39,7 @@ Interactive mode resolves project trust before running positional prompts; text,
 
 `--code-only` is an invocation policy available in every mode. It exposes only the `code` tool to the model while retaining the normal [admitted](vocabulary.md) tools inside each cell's `zi` catalog.
 
-Interactive commands remain available because they are client operations rather than model tools. Spawned Zi subagents inherit the policy. See [Code Mode](code-mode.md#code-only-invocations) for what a cell may call and which bounds apply.
+Interactive commands remain available because they are client operations rather than model tools. Spawned agents inherit the policy. See [Code Mode](code-mode.md#code-only-invocations) for what a cell may call and which bounds apply.
 
 See [JSON events](json-events.md) for the finite event stream and [RPC](rpc.md) for request framing, methods, bounds, and lifecycle.
 
@@ -97,7 +97,7 @@ zi --model provider/model-id --api-key "$KEY" "try this once"
 
 `--api-key` is memory-only. It is not written to settings, credentials, events, diagnostics, or journals. Like any command-line secret, it may still be visible in shell history or process listings; prefer provider credential variables or Zi's credential store for long-lived automation.
 
-When profile-driven subagents are active, an ephemeral parent override is forwarded privately to child Zi processes, removed from the child environment before extensions or shell tools start, and never placed in child arguments. See [Subagents](subagents.md) for how credentials and working directories propagate to children.
+AgentTeam members run in-process with the root working directory and configured credential store. An explicit root `--api-key` is intentionally not inherited by descendants; use stored or provider-native credentials for a child model. See [Agents](subagents.md) for execution selection and lifecycle ownership.
 
 ## Invocation prompt policy
 

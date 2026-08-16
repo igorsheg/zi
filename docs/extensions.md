@@ -28,7 +28,7 @@ export default function (zi: ExtensionAPI): void {
 }
 ```
 
-The supported public surface consists of lifecycle and agent-activity handlers, user-invoked commands, model-callable tools, bounded durable session operations, and optional subagent profiles and operations.
+The supported public surface consists of lifecycle and agent-activity handlers, user-invoked commands, model-callable tools, bounded durable session operations, and six recursive agent operations.
 
 Decide first whether the behavior belongs here at all. Instructions the model should follow belong in a skill or a prompt template, executable behavior belongs in an extension, and an external application belongs behind RPC. See [Start here](index.md) for the customization ladder that orders those choices.
 
@@ -54,7 +54,7 @@ Start with [`examples/extensions/custom-tool/index.ts`](../examples/extensions/c
 
 - a dormant catalog: [`examples/extensions/deferred-tools/index.ts`](../examples/extensions/deferred-tools/index.ts);
 - session persistence and custom messages: [`examples/extensions/durable-counter/index.ts`](../examples/extensions/durable-counter/index.ts);
-- programmatic subagent profiles: [`examples/extensions/subagents/index.ts`](../examples/extensions/subagents/index.ts);
+- recursive agent orchestration: [`examples/extensions/subagents/index.ts`](../examples/extensions/subagents/index.ts);
 - an observational terminal integration: [`examples/extensions/herdr-agent-state/index.ts`](../examples/extensions/herdr-agent-state/index.ts).
 
 ## Public API
@@ -167,17 +167,17 @@ Registration remains factory-time and statically reviewable. `active` defaults t
 
 A generation may register up to 256 tools in a 2 MiB catalog. At most 64 extension tools and 512 KiB of their provider-facing definitions may be active. Per-tool names are limited to 64 bytes, descriptions to 4 KiB, schemas to 16 KiB, invocation arguments to 256 KiB, progress messages to 16 KiB, results to 256 KiB, and declared execution time to one hour.
 
-### Programmatic subagent profiles
+### Agent orchestration
 
-`registerSubagentProfile(...)` is the programmatic counterpart to a Markdown profile resource. Both declarations join one `AgentSession`-owned catalog with the same name, description, instructions, optional model, and optional thinking contract. When child execution is available, a programmatic registration alone activates Zi's standard subagent tools; an extension does not need to register a second delegation tool.
+When the current session belongs to an `AgentTeam`, `zi.agents` exposes exactly `spawn`, `send`, `followup`, `wait`, `list`, and `interrupt`. The extension cannot supply sender identity, close durable identities, or register additional agent types.
 
-Extensions may optionally build specialized orchestration with the bounded `zi.subagents` operations. `send(...)` supplies context without starting idle work; `continue(...)` assigns work and starts a cycle only when idle. `interrupt(...)` returns its result plus the exact affected cycle's terminal snapshot, while `close(...)` returns the corresponding terminal snapshot.
+`spawn(taskName, message, options)` admits `default`, `explorer`, or `worker`; omission selects `default`. The `message` carries the complete runtime specialist instructions. Options may also select inherited turns, model, and thinking, which Zi resolves to concrete durable execution values before reservation.
 
-A `wait(...)` started by a command or tool belongs to that invocation: its requested or default timeout must fit the invocation's remaining deadline, and Zi cancels it when the owner is cancelled or settles. Pass a separate signal when the extension also needs to cancel the wait explicitly.
+`send(...)` supplies context without starting idle work, while `followup(...)` starts an idle target or joins an active turn. `wait(...)` returns `{ message, timedOut, agents }`; final child text remains passive mail rather than becoming a return value.
 
-The parent session retains profile precedence, process, protocol, concurrency, output, cancellation, durable evidence, containment, and shutdown ownership. Extension generation replacement removes its profile registrations without terminating admitted children. Profiles do not claim permissions, read-only behavior, worktrees, tool restrictions, or isolation.
+A wait started by a command or tool belongs to that invocation. Its requested or default timeout must fit the invocation's remaining deadline, and Zi cancels it when the owner is cancelled or settles without cancelling agent work.
 
-See [Profile-driven subagents](subagents.md) for the complete contract and example.
+The root session retains graph, process, protocol, concurrency, output, cancellation, durable evidence, containment, and shutdown ownership. Follow [Delegate work to agents](subagents.md) for recursive lineage, built-in types, and bounds.
 
 ### Durable state and custom messages
 
@@ -219,7 +219,7 @@ Edit trusted extensions, skills, prompts, settings, or context files, then run `
 
 Reload keeps the same session identity and journal, rereads settings and resources under the current project-trust admission, replaces the extension generation in place, and emits `session_shutdown` / `session_start` with reason `"reload"`. Candidate `session_start` may append custom state and append-only custom messages; turn-triggering delivery stays closed until reload settles.
 
-A failed candidate before commit retains the previous generation. A worker crash leaves the session usable without extensions until an explicit reload recovers it. Subagent profiles registered by the old generation are replaced with the generation, while already admitted child work remains owned by the session.
+A failed candidate before commit retains the previous generation. A worker crash leaves the session usable without extensions until an explicit reload recovers it. Already admitted agent work remains owned by the session rather than the failed extension generation.
 
 ## Modes and diagnostics
 
@@ -235,7 +235,7 @@ Import, factory, registration, protocol, execution, and worker failures are sour
 
 - No completion providers, command shortcuts, arbitrary UI, provider interception, or session replacement authority.
 - No `AgentSession`, terminal UI objects, or session-manager authority in a callback context.
-- No `SubagentSupervisor` or child-process handles: the parent session keeps process, protocol, concurrency, cancellation, containment, and shutdown ownership.
+- No private team owner or child-session handles: the root session keeps graph, process, cancellation, containment, and shutdown ownership.
 - `setActiveTools(...)` cannot disable built-ins or tools owned by another extension.
-- Subagent profiles claim no permissions, read-only behavior, worktrees, tool restrictions, or isolation.
+- Extensions cannot register agent types, hidden spawn instructions, or role-derived execution settings.
 - A failed worker generation is never restarted implicitly; recovery is an explicit reload or a new session.

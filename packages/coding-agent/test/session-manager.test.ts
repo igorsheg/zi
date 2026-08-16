@@ -45,40 +45,34 @@ test("session entries form one append-only branch", () => {
   expect(session.messages()).toEqual([{ role: "user", content: "hello", timestamp: 1 }])
 })
 
-test("subagent substrate journal evidence restores and rejects malformed variants", async () => {
-  const root = await mkdtemp(join(tmpdir(), "zi-subagent-journal-"))
+test("legacy subagent journals are unreadable even without a final newline", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-legacy-subagent-journal-"))
   const paths = new ZiPaths(join(root, "project"), join(root, "agent"))
-  const session = SessionManager.create(paths)
-  const appendSubagent: unknown = Reflect.get(session, "appendSubagent")
-  if (typeof appendSubagent !== "function") throw new Error("Expected appendSubagent")
-  expect(() => Reflect.apply(appendSubagent, session, [{ event: "starting", agentId: "legacy-uuid" }])).toThrow(
-    "Invalid subagent substrate journal entry"
-  )
-  session.appendSubagent({ event: "starting", name: "journal-worker" })
-  session.appendSubagent({
-    event: "work_cycle_started",
-    name: "journal-worker",
-    workCycle: 1,
-    task: "Inspect the journal"
-  })
-  session.appendSubagent({ event: "work_cycle_delivered", name: "journal-worker", workCycle: 1 })
-  expect(SessionManager.open(session.file!).subagentEntries()).toMatchObject([
-    { event: "starting", name: "journal-worker" },
-    { event: "work_cycle_started", workCycle: 1, task: "Inspect the journal" },
-    { event: "work_cycle_delivered", workCycle: 1 }
-  ])
+  const legacy = [
+    { type: "subagent", event: "starting", name: "journal-worker" },
+    {
+      type: "subagent_work_result",
+      name: "journal-worker",
+      workCycle: 1,
+      result: "completed",
+      durationMs: 1,
+      preview: "done",
+      originalBytes: 4,
+      omittedBytes: 0,
+      truncated: false
+    }
+  ]
 
-  const journalLines = (await readFile(session.file!, "utf8")).trim().split("\n")
-  const malformed: unknown = JSON.parse(journalLines.at(-1)!)
-  if (typeof malformed !== "object" || malformed === null || Array.isArray(malformed)) {
-    throw new Error("Expected a journal entry object")
+  for (const [index, data] of legacy.entries()) {
+    for (const terminated of [true, false]) {
+      const session = SessionManager.create(paths, { sessionId: `legacy-${index}-${terminated}` })
+      const anchor = session.appendCustomEntry("test.anchor")
+      const entry = { ...data, id: crypto.randomUUID(), parentId: anchor.id, timestamp: new Date(0).toISOString() }
+      // oxlint-disable-next-line no-await-in-loop -- each fixture is opened immediately after its append
+      await appendFile(session.file!, `${JSON.stringify(entry)}${terminated ? "\n" : ""}`)
+      expect(() => SessionManager.open(session.file!)).toThrow("Invalid session entry")
+    }
   }
-  Reflect.set(malformed, "workCycle", 0)
-  await appendFile(
-    session.file!,
-    `${JSON.stringify({ ...malformed, id: crypto.randomUUID(), parentId: Reflect.get(malformed, "id") })}\n`
-  )
-  expect(() => SessionManager.open(session.file!)).toThrow("Invalid session entry")
   await rm(root, { recursive: true, force: true })
 })
 

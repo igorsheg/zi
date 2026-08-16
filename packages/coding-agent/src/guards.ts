@@ -1,3 +1,4 @@
+import type { ThinkingLevel } from "@earendil-works/pi-agent-core"
 import { Type } from "typebox"
 import { Compile } from "typebox/compile"
 
@@ -18,6 +19,17 @@ const nonNegativeInteger = Compile(Type.Integer({ minimum: 0 }))
 const positiveInteger = Compile(Type.Integer({ minimum: 1 }))
 const numberGuard = Compile(Type.Number())
 const nonNegativeNumber = Compile(Type.Number({ minimum: 0 }))
+const thinkingLevel = Compile(
+  Type.Union([
+    Type.Literal("off"),
+    Type.Literal("minimal"),
+    Type.Literal("low"),
+    Type.Literal("medium"),
+    Type.Literal("high"),
+    Type.Literal("xhigh"),
+    Type.Literal("max")
+  ])
+)
 
 const textContent = Type.Object({ type: Type.Literal("text"), text: Type.String() })
 const imageContent = Type.Object({ type: Type.Literal("image"), data: Type.String(), mimeType: Type.String() })
@@ -36,7 +48,7 @@ const agentTeamToolAgent = Type.Object({
   path: agentTeamPath,
   parentPath: agentTeamPath,
   taskName: Type.String({ minLength: 1, maxLength: 64, pattern: "^[a-z][a-z0-9_-]*$" }),
-  agentType: Type.Optional(Type.String({ minLength: 1, maxLength: 64, pattern: "^[a-z][a-z0-9_-]*$" })),
+  agentType: Type.Union([Type.Literal("default"), Type.Literal("explorer"), Type.Literal("worker")]),
   residency: Type.Union([Type.Literal("unloaded"), Type.Literal("loading"), Type.Literal("resident")]),
   turnState: Type.Union([
     Type.Literal("idle"),
@@ -170,6 +182,10 @@ export function isFiniteNumber(value: unknown): value is number {
 
 export function isNonNegativeFinite(value: unknown): value is number {
   return nonNegativeNumber.Check(value)
+}
+
+export function isThinkingLevel(value: unknown): value is ThinkingLevel {
+  return thinkingLevel.Check(value)
 }
 
 export function isAgentMessage(value: unknown): value is AgentMessage {

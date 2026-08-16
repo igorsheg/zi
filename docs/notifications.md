@@ -108,7 +108,7 @@ Fidget's Neovim-specific `show_history()` echo integration is intentionally not 
 
 Prompt progress and errors persist until an admitted transition replaces or removes them. Prompt information and warnings are finite. In-flight progress skips removed history; settled information, warnings, and errors remain history-eligible. `/reload` replaces `Reloading…` on the `prompt` key with its separately keyed settled outcome. Session replacement clears every built-in key before the new session's authoritative diagnostics are projected.
 
-The composed transcript status row remains above the composer. It owns the animated `Working…`, retry/compaction/cancellation lifecycle text, detached-transcript `New output` attention, background command/subagent counts, and work-plan progress. Authentication ceremonies, picker guidance and errors, inline tool state, queued inputs, and composer metadata remain with their contextual owners. Built-in notices never submit input, wake the model, or copy transcript content.
+The composed transcript status row remains above the composer. It owns the animated `Working…`, retry/compaction/cancellation lifecycle text, detached-transcript `New output` attention, background command/agent counts, and work-plan progress. Authentication ceremonies, picker guidance and errors, inline tool state, queued inputs, and composer metadata remain with their contextual owners. Built-in notices never submit input, wake the model, or copy transcript content.
 
 ## Ownership
 

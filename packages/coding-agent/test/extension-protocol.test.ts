@@ -18,12 +18,8 @@ import {
   maxExtensionDiagnosticMessageBytes,
   maxExtensionIdBytes,
   maxExtensionProtocolFrameBytes,
+  maxExtensionAgentTaskNameBytes,
   maxExtensionQueuedWrites,
-  maxExtensionSubagentDescriptionBytes,
-  maxExtensionSubagentInstructionsBytes,
-  maxExtensionSubagentModelBytes,
-  maxExtensionSubagentNameBytes,
-  maxExtensionSubagentProfiles,
   maxExtensionToolArgumentsBytes,
   maxExtensionToolCatalogBytes,
   maxExtensionToolDescriptionBytes,
@@ -604,98 +600,42 @@ test("session-operation protocol validates source, values, delivery, and bounded
   ).toThrow("session operation error")
 })
 
-test("subagent protocol bounds profiles, operations, snapshots, and cancellation", () => {
-  const profile = {
-    source,
-    name: "finder",
-    description: "Find evidence",
-    instructions: "Find only requested evidence",
-    thinking: "high"
-  }
-  const ready = validateWorkerMessage({
-    type: "ready",
-    protocolVersion: extensionProtocolVersion,
-    generation: 1,
-    extensions: [{ source, status: "loaded" }],
-    commands: [],
-    tools: [],
-    subagents: [profile]
-  })
-  expect(ready).toMatchObject({ subagents: [{ name: "finder", thinking: "high" }] })
-  expect(Object.isFrozen(ready.type === "ready" ? ready.subagents?.[0] : undefined)).toBe(true)
-  expect(() =>
-    validateWorkerMessage({
-      type: "ready",
-      protocolVersion: extensionProtocolVersion,
-      generation: 1,
-      extensions: [{ source, status: "loaded" }],
-      commands: [],
-      tools: [],
-      subagents: [profile, profile]
-    })
-  ).toThrow("unique")
-  expect(() =>
-    validateWorkerMessage({
-      type: "ready",
-      protocolVersion: extensionProtocolVersion,
-      generation: 1,
-      extensions: [{ source, status: "loaded" }],
-      commands: [],
-      tools: [],
-      subagents: [{ ...profile, instructions: "x".repeat(maxExtensionSubagentInstructionsBytes + 1) }]
-    })
-  ).toThrow(`${maxExtensionSubagentInstructionsBytes}`)
-  expect(() =>
-    validateWorkerMessage({
-      type: "ready",
-      protocolVersion: extensionProtocolVersion,
-      generation: 1,
-      extensions: [{ source, status: "loaded" }],
-      commands: [],
-      tools: [],
-      subagents: [{ ...profile, description: " \n ", instructions: " \t " }]
-    })
-  ).toThrow("blank")
-  expect(() =>
-    validateWorkerMessage({
-      type: "ready",
-      protocolVersion: extensionProtocolVersion,
-      generation: 1,
-      extensions: [{ source, status: "loaded" }],
-      commands: [],
-      tools: [],
-      subagents: [{ ...profile, model: "   " }]
-    })
-  ).toThrow("blank")
+test("agent protocol bounds concrete spawn options, snapshots, and cancellation", () => {
   expect(
     validateWorkerMessage({
-      type: "ready",
-      protocolVersion: extensionProtocolVersion,
+      type: "agent_spawn",
       generation: 1,
-      extensions: [{ source, status: "loaded" }],
-      commands: [],
-      tools: [],
-      subagents: [
-        {
-          ...profile,
-          description: "d".repeat(maxExtensionSubagentDescriptionBytes),
-          instructions: "i".repeat(maxExtensionSubagentInstructionsBytes),
-          model: "m".repeat(maxExtensionSubagentModelBytes)
-        }
-      ]
+      requestId: 2,
+      extensionId: source.id,
+      taskName: "finder",
+      message: "Inspect protocol ownership",
+      agentType: "explorer",
+      forkTurns: 3,
+      model: "provider/model",
+      thinking: "high"
     })
-  ).toMatchObject({ subagents: [{ name: "finder" }] })
+  ).toMatchObject({ agentType: "explorer", forkTurns: 3, model: "provider/model", thinking: "high" })
   expect(() =>
     validateWorkerMessage({
       type: "agent_spawn",
       generation: 1,
       requestId: 2,
       extensionId: source.id,
-      profile: "finder",
-      name: "x".repeat(maxExtensionSubagentNameBytes + 1),
-      prompt: "inspect"
+      taskName: "x".repeat(maxExtensionAgentTaskNameBytes + 1),
+      message: "inspect"
     })
-  ).toThrow(`${maxExtensionSubagentNameBytes}`)
+  ).toThrow(`${maxExtensionAgentTaskNameBytes}`)
+  expect(() =>
+    validateWorkerMessage({
+      type: "agent_spawn",
+      generation: 1,
+      requestId: 2,
+      extensionId: source.id,
+      taskName: "finder",
+      message: "inspect",
+      agentType: "custom"
+    })
+  ).toThrow("agent type")
   expect(
     validateWorkerMessage({
       type: "agent_wait",
@@ -703,7 +643,6 @@ test("subagent protocol bounds profiles, operations, snapshots, and cancellation
       requestId: 2,
       extensionId: source.id,
       ownerRequestId: 7,
-      names: ["finder-1"],
       timeoutMs: 1_000
     })
   ).toMatchObject({ type: "agent_wait", ownerRequestId: 7, timeoutMs: 1_000 })
@@ -713,8 +652,7 @@ test("subagent protocol bounds profiles, operations, snapshots, and cancellation
       generation: 1,
       requestId: 2,
       extensionId: source.id,
-      ownerRequestId: 0,
-      names: ["finder-1"]
+      ownerRequestId: 0
     })
   ).toThrow("owner request")
   expect(
@@ -727,75 +665,32 @@ test("subagent protocol bounds profiles, operations, snapshots, and cancellation
     })
   ).toMatchObject({ type: "agent_operation_cancel", targetRequestId: 2 })
   expect(
-    validateHostMessage({
-      type: "agent_interrupt_result",
-      generation: 1,
-      requestId: 2,
-      settlement: {
-        result: "interrupted",
-        snapshot: {
-          name: "finder-1",
-          lifecycle: "idle",
-          capturedWorkCycle: 1,
-          resultReady: false,
-          completion: {
-            workCycle: 1,
-            status: "cancelled",
-            text: "",
-            originalBytes: 0,
-            omittedBytes: 0,
-            truncated: false,
-            durationMs: 100
-          }
-        }
-      }
-    })
-  ).toMatchObject({
-    type: "agent_interrupt_result",
-    settlement: {
-      result: "interrupted",
-      snapshot: { capturedWorkCycle: 1, completion: { workCycle: 1, status: "cancelled" } }
-    }
-  })
+    validateHostMessage({ type: "agent_interrupt_result", generation: 1, requestId: 2, result: "interrupted" })
+  ).toMatchObject({ type: "agent_interrupt_result", result: "interrupted" })
   expect(
     validateHostMessage({
       type: "agent_wait_result",
       generation: 1,
       requestId: 2,
+      message: "Wait timed out.",
+      timedOut: true,
       snapshots: [
         {
-          name: "finder-1",
-          lifecycle: "idle",
-          workCycle: 1,
-          capturedWorkCycle: 1,
-          task: "Inspect protocol ownership",
-          elapsedMs: 100,
-          resultReady: false,
-          completion: {
-            workCycle: 1,
-            status: "completed",
-            text: "done",
-            originalBytes: 4,
-            omittedBytes: 0,
-            truncated: false,
-            durationMs: 100
-          }
+          path: "/root/finder",
+          parentPath: "/root",
+          taskName: "finder",
+          agentType: "explorer",
+          residency: "unloaded",
+          turn: "idle",
+          turnNumber: 1,
+          status: "completed"
         }
       ]
     })
   ).toMatchObject({
     type: "agent_wait_result",
-    snapshots: [
-      {
-        name: "finder-1",
-        lifecycle: "idle",
-        workCycle: 1,
-        capturedWorkCycle: 1,
-        task: "Inspect protocol ownership",
-        elapsedMs: 100,
-        completion: { workCycle: 1, status: "completed" }
-      }
-    ]
+    timedOut: true,
+    snapshots: [{ path: "/root/finder", agentType: "explorer", status: "completed" }]
   })
 })
 
@@ -849,7 +744,7 @@ test("tool catalogs have one aggregate ready-frame budget", () => {
   ).toThrow(`catalog cannot exceed ${maxExtensionToolCatalogBytes} bytes`)
 })
 
-test("ready-frame validation bounds combined source, tool, and subagent catalogs", () => {
+test("ready-frame validation bounds combined source and tool catalogs", () => {
   const path = resolve("root", '"'.repeat(3_500))
   const largestSource: ExtensionSource = {
     id: "x".repeat(maxExtensionIdBytes),
@@ -872,13 +767,6 @@ test("ready-frame validation bounds combined source, tool, and subagent catalogs
     parameters: { type: "object", properties: {} },
     outputSchema: { type: "string" }
   }))
-  const subagents = Array.from({ length: maxExtensionSubagentProfiles }, (_, index) => ({
-    source,
-    name: `profile-${index}`,
-    description: "d".repeat(maxExtensionSubagentDescriptionBytes),
-    instructions: "i".repeat(maxExtensionSubagentInstructionsBytes),
-    model: "m".repeat(maxExtensionSubagentModelBytes)
-  }))
   expect(() =>
     validateWorkerMessage({
       type: "ready",
@@ -886,21 +774,9 @@ test("ready-frame validation bounds combined source, tool, and subagent catalogs
       generation: 1,
       extensions: [...Array.from({ length: maxExtensionSources - 1 }, () => failed), { source, status: "loaded" }],
       commands: [],
-      tools,
-      subagents
+      tools
     })
   ).toThrow(`ready frame cannot exceed ${maxExtensionProtocolFrameBytes} bytes`)
-
-  const maximumProfiles = validateWorkerMessage({
-    type: "ready",
-    protocolVersion: extensionProtocolVersion,
-    generation: 1,
-    extensions: [{ source, status: "loaded" }],
-    commands: [],
-    tools: [],
-    subagents
-  })
-  expect(encodedFrame(maximumProfiles).byteLength).toBeLessThanOrEqual(maxExtensionProtocolFrameBytes + 4)
 })
 
 test("diagnostic construction truncates UTF-8 on a complete code point", () => {

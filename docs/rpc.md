@@ -67,7 +67,7 @@ Operation failures use `ok: false` with `capacity`, `not_found`, or `operation_f
 
 A request ID is connection-local and may identify only one admitted, unsettled operation. Reusing an in-flight ID produces a recoverable `protocol_error` with code `invalid_request` and the matching ID; the duplicate record is not launched, including when it requests the reserved interruption slot. An ID may be reused only after its prior correlated response. Reuse always denotes a new request rather than a replay of the prior result.
 
-`session_event` frames contain source-ordered `AgentSessionEvent` values. Model-change events use the public model projection described below instead of exposing provider configuration or credentials. `entry_appended` is the raw all-journal event and includes `custom`, `custom_message`, `work_plan`, `subagent_work_result`, `background_task_result`, and substrate `subagent` entries. Work results are closed domain records rather than a generic RPC analytics envelope.
+`session_event` frames contain source-ordered `AgentSessionEvent` values. Model-change events use the public model projection described below instead of exposing provider configuration or credentials. `entry_appended` is the raw all-journal event and includes ordinary messages, `custom`, `custom_message`, `work_plan`, `agent_team`, and `background_task_result` entries. AgentTeam entries are closed durable graph and transition evidence rather than a generic RPC analytics envelope.
 
 Work plan replacements also emit `work_plan_changed`; see [Work plans](work-plans.md) for the replacement and persistence rules. Message pages include displayed custom messages and omit hidden ones; a hidden custom message's committed entry event remains observable to the trusted process client.
 
@@ -96,7 +96,7 @@ The idle response returns the observed revision, final message count, and the la
 
 If input was admitted after an earlier idle observation, its newer admission revision tells the client to issue another idle watch; no transcript paging is needed to recover completion evidence. Omitting `completionId` preserves the generic empty idle response. A no-ID prompt that starts or joins work invalidates any earlier completion watch so unrelated assistant output cannot be attributed to it.
 
-`delivery: "continue"` is decided inside the child `AgentSession`: idle starts a direct run; running queues follow-up into the active run. Aborting, compacting, reloading, failed, and disposed states reject the operation. The response reports only that the continue input was admitted, not that its resulting work settled. Clients using completion watches keep the same `completionId` when a continue belongs to the current logical cycle and choose a new ID when starting a new cycle.
+`delivery: "continue"` is decided inside `AgentSession`: idle starts a direct run; running queues follow-up into the active run. Aborting, compacting, reloading, failed, and disposed states reject the operation. The response reports only that the continue input was admitted, not that its resulting work settled. Clients using completion watches keep the same `completionId` when a continue belongs to the current logical cycle and choose a new ID when starting a new cycle.
 
 `command.invoke` addresses an admitted extension command directly; it does not parse slash text. Commands are idle-only `AgentSession` operations. Their optional feedback is returned as `{ "message": "…" }` (or `{}`), remains outside the journal and provider context, and may be interrupted with `session.interrupt`. Unknown names return `not_found`. The copyable client exposes `runRpcCommand(...)`, which checks `command.list` before invoking the exact name.
 
@@ -112,7 +112,7 @@ RPC has no response cache or persisted idempotency storage. Clients must use dom
 
 `connection.set_events` is owned by the RPC connection, not `AgentSession`. Admission applies the mode synchronously in input order before its response is emitted. Mode `none` suppresses only `session_event` frames; `ready`, `response`, and `protocol_error` are never suppressed. The compatibility default remains `all`.
 
-RPC remains a transport for one parent session. Profile-driven standard delegation tools and optional extension-defined orchestration appear as ordinary tools; their durable substrate evidence may appear as journal-entry events. RPC deliberately adds no `agent.*` topology methods or direct external subagent control plane.
+RPC remains a transport for the root session. The six recursive agent operations and optional extension orchestration appear as ordinary tools; their durable `agent_team` evidence may appear as journal-entry events. RPC deliberately adds no `agent.*` topology methods or direct external team control plane.
 
 Public model descriptors contain only `provider`, `id`, `name`, `reasoning`, `input`, `contextWindow`, and `maxTokens`. Catalog results add `configured`. Base URLs, headers, compatibility settings, prices, and credentials do not cross RPC.
 

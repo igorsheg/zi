@@ -46,7 +46,7 @@ test("manual compaction samples, commits, replaces active context, and orders li
   session.dispose()
 })
 
-test("manual compaction preserves subagent metadata appended while summary sampling is pending", async () => {
+test("manual compaction preserves custom metadata appended while summary sampling is pending", async () => {
   const setup = await compactionSession()
   const started = deferred<void>()
   const release = deferred<void>()
@@ -60,18 +60,14 @@ test("manual compaction preserves subagent metadata appended while summary sampl
 
   const compacting = setup.session.compact()
   await started.promise
-  const metadata = setup.session.sessionManager.appendSubagent({
-    event: "ready",
-    name: "background-reviewer",
-    sessionId: "child-session"
-  })
+  const metadata = setup.session.sessionManager.appendCustomEntry("test.metadata", { status: "ready" })
   release.resolve()
 
   const result = await compacting
 
   expect(result.summary).toBe("checkpoint with concurrent metadata")
   expect(setup.session.sessionManager.retainedEntries()).toContain(metadata)
-  expect(setup.session.sessionManager.subagentEntries()).toEqual([metadata])
+  expect(setup.session.sessionManager.customEntries("test.metadata")).toEqual([metadata])
   expect(setup.session.sessionManager.latestCompaction()).toBeDefined()
   setup.session.dispose()
 })

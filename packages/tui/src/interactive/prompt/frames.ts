@@ -2,6 +2,7 @@ import { homedir } from "node:os"
 
 import type {
   AgentSession,
+  AgentSnapshot,
   AuthenticationMethod,
   ModelChoice,
   ProjectFileSearchResult,
@@ -9,15 +10,13 @@ import type {
   SessionInfo,
   SlashCommand,
   SettingsScope,
-  StoredCredential,
-  SubagentSnapshot
+  StoredCredential
 } from "@with-zi/coding-agent"
 
 import { glyphs } from "../../glyphs.js"
-import { isActiveSubagentLifecycle } from "../subagent-activity.js"
 import { sameModel } from "./model-choices.js"
 import type { PickerFrame, PickerStackRow } from "./picker.js"
-import type { EditableSetting, EditableSettingValue, SubagentPickerScope } from "./state.js"
+import type { EditableSetting, EditableSettingValue, AgentPickerScope } from "./state.js"
 
 export const promptCompletionPickerHeight = 7
 
@@ -35,7 +34,7 @@ export const promptPickerFrameIds = {
   settings: "settings",
   settingValues: "setting-values",
   sessions: "sessions",
-  subagents: "subagents",
+  agents: "agents",
   projectTrust: "project-trust"
 } as const
 
@@ -172,19 +171,15 @@ export function sessionFrame(
 
 export type ProjectTrustSelectionId = "untrusted-session" | "trusted-session" | "trusted-saved" | "untrusted-saved"
 
-export function subagentFrame(snapshots: readonly SubagentSnapshot[], scope: SubagentPickerScope): PickerFrame {
-  const visible =
-    scope === "running" ? snapshots.filter(snapshot => isActiveSubagentLifecycle(snapshot.lifecycle)) : snapshots
+export function agentFrame(snapshots: readonly AgentSnapshot[], scope: AgentPickerScope): PickerFrame {
+  const visible = scope === "running" ? snapshots.filter(snapshot => snapshot.turn !== "idle") : snapshots
   return {
-    id: promptPickerFrameIds.subagents,
-    title: scope === "running" ? "Subagents · Running" : "Subagents · All",
+    id: promptPickerFrameIds.agents,
+    title: scope === "running" ? "Agents · Running" : "Agents · All",
     filter: "fuzzy",
-    emptyText: scope === "running" ? "No subagents are running" : "No subagents have been started in this session",
-    rows: visible.map(subagentRow),
-    footer:
-      scope === "running"
-        ? "Tab show all · Enter open transcript · Esc close"
-        : "Tab show running · Enter open transcript · Esc close"
+    emptyText: scope === "running" ? "No agents are running" : "No agents have been started in this session",
+    rows: visible.map(agentRow),
+    footer: scope === "running" ? "Tab show all · Esc close" : "Tab show running · Esc close"
   }
 }
 
@@ -443,36 +438,19 @@ function effectiveSetting(session: AgentSession, setting: EditableSetting): Edit
   }
 }
 
-function subagentRow(snapshot: SubagentSnapshot): PickerStackRow {
+function agentRow(snapshot: AgentSnapshot): PickerStackRow {
   return {
-    id: snapshot.name,
-    label: snapshot.name,
-    detail: `[${subagentStatusLabel(snapshot)}]`,
-    ...(snapshot.task ? { metadata: snapshot.task } : {}),
-    searchText: `${snapshot.name} ${snapshot.lifecycle} ${snapshot.task ?? ""} ${snapshot.completion?.status ?? ""}`
+    id: snapshot.path,
+    label: snapshot.taskName,
+    detail: `[${agentStatusLabel(snapshot)}]`,
+    metadata: snapshot.path,
+    searchText: `${snapshot.path} ${snapshot.taskName} ${snapshot.agentType} ${snapshot.turn} ${snapshot.status}`
   }
 }
 
-function subagentStatusLabel(snapshot: SubagentSnapshot): string {
-  const cycle = snapshot.workCycle ?? snapshot.capturedWorkCycle
-  const suffix = cycle === undefined ? "" : ` #${cycle}`
-  if (snapshot.completion) return `${snapshot.completion.status}${suffix}`
-  switch (snapshot.lifecycle) {
-    case "idle":
-      return `idle${suffix}`
-    case "queued":
-      return `queued${suffix}`
-    case "running":
-      return `running${suffix}`
-    case "interrupting":
-      return `interrupting${suffix}`
-    case "closing":
-      return `closing${suffix}`
-    case "exited":
-      return `exited${suffix}`
-    default:
-      return assertNever(snapshot.lifecycle)
-  }
+function agentStatusLabel(snapshot: AgentSnapshot): string {
+  const suffix = snapshot.turnNumber === 0 ? "" : ` #${snapshot.turnNumber}`
+  return snapshot.turn === "idle" ? `${snapshot.status}${suffix}` : `${snapshot.turn}${suffix}`
 }
 
 function relativeTime(timestamp: string, now: number): string {

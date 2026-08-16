@@ -414,7 +414,7 @@ export default function (zi): void {
   output.destroy()
 })
 
-test("worker subagent waits inherit their owning invocation", async () => {
+test("worker agent waits inherit their owning invocation", async () => {
   const root = await mkdtemp(join(tmpdir(), "zi-extension-worker-owned-wait-"))
   const extension = await fixture(
     root,
@@ -446,8 +446,7 @@ export default function (zi): void {
           return "cancelled"
         }
       }
-      await zi.agents.wait(1_000)
-      return "waited"
+      return JSON.stringify(await zi.agents.wait(1_000))
     }
   })
 }
@@ -463,7 +462,7 @@ export default function (zi): void {
     protocolVersion: extensionProtocolVersion,
     generation: 1,
     plan: extensionPlan(root, [extension]),
-    subagentsAvailable: true
+    agentsAvailable: true
   })
   expect((await messages.next()).type).toBe("ready")
   send(input, { type: "session_start", generation: 1, requestId: 1, reason: "startup", context: testExtensionContext })
@@ -476,16 +475,27 @@ export default function (zi): void {
     generation: 1,
     extensionId: extension.id,
     ownerRequestId: 2,
-    names: [],
     timeoutMs: 1_000
   })
-  if (wait.type !== "agent_wait") throw new Error("Expected a subagent wait request")
-  send(input, { type: "agent_wait_result", generation: 1, requestId: wait.requestId, snapshots: [] })
-  expect(await messages.next()).toEqual({ type: "tool_result", generation: 1, requestId: 2, value: "waited" })
+  if (wait.type !== "agent_wait") throw new Error("Expected an agent wait request")
+  send(input, {
+    type: "agent_wait_result",
+    generation: 1,
+    requestId: wait.requestId,
+    message: "Wait timed out.",
+    timedOut: true,
+    snapshots: []
+  })
+  expect(await messages.next()).toEqual({
+    type: "tool_result",
+    generation: 1,
+    requestId: 2,
+    value: JSON.stringify({ message: "Wait timed out.", timedOut: true, agents: [] })
+  })
 
   send(input, { type: "tool_invoke", generation: 1, requestId: 3, name: "owned_wait", arguments: { cancel: true } })
   const cancelledWait = await messages.next()
-  expect(cancelledWait).toMatchObject({ type: "agent_wait", ownerRequestId: 3, names: [] })
+  expect(cancelledWait).toMatchObject({ type: "agent_wait", ownerRequestId: 3 })
   if (cancelledWait.type !== "agent_wait") throw new Error("Expected a cancelled subagent wait request")
   expect(await messages.next()).toMatchObject({
     type: "agent_operation_cancel",
@@ -501,9 +511,16 @@ export default function (zi): void {
 
   send(input, { type: "command_invoke", generation: 1, requestId: 4, name: "owned-wait", arguments: "" })
   const commandWait = await messages.next()
-  expect(commandWait).toMatchObject({ type: "agent_wait", ownerRequestId: 4, names: [] })
+  expect(commandWait).toMatchObject({ type: "agent_wait", ownerRequestId: 4 })
   if (commandWait.type !== "agent_wait") throw new Error("Expected a command-owned subagent wait request")
-  send(input, { type: "agent_wait_result", generation: 1, requestId: commandWait.requestId, snapshots: [] })
+  send(input, {
+    type: "agent_wait_result",
+    generation: 1,
+    requestId: commandWait.requestId,
+    message: "Wait completed.",
+    timedOut: false,
+    snapshots: []
+  })
   expect(await messages.next()).toEqual({
     type: "command_result",
     generation: 1,

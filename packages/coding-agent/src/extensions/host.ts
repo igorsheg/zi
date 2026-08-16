@@ -1,15 +1,15 @@
 import type {
   ExtensionAgentSettledEvent,
+  ExtensionAgentSnapshot,
   ExtensionAgentStartEvent,
+  ExtensionAgentType,
   ExtensionContext,
   ExtensionCustomEntry,
   ExtensionCustomMessage,
   ExtensionMessageDelivery,
   ExtensionShutdownReason,
   ExtensionStartReason,
-  ExtensionSubagentInterruptSettlement,
-  ExtensionSubagentProfile,
-  ExtensionSubagentSnapshot,
+  ExtensionThinkingLevel,
   JsonValue as ExtensionJsonValue
 } from "@with-zi/extension-api"
 
@@ -39,7 +39,6 @@ import {
   type ExtensionLoadResult,
   type ExtensionSessionRequest,
   type ExtensionSessionResponse,
-  type ExtensionSubagentRegistration,
   type ExtensionToolRegistration,
   type HostMessage,
   type JsonValue,
@@ -49,21 +48,36 @@ import {
   validateWorkerMessage
 } from "./protocol.js"
 
-export interface ExtensionSubagentSessionOperations {
-  readonly waitTimeoutMs: number
-  listProfiles(extensionId: string): readonly ExtensionSubagentProfile[]
-  spawn(extensionId: string, profile: string, name: string, prompt: string, signal: AbortSignal): Promise<string>
-  send(extensionId: string, name: string, text: string): Promise<void>
-  continue(extensionId: string, name: string, text: string): Promise<"started_turn" | "follow_up">
+export interface ExtensionAgentWaitOutcome {
+  readonly message: string
+  readonly timedOut: boolean
+  readonly snapshots: readonly ExtensionAgentSnapshot[]
+}
+
+export interface ExtensionAgentSessionOperations {
+  resolveWaitTimeout(requestedTimeoutMs: number | undefined): number
+  spawn(
+    extensionId: string,
+    taskName: string,
+    message: string,
+    options: {
+      readonly agentType?: ExtensionAgentType
+      readonly forkTurns?: "all" | "none" | number
+      readonly model?: string
+      readonly thinking?: ExtensionThinkingLevel
+    },
+    signal: AbortSignal
+  ): Promise<string>
+  send(extensionId: string, target: string, message: string): Promise<void>
+  followup(extensionId: string, target: string, message: string): Promise<"started" | "joined">
   wait(
     extensionId: string,
-    names: readonly string[],
-    timeoutMs: number | undefined,
+    requestedTimeoutMs: number | undefined,
+    timeoutMs: number,
     signal: AbortSignal
-  ): Promise<readonly ExtensionSubagentSnapshot[]>
-  interrupt(extensionId: string, name: string): Promise<ExtensionSubagentInterruptSettlement>
-  close(extensionId: string, name: string): Promise<ExtensionSubagentSnapshot>
-  list(extensionId: string): readonly ExtensionSubagentSnapshot[]
+  ): Promise<ExtensionAgentWaitOutcome>
+  interrupt(extensionId: string, target: string): Promise<"interrupted" | "idle">
+  list(extensionId: string, pathPrefix?: string): readonly ExtensionAgentSnapshot[]
 }
 
 export interface ExtensionSessionOperations {
@@ -72,14 +86,14 @@ export interface ExtensionSessionOperations {
   sendMessage(message: ExtensionCustomMessage, delivery: ExtensionMessageDelivery): void
   getActiveTools(extensionId: string): readonly string[]
   setActiveTools(extensionId: string, names: readonly string[]): void
-  readonly subagents?: ExtensionSubagentSessionOperations
+  readonly agents?: ExtensionAgentSessionOperations
 }
 
 export interface ExtensionHostCapabilities {
-  readonly subagents: boolean
+  readonly agents: boolean
 }
 
-const noExtensionHostCapabilities: ExtensionHostCapabilities = Object.freeze({ subagents: false })
+const noExtensionHostCapabilities: ExtensionHostCapabilities = Object.freeze({ agents: false })
 
 export interface ExtensionHostTimeouts {
   readonly startupMs: number
@@ -206,7 +220,6 @@ interface ExtensionGenerationReady {
   readonly extensions: readonly ExtensionLoadResult[]
   readonly commands: readonly ExtensionCommandRegistration[]
   readonly tools: readonly ExtensionToolRegistration[]
-  readonly subagents: readonly ExtensionSubagentRegistration[]
 }
 
 type GenerationCommandInvocation =
@@ -285,14 +298,17 @@ type ExtensionSessionRequestOutcome =
   | { readonly type: "custom_entry_result"; readonly entry: ExtensionCustomEntry }
   | { readonly type: "custom_message_result" }
   | { readonly type: "active_tools_result"; readonly names: readonly string[] }
-  | { readonly type: "agent_roles_result"; readonly profiles: readonly ExtensionSubagentProfile[] }
-  | { readonly type: "agent_spawn_result"; readonly name: string }
+  | { readonly type: "agent_spawn_result"; readonly path: string }
   | { readonly type: "agent_send_result" }
-  | { readonly type: "agent_followup_result"; readonly delivery: "started_turn" | "follow_up" }
-  | { readonly type: "agent_wait_result"; readonly snapshots: readonly ExtensionSubagentSnapshot[] }
-  | { readonly type: "agent_interrupt_result"; readonly settlement: ExtensionSubagentInterruptSettlement }
-  | { readonly type: "agent_close_result"; readonly snapshot: ExtensionSubagentSnapshot }
-  | { readonly type: "agent_list_result"; readonly snapshots: readonly ExtensionSubagentSnapshot[] }
+  | { readonly type: "agent_followup_result"; readonly delivery: "started" | "joined" }
+  | {
+      readonly type: "agent_wait_result"
+      readonly message: string
+      readonly timedOut: boolean
+      readonly snapshots: readonly ExtensionAgentSnapshot[]
+    }
+  | { readonly type: "agent_interrupt_result"; readonly result: "interrupted" | "idle" }
+  | { readonly type: "agent_list_result"; readonly snapshots: readonly ExtensionAgentSnapshot[] }
   | { readonly type: "session_operation_error"; readonly message: string }
 
 type ProcessStatus = { readonly type: "running" } | { readonly type: "exited"; readonly exit: ExtensionWorkerExit }
@@ -383,7 +399,6 @@ class ExtensionGeneration {
   #nextAgentEventSequence = 1
   #commands: readonly ExtensionCommandRegistration[] = Object.freeze([])
   #tools: readonly ExtensionToolRegistration[] = Object.freeze([])
-  #subagents: readonly ExtensionSubagentRegistration[] = Object.freeze([])
   readonly #onProtocolData: (chunk: Buffer) => void
   readonly #onProtocolEnd: () => void
   readonly #onProtocolError: (cause: Error) => void
@@ -408,7 +423,7 @@ class ExtensionGeneration {
       request: ExtensionSessionRequest,
       signal: AbortSignal
     ) => Promise<ExtensionSessionRequestOutcome>,
-    readonly subagentsAvailable: boolean
+    readonly agentsAvailable: boolean
   ) {
     this.id = id
     this.plan = plan
@@ -457,10 +472,6 @@ class ExtensionGeneration {
     return this.#tools
   }
 
-  get subagents(): readonly ExtensionSubagentRegistration[] {
-    return this.#subagents
-  }
-
   logs(): { readonly stdout: ExtensionLogTail; readonly stderr: ExtensionLogTail } {
     return Object.freeze({ stdout: this.#stdout.snapshot(), stderr: this.#stderr.snapshot() })
   }
@@ -474,7 +485,7 @@ class ExtensionGeneration {
       protocolVersion: extensionProtocolVersion,
       generation: this.id,
       plan: this.plan,
-      subagentsAvailable: this.subagentsAvailable
+      agentsAvailable: this.agentsAvailable
     }
     try {
       return await within(
@@ -628,23 +639,17 @@ class ExtensionGeneration {
     return settled.promise
   }
 
-  admitSubagentWait(
-    extensionId: string,
-    ownerRequestId: number | undefined,
-    requestedTimeoutMs: number | undefined,
-    defaultTimeoutMs: number
-  ): number | undefined {
-    if (ownerRequestId === undefined) return requestedTimeoutMs
+  admitAgentWait(extensionId: string, ownerRequestId: number | undefined, timeoutMs: number): number {
+    if (ownerRequestId === undefined) return timeoutMs
     const command = this.#commandInvocations.get(ownerRequestId)
     const tool = this.#toolInvocations.get(ownerRequestId)
     const invocation = command ?? tool
     if (!invocation || invocation.type !== "running") {
-      throw new Error("Extension subagent wait owner is no longer active")
+      throw new Error("Extension agent wait owner is no longer active")
     }
     if (invocation.registration.source.id !== extensionId) {
-      throw new Error("Extension subagent wait owner belongs to another extension")
+      throw new Error("Extension agent wait owner belongs to another extension")
     }
-    const timeoutMs = requestedTimeoutMs ?? defaultTimeoutMs
     const settlementMarginMs = Math.min(
       extensionOwnedWaitSettlementMarginMs,
       Math.max(1, Math.floor(invocation.timeoutMs / 10))
@@ -652,7 +657,7 @@ class ExtensionGeneration {
     const remainingMs = Math.max(0, invocation.deadlineAt - Date.now() - settlementMarginMs)
     if (timeoutMs > remainingMs) {
       throw new Error(
-        `Extension subagent wait timeout ${timeoutMs}ms exceeds its owning invocation budget of ${remainingMs}ms`
+        `Extension agent wait timeout ${timeoutMs}ms exceeds its owning invocation budget of ${remainingMs}ms`
       )
     }
     return timeoutMs
@@ -883,13 +888,11 @@ class ExtensionGeneration {
       case "custom_message_send":
       case "active_tools_get":
       case "active_tools_set":
-      case "agent_roles_get":
       case "agent_spawn":
       case "agent_send":
       case "agent_followup":
       case "agent_wait":
       case "agent_interrupt":
-      case "agent_close":
       case "agent_list":
         this.#respondToSessionRequest(message)
         return
@@ -915,21 +918,10 @@ class ExtensionGeneration {
           this.#fail("handshake", "Extension worker tools did not match its loaded extensions")
           return
         }
-        const subagents = message.subagents ?? Object.freeze([])
-        if (!subagentsMatchLoadedExtensions(subagents, message.extensions)) {
-          this.#fail("handshake", "Extension worker subagent profiles did not match its loaded extensions")
-          return
-        }
         this.#commands = message.commands
         this.#tools = message.tools
-        this.#subagents = subagents
         this.#state = { type: "ready", lifecycle: "loaded" }
-        state.ready.resolve({
-          extensions: message.extensions,
-          commands: message.commands,
-          tools: message.tools,
-          subagents
-        })
+        state.ready.resolve({ extensions: message.extensions, commands: message.commands, tools: message.tools })
         return
       case "agent_event_settled": {
         const timeout = this.#pendingAgentEvents.get(message.sequence)
@@ -1255,7 +1247,6 @@ export class ExtensionHost {
   #extensions: readonly ExtensionLoadResult[] = Object.freeze([])
   #commands: readonly ExtensionCommandRegistration[] = Object.freeze([])
   #tools: readonly ExtensionToolRegistration[] = Object.freeze([])
-  #subagents: readonly ExtensionSubagentRegistration[] = Object.freeze([])
   #catalogListener: ((catalog: ExtensionHostCatalog) => void) | undefined
   #sessionOperations: ExtensionSessionOperations | undefined
   #reloadAttempt: ReloadAttempt | undefined
@@ -1333,10 +1324,6 @@ export class ExtensionHost {
 
   toolCatalog(): readonly ExtensionToolRegistration[] {
     return this.#tools
-  }
-
-  subagentCatalog(): readonly ExtensionSubagentRegistration[] {
-    return this.#subagents
   }
 
   bindSessionOperations(operations: ExtensionSessionOperations): () => void {
@@ -1547,7 +1534,6 @@ export class ExtensionHost {
       if (plan.sources.length === 0) {
         this.#state = { type: "disabled", lifecycle: state.lifecycle }
         this.#extensions = Object.freeze([])
-        this.#subagents = Object.freeze([])
         this.#setCatalog(Object.freeze([]), Object.freeze([]))
         return this.#finishReloadAttempt("disabled")
       }
@@ -1566,7 +1552,6 @@ export class ExtensionHost {
       await this.#retireCurrent(replacing, state.current, reason)
       if (this.#state !== replacing) return this.#finishReloadAttempt("superseded")
       this.#extensions = Object.freeze([])
-      this.#subagents = Object.freeze([])
       this.#setCatalog(Object.freeze([]), Object.freeze([]))
       this.#state = { type: "disabled", lifecycle: state.lifecycle }
       return this.#finishReloadAttempt("disabled")
@@ -1601,7 +1586,6 @@ export class ExtensionHost {
       if (currentFailure) {
         const cleanup = state.current.dispose()
         this.#extensions = Object.freeze([])
-        this.#subagents = Object.freeze([])
         this.#setCatalog(Object.freeze([]), Object.freeze([]))
         this.#state = { type: "failed", lifecycle: state.lifecycle, diagnostic: currentFailure, cleanup }
         await cleanup
@@ -1622,7 +1606,6 @@ export class ExtensionHost {
     }
 
     this.#extensions = ready.extensions
-    this.#subagents = ready.subagents
     this.#setCatalog(ready.commands, ready.tools)
     if (state.lifecycle === "started") {
       const dispatching: ExtensionHostState = {
@@ -1693,7 +1676,6 @@ export class ExtensionHost {
     if (plan.sources.length === 0) {
       this.#state = { type: "disabled", lifecycle }
       this.#extensions = Object.freeze([])
-      this.#subagents = Object.freeze([])
       this.#setCatalog(Object.freeze([]), Object.freeze([]))
       return
     }
@@ -1722,7 +1704,6 @@ export class ExtensionHost {
       if (this.#state === spawned) {
         const failure = failureDiagnostic(cause)
         this.#extensions = Object.freeze([])
-        this.#subagents = Object.freeze([])
         this.#setCatalog(Object.freeze([]), Object.freeze([]))
         this.#state = { type: "failed", lifecycle, diagnostic: failure, cleanup }
       }
@@ -1742,7 +1723,6 @@ export class ExtensionHost {
     }
     this.#admitLoadResults(ready.extensions)
     this.#extensions = ready.extensions
-    this.#subagents = ready.subagents
     this.#setCatalog(ready.commands, ready.tools)
 
     if (lifecycle === "started") {
@@ -1778,7 +1758,7 @@ export class ExtensionHost {
       (generation, value) => this.#generationFailed(generation, value),
       () => this.#staleFrame(),
       (generation, request, signal) => this.#handleSessionRequest(generation, request, signal),
-      this.#capabilities.subagents
+      this.#capabilities.agents
     )
   }
 
@@ -1815,7 +1795,7 @@ export class ExtensionHost {
       phase === "state_only" &&
       (request.type === "agent_spawn" || request.type === "agent_send" || request.type === "agent_followup")
     ) {
-      return { type: "session_operation_error", message: "New subagent work is closed during extension shutdown" }
+      return { type: "session_operation_error", message: "New agent work is closed during extension shutdown" }
     }
 
     try {
@@ -1838,59 +1818,55 @@ export class ExtensionHost {
         case "active_tools_set":
           operations.setActiveTools(request.extensionId, request.names)
           return { type: "active_tools_result", names: operations.getActiveTools(request.extensionId) }
-        case "agent_roles_get":
-          if (!operations.subagents) throw new Error("Subagent session operations are not bound")
-          return { type: "agent_roles_result", profiles: operations.subagents.listProfiles(request.extensionId) }
         case "agent_spawn":
-          if (!operations.subagents) throw new Error("Subagent session operations are not bound")
+          if (!operations.agents) throw new Error("Agent session operations are not bound")
           return {
             type: "agent_spawn_result",
-            name: await operations.subagents.spawn(
+            path: await operations.agents.spawn(
               request.extensionId,
-              request.profile,
-              request.name,
-              request.prompt,
+              request.taskName,
+              request.message,
+              {
+                ...(request.agentType === undefined ? {} : { agentType: request.agentType }),
+                ...(request.forkTurns === undefined ? {} : { forkTurns: request.forkTurns }),
+                ...(request.model === undefined ? {} : { model: request.model }),
+                ...(request.thinking === undefined ? {} : { thinking: request.thinking })
+              },
               signal
             )
           }
         case "agent_send":
-          if (!operations.subagents) throw new Error("Subagent session operations are not bound")
-          await operations.subagents.send(request.extensionId, request.name, request.text)
+          if (!operations.agents) throw new Error("Agent session operations are not bound")
+          await operations.agents.send(request.extensionId, request.target, request.message)
           return { type: "agent_send_result" }
         case "agent_followup":
-          if (!operations.subagents) throw new Error("Subagent session operations are not bound")
+          if (!operations.agents) throw new Error("Agent session operations are not bound")
           return {
             type: "agent_followup_result",
-            delivery: await operations.subagents.continue(request.extensionId, request.name, request.text)
+            delivery: await operations.agents.followup(request.extensionId, request.target, request.message)
           }
         case "agent_wait": {
-          if (!operations.subagents) throw new Error("Subagent session operations are not bound")
-          const timeoutMs = generation.admitSubagentWait(
+          if (!operations.agents) throw new Error("Agent session operations are not bound")
+          const timeoutMs = generation.admitAgentWait(
             request.extensionId,
             request.ownerRequestId,
-            request.timeoutMs,
-            operations.subagents.waitTimeoutMs
+            operations.agents.resolveWaitTimeout(request.timeoutMs)
           )
-          return {
-            type: "agent_wait_result",
-            snapshots: await operations.subagents.wait(request.extensionId, request.names, timeoutMs, signal)
-          }
+          const outcome = await operations.agents.wait(request.extensionId, request.timeoutMs, timeoutMs, signal)
+          return { type: "agent_wait_result", ...outcome }
         }
         case "agent_interrupt":
-          if (!operations.subagents) throw new Error("Subagent session operations are not bound")
+          if (!operations.agents) throw new Error("Agent session operations are not bound")
           return {
             type: "agent_interrupt_result",
-            settlement: await operations.subagents.interrupt(request.extensionId, request.name)
-          }
-        case "agent_close":
-          if (!operations.subagents) throw new Error("Subagent session operations are not bound")
-          return {
-            type: "agent_close_result",
-            snapshot: await operations.subagents.close(request.extensionId, request.name)
+            result: await operations.agents.interrupt(request.extensionId, request.target)
           }
         case "agent_list":
-          if (!operations.subagents) throw new Error("Subagent session operations are not bound")
-          return { type: "agent_list_result", snapshots: operations.subagents.list(request.extensionId) }
+          if (!operations.agents) throw new Error("Agent session operations are not bound")
+          return {
+            type: "agent_list_result",
+            snapshots: operations.agents.list(request.extensionId, request.pathPrefix)
+          }
         default:
           return assertNever(request)
       }
@@ -1926,7 +1902,6 @@ export class ExtensionHost {
     if (this.#state === ownerState) {
       if (!(cause instanceof ExtensionGenerationError)) this.#diagnose(failure)
       this.#extensions = Object.freeze([])
-      this.#subagents = Object.freeze([])
       this.#setCatalog(Object.freeze([]), Object.freeze([]))
       this.#state = { type: "failed", lifecycle, diagnostic: failure, cleanup }
     }
@@ -1943,7 +1918,6 @@ export class ExtensionHost {
         return undefined
       })
       this.#extensions = Object.freeze([])
-      this.#subagents = Object.freeze([])
       this.#setCatalog(Object.freeze([]), Object.freeze([]))
       this.#state = { type: "failed", lifecycle: state.lifecycle, diagnostic: value, cleanup }
     }
@@ -1966,7 +1940,6 @@ export class ExtensionHost {
       if (retainedGeneration) this.#lastLogs = retainedGeneration.logs()
       if (this.#state === state) {
         this.#extensions = Object.freeze([])
-        this.#subagents = Object.freeze([])
         this.#setCatalog(Object.freeze([]), Object.freeze([]))
         this.#state = { type: "disposed" }
       }
@@ -2134,15 +2107,6 @@ function toolsMatchLoadedExtensions(
 ): boolean {
   return tools.every(tool =>
     extensions.some(result => result.status === "loaded" && sameExtensionSource(result.source, tool.source))
-  )
-}
-
-function subagentsMatchLoadedExtensions(
-  subagents: readonly ExtensionSubagentRegistration[],
-  extensions: readonly ExtensionLoadResult[]
-): boolean {
-  return subagents.every(subagent =>
-    extensions.some(result => result.status === "loaded" && sameExtensionSource(result.source, subagent.source))
   )
 }
 

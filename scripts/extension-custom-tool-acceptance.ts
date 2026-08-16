@@ -676,8 +676,7 @@ function validateProductDocumentation(value: unknown, root: string): void {
     `${normalizedRoot}/docs/skills.md`,
     `${normalizedRoot}/docs/subagents.md`,
     `${normalizedRoot}/examples/extensions/`,
-    `${normalizedRoot}/examples/skills/`,
-    `${normalizedRoot}/examples/subagents/`
+    `${normalizedRoot}/examples/skills/`
   ]) {
     if (!payload.includes(path)) throw new Error(`Compiled provider prompt omitted packaged documentation: ${path}`)
   }

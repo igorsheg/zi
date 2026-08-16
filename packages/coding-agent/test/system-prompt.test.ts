@@ -14,21 +14,19 @@ import {
   type SystemPromptSnapshot
 } from "../src/system-prompt.js"
 
-const spawnSubagent = {
-  name: "spawn_subagent",
-  label: "spawn_subagent",
+const baseTool = {
+  name: "placeholder",
+  label: "placeholder",
   description: "test subagent tool",
   parameters: Type.Object({}),
   execute: () => Promise.resolve({ content: [], details: undefined })
 } satisfies AgentTool
 
-const readTool = { ...spawnSubagent, name: "read", label: "read" } satisfies AgentTool
-const editTool = { ...spawnSubagent, name: "edit", label: "edit" } satisfies AgentTool
-const writeTool = { ...spawnSubagent, name: "write", label: "write" } satisfies AgentTool
-const bashTool = { ...spawnSubagent, name: "bash", label: "bash" } satisfies AgentTool
-const updatePlan = { ...spawnSubagent, name: "update_plan", label: "update_plan" } satisfies AgentTool
-const listPeers = { ...spawnSubagent, name: "list_peer_subagents", label: "list_peer_subagents" } satisfies AgentTool
-const sendPeer = { ...spawnSubagent, name: "send_peer_message", label: "send_peer_message" } satisfies AgentTool
+const readTool = { ...baseTool, name: "read", label: "read" } satisfies AgentTool
+const editTool = { ...baseTool, name: "edit", label: "edit" } satisfies AgentTool
+const writeTool = { ...baseTool, name: "write", label: "write" } satisfies AgentTool
+const bashTool = { ...baseTool, name: "bash", label: "bash" } satisfies AgentTool
+const updatePlan = { ...baseTool, name: "update_plan", label: "update_plan" } satisfies AgentTool
 const reviewSkill = {
   name: "review",
   description: "Review a change",
@@ -138,7 +136,7 @@ test("the default prompt routes Zi customization work to shipped documentation",
   expect(documentation).toContain(`Product overview: ${readme}`)
   expect(documentation).toContain(`${docs}/extensions.md and ${examples}/extensions/`)
   expect(documentation).toContain(`${docs}/skills.md and ${examples}/skills/`)
-  expect(documentation).toContain(`${docs}/subagents.md and ${examples}/subagents/`)
+  expect(documentation).toContain(`${docs}/subagents.md`)
 })
 
 test("a custom prompt owns base and product documentation policy without suppressing other sections", () => {
@@ -195,7 +193,6 @@ test("sections and skill instructions follow derived capabilities", () => {
     shell: false,
     codeMode: false,
     workPlan: false,
-    peerSubagents: false,
     skillReadSurface: undefined
   })
   expect(bare.sections.map(section => section.kind)).toEqual(["base", "product-documentation", "environment"])
@@ -211,7 +208,6 @@ test("sections and skill instructions follow derived capabilities", () => {
     shell: false,
     codeMode: false,
     workPlan: true,
-    peerSubagents: false,
     skillReadSurface: "direct"
   })
   expect(direct.sections.map(section => section.kind)).toEqual([
@@ -302,23 +298,4 @@ test("project instruction envelopes neutralize every injected tag form", () => {
   expect(project.match(/<\/project_instructions>/gi)).toHaveLength(1)
   expect(project).toContain('path="/work/&quot;&gt;&lt;project_context&gt;&lt;/project_instructions&gt;"')
   for (const tag of injected) expect(project).toContain(tag.replace("<", "&lt;"))
-})
-
-test("peer doctrine is admitted only with both direct relay tools", () => {
-  const child = compileSystemPrompt("/work", createSessionResources(), [listPeers, sendPeer])
-  expect(child.capabilities.peerSubagents).toBe(true)
-  expect(sectionText(child, "peer-subagents")).toContain("Peer messages are context-only")
-  expect(sectionText(child, "peer-subagents")).toContain("final response is still delivered to your parent")
-
-  for (const tools of [[], [listPeers], [sendPeer], [spawnSubagent]]) {
-    const parent = compileSystemPrompt("/work", createSessionResources(), tools)
-    expect(parent.capabilities.peerSubagents).toBe(false)
-    expect(parent.sections.map(section => section.kind)).not.toContain("peer-subagents")
-  }
-})
-
-test("tool names do not activate native subagent prompt policy", () => {
-  const snapshot = compileSystemPrompt("/work", createSessionResources(), [spawnSubagent])
-
-  expect(snapshot.text).not.toContain("wait_subagents")
 })

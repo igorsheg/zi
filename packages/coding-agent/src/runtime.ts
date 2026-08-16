@@ -81,7 +81,7 @@ export async function createUnboundAgentRuntime(requested: CreateAgentRuntimeOpt
   const extensionHost = new ExtensionHost(
     plan => spawnExtensionWorker(plan, extensionWorkerCommand, processTreeTracker),
     undefined,
-    { subagents: true }
+    { agents: true }
   )
   let shell: SessionShell | undefined
   try {

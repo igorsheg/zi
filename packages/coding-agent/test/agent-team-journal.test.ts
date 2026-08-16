@@ -16,6 +16,7 @@ import { SessionManager } from "../src/session-manager.js"
 
 const research = parseAgentPath("/root/research")
 const review = parseAgentPath("/root/review")
+const execution = { model: { provider: "test", modelId: "model" }, thinkingLevel: "medium" } as const
 const completed: AgentTurnResult = {
   status: "completed",
   durationMs: 12,
@@ -42,19 +43,27 @@ function completionIdentity(path: string, turn: number): string {
   return `${path}\0${turn}`
 }
 
-function spawn(path = research, operationId = "spawn-1"): AgentTeamEntryData[] {
+function spawn(
+  path = research,
+  operationId = "spawn-1",
+  parentPath = rootAgentPath,
+  parentSessionId = "root-session",
+  generation = 1
+): AgentTeamEntryData[] {
   return [
     {
       type: "agent_spawn_reserved",
       operationId,
       path,
-      parentPath: rootAgentPath,
+      parentPath,
       sessionId: `session-${operationId}`,
-      parentSessionId: "root-session",
+      parentSessionId,
       parentEntryId: "parent-entry",
-      generation: 1,
+      generation,
       taskName: path.slice(path.lastIndexOf("/") + 1),
-      forkTurns: "all"
+      agentType: "default",
+      forkTurns: "all",
+      execution
     },
     { type: "agent_spawn_committed", operationId }
   ]
@@ -72,7 +81,9 @@ test("agent-team journal restores committed records and incomplete reservations"
       parentEntryId: "parent-entry",
       generation: 1,
       taskName: "review",
-      forkTurns: 2
+      agentType: "explorer",
+      forkTurns: 2,
+      execution
     })
   )
 
@@ -84,6 +95,9 @@ test("agent-team journal restores committed records and incomplete reservations"
     parentEntryId: "parent-entry",
     generation: 1,
     taskName: "research",
+    agentType: "default",
+    forkTurns: "all",
+    execution,
     nextTurn: 1,
     status: "not_started"
   })
@@ -164,7 +178,9 @@ test("agent-team journal rejects invalid graph, turn, mail, and delivery transit
         parentEntryId: "parent-entry",
         generation: 1,
         taskName: "wrong",
-        forkTurns: "all"
+        agentType: "default",
+        forkTurns: "all",
+        execution
       }
     ],
     [...spawn(), { type: "agent_turn_started", operationId: "missing", inputEntryId: "input" }],
@@ -177,28 +193,34 @@ test("agent-team journal rejects invalid graph, turn, mail, and delivery transit
   for (const candidate of invalid) expect(() => replayAgentTeamJournal(entries(...candidate))).toThrow()
 })
 
-test("agent-team journal bounds durable records", () => {
-  const data: AgentTeamEntryData[] = []
-  for (let index = 0; index < maxAgentRecords; index++) {
-    const path = parseAgentPath(`/root/agent_${index}`)
-    data.push(...spawn(path, `spawn-${index}`))
+test("agent-team journal bounds durable records across recursive branches", () => {
+  const branchA = parseAgentPath("/root/branch_a")
+  const branchB = parseAgentPath("/root/branch_b")
+  const data: AgentTeamEntryData[] = [...spawn(branchA, "branch-a"), ...spawn(branchB, "branch-b")]
+  for (let index = 0; index < (maxAgentRecords - 2) / 2; index++) {
+    data.push(
+      ...spawn(parseAgentPath(`${branchA}/leaf_${index}`), `a-${index}`, branchA, "session-branch-a", 2),
+      ...spawn(parseAgentPath(`${branchB}/leaf_${index}`), `b-${index}`, branchB, "session-branch-b", 2)
+    )
   }
   expect(replayAgentTeamJournal(entries(...data)).records.size).toBe(maxAgentRecords)
 
-  const overflow = parseAgentPath("/root/overflow")
+  const overflow = parseAgentPath(`${branchB}/overflow`)
   expect(() =>
     replayAgentTeamJournal(
       entries(...data, {
         type: "agent_spawn_reserved",
         operationId: "spawn-overflow",
         path: overflow,
-        parentPath: rootAgentPath,
+        parentPath: branchB,
         sessionId: "session-overflow",
-        parentSessionId: "root-session",
+        parentSessionId: "session-branch-b",
         parentEntryId: "parent-entry",
-        generation: 1,
+        generation: 2,
         taskName: "overflow",
-        forkTurns: "all"
+        agentType: "default",
+        forkTurns: "all",
+        execution
       })
     )
   ).toThrow(`Agent tree cannot exceed ${maxAgentRecords} records`)

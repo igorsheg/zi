@@ -314,9 +314,9 @@ test("worker session requests are source-attributed and domain refusals keep the
   await host.dispose()
 })
 
-test("subagent waits are bounded by their owning extension invocation", async () => {
+test("agent waits are bounded by their owning extension invocation", async () => {
   const workers = new TestWorkerSpawner()
-  workers.behaviors.push({ type: "tools", timeoutMs: 5_000 })
+  workers.behaviors.push({ type: "tools", timeoutMs: 15_000 })
   const timeouts = { ...testTimeouts, toolMs: 1_000 }
   const host = await ExtensionHost.create(planOne, workers.spawn, timeouts)
   const observedTimeouts: number[] = []
@@ -327,14 +327,13 @@ test("subagent waits are bounded by their owning extension invocation", async ()
     sendMessage: () => {},
     getActiveTools: () => [],
     setActiveTools: () => {},
-    subagents: {
-      waitTimeoutMs: 5_000,
-      listProfiles: () => [],
-      spawn: async () => "unused",
+    agents: {
+      resolveWaitTimeout: requestedTimeoutMs => Math.max(requestedTimeoutMs ?? 20_000, 10_000),
+      spawn: async () => "/root/unused",
       send: async () => {},
-      continue: async () => "started_turn",
-      wait: async (_extensionId, _names, timeoutMs, signal) => {
-        observedTimeouts.push(timeoutMs ?? -1)
+      followup: async () => "started",
+      wait: async (_extensionId, _requestedTimeoutMs, timeoutMs, signal) => {
+        observedTimeouts.push(timeoutMs)
         await new Promise<void>((_resolve, reject) => {
           signal.addEventListener(
             "abort",
@@ -345,13 +344,9 @@ test("subagent waits are bounded by their owning extension invocation", async ()
             { once: true }
           )
         })
-        return []
+        return { message: "Wait timed out.", timedOut: true, snapshots: [] }
       },
-      interrupt: async () => ({
-        result: "already_idle",
-        snapshot: { name: "unused", lifecycle: "idle", resultReady: false }
-      }),
-      close: async () => ({ name: "unused", lifecycle: "exited", resultReady: false }),
+      interrupt: async () => "idle",
       list: () => []
     }
   })
@@ -368,8 +363,7 @@ test("subagent waits are bounded by their owning extension invocation", async ()
     generation: 1,
     requestId: 41,
     extensionId: sourceOne.id,
-    ownerRequestId: owner.requestId,
-    names: ["finder-1"]
+    ownerRequestId: owner.requestId
   })
   await Bun.sleep(0)
   expect(observedTimeouts).toHaveLength(0)
@@ -381,7 +375,6 @@ test("subagent waits are bounded by their owning extension invocation", async ()
     requestId: 42,
     extensionId: sourceOne.id,
     ownerRequestId: owner.requestId,
-    names: ["finder-1"],
     timeoutMs: 3_600_000
   })
   await Bun.sleep(0)
@@ -394,11 +387,10 @@ test("subagent waits are bounded by their owning extension invocation", async ()
     requestId: 43,
     extensionId: sourceOne.id,
     ownerRequestId: owner.requestId,
-    names: ["finder-1"],
-    timeoutMs: 2_000
+    timeoutMs: 10_000
   })
   await Bun.sleep(0)
-  expect(observedTimeouts).toEqual([2_000])
+  expect(observedTimeouts).toEqual([10_000])
   controller.abort()
   expect(invocation).rejects.toMatchObject({ name: "AbortError" })
   await Bun.sleep(0)
@@ -410,11 +402,10 @@ test("subagent waits are bounded by their owning extension invocation", async ()
     requestId: 44,
     extensionId: sourceOne.id,
     ownerRequestId: owner.requestId,
-    names: ["finder-1"],
     timeoutMs: 100
   })
   await Bun.sleep(0)
-  expect(observedTimeouts).toEqual([2_000])
+  expect(observedTimeouts).toEqual([10_000])
   expect(worker.messages).toContainEqual(expect.objectContaining({ type: "session_operation_error", requestId: 44 }))
   expect(await host.invokeTool("echo_message", { message: "again" })).toBe("AGAIN")
 
@@ -432,11 +423,10 @@ test("subagent waits are bounded by their owning extension invocation", async ()
     requestId: 45,
     extensionId: sourceOne.id,
     ownerRequestId: completingOwner.requestId,
-    names: ["finder-2"],
     timeoutMs: 100
   })
   await Bun.sleep(0)
-  expect(observedTimeouts).toEqual([2_000, 100])
+  expect(observedTimeouts).toEqual([10_000, 10_000])
   worker.send({ type: "tool_result", generation: 1, requestId: completingOwner.requestId, value: "COMPLETED" })
   expect(await completing).toBe("COMPLETED")
   await Bun.sleep(0)

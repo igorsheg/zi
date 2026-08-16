@@ -2,6 +2,7 @@ import { isPositiveInteger, isRecord } from "../guards.js"
 import type { SessionEntryBase } from "../session-manager.js"
 import { childAgentPath, parseAgentPath, rootAgentPath, type AgentPath } from "./path.js"
 import { isAgentTurnResult, type AgentTurnResult } from "./result.js"
+import { isAgentExecutionSpec, isAgentType, type AgentExecutionSpec, type AgentType } from "./spawn.js"
 
 export type ForkTurns = "all" | "none" | number
 
@@ -21,8 +22,9 @@ export type AgentTeamEntryData =
       readonly parentEntryId: string | null
       readonly generation: number
       readonly taskName: string
+      readonly agentType: AgentType
       readonly forkTurns: ForkTurns
-      readonly role?: string
+      readonly execution: AgentExecutionSpec
     }
   | { readonly type: "agent_spawn_committed"; readonly operationId: string }
   | { readonly type: "agent_spawn_aborted"; readonly operationId: string; readonly reason: string }
@@ -69,7 +71,9 @@ export interface DurableAgentRecord {
   readonly parentEntryId: string | null
   readonly generation: number
   readonly taskName: string
-  readonly role?: string
+  readonly agentType: AgentType
+  readonly forkTurns: ForkTurns
+  readonly execution: AgentExecutionSpec
   readonly nextTurn: number
   readonly status: SettledAgentStatus
 }
@@ -163,7 +167,9 @@ export function replayAgentTeamJournal(entries: readonly AgentTeamEntry[]): Agen
           parentEntryId: reservation.parentEntryId,
           generation: reservation.generation,
           taskName: reservation.taskName,
-          ...(reservation.role === undefined ? {} : { role: reservation.role }),
+          agentType: reservation.agentType,
+          forkTurns: reservation.forkTurns,
+          execution: reservation.execution,
           nextTurn: 1,
           status: "not_started"
         })
@@ -286,8 +292,9 @@ export function isAgentTeamEntryData(value: unknown): value is AgentTeamEntryDat
           "parentEntryId",
           "generation",
           "taskName",
+          "agentType",
           "forkTurns",
-          "role"
+          "execution"
         ]) &&
         isBoundedId(value.operationId) &&
         isCanonicalPath(value.path) &&
@@ -297,8 +304,9 @@ export function isAgentTeamEntryData(value: unknown): value is AgentTeamEntryDat
         (value.parentEntryId === null || isBoundedId(value.parentEntryId)) &&
         isPositiveInteger(value.generation) &&
         typeof value.taskName === "string" &&
+        isAgentType(value.agentType) &&
         isForkTurns(value.forkTurns) &&
-        (value.role === undefined || isRoleName(value.role))
+        isAgentExecutionSpec(value.execution)
       )
     case "agent_spawn_committed":
       return hasOnlyKeys(value, ["type", "operationId"]) && isBoundedId(value.operationId)
@@ -372,8 +380,9 @@ function spawnReservation(
     parentEntryId: entry.parentEntryId,
     generation: entry.generation,
     taskName: entry.taskName,
+    agentType: entry.agentType,
     forkTurns: entry.forkTurns,
-    ...(entry.role === undefined ? {} : { role: entry.role })
+    execution: entry.execution
   }
 }
 
@@ -409,10 +418,6 @@ function isCanonicalPath(value: unknown): value is AgentPath {
 
 function isForkTurns(value: unknown): value is ForkTurns {
   return value === "all" || value === "none" || (isPositiveInteger(value) && Number.isSafeInteger(value))
-}
-
-function isRoleName(value: unknown): value is string {
-  return typeof value === "string" && /^[a-z][a-z0-9_-]*$/u.test(value) && Buffer.byteLength(value) <= 64
 }
 
 function isBoundedId(value: unknown): value is string {

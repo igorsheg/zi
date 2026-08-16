@@ -1,19 +1,13 @@
-import type { AgentTool } from "@earendil-works/pi-agent-core"
+import type { AgentTool, ThinkingLevel } from "@earendil-works/pi-agent-core"
 import { Type } from "@earendil-works/pi-ai"
-import type { ExtensionSubagentProfile } from "@with-zi/extension-api"
 
 import { type AgentSnapshot, type AgentTeam } from "./agent-team.js"
 import { type ForkTurns, maxAgentMailTextBytes } from "./journal.js"
 import { maxAgentPathBytes, maxAgentTaskNameBytes, resolveAgentPath, type AgentPath } from "./path.js"
+import { agentTypeDescription, type AgentSpawnSpec, type AgentType, maxAgentModelIdentityBytes } from "./spawn.js"
 import { type AgentTeamToolDetails, maxAgentTeamToolDetailsBytes, projectAgentTeamToolAgent } from "./tool-details.js"
-import {
-  type AgentWaitActivity,
-  maxAgentWaitTimeoutMs,
-  minAgentWaitTimeoutMs,
-  resolveAgentWaitTimeout
-} from "./wait.js"
+import { agentWaitMessage, type AgentWaitActivity, maxAgentWaitTimeoutMs, resolveAgentWaitTimeout } from "./wait.js"
 
-const maxRoleDescriptionBytes = 8 * 1024
 export const maxAgentTeamToolResultBytes = 64 * 1024
 
 const taskName = Type.String({
@@ -40,10 +34,19 @@ const listParameters = Type.Object({
 
 export type WaitForAgentActivity = (timeoutMs: number, signal?: AbortSignal) => Promise<AgentWaitActivity>
 
+export interface RequestedAgentSpawnSpec {
+  readonly agentType?: AgentType
+  readonly forkTurns: ForkTurns
+  readonly model?: string
+  readonly thinking?: ThinkingLevel
+}
+
+export type ResolveAgentSpawnSpec = (request: RequestedAgentSpawnSpec) => AgentSpawnSpec
+
 export function createAgentTeamTools(
   team: AgentTeam,
   caller: AgentPath,
-  roles: readonly ExtensionSubagentProfile[],
+  resolveSpawnSpec: ResolveAgentSpawnSpec,
   waitForActivity: WaitForAgentActivity,
   defaultWaitTimeoutMs: number
 ): readonly AgentTool[] {
@@ -51,11 +54,8 @@ export function createAgentTeamTools(
     task_name: taskName,
     message,
     agent_type: Type.Optional(
-      Type.String({
-        minLength: 1,
-        maxLength: maxAgentTaskNameBytes,
-        pattern: "^[a-z][a-z0-9_-]*$",
-        description: roleDescription(roles)
+      Type.Union([Type.Literal("default"), Type.Literal("explorer"), Type.Literal("worker")], {
+        description: agentTypeDescription
       })
     ),
     fork_turns: Type.Optional(
@@ -64,6 +64,27 @@ export function createAgentTeamTools(
         pattern: "^(all|none|[1-9][0-9]*)$",
         description: "Parent turns to inherit: all, none, or a positive integer. Defaults to all."
       })
+    ),
+    model: Type.Optional(
+      Type.String({
+        minLength: 1,
+        maxLength: maxAgentModelIdentityBytes,
+        description: "Model override for the new agent. Omit to inherit the caller's model."
+      })
+    ),
+    thinking: Type.Optional(
+      Type.Union(
+        [
+          Type.Literal("off"),
+          Type.Literal("minimal"),
+          Type.Literal("low"),
+          Type.Literal("medium"),
+          Type.Literal("high"),
+          Type.Literal("xhigh"),
+          Type.Literal("max")
+        ],
+        { description: "Thinking-level override for the new agent. Omit to inherit the caller's level." }
+      )
     )
   })
 
@@ -75,23 +96,13 @@ export function createAgentTeamTools(
     parameters: spawnParameters,
     executionMode: "parallel",
     async execute(_id, input) {
-      const role = input.agent_type === undefined ? undefined : requireRole(roles, input.agent_type)
-      const snapshot = await team.spawn({
-        sender: caller,
-        taskName: input.task_name,
-        message: role ? `${role.instructions.trimEnd()}\n\nTask:\n${input.message}` : input.message,
+      const spec = resolveSpawnSpec({
+        ...(input.agent_type === undefined ? {} : { agentType: input.agent_type }),
         forkTurns: forkTurns(input.fork_turns),
-        ...(role
-          ? {
-              role: role.name,
-              roleSelection: {
-                name: role.name,
-                ...(role.model === undefined ? {} : { model: role.model }),
-                ...(role.thinking === undefined ? {} : { thinking: role.thinking })
-              }
-            }
-          : {})
+        ...(input.model === undefined ? {} : { model: input.model }),
+        ...(input.thinking === undefined ? {} : { thinking: input.thinking })
       })
+      const snapshot = await team.spawn({ sender: caller, taskName: input.task_name, message: input.message, spec })
       return textResult(
         { agent: modelSnapshot(snapshot) },
         { type: "agent_team", outcome: "success", operation: "spawn", agent: projectAgentTeamToolAgent(snapshot) }
@@ -142,7 +153,7 @@ export function createAgentTeamTools(
       const requestedTimeoutMs = input.timeout_ms
       const timeoutMs = resolveAgentWaitTimeout(requestedTimeoutMs, defaultWaitTimeoutMs)
       const activity = await waitForActivity(timeoutMs, signal)
-      const summary = waitMessage(activity, requestedTimeoutMs, timeoutMs)
+      const summary = agentWaitMessage(activity, requestedTimeoutMs, timeoutMs)
       return textResult(
         { message: summary, timed_out: activity === "timed_out" },
         { type: "agent_team", outcome: "success", operation: "wait", activity, timedOut: activity === "timed_out" }
@@ -201,18 +212,6 @@ export function createAgentTeamTools(
   return Object.freeze([spawn, send, followup, wait, list, interrupt])
 }
 
-function waitMessage(activity: AgentWaitActivity, requestedTimeoutMs: number | undefined, timeoutMs: number): string {
-  const summary =
-    activity === "mailbox"
-      ? "Wait completed."
-      : activity === "steered"
-        ? "Wait interrupted by new input."
-        : "Wait timed out."
-  return requestedTimeoutMs !== undefined && requestedTimeoutMs < timeoutMs
-    ? `${summary}\n\nRequested timeout of ${requestedTimeoutMs}ms was clamped to the minimum of ${minAgentWaitTimeoutMs}ms.`
-    : summary
-}
-
 function forkTurns(value: string | undefined): ForkTurns {
   if (value === undefined || value === "all") return "all"
   if (value === "none") return "none"
@@ -221,32 +220,12 @@ function forkTurns(value: string | undefined): ForkTurns {
   return turns
 }
 
-function requireRole(roles: readonly ExtensionSubagentProfile[], name: string): ExtensionSubagentProfile {
-  const role = roles.find(candidate => candidate.name === name)
-  if (!role) throw new Error(`Unknown agent role: ${name}`)
-  return role
-}
-
-function roleDescription(roles: readonly ExtensionSubagentProfile[]): string {
-  if (roles.length === 0) return "Optional agent role. No named roles are currently admitted."
-  const prefix = "Optional agent role. Admitted roles: "
-  const retained: string[] = []
-  for (const role of roles) {
-    const candidate = `${role.name} — ${role.description}`
-    const text = `${prefix}${retained.length === 0 ? "" : `${retained.join("; ")}; `}${candidate}`
-    if (Buffer.byteLength(text) > maxRoleDescriptionBytes) break
-    retained.push(candidate)
-  }
-  const omitted = roles.length - retained.length
-  return `${prefix}${retained.join("; ")}${omitted > 0 ? `; ${omitted} omitted` : ""}`
-}
-
 function modelSnapshot(snapshot: AgentSnapshot) {
   return {
     path: snapshot.path,
     parent_path: snapshot.parentPath,
     task_name: snapshot.taskName,
-    ...(snapshot.role === undefined ? {} : { agent_type: snapshot.role }),
+    agent_type: snapshot.agentType,
     residency: snapshot.residency,
     status: snapshot.turn,
     turn: snapshot.turnNumber,

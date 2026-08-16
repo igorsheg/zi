@@ -215,7 +215,6 @@ test("project trust detects only exact project configuration that requires admis
     { name: "extensions", type: "directory" },
     { name: "skills", type: "directory" },
     { name: "prompts", type: "directory" },
-    { name: "subagents", type: "directory" },
     { name: "themes", type: "directory" }
   ] as const
   await Promise.all(

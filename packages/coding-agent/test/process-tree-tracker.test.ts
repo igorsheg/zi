@@ -9,7 +9,7 @@ import {
 
 test("live process containment has no synchronous OS scans or per-scope intervals", async () => {
   const sources = await Promise.all(
-    ["../src/processes/process-tree.ts", "../src/extensions/host.ts", "../src/subagents/child.ts"].map(path =>
+    ["../src/processes/process-tree.ts", "../src/extensions/host.ts"].map(path =>
       Bun.file(new URL(path, import.meta.url)).text()
     )
   )
@@ -17,7 +17,6 @@ test("live process containment has no synchronous OS scans or per-scope interval
     expect(source).not.toMatch(/\b(?:spawnSync|readFileSync|readdirSync|sleepSync)\b/)
   }
   expect(sources[1]).not.toContain("setInterval(")
-  expect(sources[2]).not.toContain("setInterval(")
 })
 
 test("one POSIX process-table scan refreshes every registered scope", async () => {

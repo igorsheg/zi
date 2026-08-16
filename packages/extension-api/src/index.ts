@@ -261,65 +261,13 @@ export type ExtensionToolDefinition<
 
 export type ExtensionThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
 
-export interface ExtensionAgentRole {
-  readonly name: string
-  readonly description: string
-  readonly instructions: string
-  readonly model?: string
-  readonly thinking?: ExtensionThinkingLevel
-}
-
-export type ExtensionSubagentProfile = ExtensionAgentRole
-
-export type ExtensionSubagentLifecycle = "idle" | "queued" | "running" | "interrupting" | "closing" | "exited"
-
-export interface ExtensionSubagentCompletion {
-  readonly workCycle: number
-  readonly status: "completed" | "failed" | "cancelled"
-  readonly text: string
-  readonly originalBytes: number
-  readonly omittedBytes: number
-  readonly truncated: boolean
-  readonly durationMs: number
-  readonly reason?: string
-  readonly error?: string
-}
-
-export interface ExtensionSubagentSnapshot {
-  readonly name: string
-  readonly lifecycle: ExtensionSubagentLifecycle
-  readonly workCycle?: number
-  readonly capturedWorkCycle?: number
-  readonly task?: string
-  readonly elapsedMs?: number
-  readonly resultReady: boolean
-  readonly completion?: ExtensionSubagentCompletion
-}
-
-export interface ExtensionSubagentInterruptSettlement {
-  readonly result: "interrupted" | "already_idle"
-  readonly snapshot: ExtensionSubagentSnapshot
-}
-
-export interface ExtensionSubagentAPI {
-  listProfiles(): Promise<readonly ExtensionSubagentProfile[]>
-  spawn(profile: string, name: string, prompt: string, signal?: AbortSignal): Promise<string>
-  send(name: string, text: string): Promise<void>
-  continue(name: string, text: string): Promise<"started_turn" | "follow_up">
-  wait(
-    names: readonly string[],
-    timeoutMs?: number,
-    signal?: AbortSignal
-  ): Promise<readonly ExtensionSubagentSnapshot[]>
-  interrupt(name: string): Promise<ExtensionSubagentInterruptSettlement>
-  close(name: string): Promise<ExtensionSubagentSnapshot>
-  list(): Promise<readonly ExtensionSubagentSnapshot[]>
-}
+export type ExtensionAgentType = "default" | "explorer" | "worker"
 
 export interface ExtensionAgentSnapshot {
   readonly path: string
   readonly parentPath: string
   readonly taskName: string
+  readonly agentType: ExtensionAgentType
   readonly sessionId?: string
   readonly residency: "unloaded" | "loading" | "resident"
   readonly turn: "idle" | "starting" | "running" | "interrupting"
@@ -327,15 +275,26 @@ export interface ExtensionAgentSnapshot {
   readonly status: "not_started" | "completed" | "interrupted" | "failed"
 }
 
+export interface ExtensionAgentWaitResult {
+  readonly message: string
+  readonly timedOut: boolean
+  readonly agents: readonly ExtensionAgentSnapshot[]
+}
+
 export interface ExtensionAgentAPI {
   spawn(
     taskName: string,
     message: string,
-    options?: { readonly agentType?: string; readonly forkTurns?: "all" }
+    options?: {
+      readonly agentType?: ExtensionAgentType
+      readonly forkTurns?: "all" | "none" | number
+      readonly model?: string
+      readonly thinking?: ExtensionThinkingLevel
+    }
   ): Promise<string>
   send(target: string, message: string): Promise<void>
   followup(target: string, message: string): Promise<"started" | "joined">
-  wait(timeoutMs?: number, signal?: AbortSignal): Promise<readonly ExtensionAgentSnapshot[]>
+  wait(timeoutMs?: number, signal?: AbortSignal): Promise<ExtensionAgentWaitResult>
   list(pathPrefix?: string): Promise<readonly ExtensionAgentSnapshot[]>
   interrupt(target: string): Promise<"interrupted" | "idle">
 }
@@ -364,7 +323,6 @@ export interface ExtensionAPI {
   ): void
   getActiveTools(): Promise<readonly string[]>
   setActiveTools(names: readonly string[]): Promise<void>
-  registerAgentRole(role: ExtensionAgentRole): void
   getSessionEntries(customType: string): Promise<readonly ExtensionCustomEntry[]>
   appendEntry(customType: string, data?: JsonValue): Promise<ExtensionCustomEntry>
   sendMessage(message: ExtensionCustomMessage, delivery: ExtensionMessageDelivery): Promise<void>

@@ -29,13 +29,7 @@ import { SessionGreeterView } from "./greeter-view.js"
 import { PickerStackView } from "./picker-view.js"
 import { QueuedInputsView } from "./queue-view.js"
 import { promptInputIsSecret, type PromptInputEdit, type PromptWorkflow } from "./state.js"
-import {
-  createPromptStore,
-  type PromptSessionActions,
-  type PromptSubagentActions,
-  type PromptStore,
-  type PromptSubmissionIntent
-} from "./store.js"
+import { createPromptStore, type PromptSessionActions, type PromptStore, type PromptSubmissionIntent } from "./store.js"
 
 type ExternalEditorState =
   | { readonly type: "idle" }
@@ -77,8 +71,7 @@ export class PromptView {
     externalEditor: ExternalEditor,
     theme: Theme,
     notices: BuiltInNoticeActions,
-    sessionActions?: PromptSessionActions,
-    subagentActions?: PromptSubagentActions
+    sessionActions?: PromptSessionActions
   ) {
     this.#renderer = renderer
     this.#interactive = interactive
@@ -86,15 +79,7 @@ export class PromptView {
     this.#exitGestures = exitGestures
     this.#externalEditor = externalEditor
     this.#notices = notices
-    this.#store = createPromptStore(
-      interactive,
-      slash,
-      sessionActions,
-      clipboard,
-      notices,
-      clipboardCopy,
-      subagentActions
-    )
+    this.#store = createPromptStore(interactive, slash, sessionActions, clipboard, notices, clipboardCopy)
     this.root = new BoxRenderable(renderer, { flexDirection: "column", flexShrink: 0 })
 
     this.#authCeremony = new AuthCeremonyView(renderer, browserOpener, theme)

@@ -18,6 +18,13 @@ import { ZiPaths } from "../src/paths.js"
 import { SessionManager, type CustomMessageEntry } from "../src/session-manager.js"
 
 const research = parseAgentPath("/root/research")
+const fact = parseAgentPath("/root/research/fact")
+const execution = { model: { provider: "test", modelId: "model" }, thinkingLevel: "medium" } as const
+const spawnSpec = (forkTurns: "all" | "none" | number = "all") => ({
+  agentType: "default" as const,
+  forkTurns,
+  execution
+})
 
 const completed = (text: string): AgentTurnResult => ({
   status: "completed",
@@ -137,7 +144,7 @@ test("AgentTeam commits spawn and turn evidence before one passive completion", 
     const tools = createAgentTeamTools(
       team,
       rootAgentPath,
-      [{ name: "reviewer", description: "Review one change", instructions: "Return concrete findings." }],
+      request => ({ agentType: request.agentType ?? "default", forkTurns: request.forkTurns, execution }),
       timeoutMs => {
         observedWaitTimeoutMs = timeoutMs
         return Promise.resolve("mailbox")
@@ -175,16 +182,11 @@ test("AgentTeam commits spawn and turn evidence before one passive completion", 
     })
     const properties = Reflect.get(spawnTool.parameters, "properties")
     expect(Reflect.get(Reflect.get(properties, "task_name"), "pattern")).toBe("^[a-z][a-z0-9_-]*$")
-    const unknownRole = await rejectionOf(
-      Promise.resolve(
-        spawnTool.execute(
-          "unknown-role",
-          { task_name: "unknown_role", message: "inspect", agent_type: "missing" },
-          undefined
-        )
-      )
-    )
-    expect(String(unknownRole)).toContain("Unknown agent role: missing")
+    expect(Reflect.get(Reflect.get(properties, "agent_type"), "anyOf")).toEqual([
+      { const: "default", type: "string" },
+      { const: "explorer", type: "string" },
+      { const: "worker", type: "string" }
+    ])
 
     const spawned = await spawnTool.execute(
       "spawn",
@@ -235,6 +237,84 @@ test("AgentTeam commits spawn and turn evidence before one passive completion", 
   }
 })
 
+test("AgentTeam routes recursive completion to the direct parent", async () => {
+  const manager = SessionManager.inMemory("/work", "root-session")
+  manager.appendMessage({ role: "user", content: "parent context", timestamp: 1 })
+  const owners: ControlledSession[] = []
+  const team = await AgentTeam.create({
+    paths: new ZiPaths("/work", "/agent"),
+    rootSessionManager: manager,
+    createSession: request => {
+      const owner = new ControlledSession(request.sessionManager)
+      owners.push(owner)
+      return Promise.resolve(owner)
+    },
+    turnTimeoutMs: 10_000,
+    shutdownTimeoutMs: 1_000
+  })
+  const rootMailbox = new RootMailbox(manager)
+  await team.bindRoot(rootMailbox)
+
+  await team.spawn({ sender: rootAgentPath, taskName: "research", message: "research", spec: spawnSpec() })
+  await team.spawn({ sender: research, taskName: "fact", message: "find a fact", spec: spawnSpec("none") })
+  expect(team.snapshots()).toEqual([
+    expect.objectContaining({ path: research, parentPath: rootAgentPath, generation: 1 }),
+    expect.objectContaining({ path: fact, parentPath: research, generation: 2 })
+  ])
+
+  owners[1]!.settle(completed("nested result"))
+  await team.waitForIdle(fact)
+  expect(owners[0]!.mail).toContainEqual(
+    expect.objectContaining({ sender: fact, target: research, kind: "completion", text: "nested result" })
+  )
+  expect(rootMailbox.received).toHaveLength(0)
+
+  owners[0]!.settle(completed("parent result"))
+  await team.waitForIdle(research)
+  expect(rootMailbox.received).toContainEqual(
+    expect.objectContaining({ sender: research, target: rootAgentPath, kind: "completion" })
+  )
+  await team.shutdown()
+})
+
+test("AgentTeam retains recursive completion until an unloaded parent is restored", async () => {
+  const manager = SessionManager.inMemory("/work", "root-session")
+  const owners: ControlledSession[] = []
+  const team = await AgentTeam.create({
+    paths: new ZiPaths("/work", "/agent"),
+    rootSessionManager: manager,
+    createSession: request => {
+      const owner = new ControlledSession(request.sessionManager)
+      owners.push(owner)
+      return Promise.resolve(owner)
+    },
+    turnTimeoutMs: 10_000,
+    shutdownTimeoutMs: 1_000
+  })
+  await team.bindRoot(new RootMailbox(manager))
+  await team.spawn({ sender: rootAgentPath, taskName: "research", message: "research", spec: spawnSpec() })
+  await team.spawn({ sender: research, taskName: "fact", message: "find a fact", spec: spawnSpec("none") })
+
+  owners[0]!.settle(completed("parent settled first"))
+  await team.waitForIdle(research)
+  owners[1]!.settle(completed("late nested result"))
+  await team.waitForIdle(fact)
+  expect(
+    manager.agentTeamEntries().some(entry => entry.type === "agent_completion_delivered" && entry.path === fact)
+  ).toBe(false)
+
+  expect(await team.followupTask(rootAgentPath, research, "use the late result")).toBe("started")
+  expect(owners[2]!.mail).toContainEqual(
+    expect.objectContaining({ sender: fact, target: research, kind: "completion", text: "late nested result" })
+  )
+  expect(
+    manager.agentTeamEntries().some(entry => entry.type === "agent_completion_delivered" && entry.path === fact)
+  ).toBe(true)
+  owners[2]!.settle(completed("done"))
+  await team.waitForIdle(research)
+  await team.shutdown()
+})
+
 test("AgentTeam restores a durable child unloaded and follows up in the same journal", async () => {
   const root = await mkdtemp(join(tmpdir(), "zi-agent-team-restore-"))
   const paths = new ZiPaths(join(root, "project"), join(root, "agent"))
@@ -255,7 +335,7 @@ test("AgentTeam restores a durable child unloaded and follows up in the same jou
       shutdownTimeoutMs: 1_000
     })
     await first.bindRoot(new RootMailbox(rootManager))
-    await first.spawn({ sender: rootAgentPath, taskName: "research", message: "first", forkTurns: "all" })
+    await first.spawn({ sender: rootAgentPath, taskName: "research", message: "first", spec: spawnSpec() })
     firstOwners[0]!.settle(completed("first child answer"))
     await first.waitForIdle(research)
     const childSessionId = first.snapshots()[0]!.sessionId
@@ -322,7 +402,7 @@ test("AgentTeam queues idle mail without starting a turn and joins a running fol
       shutdownTimeoutMs: 1_000
     })
     await team.bindRoot(new RootMailbox(manager))
-    await team.spawn({ sender: rootAgentPath, taskName: "research", message: "first", forkTurns: "none" })
+    await team.spawn({ sender: rootAgentPath, taskName: "research", message: "first", spec: spawnSpec("none") })
     owners[0]!.settle(completed("done"))
     await team.waitForIdle(research)
 
@@ -350,6 +430,52 @@ test("AgentTeam queues idle mail without starting a turn and joins a running fol
   }
 })
 
+test("AgentTeam rejects a fourth active turn across recursive branches before durable spawn admission", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-agent-team-global-turns-"))
+  const paths = new ZiPaths(join(root, "project"), join(root, "agent"))
+  try {
+    const rootManager = SessionManager.inMemory(paths.cwd, "root-session")
+    rootManager.appendMessage({ role: "user", content: "parent context", timestamp: 1 })
+    const owners = new Map<string, ControlledSession>()
+    const team = await AgentTeam.create({
+      paths,
+      rootSessionManager: rootManager,
+      createSession: request => {
+        const owner = new ControlledSession(request.sessionManager)
+        owners.set(request.path, owner)
+        return Promise.resolve(owner)
+      },
+      turnTimeoutMs: 10_000,
+      shutdownTimeoutMs: 1_000
+    })
+
+    await team.spawn({ sender: rootAgentPath, taskName: "branch-a", message: "a", spec: spawnSpec() })
+    await team.spawn({ sender: rootAgentPath, taskName: "branch-b", message: "b", spec: spawnSpec() })
+    await team.spawn({
+      sender: parseAgentPath("/root/branch-a"),
+      taskName: "leaf",
+      message: "leaf a",
+      spec: spawnSpec()
+    })
+
+    expect(
+      team.spawn({ sender: parseAgentPath("/root/branch-b"), taskName: "leaf", message: "leaf b", spec: spawnSpec() })
+    ).rejects.toThrow("Agent turn capacity reached")
+    expect(team.snapshots().map(snapshot => String(snapshot.path))).toEqual([
+      "/root/branch-a",
+      "/root/branch-a/leaf",
+      "/root/branch-b"
+    ])
+    expect(rootManager.agentTeamEntries().filter(entry => entry.type === "agent_spawn_reserved")).toHaveLength(3)
+
+    for (const owner of owners.values()) owner.settle(completed("done"))
+    await Promise.all(team.snapshots().map(snapshot => team.waitForIdle(snapshot.path)))
+    await team.shutdown()
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 test("AgentTeam evicts settled children before admitting later residency", async () => {
   const root = await mkdtemp(join(tmpdir(), "zi-agent-team-eviction-"))
   const paths = new ZiPaths(join(root, "project"), join(root, "agent"))
@@ -371,7 +497,7 @@ test("AgentTeam evicts settled children before admitting later residency", async
 
     const settleChild = async (name: string): Promise<void> => {
       const path = parseAgentPath(`/root/${name}`)
-      await team.spawn({ sender: rootAgentPath, taskName: name, message: name, forkTurns: "none" })
+      await team.spawn({ sender: rootAgentPath, taskName: name, message: name, spec: spawnSpec("none") })
       owners.at(-1)!.settle(completed(name))
       await team.waitForIdle(path)
     }
@@ -404,7 +530,9 @@ test("AgentTeam recovers an unclosed turn as interrupted and delivers it after r
       parentEntryId: null,
       generation: 1,
       taskName: "research",
-      forkTurns: "none"
+      agentType: "default",
+      forkTurns: "none",
+      execution
     })
     manager.appendAgentTeam({ type: "agent_spawn_committed", operationId: "spawn" })
     manager.appendAgentTeam({
@@ -459,7 +587,7 @@ test("AgentTeam shutdown interrupts running turns and disposes only resident chi
       shutdownTimeoutMs: 1_000
     })
     await team.bindRoot(new RootMailbox(manager))
-    await team.spawn({ sender: rootAgentPath, taskName: "research", message: "long", forkTurns: "none" })
+    await team.spawn({ sender: rootAgentPath, taskName: "research", message: "long", spec: spawnSpec("none") })
 
     await team.shutdown()
     expect(owner?.disposed).toBe(true)
@@ -484,7 +612,7 @@ test("AgentTeam bounds shutdown when interruption never settles and still dispos
     shutdownTimeoutMs: 20
   })
   await team.bindRoot(new RootMailbox(manager))
-  await team.spawn({ sender: rootAgentPath, taskName: "research", message: "long", forkTurns: "none" })
+  await team.spawn({ sender: rootAgentPath, taskName: "research", message: "long", spec: spawnSpec("none") })
 
   let shutdownError: unknown
   try {
@@ -496,15 +624,6 @@ test("AgentTeam bounds shutdown when interruption never settles and still dispos
   expect(owner?.disposed).toBe(true)
   expect(team.state).toBe("closed")
 })
-
-async function rejectionOf(promise: Promise<unknown>): Promise<unknown> {
-  try {
-    await promise
-  } catch (cause) {
-    return cause
-  }
-  throw new Error("Expected promise to reject")
-}
 
 function assistant(text: string) {
   return {

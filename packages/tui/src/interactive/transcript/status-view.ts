@@ -15,7 +15,7 @@ export type TranscriptActivityStatus =
 
 export type TranscriptBackgroundStatus =
   | { readonly type: "idle" }
-  | { readonly type: "running"; readonly shellCommands: number; readonly subagents: number }
+  | { readonly type: "running"; readonly shellCommands: number; readonly agents: number }
 
 export type TranscriptWorkPlanStatus =
   | { readonly type: "absent" }
@@ -235,12 +235,10 @@ function runningBackgroundText(
   const commands = background.shellCommands
     ? `${background.shellCommands} command${background.shellCommands === 1 ? "" : "s"}`
     : ""
-  const subagents = background.subagents
-    ? `${background.subagents} subagent${background.subagents === 1 ? "" : "s"}`
-    : ""
-  const total = background.shellCommands + background.subagents
+  const agents = background.agents ? `${background.agents} agent${background.agents === 1 ? "" : "s"}` : ""
+  const total = background.shellCommands + background.agents
   const candidates = [
-    `◎ ${[commands, subagents].filter(Boolean).join(" · ")} still running`,
+    `◎ ${[commands, agents].filter(Boolean).join(" · ")} still running`,
     `◎ ${total} still running`,
     `◎ ${total}`,
     "◎"
@@ -257,7 +255,7 @@ function samePresentation(left: TranscriptStatusPresentation, right: TranscriptS
   if (left.background.type === "running" && right.background.type === "running") {
     if (
       left.background.shellCommands !== right.background.shellCommands ||
-      left.background.subagents !== right.background.subagents
+      left.background.agents !== right.background.agents
     ) {
       return false
     }

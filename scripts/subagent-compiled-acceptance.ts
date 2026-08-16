@@ -9,7 +9,7 @@ import { isRecord } from "../packages/coding-agent/src/guards.js"
 import { createProcessTreeTracker, type ProcessScope } from "../packages/coding-agent/src/processes/process-tree.js"
 import { SessionManager } from "../packages/coding-agent/src/session-manager.js"
 
-const acceptanceText = "Profile-driven subagent acceptance passed."
+const acceptanceText = "Recursive agent acceptance passed."
 const acceptanceApiKey = "compiled-subagent-private-key"
 const requestLimitBytes = 8 * 1024 * 1024
 const agentToolNames = Object.freeze([
@@ -22,8 +22,6 @@ const agentToolNames = Object.freeze([
 ])
 
 type Mode = "close" | "crash" | "dispose"
-type Declaration = "markdown" | "programmatic"
-
 interface ProcessMarker {
   readonly agentPid: number
   readonly workerPid: number
@@ -43,21 +41,13 @@ export async function runSubagentCompiledAcceptance(options: { readonly executab
     for (const mode of ["close", "crash", "dispose"] as const) {
       const agentDirectory = join(temporary, `agent-${mode}`)
       const extensions = join(agentDirectory, "extensions")
-      const declaration: Declaration = mode === "close" ? "markdown" : "programmatic"
       // Each run owns one compiled parent, provider, credential store, extension worker, and process markers.
       // oxlint-disable-next-line no-await-in-loop
       await mkdir(extensions, { recursive: true })
       // oxlint-disable-next-line no-await-in-loop
       await writeFile(join(extensions, "acceptance.ts"), acceptanceExtension())
-      if (declaration === "markdown") {
-        const profiles = join(agentDirectory, "subagents")
-        // oxlint-disable-next-line no-await-in-loop
-        await mkdir(profiles, { recursive: true })
-        // oxlint-disable-next-line no-await-in-loop
-        await writeFile(join(profiles, "acceptance.md"), acceptanceMarkdownProfile())
-      }
       // oxlint-disable-next-line no-await-in-loop
-      await runMode(options.executable, project, agentDirectory, join(temporary, `${mode}.json`), mode, declaration)
+      await runMode(options.executable, project, agentDirectory, join(temporary, `${mode}.json`), mode)
     }
   } finally {
     await rm(temporary, { recursive: true, force: true })
@@ -69,8 +59,7 @@ async function runMode(
   project: string,
   agentDirectory: string,
   markerPath: string,
-  mode: Mode,
-  declaration: Declaration
+  mode: Mode
 ): Promise<void> {
   const descendantMarkerPath = `${markerPath}.descendant`
   const provider = new SubagentProvider(mode, markerPath, descendantMarkerPath)
@@ -97,7 +86,7 @@ async function runMode(
         acceptanceApiKey,
         "--thinking",
         "off",
-        `Complete the ${mode} ${declaration} profile-driven subagent acceptance workflow.`
+        `Complete the ${mode} recursive agent acceptance workflow.`
       ],
       {
         cwd: project,
@@ -106,8 +95,7 @@ async function runMode(
           AZURE_OPENAI_API_KEY: "subagent-acceptance",
           AZURE_OPENAI_BASE_URL: provider.baseUrl,
           ZI_AGENT_DIR: agentDirectory,
-          ZI_SUBAGENT_ACCEPTANCE_MARKER: markerPath,
-          ZI_SUBAGENT_PROFILE_DECLARATION: declaration
+          ZI_SUBAGENT_ACCEPTANCE_MARKER: markerPath
         },
         stdin: "ignore",
         stdout: "pipe",
@@ -130,9 +118,9 @@ async function runMode(
     }
     provider.assertComplete()
     if (mode === "close") {
-      await runRestorationProbe(executable, project, agentDirectory, markerPath, declaration, provider, 1)
+      await runRestorationProbe(executable, project, agentDirectory, markerPath, provider, 1)
       await compactDeliveredCompletion(agentDirectory)
-      await runRestorationProbe(executable, project, agentDirectory, markerPath, declaration, provider, 0)
+      await runRestorationProbe(executable, project, agentDirectory, markerPath, provider, 0)
     }
     await assertNativeJournal(agentDirectory, provider.name, mode)
     marker = { ...(await readProcessMarker(markerPath)), descendantPid: await readPidMarker(descendantMarkerPath) }
@@ -274,10 +262,10 @@ class SubagentProvider {
       return eventStreamResponse(textEvents("Compiled second cycle completed.", "child-second-cycle"))
     }
     if (
-      !payloadText.includes("Complete the acceptance task and return bounded evidence.") ||
+      !payloadText.includes("Act as an acceptance worker. Complete the acceptance task and return bounded evidence.") ||
       !payloadText.includes("Return one sentence.")
     ) {
-      throw new Error("Compiled child did not receive profile instructions and the delegated prompt")
+      throw new Error("Compiled child did not receive runtime instructions and the delegated prompt")
     }
     if (!outputs.has("acceptance_descendant")) {
       return eventStreamResponse(
@@ -330,8 +318,11 @@ class SubagentProvider {
       return eventStreamResponse(
         toolEvents("spawn_agent", "acceptance_spawn", {
           task_name: "acceptance-worker",
-          message: "Return one sentence.",
-          agent_type: "acceptance"
+          message:
+            "Act as an acceptance worker. Complete the acceptance task and return bounded evidence. Return one sentence.",
+          agent_type: "worker",
+          model: "azure-openai-responses/gpt-5.4",
+          thinking: "high"
         })
       )
     }
@@ -379,17 +370,10 @@ const marker = process.env.ZI_SUBAGENT_ACCEPTANCE_MARKER
 if (!marker) throw new Error("missing subagent acceptance marker")
 
 const extension: ExtensionFactory = zi => {
-  if (process.env.ZI_SUBAGENT_PROFILE_DECLARATION === "programmatic") {
-    zi.registerAgentRole({
-      name: "acceptance",
-      description: "Exercise the compiled profile-driven subagent system",
-      instructions: "Complete the acceptance task and return bounded evidence.",
-      model: "azure-openai-responses/gpt-5.4",
-      thinking: "high"
-    })
-  }
   zi.on("session_start", async (_event, context) => {
-    if (context.session.type !== "journal" || !/[\\\\/]agents[\\\\/]/.test(context.session.file)) return
+    if (context.session.type !== "journal") return
+    const sessionFile = context.session.file.replaceAll("\\\\", "/")
+    if (!sessionFile.includes("/agents/")) return
     const apiKeyVisible = Object.values(process.env).includes(${JSON.stringify(acceptanceApiKey)})
     await Bun.write(marker, JSON.stringify({ agentPid: process.ppid, workerPid: process.pid, apiKeyVisible }))
   })
@@ -416,16 +400,6 @@ const extension: ExtensionFactory = zi => {
 }
 
 export default extension
-`
-}
-
-function acceptanceMarkdownProfile(): string {
-  return `---
-description: Exercise the compiled profile-driven subagent system
-model: azure-openai-responses/gpt-5.4
-thinking: high
----
-Complete the acceptance task and return bounded evidence.
 `
 }
 
@@ -460,7 +434,7 @@ function assertProviderSelection(payload: Record<string, unknown>, isParent: boo
     return
   }
   const reasoning = record(payload.reasoning, "child reasoning")
-  if (reasoning.effort !== "high") throw new Error("Compiled child did not select profile thinking high")
+  if (reasoning.effort !== "high") throw new Error("Compiled child did not select explicit thinking high")
 }
 
 function toolEvents(name: string, callId: string, args: Record<string, unknown>): readonly Record<string, unknown>[] {
@@ -536,7 +510,6 @@ async function runRestorationProbe(
   project: string,
   agentDirectory: string,
   markerPath: string,
-  declaration: Declaration,
   provider: SubagentProvider,
   expectedOccurrences: number
 ): Promise<void> {
@@ -559,7 +532,7 @@ async function runRestorationProbe(
       acceptanceApiKey,
       "--thinking",
       "off",
-      "Verify the restored subagent delivery evidence."
+      "Verify the restored agent delivery evidence."
     ],
     {
       cwd: project,
@@ -568,8 +541,7 @@ async function runRestorationProbe(
         AZURE_OPENAI_API_KEY: "subagent-acceptance",
         AZURE_OPENAI_BASE_URL: provider.baseUrl,
         ZI_AGENT_DIR: agentDirectory,
-        ZI_SUBAGENT_ACCEPTANCE_MARKER: markerPath,
-        ZI_SUBAGENT_PROFILE_DECLARATION: declaration
+        ZI_SUBAGENT_ACCEPTANCE_MARKER: markerPath
       },
       stdin: "ignore",
       stdout: "pipe",

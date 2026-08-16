@@ -46,7 +46,7 @@ import {
   promptPickerFrameIds,
   sessionFrame,
   settingLabel,
-  subagentFrame,
+  agentFrame,
   settingsFrame,
   settingsScopeFrame,
   settingValuesFrame
@@ -139,22 +139,15 @@ export interface PromptSessionActions {
   cancelReplacement(): SessionReplacementCancellation
 }
 
-export interface PromptSubagentActions {
-  openTranscript(name: string): boolean
-}
-
-const unavailableSubagentActions: PromptSubagentActions = { openTranscript: () => false }
-
 export function createPromptStore(
   interactive: InteractiveStore,
   slash: SlashController,
   sessionActions?: PromptSessionActions,
   clipboard: ClipboardReader = unavailableClipboard,
   notices: BuiltInNoticeActions = unavailableNotices,
-  messageCopy: PromptMessageCopy = unavailableMessageCopy,
-  subagentActions: PromptSubagentActions = unavailableSubagentActions
+  messageCopy: PromptMessageCopy = unavailableMessageCopy
 ): PromptStore {
-  return new PromptController(interactive, slash, sessionActions, clipboard, notices, messageCopy, subagentActions)
+  return new PromptController(interactive, slash, sessionActions, clipboard, notices, messageCopy)
 }
 
 class PromptController implements PromptStore {
@@ -167,7 +160,6 @@ class PromptController implements PromptStore {
   readonly #clipboard: ClipboardReader
   readonly #notices: BuiltInNoticeActions
   readonly #messageCopy: PromptMessageCopy
-  readonly #subagentActions: PromptSubagentActions
   readonly #fileCompletion: FileCompletionController
   #clipboardRead: ClipboardReadState = { type: "idle" }
   #modelRefresh: ModelRefreshState = { type: "idle" }
@@ -185,8 +177,7 @@ class PromptController implements PromptStore {
     sessionActions: PromptSessionActions | undefined,
     clipboard: ClipboardReader,
     notices: BuiltInNoticeActions,
-    messageCopy: PromptMessageCopy,
-    subagentActions: PromptSubagentActions
+    messageCopy: PromptMessageCopy
   ) {
     this.#interactive = interactive
     this.#slash = slash
@@ -194,7 +185,6 @@ class PromptController implements PromptStore {
     this.#clipboard = clipboard
     this.#notices = notices
     this.#messageCopy = messageCopy
-    this.#subagentActions = subagentActions
     this.#fileCompletion = new FileCompletionController(this.picker, edit => this.#requestRange(edit))
   }
 
@@ -247,8 +237,8 @@ class PromptController implements PromptStore {
   handlePickerTab(text: string, input: FileCompletionInput): boolean {
     const presentation = this.picker.presentation(text)
     if (!presentation || presentation.frame.disabled) return false
-    if (presentation.workflow?.type === "choosing_subagent") {
-      return this.#toggleSubagentScope(presentation.workflow)
+    if (presentation.workflow?.type === "choosing_agent") {
+      return this.#toggleAgentScope(presentation.workflow)
     }
     if (!presentation.selectedId) return false
     if (presentation.frame.id === promptPickerFrameIds.files) {
@@ -311,8 +301,8 @@ class PromptController implements PromptStore {
         return this.#activateLogout(workflow, presentation)
       case "choosing_session":
         return this.#activateSession(workflow, presentation)
-      case "choosing_subagent":
-        return this.#activateSubagent(workflow, presentation)
+      case "choosing_agent":
+        return false
       case "choosing_project_trust":
         return this.#activateProjectTrust(workflow, presentation)
       default:
@@ -798,32 +788,14 @@ class PromptController implements PromptStore {
     return true
   }
 
-  #toggleSubagentScope(workflow: Extract<PromptWorkflow, { type: "choosing_subagent" }>): boolean {
+  #toggleAgentScope(workflow: Extract<PromptWorkflow, { type: "choosing_agent" }>): boolean {
     if (!this.#accepts(workflow.operationId, workflow.session)) return false
-    const next: Extract<PromptWorkflow, { type: "choosing_subagent" }> = {
+    const next: Extract<PromptWorkflow, { type: "choosing_agent" }> = {
       ...workflow,
       scope: workflow.scope === "running" ? "all" : "running"
     }
-    this.picker.replaceTopRetainingQuery(subagentFrame(next.snapshots, next.scope), next)
+    this.picker.replaceTopRetainingQuery(agentFrame(next.snapshots, next.scope), next)
     this.$state.set({ ...this.$state.get(), workflow: next })
-    return true
-  }
-
-  #activateSubagent(
-    workflow: Extract<PromptWorkflow, { type: "choosing_subagent" }>,
-    presentation: PickerPresentation
-  ): boolean {
-    if (!presentation.selectedId) return false
-    if (!this.#accepts(workflow.operationId, workflow.session)) return false
-    const snapshot = workflow.snapshots.find(candidate => candidate.name === presentation.selectedId)
-    if (!snapshot) return false
-    this.picker.close()
-    this.$state.set({ ...this.$state.get(), workflow: { type: "idle" } })
-    this.#requestInput("")
-    if (!this.#subagentActions.openTranscript(snapshot.name)) {
-      this.#notices.promptWarning(`Subagent ${snapshot.name} is no longer available`)
-      return false
-    }
     return true
   }
 
@@ -913,8 +885,8 @@ class PromptController implements PromptStore {
       case "resume_session":
         this.#openSessions(parentFilter)
         return true
-      case "subagents":
-        this.#openSubagents(parentFilter)
+      case "agents":
+        this.#openAgents(parentFilter)
         return true
       default:
         return assertNever(command)
@@ -1050,13 +1022,13 @@ class PromptController implements PromptStore {
     void start()
   }
 
-  #openSubagents(parentFilter?: string): void {
+  #openAgents(parentFilter?: string): void {
     const session = this.#interactive.getSession()
     const operationId = ++this.#nextOperationId
-    const snapshots = session.subagentSnapshots()
+    const snapshots = session.agentSnapshots()
     this.#admitChoosing(
-      subagentFrame(snapshots, "running"),
-      { type: "choosing_subagent", operationId, session, snapshots, scope: "running" },
+      agentFrame(snapshots, "running"),
+      { type: "choosing_agent", operationId, session, snapshots, scope: "running" },
       parentFilter
     )
     this.#requestInput("")

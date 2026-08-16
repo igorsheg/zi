@@ -357,8 +357,7 @@ export class InteractiveMode {
       this.#syntaxStyle,
       this.#diagnosticFlags.showTimeToFirstDraw || this.#diagnosticFlags.showStats || this.#diagnosticFlags.showMemory,
       notices,
-      this.#sessionActions,
-      { openTranscript: name => this.#workspace.openSubagent(name) }
+      this.#sessionActions
     )
   }
 }

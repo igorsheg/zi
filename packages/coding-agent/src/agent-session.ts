@@ -20,13 +20,12 @@ import {
   type Model
 } from "@earendil-works/pi-ai"
 import type {
+  ExtensionAgentSnapshot,
   ExtensionContext,
   ExtensionCustomEntry,
   ExtensionMessageDelivery,
   ExtensionShutdownReason,
-  ExtensionStartReason,
-  ExtensionSubagentProfile,
-  ExtensionSubagentSnapshot
+  ExtensionStartReason
 } from "@with-zi/extension-api"
 import type { InvariantRegistry } from "@with-zi/invariants"
 
@@ -40,8 +39,9 @@ import {
   type AgentMailPublication
 } from "./agent-team/mail.js"
 import { resolveAgentPath, type AgentPath } from "./agent-team/path.js"
-import { createAgentTeamTools } from "./agent-team/tools.js"
-import { type AgentWaitActivity, resolveAgentWaitTimeout } from "./agent-team/wait.js"
+import type { AgentSpawnSpec, AgentType } from "./agent-team/spawn.js"
+import { createAgentTeamTools, type RequestedAgentSpawnSpec } from "./agent-team/tools.js"
+import { agentWaitMessage, type AgentWaitActivity, resolveAgentWaitTimeout } from "./agent-team/wait.js"
 import type {
   Authentication,
   AuthenticationInteraction,
@@ -78,12 +78,13 @@ import { validateActiveExtensionToolCatalog, type ExtensionToolRegistration } fr
 import { admitExtensionTools } from "./extensions/tools.js"
 import { isZiAgentMessage, type AgentMessage } from "./messages.js"
 import type { ModelRegistry } from "./model-registry.js"
+import { resolveRequestedModel } from "./model-resolver.js"
 import type { ZiPaths } from "./paths.js"
 import type { ProcessTreeTracker } from "./processes/process-tree.js"
 import { type ProjectFileSearch, type ProjectFileSearchResult } from "./project-file-search.js"
 import type { ProjectConfigurationAdmission } from "./project-trust.js"
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.js"
-import { maxResourceDiagnostics, type ResourceDiagnostic } from "./resource-diagnostics.js"
+import type { ResourceDiagnostic } from "./resource-diagnostics.js"
 import type { ResourceLoader, SessionResources } from "./resource-loader.js"
 import { boundedRetryError, retryAbortedMessage, retryDelayMs, waitForRetryDelay } from "./retry.js"
 import {
@@ -113,7 +114,6 @@ import type { SettingsError, SettingsManager, SettingsScope } from "./settings-m
 import type { BackgroundTaskResultInput } from "./shell-result.js"
 import { expandSkillCommand, type Skill } from "./skills.js"
 import { builtinSlashCommands, type SlashCommand } from "./slash-commands.js"
-import type { SubagentSnapshot, SubagentTranscriptSnapshot } from "./subagents/supervisor.js"
 import { buildSystemPrompt } from "./system-prompt.js"
 import type { ToolSurface } from "./tool-surface.js"
 import { isTaskOutputToolDetails } from "./tools/shell-tasks.js"
@@ -247,7 +247,6 @@ export type AgentSessionEvent =
   | { type: "shell_task_changed"; taskId: string }
   | { type: "work_plan_changed"; plan: WorkPlanSnapshot }
   | { type: "agent_changed"; path: AgentPath }
-  | { type: "subagent_changed"; name: string }
   | {
       type: "authentication_changed"
       status: "logged_in" | "logged_out"
@@ -651,51 +650,47 @@ export class AgentSession {
       setActiveTools: (extensionId, names) => this.#setExtensionActiveTools(extensionId, names),
       ...(this.#agentTeam
         ? {
-            subagents: {
-              waitTimeoutMs: this.settingsManager?.get().subagentWaitTimeoutMs ?? 30_000,
-              listProfiles: () => this.#agentRoles(),
-              spawn: (_extensionId, profile, name, prompt) => this.#spawnExtensionAgent(profile, name, prompt),
+            agents: {
+              resolveWaitTimeout: requestedTimeoutMs =>
+                resolveAgentWaitTimeout(requestedTimeoutMs, this.settingsManager.get().agentWaitTimeoutMs),
+              spawn: (_extensionId, taskName, message, options) =>
+                this.#spawnExtensionAgent(taskName, message, options),
               send: (_extensionId, target, text) =>
                 this.#agentTeam!.team.sendMessage(
                   this.#agentTeam!.path,
                   resolveAgentPath(this.#agentTeam!.path, target),
                   text
                 ),
-              continue: (_extensionId, target, text) =>
-                this.#agentTeam!.team
-                  .followupTask(this.#agentTeam!.path, resolveAgentPath(this.#agentTeam!.path, target), text)
-                  .then(result => (result === "started" ? "started_turn" : "follow_up")),
-              wait: async (_extensionId, _names, timeoutMs, signal) => {
-                await this.waitForAgentActivity(
-                  resolveAgentWaitTimeout(timeoutMs, this.settingsManager.get().subagentWaitTimeoutMs),
-                  signal
-                )
-                return this.#agentTeam!.team.snapshots().map(extensionAgentAsLegacy)
-              },
-              interrupt: async (_extensionId, target) => {
-                const path = resolveAgentPath(this.#agentTeam!.path, target)
-                const result = await this.#agentTeam!.team.interrupt(path)
-                const snapshot = this.#agentTeam!.team.snapshots(path).find(candidate => candidate.path === path)
-                if (!snapshot) throw new Error(`Unknown agent path: ${path}`)
+              followup: (_extensionId, target, text) =>
+                this.#agentTeam!.team.followupTask(
+                  this.#agentTeam!.path,
+                  resolveAgentPath(this.#agentTeam!.path, target),
+                  text
+                ),
+              wait: async (_extensionId, requestedTimeoutMs, timeoutMs, signal) => {
+                const activity = await this.waitForAgentActivity(timeoutMs, signal)
                 return {
-                  result: result === "interrupted" ? "interrupted" : "already_idle",
-                  snapshot: extensionAgentAsLegacy(snapshot)
+                  message: agentWaitMessage(activity, requestedTimeoutMs, timeoutMs),
+                  timedOut: activity === "timed_out",
+                  snapshots: this.#agentTeam!.team.snapshots().map(extensionAgentSnapshot)
                 }
               },
-              close: () => Promise.reject(new Error("AgentTeam does not close durable identities")),
-              list: () => this.#agentTeam!.team.snapshots().map(extensionAgentAsLegacy)
+              interrupt: (_extensionId, target) =>
+                this.#agentTeam!.team.interrupt(resolveAgentPath(this.#agentTeam!.path, target)),
+              list: (_extensionId, pathPrefix) =>
+                this.#agentTeam!.team
+                  .snapshots(
+                    pathPrefix === undefined
+                      ? this.#agentTeam!.path
+                      : resolveAgentPath(this.#agentTeam!.path, pathPrefix)
+                  )
+                  .map(extensionAgentSnapshot)
             }
           }
         : {})
     })
     this.#unsubscribeAgentTeam = this.#agentTeam?.team.subscribe(change => {
-      for (const path of change.paths) {
-        const snapshot = this.#agentTeam?.team.snapshots(path).find(candidate => candidate.path === path)
-        this.#emitAll([
-          { type: "agent_changed", path },
-          ...(snapshot ? [{ type: "subagent_changed" as const, name: snapshot.taskName }] : [])
-        ])
-      }
+      for (const path of change.paths) this.#emitAll([{ type: "agent_changed", path }])
     })
     this.#unsubscribeShell = this.#shell?.subscribe(taskId => {
       try {
@@ -851,19 +846,6 @@ export class AgentSession {
     return this.#agentTeam?.team.snapshots() ?? []
   }
 
-  // Temporary presentation adapter until the deferred /agent TUI replaces the flat picker.
-  subagentSnapshots(): readonly SubagentSnapshot[] {
-    return this.agentSnapshots().map(agentSnapshotAsLegacy)
-  }
-
-  subagentSnapshot(name: string): SubagentSnapshot | undefined {
-    return this.subagentSnapshots().find(snapshot => snapshot.name === name)
-  }
-
-  subagentTranscript(_name: string): SubagentTranscriptSnapshot | undefined {
-    return undefined
-  }
-
   demoteForegroundShellTask(): ShellDemotionResult {
     this.#assertOpen()
     return this.#shell?.demoteForeground() ?? { type: "none" }
@@ -934,35 +916,7 @@ export class AgentSession {
   }
 
   get resourceDiagnostics(): readonly ResourceDiagnostic[] {
-    const diagnostics = [...this.#resources.diagnostics]
-    const resources = new Map(this.#resources.subagentProfiles.map(profile => [profile.name, profile]))
-    const collisions: ResourceDiagnostic[] = []
-    for (const registered of this.#extensionHost?.subagentCatalog() ?? []) {
-      const winner = resources.get(registered.name)
-      if (!winner) continue
-      collisions.push(
-        Object.freeze({
-          type: "collision",
-          resource: "subagent-profile",
-          name: registered.name,
-          winnerPath: winner.filePath,
-          loserPath: registered.source.entryPath
-        })
-      )
-    }
-    const remaining = maxResourceDiagnostics - diagnostics.length
-    if (collisions.length <= remaining) return Object.freeze([...diagnostics, ...collisions])
-    if (remaining <= 0) return Object.freeze(diagnostics)
-    diagnostics.push(...collisions.slice(0, remaining - 1))
-    diagnostics.push(
-      Object.freeze({
-        type: "limit",
-        resource: "discovery",
-        limit: maxResourceDiagnostics,
-        message: `Resource diagnostics are limited to ${maxResourceDiagnostics} entries`
-      })
-    )
-    return Object.freeze(diagnostics)
+    return this.#resources.diagnostics
   }
 
   get extensionCommandRevision(): number {
@@ -1156,38 +1110,41 @@ export class AgentSession {
     return this.appendCustomEntry(customType, data)
   }
 
-  #agentRoles(): readonly ExtensionSubagentProfile[] {
-    const roles = new Map<string, ExtensionSubagentProfile>()
-    for (const resource of this.#resources.subagentProfiles) roles.set(resource.name, resource)
-    for (const registered of this.#extensionHost?.subagentCatalog() ?? []) {
-      if (!roles.has(registered.name)) roles.set(registered.name, registered)
+  #resolveAgentSpawnSpec(request: RequestedAgentSpawnSpec): AgentSpawnSpec {
+    const model = request.model === undefined ? this.model : resolveRequestedModel(this.#modelRegistry, request.model)
+    return {
+      agentType: request.agentType ?? "default",
+      forkTurns: request.forkTurns,
+      execution: {
+        model: { provider: model.provider, modelId: model.id },
+        thinkingLevel: clampThinkingLevel(model, request.thinking ?? this.thinkingLevel)
+      }
     }
-    return Object.freeze([...roles.values()])
   }
 
-  async #spawnExtensionAgent(agentType: string, taskName: string, message: string): Promise<string> {
+  async #spawnExtensionAgent(
+    taskName: string,
+    message: string,
+    options: {
+      readonly agentType?: AgentType
+      readonly forkTurns?: "all" | "none" | number
+      readonly model?: string
+      readonly thinking?: ThinkingLevel
+    }
+  ): Promise<string> {
     if (!this.#agentTeam) throw new Error("AgentTeam is unavailable")
-    const role =
-      agentType === "default" ? undefined : this.#agentRoles().find(candidate => candidate.name === agentType)
-    if (agentType !== "default" && !role) throw new Error(`Unknown agent role: ${agentType}`)
-    const task = role ? `${role.instructions.trimEnd()}\n\nTask:\n${message}` : message
     const snapshot = await this.#agentTeam.team.spawn({
       sender: this.#agentTeam.path,
       taskName,
-      message: task,
-      forkTurns: "all",
-      ...(role
-        ? {
-            role: role.name,
-            roleSelection: {
-              name: role.name,
-              ...(role.model === undefined ? {} : { model: role.model }),
-              ...(role.thinking === undefined ? {} : { thinking: role.thinking })
-            }
-          }
-        : {})
+      message,
+      spec: this.#resolveAgentSpawnSpec({
+        ...(options.agentType === undefined ? {} : { agentType: options.agentType }),
+        forkTurns: options.forkTurns ?? "all",
+        ...(options.model === undefined ? {} : { model: options.model }),
+        ...(options.thinking === undefined ? {} : { thinking: options.thinking })
+      })
     })
-    return snapshot.taskName
+    return snapshot.path
   }
 
   #sendExtensionCustomMessage(message: CustomMessageInput, delivery: ExtensionMessageDelivery): void {
@@ -1970,9 +1927,9 @@ export class AgentSession {
       ? createAgentTeamTools(
           this.#agentTeam.team,
           this.#agentTeam.path,
-          this.#agentRoles(),
+          request => this.#resolveAgentSpawnSpec(request),
           (timeoutMs, signal) => this.waitForAgentActivity(timeoutMs, signal),
-          this.settingsManager.get().subagentWaitTimeoutMs
+          this.settingsManager.get().agentWaitTimeoutMs
         )
       : []
     const tools = admitExtensionTools(
@@ -3738,46 +3695,17 @@ function isSessionJsonRecord(value: SessionJson | undefined): value is { readonl
   return typeof value === "object" && value !== null && !Array.isArray(value)
 }
 
-function extensionAgentAsLegacy(snapshot: AgentSnapshot): ExtensionSubagentSnapshot {
-  const lifecycle =
-    snapshot.residency === "unloaded"
-      ? "exited"
-      : snapshot.turn === "starting"
-        ? "queued"
-        : snapshot.turn === "idle"
-          ? "idle"
-          : snapshot.turn
-  const settled = snapshot.status !== "not_started"
+function extensionAgentSnapshot(snapshot: AgentSnapshot): ExtensionAgentSnapshot {
   return Object.freeze({
-    name: snapshot.taskName,
-    lifecycle,
-    workCycle: snapshot.turnNumber,
-    task: snapshot.taskName,
-    resultReady: settled,
-    ...(settled
-      ? {
-          completion: {
-            workCycle: snapshot.turnNumber,
-            status: snapshot.status === "interrupted" ? ("cancelled" as const) : snapshot.status,
-            text: "",
-            originalBytes: 0,
-            omittedBytes: 0,
-            truncated: false,
-            durationMs: 0
-          }
-        }
-      : {})
-  })
-}
-
-function agentSnapshotAsLegacy(snapshot: AgentSnapshot): SubagentSnapshot {
-  const lifecycle = snapshot.turn === "starting" ? "queued" : snapshot.turn === "idle" ? "idle" : snapshot.turn
-  return Object.freeze({
-    name: snapshot.taskName,
-    lifecycle,
-    workCycle: snapshot.turnNumber,
-    task: snapshot.taskName,
-    sessionId: snapshot.sessionId
+    path: snapshot.path,
+    parentPath: snapshot.parentPath,
+    taskName: snapshot.taskName,
+    agentType: snapshot.agentType,
+    sessionId: snapshot.sessionId,
+    residency: snapshot.residency,
+    turn: snapshot.turn,
+    turnNumber: snapshot.turnNumber,
+    status: snapshot.status
   })
 }
 

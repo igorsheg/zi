@@ -44,6 +44,27 @@ test("prompt store restores queued text, images, and a notice without a renderer
   }
 })
 
+test("agents command opens a read-only durable-agent picker", async () => {
+  const session = await createSession("agents-picker")
+  const mode = createInteractiveStore(session)
+  const prompt = createPromptStore(mode, new SlashController())
+
+  try {
+    expect(prompt.submit("/agents", "steer")).toBe(true)
+    expect(prompt.$state.get().workflow).toMatchObject({ type: "choosing_agent", scope: "running", snapshots: [] })
+    expect(prompt.picker.presentation("")?.frame).toMatchObject({
+      id: "agents",
+      title: "Agents · Running",
+      emptyText: "No agents are running",
+      footer: "Tab show all · Esc close"
+    })
+  } finally {
+    prompt.dispose()
+    mode.dispose()
+    session.dispose()
+  }
+})
+
 test("resource command selection edits the composer without dispatching TUI domain work", async () => {
   const session = await createSession("resource-command")
   const mode = createInteractiveStore(session)

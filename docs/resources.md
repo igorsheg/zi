@@ -30,7 +30,6 @@ $HOME/.zi/agent/
 ├─ extensions/
 ├─ prompts/
 ├─ skills/
-├─ subagents/
 ├─ AGENTS.md
 ├─ SYSTEM.md
 └─ APPEND_SYSTEM.md
@@ -46,7 +45,6 @@ Use this for credentials, personal defaults, sessions, and behavior you want eve
 ├─ extensions/
 ├─ prompts/
 ├─ skills/
-├─ subagents/
 ├─ SYSTEM.md
 └─ APPEND_SYSTEM.md
 ```
@@ -66,7 +64,7 @@ Project configuration includes executable extension modules and agent policy, so
 
 Trust or rejection may apply only to the current session or be saved for the canonical working directory. A saved parent decision is inherited, so trusting a repository root covers the directories beneath it. Saved decisions live in `trust.json`.
 
-Applying a choice replaces the complete working-directory-bound runtime so settings, prompts, skills, subagent profiles, and extensions share one admission decision. One answer covers all of them.
+Applying a choice replaces the complete working-directory-bound runtime so settings, prompts, skills, and extensions share one admission decision. One answer covers all of them.
 
 Text, JSON, and RPC modes never prompt and continue with unresolved project configuration excluded. See [CLI](cli.md#modes) for how each mode behaves on an untrusted project.
 
@@ -98,16 +96,13 @@ Global and project settings can add extension, skill, and prompt files or direct
 ## Resource directories
 
 `extensions/`
-: Trusted TypeScript modules that register commands, tools, lifecycle behavior, durable state, or subagent profiles. See [Extensions](extensions.md).
+: Trusted TypeScript modules that register commands, tools, lifecycle behavior, or durable state. See [Extensions](extensions.md).
 
 `prompts/`
 : Markdown prompt templates that become slash commands. See [Prompts](prompts.md).
 
 `skills/`
 : Markdown workflows the model can load when relevant. See [Skills](skills.md).
-
-`subagents/`
-: Markdown profiles for reusable delegated roles. See [Subagents](subagents.md).
 
 `SYSTEM.md`
 : Replace Zi's default system prompt.

@@ -928,13 +928,6 @@ test("extensions orchestrate the root AgentTeam through the six-operation API", 
 import { Schema } from "@with-zi/extension-api"
 export default function (zi) {
   zi.on("agent_start", (_event, context) => appendFileSync(${JSON.stringify(modes)}, context.mode + "\\n"))
-  zi.registerAgentRole({
-    name: "extension_role",
-    description: "Exercise extension role selection",
-    instructions: "Use the extension-selected role.",
-    model: "faux/faux-1",
-    thinking: "high"
-  })
   zi.registerTool({
     name: "delegate_agent",
     label: "delegate_agent",
@@ -943,11 +936,30 @@ export default function (zi) {
     outputSchema: Schema.string(),
     async execute() {
       if (!zi.agents) throw new Error("AgentTeam API unavailable")
-      const path = await zi.agents.spawn("extension_task", "Find one fact", { agentType: "extension_role" })
-      await zi.agents.wait(1_000)
-      await zi.agents.wait(1_000)
+      let invalidModelError = ""
+      try {
+        await zi.agents.spawn("invalid_task", "This must not reserve an agent.", { model: "missing/model" })
+      } catch (cause) {
+        invalidModelError = String(cause)
+      }
+      const path = await zi.agents.spawn("extension_task", "Act as a focused worker. Find one fact.", {
+        agentType: "worker",
+        model: "faux/faux-1",
+        thinking: "high"
+      })
+      const firstWait = await zi.agents.wait(1_000)
+      const secondWait = await zi.agents.wait(1_000)
       const listed = await zi.agents.list()
-      return JSON.stringify({ path, listed: listed.map(agent => ({ path: agent.path, status: agent.status, residency: agent.residency })) })
+      return JSON.stringify({
+        path,
+        invalidModelError,
+        waits: [firstWait, secondWait].map(result => ({
+          message: result.message,
+          timedOut: result.timedOut,
+          paths: result.agents.map(agent => agent.path)
+        })),
+        listed: listed.map(agent => ({ path: agent.path, status: agent.status, residency: agent.residency }))
+      })
     }
   })
 }
@@ -976,7 +988,24 @@ export default function (zi) {
       expect.objectContaining({
         role: "toolResult",
         toolName: "delegate_agent",
-        content: [expect.objectContaining({ text: expect.stringContaining('"path":"/root/extension_task"') })]
+        content: [
+          expect.objectContaining({
+            text: expect.stringContaining(
+              '"waits":[{"message":"Wait completed.\\n\\nRequested timeout of 1000ms was clamped to the minimum of 10000ms.","timedOut":false,"paths":["/root/extension_task"]}'
+            )
+          })
+        ]
+      })
+    )
+    expect(runtime.session.messages).toContainEqual(
+      expect.objectContaining({
+        role: "toolResult",
+        toolName: "delegate_agent",
+        content: [
+          expect.objectContaining({
+            text: expect.stringContaining('"invalidModelError":"Error: Unknown model: missing/model.')
+          })
+        ]
       })
     )
     expect(runtime.session.messages).toContainEqual(
@@ -987,8 +1016,15 @@ export default function (zi) {
       })
     )
     expect(runtime.session.agentSnapshots()).toEqual([
-      expect.objectContaining({ path: "/root/extension_task", role: "extension_role", status: "completed" })
+      expect.objectContaining({ path: "/root/extension_task", agentType: "worker", status: "completed" })
     ])
+    expect(runtime.session.sessionManager.agentTeamEntries()).toContainEqual(
+      expect.objectContaining({
+        type: "agent_spawn_reserved",
+        agentType: "worker",
+        execution: { model: { provider: "faux", modelId: "faux-1" }, thinkingLevel: "off" }
+      })
+    )
     expect(await readFile(modes, "utf8")).toBe("embedded\nembedded\n")
   } finally {
     runtime.session.dispose()
@@ -1008,11 +1044,6 @@ test("a failed extension generation is removed from current and future provider 
     join(extensionDir, "crash.ts"),
     `import { Schema, type ExtensionAPI } from "@with-zi/extension-api"
 export default function (zi: ExtensionAPI): void {
-  zi.registerAgentRole({
-    name: "crash-profile",
-    description: "Profile owned by a failing generation",
-    instructions: "Work."
-  })
   zi.registerTool({
     name: "crash_tool",
     description: "Crash the extension worker",

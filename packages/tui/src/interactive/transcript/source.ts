@@ -1,4 +1,4 @@
-import type { AgentMessage, AgentSession, ShellTaskSnapshot, SubagentSnapshot } from "@with-zi/coding-agent"
+import type { AgentMessage, AgentSession, AgentSnapshot, ShellTaskSnapshot } from "@with-zi/coding-agent"
 import type { ReadableAtom } from "nanostores"
 
 import type { ActiveTool } from "../interactive-store.js"
@@ -9,7 +9,7 @@ export interface TranscriptSession extends Pick<
 > {
   readonly sessionManager?: { readonly header: { readonly cwd: string } }
   readonly shellTasks?: readonly ShellTaskSnapshot[]
-  subagentSnapshots?(): readonly SubagentSnapshot[]
+  agentSnapshots?(): readonly AgentSnapshot[]
 }
 
 export interface TranscriptSource {

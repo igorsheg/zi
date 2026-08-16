@@ -23,6 +23,7 @@ test("SlashController aggregates a session catalog with deterministic built-in p
     "reload",
     "new",
     "resume",
+    "agents",
     "review",
     "skill:pdf"
   ])
@@ -57,6 +58,7 @@ test("SlashController gives extension commands precedence over resources and ret
     "reload",
     "new",
     "resume",
+    "agents",
     "counter",
     "review"
   ])
@@ -187,6 +189,7 @@ test("SlashController parses only supported built-in invocations", () => {
   expect(slash.parse("/reload")).toEqual({ type: "reload" })
   expect(slash.parse("/new")).toEqual({ type: "new_session" })
   expect(slash.parse("/resume")).toEqual({ type: "resume_session" })
+  expect(slash.parse("/agents")).toEqual({ type: "agents" })
   expect(slash.parse("/agent")).toBeUndefined()
 })
 

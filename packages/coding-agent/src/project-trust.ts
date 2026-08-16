@@ -229,7 +229,6 @@ function trustRequiringProjectConfigurationPath(paths: ZiPaths): string | undefi
     paths.projectResourceDir("extensions"),
     paths.projectResourceDir("skills"),
     paths.projectResourceDir("prompts"),
-    paths.projectResourceDir("subagents"),
     paths.projectResourceDir("themes")
   ]
   if (!paths.projectConfigIsGlobal && projectDirectoryConfiguration.some(existsSync)) return paths.projectDir

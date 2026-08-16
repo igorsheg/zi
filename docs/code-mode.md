@@ -51,7 +51,7 @@ zi --code-only -p "inspect this repository"
 zi --code-only --mode json "implement the requested change"
 ```
 
-The cell's `zi` snapshot still contains the same admitted built-in, extension, subagent, and peer tools that an ordinary invocation exposes directly. This changes the model's control surface, not Zi's authority. TUI commands remain available, and spawned Zi subagents inherit the policy. The flag applies to the invocation and is not persisted in a session journal.
+The cell's `zi` snapshot still contains the same admitted built-in, extension, and six agent-collaboration tools that an ordinary invocation exposes directly. This changes the model's control surface, not Zi's authority. TUI commands remain available, and spawned agents inherit the policy. The flag applies to the invocation and is not persisted in a session journal.
 
 ## Memory and failure semantics
 

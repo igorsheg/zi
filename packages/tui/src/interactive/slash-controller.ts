@@ -19,7 +19,7 @@ export type InteractiveCommand =
   | { readonly type: "reload" }
   | { readonly type: "new_session" }
   | { readonly type: "resume_session" }
-  | { readonly type: "subagents" }
+  | { readonly type: "agents" }
 
 export type SlashCompletion =
   | { readonly type: "unavailable" }
@@ -213,6 +213,8 @@ function builtinIntent(name: BuiltinSlashCommandName, args: string): Interactive
       return { type: "new_session" }
     case "resume":
       return { type: "resume_session" }
+    case "agents":
+      return { type: "agents" }
     default:
       return assertNever(name)
   }

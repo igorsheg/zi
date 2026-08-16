@@ -10,7 +10,7 @@ You ask an agent for a change. It edits six files, runs something, and reports s
 
 Zi is a coding agent built the other way around. It runs in your repository, shows every tool call as it happens, writes the session to disk, and puts a hard limit on everything it retains. Work in Zi stays visible, bounded, and resumable.
 
-Not unconditionally. A `--no-session` run is ephemeral by design and resumes nothing. Subagent children are never persisted; only their evidence reaches the parent journal. Where Zi cannot keep that promise, the guide for that feature says so.
+Not unconditionally. A `--no-session` run is ephemeral by design and resumes nothing. A persistent root session also persists its recursive agent tree; an ephemeral root keeps that tree in memory only. Where Zi cannot keep a durability promise, the guide for that feature says so.
 
 ## Install
 
@@ -53,7 +53,7 @@ That last step is the important one. Zi gets better when you stop retyping instr
 ## Interactive controls
 
 - `Enter` sends a prompt. During an active turn it queues steering input; `Alt+Enter` queues a follow-up.
-- `Ctrl+Enter` interrupts only the active parent turn and sends the current draft immediately. Existing queues, background commands, and subagents continue.
+- `Ctrl+Enter` interrupts only the active root turn and sends the current draft immediately. Existing queues, background commands, and descendant agents continue.
 - `Esc` cancels the active parent turn and restores queued input to the composer.
 - `Ctrl+C` clears a non-empty draft. Zi shows `Ctrl+Z` recovery guidance, and undo restores text and image markers together.
 - `/copy` copies the latest committed assistant message to the clipboard as its Markdown source, excluding thinking and tool calls. An in-progress streaming message is not included.
@@ -97,8 +97,8 @@ Start with [Know the vocabulary](vocabulary.md) if the later pages read as jargo
 
 ### Build on it
 
-- [Extensions](extensions.md) — trusted TypeScript that adds commands, tools, state, and profiles.
-- [Delegate with subagents](subagents.md) — reusable delegated roles and their orchestration tools.
+- [Extensions](extensions.md) — trusted TypeScript that adds commands, tools, state, and agent orchestration.
+- [Delegate work to agents](subagents.md) — recursive durable agents and their six operations.
 - [JSON event stream](json-events.md) — consume one finite run as JSONL.
 - [RPC protocol](rpc.md) — drive and observe a long-lived Zi process.
 - [Terminal notifications](notifications.md) — the reference client's own notification surface.
