@@ -23,6 +23,12 @@ export type ActiveTool =
   | (ActiveToolIdentity & { readonly status: "failed"; readonly result: unknown })
   | (ActiveToolIdentity & { readonly status: "aborted"; readonly result: unknown })
 
+export interface TranscriptProjectionState {
+  readonly promptRevision: number
+  readonly transcriptRevision: number
+  readonly tools: ReadonlyMap<string, ActiveTool>
+}
+
 export interface PromptSubmission {
   readonly text: string
   readonly images: readonly ImageContent[]
@@ -170,6 +176,14 @@ export function initialInteractiveState(session: AgentSession): InteractiveState
 }
 
 export function transitionInteractiveState(state: InteractiveState, event: AgentSessionEvent): InteractiveState {
+  const projection = transitionTranscriptProjection(state, event)
+  return { session: state.session, generation: state.generation, ...projection }
+}
+
+export function transitionTranscriptProjection(
+  state: TranscriptProjectionState,
+  event: AgentSessionEvent
+): TranscriptProjectionState {
   let tools = state.tools
   let promptRevision = state.promptRevision
   let transcriptRevision = state.transcriptRevision
@@ -274,7 +288,7 @@ export function transitionInteractiveState(state: InteractiveState, event: Agent
       assertNever(event)
   }
 
-  return { session: state.session, generation: state.generation, promptRevision, transcriptRevision, tools }
+  return { promptRevision, transcriptRevision, tools }
 }
 
 function updatePreparingTool(

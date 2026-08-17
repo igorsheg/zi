@@ -57,6 +57,7 @@ export class SessionWorkspace {
   #layout: WorkspaceLayoutState = createWorkspaceLayout(primaryPaneId)
   #commandState: WorkspaceCommandState = { type: "idle" }
   #compact = false
+  #presentationSuspended = false
   #disposed = false
 
   constructor(
@@ -99,7 +100,29 @@ export class SessionWorkspace {
   }
 
   preserveFocus(): void {
-    if (this.#layout.activePaneId === primaryPaneId) this.#screen.prompt.focus()
+    if (!this.#presentationSuspended && this.#layout.activePaneId === primaryPaneId) this.#screen.prompt.focus()
+  }
+
+  suspendPresentation(): void {
+    if (this.#presentationSuspended) return
+    this.#presentationSuspended = true
+    this.#commandState = { type: "idle" }
+    this.#screen.suspendPresentation()
+    for (const pane of this.#panes.values()) {
+      if (pane.type === "work_plan") pane.view.suspendPresentation()
+    }
+    this.root.visible = false
+  }
+
+  resumePresentation(): void {
+    if (!this.#presentationSuspended) return
+    this.root.visible = true
+    this.#presentationSuspended = false
+    this.#screen.resumePresentation()
+    for (const pane of this.#panes.values()) {
+      if (pane.type === "work_plan") pane.view.resumePresentation()
+    }
+    this.#syncPresentation(true)
   }
 
   destroy(): void {
@@ -255,6 +278,7 @@ export class SessionWorkspace {
   }
 
   #syncPresentation(force = false): void {
+    if (this.#presentationSuspended) return
     const minimums = new Map<WorkspacePaneId, WorkspaceMinimumSize>()
     for (const [paneId, pane] of this.#panes) minimums.set(paneId, pane.minimum)
     const minimum = workspaceMinimumSize(this.#layout.root, minimums)
@@ -286,7 +310,7 @@ export class SessionWorkspace {
   }
 
   #onKeyPress = (key: KeyEvent): void => {
-    if (this.#disposed || key.defaultPrevented || key.propagationStopped) return
+    if (this.#disposed || this.#presentationSuspended || key.defaultPrevented || key.propagationStopped) return
     const secondaryActive = this.#layout.activePaneId !== primaryPaneId
 
     if (this.#keybindings.togglesWorkPlan(key) && this.#toggleWorkPlan()) {

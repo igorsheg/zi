@@ -1,5 +1,6 @@
 import type {
   AgentSession,
+  AgentPath,
   AuthenticationEvent,
   AuthenticationMethod,
   AuthenticationPrompt,
@@ -131,6 +132,10 @@ export interface PromptMessageCopy {
   copyLastAssistant(session: Pick<AgentSession, "getLastAssistantText">): void
 }
 
+export interface PromptAgentActions {
+  inspectAgent(path: AgentPath): void
+}
+
 export interface PromptSessionActions {
   listSessions(): Promise<SessionListResult>
   startNewSession(): Promise<void>
@@ -146,9 +151,10 @@ export function createPromptStore(
   sessionActions?: PromptSessionActions,
   clipboard: ClipboardReader = unavailableClipboard,
   notices: BuiltInNoticeActions = unavailableNotices,
-  messageCopy: PromptMessageCopy = unavailableMessageCopy
+  messageCopy: PromptMessageCopy = unavailableMessageCopy,
+  agentActions?: PromptAgentActions
 ): PromptStore {
-  return new PromptController(interactive, slash, sessionActions, clipboard, notices, messageCopy)
+  return new PromptController(interactive, slash, sessionActions, clipboard, notices, messageCopy, agentActions)
 }
 
 class PromptController implements PromptStore {
@@ -161,6 +167,7 @@ class PromptController implements PromptStore {
   readonly #clipboard: ClipboardReader
   readonly #notices: BuiltInNoticeActions
   readonly #messageCopy: PromptMessageCopy
+  readonly #agentActions: PromptAgentActions | undefined
   readonly #fileCompletion: FileCompletionController
   #clipboardRead: ClipboardReadState = { type: "idle" }
   #modelRefresh: ModelRefreshState = { type: "idle" }
@@ -178,7 +185,8 @@ class PromptController implements PromptStore {
     sessionActions: PromptSessionActions | undefined,
     clipboard: ClipboardReader,
     notices: BuiltInNoticeActions,
-    messageCopy: PromptMessageCopy
+    messageCopy: PromptMessageCopy,
+    agentActions: PromptAgentActions | undefined
   ) {
     this.#interactive = interactive
     this.#slash = slash
@@ -186,6 +194,7 @@ class PromptController implements PromptStore {
     this.#clipboard = clipboard
     this.#notices = notices
     this.#messageCopy = messageCopy
+    this.#agentActions = agentActions
     this.#fileCompletion = new FileCompletionController(this.picker, edit => this.#requestRange(edit))
   }
 
@@ -303,7 +312,7 @@ class PromptController implements PromptStore {
       case "choosing_session":
         return this.#activateSession(workflow, presentation)
       case "choosing_agent":
-        return false
+        return this.#activateAgent(workflow, presentation)
       case "choosing_project_trust":
         return this.#activateProjectTrust(workflow, presentation)
       default:
@@ -786,6 +795,21 @@ class PromptController implements PromptStore {
       this.#requestInput("")
     }
     void resume()
+    return true
+  }
+
+  #activateAgent(
+    workflow: Extract<PromptWorkflow, { type: "choosing_agent" }>,
+    presentation: PickerPresentation
+  ): boolean {
+    if (!presentation.selectedId || !this.#accepts(workflow.operationId, workflow.session)) return false
+    const selected = workflow.snapshots.find(snapshot => snapshot.path === presentation.selectedId)
+    if (!selected || !this.#agentActions) return false
+    this.picker.close()
+    this.$state.set({ ...this.$state.get(), workflow: { type: "idle" } })
+    this.#notices.clearPrompt()
+    this.#requestInput("")
+    this.#agentActions.inspectAgent(selected.path)
     return true
   }
 

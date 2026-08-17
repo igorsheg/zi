@@ -57,6 +57,26 @@ test("transcript notifications coalesce at one renderer lifecycle pass and destr
   }
 })
 
+test("a suspended transcript coalesces hidden updates into one restored sync", async () => {
+  const harness = await createTranscriptHarness([], { paused: true })
+  try {
+    harness.view.suspendPresentation()
+    harness.revision.set(1)
+    harness.revision.set(2)
+    harness.revision.set(3)
+
+    const before = harness.view.diagnostics.syncPasses
+    await harness.setup.renderOnce()
+    expect(harness.view.diagnostics.syncPasses).toBe(before)
+
+    harness.view.resumePresentation()
+    await harness.setup.renderOnce()
+    expect(harness.view.diagnostics).toMatchObject({ syncPasses: before + 1, coalescedRequests: 3 })
+  } finally {
+    harness.destroy()
+  }
+})
+
 test("Zi summary messages require post-compaction accounting", () => {
   // @ts-expect-error estimatedTokensAfter is part of Zi's public summary-message contract.
   const invalid: AgentMessage = { role: "compactionSummary", summary: "checkpoint", tokensBefore: 100, timestamp: 1 }

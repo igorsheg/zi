@@ -92,7 +92,8 @@ const defaultBindingEntries = [
   ["app.transcript.tail", ["ctrl+end"], "Jump to the transcript tail", "overridable"],
   ["app.workspace.prefix", ["ctrl+w"], "Start a workspace focus command", "overridable"],
   ["app.workspace.close", ["q"], "Close the active read-only pane", "overridable"],
-  ["app.workspace.primary", ["escape"], "Return to the primary pane", "overridable"]
+  ["app.workspace.primary", ["escape"], "Return to the primary pane", "overridable"],
+  ["app.agentTranscript.return", ["escape"], "Return from an agent transcript", "reserved"]
 ] as const
 
 export type InteractiveKeybinding = (typeof defaultBindingEntries)[number][0]

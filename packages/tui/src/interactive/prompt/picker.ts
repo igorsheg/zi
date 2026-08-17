@@ -27,6 +27,8 @@ export interface PickerFrame {
   readonly hintTone?: "warning"
   readonly emptyText?: string
   readonly footer?: string
+  readonly footerFallbacks?: readonly string[]
+  readonly keyHintMode?: "default" | "footer"
 }
 
 export interface PickerStackFrameState extends PickerFrame {
@@ -220,6 +222,7 @@ function validateFrame(frame: PickerFrame): void {
   if (frame.rows.length > maxPickerRows) {
     throw new Error(`Picker frames cannot exceed ${maxPickerRows} rows`)
   }
+  if ((frame.footerFallbacks?.length ?? 0) > 2) throw new Error("Picker frames cannot exceed two footer fallbacks")
   const ids = new Set<string>()
   for (const row of frame.rows) {
     if (ids.has(row.id)) throw new Error(`Picker row IDs must be unique: ${row.id}`)
@@ -242,7 +245,9 @@ function pickerFrame(frame: PickerStackFrameState): PickerFrame {
     ...(frame.hint ? { hint: frame.hint } : {}),
     ...(frame.hintTone ? { hintTone: frame.hintTone } : {}),
     ...(frame.emptyText ? { emptyText: frame.emptyText } : {}),
-    ...(frame.footer ? { footer: frame.footer } : {})
+    ...(frame.footer ? { footer: frame.footer } : {}),
+    ...(frame.footerFallbacks ? { footerFallbacks: frame.footerFallbacks } : {}),
+    ...(frame.keyHintMode ? { keyHintMode: frame.keyHintMode } : {})
   }
 }
 

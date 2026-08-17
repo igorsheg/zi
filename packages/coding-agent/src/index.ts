@@ -76,7 +76,14 @@ export {
   type Skill
 } from "./skills.js"
 export * from "./slash-commands.js"
-export type { AgentSnapshot, AgentTeamChange } from "./agent-team/agent-team.js"
+export {
+  AgentTranscriptOpenError,
+  type AgentSnapshot,
+  type AgentTeamChange,
+  type AgentTranscriptEvent,
+  type AgentTranscriptLease,
+  type AgentTranscriptSnapshot
+} from "./agent-team/agent-team.js"
 export { parseAgentPath, rootAgentPath, type AgentPath } from "./agent-team/path.js"
 export * from "./system-prompt.js"
 export * from "./tools/index.js"

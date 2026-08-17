@@ -30,7 +30,7 @@ import type {
 import type { InvariantRegistry } from "@with-zi/invariants"
 
 import type { AgentSessionInvariant } from "./agent-session-invariant.js"
-import type { AgentSnapshot, AgentTeam } from "./agent-team/agent-team.js"
+import type { AgentSnapshot, AgentTeam, AgentTranscriptLease } from "./agent-team/agent-team.js"
 import {
   agentMailDeliveryId,
   agentMailMessage,
@@ -880,6 +880,12 @@ export class AgentSession {
 
   agentSnapshots(): readonly AgentSnapshot[] {
     return this.#agentTeam?.team.snapshots() ?? []
+  }
+
+  openAgentTranscript(path: AgentPath, signal: AbortSignal): Promise<AgentTranscriptLease> {
+    const binding = this.#agentTeam
+    if (!binding?.owned) return Promise.reject(new Error("Agent transcripts can only be opened from the root session"))
+    return binding.team.openTranscript(path, signal)
   }
 
   demoteForegroundShellTask(): ShellDemotionResult {

@@ -123,6 +123,67 @@ test("picker view keeps a preferred total height while optional chrome changes",
   }
 })
 
+test("a footer-owned picker keeps its primary actions visible without duplicate generic hints", async () => {
+  const setup = await createTestRenderer({ width: 32, height: 8, useThread: false })
+  const stack = createPickerStack()
+  const view = new PickerStackView(setup.renderer, stack, defaultTheme, new InteractiveKeybindings(), () => "")
+  setup.renderer.root.add(view.root)
+
+  try {
+    stack.open({
+      id: "agents",
+      title: "Agents · All",
+      filter: "fuzzy",
+      rows: [
+        {
+          id: "/root/recursive/journal_probe",
+          label: "working #12",
+          metadata: "/root/recursive/journal_probe",
+          metadataTruncation: "path",
+          searchText: "journal probe"
+        },
+        {
+          id: "/root/recursive/result_probe",
+          label: "working #12",
+          metadata: "/root/recursive/result_probe",
+          metadataTruncation: "path",
+          searchText: "result probe"
+        }
+      ],
+      footer: "Enter inspect · Esc close · Tab show running",
+      footerFallbacks: ["Enter inspect · Esc close", "Enter · Esc"],
+      keyHintMode: "footer"
+    })
+    view.update(8)
+    await setup.renderOnce()
+    const frame = setup.captureCharFrame()
+    expect(frame).toContain("working #12")
+    expect(frame).toContain("jour")
+    expect(frame).toContain("res")
+    expect(frame).toContain("Enter inspect · Esc close")
+    expect(frame).not.toContain("enter confirm")
+    expect(frame).not.toContain("esc close\ntype to filter")
+
+    setup.resize(24, 8)
+    view.update(8)
+    await setup.renderOnce()
+    expect(setup.captureCharFrame()).toContain("jour")
+    expect(setup.captureCharFrame()).toContain("res")
+
+    setup.resize(16, 8)
+    view.update(8)
+    await setup.renderOnce()
+    const narrowFrame = setup.captureCharFrame()
+    expect(narrowFrame).toContain("jour")
+    expect(narrowFrame).toContain("res")
+    expect(narrowFrame).toContain("Enter · Esc")
+  } finally {
+    view.destroy()
+    stack.dispose()
+    if (!setup.renderer.isDestroyed) setup.renderer.destroy()
+  }
+})
+
 test("changed fuzzy queries select the best match without disturbing navigation for the same query", () => {
   const stack = createPickerStack()
 

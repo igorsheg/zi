@@ -179,7 +179,9 @@ export function agentFrame(snapshots: readonly AgentSnapshot[], scope: AgentPick
     filter: "fuzzy",
     emptyText: scope === "running" ? "No agents are running" : "No agents have been started in this session",
     rows: visible.map(agentRow),
-    footer: scope === "running" ? "Tab show all · Esc close" : "Tab show running · Esc close"
+    footer: agentFooter(scope, visible.length > 0),
+    footerFallbacks: visible.length > 0 ? ["Enter inspect · Esc close", "Enter · Esc"] : ["Esc · Tab", "Esc"],
+    keyHintMode: "footer"
   }
 }
 
@@ -441,16 +443,28 @@ function effectiveSetting(session: AgentSession, setting: EditableSetting): Edit
 function agentRow(snapshot: AgentSnapshot): PickerStackRow {
   return {
     id: snapshot.path,
-    label: snapshot.taskName,
-    detail: `[${agentStatusLabel(snapshot)}]`,
+    label: agentStatusLabel(snapshot),
     metadata: snapshot.path,
+    metadataTruncation: "path",
     searchText: `${snapshot.path} ${snapshot.taskName} ${snapshot.agentType} ${snapshot.turn} ${snapshot.status}`
   }
 }
 
+function agentFooter(scope: AgentPickerScope, inspectable: boolean): string {
+  const toggle = scope === "running" ? "Tab show all" : "Tab show running"
+  return inspectable ? `Enter inspect · Esc close · ${toggle}` : `Esc close · ${toggle}`
+}
+
 function agentStatusLabel(snapshot: AgentSnapshot): string {
-  const suffix = snapshot.turnNumber === 0 ? "" : ` #${snapshot.turnNumber}`
-  return snapshot.turn === "idle" ? `${snapshot.status}${suffix}` : `${snapshot.turn}${suffix}`
+  const lifecycle =
+    snapshot.turn === "running"
+      ? "working"
+      : snapshot.turn === "idle"
+        ? snapshot.status === "not_started"
+          ? "idle"
+          : snapshot.status
+        : snapshot.turn
+  return snapshot.turnNumber === 0 ? lifecycle : `${lifecycle} #${snapshot.turnNumber}`
 }
 
 function relativeTime(timestamp: string, now: number): string {

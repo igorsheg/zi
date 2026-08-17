@@ -9,6 +9,7 @@ import type {
 } from "@with-zi/coding-agent"
 
 import { createSyntaxStyle, defaultTheme, type Theme } from "../theme.js"
+import { AgentTranscriptInspector } from "./agent-transcript-inspector.js"
 import { type BrowserOpener, SystemBrowserOpener } from "./browser-opener.js"
 import { BuiltInNotificationPresenter, type BuiltInNoticeActions } from "./built-in-notifications.js"
 import { ClipboardCopyController } from "./clipboard-copy.js"
@@ -87,6 +88,7 @@ export class InteractiveMode {
   #initialProjectTrust = createInitialProjectTrustState()
   #screen: SessionScreen
   #workspace: SessionWorkspace
+  #inspector: AgentTranscriptInspector
   #releaseGeneration: () => void
   #disposed = false
 
@@ -185,9 +187,20 @@ export class InteractiveMode {
     let workspace: SessionWorkspace
     try {
       workspace = new SessionWorkspace(renderer, this.store, this.#keybindings, screen, theme, this.#syntaxStyle)
+    } catch (cause) {
+      screen.destroy()
+      builtInNotifications.dispose()
+      notifications.dispose()
+      throw cause
+    }
+    let inspector: AgentTranscriptInspector
+    try {
+      inspector = this.#createInspector(workspace)
       this.root.add(workspace.root)
+      this.root.add(inspector.root)
       notifications.attach(screen.transcript.notificationHost)
     } catch (cause) {
+      workspace.destroy()
       screen.destroy()
       builtInNotifications.dispose()
       notifications.dispose()
@@ -198,6 +211,7 @@ export class InteractiveMode {
     this.#builtInNotifications = builtInNotifications
     this.#screen = screen
     this.#workspace = workspace
+    this.#inspector = inspector
     this.#diagnostics =
       diagnostics.showTimeToFirstDraw || diagnostics.showStats || diagnostics.showMemory
         ? new TuiDiagnosticsOverlay(
@@ -232,6 +246,7 @@ export class InteractiveMode {
     if (this.#sessionRuntime && this.#sessionRuntime.session !== session) {
       throw new Error("InteractiveMode can only bind the current session runtime session")
     }
+    this.#inspector.close()
     this.store.replaceSession(session)
     this.#showBootstrapWarning(diagnostic)
     this.#showExtensionWarning(session)
@@ -257,6 +272,7 @@ export class InteractiveMode {
     this.#diagnostics?.destroy()
     this.#builtInNotifications.dispose()
     this.#notifications.dispose()
+    this.#inspector.dispose()
     this.#workspace.destroy()
     this.#screen.destroy()
     this.#externalEditor.dispose()
@@ -342,6 +358,7 @@ export class InteractiveMode {
   #replaceScreen(): void {
     this.#clipboardCopy.cancel()
     this.#notifications.detach()
+    this.#inspector.dispose()
     this.#workspace.destroy()
     this.#screen.destroy()
     this.#screen = this.#createScreen(this.#builtInNotifications)
@@ -353,7 +370,9 @@ export class InteractiveMode {
       this.#theme,
       this.#syntaxStyle
     )
+    this.#inspector = this.#createInspector(this.#workspace)
     this.root.add(this.#workspace.root)
+    this.root.add(this.#inspector.root)
     this.#notifications.attach(this.#screen.transcript.notificationHost)
     this.#screen.prompt.focus()
   }
@@ -373,7 +392,19 @@ export class InteractiveMode {
       this.#syntaxStyle,
       this.#diagnosticFlags.showTimeToFirstDraw || this.#diagnosticFlags.showStats || this.#diagnosticFlags.showMemory,
       notices,
-      this.#sessionActions
+      this.#sessionActions,
+      { inspectAgent: path => this.#inspector.open(path) }
+    )
+  }
+
+  #createInspector(workspace: SessionWorkspace): AgentTranscriptInspector {
+    return new AgentTranscriptInspector(
+      this.#renderer,
+      () => this.store.getSession(),
+      workspace,
+      this.#keybindings,
+      this.#theme,
+      this.#syntaxStyle
     )
   }
 }

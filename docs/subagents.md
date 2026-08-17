@@ -43,7 +43,17 @@ There are no legacy aliases and no close operation. Residency is reclaimed autom
 
 `list_agents` returns identity and lifecycle facts rather than copied conversations. Each row includes path, parent path, task name, built-in agent type, residency, turn state, turn number, and settled status.
 
-In the terminal, `/agents` opens the same durable facts in a read-only picker. `Tab` switches between running and all agents; descendant transcripts remain unavailable.
+In the terminal, `/agents` opens the same durable facts in a read-only picker. `Tab` switches between running and all agents.
+
+## Inspect an agent transcript
+
+You need the child's evidence without turning the terminal into a multi-agent cockpit. Open `/agents`, use the arrow keys or type to filter, press `Tab` to switch between running and all agents, then press `Enter` to inspect the selected transcript at full terminal width.
+
+The inspector is read-only. A running transcript continues to update, but the inspector has no composer and cannot send, follow up, interrupt, acknowledge completion, change residency, or start a turn.
+
+Press `Esc` to return to the exact root workspace. Zi restores its draft, transcript viewport, pane layout, and composer focus while the authoritative root session keeps running underneath.
+
+An unloaded persistent agent opens from its exact child journal without constructing or making resident an `AgentSession`. If that journal is unavailable, Zi shows a focused error and does not retry automatically; press `Esc`, return to the root, and reopen `/agents` after fixing the source problem.
 
 ## Choose a built-in type
 
@@ -117,6 +127,8 @@ Settlement is recorded before completion delivery. The completion target is the 
 
 Old journals containing the removed `subagent` or `subagent_work_result` entry types are intentionally unreadable. Zi does not keep a private compatibility parser for that retired execution system.
 
+After resuming the exact persistent root session, `/agents` can inspect the same durable descendants. An ephemeral root keeps descendants and their inspectable transcripts only for the current process.
+
 ## Capacity and shutdown
 
 The tree shares root-scoped bounds: at most 64 durable records, depth 8 including `/root`, three resident descendants, and three active descendant turns. Queues, mail, waits, retained output, turn deadlines, and shutdown settlement are bounded separately.
@@ -129,4 +141,4 @@ The root session owns team shutdown; descendants borrow the team and never dispo
 - Built-in types do not create a security boundary; agents and executable tools retain the current user's authority.
 - `wait_agent` does not return final child text or acknowledge completion mail.
 - Zi does not expose model-facing close or delete operations.
-- The terminal client lists durable agents but does not yet open descendant transcripts.
+- Agent inspection does not add direct child input, follow-up controls, transcript tabs or panes, or residency pinning.

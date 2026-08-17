@@ -15,6 +15,8 @@ export class WorkPlanPane {
   readonly #onUnavailable: () => void
   #release = () => {}
   #revision = -1
+  #presentationSuspended = false
+  #presentationDirty = false
   #disposed = false
 
   constructor(renderer: CliRenderer, session: WorkPlanSource, theme: Theme, onUnavailable: () => void) {
@@ -32,7 +34,7 @@ export class WorkPlanPane {
     })
     try {
       this.#release = session.subscribe(event => {
-        if (event.type === "work_plan_changed") this.#sync()
+        if (event.type === "work_plan_changed") this.#requestSync()
       })
       this.#sync()
     } catch (cause) {
@@ -66,11 +68,31 @@ export class WorkPlanPane {
     }
   }
 
+  suspendPresentation(): void {
+    this.#presentationSuspended = true
+  }
+
+  resumePresentation(): void {
+    if (!this.#presentationSuspended) return
+    this.#presentationSuspended = false
+    if (!this.#presentationDirty) return
+    this.#presentationDirty = false
+    this.#sync()
+  }
+
   destroy(): void {
     if (this.#disposed) return
     this.#disposed = true
     this.#release()
     this.root.destroyRecursively()
+  }
+
+  #requestSync(): void {
+    if (this.#presentationSuspended) {
+      this.#presentationDirty = true
+      return
+    }
+    this.#sync()
   }
 
   #sync(): void {

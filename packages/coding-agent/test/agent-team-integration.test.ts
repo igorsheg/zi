@@ -6,6 +6,7 @@ import { join } from "node:path"
 import type { AgentSession } from "../src/agent-session.js"
 import type { AgentSnapshot } from "../src/agent-team/agent-team.js"
 import { agentCompletionCustomType } from "../src/agent-team/mail.js"
+import { parseAgentPath } from "../src/agent-team/path.js"
 import {
   createModels,
   createTestAgentRuntime,
@@ -86,6 +87,16 @@ test("production AgentTeam restores one child lazily and continues its journal a
       })
     ])
     expect(completionEntries(second.session)).toHaveLength(1)
+
+    const transcript = await second.session.openAgentTranscript(parseAgentPath(childPath), new AbortController().signal)
+    expect(transcript.snapshot()).toMatchObject({
+      agent: { path: childPath, residency: "unloaded", status: "completed" },
+      isStreaming: false
+    })
+    expect(transcript.snapshot().messages).toContainEqual(
+      expect.objectContaining({ role: "assistant", content: [{ type: "text", text: "first child answer" }] })
+    )
+    transcript.dispose()
 
     await second.session.prompt("continue the child")
     const secondSnapshot = await waitForAgentIdle(second.session, childPath)

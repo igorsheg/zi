@@ -2,6 +2,7 @@ import { BoxRenderable, fg, StyledText, TextRenderable, type RenderContext } fro
 
 import { glyphs } from "../glyphs.js"
 import type { Theme } from "../theme.js"
+import { textWidth, truncateMiddleToCells, truncateToCells } from "./cell-text.js"
 
 export const maxPickerListRows = 10
 
@@ -10,6 +11,7 @@ export interface PickerRow {
   readonly label: string
   readonly detail?: string
   readonly metadata?: string
+  readonly metadataTruncation?: "middle" | "path"
 }
 
 export interface PickerListOptions {
@@ -63,7 +65,11 @@ export function createPickerList(ctx: RenderContext, options: PickerListOptions)
     })
     const text = new TextRenderable(ctx, { height: 1, wrapMode: "none", selectable: false })
     row.add(text)
-    return { root: row, text, row: undefined, selected: false, disabled: false, theme }
+    const view: PickerRowView = { root: row, text, row: undefined, selected: false, disabled: false, theme }
+    row.onSizeChange = () => {
+      if (view.row) view.text.content = rowContent(view.row, view.selected, view.disabled, view.theme, view.root.width)
+    }
+    return view
   }
 
   const updateRow = (view: PickerRowView, row: PickerRow, selected: boolean, disabled: boolean, theme: Theme): void => {
@@ -71,6 +77,7 @@ export function createPickerList(ctx: RenderContext, options: PickerListOptions)
       view.row?.label !== row.label ||
       view.row?.detail !== row.detail ||
       view.row?.metadata !== row.metadata ||
+      view.row?.metadataTruncation !== row.metadataTruncation ||
       view.selected !== selected ||
       view.disabled !== disabled ||
       view.theme !== theme
@@ -80,7 +87,7 @@ export function createPickerList(ctx: RenderContext, options: PickerListOptions)
     view.disabled = disabled
     view.theme = theme
     view.root.backgroundColor = theme.surface.composer
-    view.text.content = rowContent(row, selected, disabled, theme)
+    view.text.content = rowContent(row, selected, disabled, theme, view.root.width)
   }
 
   const update = (next: PickerListOptions) => {
@@ -155,14 +162,52 @@ export function createPickerList(ctx: RenderContext, options: PickerListOptions)
   }
 }
 
-function rowContent(row: PickerRow, selected: boolean, disabled: boolean, theme: Theme): StyledText {
+function rowContent(row: PickerRow, selected: boolean, disabled: boolean, theme: Theme, width: number): StyledText {
   const active = selected && !disabled
+  const marker = active ? glyphs.listSelected : glyphs.listUnselected
+  const projected = projectRow(row, Math.max(0, width - textWidth(marker)))
   return new StyledText([
-    fg(active ? theme.text.accent : theme.text.muted)(active ? glyphs.listSelected : glyphs.listUnselected),
-    fg(disabled ? theme.text.muted : theme.text.primary)(row.label),
-    ...(row.detail ? [fg(theme.text.muted)(`  ${row.detail}`)] : []),
-    ...(row.metadata ? [fg(theme.text.muted)(`  ${row.metadata}`)] : [])
+    fg(active ? theme.text.accent : theme.text.muted)(marker),
+    fg(disabled ? theme.text.muted : theme.text.primary)(projected.label),
+    ...(projected.detail ? [fg(theme.text.muted)(`  ${projected.detail}`)] : []),
+    ...(projected.metadata ? [fg(theme.text.muted)(`  ${projected.metadata}`)] : [])
   ])
+}
+
+function projectRow(
+  row: PickerRow,
+  width: number
+): { readonly label: string; readonly detail: string | undefined; readonly metadata: string | undefined } {
+  const detail = row.detail
+  if (!row.metadata || row.metadataTruncation !== "path") {
+    const prefixWidth = textWidth(row.label) + (detail ? textWidth(detail) + 2 : 0)
+    const metadataWidth = Math.max(0, width - prefixWidth - 2)
+    const metadata =
+      row.metadata && row.metadataTruncation === "middle"
+        ? truncateMiddleToCells(row.metadata, metadataWidth)
+        : row.metadata
+    return { label: row.label, detail, metadata }
+  }
+
+  const minimumMetadata = Math.min(8, Math.floor(width / 2))
+  const fullLabelWidth = textWidth(row.label)
+  const fullMetadataWidth = width - fullLabelWidth - 2
+  const metadataWidth = Math.max(0, fullMetadataWidth >= minimumMetadata ? fullMetadataWidth : minimumMetadata)
+  const labelWidth = Math.max(0, width - metadataWidth - 2)
+  return {
+    label: truncateToCells(row.label, labelWidth),
+    detail: undefined,
+    metadata: truncatePathToCells(row.metadata, metadataWidth)
+  }
+}
+
+function truncatePathToCells(path: string, width: number): string {
+  if (textWidth(path) <= width) return path
+  const leaf = path.slice(path.lastIndexOf("/") + 1)
+  if (textWidth(leaf) >= width) return truncateToCells(leaf, width)
+  const prefix = path.startsWith("/root/") ? "/root/.../" : ".../"
+  if (textWidth(prefix) >= width) return truncateToCells(leaf, width)
+  return `${prefix}${truncateToCells(leaf, width - textWidth(prefix))}`
 }
 
 function pickerWindow(

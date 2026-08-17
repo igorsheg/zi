@@ -191,6 +191,8 @@ export class TranscriptView {
   #statusHeight = -1
   #statusWidth = -1
   #runningLive = false
+  #presentationSuspended = false
+  #statusDirty = false
   #destroyed = false
 
   constructor(
@@ -260,7 +262,7 @@ export class TranscriptView {
       if (!this.scroll.isDestroyed) this.scroll.processMouseEvent(event)
     }
 
-    this.#release.push(interactive.$promptRevision.subscribe(this.#syncStatus))
+    this.#release.push(interactive.$promptRevision.subscribe(this.#requestStatusSync))
     this.#release.push(interactive.$transcriptRevision.subscribe(this.#requestSync))
     this.#release.push(this.#navigation.$navigation.subscribe(this.#syncNavigation))
     renderer.on(CliRenderEvents.SELECTION, this.#onSelection)
@@ -282,6 +284,16 @@ export class TranscriptView {
 
   get retainedToolCount(): number {
     return this.#toolViews.size
+  }
+
+  suspendPresentation(): void {
+    this.#presentationSuspended = true
+  }
+
+  resumePresentation(): void {
+    if (!this.#presentationSuspended) return
+    this.#presentationSuspended = false
+    if (this.#dirty || this.#statusDirty) this.#renderer.requestRender()
   }
 
   destroy(): void {
@@ -307,12 +319,16 @@ export class TranscriptView {
       return
     }
     this.#dirty = true
-    this.#renderer.requestRender()
+    if (!this.#presentationSuspended) this.#renderer.requestRender()
   }
 
   #syncFrame = (): void => {
-    if (this.#destroyed) return
+    if (this.#destroyed || this.#presentationSuspended) return
     this.#syncStatusGeometry()
+    if (this.#statusDirty) {
+      this.#statusDirty = false
+      this.#syncStatus()
+    }
     if (this.#dirty) {
       this.#dirty = false
       this.#syncContent()
@@ -930,7 +946,7 @@ export class TranscriptView {
   #syncNavigation = (): void => {
     const navigation = this.#navigation.$navigation.get()
     this.scroll.stickyScroll = navigation.type === "following"
-    this.#syncStatus()
+    this.#requestStatusSync()
   }
 
   #syncStatusGeometry = (): void => {
@@ -940,6 +956,15 @@ export class TranscriptView {
     this.#statusHeight = height
     this.#statusWidth = width
     this.#status.setAvailable(height > transcriptStatusRows)
+    this.#requestStatusSync()
+  }
+
+  #requestStatusSync = (): void => {
+    if (this.#destroyed) return
+    if (this.#presentationSuspended) {
+      this.#statusDirty = true
+      return
+    }
     this.#syncStatus()
   }
 
@@ -1012,7 +1037,7 @@ export class TranscriptView {
   }
 
   #onSelection = (): void => {
-    this.#queueNativeRead("manual")
+    if (!this.#presentationSuspended) this.#queueNativeRead("manual")
   }
 
   handleAction(action: TranscriptKeyAction): boolean {

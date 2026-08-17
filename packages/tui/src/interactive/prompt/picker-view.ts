@@ -1,4 +1,4 @@
-import { BoxRenderable, type CliRenderer, TextRenderable } from "@opentui/core"
+import { BoxRenderable, CliRenderEvents, type CliRenderer, TextRenderable } from "@opentui/core"
 
 import { textWidth, truncateToCells } from "../../components/cell-text.js"
 import { createPickerList, maxPickerListRows, type PickerList } from "../../components/picker-list.js"
@@ -19,6 +19,8 @@ export class PickerStackView {
   readonly #list: PickerList
   readonly #footer: TextRenderable
   readonly #keys: TextRenderable
+  #footerFrame: PickerFrame | undefined
+  #footerContent = ""
 
   constructor(
     renderer: CliRenderer,
@@ -48,12 +50,15 @@ export class PickerStackView {
     this.root.add(this.#list.root)
     this.root.add(this.#footer)
     this.root.add(this.#keys)
+    renderer.on(CliRenderEvents.RESIZE, this.#syncFooter)
   }
 
   update(maxHeight: number): boolean {
     const presentation = this.#stack.presentation(this.#filter())
     if (!presentation || maxHeight <= 0) {
       this.root.visible = false
+      this.#footerFrame = undefined
+      this.#footerContent = ""
       this.#list.update({ scope: "", rows: [], height: 0, theme: this.#theme })
       return false
     }
@@ -73,12 +78,13 @@ export class PickerStackView {
 
     const footerVisible = Boolean(presentation.frame.footer) && available > 1
     this.#footer.visible = footerVisible
-    this.#footer.content = presentation.frame.footer ?? ""
+    this.#footerFrame = presentation.frame
+    this.#syncFooter()
     if (footerVisible) available--
 
     // Deliberate (titled) pickers carry the key affordance; transient
     // completion popups stay chromeless.
-    const keysVisible = titleVisible && available > 1
+    const keysVisible = titleVisible && presentation.frame.keyHintMode !== "footer" && available > 1
     this.#keys.visible = keysVisible
     this.#keys.content = keysText(
       presentation.frame,
@@ -106,9 +112,25 @@ export class PickerStackView {
   }
 
   destroy(): void {
+    this.#footerFrame = undefined
+    this.#footerContent = ""
+    this.#renderer.off(CliRenderEvents.RESIZE, this.#syncFooter)
     this.#list.destroy()
     this.root.destroyRecursively()
   }
+
+  #syncFooter = (): void => {
+    if (!this.#footerFrame) return
+    const content = footerText(this.#footerFrame, Math.max(1, this.#renderer.width - 2))
+    if (this.#footerContent === content) return
+    this.#footerContent = content
+    this.#footer.content = content
+  }
+}
+
+function footerText(frame: PickerFrame, width: number): string {
+  const variants = [frame.footer ?? "", ...(frame.footerFallbacks ?? [])]
+  return variants.find(candidate => textWidth(candidate) <= width) ?? truncateToCells(variants.at(-1) ?? "", width)
 }
 
 function keysText(frame: PickerFrame, depth: number, width: number, keybindings: InteractiveKeybindings): string {

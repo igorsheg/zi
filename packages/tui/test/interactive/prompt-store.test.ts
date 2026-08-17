@@ -1,9 +1,10 @@
-import { expect, test } from "bun:test"
+import { expect, spyOn, test } from "bun:test"
 
 import {
   createAgentSession,
   type AgentSession,
   type ProjectTrustSelection,
+  parseAgentPath,
   SessionManager
 } from "@with-zi/coding-agent"
 import {
@@ -56,9 +57,53 @@ test("agents command opens a read-only durable-agent picker", async () => {
       id: "agents",
       title: "Agents · Running",
       emptyText: "No agents are running",
-      footer: "Tab show all · Esc close"
+      footer: "Esc close · Tab show all",
+      keyHintMode: "footer"
     })
   } finally {
+    prompt.dispose()
+    mode.dispose()
+    session.dispose()
+  }
+})
+
+test("agents picker emits the selected canonical path without loading a transcript", async () => {
+  const session = await createSession("agents-inspect")
+  const path = parseAgentPath("/root/research")
+  const snapshots = spyOn(session, "agentSnapshots").mockReturnValue([
+    {
+      path,
+      parentPath: parseAgentPath("/root"),
+      sessionId: "research-session",
+      taskName: "research",
+      agentType: "explorer",
+      generation: 1,
+      residency: "resident",
+      turn: "running",
+      turnNumber: 2,
+      status: "not_started"
+    }
+  ])
+  const mode = createInteractiveStore(session)
+  const inspected: string[] = []
+  const prompt = createPromptStore(mode, new SlashController(), undefined, undefined, undefined, undefined, {
+    inspectAgent: selected => inspected.push(selected)
+  })
+
+  try {
+    expect(prompt.submit("/agents", "steer")).toBe(true)
+    expect(prompt.picker.presentation("")?.frame).toMatchObject({
+      footer: "Enter inspect · Esc close · Tab show all",
+      keyHintMode: "footer",
+      rows: [{ id: path, label: "working #2", metadata: path }]
+    })
+    expect(prompt.activatePicker("", fileCompletionInputFromText("", 0))).toBe(true)
+    expect(inspected).toEqual([path])
+    expect(prompt.$state.get().workflow).toEqual({ type: "idle" })
+    expect(prompt.picker.presentation("")).toBeUndefined()
+    expect(session.messages).toEqual([])
+  } finally {
+    snapshots.mockRestore()
     prompt.dispose()
     mode.dispose()
     session.dispose()

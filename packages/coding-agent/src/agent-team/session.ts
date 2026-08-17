@@ -20,11 +20,13 @@ export function createAgentTeamRoot(session: AgentSession): AgentTeamRoot {
 
 class ProductionAgentTeamSessionOwner implements AgentTeamSessionOwner {
   readonly sessionId: string
+  readonly transcript: AgentSession
   readonly #session: AgentSession
   #interruption: "requested" | "turn_timeout" | "shutdown" | undefined
 
   constructor(session: AgentSession) {
     this.#session = session
+    this.transcript = session
     this.sessionId = session.sessionId
   }
 

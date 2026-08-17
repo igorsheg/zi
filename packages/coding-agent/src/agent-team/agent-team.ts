@@ -1,6 +1,10 @@
+import type { AgentSessionEvent, CompactionStatus, RetryStatus } from "../agent-session.js"
+import type { AgentMessage } from "../messages.js"
 import type { ZiPaths } from "../paths.js"
 import { createSessionFork } from "../session-fork.js"
 import { SessionManager, type CustomMessageEntry } from "../session-manager.js"
+import type { ShellTaskSnapshot } from "../session-shell.js"
+import type { WorkPlanSnapshot } from "../work-plan.js"
 import { maxAgentRecords, replayAgentTeamJournal, type DurableAgentRecord, type SettledAgentStatus } from "./journal.js"
 import type { AgentMailInput, AgentMailPublication } from "./mail.js"
 import { childAgentPath, isAgentPathWithin, rootAgentPath, type AgentPath } from "./path.js"
@@ -16,8 +20,20 @@ export interface AgentTeamMailAdmission {
   readonly publication: AgentMailPublication
 }
 
+export interface AgentTeamSessionTranscript {
+  readonly streamingMessage: AgentMessage | undefined
+  readonly isStreaming: boolean
+  readonly isAborting: boolean
+  readonly retryStatus: RetryStatus
+  readonly compactionStatus: CompactionStatus
+  readonly workPlan: WorkPlanSnapshot
+  readonly shellTasks: readonly ShellTaskSnapshot[]
+  subscribe(listener: (event: AgentSessionEvent) => void): () => void
+}
+
 export interface AgentTeamSessionOwner {
   readonly sessionId: string
+  readonly transcript: AgentTeamSessionTranscript
   startTurn(
     input: AgentMailInput,
     commit: (entry: CustomMessageEntry) => void
@@ -67,6 +83,40 @@ export interface AgentSnapshot {
   readonly turn: "idle" | "starting" | "running" | "interrupting"
   readonly turnNumber: number
   readonly status: SettledAgentStatus
+}
+
+export interface AgentTranscriptSnapshot {
+  readonly agent: AgentSnapshot
+  readonly messages: readonly AgentMessage[]
+  readonly streamingMessage: AgentMessage | undefined
+  readonly isStreaming: boolean
+  readonly isAborting: boolean
+  readonly retryStatus: RetryStatus
+  readonly compactionStatus: CompactionStatus
+  readonly workPlan: WorkPlanSnapshot
+  readonly shellTasks: readonly ShellTaskSnapshot[]
+}
+
+export type AgentTranscriptEvent =
+  | { readonly type: "agent_changed"; readonly sourceGeneration: number }
+  | { readonly type: "session"; readonly sourceGeneration: number; readonly event: AgentSessionEvent }
+
+export interface AgentTranscriptLease {
+  readonly path: AgentPath
+  snapshot(): AgentTranscriptSnapshot
+  subscribe(listener: (event: AgentTranscriptEvent) => void): () => void
+  dispose(): void
+}
+
+export class AgentTranscriptOpenError extends Error {
+  constructor(
+    readonly reason: "cancelled" | "unavailable",
+    message: string,
+    options?: ErrorOptions
+  ) {
+    super(message, options)
+    this.name = "AgentTranscriptOpenError"
+  }
 }
 
 type OrdinaryAgentMail = AgentMailInput & { readonly kind: "message" | "task" }
@@ -126,6 +176,7 @@ export class AgentTeam {
   #revision = 0
   #state: "open" | "stopping" | "closed" = "open"
   #shutdown: Promise<void> | undefined
+  #transcriptLease: TeamAgentTranscriptLease | undefined
   #nextLoadOperationId = 0
 
   private constructor(options: AgentTeamOptions) {
@@ -193,6 +244,47 @@ export class AgentTeam {
       .filter(record => prefix === undefined || isAgentPathWithin(record.metadata.path, prefix))
       .toSorted((left, right) => left.metadata.path.localeCompare(right.metadata.path))
       .map(record => snapshot(record))
+  }
+
+  async openTranscript(path: AgentPath, signal: AbortSignal): Promise<AgentTranscriptLease> {
+    this.#assertOpen()
+    if (signal.aborted) throw transcriptCancelled()
+    if (this.#transcriptLease) throw new Error("An agent transcript is already open")
+    const record = this.#requireRecord(path)
+
+    await Promise.resolve()
+    if (record.state.type !== "unloaded" && record.state.type !== "resident") {
+      await waitForTranscriptRecord(record.tail, signal)
+    }
+    this.#assertOpen()
+    if (signal.aborted) throw transcriptCancelled()
+    if (this.#transcriptLease) throw new Error("An agent transcript is already open")
+
+    let manager: SessionManager
+    try {
+      manager = this.#transcriptManager(record)
+    } catch (cause) {
+      throw new AgentTranscriptOpenError("unavailable", "The durable child journal is unavailable.", { cause })
+    }
+    if (signal.aborted) throw transcriptCancelled()
+
+    let lease: TeamAgentTranscriptLease
+    lease = new TeamAgentTranscriptLease(
+      path,
+      manager,
+      () => snapshot(record),
+      () => (record.state.type === "resident" ? record.state.owner.transcript : undefined),
+      listener => this.subscribe(listener),
+      () => {
+        if (this.#transcriptLease === lease) this.#transcriptLease = undefined
+      }
+    )
+    this.#transcriptLease = lease
+    if (signal.aborted) {
+      lease.dispose()
+      throw transcriptCancelled()
+    }
+    return lease
   }
 
   async spawn(request: SpawnAgentRequest): Promise<AgentSnapshot> {
@@ -346,6 +438,7 @@ export class AgentTeam {
   shutdown(): Promise<void> {
     if (this.#state === "closed") return Promise.resolve()
     if (this.#shutdown) return this.#shutdown
+    this.#transcriptLease?.dispose()
     this.#state = "stopping"
     const shutdown = this.#performShutdown()
     this.#shutdown = shutdown
@@ -436,6 +529,7 @@ export class AgentTeam {
       const manager =
         prepared ??
         record.memorySession ??
+        (this.#transcriptLease?.path === record.metadata.path ? this.#transcriptLease.manager : undefined) ??
         SessionManager.openAgent(
           this.#paths,
           record.metadata.sessionId,
@@ -773,6 +867,16 @@ export class AgentTeam {
     return record.state.sessionManager
   }
 
+  #transcriptManager(record: AgentRecord): SessionManager {
+    if (record.state.type === "resident") return record.state.sessionManager
+    if (record.memorySession) return record.memorySession
+    return SessionManager.openAgent(
+      this.#paths,
+      record.metadata.sessionId,
+      lineage(record.metadata, this.#rootSessionManager.sessionId)
+    )
+  }
+
   #withRecord<Value>(record: AgentRecord, operation: () => Promise<Value>): Promise<Value> {
     const result = record.tail.then(operation, operation)
     record.tail = result.then(
@@ -795,6 +899,126 @@ export class AgentTeam {
 
   #assertOpen(): void {
     if (this.#state !== "open") throw new Error(`AgentTeam is ${this.#state}`)
+  }
+}
+
+class TeamAgentTranscriptLease implements AgentTranscriptLease {
+  readonly path: AgentPath
+  readonly manager: SessionManager
+
+  readonly #agentSnapshot: () => AgentSnapshot
+  readonly #liveSource: () => AgentTeamSessionTranscript | undefined
+  readonly #releaseTeam: () => void
+  readonly #onDispose: () => void
+  readonly #listeners = new Set<(event: AgentTranscriptEvent) => void>()
+  #source: AgentTeamSessionTranscript | undefined
+  #releaseSource = () => {}
+  #sourceGeneration = 0
+  #disposed = false
+
+  constructor(
+    path: AgentPath,
+    manager: SessionManager,
+    agentSnapshot: () => AgentSnapshot,
+    liveSource: () => AgentTeamSessionTranscript | undefined,
+    subscribeTeam: (listener: (change: AgentTeamChange) => void) => () => void,
+    onDispose: () => void
+  ) {
+    this.path = path
+    this.manager = manager
+    this.#agentSnapshot = agentSnapshot
+    this.#liveSource = liveSource
+    this.#onDispose = onDispose
+    this.#bindSource()
+    this.#releaseTeam = subscribeTeam(change => {
+      if (!change.paths.includes(this.path)) return
+      this.#bindSource()
+      this.#emit({ type: "agent_changed", sourceGeneration: this.#sourceGeneration })
+    })
+  }
+
+  snapshot(): AgentTranscriptSnapshot {
+    if (this.#disposed) throw new Error("Agent transcript lease is disposed")
+    const source = this.#source
+    const workPlan = source?.workPlan ?? this.manager.latestWorkPlan() ?? emptyWorkPlan
+    return Object.freeze({
+      agent: this.#agentSnapshot(),
+      messages: this.manager.presentationMessages(),
+      streamingMessage: source?.streamingMessage,
+      isStreaming: source?.isStreaming ?? false,
+      isAborting: source?.isAborting ?? false,
+      retryStatus: source?.retryStatus ?? idleRetry,
+      compactionStatus: source?.compactionStatus ?? idleCompaction,
+      workPlan,
+      shellTasks: source?.shellTasks ?? emptyShellTasks
+    })
+  }
+
+  subscribe(listener: (event: AgentTranscriptEvent) => void): () => void {
+    if (this.#disposed) throw new Error("Agent transcript lease is disposed")
+    this.#listeners.add(listener)
+    return () => this.#listeners.delete(listener)
+  }
+
+  dispose(): void {
+    if (this.#disposed) return
+    this.#disposed = true
+    this.#sourceGeneration++
+    this.#releaseSource()
+    this.#releaseSource = () => {}
+    this.#releaseTeam()
+    this.#listeners.clear()
+    this.#onDispose()
+  }
+
+  #bindSource(): void {
+    if (this.#disposed) return
+    const source = this.#liveSource()
+    if (source === this.#source) return
+    this.#sourceGeneration++
+    const generation = this.#sourceGeneration
+    this.#releaseSource()
+    this.#releaseSource = () => {}
+    this.#source = source
+    if (source) {
+      this.#releaseSource = source.subscribe(event => {
+        if (this.#disposed || generation !== this.#sourceGeneration || source !== this.#source) return
+        this.#emit({ type: "session", sourceGeneration: generation, event })
+      })
+    }
+  }
+
+  #emit(event: AgentTranscriptEvent): void {
+    for (const listener of this.#listeners) {
+      try {
+        listener(event)
+      } catch {
+        // Transcript observation cannot own agent or session transitions.
+      }
+    }
+  }
+}
+
+const idleRetry: RetryStatus = Object.freeze({ type: "idle" })
+const idleCompaction: CompactionStatus = Object.freeze({ type: "idle" })
+const emptyWorkPlan: WorkPlanSnapshot = Object.freeze({ revision: 0, steps: Object.freeze([]) })
+const emptyShellTasks: readonly ShellTaskSnapshot[] = Object.freeze([])
+
+function transcriptCancelled(): AgentTranscriptOpenError {
+  return new AgentTranscriptOpenError("cancelled", "Agent transcript load cancelled")
+}
+
+async function waitForTranscriptRecord(settled: Promise<void>, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) throw transcriptCancelled()
+  let cancel!: () => void
+  const cancelled = new Promise<never>((_resolve, reject) => {
+    cancel = () => reject(transcriptCancelled())
+    signal.addEventListener("abort", cancel, { once: true })
+  })
+  try {
+    await Promise.race([settled, cancelled])
+  } finally {
+    signal.removeEventListener("abort", cancel)
   }
 }
 

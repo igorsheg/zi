@@ -3,11 +3,14 @@ import { mkdtemp, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
+import type { AgentSessionEvent } from "../src/agent-session.js"
 import {
   AgentTeam,
+  type AgentTranscriptEvent,
   type AgentTeamChange,
   type AgentTeamRoot,
-  type AgentTeamSessionOwner
+  type AgentTeamSessionOwner,
+  type AgentTeamSessionTranscript
 } from "../src/agent-team/agent-team.js"
 import { agentMailDeliveryId, agentMailMessage, isAgentMailEntry, type AgentMailInput } from "../src/agent-team/mail.js"
 import { parseAgentPath, rootAgentPath } from "../src/agent-team/path.js"
@@ -37,6 +40,20 @@ const completed = (text: string): AgentTurnResult => ({
 
 class ControlledSession implements AgentTeamSessionOwner {
   readonly sessionId: string
+  readonly transcriptListeners = new Set<Parameters<AgentTeamSessionTranscript["subscribe"]>[0]>()
+  readonly transcript: AgentTeamSessionTranscript = {
+    streamingMessage: undefined,
+    isStreaming: false,
+    isAborting: false,
+    retryStatus: { type: "idle" },
+    compactionStatus: { type: "idle" },
+    workPlan: { revision: 0, steps: [] },
+    shellTasks: [],
+    subscribe: listener => {
+      this.transcriptListeners.add(listener)
+      return () => this.transcriptListeners.delete(listener)
+    }
+  }
   readonly turns: Array<{
     readonly input: AgentMailInput
     readonly settlement: ReturnType<typeof deferred<AgentTurnResult>>
@@ -90,6 +107,10 @@ class ControlledSession implements AgentTeamSessionOwner {
     const active = this.turns.at(-1)
     if (!active) throw new Error("No active turn")
     active.settlement.resolve(result)
+  }
+
+  emitTranscript(event: AgentSessionEvent): void {
+    for (const listener of this.transcriptListeners) listener(event)
   }
 }
 
@@ -237,6 +258,192 @@ test("AgentTeam commits spawn and turn evidence before one passive completion", 
   }
 })
 
+test("AgentTeam transcript lease reads one durable child without residency and follows its live handoff", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-agent-team-transcript-"))
+  const paths = new ZiPaths(join(root, "project"), join(root, "agent"))
+  try {
+    const manager = SessionManager.create(paths, { sessionId: "root-session" })
+    manager.appendMessage({ role: "user", content: "parent context", timestamp: 1 })
+    const owners: ControlledSession[] = []
+    const team = await AgentTeam.create({
+      paths,
+      rootSessionManager: manager,
+      createSession: request => {
+        const owner = new ControlledSession(request.sessionManager)
+        owners.push(owner)
+        return Promise.resolve(owner)
+      },
+      turnTimeoutMs: 10_000,
+      shutdownTimeoutMs: 1_000
+    })
+    await team.bindRoot(new RootMailbox(manager))
+    await team.spawn({ sender: rootAgentPath, taskName: "research", message: "first", spec: spawnSpec("none") })
+    owners[0]!.settle(completed("first answer"))
+    await team.waitForIdle(research)
+
+    const beforeOpen = team.snapshots()
+    const lease = await team.openTranscript(research, new AbortController().signal)
+    const durableMessages = lease.snapshot().messages
+    expect(team.snapshots()).toEqual(beforeOpen)
+    expect(owners).toHaveLength(1)
+    expect(lease.snapshot()).toMatchObject({
+      agent: { path: research, residency: "unloaded", status: "completed" },
+      isStreaming: false,
+      isAborting: false,
+      retryStatus: { type: "idle" },
+      compactionStatus: { type: "idle" },
+      workPlan: { revision: 0, steps: [] },
+      shellTasks: []
+    })
+    expect(durableMessages).toContainEqual(
+      expect.objectContaining({ role: "assistant", content: [{ type: "text", text: "first answer" }] })
+    )
+
+    const events: AgentTranscriptEvent[] = []
+    lease.subscribe(event => events.push(event))
+    expect(await team.followupTask(rootAgentPath, research, "second")).toBe("started")
+    expect(owners).toHaveLength(2)
+    expect(owners[1]!.manager.presentationMessages()).toBe(durableMessages)
+    expect(owners[1]!.transcriptListeners.size).toBe(1)
+    const staleSecondTurnListener = [...owners[1]!.transcriptListeners][0]!
+    owners[1]!.emitTranscript({ type: "agent_start" })
+    owners[1]!.emitTranscript({
+      type: "tool_execution_start",
+      toolCallId: "call-2",
+      toolName: "read",
+      args: { path: "second.ts" }
+    })
+    owners[1]!.emitTranscript({
+      type: "tool_execution_update",
+      toolCallId: "call-2",
+      toolName: "read",
+      args: { path: "second.ts" },
+      partialResult: { content: [{ type: "text", text: "partial" }], details: {} }
+    })
+    owners[1]!.emitTranscript({
+      type: "tool_execution_end",
+      toolCallId: "call-2",
+      toolName: "read",
+      result: { content: [{ type: "text", text: "done" }], details: {} },
+      isError: false
+    })
+    const secondGeneration = events.findLast(event => event.type === "session")?.sourceGeneration
+    expect(secondGeneration).toBeGreaterThan(0)
+    expect(
+      events.filter(event => event.type === "session").map(event => (event.type === "session" ? event.event.type : ""))
+    ).toEqual(["agent_start", "tool_execution_start", "tool_execution_update", "tool_execution_end"])
+
+    owners[1]!.settle(completed("second answer"))
+    await team.waitForIdle(research)
+    expect(lease.snapshot().messages).toBe(durableMessages)
+    expect(lease.snapshot().agent).toMatchObject({ residency: "unloaded", turnNumber: 2, status: "completed" })
+    expect(owners[1]!.transcriptListeners.size).toBe(0)
+    const eventCountAfterUnload = events.length
+    staleSecondTurnListener({ type: "agent_start" })
+    expect(events).toHaveLength(eventCountAfterUnload)
+
+    expect(await team.followupTask(rootAgentPath, research, "third")).toBe("started")
+    expect(owners).toHaveLength(3)
+    owners[2]!.emitTranscript({ type: "shell_task_changed", taskId: "task-3" })
+    const thirdTurnEvent = events.findLast(event => event.type === "session")
+    expect(thirdTurnEvent).toMatchObject({ type: "session", event: { type: "shell_task_changed", taskId: "task-3" } })
+    expect(thirdTurnEvent?.sourceGeneration).toBeGreaterThan(secondGeneration ?? 0)
+    staleSecondTurnListener({ type: "agent_start" })
+    expect(events.at(-1)).toBe(thirdTurnEvent)
+
+    const staleThirdTurnListener = [...owners[2]!.transcriptListeners][0]!
+    lease.dispose()
+    expect(owners[2]!.transcriptListeners.size).toBe(0)
+    staleThirdTurnListener({ type: "agent_start" })
+    expect(events.at(-1)).toBe(thirdTurnEvent)
+    owners[2]!.settle(completed("third answer"))
+    await team.waitForIdle(research)
+
+    const reopened = await team.openTranscript(research, new AbortController().signal)
+    reopened.dispose()
+    await team.shutdown()
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test("AgentTeam transcript lease handles recursive interrupted memory agents and cancellation", async () => {
+  const manager = SessionManager.inMemory("/work", "root-session")
+  const owners: ControlledSession[] = []
+  const team = await AgentTeam.create({
+    paths: new ZiPaths("/work", "/agent"),
+    rootSessionManager: manager,
+    createSession: request => {
+      const owner = new ControlledSession(request.sessionManager)
+      owners.push(owner)
+      return Promise.resolve(owner)
+    },
+    turnTimeoutMs: 10_000,
+    shutdownTimeoutMs: 1_000
+  })
+  await team.bindRoot(new RootMailbox(manager))
+  await team.spawn({ sender: rootAgentPath, taskName: "research", message: "parent", spec: spawnSpec("none") })
+  await team.spawn({ sender: research, taskName: "fact", message: "nested", spec: spawnSpec("none") })
+  expect(await team.interrupt(fact)).toBe("interrupted")
+  await team.waitForIdle(fact)
+
+  const cancelled = new AbortController()
+  const opening = team.openTranscript(fact, cancelled.signal)
+  cancelled.abort()
+  expect(opening).rejects.toThrow("Agent transcript load cancelled")
+  expect(team.openTranscript(parseAgentPath("/root/missing"), new AbortController().signal)).rejects.toThrow(
+    "Unknown agent path"
+  )
+
+  const lease = await team.openTranscript(fact, new AbortController().signal)
+  expect(lease.snapshot().agent).toMatchObject({
+    path: fact,
+    parentPath: research,
+    residency: "unloaded",
+    status: "interrupted"
+  })
+  lease.dispose()
+
+  owners[0]!.settle(completed("parent done"))
+  await team.waitForIdle(research)
+  await team.shutdown()
+})
+
+test("AgentTeam transcript lease reports a missing durable child journal", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-agent-team-transcript-missing-"))
+  const paths = new ZiPaths(join(root, "project"), join(root, "agent"))
+  try {
+    const manager = SessionManager.create(paths, { sessionId: "root-session" })
+    const owners: ControlledSession[] = []
+    const team = await AgentTeam.create({
+      paths,
+      rootSessionManager: manager,
+      createSession: request => {
+        const owner = new ControlledSession(request.sessionManager)
+        owners.push(owner)
+        return Promise.resolve(owner)
+      },
+      turnTimeoutMs: 10_000,
+      shutdownTimeoutMs: 1_000
+    })
+    await team.bindRoot(new RootMailbox(manager))
+    await team.spawn({ sender: rootAgentPath, taskName: "research", message: "first", spec: spawnSpec("none") })
+    owners[0]!.settle(completed("done"))
+    await team.waitForIdle(research)
+    await rm(owners[0]!.manager.file!)
+
+    expect(team.openTranscript(research, new AbortController().signal)).rejects.toMatchObject({
+      name: "AgentTranscriptOpenError",
+      reason: "unavailable",
+      message: "The durable child journal is unavailable."
+    })
+    expect(team.snapshots()[0]).toMatchObject({ residency: "unloaded", status: "completed" })
+    await team.shutdown()
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 test("AgentTeam routes recursive completion to the direct parent", async () => {
   const manager = SessionManager.inMemory("/work", "root-session")
   manager.appendMessage({ role: "user", content: "parent context", timestamp: 1 })
@@ -361,6 +568,13 @@ test("AgentTeam restores a durable child unloaded and follows up in the same jou
       expect.objectContaining({ path: research, sessionId: childSessionId, residency: "unloaded", status: "completed" })
     ])
     expect(restoredOwners).toHaveLength(0)
+
+    const restoredTranscript = await second.openTranscript(research, new AbortController().signal)
+    expect(restoredTranscript.snapshot().messages).toContainEqual(
+      expect.objectContaining({ role: "assistant", content: [{ type: "text", text: "first child answer" }] })
+    )
+    expect(restoredOwners).toHaveLength(0)
+    restoredTranscript.dispose()
 
     expect(await second.followupTask(rootAgentPath, research, "second")).toBe("started")
     expect(restoredOwners).toHaveLength(1)

@@ -29,7 +29,13 @@ import { SessionGreeterView } from "./greeter-view.js"
 import { PickerStackView } from "./picker-view.js"
 import { QueuedInputsView } from "./queue-view.js"
 import { promptInputIsSecret, type PromptInputEdit, type PromptWorkflow } from "./state.js"
-import { createPromptStore, type PromptSessionActions, type PromptStore, type PromptSubmissionIntent } from "./store.js"
+import {
+  createPromptStore,
+  type PromptAgentActions,
+  type PromptSessionActions,
+  type PromptStore,
+  type PromptSubmissionIntent
+} from "./store.js"
 
 type ExternalEditorState =
   | { readonly type: "idle" }
@@ -58,6 +64,8 @@ export class PromptView {
   #externalEditorState: ExternalEditorState = { type: "idle" }
   #nextExternalEditorOperationId = 0
   #inputActive = true
+  #presentationSuspended = false
+  #presentationDirty = false
 
   constructor(
     renderer: CliRenderer,
@@ -71,7 +79,8 @@ export class PromptView {
     externalEditor: ExternalEditor,
     theme: Theme,
     notices: BuiltInNoticeActions,
-    sessionActions?: PromptSessionActions
+    sessionActions?: PromptSessionActions,
+    agentActions?: PromptAgentActions
   ) {
     this.#renderer = renderer
     this.#interactive = interactive
@@ -79,7 +88,7 @@ export class PromptView {
     this.#exitGestures = exitGestures
     this.#externalEditor = externalEditor
     this.#notices = notices
-    this.#store = createPromptStore(interactive, slash, sessionActions, clipboard, notices, clipboardCopy)
+    this.#store = createPromptStore(interactive, slash, sessionActions, clipboard, notices, clipboardCopy, agentActions)
     this.root = new BoxRenderable(renderer, { flexDirection: "column", flexShrink: 0 })
 
     this.#authCeremony = new AuthCeremonyView(renderer, browserOpener, theme)
@@ -117,14 +126,13 @@ export class PromptView {
     this.root.add(this.#composer.root)
     this.root.add(this.#pickerStack.root)
 
-    const update = () => this.#update()
     this.#release.push(
-      this.#store.$state.subscribe(update),
-      this.#store.picker.$state.subscribe(update),
-      interactive.$promptRevision.subscribe(update)
+      this.#store.$state.subscribe(this.#requestUpdate),
+      this.#store.picker.$state.subscribe(this.#requestUpdate),
+      interactive.$promptRevision.subscribe(this.#requestUpdate)
     )
-    renderer.on(CliRenderEvents.RESIZE, update)
-    this.#release.push(() => renderer.off(CliRenderEvents.RESIZE, update))
+    renderer.on(CliRenderEvents.RESIZE, this.#requestUpdate)
+    this.#release.push(() => renderer.off(CliRenderEvents.RESIZE, this.#requestUpdate))
     this.#input.focus()
   }
 
@@ -143,6 +151,19 @@ export class PromptView {
     this.#store.requestProjectTrust(cwd)
   }
 
+  suspendPresentation(): void {
+    this.#presentationSuspended = true
+    this.setInputActive(false)
+  }
+
+  resumePresentation(): void {
+    if (!this.#presentationSuspended) return
+    this.#presentationSuspended = false
+    if (!this.#presentationDirty) return
+    this.#presentationDirty = false
+    this.#update()
+  }
+
   destroy(): void {
     this.#externalEditorState = { type: "disposed" }
     for (const release of this.#release.splice(0)) release()
@@ -152,6 +173,14 @@ export class PromptView {
     this.#store.dispose()
     this.#pickerStack.destroy()
     this.root.destroyRecursively()
+  }
+
+  #requestUpdate = (): void => {
+    if (this.#presentationSuspended) {
+      this.#presentationDirty = true
+      return
+    }
+    this.#update()
   }
 
   #update = (): void => {
