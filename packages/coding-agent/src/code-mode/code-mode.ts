@@ -7,7 +7,7 @@ import { FramedJsonDecoder, FramedJsonWriter } from "../processes/framed-json.js
 import { spawnOwnedProcess, type OwnedProcessExit, type ProtocolOwnedProcess } from "../processes/owned-process.js"
 import { createProcessTreeTracker, type ProcessTreeTracker } from "../processes/process-tree.js"
 import type { SessionManager } from "../session-manager.js"
-import { isBuiltInToolError } from "../tools/outcome.js"
+import { builtInToolFailureReason } from "../tools/outcome.js"
 import {
   codeModeFramingLabel,
   codeModeFramingLimits,
@@ -99,7 +99,8 @@ type ExecutionState = { readonly type: "running" } | { readonly type: "final" } 
 class NestedToolFailure extends Error {
   constructor(
     readonly stage: CodeModeFailureStage,
-    cause: unknown
+    cause: unknown,
+    readonly durableReason?: string
   ) {
     super(errorMessage(cause), { cause })
   }
@@ -609,7 +610,10 @@ class CodeExecution {
           ? await contract.execute(nestedId, validated, this.#controller.signal, onUpdate)
           : { result: await tool.execute(nestedId, validated, this.#controller.signal, onUpdate), value: undefined }
         const text = toolResultText(invocation.result)
-        if (isBuiltInToolError(message.name, invocation.result.details)) throw new Error(text)
+        const failureReason = builtInToolFailureReason(message.name, invocation.result.details)
+        if (failureReason !== undefined) {
+          throw new NestedToolFailure(stage, new Error(text), `Nested Zi tool ${message.name} failed: ${failureReason}`)
+        }
         if (invocation.result.terminate) this.#terminate = true
         return {
           text,
@@ -617,7 +621,7 @@ class CodeExecution {
           terminate: invocation.result.terminate === true
         }
       } catch (cause) {
-        throw new NestedToolFailure(stage, cause)
+        throw cause instanceof NestedToolFailure ? cause : new NestedToolFailure(stage, cause)
       }
     })
     void operation.then(
@@ -650,6 +654,9 @@ class CodeExecution {
         if (this.#state.type !== "running") return undefined
         const failure = cause instanceof NestedToolFailure ? cause : new NestedToolFailure("invoke", cause)
         const error = boundedErrorText(failure.message)
+        const durableReason = boundedErrorText(
+          failure.durableReason ?? `Nested Zi tool ${message.name} failed during ${failure.stage}`
+        )
         const common = {
           id: message.id,
           name: message.name,
@@ -659,7 +666,7 @@ class CodeExecution {
         }
         this.#calls[callIndex] = this.#controller.signal.aborted
           ? { state: "aborted", ...common }
-          : { state: "failed", ...common, stage: failure.stage, error }
+          : { state: "failed", ...common, stage: failure.stage, error: durableReason }
         this.#publishProgress()
         await this.#worker
           .send({
@@ -1068,7 +1075,13 @@ function terminalCalls(calls: readonly CodeExecutionCall[]): readonly CodeModeTe
         case "succeeded":
           return Object.freeze({ state: "succeeded" as const, ...common, durationMs: call.durationMs })
         case "failed":
-          return Object.freeze({ state: "failed" as const, ...common, durationMs: call.durationMs, stage: call.stage })
+          return Object.freeze({
+            state: "failed" as const,
+            ...common,
+            durationMs: call.durationMs,
+            stage: call.stage,
+            error: terminalFailureReason(call)
+          })
         case "aborted":
           return Object.freeze({ state: "aborted" as const, ...common, durationMs: call.durationMs })
         default:
@@ -1076,6 +1089,10 @@ function terminalCalls(calls: readonly CodeExecutionCall[]): readonly CodeModeTe
       }
     })
   )
+}
+
+function terminalFailureReason(call: Extract<CodeExecutionCall, { readonly state: "failed" }>): string {
+  return boundedErrorText(call.error)
 }
 
 function terminalArguments(name: string, value: CodeModeJson): CodeModeJson {
@@ -1093,6 +1110,9 @@ function terminalArguments(name: string, value: CodeModeJson): CodeModeJson {
     if (traceNumber(value.contentBytes)) output.contentBytes = value.contentBytes
   } else if (name === "edit" && traceNumber(value.operations)) {
     output.operations = value.operations
+  } else if (name === "session_failures") {
+    if (traceNumber(value.cursor)) output.cursor = value.cursor
+    if (traceNumber(value.limit)) output.limit = value.limit
   }
   return Object.freeze(output)
 }

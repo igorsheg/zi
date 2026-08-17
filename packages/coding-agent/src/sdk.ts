@@ -31,6 +31,7 @@ import type { SettingsManager } from "./settings-manager.js"
 import { buildSystemPrompt } from "./system-prompt.js"
 import { snapshotToolSurface, type ToolSurface } from "./tool-surface.js"
 import { isBuiltInToolError } from "./tools/index.js"
+import { createSessionFailuresTool } from "./tools/session-failures.js"
 import { createUpdatePlanTool } from "./tools/work-plan.js"
 import { WorkPlan } from "./work-plan.js"
 
@@ -119,7 +120,10 @@ export async function createAgentSessionWithProcessTreeTracker(
   internals?: AgentSessionInternals
 ): Promise<CreateAgentSessionResult> {
   const { services, sessionManager } = options
-  const codeOnlyTools = Object.freeze([...(internals?.codeOnlyTools ?? [])])
+  const codeOnlyTools = Object.freeze([
+    ...(options.codeMode ? [createSessionFailuresTool(sessionManager)] : []),
+    ...(internals?.codeOnlyTools ?? [])
+  ])
   if (options.toolSurface && !options.codeMode) throw new Error("Tool surface selection requires Code Mode")
   if (codeOnlyTools.length > 0 && !options.codeMode) throw new Error("Code-only tools require Code Mode")
   const invariantRegistry = new InvariantRegistry(options.invariants)

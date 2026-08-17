@@ -65,6 +65,7 @@ export type {
   CreateAgentSessionResult,
   SessionBootstrapDiagnostic
 } from "./sdk.js"
+export * from "./session-failures.js"
 export * from "./session-manager.js"
 export * from "./session-shell.js"
 export * from "./settings-manager.js"

@@ -41,7 +41,12 @@ export type CodeModeLiveCall =
 
 export type CodeModeTerminalCall =
   | (CodeModeCallBase & { readonly state: "succeeded"; readonly durationMs: number })
-  | (CodeModeCallBase & { readonly state: "failed"; readonly durationMs: number; readonly stage: CodeModeFailureStage })
+  | (CodeModeCallBase & {
+      readonly state: "failed"
+      readonly durationMs: number
+      readonly stage: CodeModeFailureStage
+      readonly error?: string
+    })
   | (CodeModeCallBase & { readonly state: "aborted"; readonly durationMs: number })
 
 export type CodeModeTraceCall = CodeModeCall | CodeModeTerminalCall
@@ -171,9 +176,10 @@ function isTerminalCodeModeCall(value: unknown): value is CodeModeTerminalCall {
       )
     case "failed":
       return (
-        hasOnlyKeys(value, "state", "id", "name", "arguments", "startedAt", "durationMs", "stage") &&
+        hasOnlyKeys(value, "state", "id", "name", "arguments", "startedAt", "durationMs", "stage", "error") &&
         isNonNegativeFinite(value.durationMs) &&
-        isCodeModeFailureStage(value.stage)
+        isCodeModeFailureStage(value.stage) &&
+        (value.error === undefined || boundedString(value.error, maxCodeModeErrorBytes))
       )
     case "aborted":
       return (
@@ -242,6 +248,12 @@ function isTerminalArguments(name: string, value: CodeModeJson): boolean {
         keys.every(key => key === "path" || key === "operations") &&
         optionalPath(value.path) &&
         optionalTraceNumber(value.operations)
+      )
+    case "session_failures":
+      return (
+        keys.every(key => key === "cursor" || key === "limit") &&
+        optionalTraceNumber(value.cursor) &&
+        optionalTraceNumber(value.limit)
       )
     default:
       return keys.length === 0

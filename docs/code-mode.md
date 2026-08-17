@@ -41,6 +41,19 @@ Every `zi` call must be awaited before the cell returns. Zi starts calls in subm
 
 Tool failures reject with `ZiToolError`. Its `toolName` identifies the failed tool, so a cell can catch one expected failure without parsing presentation text; `Promise.allSettled` retains independent failures.
 
+## Inspect committed failures
+
+Use `session_failures` when a cell needs to analyze failure evidence already committed to the current session journal:
+
+```ts
+const page = await zi.session_failures({ cursor: 0, limit: 50 })
+return Object.groupBy(page.failures, failure => `${failure.kind}:${failure.code ?? "unknown"}`)
+```
+
+The result contains chronological failures from direct tools, nested Code Mode calls, background tasks, agent turns, and providers. Pages expose `nextCursor` while retained evidence remains, plus `retained` and `omitted` so the caller can distinguish paging from the session projection's hard bound.
+
+The active cell is not journaled until its outer `code` call settles. A `session_failures` call therefore sees evidence committed before that call, including concurrent background settlement, but not an earlier nested failure from the same active cell.
+
 ## Code-only invocations
 
 Use `--code-only` to expose only the `code` tool to the model:

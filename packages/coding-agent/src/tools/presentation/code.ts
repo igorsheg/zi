@@ -99,7 +99,7 @@ function formatTrace(
         return `✓ ${call.name}${detail ? ` ${detail}` : ""}${result}`
       }
       case "failed": {
-        const error = "error" in call ? boundInline(call.error, 160) : failureStageLabel(call.stage)
+        const error = call.error === undefined ? failureStageLabel(call.stage) : boundInline(call.error, 160)
         return `× ${call.name}${detail ? ` ${detail}` : ""} — ${error}`
       }
       case "aborted":

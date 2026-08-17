@@ -62,24 +62,28 @@ test("code-only tools stay behind Code Mode on both provider surfaces", async ()
     (["direct-and-code", "code-only"] satisfies readonly ToolSurface[]).map(async surface => {
       const catalogs: string[][] = []
       const descriptions: string[] = []
-      const { session } = await createSession(surface, catalogs, descriptions)
+      const { session } = await createSession(surface, catalogs, descriptions, true)
 
       await session.prompt("Invoke the deferred probe.")
 
       expect(catalogs[0]).toEqual(surface === "code-only" ? ["code"] : ["update_plan", "code"])
       expect(catalogs[0]).not.toContain(probeTool.name)
       expect(descriptions[0]).toContain("deferred_probe: (input:")
+      expect(descriptions[0]).toContain("session_failures: (input:")
       expect(
         session.messages.find(message => message.role === "toolResult" && message.toolCallId === "code-1")
       ).toMatchObject({
         role: "toolResult",
         toolName: "code",
         isError: false,
-        content: [{ type: "text", text: "invoked" }],
+        content: [{ type: "text", text: expect.stringContaining('"retained": 0') }],
         details: {
           type: "code_mode",
           outcome: "success",
-          calls: [expect.objectContaining({ name: probeTool.name, state: "succeeded", arguments: {} })]
+          calls: [
+            expect.objectContaining({ name: probeTool.name, state: "succeeded", arguments: {} }),
+            expect.objectContaining({ name: "session_failures", state: "succeeded", arguments: { limit: 1 } })
+          ]
         }
       })
     })
@@ -138,7 +142,12 @@ test("inactive extension registrations cannot claim code-only names", () => {
   expect(rejections).toEqual(["Extension tool deferred_probe conflicts with an existing session tool and was ignored"])
 })
 
-async function createSession(surface: ToolSurface, catalogs: string[][], descriptions: string[]) {
+async function createSession(
+  surface: ToolSurface,
+  catalogs: string[][],
+  descriptions: string[],
+  invokeSessionFailures = false
+) {
   const cwd = await mkdtemp(join(tmpdir(), "zi-code-only-tools-"))
   const paths = new ZiPaths(cwd, join(cwd, "agent"))
   const models = createModels()
@@ -151,7 +160,12 @@ async function createSession(surface: ToolSurface, catalogs: string[][], descrip
       return fauxAssistantMessage(
         fauxToolCall(
           "code",
-          { description: "Invoke the deferred probe", code: "return await zi.deferred_probe({})" },
+          {
+            description: "Invoke the deferred probe",
+            code: invokeSessionFailures
+              ? "await zi.deferred_probe({}); return await zi.session_failures({ limit: 1 })"
+              : "return await zi.deferred_probe({})"
+          },
           { id: "code-1" }
         ),
         { stopReason: "toolUse" }

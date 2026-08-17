@@ -19,8 +19,7 @@ test("versioned terminal traces reject private and nonterminal fields", () => {
   const invalid = [
     terminal([{ ...succeeded, state: "running" }]),
     terminal([{ ...succeeded, result: "private result" }]),
-    terminal([{ ...succeeded, state: "failed", stage: "invoke", error: "private error" }]),
-    terminal([{ ...succeeded, state: "failed" }]),
+    terminal([{ ...succeeded, state: "failed", stage: "invoke", error: "x".repeat(16 * 1024 + 1) }]),
     terminal([{ ...succeeded, name: "extension.private", arguments: { token: "secret" } }]),
     terminal([{ ...succeeded, arguments: { path: "src/index.ts", query: "secret" } }]),
     terminal([succeeded], ["private log"]),
@@ -30,6 +29,15 @@ test("versioned terminal traces reject private and nonterminal fields", () => {
 
   for (const details of invalid) expect(isCodeModeDetails(details)).toBe(false)
   expect(isCodeModeDetails(terminal([succeeded]))).toBe(true)
+  expect(isCodeModeDetails(terminal([{ ...succeeded, state: "failed", stage: "invoke" }]))).toBe(true)
+  expect(
+    isCodeModeDetails(terminal([{ ...succeeded, state: "failed", stage: "invoke", error: "nested failure" }]))
+  ).toBe(true)
+})
+
+test("versioned terminal traces retain bounded nested failure reasons", () => {
+  const error = "x".repeat(16 * 1024 + 1)
+  expect(isCodeModeDetails(terminal([{ ...succeeded, state: "failed", stage: "invoke", error }]))).toBe(false)
 })
 
 test("versioned terminal traces reject aggregate JSON expansion beyond the bound", () => {

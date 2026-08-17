@@ -16,6 +16,7 @@ import { createProcessTreeTracker, type ProcessScope, type ProcessTreeTracker } 
 import { SessionManager } from "../src/session-manager.js"
 import { createModels, createTestAgentRuntime, fauxAssistantMessage, fauxProvider } from "../src/testing.js"
 import { createReadTool } from "../src/tools/read.js"
+import { createSessionFailuresTool } from "../src/tools/session-failures.js"
 import { createUpdatePlanTool } from "../src/tools/work-plan.js"
 import { WorkPlan } from "../src/work-plan.js"
 
@@ -991,6 +992,11 @@ test("code guest can catch built-in expected errors and uncaught failures settle
   )
   expect(caught.content).toEqual([{ type: "text", text: "true" }])
   expect(isCodeModeDetails(caught.details) && caught.details.calls[0]?.state).toBe("failed")
+  expect(
+    isCodeModeDetails(caught.details) && caught.details.calls[0]?.state === "failed"
+      ? caught.details.calls[0].error
+      : undefined
+  ).toBe("Nested Zi tool read failed: not_found")
 
   const uncaught = await tool.execute(
     "uncaught",
@@ -1005,7 +1011,33 @@ test("code guest can catch built-in expected errors and uncaught failures settle
   expect(uncaught.content[0]).toEqual({ type: "text", text: expect.stringContaining("Nested Zi tool read failed") })
 })
 
-test("code durable failed calls retain only their fixed failure stage", async () => {
+test("session_failures excludes nested failures until the active code cell settles", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "zi-code-mode-session-failures-"))
+  const session = SessionManager.inMemory(cwd, "session-1")
+  const codeMode = new CodeMode(cwd, workerCommand, session)
+  codeModes.add(codeMode)
+  const tool = codeMode.createTool([createReadTool(cwd), createSessionFailuresTool(session)])
+
+  const result = await tool.execute(
+    "current-cell",
+    {
+      description: "Inspect committed failures",
+      code: `
+  try { await zi.read({ path: "missing.txt" }); } catch {}
+  return (await zi.session_failures({ limit: 10 })).failures.length
+`
+    },
+    undefined
+  )
+
+  expect(result.content).toEqual([{ type: "text", text: "0" }])
+  expect(isCodeModeDetails(result.details) && result.details.calls).toEqual([
+    expect.objectContaining({ name: "read", state: "failed" }),
+    expect.objectContaining({ name: "session_failures", state: "succeeded" })
+  ])
+})
+
+test("code durable failed calls retain a safe failure reason and stage", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "zi-code-mode-failure-trace-"))
   const secret = "raw-failure-secret"
   const parameters = Type.Object({ token: Type.String() })
@@ -1066,7 +1098,26 @@ test("code durable failed calls retain only their fixed failure stage", async ()
     expect.objectContaining({ state: "failed", name: "validate_failure", arguments: {}, stage: "validate" }),
     expect.objectContaining({ state: "failed", name: "invoke_failure", arguments: {}, stage: "invoke" })
   ])
-  expect(result.details.calls.every(call => !("error" in call))).toBe(true)
+  expect(result.details.calls).toEqual([
+    expect.objectContaining({
+      state: "failed",
+      name: "prepare_failure",
+      stage: "prepare",
+      error: "Nested Zi tool prepare_failure failed during prepare"
+    }),
+    expect.objectContaining({
+      state: "failed",
+      name: "validate_failure",
+      stage: "validate",
+      error: "Nested Zi tool validate_failure failed during validate"
+    }),
+    expect.objectContaining({
+      state: "failed",
+      name: "invoke_failure",
+      stage: "invoke",
+      error: "Nested Zi tool invoke_failure failed during invoke"
+    })
+  ])
   expect(JSON.stringify(result.details)).not.toContain(secret)
 
   const uncaught = await tool.execute(
