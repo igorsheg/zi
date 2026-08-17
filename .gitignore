@@ -2,6 +2,8 @@ node_modules/
 packages/*/node_modules/
 dist/
 coverage/
+.zig-cache/
+zig-out/
 *.tsbuildinfo
 .env
 .env.*
