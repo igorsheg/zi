@@ -3,6 +3,7 @@ import { Type } from "typebox"
 import { Compile } from "typebox/compile"
 
 import type { AgentTeamToolDetails } from "./agent-team/tool-details.js"
+import type { McpServersConfig } from "./mcp/config.js"
 import type { AgentMessage } from "./messages.js"
 
 /**
@@ -29,6 +30,43 @@ const thinkingLevel = Compile(
     Type.Literal("xhigh"),
     Type.Literal("max")
   ])
+)
+
+const mcpServerBase = {
+  enabled: Type.Optional(Type.Literal(true)),
+  required: Type.Optional(Type.Boolean()),
+  startupTimeoutMs: Type.Optional(Type.Number()),
+  toolTimeoutMs: Type.Optional(Type.Number())
+}
+const mcpStringRecord = Type.Record(Type.String(), Type.String())
+const mcpServers = Compile(
+  Type.Record(
+    Type.String(),
+    Type.Union([
+      Type.Object({ enabled: Type.Literal(false) }, { additionalProperties: false }),
+      Type.Object(
+        {
+          ...mcpServerBase,
+          transport: Type.Literal("stdio"),
+          command: Type.Array(Type.String()),
+          cwd: Type.Optional(Type.String()),
+          environment: Type.Optional(mcpStringRecord),
+          environmentFrom: Type.Optional(Type.Array(Type.String()))
+        },
+        { additionalProperties: false }
+      ),
+      Type.Object(
+        {
+          ...mcpServerBase,
+          transport: Type.Literal("streamable-http"),
+          url: Type.String(),
+          headers: Type.Optional(mcpStringRecord),
+          headerEnvironment: Type.Optional(mcpStringRecord)
+        },
+        { additionalProperties: false }
+      )
+    ])
+  )
 )
 
 const textContent = Type.Object({ type: Type.Literal("text"), text: Type.String() })
@@ -186,6 +224,10 @@ export function isNonNegativeFinite(value: unknown): value is number {
 
 export function isThinkingLevel(value: unknown): value is ThinkingLevel {
   return thinkingLevel.Check(value)
+}
+
+export function isMcpServersConfigShape(value: unknown): value is McpServersConfig {
+  return mcpServers.Check(value)
 }
 
 export function isAgentMessage(value: unknown): value is AgentMessage {

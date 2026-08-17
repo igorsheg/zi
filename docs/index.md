@@ -94,6 +94,7 @@ Start with [Know the vocabulary](vocabulary.md) if the later pages read as jargo
 
 - [Work plans](work-plans.md) — the ordered checklist Zi keeps for non-trivial work.
 - [Code Mode](code-mode.md) — the `code` tool, its authority, and its memory.
+- [Use MCP tools without loading every schema](mcp.md) — configure trusted servers and call deferred tools through Code Mode.
 
 ### Build on it
 

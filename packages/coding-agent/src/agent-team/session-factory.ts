@@ -74,7 +74,7 @@ export function createAgentTeamSessionFactory(options: AgentTeamSessionFactoryOp
         { type: "borrowed", tracker: processTreeTracker }
       )
       session = result.session
-      await session.startExtensionLifecycle("startup")
+      await session.activate("startup")
       return createAgentTeamSessionOwner(session)
     } catch (cause) {
       if (session) {

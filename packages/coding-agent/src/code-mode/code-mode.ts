@@ -885,7 +885,7 @@ function codeToolDescription(tools: readonly AgentTool[]): string {
   const prefix = `Execute erasable TypeScript that orchestrates the other Zi tools.
 
 Each cell is the body of an async function written in erasable TypeScript, with full Node-compatible process authority. Top-level await and return work; enums, namespaces, parameter properties, import aliases, and export assignments do not. This is not a security sandbox.
-Every direct tool is also available as zi.<tool>(input) with the same input fields; use zi["tool-name"] for punctuation.
+Every admitted tool is available as zi.<tool>(input) with the same input fields; use zi["tool-name"] for punctuation.
 Successful calls return the declared JSON-compatible JavaScript value directly; values are already decoded.
 Tool failures throw ZiToolError with toolName and may be handled with try/catch. Console arguments use bounded Node-style inspection. Logs are retained in successful and failed cell results, not streamed live.
 Zi starts calls in submission order. Tools declared parallel may overlap up to ${maxParallelNestedCalls} at once; every other tool runs exclusively after earlier calls settle. Promise.allSettled retains independent failures.
@@ -920,7 +920,7 @@ declare const zi: {
     blocks.push(block)
     bytes += blockBytes
   }
-  const omission = omitted > 0 ? `\n  /** ${omitted} additional tools retain their direct tool schemas. */` : ""
+  const omission = omitted > 0 ? `\n  /** ${omitted} additional tools retain their admitted schemas. */` : ""
   return `${prefix}${blocks.join("")}${omission}${suffix}`
 }
 

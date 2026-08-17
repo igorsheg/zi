@@ -6,6 +6,7 @@ Zi bundles or depends on third-party software. Each dependency remains under its
 
 - `@earendil-works/pi-ai` — MIT — Copyright Mario Zechner and contributors
 - `@earendil-works/pi-agent-core` — MIT — Copyright Mario Zechner and contributors
+- `@modelcontextprotocol/client` and `@modelcontextprotocol/core` — Apache-2.0/MIT licensing transition — Copyright (c) 2024-2025 Model Context Protocol a Series of LF Projects, LLC
 - `yuku-parser` and `yuku-codegen` — MIT — Copyright (c) 2026 Yuku
 - `@opentui/core` — MIT — Copyright OpenTUI contributors
 - `md4x` — MIT — Copyright © 2016-2026 Martin Mitáš; Copyright © 2025-present Pooya Parsa
@@ -53,6 +54,7 @@ Zi's standalone executable is bundled with the pinned Bun runtime and the npm de
 ## Sources
 
 - Pi: <https://github.com/earendil-works/pi>
+- Model Context Protocol TypeScript SDK: <https://github.com/modelcontextprotocol/typescript-sdk>
 - OpenTUI: <https://github.com/anomalyco/opentui>
 - md4x: <https://github.com/unjs/md4x>
 - Bun: <https://github.com/oven-sh/bun>

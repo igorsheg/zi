@@ -750,6 +750,59 @@ test("RPC mode validates recoverable records and projects model and thinking sel
   }
 })
 
+test("RPC projects authoritative MCP status without exposing MCP operations", async () => {
+  const models = createModels()
+  const runtime = await createTestAgentRuntime({
+    cwd: "/work",
+    models,
+    settings: { mcpServers: { alpha: { enabled: false } } },
+    session: { type: "new", persist: false }
+  })
+  const input = new RpcTestInput()
+  const output = new RpcTestOutput()
+  const running = runRpcMode(runtime.session, { input, writer: output })
+
+  try {
+    const ready = await output.frame(frame => frame.type === "ready")
+    expect(ready).toMatchObject({ state: { mcp: [{ name: "alpha", status: "disabled" }] } })
+
+    runtime.services.settingsManager.updateGlobal({ mcpServers: { beta: { enabled: false } } })
+    const allReload = runtime.session.reload()
+    const allStatus = await output.frame(
+      frame => frame.type === "mcp_status" && frame.mcp.some(server => server.name === "beta")
+    )
+    await allReload
+    expect(allStatus).toMatchObject({ type: "mcp_status", mcp: [{ name: "beta", status: "disabled" }] })
+    expect(
+      output.frames.some(
+        frame => frame.type === "session_event" && JSON.stringify(frame.event).includes('"type":"mcp_server_changed"')
+      )
+    ).toBe(false)
+
+    input.send({ version: 1, id: "events-none", method: "connection.set_events", params: { mode: "none" } })
+    await output.response("events-none")
+    const statusCount = output.frames.filter(frame => frame.type === "mcp_status").length
+    runtime.services.settingsManager.updateGlobal({ mcpServers: { gamma: { enabled: false } } })
+    await runtime.session.reload()
+    expect(output.frames.filter(frame => frame.type === "mcp_status")).toHaveLength(statusCount)
+
+    input.send({ version: 1, id: "events-activity", method: "connection.set_events", params: { mode: "activity" } })
+    await output.response("events-activity")
+    runtime.services.settingsManager.updateGlobal({ mcpServers: { delta: { enabled: false } } })
+    const activityReload = runtime.session.reload()
+    const activityStatus = await output.frame(
+      frame => frame.type === "mcp_status" && frame.mcp.some(server => server.name === "delta")
+    )
+    await activityReload
+    expect(activityStatus).toMatchObject({ mcp: [{ name: "delta", status: "disabled" }] })
+  } finally {
+    input.close()
+    await running
+    runtime.session.dispose()
+    await runtime.session.waitForIdle()
+  }
+})
+
 test("connection.set_events suppresses only session_event frames in input order", async () => {
   const models = createModels()
   const faux = fauxProvider({ provider: "rpc", models: [{ id: "model", name: "RPC Model", reasoning: false }] })
@@ -985,6 +1038,7 @@ function isServerFrame(value: unknown): value is RpcServerFrame {
     typeof value.sequence === "number" &&
     (value.type === "ready" ||
       value.type === "session_event" ||
+      value.type === "mcp_status" ||
       value.type === "protocol_error" ||
       value.type === "response")
   )

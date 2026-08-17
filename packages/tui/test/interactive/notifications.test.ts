@@ -423,6 +423,29 @@ test("interactive notifications anchor to the transcript above the composer", as
   }
 })
 
+test("interactive startup projects the first MCP failure with an omitted count", async () => {
+  const models = createModels()
+  const faux = fauxProvider()
+  models.setProvider(faux.provider)
+  const { session } = await createAgentRuntime({ cwd: "/work", models, session: { type: "new", persist: false } })
+  Object.defineProperty(session, "mcpHostSnapshot", {
+    configurable: true,
+    value: [
+      { name: "alpha", transport: "streamable-http", status: "failed", message: "connection failed" },
+      { name: "beta", transport: "stdio", status: "failed", message: "process exited" }
+    ]
+  })
+  const setup = await createInteractiveTest(session, { width: 80, height: 8 })
+
+  try {
+    await setup.renderOnce()
+    expect(setup.captureCharFrame()).toContain("MCP alpha: connection failed (1 additional MCP diagnostic)")
+  } finally {
+    session.dispose()
+    setup.destroy()
+  }
+})
+
 test("notification ownership survives session-screen replacement", async () => {
   const models = createModels()
   const faux = fauxProvider()

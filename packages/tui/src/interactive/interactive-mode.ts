@@ -216,6 +216,7 @@ export class InteractiveMode {
     this.#releaseGeneration = this.store.$generation.listen(() => this.#replaceScreen())
     this.#showBootstrapWarning(bootstrapDiagnostic)
     this.#showExtensionWarning(session)
+    this.#showMcpWarning(session)
     this.#presentProjectTrust(sessionRuntime?.projectTrust)
   }
 
@@ -234,6 +235,7 @@ export class InteractiveMode {
     this.store.replaceSession(session)
     this.#showBootstrapWarning(diagnostic)
     this.#showExtensionWarning(session)
+    this.#showMcpWarning(session)
     this.#presentProjectTrust(this.#sessionRuntime?.projectTrust)
   }
 
@@ -289,6 +291,20 @@ export class InteractiveMode {
     this.#builtInNotifications.setExtension(
       `Extension ${source}${diagnostic.message.replace(/[\r\n]+/g, " ")}${suffix}`
     )
+  }
+
+  #showMcpWarning(session: AgentSession): void {
+    const failures = (session.mcpHostSnapshot ?? []).filter(
+      snapshot => snapshot.status === "failed" || snapshot.status === "backoff"
+    )
+    const first = failures[0]
+    if (!first) {
+      this.#builtInNotifications.setMcp(undefined)
+      return
+    }
+    const omitted = failures.length - 1
+    const suffix = omitted > 0 ? ` (${omitted} additional MCP diagnostic${omitted === 1 ? "" : "s"})` : ""
+    this.#builtInNotifications.setMcp(`MCP ${first.name}: ${first.message.replace(/[\r\n]+/g, " ")}${suffix}`)
   }
 
   #presentProjectTrust(trust: ProjectTrustResolution | undefined): void {

@@ -48,6 +48,10 @@ test("RPC request decoding admits only the versioned closed command catalog", ()
   expectRequestError({ version: 1, id: "", method: "session.get_state" }, "invalid_request")
   expectRequestError({ version: 1, id: "x", method: "session.get_state", extra: true }, "invalid_request")
   expectRequestError({ version: 1, id: "x", method: "unknown" }, "unknown_method")
+  expectRequestError({ version: 1, id: "x", method: "mcp.search" }, "unknown_method")
+  expectRequestError({ version: 1, id: "x", method: "mcp.describe" }, "unknown_method")
+  expectRequestError({ version: 1, id: "x", method: "mcp.call" }, "unknown_method")
+  expectRequestError({ version: 1, id: "x", method: "mcp.status" }, "unknown_method")
   expect(
     decodeRpcRequest({
       version: 1,

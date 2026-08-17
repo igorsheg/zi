@@ -9,6 +9,7 @@ export const publicProductDocumentationFiles = Object.freeze([
   "extensions.md",
   "index.md",
   "json-events.md",
+  "mcp.md",
   "notifications.md",
   "prompts.md",
   "resources.md",

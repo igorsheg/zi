@@ -187,6 +187,7 @@ class AgentSessionTrace {
       case "steering_mode_changed":
       case "follow_up_mode_changed":
       case "shell_task_changed":
+      case "mcp_server_changed":
       case "work_plan_changed":
       case "agent_changed":
       case "authentication_changed":

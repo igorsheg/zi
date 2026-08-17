@@ -19,6 +19,7 @@ export interface BuiltInNoticeActions {
   backgroundTaskCapacityExceeded(): void
   reloadCompleted(outcome: ReloadNoticeOutcome, message: string): void
   reloadFailed(message: string): void
+  setMcp(message: string | undefined): void
 }
 
 interface BuiltInNoticeSource {
@@ -33,6 +34,7 @@ const promptNoticeKey = "prompt"
 const builtInNoticeKeys = [
   "bootstrap",
   "extensions",
+  "mcp",
   "project-trust",
   "automatic-compaction",
   "copy",
@@ -82,6 +84,10 @@ export class BuiltInNotificationPresenter implements BuiltInNoticeActions {
 
   setExtension(message: string | undefined): void {
     this.#setPersistent("extensions", message)
+  }
+
+  setMcp(message: string | undefined): void {
+    this.#setPersistent("mcp", message)
   }
 
   setProjectTrust(message: string | undefined): void {

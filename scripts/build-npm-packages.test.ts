@@ -45,6 +45,7 @@ test("npm package assembly wraps release archives without install-time downloads
     expect(cli).toBeDefined()
     expect(existsSync(join(platform!.directory, "bin", "zi"))).toBe(true)
     expect(existsSync(join(platform!.directory, "bin", "docs", "extensions.md"))).toBe(true)
+    expect(existsSync(join(platform!.directory, "bin", "docs", "mcp.md"))).toBe(true)
     expect(existsSync(join(platform!.directory, "bin", "docs", "skills.md"))).toBe(true)
     expect(existsSync(join(platform!.directory, "bin", "docs", "subagents.md"))).toBe(true)
     expect(existsSync(join(platform!.directory, "bin", "examples", "skills", "review", "SKILL.md"))).toBe(true)
@@ -54,6 +55,7 @@ test("npm package assembly wraps release archives without install-time downloads
       expect.arrayContaining([
         "package/bin/zi",
         "package/bin/docs/extensions.md",
+        "package/bin/docs/mcp.md",
         "package/bin/docs/skills.md",
         "package/bin/docs/subagents.md",
         "package/bin/examples/skills/review/SKILL.md"

@@ -11,6 +11,12 @@ import {
   isAgentWaitTimeout
 } from "./agent-team/timeouts.js"
 import { isRecord, isThinkingLevel } from "./guards.js"
+import {
+  snapshotMcpServersConfig,
+  validateMcpServersConfig,
+  type McpServerConfig,
+  type McpServersConfig
+} from "./mcp/config.js"
 import type { ZiPaths } from "./paths.js"
 import type { ProjectConfigurationAdmission } from "./project-trust.js"
 import { isRetryCount, isRetryDelay } from "./retry.js"
@@ -36,6 +42,7 @@ export interface AgentSettings {
   extensions?: readonly string[]
   skills?: readonly string[]
   prompts?: readonly string[]
+  mcpServers?: McpServersConfig
 }
 
 export const maxSettingsFileBytes = 1024 * 1024
@@ -203,11 +210,19 @@ export class SettingsManager {
     if (state.type === "invalid") {
       throw new Error(`Cannot update invalid ${scope} settings: ${state.path}`, { cause: state.error })
     }
+    const candidate = { type: "loaded" as const, path: state.path, settings: { ...scopeSettings(state), ...admitted } }
+    const candidateOverrides = { ...this.#overrides }
+    clearOverrides(candidateOverrides, admitted)
+    mergeSettings(
+      scopeSettings(scope === "global" ? candidate : this.#global),
+      scopeSettings(scope === "project" ? candidate : this.#project),
+      candidateOverrides
+    )
     if (this.#paths) {
       if (state.type === "absent") persistNewProjectSettings(state.path, admitted)
       else persistSettings(state.path, admitted)
     }
-    return { type: "loaded", path: state.path, settings: { ...scopeSettings(state), ...admitted } }
+    return candidate
   }
 
   #recordLoadError(scope: SettingsScope, state: SettingsScopeState): void {
@@ -274,6 +289,7 @@ function validateSettingsPatch(patch: Partial<AgentSettings>): void {
   if ("prompts" in patch && !isConfiguredResourcePaths(patch.prompts)) {
     throw new Error("Invalid prompts setting")
   }
+  if ("mcpServers" in patch) validateMcpServersConfig(patch.mcpServers)
 }
 
 function loadScope(path: string): SettingsScopeState {
@@ -291,7 +307,15 @@ function scopeSettings(state: SettingsScopeState): Partial<AgentSettings> {
 }
 
 function mergeSettings(...layers: readonly Partial<AgentSettings>[]): Readonly<AgentSettings> {
-  return Object.freeze(Object.assign({}, defaults, ...layers))
+  const settings = Object.assign({}, defaults, ...layers)
+  if (layers.some(layer => layer.mcpServers !== undefined)) {
+    const servers: Record<string, McpServerConfig> = Object.create(null)
+    for (const layer of layers) {
+      for (const [name, server] of Object.entries(layer.mcpServers ?? {})) servers[name] = server
+    }
+    settings.mcpServers = snapshotMcpServersConfig(servers)
+  }
+  return Object.freeze(settings)
 }
 
 function clearOverrides(overrides: Partial<AgentSettings>, patch: Partial<AgentSettings>): void {
@@ -313,6 +337,7 @@ function clearOverrides(overrides: Partial<AgentSettings>, patch: Partial<AgentS
   if ("extensions" in patch) delete overrides.extensions
   if ("skills" in patch) delete overrides.skills
   if ("prompts" in patch) delete overrides.prompts
+  if ("mcpServers" in patch) delete overrides.mcpServers
 }
 
 function persistNewProjectSettings(path: string, patch: Partial<AgentSettings>): void {
@@ -468,6 +493,13 @@ function loadSettings(path: string): Partial<AgentSettings> {
     if (!isConfiguredResourcePaths(value.prompts)) throw invalidSetting(path, "prompts")
     settings.prompts = freezeResourcePaths(value.prompts)
   }
+  if (value.mcpServers !== undefined) {
+    try {
+      settings.mcpServers = snapshotMcpServersConfig(value.mcpServers)
+    } catch {
+      throw invalidSetting(path, "mcpServers")
+    }
+  }
   return settings
 }
 
@@ -533,7 +565,8 @@ function normalizeSettingsPatch(patch: Partial<AgentSettings>): Partial<AgentSet
     ...patch,
     ...(patch.extensions === undefined ? {} : { extensions: freezeResourcePaths(patch.extensions) }),
     ...(patch.skills === undefined ? {} : { skills: freezeResourcePaths(patch.skills) }),
-    ...(patch.prompts === undefined ? {} : { prompts: freezeResourcePaths(patch.prompts) })
+    ...(patch.prompts === undefined ? {} : { prompts: freezeResourcePaths(patch.prompts) }),
+    ...(patch.mcpServers === undefined ? {} : { mcpServers: snapshotMcpServersConfig(patch.mcpServers) })
   }
 }
 

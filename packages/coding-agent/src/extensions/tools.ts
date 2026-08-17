@@ -12,17 +12,20 @@ export interface ExtensionToolDetails {
   readonly outcome: "progress" | "success"
 }
 
+type ExtensionToolHost = Pick<ExtensionHost, "toolCatalog" | "rejectTool" | "invokeTool">
+
 export function admitExtensionTools(
   builtInTools: readonly AgentTool[],
-  host: ExtensionHost | undefined,
-  activeTools: ReadonlySet<ExtensionToolRegistration>
+  host: ExtensionToolHost | undefined,
+  activeTools: ReadonlySet<ExtensionToolRegistration>,
+  reservedNames: ReadonlySet<string>
 ): readonly AgentTool[] {
   if (builtInTools.some(tool => tool.name === "code" || tool.name === "then")) {
     throw new Error("The tool names code and then are reserved for native code mode")
   }
   if (!host) return builtInTools
   const admitted: AgentTool[] = [...builtInTools]
-  const names = new Set([...builtInTools.map(tool => tool.name), "code", "then"])
+  const names = new Set([...reservedNames, "code", "then"])
 
   for (const registration of host.toolCatalog()) {
     if (names.has(registration.name)) {

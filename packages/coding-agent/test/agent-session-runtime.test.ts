@@ -3,6 +3,7 @@ import { existsSync } from "node:fs"
 import { mkdtemp } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
+import { fileURLToPath } from "node:url"
 
 import { AgentSessionRuntime } from "../src/agent-session-runtime.js"
 import {
@@ -19,6 +20,8 @@ import {
   fauxAssistantMessage,
   fauxProvider
 } from "../src/testing.js"
+
+const mcpFixture = fileURLToPath(new URL("./fixtures/mcp-host-server.ts", import.meta.url))
 
 test("session runtime omits a new unprompted session and disposes the replaced session", async () => {
   const root = await mkdtemp(join(tmpdir(), "zi-session-runtime-new-"))
@@ -346,6 +349,40 @@ test("replacement construction failure leaves the current session usable", async
     runtime.dispose()
     await runtime.waitForIdle()
   }
+})
+
+test("replacement activation failure disposes the candidate and terminates the runtime", async () => {
+  const models = createModels()
+  const faux = fauxProvider({ provider: "runtime-activation-failure", models: [{ id: "model" }] })
+  models.setProvider(faux.provider)
+  const options: CreateAgentRuntimeOptions = {
+    cwd: "/work",
+    model: "runtime-activation-failure/model",
+    session: { type: "new", persist: false },
+    modelFactory: () => models
+  }
+  const initial = await createAgentRuntime(options)
+  const runtime = new AgentSessionRuntime(initial, options, replacement =>
+    createUnboundAgentRuntime({
+      ...replacement,
+      settings: {
+        ...replacement.settings,
+        mcpServers: {
+          required: {
+            transport: "stdio",
+            command: [process.execPath, mcpFixture, "exit"],
+            required: true,
+            startupTimeoutMs: 1_000
+          }
+        }
+      }
+    })
+  )
+
+  await expectRejection(runtime.newSession(), "Required MCP server required failed")
+  expect(runtime.cancelReplacement().type).toBe("disposed")
+  expect(() => runtime.session).toThrow("AgentSessionRuntime is disposed")
+  await expectRejection(runtime.waitForIdle(), "Required MCP server required failed")
 })
 
 test("replacement rechecks the old session before commit and disposes a stale candidate", async () => {

@@ -15,10 +15,13 @@ import { FileCredentialStore } from "./credential-store.js"
 import { discoverExtensionLoadPlan, extensionDiscoveryDiagnostic } from "./extensions/discovery.js"
 import { ExtensionHost } from "./extensions/host.js"
 import { spawnExtensionWorker } from "./extensions/process.js"
+import { resolveMcpLoadPlan } from "./mcp/config.js"
+import { McpHost } from "./mcp/host.js"
+import { createMcpTools } from "./mcp/tools.js"
 import { FileModelCatalogStore } from "./model-catalog-store.js"
 import { ModelRegistry } from "./model-registry.js"
 import { resolveRequestedModel } from "./model-resolver.js"
-import { getAgentDir, ZiPaths } from "./paths.js"
+import { getDefaultAgentDir, ZiPaths } from "./paths.js"
 import { createProcessTreeTracker } from "./processes/process-tree.js"
 import { projectConfigurationAdmission, resolveProjectTrust, type ProjectTrustResolution } from "./project-trust.js"
 import { withRemoteModelCatalog } from "./remote-model-catalog.js"
@@ -54,7 +57,7 @@ export interface AgentRuntime {
 export async function createAgentRuntime(requested: CreateAgentRuntimeOptions): Promise<AgentRuntime> {
   const runtime = await createUnboundAgentRuntime(requested)
   try {
-    await runtime.session.startExtensionLifecycle("startup")
+    await runtime.session.activate("startup")
     return runtime
   } catch (cause) {
     runtime.session.dispose()
@@ -65,8 +68,9 @@ export async function createAgentRuntime(requested: CreateAgentRuntimeOptions): 
 
 export async function createUnboundAgentRuntime(requested: CreateAgentRuntimeOptions): Promise<AgentRuntime> {
   const options = snapshotAgentRuntimeOptions(requested)
+  const environment: Readonly<Record<string, string | undefined>> = Object.freeze({ ...process.env })
   const session = options.session ?? defaultRuntimeSession
-  const agentDir = options.agentDir ?? getAgentDir()
+  const agentDir = options.agentDir ?? environment.ZI_AGENT_DIR ?? getDefaultAgentDir()
   const requestedPaths = new ZiPaths(options.cwd, agentDir, options.sessionDir)
   const selected = await selectSession(session, requestedPaths)
   const cwd = selected.type === "resumed" ? selected.manager.header.cwd : options.cwd
@@ -77,6 +81,9 @@ export async function createUnboundAgentRuntime(requested: CreateAgentRuntimeOpt
   const settingsManager = SettingsManager.create(paths, project, options.settings ?? {})
   const extensions = discoverExtensionLoadPlan(paths, project, options.extensionPaths ?? [], settingsManager)
   const processTreeTracker = createProcessTreeTracker()
+  const mcpPlan = resolveMcpLoadPlan(settingsManager.get().mcpServers, paths, environment, process.platform)
+  const mcpHost = new McpHost(processTreeTracker)
+  let mcpTransferred = false
   const extensionWorkerCommand = options.extensionWorkerCommand ?? defaultExtensionWorkerCommand
   const extensionHost = new ExtensionHost(
     plan => spawnExtensionWorker(plan, extensionWorkerCommand, processTreeTracker),
@@ -97,7 +104,7 @@ export async function createUnboundAgentRuntime(requested: CreateAgentRuntimeOpt
       models = options.modelFactory(credentialStore)
     } else {
       modelCatalogStore = new FileModelCatalogStore(paths)
-      models = createProductionModels(credentialStore, modelCatalogStore)
+      models = createProductionModels(credentialStore, modelCatalogStore, environment)
     }
     const modelRegistry = new ModelRegistry(models)
     if (modelCatalogStore) await modelRegistry.refresh({ allowNetwork: false })
@@ -159,8 +166,13 @@ export async function createUnboundAgentRuntime(requested: CreateAgentRuntimeOpt
         ...(options.apiKey ? { apiKey: options.apiKey } : {}),
         tools: createCodingTools({ cwd: paths.cwd, shell })
       },
-      { type: "owned", tracker: processTreeTracker }
+      { type: "owned", tracker: processTreeTracker },
+      {
+        codeOnlyTools: createMcpTools(mcpHost),
+        mcp: { host: mcpHost, plan: mcpPlan, environment, platform: process.platform }
+      }
     )
+    mcpTransferred = true
     return Object.freeze({
       session: created.session,
       services,
@@ -168,16 +180,24 @@ export async function createUnboundAgentRuntime(requested: CreateAgentRuntimeOpt
       bootstrapDiagnostic: created.bootstrapDiagnostic
     })
   } catch (cause) {
-    await Promise.all([extensionHost.dispose(), shell?.dispose() ?? Promise.resolve()])
+    await Promise.all([
+      ...(mcpTransferred ? [] : [mcpHost.dispose()]),
+      extensionHost.dispose(),
+      shell?.dispose() ?? Promise.resolve()
+    ])
     await processTreeTracker.dispose()
     throw cause
   }
 }
 
-function createProductionModels(credentials: FileCredentialStore, modelsStore: FileModelCatalogStore) {
+function createProductionModels(
+  credentials: FileCredentialStore,
+  modelsStore: FileModelCatalogStore,
+  environment: Readonly<Record<string, string | undefined>>
+) {
   const models = createModels({ credentials, modelsStore })
   const localGeneratedAt = getBuiltinModelDataGeneratedAt()
-  const userAgent = `zi/${process.env.ZI_BUILD_VERSION ?? "dev"}`
+  const userAgent = `zi/${environment.ZI_BUILD_VERSION ?? "dev"}`
   for (const provider of builtinProviders()) {
     models.setProvider(
       provider.id === "radius"

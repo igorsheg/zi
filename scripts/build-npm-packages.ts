@@ -15,6 +15,7 @@ import {
   type ReleaseTarget
 } from "./build-release.js"
 import { assertDistributionDocumentation } from "./distribution-documentation.js"
+import { runMcpCompiledAcceptance } from "./mcp-compiled-acceptance.js"
 
 export const npmPackageScope = "@with-zi"
 export const npmCliPackageName = `${npmPackageScope}/zi`
@@ -360,6 +361,15 @@ async function verifyCurrentInstall(result: NpmPackageBuildResult, version: stri
         `Packed npm CLI failed its version smoke test (exit ${exitCode}): stdout=${JSON.stringify(stdout)} stderr=${JSON.stringify(stderr)}`
       )
     }
+    const platform = npmPlatform(target)
+    const nativeExecutable = join(
+      temporary,
+      "node_modules",
+      ...npmPlatformPackageName(target).split("/"),
+      "bin",
+      platform.executable
+    )
+    await runMcpCompiledAcceptance({ executable: nativeExecutable })
     await run(
       [
         "node",

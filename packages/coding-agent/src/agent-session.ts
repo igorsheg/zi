@@ -76,6 +76,8 @@ import { discoverExtensionLoadPlan, extensionDiscoveryDiagnostic } from "./exten
 import type { ExtensionHost, ExtensionHostSnapshot, ExtensionReloadResult } from "./extensions/host.js"
 import { validateActiveExtensionToolCatalog, type ExtensionToolRegistration } from "./extensions/protocol.js"
 import { admitExtensionTools } from "./extensions/tools.js"
+import { resolveMcpLoadPlan, type McpLoadPlan } from "./mcp/config.js"
+import type { McpHost, McpReloadResult, McpServerSnapshot } from "./mcp/host.js"
 import { isZiAgentMessage, type AgentMessage } from "./messages.js"
 import type { ModelRegistry } from "./model-registry.js"
 import { resolveRequestedModel } from "./model-resolver.js"
@@ -245,6 +247,7 @@ export type AgentSessionEvent =
   | { type: "steering_mode_changed"; mode: QueueMode }
   | { type: "follow_up_mode_changed"; mode: QueueMode }
   | { type: "shell_task_changed"; taskId: string }
+  | { type: "mcp_server_changed"; server: string }
   | { type: "work_plan_changed"; plan: WorkPlanSnapshot }
   | { type: "agent_changed"; path: AgentPath }
   | {
@@ -318,6 +321,7 @@ export interface SessionReloadDeps {
 export interface SessionReloadResult {
   readonly resources: SessionResources
   readonly extensions: ExtensionReloadResult | undefined
+  readonly mcp: McpReloadResult | undefined
   readonly settingsErrors: readonly SettingsError[]
 }
 
@@ -325,6 +329,13 @@ interface AgentTeamBinding {
   readonly team: AgentTeam
   readonly path: AgentPath
   readonly owned: boolean
+}
+
+interface McpSessionBinding {
+  readonly host: McpHost
+  readonly plan: McpLoadPlan
+  readonly environment: Readonly<Record<string, string | undefined>>
+  readonly platform: NodeJS.Platform
 }
 
 interface AgentSessionConfig {
@@ -336,6 +347,8 @@ interface AgentSessionConfig {
   resources: SessionResources
   projectFileSearch: ProjectFileSearch
   tools: readonly AgentTool[]
+  codeOnlyTools: readonly AgentTool[]
+  mcp?: McpSessionBinding
   toolSurface: ToolSurface | undefined
   reload: SessionReloadDeps
   invariantRegistry: InvariantRegistry
@@ -435,6 +448,15 @@ type ExtensionLifecycleState =
   | { readonly type: "started"; readonly host: ExtensionHost }
   | { readonly type: "shutdown"; readonly host: ExtensionHost; readonly settled: Promise<void> }
   | { readonly type: "disposing"; readonly host: ExtensionHost; readonly settled: Promise<void> }
+  | { readonly type: "disposed"; readonly settled: Promise<void> }
+
+type McpLifecycleState =
+  | { readonly type: "absent" }
+  | { readonly type: "unbound"; readonly host: McpHost; readonly plan: McpLoadPlan }
+  | { readonly type: "starting"; readonly host: McpHost; readonly settled: Promise<void> }
+  | { readonly type: "started"; readonly host: McpHost }
+  | { readonly type: "failed"; readonly host: McpHost; readonly cause: unknown }
+  | { readonly type: "disposing"; readonly host: McpHost; readonly settled: Promise<void> }
   | { readonly type: "disposed"; readonly settled: Promise<void> }
 
 type ModelMutationState = { type: "none" } | { type: "validating"; operationId: number }
@@ -564,12 +586,15 @@ export class AgentSession {
   readonly #workPlan: WorkPlan
   readonly #agentTeam: AgentTeamBinding | undefined
   readonly #ownedProcessTreeTracker: ProcessTreeTracker | undefined
+  readonly #codeOnlyTools: readonly AgentTool[]
+  readonly #mcpResolution: Pick<McpSessionBinding, "environment" | "platform"> | undefined
   readonly #apiKeyProvider: string | undefined
   readonly #listeners = new Set<(event: AgentSessionEvent) => void>()
   readonly #pendingShellCompletions = new Map<string, BackgroundTaskResultInput>()
   readonly #unsubscribeAgent: () => void
   readonly #unsubscribeShell: (() => void) | undefined
   readonly #unsubscribeWorkPlan: () => void
+  readonly #unsubscribeMcp: (() => void) | undefined
   readonly #unsubscribeAgentTeam: (() => void) | undefined
   readonly #unbindExtensionCatalog: (() => void) | undefined
   readonly #unbindExtensionSessionOperations: (() => void) | undefined
@@ -578,6 +603,7 @@ export class AgentSession {
   #extensionToolSelection: ExtensionToolSelection = { registrations: Object.freeze([]), active: new Set() }
   #activity: Activity = { type: "idle" }
   #extensionLifecycle: ExtensionLifecycleState
+  #mcpLifecycle: McpLifecycleState
   #pending: PendingInput[] = []
   #pendingBytes = 0
   readonly #cancelledPendingMessages = new Map<PiAgentMessage, PendingMessageCancellation>()
@@ -613,9 +639,16 @@ export class AgentSession {
     this.#extensionHost = config.extensionHost
     this.#extensionContext = config.extensionContext
     this.#baseTools = Object.freeze([...config.tools])
+    this.#codeOnlyTools = Object.freeze([...config.codeOnlyTools])
     this.#extensionLifecycle = config.extensionHost
       ? { type: "unbound", host: config.extensionHost }
       : { type: "absent" }
+    this.#mcpLifecycle = config.mcp
+      ? { type: "unbound", host: config.mcp.host, plan: config.mcp.plan }
+      : { type: "absent" }
+    this.#mcpResolution = config.mcp
+      ? { environment: config.mcp.environment, platform: config.mcp.platform }
+      : undefined
     this.#shell = config.shell
     this.#workPlan = config.workPlan
     this.#agentTeam = config.agentTeam
@@ -684,6 +717,13 @@ export class AgentSession {
             }
           }
         : {})
+    })
+    this.#unsubscribeMcp = config.mcp?.host.subscribe(server => {
+      try {
+        this.#emit({ type: "mcp_server_changed", server })
+      } catch {
+        // MCP ownership cannot cross into a session observer.
+      }
     })
     this.#unsubscribeAgentTeam = this.#agentTeam?.team.subscribe(change => {
       for (const path of change.paths) this.#emitAll([{ type: "agent_changed", path }])
@@ -1321,7 +1361,7 @@ export class AgentSession {
       const resources = await this.#reload.resourceLoader.load()
       if (!this.#ownsReload(operationId)) {
         settlement.resolve()
-        return Object.freeze({ resources, extensions: undefined, settingsErrors })
+        return Object.freeze({ resources, extensions: undefined, mcp: undefined, settingsErrors })
       }
       this.#resources = resources
       this.#applyActiveTools()
@@ -1345,9 +1385,26 @@ export class AgentSession {
         )
       }
 
+      let mcp: McpReloadResult | undefined
+      const mcpState = this.#mcpLifecycle
+      if (
+        this.#ownsReload(operationId) &&
+        settingsErrors.length === 0 &&
+        this.#mcpResolution &&
+        mcpState.type === "started"
+      ) {
+        const plan = resolveMcpLoadPlan(
+          this.settingsManager.get().mcpServers,
+          this.#reload.paths,
+          this.#mcpResolution.environment,
+          this.#mcpResolution.platform
+        )
+        mcp = await mcpState.host.reload(plan)
+      }
+
       if (this.#ownsReload(operationId)) this.#activity = { type: "idle" }
       settlement.resolve()
-      return Object.freeze({ resources, extensions, settingsErrors })
+      return Object.freeze({ resources, extensions, mcp, settingsErrors })
     } catch (cause) {
       if (this.#ownsReload(operationId)) this.#activity = { type: "idle" }
       settlement.reject(cause)
@@ -1661,13 +1718,55 @@ export class AgentSession {
     return state.type === "absent" || state.type === "disposed" ? undefined : state.host.snapshot()
   }
 
-  assertExtensionLifecycleUnbound(): void {
-    const state = this.#extensionLifecycle
-    if (state.type === "absent" || state.type === "unbound") return
-    throw new Error("AgentSession extension lifecycle is already bound")
+  get mcpHostSnapshot(): readonly McpServerSnapshot[] | undefined {
+    const state = this.#mcpLifecycle
+    return state.type === "absent" || state.type === "disposed" ? undefined : state.host.snapshot()
   }
 
-  startExtensionLifecycle(reason: ExtensionStartReason): Promise<void> {
+  assertLifecycleUnbound(): void {
+    const extensions = this.#extensionLifecycle
+    if (extensions.type !== "absent" && extensions.type !== "unbound") {
+      throw new Error("AgentSession extension lifecycle is already bound")
+    }
+    const mcp = this.#mcpLifecycle
+    if (mcp.type !== "absent" && mcp.type !== "unbound") {
+      throw new Error("AgentSession MCP lifecycle is already bound")
+    }
+  }
+
+  async activate(reason: ExtensionStartReason): Promise<void> {
+    await this.#startMcp()
+    await this.#startExtensions(reason)
+  }
+
+  #startMcp(): Promise<void> {
+    const state = this.#mcpLifecycle
+    if (state.type === "absent" || state.type === "started") return Promise.resolve()
+    if (state.type === "starting") return state.settled
+    if (state.type === "failed") return Promise.reject(state.cause)
+    if (state.type === "disposing" || state.type === "disposed") {
+      return Promise.reject(new Error("Cannot start MCP after session disposal"))
+    }
+
+    const operation = createSettlement()
+    const starting: McpLifecycleState = { type: "starting", host: state.host, settled: operation.promise }
+    this.#mcpLifecycle = starting
+    void state.host.start(state.plan).then(
+      () => {
+        if (this.#mcpLifecycle === starting) this.#mcpLifecycle = { type: "started", host: state.host }
+        operation.resolve()
+        return undefined
+      },
+      cause => {
+        if (this.#mcpLifecycle === starting) this.#mcpLifecycle = { type: "failed", host: state.host, cause }
+        operation.reject(cause)
+        return undefined
+      }
+    )
+    return operation.promise
+  }
+
+  #startExtensions(reason: ExtensionStartReason): Promise<void> {
     const state = this.#extensionLifecycle
     if (state.type === "absent" || state.type === "started") return Promise.resolve()
     if (state.type === "starting") return state.settled
@@ -1705,6 +1804,7 @@ export class AgentSession {
   waitForIdle(): Promise<void> {
     const searchSettled = this.#projectFileSearch.waitForIdle()
     const extensionsSettled = this.#extensionSettlement()
+    const mcpSettled = this.#mcpSettlement()
     const catalogSettled = this.#modelCatalogSettlementWithinDeadline()
     switch (this.#activity.type) {
       case "running":
@@ -1720,11 +1820,18 @@ export class AgentSession {
           this.#authentication.waitForIdle(),
           searchSettled,
           extensionsSettled,
+          mcpSettled,
           catalogSettled
         ])
       case "idle":
       case "failed":
-        return settleAll([this.#authentication.waitForIdle(), searchSettled, extensionsSettled, catalogSettled])
+        return settleAll([
+          this.#authentication.waitForIdle(),
+          searchSettled,
+          extensionsSettled,
+          mcpSettled,
+          catalogSettled
+        ])
       default:
         return assertNever(this.#activity)
     }
@@ -1860,8 +1967,9 @@ export class AgentSession {
 
   setActiveTools(tools: readonly AgentTool[]): void {
     this.#assertIdle("change tools")
-    this.#baseTools = Object.freeze([...tools])
-    this.#applyActiveTools()
+    const candidate = Object.freeze([...tools])
+    this.#applyActiveTools(candidate)
+    this.#baseTools = candidate
   }
 
   #applyExtensionCatalog(): void {
@@ -1917,8 +2025,8 @@ export class AgentSession {
     this.#applyActiveTools()
   }
 
-  #applyActiveTools(): void {
-    const baseTools = this.#baseTools.filter(tool => !agentTeamToolNames.has(tool.name))
+  #applyActiveTools(candidate: readonly AgentTool[] = this.#baseTools): void {
+    const baseTools = candidate.filter(tool => !agentTeamToolNames.has(tool.name))
     const agentTools = this.#agentTeam
       ? createAgentTeamTools(
           this.#agentTeam.team,
@@ -1928,19 +2036,27 @@ export class AgentSession {
           this.settingsManager.get().agentWaitTimeoutMs
         )
       : []
-    const tools = admitExtensionTools(
-      [...baseTools, ...agentTools],
+    const nativeTools = [...baseTools, ...agentTools]
+    const codeOnlyNames = new Set(this.#codeOnlyTools.map(tool => tool.name))
+    const collision = nativeTools.find(tool => codeOnlyNames.has(tool.name))
+    if (collision) throw new Error(`Code-only tool ${collision.name} conflicts with an existing session tool`)
+
+    const reservedNames = new Set([...nativeTools, ...this.#codeOnlyTools].map(tool => tool.name))
+    const directTools = admitExtensionTools(
+      nativeTools,
       this.#extensionHost,
-      this.#extensionToolSelection.active
+      this.#extensionToolSelection.active,
+      reservedNames
     )
-    const codeTool = this.#codeMode?.createTool(tools)
-    if (!codeTool) this.#agent.state.tools = [...tools]
+    const codeTools = Object.freeze([...directTools, ...this.#codeOnlyTools])
+    const codeTool = this.#codeMode?.createTool(codeTools)
+    if (!codeTool) this.#agent.state.tools = [...directTools]
     else if (this.#toolSurface === "code-only") this.#agent.state.tools = [codeTool]
-    else this.#agent.state.tools = [...tools, codeTool]
+    else this.#agent.state.tools = [...directTools, codeTool]
     this.#agent.state.systemPrompt = buildSystemPrompt(
       this.sessionManager.header.cwd,
       this.#resources,
-      tools,
+      codeTools,
       this.#toolSurface
     )
   }
@@ -1983,11 +2099,13 @@ export class AgentSession {
     }
     this.#agent.abort()
     this.#unbindExtensionCatalog?.()
+    this.#unsubscribeMcp?.()
     const processOwners = (async (): Promise<void> => {
       try {
         await settleAll([
           this.#codeMode?.dispose() ?? Promise.resolve(),
           this.#agentTeam?.owned ? this.#agentTeam.team.shutdown() : Promise.resolve(),
+          this.#disposeMcp(),
           this.#disposeExtensions(reason),
           this.#shell?.dispose() ?? Promise.resolve()
         ])
@@ -2029,6 +2147,56 @@ export class AgentSession {
       default:
         return assertNever(state)
     }
+  }
+
+  #mcpSettlement(): Promise<void> {
+    const state = this.#mcpLifecycle
+    switch (state.type) {
+      case "absent":
+      case "unbound":
+        return Promise.resolve()
+      case "started":
+      case "failed":
+        return state.host.waitForIdle()
+      case "starting":
+      case "disposing":
+      case "disposed":
+        return state.settled
+      default:
+        return assertNever(state)
+    }
+  }
+
+  #disposeMcp(): Promise<void> {
+    const state = this.#mcpLifecycle
+    if (state.type === "absent") {
+      const settled = Promise.resolve()
+      this.#mcpLifecycle = { type: "disposed", settled }
+      return settled
+    }
+    if (state.type === "disposing" || state.type === "disposed") return state.settled
+
+    const operation = createSettlement()
+    const disposing: McpLifecycleState = { type: "disposing", host: state.host, settled: operation.promise }
+    this.#mcpLifecycle = disposing
+    void state.host
+      .dispose()
+      .then(
+        () => {
+          operation.resolve()
+          return undefined
+        },
+        cause => {
+          operation.reject(cause)
+          return undefined
+        }
+      )
+      .finally(() => {
+        if (this.#mcpLifecycle === disposing) {
+          this.#mcpLifecycle = { type: "disposed", settled: operation.promise }
+        }
+      })
+    return operation.promise
   }
 
   #disposeExtensions(reason: ExtensionShutdownReason): Promise<void> {

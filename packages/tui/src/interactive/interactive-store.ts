@@ -268,6 +268,7 @@ export function transitionInteractiveState(state: InteractiveState, event: Agent
     case "turn_start":
     case "turn_end":
     case "entry_appended":
+    case "mcp_server_changed":
       break
     default:
       assertNever(event)

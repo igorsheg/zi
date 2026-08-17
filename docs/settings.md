@@ -76,6 +76,26 @@ Paths in global settings resolve relative to `$HOME/.zi/agent/`. Paths in projec
 
 Each array accepts at most 128 file or directory paths, with each path bounded at 4096 bytes, keeping resource discovery bounded no matter what a repository adds.
 
+## MCP servers
+
+Use the `mcpServers` map to admit stdio or Streamable HTTP servers by configured name:
+
+```json
+{
+  "mcpServers": {
+    "github": {
+      "transport": "stdio",
+      "command": ["npx", "-y", "@modelcontextprotocol/server-github"],
+      "environmentFrom": ["GITHUB_TOKEN"]
+    }
+  }
+}
+```
+
+A project definition replaces the complete global definition with the same name; fields do not deep-merge. Set the higher-scope entry to `{ "enabled": false }` to disable that name without copying its lower-scope connection details.
+
+MCP configuration is executable and follows project trust. See [Use MCP tools without loading every schema](mcp.md) for transport fields, secret resolution, Code Mode calls, recovery, reload, and the capability limits.
+
 ## Fields
 
 `defaultProvider`
@@ -131,6 +151,9 @@ Each array accepts at most 128 file or directory paths, with each path bounded a
 
 `prompts`
 : Additional prompt-template files or directories.
+
+`mcpServers`
+: Named stdio and Streamable HTTP server definitions deferred behind Code Mode. Global and trusted project maps replace complete definitions by name.
 
 A changed `agentTurnTimeoutMs` applies to new sessions, not the running one. See [Agents](subagents.md) for turn admission, timeout evidence, and bounded interruption settlement.
 

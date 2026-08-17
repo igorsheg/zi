@@ -15,6 +15,8 @@ import { applyCodexRequestSettings } from "./codex-settings.js"
 import type { FileCredentialStore } from "./credential-store.js"
 import { DEFAULT_THINKING_LEVEL } from "./defaults.js"
 import type { ExtensionHost } from "./extensions/host.js"
+import type { McpLoadPlan } from "./mcp/config.js"
+import type { McpHost } from "./mcp/host.js"
 import { convertToLlm, type AgentMessage } from "./messages.js"
 import type { ModelRegistry } from "./model-registry.js"
 import { findInitialModel, restoreModelFromSession } from "./model-resolver.js"
@@ -96,6 +98,16 @@ export type AgentSessionProcessTree =
   | { readonly type: "owned"; readonly tracker: ProcessTreeTracker }
   | { readonly type: "borrowed"; readonly tracker: ProcessTreeTracker }
 
+export interface AgentSessionInternals {
+  readonly codeOnlyTools?: readonly AgentTool[]
+  readonly mcp?: {
+    readonly host: McpHost
+    readonly plan: McpLoadPlan
+    readonly environment: Readonly<Record<string, string | undefined>>
+    readonly platform: NodeJS.Platform
+  }
+}
+
 /** Build one session from caller-owned services. The caller owns the returned session's disposal. */
 export function createAgentSession(options: CreateAgentSessionOptions): Promise<CreateAgentSessionResult> {
   return createAgentSessionWithProcessTreeTracker(options, { type: "owned", tracker: createProcessTreeTracker() })
@@ -103,10 +115,13 @@ export function createAgentSession(options: CreateAgentSessionOptions): Promise<
 
 export async function createAgentSessionWithProcessTreeTracker(
   options: CreateAgentSessionOptions,
-  processTree: AgentSessionProcessTree
+  processTree: AgentSessionProcessTree,
+  internals?: AgentSessionInternals
 ): Promise<CreateAgentSessionResult> {
   const { services, sessionManager } = options
+  const codeOnlyTools = Object.freeze([...(internals?.codeOnlyTools ?? [])])
   if (options.toolSurface && !options.codeMode) throw new Error("Tool surface selection requires Code Mode")
+  if (codeOnlyTools.length > 0 && !options.codeMode) throw new Error("Code-only tools require Code Mode")
   const invariantRegistry = new InvariantRegistry(options.invariants)
   const toolSurface = options.codeMode ? snapshotToolSurface(options.toolSurface ?? "direct-and-code") : undefined
   const resources = options.resources ? createSessionResources(options.resources) : await services.resourceLoader.load()
@@ -230,6 +245,17 @@ export async function createAgentSessionWithProcessTreeTracker(
       resources,
       projectFileSearch: new ProjectFileSearch(services.paths),
       tools: sessionTools,
+      codeOnlyTools,
+      ...(internals?.mcp
+        ? {
+            mcp: Object.freeze({
+              host: internals.mcp.host,
+              plan: internals.mcp.plan,
+              environment: internals.mcp.environment,
+              platform: internals.mcp.platform
+            })
+          }
+        : {}),
       toolSurface,
       reload,
       invariantRegistry,

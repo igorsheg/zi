@@ -151,6 +151,12 @@ export async function runCli(argv: readonly string[], host: CliHost): Promise<nu
         )
       }
     }
+    for (const snapshot of runtime.session.mcpHostSnapshot ?? []) {
+      if (snapshot.status !== "failed" && snapshot.status !== "backoff") continue
+      // Keep MCP diagnostics ordered without contaminating JSON or RPC stdout.
+      // oxlint-disable-next-line no-await-in-loop
+      await host.writeStderr(`Warning: (MCP ${diagnosticLine(snapshot.name)}) ${diagnosticLine(snapshot.message)}\n`)
+    }
     const bootstrapDiagnostic = runtime.bootstrapDiagnostic
     if (mode !== "interactive" && bootstrapDiagnostic && bootstrapDiagnostic.type !== "no_model") {
       await host.writeStderr(`Warning: ${bootstrapDiagnostic.message}\n`)

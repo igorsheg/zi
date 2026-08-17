@@ -7,6 +7,7 @@ import { runCodeModeAcceptance } from "./code-mode-acceptance.js"
 import { compileZi } from "./compile-zi.js"
 import { copyDistributionDocumentation } from "./distribution-documentation.js"
 import { runExtensionCustomToolAcceptance } from "./extension-custom-tool-acceptance.js"
+import { runMcpCompiledAcceptance } from "./mcp-compiled-acceptance.js"
 import { runSubagentCompiledAcceptance } from "./subagent-compiled-acceptance.js"
 
 export const releaseTargets = ["darwin-arm64", "darwin-x64", "linux-arm64", "linux-x64", "windows-x64"] as const
@@ -92,6 +93,7 @@ async function buildRelease(options: ReleaseBuildOptions): Promise<void> {
       durableExtensionSource: join(packageDirectory, "examples", "extensions", "durable-counter", "index.ts")
     })
     await runCodeModeAcceptance({ executable, cwd: packageDirectory })
+    await runMcpCompiledAcceptance({ executable })
     await runSubagentCompiledAcceptance({ executable })
     await run(["tar", "-czf", archive, "-C", outputDirectory, packageName], {
       cwd: root,

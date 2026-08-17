@@ -33,6 +33,8 @@ export type {
 export * from "./extensions/discovery.js"
 export * from "./model-registry.js"
 export * from "./model-resolver.js"
+export type { McpReloadResult, McpServerSnapshot } from "./mcp/host.js"
+export type { McpServerConfig, McpServersConfig, McpTransport } from "./mcp/config.js"
 export * from "./paths.js"
 export * from "./print-mode.js"
 export * from "./project-file-search.js"

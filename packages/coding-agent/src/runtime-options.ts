@@ -3,6 +3,7 @@ import type { CredentialStore, Models } from "@earendil-works/pi-ai"
 import type { ExtensionMode } from "@with-zi/extension-api"
 
 import { maxExplicitExtensionPaths } from "./extensions/discovery.js"
+import { snapshotMcpServersConfig } from "./mcp/config.js"
 import type { ProjectTrustDecision } from "./project-trust.js"
 import { maxConfiguredResourcePaths, type AgentSettings } from "./settings-manager.js"
 import { snapshotToolSurface, type ToolSurface } from "./tool-surface.js"
@@ -66,7 +67,8 @@ function snapshotSettings(settings: Readonly<Partial<AgentSettings>>): Readonly<
       : { skills: snapshotStrings(settings.skills, maxConfiguredResourcePaths, "Skill settings paths") }),
     ...(settings.prompts === undefined
       ? {}
-      : { prompts: snapshotStrings(settings.prompts, maxConfiguredResourcePaths, "Prompt settings paths") })
+      : { prompts: snapshotStrings(settings.prompts, maxConfiguredResourcePaths, "Prompt settings paths") }),
+    ...(settings.mcpServers === undefined ? {} : { mcpServers: snapshotMcpServersConfig(settings.mcpServers) })
   })
 }
 

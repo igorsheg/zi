@@ -374,6 +374,39 @@ test("headless startup reports source-attributed extension diagnostics on stderr
   ])
 })
 
+test("JSON startup reports ordered MCP failures on stderr without contaminating stdout", async () => {
+  const models = createModels()
+  const faux = fauxProvider()
+  models.setProvider(faux.provider)
+  faux.setResponses([fauxAssistantMessage("done")])
+  const output: string[] = []
+  const errors: string[] = []
+  const host = testHost({
+    output,
+    errors,
+    async createRuntime(options) {
+      const runtime = await createTestAgentRuntime({ ...options, models })
+      Object.defineProperty(runtime.session, "mcpHostSnapshot", {
+        configurable: true,
+        value: [
+          { name: "alpha", transport: "streamable-http", status: "failed", message: "connection failed" },
+          { name: "beta", transport: "stdio", status: "failed", message: "process exited" }
+        ]
+      })
+      return runtime
+    }
+  })
+
+  const exitCode = await runCli(
+    ["--mode", "json", "--model", `${faux.getModel().provider}/${faux.getModel().id}`, "start"],
+    host
+  )
+
+  expect(exitCode).toBe(0)
+  expect(output.every(line => line.endsWith("\n") && JSON.parse(line) !== undefined)).toBe(true)
+  expect(errors).toEqual(["Warning: (MCP alpha) connection failed\n", "Warning: (MCP beta) process exited\n"])
+})
+
 test("headless startup reports excluded project configuration without contaminating stdout", async () => {
   const models = createModels()
   const faux = fauxProvider()

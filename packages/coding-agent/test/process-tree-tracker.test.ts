@@ -363,6 +363,27 @@ test("scan failure fans one cause across capacity and reclaims every scope", asy
   await tracker.dispose()
 })
 
+test("the existing process workload plus four MCP stdio scopes fits and the next scope is rejected", async () => {
+  const rows = Array.from({ length: maxTrackedProcessScopes }, (_, index) => ({
+    pid: 1_000 + index,
+    ppid: 1,
+    pgid: 1_000 + index,
+    startIdentity: `worker-${index}`
+  }))
+  const tracker = new PosixProcessTreeTracker(
+    () => Promise.resolve(rows),
+    60_000,
+    () => true,
+    () => Promise.resolve()
+  )
+
+  const scopes = rows.map(row => tracker.track(row.pid))
+  expect(scopes).toHaveLength(24)
+  expect(() => tracker.track(2_000)).toThrow("Process-tree scope capacity exceeded (maximum 24)")
+  await Promise.all(scopes.map(scope => scope.admitted))
+  await tracker.dispose()
+})
+
 test("disposal during scan recovery cannot reopen the tracker", async () => {
   const failure = new Error("scan unavailable")
   let disposal: Promise<void> | undefined

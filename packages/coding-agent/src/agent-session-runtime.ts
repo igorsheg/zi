@@ -248,7 +248,7 @@ export class AgentSessionRuntime {
     }
 
     try {
-      next.session.assertExtensionLifecycleUnbound()
+      next.session.assertLifecycleUnbound()
     } catch (cause) {
       await this.#discard(next, discardFile, reason)
       if (isOperation(this.#readState(), operationId)) this.#transition({ type: "ready", current })
@@ -280,7 +280,26 @@ export class AgentSessionRuntime {
       throw new Error("Session replacement was superseded")
     }
 
-    await next.session.startExtensionLifecycle(reason)
+    try {
+      await next.session.activate(reason)
+    } catch (cause) {
+      await this.#discard(next, discardFile, reason)
+      const failed = this.#readState()
+      if (isOperation(failed, operationId)) {
+        const terminal = settleAll([
+          Promise.reject(cause),
+          this.#cleanupSettlement(),
+          this.#sessionListTail,
+          this.#retired,
+          next.session.waitForIdle()
+        ])
+        this.#transition({ type: "disposed", settled: terminal })
+        void terminal.catch(() => {})
+      }
+      operation.resolve()
+      if (failed.type === "disposed") throw new Error("AgentSessionRuntime is disposed", { cause })
+      throw cause
+    }
     const activated = this.#readState()
     if (activated.type === "disposed") {
       operation.resolve()
@@ -378,7 +397,7 @@ export async function createAgentSessionRuntime(
   const snapshot = snapshotAgentRuntimeOptions(options)
   const initial = await createRuntime(snapshot)
   try {
-    await initial.session.startExtensionLifecycle("startup")
+    await initial.session.activate("startup")
     return new AgentSessionRuntime(initial, snapshot, createRuntime)
   } catch (cause) {
     initial.session.dispose()

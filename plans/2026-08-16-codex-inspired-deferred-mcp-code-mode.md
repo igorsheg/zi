@@ -290,7 +290,6 @@ type McpServerState =
       readonly type: "backoff"
       readonly generation: number
       readonly plan: McpResolvedServer
-      readonly previousCatalog: readonly McpToolDescriptor[]
       readonly attempt: number
       readonly retryAt: number
       readonly timer: ReturnType<typeof setTimeout>
@@ -323,7 +322,7 @@ stopped                          -> starting | disabled
 
 A completion may commit only when its configured name, generation, and operation ID still match the authoritative record. Stale connect, refresh, close, timer, progress, and call completions are ignored after releasing resources they created.
 
-`backoff.previousCatalog` supports comparison and diagnostics but is not searchable or callable. A disconnected server is unavailable immediately; Zi does not leave callable tools registered merely to preserve cache shape.
+A backoff generation releases its catalog before scheduling recovery, so disconnected servers cannot multiply retained catalog memory. The server is unavailable immediately; Zi does not leave callable tools registered merely to preserve cache shape.
 
 ## Startup, reload, and reconnection
 
@@ -331,7 +330,7 @@ A completion may commit only when its configured name, generation, and operation
 
 Every connection generation creates a fresh SDK `Client`. Initialization awaits both the MCP handshake and the complete initial bounded `tools/list` catalog before entering `ready`. Notification handlers are installed before initial discovery so an early `tools/list_changed` schedules one serialized rerun rather than disappearing.
 
-Catalog and call operations use the public low-level `Client.request()` with the SDK's exported `ListToolsResultSchema` and `CallToolResultSchema`. Zi intentionally does not use the `listTools()` and `callTool()` conveniences in SDK 1.30.0 because they cache tool metadata and compile advertised output schemas. Low-level requests preserve protocol-shape validation without importing remote domain schemas into a second validation owner.
+Catalog and call operations use the public method-keyed `Client.request()` API. Zi intentionally does not use the `listTools()` and `callTool()` conveniences because they cache tool metadata and compile advertised output schemas. The v2 client resolves protocol result validation from the method while low-level requests avoid importing remote domain schemas into a second validation owner.
 
 `McpHost.reload(plan)` runs only through the idle `AgentSession.reload()` operation:
 
@@ -350,7 +349,7 @@ Backoff creates fresh clients. Timers are unref'd, one timer belongs to one serv
 
 ## Transport ownership
 
-Zi depends on an exact catalog-pinned `@modelcontextprotocol/sdk` version, initially `1.30.0`. The SDK owns MCP protocol types, client negotiation, Streamable HTTP behavior, and exported result-schema validation. Zi does not implement a second JSON-RPC client.
+Zi depends on exact catalog-pinned `@modelcontextprotocol/client` `2.0.0`. The split v2 client owns MCP protocol types, negotiation, Streamable HTTP behavior, and method-keyed result validation. Its public reconnection scheduler and per-request abort hooks let Zi own timer bounds without private fields or a global `fetch` patch; Zi does not implement a second JSON-RPC client.
 
 The SDK's standard stdio transport manages its immediate child with bounded TERM/KILL escalation, but that child and its descendants remain outside Zi's `ProcessTreeTracker` ownership. Zi therefore does not use it. `packages/coding-agent/src/mcp/stdio-transport.ts` implements the SDK `Transport` interface over `spawnOwnedProcess({ type: "raw" })`:
 
@@ -518,7 +517,7 @@ Diagnostics do not replace unconditional config validation, protocol validation,
 ## File-tree change
 
 ```diff
- package.json                                  # pin MCP SDK in the workspace catalog
+ package.json                                  # pin MCP client v2 in the workspace catalog
  packages/coding-agent/package.json            # add exact catalog dependency
  packages/coding-agent/src/
 +├── mcp/

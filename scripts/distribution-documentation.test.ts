@@ -24,6 +24,7 @@ test("distribution documentation ships self-customization guides and examples", 
       "extensions.md",
       "index.md",
       "json-events.md",
+      "mcp.md",
       "notifications.md",
       "prompts.md",
       "resources.md",
@@ -37,6 +38,7 @@ test("distribution documentation ships self-customization guides and examples", 
     expect(existsSync(join(destination, "docs", "index.md"))).toBe(true)
     expect(existsSync(join(destination, "docs", "code-mode.md"))).toBe(true)
     expect(existsSync(join(destination, "docs", "extensions.md"))).toBe(true)
+    expect(existsSync(join(destination, "docs", "mcp.md"))).toBe(true)
     expect(existsSync(join(destination, "docs", "notifications.md"))).toBe(true)
     expect(existsSync(join(destination, "docs", "prompts.md"))).toBe(true)
     expect(existsSync(join(destination, "docs", "skills.md"))).toBe(true)

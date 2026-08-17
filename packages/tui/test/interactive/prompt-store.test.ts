@@ -225,6 +225,7 @@ test("reload command awaits session reload, invalidates slash catalog, and repor
         diagnostics: [],
         omittedDiagnostics: 0
       },
+      mcp: undefined,
       settingsErrors: []
     }
   }
@@ -278,6 +279,7 @@ test("reload notice surfaces the first source-attributed diagnostic", async () =
       ],
       omittedDiagnostics: 2
     },
+    mcp: undefined,
     settingsErrors: []
   })
 
@@ -321,6 +323,7 @@ test("reload remaining count includes omitted extension diagnostics behind setti
       diagnostics: [],
       omittedDiagnostics: 2
     },
+    mcp: undefined,
     settingsErrors: [{ scope: "global", path: "/tmp/settings.json", error: new Error("invalid json") }]
   })
 
@@ -334,6 +337,43 @@ test("reload remaining count includes omitted extension diagnostics behind setti
         message: "Reloaded settings, resources, and extensions: /tmp/settings.json: invalid json (+2 more)"
       }
     ])
+  } finally {
+    mode.dispose()
+    session.dispose()
+  }
+})
+
+test("reload notice attributes MCP failures and refreshes the persistent MCP warning", async () => {
+  const session = await createSession("reload-mcp-diagnostics")
+  const mode = createInteractiveStore(session)
+  const notices = captureBuiltInNotices()
+  const prompt = createPromptStore(mode, new SlashController(), undefined, undefined, notices.actions)
+  Object.defineProperty(session, "mcpHostSnapshot", {
+    configurable: true,
+    value: [
+      { name: "alpha", transport: "streamable-http", status: "failed", message: "connection failed" },
+      { name: "beta", transport: "stdio", status: "failed", message: "process exited" }
+    ]
+  })
+  session.reload = async () => ({
+    resources: session.resources,
+    extensions: undefined,
+    mcp: {
+      failures: [
+        { name: "alpha", message: "connection failed" },
+        { name: "beta", message: "process exited" }
+      ]
+    },
+    settingsErrors: []
+  })
+
+  try {
+    expect(prompt.submit("/reload", "steer")).toBe(true)
+    await Bun.sleep(0)
+    expect(notices.reloads).toEqual([
+      { outcome: "warning", message: "Reloaded settings and resources: MCP alpha: connection failed (+1 more)" }
+    ])
+    expect(notices.mcps).toEqual(["MCP alpha: connection failed (1 additional MCP diagnostic)"])
   } finally {
     mode.dispose()
     session.dispose()
@@ -371,7 +411,7 @@ test("reload refuses while the session is streaming", async () => {
   let reloaded = false
   session.reload = async () => {
     reloaded = true
-    return { resources: session.resources, extensions: undefined, settingsErrors: [] }
+    return { resources: session.resources, extensions: undefined, mcp: undefined, settingsErrors: [] }
   }
 
   try {
@@ -841,9 +881,11 @@ function captureBuiltInNotices(): {
   readonly actions: BuiltInNoticeActions
   readonly prompt: PromptNotice[]
   readonly reloads: { readonly outcome: ReloadNoticeOutcome; readonly message: string }[]
+  readonly mcps: (string | undefined)[]
 } {
   const prompt: PromptNotice[] = []
   const reloads: { outcome: ReloadNoticeOutcome; message: string }[] = []
+  const mcps: (string | undefined)[] = []
   return {
     actions: {
       promptProgress: message => prompt.push({ type: "progress", message }),
@@ -853,10 +895,12 @@ function captureBuiltInNotices(): {
       clearPrompt: () => prompt.push({ type: "clear" }),
       backgroundTaskCapacityExceeded() {},
       reloadCompleted: (outcome, message) => reloads.push({ outcome, message }),
-      reloadFailed: message => reloads.push({ outcome: "error", message })
+      reloadFailed: message => reloads.push({ outcome: "error", message }),
+      setMcp: message => mcps.push(message)
     },
     prompt,
-    reloads
+    reloads,
+    mcps
   }
 }
 

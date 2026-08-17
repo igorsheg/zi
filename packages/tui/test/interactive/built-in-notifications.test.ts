@@ -29,6 +29,7 @@ test("built-in notifications own keyed passive outcomes and clear session state 
 
   presenter.setBootstrap("Saved model unavailable")
   presenter.setExtension("Extension bad.ts: Cannot find module")
+  presenter.setMcp("MCP remote: connection failed")
   presenter.setProjectTrust("Project configuration is disabled")
   presenter.copyFailed("Copy failed; the selection was preserved")
   presenter.copySucceeded()
@@ -40,12 +41,13 @@ test("built-in notifications own keyed passive outcomes and clear session state 
 
   expect(fixture.claim).toEqual({
     key: "zi.system",
-    capacity: 8,
+    capacity: 9,
     config: { name: false, icon: false, ttl: 5, priority: 20 }
   })
   expect(fixture.published).toEqual([
     persistentNotice("bootstrap", "Saved model unavailable"),
     persistentNotice("extensions", "Extension bad.ts: Cannot find module"),
+    persistentNotice("mcp", "MCP remote: connection failed"),
     persistentNotice("project-trust", "Project configuration is disabled"),
     finiteNotice("copy", "Copy failed; the selection was preserved", 3, 5, false),
     finiteNotice("copy", "Copied last assistant message to clipboard", 2, 4, false),
@@ -60,6 +62,7 @@ test("built-in notifications own keyed passive outcomes and clear session state 
   expect(fixture.removed).toEqual([
     "bootstrap",
     "extensions",
+    "mcp",
     "project-trust",
     "automatic-compaction",
     "copy",
@@ -72,7 +75,7 @@ test("built-in notifications own keyed passive outcomes and clear session state 
   expect(fixture.released).toBe(true)
   expect(fixture.producerDisposed).toBe(true)
   fixture.emitCompaction({ type: "failed", message: "stale" })
-  expect(fixture.published).toHaveLength(8)
+  expect(fixture.published).toHaveLength(9)
 })
 
 test("prompt notices replace one stable key with policy-specific lifetimes", () => {

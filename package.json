@@ -9,6 +9,7 @@
     "catalog": {
       "@earendil-works/pi-agent-core": "0.83.0",
       "@earendil-works/pi-ai": "0.83.0",
+      "@modelcontextprotocol/client": "2.0.0",
       "@opentui/core": "0.4.5",
       "@types/bun": "1.3.14",
       "entities": "7.0.1",

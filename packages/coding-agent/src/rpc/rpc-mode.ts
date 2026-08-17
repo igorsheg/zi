@@ -6,6 +6,7 @@ import type {
   CompactionStatus,
   ContextUsage
 } from "../agent-session.js"
+import type { McpServerSnapshot } from "../mcp/host.js"
 import type { AgentMessage } from "../messages.js"
 import type { AgentTeamEntry, CustomEntry, CustomMessageEntry, SessionEntry } from "../session-manager.js"
 import {
@@ -27,6 +28,8 @@ export const maxRpcInFlightOperations = 32
 export const maxRpcPendingOutputRecords = 1024
 export const maxRpcPendingOutputBytes = 32 * 1024 * 1024
 export const rpcModeSettlementTimeoutMs = 5_000
+
+const emptyMcpSnapshot: readonly McpServerSnapshot[] = Object.freeze([])
 
 export interface RpcWriter {
   write(chunk: string): void | Promise<void>
@@ -74,6 +77,7 @@ export interface RpcSessionState {
   readonly followUpMode: AgentSession["followUpMode"]
   readonly queuedInputs: QueuedInputs
   readonly workPlan: AgentSession["workPlan"]
+  readonly mcp: readonly McpServerSnapshot[]
   readonly messageCount: number
   readonly streamingMessage?: AgentMessage
   readonly compaction: CompactionStatus
@@ -101,7 +105,7 @@ export type RpcSessionEntry =
   | CustomMessageEntry
 
 export type RpcSessionEvent =
-  | Exclude<AgentSessionEvent, { type: "model_changed" | "entry_appended" }>
+  | Exclude<AgentSessionEvent, { type: "model_changed" | "entry_appended" | "mcp_server_changed" }>
   | { readonly type: "model_changed"; readonly model: RpcModel }
   | { readonly type: "entry_appended"; readonly entry: RpcSessionEntry }
 
@@ -113,6 +117,7 @@ interface RpcFrameBase {
 export type RpcServerFrame =
   | (RpcFrameBase & { readonly type: "ready"; readonly state: RpcSessionState })
   | (RpcFrameBase & { readonly type: "session_event"; readonly event: RpcSessionEvent })
+  | (RpcFrameBase & { readonly type: "mcp_status"; readonly mcp: readonly McpServerSnapshot[] })
   | (RpcFrameBase & {
       readonly type: "protocol_error"
       readonly code: RpcProtocolErrorCode | "invalid_framing"
@@ -159,6 +164,7 @@ type ConnectionState =
 type FrameBody =
   | { readonly type: "ready"; readonly state: RpcSessionState }
   | { readonly type: "session_event"; readonly event: RpcSessionEvent }
+  | { readonly type: "mcp_status"; readonly mcp: readonly McpServerSnapshot[] }
   | {
       readonly type: "protocol_error"
       readonly code: RpcProtocolErrorCode | "invalid_framing"
@@ -230,7 +236,11 @@ export async function runRpcMode(session: AgentSession, transport: RpcModeTransp
       }
     }
     if (state.type === "open" && eventMode !== "none") {
-      send({ type: "session_event", event: projectEvent(event) }, eventMode === "activity")
+      if (event.type === "mcp_server_changed") {
+        send({ type: "mcp_status", mcp: session.mcpHostSnapshot ?? emptyMcpSnapshot }, eventMode === "activity")
+      } else {
+        send({ type: "session_event", event: projectEvent(event) }, eventMode === "activity")
+      }
     }
   })
   const removeAbort = listenForAbort(transport.signal, () => stop({ type: "cancelled" }))
@@ -549,6 +559,7 @@ function sessionState(session: AgentSession): RpcSessionState {
     followUpMode: session.followUpMode,
     queuedInputs: session.queuedInputs,
     workPlan: session.workPlan,
+    mcp: session.mcpHostSnapshot ?? emptyMcpSnapshot,
     messageCount: session.messages.length,
     ...(streamingMessage ? { streamingMessage } : {}),
     compaction,
@@ -634,7 +645,7 @@ function clipUtf8(
   return { text: encoded.subarray(0, end).toString("utf8"), originalBytes, omittedBytes: originalBytes - end }
 }
 
-function projectEvent(event: AgentSessionEvent): RpcSessionEvent {
+function projectEvent(event: Exclude<AgentSessionEvent, { type: "mcp_server_changed" }>): RpcSessionEvent {
   if (event.type === "model_changed") return { type: "model_changed", model: projectModel(event.model) }
   return event
 }

@@ -123,7 +123,8 @@ const unavailableNotices: BuiltInNoticeActions = {
   clearPrompt() {},
   backgroundTaskCapacityExceeded() {},
   reloadCompleted() {},
-  reloadFailed() {}
+  reloadFailed() {},
+  setMcp() {}
 }
 
 export interface PromptMessageCopy {
@@ -986,6 +987,7 @@ class PromptController implements PromptStore {
       const outcome = reloadNoticeOutcome(result)
       const message = reloadNoticeMessage(result)
       this.$state.set({ ...this.$state.get(), workflow: { type: "idle" } })
+      this.#notices.setMcp(mcpWarning(session.mcpHostSnapshot))
       this.#notices.reloadCompleted(outcome, message)
     }
     void reload()
@@ -1917,6 +1919,9 @@ function firstReloadDiagnostic(result: SessionReloadResult): string | undefined 
     return formatReloadDiagnostic(resourceDiagnosticPath(resource), resourceDiagnosticMessage(resource), remaining)
   }
 
+  const mcp = result.mcp?.failures[0]
+  if (mcp) return formatReloadDiagnostic(`MCP ${mcp.name}`, mcp.message, remaining)
+
   const omitted = result.extensions?.omittedDiagnostics ?? 0
   if (omitted > 0) return `${omitted} omitted extension diagnostic${omitted === 1 ? "" : "s"}`
   return undefined
@@ -1928,8 +1933,18 @@ function reloadDiagnosticRemaining(result: SessionReloadResult): number {
     result.settingsErrors.length +
     result.resources.diagnostics.length +
     (result.extensions?.diagnostics.length ?? 0) +
-    (result.extensions?.omittedDiagnostics ?? 0)
+    (result.extensions?.omittedDiagnostics ?? 0) +
+    (result.mcp?.failures.length ?? 0)
   return Math.max(0, total - 1)
+}
+
+function mcpWarning(snapshots: AgentSession["mcpHostSnapshot"]): string | undefined {
+  const failures = (snapshots ?? []).filter(snapshot => snapshot.status === "failed" || snapshot.status === "backoff")
+  const first = failures[0]
+  if (!first) return undefined
+  const omitted = failures.length - 1
+  const suffix = omitted > 0 ? ` (${omitted} additional MCP diagnostic${omitted === 1 ? "" : "s"})` : ""
+  return `MCP ${first.name}: ${first.message.replace(/[\r\n]+/g, " ")}${suffix}`
 }
 
 function formatReloadDiagnostic(source: string | undefined, message: string, remaining: number): string {
