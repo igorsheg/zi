@@ -6,7 +6,8 @@ import {
   truncateToCells,
   wrapHeadToCells,
   wrapTailToCells,
-  wrapToCells
+  wrapToCells,
+  wrapWordsToCells
 } from "../src/components/cell-text.js"
 
 test("bounded cell wrapping preserves the corresponding full-wrap edges", () => {
@@ -15,6 +16,12 @@ test("bounded cell wrapping preserves the corresponding full-wrap edges", () => 
   expect(all).toEqual(["a界", "b界", "c"])
   expect(wrapHeadToCells(text, 3, 2)).toEqual({ lines: all.slice(0, 2), hasMore: true })
   expect(wrapTailToCells(text, 3, 2)).toEqual({ lines: all.slice(-2), hasMore: true })
+})
+
+test("word wrapping preserves whole words and bounds oversized tokens", () => {
+  expect(wrapWordsToCells("Implement the narrow terminal", 12)).toEqual(["Implement", "the narrow", "terminal"])
+  expect(wrapWordsToCells("extraordinary", 5)).toEqual(["extra", "ordin", "ary"])
+  expect(wrapWordsToCells("界面 remains readable", 10)).toEqual(["界面", "remains", "readable"])
 })
 
 test("native cell measurement and truncation count tabs as two cells", () => {

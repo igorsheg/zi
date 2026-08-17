@@ -286,6 +286,10 @@ export class TranscriptView {
     return this.#toolViews.size
   }
 
+  setWorkPlanStatusAvailable(available: boolean): void {
+    this.#status.setWorkPlanAvailable(available)
+  }
+
   suspendPresentation(): void {
     this.#presentationSuspended = true
   }

@@ -28,8 +28,6 @@ export type PromptKeyAction =
   | "exit"
   | "consume"
 
-export type WorkspaceKeyAction = "focus_left" | "focus_down" | "focus_up" | "focus_right" | "close" | "primary"
-
 export type TranscriptKeyAction = "page_up" | "page_down" | "line_up" | "line_down" | "tail" | "toggle_tools"
 
 export interface PromptKeyContext {
@@ -84,15 +82,13 @@ const defaultBindingEntries = [
   ["tui.select.confirm", ["return"], "Confirm selection", "reserved"],
   ["tui.select.cancel", ["escape", "ctrl+c"], "Cancel selection", "reserved"],
   ["app.tools.expand", ["ctrl+o"], "Expand or collapse tool details", "overridable"],
-  ["app.plan.toggle", ["ctrl+p"], "Open or close the work plan pane", "overridable"],
+  ["app.plan.toggle", ["ctrl+p"], "Open or close the work plan", "overridable"],
+  ["app.plan.close", ["escape"], "Close the work plan", "overridable"],
   ["app.transcript.pageUp", ["pageup"], "Scroll transcript up half a page", "overridable"],
   ["app.transcript.pageDown", ["pagedown"], "Scroll transcript down half a page", "overridable"],
   ["app.transcript.lineUp", ["ctrl+alt+up"], "Scroll transcript up one line", "overridable"],
   ["app.transcript.lineDown", ["ctrl+alt+down"], "Scroll transcript down one line", "overridable"],
   ["app.transcript.tail", ["ctrl+end"], "Jump to the transcript tail", "overridable"],
-  ["app.workspace.prefix", ["ctrl+w"], "Start a workspace focus command", "overridable"],
-  ["app.workspace.close", ["q"], "Close the active read-only pane", "overridable"],
-  ["app.workspace.primary", ["escape"], "Return to the primary pane", "overridable"],
   ["app.agentTranscript.return", ["escape"], "Return from an agent transcript", "reserved"]
 ] as const
 
@@ -205,29 +201,6 @@ export class InteractiveKeybindings {
     return undefined
   }
 
-  workspaceContextAction(event: InteractiveKeyEvent, readOnlyPaneActive: boolean): WorkspaceKeyAction | undefined {
-    if (!readOnlyPaneActive) return undefined
-    if (this.matches(event, "app.workspace.primary")) return "primary"
-    if (this.matches(event, "app.workspace.close")) return "close"
-    return undefined
-  }
-
-  workspaceChordAction(event: InteractiveKeyEvent): WorkspaceKeyAction | undefined {
-    if (event.ctrl || event.meta || event.option || event.shift || event.super || event.hyper) return undefined
-    switch (normalizeName(event.name)) {
-      case "h":
-        return "focus_left"
-      case "j":
-        return "focus_down"
-      case "k":
-        return "focus_up"
-      case "l":
-        return "focus_right"
-      default:
-        return undefined
-    }
-  }
-
   transcriptAction(event: InteractiveKeyEvent): TranscriptKeyAction | undefined {
     if (this.matches(event, "app.tools.expand")) return "toggle_tools"
     if (this.matches(event, "app.transcript.pageUp")) return "page_up"
@@ -240,6 +213,10 @@ export class InteractiveKeybindings {
 
   togglesWorkPlan(event: InteractiveKeyEvent): boolean {
     return this.matches(event, "app.plan.toggle") && !this.#hasCompetingBinding(event, "app.plan.toggle")
+  }
+
+  closesWorkPlan(event: InteractiveKeyEvent): boolean {
+    return this.matches(event, "app.plan.close")
   }
 
   #hasCompetingBinding(event: InteractiveKeyEvent, id: InteractiveKeybinding): boolean {

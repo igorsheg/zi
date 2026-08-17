@@ -62,16 +62,8 @@ test("interactive keybindings resolve semantic prompt and transcript actions", (
   expect(keybindings.togglesWorkPlan(key("p", { ctrl: true }))).toBe(true)
   expect(keybindings.togglesWorkPlan(key("p", { meta: true }))).toBe(false)
 
-  expect(keybindings.workspaceContextAction(key("escape"), true)).toBe("primary")
-  expect(keybindings.workspaceContextAction(key("q"), true)).toBe("close")
-  expect(keybindings.workspaceContextAction(key("q"), false)).toBeUndefined()
-  expect(keybindings.matches(key("w", { ctrl: true }), "app.workspace.prefix")).toBe(true)
-  expect(keybindings.workspaceChordAction(key("h"))).toBe("focus_left")
-  expect(keybindings.workspaceChordAction(key("j"))).toBe("focus_down")
-  expect(keybindings.workspaceChordAction(key("k"))).toBe("focus_up")
-  expect(keybindings.workspaceChordAction(key("l"))).toBe("focus_right")
-  expect(keybindings.workspaceChordAction(key("right"))).toBeUndefined()
-  expect(keybindings.workspaceChordAction(key("q"))).toBeUndefined()
+  expect(keybindings.closesWorkPlan(key("escape"))).toBe(true)
+  expect(keybindings.closesWorkPlan(key("q"))).toBe(false)
 })
 
 test("interactive keybinding overrides rebind and disable semantic actions per mode", () => {
@@ -81,8 +73,7 @@ test("interactive keybinding overrides rebind and disable semantic actions per m
     "app.editor.external": ["ctrl+e"],
     "app.editor.undo": ["ctrl+u"],
     "app.plan.toggle": ["ctrl+y"],
-    "app.workspace.prefix": ["ctrl+b"],
-    "app.workspace.close": [],
+    "app.plan.close": ["ctrl+b"],
     "tui.input.historyPrevious": ["ctrl+p"],
     "tui.input.historyNext": []
   })
@@ -100,9 +91,8 @@ test("interactive keybinding overrides rebind and disable semantic actions per m
   expect(keybindings.promptAction(key("down"), context())).toBeUndefined()
   expect(keybindings.togglesWorkPlan(key("p", { ctrl: true }))).toBe(false)
   expect(keybindings.togglesWorkPlan(key("y", { ctrl: true }))).toBe(true)
-  expect(keybindings.matches(key("w", { ctrl: true }), "app.workspace.prefix")).toBe(false)
-  expect(keybindings.matches(key("b", { ctrl: true }), "app.workspace.prefix")).toBe(true)
-  expect(keybindings.workspaceContextAction(key("q"), true)).toBeUndefined()
+  expect(keybindings.closesWorkPlan(key("escape"))).toBe(false)
+  expect(keybindings.closesWorkPlan(key("b", { ctrl: true }))).toBe(true)
   expect(keybindings.getKeys("app.clear")).toEqual(["ctrl+x"])
   expect(() => new InteractiveKeybindings({ "app.clear": ["wat+ctrl+x"] })).toThrow("Unknown key modifier")
 })
@@ -130,7 +120,7 @@ test("interactive keybindings expose resolved metadata for help and future short
   expect(keybindings.getHint("app.selection.copy")).toBe(process.platform === "darwin" ? "Cmd+C" : "Ctrl+C")
   expect(keybindings.getHint("app.tools.expand")).toBe("Ctrl+O")
   expect(keybindings.getHint("app.plan.toggle")).toBe("Ctrl+P")
-  expect(keybindings.getHint("app.workspace.prefix")).toBe("Ctrl+W")
+  expect(keybindings.getHint("app.plan.close")).toBe("Esc")
   expect(keybindings.getHint("app.editor.external")).toBe("Ctrl+G")
   expect(keybindings.getHint("app.editor.undo")).toBe("Ctrl+Z")
   expect(keybindings.getHint("app.message.interruptAndSend")).toBe("Ctrl+Enter")

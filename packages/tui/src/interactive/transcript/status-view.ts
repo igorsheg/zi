@@ -56,6 +56,7 @@ export class TranscriptStatusView {
   #presentation: TranscriptStatusPresentation = emptyPresentation
   #width = 0
   #available = true
+  #workPlanAvailable = true
 
   constructor(renderer: CliRenderer, keybindings: InteractiveKeybindings, theme: Theme) {
     this.root = new BoxRenderable(renderer, { id: "transcript-status", flexDirection: "column", flexShrink: 0 })
@@ -124,6 +125,12 @@ export class TranscriptStatusView {
     this.#render()
   }
 
+  setWorkPlanAvailable(available: boolean): void {
+    if (available === this.#workPlanAvailable) return
+    this.#workPlanAvailable = available
+    this.#render()
+  }
+
   destroy(): void {
     this.#working.destroy()
     this.root.destroyRecursively()
@@ -154,7 +161,11 @@ export class TranscriptStatusView {
     const priorityWidth = activityWidth + unseenWidth + backgroundWidth
     const fixedPlanWidth =
       priorityWidth + textWidth(planLabel) + textWidth(planProgress) + (priorityWidth > 0 && plan !== undefined ? 3 : 0)
-    const showPlan = this.#available && plan !== undefined && (fixedPlanWidth <= this.#width || priorityWidth === 0)
+    const showPlan =
+      this.#available &&
+      this.#workPlanAvailable &&
+      plan !== undefined &&
+      (fixedPlanWidth <= this.#width || priorityWidth === 0)
     const planWidth = showPlan ? textWidth(planLabel) + textWidth(planProgress) + (priorityWidth > 0 ? 3 : 0) : 0
     const backgroundText =
       presentation.background.type === "running"

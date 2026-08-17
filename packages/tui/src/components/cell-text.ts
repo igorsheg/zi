@@ -64,6 +64,37 @@ export function wrapToCells(text: string, maxWidth: number): string[] {
   return [...wrappedLines(text, maxWidth)]
 }
 
+export function wrapWordsToCells(text: string, maxWidth: number): string[] {
+  if (maxWidth <= 0) return []
+  const content = text.trim()
+  if (!content) return [""]
+
+  const lines: string[] = []
+  let line = ""
+  let whitespace = ""
+  for (const token of content.match(/\S+|\s+/gu) ?? []) {
+    if (/^\s+$/u.test(token)) {
+      if (line) whitespace += token
+      continue
+    }
+
+    const candidate = line ? `${line}${whitespace}${token}` : token
+    if (line && textWidth(candidate) <= maxWidth) {
+      line = candidate
+      whitespace = ""
+      continue
+    }
+    if (line) lines.push(line)
+
+    const wrapped = wrapToCells(token, maxWidth)
+    lines.push(...wrapped.slice(0, -1))
+    line = wrapped.at(-1) ?? ""
+    whitespace = ""
+  }
+  if (line) lines.push(line)
+  return lines
+}
+
 export function wrapHeadToCells(text: string, maxWidth: number, maxLines: number): CellLineWindow {
   if (maxLines <= 0) {
     const iterator = wrappedLines(text, maxWidth)

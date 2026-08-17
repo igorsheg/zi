@@ -39,7 +39,6 @@ import {
 } from "./notifications.js"
 import type { PromptSessionActions } from "./prompt/store.js"
 import { SessionScreen } from "./screen.js"
-import { SessionWorkspace } from "./session-workspace.js"
 import { SlashController } from "./slash-controller.js"
 import type { TranscriptDiagnostics } from "./transcript/view.js"
 
@@ -87,7 +86,6 @@ export class InteractiveMode {
   readonly #builtInNotifications: BuiltInNotificationPresenter
   #initialProjectTrust = createInitialProjectTrustState()
   #screen: SessionScreen
-  #workspace: SessionWorkspace
   #inspector: AgentTranscriptInspector
   #releaseGeneration: () => void
   #disposed = false
@@ -184,23 +182,13 @@ export class InteractiveMode {
       notifications.dispose()
       throw cause
     }
-    let workspace: SessionWorkspace
-    try {
-      workspace = new SessionWorkspace(renderer, this.store, this.#keybindings, screen, theme, this.#syntaxStyle)
-    } catch (cause) {
-      screen.destroy()
-      builtInNotifications.dispose()
-      notifications.dispose()
-      throw cause
-    }
     let inspector: AgentTranscriptInspector
     try {
-      inspector = this.#createInspector(workspace)
-      this.root.add(workspace.root)
+      inspector = this.#createInspector(screen)
+      this.root.add(screen.root)
       this.root.add(inspector.root)
       notifications.attach(screen.transcript.notificationHost)
     } catch (cause) {
-      workspace.destroy()
       screen.destroy()
       builtInNotifications.dispose()
       notifications.dispose()
@@ -210,7 +198,6 @@ export class InteractiveMode {
     this.notifications = notifications
     this.#builtInNotifications = builtInNotifications
     this.#screen = screen
-    this.#workspace = workspace
     this.#inspector = inspector
     this.#diagnostics =
       diagnostics.showTimeToFirstDraw || diagnostics.showStats || diagnostics.showMemory
@@ -273,7 +260,6 @@ export class InteractiveMode {
     this.#builtInNotifications.dispose()
     this.#notifications.dispose()
     this.#inspector.dispose()
-    this.#workspace.destroy()
     this.#screen.destroy()
     this.#externalEditor.dispose()
     this.#browserOpener.dispose()
@@ -283,7 +269,7 @@ export class InteractiveMode {
   }
 
   #preservePromptFocus = (): void => {
-    this.#workspace.preserveFocus()
+    this.#screen.preserveFocus()
   }
 
   #showBootstrapWarning(diagnostic: SessionBootstrapDiagnostic | undefined): void {
@@ -359,19 +345,10 @@ export class InteractiveMode {
     this.#clipboardCopy.cancel()
     this.#notifications.detach()
     this.#inspector.dispose()
-    this.#workspace.destroy()
     this.#screen.destroy()
     this.#screen = this.#createScreen(this.#builtInNotifications)
-    this.#workspace = new SessionWorkspace(
-      this.#renderer,
-      this.store,
-      this.#keybindings,
-      this.#screen,
-      this.#theme,
-      this.#syntaxStyle
-    )
-    this.#inspector = this.#createInspector(this.#workspace)
-    this.root.add(this.#workspace.root)
+    this.#inspector = this.#createInspector(this.#screen)
+    this.root.add(this.#screen.root)
     this.root.add(this.#inspector.root)
     this.#notifications.attach(this.#screen.transcript.notificationHost)
     this.#screen.prompt.focus()
@@ -397,11 +374,11 @@ export class InteractiveMode {
     )
   }
 
-  #createInspector(workspace: SessionWorkspace): AgentTranscriptInspector {
+  #createInspector(screen: SessionScreen): AgentTranscriptInspector {
     return new AgentTranscriptInspector(
       this.#renderer,
       () => this.store.getSession(),
-      workspace,
+      screen,
       this.#keybindings,
       this.#theme,
       this.#syntaxStyle
