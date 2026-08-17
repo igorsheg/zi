@@ -2125,7 +2125,7 @@ export class AgentSession {
       this.#projectFileSearch.dispose(),
       catalogSettled,
       processOwners
-    ])
+    ]).finally(() => this.#invariantRegistry.dispose())
     this.#activity = { type: "disposed", settled }
     this.#unsubscribeAgent()
     this.#unsubscribeShell?.()
@@ -2133,7 +2133,6 @@ export class AgentSession {
     this.#unsubscribeAgentTeam?.()
     this.#listeners.clear()
     this.#agentSessionInvariant.dispose()
-    this.#invariantRegistry.dispose()
     cleanupSessionResources(this.sessionId)
     void settled.catch(() => {})
   }

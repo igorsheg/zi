@@ -1,3 +1,5 @@
+import type { InvariantRegistry } from "@with-zi/invariants"
+
 import type { AgentSessionEvent, CompactionStatus, RetryStatus } from "../agent-session.js"
 import type { AgentMessage } from "../messages.js"
 import type { ZiPaths } from "../paths.js"
@@ -5,6 +7,7 @@ import { createSessionFork } from "../session-fork.js"
 import { SessionManager, type CustomMessageEntry } from "../session-manager.js"
 import type { ShellTaskSnapshot } from "../session-shell.js"
 import type { WorkPlanSnapshot } from "../work-plan.js"
+import { AgentTeamInvariant, type AgentTeamTerminalSnapshot } from "./invariant.js"
 import { maxAgentRecords, replayAgentTeamJournal, type DurableAgentRecord, type SettledAgentStatus } from "./journal.js"
 import type { AgentMailInput, AgentMailPublication } from "./mail.js"
 import { childAgentPath, isAgentPathWithin, rootAgentPath, type AgentPath } from "./path.js"
@@ -61,6 +64,7 @@ export interface AgentTeamOptions {
   readonly paths: ZiPaths
   readonly rootSessionManager: SessionManager
   readonly createSession: CreateAgentTeamSession
+  readonly invariantRegistry: InvariantRegistry
   readonly turnTimeoutMs: number
   readonly shutdownTimeoutMs: number
 }
@@ -166,10 +170,12 @@ export class AgentTeam {
   readonly #paths: ZiPaths
   readonly #rootSessionManager: SessionManager
   readonly #createSession: CreateAgentTeamSession
+  readonly #invariant: AgentTeamInvariant
   readonly #turnTimeoutMs: number
   readonly #shutdownTimeoutMs: number
   readonly #records = new Map<AgentPath, AgentRecord>()
   readonly #reservedPaths = new Set<AgentPath>()
+  readonly #spawns = new Set<Promise<AgentSnapshot>>()
   readonly #settlements = new Set<Promise<void>>()
   readonly #listeners = new Set<(change: AgentTeamChange) => void>()
   #root: AgentTeamRoot | undefined
@@ -196,6 +202,7 @@ export class AgentTeam {
       }
       this.#records.set(metadata.path, { metadata, state: { type: "unloaded" }, tail: Promise.resolve() })
     }
+    this.#invariant = new AgentTeamInvariant(options.invariantRegistry)
   }
 
   static async create(options: AgentTeamOptions): Promise<AgentTeam> {
@@ -287,8 +294,15 @@ export class AgentTeam {
     return lease
   }
 
-  async spawn(request: SpawnAgentRequest): Promise<AgentSnapshot> {
+  spawn(request: SpawnAgentRequest): Promise<AgentSnapshot> {
     this.#assertOpen()
+    const operation = this.#performSpawn(request)
+    this.#spawns.add(operation)
+    void operation.finally(() => this.#spawns.delete(operation)).catch(() => {})
+    return operation
+  }
+
+  async #performSpawn(request: SpawnAgentRequest): Promise<AgentSnapshot> {
     const parentRecord = request.sender === rootAgentPath ? undefined : this.#requireRecord(request.sender)
     const parentManager =
       parentRecord === undefined ? this.#rootSessionManager : this.#residentSessionManager(parentRecord)
@@ -328,6 +342,7 @@ export class AgentTeam {
         forkTurns: request.spec.forkTurns,
         checkpoint
       })
+      this.#assertOpen()
       this.#rootSessionManager.appendAgentTeam({ type: "agent_spawn_committed", operationId })
       committed = true
       const restored = replayAgentTeamJournal(this.#rootSessionManager.agentTeamEntries()).records.get(path)
@@ -426,11 +441,12 @@ export class AgentTeam {
       if (completion.parentPath !== rootAgentPath) continue
       const input = completionMail(completion.path, rootAgentPath, completion.turn, completion.result)
       const admission = root.admitMail(input)
+      const targetEntryId = this.#acknowledgedEntryId(input, undefined, admission)
       this.#rootSessionManager.appendAgentTeam({
         type: "agent_completion_delivered",
         path: completion.path,
         turn: completion.turn,
-        targetEntryId: admission.entry.id
+        targetEntryId
       })
     }
   }
@@ -451,6 +467,7 @@ export class AgentTeam {
   async #performShutdown(): Promise<void> {
     let failure: unknown
     try {
+      await withTimeout(Promise.allSettled(this.#spawns), this.#shutdownTimeoutMs)
       await withTimeout(
         Promise.all(
           [...this.#records.values()].map(record =>
@@ -477,9 +494,24 @@ export class AgentTeam {
     const disposals = await Promise.allSettled([...this.#records.values()].map(record => this.#disposeRecord(record)))
     const disposalFailure = disposals.find(outcome => outcome.status === "rejected")
     if (disposalFailure?.status === "rejected") failure ??= disposalFailure.reason
-    const retainedOwner = [...this.#records.values()].some(record => record.state.type !== "unloaded")
-    this.#state = retainedOwner ? "stopping" : "closed"
-    if (failure) throw failure
+    const terminal = this.#terminalSnapshot()
+    const retainedRuntime =
+      terminal.reservations > 0 ||
+      terminal.spawnOperations > 0 ||
+      terminal.settlements > 0 ||
+      terminal.transientRecords > 0 ||
+      terminal.transcriptOpen
+    if (failure) {
+      this.#state = "stopping"
+      throw failure
+    }
+    if (retainedRuntime) {
+      this.#state = "stopping"
+      throw new Error("AgentTeam shutdown retained runtime work")
+    }
+    this.#invariant.shutdownSucceeded(terminal)
+    this.#invariant.dispose()
+    this.#state = "closed"
   }
 
   async #disposeRecord(record: AgentRecord): Promise<void> {
@@ -491,6 +523,10 @@ export class AgentTeam {
     }
 
     const owner = state.owner
+    if (state.type === "resident" && (state.turn.type === "running" || state.turn.type === "interrupting")) {
+      clearTimeout(state.turn.timeout)
+      this.#invariant.deadlineReleased(record.metadata.path, state.turn.turn)
+    }
     let settlement: Promise<void>
     try {
       settlement = owner.dispose()
@@ -598,9 +634,13 @@ export class AgentTeam {
       reserved = true
       const input: AgentMailInput = { deliveryId: mailId, sender, target: record.metadata.path, kind: "task", text }
       const admission = owner.startTurn(input, entry => {
-        this.#rootSessionManager.appendAgentTeam({ type: "agent_turn_started", operationId, inputEntryId: entry.id })
+        const inputEntryId = entry.id
+        this.#invariant.turnStarted(input, entry, inputEntryId)
+        this.#rootSessionManager.appendAgentTeam({ type: "agent_turn_started", operationId, inputEntryId })
       })
+      this.#invariant.deadlineScheduled(record.metadata.path, turn)
       const timeout = setTimeout(() => {
+        this.#invariant.deadlineReleased(record.metadata.path, turn)
         void this.#withRecord(record, async () => {
           if (
             record.state.type !== "resident" ||
@@ -673,6 +713,7 @@ export class AgentTeam {
     applied: ReturnType<typeof deferred<void>>,
     attempt: number
   ): Promise<void> {
+    let settlementCommitted = false
     try {
       await this.#withRecord(record, async () => {
         const state = record.state
@@ -692,14 +733,16 @@ export class AgentTeam {
           turn,
           result
         })
+        settlementCommitted = true
         clearTimeout(state.turn.timeout)
+        this.#invariant.deadlineReleased(record.metadata.path, turn)
         record.metadata = { ...record.metadata, nextTurn: turn + 1, status: result.status }
         record.state = { ...state, turn: { type: "idle" } }
         this.#publishChange([record.metadata.path])
         await this.#deliverCompletion(record, turn, result)
       })
     } catch (cause) {
-      if (attempt === 3) {
+      if (settlementCommitted || attempt === 3) {
         this.#state = "stopping"
         applied.reject(cause)
         throw cause
@@ -733,21 +776,32 @@ export class AgentTeam {
 
   async #deliverCompletion(record: AgentRecord, turn: number, result: AgentTurnResult): Promise<void> {
     const target = record.metadata.parentPath
+    const input = completionMail(record.metadata.path, target, turn, result)
+    const parent = target === rootAgentPath ? undefined : this.#requireRecord(target)
+    const publication = parent?.state.type === "resident" && parent.state.turn.type !== "idle" ? "boundary" : "append"
+    let admission: AgentTeamMailAdmission | undefined
     try {
-      const input = completionMail(record.metadata.path, target, turn, result)
-      const parent = target === rootAgentPath ? undefined : this.#requireRecord(target)
-      const admission =
+      admission =
         target === rootAgentPath
           ? this.#root?.admitMail(input)
           : parent?.state.type === "resident"
-            ? parent.state.owner.admitMail(input, parent.state.turn.type === "idle" ? "append" : "boundary")
+            ? parent.state.owner.admitMail(input, publication)
             : undefined
-      if (!admission) return
+    } catch {
+      return
+    }
+    if (!admission) return
+    const targetEntryId = this.#acknowledgedEntryId(
+      input,
+      target === rootAgentPath ? undefined : publication,
+      admission
+    )
+    try {
       this.#rootSessionManager.appendAgentTeam({
         type: "agent_completion_delivered",
         path: record.metadata.path,
         turn,
-        targetEntryId: admission.entry.id
+        targetEntryId
       })
     } catch {
       // The durable settlement remains pending until the direct parent is resident again.
@@ -758,15 +812,14 @@ export class AgentTeam {
     const restored = replayAgentTeamJournal(this.#rootSessionManager.agentTeamEntries())
     for (const completion of restored.pendingCompletions.values()) {
       if (completion.parentPath !== record.metadata.path) continue
-      const admission = owner.admitMail(
-        completionMail(completion.path, record.metadata.path, completion.turn, completion.result),
-        "append"
-      )
+      const input = completionMail(completion.path, record.metadata.path, completion.turn, completion.result)
+      const admission = owner.admitMail(input, "append")
+      const targetEntryId = this.#acknowledgedEntryId(input, "append", admission)
       this.#rootSessionManager.appendAgentTeam({
         type: "agent_completion_delivered",
         path: completion.path,
         turn: completion.turn,
-        targetEntryId: admission.entry.id
+        targetEntryId
       })
     }
   }
@@ -787,26 +840,24 @@ export class AgentTeam {
 
   #deliverRootMail(root: AgentTeamRoot, mail: AgentMailInput): void {
     const admission = root.admitMail(mail)
-    this.#rootSessionManager.appendAgentTeam({
-      type: "agent_mail_delivered",
-      mailId: mail.deliveryId,
-      targetEntryId: admission.entry.id
-    })
+    const targetEntryId = this.#acknowledgedEntryId(mail, undefined, admission)
+    this.#rootSessionManager.appendAgentTeam({ type: "agent_mail_delivered", mailId: mail.deliveryId, targetEntryId })
   }
 
   async #retryPendingMail(record: AgentRecord, owner: AgentTeamSessionOwner): Promise<void> {
     const restored = replayAgentTeamJournal(this.#rootSessionManager.agentTeamEntries())
     for (const mail of restored.pendingMail.values()) {
       if (mail.target !== record.metadata.path) continue
-      const admission = owner.admitMail(
-        { deliveryId: mail.mailId, sender: mail.sender, target: mail.target, kind: mail.kind, text: mail.text },
-        "append"
-      )
-      this.#rootSessionManager.appendAgentTeam({
-        type: "agent_mail_delivered",
-        mailId: mail.mailId,
-        targetEntryId: admission.entry.id
-      })
+      const input: AgentMailInput = {
+        deliveryId: mail.mailId,
+        sender: mail.sender,
+        target: mail.target,
+        kind: mail.kind,
+        text: mail.text
+      }
+      const admission = owner.admitMail(input, "append")
+      const targetEntryId = this.#acknowledgedEntryId(input, "append", admission)
+      this.#rootSessionManager.appendAgentTeam({ type: "agent_mail_delivered", mailId: mail.mailId, targetEntryId })
     }
   }
 
@@ -837,14 +888,35 @@ export class AgentTeam {
     const publication: AgentMailPublication =
       record.state.type === "resident" && record.state.turn.type !== "idle" ? "boundary" : "append"
     const admission = owner.admitMail(mail, publication)
+    const targetEntryId = this.#acknowledgedEntryId(mail, publication, admission)
     try {
-      this.#rootSessionManager.appendAgentTeam({
-        type: "agent_mail_delivered",
-        mailId: mail.deliveryId,
-        targetEntryId: admission.entry.id
-      })
+      this.#rootSessionManager.appendAgentTeam({ type: "agent_mail_delivered", mailId: mail.deliveryId, targetEntryId })
     } catch {
       // Target admission is durable; restoration can acknowledge the still-pending root mail.
+    }
+  }
+
+  #acknowledgedEntryId(
+    input: AgentMailInput,
+    expectedPublication: AgentMailPublication | undefined,
+    admission: AgentTeamMailAdmission
+  ): string {
+    const targetEntryId = admission.entry.id
+    this.#invariant.mailDelivered(input, expectedPublication, admission.entry, admission.publication, targetEntryId)
+    return targetEntryId
+  }
+
+  #terminalSnapshot(): AgentTeamTerminalSnapshot {
+    let transientRecords = 0
+    for (const record of this.#records.values()) {
+      if (record.state.type !== "unloaded") transientRecords++
+    }
+    return {
+      reservations: this.#reservedPaths.size,
+      spawnOperations: this.#spawns.size,
+      settlements: this.#settlements.size,
+      transientRecords,
+      transcriptOpen: this.#transcriptLease !== undefined
     }
   }
 

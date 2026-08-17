@@ -173,6 +173,7 @@ export async function createAgentSessionWithProcessTreeTracker(
           paths: services.paths,
           rootSessionManager: sessionManager,
           createSession: membership.createChildSession,
+          invariantRegistry,
           turnTimeoutMs: settings.agentTurnTimeoutMs,
           shutdownTimeoutMs: 9_000
         })

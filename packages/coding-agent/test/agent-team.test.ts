@@ -3,6 +3,8 @@ import { mkdtemp, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
+import { InvariantError, InvariantRegistry } from "@with-zi/invariants"
+
 import type { AgentSessionEvent } from "../src/agent-session.js"
 import {
   AgentTeam,
@@ -140,6 +142,21 @@ class RootMailbox implements AgentTeamRoot {
   }
 }
 
+class MismatchedCompletionMailbox implements AgentTeamRoot {
+  readonly sessionId: string
+
+  constructor(readonly manager: SessionManager) {
+    this.sessionId = manager.sessionId
+  }
+
+  admitMail(input: AgentMailInput) {
+    const entry = this.manager.appendCriticalCustomMessage(
+      agentMailMessage({ ...input, text: `${input.text}:mismatch` })
+    )
+    return { entry, duplicate: false, publication: "append" as const }
+  }
+}
+
 test("AgentTeam commits spawn and turn evidence before one passive completion", async () => {
   const root = await mkdtemp(join(tmpdir(), "zi-agent-team-"))
   const paths = new ZiPaths(join(root, "project"), join(root, "agent"))
@@ -148,6 +165,7 @@ test("AgentTeam commits spawn and turn evidence before one passive completion", 
     rootManager.appendMessage({ role: "user", content: "parent context", timestamp: 1 })
     const owners: ControlledSession[] = []
     const team = await AgentTeam.create({
+      invariantRegistry: new InvariantRegistry(),
       paths,
       rootSessionManager: rootManager,
       createSession: request => {
@@ -258,6 +276,39 @@ test("AgentTeam commits spawn and turn evidence before one passive completion", 
   }
 })
 
+test("AgentTeam attributes completion invariant failure after durable turn settlement", async () => {
+  const manager = SessionManager.inMemory("/work", "root-session")
+  const owners: ControlledSession[] = []
+  const team = await AgentTeam.create({
+    invariantRegistry: new InvariantRegistry(),
+    paths: new ZiPaths("/work", "/agent"),
+    rootSessionManager: manager,
+    createSession: request => {
+      const owner = new ControlledSession(request.sessionManager)
+      owners.push(owner)
+      return Promise.resolve(owner)
+    },
+    turnTimeoutMs: 10_000,
+    shutdownTimeoutMs: 1_000
+  })
+  await team.bindRoot(new MismatchedCompletionMailbox(manager))
+  await team.spawn({ sender: rootAgentPath, taskName: "research", message: "inspect", spec: spawnSpec("none") })
+
+  owners[0]!.settle(completed("result"))
+  let settlementError: unknown
+  try {
+    await team.waitForIdle(research)
+  } catch (cause) {
+    settlementError = cause
+  }
+
+  expect(settlementError).toBeInstanceOf(InvariantError)
+  expect(team.state).toBe("stopping")
+  expect(manager.agentTeamEntries().filter(entry => entry.type === "agent_turn_settled")).toHaveLength(1)
+  expect(manager.agentTeamEntries().some(entry => entry.type === "agent_completion_delivered")).toBe(false)
+  await team.shutdown()
+})
+
 test("AgentTeam transcript lease reads one durable child without residency and follows its live handoff", async () => {
   const root = await mkdtemp(join(tmpdir(), "zi-agent-team-transcript-"))
   const paths = new ZiPaths(join(root, "project"), join(root, "agent"))
@@ -266,6 +317,7 @@ test("AgentTeam transcript lease reads one durable child without residency and f
     manager.appendMessage({ role: "user", content: "parent context", timestamp: 1 })
     const owners: ControlledSession[] = []
     const team = await AgentTeam.create({
+      invariantRegistry: new InvariantRegistry(),
       paths,
       rootSessionManager: manager,
       createSession: request => {
@@ -371,6 +423,7 @@ test("AgentTeam transcript lease handles recursive interrupted memory agents and
   const manager = SessionManager.inMemory("/work", "root-session")
   const owners: ControlledSession[] = []
   const team = await AgentTeam.create({
+    invariantRegistry: new InvariantRegistry(),
     paths: new ZiPaths("/work", "/agent"),
     rootSessionManager: manager,
     createSession: request => {
@@ -416,6 +469,7 @@ test("AgentTeam transcript lease reports a missing durable child journal", async
     const manager = SessionManager.create(paths, { sessionId: "root-session" })
     const owners: ControlledSession[] = []
     const team = await AgentTeam.create({
+      invariantRegistry: new InvariantRegistry(),
       paths,
       rootSessionManager: manager,
       createSession: request => {
@@ -449,6 +503,7 @@ test("AgentTeam routes recursive completion to the direct parent", async () => {
   manager.appendMessage({ role: "user", content: "parent context", timestamp: 1 })
   const owners: ControlledSession[] = []
   const team = await AgentTeam.create({
+    invariantRegistry: new InvariantRegistry(),
     paths: new ZiPaths("/work", "/agent"),
     rootSessionManager: manager,
     createSession: request => {
@@ -488,6 +543,7 @@ test("AgentTeam retains recursive completion until an unloaded parent is restore
   const manager = SessionManager.inMemory("/work", "root-session")
   const owners: ControlledSession[] = []
   const team = await AgentTeam.create({
+    invariantRegistry: new InvariantRegistry(),
     paths: new ZiPaths("/work", "/agent"),
     rootSessionManager: manager,
     createSession: request => {
@@ -531,6 +587,7 @@ test("AgentTeam restores a durable child unloaded and follows up in the same jou
     rootManager.appendMessage(assistant("parent answer"))
     const firstOwners: ControlledSession[] = []
     const first = await AgentTeam.create({
+      invariantRegistry: new InvariantRegistry(),
       paths,
       rootSessionManager: rootManager,
       createSession: request => {
@@ -551,6 +608,7 @@ test("AgentTeam restores a durable child unloaded and follows up in the same jou
     const restoredRoot = SessionManager.open(rootManager.file!)
     const restoredOwners: ControlledSession[] = []
     const second = await AgentTeam.create({
+      invariantRegistry: new InvariantRegistry(),
       paths,
       rootSessionManager: restoredRoot,
       createSession: request => {
@@ -605,6 +663,7 @@ test("AgentTeam queues idle mail without starting a turn and joins a running fol
     const manager = SessionManager.inMemory(paths.cwd, "root-session")
     const owners: ControlledSession[] = []
     const team = await AgentTeam.create({
+      invariantRegistry: new InvariantRegistry(),
       paths,
       rootSessionManager: manager,
       createSession: request => {
@@ -652,6 +711,7 @@ test("AgentTeam rejects a fourth active turn across recursive branches before du
     rootManager.appendMessage({ role: "user", content: "parent context", timestamp: 1 })
     const owners = new Map<string, ControlledSession>()
     const team = await AgentTeam.create({
+      invariantRegistry: new InvariantRegistry(),
       paths,
       rootSessionManager: rootManager,
       createSession: request => {
@@ -697,6 +757,7 @@ test("AgentTeam evicts settled children before admitting later residency", async
     const manager = SessionManager.inMemory(paths.cwd, "root-session")
     const owners: ControlledSession[] = []
     const team = await AgentTeam.create({
+      invariantRegistry: new InvariantRegistry(),
       paths,
       rootSessionManager: manager,
       createSession: request => {
@@ -759,6 +820,7 @@ test("AgentTeam recovers an unclosed turn as interrupted and delivers it after r
     manager.appendAgentTeam({ type: "agent_turn_started", operationId: "turn", inputEntryId: "child-input" })
 
     const team = await AgentTeam.create({
+      invariantRegistry: new InvariantRegistry(),
       paths,
       rootSessionManager: manager,
       createSession: () => Promise.reject(new Error("must stay unloaded")),
@@ -784,6 +846,43 @@ test("AgentTeam recovers an unclosed turn as interrupted and delivers it after r
   }
 })
 
+test("AgentTeam shutdown prevents an in-flight spawn from publishing after closure", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zi-agent-team-spawn-shutdown-"))
+  const paths = new ZiPaths(join(root, "project"), join(root, "agent"))
+  try {
+    const manager = SessionManager.create(paths, { sessionId: "root-session" })
+    const team = await AgentTeam.create({
+      invariantRegistry: new InvariantRegistry(),
+      paths,
+      rootSessionManager: manager,
+      createSession: request => Promise.resolve(new ControlledSession(request.sessionManager)),
+      turnTimeoutMs: 10_000,
+      shutdownTimeoutMs: 1_000
+    })
+    await team.bindRoot(new RootMailbox(manager))
+
+    const spawn = team.spawn({
+      sender: rootAgentPath,
+      taskName: "research",
+      message: "race shutdown",
+      spec: spawnSpec("none")
+    })
+    await team.shutdown()
+
+    let spawnError: unknown
+    try {
+      await spawn
+    } catch (cause) {
+      spawnError = cause
+    }
+    expect(String(spawnError)).toContain("AgentTeam is stopping")
+    expect(team.state).toBe("closed")
+    expect(team.snapshots()).toEqual([])
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 test("AgentTeam shutdown interrupts running turns and disposes only resident child owners", async () => {
   const root = await mkdtemp(join(tmpdir(), "zi-agent-team-shutdown-"))
   const paths = new ZiPaths(join(root, "project"), join(root, "agent"))
@@ -791,6 +890,7 @@ test("AgentTeam shutdown interrupts running turns and disposes only resident chi
     const manager = SessionManager.inMemory(paths.cwd, "root-session")
     let owner: ControlledSession | undefined
     const team = await AgentTeam.create({
+      invariantRegistry: new InvariantRegistry(),
       paths,
       rootSessionManager: manager,
       createSession: request => {
@@ -812,10 +912,11 @@ test("AgentTeam shutdown interrupts running turns and disposes only resident chi
   }
 })
 
-test("AgentTeam bounds shutdown when interruption never settles and still disposes the owner", async () => {
+test("AgentTeam bounds shutdown without reporting closed while turn settlement remains pending", async () => {
   const manager = SessionManager.inMemory("/work", "root-session")
   let owner: HangingInterruptSession | undefined
   const team = await AgentTeam.create({
+    invariantRegistry: new InvariantRegistry(),
     paths: new ZiPaths("/work", "/agent"),
     rootSessionManager: manager,
     createSession: request => {
@@ -836,7 +937,7 @@ test("AgentTeam bounds shutdown when interruption never settles and still dispos
   }
   expect(String(shutdownError)).toContain("timed out")
   expect(owner?.disposed).toBe(true)
-  expect(team.state).toBe("closed")
+  expect(team.state).toBe("stopping")
 })
 
 function assistant(text: string) {
