@@ -10,37 +10,13 @@ const responses = @import("../ai/providers/openai_responses.zig");
 const agent_limits = @import("../agent/limits.zig");
 const AgentSession = @import("AgentSession.zig");
 const ModelConfig = @import("ModelConfig.zig");
+const model_resolution = @import("ModelResolution.zig");
 
 const AgentSessionRuntime = @This();
 const max_credentials = 32;
 
-pub const Credential = union(enum) {
-    api_key: ApiKey,
-    openai_codex: OpenAiCodex,
-
-    pub const ApiKey = struct {
-        provider_id: []const u8,
-        value: []const u8,
-    };
-
-    pub const OpenAiCodex = struct {
-        access_token: []const u8,
-        account_id: ?[]const u8 = null,
-    };
-
-    fn providerId(self: Credential) []const u8 {
-        return switch (self) {
-            .api_key => |credential| credential.provider_id,
-            .openai_codex => "openai-codex",
-        };
-    }
-};
-
-pub const Config = struct {
-    model_config: ModelConfig,
-    credentials: []const Credential,
-    selection: ai_model.ModelIdentity,
-};
+pub const Credential = model_resolution.Credential;
+pub const Config = model_resolution.RuntimeConfig;
 
 pub const Options = struct {
     limits: agent_limits.RunLimits = .{},
@@ -388,6 +364,7 @@ const test_catalog_entries = [_]ai_catalog.Entry{
     },
     .{
         .identity = .{ .provider = "openai", .model = "responses-runtime" },
+        .aliases = &.{"responses-latest"},
         .profile = test_responses_profile,
     },
     .{
@@ -579,21 +556,20 @@ test "OpenAI Responses runtime crosses the provider and protocol seams" {
     var fake = fake_api.FakeTransport.init(&exchanges);
     var inspector: ResponsesInspector = .{};
     fake.inspector = .{ .context = &inspector, .inspect_fn = ResponsesInspector.inspect };
-    const credentials = [_]Credential{.{ .api_key = .{
-        .provider_id = "openai",
-        .value = "responses-secret",
-    } }};
+    var resolved = try model_resolution.resolve(std.testing.allocator, .{
+        .model_config = test_model_config,
+        .requested_provider = "openai",
+        .requested_model = "responses-latest",
+        .cli_api_key = "responses-secret",
+    });
+    defer resolved.deinit();
 
     var runtime = try createWithTransport(
         std.testing.allocator,
         std.testing.io,
         temporary.dir,
         fake.transport(),
-        .{
-            .model_config = test_model_config,
-            .credentials = &credentials,
-            .selection = .{ .provider = "openai", .model = "responses-runtime" },
-        },
+        resolved.runtimeConfig(),
         .{},
     );
     defer runtime.deinit();
