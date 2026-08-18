@@ -1,4 +1,5 @@
 pub const AgentSession = @import("AgentSession.zig");
+pub const cli = @import("cli/root.zig");
 
 pub const Event = AgentSession.Event;
 pub const EventSink = AgentSession.EventSink;
@@ -10,4 +11,5 @@ pub const StreamSink = AgentSession.StreamSink;
 
 test {
     _ = AgentSession;
+    _ = cli;
 }
