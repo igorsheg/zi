@@ -10,6 +10,8 @@ const responses = @import("../ai/providers/openai_responses.zig");
 const agent_limits = @import("../agent/limits.zig");
 const AgentSession = @import("AgentSession.zig");
 const ModelConfig = @import("ModelConfig.zig");
+const ModelConfigSnapshot = @import("ModelConfigSnapshot.zig");
+const ZiPaths = @import("ZiPaths.zig");
 const model_resolution = @import("ModelResolution.zig");
 
 const AgentSessionRuntime = @This();
@@ -460,6 +462,31 @@ test "runtime owns catalog and provider configuration through a cwd-bound tool l
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();
     try temporary.dir.writeFile(std.testing.io, .{ .sub_path = "note.txt", .data = "runtime evidence" });
+    try temporary.dir.createDirPath(std.testing.io, ".zi/agent");
+    try temporary.dir.writeFile(std.testing.io, .{
+        .sub_path = ".zi/agent/models.json",
+        .data =
+        \\{
+        \\  "version": 1,
+        \\  "providers": [{
+        \\    "id": "runtime-openai",
+        \\    "name": "Runtime OpenAI",
+        \\    "base_url": "https://example.test/v1",
+        \\    "authentication": "api_key",
+        \\    "models": [{
+        \\      "id": "runtime-model",
+        \\      "aliases": ["runtime-latest"],
+        \\      "profile": {
+        \\        "capabilities": ["streaming", "tools", "parallel_tool_calls", "thinking"],
+        \\        "settings": ["temperature", "top_p", "max_output_tokens", "stop_sequences", "seed"],
+        \\        "context_window": 128000,
+        \\        "max_output_tokens": 16384
+        \\      }
+        \\    }]
+        \\  }]
+        \\}
+        ,
+    });
 
     const tool_response =
         // ziglint-ignore: Z024 -- compact provider wire fixture
@@ -476,59 +503,37 @@ test "runtime owns catalog and provider configuration through a cwd-bound tool l
     var inspector: CompatibleInspector = .{};
     fake.inspector = .{ .context = &inspector, .inspect_fn = CompatibleInspector.inspect };
 
-    const provider_id = try std.testing.allocator.dupe(u8, "runtime-openai");
-    defer std.testing.allocator.free(provider_id);
-    const model_id = try std.testing.allocator.dupe(u8, "runtime-latest");
-    defer std.testing.allocator.free(model_id);
-    const canonical_model_id = try std.testing.allocator.dupe(u8, "runtime-model");
-    defer std.testing.allocator.free(canonical_model_id);
-    const aliases = [_][]const u8{model_id};
-    var catalog_entries = test_catalog_entries;
-    catalog_entries[0].identity = .{ .provider = provider_id, .model = canonical_model_id };
-    catalog_entries[0].aliases = &aliases;
-    const caller_catalog: ai_catalog.Catalog = .{ .entries = &catalog_entries };
-    const base_url = try std.testing.allocator.dupe(u8, "https://example.test/v1");
-    defer std.testing.allocator.free(base_url);
-    const api_key = try std.testing.allocator.dupe(u8, "runtime-secret");
-    defer std.testing.allocator.free(api_key);
-    var provider_definitions = test_provider_definitions;
-    provider_definitions[0] = .{ .openai_completions = .{
-        .id = provider_id,
-        .name = "Runtime OpenAI",
-        .base_url = base_url,
-        .authentication = .api_key,
-    } };
-    const caller_model_config: ModelConfig = .{
-        .catalog = caller_catalog,
-        .providers = &provider_definitions,
-    };
-    const credentials = [_]Credential{
-        .{ .api_key = .{ .provider_id = provider_id, .value = api_key } },
-        .{ .api_key = .{ .provider_id = "openai", .value = "unused-responses-secret" } },
-        .{ .openai_codex = .{
-            .access_token = "unused-codex-secret",
-            .account_id = "unused-account",
-        } },
-    };
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_length = try temporary.dir.realPath(std.testing.io, &path_buffer);
+    var paths = try ZiPaths.init(
+        std.testing.allocator,
+        path_buffer[0..path_length],
+        path_buffer[0..path_length],
+    );
+    errdefer paths.deinit();
+    var snapshot = try ModelConfigSnapshot.load(std.testing.allocator, std.testing.io, &paths);
+    errdefer snapshot.deinit();
+    try std.testing.expect(snapshot.diagnostic() == null);
+    var resolved = try model_resolution.resolve(std.testing.allocator, .{
+        .model_config = snapshot.view(),
+        .requested_provider = "runtime-openai",
+        .requested_model = "runtime-latest",
+        .cli_api_key = "runtime-secret",
+    });
+    errdefer resolved.deinit();
 
     var runtime = try createWithTransport(
         std.testing.allocator,
         std.testing.io,
         temporary.dir,
         fake.transport(),
-        .{
-            .model_config = caller_model_config,
-            .credentials = &credentials,
-            .selection = .{ .provider = provider_id, .model = model_id },
-        },
+        resolved.runtimeConfig(),
         .{},
     );
     defer runtime.deinit();
-    @memset(provider_id, 'x');
-    @memset(model_id, 'x');
-    @memset(canonical_model_id, 'x');
-    @memset(base_url, 'x');
-    @memset(api_key, 'x');
+    resolved.deinit();
+    snapshot.deinit();
+    paths.deinit();
 
     const result = try runtime.session().prompt("read note.txt");
     try std.testing.expectEqualStrings("runtime complete", result);
