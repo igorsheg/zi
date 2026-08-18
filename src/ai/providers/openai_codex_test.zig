@@ -27,6 +27,9 @@ const Inspector = struct {
             return error.Rejected;
         }
         if (std.mem.indexOf(u8, request.body, "\"parallel_tool_calls\":true") == null) return error.Rejected;
+        if (std.mem.indexOf(u8, request.body, "\"instructions\":\"You are concise.\\nUse read.\"") == null) {
+            return error.Rejected;
+        }
         self.saw_request = true;
     }
 };
@@ -74,7 +77,7 @@ test "Codex Responses derives account identity and normalizes SSE" {
 
     var result = try provider.modelView().complete(std.testing.allocator, std.testing.io, .{
         .messages = &messages,
-        .instructions = &.{"You are concise."},
+        .instructions = &.{ "You are concise.", "Use read." },
         .settings = .{ .reasoning_effort = .medium },
     });
     defer result.deinit();

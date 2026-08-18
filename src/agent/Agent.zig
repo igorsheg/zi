@@ -74,6 +74,8 @@ pub const RunError = error{
 allocator: std.mem.Allocator,
 io: std.Io,
 model: ai_model.Model,
+/// Borrowed immutable policy; its storage must outlive the agent.
+instructions: []const []const u8,
 catalog: tool_api.Catalog,
 history: History,
 result_arena: std.heap.ArenaAllocator,
@@ -88,6 +90,7 @@ pub fn init(
     allocator: std.mem.Allocator,
     io: std.Io,
     model: ai_model.Model,
+    instructions: []const []const u8,
     tools: []const tool_api.Tool,
     limits: limit_api.RunLimits,
     events: ?EventSink,
@@ -99,6 +102,7 @@ pub fn init(
         .allocator = allocator,
         .io = io,
         .model = model,
+        .instructions = instructions,
         .catalog = catalog,
         .history = History.init(allocator),
         .result_arena = std.heap.ArenaAllocator.init(allocator),
@@ -466,6 +470,7 @@ fn invokeModel(
 ) RunError!ai_model.OwnedResponse {
     const request: ai_model.ModelRequest = .{
         .messages = self.history.messages(),
+        .instructions = self.instructions,
         .tools = tools,
         .deadline = control.deadline,
         .cancellation = control.cancellation,
@@ -594,26 +599,29 @@ const EventRecorder = struct {
     }
 };
 
-var second_request_valid = false;
+const SecondRequestRecorder = struct {
+    valid: bool = false,
 
-fn inspectRequest(index: usize, request: ai_model.ModelRequest) void {
-    if (index != 1 or request.messages.len != 3) return;
-    const result = request.messages[2].request.parts[0].tool_result;
-    second_request_valid = result.outcome == .success and
-        std.mem.eql(u8, result.call_id, "call-1") and
-        std.mem.eql(u8, result.name, "read") and
-        std.mem.eql(u8, result.content[0].text, "file contents");
-}
+    fn observe(context: *anyopaque, index: usize, request: ai_model.ModelRequest) void {
+        const self: *SecondRequestRecorder = @ptrCast(@alignCast(context));
+        if (index != 1 or request.messages.len != 3) return;
+        const result = request.messages[2].request.parts[0].tool_result;
+        self.valid = result.outcome == .success and
+            std.mem.eql(u8, result.call_id, "call-1") and
+            std.mem.eql(u8, result.name, "read") and
+            std.mem.eql(u8, result.content[0].text, "file contents");
+    }
+};
 
 test "agent executes a tool and returns final text with owned canonical history" {
-    second_request_valid = false;
+    var request_recorder: SecondRequestRecorder = .{};
     var scripted_model: ai_testing.ScriptedModel = .{
         .identity = .{ .provider = "script", .model = "agent" },
         .steps = &.{
             .{ .tool_call = .{ .id = "call-1", .name = "read", .arguments_json = "{\"path\":\"file\"}" } },
             .{ .text = "done" },
         },
-        .on_request = inspectRequest,
+        .request_observer = .{ .context = &request_recorder, .observeFn = SecondRequestRecorder.observe },
     };
     var scripted_tool: agent_testing.ScriptedTool = .{ .result = "file contents" };
     const definition: ai_message.ToolDefinition = .{
@@ -628,6 +636,7 @@ test "agent executes a tool and returns final text with owned canonical history"
         std.testing.allocator,
         std.testing.io,
         scripted_model.asModel(),
+        &.{},
         &.{tool},
         .{},
         .{ .context = &recorder, .emitFn = EventRecorder.emit },
@@ -640,7 +649,7 @@ test "agent executes a tool and returns final text with owned canonical history"
     try std.testing.expectEqual(@as(usize, 2), agent.modelRequests());
     try std.testing.expectEqual(@as(usize, 1), agent.toolCalls());
     try std.testing.expectEqual(@as(usize, 1), scripted_tool.calls);
-    try std.testing.expect(second_request_valid);
+    try std.testing.expect(request_recorder.valid);
     try std.testing.expectEqual(@as(usize, 4), agent.messages().len);
     try std.testing.expectEqualStrings("read the file.", agent.messages()[0].request.parts[0].user.text);
     try std.testing.expectEqualStrings("read", agent.messages()[1].response.parts[0].tool_call.name);
@@ -682,6 +691,7 @@ test "agent enforces model request and tool call limits before excess work" {
         std.testing.allocator,
         std.testing.io,
         scripted_model.asModel(),
+        &.{},
         &.{tool},
         .{ .max_tool_calls = 0 },
         null,
@@ -710,6 +720,7 @@ test "recoverable tool failure is returned to the model" {
         std.testing.allocator,
         std.testing.io,
         scripted_model.asModel(),
+        &.{},
         &.{tool},
         .{},
         null,
@@ -744,6 +755,7 @@ test "length-truncated tool calls are returned as failures without execution" {
         std.testing.allocator,
         std.testing.io,
         scripted_model.asModel(),
+        &.{},
         &.{tool},
         .{},
         null,
@@ -772,6 +784,7 @@ test "model request limit stops before another model operation" {
         std.testing.allocator,
         std.testing.io,
         scripted_model.asModel(),
+        &.{},
         &.{tool},
         .{ .max_model_requests = 1 },
         null,
@@ -798,6 +811,7 @@ test "oversized tool result is not committed" {
         std.testing.allocator,
         std.testing.io,
         scripted_model.asModel(),
+        &.{},
         &.{tool},
         .{ .max_tool_result_bytes = 4 },
         null,
@@ -823,6 +837,7 @@ test "fatal tool cancellation is terminal cancellation" {
         std.testing.allocator,
         std.testing.io,
         scripted_model.asModel(),
+        &.{},
         &.{tool},
         .{},
         null,
@@ -848,6 +863,7 @@ test "fatal tool timeout and allocation failure are terminal failures" {
             std.testing.allocator,
             std.testing.io,
             scripted_model.asModel(),
+            &.{},
             &.{tool},
             .{},
             null,
@@ -858,22 +874,25 @@ test "fatal tool timeout and allocation failure are terminal failures" {
     }
 }
 
-var multi_first_request_valid = false;
-var multi_second_request_valid = false;
+const MultiTurnRecorder = struct {
+    first_valid: bool = false,
+    second_valid: bool = false,
 
-fn inspectMultiTurn(index: usize, request: ai_model.ModelRequest) void {
-    switch (index) {
-        1 => multi_first_request_valid = request.messages.len == 3 and
-            std.mem.eql(u8, request.messages[0].request.parts[0].user.text, "first question") and
-            std.mem.eql(u8, request.messages[1].response.parts[0].text.text, "first answer") and
-            std.mem.eql(u8, request.messages[2].request.parts[0].user.text, "second question"),
-        2 => multi_second_request_valid = request.messages.len == 5 and
-            std.mem.eql(u8, request.messages[3].response.parts[0].tool_call.name, "read") and
-            request.messages[4].request.parts[0].tool_result.outcome == .success and
-            std.mem.eql(u8, request.messages[4].request.parts[0].tool_result.content[0].text, "contents"),
-        else => {},
+    fn observe(context: *anyopaque, index: usize, request: ai_model.ModelRequest) void {
+        const self: *MultiTurnRecorder = @ptrCast(@alignCast(context));
+        switch (index) {
+            1 => self.first_valid = request.messages.len == 3 and
+                std.mem.eql(u8, request.messages[0].request.parts[0].user.text, "first question") and
+                std.mem.eql(u8, request.messages[1].response.parts[0].text.text, "first answer") and
+                std.mem.eql(u8, request.messages[2].request.parts[0].user.text, "second question"),
+            2 => self.second_valid = request.messages.len == 5 and
+                std.mem.eql(u8, request.messages[3].response.parts[0].tool_call.name, "read") and
+                request.messages[4].request.parts[0].tool_result.outcome == .success and
+                std.mem.eql(u8, request.messages[4].request.parts[0].tool_result.content[0].text, "contents"),
+            else => {},
+        }
     }
-}
+};
 
 test "agent completes one turn with owned canonical messages" {
     var scripted_model: ai_testing.ScriptedModel = .{
@@ -884,6 +903,7 @@ test "agent completes one turn with owned canonical messages" {
         std.testing.allocator,
         std.testing.io,
         scripted_model.asModel(),
+        &.{},
         &.{},
         .{},
         null,
@@ -901,8 +921,7 @@ test "agent completes one turn with owned canonical messages" {
 }
 
 test "agent reuses completed turns and resets run limits" {
-    multi_first_request_valid = false;
-    multi_second_request_valid = false;
+    var request_recorder: MultiTurnRecorder = .{};
     var scripted_model: ai_testing.ScriptedModel = .{
         .identity = .{ .provider = "script", .model = "multi-turn" },
         .steps = &.{
@@ -910,7 +929,7 @@ test "agent reuses completed turns and resets run limits" {
             .{ .tool_call = .{ .id = "call-1", .name = "read", .arguments_json = "{\"path\":\"a\"}" } },
             .{ .text = "second answer" },
         },
-        .on_request = inspectMultiTurn,
+        .request_observer = .{ .context = &request_recorder, .observeFn = MultiTurnRecorder.observe },
     };
     var scripted_tool: agent_testing.ScriptedTool = .{ .result = "contents" };
     const tool = scripted_tool.asTool(.{
@@ -922,6 +941,7 @@ test "agent reuses completed turns and resets run limits" {
         std.testing.allocator,
         std.testing.io,
         scripted_model.asModel(),
+        &.{},
         &.{tool},
         .{ .max_model_requests = 2 },
         null,
@@ -944,8 +964,8 @@ test "agent reuses completed turns and resets run limits" {
         try std.testing.expectEqual(@as(usize, 2), agent.modelRequests());
         try std.testing.expectEqual(@as(usize, 1), agent.toolCalls());
         try std.testing.expectEqual(@as(usize, 1), scripted_tool.calls);
-        try std.testing.expect(multi_first_request_valid);
-        try std.testing.expect(multi_second_request_valid);
+        try std.testing.expect(request_recorder.first_valid);
+        try std.testing.expect(request_recorder.second_valid);
         try std.testing.expectEqual(@as(usize, 6), agent.messages().len);
         try std.testing.expectEqualStrings("first question", agent.messages()[0].request.parts[0].user.text);
         try std.testing.expectEqualStrings("first answer", agent.messages()[1].response.parts[0].text.text);
@@ -968,6 +988,7 @@ test "completed turns accept fresh run cancellation control" {
         std.testing.allocator,
         std.testing.io,
         scripted_model.asModel(),
+        &.{},
         &.{},
         .{},
         null,
@@ -1000,6 +1021,7 @@ test "agent rejects runs after failure or cancellation without mutation" {
             std.testing.allocator,
             std.testing.io,
             cancelled_model.asModel(),
+            &.{},
             &.{fatal_tool.asTool(.{ .name = "read", .description = "", .parameters_json_schema = "{}" })},
             .{},
             null,
@@ -1026,6 +1048,7 @@ test "agent rejects runs after failure or cancellation without mutation" {
             std.testing.allocator,
             std.testing.io,
             failed_model.asModel(),
+            &.{},
             &.{quiet_tool.asTool(.{ .name = "read", .description = "", .parameters_json_schema = "{}" })},
             .{ .max_tool_calls = 0 },
             null,
@@ -1048,6 +1071,7 @@ test "agent rejects reentrant runs until terminal events settle" {
         std.testing.allocator,
         std.testing.io,
         scripted_model.asModel(),
+        &.{},
         &.{},
         .{},
         null,
@@ -1131,6 +1155,7 @@ test "agent streams a tool loop with owned canonical history" {
         std.testing.allocator,
         std.testing.io,
         scripted_model.asModel(),
+        &.{},
         &.{tool},
         .{},
         null,
@@ -1188,6 +1213,7 @@ fn expectStreamFailureDoesNotCommit(
         std.testing.io,
         scripted_model.asModel(),
         &.{},
+        &.{},
         .{},
         null,
     );
@@ -1227,6 +1253,7 @@ fn expectFatalFinishDoesNotCommit(
         std.testing.allocator,
         std.testing.io,
         scripted_model.asModel(),
+        &.{},
         &.{},
         .{},
         null,
@@ -1269,6 +1296,7 @@ fn expectNonToolFinishRejectsToolCalls(finish: ai_usage.FinishCategory) !void {
         std.testing.allocator,
         std.testing.io,
         scripted_model.asModel(),
+        &.{},
         &.{tool},
         .{},
         null,
@@ -1296,6 +1324,7 @@ test "only tool-call finishes authorize local tool execution" {
         std.testing.io,
         scripted_model.asModel(),
         &.{},
+        &.{},
         .{},
         null,
     );
@@ -1321,6 +1350,7 @@ fn expectInvalidToolIdentities(calls: []const ai_testing.ScriptedStep.ToolCall) 
         std.testing.allocator,
         std.testing.io,
         scripted_model.asModel(),
+        &.{},
         &.{tool},
         .{},
         null,
@@ -1368,6 +1398,7 @@ test "completed tool results are canonical before the next tool starts" {
         std.testing.allocator,
         std.testing.io,
         scripted_model.asModel(),
+        &.{},
         &tools,
         .{},
         null,
@@ -1416,6 +1447,7 @@ test "late cancellation preserves a completed tool result" {
         std.testing.allocator,
         std.testing.io,
         scripted_model.asModel(),
+        &.{},
         &.{tool},
         .{},
         .{ .context = &events, .emitFn = CancelOnToolCompletion.emit },
@@ -1441,6 +1473,7 @@ test "agent preflights delivery capabilities before canonical input" {
         std.testing.allocator,
         std.testing.io,
         ai_model.Model.from(&no_stream_model, no_stream_model.identity, .{}),
+        &.{},
         &.{},
         .{},
         null,
@@ -1477,6 +1510,7 @@ test "agent preflights delivery capabilities before canonical input" {
         std.testing.allocator,
         std.testing.io,
         ai_model.Model.from(&no_tools_model, no_tools_model.identity, .{}),
+        &.{},
         &.{tool},
         .{},
         null,
@@ -1489,27 +1523,31 @@ test "agent preflights delivery capabilities before canonical input" {
     try std.testing.expect(no_tools_agent.state() == .idle);
 }
 
-var streamed_second_run_valid = false;
+const StreamedRunRecorder = struct {
+    valid: bool = false,
 
-fn inspectStreamedSecondRun(index: usize, request: ai_model.ModelRequest) void {
-    if (index != 1) return;
-    streamed_second_run_valid = request.messages.len == 3 and
-        std.mem.eql(u8, request.messages[0].request.parts[0].user.text, "first stream") and
-        std.mem.eql(u8, request.messages[1].response.parts[0].text.text, "first answer") and
-        std.mem.eql(u8, request.messages[2].request.parts[0].user.text, "second stream");
-}
+    fn observe(context: *anyopaque, index: usize, request: ai_model.ModelRequest) void {
+        const self: *StreamedRunRecorder = @ptrCast(@alignCast(context));
+        if (index != 1) return;
+        self.valid = request.messages.len == 3 and
+            std.mem.eql(u8, request.messages[0].request.parts[0].user.text, "first stream") and
+            std.mem.eql(u8, request.messages[1].response.parts[0].text.text, "first answer") and
+            std.mem.eql(u8, request.messages[2].request.parts[0].user.text, "second stream");
+    }
+};
 
 test "streamed completed turns preserve history across fresh runs" {
-    streamed_second_run_valid = false;
+    var request_recorder: StreamedRunRecorder = .{};
     var scripted_model: ai_testing.ScriptedModel = .{
         .identity = .{ .provider = "script", .model = "stream-reuse" },
         .steps = &.{ .{ .text = "first answer" }, .{ .text = "second answer" } },
-        .on_request = inspectStreamedSecondRun,
+        .request_observer = .{ .context = &request_recorder, .observeFn = StreamedRunRecorder.observe },
     };
     var agent = try Agent.init(
         std.testing.allocator,
         std.testing.io,
         scripted_model.asModel(),
+        &.{},
         &.{},
         .{},
         null,
@@ -1527,7 +1565,7 @@ test "streamed completed turns preserve history across fresh runs" {
         try agent.runStream("second stream", .{ .context = &second_collector, .emitFn = StreamCollector.emit }),
     );
     try std.testing.expect(agent.state() == .completed);
-    try std.testing.expect(streamed_second_run_valid);
+    try std.testing.expect(request_recorder.valid);
     try std.testing.expectEqual(@as(usize, 4), agent.messages().len);
     try std.testing.expectEqual(@as(usize, 1), second_collector.entries[0].request_number);
 }

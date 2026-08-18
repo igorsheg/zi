@@ -42,7 +42,16 @@ pub const ScriptedModel = struct {
     streaming: bool = true,
     /// Optional synchronous observer called with the zero-based request index
     /// and the borrowed request before the step is served.
-    on_request: ?*const fn (index: usize, request: model.ModelRequest) void = null,
+    request_observer: ?RequestObserver = null,
+
+    pub const RequestObserver = struct {
+        context: *anyopaque,
+        observeFn: *const fn (context: *anyopaque, index: usize, request: model.ModelRequest) void,
+
+        fn observe(self: RequestObserver, index: usize, request: model.ModelRequest) void {
+            self.observeFn(self.context, index, request);
+        }
+    };
 
     pub fn invoke(
         self: *ScriptedModel,
@@ -54,7 +63,7 @@ pub const ScriptedModel = struct {
     ) model.ModelError!message.ResponseMessage {
         const index = self.calls;
         self.calls += 1;
-        if (self.on_request) |observe| observe(index, request);
+        if (self.request_observer) |observer| observer.observe(index, request);
 
         if (index >= self.steps.len) return error.InvalidRequest;
         switch (self.steps[index]) {
@@ -155,14 +164,6 @@ fn emitEvent(sink: stream.StreamSink, event: stream.StreamEvent) model.ModelErro
     };
 }
 
-var observed_indices: [8]usize = undefined;
-var observed_count: usize = 0;
-
-fn recordRequest(index: usize, _: model.ModelRequest) void {
-    if (observed_count < observed_indices.len) observed_indices[observed_count] = index;
-    observed_count += 1;
-}
-
 test "two scripted implementations share the model seam" {
     var first: ScriptedModel = .{
         .steps = &.{.{ .text = "first" }},
@@ -250,11 +251,23 @@ test "scripted model serves ordered steps through the model seam" {
 }
 
 test "scripted model observes requests in order" {
-    observed_count = 0;
+    const Recorder = struct {
+        const Self = @This();
+
+        indices: [8]usize = undefined,
+        count: usize = 0,
+
+        fn observe(context: *anyopaque, index: usize, _: model.ModelRequest) void {
+            const self: *Self = @ptrCast(@alignCast(context));
+            if (self.count < self.indices.len) self.indices[self.count] = index;
+            self.count += 1;
+        }
+    };
+    var recorder: Recorder = .{};
     var scripted: ScriptedModel = .{
         .steps = &.{ .{ .text = "a" }, .{ .text = "b" } },
         .identity = .{ .provider = "script", .model = "observe" },
-        .on_request = recordRequest,
+        .request_observer = .{ .context = &recorder, .observeFn = Recorder.observe },
     };
     const io = std.testing.io;
     const request: model.ModelRequest = .{ .messages = &.{} };
@@ -264,9 +277,9 @@ test "scripted model observes requests in order" {
     var second = try scripted.asModel().complete(std.testing.allocator, io, request);
     defer second.deinit();
 
-    try std.testing.expectEqual(@as(usize, 2), observed_count);
-    try std.testing.expectEqual(@as(usize, 0), observed_indices[0]);
-    try std.testing.expectEqual(@as(usize, 1), observed_indices[1]);
+    try std.testing.expectEqual(@as(usize, 2), recorder.count);
+    try std.testing.expectEqual(@as(usize, 0), recorder.indices[0]);
+    try std.testing.expectEqual(@as(usize, 1), recorder.indices[1]);
     try std.testing.expectEqual(@as(usize, 2), scripted.calls);
 }
 

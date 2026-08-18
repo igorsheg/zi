@@ -174,7 +174,7 @@ test "Agent streams an OpenAI Chat tool loop through the production provider sea
         .description = "Read a file",
         .parameters_json_schema = "{\"type\":\"object\"}",
     });
-    var agent = try Agent.init(std.testing.allocator, std.testing.io, provider.modelView(), &.{tool}, .{}, null);
+    var agent = try Agent.init(std.testing.allocator, std.testing.io, provider.modelView(), &.{}, &.{tool}, .{}, null);
     defer agent.deinit();
     var recorder: StreamRecorder = .{};
 
@@ -240,7 +240,7 @@ test "Agent streams an OpenAI Codex Responses tool loop through the production p
         .description = "Read a file",
         .parameters_json_schema = "{\"type\":\"object\"}",
     });
-    var agent = try Agent.init(std.testing.allocator, std.testing.io, provider.modelView(), &.{tool}, .{}, null);
+    var agent = try Agent.init(std.testing.allocator, std.testing.io, provider.modelView(), &.{}, &.{tool}, .{}, null);
     defer agent.deinit();
     var recorder: StreamRecorder = .{};
 

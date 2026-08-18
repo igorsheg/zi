@@ -12,6 +12,9 @@ const RequestInspector = struct {
         const self: *RequestInspector = @ptrCast(@alignCast(context));
         if (!std.mem.eql(u8, request.url, "https://example.test/v1/chat/completions")) return error.Rejected;
         if (std.mem.indexOf(u8, request.body, "\"model\":\"local-model\"") == null) return error.Rejected;
+        if (std.mem.indexOf(u8, request.body, "\"role\":\"system\",\"content\":\"Inspect before acting.\"") == null) {
+            return error.Rejected;
+        }
         if (std.mem.indexOf(u8, request.body, "\"content\":\"hello\"") == null) return error.Rejected;
         var authorized = false;
         for (request.headers) |header| {
@@ -40,7 +43,10 @@ test "OpenAI-compatible buffered invocation crosses model and transport seams" {
     const request_parts = [_]message.RequestPart{.{ .user = .{ .text = "hello" } }};
     const messages = [_]message.Message{.{ .request = .{ .parts = &request_parts } }};
 
-    var result = try provider.modelView().complete(std.testing.allocator, std.testing.io, .{ .messages = &messages });
+    var result = try provider.modelView().complete(std.testing.allocator, std.testing.io, .{
+        .messages = &messages,
+        .instructions = &.{"Inspect before acting."},
+    });
     defer result.deinit();
 
     try std.testing.expect(inspector.saw_request);
