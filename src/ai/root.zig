@@ -1,6 +1,8 @@
 pub const failure = @import("failure.zig");
 pub const message = @import("message.zig");
 pub const model = @import("model.zig");
+pub const model_catalog = @import("model_catalog.zig");
+pub const model_catalog_snapshot = @import("model_catalog_snapshot.zig");
 pub const settings = @import("settings.zig");
 pub const stream = @import("stream.zig");
 pub const usage = @import("usage.zig");
@@ -37,6 +39,8 @@ test {
     _ = protocol.openai_chat;
     _ = protocol.openai_responses;
     _ = protocol.sse;
+    _ = model_catalog;
+    _ = model_catalog_snapshot;
     _ = provider;
     _ = providers;
     _ = transport;

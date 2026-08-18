@@ -4,6 +4,20 @@ const fake_api = @import("../transport/fake.zig");
 const stream = @import("../stream.zig");
 const transport = @import("../transport.zig");
 const message = @import("../message.zig");
+const model_catalog = @import("../model_catalog.zig");
+const settings = @import("../settings.zig");
+
+const profile = profile: {
+    var value: settings.ModelProfile = .{};
+    value.capabilities = .initMany(&.{ .streaming, .tools, .parallel_tool_calls, .thinking });
+    value.settings = .initMany(&.{ .temperature, .top_p, .max_output_tokens, .stop_sequences, .seed });
+    break :profile value;
+};
+const catalog_entries = [_]model_catalog.Entry{.{
+    .identity = .{ .provider = "openai-compatible", .model = "local-model" },
+    .profile = profile,
+}};
+const catalog: model_catalog.Catalog = .{ .entries = &catalog_entries };
 
 const RequestInspector = struct {
     saw_request: bool = false,
@@ -36,14 +50,15 @@ test "OpenAI-compatible buffered invocation crosses model and transport seams" {
     var inspector: RequestInspector = .{};
     fake.inspector = .{ .context = &inspector, .inspect_fn = RequestInspector.inspect };
     var provider = compatible.OpenAiCompatible.init(fake.transport(), .{
-        .model_id = "local-model",
+        .provider_id = "openai-compatible",
+        .catalog = catalog,
         .base_url = "https://example.test/v1",
         .api_key = "secret",
     });
     const request_parts = [_]message.RequestPart{.{ .user = .{ .text = "hello" } }};
     const messages = [_]message.Message{.{ .request = .{ .parts = &request_parts } }};
 
-    var result = try provider.modelView().complete(std.testing.allocator, std.testing.io, .{
+    var result = try provider.model("local-model").?.complete(std.testing.allocator, std.testing.io, .{
         .messages = &messages,
         .instructions = &.{"Inspect before acting."},
     });
@@ -95,7 +110,8 @@ test "OpenAI-compatible SSE preserves text and indexed tool calls" {
     const exchanges = [_]fake_api.Exchange{.{ .response = .{ .status = 200, .body = body, .chunk_bytes = 17 } }};
     var fake = fake_api.FakeTransport.init(&exchanges);
     var provider = compatible.OpenAiCompatible.init(fake.transport(), .{
-        .model_id = "local-model",
+        .provider_id = "openai-compatible",
+        .catalog = catalog,
         .base_url = "https://example.test/v1",
     });
     var collector: EventCollector = .{};
@@ -103,7 +119,7 @@ test "OpenAI-compatible SSE preserves text and indexed tool calls" {
     defer collector.tool_arguments.deinit(std.testing.allocator);
     const sink: stream.StreamSink = .{ .context = &collector, .emitFn = EventCollector.emit };
 
-    var result = try provider.modelView().stream(
+    var result = try provider.model("local-model").?.stream(
         std.testing.allocator,
         std.testing.io,
         .{ .messages = &.{} },
@@ -131,7 +147,8 @@ test "OpenAI-compatible preserves application stream stop" {
     } }};
     var fake = fake_api.FakeTransport.init(&exchanges);
     var provider = compatible.OpenAiCompatible.init(fake.transport(), .{
-        .model_id = "local-model",
+        .provider_id = "openai-compatible",
+        .catalog = catalog,
         .base_url = "https://example.test/v1",
     });
     const StopSink = struct {
@@ -142,7 +159,7 @@ test "OpenAI-compatible preserves application stream stop" {
     var context: u8 = 0;
     const sink: stream.StreamSink = .{ .context = &context, .emitFn = StopSink.emit };
 
-    try std.testing.expectError(error.StreamConsumerStopped, provider.modelView().stream(
+    try std.testing.expectError(error.StreamConsumerStopped, provider.model("local-model").?.stream(
         std.testing.allocator,
         std.testing.io,
         .{ .messages = &.{} },
@@ -154,7 +171,8 @@ test "OpenAI-compatible rejects foreign provider state before transport" {
     const exchanges: [0]fake_api.Exchange = .{};
     var fake = fake_api.FakeTransport.init(&exchanges);
     var provider = compatible.OpenAiCompatible.init(fake.transport(), .{
-        .model_id = "local-model",
+        .provider_id = "openai-compatible",
+        .catalog = catalog,
         .base_url = "https://example.test/v1",
     });
     const response_parts = [_]message.ResponsePart{.{ .thinking = .{
@@ -170,7 +188,7 @@ test "OpenAI-compatible rejects foreign provider state before transport" {
         .identity = .{ .provider = "openai-codex", .model = "codex" },
     } }};
 
-    try std.testing.expectError(error.HandoffRejected, provider.modelView().complete(
+    try std.testing.expectError(error.HandoffRejected, provider.model("local-model").?.complete(
         std.testing.allocator,
         std.testing.io,
         .{ .messages = &messages, .handoff = .reject_foreign_state },

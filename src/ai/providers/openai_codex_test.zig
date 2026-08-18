@@ -2,8 +2,23 @@ const std = @import("std");
 const codex = @import("openai_codex.zig");
 const fake_api = @import("../transport/fake.zig");
 const message = @import("../message.zig");
+const model_catalog = @import("../model_catalog.zig");
 const openai_responses = @import("../protocol/openai_responses.zig");
+const settings = @import("../settings.zig");
 const transport = @import("../transport.zig");
+
+const profile = profile: {
+    var value: settings.ModelProfile = .{};
+    value.capabilities = .initMany(&.{ .streaming, .tools, .parallel_tool_calls, .thinking });
+    value.settings = .initMany(&.{ .temperature, .reasoning_effort });
+    value.reasoning_efforts = .initMany(&.{ .minimal, .low, .medium, .high });
+    break :profile value;
+};
+const catalog_entries = [_]model_catalog.Entry{.{
+    .identity = .{ .provider = "openai-codex", .model = "gpt-5.1-codex" },
+    .profile = profile,
+}};
+const catalog: model_catalog.Catalog = .{ .entries = &catalog_entries };
 
 const Inspector = struct {
     saw_request: bool = false,
@@ -11,10 +26,13 @@ const Inspector = struct {
     fn inspect(context: *anyopaque, request: transport.Request) error{Rejected}!void {
         const self: *Inspector = @ptrCast(@alignCast(context));
         if (!std.mem.eql(u8, request.url, "https://chatgpt.com/backend-api/codex/responses")) return error.Rejected;
+        var content_type = false;
         var authorization = false;
         var account = false;
         var originator = false;
         for (request.headers) |header| {
+            if (std.ascii.eqlIgnoreCase(header.name, "content-type") and
+                std.mem.eql(u8, header.value, "application/json")) content_type = true;
             if (std.ascii.eqlIgnoreCase(header.name, "authorization") and
                 std.mem.startsWith(u8, header.value, "Bearer aaa.")) authorization = true;
             if (std.ascii.eqlIgnoreCase(header.name, "chatgpt-account-id") and
@@ -22,7 +40,7 @@ const Inspector = struct {
             if (std.ascii.eqlIgnoreCase(header.name, "originator") and
                 std.mem.eql(u8, header.value, "zi")) originator = true;
         }
-        if (!authorization or !account or !originator) return error.Rejected;
+        if (!content_type or !authorization or !account or !originator) return error.Rejected;
         if (std.mem.indexOf(u8, request.body, "\"include\":[\"reasoning.encrypted_content\"]") == null) {
             return error.Rejected;
         }
@@ -61,7 +79,7 @@ test "Codex Responses derives account identity and normalizes SSE" {
         \\data: {"type":"response.output_item.done","output_index":1,"item":{"type":"message","id":"msg_1","content":[{"type":"output_text","text":"Hello"}]}}
         \\
         // ziglint-ignore: Z024 -- compact wire fixture
-        \\data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":5,"output_tokens":3,"input_tokens_details":{"cached_tokens":2}}}}
+        \\data: {"type":"response.done","response":{"status":"completed","usage":{"input_tokens":5,"output_tokens":3,"input_tokens_details":{"cached_tokens":2}}}}
         \\
     ;
     const exchanges = [_]fake_api.Exchange{.{ .response = .{ .status = 200, .body = response, .chunk_bytes = 13 } }};
@@ -69,13 +87,13 @@ test "Codex Responses derives account identity and normalizes SSE" {
     var inspector: Inspector = .{};
     fake.inspector = .{ .context = &inspector, .inspect_fn = Inspector.inspect };
     var provider = codex.OpenAiCodex.init(fake.transport(), .{
-        .model_id = "gpt-5.1-codex",
+        .catalog = catalog,
         .access_token = token,
     });
     const request_parts = [_]message.RequestPart{.{ .user = .{ .text = "Say hello" } }};
     const messages = [_]message.Message{.{ .request = .{ .parts = &request_parts } }};
 
-    var result = try provider.modelView().complete(std.testing.allocator, std.testing.io, .{
+    var result = try provider.model("gpt-5.1-codex").?.complete(std.testing.allocator, std.testing.io, .{
         .messages = &messages,
         .instructions = &.{ "You are concise.", "Use read." },
         .settings = .{ .reasoning_effort = .medium },
@@ -91,11 +109,12 @@ test "Codex Responses derives account identity and normalizes SSE" {
     const replay_messages = [_]message.Message{.{ .response = result.value }};
     const replay_body = try openai_responses.encodeCodexRequest(
         std.testing.allocator,
-        "gpt-5.1-codex",
+        .{ .provider = "openai-codex", .model = "gpt-5.1-codex" },
         .{ .messages = &replay_messages },
     );
     defer std.testing.allocator.free(replay_body);
     try std.testing.expect(std.mem.indexOf(u8, replay_body, "\"encrypted_content\":\"enc\"") != null);
+    try std.testing.expectEqual(@as(u64, 3), result.value.usage.input_tokens);
     try std.testing.expectEqual(@as(u64, 2), result.value.usage.cached_input_tokens);
     try std.testing.expectEqual(.stop, result.value.finish.category);
 }
@@ -114,14 +133,15 @@ test "Codex account ID parser rejects tokens without the auth claim" {
 test "Codex Responses accumulates streamed tool arguments" {
     const response =
         // ziglint-ignore: Z024 -- compact wire fixture
-        \\data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_1","name":"read"}}
+        \\data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"read"}}
         \\
         \\data: {"type":"response.function_call_arguments.delta","output_index":0,"delta":"{\"path\":"}
         \\
-        \\data: {"type":"response.function_call_arguments.delta","output_index":0,"delta":"\"src\"}"}
+        // ziglint-ignore: Z024 -- compact wire fixture
+        \\data: {"type":"response.function_call_arguments.done","output_index":0,"arguments":"{\"path\":\"src\"}"}
         \\
         // ziglint-ignore: Z024 -- compact wire fixture
-        \\data: {"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","call_id":"call_1","name":"read","arguments":"{\"path\":\"src\"}"}}
+        \\data: {"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"read"}}
         \\
         \\data: {"type":"response.completed","response":{"status":"completed"}}
         \\
@@ -133,7 +153,7 @@ test "Codex Responses accumulates streamed tool arguments" {
     } }};
     var fake = fake_api.FakeTransport.init(&exchanges);
     var provider = codex.OpenAiCodex.init(fake.transport(), .{
-        .model_id = "gpt-5.1-codex",
+        .catalog = catalog,
         .access_token = "token",
         .account_id = "acc_test",
     });
@@ -143,7 +163,7 @@ test "Codex Responses accumulates streamed tool arguments" {
         .parameters_json_schema = "{\"type\":\"object\"}",
     }};
 
-    var result = try provider.modelView().complete(std.testing.allocator, std.testing.io, .{
+    var result = try provider.model("gpt-5.1-codex").?.complete(std.testing.allocator, std.testing.io, .{
         .messages = &.{},
         .tools = &tools,
     });
@@ -153,5 +173,14 @@ test "Codex Responses accumulates streamed tool arguments" {
     try std.testing.expectEqualStrings("call_1", result.value.parts[0].tool_call.id);
     try std.testing.expectEqualStrings("read", result.value.parts[0].tool_call.name);
     try std.testing.expectEqualStrings("{\"path\":\"src\"}", result.value.parts[0].tool_call.arguments_json);
+    const replay_messages = [_]message.Message{.{ .response = result.value }};
+    const replay_body = try openai_responses.encodeCodexRequest(
+        std.testing.allocator,
+        .{ .provider = "openai-codex", .model = "gpt-5.1-codex" },
+        .{ .messages = &replay_messages },
+    );
+    defer std.testing.allocator.free(replay_body);
+    try std.testing.expect(std.mem.indexOf(u8, replay_body, "\"call_id\":\"call_1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, replay_body, "\"id\":\"fc_1\"") != null);
     try std.testing.expectEqual(.tool_calls, result.value.finish.category);
 }

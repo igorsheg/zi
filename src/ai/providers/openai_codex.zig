@@ -2,18 +2,16 @@ const std = @import("std");
 const failure = @import("../failure.zig");
 const message = @import("../message.zig");
 const model_api = @import("../model.zig");
+const model_catalog = @import("../model_catalog.zig");
 const openai_responses = @import("../protocol/openai_responses.zig");
 const provider_api = @import("../provider.zig");
-const settings = @import("../settings.zig");
 const transport_api = @import("../transport.zig");
 
 pub const Config = struct {
-    model_id: []const u8,
-    display_name: ?[]const u8 = null,
+    catalog: model_catalog.Catalog,
     access_token: []const u8,
     account_id: ?[]const u8 = null,
     base_url: []const u8 = "https://chatgpt.com/backend-api",
-    profile: settings.ModelProfile = defaultProfile(),
 };
 
 pub const OpenAiCodex = struct {
@@ -29,33 +27,18 @@ pub const OpenAiCodex = struct {
     }
 
     pub fn model(self: *OpenAiCodex, model_id: []const u8) ?model_api.Model {
-        if (!std.mem.eql(u8, model_id, self.config.model_id)) return null;
-        return self.modelView();
-    }
-
-    pub fn modelView(self: *OpenAiCodex) model_api.Model {
-        return model_api.Model.from(self, .{
+        const resolved = self.config.catalog.resolve(.{
             .provider = "openai-codex",
-            .model = self.config.model_id,
-        }, self.config.profile);
+            .model = model_id,
+        }) orelse return null;
+        return model_api.Model.from(self, resolved.entry.identity, resolved.entry.profile);
     }
 
     pub fn models(
         self: *OpenAiCodex,
         allocator: std.mem.Allocator,
     ) provider_api.ProviderError!provider_api.OwnedModelList {
-        var arena = std.heap.ArenaAllocator.init(allocator);
-        errdefer arena.deinit();
-        const items = arena.allocator().alloc(provider_api.ModelDescriptor, 1) catch return error.OutOfMemory;
-        items[0] = .{
-            .id = arena.allocator().dupe(u8, self.config.model_id) catch return error.OutOfMemory,
-            .display_name = if (self.config.display_name) |name|
-                arena.allocator().dupe(u8, name) catch return error.OutOfMemory
-            else
-                null,
-            .profile = self.config.profile,
-        };
-        return .{ .arena = arena, .items = items };
+        return provider_api.modelsFromCatalog(allocator, self.config.catalog, "openai-codex");
     }
 
     pub fn invoke(
@@ -63,38 +46,44 @@ pub const OpenAiCodex = struct {
         result_allocator: std.mem.Allocator,
         scratch_allocator: std.mem.Allocator,
         io: std.Io,
+        identity: message.ModelIdentity,
         request: model_api.ModelRequest,
         delivery: model_api.Delivery,
     ) failure.ModelError!message.ResponseMessage {
-        try request.validateHandoff("openai-codex", "openai-codex-responses");
+        try request.validateHandoff(identity.provider, "openai-codex-responses");
         if (self.config.access_token.len == 0) return error.InvalidRequest;
         const account_id = if (self.config.account_id) |value|
             value
         else
             try accountIdFromJwt(scratch_allocator, self.config.access_token);
-        defer if (self.config.account_id == null) scratch_allocator.free(account_id);
+        defer if (self.config.account_id == null) {
+            std.crypto.secureZero(u8, @constCast(account_id));
+            scratch_allocator.free(account_id);
+        };
         const authorization = std.fmt.allocPrint(
             scratch_allocator,
             "Bearer {s}",
             .{self.config.access_token},
         ) catch return error.OutOfMemory;
-        defer scratch_allocator.free(authorization);
-        const body = try openai_responses.encodeCodexRequest(
-            scratch_allocator,
-            self.config.model_id,
-            request,
-        );
-        defer scratch_allocator.free(body);
+        defer {
+            std.crypto.secureZero(u8, authorization);
+            scratch_allocator.free(authorization);
+        }
+        const body = try openai_responses.encodeCodexRequest(scratch_allocator, identity, request);
+        defer {
+            std.crypto.secureZero(u8, @constCast(body));
+            scratch_allocator.free(body);
+        }
         const url = try endpointUrl(scratch_allocator, self.config.base_url);
         defer scratch_allocator.free(url);
         const headers = [_]transport_api.Header{
+            .{ .name = "content-type", .value = "application/json" },
             .{ .name = "authorization", .value = authorization },
             .{ .name = "chatgpt-account-id", .value = account_id },
             .{ .name = "originator", .value = "zi" },
             .{ .name = "openai-beta", .value = "responses=experimental" },
             .{ .name = "accept", .value = "text/event-stream" },
         };
-        const identity: message.ModelIdentity = .{ .provider = "openai-codex", .model = self.config.model_id };
         const application_sink = switch (delivery) {
             .buffered => null,
             .streaming => |sink| sink,
@@ -103,6 +92,7 @@ pub const OpenAiCodex = struct {
             result_allocator,
             scratch_allocator,
             identity,
+            "openai-codex-responses",
             application_sink,
         );
         defer decoder.deinit();
@@ -124,14 +114,6 @@ pub const OpenAiCodex = struct {
     }
 };
 
-pub fn defaultProfile() settings.ModelProfile {
-    var profile: settings.ModelProfile = .{};
-    profile.capabilities = .initMany(&.{ .streaming, .tools, .parallel_tool_calls, .thinking });
-    profile.settings = .initMany(&.{ .temperature, .reasoning_effort });
-    profile.reasoning_efforts = .initMany(&.{ .minimal, .low, .medium, .high });
-    return profile;
-}
-
 pub fn accountIdFromJwt(
     allocator: std.mem.Allocator,
     access_token: []const u8,
@@ -143,24 +125,27 @@ pub fn accountIdFromJwt(
     const decoded_size = std.base64.url_safe_no_pad.Decoder.calcSizeForSlice(payload_segment) catch
         return error.InvalidRequest;
     const decoded = allocator.alloc(u8, decoded_size) catch return error.OutOfMemory;
-    defer allocator.free(decoded);
+    defer {
+        std.crypto.secureZero(u8, decoded);
+        allocator.free(decoded);
+    }
     std.base64.url_safe_no_pad.Decoder.decode(decoded, payload_segment) catch return error.InvalidRequest;
-    var parsed = std.json.parseFromSlice(
-        std.json.Value,
-        allocator,
-        decoded,
-        .{},
-    ) catch |parse_failure| switch (parse_failure) {
+    const Claims = struct {
+        @"https://api.openai.com/auth": struct {
+            chatgpt_account_id: []const u8,
+        },
+    };
+    var parsed = std.json.parseFromSlice(Claims, allocator, decoded, .{
+        .ignore_unknown_fields = true,
+    }) catch |parse_failure| switch (parse_failure) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.InvalidRequest,
     };
     defer parsed.deinit();
-    if (parsed.value != .object) return error.InvalidRequest;
-    const auth = parsed.value.object.get("https://api.openai.com/auth") orelse return error.InvalidRequest;
-    if (auth != .object) return error.InvalidRequest;
-    const account = auth.object.get("chatgpt_account_id") orelse return error.InvalidRequest;
-    if (account != .string or account.string.len == 0) return error.InvalidRequest;
-    return allocator.dupe(u8, account.string) catch return error.OutOfMemory;
+    const account_id = parsed.value.@"https://api.openai.com/auth".chatgpt_account_id;
+    if (account_id.len == 0) return error.InvalidRequest;
+    defer std.crypto.secureZero(u8, @constCast(account_id));
+    return allocator.dupe(u8, account_id) catch return error.OutOfMemory;
 }
 
 fn endpointUrl(allocator: std.mem.Allocator, base_url: []const u8) failure.ModelError![]const u8 {

@@ -100,6 +100,22 @@ _Avoid_: Abort, component unmount, session disposal
 The process-scoped capabilities from which agent sessions are constructed, including models, credentials, settings, filesystem/process access, and persistence.
 _Avoid_: Globals, app context
 
+**Model catalog**:
+The trusted provider-scoped model metadata compiled into Zi: canonical model identities, aliases, capabilities, settings, and limits with reviewable provenance. Catalog presence describes a model but does not make it available; availability is the intersection of catalog metadata and a provider definition installed with its admitted credentials.
+_Avoid_: Provider registry, model configuration, provider discovery, model picker
+
+**Provider definition**:
+The admitted description of one provider identity: API adapter, endpoint, authentication policy, and model declarations or overrides. Built-in, user, and extension definitions share this shape, while resolved credential bytes and live provider implementations do not.
+_Avoid_: Model catalog entry, provider implementation, credential
+
+**Model selection**:
+A requested provider ID and model ID admitted before an agent session is constructed. Resolution canonicalizes catalog aliases and succeeds only when the model belongs to an available provider.
+_Avoid_: Model configuration, resolved credential, active model
+
+**Model runtime**:
+The runtime-services owner that composes credential-blind provider definitions, admitted credentials, and the model catalog. It owns only installed live provider implementations and resolves a model selection to the concrete model used by an agent session.
+_Avoid_: Model catalog, provider registry, model selector
+
 **Agent session runtime**:
 The optional coding-agent owner of one replaceable current `AgentRuntime`. It performs bounded session listing and whole-runtime new/resume transitions, building an unbound candidate, retiring the current extension lifecycle, and only then activating the candidate. Single-session SDK callers do not need it.
 _Avoid_: Session manager, root store, TUI session controller

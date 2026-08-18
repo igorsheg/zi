@@ -58,6 +58,7 @@ pub const ScriptedModel = struct {
         allocator: std.mem.Allocator,
         _: std.mem.Allocator,
         _: std.Io,
+        _: message.ModelIdentity,
         request: model.ModelRequest,
         delivery: model.Delivery,
     ) model.ModelError!message.ResponseMessage {

@@ -1,5 +1,6 @@
 const std = @import("std");
 const message = @import("message.zig");
+const model_catalog = @import("model_catalog.zig");
 const model_api = @import("model.zig");
 const settings = @import("settings.zig");
 
@@ -20,6 +21,43 @@ pub const OwnedModelList = struct {
 };
 
 pub const ProviderError = error{OutOfMemory};
+
+pub fn modelsFromCatalog(
+    allocator: std.mem.Allocator,
+    catalog: model_catalog.Catalog,
+    provider_id: []const u8,
+) ProviderError!OwnedModelList {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    var count: usize = 0;
+    for (catalog.entries) |entry| {
+        if (std.mem.eql(u8, entry.identity.provider, provider_id)) count += 1;
+    }
+    const items = arena.allocator().alloc(ModelDescriptor, count) catch return error.OutOfMemory;
+    var index: usize = 0;
+    for (catalog.entries) |entry| {
+        if (!std.mem.eql(u8, entry.identity.provider, provider_id)) continue;
+        items[index] = .{
+            .id = arena.allocator().dupe(u8, entry.identity.model) catch return error.OutOfMemory,
+            .profile = entry.profile,
+        };
+        index += 1;
+    }
+    return .{ .arena = arena, .items = items };
+}
+
+fn createCatalogModelList(allocator: std.mem.Allocator) !void {
+    const entries = [_]model_catalog.Entry{
+        .{ .identity = .{ .provider = "provider", .model = "one" }, .profile = .{} },
+        .{ .identity = .{ .provider = "provider", .model = "two" }, .profile = .{} },
+    };
+    var list = try modelsFromCatalog(allocator, .{ .entries = &entries }, "provider");
+    list.deinit();
+}
+
+test "catalog model lists clean up every allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, createCatalogModelList, .{});
+}
 
 pub const Provider = struct {
     context: *anyopaque,
@@ -122,6 +160,7 @@ test "registry resolves borrowed provider models without central dispatch" {
             allocator: std.mem.Allocator,
             _: std.mem.Allocator,
             _: std.Io,
+            _: message.ModelIdentity,
             _: model_api.ModelRequest,
             _: model_api.Delivery,
         ) model_api.ModelError!message.ResponseMessage {

@@ -5,7 +5,31 @@ const ai_stream = @import("../ai/stream.zig");
 const compatible = @import("../ai/providers/openai_compatible.zig");
 const codex = @import("../ai/providers/openai_codex.zig");
 const fake_api = @import("../ai/transport/fake.zig");
+const model_catalog = @import("../ai/model_catalog.zig");
+const settings = @import("../ai/settings.zig");
 const transport = @import("../ai/transport.zig");
+
+const compatible_profile = profile: {
+    var value: settings.ModelProfile = .{};
+    value.capabilities = .initMany(&.{ .streaming, .tools, .parallel_tool_calls, .thinking });
+    value.settings = .initMany(&.{ .temperature, .top_p, .max_output_tokens, .stop_sequences, .seed });
+    break :profile value;
+};
+const codex_profile = profile: {
+    var value: settings.ModelProfile = .{};
+    value.capabilities = .initMany(&.{ .streaming, .tools, .parallel_tool_calls, .thinking });
+    value.settings = .initMany(&.{ .temperature, .reasoning_effort });
+    value.reasoning_efforts = .initMany(&.{ .minimal, .low, .medium, .high });
+    break :profile value;
+};
+const catalog_entries = [_]model_catalog.Entry{
+    .{ .identity = .{ .provider = "openai", .model = "gpt-4.1" }, .profile = compatible_profile },
+    .{
+        .identity = .{ .provider = "openai-codex", .model = "gpt-5.1-codex" },
+        .profile = codex_profile,
+    },
+};
+const catalog: model_catalog.Catalog = .{ .entries = &catalog_entries };
 
 const StreamRecorder = struct {
     count: usize = 0,
@@ -164,7 +188,7 @@ test "Agent streams an OpenAI Chat tool loop through the production provider sea
     fake.inspector = .{ .context = &inspector, .inspect_fn = OpenAiInspector.inspect };
     var provider = compatible.OpenAiCompatible.init(fake.transport(), .{
         .provider_id = "openai",
-        .model_id = "gpt-4.1",
+        .catalog = catalog,
         .base_url = "https://api.openai.com/v1",
         .api_key = "secret",
     });
@@ -174,7 +198,15 @@ test "Agent streams an OpenAI Chat tool loop through the production provider sea
         .description = "Read a file",
         .parameters_json_schema = "{\"type\":\"object\"}",
     });
-    var agent = try Agent.init(std.testing.allocator, std.testing.io, provider.modelView(), &.{}, &.{tool}, .{}, null);
+    var agent = try Agent.init(
+        std.testing.allocator,
+        std.testing.io,
+        provider.model("gpt-4.1").?,
+        &.{},
+        &.{tool},
+        .{},
+        null,
+    );
     defer agent.deinit();
     var recorder: StreamRecorder = .{};
 
@@ -230,7 +262,7 @@ test "Agent streams an OpenAI Codex Responses tool loop through the production p
     var inspector: CodexInspector = .{};
     fake.inspector = .{ .context = &inspector, .inspect_fn = CodexInspector.inspect };
     var provider = codex.OpenAiCodex.init(fake.transport(), .{
-        .model_id = "gpt-5.1-codex",
+        .catalog = catalog,
         .access_token = "token",
         .account_id = "acc_test",
     });
@@ -240,7 +272,15 @@ test "Agent streams an OpenAI Codex Responses tool loop through the production p
         .description = "Read a file",
         .parameters_json_schema = "{\"type\":\"object\"}",
     });
-    var agent = try Agent.init(std.testing.allocator, std.testing.io, provider.modelView(), &.{}, &.{tool}, .{}, null);
+    var agent = try Agent.init(
+        std.testing.allocator,
+        std.testing.io,
+        provider.model("gpt-5.1-codex").?,
+        &.{},
+        &.{tool},
+        .{},
+        null,
+    );
     defer agent.deinit();
     var recorder: StreamRecorder = .{};
 

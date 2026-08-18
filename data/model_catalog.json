@@ -1,0 +1,103 @@
+{
+  "version": 1,
+  "updated_at": "2026-08-16",
+  "entries": [
+    {
+      "provider_id": "openai",
+      "model_id": "gpt-5.6-sol",
+      "aliases": ["gpt-5.6"],
+      "source_url": "https://developers.openai.com/api/docs/models/gpt-5.6-sol",
+      "profile": {
+        "capabilities": ["streaming", "tools", "parallel_tool_calls", "thinking"],
+        "settings": ["max_output_tokens", "reasoning_effort"],
+        "reasoning_efforts": ["low", "medium", "high"],
+        "context_window": 1050000,
+        "max_output_tokens": 128000
+      }
+    },
+    {
+      "provider_id": "openai-codex",
+      "model_id": "gpt-5.3-codex-spark",
+      "source_url": "https://github.com/badlogic/pi-mono/commit/73414d08b94d7db46d3fa66582c8fe3b02dabf72",
+      "profile": {
+        "capabilities": ["streaming", "tools", "parallel_tool_calls", "thinking"],
+        "settings": ["reasoning_effort"],
+        "reasoning_efforts": ["minimal", "low", "medium", "high"],
+        "context_window": 128000,
+        "max_output_tokens": 128000
+      }
+    },
+    {
+      "provider_id": "openai-codex",
+      "model_id": "gpt-5.4",
+      "source_url": "https://github.com/badlogic/pi-mono/commit/73414d08b94d7db46d3fa66582c8fe3b02dabf72",
+      "profile": {
+        "capabilities": ["streaming", "tools", "parallel_tool_calls", "thinking"],
+        "settings": ["reasoning_effort"],
+        "reasoning_efforts": ["minimal", "low", "medium", "high"],
+        "context_window": 272000,
+        "max_output_tokens": 128000
+      }
+    },
+    {
+      "provider_id": "openai-codex",
+      "model_id": "gpt-5.4-mini",
+      "source_url": "https://github.com/badlogic/pi-mono/commit/73414d08b94d7db46d3fa66582c8fe3b02dabf72",
+      "profile": {
+        "capabilities": ["streaming", "tools", "parallel_tool_calls", "thinking"],
+        "settings": ["reasoning_effort"],
+        "reasoning_efforts": ["minimal", "low", "medium", "high"],
+        "context_window": 272000,
+        "max_output_tokens": 128000
+      }
+    },
+    {
+      "provider_id": "openai-codex",
+      "model_id": "gpt-5.5",
+      "source_url": "https://github.com/badlogic/pi-mono/commit/73414d08b94d7db46d3fa66582c8fe3b02dabf72",
+      "profile": {
+        "capabilities": ["streaming", "tools", "parallel_tool_calls", "thinking"],
+        "settings": ["reasoning_effort"],
+        "reasoning_efforts": ["minimal", "low", "medium", "high"],
+        "context_window": 272000,
+        "max_output_tokens": 128000
+      }
+    },
+    {
+      "provider_id": "openai-codex",
+      "model_id": "gpt-5.6-luna",
+      "source_url": "https://github.com/badlogic/pi-mono/commit/73414d08b94d7db46d3fa66582c8fe3b02dabf72",
+      "profile": {
+        "capabilities": ["streaming", "tools", "parallel_tool_calls", "thinking"],
+        "settings": ["reasoning_effort"],
+        "reasoning_efforts": ["minimal", "low", "medium", "high"],
+        "context_window": 272000,
+        "max_output_tokens": 128000
+      }
+    },
+    {
+      "provider_id": "openai-codex",
+      "model_id": "gpt-5.6-sol",
+      "source_url": "https://github.com/badlogic/pi-mono/commit/73414d08b94d7db46d3fa66582c8fe3b02dabf72",
+      "profile": {
+        "capabilities": ["streaming", "tools", "parallel_tool_calls", "thinking"],
+        "settings": ["reasoning_effort"],
+        "reasoning_efforts": ["minimal", "low", "medium", "high"],
+        "context_window": 272000,
+        "max_output_tokens": 128000
+      }
+    },
+    {
+      "provider_id": "openai-codex",
+      "model_id": "gpt-5.6-terra",
+      "source_url": "https://github.com/badlogic/pi-mono/commit/73414d08b94d7db46d3fa66582c8fe3b02dabf72",
+      "profile": {
+        "capabilities": ["streaming", "tools", "parallel_tool_calls", "thinking"],
+        "settings": ["reasoning_effort"],
+        "reasoning_efforts": ["minimal", "low", "medium", "high"],
+        "context_window": 272000,
+        "max_output_tokens": 128000
+      }
+    }
+  ]
+}

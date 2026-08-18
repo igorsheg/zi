@@ -3,31 +3,31 @@ const failure = @import("../failure.zig");
 const message = @import("../message.zig");
 const model_api = @import("../model.zig");
 const model_catalog = @import("../model_catalog.zig");
-const openai_chat = @import("../protocol/openai_chat.zig");
+const openai_responses = @import("../protocol/openai_responses.zig");
 const provider_api = @import("../provider.zig");
 const transport_api = @import("../transport.zig");
 
 pub const Config = struct {
     provider_id: []const u8,
     catalog: model_catalog.Catalog,
-    base_url: []const u8,
     api_key: ?[]const u8 = null,
+    base_url: []const u8,
     headers: []const transport_api.Header = &.{},
 };
 
-pub const OpenAiCompatible = struct {
+pub const OpenAiResponses = struct {
     transport: transport_api.Transport,
     config: Config,
 
-    pub fn init(transport: transport_api.Transport, config: Config) OpenAiCompatible {
+    pub fn init(transport: transport_api.Transport, config: Config) OpenAiResponses {
         return .{ .transport = transport, .config = config };
     }
 
-    pub fn provider(self: *OpenAiCompatible) provider_api.Provider {
+    pub fn provider(self: *OpenAiResponses) provider_api.Provider {
         return provider_api.Provider.from(self, self.config.provider_id);
     }
 
-    pub fn model(self: *OpenAiCompatible, model_id: []const u8) ?model_api.Model {
+    pub fn model(self: *OpenAiResponses, model_id: []const u8) ?model_api.Model {
         const resolved = self.config.catalog.resolve(.{
             .provider = self.config.provider_id,
             .model = model_id,
@@ -36,14 +36,14 @@ pub const OpenAiCompatible = struct {
     }
 
     pub fn models(
-        self: *OpenAiCompatible,
+        self: *OpenAiResponses,
         allocator: std.mem.Allocator,
     ) provider_api.ProviderError!provider_api.OwnedModelList {
         return provider_api.modelsFromCatalog(allocator, self.config.catalog, self.config.provider_id);
     }
 
     pub fn invoke(
-        self: *OpenAiCompatible,
+        self: *OpenAiResponses,
         result_allocator: std.mem.Allocator,
         scratch_allocator: std.mem.Allocator,
         io: std.Io,
@@ -51,13 +51,12 @@ pub const OpenAiCompatible = struct {
         request: model_api.ModelRequest,
         delivery: model_api.Delivery,
     ) failure.ModelError!message.ResponseMessage {
-        try request.validateHandoff(identity.provider, null);
-        const streaming = switch (delivery) {
-            .buffered => false,
-            .streaming => true,
-        };
-        const body = try openai_chat.encodeRequest(scratch_allocator, identity.model, request, streaming);
-        defer scratch_allocator.free(body);
+        try request.validateHandoff(identity.provider, "openai-responses");
+        const body = try openai_responses.encodeRequest(scratch_allocator, identity, request);
+        defer {
+            std.crypto.secureZero(u8, @constCast(body));
+            scratch_allocator.free(body);
+        }
         const url = try endpointUrl(scratch_allocator, self.config.base_url);
         defer scratch_allocator.free(url);
         const authorization = if (self.config.api_key) |key|
@@ -70,75 +69,53 @@ pub const OpenAiCompatible = struct {
         };
         var headers: std.ArrayList(transport_api.Header) = .empty;
         defer headers.deinit(scratch_allocator);
-        headers.append(scratch_allocator, .{
-            .name = "accept",
-            .value = if (streaming) "text/event-stream" else "application/json",
-        }) catch return error.OutOfMemory;
+        headers.append(scratch_allocator, .{ .name = "content-type", .value = "application/json" }) catch
+            return error.OutOfMemory;
+        headers.append(scratch_allocator, .{ .name = "accept", .value = "text/event-stream" }) catch
+            return error.OutOfMemory;
         if (authorization) |value| headers.append(scratch_allocator, .{
             .name = "authorization",
             .value = value,
         }) catch return error.OutOfMemory;
         headers.appendSlice(scratch_allocator, self.config.headers) catch return error.OutOfMemory;
 
-        const transport_request: transport_api.Request = .{
+        const application_sink = switch (delivery) {
+            .buffered => null,
+            .streaming => |sink| sink,
+        };
+        var decoder = openai_responses.StreamDecoder.init(
+            result_allocator,
+            scratch_allocator,
+            identity,
+            "openai-responses",
+            application_sink,
+        );
+        defer decoder.deinit();
+        _ = self.transport.exchange(scratch_allocator, io, .{
             .method = .POST,
             .url = url,
             .headers = headers.items,
             .body = body,
             .deadline = request.deadline,
             .cancellation = request.cancellation,
+        }, .{ .streaming = decoder.bodySink() }) catch |transport_failure| {
+            if (decoder.failure_value) |decode_failure| return decode_failure;
+            if (!decoder.terminal) return mapTransportError(transport_failure);
         };
-
-        return switch (delivery) {
-            .buffered => complete: {
-                const response = self.transport.exchange(
-                    scratch_allocator,
-                    io,
-                    transport_request,
-                    .buffered,
-                ) catch |transport_failure| {
-                    return mapTransportError(transport_failure);
-                };
-                defer if (response.body.len > 0) scratch_allocator.free(response.body);
-                if (response.status < 200 or response.status >= 300) {
-                    observeFailure(request.failure_sink, identity, response.status, response.body);
-                    return statusError(response.status);
-                }
-                break :complete openai_chat.decodeResponse(result_allocator, identity, response.body);
-            },
-            .streaming => |sink| streaming_response: {
-                var decoder = openai_chat.StreamDecoder.init(
-                    result_allocator,
-                    scratch_allocator,
-                    identity,
-                    sink,
-                );
-                defer decoder.deinit();
-                _ = self.transport.exchange(
-                    scratch_allocator,
-                    io,
-                    transport_request,
-                    .{ .streaming = decoder.bodySink() },
-                ) catch |transport_failure| {
-                    if (decoder.failure_value) |decode_failure| return decode_failure;
-                    return mapTransportError(transport_failure);
-                };
-                if (decoder.status < 200 or decoder.status >= 300) {
-                    observeFailure(request.failure_sink, identity, decoder.status, decoder.error_body.items);
-                }
-                break :streaming_response decoder.result();
-            },
-        };
+        if (decoder.status < 200 or decoder.status >= 300) {
+            observeFailure(request.failure_sink, identity, decoder.status, decoder.error_body.items);
+        }
+        return decoder.result();
     }
 };
 
 fn endpointUrl(allocator: std.mem.Allocator, base_url: []const u8) failure.ModelError![]const u8 {
     const base = std.mem.trim(u8, base_url, " \t\r\n/");
     if (base.len == 0) return error.InvalidRequest;
-    if (std.mem.endsWith(u8, base, "/chat/completions")) {
+    if (std.mem.endsWith(u8, base, "/responses")) {
         return allocator.dupe(u8, base) catch return error.OutOfMemory;
     }
-    return std.fmt.allocPrint(allocator, "{s}/chat/completions", .{base}) catch return error.OutOfMemory;
+    return std.fmt.allocPrint(allocator, "{s}/responses", .{base}) catch return error.OutOfMemory;
 }
 
 fn observeFailure(
@@ -155,17 +132,8 @@ fn observeFailure(
     });
 }
 
-fn statusError(status: u16) failure.ModelError {
-    return switch (status) {
-        401, 403 => error.ProviderRejectedRequest,
-        429 => error.RateLimited,
-        500, 502, 503, 504 => error.ProviderUnavailable,
-        else => error.ProviderRejectedRequest,
-    };
-}
-
-fn mapTransportError(value: transport_api.Error) failure.ModelError {
-    return switch (value) {
+fn mapTransportError(transport_failure: transport_api.Error) failure.ModelError {
+    return switch (transport_failure) {
         error.OutOfMemory => error.OutOfMemory,
         error.Cancelled => error.Cancelled,
         error.TimedOut => error.TimedOut,

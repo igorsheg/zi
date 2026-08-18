@@ -83,12 +83,13 @@ pub const Model = struct {
             result_allocator: std.mem.Allocator,
             scratch_allocator: std.mem.Allocator,
             io: std.Io,
+            identity: ModelIdentity,
             request: ModelRequest,
             delivery: Delivery,
         ) ModelError!message.ResponseMessage,
     };
 
-    pub fn from(implementation: anytype, identity: ModelIdentity, profile: ModelProfile) Model {
+    pub fn from(implementation: anytype, model_identity: ModelIdentity, profile: ModelProfile) Model {
         const Implementation = @TypeOf(implementation.*);
         const VTableImpl = struct {
             // Context leads because this adapter implements the erased model ABI.
@@ -98,18 +99,19 @@ pub const Model = struct {
                 result_allocator: std.mem.Allocator, // ziglint-ignore: Z023
                 scratch_allocator: std.mem.Allocator, // ziglint-ignore: Z023
                 io: std.Io, // ziglint-ignore: Z023
+                identity: ModelIdentity,
                 request: ModelRequest,
                 delivery: Delivery,
             ) ModelError!message.ResponseMessage {
                 const instance: *Implementation = @ptrCast(@alignCast(context));
-                return instance.invoke(result_allocator, scratch_allocator, io, request, delivery);
+                return instance.invoke(result_allocator, scratch_allocator, io, identity, request, delivery);
             }
             const vtable: VTable = .{ .invoke = invokeImpl };
         };
         return .{
             .context = implementation,
             .vtable = &VTableImpl.vtable,
-            .identity = identity,
+            .identity = model_identity,
             .profile = profile,
         };
     }
@@ -157,6 +159,7 @@ pub const Model = struct {
             arena.allocator(),
             allocator,
             io,
+            self.identity,
             request,
             delivery,
         );
