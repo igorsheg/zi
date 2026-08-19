@@ -6,20 +6,33 @@ This file is for durable rules. Prefer principles and ownership boundaries over
 feature inventories. When a fact changes often, point to the source of truth
 instead of copying it here.
 
+The tree wins. If a rule below disagrees with `src/`, `build.zig`, or
+`.github/workflows/`, the code is right and this file is stale. Fix the file in
+the same change that discovers the drift.
+
 ## Declaring work ready
 
 Do not say the work is ready, done, or complete until you have built the binary
-and exercised the change. A passing test suite is necessary, not sufficient.
+and proven the change at the highest level it is actually reachable. A passing
+test suite is necessary, not sufficient.
 
 Before reporting the work as ready:
 
-1. `zig build` succeeds.
-2. Focused tests for the changed path pass (`zig build test` when the change is
+1. `zig fmt --check src/ tools/` passes.
+2. `zig build` succeeds.
+3. Focused tests for the changed path pass (`zig build test` when the change is
    not local enough to isolate).
-3. Run the built binary at `./zig-out/bin/zi` and drive at least the happy path
-   that the change affects.
-4. Confirm the process did not abort, stderr is clean, and the behavior matches
+4. Prove the change at its reachable level, and say which level you used:
+   - Reachable from the binary: run `./zig-out/bin/zi` and drive the happy path
+     the change affects.
+   - Library-level only: run the focused tests, run `./zig-out/bin/zi` to
+     confirm the process still builds and starts clean, and state plainly that
+     the change is not yet reachable from the binary.
+5. Confirm the process did not abort, stderr is clean, and the behavior matches
    what you are about to tell the user.
+
+Never describe library-level work as user-facing behavior. "You can now resume a
+session" is false while nothing in `main` can reach the code that does it.
 
 If you cannot run the binary, say so and ask the user to verify. "The tests
 pass" is not a substitute.
@@ -33,6 +46,36 @@ reflects your change.
 `zig build` writes to `zig-out/bin/zi`. That is the only binary that contains
 your latest change.
 
+### What the binary does today
+
+`src/main.zig` is a stub. It writes one readiness line and exits. The CLI core
+in `src/coding_agent/cli/` parses args, composes an initial message, and runs
+print mode, but nothing in `main` composes it yet.
+
+Read `src/main.zig` before you claim anything about what a user can do. It is
+nine lines. Do not infer a product surface from the presence of a module.
+
+Wiring `main` to the CLI core is admitted work, not a side effect of another
+change. When it lands, step 4 above stops having a library-only branch for
+anything the CLI reaches.
+
+## Continuous integration
+
+`.github/workflows/ci.yml` runs on pull requests and on pushes to `main` and
+`zig`. It pins Zig to the same version as `.minimum_zig_version` and runs
+exactly three checks on `ubuntu-24.04`:
+
+```
+zig fmt --check src/ tools/
+zig build
+zig build test
+```
+
+The CI commands are part of the local ready gate, not a superset of it. If CI
+fails after those commands pass locally, investigate platform dependence. Keep
+the two in sync: a new required CI check belongs in this file and in `ci.yml`
+in the same change.
+
 ## References
 
 Use these references by role. Do not port any of them literally.
@@ -45,6 +88,10 @@ Use these references by role. Do not port any of them literally.
 
 Concrete behavior pins and provenance live with the owning source and data, or
 in commit history, not as duplicated commit hashes in this file.
+
+A reference's rules assume a reference's maturity. fx ships a real binary, a
+four-platform CI matrix, and a release pipeline. Zi does not. Do not adopt a
+process rule whose precondition this repo has not built.
 
 When the references disagree:
 
@@ -72,7 +119,20 @@ zig build check-model-catalog      # verify data/model_catalog.json vs the snaps
 zig build update-model-catalog     # regenerate src/ai/model_catalog_snapshot.zig
 ```
 
-`.minimum_zig_version` in `build.zig.zon` is the pinned toolchain.
+`.minimum_zig_version` in `build.zig.zon` is the pinned toolchain. `build.zig`
+owns the step list; that block is a convenience copy, not the authority.
+
+`node_modules/` and `dist/` may still exist on disk as ignored leftovers from
+`main`. They are not part of this branch. Do not read, grep, or reason from
+them, and do not let a search result inside them influence a decision.
+
+## Commits
+
+- Conventional commits, with a scope naming the owning module:
+  `feat(coding-agent): add durable session journal`.
+- No emojis in commit messages or PR text.
+- No generated-by or co-authored-by attribution footers.
+- One admitted capability per commit, with its tests.
 
 ## Code style
 
@@ -95,6 +155,12 @@ zig build update-model-catalog     # regenerate src/ai/model_catalog_snapshot.zi
 
 `src/main.zig` is the composition root. Do not add leaf feature logic there.
 
+Each module directory has a `root.zig` that is its public seam to other modules.
+Owners inside one module may import sibling files directly; callers outside it
+use `root.zig` instead of reaching through the boundary. Its `test { _ = ... }`
+block is also the test registry: a new file in the module is not covered by
+`zig build test` until it is referenced there.
+
 Module ownership (stable boundaries):
 
 - `src/ai/` owns the provider-independent model substrate: identities, profiles,
@@ -102,17 +168,21 @@ Module ownership (stable boundaries):
   transports, and provider adapters.
 - `src/agent/` owns the streamed tool loop: history, tool execution, run limits,
   commits, and agent state.
-- `src/coding_agent/` owns coding-agent policy: `AgentSession`, cwd-bound tools,
-  CLI core, `ZiPaths`, model config and resolution, and the durable session
-  journal.
+- `src/coding_agent/` owns coding-agent policy: the session (identity,
+  selection, durable journal, commits, on-disk format), the runtime that admits
+  a model and its credentials, cwd-bound tools, `ZiPaths`, model config and
+  resolution, and CLI core.
 - `src/BoundedJson.zig` is the shared bounded JSON helper. Domain-specific
   validation stays with the owning module.
 - `data/model_catalog.json` plus `tools/model_catalog.zig` own catalog
   generation. The compiled snapshot lives in `src/ai/model_catalog_snapshot.zig`.
 
+Dependencies point one way: `coding_agent` depends on `agent` and `ai`; `agent`
+depends on `ai`; `ai` depends on neither. Do not add a back edge.
+
 For the admitted product surface right now (providers, tools, what `main`
-actually does), trust `src/` and `README.md`. Do not invent interactive mode,
-extensions, RPC, Code Mode, MCP, or npm install on this branch.
+actually does), trust `src/`. Do not invent interactive mode, extensions, RPC,
+Code Mode, MCP, or npm install on this branch.
 
 ### Adding a feature
 
@@ -121,7 +191,7 @@ Before implementing, answer in order:
 1. Which module owns the behavior?
 2. What is the typed contract?
 3. Does it need persistence?
-4. What tests land with it?
+4. What tests land with it, and where are they registered?
 
 If unclear, define the contract first. Port one pi capability at a time with its
 behavior tests and upstream provenance. Prefer a deep owner over another
@@ -129,18 +199,20 @@ pass-through wrapper.
 
 ## Configuration and state
 
-`ZiPaths` is the immutable owner of one effective cwd. It resolves
-`$HOME/.zi/agent`, exact `<cwd>/.zi`, and the global models file. Settings,
-credentials, resources, and persistent session creation consume that cwd-bound
-value. Do not join `.zi` or re-read process cwd inside those owners.
+`ZiPaths` is the immutable owner of one effective cwd and one home. From those
+two admitted values it resolves the global agent directory, its sessions
+directory, the exact project `.zi`, and the global models file. Settings,
+credentials, resources, and persistent session creation consume those cwd-bound
+values. Do not join `.zi` or re-read process cwd inside those owners.
 
 The session journal is the append-only JSONL authority for one durable session
 when persistence is admitted. Torn-tail repair happens on the next append. The
 owner that creates a session disposes it.
 
 Credentials are admitted values on the session runtime, not ambient environment
-reads scattered through the tree. Do not add a second configuration path for
-the same fact.
+reads scattered through the tree. The process edge reads the environment once
+and passes the value inward; owners take credential inputs and never call
+`getenv`. Do not add a second configuration path for the same fact.
 
 ## Zig-specific patterns
 
@@ -169,18 +241,24 @@ the same fact.
 ### I/O (Zig 0.16)
 
 - `main` uses `pub fn main(init: std.process.Init) !void`.
-- Pass `std.Io` explicitly. File operations use `std.Io.Dir` and `std.Io.File`.
+- Pass `std.Io` explicitly. File and directory operations use `std.Io.File` and
+  `std.Io.Dir`, not `std.fs`. Pure path math (`std.fs.path.resolve`, `join`,
+  `dirname`) is not I/O and stays on `std.fs.path`.
 - In test blocks, use `std.testing.io`.
 - `ArrayList(T)` initializes with `.empty`.
-- `std.mem` renames: `trimStart`, `trimEnd`, `find`, `findScalar`.
+- New code uses the current `std.mem` names: `find`, `findScalar`,
+  `findScalarPos`, `trimStart`, `trimEnd`. `indexOf` and `indexOfScalar` are
+  deprecated aliases that still compile, and the tree still has call sites using
+  them. Do not mass-rename them as a side effect of unrelated work.
 
 ## Testing
 
 Zig unit tests go inside the source file they test, using
-`test "description" { ... }` blocks.
+`test "description" { ... }` blocks. A new file is only reached by the suite
+once its module `root.zig` references it.
 
 - Run the narrowest relevant tests while developing. `zig build test` is the
-  full suite.
+  full suite, and it also runs the model-catalog check.
 - Use `std.testing.expect`, `std.testing.expectEqual`, and
   `std.testing.expectEqualStrings`.
 - Cover transitions, forbidden transitions, cancellation, stale completion, and
@@ -193,10 +271,15 @@ There is no TypeScript, bun, or e2e suite on this branch.
 
 There is no product `docs/` tree until the Zig binary has a user-facing surface.
 
+`README.md` is currently a logo and a one-line description. It is not yet a
+build or usage reference, so do not cite it as the authority for either.
+`build.zig` owns the step list and `src/main.zig` owns what the process does.
+
 When behavior that already exists in the binary changes:
 
 1. Update `--help` only after the process actually exposes it.
-2. Update `README.md` for build steps and what the binary does today.
+2. Give `README.md` build steps and a usage section at the same time the binary
+   first has a real surface, and keep it accurate from then on.
 
 Do not document intended behavior as if it already exists. Completed
 implementation plans remain available in commit history instead of forming a
@@ -205,6 +288,7 @@ second documentation tree.
 ## What not to do
 
 - Do not grow `main.zig` with leaf feature logic.
+- Do not report a library-level change as a user-facing capability.
 - Do not reintroduce TypeScript, bun, npm, OpenTUI, Nano Stores, TypeBox, or
   `packages/` into this Zig tree.
 - Do not add a second execution path for the same feature without a clear reason.
@@ -212,7 +296,8 @@ second documentation tree.
 - Do not copy a reference project's product scope wholesale (ZigAI agent/graph/
   MCP/durable-workflow/UI; fx TUI/ACP/WASM/PGSO/tape replay/release machinery).
   Take a pattern only when it fits an existing Zi owner.
-- Do not commit generated state from `.zig-cache/` or `zig-out/`.
+- Do not reach past another module's `root.zig` to import one of its files.
+- Do not commit generated state from `.zig-cache/`, `zig-out/`, or `.zi/`.
 - Do not add dependencies outside the Zig standard library without discussion.
 - Do not use `@import` with runtime-computed paths.
 - Do not ignore `zig fmt` failures.
@@ -221,15 +306,23 @@ second documentation tree.
 ## Before marking a change ready
 
 1. Run `zig fmt --check src/ tools/` and the focused tests for the changed path.
-2. Build and exercise the change with `./zig-out/bin/zi`.
-3. Update `README.md` only if user-visible behavior already exists and changed.
-4. If this file's durable claims no longer match the tree, update this file in
+2. Build and exercise the change with `./zig-out/bin/zi`, at the level the
+   change is reachable.
+3. Run the commands CI will run. If the commit has been pushed, confirm CI
+   passes on that exact commit.
+4. Update `README.md` only if user-visible behavior already exists and changed.
+5. If this file's durable claims no longer match the tree, update this file in
    the same change.
 
 ## Keeping this file honest
 
 Update `AGENTS.md` when a durable rule changes: ownership boundaries, toolchain
-commands, ready-gate requirements, or hard prohibitions.
+commands, ready-gate requirements, dependency direction, or hard prohibitions.
+
+Reconcile against the tree, not against memory of the tree. Before trusting a
+claim here, check the file it names. A rule that cannot currently be satisfied
+is worse than no rule, because it teaches the next agent to route around this
+file.
 
 Do not use this file as a changelog of admitted providers, tools, CLI modes, or
 reference commit pins. Those belong in `src/`, `README.md`,
