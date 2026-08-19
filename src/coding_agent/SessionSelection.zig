@@ -5,6 +5,7 @@ const journal_api = @import("SessionJournal.zig");
 const ZiPaths = @import("ZiPaths.zig");
 
 const SessionSelection = @This();
+const sessions_directory_name = "sessions";
 const max_directory_entries = 4096;
 const private_dir_permissions = std.Io.File.Permissions.fromMode(0o700);
 
@@ -122,16 +123,18 @@ fn createNew(
     var paths = try ZiPaths.init(allocator, cwd, home);
     errdefer paths.deinit();
     try admitCwd(io, paths.cwd);
-    try ensureSessionStorage(io, paths.global_sessions);
+    const sessions_path = try resolveSessionsPath(allocator, &paths);
+    defer allocator.free(sessions_path);
+    try ensureSessionStorage(io, sessions_path);
 
     const stamp = try sources.next();
     var filename_buffer: [42]u8 = undefined;
     const filename = std.fmt.bufPrint(&filename_buffer, "{s}.jsonl", .{stamp.id()}) catch unreachable;
-    const journal_path = std.fs.path.resolve(allocator, &.{ paths.global_sessions, filename }) catch
+    const journal_path = std.fs.path.resolve(allocator, &.{ sessions_path, filename }) catch
         return error.OutOfMemory;
     errdefer allocator.free(journal_path);
     if (journal_path.len > ZiPaths.max_path_bytes) return error.InvalidSessionPath;
-    var directory = std.Io.Dir.openDir(.cwd(), io, paths.global_sessions, .{}) catch
+    var directory = std.Io.Dir.openDir(.cwd(), io, sessions_path, .{}) catch
         return error.SessionStorageUnavailable;
     defer directory.close(io);
 
@@ -225,7 +228,9 @@ fn findRecent(
     io: std.Io,
     paths: *const ZiPaths,
 ) Error!?[]u8 {
-    var directory = std.Io.Dir.openDir(.cwd(), io, paths.global_sessions, .{ .iterate = true }) catch |failure| {
+    const sessions_path = try resolveSessionsPath(allocator, paths);
+    defer allocator.free(sessions_path);
+    var directory = std.Io.Dir.openDir(.cwd(), io, sessions_path, .{ .iterate = true }) catch |failure| {
         return switch (failure) {
             error.FileNotFound => null,
             else => error.SessionStorageUnavailable,
@@ -264,7 +269,7 @@ fn findRecent(
     }
 
     const name = best_name orelse return null;
-    const result = std.fs.path.resolve(allocator, &.{ paths.global_sessions, name }) catch
+    const result = std.fs.path.resolve(allocator, &.{ sessions_path, name }) catch
         return error.OutOfMemory;
     if (result.len > ZiPaths.max_path_bytes) {
         allocator.free(result);
@@ -281,6 +286,16 @@ fn admitCwd(io: std.Io, cwd: []const u8) Error!void {
         };
     };
     if (stat.kind != .directory) return error.MissingCwd;
+}
+
+fn resolveSessionsPath(allocator: std.mem.Allocator, paths: *const ZiPaths) Error![]u8 {
+    const result = std.fs.path.resolve(allocator, &.{ paths.global_agent, sessions_directory_name }) catch
+        return error.OutOfMemory;
+    if (result.len > ZiPaths.max_path_bytes) {
+        allocator.free(result);
+        return error.InvalidSessionPath;
+    }
+    return result;
 }
 
 fn ensureSessionStorage(io: std.Io, path: []const u8) Error!void {
@@ -363,7 +378,9 @@ test "session selection creates a private journal from admitted paths" {
     try std.testing.expect(selected.origin == .new);
     try std.testing.expectEqualStrings(root, selected.paths.cwd);
     try std.testing.expectEqualStrings(root, selected.restored().header.cwd);
-    try std.testing.expect(std.mem.startsWith(u8, selected.journal_path, selected.paths.global_sessions));
+    const sessions_path = try resolveSessionsPath(std.testing.allocator, &selected.paths);
+    defer std.testing.allocator.free(sessions_path);
+    try std.testing.expect(std.mem.startsWith(u8, selected.journal_path, sessions_path));
     const stat = try std.Io.Dir.statFile(.cwd(), std.testing.io, selected.journal_path, .{});
     try std.testing.expectEqual(@as(u16, 0), stat.permissions.toMode() & 0o077);
 }
@@ -482,8 +499,10 @@ test "session continuation ignores corrupt candidates and creates a new journal"
     const root = try temporaryPath(&temporary, &root_buffer);
     var paths = try ZiPaths.init(std.testing.allocator, root, root);
     defer paths.deinit();
-    try ensureSessionStorage(std.testing.io, paths.global_sessions);
-    var directory = try std.Io.Dir.openDir(.cwd(), std.testing.io, paths.global_sessions, .{});
+    const sessions_path = try resolveSessionsPath(std.testing.allocator, &paths);
+    defer std.testing.allocator.free(sessions_path);
+    try ensureSessionStorage(std.testing.io, sessions_path);
+    var directory = try std.Io.Dir.openDir(.cwd(), std.testing.io, sessions_path, .{});
     defer directory.close(std.testing.io);
     try directory.writeFile(std.testing.io, .{
         .sub_path = "corrupt.jsonl",
@@ -511,8 +530,10 @@ test "session continuation bounds directory inspection" {
     const root = try temporaryPath(&temporary, &root_buffer);
     var paths = try ZiPaths.init(std.testing.allocator, root, root);
     defer paths.deinit();
-    try ensureSessionStorage(std.testing.io, paths.global_sessions);
-    var directory = try std.Io.Dir.openDir(.cwd(), std.testing.io, paths.global_sessions, .{});
+    const sessions_path = try resolveSessionsPath(std.testing.allocator, &paths);
+    defer std.testing.allocator.free(sessions_path);
+    try ensureSessionStorage(std.testing.io, sessions_path);
+    var directory = try std.Io.Dir.openDir(.cwd(), std.testing.io, sessions_path, .{});
     defer directory.close(std.testing.io);
     var name_buffer: [32]u8 = undefined;
     for (0..max_directory_entries + 1) |index| {

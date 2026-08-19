@@ -9,6 +9,7 @@ const ZiPaths = @import("ZiPaths.zig");
 
 const ModelConfigSnapshot = @This();
 
+const models_file_name = "models.json";
 const max_document_bytes = 1024 * 1024;
 const max_value_bytes = 32 * 1024;
 const max_json_depth = 32;
@@ -132,9 +133,17 @@ pub fn load(
     var arena = std.heap.ArenaAllocator.init(allocator);
     errdefer arena.deinit();
 
-    const source_text = std.Io.Dir.cwd().readFileAlloc(
+    const directory = std.Io.Dir.openDirAbsolute(io, paths.global_agent, .{}) catch |failure| {
+        return switch (failure) {
+            error.Canceled => error.Cancelled,
+            error.FileNotFound => settled(arena, null),
+            else => settled(arena, .unreadable),
+        };
+    };
+    defer directory.close(io);
+    const source_text = directory.readFileAlloc(
         io,
-        paths.global_models_file,
+        models_file_name,
         allocator,
         .limited(max_document_bytes),
     ) catch |failure| return switch (failure) {

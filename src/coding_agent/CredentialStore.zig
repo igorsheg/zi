@@ -155,7 +155,14 @@ pub fn load(
     io: std.Io,
     paths: *const ZiPaths,
 ) Error!Snapshot {
-    return loadFile(allocator, io, .cwd(), paths.global_auth_file);
+    const directory = std.Io.Dir.openDirAbsolute(io, paths.global_agent, .{}) catch |failure| {
+        return switch (failure) {
+            error.FileNotFound => empty(allocator),
+            else => error.ReadFailed,
+        };
+    };
+    defer directory.close(io);
+    return loadFile(allocator, io, directory, auth_file_name);
 }
 
 pub fn beginMutation(io: std.Io, paths: *const ZiPaths) Error!Mutation {
@@ -458,7 +465,9 @@ test "credential store atomically inserts and replaces provider credentials" {
     try std.testing.expectEqualStrings("access-token", snapshot.entries[1].credential.oauth.access);
     try std.testing.expectEqualStrings("refresh-token", snapshot.entries[1].credential.oauth.refresh);
 
-    const file = try std.Io.Dir.cwd().openFile(std.testing.io, paths.global_auth_file, .{
+    var agent_directory = try std.Io.Dir.openDirAbsolute(std.testing.io, paths.global_agent, .{});
+    defer agent_directory.close(std.testing.io);
+    const file = try agent_directory.openFile(std.testing.io, auth_file_name, .{
         .mode = .read_only,
         .allow_directory = false,
     });
@@ -467,9 +476,9 @@ test "credential store atomically inserts and replaces provider credentials" {
     if (comptime builtin.os.tag != .windows) {
         try std.testing.expectEqual(@as(u16, 0), stat.permissions.toMode() & 0o077);
     }
-    const encoded = try std.Io.Dir.cwd().readFileAlloc(
+    const encoded = try agent_directory.readFileAlloc(
         std.testing.io,
-        paths.global_auth_file,
+        auth_file_name,
         std.testing.allocator,
         .limited(max_document_bytes),
     );

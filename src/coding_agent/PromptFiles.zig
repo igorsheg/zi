@@ -2,6 +2,8 @@ const std = @import("std");
 const ZiPaths = @import("ZiPaths.zig");
 
 const PromptFiles = @This();
+const system_file_name = "SYSTEM.md";
+const append_file_name = "APPEND_SYSTEM.md";
 const max_file_bytes = 1024 * 1024;
 const read_buffer_bytes = 8192;
 
@@ -32,12 +34,24 @@ pub fn load(
     var arena = std.heap.ArenaAllocator.init(allocator);
     errdefer arena.deinit();
     const owned = arena.allocator();
+    const directory = std.Io.Dir.openDirAbsolute(io, paths.global_agent, .{}) catch |failure| {
+        return switch (failure) {
+            error.FileNotFound => .{
+                .arena = arena,
+                .system_text = null,
+                .append_text = null,
+            },
+            error.Canceled => error.Cancelled,
+            else => error.PromptFileReadFailed,
+        };
+    };
+    defer directory.close(io);
     const system_text = if (requested.system)
-        try loadOptionalText(owned, io, paths.global_system_prompt_file)
+        try loadOptionalText(owned, io, directory, system_file_name)
     else
         null;
     const append_text = if (requested.append)
-        try loadOptionalText(owned, io, paths.global_append_system_prompt_file)
+        try loadOptionalText(owned, io, directory, append_file_name)
     else
         null;
     return .{
@@ -63,9 +77,10 @@ pub fn append(self: *const PromptFiles) ?[]const u8 {
 fn loadOptionalText(
     allocator: std.mem.Allocator,
     io: std.Io,
-    path: []const u8,
+    directory: std.Io.Dir,
+    file_name: []const u8,
 ) Error!?[]const u8 {
-    const path_stat = std.Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch |failure| {
+    const path_stat = directory.statFile(io, file_name, .{ .follow_symlinks = false }) catch |failure| {
         return switch (failure) {
             error.FileNotFound, error.NotDir => null,
             error.Canceled => error.Cancelled,
@@ -75,7 +90,7 @@ fn loadOptionalText(
     if (path_stat.kind != .file) return error.UnsafePromptFile;
     if (path_stat.size > max_file_bytes) return error.PromptFileTooLarge;
 
-    const file = std.Io.Dir.cwd().openFile(io, path, .{
+    const file = directory.openFile(io, file_name, .{
         .mode = .read_only,
         .allow_directory = false,
         .follow_symlinks = false,

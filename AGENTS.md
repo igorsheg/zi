@@ -195,10 +195,10 @@ pass-through wrapper.
 ## Configuration and state
 
 `ZiPaths` is the immutable owner of one effective cwd and one home. From those
-two admitted values it resolves the global agent directory, its sessions
-directory, the exact project `.zi`, and the global models and prompt files. Settings,
-credentials, resources, and persistent session creation consume those cwd-bound
-values. Do not join `.zi` or re-read process cwd inside those owners.
+two admitted values it resolves the global agent root and the exact project `.zi`
+root. Feature owners define their directories and files beneath those roots.
+Settings, credentials, resources, and persistent session creation consume the
+cwd-bound roots. Do not join `.zi` or re-read process cwd inside those owners.
 
 The session journal is the append-only JSONL authority for one durable session
 when persistence is admitted. Torn-tail repair happens on the next append. The

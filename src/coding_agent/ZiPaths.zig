@@ -12,13 +12,7 @@ arena: std.heap.ArenaAllocator,
 cwd: []const u8,
 home: []const u8,
 global_agent: []const u8,
-global_sessions: []const u8,
 project: []const u8,
-global_models_file: []const u8,
-global_auth_file: []const u8,
-global_auth_lock: []const u8,
-global_system_prompt_file: []const u8,
-global_append_system_prompt_file: []const u8,
 
 pub fn init(allocator: std.mem.Allocator, cwd: []const u8, home: []const u8) Error!ZiPaths {
     try validateAbsolutePath(cwd);
@@ -30,38 +24,15 @@ pub fn init(allocator: std.mem.Allocator, cwd: []const u8, home: []const u8) Err
     const normalized_cwd = try std.fs.path.resolve(owned, &.{cwd});
     const normalized_home = try std.fs.path.resolve(owned, &.{home});
     const global_agent = try std.fs.path.resolve(owned, &.{ normalized_home, ".zi", "agent" });
-    const global_sessions = try std.fs.path.resolve(owned, &.{ global_agent, "sessions" });
     const project = try std.fs.path.resolve(owned, &.{ normalized_cwd, ".zi" });
-    const global_models_file = try std.fs.path.resolve(owned, &.{ global_agent, "models.json" });
-    const global_auth_file = try std.fs.path.resolve(owned, &.{ global_agent, "auth.json" });
-    const global_auth_lock = try std.fs.path.resolve(owned, &.{ global_agent, ".auth.lock" });
-    const global_system_prompt_file = try std.fs.path.resolve(owned, &.{ global_agent, "SYSTEM.md" });
-    const global_append_system_prompt_file = try std.fs.path.resolve(owned, &.{ global_agent, "APPEND_SYSTEM.md" });
-    if (normalized_cwd.len > max_path_bytes or
-        global_agent.len > max_path_bytes or
-        global_sessions.len > max_path_bytes or
-        project.len > max_path_bytes or
-        global_models_file.len > max_path_bytes or
-        global_auth_file.len > max_path_bytes or
-        global_auth_lock.len > max_path_bytes or
-        global_system_prompt_file.len > max_path_bytes or
-        global_append_system_prompt_file.len > max_path_bytes)
-    {
-        return error.InvalidPath;
-    }
+    if (global_agent.len > max_path_bytes or project.len > max_path_bytes) return error.InvalidPath;
 
     return .{
         .arena = arena,
         .cwd = normalized_cwd,
         .home = normalized_home,
         .global_agent = global_agent,
-        .global_sessions = global_sessions,
         .project = project,
-        .global_models_file = global_models_file,
-        .global_auth_file = global_auth_file,
-        .global_auth_lock = global_auth_lock,
-        .global_system_prompt_file = global_system_prompt_file,
-        .global_append_system_prompt_file = global_append_system_prompt_file,
     };
 }
 
@@ -77,7 +48,7 @@ fn validateAbsolutePath(path: []const u8) error{InvalidPath}!void {
     if (!std.fs.path.isAbsolute(path)) return error.InvalidPath;
 }
 
-test "Zi paths own normalized cwd-bound configuration roots" {
+test "Zi paths own normalized cwd-bound roots" {
     const cwd_input = try std.testing.allocator.dupe(u8, "/tmp/zi-work/./child/..");
     defer std.testing.allocator.free(cwd_input);
     const home_input = try std.testing.allocator.dupe(u8, "/tmp/zi-home/./user/..");
@@ -91,19 +62,7 @@ test "Zi paths own normalized cwd-bound configuration roots" {
     try std.testing.expectEqualStrings("/tmp/zi-work", paths.cwd);
     try std.testing.expectEqualStrings("/tmp/zi-home", paths.home);
     try std.testing.expectEqualStrings("/tmp/zi-home/.zi/agent", paths.global_agent);
-    try std.testing.expectEqualStrings("/tmp/zi-home/.zi/agent/sessions", paths.global_sessions);
     try std.testing.expectEqualStrings("/tmp/zi-work/.zi", paths.project);
-    try std.testing.expectEqualStrings("/tmp/zi-home/.zi/agent/models.json", paths.global_models_file);
-    try std.testing.expectEqualStrings("/tmp/zi-home/.zi/agent/auth.json", paths.global_auth_file);
-    try std.testing.expectEqualStrings("/tmp/zi-home/.zi/agent/.auth.lock", paths.global_auth_lock);
-    try std.testing.expectEqualStrings(
-        "/tmp/zi-home/.zi/agent/SYSTEM.md",
-        paths.global_system_prompt_file,
-    );
-    try std.testing.expectEqualStrings(
-        "/tmp/zi-home/.zi/agent/APPEND_SYSTEM.md",
-        paths.global_append_system_prompt_file,
-    );
 }
 
 test "Zi paths reject invalid admitted roots" {
