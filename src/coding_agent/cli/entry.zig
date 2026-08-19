@@ -125,5 +125,9 @@ fn writeCliHelp(writer: *std.Io.Writer) !void {
         \\  -h, --help           Show help
         \\  -v, --version        Show the version
         \\
+        \\Prompt files:
+        \\  $HOME/.zi/agent/SYSTEM.md         Replace the composed prompt base
+        \\  $HOME/.zi/agent/APPEND_SYSTEM.md  Append persistent rules
+        \\
     );
 }

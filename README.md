@@ -42,4 +42,6 @@ Append rules to Zi's default system prompt for one launch:
 
 `--append-system-prompt` is an alias for `--rules`. Use `--system-prompt` or `--system-prompt-override` to replace the default prompt verbatim. Append and replacement options cannot be combined.
 
+For persistent customization, Zi loads `$HOME/.zi/agent/SYSTEM.md` as the composed prompt base and `$HOME/.zi/agent/APPEND_SYSTEM.md` as appended rules. An explicit replacement bypasses both files. Explicit `--rules` replaces `APPEND_SYSTEM.md` for that launch while retaining `SYSTEM.md` as the base. Files must be regular UTF-8 text without NUL bytes and may not exceed 1 MiB each.
+
 Run `./zig-out/bin/zi --help` for the current command surface. Interactive, JSON, and RPC modes are not available yet.

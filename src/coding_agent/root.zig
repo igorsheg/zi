@@ -11,6 +11,7 @@ const credential_store = @import("CredentialStore.zig");
 const model_config = @import("ModelConfig.zig");
 const model_config_snapshot = @import("ModelConfigSnapshot.zig");
 const model_resolution = @import("ModelResolution.zig");
+const prompt_files = @import("PromptFiles.zig");
 const session_format = @import("SessionFormat.zig");
 const session_journal = @import("SessionJournal.zig");
 const session_commit = @import("SessionCommit.zig");
@@ -32,6 +33,7 @@ test {
     _ = model_config;
     _ = model_config_snapshot;
     _ = model_resolution;
+    _ = prompt_files;
     _ = RuntimeServices;
     _ = session_format;
     _ = session_journal;

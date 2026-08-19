@@ -6,9 +6,11 @@ const CredentialManager = @import("CredentialManager.zig");
 const CredentialStore = @import("CredentialStore.zig");
 const ModelConfigSnapshot = @import("ModelConfigSnapshot.zig");
 const ModelResolution = @import("ModelResolution.zig");
+const PromptFiles = @import("PromptFiles.zig");
 const SessionFormat = @import("SessionFormat.zig");
 const SessionJournal = @import("SessionJournal.zig");
 const SessionSelection = @import("SessionSelection.zig");
+const SystemPrompt = @import("SystemPrompt.zig");
 const ZiPaths = @import("ZiPaths.zig");
 
 const RuntimeServices = @This();
@@ -50,6 +52,10 @@ pub const Error = error{
     InvalidModelConfiguration,
     InvalidSystemPrompt,
     SystemPromptTooLarge,
+    PromptFileTooLarge,
+    InvalidPromptFile,
+    UnsafePromptFile,
+    PromptFileReadFailed,
     SelectionRequired,
     IncompleteSelection,
     UnknownSelection,
@@ -153,6 +159,21 @@ fn createOwned(
     );
     errdefer selection.deinit();
 
+    var runtime_options = inputs.options;
+    runtime_options.prompt.working_directory = selection.pathsView().cwd;
+    const requested_prompt_files = requestedPromptFiles(runtime_options.prompt.policy);
+    var prompt_files: ?PromptFiles = if (requested_prompt_files.system or requested_prompt_files.append)
+        try PromptFiles.load(allocator, io, selection.pathsView(), requested_prompt_files)
+    else
+        null;
+    defer if (prompt_files) |*files| files.deinit();
+    var discovered_appends: [1][]const u8 = undefined;
+    runtime_options.prompt.policy = resolvePromptPolicy(
+        runtime_options.prompt.policy,
+        if (prompt_files) |*files| files else null,
+        &discovered_appends,
+    );
+
     var snapshot = try ModelConfigSnapshot.load(allocator, io, selection.pathsView());
     errdefer snapshot.deinit();
     const requested = effectiveRequest(&selection, inputs);
@@ -230,8 +251,6 @@ fn createOwned(
     var cwd = std.Io.Dir.openDir(.cwd(), io, selection.pathsView().cwd, .{}) catch
         return error.CwdUnavailable;
     errdefer cwd.close(io);
-    var runtime_options = inputs.options;
-    runtime_options.prompt.working_directory = selection.pathsView().cwd;
     var opened = selection.takeJournal();
     const runtime = switch (transport) {
         .http => try AgentSessionRuntime.createDurable(
@@ -269,6 +288,47 @@ fn createOwned(
         .runtime = runtime,
     };
     return self;
+}
+
+fn requestedPromptFiles(policy: SystemPrompt.Policy) PromptFiles.Requested {
+    return switch (policy) {
+        .verbatim => .{},
+        .composed => |composition| .{
+            .system = switch (composition.base) {
+                .builtin => true,
+                .custom => false,
+            },
+            .append = composition.appends.len == 0,
+        },
+    };
+}
+
+fn resolvePromptPolicy(
+    policy: SystemPrompt.Policy,
+    files: ?*const PromptFiles,
+    discovered_appends: *[1][]const u8,
+) SystemPrompt.Policy {
+    return switch (policy) {
+        .verbatim => policy,
+        .composed => |composition| .{ .composed = .{
+            .base = switch (composition.base) {
+                .builtin => if (files) |loaded|
+                    if (loaded.system()) |text| .{ .custom = text } else .builtin
+                else
+                    .builtin,
+                .custom => composition.base,
+            },
+            .appends = if (composition.appends.len > 0)
+                composition.appends
+            else if (files) |loaded|
+                if (loaded.append()) |text| appends: {
+                    discovered_appends[0] = text;
+                    break :appends discovered_appends[0..1];
+                } else &.{}
+            else
+                &.{},
+        } },
+    };
 }
 
 const RequestedModel = struct {
@@ -357,7 +417,7 @@ fn openJournal(allocator: std.mem.Allocator, path: []const u8) !SessionJournal.O
     );
 }
 
-test "runtime services compose effective paths, models, credentials, durability, and transport" {
+test "runtime services compose effective paths, models, prompts, credentials, durability, and transport" {
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();
     try temporary.dir.writeFile(std.testing.io, .{ .sub_path = "evidence.txt", .data = "cwd evidence" });
@@ -368,6 +428,14 @@ test "runtime services compose effective paths, models, credentials, durability,
     try CredentialStore.put(std.testing.allocator, std.testing.io, &credential_paths, .{
         .provider_id = "custom-openai",
         .credential = .{ .api_key = .{ .key = "stored-custom-secret" } },
+    });
+    try temporary.dir.writeFile(std.testing.io, .{
+        .sub_path = ".zi/agent/SYSTEM.md",
+        .data = "Global system base.",
+    });
+    try temporary.dir.writeFile(std.testing.io, .{
+        .sub_path = ".zi/agent/APPEND_SYSTEM.md",
+        .data = "Ignored global rules.",
     });
     try writeCustomModels(&temporary);
     var sources: TestSources = .{};
@@ -380,8 +448,23 @@ test "runtime services compose effective paths, models, credentials, durability,
         \\data: {"type":"response.completed","response":{"status":"completed"}}
         \\
     ;
+    const Inspector = struct {
+        const Self = @This();
+
+        prompt_seen: bool = false,
+
+        fn inspect(context: *anyopaque, request: ai.transport.Request) error{Rejected}!void {
+            const self: *Self = @ptrCast(@alignCast(context));
+            if (std.mem.find(u8, request.body, "Global system base.") == null) return error.Rejected;
+            if (std.mem.find(u8, request.body, "Use focused tests.") == null) return error.Rejected;
+            if (std.mem.find(u8, request.body, "Ignored global rules.") != null) return error.Rejected;
+            self.prompt_seen = true;
+        }
+    };
     const exchanges = [_]fake_api.Exchange{.{ .response = .{ .status = 200, .body = response } }};
     var fake = fake_api.FakeTransport.init(&exchanges);
+    var inspector: Inspector = .{};
+    fake.inspector = .{ .context = &inspector, .inspect_fn = Inspector.inspect };
 
     var services = try createWithTransport(std.testing.allocator, std.testing.io, .{
         .startup_cwd = root,
@@ -398,13 +481,20 @@ test "runtime services compose effective paths, models, credentials, durability,
     defer std.testing.allocator.free(journal_path);
     try std.testing.expectEqualStrings(root, services.paths().cwd);
     try std.testing.expect(services.modelDiagnostic() == null);
+    try std.testing.expect(std.mem.startsWith(u8, services.session().systemPrompt(), "Global system base."));
     try std.testing.expect(std.mem.find(u8, services.session().systemPrompt(), root) != null);
     try std.testing.expect(std.mem.find(
         u8,
         services.session().systemPrompt(),
         "<human_rules>\nUse focused tests.\n</human_rules>",
     ) != null);
+    try std.testing.expect(std.mem.find(
+        u8,
+        services.session().systemPrompt(),
+        "Ignored global rules.",
+    ) == null);
     try std.testing.expectEqualStrings("composed", try services.session().prompt("hello"));
+    try std.testing.expect(inspector.prompt_seen);
     services.deinit();
 
     var opened = try openJournal(std.testing.allocator, journal_path);
@@ -415,6 +505,87 @@ test "runtime services compose effective paths, models, credentials, durability,
     try std.testing.expectEqualStrings("model-a", entries[0].model_change.selection.model);
     try std.testing.expect(entries[3].turn_end.outcome == .completed);
     try std.testing.expectEqual(@as(usize, 1), fake.next_index);
+}
+
+test "runtime services discover global prompt files for default composition" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try temporary.dir.createDirPath(std.testing.io, ".zi/agent");
+    try temporary.dir.writeFile(std.testing.io, .{
+        .sub_path = ".zi/agent/SYSTEM.md",
+        .data = "Discovered base.",
+    });
+    try temporary.dir.writeFile(std.testing.io, .{
+        .sub_path = ".zi/agent/APPEND_SYSTEM.md",
+        .data = "Discovered rules.",
+    });
+    var root_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root = try temporaryPath(&temporary, &root_buffer);
+    var sources: TestSources = .{};
+    var fake = fake_api.FakeTransport.init(&.{});
+
+    var services = try createWithTransport(std.testing.allocator, std.testing.io, .{
+        .startup_cwd = root,
+        .home = root,
+        .session = .new,
+        .sources = sources.view(),
+        .requested_provider = "openai",
+        .requested_model = "gpt-5.6",
+        .cli_api_key = "secret",
+    }, fake.transport());
+    defer services.deinit();
+
+    try std.testing.expect(std.mem.startsWith(u8, services.session().systemPrompt(), "Discovered base."));
+    try std.testing.expect(std.mem.find(
+        u8,
+        services.session().systemPrompt(),
+        "<human_rules>\nDiscovered rules.\n</human_rules>",
+    ) != null);
+}
+
+test "runtime services do not read global prompt files shadowed by explicit policy" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try temporary.dir.createDirPath(std.testing.io, ".zi/agent/SYSTEM.md");
+    try temporary.dir.createDir(std.testing.io, ".zi/agent/APPEND_SYSTEM.md", .default_dir);
+    var root_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root = try temporaryPath(&temporary, &root_buffer);
+    var sources: TestSources = .{};
+    var fake = fake_api.FakeTransport.init(&.{});
+
+    var replaced = try createWithTransport(std.testing.allocator, std.testing.io, .{
+        .startup_cwd = root,
+        .home = root,
+        .session = .new,
+        .sources = sources.view(),
+        .requested_provider = "openai",
+        .requested_model = "gpt-5.6",
+        .cli_api_key = "secret",
+        .options = .{ .prompt = .{ .policy = .{ .verbatim = "Explicit replacement." } } },
+    }, fake.transport());
+    try std.testing.expectEqualStrings("Explicit replacement.", replaced.session().systemPrompt());
+    replaced.deinit();
+
+    try temporary.dir.deleteTree(std.testing.io, ".zi/agent/SYSTEM.md");
+    try temporary.dir.writeFile(std.testing.io, .{
+        .sub_path = ".zi/agent/SYSTEM.md",
+        .data = "Discovered base.",
+    });
+    var appended = try createWithTransport(std.testing.allocator, std.testing.io, .{
+        .startup_cwd = root,
+        .home = root,
+        .session = .new,
+        .sources = sources.view(),
+        .requested_provider = "openai",
+        .requested_model = "gpt-5.6",
+        .cli_api_key = "secret",
+        .options = .{ .prompt = .{ .policy = .{ .composed = .{
+            .appends = &.{"Explicit rules."},
+        } } } },
+    }, fake.transport());
+    defer appended.deinit();
+    try std.testing.expect(std.mem.startsWith(u8, appended.session().systemPrompt(), "Discovered base."));
+    try std.testing.expect(std.mem.find(u8, appended.session().systemPrompt(), "Explicit rules.") != null);
 }
 
 test "runtime services refresh and persist expired Codex credentials before prompting" {

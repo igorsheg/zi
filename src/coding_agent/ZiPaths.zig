@@ -17,6 +17,8 @@ project: []const u8,
 global_models_file: []const u8,
 global_auth_file: []const u8,
 global_auth_lock: []const u8,
+global_system_prompt_file: []const u8,
+global_append_system_prompt_file: []const u8,
 
 pub fn init(allocator: std.mem.Allocator, cwd: []const u8, home: []const u8) Error!ZiPaths {
     try validateAbsolutePath(cwd);
@@ -33,13 +35,17 @@ pub fn init(allocator: std.mem.Allocator, cwd: []const u8, home: []const u8) Err
     const global_models_file = try std.fs.path.resolve(owned, &.{ global_agent, "models.json" });
     const global_auth_file = try std.fs.path.resolve(owned, &.{ global_agent, "auth.json" });
     const global_auth_lock = try std.fs.path.resolve(owned, &.{ global_agent, ".auth.lock" });
+    const global_system_prompt_file = try std.fs.path.resolve(owned, &.{ global_agent, "SYSTEM.md" });
+    const global_append_system_prompt_file = try std.fs.path.resolve(owned, &.{ global_agent, "APPEND_SYSTEM.md" });
     if (normalized_cwd.len > max_path_bytes or
         global_agent.len > max_path_bytes or
         global_sessions.len > max_path_bytes or
         project.len > max_path_bytes or
         global_models_file.len > max_path_bytes or
         global_auth_file.len > max_path_bytes or
-        global_auth_lock.len > max_path_bytes)
+        global_auth_lock.len > max_path_bytes or
+        global_system_prompt_file.len > max_path_bytes or
+        global_append_system_prompt_file.len > max_path_bytes)
     {
         return error.InvalidPath;
     }
@@ -54,6 +60,8 @@ pub fn init(allocator: std.mem.Allocator, cwd: []const u8, home: []const u8) Err
         .global_models_file = global_models_file,
         .global_auth_file = global_auth_file,
         .global_auth_lock = global_auth_lock,
+        .global_system_prompt_file = global_system_prompt_file,
+        .global_append_system_prompt_file = global_append_system_prompt_file,
     };
 }
 
@@ -88,6 +96,14 @@ test "Zi paths own normalized cwd-bound configuration roots" {
     try std.testing.expectEqualStrings("/tmp/zi-home/.zi/agent/models.json", paths.global_models_file);
     try std.testing.expectEqualStrings("/tmp/zi-home/.zi/agent/auth.json", paths.global_auth_file);
     try std.testing.expectEqualStrings("/tmp/zi-home/.zi/agent/.auth.lock", paths.global_auth_lock);
+    try std.testing.expectEqualStrings(
+        "/tmp/zi-home/.zi/agent/SYSTEM.md",
+        paths.global_system_prompt_file,
+    );
+    try std.testing.expectEqualStrings(
+        "/tmp/zi-home/.zi/agent/APPEND_SYSTEM.md",
+        paths.global_append_system_prompt_file,
+    );
 }
 
 test "Zi paths reject invalid admitted roots" {

@@ -196,7 +196,7 @@ pass-through wrapper.
 
 `ZiPaths` is the immutable owner of one effective cwd and one home. From those
 two admitted values it resolves the global agent directory, its sessions
-directory, the exact project `.zi`, and the global models file. Settings,
+directory, the exact project `.zi`, and the global models and prompt files. Settings,
 credentials, resources, and persistent session creation consume those cwd-bound
 values. Do not join `.zi` or re-read process cwd inside those owners.
 
