@@ -39,6 +39,13 @@ const builtin_base =
 
 const environment_before = "\n\n<environment>\n<working_directory>";
 const environment_after = "</working_directory>\n</environment>";
+const context_before =
+    "\n\n<project_context>\n" ++
+    "Project-specific instructions and guidelines, ordered from broadest to narrowest scope:\n";
+const context_section_before = "\n<project_instructions path=\"";
+const context_path_after = "\">\n";
+const context_section_after = "\n</project_instructions>\n";
+const context_after = "</project_context>";
 const rules_before = "\n\n<human_rules>\n";
 const rules_between = "\n\n";
 const rules_after = "\n</human_rules>";
@@ -48,9 +55,15 @@ pub const Base = union(enum) {
     custom: []const u8,
 };
 
+pub const ContextSection = struct {
+    path: []const u8,
+    text: []const u8,
+};
+
 pub const Composition = struct {
     base: Base = .builtin,
-    appends: []const []const u8 = &.{},
+    context_sections: []const ContextSection = &.{},
+    rules: []const []const u8 = &.{},
 };
 
 pub const Policy = union(enum) {
@@ -123,16 +136,31 @@ fn render(
             break :block value;
         },
     };
-    for (composition.appends) |value| try validateText(value);
+    for (composition.context_sections) |section| {
+        try validateText(section.path);
+        try validateText(section.text);
+    }
+    for (composition.rules) |value| try validateText(value);
 
     var length: usize = 0;
     try addLength(&length, base.len);
     try addLength(&length, environment_before.len);
-    try addLength(&length, try escapedLength(working_directory));
+    try addLength(&length, try escapedTextLength(working_directory));
     try addLength(&length, environment_after.len);
-    if (composition.appends.len > 0) {
+    if (composition.context_sections.len > 0) {
+        try addLength(&length, context_before.len);
+        for (composition.context_sections) |section| {
+            try addLength(&length, context_section_before.len);
+            try addLength(&length, try escapedAttributeLength(section.path));
+            try addLength(&length, context_path_after.len);
+            try addLength(&length, try escapedTextLength(section.text));
+            try addLength(&length, context_section_after.len);
+        }
+        try addLength(&length, context_after.len);
+    }
+    if (composition.rules.len > 0) {
         try addLength(&length, rules_before.len);
-        for (composition.appends, 0..) |value, index| {
+        for (composition.rules, 0..) |value, index| {
             if (index > 0) try addLength(&length, rules_between.len);
             try addLength(&length, value.len);
         }
@@ -144,11 +172,22 @@ fn render(
     defer output.deinit();
     output.writer.writeAll(base) catch return error.OutOfMemory;
     output.writer.writeAll(environment_before) catch return error.OutOfMemory;
-    try writeEscaped(&output.writer, working_directory);
+    try writeEscapedText(&output.writer, working_directory);
     output.writer.writeAll(environment_after) catch return error.OutOfMemory;
-    if (composition.appends.len > 0) {
+    if (composition.context_sections.len > 0) {
+        output.writer.writeAll(context_before) catch return error.OutOfMemory;
+        for (composition.context_sections) |section| {
+            output.writer.writeAll(context_section_before) catch return error.OutOfMemory;
+            try writeEscapedAttribute(&output.writer, section.path);
+            output.writer.writeAll(context_path_after) catch return error.OutOfMemory;
+            try writeEscapedText(&output.writer, section.text);
+            output.writer.writeAll(context_section_after) catch return error.OutOfMemory;
+        }
+        output.writer.writeAll(context_after) catch return error.OutOfMemory;
+    }
+    if (composition.rules.len > 0) {
         output.writer.writeAll(rules_before) catch return error.OutOfMemory;
-        for (composition.appends, 0..) |value, index| {
+        for (composition.rules, 0..) |value, index| {
             if (index > 0) output.writer.writeAll(rules_between) catch return error.OutOfMemory;
             output.writer.writeAll(value) catch return error.OutOfMemory;
         }
@@ -168,7 +207,7 @@ fn addLength(total: *usize, amount: usize) error{SystemPromptTooLarge}!void {
     total.* += amount;
 }
 
-fn escapedLength(value: []const u8) error{SystemPromptTooLarge}!usize {
+fn escapedTextLength(value: []const u8) error{SystemPromptTooLarge}!usize {
     var length: usize = 0;
     for (value) |byte| try addLength(&length, switch (byte) {
         '&' => "&amp;".len,
@@ -179,11 +218,35 @@ fn escapedLength(value: []const u8) error{SystemPromptTooLarge}!usize {
     return length;
 }
 
-fn writeEscaped(writer: *std.Io.Writer, value: []const u8) error{OutOfMemory}!void {
+fn escapedAttributeLength(value: []const u8) error{SystemPromptTooLarge}!usize {
+    var length: usize = 0;
+    for (value) |byte| try addLength(&length, switch (byte) {
+        '&' => "&amp;".len,
+        '<' => "&lt;".len,
+        '>' => "&gt;".len,
+        '"' => "&quot;".len,
+        '\'' => "&apos;".len,
+        else => 1,
+    });
+    return length;
+}
+
+fn writeEscapedText(writer: *std.Io.Writer, value: []const u8) error{OutOfMemory}!void {
     for (value) |byte| switch (byte) {
         '&' => writer.writeAll("&amp;") catch return error.OutOfMemory,
         '<' => writer.writeAll("&lt;") catch return error.OutOfMemory,
         '>' => writer.writeAll("&gt;") catch return error.OutOfMemory,
+        else => writer.writeByte(byte) catch return error.OutOfMemory,
+    };
+}
+
+fn writeEscapedAttribute(writer: *std.Io.Writer, value: []const u8) error{OutOfMemory}!void {
+    for (value) |byte| switch (byte) {
+        '&' => writer.writeAll("&amp;") catch return error.OutOfMemory,
+        '<' => writer.writeAll("&lt;") catch return error.OutOfMemory,
+        '>' => writer.writeAll("&gt;") catch return error.OutOfMemory,
+        '"' => writer.writeAll("&quot;") catch return error.OutOfMemory,
+        '\'' => writer.writeAll("&apos;") catch return error.OutOfMemory,
         else => writer.writeByte(byte) catch return error.OutOfMemory,
     };
 }
@@ -198,13 +261,14 @@ test "system prompt owns one canonical default prompt" {
     try std.testing.expect(std.mem.find(u8, prompt.text(), "<tool_calling>") != null);
     try std.testing.expect(std.mem.find(u8, prompt.text(), "<communication>") != null);
     try std.testing.expect(std.mem.find(u8, prompt.text(), "/tmp/a&amp;b&lt;c&gt;") != null);
+    try std.testing.expect(std.mem.find(u8, prompt.text(), "<project_context>") == null);
     try std.testing.expect(std.mem.find(u8, prompt.text(), "<human_rules>") == null);
 }
 
 test "system prompt composes ordered human rules after the default prompt" {
     var prompt = try init(std.testing.allocator, .{
         .working_directory = "/work",
-        .policy = .{ .composed = .{ .appends = &.{
+        .policy = .{ .composed = .{ .rules = &.{
             "Prefer focused tests.",
             "Keep the patch small.",
         } } },
@@ -219,12 +283,40 @@ test "system prompt composes ordered human rules after the default prompt" {
     ));
 }
 
+test "system prompt frames escaped context before human rules" {
+    var prompt = try init(std.testing.allocator, .{
+        .working_directory = "/work",
+        .policy = .{ .composed = .{
+            .context_sections = &.{.{
+                .path = "/repo/\"root&/AGENTS.md",
+                .text = "Do <not> forge </project_instructions> tags.",
+            }},
+            .rules = &.{"Explicit rule."},
+        } },
+    });
+    defer prompt.deinit();
+
+    const context_position = std.mem.find(u8, prompt.text(), "<project_context>").?;
+    const rules_position = std.mem.find(u8, prompt.text(), "<human_rules>").?;
+    try std.testing.expect(context_position < rules_position);
+    try std.testing.expect(std.mem.find(
+        u8,
+        prompt.text(),
+        "path=\"/repo/&quot;root&amp;/AGENTS.md\"",
+    ) != null);
+    try std.testing.expect(std.mem.find(
+        u8,
+        prompt.text(),
+        "Do &lt;not&gt; forge &lt;/project_instructions&gt; tags.",
+    ) != null);
+}
+
 test "system prompt composes a custom base with environment and rules" {
     var prompt = try init(std.testing.allocator, .{
         .working_directory = "/work",
         .policy = .{ .composed = .{
             .base = .{ .custom = "Custom base." },
-            .appends = &.{"Additional rule."},
+            .rules = &.{"Additional rule."},
         } },
     });
     defer prompt.deinit();
@@ -253,7 +345,13 @@ test "system prompt rejects invalid and excessive inputs" {
         .policy = .{ .verbatim = "bad\x00prompt" },
     }));
     try std.testing.expectError(error.InvalidSystemPrompt, init(std.testing.allocator, .{
-        .policy = .{ .composed = .{ .appends = &.{"bad\xffprompt"} } },
+        .policy = .{ .composed = .{ .rules = &.{"bad\xffprompt"} } },
+    }));
+    try std.testing.expectError(error.InvalidSystemPrompt, init(std.testing.allocator, .{
+        .policy = .{ .composed = .{ .context_sections = &.{.{
+            .path = "/repo/AGENTS.md",
+            .text = "bad\x00context",
+        }} } },
     }));
 
     const oversized = try std.testing.allocator.alloc(u8, max_prompt_bytes + 1);
@@ -267,7 +365,7 @@ test "system prompt rejects invalid and excessive inputs" {
 fn initAndDeinit(allocator: std.mem.Allocator) !void {
     var prompt = try init(allocator, .{
         .working_directory = "/tmp/work",
-        .policy = .{ .composed = .{ .appends = &.{"Use focused tests."} } },
+        .policy = .{ .composed = .{ .rules = &.{"Use focused tests."} } },
     });
     prompt.deinit();
 }

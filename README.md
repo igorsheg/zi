@@ -42,6 +42,8 @@ Append rules to Zi's default system prompt for one launch:
 
 `--append-system-prompt` is an alias for `--rules`. Use `--system-prompt` or `--system-prompt-override` to replace the default prompt verbatim. Append and replacement options cannot be combined.
 
-For persistent customization, Zi loads `$HOME/.zi/agent/SYSTEM.md` as the composed prompt base and `$HOME/.zi/agent/APPEND_SYSTEM.md` as appended rules. An explicit replacement bypasses both files. Explicit `--rules` replaces `APPEND_SYSTEM.md` for that launch while retaining `SYSTEM.md` as the base. Files must be regular UTF-8 text without NUL bytes and may not exceed 1 MiB each.
+For persistent customization, Zi loads `$HOME/.zi/agent/SYSTEM.md` as the composed prompt base and `$HOME/.zi/agent/APPEND_SYSTEM.md` as appended rules. Explicit `--rules` replaces `APPEND_SYSTEM.md` for that launch while retaining `SYSTEM.md` as the base. Files must be regular UTF-8 text without NUL bytes and may not exceed 1 MiB each.
+
+Zi also loads one context file from the global agent directory and from each ancestor of the effective working directory. `AGENTS.md` takes precedence over `CLAUDE.md` in each directory, and files are applied from global and broadest scope to the working directory. Context files must be regular UTF-8 text without NUL bytes. Each file is limited to 64 KiB, with a 128 KiB aggregate limit. An explicit system-prompt replacement is verbatim and bypasses prompt and context file discovery.
 
 Run `./zig-out/bin/zi --help` for the current command surface. Interactive, JSON, and RPC modes are not available yet.

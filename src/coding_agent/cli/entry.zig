@@ -129,5 +129,9 @@ fn writeCliHelp(writer: *std.Io.Writer) !void {
         \\  $HOME/.zi/agent/SYSTEM.md         Replace the composed prompt base
         \\  $HOME/.zi/agent/APPEND_SYSTEM.md  Append persistent rules
         \\
+        \\Context files:
+        \\  $HOME/.zi/agent/AGENTS.md         Add global coding instructions
+        \\  Ancestor AGENTS.md or CLAUDE.md   Add broad-to-narrow project instructions
+        \\
     );
 }

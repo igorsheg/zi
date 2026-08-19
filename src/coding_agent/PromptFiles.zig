@@ -1,11 +1,11 @@
 const std = @import("std");
+const BoundedTextFile = @import("BoundedTextFile.zig");
 const ZiPaths = @import("ZiPaths.zig");
 
 const PromptFiles = @This();
 const system_file_name = "SYSTEM.md";
 const append_file_name = "APPEND_SYSTEM.md";
 const max_file_bytes = 1024 * 1024;
-const read_buffer_bytes = 8192;
 
 pub const Requested = struct {
     system: bool = false,
@@ -80,45 +80,21 @@ fn loadOptionalText(
     directory: std.Io.Dir,
     file_name: []const u8,
 ) Error!?[]const u8 {
-    const path_stat = directory.statFile(io, file_name, .{ .follow_symlinks = false }) catch |failure| {
-        return switch (failure) {
-            error.FileNotFound, error.NotDir => null,
-            error.Canceled => error.Cancelled,
-            else => error.PromptFileReadFailed,
-        };
-    };
-    if (path_stat.kind != .file) return error.UnsafePromptFile;
-    if (path_stat.size > max_file_bytes) return error.PromptFileTooLarge;
-
-    const file = directory.openFile(io, file_name, .{
-        .mode = .read_only,
-        .allow_directory = false,
-        .follow_symlinks = false,
-    }) catch |failure| return switch (failure) {
-        error.FileNotFound, error.NotDir => null,
-        error.Canceled => error.Cancelled,
-        error.SymLinkLoop, error.IsDir => error.UnsafePromptFile,
-        else => error.PromptFileReadFailed,
-    };
-    defer file.close(io);
-    const opened_stat = file.stat(io) catch return error.PromptFileReadFailed;
-    if (opened_stat.kind != .file) return error.UnsafePromptFile;
-    if (opened_stat.size > max_file_bytes) return error.PromptFileTooLarge;
-
-    var read_buffer: [read_buffer_bytes]u8 = undefined;
-    var reader = file.reader(io, &read_buffer);
-    const text = reader.interface.allocRemaining(
+    const outcome = try BoundedTextFile.loadOptional(
         allocator,
-        .limited(max_file_bytes + 1),
-    ) catch |failure| return switch (failure) {
-        error.OutOfMemory => error.OutOfMemory,
-        error.StreamTooLong => error.PromptFileTooLarge,
-        else => error.PromptFileReadFailed,
+        io,
+        directory,
+        file_name,
+        max_file_bytes,
+    );
+    return switch (outcome) {
+        .missing => null,
+        .loaded => |text| text,
+        .too_large => error.PromptFileTooLarge,
+        .invalid => error.InvalidPromptFile,
+        .unsafe => error.UnsafePromptFile,
+        .unreadable => error.PromptFileReadFailed,
     };
-    if (text.len > max_file_bytes) return error.PromptFileTooLarge;
-    if (!std.unicode.utf8ValidateSlice(text)) return error.InvalidPromptFile;
-    if (std.mem.findScalar(u8, text, 0) != null) return error.InvalidPromptFile;
-    return text;
 }
 
 fn temporaryPath(temporary: *std.testing.TmpDir, buffer: []u8) ![]const u8 {

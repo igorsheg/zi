@@ -4,6 +4,7 @@ const AgentSession = @import("AgentSession.zig");
 const AgentSessionRuntime = @import("AgentSessionRuntime.zig");
 const CredentialManager = @import("CredentialManager.zig");
 const CredentialStore = @import("CredentialStore.zig");
+const ContextFiles = @import("ContextFiles.zig");
 const ModelConfigSnapshot = @import("ModelConfigSnapshot.zig");
 const ModelResolution = @import("ModelResolution.zig");
 const PromptFiles = @import("PromptFiles.zig");
@@ -56,6 +57,13 @@ pub const Error = error{
     InvalidPromptFile,
     UnsafePromptFile,
     PromptFileReadFailed,
+    ContextFileTooLarge,
+    ContextFilesTooLarge,
+    TooManyContextFiles,
+    ContextTraversalTooDeep,
+    InvalidContextFile,
+    UnsafeContextFile,
+    ContextFileReadFailed,
     SelectionRequired,
     IncompleteSelection,
     UnknownSelection,
@@ -167,11 +175,32 @@ fn createOwned(
     else
         null;
     defer if (prompt_files) |*files| files.deinit();
-    var discovered_appends: [1][]const u8 = undefined;
+    var discovered_rules: [1][]const u8 = undefined;
     runtime_options.prompt.policy = resolvePromptPolicy(
         runtime_options.prompt.policy,
         if (prompt_files) |*files| files else null,
-        &discovered_appends,
+        &discovered_rules,
+    );
+
+    var context_files: ?ContextFiles = if (requestsContextFiles(runtime_options.prompt.policy))
+        try ContextFiles.load(allocator, io, selection.pathsView())
+    else
+        null;
+    defer if (context_files) |*files| files.deinit();
+    var discovered_context_sections: []SystemPrompt.ContextSection = &.{};
+    defer if (discovered_context_sections.len > 0) allocator.free(discovered_context_sections);
+    if (context_files) |*files| {
+        const loaded_sections = files.sections();
+        if (loaded_sections.len > 0) {
+            discovered_context_sections = try allocator.alloc(SystemPrompt.ContextSection, loaded_sections.len);
+            for (loaded_sections, discovered_context_sections) |source, *destination| {
+                destination.* = .{ .path = source.path, .text = source.text };
+            }
+        }
+    }
+    runtime_options.prompt.policy = resolveContextPolicy(
+        runtime_options.prompt.policy,
+        discovered_context_sections,
     );
 
     var snapshot = try ModelConfigSnapshot.load(allocator, io, selection.pathsView());
@@ -298,7 +327,7 @@ fn requestedPromptFiles(policy: SystemPrompt.Policy) PromptFiles.Requested {
                 .builtin => true,
                 .custom => false,
             },
-            .append = composition.appends.len == 0,
+            .append = composition.rules.len == 0,
         },
     };
 }
@@ -306,7 +335,7 @@ fn requestedPromptFiles(policy: SystemPrompt.Policy) PromptFiles.Requested {
 fn resolvePromptPolicy(
     policy: SystemPrompt.Policy,
     files: ?*const PromptFiles,
-    discovered_appends: *[1][]const u8,
+    discovered_rules: *[1][]const u8,
 ) SystemPrompt.Policy {
     return switch (policy) {
         .verbatim => policy,
@@ -318,15 +347,40 @@ fn resolvePromptPolicy(
                     .builtin,
                 .custom => composition.base,
             },
-            .appends = if (composition.appends.len > 0)
-                composition.appends
+            .context_sections = composition.context_sections,
+            .rules = if (composition.rules.len > 0)
+                composition.rules
             else if (files) |loaded|
-                if (loaded.append()) |text| appends: {
-                    discovered_appends[0] = text;
-                    break :appends discovered_appends[0..1];
+                if (loaded.append()) |text| rules: {
+                    discovered_rules[0] = text;
+                    break :rules discovered_rules[0..1];
                 } else &.{}
             else
                 &.{},
+        } },
+    };
+}
+
+fn requestsContextFiles(policy: SystemPrompt.Policy) bool {
+    return switch (policy) {
+        .verbatim => false,
+        .composed => |composition| composition.context_sections.len == 0,
+    };
+}
+
+fn resolveContextPolicy(
+    policy: SystemPrompt.Policy,
+    discovered: []const SystemPrompt.ContextSection,
+) SystemPrompt.Policy {
+    return switch (policy) {
+        .verbatim => policy,
+        .composed => |composition| .{ .composed = .{
+            .base = composition.base,
+            .context_sections = if (composition.context_sections.len > 0)
+                composition.context_sections
+            else
+                discovered,
+            .rules = composition.rules,
         } },
     };
 }
@@ -437,6 +491,14 @@ test "runtime services compose effective paths, models, prompts, credentials, du
         .sub_path = ".zi/agent/APPEND_SYSTEM.md",
         .data = "Ignored global rules.",
     });
+    try temporary.dir.writeFile(std.testing.io, .{
+        .sub_path = ".zi/agent/AGENTS.md",
+        .data = "Global context instructions.",
+    });
+    try temporary.dir.writeFile(std.testing.io, .{
+        .sub_path = "AGENTS.md",
+        .data = "Project context instructions.",
+    });
     try writeCustomModels(&temporary);
     var sources: TestSources = .{};
     const response =
@@ -457,6 +519,8 @@ test "runtime services compose effective paths, models, prompts, credentials, du
             const self: *Self = @ptrCast(@alignCast(context));
             if (std.mem.find(u8, request.body, "Global system base.") == null) return error.Rejected;
             if (std.mem.find(u8, request.body, "Use focused tests.") == null) return error.Rejected;
+            if (std.mem.find(u8, request.body, "Global context instructions.") == null) return error.Rejected;
+            if (std.mem.find(u8, request.body, "Project context instructions.") == null) return error.Rejected;
             if (std.mem.find(u8, request.body, "Ignored global rules.") != null) return error.Rejected;
             self.prompt_seen = true;
         }
@@ -474,7 +538,7 @@ test "runtime services compose effective paths, models, prompts, credentials, du
         .requested_provider = "custom-openai",
         .requested_model = "model-a",
         .options = .{ .prompt = .{ .policy = .{ .composed = .{
-            .appends = &.{"Use focused tests."},
+            .rules = &.{"Use focused tests."},
         } } } },
     }, fake.transport());
     const journal_path = try std.testing.allocator.dupe(u8, services.journalPath());
@@ -488,6 +552,23 @@ test "runtime services compose effective paths, models, prompts, credentials, du
         services.session().systemPrompt(),
         "<human_rules>\nUse focused tests.\n</human_rules>",
     ) != null);
+    const global_context_position = std.mem.find(
+        u8,
+        services.session().systemPrompt(),
+        "Global context instructions.",
+    ).?;
+    const project_context_position = std.mem.find(
+        u8,
+        services.session().systemPrompt(),
+        "Project context instructions.",
+    ).?;
+    const explicit_rules_position = std.mem.find(
+        u8,
+        services.session().systemPrompt(),
+        "Use focused tests.",
+    ).?;
+    try std.testing.expect(global_context_position < project_context_position);
+    try std.testing.expect(project_context_position < explicit_rules_position);
     try std.testing.expect(std.mem.find(
         u8,
         services.session().systemPrompt(),
@@ -548,6 +629,7 @@ test "runtime services do not read global prompt files shadowed by explicit poli
     defer temporary.cleanup();
     try temporary.dir.createDirPath(std.testing.io, ".zi/agent/SYSTEM.md");
     try temporary.dir.createDir(std.testing.io, ".zi/agent/APPEND_SYSTEM.md", .default_dir);
+    try temporary.dir.createDir(std.testing.io, "AGENTS.md", .default_dir);
     var root_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const root = try temporaryPath(&temporary, &root_buffer);
     var sources: TestSources = .{};
@@ -566,6 +648,7 @@ test "runtime services do not read global prompt files shadowed by explicit poli
     try std.testing.expectEqualStrings("Explicit replacement.", replaced.session().systemPrompt());
     replaced.deinit();
 
+    try temporary.dir.deleteTree(std.testing.io, "AGENTS.md");
     try temporary.dir.deleteTree(std.testing.io, ".zi/agent/SYSTEM.md");
     try temporary.dir.writeFile(std.testing.io, .{
         .sub_path = ".zi/agent/SYSTEM.md",
@@ -580,7 +663,7 @@ test "runtime services do not read global prompt files shadowed by explicit poli
         .requested_model = "gpt-5.6",
         .cli_api_key = "secret",
         .options = .{ .prompt = .{ .policy = .{ .composed = .{
-            .appends = &.{"Explicit rules."},
+            .rules = &.{"Explicit rules."},
         } } } },
     }, fake.transport());
     defer appended.deinit();
@@ -714,6 +797,62 @@ test "long-lived runtime rechecks OAuth expiry before each invocation" {
     var stored = try CredentialStore.load(std.testing.allocator, std.testing.io, &credential_paths);
     defer stored.deinit();
     try std.testing.expectEqualStrings("rotated-refresh", stored.entries[0].credential.oauth.refresh);
+}
+
+test "runtime services discover context from a resumed session working directory" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try temporary.dir.createDir(std.testing.io, "launch", .default_dir);
+    try temporary.dir.createDir(std.testing.io, "stored", .default_dir);
+    try temporary.dir.writeFile(std.testing.io, .{
+        .sub_path = "launch/AGENTS.md",
+        .data = "Launch directory context.",
+    });
+    try temporary.dir.writeFile(std.testing.io, .{
+        .sub_path = "stored/AGENTS.md",
+        .data = "Stored directory context.",
+    });
+    var root_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root = try temporaryPath(&temporary, &root_buffer);
+    const launch_cwd = try std.fs.path.resolve(std.testing.allocator, &.{ root, "launch" });
+    defer std.testing.allocator.free(launch_cwd);
+    const stored_cwd = try std.fs.path.resolve(std.testing.allocator, &.{ root, "stored" });
+    defer std.testing.allocator.free(stored_cwd);
+    var sources: TestSources = .{};
+    var fake = fake_api.FakeTransport.init(&.{});
+
+    var created = try createWithTransport(std.testing.allocator, std.testing.io, .{
+        .startup_cwd = stored_cwd,
+        .home = root,
+        .session = .new,
+        .sources = sources.view(),
+        .requested_provider = "openai",
+        .requested_model = "gpt-5.6",
+        .cli_api_key = "secret",
+    }, fake.transport());
+    const journal_path = try std.testing.allocator.dupe(u8, created.journalPath());
+    defer std.testing.allocator.free(journal_path);
+    created.deinit();
+
+    var resumed = try createWithTransport(std.testing.allocator, std.testing.io, .{
+        .startup_cwd = launch_cwd,
+        .home = root,
+        .session = .{ .open = journal_path },
+        .sources = sources.view(),
+        .cli_api_key = "secret",
+    }, fake.transport());
+    defer resumed.deinit();
+    try std.testing.expectEqualStrings(stored_cwd, resumed.paths().cwd);
+    try std.testing.expect(std.mem.find(
+        u8,
+        resumed.session().systemPrompt(),
+        "Stored directory context.",
+    ) != null);
+    try std.testing.expect(std.mem.find(
+        u8,
+        resumed.session().systemPrompt(),
+        "Launch directory context.",
+    ) == null);
 }
 
 test "runtime services restore the journal model unless an explicit override commits first" {

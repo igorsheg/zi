@@ -87,12 +87,12 @@ pub fn runPrintLaunch(
         environment_entries[0] = .{ .name = "OPENAI_API_KEY", .value = key };
         break :count 1;
     } else 0;
-    var prompt_appends: [1][]const u8 = undefined;
+    var prompt_rules: [1][]const u8 = undefined;
     const prompt_policy: SystemPrompt.Policy = switch (request.system_prompt) {
         .default => .{ .composed = .{} },
         .append => |value| policy: {
-            prompt_appends[0] = value;
-            break :policy .{ .composed = .{ .appends = &prompt_appends } };
+            prompt_rules[0] = value;
+            break :policy .{ .composed = .{ .rules = &prompt_rules } };
         },
         .replace => |value| .{ .verbatim = value },
     };

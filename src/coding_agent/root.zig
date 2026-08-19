@@ -6,6 +6,8 @@ pub const SystemPrompt = @import("SystemPrompt.zig");
 pub const ZiPaths = @import("ZiPaths.zig");
 pub const cli = @import("cli/root.zig");
 const agent_session_runtime = @import("AgentSessionRuntime.zig");
+const bounded_text_file = @import("BoundedTextFile.zig");
+const context_files = @import("ContextFiles.zig");
 const credential_manager = @import("CredentialManager.zig");
 const credential_store = @import("CredentialStore.zig");
 const model_config = @import("ModelConfig.zig");
@@ -28,6 +30,8 @@ pub const StreamSink = AgentSession.StreamSink;
 test {
     _ = AgentSession;
     _ = agent_session_runtime;
+    _ = bounded_text_file;
+    _ = context_files;
     _ = credential_manager;
     _ = credential_store;
     _ = model_config;

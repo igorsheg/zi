@@ -169,6 +169,9 @@ Module ownership (stable boundaries):
   resolution, and CLI core.
 - `src/BoundedJson.zig` is the shared bounded JSON helper. Domain-specific
   validation stays with the owning module.
+- `src/coding_agent/BoundedTextFile.zig` shares optional bounded UTF-8 file-read
+  mechanics inside `coding_agent`. Discovery, limits, and diagnostics stay with
+  each resource owner.
 - `data/model_catalog.json` plus `tools/model_catalog.zig` own catalog
   generation. The compiled snapshot lives in `src/ai/model_catalog_snapshot.zig`.
 
@@ -199,6 +202,10 @@ two admitted values it resolves the global agent root and the exact project `.zi
 root. Feature owners define their directories and files beneath those roots.
 Settings, credentials, resources, and persistent session creation consume the
 cwd-bound roots. Do not join `.zi` or re-read process cwd inside those owners.
+
+`ContextFiles` owns bounded global and cwd-ancestor instruction discovery.
+Ancestor instructions apply from broadest to narrowest scope. This does not grant
+project-local prompt replacement files trust.
 
 The session journal is the append-only JSONL authority for one durable session
 when persistence is admitted. Torn-tail repair happens on the next append. The
