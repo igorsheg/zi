@@ -4,6 +4,7 @@ const agent_session_runtime = @import("AgentSessionRuntime.zig");
 const model_config = @import("ModelConfig.zig");
 const model_config_snapshot = @import("ModelConfigSnapshot.zig");
 const model_resolution = @import("ModelResolution.zig");
+const runtime_services = @import("RuntimeServices.zig");
 const session_format = @import("SessionFormat.zig");
 const session_journal = @import("SessionJournal.zig");
 const session_commit = @import("SessionCommit.zig");
@@ -24,6 +25,7 @@ test {
     _ = model_config;
     _ = model_config_snapshot;
     _ = model_resolution;
+    _ = runtime_services;
     _ = session_format;
     _ = session_journal;
     _ = session_commit;

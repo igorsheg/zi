@@ -1,4 +1,5 @@
 const std = @import("std");
+const ai = @import("../ai/root.zig");
 const format = @import("SessionFormat.zig");
 const journal_api = @import("SessionJournal.zig");
 const ZiPaths = @import("ZiPaths.zig");
@@ -7,7 +8,25 @@ const SessionSelection = @This();
 const max_directory_entries = 4096;
 const private_dir_permissions = std.Io.File.Permissions.fromMode(0o700);
 
-const Error = ZiPaths.Error || journal_api.Error || error{
+pub const Error = error{
+    OutOfMemory,
+    InvalidPath,
+    InvalidHeader,
+    InvalidRecord,
+    UnsupportedVersion,
+    SessionTooLarge,
+    TooManyEntries,
+    AlreadyExists,
+    NotFound,
+    UnsafeFile,
+    OpenFailed,
+    CreateFailed,
+    CreateIndeterminate,
+    ReadFailed,
+    AppendFailed,
+    RepairFailed,
+    CommitIndeterminate,
+    ReadOnly,
     InvalidSessionPath,
     MissingCwd,
     CwdUnavailable,
@@ -16,7 +35,7 @@ const Error = ZiPaths.Error || journal_api.Error || error{
     TooManySessions,
 };
 
-const Intent = union(enum) {
+pub const Intent = union(enum) {
     new,
     open: []const u8,
     continue_recent,
@@ -31,10 +50,15 @@ const Origin = enum {
 allocator: std.mem.Allocator,
 paths: ZiPaths,
 journal_path: []const u8,
-opened: journal_api.Opened,
+journal: JournalOwnership,
 origin: Origin,
 
-fn select(
+const JournalOwnership = union(enum) {
+    admitted: journal_api.Opened,
+    transferred,
+};
+
+pub fn select(
     allocator: std.mem.Allocator,
     io: std.Io,
     startup_cwd: []const u8,
@@ -49,11 +73,43 @@ fn select(
     };
 }
 
-fn deinit(self: *SessionSelection) void {
-    self.opened.deinit();
+pub fn deinit(self: *SessionSelection) void {
+    switch (self.journal) {
+        .admitted => |*opened| opened.deinit(),
+        .transferred => {},
+    }
     self.allocator.free(self.journal_path);
     self.paths.deinit();
     self.* = undefined;
+}
+
+pub fn pathsView(self: *const SessionSelection) *const ZiPaths {
+    return &self.paths;
+}
+
+pub fn journalPath(self: *const SessionSelection) []const u8 {
+    return self.journal_path;
+}
+
+pub fn restoredModel(self: *const SessionSelection) ?ai.ModelIdentity {
+    return self.restored().active_model;
+}
+
+pub fn takeJournal(self: *SessionSelection) journal_api.Opened {
+    return switch (self.journal) {
+        .admitted => |opened| result: {
+            self.journal = .transferred;
+            break :result opened;
+        },
+        .transferred => unreachable,
+    };
+}
+
+fn restored(self: *const SessionSelection) *const format.Restored {
+    return switch (self.journal) {
+        .admitted => |*opened| &opened.restore_candidate,
+        .transferred => unreachable,
+    };
 }
 
 fn createNew(
@@ -96,7 +152,7 @@ fn createNew(
         .allocator = allocator,
         .paths = paths,
         .journal_path = journal_path,
-        .opened = opened,
+        .journal = .{ .admitted = opened },
         .origin = .new,
     };
 }
@@ -141,7 +197,7 @@ fn openExact(
         .allocator = allocator,
         .paths = paths,
         .journal_path = journal_path,
-        .opened = opened,
+        .journal = .{ .admitted = opened },
         .origin = origin,
     };
 }
@@ -306,7 +362,7 @@ test "session selection creates a private journal from admitted paths" {
 
     try std.testing.expect(selected.origin == .new);
     try std.testing.expectEqualStrings(root, selected.paths.cwd);
-    try std.testing.expectEqualStrings(root, selected.opened.restore_candidate.header.cwd);
+    try std.testing.expectEqualStrings(root, selected.restored().header.cwd);
     try std.testing.expect(std.mem.startsWith(u8, selected.journal_path, selected.paths.global_sessions));
     const stat = try std.Io.Dir.statFile(.cwd(), std.testing.io, selected.journal_path, .{});
     try std.testing.expectEqual(@as(u16, 0), stat.permissions.toMode() & 0o077);
@@ -375,7 +431,7 @@ test "session continuation chooses the newest valid journal for the admitted cwd
         sources.view(),
         .new,
     );
-    const older_id = try std.testing.allocator.dupe(u8, older.opened.restore_candidate.header.id);
+    const older_id = try std.testing.allocator.dupe(u8, older.restored().header.id);
     defer std.testing.allocator.free(older_id);
     var older_file = try std.Io.Dir.openFile(.cwd(), std.testing.io, older.journal_path, .{ .mode = .read_write });
     defer older_file.close(std.testing.io);
@@ -401,7 +457,7 @@ test "session continuation chooses the newest valid journal for the admitted cwd
         sources.view(),
         .new,
     );
-    const newer_id = try std.testing.allocator.dupe(u8, newer.opened.restore_candidate.header.id);
+    const newer_id = try std.testing.allocator.dupe(u8, newer.restored().header.id);
     defer std.testing.allocator.free(newer_id);
     newer.deinit();
 
@@ -416,7 +472,7 @@ test "session continuation chooses the newest valid journal for the admitted cwd
     defer continued.deinit();
     try std.testing.expect(continued.origin == .continued);
     try std.testing.expect(!std.mem.eql(u8, older_id, newer_id));
-    try std.testing.expectEqualStrings(newer_id, continued.opened.restore_candidate.header.id);
+    try std.testing.expectEqualStrings(newer_id, continued.restored().header.id);
 }
 
 test "session continuation ignores corrupt candidates and creates a new journal" {

@@ -37,7 +37,16 @@ pub const CreateError = error{
     InvalidToolArguments,
 };
 
-const DurableCreateError = CreateError || error{ PersistenceFailed, SessionTooLarge };
+pub const DurableCreateError = error{
+    OutOfMemory,
+    InvalidModelConfiguration,
+    DuplicateToolName,
+    InvalidToolDefinition,
+    UnknownTool,
+    InvalidToolArguments,
+    PersistenceFailed,
+    SessionTooLarge,
+};
 
 const ProviderStorage = union(enum) {
     openai_completions: compatible.OpenAiCompatible,
@@ -204,6 +213,37 @@ pub fn create(
     return runtime;
 }
 
+pub fn createDurable(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cwd: std.Io.Dir,
+    config: Config,
+    options: Options,
+    opened: *SessionJournal.Opened,
+    sources: SessionFormat.Sources,
+) DurableCreateError!*AgentSessionRuntime {
+    var owned = opened.*;
+    opened.* = undefined;
+    var owned_live = true;
+    errdefer if (owned_live) owned.deinit();
+    const runtime = try allocator.create(AgentSessionRuntime);
+    errdefer allocator.destroy(runtime);
+    runtime.allocator = allocator;
+    runtime.transport = .{ .http = ai_transport.HttpTransport.init(allocator) };
+    const initialize_result = runtime.initializeDurable(
+        io,
+        cwd,
+        config,
+        options,
+        &owned,
+        sources,
+        .none(),
+    );
+    owned_live = false;
+    try initialize_result;
+    return runtime;
+}
+
 pub fn session(self: *AgentSessionRuntime) *AgentSession {
     return &self.session_value;
 }
@@ -234,7 +274,7 @@ fn createWithTransport(
     return runtime;
 }
 
-fn createDurableWithTransport(
+pub fn createDurableWithTransport(
     allocator: std.mem.Allocator,
     io: std.Io,
     cwd: std.Io.Dir,
