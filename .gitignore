@@ -1,5 +1,8 @@
 .zig-cache/
 zig-out/
+.wizard/
+dist/
+node_modules/
 .env
 .env.*
 !.env.example
