@@ -16,7 +16,10 @@ pub const builtin = [_]provider_api.Definition{
         .id = "openai-codex",
         .name = "OpenAI Codex",
         .base_url = "https://chatgpt.com/backend-api",
-        .auth = .{ .oauth = .{ .refresher = codex_oauth.refresher() } },
+        .auth = .{ .oauth = .{
+            .authenticator = codex_oauth.authenticator(),
+            .refresher = codex_oauth.refresher(),
+        } },
     },
 };
 

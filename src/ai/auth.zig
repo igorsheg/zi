@@ -34,6 +34,7 @@ pub const ApiKeyAuth = struct {
 };
 
 pub const OAuthAuth = struct {
+    authenticator: ?oauth_api.Authenticator = null,
     refresher: ?oauth_api.Refresher = null,
     refresh_skew_ms: u64 = 5 * 60 * 1000,
 };
@@ -48,6 +49,42 @@ pub const Inputs = struct {
     explicit_api_key: ?[]const u8 = null,
     stored: []const CredentialEntry = &.{},
     environment: Environment = .{},
+};
+
+pub const Resolver = struct {
+    context: *anyopaque,
+    resolve_fn: *const fn (
+        *anyopaque,
+        std.mem.Allocator,
+        std.mem.Allocator,
+        std.Io,
+        transport.Transport,
+        ProviderAuth,
+        []const u8,
+        Inputs,
+    ) anyerror!ModelAuth,
+
+    pub fn resolve(
+        self: Resolver,
+        result_allocator: std.mem.Allocator,
+        scratch_allocator: std.mem.Allocator,
+        io: std.Io,
+        transport_value: transport.Transport,
+        policy: ProviderAuth,
+        provider_id: []const u8,
+        inputs: Inputs,
+    ) anyerror!ModelAuth {
+        return self.resolve_fn(
+            self.context,
+            result_allocator,
+            scratch_allocator,
+            io,
+            transport_value,
+            policy,
+            provider_id,
+            inputs,
+        );
+    }
 };
 
 pub const Error = error{
