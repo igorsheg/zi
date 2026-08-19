@@ -17,6 +17,13 @@ pub const SessionIntent = union(enum) {
     open: []const u8,
 };
 
+/// Process-boundary system-prompt intent whose text remains borrowed from argv.
+pub const PromptIntent = union(enum) {
+    default,
+    append: []const u8,
+    replace: []const u8,
+};
+
 /// One print launch whose strings remain borrowed from argv for its execution.
 pub const LaunchRequest = struct {
     session: SessionIntent = .new,
@@ -24,6 +31,7 @@ pub const LaunchRequest = struct {
     model: ?[]const u8 = null,
     api_key: ?[]const u8 = null,
     file_path: ?[]const u8 = null,
+    system_prompt: PromptIntent = .default,
     message_buffer: [max_arguments][]const u8 = undefined,
     message_count: usize = 0,
 
@@ -56,6 +64,7 @@ pub const Diagnostic = union(enum) {
     unavailable_mode: Mode,
     invalid_auth_command: []const u8,
     conflicting_session_option: []const u8,
+    conflicting_system_prompt_option: []const u8,
     too_many_file_inputs,
     unknown_option: []const u8,
 };
@@ -131,6 +140,22 @@ pub fn parseInvocation(argv: []const []const u8, terminal: Terminal) ParseResult
                 continue;
             };
             admitSessionIntent(&launch, .{ .open = value }, argument, &rejection);
+        } else if (std.mem.eql(u8, argument, "--rules") or
+            std.mem.eql(u8, argument, "--append-system-prompt"))
+        {
+            const value = valueAfter(argv, &index) orelse {
+                rejection.add(.{ .missing_value = argument });
+                continue;
+            };
+            admitSystemPrompt(&launch, .{ .append = value }, argument, &rejection);
+        } else if (std.mem.eql(u8, argument, "--system-prompt") or
+            std.mem.eql(u8, argument, "--system-prompt-override"))
+        {
+            const value = valueAfter(argv, &index) orelse {
+                rejection.add(.{ .missing_value = argument });
+                continue;
+            };
+            admitSystemPrompt(&launch, .{ .replace = value }, argument, &rejection);
         } else if (std.mem.eql(u8, argument, "--provider")) {
             launch.provider = valueAfter(argv, &index) orelse {
                 rejection.add(.{ .missing_value = argument });
@@ -222,6 +247,19 @@ fn admitSessionIntent(
     launch.session = intent;
 }
 
+fn admitSystemPrompt(
+    launch: *LaunchRequest,
+    intent: PromptIntent,
+    option: []const u8,
+    rejection: *Rejection,
+) void {
+    if (launch.system_prompt != .default) {
+        rejection.add(.{ .conflicting_system_prompt_option = option });
+        return;
+    }
+    launch.system_prompt = intent;
+}
+
 fn appendMessage(launch: *LaunchRequest, message: []const u8) void {
     launch.message_buffer[launch.message_count] = message;
     launch.message_count += 1;
@@ -255,6 +293,42 @@ test "CLI surface admits one typed launch invocation" {
     try std.testing.expectEqual(@as(usize, 2), launch.messages().len);
     try std.testing.expectEqualStrings("first", launch.messages()[0]);
     try std.testing.expectEqualStrings("second", launch.messages()[1]);
+}
+
+test "CLI surface admits appended and replacement system prompts" {
+    const appended = parseInvocation(&.{ "--print", "--rules", "Prefer focused tests.", "fix it" }, .{
+        .stdin_is_tty = true,
+        .stdout_is_tty = true,
+    });
+    try std.testing.expect(appended == .admitted);
+    try std.testing.expect(appended.admitted.launch.system_prompt == .append);
+    try std.testing.expectEqualStrings(
+        "Prefer focused tests.",
+        appended.admitted.launch.system_prompt.append,
+    );
+
+    const replaced = parseInvocation(&.{ "--print", "--system-prompt", "Answer briefly.", "question" }, .{
+        .stdin_is_tty = true,
+        .stdout_is_tty = true,
+    });
+    try std.testing.expect(replaced == .admitted);
+    try std.testing.expect(replaced.admitted.launch.system_prompt == .replace);
+    try std.testing.expectEqualStrings("Answer briefly.", replaced.admitted.launch.system_prompt.replace);
+}
+
+test "CLI surface rejects conflicting system prompt controls" {
+    const parsed = parseInvocation(&.{
+        "--print",
+        "--rules",
+        "Prefer focused tests.",
+        "--system-prompt-override",
+        "Answer briefly.",
+    }, .{ .stdin_is_tty = true, .stdout_is_tty = true });
+    try std.testing.expect(parsed == .rejected);
+    try std.testing.expectEqualStrings(
+        "--system-prompt-override",
+        parsed.rejected.diagnostics()[0].conflicting_system_prompt_option,
+    );
 }
 
 test "CLI surface admits recent and exact durable session continuation" {

@@ -48,6 +48,8 @@ pub const Error = error{
     TooManySessions,
     Cancelled,
     InvalidModelConfiguration,
+    InvalidSystemPrompt,
+    SystemPromptTooLarge,
     SelectionRequired,
     IncompleteSelection,
     UnknownSelection,
@@ -228,6 +230,8 @@ fn createOwned(
     var cwd = std.Io.Dir.openDir(.cwd(), io, selection.pathsView().cwd, .{}) catch
         return error.CwdUnavailable;
     errdefer cwd.close(io);
+    var runtime_options = inputs.options;
+    runtime_options.prompt.working_directory = selection.pathsView().cwd;
     var opened = selection.takeJournal();
     const runtime = switch (transport) {
         .http => try AgentSessionRuntime.createDurable(
@@ -235,7 +239,7 @@ fn createOwned(
             io,
             cwd,
             runtime_config,
-            inputs.options,
+            runtime_options,
             &opened,
             inputs.sources,
         ),
@@ -245,7 +249,7 @@ fn createOwned(
             cwd,
             borrowed,
             runtime_config,
-            inputs.options,
+            runtime_options,
             &opened,
             inputs.sources,
             .none(),
@@ -386,11 +390,20 @@ test "runtime services compose effective paths, models, credentials, durability,
         .sources = sources.view(),
         .requested_provider = "custom-openai",
         .requested_model = "model-a",
+        .options = .{ .prompt = .{ .policy = .{ .composed = .{
+            .appends = &.{"Use focused tests."},
+        } } } },
     }, fake.transport());
     const journal_path = try std.testing.allocator.dupe(u8, services.journalPath());
     defer std.testing.allocator.free(journal_path);
     try std.testing.expectEqualStrings(root, services.paths().cwd);
     try std.testing.expect(services.modelDiagnostic() == null);
+    try std.testing.expect(std.mem.find(u8, services.session().systemPrompt(), root) != null);
+    try std.testing.expect(std.mem.find(
+        u8,
+        services.session().systemPrompt(),
+        "<human_rules>\nUse focused tests.\n</human_rules>",
+    ) != null);
     try std.testing.expectEqualStrings("composed", try services.session().prompt("hello"));
     services.deinit();
 

@@ -98,6 +98,10 @@ fn writeCliDiagnostics(writer: *std.Io.Writer, diagnostics: []const surface.Diag
             "Session selection is already set; {s} cannot be combined with it.\n",
             .{option},
         ),
+        .conflicting_system_prompt_option => |option| try writer.print(
+            "System prompt customization is already set; {s} cannot be combined with it.\n",
+            .{option},
+        ),
         .too_many_file_inputs => try writer.writeAll("Print mode accepts at most one @file input.\n"),
         .unknown_option => |option| try writer.print("Unknown option: {s}.\n", .{option}),
     };
@@ -116,6 +120,8 @@ fn writeCliHelp(writer: *std.Io.Writer) !void {
         \\  --provider VALUE     Select a provider
         \\  --model VALUE        Select a model
         \\  --api-key VALUE      Use an explicit API key
+        \\  --rules TEXT         Append session rules to the default system prompt
+        \\  --system-prompt TEXT Replace the default system prompt
         \\  -h, --help           Show help
         \\  -v, --version        Show the version
         \\

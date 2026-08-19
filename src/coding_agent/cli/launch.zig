@@ -1,6 +1,7 @@
 const std = @import("std");
 const ai = @import("../../ai/root.zig");
 const RuntimeServices = @import("../RuntimeServices.zig");
+const SystemPrompt = @import("../SystemPrompt.zig");
 const SessionFormat = @import("../SessionFormat.zig");
 const initial_message = @import("initial_message.zig");
 const print_mode = @import("print_mode.zig");
@@ -86,6 +87,15 @@ pub fn runPrintLaunch(
         environment_entries[0] = .{ .name = "OPENAI_API_KEY", .value = key };
         break :count 1;
     } else 0;
+    var prompt_appends: [1][]const u8 = undefined;
+    const prompt_policy: SystemPrompt.Policy = switch (request.system_prompt) {
+        .default => .{ .composed = .{} },
+        .append => |value| policy: {
+            prompt_appends[0] = value;
+            break :policy .{ .composed = .{ .appends = &prompt_appends } };
+        },
+        .replace => |value| .{ .verbatim = value },
+    };
     var sources: Sources = .{ .io = context.io };
     var runtime = RuntimeServices.create(context.allocator, context.io, .{
         .startup_cwd = context.cwd,
@@ -100,6 +110,7 @@ pub fn runPrintLaunch(
         .requested_model = request.model,
         .cli_api_key = request.api_key,
         .environment = .{ .entries = environment_entries[0..environment_count] },
+        .options = .{ .prompt = .{ .policy = prompt_policy } },
     }) catch |failure| {
         try context.stderr.print("Unable to start the coding agent: {s}.\n", .{@errorName(failure)});
         return .failure;

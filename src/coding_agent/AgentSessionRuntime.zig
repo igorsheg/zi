@@ -6,7 +6,6 @@ const ai_protocol = @import("../ai/protocol.zig");
 const ai_protocols = @import("../ai/protocols/root.zig");
 const ai_settings = @import("../ai/settings.zig");
 const ai_transport = @import("../ai/transport.zig");
-const agent_limits = @import("../agent/limits.zig");
 const AgentSession = @import("AgentSession.zig");
 const ModelConfig = @import("ModelConfig.zig");
 const ModelConfigSnapshot = @import("ModelConfigSnapshot.zig");
@@ -22,14 +21,13 @@ const max_credentials = 32;
 pub const Credential = model_resolution.StoredCredential;
 pub const Config = model_resolution.RuntimeConfig;
 
-pub const Options = struct {
-    limits: agent_limits.RunLimits = .{},
-    events: ?AgentSession.EventSink = null,
-};
+pub const Options = AgentSession.Options;
 
 pub const CreateError = error{
     OutOfMemory,
     InvalidModelConfiguration,
+    InvalidSystemPrompt,
+    SystemPromptTooLarge,
     DuplicateToolName,
     InvalidToolDefinition,
     UnknownTool,
@@ -39,6 +37,8 @@ pub const CreateError = error{
 pub const DurableCreateError = error{
     OutOfMemory,
     InvalidModelConfiguration,
+    InvalidSystemPrompt,
+    SystemPromptTooLarge,
     DuplicateToolName,
     InvalidToolDefinition,
     UnknownTool,
@@ -193,8 +193,7 @@ fn initialize(
         io,
         self.model_runtime.model(),
         cwd,
-        options.limits,
-        options.events,
+        options,
     );
 }
 

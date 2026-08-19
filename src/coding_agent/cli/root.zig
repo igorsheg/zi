@@ -28,7 +28,6 @@ test "CLI core parses, composes, runs sequential prompts, and prints only the fi
         scripted.asModel(),
         temporary.dir,
         .{},
-        null,
     );
     defer session.deinit();
     var stdout: std.Io.Writer.Allocating = .init(std.testing.allocator);
@@ -80,7 +79,6 @@ test "text print mode routes a settled agent failure only to stderr" {
         scripted.asModel(),
         temporary.dir,
         .{},
-        null,
     );
     defer session.deinit();
     var stdout: std.Io.Writer.Allocating = .init(std.testing.allocator);
@@ -139,7 +137,6 @@ test "text print mode reports bounded provider failure details" {
         ),
         temporary.dir,
         .{},
-        null,
     );
     defer session.deinit();
     var stdout: std.Io.Writer.Allocating = .init(std.testing.allocator);
@@ -176,7 +173,6 @@ test "text print mode rejects invalid and excessive prompts before model admissi
         scripted.asModel(),
         temporary.dir,
         .{},
-        null,
     );
     defer session.deinit();
     var stdout: std.Io.Writer.Allocating = .init(std.testing.allocator);
@@ -245,7 +241,6 @@ test "text print mode succeeds silently without a prompt" {
         scripted.asModel(),
         temporary.dir,
         .{},
-        null,
     );
     defer session.deinit();
     var stdout: std.Io.Writer.Allocating = .init(std.testing.allocator);

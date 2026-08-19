@@ -10,6 +10,7 @@ const WriteTool = @import("tools/WriteTool.zig");
 const EditTool = @import("tools/EditTool.zig");
 const BashTool = @import("tools/BashTool.zig");
 const SessionCommit = @import("SessionCommit.zig");
+const SystemPrompt = @import("SystemPrompt.zig");
 
 const AgentSession = @This();
 
@@ -21,13 +22,20 @@ pub const State = Agent.State;
 pub const StreamEvent = Agent.StreamEvent;
 pub const StreamSink = Agent.StreamSink;
 
-const coding_instructions = [_][]const u8{
-    "You are a coding agent. Inspect relevant files before drawing conclusions. " ++
-        "Use read instead of cat, sed, or guessing file contents, and continue truncated reads with offset. " ++
-        "Read an existing file before editing it. Use edit for precise changes, combine disjoint changes " ++
-        "to one file in one call, keep each oldText small but unique and exact, and never overlap replacements. " ++
-        "Use write only for new files or complete rewrites. Use bash for builds, tests, repository inspection, " ++
-        "and commands. Bash calls are non-interactive and cannot create managed background jobs.",
+pub const Options = struct {
+    limits: agent_limits.RunLimits = .{},
+    events: ?Agent.EventSink = null,
+    prompt: SystemPrompt.Config = .{},
+};
+
+pub const InitError = error{
+    OutOfMemory,
+    InvalidSystemPrompt,
+    SystemPromptTooLarge,
+    DuplicateToolName,
+    InvalidToolDefinition,
+    UnknownTool,
+    InvalidToolArguments,
 };
 
 const Tools = struct {
@@ -39,6 +47,7 @@ const Tools = struct {
 
 allocator: std.mem.Allocator,
 tools: *Tools,
+system_prompt: SystemPrompt,
 agent: Agent,
 commit_owner: ?*SessionCommit = null,
 
@@ -47,9 +56,10 @@ pub fn init(
     io: std.Io,
     model: ai_model.Model,
     cwd: std.Io.Dir,
-    limits: agent_limits.RunLimits,
-    events: ?Agent.EventSink,
-) tool_api.Error!AgentSession {
+    options: Options,
+) InitError!AgentSession {
+    var system_prompt = try SystemPrompt.init(allocator, options.prompt);
+    errdefer system_prompt.deinit();
     const tools = try allocator.create(Tools);
     errdefer allocator.destroy(tools);
     tools.* = .{
@@ -67,14 +77,15 @@ pub fn init(
     return .{
         .allocator = allocator,
         .tools = tools,
+        .system_prompt = system_prompt,
         .agent = try Agent.init(
             allocator,
             io,
             model,
-            &coding_instructions,
+            system_prompt.instructions(),
             &admitted,
-            limits,
-            events,
+            options.limits,
+            options.events,
         ),
     };
 }
@@ -82,6 +93,7 @@ pub fn init(
 pub fn deinit(self: *AgentSession) void {
     self.agent.deinit();
     if (self.commit_owner) |commit_owner| commit_owner.deinit();
+    self.system_prompt.deinit();
     self.allocator.destroy(self.tools);
     self.* = undefined;
 }
@@ -118,6 +130,17 @@ pub fn state(self: *const AgentSession) Agent.State {
     return self.agent.state();
 }
 
+pub fn systemPrompt(self: *const AgentSession) []const u8 {
+    return self.system_prompt.text();
+}
+
+fn hasCodingInstructions(request: ai_model.ModelRequest) bool {
+    if (request.instructions.len != 1) return false;
+    return std.mem.find(u8, request.instructions[0], "You are Zi") != null and
+        std.mem.find(u8, request.instructions[0], "<work_policy>") != null and
+        std.mem.find(u8, request.instructions[0], "<tool_calling>") != null;
+}
+
 const ai_testing = @import("../ai/testing.zig");
 const ai_stream = @import("../ai/stream.zig");
 
@@ -134,9 +157,7 @@ const RequestRecorder = struct {
     fn observe(context: *anyopaque, index: usize, request: ai_model.ModelRequest) void {
         const self: *RequestRecorder = @ptrCast(@alignCast(context));
         self.count += 1;
-        self.instructions_valid = self.instructions_valid and
-            request.instructions.len == coding_instructions.len and
-            std.mem.eql(u8, request.instructions[0], coding_instructions[0]);
+        self.instructions_valid = self.instructions_valid and hasCodingInstructions(request);
         if (index != 1 and index != 2) return;
         for (request.messages) |entry| switch (entry) {
             .response => {},
@@ -174,9 +195,7 @@ const EditRequestRecorder = struct {
     fn observe(context: *anyopaque, index: usize, request: ai_model.ModelRequest) void {
         const self: *EditRequestRecorder = @ptrCast(@alignCast(context));
         self.count += 1;
-        self.instructions_valid = self.instructions_valid and
-            request.instructions.len == coding_instructions.len and
-            std.mem.eql(u8, request.instructions[0], coding_instructions[0]);
+        self.instructions_valid = self.instructions_valid and hasCodingInstructions(request);
         for (request.messages) |entry| switch (entry) {
             .response => {},
             .request => |message| for (message.parts) |part| switch (part) {
@@ -209,6 +228,40 @@ const EditRequestRecorder = struct {
     }
 };
 
+test "coding-agent session sends its owned custom system prompt" {
+    const Recorder = struct {
+        const Self = @This();
+
+        valid: bool = true,
+
+        fn observe(context: *anyopaque, _: usize, request: ai_model.ModelRequest) void {
+            const self: *Self = @ptrCast(@alignCast(context));
+            self.valid = self.valid and request.instructions.len == 1 and
+                std.mem.eql(u8, request.instructions[0], "Answer with one word.");
+        }
+    };
+    var recorder: Recorder = .{};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var scripted: ai_testing.ScriptedModel = .{
+        .identity = .{ .provider = "script", .model = "custom-system-prompt" },
+        .steps = &.{.{ .text = "Done" }},
+        .request_observer = .{ .context = &recorder, .observeFn = Recorder.observe },
+    };
+    var session = try AgentSession.init(
+        std.testing.allocator,
+        std.testing.io,
+        scripted.asModel(),
+        temporary.dir,
+        .{ .prompt = .{ .policy = .{ .verbatim = "Answer with one word." } } },
+    );
+    defer session.deinit();
+
+    try std.testing.expectEqualStrings("Answer with one word.", session.systemPrompt());
+    try std.testing.expectEqualStrings("Done", try session.prompt("Finish."));
+    try std.testing.expect(recorder.valid);
+}
+
 test "coding-agent session writes and reads a workspace file before a later prompt" {
     var request_recorder: RequestRecorder = .{};
     var temporary = std.testing.tmpDir(.{});
@@ -237,7 +290,6 @@ test "coding-agent session writes and reads a workspace file before a later prom
         scripted.asModel(),
         temporary.dir,
         .{},
-        null,
     );
     defer session.deinit();
     var sink_context: u8 = 0;
@@ -328,9 +380,7 @@ const BashRequestRecorder = struct {
     fn observe(context: *anyopaque, index: usize, request: ai_model.ModelRequest) void {
         const self: *BashRequestRecorder = @ptrCast(@alignCast(context));
         self.count += 1;
-        self.instructions_valid = self.instructions_valid and
-            request.instructions.len == coding_instructions.len and
-            std.mem.eql(u8, request.instructions[0], coding_instructions[0]);
+        self.instructions_valid = self.instructions_valid and hasCodingInstructions(request);
         if (index != 1) return;
         for (request.messages) |entry| switch (entry) {
             .response => {},
@@ -387,7 +437,6 @@ test "coding-agent session reads, edits, and verifies an existing file" {
         scripted.asModel(),
         temporary.dir,
         .{},
-        null,
     );
     defer session.deinit();
 
@@ -461,7 +510,6 @@ test "coding-agent session executes bash in the workspace and continues" {
         scripted.asModel(),
         temporary.dir,
         .{},
-        null,
     );
     defer session.deinit();
 
@@ -500,7 +548,6 @@ test "coding-agent cancellation settles a running bash process" {
         scripted.asModel(),
         temporary.dir,
         .{},
-        null,
     );
     defer session.deinit();
     var cancellation: ai_model.CancellationToken = .{};

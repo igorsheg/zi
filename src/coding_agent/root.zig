@@ -2,6 +2,7 @@ pub const AgentSession = @import("AgentSession.zig");
 pub const RuntimeServices = @import("RuntimeServices.zig");
 pub const SessionIntent = @import("SessionSelection.zig").Intent;
 pub const SessionSources = @import("SessionFormat.zig").Sources;
+pub const SystemPrompt = @import("SystemPrompt.zig");
 pub const ZiPaths = @import("ZiPaths.zig");
 pub const cli = @import("cli/root.zig");
 const agent_session_runtime = @import("AgentSessionRuntime.zig");
@@ -36,6 +37,7 @@ test {
     _ = session_journal;
     _ = session_commit;
     _ = session_selection;
+    _ = SystemPrompt;
     _ = ZiPaths;
     _ = cli;
 }
