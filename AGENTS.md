@@ -216,7 +216,8 @@ and passes the value inward; owners take credential inputs and never call
 
 `$HOME/.zi/agent/auth.json` is the durable credential authority. `CredentialStore`
 owns its bounded versioned format, private permissions, mutation lock, atomic
-replacement, and secret wiping.
+replacement, and secret wiping. OAuth refresh rechecks expiry while holding the
+store mutation lock and persists a rotated credential before releasing it.
 
 ## Zig-specific patterns
 

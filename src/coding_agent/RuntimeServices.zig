@@ -2,6 +2,8 @@ const std = @import("std");
 const ai = @import("../ai/root.zig");
 const AgentSession = @import("AgentSession.zig");
 const AgentSessionRuntime = @import("AgentSessionRuntime.zig");
+const CredentialManager = @import("CredentialManager.zig");
+const CredentialStore = @import("CredentialStore.zig");
 const ModelConfigSnapshot = @import("ModelConfigSnapshot.zig");
 const ModelResolution = @import("ModelResolution.zig");
 const SessionFormat = @import("SessionFormat.zig");
@@ -17,6 +19,14 @@ pub const Error = error{
     InvalidHeader,
     InvalidRecord,
     UnsupportedVersion,
+    InvalidCredentialFile,
+    UnsafeCredentialStorage,
+    CredentialReadFailed,
+    CredentialLockFailed,
+    CredentialWriteFailed,
+    CredentialCommitIndeterminate,
+    CredentialRefreshUnavailable,
+    CredentialRefreshFailed,
     SessionTooLarge,
     TooManyEntries,
     AlreadyExists,
@@ -60,7 +70,6 @@ pub const Inputs = struct {
     requested_provider: ?[]const u8 = null,
     requested_model: ?[]const u8 = null,
     cli_api_key: ?[]const u8 = null,
-    stored_credentials: []const ModelResolution.StoredCredential = &.{},
     environment: ai.auth.Environment = .{},
     options: AgentSessionRuntime.Options = .{},
 };
@@ -143,12 +152,53 @@ fn createOwned(
     var snapshot = try ModelConfigSnapshot.load(allocator, io, selection.pathsView());
     errdefer snapshot.deinit();
     const requested = effectiveRequest(&selection, inputs);
+    var refresh_http = ai.transport.HttpTransport.init(allocator);
+    const refresh_transport = switch (transport) {
+        .http => refresh_http.transport(),
+        .borrowed => |borrowed| borrowed,
+    };
+    var stored_credentials = CredentialManager.loadForRuntime(
+        allocator,
+        io,
+        selection.pathsView(),
+        refresh_transport,
+        .{
+            .model_config = snapshot.view(),
+            .selection = .{
+                .provider = requested.provider orelse "",
+                .model = requested.model orelse "",
+            },
+            .explicit_api_key = inputs.cli_api_key,
+            .now_ms = inputs.sources.nowMsFn(inputs.sources.clock_context),
+        },
+    ) catch |failure| return switch (failure) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.InvalidCredentialFile => error.InvalidCredentialFile,
+        error.UnsupportedVersion => error.UnsupportedVersion,
+        error.UnsafePath => error.UnsafeCredentialStorage,
+        error.ReadFailed => error.CredentialReadFailed,
+        error.LockFailed => error.CredentialLockFailed,
+        error.WriteFailed => error.CredentialWriteFailed,
+        error.CommitIndeterminate => error.CredentialCommitIndeterminate,
+        error.InvalidModelConfiguration => error.InvalidModelConfiguration,
+        error.RefreshUnavailable => error.CredentialRefreshUnavailable,
+        error.Rejected,
+        error.InvalidResponse,
+        error.Cancelled,
+        error.TimedOut,
+        error.InvalidUrl,
+        error.ConnectionFailed,
+        error.ResponseTooLarge,
+        error.ConsumerStopped,
+        => error.CredentialRefreshFailed,
+    };
+    defer stored_credentials.deinit();
     var resolved = try ModelResolution.resolve(allocator, .{
         .model_config = snapshot.view(),
         .requested_provider = requested.provider,
         .requested_model = requested.model,
         .cli_api_key = inputs.cli_api_key,
-        .stored_credentials = inputs.stored_credentials,
+        .stored_credentials = stored_credentials.entries,
         .environment = inputs.environment,
     });
     errdefer resolved.deinit();
@@ -247,6 +297,19 @@ fn temporaryPath(temporary: *std.testing.TmpDir, buffer: []u8) ![]const u8 {
     return buffer[0..length];
 }
 
+fn testAccessToken(allocator: std.mem.Allocator, account_id: []const u8) ![]u8 {
+    const payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"https://api.openai.com/auth\":{{\"chatgpt_account_id\":\"{s}\"}}}}",
+        .{account_id},
+    );
+    defer allocator.free(payload);
+    const encoded = try allocator.alloc(u8, std.base64.url_safe_no_pad.Encoder.calcSize(payload.len));
+    defer allocator.free(encoded);
+    _ = std.base64.url_safe_no_pad.Encoder.encode(encoded, payload);
+    return std.fmt.allocPrint(allocator, "header.{s}.signature", .{encoded});
+}
+
 fn writeCustomModels(temporary: *std.testing.TmpDir) !void {
     try temporary.dir.createDirPath(std.testing.io, ".zi/agent");
     try temporary.dir.writeFile(std.testing.io, .{
@@ -270,10 +333,16 @@ fn openJournal(allocator: std.mem.Allocator, path: []const u8) !SessionJournal.O
 test "runtime services compose effective paths, models, credentials, durability, and transport" {
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();
-    try writeCustomModels(&temporary);
     try temporary.dir.writeFile(std.testing.io, .{ .sub_path = "evidence.txt", .data = "cwd evidence" });
     var root_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const root = try temporaryPath(&temporary, &root_buffer);
+    var credential_paths = try ZiPaths.init(std.testing.allocator, root, root);
+    defer credential_paths.deinit();
+    try CredentialStore.put(std.testing.allocator, std.testing.io, &credential_paths, .{
+        .provider_id = "custom-openai",
+        .credential = .{ .api_key = .{ .key = "stored-custom-secret" } },
+    });
+    try writeCustomModels(&temporary);
     var sources: TestSources = .{};
     const response =
         // ziglint-ignore: Z024 -- compact provider wire fixture
@@ -294,7 +363,6 @@ test "runtime services compose effective paths, models, credentials, durability,
         .sources = sources.view(),
         .requested_provider = "custom-openai",
         .requested_model = "model-a",
-        .cli_api_key = "custom-secret",
     }, fake.transport());
     const journal_path = try std.testing.allocator.dupe(u8, services.journalPath());
     defer std.testing.allocator.free(journal_path);
@@ -311,6 +379,65 @@ test "runtime services compose effective paths, models, credentials, durability,
     try std.testing.expectEqualStrings("model-a", entries[0].model_change.selection.model);
     try std.testing.expect(entries[3].turn_end.outcome == .completed);
     try std.testing.expectEqual(@as(usize, 1), fake.next_index);
+}
+
+test "runtime services refresh and persist expired Codex credentials before prompting" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var root_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root = try temporaryPath(&temporary, &root_buffer);
+    var credential_paths = try ZiPaths.init(std.testing.allocator, root, root);
+    defer credential_paths.deinit();
+    try CredentialStore.put(std.testing.allocator, std.testing.io, &credential_paths, .{
+        .provider_id = "openai-codex",
+        .credential = .{ .oauth = .{
+            .access = "expired-access",
+            .refresh = "expired-refresh",
+            .expires_at_ms = 1,
+            .account_id = "expired-account",
+        } },
+    });
+    const access = try testAccessToken(std.testing.allocator, "runtime-account");
+    defer std.testing.allocator.free(access);
+    const refresh_response = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"access_token\":\"{s}\",\"refresh_token\":\"runtime-refresh\",\"expires_in\":3600}}",
+        .{access},
+    );
+    defer std.testing.allocator.free(refresh_response);
+    const model_response =
+        // ziglint-ignore: Z024 -- compact provider wire fixture
+        \\data: {"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_1","content":[]}}
+        \\
+        \\data: {"type":"response.output_text.delta","output_index":0,"delta":"refreshed codex"}
+        \\
+        \\data: {"type":"response.completed","response":{"status":"completed"}}
+        \\
+    ;
+    const exchanges = [_]fake_api.Exchange{
+        .{ .response = .{ .status = 200, .body = refresh_response } },
+        .{ .response = .{ .status = 200, .body = model_response } },
+    };
+    var fake = fake_api.FakeTransport.init(&exchanges);
+    var sources: TestSources = .{};
+    var services = try createWithTransport(std.testing.allocator, std.testing.io, .{
+        .startup_cwd = root,
+        .home = root,
+        .session = .new,
+        .sources = sources.view(),
+        .requested_provider = "openai-codex",
+        .requested_model = "gpt-5.6-terra",
+    }, fake.transport());
+    try std.testing.expectEqualStrings("refreshed codex", try services.session().prompt("hello"));
+    services.deinit();
+
+    var stored = try CredentialStore.load(std.testing.allocator, std.testing.io, &credential_paths);
+    defer stored.deinit();
+    const refreshed = stored.entries[0].credential.oauth;
+    try std.testing.expectEqualStrings(access, refreshed.access);
+    try std.testing.expectEqualStrings("runtime-refresh", refreshed.refresh);
+    try std.testing.expectEqualStrings("runtime-account", refreshed.account_id.?);
+    try std.testing.expectEqual(@as(usize, 2), fake.next_index);
 }
 
 test "runtime services restore the journal model unless an explicit override commits first" {
