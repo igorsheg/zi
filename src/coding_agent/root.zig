@@ -1,6 +1,7 @@
 pub const AgentSession = @import("AgentSession.zig");
 pub const cli = @import("cli/root.zig");
 const agent_session_runtime = @import("AgentSessionRuntime.zig");
+const credential_store = @import("CredentialStore.zig");
 const model_config = @import("ModelConfig.zig");
 const model_config_snapshot = @import("ModelConfigSnapshot.zig");
 const model_resolution = @import("ModelResolution.zig");
@@ -22,6 +23,7 @@ pub const StreamSink = AgentSession.StreamSink;
 test {
     _ = AgentSession;
     _ = agent_session_runtime;
+    _ = credential_store;
     _ = model_config;
     _ = model_config_snapshot;
     _ = model_resolution;

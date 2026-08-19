@@ -214,6 +214,10 @@ reads scattered through the tree. The process edge reads the environment once
 and passes the value inward; owners take credential inputs and never call
 `getenv`. Do not add a second configuration path for the same fact.
 
+`$HOME/.zi/agent/auth.json` is the durable credential authority. `CredentialStore`
+owns its bounded versioned format, private permissions, mutation lock, atomic
+replacement, and secret wiping.
+
 ## Zig-specific patterns
 
 ### Memory
