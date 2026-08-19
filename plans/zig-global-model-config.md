@@ -2,6 +2,9 @@
 
 Status: Implemented and verified on 2026-08-18
 
+Source-schema note: the first Zig-specific durable schema below was superseded by the approved Pi-shaped contract in
+`plans/zig-pi-model-config.md`. The owner decomposition and runtime lifetime boundary remain in force.
+
 ## Intent
 
 Admit credential-blind custom OpenAI Chat Completions-compatible providers from the global

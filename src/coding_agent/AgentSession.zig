@@ -8,6 +8,7 @@ const ReadTool = @import("tools/ReadTool.zig");
 const WriteTool = @import("tools/WriteTool.zig");
 const EditTool = @import("tools/EditTool.zig");
 const BashTool = @import("tools/BashTool.zig");
+const SessionCommit = @import("SessionCommit.zig");
 
 const AgentSession = @This();
 
@@ -38,6 +39,7 @@ const Tools = struct {
 allocator: std.mem.Allocator,
 tools: *Tools,
 agent: Agent,
+commit_owner: ?*SessionCommit = null,
 
 pub fn init(
     allocator: std.mem.Allocator,
@@ -78,6 +80,7 @@ pub fn init(
 
 pub fn deinit(self: *AgentSession) void {
     self.agent.deinit();
+    if (self.commit_owner) |commit_owner| commit_owner.deinit();
     self.allocator.destroy(self.tools);
     self.* = undefined;
 }

@@ -3,6 +3,7 @@ const ai_message = @import("../ai/message.zig");
 const ai_model = @import("../ai/model.zig");
 const ai_stream = @import("../ai/stream.zig");
 const ai_usage = @import("../ai/usage.zig");
+const commit_api = @import("Commit.zig");
 const History = @import("History.zig");
 const tool_api = @import("Tool.zig");
 const limit_api = @import("limits.zig");
@@ -68,7 +69,32 @@ pub const RunError = error{
     MaxToolCallsExceeded,
     ToolResultTooLarge,
     ToolControlUnavailable,
+    PersistenceFailed,
+    SessionTooLarge,
     AlreadyRun,
+};
+
+const TurnError = error{
+    OutOfMemory,
+    Cancelled,
+    TimedOut,
+    UnsupportedCapability,
+    UnsupportedSetting,
+    InvalidRequest,
+    ConnectionFailed,
+    RateLimited,
+    ProviderRejectedRequest,
+    ProviderUnavailable,
+    InvalidProviderResponse,
+    StreamInterrupted,
+    StreamConsumerStopped,
+    HandoffRejected,
+    MaxModelRequestsExceeded,
+    MaxToolCallsExceeded,
+    ToolResultTooLarge,
+    ToolControlUnavailable,
+    PersistenceFailed,
+    SessionTooLarge,
 };
 
 allocator: std.mem.Allocator,
@@ -82,6 +108,7 @@ result_arena: std.heap.ArenaAllocator,
 run_state: State = .idle,
 limits: limit_api.RunLimits,
 events: ?EventSink,
+commits: ?commit_api.Sink = null,
 model_request_count: usize = 0,
 tool_call_count: usize = 0,
 run_admitted: bool = false,
@@ -132,6 +159,19 @@ pub fn modelRequests(self: *const Agent) usize {
 
 pub fn toolCalls(self: *const Agent) usize {
     return self.tool_call_count;
+}
+
+/// Construction-only binding; committed sessions install it before the agent is published.
+pub fn bindCommits(
+    self: *Agent,
+    initial_messages: []const ai_message.Message,
+    sink: commit_api.Sink,
+) error{ OutOfMemory, SessionTooLarge }!void {
+    std.debug.assert(self.run_state == .idle);
+    std.debug.assert(self.history.messages().len == 0);
+    std.debug.assert(self.commits == null);
+    for (initial_messages) |message| try self.history.append(message);
+    self.commits = sink;
 }
 
 pub const StreamEvent = struct {
@@ -189,18 +229,33 @@ fn runInternal(self: *Agent, input: []const u8, control: RunControl, delivery: D
     self.model_request_count = 0;
     self.tool_call_count = 0;
 
-    self.history.appendRequest(.{ .parts = &.{.{ .user = .{ .text = input } }} }) catch |failure| {
+    self.commitMessage(.user, .{ .request = .{
+        .parts = &.{.{ .user = .{ .text = input } }},
+    } }) catch |failure| {
         self.fail(failure);
         return failure;
     };
 
-    while (true) {
-        self.checkControl(control) catch |failure| {
-            self.fail(failure);
-            return failure;
+    const text = self.runTurn(control, delivery) catch |failure| {
+        self.settleTurn(turnOutcome(failure)) catch |settlement_failure| {
+            self.fail(settlement_failure);
+            return settlement_failure;
         };
+        self.fail(failure);
+        return failure;
+    };
+    self.settleTurn(.completed) catch |failure| {
+        self.fail(failure);
+        return failure;
+    };
+    self.transition(.completed);
+    return text;
+}
+
+fn runTurn(self: *Agent, control: RunControl, delivery: Delivery) TurnError![]const u8 {
+    while (true) {
+        try self.checkControl(control);
         if (self.model_request_count >= self.limits.max_model_requests) {
-            self.fail(error.MaxModelRequestsExceeded);
             return error.MaxModelRequestsExceeded;
         }
         self.model_request_count += 1;
@@ -209,43 +264,20 @@ fn runInternal(self: *Agent, input: []const u8, control: RunControl, delivery: D
 
         var definitions: std.ArrayList(ai_message.ToolDefinition) = .empty;
         defer definitions.deinit(self.allocator);
-        for (self.catalog.tools.items) |tool| definitions.append(self.allocator, tool.definition) catch |failure| {
-            self.fail(failure);
-            return failure;
-        };
+        for (self.catalog.tools.items) |tool| try definitions.append(self.allocator, tool.definition);
 
-        var response = self.invokeModel(control, delivery, definitions.items) catch |failure| {
-            self.fail(failure);
-            return failure;
-        };
-        const call_count = validateResponseFinish(response.value) catch |failure| {
-            response.deinit();
-            self.fail(failure);
-            return failure;
-        };
-        self.history.appendResponse(response.value) catch |failure| {
-            response.deinit();
-            self.fail(failure);
-            return failure;
-        };
-        response.deinit();
+        var response = try self.invokeModel(control, delivery, definitions.items);
+        defer response.deinit();
+        const call_count = try validateResponseFinish(response.value);
+        try self.commitMessage(.response, .{ .response = response.value });
         self.emit(.{ .model_request_completed = .{ .number = self.model_request_count } });
-        self.checkControl(control) catch |failure| {
-            self.fail(failure);
-            return failure;
-        };
+        try self.checkControl(control);
 
         const stored_response = self.history.messages()[self.history.messages().len - 1].response;
         if (call_count == 0) {
-            const text = collectText(self.result_arena.allocator(), stored_response.parts) catch |failure| {
-                self.fail(failure);
-                return failure;
-            };
-            self.transition(.completed);
-            return text;
+            return collectText(self.result_arena.allocator(), stored_response.parts);
         }
         if (call_count > self.limits.max_tool_calls -| self.tool_call_count) {
-            self.fail(error.MaxToolCallsExceeded);
             return error.MaxToolCallsExceeded;
         }
 
@@ -264,38 +296,61 @@ fn runInternal(self: *Agent, input: []const u8, control: RunControl, delivery: D
                 defer result_arena.deinit();
                 const result_memory = result_arena.allocator();
                 const result = if (stored_response.finish.category == .length)
-                    self.failureResult(
+                    try self.failureResult(
                         result_memory,
                         call,
                         "Tool call was not executed because the model response was truncated.",
-                    ) catch |failure| {
-                        self.fail(failure);
-                        return failure;
-                    }
+                    )
                 else
-                    self.executeTool(result_memory, call, control) catch |failure| {
-                        self.fail(failure);
-                        return failure;
-                    };
+                    try self.executeTool(result_memory, call, control);
+                const result_parts = [_]ai_message.RequestPart{.{ .tool_result = result }};
+                try self.commitMessage(.tool_result, .{ .request = .{ .parts = &result_parts } });
                 self.emit(.{ .tool_execution_completed = .{
                     .number = number,
                     .call_id = call.id,
                     .name = call.name,
                     .outcome = if (result.outcome == .success) .success else .failure,
                 } });
-                const result_parts = [_]ai_message.RequestPart{.{ .tool_result = result }};
-                self.history.appendRequest(.{ .parts = &result_parts }) catch |failure| {
-                    self.fail(failure);
-                    return failure;
-                };
-                self.checkControl(control) catch |failure| {
-                    self.fail(failure);
-                    return failure;
-                };
+                try self.checkControl(control);
             },
             else => {},
         };
     }
+}
+
+fn commitMessage(self: *Agent, kind: commit_api.MessageKind, value: ai_message.Message) TurnError!void {
+    var prepared = try self.history.prepare(value);
+    errdefer prepared.deinit();
+    if (self.commits) |sink| try sink.commitMessage(kind, prepared.value);
+    prepared.publish(&self.history);
+}
+
+fn settleTurn(self: *Agent, outcome: commit_api.TurnOutcome) commit_api.Error!void {
+    if (self.commits) |sink| return sink.settleTurn(outcome);
+}
+
+fn turnOutcome(failure: TurnError) commit_api.TurnOutcome {
+    return switch (failure) {
+        error.Cancelled => .cancelled,
+        error.StreamInterrupted => .interrupted,
+        error.OutOfMemory, error.SessionTooLarge => .{ .failed = .resource_exhausted },
+        error.TimedOut => .{ .failed = .timed_out },
+        error.UnsupportedCapability => .{ .failed = .unsupported_capability },
+        error.UnsupportedSetting => .{ .failed = .unsupported_setting },
+        error.InvalidRequest => .{ .failed = .invalid_request },
+        error.ConnectionFailed => .{ .failed = .connection_failed },
+        error.RateLimited => .{ .failed = .rate_limited },
+        error.ProviderRejectedRequest => .{ .failed = .provider_rejected_request },
+        error.ProviderUnavailable => .{ .failed = .provider_unavailable },
+        error.InvalidProviderResponse => .{ .failed = .invalid_provider_response },
+        error.StreamConsumerStopped => .{ .failed = .stream_consumer_stopped },
+        error.HandoffRejected => .{ .failed = .handoff_rejected },
+        error.MaxModelRequestsExceeded => .{ .failed = .max_model_requests_exceeded },
+        error.MaxToolCallsExceeded => .{ .failed = .max_tool_calls_exceeded },
+        error.ToolResultTooLarge => .{ .failed = .tool_result_too_large },
+        error.ToolControlUnavailable => .{ .failed = .tool_control_unavailable },
+        error.PersistenceFailed => .{ .failed = .persistence_failed },
+    };
 }
 
 fn executeTool(
@@ -303,7 +358,7 @@ fn executeTool(
     allocator: std.mem.Allocator,
     call: ai_message.ToolCall,
     control: RunControl,
-) RunError!ai_message.ToolResult {
+) TurnError!ai_message.ToolResult {
     const resolved = self.catalog.lookup(call.name) orelse return self.failureResult(
         allocator,
         call,
@@ -350,7 +405,7 @@ fn executeControlled(
     tool: tool_api.Tool,
     arguments_json: []const u8,
     control: RunControl,
-) RunError!tool_api.ToolExecution {
+) TurnError!tool_api.ToolExecution {
     const run_context: tool_api.Tool.RunContext = .{
         .cancellation = control.cancellation,
         .deadline = control.deadline,
@@ -419,7 +474,7 @@ fn failureResult(
     allocator: std.mem.Allocator,
     call: ai_message.ToolCall,
     failure: []const u8,
-) RunError!ai_message.ToolResult {
+) error{ OutOfMemory, ToolResultTooLarge }!ai_message.ToolResult {
     if (failure.len > self.limits.max_tool_result_bytes) return error.ToolResultTooLarge;
     const content = try allocator.alloc(ai_message.Content, 1);
     content[0] = .{ .text = try allocator.dupe(u8, failure) };
@@ -467,7 +522,7 @@ fn invokeModel(
     control: RunControl,
     delivery: Delivery,
     tools: []const ai_message.ToolDefinition,
-) RunError!ai_model.OwnedResponse {
+) TurnError!ai_model.OwnedResponse {
     const request: ai_model.ModelRequest = .{
         .messages = self.history.messages(),
         .instructions = self.instructions,
@@ -500,7 +555,7 @@ const StreamSinkAdapter = struct {
     }
 };
 
-fn validateResponseFinish(response: ai_message.ResponseMessage) RunError!usize {
+fn validateResponseFinish(response: ai_message.ResponseMessage) error{ Cancelled, InvalidProviderResponse }!usize {
     const call_count = countToolCalls(response.parts);
     switch (response.finish.category) {
         .cancelled => return error.Cancelled,

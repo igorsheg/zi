@@ -11,6 +11,9 @@ const agent_limits = @import("../agent/limits.zig");
 const AgentSession = @import("AgentSession.zig");
 const ModelConfig = @import("ModelConfig.zig");
 const ModelConfigSnapshot = @import("ModelConfigSnapshot.zig");
+const SessionCommit = @import("SessionCommit.zig");
+const SessionFormat = @import("SessionFormat.zig");
+const SessionJournal = @import("SessionJournal.zig");
 const ZiPaths = @import("ZiPaths.zig");
 const model_resolution = @import("ModelResolution.zig");
 
@@ -33,6 +36,8 @@ pub const CreateError = error{
     UnknownTool,
     InvalidToolArguments,
 };
+
+const DurableCreateError = CreateError || error{ PersistenceFailed, SessionTooLarge };
 
 const ProviderStorage = union(enum) {
     openai_completions: compatible.OpenAiCompatible,
@@ -229,6 +234,31 @@ fn createWithTransport(
     return runtime;
 }
 
+fn createDurableWithTransport(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cwd: std.Io.Dir,
+    transport: ai_transport.Transport,
+    config: Config,
+    options: Options,
+    opened: *SessionJournal.Opened,
+    sources: SessionFormat.Sources,
+    faults: SessionJournal.Faults,
+) DurableCreateError!*AgentSessionRuntime {
+    var owned = opened.*;
+    opened.* = undefined;
+    var owned_live = true;
+    errdefer if (owned_live) owned.deinit();
+    const runtime = try allocator.create(AgentSessionRuntime);
+    errdefer allocator.destroy(runtime);
+    runtime.allocator = allocator;
+    runtime.transport = .{ .borrowed = transport };
+    const initialize_result = runtime.initializeDurable(io, cwd, config, options, &owned, sources, faults);
+    owned_live = false;
+    try initialize_result;
+    return runtime;
+}
+
 fn initialize(
     self: *AgentSessionRuntime,
     io: std.Io,
@@ -246,6 +276,42 @@ fn initialize(
         options.limits,
         options.events,
     );
+}
+
+fn initializeDurable(
+    self: *AgentSessionRuntime,
+    io: std.Io,
+    cwd: std.Io.Dir,
+    config: Config,
+    options: Options,
+    opened: *SessionJournal.Opened,
+    sources: SessionFormat.Sources,
+    faults: SessionJournal.Faults,
+) DurableCreateError!void {
+    var opened_owned = true;
+    errdefer if (opened_owned) opened.deinit();
+    try self.initialize(io, cwd, config, options);
+    errdefer {
+        self.session_value.deinit();
+        self.model_runtime.deinit();
+    }
+
+    const commit_result = SessionCommit.create(
+        self.allocator,
+        opened,
+        sources,
+        self.model_runtime.model().identity,
+        faults,
+    );
+    opened_owned = false;
+    const commit_owner = commit_result catch |failure| return switch (failure) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.SessionTooLarge => error.SessionTooLarge,
+        error.PersistenceFailed => error.PersistenceFailed,
+    };
+    errdefer commit_owner.deinit();
+    try commit_owner.bindAgent(&self.session_value.agent);
+    self.session_value.commit_owner = commit_owner;
 }
 
 fn validateConfig(config: Config) error{InvalidModelConfiguration}!void {
@@ -399,22 +465,31 @@ const test_model_config: ModelConfig = .{
     .providers = &test_provider_definitions,
 };
 
-const CompatibleInspector = struct {
+const CustomResponsesInspector = struct {
     calls: usize = 0,
 
     fn inspect(context: *anyopaque, request: ai_transport.Request) error{Rejected}!void {
-        const self: *CompatibleInspector = @ptrCast(@alignCast(context));
-        if (!std.mem.eql(u8, request.url, "https://example.test/v1/chat/completions")) return error.Rejected;
-        if (std.mem.indexOf(u8, request.body, "\"model\":\"runtime-model\"") == null) return error.Rejected;
+        const self: *CustomResponsesInspector = @ptrCast(@alignCast(context));
+        if (!std.mem.eql(u8, request.url, "https://example.test/openai/v1/responses")) {
+            return error.Rejected;
+        }
+        if (std.mem.indexOf(u8, request.body, "\"model\":\"custom-reasoning-model\"") == null) {
+            return error.Rejected;
+        }
         if (!hasHeader(request, "authorization", "Bearer runtime-secret")) return error.Rejected;
         switch (self.calls) {
             0 => {
-                if (std.mem.indexOf(u8, request.body, "\"content\":\"read note.txt\"") == null) {
+                if (std.mem.indexOf(u8, request.body, "read note.txt") == null) {
                     return error.Rejected;
                 }
                 if (std.mem.indexOf(u8, request.body, "\"name\":\"read\"") == null) return error.Rejected;
             },
-            1 => if (std.mem.indexOf(u8, request.body, "runtime evidence") == null) return error.Rejected,
+            1 => {
+                if (std.mem.indexOf(u8, request.body, "\"type\":\"function_call_output\"") == null) {
+                    return error.Rejected;
+                }
+                if (std.mem.indexOf(u8, request.body, "runtime evidence") == null) return error.Rejected;
+            },
             else => return error.Rejected,
         }
         self.calls += 1;
@@ -458,6 +533,86 @@ fn hasHeader(request: ai_transport.Request, name: []const u8, value: []const u8)
     return false;
 }
 
+const DurableSources = struct {
+    next_id: u64 = 0,
+    next_ms: u64 = 1_777_800_000_000,
+
+    fn nextId(context: *anyopaque) [16]u8 {
+        const self: *DurableSources = @ptrCast(@alignCast(context));
+        self.next_id += 1;
+        var bytes: [16]u8 = @splat(0);
+        std.mem.writeInt(u64, bytes[8..16], self.next_id, .big);
+        return bytes;
+    }
+
+    fn nowMs(context: *anyopaque) u64 {
+        const self: *DurableSources = @ptrCast(@alignCast(context));
+        defer self.next_ms += 1;
+        return self.next_ms;
+    }
+
+    fn view(self: *DurableSources) SessionFormat.Sources {
+        return .{
+            .id_context = self,
+            .nextIdFn = nextId,
+            .clock_context = self,
+            .nowMsFn = nowMs,
+        };
+    }
+};
+
+const AppendFault = struct {
+    fail_on_record: usize,
+    records_seen: usize = 0,
+    failed: bool = false,
+
+    fn boundary(context: *anyopaque, point: SessionJournal.Boundary) anyerror!void {
+        const self: *AppendFault = @ptrCast(@alignCast(context));
+        if (point != .after_append_record_write) return;
+        self.records_seen += 1;
+        if (!self.failed and self.records_seen == self.fail_on_record) {
+            self.failed = true;
+            return error.InjectedFault;
+        }
+    }
+
+    fn faults(self: *AppendFault) SessionJournal.Faults {
+        return .{ .context = self, .boundaryFn = boundary };
+    }
+};
+
+const DurableEventRecorder = struct {
+    model_completions: usize = 0,
+    tool_completions: usize = 0,
+
+    fn emit(context: *anyopaque, event: AgentSession.Event) void {
+        const self: *DurableEventRecorder = @ptrCast(@alignCast(context));
+        switch (event) {
+            .model_request_completed => self.model_completions += 1,
+            .tool_execution_completed => self.tool_completions += 1,
+            else => {},
+        }
+    }
+};
+
+fn createTestJournal(
+    dir: std.Io.Dir,
+    cwd: []const u8,
+) !SessionJournal.Opened {
+    return SessionJournal.create(
+        std.testing.allocator,
+        std.testing.io,
+        dir,
+        "session.jsonl",
+        .{
+            .id = "session-runtime",
+            .timestamp = "2026-08-19T10:30:00.000Z",
+            .cwd = cwd,
+        },
+        .none(),
+    );
+}
+
 test "runtime owns catalog and provider configuration through a cwd-bound tool loop" {
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();
@@ -467,41 +622,55 @@ test "runtime owns catalog and provider configuration through a cwd-bound tool l
         .sub_path = ".zi/agent/models.json",
         .data =
         \\{
-        \\  "version": 1,
-        \\  "providers": [{
-        \\    "id": "runtime-openai",
-        \\    "name": "Runtime OpenAI",
-        \\    "base_url": "https://example.test/v1",
-        \\    "authentication": "api_key",
-        \\    "models": [{
-        \\      "id": "runtime-model",
-        \\      "aliases": ["runtime-latest"],
-        \\      "profile": {
-        \\        "capabilities": ["streaming", "tools", "parallel_tool_calls", "thinking"],
-        \\        "settings": ["temperature", "top_p", "max_output_tokens", "stop_sequences", "seed"],
-        \\        "context_window": 128000,
-        \\        "max_output_tokens": 16384
-        \\      }
-        \\    }]
-        \\  }]
+        \\  "providers": {
+        \\    "custom-openai": {
+        \\      "baseUrl": "https://example.test/openai/v1",
+        \\      "api": "openai-responses",
+        \\      "models": [{
+        \\        "id": "custom-reasoning-model",
+        \\        "reasoning": true,
+        \\        "input": ["text", "image"],
+        \\        "contextWindow": 272000,
+        \\        "maxTokens": 128000
+        \\      }]
+        \\    }
+        \\  }
         \\}
         ,
     });
 
     const tool_response =
         // ziglint-ignore: Z024 -- compact provider wire fixture
-        \\{"choices":[{"message":{"content":null,"tool_calls":[{"id":"call-1","function":{"name":"read","arguments":"{\"path\":\"note.txt\"}"}}]},"finish_reason":"tool_calls"}]}
+        \\data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"read"}}
+        \\
+        \\data: {"type":"response.function_call_arguments.delta","output_index":0,"delta":"{\"path\":"}
+        \\
+        \\data: {"type":"response.function_call_arguments.delta","output_index":0,"delta":"\"note.txt\"}"}
+        \\
+        \\data: {"type":"response.function_call_arguments.done","output_index":0,"arguments":"{\"path\":\"note.txt\"}"}
+        \\
+        // ziglint-ignore: Z024 -- compact provider wire fixture
+        \\data: {"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"read","arguments":"{\"path\":\"note.txt\"}"}}
+        \\
+        \\data: {"type":"response.completed","response":{"status":"completed"}}
+        \\
     ;
     const final_response =
-        \\{"choices":[{"message":{"content":"runtime complete"},"finish_reason":"stop"}]}
+        // ziglint-ignore: Z024 -- compact provider wire fixture
+        \\data: {"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_1","content":[]}}
+        \\
+        \\data: {"type":"response.output_text.delta","output_index":0,"delta":"runtime complete"}
+        \\
+        \\data: {"type":"response.completed","response":{"status":"completed"}}
+        \\
     ;
     const exchanges = [_]fake_api.Exchange{
-        .{ .response = .{ .status = 200, .body = tool_response } },
-        .{ .response = .{ .status = 200, .body = final_response } },
+        .{ .response = .{ .status = 200, .body = tool_response, .chunk_bytes = 13 } },
+        .{ .response = .{ .status = 200, .body = final_response, .chunk_bytes = 11 } },
     };
     var fake = fake_api.FakeTransport.init(&exchanges);
-    var inspector: CompatibleInspector = .{};
-    fake.inspector = .{ .context = &inspector, .inspect_fn = CompatibleInspector.inspect };
+    var inspector: CustomResponsesInspector = .{};
+    fake.inspector = .{ .context = &inspector, .inspect_fn = CustomResponsesInspector.inspect };
 
     var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path_length = try temporary.dir.realPath(std.testing.io, &path_buffer);
@@ -516,8 +685,8 @@ test "runtime owns catalog and provider configuration through a cwd-bound tool l
     try std.testing.expect(snapshot.diagnostic() == null);
     var resolved = try model_resolution.resolve(std.testing.allocator, .{
         .model_config = snapshot.view(),
-        .requested_provider = "runtime-openai",
-        .requested_model = "runtime-latest",
+        .requested_provider = "custom-openai",
+        .requested_model = "custom-reasoning-model",
         .cli_api_key = "runtime-secret",
     });
     errdefer resolved.deinit();
@@ -541,8 +710,325 @@ test "runtime owns catalog and provider configuration through a cwd-bound tool l
     try std.testing.expectEqual(@as(usize, 2), fake.next_index);
     try std.testing.expectEqual(@as(usize, 2), inspector.calls);
     const history = runtime.session().messages();
-    try std.testing.expectEqualStrings("runtime-openai", history[3].response.identity.provider);
-    try std.testing.expectEqualStrings("runtime-model", history[3].response.identity.model);
+    try std.testing.expectEqualStrings("custom-openai", history[3].response.identity.provider);
+    try std.testing.expectEqualStrings("custom-reasoning-model", history[3].response.identity.model);
+}
+
+test "durable runtime commits a FakeTransport tool loop before publishing history" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try temporary.dir.writeFile(std.testing.io, .{ .sub_path = "note.txt", .data = "durable evidence" });
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_length = try temporary.dir.realPath(std.testing.io, &path_buffer);
+    const cwd = path_buffer[0..path_length];
+    var opened = try createTestJournal(temporary.dir, cwd);
+
+    const tool_response =
+        // ziglint-ignore: Z024 -- compact provider wire fixture
+        \\data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"read"}}
+        \\
+        \\data: {"type":"response.function_call_arguments.done","output_index":0,"arguments":"{\"path\":\"note.txt\"}"}
+        \\
+        // ziglint-ignore: Z024 -- compact provider wire fixture
+        \\data: {"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"read","arguments":"{\"path\":\"note.txt\"}"}}
+        \\
+        \\data: {"type":"response.completed","response":{"status":"completed"}}
+        \\
+    ;
+    const final_response =
+        // ziglint-ignore: Z024 -- compact provider wire fixture
+        \\data: {"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_1","content":[]}}
+        \\
+        \\data: {"type":"response.output_text.delta","output_index":0,"delta":"durably complete"}
+        \\
+        \\data: {"type":"response.completed","response":{"status":"completed"}}
+        \\
+    ;
+    const exchanges = [_]fake_api.Exchange{
+        .{ .response = .{ .status = 200, .body = tool_response, .chunk_bytes = 13 } },
+        .{ .response = .{ .status = 200, .body = final_response, .chunk_bytes = 11 } },
+    };
+    var fake = fake_api.FakeTransport.init(&exchanges);
+    var sources: DurableSources = .{};
+    const credentials = [_]Credential{.{ .api_key = .{
+        .provider_id = "openai",
+        .value = "responses-secret",
+    } }};
+    var runtime = try createDurableWithTransport(
+        std.testing.allocator,
+        std.testing.io,
+        temporary.dir,
+        fake.transport(),
+        .{
+            .model_config = test_model_config,
+            .credentials = &credentials,
+            .selection = .{ .provider = "openai", .model = "responses-runtime" },
+        },
+        .{},
+        &opened,
+        sources.view(),
+        .none(),
+    );
+    errdefer runtime.deinit();
+
+    try std.testing.expectEqualStrings("durably complete", try runtime.session().prompt("read note.txt"));
+    try std.testing.expectEqual(@as(usize, 4), runtime.session().messages().len);
+    runtime.deinit();
+
+    var restored = try SessionJournal.openReadOnly(
+        std.testing.allocator,
+        std.testing.io,
+        temporary.dir,
+        "session.jsonl",
+    );
+    defer restored.deinit();
+    const entries = restored.restore_candidate.entries;
+    try std.testing.expectEqual(@as(usize, 6), entries.len);
+    try std.testing.expect(entries[0] == .model_change);
+    try std.testing.expect(entries[1] == .message);
+    try std.testing.expect(entries[2] == .message);
+    try std.testing.expect(entries[3] == .message);
+    try std.testing.expect(entries[4] == .message);
+    try std.testing.expect(entries[5].turn_end.outcome == .completed);
+    try std.testing.expectEqual(@as(usize, 4), restored.restore_candidate.context_messages.len);
+    try std.testing.expectEqualStrings(
+        "durable evidence",
+        restored.restore_candidate.context_messages[2].request.parts[0].tool_result.content[0].text,
+    );
+    try std.testing.expect(restored.restore_candidate.recovery == .clean);
+}
+
+test "durable runtime publishes neither a message nor completion event before journal commit" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_length = try temporary.dir.realPath(std.testing.io, &path_buffer);
+    var opened = try createTestJournal(temporary.dir, path_buffer[0..path_length]);
+    const response =
+        // ziglint-ignore: Z024 -- compact provider wire fixture
+        \\data: {"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_1","content":[]}}
+        \\
+        \\data: {"type":"response.output_text.delta","output_index":0,"delta":"must not publish"}
+        \\
+        \\data: {"type":"response.completed","response":{"status":"completed"}}
+        \\
+    ;
+    const exchanges = [_]fake_api.Exchange{.{ .response = .{
+        .status = 200,
+        .body = response,
+        .chunk_bytes = 9,
+    } }};
+    var fake = fake_api.FakeTransport.init(&exchanges);
+    var sources: DurableSources = .{};
+    var fault: AppendFault = .{ .fail_on_record = 3 };
+    var events: DurableEventRecorder = .{};
+    const credentials = [_]Credential{.{ .api_key = .{
+        .provider_id = "openai",
+        .value = "responses-secret",
+    } }};
+    var runtime = try createDurableWithTransport(
+        std.testing.allocator,
+        std.testing.io,
+        temporary.dir,
+        fake.transport(),
+        .{
+            .model_config = test_model_config,
+            .credentials = &credentials,
+            .selection = .{ .provider = "openai", .model = "responses-runtime" },
+        },
+        .{ .events = .{ .context = &events, .emitFn = DurableEventRecorder.emit } },
+        &opened,
+        sources.view(),
+        fault.faults(),
+    );
+    errdefer runtime.deinit();
+
+    try std.testing.expectError(error.PersistenceFailed, runtime.session().prompt("hello"));
+    try std.testing.expectEqual(@as(usize, 1), runtime.session().messages().len);
+    try std.testing.expectEqual(@as(usize, 0), events.model_completions);
+    try std.testing.expect(runtime.session().state() == .failed);
+    runtime.deinit();
+
+    var restored = try SessionJournal.openReadOnly(
+        std.testing.allocator,
+        std.testing.io,
+        temporary.dir,
+        "session.jsonl",
+    );
+    defer restored.deinit();
+    const entries = restored.restore_candidate.entries;
+    try std.testing.expectEqual(@as(usize, 3), entries.len);
+    try std.testing.expect(entries[0] == .model_change);
+    try std.testing.expect(entries[1].message.message == .request);
+    try std.testing.expectEqual(
+        SessionFormat.FailureCategory.persistence_failed,
+        entries[2].turn_end.outcome.failed,
+    );
+    try std.testing.expectEqual(@as(usize, 1), restored.restore_candidate.context_messages.len);
+}
+
+test "durable runtime withholds a tool result and completion event when its commit fails" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_length = try temporary.dir.realPath(std.testing.io, &path_buffer);
+    var opened = try createTestJournal(temporary.dir, path_buffer[0..path_length]);
+    const response =
+        // ziglint-ignore: Z024 -- compact provider wire fixture
+        \\data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"write"}}
+        \\
+        // ziglint-ignore: Z024 -- compact provider wire fixture
+        \\data: {"type":"response.function_call_arguments.done","output_index":0,"arguments":"{\"path\":\"created.txt\",\"content\":\"tool effect\"}"}
+        \\
+        // ziglint-ignore: Z024 -- compact provider wire fixture
+        \\data: {"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"write","arguments":"{\"path\":\"created.txt\",\"content\":\"tool effect\"}"}}
+        \\
+        \\data: {"type":"response.completed","response":{"status":"completed"}}
+        \\
+    ;
+    const exchanges = [_]fake_api.Exchange{.{ .response = .{
+        .status = 200,
+        .body = response,
+        .chunk_bytes = 11,
+    } }};
+    var fake = fake_api.FakeTransport.init(&exchanges);
+    var sources: DurableSources = .{};
+    var fault: AppendFault = .{ .fail_on_record = 4 };
+    var events: DurableEventRecorder = .{};
+    const credentials = [_]Credential{.{ .api_key = .{
+        .provider_id = "openai",
+        .value = "responses-secret",
+    } }};
+    var runtime = try createDurableWithTransport(
+        std.testing.allocator,
+        std.testing.io,
+        temporary.dir,
+        fake.transport(),
+        .{
+            .model_config = test_model_config,
+            .credentials = &credentials,
+            .selection = .{ .provider = "openai", .model = "responses-runtime" },
+        },
+        .{ .events = .{ .context = &events, .emitFn = DurableEventRecorder.emit } },
+        &opened,
+        sources.view(),
+        fault.faults(),
+    );
+    errdefer runtime.deinit();
+
+    try std.testing.expectError(error.PersistenceFailed, runtime.session().prompt("write the file"));
+    try std.testing.expectEqual(@as(usize, 2), runtime.session().messages().len);
+    try std.testing.expectEqual(@as(usize, 1), events.model_completions);
+    try std.testing.expectEqual(@as(usize, 0), events.tool_completions);
+    const created = try temporary.dir.readFileAlloc(
+        std.testing.io,
+        "created.txt",
+        std.testing.allocator,
+        .unlimited,
+    );
+    defer std.testing.allocator.free(created);
+    try std.testing.expectEqualStrings("tool effect", created);
+    runtime.deinit();
+
+    var restored = try SessionJournal.openReadOnly(
+        std.testing.allocator,
+        std.testing.io,
+        temporary.dir,
+        "session.jsonl",
+    );
+    defer restored.deinit();
+    const entries = restored.restore_candidate.entries;
+    try std.testing.expectEqual(@as(usize, 4), entries.len);
+    try std.testing.expect(entries[2].message.message == .response);
+    try std.testing.expectEqual(
+        SessionFormat.FailureCategory.persistence_failed,
+        entries[3].turn_end.outcome.failed,
+    );
+    try std.testing.expectEqual(@as(usize, 1), restored.restore_candidate.context_messages.len);
+}
+
+test "durable runtime closes a restored open turn before admitting cancellation" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_length = try temporary.dir.realPath(std.testing.io, &path_buffer);
+    var opened = try createTestJournal(temporary.dir, path_buffer[0..path_length]);
+    try opened.journal.append(.{ .model_change = .{
+        .base = .{
+            .id = "model-entry",
+            .parent_id = null,
+            .timestamp = "2026-08-19T10:30:01.000Z",
+        },
+        .selection = .{ .provider = "openai", .model = "responses-runtime" },
+    } }, .none());
+    try opened.journal.append(.{ .message = .{
+        .base = .{
+            .id = "open-turn",
+            .parent_id = "model-entry",
+            .timestamp = "2026-08-19T10:30:02.000Z",
+        },
+        .message = .{ .request = .{ .parts = &.{.{ .user = .{ .text = "before crash" } }} } },
+    } }, .none());
+    opened.deinit();
+    opened = try SessionJournal.openWritable(
+        std.testing.allocator,
+        std.testing.io,
+        temporary.dir,
+        "session.jsonl",
+    );
+
+    const exchanges: [0]fake_api.Exchange = .{};
+    var fake = fake_api.FakeTransport.init(&exchanges);
+    var sources: DurableSources = .{};
+    const credentials = [_]Credential{.{ .api_key = .{
+        .provider_id = "openai",
+        .value = "responses-secret",
+    } }};
+    var runtime = try createDurableWithTransport(
+        std.testing.allocator,
+        std.testing.io,
+        temporary.dir,
+        fake.transport(),
+        .{
+            .model_config = test_model_config,
+            .credentials = &credentials,
+            .selection = .{ .provider = "openai", .model = "responses-runtime" },
+        },
+        .{},
+        &opened,
+        sources.view(),
+        .none(),
+    );
+    errdefer runtime.deinit();
+    try std.testing.expectEqual(@as(usize, 1), runtime.session().messages().len);
+    try std.testing.expectEqualStrings(
+        "before crash",
+        runtime.session().messages()[0].request.parts[0].user.text,
+    );
+
+    var cancellation: ai_model.CancellationToken = .{};
+    cancellation.cancel();
+    try std.testing.expectError(
+        error.Cancelled,
+        runtime.session().promptWithControl("cancel this", .{ .cancellation = &cancellation }),
+    );
+    try std.testing.expect(runtime.session().state() == .cancelled);
+    try std.testing.expectEqual(@as(usize, 0), fake.next_index);
+    runtime.deinit();
+
+    var restored = try SessionJournal.openReadOnly(
+        std.testing.allocator,
+        std.testing.io,
+        temporary.dir,
+        "session.jsonl",
+    );
+    defer restored.deinit();
+    const entries = restored.restore_candidate.entries;
+    try std.testing.expectEqual(@as(usize, 5), entries.len);
+    try std.testing.expect(entries[2].turn_end.outcome == .interrupted);
+    try std.testing.expect(entries[3].message.message == .request);
+    try std.testing.expect(entries[4].turn_end.outcome == .cancelled);
+    try std.testing.expect(restored.restore_candidate.recovery == .clean);
 }
 
 test "OpenAI Responses runtime crosses the provider and protocol seams" {
@@ -752,6 +1238,69 @@ test "runtime construction settles every allocation failure" {
         std.testing.allocator,
         createAndDisposeForAllocationFailure,
         .{temporary.dir},
+    );
+}
+
+fn deleteAllocationJournal(dir: std.Io.Dir) !void {
+    dir.deleteFile(std.testing.io, "allocation-session.jsonl") catch |failure| switch (failure) {
+        error.FileNotFound => {},
+        else => return failure,
+    };
+}
+
+fn createDurableForAllocationFailure(
+    allocator: std.mem.Allocator,
+    cwd_dir: std.Io.Dir,
+    cwd: []const u8,
+) !void {
+    try deleteAllocationJournal(cwd_dir);
+    defer deleteAllocationJournal(cwd_dir) catch unreachable;
+    var opened = try SessionJournal.create(
+        allocator,
+        std.testing.io,
+        cwd_dir,
+        "allocation-session.jsonl",
+        .{
+            .id = "allocation-session",
+            .timestamp = "2026-08-19T10:30:00.000Z",
+            .cwd = cwd,
+        },
+        .none(),
+    );
+    var sources: DurableSources = .{};
+    const exchanges: [0]fake_api.Exchange = .{};
+    var fake = fake_api.FakeTransport.init(&exchanges);
+    const credentials = [_]Credential{.{ .api_key = .{
+        .provider_id = "openai",
+        .value = "responses-secret",
+    } }};
+    var runtime = try createDurableWithTransport(
+        allocator,
+        std.testing.io,
+        cwd_dir,
+        fake.transport(),
+        .{
+            .model_config = test_model_config,
+            .credentials = &credentials,
+            .selection = .{ .provider = "openai", .model = "responses-runtime" },
+        },
+        .{},
+        &opened,
+        sources.view(),
+        .none(),
+    );
+    runtime.deinit();
+}
+
+test "durable runtime binding settles every allocation failure" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_length = try temporary.dir.realPath(std.testing.io, &path_buffer);
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        createDurableForAllocationFailure,
+        .{ temporary.dir, path_buffer[0..path_length] },
     );
 }
 

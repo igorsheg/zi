@@ -2,16 +2,38 @@ const std = @import("std");
 const message = @import("../ai/message.zig");
 
 const History = @This();
+const max_messages = 65_536;
 
-arena: std.heap.ArenaAllocator,
+allocator: std.mem.Allocator,
 entries: std.ArrayList(message.Message) = .empty,
+arenas: std.ArrayList(std.heap.ArenaAllocator) = .empty,
+
+pub const Error = error{ OutOfMemory, SessionTooLarge };
+
+pub const Prepared = struct {
+    arena: std.heap.ArenaAllocator,
+    value: message.Message,
+
+    pub fn deinit(self: *Prepared) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+
+    pub fn publish(self: *Prepared, history: *History) void {
+        history.entries.appendAssumeCapacity(self.value);
+        history.arenas.appendAssumeCapacity(self.arena);
+        self.* = undefined;
+    }
+};
 
 pub fn init(allocator: std.mem.Allocator) History {
-    return .{ .arena = std.heap.ArenaAllocator.init(allocator) };
+    return .{ .allocator = allocator };
 }
 
 pub fn deinit(self: *History) void {
-    self.arena.deinit();
+    for (self.arenas.items) |*arena| arena.deinit();
+    self.arenas.deinit(self.allocator);
+    self.entries.deinit(self.allocator);
     self.* = undefined;
 }
 
@@ -19,16 +41,32 @@ pub fn messages(self: *const History) []const message.Message {
     return self.entries.items;
 }
 
-pub fn appendRequest(self: *History, request: message.RequestMessage) error{OutOfMemory}!void {
-    const memory = self.arena.allocator();
-    const copy = try copyRequest(memory, request);
-    try self.entries.append(memory, .{ .request = copy });
+pub fn prepare(self: *History, value: message.Message) Error!Prepared {
+    if (self.entries.items.len >= max_messages) return error.SessionTooLarge;
+    self.entries.ensureUnusedCapacity(self.allocator, 1) catch return error.OutOfMemory;
+    self.arenas.ensureUnusedCapacity(self.allocator, 1) catch return error.OutOfMemory;
+
+    var arena = std.heap.ArenaAllocator.init(self.allocator);
+    errdefer arena.deinit();
+    const memory = arena.allocator();
+    const copy: message.Message = switch (value) {
+        .request => |request| .{ .request = try copyRequest(memory, request) },
+        .response => |response| .{ .response = try copyResponse(memory, response) },
+    };
+    return .{ .arena = arena, .value = copy };
 }
 
-pub fn appendResponse(self: *History, response: message.ResponseMessage) error{OutOfMemory}!void {
-    const memory = self.arena.allocator();
-    const copy = try copyResponse(memory, response);
-    try self.entries.append(memory, .{ .response = copy });
+pub fn append(self: *History, value: message.Message) Error!void {
+    var prepared = try self.prepare(value);
+    prepared.publish(self);
+}
+
+pub fn appendRequest(self: *History, request: message.RequestMessage) Error!void {
+    return self.append(.{ .request = request });
+}
+
+pub fn appendResponse(self: *History, response: message.ResponseMessage) Error!void {
+    return self.append(.{ .response = response });
 }
 
 fn copyRequest(allocator: std.mem.Allocator, source: message.RequestMessage) !message.RequestMessage {
@@ -183,5 +221,53 @@ test "history owns appended canonical messages" {
     try std.testing.expectEqualStrings(
         "{\"path\":\"a\"}",
         history.messages()[1].response.parts[0].tool_call.arguments_json,
+    );
+}
+
+test "prepared history remains invisible until infallible publication" {
+    var history = History.init(std.testing.allocator);
+    defer history.deinit();
+    const source = try std.testing.allocator.dupe(u8, "prepared request");
+    defer std.testing.allocator.free(source);
+
+    var prepared = try history.prepare(.{ .request = .{
+        .parts = &.{.{ .user = .{ .text = source } }},
+    } });
+    try std.testing.expectEqual(@as(usize, 0), history.messages().len);
+    @memset(source, 'x');
+    prepared.publish(&history);
+
+    try std.testing.expectEqual(@as(usize, 1), history.messages().len);
+    try std.testing.expectEqualStrings(
+        "prepared request",
+        history.messages()[0].request.parts[0].user.text,
+    );
+}
+
+fn appendForAllocationFailure(allocator: std.mem.Allocator) !void {
+    var history = History.init(allocator);
+    defer history.deinit();
+    try history.appendRequest(.{ .parts = &.{.{ .user = .{ .text = "question" } }} });
+    try history.appendResponse(.{
+        .parts = &.{.{ .tool_call = .{
+            .id = "call-1",
+            .name = "read",
+            .arguments_json = "{\"path\":\"README.md\"}",
+            .provider_state = .{
+                .provider = "openai",
+                .protocol = "openai-responses",
+                .value = .{ .string = "opaque" },
+            },
+        } }},
+        .identity = .{ .provider = "openai", .model = "gpt-test" },
+        .finish = .{ .category = .tool_calls },
+    });
+}
+
+test "history preparation settles every allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        appendForAllocationFailure,
+        .{},
     );
 }
