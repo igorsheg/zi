@@ -1,7 +1,7 @@
 const std = @import("std");
 
 const ZiPaths = @This();
-const max_path_bytes = 32 * 1024;
+pub const max_path_bytes = 32 * 1024;
 
 pub const Error = error{
     OutOfMemory,
@@ -11,6 +11,7 @@ pub const Error = error{
 arena: std.heap.ArenaAllocator,
 cwd: []const u8,
 global_agent: []const u8,
+global_sessions: []const u8,
 project: []const u8,
 global_models_file: []const u8,
 
@@ -24,10 +25,12 @@ pub fn init(allocator: std.mem.Allocator, cwd: []const u8, home: []const u8) Err
     const normalized_cwd = try std.fs.path.resolve(owned, &.{cwd});
     const normalized_home = try std.fs.path.resolve(owned, &.{home});
     const global_agent = try std.fs.path.resolve(owned, &.{ normalized_home, ".zi", "agent" });
+    const global_sessions = try std.fs.path.resolve(owned, &.{ global_agent, "sessions" });
     const project = try std.fs.path.resolve(owned, &.{ normalized_cwd, ".zi" });
     const global_models_file = try std.fs.path.resolve(owned, &.{ global_agent, "models.json" });
     if (normalized_cwd.len > max_path_bytes or
         global_agent.len > max_path_bytes or
+        global_sessions.len > max_path_bytes or
         project.len > max_path_bytes or
         global_models_file.len > max_path_bytes)
     {
@@ -38,6 +41,7 @@ pub fn init(allocator: std.mem.Allocator, cwd: []const u8, home: []const u8) Err
         .arena = arena,
         .cwd = normalized_cwd,
         .global_agent = global_agent,
+        .global_sessions = global_sessions,
         .project = project,
         .global_models_file = global_models_file,
     };
@@ -68,6 +72,7 @@ test "Zi paths own normalized cwd-bound configuration roots" {
 
     try std.testing.expectEqualStrings("/tmp/zi-work", paths.cwd);
     try std.testing.expectEqualStrings("/tmp/zi-home/.zi/agent", paths.global_agent);
+    try std.testing.expectEqualStrings("/tmp/zi-home/.zi/agent/sessions", paths.global_sessions);
     try std.testing.expectEqualStrings("/tmp/zi-work/.zi", paths.project);
     try std.testing.expectEqualStrings("/tmp/zi-home/.zi/agent/models.json", paths.global_models_file);
 }

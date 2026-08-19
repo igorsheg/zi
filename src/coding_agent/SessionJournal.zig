@@ -496,7 +496,7 @@ fn sizeError(offset: u64) Error {
     return if (offset == 0) error.InvalidHeader else error.InvalidRecord;
 }
 
-fn syncDirectory(dir: std.Io.Dir) !void {
+pub fn syncDirectory(dir: std.Io.Dir) !void {
     if (comptime builtin.os.tag == .windows) return error.OperationUnsupported;
     while (true) {
         const result = std.c.fsync(dir.handle);

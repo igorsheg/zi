@@ -7,6 +7,7 @@ const model_resolution = @import("ModelResolution.zig");
 const session_format = @import("SessionFormat.zig");
 const session_journal = @import("SessionJournal.zig");
 const session_commit = @import("SessionCommit.zig");
+const session_selection = @import("SessionSelection.zig");
 const zi_paths = @import("ZiPaths.zig");
 
 pub const Event = AgentSession.Event;
@@ -26,6 +27,7 @@ test {
     _ = session_format;
     _ = session_journal;
     _ = session_commit;
+    _ = session_selection;
     _ = zi_paths;
     _ = cli;
 }
