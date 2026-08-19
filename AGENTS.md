@@ -1,102 +1,175 @@
 # Zi engineering rules
 
-## Product references
+Instructions for AI coding agents working on this Zig rewrite.
 
-- `pi-coding-agent` at commit `73414d08b94d7db46d3fa66582c8fe3b02dabf72` is the coding-agent behavior **and architecture** reference, and its interactive mode is the TUI product-behavior reference.
-- `pi-ai` and `pi-agent-core` are dependencies; `pi-coding-agent` and `pi-tui` are not.
-- Imperative `@opentui/core` renderables are the terminal architecture; `@opentui/react` and Pi's TUI implementation are not.
-- OpenCode is a source of proven OpenTUI application patterns, not a template to copy wholesale.
-- `docs/` is the single source for public consumer guides shipped with Zi and rendered by the website. Do not keep a second Markdown corpus under `website/`; keep architecture decisions, roadmaps, research, implementation plans, and maintainer notes out of `docs/`.
+## References
 
-## Documentation voice
+Use pi as the behavioral specification and ZigAI as the Zig implementation model. Use [vercel-labs/fx](https://github.com/vercel-labs/fx/tree/main) as a second Zig implementation reference, beside ZigAI.
 
-`docs/` is a man page written by the person who built it. It ships inside the npm tarball and is read by Zi itself as agent context, so density is a feature and narrative padding is a cost.
+- [earendil-works/pi](https://github.com/earendil-works/pi) owns observable coding-agent behavior: model lookup, normalized messages, streaming tool calls, reasoning, usage, context persistence, and the coding-agent CLI/session contract. `pi-coding-agent` at commit `73414d08b94d7db46d3fa66582c8fe3b02dabf72` is the current behavior pin.
+- [Kludex/zigai](https://github.com/Kludex/zigai) informs Zig representation: small erased interfaces, tagged unions, borrowed request data, arena-owned results, synchronous borrowed stream events, explicit model profiles, injected `std.Io`, and adapters isolated from orchestration.
+- [vercel-labs/fx](https://github.com/vercel-labs/fx) informs Zig 0.16 process shape, module ownership, and how a native coding-agent binary is composed. Take a pattern from fx only when it fits Zi's current owners.
 
-- Open every page on the reader's situation, then what Zi does about it, then the smallest working example. Never open with a noun-phrase definition of the feature.
-- State the failure a bound or rule prevents where it is not self-evident. Bounds must read as design, not legislation.
-- Say plainly where Zi chose among alternatives or deliberately refuses to do something. A contract page with real non-numeric limits carries a `## What this does not do` section; that section is not a roadmap.
-- One idea per paragraph, two to four sentences, varied sentence length. Do not chain more than two semicolon clauses.
-- Keep Zi's ubiquitous language—admitted, settled, bounded, owner, evidence, projection, generation, trusted, journal—and define it only in `docs/vocabulary.md`.
-- Titles are imperative and goal-shaped for guide pages, noun-shaped for reference pages. Cross-references state why you would follow them.
-- The website Markdown subset is heading, paragraph, code, flat list, single-line definition, and table. Blockquotes and nested lists do not parse, mismatched table rows fail the build, and doc links are not validated. Use `text` fences for figures.
+Neither project is to be ported literally. TypeScript runtime assumptions must not leak into Zig. ZigAI's agent, graph, MCP, durable execution, realtime, and UI scope must not leak into this tree. fx's TUI, ACP, WASM SDK, PGSO, and release machinery must not leak into this tree.
 
-## Product direction
+When the references disagree:
 
-- Zi is a dependable coding-agent substrate with an opinionated reference terminal client. Optimize supported surfaces for downstream configuration, extension, process composition, and eventually deliberate embedding—not for exporting internal modules.
-- Use the least powerful sufficient customization level: prompt policy, skill/template, CLI composition, extension, RPC, curated SDK, then separate client or fork.
-- Route universal coding-agent policy into `AgentSession` or another concrete coding-agent owner; route specialized executable behavior into extensions; route external applications through RPC; keep substantially different interaction models in clients or forks.
-- A public building block requires a narrow documented contract, one complete example, compiled-release acceptance, explicit lifecycle/cancellation/bounds/versioning, and no dependency on private Zi modules.
-- Mainline adopts downstream behavior after repeated evidence or when required by a universal invariant or the reference client. Do not add speculative hooks, registries, package splits, or UI callbacks to appear extensible.
+1. Preserve pi's observable cross-provider behavior.
+2. Preserve Zig's explicit ownership, error, and I/O model.
+3. Keep Zi's public seam smaller than any reference's full surface.
+4. Put provider quirks in adapters or model profiles, never in harness branches.
+5. Defer a feature rather than weaken the canonical types.
 
-## Code quality
+This branch is the Zig rewrite. It is not a mix of the TypeScript product on `main`. Do not reintroduce Node, bun, npm, OpenTUI, or `packages/`.
 
-Legibility, local reasoning, and ease of change are the top priorities. Do not emit verbose, defensive AI-slop code.
+## Declaring work ready
 
-- Write direct code with one obvious control path.
-- Name the owner of mutable state and resource lifetimes.
-- Keep modules deep and interfaces narrow.
-- Prefer concrete types over generic frameworks and option bags.
-- Do not create `shared`, `common`, `utils`, manager-of-managers, command buses, or view-model corridors without concrete repeated pressure.
-- Do not mirror state between layers. Derive cheap values where they are rendered.
-- Do not add defensive branches for states made impossible by the types or owner.
-- Do validate external input, persisted data, provider data, and process boundaries.
-- Validate runtime JSON with the compiled TypeBox guards in `packages/coding-agent/src/guards.ts`; reach for that owner before writing another inline `isRecord` or sibling primitive guard, and extend it when a primitive check repeats. Byte-length, cross-field, cycle, and exact-message checks stay with their owning domain module instead of becoming schema indirection.
-- Bound queues, output, retries, subprocesses, retained UI data, and shutdown waits.
-- Treat interruption, cancellation, shutdown, and disposal as distinct owner transitions. Restore terminal resources before bounded settlement waits; only the layer that created a session disposes it.
-- Derive global `$HOME/.zi/agent` and exact `<cwd>/.zi` configuration through the immutable coding-agent `ZiPaths` owner. Settings, credentials, resources, and persistent session creation consume that cwd-bound value; do not join `.zi` or re-read process cwd inside those owners.
-- Bind terminal product behavior through the instance-scoped semantic keybinding owner. Components may handle native mechanics but do not hard-code product chords; future extension shortcuts join through mode-owned conflict resolution, not mutable global registration.
-- Comments explain invariants, trade-offs, and provenance. They do not narrate syntax or restate types.
-- Avoid boilerplate JSDoc on self-explanatory symbols.
-- Port one Pi capability at a time with its behavior tests and upstream provenance.
-- For capabilities spanning `coding-agent` and a client, preserve owner decomposition: coding-agent owners expose authoritative domain data and operations; the client mode composes those owners and translates client input into closed typed intents; stores own admitted transient workflows; components only render state and report native interaction—never hard-code domain catalogs, parse domain syntax, or dispatch business operations.
-- Keep imperative components cohesive. A deep prompt owner is preferable to many pass-through wrappers.
-- Do not introduce a frontend-wide projection schema until multiple screens need it.
+Do not say the work is ready, done, or complete until you have built the binary and exercised the change. A passing test suite is necessary, not sufficient.
 
-## State and transition design
+Before reporting the work as ready:
 
-Explicit-state, data-oriented design is mandatory for stateful behavior.
+1. `zig build` succeeds.
+2. Focused tests for the changed path pass (`zig build test` when the change is not local enough to isolate).
+3. Run the built binary at `./zig-out/bin/zi` and drive at least the happy path that the change affects.
+4. Confirm the process did not abort, stderr is clean, and the behavior matches what you are about to tell the user.
 
-- Name the state owner, the concrete states, and the allowed transitions before distributing behavior across methods, hooks, or components.
-- Represent mutually exclusive states as explicit discriminated unions with domain-named fields. Make invalid combinations unrepresentable instead of coordinating boolean flags and optional properties.
-- Write unions directly. Do not hide domain states behind generic tagged-union builders, payload envelopes, class hierarchies, or a state-machine framework.
-- Keep transition rules with the state owner. UI components render state and request operations; effects synchronize owned resources but do not become a second transition system.
-- Separate transition decisions from side effects. Admit an operation from the current state, record the new state, run the bounded effect, then apply its success, failure, or cancellation transition.
-- Handle closed unions exhaustively and use `never` checks. Validate open or external events before they enter the machine.
-- Test transitions and forbidden transitions as behavior. Include races, cancellation, stale completion, and bounds where the owner crosses asynchronous or process boundaries.
-- Add a runtime invariant when correctness depends on a relationship across authoritative events or mutable owner state: start/end pairing, monotonic identity, settlement/result correspondence, or terminal cleanup. Keep the check beside that owner and observe the operation at its admission or commit point; reject an invalid candidate before external publication when possible.
-- `@with-zi/invariants` owns only instance-scoped selection, owner reservation, failure attribution, and cleanup. Product vocabulary and transition rules stay in owner-local invariant modules; do not add product knowledge to the registry, module-global registrations, or a generic invariant event bus.
-- Runtime invariants are diagnostics, not validation or business enforcement. External input and durable data remain unconditionally validated, and guarantees required when diagnostics are disabled—such as bounds, uniqueness, and successful-shutdown correspondence—remain in production owners. Never add invariant observations to the journal merely to test runtime behavior.
-- Test each invariant with a valid trace and deliberately invalid observations, including transactional rejection, disposal, and restoration from durable history when the owner supports resume. Do not invent checks for method presence, metadata, fixed examples, or states already enforced by types and load-time wiring.
-- A boolean is acceptable only for a truly independent binary fact. When combinations acquire meaning, replace the flags with explicit states.
-- Keep one source of truth. Derived render values are not additional state, and mutable state is never mirrored between owners.
-- `AgentSession` is the shared client-independent business boundary. The terminal-specific `InteractiveMode`, OpenTUI renderables, and presentation stores live under `packages/tui/src/interactive/`.
-- Stores are instance-scoped and created by factories. Never export a mutable module-global application store or collect unrelated capabilities into one root state blob.
-- Store writable atoms are private implementation details. Components subscribe and request domain-named operations; they do not call `.set()`.
-- TUI stores may retain an `AgentSession` reference for subscription identity but may not copy messages, model, queues, or other authoritative state. Native textarea and scroll state remain OpenTUI-owned.
-- Below-composer choice flows use the instance-scoped `PickerStack`: `Composer` remains the only input and focus owner; the stack owns frames, selection, suspended parent filters, and top-frame filtering; picker views render only the active frame and never create or edit an input.
-- Coding-agent owners do not depend on frontend state libraries. TUI stores use explicit binding and disposal; use Nano Stores `onMount()` only when a terminal resource lifetime genuinely follows observation.
+If you cannot run the binary, say so and ask the user to verify. "The tests pass" is not a substitute.
 
-## TUI hot paths and retained projections
+### Always use the built binary in this repo
 
-Terminal performance is an ownership and data-flow property, not a late rendering optimization.
+When running zi for verification, always use `./zig-out/bin/zi` from this checkout. Never run `zi` from `PATH`, and never assume an installed copy reflects your change.
 
-- Treat native renderable identity, retained node count, subscriptions, scheduled frames, and listeners as owned resources with explicit lifetimes.
-- A TUI projection reads authoritative domain state; it may retain bounded indexes, keys, omission counts, and renderable handles, but never copied message text or a second mutable timeline.
-- Hot-path work must scale with the changed tail or invalidated suffix. Do not scan complete sessions, rebuild unchanged siblings, or recreate roots for streaming text and progress updates.
-- Keep committed renderables stable until explicit reset or bounded eviction. Keep transient renderables keyed and update native properties only when their visible presentation changed.
-- Admit high-frequency presentation work through one semantic notification stream and one renderer-owned pre-layout lifecycle admission per visible frame. Use renderer-installed `requestAnimationFrame` only for work that must observe the following frame's settled layout; do not add polling, timers, or an independent FPS scheduler.
-- Every retained terminal collection and presentation index has a hard bound. Eviction must preserve explicit navigation state, clear native selection before destroying selectable nodes, and anchor detached viewports when layout changes.
-- The owner that creates a renderable, subscription, listener, scheduled callback, or live renderer request releases it. Destroyed or replaced screens must reject stale callbacks.
-- Test performance properties structurally: reconciliation count, stable identity, bounded roots, sibling retention, native assignment avoidance, stale completion, and cleanup. Do not use CI wall-clock thresholds.
-- Add custom framebuffer renderables only after instrumentation proves stable core renderables, bounded projection, reduced assignments, and frame coalescing are insufficient.
-- New asynchronous terminal catalogs and history views load from their presenting feature owner after first draw; the authoritative coding-agent owner provides bounded single-flight operations. Do not introduce a generic query cache or preload inactive screens.
+`zig build` writes to `zig-out/bin/zi`. That is the only binary that contains your latest change.
 
-Before adding a new retained row or transient workflow, identify its authoritative source, stable key, invalidation boundary, retention bound, disposal path, and structural tests.
+## Language and toolchain
 
-## Workspace ownership
+This project is written in **Zig 0.16+**. There is no Node.js runtime, no `package.json`, and no JavaScript build step.
 
-- `packages/coding-agent`: `AgentSession`, coding-agent policy, managers, tools, and non-terminal modes such as print/RPC.
-- `packages/tui`: the terminal-specific interactive mode, Nano Stores, and imperative OpenTUI composition.
-- `packages/cli`: argument parsing, mode selection, and process exit reporting only.
+```bash
+zig build                          # build the binary
+zig build test                     # run unit tests and the model-catalog check
+zig build run                      # build and run
+zig fmt src/ tools/                # format Zig sources
+zig build check-model-catalog      # verify data/model_catalog.json vs the snapshot
+zig build update-model-catalog     # regenerate src/ai/model_catalog_snapshot.zig
+```
 
-Dependencies point `cli -> tui -> coding-agent`, with `cli -> coding-agent` for shared runtime construction and future non-terminal modes. `coding-agent` never imports a frontend. The TUI entrypoint is loaded dynamically so print/JSON modes need not load OpenTUI.
+`.minimum_zig_version` in `build.zig.zon` is the pinned toolchain.
+
+## Code style
+
+- Format Zig with `zig fmt` before committing. The canonical check is `zig fmt --check src/ tools/`.
+- Do not use emojis in code, output, or documentation.
+- Do not use em dashes. Use a comma, colon, period, parentheses, or a plain hyphen.
+- Prefer `snake_case` for Zig identifiers. Types use `PascalCase`.
+- Keep `pub` surface area minimal. Only mark declarations `pub` when they are used outside the file.
+- Write direct code with one obvious control path. Name the owner of mutable state and resource lifetimes.
+- Comments explain invariants, trade-offs, and provenance. They do not narrate syntax.
+- Represent mutually exclusive states as explicit tagged unions. Make invalid combinations unrepresentable.
+
+## Architecture
+
+`src/main.zig` is the composition root. Do not add leaf feature logic there.
+
+Current owners:
+
+- `src/ai/` owns the provider-independent model substrate: identities, profiles, settings, messages, streams, usage, failures, catalogs, wire protocols, transports, and provider adapters.
+- `src/agent/` owns the streamed tool loop: history, tool execution, run limits, commits, and agent state.
+- `src/coding_agent/` owns coding-agent policy: `AgentSession`, cwd-bound read/write/edit/bash tools, CLI argument and print-mode core, `ZiPaths`, model config and resolution, and the durable session journal.
+- `src/BoundedJson.zig` is the shared bounded JSON helper. Byte-length, cross-field, and exact-message checks stay with the owning domain module.
+- `data/model_catalog.json` plus `tools/model_catalog.zig` own catalog generation. The compiled snapshot lives in `src/ai/model_catalog_snapshot.zig`.
+
+Admitted providers today are OpenAI-compatible chat, OpenAI Responses, and OpenAI Codex. Admitted workspace tools are read, write, edit, and bash.
+
+The CLI core under `src/coding_agent/cli/` parses arguments and can run print mode against an existing `AgentSession`. It is not yet the process entrypoint. `main.zig` currently only proves the binary links and starts. Do not document interactive mode, extensions, RPC, Code Mode, MCP, or npm install as if they exist on this branch.
+
+### Adding a feature
+
+Before implementing, answer in order:
+
+1. Which module owns the behavior?
+2. What is the typed contract?
+3. Does it need persistence?
+4. What tests land with it?
+
+If unclear, define the contract first. Port one pi capability at a time with its behavior tests and upstream provenance. Prefer a deep owner over another pass-through wrapper.
+
+## Configuration and state
+
+`ZiPaths` is the immutable owner of one effective cwd. It resolves `$HOME/.zi/agent`, exact `<cwd>/.zi`, and the global models file. Settings, credentials, resources, and persistent session creation consume that cwd-bound value. Do not join `.zi` or re-read process cwd inside those owners.
+
+The session journal is the append-only JSONL authority for one durable session when persistence is admitted. Torn-tail repair happens on the next append. The owner that creates a session disposes it.
+
+Credentials are admitted values on `AgentSessionRuntime`, not ambient environment reads. Do not add a second configuration path for the same fact.
+
+## Zig-specific patterns
+
+### Memory
+
+- Allocators are passed explicitly. Never use a global allocator.
+- Free what you allocate. Use `defer` for cleanup at the call site.
+- Prefer `ArenaAllocator` for request-scoped work that can be freed in bulk.
+- When a function returns allocated memory, document who owns it.
+
+### Error handling
+
+- Return errors rather than panicking. `@panic` is for programmer bugs, not runtime conditions.
+- Use `errdefer` to clean up partial state on error paths.
+- Prefer specific error sets over `anyerror` when the set is bounded.
+- Validate external input, persisted data, provider data, and process boundaries. Do not add defensive branches for states the types already forbid.
+
+### Strings and JSON
+
+- Zig strings are `[]const u8`. There is no implicit null termination.
+- Bound queues, output, retries, subprocesses, and retained data.
+- Use the project's bounded JSON helper instead of inventing another decoder.
+
+### I/O (Zig 0.16)
+
+- `main` uses `pub fn main(init: std.process.Init) !void`.
+- Pass `std.Io` explicitly. File operations use `std.Io.Dir` and `std.Io.File`.
+- In test blocks, use `std.testing.io`.
+- `ArrayList(T)` initializes with `.empty`.
+- `std.mem` renames: `trimStart`, `trimEnd`, `find`, `findScalar`.
+
+## Testing
+
+Zig unit tests go inside the source file they test, using `test "description" { ... }` blocks.
+
+- Run the narrowest relevant tests while developing. `zig build test` is the full suite.
+- Use `std.testing.expect`, `std.testing.expectEqual`, and `std.testing.expectEqualStrings`.
+- Cover transitions, forbidden transitions, cancellation, stale completion, and bounds where an owner crosses I/O or process boundaries.
+- Use transport and model fakes. Do not require a network for unit tests.
+
+There is no TypeScript, bun, or e2e suite on this branch.
+
+## Documentation
+
+There is no `docs/` tree until the Zig product has a user-facing surface.
+
+When behavior that already exists in the binary changes:
+
+1. Update `--help` only after the process actually exposes it.
+2. Update `README.md` for build steps and what the binary does today.
+
+Do not document intended behavior as if it already exists. Maintainer notes and implementation plans live under `plans/zig-*.md`.
+
+## What not to do
+
+- Do not grow `main.zig` with leaf feature logic.
+- Do not reintroduce TypeScript, bun, npm, OpenTUI, Nano Stores, TypeBox, or `packages/`.
+- Do not add a second execution path for the same feature without a clear reason.
+- Do not port pi types, promises, or mutation into Zig.
+- Do not copy ZigAI agent, graph, MCP, durable-workflow, or UI scope.
+- Do not copy fx TUI, ACP, WASM, PGSO, tape replay, or release machinery.
+- Do not commit generated state from `.zig-cache/` or `zig-out/`.
+- Do not add dependencies outside the Zig standard library without discussion.
+- Do not use `@import` with runtime-computed paths.
+- Do not ignore `zig fmt` failures.
+- Do not report work as ready without running the binary.
+
+## Before marking a change ready
+
+1. Run `zig fmt --check src/ tools/` and the focused tests for the changed path.
+2. Build and exercise the change with `./zig-out/bin/zi`.
+3. Update `README.md` only if user-visible behavior already exists and changed.
