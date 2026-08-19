@@ -94,6 +94,10 @@ fn writeCliDiagnostics(writer: *std.Io.Writer, diagnostics: []const surface.Diag
             .rpc => try writer.writeAll("RPC mode is not available yet.\n"),
         },
         .invalid_auth_command => |command| try writer.print("Unsupported auth command: {s}.\n", .{command}),
+        .conflicting_session_option => |option| try writer.print(
+            "Session selection is already set; {s} cannot be combined with it.\n",
+            .{option},
+        ),
         .too_many_file_inputs => try writer.writeAll("Print mode accepts at most one @file input.\n"),
         .unknown_option => |option| try writer.print("Unknown option: {s}.\n", .{option}),
     };
@@ -103,9 +107,12 @@ fn writeCliHelp(writer: *std.Io.Writer) !void {
     try writer.writeAll(
         \\Usage:
         \\  zi --print --provider PROVIDER --model MODEL [PROMPT]
+        \\  zi --print (--continue | --session PATH) [PROMPT]
         \\
         \\Options:
         \\  -p, --print          Run prompts and print the final response
+        \\  -c, --continue       Continue the most recent session for this directory
+        \\  --session PATH       Continue an exact session journal
         \\  --provider VALUE     Select a provider
         \\  --model VALUE        Select a model
         \\  --api-key VALUE      Use an explicit API key

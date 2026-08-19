@@ -90,7 +90,11 @@ pub fn runPrintLaunch(
     var runtime = RuntimeServices.create(context.allocator, context.io, .{
         .startup_cwd = context.cwd,
         .home = context.home,
-        .session = .new,
+        .session = switch (request.session) {
+            .new => .new,
+            .continue_recent => .continue_recent,
+            .open => |path| .{ .open = path },
+        },
         .sources = sources.view(),
         .requested_provider = request.provider,
         .requested_model = request.model,
@@ -110,4 +114,73 @@ pub fn runPrintLaunch(
         context.stdout,
         context.stderr,
     );
+}
+
+test "print launch reopens recent and exact sessions with their restored model" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var root_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_length = try temporary.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_length];
+    var stdout: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer stdout.deinit();
+    var stderr: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer stderr.deinit();
+
+    const Fixture = struct {
+        fn run(
+            request: *const surface.LaunchRequest,
+            root_path: []const u8,
+            stdout_writer: *std.Io.Writer,
+            stderr_writer: *std.Io.Writer,
+        ) !print_mode.ExitCode {
+            var stdin = std.Io.Reader.fixed("");
+            return runPrintLaunch(request, .{
+                .allocator = std.testing.allocator,
+                .io = std.testing.io,
+                .cwd = root_path,
+                .home = root_path,
+                .openai_api_key = null,
+                .stdin_is_tty = true,
+                .stdin = &stdin,
+                .stdout = stdout_writer,
+                .stderr = stderr_writer,
+            });
+        }
+    };
+
+    const created: surface.LaunchRequest = .{
+        .provider = "openai",
+        .model = "gpt-5.6-sol",
+        .api_key = "test-secret",
+    };
+    try std.testing.expect(try Fixture.run(&created, root, &stdout.writer, &stderr.writer) == .success);
+
+    var sessions = try temporary.dir.openDir(std.testing.io, ".zi/agent/sessions", .{ .iterate = true });
+    defer sessions.close(std.testing.io);
+    var iterator = sessions.iterateAssumeFirstIteration();
+    const entry = (try iterator.next(std.testing.io)).?;
+    const session_path = try std.fs.path.resolve(std.testing.allocator, &.{ root, ".zi/agent/sessions", entry.name });
+    defer std.testing.allocator.free(session_path);
+    try std.testing.expect(try iterator.next(std.testing.io) == null);
+
+    const recent: surface.LaunchRequest = .{
+        .session = .continue_recent,
+        .api_key = "test-secret",
+    };
+    try std.testing.expect(try Fixture.run(&recent, root, &stdout.writer, &stderr.writer) == .success);
+
+    const exact: surface.LaunchRequest = .{
+        .session = .{ .open = session_path },
+        .api_key = "test-secret",
+    };
+    try std.testing.expect(try Fixture.run(&exact, root, &stdout.writer, &stderr.writer) == .success);
+    try std.testing.expectEqualStrings("", stdout.written());
+    try std.testing.expectEqualStrings("", stderr.written());
+
+    var verify = try temporary.dir.openDir(std.testing.io, ".zi/agent/sessions", .{ .iterate = true });
+    defer verify.close(std.testing.io);
+    var verify_iterator = verify.iterateAssumeFirstIteration();
+    try std.testing.expect(try verify_iterator.next(std.testing.io) != null);
+    try std.testing.expect(try verify_iterator.next(std.testing.io) == null);
 }

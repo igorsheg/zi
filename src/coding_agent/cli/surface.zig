@@ -10,8 +10,16 @@ pub const Terminal = struct {
     stdout_is_tty: bool,
 };
 
+/// One admitted durable-session choice whose path remains borrowed from argv.
+pub const SessionIntent = union(enum) {
+    new,
+    continue_recent,
+    open: []const u8,
+};
+
 /// One print launch whose strings remain borrowed from argv for its execution.
 pub const LaunchRequest = struct {
+    session: SessionIntent = .new,
     provider: ?[]const u8 = null,
     model: ?[]const u8 = null,
     api_key: ?[]const u8 = null,
@@ -47,6 +55,7 @@ pub const Diagnostic = union(enum) {
     invalid_mode: []const u8,
     unavailable_mode: Mode,
     invalid_auth_command: []const u8,
+    conflicting_session_option: []const u8,
     too_many_file_inputs,
     unknown_option: []const u8,
 };
@@ -114,6 +123,14 @@ pub fn parseInvocation(argv: []const []const u8, terminal: Terminal) ParseResult
                 rejection.add(.{ .invalid_mode = value });
                 continue;
             };
+        } else if (std.mem.eql(u8, argument, "--continue") or std.mem.eql(u8, argument, "-c")) {
+            admitSessionIntent(&launch, .continue_recent, argument, &rejection);
+        } else if (std.mem.eql(u8, argument, "--session")) {
+            const value = valueAfter(argv, &index) orelse {
+                rejection.add(.{ .missing_value = argument });
+                continue;
+            };
+            admitSessionIntent(&launch, .{ .open = value }, argument, &rejection);
         } else if (std.mem.eql(u8, argument, "--provider")) {
             launch.provider = valueAfter(argv, &index) orelse {
                 rejection.add(.{ .missing_value = argument });
@@ -192,6 +209,19 @@ fn parseMode(value: []const u8) ?RequestedMode {
     return null;
 }
 
+fn admitSessionIntent(
+    launch: *LaunchRequest,
+    intent: SessionIntent,
+    option: []const u8,
+    rejection: *Rejection,
+) void {
+    if (launch.session != .new) {
+        rejection.add(.{ .conflicting_session_option = option });
+        return;
+    }
+    launch.session = intent;
+}
+
 fn appendMessage(launch: *LaunchRequest, message: []const u8) void {
     launch.message_buffer[launch.message_count] = message;
     launch.message_count += 1;
@@ -217,6 +247,7 @@ test "CLI surface admits one typed launch invocation" {
     }, .{ .stdin_is_tty = true, .stdout_is_tty = true });
     try std.testing.expect(parsed == .admitted);
     const launch = parsed.admitted.launch;
+    try std.testing.expect(launch.session == .new);
     try std.testing.expectEqualStrings("openai", launch.provider.?);
     try std.testing.expectEqualStrings("gpt-5", launch.model.?);
     try std.testing.expectEqualStrings("secret", launch.api_key.?);
@@ -224,6 +255,35 @@ test "CLI surface admits one typed launch invocation" {
     try std.testing.expectEqual(@as(usize, 2), launch.messages().len);
     try std.testing.expectEqualStrings("first", launch.messages()[0]);
     try std.testing.expectEqualStrings("second", launch.messages()[1]);
+}
+
+test "CLI surface admits recent and exact durable session continuation" {
+    const recent = parseInvocation(&.{ "--print", "--continue", "follow up" }, .{
+        .stdin_is_tty = true,
+        .stdout_is_tty = true,
+    });
+    try std.testing.expect(recent == .admitted);
+    try std.testing.expect(recent.admitted.launch.session == .continue_recent);
+
+    const exact = parseInvocation(&.{ "--print", "--session", "session.jsonl", "follow up" }, .{
+        .stdin_is_tty = true,
+        .stdout_is_tty = true,
+    });
+    try std.testing.expect(exact == .admitted);
+    try std.testing.expect(exact.admitted.launch.session == .open);
+    try std.testing.expectEqualStrings("session.jsonl", exact.admitted.launch.session.open);
+}
+
+test "CLI surface rejects conflicting durable session choices" {
+    const parsed = parseInvocation(&.{ "--print", "-c", "--session", "session.jsonl" }, .{
+        .stdin_is_tty = true,
+        .stdout_is_tty = true,
+    });
+    try std.testing.expect(parsed == .rejected);
+    try std.testing.expectEqualStrings(
+        "--session",
+        parsed.rejected.diagnostics()[0].conflicting_session_option,
+    );
 }
 
 test "CLI surface resolves automatic presentation only at the process edge" {
