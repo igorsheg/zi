@@ -1,32 +1,11 @@
-const app = @import("app.zig");
-const args = @import("args.zig");
 const auth_command = @import("auth_command.zig");
+const entry = @import("entry.zig");
 const initial_message = @import("initial_message.zig");
+const launch = @import("launch.zig");
 const print_mode = @import("print_mode.zig");
+const surface = @import("surface.zig");
 
-pub const run = app.run;
-pub const AppMode = args.AppMode;
-pub const AuthCommand = args.AuthCommand;
-pub const AuthMethod = args.AuthMethod;
-pub const Args = args.Args;
-pub const Diagnostic = args.Diagnostic;
-pub const DiagnosticDetail = args.DiagnosticDetail;
-pub const DiagnosticSeverity = args.DiagnosticSeverity;
-pub const Mode = args.Mode;
-pub const UnknownFlag = args.UnknownFlag;
-pub const UnknownFlagValue = args.UnknownFlagValue;
-pub const parseArgs = args.parseArgs;
-pub const resolveAppMode = args.resolveAppMode;
-pub const runAuthCommand = auth_command.run;
-pub const AuthExitCode = auth_command.ExitCode;
-
-pub const InitialMessage = initial_message.InitialMessage;
-pub const InitialMessageError = initial_message.Error;
-pub const buildInitialMessage = initial_message.buildInitialMessage;
-
-pub const ExitCode = print_mode.ExitCode;
-pub const PrintModeOptions = print_mode.PrintModeOptions;
-pub const runPrintMode = print_mode.runPrintMode;
+pub const run = entry.run;
 
 const std = @import("std");
 const ai_testing = @import("../../ai/testing.zig");
@@ -56,16 +35,20 @@ test "CLI core parses, composes, runs sequential prompts, and prints only the fi
     var stderr: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer stderr.deinit();
 
-    var parsed = try parseArgs(std.testing.allocator, &.{ "-p", "first prompt", "second prompt" });
-    defer parsed.deinit();
-    var initial = try buildInitialMessage(
+    const parsed = surface.parseInvocation(&.{ "-p", "first prompt", "second prompt" }, .{
+        .stdin_is_tty = true,
+        .stdout_is_tty = true,
+    });
+    try std.testing.expect(parsed == .admitted);
+    const request = parsed.admitted.launch;
+    var initial = try initial_message.buildInitialMessage(
         std.testing.allocator,
-        parsed.messages,
+        request.messages(),
         "stdin\n",
         null,
     );
     defer initial.deinit();
-    const exit = try runPrintMode(
+    const exit = try print_mode.runPrintMode(
         &session,
         .{ .initial_message = initial.text, .messages = initial.remaining_messages },
         &stdout.writer,
@@ -104,7 +87,7 @@ test "text print mode routes a settled agent failure only to stderr" {
     var stderr: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer stderr.deinit();
 
-    const exit = try runPrintMode(
+    const exit = try print_mode.runPrintMode(
         &session,
         .{ .initial_message = "fail" },
         &stdout.writer,
@@ -137,7 +120,7 @@ test "text print mode rejects invalid and excessive prompts before model admissi
     var stderr: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer stderr.deinit();
 
-    const exit = try runPrintMode(
+    const exit = try print_mode.runPrintMode(
         &session,
         .{ .initial_message = "\xff" },
         &stdout.writer,
@@ -153,7 +136,7 @@ test "text print mode rejects invalid and excessive prompts before model admissi
     defer later_stdout.deinit();
     var later_stderr: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer later_stderr.deinit();
-    const later_exit = try runPrintMode(
+    const later_exit = try print_mode.runPrintMode(
         &session,
         .{ .initial_message = "valid", .messages = &.{"\xff"} },
         &later_stdout.writer,
@@ -170,7 +153,7 @@ test "text print mode rejects invalid and excessive prompts before model admissi
     defer count_stdout.deinit();
     var count_stderr: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer count_stderr.deinit();
-    const count_exit = try runPrintMode(
+    const count_exit = try print_mode.runPrintMode(
         &session,
         .{ .messages = &messages },
         &count_stdout.writer,
@@ -206,7 +189,7 @@ test "text print mode succeeds silently without a prompt" {
     var stderr: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer stderr.deinit();
 
-    const exit = try runPrintMode(&session, .{}, &stdout.writer, &stderr.writer);
+    const exit = try print_mode.runPrintMode(&session, .{}, &stdout.writer, &stderr.writer);
     try std.testing.expect(exit == .success);
     try std.testing.expectEqualStrings("", stdout.written());
     try std.testing.expectEqualStrings("", stderr.written());
@@ -215,9 +198,10 @@ test "text print mode succeeds silently without a prompt" {
 }
 
 test {
-    _ = app;
-    _ = args;
     _ = auth_command;
+    _ = entry;
     _ = initial_message;
+    _ = launch;
     _ = print_mode;
+    _ = surface;
 }

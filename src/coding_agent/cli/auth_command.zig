@@ -3,7 +3,7 @@ const ai = @import("../../ai/root.zig");
 const CredentialManager = @import("../CredentialManager.zig");
 const ModelConfig = @import("../ModelConfig.zig");
 const ZiPaths = @import("../ZiPaths.zig");
-const args = @import("args.zig");
+const surface = @import("surface.zig");
 
 pub const ExitCode = enum(u8) {
     success = 0,
@@ -57,11 +57,12 @@ const TerminalInteraction = struct {
     }
 };
 
-pub fn run(
+/// Runs one admitted authentication command against the durable credential owner.
+pub fn runAuthCommand(
     allocator: std.mem.Allocator,
     io: std.Io,
     paths: *const ZiPaths,
-    command: args.AuthCommand,
+    command: surface.AuthCommand,
     stdin: *std.Io.Reader,
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,

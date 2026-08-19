@@ -48,8 +48,9 @@ your latest change.
 
 ### What the binary does today
 
-`src/main.zig` delegates process composition to `src/coding_agent/cli/app.zig`.
-The built binary exposes the surface printed by `./zig-out/bin/zi --help`.
+`src/main.zig` delegates process adaptation and dispatch to
+`src/coding_agent/cli/entry.zig`. The built binary exposes the surface printed
+by `./zig-out/bin/zi --help`.
 Treat that output and the composition code as the authority. Do not infer
 interactive, JSON, or RPC support from parser types that the process rejects.
 
