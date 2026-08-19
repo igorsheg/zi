@@ -1,8 +1,13 @@
+const app = @import("app.zig");
 const args = @import("args.zig");
+const auth_command = @import("auth_command.zig");
 const initial_message = @import("initial_message.zig");
 const print_mode = @import("print_mode.zig");
 
+pub const run = app.run;
 pub const AppMode = args.AppMode;
+pub const AuthCommand = args.AuthCommand;
+pub const AuthMethod = args.AuthMethod;
 pub const Args = args.Args;
 pub const Diagnostic = args.Diagnostic;
 pub const DiagnosticDetail = args.DiagnosticDetail;
@@ -12,6 +17,8 @@ pub const UnknownFlag = args.UnknownFlag;
 pub const UnknownFlagValue = args.UnknownFlagValue;
 pub const parseArgs = args.parseArgs;
 pub const resolveAppMode = args.resolveAppMode;
+pub const runAuthCommand = auth_command.run;
+pub const AuthExitCode = auth_command.ExitCode;
 
 pub const InitialMessage = initial_message.InitialMessage;
 pub const InitialMessageError = initial_message.Error;
@@ -208,7 +215,9 @@ test "text print mode succeeds silently without a prompt" {
 }
 
 test {
+    _ = app;
     _ = args;
+    _ = auth_command;
     _ = initial_message;
     _ = print_mode;
 }

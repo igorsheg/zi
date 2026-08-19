@@ -48,16 +48,10 @@ your latest change.
 
 ### What the binary does today
 
-`src/main.zig` is a stub. It writes one readiness line and exits. The CLI core
-in `src/coding_agent/cli/` parses args, composes an initial message, and runs
-print mode, but nothing in `main` composes it yet.
-
-Read `src/main.zig` before you claim anything about what a user can do. It is
-nine lines. Do not infer a product surface from the presence of a module.
-
-Wiring `main` to the CLI core is admitted work, not a side effect of another
-change. When it lands, step 4 above stops having a library-only branch for
-anything the CLI reaches.
+`src/main.zig` delegates process composition to `src/coding_agent/cli/app.zig`.
+The built binary exposes the surface printed by `./zig-out/bin/zi --help`.
+Treat that output and the composition code as the authority. Do not infer
+interactive, JSON, or RPC support from parser types that the process rejects.
 
 ## Continuous integration
 
@@ -274,17 +268,12 @@ There is no TypeScript, bun, or e2e suite on this branch.
 
 ## Documentation
 
-There is no product `docs/` tree until the Zig binary has a user-facing surface.
+There is no product `docs/` tree. `README.md` documents the admitted build and
+usage surface. `build.zig` owns the step list, and `src/main.zig` plus
+`src/coding_agent/cli/` own what the process does.
 
-`README.md` is currently a logo and a one-line description. It is not yet a
-build or usage reference, so do not cite it as the authority for either.
-`build.zig` owns the step list and `src/main.zig` owns what the process does.
-
-When behavior that already exists in the binary changes:
-
-1. Update `--help` only after the process actually exposes it.
-2. Give `README.md` build steps and a usage section at the same time the binary
-   first has a real surface, and keep it accurate from then on.
+When behavior that already exists in the binary changes, update `--help` and
+`README.md` in the same change and keep both limited to the reachable surface.
 
 Do not document intended behavior as if it already exists. Completed
 implementation plans remain available in commit history instead of forming a

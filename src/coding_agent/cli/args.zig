@@ -17,6 +17,21 @@ pub const AppMode = enum {
     rpc,
 };
 
+pub const AuthMethod = enum {
+    browser,
+    device_code,
+};
+
+pub const AuthCommand = union(enum) {
+    login: struct {
+        provider_id: []const u8,
+        method: AuthMethod,
+    },
+    logout: struct {
+        provider_id: []const u8,
+    },
+};
+
 pub const UnknownFlagValue = union(enum) {
     boolean: bool,
     string: []const u8,
@@ -39,6 +54,8 @@ pub const DiagnosticDetail = union(enum) {
     invalid_utf8: usize,
     missing_value: []const u8,
     invalid_mode: []const u8,
+    invalid_auth_command: []const u8,
+    invalid_auth_method: []const u8,
     unknown_option: []const u8,
 };
 
@@ -52,6 +69,7 @@ pub const Args = struct {
     provider: ?[]const u8 = null,
     model: ?[]const u8 = null,
     api_key: ?[]const u8 = null,
+    auth: ?AuthCommand = null,
     mode: ?Mode = null,
     print: bool = false,
     help: bool = false,
@@ -120,6 +138,10 @@ pub fn parseArgs(
     if (diagnostics.items.len > 0) {
         return finish(allocator, result, &messages, &file_args, &unknown_flags, &diagnostics);
     }
+    if (argv.len > 0 and std.mem.eql(u8, argv[0], "auth")) {
+        try parseAuthCommand(argv, &result, &diagnostics);
+        return finish(allocator, result, &messages, &file_args, &unknown_flags, &diagnostics);
+    }
 
     var index: usize = 0;
     while (index < argv.len) : (index += 1) {
@@ -177,6 +199,53 @@ pub fn resolveAppMode(args: *const Args, stdin_is_tty: bool, stdout_is_tty: bool
     if (args.mode == .json) return .json;
     if (args.print or !stdin_is_tty or !stdout_is_tty) return .print;
     return .interactive;
+}
+
+fn parseAuthCommand(
+    argv: []const []const u8,
+    result: *Args,
+    diagnostics: *std.ArrayList(Diagnostic),
+) error{OutOfMemory}!void {
+    if (argv.len < 2) {
+        try diagnostics.append(result.allocator, .{ .detail = .{ .invalid_auth_command = "" } });
+        return;
+    }
+    const action = argv[1];
+    var provider_id: []const u8 = "openai-codex";
+    var provider_set = false;
+    var method: AuthMethod = .browser;
+    var index: usize = 2;
+    while (index < argv.len) : (index += 1) {
+        const argument = argv[index];
+        if (std.mem.eql(u8, argument, "--method")) {
+            const value = valueAfter(argv, &index) orelse {
+                try diagnostics.append(result.allocator, .{ .detail = .{ .missing_value = argument } });
+                continue;
+            };
+            method = if (std.mem.eql(u8, value, "browser"))
+                .browser
+            else if (std.mem.eql(u8, value, "device-code"))
+                .device_code
+            else {
+                try diagnostics.append(result.allocator, .{ .detail = .{ .invalid_auth_method = value } });
+                continue;
+            };
+        } else if (std.mem.startsWith(u8, argument, "-")) {
+            try diagnostics.append(result.allocator, .{ .detail = .{ .unknown_option = argument } });
+        } else if (!provider_set) {
+            provider_id = argument;
+            provider_set = true;
+        } else {
+            try diagnostics.append(result.allocator, .{ .detail = .{ .unknown_option = argument } });
+        }
+    }
+    if (std.mem.eql(u8, action, "login")) {
+        result.auth = .{ .login = .{ .provider_id = provider_id, .method = method } };
+    } else if (std.mem.eql(u8, action, "logout")) {
+        result.auth = .{ .logout = .{ .provider_id = provider_id } };
+    } else {
+        try diagnostics.append(result.allocator, .{ .detail = .{ .invalid_auth_command = action } });
+    }
 }
 
 fn finish(
@@ -258,6 +327,25 @@ fn setUnknownFlag(
         }
     }
     try unknown_flags.append(allocator, .{ .name = name, .value = value });
+}
+
+test "parseArgs admits OAuth login and logout commands" {
+    var login = try parseArgs(std.testing.allocator, &.{
+        "auth",
+        "login",
+        "openai-codex",
+        "--method",
+        "device-code",
+    });
+    defer login.deinit();
+    try std.testing.expect(login.auth.? == .login);
+    try std.testing.expectEqualStrings("openai-codex", login.auth.?.login.provider_id);
+    try std.testing.expect(login.auth.?.login.method == .device_code);
+
+    var logout = try parseArgs(std.testing.allocator, &.{ "auth", "logout" });
+    defer logout.deinit();
+    try std.testing.expect(logout.auth.? == .logout);
+    try std.testing.expectEqualStrings("openai-codex", logout.auth.?.logout.provider_id);
 }
 
 test "parseArgs preserves pi print, prompt, file, and extension flag behavior" {

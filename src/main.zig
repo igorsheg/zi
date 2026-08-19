@@ -1,9 +1,7 @@
 const std = @import("std");
+const zi = @import("zi");
 
 pub fn main(init: std.process.Init) !void {
-    const io = init.io;
-    var buffer: [256]u8 = undefined;
-    var writer = std.Io.File.Writer.init(.stdout(), io, &buffer);
-    try writer.interface.writeAll("zi zig substrate ready\n");
-    try writer.interface.flush();
+    const exit_code = try zi.coding_agent.cli.run(init);
+    if (exit_code != 0) std.process.exit(exit_code);
 }
