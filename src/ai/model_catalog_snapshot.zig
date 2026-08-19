@@ -8,6 +8,7 @@ pub const updated_at = "2026-08-16";
 pub const entries = [_]catalog.Entry{
     .{
         .identity = .{ .provider = "openai", .model = "gpt-5.6-sol" },
+        .protocol_id = "openai-responses",
         .aliases = &.{"gpt-5.6"},
         .source_url = "https://developers.openai.com/api/docs/models/gpt-5.6-sol",
         .profile = .{
@@ -20,6 +21,7 @@ pub const entries = [_]catalog.Entry{
     },
     .{
         .identity = .{ .provider = "openai-codex", .model = "gpt-5.3-codex-spark" },
+        .protocol_id = "openai-codex-responses",
         .aliases = &.{},
         .source_url = "https://github.com/badlogic/pi-mono/commit/73414d08b94d7db46d3fa66582c8fe3b02dabf72",
         .profile = .{
@@ -32,6 +34,7 @@ pub const entries = [_]catalog.Entry{
     },
     .{
         .identity = .{ .provider = "openai-codex", .model = "gpt-5.4" },
+        .protocol_id = "openai-codex-responses",
         .aliases = &.{},
         .source_url = "https://github.com/badlogic/pi-mono/commit/73414d08b94d7db46d3fa66582c8fe3b02dabf72",
         .profile = .{
@@ -44,6 +47,7 @@ pub const entries = [_]catalog.Entry{
     },
     .{
         .identity = .{ .provider = "openai-codex", .model = "gpt-5.4-mini" },
+        .protocol_id = "openai-codex-responses",
         .aliases = &.{},
         .source_url = "https://github.com/badlogic/pi-mono/commit/73414d08b94d7db46d3fa66582c8fe3b02dabf72",
         .profile = .{
@@ -56,6 +60,7 @@ pub const entries = [_]catalog.Entry{
     },
     .{
         .identity = .{ .provider = "openai-codex", .model = "gpt-5.5" },
+        .protocol_id = "openai-codex-responses",
         .aliases = &.{},
         .source_url = "https://github.com/badlogic/pi-mono/commit/73414d08b94d7db46d3fa66582c8fe3b02dabf72",
         .profile = .{
@@ -68,6 +73,7 @@ pub const entries = [_]catalog.Entry{
     },
     .{
         .identity = .{ .provider = "openai-codex", .model = "gpt-5.6-luna" },
+        .protocol_id = "openai-codex-responses",
         .aliases = &.{},
         .source_url = "https://github.com/badlogic/pi-mono/commit/73414d08b94d7db46d3fa66582c8fe3b02dabf72",
         .profile = .{
@@ -80,6 +86,7 @@ pub const entries = [_]catalog.Entry{
     },
     .{
         .identity = .{ .provider = "openai-codex", .model = "gpt-5.6-sol" },
+        .protocol_id = "openai-codex-responses",
         .aliases = &.{},
         .source_url = "https://github.com/badlogic/pi-mono/commit/73414d08b94d7db46d3fa66582c8fe3b02dabf72",
         .profile = .{
@@ -92,6 +99,7 @@ pub const entries = [_]catalog.Entry{
     },
     .{
         .identity = .{ .provider = "openai-codex", .model = "gpt-5.6-terra" },
+        .protocol_id = "openai-codex-responses",
         .aliases = &.{},
         .source_url = "https://github.com/badlogic/pi-mono/commit/73414d08b94d7db46d3fa66582c8fe3b02dabf72",
         .profile = .{

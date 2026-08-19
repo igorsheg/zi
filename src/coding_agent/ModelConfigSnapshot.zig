@@ -1,6 +1,8 @@
 const std = @import("std");
 const bounded_json = @import("../BoundedJson.zig");
 const ai_catalog = @import("../ai/model_catalog.zig");
+const ai_protocol = @import("../ai/protocol.zig");
+const ai_protocols = @import("../ai/protocols/root.zig");
 const ai_settings = @import("../ai/settings.zig");
 const ModelConfig = @import("ModelConfig.zig");
 const ZiPaths = @import("ZiPaths.zig");
@@ -36,15 +38,10 @@ const Source = struct {
     providers: std.json.ArrayHashMap(SourceProvider),
 };
 
-const Api = enum {
-    @"openai-completions",
-    @"openai-responses",
-};
-
 const SourceProvider = struct {
     name: ?[]const u8 = null,
     baseUrl: []const u8,
-    api: Api,
+    protocol: []const u8,
     models: []const SourceModel,
     compat: ?Compat = null,
 };
@@ -52,7 +49,7 @@ const SourceProvider = struct {
 const SourceModel = struct {
     id: []const u8,
     name: ?[]const u8 = null,
-    api: ?Api = null,
+    protocol: ?[]const u8 = null,
     baseUrl: ?[]const u8 = null,
     reasoning: bool = false,
     thinkingLevelMap: ?ThinkingLevelMap = null,
@@ -219,7 +216,8 @@ fn compose(allocator: std.mem.Allocator, source: Source) error{ OutOfMemory, Inv
         for (provider.models) |model| {
             entries[entry_index] = .{
                 .identity = .{ .provider = provider_id, .model = model.id },
-                .profile = try profile(provider.api, model),
+                .protocol_id = provider.protocol,
+                .profile = try profile(provider.protocol, model),
             };
             entry_index += 1;
         }
@@ -231,15 +229,11 @@ fn compose(allocator: std.mem.Allocator, source: Source) error{ OutOfMemory, Inv
     );
     @memcpy(providers[0..ModelConfig.builtin.providers.len], ModelConfig.builtin.providers);
     for (provider_ids, source_providers, 0..) |provider_id, provider, index| {
-        const definition: ModelConfig.ProviderDefinition.OpenAi = .{
+        providers[ModelConfig.builtin.providers.len + index] = .{
             .id = provider_id,
             .name = provider.name orelse provider_id,
             .base_url = provider.baseUrl,
-            .authentication = .api_key,
-        };
-        providers[ModelConfig.builtin.providers.len + index] = switch (provider.api) {
-            .@"openai-completions" => .{ .openai_completions = definition },
-            .@"openai-responses" => .{ .openai_responses = definition },
+            .auth = .{ .api_key = .{} },
         };
     }
     return ModelConfig.init(.{ .entries = entries }, providers) catch return error.InvalidModelsFile;
@@ -247,9 +241,10 @@ fn compose(allocator: std.mem.Allocator, source: Source) error{ OutOfMemory, Inv
 
 fn validateProvider(provider_id: []const u8, provider: SourceProvider) error{InvalidModelsFile}!void {
     try validateIdentifierBytes(provider_id, max_provider_id_bytes);
-    if (std.mem.eql(u8, provider_id, "openai") or std.mem.eql(u8, provider_id, "openai-codex")) {
-        return error.InvalidModelsFile;
+    for (ModelConfig.builtin.providers) |builtin| {
+        if (std.mem.eql(u8, provider_id, builtin.id)) return error.InvalidModelsFile;
     }
+    _ = protocolRegistry().find(provider.protocol) orelse return error.InvalidModelsFile;
     if (provider.name) |name| try validateText(name, max_provider_name_bytes);
     try validateEndpoint(provider.baseUrl);
     if (provider.models.len == 0 or provider.models.len > max_models_per_provider) {
@@ -263,7 +258,9 @@ fn validateProvider(provider_id: []const u8, provider: SourceProvider) error{Inv
 fn validateModel(provider: SourceProvider, model: SourceModel) error{InvalidModelsFile}!void {
     try validateIdentifierBytes(model.id, max_model_id_bytes);
     if (model.name) |name| try validateText(name, max_model_name_bytes);
-    if (model.api) |api| if (api != provider.api) return error.InvalidModelsFile;
+    if (model.protocol) |protocol_id| {
+        if (!std.mem.eql(u8, protocol_id, provider.protocol)) return error.InvalidModelsFile;
+    }
     if (model.baseUrl) |base_url| {
         try validateEndpoint(base_url);
         if (!std.mem.eql(u8, base_url, provider.baseUrl)) return error.InvalidModelsFile;
@@ -292,27 +289,14 @@ fn validateModel(provider: SourceProvider, model: SourceModel) error{InvalidMode
     if (model.cost) |cost| try validateCost(cost);
 }
 
-fn profile(api: Api, model: SourceModel) error{InvalidModelsFile}!ai_settings.ModelProfile {
-    var capabilities: std.EnumSet(ai_settings.Capability) = .initEmpty();
-    capabilities.insert(.streaming);
-    capabilities.insert(.tools);
-    capabilities.insert(.parallel_tool_calls);
+fn protocolRegistry() ai_protocol.Registry {
+    return ai_protocol.Registry.init(&ai_protocols.builtin) catch unreachable;
+}
 
-    var settings: std.EnumSet(ai_settings.Setting) = .initEmpty();
-    switch (api) {
-        .@"openai-completions" => {
-            settings.insert(.temperature);
-            settings.insert(.top_p);
-            settings.insert(.max_output_tokens);
-            settings.insert(.stop_sequences);
-            settings.insert(.seed);
-        },
-        .@"openai-responses" => settings.insert(.max_output_tokens),
-    }
-
+fn profile(protocol_id: []const u8, model: SourceModel) error{InvalidModelsFile}!ai_settings.ModelProfile {
+    const protocol = protocolRegistry().find(protocol_id) orelse return error.InvalidModelsFile;
     var efforts: std.EnumSet(ai_settings.ReasoningEffort) = .initEmpty();
-    if (api == .@"openai-responses" and model.reasoning) {
-        capabilities.insert(.thinking);
+    if (model.reasoning) {
         if (model.thinkingLevelMap) |thinking_map| {
             if (thinking_map.minimal != .unsupported) efforts.insert(.minimal);
             if (thinking_map.low != .unsupported) efforts.insert(.low);
@@ -321,15 +305,14 @@ fn profile(api: Api, model: SourceModel) error{InvalidModelsFile}!ai_settings.Mo
         } else {
             efforts = .initFull();
         }
-        if (efforts.count() != 0) settings.insert(.reasoning_effort);
     }
-    return .{
-        .capabilities = capabilities,
-        .settings = settings,
+    var value = protocol.profile(.{
+        .reasoning = model.reasoning,
         .reasoning_efforts = efforts,
-        .context_window = model.contextWindow,
-        .max_output_tokens = model.maxTokens,
-    };
+    });
+    value.context_window = model.contextWindow;
+    value.max_output_tokens = model.maxTokens;
+    return value;
 }
 
 fn validateThinkingMapping(
@@ -424,7 +407,7 @@ const custom_openai_provider_source =
     \\  "providers": {
     \\    "custom-openai": {
     \\      "baseUrl": "https://example.test/openai/v1",
-    \\      "api": "openai-responses",
+    \\      "protocol": "openai-responses",
     \\      "models": [{
     \\        "id": "custom-reasoning-model",
     \\        "name": "Custom Reasoning Model",
@@ -470,7 +453,7 @@ const completions_source =
     \\    "local": {
     \\      "name": "Local Models",
     \\      "baseUrl": "http://127.0.0.1:11434/v1",
-    \\      "api": "openai-completions",
+    \\      "protocol": "openai-completions",
     \\      "models": [{"id": "qwen-coder"}]
     \\    }
     \\  }
@@ -482,7 +465,7 @@ const sparse_thinking_source =
     \\  "providers": {
     \\    "sparse": {
     \\      "baseUrl": "https://example.test/v1",
-    \\      "api": "openai-responses",
+    \\      "protocol": "openai-responses",
     \\      "models": [{
     \\        "id": "reasoner",
     \\        "reasoning": true,
@@ -535,10 +518,10 @@ test "global models snapshot owns a Pi-shaped Responses provider" {
     const config = snapshot.view();
     try std.testing.expectEqual(ModelConfig.builtin.providers.len + 1, config.providers.len);
     try std.testing.expectEqual(ModelConfig.builtin.catalog.entries.len + 1, config.catalog.entries.len);
-    const provider = config.findProvider("custom-openai").?.openai_responses;
+    const provider = config.findProvider("custom-openai").?.*;
     try std.testing.expectEqualStrings("custom-openai", provider.name);
     try std.testing.expectEqualStrings("https://example.test/openai/v1", provider.base_url);
-    try std.testing.expectEqual(ModelConfig.ProviderDefinition.OpenAi.Authentication.api_key, provider.authentication);
+    try std.testing.expect(provider.auth.api_key != null);
     const resolved = config.resolve(.{
         .provider = "custom-openai",
         .model = "custom-reasoning-model",
@@ -564,7 +547,7 @@ test "Pi defaults project into a custom Chat Completions profile" {
     defer snapshot.deinit();
 
     const config = snapshot.view();
-    const provider = config.findProvider("local").?.openai_completions;
+    const provider = config.findProvider("local").?.*;
     try std.testing.expectEqualStrings("Local Models", provider.name);
     const resolved = config.resolve(.{ .provider = "local", .model = "qwen-coder" }).?;
     try std.testing.expect(resolved.entry.profile.supportsSetting(.temperature));
@@ -604,28 +587,28 @@ test "invalid global models files retain built-ins with one diagnostic" {
         \\{"providers":{},"unknown":true}
         ,
         // ziglint-ignore: Z024 -- compact invalid JSON fixture
-        \\{"providers":{"openai":{"baseUrl":"https://example.test/v1","api":"openai-responses","models":[{"id":"model"}]}}}
+        \\{"providers":{"openai":{"baseUrl":"https://example.test/v1","protocol":"openai-responses","models":[{"id":"model"}]}}}
         ,
         // ziglint-ignore: Z024 -- compact invalid JSON fixture
-        \\{"providers":{"bad":{"baseUrl":"file:///tmp/model","api":"openai-responses","models":[{"id":"model"}]}}}
+        \\{"providers":{"bad":{"baseUrl":"file:///tmp/model","protocol":"openai-responses","models":[{"id":"model"}]}}}
         ,
         // ziglint-ignore: Z024 -- compact invalid JSON fixture
-        \\{"providers":{"bad":{"baseUrl":"https://example.test/v1","api":"anthropic-messages","models":[{"id":"model"}]}}}
+        \\{"providers":{"bad":{"baseUrl":"https://example.test/v1","protocol":"anthropic-messages","models":[{"id":"model"}]}}}
         ,
         // ziglint-ignore: Z024 -- compact invalid JSON fixture
-        \\{"providers":{"bad":{"baseUrl":"https://example.test/v1","api":"openai-responses","apiKey":"secret","models":[{"id":"model"}]}}}
+        \\{"providers":{"bad":{"baseUrl":"https://example.test/v1","protocol":"openai-responses","apiKey":"secret","models":[{"id":"model"}]}}}
         ,
         // ziglint-ignore: Z024 -- compact invalid JSON fixture
-        \\{"providers":{"bad":{"baseUrl":"https://example.test/v1","api":"openai-responses","models":[{"id":"model","input":["image"]}]}}}
+        \\{"providers":{"bad":{"baseUrl":"https://example.test/v1","protocol":"openai-responses","models":[{"id":"model","input":["image"]}]}}}
         ,
         // ziglint-ignore: Z024 -- compact invalid JSON fixture
-        \\{"providers":{"bad":{"baseUrl":"https://example.test/v1","api":"openai-responses","models":[{"id":"model","api":"openai-completions"}]}}}
+        \\{"providers":{"bad":{"baseUrl":"https://example.test/v1","protocol":"openai-responses","models":[{"id":"model","protocol":"openai-completions"}]}}}
         ,
         // ziglint-ignore: Z024 -- compact invalid JSON fixture
-        \\{"providers":{"bad":{"baseUrl":"https://example.test/v1","api":"openai-responses","models":[{"id":"model"},{"id":"model"}]}}}
+        \\{"providers":{"bad":{"baseUrl":"https://example.test/v1","protocol":"openai-responses","models":[{"id":"model"},{"id":"model"}]}}}
         ,
         // ziglint-ignore: Z024 -- compact invalid JSON fixture
-        \\{"providers":{"bad":{"baseUrl":"https://example.test/v1","api":"openai-responses","models":[{"id":"model","reasoning":true,"thinkingLevelMap":{"high":"maximum"}}]}}}
+        \\{"providers":{"bad":{"baseUrl":"https://example.test/v1","protocol":"openai-responses","models":[{"id":"model","reasoning":true,"thinkingLevelMap":{"high":"maximum"}}]}}}
         ,
     };
     for (cases) |contents| {

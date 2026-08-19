@@ -2,51 +2,36 @@ const std = @import("std");
 const failure = @import("../failure.zig");
 const message = @import("../message.zig");
 const model_api = @import("../model.zig");
-const model_catalog = @import("../model_catalog.zig");
 const openai_responses = @import("../protocol/openai_responses.zig");
-const provider_api = @import("../provider.zig");
+const protocol_api = @import("../protocol.zig");
+const settings = @import("../settings.zig");
 const transport_api = @import("../transport.zig");
 
-pub const Config = struct {
-    provider_id: []const u8,
-    catalog: model_catalog.Catalog,
-    api_key: ?[]const u8 = null,
-    base_url: []const u8,
-    headers: []const transport_api.Header = &.{},
-};
+pub const id = "openai-responses";
 
 pub const OpenAiResponses = struct {
-    transport: transport_api.Transport,
-    config: Config,
-
-    pub fn init(transport: transport_api.Transport, config: Config) OpenAiResponses {
-        return .{ .transport = transport, .config = config };
+    pub fn profile(_: *const OpenAiResponses, hints: protocol_api.ProfileHints) settings.ModelProfile {
+        var value: settings.ModelProfile = .{};
+        value.capabilities = .initMany(&.{ .streaming, .tools, .parallel_tool_calls });
+        value.settings = .initOne(.max_output_tokens);
+        if (hints.reasoning) {
+            value.capabilities.insert(.thinking);
+            value.settings.insert(.reasoning_effort);
+            value.reasoning_efforts = hints.reasoning_efforts;
+        }
+        return value;
     }
 
-    pub fn provider(self: *OpenAiResponses) provider_api.Provider {
-        return provider_api.Provider.from(self, self.config.provider_id);
-    }
-
-    pub fn model(self: *OpenAiResponses, model_id: []const u8) ?model_api.Model {
-        const resolved = self.config.catalog.resolve(.{
-            .provider = self.config.provider_id,
-            .model = model_id,
-        }) orelse return null;
-        return model_api.Model.from(self, resolved.entry.identity, resolved.entry.profile);
-    }
-
-    pub fn models(
-        self: *OpenAiResponses,
-        allocator: std.mem.Allocator,
-    ) provider_api.ProviderError!provider_api.OwnedModelList {
-        return provider_api.modelsFromCatalog(allocator, self.config.catalog, self.config.provider_id);
+    pub fn protocol(self: *const OpenAiResponses) protocol_api.Protocol {
+        return protocol_api.Protocol.from(self, id);
     }
 
     pub fn invoke(
-        self: *OpenAiResponses,
+        _: *const OpenAiResponses,
         result_allocator: std.mem.Allocator,
         scratch_allocator: std.mem.Allocator,
         io: std.Io,
+        invocation: protocol_api.Invocation,
         identity: message.ModelIdentity,
         request: model_api.ModelRequest,
         delivery: model_api.Delivery,
@@ -57,9 +42,9 @@ pub const OpenAiResponses = struct {
             std.crypto.secureZero(u8, @constCast(body));
             scratch_allocator.free(body);
         }
-        const url = try endpointUrl(scratch_allocator, self.config.base_url);
+        const url = try endpointUrl(scratch_allocator, invocation.base_url);
         defer scratch_allocator.free(url);
-        const authorization = if (self.config.api_key) |key|
+        const authorization = if (invocation.auth.api_key) |key|
             std.fmt.allocPrint(scratch_allocator, "Bearer {s}", .{key}) catch return error.OutOfMemory
         else
             null;
@@ -77,7 +62,8 @@ pub const OpenAiResponses = struct {
             .name = "authorization",
             .value = value,
         }) catch return error.OutOfMemory;
-        headers.appendSlice(scratch_allocator, self.config.headers) catch return error.OutOfMemory;
+        headers.appendSlice(scratch_allocator, invocation.headers) catch return error.OutOfMemory;
+        headers.appendSlice(scratch_allocator, invocation.auth.headers) catch return error.OutOfMemory;
 
         const application_sink = switch (delivery) {
             .buffered => null,
@@ -91,7 +77,7 @@ pub const OpenAiResponses = struct {
             application_sink,
         );
         defer decoder.deinit();
-        _ = self.transport.exchange(scratch_allocator, io, .{
+        _ = invocation.transport.exchange(scratch_allocator, io, .{
             .method = .POST,
             .url = url,
             .headers = headers.items,

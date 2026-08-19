@@ -2,51 +2,31 @@ const std = @import("std");
 const failure = @import("../failure.zig");
 const message = @import("../message.zig");
 const model_api = @import("../model.zig");
-const model_catalog = @import("../model_catalog.zig");
 const openai_chat = @import("../protocol/openai_chat.zig");
-const provider_api = @import("../provider.zig");
+const protocol_api = @import("../protocol.zig");
+const settings = @import("../settings.zig");
 const transport_api = @import("../transport.zig");
 
-pub const Config = struct {
-    provider_id: []const u8,
-    catalog: model_catalog.Catalog,
-    base_url: []const u8,
-    api_key: ?[]const u8 = null,
-    headers: []const transport_api.Header = &.{},
-};
+pub const id = "openai-completions";
 
 pub const OpenAiCompatible = struct {
-    transport: transport_api.Transport,
-    config: Config,
-
-    pub fn init(transport: transport_api.Transport, config: Config) OpenAiCompatible {
-        return .{ .transport = transport, .config = config };
+    pub fn profile(_: *const OpenAiCompatible, _: protocol_api.ProfileHints) settings.ModelProfile {
+        var value: settings.ModelProfile = .{};
+        value.capabilities = .initMany(&.{ .streaming, .tools, .parallel_tool_calls });
+        value.settings = .initMany(&.{ .temperature, .top_p, .max_output_tokens, .stop_sequences, .seed });
+        return value;
     }
 
-    pub fn provider(self: *OpenAiCompatible) provider_api.Provider {
-        return provider_api.Provider.from(self, self.config.provider_id);
-    }
-
-    pub fn model(self: *OpenAiCompatible, model_id: []const u8) ?model_api.Model {
-        const resolved = self.config.catalog.resolve(.{
-            .provider = self.config.provider_id,
-            .model = model_id,
-        }) orelse return null;
-        return model_api.Model.from(self, resolved.entry.identity, resolved.entry.profile);
-    }
-
-    pub fn models(
-        self: *OpenAiCompatible,
-        allocator: std.mem.Allocator,
-    ) provider_api.ProviderError!provider_api.OwnedModelList {
-        return provider_api.modelsFromCatalog(allocator, self.config.catalog, self.config.provider_id);
+    pub fn protocol(self: *const OpenAiCompatible) protocol_api.Protocol {
+        return protocol_api.Protocol.from(self, id);
     }
 
     pub fn invoke(
-        self: *OpenAiCompatible,
+        _: *const OpenAiCompatible,
         result_allocator: std.mem.Allocator,
         scratch_allocator: std.mem.Allocator,
         io: std.Io,
+        invocation: protocol_api.Invocation,
         identity: message.ModelIdentity,
         request: model_api.ModelRequest,
         delivery: model_api.Delivery,
@@ -58,9 +38,9 @@ pub const OpenAiCompatible = struct {
         };
         const body = try openai_chat.encodeRequest(scratch_allocator, identity.model, request, streaming);
         defer scratch_allocator.free(body);
-        const url = try endpointUrl(scratch_allocator, self.config.base_url);
+        const url = try endpointUrl(scratch_allocator, invocation.base_url);
         defer scratch_allocator.free(url);
-        const authorization = if (self.config.api_key) |key|
+        const authorization = if (invocation.auth.api_key) |key|
             std.fmt.allocPrint(scratch_allocator, "Bearer {s}", .{key}) catch return error.OutOfMemory
         else
             null;
@@ -78,7 +58,8 @@ pub const OpenAiCompatible = struct {
             .name = "authorization",
             .value = value,
         }) catch return error.OutOfMemory;
-        headers.appendSlice(scratch_allocator, self.config.headers) catch return error.OutOfMemory;
+        headers.appendSlice(scratch_allocator, invocation.headers) catch return error.OutOfMemory;
+        headers.appendSlice(scratch_allocator, invocation.auth.headers) catch return error.OutOfMemory;
 
         const transport_request: transport_api.Request = .{
             .method = .POST,
@@ -91,7 +72,7 @@ pub const OpenAiCompatible = struct {
 
         return switch (delivery) {
             .buffered => complete: {
-                const response = self.transport.exchange(
+                const response = invocation.transport.exchange(
                     scratch_allocator,
                     io,
                     transport_request,
@@ -114,7 +95,7 @@ pub const OpenAiCompatible = struct {
                     sink,
                 );
                 defer decoder.deinit();
-                _ = self.transport.exchange(
+                _ = invocation.transport.exchange(
                     scratch_allocator,
                     io,
                     transport_request,

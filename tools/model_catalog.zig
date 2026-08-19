@@ -13,6 +13,7 @@ const Source = struct {
 const SourceEntry = struct {
     provider_id: []const u8,
     model_id: []const u8,
+    protocol_id: []const u8,
     aliases: []const []const u8 = &.{},
     source_url: []const u8,
     profile: SourceProfile,
@@ -136,6 +137,7 @@ fn validateSource(allocator: std.mem.Allocator, source: Source) !void {
         try validateOrderedEnums(settings.ReasoningEffort, entry.profile.reasoning_efforts);
         entries[index] = .{
             .identity = .{ .provider = entry.provider_id, .model = entry.model_id },
+            .protocol_id = entry.protocol_id,
             .aliases = entry.aliases,
             .source_url = entry.source_url,
             .profile = profileFromSource(entry.profile),
@@ -182,6 +184,7 @@ fn writeEntry(writer: *std.Io.Writer, entry: SourceEntry) !void {
         "    .{{\n        .identity = .{{ .provider = \"{f}\", .model = \"{f}\" }},\n",
         .{ std.zig.fmtString(entry.provider_id), std.zig.fmtString(entry.model_id) },
     );
+    try writer.print("        .protocol_id = \"{f}\",\n", .{std.zig.fmtString(entry.protocol_id)});
     try writer.writeAll("        .aliases = &.{");
     if (entry.aliases.len > 1) try writer.writeByte(' ');
     for (entry.aliases, 0..) |alias, index| {
@@ -246,6 +249,7 @@ test "generator is deterministic and validates source ordering" {
         \\  "entries": [{
         \\    "provider_id": "test",
         \\    "model_id": "model",
+        \\    "protocol_id": "test-protocol",
         \\    "aliases": ["alias"],
         \\    "source_url": "https://example.test/model",
         \\    "profile": {
@@ -296,6 +300,7 @@ test "generator releases every allocation" {
         \\  "entries": [{
         \\    "provider_id": "test",
         \\    "model_id": "model",
+        \\    "protocol_id": "test-protocol",
         \\    "source_url": "https://example.test/model",
         \\    "profile": {}
         \\  }]

@@ -1,12 +1,11 @@
 const std = @import("std");
 const ai_catalog = @import("../ai/model_catalog.zig");
 const ai_model = @import("../ai/model.zig");
-const ai_provider = @import("../ai/provider.zig");
+const ai_models = @import("../ai/Models.zig");
+const ai_protocol = @import("../ai/protocol.zig");
+const ai_protocols = @import("../ai/protocols/root.zig");
 const ai_settings = @import("../ai/settings.zig");
 const ai_transport = @import("../ai/transport.zig");
-const compatible = @import("../ai/providers/openai_compatible.zig");
-const codex = @import("../ai/providers/openai_codex.zig");
-const responses = @import("../ai/providers/openai_responses.zig");
 const agent_limits = @import("../agent/limits.zig");
 const AgentSession = @import("AgentSession.zig");
 const ModelConfig = @import("ModelConfig.zig");
@@ -20,7 +19,7 @@ const model_resolution = @import("ModelResolution.zig");
 const AgentSessionRuntime = @This();
 const max_credentials = 32;
 
-pub const Credential = model_resolution.Credential;
+pub const Credential = model_resolution.StoredCredential;
 pub const Config = model_resolution.RuntimeConfig;
 
 pub const Options = struct {
@@ -48,139 +47,6 @@ pub const DurableCreateError = error{
     SessionTooLarge,
 };
 
-const ProviderStorage = union(enum) {
-    openai_completions: compatible.OpenAiCompatible,
-    openai_responses: responses.OpenAiResponses,
-    openai_codex_responses: codex.OpenAiCodex,
-
-    fn view(self: *ProviderStorage) ai_provider.Provider {
-        return switch (self.*) {
-            .openai_completions => |*provider| provider.provider(),
-            .openai_responses => |*provider| provider.provider(),
-            .openai_codex_responses => |*provider| provider.provider(),
-        };
-    }
-};
-
-const ModelRuntime = struct {
-    arena: std.heap.ArenaAllocator,
-    registry: ai_provider.Registry,
-    catalog: ai_catalog.Catalog,
-    providers: []ProviderStorage,
-    sensitive: [][]u8,
-    sensitive_count: usize,
-    model_value: ai_model.Model,
-
-    const InitError = error{ OutOfMemory, InvalidModelConfiguration };
-
-    fn init(
-        self: *ModelRuntime,
-        allocator: std.mem.Allocator,
-        transport: ai_transport.Transport,
-        config: Config,
-    ) InitError!void {
-        try validateConfig(config);
-        self.arena = std.heap.ArenaAllocator.init(allocator);
-        errdefer self.arena.deinit();
-        self.registry = ai_provider.Registry.init(allocator);
-        errdefer self.registry.deinit();
-
-        const owned = self.arena.allocator();
-        self.catalog = try copyCatalog(owned, config.model_config.catalog);
-        self.providers = try owned.alloc(ProviderStorage, config.model_config.providers.len);
-        self.sensitive = try owned.alloc([]u8, config.credentials.len * 2);
-        self.sensitive_count = 0;
-        errdefer self.wipeSensitive();
-        var provider_count: usize = 0;
-        for (config.model_config.providers) |provider| {
-            switch (provider) {
-                .openai_completions => |definition| {
-                    const api_key = switch (definition.authentication) {
-                        .none => null,
-                        .api_key => key: {
-                            const value = findApiKey(config.credentials, definition.id) orelse continue;
-                            break :key try self.copySensitive(value);
-                        },
-                    };
-                    self.providers[provider_count] = .{
-                        .openai_completions = compatible.OpenAiCompatible.init(transport, .{
-                            .provider_id = try owned.dupe(u8, definition.id),
-                            .catalog = self.catalog,
-                            .base_url = try owned.dupe(u8, definition.base_url),
-                            .api_key = api_key,
-                        }),
-                    };
-                },
-                .openai_responses => |definition| {
-                    const api_key = switch (definition.authentication) {
-                        .none => null,
-                        .api_key => key: {
-                            const value = findApiKey(config.credentials, definition.id) orelse continue;
-                            break :key try self.copySensitive(value);
-                        },
-                    };
-                    self.providers[provider_count] = .{
-                        .openai_responses = responses.OpenAiResponses.init(transport, .{
-                            .provider_id = try owned.dupe(u8, definition.id),
-                            .catalog = self.catalog,
-                            .base_url = try owned.dupe(u8, definition.base_url),
-                            .api_key = api_key,
-                        }),
-                    };
-                },
-                .openai_codex_responses => |definition| {
-                    const credential = findCodexCredential(config.credentials) orelse continue;
-                    self.providers[provider_count] = .{
-                        .openai_codex_responses = codex.OpenAiCodex.init(transport, .{
-                            .catalog = self.catalog,
-                            .base_url = try owned.dupe(u8, definition.base_url),
-                            .access_token = try self.copySensitive(credential.access_token),
-                            .account_id = if (credential.account_id) |account_id|
-                                try self.copySensitive(account_id)
-                            else
-                                null,
-                        }),
-                    };
-                },
-            }
-            self.registry.register(self.providers[provider_count].view()) catch |failure| switch (failure) {
-                error.OutOfMemory => return error.OutOfMemory,
-                error.DuplicateProvider, error.InvalidProvider => return error.InvalidModelConfiguration,
-            };
-            provider_count += 1;
-        }
-        self.providers = self.providers[0..provider_count];
-        self.model_value = self.resolve(config.selection) orelse return error.InvalidModelConfiguration;
-    }
-
-    fn resolve(self: *const ModelRuntime, selection: ai_model.ModelIdentity) ?ai_model.Model {
-        const resolved = self.catalog.resolve(selection) orelse return null;
-        return self.registry.resolve(resolved.entry.identity);
-    }
-
-    fn model(self: *const ModelRuntime) ai_model.Model {
-        return self.model_value;
-    }
-
-    fn deinit(self: *ModelRuntime) void {
-        self.wipeSensitive();
-        self.registry.deinit();
-        self.arena.deinit();
-        self.* = undefined;
-    }
-
-    fn copySensitive(self: *ModelRuntime, value: []const u8) error{OutOfMemory}![]u8 {
-        const copied = try self.arena.allocator().dupe(u8, value);
-        self.sensitive[self.sensitive_count] = copied;
-        self.sensitive_count += 1;
-        return copied;
-    }
-
-    fn wipeSensitive(self: *ModelRuntime) void {
-        for (self.sensitive[0..self.sensitive_count]) |value| std.crypto.secureZero(u8, value);
-    }
-};
-
 const TransportOwner = union(enum) {
     http: ai_transport.HttpTransport,
     borrowed: ai_transport.Transport,
@@ -195,7 +61,7 @@ const TransportOwner = union(enum) {
 
 allocator: std.mem.Allocator,
 transport: TransportOwner,
-model_runtime: ModelRuntime,
+model_runtime: ai_models,
 session_value: AgentSession,
 
 pub fn create(
@@ -306,7 +172,20 @@ fn initialize(
     config: Config,
     options: Options,
 ) CreateError!void {
-    try self.model_runtime.init(self.allocator, self.transport.view(), config);
+    self.model_runtime = ai_models.init(
+        self.allocator,
+        self.transport.view(),
+        ai_protocol.Registry.init(&ai_protocols.builtin) catch return error.InvalidModelConfiguration,
+        .{
+            .catalog = config.model_config.catalog,
+            .providers = config.model_config.providers,
+            .credentials = config.credentials,
+            .selection = config.selection,
+        },
+    ) catch |failure| return switch (failure) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.InvalidConfiguration => error.InvalidModelConfiguration,
+    };
     errdefer self.model_runtime.deinit();
     self.session_value = try AgentSession.init(
         self.allocator,
@@ -354,94 +233,6 @@ fn initializeDurable(
     self.session_value.commit_owner = commit_owner;
 }
 
-fn validateConfig(config: Config) error{InvalidModelConfiguration}!void {
-    config.model_config.validate() catch return error.InvalidModelConfiguration;
-    if (config.credentials.len > max_credentials) return error.InvalidModelConfiguration;
-    for (config.credentials, 0..) |credential, index| {
-        switch (credential) {
-            .api_key => |api_key| {
-                if (api_key.provider_id.len == 0 or api_key.value.len == 0) {
-                    return error.InvalidModelConfiguration;
-                }
-                const provider = config.model_config.findProvider(api_key.provider_id) orelse
-                    return error.InvalidModelConfiguration;
-                const accepts_api_key = switch (provider.*) {
-                    .openai_completions, .openai_responses => |definition| switch (definition.authentication) {
-                        .none => false,
-                        .api_key => true,
-                    },
-                    .openai_codex_responses => false,
-                };
-                if (!accepts_api_key) return error.InvalidModelConfiguration;
-            },
-            .openai_codex => |openai_codex| {
-                if (openai_codex.access_token.len == 0) return error.InvalidModelConfiguration;
-                if (openai_codex.account_id) |account_id| {
-                    if (account_id.len == 0) return error.InvalidModelConfiguration;
-                }
-                const provider = config.model_config.findProvider("openai-codex") orelse
-                    return error.InvalidModelConfiguration;
-                if (provider.* != .openai_codex_responses) return error.InvalidModelConfiguration;
-            },
-        }
-        for (config.credentials[0..index]) |previous| {
-            if (std.mem.eql(u8, previous.providerId(), credential.providerId())) {
-                return error.InvalidModelConfiguration;
-            }
-        }
-    }
-    const selected = config.model_config.resolve(config.selection) orelse
-        return error.InvalidModelConfiguration;
-    const provider = config.model_config.findProvider(selected.providerId()).?;
-    if (!providerAvailable(provider.*, config.credentials)) return error.InvalidModelConfiguration;
-}
-
-fn providerAvailable(provider: ModelConfig.ProviderDefinition, credentials: []const Credential) bool {
-    return switch (provider) {
-        .openai_completions, .openai_responses => |definition| switch (definition.authentication) {
-            .none => true,
-            .api_key => findApiKey(credentials, definition.id) != null,
-        },
-        .openai_codex_responses => findCodexCredential(credentials) != null,
-    };
-}
-
-fn findApiKey(credentials: []const Credential, provider_id: []const u8) ?[]const u8 {
-    for (credentials) |credential| switch (credential) {
-        .api_key => |api_key| if (std.mem.eql(u8, api_key.provider_id, provider_id)) return api_key.value,
-        .openai_codex => {},
-    };
-    return null;
-}
-
-fn findCodexCredential(credentials: []const Credential) ?Credential.OpenAiCodex {
-    for (credentials) |credential| switch (credential) {
-        .api_key => {},
-        .openai_codex => |openai_codex| return openai_codex,
-    };
-    return null;
-}
-
-fn copyCatalog(allocator: std.mem.Allocator, source: ai_catalog.Catalog) error{OutOfMemory}!ai_catalog.Catalog {
-    const entries = try allocator.alloc(ai_catalog.Entry, source.entries.len);
-    for (source.entries, 0..) |entry, index| {
-        const aliases = try allocator.alloc([]const u8, entry.aliases.len);
-        for (entry.aliases, 0..) |alias, alias_index| {
-            aliases[alias_index] = try allocator.dupe(u8, alias);
-        }
-        entries[index] = .{
-            .identity = .{
-                .provider = try allocator.dupe(u8, entry.identity.provider),
-                .model = try allocator.dupe(u8, entry.identity.model),
-            },
-            .aliases = aliases,
-            .source_url = if (entry.source_url) |source_url| try allocator.dupe(u8, source_url) else null,
-            .profile = entry.profile,
-        };
-    }
-    return .{ .entries = entries };
-}
-
 const fake_api = @import("../ai/transport/fake.zig");
 
 const test_compatible_profile = profile: {
@@ -467,43 +258,63 @@ const test_codex_profile = profile: {
 const test_catalog_entries = [_]ai_catalog.Entry{
     .{
         .identity = .{ .provider = "runtime-openai", .model = "runtime-model" },
+        .protocol_id = "openai-completions",
         .aliases = &.{"runtime-latest"},
         .profile = test_compatible_profile,
     },
     .{
         .identity = .{ .provider = "openai", .model = "responses-runtime" },
+        .protocol_id = "openai-responses",
         .aliases = &.{"responses-latest"},
         .profile = test_responses_profile,
     },
     .{
         .identity = .{ .provider = "openai-codex", .model = "codex-runtime" },
+        .protocol_id = "openai-codex-responses",
         .profile = test_codex_profile,
     },
 };
 const test_catalog: ai_catalog.Catalog = .{ .entries = &test_catalog_entries };
 const test_provider_definitions = [_]ModelConfig.ProviderDefinition{
-    .{ .openai_completions = .{
+    .{
         .id = "runtime-openai",
         .name = "Runtime OpenAI",
         .base_url = "https://example.test/v1",
-        .authentication = .api_key,
-    } },
-    .{ .openai_responses = .{
+        .auth = .{ .api_key = .{} },
+    },
+    .{
         .id = "openai",
         .name = "OpenAI",
         .base_url = "https://api.openai.com/v1",
-        .authentication = .api_key,
-    } },
-    .{ .openai_codex_responses = .{
+        .auth = .{ .api_key = .{} },
+    },
+    .{
         .id = "openai-codex",
         .name = "OpenAI Codex",
         .base_url = "https://chatgpt.com/backend-api",
-    } },
+        .auth = .{ .oauth = .{} },
+    },
 };
 const test_model_config: ModelConfig = .{
     .catalog = test_catalog,
     .providers = &test_provider_definitions,
 };
+
+fn apiKeyCredential(provider_id: []const u8, key: []const u8) Credential {
+    return .{ .provider_id = provider_id, .credential = .{ .api_key = .{ .key = key } } };
+}
+
+fn oauthCredential(provider_id: []const u8, access: []const u8, account_id: ?[]const u8) Credential {
+    return .{
+        .provider_id = provider_id,
+        .credential = .{ .oauth = .{
+            .access = access,
+            .refresh = "refresh",
+            .expires_at_ms = 1,
+            .account_id = account_id,
+        } },
+    };
+}
 
 const CustomResponsesInspector = struct {
     calls: usize = 0,
@@ -665,7 +476,7 @@ test "runtime owns catalog and provider configuration through a cwd-bound tool l
         \\  "providers": {
         \\    "custom-openai": {
         \\      "baseUrl": "https://example.test/openai/v1",
-        \\      "api": "openai-responses",
+        \\      "protocol": "openai-responses",
         \\      "models": [{
         \\        "id": "custom-reasoning-model",
         \\        "reasoning": true,
@@ -790,10 +601,7 @@ test "durable runtime commits a FakeTransport tool loop before publishing histor
     };
     var fake = fake_api.FakeTransport.init(&exchanges);
     var sources: DurableSources = .{};
-    const credentials = [_]Credential{.{ .api_key = .{
-        .provider_id = "openai",
-        .value = "responses-secret",
-    } }};
+    const credentials = [_]Credential{apiKeyCredential("openai", "responses-secret")};
     var runtime = try createDurableWithTransport(
         std.testing.allocator,
         std.testing.io,
@@ -862,10 +670,7 @@ test "durable runtime publishes neither a message nor completion event before jo
     var sources: DurableSources = .{};
     var fault: AppendFault = .{ .fail_on_record = 3 };
     var events: DurableEventRecorder = .{};
-    const credentials = [_]Credential{.{ .api_key = .{
-        .provider_id = "openai",
-        .value = "responses-secret",
-    } }};
+    const credentials = [_]Credential{apiKeyCredential("openai", "responses-secret")};
     var runtime = try createDurableWithTransport(
         std.testing.allocator,
         std.testing.io,
@@ -935,10 +740,7 @@ test "durable runtime withholds a tool result and completion event when its comm
     var sources: DurableSources = .{};
     var fault: AppendFault = .{ .fail_on_record = 4 };
     var events: DurableEventRecorder = .{};
-    const credentials = [_]Credential{.{ .api_key = .{
-        .provider_id = "openai",
-        .value = "responses-secret",
-    } }};
+    const credentials = [_]Credential{apiKeyCredential("openai", "responses-secret")};
     var runtime = try createDurableWithTransport(
         std.testing.allocator,
         std.testing.io,
@@ -1020,10 +822,7 @@ test "durable runtime closes a restored open turn before admitting cancellation"
     const exchanges: [0]fake_api.Exchange = .{};
     var fake = fake_api.FakeTransport.init(&exchanges);
     var sources: DurableSources = .{};
-    const credentials = [_]Credential{.{ .api_key = .{
-        .provider_id = "openai",
-        .value = "responses-secret",
-    } }};
+    const credentials = [_]Credential{apiKeyCredential("openai", "responses-secret")};
     var runtime = try createDurableWithTransport(
         std.testing.allocator,
         std.testing.io,
@@ -1125,10 +924,7 @@ test "OpenAI Codex runtime crosses the provider and Responses SSE seams" {
     var fake = fake_api.FakeTransport.init(&exchanges);
     var inspector: CodexInspector = .{};
     fake.inspector = .{ .context = &inspector, .inspect_fn = CodexInspector.inspect };
-    const credentials = [_]Credential{.{ .openai_codex = .{
-        .access_token = "codex-secret",
-        .account_id = "account-runtime",
-    } }};
+    const credentials = [_]Credential{oauthCredential("openai-codex", "codex-secret", "account-runtime")};
 
     var runtime = try createWithTransport(
         std.testing.allocator,
@@ -1154,42 +950,33 @@ test "runtime rejects invalid credentials and unavailable selections before tran
     const exchanges: [0]fake_api.Exchange = .{};
     var fake = fake_api.FakeTransport.init(&exchanges);
     const no_credentials: [0]Credential = .{};
-    const empty_provider_id = [_]Credential{.{ .api_key = .{ .provider_id = "", .value = "key" } }};
-    const empty_api_key = [_]Credential{.{ .api_key = .{ .provider_id = "openai", .value = "" } }};
-    const unknown_provider = [_]Credential{.{ .api_key = .{ .provider_id = "missing", .value = "key" } }};
-    const empty_access_token = [_]Credential{.{ .openai_codex = .{ .access_token = "" } }};
-    const empty_account_id = [_]Credential{.{ .openai_codex = .{
-        .access_token = "token",
-        .account_id = "",
-    } }};
+    const empty_provider_id = [_]Credential{apiKeyCredential("", "key")};
+    const empty_api_key = [_]Credential{apiKeyCredential("openai", "")};
+    const unknown_provider = [_]Credential{apiKeyCredential("missing", "key")};
+    const empty_access_token = [_]Credential{oauthCredential("openai-codex", "", null)};
+    const empty_account_id = [_]Credential{oauthCredential("openai-codex", "token", "")};
     const duplicate_credentials = [_]Credential{
-        .{ .api_key = .{ .provider_id = "openai", .value = "one" } },
-        .{ .api_key = .{ .provider_id = "openai", .value = "two" } },
+        apiKeyCredential("openai", "one"),
+        apiKeyCredential("openai", "two"),
     };
-    const openai_credential = [_]Credential{.{ .api_key = .{
-        .provider_id = "openai",
-        .value = "key",
-    } }};
-    const no_auth_definitions = [_]ModelConfig.ProviderDefinition{.{ .openai_completions = .{
+    const openai_credential = [_]Credential{apiKeyCredential("openai", "key")};
+    const no_auth_definitions = [_]ModelConfig.ProviderDefinition{.{
         .id = "runtime-openai",
         .name = "Runtime OpenAI",
         .base_url = "https://example.test/v1",
-        .authentication = .none,
-    } }};
+        .auth = .{ .allow_unauthenticated = true },
+    }};
     const no_auth_config: ModelConfig = .{
         .catalog = test_catalog,
         .providers = &no_auth_definitions,
     };
-    const unexpected_api_key = [_]Credential{.{ .api_key = .{
-        .provider_id = "runtime-openai",
-        .value = "key",
-    } }};
+    const unexpected_api_key = [_]Credential{apiKeyCredential("runtime-openai", "key")};
     const openai_only_definitions = [_]ModelConfig.ProviderDefinition{test_provider_definitions[1]};
     const openai_only_config: ModelConfig = .{
         .catalog = test_catalog,
         .providers = &openai_only_definitions,
     };
-    const unexpected_codex = [_]Credential{.{ .openai_codex = .{ .access_token = "token" } }};
+    const unexpected_codex = [_]Credential{oauthCredential("openai-codex", "token", null)};
     const cases = [_]Config{
         .{ .model_config = test_model_config, .credentials = &empty_provider_id, .selection = .{
             .provider = "openai",
@@ -1249,12 +1036,9 @@ fn createAndDisposeForAllocationFailure(allocator: std.mem.Allocator, cwd: std.I
     const exchanges: [0]fake_api.Exchange = .{};
     var fake = fake_api.FakeTransport.init(&exchanges);
     const credentials = [_]Credential{
-        .{ .api_key = .{ .provider_id = "runtime-openai", .value = "runtime-secret" } },
-        .{ .api_key = .{ .provider_id = "openai", .value = "responses-secret" } },
-        .{ .openai_codex = .{
-            .access_token = "codex-secret",
-            .account_id = "account-runtime",
-        } },
+        apiKeyCredential("runtime-openai", "runtime-secret"),
+        apiKeyCredential("openai", "responses-secret"),
+        oauthCredential("openai-codex", "codex-secret", "account-runtime"),
     };
     var runtime = try createWithTransport(
         allocator,
@@ -1310,10 +1094,7 @@ fn createDurableForAllocationFailure(
     var sources: DurableSources = .{};
     const exchanges: [0]fake_api.Exchange = .{};
     var fake = fake_api.FakeTransport.init(&exchanges);
-    const credentials = [_]Credential{.{ .api_key = .{
-        .provider_id = "openai",
-        .value = "responses-secret",
-    } }};
+    const credentials = [_]Credential{apiKeyCredential("openai", "responses-secret")};
     var runtime = try createDurableWithTransport(
         allocator,
         std.testing.io,
@@ -1354,11 +1135,8 @@ test "runtime wipes every copied credential and Codex account ID" {
     const exchanges: [0]fake_api.Exchange = .{};
     var fake = fake_api.FakeTransport.init(&exchanges);
     const credentials = [_]Credential{
-        .{ .api_key = .{ .provider_id = "openai", .value = "wipe-openai-secret" } },
-        .{ .openai_codex = .{
-            .access_token = "wipe-codex-secret",
-            .account_id = "wipe-account-runtime",
-        } },
+        apiKeyCredential("openai", "wipe-openai-secret"),
+        oauthCredential("openai-codex", "wipe-codex-secret", "wipe-account-runtime"),
     };
 
     var runtime = try createWithTransport(
@@ -1374,9 +1152,9 @@ test "runtime wipes every copied credential and Codex account ID" {
         .{},
     );
     const sensitive = runtime.model_runtime.sensitive[0..runtime.model_runtime.sensitive_count];
-    try std.testing.expectEqual(@as(usize, 3), sensitive.len);
-    var offsets: [3]usize = undefined;
-    var lengths: [3]usize = undefined;
+    try std.testing.expectEqual(@as(usize, 4), sensitive.len);
+    var offsets: [4]usize = undefined;
+    var lengths: [4]usize = undefined;
     for (sensitive, 0..) |value, index| {
         offsets[index] = @intFromPtr(value.ptr) - @intFromPtr(backing.ptr);
         lengths[index] = value.len;
@@ -1390,10 +1168,7 @@ test "runtime wipes every copied credential and Codex account ID" {
 test "production runtime uses built-in model configuration without model IO" {
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();
-    const credentials = [_]Credential{.{ .api_key = .{
-        .provider_id = "openai",
-        .value = "runtime-secret",
-    } }};
+    const credentials = [_]Credential{apiKeyCredential("openai", "runtime-secret")};
     var runtime = try create(
         std.testing.allocator,
         std.testing.io,

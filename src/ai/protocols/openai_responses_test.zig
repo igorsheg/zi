@@ -3,6 +3,8 @@ const fake_api = @import("../transport/fake.zig");
 const message = @import("../message.zig");
 const model_catalog = @import("../model_catalog.zig");
 const openai_responses = @import("../protocol/openai_responses.zig");
+const protocol_api = @import("../protocol.zig");
+const provider_api = @import("../provider.zig");
 const responses = @import("openai_responses.zig");
 const settings = @import("../settings.zig");
 const transport = @import("../transport.zig");
@@ -19,10 +21,28 @@ const profile = profile: {
 };
 const catalog_entries = [_]model_catalog.Entry{.{
     .identity = .{ .provider = "openai", .model = "gpt-test" },
+    .protocol_id = "openai-responses",
     .aliases = &.{"latest"},
     .profile = profile,
 }};
 const catalog: model_catalog.Catalog = .{ .entries = &catalog_entries };
+const protocol_implementation: responses.OpenAiResponses = .{};
+const protocols = [_]protocol_api.Protocol{protocol_implementation.protocol()};
+
+fn makeProvider(transport_value: transport.Transport, api_key: ?[]const u8) provider_api.Configured {
+    return .{
+        .transport = transport_value,
+        .protocols = protocol_api.Registry.init(&protocols) catch unreachable,
+        .catalog = catalog,
+        .definition = .{
+            .id = "openai",
+            .name = "OpenAI",
+            .base_url = "https://api.openai.com/v1",
+            .auth = .{ .api_key = .{}, .allow_unauthenticated = true },
+        },
+        .auth_inputs = .{ .explicit_api_key = api_key },
+    };
+}
 
 const Inspector = struct {
     saw_request: bool = false,
@@ -77,12 +97,7 @@ test "OpenAI Responses crosses catalog model protocol and transport seams" {
     var fake = fake_api.FakeTransport.init(&exchanges);
     var inspector: Inspector = .{};
     fake.inspector = .{ .context = &inspector, .inspect_fn = Inspector.inspect };
-    var provider = responses.OpenAiResponses.init(fake.transport(), .{
-        .provider_id = "openai",
-        .catalog = catalog,
-        .api_key = "secret",
-        .base_url = "https://api.openai.com/v1",
-    });
+    var provider = makeProvider(fake.transport(), "secret");
     const request_parts = [_]message.RequestPart{.{ .user = .{ .text = "hello" } }};
     const messages = [_]message.Message{.{ .request = .{ .parts = &request_parts } }};
     const tools = [_]message.ToolDefinition{.{
@@ -153,11 +168,7 @@ test "Responses decoder accepts response done without misdirecting index-less de
     ;
     const exchanges = [_]fake_api.Exchange{.{ .response = .{ .status = 200, .body = response } }};
     var fake = fake_api.FakeTransport.init(&exchanges);
-    var provider = responses.OpenAiResponses.init(fake.transport(), .{
-        .provider_id = "openai",
-        .catalog = catalog,
-        .base_url = "https://api.openai.com/v1",
-    });
+    var provider = makeProvider(fake.transport(), null);
     var result = try provider.model("gpt-test").?.complete(
         std.testing.allocator,
         std.testing.io,
@@ -188,11 +199,7 @@ test "Responses decoder retains reasoning refusal and terminal encrypted state" 
     ;
     const exchanges = [_]fake_api.Exchange{.{ .response = .{ .status = 200, .body = response } }};
     var fake = fake_api.FakeTransport.init(&exchanges);
-    var provider = responses.OpenAiResponses.init(fake.transport(), .{
-        .provider_id = "openai",
-        .catalog = catalog,
-        .base_url = "https://api.openai.com/v1",
-    });
+    var provider = makeProvider(fake.transport(), null);
     var result = try provider.model("gpt-test").?.complete(
         std.testing.allocator,
         std.testing.io,
@@ -223,11 +230,7 @@ test "Responses decoder rejects provider error events" {
     for (failures) |response| {
         const exchanges = [_]fake_api.Exchange{.{ .response = .{ .status = 200, .body = response } }};
         var fake = fake_api.FakeTransport.init(&exchanges);
-        var provider = responses.OpenAiResponses.init(fake.transport(), .{
-            .provider_id = "openai",
-            .catalog = catalog,
-            .base_url = "https://api.openai.com/v1",
-        });
+        var provider = makeProvider(fake.transport(), null);
         try std.testing.expectError(
             error.InvalidProviderResponse,
             provider.model("gpt-test").?.complete(std.testing.allocator, std.testing.io, .{ .messages = &.{} }),
@@ -242,11 +245,7 @@ test "Responses decoder rejects provider error events" {
         .response = .{ .status = 200, .body = cancelled },
     }};
     var fake = fake_api.FakeTransport.init(&cancelled_exchanges);
-    var provider = responses.OpenAiResponses.init(fake.transport(), .{
-        .provider_id = "openai",
-        .catalog = catalog,
-        .base_url = "https://api.openai.com/v1",
-    });
+    var provider = makeProvider(fake.transport(), null);
     try std.testing.expectError(
         error.Cancelled,
         provider.model("gpt-test").?.complete(std.testing.allocator, std.testing.io, .{ .messages = &.{} }),
@@ -262,11 +261,7 @@ test "Responses decoder rejects an output index reused with another part kind" {
     ;
     const exchanges = [_]fake_api.Exchange{.{ .response = .{ .status = 200, .body = response } }};
     var fake = fake_api.FakeTransport.init(&exchanges);
-    var provider = responses.OpenAiResponses.init(fake.transport(), .{
-        .provider_id = "openai",
-        .catalog = catalog,
-        .base_url = "https://api.openai.com/v1",
-    });
+    var provider = makeProvider(fake.transport(), null);
 
     try std.testing.expectError(
         error.InvalidProviderResponse,

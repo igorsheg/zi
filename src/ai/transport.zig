@@ -18,6 +18,7 @@ pub const Request = struct {
     url: []const u8,
     headers: []const Header = &.{},
     body: []const u8 = "",
+    content_type: ?[]const u8 = "application/json",
     max_response_bytes: usize = 8 * 1024 * 1024,
     deadline: ?std.Io.Clock.Timestamp = null,
     cancellation: ?*const model.CancellationToken = null,
@@ -169,7 +170,10 @@ pub const HttpTransport = struct {
         var http_request = client.request(httpMethod(request_value.method), uri, .{
             .redirect_behavior = .unhandled,
             .headers = .{
-                .content_type = .{ .override = "application/json" },
+                .content_type = if (request_value.content_type) |value|
+                    .{ .override = value }
+                else
+                    .omit,
                 .accept_encoding = .omit,
             },
             .extra_headers = headers.items,

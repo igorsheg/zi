@@ -6,6 +6,7 @@ const settings = model_settings;
 pub const Error = error{
     InvalidProviderId,
     InvalidModelId,
+    InvalidProtocolId,
     InvalidAlias,
     InvalidSource,
     InvalidProfile,
@@ -14,6 +15,7 @@ pub const Error = error{
 
 pub const Entry = struct {
     identity: message.ModelIdentity,
+    protocol_id: []const u8,
     aliases: []const []const u8 = &.{},
     source_url: ?[]const u8 = null,
     profile: settings.ModelProfile,
@@ -76,6 +78,7 @@ pub const Catalog = struct {
 fn validateEntry(entry: Entry) Error!void {
     if (!validIdentifier(entry.identity.provider)) return error.InvalidProviderId;
     if (!validIdentifier(entry.identity.model)) return error.InvalidModelId;
+    if (!validIdentifier(entry.protocol_id)) return error.InvalidProtocolId;
     if (entry.source_url) |source_url| {
         if (source_url.len == 0 or std.mem.indexOfAny(u8, source_url, "\r\n\x00") != null) {
             return error.InvalidSource;
@@ -126,12 +129,14 @@ test "catalog resolves canonical IDs and provider-scoped aliases" {
     const entries = [_]Entry{
         .{
             .identity = .{ .provider = "openai", .model = "model-one" },
+            .protocol_id = "protocol-one",
             .aliases = &.{"latest"},
             .source_url = "https://example.test/model-one",
             .profile = .{ .context_window = 100, .max_output_tokens = 20 },
         },
         .{
             .identity = .{ .provider = "other", .model = "model-one" },
+            .protocol_id = "protocol-two",
             .aliases = &.{"latest"},
             .profile = .{},
         },
@@ -154,7 +159,11 @@ test "catalog resolves canonical IDs and provider-scoped aliases" {
 }
 
 test "catalog rejects invalid identity aliases source and profile" {
-    const valid: Entry = .{ .identity = .{ .provider = "provider", .model = "model" }, .profile = .{} };
+    const valid: Entry = .{
+        .identity = .{ .provider = "provider", .model = "model" },
+        .protocol_id = "protocol",
+        .profile = .{},
+    };
     var entry = valid;
     entry.identity.provider = "";
     try std.testing.expectError(error.InvalidProviderId, Catalog.init(&.{entry}));
@@ -175,6 +184,7 @@ test "catalog rejects invalid identity aliases source and profile" {
         valid,
         .{
             .identity = .{ .provider = "provider", .model = "other" },
+            .protocol_id = "protocol",
             .aliases = &.{"model"},
             .profile = .{},
         },

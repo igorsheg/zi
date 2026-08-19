@@ -60,8 +60,8 @@ pub const Inputs = struct {
     requested_provider: ?[]const u8 = null,
     requested_model: ?[]const u8 = null,
     cli_api_key: ?[]const u8 = null,
-    stored_credentials: []const ModelResolution.Credential = &.{},
-    openai_environment_api_key: ?[]const u8 = null,
+    stored_credentials: []const ModelResolution.StoredCredential = &.{},
+    environment: ai.auth.Environment = .{},
     options: AgentSessionRuntime.Options = .{},
 };
 
@@ -149,7 +149,7 @@ fn createOwned(
         .requested_model = requested.model,
         .cli_api_key = inputs.cli_api_key,
         .stored_credentials = inputs.stored_credentials,
-        .openai_environment_api_key = inputs.openai_environment_api_key,
+        .environment = inputs.environment,
     });
     errdefer resolved.deinit();
 
@@ -239,7 +239,7 @@ const TestSources = struct {
 
 const custom_models =
     // ziglint-ignore: Z024 -- compact external JSON fixture
-    \\{"providers":{"custom-openai":{"baseUrl":"https://example.test/openai/v1","api":"openai-responses","models":[{"id":"model-a"},{"id":"model-b"}]}}}
+    \\{"providers":{"custom-openai":{"baseUrl":"https://example.test/openai/v1","protocol":"openai-responses","models":[{"id":"model-a"},{"id":"model-b"}]}}}
 ;
 
 fn temporaryPath(temporary: *std.testing.TmpDir, buffer: []u8) ![]const u8 {

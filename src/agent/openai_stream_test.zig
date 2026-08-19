@@ -1,11 +1,14 @@
 const std = @import("std");
 const Agent = @import("Agent.zig");
 const agent_testing = @import("testing.zig");
+const credential = @import("../ai/credential.zig");
 const ai_stream = @import("../ai/stream.zig");
-const compatible = @import("../ai/providers/openai_compatible.zig");
-const codex = @import("../ai/providers/openai_codex.zig");
+const compatible = @import("../ai/protocols/openai_compatible.zig");
+const codex = @import("../ai/protocols/openai_codex.zig");
 const fake_api = @import("../ai/transport/fake.zig");
 const model_catalog = @import("../ai/model_catalog.zig");
+const protocol_api = @import("../ai/protocol.zig");
+const provider_api = @import("../ai/provider.zig");
 const settings = @import("../ai/settings.zig");
 const transport = @import("../ai/transport.zig");
 
@@ -23,13 +26,24 @@ const codex_profile = profile: {
     break :profile value;
 };
 const catalog_entries = [_]model_catalog.Entry{
-    .{ .identity = .{ .provider = "openai", .model = "gpt-4.1" }, .profile = compatible_profile },
+    .{
+        .identity = .{ .provider = "openai", .model = "gpt-4.1" },
+        .protocol_id = "openai-completions",
+        .profile = compatible_profile,
+    },
     .{
         .identity = .{ .provider = "openai-codex", .model = "gpt-5.1-codex" },
+        .protocol_id = "openai-codex-responses",
         .profile = codex_profile,
     },
 };
 const catalog: model_catalog.Catalog = .{ .entries = &catalog_entries };
+const compatible_protocol: compatible.OpenAiCompatible = .{};
+const codex_protocol: codex.OpenAiCodex = .{};
+const protocols = [_]protocol_api.Protocol{
+    compatible_protocol.protocol(),
+    codex_protocol.protocol(),
+};
 
 const StreamRecorder = struct {
     count: usize = 0,
@@ -186,12 +200,18 @@ test "Agent streams an OpenAI Chat tool loop through the production provider sea
     var fake = fake_api.FakeTransport.init(&exchanges);
     var inspector: OpenAiInspector = .{};
     fake.inspector = .{ .context = &inspector, .inspect_fn = OpenAiInspector.inspect };
-    var provider = compatible.OpenAiCompatible.init(fake.transport(), .{
-        .provider_id = "openai",
+    var provider: provider_api.Configured = .{
+        .transport = fake.transport(),
+        .protocols = protocol_api.Registry.init(&protocols) catch unreachable,
         .catalog = catalog,
-        .base_url = "https://api.openai.com/v1",
-        .api_key = "secret",
-    });
+        .definition = .{
+            .id = "openai",
+            .name = "OpenAI",
+            .base_url = "https://api.openai.com/v1",
+            .auth = .{ .api_key = .{} },
+        },
+        .auth_inputs = .{ .explicit_api_key = "secret" },
+    };
     var scripted_tool: agent_testing.ScriptedTool = .{ .result = "file contents" };
     const tool = scripted_tool.asTool(.{
         .name = "read",
@@ -261,11 +281,27 @@ test "Agent streams an OpenAI Codex Responses tool loop through the production p
     var fake = fake_api.FakeTransport.init(&exchanges);
     var inspector: CodexInspector = .{};
     fake.inspector = .{ .context = &inspector, .inspect_fn = CodexInspector.inspect };
-    var provider = codex.OpenAiCodex.init(fake.transport(), .{
+    const credentials = [_]credential.Entry{.{
+        .provider_id = "openai-codex",
+        .credential = .{ .oauth = .{
+            .access = "token",
+            .refresh = "refresh",
+            .expires_at_ms = 1,
+            .account_id = "acc_test",
+        } },
+    }};
+    var provider: provider_api.Configured = .{
+        .transport = fake.transport(),
+        .protocols = protocol_api.Registry.init(&protocols) catch unreachable,
         .catalog = catalog,
-        .access_token = "token",
-        .account_id = "acc_test",
-    });
+        .definition = .{
+            .id = "openai-codex",
+            .name = "OpenAI Codex",
+            .base_url = "https://chatgpt.com/backend-api",
+            .auth = .{ .oauth = .{} },
+        },
+        .auth_inputs = .{ .stored = &credentials },
+    };
     var scripted_tool: agent_testing.ScriptedTool = .{ .result = "file contents" };
     const tool = scripted_tool.asTool(.{
         .name = "read",

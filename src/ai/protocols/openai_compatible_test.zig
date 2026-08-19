@@ -5,6 +5,8 @@ const stream = @import("../stream.zig");
 const transport = @import("../transport.zig");
 const message = @import("../message.zig");
 const model_catalog = @import("../model_catalog.zig");
+const protocol_api = @import("../protocol.zig");
+const provider_api = @import("../provider.zig");
 const settings = @import("../settings.zig");
 
 const profile = profile: {
@@ -15,9 +17,27 @@ const profile = profile: {
 };
 const catalog_entries = [_]model_catalog.Entry{.{
     .identity = .{ .provider = "openai-compatible", .model = "local-model" },
+    .protocol_id = "openai-completions",
     .profile = profile,
 }};
 const catalog: model_catalog.Catalog = .{ .entries = &catalog_entries };
+const protocol_implementation: compatible.OpenAiCompatible = .{};
+const protocols = [_]protocol_api.Protocol{protocol_implementation.protocol()};
+
+fn makeProvider(transport_value: transport.Transport, api_key: ?[]const u8) provider_api.Configured {
+    return .{
+        .transport = transport_value,
+        .protocols = protocol_api.Registry.init(&protocols) catch unreachable,
+        .catalog = catalog,
+        .definition = .{
+            .id = "openai-compatible",
+            .name = "OpenAI Compatible",
+            .base_url = "https://example.test/v1",
+            .auth = .{ .api_key = .{}, .allow_unauthenticated = true },
+        },
+        .auth_inputs = .{ .explicit_api_key = api_key },
+    };
+}
 
 const RequestInspector = struct {
     saw_request: bool = false,
@@ -49,12 +69,7 @@ test "OpenAI-compatible buffered invocation crosses model and transport seams" {
     var fake = fake_api.FakeTransport.init(&exchanges);
     var inspector: RequestInspector = .{};
     fake.inspector = .{ .context = &inspector, .inspect_fn = RequestInspector.inspect };
-    var provider = compatible.OpenAiCompatible.init(fake.transport(), .{
-        .provider_id = "openai-compatible",
-        .catalog = catalog,
-        .base_url = "https://example.test/v1",
-        .api_key = "secret",
-    });
+    var provider = makeProvider(fake.transport(), "secret");
     const request_parts = [_]message.RequestPart{.{ .user = .{ .text = "hello" } }};
     const messages = [_]message.Message{.{ .request = .{ .parts = &request_parts } }};
 
@@ -109,11 +124,7 @@ test "OpenAI-compatible SSE preserves text and indexed tool calls" {
     ;
     const exchanges = [_]fake_api.Exchange{.{ .response = .{ .status = 200, .body = body, .chunk_bytes = 17 } }};
     var fake = fake_api.FakeTransport.init(&exchanges);
-    var provider = compatible.OpenAiCompatible.init(fake.transport(), .{
-        .provider_id = "openai-compatible",
-        .catalog = catalog,
-        .base_url = "https://example.test/v1",
-    });
+    var provider = makeProvider(fake.transport(), null);
     var collector: EventCollector = .{};
     defer collector.text.deinit(std.testing.allocator);
     defer collector.tool_arguments.deinit(std.testing.allocator);
@@ -146,11 +157,7 @@ test "OpenAI-compatible preserves application stream stop" {
         .body = body,
     } }};
     var fake = fake_api.FakeTransport.init(&exchanges);
-    var provider = compatible.OpenAiCompatible.init(fake.transport(), .{
-        .provider_id = "openai-compatible",
-        .catalog = catalog,
-        .base_url = "https://example.test/v1",
-    });
+    var provider = makeProvider(fake.transport(), null);
     const StopSink = struct {
         fn emit(_: *anyopaque, _: stream.StreamEvent) stream.StreamSinkError!void {
             return error.ConsumerStopped;
@@ -170,11 +177,7 @@ test "OpenAI-compatible preserves application stream stop" {
 test "OpenAI-compatible rejects foreign provider state before transport" {
     const exchanges: [0]fake_api.Exchange = .{};
     var fake = fake_api.FakeTransport.init(&exchanges);
-    var provider = compatible.OpenAiCompatible.init(fake.transport(), .{
-        .provider_id = "openai-compatible",
-        .catalog = catalog,
-        .base_url = "https://example.test/v1",
-    });
+    var provider = makeProvider(fake.transport(), null);
     const response_parts = [_]message.ResponsePart{.{ .thinking = .{
         .text = "thought",
         .provider_state = .{

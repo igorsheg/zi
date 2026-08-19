@@ -3,7 +3,10 @@ const codex = @import("openai_codex.zig");
 const fake_api = @import("../transport/fake.zig");
 const message = @import("../message.zig");
 const model_catalog = @import("../model_catalog.zig");
+const credential = @import("../credential.zig");
 const openai_responses = @import("../protocol/openai_responses.zig");
+const protocol_api = @import("../protocol.zig");
+const provider_api = @import("../provider.zig");
 const settings = @import("../settings.zig");
 const transport = @import("../transport.zig");
 
@@ -16,9 +19,39 @@ const profile = profile: {
 };
 const catalog_entries = [_]model_catalog.Entry{.{
     .identity = .{ .provider = "openai-codex", .model = "gpt-5.1-codex" },
+    .protocol_id = "openai-codex-responses",
     .profile = profile,
 }};
 const catalog: model_catalog.Catalog = .{ .entries = &catalog_entries };
+const protocol_implementation: codex.OpenAiCodex = .{};
+const protocols = [_]protocol_api.Protocol{protocol_implementation.protocol()};
+
+fn makeProvider(
+    transport_value: transport.Transport,
+    credentials: []const credential.Entry,
+) provider_api.Configured {
+    return .{
+        .transport = transport_value,
+        .protocols = protocol_api.Registry.init(&protocols) catch unreachable,
+        .catalog = catalog,
+        .definition = .{
+            .id = "openai-codex",
+            .name = "OpenAI Codex",
+            .base_url = "https://chatgpt.com/backend-api",
+            .auth = .{ .oauth = .{} },
+        },
+        .auth_inputs = .{ .stored = credentials },
+    };
+}
+
+fn testToken(allocator: std.mem.Allocator) ![]u8 {
+    const payload = "{\"https://api.openai.com/auth\":{\"chatgpt_account_id\":\"acc_test\"}}";
+    const encoded_size = std.base64.url_safe_no_pad.Encoder.calcSize(payload.len);
+    const encoded = try allocator.alloc(u8, encoded_size);
+    defer allocator.free(encoded);
+    _ = std.base64.url_safe_no_pad.Encoder.encode(encoded, payload);
+    return std.fmt.allocPrint(allocator, "aaa.{s}.bbb", .{encoded});
+}
 
 const Inspector = struct {
     saw_request: bool = false,
@@ -53,12 +86,7 @@ const Inspector = struct {
 };
 
 test "Codex Responses derives account identity and normalizes SSE" {
-    const payload = "{\"https://api.openai.com/auth\":{\"chatgpt_account_id\":\"acc_test\"}}";
-    const encoded_size = std.base64.url_safe_no_pad.Encoder.calcSize(payload.len);
-    const encoded = try std.testing.allocator.alloc(u8, encoded_size);
-    defer std.testing.allocator.free(encoded);
-    _ = std.base64.url_safe_no_pad.Encoder.encode(encoded, payload);
-    const token = try std.fmt.allocPrint(std.testing.allocator, "aaa.{s}.bbb", .{encoded});
+    const token = try testToken(std.testing.allocator);
     defer std.testing.allocator.free(token);
     const response =
         \\data: {"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"rs_1"}}
@@ -86,10 +114,15 @@ test "Codex Responses derives account identity and normalizes SSE" {
     var fake = fake_api.FakeTransport.init(&exchanges);
     var inspector: Inspector = .{};
     fake.inspector = .{ .context = &inspector, .inspect_fn = Inspector.inspect };
-    var provider = codex.OpenAiCodex.init(fake.transport(), .{
-        .catalog = catalog,
-        .access_token = token,
-    });
+    const credentials = [_]credential.Entry{.{
+        .provider_id = "openai-codex",
+        .credential = .{ .oauth = .{
+            .access = token,
+            .refresh = "refresh",
+            .expires_at_ms = 1,
+        } },
+    }};
+    var provider = makeProvider(fake.transport(), &credentials);
     const request_parts = [_]message.RequestPart{.{ .user = .{ .text = "Say hello" } }};
     const messages = [_]message.Message{.{ .request = .{ .parts = &request_parts } }};
 
@@ -152,11 +185,17 @@ test "Codex Responses accumulates streamed tool arguments" {
         .chunk_bytes = 11,
     } }};
     var fake = fake_api.FakeTransport.init(&exchanges);
-    var provider = codex.OpenAiCodex.init(fake.transport(), .{
-        .catalog = catalog,
-        .access_token = "token",
-        .account_id = "acc_test",
-    });
+    const token = try testToken(std.testing.allocator);
+    defer std.testing.allocator.free(token);
+    const credentials = [_]credential.Entry{.{
+        .provider_id = "openai-codex",
+        .credential = .{ .oauth = .{
+            .access = token,
+            .refresh = "refresh",
+            .expires_at_ms = 1,
+        } },
+    }};
+    var provider = makeProvider(fake.transport(), &credentials);
     const tools = [_]message.ToolDefinition{.{
         .name = "read",
         .description = "Read a path",
