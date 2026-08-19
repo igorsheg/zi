@@ -22,7 +22,101 @@ pub const Error = error{
     ConsumerStopped,
     Rejected,
     InvalidModelConfiguration,
+    AuthenticationUnavailable,
     RefreshUnavailable,
+};
+
+pub const LoginInputs = struct {
+    provider_id: []const u8,
+    method: ai.oauth.LoginMethod,
+    interaction: ai.oauth.Interaction,
+    now_ms: u64,
+};
+
+pub const PersistentResolver = struct {
+    allocator: std.mem.Allocator,
+    paths: ZiPaths,
+    model_config: ModelConfig,
+    selection: ai.ModelIdentity,
+    explicit_api_key: ?[]const u8,
+    environment: ai.auth.Environment,
+    clock_context: *anyopaque,
+    now_ms_fn: *const fn (*anyopaque) u64,
+    current: ?CredentialStore.Snapshot = null,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        cwd: []const u8,
+        home: []const u8,
+        model_config: ModelConfig,
+        selection: ai.ModelIdentity,
+        explicit_api_key: ?[]const u8,
+        environment: ai.auth.Environment,
+        clock_context: *anyopaque,
+        now_ms_fn: *const fn (*anyopaque) u64,
+    ) !*PersistentResolver {
+        const self = try allocator.create(PersistentResolver);
+        errdefer allocator.destroy(self);
+        self.* = .{
+            .allocator = allocator,
+            .paths = try ZiPaths.init(allocator, cwd, home),
+            .model_config = model_config,
+            .selection = selection,
+            .explicit_api_key = explicit_api_key,
+            .environment = environment,
+            .clock_context = clock_context,
+            .now_ms_fn = now_ms_fn,
+        };
+        return self;
+    }
+
+    // Heap destruction follows explicit field invalidation.
+    // ziglint-ignore: Z030
+    pub fn deinit(self: *PersistentResolver) void {
+        const allocator = self.allocator;
+        if (self.current) |*snapshot| snapshot.deinit();
+        self.paths.deinit();
+        self.* = undefined;
+        allocator.destroy(self);
+    }
+
+    pub fn resolver(self: *PersistentResolver) ai.auth.Resolver {
+        return .{ .context = self, .resolve_fn = resolve };
+    }
+
+    // Context leads because this callback implements the erased resolver ABI.
+    // ziglint-ignore: Z023
+    fn resolve(
+        context: *anyopaque,
+        _: std.mem.Allocator, // ziglint-ignore: Z023
+        _: std.mem.Allocator, // ziglint-ignore: Z023
+        io: std.Io, // ziglint-ignore: Z023
+        transport: ai.transport.Transport,
+        policy: ai.auth.ProviderAuth,
+        provider_id: []const u8,
+        _: ai.auth.Inputs,
+    ) anyerror!ai.ModelAuth {
+        const self: *PersistentResolver = @ptrCast(@alignCast(context));
+        if (self.current) |*snapshot| snapshot.deinit();
+        self.current = null;
+        self.current = try loadForRuntime(
+            self.allocator,
+            io,
+            &self.paths,
+            transport,
+            .{
+                .model_config = self.model_config,
+                .selection = self.selection,
+                .explicit_api_key = self.explicit_api_key,
+                .now_ms = self.now_ms_fn(self.clock_context),
+            },
+        );
+        return ai.auth.resolve(policy, provider_id, .{
+            .explicit_api_key = self.explicit_api_key,
+            .stored = self.current.?.entries,
+            .environment = self.environment,
+        });
+    }
 };
 
 pub const Inputs = struct {
@@ -31,6 +125,45 @@ pub const Inputs = struct {
     explicit_api_key: ?[]const u8 = null,
     now_ms: u64,
 };
+
+pub fn login(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    paths: *const ZiPaths,
+    transport: ai.transport.Transport,
+    model_config: ModelConfig,
+    inputs: LoginInputs,
+) Error!void {
+    const provider = model_config.findProvider(inputs.provider_id) orelse
+        return error.InvalidModelConfiguration;
+    const oauth_policy = provider.auth.oauth orelse return error.InvalidModelConfiguration;
+    const authenticator = oauth_policy.authenticator orelse return error.AuthenticationUnavailable;
+    var authenticated = try authenticator.login(
+        allocator,
+        allocator,
+        io,
+        transport,
+        .{
+            .method = inputs.method,
+            .interaction = inputs.interaction,
+            .now_ms = inputs.now_ms,
+        },
+    );
+    defer authenticated.deinit();
+    try CredentialStore.put(allocator, io, paths, .{
+        .provider_id = provider.id,
+        .credential = .{ .oauth = authenticated.credential },
+    });
+}
+
+pub fn logout(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    paths: *const ZiPaths,
+    provider_id: []const u8,
+) Error!bool {
+    return CredentialStore.remove(allocator, io, paths, provider_id);
+}
 
 pub fn loadForRuntime(
     allocator: std.mem.Allocator,
@@ -68,11 +201,9 @@ pub fn loadForRuntime(
         .api_key => return error.InvalidModelConfiguration,
     };
 
-    var scratch = std.heap.ArenaAllocator.init(allocator);
-    defer scratch.deinit();
     var refreshed = try refresher.refresh(
         allocator,
-        scratch.allocator(),
+        allocator,
         io,
         transport,
         .{ .credential = existing, .now_ms = inputs.now_ms },

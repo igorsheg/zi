@@ -10,6 +10,28 @@ const auth_file_name = "auth.json";
 const lock_file_name = ".auth.lock";
 const max_document_bytes = 2 * 1024 * 1024;
 const max_provider_id_bytes = 256;
+const lock_timeout_ms = 2000;
+const lock_poll_ms = 10;
+
+pub const Boundary = enum {
+    after_write,
+    after_file_sync,
+    after_replace,
+};
+
+pub const Faults = struct {
+    context: ?*anyopaque = null,
+    boundary_fn: ?*const fn (*anyopaque, Boundary) anyerror!void = null,
+
+    pub fn none() Faults {
+        return .{};
+    }
+
+    fn boundary(self: Faults, point: Boundary) !void {
+        const function = self.boundary_fn orelse return;
+        return function(self.context.?, point);
+    }
+};
 
 pub const Error = error{
     OutOfMemory,
@@ -52,6 +74,7 @@ pub const Mutation = struct {
     io: std.Io,
     directory: std.Io.Dir,
     lock: std.Io.File,
+    faults: Faults,
 
     pub fn deinit(self: *Mutation) void {
         self.lock.close(self.io);
@@ -83,7 +106,31 @@ pub const Mutation = struct {
         }
         if (replacing == null) updated[cursor] = entry;
 
-        const encoded = try encode(allocator, updated);
+        try self.writeEntries(allocator, updated);
+    }
+
+    pub fn remove(
+        self: *Mutation,
+        allocator: std.mem.Allocator,
+        provider_id: []const u8,
+    ) Error!bool {
+        var current = try self.load(allocator);
+        defer current.deinit();
+        const removing = find(current.entries, provider_id) orelse return false;
+        const updated = try allocator.alloc(credential.Entry, current.entries.len - 1);
+        defer allocator.free(updated);
+        var cursor: usize = 0;
+        for (current.entries, 0..) |entry, index| {
+            if (index == removing) continue;
+            updated[cursor] = entry;
+            cursor += 1;
+        }
+        try self.writeEntries(allocator, updated);
+        return true;
+    }
+
+    fn writeEntries(self: *Mutation, allocator: std.mem.Allocator, entries: []const credential.Entry) Error!void {
+        const encoded = try encode(allocator, entries);
         defer {
             std.crypto.secureZero(u8, encoded);
             allocator.free(encoded);
@@ -94,8 +141,11 @@ pub const Mutation = struct {
         }) catch return error.WriteFailed;
         defer atomic.deinit(self.io);
         atomic.file.writePositionalAll(self.io, encoded, 0) catch return error.WriteFailed;
+        self.faults.boundary(.after_write) catch return error.WriteFailed;
         atomic.file.sync(self.io) catch return error.WriteFailed;
+        self.faults.boundary(.after_file_sync) catch return error.WriteFailed;
         atomic.replace(self.io) catch return error.WriteFailed;
+        self.faults.boundary(.after_replace) catch return error.CommitIndeterminate;
         syncDirectory(self.directory) catch return error.CommitIndeterminate;
     }
 };
@@ -109,17 +159,32 @@ pub fn load(
 }
 
 pub fn beginMutation(io: std.Io, paths: *const ZiPaths) Error!Mutation {
+    return beginMutationWithFaults(io, paths, .none());
+}
+
+fn beginMutationWithFaults(io: std.Io, paths: *const ZiPaths, faults: Faults) Error!Mutation {
     var directory = try openPrivateAgentDirectory(io, paths);
     errdefer directory.close(io);
     const lock = directory.createFile(io, lock_file_name, .{
         .read = true,
         .truncate = false,
-        .lock = .exclusive,
         .permissions = private_file_permissions,
     }) catch return error.LockFailed;
     errdefer lock.close(io);
     try validatePrivateFile(lock.stat(io) catch return error.LockFailed);
-    return .{ .io = io, .directory = directory, .lock = lock };
+    const deadline = std.Io.Clock.Timestamp.fromNow(io, .{
+        .raw = .fromMilliseconds(lock_timeout_ms),
+        .clock = .awake,
+    });
+    while (!(lock.tryLock(io, .exclusive) catch return error.LockFailed)) {
+        if (std.Io.Clock.Timestamp.now(io, .awake).compare(.gte, deadline)) return error.LockFailed;
+        const poll: std.Io.Timeout = .{ .duration = .{
+            .raw = .fromMilliseconds(lock_poll_ms),
+            .clock = .awake,
+        } };
+        poll.sleep(io) catch return error.LockFailed;
+    }
+    return .{ .io = io, .directory = directory, .lock = lock, .faults = faults };
 }
 
 pub fn put(
@@ -131,6 +196,17 @@ pub fn put(
     var mutation = try beginMutation(io, paths);
     defer mutation.deinit();
     return mutation.put(allocator, entry);
+}
+
+pub fn remove(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    paths: *const ZiPaths,
+    provider_id: []const u8,
+) Error!bool {
+    var mutation = try beginMutation(io, paths);
+    defer mutation.deinit();
+    return mutation.remove(allocator, provider_id);
 }
 
 fn loadFile(
@@ -399,6 +475,72 @@ test "credential store atomically inserts and replaces provider credentials" {
     );
     defer std.testing.allocator.free(encoded);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "first-secret") == null);
+
+    try std.testing.expect(try remove(
+        std.testing.allocator,
+        std.testing.io,
+        &paths,
+        "provider-a",
+    ));
+    try std.testing.expect(!try remove(
+        std.testing.allocator,
+        std.testing.io,
+        &paths,
+        "provider-a",
+    ));
+    var after_remove = try load(std.testing.allocator, std.testing.io, &paths);
+    defer after_remove.deinit();
+    try std.testing.expectEqual(@as(usize, 1), after_remove.entries.len);
+    try std.testing.expectEqualStrings("provider-b", after_remove.entries[0].provider_id);
+}
+
+test "credential store distinguishes failed and indeterminate replacement boundaries" {
+    const Fault = struct {
+        const Self = @This();
+
+        fail_at: Boundary,
+
+        fn boundary(context: *anyopaque, point: Boundary) anyerror!void {
+            const self: *Self = @ptrCast(@alignCast(context));
+            if (point == self.fail_at) return error.Injected;
+        }
+
+        fn faults(self: *Self) Faults {
+            return .{ .context = self, .boundary_fn = boundary };
+        }
+    };
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var root_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root = try temporaryPath(&temporary, &root_buffer);
+    var paths = try ZiPaths.init(std.testing.allocator, root, root);
+    defer paths.deinit();
+    try put(std.testing.allocator, std.testing.io, &paths, .{
+        .provider_id = "provider",
+        .credential = .{ .api_key = .{ .key = "original" } },
+    });
+
+    var before_replace: Fault = .{ .fail_at = .after_write };
+    var failed = try beginMutationWithFaults(std.testing.io, &paths, before_replace.faults());
+    try std.testing.expectError(error.WriteFailed, failed.put(std.testing.allocator, .{
+        .provider_id = "provider",
+        .credential = .{ .api_key = .{ .key = "not-committed" } },
+    }));
+    failed.deinit();
+    var original = try load(std.testing.allocator, std.testing.io, &paths);
+    try std.testing.expectEqualStrings("original", original.entries[0].credential.api_key.key);
+    original.deinit();
+
+    var after_replace: Fault = .{ .fail_at = .after_replace };
+    var indeterminate = try beginMutationWithFaults(std.testing.io, &paths, after_replace.faults());
+    try std.testing.expectError(error.CommitIndeterminate, indeterminate.put(std.testing.allocator, .{
+        .provider_id = "provider",
+        .credential = .{ .api_key = .{ .key = "published" } },
+    }));
+    indeterminate.deinit();
+    var published = try load(std.testing.allocator, std.testing.io, &paths);
+    defer published.deinit();
+    try std.testing.expectEqualStrings("published", published.entries[0].credential.api_key.key);
 }
 
 test "credential store rejects unknown fields and unsupported versions" {

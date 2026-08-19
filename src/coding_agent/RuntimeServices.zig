@@ -85,6 +85,7 @@ selection: SessionSelection,
 cwd: std.Io.Dir,
 snapshot: ModelConfigSnapshot,
 resolved: ModelResolution.Resolved,
+credential_resolver: *CredentialManager.PersistentResolver,
 runtime: *AgentSessionRuntime,
 
 pub fn create(
@@ -116,6 +117,7 @@ pub fn modelDiagnostic(self: *const RuntimeServices) ?ModelConfigSnapshot.Diagno
 pub fn deinit(self: *RuntimeServices) void {
     const allocator = self.allocator;
     self.runtime.deinit();
+    self.credential_resolver.deinit();
     self.cwd.close(self.io);
     self.resolved.deinit();
     self.snapshot.deinit();
@@ -181,7 +183,9 @@ fn createOwned(
         error.WriteFailed => error.CredentialWriteFailed,
         error.CommitIndeterminate => error.CredentialCommitIndeterminate,
         error.InvalidModelConfiguration => error.InvalidModelConfiguration,
-        error.RefreshUnavailable => error.CredentialRefreshUnavailable,
+        error.AuthenticationUnavailable,
+        error.RefreshUnavailable,
+        => error.CredentialRefreshUnavailable,
         error.Rejected,
         error.InvalidResponse,
         error.Cancelled,
@@ -203,6 +207,23 @@ fn createOwned(
     });
     errdefer resolved.deinit();
 
+    const credential_resolver = CredentialManager.PersistentResolver.init(
+        allocator,
+        selection.pathsView().cwd,
+        selection.pathsView().home,
+        snapshot.view(),
+        resolved.selection,
+        inputs.cli_api_key,
+        inputs.environment,
+        inputs.sources.clock_context,
+        inputs.sources.nowMsFn,
+    ) catch |failure| return switch (failure) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.InvalidPath => error.InvalidPath,
+    };
+    errdefer credential_resolver.deinit();
+    var runtime_config = resolved.runtimeConfig();
+    runtime_config.auth_resolver = credential_resolver.resolver();
     var cwd = std.Io.Dir.openDir(.cwd(), io, selection.pathsView().cwd, .{}) catch
         return error.CwdUnavailable;
     errdefer cwd.close(io);
@@ -212,7 +233,7 @@ fn createOwned(
             allocator,
             io,
             cwd,
-            resolved.runtimeConfig(),
+            runtime_config,
             inputs.options,
             &opened,
             inputs.sources,
@@ -222,7 +243,7 @@ fn createOwned(
             io,
             cwd,
             borrowed,
-            resolved.runtimeConfig(),
+            runtime_config,
             inputs.options,
             &opened,
             inputs.sources,
@@ -239,6 +260,7 @@ fn createOwned(
         .cwd = cwd,
         .snapshot = snapshot,
         .resolved = resolved,
+        .credential_resolver = credential_resolver,
         .runtime = runtime,
     };
     return self;
@@ -438,6 +460,75 @@ test "runtime services refresh and persist expired Codex credentials before prom
     try std.testing.expectEqualStrings("runtime-refresh", refreshed.refresh);
     try std.testing.expectEqualStrings("runtime-account", refreshed.account_id.?);
     try std.testing.expectEqual(@as(usize, 2), fake.next_index);
+}
+
+test "long-lived runtime rechecks OAuth expiry before each invocation" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var root_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root = try temporaryPath(&temporary, &root_buffer);
+    var credential_paths = try ZiPaths.init(std.testing.allocator, root, root);
+    defer credential_paths.deinit();
+    var sources: TestSources = .{};
+    const expires_at_ms = sources.next_ms + 10 * 60 * 1000;
+    try CredentialStore.put(std.testing.allocator, std.testing.io, &credential_paths, .{
+        .provider_id = "openai-codex",
+        .credential = .{ .oauth = .{
+            .access = "initial-access",
+            .refresh = "initial-refresh",
+            .expires_at_ms = expires_at_ms,
+            .account_id = "initial-account",
+        } },
+    });
+    const access = try testAccessToken(std.testing.allocator, "rotated-account");
+    defer std.testing.allocator.free(access);
+    const refresh_response = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"access_token\":\"{s}\",\"refresh_token\":\"rotated-refresh\",\"expires_in\":3600}}",
+        .{access},
+    );
+    defer std.testing.allocator.free(refresh_response);
+    const first_response =
+        // ziglint-ignore: Z024 -- compact provider wire fixture
+        \\data: {"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_1","content":[]}}
+        \\
+        \\data: {"type":"response.output_text.delta","output_index":0,"delta":"first"}
+        \\
+        \\data: {"type":"response.completed","response":{"status":"completed"}}
+        \\
+    ;
+    const second_response =
+        // ziglint-ignore: Z024 -- compact provider wire fixture
+        \\data: {"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_2","content":[]}}
+        \\
+        \\data: {"type":"response.output_text.delta","output_index":0,"delta":"second"}
+        \\
+        \\data: {"type":"response.completed","response":{"status":"completed"}}
+        \\
+    ;
+    const exchanges = [_]fake_api.Exchange{
+        .{ .response = .{ .status = 200, .body = first_response } },
+        .{ .response = .{ .status = 200, .body = refresh_response } },
+        .{ .response = .{ .status = 200, .body = second_response } },
+    };
+    var fake = fake_api.FakeTransport.init(&exchanges);
+    var services = try createWithTransport(std.testing.allocator, std.testing.io, .{
+        .startup_cwd = root,
+        .home = root,
+        .session = .new,
+        .sources = sources.view(),
+        .requested_provider = "openai-codex",
+        .requested_model = "gpt-5.6-terra",
+    }, fake.transport());
+    defer services.deinit();
+    try std.testing.expectEqualStrings("first", try services.session().prompt("one"));
+    sources.next_ms = expires_at_ms;
+    try std.testing.expectEqualStrings("second", try services.session().prompt("two"));
+    try std.testing.expectEqual(@as(usize, 3), fake.next_index);
+
+    var stored = try CredentialStore.load(std.testing.allocator, std.testing.io, &credential_paths);
+    defer stored.deinit();
+    try std.testing.expectEqualStrings("rotated-refresh", stored.entries[0].credential.oauth.refresh);
 }
 
 test "runtime services restore the journal model unless an explicit override commits first" {

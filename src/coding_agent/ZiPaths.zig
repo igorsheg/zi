@@ -10,6 +10,7 @@ pub const Error = error{
 
 arena: std.heap.ArenaAllocator,
 cwd: []const u8,
+home: []const u8,
 global_agent: []const u8,
 global_sessions: []const u8,
 project: []const u8,
@@ -46,6 +47,7 @@ pub fn init(allocator: std.mem.Allocator, cwd: []const u8, home: []const u8) Err
     return .{
         .arena = arena,
         .cwd = normalized_cwd,
+        .home = normalized_home,
         .global_agent = global_agent,
         .global_sessions = global_sessions,
         .project = project,
@@ -79,6 +81,7 @@ test "Zi paths own normalized cwd-bound configuration roots" {
     @memset(home_input, 'x');
 
     try std.testing.expectEqualStrings("/tmp/zi-work", paths.cwd);
+    try std.testing.expectEqualStrings("/tmp/zi-home", paths.home);
     try std.testing.expectEqualStrings("/tmp/zi-home/.zi/agent", paths.global_agent);
     try std.testing.expectEqualStrings("/tmp/zi-home/.zi/agent/sessions", paths.global_sessions);
     try std.testing.expectEqualStrings("/tmp/zi-work/.zi", paths.project);

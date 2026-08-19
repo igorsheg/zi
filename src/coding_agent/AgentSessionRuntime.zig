@@ -180,6 +180,7 @@ fn initialize(
             .catalog = config.model_config.catalog,
             .providers = config.model_config.providers,
             .credentials = config.credentials,
+            .auth_resolver = config.auth_resolver,
             .selection = config.selection,
         },
     ) catch |failure| return switch (failure) {

@@ -23,6 +23,7 @@ pub const Error = error{
 pub const RuntimeConfig = struct {
     model_config: ModelConfig,
     credentials: []const StoredCredential,
+    auth_resolver: ?ai.auth.Resolver = null,
     selection: ai_model.ModelIdentity,
 };
 

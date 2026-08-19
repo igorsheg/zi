@@ -13,6 +13,7 @@ pub const Config = struct {
     catalog: model_catalog.Catalog,
     providers: []const provider_api.Definition,
     credentials: []const credential.Entry,
+    auth_resolver: ?auth.Resolver = null,
     selection: model_api.ModelIdentity,
 };
 
@@ -66,6 +67,7 @@ pub fn init(
             .catalog = self.catalog,
             .definition = try copyProvider(owned, definition),
             .auth_inputs = .{ .stored = self.credentials },
+            .auth_resolver = config.auth_resolver,
         };
         self.registry.register(self.providers[index].provider()) catch |failure| switch (failure) {
             error.OutOfMemory => return error.OutOfMemory,

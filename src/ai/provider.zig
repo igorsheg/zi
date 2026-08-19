@@ -130,6 +130,7 @@ pub const Configured = struct {
     catalog: model_catalog.Catalog,
     definition: Definition,
     auth_inputs: auth_api.Inputs,
+    auth_resolver: ?auth_api.Resolver = null,
 
     pub fn provider(self: *Configured) Provider {
         return Provider.from(self, self.definition.id);
@@ -159,11 +160,22 @@ pub const Configured = struct {
     ) model_api.ModelError!message.ResponseMessage {
         const entry = self.catalog.resolve(identity) orelse return error.InvalidRequest;
         const protocol = self.protocols.find(entry.entry.protocol_id) orelse return error.InvalidRequest;
-        const resolved_auth = auth_api.resolve(
-            self.definition.auth,
-            self.definition.id,
-            self.auth_inputs,
-        ) catch return error.InvalidRequest;
+        const resolved_auth = if (self.auth_resolver) |resolver|
+            resolver.resolve(
+                scratch_allocator,
+                scratch_allocator,
+                io,
+                self.transport,
+                self.definition.auth,
+                self.definition.id,
+                self.auth_inputs,
+            ) catch return error.InvalidRequest
+        else
+            auth_api.resolve(
+                self.definition.auth,
+                self.definition.id,
+                self.auth_inputs,
+            ) catch return error.InvalidRequest;
         return protocol.invoke(result_allocator, scratch_allocator, io, .{
             .transport = self.transport,
             .base_url = resolved_auth.base_url orelse self.definition.base_url,
