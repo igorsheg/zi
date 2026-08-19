@@ -7,6 +7,8 @@ const surface = @import("surface.zig");
 pub const run = entry.run;
 
 const std = @import("std");
+const ai_message = @import("../../ai/message.zig");
+const ai_model = @import("../../ai/model.zig");
 const ai_testing = @import("../../ai/testing.zig");
 const AgentSession = @import("../AgentSession.zig");
 
@@ -96,6 +98,69 @@ test "text print mode routes a settled agent failure only to stderr" {
     try std.testing.expectEqualStrings("", stdout.written());
     try std.testing.expectEqualStrings("Request failed: InvalidRequest\n", stderr.written());
     try std.testing.expect(session.state() == .failed);
+}
+
+test "text print mode reports bounded provider failure details" {
+    const RejectingModel = struct {
+        const Self = @This();
+
+        pub fn invoke(
+            _: *Self,
+            _: std.mem.Allocator,
+            _: std.mem.Allocator,
+            _: std.Io,
+            _: ai_message.ModelIdentity,
+            request: ai_model.ModelRequest,
+            _: ai_model.Delivery,
+        ) ai_model.ModelError!ai_message.ResponseMessage {
+            request.failure_sink.?.observe(.{
+                .provider = "openai-codex",
+                .status = 400,
+                .code = "bad_request",
+                .message = "Unsupported content type",
+                .request_id = "request-123",
+                .retry_after_ms = 3000,
+            });
+            return error.ProviderRejectedRequest;
+        }
+    };
+    var implementation: RejectingModel = .{};
+    var profile: ai_model.ModelProfile = .{};
+    profile.capabilities.insert(.tools);
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var session = try AgentSession.init(
+        std.testing.allocator,
+        std.testing.io,
+        ai_model.Model.from(
+            &implementation,
+            .{ .provider = "openai-codex", .model = "rejecting" },
+            profile,
+        ),
+        temporary.dir,
+        .{},
+        null,
+    );
+    defer session.deinit();
+    var stdout: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer stdout.deinit();
+    var stderr: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer stderr.deinit();
+
+    const exit = try print_mode.runPrintMode(
+        &session,
+        .{ .initial_message = "fail" },
+        &stdout.writer,
+        &stderr.writer,
+    );
+    try std.testing.expect(exit == .failure);
+    try std.testing.expectEqualStrings("", stdout.written());
+    try std.testing.expectEqualStrings(
+        "Request failed: ProviderRejectedRequest (HTTP 400: Unsupported content type)\n",
+        stderr.written(),
+    );
+    try std.testing.expectEqualStrings("request-123", session.providerFailure().?.request_id.?);
+    try std.testing.expectEqual(@as(?u64, 3000), session.providerFailure().?.retry_after_ms);
 }
 
 test "text print mode rejects invalid and excessive prompts before model admission" {

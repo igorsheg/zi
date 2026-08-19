@@ -1,4 +1,5 @@
 const std = @import("std");
+const ai_failure = @import("../ai/failure.zig");
 const ai_message = @import("../ai/message.zig");
 const ai_model = @import("../ai/model.zig");
 const ai_stream = @import("../ai/stream.zig");
@@ -111,6 +112,7 @@ events: ?EventSink,
 commits: ?commit_api.Sink = null,
 model_request_count: usize = 0,
 tool_call_count: usize = 0,
+provider_failure: ?ai_failure.ProviderFailure = null,
 run_admitted: bool = false,
 
 pub fn init(
@@ -159,6 +161,11 @@ pub fn modelRequests(self: *const Agent) usize {
 
 pub fn toolCalls(self: *const Agent) usize {
     return self.tool_call_count;
+}
+
+/// Provider failure details remain valid until the next admitted run or deinit.
+pub fn providerFailure(self: *const Agent) ?ai_failure.ProviderFailure {
+    return self.provider_failure;
 }
 
 /// Construction-only binding; committed sessions install it before the agent is published.
@@ -228,6 +235,7 @@ fn runInternal(self: *Agent, input: []const u8, control: RunControl, delivery: D
     self.result_arena = std.heap.ArenaAllocator.init(self.allocator);
     self.model_request_count = 0;
     self.tool_call_count = 0;
+    self.provider_failure = null;
 
     self.commitMessage(.user, .{ .request = .{
         .parts = &.{.{ .user = .{ .text = input } }},
@@ -527,6 +535,7 @@ fn invokeModel(
         .messages = self.history.messages(),
         .instructions = self.instructions,
         .tools = tools,
+        .failure_sink = .{ .context = self, .observeFn = observeProviderFailure },
         .deadline = control.deadline,
         .cancellation = control.cancellation,
     };
@@ -543,6 +552,52 @@ fn invokeModel(
             });
         },
     };
+}
+
+fn observeProviderFailure(context: *anyopaque, provider_failure: ai_failure.ProviderFailure) void {
+    const self: *Agent = @ptrCast(@alignCast(context));
+    if (provider_failure.provider.len == 0 or
+        provider_failure.provider.len > ai_failure.ProviderFailure.max_provider_bytes or
+        provider_failure.message.len == 0 or
+        provider_failure.message.len > ai_failure.ProviderFailure.max_message_bytes or
+        !safeDiagnosticText(provider_failure.message)) return;
+
+    const allocator = self.result_arena.allocator();
+    const provider = allocator.dupe(u8, provider_failure.provider) catch return;
+    const message = allocator.dupe(u8, provider_failure.message) catch return;
+    self.provider_failure = .{
+        .provider = provider,
+        .status = provider_failure.status,
+        .code = copyOptionalDiagnostic(
+            allocator,
+            provider_failure.code,
+            ai_failure.ProviderFailure.max_code_bytes,
+        ),
+        .message = message,
+        .request_id = copyOptionalDiagnostic(
+            allocator,
+            provider_failure.request_id,
+            ai_failure.ProviderFailure.max_request_id_bytes,
+        ),
+        .retry_after_ms = provider_failure.retry_after_ms,
+        .sensitive_data_redacted = provider_failure.sensitive_data_redacted,
+    };
+}
+
+fn copyOptionalDiagnostic(
+    allocator: std.mem.Allocator,
+    value: ?[]const u8,
+    max_bytes: usize,
+) ?[]const u8 {
+    const text = value orelse return null;
+    if (text.len == 0 or text.len > max_bytes or !safeDiagnosticText(text)) return null;
+    return allocator.dupe(u8, text) catch null;
+}
+
+fn safeDiagnosticText(value: []const u8) bool {
+    if (!std.unicode.utf8ValidateSlice(value)) return false;
+    for (value) |byte| if (byte < 0x20 or byte == 0x7f) return false;
+    return true;
 }
 
 const StreamSinkAdapter = struct {
@@ -667,6 +722,50 @@ const SecondRequestRecorder = struct {
             std.mem.eql(u8, result.content[0].text, "file contents");
     }
 };
+
+test "agent retains only bounded safe provider failure details" {
+    var scripted_model: ai_testing.ScriptedModel = .{
+        .identity = .{ .provider = "script", .model = "agent" },
+        .steps = &.{.{ .text = "unused" }},
+    };
+    var agent = try Agent.init(
+        std.testing.allocator,
+        std.testing.io,
+        scripted_model.asModel(),
+        &.{},
+        &.{},
+        .{},
+        null,
+    );
+    defer agent.deinit();
+
+    var oversized_message = [_]u8{'x'} ** (ai_failure.ProviderFailure.max_message_bytes + 1);
+    observeProviderFailure(&agent, .{
+        .provider = "provider",
+        .status = 400,
+        .message = &oversized_message,
+    });
+    try std.testing.expect(agent.providerFailure() == null);
+
+    var provider = [_]u8{ 'p', 'r', 'o', 'v', 'i', 'd', 'e', 'r' };
+    var message = [_]u8{ 's', 'a', 'f', 'e' };
+    var oversized_code = [_]u8{'x'} ** (ai_failure.ProviderFailure.max_code_bytes + 1);
+    observeProviderFailure(&agent, .{
+        .provider = &provider,
+        .status = 429,
+        .code = &oversized_code,
+        .message = &message,
+        .request_id = "unsafe\nrequest",
+    });
+    @memset(&provider, 'x');
+    @memset(&message, 'x');
+
+    const retained = agent.providerFailure().?;
+    try std.testing.expectEqualStrings("provider", retained.provider);
+    try std.testing.expectEqualStrings("safe", retained.message);
+    try std.testing.expect(retained.code == null);
+    try std.testing.expect(retained.request_id == null);
+}
 
 test "agent executes a tool and returns final text with owned canonical history" {
     var request_recorder: SecondRequestRecorder = .{};

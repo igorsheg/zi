@@ -1,6 +1,7 @@
 const std = @import("std");
 const failure = @import("../failure.zig");
 const message = @import("../message.zig");
+const openai_error = @import("../protocol/openai_error.zig");
 const model_api = @import("../model.zig");
 const openai_chat = @import("../protocol/openai_chat.zig");
 const protocol_api = @import("../protocol.zig");
@@ -86,7 +87,15 @@ pub const OpenAiCompatible = struct {
                 };
                 defer if (response.body.len > 0) scratch_allocator.free(response.body);
                 if (response.status < 200 or response.status >= 300) {
-                    observeFailure(request.failure_sink, identity, response.status, response.body);
+                    openai_error.observe(
+                        scratch_allocator,
+                        request.failure_sink,
+                        identity.provider,
+                        response.status,
+                        response.body,
+                        response.metadata,
+                        headers.items(),
+                    );
                     return statusError(response.status);
                 }
                 break :complete openai_chat.decodeResponse(result_allocator, identity, response.body);
@@ -109,7 +118,15 @@ pub const OpenAiCompatible = struct {
                     return mapTransportError(transport_failure);
                 };
                 if (decoder.status < 200 or decoder.status >= 300) {
-                    observeFailure(request.failure_sink, identity, decoder.status, decoder.error_body.items);
+                    openai_error.observe(
+                        scratch_allocator,
+                        request.failure_sink,
+                        identity.provider,
+                        decoder.status,
+                        decoder.error_body.items,
+                        decoder.response_metadata,
+                        headers.items(),
+                    );
                 }
                 break :streaming_response decoder.result();
             },
@@ -128,20 +145,6 @@ fn endpointUrl(allocator: std.mem.Allocator, base_url: []const u8) failure.Model
         return allocator.dupe(u8, base) catch return error.OutOfMemory;
     }
     return std.fmt.allocPrint(allocator, "{s}/chat/completions", .{base}) catch return error.OutOfMemory;
-}
-
-fn observeFailure(
-    sink: ?failure.FailureSink,
-    identity: message.ModelIdentity,
-    status: u16,
-    body: []const u8,
-) void {
-    const observer = sink orelse return;
-    observer.observe(.{
-        .provider = identity.provider,
-        .status = status,
-        .message = body[0..@min(body.len, 2048)],
-    });
 }
 
 fn statusError(status: u16) failure.ModelError {

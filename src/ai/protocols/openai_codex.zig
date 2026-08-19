@@ -2,6 +2,7 @@ const std = @import("std");
 const failure = @import("../failure.zig");
 const message = @import("../message.zig");
 const model_api = @import("../model.zig");
+const openai_error = @import("../protocol/openai_error.zig");
 const openai_responses = @import("../protocol/openai_responses.zig");
 const openai_codex_provider = @import("../providers/openai_codex.zig");
 const protocol_api = @import("../protocol.zig");
@@ -99,7 +100,15 @@ pub const OpenAiCodex = struct {
             if (!decoder.terminal) return mapTransportError(transport_failure);
         };
         if (decoder.status < 200 or decoder.status >= 300) {
-            observeFailure(request.failure_sink, decoder.status, decoder.error_body.items);
+            openai_error.observe(
+                scratch_allocator,
+                request.failure_sink,
+                identity.provider,
+                decoder.status,
+                decoder.error_body.items,
+                decoder.response_metadata,
+                headers.items(),
+            );
         }
         return decoder.result();
     }
@@ -132,15 +141,6 @@ fn endpointUrl(allocator: std.mem.Allocator, base_url: []const u8) failure.Model
         return std.fmt.allocPrint(allocator, "{s}/responses", .{base}) catch return error.OutOfMemory;
     }
     return std.fmt.allocPrint(allocator, "{s}/codex/responses", .{base}) catch return error.OutOfMemory;
-}
-
-fn observeFailure(sink: ?failure.FailureSink, status: u16, body: []const u8) void {
-    const observer = sink orelse return;
-    observer.observe(.{
-        .provider = "openai-codex",
-        .status = status,
-        .message = body[0..@min(body.len, 2048)],
-    });
 }
 
 fn mapTransportError(value: transport_api.Error) failure.ModelError {

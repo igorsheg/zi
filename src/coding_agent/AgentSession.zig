@@ -1,4 +1,5 @@
 const std = @import("std");
+const ai_failure = @import("../ai/failure.zig");
 const ai_message = @import("../ai/message.zig");
 const ai_model = @import("../ai/model.zig");
 const Agent = @import("../agent/Agent.zig");
@@ -107,6 +108,10 @@ pub fn promptStream(
 
 pub fn messages(self: *const AgentSession) []const ai_message.Message {
     return self.agent.messages();
+}
+
+pub fn providerFailure(self: *const AgentSession) ?ai_failure.ProviderFailure {
+    return self.agent.providerFailure();
 }
 
 pub fn state(self: *const AgentSession) Agent.State {

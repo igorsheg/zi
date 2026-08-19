@@ -6,8 +6,12 @@ pub const Header = struct {
     value: []const u8,
     sensitive: bool = false,
 
+    pub fn isSensitive(self: Header) bool {
+        return self.sensitive or isSensitiveHeaderName(self.name);
+    }
+
     pub fn redactedValue(self: Header) []const u8 {
-        return if (self.sensitive or isSensitiveHeaderName(self.name)) "[redacted]" else self.value;
+        return if (self.isSensitive()) "[redacted]" else self.value;
     }
 };
 

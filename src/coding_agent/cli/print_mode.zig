@@ -61,11 +61,23 @@ fn prompt(
     stderr: *std.Io.Writer,
 ) std.Io.Writer.Error!?[]const u8 {
     return session.prompt(message) catch |failure| {
-        try writeFailure(stderr, failure);
+        try writeFailure(session, stderr, failure);
         return null;
     };
 }
 
-fn writeFailure(stderr: *std.Io.Writer, failure: AgentSession.RunError) std.Io.Writer.Error!void {
+fn writeFailure(
+    session: *const AgentSession,
+    stderr: *std.Io.Writer,
+    failure: AgentSession.RunError,
+) std.Io.Writer.Error!void {
+    if (session.providerFailure()) |provider_failure| {
+        try stderr.print("Request failed: {s} (HTTP {d}: {s})\n", .{
+            @errorName(failure),
+            provider_failure.status,
+            provider_failure.message,
+        });
+        return;
+    }
     try stderr.print("Request failed: {s}\n", .{@errorName(failure)});
 }

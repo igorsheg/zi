@@ -174,6 +174,7 @@ pub const StreamDecoder = struct {
     finish_value: usage_api.Finish = .{},
     failure_value: ?failure.ModelError = null,
     status: u16 = 0,
+    response_metadata: transport_api.ResponseMetadata = .{},
     error_body: std.ArrayList(u8) = .empty,
 
     const Part = union(enum) {
@@ -283,6 +284,7 @@ pub const StreamDecoder = struct {
     fn startBody(context: *anyopaque, head: transport_api.ResponseHead) transport_api.SinkError!void {
         const self: *StreamDecoder = @ptrCast(@alignCast(context));
         self.status = head.status;
+        self.response_metadata = head.metadata;
     }
 
     fn chunkBody(context: *anyopaque, bytes: []const u8) transport_api.SinkError!void {
