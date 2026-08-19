@@ -76,8 +76,8 @@ pub const OAuth = struct {
         const response = try transport.exchange(scratch_allocator, io, .{
             .method = .POST,
             .url = token_url,
+            .headers = &.{.{ .name = "content-type", .value = "application/x-www-form-urlencoded" }},
             .body = body.written(),
-            .content_type = "application/x-www-form-urlencoded",
             .max_response_bytes = max_response_bytes,
             .deadline = deadline,
             .cancellation = request.cancellation,
@@ -412,8 +412,8 @@ fn exchangeForm(
     return transport.exchange(allocator, io, .{
         .method = .POST,
         .url = token_url,
+        .headers = &.{.{ .name = "content-type", .value = "application/x-www-form-urlencoded" }},
         .body = body,
-        .content_type = "application/x-www-form-urlencoded",
         .max_response_bytes = max_response_bytes,
         .deadline = std.Io.Clock.Timestamp.fromNow(io, .{
             .raw = .fromSeconds(15),
@@ -434,8 +434,8 @@ fn exchangeJson(
     return transport.exchange(allocator, io, .{
         .method = .POST,
         .url = url,
+        .headers = &.{.{ .name = "content-type", .value = "application/json" }},
         .body = body,
-        .content_type = "application/json",
         .max_response_bytes = max_response_bytes,
         .deadline = std.Io.Clock.Timestamp.fromNow(io, .{
             .raw = .fromSeconds(15),
@@ -769,9 +769,12 @@ test "Codex OAuth refresh rotates tokens and extracts the account identity" {
         fn inspect(_: *anyopaque, request: transport_api.Request) error{Rejected}!void {
             if (!std.mem.eql(u8, request.url, token_url)) return error.Rejected;
             if (request.method != .POST) return error.Rejected;
-            if (!std.mem.eql(u8, request.content_type.?, "application/x-www-form-urlencoded")) {
-                return error.Rejected;
+            var content_type = false;
+            for (request.headers) |header| {
+                if (std.ascii.eqlIgnoreCase(header.name, "content-type") and
+                    std.mem.eql(u8, header.value, "application/x-www-form-urlencoded")) content_type = true;
             }
+            if (!content_type) return error.Rejected;
             const expected = "grant_type=refresh_token&refresh_token=old%20refresh%2B%2F%3F&client_id=" ++ client_id;
             if (!std.mem.eql(u8, request.body, expected)) return error.Rejected;
             if (request.max_response_bytes != max_response_bytes or request.deadline == null) {

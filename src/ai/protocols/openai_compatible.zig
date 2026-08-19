@@ -48,23 +48,27 @@ pub const OpenAiCompatible = struct {
             std.crypto.secureZero(u8, value);
             scratch_allocator.free(value);
         };
-        var headers: std.ArrayList(transport_api.Header) = .empty;
-        defer headers.deinit(scratch_allocator);
-        headers.append(scratch_allocator, .{
+        var headers = transport_api.HeaderList.init(scratch_allocator);
+        defer headers.deinit();
+        headers.append(.{ .name = "content-type", .value = "application/json" }) catch |failure_value| {
+            return headerError(failure_value);
+        };
+        headers.append(.{
             .name = "accept",
             .value = if (streaming) "text/event-stream" else "application/json",
-        }) catch return error.OutOfMemory;
-        if (authorization) |value| headers.append(scratch_allocator, .{
+        }) catch |failure_value| return headerError(failure_value);
+        if (authorization) |value| headers.append(.{
             .name = "authorization",
             .value = value,
-        }) catch return error.OutOfMemory;
-        headers.appendSlice(scratch_allocator, invocation.headers) catch return error.OutOfMemory;
-        headers.appendSlice(scratch_allocator, invocation.auth.headers) catch return error.OutOfMemory;
+            .sensitive = true,
+        }) catch |failure_value| return headerError(failure_value);
+        headers.appendSlice(invocation.headers) catch |failure_value| return headerError(failure_value);
+        headers.appendSlice(invocation.auth.headers) catch |failure_value| return headerError(failure_value);
 
         const transport_request: transport_api.Request = .{
             .method = .POST,
             .url = url,
-            .headers = headers.items,
+            .headers = headers.items(),
             .body = body,
             .deadline = request.deadline,
             .cancellation = request.cancellation,
@@ -113,6 +117,10 @@ pub const OpenAiCompatible = struct {
     }
 };
 
+fn headerError(failure_value: anyerror) failure.ModelError {
+    return if (failure_value == error.OutOfMemory) error.OutOfMemory else error.InvalidRequest;
+}
+
 fn endpointUrl(allocator: std.mem.Allocator, base_url: []const u8) failure.ModelError![]const u8 {
     const base = std.mem.trim(u8, base_url, " \t\r\n/");
     if (base.len == 0) return error.InvalidRequest;
@@ -150,7 +158,7 @@ fn mapTransportError(value: transport_api.Error) failure.ModelError {
         error.OutOfMemory => error.OutOfMemory,
         error.Cancelled => error.Cancelled,
         error.TimedOut => error.TimedOut,
-        error.InvalidUrl => error.InvalidRequest,
+        error.InvalidUrl, error.InvalidRequest => error.InvalidRequest,
         error.ConnectionFailed => error.ConnectionFailed,
         error.InvalidResponse, error.ResponseTooLarge => error.InvalidProviderResponse,
         error.ConsumerStopped => error.StreamConsumerStopped,

@@ -63,18 +63,18 @@ pub const OpenAiCodex = struct {
         }
         const url = try endpointUrl(scratch_allocator, invocation.base_url);
         defer scratch_allocator.free(url);
-        var headers: std.ArrayList(transport_api.Header) = .empty;
-        defer headers.deinit(scratch_allocator);
-        headers.appendSlice(scratch_allocator, &.{
+        var headers = transport_api.HeaderList.init(scratch_allocator);
+        defer headers.deinit();
+        headers.appendSlice(&.{
             .{ .name = "content-type", .value = "application/json" },
-            .{ .name = "authorization", .value = authorization },
-            .{ .name = "chatgpt-account-id", .value = account_id },
+            .{ .name = "authorization", .value = authorization, .sensitive = true },
+            .{ .name = "chatgpt-account-id", .value = account_id, .sensitive = true },
             .{ .name = "originator", .value = "zi" },
             .{ .name = "openai-beta", .value = "responses=experimental" },
             .{ .name = "accept", .value = "text/event-stream" },
-        }) catch return error.OutOfMemory;
-        headers.appendSlice(scratch_allocator, invocation.headers) catch return error.OutOfMemory;
-        headers.appendSlice(scratch_allocator, invocation.auth.headers) catch return error.OutOfMemory;
+        }) catch |failure_value| return headerError(failure_value);
+        headers.appendSlice(invocation.headers) catch |failure_value| return headerError(failure_value);
+        headers.appendSlice(invocation.auth.headers) catch |failure_value| return headerError(failure_value);
         const application_sink = switch (delivery) {
             .buffered => null,
             .streaming => |sink| sink,
@@ -90,7 +90,7 @@ pub const OpenAiCodex = struct {
         _ = invocation.transport.exchange(scratch_allocator, io, .{
             .method = .POST,
             .url = url,
-            .headers = headers.items,
+            .headers = headers.items(),
             .body = body,
             .deadline = request.deadline,
             .cancellation = request.cancellation,
@@ -104,6 +104,10 @@ pub const OpenAiCodex = struct {
         return decoder.result();
     }
 };
+
+fn headerError(failure_value: anyerror) failure.ModelError {
+    return if (failure_value == error.OutOfMemory) error.OutOfMemory else error.InvalidRequest;
+}
 
 pub fn accountIdFromJwt(
     allocator: std.mem.Allocator,
@@ -144,7 +148,7 @@ fn mapTransportError(value: transport_api.Error) failure.ModelError {
         error.OutOfMemory => error.OutOfMemory,
         error.Cancelled => error.Cancelled,
         error.TimedOut => error.TimedOut,
-        error.InvalidUrl => error.InvalidRequest,
+        error.InvalidUrl, error.InvalidRequest => error.InvalidRequest,
         error.ConnectionFailed => error.ConnectionFailed,
         error.InvalidResponse, error.ResponseTooLarge => error.InvalidProviderResponse,
         error.ConsumerStopped => error.StreamConsumerStopped,

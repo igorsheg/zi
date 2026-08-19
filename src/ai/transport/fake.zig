@@ -6,6 +6,7 @@ pub const Exchange = union(enum) {
         status: u16,
         body: []const u8,
         chunk_bytes: usize = 0,
+        metadata: transport_api.ResponseMetadata = .{},
     },
     failure: transport_api.Error,
 };
@@ -49,9 +50,12 @@ pub const FakeTransport = struct {
                 .buffered => .{
                     .status = response.status,
                     .body = allocator.dupe(u8, response.body) catch return error.OutOfMemory,
+                    .metadata = response.metadata,
                 },
                 .streaming => |sink| streaming: {
-                    sink.start(.{ .status = response.status }) catch |failure| return sinkError(failure);
+                    sink.start(.{ .status = response.status, .metadata = response.metadata }) catch |failure| {
+                        return sinkError(failure);
+                    };
                     const chunk_bytes = if (response.chunk_bytes == 0) response.body.len else response.chunk_bytes;
                     var offset: usize = 0;
                     while (offset < response.body.len) {
@@ -59,7 +63,7 @@ pub const FakeTransport = struct {
                         sink.chunk(response.body[offset..end]) catch |failure| return sinkError(failure);
                         offset = end;
                     }
-                    break :streaming .{ .status = response.status, .body = "" };
+                    break :streaming .{ .status = response.status, .body = "", .metadata = response.metadata };
                 },
             },
         };

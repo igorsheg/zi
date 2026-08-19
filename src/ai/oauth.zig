@@ -8,6 +8,7 @@ pub const Error = error{
     Cancelled,
     TimedOut,
     InvalidUrl,
+    InvalidRequest,
     ConnectionFailed,
     InvalidResponse,
     ResponseTooLarge,

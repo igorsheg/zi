@@ -237,6 +237,9 @@ store mutation lock and persists a rotated credential before releasing it.
 - Zig strings are `[]const u8`. There is no implicit null termination.
 - Bound queues, output, retries, subprocesses, and retained data.
 - Use the project's bounded JSON helper instead of inventing another decoder.
+- `ai.transport.Request.headers` is the sole outbound header representation.
+  Compose headers case-insensitively with `HeaderList`; configured headers may
+  not replace framing, authentication, or protocol-owned headers.
 
 ### I/O (Zig 0.16)
 

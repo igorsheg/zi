@@ -147,6 +147,7 @@ fn copyProvider(
         destination.* = .{
             .name = try allocator.dupe(u8, header.name),
             .value = try allocator.dupe(u8, header.value),
+            .sensitive = header.sensitive,
         };
     }
     return .{
@@ -191,6 +192,7 @@ fn validate(protocols: protocol_api.Registry, config: Config) Error!void {
         if (provider.id.len == 0 or provider.name.len == 0 or provider.base_url.len == 0) {
             return error.InvalidConfiguration;
         }
+        transport_api.validateExtraHeaders(provider.headers) catch return error.InvalidConfiguration;
         for (config.providers[0..index]) |previous| {
             if (std.mem.eql(u8, previous.id, provider.id)) return error.InvalidConfiguration;
         }

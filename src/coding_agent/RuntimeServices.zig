@@ -191,6 +191,7 @@ fn createOwned(
         error.Cancelled,
         error.TimedOut,
         error.InvalidUrl,
+        error.InvalidRequest,
         error.ConnectionFailed,
         error.ResponseTooLarge,
         error.ConsumerStopped,
