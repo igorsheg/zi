@@ -24,19 +24,6 @@ Run one or more prompts in print mode:
 ./zig-out/bin/zi --print --provider openai --model gpt-5.6-sol "Explain this repository"
 ```
 
-Set `OPENAI_API_KEY` or pass `--api-key`. Explicit CLI credentials take precedence over stored credentials and the environment.
-
-Sign in to OpenAI Codex with a browser or device code:
-
-```sh
-./zig-out/bin/zi auth login openai-codex --method browser
-./zig-out/bin/zi auth login openai-codex --method device-code
-```
-
-Credentials are stored in `$HOME/.zi/agent/auth.json`. Sign out with:
-
-```sh
-./zig-out/bin/zi auth logout openai-codex
-```
+Set `OPENAI_API_KEY` or pass `--api-key`. Explicit CLI credentials take precedence over credentials stored in `$HOME/.zi/agent/auth.json` and the environment.
 
 Run `./zig-out/bin/zi --help` for the current command surface. Interactive, JSON, and RPC modes are not available yet.

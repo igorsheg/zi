@@ -1,4 +1,3 @@
-const auth_command = @import("auth_command.zig");
 const entry = @import("entry.zig");
 const initial_message = @import("initial_message.zig");
 const launch = @import("launch.zig");
@@ -198,7 +197,6 @@ test "text print mode succeeds silently without a prompt" {
 }
 
 test {
-    _ = auth_command;
     _ = entry;
     _ = initial_message;
     _ = launch;

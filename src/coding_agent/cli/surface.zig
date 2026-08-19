@@ -10,22 +10,6 @@ pub const Terminal = struct {
     stdout_is_tty: bool,
 };
 
-pub const AuthMethod = enum {
-    browser,
-    device_code,
-};
-
-/// One admitted credential command with provider identifiers borrowed from argv.
-pub const AuthCommand = union(enum) {
-    login: struct {
-        provider_id: []const u8,
-        method: AuthMethod,
-    },
-    logout: struct {
-        provider_id: []const u8,
-    },
-};
-
 /// One print launch whose strings remain borrowed from argv for its execution.
 pub const LaunchRequest = struct {
     provider: ?[]const u8 = null,
@@ -44,7 +28,6 @@ pub const LaunchRequest = struct {
 pub const Invocation = union(enum) {
     help,
     version,
-    auth: AuthCommand,
     launch: LaunchRequest,
 };
 
@@ -64,7 +47,6 @@ pub const Diagnostic = union(enum) {
     invalid_mode: []const u8,
     unavailable_mode: Mode,
     invalid_auth_command: []const u8,
-    invalid_auth_method: []const u8,
     too_many_file_inputs,
     unknown_option: []const u8,
 };
@@ -101,7 +83,8 @@ pub fn parseInvocation(argv: []const []const u8, terminal: Terminal) ParseResult
     var rejection: Rejection = .{};
     if (!validateArguments(argv, &rejection)) return .{ .rejected = rejection };
     if (argv.len > 0 and std.mem.eql(u8, argv[0], "auth")) {
-        return parseAuthInvocation(argv, rejection);
+        rejection.add(.{ .invalid_auth_command = if (argv.len > 1) argv[1] else "" });
+        return .{ .rejected = rejection };
     }
 
     var launch: LaunchRequest = .{};
@@ -196,70 +179,6 @@ fn validateArguments(argv: []const []const u8, rejection: *Rejection) bool {
     return rejection.count == 0;
 }
 
-fn parseAuthInvocation(argv: []const []const u8, rejection_value: Rejection) ParseResult {
-    var rejection = rejection_value;
-    if (argv.len < 2) {
-        rejection.add(.{ .invalid_auth_command = "" });
-        return .{ .rejected = rejection };
-    }
-    const action = argv[1];
-    if (std.mem.eql(u8, action, "login")) return parseLogin(argv[2..], rejection);
-    if (std.mem.eql(u8, action, "logout")) return parseLogout(argv[2..], rejection);
-    rejection.add(.{ .invalid_auth_command = action });
-    return .{ .rejected = rejection };
-}
-
-fn parseLogin(argv: []const []const u8, rejection_value: Rejection) ParseResult {
-    var rejection = rejection_value;
-    var provider_id: []const u8 = "openai-codex";
-    var provider_set = false;
-    var method: AuthMethod = .browser;
-    var index: usize = 0;
-    while (index < argv.len) : (index += 1) {
-        const argument = argv[index];
-        if (std.mem.eql(u8, argument, "--method")) {
-            const value = valueAfter(argv, &index) orelse {
-                rejection.add(.{ .missing_value = argument });
-                continue;
-            };
-            method = parseAuthMethod(value) orelse {
-                rejection.add(.{ .invalid_auth_method = value });
-                continue;
-            };
-        } else if (std.mem.startsWith(u8, argument, "-")) {
-            rejection.add(.{ .unknown_option = argument });
-        } else if (!provider_set) {
-            provider_id = argument;
-            provider_set = true;
-        } else {
-            rejection.add(.{ .unknown_option = argument });
-        }
-    }
-    if (rejection.count > 0) return .{ .rejected = rejection };
-    return .{ .admitted = .{ .auth = .{ .login = .{
-        .provider_id = provider_id,
-        .method = method,
-    } } } };
-}
-
-fn parseLogout(argv: []const []const u8, rejection_value: Rejection) ParseResult {
-    var rejection = rejection_value;
-    var provider_id: []const u8 = "openai-codex";
-    var provider_set = false;
-    for (argv) |argument| {
-        if (std.mem.startsWith(u8, argument, "-")) {
-            rejection.add(.{ .unknown_option = argument });
-        } else if (!provider_set) {
-            provider_id = argument;
-            provider_set = true;
-        } else {
-            rejection.add(.{ .unknown_option = argument });
-        }
-    }
-    if (rejection.count > 0) return .{ .rejected = rejection };
-    return .{ .admitted = .{ .auth = .{ .logout = .{ .provider_id = provider_id } } } };
-}
-
 fn valueAfter(argv: []const []const u8, index: *usize) ?[]const u8 {
     if (index.* + 1 >= argv.len) return null;
     index.* += 1;
@@ -270,12 +189,6 @@ fn parseMode(value: []const u8) ?RequestedMode {
     if (std.mem.eql(u8, value, "text")) return .text;
     if (std.mem.eql(u8, value, "json")) return .json;
     if (std.mem.eql(u8, value, "rpc")) return .rpc;
-    return null;
-}
-
-fn parseAuthMethod(value: []const u8) ?AuthMethod {
-    if (std.mem.eql(u8, value, "browser")) return .browser;
-    if (std.mem.eql(u8, value, "device-code")) return .device_code;
     return null;
 }
 
@@ -333,23 +246,13 @@ test "CLI surface routes help and version before launch admission" {
     try std.testing.expect(version.admitted == .version);
 }
 
-test "CLI surface admits provider-scoped login and logout" {
-    const login = parseInvocation(&.{
-        "auth",
-        "login",
-        "openai-codex",
-        "--method",
-        "device-code",
-    }, .{ .stdin_is_tty = true, .stdout_is_tty = true });
-    try std.testing.expect(login == .admitted);
-    try std.testing.expect(login.admitted.auth == .login);
-    try std.testing.expectEqualStrings("openai-codex", login.admitted.auth.login.provider_id);
-    try std.testing.expectEqual(AuthMethod.device_code, login.admitted.auth.login.method);
-
-    const logout = parseInvocation(&.{ "auth", "logout" }, .{ .stdin_is_tty = true, .stdout_is_tty = true });
-    try std.testing.expect(logout == .admitted);
-    try std.testing.expect(logout.admitted.auth == .logout);
-    try std.testing.expectEqualStrings("openai-codex", logout.admitted.auth.logout.provider_id);
+test "CLI surface reserves pi auth commands without admitting login ceremonies" {
+    const login = parseInvocation(&.{ "auth", "login", "openai-codex" }, .{
+        .stdin_is_tty = true,
+        .stdout_is_tty = true,
+    });
+    try std.testing.expect(login == .rejected);
+    try std.testing.expectEqualStrings("login", login.rejected.diagnostics()[0].invalid_auth_command);
 }
 
 test "CLI surface rejects options outside their command grammar" {
@@ -359,13 +262,6 @@ test "CLI surface rejects options outside their command grammar" {
     });
     try std.testing.expect(extension_flag == .rejected);
     try std.testing.expectEqualStrings("--plan=careful", extension_flag.rejected.diagnostics()[0].unknown_option);
-
-    const logout_method = parseInvocation(&.{ "auth", "logout", "--method", "browser" }, .{
-        .stdin_is_tty = true,
-        .stdout_is_tty = true,
-    });
-    try std.testing.expect(logout_method == .rejected);
-    try std.testing.expectEqualStrings("--method", logout_method.rejected.diagnostics()[0].unknown_option);
 }
 
 test "CLI surface bounds arguments before admission" {

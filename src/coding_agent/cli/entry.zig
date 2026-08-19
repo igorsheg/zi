@@ -1,6 +1,4 @@
 const std = @import("std");
-const ZiPaths = @import("../ZiPaths.zig");
-const auth_command = @import("auth_command.zig");
 const launch = @import("launch.zig");
 const surface = @import("surface.zig");
 
@@ -46,44 +44,9 @@ pub fn run(init: std.process.Init) !u8 {
                 try stdout.print("zi {s}\n", .{version});
                 return 0;
             },
-            .auth => |command| return runAuthInvocation(init, command, stdout, stderr),
             .launch => |request| return runLaunchInvocation(init, &request, stdin_is_tty, stdout, stderr),
         },
     }
-}
-
-fn runAuthInvocation(
-    init: std.process.Init,
-    command: surface.AuthCommand,
-    stdout: *std.Io.Writer,
-    stderr: *std.Io.Writer,
-) !u8 {
-    const allocator = init.gpa;
-    const io = init.io;
-    const cwd = try std.process.currentPathAlloc(io, allocator);
-    defer allocator.free(cwd);
-    const home = init.environ_map.get("HOME") orelse {
-        try stderr.writeAll("Unable to start: HOME is not set.\n");
-        return 1;
-    };
-    var stdin_buffer: [64 * 1024]u8 = undefined;
-    var stdin_file = std.Io.File.Reader.init(.stdin(), io, &stdin_buffer);
-    var paths = ZiPaths.init(allocator, cwd, home) catch |failure| {
-        try stderr.print("Unable to resolve credential paths: {s}.\n", .{@errorName(failure)});
-        return 1;
-    };
-    defer paths.deinit();
-    const result = try auth_command.runAuthCommand(
-        allocator,
-        io,
-        &paths,
-        command,
-        &stdin_file.interface,
-        stdout,
-        stderr,
-        currentTimeMs(io),
-    );
-    return @intFromEnum(result);
 }
 
 fn runLaunchInvocation(
@@ -117,11 +80,6 @@ fn runLaunchInvocation(
     return @intFromEnum(result);
 }
 
-fn currentTimeMs(io: std.Io) u64 {
-    const value = std.Io.Timestamp.now(io, .real).toMilliseconds();
-    return if (value > 0) @intCast(value) else 0;
-}
-
 fn writeCliDiagnostics(writer: *std.Io.Writer, diagnostics: []const surface.Diagnostic) !void {
     for (diagnostics) |diagnostic| switch (diagnostic) {
         .too_many_arguments => try writer.writeAll("Too many command-line arguments.\n"),
@@ -136,7 +94,6 @@ fn writeCliDiagnostics(writer: *std.Io.Writer, diagnostics: []const surface.Diag
             .rpc => try writer.writeAll("RPC mode is not available yet.\n"),
         },
         .invalid_auth_command => |command| try writer.print("Unsupported auth command: {s}.\n", .{command}),
-        .invalid_auth_method => |method| try writer.print("Unsupported login method: {s}.\n", .{method}),
         .too_many_file_inputs => try writer.writeAll("Print mode accepts at most one @file input.\n"),
         .unknown_option => |option| try writer.print("Unknown option: {s}.\n", .{option}),
     };
@@ -146,8 +103,6 @@ fn writeCliHelp(writer: *std.Io.Writer) !void {
     try writer.writeAll(
         \\Usage:
         \\  zi --print --provider PROVIDER --model MODEL [PROMPT]
-        \\  zi auth login [PROVIDER] [--method browser|device-code]
-        \\  zi auth logout [PROVIDER]
         \\
         \\Options:
         \\  -p, --print          Run prompts and print the final response
