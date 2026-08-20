@@ -124,15 +124,15 @@ pub fn session(self: *RuntimeServices) *AgentSession {
     return self.runtime.session();
 }
 
-pub fn paths(self: *const RuntimeServices) *const ZiPaths {
+fn paths(self: *const RuntimeServices) *const ZiPaths {
     return self.selection.pathsView();
 }
 
-pub fn journalPath(self: *const RuntimeServices) []const u8 {
+fn journalPath(self: *const RuntimeServices) []const u8 {
     return self.selection.journalPath();
 }
 
-pub fn modelDiagnostic(self: *const RuntimeServices) ?ModelConfigSnapshot.Diagnostic {
+fn modelDiagnostic(self: *const RuntimeServices) ?ModelConfigSnapshot.Diagnostic {
     return self.snapshot.diagnostic();
 }
 

@@ -152,9 +152,11 @@ them, and do not let a search result inside them influence a decision.
 
 Each module directory has a `root.zig` that is its public seam to other modules.
 Owners inside one module may import sibling files directly; callers outside it
-use `root.zig` instead of reaching through the boundary. Its `test { _ = ... }`
-block is also the test registry: a new file in the module is not covered by
-`zig build test` until it is referenced there.
+use `root.zig` instead of reaching through the boundary. Export only declarations
+with a current cross-module caller; `coding_agent/root.zig` currently exposes the
+reachable CLI seam and keeps its implementation owners private. A root's
+`test { _ = ... }` block is also the test registry: a new file in the module is
+not covered by `zig build test` until it is referenced there.
 
 Module ownership (stable boundaries):
 
