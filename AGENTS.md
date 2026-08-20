@@ -206,8 +206,8 @@ cwd-bound roots. Do not join `.zi` or re-read process cwd inside those owners.
 `ProjectTrust` owns project prompt-file admission, and `ProjectTrustStore` owns
 canonical directory identities plus the bounded versioned
 `$HOME/.zi/agent/trust.json`. The nearest saved cwd or ancestor decision applies;
-without one, non-interactive automatic trust is closed. Store mutations require
-private permissions, a dedicated lock, and atomic replacement. Explicit approve
+without one, non-interactive automatic trust is closed. Store mutations consume
+the shared private-file transaction mechanics. Explicit approve
 and reject launch decisions override saved policy without persisting it. Trusted
 project prompt files resolve from the effective session cwd and shadow global
 prompt files independently by role.
@@ -225,10 +225,15 @@ reads scattered through the tree. The process edge reads the environment once
 and passes the value inward; owners take credential inputs and never call
 `getenv`. Do not add a second configuration path for the same fact.
 
+`PrivateFileStore` owns the shared mechanics for bounded private-file reads,
+non-following path validation, mutation locks, and durable atomic replacement.
+Domain stores retain their own filenames, formats, limits, error mapping, and
+secret handling.
+
 `$HOME/.zi/agent/auth.json` is the durable credential authority. `CredentialStore`
-owns its bounded versioned format, private permissions, mutation lock, atomic
-replacement, and secret wiping. OAuth refresh rechecks expiry while holding the
-store mutation lock and persists a rotated credential before releasing it.
+owns its bounded versioned format and secret wiping, and performs mutations
+through `PrivateFileStore`. OAuth refresh rechecks expiry while holding the store
+mutation lock and persists a rotated credential before releasing it.
 
 ## Zig-specific patterns
 

@@ -1,18 +1,14 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const BoundedJson = @import("../BoundedJson.zig");
+const PrivateFileStore = @import("PrivateFileStore.zig");
 const ProjectTrust = @import("ProjectTrust.zig");
 const ZiPaths = @import("ZiPaths.zig");
 
-const private_dir_permissions = std.Io.File.Permissions.fromMode(0o700);
-const private_file_permissions = std.Io.File.Permissions.fromMode(0o600);
 const trust_file_name = "trust.json";
 const lock_file_name = ".trust.lock";
 const max_document_bytes = 1024 * 1024;
 const max_entries = 1024;
-const lock_timeout_ms = 2000;
-const lock_poll_ms = 10;
-
 pub const Error = error{
     OutOfMemory,
     InvalidProjectIdentity,
@@ -95,25 +91,8 @@ pub const Snapshot = struct {
     }
 };
 
-const Boundary = enum {
-    after_write,
-    after_file_sync,
-    after_replace,
-};
-
-const Faults = struct {
-    context: ?*anyopaque = null,
-    boundary_fn: ?*const fn (*anyopaque, Boundary) anyerror!void = null,
-
-    fn none() Faults {
-        return .{};
-    }
-
-    fn boundary(self: Faults, point: Boundary) !void {
-        const function = self.boundary_fn orelse return;
-        return function(self.context.?, point);
-    }
-};
+const Boundary = PrivateFileStore.Boundary;
+const Faults = PrivateFileStore.Faults;
 
 const Source = struct {
     version: u32,
@@ -126,14 +105,10 @@ const SourceEntry = struct {
 };
 
 const Mutation = struct {
-    io: std.Io,
-    directory: std.Io.Dir,
-    lock: std.Io.File,
-    faults: Faults,
+    store: PrivateFileStore.Mutation,
 
     fn deinit(self: *Mutation) void {
-        self.lock.close(self.io);
-        self.directory.close(self.io);
+        self.store.deinit();
         self.* = undefined;
     }
 
@@ -143,7 +118,7 @@ const Mutation = struct {
         identity: *const Identity,
         decision: ProjectTrust.Decision,
     ) Error!void {
-        var current = try loadFile(allocator, self.io, self.directory, false);
+        var current = try loadMutation(self, allocator);
         defer current.deinit();
         const replacing = findExact(current.entries, identity.path());
         const count = current.entries.len + @intFromBool(replacing == null);
@@ -169,7 +144,7 @@ const Mutation = struct {
         allocator: std.mem.Allocator,
         identity: *const Identity,
     ) Error!bool {
-        var current = try loadFile(allocator, self.io, self.directory, false);
+        var current = try loadMutation(self, allocator);
         defer current.deinit();
         const removing = findExact(current.entries, identity.path()) orelse return false;
         const updated = try allocator.alloc(Entry, current.entries.len - 1);
@@ -187,18 +162,7 @@ const Mutation = struct {
     fn writeEntries(self: *Mutation, allocator: std.mem.Allocator, entries: []const Entry) Error!void {
         const encoded = try encode(allocator, entries);
         defer allocator.free(encoded);
-        var atomic = self.directory.createFileAtomic(self.io, trust_file_name, .{
-            .permissions = private_file_permissions,
-            .replace = true,
-        }) catch return error.ProjectTrustWriteFailed;
-        defer atomic.deinit(self.io);
-        atomic.file.writePositionalAll(self.io, encoded, 0) catch return error.ProjectTrustWriteFailed;
-        self.faults.boundary(.after_write) catch return error.ProjectTrustWriteFailed;
-        atomic.file.sync(self.io) catch return error.ProjectTrustWriteFailed;
-        self.faults.boundary(.after_file_sync) catch return error.ProjectTrustWriteFailed;
-        atomic.replace(self.io) catch return error.ProjectTrustWriteFailed;
-        self.faults.boundary(.after_replace) catch return error.ProjectTrustCommitIndeterminate;
-        syncDirectory(self.directory) catch return error.ProjectTrustCommitIndeterminate;
+        self.store.replace(trust_file_name, encoded) catch |failure| return mapWriteFailure(failure);
     }
 };
 
@@ -207,12 +171,15 @@ pub fn load(
     io: std.Io,
     paths: *const ZiPaths,
 ) Error!Snapshot {
-    const directory = openExistingAgentDirectory(io, paths.global_agent) catch |failure| return switch (failure) {
-        error.FileNotFound => empty(allocator),
-        error.UnsafeProjectTrustStorage => error.UnsafeProjectTrustStorage,
-    };
-    defer directory.close(io);
-    return loadFile(allocator, io, directory, true);
+    const source_text = PrivateFileStore.readFileAlloc(
+        allocator,
+        io,
+        paths.home,
+        paths.global_agent,
+        trust_file_name,
+        max_document_bytes,
+    ) catch |failure| return mapReadFailure(failure);
+    return decodeOptional(allocator, source_text);
 }
 
 pub fn put(
@@ -239,98 +206,55 @@ pub fn remove(
 }
 
 fn beginMutation(io: std.Io, paths: *const ZiPaths, faults: Faults) Error!Mutation {
-    var directory = try openPrivateAgentDirectory(io, paths.global_agent);
-    errdefer directory.close(io);
-    const lock = try openOrCreatePrivateLock(io, directory);
-    errdefer lock.close(io);
-    const deadline = std.Io.Clock.Timestamp.fromNow(io, .{
-        .raw = .fromMilliseconds(lock_timeout_ms),
-        .clock = .awake,
-    });
-    while (!(lock.tryLock(io, .exclusive) catch return error.ProjectTrustLockFailed)) {
-        if (std.Io.Clock.Timestamp.now(io, .awake).compare(.gte, deadline)) {
-            return error.ProjectTrustLockFailed;
-        }
-        const poll: std.Io.Timeout = .{ .duration = .{
-            .raw = .fromMilliseconds(lock_poll_ms),
-            .clock = .awake,
-        } };
-        poll.sleep(io) catch return error.ProjectTrustLockFailed;
-    }
-    return .{ .io = io, .directory = directory, .lock = lock, .faults = faults };
+    const store = PrivateFileStore.beginMutation(
+        io,
+        paths.home,
+        paths.global_agent,
+        lock_file_name,
+        faults,
+    ) catch |failure| return mapMutationFailure(failure);
+    return .{ .store = store };
 }
 
-fn openOrCreatePrivateLock(io: std.Io, directory: std.Io.Dir) Error!std.Io.File {
-    var attempts: usize = 0;
-    while (attempts < 2) : (attempts += 1) {
-        const existing = directory.openFile(io, lock_file_name, .{
-            .mode = .read_write,
-            .allow_directory = false,
-            .follow_symlinks = false,
-        }) catch |failure| switch (failure) {
-            error.FileNotFound => {
-                const created = directory.createFile(io, lock_file_name, .{
-                    .read = true,
-                    .exclusive = true,
-                    .permissions = private_file_permissions,
-                }) catch |create_failure| switch (create_failure) {
-                    error.PathAlreadyExists => continue,
-                    else => return error.ProjectTrustLockFailed,
-                };
-                validatePrivateFile(created.stat(io) catch {
-                    created.close(io);
-                    return error.ProjectTrustLockFailed;
-                }) catch {
-                    created.close(io);
-                    return error.UnsafeProjectTrustStorage;
-                };
-                return created;
-            },
-            error.IsDir, error.SymLinkLoop => return error.UnsafeProjectTrustStorage,
-            else => return error.ProjectTrustLockFailed,
-        };
-        errdefer existing.close(io);
-        validatePrivateFile(existing.stat(io) catch return error.ProjectTrustLockFailed) catch
-            return error.UnsafeProjectTrustStorage;
-        return existing;
-    }
-    return error.ProjectTrustLockFailed;
-}
-
-fn loadFile(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    directory: std.Io.Dir,
-    validate_directory: bool,
-) Error!Snapshot {
-    const file = directory.openFile(io, trust_file_name, .{
-        .mode = .read_only,
-        .allow_directory = false,
-        .follow_symlinks = false,
-    }) catch |failure| return switch (failure) {
-        error.FileNotFound => empty(allocator),
-        error.IsDir, error.SymLinkLoop => error.UnsafeProjectTrustStorage,
-        else => error.ProjectTrustReadFailed,
-    };
-    defer file.close(io);
-    if (validate_directory) {
-        validatePrivateDirectory(directory.stat(io) catch return error.ProjectTrustReadFailed) catch
-            return error.UnsafeProjectTrustStorage;
-    }
-    validatePrivateFile(file.stat(io) catch return error.ProjectTrustReadFailed) catch
-        return error.UnsafeProjectTrustStorage;
-    var read_buffer: [8192]u8 = undefined;
-    var file_reader = file.reader(io, &read_buffer);
-    const source_text = file_reader.interface.allocRemaining(
+fn loadMutation(self: *Mutation, allocator: std.mem.Allocator) Error!Snapshot {
+    const source_text = self.store.readFileAlloc(
         allocator,
-        .limited(max_document_bytes + 1),
-    ) catch |failure| return switch (failure) {
-        error.OutOfMemory => error.OutOfMemory,
-        else => error.ProjectTrustReadFailed,
-    };
+        trust_file_name,
+        max_document_bytes,
+    ) catch |failure| return mapReadFailure(failure);
+    return decodeOptional(allocator, source_text);
+}
+
+fn decodeOptional(allocator: std.mem.Allocator, maybe_source_text: ?[]u8) Error!Snapshot {
+    const source_text = maybe_source_text orelse return empty(allocator);
     defer allocator.free(source_text);
     if (source_text.len > max_document_bytes) return error.InvalidProjectTrustFile;
     return decode(allocator, source_text);
+}
+
+fn mapReadFailure(failure: PrivateFileStore.Error) Error {
+    return switch (failure) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.UnsafePath => error.UnsafeProjectTrustStorage,
+        else => error.ProjectTrustReadFailed,
+    };
+}
+
+fn mapMutationFailure(failure: PrivateFileStore.Error) Error {
+    return switch (failure) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.UnsafePath => error.UnsafeProjectTrustStorage,
+        else => error.ProjectTrustLockFailed,
+    };
+}
+
+fn mapWriteFailure(failure: PrivateFileStore.Error) Error {
+    return switch (failure) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.UnsafePath => error.UnsafeProjectTrustStorage,
+        error.CommitIndeterminate => error.ProjectTrustCommitIndeterminate,
+        else => error.ProjectTrustWriteFailed,
+    };
 }
 
 fn empty(allocator: std.mem.Allocator) Snapshot {
@@ -434,52 +358,6 @@ fn findExact(entries: []const Entry, path: []const u8) ?usize {
 
 fn lessThanEntry(_: void, left: Entry, right: Entry) bool {
     return std.mem.order(u8, left.path, right.path) == .lt;
-}
-
-fn openExistingAgentDirectory(
-    io: std.Io,
-    path: []const u8,
-) error{ FileNotFound, UnsafeProjectTrustStorage }!std.Io.Dir {
-    const directory = std.Io.Dir.openDirAbsolute(io, path, .{ .follow_symlinks = false }) catch |failure| {
-        return switch (failure) {
-            error.FileNotFound => error.FileNotFound,
-            else => error.UnsafeProjectTrustStorage,
-        };
-    };
-    return directory;
-}
-
-fn openPrivateAgentDirectory(io: std.Io, path: []const u8) Error!std.Io.Dir {
-    _ = std.Io.Dir.createDirPathStatus(.cwd(), io, path, private_dir_permissions) catch
-        return error.UnsafeProjectTrustStorage;
-    var directory = openExistingAgentDirectory(io, path) catch return error.UnsafeProjectTrustStorage;
-    errdefer directory.close(io);
-    try validatePrivateDirectory(directory.stat(io) catch return error.UnsafeProjectTrustStorage);
-    return directory;
-}
-
-fn validatePrivateDirectory(stat: std.Io.File.Stat) error{UnsafeProjectTrustStorage}!void {
-    if (stat.kind != .directory) return error.UnsafeProjectTrustStorage;
-    if (comptime builtin.os.tag != .windows) {
-        if (stat.permissions.toMode() & 0o077 != 0) return error.UnsafeProjectTrustStorage;
-    }
-}
-
-fn validatePrivateFile(stat: std.Io.File.Stat) error{UnsafeProjectTrustStorage}!void {
-    if (stat.kind != .file or stat.nlink != 1) return error.UnsafeProjectTrustStorage;
-    if (comptime builtin.os.tag != .windows) {
-        if (stat.permissions.toMode() & 0o077 != 0) return error.UnsafeProjectTrustStorage;
-    }
-}
-
-fn syncDirectory(directory: std.Io.Dir) !void {
-    if (comptime builtin.os.tag == .windows) return error.OperationUnsupported;
-    while (true) {
-        const result = std.c.fsync(directory.handle);
-        if (result == 0) return;
-        if (std.c.errno(result) == .INTR) continue;
-        return error.DirectorySyncFailed;
-    }
 }
 
 fn temporaryPath(temporary: *std.testing.TmpDir, buffer: []u8) ![]const u8 {

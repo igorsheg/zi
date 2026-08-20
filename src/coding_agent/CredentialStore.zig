@@ -2,36 +2,15 @@ const std = @import("std");
 const builtin = @import("builtin");
 const BoundedJson = @import("../BoundedJson.zig");
 const credential = @import("../ai/credential.zig");
+const PrivateFileStore = @import("PrivateFileStore.zig");
 const ZiPaths = @import("ZiPaths.zig");
 
-const private_dir_permissions = std.Io.File.Permissions.fromMode(0o700);
-const private_file_permissions = std.Io.File.Permissions.fromMode(0o600);
 const auth_file_name = "auth.json";
 const lock_file_name = ".auth.lock";
 const max_document_bytes = 2 * 1024 * 1024;
 const max_provider_id_bytes = 256;
-const lock_timeout_ms = 2000;
-const lock_poll_ms = 10;
-
-pub const Boundary = enum {
-    after_write,
-    after_file_sync,
-    after_replace,
-};
-
-pub const Faults = struct {
-    context: ?*anyopaque = null,
-    boundary_fn: ?*const fn (*anyopaque, Boundary) anyerror!void = null,
-
-    pub fn none() Faults {
-        return .{};
-    }
-
-    fn boundary(self: Faults, point: Boundary) !void {
-        const function = self.boundary_fn orelse return;
-        return function(self.context.?, point);
-    }
-};
+pub const Boundary = PrivateFileStore.Boundary;
+pub const Faults = PrivateFileStore.Faults;
 
 pub const Error = error{
     OutOfMemory,
@@ -71,19 +50,20 @@ pub const Snapshot = struct {
 };
 
 pub const Mutation = struct {
-    io: std.Io,
-    directory: std.Io.Dir,
-    lock: std.Io.File,
-    faults: Faults,
+    store: PrivateFileStore.Mutation,
 
     pub fn deinit(self: *Mutation) void {
-        self.lock.close(self.io);
-        self.directory.close(self.io);
+        self.store.deinit();
         self.* = undefined;
     }
 
     pub fn load(self: *Mutation, allocator: std.mem.Allocator) Error!Snapshot {
-        return loadFile(allocator, self.io, self.directory, auth_file_name);
+        const source_text = self.store.readFileAlloc(
+            allocator,
+            auth_file_name,
+            max_document_bytes,
+        ) catch |failure| return mapReadFailure(failure);
+        return decodeOptional(allocator, source_text);
     }
 
     pub fn put(
@@ -135,18 +115,7 @@ pub const Mutation = struct {
             std.crypto.secureZero(u8, encoded);
             allocator.free(encoded);
         }
-        var atomic = self.directory.createFileAtomic(self.io, auth_file_name, .{
-            .permissions = private_file_permissions,
-            .replace = true,
-        }) catch return error.WriteFailed;
-        defer atomic.deinit(self.io);
-        atomic.file.writePositionalAll(self.io, encoded, 0) catch return error.WriteFailed;
-        self.faults.boundary(.after_write) catch return error.WriteFailed;
-        atomic.file.sync(self.io) catch return error.WriteFailed;
-        self.faults.boundary(.after_file_sync) catch return error.WriteFailed;
-        atomic.replace(self.io) catch return error.WriteFailed;
-        self.faults.boundary(.after_replace) catch return error.CommitIndeterminate;
-        syncDirectory(self.directory) catch return error.CommitIndeterminate;
+        self.store.replace(auth_file_name, encoded) catch |failure| return mapWriteFailure(failure);
     }
 };
 
@@ -155,14 +124,15 @@ pub fn load(
     io: std.Io,
     paths: *const ZiPaths,
 ) Error!Snapshot {
-    const directory = std.Io.Dir.openDirAbsolute(io, paths.global_agent, .{}) catch |failure| {
-        return switch (failure) {
-            error.FileNotFound => empty(allocator),
-            else => error.ReadFailed,
-        };
-    };
-    defer directory.close(io);
-    return loadFile(allocator, io, directory, auth_file_name);
+    const source_text = PrivateFileStore.readFileAlloc(
+        allocator,
+        io,
+        paths.home,
+        paths.global_agent,
+        auth_file_name,
+        max_document_bytes,
+    ) catch |failure| return mapReadFailure(failure);
+    return decodeOptional(allocator, source_text);
 }
 
 pub fn beginMutation(io: std.Io, paths: *const ZiPaths) Error!Mutation {
@@ -170,28 +140,14 @@ pub fn beginMutation(io: std.Io, paths: *const ZiPaths) Error!Mutation {
 }
 
 fn beginMutationWithFaults(io: std.Io, paths: *const ZiPaths, faults: Faults) Error!Mutation {
-    var directory = try openPrivateAgentDirectory(io, paths);
-    errdefer directory.close(io);
-    const lock = directory.createFile(io, lock_file_name, .{
-        .read = true,
-        .truncate = false,
-        .permissions = private_file_permissions,
-    }) catch return error.LockFailed;
-    errdefer lock.close(io);
-    try validatePrivateFile(lock.stat(io) catch return error.LockFailed);
-    const deadline = std.Io.Clock.Timestamp.fromNow(io, .{
-        .raw = .fromMilliseconds(lock_timeout_ms),
-        .clock = .awake,
-    });
-    while (!(lock.tryLock(io, .exclusive) catch return error.LockFailed)) {
-        if (std.Io.Clock.Timestamp.now(io, .awake).compare(.gte, deadline)) return error.LockFailed;
-        const poll: std.Io.Timeout = .{ .duration = .{
-            .raw = .fromMilliseconds(lock_poll_ms),
-            .clock = .awake,
-        } };
-        poll.sleep(io) catch return error.LockFailed;
-    }
-    return .{ .io = io, .directory = directory, .lock = lock, .faults = faults };
+    const store = PrivateFileStore.beginMutation(
+        io,
+        paths.home,
+        paths.global_agent,
+        lock_file_name,
+        faults,
+    ) catch |failure| return mapMutationFailure(failure);
+    return .{ .store = store };
 }
 
 pub fn put(
@@ -216,39 +172,39 @@ pub fn remove(
     return mutation.remove(allocator, provider_id);
 }
 
-fn loadFile(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    directory: std.Io.Dir,
-    path: []const u8,
-) Error!Snapshot {
-    const file = directory.openFile(io, path, .{
-        .mode = .read_only,
-        .allow_directory = false,
-        .follow_symlinks = false,
-    }) catch |failure| return switch (failure) {
-        error.FileNotFound => empty(allocator),
-        else => error.ReadFailed,
-    };
-    defer file.close(io);
-    const stat = file.stat(io) catch return error.ReadFailed;
-    try validatePrivateFile(stat);
-    if (stat.size > max_document_bytes) return error.InvalidCredentialFile;
-    var read_buffer: [8192]u8 = undefined;
-    var file_reader = file.reader(io, &read_buffer);
-    const source_text = file_reader.interface.allocRemaining(
-        allocator,
-        .limited(max_document_bytes + 1),
-    ) catch |failure| return switch (failure) {
-        error.OutOfMemory => error.OutOfMemory,
-        else => error.ReadFailed,
-    };
+fn decodeOptional(allocator: std.mem.Allocator, maybe_source_text: ?[]u8) Error!Snapshot {
+    const source_text = maybe_source_text orelse return empty(allocator);
     defer {
         std.crypto.secureZero(u8, source_text);
         allocator.free(source_text);
     }
     if (source_text.len > max_document_bytes) return error.InvalidCredentialFile;
     return decode(allocator, source_text);
+}
+
+fn mapReadFailure(failure: PrivateFileStore.Error) Error {
+    return switch (failure) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.UnsafePath => error.UnsafePath,
+        else => error.ReadFailed,
+    };
+}
+
+fn mapMutationFailure(failure: PrivateFileStore.Error) Error {
+    return switch (failure) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.UnsafePath => error.UnsafePath,
+        else => error.LockFailed,
+    };
+}
+
+fn mapWriteFailure(failure: PrivateFileStore.Error) Error {
+    return switch (failure) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.UnsafePath => error.UnsafePath,
+        error.CommitIndeterminate => error.CommitIndeterminate,
+        else => error.WriteFailed,
+    };
 }
 
 pub fn empty(allocator: std.mem.Allocator) Error!Snapshot {
@@ -391,36 +347,6 @@ fn wipeCredentials(entries: []const credential.Entry) void {
             if (oauth.account_id) |account_id| std.crypto.secureZero(u8, @constCast(account_id));
         },
     };
-}
-
-fn openPrivateAgentDirectory(io: std.Io, paths: *const ZiPaths) Error!std.Io.Dir {
-    _ = std.Io.Dir.createDirPathStatus(.cwd(), io, paths.global_agent, private_dir_permissions) catch
-        return error.UnsafePath;
-    const directory = std.Io.Dir.openDirAbsolute(io, paths.global_agent, .{}) catch return error.UnsafePath;
-    errdefer directory.close(io);
-    const stat = directory.stat(io) catch return error.UnsafePath;
-    if (stat.kind != .directory) return error.UnsafePath;
-    if (comptime builtin.os.tag != .windows) {
-        if (stat.permissions.toMode() & 0o077 != 0) return error.UnsafePath;
-    }
-    return directory;
-}
-
-fn validatePrivateFile(stat: std.Io.File.Stat) Error!void {
-    if (stat.kind != .file or stat.nlink != 1) return error.UnsafePath;
-    if (comptime builtin.os.tag != .windows) {
-        if (stat.permissions.toMode() & 0o077 != 0) return error.UnsafePath;
-    }
-}
-
-fn syncDirectory(directory: std.Io.Dir) !void {
-    if (comptime builtin.os.tag == .windows) return error.OperationUnsupported;
-    while (true) {
-        const result = std.c.fsync(directory.handle);
-        if (result == 0) return;
-        if (std.c.errno(result) == .INTR) continue;
-        return error.DirectorySyncFailed;
-    }
 }
 
 fn temporaryPath(temporary: *std.testing.TmpDir, buffer: []u8) ![]const u8 {
