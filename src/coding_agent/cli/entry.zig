@@ -98,6 +98,10 @@ fn writeCliDiagnostics(writer: *std.Io.Writer, diagnostics: []const surface.Diag
             "Session selection is already set; {s} cannot be combined with it.\n",
             .{option},
         ),
+        .conflicting_project_trust_option => |option| try writer.print(
+            "Project trust is already set; {s} cannot be combined with it.\n",
+            .{option},
+        ),
         .conflicting_system_prompt_option => |option| try writer.print(
             "System prompt customization is already set; {s} cannot be combined with it.\n",
             .{option},
@@ -120,6 +124,8 @@ fn writeCliHelp(writer: *std.Io.Writer) !void {
         \\  --provider VALUE     Select a provider
         \\  --model VALUE        Select a model
         \\  --api-key VALUE      Use an explicit API key
+        \\  -a, --approve        Trust project prompt files for this launch
+        \\  -na, --no-approve    Ignore project prompt files for this launch
         \\  --rules TEXT         Append session rules to the default system prompt
         \\  --system-prompt TEXT Replace the default system prompt
         \\  -h, --help           Show help
@@ -128,6 +134,8 @@ fn writeCliHelp(writer: *std.Io.Writer) !void {
         \\Prompt files:
         \\  $HOME/.zi/agent/SYSTEM.md         Replace the composed prompt base
         \\  $HOME/.zi/agent/APPEND_SYSTEM.md  Append persistent rules
+        \\  $CWD/.zi/SYSTEM.md                Replace the base when approved
+        \\  $CWD/.zi/APPEND_SYSTEM.md         Replace persistent rules when approved
         \\
         \\Context files:
         \\  $HOME/.zi/agent/AGENTS.md         Add global coding instructions

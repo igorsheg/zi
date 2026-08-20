@@ -1,5 +1,6 @@
 const std = @import("std");
 const BoundedTextFile = @import("BoundedTextFile.zig");
+const ProjectTrust = @import("ProjectTrust.zig");
 const ZiPaths = @import("ZiPaths.zig");
 
 const PromptFiles = @This();
@@ -30,30 +31,40 @@ pub fn load(
     io: std.Io,
     paths: *const ZiPaths,
     requested: Requested,
+    project_trust: ProjectTrust.Decision,
 ) Error!PromptFiles {
     var arena = std.heap.ArenaAllocator.init(allocator);
     errdefer arena.deinit();
     const owned = arena.allocator();
-    const directory = std.Io.Dir.openDirAbsolute(io, paths.global_agent, .{}) catch |failure| {
-        return switch (failure) {
-            error.FileNotFound => .{
-                .arena = arena,
-                .system_text = null,
-                .append_text = null,
-            },
-            error.Canceled => error.Cancelled,
-            else => error.PromptFileReadFailed,
-        };
-    };
-    defer directory.close(io);
-    const system_text = if (requested.system)
-        try loadOptionalText(owned, io, directory, system_file_name)
+
+    const project_directory: ?std.Io.Dir = if (project_trust == .trusted)
+        try openOptionalDirectory(io, paths.project, false)
     else
         null;
-    const append_text = if (requested.append)
-        try loadOptionalText(owned, io, directory, append_file_name)
+    defer if (project_directory) |directory| directory.close(io);
+    var system_text: ?[]const u8 = if (requested.system and project_directory != null)
+        try loadOptionalText(owned, io, project_directory.?, system_file_name)
     else
         null;
+    var append_text: ?[]const u8 = if (requested.append and project_directory != null)
+        try loadOptionalText(owned, io, project_directory.?, append_file_name)
+    else
+        null;
+
+    const needs_global_system = requested.system and system_text == null;
+    const needs_global_append = requested.append and append_text == null;
+    if (needs_global_system or needs_global_append) {
+        const global_directory = try openOptionalDirectory(io, paths.global_agent, true);
+        if (global_directory) |directory| {
+            defer directory.close(io);
+            if (needs_global_system) {
+                system_text = try loadOptionalText(owned, io, directory, system_file_name);
+            }
+            if (needs_global_append) {
+                append_text = try loadOptionalText(owned, io, directory, append_file_name);
+            }
+        }
+    }
     return .{
         .arena = arena,
         .system_text = system_text,
@@ -72,6 +83,21 @@ pub fn system(self: *const PromptFiles) ?[]const u8 {
 
 pub fn append(self: *const PromptFiles) ?[]const u8 {
     return self.append_text;
+}
+
+fn openOptionalDirectory(
+    io: std.Io,
+    path: []const u8,
+    follow_symlinks: bool,
+) Error!?std.Io.Dir {
+    return std.Io.Dir.openDirAbsolute(io, path, .{ .follow_symlinks = follow_symlinks }) catch |failure| {
+        return switch (failure) {
+            error.FileNotFound => null,
+            error.Canceled => error.Cancelled,
+            error.NotDir, error.SymLinkLoop => error.UnsafePromptFile,
+            else => error.PromptFileReadFailed,
+        };
+    };
 }
 
 fn loadOptionalText(
@@ -126,7 +152,7 @@ test "prompt files load requested global text and own its bytes" {
     var files = try load(std.testing.allocator, std.testing.io, &paths, .{
         .system = true,
         .append = true,
-    });
+    }, .untrusted);
     defer files.deinit();
     try temporary.dir.writeFile(std.testing.io, .{
         .sub_path = ".zi/agent/SYSTEM.md",
@@ -149,10 +175,129 @@ test "prompt files distinguish absent and unrequested sources" {
     var paths = try testPaths(&temporary, &root_buffer);
     defer paths.deinit();
 
-    var files = try load(std.testing.allocator, std.testing.io, &paths, .{ .append = true });
+    var files = try load(std.testing.allocator, std.testing.io, &paths, .{ .append = true }, .untrusted);
     defer files.deinit();
     try std.testing.expect(files.system() == null);
     try std.testing.expect(files.append() == null);
+}
+
+test "trusted project prompt files shadow global sources independently" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try temporary.dir.createDirPath(std.testing.io, ".zi/agent");
+    try temporary.dir.writeFile(std.testing.io, .{
+        .sub_path = ".zi/agent/SYSTEM.md",
+        .data = "Global base.",
+    });
+    try temporary.dir.writeFile(std.testing.io, .{
+        .sub_path = ".zi/agent/APPEND_SYSTEM.md",
+        .data = "Global rules.",
+    });
+    try temporary.dir.writeFile(std.testing.io, .{
+        .sub_path = ".zi/SYSTEM.md",
+        .data = "Project base.",
+    });
+    try temporary.dir.writeFile(std.testing.io, .{
+        .sub_path = ".zi/APPEND_SYSTEM.md",
+        .data = "Project rules.",
+    });
+    var root_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    var paths = try testPaths(&temporary, &root_buffer);
+    defer paths.deinit();
+
+    var project = try load(std.testing.allocator, std.testing.io, &paths, .{
+        .system = true,
+        .append = true,
+    }, .trusted);
+    try std.testing.expectEqualStrings("Project base.", project.system().?);
+    try std.testing.expectEqualStrings("Project rules.", project.append().?);
+    project.deinit();
+
+    try temporary.dir.deleteFile(std.testing.io, ".zi/APPEND_SYSTEM.md");
+    var partial = try load(std.testing.allocator, std.testing.io, &paths, .{
+        .system = true,
+        .append = true,
+    }, .trusted);
+    try std.testing.expectEqualStrings("Project base.", partial.system().?);
+    try std.testing.expectEqualStrings("Global rules.", partial.append().?);
+    partial.deinit();
+
+    try temporary.dir.deleteFile(std.testing.io, ".zi/SYSTEM.md");
+    try temporary.dir.createDir(std.testing.io, ".zi/SYSTEM.md", .default_dir);
+    var untrusted = try load(std.testing.allocator, std.testing.io, &paths, .{
+        .system = true,
+        .append = true,
+    }, .untrusted);
+    defer untrusted.deinit();
+    try std.testing.expectEqualStrings("Global base.", untrusted.system().?);
+    try std.testing.expectEqualStrings("Global rules.", untrusted.append().?);
+}
+
+test "trusted project prompt files prevent reads from shadowed global sources" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try temporary.dir.createDirPath(std.testing.io, ".zi/agent/SYSTEM.md");
+    try temporary.dir.writeFile(std.testing.io, .{
+        .sub_path = ".zi/SYSTEM.md",
+        .data = "Project base.",
+    });
+    var root_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    var paths = try testPaths(&temporary, &root_buffer);
+    defer paths.deinit();
+
+    var files = try load(
+        std.testing.allocator,
+        std.testing.io,
+        &paths,
+        .{ .system = true },
+        .trusted,
+    );
+    defer files.deinit();
+    try std.testing.expectEqualStrings("Project base.", files.system().?);
+}
+
+test "trusted project prompt files reject a linked project configuration root" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try temporary.dir.createDirPath(std.testing.io, "home/.zi/agent");
+    try temporary.dir.createDir(std.testing.io, "workspace", .default_dir);
+    try temporary.dir.createDir(std.testing.io, "outside", .default_dir);
+    try temporary.dir.writeFile(std.testing.io, .{
+        .sub_path = "home/.zi/agent/SYSTEM.md",
+        .data = "Global base.",
+    });
+    try temporary.dir.writeFile(std.testing.io, .{
+        .sub_path = "outside/SYSTEM.md",
+        .data = "Linked project base.",
+    });
+    try temporary.dir.symLink(
+        std.testing.io,
+        "../outside",
+        "workspace/.zi",
+        .{ .is_directory = true },
+    );
+    var root_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root = try temporaryPath(&temporary, &root_buffer);
+    const cwd = try std.fs.path.resolve(std.testing.allocator, &.{ root, "workspace" });
+    defer std.testing.allocator.free(cwd);
+    const home = try std.fs.path.resolve(std.testing.allocator, &.{ root, "home" });
+    defer std.testing.allocator.free(home);
+    var paths = try ZiPaths.init(std.testing.allocator, cwd, home);
+    defer paths.deinit();
+
+    try std.testing.expectError(
+        error.UnsafePromptFile,
+        load(std.testing.allocator, std.testing.io, &paths, .{ .system = true }, .trusted),
+    );
+    var untrusted = try load(
+        std.testing.allocator,
+        std.testing.io,
+        &paths,
+        .{ .system = true },
+        .untrusted,
+    );
+    defer untrusted.deinit();
+    try std.testing.expectEqualStrings("Global base.", untrusted.system().?);
 }
 
 test "prompt files reject invalid excessive and non-regular sources" {
@@ -169,7 +314,7 @@ test "prompt files reject invalid excessive and non-regular sources" {
     });
     try std.testing.expectError(
         error.InvalidPromptFile,
-        load(std.testing.allocator, std.testing.io, &paths, .{ .system = true }),
+        load(std.testing.allocator, std.testing.io, &paths, .{ .system = true }, .untrusted),
     );
     try temporary.dir.writeFile(std.testing.io, .{
         .sub_path = ".zi/agent/SYSTEM.md",
@@ -177,7 +322,7 @@ test "prompt files reject invalid excessive and non-regular sources" {
     });
     try std.testing.expectError(
         error.InvalidPromptFile,
-        load(std.testing.allocator, std.testing.io, &paths, .{ .system = true }),
+        load(std.testing.allocator, std.testing.io, &paths, .{ .system = true }, .untrusted),
     );
 
     const oversized = try std.testing.allocator.alloc(u8, max_file_bytes + 1);
@@ -189,14 +334,14 @@ test "prompt files reject invalid excessive and non-regular sources" {
     });
     try std.testing.expectError(
         error.PromptFileTooLarge,
-        load(std.testing.allocator, std.testing.io, &paths, .{ .system = true }),
+        load(std.testing.allocator, std.testing.io, &paths, .{ .system = true }, .untrusted),
     );
 
     try temporary.dir.deleteFile(std.testing.io, ".zi/agent/SYSTEM.md");
     try temporary.dir.createDir(std.testing.io, ".zi/agent/SYSTEM.md", .default_dir);
     try std.testing.expectError(
         error.UnsafePromptFile,
-        load(std.testing.allocator, std.testing.io, &paths, .{ .system = true }),
+        load(std.testing.allocator, std.testing.io, &paths, .{ .system = true }, .untrusted),
     );
 
     try temporary.dir.deleteTree(std.testing.io, ".zi/agent/SYSTEM.md");
@@ -212,7 +357,7 @@ test "prompt files reject invalid excessive and non-regular sources" {
     );
     try std.testing.expectError(
         error.UnsafePromptFile,
-        load(std.testing.allocator, std.testing.io, &paths, .{ .system = true }),
+        load(std.testing.allocator, std.testing.io, &paths, .{ .system = true }, .untrusted),
     );
 }
 
@@ -224,7 +369,7 @@ fn loadAndDeinit(allocator: std.mem.Allocator, context: *AllocationContext) !voi
     var files = try load(allocator, std.testing.io, context.paths, .{
         .system = true,
         .append = true,
-    });
+    }, .trusted);
     files.deinit();
 }
 
@@ -239,6 +384,14 @@ test "prompt files settle every allocation failure" {
     try temporary.dir.writeFile(std.testing.io, .{
         .sub_path = ".zi/agent/APPEND_SYSTEM.md",
         .data = "Global rules.",
+    });
+    try temporary.dir.writeFile(std.testing.io, .{
+        .sub_path = ".zi/SYSTEM.md",
+        .data = "Project base.",
+    });
+    try temporary.dir.writeFile(std.testing.io, .{
+        .sub_path = ".zi/APPEND_SYSTEM.md",
+        .data = "Project rules.",
     });
     var root_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     var paths = try testPaths(&temporary, &root_buffer);

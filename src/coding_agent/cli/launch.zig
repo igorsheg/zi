@@ -109,6 +109,7 @@ pub fn runPrintLaunch(
         .requested_provider = request.provider,
         .requested_model = request.model,
         .cli_api_key = request.api_key,
+        .project_trust = request.project_trust,
         .environment = .{ .entries = environment_entries[0..environment_count] },
         .options = .{ .prompt = .{ .policy = prompt_policy } },
     }) catch |failure| {

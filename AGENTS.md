@@ -203,9 +203,14 @@ root. Feature owners define their directories and files beneath those roots.
 Settings, credentials, resources, and persistent session creation consume the
 cwd-bound roots. Do not join `.zi` or re-read process cwd inside those owners.
 
+`ProjectTrust` owns per-launch project prompt-file admission. Non-interactive
+automatic trust is closed; explicit approve and reject decisions are not persisted.
+Trusted project prompt files are resolved from the effective session cwd and
+shadow global prompt files independently by role.
+
 `ContextFiles` owns bounded global and cwd-ancestor instruction discovery.
-Ancestor instructions apply from broadest to narrowest scope. This does not grant
-project-local prompt replacement files trust.
+Ancestor instructions apply from broadest to narrowest scope regardless of
+project-resource trust.
 
 The session journal is the append-only JSONL authority for one durable session
 when persistence is admitted. Torn-tail repair happens on the next append. The

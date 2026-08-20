@@ -1,4 +1,5 @@
 const std = @import("std");
+const ProjectTrust = @import("../ProjectTrust.zig");
 
 const max_arguments = 64;
 const max_argument_bytes = 256 * 1024;
@@ -31,6 +32,7 @@ pub const LaunchRequest = struct {
     model: ?[]const u8 = null,
     api_key: ?[]const u8 = null,
     file_path: ?[]const u8 = null,
+    project_trust: ProjectTrust.Intent = .automatic,
     system_prompt: PromptIntent = .default,
     message_buffer: [max_arguments][]const u8 = undefined,
     message_count: usize = 0,
@@ -64,6 +66,7 @@ pub const Diagnostic = union(enum) {
     unavailable_mode: Mode,
     invalid_auth_command: []const u8,
     conflicting_session_option: []const u8,
+    conflicting_project_trust_option: []const u8,
     conflicting_system_prompt_option: []const u8,
     too_many_file_inputs,
     unknown_option: []const u8,
@@ -140,6 +143,10 @@ pub fn parseInvocation(argv: []const []const u8, terminal: Terminal) ParseResult
                 continue;
             };
             admitSessionIntent(&launch, .{ .open = value }, argument, &rejection);
+        } else if (std.mem.eql(u8, argument, "--approve") or std.mem.eql(u8, argument, "-a")) {
+            admitProjectTrust(&launch, .approve, argument, &rejection);
+        } else if (std.mem.eql(u8, argument, "--no-approve") or std.mem.eql(u8, argument, "-na")) {
+            admitProjectTrust(&launch, .reject, argument, &rejection);
         } else if (std.mem.eql(u8, argument, "--rules") or
             std.mem.eql(u8, argument, "--append-system-prompt"))
         {
@@ -247,6 +254,19 @@ fn admitSessionIntent(
     launch.session = intent;
 }
 
+fn admitProjectTrust(
+    launch: *LaunchRequest,
+    intent: ProjectTrust.Intent,
+    option: []const u8,
+    rejection: *Rejection,
+) void {
+    if (launch.project_trust != .automatic) {
+        rejection.add(.{ .conflicting_project_trust_option = option });
+        return;
+    }
+    launch.project_trust = intent;
+}
+
 fn admitSystemPrompt(
     launch: *LaunchRequest,
     intent: PromptIntent,
@@ -286,6 +306,7 @@ test "CLI surface admits one typed launch invocation" {
     try std.testing.expect(parsed == .admitted);
     const launch = parsed.admitted.launch;
     try std.testing.expect(launch.session == .new);
+    try std.testing.expectEqual(ProjectTrust.Intent.automatic, launch.project_trust);
     try std.testing.expectEqualStrings("openai", launch.provider.?);
     try std.testing.expectEqualStrings("gpt-5", launch.model.?);
     try std.testing.expectEqualStrings("secret", launch.api_key.?);
@@ -293,6 +314,32 @@ test "CLI surface admits one typed launch invocation" {
     try std.testing.expectEqual(@as(usize, 2), launch.messages().len);
     try std.testing.expectEqualStrings("first", launch.messages()[0]);
     try std.testing.expectEqualStrings("second", launch.messages()[1]);
+}
+
+test "CLI surface admits and bounds project trust overrides" {
+    const approved = parseInvocation(&.{ "--print", "--approve", "inspect" }, .{
+        .stdin_is_tty = true,
+        .stdout_is_tty = true,
+    });
+    try std.testing.expect(approved == .admitted);
+    try std.testing.expectEqual(ProjectTrust.Intent.approve, approved.admitted.launch.project_trust);
+
+    const rejected = parseInvocation(&.{ "--print", "-na", "inspect" }, .{
+        .stdin_is_tty = true,
+        .stdout_is_tty = true,
+    });
+    try std.testing.expect(rejected == .admitted);
+    try std.testing.expectEqual(ProjectTrust.Intent.reject, rejected.admitted.launch.project_trust);
+
+    const conflicting = parseInvocation(&.{ "--print", "-a", "--no-approve" }, .{
+        .stdin_is_tty = true,
+        .stdout_is_tty = true,
+    });
+    try std.testing.expect(conflicting == .rejected);
+    try std.testing.expectEqualStrings(
+        "--no-approve",
+        conflicting.rejected.diagnostics()[0].conflicting_project_trust_option,
+    );
 }
 
 test "CLI surface admits appended and replacement system prompts" {

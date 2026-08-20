@@ -7,6 +7,7 @@ const CredentialStore = @import("CredentialStore.zig");
 const ContextFiles = @import("ContextFiles.zig");
 const ModelConfigSnapshot = @import("ModelConfigSnapshot.zig");
 const ModelResolution = @import("ModelResolution.zig");
+const ProjectTrust = @import("ProjectTrust.zig");
 const PromptFiles = @import("PromptFiles.zig");
 const SessionFormat = @import("SessionFormat.zig");
 const SessionJournal = @import("SessionJournal.zig");
@@ -86,6 +87,7 @@ pub const Inputs = struct {
     requested_provider: ?[]const u8 = null,
     requested_model: ?[]const u8 = null,
     cli_api_key: ?[]const u8 = null,
+    project_trust: ProjectTrust.Intent = .automatic,
     environment: ai.auth.Environment = .{},
     options: AgentSessionRuntime.Options = .{},
 };
@@ -170,8 +172,9 @@ fn createOwned(
     var runtime_options = inputs.options;
     runtime_options.prompt.working_directory = selection.pathsView().cwd;
     const requested_prompt_files = requestedPromptFiles(runtime_options.prompt.policy);
+    const project_trust = ProjectTrust.resolve(inputs.project_trust);
     var prompt_files: ?PromptFiles = if (requested_prompt_files.system or requested_prompt_files.append)
-        try PromptFiles.load(allocator, io, selection.pathsView(), requested_prompt_files)
+        try PromptFiles.load(allocator, io, selection.pathsView(), requested_prompt_files, project_trust)
     else
         null;
     defer if (prompt_files) |*files| files.deinit();
@@ -492,6 +495,14 @@ test "runtime services compose effective paths, models, prompts, credentials, du
         .data = "Ignored global rules.",
     });
     try temporary.dir.writeFile(std.testing.io, .{
+        .sub_path = ".zi/SYSTEM.md",
+        .data = "Untrusted project base.",
+    });
+    try temporary.dir.writeFile(std.testing.io, .{
+        .sub_path = ".zi/APPEND_SYSTEM.md",
+        .data = "Untrusted project rules.",
+    });
+    try temporary.dir.writeFile(std.testing.io, .{
         .sub_path = ".zi/agent/AGENTS.md",
         .data = "Global context instructions.",
     });
@@ -521,6 +532,8 @@ test "runtime services compose effective paths, models, prompts, credentials, du
             if (std.mem.find(u8, request.body, "Use focused tests.") == null) return error.Rejected;
             if (std.mem.find(u8, request.body, "Global context instructions.") == null) return error.Rejected;
             if (std.mem.find(u8, request.body, "Project context instructions.") == null) return error.Rejected;
+            if (std.mem.find(u8, request.body, "Untrusted project base.") != null) return error.Rejected;
+            if (std.mem.find(u8, request.body, "Untrusted project rules.") != null) return error.Rejected;
             if (std.mem.find(u8, request.body, "Ignored global rules.") != null) return error.Rejected;
             self.prompt_seen = true;
         }
@@ -622,6 +635,77 @@ test "runtime services discover global prompt files for default composition" {
         services.session().systemPrompt(),
         "<human_rules>\nDiscovered rules.\n</human_rules>",
     ) != null);
+}
+
+test "runtime services gate project prompt precedence with launch trust" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try temporary.dir.createDirPath(std.testing.io, ".zi/agent");
+    try temporary.dir.writeFile(std.testing.io, .{
+        .sub_path = ".zi/agent/SYSTEM.md",
+        .data = "Global base.",
+    });
+    try temporary.dir.writeFile(std.testing.io, .{
+        .sub_path = ".zi/agent/APPEND_SYSTEM.md",
+        .data = "Global rules.",
+    });
+    try temporary.dir.writeFile(std.testing.io, .{
+        .sub_path = ".zi/SYSTEM.md",
+        .data = "Project base.",
+    });
+    try temporary.dir.writeFile(std.testing.io, .{
+        .sub_path = ".zi/APPEND_SYSTEM.md",
+        .data = "Project rules.",
+    });
+    var root_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root = try temporaryPath(&temporary, &root_buffer);
+    var sources: TestSources = .{};
+    var fake = fake_api.FakeTransport.init(&.{});
+
+    var automatic = try createWithTransport(std.testing.allocator, std.testing.io, .{
+        .startup_cwd = root,
+        .home = root,
+        .session = .new,
+        .sources = sources.view(),
+        .requested_provider = "openai",
+        .requested_model = "gpt-5.6",
+        .cli_api_key = "secret",
+    }, fake.transport());
+    try std.testing.expect(std.mem.startsWith(u8, automatic.session().systemPrompt(), "Global base."));
+    try std.testing.expect(std.mem.find(u8, automatic.session().systemPrompt(), "Global rules.") != null);
+    automatic.deinit();
+
+    var approved = try createWithTransport(std.testing.allocator, std.testing.io, .{
+        .startup_cwd = root,
+        .home = root,
+        .session = .new,
+        .sources = sources.view(),
+        .requested_provider = "openai",
+        .requested_model = "gpt-5.6",
+        .cli_api_key = "secret",
+        .project_trust = .approve,
+    }, fake.transport());
+    try std.testing.expect(std.mem.startsWith(u8, approved.session().systemPrompt(), "Project base."));
+    try std.testing.expect(std.mem.find(u8, approved.session().systemPrompt(), "Project rules.") != null);
+    approved.deinit();
+
+    var explicit_rules = try createWithTransport(std.testing.allocator, std.testing.io, .{
+        .startup_cwd = root,
+        .home = root,
+        .session = .new,
+        .sources = sources.view(),
+        .requested_provider = "openai",
+        .requested_model = "gpt-5.6",
+        .cli_api_key = "secret",
+        .project_trust = .approve,
+        .options = .{ .prompt = .{ .policy = .{ .composed = .{
+            .rules = &.{"Explicit rules."},
+        } } } },
+    }, fake.transport());
+    defer explicit_rules.deinit();
+    try std.testing.expect(std.mem.startsWith(u8, explicit_rules.session().systemPrompt(), "Project base."));
+    try std.testing.expect(std.mem.find(u8, explicit_rules.session().systemPrompt(), "Explicit rules.") != null);
+    try std.testing.expect(std.mem.find(u8, explicit_rules.session().systemPrompt(), "Project rules.") == null);
 }
 
 test "runtime services do not read global prompt files shadowed by explicit policy" {
@@ -802,8 +886,8 @@ test "long-lived runtime rechecks OAuth expiry before each invocation" {
 test "runtime services discover context from a resumed session working directory" {
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();
-    try temporary.dir.createDir(std.testing.io, "launch", .default_dir);
-    try temporary.dir.createDir(std.testing.io, "stored", .default_dir);
+    try temporary.dir.createDirPath(std.testing.io, "launch/.zi");
+    try temporary.dir.createDirPath(std.testing.io, "stored/.zi");
     try temporary.dir.writeFile(std.testing.io, .{
         .sub_path = "launch/AGENTS.md",
         .data = "Launch directory context.",
@@ -811,6 +895,14 @@ test "runtime services discover context from a resumed session working directory
     try temporary.dir.writeFile(std.testing.io, .{
         .sub_path = "stored/AGENTS.md",
         .data = "Stored directory context.",
+    });
+    try temporary.dir.writeFile(std.testing.io, .{
+        .sub_path = "launch/.zi/SYSTEM.md",
+        .data = "Launch project base.",
+    });
+    try temporary.dir.writeFile(std.testing.io, .{
+        .sub_path = "stored/.zi/SYSTEM.md",
+        .data = "Stored project base.",
     });
     var root_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const root = try temporaryPath(&temporary, &root_buffer);
@@ -840,9 +932,12 @@ test "runtime services discover context from a resumed session working directory
         .session = .{ .open = journal_path },
         .sources = sources.view(),
         .cli_api_key = "secret",
+        .project_trust = .approve,
     }, fake.transport());
     defer resumed.deinit();
     try std.testing.expectEqualStrings(stored_cwd, resumed.paths().cwd);
+    try std.testing.expect(std.mem.startsWith(u8, resumed.session().systemPrompt(), "Stored project base."));
+    try std.testing.expect(std.mem.find(u8, resumed.session().systemPrompt(), "Launch project base.") == null);
     try std.testing.expect(std.mem.find(
         u8,
         resumed.session().systemPrompt(),
