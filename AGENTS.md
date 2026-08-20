@@ -154,8 +154,8 @@ them, and do not let a search result inside them influence a decision.
 Each module directory has a `root.zig` that is its public seam to other modules.
 Owners inside one module may import sibling files directly; callers outside it
 use `root.zig` instead of reaching through the boundary. Export only declarations
-with a current cross-module caller; `coding_agent/root.zig` currently exposes the
-reachable CLI seam and keeps its implementation owners private. A root's
+with a current cross-module caller. `coding_agent/root.zig` exposes the CLI and
+interactive-client contracts consumed by the process root and `smol`. A root's
 `test { _ = ... }` block is also the test registry: a new file in the module is
 not covered by `zig build test` until it is referenced there.
 
@@ -171,7 +171,11 @@ Module ownership (stable boundaries):
 - `src/coding_agent/` owns coding-agent policy: the session (identity,
   selection, durable journal, commits, on-disk format), the runtime that admits
   a model and its credentials, cwd-bound tools, `ZiPaths`, model config and
-  resolution, the CLI process adapter, and the interactive application.
+  resolution, the CLI process adapter, the serialized turn worker, and
+  presentation-neutral interactive behavior.
+- `src/smol/` owns the concrete non-alternate-screen interactive client: terminal
+  lifecycle, input decoding and editing, event polling, and rendering. It
+  consumes only the public coding-agent interactive contract.
 - `src/BoundedJson.zig` is the shared bounded JSON helper. Domain-specific
   validation stays with the owning module.
 - `src/coding_agent/BoundedTextFile.zig` shares optional bounded UTF-8 file-read
@@ -180,8 +184,11 @@ Module ownership (stable boundaries):
 - `data/model_catalog.json` plus `tools/model_catalog.zig` own catalog
   generation. The compiled snapshot lives in `src/ai/model_catalog_snapshot.zig`.
 
-Dependencies point one way: `coding_agent` depends on `agent` and `ai`; `agent`
-depends on `ai`; `ai` depends on neither. Do not add a back edge.
+Dependencies point one way: `smol` depends on `coding_agent` and `ai`;
+`coding_agent` depends on `agent` and `ai`; `agent` depends on `ai`; `ai`
+depends on neither. The CLI accepts an erased interactive frontend from
+`src/main.zig`; neither `coding_agent` nor its CLI may import `smol`. Do not add a
+back edge.
 
 For the admitted product behavior right now (providers, tools, and what `main`
 actually does), trust `src/`. Do not invent extensions, RPC, Code Mode, MCP, or
@@ -247,24 +254,25 @@ event-count and aggregate-byte limits rather than locking the agent or retaining
 borrowed callback data. `SessionTranscript` owns the presentation-neutral active
 branch projection of restored journal entries. It preserves user, assistant,
 tool, model-change, failure, cancellation, and interruption facts independently
-of the cleaned provider-context projection. `coding_agent/interactive/` owns the
-interactive application. Its `Policy` owns bounded sequential follow-ups and
-deterministic submission, cancellation, restoration, stale-run, and
-poisoned-session transitions. `App` applies that policy to worker facts and
-input actions, and clears editor drafts only after policy and worker admission
-succeed. The CLI owns process adaptation and launch composition, not terminal
-mechanics or interactive policy.
+of the cleaned provider-context projection. `coding_agent/interactive/` owns
+frontend-neutral interactive behavior. `SessionPolicy` owns bounded sequential
+follow-ups and deterministic submission, cancellation, restoration, stale-run,
+and poisoned-session transitions. `SessionController` applies that policy to
+`TurnWorker`, emits borrowed admitted facts, and clears no client-owned draft.
+The CLI owns process adaptation, runtime and worker launch, frontend invocation,
+and exit mapping. It does not own terminal mechanics, input state, or rendering.
 
-`interactive/terminal/Session.zig` owns raw-mode admission and best-effort
-cooked-mode, style, hyperlink, and cursor restoration. Interactive mode starts
-on the normal screen without mouse tracking, alternate-screen rendering,
-keyboard-protocol negotiation, or frame diffs. `interactive/input/Decoder.zig`
-owns bounded escape parsing and resolves a bare Escape only after a quiet-period
-deadline. `interactive/EventLoop.zig` handles bounded terminal bytes, resize
-observation, worker fact collection, and input-deadline callbacks on the
-terminal-owning thread. It does not interpret coding-agent input actions.
-`NormalScreenRenderer` uses append-only output, sanitizes all provider and tool
-text before writing terminal bytes, and redraws only the active prompt line.
+`smol/terminal/Session.zig` owns raw-mode admission and best-effort cooked-mode,
+style, hyperlink, and cursor restoration. The current smol client starts on the
+normal screen without mouse tracking, alternate-screen rendering,
+keyboard-protocol negotiation, or frame diffs. `smol/input/Decoder.zig` owns
+bounded escape parsing and resolves a bare Escape only after a quiet-period
+deadline. `smol/EventLoop.zig` handles bounded terminal bytes, resize observation,
+worker fact collection, and input-deadline callbacks on the terminal-owning
+thread. It does not interpret coding-agent input actions.
+`smol/NormalScreenRenderer.zig` uses append-only output, sanitizes all provider
+and tool text before writing terminal bytes, and redraws only the active prompt
+line.
 
 Credentials are admitted values on the session runtime, not ambient environment
 reads scattered through the tree. The process edge reads the environment once

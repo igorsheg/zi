@@ -1,7 +1,10 @@
 const std = @import("std");
-const ai = @import("../../ai/root.zig");
-const session_event = @import("../AgentSessionEvent.zig");
-const SessionTranscript = @import("../SessionTranscript.zig");
+const ai = @import("../ai/root.zig");
+const interactive = @import("../coding_agent/root.zig").interactive;
+const session_event = struct {
+    const Event = interactive.Event;
+};
+const SessionTranscript = interactive.SessionTranscript;
 const LineEditor = @import("input/LineEditor.zig");
 
 const NormalScreenRenderer = @This();

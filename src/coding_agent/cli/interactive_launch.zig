@@ -8,10 +8,12 @@ const surface = @import("surface.zig");
 
 const max_initial_prompts = 64;
 
-/// Takes ownership of the created runtime on successful worker admission.
+/// Takes ownership of the created runtime on successful worker admission, then
+/// runs the frontend selected by the process composition root.
 pub fn runInteractiveLaunch(
     request: *const surface.LaunchRequest,
     context: launch.LaunchContext,
+    frontend: interactive.Frontend,
 ) !print_mode.ExitCode {
     var prepared = (try launch.prepareInitial(request, context, false)) orelse return .failure;
     defer prepared.deinit();
@@ -28,28 +30,29 @@ pub fn runInteractiveLaunch(
         return .failure;
     };
     defer worker.deinit();
-
-    var app = interactive.App.init(
+    var controller = interactive.SessionController.init(
         context.allocator,
-        context.io,
         worker,
-        context.stdout,
-        .{},
+        interactive.default_limits,
     ) catch |failure| {
-        try context.stderr.print("Unable to start interactive mode: {s}.\n", .{@errorName(failure)});
+        try context.stderr.print("Unable to start interactive behavior: {s}.\n", .{@errorName(failure)});
         return .failure;
     };
-    defer app.deinit();
+    defer controller.deinit();
 
     var prompt_buffer: [max_initial_prompts][]const u8 = undefined;
     const prompts = collectInitialPrompts(&prepared.value, &prompt_buffer);
-    const cause = app.run(
-        std.Io.File.stdin(),
-        std.Io.File.stdout(),
-        transcript,
-        .{ .initial_prompts = prompts },
-    ) catch |failure| {
-        try context.stderr.print("Interactive mode failed: {s}.\n", .{@errorName(failure)});
+    const cause = frontend.run(.{
+        .allocator = context.allocator,
+        .io = context.io,
+        .controller = &controller,
+        .transcript = transcript,
+        .initial_prompts = prompts,
+        .input = std.Io.File.stdin(),
+        .output = std.Io.File.stdout(),
+        .writer = context.stdout,
+    }) catch |failure| {
+        try context.stderr.print("Interactive frontend failed: {s}.\n", .{@errorName(failure)});
         return .failure;
     };
     return switch (cause) {

@@ -1,4 +1,5 @@
 const std = @import("std");
+const interactive = @import("../interactive/root.zig");
 const interactive_launch = @import("interactive_launch.zig");
 const launch = @import("launch.zig");
 const surface = @import("surface.zig");
@@ -7,7 +8,7 @@ const trust = @import("trust.zig");
 const version = "0.1.0";
 
 /// Adapts the process once, dispatches one admitted invocation, and returns its exit code.
-pub fn run(init: std.process.Init) !u8 {
+pub fn run(init: std.process.Init, frontend: interactive.Frontend) !u8 {
     const allocator = init.gpa;
     const io = init.io;
     var stdout_buffer: [4096]u8 = undefined;
@@ -47,7 +48,14 @@ pub fn run(init: std.process.Init) !u8 {
                 return 0;
             },
             .trust => |request| return runTrustInvocation(init, request, stdout, stderr),
-            .launch => |request| return runLaunchInvocation(init, &request, stdin_is_tty, stdout, stderr),
+            .launch => |request| return runLaunchInvocation(
+                init,
+                &request,
+                frontend,
+                stdin_is_tty,
+                stdout,
+                stderr,
+            ),
         },
     }
 }
@@ -79,6 +87,7 @@ fn runTrustInvocation(
 fn runLaunchInvocation(
     init: std.process.Init,
     request: *const surface.LaunchRequest,
+    frontend: interactive.Frontend,
     stdin_is_tty: bool,
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
@@ -107,7 +116,7 @@ fn runLaunchInvocation(
         .stderr = stderr,
     };
     const result = switch (request.mode) {
-        .interactive => try interactive_launch.runInteractiveLaunch(request, context),
+        .interactive => try interactive_launch.runInteractiveLaunch(request, context, frontend),
         .print => try launch.runPrintLaunch(request, context),
     };
     return @intFromEnum(result);

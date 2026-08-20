@@ -2,7 +2,7 @@ const std = @import("std");
 const agent = @import("../../agent/root.zig");
 const session_event = @import("../AgentSessionEvent.zig");
 
-const Policy = @This();
+const SessionPolicy = @This();
 
 pub const Limits = struct {
     max_prompt_bytes: usize = 1024 * 1024,
@@ -12,6 +12,11 @@ pub const Limits = struct {
 };
 
 pub const default_limits: Limits = .{};
+
+pub const InitError = error{
+    OutOfMemory,
+    InvalidLimits,
+};
 
 pub const Error = error{
     OutOfMemory,
@@ -100,7 +105,7 @@ settled_run_id: ?agent.event.RunId = null,
 pub fn init(
     allocator: std.mem.Allocator,
     limits: Limits,
-) Error!Policy {
+) InitError!SessionPolicy {
     if (limits.max_prompt_bytes == 0 or
         limits.max_follow_ups == 0 or
         limits.max_follow_up_bytes == 0 or
@@ -118,17 +123,17 @@ pub fn init(
     };
 }
 
-pub fn deinit(self: *Policy) void {
+pub fn deinit(self: *SessionPolicy) void {
     self.clearFollowUps();
     self.follow_ups.deinit(self.allocator);
     self.* = undefined;
 }
 
-pub fn phase(self: *const Policy) Phase {
+pub fn phase(self: *const SessionPolicy) Phase {
     return self.phase_value;
 }
 
-pub fn queuedFollowUps(self: *const Policy) []const []u8 {
+pub fn queuedFollowUps(self: *const SessionPolicy) []const []u8 {
     return self.follow_ups.items;
 }
 
@@ -136,7 +141,7 @@ pub fn queuedFollowUps(self: *const Policy) []const []u8 {
 /// the editor only after `commitSubmission` succeeds. A start-route prompt must
 /// first be accepted by `TurnWorker.submit`.
 pub fn prepareSubmission(
-    self: *const Policy,
+    self: *const SessionPolicy,
     draft: []const u8,
 ) Error!PreparedSubmission {
     if (self.phase_value == .poisoned) return error.SessionUnavailable;
@@ -167,7 +172,7 @@ pub fn prepareSubmission(
 /// Commits a prepared submission. Calls are serialized by the terminal event
 /// loop, so no event may be reduced between preparation and commit.
 pub fn commitSubmission(
-    self: *Policy,
+    self: *SessionPolicy,
     prepared: *PreparedSubmission,
 ) void {
     switch (prepared.route) {
@@ -189,7 +194,7 @@ pub fn commitSubmission(
 /// Applies one ordered worker event. Events from an inactive run are fenced as
 /// stale and must not reach transcript or renderer reducers.
 pub fn applyEvent(
-    self: *Policy,
+    self: *SessionPolicy,
     event: session_event.Event,
 ) EventResult {
     if (event == .agent_start) return self.applyAgentStart(event.agent_start.run_id);
@@ -208,7 +213,7 @@ pub fn applyEvent(
 /// event delivery failed before `agent_settled`, the completion performs the
 /// same deterministic settlement transition.
 pub fn applyCompletion(
-    self: *Policy,
+    self: *SessionPolicy,
     run_id: agent.event.RunId,
     availability: session_event.Availability,
 ) EventResult {
@@ -231,7 +236,7 @@ pub fn applyCompletion(
 
 /// Confirms that the follow-up named by `submit_follow_up` was copied into the
 /// worker queue. On rejection, call `rejectFollowUpSubmission` instead.
-pub fn confirmFollowUpSubmission(self: *Policy) void {
+pub fn confirmFollowUpSubmission(self: *SessionPolicy) void {
     std.debug.assert(self.phase_value == .dispatching_follow_up);
     const submitted = self.follow_ups.orderedRemove(0);
     self.follow_up_bytes -= submitted.len;
@@ -239,11 +244,11 @@ pub fn confirmFollowUpSubmission(self: *Policy) void {
     self.phase_value = .awaiting_start;
 }
 
-pub fn rejectFollowUpSubmission(self: *Policy) void {
+pub fn rejectFollowUpSubmission(self: *SessionPolicy) void {
     std.debug.assert(self.phase_value == .dispatching_follow_up);
 }
 
-pub fn pendingFollowUp(self: *const Policy) ?[]const u8 {
+pub fn pendingFollowUp(self: *const SessionPolicy) ?[]const u8 {
     if (self.phase_value != .dispatching_follow_up) return null;
     return self.follow_ups.items[0];
 }
@@ -251,7 +256,7 @@ pub fn pendingFollowUp(self: *const Policy) ?[]const u8 {
 /// Restores queued follow-ups before the current editor text. Allocation
 /// completes before the queue is cleared, so failure leaves every draft intact.
 pub fn restoreQueued(
-    self: *Policy,
+    self: *SessionPolicy,
     current_draft: []const u8,
 ) error{ OutOfMemory, RestoredDraftTooLarge }!?OwnedDraft {
     if (self.follow_ups.items.len == 0) return null;
@@ -296,7 +301,7 @@ pub fn restoreQueued(
 /// Escape restores follow-ups transactionally and requests cancellation only
 /// when a run id is already known. An awaiting run is cancelled on agent_start.
 pub fn escape(
-    self: *Policy,
+    self: *SessionPolicy,
     current_draft: []const u8,
 ) error{ OutOfMemory, RestoredDraftTooLarge }!EscapeResult {
     const restored = try self.restoreQueued(current_draft);
@@ -321,7 +326,7 @@ pub fn escape(
 }
 
 fn settle(
-    self: *Policy,
+    self: *SessionPolicy,
     run_id: agent.event.RunId,
     availability: session_event.Availability,
 ) EventResult {
@@ -345,7 +350,7 @@ fn settle(
     };
 }
 
-fn applyAgentStart(self: *Policy, run_id: agent.event.RunId) EventResult {
+fn applyAgentStart(self: *SessionPolicy, run_id: agent.event.RunId) EventResult {
     return switch (self.phase_value) {
         .awaiting_start => started: {
             self.settled_run_id = null;
@@ -363,7 +368,7 @@ fn applyAgentStart(self: *Policy, run_id: agent.event.RunId) EventResult {
     };
 }
 
-fn activeRunId(self: *const Policy) ?agent.event.RunId {
+fn activeRunId(self: *const SessionPolicy) ?agent.event.RunId {
     return switch (self.phase_value) {
         .running => |run_id| run_id,
         .cancelling => |run_id| run_id,
@@ -371,7 +376,7 @@ fn activeRunId(self: *const Policy) ?agent.event.RunId {
     };
 }
 
-fn clearFollowUps(self: *Policy) void {
+fn clearFollowUps(self: *SessionPolicy) void {
     for (self.follow_ups.items) |follow_up| self.allocator.free(follow_up);
     self.follow_ups.clearRetainingCapacity();
     self.follow_up_bytes = 0;
@@ -396,7 +401,7 @@ fn testRunId(value: u64) agent.event.RunId {
     return @enumFromInt(value);
 }
 
-fn startRun(policy: *Policy, prompt: []const u8, id: u64) !void {
+fn startRun(policy: *SessionPolicy, prompt: []const u8, id: u64) !void {
     var prepared = try policy.prepareSubmission(prompt);
     policy.commitSubmission(&prepared);
     const result = policy.applyEvent(.{ .agent_start = .{ .run_id = testRunId(id) } });
@@ -404,7 +409,7 @@ fn startRun(policy: *Policy, prompt: []const u8, id: u64) !void {
 }
 
 test "submission remains transactional until committed" {
-    var policy = try Policy.init(std.testing.allocator, .{});
+    var policy = try SessionPolicy.init(std.testing.allocator, .{});
     defer policy.deinit();
     var draft = [_]u8{ ' ', 'h', 'e', 'l', 'l', 'o', ' ' };
 
@@ -421,7 +426,7 @@ test "submission remains transactional until committed" {
 }
 
 test "follow-ups dispatch sequentially after matching settlements" {
-    var policy = try Policy.init(std.testing.allocator, .{});
+    var policy = try SessionPolicy.init(std.testing.allocator, .{});
     defer policy.deinit();
     try startRun(&policy, "initial", 1);
 
@@ -475,7 +480,7 @@ test "follow-ups dispatch sequentially after matching settlements" {
 }
 
 test "completion settles a run when settled event delivery failed" {
-    var policy = try Policy.init(std.testing.allocator, .{});
+    var policy = try SessionPolicy.init(std.testing.allocator, .{});
     defer policy.deinit();
     try startRun(&policy, "initial", 12);
 
@@ -494,7 +499,7 @@ test "completion settles a run when settled event delivery failed" {
 }
 
 test "escape restores queued drafts before requesting cancellation" {
-    var policy = try Policy.init(std.testing.allocator, .{});
+    var policy = try SessionPolicy.init(std.testing.allocator, .{});
     defer policy.deinit();
     try startRun(&policy, "initial", 7);
     var first = try policy.prepareSubmission("one");
@@ -512,7 +517,7 @@ test "escape restores queued drafts before requesting cancellation" {
 }
 
 test "oversized restoration preserves queue and cancellation state" {
-    var policy = try Policy.init(std.testing.allocator, .{
+    var policy = try SessionPolicy.init(std.testing.allocator, .{
         .max_prompt_bytes = 4,
         .max_follow_ups = 2,
         .max_follow_up_bytes = 4,
@@ -530,7 +535,7 @@ test "oversized restoration preserves queue and cancellation state" {
 }
 
 test "escape before agent start defers cancellation to the admitted run" {
-    var policy = try Policy.init(std.testing.allocator, .{});
+    var policy = try SessionPolicy.init(std.testing.allocator, .{});
     defer policy.deinit();
     var prepared = try policy.prepareSubmission("initial");
     policy.commitSubmission(&prepared);
@@ -544,7 +549,7 @@ test "escape before agent start defers cancellation to the admitted run" {
 }
 
 test "poisoned settlement fences future submission" {
-    var policy = try Policy.init(std.testing.allocator, .{});
+    var policy = try SessionPolicy.init(std.testing.allocator, .{});
     defer policy.deinit();
     try startRun(&policy, "initial", 4);
     var follow_up = try policy.prepareSubmission("preserve me");
@@ -562,7 +567,7 @@ test "poisoned settlement fences future submission" {
 }
 
 test "follow-up bounds leave existing queue unchanged" {
-    var policy = try Policy.init(std.testing.allocator, .{
+    var policy = try SessionPolicy.init(std.testing.allocator, .{
         .max_prompt_bytes = 8,
         .max_follow_ups = 1,
         .max_follow_up_bytes = 3,
@@ -577,7 +582,7 @@ test "follow-up bounds leave existing queue unchanged" {
     try std.testing.expectEqual(@as(usize, 1), policy.queuedFollowUps().len);
     try std.testing.expectEqualStrings("one", policy.queuedFollowUps()[0]);
 
-    var byte_policy = try Policy.init(std.testing.allocator, .{
+    var byte_policy = try SessionPolicy.init(std.testing.allocator, .{
         .max_prompt_bytes = 8,
         .max_follow_ups = 2,
         .max_follow_up_bytes = 3,
@@ -593,7 +598,7 @@ test "follow-up bounds leave existing queue unchanged" {
 }
 
 fn exerciseAllocations(allocator: std.mem.Allocator) !void {
-    var policy = try Policy.init(allocator, .{});
+    var policy = try SessionPolicy.init(allocator, .{});
     defer policy.deinit();
     var start = try policy.prepareSubmission("start");
     policy.commitSubmission(&start);
