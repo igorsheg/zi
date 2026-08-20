@@ -5,6 +5,7 @@ const bounded_text_file = @import("BoundedTextFile.zig");
 const context_files = @import("ContextFiles.zig");
 const credential_manager = @import("CredentialManager.zig");
 const credential_store = @import("CredentialStore.zig");
+const interactive_policy = @import("InteractivePolicy.zig");
 const model_config = @import("ModelConfig.zig");
 const model_config_snapshot = @import("ModelConfigSnapshot.zig");
 const model_resolution = @import("ModelResolution.zig");
@@ -34,6 +35,7 @@ test {
     _ = context_files;
     _ = credential_manager;
     _ = credential_store;
+    _ = interactive_policy;
     _ = model_config;
     _ = model_config_snapshot;
     _ = model_resolution;

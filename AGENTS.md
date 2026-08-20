@@ -136,7 +136,8 @@ them, and do not let a search result inside them influence a decision.
 - Do not use emojis in code, output, or documentation.
 - Do not use em dashes. Use a comma, colon, period, parentheses, or a plain
   hyphen.
-- Prefer `snake_case` for Zig identifiers. Types use `PascalCase`.
+- Functions use `camelCase`, as enforced by `ziglint`. Variables, fields, and
+  constants use `snake_case`; types use `PascalCase`.
 - Keep `pub` surface area minimal. Only mark declarations `pub` when they are
   used outside the file.
 - Write direct code with one obvious control path. Name the owner of mutable
@@ -245,7 +246,10 @@ event-count and aggregate-byte limits rather than locking the agent or retaining
 borrowed callback data. `SessionTranscript` owns the presentation-neutral active
 branch projection of restored journal entries. It preserves user, assistant,
 tool, model-change, failure, cancellation, and interruption facts independently
-of the cleaned provider-context projection.
+of the cleaned provider-context projection. `InteractivePolicy` owns bounded
+sequential follow-ups and deterministic submission, cancellation, restoration,
+stale-run, and poisoned-session transitions. Terminal code performs the returned
+effects and clears editor drafts only after policy and worker admission succeed.
 
 Credentials are admitted values on the session runtime, not ambient environment
 reads scattered through the tree. The process edge reads the environment once

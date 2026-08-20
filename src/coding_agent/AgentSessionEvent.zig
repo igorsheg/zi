@@ -7,6 +7,7 @@ pub const Availability = enum {
 };
 
 pub const AgentSettled = struct {
+    run_id: agent.event.RunId,
     availability: Availability,
 };
 

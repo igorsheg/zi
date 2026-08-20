@@ -45,10 +45,12 @@ const Tools = struct {
     edit: EditTool,
     bash: BashTool,
     events: ?EventSink,
+    last_run_id: ?agent_api.event.RunId = null,
 
     fn emitAgentEvent(context: *anyopaque, event: Agent.Event) agent_api.event.SinkError!void {
         const self: *Tools = @ptrCast(@alignCast(context));
         const sink = self.events orelse return;
+        if (event == .agent_start) self.last_run_id = event.agent_start.run_id;
         return sink.emit(session_event.fromAgent(event));
     }
 };
@@ -155,7 +157,10 @@ fn emitSettled(self: *AgentSession) Agent.RunError!void {
         .poisoned => .poisoned,
         .running => unreachable,
     };
-    sink.emit(.{ .agent_settled = .{ .availability = availability } }) catch |failure| return switch (failure) {
+    sink.emit(.{ .agent_settled = .{
+        .run_id = self.tools.last_run_id orelse unreachable,
+        .availability = availability,
+    } }) catch |failure| return switch (failure) {
         error.OutOfMemory => error.OutOfMemory,
         error.Cancelled => error.Cancelled,
         error.ConsumerStopped => error.EventConsumerStopped,
@@ -275,6 +280,7 @@ test "coding-agent session extends core lifecycle with final settlement" {
         count: usize = 0,
         saw_complete_partial: bool = false,
         settled: ?session_event.Availability = null,
+        settled_run_id: ?agent_api.event.RunId = null,
 
         fn emit(context: *anyopaque, event: Event) session_event.SinkError!void {
             const self: *Self = @ptrCast(@alignCast(context));
@@ -286,7 +292,10 @@ test "coding-agent session extends core lifecycle with final settlement" {
                 {
                     self.saw_complete_partial = std.mem.eql(u8, update.message.parts[0].text, "complete");
                 },
-                .agent_settled => |settled| self.settled = settled.availability,
+                .agent_settled => |settled| {
+                    self.settled = settled.availability;
+                    self.settled_run_id = settled.run_id;
+                },
                 else => {},
             }
         }
@@ -326,6 +335,7 @@ test "coding-agent session extends core lifecycle with final settlement" {
     try std.testing.expectEqualSlices(std.meta.Tag(Event), &expected, recorder.tags[0..recorder.count]);
     try std.testing.expect(recorder.saw_complete_partial);
     try std.testing.expectEqual(session_event.Availability.ready, recorder.settled.?);
+    try std.testing.expectEqual(@as(u64, 1), @intFromEnum(recorder.settled_run_id.?));
 }
 
 test "coding-agent session sends its owned custom system prompt" {

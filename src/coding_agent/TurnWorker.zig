@@ -1,5 +1,6 @@
 const std = @import("std");
 const ai = @import("../ai/root.zig");
+const agent = @import("../agent/root.zig");
 const AgentSession = @import("AgentSession.zig");
 const session_event = @import("AgentSessionEvent.zig");
 const OwnedAgentSessionEvent = @import("OwnedAgentSessionEvent.zig");
@@ -40,7 +41,9 @@ pub const RunOutcome = union(enum) {
 };
 
 pub const Completion = struct {
+    run_id: agent.event.RunId,
     outcome: RunOutcome,
+    availability: session_event.Availability,
 };
 
 pub const Snapshot = struct {
@@ -58,6 +61,9 @@ pub const Availability = enum {
     poisoned,
 };
 
+/// Detached worker output. Consumers reduce `events` in order before matching
+/// `completions`; a completion also settles policy when event delivery failed
+/// before the corresponding `agent_settled` event.
 pub const Batch = struct {
     events: std.ArrayList(OwnedAgentSessionEvent),
     completions: std.ArrayList(Completion),
@@ -120,6 +126,7 @@ events: std.ArrayList(OwnedAgentSessionEvent) = .empty,
 queued_event_bytes: usize = 0,
 completions: std.ArrayList(Completion) = .empty,
 cancellation: ai.model.CancellationToken = .{},
+active_run_id: ?agent.event.RunId = null,
 admitted: bool = false,
 processing: bool = false,
 stop_requested: bool = false,
@@ -291,17 +298,27 @@ fn workerMain(self: *TurnWorker) void {
 
         self.mutex.lockUncancelable(self.io);
         self.processing = false;
-        self.availability = switch (self.owner.session().state()) {
+        const run_id = self.active_run_id orelse unreachable;
+        const availability: session_event.Availability = switch (self.owner.session().state()) {
             .ready => .ready,
             .poisoned => .poisoned,
             .running => unreachable,
+        };
+        self.availability = switch (availability) {
+            .ready => .ready,
+            .poisoned => .poisoned,
         };
         while (self.completions.items.len >= self.limits.max_queued_completions and
             !self.stop_requested)
         {
             self.condition.wait(self.io, &self.mutex) catch continue;
         }
-        if (!self.stop_requested) self.completions.appendAssumeCapacity(.{ .outcome = outcome });
+        if (!self.stop_requested) self.completions.appendAssumeCapacity(.{
+            .run_id = run_id,
+            .outcome = outcome,
+            .availability = availability,
+        });
+        self.active_run_id = null;
         self.condition.broadcast(self.io);
         self.mutex.unlock(self.io);
     }
@@ -326,6 +343,11 @@ fn emitSessionEvent(
     event: AgentSession.Event,
 ) session_event.SinkError!void {
     const self: *TurnWorker = @ptrCast(@alignCast(context));
+    if (event == .agent_start) {
+        self.mutex.lockUncancelable(self.io);
+        self.active_run_id = event.agent_start.run_id;
+        self.mutex.unlock(self.io);
+    }
     var owned = OwnedAgentSessionEvent.init(self.allocator, event, self.limits.event) catch |failure| {
         return switch (failure) {
             error.OutOfMemory => error.OutOfMemory,
@@ -422,7 +444,13 @@ test "worker serializes owned prompts and publishes owned ordered events" {
     var batch = try worker.takeBatch();
     defer batch.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 2), batch.completions.items.len);
-    for (batch.completions.items) |completion| try std.testing.expect(completion.outcome == .completed);
+    for (batch.completions.items, 1..) |completion, expected_run_id| {
+        try std.testing.expect(completion.outcome == .completed);
+        try std.testing.expectEqual(
+            @as(u64, @intCast(expected_run_id)),
+            @intFromEnum(completion.run_id),
+        );
+    }
 
     var starts: usize = 0;
     var settled: usize = 0;
