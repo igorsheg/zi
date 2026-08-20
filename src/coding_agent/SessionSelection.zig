@@ -93,7 +93,7 @@ pub fn journalPath(self: *const SessionSelection) []const u8 {
 }
 
 pub fn restoredModel(self: *const SessionSelection) ?ai.ModelIdentity {
-    return self.restored().active_model;
+    return self.restoredView().active_model;
 }
 
 pub fn takeJournal(self: *SessionSelection) journal_api.Opened {
@@ -106,7 +106,8 @@ pub fn takeJournal(self: *SessionSelection) journal_api.Opened {
     };
 }
 
-fn restored(self: *const SessionSelection) *const format.Restored {
+/// Borrows the admitted restoration until `takeJournal` transfers it.
+pub fn restoredView(self: *const SessionSelection) *const format.Restored {
     return switch (self.journal) {
         .admitted => |*opened| &opened.restore_candidate,
         .transferred => unreachable,
@@ -377,7 +378,7 @@ test "session selection creates a private journal from admitted paths" {
 
     try std.testing.expect(selected.origin == .new);
     try std.testing.expectEqualStrings(root, selected.paths.cwd);
-    try std.testing.expectEqualStrings(root, selected.restored().header.cwd);
+    try std.testing.expectEqualStrings(root, selected.restoredView().header.cwd);
     const sessions_path = try resolveSessionsPath(std.testing.allocator, &selected.paths);
     defer std.testing.allocator.free(sessions_path);
     try std.testing.expect(std.mem.startsWith(u8, selected.journal_path, sessions_path));
@@ -448,7 +449,7 @@ test "session continuation chooses the newest valid journal for the admitted cwd
         sources.view(),
         .new,
     );
-    const older_id = try std.testing.allocator.dupe(u8, older.restored().header.id);
+    const older_id = try std.testing.allocator.dupe(u8, older.restoredView().header.id);
     defer std.testing.allocator.free(older_id);
     var older_file = try std.Io.Dir.openFile(.cwd(), std.testing.io, older.journal_path, .{ .mode = .read_write });
     defer older_file.close(std.testing.io);
@@ -474,7 +475,7 @@ test "session continuation chooses the newest valid journal for the admitted cwd
         sources.view(),
         .new,
     );
-    const newer_id = try std.testing.allocator.dupe(u8, newer.restored().header.id);
+    const newer_id = try std.testing.allocator.dupe(u8, newer.restoredView().header.id);
     defer std.testing.allocator.free(newer_id);
     newer.deinit();
 
@@ -489,7 +490,7 @@ test "session continuation chooses the newest valid journal for the admitted cwd
     defer continued.deinit();
     try std.testing.expect(continued.origin == .continued);
     try std.testing.expect(!std.mem.eql(u8, older_id, newer_id));
-    try std.testing.expectEqualStrings(newer_id, continued.restored().header.id);
+    try std.testing.expectEqualStrings(newer_id, continued.restoredView().header.id);
 }
 
 test "session continuation ignores corrupt candidates and creates a new journal" {

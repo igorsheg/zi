@@ -11,6 +11,7 @@ const RuntimeResources = @import("RuntimeResources.zig");
 const SessionFormat = @import("SessionFormat.zig");
 const SessionJournal = @import("SessionJournal.zig");
 const SessionSelection = @import("SessionSelection.zig");
+const SessionTranscript = @import("SessionTranscript.zig");
 const ZiPaths = @import("ZiPaths.zig");
 
 const RuntimeServices = @This();
@@ -28,6 +29,7 @@ pub const Error = error{
     ProjectTrustCommitIndeterminate,
     InvalidHeader,
     InvalidRecord,
+    InvalidTranscript,
     UnsupportedVersion,
     InvalidCredentialFile,
     UnsafeCredentialStorage,
@@ -110,6 +112,7 @@ cwd: std.Io.Dir,
 snapshot: ModelConfigSnapshot,
 resolved: ModelResolution.Resolved,
 credential_resolver: *CredentialManager.PersistentResolver,
+transcript_value: SessionTranscript,
 runtime: *AgentSessionRuntime,
 
 pub fn create(
@@ -122,6 +125,10 @@ pub fn create(
 
 pub fn session(self: *RuntimeServices) *AgentSession {
     return self.runtime.session();
+}
+
+pub fn transcript(self: *const RuntimeServices) *const SessionTranscript {
+    return &self.transcript_value;
 }
 
 fn paths(self: *const RuntimeServices) *const ZiPaths {
@@ -141,6 +148,7 @@ fn modelDiagnostic(self: *const RuntimeServices) ?ModelConfigSnapshot.Diagnostic
 pub fn deinit(self: *RuntimeServices) void {
     const allocator = self.allocator;
     self.runtime.deinit();
+    self.transcript_value.deinit();
     self.credential_resolver.deinit();
     self.cwd.close(self.io);
     self.resolved.deinit();
@@ -264,6 +272,8 @@ fn createOwned(
     var cwd = std.Io.Dir.openDir(.cwd(), io, selection.pathsView().cwd, .{}) catch
         return error.CwdUnavailable;
     errdefer cwd.close(io);
+    var transcript_value = try SessionTranscript.init(allocator, selection.restoredView());
+    errdefer transcript_value.deinit();
     var opened = selection.takeJournal();
     const runtime = switch (transport) {
         .http => try AgentSessionRuntime.createDurable(
@@ -298,6 +308,7 @@ fn createOwned(
         .snapshot = snapshot,
         .resolved = resolved,
         .credential_resolver = credential_resolver,
+        .transcript_value = transcript_value,
         .runtime = runtime,
     };
     return self;
@@ -390,6 +401,18 @@ fn openJournal(allocator: std.mem.Allocator, path: []const u8) !SessionJournal.O
     );
 }
 
+fn openWritableJournal(allocator: std.mem.Allocator, path: []const u8) !SessionJournal.Opened {
+    const parent = std.fs.path.dirname(path).?;
+    var directory = try std.Io.Dir.openDir(.cwd(), std.testing.io, parent, .{});
+    defer directory.close(std.testing.io);
+    return SessionJournal.openWritable(
+        allocator,
+        std.testing.io,
+        directory,
+        std.fs.path.basename(path),
+    );
+}
+
 test "runtime services compose effective paths, models, prompts, credentials, durability, and transport" {
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();
@@ -474,6 +497,7 @@ test "runtime services compose effective paths, models, prompts, credentials, du
     defer std.testing.allocator.free(journal_path);
     try std.testing.expectEqualStrings(root, services.paths().cwd);
     try std.testing.expect(services.modelDiagnostic() == null);
+    try std.testing.expectEqual(@as(usize, 0), services.transcript().items.len);
     try std.testing.expect(std.mem.startsWith(u8, services.session().systemPrompt(), "Global system base."));
     try std.testing.expect(std.mem.find(u8, services.session().systemPrompt(), root) != null);
     try std.testing.expect(std.mem.find(
@@ -506,6 +530,29 @@ test "runtime services compose effective paths, models, prompts, credentials, du
     try std.testing.expectEqualStrings("composed", try services.session().prompt("hello"));
     try std.testing.expect(inspector.prompt_seen);
     services.deinit();
+
+    var resume_fake = fake_api.FakeTransport.init(&.{});
+    var resumed = try createWithTransport(std.testing.allocator, std.testing.io, .{
+        .startup_cwd = root,
+        .home = root,
+        .session = .{ .open = journal_path },
+        .sources = sources.view(),
+    }, resume_fake.transport());
+    const transcript_view = resumed.transcript();
+    try std.testing.expectEqual(@as(usize, 3), transcript_view.items.len);
+    try std.testing.expectEqualStrings(
+        "model-a",
+        transcript_view.items[0].content.model_change.model,
+    );
+    try std.testing.expectEqualStrings(
+        "hello",
+        transcript_view.items[1].content.user.parts[0].text,
+    );
+    try std.testing.expectEqualStrings(
+        "composed",
+        transcript_view.items[2].content.assistant.parts[0].text.text,
+    );
+    resumed.deinit();
 
     var opened = try openJournal(std.testing.allocator, journal_path);
     defer opened.deinit();
@@ -1023,6 +1070,62 @@ test "runtime services discover context from a resumed session working directory
         resumed.session().systemPrompt(),
         "Launch directory context.",
     ) == null);
+}
+
+test "runtime services retain a synthetic interruption for restored open turns" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try writeCustomModels(&temporary);
+    var root_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root = try temporaryPath(&temporary, &root_buffer);
+    var sources: TestSources = .{};
+    var fake = fake_api.FakeTransport.init(&.{});
+
+    var created = try createWithTransport(std.testing.allocator, std.testing.io, .{
+        .startup_cwd = root,
+        .home = root,
+        .session = .new,
+        .sources = sources.view(),
+        .requested_provider = "custom-openai",
+        .requested_model = "model-a",
+        .cli_api_key = "custom-secret",
+    }, fake.transport());
+    const journal_path = try std.testing.allocator.dupe(u8, created.journalPath());
+    defer std.testing.allocator.free(journal_path);
+    created.deinit();
+
+    var writable = try openWritableJournal(std.testing.allocator, journal_path);
+    const parent_id = writable.restore_candidate.active_leaf_id.?;
+    try writable.journal.append(.{ .message = .{
+        .base = .{
+            .id = "open-user",
+            .parent_id = parent_id,
+            .timestamp = "2026-08-19T10:30:02.000Z",
+        },
+        .message = .{ .request = .{ .parts = &.{.{ .user = .{ .text = "unfinished" } }} } },
+    } }, .none());
+    writable.deinit();
+
+    var resumed = try createWithTransport(std.testing.allocator, std.testing.io, .{
+        .startup_cwd = root,
+        .home = root,
+        .session = .{ .open = journal_path },
+        .sources = sources.view(),
+        .cli_api_key = "custom-secret",
+    }, fake.transport());
+    const transcript_view = resumed.transcript();
+    try std.testing.expectEqual(@as(usize, 3), transcript_view.items.len);
+    try std.testing.expectEqualStrings(
+        "unfinished",
+        transcript_view.items[1].content.user.parts[0].text,
+    );
+    try std.testing.expect(transcript_view.items[2].content == .interrupted);
+    try std.testing.expect(transcript_view.items[2].metadata == .recovered_open_turn);
+    try std.testing.expectEqualStrings(
+        "open-user",
+        transcript_view.items[2].content.interrupted.turn_id,
+    );
+    resumed.deinit();
 }
 
 test "runtime services restore the journal model unless an explicit override commits first" {

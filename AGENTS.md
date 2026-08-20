@@ -220,8 +220,9 @@ prompt files independently by role.
 `RuntimeResources` owns invocation-scoped trust resolution, prompt-file and
 context discovery, and the effective prompt policy that borrows those owned
 resources. `RuntimeServices` sequences session selection, resources, model and
-credential admission, and runtime construction; resource policy does not belong
-in that composition owner.
+credential admission, and runtime construction. It projects and owns the
+restored `SessionTranscript` before transferring the selected journal into the
+live runtime. Resource policy does not belong in that composition owner.
 
 `ContextFiles` owns bounded global and cwd-ancestor instruction discovery.
 Ancestor instructions apply from broadest to narrowest scope regardless of
