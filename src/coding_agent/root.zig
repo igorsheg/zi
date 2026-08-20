@@ -19,6 +19,7 @@ const session_commit = @import("SessionCommit.zig");
 const session_format = @import("SessionFormat.zig");
 const session_journal = @import("SessionJournal.zig");
 const session_selection = @import("SessionSelection.zig");
+const session_transcript = @import("SessionTranscript.zig");
 const system_prompt = @import("SystemPrompt.zig");
 const turn_worker = @import("TurnWorker.zig");
 const zi_paths = @import("ZiPaths.zig");
@@ -47,6 +48,7 @@ test {
     _ = session_format;
     _ = session_journal;
     _ = session_selection;
+    _ = session_transcript;
     _ = system_prompt;
     _ = turn_worker;
     _ = zi_paths;

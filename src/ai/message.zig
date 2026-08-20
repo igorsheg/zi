@@ -109,14 +109,21 @@ pub fn copyRequestLeaky(
 ) error{OutOfMemory}!RequestMessage {
     const parts = try allocator.alloc(RequestPart, source.parts.len);
     for (source.parts, parts) |part, *copy| copy.* = switch (part) {
-        .user => |user| .{ .user = switch (user) {
-            .text => |text| .{ .text = try allocator.dupe(u8, text) },
-            .image => |image| .{ .image = try copyImageLeaky(allocator, image) },
-        } },
+        .user => |user| .{ .user = try copyUserContentLeaky(allocator, user) },
         .tool_result => |result| .{ .tool_result = try copyToolResultLeaky(allocator, result) },
         .retry_prompt => |text| .{ .retry_prompt = try allocator.dupe(u8, text) },
     };
     return .{ .parts = parts };
+}
+
+pub fn copyUserContentLeaky(
+    allocator: std.mem.Allocator,
+    source: UserContent,
+) error{OutOfMemory}!UserContent {
+    return switch (source) {
+        .text => |text| .{ .text = try allocator.dupe(u8, text) },
+        .image => |image| .{ .image = try copyImageLeaky(allocator, image) },
+    };
 }
 
 pub fn copyResponseLeaky(

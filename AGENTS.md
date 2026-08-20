@@ -242,7 +242,10 @@ stream owners provide bulk-lifetime copy operations so boundary owners do not
 reimplement nested message or provider-state copying. Only `TurnWorker` mutates
 or disposes a transferred `AgentSession`. It applies backpressure at bounded
 event-count and aggregate-byte limits rather than locking the agent or retaining
-borrowed callback data.
+borrowed callback data. `SessionTranscript` owns the presentation-neutral active
+branch projection of restored journal entries. It preserves user, assistant,
+tool, model-change, failure, cancellation, and interruption facts independently
+of the cleaned provider-context projection.
 
 Credentials are admitted values on the session runtime, not ambient environment
 reads scattered through the tree. The process edge reads the environment once
