@@ -250,6 +250,11 @@ of the cleaned provider-context projection. `InteractivePolicy` owns bounded
 sequential follow-ups and deterministic submission, cancellation, restoration,
 stale-run, and poisoned-session transitions. Terminal code performs the returned
 effects and clears editor drafts only after policy and worker admission succeed.
+`coding_agent/cli/TerminalSession.zig` owns raw-mode admission and best-effort
+cooked-mode, style, hyperlink, and cursor restoration. Interactive mode starts
+on the normal screen without mouse tracking, alternate-screen rendering,
+keyboard-protocol negotiation, or frame diffs. `InputDecoder.zig` owns bounded
+escape parsing and resolves a bare Escape only after a quiet-period deadline.
 
 Credentials are admitted values on the session runtime, not ambient environment
 reads scattered through the tree. The process edge reads the environment once

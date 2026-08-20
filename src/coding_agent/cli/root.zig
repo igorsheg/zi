@@ -1,8 +1,10 @@
 const entry = @import("entry.zig");
+const input_decoder = @import("InputDecoder.zig");
 const initial_message = @import("initial_message.zig");
 const launch = @import("launch.zig");
 const print_mode = @import("print_mode.zig");
 const surface = @import("surface.zig");
+const terminal_session = @import("TerminalSession.zig");
 const trust = @import("trust.zig");
 
 pub const run = entry.run;
@@ -260,9 +262,11 @@ test "text print mode succeeds silently without a prompt" {
 
 test {
     _ = entry;
+    _ = input_decoder;
     _ = initial_message;
     _ = launch;
     _ = print_mode;
     _ = surface;
+    _ = terminal_session;
     _ = trust;
 }
