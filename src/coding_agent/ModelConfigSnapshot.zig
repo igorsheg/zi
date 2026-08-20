@@ -1,9 +1,10 @@
 const std = @import("std");
 const bounded_json = @import("../BoundedJson.zig");
-const ai_catalog = @import("../ai/model_catalog.zig");
-const ai_protocol = @import("../ai/protocol.zig");
-const ai_protocols = @import("../ai/protocols/root.zig");
-const ai_settings = @import("../ai/settings.zig");
+const ai = @import("../ai/root.zig");
+const ai_catalog = ai.model_catalog;
+const ai_protocol = ai.protocol_api;
+const ai_protocols = ai.protocols;
+const ai_settings = ai.settings;
 const ModelConfig = @import("ModelConfig.zig");
 const ZiPaths = @import("ZiPaths.zig");
 

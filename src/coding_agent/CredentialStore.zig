@@ -1,7 +1,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const BoundedJson = @import("../BoundedJson.zig");
-const credential = @import("../ai/credential.zig");
+const ai = @import("../ai/root.zig");
+const credential = ai.credential;
 const PrivateFileStore = @import("PrivateFileStore.zig");
 const ZiPaths = @import("ZiPaths.zig");
 

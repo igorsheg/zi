@@ -1,7 +1,8 @@
 const std = @import("std");
 const bounded_json = @import("../BoundedJson.zig");
-const ai_message = @import("../ai/message.zig");
-const ai_usage = @import("../ai/usage.zig");
+const ai = @import("../ai/root.zig");
+const ai_message = ai.message;
+const ai_usage = ai.usage;
 
 pub const max_header_bytes = 64 * 1024;
 pub const max_record_bytes = 64 * 1024 * 1024;

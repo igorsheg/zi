@@ -8,9 +8,10 @@ const trust = @import("trust.zig");
 pub const run = entry.run;
 
 const std = @import("std");
-const ai_message = @import("../../ai/message.zig");
-const ai_model = @import("../../ai/model.zig");
-const ai_testing = @import("../../ai/testing.zig");
+const ai = @import("../../ai/root.zig");
+const ai_message = ai.message;
+const ai_model = ai.model;
+const ai_testing = ai.testing;
 const AgentSession = @import("../AgentSession.zig");
 
 test "CLI core parses, composes, runs sequential prompts, and prints only the final response" {

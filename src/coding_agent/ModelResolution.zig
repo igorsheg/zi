@@ -1,7 +1,7 @@
 const std = @import("std");
 const ai = @import("../ai/root.zig");
-const ai_catalog = @import("../ai/model_catalog.zig");
-const ai_model = @import("../ai/model.zig");
+const ai_catalog = ai.model_catalog;
+const ai_model = ai.model;
 const ModelConfig = @import("ModelConfig.zig");
 
 const max_credentials = ai.credential.max_credentials;

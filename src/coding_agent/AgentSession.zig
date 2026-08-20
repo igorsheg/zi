@@ -1,10 +1,12 @@
 const std = @import("std");
-const ai_failure = @import("../ai/failure.zig");
-const ai_message = @import("../ai/message.zig");
-const ai_model = @import("../ai/model.zig");
-const Agent = @import("../agent/Agent.zig");
-const agent_limits = @import("../agent/limits.zig");
-const tool_api = @import("../agent/Tool.zig");
+const ai = @import("../ai/root.zig");
+const agent_api = @import("../agent/root.zig");
+const ai_failure = ai.failure;
+const ai_message = ai.message;
+const ai_model = ai.model;
+const Agent = agent_api.Agent;
+const agent_limits = agent_api.limits;
+const tool_api = agent_api.tool;
 const ReadTool = @import("tools/ReadTool.zig");
 const WriteTool = @import("tools/WriteTool.zig");
 const EditTool = @import("tools/EditTool.zig");
@@ -141,8 +143,8 @@ fn hasCodingInstructions(request: ai_model.ModelRequest) bool {
         std.mem.find(u8, request.instructions[0], "<tool_calling>") != null;
 }
 
-const ai_testing = @import("../ai/testing.zig");
-const ai_stream = @import("../ai/stream.zig");
+const ai_testing = ai.testing;
+const ai_stream = ai.stream;
 
 const IgnoreStream = struct {
     fn emit(_: *anyopaque, _: Agent.StreamEvent) ai_stream.StreamSinkError!void {}

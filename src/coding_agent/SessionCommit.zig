@@ -1,7 +1,9 @@
 const std = @import("std");
-const ai_message = @import("../ai/message.zig");
-const Agent = @import("../agent/Agent.zig");
-const commit_api = @import("../agent/Commit.zig");
+const ai = @import("../ai/root.zig");
+const agent_api = @import("../agent/root.zig");
+const ai_message = ai.message;
+const Agent = agent_api.Agent;
+const commit_api = agent_api.commit;
 const format = @import("SessionFormat.zig");
 const journal_api = @import("SessionJournal.zig");
 

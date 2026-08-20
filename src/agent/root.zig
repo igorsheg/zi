@@ -1,4 +1,5 @@
 pub const Agent = @import("Agent.zig");
+pub const commit = @import("Commit.zig");
 pub const History = @import("History.zig");
 pub const tool = @import("Tool.zig");
 pub const limits = @import("limits.zig");
@@ -17,6 +18,7 @@ pub const State = Agent.State;
 
 test {
     _ = Agent;
+    _ = commit;
     _ = History;
     _ = tool;
     _ = limits;

@@ -1,8 +1,8 @@
 const std = @import("std");
 const ai = @import("../ai/root.zig");
-const ai_catalog = @import("../ai/model_catalog.zig");
-const ai_model = @import("../ai/model.zig");
-const snapshot = @import("../ai/model_catalog_snapshot.zig");
+const ai_catalog = ai.model_catalog;
+const ai_model = ai.model;
+const snapshot = ai.model_catalog_snapshot;
 
 const ModelConfig = @This();
 const max_providers = 32;

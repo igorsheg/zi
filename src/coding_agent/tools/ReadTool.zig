@@ -1,7 +1,9 @@
 const std = @import("std");
-const ai_message = @import("../../ai/message.zig");
-const ai_model = @import("../../ai/model.zig");
-const tool_api = @import("../../agent/Tool.zig");
+const ai = @import("../../ai/root.zig");
+const agent_api = @import("../../agent/root.zig");
+const ai_message = ai.message;
+const ai_model = ai.model;
+const tool_api = agent_api.tool;
 
 const ReadTool = @This();
 

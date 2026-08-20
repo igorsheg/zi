@@ -1,11 +1,12 @@
 const std = @import("std");
-const ai_catalog = @import("../ai/model_catalog.zig");
-const ai_model = @import("../ai/model.zig");
-const ai_models = @import("../ai/Models.zig");
-const ai_protocol = @import("../ai/protocol.zig");
-const ai_protocols = @import("../ai/protocols/root.zig");
-const ai_settings = @import("../ai/settings.zig");
-const ai_transport = @import("../ai/transport.zig");
+const ai = @import("../ai/root.zig");
+const ai_catalog = ai.model_catalog;
+const ai_model = ai.model;
+const ai_models = ai.models;
+const ai_protocol = ai.protocol_api;
+const ai_protocols = ai.protocols;
+const ai_settings = ai.settings;
+const ai_transport = ai.transport;
 const AgentSession = @import("AgentSession.zig");
 const ModelConfig = @import("ModelConfig.zig");
 const ModelConfigSnapshot = @import("ModelConfigSnapshot.zig");
@@ -233,7 +234,7 @@ fn initializeDurable(
     self.session_value.commit_owner = commit_owner;
 }
 
-const fake_api = @import("../ai/transport/fake.zig");
+const fake_api = ai.transport_testing;
 
 const test_compatible_profile = profile: {
     var value: ai_settings.ModelProfile = .{};
