@@ -13,10 +13,17 @@ const TerminalSession = @import("terminal/Session.zig");
 
 const App = @This();
 
-pub const Options = struct {
-    policy_limits: Policy.Limits = Policy.default_limits,
+pub const InitOptions = struct {
     escape_timeout_ms: i64 = 30,
 };
+
+pub const RunOptions = struct {
+    initial_prompts: []const []const u8 = &.{},
+    poll_timeout_ms: i32 = 16,
+    max_reads_per_tick: usize = 32,
+};
+
+pub const ExitCause = EventLoop.ExitCause;
 
 allocator: std.mem.Allocator,
 io: std.Io,
@@ -33,10 +40,10 @@ pub fn init(
     io: std.Io,
     worker: *TurnWorker,
     writer: *std.Io.Writer,
-    options: Options,
+    options: InitOptions,
 ) !App {
     if (options.escape_timeout_ms < 0) return error.InvalidEscapeTimeout;
-    var policy = try Policy.init(allocator, options.policy_limits);
+    var policy = try Policy.init(allocator, Policy.default_limits);
     errdefer policy.deinit();
     return .{
         .allocator = allocator,
@@ -45,7 +52,7 @@ pub fn init(
         .policy = policy,
         .editor = LineEditor.init(
             allocator,
-            options.policy_limits.max_restored_draft_bytes,
+            Policy.default_limits.max_restored_draft_bytes,
         ),
         .renderer = NormalScreenRenderer.init(writer),
         .escape_timeout_ms = options.escape_timeout_ms,
@@ -64,26 +71,33 @@ pub fn run(
     input: std.Io.File,
     output: std.Io.File,
     transcript: ?*const SessionTranscript,
-    event_loop_options: EventLoop.Options,
-) !EventLoop.ExitCause {
+    options: RunOptions,
+) !ExitCause {
     var terminal = try TerminalSession.start(self.io, input, output);
     defer terminal.deinit();
-    return self.runWithTerminal(&terminal, transcript, event_loop_options);
+    return self.runWithTerminal(&terminal, transcript, options);
 }
 
 fn runWithTerminal(
     self: *App,
     terminal: anytype,
     transcript: ?*const SessionTranscript,
-    event_loop_options: EventLoop.Options,
-) !EventLoop.ExitCause {
+    options: RunOptions,
+) !ExitCause {
     try self.start(transcript);
-    const cause = EventLoop.run(terminal, self.callbacks(), event_loop_options) catch |failure| {
+    var finish_pending = true;
+    defer if (finish_pending) {
         const finish_result = self.finish();
         if (finish_result) |_| {} else |_| {}
-        return failure;
     };
-    try self.finish();
+    for (options.initial_prompts) |prompt| try self.submitPrompt(prompt);
+    const cause = try EventLoop.run(terminal, self.callbacks(), .{
+        .poll_timeout_ms = options.poll_timeout_ms,
+        .max_reads_per_tick = options.max_reads_per_tick,
+    });
+    const finish_result = self.finish();
+    finish_pending = false;
+    try finish_result;
     return cause;
 }
 
@@ -200,22 +214,23 @@ fn submitDraft(self: *App) !void {
         try self.renderer.renderNotice("input is not valid UTF-8");
         return;
     }
-    var prepared = self.policy.prepareSubmission(self.editor.text()) catch |failure| {
+    self.submitPrompt(self.editor.text()) catch |failure| {
         if (failure != error.EmptyPrompt) try self.renderer.renderNotice(@errorName(failure));
         return;
     };
+    self.editor.clear();
+}
+
+fn submitPrompt(self: *App, prompt: []const u8) !void {
+    var prepared = try self.policy.prepareSubmission(prompt);
     var prepared_live = true;
     defer if (prepared_live) prepared.deinit();
     switch (prepared.route) {
-        .start => self.worker.submit(prepared.text) catch |failure| {
-            try self.renderer.renderNotice(@errorName(failure));
-            return;
-        },
+        .start => try self.worker.submit(prepared.text),
         .follow_up => {},
     }
     self.policy.commitSubmission(&prepared);
     prepared_live = false;
-    self.editor.clear();
 }
 
 fn cancelAndRestore(self: *App) !void {

@@ -9,20 +9,21 @@ const surface = @import("surface.zig");
 
 const max_input_bytes = 8 * 1024 * 1024;
 
-/// Process-owned inputs required for one synchronous print launch.
-pub const PrintLaunchContext = struct {
+/// Process-owned inputs shared by admitted launch modes.
+pub const LaunchContext = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     cwd: []const u8,
     home: []const u8,
     openai_api_key: ?[]const u8,
+    sources: SessionFormat.Sources,
     stdin_is_tty: bool,
     stdin: *std.Io.Reader,
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
 };
 
-const Sources = struct {
+pub const Sources = struct {
     io: std.Io,
 
     fn nextId(context: *anyopaque) [16]u8 {
@@ -38,7 +39,7 @@ const Sources = struct {
         return if (value > 0) @intCast(value) else 0;
     }
 
-    fn view(self: *Sources) SessionFormat.Sources {
+    pub fn view(self: *Sources) SessionFormat.Sources {
         return .{
             .id_context = self,
             .nextIdFn = nextId,
@@ -48,16 +49,29 @@ const Sources = struct {
     }
 };
 
-/// Runs one admitted print launch and maps expected failures to process output.
-pub fn runPrintLaunch(
+pub const PreparedInitial = struct {
+    allocator: std.mem.Allocator,
+    stdin_content: ?[]u8,
+    file_content: ?[]u8,
+    value: initial_message.InitialMessage,
+
+    pub fn deinit(self: *PreparedInitial) void {
+        self.value.deinit();
+        if (self.file_content) |content| self.allocator.free(content);
+        if (self.stdin_content) |content| self.allocator.free(content);
+        self.* = undefined;
+    }
+};
+
+pub fn prepareInitial(
     request: *const surface.LaunchRequest,
-    context: PrintLaunchContext,
-) !print_mode.ExitCode {
-    const stdin_content = if (context.stdin_is_tty)
-        null
+    context: LaunchContext,
+    include_piped_stdin: bool,
+) !?PreparedInitial {
+    const stdin_content = if (include_piped_stdin and !context.stdin_is_tty)
+        try context.stdin.allocRemaining(context.allocator, .limited(max_input_bytes))
     else
-        try context.stdin.allocRemaining(context.allocator, .limited(max_input_bytes));
-    defer if (stdin_content) |content| context.allocator.free(content);
+        null;
     const file_content = if (request.file_path) |path|
         std.Io.Dir.cwd().readFileAlloc(
             context.io,
@@ -65,23 +79,36 @@ pub fn runPrintLaunch(
             context.allocator,
             .limited(max_input_bytes),
         ) catch |failure| {
+            if (stdin_content) |content| context.allocator.free(content);
             try context.stderr.print("Unable to read {s}: {s}.\n", .{ path, @errorName(failure) });
-            return .failure;
+            return null;
         }
     else
         null;
-    defer if (file_content) |content| context.allocator.free(content);
-    var initial = initial_message.buildInitialMessage(
+    const initial = initial_message.buildInitialMessage(
         context.allocator,
         request.messages(),
         stdin_content,
         file_content,
     ) catch |failure| {
+        if (file_content) |content| context.allocator.free(content);
+        if (stdin_content) |content| context.allocator.free(content);
         try context.stderr.print("Unable to compose the prompt: {s}.\n", .{@errorName(failure)});
-        return .failure;
+        return null;
     };
-    defer initial.deinit();
+    return .{
+        .allocator = context.allocator,
+        .stdin_content = stdin_content,
+        .file_content = file_content,
+        .value = initial,
+    };
+}
 
+/// Creates one runtime or reports an expected launch failure to stderr.
+pub fn createRuntime(
+    request: *const surface.LaunchRequest,
+    context: LaunchContext,
+) !?*RuntimeServices {
     var environment_entries: [1]ai.auth.EnvironmentEntry = undefined;
     const environment_count: usize = if (context.openai_api_key) |key| count: {
         environment_entries[0] = .{ .name = "OPENAI_API_KEY", .value = key };
@@ -96,8 +123,7 @@ pub fn runPrintLaunch(
         },
         .replace => |value| .{ .verbatim = value },
     };
-    var sources: Sources = .{ .io = context.io };
-    var runtime = RuntimeServices.create(context.allocator, context.io, .{
+    return RuntimeServices.create(context.allocator, context.io, .{
         .startup_cwd = context.cwd,
         .home = context.home,
         .session = switch (request.session) {
@@ -105,7 +131,7 @@ pub fn runPrintLaunch(
             .continue_recent => .continue_recent,
             .open => |path| .{ .open = path },
         },
-        .sources = sources.view(),
+        .sources = context.sources,
         .requested_provider = request.provider,
         .requested_model = request.model,
         .cli_api_key = request.api_key,
@@ -114,14 +140,24 @@ pub fn runPrintLaunch(
         .options = .{ .prompt = .{ .policy = prompt_policy } },
     }) catch |failure| {
         try context.stderr.print("Unable to start the coding agent: {s}.\n", .{@errorName(failure)});
-        return .failure;
+        return null;
     };
+}
+
+/// Runs one admitted print launch and maps expected failures to process output.
+pub fn runPrintLaunch(
+    request: *const surface.LaunchRequest,
+    context: LaunchContext,
+) !print_mode.ExitCode {
+    var prepared = (try prepareInitial(request, context, true)) orelse return .failure;
+    defer prepared.deinit();
+    var runtime = (try createRuntime(request, context)) orelse return .failure;
     defer runtime.deinit();
     return print_mode.runPrintMode(
         runtime.session(),
         .{
-            .initial_message = initial.text,
-            .messages = initial.remaining_messages,
+            .initial_message = prepared.value.text,
+            .messages = prepared.value.remaining_messages,
         },
         context.stdout,
         context.stderr,
@@ -147,12 +183,14 @@ test "print launch reopens recent and exact sessions with their restored model" 
             stderr_writer: *std.Io.Writer,
         ) !print_mode.ExitCode {
             var stdin = std.Io.Reader.fixed("");
+            var sources: Sources = .{ .io = std.testing.io };
             return runPrintLaunch(request, .{
                 .allocator = std.testing.allocator,
                 .io = std.testing.io,
                 .cwd = root_path,
                 .home = root_path,
                 .openai_api_key = null,
+                .sources = sources.view(),
                 .stdin_is_tty = true,
                 .stdin = &stdin,
                 .stdout = stdout_writer,

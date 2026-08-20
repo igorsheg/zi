@@ -1,4 +1,6 @@
 const app = @import("App.zig");
+
+pub const App = app;
 const event_loop = @import("EventLoop.zig");
 const normal_screen_renderer = @import("NormalScreenRenderer.zig");
 const policy = @import("Policy.zig");

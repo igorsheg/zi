@@ -38,8 +38,14 @@ pub const TrustRequest = struct {
     path: ?[]const u8 = null,
 };
 
-/// One print launch whose strings remain borrowed from argv for its execution.
+pub const LaunchMode = enum {
+    interactive,
+    print,
+};
+
+/// One launch whose strings remain borrowed from argv for its execution.
 pub const LaunchRequest = struct {
+    mode: LaunchMode = .print,
     session: SessionIntent = .new,
     provider: ?[]const u8 = null,
     model: ?[]const u8 = null,
@@ -64,7 +70,6 @@ pub const Invocation = union(enum) {
 };
 
 pub const Mode = enum {
-    interactive,
     json,
     rpc,
 };
@@ -213,13 +218,21 @@ pub fn parseInvocation(argv: []const []const u8, terminal: Terminal) ParseResult
     if (rejection.count > 0) return .{ .rejected = rejection };
     if (help_requested) return .{ .admitted = .help };
     if (version_requested) return .{ .admitted = .version };
-    switch (requested_mode) {
-        .json => rejection.add(.{ .unavailable_mode = .json }),
-        .rpc => rejection.add(.{ .unavailable_mode = .rpc }),
-        .automatic, .text => if (!print_requested and terminal.stdin_is_tty and terminal.stdout_is_tty) {
-            rejection.add(.{ .unavailable_mode = .interactive });
+    launch.mode = switch (requested_mode) {
+        .json => rejected: {
+            rejection.add(.{ .unavailable_mode = .json });
+            break :rejected .print;
         },
-    }
+        .rpc => rejected: {
+            rejection.add(.{ .unavailable_mode = .rpc });
+            break :rejected .print;
+        },
+        .text => .print,
+        .automatic => if (print_requested or !terminal.stdin_is_tty or !terminal.stdout_is_tty)
+            .print
+        else
+            .interactive,
+    };
     if (rejection.count > 0) return .{ .rejected = rejection };
     return .{ .admitted = .{ .launch = launch } };
 }
@@ -354,6 +367,7 @@ test "CLI surface admits one typed launch invocation" {
     }, .{ .stdin_is_tty = true, .stdout_is_tty = true });
     try std.testing.expect(parsed == .admitted);
     const launch = parsed.admitted.launch;
+    try std.testing.expectEqual(LaunchMode.print, launch.mode);
     try std.testing.expect(launch.session == .new);
     try std.testing.expectEqual(ProjectTrust.Intent.automatic, launch.project_trust);
     try std.testing.expectEqualStrings("openai", launch.provider.?);
@@ -498,11 +512,18 @@ test "CLI surface rejects conflicting durable session choices" {
 test "CLI surface resolves automatic presentation only at the process edge" {
     const piped = parseInvocation(&.{"prompt"}, .{ .stdin_is_tty = false, .stdout_is_tty = true });
     try std.testing.expect(piped == .admitted);
-    try std.testing.expect(piped.admitted == .launch);
+    try std.testing.expectEqual(LaunchMode.print, piped.admitted.launch.mode);
 
     const terminal = parseInvocation(&.{"prompt"}, .{ .stdin_is_tty = true, .stdout_is_tty = true });
-    try std.testing.expect(terminal == .rejected);
-    try std.testing.expectEqual(Mode.interactive, terminal.rejected.diagnostics()[0].unavailable_mode);
+    try std.testing.expect(terminal == .admitted);
+    try std.testing.expectEqual(LaunchMode.interactive, terminal.admitted.launch.mode);
+
+    const explicit_text = parseInvocation(&.{ "--mode", "text", "prompt" }, .{
+        .stdin_is_tty = true,
+        .stdout_is_tty = true,
+    });
+    try std.testing.expect(explicit_text == .admitted);
+    try std.testing.expectEqual(LaunchMode.print, explicit_text.admitted.launch.mode);
 }
 
 test "CLI surface routes help and version before launch admission" {

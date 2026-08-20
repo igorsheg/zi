@@ -16,7 +16,10 @@ pub fn init(writer: *std.Io.Writer) NormalScreenRenderer {
 }
 
 pub fn renderWelcome(self: *NormalScreenRenderer) !void {
-    try self.writer.writeAll("Zi interactive. Enter submits, Alt+Enter queues, Escape cancels, Ctrl-D exits.\n");
+    try self.writer.writeAll(
+        "Zi interactive. Enter submits or queues while busy. " ++
+            "Escape cancels. Ctrl-D exits when idle.\n",
+    );
 }
 
 pub fn renderTranscript(

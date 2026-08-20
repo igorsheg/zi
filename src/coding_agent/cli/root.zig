@@ -1,5 +1,6 @@
 const entry = @import("entry.zig");
 const initial_message = @import("initial_message.zig");
+const interactive_launch = @import("interactive_launch.zig");
 const launch = @import("launch.zig");
 const print_mode = @import("print_mode.zig");
 const surface = @import("surface.zig");
@@ -261,6 +262,7 @@ test "text print mode succeeds silently without a prompt" {
 test {
     _ = entry;
     _ = initial_message;
+    _ = interactive_launch;
     _ = launch;
     _ = print_mode;
     _ = surface;

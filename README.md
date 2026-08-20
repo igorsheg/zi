@@ -18,6 +18,16 @@ The binary is written to `zig-out/bin/zi`.
 
 ## Usage
 
+Start an interactive session from a terminal:
+
+```sh
+./zig-out/bin/zi --provider openai --model gpt-5.6-sol
+```
+
+Press Enter to submit. While a turn is running, new submissions queue as
+follow-ups. Press Escape to cancel the active turn, Ctrl-C on an empty prompt to
+exit, or Ctrl-D on an empty idle prompt to exit.
+
 Run one or more prompts in print mode:
 
 ```sh
@@ -50,4 +60,4 @@ Explicit `--rules` takes precedence over project and global `APPEND_SYSTEM.md` f
 
 Zi also loads one context file from the global agent directory and from each ancestor of the effective working directory. `AGENTS.md` takes precedence over `CLAUDE.md` in each directory, and files are applied from global and broadest scope to the working directory. Context files must be regular UTF-8 text without NUL bytes. Each file is limited to 64 KiB, with a 128 KiB aggregate limit. An explicit system-prompt replacement is verbatim and bypasses prompt and context file discovery.
 
-Run `./zig-out/bin/zi --help` for the current command surface. Interactive, JSON, and RPC modes are not available yet.
+Run `./zig-out/bin/zi --help` for the current command surface. JSON and RPC modes are not available yet.

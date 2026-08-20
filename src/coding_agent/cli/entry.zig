@@ -1,4 +1,5 @@
 const std = @import("std");
+const interactive_launch = @import("interactive_launch.zig");
 const launch = @import("launch.zig");
 const surface = @import("surface.zig");
 const trust = @import("trust.zig");
@@ -92,17 +93,23 @@ fn runLaunchInvocation(
     };
     var stdin_buffer: [64 * 1024]u8 = undefined;
     var stdin_file = std.Io.File.Reader.init(.stdin(), io, &stdin_buffer);
-    const result = try launch.runPrintLaunch(request, .{
+    var sources: launch.Sources = .{ .io = io };
+    const context: launch.LaunchContext = .{
         .allocator = allocator,
         .io = io,
         .cwd = cwd,
         .home = home,
         .openai_api_key = init.environ_map.get("OPENAI_API_KEY"),
+        .sources = sources.view(),
         .stdin_is_tty = stdin_is_tty,
         .stdin = &stdin_file.interface,
         .stdout = stdout,
         .stderr = stderr,
-    });
+    };
+    const result = switch (request.mode) {
+        .interactive => try interactive_launch.runInteractiveLaunch(request, context),
+        .print => try launch.runPrintLaunch(request, context),
+    };
     return @intFromEnum(result);
 }
 
@@ -115,7 +122,6 @@ fn writeCliDiagnostics(writer: *std.Io.Writer, diagnostics: []const surface.Diag
         .missing_value => |option| try writer.print("{s} requires a value.\n", .{option}),
         .invalid_mode => |mode| try writer.print("Unsupported mode: {s}.\n", .{mode}),
         .unavailable_mode => |mode| switch (mode) {
-            .interactive => try writer.writeAll("Interactive mode is not available yet. Use --print.\n"),
             .json => try writer.writeAll("JSON mode is not available yet.\n"),
             .rpc => try writer.writeAll("RPC mode is not available yet.\n"),
         },
@@ -142,12 +148,15 @@ fn writeCliDiagnostics(writer: *std.Io.Writer, diagnostics: []const surface.Diag
 fn writeCliHelp(writer: *std.Io.Writer) !void {
     try writer.writeAll(
         \\Usage:
+        \\  zi --provider PROVIDER --model MODEL [PROMPT]
+        \\  zi (--continue | --session PATH) [PROMPT]
         \\  zi --print --provider PROVIDER --model MODEL [PROMPT]
         \\  zi --print (--continue | --session PATH) [PROMPT]
         \\  zi trust (status | allow | deny | remove) [PATH]
         \\
         \\Options:
         \\  -p, --print          Run prompts and print the final response
+        \\                       Without --print, a terminal starts interactive mode
         \\  -c, --continue       Continue the most recent session for this directory
         \\  --session PATH       Continue an exact session journal
         \\  --provider VALUE     Select a provider

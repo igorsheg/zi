@@ -183,9 +183,9 @@ Module ownership (stable boundaries):
 Dependencies point one way: `coding_agent` depends on `agent` and `ai`; `agent`
 depends on `ai`; `ai` depends on neither. Do not add a back edge.
 
-For the admitted product surface right now (providers, tools, what `main`
-actually does), trust `src/`. Do not invent interactive mode, extensions, RPC,
-Code Mode, MCP, or npm install on this branch.
+For the admitted product behavior right now (providers, tools, and what `main`
+actually does), trust `src/`. Do not invent extensions, RPC, Code Mode, MCP, or
+npm install on this branch.
 
 ### Adding a feature
 
