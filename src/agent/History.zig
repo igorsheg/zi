@@ -69,6 +69,14 @@ pub fn appendResponse(self: *History, response: message.ResponseMessage) Error!v
     return self.append(.{ .response = response });
 }
 
+/// Removes a suffix from provider context and releases its owned storage.
+pub fn truncate(self: *History, new_len: usize) void {
+    std.debug.assert(new_len <= self.entries.items.len);
+    for (self.arenas.items[new_len..]) |*arena| arena.deinit();
+    self.entries.shrinkRetainingCapacity(new_len);
+    self.arenas.shrinkRetainingCapacity(new_len);
+}
+
 fn copyRequest(allocator: std.mem.Allocator, source: message.RequestMessage) !message.RequestMessage {
     const parts = try allocator.alloc(message.RequestPart, source.parts.len);
     for (source.parts, parts) |part, *copy| copy.* = switch (part) {
@@ -222,6 +230,21 @@ test "history owns appended canonical messages" {
         "{\"path\":\"a\"}",
         history.messages()[1].response.parts[0].tool_call.arguments_json,
     );
+}
+
+test "history truncation releases a provider-context suffix" {
+    var history = History.init(std.testing.allocator);
+    defer history.deinit();
+    try history.appendRequest(.{ .parts = &.{.{ .user = .{ .text = "question" } }} });
+    try history.appendResponse(.{
+        .parts = &.{.{ .tool_call = .{ .id = "call", .name = "read", .arguments_json = "{}" } }},
+        .identity = .{ .provider = "script", .model = "truncate" },
+        .finish = .{ .category = .tool_calls },
+    });
+
+    history.truncate(1);
+    try std.testing.expectEqual(@as(usize, 1), history.messages().len);
+    try std.testing.expectEqualStrings("question", history.messages()[0].request.parts[0].user.text);
 }
 
 test "prepared history remains invisible until infallible publication" {

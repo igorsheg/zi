@@ -9,7 +9,12 @@ const journal_api = @import("SessionJournal.zig");
 
 const SessionCommit = @This();
 
-pub const Error = error{ OutOfMemory, SessionTooLarge, PersistenceFailed };
+pub const Error = error{
+    OutOfMemory,
+    SessionTooLarge,
+    PersistenceFailed,
+    CommitIndeterminate,
+};
 
 const EntryId = struct {
     bytes: [128]u8 = undefined,
@@ -103,7 +108,7 @@ fn sink(self: *SessionCommit) commit_api.Sink {
     return .{
         .context = self,
         .messageFn = commitMessage,
-        .settleFn = settleTurn,
+        .settleFn = settleRun,
     };
 }
 
@@ -122,7 +127,7 @@ fn commitMessage(
     if (kind == .user) self.turn = .{ .active = EntryId.init(stamp.id()) };
 }
 
-fn settleTurn(context: *anyopaque, outcome: commit_api.TurnOutcome) commit_api.Error!void {
+fn settleRun(context: *anyopaque, outcome: commit_api.RunOutcome) commit_api.Error!void {
     const self: *SessionCommit = @ptrCast(@alignCast(context));
     const turn_id = switch (self.turn) {
         .active => |*id| id.slice(),
@@ -153,11 +158,12 @@ fn mapJournalError(failure: journal_api.Error) commit_api.Error {
     return switch (failure) {
         error.OutOfMemory => error.OutOfMemory,
         error.SessionTooLarge, error.TooManyEntries => error.SessionTooLarge,
+        error.CommitIndeterminate => error.CommitIndeterminate,
         else => error.PersistenceFailed,
     };
 }
 
-fn mapOutcome(outcome: commit_api.TurnOutcome) format.TurnOutcome {
+fn mapOutcome(outcome: commit_api.RunOutcome) format.TurnOutcome {
     return switch (outcome) {
         .completed => .completed,
         .cancelled => .cancelled,
@@ -173,7 +179,7 @@ fn mapOutcome(outcome: commit_api.TurnOutcome) format.TurnOutcome {
             .provider_rejected_request => .provider_rejected_request,
             .provider_unavailable => .provider_unavailable,
             .invalid_provider_response => .invalid_provider_response,
-            .stream_consumer_stopped => .stream_consumer_stopped,
+            .event_consumer_stopped => .stream_consumer_stopped,
             .handoff_rejected => .handoff_rejected,
             .max_model_requests_exceeded => .max_model_requests_exceeded,
             .max_tool_calls_exceeded => .max_tool_calls_exceeded,

@@ -163,8 +163,10 @@ Module ownership (stable boundaries):
 - `src/ai/` owns the provider-independent model substrate: identities, profiles,
   settings, messages, streams, usage, failures, catalogs, wire protocols,
   transports, and provider adapters.
-- `src/agent/` owns the streamed tool loop: history, tool execution, run limits,
-  commits, and agent state.
+- `src/agent/` owns the streamed tool loop: provider context, tool execution,
+  run limits, commits, resumable settlement, and the data-oriented run, turn,
+  message, and tool event contract. Core event payloads are borrowed during the
+  synchronous sink call.
 - `src/coding_agent/` owns coding-agent policy: the session (identity,
   selection, durable journal, commits, on-disk format), the runtime that admits
   a model and its credentials, cwd-bound tools, `ZiPaths`, model config and
@@ -226,7 +228,16 @@ project-resource trust.
 
 The session journal is the append-only JSONL authority for one durable session
 when persistence is admitted. Torn-tail repair happens on the next append. The
-owner that creates a session disposes it.
+owner that creates a session disposes it. Live and restored provider context use
+`agent.ContextProjection` to remove incomplete tool exchanges after abandoned
+runs. Ordinary provider, tool, cancellation, timeout, and bounded-resource
+settlement returns the agent to ready; indeterminate publication poisons the live
+agent until the durable session is reopened.
+
+`AgentSessionEvent` extends the core agent lifecycle with session facts such as
+final settlement. It does not replace core payloads with rendering commands.
+Worker or UI boundaries must deep-copy the borrowed session event and derive
+presentation in their own reducer.
 
 Credentials are admitted values on the session runtime, not ambient environment
 reads scattered through the tree. The process edge reads the environment once

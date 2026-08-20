@@ -1,4 +1,5 @@
 const agent_session = @import("AgentSession.zig");
+const agent_session_event = @import("AgentSessionEvent.zig");
 const agent_session_runtime = @import("AgentSessionRuntime.zig");
 const bounded_text_file = @import("BoundedTextFile.zig");
 const context_files = @import("ContextFiles.zig");
@@ -24,6 +25,7 @@ pub const cli = @import("cli/root.zig");
 
 test {
     _ = agent_session;
+    _ = agent_session_event;
     _ = agent_session_runtime;
     _ = bounded_text_file;
     _ = context_files;

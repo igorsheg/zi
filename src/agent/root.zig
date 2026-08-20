@@ -1,5 +1,7 @@
 pub const Agent = @import("Agent.zig");
 pub const commit = @import("Commit.zig");
+pub const context_projection = @import("ContextProjection.zig");
+pub const event = @import("Event.zig");
 pub const History = @import("History.zig");
 pub const tool = @import("Tool.zig");
 pub const limits = @import("limits.zig");
@@ -12,13 +14,13 @@ pub const RunLimits = limits.RunLimits;
 pub const Event = Agent.Event;
 pub const EventSink = Agent.EventSink;
 pub const RunControl = Agent.RunControl;
-pub const StreamEvent = Agent.StreamEvent;
-pub const StreamSink = Agent.StreamSink;
 pub const State = Agent.State;
 
 test {
     _ = Agent;
     _ = commit;
+    _ = context_projection;
+    _ = event;
     _ = History;
     _ = tool;
     _ = limits;

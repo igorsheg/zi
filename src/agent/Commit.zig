@@ -1,6 +1,11 @@
 const message = @import("../ai/message.zig");
 
-pub const Error = error{ OutOfMemory, SessionTooLarge, PersistenceFailed };
+pub const Error = error{
+    OutOfMemory,
+    SessionTooLarge,
+    PersistenceFailed,
+    CommitIndeterminate,
+};
 
 pub const MessageKind = enum {
     user,
@@ -19,7 +24,7 @@ pub const Failure = enum {
     provider_rejected_request,
     provider_unavailable,
     invalid_provider_response,
-    stream_consumer_stopped,
+    event_consumer_stopped,
     handoff_rejected,
     max_model_requests_exceeded,
     max_tool_calls_exceeded,
@@ -28,7 +33,7 @@ pub const Failure = enum {
     persistence_failed,
 };
 
-pub const TurnOutcome = union(enum) {
+pub const RunOutcome = union(enum) {
     completed,
     failed: Failure,
     cancelled,
@@ -38,13 +43,13 @@ pub const TurnOutcome = union(enum) {
 pub const Sink = struct {
     context: *anyopaque,
     messageFn: *const fn (context: *anyopaque, kind: MessageKind, value: message.Message) Error!void,
-    settleFn: *const fn (context: *anyopaque, outcome: TurnOutcome) Error!void,
+    settleFn: *const fn (context: *anyopaque, outcome: RunOutcome) Error!void,
 
     pub fn commitMessage(self: Sink, kind: MessageKind, value: message.Message) Error!void {
         return self.messageFn(self.context, kind, value);
     }
 
-    pub fn settleTurn(self: Sink, outcome: TurnOutcome) Error!void {
+    pub fn settleRun(self: Sink, outcome: RunOutcome) Error!void {
         return self.settleFn(self.context, outcome);
     }
 };

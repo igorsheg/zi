@@ -1,8 +1,8 @@
 const std = @import("std");
 const Agent = @import("Agent.zig");
 const agent_testing = @import("testing.zig");
+const event_api = @import("Event.zig");
 const credential = @import("../ai/credential.zig");
-const ai_stream = @import("../ai/stream.zig");
 const compatible = @import("../ai/protocols/openai_compatible.zig");
 const codex = @import("../ai/protocols/openai_codex.zig");
 const fake_api = @import("../ai/transport/fake.zig");
@@ -52,12 +52,16 @@ const StreamRecorder = struct {
     saw_second: bool = false,
     ordered: bool = true,
 
-    fn emit(context: *anyopaque, event: Agent.StreamEvent) ai_stream.StreamSinkError!void {
+    fn emit(context: *anyopaque, value: Agent.Event) event_api.SinkError!void {
         const self: *StreamRecorder = @ptrCast(@alignCast(context));
-        if (event.request_number < self.last_request) self.ordered = false;
-        self.last_request = event.request_number;
-        self.saw_first = self.saw_first or event.request_number == 1;
-        self.saw_second = self.saw_second or event.request_number == 2;
+        const event = switch (value) {
+            .message_update => |update| update,
+            else => return,
+        };
+        if (event.turn_index < self.last_request) self.ordered = false;
+        self.last_request = event.turn_index;
+        self.saw_first = self.saw_first or event.turn_index == 1;
+        self.saw_second = self.saw_second or event.turn_index == 2;
         self.count += 1;
     }
 
@@ -155,7 +159,7 @@ fn hasHeader(request: transport.Request, name: []const u8, value: []const u8) bo
 }
 
 fn expectCompletedToolLoop(agent: *const Agent, provider: []const u8, final_text: []const u8) !void {
-    try std.testing.expect(agent.state() == .completed);
+    try std.testing.expect(agent.state() == .ready);
     try std.testing.expectEqual(@as(usize, 2), agent.modelRequests());
     try std.testing.expectEqual(@as(usize, 1), agent.toolCalls());
     try std.testing.expectEqual(@as(usize, 4), agent.messages().len);
@@ -218,6 +222,7 @@ test "Agent streams an OpenAI Chat tool loop through the production provider sea
         .description = "Read a file",
         .parameters_json_schema = "{\"type\":\"object\"}",
     });
+    var recorder: StreamRecorder = .{};
     var agent = try Agent.init(
         std.testing.allocator,
         std.testing.io,
@@ -225,15 +230,11 @@ test "Agent streams an OpenAI Chat tool loop through the production provider sea
         &.{},
         &.{tool},
         .{},
-        null,
+        .{ .context = &recorder, .emitFn = StreamRecorder.emit },
     );
     defer agent.deinit();
-    var recorder: StreamRecorder = .{};
 
-    const text = try agent.runStream("read src/main.zig", .{
-        .context = &recorder,
-        .emitFn = StreamRecorder.emit,
-    });
+    const text = try agent.run("read src/main.zig");
 
     try std.testing.expectEqualStrings("OpenAI done", text);
     try std.testing.expectEqual(@as(usize, 1), scripted_tool.calls);
@@ -308,6 +309,7 @@ test "Agent streams an OpenAI Codex Responses tool loop through the production p
         .description = "Read a file",
         .parameters_json_schema = "{\"type\":\"object\"}",
     });
+    var recorder: StreamRecorder = .{};
     var agent = try Agent.init(
         std.testing.allocator,
         std.testing.io,
@@ -315,15 +317,11 @@ test "Agent streams an OpenAI Codex Responses tool loop through the production p
         &.{},
         &.{tool},
         .{},
-        null,
+        .{ .context = &recorder, .emitFn = StreamRecorder.emit },
     );
     defer agent.deinit();
-    var recorder: StreamRecorder = .{};
 
-    const text = try agent.runStream("read src/main.zig", .{
-        .context = &recorder,
-        .emitFn = StreamRecorder.emit,
-    });
+    const text = try agent.run("read src/main.zig");
 
     try std.testing.expectEqualStrings("Codex done", text);
     try std.testing.expectEqual(@as(usize, 1), scripted_tool.calls);

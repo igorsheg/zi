@@ -5,6 +5,8 @@ const ai_model = @import("../ai/model.zig");
 const ai_stream = @import("../ai/stream.zig");
 const ai_usage = @import("../ai/usage.zig");
 const commit_api = @import("Commit.zig");
+const context_projection = @import("ContextProjection.zig");
+const event_api = @import("Event.zig");
 const History = @import("History.zig");
 const tool_api = @import("Tool.zig");
 const limit_api = @import("limits.zig");
@@ -12,44 +14,20 @@ const limit_api = @import("limits.zig");
 const Agent = @This();
 
 pub const State = union(enum) {
-    idle,
-    requesting_model: struct { number: usize },
-    executing_tools: struct { first: usize, count: usize },
-    completed,
-    failed,
-    cancelled,
+    ready,
+    running: event_api.RunId,
+    poisoned,
 };
 
 pub const StateTag = std.meta.Tag(State);
-
-pub const ToolOutcome = enum { success, failure };
 
 pub const RunControl = struct {
     cancellation: ?*const ai_model.CancellationToken = null,
     deadline: ?std.Io.Clock.Timestamp = null,
 };
 
-pub const Event = union(enum) {
-    state_changed: struct { from: StateTag, to: StateTag },
-    model_request_started: struct { number: usize },
-    model_request_completed: struct { number: usize },
-    tool_execution_started: struct { number: usize, call_id: []const u8, name: []const u8 },
-    tool_execution_completed: struct {
-        number: usize,
-        call_id: []const u8,
-        name: []const u8,
-        outcome: ToolOutcome,
-    },
-};
-
-pub const EventSink = struct {
-    context: *anyopaque,
-    emitFn: *const fn (context: *anyopaque, event: Event) void,
-
-    pub fn emit(self: EventSink, event: Event) void {
-        self.emitFn(self.context, event);
-    }
-};
+pub const Event = event_api.Event;
+pub const EventSink = event_api.Sink;
 
 pub const RunError = error{
     OutOfMemory,
@@ -64,15 +42,17 @@ pub const RunError = error{
     ProviderUnavailable,
     InvalidProviderResponse,
     StreamInterrupted,
-    StreamConsumerStopped,
+    EventConsumerStopped,
     HandoffRejected,
     MaxModelRequestsExceeded,
     MaxToolCallsExceeded,
     ToolResultTooLarge,
     ToolControlUnavailable,
     PersistenceFailed,
+    CommitIndeterminate,
     SessionTooLarge,
     AlreadyRun,
+    SessionUnavailable,
 };
 
 const TurnError = error{
@@ -88,13 +68,14 @@ const TurnError = error{
     ProviderUnavailable,
     InvalidProviderResponse,
     StreamInterrupted,
-    StreamConsumerStopped,
+    EventConsumerStopped,
     HandoffRejected,
     MaxModelRequestsExceeded,
     MaxToolCallsExceeded,
     ToolResultTooLarge,
     ToolControlUnavailable,
     PersistenceFailed,
+    CommitIndeterminate,
     SessionTooLarge,
 };
 
@@ -106,14 +87,15 @@ instructions: []const []const u8,
 catalog: tool_api.Catalog,
 history: History,
 result_arena: std.heap.ArenaAllocator,
-run_state: State = .idle,
+run_state: State = .ready,
 limits: limit_api.RunLimits,
 events: ?EventSink,
 commits: ?commit_api.Sink = null,
 model_request_count: usize = 0,
 tool_call_count: usize = 0,
 provider_failure: ?ai_failure.ProviderFailure = null,
-run_admitted: bool = false,
+context: context_projection.State = .{},
+next_run_id: u64 = 0,
 
 pub fn init(
     allocator: std.mem.Allocator,
@@ -174,32 +156,12 @@ pub fn bindCommits(
     initial_messages: []const ai_message.Message,
     sink: commit_api.Sink,
 ) error{ OutOfMemory, SessionTooLarge }!void {
-    std.debug.assert(self.run_state == .idle);
+    std.debug.assert(self.run_state == .ready);
     std.debug.assert(self.history.messages().len == 0);
     std.debug.assert(self.commits == null);
     for (initial_messages) |message| try self.history.append(message);
     self.commits = sink;
 }
-
-pub const StreamEvent = struct {
-    request_number: usize,
-    event: ai_stream.StreamEvent,
-};
-
-/// Event payload slices are borrowed for the duration of emitFn.
-pub const StreamSink = struct {
-    context: *anyopaque,
-    emitFn: *const fn (context: *anyopaque, event: StreamEvent) ai_stream.StreamSinkError!void,
-
-    pub fn emit(self: StreamSink, event: StreamEvent) ai_stream.StreamSinkError!void {
-        return self.emitFn(self.context, event);
-    }
-};
-
-const Delivery = union(enum) {
-    buffered,
-    streaming: StreamSink,
-};
 
 /// The returned final text remains valid until the next admitted run or deinit.
 pub fn run(self: *Agent, input: []const u8) RunError![]const u8 {
@@ -207,123 +169,304 @@ pub fn run(self: *Agent, input: []const u8) RunError![]const u8 {
 }
 
 pub fn runWithControl(self: *Agent, input: []const u8, control: RunControl) RunError![]const u8 {
-    return self.runInternal(input, control, .buffered);
+    return self.runInternal(input, control);
 }
 
-/// The returned final text remains valid until the next admitted run or deinit.
-pub fn runStream(self: *Agent, input: []const u8, sink: StreamSink) RunError![]const u8 {
-    return self.runStreamWithControl(input, sink, .{});
-}
+fn runInternal(self: *Agent, input: []const u8, control: RunControl) RunError![]const u8 {
+    switch (self.run_state) {
+        .ready => {},
+        .running => return error.AlreadyRun,
+        .poisoned => return error.SessionUnavailable,
+    }
+    try self.preflight();
 
-pub fn runStreamWithControl(
-    self: *Agent,
-    input: []const u8,
-    sink: StreamSink,
-    control: RunControl,
-) RunError![]const u8 {
-    return self.runInternal(input, control, .{ .streaming = sink });
-}
-
-fn runInternal(self: *Agent, input: []const u8, control: RunControl, delivery: Delivery) RunError![]const u8 {
-    if (self.run_admitted) return error.AlreadyRun;
-    if (self.run_state != .idle and self.run_state != .completed) return error.AlreadyRun;
-    try self.preflight(delivery);
-
-    self.run_admitted = true;
-    defer self.run_admitted = false;
+    self.next_run_id +%= 1;
+    if (self.next_run_id == 0) self.next_run_id = 1;
+    const run_id: event_api.RunId = @enumFromInt(self.next_run_id);
+    self.run_state = .{ .running = run_id };
     self.result_arena.deinit();
     self.result_arena = std.heap.ArenaAllocator.init(self.allocator);
     self.model_request_count = 0;
     self.tool_call_count = 0;
     self.provider_failure = null;
+    self.context.reset();
+    defer self.history.truncate(self.context.abandoned(self.history.messages().len));
+    const first_message = self.history.messages().len;
+
+    self.emit(.{ .agent_start = .{ .run_id = run_id } }) catch |failure| {
+        self.run_state = .ready;
+        return failure;
+    };
 
     self.commitMessage(.user, .{ .request = .{
         .parts = &.{.{ .user = .{ .text = input } }},
     } }) catch |failure| {
-        self.fail(failure);
-        return failure;
+        return self.finishUnpublishedRun(run_id, first_message, failure);
     };
 
-    const text = self.runTurn(control, delivery) catch |failure| {
-        self.settleTurn(turnOutcome(failure)) catch |settlement_failure| {
-            self.fail(settlement_failure);
-            return settlement_failure;
-        };
-        self.fail(failure);
+    const result = self.runTurns(run_id, control);
+    const outcome: commit_api.RunOutcome = if (result) |_| .completed else |failure| runOutcome(failure);
+    if (result) |_| {} else |failure| {
+        if (failure == error.CommitIndeterminate) {
+            self.run_state = .poisoned;
+            discardEventResult(self.emitAgentEnd(run_id, outcome, first_message));
+            return failure;
+        }
+    }
+    const settlement = self.settleRun(outcome);
+    if (settlement) |_| {} else |failure| {
+        self.run_state = .poisoned;
+        discardEventResult(self.emitAgentEnd(
+            run_id,
+            .{ .failed = .persistence_failed },
+            first_message,
+        ));
+        return failure;
+    }
+
+    self.emitAgentEnd(run_id, outcome, first_message) catch |failure| {
+        self.run_state = .ready;
         return failure;
     };
-    self.settleTurn(.completed) catch |failure| {
-        self.fail(failure);
-        return failure;
-    };
-    self.transition(.completed);
-    return text;
+    self.run_state = .ready;
+    return result;
 }
 
-fn runTurn(self: *Agent, control: RunControl, delivery: Delivery) TurnError![]const u8 {
+fn finishUnpublishedRun(
+    self: *Agent,
+    run_id: event_api.RunId,
+    first_message: usize,
+    failure: TurnError,
+) RunError {
+    const outcome = runOutcome(failure);
+    if (failure == error.CommitIndeterminate) self.run_state = .poisoned;
+    self.emitAgentEnd(run_id, outcome, first_message) catch |event_failure| {
+        if (self.run_state != .poisoned) self.run_state = .ready;
+        return event_failure;
+    };
+    if (self.run_state != .poisoned) self.run_state = .ready;
+    return failure;
+}
+
+fn discardEventResult(result: TurnError!void) void {
+    if (result) |_| {} else |_| {}
+}
+
+fn emitAgentEnd(
+    self: *Agent,
+    run_id: event_api.RunId,
+    outcome: commit_api.RunOutcome,
+    first_message: usize,
+) TurnError!void {
+    try self.emit(.{ .agent_end = .{
+        .run_id = run_id,
+        .outcome = outcome,
+        .messages = self.history.messages()[first_message..],
+    } });
+}
+
+fn runTurns(self: *Agent, run_id: event_api.RunId, control: RunControl) TurnError![]const u8 {
+    var definitions: std.ArrayList(ai_message.ToolDefinition) = .empty;
+    defer definitions.deinit(self.allocator);
+    for (self.catalog.tools.items) |tool| try definitions.append(self.allocator, tool.definition);
+
+    const user_message_index = self.history.messages().len - 1;
     while (true) {
-        try self.checkControl(control);
         if (self.model_request_count >= self.limits.max_model_requests) {
             return error.MaxModelRequestsExceeded;
         }
         self.model_request_count += 1;
-        self.transition(.{ .requesting_model = .{ .number = self.model_request_count } });
-        self.emit(.{ .model_request_started = .{ .number = self.model_request_count } });
-
-        var definitions: std.ArrayList(ai_message.ToolDefinition) = .empty;
-        defer definitions.deinit(self.allocator);
-        for (self.catalog.tools.items) |tool| try definitions.append(self.allocator, tool.definition);
-
-        var response = try self.invokeModel(control, delivery, definitions.items);
-        defer response.deinit();
-        const call_count = try validateResponseFinish(response.value);
-        try self.commitMessage(.response, .{ .response = response.value });
-        self.emit(.{ .model_request_completed = .{ .number = self.model_request_count } });
-        try self.checkControl(control);
-
-        const stored_response = self.history.messages()[self.history.messages().len - 1].response;
-        if (call_count == 0) {
-            return collectText(self.result_arena.allocator(), stored_response.parts);
+        const turn_index: event_api.TurnIndex = @intCast(self.model_request_count);
+        try self.emit(.{ .turn_start = .{ .run_id = run_id, .index = turn_index } });
+        if (turn_index == 1) {
+            const user = self.history.messages()[user_message_index];
+            try self.emitMessageLifecycle(run_id, turn_index, user);
         }
+
+        var accumulator = ai_stream.ResponseAccumulator.init(self.allocator, self.model.identity);
+        defer accumulator.deinit();
+        try self.emit(.{ .message_start = .{
+            .run_id = run_id,
+            .turn_index = turn_index,
+            .message = .{ .response = accumulator.snapshot() },
+        } });
+        self.checkControl(control) catch |failure| {
+            try self.emitDiscardedTurn(run_id, turn_index, accumulator.snapshot(), failure);
+            return failure;
+        };
+
+        var response = self.invokeModel(
+            run_id,
+            turn_index,
+            control,
+            definitions.items,
+            &accumulator,
+        ) catch |failure| {
+            try self.emitDiscardedTurn(run_id, turn_index, accumulator.snapshot(), failure);
+            return failure;
+        };
+        defer response.deinit();
+        if (!self.model.profile.supports(.streaming)) {
+            accumulator.finish(response.value) catch |failure| {
+                try self.emitDiscardedTurn(run_id, turn_index, accumulator.snapshot(), failure);
+                return failure;
+            };
+        }
+        const call_count = validateResponseFinish(response.value) catch |failure| {
+            try self.emitDiscardedTurn(run_id, turn_index, accumulator.snapshot(), failure);
+            return failure;
+        };
+        const response_index = self.history.messages().len;
+        self.commitMessage(.response, .{ .response = response.value }) catch |failure| {
+            try self.emitDiscardedTurn(run_id, turn_index, accumulator.snapshot(), failure);
+            return failure;
+        };
+        const stored_response_message = self.history.messages()[self.history.messages().len - 1];
+        const stored_response = stored_response_message.response;
+        self.context.publishResponse(response_index, stored_response);
+        const response_end: event_api.ResponseEnd = .{ .published = stored_response };
+        try self.emit(.{ .message_end = .{
+            .run_id = run_id,
+            .turn_index = turn_index,
+            .message = .{ .published = stored_response_message },
+        } });
+
+        var tool_results: std.ArrayList(ai_message.ToolResult) = .empty;
+        defer tool_results.deinit(self.allocator);
         if (call_count > self.limits.max_tool_calls -| self.tool_call_count) {
+            try self.emit(.{ .turn_end = .{
+                .run_id = run_id,
+                .index = turn_index,
+                .response = response_end,
+                .tool_results = tool_results.items,
+            } });
             return error.MaxToolCallsExceeded;
         }
 
-        const first_call = self.tool_call_count + 1;
-        self.transition(.{ .executing_tools = .{ .first = first_call, .count = call_count } });
         for (stored_response.parts) |part| switch (part) {
             .tool_call => |call| {
                 self.tool_call_count += 1;
-                const number = self.tool_call_count;
-                self.emit(.{ .tool_execution_started = .{
-                    .number = number,
+                try self.emit(.{ .tool_execution_start = .{
+                    .run_id = run_id,
+                    .turn_index = turn_index,
                     .call_id = call.id,
                     .name = call.name,
+                    .arguments_json = call.arguments_json,
                 } });
                 var result_arena = std.heap.ArenaAllocator.init(self.allocator);
                 defer result_arena.deinit();
-                const result_memory = result_arena.allocator();
                 const result = if (stored_response.finish.category == .length)
                     try self.failureResult(
-                        result_memory,
+                        result_arena.allocator(),
                         call,
                         "Tool call was not executed because the model response was truncated.",
                     )
                 else
-                    try self.executeTool(result_memory, call, control);
+                    self.executeTool(result_arena.allocator(), call, control) catch |failure| {
+                        try self.emit(.{ .tool_execution_end = .{
+                            .run_id = run_id,
+                            .turn_index = turn_index,
+                            .call_id = call.id,
+                            .name = call.name,
+                            .result = .{ .discarded = runOutcome(failure) },
+                        } });
+                        try self.emit(.{ .turn_end = .{
+                            .run_id = run_id,
+                            .index = turn_index,
+                            .response = response_end,
+                            .tool_results = tool_results.items,
+                        } });
+                        return failure;
+                    };
                 const result_parts = [_]ai_message.RequestPart{.{ .tool_result = result }};
-                try self.commitMessage(.tool_result, .{ .request = .{ .parts = &result_parts } });
-                self.emit(.{ .tool_execution_completed = .{
-                    .number = number,
+                self.commitMessage(.tool_result, .{ .request = .{ .parts = &result_parts } }) catch |failure| {
+                    try self.emit(.{ .tool_execution_end = .{
+                        .run_id = run_id,
+                        .turn_index = turn_index,
+                        .call_id = call.id,
+                        .name = call.name,
+                        .result = .{ .discarded = runOutcome(failure) },
+                    } });
+                    try self.emit(.{ .turn_end = .{
+                        .run_id = run_id,
+                        .index = turn_index,
+                        .response = response_end,
+                        .tool_results = tool_results.items,
+                    } });
+                    return failure;
+                };
+                const stored_result_message = self.history.messages()[self.history.messages().len - 1];
+                const stored_result = stored_result_message.request;
+                try tool_results.append(self.allocator, stored_result.parts[0].tool_result);
+                try self.emit(.{ .tool_execution_end = .{
+                    .run_id = run_id,
+                    .turn_index = turn_index,
                     .call_id = call.id,
                     .name = call.name,
-                    .outcome = if (result.outcome == .success) .success else .failure,
+                    .result = .{ .published = stored_result.parts[0].tool_result },
                 } });
-                try self.checkControl(control);
+                try self.emitMessageLifecycle(run_id, turn_index, stored_result_message);
             },
             else => {},
         };
+
+        if (call_count > 0) self.context.completeToolExchange();
+        try self.emit(.{ .turn_end = .{
+            .run_id = run_id,
+            .index = turn_index,
+            .response = response_end,
+            .tool_results = tool_results.items,
+        } });
+        if (call_count == 0) {
+            return collectText(self.result_arena.allocator(), stored_response.parts);
+        }
     }
+}
+
+fn emitDiscardedTurn(
+    self: *Agent,
+    run_id: event_api.RunId,
+    turn_index: event_api.TurnIndex,
+    response: ai_stream.ResponseSnapshot,
+    failure: TurnError,
+) TurnError!void {
+    const discarded: event_api.DiscardedResponse = .{
+        .response = response,
+        .outcome = runOutcome(failure),
+    };
+    try self.emit(.{ .message_end = .{
+        .run_id = run_id,
+        .turn_index = turn_index,
+        .message = .{ .discarded_response = discarded },
+    } });
+    try self.emit(.{ .turn_end = .{
+        .run_id = run_id,
+        .index = turn_index,
+        .response = .{ .discarded = discarded },
+        .tool_results = &.{},
+    } });
+}
+
+fn emitMessageLifecycle(
+    self: *Agent,
+    run_id: event_api.RunId,
+    turn_index: event_api.TurnIndex,
+    message: ai_message.Message,
+) TurnError!void {
+    const snapshot: event_api.MessageSnapshot = switch (message) {
+        .request => |request| .{ .request = request },
+        .response => unreachable,
+    };
+    try self.emit(.{ .message_start = .{
+        .run_id = run_id,
+        .turn_index = turn_index,
+        .message = snapshot,
+    } });
+    try self.emit(.{ .message_end = .{
+        .run_id = run_id,
+        .turn_index = turn_index,
+        .message = .{ .published = message },
+    } });
 }
 
 fn commitMessage(self: *Agent, kind: commit_api.MessageKind, value: ai_message.Message) TurnError!void {
@@ -333,11 +476,11 @@ fn commitMessage(self: *Agent, kind: commit_api.MessageKind, value: ai_message.M
     prepared.publish(&self.history);
 }
 
-fn settleTurn(self: *Agent, outcome: commit_api.TurnOutcome) commit_api.Error!void {
-    if (self.commits) |sink| return sink.settleTurn(outcome);
+fn settleRun(self: *Agent, outcome: commit_api.RunOutcome) commit_api.Error!void {
+    if (self.commits) |sink| return sink.settleRun(outcome);
 }
 
-fn turnOutcome(failure: TurnError) commit_api.TurnOutcome {
+fn runOutcome(failure: TurnError) commit_api.RunOutcome {
     return switch (failure) {
         error.Cancelled => .cancelled,
         error.StreamInterrupted => .interrupted,
@@ -351,13 +494,13 @@ fn turnOutcome(failure: TurnError) commit_api.TurnOutcome {
         error.ProviderRejectedRequest => .{ .failed = .provider_rejected_request },
         error.ProviderUnavailable => .{ .failed = .provider_unavailable },
         error.InvalidProviderResponse => .{ .failed = .invalid_provider_response },
-        error.StreamConsumerStopped => .{ .failed = .stream_consumer_stopped },
+        error.EventConsumerStopped => .{ .failed = .event_consumer_stopped },
         error.HandoffRejected => .{ .failed = .handoff_rejected },
         error.MaxModelRequestsExceeded => .{ .failed = .max_model_requests_exceeded },
         error.MaxToolCallsExceeded => .{ .failed = .max_tool_calls_exceeded },
         error.ToolResultTooLarge => .{ .failed = .tool_result_too_large },
         error.ToolControlUnavailable => .{ .failed = .tool_control_unavailable },
-        error.PersistenceFailed => .{ .failed = .persistence_failed },
+        error.PersistenceFailed, error.CommitIndeterminate => .{ .failed = .persistence_failed },
     };
 }
 
@@ -494,21 +637,16 @@ fn failureResult(
     };
 }
 
-fn transition(self: *Agent, next: State) void {
-    const previous = std.meta.activeTag(self.run_state);
-    self.run_state = next;
-    self.emit(.{ .state_changed = .{ .from = previous, .to = std.meta.activeTag(next) } });
+fn emit(self: *Agent, event: Event) TurnError!void {
+    const sink = self.events orelse return;
+    sink.emit(event) catch |failure| return switch (failure) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.Cancelled => error.Cancelled,
+        error.ConsumerStopped => error.EventConsumerStopped,
+    };
 }
 
-fn fail(self: *Agent, failure: anytype) void {
-    if (failure == error.Cancelled) self.transition(.cancelled) else self.transition(.failed);
-}
-
-fn emit(self: *Agent, event: Event) void {
-    if (self.events) |sink| sink.emit(event);
-}
-
-fn checkControl(self: *const Agent, control: RunControl) ai_model.ModelError!void {
+fn checkControl(self: *const Agent, control: RunControl) error{ Cancelled, TimedOut }!void {
     if (control.cancellation) |token| if (token.isCancelled()) return error.Cancelled;
     if (control.deadline) |deadline| {
         const now = std.Io.Clock.Timestamp.now(self.io, deadline.clock);
@@ -516,20 +654,19 @@ fn checkControl(self: *const Agent, control: RunControl) ai_model.ModelError!voi
     }
 }
 
-fn preflight(self: *const Agent, delivery: Delivery) error{UnsupportedCapability}!void {
+fn preflight(self: *const Agent) error{UnsupportedCapability}!void {
     if (self.catalog.tools.items.len > 0 and !self.model.profile.supports(.tools)) {
-        return error.UnsupportedCapability;
-    }
-    if (delivery == .streaming and !self.model.profile.supports(.streaming)) {
         return error.UnsupportedCapability;
     }
 }
 
 fn invokeModel(
     self: *Agent,
+    run_id: event_api.RunId,
+    turn_index: event_api.TurnIndex,
     control: RunControl,
-    delivery: Delivery,
     tools: []const ai_message.ToolDefinition,
+    accumulator: *ai_stream.ResponseAccumulator,
 ) TurnError!ai_model.OwnedResponse {
     const request: ai_model.ModelRequest = .{
         .messages = self.history.messages(),
@@ -539,18 +676,42 @@ fn invokeModel(
         .deadline = control.deadline,
         .cancellation = control.cancellation,
     };
-    return switch (delivery) {
-        .buffered => self.model.complete(self.allocator, self.io, request),
-        .streaming => |sink| stream: {
-            var adapter = StreamSinkAdapter{
-                .request_number = self.model_request_count,
-                .sink = sink,
-            };
-            break :stream self.model.stream(self.allocator, self.io, request, .{
-                .context = &adapter,
-                .emitFn = StreamSinkAdapter.emit,
-            });
-        },
+    if (!self.model.profile.supports(.streaming)) {
+        return self.model.complete(self.allocator, self.io, request) catch |failure|
+            return mapModelError(failure);
+    }
+
+    var adapter: StreamEventAdapter = .{
+        .agent = self,
+        .run_id = run_id,
+        .turn_index = turn_index,
+        .accumulator = accumulator,
+    };
+    return self.model.stream(self.allocator, self.io, request, .{
+        .context = &adapter,
+        .emitFn = StreamEventAdapter.emit,
+    }) catch |failure| {
+        if (adapter.failure) |event_failure| return event_failure;
+        return mapModelError(failure);
+    };
+}
+
+fn mapModelError(failure: ai_model.ModelError) TurnError {
+    return switch (failure) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.Cancelled => error.Cancelled,
+        error.TimedOut => error.TimedOut,
+        error.UnsupportedCapability => error.UnsupportedCapability,
+        error.UnsupportedSetting => error.UnsupportedSetting,
+        error.InvalidRequest => error.InvalidRequest,
+        error.ConnectionFailed => error.ConnectionFailed,
+        error.RateLimited => error.RateLimited,
+        error.ProviderRejectedRequest => error.ProviderRejectedRequest,
+        error.ProviderUnavailable => error.ProviderUnavailable,
+        error.InvalidProviderResponse => error.InvalidProviderResponse,
+        error.StreamInterrupted => error.StreamInterrupted,
+        error.StreamConsumerStopped => error.EventConsumerStopped,
+        error.HandoffRejected => error.HandoffRejected,
     };
 }
 
@@ -600,13 +761,38 @@ fn safeDiagnosticText(value: []const u8) bool {
     return true;
 }
 
-const StreamSinkAdapter = struct {
-    request_number: usize,
-    sink: StreamSink,
+const StreamEventAdapter = struct {
+    agent: *Agent,
+    run_id: event_api.RunId,
+    turn_index: event_api.TurnIndex,
+    accumulator: *ai_stream.ResponseAccumulator,
+    failure: ?TurnError = null,
 
     fn emit(context: *anyopaque, event: ai_stream.StreamEvent) ai_stream.StreamSinkError!void {
-        const self: *StreamSinkAdapter = @ptrCast(@alignCast(context));
-        return self.sink.emit(.{ .request_number = self.request_number, .event = event });
+        const self: *StreamEventAdapter = @ptrCast(@alignCast(context));
+        const snapshot = self.accumulator.apply(event) catch |failure| {
+            self.failure = switch (failure) {
+                error.OutOfMemory => error.OutOfMemory,
+                error.InvalidStream => error.InvalidProviderResponse,
+            };
+            return switch (failure) {
+                error.OutOfMemory => error.OutOfMemory,
+                error.InvalidStream => error.ConsumerStopped,
+            };
+        };
+        self.agent.emit(.{ .message_update = .{
+            .run_id = self.run_id,
+            .turn_index = self.turn_index,
+            .message = snapshot,
+            .update = event,
+        } }) catch |failure| {
+            self.failure = failure;
+            return switch (failure) {
+                error.OutOfMemory => error.OutOfMemory,
+                error.Cancelled => error.Cancelled,
+                else => error.ConsumerStopped,
+            };
+        };
     }
 };
 
@@ -699,12 +885,12 @@ const ai_testing = @import("../ai/testing.zig");
 const agent_testing = @import("testing.zig");
 
 const EventRecorder = struct {
-    events: [16]Event = undefined,
+    tags: [32]std.meta.Tag(Event) = undefined,
     count: usize = 0,
 
-    fn emit(context: *anyopaque, event: Event) void {
+    fn emit(context: *anyopaque, event: Event) event_api.SinkError!void {
         const self: *EventRecorder = @ptrCast(@alignCast(context));
-        self.events[self.count] = event;
+        self.tags[self.count] = std.meta.activeTag(event);
         self.count += 1;
     }
 };
@@ -799,7 +985,7 @@ test "agent executes a tool and returns final text with owned canonical history"
 
     const text = try agent.runWithControl("read the file.", .{ .cancellation = &cancellation });
     try std.testing.expectEqualStrings("done", text);
-    try std.testing.expect(agent.state() == .completed);
+    try std.testing.expect(agent.state() == .ready);
     try std.testing.expectEqual(@as(usize, 2), agent.modelRequests());
     try std.testing.expectEqual(@as(usize, 1), agent.toolCalls());
     try std.testing.expectEqual(@as(usize, 1), scripted_tool.calls);
@@ -813,21 +999,68 @@ test "agent executes a tool and returns final text with owned canonical history"
     );
     try std.testing.expectEqualStrings("done", agent.messages()[3].response.parts[0].text.text);
     const expected = [_]std.meta.Tag(Event){
-        .state_changed,
-        .model_request_started,
-        .model_request_completed,
-        .state_changed,
-        .tool_execution_started,
-        .tool_execution_completed,
-        .state_changed,
-        .model_request_started,
-        .model_request_completed,
-        .state_changed,
+        .agent_start,
+        .turn_start,
+        .message_start,
+        .message_end,
+        .message_start,
+        .message_update,
+        .message_update,
+        .message_update,
+        .message_end,
+        .tool_execution_start,
+        .tool_execution_end,
+        .message_start,
+        .message_end,
+        .turn_end,
+        .turn_start,
+        .message_start,
+        .message_update,
+        .message_update,
+        .message_update,
+        .message_end,
+        .turn_end,
+        .agent_end,
     };
-    try std.testing.expectEqual(expected.len, recorder.count);
-    for (expected, recorder.events[0..recorder.count]) |tag, event| {
-        try std.testing.expectEqual(tag, std.meta.activeTag(event));
-    }
+    try std.testing.expectEqualSlices(std.meta.Tag(Event), &expected, recorder.tags[0..recorder.count]);
+}
+
+test "pre-cancelled runs close their message and turn lifecycle" {
+    var scripted_model: ai_testing.ScriptedModel = .{
+        .identity = .{ .provider = "script", .model = "pre-cancelled" },
+        .steps = &.{.{ .text = "never" }},
+    };
+    var recorder: EventRecorder = .{};
+    var agent = try Agent.init(
+        std.testing.allocator,
+        std.testing.io,
+        scripted_model.asModel(),
+        &.{},
+        &.{},
+        .{},
+        .{ .context = &recorder, .emitFn = EventRecorder.emit },
+    );
+    defer agent.deinit();
+    var cancellation: ai_model.CancellationToken = .{};
+    cancellation.cancel();
+
+    try std.testing.expectError(
+        error.Cancelled,
+        agent.runWithControl("stop", .{ .cancellation = &cancellation }),
+    );
+    const expected = [_]std.meta.Tag(Event){
+        .agent_start,
+        .turn_start,
+        .message_start,
+        .message_end,
+        .message_start,
+        .message_end,
+        .turn_end,
+        .agent_end,
+    };
+    try std.testing.expectEqualSlices(std.meta.Tag(Event), &expected, recorder.tags[0..recorder.count]);
+    try std.testing.expectEqual(@as(usize, 0), scripted_model.calls);
+    try std.testing.expect(agent.state() == .ready);
 }
 
 test "agent enforces model request and tool call limits before excess work" {
@@ -852,7 +1085,7 @@ test "agent enforces model request and tool call limits before excess work" {
     );
     defer agent.deinit();
     try std.testing.expectError(error.MaxToolCallsExceeded, agent.run("go"));
-    try std.testing.expect(agent.state() == .failed);
+    try std.testing.expect(agent.state() == .ready);
     try std.testing.expectEqual(@as(usize, 0), scripted_tool.calls);
 }
 
@@ -947,10 +1180,10 @@ test "model request limit stops before another model operation" {
     try std.testing.expectError(error.MaxModelRequestsExceeded, agent.run("go"));
     try std.testing.expectEqual(@as(usize, 1), scripted_model.calls);
     try std.testing.expectEqual(@as(usize, 3), agent.messages().len);
-    try std.testing.expect(agent.state() == .failed);
+    try std.testing.expect(agent.state() == .ready);
 }
 
-test "oversized tool result is not committed" {
+test "oversized tool result removes its incomplete exchange from provider context" {
     var scripted_model: ai_testing.ScriptedModel = .{
         .identity = .{ .provider = "script", .model = "result-limit" },
         .steps = &.{.{ .tool_call = .{ .id = "call", .name = "read", .arguments_json = "{}" } }},
@@ -972,8 +1205,8 @@ test "oversized tool result is not committed" {
     );
     defer agent.deinit();
     try std.testing.expectError(error.ToolResultTooLarge, agent.run("go"));
-    try std.testing.expectEqual(@as(usize, 2), agent.messages().len);
-    try std.testing.expect(agent.state() == .failed);
+    try std.testing.expectEqual(@as(usize, 1), agent.messages().len);
+    try std.testing.expect(agent.state() == .ready);
 }
 
 test "fatal tool cancellation is terminal cancellation" {
@@ -998,7 +1231,7 @@ test "fatal tool cancellation is terminal cancellation" {
     );
     defer agent.deinit();
     try std.testing.expectError(error.Cancelled, agent.run("go"));
-    try std.testing.expect(agent.state() == .cancelled);
+    try std.testing.expect(agent.state() == .ready);
 }
 
 test "fatal tool timeout and allocation failure are terminal failures" {
@@ -1024,7 +1257,7 @@ test "fatal tool timeout and allocation failure are terminal failures" {
         );
         defer agent.deinit();
         try std.testing.expectError(fatal, agent.run("go"));
-        try std.testing.expect(agent.state() == .failed);
+        try std.testing.expect(agent.state() == .ready);
     }
 }
 
@@ -1066,7 +1299,7 @@ test "agent completes one turn with owned canonical messages" {
 
     const text = try agent.run("question one");
     try std.testing.expectEqualStrings("answer one", text);
-    try std.testing.expect(agent.state() == .completed);
+    try std.testing.expect(agent.state() == .ready);
     try std.testing.expectEqual(@as(usize, 1), agent.modelRequests());
     try std.testing.expectEqual(@as(usize, 0), agent.toolCalls());
     try std.testing.expectEqual(@as(usize, 2), agent.messages().len);
@@ -1105,7 +1338,7 @@ test "agent reuses completed turns and resets run limits" {
     {
         const first_text = try agent.run("first question");
         try std.testing.expectEqualStrings("first answer", first_text);
-        try std.testing.expect(agent.state() == .completed);
+        try std.testing.expect(agent.state() == .ready);
         try std.testing.expectEqual(@as(usize, 1), agent.modelRequests());
         try std.testing.expectEqual(@as(usize, 0), agent.toolCalls());
         try std.testing.expectEqual(@as(usize, 2), agent.messages().len);
@@ -1114,7 +1347,7 @@ test "agent reuses completed turns and resets run limits" {
     {
         const second_text = try agent.run("second question");
         try std.testing.expectEqualStrings("second answer", second_text);
-        try std.testing.expect(agent.state() == .completed);
+        try std.testing.expect(agent.state() == .ready);
         try std.testing.expectEqual(@as(usize, 2), agent.modelRequests());
         try std.testing.expectEqual(@as(usize, 1), agent.toolCalls());
         try std.testing.expectEqual(@as(usize, 1), scripted_tool.calls);
@@ -1160,15 +1393,18 @@ test "completed turns accept fresh run cancellation control" {
         "second",
         try agent.runWithControl("two", .{ .cancellation = &second_control }),
     );
-    try std.testing.expect(agent.state() == .completed);
+    try std.testing.expect(agent.state() == .ready);
     try std.testing.expectEqual(@as(usize, 4), agent.messages().len);
 }
 
-test "agent rejects runs after failure or cancellation without mutation" {
+test "agent accepts a fresh run after settled cancellation and failure" {
     {
         var cancelled_model: ai_testing.ScriptedModel = .{
-            .identity = .{ .provider = "script", .model = "cancelled-turn" },
-            .steps = &.{.{ .tool_call = .{ .id = "call", .name = "read", .arguments_json = "{}" } }},
+            .identity = .{ .provider = "script", .model = "cancelled-run" },
+            .steps = &.{
+                .{ .tool_call = .{ .id = "call", .name = "read", .arguments_json = "{}" } },
+                .{ .text = "recovered after cancellation" },
+            },
         };
         var fatal_tool: agent_testing.ScriptedTool = .{ .result = "", .fatal = error.Cancelled };
         var agent = try Agent.init(
@@ -1182,20 +1418,21 @@ test "agent rejects runs after failure or cancellation without mutation" {
         );
         defer agent.deinit();
         try std.testing.expectError(error.Cancelled, agent.run("stop me"));
-        const message_count = agent.messages().len;
-        const request_count = agent.modelRequests();
-        const tool_count = agent.toolCalls();
-        try std.testing.expectError(error.AlreadyRun, agent.run("again"));
-        try std.testing.expectEqual(message_count, agent.messages().len);
-        try std.testing.expectEqual(request_count, agent.modelRequests());
-        try std.testing.expectEqual(tool_count, agent.toolCalls());
-        try std.testing.expect(agent.state() == .cancelled);
+        try std.testing.expect(agent.state() == .ready);
+        try std.testing.expectEqualStrings("recovered after cancellation", try agent.run("again"));
+        try std.testing.expect(agent.state() == .ready);
+        try std.testing.expectEqual(@as(usize, 3), agent.messages().len);
+        try std.testing.expectEqualStrings("stop me", agent.messages()[0].request.parts[0].user.text);
+        try std.testing.expectEqualStrings("again", agent.messages()[1].request.parts[0].user.text);
     }
 
     {
         var failed_model: ai_testing.ScriptedModel = .{
-            .identity = .{ .provider = "script", .model = "failed-turn" },
-            .steps = &.{.{ .tool_call = .{ .id = "call", .name = "read", .arguments_json = "{}" } }},
+            .identity = .{ .provider = "script", .model = "failed-run" },
+            .steps = &.{
+                .{ .tool_call = .{ .id = "call", .name = "read", .arguments_json = "{}" } },
+                .{ .text = "recovered after failure" },
+            },
         };
         var quiet_tool: agent_testing.ScriptedTool = .{ .result = "x" };
         var agent = try Agent.init(
@@ -1209,10 +1446,12 @@ test "agent rejects runs after failure or cancellation without mutation" {
         );
         defer agent.deinit();
         try std.testing.expectError(error.MaxToolCallsExceeded, agent.run("limit me"));
-        const message_count = agent.messages().len;
-        try std.testing.expectError(error.AlreadyRun, agent.run("again"));
-        try std.testing.expectEqual(message_count, agent.messages().len);
-        try std.testing.expect(agent.state() == .failed);
+        try std.testing.expect(agent.state() == .ready);
+        try std.testing.expectEqualStrings("recovered after failure", try agent.run("again"));
+        try std.testing.expect(agent.state() == .ready);
+        try std.testing.expectEqual(@as(usize, 3), agent.messages().len);
+        try std.testing.expectEqualStrings("limit me", agent.messages()[0].request.parts[0].user.text);
+        try std.testing.expectEqualStrings("again", agent.messages()[1].request.parts[0].user.text);
     }
 }
 
@@ -1235,20 +1474,16 @@ test "agent rejects reentrant runs until terminal events settle" {
     const ReentrantRecorder = struct {
         const Self = @This();
         agent: *Agent,
-        requesting_rejected: bool = false,
-        completed_rejected: bool = false,
+        turn_start_rejected: bool = false,
+        agent_end_rejected: bool = false,
 
-        fn emit(context: *anyopaque, event: Event) void {
+        fn emit(context: *anyopaque, event: Event) event_api.SinkError!void {
             const self: *Self = @ptrCast(@alignCast(context));
-            const change = switch (event) {
-                .state_changed => |change| change,
-                else => return,
-            };
-            if (change.to != .requesting_model and change.to != .completed) return;
+            if (event != .turn_start and event != .agent_end) return;
             const attempt = self.agent.run("nested");
             const rejected = if (attempt) |_| false else |failure| failure == error.AlreadyRun;
-            if (change.to == .requesting_model) self.requesting_rejected = rejected;
-            if (change.to == .completed) self.completed_rejected = rejected;
+            if (event == .turn_start) self.turn_start_rejected = rejected;
+            if (event == .agent_end) self.agent_end_rejected = rejected;
         }
     };
     var recorder: ReentrantRecorder = .{ .agent = &agent };
@@ -1256,16 +1491,16 @@ test "agent rejects reentrant runs until terminal events settle" {
 
     const text = try agent.run("outer");
     try std.testing.expectEqualStrings("answer", text);
-    try std.testing.expect(recorder.requesting_rejected);
-    try std.testing.expect(recorder.completed_rejected);
-    try std.testing.expect(agent.state() == .completed);
+    try std.testing.expect(recorder.turn_start_rejected);
+    try std.testing.expect(recorder.agent_end_rejected);
+    try std.testing.expect(agent.state() == .ready);
     try std.testing.expectEqual(@as(usize, 1), agent.modelRequests());
     try std.testing.expectEqual(@as(usize, 2), agent.messages().len);
 }
 
 const StreamCollector = struct {
     const Entry = struct {
-        request_number: usize,
+        turn_index: event_api.TurnIndex,
         tag: std.meta.Tag(ai_stream.StreamEvent),
     };
 
@@ -1273,17 +1508,21 @@ const StreamCollector = struct {
     count: usize = 0,
     completed_tool_call_valid: bool = false,
 
-    fn emit(context: *anyopaque, event: StreamEvent) ai_stream.StreamSinkError!void {
+    fn emit(context: *anyopaque, value: Event) event_api.SinkError!void {
         const self: *StreamCollector = @ptrCast(@alignCast(context));
+        const update = switch (value) {
+            .message_update => |event| event,
+            else => return,
+        };
         self.entries[self.count] = .{
-            .request_number = event.request_number,
-            .tag = std.meta.activeTag(event.event),
+            .turn_index = update.turn_index,
+            .tag = std.meta.activeTag(update.update),
         };
         self.count += 1;
-        if (event.event == .part_end and event.event.part_end.part == .tool_call) {
+        if (update.update == .part_end and update.update.part_end.part == .tool_call) {
             self.completed_tool_call_valid = std.mem.eql(
                 u8,
-                event.event.part_end.part.tool_call.arguments_json,
+                update.update.part_end.part.tool_call.arguments_json,
                 "{\"path\":\"file\"}",
             );
         }
@@ -1312,13 +1551,13 @@ test "agent streams a tool loop with owned canonical history" {
         &.{},
         &.{tool},
         .{},
-        null,
+        .{ .context = &collector, .emitFn = StreamCollector.emit },
     );
     defer agent.deinit();
 
-    const text = try agent.runStream("read the file.", .{ .context = &collector, .emitFn = StreamCollector.emit });
+    const text = try agent.run("read the file.");
     try std.testing.expectEqualStrings("streamed final", text);
-    try std.testing.expect(agent.state() == .completed);
+    try std.testing.expect(agent.state() == .ready);
     try std.testing.expectEqual(@as(usize, 2), agent.modelRequests());
     try std.testing.expectEqual(@as(usize, 1), agent.toolCalls());
     try std.testing.expectEqual(@as(usize, 1), scripted_tool.calls);
@@ -1333,10 +1572,10 @@ test "agent streams a tool loop with owned canonical history" {
 
     try std.testing.expectEqual(@as(usize, 6), collector.count);
     for (collector.entries[0..3]) |entry| {
-        try std.testing.expectEqual(@as(usize, 1), entry.request_number);
+        try std.testing.expectEqual(@as(event_api.TurnIndex, 1), entry.turn_index);
     }
     for (collector.entries[3..6]) |entry| {
-        try std.testing.expectEqual(@as(usize, 2), entry.request_number);
+        try std.testing.expectEqual(@as(event_api.TurnIndex, 2), entry.turn_index);
     }
     try std.testing.expectEqual(.part_start, collector.entries[0].tag);
     try std.testing.expectEqual(.part_end, collector.entries[2].tag);
@@ -1344,17 +1583,17 @@ test "agent streams a tool loop with owned canonical history" {
     try std.testing.expectEqual(.part_start, collector.entries[3].tag);
 }
 
-const StreamFailSink = struct {
-    failure: ai_stream.StreamSinkError,
+const EventFailSink = struct {
+    failure: event_api.SinkError,
 
-    fn emit(context: *anyopaque, _: StreamEvent) ai_stream.StreamSinkError!void {
-        const self: *StreamFailSink = @ptrCast(@alignCast(context));
-        return self.failure;
+    fn emit(context: *anyopaque, event: Event) event_api.SinkError!void {
+        const self: *EventFailSink = @ptrCast(@alignCast(context));
+        if (event == .message_update) return self.failure;
     }
 };
 
-fn expectStreamFailureDoesNotCommit(
-    failure: ai_stream.StreamSinkError,
+fn expectEventFailureDoesNotCommit(
+    failure: event_api.SinkError,
     expected: RunError,
     expected_state_tag: StateTag,
 ) !void {
@@ -1372,21 +1611,19 @@ fn expectStreamFailureDoesNotCommit(
         null,
     );
     defer agent.deinit();
-    var sink_state: StreamFailSink = .{ .failure = failure };
+    var sink_state: EventFailSink = .{ .failure = failure };
+    agent.events = .{ .context = &sink_state, .emitFn = EventFailSink.emit };
 
-    try std.testing.expectError(
-        expected,
-        agent.runStream("go", .{ .context = &sink_state, .emitFn = StreamFailSink.emit }),
-    );
+    try std.testing.expectError(expected, agent.run("go"));
     try std.testing.expectEqual(expected_state_tag, std.meta.activeTag(agent.state()));
     try std.testing.expectEqual(@as(usize, 1), agent.messages().len);
     try std.testing.expectEqualStrings("go", agent.messages()[0].request.parts[0].user.text);
 }
 
-test "agent stream sink failures commit no partial response" {
-    try expectStreamFailureDoesNotCommit(error.ConsumerStopped, error.StreamConsumerStopped, .failed);
-    try expectStreamFailureDoesNotCommit(error.OutOfMemory, error.OutOfMemory, .failed);
-    try expectStreamFailureDoesNotCommit(error.Cancelled, error.Cancelled, .cancelled);
+test "agent event sink failures commit no partial response" {
+    try expectEventFailureDoesNotCommit(error.ConsumerStopped, error.EventConsumerStopped, .ready);
+    try expectEventFailureDoesNotCommit(error.OutOfMemory, error.OutOfMemory, .ready);
+    try expectEventFailureDoesNotCommit(error.Cancelled, error.Cancelled, .ready);
 }
 
 fn expectFatalFinishDoesNotCommit(
@@ -1414,20 +1651,71 @@ fn expectFatalFinishDoesNotCommit(
     );
     defer agent.deinit();
     var collector: StreamCollector = .{};
+    agent.events = .{ .context = &collector, .emitFn = StreamCollector.emit };
 
-    try std.testing.expectError(
-        expected,
-        agent.runStream("go", .{ .context = &collector, .emitFn = StreamCollector.emit }),
-    );
+    try std.testing.expectError(expected, agent.run("go"));
     try std.testing.expect(collector.count > 0);
     try std.testing.expectEqual(expected_state_tag, std.meta.activeTag(agent.state()));
     try std.testing.expectEqual(@as(usize, 1), agent.messages().len);
     try std.testing.expectEqualStrings("go", agent.messages()[0].request.parts[0].user.text);
 }
 
+test "indeterminate message publication poisons the live agent" {
+    const Commits = struct {
+        const Self = @This();
+
+        messages: usize = 0,
+        settlements: usize = 0,
+
+        fn message(
+            context: *anyopaque,
+            _: commit_api.MessageKind,
+            _: ai_message.Message,
+        ) commit_api.Error!void {
+            const self: *Self = @ptrCast(@alignCast(context));
+            self.messages += 1;
+            if (self.messages == 2) return error.CommitIndeterminate;
+        }
+
+        fn settle(
+            context: *anyopaque,
+            _: commit_api.RunOutcome,
+        ) commit_api.Error!void {
+            const self: *Self = @ptrCast(@alignCast(context));
+            self.settlements += 1;
+        }
+    };
+
+    var scripted_model: ai_testing.ScriptedModel = .{
+        .identity = .{ .provider = "script", .model = "indeterminate" },
+        .steps = &.{.{ .text = "uncertain" }},
+    };
+    var commits: Commits = .{};
+    var agent = try Agent.init(
+        std.testing.allocator,
+        std.testing.io,
+        scripted_model.asModel(),
+        &.{},
+        &.{},
+        .{},
+        null,
+    );
+    defer agent.deinit();
+    try agent.bindCommits(&.{}, .{
+        .context = &commits,
+        .messageFn = Commits.message,
+        .settleFn = Commits.settle,
+    });
+
+    try std.testing.expectError(error.CommitIndeterminate, agent.run("question"));
+    try std.testing.expect(agent.state() == .poisoned);
+    try std.testing.expectEqual(@as(usize, 0), commits.settlements);
+    try std.testing.expectError(error.SessionUnavailable, agent.run("again"));
+}
+
 test "fatal streamed finishes commit no partial response" {
-    try expectFatalFinishDoesNotCommit(.cancelled, error.Cancelled, .cancelled);
-    try expectFatalFinishDoesNotCommit(.provider_error, error.InvalidProviderResponse, .failed);
+    try expectFatalFinishDoesNotCommit(.cancelled, error.Cancelled, .ready);
+    try expectFatalFinishDoesNotCommit(.provider_error, error.InvalidProviderResponse, .ready);
 }
 
 fn expectNonToolFinishRejectsToolCalls(finish: ai_usage.FinishCategory) !void {
@@ -1461,7 +1749,7 @@ fn expectNonToolFinishRejectsToolCalls(finish: ai_usage.FinishCategory) !void {
     try std.testing.expectEqual(@as(usize, 0), scripted_tool.calls);
     try std.testing.expectEqual(@as(usize, 0), agent.toolCalls());
     try std.testing.expectEqual(@as(usize, 1), agent.messages().len);
-    try std.testing.expect(agent.state() == .failed);
+    try std.testing.expect(agent.state() == .ready);
 }
 
 test "only tool-call finishes authorize local tool execution" {
@@ -1486,7 +1774,7 @@ test "only tool-call finishes authorize local tool execution" {
 
     try std.testing.expectError(error.InvalidProviderResponse, agent.run("go"));
     try std.testing.expectEqual(@as(usize, 1), agent.messages().len);
-    try std.testing.expect(agent.state() == .failed);
+    try std.testing.expect(agent.state() == .ready);
 }
 
 fn expectInvalidToolIdentities(calls: []const ai_testing.ScriptedStep.ToolCall) !void {
@@ -1533,7 +1821,7 @@ test "tool execution requires non-empty unique call identities" {
     try expectInvalidToolIdentities(&empty_name);
 }
 
-test "completed tool results are canonical before the next tool starts" {
+test "failed tool batches are removed from provider context" {
     const calls = [_]ai_testing.ScriptedStep.ToolCall{
         .{ .id = "call-1", .name = "first", .arguments_json = "{}" },
         .{ .id = "call-2", .name = "second", .arguments_json = "{}" },
@@ -1563,24 +1851,17 @@ test "completed tool results are canonical before the next tool starts" {
     try std.testing.expectEqual(@as(usize, 1), first_tool.calls);
     try std.testing.expectEqual(@as(usize, 1), second_tool.calls);
     try std.testing.expectEqual(@as(usize, 2), agent.toolCalls());
-    try std.testing.expectEqual(@as(usize, 3), agent.messages().len);
-    try std.testing.expectEqualStrings(
-        "first complete",
-        agent.messages()[2].request.parts[0].tool_result.content[0].text,
-    );
-    try std.testing.expectEqualStrings(
-        "call-1",
-        agent.messages()[2].request.parts[0].tool_result.call_id,
-    );
-    try std.testing.expect(agent.state() == .failed);
+    try std.testing.expectEqual(@as(usize, 1), agent.messages().len);
+    try std.testing.expectEqualStrings("go", agent.messages()[0].request.parts[0].user.text);
+    try std.testing.expect(agent.state() == .ready);
 }
 
 const CancelOnToolCompletion = struct {
     token: *ai_model.CancellationToken,
 
-    fn emit(context: *anyopaque, event: Event) void {
+    fn emit(context: *anyopaque, event: Event) event_api.SinkError!void {
         const self: *CancelOnToolCompletion = @ptrCast(@alignCast(context));
-        if (event == .tool_execution_completed) self.token.cancel();
+        if (event == .tool_execution_end) self.token.cancel();
     }
 };
 
@@ -1615,10 +1896,10 @@ test "late cancellation preserves a completed tool result" {
         "completed",
         agent.messages()[2].request.parts[0].tool_result.content[0].text,
     );
-    try std.testing.expect(agent.state() == .cancelled);
+    try std.testing.expect(agent.state() == .ready);
 }
 
-test "agent preflights delivery capabilities before canonical input" {
+test "agent falls back to buffered models and preflights tool capabilities" {
     var no_stream_model: ai_testing.ScriptedModel = .{
         .identity = .{ .provider = "script", .model = "buffered-only" },
         .steps = &.{.{ .text = "never" }},
@@ -1633,22 +1914,11 @@ test "agent preflights delivery capabilities before canonical input" {
         null,
     );
     defer no_stream_agent.deinit();
-    var collector: StreamCollector = .{};
 
-    try std.testing.expectError(
-        error.UnsupportedCapability,
-        no_stream_agent.runStream("not submitted", .{
-            .context = &collector,
-            .emitFn = StreamCollector.emit,
-        }),
-    );
-    try std.testing.expectEqual(@as(usize, 0), no_stream_model.calls);
-    try std.testing.expectEqual(@as(usize, 0), no_stream_agent.messages().len);
-    try std.testing.expect(no_stream_agent.state() == .idle);
     try std.testing.expectEqualStrings("never", try no_stream_agent.run("submitted"));
     try std.testing.expectEqual(@as(usize, 1), no_stream_model.calls);
     try std.testing.expectEqual(@as(usize, 2), no_stream_agent.messages().len);
-    try std.testing.expect(no_stream_agent.state() == .completed);
+    try std.testing.expect(no_stream_agent.state() == .ready);
 
     var no_tools_model: ai_testing.ScriptedModel = .{
         .identity = .{ .provider = "script", .model = "without-tools" },
@@ -1674,7 +1944,7 @@ test "agent preflights delivery capabilities before canonical input" {
     try std.testing.expectError(error.UnsupportedCapability, no_tools_agent.run("not submitted"));
     try std.testing.expectEqual(@as(usize, 0), no_tools_model.calls);
     try std.testing.expectEqual(@as(usize, 0), no_tools_agent.messages().len);
-    try std.testing.expect(no_tools_agent.state() == .idle);
+    try std.testing.expect(no_tools_agent.state() == .ready);
 }
 
 const StreamedRunRecorder = struct {
@@ -1710,16 +1980,12 @@ test "streamed completed turns preserve history across fresh runs" {
     var first_collector: StreamCollector = .{};
     var second_collector: StreamCollector = .{};
 
-    try std.testing.expectEqualStrings(
-        "first answer",
-        try agent.runStream("first stream", .{ .context = &first_collector, .emitFn = StreamCollector.emit }),
-    );
-    try std.testing.expectEqualStrings(
-        "second answer",
-        try agent.runStream("second stream", .{ .context = &second_collector, .emitFn = StreamCollector.emit }),
-    );
-    try std.testing.expect(agent.state() == .completed);
+    agent.events = .{ .context = &first_collector, .emitFn = StreamCollector.emit };
+    try std.testing.expectEqualStrings("first answer", try agent.run("first stream"));
+    agent.events = .{ .context = &second_collector, .emitFn = StreamCollector.emit };
+    try std.testing.expectEqualStrings("second answer", try agent.run("second stream"));
+    try std.testing.expect(agent.state() == .ready);
     try std.testing.expect(request_recorder.valid);
     try std.testing.expectEqual(@as(usize, 4), agent.messages().len);
-    try std.testing.expectEqual(@as(usize, 1), second_collector.entries[0].request_number);
+    try std.testing.expectEqual(@as(event_api.TurnIndex, 1), second_collector.entries[0].turn_index);
 }

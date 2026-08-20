@@ -1,5 +1,6 @@
 const std = @import("std");
 const ai = @import("../ai/root.zig");
+const agent_api = @import("../agent/root.zig");
 const ai_catalog = ai.model_catalog;
 const ai_model = ai.model;
 const ai_models = ai.models;
@@ -45,6 +46,7 @@ pub const DurableCreateError = error{
     UnknownTool,
     InvalidToolArguments,
     PersistenceFailed,
+    CommitIndeterminate,
     SessionTooLarge,
 };
 
@@ -228,6 +230,7 @@ fn initializeDurable(
         error.OutOfMemory => error.OutOfMemory,
         error.SessionTooLarge => error.SessionTooLarge,
         error.PersistenceFailed => error.PersistenceFailed,
+        error.CommitIndeterminate => error.CommitIndeterminate,
     };
     errdefer commit_owner.deinit();
     try commit_owner.bindAgent(&self.session_value.agent);
@@ -437,11 +440,19 @@ const DurableEventRecorder = struct {
     model_completions: usize = 0,
     tool_completions: usize = 0,
 
-    fn emit(context: *anyopaque, event: AgentSession.Event) void {
+    fn emit(context: *anyopaque, event: AgentSession.Event) agent_api.event.SinkError!void {
         const self: *DurableEventRecorder = @ptrCast(@alignCast(context));
         switch (event) {
-            .model_request_completed => self.model_completions += 1,
-            .tool_execution_completed => self.tool_completions += 1,
+            .message_end => |ended| switch (ended.message) {
+                .published => |message| if (message == .response) {
+                    self.model_completions += 1;
+                },
+                .discarded_response => {},
+            },
+            .tool_execution_end => |ended| switch (ended.result) {
+                .published => self.tool_completions += 1,
+                .discarded => {},
+            },
             else => {},
         }
     }
@@ -558,7 +569,7 @@ test "runtime owns catalog and provider configuration through a cwd-bound tool l
 
     const result = try runtime.session().prompt("read note.txt");
     try std.testing.expectEqualStrings("runtime complete", result);
-    try std.testing.expect(runtime.session().state() == .completed);
+    try std.testing.expect(runtime.session().state() == .ready);
     try std.testing.expectEqual(@as(usize, 2), fake.next_index);
     try std.testing.expectEqual(@as(usize, 2), inspector.calls);
     const history = runtime.session().messages();
@@ -692,7 +703,7 @@ test "durable runtime publishes neither a message nor completion event before jo
     try std.testing.expectError(error.PersistenceFailed, runtime.session().prompt("hello"));
     try std.testing.expectEqual(@as(usize, 1), runtime.session().messages().len);
     try std.testing.expectEqual(@as(usize, 0), events.model_completions);
-    try std.testing.expect(runtime.session().state() == .failed);
+    try std.testing.expect(runtime.session().state() == .ready);
     runtime.deinit();
 
     var restored = try SessionJournal.openReadOnly(
@@ -760,7 +771,7 @@ test "durable runtime withholds a tool result and completion event when its comm
     errdefer runtime.deinit();
 
     try std.testing.expectError(error.PersistenceFailed, runtime.session().prompt("write the file"));
-    try std.testing.expectEqual(@as(usize, 2), runtime.session().messages().len);
+    try std.testing.expectEqual(@as(usize, 1), runtime.session().messages().len);
     try std.testing.expectEqual(@as(usize, 1), events.model_completions);
     try std.testing.expectEqual(@as(usize, 0), events.tool_completions);
     const created = try temporary.dir.readFileAlloc(
@@ -852,7 +863,7 @@ test "durable runtime closes a restored open turn before admitting cancellation"
         error.Cancelled,
         runtime.session().promptWithControl("cancel this", .{ .cancellation = &cancellation }),
     );
-    try std.testing.expect(runtime.session().state() == .cancelled);
+    try std.testing.expect(runtime.session().state() == .ready);
     try std.testing.expectEqual(@as(usize, 0), fake.next_index);
     runtime.deinit();
 

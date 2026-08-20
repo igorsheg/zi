@@ -97,7 +97,7 @@ test "text print mode routes a settled agent failure only to stderr" {
     try std.testing.expect(exit == .failure);
     try std.testing.expectEqualStrings("", stdout.written());
     try std.testing.expectEqualStrings("Request failed: InvalidRequest\n", stderr.written());
-    try std.testing.expect(session.state() == .failed);
+    try std.testing.expect(session.state() == .ready);
 }
 
 test "text print mode reports bounded provider failure details" {
@@ -192,7 +192,7 @@ test "text print mode rejects invalid and excessive prompts before model admissi
     try std.testing.expectEqualStrings("", stdout.written());
     try std.testing.expectEqualStrings("Prompt is not valid UTF-8.\n", stderr.written());
     try std.testing.expectEqual(@as(usize, 0), scripted.calls);
-    try std.testing.expect(session.state() == .idle);
+    try std.testing.expect(session.state() == .ready);
 
     var later_stdout: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer later_stdout.deinit();
@@ -255,7 +255,7 @@ test "text print mode succeeds silently without a prompt" {
     try std.testing.expectEqualStrings("", stdout.written());
     try std.testing.expectEqualStrings("", stderr.written());
     try std.testing.expectEqual(@as(usize, 0), scripted.calls);
-    try std.testing.expect(session.state() == .idle);
+    try std.testing.expect(session.state() == .ready);
 }
 
 test {

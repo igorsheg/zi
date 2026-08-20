@@ -1,6 +1,7 @@
 const std = @import("std");
 const bounded_json = @import("../BoundedJson.zig");
 const ai = @import("../ai/root.zig");
+const agent = @import("../agent/root.zig");
 const ai_message = ai.message;
 const ai_usage = ai.usage;
 
@@ -778,7 +779,7 @@ const RequestKind = enum { user, tool_results };
 
 const ProjectedTurn = struct {
     id: []const u8,
-    unsafe_context_start: ?usize = null,
+    context: agent.context_projection.State = .{},
 };
 
 const ProjectionTurn = union(enum) {
@@ -813,28 +814,27 @@ fn project(
                 .request => |request| switch (try classifyRequest(request)) {
                     .user => turn = .{ .active = .{ .id = message_entry.base.id } },
                     .tool_results => if (states[index].pending_response == null) {
-                        turn.active.unsafe_context_start = null;
+                        turn.active.context.completeToolExchange();
                     },
                 },
-                .response => |response| if (countToolCalls(response) != 0) {
-                    turn.active.unsafe_context_start = context.items.len;
-                },
+                .response => |response| turn.active.context.publishResponse(context.items.len, response),
             }
             try context.append(allocator, message_entry.message);
         },
         .turn_end => |terminal| {
-            switch (terminal.outcome) {
-                .completed => {},
-                .failed, .cancelled, .interrupted => trimUnsafeContext(&context, turn.active),
-            }
+            context.items.len = switch (terminal.outcome) {
+                .completed => turn.active.context.completed(context.items.len),
+                .failed, .cancelled, .interrupted => turn.active.context.abandoned(context.items.len),
+            };
             turn = .idle;
         },
     };
 
     const recovery: Recovery = switch (turn) {
         .idle => .clean,
-        .active => |active| interrupted: {
-            trimUnsafeContext(&context, active);
+        .active => |active_value| interrupted: {
+            var active = active_value;
+            context.items.len = active.context.abandoned(context.items.len);
             break :interrupted .{ .interrupted = .{ .turn_id = active.id } };
         },
     };
@@ -984,10 +984,6 @@ fn resolveToolResult(
 fn resolvedMask(call_count: u7) u64 {
     if (call_count == 64) return std.math.maxInt(u64);
     return (@as(u64, 1) << @intCast(call_count)) - 1;
-}
-
-fn trimUnsafeContext(context: *std.ArrayList(ai_message.Message), active: ProjectedTurn) void {
-    if (active.unsafe_context_start) |start| context.items.len = start;
 }
 
 fn sameModel(left: ai_message.ModelIdentity, right: ai_message.ModelIdentity) bool {

@@ -6,6 +6,7 @@ const ai_message = ai.message;
 const ai_model = ai.model;
 const Agent = agent_api.Agent;
 const agent_limits = agent_api.limits;
+const session_event = @import("AgentSessionEvent.zig");
 const tool_api = agent_api.tool;
 const ReadTool = @import("tools/ReadTool.zig");
 const WriteTool = @import("tools/WriteTool.zig");
@@ -16,17 +17,15 @@ const SystemPrompt = @import("SystemPrompt.zig");
 
 const AgentSession = @This();
 
-pub const Event = Agent.Event;
-pub const EventSink = Agent.EventSink;
+pub const Event = session_event.Event;
+pub const EventSink = session_event.Sink;
 pub const RunControl = Agent.RunControl;
 pub const RunError = Agent.RunError;
 pub const State = Agent.State;
-pub const StreamEvent = Agent.StreamEvent;
-pub const StreamSink = Agent.StreamSink;
 
 pub const Options = struct {
     limits: agent_limits.RunLimits = .{},
-    events: ?Agent.EventSink = null,
+    events: ?EventSink = null,
     prompt: SystemPrompt.Config = .{},
 };
 
@@ -45,6 +44,13 @@ const Tools = struct {
     write: WriteTool,
     edit: EditTool,
     bash: BashTool,
+    events: ?EventSink,
+
+    fn emitAgentEvent(context: *anyopaque, event: Agent.Event) agent_api.event.SinkError!void {
+        const self: *Tools = @ptrCast(@alignCast(context));
+        const sink = self.events orelse return;
+        return sink.emit(session_event.fromAgent(event));
+    }
 };
 
 allocator: std.mem.Allocator,
@@ -69,6 +75,7 @@ pub fn init(
         .write = .{ .cwd = cwd },
         .edit = .{ .cwd = cwd },
         .bash = .{ .cwd = cwd },
+        .events = options.events,
     };
     const admitted = [_]tool_api.Tool{
         tools.read.asTool(),
@@ -87,7 +94,10 @@ pub fn init(
             system_prompt.instructions(),
             &admitted,
             options.limits,
-            options.events,
+            if (options.events == null) null else .{
+                .context = tools,
+                .emitFn = Tools.emitAgentEvent,
+            },
         ),
     };
 }
@@ -101,7 +111,7 @@ pub fn deinit(self: *AgentSession) void {
 }
 
 pub fn prompt(self: *AgentSession, input: []const u8) Agent.RunError![]const u8 {
-    return self.agent.run(input);
+    return self.promptInternal(input, .{});
 }
 
 pub fn promptWithControl(
@@ -109,15 +119,37 @@ pub fn promptWithControl(
     input: []const u8,
     control: Agent.RunControl,
 ) Agent.RunError![]const u8 {
-    return self.agent.runWithControl(input, control);
+    return self.promptInternal(input, control);
 }
 
-pub fn promptStream(
+fn promptInternal(
     self: *AgentSession,
     input: []const u8,
-    sink: Agent.StreamSink,
+    control: Agent.RunControl,
 ) Agent.RunError![]const u8 {
-    return self.agent.runStream(input, sink);
+    const result = self.agent.runWithControl(input, control);
+    if (result) |text| {
+        try self.emitSettled();
+        return text;
+    } else |failure| {
+        const settled = self.emitSettled();
+        if (settled) |_| {} else |_| {}
+        return failure;
+    }
+}
+
+fn emitSettled(self: *AgentSession) Agent.RunError!void {
+    const sink = self.tools.events orelse return;
+    const availability: session_event.Availability = switch (self.agent.state()) {
+        .ready => .ready,
+        .poisoned => .poisoned,
+        .running => unreachable,
+    };
+    sink.emit(.{ .agent_settled = .{ .availability = availability } }) catch |failure| return switch (failure) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.Cancelled => error.Cancelled,
+        error.ConsumerStopped => error.EventConsumerStopped,
+    };
 }
 
 pub fn messages(self: *const AgentSession) []const ai_message.Message {
@@ -144,11 +176,6 @@ fn hasCodingInstructions(request: ai_model.ModelRequest) bool {
 }
 
 const ai_testing = ai.testing;
-const ai_stream = ai.stream;
-
-const IgnoreStream = struct {
-    fn emit(_: *anyopaque, _: Agent.StreamEvent) ai_stream.StreamSinkError!void {}
-};
 
 const RequestRecorder = struct {
     count: usize = 0,
@@ -230,6 +257,67 @@ const EditRequestRecorder = struct {
     }
 };
 
+test "coding-agent session extends core lifecycle with final settlement" {
+    const Recorder = struct {
+        const Self = @This();
+
+        tags: [16]std.meta.Tag(Event) = undefined,
+        count: usize = 0,
+        saw_complete_partial: bool = false,
+        settled: ?session_event.Availability = null,
+
+        fn emit(context: *anyopaque, event: Event) session_event.SinkError!void {
+            const self: *Self = @ptrCast(@alignCast(context));
+            self.tags[self.count] = std.meta.activeTag(event);
+            self.count += 1;
+            switch (event) {
+                .message_update => |update| if (update.message.parts.len > 0 and
+                    update.message.parts[0] == .text)
+                {
+                    self.saw_complete_partial = std.mem.eql(u8, update.message.parts[0].text, "complete");
+                },
+                .agent_settled => |settled| self.settled = settled.availability,
+                else => {},
+            }
+        }
+    };
+
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var scripted: ai_testing.ScriptedModel = .{
+        .identity = .{ .provider = "script", .model = "session-events" },
+        .steps = &.{.{ .text = "complete" }},
+    };
+    var recorder: Recorder = .{};
+    var session = try AgentSession.init(
+        std.testing.allocator,
+        std.testing.io,
+        scripted.asModel(),
+        temporary.dir,
+        .{ .events = .{ .context = &recorder, .emitFn = Recorder.emit } },
+    );
+    defer session.deinit();
+
+    try std.testing.expectEqualStrings("complete", try session.prompt("question"));
+    const expected = [_]std.meta.Tag(Event){
+        .agent_start,
+        .turn_start,
+        .message_start,
+        .message_end,
+        .message_start,
+        .message_update,
+        .message_update,
+        .message_update,
+        .message_end,
+        .turn_end,
+        .agent_end,
+        .agent_settled,
+    };
+    try std.testing.expectEqualSlices(std.meta.Tag(Event), &expected, recorder.tags[0..recorder.count]);
+    try std.testing.expect(recorder.saw_complete_partial);
+    try std.testing.expectEqual(session_event.Availability.ready, recorder.settled.?);
+}
+
 test "coding-agent session sends its owned custom system prompt" {
     const Recorder = struct {
         const Self = @This();
@@ -294,19 +382,14 @@ test "coding-agent session writes and reads a workspace file before a later prom
         .{},
     );
     defer session.deinit();
-    var sink_context: u8 = 0;
-
-    const text = try session.promptStream("Create and verify the entrypoint.", .{
-        .context = &sink_context,
-        .emitFn = IgnoreStream.emit,
-    });
+    const text = try session.prompt("Create and verify the entrypoint.");
 
     try std.testing.expectEqualStrings("Created and verified the entrypoint.", text);
     try std.testing.expect(request_recorder.instructions_valid);
     try std.testing.expect(request_recorder.write_result_seen);
     try std.testing.expect(request_recorder.read_result_seen);
     try std.testing.expectEqual(@as(usize, 3), request_recorder.count);
-    try std.testing.expect(session.state() == .completed);
+    try std.testing.expect(session.state() == .ready);
     try std.testing.expectEqual(@as(usize, 6), session.messages().len);
     try std.testing.expectEqualStrings(
         "Successfully wrote 22 bytes to src/main.zig",
@@ -562,5 +645,5 @@ test "coding-agent cancellation settles a running bash process" {
     try std.testing.expectError(error.Cancelled, prompt_result);
     try temporary.dir.access(std.testing.io, "started", .{});
     try std.testing.expectError(error.FileNotFound, temporary.dir.access(std.testing.io, "late", .{}));
-    try std.testing.expect(session.state() == .cancelled);
+    try std.testing.expect(session.state() == .ready);
 }
