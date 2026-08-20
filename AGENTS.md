@@ -255,6 +255,10 @@ cooked-mode, style, hyperlink, and cursor restoration. Interactive mode starts
 on the normal screen without mouse tracking, alternate-screen rendering,
 keyboard-protocol negotiation, or frame diffs. `InputDecoder.zig` owns bounded
 escape parsing and resolves a bare Escape only after a quiet-period deadline.
+`InteractiveEventLoop.zig` interleaves bounded input reads, resize observation,
+and worker fact collection on the terminal-owning thread. `InteractiveRenderer`
+uses append-only normal-screen output, sanitizes all provider and tool text before
+writing terminal bytes, and redraws only the active prompt line.
 
 Credentials are admitted values on the session runtime, not ambient environment
 reads scattered through the tree. The process edge reads the environment once

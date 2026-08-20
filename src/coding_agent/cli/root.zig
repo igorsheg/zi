@@ -1,6 +1,10 @@
 const entry = @import("entry.zig");
+const interactive_controller = @import("InteractiveController.zig");
+const interactive_event_loop = @import("InteractiveEventLoop.zig");
+const interactive_renderer = @import("InteractiveRenderer.zig");
 const input_decoder = @import("InputDecoder.zig");
 const initial_message = @import("initial_message.zig");
+const line_editor = @import("LineEditor.zig");
 const launch = @import("launch.zig");
 const print_mode = @import("print_mode.zig");
 const surface = @import("surface.zig");
@@ -262,8 +266,12 @@ test "text print mode succeeds silently without a prompt" {
 
 test {
     _ = entry;
+    _ = interactive_controller;
+    _ = interactive_event_loop;
+    _ = interactive_renderer;
     _ = input_decoder;
     _ = initial_message;
+    _ = line_editor;
     _ = launch;
     _ = print_mode;
     _ = surface;

@@ -8,7 +8,10 @@ pub const Limits = struct {
     max_prompt_bytes: usize = 1024 * 1024,
     max_follow_ups: usize = 16,
     max_follow_up_bytes: usize = 4 * 1024 * 1024,
+    max_restored_draft_bytes: usize = 5 * 1024 * 1024,
 };
+
+pub const default_limits: Limits = .{};
 
 pub const Error = error{
     OutOfMemory,
@@ -16,6 +19,7 @@ pub const Error = error{
     PromptTooLarge,
     FollowUpQueueFull,
     FollowUpQueueTooLarge,
+    RestoredDraftTooLarge,
     SessionUnavailable,
     InvalidLimits,
 };
@@ -99,7 +103,8 @@ pub fn init(
 ) Error!InteractivePolicy {
     if (limits.max_prompt_bytes == 0 or
         limits.max_follow_ups == 0 or
-        limits.max_follow_up_bytes == 0)
+        limits.max_follow_up_bytes == 0 or
+        limits.max_restored_draft_bytes < limits.max_prompt_bytes)
     {
         return error.InvalidLimits;
     }
@@ -248,16 +253,19 @@ pub fn pendingFollowUp(self: *const InteractivePolicy) ?[]const u8 {
 pub fn restoreQueued(
     self: *InteractivePolicy,
     current_draft: []const u8,
-) error{OutOfMemory}!?OwnedDraft {
+) error{ OutOfMemory, RestoredDraftTooLarge }!?OwnedDraft {
     if (self.follow_ups.items.len == 0) return null;
     const include_current = std.mem.trim(u8, current_draft, " \t\r\n").len != 0;
     var total = self.follow_up_bytes;
     const separators = self.follow_ups.items.len - 1 + @intFromBool(include_current);
-    const separator_bytes = std.math.mul(usize, separators, 2) catch return error.OutOfMemory;
-    total = std.math.add(usize, total, separator_bytes) catch return error.OutOfMemory;
+    const separator_bytes = std.math.mul(usize, separators, 2) catch
+        return error.RestoredDraftTooLarge;
+    total = std.math.add(usize, total, separator_bytes) catch
+        return error.RestoredDraftTooLarge;
     if (include_current) {
-        total = std.math.add(usize, total, current_draft.len) catch return error.OutOfMemory;
+        total = std.math.add(usize, total, current_draft.len) catch return error.RestoredDraftTooLarge;
     }
+    if (total > self.limits.max_restored_draft_bytes) return error.RestoredDraftTooLarge;
     const combined = try self.allocator.alloc(u8, total);
     var offset: usize = 0;
     for (self.follow_ups.items, 0..) |follow_up, index| {
@@ -290,7 +298,7 @@ pub fn restoreQueued(
 pub fn escape(
     self: *InteractivePolicy,
     current_draft: []const u8,
-) error{OutOfMemory}!EscapeResult {
+) error{ OutOfMemory, RestoredDraftTooLarge }!EscapeResult {
     const restored = try self.restoreQueued(current_draft);
     const request_cancel = switch (self.phase_value) {
         .running => |run_id| cancel: {
@@ -501,6 +509,24 @@ test "escape restores queued drafts before requesting cancellation" {
     try std.testing.expectEqual(@as(usize, 0), policy.queuedFollowUps().len);
     try std.testing.expectEqual(@as(usize, 2), escaped.restored.?.restored_count);
     try std.testing.expectEqualStrings("one\n\ntwo\n\ncurrent", escaped.restored.?.text);
+}
+
+test "oversized restoration preserves queue and cancellation state" {
+    var policy = try InteractivePolicy.init(std.testing.allocator, .{
+        .max_prompt_bytes = 4,
+        .max_follow_ups = 2,
+        .max_follow_up_bytes = 4,
+        .max_restored_draft_bytes = 5,
+    });
+    defer policy.deinit();
+    try startRun(&policy, "run", 9);
+    var follow_up = try policy.prepareSubmission("four");
+    policy.commitSubmission(&follow_up);
+
+    try std.testing.expectError(error.RestoredDraftTooLarge, policy.escape("xx"));
+    try std.testing.expect(policy.phase() == .running);
+    try std.testing.expectEqual(@as(usize, 1), policy.queuedFollowUps().len);
+    try std.testing.expectEqualStrings("four", policy.queuedFollowUps()[0]);
 }
 
 test "escape before agent start defers cancellation to the admitted run" {

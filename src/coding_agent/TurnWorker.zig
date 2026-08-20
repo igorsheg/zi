@@ -485,7 +485,7 @@ test "worker cancellation settles ready and admits another prompt" {
             .{ .tool_call = .{
                 .id = "call-1",
                 .name = "bash",
-                .arguments_json = "{\"command\":\": > started; end=$((SECONDS+1)); " ++
+                .arguments_json = "{\"command\":\": > started; end=$((SECONDS+5)); " ++
                     "while (( SECONDS < end )); do :; done; : > late\"}",
             } },
             .{ .text = "resumed" },
