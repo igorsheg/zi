@@ -3,22 +3,29 @@ const ai = @import("../../ai/root.zig");
 const agent = @import("../../agent/root.zig");
 const AgentSession = @import("../AgentSession.zig");
 const SessionTranscript = @import("../SessionTranscript.zig");
-const InteractivePolicy = @import("../InteractivePolicy.zig");
+const Policy = @import("Policy.zig");
 const TurnWorker = @import("../TurnWorker.zig");
-const InputDecoder = @import("InputDecoder.zig");
-const InteractiveEventLoop = @import("InteractiveEventLoop.zig");
-const InteractiveRenderer = @import("InteractiveRenderer.zig");
-const LineEditor = @import("LineEditor.zig");
-const TerminalSession = @import("TerminalSession.zig");
+const Decoder = @import("input/Decoder.zig");
+const EventLoop = @import("EventLoop.zig");
+const NormalScreenRenderer = @import("NormalScreenRenderer.zig");
+const LineEditor = @import("input/LineEditor.zig");
+const TerminalSession = @import("terminal/Session.zig");
 
-const InteractiveController = @This();
+const App = @This();
+
+pub const Options = struct {
+    policy_limits: Policy.Limits = Policy.default_limits,
+    escape_timeout_ms: i64 = 30,
+};
 
 allocator: std.mem.Allocator,
 io: std.Io,
 worker: *TurnWorker,
-policy: InteractivePolicy,
+policy: Policy,
+decoder: Decoder = .{},
 editor: LineEditor,
-renderer: InteractiveRenderer,
+renderer: NormalScreenRenderer,
+escape_timeout_ms: i64,
 should_exit: bool = false,
 
 pub fn init(
@@ -26,8 +33,10 @@ pub fn init(
     io: std.Io,
     worker: *TurnWorker,
     writer: *std.Io.Writer,
-) !InteractiveController {
-    var policy = try InteractivePolicy.init(allocator, InteractivePolicy.default_limits);
+    options: Options,
+) !App {
+    if (options.escape_timeout_ms < 0) return error.InvalidEscapeTimeout;
+    var policy = try Policy.init(allocator, options.policy_limits);
     errdefer policy.deinit();
     return .{
         .allocator = allocator,
@@ -36,44 +45,71 @@ pub fn init(
         .policy = policy,
         .editor = LineEditor.init(
             allocator,
-            InteractivePolicy.default_limits.max_restored_draft_bytes,
+            options.policy_limits.max_restored_draft_bytes,
         ),
-        .renderer = InteractiveRenderer.init(writer),
+        .renderer = NormalScreenRenderer.init(writer),
+        .escape_timeout_ms = options.escape_timeout_ms,
     };
 }
 
-pub fn deinit(self: *InteractiveController) void {
+pub fn deinit(self: *App) void {
     self.editor.deinit();
     self.policy.deinit();
     self.* = undefined;
 }
 
-pub fn callbacks(self: *InteractiveController) InteractiveEventLoop.Callbacks {
+/// Owns raw terminal admission and runs one interactive application instance.
+pub fn run(
+    self: *App,
+    input: std.Io.File,
+    output: std.Io.File,
+    transcript: ?*const SessionTranscript,
+    event_loop_options: EventLoop.Options,
+) !EventLoop.ExitCause {
+    var terminal = try TerminalSession.start(self.io, input, output);
+    defer terminal.deinit();
+    return self.runWithTerminal(&terminal, transcript, event_loop_options);
+}
+
+fn runWithTerminal(
+    self: *App,
+    terminal: anytype,
+    transcript: ?*const SessionTranscript,
+    event_loop_options: EventLoop.Options,
+) !EventLoop.ExitCause {
+    try self.start(transcript);
+    const cause = EventLoop.run(terminal, self.callbacks(), event_loop_options) catch |failure| {
+        const finish_result = self.finish();
+        if (finish_result) |_| {} else |_| {}
+        return failure;
+    };
+    try self.finish();
+    return cause;
+}
+
+fn callbacks(self: *App) EventLoop.Callbacks {
     return .{
         .context = self,
         .collectFactsFn = collectFacts,
-        .handleActionFn = handleAction,
+        .handleByteFn = handleByte,
+        .settleInputFn = settleInput,
         .resizeFn = handleResize,
         .shouldExitFn = shouldExit,
-        .nowMsFn = nowMs,
     };
 }
 
-pub fn start(
-    self: *InteractiveController,
-    transcript: ?*const SessionTranscript,
-) !void {
+fn start(self: *App, transcript: ?*const SessionTranscript) !void {
     try self.renderer.renderWelcome();
     if (transcript) |restored| try self.renderer.renderTranscript(restored);
     try self.renderer.redrawPrompt(&self.editor);
 }
 
-pub fn finish(self: *InteractiveController) !void {
+fn finish(self: *App) !void {
     try self.renderer.finish();
 }
 
 fn collectFacts(context: *anyopaque) !void {
-    const self: *InteractiveController = @ptrCast(@alignCast(context));
+    const self: *App = @ptrCast(@alignCast(context));
     const snapshot = self.worker.snapshot();
     if (snapshot.queued_events == 0 and snapshot.queued_completions == 0) return;
 
@@ -97,8 +133,19 @@ fn collectFacts(context: *anyopaque) !void {
     try self.renderer.redrawPrompt(&self.editor);
 }
 
-fn handleAction(context: *anyopaque, action: InputDecoder.Action) !void {
-    const self: *InteractiveController = @ptrCast(@alignCast(context));
+fn handleByte(context: *anyopaque, byte: u8) !void {
+    const self: *App = @ptrCast(@alignCast(context));
+    if (self.decoder.feed(byte, self.nowMs())) |action| try self.handleAction(action);
+}
+
+fn settleInput(context: *anyopaque) !void {
+    const self: *App = @ptrCast(@alignCast(context));
+    if (self.decoder.flush(self.nowMs(), self.escape_timeout_ms)) |action| {
+        try self.handleAction(action);
+    }
+}
+
+fn handleAction(self: *App, action: Decoder.Action) !void {
     switch (action) {
         .text_byte => |byte| self.editor.insertByte(byte) catch |failure| {
             try self.renderer.renderNotice(@errorName(failure));
@@ -134,22 +181,21 @@ fn handleAction(context: *anyopaque, action: InputDecoder.Action) !void {
 }
 
 fn handleResize(context: *anyopaque, _: TerminalSession.Size) !void {
-    const self: *InteractiveController = @ptrCast(@alignCast(context));
+    const self: *App = @ptrCast(@alignCast(context));
     try self.renderer.redrawPrompt(&self.editor);
 }
 
 fn shouldExit(context: *anyopaque) bool {
-    const self: *InteractiveController = @ptrCast(@alignCast(context));
+    const self: *App = @ptrCast(@alignCast(context));
     return self.should_exit;
 }
 
-fn nowMs(context: *anyopaque) i64 {
-    const self: *InteractiveController = @ptrCast(@alignCast(context));
+fn nowMs(self: *App) i64 {
     const value = std.Io.Timestamp.now(self.io, .awake).toMilliseconds();
     return std.math.cast(i64, value) orelse std.math.maxInt(i64);
 }
 
-fn submitDraft(self: *InteractiveController) !void {
+fn submitDraft(self: *App) !void {
     if (!self.editor.validUtf8()) {
         try self.renderer.renderNotice("input is not valid UTF-8");
         return;
@@ -172,7 +218,7 @@ fn submitDraft(self: *InteractiveController) !void {
     self.editor.clear();
 }
 
-fn cancelAndRestore(self: *InteractiveController) !void {
+fn cancelAndRestore(self: *App) !void {
     var result = self.policy.escape(self.editor.text()) catch |failure| {
         try self.renderer.renderNotice(@errorName(failure));
         return;
@@ -184,7 +230,7 @@ fn cancelAndRestore(self: *InteractiveController) !void {
     if (result.request_cancel) _ = self.worker.requestCancel();
 }
 
-fn applyEffect(self: *InteractiveController, effect: InteractivePolicy.Effect) !void {
+fn applyEffect(self: *App, effect: Policy.Effect) !void {
     switch (effect) {
         .none => {},
         .request_cancel => _ = self.worker.requestCancel(),
@@ -253,11 +299,11 @@ const TestSessionOwner = struct {
     }
 };
 
-test "controller drives one worker turn through policy and renderer" {
+test "app drives one worker turn through policy and renderer" {
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();
     var scripted: ai.testing.ScriptedModel = .{
-        .identity = .{ .provider = "script", .model = "controller" },
+        .identity = .{ .provider = "script", .model = "app" },
         .steps = &.{.{ .text = "answer" }},
     };
     const owner = try TestSessionOwner.create(
@@ -274,17 +320,16 @@ test "controller drives one worker turn through policy and renderer" {
     defer worker.deinit();
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
-    var controller = try InteractiveController.init(
+    var app = try App.init(
         std.testing.allocator,
         std.testing.io,
         worker,
         &output.writer,
+        .{},
     );
-    defer controller.deinit();
-    const port = controller.callbacks();
-    try controller.start(null);
-    for ("hello") |byte| try port.handleActionFn(port.context, .{ .text_byte = byte });
-    try port.handleActionFn(port.context, .submit);
+    defer app.deinit();
+    const port = app.callbacks();
+    for ("hello\r") |byte| try port.handleByteFn(port.context, byte);
 
     var settled = false;
     for (0..10_000) |_| {
@@ -294,7 +339,7 @@ test "controller drives one worker turn through policy and renderer" {
             snapshot.queued_prompts == 0 and
             snapshot.queued_events == 0 and
             snapshot.queued_completions == 0 and
-            controller.policy.phase() == .idle)
+            app.policy.phase() == .idle)
         {
             settled = true;
             break;
@@ -304,19 +349,45 @@ test "controller drives one worker turn through policy and renderer" {
     try std.testing.expect(settled);
     try std.testing.expect(std.mem.find(u8, output.written(), "> hello\n") != null);
     try std.testing.expect(std.mem.find(u8, output.written(), "answer\n") != null);
+
+    try app.finish();
+
+    const ExitTerminal = struct {
+        const Self = @This();
+
+        delivered: bool = false,
+
+        pub fn querySize(_: *Self) !TerminalSession.Size {
+            return .{ .rows = 24, .columns = 80 };
+        }
+
+        pub fn pollInput(self: *Self, _: i32) !TerminalSession.PollResult {
+            return if (self.delivered) .{} else .{ .readable = true };
+        }
+
+        pub fn read(self: *Self, bytes: []u8) !usize {
+            self.delivered = true;
+            bytes[0] = 4;
+            return 1;
+        }
+    };
+    var terminal: ExitTerminal = .{};
+    const cause = try app.runWithTerminal(&terminal, null, .{ .poll_timeout_ms = 0 });
+    try std.testing.expectEqual(EventLoop.ExitCause.requested, cause);
+    try std.testing.expect(std.mem.endsWith(u8, output.written(), "\n"));
 }
 
-test "controller binds the worker policy editor renderer and event loop ports" {
+test "app rejects invalid input deadline configuration" {
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
-    var controller = try InteractiveController.init(
-        std.testing.allocator,
-        std.testing.io,
-        undefined,
-        &output.writer,
+    try std.testing.expectError(
+        error.InvalidEscapeTimeout,
+        App.init(
+            std.testing.allocator,
+            std.testing.io,
+            undefined,
+            &output.writer,
+            .{ .escape_timeout_ms = -1 },
+        ),
     );
-    defer controller.deinit();
-    _ = controller.callbacks();
-    try controller.start(null);
-    try std.testing.expect(std.mem.endsWith(u8, output.written(), "\r\x1b[2K> "));
 }

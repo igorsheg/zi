@@ -171,7 +171,7 @@ Module ownership (stable boundaries):
 - `src/coding_agent/` owns coding-agent policy: the session (identity,
   selection, durable journal, commits, on-disk format), the runtime that admits
   a model and its credentials, cwd-bound tools, `ZiPaths`, model config and
-  resolution, and CLI core.
+  resolution, the CLI process adapter, and the interactive application.
 - `src/BoundedJson.zig` is the shared bounded JSON helper. Domain-specific
   validation stays with the owning module.
 - `src/coding_agent/BoundedTextFile.zig` shares optional bounded UTF-8 file-read
@@ -246,19 +246,24 @@ event-count and aggregate-byte limits rather than locking the agent or retaining
 borrowed callback data. `SessionTranscript` owns the presentation-neutral active
 branch projection of restored journal entries. It preserves user, assistant,
 tool, model-change, failure, cancellation, and interruption facts independently
-of the cleaned provider-context projection. `InteractivePolicy` owns bounded
-sequential follow-ups and deterministic submission, cancellation, restoration,
-stale-run, and poisoned-session transitions. Terminal code performs the returned
-effects and clears editor drafts only after policy and worker admission succeed.
-`coding_agent/cli/TerminalSession.zig` owns raw-mode admission and best-effort
+of the cleaned provider-context projection. `coding_agent/interactive/` owns the
+interactive application. Its `Policy` owns bounded sequential follow-ups and
+deterministic submission, cancellation, restoration, stale-run, and
+poisoned-session transitions. `App` applies that policy to worker facts and
+input actions, and clears editor drafts only after policy and worker admission
+succeed. The CLI owns process adaptation and launch composition, not terminal
+mechanics or interactive policy.
+
+`interactive/terminal/Session.zig` owns raw-mode admission and best-effort
 cooked-mode, style, hyperlink, and cursor restoration. Interactive mode starts
 on the normal screen without mouse tracking, alternate-screen rendering,
-keyboard-protocol negotiation, or frame diffs. `InputDecoder.zig` owns bounded
-escape parsing and resolves a bare Escape only after a quiet-period deadline.
-`InteractiveEventLoop.zig` interleaves bounded input reads, resize observation,
-and worker fact collection on the terminal-owning thread. `InteractiveRenderer`
-uses append-only normal-screen output, sanitizes all provider and tool text before
-writing terminal bytes, and redraws only the active prompt line.
+keyboard-protocol negotiation, or frame diffs. `interactive/input/Decoder.zig`
+owns bounded escape parsing and resolves a bare Escape only after a quiet-period
+deadline. `interactive/EventLoop.zig` handles bounded terminal bytes, resize
+observation, worker fact collection, and input-deadline callbacks on the
+terminal-owning thread. It does not interpret coding-agent input actions.
+`NormalScreenRenderer` uses append-only output, sanitizes all provider and tool
+text before writing terminal bytes, and redraws only the active prompt line.
 
 Credentials are admitted values on the session runtime, not ambient environment
 reads scattered through the tree. The process edge reads the environment once
@@ -335,7 +340,7 @@ There is no TypeScript, bun, or e2e suite on this branch.
 
 There is no product `docs/` tree. `README.md` documents the admitted build and
 usage surface. `build.zig` owns the step list, and `src/main.zig` plus
-`src/coding_agent/cli/` own what the process does.
+`src/coding_agent/cli/` own the reachable process contract.
 
 When behavior that already exists in the binary changes, update `--help` and
 `README.md` in the same change and keep both limited to the reachable surface.

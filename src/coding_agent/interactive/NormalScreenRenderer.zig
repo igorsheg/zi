@@ -2,25 +2,25 @@ const std = @import("std");
 const ai = @import("../../ai/root.zig");
 const session_event = @import("../AgentSessionEvent.zig");
 const SessionTranscript = @import("../SessionTranscript.zig");
-const LineEditor = @import("LineEditor.zig");
+const LineEditor = @import("input/LineEditor.zig");
 
-const InteractiveRenderer = @This();
+const NormalScreenRenderer = @This();
 
 writer: *std.Io.Writer,
 prompt_visible: bool = false,
 assistant_line_open: bool = false,
 thinking_line_open: bool = false,
 
-pub fn init(writer: *std.Io.Writer) InteractiveRenderer {
+pub fn init(writer: *std.Io.Writer) NormalScreenRenderer {
     return .{ .writer = writer };
 }
 
-pub fn renderWelcome(self: *InteractiveRenderer) !void {
+pub fn renderWelcome(self: *NormalScreenRenderer) !void {
     try self.writer.writeAll("Zi interactive. Enter submits, Alt+Enter queues, Escape cancels, Ctrl-D exits.\n");
 }
 
 pub fn renderTranscript(
-    self: *InteractiveRenderer,
+    self: *NormalScreenRenderer,
     transcript: *const SessionTranscript,
 ) !void {
     try self.erasePrompt();
@@ -39,7 +39,7 @@ pub fn renderTranscript(
 }
 
 pub fn renderEvent(
-    self: *InteractiveRenderer,
+    self: *NormalScreenRenderer,
     event: session_event.Event,
 ) !void {
     try self.erasePrompt();
@@ -107,7 +107,7 @@ pub fn renderEvent(
     }
 }
 
-pub fn renderNotice(self: *InteractiveRenderer, label: []const u8) !void {
+pub fn renderNotice(self: *NormalScreenRenderer, label: []const u8) !void {
     try self.erasePrompt();
     try self.finishAssistant();
     try self.writer.writeByte('[');
@@ -115,32 +115,34 @@ pub fn renderNotice(self: *InteractiveRenderer, label: []const u8) !void {
     try self.writer.writeAll("]\n");
 }
 
-pub fn renderCompletionFailure(self: *InteractiveRenderer, failure: anyerror) !void {
+pub fn renderCompletionFailure(self: *NormalScreenRenderer, failure: anyerror) !void {
     try self.renderNotice(@errorName(failure));
 }
 
-pub fn redrawPrompt(self: *InteractiveRenderer, editor: *const LineEditor) !void {
+pub fn redrawPrompt(self: *NormalScreenRenderer, editor: *const LineEditor) !void {
     try self.finishAssistant();
     try self.writer.writeAll("\r\x1b[2K> ");
     try writeSafeText(self.writer, editor.text(), false);
     const suffix = editor.suffixScalarCount();
     if (suffix > 0) try self.writer.print("\x1b[{d}D", .{suffix});
     self.prompt_visible = true;
+    try self.writer.flush();
 }
 
-pub fn finish(self: *InteractiveRenderer) !void {
+pub fn finish(self: *NormalScreenRenderer) !void {
     try self.erasePrompt();
     try self.finishAssistant();
     try self.writer.writeByte('\n');
+    try self.writer.flush();
 }
 
-fn erasePrompt(self: *InteractiveRenderer) !void {
+fn erasePrompt(self: *NormalScreenRenderer) !void {
     if (!self.prompt_visible) return;
     try self.writer.writeAll("\r\x1b[2K");
     self.prompt_visible = false;
 }
 
-fn beginAssistant(self: *InteractiveRenderer) !void {
+fn beginAssistant(self: *NormalScreenRenderer) !void {
     if (self.thinking_line_open) {
         try self.writer.writeByte('\n');
         self.thinking_line_open = false;
@@ -148,7 +150,7 @@ fn beginAssistant(self: *InteractiveRenderer) !void {
     self.assistant_line_open = true;
 }
 
-fn beginThinking(self: *InteractiveRenderer) !void {
+fn beginThinking(self: *NormalScreenRenderer) !void {
     if (self.thinking_line_open) return;
     if (self.assistant_line_open) {
         try self.writer.writeByte('\n');
@@ -158,14 +160,14 @@ fn beginThinking(self: *InteractiveRenderer) !void {
     self.thinking_line_open = true;
 }
 
-fn finishAssistant(self: *InteractiveRenderer) !void {
+fn finishAssistant(self: *NormalScreenRenderer) !void {
     if (!self.assistant_line_open and !self.thinking_line_open) return;
     try self.writer.writeByte('\n');
     self.assistant_line_open = false;
     self.thinking_line_open = false;
 }
 
-fn renderModel(self: *InteractiveRenderer, identity: ai.message.ModelIdentity) !void {
+fn renderModel(self: *NormalScreenRenderer, identity: ai.message.ModelIdentity) !void {
     try self.writer.writeAll("[model ");
     try writeSafeText(self.writer, identity.provider, false);
     try self.writer.writeByte('/');
@@ -173,7 +175,7 @@ fn renderModel(self: *InteractiveRenderer, identity: ai.message.ModelIdentity) !
     try self.writer.writeAll("]\n");
 }
 
-fn renderUser(self: *InteractiveRenderer, parts: []const ai.message.UserContent) !void {
+fn renderUser(self: *NormalScreenRenderer, parts: []const ai.message.UserContent) !void {
     try self.finishAssistant();
     try self.writer.writeAll("> ");
     for (parts, 0..) |part, index| {
@@ -190,7 +192,7 @@ fn renderUser(self: *InteractiveRenderer, parts: []const ai.message.UserContent)
     try self.writer.writeByte('\n');
 }
 
-fn renderResponse(self: *InteractiveRenderer, response: ai.message.ResponseMessage) !void {
+fn renderResponse(self: *NormalScreenRenderer, response: ai.message.ResponseMessage) !void {
     try self.finishAssistant();
     for (response.parts) |part| switch (part) {
         .text => |text| {
@@ -212,7 +214,7 @@ fn renderResponse(self: *InteractiveRenderer, response: ai.message.ResponseMessa
     };
 }
 
-fn renderToolResult(self: *InteractiveRenderer, result: ai.message.ToolResult) !void {
+fn renderToolResult(self: *NormalScreenRenderer, result: ai.message.ToolResult) !void {
     try self.finishAssistant();
     try self.writer.writeAll("[tool result ");
     try writeSafeText(self.writer, result.name, false);
@@ -266,7 +268,7 @@ fn writeSafeText(writer: *std.Io.Writer, text: []const u8, allow_newlines: bool)
 test "renderer streams normalized text and redraws the prompt" {
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
-    var renderer = InteractiveRenderer.init(&output.writer);
+    var renderer = NormalScreenRenderer.init(&output.writer);
     var editor = LineEditor.init(std.testing.allocator, 32);
     defer editor.deinit();
     try editor.replace("next");

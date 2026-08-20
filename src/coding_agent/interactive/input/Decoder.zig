@@ -1,6 +1,6 @@
 const std = @import("std");
 
-const InputDecoder = @This();
+const Decoder = @This();
 
 pub const Action = union(enum) {
     text_byte: u8,
@@ -36,17 +36,17 @@ const Sequence = struct {
 
 state: State = .idle,
 
-pub fn reset(self: *InputDecoder) void {
+pub fn reset(self: *Decoder) void {
     self.* = .{};
 }
 
-pub fn hasPending(self: *const InputDecoder) bool {
+pub fn hasPending(self: *const Decoder) bool {
     return self.state != .idle;
 }
 
 /// Consumes one terminal byte. A null result means the decoder needs more bytes
 /// before it can distinguish Escape from a control sequence.
-pub fn feed(self: *InputDecoder, byte: u8, now_ms: i64) ?Action {
+pub fn feed(self: *Decoder, byte: u8, now_ms: i64) ?Action {
     return switch (self.state) {
         .idle => self.feedIdle(byte, now_ms),
         .escape => |started_ms| self.feedEscape(byte, started_ms, now_ms),
@@ -57,7 +57,7 @@ pub fn feed(self: *InputDecoder, byte: u8, now_ms: i64) ?Action {
 
 /// Resolves a bare Escape after the caller's quiet-period deadline. Incomplete
 /// control sequences are discarded rather than misreported as cancellation.
-pub fn flush(self: *InputDecoder, now_ms: i64, timeout_ms: i64) ?Action {
+pub fn flush(self: *Decoder, now_ms: i64, timeout_ms: i64) ?Action {
     const started_ms = switch (self.state) {
         .idle => return null,
         .escape => |started| started,
@@ -70,7 +70,7 @@ pub fn flush(self: *InputDecoder, now_ms: i64, timeout_ms: i64) ?Action {
     return action;
 }
 
-fn feedIdle(self: *InputDecoder, byte: u8, now_ms: i64) ?Action {
+fn feedIdle(self: *Decoder, byte: u8, now_ms: i64) ?Action {
     return switch (byte) {
         0x1b => pending: {
             self.state = .{ .escape = now_ms };
@@ -86,7 +86,7 @@ fn feedIdle(self: *InputDecoder, byte: u8, now_ms: i64) ?Action {
     };
 }
 
-fn feedEscape(self: *InputDecoder, byte: u8, started_ms: i64, now_ms: i64) ?Action {
+fn feedEscape(self: *Decoder, byte: u8, started_ms: i64, now_ms: i64) ?Action {
     return switch (byte) {
         '[' => pending: {
             self.state = .{ .csi = .{ .started_ms = started_ms } };
@@ -111,7 +111,7 @@ fn feedEscape(self: *InputDecoder, byte: u8, started_ms: i64, now_ms: i64) ?Acti
     };
 }
 
-fn feedCsi(self: *InputDecoder, sequence: *Sequence, byte: u8, now_ms: i64) ?Action {
+fn feedCsi(self: *Decoder, sequence: *Sequence, byte: u8, now_ms: i64) ?Action {
     sequence.started_ms = now_ms;
     if (sequence.len == sequence.bytes.len) {
         self.state = .idle;
@@ -146,7 +146,7 @@ fn feedCsi(self: *InputDecoder, sequence: *Sequence, byte: u8, now_ms: i64) ?Act
     return action;
 }
 
-fn feedSs3(self: *InputDecoder, byte: u8) Action {
+fn feedSs3(self: *Decoder, byte: u8) Action {
     self.state = .idle;
     return switch (byte) {
         'A' => .cursor_up,
@@ -160,7 +160,7 @@ fn feedSs3(self: *InputDecoder, byte: u8) Action {
 }
 
 test "decoder distinguishes submit follow-up and timed Escape" {
-    var decoder: InputDecoder = .{};
+    var decoder: Decoder = .{};
     try std.testing.expect(decoder.feed('\r', 0).? == .submit);
     try std.testing.expect(decoder.feed(0x1b, 10) == null);
     try std.testing.expect(decoder.feed('\r', 11).? == .follow_up);
@@ -186,7 +186,7 @@ test "decoder handles navigation and editing sequences" {
         .{ .bytes = "\x1bOF", .expected = .end },
     };
     for (cases) |case| {
-        var decoder: InputDecoder = .{};
+        var decoder: Decoder = .{};
         var result: ?Action = null;
         for (case.bytes) |byte| {
             if (decoder.feed(byte, 1)) |action| result = action;
@@ -198,7 +198,7 @@ test "decoder handles navigation and editing sequences" {
 }
 
 test "decoder preserves text bytes and control actions" {
-    var decoder: InputDecoder = .{};
+    var decoder: Decoder = .{};
     try std.testing.expectEqual(@as(u8, 'x'), decoder.feed('x', 0).?.text_byte);
     try std.testing.expectEqual(@as(u8, 0xc3), decoder.feed(0xc3, 0).?.text_byte);
     try std.testing.expect(decoder.feed(127, 0).? == .backspace);
@@ -207,7 +207,7 @@ test "decoder preserves text bytes and control actions" {
 }
 
 test "decoder discards incomplete and bounded unknown sequences" {
-    var decoder: InputDecoder = .{};
+    var decoder: Decoder = .{};
     _ = decoder.feed(0x1b, 0);
     _ = decoder.feed('[', 0);
     _ = decoder.feed('1', 0);

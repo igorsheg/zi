@@ -1,7 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-const TerminalSession = @This();
+const Session = @This();
 
 pub const restore_sequence = "\x1b]8;;\x1b\\\x1b[0m\x1b[?25h";
 
@@ -42,7 +42,7 @@ pub fn start(
     io: std.Io,
     input: std.Io.File,
     output: std.Io.File,
-) StartError!TerminalSession {
+) StartError!Session {
     const input_is_tty = input.isTty(io) catch return error.NotATerminal;
     const output_is_tty = output.isTty(io) catch return error.NotATerminal;
     if (!input_is_tty or !output_is_tty) return error.NotATerminal;
@@ -81,7 +81,7 @@ pub fn start(
 /// cooked input restoration must still run when output has already closed.
 // Idempotence is required by nested terminal cleanup paths.
 // ziglint-ignore: Z030
-pub fn deinit(self: *TerminalSession) void {
+pub fn deinit(self: *Session) void {
     if (!self.active) return;
     const termios_result = std.posix.tcsetattr(self.input.handle, .FLUSH, self.original);
     if (termios_result) |_| {} else |_| {}
@@ -90,11 +90,11 @@ pub fn deinit(self: *TerminalSession) void {
     self.active = false;
 }
 
-pub fn read(self: TerminalSession, buffer: []u8) !usize {
+pub fn read(self: Session, buffer: []u8) !usize {
     return std.posix.read(self.input.handle, buffer);
 }
 
-pub fn pollInput(self: TerminalSession, timeout_ms: i32) !PollResult {
+pub fn pollInput(self: Session, timeout_ms: i32) !PollResult {
     var descriptors = [_]std.posix.pollfd{.{
         .fd = self.input.handle,
         .events = std.posix.POLL.IN,
@@ -109,7 +109,7 @@ pub fn pollInput(self: TerminalSession, timeout_ms: i32) !PollResult {
     };
 }
 
-pub fn querySize(self: TerminalSession) SizeError!Size {
+pub fn querySize(self: Session) SizeError!Size {
     var value: std.posix.winsize = .{ .row = 0, .col = 0, .xpixel = 0, .ypixel = 0 };
     const request: c_int = @intCast(std.c.T.IOCGWINSZ);
     const result = std.c.ioctl(self.output.handle, request, &value);
@@ -203,7 +203,7 @@ test "terminal session enters raw mode and restores termios and cursor state" {
     defer pty.close();
     const original = try std.posix.tcgetattr(pty.slave.handle);
 
-    var session = try TerminalSession.start(std.testing.io, pty.slave, pty.slave);
+    var session = try Session.start(std.testing.io, pty.slave, pty.slave);
     const raw = try std.posix.tcgetattr(pty.slave.handle);
     try std.testing.expect(!raw.lflag.ECHO);
     try std.testing.expect(!raw.lflag.ICANON);
@@ -232,7 +232,7 @@ test "terminal session preserves input queued before raw-mode admission" {
     try std.posix.tcsetattr(pty.slave.handle, .NOW, original);
     try pty.master.writeStreamingAll(std.testing.io, "x");
 
-    var session = try TerminalSession.start(std.testing.io, pty.slave, pty.slave);
+    var session = try Session.start(std.testing.io, pty.slave, pty.slave);
     const poll = try session.pollInput(100);
     try std.testing.expect(poll.readable);
     var byte: [1]u8 = undefined;
