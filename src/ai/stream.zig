@@ -82,6 +82,63 @@ pub const ResponseSnapshot = struct {
     usage: usage.Usage = .{},
 };
 
+pub fn copySnapshotLeaky(
+    allocator: std.mem.Allocator,
+    source: ResponseSnapshot,
+) error{OutOfMemory}!ResponseSnapshot {
+    const parts = try allocator.alloc(ResponsePartSnapshot, source.parts.len);
+    for (source.parts, parts) |part, *copy| copy.* = switch (part) {
+        .text => |text| .{ .text = try allocator.dupe(u8, text) },
+        .thinking => |thinking| .{ .thinking = try allocator.dupe(u8, thinking) },
+        .tool_call => |call| .{ .tool_call = .{
+            .id = if (call.id) |id| try allocator.dupe(u8, id) else null,
+            .name = if (call.name) |name| try allocator.dupe(u8, name) else null,
+            .arguments_json = try allocator.dupe(u8, call.arguments_json),
+        } },
+    };
+    return .{
+        .parts = parts,
+        .identity = try message.copyIdentityLeaky(allocator, source.identity),
+        .usage = source.usage,
+    };
+}
+
+pub fn copyEventLeaky(
+    allocator: std.mem.Allocator,
+    source: StreamEvent,
+) error{OutOfMemory}!StreamEvent {
+    return switch (source) {
+        .part_start => |start| .{ .part_start = .{
+            .index = start.index,
+            .part = switch (start.part) {
+                .text => .text,
+                .thinking => .thinking,
+                .tool_call => |call| .{ .tool_call = .{
+                    .id = if (call.id) |id| try allocator.dupe(u8, id) else null,
+                    .name = if (call.name) |name| try allocator.dupe(u8, name) else null,
+                } },
+            },
+        } },
+        .part_delta => |delta| .{ .part_delta = .{
+            .index = delta.index,
+            .delta = switch (delta.delta) {
+                .text => |text| .{ .text = try allocator.dupe(u8, text) },
+                .thinking => |thinking| .{ .thinking = try allocator.dupe(u8, thinking) },
+                .tool_call => |call| .{ .tool_call = .{
+                    .id = if (call.id) |id| try allocator.dupe(u8, id) else null,
+                    .name = if (call.name) |name| try allocator.dupe(u8, name) else null,
+                    .arguments_delta = try allocator.dupe(u8, call.arguments_delta),
+                } },
+            },
+        } },
+        .part_end => |end| .{ .part_end = .{
+            .index = end.index,
+            .part = try message.copyResponsePartLeaky(allocator, end.part),
+        } },
+        .usage => |value| .{ .usage = value },
+    };
+}
+
 pub const AccumulatorError = error{
     OutOfMemory,
     InvalidStream,

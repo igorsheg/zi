@@ -236,8 +236,10 @@ agent until the durable session is reopened.
 
 `AgentSessionEvent` extends the core agent lifecycle with session facts such as
 final settlement. It does not replace core payloads with rendering commands.
-Worker or UI boundaries must deep-copy the borrowed session event and derive
-presentation in their own reducer.
+`OwnedAgentSessionEvent` is the bounded arena-owned copy for worker or UI
+boundaries; presentation remains a downstream reducer. Canonical message and
+stream owners provide bulk-lifetime copy operations so boundary owners do not
+reimplement nested message or provider-state copying.
 
 Credentials are admitted values on the session runtime, not ambient environment
 reads scattered through the tree. The process edge reads the environment once

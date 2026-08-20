@@ -10,10 +10,6 @@ pub const AgentSettled = struct {
     availability: Availability,
 };
 
-pub const QueueUpdate = struct {
-    follow_ups: []const []const u8,
-};
-
 /// Coding-agent events extend the core agent lifecycle without replacing its
 /// payloads. The repeated tags keep consumption flat while the shared payload
 /// declarations prevent a second event vocabulary.
@@ -28,7 +24,6 @@ pub const Event = union(enum) {
     tool_execution_start: agent.event.ToolExecutionStart,
     tool_execution_end: agent.event.ToolExecutionEnd,
     agent_settled: AgentSettled,
-    queue_update: QueueUpdate,
 };
 
 pub const SinkError = agent.event.SinkError;

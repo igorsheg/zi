@@ -49,10 +49,7 @@ pub fn prepare(self: *History, value: message.Message) Error!Prepared {
     var arena = std.heap.ArenaAllocator.init(self.allocator);
     errdefer arena.deinit();
     const memory = arena.allocator();
-    const copy: message.Message = switch (value) {
-        .request => |request| .{ .request = try copyRequest(memory, request) },
-        .response => |response| .{ .response = try copyResponse(memory, response) },
-    };
+    const copy = try message.copyLeaky(memory, value);
     return .{ .arena = arena, .value = copy };
 }
 
@@ -75,108 +72,6 @@ pub fn truncate(self: *History, new_len: usize) void {
     for (self.arenas.items[new_len..]) |*arena| arena.deinit();
     self.entries.shrinkRetainingCapacity(new_len);
     self.arenas.shrinkRetainingCapacity(new_len);
-}
-
-fn copyRequest(allocator: std.mem.Allocator, source: message.RequestMessage) !message.RequestMessage {
-    const parts = try allocator.alloc(message.RequestPart, source.parts.len);
-    for (source.parts, parts) |part, *copy| copy.* = switch (part) {
-        .user => |user| .{ .user = switch (user) {
-            .text => |text| .{ .text = try allocator.dupe(u8, text) },
-            .image => |image| .{ .image = try copyImage(allocator, image) },
-        } },
-        .tool_result => |result| .{ .tool_result = .{
-            .call_id = try allocator.dupe(u8, result.call_id),
-            .name = try allocator.dupe(u8, result.name),
-            .content = try copyContent(allocator, result.content),
-            .outcome = result.outcome,
-        } },
-        .retry_prompt => |text| .{ .retry_prompt = try allocator.dupe(u8, text) },
-    };
-    return .{ .parts = parts };
-}
-
-fn copyResponse(allocator: std.mem.Allocator, source: message.ResponseMessage) !message.ResponseMessage {
-    const parts = try allocator.alloc(message.ResponsePart, source.parts.len);
-    for (source.parts, parts) |part, *copy| copy.* = switch (part) {
-        .text => |text| .{ .text = .{
-            .text = try allocator.dupe(u8, text.text),
-            .provider_state = if (text.provider_state) |state| try copyProviderState(allocator, state) else null,
-        } },
-        .thinking => |thinking| .{ .thinking = .{
-            .text = try allocator.dupe(u8, thinking.text),
-            .provider_state = if (thinking.provider_state) |state| try copyProviderState(allocator, state) else null,
-        } },
-        .tool_call => |call| .{ .tool_call = .{
-            .id = try allocator.dupe(u8, call.id),
-            .name = try allocator.dupe(u8, call.name),
-            .arguments_json = try allocator.dupe(u8, call.arguments_json),
-            .provider_state = if (call.provider_state) |state| try copyProviderState(allocator, state) else null,
-        } },
-    };
-    return .{
-        .parts = parts,
-        .identity = .{
-            .provider = try allocator.dupe(u8, source.identity.provider),
-            .model = try allocator.dupe(u8, source.identity.model),
-        },
-        .usage = source.usage,
-        .finish = .{
-            .category = source.finish.category,
-            .raw_reason = if (source.finish.raw_reason) |reason| try allocator.dupe(u8, reason) else null,
-        },
-    };
-}
-
-fn copyContent(allocator: std.mem.Allocator, source: []const message.Content) ![]const message.Content {
-    const content = try allocator.alloc(message.Content, source.len);
-    for (source, content) |item, *copy| copy.* = switch (item) {
-        .text => |text| .{ .text = try allocator.dupe(u8, text) },
-        .image => |image| .{ .image = try copyImage(allocator, image) },
-    };
-    return content;
-}
-
-fn copyImage(allocator: std.mem.Allocator, source: message.Image) !message.Image {
-    return .{
-        .media_type = try allocator.dupe(u8, source.media_type),
-        .source = switch (source.source) {
-            .bytes => |bytes| .{ .bytes = try allocator.dupe(u8, bytes) },
-            .url => |url| .{ .url = try allocator.dupe(u8, url) },
-        },
-    };
-}
-
-fn copyProviderState(allocator: std.mem.Allocator, source: message.ProviderState) !message.ProviderState {
-    return .{
-        .provider = try allocator.dupe(u8, source.provider),
-        .protocol = try allocator.dupe(u8, source.protocol),
-        .value = try copyJson(allocator, source.value),
-    };
-}
-
-fn copyJson(allocator: std.mem.Allocator, source: std.json.Value) error{OutOfMemory}!std.json.Value {
-    return switch (source) {
-        .null => .null,
-        .bool => |value| .{ .bool = value },
-        .integer => |value| .{ .integer = value },
-        .float => |value| .{ .float = value },
-        .number_string => |value| .{ .number_string = try allocator.dupe(u8, value) },
-        .string => |value| .{ .string = try allocator.dupe(u8, value) },
-        .array => |value| array: {
-            var copy = std.json.Array.init(allocator);
-            for (value.items) |item| try copy.append(try copyJson(allocator, item));
-            break :array .{ .array = copy };
-        },
-        .object => |value| object: {
-            var copy: std.json.ObjectMap = .{};
-            var iterator = value.iterator();
-            while (iterator.next()) |entry| {
-                const key = try allocator.dupe(u8, entry.key_ptr.*);
-                try copy.put(allocator, key, try copyJson(allocator, entry.value_ptr.*));
-            }
-            break :object .{ .object = copy };
-        },
-    };
 }
 
 test "history owns provider state JSON" {
