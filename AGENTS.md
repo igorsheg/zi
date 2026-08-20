@@ -212,6 +212,12 @@ and reject launch decisions override saved policy without persisting it. Trusted
 project prompt files resolve from the effective session cwd and shadow global
 prompt files independently by role.
 
+`RuntimeResources` owns invocation-scoped trust resolution, prompt-file and
+context discovery, and the effective prompt policy that borrows those owned
+resources. `RuntimeServices` sequences session selection, resources, model and
+credential admission, and runtime construction; resource policy does not belong
+in that composition owner.
+
 `ContextFiles` owns bounded global and cwd-ancestor instruction discovery.
 Ancestor instructions apply from broadest to narrowest scope regardless of
 project-resource trust.

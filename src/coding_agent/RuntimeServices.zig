@@ -4,16 +4,13 @@ const AgentSession = @import("AgentSession.zig");
 const AgentSessionRuntime = @import("AgentSessionRuntime.zig");
 const CredentialManager = @import("CredentialManager.zig");
 const CredentialStore = @import("CredentialStore.zig");
-const ContextFiles = @import("ContextFiles.zig");
 const ModelConfigSnapshot = @import("ModelConfigSnapshot.zig");
 const ModelResolution = @import("ModelResolution.zig");
 const ProjectTrust = @import("ProjectTrust.zig");
-const ProjectTrustStore = @import("ProjectTrustStore.zig");
-const PromptFiles = @import("PromptFiles.zig");
+const RuntimeResources = @import("RuntimeResources.zig");
 const SessionFormat = @import("SessionFormat.zig");
 const SessionJournal = @import("SessionJournal.zig");
 const SessionSelection = @import("SessionSelection.zig");
-const SystemPrompt = @import("SystemPrompt.zig");
 const ZiPaths = @import("ZiPaths.zig");
 
 const RuntimeServices = @This();
@@ -180,51 +177,15 @@ fn createOwned(
 
     var runtime_options = inputs.options;
     runtime_options.prompt.working_directory = selection.pathsView().cwd;
-    const requested_prompt_files = requestedPromptFiles(runtime_options.prompt.policy);
-    var prompt_files: ?PromptFiles = if (requested_prompt_files.system or requested_prompt_files.append) files: {
-        const project_trust = try resolveProjectTrust(
-            allocator,
-            io,
-            selection.pathsView(),
-            requested_prompt_files,
-            inputs.project_trust,
-        );
-        break :files try PromptFiles.load(
-            allocator,
-            io,
-            selection.pathsView(),
-            requested_prompt_files,
-            project_trust,
-        );
-    } else null;
-    defer if (prompt_files) |*files| files.deinit();
-    var discovered_rules: [1][]const u8 = undefined;
-    runtime_options.prompt.policy = resolvePromptPolicy(
+    var resources = try RuntimeResources.resolve(
+        allocator,
+        io,
+        selection.pathsView(),
+        inputs.project_trust,
         runtime_options.prompt.policy,
-        if (prompt_files) |*files| files else null,
-        &discovered_rules,
     );
-
-    var context_files: ?ContextFiles = if (requestsContextFiles(runtime_options.prompt.policy))
-        try ContextFiles.load(allocator, io, selection.pathsView())
-    else
-        null;
-    defer if (context_files) |*files| files.deinit();
-    var discovered_context_sections: []SystemPrompt.ContextSection = &.{};
-    defer if (discovered_context_sections.len > 0) allocator.free(discovered_context_sections);
-    if (context_files) |*files| {
-        const loaded_sections = files.sections();
-        if (loaded_sections.len > 0) {
-            discovered_context_sections = try allocator.alloc(SystemPrompt.ContextSection, loaded_sections.len);
-            for (loaded_sections, discovered_context_sections) |source, *destination| {
-                destination.* = .{ .path = source.path, .text = source.text };
-            }
-        }
-    }
-    runtime_options.prompt.policy = resolveContextPolicy(
-        runtime_options.prompt.policy,
-        discovered_context_sections,
-    );
+    defer resources.deinit();
+    runtime_options.prompt.policy = resources.policy();
 
     var snapshot = try ModelConfigSnapshot.load(allocator, io, selection.pathsView());
     errdefer snapshot.deinit();
@@ -342,91 +303,6 @@ fn createOwned(
     return self;
 }
 
-fn resolveProjectTrust(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    effective_paths: *const ZiPaths,
-    requested: PromptFiles.Requested,
-    intent: ProjectTrust.Intent,
-) Error!ProjectTrust.Decision {
-    if (intent != .automatic) return ProjectTrust.resolve(intent, null);
-    if (!try PromptFiles.hasProjectSources(io, effective_paths, requested)) {
-        return ProjectTrust.resolve(.automatic, null);
-    }
-    var identity = try ProjectTrustStore.Identity.init(allocator, io, effective_paths.cwd);
-    defer identity.deinit();
-    var snapshot = try ProjectTrustStore.load(allocator, io, effective_paths);
-    defer snapshot.deinit();
-    const saved = if (snapshot.nearest(&identity)) |entry| entry.decision else null;
-    return ProjectTrust.resolve(.automatic, saved);
-}
-
-fn requestedPromptFiles(policy: SystemPrompt.Policy) PromptFiles.Requested {
-    return switch (policy) {
-        .verbatim => .{},
-        .composed => |composition| .{
-            .system = switch (composition.base) {
-                .builtin => true,
-                .custom => false,
-            },
-            .append = composition.rules.len == 0,
-        },
-    };
-}
-
-fn resolvePromptPolicy(
-    policy: SystemPrompt.Policy,
-    files: ?*const PromptFiles,
-    discovered_rules: *[1][]const u8,
-) SystemPrompt.Policy {
-    return switch (policy) {
-        .verbatim => policy,
-        .composed => |composition| .{ .composed = .{
-            .base = switch (composition.base) {
-                .builtin => if (files) |loaded|
-                    if (loaded.system()) |text| .{ .custom = text } else .builtin
-                else
-                    .builtin,
-                .custom => composition.base,
-            },
-            .context_sections = composition.context_sections,
-            .rules = if (composition.rules.len > 0)
-                composition.rules
-            else if (files) |loaded|
-                if (loaded.append()) |text| rules: {
-                    discovered_rules[0] = text;
-                    break :rules discovered_rules[0..1];
-                } else &.{}
-            else
-                &.{},
-        } },
-    };
-}
-
-fn requestsContextFiles(policy: SystemPrompt.Policy) bool {
-    return switch (policy) {
-        .verbatim => false,
-        .composed => |composition| composition.context_sections.len == 0,
-    };
-}
-
-fn resolveContextPolicy(
-    policy: SystemPrompt.Policy,
-    discovered: []const SystemPrompt.ContextSection,
-) SystemPrompt.Policy {
-    return switch (policy) {
-        .verbatim => policy,
-        .composed => |composition| .{ .composed = .{
-            .base = composition.base,
-            .context_sections = if (composition.context_sections.len > 0)
-                composition.context_sections
-            else
-                discovered,
-            .rules = composition.rules,
-        } },
-    };
-}
-
 const RequestedModel = struct {
     provider: ?[]const u8,
     model: ?[]const u8,
@@ -440,6 +316,7 @@ fn effectiveRequest(selection: *const SessionSelection, inputs: Inputs) Requeste
     return .{ .provider = restored.provider, .model = restored.model };
 }
 
+const ProjectTrustStore = @import("ProjectTrustStore.zig");
 const fake_api = ai.transport_testing;
 
 const TestSources = struct {

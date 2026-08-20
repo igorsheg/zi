@@ -17,6 +17,7 @@ const model_config_snapshot = @import("ModelConfigSnapshot.zig");
 const model_resolution = @import("ModelResolution.zig");
 const prompt_files = @import("PromptFiles.zig");
 const private_file_store = @import("PrivateFileStore.zig");
+const runtime_resources = @import("RuntimeResources.zig");
 const session_format = @import("SessionFormat.zig");
 const session_journal = @import("SessionJournal.zig");
 const session_commit = @import("SessionCommit.zig");
@@ -42,6 +43,7 @@ test {
     _ = model_resolution;
     _ = prompt_files;
     _ = private_file_store;
+    _ = runtime_resources;
     _ = ProjectTrust;
     _ = ProjectTrustStore;
     _ = RuntimeServices;
