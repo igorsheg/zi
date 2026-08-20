@@ -1,6 +1,7 @@
 pub const AgentSession = @import("AgentSession.zig");
 pub const RuntimeServices = @import("RuntimeServices.zig");
 pub const ProjectTrust = @import("ProjectTrust.zig");
+pub const ProjectTrustStore = @import("ProjectTrustStore.zig");
 pub const SessionIntent = @import("SessionSelection.zig").Intent;
 pub const SessionSources = @import("SessionFormat.zig").Sources;
 pub const SystemPrompt = @import("SystemPrompt.zig");
@@ -40,6 +41,7 @@ test {
     _ = model_resolution;
     _ = prompt_files;
     _ = ProjectTrust;
+    _ = ProjectTrustStore;
     _ = RuntimeServices;
     _ = session_format;
     _ = session_journal;

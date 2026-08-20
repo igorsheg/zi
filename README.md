@@ -42,7 +42,9 @@ Append rules to Zi's default system prompt for one launch:
 
 `--append-system-prompt` is an alias for `--rules`. Use `--system-prompt` or `--system-prompt-override` to replace the default prompt verbatim. Append and replacement options cannot be combined.
 
-For persistent customization, Zi loads `$HOME/.zi/agent/SYSTEM.md` as the composed prompt base and `$HOME/.zi/agent/APPEND_SYSTEM.md` as appended rules. Pass `--approve` or `-a` to let `$CWD/.zi/SYSTEM.md` and `$CWD/.zi/APPEND_SYSTEM.md` shadow their global counterparts for one launch. `--no-approve` or `-na` explicitly ignores project prompt files. Automatic project prompt trust remains closed in print mode, and launch overrides are not persisted. Resumed sessions resolve project files from their stored working directory.
+For persistent customization, Zi loads `$HOME/.zi/agent/SYSTEM.md` as the composed prompt base and `$HOME/.zi/agent/APPEND_SYSTEM.md` as appended rules. Save project trust with `zi trust allow [PATH]`, deny it with `zi trust deny [PATH]`, inspect the effective decision with `zi trust status [PATH]`, or delete the exact decision with `zi trust remove [PATH]`. The nearest saved directory or ancestor decision applies. With no saved decision, automatic trust remains closed.
+
+Trusted `$CWD/.zi/SYSTEM.md` and `$CWD/.zi/APPEND_SYSTEM.md` files shadow their global counterparts. Pass `--approve` or `-a` to trust them for one launch, or `--no-approve` or `-na` to ignore them. Launch overrides are never persisted. Resumed sessions resolve saved trust and project files from their stored working directory. Zi manages saved decisions in the private `$HOME/.zi/agent/trust.json` store.
 
 Explicit `--rules` takes precedence over project and global `APPEND_SYSTEM.md` files while retaining the highest-precedence `SYSTEM.md` base. Prompt files must be regular UTF-8 text without NUL bytes and may not exceed 1 MiB each.
 

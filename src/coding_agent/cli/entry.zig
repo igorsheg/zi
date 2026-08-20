@@ -1,6 +1,7 @@
 const std = @import("std");
 const launch = @import("launch.zig");
 const surface = @import("surface.zig");
+const trust = @import("trust.zig");
 
 const version = "0.1.0";
 
@@ -44,9 +45,34 @@ pub fn run(init: std.process.Init) !u8 {
                 try stdout.print("zi {s}\n", .{version});
                 return 0;
             },
+            .trust => |request| return runTrustInvocation(init, request, stdout, stderr),
             .launch => |request| return runLaunchInvocation(init, &request, stdin_is_tty, stdout, stderr),
         },
     }
+}
+
+fn runTrustInvocation(
+    init: std.process.Init,
+    request: surface.TrustRequest,
+    stdout: *std.Io.Writer,
+    stderr: *std.Io.Writer,
+) !u8 {
+    const allocator = init.gpa;
+    const io = init.io;
+    const cwd = try std.process.currentPathAlloc(io, allocator);
+    defer allocator.free(cwd);
+    const home = init.environ_map.get("HOME") orelse {
+        try stderr.writeAll("Unable to manage project trust: HOME is not set.\n");
+        return 1;
+    };
+    return trust.run(request, .{
+        .allocator = allocator,
+        .io = io,
+        .cwd = cwd,
+        .home = home,
+        .stdout = stdout,
+        .stderr = stderr,
+    });
 }
 
 fn runLaunchInvocation(
@@ -94,6 +120,8 @@ fn writeCliDiagnostics(writer: *std.Io.Writer, diagnostics: []const surface.Diag
             .rpc => try writer.writeAll("RPC mode is not available yet.\n"),
         },
         .invalid_auth_command => |command| try writer.print("Unsupported auth command: {s}.\n", .{command}),
+        .invalid_trust_command => |command| try writer.print("Unsupported trust command: {s}.\n", .{command}),
+        .too_many_trust_arguments => try writer.writeAll("Trust commands accept at most one path.\n"),
         .conflicting_session_option => |option| try writer.print(
             "Session selection is already set; {s} cannot be combined with it.\n",
             .{option},
@@ -116,6 +144,7 @@ fn writeCliHelp(writer: *std.Io.Writer) !void {
         \\Usage:
         \\  zi --print --provider PROVIDER --model MODEL [PROMPT]
         \\  zi --print (--continue | --session PATH) [PROMPT]
+        \\  zi trust (status | allow | deny | remove) [PATH]
         \\
         \\Options:
         \\  -p, --print          Run prompts and print the final response
@@ -131,11 +160,17 @@ fn writeCliHelp(writer: *std.Io.Writer) !void {
         \\  -h, --help           Show help
         \\  -v, --version        Show the version
         \\
+        \\Persistent project trust:
+        \\  zi trust status [PATH]  Show the nearest saved decision
+        \\  zi trust allow [PATH]   Save a trusted decision
+        \\  zi trust deny [PATH]    Save an untrusted decision
+        \\  zi trust remove [PATH]  Remove the exact saved decision
+        \\
         \\Prompt files:
         \\  $HOME/.zi/agent/SYSTEM.md         Replace the composed prompt base
         \\  $HOME/.zi/agent/APPEND_SYSTEM.md  Append persistent rules
-        \\  $CWD/.zi/SYSTEM.md                Replace the base when approved
-        \\  $CWD/.zi/APPEND_SYSTEM.md         Replace persistent rules when approved
+        \\  $CWD/.zi/SYSTEM.md                Replace the base when trusted
+        \\  $CWD/.zi/APPEND_SYSTEM.md         Replace persistent rules when trusted
         \\
         \\Context files:
         \\  $HOME/.zi/agent/AGENTS.md         Add global coding instructions

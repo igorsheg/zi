@@ -8,6 +8,7 @@ const ContextFiles = @import("ContextFiles.zig");
 const ModelConfigSnapshot = @import("ModelConfigSnapshot.zig");
 const ModelResolution = @import("ModelResolution.zig");
 const ProjectTrust = @import("ProjectTrust.zig");
+const ProjectTrustStore = @import("ProjectTrustStore.zig");
 const PromptFiles = @import("PromptFiles.zig");
 const SessionFormat = @import("SessionFormat.zig");
 const SessionJournal = @import("SessionJournal.zig");
@@ -20,6 +21,14 @@ const RuntimeServices = @This();
 pub const Error = error{
     OutOfMemory,
     InvalidPath,
+    InvalidProjectIdentity,
+    ProjectIdentityUnavailable,
+    InvalidProjectTrustFile,
+    UnsafeProjectTrustStorage,
+    ProjectTrustReadFailed,
+    ProjectTrustLockFailed,
+    ProjectTrustWriteFailed,
+    ProjectTrustCommitIndeterminate,
     InvalidHeader,
     InvalidRecord,
     UnsupportedVersion,
@@ -172,11 +181,22 @@ fn createOwned(
     var runtime_options = inputs.options;
     runtime_options.prompt.working_directory = selection.pathsView().cwd;
     const requested_prompt_files = requestedPromptFiles(runtime_options.prompt.policy);
-    const project_trust = ProjectTrust.resolve(inputs.project_trust);
-    var prompt_files: ?PromptFiles = if (requested_prompt_files.system or requested_prompt_files.append)
-        try PromptFiles.load(allocator, io, selection.pathsView(), requested_prompt_files, project_trust)
-    else
-        null;
+    var prompt_files: ?PromptFiles = if (requested_prompt_files.system or requested_prompt_files.append) files: {
+        const project_trust = try resolveProjectTrust(
+            allocator,
+            io,
+            selection.pathsView(),
+            requested_prompt_files,
+            inputs.project_trust,
+        );
+        break :files try PromptFiles.load(
+            allocator,
+            io,
+            selection.pathsView(),
+            requested_prompt_files,
+            project_trust,
+        );
+    } else null;
     defer if (prompt_files) |*files| files.deinit();
     var discovered_rules: [1][]const u8 = undefined;
     runtime_options.prompt.policy = resolvePromptPolicy(
@@ -320,6 +340,25 @@ fn createOwned(
         .runtime = runtime,
     };
     return self;
+}
+
+fn resolveProjectTrust(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    effective_paths: *const ZiPaths,
+    requested: PromptFiles.Requested,
+    intent: ProjectTrust.Intent,
+) Error!ProjectTrust.Decision {
+    if (intent != .automatic) return ProjectTrust.resolve(intent, null);
+    if (!try PromptFiles.hasProjectSources(io, effective_paths, requested)) {
+        return ProjectTrust.resolve(.automatic, null);
+    }
+    var identity = try ProjectTrustStore.Identity.init(allocator, io, effective_paths.cwd);
+    defer identity.deinit();
+    var snapshot = try ProjectTrustStore.load(allocator, io, effective_paths);
+    defer snapshot.deinit();
+    const saved = if (snapshot.nearest(&identity)) |entry| entry.decision else null;
+    return ProjectTrust.resolve(.automatic, saved);
 }
 
 fn requestedPromptFiles(policy: SystemPrompt.Policy) PromptFiles.Requested {
@@ -640,7 +679,12 @@ test "runtime services discover global prompt files for default composition" {
 test "runtime services gate project prompt precedence with launch trust" {
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();
-    try temporary.dir.createDirPath(std.testing.io, ".zi/agent");
+    try temporary.dir.createDir(std.testing.io, ".zi", .default_dir);
+    try temporary.dir.createDir(
+        std.testing.io,
+        ".zi/agent",
+        std.Io.File.Permissions.fromMode(0o700),
+    );
     try temporary.dir.writeFile(std.testing.io, .{
         .sub_path = ".zi/agent/SYSTEM.md",
         .data = "Global base.",
@@ -675,6 +719,48 @@ test "runtime services gate project prompt precedence with launch trust" {
     try std.testing.expect(std.mem.find(u8, automatic.session().systemPrompt(), "Global rules.") != null);
     automatic.deinit();
 
+    var identity = try ProjectTrustStore.Identity.init(std.testing.allocator, std.testing.io, root);
+    defer identity.deinit();
+    var trust_paths = try ZiPaths.init(std.testing.allocator, root, root);
+    defer trust_paths.deinit();
+    try ProjectTrustStore.put(
+        std.testing.allocator,
+        std.testing.io,
+        &trust_paths,
+        &identity,
+        .trusted,
+    );
+    var saved = try createWithTransport(std.testing.allocator, std.testing.io, .{
+        .startup_cwd = root,
+        .home = root,
+        .session = .new,
+        .sources = sources.view(),
+        .requested_provider = "openai",
+        .requested_model = "gpt-5.6",
+        .cli_api_key = "secret",
+    }, fake.transport());
+    try std.testing.expect(std.mem.startsWith(u8, saved.session().systemPrompt(), "Project base."));
+    saved.deinit();
+
+    try ProjectTrustStore.put(
+        std.testing.allocator,
+        std.testing.io,
+        &trust_paths,
+        &identity,
+        .untrusted,
+    );
+    var denied = try createWithTransport(std.testing.allocator, std.testing.io, .{
+        .startup_cwd = root,
+        .home = root,
+        .session = .new,
+        .sources = sources.view(),
+        .requested_provider = "openai",
+        .requested_model = "gpt-5.6",
+        .cli_api_key = "secret",
+    }, fake.transport());
+    try std.testing.expect(std.mem.startsWith(u8, denied.session().systemPrompt(), "Global base."));
+    denied.deinit();
+
     var approved = try createWithTransport(std.testing.allocator, std.testing.io, .{
         .startup_cwd = root,
         .home = root,
@@ -688,6 +774,26 @@ test "runtime services gate project prompt precedence with launch trust" {
     try std.testing.expect(std.mem.startsWith(u8, approved.session().systemPrompt(), "Project base."));
     try std.testing.expect(std.mem.find(u8, approved.session().systemPrompt(), "Project rules.") != null);
     approved.deinit();
+
+    try ProjectTrustStore.put(
+        std.testing.allocator,
+        std.testing.io,
+        &trust_paths,
+        &identity,
+        .trusted,
+    );
+    var rejected = try createWithTransport(std.testing.allocator, std.testing.io, .{
+        .startup_cwd = root,
+        .home = root,
+        .session = .new,
+        .sources = sources.view(),
+        .requested_provider = "openai",
+        .requested_model = "gpt-5.6",
+        .cli_api_key = "secret",
+        .project_trust = .reject,
+    }, fake.transport());
+    try std.testing.expect(std.mem.startsWith(u8, rejected.session().systemPrompt(), "Global base."));
+    rejected.deinit();
 
     var explicit_rules = try createWithTransport(std.testing.allocator, std.testing.io, .{
         .startup_cwd = root,
@@ -706,6 +812,83 @@ test "runtime services gate project prompt precedence with launch trust" {
     try std.testing.expect(std.mem.startsWith(u8, explicit_rules.session().systemPrompt(), "Project base."));
     try std.testing.expect(std.mem.find(u8, explicit_rules.session().systemPrompt(), "Explicit rules.") != null);
     try std.testing.expect(std.mem.find(u8, explicit_rules.session().systemPrompt(), "Project rules.") == null);
+}
+
+test "runtime services consult saved trust only for automatic protected resources" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try temporary.dir.createDir(std.testing.io, ".zi", .default_dir);
+    try temporary.dir.createDir(
+        std.testing.io,
+        ".zi/agent",
+        std.Io.File.Permissions.fromMode(0o700),
+    );
+    try temporary.dir.writeFile(std.testing.io, .{
+        .sub_path = ".zi/agent/SYSTEM.md",
+        .data = "Global base.",
+    });
+    const trust_file = try temporary.dir.createFile(std.testing.io, ".zi/agent/trust.json", .{
+        .permissions = std.Io.File.Permissions.fromMode(0o600),
+    });
+    try trust_file.writePositionalAll(std.testing.io, "invalid", 0);
+    trust_file.close(std.testing.io);
+    var root_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root = try temporaryPath(&temporary, &root_buffer);
+    var sources: TestSources = .{};
+    var fake = fake_api.FakeTransport.init(&.{});
+    const base_inputs: Inputs = .{
+        .startup_cwd = root,
+        .home = root,
+        .session = .new,
+        .sources = sources.view(),
+        .requested_provider = "openai",
+        .requested_model = "gpt-5.6",
+        .cli_api_key = "secret",
+    };
+
+    var no_project_source = try createWithTransport(
+        std.testing.allocator,
+        std.testing.io,
+        base_inputs,
+        fake.transport(),
+    );
+    try std.testing.expect(std.mem.startsWith(
+        u8,
+        no_project_source.session().systemPrompt(),
+        "Global base.",
+    ));
+    no_project_source.deinit();
+
+    try temporary.dir.writeFile(std.testing.io, .{
+        .sub_path = ".zi/SYSTEM.md",
+        .data = "Project base.",
+    });
+    try std.testing.expectError(
+        error.InvalidProjectTrustFile,
+        createWithTransport(std.testing.allocator, std.testing.io, base_inputs, fake.transport()),
+    );
+
+    var rejected_inputs = base_inputs;
+    rejected_inputs.project_trust = .reject;
+    var rejected = try createWithTransport(
+        std.testing.allocator,
+        std.testing.io,
+        rejected_inputs,
+        fake.transport(),
+    );
+    try std.testing.expect(std.mem.startsWith(u8, rejected.session().systemPrompt(), "Global base."));
+    rejected.deinit();
+
+    var approved_inputs = base_inputs;
+    approved_inputs.project_trust = .approve;
+    var approved = try createWithTransport(
+        std.testing.allocator,
+        std.testing.io,
+        approved_inputs,
+        fake.transport(),
+    );
+    defer approved.deinit();
+    try std.testing.expect(std.mem.startsWith(u8, approved.session().systemPrompt(), "Project base."));
 }
 
 test "runtime services do not read global prompt files shadowed by explicit policy" {
@@ -926,13 +1109,28 @@ test "runtime services discover context from a resumed session working directory
     defer std.testing.allocator.free(journal_path);
     created.deinit();
 
+    var stored_identity = try ProjectTrustStore.Identity.init(
+        std.testing.allocator,
+        std.testing.io,
+        stored_cwd,
+    );
+    defer stored_identity.deinit();
+    var trust_paths = try ZiPaths.init(std.testing.allocator, stored_cwd, root);
+    defer trust_paths.deinit();
+    try ProjectTrustStore.put(
+        std.testing.allocator,
+        std.testing.io,
+        &trust_paths,
+        &stored_identity,
+        .trusted,
+    );
+
     var resumed = try createWithTransport(std.testing.allocator, std.testing.io, .{
         .startup_cwd = launch_cwd,
         .home = root,
         .session = .{ .open = journal_path },
         .sources = sources.view(),
         .cli_api_key = "secret",
-        .project_trust = .approve,
     }, fake.transport());
     defer resumed.deinit();
     try std.testing.expectEqualStrings(stored_cwd, resumed.paths().cwd);

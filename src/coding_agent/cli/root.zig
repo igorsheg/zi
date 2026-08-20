@@ -3,6 +3,7 @@ const initial_message = @import("initial_message.zig");
 const launch = @import("launch.zig");
 const print_mode = @import("print_mode.zig");
 const surface = @import("surface.zig");
+const trust = @import("trust.zig");
 
 pub const run = entry.run;
 
@@ -262,4 +263,5 @@ test {
     _ = launch;
     _ = print_mode;
     _ = surface;
+    _ = trust;
 }

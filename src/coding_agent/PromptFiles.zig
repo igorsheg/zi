@@ -26,6 +26,25 @@ arena: std.heap.ArenaAllocator,
 system_text: ?[]const u8,
 append_text: ?[]const u8,
 
+pub fn hasProjectSources(
+    io: std.Io,
+    paths: *const ZiPaths,
+    requested: Requested,
+) Error!bool {
+    const directory = std.Io.Dir.openDirAbsolute(io, paths.project, .{
+        .follow_symlinks = false,
+    }) catch |failure| return switch (failure) {
+        error.FileNotFound => false,
+        error.Canceled => error.Cancelled,
+        error.NotDir, error.SymLinkLoop => true,
+        else => true,
+    };
+    defer directory.close(io);
+    if (requested.system and try sourceExists(io, directory, system_file_name)) return true;
+    if (requested.append and try sourceExists(io, directory, append_file_name)) return true;
+    return false;
+}
+
 pub fn load(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -98,6 +117,20 @@ fn openOptionalDirectory(
             else => error.PromptFileReadFailed,
         };
     };
+}
+
+fn sourceExists(io: std.Io, directory: std.Io.Dir, path: []const u8) Error!bool {
+    const file = directory.openFile(io, path, .{
+        .mode = .read_only,
+        .allow_directory = false,
+        .follow_symlinks = false,
+    }) catch |failure| return switch (failure) {
+        error.FileNotFound => false,
+        error.Canceled => error.Cancelled,
+        else => true,
+    };
+    file.close(io);
+    return true;
 }
 
 fn loadOptionalText(
@@ -179,6 +212,25 @@ test "prompt files distinguish absent and unrequested sources" {
     defer files.deinit();
     try std.testing.expect(files.system() == null);
     try std.testing.expect(files.append() == null);
+}
+
+test "project prompt source detection is role-aware and treats unsafe roots as present" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try temporary.dir.createDir(std.testing.io, ".zi", .default_dir);
+    try temporary.dir.writeFile(std.testing.io, .{
+        .sub_path = ".zi/SYSTEM.md",
+        .data = "Project base.",
+    });
+    var root_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    var paths = try testPaths(&temporary, &root_buffer);
+    defer paths.deinit();
+    try std.testing.expect(try hasProjectSources(std.testing.io, &paths, .{ .system = true }));
+    try std.testing.expect(!try hasProjectSources(std.testing.io, &paths, .{ .append = true }));
+
+    try temporary.dir.deleteTree(std.testing.io, ".zi");
+    try temporary.dir.writeFile(std.testing.io, .{ .sub_path = ".zi", .data = "unsafe" });
+    try std.testing.expect(try hasProjectSources(std.testing.io, &paths, .{ .system = true }));
 }
 
 test "trusted project prompt files shadow global sources independently" {

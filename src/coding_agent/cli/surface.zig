@@ -25,6 +25,19 @@ pub const PromptIntent = union(enum) {
     replace: []const u8,
 };
 
+pub const TrustAction = enum {
+    status,
+    allow,
+    deny,
+    remove,
+};
+
+/// One persistent project-trust operation whose optional path borrows argv.
+pub const TrustRequest = struct {
+    action: TrustAction,
+    path: ?[]const u8 = null,
+};
+
 /// One print launch whose strings remain borrowed from argv for its execution.
 pub const LaunchRequest = struct {
     session: SessionIntent = .new,
@@ -46,6 +59,7 @@ pub const LaunchRequest = struct {
 pub const Invocation = union(enum) {
     help,
     version,
+    trust: TrustRequest,
     launch: LaunchRequest,
 };
 
@@ -65,6 +79,8 @@ pub const Diagnostic = union(enum) {
     invalid_mode: []const u8,
     unavailable_mode: Mode,
     invalid_auth_command: []const u8,
+    invalid_trust_command: []const u8,
+    too_many_trust_arguments,
     conflicting_session_option: []const u8,
     conflicting_project_trust_option: []const u8,
     conflicting_system_prompt_option: []const u8,
@@ -106,6 +122,9 @@ pub fn parseInvocation(argv: []const []const u8, terminal: Terminal) ParseResult
     if (argv.len > 0 and std.mem.eql(u8, argv[0], "auth")) {
         rejection.add(.{ .invalid_auth_command = if (argv.len > 1) argv[1] else "" });
         return .{ .rejected = rejection };
+    }
+    if (argv.len > 0 and std.mem.eql(u8, argv[0], "trust")) {
+        return parseTrustInvocation(argv[1..], &rejection);
     }
 
     var launch: LaunchRequest = .{};
@@ -203,6 +222,36 @@ pub fn parseInvocation(argv: []const []const u8, terminal: Terminal) ParseResult
     }
     if (rejection.count > 0) return .{ .rejected = rejection };
     return .{ .admitted = .{ .launch = launch } };
+}
+
+fn parseTrustInvocation(arguments: []const []const u8, rejection: *Rejection) ParseResult {
+    if (arguments.len == 1 and
+        (std.mem.eql(u8, arguments[0], "--help") or std.mem.eql(u8, arguments[0], "-h")))
+    {
+        return .{ .admitted = .help };
+    }
+    if (arguments.len > 2) {
+        rejection.add(.too_many_trust_arguments);
+        return .{ .rejected = rejection.* };
+    }
+    const action: TrustAction = if (arguments.len == 0)
+        .status
+    else if (std.mem.eql(u8, arguments[0], "status"))
+        .status
+    else if (std.mem.eql(u8, arguments[0], "allow"))
+        .allow
+    else if (std.mem.eql(u8, arguments[0], "deny"))
+        .deny
+    else if (std.mem.eql(u8, arguments[0], "remove"))
+        .remove
+    else {
+        rejection.add(.{ .invalid_trust_command = arguments[0] });
+        return .{ .rejected = rejection.* };
+    };
+    return .{ .admitted = .{ .trust = .{
+        .action = action,
+        .path = if (arguments.len == 2) arguments[1] else null,
+    } } };
 }
 
 fn validateArguments(argv: []const []const u8, rejection: *Rejection) bool {
@@ -314,6 +363,45 @@ test "CLI surface admits one typed launch invocation" {
     try std.testing.expectEqual(@as(usize, 2), launch.messages().len);
     try std.testing.expectEqualStrings("first", launch.messages()[0]);
     try std.testing.expectEqualStrings("second", launch.messages()[1]);
+}
+
+test "CLI surface admits bounded persistent trust commands" {
+    const status = parseInvocation(&.{"trust"}, .{
+        .stdin_is_tty = true,
+        .stdout_is_tty = true,
+    });
+    try std.testing.expect(status == .admitted);
+    try std.testing.expectEqual(TrustAction.status, status.admitted.trust.action);
+    try std.testing.expect(status.admitted.trust.path == null);
+
+    const help = parseInvocation(&.{ "trust", "--help" }, .{
+        .stdin_is_tty = true,
+        .stdout_is_tty = true,
+    });
+    try std.testing.expect(help == .admitted);
+    try std.testing.expect(help.admitted == .help);
+
+    const allow = parseInvocation(&.{ "trust", "allow", "../workspace" }, .{
+        .stdin_is_tty = true,
+        .stdout_is_tty = true,
+    });
+    try std.testing.expect(allow == .admitted);
+    try std.testing.expectEqual(TrustAction.allow, allow.admitted.trust.action);
+    try std.testing.expectEqualStrings("../workspace", allow.admitted.trust.path.?);
+
+    const invalid = parseInvocation(&.{ "trust", "maybe" }, .{
+        .stdin_is_tty = true,
+        .stdout_is_tty = true,
+    });
+    try std.testing.expect(invalid == .rejected);
+    try std.testing.expectEqualStrings("maybe", invalid.rejected.diagnostics()[0].invalid_trust_command);
+
+    const excessive = parseInvocation(&.{ "trust", "remove", ".", "extra" }, .{
+        .stdin_is_tty = true,
+        .stdout_is_tty = true,
+    });
+    try std.testing.expect(excessive == .rejected);
+    try std.testing.expect(excessive.rejected.diagnostics()[0] == .too_many_trust_arguments);
 }
 
 test "CLI surface admits and bounds project trust overrides" {

@@ -203,10 +203,14 @@ root. Feature owners define their directories and files beneath those roots.
 Settings, credentials, resources, and persistent session creation consume the
 cwd-bound roots. Do not join `.zi` or re-read process cwd inside those owners.
 
-`ProjectTrust` owns per-launch project prompt-file admission. Non-interactive
-automatic trust is closed; explicit approve and reject decisions are not persisted.
-Trusted project prompt files are resolved from the effective session cwd and
-shadow global prompt files independently by role.
+`ProjectTrust` owns project prompt-file admission, and `ProjectTrustStore` owns
+canonical directory identities plus the bounded versioned
+`$HOME/.zi/agent/trust.json`. The nearest saved cwd or ancestor decision applies;
+without one, non-interactive automatic trust is closed. Store mutations require
+private permissions, a dedicated lock, and atomic replacement. Explicit approve
+and reject launch decisions override saved policy without persisting it. Trusted
+project prompt files resolve from the effective session cwd and shadow global
+prompt files independently by role.
 
 `ContextFiles` owns bounded global and cwd-ancestor instruction discovery.
 Ancestor instructions apply from broadest to narrowest scope regardless of
