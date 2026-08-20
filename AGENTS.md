@@ -239,7 +239,10 @@ final settlement. It does not replace core payloads with rendering commands.
 `OwnedAgentSessionEvent` is the bounded arena-owned copy for worker or UI
 boundaries; presentation remains a downstream reducer. Canonical message and
 stream owners provide bulk-lifetime copy operations so boundary owners do not
-reimplement nested message or provider-state copying.
+reimplement nested message or provider-state copying. Only `TurnWorker` mutates
+or disposes a transferred `AgentSession`. It applies backpressure at bounded
+event-count and aggregate-byte limits rather than locking the agent or retaining
+borrowed callback data.
 
 Credentials are admitted values on the session runtime, not ambient environment
 reads scattered through the tree. The process edge reads the environment once

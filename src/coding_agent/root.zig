@@ -20,6 +20,7 @@ const session_format = @import("SessionFormat.zig");
 const session_journal = @import("SessionJournal.zig");
 const session_selection = @import("SessionSelection.zig");
 const system_prompt = @import("SystemPrompt.zig");
+const turn_worker = @import("TurnWorker.zig");
 const zi_paths = @import("ZiPaths.zig");
 
 pub const cli = @import("cli/root.zig");
@@ -47,6 +48,7 @@ test {
     _ = session_journal;
     _ = session_selection;
     _ = system_prompt;
+    _ = turn_worker;
     _ = zi_paths;
     _ = cli;
 }

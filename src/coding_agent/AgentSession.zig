@@ -110,6 +110,16 @@ pub fn deinit(self: *AgentSession) void {
     self.* = undefined;
 }
 
+/// Construction-only binding used when the session is transferred to a worker.
+pub fn bindEvents(self: *AgentSession, sink: EventSink) error{EventsAlreadyBound}!void {
+    if (self.tools.events != null) return error.EventsAlreadyBound;
+    try self.agent.bindEvents(.{
+        .context = self.tools,
+        .emitFn = Tools.emitAgentEvent,
+    });
+    self.tools.events = sink;
+}
+
 pub fn prompt(self: *AgentSession, input: []const u8) Agent.RunError![]const u8 {
     return self.promptInternal(input, .{});
 }

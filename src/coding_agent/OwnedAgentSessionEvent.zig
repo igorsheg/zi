@@ -6,9 +6,12 @@ const session_format = @import("SessionFormat.zig");
 
 const OwnedAgentSessionEvent = @This();
 
+pub const default_max_retained_bytes = session_format.max_journal_bytes;
+pub const default_max_items = session_format.max_entries;
+
 pub const Limits = struct {
-    max_retained_bytes: usize = session_format.max_journal_bytes,
-    max_items: usize = session_format.max_entries,
+    max_retained_bytes: usize = default_max_retained_bytes,
+    max_items: usize = default_max_items,
 };
 
 pub const Error = error{

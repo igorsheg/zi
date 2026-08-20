@@ -150,6 +150,13 @@ pub fn providerFailure(self: *const Agent) ?ai_failure.ProviderFailure {
     return self.provider_failure;
 }
 
+/// Construction-only binding for a consumer that outlives every run.
+pub fn bindEvents(self: *Agent, sink: EventSink) error{EventsAlreadyBound}!void {
+    std.debug.assert(self.run_state == .ready);
+    if (self.events != null) return error.EventsAlreadyBound;
+    self.events = sink;
+}
+
 /// Construction-only binding; committed sessions install it before the agent is published.
 pub fn bindCommits(
     self: *Agent,
