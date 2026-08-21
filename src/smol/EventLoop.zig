@@ -12,6 +12,7 @@ pub const Callbacks = struct {
     handleByteFn: *const fn (*anyopaque, u8) anyerror!void,
     settleInputFn: *const fn (*anyopaque) anyerror!void,
     resizeFn: *const fn (*anyopaque, TerminalSession.Size) anyerror!void,
+    commitFrameFn: *const fn (*anyopaque) anyerror!void,
     shouldExitFn: *const fn (*anyopaque) bool,
 
     fn collectFacts(self: Callbacks) !void {
@@ -30,6 +31,10 @@ pub const Callbacks = struct {
         return self.resizeFn(self.context, size);
     }
 
+    fn commitFrame(self: Callbacks) !void {
+        return self.commitFrameFn(self.context);
+    }
+
     fn shouldExit(self: Callbacks) bool {
         return self.shouldExitFn(self.context);
     }
@@ -40,8 +45,9 @@ pub const Options = struct {
     max_reads_per_tick: usize = 32,
 };
 
-/// Interleaves worker fact collection, resize observation, bounded terminal
-/// reads, and input-deadline settlement on one terminal-owning thread.
+/// Collects worker facts, observes resize, reduces bounded terminal input,
+/// settles decoder delivery, then commits one requested frame on the
+/// terminal-owning thread. The ordering follows fx's `ui/event_loop.zig`.
 pub fn run(
     terminal: anytype,
     callbacks: Callbacks,
@@ -64,9 +70,6 @@ pub fn run(
             }
         } else |_| {}
 
-        try callbacks.settleInput();
-        if (callbacks.shouldExit()) return .requested;
-
         var poll = try terminal.pollInput(options.poll_timeout_ms);
         var reads: usize = 0;
         while (poll.readable and reads < options.max_reads_per_tick) : (reads += 1) {
@@ -78,7 +81,18 @@ pub fn run(
             }
             poll = try terminal.pollInput(0);
         }
-        if (poll.closed()) return .input_closed;
+        if (poll.readable) {
+            try callbacks.commitFrame();
+            continue;
+        }
+        if (poll.closed()) {
+            if (reads != 0) try callbacks.commitFrame();
+            return .input_closed;
+        }
+
+        try callbacks.settleInput();
+        if (callbacks.shouldExit()) return .requested;
+        try callbacks.commitFrame();
     }
     return .requested;
 }
@@ -89,6 +103,7 @@ const TestContext = struct {
     collect_count: usize = 0,
     settle_count: usize = 0,
     resize_count: usize = 0,
+    commit_count: usize = 0,
     last_size: ?TerminalSession.Size = null,
     exit: bool = false,
 
@@ -115,6 +130,11 @@ const TestContext = struct {
         self.last_size = size;
     }
 
+    fn commitFrame(raw: *anyopaque) !void {
+        const self: *TestContext = @ptrCast(@alignCast(raw));
+        self.commit_count += 1;
+    }
+
     fn shouldExit(raw: *anyopaque) bool {
         const self: *TestContext = @ptrCast(@alignCast(raw));
         return self.exit;
@@ -127,6 +147,7 @@ const TestContext = struct {
             .handleByteFn = handleByte,
             .settleInputFn = settle,
             .resizeFn = resize,
+            .commitFrameFn = commitFrame,
             .shouldExitFn = shouldExit,
         };
     }
@@ -163,9 +184,21 @@ test "event loop batches terminal bytes around worker fact collection" {
     try std.testing.expectEqual(ExitCause.requested, cause);
     try std.testing.expectEqualStrings("hi\r\x04", context.bytes[0..context.byte_count]);
     try std.testing.expectEqual(@as(usize, 1), context.collect_count);
-    try std.testing.expectEqual(@as(usize, 1), context.settle_count);
+    try std.testing.expectEqual(@as(usize, 0), context.settle_count);
     try std.testing.expectEqual(@as(usize, 1), context.resize_count);
+    try std.testing.expectEqual(@as(usize, 0), context.commit_count);
     try std.testing.expectEqual(@as(u16, 80), context.last_size.?.columns);
+}
+
+test "event loop commits bytes before reporting input closure" {
+    var context: TestContext = .{};
+    const chunks = [_][]const u8{"abc"};
+    var terminal: TestTerminal = .{ .chunks = &chunks };
+
+    const cause = try run(&terminal, context.callbacks(), .{});
+    try std.testing.expectEqual(ExitCause.input_closed, cause);
+    try std.testing.expectEqualStrings("abc", context.bytes[0..context.byte_count]);
+    try std.testing.expectEqual(@as(usize, 1), context.commit_count);
 }
 
 test "event loop rejects unbounded read configuration" {
@@ -215,6 +248,7 @@ test "event loop settles pending input after quiet polls" {
                 .handleByteFn = handleByte,
                 .settleInputFn = settle,
                 .resizeFn = resize,
+                .commitFrameFn = commitFrame,
                 .shouldExitFn = shouldExit,
             };
         }
@@ -234,6 +268,11 @@ test "event loop settles pending input after quiet polls" {
             self.base.last_size = size;
         }
 
+        fn commitFrame(raw: *anyopaque) !void {
+            const self: *Self = @ptrCast(@alignCast(raw));
+            self.base.commit_count += 1;
+        }
+
         fn shouldExit(raw: *anyopaque) bool {
             const self: *Self = @ptrCast(@alignCast(raw));
             return self.base.exit;
@@ -245,5 +284,6 @@ test "event loop settles pending input after quiet polls" {
     const cause = try run(&terminal, context.callbacks(), .{ .poll_timeout_ms = 0 });
     try std.testing.expectEqual(ExitCause.requested, cause);
     try std.testing.expectEqual(@as(usize, 3), context.base.settle_count);
-    try std.testing.expectEqual(@as(usize, 2), terminal.polls);
+    try std.testing.expectEqual(@as(usize, 3), terminal.polls);
+    try std.testing.expectEqual(@as(usize, 2), context.base.commit_count);
 }

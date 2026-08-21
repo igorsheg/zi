@@ -4,10 +4,21 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const uucode_dependency = b.dependency("uucode", .{
+        .target = target,
+        .optimize = optimize,
+        .fields = @as([]const []const u8, &.{
+            "grapheme_break",
+            "east_asian_width",
+            "general_category",
+            "is_emoji_presentation",
+        }),
+    });
     const zi = b.addModule("zi", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{.{ .name = "uucode", .module = uucode_dependency.module("uucode") }},
     });
 
     const exe = b.addExecutable(.{

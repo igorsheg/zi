@@ -73,13 +73,16 @@ in the same change.
 
 ## References
 
-Use these references by role. Do not port any of them literally.
+Use these references by role. Do not port a reference wholesale. Attributed
+source adaptations must preserve the upstream license and revision in
+`THIRD_PARTY_NOTICES.md`.
 
 | Role | Reference | Use for |
 | --- | --- | --- |
 | Behavior | [pi](https://github.com/earendil-works/pi) / [pi-mono](https://github.com/badlogic/pi-mono) | Observable coding-agent behavior: model lookup, normalized messages, streaming tool calls, reasoning, usage, context, CLI/session contract |
 | Zig model | [ZigAI](https://github.com/Kludex/zigai) | Representation: small erased interfaces, tagged unions, borrowed request data, arena-owned results, synchronous borrowed stream events, explicit model profiles, injected `std.Io`, adapters isolated from orchestration |
 | Zig process | [fx](https://github.com/vercel-labs/fx) | Zig 0.16 process shape, module ownership, and native binary composition. Take a pattern only when it fits Zi's current owners |
+| Terminal rendering | [OpenTUI](https://github.com/anomalyco/opentui) | Unicode grapheme segmentation, terminal display width, cell spans, frame diffing, and ANSI encoding. Adapt only the behavior owned by `terminal_render`; do not import the TypeScript runtime or native package wholesale |
 
 Concrete behavior pins and provenance live with the owning source and data, or
 in commit history, not as duplicated commit hashes in this file.
@@ -97,13 +100,14 @@ When the references disagree:
 5. Defer a feature rather than weaken the canonical types.
 
 This branch is the Zig rewrite. It is not a mix of the TypeScript product on
-`main`. Do not reintroduce Node, bun, npm, OpenTUI, or `packages/` into the Zig
-tree.
+`main`. Do not reintroduce Node, bun, npm, OpenTUI's runtime or native package,
+or `packages/` into the Zig tree.
 
 ## Language and toolchain
 
 This project is written in **Zig 0.16+**. There is no Node.js runtime, no
-`package.json`, and no JavaScript build step for this branch.
+`package.json`, and no JavaScript build step for this branch. `build.zig.zon`
+pins `uucode` for generated Unicode grapheme and width tables.
 
 ```bash
 zig build                          # build the binary
@@ -173,9 +177,15 @@ Module ownership (stable boundaries):
   a model and its credentials, cwd-bound tools, `ZiPaths`, model config and
   resolution, the CLI process adapter, the serialized turn worker, and
   presentation-neutral interactive behavior.
+- `src/terminal_render/` owns frontend-neutral terminal text and frame mechanics:
+  Unicode grapheme boundaries and display width, frame-owned grapheme storage,
+  cells and styles, surfaces, semantic frame diffs, and error-returning ANSI
+  encoding. It depends only on the standard library and the pinned `uucode`
+  tables.
 - `src/smol/` owns the concrete non-alternate-screen interactive client: terminal
-  lifecycle, input decoding and editing, event polling, and rendering. It
-  consumes only the public coding-agent interactive contract.
+  lifecycle, input decoding and editing, event polling, footer layout,
+  normal-buffer publication, and rendering policy. It consumes the public
+  coding-agent interactive and terminal-render contracts.
 - `src/BoundedJson.zig` is the shared bounded JSON helper. Domain-specific
   validation stays with the owning module.
 - `src/coding_agent/BoundedTextFile.zig` shares optional bounded UTF-8 file-read
@@ -184,9 +194,9 @@ Module ownership (stable boundaries):
 - `data/model_catalog.json` plus `tools/model_catalog.zig` own catalog
   generation. The compiled snapshot lives in `src/ai/model_catalog_snapshot.zig`.
 
-Dependencies point one way: `smol` depends on `coding_agent` and `ai`;
-`coding_agent` depends on `agent` and `ai`; `agent` depends on `ai`; `ai`
-depends on neither. The CLI accepts an erased interactive frontend from
+Dependencies point one way: `smol` depends on `coding_agent`, `ai`, and
+`terminal_render`; `terminal_render` depends on no Zi module; `coding_agent`
+depends on `agent` and `ai`; `agent` depends on `ai`; `ai` depends on neither. The CLI accepts an erased interactive frontend from
 `src/main.zig`; neither `coding_agent` nor its CLI may import `smol`. Do not add a
 back edge.
 
@@ -264,15 +274,21 @@ and exit mapping. It does not own terminal mechanics, input state, or rendering.
 
 `smol/terminal/Session.zig` owns raw-mode admission and best-effort cooked-mode,
 style, hyperlink, and cursor restoration. The current smol client starts on the
-normal screen without mouse tracking, alternate-screen rendering,
-keyboard-protocol negotiation, or frame diffs. `smol/input/Decoder.zig` owns
-bounded escape parsing and resolves a bare Escape only after a quiet-period
-deadline. `smol/EventLoop.zig` handles bounded terminal bytes, resize observation,
-worker fact collection, and input-deadline callbacks on the terminal-owning
-thread. It does not interpret coding-agent input actions.
-`smol/NormalScreenRenderer.zig` uses append-only output, sanitizes all provider
-and tool text before writing terminal bytes, and redraws only the active prompt
-line.
+normal screen without mouse tracking, alternate-screen rendering, or
+keyboard-protocol negotiation. `smol/input/Decoder.zig` owns bounded escape parsing and resolves a bare Escape only after a quiet-period
+deadline. `smol/EventLoop.zig` handles bounded terminal bytes, resize
+observation, worker fact collection, input-deadline settlement, and one frame
+commit after reduction on the terminal-owning thread. It does not interpret
+coding-agent input actions. `smol/Screen.zig` coalesces typed render requests,
+sanitizes provider and tool text, keeps completed transcript output append-only,
+and paints the normal-buffer status and composer footer. `smol/render/FooterLayout.zig`
+owns non-overlapping status and composer bands, display-cell wrapping, bounded
+composer viewport selection, and cursor geometry. `terminal_render/Surface.zig`
+owns typed frame cells, frame-local grapheme bytes, cell spans, and cursor
+invariants. `terminal_render/Text.zig` owns Unicode grapheme boundaries and
+display width. `smol/render/TerminalRenderer.zig` is the sole live frame writer. It composes a
+complete wire transaction, diffs against its authoritative footer shadow, and
+replaces that shadow only after a successful flush.
 
 Credentials are admitted values on the session runtime, not ambient environment
 reads scattered through the tree. The process edge reads the environment once
@@ -362,8 +378,8 @@ second documentation tree.
 
 - Do not grow `main.zig` with leaf feature logic.
 - Do not report a library-level change as a user-facing capability.
-- Do not reintroduce TypeScript, bun, npm, OpenTUI, Nano Stores, TypeBox, or
-  `packages/` into this Zig tree.
+- Do not reintroduce TypeScript, bun, npm, OpenTUI's runtime or native package,
+  Nano Stores, TypeBox, or `packages/` into this Zig tree.
 - Do not add a second execution path for the same feature without a clear reason.
 - Do not port pi types, promises, or mutation into Zig.
 - Do not copy a reference project's product scope wholesale (ZigAI agent/graph/

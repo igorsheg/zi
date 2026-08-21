@@ -3,7 +3,7 @@ const coding_agent = @import("../coding_agent/root.zig");
 const interactive = coding_agent.interactive;
 const Decoder = @import("input/Decoder.zig");
 const EventLoop = @import("EventLoop.zig");
-const NormalScreenRenderer = @import("NormalScreenRenderer.zig");
+const Screen = @import("Screen.zig");
 const LineEditor = @import("input/LineEditor.zig");
 const TerminalSession = @import("terminal/Session.zig");
 
@@ -25,7 +25,7 @@ io: std.Io,
 controller: *interactive.SessionController,
 decoder: Decoder = .{},
 editor: LineEditor,
-renderer: NormalScreenRenderer,
+screen: Screen,
 escape_timeout_ms: i64,
 should_exit: bool = false,
 
@@ -37,19 +37,22 @@ pub fn init(
     options: InitOptions,
 ) !App {
     if (options.escape_timeout_ms < 0) return error.InvalidEscapeTimeout;
+    var editor = LineEditor.init(
+        allocator,
+        interactive.default_limits.max_restored_draft_bytes,
+    );
+    errdefer editor.deinit();
     return .{
         .io = io,
         .controller = controller,
-        .editor = LineEditor.init(
-            allocator,
-            interactive.default_limits.max_restored_draft_bytes,
-        ),
-        .renderer = NormalScreenRenderer.init(writer),
+        .editor = editor,
+        .screen = try Screen.init(allocator, writer, .{}),
         .escape_timeout_ms = options.escape_timeout_ms,
     };
 }
 
 pub fn deinit(self: *App) void {
+    self.screen.deinit();
     self.editor.deinit();
     self.* = undefined;
 }
@@ -80,6 +83,8 @@ fn runWithTerminal(
         if (finish_result) |_| {} else |_| {}
     };
     for (options.initial_prompts) |prompt| try self.submitPrompt(prompt);
+    if (terminal.querySize()) |size| self.screen.resized(size) else |_| {}
+    try self.commitFrameImpl();
     const cause = try EventLoop.run(terminal, self.callbacks(), .{
         .poll_timeout_ms = options.poll_timeout_ms,
         .max_reads_per_tick = options.max_reads_per_tick,
@@ -97,6 +102,7 @@ fn callbacks(self: *App) EventLoop.Callbacks {
         .handleByteFn = handleByte,
         .settleInputFn = settleInput,
         .resizeFn = handleResize,
+        .commitFrameFn = commitFrame,
         .shouldExitFn = shouldExit,
     };
 }
@@ -106,13 +112,11 @@ fn controllerSink(self: *App) interactive.ControllerSink {
 }
 
 fn start(self: *App, transcript: ?*const interactive.SessionTranscript) !void {
-    try self.renderer.renderWelcome();
-    if (transcript) |restored| try self.renderer.renderTranscript(restored);
-    try self.renderer.redrawPrompt(&self.editor);
+    try self.screen.start(transcript);
 }
 
 fn finish(self: *App) !void {
-    try self.renderer.finish();
+    try self.screen.finish(self.frameView());
 }
 
 fn collectFacts(context: *anyopaque) !void {
@@ -124,25 +128,15 @@ fn collectFacts(context: *anyopaque) !void {
         self.controllerSink(),
     );
     defer result.deinit();
-    if (result.restored) |restored| try self.editor.replace(restored.text);
-    try self.renderer.redrawPrompt(&self.editor);
+    if (result.restored) |restored| {
+        try self.editor.replace(restored.text);
+        self.screen.editorChanged();
+    }
 }
 
 fn emitControllerFact(context: *anyopaque, fact: interactive.ControllerFact) !void {
     const self: *App = @ptrCast(@alignCast(context));
-    switch (fact) {
-        .event => |event| try self.renderer.renderEvent(event),
-        .completion => |completion| {
-            if (!completion.agent_end_observed) switch (completion.value.outcome) {
-                .completed => {},
-                .failed => |failure| try self.renderer.renderCompletionFailure(failure),
-            };
-        },
-        .fault => |fault| switch (fault) {
-            .follow_up_submission => |failure| try self.renderer.renderNotice(@errorName(failure)),
-            .draft_restore => |failure| try self.renderer.renderNotice(@errorName(failure)),
-        },
-    }
+    try self.screen.apply(fact);
 }
 
 fn handleByte(context: *anyopaque, byte: u8) !void {
@@ -160,7 +154,7 @@ fn settleInput(context: *anyopaque) !void {
 fn handleAction(self: *App, action: Decoder.Action) !void {
     switch (action) {
         .text_byte => |byte| self.editor.insertByte(byte) catch |failure| {
-            try self.renderer.renderNotice(@errorName(failure));
+            try self.screen.notice(@errorName(failure));
         },
         .submit, .follow_up => try self.submitDraft(),
         .escape => try self.cancelAndRestore(),
@@ -181,7 +175,7 @@ fn handleAction(self: *App, action: Decoder.Action) !void {
         .backspace => self.editor.deleteBackward(),
         .delete => self.editor.deleteForward(),
         .tab => self.editor.insertByte('\t') catch |failure| {
-            try self.renderer.renderNotice(@errorName(failure));
+            try self.screen.notice(@errorName(failure));
         },
         .cursor_left => self.editor.moveLeft(),
         .cursor_right => self.editor.moveRight(),
@@ -189,12 +183,32 @@ fn handleAction(self: *App, action: Decoder.Action) !void {
         .end => self.editor.moveEnd(),
         .cursor_up, .cursor_down, .ignored => {},
     }
-    if (!self.should_exit) try self.renderer.redrawPrompt(&self.editor);
+    if (!self.should_exit) self.screen.editorChanged();
 }
 
-fn handleResize(context: *anyopaque, _: TerminalSession.Size) !void {
+fn handleResize(context: *anyopaque, size: TerminalSession.Size) !void {
     const self: *App = @ptrCast(@alignCast(context));
-    try self.renderer.redrawPrompt(&self.editor);
+    self.screen.resized(size);
+}
+
+fn commitFrame(context: *anyopaque) !void {
+    const self: *App = @ptrCast(@alignCast(context));
+    try self.commitFrameImpl();
+}
+
+fn commitFrameImpl(self: *App) !void {
+    try self.screen.commit(self.frameView());
+}
+
+fn frameView(self: *const App) Screen.FrameView {
+    return .{
+        .composer = .{
+            .text = self.editor.text(),
+            .cursor_byte = self.editor.cursorByte(),
+        },
+        .phase = self.controller.phase(),
+        .queued_count = self.controller.queuedFollowUpCount(),
+    };
 }
 
 fn shouldExit(context: *anyopaque) bool {
@@ -209,11 +223,11 @@ fn nowMs(self: *App) i64 {
 
 fn submitDraft(self: *App) !void {
     if (!self.editor.validUtf8()) {
-        try self.renderer.renderNotice("input is not valid UTF-8");
+        try self.screen.notice("input is not valid UTF-8");
         return;
     }
     self.submitPrompt(self.editor.text()) catch |failure| {
-        if (failure != error.EmptyPrompt) try self.renderer.renderNotice(@errorName(failure));
+        if (failure != error.EmptyPrompt) try self.screen.notice(@errorName(failure));
         return;
     };
     self.editor.clear();
@@ -221,11 +235,12 @@ fn submitDraft(self: *App) !void {
 
 fn submitPrompt(self: *App, prompt: []const u8) !void {
     _ = try self.controller.submit(prompt);
+    self.screen.editorChanged();
 }
 
 fn cancelAndRestore(self: *App) !void {
     const restored_optional = self.controller.cancel(self.editor.text()) catch |failure| {
-        try self.renderer.renderNotice(@errorName(failure));
+        try self.screen.notice(@errorName(failure));
         return;
     };
     if (restored_optional) |restored_value| {

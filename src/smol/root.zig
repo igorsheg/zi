@@ -1,7 +1,9 @@
 const coding_agent = @import("../coding_agent/root.zig");
 const App = @import("App.zig");
 const event_loop = @import("EventLoop.zig");
-const normal_screen_renderer = @import("NormalScreenRenderer.zig");
+const render_request = @import("RenderRequest.zig");
+const screen = @import("Screen.zig");
+const render = @import("render/root.zig");
 const decoder = @import("input/Decoder.zig");
 const line_editor = @import("input/LineEditor.zig");
 const terminal_session = @import("terminal/Session.zig");
@@ -37,7 +39,9 @@ fn run(
 test {
     _ = App;
     _ = event_loop;
-    _ = normal_screen_renderer;
+    _ = render_request;
+    _ = screen;
+    _ = render;
     _ = decoder;
     _ = line_editor;
     _ = terminal_session;

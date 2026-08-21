@@ -9,3 +9,5 @@ node_modules/
 .DS_Store
 .zi/
 .pi/todos/
+.pi/fabric/
+zig-pkg/

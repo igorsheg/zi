@@ -25,8 +25,9 @@ Start an interactive session from a terminal:
 ```
 
 Press Enter to submit. While a turn is running, new submissions queue as
-follow-ups. Press Escape to cancel the active turn, Ctrl-C on an empty prompt to
-exit, or Ctrl-D on an empty idle prompt to exit.
+follow-ups. Cursor movement, deletion, and wrapping treat Unicode grapheme
+clusters as single characters. Press Escape to cancel the active turn, Ctrl-C
+on an empty prompt to exit, or Ctrl-D on an empty idle prompt to exit.
 
 Run one or more prompts in print mode:
 

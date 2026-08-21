@@ -1,4 +1,5 @@
 const std = @import("std");
+const Text = @import("../../terminal_render/root.zig").Text;
 
 const LineEditor = @This();
 
@@ -40,17 +41,11 @@ pub fn insertByte(self: *LineEditor, byte: u8) Error!void {
 }
 
 pub fn moveLeft(self: *LineEditor) void {
-    if (self.cursor == 0) return;
-    self.cursor -= 1;
-    while (self.cursor > 0 and isContinuation(self.bytes.items[self.cursor])) self.cursor -= 1;
+    self.cursor = Text.previousBoundary(self.bytes.items, self.cursor);
 }
 
 pub fn moveRight(self: *LineEditor) void {
-    if (self.cursor >= self.bytes.items.len) return;
-    self.cursor += 1;
-    while (self.cursor < self.bytes.items.len and isContinuation(self.bytes.items[self.cursor])) {
-        self.cursor += 1;
-    }
+    self.cursor = Text.nextBoundary(self.bytes.items, self.cursor);
 }
 
 pub fn moveHome(self: *LineEditor) void {
@@ -64,16 +59,14 @@ pub fn moveEnd(self: *LineEditor) void {
 pub fn deleteBackward(self: *LineEditor) void {
     if (self.cursor == 0) return;
     const end = self.cursor;
-    self.moveLeft();
+    self.cursor = Text.previousBoundary(self.bytes.items, self.cursor);
     self.deleteRange(self.cursor, end);
 }
 
 pub fn deleteForward(self: *LineEditor) void {
     if (self.cursor >= self.bytes.items.len) return;
     const start = self.cursor;
-    self.moveRight();
-    const end = self.cursor;
-    self.cursor = start;
+    const end = Text.nextBoundary(self.bytes.items, self.cursor);
     self.deleteRange(start, end);
 }
 
@@ -94,14 +87,6 @@ pub fn validUtf8(self: *const LineEditor) bool {
     return std.unicode.utf8ValidateSlice(self.bytes.items);
 }
 
-/// Returns the number of Unicode scalars after the cursor. Renderers use this
-/// only for cursor placement; invalid in-progress UTF-8 falls back to bytes.
-pub fn suffixScalarCount(self: *const LineEditor) usize {
-    const suffix = self.bytes.items[self.cursor..];
-    if (!std.unicode.utf8ValidateSlice(suffix)) return suffix.len;
-    return std.unicode.utf8CountCodepoints(suffix) catch suffix.len;
-}
-
 fn deleteRange(self: *LineEditor, start: usize, end: usize) void {
     std.debug.assert(start <= end);
     std.debug.assert(end <= self.bytes.items.len);
@@ -110,23 +95,71 @@ fn deleteRange(self: *LineEditor, start: usize, end: usize) void {
     self.bytes.items.len -= end - start;
 }
 
-fn isContinuation(byte: u8) bool {
-    return byte & 0xc0 == 0x80;
-}
-
-test "line editor inserts and deletes at UTF-8 scalar boundaries" {
+test "line editor moves and deletes combining sequences as graphemes" {
+    const combined = "e\u{301}";
     var editor = LineEditor.init(std.testing.allocator, 32);
     defer editor.deinit();
-    for ("aéz") |byte| try editor.insertByte(byte);
-    try std.testing.expect(editor.validUtf8());
+    try editor.replace("a" ++ combined ++ "z");
+
     editor.moveLeft();
+    try std.testing.expectEqual(@as(usize, 1 + combined.len), editor.cursorByte());
     editor.moveLeft();
     try std.testing.expectEqual(@as(usize, 1), editor.cursorByte());
-    try editor.insertByte('!');
-    try std.testing.expectEqualStrings("a!éz", editor.text());
-    editor.deleteForward();
-    try std.testing.expectEqualStrings("a!z", editor.text());
+    editor.moveRight();
+    try std.testing.expectEqual(@as(usize, 1 + combined.len), editor.cursorByte());
     editor.deleteBackward();
+    try std.testing.expectEqualStrings("az", editor.text());
+
+    try editor.replace("a" ++ combined ++ "z");
+    editor.moveHome();
+    editor.moveRight();
+    editor.deleteForward();
+    try std.testing.expectEqualStrings("az", editor.text());
+}
+
+test "line editor moves and deletes emoji ZWJ families as graphemes" {
+    const family = "👨‍👩‍👧‍👦";
+    var editor = LineEditor.init(std.testing.allocator, 64);
+    defer editor.deinit();
+    try editor.replace("a" ++ family ++ "z");
+
+    editor.moveHome();
+    editor.moveRight();
+    try std.testing.expectEqual(@as(usize, 1), editor.cursorByte());
+    editor.moveRight();
+    try std.testing.expectEqual(@as(usize, 1 + family.len), editor.cursorByte());
+    editor.deleteBackward();
+    try std.testing.expectEqualStrings("az", editor.text());
+}
+
+test "line editor moves and deletes regional-indicator flags as graphemes" {
+    const flag = "🇺🇦";
+    var editor = LineEditor.init(std.testing.allocator, 32);
+    defer editor.deinit();
+    try editor.replace("a" ++ flag ++ "z");
+
+    editor.moveHome();
+    editor.moveRight();
+    editor.deleteForward();
+    try std.testing.expectEqualStrings("az", editor.text());
+}
+
+test "line editor preserves byte editing for partial invalid UTF-8" {
+    var editor = LineEditor.init(std.testing.allocator, 8);
+    defer editor.deinit();
+    for ([_]u8{ 'a', 0xf0, 0x9f, 'z' }) |byte| try editor.insertByte(byte);
+    try std.testing.expect(!editor.validUtf8());
+
+    editor.moveLeft();
+    try std.testing.expectEqual(@as(usize, 3), editor.cursorByte());
+    editor.moveLeft();
+    try std.testing.expectEqual(@as(usize, 2), editor.cursorByte());
+    editor.deleteBackward();
+    try std.testing.expectEqualSlices(u8, &.{ 'a', 0x9f, 'z' }, editor.text());
+
+    editor.moveHome();
+    editor.moveRight();
+    editor.deleteForward();
     try std.testing.expectEqualStrings("az", editor.text());
 }
 
@@ -138,15 +171,4 @@ test "line editor replacement is transactional at its bound" {
     try std.testing.expectEqualStrings("keep", editor.text());
     try std.testing.expectError(error.InputTooLarge, editor.insertByte('!'));
     try std.testing.expectEqualStrings("keep", editor.text());
-}
-
-test "line editor reports suffix scalar count" {
-    var editor = LineEditor.init(std.testing.allocator, 32);
-    defer editor.deinit();
-    try editor.replace("aéz");
-    editor.moveLeft();
-    editor.moveLeft();
-    try std.testing.expectEqual(@as(usize, 2), editor.suffixScalarCount());
-    editor.moveHome();
-    try std.testing.expectEqual(@as(usize, 3), editor.suffixScalarCount());
 }
