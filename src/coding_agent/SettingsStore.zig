@@ -56,7 +56,6 @@ pub const ModelThinkingLevel = struct {
 pub const LoadError = error{
     OutOfMemory,
     Cancelled,
-    UnsafeGlobalSettingsStorage,
 };
 
 pub const MutationError = error{
@@ -160,6 +159,29 @@ const Mutation = struct {
     }
 };
 
+pub fn hasProjectSource(io: std.Io, paths: *const ZiPaths) error{Cancelled}!bool {
+    const directory = std.Io.Dir.openDirAbsolute(io, paths.project, .{
+        .follow_symlinks = false,
+    }) catch |failure| return switch (failure) {
+        error.FileNotFound => false,
+        error.Canceled => error.Cancelled,
+        error.NotDir, error.SymLinkLoop => true,
+        else => true,
+    };
+    defer directory.close(io);
+    const file = directory.openFile(io, settings_file_name, .{
+        .mode = .read_only,
+        .allow_directory = false,
+        .follow_symlinks = false,
+    }) catch |failure| return switch (failure) {
+        error.FileNotFound => false,
+        error.Canceled => error.Cancelled,
+        else => true,
+    };
+    file.close(io);
+    return true;
+}
+
 pub fn load(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -239,27 +261,36 @@ fn loadGlobal(
     diagnostics: *[2]Diagnostic,
     diagnostic_count: *usize,
 ) LoadError!Source {
-    const maybe_source = PrivateFileStore.readFileAlloc(
-        allocator,
-        io,
-        paths.home,
-        paths.global_agent,
-        settings_file_name,
-        max_document_bytes + 1,
-    ) catch |failure| return switch (failure) {
-        error.OutOfMemory => error.OutOfMemory,
-        error.UnsafePath => error.UnsafeGlobalSettingsStorage,
+    var directory = std.Io.Dir.openDirAbsolute(io, paths.global_agent, .{
+        .follow_symlinks = false,
+    }) catch |failure| return switch (failure) {
+        error.Canceled => error.Cancelled,
+        error.FileNotFound => settledSource(diagnostics, diagnostic_count, .global, .missing),
+        error.NotDir, error.SymLinkLoop => settledSource(diagnostics, diagnostic_count, .global, .unsafe),
         else => settledSource(diagnostics, diagnostic_count, .global, .unreadable),
     };
-    const source = maybe_source orelse
-        return settledSource(diagnostics, diagnostic_count, .global, .missing);
-    defer allocator.free(source);
-    if (source.len > max_document_bytes) {
-        return settledSource(diagnostics, diagnostic_count, .global, .too_large);
-    }
-    return parseSource(allocator, json_allocator, source) catch |failure| switch (failure) {
-        error.OutOfMemory => error.OutOfMemory,
-        error.InvalidSource => settledSource(diagnostics, diagnostic_count, .global, .invalid),
+    defer directory.close(io);
+
+    const outcome = try BoundedTextFile.loadOptional(
+        allocator,
+        io,
+        directory,
+        settings_file_name,
+        max_document_bytes,
+    );
+    return switch (outcome) {
+        .missing => settledSource(diagnostics, diagnostic_count, .global, .missing),
+        .too_large => settledSource(diagnostics, diagnostic_count, .global, .too_large),
+        .invalid => settledSource(diagnostics, diagnostic_count, .global, .invalid),
+        .unsafe => settledSource(diagnostics, diagnostic_count, .global, .unsafe),
+        .unreadable => settledSource(diagnostics, diagnostic_count, .global, .unreadable),
+        .loaded => |source| loaded: {
+            defer allocator.free(source);
+            break :loaded parseSource(allocator, json_allocator, source) catch |failure| switch (failure) {
+                error.OutOfMemory => error.OutOfMemory,
+                error.InvalidSource => settledSource(diagnostics, diagnostic_count, .global, .invalid),
+            };
+        },
     };
 }
 
@@ -701,6 +732,26 @@ fn diagnosticFor(snapshot: *const Snapshot, scope: Scope) ?DiagnosticKind {
     return null;
 }
 
+test "project settings source detection treats unsafe roots as present" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try temporary.dir.createDir(std.testing.io, ".zi", .default_dir);
+    var root_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    var paths = try testPaths(&temporary, &root_buffer);
+    defer paths.deinit();
+
+    try std.testing.expect(!try hasProjectSource(std.testing.io, &paths));
+    try temporary.dir.writeFile(std.testing.io, .{
+        .sub_path = ".zi/settings.json",
+        .data = "{}",
+    });
+    try std.testing.expect(try hasProjectSource(std.testing.io, &paths));
+
+    try temporary.dir.deleteTree(std.testing.io, ".zi");
+    try temporary.dir.writeFile(std.testing.io, .{ .sub_path = ".zi", .data = "unsafe" });
+    try std.testing.expect(try hasProjectSource(std.testing.io, &paths));
+}
+
 test "missing settings files contribute bounded diagnostics" {
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();
@@ -980,7 +1031,7 @@ test "global settings mutation distinguishes determinate and indeterminate failu
     try std.testing.expectEqualStrings("published", published.default_model.?);
 }
 
-test "unsafe global settings storage remains an error" {
+test "global settings reads do not require secret-file permissions" {
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();
@@ -988,16 +1039,15 @@ test "unsafe global settings storage remains an error" {
     const file = try temporary.dir.createFile(std.testing.io, ".zi/agent/settings.json", .{
         .permissions = std.Io.File.Permissions.fromMode(0o644),
     });
-    try file.writePositionalAll(std.testing.io, "{}", 0);
+    try file.writePositionalAll(std.testing.io, "{\"defaultProvider\":\"openai\",\"defaultModel\":\"gpt-5.6-sol\"}", 0);
     file.close(std.testing.io);
     var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     var paths = try testPaths(&temporary, &path_buffer);
     defer paths.deinit();
 
-    try std.testing.expectError(
-        error.UnsafeGlobalSettingsStorage,
-        load(std.testing.allocator, std.testing.io, &paths, .untrusted),
-    );
+    var snapshot = try load(std.testing.allocator, std.testing.io, &paths, .untrusted);
+    defer snapshot.deinit();
+    try std.testing.expectEqualStrings("openai", snapshot.default_provider.?);
 }
 
 fn decodeAndDeinit(allocator: std.mem.Allocator) !void {

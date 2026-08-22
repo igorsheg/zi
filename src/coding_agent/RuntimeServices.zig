@@ -4,6 +4,8 @@ const AgentSession = @import("AgentSession.zig");
 const AgentSessionRuntime = @import("AgentSessionRuntime.zig");
 const CredentialManager = @import("CredentialManager.zig");
 const CredentialStore = @import("CredentialStore.zig");
+const ModelBootstrapPolicy = @import("ModelBootstrapPolicy.zig");
+const ModelConfig = @import("ModelConfig.zig");
 const ModelConfigSnapshot = @import("ModelConfigSnapshot.zig");
 const ModelResolution = @import("ModelResolution.zig");
 const ProjectTrust = @import("ProjectTrust.zig");
@@ -12,6 +14,7 @@ const SessionFormat = @import("SessionFormat.zig");
 const SessionJournal = @import("SessionJournal.zig");
 const SessionSelection = @import("SessionSelection.zig");
 const SessionTranscript = @import("SessionTranscript.zig");
+const SettingsStore = @import("SettingsStore.zig");
 const ZiPaths = @import("ZiPaths.zig");
 
 const RuntimeServices = @This();
@@ -195,61 +198,61 @@ fn createOwned(
     defer resources.deinit();
     runtime_options.prompt.policy = resources.policy();
 
+    var settings = SettingsStore.load(
+        allocator,
+        io,
+        selection.pathsView(),
+        resources.projectTrust(),
+    ) catch |failure| return switch (failure) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.Cancelled => error.Cancelled,
+    };
+    defer settings.deinit();
     var snapshot = try ModelConfigSnapshot.load(allocator, io, selection.pathsView());
     errdefer snapshot.deinit();
-    const requested = effectiveRequest(&selection, inputs);
+
+    var planning_credentials = switch (explicitSelection(inputs)) {
+        .complete => CredentialStore.empty(allocator) catch |failure|
+            return mapCredentialStoreFailure(failure),
+        else => CredentialStore.load(allocator, io, selection.pathsView()) catch |failure|
+            return mapCredentialStoreFailure(failure),
+    };
+    defer planning_credentials.deinit();
+    const bootstrap_models = try buildBootstrapModels(
+        snapshot.view(),
+        settings.enabled_models,
+        planning_credentials.entries,
+        inputs.environment,
+    );
+    const bootstrap_plan = ModelBootstrapPolicy.plan(.{
+        .session_state = if (selection.isFresh()) .fresh else .existing,
+        .explicit = explicitSelection(inputs),
+        .fresh_scoped_models = bootstrap_models.scopedItems(),
+        .restored_model = selection.restoredModel(),
+        .effective_settings_default = settingsDefault(&settings),
+        .available_models = bootstrap_models.availableItems(),
+    }) catch |failure| return switch (failure) {
+        error.IncompleteExplicitSelection => error.IncompleteSelection,
+        error.TooManyScopedModels,
+        error.TooManyAvailableModels,
+        error.TooManyCandidates,
+        => error.InvalidModelConfiguration,
+    };
+
     var refresh_http = ai.transport.HttpTransport.init(allocator);
     const refresh_transport = switch (transport) {
         .http => refresh_http.transport(),
         .borrowed => |borrowed| borrowed,
     };
-    var stored_credentials = CredentialManager.loadForRuntime(
+    var resolved = try admitBootstrapPlan(
         allocator,
         io,
         selection.pathsView(),
         refresh_transport,
-        .{
-            .model_config = snapshot.view(),
-            .selection = .{
-                .provider = requested.provider orelse "",
-                .model = requested.model orelse "",
-            },
-            .explicit_api_key = inputs.cli_api_key,
-            .now_ms = inputs.sources.nowMsFn(inputs.sources.clock_context),
-        },
-    ) catch |failure| return switch (failure) {
-        error.OutOfMemory => error.OutOfMemory,
-        error.InvalidCredentialFile => error.InvalidCredentialFile,
-        error.UnsupportedVersion => error.UnsupportedVersion,
-        error.UnsafePath => error.UnsafeCredentialStorage,
-        error.ReadFailed => error.CredentialReadFailed,
-        error.LockFailed => error.CredentialLockFailed,
-        error.WriteFailed => error.CredentialWriteFailed,
-        error.CommitIndeterminate => error.CredentialCommitIndeterminate,
-        error.InvalidModelConfiguration => error.InvalidModelConfiguration,
-        error.AuthenticationUnavailable,
-        error.RefreshUnavailable,
-        => error.CredentialRefreshUnavailable,
-        error.Rejected,
-        error.InvalidResponse,
-        error.Cancelled,
-        error.TimedOut,
-        error.InvalidUrl,
-        error.InvalidRequest,
-        error.ConnectionFailed,
-        error.ResponseTooLarge,
-        error.ConsumerStopped,
-        => error.CredentialRefreshFailed,
-    };
-    defer stored_credentials.deinit();
-    var resolved = try ModelResolution.resolve(allocator, .{
-        .model_config = snapshot.view(),
-        .requested_provider = requested.provider,
-        .requested_model = requested.model,
-        .cli_api_key = inputs.cli_api_key,
-        .stored_credentials = stored_credentials.entries,
-        .environment = inputs.environment,
-    });
+        snapshot.view(),
+        bootstrap_plan,
+        inputs,
+    );
     errdefer resolved.deinit();
 
     const credential_resolver = CredentialManager.PersistentResolver.init(
@@ -314,17 +317,290 @@ fn createOwned(
     return self;
 }
 
-const RequestedModel = struct {
-    provider: ?[]const u8,
-    model: ?[]const u8,
+const BootstrapModels = struct {
+    available: [ModelBootstrapPolicy.max_available_models]ai.ModelIdentity = undefined,
+    available_len: usize = 0,
+    scoped: [ModelBootstrapPolicy.max_scoped_models]ai.ModelIdentity = undefined,
+    scoped_len: usize = 0,
+
+    fn availableItems(self: *const BootstrapModels) []const ai.ModelIdentity {
+        return self.available[0..self.available_len];
+    }
+
+    fn scopedItems(self: *const BootstrapModels) []const ai.ModelIdentity {
+        return self.scoped[0..self.scoped_len];
+    }
+
+    fn appendAvailable(self: *BootstrapModels, identity: ai.ModelIdentity) bool {
+        if (self.available_len == self.available.len) return false;
+        self.available[self.available_len] = identity;
+        self.available_len += 1;
+        return true;
+    }
+
+    fn appendScoped(self: *BootstrapModels, identity: ai.ModelIdentity) Error!void {
+        for (self.scopedItems()) |existing| {
+            if (sameIdentity(existing, identity)) return;
+        }
+        if (self.scoped_len == self.scoped.len) return error.InvalidModelConfiguration;
+        self.scoped[self.scoped_len] = identity;
+        self.scoped_len += 1;
+    }
 };
 
-fn effectiveRequest(selection: *const SessionSelection, inputs: Inputs) RequestedModel {
-    if (inputs.requested_provider != null or inputs.requested_model != null) {
-        return .{ .provider = inputs.requested_provider, .model = inputs.requested_model };
+fn explicitSelection(inputs: Inputs) ModelBootstrapPolicy.ExplicitSelection {
+    if (inputs.requested_provider) |provider| {
+        const model = inputs.requested_model orelse return .provider_only;
+        return .{ .complete = .{ .provider = provider, .model = model } };
     }
-    const restored = selection.restoredModel() orelse return .{ .provider = null, .model = null };
-    return .{ .provider = restored.provider, .model = restored.model };
+    return if (inputs.requested_model != null) .model_only else .absent;
+}
+
+fn settingsDefault(settings: *const SettingsStore.Snapshot) ?ai.ModelIdentity {
+    const provider = settings.default_provider orelse return null;
+    const model = settings.default_model orelse return null;
+    return .{ .provider = provider, .model = model };
+}
+
+fn buildBootstrapModels(
+    model_config: ModelConfig,
+    enabled_models: ?[]const []const u8,
+    stored_credentials: []const ai.credential.Entry,
+    environment: ai.auth.Environment,
+) Error!BootstrapModels {
+    var result: BootstrapModels = .{};
+    for (model_config.catalog.entries) |entry| {
+        _ = ai.Models.resolveAuth(
+            model_config.catalog,
+            model_config.providers,
+            entry.identity,
+            .{
+                .stored = stored_credentials,
+                .environment = environment,
+            },
+        ) catch continue;
+        if (!result.appendAvailable(entry.identity)) break;
+    }
+
+    const patterns = enabled_models orelse return result;
+    for (patterns) |pattern| {
+        if (std.mem.findScalar(u8, pattern, '*') == null) {
+            const slash = std.mem.findScalar(u8, pattern, '/') orelse continue;
+            if (slash == 0 or slash + 1 == pattern.len) continue;
+            const resolved = model_config.resolve(.{
+                .provider = pattern[0..slash],
+                .model = pattern[slash + 1 ..],
+            }) orelse continue;
+            if (containsIdentity(result.availableItems(), resolved.entry.identity)) {
+                try result.appendScoped(resolved.entry.identity);
+            }
+            continue;
+        }
+
+        // Zi admits '*' over canonical provider/model text. Other minimatch
+        // syntax is literal until the catalog needs a wider matching contract.
+        for (result.availableItems()) |identity| {
+            if (wildcardMatchesIdentity(pattern, identity)) try result.appendScoped(identity);
+        }
+    }
+    return result;
+}
+
+fn wildcardMatchesIdentity(pattern: []const u8, identity: ai.ModelIdentity) bool {
+    const text_len = identity.provider.len + 1 + identity.model.len;
+    var pattern_index: usize = 0;
+    var text_index: usize = 0;
+    var star_index: ?usize = null;
+    var star_text_index: usize = 0;
+
+    while (text_index < text_len) {
+        if (pattern_index < pattern.len and pattern[pattern_index] == '*') {
+            star_index = pattern_index;
+            pattern_index += 1;
+            star_text_index = text_index;
+        } else if (pattern_index < pattern.len and
+            pattern[pattern_index] == identityByte(identity, text_index))
+        {
+            pattern_index += 1;
+            text_index += 1;
+        } else if (star_index) |star| {
+            pattern_index = star + 1;
+            star_text_index += 1;
+            text_index = star_text_index;
+        } else {
+            return false;
+        }
+    }
+    while (pattern_index < pattern.len and pattern[pattern_index] == '*') pattern_index += 1;
+    return pattern_index == pattern.len;
+}
+
+fn identityByte(identity: ai.ModelIdentity, index: usize) u8 {
+    if (index < identity.provider.len) return identity.provider[index];
+    if (index == identity.provider.len) return '/';
+    return identity.model[index - identity.provider.len - 1];
+}
+
+fn containsIdentity(identities: []const ai.ModelIdentity, wanted: ai.ModelIdentity) bool {
+    for (identities) |identity| {
+        if (sameIdentity(identity, wanted)) return true;
+    }
+    return false;
+}
+
+fn sameIdentity(left: ai.ModelIdentity, right: ai.ModelIdentity) bool {
+    return std.mem.eql(u8, left.provider, right.provider) and
+        std.mem.eql(u8, left.model, right.model);
+}
+
+fn admitBootstrapPlan(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    zi_paths: *const ZiPaths,
+    transport: ai.transport.Transport,
+    model_config: ModelConfig,
+    plan: ModelBootstrapPolicy.Plan,
+    inputs: Inputs,
+) Error!ModelResolution.Resolved {
+    var index: usize = 0;
+    while (index < plan.items().len) {
+        const candidate = plan.items()[index];
+        const terminal = candidate.provenance == .explicit_cli;
+        const admission = try admitCandidate(
+            allocator,
+            io,
+            zi_paths,
+            transport,
+            model_config,
+            candidate.identity,
+            inputs,
+            terminal,
+        );
+        switch (admission) {
+            .admitted => |resolved| return resolved,
+            .unavailable => {},
+        }
+        index = plan.nextAfterAdmissionFailure(index) orelse return error.SelectionRequired;
+    }
+    return error.SelectionRequired;
+}
+
+const CandidateAdmission = union(enum) {
+    admitted: ModelResolution.Resolved,
+    unavailable,
+};
+
+fn admitCandidate(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    zi_paths: *const ZiPaths,
+    transport: ai.transport.Transport,
+    model_config: ModelConfig,
+    identity: ai.ModelIdentity,
+    inputs: Inputs,
+    terminal: bool,
+) Error!CandidateAdmission {
+    var stored_credentials = CredentialManager.loadForRuntime(
+        allocator,
+        io,
+        zi_paths,
+        transport,
+        .{
+            .model_config = model_config,
+            .selection = identity,
+            .explicit_api_key = inputs.cli_api_key,
+            .now_ms = inputs.sources.nowMsFn(inputs.sources.clock_context),
+        },
+    ) catch |failure| {
+        if (!terminal and credentialFailureAllowsFallback(failure)) return .unavailable;
+        return mapCredentialRuntimeFailure(failure);
+    };
+    defer stored_credentials.deinit();
+
+    const resolved = ModelResolution.resolve(allocator, .{
+        .model_config = model_config,
+        .requested_provider = identity.provider,
+        .requested_model = identity.model,
+        .cli_api_key = inputs.cli_api_key,
+        .stored_credentials = stored_credentials.entries,
+        .environment = inputs.environment,
+    }) catch |failure| {
+        if (!terminal and resolutionFailureAllowsFallback(failure)) return .unavailable;
+        return failure;
+    };
+    return .{ .admitted = resolved };
+}
+
+fn credentialFailureAllowsFallback(failure: CredentialManager.Error) bool {
+    return switch (failure) {
+        error.InvalidModelConfiguration,
+        error.AuthenticationUnavailable,
+        error.RefreshUnavailable,
+        error.TimedOut,
+        error.InvalidUrl,
+        error.InvalidRequest,
+        error.ConnectionFailed,
+        error.InvalidResponse,
+        error.ResponseTooLarge,
+        error.ConsumerStopped,
+        error.Rejected,
+        => true,
+        else => false,
+    };
+}
+
+fn resolutionFailureAllowsFallback(failure: ModelResolution.Error) bool {
+    return switch (failure) {
+        error.SelectionRequired,
+        error.IncompleteSelection,
+        error.UnknownSelection,
+        error.MissingCredential,
+        error.InvalidCredential,
+        error.DuplicateCredential,
+        error.UnsupportedCliCredential,
+        => true,
+        else => false,
+    };
+}
+
+fn mapCredentialStoreFailure(failure: CredentialStore.Error) Error {
+    return switch (failure) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.InvalidCredentialFile => error.InvalidCredentialFile,
+        error.UnsupportedVersion => error.UnsupportedVersion,
+        error.UnsafePath => error.UnsafeCredentialStorage,
+        error.ReadFailed => error.CredentialReadFailed,
+        error.LockFailed => error.CredentialLockFailed,
+        error.WriteFailed => error.CredentialWriteFailed,
+        error.CommitIndeterminate => error.CredentialCommitIndeterminate,
+    };
+}
+
+fn mapCredentialRuntimeFailure(failure: CredentialManager.Error) Error {
+    return switch (failure) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.InvalidCredentialFile => error.InvalidCredentialFile,
+        error.UnsupportedVersion => error.UnsupportedVersion,
+        error.UnsafePath => error.UnsafeCredentialStorage,
+        error.ReadFailed => error.CredentialReadFailed,
+        error.LockFailed => error.CredentialLockFailed,
+        error.WriteFailed => error.CredentialWriteFailed,
+        error.CommitIndeterminate => error.CredentialCommitIndeterminate,
+        error.InvalidModelConfiguration => error.InvalidModelConfiguration,
+        error.AuthenticationUnavailable,
+        error.RefreshUnavailable,
+        => error.CredentialRefreshUnavailable,
+        error.Cancelled => error.Cancelled,
+        error.Rejected,
+        error.InvalidResponse,
+        error.TimedOut,
+        error.InvalidUrl,
+        error.InvalidRequest,
+        error.ConnectionFailed,
+        error.ResponseTooLarge,
+        error.ConsumerStopped,
+        => error.CredentialRefreshFailed,
+    };
 }
 
 const ProjectTrustStore = @import("ProjectTrustStore.zig");
@@ -1178,9 +1454,15 @@ test "runtime services restore the journal model unless an explicit override com
     try std.testing.expectEqualStrings("model-b", entries[1].model_change.selection.model);
 }
 
-test "runtime services reject unavailable restored models and credentials without rewriting" {
+test "runtime services fall back from an invalid restored model and append one model change" {
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();
+    try temporary.dir.createDirPath(std.testing.io, ".zi");
+    try temporary.dir.createDir(
+        std.testing.io,
+        ".zi/agent",
+        std.Io.File.Permissions.fromMode(0o700),
+    );
     try writeCustomModels(&temporary);
     var root_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const root = try temporaryPath(&temporary, &root_buffer);
@@ -1199,7 +1481,7 @@ test "runtime services reject unavailable restored models and credentials withou
     defer std.testing.allocator.free(journal_path);
     created.deinit();
 
-    try std.testing.expectError(error.MissingCredential, createWithTransport(
+    try std.testing.expectError(error.SelectionRequired, createWithTransport(
         std.testing.allocator,
         std.testing.io,
         .{
@@ -1210,24 +1492,290 @@ test "runtime services reject unavailable restored models and credentials withou
         },
         fake.transport(),
     ));
-    try temporary.dir.deleteFile(std.testing.io, ".zi/agent/models.json");
+    var unchanged = try openJournal(std.testing.allocator, journal_path);
+    try std.testing.expectEqual(@as(usize, 1), unchanged.restore_candidate.entries.len);
+    unchanged.deinit();
 
-    try std.testing.expectError(error.UnknownSelection, createWithTransport(
-        std.testing.allocator,
-        std.testing.io,
-        .{
-            .startup_cwd = root,
-            .home = root,
-            .session = .{ .open = journal_path },
-            .sources = sources.view(),
-            .cli_api_key = "custom-secret",
-        },
-        fake.transport(),
-    ));
+    try temporary.dir.deleteFile(std.testing.io, ".zi/agent/models.json");
+    var credential_paths = try ZiPaths.init(std.testing.allocator, root, root);
+    defer credential_paths.deinit();
+    try CredentialStore.put(std.testing.allocator, std.testing.io, &credential_paths, .{
+        .provider_id = "openai",
+        .credential = .{ .api_key = .{ .key = "stored-openai" } },
+    });
+    var resumed = try createWithTransport(std.testing.allocator, std.testing.io, .{
+        .startup_cwd = root,
+        .home = root,
+        .session = .{ .open = journal_path },
+        .sources = sources.view(),
+    }, fake.transport());
+    resumed.deinit();
+
     var opened = try openJournal(std.testing.allocator, journal_path);
     defer opened.deinit();
-    try std.testing.expectEqual(@as(usize, 1), opened.restore_candidate.entries.len);
-    try std.testing.expectEqualStrings("model-a", opened.restore_candidate.active_model.?.model);
+    try std.testing.expectEqual(@as(usize, 2), opened.restore_candidate.entries.len);
+    try std.testing.expectEqualStrings("model-a", opened.restore_candidate.entries[0].model_change.selection.model);
+    try std.testing.expectEqualStrings("openai", opened.restore_candidate.entries[1].model_change.selection.provider);
+    try std.testing.expectEqualStrings("gpt-5.6-sol", opened.restore_candidate.active_model.?.model);
+}
+
+test "enabled model scope admits exact aliases and star wildcards in settings order" {
+    const stored = [_]ai.credential.Entry{
+        .{
+            .provider_id = "openai",
+            .credential = .{ .api_key = .{ .key = "openai-key" } },
+        },
+        .{
+            .provider_id = "openai-codex",
+            .credential = .{ .oauth = .{
+                .access = "codex-access",
+                .refresh = "codex-refresh",
+                .expires_at_ms = 1,
+            } },
+        },
+    };
+    const patterns = [_][]const u8{
+        "openai-codex/gpt-5.4*",
+        "openai/gpt-5.6",
+        "openai-codex/gpt-5.4",
+        "openai-codex/gpt-5.?",
+    };
+    const models = try buildBootstrapModels(
+        ModelConfig.builtin,
+        &patterns,
+        &stored,
+        .{},
+    );
+
+    try std.testing.expectEqual(@as(usize, 3), models.scopedItems().len);
+    try std.testing.expectEqualStrings("gpt-5.4", models.scopedItems()[0].model);
+    try std.testing.expectEqualStrings("gpt-5.4-mini", models.scopedItems()[1].model);
+    try std.testing.expectEqualStrings("gpt-5.6-sol", models.scopedItems()[2].model);
+}
+
+test "runtime services use trusted project enabled scope then settings default without prompt files" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try temporary.dir.createDirPath(std.testing.io, ".zi");
+    try temporary.dir.createDir(
+        std.testing.io,
+        ".zi/agent",
+        std.Io.File.Permissions.fromMode(0o700),
+    );
+    try writeCustomModels(&temporary);
+    var root_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root = try temporaryPath(&temporary, &root_buffer);
+    var zi_paths = try ZiPaths.init(std.testing.allocator, root, root);
+    defer zi_paths.deinit();
+    try CredentialStore.put(std.testing.allocator, std.testing.io, &zi_paths, .{
+        .provider_id = "custom-openai",
+        .credential = .{ .api_key = .{ .key = "custom-key" } },
+    });
+    try temporary.dir.writeFile(std.testing.io, .{
+        .sub_path = ".zi/settings.json",
+        .data =
+        // ziglint-ignore: Z024 -- compact settings fixture
+        "{\"defaultProvider\":\"custom-openai\",\"defaultModel\":\"model-b\",\"enabledModels\":[\"custom-openai/model-a\"]}",
+    });
+    var identity = try ProjectTrustStore.Identity.init(std.testing.allocator, std.testing.io, root);
+    defer identity.deinit();
+    try ProjectTrustStore.put(
+        std.testing.allocator,
+        std.testing.io,
+        &zi_paths,
+        &identity,
+        .trusted,
+    );
+    var sources: TestSources = .{};
+    var fake = fake_api.FakeTransport.init(&.{});
+
+    var scoped = try createWithTransport(std.testing.allocator, std.testing.io, .{
+        .startup_cwd = root,
+        .home = root,
+        .session = .new,
+        .sources = sources.view(),
+    }, fake.transport());
+    try std.testing.expectEqualStrings("model-a", scoped.resolved.selection.model);
+    scoped.deinit();
+
+    try temporary.dir.writeFile(std.testing.io, .{
+        .sub_path = ".zi/settings.json",
+        .data = "{\"defaultProvider\":\"custom-openai\",\"defaultModel\":\"model-b\"}",
+    });
+    var configured_default = try createWithTransport(std.testing.allocator, std.testing.io, .{
+        .startup_cwd = root,
+        .home = root,
+        .session = .new,
+        .sources = sources.view(),
+    }, fake.transport());
+    try std.testing.expectEqualStrings("model-b", configured_default.resolved.selection.model);
+    configured_default.deinit();
+
+    var rejected = try createWithTransport(std.testing.allocator, std.testing.io, .{
+        .startup_cwd = root,
+        .home = root,
+        .session = .new,
+        .sources = sources.view(),
+        .project_trust = .reject,
+    }, fake.transport());
+    defer rejected.deinit();
+    try std.testing.expectEqualStrings("model-a", rejected.resolved.selection.model);
+}
+
+test "runtime services keep complete explicit failures terminal and reject partial selection" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try temporary.dir.createDirPath(std.testing.io, ".zi");
+    try temporary.dir.createDir(
+        std.testing.io,
+        ".zi/agent",
+        std.Io.File.Permissions.fromMode(0o700),
+    );
+    try writeCustomModels(&temporary);
+    var root_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root = try temporaryPath(&temporary, &root_buffer);
+    var zi_paths = try ZiPaths.init(std.testing.allocator, root, root);
+    defer zi_paths.deinit();
+    try CredentialStore.put(std.testing.allocator, std.testing.io, &zi_paths, .{
+        .provider_id = "openai",
+        .credential = .{ .api_key = .{ .key = "openai-key" } },
+    });
+    var sources: TestSources = .{};
+    var fake = fake_api.FakeTransport.init(&.{});
+    const base: Inputs = .{
+        .startup_cwd = root,
+        .home = root,
+        .session = .new,
+        .sources = sources.view(),
+    };
+
+    var partial = base;
+    partial.requested_provider = "openai";
+    try std.testing.expectError(
+        error.IncompleteSelection,
+        createWithTransport(std.testing.allocator, std.testing.io, partial, fake.transport()),
+    );
+
+    var unknown = base;
+    unknown.requested_provider = "openai";
+    unknown.requested_model = "unknown";
+    try std.testing.expectError(
+        error.UnknownSelection,
+        createWithTransport(std.testing.allocator, std.testing.io, unknown, fake.transport()),
+    );
+
+    var missing_credential = base;
+    missing_credential.requested_provider = "custom-openai";
+    missing_credential.requested_model = "model-b";
+    try std.testing.expectError(
+        error.MissingCredential,
+        createWithTransport(
+            std.testing.allocator,
+            std.testing.io,
+            missing_credential,
+            fake.transport(),
+        ),
+    );
+}
+
+test "complete explicit API key selection does not read auth storage" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try temporary.dir.createDirPath(std.testing.io, ".zi");
+    try temporary.dir.createDir(
+        std.testing.io,
+        ".zi/agent",
+        std.Io.File.Permissions.fromMode(0o700),
+    );
+    const auth_file = try temporary.dir.createFile(std.testing.io, ".zi/agent/auth.json", .{
+        .permissions = std.Io.File.Permissions.fromMode(0o600),
+    });
+    try auth_file.writePositionalAll(std.testing.io, "invalid", 0);
+    auth_file.close(std.testing.io);
+    var root_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root = try temporaryPath(&temporary, &root_buffer);
+    var sources: TestSources = .{};
+    var fake = fake_api.FakeTransport.init(&.{});
+
+    var services = try createWithTransport(std.testing.allocator, std.testing.io, .{
+        .startup_cwd = root,
+        .home = root,
+        .session = .new,
+        .sources = sources.view(),
+        .requested_provider = "openai",
+        .requested_model = "gpt-5.6-sol",
+        .cli_api_key = "explicit-key",
+    }, fake.transport());
+    defer services.deinit();
+    try std.testing.expectEqualStrings("openai", services.resolved.selection.provider);
+}
+
+test "runtime services return SelectionRequired when no authenticated model exists" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var root_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root = try temporaryPath(&temporary, &root_buffer);
+    var sources: TestSources = .{};
+    var fake = fake_api.FakeTransport.init(&.{});
+
+    try std.testing.expectError(error.SelectionRequired, createWithTransport(
+        std.testing.allocator,
+        std.testing.io,
+        .{
+            .startup_cwd = root,
+            .home = root,
+            .session = .new,
+            .sources = sources.view(),
+        },
+        fake.transport(),
+    ));
+}
+
+test "failed OAuth refresh falls through to the next authenticated bootstrap candidate" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var root_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root = try temporaryPath(&temporary, &root_buffer);
+    var zi_paths = try ZiPaths.init(std.testing.allocator, root, root);
+    defer zi_paths.deinit();
+    try CredentialStore.put(std.testing.allocator, std.testing.io, &zi_paths, .{
+        .provider_id = "openai-codex",
+        .credential = .{ .oauth = .{
+            .access = "expired-access",
+            .refresh = "expired-refresh",
+            .expires_at_ms = 1,
+            .account_id = "expired-account",
+        } },
+    });
+    try temporary.dir.writeFile(std.testing.io, .{
+        .sub_path = ".zi/settings.json",
+        .data = "{\"enabledModels\":[\"openai-codex/gpt-5.6-terra\"]}",
+    });
+    const exchanges = [_]fake_api.Exchange{.{ .response = .{
+        .status = 400,
+        .body = "{\"error\":\"invalid_grant\"}",
+    } }};
+    var fake = fake_api.FakeTransport.init(&exchanges);
+    var sources: TestSources = .{};
+    var services = try createWithTransport(std.testing.allocator, std.testing.io, .{
+        .startup_cwd = root,
+        .home = root,
+        .session = .new,
+        .sources = sources.view(),
+        .project_trust = .approve,
+        .environment = .{ .entries = &.{.{
+            .name = "OPENAI_API_KEY",
+            .value = "environment-openai",
+        }} },
+    }, fake.transport());
+    defer services.deinit();
+
+    try std.testing.expectEqualStrings("openai", services.resolved.selection.provider);
+    try std.testing.expectEqualStrings("gpt-5.6-sol", services.resolved.selection.model);
+    try std.testing.expectEqual(@as(usize, 1), fake.next_index);
+    var stored = try CredentialStore.load(std.testing.allocator, std.testing.io, &zi_paths);
+    defer stored.deinit();
+    try std.testing.expectEqualStrings("expired-refresh", stored.entries[0].credential.oauth.refresh);
 }
 
 const AllocationContext = struct {

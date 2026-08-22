@@ -96,6 +96,10 @@ pub fn restoredModel(self: *const SessionSelection) ?ai.ModelIdentity {
     return self.restoredView().active_model;
 }
 
+pub fn isFresh(self: *const SessionSelection) bool {
+    return self.origin == .new;
+}
+
 pub fn takeJournal(self: *SessionSelection) journal_api.Opened {
     return switch (self.journal) {
         .admitted => |opened| result: {

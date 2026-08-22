@@ -4,6 +4,7 @@ const ProjectTrust = @import("ProjectTrust.zig");
 const ProjectTrustStore = @import("ProjectTrustStore.zig");
 const PromptFiles = @import("PromptFiles.zig");
 const SystemPrompt = @import("SystemPrompt.zig");
+const SettingsStore = @import("SettingsStore.zig");
 const ZiPaths = @import("ZiPaths.zig");
 
 const RuntimeResources = @This();
@@ -37,6 +38,7 @@ allocator: std.mem.Allocator,
 arena: std.heap.ArenaAllocator,
 prompt_files: ?PromptFiles = null,
 context_files: ?ContextFiles = null,
+project_trust: ProjectTrust.Decision,
 effective_policy: SystemPrompt.Policy,
 
 pub fn resolve(
@@ -46,22 +48,23 @@ pub fn resolve(
     intent: ProjectTrust.Intent,
     requested_policy: SystemPrompt.Policy,
 ) Error!RuntimeResources {
+    const requested_prompt_files = requestedPromptFiles(requested_policy);
+    const project_trust = try resolveProjectTrust(
+        allocator,
+        io,
+        paths,
+        requested_prompt_files,
+        intent,
+    );
     var resources: RuntimeResources = .{
         .allocator = allocator,
         .arena = .init(allocator),
+        .project_trust = project_trust,
         .effective_policy = requested_policy,
     };
     errdefer resources.deinit();
 
-    const requested_prompt_files = requestedPromptFiles(requested_policy);
     if (requested_prompt_files.system or requested_prompt_files.append) {
-        const project_trust = try resolveProjectTrust(
-            allocator,
-            io,
-            paths,
-            requested_prompt_files,
-            intent,
-        );
         resources.prompt_files = try PromptFiles.load(
             allocator,
             io,
@@ -91,6 +94,10 @@ pub fn policy(self: *const RuntimeResources) SystemPrompt.Policy {
     return self.effective_policy;
 }
 
+pub fn projectTrust(self: *const RuntimeResources) ProjectTrust.Decision {
+    return self.project_trust;
+}
+
 pub fn deinit(self: *RuntimeResources) void {
     if (self.context_files) |*files| files.deinit();
     if (self.prompt_files) |*files| files.deinit();
@@ -106,7 +113,9 @@ fn resolveProjectTrust(
     intent: ProjectTrust.Intent,
 ) Error!ProjectTrust.Decision {
     if (intent != .automatic) return ProjectTrust.resolve(intent, null);
-    if (!try PromptFiles.hasProjectSources(io, paths, requested)) {
+    const has_prompt_source = try PromptFiles.hasProjectSources(io, paths, requested);
+    const has_settings_source = try SettingsStore.hasProjectSource(io, paths);
+    if (!has_prompt_source and !has_settings_source) {
         return ProjectTrust.resolve(.automatic, null);
     }
     var identity = try ProjectTrustStore.Identity.init(allocator, io, paths.cwd);
