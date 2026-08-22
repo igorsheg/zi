@@ -2,6 +2,8 @@ const std = @import("std");
 const ai = @import("../ai/root.zig");
 const interactive = @import("../coding_agent/root.zig").interactive;
 const RenderRequest = @import("RenderRequest.zig");
+const SafeText = @import("SafeText.zig");
+const TranscriptPresenter = @import("TranscriptPresenter.zig");
 const terminal_render = @import("../terminal_render/root.zig");
 const render = @import("render/root.zig");
 const TerminalSession = @import("terminal/Session.zig");
@@ -25,15 +27,9 @@ pub const FrameView = struct {
     queued_count: usize,
 };
 
-const StreamLine = enum {
-    closed,
-    assistant,
-    thinking,
-};
-
 const StagingCheckpoint = struct {
     byte_len: usize,
-    stream_line: StreamLine,
+    presenter: TranscriptPresenter,
 };
 
 output: *std.Io.Writer,
@@ -41,7 +37,7 @@ staged: std.Io.Writer.Allocating,
 requests: RenderRequest.State = .{},
 terminal_renderer: render.TerminalRenderer,
 max_staged_bytes: usize,
-stream_line: StreamLine = .closed,
+presenter: TranscriptPresenter = .{},
 size: ?TerminalSession.Size = null,
 
 pub fn init(
@@ -122,7 +118,6 @@ pub fn commit(self: *Screen, view: FrameView) !void {
 
     const checkpoint = self.stagingCheckpoint();
     errdefer self.restoreStaging(checkpoint);
-    try self.finishAssistant();
     try self.ensureStagedBound();
     var surface = try self.buildFrame(view);
     defer surface.deinit();
@@ -144,13 +139,13 @@ pub fn finish(self: *Screen, view: FrameView) !void {
 fn stagingCheckpoint(self: *Screen) StagingCheckpoint {
     return .{
         .byte_len = self.staged.written().len,
-        .stream_line = self.stream_line,
+        .presenter = self.presenter,
     };
 }
 
 fn restoreStaging(self: *Screen, checkpoint: StagingCheckpoint) void {
     self.staged.shrinkRetainingCapacity(checkpoint.byte_len);
-    self.stream_line = checkpoint.stream_line;
+    self.presenter = checkpoint.presenter;
 }
 
 fn ensureStagedBound(self: *Screen) !void {
@@ -158,11 +153,7 @@ fn ensureStagedBound(self: *Screen) !void {
 }
 
 fn renderWelcome(self: *Screen) !void {
-    try self.staged.writer.writeAll(
-        "Zi\n" ++
-            "  Enter submits. Enter while busy queues the next prompt.\n" ++
-            "  Escape cancels. Ctrl-D exits when idle.\n\n",
-    );
+    try self.presenter.renderWelcome(&self.staged);
 }
 
 fn renderTranscript(
@@ -174,12 +165,17 @@ fn renderTranscript(
         .user => |user| try self.renderUser(user.parts),
         .assistant => |response| try self.renderResponse(response),
         .tool_results => |results| for (results.results) |result| try self.renderToolResult(result),
-        .failure => |failure| try self.staged.writer.print(
-            "[turn failed: {s}]\n",
-            .{@tagName(failure.category)},
-        ),
-        .cancelled => try self.staged.writer.writeAll("[turn cancelled]\n"),
-        .interrupted => try self.staged.writer.writeAll("[turn interrupted]\n"),
+        .failure => |failure| {
+            var label_buffer: [128]u8 = undefined;
+            const label = try std.fmt.bufPrint(
+                &label_buffer,
+                "turn failed: {s}",
+                .{@tagName(failure.category)},
+            );
+            try self.renderNotice(label);
+        },
+        .cancelled => try self.renderNotice("turn cancelled"),
+        .interrupted => try self.renderNotice("turn interrupted"),
     };
 }
 
@@ -191,68 +187,72 @@ fn renderEvent(self: *Screen, event: interactive.Event) !void {
                 .user => |user| try self.renderUser(&.{user}),
                 .tool_result, .retry_prompt => {},
             },
-            .response => {},
+            .response => try self.presenter.startResponse(),
         },
         .message_update => |update| switch (update.update) {
-            .part_start => |started_part| switch (started_part.part) {
-                .thinking => try self.beginThinking(),
-                .text, .tool_call => {},
-            },
-            .part_delta => |delta| switch (delta.delta) {
-                .text => |text| {
-                    try self.beginAssistant();
-                    try writeSafeText(&self.staged.writer, text, true);
-                },
-                .thinking => |thinking| {
-                    try self.beginThinking();
-                    try writeSafeText(&self.staged.writer, thinking, true);
-                },
-                .tool_call => {},
-            },
-            .part_end, .usage => {},
+            .part_end => |ended| try self.presenter.renderPartEnd(
+                &self.staged,
+                ended,
+                self.max_staged_bytes,
+            ),
+            .part_start, .part_delta, .usage => {},
         },
         .message_end => |ended| switch (ended.message) {
             .published => |message| switch (message) {
                 .request => {},
-                .response => try self.finishAssistant(),
+                .response => |response| try self.presenter.finishResponse(
+                    &self.staged,
+                    response,
+                    self.max_staged_bytes,
+                ),
             },
             .discarded_response => |discarded| {
-                try self.finishAssistant();
-                try self.staged.writer.print("[response discarded: {s}]\n", .{@tagName(discarded.outcome)});
+                try self.presenter.finishDiscardedResponse(
+                    &self.staged,
+                    discarded.response,
+                    self.max_staged_bytes,
+                );
+                var label_buffer: [128]u8 = undefined;
+                const label = try std.fmt.bufPrint(
+                    &label_buffer,
+                    "response discarded: {s}",
+                    .{@tagName(discarded.outcome)},
+                );
+                try self.renderNotice(label);
             },
         },
-        .tool_execution_start => |started| {
-            try self.finishAssistant();
-            try self.staged.writer.writeAll("[tool ");
-            try writeSafeText(&self.staged.writer, started.name, false);
-            try self.staged.writer.writeAll("] ");
-            try writeSafeText(&self.staged.writer, started.arguments_json, false);
-            try self.staged.writer.writeByte('\n');
-        },
-        .tool_execution_end => |ended| switch (ended.result) {
-            .published => |result| try self.renderToolResult(result),
-            .discarded => |outcome| try self.staged.writer.print(
-                "[tool result discarded: {s}]\n",
-                .{@tagName(outcome)},
-            ),
-        },
+        .tool_execution_start => |started| try self.presenter.startTool(
+            started.call_id,
+            started.name,
+        ),
+        .tool_execution_end => |ended| try self.presenter.finishTool(
+            &self.staged,
+            ended.call_id,
+            ended.name,
+            ended.result,
+        ),
         .agent_end => |ended| switch (ended.outcome) {
             .completed => {},
-            .cancelled => try self.staged.writer.writeAll("[turn cancelled]\n"),
-            .interrupted => try self.staged.writer.writeAll("[turn interrupted]\n"),
-            .failed => |failure| try self.staged.writer.print("[turn failed: {s}]\n", .{@tagName(failure)}),
+            .cancelled => try self.renderNotice("turn cancelled"),
+            .interrupted => try self.renderNotice("turn interrupted"),
+            .failed => |failure| {
+                var label_buffer: [128]u8 = undefined;
+                const label = try std.fmt.bufPrint(
+                    &label_buffer,
+                    "turn failed: {s}",
+                    .{@tagName(failure)},
+                );
+                try self.renderNotice(label);
+            },
         },
         .agent_settled => |settled| if (settled.availability == .poisoned) {
-            try self.staged.writer.writeAll("[session unavailable, reopen the durable session]\n");
+            try self.renderNotice("session unavailable, reopen the durable session");
         },
     }
 }
 
 fn renderNotice(self: *Screen, label: []const u8) !void {
-    try self.finishAssistant();
-    try self.staged.writer.writeByte('[');
-    try writeSafeText(&self.staged.writer, label, false);
-    try self.staged.writer.writeAll("]\n");
+    try self.presenter.renderNotice(&self.staged, label);
 }
 
 fn buildFrame(self: *Screen, view: FrameView) !terminal_render.Surface {
@@ -276,9 +276,14 @@ fn buildFrame(self: *Screen, view: FrameView) !terminal_render.Surface {
     errdefer surface.deinit();
 
     if (layout.status) |status| {
+        var status_buffer: [128]u8 = undefined;
         const label = switch (view.phase) {
             .idle => "Ready",
-            .awaiting_start, .running => "Working",
+            .awaiting_start => "Working",
+            .running => if (self.presenter.activeToolLabel()) |tool_name|
+                try std.fmt.bufPrint(&status_buffer, "Working · {s}", .{tool_name})
+            else
+                "Working",
             .cancel_pending, .cancelling => "Cancelling",
             .dispatching_follow_up => "Starting queued prompt",
             .poisoned => "Session unavailable",
@@ -324,126 +329,25 @@ fn buildFrame(self: *Screen, view: FrameView) !terminal_render.Surface {
     return surface;
 }
 
-fn beginAssistant(self: *Screen) !void {
-    switch (self.stream_line) {
-        .closed, .assistant => {},
-        .thinking => try self.staged.writer.writeByte('\n'),
-    }
-    self.stream_line = .assistant;
-}
-
-fn beginThinking(self: *Screen) !void {
-    switch (self.stream_line) {
-        .thinking => return,
-        .closed => {},
-        .assistant => try self.staged.writer.writeByte('\n'),
-    }
-    try self.staged.writer.writeAll("[thinking] ");
-    self.stream_line = .thinking;
-}
-
-fn finishAssistant(self: *Screen) !void {
-    if (self.stream_line == .closed) return;
-    try self.staged.writer.writeByte('\n');
-    self.stream_line = .closed;
-}
-
 fn renderModel(self: *Screen, identity: ai.message.ModelIdentity) !void {
-    try self.staged.writer.writeAll("[model ");
-    try writeSafeText(&self.staged.writer, identity.provider, false);
-    try self.staged.writer.writeByte('/');
-    try writeSafeText(&self.staged.writer, identity.model, false);
-    try self.staged.writer.writeAll("]\n");
+    try self.presenter.renderModel(&self.staged, identity);
 }
 
 fn renderUser(self: *Screen, parts: []const ai.message.UserContent) !void {
-    try self.finishAssistant();
-    try self.staged.writer.writeAll("❯ ");
-    for (parts, 0..) |part, index| {
-        if (index != 0) try self.staged.writer.writeByte(' ');
-        switch (part) {
-            .text => |text| try writeSafeText(&self.staged.writer, text, true),
-            .image => |image| {
-                try self.staged.writer.writeAll("[image ");
-                try writeSafeText(&self.staged.writer, image.media_type, false);
-                try self.staged.writer.writeByte(']');
-            },
-        }
-    }
-    try self.staged.writer.writeByte('\n');
+    const columns = if (self.size) |size| size.columns else 80;
+    try self.presenter.renderUser(self.staged.allocator, &self.staged, parts, columns);
 }
 
 fn renderResponse(self: *Screen, response: ai.message.ResponseMessage) !void {
-    try self.finishAssistant();
-    for (response.parts) |part| switch (part) {
-        .text => |text| {
-            try writeSafeText(&self.staged.writer, text.text, true);
-            try self.staged.writer.writeByte('\n');
-        },
-        .thinking => |thinking| {
-            try self.staged.writer.writeAll("[thinking] ");
-            try writeSafeText(&self.staged.writer, thinking.text, true);
-            try self.staged.writer.writeByte('\n');
-        },
-        .tool_call => |call| {
-            try self.staged.writer.writeAll("[tool call ");
-            try writeSafeText(&self.staged.writer, call.name, false);
-            try self.staged.writer.writeAll("] ");
-            try writeSafeText(&self.staged.writer, call.arguments_json, false);
-            try self.staged.writer.writeByte('\n');
-        },
-    };
+    try self.presenter.renderRestoredResponse(&self.staged, response, self.max_staged_bytes);
 }
 
 fn renderToolResult(self: *Screen, result: ai.message.ToolResult) !void {
-    try self.finishAssistant();
-    try self.staged.writer.writeAll("[tool result ");
-    try writeSafeText(&self.staged.writer, result.name, false);
-    try self.staged.writer.print(" {s}]\n", .{@tagName(result.outcome)});
-    for (result.content) |content| switch (content) {
-        .text => |text| {
-            try writeSafeText(&self.staged.writer, text, true);
-            if (!std.mem.endsWith(u8, text, "\n")) try self.staged.writer.writeByte('\n');
-        },
-        .image => |image| {
-            try self.staged.writer.writeAll("[image ");
-            try writeSafeText(&self.staged.writer, image.media_type, false);
-            try self.staged.writer.writeAll("]\n");
-        },
-    };
+    try self.presenter.renderToolResult(&self.staged, result);
 }
 
 fn writeSafeText(writer: *std.Io.Writer, text: []const u8, allow_newlines: bool) !void {
-    if (!std.unicode.utf8ValidateSlice(text)) {
-        for (text) |byte| {
-            if (byte >= 0x20 and byte < 0x7f) {
-                try writer.writeByte(byte);
-            } else if (allow_newlines and byte == '\n') {
-                try writer.writeByte('\n');
-            } else if (byte == '\t') {
-                try writer.writeByte('\t');
-            } else {
-                try writer.writeAll("�");
-            }
-        }
-        return;
-    }
-
-    var iterator = std.unicode.Utf8View.initUnchecked(text).iterator();
-    while (iterator.peek(1).len != 0) {
-        const scalar_start = iterator.i;
-        const scalar = iterator.nextCodepoint().?;
-        const codepoint = text[scalar_start..iterator.i];
-        if (allow_newlines and scalar == '\n') {
-            try writer.writeByte('\n');
-        } else if (scalar == '\t') {
-            try writer.writeByte('\t');
-        } else if (scalar < 0x20 or (scalar >= 0x7f and scalar <= 0x9f)) {
-            try writer.writeAll("�");
-        } else {
-            try writer.writeAll(codepoint);
-        }
-    }
+    try SafeText.write(writer, text, allow_newlines);
 }
 
 test "screen stages facts and publishes one status composer frame" {
@@ -464,10 +368,116 @@ test "screen stages facts and publishes one status composer frame" {
         .queued_count = 2,
     });
 
-    try std.testing.expect(std.mem.find(u8, output.written(), "❯ hello") != null);
+    try std.testing.expect(std.mem.find(u8, output.written(), "┃ hello") != null);
     try std.testing.expect(std.mem.find(u8, output.written(), "Working") != null);
     try std.testing.expect(std.mem.find(u8, output.written(), "2 queued") != null);
     try std.testing.expect(std.mem.find(u8, output.written(), "next") != null);
+}
+
+test "screen renders Markdown thinking and prose once in response order" {
+    const parts = [_]ai.message.ResponsePart{
+        .{ .thinking = .{ .text = "**inspect** state" } },
+        .{ .text = .{ .text = "Use `ready`." } },
+    };
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var screen = try Screen.init(std.testing.allocator, &output.writer, .{});
+    defer screen.deinit();
+
+    try screen.apply(.{ .event = .{ .message_start = .{
+        .run_id = @enumFromInt(1),
+        .turn_index = 1,
+        .message = .{ .response = .{
+            .parts = &.{},
+            .identity = .{ .provider = "test", .model = "model" },
+        } },
+    } } });
+    try screen.apply(.{ .event = .{ .message_update = .{
+        .run_id = @enumFromInt(1),
+        .turn_index = 1,
+        .message = .{
+            .parts = &.{.{ .thinking = "**inspect** state" }},
+            .identity = .{ .provider = "test", .model = "model" },
+        },
+        .update = .{ .part_end = .{ .index = 0, .part = parts[0] } },
+    } } });
+    try screen.apply(.{ .event = .{ .message_update = .{
+        .run_id = @enumFromInt(1),
+        .turn_index = 1,
+        .message = .{
+            .parts = &.{
+                .{ .thinking = "**inspect** state" },
+                .{ .text = "Use `ready`." },
+            },
+            .identity = .{ .provider = "test", .model = "model" },
+        },
+        .update = .{ .part_end = .{ .index = 1, .part = parts[1] } },
+    } } });
+    try screen.apply(.{ .event = .{ .message_end = .{
+        .run_id = @enumFromInt(1),
+        .turn_index = 1,
+        .message = .{ .published = .{ .response = .{
+            .parts = &parts,
+            .identity = .{ .provider = "test", .model = "model" },
+        } } },
+    } } });
+    try screen.commit(.{
+        .composer = .{ .text = "", .cursor_byte = 0 },
+        .phase = .idle,
+        .queued_count = 0,
+    });
+
+    const rendered = output.written();
+    const thinking = std.mem.find(u8, rendered, "Thinking").?;
+    const inspect = std.mem.find(u8, rendered, "inspect").?;
+    const answer = std.mem.find(u8, rendered, "Use ").?;
+    try std.testing.expect(thinking < inspect);
+    try std.testing.expect(inspect < answer);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, rendered, "inspect"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, rendered, "ready"));
+    try std.testing.expect(std.mem.find(u8, rendered, "**") == null);
+}
+
+test "screen keeps running tool details in footer and appends one compact result" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var screen = try Screen.init(std.testing.allocator, &output.writer, .{});
+    defer screen.deinit();
+
+    try screen.apply(.{ .event = .{ .tool_execution_start = .{
+        .run_id = @enumFromInt(1),
+        .turn_index = 1,
+        .call_id = "call-1",
+        .name = "read",
+        .arguments_json = "{\"path\":\"secret\"}",
+    } } });
+    try screen.commit(.{
+        .composer = .{ .text = "", .cursor_byte = 0 },
+        .phase = .{ .running = @enumFromInt(1) },
+        .queued_count = 0,
+    });
+    try std.testing.expect(std.mem.find(u8, output.written(), "Working · read") != null);
+    try std.testing.expect(std.mem.find(u8, output.written(), "secret") == null);
+
+    try screen.apply(.{ .event = .{ .tool_execution_end = .{
+        .run_id = @enumFromInt(1),
+        .turn_index = 1,
+        .call_id = "call-1",
+        .name = "read",
+        .result = .{ .published = .{
+            .call_id = "call-1",
+            .name = "read",
+            .content = &.{.{ .text = "private file contents" }},
+            .outcome = .success,
+        } },
+    } } });
+    try screen.commit(.{
+        .composer = .{ .text = "", .cursor_byte = 0 },
+        .phase = .{ .running = @enumFromInt(1) },
+        .queued_count = 0,
+    });
+    try std.testing.expect(std.mem.find(u8, output.written(), "• read") != null);
+    try std.testing.expect(std.mem.find(u8, output.written(), "private file contents") == null);
 }
 
 test "screen reflows the composer across terminal resize" {

@@ -107,7 +107,9 @@ or `packages/` into the Zig tree.
 
 This project is written in **Zig 0.16+**. There is no Node.js runtime, no
 `package.json`, and no JavaScript build step for this branch. `build.zig.zon`
-pins `uucode` for generated Unicode grapheme and width tables.
+pins `uucode` for generated Unicode grapheme and width tables. The pinned md4x
+parser and ANSI renderer snapshot is vendored under `third_party/md4x/`;
+`THIRD_PARTY_NOTICES.md` owns its provenance.
 
 ```bash
 zig build                          # build the binary
@@ -185,7 +187,8 @@ Module ownership (stable boundaries):
 - `src/smol/` owns the concrete non-alternate-screen interactive client: terminal
   lifecycle, input decoding and editing, event polling, footer layout,
   normal-buffer publication, and rendering policy. It consumes the public
-  coding-agent interactive and terminal-render contracts.
+  coding-agent interactive and terminal-render contracts. `smol/MarkdownAnsi.zig`
+  is the sole consumer of the vendored md4x parser and ANSI renderer.
 - `src/BoundedJson.zig` is the shared bounded JSON helper. Domain-specific
   validation stays with the owning module.
 - `src/coding_agent/BoundedTextFile.zig` shares optional bounded UTF-8 file-read

@@ -12,6 +12,16 @@ license texts are retained under `third_party/licenses/`.
   - Its UTF-8 implementation includes work by Bjoern Hoehrmann under the MIT
     license.
 
+## Vendored source
+
+- md4x 0.0.29, revision `3e3036f272b925c9a3d191a93b5155577b3bc1b6`
+  - Source: https://github.com/unjs/md4x
+  - License: MIT
+  - `third_party/md4x/` contains the parser and ANSI renderer subset used for
+    terminal Markdown presentation. md4x is a fork of md4c and retains Martin
+    Mitáš's and Pooya Parsa's copyright notices. The vendored heal source also
+    preserves its attribution to Vercel's remend implementation.
+
 ## Adapted source behavior
 
 - OpenTUI, revision `6f7833d09773b88cf5984b2a4e7bc428e1f8ffcb`

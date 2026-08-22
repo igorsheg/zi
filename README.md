@@ -27,7 +27,10 @@ Start an interactive session from a terminal:
 Press Enter to submit. While a turn is running, new submissions queue as
 follow-ups. Cursor movement, deletion, and wrapping treat Unicode grapheme
 clusters as single characters. Press Escape to cancel the active turn, Ctrl-C
-on an empty prompt to exit, or Ctrl-D on an empty idle prompt to exit.
+on an empty prompt to exit, or Ctrl-D on an empty idle prompt to exit. User
+messages use a compact rail. Assistant prose and thinking render as separate
+Markdown blocks in model response order. Running tools appear in the footer,
+and completed tools append compact results without dumping arguments or output.
 
 Run one or more prompts in print mode:
 

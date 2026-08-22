@@ -178,6 +178,10 @@ fn writeCliHelp(writer: *std.Io.Writer) !void {
         \\  -h, --help           Show help
         \\  -v, --version        Show the version
         \\
+        \\Interactive transcript:
+        \\  Assistant prose and thinking render as ordered Markdown blocks
+        \\  Running tools use the footer; completed tools append compact results
+        \\
         \\Persistent project trust:
         \\  zi trust status [PATH]  Show the nearest saved decision
         \\  zi trust allow [PATH]   Save a trusted decision

@@ -1,0 +1,609 @@
+// MD4X parser — internal types module.
+//
+// Holds the shared @cImport, ABI scalar aliases, MD_CTX, and every internal
+// struct / enum / flag constant the parser passes between its subsystem
+// modules. Extracted verbatim from the monolithic src/md4x.zig (pure refactor —
+// no logic change). See AGENTS.md.
+
+const std = @import("std");
+const util = @import("util.zig");
+
+// The shared ABI types (formerly @cImport of md4x.h + entity.h) now live in
+// the Zig-native src/abi.zig. Re-exported as `c` so all parser modules
+// (`const c = types.c`) keep their existing `c.MD_*` / `c.entity_lookup` refs.
+pub const c = @import("abi");
+
+pub const c_allocator = std.heap.c_allocator;
+
+// "These are omnipresent so lets save some typing." (md4x.c) ABI scalar aliases.
+pub const CHAR = c.MD_CHAR; // == c_char (signed char, 8-bit)
+pub const SZ = c.MD_SIZE; // == c_uint (32-bit)
+pub const OFF = c.MD_OFFSET; // == c_uint (32-bit)
+pub const MD_SIZE = c.MD_SIZE; // explicit alias used in a few signatures
+
+// SZ_MAX / OFF_MAX (UTF-8 build: 32-bit unsigned).
+pub const SZ_MAX: SZ = std.math.maxInt(SZ);
+pub const OFF_MAX: OFF = std.math.maxInt(OFF);
+
+// ============================================================================
+//  Internal Types
+// ============================================================================
+
+// Internal-only line classifier (never crosses the C ABI — lives only in the
+// plain `MD_LINE_ANALYSIS` struct). The explicit `c_int` backing is dropped so
+// the compiler picks the layout, and the members use the idiomatic Zig
+// spelling (`.blank`, `.atx_header`, …) matching the `BlockType` / `SpanType`
+// convention in `src/abi.zig`. Declaration order — hence the ordinals — is
+// frozen to the C enumeration this replaces.
+pub const MD_LINETYPE = enum {
+    blank,
+    hr,
+    atx_header,
+    setext_header,
+    setext_underline,
+    indented_code,
+    fenced_code,
+    html,
+    text,
+    table,
+    table_underline,
+    frontmatter,
+    block_component,
+};
+
+pub const MD_LINE_ANALYSIS = struct {
+    type: MD_LINETYPE = .blank,
+    data: c_uint = 0,
+    enforce_new_block: bool = false,
+    beg: OFF = 0,
+    end: OFF = 0,
+    indent: c_uint = 0, // Indentation level.
+};
+
+pub const MD_LINE = extern struct {
+    beg: OFF,
+    end: OFF,
+};
+
+pub const MD_VERBATIMLINE = extern struct {
+    beg: OFF,
+    end: OFF,
+    indent: OFF,
+};
+
+// Block flags (md4x.c ~5355). These ride in the MD_BLOCK.flags 8-bit field.
+pub const MD_BLOCK_CONTAINER_OPENER: c_uint = 0x01;
+pub const MD_BLOCK_CONTAINER_CLOSER: c_uint = 0x02;
+pub const MD_BLOCK_CONTAINER: c_uint = (MD_BLOCK_CONTAINER_OPENER | MD_BLOCK_CONTAINER_CLOSER);
+pub const MD_BLOCK_LOOSE_LIST: c_uint = 0x04;
+pub const MD_BLOCK_SETEXT_HEADER: c_uint = 0x08;
+// Block-attribute bookkeeping, all three written by md_resolve_block_attrs()
+// (process.zig) between block analysis and emission. The run itself is never
+// copied: `HAS_ATTRS` says the block's last line was shortened to just before a
+// trailing `{...}`, and the bytes are re-scanned from that shortened end.
+pub const MD_BLOCK_HAS_ATTRS: c_uint = 0x10;
+// The run belongs to the enclosing container (a tight list item, or a blockquote
+// holding only this paragraph), not to this block.
+pub const MD_BLOCK_ATTRS_HOISTED: c_uint = 0x20;
+// Emit this paragraph's contents without the <p> bookends — the one-paragraph
+// blockquote form, where the quote itself takes the attributes.
+pub const MD_BLOCK_UNWRAP_P: c_uint = 0x40;
+// Set on BOTH the opener and the closer of a `::ul` / `::ol` / `::table` /
+// `::blockquote` / `::pre` that wraps a single same-tagged child: the two fold
+// into ONE element (`.agents/comark/attributes.md:306-360`), so neither the
+// enter nor the leave is emitted and the wrapper's `{props}` travel to the
+// child's detail as its `raw_attrs`. Decided in md_resolve_block_attrs, which
+// is the only pass that sees the finished block tree before any callback fires.
+pub const MD_BLOCK_FOLDED_WRAPPER: c_uint = 0x80;
+
+// `struct MD_BLOCK_tag` (md4x.c ~5361). C uses bitfields:
+//   MD_BLOCKTYPE type :8; unsigned flags :8; unsigned data :16; MD_SIZE n_lines;
+// Blocks are stored interleaved with MD_LINE/MD_VERBATIMLINE in ctx.block_bytes
+// and accessed by raw byte offset, so the in-memory layout must match C exactly.
+// On little-endian the three bitfields pack into one u32 (type=byte0, flags=byte1,
+// data=bytes2-3), followed by a 4-byte MD_SIZE — 8 bytes total. We model that
+// with a packed struct so field reads/writes go to the right bits.
+pub const MD_BLOCK = extern struct {
+    bits: BlockBits = .{},
+    n_lines: MD_SIZE = 0,
+
+    const BlockBits = packed struct(u32) {
+        type: u8 = 0,
+        flags: u8 = 0,
+        data: u16 = 0,
+    };
+
+    // Only valid on a pointer that really is an MD_BLOCK header: `bits.type`
+    // then holds a value written by `setType` (the zeroed default being
+    // `.doc`), so the ordinal is always in range. Use `typeIsRaw` where the
+    // pointer may instead land on an interleaved MD_LINE payload.
+    pub inline fn getType(self: *const MD_BLOCK) c.BlockType {
+        return @enumFromInt(self.bits.type);
+    }
+    pub inline fn setType(self: *MD_BLOCK, t: c.BlockType) void {
+        self.bits.type = @intCast(@intFromEnum(t));
+    }
+
+    /// Compare the raw type byte without decoding it into a `BlockType`.
+    ///
+    /// `md_analyze_line`'s two-blank-lines hack peeks at `block_bytes`'s last
+    /// `@sizeOf(MD_BLOCK)` bytes, which are a block header only if a header was
+    /// the most recent push — otherwise they are part of an `MD_LINE` /
+    /// `MD_VERBATIMLINE` and the byte is arbitrary line-offset data. md4c reads
+    /// it as a plain int and lets the comparison simply fail; `@enumFromInt`
+    /// would instead be illegal behavior there, so those sites use this.
+    pub inline fn typeIsRaw(self: *const MD_BLOCK, t: c.BlockType) bool {
+        return self.bits.type == @as(u8, @intCast(@intFromEnum(t)));
+    }
+};
+
+/// Hard cap on how many `::component` / `#slot` / `> [!ALERT]` records one
+/// document may carry (65 536 of each, counted separately).
+///
+/// `MD_BLOCK.bits.data` above is 16 bits wide, and that width is frozen: an
+/// `MD_BLOCK` is interleaved with `MD_LINE`/`MD_VERBATIMLINE` inside the raw
+/// `block_bytes` arena, so widening the field is a layout change, not a type
+/// change. The ul/ol/li/h/table payloads that travel through `data` are a mark
+/// character, a heading level or a ≤128 column count, all of which fit — but
+/// the three MDC container kinds route the *array index* of their info record
+/// (`block_component_info` / `slot_info` / `block_alert_info`) through it. Past
+/// 65 536 records the index would wrap and `md_process_block` would read a
+/// different record: wrong tag name, wrong props, wrong slot name, silently.
+///
+/// So the three openers stop recognizing their syntax once this many records
+/// exist. The line then falls through the rest of line classification exactly
+/// as it would with the extension disabled — literal text — instead of opening
+/// a container that aliases an earlier one. Refusing at the *opener* keeps
+/// enter/leave emission balanced; no container is pushed, so none is popped.
+pub const MAX_BLOCK_INFO_RECORDS: usize = 0x10000;
+
+/// Hard ceiling on the `block_bytes` arena, in bytes.
+///
+/// The arena accumulates the WHOLE document — one `MD_BLOCK` (8 bytes) per
+/// block plus one `MD_LINE` (8) or `MD_VERBATIMLINE` (12) per line — and is
+/// only reset once `md_process_all_blocks` has walked it. Fenced code amplifies
+/// hardest: a one-byte blank line inside a fence costs 12 arena bytes, so a
+/// ~180 MB document already demands >2 GiB of arena, far below the 4 GiB an
+/// `MD_SIZE` input allows. `md_push_block_bytes` therefore has to be able to
+/// refuse.
+///
+/// The ceiling is `maxInt(OFF)` because `MD_CONTAINER.block_byte_off` is an
+/// `OFF` (u32): every list opener records its arena offset there and
+/// `md_analyze_line` writes the loose-list flag back through it. An arena
+/// larger than `OFF` can address would truncate that offset and flip the flag
+/// on an unrelated earlier block. Refusing keeps the two in step.
+///
+/// Like every other allocation refusal in the parser this surfaces as `null`
+/// from `md_push_block_bytes` and `-1` from its callers, i.e. it is
+/// indistinguishable from OOM — which is what running out of arena is.
+pub const MAX_BLOCK_BYTES: usize = std.math.maxInt(OFF);
+
+// `struct MD_CONTAINER_tag` (md4x.c ~5379). Internal-only (never crosses the C
+// ABI). C uses several `unsigned :8`/`:2` bitfields; we model with plain integer
+// fields since only the *values* matter (containers live in ctx.containers, a
+// distinct MD_CONTAINER[] array, not in block_bytes — so exact bit packing is
+// irrelevant, mirroring the MD_REF_DEF bitfield decision in Pass B).
+// Internal-only (never crosses the C ABI, never stored in block_bytes); drop
+// `extern` so the compiler may lay out / pad the fields optimally.
+pub const MD_CONTAINER = struct {
+    ch: CHAR = 0,
+    // NOTE: `is_loose` stays an integer — md_process_block() stores the raw
+    // masked `MD_BLOCK_LOOSE_LIST` bit (value 4) in it, so it is not two-state.
+    is_loose: u8 = 0,
+    is_task: bool = false,
+    is_alert: bool = false,
+    start: c_uint = 0,
+    mark_indent: c_uint = 0,
+    contents_indent: c_uint = 0,
+    block_byte_off: OFF = 0,
+    task_mark_off: OFF = 0,
+    colon_count: c_uint = 0, // For block components: number of colons in opener.
+    comp_fm_state: c_uint = 0, // Component frontmatter: 0=looking, 1=inside, 2=done.
+};
+
+// The mark structure. Faithful layout of `struct MD_MARK_tag` (md4x.c ~2574).
+// extern struct so the field order/sizes mirror C exactly (md_mark_store_ptr
+// memcpy's a `void*` over the first two OFF fields beg+end). On 64-bit,
+// sizeof(void*) == 2*sizeof(OFF), matching the C assertion.
+pub const MD_MARK = extern struct {
+    beg: OFF = 0,
+    end: OFF = 0,
+    // For unresolved openers, 'next' forms a stack of unresolved openers.
+    // When resolved, prev/next index the opener/closer counterpart.
+    prev: c_int = 0,
+    next: c_int = 0,
+    ch: CHAR = 0,
+    flags: u8 = 0,
+};
+
+// Mark flag bits for `MD_MARK.flags`, namespaced the way `abi.BlockType` /
+// `abi.SpanType` group the type codes. Values are verbatim from md4x.c ~2591
+// and are frozen.
+//
+// This is a namespace of `u8` bit constants rather than a `packed struct(u8)`
+// on purpose: the upper bits are DELIBERATELY OVERLOADED per mark type — bit
+// 0x20 is `emph_oc` on an emphasis mark, `autolink` on '<'/'>',
+// `valid_permissive_autolink` on a permissive autolink and
+// `has_nested_brackets` on '[', and bit 0x40 is both `emph_mod3_0` and
+// `autolink_missing_mailto`. A packed struct cannot express that aliasing.
+pub const MarkFlags = struct {
+    // Flags that apply to ALL mark types.
+    pub const potential_opener: u8 = 0x01; // Maybe opener.
+    pub const potential_closer: u8 = 0x02; // Maybe closer.
+    pub const opener: u8 = 0x04; // Definitely opener.
+    pub const closer: u8 = 0x08; // Definitely closer.
+    pub const resolved: u8 = 0x10; // Resolved in any definite way.
+
+    // Flags specific for various mark types (they share bits).
+    pub const emph_oc: u8 = 0x20; // Opener/closer mixed candidate ("rule of 3").
+    pub const emph_mod3_0: u8 = 0x40;
+    pub const emph_mod3_1: u8 = 0x80;
+    pub const emph_mod3_2: u8 = (0x40 | 0x80);
+    pub const emph_mod3_mask: u8 = (0x40 | 0x80);
+    pub const autolink: u8 = 0x20; // Distinguisher for '<', '>'.
+    pub const autolink_missing_mailto: u8 = 0x40;
+    pub const valid_permissive_autolink: u8 = 0x20; // For permissive autolinks.
+    pub const has_nested_brackets: u8 = 0x20; // For '[' to rule out invalid labels early.
+    // `[` opener of a `[^label]` footnote reference (never a link/image
+    // opener). Aliases the same bit as `emph_mod3_0` / `autolink_missing_mailto`
+    // — neither of which is ever written on a '[' mark: mod-3 bits belong to
+    // '*'/'_' and the mailto bit to '<'/'>'/'@'/':'/'.'. The bit a '[' mark DOES
+    // already use is 0x20 (`has_nested_brackets`), which is why this one is 0x40
+    // and not 0x20.
+    pub const footnote_ref: u8 = 0x40;
+};
+
+pub const CODESPAN_MARK_MAXLEN: usize = 32;
+
+// Minimal indentation to call the block "indented code block". A constant, not
+// an MD_CTX field: upstream only ever moved it to disable indented code blocks
+// entirely, and md4x has no dialect switch to do that with.
+pub const CODE_INDENT_OFFSET: c_uint = 4;
+
+// Reference definition. Faithful layout of `struct MD_REF_DEF_tag` (md4x.c
+// ~1635). The two trailing `unsigned char : 1` bitfields are modelled as a
+// single `u8` flags byte holding bit0=label_needs_free, bit1=title_needs_free.
+// We never share this struct across the C ABI (renderers don't see it), so the
+// exact bit packing is irrelevant — only the field *values* matter for the
+// differential. We store the two flags as plain bools for clarity.
+pub const MD_REF_DEF = extern struct {
+    label: [*c]CHAR = null,
+    title: [*c]CHAR = null,
+    hash: c_uint = 0,
+    label_size: SZ = 0,
+    title_size: SZ = 0,
+    dest_beg: OFF = 0,
+    dest_end: OFF = 0,
+    label_needs_free: bool = false,
+    title_needs_free: bool = false,
+};
+
+// One footnote definition, `[^label]: text…`. Internal-only (renderers see the
+// public `BlockFootnoteDefDetail` instead), so plain struct / Zig slices.
+//
+// `label` points **into ctx.text** — a footnote label may not span lines, so
+// unlike a link-reference label it never needs the merge-and-own path and there
+// is nothing to free. `content_lines` is the one owned allocation; its length is
+// exactly `content_lines.len`, which is what `md_free_footnote_defs` frees.
+pub const MD_FOOTNOTE_DEF = struct {
+    // Non-const to keep the `label`/`label_size`/`hash` header layout-compatible
+    // with MD_REF_DEF, which is what lets both share `LabelHashTable`.
+    label: [*c]CHAR = null,
+    label_size: SZ = 0,
+    hash: c_uint = 0,
+    /// 0 = unreferenced; otherwise the 1-based order of the first reference.
+    index: c_uint = 0,
+    /// Number of `[^label]` references that resolved to this definition.
+    ref_count: c_uint = 0,
+    content_lines: []MD_LINE = &.{},
+};
+
+// Complex hashtable bucket: holds multiple label-def pointers (a hash collision
+// of distinct labels). Mirrors `struct MD_REF_DEF_LIST_tag` with the C
+// flexible-array member `MD_REF_DEF* ref_defs[]`. We allocate
+// `@sizeOf(MD_REF_DEF_LIST) + n * @sizeOf(?*Def)` bytes and index past the
+// header manually (see refdefs.LabelHashTable(Def).items).
+//
+// The header is shared by every label hashtable (link ref-defs and footnote
+// defs): the flexible array is pointer-sized whatever `Def` is, so only the
+// element *type* differs and that lives in the generic, not here.
+pub const MD_REF_DEF_LIST = extern struct {
+    n_ref_defs: c_int = 0,
+    alloc_ref_defs: c_int = 0,
+    // Flexible array `Def* defs[]` follows in memory.
+};
+
+// "During analyzes of inline marks, we need to manage stacks of unresolved
+//  openers of the given type." Top == -1 if empty.
+pub const MD_MARKSTACK = struct {
+    top: c_int = -1,
+};
+
+pub const MD_BLOCK_COMPONENT_INFO = struct {
+    colon_count: c_uint = 0, // Number of colons in the opener fence (2+).
+    name_beg: OFF = 0, // Offset of component name in source.
+    name_end: OFF = 0,
+    props_beg: OFF = 0, // Offset of raw props content (after '{'), or 0.
+    props_end: OFF = 0, // Offset of '}', or 0.
+    title_beg: OFF = 0, // Offset of title text after name, or 0.
+    title_end: OFF = 0, // End offset of title text, or 0.
+};
+
+pub const MD_SLOT_INFO = struct {
+    name_beg: OFF = 0, // Offset of slot name in source.
+    name_end: OFF = 0,
+};
+
+pub const MD_BLOCK_ALERT_INFO = struct {
+    type_beg: OFF = 0, // Offset of type name in source.
+    type_end: OFF = 0,
+};
+
+// A matched `{`…`}` brace pair in the document (offsets of the braces
+// themselves). Produced by the document-wide pairing pass that backs the
+// inline-attribute scans; see MD_CTX.brace_pairs.
+pub const MD_BRACE_PAIR = struct {
+    open: OFF = 0,
+    close: OFF = 0,
+};
+
+pub const MD_INLINE_ATTR_INFO = struct {
+    closer_index: c_int = 0, // Index of the closer mark that has attrs after it.
+    attrs_beg: OFF = 0, // Offset of attrs content (after '{').
+    attrs_end: OFF = 0, // Offset of '}' (exclusive).
+    skip_end: OFF = 0, // Offset after '}' for text skipping.
+};
+
+// An all-no-op SAX callback table (PLAN item 11). `c.Parser`'s five callbacks
+// are non-optional and un-defaulted, so `c.Parser{}` no longer exists — this is
+// the placeholder that keeps MD_CTX's all-default initializer working. It is
+// never observable in production: `md_parse` overwrites `ctx.parser` with the
+// caller's table before any emission. Only the unit tests that build a bare
+// `MD_CTX` (and never emit) ever read it.
+pub const noop_parser: c.Parser = .{
+    .enter_block = noop_callbacks.block,
+    .leave_block = noop_callbacks.block,
+    .enter_span = noop_callbacks.span,
+    .leave_span = noop_callbacks.span,
+    .text = noop_callbacks.text,
+};
+
+const noop_callbacks = struct {
+    fn block(_: *const c.BlockDetail, _: ?*anyopaque) c.CallbackResult {
+        return 0;
+    }
+    fn span(_: *const c.SpanDetail, _: ?*anyopaque) c.CallbackResult {
+        return 0;
+    }
+    fn text(_: c.TextType, _: []const CHAR, _: ?*anyopaque) c.CallbackResult {
+        return 0;
+    }
+};
+
+// Context propagated through all the parsing. Internal struct — no C ABI needed.
+// Field order/comments mirror struct MD_CTX_tag in md4x.c exactly.
+pub const MD_CTX = struct {
+    // Allocator for the typed growable arrays (PLAN 8.1/8.5). Defaults to the
+    // libc-backed c_allocator (production); native tests can inject a
+    // std.testing.FailingAllocator to exercise the OOM-cleanup paths.
+    alloc: std.mem.Allocator = c_allocator,
+
+    // Immutable stuff (parameters of md_parse()).
+    text: [*c]const CHAR = null,
+    size: SZ = 0,
+    parser: c.Parser = noop_parser,
+    userdata: ?*anyopaque = null,
+
+    // When this is true, it allows some optimizations.
+    doc_ends_with_newline: bool = false,
+
+    // Helper temporary growing buffer.
+    buffer: [*c]CHAR = null,
+    alloc_buffer: c_uint = 0,
+
+    // Reference definitions. (PLAN 8.1: the flat ref-def array is an
+    // ArrayListUnmanaged; the hashtable still stores raw `&ref_defs.items[i]`
+    // pointers + the pointer-identity range check, valid because the table is
+    // built only after collection completes — no append moves the buffer after.)
+    ref_defs: std.ArrayListUnmanaged(MD_REF_DEF) = .empty,
+    ref_def_hashtable: [*c]?*anyopaque = null,
+    // A bucket count, so `usize` — the type the allocation and every index into
+    // the table already want. md4c keeps it `int` and computes `n * 5 / 4` in
+    // `int`, which overflows above ~429M ref-defs; upstream 19dd06f widened it.
+    ref_def_hashtable_size: usize = 0,
+    max_ref_def_output: SZ = 0,
+
+    // Footnote definitions. Same shape as the ref-def pair above and driven by
+    // the same generic (`refdefs.LabelHashTable`); only the record type differs.
+    footnote_defs: std.ArrayListUnmanaged(MD_FOOTNOTE_DEF) = .empty,
+    footnote_hashtable: [*c]?*anyopaque = null,
+    footnote_hashtable_size: usize = 0,
+    /// 1-based counter handing out `MD_FOOTNOTE_DEF.index` on first reference.
+    next_footnote_index: c_uint = 0,
+
+    // Stack of inline/span markers. (PLAN 8.1: ArrayListUnmanaged. The emphasis
+    // engine walks it with raw `[*c]MD_MARK` pointers derived from
+    // `marks.items.ptr`; `nMarks()` returns the count; reset is
+    // `clearRetainingCapacity()`.)
+    marks: std.ArrayListUnmanaged(MD_MARK) = .empty,
+
+    // UTF-8 build: 256-entry mark char map.
+    mark_char_map: [256]u8 = [_]u8{0} ** 256,
+
+    // For resolving of inline spans (the mod-3 emphasis layout). Indices:
+    //   0-2  ASTERISK_OPENERS_oo_mod3_{0,1,2}   (opener-only)
+    //   3-5  ASTERISK_OPENERS_oc_mod3_{0,1,2}   (opener+closer candidate)
+    //   6-8  UNDERSCORE_OPENERS_oo_mod3_{0,1,2} (opener-only)
+    //   9-11 UNDERSCORE_OPENERS_oc_mod3_{0,1,2} (opener+closer candidate)
+    //   12   TILDE_OPENERS_1
+    //   13   TILDE_OPENERS_2
+    //   14   BRACKET_OPENERS
+    //   15   DOLLAR_OPENERS
+    //   16   EQUAL_OPENERS
+    opener_stacks: [17]MD_MARKSTACK = [_]MD_MARKSTACK{.{}} ** 17,
+
+    // Stack of dummies which need to call free() for pointers stored in them.
+    ptr_stack: MD_MARKSTACK = .{},
+
+    // For resolving table rows.
+    n_table_cell_boundaries: c_int = 0,
+    table_cell_boundaries_head: c_int = 0,
+    table_cell_boundaries_tail: c_int = 0,
+
+    // Set while the contents of a table cell are being processed, so the
+    // inline emitter knows to unescape `\|` in verbatim runs. See
+    // md_emit_verbatim_text.
+    in_table_cell: bool = false,
+
+    // For resolving links.
+    unresolved_link_head: c_int = 0,
+    unresolved_link_tail: c_int = 0,
+
+    // For resolving raw HTML.
+    html_comment_horizon: OFF = 0,
+    html_proc_instr_horizon: OFF = 0,
+    html_decl_horizon: OFF = 0,
+    html_cdata_horizon: OFF = 0,
+
+    // For block analysis. Holds MD_BLOCK as well as MD_LINE structures.
+    block_bytes: ?*anyopaque = null,
+    current_block: [*c]MD_BLOCK = null,
+    // Byte counters, not indices into a C array: `usize` (what `arena_realloc`
+    // takes), never `c_int`. As `int` — md4c's type, inherited verbatim — the
+    // 1.5x growth step signed-overflows once the arena passes ~1.6 GB, which a
+    // ~140 MB document reaches; both counters then go incoherent and the slot
+    // pointer derived from `n_block_bytes` is no longer inside the arena.
+    // `MAX_BLOCK_BYTES` caps them; see md_push_block_bytes.
+    n_block_bytes: usize = 0,
+    alloc_block_bytes: usize = 0,
+
+    // For container block analysis.
+    // Container stack (PLAN 8.1: ArrayListUnmanaged). `nContainers()` returns the
+    // depth as a c_int; pushes are `.append`, pops `.items.len -= 1`, and the
+    // serialize-phase reuse resets via `clearRetainingCapacity()`.
+    containers: std.ArrayListUnmanaged(MD_CONTAINER) = .empty,
+
+    // Contextual info for line analysis.
+    code_fence_length: SZ = 0, // For checking closing fence length.
+    html_block_type: c_int = 0, // For checking closing raw HTML condition.
+    frontmatter_state: c_int = 0, // 0: looking for opener, 1: inside, 2: done/disabled
+    last_line_has_list_loosening_effect: bool = false,
+    last_list_item_starts_with_two_blank_lines: bool = false,
+
+    // Block component info array. (PLAN 8.1: ArrayListUnmanaged.)
+    block_component_info: std.ArrayListUnmanaged(MD_BLOCK_COMPONENT_INFO) = .empty,
+    block_component_nesting: c_int = 0,
+
+    // Slot info array within block components. (PLAN 8.1: ArrayListUnmanaged.)
+    slot_info: std.ArrayListUnmanaged(MD_SLOT_INFO) = .empty,
+
+    // Alert info array. (PLAN 8.1: migrated to ArrayListUnmanaged — the count is
+    // `.items.len`, growth/cleanup go through `c_allocator`.)
+    block_alert_info: std.ArrayListUnmanaged(MD_BLOCK_ALERT_INFO) = .empty,
+
+    // Inline attribute info array. (PLAN 8.1: ArrayListUnmanaged; reset per
+    // resolve pass with clearRetainingCapacity to reuse the buffer.)
+    inline_attrs: std.ArrayListUnmanaged(MD_INLINE_ATTR_INFO) = .empty,
+
+    // Document-wide `{`…`}` pairing for the inline-attribute scans, built once
+    // per parse (lazily, on the first `{` candidate — a document without one
+    // never pays for it) and then queried by binary search on `.open`. The
+    // per-candidate "scan forward to ctx.size counting brace depth" it replaces
+    // was quadratic on unbalanced braces; see md_build_brace_pairs()
+    // (inlines.zig). Sorted ascending by `.open`; unmatched `{` are absent.
+    brace_pairs: std.ArrayListUnmanaged(MD_BRACE_PAIR) = .empty,
+    brace_pairs_built: bool = false,
+
+    // Character accessors. `CH(off)` / `STR(off)` from md4x.c operate on the
+    // enclosing `ctx`; here they are methods on *const MD_CTX.
+    // NOTE: ctx.text is `char*`; in classification we always reinterpret as the
+    // unsigned byte value to match the C `(unsigned)(ch)` casts.
+    pub inline fn ch(self: *const MD_CTX, off: OFF) CHAR {
+        return self.text[off];
+    }
+    pub inline fn str(self: *const MD_CTX, off: OFF) [*c]const CHAR {
+        return self.text + off;
+    }
+
+    // Offset-based character-class predicates (PLAN 8.7): methods on *const
+    // MD_CTX that read ctx.text[off] (or decode the UTF-8 codepoint there) and
+    // delegate to the pure `IS*_(ch)` / md_is_unicode_* helpers in util.zig.
+    // The `IS*_` helpers stay free functions taking a raw CHAR — they mirror
+    // md4c's macros and are kept for upstream cross-reference (PLAN 8.6).
+    // Container-stack depth as a c_int (PLAN 8.1: ctx.containers is now an
+    // ArrayListUnmanaged; this replaces the old n_containers field on reads).
+    pub inline fn nContainers(self: *const MD_CTX) c_int {
+        return @intCast(self.containers.items.len);
+    }
+
+    // Inline-mark count as a c_int (PLAN 8.1: ctx.marks is an ArrayListUnmanaged).
+    pub inline fn nMarks(self: *const MD_CTX) c_int {
+        return @intCast(self.marks.items.len);
+    }
+
+    pub inline fn isAnyOf(self: *const MD_CTX, off: OFF, palette: [*:0]const u8) bool {
+        return util.ISANYOF_(self.ch(off), palette);
+    }
+    pub inline fn isAnyOf2(self: *const MD_CTX, off: OFF, ch1: CHAR, ch2: CHAR) bool {
+        return util.ISANYOF2_(self.ch(off), ch1, ch2);
+    }
+    pub inline fn isAnyOf3(self: *const MD_CTX, off: OFF, ch1: CHAR, ch2: CHAR, ch3: CHAR) bool {
+        return util.ISANYOF3_(self.ch(off), ch1, ch2, ch3);
+    }
+    pub inline fn isAscii(self: *const MD_CTX, off: OFF) bool {
+        return util.ISASCII_(self.ch(off));
+    }
+    pub inline fn isBlank(self: *const MD_CTX, off: OFF) bool {
+        return util.ISBLANK_(self.ch(off));
+    }
+    pub inline fn isNewline(self: *const MD_CTX, off: OFF) bool {
+        return util.ISNEWLINE_(self.ch(off));
+    }
+    pub inline fn isWhitespace(self: *const MD_CTX, off: OFF) bool {
+        return util.ISWHITESPACE_(self.ch(off));
+    }
+    pub inline fn isCntrl(self: *const MD_CTX, off: OFF) bool {
+        return util.ISCNTRL_(self.ch(off));
+    }
+    pub inline fn isPunct(self: *const MD_CTX, off: OFF) bool {
+        return util.ISPUNCT_(self.ch(off));
+    }
+    pub inline fn isUpper(self: *const MD_CTX, off: OFF) bool {
+        return util.ISUPPER_(self.ch(off));
+    }
+    pub inline fn isLower(self: *const MD_CTX, off: OFF) bool {
+        return util.ISLOWER_(self.ch(off));
+    }
+    pub inline fn isAlpha(self: *const MD_CTX, off: OFF) bool {
+        return util.ISALPHA_(self.ch(off));
+    }
+    pub inline fn isDigit(self: *const MD_CTX, off: OFF) bool {
+        return util.ISDIGIT_(self.ch(off));
+    }
+    pub inline fn isXdigit(self: *const MD_CTX, off: OFF) bool {
+        return util.ISXDIGIT_(self.ch(off));
+    }
+    pub inline fn isAlnum(self: *const MD_CTX, off: OFF) bool {
+        return util.ISALNUM_(self.ch(off));
+    }
+    pub inline fn isUnicodeWhitespace(self: *const MD_CTX, off: OFF) bool {
+        return util.md_is_unicode_whitespace(util.md_decode_utf8(self.str(off), self.size - off, null));
+    }
+    pub inline fn isUnicodeWhitespaceBefore(self: *const MD_CTX, off: OFF) bool {
+        return util.md_is_unicode_whitespace(util.md_decode_utf8_before(self, off));
+    }
+    pub inline fn isUnicodePunct(self: *const MD_CTX, off: OFF) bool {
+        return util.md_is_unicode_punct(util.md_decode_utf8(self.str(off), self.size - off, null));
+    }
+    pub inline fn isUnicodePunctBefore(self: *const MD_CTX, off: OFF) bool {
+        return util.md_is_unicode_punct(util.md_decode_utf8_before(self, off));
+    }
+
+    // `MD_LOG(msg)` — call ctx->parser.debug_log if set. The C macro reads `ctx`
+    // from the enclosing scope; here it is a method on *MD_CTX.
+    pub inline fn log(self: *MD_CTX, msg: []const u8) void {
+        if (self.parser.debug_log) |cb| {
+            cb(msg, self.userdata);
+        }
+    }
+};
