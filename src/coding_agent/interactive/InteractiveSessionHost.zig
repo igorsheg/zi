@@ -15,7 +15,6 @@ const ZiPaths = @import("../ZiPaths.zig");
 const InteractiveSessionHost = @This();
 
 const max_identifier_bytes = 512;
-const max_pending_facts = 16;
 
 pub const Options = struct {
     worker_limits: TurnWorker.Limits = .{},
@@ -180,6 +179,16 @@ const FixedModel = struct {
 };
 
 const PendingFact = union(enum) {
+    auth_started: struct {
+        provider: FixedText,
+        method: ai.oauth.LoginMethod,
+    },
+    auth_cancelled: FixedText,
+    login_succeeded: FixedText,
+    login_failed: struct {
+        provider: FixedText,
+        failure: AuthOperation.Failure,
+    },
     model_changed: FixedModel,
     model_less,
     model_switch_failed: struct {
@@ -196,6 +205,20 @@ const PendingFact = union(enum) {
 
     fn view(self: *const PendingFact) Fact {
         return switch (self.*) {
+            .auth_started => |*value| .{ .auth_started = .{
+                .provider = value.provider.slice(),
+                .method = value.method,
+            } },
+            .auth_cancelled => |*provider| .{ .auth_cancelled = .{
+                .provider = provider.slice(),
+            } },
+            .login_succeeded => |*provider| .{ .login_succeeded = .{
+                .provider = provider.slice(),
+            } },
+            .login_failed => |*value| .{ .login_failed = .{
+                .provider = value.provider.slice(),
+                .failure = value.failure,
+            } },
             .model_changed => |*selection| .{ .model_changed = selection.view() },
             .model_less => .model_less,
             .model_switch_failed => |*value| .{ .model_switch_failed = .{
@@ -231,11 +254,11 @@ io: std.Io,
 inputs: ReopenInputs,
 settings_paths: ZiPaths,
 journal_path: []u8,
-initial_transcript: *const SessionTranscript,
+transcript_value: SessionTranscript,
 backend: Backend = .transitioning,
 auth: ?*AuthOperation = null,
-auth_started_pending: bool = false,
-auth_outcome: ?AuthOperation.Outcome = null,
+auth_batch: ?AuthOperation.Batch = null,
+auth_fact_cursor: usize = 0,
 pending: std.ArrayList(PendingFact) = .empty,
 options: Options,
 
@@ -264,6 +287,8 @@ pub fn init(
         owned_inputs.initial().home,
     );
     errdefer settings_paths.deinit();
+    var transcript_value = try owned_lifecycle.transcript().clone(allocator);
+    errdefer transcript_value.deinit();
     const self = try allocator.create(InteractiveSessionHost);
     errdefer allocator.destroy(self);
     self.* = .{
@@ -272,12 +297,11 @@ pub fn init(
         .inputs = owned_inputs,
         .settings_paths = settings_paths,
         .journal_path = journal_path,
-        .initial_transcript = owned_lifecycle.transcript(),
+        .transcript_value = transcript_value,
         .options = options,
     };
     inputs_live = false;
     errdefer self.inputs.deinit();
-    try self.pending.ensureTotalCapacity(allocator, max_pending_facts);
     errdefer self.pending.deinit(allocator);
     self.installLifecycle(owned_lifecycle) catch |failure| {
         lifecycle_live = false;
@@ -288,7 +312,7 @@ pub fn init(
 }
 
 pub fn transcript(self: *const InteractiveSessionHost) *const SessionTranscript {
-    return self.initial_transcript;
+    return &self.transcript_value;
 }
 
 pub fn snapshot(self: *InteractiveSessionHost) Snapshot {
@@ -319,7 +343,7 @@ pub fn canExit(self: *InteractiveSessionHost) bool {
 }
 
 pub fn hasPendingFacts(self: *InteractiveSessionHost) bool {
-    if (self.auth_started_pending or self.auth_outcome != null or self.pending.items.len != 0) return true;
+    if (self.pending.items.len != 0 or self.auth_batch != null) return true;
     if (self.auth) |operation| if (operation.hasPending()) return true;
     return switch (self.backend) {
         .runnable => |*runnable| runnable.controller.hasPendingFacts(),
@@ -332,6 +356,11 @@ pub fn hasPendingFacts(self: *InteractiveSessionHost) bool {
 pub fn submit(self: *InteractiveSessionHost, source: []const u8) SubmitError!SubmitDisposition {
     const text = std.mem.trim(u8, source, " \t\r\n");
     if (text.len == 0) return error.EmptyPrompt;
+    const parsed = try parseCommand(text);
+    switch (parsed) {
+        .login, .model => if (self.hasUndrainedControlFacts()) return error.CommandBusy,
+        .ordinary => {},
+    }
     if (self.auth) |operation| {
         if (!operation.isAwaitingAnswer()) return error.AuthenticationBusy;
         try operation.answer(text);
@@ -343,10 +372,12 @@ pub fn submit(self: *InteractiveSessionHost, source: []const u8) SubmitError!Sub
         .model_less, .runnable => {},
     }
 
-    switch (try parseCommand(text)) {
+    switch (parsed) {
         .ordinary => {},
         .login => |command| {
             if (!self.isQuiescent()) return error.CommandBusy;
+            try self.pending.ensureUnusedCapacity(self.allocator, 1);
+            const provider_copy = try FixedText.init(command.provider);
             const operation = if (self.options.auth_transport) |transport|
                 try AuthOperation.startWithTransport(self.allocator, self.io, .{
                     .startup_cwd = self.inputs.initial().startup_cwd,
@@ -370,7 +401,10 @@ pub fn submit(self: *InteractiveSessionHost, source: []const u8) SubmitError!Sub
                     .limits = self.options.auth_limits,
                 });
             self.auth = operation;
-            self.auth_started_pending = true;
+            self.appendPendingAssumeCapacity(.{ .auth_started = .{
+                .provider = provider_copy,
+                .method = operation.loginMethod(),
+            } });
             return .command;
         },
         .model => |selection| {
@@ -422,37 +456,30 @@ pub fn drain(
     var result: DrainResult = .{};
     errdefer result.deinit();
 
-    if (self.auth_started_pending) {
-        const operation = self.auth.?;
-        try sink.emit(.{ .auth_started = .{
-            .provider = operation.provider(),
-            .method = operation.loginMethod(),
-        } });
-        self.auth_started_pending = false;
-    }
-
+    try self.drainPending(sink);
     if (self.auth) |operation| {
-        if (operation.hasPending()) {
-            var batch = try operation.takeBatch();
-            defer batch.deinit();
-            if (batch.outcome) |outcome| self.auth_outcome = outcome;
-            for (0..batch.len()) |index| {
-                const fact_value = batch.fact(index);
-                try sink.emit(switch (fact_value) {
-                    .auth_url, .device_code, .prompt => .{ .auth_interaction = fact_value },
-                });
+        if (self.auth_batch == null and operation.hasPending()) {
+            self.auth_batch = try operation.takeBatch();
+            self.auth_fact_cursor = 0;
+        }
+        if (self.auth_batch) |*batch| {
+            while (self.auth_fact_cursor < batch.len()) {
+                const fact_value = batch.fact(self.auth_fact_cursor);
+                try sink.emit(.{ .auth_interaction = fact_value });
+                self.auth_fact_cursor += 1;
+            }
+            if (batch.outcome) |outcome| {
+                try self.pending.ensureUnusedCapacity(self.allocator, 2);
+                self.settleAuthAssumeCapacity(outcome);
+                self.releaseAuthBatch();
+                operation.deinit();
+                self.auth = null;
+            } else {
+                self.releaseAuthBatch();
             }
         }
-        if (self.auth_outcome) |outcome| {
-            try self.settleAuth(outcome, sink);
-            self.auth_outcome = null;
-        }
     }
-
-    while (self.pending.items.len != 0) {
-        const fact_value = self.pending.orderedRemove(0);
-        try sink.emit(fact_value.view());
-    }
+    try self.drainPending(sink);
 
     switch (self.backend) {
         .runnable => |*runnable| {
@@ -478,8 +505,10 @@ pub fn drain(
 // ziglint-ignore: Z030
 pub fn deinit(self: *InteractiveSessionHost) void {
     if (self.auth) |operation| operation.deinit();
+    if (self.auth_batch) |*batch| batch.deinit();
     self.deinitBackend();
     self.pending.deinit(self.allocator);
+    self.transcript_value.deinit();
     self.allocator.free(self.journal_path);
     self.settings_paths.deinit();
     self.inputs.deinit();
@@ -488,17 +517,19 @@ pub fn deinit(self: *InteractiveSessionHost) void {
     allocator.destroy(self);
 }
 
-fn settleAuth(self: *InteractiveSessionHost, outcome: AuthOperation.Outcome, sink: Sink) !void {
-    const operation = self.auth.?;
-    const provider = operation.provider();
+fn settleAuthAssumeCapacity(
+    self: *InteractiveSessionHost,
+    outcome: AuthOperation.Outcome,
+) void {
+    const provider = FixedText.init(self.auth.?.provider()) catch unreachable;
     switch (outcome) {
-        .cancelled => try sink.emit(.{ .auth_cancelled = .{ .provider = provider } }),
-        .failed => |failure| try sink.emit(.{ .login_failed = .{
+        .cancelled => self.appendPendingAssumeCapacity(.{ .auth_cancelled = provider }),
+        .failed => |failure| self.appendPendingAssumeCapacity(.{ .login_failed = .{
             .provider = provider,
             .failure = failure,
         } }),
         .succeeded => {
-            try sink.emit(.{ .login_succeeded = .{ .provider = provider } });
+            self.appendPendingAssumeCapacity(.{ .login_succeeded = provider });
             self.closeForTransition();
             const lifecycle = RuntimeServices.createInteractive(
                 self.allocator,
@@ -506,33 +537,32 @@ fn settleAuth(self: *InteractiveSessionHost, outcome: AuthOperation.Outcome, sin
                 self.inputs.reopen(self.journal_path, .{}),
             ) catch |failure| {
                 self.backend = .unavailable;
-                try sink.emit(.{ .session_unavailable = .{ .reason = @errorName(failure) } });
-                operation.deinit();
-                self.auth = null;
+                self.appendPendingAssumeCapacity(.{
+                    .session_unavailable = .{ .reason = @errorName(failure) },
+                });
                 return;
             };
             self.installLifecycle(lifecycle) catch |failure| {
                 self.backend = .unavailable;
-                try sink.emit(.{ .session_unavailable = .{ .reason = @errorName(failure) } });
-                operation.deinit();
-                self.auth = null;
+                self.appendPendingAssumeCapacity(.{
+                    .session_unavailable = .{ .reason = @errorName(failure) },
+                });
                 return;
             };
             switch (self.backend) {
-                .runnable => |*runnable| try sink.emit(.{
-                    .model_changed = runnable.active_model.view(),
+                .runnable => |*runnable| self.appendPendingAssumeCapacity(.{
+                    .model_changed = runnable.active_model,
                 }),
-                .model_less => try sink.emit(.model_less),
+                .model_less => self.appendPendingAssumeCapacity(.model_less),
                 .transitioning, .unavailable => unreachable,
             }
         },
     }
-    operation.deinit();
-    self.auth = null;
 }
 
 fn switchModel(self: *InteractiveSessionHost, requested: ai.ModelIdentity) !void {
     const requested_copy = try FixedModel.init(requested);
+    try self.pending.ensureUnusedCapacity(self.allocator, 3);
     self.closeForTransition();
     const lifecycle = RuntimeServices.createInteractive(
         self.allocator,
@@ -552,7 +582,7 @@ fn switchModel(self: *InteractiveSessionHost, requested: ai.ModelIdentity) !void
 
     const canonical = self.activeModel() orelse unreachable;
     const canonical_copy = try FixedModel.init(canonical);
-    self.appendPending(.{ .model_changed = canonical_copy });
+    self.appendPendingAssumeCapacity(.{ .model_changed = canonical_copy });
     SettingsStore.setGlobalDefaultModel(
         self.allocator,
         self.io,
@@ -560,10 +590,10 @@ fn switchModel(self: *InteractiveSessionHost, requested: ai.ModelIdentity) !void
         canonical.provider,
         canonical.model,
     ) catch |failure| switch (failure) {
-        error.CommitIndeterminate => self.appendPending(.{
+        error.CommitIndeterminate => self.appendPendingAssumeCapacity(.{
             .settings_commit_indeterminate = canonical_copy,
         }),
-        else => self.appendPending(.{ .settings_failed = .{
+        else => self.appendPendingAssumeCapacity(.{ .settings_failed = .{
             .selection = canonical_copy,
             .reason = @errorName(failure),
         } }),
@@ -582,28 +612,32 @@ fn recoverAfterSwitchFailure(
     ) catch |recovery_failure| {
         self.backend = .unavailable;
         self.appendSwitchFailure(requested, failure);
-        self.appendPending(.{ .session_unavailable = .{ .reason = @errorName(recovery_failure) } });
+        self.appendPendingAssumeCapacity(.{
+            .session_unavailable = .{ .reason = @errorName(recovery_failure) },
+        });
         return;
     };
     self.installLifecycle(lifecycle) catch |recovery_failure| {
         self.backend = .unavailable;
         self.appendSwitchFailure(requested, failure);
-        self.appendPending(.{ .session_unavailable = .{ .reason = @errorName(recovery_failure) } });
+        self.appendPendingAssumeCapacity(.{
+            .session_unavailable = .{ .reason = @errorName(recovery_failure) },
+        });
         return;
     };
     self.appendSwitchFailure(requested, failure);
     if (self.activeModel()) |model| {
-        self.appendPending(.{ .model_changed = try FixedModel.init(model) });
+        self.appendPendingAssumeCapacity(.{ .model_changed = try FixedModel.init(model) });
     } else {
-        self.appendPending(.model_less);
+        self.appendPendingAssumeCapacity(.model_less);
     }
 }
 
 fn appendSwitchFailure(self: *InteractiveSessionHost, requested: FixedModel, failure: anyerror) void {
     if (failure == error.CommitIndeterminate) {
-        self.appendPending(.{ .model_switch_commit_indeterminate = requested });
+        self.appendPendingAssumeCapacity(.{ .model_switch_commit_indeterminate = requested });
     } else {
-        self.appendPending(.{ .model_switch_failed = .{
+        self.appendPendingAssumeCapacity(.{ .model_switch_failed = .{
             .requested = requested,
             .reason = @errorName(failure),
         } });
@@ -696,8 +730,26 @@ fn workerQuiescent(worker: *TurnWorker) bool {
         value.queued_completions == 0;
 }
 
-fn appendPending(self: *InteractiveSessionHost, fact: PendingFact) void {
-    std.debug.assert(self.pending.items.len < max_pending_facts);
+fn hasUndrainedControlFacts(self: *InteractiveSessionHost) bool {
+    if (self.pending.items.len != 0 or self.auth_batch != null) return true;
+    if (self.auth) |operation| return operation.hasPending();
+    return false;
+}
+
+fn drainPending(self: *InteractiveSessionHost, sink: Sink) !void {
+    while (self.pending.items.len != 0) {
+        try sink.emit(self.pending.items[0].view());
+        _ = self.pending.orderedRemove(0);
+    }
+}
+
+fn releaseAuthBatch(self: *InteractiveSessionHost) void {
+    self.auth_batch.?.deinit();
+    self.auth_batch = null;
+    self.auth_fact_cursor = 0;
+}
+
+fn appendPendingAssumeCapacity(self: *InteractiveSessionHost, fact: PendingFact) void {
     self.pending.appendAssumeCapacity(fact);
 }
 
@@ -760,6 +812,104 @@ const HostTestSources = struct {
             .clock_context = self,
             .nowMsFn = nowMs,
         };
+    }
+};
+
+const RetryAuthRecorder = struct {
+    host: *InteractiveSessionHost,
+    answer: []const u8,
+    auth_url_attempts: usize = 0,
+    prompt_attempts: usize = 0,
+    login_attempts: usize = 0,
+    auth_url_order: ?usize = null,
+    prompt_order: ?usize = null,
+    login_order: ?usize = null,
+    model_order: ?usize = null,
+    sequence: usize = 0,
+
+    fn emit(context: *anyopaque, fact: Fact) !void {
+        const self: *RetryAuthRecorder = @ptrCast(@alignCast(context));
+        switch (fact) {
+            .auth_started => {},
+            .auth_interaction => |interaction| switch (interaction) {
+                .auth_url => {
+                    self.auth_url_attempts += 1;
+                    if (self.auth_url_attempts == 1) return error.Injected;
+                    self.auth_url_order = self.nextOrder();
+                },
+                .prompt => {
+                    self.prompt_attempts += 1;
+                    if (self.prompt_attempts == 1) return error.Injected;
+                    self.prompt_order = self.nextOrder();
+                    try std.testing.expect((try self.host.submit(self.answer)) == .oauth_answer);
+                },
+                .device_code => return error.UnexpectedDeviceCode,
+            },
+            .login_succeeded => {
+                self.login_attempts += 1;
+                try std.testing.expect(self.host.snapshot().phase == .turn);
+                if (self.login_attempts == 1) return error.Injected;
+                self.login_order = self.nextOrder();
+            },
+            .model_changed => self.model_order = self.nextOrder(),
+            .turn,
+            .auth_cancelled,
+            .login_failed,
+            .model_less,
+            .model_switch_failed,
+            .model_switch_commit_indeterminate,
+            .settings_failed,
+            .settings_commit_indeterminate,
+            .session_unavailable,
+            => return error.UnexpectedFact,
+        }
+    }
+
+    fn nextOrder(self: *RetryAuthRecorder) usize {
+        const result = self.sequence;
+        self.sequence += 1;
+        return result;
+    }
+
+    fn sink(self: *RetryAuthRecorder) Sink {
+        return .{ .context = self, .emit_fn = emit };
+    }
+};
+
+const DeviceRetryRecorder = struct {
+    host: *InteractiveSessionHost,
+    device_attempts: usize = 0,
+    saw_cancelled: bool = false,
+
+    fn emit(context: *anyopaque, fact: Fact) !void {
+        const self: *DeviceRetryRecorder = @ptrCast(@alignCast(context));
+        switch (fact) {
+            .auth_started => {},
+            .auth_interaction => |interaction| switch (interaction) {
+                .device_code => {
+                    self.device_attempts += 1;
+                    if (self.device_attempts == 1) return error.Injected;
+                    self.host.requestExit();
+                },
+                .auth_url, .prompt => return error.UnexpectedInteraction,
+            },
+            .auth_cancelled => self.saw_cancelled = true,
+            .turn,
+            .login_succeeded,
+            .login_failed,
+            .model_changed,
+            .model_less,
+            .model_switch_failed,
+            .model_switch_commit_indeterminate,
+            .settings_failed,
+            .settings_commit_indeterminate,
+            .session_unavailable,
+            => return error.UnexpectedFact,
+        }
+    }
+
+    fn sink(self: *DeviceRetryRecorder) Sink {
+        return .{ .context = self, .emit_fn = emit };
     }
 };
 
@@ -944,6 +1094,95 @@ test "model switch reopens the exact journal and persists the canonical default"
     try std.testing.expect(std.mem.find(u8, settings, "gpt-5.6-luna") != null);
 }
 
+test "host transcript remains valid after replacing its initial backend" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var root_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root = try hostTestRoot(&temporary, &root_buffer);
+    var paths = try ZiPaths.init(std.testing.allocator, root, root);
+    defer paths.deinit();
+    try CredentialStore.put(std.testing.allocator, std.testing.io, &paths, .{
+        .provider_id = "openai-codex",
+        .credential = .{ .oauth = .{
+            .access = "fresh-access",
+            .refresh = "fresh-refresh",
+            .expires_at_ms = std.math.maxInt(u64),
+            .account_id = "account",
+        } },
+    });
+    var sources: HostTestSources = .{};
+    const initial = try createHostForTest(root, sources.view(), .{
+        .provider = "openai-codex",
+        .model = "gpt-5.6-terra",
+    }, .{});
+    const journal_path = try std.testing.allocator.dupe(u8, initial.journal_path);
+    defer std.testing.allocator.free(journal_path);
+    initial.deinit();
+
+    var inputs = try ReopenInputs.init(std.testing.allocator, .{
+        .startup_cwd = root,
+        .home = root,
+        .session = .{ .open = journal_path },
+        .sources = sources.view(),
+    });
+    var lifecycle = try RuntimeServices.createInteractive(
+        std.testing.allocator,
+        std.testing.io,
+        inputs.initial(),
+    );
+    const host = try InteractiveSessionHost.init(
+        std.testing.allocator,
+        std.testing.io,
+        &inputs,
+        &lifecycle,
+        .{},
+    );
+    defer host.deinit();
+    const transcript_view = host.transcript();
+    try std.testing.expect(transcript_view.items.len != 0);
+    try std.testing.expectEqualStrings(
+        "gpt-5.6-terra",
+        transcript_view.items[0].content.model_change.model,
+    );
+
+    try std.testing.expect((try host.submit("/model openai-codex/gpt-5.6-luna")) == .command);
+    var recorder: HostTestRecorder = .{};
+    var update = try host.drain("", recorder.sink());
+    update.deinit();
+    try std.testing.expect(host.transcript() == transcript_view);
+    try std.testing.expectEqualStrings(
+        "gpt-5.6-terra",
+        transcript_view.items[0].content.model_change.model,
+    );
+}
+
+test "undrained control facts reject more than sixteen commands without growing pending state" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var root_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root = try hostTestRoot(&temporary, &root_buffer);
+    var sources: HostTestSources = .{};
+    const host = try createHostForTest(root, sources.view(), null, .{});
+    defer host.deinit();
+
+    try std.testing.expect((try host.submit("/model missing-provider/missing-model")) == .command);
+    const pending_count = host.pending.items.len;
+    try std.testing.expect(pending_count != 0);
+    for (0..32) |index| {
+        const command = if (index % 2 == 0)
+            "/model missing-provider/another-model"
+        else
+            "/login missing-provider";
+        try std.testing.expectError(error.CommandBusy, host.submit(command));
+        try std.testing.expectEqual(pending_count, host.pending.items.len);
+    }
+
+    var recorder: HostTestRecorder = .{};
+    var update = try host.drain("", recorder.sink());
+    update.deinit();
+    try std.testing.expect(host.snapshot().phase == .model_less);
+}
+
 test "failed model switch recovers model-less state from the same journal" {
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();
@@ -964,6 +1203,136 @@ test "failed model switch recovers model-less state from the same journal" {
     try std.testing.expect(host.snapshot().phase == .model_less);
     try std.testing.expectEqualStrings(journal_path, host.journal_path);
     try std.testing.expectError(error.ModelSelectionRequired, host.submit("/unknown stays a prompt"));
+}
+
+test "auth delivery and settlement retry without repeating lifecycle mutation" {
+    const answer = "retry-answer-secret";
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var root_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root = try hostTestRoot(&temporary, &root_buffer);
+    const access = try hostTestAccessToken(std.testing.allocator);
+    defer std.testing.allocator.free(access);
+    const body = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"access_token\":\"{s}\",\"refresh_token\":\"refresh\",\"expires_in\":3600}}",
+        .{access},
+    );
+    defer std.testing.allocator.free(body);
+    const exchanges = [_]ai.transport_testing.Exchange{.{ .response = .{ .status = 200, .body = body } }};
+    var fake = ai.transport_testing.FakeTransport.init(&exchanges);
+    var sources: HostTestSources = .{};
+    const host = try createHostForTest(root, sources.view(), null, .{
+        .auth_transport = fake.transport(),
+    });
+    defer host.deinit();
+    try std.testing.expect((try host.submit("/login openai-codex")) == .command);
+
+    var recorder: RetryAuthRecorder = .{ .host = host, .answer = answer };
+    var checked_single_transition = false;
+    for (0..5_000) |_| {
+        if (host.hasPendingFacts()) {
+            var update = host.drain("", recorder.sink()) catch |failure| {
+                try std.testing.expectEqual(error.Injected, failure);
+                if (recorder.login_attempts == 1 and !checked_single_transition) {
+                    const journal = try std.Io.Dir.readFileAlloc(
+                        .cwd(),
+                        std.testing.io,
+                        host.journal_path,
+                        std.testing.allocator,
+                        .unlimited,
+                    );
+                    defer std.testing.allocator.free(journal);
+                    try std.testing.expectEqual(
+                        @as(usize, 1),
+                        std.mem.count(u8, journal, "model_change"),
+                    );
+                    checked_single_transition = true;
+                }
+                try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+                continue;
+            };
+            update.deinit();
+        }
+        if (recorder.model_order != null) break;
+        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+
+    try std.testing.expect(checked_single_transition);
+    try std.testing.expectEqual(@as(usize, 2), recorder.auth_url_attempts);
+    try std.testing.expectEqual(@as(usize, 2), recorder.prompt_attempts);
+    try std.testing.expectEqual(@as(usize, 2), recorder.login_attempts);
+    try std.testing.expect(recorder.auth_url_order.? < recorder.prompt_order.?);
+    try std.testing.expect(recorder.prompt_order.? < recorder.login_order.?);
+    try std.testing.expect(recorder.login_order.? < recorder.model_order.?);
+    try std.testing.expect(host.snapshot().phase == .turn);
+
+    const journal = try std.Io.Dir.readFileAlloc(
+        .cwd(),
+        std.testing.io,
+        host.journal_path,
+        std.testing.allocator,
+        .unlimited,
+    );
+    defer std.testing.allocator.free(journal);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, journal, "model_change"));
+}
+
+test "device auth fact retries before cancellation settles" {
+    const BlockingDeviceTransport = struct {
+        const Self = @This();
+
+        calls: usize = 0,
+
+        pub fn exchange(
+            self: *Self,
+            allocator: std.mem.Allocator,
+            io: std.Io,
+            request: ai.transport.Request,
+            _: ai.transport.Delivery,
+        ) ai.transport.Error!ai.transport.Response {
+            self.calls += 1;
+            if (self.calls == 1) return .{
+                .status = 200,
+                .body = try allocator.dupe(
+                    u8,
+                    "{\"device_auth_id\":\"device\",\"user_code\":\"CODE\",\"interval\":5}",
+                ),
+            };
+            while (request.cancellation) |cancellation| {
+                if (cancellation.isCancelled()) return error.Cancelled;
+                io.sleep(.fromMilliseconds(1), .awake) catch return error.Cancelled;
+            } else return error.InvalidRequest;
+        }
+    };
+
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var root_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root = try hostTestRoot(&temporary, &root_buffer);
+    var transport: BlockingDeviceTransport = .{};
+    var sources: HostTestSources = .{};
+    const host = try createHostForTest(root, sources.view(), null, .{
+        .auth_transport = ai.transport.Transport.from(&transport),
+    });
+    defer host.deinit();
+    try std.testing.expect((try host.submit("/login openai-codex --device")) == .command);
+
+    var recorder: DeviceRetryRecorder = .{ .host = host };
+    for (0..5_000) |_| {
+        if (host.hasPendingFacts()) {
+            var update = host.drain("", recorder.sink()) catch |failure| {
+                try std.testing.expectEqual(error.Injected, failure);
+                continue;
+            };
+            update.deinit();
+        }
+        if (recorder.saw_cancelled) break;
+        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expectEqual(@as(usize, 2), recorder.device_attempts);
+    try std.testing.expect(recorder.saw_cancelled);
+    try std.testing.expect(host.snapshot().phase == .model_less);
 }
 
 test "background login activates the original journal without exposing the answer" {
@@ -991,7 +1360,7 @@ test "background login activates the original journal without exposing the answe
     defer std.testing.allocator.free(journal_path);
     try std.testing.expect((try host.submit("/login openai-codex")) == .command);
     try std.testing.expectError(
-        error.AuthenticationBusy,
+        error.CommandBusy,
         host.submit("/model openai-codex/gpt-5.6-terra"),
     );
 

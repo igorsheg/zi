@@ -69,9 +69,33 @@ pub const DrainResult = struct {
     }
 };
 
+const DeliverySource = union(enum) {
+    event: usize,
+    completion: struct {
+        index: usize,
+        agent_end_observed: bool,
+    },
+};
+
+const DeliveryStage = union(enum) {
+    primary: SessionPolicy.Effect,
+    effect: SessionPolicy.Effect,
+    fault: Fault,
+};
+
+const PreparedDelivery = struct {
+    source: DeliverySource,
+    stage: DeliveryStage,
+};
+
 allocator: std.mem.Allocator,
 worker: *TurnWorker,
 policy: SessionPolicy,
+in_flight: ?TurnWorker.Batch = null,
+event_cursor: usize = 0,
+completion_cursor: usize = 0,
+prepared: ?PreparedDelivery = null,
+pending_restored: ?OwnedDraft = null,
 
 pub fn init(
     allocator: std.mem.Allocator,
@@ -86,6 +110,8 @@ pub fn init(
 }
 
 pub fn deinit(self: *SessionController) void {
+    if (self.pending_restored) |*restored| restored.deinit();
+    if (self.in_flight) |*batch| batch.deinit(self.allocator);
     self.policy.deinit();
     self.* = undefined;
 }
@@ -105,8 +131,8 @@ pub fn queuedFollowUp(self: *const SessionController, index: usize) ?[]const u8 
 }
 
 pub fn hasPendingFacts(self: *SessionController) bool {
-    const snapshot = self.worker.snapshot();
-    return snapshot.queued_events != 0 or snapshot.queued_completions != 0;
+    if (self.in_flight != null or self.prepared != null or self.pending_restored != null) return true;
+    return workerHasPending(self.worker);
 }
 
 /// Admits a prompt transactionally. The caller may clear its editor only after
@@ -142,64 +168,134 @@ pub fn cancel(
     return result.restored;
 }
 
-/// Reduces one detached worker batch in contractual order. The controller owns
-/// interactive transitions and worker effects; the client only consumes facts.
+/// Reduces detached worker output in contractual order. A policy transition is
+/// prepared once, then its borrowed fact remains retained until the sink accepts it.
 pub fn drain(
     self: *SessionController,
     current_draft: []const u8,
     sink: Sink,
 ) !DrainResult {
-    if (!self.hasPendingFacts()) return .{};
+    while (true) {
+        if (self.pending_restored) |restored| {
+            self.pending_restored = null;
+            return .{ .restored = restored };
+        }
+        if (self.prepared != null) {
+            try self.deliverPrepared(current_draft, sink);
+            continue;
+        }
+        if (self.in_flight == null) {
+            if (!workerHasPending(self.worker)) return .{};
+            self.in_flight = try self.worker.takeBatch();
+            self.event_cursor = 0;
+            self.completion_cursor = 0;
+        }
+        if (self.prepareNext()) continue;
 
-    var batch = try self.worker.takeBatch();
-    defer batch.deinit(self.allocator);
-    var result: DrainResult = .{};
-    errdefer result.deinit();
-
-    for (batch.events.items) |owned| {
-        const reduced = self.policy.applyEvent(owned.value);
-        if (reduced.admission == .stale) continue;
-        try sink.emit(.{ .event = owned.value });
-        try self.applyEffect(reduced.effect, current_draft, sink, &result);
+        self.in_flight.?.deinit(self.allocator);
+        self.in_flight = null;
     }
-    for (batch.completions.items) |completion| {
-        const reduced = self.policy.applyCompletion(completion.run_id, completion.availability);
-        if (reduced.admission == .stale) continue;
-        try sink.emit(.{ .completion = .{
-            .value = completion,
-            .agent_end_observed = batchContainsAgentEnd(&batch, completion.run_id),
-        } });
-        try self.applyEffect(reduced.effect, current_draft, sink, &result);
-    }
-    return result;
 }
 
-fn applyEffect(
+fn prepareNext(self: *SessionController) bool {
+    const batch = &self.in_flight.?;
+    while (self.event_cursor < batch.events.items.len) {
+        const index = self.event_cursor;
+        const reduced = self.policy.applyEvent(batch.events.items[index].value);
+        if (reduced.admission == .stale) {
+            self.event_cursor += 1;
+            continue;
+        }
+        self.prepared = .{
+            .source = .{ .event = index },
+            .stage = .{ .primary = reduced.effect },
+        };
+        return true;
+    }
+    while (self.completion_cursor < batch.completions.items.len) {
+        const index = self.completion_cursor;
+        const completion = batch.completions.items[index];
+        const reduced = self.policy.applyCompletion(completion.run_id, completion.availability);
+        if (reduced.admission == .stale) {
+            self.completion_cursor += 1;
+            continue;
+        }
+        self.prepared = .{
+            .source = .{ .completion = .{
+                .index = index,
+                .agent_end_observed = batchContainsAgentEnd(batch, completion.run_id),
+            } },
+            .stage = .{ .primary = reduced.effect },
+        };
+        return true;
+    }
+    return false;
+}
+
+fn deliverPrepared(
     self: *SessionController,
-    effect: SessionPolicy.Effect,
     current_draft: []const u8,
     sink: Sink,
-    result: *DrainResult,
 ) !void {
-    switch (effect) {
-        .none => {},
-        .request_cancel => _ = self.worker.requestCancel(),
-        .submit_follow_up => |prompt| {
-            self.worker.submit(prompt) catch |failure| {
-                self.policy.rejectFollowUpSubmission();
-                try sink.emit(.{ .fault = .{ .follow_up_submission = failure } });
-                return;
-            };
-            self.policy.confirmFollowUpSubmission();
+    while (true) switch (self.prepared.?.stage) {
+        .primary => |effect| {
+            try sink.emit(self.preparedFact());
+            self.prepared.?.stage = .{ .effect = effect };
         },
-        .session_poisoned => {
-            std.debug.assert(result.restored == null);
-            result.restored = self.policy.restoreQueued(current_draft) catch |failure| {
-                try sink.emit(.{ .fault = .{ .draft_restore = failure } });
-                return;
-            };
+        .effect => |effect| switch (effect) {
+            .none => return self.finishPrepared(),
+            .request_cancel => {
+                _ = self.worker.requestCancel();
+                return self.finishPrepared();
+            },
+            .submit_follow_up => |prompt| {
+                self.worker.submit(prompt) catch |failure| {
+                    self.policy.rejectFollowUpSubmission();
+                    self.prepared.?.stage = .{ .fault = .{
+                        .follow_up_submission = failure,
+                    } };
+                    continue;
+                };
+                self.policy.confirmFollowUpSubmission();
+                return self.finishPrepared();
+            },
+            .session_poisoned => {
+                self.pending_restored = self.policy.restoreQueued(current_draft) catch |failure| {
+                    self.prepared.?.stage = .{ .fault = .{ .draft_restore = failure } };
+                    continue;
+                };
+                return self.finishPrepared();
+            },
         },
+        .fault => |fault| {
+            try sink.emit(.{ .fault = fault });
+            return self.finishPrepared();
+        },
+    };
+}
+
+fn preparedFact(self: *SessionController) Fact {
+    const batch = &self.in_flight.?;
+    return switch (self.prepared.?.source) {
+        .event => |index| .{ .event = batch.events.items[index].value },
+        .completion => |delivery| .{ .completion = .{
+            .value = batch.completions.items[delivery.index],
+            .agent_end_observed = delivery.agent_end_observed,
+        } },
+    };
+}
+
+fn finishPrepared(self: *SessionController) void {
+    switch (self.prepared.?.source) {
+        .event => self.event_cursor += 1,
+        .completion => self.completion_cursor += 1,
     }
+    self.prepared = null;
+}
+
+fn workerHasPending(worker: *TurnWorker) bool {
+    const snapshot = worker.snapshot();
+    return snapshot.queued_events != 0 or snapshot.queued_completions != 0;
 }
 
 fn batchContainsAgentEnd(
@@ -270,6 +366,51 @@ const TestSink = struct {
     }
 };
 
+const RetrySink = struct {
+    sequence: usize = 0,
+    start_attempts: usize = 0,
+    end_attempts: usize = 0,
+    completion_attempts: usize = 0,
+    start_order: ?usize = null,
+    end_order: ?usize = null,
+    completion_order: ?usize = null,
+
+    fn emit(context: *anyopaque, fact: Fact) !void {
+        const self: *RetrySink = @ptrCast(@alignCast(context));
+        switch (fact) {
+            .event => |event| switch (event) {
+                .agent_start => {
+                    self.start_attempts += 1;
+                    if (self.start_attempts == 1) return error.Injected;
+                    self.start_order = self.nextOrder();
+                },
+                .agent_end => {
+                    self.end_attempts += 1;
+                    if (self.end_attempts == 1) return error.Injected;
+                    self.end_order = self.nextOrder();
+                },
+                else => {},
+            },
+            .completion => {
+                self.completion_attempts += 1;
+                if (self.completion_attempts == 1) return error.Injected;
+                self.completion_order = self.nextOrder();
+            },
+            .fault => return error.UnexpectedFault,
+        }
+    }
+
+    fn nextOrder(self: *RetrySink) usize {
+        const result = self.sequence;
+        self.sequence += 1;
+        return result;
+    }
+
+    fn sink(self: *RetrySink) Sink {
+        return .{ .context = self, .emitFn = emit };
+    }
+};
+
 test "session controller drives a worker without frontend state" {
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();
@@ -317,4 +458,67 @@ test "session controller drives a worker without frontend state" {
     try std.testing.expect(settled);
     try std.testing.expect(sink.saw_agent_end);
     try std.testing.expectEqual(@as(usize, 1), sink.completion_count);
+}
+
+test "session controller retries prepared turn facts without repeating policy transitions" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var scripted: ai.testing.ScriptedModel = .{
+        .identity = .{ .provider = "script", .model = "controller-retry" },
+        .steps = &.{.{ .text = "answer" }},
+    };
+    const owner = try TestSessionOwner.create(
+        std.testing.allocator,
+        scripted.asModel(),
+        temporary.dir,
+    );
+    var worker = try TurnWorker.start(
+        std.testing.allocator,
+        std.testing.io,
+        TurnWorker.SessionOwner.from(owner),
+        .{},
+    );
+    defer worker.deinit();
+    var controller = try SessionController.init(
+        std.testing.allocator,
+        worker,
+        SessionPolicy.default_limits,
+    );
+    defer controller.deinit();
+
+    try std.testing.expectEqual(SubmitDisposition.started, try controller.submit("hello"));
+    var sink: RetrySink = .{};
+    var saw_completion_failure_at_idle = false;
+    var settled = false;
+    for (0..10_000) |_| {
+        var update = controller.drain("", sink.sink()) catch |failure| {
+            try std.testing.expectEqual(error.Injected, failure);
+            if (sink.completion_attempts == 1) {
+                try std.testing.expect(controller.phase() == .idle);
+                saw_completion_failure_at_idle = true;
+            }
+            std.Thread.yield() catch std.atomic.spinLoopHint();
+            continue;
+        };
+        update.deinit();
+        const snapshot = worker.snapshot();
+        if (!snapshot.processing and
+            snapshot.queued_prompts == 0 and
+            !controller.hasPendingFacts() and
+            controller.phase() == .idle)
+        {
+            settled = true;
+            break;
+        }
+        std.Thread.yield() catch std.atomic.spinLoopHint();
+    }
+
+    try std.testing.expect(settled);
+    try std.testing.expect(saw_completion_failure_at_idle);
+    try std.testing.expectEqual(@as(usize, 2), sink.start_attempts);
+    try std.testing.expectEqual(@as(usize, 2), sink.end_attempts);
+    try std.testing.expectEqual(@as(usize, 2), sink.completion_attempts);
+    try std.testing.expect(sink.start_order.? < sink.end_order.?);
+    try std.testing.expect(sink.end_order.? < sink.completion_order.?);
+    try std.testing.expect(controller.phase() == .idle);
 }

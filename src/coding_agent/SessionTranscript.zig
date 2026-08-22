@@ -141,9 +141,78 @@ pub fn init(
     };
 }
 
+/// Deep-copies a transcript into storage owned by the returned value.
+pub fn clone(
+    self: *const SessionTranscript,
+    allocator: std.mem.Allocator,
+) error{OutOfMemory}!SessionTranscript {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    const memory = arena.allocator();
+    const items = try memory.alloc(Item, self.items.len);
+    for (self.items, items) |item, *copy| {
+        copy.* = .{
+            .metadata = try cloneMetadataLeaky(memory, item.metadata),
+            .content = try cloneContentLeaky(memory, item.content),
+        };
+    }
+    return .{ .arena = arena, .items = items };
+}
+
 pub fn deinit(self: *SessionTranscript) void {
     self.arena.deinit();
     self.* = undefined;
+}
+
+fn cloneMetadataLeaky(
+    allocator: std.mem.Allocator,
+    metadata: Metadata,
+) error{OutOfMemory}!Metadata {
+    return switch (metadata) {
+        .durable => |durable| .{ .durable = .{
+            .entry_id = try allocator.dupe(u8, durable.entry_id),
+            .timestamp = try allocator.dupe(u8, durable.timestamp),
+        } },
+        .recovered_open_turn => .recovered_open_turn,
+    };
+}
+
+fn cloneContentLeaky(
+    allocator: std.mem.Allocator,
+    content: Content,
+) error{OutOfMemory}!Content {
+    return switch (content) {
+        .model_change => |identity| .{
+            .model_change = try ai.message.copyIdentityLeaky(allocator, identity),
+        },
+        .user => |user| result: {
+            const parts = try allocator.alloc(ai.message.UserContent, user.parts.len);
+            for (user.parts, parts) |part, *copy| {
+                copy.* = try ai.message.copyUserContentLeaky(allocator, part);
+            }
+            break :result .{ .user = .{ .parts = parts } };
+        },
+        .assistant => |response| .{
+            .assistant = try ai.message.copyResponseLeaky(allocator, response),
+        },
+        .tool_results => |tool_results| result: {
+            const results = try allocator.alloc(ai.message.ToolResult, tool_results.results.len);
+            for (tool_results.results, results) |tool_result, *copy| {
+                copy.* = try ai.message.copyToolResultLeaky(allocator, tool_result);
+            }
+            break :result .{ .tool_results = .{ .results = results } };
+        },
+        .failure => |failure| .{ .failure = .{
+            .turn_id = try allocator.dupe(u8, failure.turn_id),
+            .category = failure.category,
+        } },
+        .cancelled => |cancelled| .{ .cancelled = .{
+            .turn_id = try allocator.dupe(u8, cancelled.turn_id),
+        } },
+        .interrupted => |interrupted| .{ .interrupted = .{
+            .turn_id = try allocator.dupe(u8, interrupted.turn_id),
+        } },
+    };
 }
 
 const RequestKind = enum {
@@ -414,6 +483,28 @@ test "transcript settles every allocation failure" {
     try std.testing.checkAllAllocationFailures(
         std.testing.allocator,
         projectForAllocationFailure,
+        .{},
+    );
+}
+
+fn cloneForAllocationFailure(allocator: std.mem.Allocator) !void {
+    const entries = [_]session_format.Entry{.{ .message = .{
+        .base = .{ .id = "user", .parent_id = null, .timestamp = "t0" },
+        .message = .{ .request = .{ .parts = &.{.{ .user = .{ .text = "secret" } }} } },
+    } }};
+    var restored = restoredView(&entries, "user", .clean);
+    defer restored.deinit();
+    var source = try SessionTranscript.init(std.testing.allocator, &restored);
+    defer source.deinit();
+    var copy = try source.clone(allocator);
+    defer copy.deinit();
+    try std.testing.expectEqualStrings("secret", copy.items[0].content.user.parts[0].text);
+}
+
+test "transcript clone owns nested data and settles every allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        cloneForAllocationFailure,
         .{},
     );
 }

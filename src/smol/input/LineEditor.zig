@@ -18,7 +18,11 @@ pub fn init(allocator: std.mem.Allocator, max_bytes: usize) LineEditor {
 }
 
 pub fn deinit(self: *LineEditor) void {
-    self.bytes.deinit(self.allocator);
+    const allocation = self.bytes.allocatedSlice();
+    std.crypto.secureZero(u8, allocation);
+    if (allocation.len != 0) {
+        self.allocator.rawFree(allocation, .of(u8), @returnAddress());
+    }
     self.* = undefined;
 }
 
@@ -76,8 +80,8 @@ pub fn clear(self: *LineEditor) void {
 }
 
 pub fn secureClear(self: *LineEditor) void {
-    std.crypto.secureZero(u8, self.bytes.items);
     self.clear();
+    std.crypto.secureZero(u8, self.bytes.allocatedSlice());
 }
 
 pub fn replace(self: *LineEditor, replacement: []const u8) Error!void {
@@ -168,15 +172,30 @@ test "line editor preserves byte editing for partial invalid UTF-8" {
     try std.testing.expectEqualStrings("az", editor.text());
 }
 
-test "line editor securely clears an OAuth answer" {
-    var editor = LineEditor.init(std.testing.allocator, 32);
-    defer editor.deinit();
+test "line editor securely clears deleted and retained OAuth answer bytes" {
+    var backing: [256]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&backing);
+    var editor = LineEditor.init(fixed.allocator(), 32);
     try editor.replace("authorization-secret");
+    editor.deleteBackward();
+    editor.deleteBackward();
     const retained = editor.bytes.allocatedSlice();
     editor.secureClear();
     try std.testing.expect(editor.isEmpty());
     try std.testing.expectEqual(@as(usize, 0), editor.cursorByte());
-    try std.testing.expect(!std.mem.eql(u8, "authorization-secret", retained[0..20]));
+    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 20), retained[0..20]);
+    editor.deinit();
+}
+
+test "line editor deinit wipes its full allocation" {
+    var backing: [256]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&backing);
+    var editor = LineEditor.init(fixed.allocator(), 32);
+    try editor.replace("teardown-secret");
+    editor.deleteBackward();
+    const retained = editor.bytes.allocatedSlice();
+    editor.deinit();
+    for (retained) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
 }
 
 test "line editor replacement is transactional at its bound" {

@@ -439,7 +439,7 @@ fn notify(context: *anyopaque, event: ai.oauth.Event) anyerror!void {
 // ziglint-ignore: Z023
 fn prompt(
     context: *anyopaque,
-    _: std.mem.Allocator, // ziglint-ignore: Z023
+    allocator: std.mem.Allocator, // ziglint-ignore: Z023
     request: ai.oauth.Prompt,
 ) anyerror![]u8 {
     const self: *AuthOperation = @ptrCast(@alignCast(context));
@@ -457,7 +457,11 @@ fn prompt(
         self.condition.wait(self.io, &self.mutex) catch continue;
     }
     if (self.cancellation.isCancelled()) return error.Cancelled;
-    const answer_value = self.pending_answer.?;
+    const answer_value = try copyPromptAnswer(
+        allocator,
+        self.allocator,
+        self.pending_answer.?,
+    );
     self.pending_answer = null;
     self.awaiting_prompt = false;
     return answer_value;
@@ -493,9 +497,19 @@ fn admitFactBytes(max_bytes: usize, values: []const []const u8) error{FactTooLar
     }
 }
 
+fn copyPromptAnswer(
+    output_allocator: std.mem.Allocator,
+    mailbox_allocator: std.mem.Allocator,
+    mailbox_value: []u8,
+) error{OutOfMemory}![]u8 {
+    const output = try output_allocator.dupe(u8, mailbox_value);
+    wipeAndFree(mailbox_allocator, mailbox_value);
+    return output;
+}
+
 fn wipeAndFree(allocator: std.mem.Allocator, value: []u8) void {
     std.crypto.secureZero(u8, value);
-    allocator.free(value);
+    allocator.rawFree(value, .of(u8), @returnAddress());
 }
 
 fn mapFailure(failure: CredentialManager.Error) Failure {
@@ -666,6 +680,22 @@ test "device OAuth cancellation interrupts a blocked poll without prompting" {
     }
     try std.testing.expect(saw_device);
     try std.testing.expect(cancelled);
+}
+
+test "OAuth prompt answers move into the callback allocator" {
+    var mailbox_backing: [64]u8 = undefined;
+    var output_backing: [64]u8 = undefined;
+    var mailbox = std.heap.FixedBufferAllocator.init(&mailbox_backing);
+    var output = std.heap.FixedBufferAllocator.init(&output_backing);
+    const mailbox_value = try mailbox.allocator().dupe(u8, "provider-answer");
+    const copied_answer = try copyPromptAnswer(output.allocator(), mailbox.allocator(), mailbox_value);
+    defer output.allocator().free(copied_answer);
+
+    try std.testing.expect(output.ownsSlice(copied_answer));
+    try std.testing.expectEqualStrings("provider-answer", copied_answer);
+    for (mailbox_backing[0.."provider-answer".len]) |byte| {
+        try std.testing.expectEqual(@as(u8, 0), byte);
+    }
 }
 
 test "OAuth fact and answer bounds reject data without retaining it" {
