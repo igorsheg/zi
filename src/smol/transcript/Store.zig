@@ -24,6 +24,7 @@ pub const Error = error{
     EntryNotFound,
     EntrySealed,
     IdExhausted,
+    OpenEntryExists,
 };
 
 /// One transcript entry. The source holds presentation bytes (text with
@@ -58,8 +59,20 @@ pub fn deinit(self: *Store) void {
     self.* = undefined;
 }
 
-/// Appends one open entry seeded with `bytes`. Returns the sequential id.
-pub fn appendEntry(self: *Store, kind: Kind, bytes: []const u8) Error!u32 {
+/// Appends one immutable entry. No entry may follow an open tail.
+pub fn appendSealed(self: *Store, kind: Kind, bytes: []const u8) Error!u32 {
+    return self.append(kind, bytes, true);
+}
+
+/// Opens the only mutable entry, which is always the store tail.
+pub fn openEntry(self: *Store, kind: Kind, bytes: []const u8) Error!u32 {
+    return self.append(kind, bytes, false);
+}
+
+fn append(self: *Store, kind: Kind, bytes: []const u8, sealed: bool) Error!u32 {
+    if (self.lastEntry()) |last| {
+        if (!last.sealed) return error.OpenEntryExists;
+    }
     if (bytes.len > self.max_store_bytes - self.total_bytes) return error.StoreFull;
     if (self.next_id == std.math.maxInt(u32)) return error.IdExhausted;
     const id = self.next_id;
@@ -71,6 +84,7 @@ pub fn appendEntry(self: *Store, kind: Kind, bytes: []const u8) Error!u32 {
     try self.entries.append(self.allocator, .{
         .id = id,
         .kind = kind,
+        .sealed = sealed,
         .source = source,
     });
     self.total_bytes += bytes.len;
@@ -89,6 +103,7 @@ pub fn appendTo(self: *Store, id: u32, bytes: []const u8) Error!void {
 
 pub fn sealEntry(self: *Store, id: u32) Error!void {
     const target = self.entry(id) orelse return error.EntryNotFound;
+    if (target.sealed) return error.EntrySealed;
     target.sealed = true;
 }
 
@@ -130,33 +145,35 @@ fn entry(self: *Store, id: u32) ?*Entry {
     }
     return null;
 }
-
-test "entries get sequential ids and grow until sealed" {
+test "entries get sequential ids and only the tail may stay open" {
     var store = init(std.testing.allocator, 256);
     defer store.deinit();
 
-    const first = try store.appendEntry(.user, "hello\n");
-    const second = try store.appendEntry(.assistant, "");
+    const first = try store.appendSealed(.user, "hello\n");
+    const second = try store.openEntry(.assistant, "");
     try std.testing.expectEqual(first + 1, second);
     try std.testing.expectEqual(@as(usize, 2), store.entryCount());
+    try std.testing.expectError(error.OpenEntryExists, store.openEntry(.thinking, ""));
+    try std.testing.expectError(error.OpenEntryExists, store.appendSealed(.notice, "later"));
 
     try store.appendTo(second, "streaming ");
     try store.appendTo(second, "text");
     try store.sealEntry(second);
     try std.testing.expectEqualStrings("streaming text", store.entry(second).?.bytes());
     try std.testing.expect(store.entry(second).?.sealed);
-
     try std.testing.expectError(error.EntrySealed, store.appendTo(second, "more"));
-    try std.testing.expect(store.entry(first).?.sealed == false);
+
+    const third = try store.appendSealed(.notice, "done\n");
+    try std.testing.expectEqual(second + 1, third);
 }
 
 test "dropEntriesFrom frees the subtree and keeps earlier entries" {
     var store = init(std.testing.allocator, 256);
     defer store.deinit();
 
-    const keep = try store.appendEntry(.welcome, "welcome\n");
-    _ = try store.appendEntry(.assistant, "partial");
-    _ = try store.appendEntry(.notice, "[cancelled]\n");
+    const keep = try store.appendSealed(.welcome, "welcome\n");
+    _ = try store.appendSealed(.assistant, "partial");
+    _ = try store.appendSealed(.notice, "[cancelled]\n");
     const before = store.total_bytes;
 
     try store.dropEntriesFrom(keep + 1);
@@ -164,8 +181,7 @@ test "dropEntriesFrom frees the subtree and keeps earlier entries" {
     try std.testing.expectEqual(before - "partial".len - "[cancelled]\n".len, store.total_bytes);
     try std.testing.expectEqualStrings("welcome\n", store.entryAt(0).?.bytes());
 
-    // Dropped ids are gone; new appends continue the sequence without reuse.
-    const fresh = try store.appendEntry(.user, "again\n");
+    const fresh = try store.appendSealed(.user, "again\n");
     try std.testing.expect(fresh > keep + 2);
 }
 
@@ -173,8 +189,8 @@ test "the byte bound rejects appends transactionally" {
     var store = init(std.testing.allocator, 16);
     defer store.deinit();
 
-    const id = try store.appendEntry(.assistant, "twelve bytes");
-    try std.testing.expectError(error.StoreFull, store.appendEntry(.notice, "way too long"));
+    try std.testing.expectError(error.StoreFull, store.appendSealed(.notice, "way too long for bound"));
+    const id = try store.openEntry(.assistant, "twelve bytes");
     try std.testing.expectError(error.StoreFull, store.appendTo(id, "overflow"));
     try std.testing.expectEqual(@as(usize, 12), store.total_bytes);
     try std.testing.expectEqualStrings("twelve bytes", store.entry(id).?.bytes());
@@ -185,7 +201,7 @@ test "entry ids fail explicitly before integer exhaustion" {
     defer store.deinit();
     store.next_id = std.math.maxInt(u32);
 
-    try std.testing.expectError(error.IdExhausted, store.appendEntry(.notice, ""));
+    try std.testing.expectError(error.IdExhausted, store.appendSealed(.notice, ""));
     try std.testing.expectEqual(@as(usize, 0), store.entryCount());
 }
 
@@ -194,7 +210,7 @@ test "entry lookups miss unknown and dropped ids" {
     defer store.deinit();
 
     try std.testing.expectError(error.EntryNotFound, store.sealEntry(99));
-    const id = try store.appendEntry(.tool, "tool\n");
+    const id = try store.openEntry(.tool, "tool\n");
     try std.testing.expectError(error.EntryNotFound, store.dropEntriesFrom(50));
     try store.dropEntriesFrom(id);
     try std.testing.expectError(error.EntryNotFound, store.appendTo(id, "x"));

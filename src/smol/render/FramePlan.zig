@@ -154,11 +154,17 @@ pub fn solve(input: SolveInput) SolveError!FramePlan {
         materialized_transcript_rows;
     const document_rows = std.math.cast(u16, document_rows_unbounded) orelse
         return error.DocumentRowCountOverflow;
-    const physical_scroll_rows_u16 = @max(required_release_rows, document_rows);
-    const blank_scroll_rows = physical_scroll_rows_u16 - document_rows;
-    const physical_scroll_rows: u32 = physical_scroll_rows_u16;
+    const physical_scroll_rows = std.math.add(
+        u32,
+        required_release_rows,
+        document_rows,
+    ) catch return error.DocumentRowCountOverflow;
+    const blank_scroll_rows = required_release_rows;
     const preserved_capacity = initial_owned_top - 1;
-    const released_preserved_rows = @min(physical_scroll_rows_u16, preserved_capacity);
+    const released_preserved_rows: u16 = @intCast(@min(
+        physical_scroll_rows,
+        @as(u32, preserved_capacity),
+    ));
     const owned_top = initial_owned_top - released_preserved_rows;
     const owned_bottom = if (frame_height == 0)
         owned_top - 1
@@ -337,7 +343,7 @@ test "tiny terminals reserve the footer before transcript rows" {
     try std.testing.expectEqual(@as(u16, 1), two_rows.visible_transcript_rows);
     try std.testing.expectEqual(@as(u32, 11), two_rows.materialized_transcript_rows);
     try std.testing.expectEqual(@as(u16, 11), two_rows.document_rows);
-    try std.testing.expectEqual(@as(u32, 11), two_rows.physical_scroll_rows);
+    try std.testing.expectEqual(@as(u32, 12), two_rows.physical_scroll_rows);
     try expectPlanBands(two_rows, .empty(), .{ .top = 1, .bottom = 1 }, .{ .top = 2, .bottom = 2 });
 }
 
@@ -476,8 +482,8 @@ test "full lower frame growth accounts for preserved release first" {
 
     try std.testing.expectEqual(@as(u16, 4), grown.required_release_rows);
     try std.testing.expectEqual(@as(u16, 1), grown.document_rows);
-    try std.testing.expectEqual(@as(u16, 3), grown.blank_scroll_rows);
-    try std.testing.expectEqual(@as(u32, 4), grown.physical_scroll_rows);
+    try std.testing.expectEqual(@as(u16, 4), grown.blank_scroll_rows);
+    try std.testing.expectEqual(@as(u32, 5), grown.physical_scroll_rows);
     try std.testing.expectEqual(@as(u16, 4), grown.released_preserved_rows);
     try std.testing.expectEqual(@as(u16, 1), grown.owned_top);
 }
@@ -558,8 +564,8 @@ test "first oversized frame materializes its complete hidden prefix" {
     try std.testing.expectEqual(@as(u32, 7), plan.materialized_transcript_rows);
     try std.testing.expectEqual(@as(u16, 3), plan.required_release_rows);
     try std.testing.expectEqual(@as(u16, 7), plan.document_rows);
-    try std.testing.expectEqual(@as(u16, 0), plan.blank_scroll_rows);
-    try std.testing.expectEqual(@as(u32, 7), plan.physical_scroll_rows);
+    try std.testing.expectEqual(@as(u16, 3), plan.blank_scroll_rows);
+    try std.testing.expectEqual(@as(u32, 10), plan.physical_scroll_rows);
     try std.testing.expectEqual(@as(u16, 3), plan.released_preserved_rows);
 }
 
@@ -585,7 +591,7 @@ test "same geometry materializes only the increase in hidden prefix" {
     try std.testing.expectEqual(@as(u32, 9), grown.physical_scroll_rows);
 }
 
-test "release and document rows share movement instead of adding" {
+test "preserved release precedes additive document movement" {
     const initial = try solve(.{
         .geometry = .{ .rows = 8, .columns = 20 },
         .launch_row = 6,
@@ -602,8 +608,8 @@ test "release and document rows share movement instead of adding" {
 
     try std.testing.expectEqual(@as(u16, 5), grown.required_release_rows);
     try std.testing.expectEqual(@as(u16, 2), grown.document_rows);
-    try std.testing.expectEqual(@as(u16, 3), grown.blank_scroll_rows);
-    try std.testing.expectEqual(@as(u32, 5), grown.physical_scroll_rows);
+    try std.testing.expectEqual(@as(u16, 5), grown.blank_scroll_rows);
+    try std.testing.expectEqual(@as(u32, 7), grown.physical_scroll_rows);
 }
 
 test "geometry change records the new hidden prefix without materializing reflow" {

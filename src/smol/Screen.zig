@@ -350,7 +350,7 @@ fn streamMarkdownBytes(self: *Screen, bytes: []const u8) !void {
             "\x1b[2mThinking\x1b[22m\n"
         else
             "";
-        self.open_entry = try self.store.appendEntry(
+        self.open_entry = try self.store.openEntry(
             switch (self.open_kind) {
                 .assistant => .assistant,
                 .thinking => .thinking,
@@ -563,9 +563,7 @@ fn addNotice(self: *Screen, label: []const u8) !void {
 }
 
 fn sealedEntry(self: *Screen, kind: Kind, bytes: []const u8) !u32 {
-    const id = try self.store.appendEntry(kind, bytes);
-    try self.store.sealEntry(id);
-    return id;
+    return self.store.appendSealed(kind, bytes);
 }
 
 fn remainingStoreBytes(self: *const Screen) usize {
@@ -1466,7 +1464,7 @@ test "screen makes an open entry irreversible on its first materializing commit"
     defer screen.deinit();
     try screen.begin(.{ .rows = 4, .columns = 20 }, 1);
 
-    const id = try screen.store.appendEntry(.assistant, "one\ntwo\nthree\n");
+    const id = try screen.store.openEntry(.assistant, "one\ntwo\nthree\n");
     screen.open_entry = id;
     screen.requests.request(.transcript);
     try screen.commit(.{
@@ -1514,7 +1512,7 @@ test "screen settles a partial assistant after native scrolling makes it final" 
     defer screen.deinit();
     try screen.begin(.{ .rows = 4, .columns = 20 }, 1);
 
-    const id = try screen.store.appendEntry(.assistant, "one\ntwo\n");
+    const id = try screen.store.openEntry(.assistant, "one\ntwo\n");
     screen.open_entry = id;
     screen.requests.request(.transcript);
     try screen.commit(.{

@@ -230,7 +230,9 @@ fn applyMovementToCandidate(
     if (document) |value| {
         var row: u16 = 1;
         while (row <= value.rows) : (row += 1) {
-            try candidate.copyRowFrom(candidate.rows, value, row);
+            // A document row is painted at the first owned row, then one
+            // bottom-edge linefeed releases that exact row into history.
+            try candidate.copyRowFrom(frame_plan.owned_top, value, row);
             candidate.scrollUp(1);
         }
     }
@@ -336,9 +338,11 @@ fn writeMovement(
         var row: u16 = 1;
         while (row <= value.rows) : (row += 1) {
             encoder.forgetCursor();
-            try encoder.moveTo(.{ .row = terminal_rows, .column = 1 });
+            try encoder.moveTo(.{ .row = frame_plan.owned_top, .column = 1 });
             try encoder.eraseLine(.entire);
             try writeRow(encoder, value, row);
+            encoder.forgetCursor();
+            try encoder.moveTo(.{ .row = terminal_rows, .column = 1 });
             try encoder.writer.writeAll("\r\n");
             encoder.invalidate();
         }
@@ -493,6 +497,41 @@ test "initial oversized document rows publish exactly once in typed order" {
     const unchanged_plan = try renderer.plan(.{ .rows = 4, .columns = 12 }, 6, 1);
     _ = try renderer.commit(&output.writer, &target, null, unchanged_plan);
     try std.testing.expectEqual(before, output.written().len);
+}
+
+test "lower launch releases shell rows before document history" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var renderer = TerminalRenderer.init(std.testing.allocator);
+    defer renderer.deinit();
+    try renderer.begin(.{ .rows = 6, .columns = 20 }, 4);
+
+    const frame_plan = try renderer.plan(.{ .rows = 6, .columns = 20 }, 11, 2);
+    try std.testing.expectEqual(@as(u16, 3), frame_plan.blank_scroll_rows);
+    try std.testing.expectEqual(@as(u16, 7), frame_plan.document_rows);
+    try std.testing.expectEqual(@as(u32, 10), frame_plan.physical_scroll_rows);
+
+    var target = try makeTarget(std.testing.allocator, frame_plan, "visible", "Ready");
+    defer target.deinit();
+    var document = try makeDocument(
+        std.testing.allocator,
+        frame_plan,
+        &.{ "d1", "d2", "d3", "d4", "d5", "d6", "d7" },
+    );
+    defer document.deinit();
+
+    const result = try renderer.commit(&output.writer, &target, &document, frame_plan);
+    const bytes = output.written();
+    try std.testing.expectEqual(@as(u32, 10), result.physical_scroll_rows);
+    try std.testing.expectEqual(@as(usize, 10), std.mem.count(u8, bytes, "\r\n"));
+    const first_document = std.mem.find(u8, bytes, "d1").?;
+    const owned_top = std.mem.find(u8, bytes, "\x1b[1;1H").?;
+    try std.testing.expect(owned_top < first_document);
+    inline for (.{ "d1", "d2", "d3", "d4", "d5", "d6", "d7" }) |line| {
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, line));
+    }
+    try std.testing.expect(std.mem.find(u8, bytes, "\x1b[2J") == null);
+    try std.testing.expect(std.mem.find(u8, bytes, "\x1b[3J") == null);
 }
 
 test "coalesced document growth clears footer before history materialization" {
