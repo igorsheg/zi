@@ -59,6 +59,26 @@ pub fn decodeOwnedHeader(
     };
 }
 
+/// Fixed-width canonical session id text.
+pub const stamp_id_width = 36;
+
+/// Formats one 128-bit id into its fixed-width text. The hex field widths
+/// 8+1+4+1+4+1+4+1+12 compose to exactly stamp_id_width, so the print cannot
+/// run out of space; keeping the proof here means every stamp site shares it.
+fn writeStampId(buffer: *[stamp_id_width]u8, id_bytes: *const [16]u8) void {
+    _ = std.fmt.bufPrint(
+        buffer,
+        "{x:0>8}-{x:0>4}-{x:0>4}-{x:0>4}-{x:0>12}",
+        .{
+            std.mem.readInt(u32, id_bytes[0..4], .big),
+            std.mem.readInt(u16, id_bytes[4..6], .big),
+            std.mem.readInt(u16, id_bytes[6..8], .big),
+            std.mem.readInt(u16, id_bytes[8..10], .big),
+            std.mem.readInt(u48, id_bytes[10..16], .big),
+        },
+    ) catch unreachable;
+}
+
 pub const Sources = struct {
     id_context: *anyopaque,
     nextIdFn: *const fn (context: *anyopaque) [16]u8,
@@ -69,17 +89,7 @@ pub const Sources = struct {
         const id_bytes = self.nextIdFn(self.id_context);
         const unix_ms = self.nowMsFn(self.clock_context);
         var stamp: Stamp = undefined;
-        _ = std.fmt.bufPrint(
-            &stamp.id_buffer,
-            "{x:0>8}-{x:0>4}-{x:0>4}-{x:0>4}-{x:0>12}",
-            .{
-                std.mem.readInt(u32, id_bytes[0..4], .big),
-                std.mem.readInt(u16, id_bytes[4..6], .big),
-                std.mem.readInt(u16, id_bytes[6..8], .big),
-                std.mem.readInt(u16, id_bytes[8..10], .big),
-                std.mem.readInt(u48, id_bytes[10..16], .big),
-            },
-        ) catch unreachable;
+        writeStampId(&stamp.id_buffer, &id_bytes);
         try formatTimestamp(&stamp.timestamp_buffer, unix_ms);
         return stamp;
     }
@@ -739,6 +749,8 @@ fn parseTimestampPart(comptime T: type, value: []const u8) ?T {
 }
 
 fn formatTimestamp(buffer: *[24]u8, unix_ms: u64) Error!void {
+    // The clamped range keeps every field within its width, so the widths
+    // 4+1+2+1+2+1+2+1+2+1+2+1+3+1 compose to exactly buffer.len below.
     const max_unix_ms = 253_402_300_799_999;
     if (unix_ms > max_unix_ms) return error.InvalidRecord;
     const epoch_seconds: std.time.epoch.EpochSeconds = .{ .secs = unix_ms / 1000 };

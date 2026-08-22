@@ -137,6 +137,18 @@ fn ignoreDeleteError(failure: anyerror) void {
     std.debug.assert(@errorName(failure).len != 0);
 }
 
+/// Journal filenames bind a fixed-width stamp id to a constant extension.
+/// The typed id buffer makes any stamp-width change a compile error here
+/// instead of a runtime formatting failure.
+const journal_filename_width = format.stamp_id_width + ".jsonl".len;
+
+fn writeJournalFilename(buffer: *[journal_filename_width]u8, stamp: *const format.Stamp) []const u8 {
+    const id_text = &stamp.id_buffer;
+    @memcpy(buffer[0..id_text.len], id_text);
+    @memcpy(buffer[id_text.len..], ".jsonl");
+    return buffer;
+}
+
 fn createNew(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -152,8 +164,8 @@ fn createNew(
     try ensureSessionStorage(io, sessions_path);
 
     const stamp = try sources.next();
-    var filename_buffer: [42]u8 = undefined;
-    const filename = std.fmt.bufPrint(&filename_buffer, "{s}.jsonl", .{stamp.id()}) catch unreachable;
+    var filename_buffer: [journal_filename_width]u8 = undefined;
+    const filename = writeJournalFilename(&filename_buffer, &stamp);
     const journal_path = std.fs.path.resolve(allocator, &.{ sessions_path, filename }) catch
         return error.OutOfMemory;
     errdefer allocator.free(journal_path);
