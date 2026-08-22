@@ -49,13 +49,14 @@ pub fn deinit(self: *Surface) void {
     self.* = undefined;
 }
 
-/// The returned surface owns an independent copy of every referenced grapheme.
-pub fn clone(self: *const Surface) !Surface {
-    var graphemes = try self.graphemes.clone();
+/// The returned surface owns an independent copy in `allocator`, including
+/// every referenced grapheme.
+pub fn clone(self: *const Surface, allocator: std.mem.Allocator) !Surface {
+    var graphemes = try self.graphemes.clone(allocator);
     errdefer graphemes.deinit();
-    const cells = try self.allocator.dupe(Cell, self.cells);
+    const cells = try allocator.dupe(Cell, self.cells);
     return .{
-        .allocator = self.allocator,
+        .allocator = allocator,
         .rows = self.rows,
         .columns = self.columns,
         .cells = cells,
@@ -246,7 +247,7 @@ test "clone owns grapheme bytes and row equality ignores store IDs" {
     var original = try Surface.init(std.testing.allocator, 1, 4);
     defer original.deinit();
     _ = try original.writeText(1, 1, "界", .{});
-    var copy = try original.clone();
+    var copy = try original.clone(std.testing.allocator);
     defer copy.deinit();
     try std.testing.expect(rowEqual(&original, &copy, 1));
 

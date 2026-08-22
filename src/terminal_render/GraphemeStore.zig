@@ -24,11 +24,11 @@ pub fn deinit(self: *GraphemeStore) void {
     self.* = undefined;
 }
 
-pub fn clone(self: *const GraphemeStore) !GraphemeStore {
-    var copy = GraphemeStore.init(self.allocator);
+pub fn clone(self: *const GraphemeStore, allocator: std.mem.Allocator) !GraphemeStore {
+    var copy = GraphemeStore.init(allocator);
     errdefer copy.deinit();
-    try copy.bytes.appendSlice(self.allocator, self.bytes.items);
-    try copy.entries.appendSlice(self.allocator, self.entries.items);
+    try copy.bytes.appendSlice(allocator, self.bytes.items);
+    try copy.entries.appendSlice(allocator, self.entries.items);
     return copy;
 }
 
@@ -58,7 +58,7 @@ test "grapheme store clone preserves typed IDs" {
     var store = GraphemeStore.init(std.testing.allocator);
     defer store.deinit();
     const id = try store.put("👨‍👩‍👧‍👦");
-    var copy = try store.clone();
+    var copy = try store.clone(std.testing.allocator);
     defer copy.deinit();
     try std.testing.expectEqualStrings(store.get(id).?, copy.get(id).?);
 }

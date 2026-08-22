@@ -29,7 +29,9 @@ follow-ups. Cursor movement, deletion, and wrapping treat Unicode grapheme
 clusters as single characters. Press Escape to cancel the active turn, Ctrl-C
 on an empty prompt to exit, or Ctrl-D on an empty idle prompt to exit. User
 messages use a compact rail. Assistant prose and thinking render as separate
-Markdown blocks in model response order. Running tools appear in the footer,
+Markdown blocks in model response order. Settled lines appear progressively as
+the response streams, and the visible transcript reflows after a resize. Running
+tools appear in the footer,
 and completed tools append compact results without dumping arguments or output.
 When no authenticated model is available, interactive mode still opens a durable
 session. Drafts remain intact until a model is available. Use

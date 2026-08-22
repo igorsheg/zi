@@ -44,7 +44,7 @@ test "diff emits nothing for identical frames" {
     var previous = try Surface.init(std.testing.allocator, 2, 4);
     defer previous.deinit();
     _ = try previous.writeText(1, 1, "same", .{});
-    var current = try previous.clone();
+    var current = try previous.clone(std.testing.allocator);
     defer current.deinit();
 
     var iterator = Iterator.init(&previous, &current);
@@ -54,7 +54,7 @@ test "diff emits nothing for identical frames" {
 test "diff emits one changed row span" {
     var previous = try Surface.init(std.testing.allocator, 3, 4);
     defer previous.deinit();
-    var current = try previous.clone();
+    var current = try previous.clone(std.testing.allocator);
     defer current.deinit();
     _ = try current.writeText(2, 2, "x", .{});
 
