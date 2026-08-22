@@ -1,6 +1,5 @@
 const std = @import("std");
 const interactive = @import("../interactive/root.zig");
-const TurnWorker = @import("../TurnWorker.zig");
 const initial_message = @import("initial_message.zig");
 const launch = @import("launch.zig");
 const print_mode = @import("print_mode.zig");
@@ -17,60 +16,37 @@ pub fn runInteractiveLaunch(
 ) !print_mode.ExitCode {
     var prepared = (try launch.prepareInitial(request, context, false)) orelse return .failure;
     defer prepared.deinit();
-    const lifecycle = (try launch.createInteractiveRuntime(request, context)) orelse return .failure;
+    var runtime = (try launch.prepareInteractiveRuntime(request, context)) orelse return .failure;
+    var runtime_live = true;
+    defer if (runtime_live) runtime.deinit();
+    runtime_live = false;
+    const host = interactive.InteractiveSessionHost.init(
+        context.allocator,
+        context.io,
+        &runtime.inputs,
+        &runtime.lifecycle,
+        .{},
+    ) catch |failure| {
+        try context.stderr.print("Unable to start interactive behavior: {s}.\n", .{@errorName(failure)});
+        return .failure;
+    };
+    defer host.deinit();
     var prompt_buffer: [max_initial_prompts][]const u8 = undefined;
     const prompts = collectInitialPrompts(&prepared.value, &prompt_buffer);
-    return switch (lifecycle) {
-        .runnable => |runtime| runnable: {
-            const transcript = runtime.transcript();
-            const worker = TurnWorker.start(
-                context.allocator,
-                context.io,
-                TurnWorker.SessionOwner.from(runtime),
-                .{},
-            ) catch |failure| {
-                runtime.deinit();
-                try context.stderr.print("Unable to start the interactive worker: {s}.\n", .{@errorName(failure)});
-                break :runnable .failure;
-            };
-            defer worker.deinit();
-            var controller = interactive.SessionController.init(
-                context.allocator,
-                worker,
-                interactive.default_limits,
-            ) catch |failure| {
-                try context.stderr.print("Unable to start interactive behavior: {s}.\n", .{@errorName(failure)});
-                break :runnable .failure;
-            };
-            defer controller.deinit();
-            break :runnable try runFrontend(context, frontend, &controller, transcript, prompts);
-        },
-        .model_less => |runtime| model_less: {
-            defer runtime.deinit();
-            var controller = interactive.SessionController.initModelLess(
-                context.allocator,
-                interactive.default_limits,
-            ) catch |failure| {
-                try context.stderr.print("Unable to start interactive behavior: {s}.\n", .{@errorName(failure)});
-                break :model_less .failure;
-            };
-            defer controller.deinit();
-            break :model_less try runFrontend(context, frontend, &controller, runtime.transcript(), prompts);
-        },
-    };
+    return runFrontend(context, frontend, host, host.transcript(), prompts);
 }
 
 fn runFrontend(
     context: launch.LaunchContext,
     frontend: interactive.Frontend,
-    controller: *interactive.SessionController,
+    host: *interactive.InteractiveSessionHost,
     transcript: *const interactive.SessionTranscript,
     prompts: []const []const u8,
 ) !print_mode.ExitCode {
     const cause = frontend.run(.{
         .allocator = context.allocator,
         .io = context.io,
-        .controller = controller,
+        .host = host,
         .transcript = transcript,
         .initial_prompts = prompts,
         .input = std.Io.File.stdin(),

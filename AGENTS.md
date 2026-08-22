@@ -269,11 +269,15 @@ branch projection of restored journal entries. It preserves user, assistant,
 tool, model-change, failure, cancellation, and interruption facts independently
 of the cleaned provider-context projection. `coding_agent/interactive/` owns
 frontend-neutral interactive behavior. `SessionPolicy` owns bounded sequential
-follow-ups and deterministic submission, cancellation, restoration, stale-run,
-and poisoned-session transitions. `SessionController` applies that policy to
-`TurnWorker`, emits borrowed admitted facts, and clears no client-owned draft.
-The CLI owns process adaptation, runtime and worker launch, frontend invocation,
-and exit mapping. It does not own terminal mechanics, input state, or rendering.
+follow-ups and deterministic turn submission, cancellation, restoration,
+stale-run, and poisoned-session transitions. `SessionController` applies that
+turn-only policy to `TurnWorker`. `InteractiveSessionHost` owns the model-less,
+runnable, transitioning, and unavailable lifecycle, exact-journal reopen inputs,
+login and model commands, auth activation, worker replacement, and borrowed
+interactive facts. `AuthOperation` owns the OAuth thread, cancellation, bounded
+owned interaction facts, and securely wiped prompt answers. The CLI owns process
+adaptation, initial runtime creation, host launch, frontend invocation, and exit
+mapping. It does not own terminal mechanics, input state, or rendering.
 
 `smol/terminal/Session.zig` owns raw-mode admission and best-effort cooked-mode,
 style, hyperlink, and cursor restoration. The current smol client starts on the

@@ -19,6 +19,7 @@ pub const InitOptions = struct {
 pub const ComposerView = struct {
     text: []const u8,
     cursor_byte: usize,
+    masked: bool = false,
 };
 
 pub const FrameView = struct {
@@ -72,24 +73,92 @@ pub fn start(
     self.requests.request(.first_frame);
 }
 
-pub fn apply(self: *Screen, fact: interactive.ControllerFact) !void {
+pub fn apply(self: *Screen, fact: interactive.HostFact) !void {
     const checkpoint = self.stagingCheckpoint();
     errdefer self.restoreStaging(checkpoint);
     switch (fact) {
-        .event => |event| try self.renderEvent(event),
-        .completion => |completion| {
-            if (!completion.agent_end_observed) switch (completion.value.outcome) {
-                .completed => {},
-                .failed => |failure| try self.renderNotice(@errorName(failure)),
-            };
+        .turn => |turn| try self.renderTurnFact(turn),
+        .auth_started => |value| {
+            var buffer: [1024]u8 = undefined;
+            const label = try std.fmt.bufPrint(&buffer, "Logging in to {s}", .{value.provider});
+            try self.renderNotice(label);
         },
-        .fault => |fault| switch (fault) {
-            .follow_up_submission => |failure| try self.renderNotice(@errorName(failure)),
-            .draft_restore => |failure| try self.renderNotice(@errorName(failure)),
+        .auth_interaction => |interaction| switch (interaction) {
+            .auth_url => |value| {
+                try self.renderNotice(value.instructions);
+                try self.renderNotice(value.url);
+            },
+            .device_code => |value| {
+                try self.renderNotice(value.verification_uri);
+                var buffer: [1024]u8 = undefined;
+                const label = try std.fmt.bufPrint(&buffer, "Device code: {s}", .{value.user_code});
+                try self.renderNotice(label);
+            },
+            .prompt => |value| try self.renderNotice(value.message),
+        },
+        .auth_cancelled => |value| {
+            var buffer: [1024]u8 = undefined;
+            const label = try std.fmt.bufPrint(&buffer, "Login cancelled for {s}", .{value.provider});
+            try self.renderNotice(label);
+        },
+        .login_succeeded => |value| {
+            var buffer: [1024]u8 = undefined;
+            const label = try std.fmt.bufPrint(&buffer, "Logged in to {s}", .{value.provider});
+            try self.renderNotice(label);
+        },
+        .login_failed => |value| {
+            var buffer: [1024]u8 = undefined;
+            const label = try std.fmt.bufPrint(
+                &buffer,
+                "Login failed for {s}: {s}",
+                .{ value.provider, @tagName(value.failure) },
+            );
+            try self.renderNotice(label);
+        },
+        .model_changed => |selection| try self.renderModel(selection),
+        .model_less => try self.renderNotice("No model is available"),
+        .model_switch_failed => |value| {
+            var buffer: [1200]u8 = undefined;
+            const label = try std.fmt.bufPrint(
+                &buffer,
+                "Model switch to {s}/{s} failed: {s}",
+                .{ value.requested.provider, value.requested.model, value.reason },
+            );
+            try self.renderNotice(label);
+        },
+        .model_switch_commit_indeterminate => |value| {
+            var buffer: [1200]u8 = undefined;
+            const label = try std.fmt.bufPrint(
+                &buffer,
+                "Model switch to {s}/{s} had an indeterminate journal commit",
+                .{ value.provider, value.model },
+            );
+            try self.renderNotice(label);
+        },
+        .settings_failed => |value| {
+            var buffer: [1200]u8 = undefined;
+            const label = try std.fmt.bufPrint(
+                &buffer,
+                "Model changed, but saving the default failed: {s}",
+                .{value.reason},
+            );
+            try self.renderNotice(label);
+        },
+        .settings_commit_indeterminate => try self.renderNotice(
+            "Model changed, but saving the default was indeterminate",
+        ),
+        .session_unavailable => |value| {
+            var buffer: [1024]u8 = undefined;
+            const label = try std.fmt.bufPrint(&buffer, "Session unavailable: {s}", .{value.reason});
+            try self.renderNotice(label);
         },
     }
     try self.ensureStagedBound();
     self.requests.request(.transcript);
+}
+
+fn applyEventFact(self: *Screen, event: interactive.Event) !void {
+    try self.apply(.{ .turn = .{ .event = event } });
 }
 
 pub fn notice(self: *Screen, text: []const u8) !void {
@@ -251,6 +320,22 @@ fn renderEvent(self: *Screen, event: interactive.Event) !void {
     }
 }
 
+fn renderTurnFact(self: *Screen, fact: interactive.TurnFact) !void {
+    switch (fact) {
+        .event => |event| try self.renderEvent(event),
+        .completion => |completion| {
+            if (!completion.agent_end_observed) switch (completion.value.outcome) {
+                .completed => {},
+                .failed => |failure| try self.renderNotice(@errorName(failure)),
+            };
+        },
+        .fault => |fault| switch (fault) {
+            .follow_up_submission => |failure| try self.renderNotice(@errorName(failure)),
+            .draft_restore => |failure| try self.renderNotice(@errorName(failure)),
+        },
+    }
+}
+
 fn renderNotice(self: *Screen, label: []const u8) !void {
     try self.presenter.renderNotice(&self.staged, label);
 }
@@ -258,11 +343,15 @@ fn renderNotice(self: *Screen, label: []const u8) !void {
 fn buildFrame(self: *Screen, view: FrameView) !terminal_render.Surface {
     const terminal_size = self.size orelse TerminalSession.Size{ .rows = 24, .columns = 80 };
     const prompt = "❯ ";
+    const masked_text = if (view.composer.masked) try self.staged.allocator.alloc(u8, view.composer.text.len) else null;
+    defer if (masked_text) |text| self.staged.allocator.free(text);
+    if (masked_text) |text| @memset(text, '*');
+    const composer_text: []const u8 = masked_text orelse view.composer.text;
     var layout = try render.FooterLayout.init(
         self.staged.allocator,
         terminal_size.rows,
         terminal_size.columns,
-        view.composer.text,
+        composer_text,
         view.composer.cursor_byte,
         @intCast(terminal_render.Text.displayWidth(prompt)),
     );
@@ -278,15 +367,21 @@ fn buildFrame(self: *Screen, view: FrameView) !terminal_render.Surface {
     if (layout.status) |status| {
         var status_buffer: [128]u8 = undefined;
         const label = switch (view.phase) {
-            .idle => "Ready",
-            .awaiting_start => "Working",
-            .running => if (self.presenter.activeToolLabel()) |tool_name|
-                try std.fmt.bufPrint(&status_buffer, "Working · {s}", .{tool_name})
-            else
-                "Working",
-            .cancel_pending, .cancelling => "Cancelling",
-            .dispatching_follow_up => "Starting queued prompt",
-            .poisoned => "Session unavailable",
+            .model_less => "No model selected",
+            .authenticating => "Authenticating",
+            .transitioning => "Changing session backend",
+            .unavailable => "Session unavailable",
+            .turn => |turn_phase| switch (turn_phase) {
+                .idle => "Ready",
+                .awaiting_start => "Working",
+                .running => if (self.presenter.activeToolLabel()) |tool_name|
+                    try std.fmt.bufPrint(&status_buffer, "Working · {s}", .{tool_name})
+                else
+                    "Working",
+                .cancel_pending, .cancelling => "Cancelling",
+                .dispatching_follow_up => "Starting queued prompt",
+                .poisoned => "Session unavailable",
+            },
         };
         _ = try surface.writeText(status.first_row, 1, label, .{
             .attributes = .{ .dim = true },
@@ -321,7 +416,7 @@ fn buildFrame(self: *Screen, view: FrameView) !terminal_render.Surface {
         _ = try surface.writeText(
             row,
             line.start_column,
-            view.composer.text[line.start_byte..line.end_byte],
+            composer_text[line.start_byte..line.end_byte],
             .{},
         );
     }
@@ -356,15 +451,15 @@ test "screen stages facts and publishes one status composer frame" {
     var screen = try Screen.init(std.testing.allocator, &output.writer, .{});
     defer screen.deinit();
 
-    try screen.apply(.{ .event = .{ .message_start = .{
+    try screen.applyEventFact(.{ .message_start = .{
         .run_id = @enumFromInt(1),
         .turn_index = 1,
         .message = .{ .request = .{ .parts = &.{.{ .user = .{ .text = "hello" } }} } },
-    } } });
+    } });
     try std.testing.expectEqual(@as(usize, 0), output.written().len);
     try screen.commit(.{
         .composer = .{ .text = "next", .cursor_byte = 4 },
-        .phase = .{ .running = @enumFromInt(1) },
+        .phase = .{ .turn = .{ .running = @enumFromInt(1) } },
         .queued_count = 2,
     });
 
@@ -384,15 +479,15 @@ test "screen renders Markdown thinking and prose once in response order" {
     var screen = try Screen.init(std.testing.allocator, &output.writer, .{});
     defer screen.deinit();
 
-    try screen.apply(.{ .event = .{ .message_start = .{
+    try screen.applyEventFact(.{ .message_start = .{
         .run_id = @enumFromInt(1),
         .turn_index = 1,
         .message = .{ .response = .{
             .parts = &.{},
             .identity = .{ .provider = "test", .model = "model" },
         } },
-    } } });
-    try screen.apply(.{ .event = .{ .message_update = .{
+    } });
+    try screen.applyEventFact(.{ .message_update = .{
         .run_id = @enumFromInt(1),
         .turn_index = 1,
         .message = .{
@@ -400,8 +495,8 @@ test "screen renders Markdown thinking and prose once in response order" {
             .identity = .{ .provider = "test", .model = "model" },
         },
         .update = .{ .part_end = .{ .index = 0, .part = parts[0] } },
-    } } });
-    try screen.apply(.{ .event = .{ .message_update = .{
+    } });
+    try screen.applyEventFact(.{ .message_update = .{
         .run_id = @enumFromInt(1),
         .turn_index = 1,
         .message = .{
@@ -412,18 +507,18 @@ test "screen renders Markdown thinking and prose once in response order" {
             .identity = .{ .provider = "test", .model = "model" },
         },
         .update = .{ .part_end = .{ .index = 1, .part = parts[1] } },
-    } } });
-    try screen.apply(.{ .event = .{ .message_end = .{
+    } });
+    try screen.applyEventFact(.{ .message_end = .{
         .run_id = @enumFromInt(1),
         .turn_index = 1,
         .message = .{ .published = .{ .response = .{
             .parts = &parts,
             .identity = .{ .provider = "test", .model = "model" },
         } } },
-    } } });
+    } });
     try screen.commit(.{
         .composer = .{ .text = "", .cursor_byte = 0 },
-        .phase = .idle,
+        .phase = .{ .turn = .idle },
         .queued_count = 0,
     });
 
@@ -444,22 +539,22 @@ test "screen keeps running tool details in footer and appends one compact result
     var screen = try Screen.init(std.testing.allocator, &output.writer, .{});
     defer screen.deinit();
 
-    try screen.apply(.{ .event = .{ .tool_execution_start = .{
+    try screen.applyEventFact(.{ .tool_execution_start = .{
         .run_id = @enumFromInt(1),
         .turn_index = 1,
         .call_id = "call-1",
         .name = "read",
         .arguments_json = "{\"path\":\"secret\"}",
-    } } });
+    } });
     try screen.commit(.{
         .composer = .{ .text = "", .cursor_byte = 0 },
-        .phase = .{ .running = @enumFromInt(1) },
+        .phase = .{ .turn = .{ .running = @enumFromInt(1) } },
         .queued_count = 0,
     });
     try std.testing.expect(std.mem.find(u8, output.written(), "Working · read") != null);
     try std.testing.expect(std.mem.find(u8, output.written(), "secret") == null);
 
-    try screen.apply(.{ .event = .{ .tool_execution_end = .{
+    try screen.applyEventFact(.{ .tool_execution_end = .{
         .run_id = @enumFromInt(1),
         .turn_index = 1,
         .call_id = "call-1",
@@ -470,14 +565,30 @@ test "screen keeps running tool details in footer and appends one compact result
             .content = &.{.{ .text = "private file contents" }},
             .outcome = .success,
         } },
-    } } });
+    } });
     try screen.commit(.{
         .composer = .{ .text = "", .cursor_byte = 0 },
-        .phase = .{ .running = @enumFromInt(1) },
+        .phase = .{ .turn = .{ .running = @enumFromInt(1) } },
         .queued_count = 0,
     });
     try std.testing.expect(std.mem.find(u8, output.written(), "• read") != null);
     try std.testing.expect(std.mem.find(u8, output.written(), "private file contents") == null);
+}
+
+test "screen masks OAuth answer composer bytes" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var screen = try Screen.init(std.testing.allocator, &output.writer, .{});
+    defer screen.deinit();
+    screen.resized(.{ .rows = 3, .columns = 40 });
+    screen.editorChanged();
+    try screen.commit(.{
+        .composer = .{ .text = "oauth-secret", .cursor_byte = 12, .masked = true },
+        .phase = .authenticating,
+        .queued_count = 0,
+    });
+    try std.testing.expect(std.mem.find(u8, output.written(), "oauth-secret") == null);
+    try std.testing.expect(std.mem.find(u8, output.written(), "************") != null);
 }
 
 test "screen reflows the composer across terminal resize" {
@@ -489,7 +600,7 @@ test "screen reflows the composer across terminal resize" {
     screen.resized(.{ .rows = 3, .columns = 6 });
     try screen.commit(.{
         .composer = .{ .text = "abcdefghijkl", .cursor_byte = 12 },
-        .phase = .idle,
+        .phase = .{ .turn = .idle },
         .queued_count = 0,
     });
     try std.testing.expectEqual(@as(u16, 3), screen.terminal_renderer.previous.?.rows);
@@ -500,7 +611,7 @@ test "screen reflows the composer across terminal resize" {
     screen.resized(.{ .rows = 3, .columns = 10 });
     try screen.commit(.{
         .composer = .{ .text = "abcdefghijkl", .cursor_byte = 12 },
-        .phase = .idle,
+        .phase = .{ .turn = .idle },
         .queued_count = 0,
     });
     try std.testing.expectEqual(@as(u16, 10), screen.terminal_renderer.previous.?.columns);
@@ -518,7 +629,7 @@ test "screen paints one ZWJ grapheme and places the composer cursor by cells" {
     screen.editorChanged();
     try screen.commit(.{
         .composer = .{ .text = family, .cursor_byte = family.len },
-        .phase = .idle,
+        .phase = .{ .turn = .idle },
         .queued_count = 0,
     });
 
@@ -567,7 +678,7 @@ test "screen restores an uncommitted frame request after output failure" {
     screen.editorChanged();
     try std.testing.expectError(error.WriteFailed, screen.commit(.{
         .composer = .{ .text = "draft", .cursor_byte = 5 },
-        .phase = .idle,
+        .phase = .{ .turn = .idle },
         .queued_count = 0,
     }));
     try std.testing.expect(screen.requests.hasPending());

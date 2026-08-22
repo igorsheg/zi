@@ -141,6 +141,20 @@ pub const Interactive = union(enum) {
         };
     }
 
+    pub fn journalPath(self: Interactive) []const u8 {
+        return switch (self) {
+            .model_less => |value| value.selection.journalPath(),
+            .runnable => |value| value.journalPath(),
+        };
+    }
+
+    pub fn activeModel(self: Interactive) ?ai.ModelIdentity {
+        return switch (self) {
+            .model_less => |value| value.selection.restoredModel(),
+            .runnable => |value| value.modelIdentity(),
+        };
+    }
+
     pub fn deinit(self: Interactive) void {
         switch (self) {
             .model_less => |value| value.deinit(),
@@ -200,6 +214,10 @@ fn paths(self: *const RuntimeServices) *const ZiPaths {
 
 fn journalPath(self: *const RuntimeServices) []const u8 {
     return self.selection.journalPath();
+}
+
+fn modelIdentity(self: *const RuntimeServices) ai.ModelIdentity {
+    return self.resolved.selection;
 }
 
 fn modelDiagnostic(self: *const RuntimeServices) ?ModelConfigSnapshot.Diagnostic {

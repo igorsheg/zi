@@ -257,15 +257,28 @@ fn loginDeviceCode(
         const disposition = devicePollDisposition(scratch_allocator, poll.status, poll.body);
         if (disposition == .failed) return error.Rejected;
         if (disposition == .slow_down) interval = @min(interval + 5, 60);
-        if (interval > 0) {
-            const timeout: std.Io.Timeout = .{ .duration = .{
-                .raw = .fromSeconds(@intCast(interval)),
-                .clock = .awake,
-            } };
-            timeout.sleep(io) catch return error.Cancelled;
-        }
+        if (interval > 0) try cancellableSleep(io, interval, request.cancellation);
     }
     return error.TimedOut;
+}
+
+fn cancellableSleep(
+    io: std.Io,
+    seconds: u64,
+    cancellation: ?*const model_api.CancellationToken,
+) oauth_api.Error!void {
+    var remaining_ms = std.math.mul(u64, seconds, 1000) catch return error.TimedOut;
+    while (remaining_ms != 0) {
+        if (cancellation) |token| if (token.isCancelled()) return error.Cancelled;
+        const slice_ms = @min(remaining_ms, 100);
+        const timeout: std.Io.Timeout = .{ .duration = .{
+            .raw = .fromMilliseconds(@intCast(slice_ms)),
+            .clock = .awake,
+        } };
+        timeout.sleep(io) catch return error.Cancelled;
+        remaining_ms -= slice_ms;
+    }
+    if (cancellation) |token| if (token.isCancelled()) return error.Cancelled;
 }
 
 const PollDisposition = enum { pending, slow_down, failed };

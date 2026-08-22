@@ -32,6 +32,7 @@ pub const LoginInputs = struct {
     method: ai.oauth.LoginMethod,
     interaction: ai.oauth.Interaction,
     now_ms: u64,
+    cancellation: ?*const ai.model.CancellationToken = null,
 };
 
 pub const PersistentResolver = struct {
@@ -148,6 +149,7 @@ pub fn login(
             .method = inputs.method,
             .interaction = inputs.interaction,
             .now_ms = inputs.now_ms,
+            .cancellation = inputs.cancellation,
         },
     );
     defer authenticated.deinit();

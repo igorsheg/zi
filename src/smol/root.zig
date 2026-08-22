@@ -22,7 +22,7 @@ fn run(
     var app = try App.init(
         context.allocator,
         context.io,
-        context.controller,
+        context.host,
         context.writer,
         .{},
     );

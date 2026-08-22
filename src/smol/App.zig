@@ -22,7 +22,7 @@ pub const RunOptions = struct {
 pub const ExitCause = EventLoop.ExitCause;
 
 io: std.Io,
-controller: *interactive.SessionController,
+host: *interactive.InteractiveSessionHost,
 decoder: Decoder = .{},
 editor: LineEditor,
 screen: Screen,
@@ -32,7 +32,7 @@ should_exit: bool = false,
 pub fn init(
     allocator: std.mem.Allocator,
     io: std.Io,
-    controller: *interactive.SessionController,
+    host: *interactive.InteractiveSessionHost,
     writer: *std.Io.Writer,
     options: InitOptions,
 ) !App {
@@ -44,7 +44,7 @@ pub fn init(
     errdefer editor.deinit();
     return .{
         .io = io,
-        .controller = controller,
+        .host = host,
         .editor = editor,
         .screen = try Screen.init(allocator, writer, .{}),
         .escape_timeout_ms = options.escape_timeout_ms,
@@ -82,7 +82,7 @@ fn runWithTerminal(
         const finish_result = self.finish();
         if (finish_result) |_| {} else |_| {}
     };
-    for (options.initial_prompts) |prompt| try self.submitPrompt(prompt);
+    for (options.initial_prompts) |prompt| _ = try self.submitPrompt(prompt);
     if (terminal.querySize()) |size| self.screen.resized(size) else |_| {}
     try self.commitFrameImpl();
     const cause = try EventLoop.run(terminal, self.callbacks(), .{
@@ -107,8 +107,8 @@ fn callbacks(self: *App) EventLoop.Callbacks {
     };
 }
 
-fn controllerSink(self: *App) interactive.ControllerSink {
-    return .{ .context = self, .emitFn = emitControllerFact };
+fn hostSink(self: *App) interactive.HostSink {
+    return .{ .context = self, .emit_fn = emitHostFact };
 }
 
 fn start(self: *App, transcript: ?*const interactive.SessionTranscript) !void {
@@ -121,11 +121,11 @@ fn finish(self: *App) !void {
 
 fn collectFacts(context: *anyopaque) !void {
     const self: *App = @ptrCast(@alignCast(context));
-    if (!self.controller.hasPendingFacts()) return;
+    if (!self.host.hasPendingFacts()) return;
 
-    var result = try self.controller.drain(
+    var result = try self.host.drain(
         self.editor.text(),
-        self.controllerSink(),
+        self.hostSink(),
     );
     defer result.deinit();
     if (result.restored) |restored| {
@@ -134,7 +134,7 @@ fn collectFacts(context: *anyopaque) !void {
     }
 }
 
-fn emitControllerFact(context: *anyopaque, fact: interactive.ControllerFact) !void {
+fn emitHostFact(context: *anyopaque, fact: interactive.HostFact) !void {
     const self: *App = @ptrCast(@alignCast(context));
     try self.screen.apply(fact);
 }
@@ -159,18 +159,24 @@ fn handleAction(self: *App, action: Decoder.Action) !void {
         .submit, .follow_up => try self.submitDraft(),
         .escape => try self.cancelAndRestore(),
         .interrupt => {
-            if (self.controller.phase() == .idle) {
-                if (self.editor.isEmpty()) {
-                    self.should_exit = true;
-                } else {
-                    self.editor.clear();
-                }
+            if (self.editor.isEmpty() and self.host.canExit()) {
+                self.should_exit = true;
+            } else if (self.editor.isEmpty() and self.host.snapshot().phase == .authenticating) {
+                self.host.requestExit();
+                self.should_exit = true;
+            } else if (self.host.canExit()) {
+                self.editor.clear();
             } else {
                 try self.cancelAndRestore();
             }
         },
-        .end_of_input => if (self.editor.isEmpty() and self.controller.phase() == .idle) {
-            self.should_exit = true;
+        .end_of_input => if (self.editor.isEmpty()) {
+            if (self.host.canExit()) {
+                self.should_exit = true;
+            } else if (self.host.snapshot().phase == .authenticating) {
+                self.host.requestExit();
+                self.should_exit = true;
+            }
         },
         .backspace => self.editor.deleteBackward(),
         .delete => self.editor.deleteForward(),
@@ -200,14 +206,16 @@ fn commitFrameImpl(self: *App) !void {
     try self.screen.commit(self.frameView());
 }
 
-fn frameView(self: *const App) Screen.FrameView {
+fn frameView(self: *App) Screen.FrameView {
+    const host_snapshot = self.host.snapshot();
     return .{
         .composer = .{
             .text = self.editor.text(),
             .cursor_byte = self.editor.cursorByte(),
+            .masked = host_snapshot.mask_composer,
         },
-        .phase = self.controller.phase(),
-        .queued_count = self.controller.queuedFollowUpCount(),
+        .phase = host_snapshot.phase,
+        .queued_count = host_snapshot.queued_follow_ups,
     };
 }
 
@@ -226,32 +234,31 @@ fn submitDraft(self: *App) !void {
         try self.screen.notice("input is not valid UTF-8");
         return;
     }
-    self.submitPrompt(self.editor.text()) catch |failure| {
+    const disposition = self.submitPrompt(self.editor.text()) catch |failure| {
         if (failure == error.ModelSelectionRequired) {
-            try self.screen.notice("No model selected. Run `zi auth login PROVIDER`, then restart Zi.");
+            try self.screen.notice("No model selected. Use /login PROVIDER or /model PROVIDER/MODEL.");
         } else if (failure != error.EmptyPrompt) {
             try self.screen.notice(@errorName(failure));
         }
         return;
     };
-    self.editor.clear();
+    if (disposition == .oauth_answer) self.editor.secureClear() else self.editor.clear();
 }
 
-fn submitPrompt(self: *App, prompt: []const u8) !void {
-    _ = try self.controller.submit(prompt);
+fn submitPrompt(self: *App, prompt: []const u8) !interactive.SubmitDisposition {
+    const disposition = try self.host.submit(prompt);
     self.screen.editorChanged();
+    return disposition;
 }
 
 fn cancelAndRestore(self: *App) !void {
-    const restored_optional = self.controller.cancel(self.editor.text()) catch |failure| {
+    var result = self.host.cancel(self.editor.text()) catch |failure| {
         try self.screen.notice(@errorName(failure));
         return;
     };
-    if (restored_optional) |restored_value| {
-        var restored = restored_value;
-        defer restored.deinit();
-        try self.editor.replace(restored.text);
-    }
+    defer result.deinit();
+    if (result.wipe_draft) self.editor.secureClear();
+    if (result.restored) |restored| try self.editor.replace(restored.text);
 }
 
 test "app rejects invalid input deadline configuration" {

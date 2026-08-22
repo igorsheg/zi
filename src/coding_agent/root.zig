@@ -1,6 +1,7 @@
 const agent_session = @import("AgentSession.zig");
 const agent_session_event = @import("AgentSessionEvent.zig");
 const agent_session_runtime = @import("AgentSessionRuntime.zig");
+const auth_operation = @import("AuthOperation.zig");
 const bounded_text_file = @import("BoundedTextFile.zig");
 const context_files = @import("ContextFiles.zig");
 const credential_manager = @import("CredentialManager.zig");
@@ -15,6 +16,7 @@ const private_file_store = @import("PrivateFileStore.zig");
 const project_trust = @import("ProjectTrust.zig");
 const project_trust_store = @import("ProjectTrustStore.zig");
 const prompt_files = @import("PromptFiles.zig");
+const reopen_inputs = @import("ReopenInputs.zig");
 const runtime_resources = @import("RuntimeResources.zig");
 const runtime_services = @import("RuntimeServices.zig");
 const session_commit = @import("SessionCommit.zig");
@@ -33,6 +35,7 @@ test {
     _ = agent_session;
     _ = agent_session_event;
     _ = agent_session_runtime;
+    _ = auth_operation;
     _ = bounded_text_file;
     _ = context_files;
     _ = credential_manager;
@@ -47,6 +50,7 @@ test {
     _ = project_trust;
     _ = project_trust_store;
     _ = prompt_files;
+    _ = reopen_inputs;
     _ = runtime_resources;
     _ = runtime_services;
     _ = session_commit;

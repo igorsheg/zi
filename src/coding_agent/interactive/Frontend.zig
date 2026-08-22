@@ -1,6 +1,6 @@
 const std = @import("std");
 const SessionTranscript = @import("../SessionTranscript.zig");
-const SessionController = @import("SessionController.zig").SessionController;
+const InteractiveSessionHost = @import("InteractiveSessionHost.zig");
 
 pub const ExitCause = enum {
     requested,
@@ -8,12 +8,12 @@ pub const ExitCause = enum {
 };
 
 /// Borrowed process and coding-agent values for one synchronous frontend run.
-/// The launch owner keeps the controller, transcript, prompts, files, and
-/// writer alive until `runFn` returns.
+/// The launch owner keeps the host, transcript, prompts, files, and writer
+/// alive until `runFn` returns.
 pub const Context = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
-    controller: *SessionController,
+    host: *InteractiveSessionHost,
     transcript: *const SessionTranscript,
     initial_prompts: []const []const u8,
     input: std.Io.File,

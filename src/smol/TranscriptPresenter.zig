@@ -54,6 +54,7 @@ pub fn renderWelcome(self: *TranscriptPresenter, output: *std.Io.Writer.Allocati
     try output.writer.writeAll(
         "Zi\n" ++
             "  Enter submits. Enter while busy queues the next prompt.\n" ++
+            "  /login PROVIDER [--device] logs in. /model PROVIDER/MODEL switches while idle.\n" ++
             "  Escape cancels. Ctrl-D exits when idle.\n\n",
     );
     self.last_block = .welcome;

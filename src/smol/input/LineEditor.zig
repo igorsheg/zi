@@ -75,6 +75,11 @@ pub fn clear(self: *LineEditor) void {
     self.cursor = 0;
 }
 
+pub fn secureClear(self: *LineEditor) void {
+    std.crypto.secureZero(u8, self.bytes.items);
+    self.clear();
+}
+
 pub fn replace(self: *LineEditor, replacement: []const u8) Error!void {
     if (replacement.len > self.max_bytes) return error.InputTooLarge;
     try self.bytes.ensureTotalCapacity(self.allocator, replacement.len);
@@ -161,6 +166,17 @@ test "line editor preserves byte editing for partial invalid UTF-8" {
     editor.moveRight();
     editor.deleteForward();
     try std.testing.expectEqualStrings("az", editor.text());
+}
+
+test "line editor securely clears an OAuth answer" {
+    var editor = LineEditor.init(std.testing.allocator, 32);
+    defer editor.deinit();
+    try editor.replace("authorization-secret");
+    const retained = editor.bytes.allocatedSlice();
+    editor.secureClear();
+    try std.testing.expect(editor.isEmpty());
+    try std.testing.expectEqual(@as(usize, 0), editor.cursorByte());
+    try std.testing.expect(!std.mem.eql(u8, "authorization-secret", retained[0..20]));
 }
 
 test "line editor replacement is transactional at its bound" {

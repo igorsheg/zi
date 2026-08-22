@@ -210,7 +210,9 @@ fn writeCliHelp(writer: *std.Io.Writer) !void {
         \\  -v, --version        Show the version
         \\  auth login           Start the provider-owned OAuth login ceremony
         \\
-        \\Interactive transcript:
+        \\Interactive commands:
+        \\  /login PROVIDER [--device]  Log in without leaving the TUI
+        \\  /model PROVIDER/MODEL       Switch models while idle
         \\  Without an authenticated model, Zi opens a model-less session
         \\  Assistant prose and thinking render as ordered Markdown blocks
         \\  Running tools use the footer; completed tools append compact results

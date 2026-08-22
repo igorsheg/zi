@@ -32,8 +32,10 @@ messages use a compact rail. Assistant prose and thinking render as separate
 Markdown blocks in model response order. Running tools appear in the footer,
 and completed tools append compact results without dumping arguments or output.
 When no authenticated model is available, interactive mode still opens a durable
-session. Drafts remain intact until a model is available. Run
-`./zig-out/bin/zi auth login PROVIDER`, then restart Zi.
+session. Drafts remain intact until a model is available. Use
+`/login PROVIDER [--device]` to log in without leaving the TUI. Use
+`/model PROVIDER/MODEL` while idle to switch the same durable session and save
+the selected model as the global default.
 
 Run one or more prompts in print mode:
 

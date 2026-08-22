@@ -1,5 +1,6 @@
 const std = @import("std");
 const ai = @import("../../ai/root.zig");
+const ReopenInputs = @import("../ReopenInputs.zig");
 const RuntimeServices = @import("../RuntimeServices.zig");
 const SystemPrompt = @import("../SystemPrompt.zig");
 const SessionFormat = @import("../SessionFormat.zig");
@@ -150,10 +151,21 @@ pub fn createRuntime(
     };
 }
 
-pub fn createInteractiveRuntime(
+pub const PreparedInteractiveRuntime = struct {
+    inputs: ReopenInputs,
+    lifecycle: RuntimeServices.Interactive,
+
+    pub fn deinit(self: *PreparedInteractiveRuntime) void {
+        self.lifecycle.deinit();
+        self.inputs.deinit();
+        self.* = undefined;
+    }
+};
+
+pub fn prepareInteractiveRuntime(
     request: *const surface.LaunchRequest,
     context: LaunchContext,
-) !?RuntimeServices.Interactive {
+) !?PreparedInteractiveRuntime {
     var environment_entries: [1]ai.auth.EnvironmentEntry = undefined;
     const environment_count: usize = if (context.openai_api_key) |key| count: {
         environment_entries[0] = .{ .name = "OPENAI_API_KEY", .value = key };
@@ -168,7 +180,7 @@ pub fn createInteractiveRuntime(
         },
         .replace => |value| .{ .verbatim = value },
     };
-    return RuntimeServices.createInteractive(context.allocator, context.io, .{
+    var inputs = ReopenInputs.init(context.allocator, .{
         .startup_cwd = context.cwd,
         .home = context.home,
         .session = switch (request.session) {
@@ -184,9 +196,20 @@ pub fn createInteractiveRuntime(
         .environment = .{ .entries = environment_entries[0..environment_count] },
         .options = .{ .prompt = .{ .policy = prompt_policy } },
     }) catch |failure| {
-        try context.stderr.print("Unable to start the coding agent: {s}.\n", .{@errorName(failure)});
+        try context.stderr.print("Unable to retain interactive launch inputs: {s}.\n", .{@errorName(failure)});
         return null;
     };
+    errdefer inputs.deinit();
+    const lifecycle = RuntimeServices.createInteractive(
+        context.allocator,
+        context.io,
+        inputs.initial(),
+    ) catch |failure| {
+        try context.stderr.print("Unable to start the coding agent: {s}.\n", .{@errorName(failure)});
+        inputs.deinit();
+        return null;
+    };
+    return .{ .inputs = inputs, .lifecycle = lifecycle };
 }
 
 /// Runs one admitted print launch and maps expected failures to process output.
