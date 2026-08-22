@@ -7,6 +7,7 @@ const context_files = @import("ContextFiles.zig");
 const credential_manager = @import("CredentialManager.zig");
 const credential_store = @import("CredentialStore.zig");
 pub const interactive = @import("interactive/root.zig");
+const model_admission = @import("ModelAdmission.zig");
 const model_bootstrap_policy = @import("ModelBootstrapPolicy.zig");
 const model_config = @import("ModelConfig.zig");
 const model_config_snapshot = @import("ModelConfigSnapshot.zig");
@@ -41,6 +42,7 @@ test {
     _ = credential_manager;
     _ = credential_store;
     _ = interactive;
+    _ = model_admission;
     _ = model_bootstrap_policy;
     _ = model_config;
     _ = model_config_snapshot;
