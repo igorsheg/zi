@@ -1,4 +1,5 @@
 const std = @import("std");
+const ai = @import("../../ai/root.zig");
 const ProjectTrust = @import("../ProjectTrust.zig");
 
 const max_arguments = 64;
@@ -38,6 +39,12 @@ pub const TrustRequest = struct {
     path: ?[]const u8 = null,
 };
 
+/// One OAuth credential operation whose provider borrows argv.
+pub const AuthRequest = struct {
+    provider: []const u8,
+    method: ai.oauth.LoginMethod = .browser,
+};
+
 pub const LaunchMode = enum {
     interactive,
     print,
@@ -66,6 +73,7 @@ pub const Invocation = union(enum) {
     help,
     version,
     trust: TrustRequest,
+    auth: AuthRequest,
     launch: LaunchRequest,
 };
 
@@ -125,8 +133,7 @@ pub fn parseInvocation(argv: []const []const u8, terminal: Terminal) ParseResult
     var rejection: Rejection = .{};
     if (!validateArguments(argv, &rejection)) return .{ .rejected = rejection };
     if (argv.len > 0 and std.mem.eql(u8, argv[0], "auth")) {
-        rejection.add(.{ .invalid_auth_command = if (argv.len > 1) argv[1] else "" });
-        return .{ .rejected = rejection };
+        return parseAuthInvocation(argv[1..], &rejection);
     }
     if (argv.len > 0 and std.mem.eql(u8, argv[0], "trust")) {
         return parseTrustInvocation(argv[1..], &rejection);
@@ -235,6 +242,25 @@ pub fn parseInvocation(argv: []const []const u8, terminal: Terminal) ParseResult
     };
     if (rejection.count > 0) return .{ .rejected = rejection };
     return .{ .admitted = .{ .launch = launch } };
+}
+
+fn parseAuthInvocation(arguments: []const []const u8, rejection: *Rejection) ParseResult {
+    if (arguments.len < 2 or !std.mem.eql(u8, arguments[0], "login")) {
+        rejection.add(.{ .invalid_auth_command = if (arguments.len > 0) arguments[0] else "" });
+        return .{ .rejected = rejection.* };
+    }
+    if (arguments.len > 3) {
+        rejection.add(.{ .invalid_auth_command = arguments[0] });
+        return .{ .rejected = rejection.* };
+    }
+    const method: ai.oauth.LoginMethod = if (arguments.len == 3) option: {
+        if (!std.mem.eql(u8, arguments[2], "--device")) {
+            rejection.add(.{ .invalid_auth_command = arguments[2] });
+            return .{ .rejected = rejection.* };
+        }
+        break :option .device_code;
+    } else .browser;
+    return .{ .admitted = .{ .auth = .{ .provider = arguments[1], .method = method } } };
 }
 
 fn parseTrustInvocation(arguments: []const []const u8, rejection: *Rejection) ParseResult {
@@ -536,13 +562,29 @@ test "CLI surface routes help and version before launch admission" {
     try std.testing.expect(version.admitted == .version);
 }
 
-test "CLI surface reserves pi auth commands without admitting login ceremonies" {
-    const login = parseInvocation(&.{ "auth", "login", "openai-codex" }, .{
+test "CLI surface admits bounded OAuth login commands" {
+    const browser = parseInvocation(&.{ "auth", "login", "openai-codex" }, .{
         .stdin_is_tty = true,
         .stdout_is_tty = true,
     });
-    try std.testing.expect(login == .rejected);
-    try std.testing.expectEqualStrings("login", login.rejected.diagnostics()[0].invalid_auth_command);
+    try std.testing.expect(browser == .admitted);
+    try std.testing.expect(browser.admitted == .auth);
+    try std.testing.expectEqualStrings("openai-codex", browser.admitted.auth.provider);
+    try std.testing.expectEqual(ai.oauth.LoginMethod.browser, browser.admitted.auth.method);
+
+    const device = parseInvocation(&.{ "auth", "login", "openai-codex", "--device" }, .{
+        .stdin_is_tty = true,
+        .stdout_is_tty = true,
+    });
+    try std.testing.expect(device == .admitted);
+    try std.testing.expectEqual(ai.oauth.LoginMethod.device_code, device.admitted.auth.method);
+
+    const rejected = parseInvocation(&.{ "auth", "logout", "openai-codex" }, .{
+        .stdin_is_tty = true,
+        .stdout_is_tty = true,
+    });
+    try std.testing.expect(rejected == .rejected);
+    try std.testing.expect(rejected.rejected.diagnostics()[0] == .invalid_auth_command);
 }
 
 test "CLI surface rejects options outside their command grammar" {

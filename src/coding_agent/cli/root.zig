@@ -1,3 +1,4 @@
+const auth = @import("auth.zig");
 const entry = @import("entry.zig");
 const initial_message = @import("initial_message.zig");
 const interactive_launch = @import("interactive_launch.zig");
@@ -14,6 +15,10 @@ const ai_message = ai.message;
 const ai_model = ai.model;
 const ai_testing = ai.testing;
 const AgentSession = @import("../AgentSession.zig");
+
+test {
+    _ = auth;
+}
 
 test "CLI core parses, composes, runs sequential prompts, and prints only the final response" {
     var temporary = std.testing.tmpDir(.{});

@@ -62,6 +62,8 @@ Trusted `$CWD/.zi/SYSTEM.md` and `$CWD/.zi/APPEND_SYSTEM.md` files shadow their 
 
 Explicit `--rules` takes precedence over project and global `APPEND_SYSTEM.md` files while retaining the highest-precedence `SYSTEM.md` base. Prompt files must be regular UTF-8 text without NUL bytes and may not exceed 1 MiB each.
 
+Log in to an OAuth-backed provider with `./zig-out/bin/zi auth login openai-codex`. Add `--device` for the device-code ceremony. Zi prints provider-supplied browser or device instructions and stores a successful credential in `$HOME/.zi/agent/auth.json`.
+
 Zi also loads one context file from the global agent directory and from each ancestor of the effective working directory. `AGENTS.md` takes precedence over `CLAUDE.md` in each directory, and files are applied from global and broadest scope to the working directory. Context files must be regular UTF-8 text without NUL bytes. Each file is limited to 64 KiB, with a 128 KiB aggregate limit. An explicit system-prompt replacement is verbatim and bypasses prompt and context file discovery.
 
 Run `./zig-out/bin/zi --help` for the current command surface. JSON and RPC modes are not available yet.

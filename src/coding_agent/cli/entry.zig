@@ -1,4 +1,5 @@
 const std = @import("std");
+const auth = @import("auth.zig");
 const interactive = @import("../interactive/root.zig");
 const interactive_launch = @import("interactive_launch.zig");
 const launch = @import("launch.zig");
@@ -48,6 +49,7 @@ pub fn run(init: std.process.Init, frontend: interactive.Frontend) !u8 {
                 return 0;
             },
             .trust => |request| return runTrustInvocation(init, request, stdout, stderr),
+            .auth => |request| return runAuthInvocation(init, request, stdout, stderr),
             .launch => |request| return runLaunchInvocation(
                 init,
                 &request,
@@ -81,6 +83,33 @@ fn runTrustInvocation(
         .home = home,
         .stdout = stdout,
         .stderr = stderr,
+    });
+}
+
+fn runAuthInvocation(
+    init: std.process.Init,
+    request: surface.AuthRequest,
+    stdout: *std.Io.Writer,
+    stderr: *std.Io.Writer,
+) !u8 {
+    const allocator = init.gpa;
+    const io = init.io;
+    const cwd = try std.process.currentPathAlloc(io, allocator);
+    defer allocator.free(cwd);
+    const home = init.environ_map.get("HOME") orelse {
+        try stderr.writeAll("Unable to log in: HOME is not set.\n");
+        return 1;
+    };
+    var stdin_buffer: [64 * 1024]u8 = undefined;
+    var stdin_file = std.Io.File.Reader.init(.stdin(), io, &stdin_buffer);
+    return auth.run(request, .{
+        .allocator = allocator,
+        .io = io,
+        .cwd = cwd,
+        .home = home,
+        .input = &stdin_file.interface,
+        .output = stdout,
+        .error_output = stderr,
     });
 }
 
@@ -162,6 +191,7 @@ fn writeCliHelp(writer: *std.Io.Writer) !void {
         \\  zi --print --provider PROVIDER --model MODEL [PROMPT]
         \\  zi --print (--continue | --session PATH) [PROMPT]
         \\  zi trust (status | allow | deny | remove) [PATH]
+        \\  zi auth login PROVIDER [--device]
         \\
         \\Options:
         \\  -p, --print          Run prompts and print the final response
@@ -177,6 +207,7 @@ fn writeCliHelp(writer: *std.Io.Writer) !void {
         \\  --system-prompt TEXT Replace the default system prompt
         \\  -h, --help           Show help
         \\  -v, --version        Show the version
+        \\  auth login           Start the provider-owned OAuth login ceremony
         \\
         \\Interactive transcript:
         \\  Assistant prose and thinking render as ordered Markdown blocks
