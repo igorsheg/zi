@@ -107,9 +107,9 @@ or `packages/` into the Zig tree.
 
 This project is written in **Zig 0.16+**. There is no Node.js runtime, no
 `package.json`, and no JavaScript build step for this branch. `build.zig.zon`
-pins `uucode` for generated Unicode grapheme and width tables. The pinned md4x
-parser and ANSI renderer snapshot is vendored under `third_party/md4x/`;
-`THIRD_PARTY_NOTICES.md` owns its provenance.
+pins `uucode` for generated Unicode grapheme and width tables. Smol's
+incremental Markdown presentation processor is adapted from the pinned fx
+revision recorded in `THIRD_PARTY_NOTICES.md`.
 
 ```bash
 zig build                          # build the binary
@@ -185,10 +185,10 @@ Module ownership (stable boundaries):
   encoding. It depends only on the standard library and the pinned `uucode`
   tables.
 - `src/smol/` owns the concrete non-alternate-screen interactive client: terminal
-  lifecycle, input decoding and editing, event polling, footer layout,
-  normal-buffer publication, and rendering policy. It consumes the public
-  coding-agent interactive and terminal-render contracts. `smol/MarkdownAnsi.zig`
-  is the sole consumer of the vendored md4x parser and ANSI renderer.
+  lifecycle, input decoding and editing, event polling, incremental Markdown
+  presentation, the typed transcript store, paint-time transcript reflow, footer
+  layout, normal-buffer publication, and rendering policy. It consumes the
+  public coding-agent interactive and terminal-render contracts.
 - `src/BoundedJson.zig` is the shared bounded JSON helper. Domain-specific
   validation stays with the owning module.
 - `src/coding_agent/BoundedTextFile.zig` shares optional bounded UTF-8 file-read
@@ -287,15 +287,16 @@ deadline. `smol/EventLoop.zig` handles bounded terminal bytes, resize
 observation, worker fact collection, input-deadline settlement, and one frame
 commit after reduction on the terminal-owning thread. It does not interpret
 coding-agent input actions. `smol/Screen.zig` coalesces typed render requests,
-sanitizes provider and tool text, keeps completed transcript output append-only,
-and paints the normal-buffer status and composer footer. `smol/render/FooterLayout.zig`
-owns non-overlapping status and composer bands, display-cell wrapping, bounded
-composer viewport selection, and cursor geometry. `terminal_render/Surface.zig`
-owns typed frame cells, frame-local grapheme bytes, cell spans, and cursor
-invariants. `terminal_render/Text.zig` owns Unicode grapheme boundaries and
-display width. `smol/render/TerminalRenderer.zig` is the sole live frame writer. It composes a
-complete wire transaction, diffs against its authoritative footer shadow, and
-replaces that shadow only after a successful flush.
+sanitizes provider and tool text, incrementally presents settled Markdown into
+typed transcript entries, and reflows the transcript tail at paint time.
+`smol/render/FooterLayout.zig` owns non-overlapping status and composer bands,
+display-cell wrapping, bounded composer viewport selection, and cursor geometry.
+`terminal_render/Surface.zig` owns typed frame cells, frame-local grapheme bytes,
+cell spans, and cursor invariants. `terminal_render/Text.zig` owns Unicode
+grapheme boundaries and display width. `smol/render/TerminalRenderer.zig` is the
+sole live frame writer. It composes a complete wire transaction, diffs against
+its allocator-owned full-frame shadow, and replaces that shadow only after a
+successful flush.
 
 Credentials are admitted values on the session runtime, not ambient environment
 reads scattered through the tree. The process edge reads the environment once

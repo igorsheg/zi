@@ -14,30 +14,12 @@ pub fn build(b: *std.Build) void {
             "is_emoji_presentation",
         }),
     });
-    const md4x_abi = b.createModule(.{
-        .root_source_file = b.path("third_party/md4x/src/abi.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    const md4x_options = b.addOptions();
-    md4x_options.addOption(bool, "emoji", false);
-    const md4x = b.createModule(.{
-        .root_source_file = b.path("third_party/md4x/root.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    md4x.addImport("abi", md4x_abi);
-    md4x.addImport("build_config", md4x_options.createModule());
-
     const zi = b.addModule("zi", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
-        .link_libc = true,
         .imports = &.{
             .{ .name = "uucode", .module = uucode_dependency.module("uucode") },
-            .{ .name = "md4x", .module = md4x },
         },
     });
 
