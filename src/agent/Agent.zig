@@ -369,39 +369,11 @@ fn runTurns(self: *Agent, run_id: event_api.RunId, control: RunControl) TurnErro
                         "Tool call was not executed because the model response was truncated.",
                     )
                 else
-                    self.executeTool(result_arena.allocator(), call, control) catch |failure| {
-                        try self.emit(.{ .tool_execution_end = .{
-                            .run_id = run_id,
-                            .turn_index = turn_index,
-                            .call_id = call.id,
-                            .name = call.name,
-                            .result = .{ .discarded = runOutcome(failure) },
-                        } });
-                        try self.emit(.{ .turn_end = .{
-                            .run_id = run_id,
-                            .index = turn_index,
-                            .response = response_end,
-                            .tool_results = tool_results.items,
-                        } });
-                        return failure;
-                    };
+                    self.executeTool(result_arena.allocator(), call, control) catch |failure|
+                        return self.discardToolExecution(run_id, turn_index, response_end, call, failure);
                 const result_parts = [_]ai_message.RequestPart{.{ .tool_result = result }};
-                self.commitMessage(.tool_result, .{ .request = .{ .parts = &result_parts } }) catch |failure| {
-                    try self.emit(.{ .tool_execution_end = .{
-                        .run_id = run_id,
-                        .turn_index = turn_index,
-                        .call_id = call.id,
-                        .name = call.name,
-                        .result = .{ .discarded = runOutcome(failure) },
-                    } });
-                    try self.emit(.{ .turn_end = .{
-                        .run_id = run_id,
-                        .index = turn_index,
-                        .response = response_end,
-                        .tool_results = tool_results.items,
-                    } });
-                    return failure;
-                };
+                self.commitMessage(.tool_result, .{ .request = .{ .parts = &result_parts } }) catch |failure|
+                    return self.discardToolExecution(run_id, turn_index, response_end, call, failure);
                 const stored_result_message = self.history.messages()[self.history.messages().len - 1];
                 const stored_result = stored_result_message.request;
                 try tool_results.append(self.allocator, stored_result.parts[0].tool_result);
@@ -452,6 +424,33 @@ fn emitDiscardedTurn(
         .response = .{ .discarded = discarded },
         .tool_results = &.{},
     } });
+}
+
+/// Emits the abandoned shape for a failure between tool execution start and
+/// its committed result: the result is discarded and the turn ends without
+/// published tool results.
+fn discardToolExecution(
+    self: *Agent,
+    run_id: event_api.RunId,
+    turn_index: event_api.TurnIndex,
+    response_end: event_api.ResponseEnd,
+    call: ai_message.ToolCall,
+    failure: TurnError,
+) TurnError {
+    try self.emit(.{ .tool_execution_end = .{
+        .run_id = run_id,
+        .turn_index = turn_index,
+        .call_id = call.id,
+        .name = call.name,
+        .result = .{ .discarded = runOutcome(failure) },
+    } });
+    try self.emit(.{ .turn_end = .{
+        .run_id = run_id,
+        .index = turn_index,
+        .response = response_end,
+        .tool_results = &.{},
+    } });
+    return failure;
 }
 
 fn emitMessageLifecycle(
