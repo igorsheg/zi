@@ -9,6 +9,7 @@ const render = @import("render/root.zig");
 const markdown = @import("markdown/root.zig");
 const decoder = @import("input/Decoder.zig");
 const line_editor = @import("input/LineEditor.zig");
+const cursor_probe = @import("terminal/CursorProbe.zig");
 const terminal_session = @import("terminal/Session.zig");
 
 pub const frontend: coding_agent.interactive.Frontend = .{
@@ -50,5 +51,6 @@ test {
     _ = markdown;
     _ = decoder;
     _ = line_editor;
+    _ = cursor_probe;
     _ = terminal_session;
 }

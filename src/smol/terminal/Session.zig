@@ -1,9 +1,14 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const CursorProbe = @import("CursorProbe.zig");
 
 const Session = @This();
 
-pub const restore_sequence = "\x1b]8;;\x1b\\\x1b[0m\x1b[?25h";
+pub const admission_sequence = "\x1b[?7l";
+pub const restore_sequence = "\x1b[?7h\x1b]8;;\x1b\\\x1b[0m\x1b[?25h";
+const cursor_query_sequence = "\x1b[6n";
+const cursor_query_timeout_ms: i32 = 100;
+const max_probe_input_bytes = CursorProbe.max_deferred_bytes;
 
 pub const Size = struct {
     rows: u16,
@@ -34,6 +39,9 @@ io: std.Io,
 input: std.Io.File,
 output: std.Io.File,
 original: std.posix.termios,
+deferred_input: [CursorProbe.max_deferred_bytes]u8 = undefined,
+deferred_start: u16 = 0,
+deferred_len: u16 = 0,
 active: bool = true,
 
 /// Enters raw mode on the normal screen. No alternate screen, mouse tracking,
@@ -69,6 +77,12 @@ pub fn start(
     }
     std.posix.tcsetattr(input.handle, .NOW, raw) catch
         return error.UnableToConfigureTerminal;
+    errdefer {
+        std.posix.tcsetattr(input.handle, .NOW, original) catch {};
+        output.writeStreamingAll(io, restore_sequence) catch {};
+    }
+    output.writeStreamingAll(io, admission_sequence) catch
+        return error.UnableToConfigureTerminal;
     return .{
         .io = io,
         .input = input,
@@ -90,11 +104,103 @@ pub fn deinit(self: *Session) void {
     self.active = false;
 }
 
-pub fn read(self: Session, buffer: []u8) !usize {
+pub fn read(self: *Session, buffer: []u8) !usize {
+    if (buffer.len == 0) return 0;
+    if (self.deferred_start < self.deferred_len) {
+        const available = self.deferred_len - self.deferred_start;
+        const count = @min(buffer.len, available);
+        @memcpy(buffer[0..count], self.deferred_input[self.deferred_start..][0..count]);
+        self.deferred_start += @intCast(count);
+        if (self.deferred_start == self.deferred_len) {
+            self.deferred_start = 0;
+            self.deferred_len = 0;
+        }
+        return count;
+    }
     return std.posix.read(self.input.handle, buffer);
 }
 
-pub fn pollInput(self: Session, timeout_ms: i32) !PollResult {
+pub fn pollInput(self: *Session, timeout_ms: i32) !PollResult {
+    if (self.deferred_start < self.deferred_len) return .{ .readable = true };
+    return self.pollFileInput(timeout_ms);
+}
+
+/// Admits a normal-buffer inline viewport and returns its one-based launch row.
+/// Cursor probing never consumes user input. A failed probe moves to the bottom
+/// row without clearing shell output or scrollback.
+pub fn prepareInline(self: *Session, size: Size) !u16 {
+    if (size.rows == 0 or size.columns == 0) return error.InvalidTerminalSize;
+
+    const position = self.queryCursorPosition() catch {
+        var fallback: [32]u8 = undefined;
+        const sequence = try std.fmt.bufPrint(&fallback, "\x1b[{d};1H", .{size.rows});
+        try self.output.writeStreamingAll(self.io, sequence);
+        return size.rows;
+    };
+    if (position.row > size.rows or position.column > size.columns) {
+        var fallback: [32]u8 = undefined;
+        const sequence = try std.fmt.bufPrint(&fallback, "\x1b[{d};1H", .{size.rows});
+        try self.output.writeStreamingAll(self.io, sequence);
+        return size.rows;
+    }
+    if (position.column == 1) return position.row;
+
+    try self.output.writeStreamingAll(self.io, "\n");
+    return @min(position.row +| 1, size.rows);
+}
+
+fn queryCursorPosition(self: *Session) !CursorProbe.Position {
+    if (self.deferred_input.len - self.deferred_len < max_probe_input_bytes) {
+        return error.CursorPositionUnavailable;
+    }
+    try self.output.writeStreamingAll(self.io, cursor_query_sequence);
+
+    var parser: CursorProbe.Parser = .{};
+    defer {
+        parser.finish() catch unreachable;
+        self.appendDeferredInput(parser.deferredInput()) catch unreachable;
+    }
+
+    const started_ms = nowMs(self.io);
+    const deadline_ms = std.math.add(i64, started_ms, cursor_query_timeout_ms) catch std.math.maxInt(i64);
+    var observed: usize = 0;
+    while (observed < max_probe_input_bytes) : (observed += 1) {
+        const current_ms = nowMs(self.io);
+        if (current_ms >= deadline_ms) break;
+        const remaining_ms: i32 = @intCast(deadline_ms - current_ms);
+        const poll = try self.pollFileInput(remaining_ms);
+        if (poll.closed() or !poll.readable) break;
+
+        var byte: [1]u8 = undefined;
+        const count = try std.posix.read(self.input.handle, &byte);
+        if (count == 0) break;
+        try parser.feed(byte[0]);
+        if (parser.position()) |position| return position;
+    }
+    return error.CursorPositionUnavailable;
+}
+
+fn appendDeferredInput(self: *Session, bytes: []const u8) error{DeferredInputFull}!void {
+    if (bytes.len == 0) return;
+    const pending = self.deferred_len - self.deferred_start;
+    if (bytes.len > self.deferred_input.len - pending) return error.DeferredInputFull;
+    if (self.deferred_start > 0 and pending > 0) {
+        @memmove(
+            self.deferred_input[0..pending],
+            self.deferred_input[self.deferred_start..self.deferred_len],
+        );
+    }
+    @memcpy(self.deferred_input[pending..][0..bytes.len], bytes);
+    self.deferred_start = 0;
+    self.deferred_len = @intCast(pending + bytes.len);
+}
+
+fn nowMs(io: std.Io) i64 {
+    const value = std.Io.Timestamp.now(io, .awake).toMilliseconds();
+    return std.math.cast(i64, value) orelse std.math.maxInt(i64);
+}
+
+fn pollFileInput(self: Session, timeout_ms: i32) !PollResult {
     var descriptors = [_]std.posix.pollfd{.{
         .fd = self.input.handle,
         .events = std.posix.POLL.IN,
@@ -180,13 +286,25 @@ const TestPty = struct {
     }
 };
 
-fn readRestoreSequence(file: std.Io.File, output: []u8) !void {
+fn readExact(file: std.Io.File, output: []u8) !void {
     var offset: usize = 0;
     while (offset < output.len) {
         const count = try file.readStreaming(std.testing.io, &.{output[offset..]});
         if (count == 0) return error.UnexpectedEndOfFile;
         offset += count;
     }
+}
+
+fn expectFileBytes(file: std.Io.File, expected: []const u8) !void {
+    var actual: [64]u8 = undefined;
+    try std.testing.expect(expected.len <= actual.len);
+    try readExact(file, actual[0..expected.len]);
+    try std.testing.expectEqualStrings(expected, actual[0..expected.len]);
+}
+
+fn replyToCursorProbe(file: std.Io.File, response: []const u8) !void {
+    try expectFileBytes(file, cursor_query_sequence);
+    try file.writeStreamingAll(std.testing.io, response);
 }
 
 test "terminal size rejects unknown geometry" {
@@ -197,26 +315,29 @@ test "terminal size rejects unknown geometry" {
     try std.testing.expectError(error.UnableToReadTerminalSize, sizeFromValues(24, 0));
 }
 
-test "terminal session enters raw mode and restores termios and cursor state" {
+test "terminal session admits exact normal-buffer modes and restores exact cleanup" {
     if (!supports_test_pty) return error.SkipZigTest;
     const pty = try TestPty.open();
     defer pty.close();
     const original = try std.posix.tcgetattr(pty.slave.handle);
 
     var session = try Session.start(std.testing.io, pty.slave, pty.slave);
+    try expectFileBytes(pty.master, admission_sequence);
     const raw = try std.posix.tcgetattr(pty.slave.handle);
     try std.testing.expect(!raw.lflag.ECHO);
     try std.testing.expect(!raw.lflag.ICANON);
     try std.testing.expect(!raw.lflag.ISIG);
     try std.testing.expect(raw.cflag.CSIZE == .CS8);
     var output: [restore_sequence.len]u8 = undefined;
-    var output_future = std.testing.io.async(readRestoreSequence, .{ pty.master, &output });
+    var output_future = std.testing.io.async(readExact, .{ pty.master, &output });
     session.deinit();
     try output_future.await(std.testing.io);
 
     const restored = try std.posix.tcgetattr(pty.slave.handle);
     try std.testing.expect(std.meta.eql(original, restored));
     try std.testing.expectEqualStrings(restore_sequence, &output);
+    try std.testing.expect(std.mem.find(u8, admission_sequence, "?1049") == null);
+    try std.testing.expect(std.mem.find(u8, admission_sequence, "?1000") == null);
 }
 
 test "terminal session preserves input queued before raw-mode admission" {
@@ -233,13 +354,81 @@ test "terminal session preserves input queued before raw-mode admission" {
     try pty.master.writeStreamingAll(std.testing.io, "x");
 
     var session = try Session.start(std.testing.io, pty.slave, pty.slave);
+    try expectFileBytes(pty.master, admission_sequence);
     const poll = try session.pollInput(100);
     try std.testing.expect(poll.readable);
     var byte: [1]u8 = undefined;
     try std.testing.expectEqual(@as(usize, 1), try session.read(&byte));
     try std.testing.expectEqual(@as(u8, 'x'), byte[0]);
     var output: [restore_sequence.len]u8 = undefined;
-    var output_future = std.testing.io.async(readRestoreSequence, .{ pty.master, &output });
+    var output_future = std.testing.io.async(readExact, .{ pty.master, &output });
     session.deinit();
     try output_future.await(std.testing.io);
+}
+
+test "prepare inline starts a fresh line when launched mid-line" {
+    if (!supports_test_pty) return error.SkipZigTest;
+    const pty = try TestPty.open();
+    defer pty.close();
+
+    var session = try Session.start(std.testing.io, pty.slave, pty.slave);
+    try expectFileBytes(pty.master, admission_sequence);
+    var reply = std.testing.io.async(replyToCursorProbe, .{ pty.master, "\x1b[4;7R" });
+    try std.testing.expectEqual(
+        @as(u16, 5),
+        try session.prepareInline(.{ .rows = 24, .columns = 80 }),
+    );
+    try reply.await(std.testing.io);
+    try expectFileBytes(pty.master, "\r\n");
+
+    session.deinit();
+    try expectFileBytes(pty.master, restore_sequence);
+}
+
+test "prepare inline falls back to the terminal bottom without clearing" {
+    if (!supports_test_pty) return error.SkipZigTest;
+    const pty = try TestPty.open();
+    defer pty.close();
+
+    var session = try Session.start(std.testing.io, pty.slave, pty.slave);
+    try expectFileBytes(pty.master, admission_sequence);
+    var probe_read = std.testing.io.async(expectFileBytes, .{ pty.master, cursor_query_sequence });
+    try std.testing.expectEqual(
+        @as(u16, 24),
+        try session.prepareInline(.{ .rows = 24, .columns = 80 }),
+    );
+    try probe_read.await(std.testing.io);
+    try expectFileBytes(pty.master, "\x1b[24;1H");
+
+    session.deinit();
+    try expectFileBytes(pty.master, restore_sequence);
+}
+
+test "cursor probe defers user input and reads it before file input" {
+    if (!supports_test_pty) return error.SkipZigTest;
+    const pty = try TestPty.open();
+    defer pty.close();
+
+    var session = try Session.start(std.testing.io, pty.slave, pty.slave);
+    try expectFileBytes(pty.master, admission_sequence);
+    var reply = std.testing.io.async(
+        replyToCursorProbe,
+        .{ pty.master, "ab\x1b[4;1Rcd" },
+    );
+    try std.testing.expectEqual(
+        @as(u16, 4),
+        try session.prepareInline(.{ .rows = 24, .columns = 80 }),
+    );
+    try reply.await(std.testing.io);
+
+    try std.testing.expect((try session.pollInput(0)).readable);
+    var input: [4]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 2), try session.read(&input));
+    try std.testing.expectEqualStrings("ab", input[0..2]);
+    try std.testing.expect((try session.pollInput(100)).readable);
+    try std.testing.expectEqual(@as(usize, 2), try session.read(&input));
+    try std.testing.expectEqualStrings("cd", input[0..2]);
+
+    session.deinit();
+    try expectFileBytes(pty.master, restore_sequence);
 }
