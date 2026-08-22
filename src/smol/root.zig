@@ -7,6 +7,7 @@ const markdown_ansi = @import("MarkdownAnsi.zig");
 const safe_text = @import("SafeText.zig");
 const transcript_presenter = @import("TranscriptPresenter.zig");
 const render = @import("render/root.zig");
+const markdown = @import("markdown/root.zig");
 const decoder = @import("input/Decoder.zig");
 const line_editor = @import("input/LineEditor.zig");
 const terminal_session = @import("terminal/Session.zig");
@@ -48,6 +49,7 @@ test {
     _ = safe_text;
     _ = transcript_presenter;
     _ = render;
+    _ = markdown;
     _ = decoder;
     _ = line_editor;
     _ = terminal_session;

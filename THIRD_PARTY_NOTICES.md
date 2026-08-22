@@ -24,6 +24,12 @@ license texts are retained under `third_party/licenses/`.
 
 ## Adapted source behavior
 
+- fx, revision `5ed3be1b67e59b6607f09f69581107d70fa6d243`
+  - Source: https://github.com/vercel-labs/fx
+  - License: Apache-2.0
+  - `src/smol/markdown/` adapts the incremental Markdown presentation processor
+    and its parser and renderer leaf modules.
+
 - OpenTUI, revision `6f7833d09773b88cf5984b2a4e7bc428e1f8ffcb`
   - Source: https://github.com/anomalyco/opentui
   - License: MIT
@@ -32,8 +38,7 @@ license texts are retained under `third_party/licenses/`.
 
 ## Design references only
 
-Pi, ZigAI, and fx remain design references. Zi does not bundle their source.
+Pi and ZigAI remain design references. Zi does not bundle their source.
 
 - Pi: https://github.com/earendil-works/pi
 - ZigAI: https://github.com/Kludex/zigai
-- fx: https://github.com/vercel-labs/fx
