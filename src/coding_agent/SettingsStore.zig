@@ -233,9 +233,38 @@ pub fn setGlobalDefaultModel(
     provider: []const u8,
     model: []const u8,
 ) MutationError!void {
+    try hardenExistingGlobalSettings(io, paths);
     var mutation = try beginMutationWithFaults(io, paths, .none());
     defer mutation.deinit();
     return mutation.setDefaultModel(allocator, provider, model);
+}
+
+fn hardenExistingGlobalSettings(io: std.Io, paths: *const ZiPaths) MutationError!void {
+    if (comptime builtin.os.tag == .windows) return;
+    var directory = std.Io.Dir.openDirAbsolute(io, paths.global_agent, .{
+        .follow_symlinks = false,
+    }) catch |failure| return switch (failure) {
+        error.FileNotFound => {},
+        error.NotDir, error.SymLinkLoop => error.UnsafeGlobalSettingsStorage,
+        else => error.SettingsReadFailed,
+    };
+    defer directory.close(io);
+    const file = directory.openFile(io, settings_file_name, .{
+        .mode = .read_write,
+        .allow_directory = false,
+        .follow_symlinks = false,
+        .resolve_beneath = true,
+    }) catch |failure| return switch (failure) {
+        error.FileNotFound => {},
+        error.IsDir, error.NotDir, error.SymLinkLoop => error.UnsafeGlobalSettingsStorage,
+        else => error.SettingsReadFailed,
+    };
+    defer file.close(io);
+    const stat = file.stat(io) catch return error.SettingsReadFailed;
+    if (stat.kind != .file or stat.nlink != 1) return error.UnsafeGlobalSettingsStorage;
+    if (stat.permissions.toMode() & 0o777 == 0o600) return;
+    file.setPermissions(io, PrivateFileStore.private_file_permissions) catch
+        return error.SettingsWriteFailed;
 }
 
 fn beginMutationWithFaults(
@@ -1035,7 +1064,12 @@ test "global settings reads do not require secret-file permissions" {
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();
-    try temporary.dir.createDirPath(std.testing.io, ".zi/agent");
+    try temporary.dir.createDir(std.testing.io, ".zi", .default_dir);
+    try temporary.dir.createDir(
+        std.testing.io,
+        ".zi/agent",
+        std.Io.File.Permissions.fromMode(0o700),
+    );
     const file = try temporary.dir.createFile(std.testing.io, ".zi/agent/settings.json", .{
         .permissions = std.Io.File.Permissions.fromMode(0o644),
     });
@@ -1046,8 +1080,25 @@ test "global settings reads do not require secret-file permissions" {
     defer paths.deinit();
 
     var snapshot = try load(std.testing.allocator, std.testing.io, &paths, .untrusted);
-    defer snapshot.deinit();
     try std.testing.expectEqualStrings("openai", snapshot.default_provider.?);
+    snapshot.deinit();
+
+    try setGlobalDefaultModel(
+        std.testing.allocator,
+        std.testing.io,
+        &paths,
+        "openai-codex",
+        "gpt-5.6-terra",
+    );
+    const stat = try temporary.dir.statFile(
+        std.testing.io,
+        ".zi/agent/settings.json",
+        .{ .follow_symlinks = false },
+    );
+    try std.testing.expectEqual(@as(u32, 0o600), stat.permissions.toMode() & 0o777);
+    var updated = try load(std.testing.allocator, std.testing.io, &paths, .untrusted);
+    defer updated.deinit();
+    try std.testing.expectEqualStrings("openai-codex", updated.default_provider.?);
 }
 
 fn decodeAndDeinit(allocator: std.mem.Allocator) !void {
