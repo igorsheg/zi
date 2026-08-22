@@ -186,6 +186,7 @@ fn writeCliDiagnostics(writer: *std.Io.Writer, diagnostics: []const surface.Diag
 fn writeCliHelp(writer: *std.Io.Writer) !void {
     try writer.writeAll(
         \\Usage:
+        \\  zi [PROMPT]
         \\  zi --provider PROVIDER --model MODEL [PROMPT]
         \\  zi (--continue | --session PATH) [PROMPT]
         \\  zi --print --provider PROVIDER --model MODEL [PROMPT]
@@ -210,6 +211,7 @@ fn writeCliHelp(writer: *std.Io.Writer) !void {
         \\  auth login           Start the provider-owned OAuth login ceremony
         \\
         \\Interactive transcript:
+        \\  Without an authenticated model, Zi opens a model-less session
         \\  Assistant prose and thinking render as ordered Markdown blocks
         \\  Running tools use the footer; completed tools append compact results
         \\

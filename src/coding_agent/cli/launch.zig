@@ -139,6 +139,51 @@ pub fn createRuntime(
         .environment = .{ .entries = environment_entries[0..environment_count] },
         .options = .{ .prompt = .{ .policy = prompt_policy } },
     }) catch |failure| {
+        if (failure == error.SelectionRequired) {
+            try context.stderr.writeAll(
+                "No model is available. Run `zi auth login PROVIDER` or pass --provider and --model.\n",
+            );
+        } else {
+            try context.stderr.print("Unable to start the coding agent: {s}.\n", .{@errorName(failure)});
+        }
+        return null;
+    };
+}
+
+pub fn createInteractiveRuntime(
+    request: *const surface.LaunchRequest,
+    context: LaunchContext,
+) !?RuntimeServices.Interactive {
+    var environment_entries: [1]ai.auth.EnvironmentEntry = undefined;
+    const environment_count: usize = if (context.openai_api_key) |key| count: {
+        environment_entries[0] = .{ .name = "OPENAI_API_KEY", .value = key };
+        break :count 1;
+    } else 0;
+    var prompt_rules: [1][]const u8 = undefined;
+    const prompt_policy: SystemPrompt.Policy = switch (request.system_prompt) {
+        .default => .{ .composed = .{} },
+        .append => |value| policy: {
+            prompt_rules[0] = value;
+            break :policy .{ .composed = .{ .rules = &prompt_rules } };
+        },
+        .replace => |value| .{ .verbatim = value },
+    };
+    return RuntimeServices.createInteractive(context.allocator, context.io, .{
+        .startup_cwd = context.cwd,
+        .home = context.home,
+        .session = switch (request.session) {
+            .new => .new,
+            .continue_recent => .continue_recent,
+            .open => |path| .{ .open = path },
+        },
+        .sources = context.sources,
+        .requested_provider = request.provider,
+        .requested_model = request.model,
+        .cli_api_key = request.api_key,
+        .project_trust = request.project_trust,
+        .environment = .{ .entries = environment_entries[0..environment_count] },
+        .options = .{ .prompt = .{ .policy = prompt_policy } },
+    }) catch |failure| {
         try context.stderr.print("Unable to start the coding agent: {s}.\n", .{@errorName(failure)});
         return null;
     };

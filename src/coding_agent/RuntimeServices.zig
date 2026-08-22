@@ -108,6 +108,52 @@ const Transport = union(enum) {
     borrowed: ai.transport.Transport,
 };
 
+pub const ModelLess = struct {
+    allocator: std.mem.Allocator,
+    selection: SessionSelection,
+    snapshot: ModelConfigSnapshot,
+    transcript_value: SessionTranscript,
+
+    pub fn transcript(self: *const ModelLess) *const SessionTranscript {
+        return &self.transcript_value;
+    }
+
+    // Heap destruction follows explicit field invalidation.
+    // ziglint-ignore: Z030
+    pub fn deinit(self: *ModelLess) void {
+        const allocator = self.allocator;
+        self.transcript_value.deinit();
+        self.snapshot.deinit();
+        self.selection.deinit();
+        self.* = undefined;
+        allocator.destroy(self);
+    }
+};
+
+pub const Interactive = union(enum) {
+    model_less: *ModelLess,
+    runnable: *RuntimeServices,
+
+    pub fn transcript(self: Interactive) *const SessionTranscript {
+        return switch (self) {
+            .model_less => |value| value.transcript(),
+            .runnable => |value| value.transcript(),
+        };
+    }
+
+    pub fn deinit(self: Interactive) void {
+        switch (self) {
+            .model_less => |value| value.deinit(),
+            .runnable => |value| value.deinit(),
+        }
+    }
+};
+
+const Creation = union(enum) {
+    model_less: *ModelLess,
+    runnable: *RuntimeServices,
+};
+
 io: std.Io,
 allocator: std.mem.Allocator,
 selection: SessionSelection,
@@ -123,7 +169,21 @@ pub fn create(
     io: std.Io,
     inputs: Inputs,
 ) Error!*RuntimeServices {
-    return createOwned(allocator, io, inputs, .http);
+    return switch (try createOwned(allocator, io, inputs, .http, false)) {
+        .runnable => |runtime| runtime,
+        .model_less => unreachable,
+    };
+}
+
+pub fn createInteractive(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    inputs: Inputs,
+) Error!Interactive {
+    return switch (try createOwned(allocator, io, inputs, .http, true)) {
+        .runnable => |runtime| .{ .runnable = runtime },
+        .model_less => |runtime| .{ .model_less = runtime },
+    };
 }
 
 pub fn session(self: *RuntimeServices) *AgentSession {
@@ -167,7 +227,10 @@ fn createWithTransport(
     inputs: Inputs,
     transport: ai.transport.Transport,
 ) Error!*RuntimeServices {
-    return createOwned(allocator, io, inputs, .{ .borrowed = transport });
+    return switch (try createOwned(allocator, io, inputs, .{ .borrowed = transport }, false)) {
+        .runnable => |runtime| runtime,
+        .model_less => unreachable,
+    };
 }
 
 fn createOwned(
@@ -175,7 +238,8 @@ fn createOwned(
     io: std.Io,
     inputs: Inputs,
     transport: Transport,
-) Error!*RuntimeServices {
+    allow_model_less: bool,
+) Error!Creation {
     var selection = try SessionSelection.select(
         allocator,
         io,
@@ -184,7 +248,10 @@ fn createOwned(
         inputs.sources,
         inputs.session,
     );
-    errdefer selection.deinit();
+    errdefer {
+        selection.discardNew();
+        selection.deinit();
+    }
 
     var runtime_options = inputs.options;
     runtime_options.prompt.working_directory = selection.pathsView().cwd;
@@ -244,7 +311,7 @@ fn createOwned(
         .http => refresh_http.transport(),
         .borrowed => |borrowed| borrowed,
     };
-    var resolved = try admitBootstrapPlan(
+    var resolved = admitBootstrapPlan(
         allocator,
         io,
         selection.pathsView(),
@@ -252,7 +319,19 @@ fn createOwned(
         snapshot.view(),
         bootstrap_plan,
         inputs,
-    );
+    ) catch |failure| {
+        if (failure != error.SelectionRequired or !allow_model_less) return failure;
+        var transcript_value = try SessionTranscript.init(allocator, selection.restoredView());
+        errdefer transcript_value.deinit();
+        const model_less = try allocator.create(ModelLess);
+        model_less.* = .{
+            .allocator = allocator,
+            .selection = selection,
+            .snapshot = snapshot,
+            .transcript_value = transcript_value,
+        };
+        return .{ .model_less = model_less };
+    };
     errdefer resolved.deinit();
 
     const credential_resolver = CredentialManager.PersistentResolver.init(
@@ -314,7 +393,7 @@ fn createOwned(
         .transcript_value = transcript_value,
         .runtime = runtime,
     };
-    return self;
+    return .{ .runnable = self };
 }
 
 const BootstrapModels = struct {
@@ -1718,17 +1797,53 @@ test "runtime services return SelectionRequired when no authenticated model exis
     var sources: TestSources = .{};
     var fake = fake_api.FakeTransport.init(&.{});
 
+    const inputs: Inputs = .{
+        .startup_cwd = root,
+        .home = root,
+        .session = .new,
+        .sources = sources.view(),
+    };
     try std.testing.expectError(error.SelectionRequired, createWithTransport(
         std.testing.allocator,
         std.testing.io,
-        .{
-            .startup_cwd = root,
-            .home = root,
-            .session = .new,
-            .sources = sources.view(),
-        },
+        inputs,
         fake.transport(),
     ));
+    var sessions = try temporary.dir.openDir(std.testing.io, ".zi/agent/sessions", .{ .iterate = true });
+    defer sessions.close(std.testing.io);
+    var iterator = sessions.iterateAssumeFirstIteration();
+    try std.testing.expect(try iterator.next(std.testing.io) == null);
+}
+
+test "interactive runtime admits and preserves a model-less durable session" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var root_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root = try temporaryPath(&temporary, &root_buffer);
+    var sources: TestSources = .{};
+
+    const lifecycle = try createInteractive(std.testing.allocator, std.testing.io, .{
+        .startup_cwd = root,
+        .home = root,
+        .session = .new,
+        .sources = sources.view(),
+    });
+    switch (lifecycle) {
+        .runnable => |runtime| {
+            runtime.deinit();
+            return error.UnexpectedRunnableSession;
+        },
+        .model_less => |runtime| {
+            try std.testing.expectEqual(@as(usize, 0), runtime.transcript().items.len);
+            runtime.deinit();
+        },
+    }
+
+    var sessions = try temporary.dir.openDir(std.testing.io, ".zi/agent/sessions", .{ .iterate = true });
+    defer sessions.close(std.testing.io);
+    var iterator = sessions.iterateAssumeFirstIteration();
+    try std.testing.expect(try iterator.next(std.testing.io) != null);
+    try std.testing.expect(try iterator.next(std.testing.io) == null);
 }
 
 test "failed OAuth refresh falls through to the next authenticated bootstrap candidate" {

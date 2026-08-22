@@ -31,6 +31,9 @@ on an empty prompt to exit, or Ctrl-D on an empty idle prompt to exit. User
 messages use a compact rail. Assistant prose and thinking render as separate
 Markdown blocks in model response order. Running tools appear in the footer,
 and completed tools append compact results without dumping arguments or output.
+When no authenticated model is available, interactive mode still opens a durable
+session. Drafts remain intact until a model is available. Run
+`./zig-out/bin/zi auth login PROVIDER`, then restart Zi.
 
 Run one or more prompts in print mode:
 

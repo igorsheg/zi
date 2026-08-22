@@ -49,10 +49,12 @@ const Origin = enum {
 };
 
 allocator: std.mem.Allocator,
+io: std.Io,
 paths: ZiPaths,
 journal_path: []const u8,
 journal: JournalOwnership,
 origin: Origin,
+discard_new: bool = false,
 
 const JournalOwnership = union(enum) {
     admitted: journal_api.Opened,
@@ -75,9 +77,18 @@ pub fn select(
 }
 
 pub fn deinit(self: *SessionSelection) void {
+    const owns_journal = switch (self.journal) {
+        .admitted => true,
+        .transferred => false,
+    };
+    const remove_new = self.origin == .new and self.discard_new and owns_journal;
     switch (self.journal) {
         .admitted => |*opened| opened.deinit(),
         .transferred => {},
+    }
+    if (remove_new) {
+        std.Io.Dir.deleteFile(.cwd(), self.io, self.journal_path) catch |failure|
+            ignoreDeleteError(failure);
     }
     self.allocator.free(self.journal_path);
     self.paths.deinit();
@@ -94,6 +105,10 @@ pub fn journalPath(self: *const SessionSelection) []const u8 {
 
 pub fn restoredModel(self: *const SessionSelection) ?ai.ModelIdentity {
     return self.restoredView().active_model;
+}
+
+pub fn discardNew(self: *SessionSelection) void {
+    self.discard_new = true;
 }
 
 pub fn isFresh(self: *const SessionSelection) bool {
@@ -116,6 +131,10 @@ pub fn restoredView(self: *const SessionSelection) *const format.Restored {
         .admitted => |*opened| &opened.restore_candidate,
         .transferred => unreachable,
     };
+}
+
+fn ignoreDeleteError(failure: anyerror) void {
+    std.debug.assert(@errorName(failure).len != 0);
 }
 
 fn createNew(
@@ -158,6 +177,7 @@ fn createNew(
     errdefer opened.deinit();
     return .{
         .allocator = allocator,
+        .io = io,
         .paths = paths,
         .journal_path = journal_path,
         .journal = .{ .admitted = opened },
@@ -203,6 +223,7 @@ fn openExact(
     if (!sameHeader(probed, opened.restore_candidate.header)) return error.SessionChanged;
     return .{
         .allocator = allocator,
+        .io = io,
         .paths = paths,
         .journal_path = journal_path,
         .journal = .{ .admitted = opened },

@@ -227,7 +227,11 @@ fn submitDraft(self: *App) !void {
         return;
     }
     self.submitPrompt(self.editor.text()) catch |failure| {
-        if (failure != error.EmptyPrompt) try self.screen.notice(@errorName(failure));
+        if (failure == error.ModelSelectionRequired) {
+            try self.screen.notice("No model selected. Run `zi auth login PROVIDER`, then restart Zi.");
+        } else if (failure != error.EmptyPrompt) {
+            try self.screen.notice(@errorName(failure));
+        }
         return;
     };
     self.editor.clear();

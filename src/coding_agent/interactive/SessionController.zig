@@ -23,6 +23,7 @@ pub const SubmitError = error{
     InvalidLimits,
     QueueFull,
     WorkerStopped,
+    ModelSelectionRequired,
 };
 pub const CancelError = error{ OutOfMemory, RestoredDraftTooLarge };
 pub const Phase = SessionPolicy.Phase;
@@ -69,8 +70,13 @@ pub const DrainResult = struct {
     }
 };
 
+const Backend = union(enum) {
+    model_less,
+    runnable: *TurnWorker,
+};
+
 allocator: std.mem.Allocator,
-worker: *TurnWorker,
+backend: Backend,
 policy: SessionPolicy,
 
 pub fn init(
@@ -80,7 +86,18 @@ pub fn init(
 ) InitError!SessionController {
     return .{
         .allocator = allocator,
-        .worker = worker,
+        .backend = .{ .runnable = worker },
+        .policy = try SessionPolicy.init(allocator, limits),
+    };
+}
+
+pub fn initModelLess(
+    allocator: std.mem.Allocator,
+    limits: SessionPolicy.Limits,
+) InitError!SessionController {
+    return .{
+        .allocator = allocator,
+        .backend = .model_less,
         .policy = try SessionPolicy.init(allocator, limits),
     };
 }
@@ -105,7 +122,11 @@ pub fn queuedFollowUp(self: *const SessionController, index: usize) ?[]const u8 
 }
 
 pub fn hasPendingFacts(self: *SessionController) bool {
-    const snapshot = self.worker.snapshot();
+    const worker = switch (self.backend) {
+        .model_less => return false,
+        .runnable => |value| value,
+    };
+    const snapshot = worker.snapshot();
     return snapshot.queued_events != 0 or snapshot.queued_completions != 0;
 }
 
@@ -115,13 +136,17 @@ pub fn submit(
     self: *SessionController,
     prompt: []const u8,
 ) SubmitError!SubmitDisposition {
+    const worker = switch (self.backend) {
+        .model_less => return error.ModelSelectionRequired,
+        .runnable => |value| value,
+    };
     var prepared = try self.policy.prepareSubmission(prompt);
     var prepared_live = true;
     defer if (prepared_live) prepared.deinit();
 
     const disposition: SubmitDisposition = switch (prepared.route) {
         .start => started: {
-            try self.worker.submit(prepared.text);
+            try worker.submit(prepared.text);
             break :started .started;
         },
         .follow_up => .queued_follow_up,
@@ -138,7 +163,10 @@ pub fn cancel(
     current_draft: []const u8,
 ) CancelError!?OwnedDraft {
     const result = try self.policy.escape(current_draft);
-    if (result.request_cancel) _ = self.worker.requestCancel();
+    if (result.request_cancel) switch (self.backend) {
+        .model_less => {},
+        .runnable => |worker| _ = worker.requestCancel(),
+    };
     return result.restored;
 }
 
@@ -151,7 +179,11 @@ pub fn drain(
 ) !DrainResult {
     if (!self.hasPendingFacts()) return .{};
 
-    var batch = try self.worker.takeBatch();
+    const worker = switch (self.backend) {
+        .model_less => return .{},
+        .runnable => |value| value,
+    };
+    var batch = try worker.takeBatch();
     defer batch.deinit(self.allocator);
     var result: DrainResult = .{};
     errdefer result.deinit();
@@ -183,9 +215,16 @@ fn applyEffect(
 ) !void {
     switch (effect) {
         .none => {},
-        .request_cancel => _ = self.worker.requestCancel(),
+        .request_cancel => switch (self.backend) {
+            .model_less => {},
+            .runnable => |worker| _ = worker.requestCancel(),
+        },
         .submit_follow_up => |prompt| {
-            self.worker.submit(prompt) catch |failure| {
+            const worker = switch (self.backend) {
+                .model_less => return,
+                .runnable => |value| value,
+            };
+            worker.submit(prompt) catch |failure| {
                 self.policy.rejectFollowUpSubmission();
                 try sink.emit(.{ .fault = .{ .follow_up_submission = failure } });
                 return;
@@ -269,6 +308,18 @@ const TestSink = struct {
         return .{ .context = self, .emitFn = emit };
     }
 };
+
+test "model-less controller rejects prompts without changing draft policy" {
+    var controller = try SessionController.initModelLess(
+        std.testing.allocator,
+        SessionPolicy.default_limits,
+    );
+    defer controller.deinit();
+
+    try std.testing.expectError(error.ModelSelectionRequired, controller.submit("keep this draft"));
+    try std.testing.expect(!controller.hasPendingFacts());
+    try std.testing.expectEqual(SessionPolicy.Phase.idle, controller.phase());
+}
 
 test "session controller drives a worker without frontend state" {
     var temporary = std.testing.tmpDir(.{});
