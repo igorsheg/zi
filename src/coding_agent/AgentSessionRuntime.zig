@@ -5,7 +5,7 @@ const ai_catalog = ai.model_catalog;
 const ai_model = ai.model;
 const ai_models = ai.models;
 const ai_protocol = ai.protocol_api;
-const ai_protocols = ai.protocols;
+const ai_adapters = ai.adapters;
 const ai_settings = ai.settings;
 const ai_transport = ai.transport;
 const AgentSession = @import("AgentSession.zig");
@@ -178,7 +178,7 @@ fn initialize(
     self.model_runtime = ai_models.init(
         self.allocator,
         self.transport.view(),
-        ai_protocol.Registry.init(&ai_protocols.builtin) catch return error.InvalidModelConfiguration,
+        ai_protocol.Registry.init(&ai_adapters.builtin) catch return error.InvalidModelConfiguration,
         .{
             .catalog = config.model_config.catalog,
             .providers = config.model_config.providers,

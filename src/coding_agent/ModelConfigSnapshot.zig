@@ -3,7 +3,7 @@ const bounded_json = @import("../BoundedJson.zig");
 const ai = @import("../ai/root.zig");
 const ai_catalog = ai.model_catalog;
 const ai_protocol = ai.protocol_api;
-const ai_protocols = ai.protocols;
+const ai_adapters = ai.adapters;
 const ai_settings = ai.settings;
 const ModelConfig = @import("ModelConfig.zig");
 const ZiPaths = @import("ZiPaths.zig");
@@ -300,7 +300,7 @@ fn validateModel(provider: SourceProvider, model: SourceModel) error{InvalidMode
 }
 
 fn protocolRegistry() ai_protocol.Registry {
-    return ai_protocol.Registry.init(&ai_protocols.builtin) catch unreachable;
+    return ai_protocol.Registry.init(&ai_adapters.builtin) catch unreachable;
 }
 
 fn profile(protocol_id: []const u8, model: SourceModel) error{InvalidModelsFile}!ai_settings.ModelProfile {
