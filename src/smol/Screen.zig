@@ -74,6 +74,31 @@ pub fn start(
 }
 
 pub fn apply(self: *Screen, fact: interactive.HostFact) !void {
+    // Streaming part facts mutate only the live region, which is derived
+    // state outside the staged transcript; handle them before the rollback
+    // guard so a failed frame never rolls back accumulated stream bytes.
+    switch (fact) {
+        .turn => |turn| switch (turn) {
+            .event => |event| switch (event) {
+                .message_update => |update| switch (update.update) {
+                    .part_start => |started| {
+                        self.presenter.streamPartStart(started);
+                        self.requests.request(.transcript);
+                        return;
+                    },
+                    .part_delta => |delta| {
+                        self.presenter.streamPartDelta(delta);
+                        self.requests.request(.transcript);
+                        return;
+                    },
+                    else => {},
+                },
+                else => {},
+            },
+            else => {},
+        },
+        else => {},
+    }
     const checkpoint = self.stagingCheckpoint();
     errdefer self.restoreStaging(checkpoint);
     switch (fact) {
@@ -188,12 +213,30 @@ pub fn commit(self: *Screen, view: FrameView) !void {
     const checkpoint = self.stagingCheckpoint();
     errdefer self.restoreStaging(checkpoint);
     try self.ensureStagedBound();
-    var surface = try self.buildFrame(view);
+
+    // Render the live band before building the footer so the layout can
+    // reserve exactly its row count at the bottom of the viewport.
+    var live_storage: ?std.Io.Writer.Allocating = null;
+    defer if (live_storage) |*storage| storage.deinit();
+    var live: ?[]const u8 = null;
+    if (self.presenter.liveBlock() != null) {
+        live_storage = .init(self.staged.allocator);
+        try self.presenter.renderLiveBlock(
+            self.staged.allocator,
+            &live_storage.?,
+            self.max_staged_bytes,
+        );
+        live = live_storage.?.written();
+    }
+    const live_rows = render.TerminalRenderer.LiveBand.of(live).rows;
+
+    var surface = try self.buildFrame(view, live_rows);
     defer surface.deinit();
     _ = try self.terminal_renderer.commit(
         self.output,
         &surface,
         self.staged.written(),
+        live,
     );
     self.staged.clearRetainingCapacity();
     attempt.commit();
@@ -302,15 +345,19 @@ fn renderEvent(self: *Screen, event: interactive.Event) !void {
         ),
         .agent_end => |ended| switch (ended.outcome) {
             .completed => {},
-            .cancelled => try self.renderNotice("turn cancelled"),
-            .interrupted => try self.renderNotice("turn interrupted"),
-            .failed => |failure| {
+            .cancelled, .interrupted, .failed => {
+                self.presenter.discardLivePart();
                 var label_buffer: [128]u8 = undefined;
-                const label = try std.fmt.bufPrint(
-                    &label_buffer,
-                    "turn failed: {s}",
-                    .{@tagName(failure)},
-                );
+                const label = switch (ended.outcome) {
+                    .cancelled => "turn cancelled",
+                    .interrupted => "turn interrupted",
+                    .failed => |failure| try std.fmt.bufPrint(
+                        &label_buffer,
+                        "turn failed: {s}",
+                        .{@tagName(failure)},
+                    ),
+                    .completed => unreachable,
+                };
                 try self.renderNotice(label);
             },
         },
@@ -340,16 +387,20 @@ fn renderNotice(self: *Screen, label: []const u8) !void {
     try self.presenter.renderNotice(&self.staged, label);
 }
 
-fn buildFrame(self: *Screen, view: FrameView) !terminal_render.Surface {
+fn buildFrame(self: *Screen, view: FrameView, live_rows: u16) !terminal_render.Surface {
     const terminal_size = self.size orelse TerminalSession.Size{ .rows = 24, .columns = 80 };
     const prompt = "❯ ";
+    // The live band owns the rows above the footer bands; keep a small floor
+    // so tiny terminals degrade to footer-only frames instead of underflowing.
+    const footer_rows: u16 = terminal_size.rows -| live_rows;
+    const bounded_rows: u16 = @max(footer_rows, @min(terminal_size.rows, 5));
     const masked_text = if (view.composer.masked) try self.staged.allocator.alloc(u8, view.composer.text.len) else null;
     defer if (masked_text) |text| self.staged.allocator.free(text);
     if (masked_text) |text| @memset(text, '*');
     const composer_text: []const u8 = masked_text orelse view.composer.text;
     var layout = try render.FooterLayout.init(
         self.staged.allocator,
-        terminal_size.rows,
+        bounded_rows,
         terminal_size.columns,
         composer_text,
         view.composer.cursor_byte,

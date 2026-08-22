@@ -33,11 +33,35 @@ const Sink = struct {
     }
 };
 
+/// Renders one complete Markdown block. Source controls are neutralized before
+/// the trusted ANSI renderer runs.
 pub fn render(
     allocator: std.mem.Allocator,
     writer: *std.Io.Writer,
     markdown: []const u8,
     max_output_bytes: usize,
+) RenderError!usize {
+    return renderWithFlags(allocator, writer, markdown, max_output_bytes, 0);
+}
+
+/// Renders one incomplete Markdown prefix for live streaming display. The
+/// renderer heals unterminated constructs (open fences, emphasis spans) so a
+/// growing block shows its visible prefix instead of parser fallback garbage.
+pub fn renderPartial(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    markdown: []const u8,
+    max_output_bytes: usize,
+) RenderError!usize {
+    return renderWithFlags(allocator, writer, markdown, max_output_bytes, md4x.MD_ANSI_FLAG_HEAL);
+}
+
+fn renderWithFlags(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    markdown: []const u8,
+    max_output_bytes: usize,
+    renderer_flags: c_uint,
 ) RenderError!usize {
     var safe: std.Io.Writer.Allocating = .init(allocator);
     defer safe.deinit();
@@ -49,12 +73,13 @@ pub fn render(
         .writer = writer,
         .remaining = max_output_bytes,
     };
-    const result = md4x.md_ansi(
+    const result = md4x.md_ansi_ex(
         @ptrCast(source.ptr),
         @intCast(source.len),
         Sink.append,
         &sink,
-        0,
+        renderer_flags,
+        null,
     );
     if (sink.failure) |failure| return failure;
     if (sink.output_too_large) return error.MarkdownOutputTooLarge;
@@ -108,5 +133,53 @@ test "markdown enforces its output bound" {
     try std.testing.expectError(
         error.MarkdownOutputTooLarge,
         render(std.testing.allocator, &output.writer, "long output", 4),
+    );
+}
+
+test "partial rendering heals an unterminated code fence" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    _ = try renderPartial(
+        std.testing.allocator,
+        &output.writer,
+        "Counting:\n\n```zig\nconst x = 1;",
+        4096,
+    );
+    try std.testing.expect(std.mem.find(u8, output.written(), "Counting:") != null);
+    try std.testing.expect(std.mem.find(u8, output.written(), "const x = 1;") != null);
+}
+
+test "partial rendering heals an unterminated emphasis span" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    _ = try renderPartial(std.testing.allocator, &output.writer, "working on **this", 1024);
+    const rendered = output.written();
+    try std.testing.expect(std.mem.find(u8, rendered, "this") != null);
+    try std.testing.expect(std.mem.find(u8, rendered, "**") == null);
+}
+
+test "partial rendering neutralizes source controls" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    _ = try renderPartial(
+        std.testing.allocator,
+        &output.writer,
+        "```\nsafe\x1b[2Jtail",
+        1024,
+    );
+    try std.testing.expect(std.mem.find(u8, output.written(), "\x1b[2J") == null);
+    try std.testing.expect(std.mem.find(u8, output.written(), "safe") != null);
+}
+
+test "partial rendering enforces its output bound" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    try std.testing.expectError(
+        error.MarkdownOutputTooLarge,
+        renderPartial(std.testing.allocator, &output.writer, "long output", 4),
     );
 }

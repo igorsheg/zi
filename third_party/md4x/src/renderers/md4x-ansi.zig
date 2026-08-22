@@ -63,7 +63,8 @@ const MD_ANSI_FLAG_NO_COLOR: c_uint = 0x0004;
 // no-op instead of NO_COLOR or SHOW_URLS.
 const MD_ANSI_FLAG_SHOW_URLS: c_uint = 0x0010;
 const MD_ANSI_FLAG_SHOW_FRONTMATTER: c_uint = 0x0020;
-const MD_ANSI_FLAG_HEAL: c_uint = 0x0100;
+/// Public so embedders can request heal-before-render through `md_ansi_ex`.
+pub const MD_ANSI_FLAG_HEAL: c_uint = 0x0100;
 
 // ANSI escape sequences
 const ANSI_RESET = "\x1b[0m";
