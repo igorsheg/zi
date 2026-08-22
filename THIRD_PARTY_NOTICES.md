@@ -28,7 +28,8 @@ license texts are retained under `third_party/licenses/`.
   - Source: https://github.com/vercel-labs/fx
   - License: Apache-2.0
   - `src/smol/markdown/` adapts the incremental Markdown presentation processor
-    and its parser and renderer leaf modules.
+    and its parser and renderer leaf modules. `src/smol/transcript/Store.zig`
+    adapts the ordered raw-entry store design.
 
 - OpenTUI, revision `6f7833d09773b88cf5984b2a4e7bc428e1f8ffcb`
   - Source: https://github.com/anomalyco/opentui

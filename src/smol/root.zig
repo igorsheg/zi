@@ -6,6 +6,7 @@ const screen = @import("Screen.zig");
 const markdown_ansi = @import("MarkdownAnsi.zig");
 const safe_text = @import("SafeText.zig");
 const transcript_presenter = @import("TranscriptPresenter.zig");
+const transcript = @import("transcript/root.zig");
 const render = @import("render/root.zig");
 const markdown = @import("markdown/root.zig");
 const decoder = @import("input/Decoder.zig");
@@ -48,6 +49,7 @@ test {
     _ = markdown_ansi;
     _ = safe_text;
     _ = transcript_presenter;
+    _ = transcript;
     _ = render;
     _ = markdown;
     _ = decoder;
