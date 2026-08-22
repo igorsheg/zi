@@ -65,6 +65,24 @@ pub fn clone(self: *const Surface, allocator: std.mem.Allocator) !Surface {
     };
 }
 
+/// Returns a blank surface at new dimensions. Only the clamped cursor and its
+/// visibility carry over, because terminal resize reflow cannot be inferred
+/// from the old cell grid.
+pub fn blankResizedClone(
+    self: *const Surface,
+    allocator: std.mem.Allocator,
+    rows: u16,
+    columns: u16,
+) !Surface {
+    var resized = try Surface.init(allocator, rows, columns);
+    resized.cursor = .{
+        .row = @min(self.cursor.row, rows),
+        .column = @min(self.cursor.column, columns),
+        .visible = self.cursor.visible,
+    };
+    return resized;
+}
+
 pub fn setCursor(self: *Surface, cursor: Cursor) !void {
     if (cursor.row == 0 or cursor.row > self.rows or
         cursor.column == 0 or cursor.column > self.columns)
@@ -164,6 +182,16 @@ pub fn lastOccupiedColumn(self: *const Surface, row: u16) u16 {
     return 0;
 }
 
+/// Applies a physical upward terminal scroll to the cell grid. The cursor does
+/// not move, matching an upward scroll operation at the terminal boundary.
+pub fn scrollUp(self: *Surface, row_count: u32) void {
+    const rows_to_scroll: usize = @intCast(@min(row_count, @as(u32, self.rows)));
+    if (rows_to_scroll == 0) return;
+    const cell_count = rows_to_scroll * self.columns;
+    @memmove(self.cells[0 .. self.cells.len - cell_count], self.cells[cell_count..]);
+    @memset(self.cells[self.cells.len - cell_count ..], .{});
+}
+
 fn writeBlankSpan(self: *Surface, row: u16, column: u16, width: u8, style: Style) !void {
     for (0..width) |offset| {
         const target_column = column + @as(u16, @intCast(offset));
@@ -257,6 +285,49 @@ test "clone owns grapheme bytes and row equality ignores store IDs" {
     _ = try equivalent.writeText(1, 1, "界", .{});
     try std.testing.expect(original.cells[0].grapheme.? != equivalent.cells[0].grapheme.?);
     try std.testing.expect(rowEqual(&original, &equivalent, 1));
+}
+
+test "blank resized clone forgets cells and clamps the retained cursor" {
+    var original = try Surface.init(std.testing.allocator, 3, 6);
+    defer original.deinit();
+    _ = try original.writeText(1, 1, "shell", .{});
+    try original.setCursor(.{ .row = 3, .column = 6, .visible = false });
+
+    var resized = try original.blankResizedClone(std.testing.allocator, 2, 4);
+    defer resized.deinit();
+    try std.testing.expectEqual(@as(u16, 2), resized.rows);
+    try std.testing.expectEqual(@as(u16, 4), resized.columns);
+    const expected_cursor: Cursor = .{ .row = 2, .column = 4, .visible = false };
+    try std.testing.expectEqual(expected_cursor, resized.cursor);
+    for (resized.cells) |value| try std.testing.expect(value.isBlank());
+    try std.testing.expectEqualStrings("s", original.graphemeBytes(original.cells[0]).?);
+}
+
+test "scroll up moves complete rows and blanks the released tail" {
+    var surface = try Surface.init(std.testing.allocator, 4, 4);
+    defer surface.deinit();
+    _ = try surface.writeText(1, 1, "one", .{});
+    _ = try surface.writeText(2, 1, "two", .{});
+    _ = try surface.writeText(3, 1, "界", .{});
+    try surface.setCursor(.{ .row = 4, .column = 3 });
+
+    surface.scrollUp(2);
+    try std.testing.expectEqualStrings("界", surface.graphemeBytes(surface.rowCells(1).?[0]).?);
+    try std.testing.expectEqual(@as(u8, 1), surface.rowCells(1).?[1].lead_offset);
+    for (surface.rowCells(2).?) |value| try std.testing.expect(value.isBlank());
+    for (surface.rowCells(3).?) |value| try std.testing.expect(value.isBlank());
+    for (surface.rowCells(4).?) |value| try std.testing.expect(value.isBlank());
+    const expected_cursor: Cursor = .{ .row = 4, .column = 3 };
+    try std.testing.expectEqual(expected_cursor, surface.cursor);
+}
+
+test "scroll up clamps movement to surface height" {
+    var surface = try Surface.init(std.testing.allocator, 2, 3);
+    defer surface.deinit();
+    _ = try surface.writeText(2, 1, "x", .{});
+
+    surface.scrollUp(std.math.maxInt(u32));
+    for (surface.cells) |value| try std.testing.expect(value.isBlank());
 }
 
 test "surface clips whole graphemes at the row boundary" {

@@ -20,7 +20,8 @@ license texts are retained under `third_party/licenses/`.
   - `src/smol/markdown/` adapts the incremental Markdown presentation processor
     and its parser and renderer leaf modules. `src/smol/transcript/Store.zig`
     adapts the ordered raw-entry store design. `src/smol/terminal/` adapts the
-    normal-buffer cursor admission behavior.
+    normal-buffer cursor admission behavior. `src/smol/render/FramePlan.zig`
+    adapts compact-until-full ownership and release-first scroll accounting.
 
 - OpenTUI, revision `6f7833d09773b88cf5984b2a4e7bc428e1f8ffcb`
   - Source: https://github.com/anomalyco/opentui
