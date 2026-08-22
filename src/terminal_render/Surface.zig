@@ -182,6 +182,33 @@ pub fn lastOccupiedColumn(self: *const Surface, row: u16) u16 {
     return 0;
 }
 
+pub fn clearRow(self: *Surface, row: u16) !void {
+    const cells = self.mutableRowCells(row) orelse return error.OutOfBounds;
+    @memset(cells, .{});
+}
+
+/// Replaces one row with an owned semantic copy from another surface. Grapheme
+/// IDs remain local to the destination surface.
+pub fn copyRowFrom(
+    self: *Surface,
+    target_row: u16,
+    source: *const Surface,
+    source_row: u16,
+) !void {
+    if (self.columns != source.columns) return error.ColumnCountMismatch;
+    if (self == source) return error.AliasedSurface;
+    const source_cells = source.rowCells(source_row) orelse return error.OutOfBounds;
+    const target_cells = self.mutableRowCells(target_row) orelse return error.OutOfBounds;
+    @memset(target_cells, .{});
+    for (source_cells, target_cells) |source_cell, *target_cell| {
+        target_cell.* = source_cell;
+        if (source_cell.grapheme) |id| {
+            const bytes = source.graphemes.get(id) orelse return error.InvalidGraphemeReference;
+            target_cell.grapheme = try self.graphemes.put(bytes);
+        }
+    }
+}
+
 /// Applies a physical upward terminal scroll to the cell grid. The cursor does
 /// not move, matching an upward scroll operation at the terminal boundary.
 pub fn scrollUp(self: *Surface, row_count: u32) void {
@@ -243,6 +270,12 @@ fn clearSpanAt(self: *Surface, row: u16, column: u16) void {
     }
 }
 
+fn mutableRowCells(self: *Surface, row: u16) ?[]Cell {
+    if (row == 0 or row > self.rows) return null;
+    const start = @as(usize, row - 1) * self.columns;
+    return self.cells[start..][0..self.columns];
+}
+
 fn cellIndex(self: *const Surface, row: u16, column: u16) ?usize {
     if (row == 0 or row > self.rows or column == 0 or column > self.columns) return null;
     return @as(usize, row - 1) * self.columns + column - 1;
@@ -301,6 +334,24 @@ test "blank resized clone forgets cells and clamps the retained cursor" {
     try std.testing.expectEqual(expected_cursor, resized.cursor);
     for (resized.cells) |value| try std.testing.expect(value.isBlank());
     try std.testing.expectEqualStrings("s", original.graphemeBytes(original.cells[0]).?);
+}
+
+test "row copies own graphemes and preserve blank-cell styles" {
+    var source = try Surface.init(std.testing.allocator, 1, 6);
+    defer source.deinit();
+    _ = try source.writeText(1, 1, "界", .{ .attributes = .{ .bold = true } });
+    _ = try source.writeText(1, 3, "\t", .{ .attributes = .{ .dim = true } });
+
+    var target = try Surface.init(std.testing.allocator, 2, 6);
+    defer target.deinit();
+    _ = try target.writeText(2, 1, "old", .{});
+    try target.copyRowFrom(2, &source, 1);
+
+    try std.testing.expectEqualStrings("界", target.graphemeBytes(target.rowCells(2).?[0]).?);
+    try std.testing.expect(target.rowCells(2).?[0].style.attributes.bold);
+    try std.testing.expect(target.rowCells(2).?[2].style.attributes.dim);
+    try target.clearRow(2);
+    for (target.rowCells(2).?) |value| try std.testing.expect(value.isBlank());
 }
 
 test "scroll up moves complete rows and blanks the released tail" {

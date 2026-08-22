@@ -38,11 +38,11 @@ pub const CommittedLayout = struct {
     owned_top: u16,
     owned_bottom: u16,
     transcript_rows: u32,
+    visible_transcript_rows: u16,
+    /// Transcript prefix represented by native document history rather than the
+    /// current visible band at this geometry.
+    materialized_transcript_rows: u32,
     footer_rows: u16,
-
-    pub fn frameIsFull(self: CommittedLayout) bool {
-        return self.owned_bottom != 0 and self.owned_bottom == self.geometry.rows;
-    }
 };
 
 pub const SolveInput = struct {
@@ -62,12 +62,20 @@ pub const FramePlan = struct {
     footer_band: Band,
     owned_top: u16,
     owned_bottom: u16,
-    /// Rows the terminal must physically scroll before this layout is painted.
-    physical_scroll_rows: u32,
-    /// Prefix rows released by that physical movement. Scroll beyond this count
-    /// advances an already full transcript through the native scrollback buffer.
-    released_preserved_rows: u16,
     transcript_rows: u32,
+    visible_transcript_rows: u16,
+    /// Total wrapped prefix outside the visible transcript band.
+    materialized_transcript_rows: u32,
+    /// Prefix rows that must be emitted as typed document lines this transaction.
+    document_rows: u16,
+    /// Physical rows required only to release enough screen space for the frame.
+    required_release_rows: u16,
+    /// Blank rows emitted before document rows when release needs more movement.
+    blank_scroll_rows: u16,
+    /// Total movement shared by release and document publication.
+    physical_scroll_rows: u32,
+    /// Preserved shell rows released by that physical movement.
+    released_preserved_rows: u16,
     footer_rows: u16,
 
     pub fn committed(self: FramePlan) CommittedLayout {
@@ -79,6 +87,8 @@ pub const FramePlan = struct {
             .owned_top = self.owned_top,
             .owned_bottom = self.owned_bottom,
             .transcript_rows = self.transcript_rows,
+            .visible_transcript_rows = self.visible_transcript_rows,
+            .materialized_transcript_rows = self.materialized_transcript_rows,
             .footer_rows = self.footer_rows,
         };
     }
@@ -88,11 +98,11 @@ pub const SolveError = error{
     InvalidGeometry,
     InvalidLaunchRow,
     InvalidPriorLayout,
+    DocumentRowCountOverflow,
 };
 
-/// Solves compact-until-full normal-buffer ownership. Physical movement always
-/// consumes the preserved prefix before it counts as full-frame transcript
-/// advancement.
+/// Solves compact-until-full normal-buffer ownership. Typed document rows and
+/// blank layout release share the same physical scroll transaction.
 pub fn solve(input: SolveInput) SolveError!FramePlan {
     if (input.geometry.rows == 0 or input.geometry.columns == 0) {
         return error.InvalidGeometry;
@@ -108,27 +118,47 @@ pub fn solve(input: SolveInput) SolveError!FramePlan {
         input.launch_row;
     const footer_height = @min(input.footer_rows, input.geometry.rows);
     const transcript_capacity = input.geometry.rows - footer_height;
-    const transcript_height: u16 = @intCast(@min(
+    const naturally_visible_rows = @min(
         input.transcript_rows,
         @as(u32, transcript_capacity),
-    ));
-    const frame_height = transcript_height + footer_height;
+    );
+    const naturally_materialized_rows = input.transcript_rows - naturally_visible_rows;
+    const materialized_transcript_rows: u32 = if (input.prior) |prior|
+        if (sameGeometry(prior.geometry, input.geometry) and
+            input.transcript_rows >= prior.transcript_rows)
+            @max(
+                @min(prior.materialized_transcript_rows, input.transcript_rows),
+                naturally_materialized_rows,
+            )
+        else
+            naturally_materialized_rows
+    else
+        naturally_materialized_rows;
+    const visible_transcript_rows: u16 = @intCast(
+        input.transcript_rows - materialized_transcript_rows,
+    );
+    const frame_height = visible_transcript_rows + footer_height;
     const available_rows = input.geometry.rows - initial_owned_top + 1;
-    const geometry_release = frame_height -| available_rows;
+    const required_release_rows = frame_height -| available_rows;
 
-    const native_growth: u32 = if (input.prior) |prior|
-        if (sameGeometry(prior.geometry, input.geometry) and prior.frameIsFull())
-            input.transcript_rows -| prior.transcript_rows
+    const document_rows_unbounded: u32 = if (input.prior) |prior|
+        if (sameGeometry(prior.geometry, input.geometry) and
+            input.transcript_rows >= prior.transcript_rows)
+            materialized_transcript_rows -| @min(
+                prior.materialized_transcript_rows,
+                input.transcript_rows,
+            )
         else
             0
     else
-        0;
-    const physical_scroll_rows = @max(@as(u32, geometry_release), native_growth);
+        materialized_transcript_rows;
+    const document_rows = std.math.cast(u16, document_rows_unbounded) orelse
+        return error.DocumentRowCountOverflow;
+    const physical_scroll_rows_u16 = @max(required_release_rows, document_rows);
+    const blank_scroll_rows = physical_scroll_rows_u16 - document_rows;
+    const physical_scroll_rows: u32 = physical_scroll_rows_u16;
     const preserved_capacity = initial_owned_top - 1;
-    const released_preserved_rows: u16 = @intCast(@min(
-        physical_scroll_rows,
-        @as(u32, preserved_capacity),
-    ));
+    const released_preserved_rows = @min(physical_scroll_rows_u16, preserved_capacity);
     const owned_top = initial_owned_top - released_preserved_rows;
     const owned_bottom = if (frame_height == 0)
         owned_top - 1
@@ -136,11 +166,11 @@ pub fn solve(input: SolveInput) SolveError!FramePlan {
         owned_top + frame_height - 1;
     std.debug.assert(owned_bottom <= input.geometry.rows);
 
-    const transcript_band = bandFromTopHeight(owned_top, transcript_height);
+    const transcript_band = bandFromTopHeight(owned_top, visible_transcript_rows);
     const footer_band = if (footer_height == 0)
         Band.empty()
     else
-        bandFromTopHeight(owned_top + transcript_height, footer_height);
+        bandFromTopHeight(owned_top + visible_transcript_rows, footer_height);
     return .{
         .geometry = input.geometry,
         .preserved_band = if (owned_top > 1)
@@ -151,9 +181,14 @@ pub fn solve(input: SolveInput) SolveError!FramePlan {
         .footer_band = footer_band,
         .owned_top = owned_top,
         .owned_bottom = owned_bottom,
+        .transcript_rows = input.transcript_rows,
+        .visible_transcript_rows = visible_transcript_rows,
+        .materialized_transcript_rows = materialized_transcript_rows,
+        .document_rows = document_rows,
+        .required_release_rows = required_release_rows,
+        .blank_scroll_rows = blank_scroll_rows,
         .physical_scroll_rows = physical_scroll_rows,
         .released_preserved_rows = released_preserved_rows,
-        .transcript_rows = input.transcript_rows,
         .footer_rows = input.footer_rows,
     };
 }
@@ -214,6 +249,14 @@ fn validateCommitted(layout: CommittedLayout) SolveError!void {
     {
         return error.InvalidPriorLayout;
     }
+    if (layout.visible_transcript_rows != layout.transcript_band.height() or
+        layout.visible_transcript_rows > layout.transcript_rows or
+        layout.materialized_transcript_rows !=
+            layout.transcript_rows - layout.visible_transcript_rows or
+        layout.footer_band.height() != @min(layout.footer_rows, layout.geometry.rows))
+    {
+        return error.InvalidPriorLayout;
+    }
 }
 
 fn validOwnedBand(band: Band, layout: CommittedLayout) bool {
@@ -238,6 +281,10 @@ test "first frame stays compact at the launch row" {
 
     try std.testing.expectEqual(@as(u16, 6), plan.owned_top);
     try std.testing.expectEqual(@as(u16, 10), plan.owned_bottom);
+    try std.testing.expectEqual(@as(u16, 3), plan.visible_transcript_rows);
+    try std.testing.expectEqual(@as(u32, 0), plan.materialized_transcript_rows);
+    try std.testing.expectEqual(@as(u16, 0), plan.document_rows);
+    try std.testing.expectEqual(@as(u16, 0), plan.blank_scroll_rows);
     try std.testing.expectEqual(@as(u32, 0), plan.physical_scroll_rows);
     try expectPlanBands(
         plan,
@@ -255,6 +302,9 @@ test "launch near the bottom releases only rows needed by the first frame" {
         .footer_rows = 2,
     });
 
+    try std.testing.expectEqual(@as(u16, 2), plan.required_release_rows);
+    try std.testing.expectEqual(@as(u16, 0), plan.document_rows);
+    try std.testing.expectEqual(@as(u16, 2), plan.blank_scroll_rows);
     try std.testing.expectEqual(@as(u32, 2), plan.physical_scroll_rows);
     try std.testing.expectEqual(@as(u16, 2), plan.released_preserved_rows);
     try expectPlanBands(
@@ -274,6 +324,9 @@ test "tiny terminals reserve the footer before transcript rows" {
     });
     try expectPlanBands(one_row, .empty(), .empty(), .{ .top = 1, .bottom = 1 });
     try std.testing.expectEqual(@as(u16, 1), one_row.owned_bottom);
+    try std.testing.expectEqual(@as(u32, 12), one_row.materialized_transcript_rows);
+    try std.testing.expectEqual(@as(u16, 12), one_row.document_rows);
+    try std.testing.expectEqual(@as(u32, 12), one_row.physical_scroll_rows);
 
     const two_rows = try solve(.{
         .geometry = .{ .rows = 2, .columns = 8 },
@@ -281,7 +334,10 @@ test "tiny terminals reserve the footer before transcript rows" {
         .transcript_rows = 12,
         .footer_rows = 1,
     });
-    try std.testing.expectEqual(@as(u32, 1), two_rows.physical_scroll_rows);
+    try std.testing.expectEqual(@as(u16, 1), two_rows.visible_transcript_rows);
+    try std.testing.expectEqual(@as(u32, 11), two_rows.materialized_transcript_rows);
+    try std.testing.expectEqual(@as(u16, 11), two_rows.document_rows);
+    try std.testing.expectEqual(@as(u32, 11), two_rows.physical_scroll_rows);
     try expectPlanBands(two_rows, .empty(), .{ .top = 1, .bottom = 1 }, .{ .top = 2, .bottom = 2 });
 }
 
@@ -345,6 +401,35 @@ test "footer growth releases preserved rows and shrink keeps the committed top" 
     );
 }
 
+test "materialized prefix remains hidden when footer space returns" {
+    const compact = try solve(.{
+        .geometry = .{ .rows = 6, .columns = 20 },
+        .launch_row = 1,
+        .transcript_rows = 4,
+        .footer_rows = 1,
+    });
+    const expanded_footer = try solve(.{
+        .geometry = compact.geometry,
+        .launch_row = 1,
+        .transcript_rows = 4,
+        .footer_rows = 3,
+        .prior = compact.committed(),
+    });
+    const restored_footer = try solve(.{
+        .geometry = compact.geometry,
+        .launch_row = 1,
+        .transcript_rows = 4,
+        .footer_rows = 1,
+        .prior = expanded_footer.committed(),
+    });
+
+    try std.testing.expectEqual(@as(u16, 1), expanded_footer.document_rows);
+    try std.testing.expectEqual(@as(u32, 1), expanded_footer.materialized_transcript_rows);
+    try std.testing.expectEqual(@as(u16, 0), restored_footer.document_rows);
+    try std.testing.expectEqual(@as(u32, 1), restored_footer.materialized_transcript_rows);
+    try std.testing.expectEqual(@as(u16, 3), restored_footer.visible_transcript_rows);
+}
+
 test "full frame transcript growth continues native scrolling" {
     const initial = try solve(.{
         .geometry = .{ .rows = 6, .columns = 40 },
@@ -360,6 +445,10 @@ test "full frame transcript growth continues native scrolling" {
         .prior = initial.committed(),
     });
 
+    try std.testing.expectEqual(@as(u16, 4), grown.visible_transcript_rows);
+    try std.testing.expectEqual(@as(u32, 3), grown.materialized_transcript_rows);
+    try std.testing.expectEqual(@as(u16, 3), grown.document_rows);
+    try std.testing.expectEqual(@as(u16, 0), grown.blank_scroll_rows);
     try std.testing.expectEqual(@as(u32, 3), grown.physical_scroll_rows);
     try std.testing.expectEqual(@as(u16, 0), grown.released_preserved_rows);
     try expectPlanBands(
@@ -385,10 +474,12 @@ test "full lower frame growth accounts for preserved release first" {
         .prior = initial.committed(),
     });
 
-    try std.testing.expectEqual(@as(u32, 5), grown.physical_scroll_rows);
+    try std.testing.expectEqual(@as(u16, 4), grown.required_release_rows);
+    try std.testing.expectEqual(@as(u16, 1), grown.document_rows);
+    try std.testing.expectEqual(@as(u16, 3), grown.blank_scroll_rows);
+    try std.testing.expectEqual(@as(u32, 4), grown.physical_scroll_rows);
     try std.testing.expectEqual(@as(u16, 4), grown.released_preserved_rows);
     try std.testing.expectEqual(@as(u16, 1), grown.owned_top);
-    try std.testing.expectEqual(@as(u32, 1), grown.physical_scroll_rows - grown.released_preserved_rows);
 }
 
 test "height shrink releases only enough rows and keeps lower shell history" {
@@ -449,9 +540,99 @@ test "resize does not infer transcript growth scroll from changed geometry" {
         .prior = initial.committed(),
     });
 
+    try std.testing.expectEqual(@as(u16, 0), resized.document_rows);
     try std.testing.expectEqual(@as(u32, 0), resized.physical_scroll_rows);
     try std.testing.expectEqual(@as(u16, 1), resized.owned_top);
     try std.testing.expectEqual(@as(u16, 7), resized.owned_bottom);
+}
+
+test "first oversized frame materializes its complete hidden prefix" {
+    const plan = try solve(.{
+        .geometry = .{ .rows = 6, .columns = 20 },
+        .launch_row = 4,
+        .transcript_rows = 11,
+        .footer_rows = 2,
+    });
+
+    try std.testing.expectEqual(@as(u16, 4), plan.visible_transcript_rows);
+    try std.testing.expectEqual(@as(u32, 7), plan.materialized_transcript_rows);
+    try std.testing.expectEqual(@as(u16, 3), plan.required_release_rows);
+    try std.testing.expectEqual(@as(u16, 7), plan.document_rows);
+    try std.testing.expectEqual(@as(u16, 0), plan.blank_scroll_rows);
+    try std.testing.expectEqual(@as(u32, 7), plan.physical_scroll_rows);
+    try std.testing.expectEqual(@as(u16, 3), plan.released_preserved_rows);
+}
+
+test "same geometry materializes only the increase in hidden prefix" {
+    const initial = try solve(.{
+        .geometry = .{ .rows = 5, .columns = 20 },
+        .launch_row = 1,
+        .transcript_rows = 7,
+        .footer_rows = 2,
+    });
+    const grown = try solve(.{
+        .geometry = initial.geometry,
+        .launch_row = 1,
+        .transcript_rows = 16,
+        .footer_rows = 2,
+        .prior = initial.committed(),
+    });
+
+    try std.testing.expectEqual(@as(u32, 4), initial.materialized_transcript_rows);
+    try std.testing.expectEqual(@as(u16, 4), initial.document_rows);
+    try std.testing.expectEqual(@as(u32, 13), grown.materialized_transcript_rows);
+    try std.testing.expectEqual(@as(u16, 9), grown.document_rows);
+    try std.testing.expectEqual(@as(u32, 9), grown.physical_scroll_rows);
+}
+
+test "release and document rows share movement instead of adding" {
+    const initial = try solve(.{
+        .geometry = .{ .rows = 8, .columns = 20 },
+        .launch_row = 6,
+        .transcript_rows = 1,
+        .footer_rows = 2,
+    });
+    const grown = try solve(.{
+        .geometry = initial.geometry,
+        .launch_row = 6,
+        .transcript_rows = 8,
+        .footer_rows = 2,
+        .prior = initial.committed(),
+    });
+
+    try std.testing.expectEqual(@as(u16, 5), grown.required_release_rows);
+    try std.testing.expectEqual(@as(u16, 2), grown.document_rows);
+    try std.testing.expectEqual(@as(u16, 3), grown.blank_scroll_rows);
+    try std.testing.expectEqual(@as(u32, 5), grown.physical_scroll_rows);
+}
+
+test "geometry change records the new hidden prefix without materializing reflow" {
+    const initial = try solve(.{
+        .geometry = .{ .rows = 8, .columns = 40 },
+        .launch_row = 1,
+        .transcript_rows = 6,
+        .footer_rows = 2,
+    });
+    const resized = try solve(.{
+        .geometry = .{ .rows = 4, .columns = 12 },
+        .launch_row = 1,
+        .transcript_rows = 12,
+        .footer_rows = 2,
+        .prior = initial.committed(),
+    });
+
+    try std.testing.expectEqual(@as(u32, 10), resized.materialized_transcript_rows);
+    try std.testing.expectEqual(@as(u16, 0), resized.document_rows);
+    try std.testing.expectEqual(@as(u16, 0), resized.blank_scroll_rows);
+}
+
+test "document row count fails rather than truncating" {
+    try std.testing.expectError(error.DocumentRowCountOverflow, solve(.{
+        .geometry = .{ .rows = 2, .columns = 1 },
+        .launch_row = 1,
+        .transcript_rows = @as(u32, std.math.maxInt(u16)) + 2,
+        .footer_rows = 1,
+    }));
 }
 
 test "solver rejects invalid launch geometry and prior layouts" {

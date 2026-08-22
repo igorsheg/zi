@@ -82,7 +82,6 @@ markdown_out: std.ArrayList(u8) = .empty,
 open_entry: ?u32 = null,
 open_kind: StreamKind = .assistant,
 open_part_index: usize = 0,
-committed_open_entry: ?u32 = null,
 open_entry_irreversible: bool = false,
 response_next_index: usize = 0,
 active_tool: ?ActiveTool = null,
@@ -128,7 +127,7 @@ pub fn start(
     restored: ?*const interactive.SessionTranscript,
 ) !void {
     if (self.size == null) return error.ScreenNotPrepared;
-    _ = try self.store.appendEntry(.welcome,
+    _ = try self.sealedEntry(.welcome,
         \\Zi
         \\  Enter submits. Enter while busy queues the next prompt.
         \\  /login PROVIDER [--device] logs in. /model PROVIDER/MODEL switches while idle.
@@ -358,7 +357,6 @@ fn streamMarkdownBytes(self: *Screen, bytes: []const u8) !void {
             },
             seed,
         );
-        self.committed_open_entry = null;
         self.open_entry_irreversible = false;
     }
     // Only settled processor output enters the transcript source. Sanitation
@@ -413,7 +411,6 @@ fn discardOpenEntry(self: *Screen) !void {
 
 fn resetOpenEntry(self: *Screen) void {
     self.open_entry = null;
-    self.committed_open_entry = null;
     self.open_entry_irreversible = false;
     self.processor.reset(self.allocator);
 }
@@ -602,24 +599,22 @@ pub fn commit(self: *Screen, view: FrameView) !void {
     var arena = std.heap.ArenaAllocator.init(self.allocator);
     defer arena.deinit();
     var frame = try self.buildFrame(arena.allocator(), view);
-    defer frame.surface.deinit();
-    const open_entry = self.open_entry;
-    const was_committed = open_entry != null and self.committed_open_entry == open_entry;
-    const result = try self.terminal_renderer.commit(
+    defer frame.deinit();
+    _ = try self.terminal_renderer.commit(
         self.output,
         &frame.surface,
+        if (frame.document) |*document| document else null,
         frame.plan,
     );
-    if (open_entry) |id| {
-        if (was_committed and result.physical_scroll_rows != 0) {
-            self.open_entry_irreversible = true;
-        }
-        self.committed_open_entry = id;
-    }
+    if (frame.open_entry_materialized) self.open_entry_irreversible = true;
     attempt.commit();
 }
 
 pub fn finish(self: *Screen, view: FrameView) !void {
+    if (self.open_entry != null) {
+        try self.sealOpenEntry();
+        self.requests.request(.transcript);
+    }
     if (self.terminal_renderer.isPublicationIndeterminate()) return;
     try self.commit(view);
     try self.terminal_renderer.finish(self.output);
@@ -639,7 +634,15 @@ const RowRef = struct {
 
 const BuiltFrame = struct {
     surface: terminal_render.Surface,
+    document: ?terminal_render.Surface,
     plan: render.FramePlan.FramePlan,
+    open_entry_materialized: bool,
+
+    fn deinit(self: *BuiltFrame) void {
+        if (self.document) |*document| document.deinit();
+        self.surface.deinit();
+        self.* = undefined;
+    }
 };
 
 fn buildFrame(self: *Screen, arena: std.mem.Allocator, view: FrameView) !BuiltFrame {
@@ -677,7 +680,44 @@ fn buildFrame(self: *Screen, arena: std.mem.Allocator, view: FrameView) !BuiltFr
         measured_transcript_rows,
         footer_rows,
     );
-    const visible_transcript_rows = frame_plan.transcript_band.height();
+    const visible_transcript_rows = frame_plan.visible_transcript_rows;
+    const materialized_transcript_rows = std.math.cast(
+        usize,
+        frame_plan.materialized_transcript_rows,
+    ) orelse return error.TranscriptRowCountOverflow;
+    if (materialized_transcript_rows > rows.items.len or
+        rows.items.len - materialized_transcript_rows != @as(usize, visible_transcript_rows))
+    {
+        return error.InvalidFramePlan;
+    }
+    const document_rows: usize = frame_plan.document_rows;
+    if (document_rows > materialized_transcript_rows) return error.InvalidFramePlan;
+
+    var document: ?terminal_render.Surface = null;
+    var open_entry_materialized = false;
+    errdefer if (document) |*value| value.deinit();
+    if (frame_plan.document_rows != 0) {
+        document = try terminal_render.Surface.init(
+            arena,
+            frame_plan.document_rows,
+            terminal_size.columns,
+        );
+        const first_document = materialized_transcript_rows - document_rows;
+        for (rows.items[first_document..materialized_transcript_rows], 1..) |row, document_row| {
+            try self.paintRowRef(&document.?, @intCast(document_row), row);
+            if (self.open_entry) |open_id| {
+                if (row.entry_index) |entry_index| {
+                    const entry = self.store.entryAt(entry_index) orelse
+                        return error.TranscriptEntryMissing;
+                    open_entry_materialized = open_entry_materialized or entry.id == open_id;
+                } else {
+                    // Separator rows cannot be attributed exactly. Once one is
+                    // published ahead of an open tail, retain that tail.
+                    open_entry_materialized = true;
+                }
+            }
+        }
+    }
 
     var surface = try terminal_render.Surface.init(
         arena,
@@ -685,18 +725,9 @@ fn buildFrame(self: *Screen, arena: std.mem.Allocator, view: FrameView) !BuiltFr
         terminal_size.columns,
     );
     errdefer surface.deinit();
-
-    const first_visible = rows.items.len -| visible_transcript_rows;
-    for (rows.items[first_visible..], 0..) |row, index| {
+    for (rows.items[materialized_transcript_rows..], 0..) |row, index| {
         const surface_row = frame_plan.transcript_band.top + @as(u16, @intCast(index));
-        const entry_index = row.entry_index orelse continue;
-        const entry = self.store.entryAt(entry_index) orelse continue;
-        try paintSourceRange(
-            &surface,
-            surface_row,
-            entry.bytes()[row.start_byte..row.end_byte],
-            row.style,
-        );
+        try self.paintRowRef(&surface, surface_row, row);
     }
 
     const footer_offset = frame_plan.footer_band.top - 1;
@@ -761,7 +792,23 @@ fn buildFrame(self: *Screen, arena: std.mem.Allocator, view: FrameView) !BuiltFr
         .row = layout.cursor.row + footer_offset,
         .column = layout.cursor.column,
     });
-    return .{ .surface = surface, .plan = frame_plan };
+    return .{
+        .surface = surface,
+        .document = document,
+        .plan = frame_plan,
+        .open_entry_materialized = open_entry_materialized,
+    };
+}
+
+fn paintRowRef(self: *const Screen, surface: *terminal_render.Surface, row: u16, ref: RowRef) !void {
+    const entry_index = ref.entry_index orelse return;
+    const entry = self.store.entryAt(entry_index) orelse return error.TranscriptEntryMissing;
+    try paintSourceRange(
+        surface,
+        row,
+        entry.bytes()[ref.start_byte..ref.end_byte],
+        ref.style,
+    );
 }
 
 /// Wraps every entry source into display rows at the current column count.
@@ -1041,6 +1088,128 @@ test "screen paints compact absolute bands from the launch row" {
     }
 }
 
+test "screen materializes an oversized restored transcript on its first frame" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var screen = try Screen.init(std.testing.allocator, &output.writer, .{});
+    defer screen.deinit();
+    try screen.begin(.{ .rows = 5, .columns = 40 }, 1);
+
+    var restored: interactive.SessionTranscript = .{
+        .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+        .items = &.{.{
+            .metadata = .recovered_open_turn,
+            .content = .{ .assistant = .{
+                .parts = &.{.{ .text = .{ .text =
+                \\**alpha界**
+                \\beta
+                \\gamma
+                \\delta
+                \\epsilon
+                \\zeta
+                } }},
+                .identity = .{ .provider = "test", .model = "model" },
+            } },
+        }},
+    };
+    defer restored.deinit();
+    try screen.start(&restored);
+    try screen.commit(.{
+        .composer = .{ .text = "", .cursor_byte = 0 },
+        .phase = .{ .turn = .idle },
+        .queued_count = 0,
+    });
+
+    const bytes = output.written();
+    inline for (.{ "alpha", "界", "beta", "gamma", "delta", "epsilon", "zeta" }) |text| {
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, text));
+    }
+    try std.testing.expect(screen.terminal_renderer.committed_layout.?.materialized_transcript_rows != 0);
+    try std.testing.expect(screen.store.entryAt(0).?.sealed);
+    try std.testing.expect(screen.store.entryAt(1).?.sealed);
+    try std.testing.expect(std.mem.find(u8, bytes, "**") == null);
+    try std.testing.expect(std.mem.find(u8, bytes, "\x1b[2J") == null);
+    try std.testing.expect(std.mem.find(u8, bytes, "\x1b[3J") == null);
+}
+
+test "screen builds typed document rows with gaps Unicode and boundary SGR" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var screen = try Screen.init(std.testing.allocator, &output.writer, .{});
+    defer screen.deinit();
+    try screen.begin(.{ .rows = 4, .columns = 20 }, 1);
+    _ = try screen.sealedEntry(.assistant, "\x1b[1mbold界\x1b[22m\nsecond\n");
+    _ = try screen.sealedEntry(.notice, "later\nlast\n");
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var frame = try screen.buildFrame(arena.allocator(), .{
+        .composer = .{ .text = "", .cursor_byte = 0 },
+        .phase = .{ .turn = .idle },
+        .queued_count = 0,
+    });
+    defer frame.deinit();
+    try std.testing.expectEqual(@as(u16, 3), frame.plan.document_rows);
+    const document = &frame.document.?;
+    try std.testing.expect(document.rowCells(1).?[0].style.attributes.bold);
+    try std.testing.expectEqualStrings("b", document.graphemeBytes(document.rowCells(1).?[0]).?);
+    try std.testing.expectEqualStrings("s", document.graphemeBytes(document.rowCells(2).?[0]).?);
+    for (document.rowCells(3).?) |cell| try std.testing.expect(cell.isBlank());
+
+    screen.requests.request(.transcript);
+    try screen.commit(.{
+        .composer = .{ .text = "", .cursor_byte = 0 },
+        .phase = .{ .turn = .idle },
+        .queued_count = 0,
+    });
+    const bytes = output.written();
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "bold界"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "second"));
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, bytes, "\r\n"));
+    try std.testing.expect(std.mem.find(u8, bytes, "\x1b[0;1;39;49m") != null);
+    try std.testing.expect(std.mem.find(u8, bytes, "\x1b[2J") == null);
+    try std.testing.expect(std.mem.find(u8, bytes, "\x1b[3J") == null);
+}
+
+test "screen does not repaint materialized transcript prefix after footer shrink" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var screen = try Screen.init(std.testing.allocator, &output.writer, .{});
+    defer screen.deinit();
+    try screen.begin(.{ .rows = 6, .columns = 20 }, 1);
+    _ = try screen.sealedEntry(.assistant, "one\ntwo\nthree\nfour\n");
+
+    screen.requests.request(.transcript);
+    try screen.commit(.{
+        .composer = .{ .text = "", .cursor_byte = 0 },
+        .phase = .{ .turn = .idle },
+        .queued_count = 0,
+    });
+    screen.editorChanged();
+    try screen.commit(.{
+        .composer = .{ .text = "abcdefghijklmnopqrstuvwxyz", .cursor_byte = 26 },
+        .phase = .{ .turn = .idle },
+        .queued_count = 0,
+    });
+    try std.testing.expectEqual(
+        @as(u32, 1),
+        screen.terminal_renderer.committed_layout.?.materialized_transcript_rows,
+    );
+    const before_shrink = std.mem.count(u8, output.written(), "one");
+
+    screen.editorChanged();
+    try screen.commit(.{
+        .composer = .{ .text = "", .cursor_byte = 0 },
+        .phase = .{ .turn = .idle },
+        .queued_count = 0,
+    });
+    try std.testing.expectEqual(before_shrink, std.mem.count(u8, output.written(), "one"));
+    try std.testing.expectEqual(
+        @as(u32, 1),
+        screen.terminal_renderer.committed_layout.?.materialized_transcript_rows,
+    );
+}
+
 test "screen streams markdown progressively without repainting sealed rows" {
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
@@ -1288,6 +1457,54 @@ test "screen drops an abandoned streaming entry on abnormal turn end" {
         .queued_count = 0,
     });
     try std.testing.expect(std.mem.indexOf(u8, output.written()[cancelled..], "half") == null);
+}
+
+test "screen makes an open entry irreversible on its first materializing commit" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var screen = try Screen.init(std.testing.allocator, &output.writer, .{});
+    defer screen.deinit();
+    try screen.begin(.{ .rows = 4, .columns = 20 }, 1);
+
+    const id = try screen.store.appendEntry(.assistant, "one\ntwo\nthree\n");
+    screen.open_entry = id;
+    screen.requests.request(.transcript);
+    try screen.commit(.{
+        .composer = .{ .text = "", .cursor_byte = 0 },
+        .phase = .{ .turn = .idle },
+        .queued_count = 0,
+    });
+
+    try std.testing.expect(screen.open_entry_irreversible);
+    try screen.applyEventFact(.{ .agent_end = .{
+        .run_id = @enumFromInt(1),
+        .outcome = .cancelled,
+        .messages = &.{},
+    } });
+    try std.testing.expect(screen.open_entry == null);
+    try std.testing.expect(screen.store.entryAt(0).?.sealed);
+    try std.testing.expectEqualStrings("one\ntwo\nthree\n", screen.store.entryAt(0).?.bytes());
+}
+
+test "screen finish flushes and seals an open Markdown tail before publication" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var screen = try Screen.init(std.testing.allocator, &output.writer, .{});
+    defer screen.deinit();
+    try screen.begin(.{ .rows = 6, .columns = 30 }, 1);
+    try screen.streamMarkdownBytes("buffered **tail**");
+
+    try screen.finish(.{
+        .composer = .{ .text = "", .cursor_byte = 0 },
+        .phase = .{ .turn = .idle },
+        .queued_count = 0,
+    });
+
+    try std.testing.expect(screen.open_entry == null);
+    try std.testing.expect(screen.store.entryAt(0).?.sealed);
+    try std.testing.expect(std.mem.find(u8, output.written(), "buffered ") != null);
+    try std.testing.expect(std.mem.find(u8, output.written(), "tail") != null);
+    try std.testing.expect(std.mem.find(u8, output.written(), "**") == null);
 }
 
 test "screen settles a partial assistant after native scrolling makes it final" {

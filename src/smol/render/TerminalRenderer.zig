@@ -78,6 +78,7 @@ pub fn commit(
     self: *TerminalRenderer,
     output: *std.Io.Writer,
     target: *const Surface,
+    document: ?*const Surface,
     frame_plan: FramePlan.FramePlan,
 ) !CommitResult {
     if (self.publication_indeterminate) return error.IndeterminatePublication;
@@ -92,6 +93,7 @@ pub fn commit(
         return error.SurfaceGeometryMismatch;
     }
     if (!frame_plan.footer_band.contains(target.cursor.row)) return error.CursorOutsideFooter;
+    try validateDocument(document, frame_plan);
 
     // Frame surfaces may use a request arena. Both candidate and authoritative
     // copies use the renderer allocator and survive until publication settles.
@@ -103,7 +105,12 @@ pub fn commit(
     else
         try Surface.init(self.allocator, target.rows, target.columns);
     defer candidate.deinit();
-    candidate.scrollUp(frame_plan.physical_scroll_rows);
+    try applyMovementToCandidate(
+        &candidate,
+        self.committed_layout,
+        document,
+        frame_plan,
+    );
 
     var next = try target.clone(self.allocator);
     errdefer next.deinit();
@@ -121,6 +128,8 @@ pub fn commit(
         &wire.writer,
         if (force_owned_repaint) null else &candidate,
         target,
+        document,
+        self.committed_layout,
         frame_plan,
         bounds,
     );
@@ -196,6 +205,53 @@ pub fn finish(self: *TerminalRenderer, output: *std.Io.Writer) !void {
     self.finished = true;
 }
 
+fn validateDocument(
+    document: ?*const Surface,
+    frame_plan: FramePlan.FramePlan,
+) !void {
+    if (frame_plan.document_rows == 0) {
+        if (document != null) return error.UnexpectedDocumentSurface;
+        return;
+    }
+    const value = document orelse return error.MissingDocumentSurface;
+    if (value.rows != frame_plan.document_rows) return error.DocumentRowCountMismatch;
+    if (value.columns != frame_plan.geometry.columns) return error.DocumentColumnCountMismatch;
+}
+
+fn applyMovementToCandidate(
+    candidate: *Surface,
+    prior: ?FramePlan.CommittedLayout,
+    document: ?*const Surface,
+    frame_plan: FramePlan.FramePlan,
+) !void {
+    if (frame_plan.physical_scroll_rows == 0) return;
+    try clearPriorFooter(candidate, prior);
+    candidate.scrollUp(frame_plan.blank_scroll_rows);
+    if (document) |value| {
+        var row: u16 = 1;
+        while (row <= value.rows) : (row += 1) {
+            try candidate.copyRowFrom(candidate.rows, value, row);
+            candidate.scrollUp(1);
+        }
+    }
+    try candidate.setCursor(.{
+        .row = candidate.rows,
+        .column = 1,
+        .visible = candidate.cursor.visible,
+    });
+}
+
+fn clearPriorFooter(
+    surface: *Surface,
+    prior: ?FramePlan.CommittedLayout,
+) !void {
+    const layout = prior orelse return;
+    if (layout.footer_band.isEmpty() or layout.footer_band.top > surface.rows) return;
+    var row = layout.footer_band.top;
+    const bottom = @min(layout.footer_band.bottom, surface.rows);
+    while (row <= bottom) : (row += 1) try surface.clearRow(row);
+}
+
 fn ownedUnion(
     prior: ?FramePlan.CommittedLayout,
     current: FramePlan.FramePlan,
@@ -214,6 +270,8 @@ fn compose(
     writer: *std.Io.Writer,
     previous: ?*const Surface,
     target: *const Surface,
+    document: ?*const Surface,
+    prior: ?FramePlan.CommittedLayout,
     frame_plan: FramePlan.FramePlan,
     bounds: Diff.RowBounds,
 ) !u16 {
@@ -226,13 +284,7 @@ fn compose(
     try writer.writeAll("\x1b[?2026h\x1b[?25l\x1b[0m");
     var encoder = Ansi.Encoder.init(writer);
     encoder.invalidate();
-
-    if (frame_plan.physical_scroll_rows != 0) {
-        try encoder.moveTo(.{ .row = target.rows, .column = 1 });
-        var remaining = frame_plan.physical_scroll_rows;
-        while (remaining != 0) : (remaining -= 1) try writer.writeAll("\r\n");
-        encoder.invalidate();
-    }
+    try writeMovement(&encoder, target.rows, document, prior, frame_plan);
 
     var changed_rows: u16 = 0;
     if (first_span) |span| {
@@ -250,6 +302,47 @@ fn compose(
     try writer.writeAll("\x1b[?2026l");
     try writer.writeAll(if (target.cursor.visible) "\x1b[?25h" else "\x1b[?25l");
     return changed_rows;
+}
+
+fn writeMovement(
+    encoder: *Ansi.Encoder,
+    terminal_rows: u16,
+    document: ?*const Surface,
+    prior: ?FramePlan.CommittedLayout,
+    frame_plan: FramePlan.FramePlan,
+) !void {
+    if (frame_plan.physical_scroll_rows == 0) return;
+    if (prior) |layout| {
+        if (!layout.footer_band.isEmpty() and layout.footer_band.top <= terminal_rows) {
+            var row = layout.footer_band.top;
+            const bottom = @min(layout.footer_band.bottom, terminal_rows);
+            while (row <= bottom) : (row += 1) {
+                encoder.forgetCursor();
+                try encoder.moveTo(.{ .row = row, .column = 1 });
+                try encoder.eraseLine(.entire);
+            }
+        }
+    }
+
+    var blank_row: u16 = 0;
+    while (blank_row < frame_plan.blank_scroll_rows) : (blank_row += 1) {
+        encoder.forgetCursor();
+        try encoder.moveTo(.{ .row = terminal_rows, .column = 1 });
+        try encoder.eraseLine(.entire);
+        try encoder.writer.writeAll("\r\n");
+        encoder.invalidate();
+    }
+    if (document) |value| {
+        var row: u16 = 1;
+        while (row <= value.rows) : (row += 1) {
+            encoder.forgetCursor();
+            try encoder.moveTo(.{ .row = terminal_rows, .column = 1 });
+            try encoder.eraseLine(.entire);
+            try writeRow(encoder, value, row);
+            try encoder.writer.writeAll("\r\n");
+            encoder.invalidate();
+        }
+    }
 }
 
 fn paintChangedRow(encoder: *Ansi.Encoder, surface: *const Surface, row: u16) !void {
@@ -300,6 +393,24 @@ fn makeTarget(
     return target;
 }
 
+fn makeDocument(
+    allocator: std.mem.Allocator,
+    frame_plan: FramePlan.FramePlan,
+    lines: []const []const u8,
+) !Surface {
+    if (lines.len != frame_plan.document_rows) return error.DocumentRowCountMismatch;
+    var document = try Surface.init(
+        allocator,
+        frame_plan.document_rows,
+        frame_plan.geometry.columns,
+    );
+    errdefer document.deinit();
+    for (lines, 1..) |line, row| {
+        _ = try document.writeText(@intCast(row), 1, line, .{});
+    }
+    return document;
+}
+
 fn expectRowsNotAddressed(bytes: []const u8, first: u16, last: u16) !void {
     var row = first;
     while (row <= last) : (row += 1) {
@@ -331,7 +442,7 @@ test "first frame is compact and never addresses prelaunch rows" {
     var target = try makeTarget(std.testing.allocator, frame_plan, "answer", "Ready");
     defer target.deinit();
 
-    const result = try renderer.commit(&output.writer, &target, frame_plan);
+    const result = try renderer.commit(&output.writer, &target, null, frame_plan);
     try std.testing.expectEqual(@as(u16, 3), result.changed_rows);
     try std.testing.expectEqual(@as(u16, 6), renderer.committed_layout.?.owned_top);
     try std.testing.expectEqual(@as(u16, 8), renderer.committed_layout.?.owned_bottom);
@@ -340,6 +451,115 @@ test "first frame is compact and never addresses prelaunch rows" {
     try std.testing.expect(std.mem.find(u8, bytes, "\x1b[H") == null);
     try std.testing.expect(std.mem.find(u8, bytes, "\x1b[2J") == null);
     try std.testing.expect(std.mem.find(u8, bytes, "\x1b[3J") == null);
+}
+
+test "initial oversized document rows publish exactly once in typed order" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var renderer = TerminalRenderer.init(std.testing.allocator);
+    defer renderer.deinit();
+    try renderer.begin(.{ .rows = 4, .columns = 12 }, 1);
+    const frame_plan = try renderer.plan(.{ .rows = 4, .columns = 12 }, 6, 1);
+    var target = try makeTarget(std.testing.allocator, frame_plan, "visible", "Ready");
+    defer target.deinit();
+    var document = try makeDocument(
+        std.testing.allocator,
+        frame_plan,
+        &.{ "first", "界", "third" },
+    );
+    defer document.deinit();
+    try document.clearRow(1);
+    _ = try document.writeText(1, 1, "first", .{ .attributes = .{ .bold = true } });
+
+    const result = try renderer.commit(&output.writer, &target, &document, frame_plan);
+    const bytes = output.written();
+    const first = std.mem.find(u8, bytes, "first").?;
+    const unicode = std.mem.find(u8, bytes, "界").?;
+    const third = std.mem.find(u8, bytes, "third").?;
+    const visible = std.mem.find(u8, bytes, "visible").?;
+    try std.testing.expect(first < unicode);
+    try std.testing.expect(unicode < third);
+    try std.testing.expect(third < visible);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "first"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "界"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "third"));
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, bytes, "\r\n"));
+    try std.testing.expect(std.mem.find(u8, bytes[0..first], "\x1b[0;1;39;49m") != null);
+    try std.testing.expect(std.mem.find(u8, bytes, "\x1b[2J") == null);
+    try std.testing.expect(std.mem.find(u8, bytes, "\x1b[3J") == null);
+    try std.testing.expectEqual(@as(u32, 3), result.physical_scroll_rows);
+
+    const before = output.written().len;
+    const unchanged_plan = try renderer.plan(.{ .rows = 4, .columns = 12 }, 6, 1);
+    _ = try renderer.commit(&output.writer, &target, null, unchanged_plan);
+    try std.testing.expectEqual(before, output.written().len);
+}
+
+test "coalesced document growth clears footer before history materialization" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var renderer = TerminalRenderer.init(std.testing.allocator);
+    defer renderer.deinit();
+    try renderer.begin(.{ .rows = 4, .columns = 16 }, 1);
+
+    const first_plan = try renderer.plan(.{ .rows = 4, .columns = 16 }, 2, 2);
+    var first_target = try makeTarget(std.testing.allocator, first_plan, "old", "FOOTER");
+    defer first_target.deinit();
+    _ = try renderer.commit(&output.writer, &first_target, null, first_plan);
+    const before = output.written().len;
+
+    const grown_plan = try renderer.plan(.{ .rows = 4, .columns = 16 }, 9, 2);
+    try std.testing.expectEqual(@as(u16, 7), grown_plan.document_rows);
+    var grown_target = try makeTarget(std.testing.allocator, grown_plan, "tail", "FOOTER");
+    defer grown_target.deinit();
+    var document = try makeDocument(
+        std.testing.allocator,
+        grown_plan,
+        &.{ "row-1", "row-2", "row-3", "row-4", "row-5", "row-6", "row-7" },
+    );
+    defer document.deinit();
+    _ = try renderer.commit(&output.writer, &grown_target, &document, grown_plan);
+
+    const delta = output.written()[before..];
+    const footer_clear = std.mem.find(u8, delta, "\x1b[3;1H\x1b[2K").?;
+    const first_document = std.mem.find(u8, delta, "row-1").?;
+    const last_document = std.mem.find(u8, delta, "row-7").?;
+    const footer_repaint = std.mem.find(u8, delta, "FOOTER").?;
+    try std.testing.expect(footer_clear < first_document);
+    try std.testing.expect(first_document < last_document);
+    try std.testing.expect(last_document < footer_repaint);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, delta, "FOOTER"));
+    try std.testing.expectEqual(@as(usize, 7), std.mem.count(u8, delta, "\r\n"));
+    try std.testing.expect(std.mem.find(u8, delta, "\x1b[2J") == null);
+    try std.testing.expect(std.mem.find(u8, delta, "\x1b[3J") == null);
+}
+
+test "renderer validates typed document geometry and count" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var renderer = TerminalRenderer.init(std.testing.allocator);
+    defer renderer.deinit();
+    try renderer.begin(.{ .rows = 3, .columns = 8 }, 1);
+    const frame_plan = try renderer.plan(.{ .rows = 3, .columns = 8 }, 4, 1);
+    var target = try makeTarget(std.testing.allocator, frame_plan, "tail", "Ready");
+    defer target.deinit();
+    try std.testing.expectError(
+        error.MissingDocumentSurface,
+        renderer.commit(&output.writer, &target, null, frame_plan),
+    );
+
+    var wrong_rows = try Surface.init(std.testing.allocator, 1, 8);
+    defer wrong_rows.deinit();
+    try std.testing.expectError(
+        error.DocumentRowCountMismatch,
+        renderer.commit(&output.writer, &target, &wrong_rows, frame_plan),
+    );
+    var wrong_columns = try Surface.init(std.testing.allocator, frame_plan.document_rows, 7);
+    defer wrong_columns.deinit();
+    try std.testing.expectError(
+        error.DocumentColumnCountMismatch,
+        renderer.commit(&output.writer, &target, &wrong_columns, frame_plan),
+    );
 }
 
 test "transcript growth physically scrolls and replaces the full shadow" {
@@ -352,13 +572,13 @@ test "transcript growth physically scrolls and replaces the full shadow" {
     const first_plan = try renderer.plan(.{ .rows = 5, .columns = 20 }, 1, 2);
     var first = try makeTarget(std.testing.allocator, first_plan, "old", "Ready");
     defer first.deinit();
-    _ = try renderer.commit(&output.writer, &first, first_plan);
+    _ = try renderer.commit(&output.writer, &first, null, first_plan);
     const before = output.written().len;
 
     const grown_plan = try renderer.plan(.{ .rows = 5, .columns = 20 }, 3, 2);
     var grown = try makeTarget(std.testing.allocator, grown_plan, "new", "Ready");
     defer grown.deinit();
-    const result = try renderer.commit(&output.writer, &grown, grown_plan);
+    const result = try renderer.commit(&output.writer, &grown, null, grown_plan);
     const delta = output.written()[before..];
 
     try std.testing.expectEqual(@as(u32, 2), result.physical_scroll_rows);
@@ -382,13 +602,13 @@ test "resize forces repaint only across the old and new owned union" {
     const first_plan = try renderer.plan(.{ .rows = 8, .columns = 10 }, 1, 2);
     var first = try makeTarget(std.testing.allocator, first_plan, "old", "Ready");
     defer first.deinit();
-    _ = try renderer.commit(&output.writer, &first, first_plan);
+    _ = try renderer.commit(&output.writer, &first, null, first_plan);
     const before = output.written().len;
 
     const resized_plan = try renderer.plan(.{ .rows = 6, .columns = 12 }, 1, 2);
     var resized = try makeTarget(std.testing.allocator, resized_plan, "new", "Ready");
     defer resized.deinit();
-    const result = try renderer.commit(&output.writer, &resized, resized_plan);
+    const result = try renderer.commit(&output.writer, &resized, null, resized_plan);
     const delta = output.written()[before..];
 
     try std.testing.expectEqual(@as(u16, 3), result.changed_rows);
@@ -413,13 +633,13 @@ test "frame shrink clears only stale rows that were previously owned" {
     while (row <= first_plan.footer_band.bottom) : (row += 1) {
         _ = try first.writeText(row, 1, "stale", .{});
     }
-    _ = try renderer.commit(&output.writer, &first, first_plan);
+    _ = try renderer.commit(&output.writer, &first, null, first_plan);
     const before = output.written().len;
 
     const shrunk_plan = try renderer.plan(.{ .rows = 10, .columns = 20 }, 1, 2);
     var shrunk = try makeTarget(std.testing.allocator, shrunk_plan, "answer", "Ready");
     defer shrunk.deinit();
-    _ = try renderer.commit(&output.writer, &shrunk, shrunk_plan);
+    _ = try renderer.commit(&output.writer, &shrunk, null, shrunk_plan);
     const delta = output.written()[before..];
 
     try std.testing.expect(std.mem.find(u8, delta, "\x1b[7;1H\x1b[2K") != null);
@@ -436,7 +656,7 @@ test "finish clears only footer rows and leaves transcript visible" {
     const frame_plan = try renderer.plan(.{ .rows = 10, .columns = 20 }, 2, 2);
     var target = try makeTarget(std.testing.allocator, frame_plan, "answer", "Ready");
     defer target.deinit();
-    _ = try renderer.commit(&output.writer, &target, frame_plan);
+    _ = try renderer.commit(&output.writer, &target, null, frame_plan);
     const before = output.written().len;
 
     try renderer.finish(&output.writer);
@@ -464,13 +684,13 @@ test "renderer shadow outlives a frame arena" {
         const frame_plan = try renderer.plan(.{ .rows = 4, .columns = 12 }, 1, 2);
         var first = try makeTarget(arena.allocator(), frame_plan, "first", "Ready");
         defer first.deinit();
-        _ = try renderer.commit(&output.writer, &first, frame_plan);
+        _ = try renderer.commit(&output.writer, &first, null, frame_plan);
     }
 
     const second_plan = try renderer.plan(.{ .rows = 4, .columns = 12 }, 1, 2);
     var second = try makeTarget(std.testing.allocator, second_plan, "second", "Ready");
     defer second.deinit();
-    const result = try renderer.commit(&output.writer, &second, second_plan);
+    const result = try renderer.commit(&output.writer, &second, null, second_plan);
     try std.testing.expectEqual(@as(u16, 1), result.changed_rows);
     try std.testing.expect(std.mem.find(u8, output.written(), "second") != null);
 }
@@ -484,11 +704,11 @@ test "unchanged frame writes no transaction" {
     const frame_plan = try renderer.plan(.{ .rows = 4, .columns = 12 }, 1, 2);
     var target = try makeTarget(std.testing.allocator, frame_plan, "same", "Ready");
     defer target.deinit();
-    _ = try renderer.commit(&output.writer, &target, frame_plan);
+    _ = try renderer.commit(&output.writer, &target, null, frame_plan);
     const before = output.written().len;
 
     const next_plan = try renderer.plan(.{ .rows = 4, .columns = 12 }, 1, 2);
-    const result = try renderer.commit(&output.writer, &target, next_plan);
+    const result = try renderer.commit(&output.writer, &target, null, next_plan);
     try std.testing.expectEqual(@as(usize, 0), result.bytes_written);
     try std.testing.expectEqual(before, output.written().len);
 }
@@ -510,13 +730,13 @@ test "failed write leaves shadow and layout unchanged and poisons publication" {
     const first_plan = try renderer.plan(.{ .rows = 5, .columns = 12 }, 1, 2);
     var first = try makeTarget(std.testing.allocator, first_plan, "old", "Ready");
     defer first.deinit();
-    _ = try renderer.commit(&initial.writer, &first, first_plan);
+    _ = try renderer.commit(&initial.writer, &first, null, first_plan);
     const committed_before = renderer.committed_layout.?;
 
     const second_plan = try renderer.plan(.{ .rows = 5, .columns = 12 }, 2, 2);
     var second = try makeTarget(std.testing.allocator, second_plan, "new", "Ready");
     defer second.deinit();
-    try std.testing.expectError(error.WriteFailed, renderer.commit(&failing, &second, second_plan));
+    try std.testing.expectError(error.WriteFailed, renderer.commit(&failing, &second, null, second_plan));
     try std.testing.expectEqual(committed_before, renderer.committed_layout.?);
     try std.testing.expectEqualStrings(
         "o",
@@ -526,7 +746,7 @@ test "failed write leaves shadow and layout unchanged and poisons publication" {
     try std.testing.expect(renderer.isPublicationIndeterminate());
     try std.testing.expectError(
         error.IndeterminatePublication,
-        renderer.commit(&failing, &second, second_plan),
+        renderer.commit(&failing, &second, null, second_plan),
     );
 }
 
@@ -564,7 +784,7 @@ test "partial publication poisons the renderer without installing a shadow" {
 
     try std.testing.expectError(
         error.WriteFailed,
-        renderer.commit(&output.writer, &target, frame_plan),
+        renderer.commit(&output.writer, &target, null, frame_plan),
     );
     try std.testing.expect(output.accepted != 0);
     try std.testing.expect(renderer.shadow == null);
@@ -572,7 +792,7 @@ test "partial publication poisons the renderer without installing a shadow" {
     try std.testing.expect(renderer.isPublicationIndeterminate());
     try std.testing.expectError(
         error.IndeterminatePublication,
-        renderer.commit(&output.writer, &target, frame_plan),
+        renderer.commit(&output.writer, &target, null, frame_plan),
     );
 }
 
@@ -597,7 +817,7 @@ test "flush failure leaves the committed transaction unchanged" {
     var target = try makeTarget(std.testing.allocator, frame_plan, "text", "Ready");
     defer target.deinit();
 
-    try std.testing.expectError(error.WriteFailed, renderer.commit(&writer, &target, frame_plan));
+    try std.testing.expectError(error.WriteFailed, renderer.commit(&writer, &target, null, frame_plan));
     try std.testing.expect(renderer.shadow == null);
     try std.testing.expect(renderer.committed_layout == null);
     try std.testing.expect(renderer.isPublicationIndeterminate());
@@ -619,7 +839,7 @@ test "failed finish poisons the renderer without clearing committed state" {
     const frame_plan = try renderer.plan(.{ .rows = 4, .columns = 10 }, 1, 2);
     var target = try makeTarget(std.testing.allocator, frame_plan, "text", "Ready");
     defer target.deinit();
-    _ = try renderer.commit(&initial.writer, &target, frame_plan);
+    _ = try renderer.commit(&initial.writer, &target, null, frame_plan);
 
     try std.testing.expectError(error.WriteFailed, renderer.finish(&failing));
     try std.testing.expect(renderer.isPublicationIndeterminate());

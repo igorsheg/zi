@@ -126,27 +126,29 @@ pub fn pollInput(self: *Session, timeout_ms: i32) !PollResult {
 }
 
 /// Admits a normal-buffer inline viewport and returns its one-based launch row.
-/// Cursor probing never consumes user input. A failed probe moves to the bottom
-/// row without clearing shell output or scrollback.
+/// Cursor probing never consumes user input. Failed and mid-line probes create
+/// a fresh column-one line without clearing terminal content.
 pub fn prepareInline(self: *Session, size: Size) !u16 {
     if (size.rows == 0 or size.columns == 0) return error.InvalidTerminalSize;
 
-    const position = self.queryCursorPosition() catch {
-        var fallback: [32]u8 = undefined;
-        const sequence = try std.fmt.bufPrint(&fallback, "\x1b[{d};1H", .{size.rows});
-        try self.output.writeStreamingAll(self.io, sequence);
-        return size.rows;
-    };
+    const position = self.queryCursorPosition() catch return self.freshBottomLine(size.rows);
     if (position.row > size.rows or position.column > size.columns) {
-        var fallback: [32]u8 = undefined;
-        const sequence = try std.fmt.bufPrint(&fallback, "\x1b[{d};1H", .{size.rows});
-        try self.output.writeStreamingAll(self.io, sequence);
-        return size.rows;
+        return self.freshBottomLine(size.rows);
     }
     if (position.column == 1) return position.row;
 
-    try self.output.writeStreamingAll(self.io, "\n");
+    try self.output.writeStreamingAll(self.io, "\r\n");
     return @min(position.row +| 1, size.rows);
+}
+
+fn freshBottomLine(self: *Session, bottom_row: u16) !u16 {
+    var fallback: [32]u8 = undefined;
+    const move = try std.fmt.bufPrint(&fallback, "\x1b[{d};1H", .{bottom_row});
+    try self.output.writeStreamingAll(self.io, move);
+    // LF at the bottom scrolls the existing shell row into history. CR makes
+    // the newly exposed line safe even when output post-processing is disabled.
+    try self.output.writeStreamingAll(self.io, "\r\n");
+    return bottom_row;
 }
 
 fn queryCursorPosition(self: *Session) !CursorProbe.Position {
@@ -379,13 +381,13 @@ test "prepare inline starts a fresh line when launched mid-line" {
         try session.prepareInline(.{ .rows = 24, .columns = 80 }),
     );
     try reply.await(std.testing.io);
-    try expectFileBytes(pty.master, "\r\n");
+    try expectFileBytes(pty.master, "\r\r\n");
 
     session.deinit();
     try expectFileBytes(pty.master, restore_sequence);
 }
 
-test "prepare inline falls back to the terminal bottom without clearing" {
+test "prepare inline fallback scrolls to a fresh bottom line without clearing" {
     if (!supports_test_pty) return error.SkipZigTest;
     const pty = try TestPty.open();
     defer pty.close();
@@ -398,7 +400,30 @@ test "prepare inline falls back to the terminal bottom without clearing" {
         try session.prepareInline(.{ .rows = 24, .columns = 80 }),
     );
     try probe_read.await(std.testing.io);
-    try expectFileBytes(pty.master, "\x1b[24;1H");
+    try expectFileBytes(pty.master, "\x1b[24;1H\r\r\n");
+
+    session.deinit();
+    try expectFileBytes(pty.master, restore_sequence);
+}
+
+test "prepare inline fallback preserves input observed by the failed probe" {
+    if (!supports_test_pty) return error.SkipZigTest;
+    const pty = try TestPty.open();
+    defer pty.close();
+
+    var session = try Session.start(std.testing.io, pty.slave, pty.slave);
+    try expectFileBytes(pty.master, admission_sequence);
+    var reply = std.testing.io.async(replyToCursorProbe, .{ pty.master, "typed" });
+    try std.testing.expectEqual(
+        @as(u16, 24),
+        try session.prepareInline(.{ .rows = 24, .columns = 80 }),
+    );
+    try reply.await(std.testing.io);
+    try expectFileBytes(pty.master, "\x1b[24;1H\r\r\n");
+
+    var input: [5]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, input.len), try session.read(&input));
+    try std.testing.expectEqualStrings("typed", &input);
 
     session.deinit();
     try expectFileBytes(pty.master, restore_sequence);
