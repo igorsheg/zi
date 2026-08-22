@@ -76,6 +76,7 @@ fn runWithTerminal(
     transcript: ?*const interactive.SessionTranscript,
     options: RunOptions,
 ) !ExitCause {
+    try self.prepareInline(terminal);
     try self.start(transcript);
     var finish_pending = true;
     defer if (finish_pending) {
@@ -83,7 +84,6 @@ fn runWithTerminal(
         if (finish_result) |_| {} else |_| {}
     };
     for (options.initial_prompts) |prompt| _ = try self.submitPrompt(prompt);
-    if (terminal.querySize()) |size| self.screen.resized(size) else |_| {}
     try self.commitFrameImpl();
     const cause = try EventLoop.run(terminal, self.callbacks(), .{
         .poll_timeout_ms = options.poll_timeout_ms,
@@ -93,6 +93,12 @@ fn runWithTerminal(
     finish_pending = false;
     try finish_result;
     return cause;
+}
+
+fn prepareInline(self: *App, terminal: anytype) !void {
+    const size = try terminal.querySize();
+    const launch_row = try terminal.prepareInline(size);
+    try self.screen.begin(size, launch_row);
 }
 
 fn callbacks(self: *App) EventLoop.Callbacks {
@@ -194,7 +200,7 @@ fn handleAction(self: *App, action: Decoder.Action) !void {
 
 fn handleResize(context: *anyopaque, size: TerminalSession.Size) !void {
     const self: *App = @ptrCast(@alignCast(context));
-    self.screen.resized(size);
+    try self.screen.resized(size);
 }
 
 fn commitFrame(context: *anyopaque) !void {
@@ -259,6 +265,52 @@ fn cancelAndRestore(self: *App) !void {
     defer result.deinit();
     if (result.wipe_draft) self.editor.secureClear();
     if (result.restored) |restored| try self.editor.replace(restored.text);
+}
+
+test "app prepares exact inline geometry before screen publication" {
+    const Terminal = struct {
+        const Self = @This();
+
+        queried: bool = false,
+        prepared: bool = false,
+
+        fn querySize(self: *Self) !TerminalSession.Size {
+            self.queried = true;
+            return .{ .rows = 18, .columns = 72 };
+        }
+
+        fn prepareInline(self: *Self, size: TerminalSession.Size) !u16 {
+            try std.testing.expect(self.queried);
+            try std.testing.expectEqual(@as(u16, 18), size.rows);
+            try std.testing.expectEqual(@as(u16, 72), size.columns);
+            self.prepared = true;
+            return 7;
+        }
+    };
+
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var app = try App.init(
+        std.testing.allocator,
+        std.testing.io,
+        undefined,
+        &output.writer,
+        .{},
+    );
+    defer app.deinit();
+    app.screen.editorChanged();
+    try std.testing.expectError(error.ScreenNotPrepared, app.screen.commit(.{
+        .composer = .{ .text = "", .cursor_byte = 0 },
+        .phase = .{ .turn = .idle },
+        .queued_count = 0,
+    }));
+
+    var terminal: Terminal = .{};
+    try app.prepareInline(&terminal);
+    try std.testing.expect(terminal.prepared);
+    try std.testing.expectEqual(@as(u16, 18), app.screen.size.?.rows);
+    try std.testing.expectEqual(@as(u16, 72), app.screen.size.?.columns);
+    try std.testing.expectEqual(@as(u16, 7), app.screen.terminal_renderer.launch_row.?);
 }
 
 test "app rejects invalid input deadline configuration" {

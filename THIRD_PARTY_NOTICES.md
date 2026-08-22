@@ -22,6 +22,10 @@ license texts are retained under `third_party/licenses/`.
     adapts the ordered raw-entry store design. `src/smol/terminal/` adapts the
     normal-buffer cursor admission behavior. `src/smol/render/FramePlan.zig`
     adapts compact-until-full ownership and release-first scroll accounting.
+    `src/smol/render/TerminalRenderer.zig` and `src/smol/Screen.zig` adapt the
+    owned-band synchronized publication, physical-scroll shadow update, and
+    normal-buffer transcript finality behavior from fx's frame builder,
+    terminal diff, and transcript runtime.
 
 - OpenTUI, revision `6f7833d09773b88cf5984b2a4e7bc428e1f8ffcb`
   - Source: https://github.com/anomalyco/opentui

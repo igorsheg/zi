@@ -5,7 +5,7 @@ const CursorProbe = @import("CursorProbe.zig");
 const Session = @This();
 
 pub const admission_sequence = "\x1b[?7l";
-pub const restore_sequence = "\x1b[?7h\x1b]8;;\x1b\\\x1b[0m\x1b[?25h";
+pub const restore_sequence = "\x1b[?2026l\x1b[?7h\x1b]8;;\x1b\\\x1b[0m\x1b[?25h";
 const cursor_query_sequence = "\x1b[6n";
 const cursor_query_timeout_ms: i32 = 100;
 const max_probe_input_bytes = CursorProbe.max_deferred_bytes;

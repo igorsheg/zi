@@ -81,6 +81,9 @@ processor: markdown.Processor,
 markdown_out: std.ArrayList(u8) = .empty,
 open_entry: ?u32 = null,
 open_kind: StreamKind = .assistant,
+open_part_index: usize = 0,
+committed_open_entry: ?u32 = null,
+open_entry_irreversible: bool = false,
 response_next_index: usize = 0,
 active_tool: ?ActiveTool = null,
 
@@ -109,10 +112,22 @@ pub fn deinit(self: *Screen) void {
     self.* = undefined;
 }
 
+/// Admits the exact terminal geometry and the one-based row returned by the
+/// terminal cursor probe. This must happen before startup or publication.
+pub fn begin(self: *Screen, size: TerminalSession.Size, launch_row: u16) !void {
+    if (self.size != null) return error.AlreadyPrepared;
+    try self.terminal_renderer.begin(
+        .{ .rows = size.rows, .columns = size.columns },
+        launch_row,
+    );
+    self.size = size;
+}
+
 pub fn start(
     self: *Screen,
     restored: ?*const interactive.SessionTranscript,
 ) !void {
+    if (self.size == null) return error.ScreenNotPrepared;
     _ = try self.store.appendEntry(.welcome,
         \\Zi
         \\  Enter submits. Enter while busy queues the next prompt.
@@ -312,6 +327,7 @@ fn applyEvent(self: *Screen, event: interactive.Event) !void {
 // Streaming facts ------------------------------------------------------------
 
 fn streamPartStart(self: *Screen, started: ai.stream.PartStart) void {
+    self.open_part_index = started.index;
     switch (started.part) {
         .text => self.open_kind = .assistant,
         .thinking => self.open_kind = .thinking,
@@ -320,6 +336,7 @@ fn streamPartStart(self: *Screen, started: ai.stream.PartStart) void {
 }
 
 fn streamPartDelta(self: *Screen, delta: ai.stream.PartDelta) !void {
+    self.open_part_index = delta.index;
     switch (delta.delta) {
         .text => |text| try self.streamMarkdownBytes(text),
         .thinking => |thinking| try self.streamMarkdownBytes(thinking),
@@ -341,6 +358,8 @@ fn streamMarkdownBytes(self: *Screen, bytes: []const u8) !void {
             },
             seed,
         );
+        self.committed_open_entry = null;
+        self.open_entry_irreversible = false;
     }
     // Only settled processor output enters the transcript source. Sanitation
     // happens before Markdown interpretation so provider controls can never be
@@ -354,50 +373,49 @@ fn streamMarkdownBytes(self: *Screen, bytes: []const u8) !void {
 
 fn sealStreamedPart(self: *Screen, index: usize, part: ai.message.ResponsePart) !void {
     self.response_next_index = index + 1;
-    if (self.open_entry) |id| {
-        defer {
-            self.open_entry = null;
-            self.processor.reset(self.allocator);
-        }
-        self.markdown_out.clearRetainingCapacity();
-        try self.processor.flush(self.allocator, &self.markdown_out);
-        if (self.markdown_out.items.len != 0) {
-            try self.store.appendTo(id, self.markdown_out.items);
-        }
-        try self.store.sealEntry(id);
-        return;
-    }
+    if (self.open_entry != null) return self.sealOpenEntry();
     try self.renderPartSource(part);
 }
 
 fn finishResponse(self: *Screen, parts: []const ai.message.ResponsePart) !void {
-    if (self.open_entry) |id| {
-        defer {
-            self.open_entry = null;
-            self.processor.reset(self.allocator);
-        }
-        self.markdown_out.clearRetainingCapacity();
-        try self.processor.flush(self.allocator, &self.markdown_out);
-        if (self.markdown_out.items.len != 0) {
-            try self.store.appendTo(id, self.markdown_out.items);
-        }
-        try self.store.sealEntry(id);
-    }
+    if (self.open_entry != null) try self.sealOpenEntry();
     // Parts the stream never delivered are rendered whole, once.
     for (parts[self.response_next_index..]) |part| try self.renderPartSource(part);
     self.response_next_index = 0;
 }
 
-/// Drops the unsealed streaming entry without rendering it, for turns that
-/// end abnormally mid-part.
+/// Finalizes an open entry whose already-painted rows may have entered native
+/// scrollback. Released terminal history is immutable, so cancellation must
+/// retain the matching transcript source instead of trying to erase it.
+fn sealOpenEntry(self: *Screen) !void {
+    const id = self.open_entry orelse return;
+    defer self.resetOpenEntry();
+    self.markdown_out.clearRetainingCapacity();
+    try self.processor.flush(self.allocator, &self.markdown_out);
+    if (self.markdown_out.items.len != 0) {
+        try self.store.appendTo(id, self.markdown_out.items);
+    }
+    try self.store.sealEntry(id);
+    self.response_next_index = @max(self.response_next_index, self.open_part_index +| 1);
+}
+
+/// Drops a replaceable tail only while every painted row remains inside Zi's
+/// current owned band. Once a commit scrolls a prior copy, finality wins.
 fn discardOpenEntry(self: *Screen) !void {
     const id = self.open_entry orelse return;
-    self.open_entry = null;
-    self.processor.reset(self.allocator);
+    if (self.open_entry_irreversible) return self.sealOpenEntry();
+    self.resetOpenEntry();
     self.store.dropEntriesFrom(id) catch |failure| switch (failure) {
         error.EntryNotFound => {},
         else => return failure,
     };
+}
+
+fn resetOpenEntry(self: *Screen) void {
+    self.open_entry = null;
+    self.committed_open_entry = null;
+    self.open_entry_irreversible = false;
+    self.processor.reset(self.allocator);
 }
 
 // Entry helpers --------------------------------------------------------------
@@ -566,8 +584,10 @@ pub fn editorChanged(self: *Screen) void {
     self.requests.request(.footer);
 }
 
-pub fn resized(self: *Screen, size: TerminalSession.Size) void {
-    if (self.size != null and std.meta.eql(self.size.?, size)) return;
+pub fn resized(self: *Screen, size: TerminalSession.Size) !void {
+    if (self.size == null) return error.ScreenNotPrepared;
+    if (size.rows == 0 or size.columns == 0) return error.InvalidTerminalSize;
+    if (std.meta.eql(self.size.?, size)) return;
     self.size = size;
     self.requests.request(.resize);
 }
@@ -581,9 +601,21 @@ pub fn commit(self: *Screen, view: FrameView) !void {
     // Per-frame painting allocations are request-scoped and freed in bulk.
     var arena = std.heap.ArenaAllocator.init(self.allocator);
     defer arena.deinit();
-    var surface = try self.buildFrame(arena.allocator(), view);
-    defer surface.deinit();
-    _ = try self.terminal_renderer.commit(self.output, &surface);
+    var frame = try self.buildFrame(arena.allocator(), view);
+    defer frame.surface.deinit();
+    const open_entry = self.open_entry;
+    const was_committed = open_entry != null and self.committed_open_entry == open_entry;
+    const result = try self.terminal_renderer.commit(
+        self.output,
+        &frame.surface,
+        frame.plan,
+    );
+    if (open_entry) |id| {
+        if (was_committed and result.physical_scroll_rows != 0) {
+            self.open_entry_irreversible = true;
+        }
+        self.committed_open_entry = id;
+    }
     attempt.commit();
 }
 
@@ -595,7 +627,7 @@ pub fn finish(self: *Screen, view: FrameView) !void {
 
 // Painting -------------------------------------------------------------------
 
-/// One wrapped display row of the transcript viewport: a byte range inside a
+/// One wrapped display row of the transcript band: a byte range inside a
 /// specific entry's source plus the SGR style state at the row boundary so
 /// styles reassert cleanly across wraps and never leak between rows.
 const RowRef = struct {
@@ -605,8 +637,13 @@ const RowRef = struct {
     style: Style,
 };
 
-fn buildFrame(self: *Screen, arena: std.mem.Allocator, view: FrameView) !terminal_render.Surface {
-    const terminal_size = self.size orelse TerminalSession.Size{ .rows = 24, .columns = 80 };
+const BuiltFrame = struct {
+    surface: terminal_render.Surface,
+    plan: render.FramePlan.FramePlan,
+};
+
+fn buildFrame(self: *Screen, arena: std.mem.Allocator, view: FrameView) !BuiltFrame {
+    const terminal_size = self.size orelse return error.ScreenNotPrepared;
     const prompt = "\u{276f} ";
 
     const budget = @min(
@@ -630,10 +667,17 @@ fn buildFrame(self: *Screen, arena: std.mem.Allocator, view: FrameView) !termina
 
     const footer_rows: u16 =
         (if (layout.status != null) @as(u16, 1) else 0) + layout.composer.row_count;
-    const transcript_rows = terminal_size.rows -| footer_rows;
 
     var rows: std.ArrayList(RowRef) = .empty;
     try self.wrapTranscriptRows(arena, terminal_size.columns, &rows);
+    const measured_transcript_rows = std.math.cast(u32, rows.items.len) orelse
+        return error.TranscriptRowCountOverflow;
+    const frame_plan = try self.terminal_renderer.plan(
+        .{ .rows = terminal_size.rows, .columns = terminal_size.columns },
+        measured_transcript_rows,
+        footer_rows,
+    );
+    const visible_transcript_rows = frame_plan.transcript_band.height();
 
     var surface = try terminal_render.Surface.init(
         arena,
@@ -642,10 +686,9 @@ fn buildFrame(self: *Screen, arena: std.mem.Allocator, view: FrameView) !termina
     );
     errdefer surface.deinit();
 
-    // Tail viewport: the newest wrapped rows fill the space above the footer.
-    const first_visible = rows.items.len -| transcript_rows;
+    const first_visible = rows.items.len -| visible_transcript_rows;
     for (rows.items[first_visible..], 0..) |row, index| {
-        const surface_row: u16 = @intCast(index + 1);
+        const surface_row = frame_plan.transcript_band.top + @as(u16, @intCast(index));
         const entry_index = row.entry_index orelse continue;
         const entry = self.store.entryAt(entry_index) orelse continue;
         try paintSourceRange(
@@ -656,8 +699,9 @@ fn buildFrame(self: *Screen, arena: std.mem.Allocator, view: FrameView) !termina
         );
     }
 
+    const footer_offset = frame_plan.footer_band.top - 1;
     if (layout.status) |status| {
-        const status_row: u16 = status.first_row + transcript_rows;
+        const status_row: u16 = status.first_row + footer_offset;
         var status_buffer: [128]u8 = undefined;
         const label = switch (view.phase) {
             .model_less => "No model selected",
@@ -699,9 +743,8 @@ fn buildFrame(self: *Screen, arena: std.mem.Allocator, view: FrameView) !termina
         }
     }
 
-    const composer_offset = transcript_rows;
     for (layout.visibleLines(), 0..) |line, visible_index| {
-        const row = layout.composer.first_row + composer_offset + @as(u16, @intCast(visible_index));
+        const row = layout.composer.first_row + footer_offset + @as(u16, @intCast(visible_index));
         if (layout.sourceLineIndex(visible_index) == 0 and line.start_column > 1) {
             _ = try surface.writeText(row, 1, prompt, .{
                 .attributes = .{ .bold = true },
@@ -715,10 +758,10 @@ fn buildFrame(self: *Screen, arena: std.mem.Allocator, view: FrameView) !termina
         );
     }
     try surface.setCursor(.{
-        .row = layout.cursor.row + composer_offset,
+        .row = layout.cursor.row + footer_offset,
         .column = layout.cursor.column,
     });
-    return surface;
+    return .{ .surface = surface, .plan = frame_plan };
 }
 
 /// Wraps every entry source into display rows at the current column count.
@@ -923,11 +966,31 @@ fn applySgr(style: *Style, params: []const u8) void {
     }
 }
 
+fn beginTestScreen(screen: *Screen) !void {
+    try screen.begin(.{ .rows = 24, .columns = 80 }, 1);
+}
+
+test "screen rejects publication before inline admission" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var screen = try Screen.init(std.testing.allocator, &output.writer, .{});
+    defer screen.deinit();
+    screen.editorChanged();
+
+    try std.testing.expectError(error.ScreenNotPrepared, screen.commit(.{
+        .composer = .{ .text = "", .cursor_byte = 0 },
+        .phase = .{ .turn = .idle },
+        .queued_count = 0,
+    }));
+    try std.testing.expect(screen.requests.hasPending());
+}
+
 test "screen stages facts and publishes one status composer frame" {
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
     var screen = try Screen.init(std.testing.allocator, &output.writer, .{});
     defer screen.deinit();
+    try beginTestScreen(&screen);
 
     try screen.applyEventFact(.{ .message_start = .{
         .run_id = @enumFromInt(1),
@@ -946,11 +1009,44 @@ test "screen stages facts and publishes one status composer frame" {
     try std.testing.expect(std.mem.find(u8, output.written(), "next") != null);
 }
 
+test "screen paints compact absolute bands from the launch row" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var screen = try Screen.init(std.testing.allocator, &output.writer, .{});
+    defer screen.deinit();
+    try screen.begin(.{ .rows = 12, .columns = 30 }, 6);
+    try screen.notice("hello");
+
+    try screen.commit(.{
+        .composer = .{ .text = "", .cursor_byte = 0 },
+        .phase = .{ .turn = .idle },
+        .queued_count = 0,
+    });
+
+    const layout = screen.terminal_renderer.committed_layout.?;
+    const expected_transcript: render.FramePlan.Band = .{ .top = 6, .bottom = 6 };
+    const expected_footer: render.FramePlan.Band = .{ .top = 7, .bottom = 8 };
+    try std.testing.expectEqual(expected_transcript, layout.transcript_band);
+    try std.testing.expectEqual(expected_footer, layout.footer_band);
+    for (1..6) |row| {
+        for (screen.terminal_renderer.shadow.?.rowCells(@intCast(row)).?) |cell| {
+            try std.testing.expect(cell.isBlank());
+        }
+    }
+    var row: u16 = 1;
+    while (row < 6) : (row += 1) {
+        var sequence: [32]u8 = undefined;
+        const cup = try std.fmt.bufPrint(&sequence, "\x1b[{d};1H", .{row});
+        try std.testing.expect(std.mem.find(u8, output.written(), cup) == null);
+    }
+}
+
 test "screen streams markdown progressively without repainting sealed rows" {
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
     var screen = try Screen.init(std.testing.allocator, &output.writer, .{});
     defer screen.deinit();
+    try beginTestScreen(&screen);
 
     try screen.applyEventFact(.{ .message_start = .{
         .run_id = @enumFromInt(1),
@@ -1044,6 +1140,7 @@ test "screen renders Markdown thinking and prose once in response order" {
     defer output.deinit();
     var screen = try Screen.init(std.testing.allocator, &output.writer, .{});
     defer screen.deinit();
+    try beginTestScreen(&screen);
 
     try screen.applyEventFact(.{ .message_start = .{
         .run_id = @enumFromInt(1),
@@ -1104,6 +1201,7 @@ test "screen keeps running tool details in footer and appends one compact result
     defer output.deinit();
     var screen = try Screen.init(std.testing.allocator, &output.writer, .{});
     defer screen.deinit();
+    try beginTestScreen(&screen);
 
     try screen.applyEventFact(.{ .tool_execution_start = .{
         .run_id = @enumFromInt(1),
@@ -1146,6 +1244,7 @@ test "screen drops an abandoned streaming entry on abnormal turn end" {
     defer output.deinit();
     var screen = try Screen.init(std.testing.allocator, &output.writer, .{});
     defer screen.deinit();
+    try beginTestScreen(&screen);
 
     try screen.applyEventFact(.{ .message_update = .{
         .run_id = @enumFromInt(1),
@@ -1191,12 +1290,48 @@ test "screen drops an abandoned streaming entry on abnormal turn end" {
     try std.testing.expect(std.mem.indexOf(u8, output.written()[cancelled..], "half") == null);
 }
 
+test "screen settles a partial assistant after native scrolling makes it final" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var screen = try Screen.init(std.testing.allocator, &output.writer, .{});
+    defer screen.deinit();
+    try screen.begin(.{ .rows = 4, .columns = 20 }, 1);
+
+    const id = try screen.store.appendEntry(.assistant, "one\ntwo\n");
+    screen.open_entry = id;
+    screen.requests.request(.transcript);
+    try screen.commit(.{
+        .composer = .{ .text = "", .cursor_byte = 0 },
+        .phase = .{ .turn = .idle },
+        .queued_count = 0,
+    });
+
+    try screen.store.appendTo(id, "three\n");
+    screen.requests.request(.transcript);
+    try screen.commit(.{
+        .composer = .{ .text = "", .cursor_byte = 0 },
+        .phase = .{ .turn = .idle },
+        .queued_count = 0,
+    });
+    try std.testing.expect(screen.open_entry_irreversible);
+
+    try screen.applyEventFact(.{ .agent_end = .{
+        .run_id = @enumFromInt(1),
+        .outcome = .cancelled,
+        .messages = &.{},
+    } });
+    try std.testing.expect(screen.open_entry == null);
+    try std.testing.expectEqual(@as(usize, 2), screen.store.entryCount());
+    try std.testing.expect(screen.store.entryAt(0).?.sealed);
+    try std.testing.expectEqualStrings("one\ntwo\nthree\n", screen.store.entryAt(0).?.bytes());
+}
+
 test "screen masks OAuth answer composer bytes" {
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
     var screen = try Screen.init(std.testing.allocator, &output.writer, .{});
     defer screen.deinit();
-    screen.resized(.{ .rows = 10, .columns = 40 });
+    try screen.begin(.{ .rows = 10, .columns = 40 }, 3);
     screen.editorChanged();
     try screen.commit(.{
         .composer = .{ .text = "oauth-secret", .cursor_byte = 12, .masked = true },
@@ -1213,22 +1348,23 @@ test "screen reflows the composer across terminal resize" {
     var screen = try Screen.init(std.testing.allocator, &output.writer, .{});
     defer screen.deinit();
 
-    screen.resized(.{ .rows = 12, .columns = 6 });
+    try screen.begin(.{ .rows = 12, .columns = 6 }, 4);
+    screen.editorChanged();
     try screen.commit(.{
         .composer = .{ .text = "abcdefghijkl", .cursor_byte = 12 },
         .phase = .{ .turn = .idle },
         .queued_count = 0,
     });
-    try std.testing.expectEqual(@as(u16, 12), screen.terminal_renderer.previous.?.rows);
-    try std.testing.expectEqual(@as(u16, 6), screen.terminal_renderer.previous.?.columns);
+    try std.testing.expectEqual(@as(u16, 12), screen.terminal_renderer.shadow.?.rows);
+    try std.testing.expectEqual(@as(u16, 6), screen.terminal_renderer.shadow.?.columns);
 
-    screen.resized(.{ .rows = 12, .columns = 10 });
+    try screen.resized(.{ .rows = 12, .columns = 10 });
     try screen.commit(.{
         .composer = .{ .text = "abcdefghijkl", .cursor_byte = 12 },
         .phase = .{ .turn = .idle },
         .queued_count = 0,
     });
-    try std.testing.expectEqual(@as(u16, 10), screen.terminal_renderer.previous.?.columns);
+    try std.testing.expectEqual(@as(u16, 10), screen.terminal_renderer.shadow.?.columns);
 }
 
 test "screen paints one ZWJ grapheme and places the composer cursor by cells" {
@@ -1237,7 +1373,7 @@ test "screen paints one ZWJ grapheme and places the composer cursor by cells" {
     defer output.deinit();
     var screen = try Screen.init(std.testing.allocator, &output.writer, .{});
     defer screen.deinit();
-    screen.resized(.{ .rows = 8, .columns = 8 });
+    try screen.begin(.{ .rows = 8, .columns = 8 }, 2);
     screen.editorChanged();
     try screen.commit(.{
         .composer = .{ .text = family, .cursor_byte = family.len },
@@ -1246,10 +1382,10 @@ test "screen paints one ZWJ grapheme and places the composer cursor by cells" {
     });
 
     try std.testing.expect(std.mem.find(u8, output.written(), family) != null);
-    const previous = &screen.terminal_renderer.previous.?;
+    const shadow = &screen.terminal_renderer.shadow.?;
     // The composer cursor sits past the two-cell family grapheme plus prompt.
-    try std.testing.expect(previous.cursor.column >= 5);
-    const cursor_cells = previous.rowCells(previous.cursor.row).?;
+    try std.testing.expect(shadow.cursor.column >= 5);
+    const cursor_cells = shadow.rowCells(shadow.cursor.row).?;
     var wide_found = false;
     for (cursor_cells) |cell| {
         if (cell.width == 2 and !cell.isContinuation()) wide_found = true;
@@ -1305,6 +1441,7 @@ test "screen restores an uncommitted frame request after output failure" {
     var failing: std.Io.Writer = .{ .vtable = &Failing.vtable, .buffer = &.{} };
     var screen = try Screen.init(std.testing.allocator, &failing, .{});
     defer screen.deinit();
+    try beginTestScreen(&screen);
     screen.editorChanged();
     try std.testing.expectError(error.WriteFailed, screen.commit(.{
         .composer = .{ .text = "draft", .cursor_byte = 5 },
@@ -1312,5 +1449,5 @@ test "screen restores an uncommitted frame request after output failure" {
         .queued_count = 0,
     }));
     try std.testing.expect(screen.requests.hasPending());
-    try std.testing.expect(screen.terminal_renderer.previous == null);
+    try std.testing.expect(screen.terminal_renderer.shadow == null);
 }

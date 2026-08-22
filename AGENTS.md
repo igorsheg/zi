@@ -279,24 +279,30 @@ owned interaction facts, and securely wiped prompt answers. The CLI owns process
 adaptation, initial runtime creation, host launch, frontend invocation, and exit
 mapping. It does not own terminal mechanics, input state, or rendering.
 
-`smol/terminal/Session.zig` owns raw-mode admission and best-effort cooked-mode,
-style, hyperlink, and cursor restoration. The current smol client starts on the
-normal screen without mouse tracking, alternate-screen rendering, or
-keyboard-protocol negotiation. `smol/input/Decoder.zig` owns bounded escape parsing and resolves a bare Escape only after a quiet-period
+`smol/terminal/Session.zig` owns raw-mode admission, cursor-probed inline launch,
+deferred probe input, and best-effort cooked-mode, synchronized-update, style,
+hyperlink, and cursor restoration. The current smol client uses a compact region
+in the normal buffer without mouse tracking, alternate-screen rendering, or
+keyboard-protocol negotiation. It never clears the complete display or shell
+history. `smol/input/Decoder.zig` owns bounded escape parsing and resolves a bare Escape only after a quiet-period
 deadline. `smol/EventLoop.zig` handles bounded terminal bytes, resize
 observation, worker fact collection, input-deadline settlement, and one frame
 commit after reduction on the terminal-owning thread. It does not interpret
 coding-agent input actions. `smol/Screen.zig` coalesces typed render requests,
 sanitizes provider and tool text, incrementally presents settled Markdown into
-typed transcript entries, and reflows the transcript tail at paint time.
+typed transcript entries, and paints compact absolute transcript and footer
+bands from the admitted launch row. Partial assistant rows become final once
+physical scrolling can expose them in native history.
 `smol/render/FooterLayout.zig` owns non-overlapping status and composer bands,
 display-cell wrapping, bounded composer viewport selection, and cursor geometry.
 `terminal_render/Surface.zig` owns typed frame cells, frame-local grapheme bytes,
 cell spans, and cursor invariants. `terminal_render/Text.zig` owns Unicode
 grapheme boundaries and display width. `smol/render/TerminalRenderer.zig` is the
-sole live frame writer. It composes a complete wire transaction, diffs against
-its allocator-owned full-frame shadow, and replaces that shadow only after a
-successful flush.
+sole live frame writer. It solves normal-buffer ownership with `FramePlan`,
+physically scrolls before bounded owned-band diffs, and retains an allocator-owned
+full-size shadow plus committed layout only after a successful flush. Finish
+clears Zi's committed footer rows, leaves transcript rows visible, and returns
+the cursor on the first cleared line.
 
 Credentials are admitted values on the session runtime, not ambient environment
 reads scattered through the tree. The process edge reads the environment once
