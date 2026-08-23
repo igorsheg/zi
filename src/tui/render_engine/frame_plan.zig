@@ -112,10 +112,10 @@ pub fn solve(input: SolveInput) SolveError!FramePlan {
     }
     if (input.prior) |prior| try validateCommitted(prior);
 
-    const initial_owned_top = if (input.prior) |prior|
-        @min(prior.owned_top, input.geometry.rows)
-    else
-        input.launch_row;
+    const initial_owned_top = normalizeOwnedTop(
+        if (input.prior) |prior| prior.owned_top else input.launch_row,
+        input.geometry.rows,
+    );
     const footer_height = @min(input.footer_rows, input.geometry.rows);
     const transcript_capacity = input.geometry.rows - footer_height;
     const naturally_visible_rows = @min(
@@ -197,6 +197,11 @@ pub fn solve(input: SolveInput) SolveError!FramePlan {
         .released_preserved_rows = released_preserved_rows,
         .footer_rows = input.footer_rows,
     };
+}
+
+fn normalizeOwnedTop(owned_top: u16, terminal_rows: u16) u16 {
+    if (terminal_rows == 0) return 0;
+    return @max(@min(owned_top, terminal_rows), 1);
 }
 
 fn sameGeometry(a: Geometry, b: Geometry) bool {

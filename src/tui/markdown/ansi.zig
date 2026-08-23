@@ -11,21 +11,12 @@ pub const dim_open = "\x1b[2m";
 pub const dim_close = "\x1b[22m";
 pub const underline_open = "\x1b[4m";
 pub const underline_close = "\x1b[24m";
-const task_completed_dark_open = "\x1b[38;5;252m";
-const task_completed_light_open = "\x1b[38;5;238m";
-pub var task_completed_open: []const u8 = task_completed_dark_open;
+pub const task_completed_open = "\x1b[38;5;252m";
 pub const task_completed_close = "\x1b[39m";
 pub const strike_open = "\x1b[9m";
 pub const strike_close = "\x1b[29m";
-const inline_code_dark_open = "\x1b[38;5;245m";
-const inline_code_light_open = "\x1b[38;5;247m";
-pub var inline_code_open: []const u8 = inline_code_dark_open;
+pub const inline_code_open = "\x1b[38;5;245m";
 pub const inline_code_close = "\x1b[39m";
-
-pub fn setInlineCodeTheme(light: bool) void {
-    inline_code_open = if (light) inline_code_light_open else inline_code_dark_open;
-    task_completed_open = if (light) task_completed_light_open else task_completed_dark_open;
-}
 
 // Keeps table intersections aligned with row separators.
 pub const table_column_sep = " \xe2\x94\x82 ";
@@ -59,11 +50,4 @@ test "writeHorizontalRule uses the declared width" {
     defer out.deinit(std.testing.allocator);
     try writeHorizontalRule(std.testing.allocator, &out);
     try std.testing.expectEqual(horizontal_rule_width * table_horiz.len + dim_open.len + dim_close.len, out.items.len);
-}
-
-test "setInlineCodeTheme switches palettes" {
-    setInlineCodeTheme(true);
-    try std.testing.expectEqualStrings("\x1b[38;5;247m", inline_code_open);
-    setInlineCodeTheme(false);
-    try std.testing.expectEqualStrings("\x1b[38;5;245m", inline_code_open);
 }

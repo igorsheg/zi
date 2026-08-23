@@ -1,6 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const CursorProbe = @import("CursorProbe.zig");
+const CursorProbe = @import("cursor_position_parser.zig");
 
 const Session = @This();
 

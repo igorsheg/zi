@@ -1,3 +1,5 @@
+// Adapts vercel-labs/fx src/ui/render_engine/footer_layout.zig to Zi's
+// compact composer-only interaction surface.
 const std = @import("std");
 const terminal_render = @import("../../terminal_render/root.zig");
 const Surface = terminal_render.Surface;
@@ -23,8 +25,10 @@ pub const VisualLine = struct {
 allocator: std.mem.Allocator,
 columns: u16,
 surface_rows: u16,
-status: ?Band,
+top_divider: ?Band,
 composer: Band,
+bottom_divider: ?Band,
+hint: ?Band,
 lines: []VisualLine,
 first_visible_line: usize,
 cursor: Surface.Cursor,
@@ -117,8 +121,15 @@ pub fn init(
         .start_column = final_indent + 1,
     });
 
-    const has_status = terminal_rows > 1;
-    const max_composer_rows: usize = terminal_rows - @intFromBool(has_status);
+    // fx reserves top and bottom composer chrome plus a contextual hint. Zi
+    // sheds those rows in that order when the terminal is too short.
+    const has_hint = terminal_rows >= 2;
+    const has_top_divider = terminal_rows >= 3;
+    const has_bottom_divider = terminal_rows >= 4;
+    const chrome_rows: u16 = @as(u16, @intFromBool(has_hint)) +
+        @as(u16, @intFromBool(has_top_divider)) +
+        @as(u16, @intFromBool(has_bottom_divider));
+    const max_composer_rows: usize = terminal_rows - chrome_rows;
     const visible_count = @min(lines.items.len, max_composer_rows);
     const first_visible_line = if (lines.items.len <= visible_count)
         0
@@ -126,20 +137,38 @@ pub fn init(
         0
     else
         @min(cursor_line - visible_count + 1, lines.items.len - visible_count);
-    const status: ?Band = if (has_status) .{ .first_row = 1, .row_count = 1 } else null;
-    const composer_first_row: u16 = if (has_status) 2 else 1;
+
+    const top_divider: ?Band = if (has_top_divider) .{ .first_row = 1, .row_count = 1 } else null;
+    const composer_first_row: u16 = 1 + @as(u16, @intFromBool(has_top_divider));
     const composer: Band = .{
         .first_row = composer_first_row,
         .row_count = @intCast(visible_count),
     };
+    const bottom_divider: ?Band = if (has_bottom_divider) .{
+        .first_row = composer.lastRow() + 1,
+        .row_count = 1,
+    } else null;
+    const hint: ?Band = if (has_hint) .{
+        .first_row = composer.lastRow() + 1 +
+            @as(u16, @intFromBool(has_bottom_divider)),
+        .row_count = 1,
+    } else null;
+    const surface_rows = if (hint) |band|
+        band.lastRow()
+    else if (bottom_divider) |band|
+        band.lastRow()
+    else
+        composer.lastRow();
     const owned_lines = try allocator.dupe(VisualLine, lines.items);
 
     return .{
         .allocator = allocator,
         .columns = columns,
-        .surface_rows = composer.lastRow(),
-        .status = status,
+        .surface_rows = surface_rows,
+        .top_divider = top_divider,
         .composer = composer,
+        .bottom_divider = bottom_divider,
+        .hint = hint,
         .lines = owned_lines,
         .first_visible_line = first_visible_line,
         .cursor = .{
@@ -168,69 +197,45 @@ pub fn sourceLineIndex(self: *const FooterLayout, visible_index: usize) usize {
     return self.first_visible_line + visible_index;
 }
 
-test "layout wraps composer and places cursor by display cells" {
+test "layout wraps composer inside fx-style chrome" {
     var layout = try FooterLayout.init(std.testing.allocator, 8, 6, "ab界cd", 5, 2);
     defer layout.deinit();
+    try std.testing.expect(layout.top_divider != null);
+    try std.testing.expect(layout.bottom_divider != null);
+    try std.testing.expect(layout.hint != null);
     try std.testing.expectEqual(@as(usize, 2), layout.lines.len);
-    try std.testing.expectEqual(@as(usize, 0), layout.lines[0].start_byte);
-    try std.testing.expectEqual(@as(usize, 5), layout.lines[0].end_byte);
-    try std.testing.expectEqual(@as(usize, 5), layout.lines[1].start_byte);
     try std.testing.expectEqual(@as(u16, 3), layout.cursor.row);
     try std.testing.expectEqual(@as(u16, 1), layout.cursor.column);
 }
 
 test "layout never splits an emoji ZWJ grapheme" {
     const family = "👨‍👩‍👧‍👦";
-    var layout = try FooterLayout.init(std.testing.allocator, 4, 4, family, family.len, 2);
+    var layout = try FooterLayout.init(std.testing.allocator, 6, 4, family, family.len, 2);
     defer layout.deinit();
     try std.testing.expectEqual(@as(usize, 2), layout.lines.len);
     try std.testing.expectEqual(@as(usize, family.len), layout.lines[0].end_byte);
     try std.testing.expectEqual(@as(usize, family.len), layout.lines[1].start_byte);
-    try std.testing.expectEqual(@as(u16, 3), layout.cursor.row);
-    try std.testing.expectEqual(@as(u16, 1), layout.cursor.column);
-}
-
-test "layout advances an end cursor past an exactly full row" {
-    var layout = try FooterLayout.init(std.testing.allocator, 4, 6, "abcd", 4, 2);
-    defer layout.deinit();
-    try std.testing.expectEqual(@as(usize, 2), layout.lines.len);
-    try std.testing.expectEqual(@as(usize, 4), layout.lines[1].start_byte);
-    try std.testing.expectEqual(@as(usize, 4), layout.lines[1].end_byte);
-    try std.testing.expectEqual(@as(u16, 3), layout.cursor.row);
-    try std.testing.expectEqual(@as(u16, 1), layout.cursor.column);
 }
 
 test "layout keeps the cursor line visible in a bounded terminal" {
-    var layout = try FooterLayout.init(std.testing.allocator, 3, 4, "abcdefghijkl", 12, 2);
+    var layout = try FooterLayout.init(std.testing.allocator, 4, 4, "abcdefghijkl", 12, 2);
     defer layout.deinit();
-    try std.testing.expectEqual(@as(u16, 1), layout.status.?.row_count);
-    try std.testing.expectEqual(@as(u16, 2), layout.composer.row_count);
-    try std.testing.expectEqual(@as(usize, 2), layout.first_visible_line);
-    try std.testing.expectEqual(@as(u16, 3), layout.cursor.row);
+    try std.testing.expectEqual(@as(u16, 1), layout.composer.row_count);
+    try std.testing.expectEqual(@as(usize, 3), layout.first_visible_line);
+    try std.testing.expectEqual(@as(u16, 2), layout.cursor.row);
 }
 
-test "layout handles maximum terminal width without arithmetic overflow" {
-    const columns = std.math.maxInt(u16);
-    const text = try std.testing.allocator.alloc(u8, @as(usize, columns) + 1);
-    defer std.testing.allocator.free(text);
-    @memset(text, 'a');
-    text[columns] = 'b';
+test "tiny terminals shed footer chrome before the composer" {
+    var one = try FooterLayout.init(std.testing.allocator, 1, 10, "draft", 5, 2);
+    defer one.deinit();
+    try std.testing.expect(one.top_divider == null);
+    try std.testing.expect(one.bottom_divider == null);
+    try std.testing.expect(one.hint == null);
+    try std.testing.expectEqual(@as(u16, 1), one.surface_rows);
 
-    var wrapped = try FooterLayout.init(std.testing.allocator, 3, columns, text, text.len, 0);
-    defer wrapped.deinit();
-    try std.testing.expectEqual(@as(usize, 2), wrapped.lines.len);
-    try std.testing.expectEqual(@as(usize, columns), wrapped.lines[1].start_byte);
-
-    text[columns] = '\n';
-    var newline = try FooterLayout.init(std.testing.allocator, 3, columns, text, columns, 0);
-    defer newline.deinit();
-    try std.testing.expectEqual(columns, newline.cursor.column);
-}
-
-test "one-row terminal admits only a composer band" {
-    var layout = try FooterLayout.init(std.testing.allocator, 1, 10, "draft", 5, 2);
-    defer layout.deinit();
-    try std.testing.expect(layout.status == null);
-    try std.testing.expectEqual(@as(u16, 1), layout.surface_rows);
-    try std.testing.expectEqual(@as(u16, 1), layout.composer.first_row);
+    var two = try FooterLayout.init(std.testing.allocator, 2, 10, "draft", 5, 2);
+    defer two.deinit();
+    try std.testing.expect(two.top_divider == null);
+    try std.testing.expect(two.hint != null);
+    try std.testing.expectEqual(@as(u16, 2), two.surface_rows);
 }

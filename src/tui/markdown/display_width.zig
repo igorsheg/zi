@@ -6,14 +6,7 @@
 const std = @import("std");
 const Text = @import("../../terminal_render/root.zig").Text;
 
-/// Display width of text, counting grapheme clusters. Maps to fx's
-/// visibleWidth over its own Unicode tables.
-pub fn visibleWidth(text: []const u8) usize {
-    return Text.displayWidth(text);
-}
-
-/// Same as visibleWidth, but skips ANSI escape sequences so callers can
-/// measure the rendered cell width of styled text. terminal_render has no
+/// Skips ANSI escape sequences while measuring styled text. terminal_render has no
 /// equivalent of this function, so it is implemented here minimally: escape
 /// sequences run from ESC (0x1b) through a terminating byte in 0x40..0x7e,
 /// with CSI private-marker bytes skipped conservatively.
@@ -56,11 +49,6 @@ fn ansiSequenceEnd(text: []const u8, start: usize) usize {
         // Two-byte escape such as ESC ( B.
         else => return @min(start + 2, text.len),
     }
-}
-
-test "visibleWidth counts ascii and wide characters" {
-    try std.testing.expectEqual(@as(usize, 5), visibleWidth("hello"));
-    try std.testing.expectEqual(@as(usize, 4), visibleWidth("\xe4\xbd\xa0\xe5\xa5\xbd"));
 }
 
 test "visibleWidthIgnoringAnsi skips escapes" {

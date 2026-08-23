@@ -2,7 +2,7 @@ const std = @import("std");
 const coding_agent = @import("../coding_agent/root.zig");
 const interactive = coding_agent.interactive;
 const Decoder = @import("input/Decoder.zig");
-const EventLoop = @import("EventLoop.zig");
+const EventLoop = @import("event_loop.zig");
 const Screen = @import("Screen.zig");
 const LineEditor = @import("input/LineEditor.zig");
 const TerminalSession = @import("terminal/Session.zig");
@@ -57,7 +57,7 @@ pub fn deinit(self: *App) void {
     self.* = undefined;
 }
 
-/// Owns raw terminal admission and runs one smol client instance.
+/// Owns raw terminal admission and runs one tui client instance.
 pub fn run(
     self: *App,
     input: std.Io.File,

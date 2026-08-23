@@ -17,15 +17,26 @@ license texts are retained under `third_party/licenses/`.
 - fx, revision `5ed3be1b67e59b6607f09f69581107d70fa6d243`
   - Source: https://github.com/vercel-labs/fx
   - License: Apache-2.0
-  - `src/smol/markdown/` adapts the incremental Markdown presentation processor
-    and its parser and renderer leaf modules. `src/smol/transcript/Store.zig`
-    adapts the ordered raw-entry store design. `src/smol/terminal/` adapts the
-    normal-buffer cursor admission behavior. `src/smol/render/FramePlan.zig`
-    adapts compact-until-full ownership and release-first scroll accounting.
-    `src/smol/render/TerminalRenderer.zig` and `src/smol/Screen.zig` adapt the
-    owned-band synchronized publication, physical-scroll shadow update, and
-    normal-buffer transcript finality behavior from fx's frame builder,
-    terminal diff, and transcript runtime.
+  - `src/tui/markdown/` adapts the incremental Markdown presentation processor
+    and its parser and renderer leaf modules. `src/tui/transcript/Store.zig`
+    adapts the bounded ordered semantic-entry store design. `src/tui/terminal/`
+    adapts the normal-buffer cursor admission behavior.
+    `src/tui/assistant/user_message_card.zig`,
+    `src/tui/footer/presentation.zig`, `src/tui/footer/surface_frame.zig`,
+    `src/tui/tools/tool_presentation.zig`, `src/tui/transcript/Runtime.zig`,
+    `src/tui/transcript/painter.zig`,
+    `src/tui/transcript/tool_group_projection.zig`,
+    `src/tui/render_engine/transcript_blocks.zig`,
+    `src/tui/render_engine/FooterLayout.zig`,
+    `src/tui/render_engine/frame_builder.zig`,
+    `src/tui/render_engine/frame_plan.zig`,
+    `src/tui/render_engine/TerminalRenderer.zig`, and `src/tui/Screen.zig` adapt
+    semantic transcript ownership, connected user-turn rails, grouped and
+    action-oriented tool status, paint-time reflow, footer surface assembly,
+    compact-until-full frame composition, owned-band synchronized publication,
+    physical-scroll shadow update, and normal-buffer transcript finality from
+    fx's corresponding presentation, transcript, footer, frame-builder, and
+    terminal-diff owners.
 
 - OpenTUI, revision `6f7833d09773b88cf5984b2a4e7bc428e1f8ffcb`
   - Source: https://github.com/anomalyco/opentui

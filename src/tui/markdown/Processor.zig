@@ -85,17 +85,7 @@ pub const MarkdownProcessor = struct {
         try self.pushWithCompletions(alloc, input, out, .{});
     }
 
-    pub fn pushWithTableCompletion(
-        self: *MarkdownProcessor,
-        alloc: Allocator,
-        input: []const u8,
-        out: *std.ArrayList(u8),
-        completion: ?*const payload.TableCompletion,
-    ) !void {
-        try self.pushWithCompletions(alloc, input, out, .{ .table = completion });
-    }
-
-    pub fn pushWithCompletions(
+    fn pushWithCompletions(
         self: *MarkdownProcessor,
         alloc: Allocator,
         input: []const u8,
@@ -115,49 +105,11 @@ pub const MarkdownProcessor = struct {
         }
     }
 
-    /// Rebuilds structural Markdown state from source that is already visible.
-    /// Buffered bytes are discarded so later chunks emit only new content.
-    pub fn restorePresentedPrefix(
-        self: *MarkdownProcessor,
-        alloc: Allocator,
-        source: []const u8,
-    ) !void {
-        self.reset(alloc);
-        var discarded: std.ArrayList(u8) = .empty;
-        defer discarded.deinit(alloc);
-
-        try self.push(alloc, source, &discarded);
-        if (self.line_buf.items.len > 0) {
-            try self.handleLine(
-                alloc,
-                self.line_buf.items,
-                false,
-                &discarded,
-                .{},
-            );
-            self.line_buf.clearRetainingCapacity();
-        }
-        self.pending_top_level_line.clearRetainingCapacity();
-        self.pipe_buf.clearRetainingCapacity();
-        self.in_pipe_block = false;
-        self.pipe_last_line_has_lf = false;
-        self.code_buf.clearRetainingCapacity();
-    }
-
     pub fn flush(self: *MarkdownProcessor, alloc: Allocator, out: *std.ArrayList(u8)) !void {
         try self.flushWithCompletions(alloc, out, .{});
     }
 
-    pub fn flushWithTableCompletion(
-        self: *MarkdownProcessor,
-        alloc: Allocator,
-        out: *std.ArrayList(u8),
-        completion: ?*const payload.TableCompletion,
-    ) !void {
-        try self.flushWithCompletions(alloc, out, .{ .table = completion });
-    }
-
-    pub fn flushWithCompletions(
+    fn flushWithCompletions(
         self: *MarkdownProcessor,
         alloc: Allocator,
         out: *std.ArrayList(u8),
@@ -670,27 +622,6 @@ test "flush emits the tail and closes open styles" {
     try processor.push(alloc, "run `zig build", &out);
     try processor.flush(alloc, &out);
     try std.testing.expectEqualStrings("run \x1b[38;5;245mzig build\x1b[39m", out.items);
-}
-
-test "restorePresentedPrefix resumes after truncation without replaying rendered bytes" {
-    const alloc = std.testing.allocator;
-    var processor: MarkdownProcessor = .{};
-    defer processor.deinit(alloc);
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(alloc);
-
-    const prefix = "Partial paragraph.\n```zig\nconst value =";
-    try processor.restorePresentedPrefix(alloc, prefix);
-    try std.testing.expect(processor.in_code_block);
-    try std.testing.expectEqual(@as(?u8, '`'), processor.code_fence_marker);
-    try std.testing.expectEqualStrings("zig", processor.code_language.items);
-    try std.testing.expectEqual(@as(usize, 0), processor.code_buf.items.len);
-
-    // Only the unseen continuation is pushed; buffered bytes were discarded.
-    try processor.push(alloc, " 1;\n```\nafter\n", &out);
-    try processor.flush(alloc, &out);
-
-    try std.testing.expectEqualStrings("\x1b[2m\xe2\x94\x82 \x1b[22m 1;\nafter\n", out.items);
 }
 
 test "unterminated fence streams cleanly and flushes without garbage" {

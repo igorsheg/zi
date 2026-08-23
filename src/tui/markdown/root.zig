@@ -1,5 +1,5 @@
-// Markdown presentation leaf modules adapted from vercel-labs/fx. Screen owns
-// sanitation and feeds one processor per response part.
+// Markdown presentation leaf modules adapted from vercel-labs/fx. Transcript
+// Runtime owns sanitation and feeds the incremental processor.
 const ansi = @import("ansi.zig");
 const text_util = @import("text_util.zig");
 const payload = @import("payload.zig");

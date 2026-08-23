@@ -3,7 +3,7 @@
 // 5ed3be1. Licensed under Apache-2.0 and adapted for Zi.
 const std = @import("std");
 const terminal_render = @import("../../terminal_render/root.zig");
-const FramePlan = @import("FramePlan.zig");
+const FramePlan = @import("frame_plan.zig");
 const Ansi = terminal_render.Ansi;
 const Diff = terminal_render.Diff;
 const Surface = terminal_render.Surface;

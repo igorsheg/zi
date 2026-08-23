@@ -161,7 +161,7 @@ Each module directory has a `root.zig` that is its public seam to other modules.
 Owners inside one module may import sibling files directly; callers outside it
 use `root.zig` instead of reaching through the boundary. Export only declarations
 with a current cross-module caller. `coding_agent/root.zig` exposes the CLI and
-interactive-client contracts consumed by the process root and `smol`. A root's
+interactive-client contracts consumed by the process root and `tui`. A root's
 `test { _ = ... }` block is also the test registry: a new file in the module is
 not covered by `zig build test` until it is referenced there.
 
@@ -184,7 +184,7 @@ Module ownership (stable boundaries):
   cells and styles, surfaces, semantic frame diffs, and error-returning ANSI
   encoding. It depends only on the standard library and the pinned `uucode`
   tables.
-- `src/smol/` owns the concrete non-alternate-screen interactive client: terminal
+- `src/tui/` owns the concrete non-alternate-screen interactive client: terminal
   lifecycle, input decoding and editing, event polling, incremental Markdown
   presentation, the typed transcript store, paint-time transcript reflow, footer
   layout, normal-buffer publication, and rendering policy. It consumes the
@@ -197,10 +197,10 @@ Module ownership (stable boundaries):
 - `data/model_catalog.json` plus `tools/model_catalog.zig` own catalog
   generation. The compiled snapshot lives in `src/ai/model_catalog_snapshot.zig`.
 
-Dependencies point one way: `smol` depends on `coding_agent`, `ai`, and
+Dependencies point one way: `tui` depends on `coding_agent`, `ai`, and
 `terminal_render`; `terminal_render` depends on no Zi module; `coding_agent`
 depends on `agent` and `ai`; `agent` depends on `ai`; `ai` depends on neither. The CLI accepts an erased interactive frontend from
-`src/main.zig`; neither `coding_agent` nor its CLI may import `smol`. Do not add a
+`src/main.zig`; neither `coding_agent` nor its CLI may import `tui`. Do not add a
 back edge.
 
 For the admitted product behavior right now (providers, tools, and what `main`
@@ -279,26 +279,33 @@ owned interaction facts, and securely wiped prompt answers. The CLI owns process
 adaptation, initial runtime creation, host launch, frontend invocation, and exit
 mapping. It does not own terminal mechanics, input state, or rendering.
 
-`smol/terminal/Session.zig` owns raw-mode admission, cursor-probed inline launch,
+`tui/terminal/Session.zig` owns raw-mode admission, cursor-probed inline launch,
 deferred probe input, and best-effort cooked-mode, synchronized-update, style,
-hyperlink, and cursor restoration. The current smol client uses a compact region
+hyperlink, and cursor restoration. The current tui client uses a compact region
 in the normal buffer without mouse tracking, alternate-screen rendering, or
 keyboard-protocol negotiation. It never clears the complete display or shell
-history. `smol/input/Decoder.zig` owns bounded escape parsing and resolves a bare Escape only after a quiet-period
-deadline. `smol/EventLoop.zig` handles bounded terminal bytes, resize
+history. `tui/input/Decoder.zig` owns bounded escape parsing and resolves a bare Escape only after a quiet-period
+deadline. `tui/event_loop.zig` handles bounded terminal bytes, resize
 observation, worker fact collection, input-deadline settlement, and one frame
 commit after reduction on the terminal-owning thread. It does not interpret
-coding-agent input actions. `smol/Screen.zig` coalesces typed render requests,
-sanitizes provider and tool text, incrementally presents settled Markdown into
-typed transcript entries, and paints compact absolute transcript and footer
-bands from the admitted launch row. Partial assistant rows become final once
+coding-agent input actions. `tui/transcript/Runtime.zig` reduces borrowed host
+facts into the bounded semantic transcript store, owns incremental Markdown and
+tool lifecycle presentation, and settles the only mutable assistant tail.
+`tui/transcript/tool_group_projection.zig` projects consecutive tool statuses
+without mutating retained entries. `tui/transcript/painter.zig` rebuilds semantic
+entries at paint-time width and emits typed rows with entry, separator, and
+footer-boundary provenance. `tui/footer/surface_frame.zig` owns footer
+measurement and typed painting; `tui/render_engine/FooterLayout.zig` owns
+display-cell composer wrapping, bounded viewport selection, chrome rows, and
+cursor geometry. `tui/render_engine/frame_builder.zig` composes independently
+prepared transcript and footer projections into one candidate frame.
+`tui/Screen.zig` only coalesces render invalidations, coordinates those owners, and
+publishes from the admitted launch row. Partial assistant rows become final once
 physical scrolling can expose them in native history.
-`smol/render/FooterLayout.zig` owns non-overlapping status and composer bands,
-display-cell wrapping, bounded composer viewport selection, and cursor geometry.
 `terminal_render/Surface.zig` owns typed frame cells, frame-local grapheme bytes,
 cell spans, and cursor invariants. `terminal_render/Text.zig` owns Unicode
-grapheme boundaries and display width. `smol/render/TerminalRenderer.zig` is the
-sole live frame writer. It solves normal-buffer ownership with `FramePlan`,
+grapheme boundaries and display width. `tui/render_engine/TerminalRenderer.zig`
+is the sole live frame writer. It solves normal-buffer ownership with `FramePlan`,
 physically scrolls before bounded owned-band diffs, and retains an allocator-owned
 full-size shadow plus committed layout only after a successful flush. Finish
 clears Zi's committed footer rows, leaves transcript rows visible, and returns

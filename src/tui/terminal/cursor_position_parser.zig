@@ -93,8 +93,13 @@ fn classify(bytes: []const u8) Candidate {
     if (index == bytes.len) return .prefix;
     if (column_len == 0 or bytes[index] != 'R' or index + 1 != bytes.len) return .invalid;
 
-    const row = std.fmt.parseUnsigned(u16, bytes[row_start..][0..row_len], 10) catch return .invalid;
-    const column = std.fmt.parseUnsigned(u16, bytes[column_start..][0..column_len], 10) catch return .invalid;
+    const row = std.fmt.parseUnsigned(u16, bytes[row_start .. row_start + row_len], 10) catch
+        return .invalid;
+    const column = std.fmt.parseUnsigned(
+        u16,
+        bytes[column_start .. column_start + column_len],
+        10,
+    ) catch return .invalid;
     if (row == 0 or column == 0) return .invalid;
     return .{ .complete = .{ .row = row, .column = column } };
 }
