@@ -1,8 +1,9 @@
 const std = @import("std");
 const ai = @import("../ai/root.zig");
 const agent = @import("../agent/root.zig");
-const AgentSession = @import("AgentSession.zig");
-const session_event = @import("AgentSessionEvent.zig");
+const agent_session_mod = @import("AgentSession.zig");
+const AgentSession = agent_session_mod.AgentSession;
+const session_event = agent_session_mod;
 const OwnedEvent = session_event.Owned;
 
 const TurnWorker = @This();
@@ -12,6 +13,7 @@ pub const Limits = struct {
     max_queued_prompts: usize = 16,
     max_queued_events: usize = 256,
     max_queued_event_bytes: usize = OwnedEvent.default_max_retained_bytes,
+    max_queued_event_items: usize = OwnedEvent.default_max_items,
     max_queued_completions: usize = 32,
     event: OwnedEvent.Limits = .{},
 };
@@ -51,6 +53,7 @@ pub const Snapshot = struct {
     queued_prompts: usize,
     queued_events: usize,
     queued_event_bytes: usize,
+    queued_event_items: usize,
     queued_completions: usize,
     stop_requested: bool,
     availability: session_event.Availability,
@@ -119,6 +122,7 @@ condition: std.Io.Condition = .init,
 prompts: std.ArrayList([]u8) = .empty,
 events: std.ArrayList(OwnedEvent) = .empty,
 queued_event_bytes: usize = 0,
+queued_event_items: usize = 0,
 completions: std.ArrayList(Completion) = .empty,
 cancellation: ai.model.CancellationToken = .{},
 active_run_id: ?agent.event.RunId = null,
@@ -141,6 +145,7 @@ pub fn start(
         limits.max_queued_prompts == 0 or
         limits.max_queued_events == 0 or
         limits.max_queued_event_bytes == 0 or
+        limits.max_queued_event_items == 0 or
         limits.max_queued_completions == 0)
     {
         return error.InvalidWorkerLimits;
@@ -215,6 +220,7 @@ pub fn snapshot(self: *TurnWorker) Snapshot {
         .queued_prompts = self.prompts.items.len,
         .queued_events = self.events.items.len,
         .queued_event_bytes = self.queued_event_bytes,
+        .queued_event_items = self.queued_event_items,
         .queued_completions = self.completions.items.len,
         .stop_requested = self.stop_requested,
         .availability = self.availability,
@@ -235,6 +241,7 @@ pub fn takeBatch(self: *TurnWorker) error{OutOfMemory}!Batch {
     const completions = self.completions;
     self.events = replacement_events;
     self.queued_event_bytes = 0;
+    self.queued_event_items = 0;
     self.completions = replacement_completions;
     self.condition.broadcast(self.io);
     self.mutex.unlock(self.io);
@@ -332,7 +339,7 @@ fn takePrompt(self: *TurnWorker) ?[]u8 {
 
 fn emitSessionEvent(
     context: *anyopaque,
-    event: AgentSession.Event,
+    event: session_event.Event,
 ) session_event.SinkError!void {
     const self: *TurnWorker = @ptrCast(@alignCast(context));
     if (event == .agent_start) {
@@ -348,14 +355,17 @@ fn emitSessionEvent(
     };
     errdefer owned.deinit();
 
-    if (owned.retained_bytes > self.limits.max_queued_event_bytes) {
+    if (owned.retained_bytes > self.limits.max_queued_event_bytes or
+        owned.item_count > self.limits.max_queued_event_items)
+    {
         return error.ConsumerStopped;
     }
 
     self.mutex.lockUncancelable(self.io);
     defer self.mutex.unlock(self.io);
     while ((self.events.items.len >= self.limits.max_queued_events or
-        self.queued_event_bytes > self.limits.max_queued_event_bytes - owned.retained_bytes) and
+        self.queued_event_bytes > self.limits.max_queued_event_bytes - owned.retained_bytes or
+        self.queued_event_items > self.limits.max_queued_event_items - owned.item_count) and
         !self.stop_requested)
     {
         self.condition.wait(self.io, &self.mutex) catch continue;
@@ -363,6 +373,7 @@ fn emitSessionEvent(
     if (self.stop_requested) return error.ConsumerStopped;
     self.events.appendAssumeCapacity(owned);
     self.queued_event_bytes += owned.retained_bytes;
+    self.queued_event_items += owned.item_count;
     self.condition.broadcast(self.io);
 }
 
@@ -379,9 +390,12 @@ const TestOwner = struct {
     ) !*TestOwner {
         const self = try allocator.create(TestOwner);
         errdefer allocator.destroy(self);
+        // The session takes ownership of its own dedicated handle so the
+        // caller's TmpDir handle is not closed twice.
+        const session_cwd = try cwd.openDir(std.testing.io, ".", .{});
         self.* = .{
             .allocator = allocator,
-            .session_value = try AgentSession.init(allocator, std.testing.io, model, cwd, .{}),
+            .session_value = try AgentSession.init(allocator, std.testing.io, model, session_cwd, .{}),
             .disposed = disposed,
         };
         return self;
@@ -578,6 +592,61 @@ test "worker rejects an event larger than its aggregate queue bound without bloc
         error.EventConsumerStopped,
         batch.completions.items[0].outcome.failed,
     );
+}
+
+test "worker rejects a zero event item limit as invalid" {
+    var scripted: ai.testing.ScriptedModel = .{
+        .identity = .{ .provider = "script", .model = "worker-item-invalid" },
+        .steps = &.{.{ .text = "unused" }},
+    };
+    var disposed = std.atomic.Value(bool).init(false);
+    const owner = try TestOwner.create(
+        std.testing.allocator,
+        scripted.asModel(),
+        .cwd(),
+        &disposed,
+    );
+    try std.testing.expectError(error.InvalidWorkerLimits, TurnWorker.start(
+        std.testing.allocator,
+        std.testing.io,
+        SessionOwner.from(owner),
+        .{ .max_queued_event_items = 0 },
+    ));
+    owner.deinit();
+}
+
+test "worker tracks aggregate queued event items across batch transfer" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var scripted: ai.testing.ScriptedModel = .{
+        .identity = .{ .provider = "script", .model = "worker-item-sum" },
+        .steps = &.{.{ .text = "answer" }},
+    };
+    var disposed = std.atomic.Value(bool).init(false);
+    const owner = try TestOwner.create(
+        std.testing.allocator,
+        scripted.asModel(),
+        temporary.dir,
+        &disposed,
+    );
+    var worker = try TurnWorker.start(
+        std.testing.allocator,
+        std.testing.io,
+        SessionOwner.from(owner),
+        .{},
+    );
+    defer worker.deinit();
+
+    try worker.submit("count the items");
+    worker.waitUntilIdle();
+    const queued_before = worker.snapshot().queued_event_items;
+    try std.testing.expect(queued_before > 0);
+    var batch = try worker.takeBatch();
+    defer batch.deinit(std.testing.allocator);
+    var sum: usize = 0;
+    for (batch.events.items) |event| sum += event.item_count;
+    try std.testing.expectEqual(queued_before, sum);
+    try std.testing.expectEqual(@as(usize, 0), worker.snapshot().queued_event_items);
 }
 
 test "worker validates submissions and disposes its session on its worker thread" {

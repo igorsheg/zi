@@ -20,6 +20,7 @@ pub const Request = struct {
     credential: credential.Credential.OAuth,
     now_ms: u64,
     cancellation: ?*const model.CancellationToken = null,
+    deadline: ?std.Io.Clock.Timestamp = null,
 };
 
 pub const LoginMethod = enum {

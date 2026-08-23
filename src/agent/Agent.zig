@@ -340,6 +340,7 @@ fn runTurns(self: *Agent, run_id: event_api.RunId, control: RunControl) TurnErro
 
         var tool_results: std.ArrayList(ai_message.ToolResult) = .empty;
         defer tool_results.deinit(self.allocator);
+        var committed_tool_results: usize = 0;
         if (call_count > self.limits.max_tool_calls -| self.tool_call_count) {
             try self.emit(.{ .turn_end = .{
                 .run_id = run_id,
@@ -374,6 +375,8 @@ fn runTurns(self: *Agent, run_id: event_api.RunId, control: RunControl) TurnErro
                 const result_parts = [_]ai_message.RequestPart{.{ .tool_result = result }};
                 self.commitMessage(.tool_result, .{ .request = .{ .parts = &result_parts } }) catch |failure|
                     return self.discardToolExecution(run_id, turn_index, response_end, call, failure);
+                committed_tool_results += 1;
+                if (committed_tool_results == call_count) self.context.completeToolExchange();
                 const stored_result_message = self.history.messages()[self.history.messages().len - 1];
                 const stored_result = stored_result_message.request;
                 try tool_results.append(self.allocator, stored_result.parts[0].tool_result);
@@ -389,7 +392,6 @@ fn runTurns(self: *Agent, run_id: event_api.RunId, control: RunControl) TurnErro
             else => {},
         };
 
-        if (call_count > 0) self.context.completeToolExchange();
         try self.emit(.{ .turn_end = .{
             .run_id = run_id,
             .index = turn_index,
@@ -1587,6 +1589,59 @@ test "agent streams a tool loop with owned canonical history" {
     try std.testing.expectEqual(.part_end, collector.entries[2].tag);
     try std.testing.expect(collector.completed_tool_call_valid);
     try std.testing.expectEqual(.part_start, collector.entries[3].tag);
+}
+
+const FinalToolEndFailSink = struct {
+    fn emit(_: *anyopaque, value: Event) event_api.SinkError!void {
+        if (value == .tool_execution_end and value.tool_execution_end.result == .published) {
+            return error.ConsumerStopped;
+        }
+    }
+};
+
+test "final tool end delivery failure retains the fully committed exchange" {
+    var scripted_model: ai_testing.ScriptedModel = .{
+        .identity = .{ .provider = "script", .model = "tool-end-fail" },
+        .steps = &.{.{ .tool_call = .{
+            .id = "call-1",
+            .name = "read",
+            .arguments_json = "{}",
+        } }},
+    };
+    var scripted_tool: agent_testing.ScriptedTool = .{ .result = "contents" };
+    const tool = scripted_tool.asTool(.{
+        .name = "read",
+        .description = "",
+        .parameters_json_schema = "{}",
+    });
+    var sink_state: u8 = 0;
+    var agent = try Agent.init(
+        std.testing.allocator,
+        std.testing.io,
+        scripted_model.asModel(),
+        &.{},
+        &.{tool},
+        .{},
+        .{ .context = &sink_state, .emitFn = FinalToolEndFailSink.emit },
+    );
+    defer agent.deinit();
+
+    try std.testing.expectError(error.EventConsumerStopped, agent.run("read"));
+    try std.testing.expectEqual(@as(usize, 3), agent.messages().len);
+    try std.testing.expectEqual(
+        agent.messages().len,
+        agent.context.abandoned(agent.messages().len),
+    );
+
+    var reopened: context_projection.State = .{};
+    for (agent.messages(), 0..) |entry, index| switch (entry) {
+        .response => |response| reopened.publishResponse(index, response),
+        .request => |request| for (request.parts) |part| switch (part) {
+            .tool_result => reopened.completeToolExchange(),
+            else => {},
+        },
+    };
+    try std.testing.expectEqual(agent.messages().len, reopened.abandoned(agent.messages().len));
 }
 
 const EventFailSink = struct {

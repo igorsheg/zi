@@ -166,10 +166,17 @@ pub const Configured = struct {
                 scratch_allocator,
                 io,
                 self.transport,
+                .{ .cancellation = request.cancellation, .deadline = request.deadline },
                 self.definition.auth,
                 self.definition.id,
                 self.auth_inputs,
-            ) catch return error.InvalidRequest
+            ) catch |auth_failure| return switch (auth_failure) {
+                error.OutOfMemory => error.OutOfMemory,
+                error.Cancelled => error.Cancelled,
+                error.TimedOut => error.TimedOut,
+                error.InvalidRequest => error.InvalidRequest,
+                error.ProviderUnavailable => error.ProviderUnavailable,
+            }
         else
             auth_api.resolve(
                 self.definition.auth,
@@ -259,6 +266,110 @@ test "registry resolves borrowed provider models without central dispatch" {
     try std.testing.expect(registry.resolve(stub.identity) != null);
     try std.testing.expect(registry.resolve(.{ .provider = "stub", .model = "missing" }) == null);
     try std.testing.expectError(error.DuplicateProvider, registry.register(stub.provider()));
+}
+
+test "configured provider forwards auth control and preserves resolver failures" {
+    const StubProtocol = struct {
+        const Self = @This();
+
+        pub fn profile(_: *const Self, _: protocol_api.ProfileHints) settings.ModelProfile {
+            return .{};
+        }
+        pub fn invoke(
+            _: *const Self,
+            allocator: std.mem.Allocator,
+            _: std.mem.Allocator,
+            _: std.Io,
+            _: protocol_api.Invocation,
+            identity: message.ModelIdentity,
+            _: model_api.ModelRequest,
+            _: model_api.Delivery,
+        ) model_api.ModelError!message.ResponseMessage {
+            return .{ .identity = identity, .parts = try allocator.alloc(message.ResponsePart, 0) };
+        }
+    };
+    const ResolverState = struct {
+        const Self = @This();
+
+        failure: ?auth_api.ResolverError = null,
+        expected_cancellation: ?*const model_api.CancellationToken = null,
+        expected_deadline: ?std.Io.Clock.Timestamp = null,
+        saw_control: bool = false,
+
+        // Context leads because this callback implements the erased resolver ABI.
+        // ziglint-ignore: Z023
+        fn resolve(
+            context: *anyopaque,
+            _: std.mem.Allocator, // ziglint-ignore: Z023
+            _: std.mem.Allocator, // ziglint-ignore: Z023
+            _: std.Io, // ziglint-ignore: Z023
+            _: transport_api.Transport,
+            control: auth_api.RequestControl,
+            _: auth_api.ProviderAuth,
+            _: []const u8,
+            _: auth_api.Inputs,
+        ) auth_api.ResolverError!auth_api.ModelAuth {
+            const self: *Self = @ptrCast(@alignCast(context));
+            self.saw_control = control.cancellation == self.expected_cancellation and
+                control.deadline != null and self.expected_deadline != null and
+                std.meta.eql(control.deadline.?, self.expected_deadline.?);
+            if (self.failure) |failure_value| return failure_value;
+            return .{};
+        }
+    };
+    const entries = [_]model_catalog.Entry{.{
+        .identity = .{ .provider = "auth", .model = "controlled" },
+        .protocol_id = "auth-wire",
+        .profile = .{},
+    }};
+    const implementation: StubProtocol = .{};
+    const protocols = [_]protocol_api.Protocol{protocol_api.Protocol.from(&implementation, "auth-wire")};
+    var fake = fake_transport.FakeTransport.init(&.{});
+    var token: model_api.CancellationToken = .{};
+    const deadline = std.Io.Clock.Timestamp.fromNow(std.testing.io, .{
+        .raw = .fromSeconds(30),
+        .clock = .awake,
+    });
+    var resolver_state: ResolverState = .{
+        .expected_cancellation = &token,
+        .expected_deadline = deadline,
+    };
+    var configured: Configured = .{
+        .transport = fake.transport(),
+        .protocols = try protocol_api.Registry.init(&protocols),
+        .catalog = .{ .entries = &entries },
+        .definition = .{
+            .id = "auth",
+            .name = "Auth",
+            .base_url = "https://example.test",
+            .auth = .{ .allow_unauthenticated = true },
+        },
+        .auth_inputs = .{},
+        .auth_resolver = .{ .context = &resolver_state, .resolve_fn = ResolverState.resolve },
+    };
+    var response = try configured.model("controlled").?.complete(
+        std.testing.allocator,
+        std.testing.io,
+        .{ .messages = &.{}, .cancellation = &token, .deadline = deadline },
+    );
+    response.deinit();
+    try std.testing.expect(resolver_state.saw_control);
+
+    const failures = [_]auth_api.ResolverError{
+        error.OutOfMemory,
+        error.Cancelled,
+        error.TimedOut,
+        error.ProviderUnavailable,
+        error.InvalidRequest,
+    };
+    for (failures) |failure_value| {
+        resolver_state.failure = failure_value;
+        try std.testing.expectError(failure_value, configured.model("controlled").?.complete(
+            std.testing.allocator,
+            std.testing.io,
+            .{ .messages = &.{}, .cancellation = &token, .deadline = deadline },
+        ));
+    }
 }
 
 test "configured provider binds a non-OpenAI model through its protocol" {

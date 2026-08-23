@@ -1,6 +1,6 @@
 const std = @import("std");
 const agent = @import("../../agent/root.zig");
-const session_event = @import("../AgentSessionEvent.zig");
+const session_event = @import("../AgentSession.zig");
 
 const SessionPolicy = @This();
 

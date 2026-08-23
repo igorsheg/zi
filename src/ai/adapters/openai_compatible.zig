@@ -32,7 +32,7 @@ pub const OpenAiCompatible = struct {
         request: model_api.ModelRequest,
         delivery: model_api.Delivery,
     ) failure.ModelError!message.ResponseMessage {
-        try request.validateHandoff(identity.provider, null);
+        try request.validateHandoff(identity, null);
         const streaming = switch (delivery) {
             .buffered => false,
             .streaming => true,

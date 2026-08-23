@@ -49,7 +49,7 @@ your latest change.
 ### What the binary does today
 
 `src/main.zig` delegates process adaptation and dispatch to
-`src/coding_agent/cli/entry.zig`. The built binary exposes the surface printed
+`src/coding_agent/cli/root.zig`. The built binary exposes the surface printed
 by `./zig-out/bin/zi --help`.
 Treat that output and the composition code as the authority. Do not infer
 interactive, JSON, or RPC support from parser types that the process rejects.
@@ -178,7 +178,9 @@ Module ownership (stable boundaries):
   selection, durable journal, commits, on-disk format), the runtime that admits
   a model and its credentials, cwd-bound tools, `ZiPaths`, model config and
   resolution, the CLI process adapter, the serialized turn worker, and
-  presentation-neutral interactive behavior.
+  presentation-neutral interactive behavior. `Tools.Workspace` owns the
+  admitted `std.Io` and cwd handle, `AgentSession` owns its `Tools.Toolset`, and
+  `Runtime` transfers cwd ownership instead of retaining a second owner.
 - `src/terminal_render/` owns frontend-neutral terminal text and frame mechanics:
   Unicode grapheme boundaries and display width, frame-owned grapheme storage,
   cells and styles, surfaces, semantic frame diffs, and error-returning ANSI
@@ -191,9 +193,9 @@ Module ownership (stable boundaries):
   public coding-agent interactive and terminal-render contracts.
 - `src/BoundedJson.zig` is the shared bounded JSON helper. Domain-specific
   validation stays with the owning module.
-- `src/coding_agent/BoundedTextFile.zig` shares optional bounded UTF-8 file-read
-  mechanics inside `coding_agent`. Discovery, limits, and diagnostics stay with
-  each resource owner.
+- `Prompt.BoundedTextFile` in `src/coding_agent/Prompt.zig` shares optional
+  bounded UTF-8 file-read mechanics inside `coding_agent`. Discovery, limits,
+  and diagnostics stay with each resource owner.
 - `data/model_catalog.json` plus `tools/model_catalog.zig` own catalog
   generation. The compiled snapshot lives in `src/ai/model_catalog_snapshot.zig`.
 
@@ -228,23 +230,23 @@ root. Feature owners define their directories and files beneath those roots.
 Settings, credentials, resources, and persistent session creation consume the
 cwd-bound roots. Do not join `.zi` or re-read process cwd inside those owners.
 
-`ProjectTrust` owns project prompt-file admission, and `ProjectTrustStore` owns
-canonical directory identities plus the bounded versioned
-`$HOME/.zi/agent/trust.json`. The nearest saved cwd or ancestor decision applies;
+`ProjectTrust` owns project prompt-file admission, canonical directory
+identities, and the bounded versioned `$HOME/.zi/agent/trust.json`. The nearest
+saved cwd or ancestor decision applies;
 without one, non-interactive automatic trust is closed. Store mutations consume
 the shared private-file transaction mechanics. Explicit approve
 and reject launch decisions override saved policy without persisting it. Trusted
 project prompt files resolve from the effective session cwd and shadow global
 prompt files independently by role.
 
-`RuntimeResources` owns invocation-scoped trust resolution, prompt-file and
-context discovery, and the effective prompt policy that borrows those owned
-resources. `RuntimeServices` sequences session selection, resources, model and
+`Runtime` owns invocation-scoped trust resolution, prompt-file and context
+discovery, and the effective prompt policy that borrows those owned resources.
+`Runtime.Services` sequences session selection, resources, model and
 credential admission, and runtime construction. It projects and owns the
-restored `SessionTranscript` before transferring the selected journal into the
+restored `Session.Transcript` before transferring the selected journal into the
 live runtime. Resource policy does not belong in that composition owner.
 
-`ContextFiles` owns bounded global and cwd-ancestor instruction discovery.
+`Prompt.ContextFiles` owns bounded global and cwd-ancestor instruction discovery.
 Ancestor instructions apply from broadest to narrowest scope regardless of
 project-resource trust.
 
@@ -256,15 +258,15 @@ runs. Ordinary provider, tool, cancellation, timeout, and bounded-resource
 settlement returns the agent to ready; indeterminate publication poisons the live
 agent until the durable session is reopened.
 
-`AgentSessionEvent` extends the core agent lifecycle with session facts such as
+`AgentSession.Event` extends the core agent lifecycle with session facts such as
 final settlement. It does not replace core payloads with rendering commands.
-`OwnedAgentSessionEvent` is the bounded arena-owned copy for worker or UI
-boundaries; presentation remains a downstream reducer. Canonical message and
+`AgentSession.Owned` is the bounded arena-owned copy for worker or UI boundaries;
+presentation remains a downstream reducer. Canonical message and
 stream owners provide bulk-lifetime copy operations so boundary owners do not
 reimplement nested message or provider-state copying. Only `TurnWorker` mutates
 or disposes a transferred `AgentSession`. It applies backpressure at bounded
-event-count and aggregate-byte limits rather than locking the agent or retaining
-borrowed callback data. `SessionTranscript` owns the presentation-neutral active
+event-count, aggregate-byte, and aggregate-item limits rather than locking the
+agent or retaining borrowed callback data. `Session.Transcript` owns the presentation-neutral active
 branch projection of restored journal entries. It preserves user, assistant,
 tool, model-change, failure, cancellation, and interruption facts independently
 of the cleaned provider-context projection. `coding_agent/interactive/` owns
@@ -274,8 +276,8 @@ stale-run, and poisoned-session transitions. `SessionController` applies that
 turn-only policy to `TurnWorker`. `InteractiveSessionHost` owns the model-less,
 runnable, transitioning, and unavailable lifecycle, exact-journal reopen inputs,
 login and model commands, auth activation, worker replacement, and borrowed
-interactive facts. `AuthOperation` owns the OAuth thread, cancellation, bounded
-owned interaction facts, and securely wiped prompt answers. The CLI owns process
+interactive facts. `Credentials.AuthOperation` owns the OAuth thread,
+cancellation, bounded owned interaction facts, and securely wiped prompt answers. The CLI owns process
 adaptation, initial runtime creation, host launch, frontend invocation, and exit
 mapping. It does not own terminal mechanics, input state, or rendering.
 
@@ -321,10 +323,11 @@ non-following path validation, mutation locks, and durable atomic replacement.
 Domain stores retain their own filenames, formats, limits, error mapping, and
 secret handling.
 
-`$HOME/.zi/agent/auth.json` is the durable credential authority. `CredentialStore`
-owns its bounded versioned format and secret wiping, and performs mutations
-through `PrivateFileStore`. OAuth refresh rechecks expiry while holding the store
-mutation lock and persists a rotated credential before releasing it.
+`$HOME/.zi/agent/auth.json` is the durable credential authority.
+`Credentials.Store` owns its bounded versioned format and secret wiping, and
+performs mutations through `PrivateFileStore`. OAuth refresh rechecks expiry
+while holding the store mutation lock, consumes the model request cancellation
+and deadline, and persists a rotated credential before releasing the lock.
 
 ## Zig-specific patterns
 

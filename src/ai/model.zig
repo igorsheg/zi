@@ -19,7 +19,7 @@ pub const ModelRequest = struct {
 
     pub fn validateHandoff(
         self: ModelRequest,
-        provider_id: []const u8,
+        target: ModelIdentity,
         protocol_id: ?[]const u8,
     ) ModelError!void {
         if (self.handoff == .drop_foreign_state) return;
@@ -31,13 +31,45 @@ pub const ModelRequest = struct {
                     .thinking => |thinking| thinking.provider_state,
                     .tool_call => |tool_call| tool_call.provider_state,
                 } orelse continue;
-                if (!std.mem.eql(u8, state.provider, provider_id)) return error.HandoffRejected;
+                if (!std.mem.eql(u8, response.identity.provider, target.provider) or
+                    !std.mem.eql(u8, response.identity.model, target.model)) return error.HandoffRejected;
+                if (!std.mem.eql(u8, state.provider, target.provider)) return error.HandoffRejected;
                 const accepted = protocol_id orelse return error.HandoffRejected;
                 if (!std.mem.eql(u8, state.protocol, accepted)) return error.HandoffRejected;
             },
         };
     }
 };
+
+test "handoff validation requires exact provider protocol and model" {
+    const state: message.ProviderState = .{
+        .provider = "openai",
+        .protocol = "openai-responses",
+        .value = .null,
+    };
+    const parts = [_]message.ResponsePart{.{ .thinking = .{
+        .text = "reasoning",
+        .provider_state = state,
+    } }};
+    const messages = [_]message.Message{.{ .response = .{
+        .parts = &parts,
+        .identity = .{ .provider = "openai", .model = "source" },
+    } }};
+    const request: ModelRequest = .{ .messages = &messages, .handoff = .reject_foreign_state };
+    try request.validateHandoff(.{ .provider = "openai", .model = "source" }, "openai-responses");
+    try std.testing.expectError(
+        error.HandoffRejected,
+        request.validateHandoff(.{ .provider = "openai", .model = "target" }, "openai-responses"),
+    );
+    try std.testing.expectError(
+        error.HandoffRejected,
+        request.validateHandoff(.{ .provider = "other", .model = "source" }, "openai-responses"),
+    );
+    try std.testing.expectError(
+        error.HandoffRejected,
+        request.validateHandoff(.{ .provider = "openai", .model = "source" }, "other-protocol"),
+    );
+}
 
 pub const HandoffPolicy = enum {
     reject_foreign_state,

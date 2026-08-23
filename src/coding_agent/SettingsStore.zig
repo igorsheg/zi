@@ -1,7 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const BoundedJson = @import("../BoundedJson.zig");
-const BoundedTextFile = @import("BoundedTextFile.zig");
+const Prompt = @import("Prompt.zig");
 const PrivateFileStore = @import("PrivateFileStore.zig");
 const ProjectTrust = @import("ProjectTrust.zig");
 const ZiPaths = @import("ZiPaths.zig");
@@ -300,7 +300,7 @@ fn loadGlobal(
     };
     defer directory.close(io);
 
-    const outcome = try BoundedTextFile.loadOptional(
+    const outcome = try Prompt.BoundedTextFile.loadOptional(
         allocator,
         io,
         directory,
@@ -346,7 +346,7 @@ fn loadProject(
     };
     defer directory.close(io);
 
-    const outcome = try BoundedTextFile.loadOptional(
+    const outcome = try Prompt.BoundedTextFile.loadOptional(
         allocator,
         io,
         directory,

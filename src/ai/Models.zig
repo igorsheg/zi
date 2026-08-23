@@ -213,12 +213,17 @@ fn validate(protocols: protocol_api.Registry, config: Config) Error!void {
             if (std.mem.eql(u8, previous.provider_id, entry.provider_id)) return error.InvalidConfiguration;
         }
     }
-    _ = resolveAuth(
-        config.catalog,
-        config.providers,
-        config.selection,
-        .{ .stored = config.credentials },
-    ) catch return error.InvalidConfiguration;
+    // A dynamic resolver is authoritative at invocation time, so static
+    // credentials may be absent. Registry resolution below still validates the
+    // selected provider and model during initialization.
+    if (config.auth_resolver == null) {
+        _ = resolveAuth(
+            config.catalog,
+            config.providers,
+            config.selection,
+            .{ .stored = config.credentials },
+        ) catch return error.InvalidConfiguration;
+    }
 }
 
 fn findProvider(providers: []const provider_api.Definition, id: []const u8) ?*const provider_api.Definition {

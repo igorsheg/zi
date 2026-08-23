@@ -66,6 +66,7 @@ fn encode(
             .text => |text| try writeAssistantText(
                 writer,
                 identity,
+                response.identity,
                 if (flavor == .codex) "openai-codex-responses" else "openai-responses",
                 text,
                 &wrote,
@@ -73,6 +74,7 @@ fn encode(
             .thinking => |thinking| try writeReasoningState(
                 writer,
                 identity,
+                response.identity,
                 if (flavor == .codex) "openai-codex-responses" else "openai-responses",
                 thinking,
                 &wrote,
@@ -81,6 +83,7 @@ fn encode(
                 allocator,
                 writer,
                 identity,
+                response.identity,
                 if (flavor == .codex) "openai-codex-responses" else "openai-responses",
                 call,
                 &wrote,
@@ -575,6 +578,7 @@ pub const StreamDecoder = struct {
                     .input_tokens = value.input_tokens -| cached_input -| cache_write,
                     .output_tokens = value.output_tokens,
                     .cached_input_tokens = cached_input,
+                    .cache_write_tokens = cache_write,
                     .reasoning_tokens = if (value.output_tokens_details) |details| details.reasoning_tokens else 0,
                 };
                 if (self.sink) |event_sink| try event_sink.emit(.{ .usage = self.usage });
@@ -584,7 +588,7 @@ pub const StreamDecoder = struct {
             {
                 const reason = if (response.incomplete_details) |details| details.reason else null;
                 self.finish_value = .{
-                    .category = .length,
+                    .category = incompleteFinishCategory(reason),
                     .raw_reason = if (reason) |value| try duplicate(self.allocator, value) else null,
                 };
             } else {
@@ -739,13 +743,22 @@ pub const StreamDecoder = struct {
 fn writeReasoningState(
     writer: *std.Io.Writer,
     identity: message.ModelIdentity,
+    source_identity: message.ModelIdentity,
     protocol_id: []const u8,
     thinking: message.ThinkingPart,
     wrote: *bool,
 ) failure.ModelError!void {
-    const state = thinking.provider_state orelse return;
-    if (!std.mem.eql(u8, state.provider, identity.provider) or
-        !std.mem.eql(u8, state.protocol, protocol_id)) return;
+    const state = thinking.provider_state orelse {
+        if (thinking.text.len > 0) try writeRoleText(writer, "assistant", "output_text", thinking.text, wrote);
+        return;
+    };
+    if (!sameIdentity(source_identity, identity) or
+        !std.mem.eql(u8, state.provider, identity.provider) or
+        !std.mem.eql(u8, state.protocol, protocol_id))
+    {
+        if (thinking.text.len > 0) try writeRoleText(writer, "assistant", "output_text", thinking.text, wrote);
+        return;
+    }
     if (state.value != .object) return error.InvalidRequest;
     const kind = state.value.object.get("type") orelse return error.InvalidRequest;
     const item_id = state.value.object.get("id") orelse return error.InvalidRequest;
@@ -761,6 +774,7 @@ fn writeReasoningState(
 fn writeAssistantText(
     writer: *std.Io.Writer,
     identity: message.ModelIdentity,
+    source_identity: message.ModelIdentity,
     protocol_id: []const u8,
     text: message.TextPart,
     wrote: *bool,
@@ -769,7 +783,8 @@ fn writeAssistantText(
         try writeRoleText(writer, "assistant", "output_text", text.text, wrote);
         return;
     };
-    if (!std.mem.eql(u8, state.provider, identity.provider) or
+    if (!sameIdentity(source_identity, identity) or
+        !std.mem.eql(u8, state.provider, identity.provider) or
         !std.mem.eql(u8, state.protocol, protocol_id))
     {
         try writeRoleText(writer, "assistant", "output_text", text.text, wrote);
@@ -823,6 +838,7 @@ fn writeToolCall(
     allocator: std.mem.Allocator,
     writer: *std.Io.Writer,
     identity: message.ModelIdentity,
+    source_identity: message.ModelIdentity,
     protocol_id: []const u8,
     call: message.ToolCall,
     wrote: *bool,
@@ -832,7 +848,8 @@ fn writeToolCall(
         error.InvalidJson => return error.InvalidRequest,
     };
     var item_id: ?[]const u8 = null;
-    if (call.provider_state) |state| if (std.mem.eql(u8, state.provider, identity.provider) and
+    if (call.provider_state) |state| if (sameIdentity(source_identity, identity) and
+        std.mem.eql(u8, state.provider, identity.provider) and
         std.mem.eql(u8, state.protocol, protocol_id))
     {
         if (state.value != .object) return error.InvalidRequest;
@@ -903,6 +920,18 @@ fn validateJson(allocator: std.mem.Allocator, value: []const u8) JsonValidationE
 
 fn duplicate(allocator: std.mem.Allocator, value: []const u8) failure.ModelError![]const u8 {
     return allocator.dupe(u8, value) catch return error.OutOfMemory;
+}
+
+fn sameIdentity(left: message.ModelIdentity, right: message.ModelIdentity) bool {
+    return std.mem.eql(u8, left.provider, right.provider) and
+        std.mem.eql(u8, left.model, right.model);
+}
+
+fn incompleteFinishCategory(reason: ?[]const u8) usage_api.FinishCategory {
+    const value = reason orelse return .unknown;
+    if (std.mem.eql(u8, value, "max_output_tokens")) return .length;
+    if (std.mem.eql(u8, value, "content_filter")) return .content_filter;
+    return .unknown;
 }
 
 fn hasTools(parts: []const StreamDecoder.Part) bool {

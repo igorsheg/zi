@@ -69,10 +69,7 @@ pub const OAuth = struct {
         form.append(&body.writer, "refresh_token", request.credential.refresh) catch return error.OutOfMemory;
         form.append(&body.writer, "client_id", client_id) catch return error.OutOfMemory;
 
-        const deadline = std.Io.Clock.Timestamp.fromNow(io, .{
-            .raw = .fromSeconds(15),
-            .clock = .awake,
-        });
+        const deadline = refreshDeadline(io, request.deadline);
         const response = try transport.exchange(scratch_allocator, io, .{
             .method = .POST,
             .url = token_url,
@@ -92,6 +89,19 @@ pub const OAuth = struct {
         );
     }
 };
+
+fn refreshDeadline(io: std.Io, request_deadline: ?std.Io.Clock.Timestamp) std.Io.Clock.Timestamp {
+    const refresh_deadline = std.Io.Clock.Timestamp.fromNow(io, .{
+        .raw = .fromSeconds(15),
+        .clock = .awake,
+    });
+    const requested = request_deadline orelse return refresh_deadline;
+    return if (requested.durationFromNow(io).raw.nanoseconds <=
+        refresh_deadline.durationFromNow(io).raw.nanoseconds)
+        requested
+    else
+        refresh_deadline;
+}
 
 fn loginBrowser(
     result_allocator: std.mem.Allocator,

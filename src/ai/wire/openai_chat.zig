@@ -109,7 +109,10 @@ pub fn decodeResponse(
         usage: ?struct {
             prompt_tokens: u64 = 0,
             completion_tokens: u64 = 0,
-            prompt_tokens_details: ?struct { cached_tokens: u64 = 0 } = null,
+            prompt_tokens_details: ?struct {
+                cached_tokens: u64 = 0,
+                cache_write_tokens: u64 = 0,
+            } = null,
             completion_tokens_details: ?struct { reasoning_tokens: u64 = 0 } = null,
         } = null,
     };
@@ -153,9 +156,12 @@ pub fn decodeResponse(
         .parts = parts.toOwnedSlice(allocator) catch return error.OutOfMemory,
         .identity = identity,
         .usage = if (wire_usage) |value| .{
-            .input_tokens = value.prompt_tokens,
+            .input_tokens = value.prompt_tokens -|
+                (if (value.prompt_tokens_details) |details| details.cached_tokens else 0) -|
+                (if (value.prompt_tokens_details) |details| details.cache_write_tokens else 0),
             .output_tokens = value.completion_tokens,
             .cached_input_tokens = if (value.prompt_tokens_details) |details| details.cached_tokens else 0,
+            .cache_write_tokens = if (value.prompt_tokens_details) |details| details.cache_write_tokens else 0,
             .reasoning_tokens = if (value.completion_tokens_details) |details| details.reasoning_tokens else 0,
         } else .{},
         .finish = try finish(allocator, finish_reason),
@@ -339,7 +345,10 @@ pub const StreamDecoder = struct {
             usage: ?struct {
                 prompt_tokens: u64 = 0,
                 completion_tokens: u64 = 0,
-                prompt_tokens_details: ?struct { cached_tokens: u64 = 0 } = null,
+                prompt_tokens_details: ?struct {
+                    cached_tokens: u64 = 0,
+                    cache_write_tokens: u64 = 0,
+                } = null,
                 completion_tokens_details: ?struct { reasoning_tokens: u64 = 0 } = null,
             } = null,
         };
@@ -351,9 +360,12 @@ pub const StreamDecoder = struct {
         defer parsed.deinit();
         if (parsed.value.usage) |value| {
             self.usage = .{
-                .input_tokens = value.prompt_tokens,
+                .input_tokens = value.prompt_tokens -|
+                    (if (value.prompt_tokens_details) |details| details.cached_tokens else 0) -|
+                    (if (value.prompt_tokens_details) |details| details.cache_write_tokens else 0),
                 .output_tokens = value.completion_tokens,
                 .cached_input_tokens = if (value.prompt_tokens_details) |details| details.cached_tokens else 0,
+                .cache_write_tokens = if (value.prompt_tokens_details) |details| details.cache_write_tokens else 0,
                 .reasoning_tokens = if (value.completion_tokens_details) |details| details.reasoning_tokens else 0,
             };
             if (self.sink) |event_sink| try event_sink.emit(.{ .usage = self.usage });
@@ -536,6 +548,37 @@ fn writeAssistant(
 
 fn writeJson(writer: *std.Io.Writer, value: anytype) !void {
     try std.json.Stringify.value(value, .{}, writer);
+}
+
+test "Chat buffered and streamed usage separates uncached reads and writes" {
+    const identity: message.ModelIdentity = .{ .provider = "openai", .model = "chat" };
+    const buffered =
+        "{\"choices\":[{\"message\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]," ++
+        "\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":3," ++
+        "\"prompt_tokens_details\":{\"cached_tokens\":2,\"cache_write_tokens\":1}}}";
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const decoded = try decodeResponse(arena.allocator(), identity, buffered);
+    try std.testing.expectEqual(@as(u64, 2), decoded.usage.input_tokens);
+    try std.testing.expectEqual(@as(u64, 2), decoded.usage.cached_input_tokens);
+    try std.testing.expectEqual(@as(u64, 1), decoded.usage.cache_write_tokens);
+    try std.testing.expectEqual(@as(u64, 3), decoded.usage.output_tokens);
+
+    var decoder = StreamDecoder.init(arena.allocator(), std.testing.allocator, identity, null);
+    defer decoder.deinit();
+    const sink = decoder.bodySink();
+    try sink.start(.{ .status = 200 });
+    try sink.chunk(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n" ++
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":3," ++
+            "\"prompt_tokens_details\":{\"cached_tokens\":2,\"cache_write_tokens\":1}}}\n\n" ++
+            "data: [DONE]\n\n",
+    );
+    const streamed = try decoder.result();
+    try std.testing.expectEqual(@as(u64, 2), streamed.usage.input_tokens);
+    try std.testing.expectEqual(@as(u64, 2), streamed.usage.cached_input_tokens);
+    try std.testing.expectEqual(@as(u64, 1), streamed.usage.cache_write_tokens);
+    try std.testing.expectEqual(@as(u64, 3), streamed.usage.output_tokens);
 }
 
 fn duplicate(allocator: std.mem.Allocator, value: []const u8) failure.ModelError![]const u8 {

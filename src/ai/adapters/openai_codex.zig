@@ -37,7 +37,7 @@ pub const OpenAiCodex = struct {
         request: model_api.ModelRequest,
         delivery: model_api.Delivery,
     ) failure.ModelError!message.ResponseMessage {
-        try request.validateHandoff(identity.provider, id);
+        try request.validateHandoff(identity, id);
         const access_token = invocation.auth.api_key orelse return error.InvalidRequest;
         if (access_token.len == 0) return error.InvalidRequest;
         const account_id = if (invocation.auth.account_id) |value|

@@ -37,7 +37,7 @@ pub const OpenAiResponses = struct {
         request: model_api.ModelRequest,
         delivery: model_api.Delivery,
     ) failure.ModelError!message.ResponseMessage {
-        try request.validateHandoff(identity.provider, "openai-responses");
+        try request.validateHandoff(identity, "openai-responses");
         const body = try openai_responses.encodeRequest(scratch_allocator, identity, request);
         defer {
             std.crypto.secureZero(u8, @constCast(body));

@@ -7,7 +7,9 @@ const protocol_api = @import("../protocol.zig");
 const provider_api = @import("../provider.zig");
 const responses = @import("openai_responses.zig");
 const settings = @import("../settings.zig");
+const stream = @import("../stream.zig");
 const transport = @import("../transport.zig");
+const usage = @import("../usage.zig");
 
 const profile = profile: {
     var value: settings.ModelProfile = .{
@@ -125,6 +127,7 @@ test "OpenAI Responses crosses catalog model protocol and transport seams" {
     try std.testing.expectEqualStrings("Hello", result.value.parts[1].text.text);
     try std.testing.expectEqual(@as(u64, 2), result.value.usage.input_tokens);
     try std.testing.expectEqual(@as(u64, 2), result.value.usage.cached_input_tokens);
+    try std.testing.expectEqual(@as(u64, 1), result.value.usage.cache_write_tokens);
     const replay_messages = [_]message.Message{.{ .response = result.value }};
     const replay_body = try openai_responses.encodeRequest(
         std.testing.allocator,
@@ -135,6 +138,15 @@ test "OpenAI Responses crosses catalog model protocol and transport seams" {
     try std.testing.expect(std.mem.indexOf(u8, replay_body, "\"encrypted_content\":\"enc\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, replay_body, "\"id\":\"msg_1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, replay_body, "\"phase\":\"final_answer\"") != null);
+
+    const handoff_body = try openai_responses.encodeRequest(
+        std.testing.allocator,
+        .{ .provider = "openai", .model = "other-model" },
+        .{ .messages = &replay_messages },
+    );
+    defer std.testing.allocator.free(handoff_body);
+    try std.testing.expect(std.mem.indexOf(u8, handoff_body, "\"encrypted_content\":\"enc\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, handoff_body, "\"text\":\"why\"") != null);
 }
 
 test "Responses encoder gives empty tool results explicit output" {
@@ -212,6 +224,68 @@ test "Responses decoder retains reasoning refusal and terminal encrypted state" 
         "terminal-enc",
         result.value.parts[0].thinking.provider_state.?.value.object.get("encrypted_content").?.string,
     );
+}
+
+test "Responses incomplete reasons preserve raw provider detail and normalize categories" {
+    const cases = [_]struct { reason: []const u8, category: usage.FinishCategory }{
+        .{ .reason = "max_output_tokens", .category = .length },
+        .{ .reason = "content_filter", .category = .content_filter },
+        .{ .reason = "other", .category = .unknown },
+    };
+    for (cases) |case| {
+        const body = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "data: {{\"type\":\"response.incomplete\",\"response\":{{\"status\":\"incomplete\"," ++
+                "\"incomplete_details\":{{\"reason\":\"{s}\"}}}}}}\n",
+            .{case.reason},
+        );
+        defer std.testing.allocator.free(body);
+        const exchanges = [_]fake_api.Exchange{.{ .response = .{ .status = 200, .body = body } }};
+        var fake = fake_api.FakeTransport.init(&exchanges);
+        var provider = makeProvider(fake.transport(), null);
+        var result = try provider.model("gpt-test").?.complete(
+            std.testing.allocator,
+            std.testing.io,
+            .{ .messages = &.{} },
+        );
+        defer result.deinit();
+        try std.testing.expectEqual(case.category, result.value.finish.category);
+        try std.testing.expectEqualStrings(case.reason, result.value.finish.raw_reason.?);
+    }
+}
+
+test "Responses application streaming preserves incomplete reason categories" {
+    const Sink = struct {
+        fn emit(_: *anyopaque, _: stream.StreamEvent) stream.StreamSinkError!void {}
+    };
+    var sink_context: u8 = 0;
+    const sink: stream.StreamSink = .{ .context = &sink_context, .emitFn = Sink.emit };
+    const cases = [_]struct { reason: []const u8, category: usage.FinishCategory }{
+        .{ .reason = "max_output_tokens", .category = .length },
+        .{ .reason = "content_filter", .category = .content_filter },
+        .{ .reason = "other", .category = .unknown },
+    };
+    for (cases) |case| {
+        const body = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "data: {{\"type\":\"response.incomplete\",\"response\":{{\"status\":\"incomplete\"," ++
+                "\"incomplete_details\":{{\"reason\":\"{s}\"}}}}}}\n",
+            .{case.reason},
+        );
+        defer std.testing.allocator.free(body);
+        const exchanges = [_]fake_api.Exchange{.{ .response = .{ .status = 200, .body = body } }};
+        var fake = fake_api.FakeTransport.init(&exchanges);
+        var provider = makeProvider(fake.transport(), null);
+        var result = try provider.model("gpt-test").?.stream(
+            std.testing.allocator,
+            std.testing.io,
+            .{ .messages = &.{} },
+            sink,
+        );
+        defer result.deinit();
+        try std.testing.expectEqual(case.category, result.value.finish.category);
+        try std.testing.expectEqualStrings(case.reason, result.value.finish.raw_reason.?);
+    }
 }
 
 test "Responses decoder rejects provider error events" {

@@ -188,6 +188,7 @@ pub const Restored = struct {
     header: Header,
     entries: []const Entry,
     active_leaf_id: ?[]const u8,
+    active_entries: []const Entry,
     active_model: ?ai_message.ModelIdentity,
     context_messages: []const ai_message.Message,
     recovery: Recovery,
@@ -268,6 +269,7 @@ pub const Restorer = struct {
                 null
             else
                 self.entries.items[self.entries.items.len - 1].base().id,
+            .active_entries = projection.active_entries,
             .active_model = projection.active_model,
             .context_messages = projection.context_messages,
             .recovery = projection.recovery,
@@ -399,6 +401,7 @@ const WireUsage = struct {
     inputTokens: u64,
     outputTokens: u64,
     cachedInputTokens: u64,
+    cacheWriteTokens: u64 = 0,
     reasoningTokens: u64,
 };
 
@@ -442,15 +445,18 @@ fn decodeEntry(
     encoded: []const u8,
 ) Error!Entry {
     try preflight(scratch, error.InvalidRecord, encoded, max_record_bytes);
-    const kind = std.json.parseFromSliceLeaky(WireRecordKind, allocator, encoded, .{
-        .allocate = .alloc_always,
+    // The discriminator is dispatch-only; parse it with a temporary owned
+    // parse on the scratch allocator and release it before the concrete wire
+    // record is parsed into the restoration arena.
+    const kind = std.json.parseFromSlice(WireRecordKind, scratch, encoded, .{
         .ignore_unknown_fields = true,
         .max_value_len = max_value_bytes,
     }) catch |failure| return switch (failure) {
         error.OutOfMemory => error.OutOfMemory,
         else => error.InvalidRecord,
     };
-    if (std.mem.eql(u8, kind.type, "message")) {
+    defer kind.deinit();
+    if (std.mem.eql(u8, kind.value.type, "message")) {
         const wire = try parseWire(WireMessageEntry, allocator, encoded);
         if (!std.mem.eql(u8, wire.type, "message")) return error.InvalidRecord;
         const base = try decodeBase(.{
@@ -463,7 +469,7 @@ fn decodeEntry(
             .message = try decodeMessage(scratch, allocator, wire.message),
         } };
     }
-    if (std.mem.eql(u8, kind.type, "model_change")) {
+    if (std.mem.eql(u8, kind.value.type, "model_change")) {
         const wire = try parseWire(WireModelChangeEntry, allocator, encoded);
         if (!std.mem.eql(u8, wire.type, "model_change")) return error.InvalidRecord;
         try validateIdentifier(error.InvalidRecord, wire.provider, max_provider_id_bytes);
@@ -477,7 +483,7 @@ fn decodeEntry(
             .selection = .{ .provider = wire.provider, .model = wire.modelId },
         } };
     }
-    if (std.mem.eql(u8, kind.type, "turn_end")) {
+    if (std.mem.eql(u8, kind.value.type, "turn_end")) {
         const wire = try parseWire(WireTurnEndEntry, allocator, encoded);
         if (!std.mem.eql(u8, wire.type, "turn_end")) return error.InvalidRecord;
         try validateIdentifier(error.InvalidRecord, wire.turnId, max_id_bytes);
@@ -632,6 +638,7 @@ fn decodeResponse(
             .input_tokens = wire.usage.inputTokens,
             .output_tokens = wire.usage.outputTokens,
             .cached_input_tokens = wire.usage.cachedInputTokens,
+            .cache_write_tokens = wire.usage.cacheWriteTokens,
             .reasoning_tokens = wire.usage.reasoningTokens,
         },
         .finish = .{
@@ -774,6 +781,7 @@ fn formatTimestamp(buffer: *[24]u8, unix_ms: u64) Error!void {
 
 const Projection = struct {
     active_model: ?ai_message.ModelIdentity,
+    active_entries: []const Entry,
     context_messages: []const ai_message.Message,
     recovery: Recovery,
 };
@@ -816,6 +824,9 @@ fn project(
         std.mem.reverse(usize, path.items);
     }
 
+    const active_entries = try allocator.alloc(Entry, path.items.len);
+    for (path.items, 0..) |index, slot| active_entries[slot] = entries[index];
+
     var context: std.ArrayList(ai_message.Message) = .empty;
     var active_model: ?ai_message.ModelIdentity = null;
     var turn: ProjectionTurn = .idle;
@@ -852,6 +863,7 @@ fn project(
     };
     return .{
         .active_model = active_model,
+        .active_entries = active_entries,
         .context_messages = context.items,
         .recovery = recovery,
     };
@@ -1237,6 +1249,7 @@ fn writeUsage(json: *std.json.Stringify, usage: ai_usage.Usage) Error!void {
     try writeField(json, "inputTokens", usage.input_tokens);
     try writeField(json, "outputTokens", usage.output_tokens);
     try writeField(json, "cachedInputTokens", usage.cached_input_tokens);
+    try writeField(json, "cacheWriteTokens", usage.cache_write_tokens);
     try writeField(json, "reasoningTokens", usage.reasoning_tokens);
     json.endObject() catch return error.OutOfMemory;
 }
@@ -1303,7 +1316,12 @@ test "session format round trips a completed tool turn" {
                 .provider_state = provider_state,
             } }},
             .identity = .{ .provider = "openai", .model = "gpt-5.2" },
-            .usage = .{ .input_tokens = 10, .output_tokens = 4, .cached_input_tokens = 2 },
+            .usage = .{
+                .input_tokens = 10,
+                .output_tokens = 4,
+                .cached_input_tokens = 2,
+                .cache_write_tokens = 1,
+            },
             .finish = .{ .category = .tool_calls, .raw_reason = "tool_calls" },
         } },
     } });
@@ -1350,11 +1368,32 @@ test "session format round trips a completed tool turn" {
         "opaque-state",
         restored.context_messages[1].response.parts[0].tool_call.provider_state.?.value.string,
     );
+    try std.testing.expectEqual(@as(u64, 1), restored.context_messages[1].response.usage.cache_write_tokens);
     try std.testing.expectEqualStrings(
         "contents",
         restored.context_messages[2].request.parts[0].tool_result.content[0].text,
     );
     try std.testing.expect(restored.recovery == .clean);
+}
+
+test "session usage accepts old journals and preserves cache writes" {
+    var old = try std.json.parseFromSlice(
+        WireUsage,
+        std.testing.allocator,
+        "{\"inputTokens\":5,\"outputTokens\":2,\"cachedInputTokens\":1,\"reasoningTokens\":0}",
+        .{},
+    );
+    defer old.deinit();
+    try std.testing.expectEqual(@as(u64, 0), old.value.cacheWriteTokens);
+
+    var current = try std.json.parseFromSlice(
+        WireUsage,
+        std.testing.allocator,
+        "{\"inputTokens\":5,\"outputTokens\":2,\"cachedInputTokens\":1,\"cacheWriteTokens\":2,\"reasoningTokens\":0}",
+        .{},
+    );
+    defer current.deinit();
+    try std.testing.expectEqual(@as(u64, 2), current.value.cacheWriteTokens);
 }
 
 test "session restore trims unresolved tool protocol but retains durable entries" {

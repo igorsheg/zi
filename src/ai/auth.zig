@@ -1,5 +1,6 @@
 const std = @import("std");
 const credential_api = @import("credential.zig");
+const model_api = @import("model.zig");
 const oauth_api = @import("oauth.zig");
 const transport = @import("transport.zig");
 
@@ -51,6 +52,19 @@ pub const Inputs = struct {
     environment: Environment = .{},
 };
 
+pub const RequestControl = struct {
+    cancellation: ?*const model_api.CancellationToken = null,
+    deadline: ?std.Io.Clock.Timestamp = null,
+};
+
+pub const ResolverError = error{
+    OutOfMemory,
+    Cancelled,
+    TimedOut,
+    InvalidRequest,
+    ProviderUnavailable,
+};
+
 pub const Resolver = struct {
     context: *anyopaque,
     resolve_fn: *const fn (
@@ -59,10 +73,11 @@ pub const Resolver = struct {
         std.mem.Allocator,
         std.Io,
         transport.Transport,
+        RequestControl,
         ProviderAuth,
         []const u8,
         Inputs,
-    ) anyerror!ModelAuth,
+    ) ResolverError!ModelAuth,
 
     pub fn resolve(
         self: Resolver,
@@ -70,16 +85,18 @@ pub const Resolver = struct {
         scratch_allocator: std.mem.Allocator,
         io: std.Io,
         transport_value: transport.Transport,
+        control: RequestControl,
         policy: ProviderAuth,
         provider_id: []const u8,
         inputs: Inputs,
-    ) anyerror!ModelAuth {
+    ) ResolverError!ModelAuth {
         return self.resolve_fn(
             self.context,
             result_allocator,
             scratch_allocator,
             io,
             transport_value,
+            control,
             policy,
             provider_id,
             inputs,

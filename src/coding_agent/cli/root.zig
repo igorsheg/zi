@@ -1,14 +1,17 @@
 const std = @import("std");
 const ai = @import("../../ai/root.zig");
-const AgentSession = @import("../AgentSession.zig");
-const CredentialManager = @import("../CredentialManager.zig");
-const ModelConfigSnapshot = @import("../ModelConfigSnapshot.zig");
+const AgentSession = @import("../AgentSession.zig").AgentSession;
+const Credentials = @import("../Credentials.zig");
+const CredentialManager = Credentials.Manager;
+const Model = @import("../Model.zig");
+const ModelConfigSnapshot = Model.Snapshot;
 const ProjectTrust = @import("../ProjectTrust.zig");
-const ProjectTrustStore = @import("../ProjectTrustStore.zig");
-const ReopenInputs = @import("../ReopenInputs.zig");
-const RuntimeServices = @import("../RuntimeServices.zig");
+const Runtime = @import("../Runtime.zig");
+const ReopenInputs = Runtime.ReopenInputs;
+const RuntimeServices = Runtime.Services;
 const SessionFormat = @import("../SessionFormat.zig");
-const SystemPrompt = @import("../SystemPrompt.zig");
+const Prompt = @import("../Prompt.zig");
+const SystemPrompt = Prompt.SystemPrompt;
 const ZiPaths = @import("../ZiPaths.zig");
 const interactive = @import("../interactive/root.zig");
 const surface = @import("surface.zig");
@@ -111,7 +114,8 @@ fn runAuthInvocation(
         try stderr.writeAll("Unable to log in: HOME is not set.\n");
         return 1;
     };
-    var stdin_buffer: [64 * 1024]u8 = undefined;
+    var stdin_buffer: [auth_input_buffer_bytes]u8 = undefined;
+    defer wipeAuthInputBuffer(&stdin_buffer);
     var stdin_file = std.Io.File.Reader.init(.stdin(), io, &stdin_buffer);
     return executeAuth(request, .{
         .allocator = allocator,
@@ -685,6 +689,7 @@ fn writeFailure(
 }
 
 const max_auth_prompt_bytes = 16 * 1024;
+const auth_input_buffer_bytes = 64 * 1024;
 
 const AuthContext = struct {
     allocator: std.mem.Allocator,
@@ -749,6 +754,7 @@ fn notify(context: *anyopaque, event: ai.oauth.Event) anyerror!void {
             .{ value.verification_uri, value.user_code },
         ),
     }
+    try self.output.flush();
 }
 
 // Context leads because this callback implements the erased OAuth interaction ABI.
@@ -758,11 +764,17 @@ fn oauthPrompt(context: *anyopaque, allocator: std.mem.Allocator, request: ai.oa
     try self.output.writeAll(request.message);
     if (request.placeholder) |placeholder| try self.output.print(" ({s})", .{placeholder});
     try self.output.writeAll(": ");
+    try self.output.flush();
     const line = (try self.input.takeDelimiter('\n')) orelse return error.ConsumerStopped;
+    defer std.crypto.secureZero(u8, @constCast(line));
     if (line.len > max_auth_prompt_bytes) return error.ConsumerStopped;
     const value = std.mem.trim(u8, line, " \t\r\n");
     if (value.len == 0) return error.ConsumerStopped;
     return allocator.dupe(u8, value);
+}
+
+fn wipeAuthInputBuffer(buffer: *[auth_input_buffer_bytes]u8) void {
+    std.crypto.secureZero(u8, buffer);
 }
 
 fn oauthNowMs(io: std.Io) u64 {
@@ -793,7 +805,7 @@ fn executeTrust(request: surface.TrustRequest, context: TrustContext) !u8 {
         return 1;
     };
     defer paths.deinit();
-    var identity = ProjectTrustStore.Identity.init(context.allocator, context.io, target_path) catch |failure| {
+    var identity = ProjectTrust.Identity.init(context.allocator, context.io, target_path) catch |failure| {
         try context.stderr.print("Unable to identify the project: {s}.\n", .{@errorName(failure)});
         return 1;
     };
@@ -810,9 +822,9 @@ fn executeTrust(request: surface.TrustRequest, context: TrustContext) !u8 {
 fn status(
     context: TrustContext,
     paths: *const ZiPaths,
-    identity: *const ProjectTrustStore.Identity,
+    identity: *const ProjectTrust.Identity,
 ) !u8 {
-    var snapshot = ProjectTrustStore.load(context.allocator, context.io, paths) catch |failure| {
+    var snapshot = ProjectTrust.load(context.allocator, context.io, paths) catch |failure| {
         try writeStoreFailure(context.stderr, "read", failure);
         return 1;
     };
@@ -831,10 +843,10 @@ fn status(
 fn update(
     context: TrustContext,
     paths: *const ZiPaths,
-    identity: *const ProjectTrustStore.Identity,
+    identity: *const ProjectTrust.Identity,
     decision: ProjectTrust.Decision,
 ) !u8 {
-    ProjectTrustStore.put(
+    ProjectTrust.put(
         context.allocator,
         context.io,
         paths,
@@ -854,9 +866,9 @@ fn update(
 fn remove(
     context: TrustContext,
     paths: *const ZiPaths,
-    identity: *const ProjectTrustStore.Identity,
+    identity: *const ProjectTrust.Identity,
 ) !u8 {
-    const removed = ProjectTrustStore.remove(
+    const removed = ProjectTrust.remove(
         context.allocator,
         context.io,
         paths,
@@ -907,7 +919,7 @@ test "CLI core parses, composes, runs sequential prompts, and prints only the fi
         std.testing.allocator,
         std.testing.io,
         scripted.asModel(),
-        temporary.dir,
+        try temporary.dir.openDir(std.testing.io, ".", .{}),
         .{},
     );
     defer session.deinit();
@@ -958,7 +970,7 @@ test "text print mode routes a settled agent failure only to stderr" {
         std.testing.allocator,
         std.testing.io,
         scripted.asModel(),
-        temporary.dir,
+        try temporary.dir.openDir(std.testing.io, ".", .{}),
         .{},
     );
     defer session.deinit();
@@ -1016,7 +1028,7 @@ test "text print mode reports bounded provider failure details" {
             .{ .provider = "openai-codex", .model = "rejecting" },
             profile,
         ),
-        temporary.dir,
+        try temporary.dir.openDir(std.testing.io, ".", .{}),
         .{},
     );
     defer session.deinit();
@@ -1052,7 +1064,7 @@ test "text print mode rejects invalid and excessive prompts before model admissi
         std.testing.allocator,
         std.testing.io,
         scripted.asModel(),
-        temporary.dir,
+        try temporary.dir.openDir(std.testing.io, ".", .{}),
         .{},
     );
     defer session.deinit();
@@ -1120,7 +1132,7 @@ test "text print mode succeeds silently without a prompt" {
         std.testing.allocator,
         std.testing.io,
         scripted.asModel(),
-        temporary.dir,
+        try temporary.dir.openDir(std.testing.io, ".", .{}),
         .{},
     );
     defer session.deinit();
@@ -1280,6 +1292,82 @@ test "interactive launch preserves composed initial prompt order" {
     try std.testing.expectEqualStrings("file:first", prompts[0]);
     try std.testing.expectEqualStrings("second", prompts[1]);
     try std.testing.expectEqualStrings("third", prompts[2]);
+}
+
+test "OAuth callbacks flush borrowed output and wipe consumed answers" {
+    const FlushRecorder = struct {
+        const Self = @This();
+
+        writer: std.Io.Writer = .{ .vtable = &vtable, .buffer = &.{} },
+        flushes: usize = 0,
+
+        fn drain(writer: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+            _ = writer;
+            var consumed: usize = 0;
+            for (data[0 .. data.len - 1]) |bytes| consumed += bytes.len;
+            consumed += data[data.len - 1].len * splat;
+            return consumed;
+        }
+        fn flush(writer: *std.Io.Writer) std.Io.Writer.Error!void {
+            const self: *Self = @fieldParentPtr("writer", writer);
+            self.flushes += 1;
+        }
+        const vtable: std.Io.Writer.VTable = .{ .drain = drain, .flush = flush };
+    };
+
+    var output: FlushRecorder = .{};
+    var answer = [_]u8{ 's', 'e', 'c', 'r', 'e', 't', '\n' };
+    var input = std.Io.Reader.fixed(&answer);
+    var interaction: InteractionContext = .{
+        .allocator = std.testing.allocator,
+        .input = &input,
+        .output = &output.writer,
+    };
+    try notify(&interaction, .{ .auth_url = .{ .url = "https://example.test", .instructions = "Open" } });
+    try std.testing.expectEqual(@as(usize, 1), output.flushes);
+    try notify(&interaction, .{ .device_code = .{
+        .user_code = "ABCD-EFGH",
+        .verification_uri = "https://example.test/device",
+        .interval_seconds = 1,
+        .expires_in_seconds = 60,
+    } });
+    try std.testing.expectEqual(@as(usize, 2), output.flushes);
+    const owned = try oauthPrompt(&interaction, std.testing.allocator, .{ .message = "Token" });
+    defer {
+        std.crypto.secureZero(u8, owned);
+        std.testing.allocator.free(owned);
+    }
+    try std.testing.expectEqual(@as(usize, 3), output.flushes);
+    try std.testing.expectEqualStrings("secret", owned);
+    for (answer[0 .. answer.len - 1]) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
+
+    var backing: [auth_input_buffer_bytes]u8 = @splat(0xa5);
+    wipeAuthInputBuffer(&backing);
+    for (backing) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
+}
+
+test "OAuth prompt wipes rejected and closed input" {
+    var output_buffer: [64]u8 = undefined;
+    var output = std.Io.Writer.fixed(&output_buffer);
+    var rejected = [_]u8{ ' ', '\n' };
+    var rejected_reader = std.Io.Reader.fixed(&rejected);
+    var interaction: InteractionContext = .{
+        .allocator = std.testing.allocator,
+        .input = &rejected_reader,
+        .output = &output,
+    };
+    try std.testing.expectError(
+        error.ConsumerStopped,
+        oauthPrompt(&interaction, std.testing.allocator, .{ .message = "Token" }),
+    );
+    try std.testing.expectEqual(@as(u8, 0), rejected[0]);
+
+    var closed_reader = std.Io.Reader.fixed("");
+    interaction.input = &closed_reader;
+    try std.testing.expectError(
+        error.ConsumerStopped,
+        oauthPrompt(&interaction, std.testing.allocator, .{ .message = "Token" }),
+    );
 }
 
 test "auth parser inputs retain provider and login method" {

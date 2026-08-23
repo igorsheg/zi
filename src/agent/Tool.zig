@@ -4,6 +4,7 @@
 //! `.failure` is a model-visible result and only ToolFatalError aborts the run.
 
 const std = @import("std");
+const BoundedJson = @import("../BoundedJson.zig");
 const message = @import("../ai/message.zig");
 const model = @import("../ai/model.zig");
 
@@ -150,11 +151,21 @@ pub const Catalog = struct {
     }
 };
 
+const json_limits: BoundedJson.Limits = .{
+    .document_bytes = 2 * 1024 * 1024,
+    .value_bytes = 1024 * 1024,
+    .depth = 64,
+    .collection_items = 4096,
+};
+
 fn validateJsonObject(
     allocator: std.mem.Allocator,
     source: []const u8,
     invalid: Error,
 ) Error!void {
+    BoundedJson.validate(allocator, source, json_limits) catch |failure| {
+        return if (failure == error.OutOfMemory) error.OutOfMemory else invalid;
+    };
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, source, .{}) catch |failure| {
         return if (failure == error.OutOfMemory) error.OutOfMemory else invalid;
     };
@@ -163,6 +174,7 @@ fn validateJsonObject(
 }
 
 const FakeEcho = struct {
+    calls: usize = 0,
     fatal: bool = false,
     recover_with: ?[]const u8 = null,
     expect_control: bool = false,
@@ -174,6 +186,7 @@ const FakeEcho = struct {
         run_context: Tool.RunContext,
         arguments_json: []const u8,
     ) ToolFatalError!ToolExecution {
+        self.calls += 1;
         if (self.expect_control) std.debug.assert(run_context.cancellation != null);
         if (self.fatal) return error.Cancelled;
         if (self.recover_with) |failure| return .{ .failure = failure };
@@ -252,6 +265,67 @@ test "validateArguments accepts JSON objects and rejects everything else" {
     try std.testing.expectError(error.InvalidToolArguments, Tool.validateArguments(std.testing.allocator, "[1,2]"));
     try std.testing.expectError(error.InvalidToolArguments, Tool.validateArguments(std.testing.allocator, "\"text\""));
     try std.testing.expectError(error.InvalidToolArguments, Tool.validateArguments(std.testing.allocator, "{invalid"));
+}
+
+test "tool JSON admission enforces every allocation dimension without invoking the executor" {
+    var echo: FakeEcho = .{};
+    const tool = Tool.from(&echo, echo_definition);
+    const document = try std.testing.allocator.alloc(u8, json_limits.document_bytes + 1);
+    defer std.testing.allocator.free(document);
+    @memset(document, ' ');
+    try std.testing.expectError(error.InvalidToolArguments, Tool.validateArguments(std.testing.allocator, document));
+    try std.testing.expectEqual(@as(usize, 0), echo.calls);
+
+    const value = try std.testing.allocator.alloc(u8, json_limits.value_bytes + 16);
+    defer std.testing.allocator.free(value);
+    value[0] = '{';
+    value[1] = '"';
+    value[2] = 'v';
+    value[3] = '"';
+    value[4] = ':';
+    value[5] = '"';
+    @memset(value[6 .. value.len - 2], 'x');
+    value[value.len - 2] = '"';
+    value[value.len - 1] = '}';
+    try std.testing.expectError(error.InvalidToolArguments, Tool.validateArguments(std.testing.allocator, value));
+    try std.testing.expectEqual(@as(usize, 0), echo.calls);
+
+    var nested: std.ArrayList(u8) = .empty;
+    defer nested.deinit(std.testing.allocator);
+    try nested.appendSlice(std.testing.allocator, "{\"v\":");
+    for (0..json_limits.depth) |_| try nested.append(std.testing.allocator, '[');
+    try nested.append(std.testing.allocator, '0');
+    for (0..json_limits.depth) |_| try nested.append(std.testing.allocator, ']');
+    try nested.append(std.testing.allocator, '}');
+    try std.testing.expectError(
+        error.InvalidToolArguments,
+        Tool.validateArguments(std.testing.allocator, nested.items),
+    );
+    try std.testing.expectEqual(@as(usize, 0), echo.calls);
+
+    var items: std.ArrayList(u8) = .empty;
+    defer items.deinit(std.testing.allocator);
+    try items.appendSlice(std.testing.allocator, "{\"v\":[");
+    for (0..json_limits.collection_items + 1) |index| {
+        if (index > 0) try items.append(std.testing.allocator, ',');
+        try items.append(std.testing.allocator, '0');
+    }
+    try items.appendSlice(std.testing.allocator, "]}");
+    try std.testing.expectError(error.InvalidToolArguments, Tool.validateArguments(std.testing.allocator, items.items));
+    try std.testing.expectEqual(@as(usize, 0), echo.calls);
+    _ = tool;
+}
+
+fn validateArgumentsForAllocationFailure(allocator: std.mem.Allocator) !void {
+    try Tool.validateArguments(allocator, "{\"items\":[1,2,3],\"nested\":{\"ok\":true}}");
+}
+
+test "bounded tool JSON admission settles every allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        validateArgumentsForAllocationFailure,
+        .{},
+    );
 }
 
 test "erased executor returns success output" {
