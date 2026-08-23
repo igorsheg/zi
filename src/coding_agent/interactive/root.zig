@@ -17,10 +17,7 @@ pub const HostFact = interactive_session_host.Fact;
 pub const TurnFact = session_controller.Fact;
 pub const HostSink = interactive_session_host.Sink;
 pub const Phase = interactive_session_host.Phase;
-pub const Snapshot = interactive_session_host.Snapshot;
 pub const SubmitDisposition = interactive_session_host.SubmitDisposition;
-pub const CancelResult = interactive_session_host.CancelResult;
-pub const DrainResult = interactive_session_host.DrainResult;
 
 test {
     _ = frontend;

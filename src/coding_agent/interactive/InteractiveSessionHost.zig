@@ -119,17 +119,9 @@ pub const Sink = struct {
     }
 };
 
-pub const DrainResult = struct {
-    restored: ?SessionController.OwnedDraft = null,
-
-    pub fn deinit(self: *DrainResult) void {
-        if (self.restored) |*draft| draft.deinit();
-        self.* = undefined;
-    }
-};
+pub const DrainResult = SessionController.DrainResult;
 
 const ModelLessBackend = struct {
-    runtime: *RuntimeServices.ModelLess,
     active_model: ?FixedModel,
 };
 
@@ -274,7 +266,7 @@ pub fn init(
     inputs.* = undefined;
     var inputs_live = true;
     errdefer if (inputs_live) owned_inputs.deinit();
-    const owned_lifecycle = lifecycle.*;
+    var owned_lifecycle = lifecycle.*;
     lifecycle.* = undefined;
     var lifecycle_live = true;
     errdefer if (lifecycle_live) owned_lifecycle.deinit();
@@ -287,8 +279,6 @@ pub fn init(
         owned_inputs.initial().home,
     );
     errdefer settings_paths.deinit();
-    var transcript_value = try owned_lifecycle.transcript().clone(allocator);
-    errdefer transcript_value.deinit();
     const self = try allocator.create(InteractiveSessionHost);
     errdefer allocator.destroy(self);
     self.* = .{
@@ -297,17 +287,15 @@ pub fn init(
         .inputs = owned_inputs,
         .settings_paths = settings_paths,
         .journal_path = journal_path,
-        .transcript_value = transcript_value,
+        .transcript_value = owned_lifecycle.transcript_value,
         .options = options,
     };
     inputs_live = false;
     errdefer self.inputs.deinit();
     errdefer self.pending.deinit(allocator);
-    self.installLifecycle(owned_lifecycle) catch |failure| {
-        lifecycle_live = false;
-        return failure;
-    };
+    errdefer self.transcript_value.deinit();
     lifecycle_live = false;
+    try self.installLifecycle(owned_lifecycle.lifecycle);
     return self;
 }
 
@@ -531,7 +519,7 @@ fn settleAuthAssumeCapacity(
         .succeeded => {
             self.appendPendingAssumeCapacity(.{ .login_succeeded = provider });
             self.closeForTransition();
-            const lifecycle = RuntimeServices.createInteractive(
+            const lifecycle = RuntimeServices.reopenInteractive(
                 self.allocator,
                 self.io,
                 self.inputs.reopen(self.journal_path, .{}),
@@ -564,7 +552,7 @@ fn switchModel(self: *InteractiveSessionHost, requested: ai.ModelIdentity) !void
     const requested_copy = try FixedModel.init(requested);
     try self.pending.ensureUnusedCapacity(self.allocator, 3);
     self.closeForTransition();
-    const lifecycle = RuntimeServices.createInteractive(
+    const lifecycle = RuntimeServices.reopenInteractive(
         self.allocator,
         self.io,
         self.inputs.reopen(self.journal_path, .{
@@ -605,7 +593,7 @@ fn recoverAfterSwitchFailure(
     requested: FixedModel,
     failure: anyerror,
 ) !void {
-    const lifecycle = RuntimeServices.createInteractive(
+    const lifecycle = RuntimeServices.reopenInteractive(
         self.allocator,
         self.io,
         self.inputs.reopen(self.journal_path, .{}),
@@ -644,7 +632,7 @@ fn appendSwitchFailure(self: *InteractiveSessionHost, requested: FixedModel, fai
     }
 }
 
-fn installLifecycle(self: *InteractiveSessionHost, lifecycle: RuntimeServices.Interactive) !void {
+fn installLifecycle(self: *InteractiveSessionHost, lifecycle: RuntimeServices.Lifecycle) !void {
     std.debug.assert(self.backend == .transitioning);
     const active_model = if (lifecycle.activeModel()) |model|
         FixedModel.init(model) catch |failure| {
@@ -654,10 +642,12 @@ fn installLifecycle(self: *InteractiveSessionHost, lifecycle: RuntimeServices.In
     else
         null;
     switch (lifecycle) {
-        .model_less => |runtime| self.backend = .{ .model_less = .{
-            .runtime = runtime,
-            .active_model = active_model,
-        } },
+        .model_less => |runtime| {
+            runtime.deinit();
+            self.backend = .{ .model_less = .{
+                .active_model = active_model,
+            } };
+        },
         .runnable => |runtime| {
             const worker = TurnWorker.start(
                 self.allocator,
@@ -700,7 +690,7 @@ fn closeForTransition(self: *InteractiveSessionHost) void {
 
 fn deinitBackend(self: *InteractiveSessionHost) void {
     switch (self.backend) {
-        .model_less => |runtime| runtime.runtime.deinit(),
+        .model_less => {},
         .runnable => |*runnable| {
             runnable.controller.deinit();
             runnable.worker.deinit();
@@ -1130,6 +1120,7 @@ test "host transcript remains valid after replacing its initial backend" {
         std.testing.io,
         inputs.initial(),
     );
+    const transcript_items = lifecycle.transcript().items.ptr;
     const host = try InteractiveSessionHost.init(
         std.testing.allocator,
         std.testing.io,
@@ -1140,6 +1131,7 @@ test "host transcript remains valid after replacing its initial backend" {
     defer host.deinit();
     const transcript_view = host.transcript();
     try std.testing.expect(transcript_view.items.len != 0);
+    try std.testing.expect(transcript_view.items.ptr == transcript_items);
     try std.testing.expectEqualStrings(
         "gpt-5.6-terra",
         transcript_view.items[0].content.model_change.model,

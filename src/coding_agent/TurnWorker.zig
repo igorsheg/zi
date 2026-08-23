@@ -3,7 +3,7 @@ const ai = @import("../ai/root.zig");
 const agent = @import("../agent/root.zig");
 const AgentSession = @import("AgentSession.zig");
 const session_event = @import("AgentSessionEvent.zig");
-const OwnedAgentSessionEvent = @import("OwnedAgentSessionEvent.zig");
+const OwnedEvent = session_event.Owned;
 
 const TurnWorker = @This();
 
@@ -11,9 +11,9 @@ pub const Limits = struct {
     max_prompt_bytes: usize = 1024 * 1024,
     max_queued_prompts: usize = 16,
     max_queued_events: usize = 256,
-    max_queued_event_bytes: usize = OwnedAgentSessionEvent.default_max_retained_bytes,
+    max_queued_event_bytes: usize = OwnedEvent.default_max_retained_bytes,
     max_queued_completions: usize = 32,
-    event: OwnedAgentSessionEvent.Limits = .{},
+    event: OwnedEvent.Limits = .{},
 };
 
 pub const StartError = error{
@@ -53,19 +53,14 @@ pub const Snapshot = struct {
     queued_event_bytes: usize,
     queued_completions: usize,
     stop_requested: bool,
-    availability: Availability,
-};
-
-pub const Availability = enum {
-    ready,
-    poisoned,
+    availability: session_event.Availability,
 };
 
 /// Detached worker output. Consumers reduce `events` in order before matching
 /// `completions`; a completion also settles policy when event delivery failed
 /// before the corresponding `agent_settled` event.
 pub const Batch = struct {
-    events: std.ArrayList(OwnedAgentSessionEvent),
+    events: std.ArrayList(OwnedEvent),
     completions: std.ArrayList(Completion),
 
     pub fn deinit(self: *Batch, allocator: std.mem.Allocator) void {
@@ -122,7 +117,7 @@ thread: std.Thread,
 mutex: std.Io.Mutex = .init,
 condition: std.Io.Condition = .init,
 prompts: std.ArrayList([]u8) = .empty,
-events: std.ArrayList(OwnedAgentSessionEvent) = .empty,
+events: std.ArrayList(OwnedEvent) = .empty,
 queued_event_bytes: usize = 0,
 completions: std.ArrayList(Completion) = .empty,
 cancellation: ai.model.CancellationToken = .{},
@@ -130,7 +125,7 @@ active_run_id: ?agent.event.RunId = null,
 admitted: bool = false,
 processing: bool = false,
 stop_requested: bool = false,
-availability: Availability = .ready,
+availability: session_event.Availability = .ready,
 
 /// On success, ownership transfers to the worker. On failure, the caller still
 /// owns `owner`; no thread can observe its session after this function returns.
@@ -228,7 +223,7 @@ pub fn snapshot(self: *TurnWorker) Snapshot {
 
 /// Transfers all currently queued events and completions to the caller.
 pub fn takeBatch(self: *TurnWorker) error{OutOfMemory}!Batch {
-    var replacement_events: std.ArrayList(OwnedAgentSessionEvent) = .empty;
+    var replacement_events: std.ArrayList(OwnedEvent) = .empty;
     errdefer replacement_events.deinit(self.allocator);
     try replacement_events.ensureTotalCapacity(self.allocator, self.limits.max_queued_events);
     var replacement_completions: std.ArrayList(Completion) = .empty;
@@ -304,10 +299,7 @@ fn workerMain(self: *TurnWorker) void {
             .poisoned => .poisoned,
             .running => unreachable,
         };
-        self.availability = switch (availability) {
-            .ready => .ready,
-            .poisoned => .poisoned,
-        };
+        self.availability = availability;
         while (self.completions.items.len >= self.limits.max_queued_completions and
             !self.stop_requested)
         {
@@ -348,7 +340,7 @@ fn emitSessionEvent(
         self.active_run_id = event.agent_start.run_id;
         self.mutex.unlock(self.io);
     }
-    var owned = OwnedAgentSessionEvent.init(self.allocator, event, self.limits.event) catch |failure| {
+    var owned = OwnedEvent.init(self.allocator, event, self.limits.event) catch |failure| {
         return switch (failure) {
             error.OutOfMemory => error.OutOfMemory,
             error.EventTooLarge, error.TooManyItems => error.ConsumerStopped,

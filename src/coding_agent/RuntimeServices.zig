@@ -6,7 +6,6 @@ const CredentialManager = @import("CredentialManager.zig");
 const ModelAdmission = @import("ModelAdmission.zig");
 const CredentialStore = @import("CredentialStore.zig");
 const ModelBootstrapPolicy = @import("ModelBootstrapPolicy.zig");
-const ModelConfig = @import("ModelConfig.zig");
 const ModelConfigSnapshot = @import("ModelConfigSnapshot.zig");
 const ModelResolution = @import("ModelResolution.zig");
 const ProjectTrust = @import("ProjectTrust.zig");
@@ -112,51 +111,36 @@ const Transport = union(enum) {
 pub const ModelLess = struct {
     allocator: std.mem.Allocator,
     selection: SessionSelection,
-    snapshot: ModelConfigSnapshot,
-    transcript_value: SessionTranscript,
-
-    pub fn transcript(self: *const ModelLess) *const SessionTranscript {
-        return &self.transcript_value;
-    }
 
     // Heap destruction follows explicit field invalidation.
     // ziglint-ignore: Z030
     pub fn deinit(self: *ModelLess) void {
         const allocator = self.allocator;
-        self.transcript_value.deinit();
-        self.snapshot.deinit();
         self.selection.deinit();
         self.* = undefined;
         allocator.destroy(self);
     }
 };
 
-pub const Interactive = union(enum) {
+pub const Lifecycle = union(enum) {
     model_less: *ModelLess,
     runnable: *RuntimeServices,
 
-    pub fn transcript(self: Interactive) *const SessionTranscript {
-        return switch (self) {
-            .model_less => |value| value.transcript(),
-            .runnable => |value| value.transcript(),
-        };
-    }
-
-    pub fn journalPath(self: Interactive) []const u8 {
+    pub fn journalPath(self: Lifecycle) []const u8 {
         return switch (self) {
             .model_less => |value| value.selection.journalPath(),
             .runnable => |value| value.journalPath(),
         };
     }
 
-    pub fn activeModel(self: Interactive) ?ai.ModelIdentity {
+    pub fn activeModel(self: Lifecycle) ?ai.ModelIdentity {
         return switch (self) {
             .model_less => |value| value.selection.restoredModel(),
             .runnable => |value| value.modelIdentity(),
         };
     }
 
-    pub fn deinit(self: Interactive) void {
+    pub fn deinit(self: Lifecycle) void {
         switch (self) {
             .model_less => |value| value.deinit(),
             .runnable => |value| value.deinit(),
@@ -164,9 +148,46 @@ pub const Interactive = union(enum) {
     }
 };
 
-const Creation = union(enum) {
-    model_less: *ModelLess,
-    runnable: *RuntimeServices,
+pub const Interactive = struct {
+    lifecycle: Lifecycle,
+    transcript_value: SessionTranscript,
+
+    pub fn transcript(self: *const Interactive) *const SessionTranscript {
+        return &self.transcript_value;
+    }
+
+    pub fn journalPath(self: *const Interactive) []const u8 {
+        return self.lifecycle.journalPath();
+    }
+
+    pub fn activeModel(self: *const Interactive) ?ai.ModelIdentity {
+        return self.lifecycle.activeModel();
+    }
+
+    pub fn deinit(self: *Interactive) void {
+        self.lifecycle.deinit();
+        self.transcript_value.deinit();
+        self.* = undefined;
+    }
+};
+
+const CreationMode = enum {
+    runtime,
+    interactive,
+    reopen,
+
+    fn allowsModelLess(self: CreationMode) bool {
+        return self != .runtime;
+    }
+
+    fn includesTranscript(self: CreationMode) bool {
+        return self == .interactive;
+    }
+};
+
+const Created = struct {
+    lifecycle: Lifecycle,
+    transcript: ?SessionTranscript,
 };
 
 io: std.Io,
@@ -176,7 +197,6 @@ cwd: std.Io.Dir,
 snapshot: ModelConfigSnapshot,
 resolved: ModelResolution.Resolved,
 credential_resolver: *CredentialManager.PersistentResolver,
-transcript_value: SessionTranscript,
 runtime: *AgentSessionRuntime,
 
 pub fn create(
@@ -184,10 +204,14 @@ pub fn create(
     io: std.Io,
     inputs: Inputs,
 ) Error!*RuntimeServices {
-    return switch (try createOwned(allocator, io, inputs, .http, false)) {
+    const created = try createOwned(allocator, io, inputs, .http, .runtime);
+    std.debug.assert(created.transcript == null);
+    return switch (created.lifecycle) {
         .runnable => |runtime| runtime,
-        // Only createInteractive allows the model-less outcome.
-        .model_less => error.SelectionRequired,
+        .model_less => |runtime| {
+            runtime.deinit();
+            return error.SelectionRequired;
+        },
     };
 }
 
@@ -196,18 +220,25 @@ pub fn createInteractive(
     io: std.Io,
     inputs: Inputs,
 ) Error!Interactive {
-    return switch (try createOwned(allocator, io, inputs, .http, true)) {
-        .runnable => |runtime| .{ .runnable = runtime },
-        .model_less => |runtime| .{ .model_less = runtime },
+    const created = try createOwned(allocator, io, inputs, .http, .interactive);
+    return .{
+        .lifecycle = created.lifecycle,
+        .transcript_value = created.transcript.?,
     };
+}
+
+pub fn reopenInteractive(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    inputs: Inputs,
+) Error!Lifecycle {
+    const created = try createOwned(allocator, io, inputs, .http, .reopen);
+    std.debug.assert(created.transcript == null);
+    return created.lifecycle;
 }
 
 pub fn session(self: *RuntimeServices) *AgentSession {
     return self.runtime.session();
-}
-
-pub fn transcript(self: *const RuntimeServices) *const SessionTranscript {
-    return &self.transcript_value;
 }
 
 fn paths(self: *const RuntimeServices) *const ZiPaths {
@@ -231,7 +262,6 @@ fn modelDiagnostic(self: *const RuntimeServices) ?ModelConfigSnapshot.Diagnostic
 pub fn deinit(self: *RuntimeServices) void {
     const allocator = self.allocator;
     self.runtime.deinit();
-    self.transcript_value.deinit();
     self.credential_resolver.deinit();
     self.cwd.close(self.io);
     self.resolved.deinit();
@@ -247,10 +277,39 @@ fn createWithTransport(
     inputs: Inputs,
     transport: ai.transport.Transport,
 ) Error!*RuntimeServices {
-    return switch (try createOwned(allocator, io, inputs, .{ .borrowed = transport }, false)) {
+    const created = try createOwned(
+        allocator,
+        io,
+        inputs,
+        .{ .borrowed = transport },
+        .runtime,
+    );
+    std.debug.assert(created.transcript == null);
+    return switch (created.lifecycle) {
         .runnable => |runtime| runtime,
-        // Only createInteractive allows the model-less outcome.
-        .model_less => error.SelectionRequired,
+        .model_less => |runtime| {
+            runtime.deinit();
+            return error.SelectionRequired;
+        },
+    };
+}
+
+fn createInteractiveWithTransport(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    inputs: Inputs,
+    transport: ai.transport.Transport,
+) Error!Interactive {
+    const created = try createOwned(
+        allocator,
+        io,
+        inputs,
+        .{ .borrowed = transport },
+        .interactive,
+    );
+    return .{
+        .lifecycle = created.lifecycle,
+        .transcript_value = created.transcript.?,
     };
 }
 
@@ -259,8 +318,8 @@ fn createOwned(
     io: std.Io,
     inputs: Inputs,
     transport: Transport,
-    allow_model_less: bool,
-) Error!Creation {
+    mode: CreationMode,
+) Error!Created {
     var selection = try SessionSelection.select(
         allocator,
         io,
@@ -345,17 +404,23 @@ fn createOwned(
             .sources = inputs.sources,
         },
     ) catch |failure| {
-        if (failure != error.SelectionRequired or !allow_model_less) return failure;
-        var transcript_value = try SessionTranscript.init(allocator, selection.restoredView());
-        errdefer transcript_value.deinit();
+        if (failure != error.SelectionRequired or !mode.allowsModelLess()) return failure;
         const model_less = try allocator.create(ModelLess);
+        errdefer allocator.destroy(model_less);
+        var transcript_value: ?SessionTranscript = if (mode.includesTranscript())
+            try SessionTranscript.init(allocator, selection.restoredView())
+        else
+            null;
+        errdefer if (transcript_value) |*transcript| transcript.deinit();
+        snapshot.deinit();
         model_less.* = .{
             .allocator = allocator,
             .selection = selection,
-            .snapshot = snapshot,
-            .transcript_value = transcript_value,
         };
-        return .{ .model_less = model_less };
+        return .{
+            .lifecycle = .{ .model_less = model_less },
+            .transcript = transcript_value,
+        };
     };
     errdefer resolved.deinit();
 
@@ -379,8 +444,11 @@ fn createOwned(
     var cwd = std.Io.Dir.openDir(.cwd(), io, selection.pathsView().cwd, .{}) catch
         return error.CwdUnavailable;
     errdefer cwd.close(io);
-    var transcript_value = try SessionTranscript.init(allocator, selection.restoredView());
-    errdefer transcript_value.deinit();
+    var transcript_value: ?SessionTranscript = if (mode.includesTranscript())
+        try SessionTranscript.init(allocator, selection.restoredView())
+    else
+        null;
+    errdefer if (transcript_value) |*transcript| transcript.deinit();
     var opened = selection.takeJournal();
     const runtime = switch (transport) {
         .http => try AgentSessionRuntime.createDurable(
@@ -415,10 +483,12 @@ fn createOwned(
         .snapshot = snapshot,
         .resolved = resolved,
         .credential_resolver = credential_resolver,
-        .transcript_value = transcript_value,
         .runtime = runtime,
     };
-    return .{ .runnable = self };
+    return .{
+        .lifecycle = .{ .runnable = self },
+        .transcript = transcript_value,
+    };
 }
 
 fn explicitSelection(inputs: Inputs) ModelBootstrapPolicy.ExplicitSelection {
@@ -618,7 +688,6 @@ test "runtime services compose effective paths, models, prompts, credentials, du
     defer std.testing.allocator.free(journal_path);
     try std.testing.expectEqualStrings(root, services.paths().cwd);
     try std.testing.expect(services.modelDiagnostic() == null);
-    try std.testing.expectEqual(@as(usize, 0), services.transcript().items.len);
     try std.testing.expect(std.mem.startsWith(u8, services.session().systemPrompt(), "Global system base."));
     try std.testing.expect(std.mem.find(u8, services.session().systemPrompt(), root) != null);
     try std.testing.expect(std.mem.find(
@@ -653,7 +722,7 @@ test "runtime services compose effective paths, models, prompts, credentials, du
     services.deinit();
 
     var resume_fake = fake_api.FakeTransport.init(&.{});
-    var resumed = try createWithTransport(std.testing.allocator, std.testing.io, .{
+    var resumed = try createInteractiveWithTransport(std.testing.allocator, std.testing.io, .{
         .startup_cwd = root,
         .home = root,
         .session = .{ .open = journal_path },
@@ -1227,7 +1296,7 @@ test "runtime services retain a synthetic interruption for restored open turns" 
     } }, .none());
     writable.deinit();
 
-    var resumed = try createWithTransport(std.testing.allocator, std.testing.io, .{
+    var resumed = try createInteractiveWithTransport(std.testing.allocator, std.testing.io, .{
         .startup_cwd = root,
         .home = root,
         .session = .{ .open = journal_path },
@@ -1554,21 +1623,17 @@ test "interactive runtime admits and preserves a model-less durable session" {
     const root = try temporaryPath(&temporary, &root_buffer);
     var sources: TestSources = .{};
 
-    const lifecycle = try createInteractive(std.testing.allocator, std.testing.io, .{
+    var interactive = try createInteractive(std.testing.allocator, std.testing.io, .{
         .startup_cwd = root,
         .home = root,
         .session = .new,
         .sources = sources.view(),
     });
-    switch (lifecycle) {
-        .runnable => |runtime| {
-            runtime.deinit();
-            return error.UnexpectedRunnableSession;
-        },
-        .model_less => |runtime| {
-            try std.testing.expectEqual(@as(usize, 0), runtime.transcript().items.len);
-            runtime.deinit();
-        },
+    defer interactive.deinit();
+    try std.testing.expectEqual(@as(usize, 0), interactive.transcript().items.len);
+    switch (interactive.lifecycle) {
+        .runnable => return error.UnexpectedRunnableSession,
+        .model_less => {},
     }
 
     var sessions = try temporary.dir.openDir(std.testing.io, ".zi/agent/sessions", .{ .iterate = true });

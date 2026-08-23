@@ -12,7 +12,6 @@ const model_bootstrap_policy = @import("ModelBootstrapPolicy.zig");
 const model_config = @import("ModelConfig.zig");
 const model_config_snapshot = @import("ModelConfigSnapshot.zig");
 const model_resolution = @import("ModelResolution.zig");
-const owned_agent_session_event = @import("OwnedAgentSessionEvent.zig");
 const private_file_store = @import("PrivateFileStore.zig");
 const project_trust = @import("ProjectTrust.zig");
 const project_trust_store = @import("ProjectTrustStore.zig");
@@ -47,7 +46,6 @@ test {
     _ = model_config;
     _ = model_config_snapshot;
     _ = model_resolution;
-    _ = owned_agent_session_event;
     _ = private_file_store;
     _ = project_trust;
     _ = project_trust_store;

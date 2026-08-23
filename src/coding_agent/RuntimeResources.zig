@@ -34,7 +34,6 @@ pub const Error = error{
     ContextFileReadFailed,
 };
 
-allocator: std.mem.Allocator,
 arena: std.heap.ArenaAllocator,
 prompt_files: ?PromptFiles = null,
 context_files: ?ContextFiles = null,
@@ -57,7 +56,6 @@ pub fn resolve(
         intent,
     );
     var resources: RuntimeResources = .{
-        .allocator = allocator,
         .arena = .init(allocator),
         .project_trust = project_trust,
         .effective_policy = requested_policy,
