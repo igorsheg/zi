@@ -410,6 +410,11 @@ pub const Log = struct {
         return self.written_items;
     }
 
+    /// Returns the configured selection borrowed until setSelection or deinit.
+    pub fn currentSelection(self: *const Log) Selection {
+        return self.selection.borrow();
+    }
+
     pub fn appendSnapshot(
         self: *Log,
         start_index: usize,

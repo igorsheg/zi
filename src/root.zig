@@ -12,6 +12,7 @@ pub const CatalogManager = @import("CatalogManager.zig");
 pub const CatalogService = @import("CatalogService.zig");
 pub const PromptAssembly = @import("PromptAssembly.zig");
 pub const SecureOpen = @import("SecureOpen.zig");
+pub const SessionDurability = @import("SessionDurability.zig");
 const ProcessSpawn = @import("ProcessSpawn.zig");
 
 test {
@@ -29,5 +30,6 @@ test {
     _ = CatalogService;
     _ = PromptAssembly;
     _ = SecureOpen;
+    _ = SessionDurability;
     _ = ProcessSpawn;
 }

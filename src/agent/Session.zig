@@ -242,6 +242,17 @@ pub const Session = struct {
         }
     }
 
+    /// Returns the live selection borrowed until the next selection change or deinit.
+    pub fn currentSelection(self: *const Session) Selection {
+        return .{
+            .provider_id = self.provider_id,
+            .model = self.model,
+            .model_label = self.model_label,
+            .effort = self.effort,
+            .preset = self.preset,
+        };
+    }
+
     pub fn items(self: *const Session) []const Item {
         return self.record.items;
     }
