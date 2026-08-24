@@ -76,6 +76,87 @@ pub const ExitProbe = struct {
 pub const OwnedSpool = struct {
     file: std.Io.File,
     path: []u8,
+    store: ?*SpoolStore = null,
+};
+
+/// Heap-stable owner for one private task-log root. Bash owns one reference;
+/// each adopted job owns another. The final release removes an empty root,
+/// while a durably retained log intentionally keeps it.
+pub const SpoolStore = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    trusted_log_root: []u8,
+    references: usize = 1,
+    active_jobs: usize = 0,
+    retained_logs: usize = 0,
+
+    pub fn create(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        owned_trusted_log_root: []u8,
+    ) error{OutOfMemory}!*SpoolStore {
+        const self = try allocator.create(SpoolStore);
+        self.* = .{ .allocator = allocator, .io = io, .trusted_log_root = owned_trusted_log_root };
+        return self;
+    }
+
+    fn acquireJob(self: *SpoolStore) void {
+        self.references += 1;
+        self.active_jobs += 1;
+    }
+
+    fn releaseJob(self: *SpoolStore, retained: bool) void {
+        std.debug.assert(self.active_jobs > 0);
+        self.active_jobs -= 1;
+        if (retained) self.retained_logs += 1;
+        self.release();
+    }
+
+    /// Bash must be deinitialized after its registry. This assertion catches
+    /// the reverse order before borrowed registry state or spool ownership can
+    /// be invalidated.
+    pub fn releaseOwner(self: *SpoolStore) void {
+        if (self.active_jobs != 0) {
+            std.debug.assert(self.active_jobs == 0);
+            return;
+        }
+        self.release();
+    }
+
+    fn release(self: *SpoolStore) void {
+        std.debug.assert(self.references > 0);
+        self.references -= 1;
+        if (self.references != 0) return;
+        if (self.retained_logs == 0) std.Io.Dir.cwd().deleteDir(self.io, self.trusted_log_root) catch |err| {
+            std.log.warn("removing empty bash task log directory: {s}", .{@errorName(err)});
+        };
+        const allocator = self.allocator;
+        allocator.free(self.trusted_log_root);
+        allocator.destroy(self);
+    }
+
+    fn syncDirectory(self: *SpoolStore) !void {
+        const directory = try std.Io.Dir.cwd().openDir(self.io, self.trusted_log_root, .{});
+        defer directory.close(self.io);
+        const file: std.Io.File = .{ .handle = directory.handle, .flags = .{ .nonblocking = false } };
+        try file.sync(self.io);
+    }
+};
+
+pub const StoreSpoolFactory = struct {
+    store: *SpoolStore,
+
+    pub fn create(
+        self: *StoreSpoolFactory,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+    ) error{ OutOfMemory, Unexpected }!OwnedSpool {
+        var factory: DirectorySpoolFactory = .{ .directory = self.store.trusted_log_root };
+        var spool = try factory.create(allocator, io);
+        self.store.acquireJob();
+        spool.store = self.store;
+        return spool;
+    }
 };
 
 /// Synchronous spool creation seam. The returned path and file are transferred
@@ -152,6 +233,7 @@ pub const BashTaskJob = struct {
     mutex: std.Io.Mutex = .init,
     spool_file: std.Io.File,
     spool_path: []u8,
+    spool_store: ?*SpoolStore,
     total_bytes: usize = 0,
     stored_bytes: usize = 0,
     binary: bool = false,
@@ -182,6 +264,7 @@ pub const BashTaskJob = struct {
             spool.file.close(io);
             std.Io.Dir.cwd().deleteFile(io, spool.path) catch {};
             allocator.free(spool.path);
+            if (spool.store) |store| store.releaseJob(false);
         }
         var process = try BashProcess.spawn(invocation, io);
         errdefer {
@@ -199,6 +282,7 @@ pub const BashTaskJob = struct {
             .process = process,
             .spool_file = spool.file,
             .spool_path = spool.path,
+            .spool_store = spool.store,
             .thread = undefined,
         };
         self.thread = try std.Thread.spawn(.{}, drainMain, .{self});
@@ -242,7 +326,10 @@ pub const BashTaskJob = struct {
                             self.mutex.lockUncancelable(self.io);
                             self.total_bytes +|= chunk.len;
                             self.binary = self.binary or std.mem.findScalar(u8, chunk, 0) != null;
-                            const crossed = self.total_bytes >= TaskRegistry.hard_output_bytes;
+                            // hax task_registry.c@189816f lines 121-132 increments first and
+                            // uses >= before write_spool. Exact-cap output therefore overflows,
+                            // and the whole chunk that reaches or crosses the cap is discarded.
+                            const crossed = drainLimitReached(self.total_bytes);
                             if (crossed) {
                                 self.overflow = true;
                             } else if (!self.write_failed) {
@@ -343,10 +430,26 @@ pub const BashTaskJob = struct {
         };
     }
 
-    pub fn retainLog(self: *BashTaskJob) void {
+    pub fn retainLog(self: *BashTaskJob) TaskRegistry.JobError!TaskRegistry.RetainLogResult {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
+        if (self.write_failed) return .unavailable;
+        self.spool_file.sync(self.io) catch return .durability_uncertain;
+        if (self.spool_store) |store| {
+            store.syncDirectory() catch return .durability_uncertain;
+        } else {
+            const parent = std.fs.path.dirname(self.spool_path) orelse return .unavailable;
+            const directory = std.Io.Dir.cwd().openDir(self.io, parent, .{}) catch
+                return .durability_uncertain;
+            defer directory.close(self.io);
+            const file: std.Io.File = .{
+                .handle = directory.handle,
+                .flags = .{ .nonblocking = false },
+            };
+            file.sync(self.io) catch return .durability_uncertain;
+        }
         self.retain_log = true;
+        return .retained;
     }
 
     /// Makes bytes sampled during the foreground yield visible again after the
@@ -396,11 +499,21 @@ pub const BashTaskJob = struct {
             std.log.warn("unlinking bash task log: {s}", .{@errorName(err)});
         };
         self.allocator.free(self.spool_path);
+        if (self.spool_store) |store| store.releaseJob(retain_log);
         const owner_allocator = self.allocator;
         _ = callback_allocator;
         owner_allocator.destroy(self);
     }
 };
+
+fn drainLimitReached(total_bytes_after_read: usize) bool {
+    return total_bytes_after_read >= TaskRegistry.hard_output_bytes;
+}
+
+test "background drain limit treats exact equality as overflow" {
+    try std.testing.expect(!drainLimitReached(TaskRegistry.hard_output_bytes - 1));
+    try std.testing.expect(drainLimitReached(TaskRegistry.hard_output_bytes));
+}
 
 const ClockThread = struct {
     clock: ProducerClock,
@@ -481,6 +594,92 @@ test "adopted job shutdown frees through its owner allocator" {
         error.FileNotFound,
         std.Io.Dir.cwd().statFile(std.testing.io, spool_path, .{}),
     );
+}
+
+fn removeTestTree(path: []const u8) !void {
+    try std.Io.Dir.cwd().deleteTree(std.testing.io, path);
+}
+
+test "spool store removes an empty owner root after its last job" {
+    const root = ".zig-cache/tmp/zi-spool-empty";
+    try removeTestTree(root);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, root);
+    const owned_root = try std.testing.allocator.dupe(u8, root);
+    const store = try SpoolStore.create(std.testing.allocator, std.testing.io, owned_root);
+    var factory: StoreSpoolFactory = .{ .store = store };
+    const spool = try factory.create(std.testing.allocator, std.testing.io);
+    spool.file.close(std.testing.io);
+    try std.Io.Dir.cwd().deleteFile(std.testing.io, spool.path);
+    std.testing.allocator.free(spool.path);
+    store.releaseJob(false);
+    store.releaseOwner();
+    try std.testing.expectError(
+        error.FileNotFound,
+        std.Io.Dir.cwd().statFile(std.testing.io, root, .{}),
+    );
+}
+
+test "spool store intentionally keeps a root containing a retained log" {
+    const root = ".zig-cache/tmp/zi-spool-retained";
+    try removeTestTree(root);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, root);
+    defer removeTestTree(root) catch unreachable;
+    const owned_root = try std.testing.allocator.dupe(u8, root);
+    const store = try SpoolStore.create(std.testing.allocator, std.testing.io, owned_root);
+    var factory: StoreSpoolFactory = .{ .store = store };
+    const spool = try factory.create(std.testing.allocator, std.testing.io);
+    spool.file.close(std.testing.io);
+    std.testing.allocator.free(spool.path);
+    store.releaseJob(true);
+    store.releaseOwner();
+    _ = try std.Io.Dir.cwd().statFile(std.testing.io, root, .{});
+}
+
+test "retainLog reports retained only after file and directory sync" {
+    var argv: [4:null]?[*:0]const u8 = undefined;
+    var spool_factory: DirectorySpoolFactory = .{ .directory = ".zig-cache/tmp" };
+    const implementation = try BashTaskJob.create(
+        std.testing.allocator,
+        std.testing.io,
+        ProducerClock.fromIo(std.testing.io),
+        SpoolFactory.from(&spool_factory),
+        testInvocation("true", &argv),
+        null,
+    );
+    const path = try std.testing.allocator.dupe(u8, implementation.spool_path);
+    defer std.testing.allocator.free(path);
+    try std.testing.expectEqual(TaskRegistry.RetainLogResult.retained, try implementation.retainLog());
+    implementation.deinit(std.testing.allocator);
+    _ = try std.Io.Dir.cwd().statFile(std.testing.io, path, .{});
+    try std.Io.Dir.cwd().deleteFile(std.testing.io, path);
+}
+
+test "retainLog reports uncertain durability when its trusted root disappears" {
+    const root = ".zig-cache/tmp/zi-retain-fault";
+    const moved = ".zig-cache/tmp/zi-retain-fault-moved";
+    try removeTestTree(root);
+    try removeTestTree(moved);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, root);
+    defer removeTestTree(moved) catch unreachable;
+    var argv: [4:null]?[*:0]const u8 = undefined;
+    var spool_factory: DirectorySpoolFactory = .{ .directory = root };
+    const implementation = try BashTaskJob.create(
+        std.testing.allocator,
+        std.testing.io,
+        ProducerClock.fromIo(std.testing.io),
+        SpoolFactory.from(&spool_factory),
+        testInvocation("true", &argv),
+        null,
+    );
+    try std.Io.Dir.cwd().rename(root, std.Io.Dir.cwd(), moved, std.testing.io);
+    try std.testing.expectEqual(
+        TaskRegistry.RetainLogResult.durability_uncertain,
+        try implementation.retainLog(),
+    );
+    try std.testing.expect(!implementation.retain_log);
+    try std.Io.Dir.cwd().rename(moved, std.Io.Dir.cwd(), root, std.testing.io);
+    implementation.deinit(std.testing.allocator);
+    try std.Io.Dir.cwd().deleteDir(std.testing.io, root);
 }
 
 const FailingExitProbe = struct {

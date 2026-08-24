@@ -17,6 +17,9 @@ pub const Status = union(enum) {
 
 pub const Termination = enum { graceful, force };
 pub const JobError = error{Unexpected};
+
+/// A log path may be advertised only after the job confirms durable retention.
+pub const RetainLogResult = enum { retained, unavailable, durability_uncertain };
 pub const ReadOutcome = union(enum) {
     data: usize,
     would_block,
@@ -46,7 +49,9 @@ pub const Job = struct {
         poll: *const fn (*anyopaque) JobError!void,
         read_at: *const fn (*anyopaque, usize, []u8) JobError!ReadOutcome,
         output_snapshot: *const fn (*anyopaque) OutputSnapshot,
-        retain_log: *const fn (*anyopaque) void,
+        /// Must return `.retained` only after the snapshot path is durable and
+        /// will survive job deinit. Other outcomes must not advertise it.
+        retain_log: *const fn (*anyopaque) JobError!RetainLogResult,
         status: *const fn (*anyopaque) Status,
         terminate: *const fn (*anyopaque, Termination) void,
         /// This is the registry allocator for callback/result context. An
@@ -73,9 +78,9 @@ pub const Job = struct {
                 const self: *Implementation = @ptrCast(@alignCast(context));
                 return self.outputSnapshot();
             }
-            fn retainLog(context: *anyopaque) void {
+            fn retainLog(context: *anyopaque) JobError!RetainLogResult {
                 const self: *Implementation = @ptrCast(@alignCast(context));
-                self.retainLog();
+                return self.retainLog();
             }
             fn status(context: *anyopaque) Status {
                 const self: *Implementation = @ptrCast(@alignCast(context));
@@ -294,12 +299,12 @@ pub const TaskRegistry = struct {
         );
     }
 
-    fn jobRetainLog(self: *TaskRegistry, index: usize) Error!void {
+    fn jobRetainLog(self: *TaskRegistry, index: usize) Error!RetainLogResult {
         try self.enterCallback();
         defer self.leaveCallback();
-        self.entries.items[index].job.vtable.retain_log(
+        return self.entries.items[index].job.vtable.retain_log(
             self.entries.items[index].job.context,
-        );
+        ) catch error.InvalidJob;
     }
 
     fn jobStatus(self: *TaskRegistry, index: usize) Error!Status {
@@ -484,16 +489,35 @@ pub const TaskRegistry = struct {
         try self.ensurePublic();
         try self.pollAll();
         const index = self.findIndex(id) orelse return null;
-        const report = try self.collectOutput(result_allocator, index);
-        try self.commitReport(index, report);
+        var report = try self.collectOutput(result_allocator, index);
+        errdefer report.deinit(result_allocator);
+        try self.finalizeReport(result_allocator, index, &report);
+        self.commitReport(index, report);
         return @as(?Report, report);
     }
 
-    fn commitReport(self: *TaskRegistry, index: usize, report: Report) Error!void {
-        if (report.advertised_log and !self.entries.items[index].log_retained) {
-            try self.jobRetainLog(index);
+    fn finalizeReport(
+        self: *TaskRegistry,
+        result_allocator: std.mem.Allocator,
+        index: usize,
+        report: *Report,
+    ) Error!void {
+        if (!report.advertised_log or self.entries.items[index].log_retained) return;
+        // Allocate both outcomes before the irreversible durability request.
+        // An OOM here leaves retention and the delivery cursor untouched.
+        var failed = try retentionFailedReport(result_allocator, report.*);
+        errdefer failed.deinit(result_allocator);
+        const retained = try self.jobRetainLog(index);
+        if (retained == .retained) {
+            failed.deinit(result_allocator);
             self.entries.items[index].log_retained = true;
+        } else {
+            report.deinit(result_allocator);
+            report.* = failed;
         }
+    }
+
+    fn commitReport(self: *TaskRegistry, index: usize, report: Report) void {
         self.entries.items[index].log_advertised =
             self.entries.items[index].log_advertised or report.advertised_log;
         self.entries.items[index].delivered_bytes = report.next_cursor;
@@ -759,8 +783,22 @@ pub const TaskRegistry = struct {
         try self.streamDisplay(index, options.display, &displayed_bytes, &displayed_body);
         var report = try self.collectOutput(result_allocator, index);
         defer report.deinit(result_allocator);
+        const footer_text = try self.footer(
+            result_allocator,
+            index,
+            stop,
+            options.kill_on_timeout,
+            report.body.len == 0 and report.marker == null,
+        );
+        defer result_allocator.free(footer_text);
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(result_allocator);
+        const current_marker_bytes = if (report.marker) |marker| marker.len else 0;
+        const marker_bytes = @max(current_marker_bytes, retention_failure_marker.len);
+        const reserved = std.math.add(usize, report.body.len, marker_bytes + footer_text.len + 2) catch
+            return error.OutOfMemory;
+        try out.ensureTotalCapacity(result_allocator, reserved);
+        try self.finalizeReport(result_allocator, index, &report);
         if (report.body.len > 0) try out.appendSlice(result_allocator, report.body);
         if (report.marker) |marker| {
             if (out.items.len > 0 and out.items[out.items.len - 1] != '\n')
@@ -780,14 +818,6 @@ pub const TaskRegistry = struct {
                 displayed_body = true;
             }
         }
-        const footer_text = try self.footer(
-            result_allocator,
-            index,
-            stop,
-            options.kill_on_timeout,
-            out.items.len == 0,
-        );
-        defer result_allocator.free(footer_text);
         try out.appendSlice(result_allocator, footer_text);
         if (options.display) |display| {
             if (displayed_body) try self.emitDisplay(display, "\n");
@@ -795,7 +825,7 @@ pub const TaskRegistry = struct {
         }
         const owned = try out.toOwnedSlice(result_allocator);
         errdefer result_allocator.free(owned);
-        try self.commitReport(index, report);
+        self.commitReport(index, report);
         if (self.entries.items[index].status != .running) {
             self.entries.items[index].notified = true;
             self.entries.items[index].collected = true;
@@ -968,6 +998,19 @@ pub const TaskRegistry = struct {
 };
 
 const WaitStop = enum { target_done, other_done, timed_out, interrupted };
+
+const retention_failure_marker =
+    "[full output unavailable: log retention or durability could not be confirmed]";
+
+fn retentionFailedReport(allocator: std.mem.Allocator, report: Report) Error!Report {
+    const body = try allocator.dupe(u8, report.body);
+    errdefer allocator.free(body);
+    return .{
+        .body = body,
+        .marker = try allocator.dupe(u8, retention_failure_marker),
+        .next_cursor = report.next_cursor,
+    };
+}
 
 fn unavailableReport(
     allocator: std.mem.Allocator,
@@ -1257,6 +1300,8 @@ const ScriptedJob = struct {
     unavailable: bool = false,
     saved_path: ?[]const u8 = null,
     retained: bool = false,
+    retain_calls: usize = 0,
+    retain_result: RetainLogResult = .retained,
     stopped: bool = false,
     force_stopped: bool = false,
 
@@ -1282,8 +1327,10 @@ const ScriptedJob = struct {
             .saved_path = self.saved_path,
         };
     }
-    fn retainLog(self: *ScriptedJob) void {
+    fn retainLog(self: *ScriptedJob) JobError!RetainLogResult {
         self.retained = true;
+        self.retain_calls += 1;
+        return self.retain_result;
     }
     fn status(self: *ScriptedJob) Status {
         if (self.force_stopped) return .{ .signaled = 9 };
@@ -1402,7 +1449,9 @@ const ReentrantJob = struct {
     fn outputSnapshot(_: *ReentrantJob) OutputSnapshot {
         return .{ .total_bytes = 0, .stored_bytes = 0, .eof_ms = 0 };
     }
-    fn retainLog(_: *ReentrantJob) void {}
+    fn retainLog(_: *ReentrantJob) JobError!RetainLogResult {
+        return .unavailable;
+    }
     fn status(self: *ReentrantJob) Status {
         return if (self.finished) .{ .exited = 0 } else .running;
     }
@@ -1564,6 +1613,28 @@ test "duration formatting rounds like hax" {
     }
 }
 
+test "unavailable retention never advertises a generic job path and is called once" {
+    var time: TestTime = .{};
+    var registry = try TaskRegistry.init(std.testing.allocator, Clock.from(&time), Poller.from(&time), .{});
+    defer registry.deinit();
+    const implementation = try std.testing.allocator.create(ScriptedJob);
+    implementation.* = .{
+        .bytes = "binary\x00",
+        .finish_after = 1,
+        .saved_path = "/untrusted/job.log",
+        .retain_result = .unavailable,
+    };
+    var job = Job.from(implementation);
+    _ = try registry.adopt(&job, "binary", null, 0);
+    var report = (try registry.reportOutput(std.testing.allocator, "t1")).?;
+    defer report.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), implementation.retain_calls);
+    try std.testing.expect(!report.advertised_log);
+    try std.testing.expect(report.marker != null);
+    try std.testing.expect(std.mem.indexOf(u8, report.marker.?, "/untrusted/job.log") == null);
+    try std.testing.expect(std.mem.indexOf(u8, report.marker.?, "durability") != null);
+}
+
 test "overflow marker retains only the recoverable saved log" {
     var time: TestTime = .{};
     var registry = try TaskRegistry.init(std.testing.allocator, Clock.from(&time), Poller.from(&time), .{
@@ -1685,7 +1756,9 @@ const DelayedEofJob = struct {
             .eof_ms = if (self.polls < 2) null else 1000,
         };
     }
-    fn retainLog(_: *DelayedEofJob) void {}
+    fn retainLog(_: *DelayedEofJob) JobError!RetainLogResult {
+        return .unavailable;
+    }
     fn status(_: *DelayedEofJob) Status {
         return .{ .exited = 7 };
     }
@@ -1706,7 +1779,9 @@ const TerminationTraceJob = struct {
     fn outputSnapshot(_: *TerminationTraceJob) OutputSnapshot {
         return .{ .total_bytes = 0, .stored_bytes = 0, .eof_ms = 0 };
     }
-    fn retainLog(_: *TerminationTraceJob) void {}
+    fn retainLog(_: *TerminationTraceJob) JobError!RetainLogResult {
+        return .unavailable;
+    }
     fn status(self: *TerminationTraceJob) Status {
         return if (self.stopped) .{ .signaled = 9 } else .running;
     }
@@ -1840,6 +1915,38 @@ test "write and read failures advertise sanitized retained source paths" {
     try std.testing.expect(std.mem.indexOf(u8, read_report.marker.?, "log read failed") != null);
     try std.testing.expect(std.mem.indexOf(u8, read_report.marker.?, "/tmp/read-failed.log") != null);
     try std.testing.expect(read_job.retained);
+}
+
+test "wait allocates retained and failed forms before calling retain once" {
+    const bytes = try std.testing.allocator.alloc(u8, 80 * 1024);
+    defer std.testing.allocator.free(bytes);
+    @memset(bytes, 'w');
+    var reached_success = false;
+    for (0..96) |fail_index| {
+        var time: TestTime = .{};
+        var registry = try TaskRegistry.init(std.testing.allocator, Clock.from(&time), Poller.from(&time), .{});
+        defer registry.deinit();
+        const implementation = try std.testing.allocator.create(ScriptedJob);
+        implementation.* = .{
+            .bytes = bytes,
+            .finish_after = std.math.maxInt(usize),
+            .saved_path = "/tmp/wait-oom.log",
+        };
+        var job = Job.from(implementation);
+        _ = try registry.adopt(&job, "large", null, 0);
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        if (registry.wait(failing.allocator(), "t1", .{ .timeout_ms = 0 })) |output| {
+            failing.allocator().free(output);
+            try std.testing.expectEqual(@as(usize, 1), implementation.retain_calls);
+            reached_success = true;
+            break;
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expectEqual(@as(usize, 0), implementation.retain_calls);
+            try std.testing.expectEqual(@as(usize, 0), registry.entries.items[0].delivered_bytes);
+        }
+    }
+    try std.testing.expect(reached_success);
 }
 
 test "report OOM never advances cursor or prematurely retains an omitted log" {

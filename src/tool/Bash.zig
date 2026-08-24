@@ -9,7 +9,8 @@ const BashTaskJobModule = @import("BashTaskJob.zig");
 const BashTaskJob = BashTaskJobModule.BashTaskJob;
 const ProducerClock = BashTaskJobModule.ProducerClock;
 const SpoolFactory = BashTaskJobModule.SpoolFactory;
-const DirectorySpoolFactory = BashTaskJobModule.DirectorySpoolFactory;
+const SpoolStore = BashTaskJobModule.SpoolStore;
+const StoreSpoolFactory = BashTaskJobModule.StoreSpoolFactory;
 const TaskRegistryModule = @import("TaskRegistry.zig");
 
 const maximum_json_bytes: usize = 1024 * 1024;
@@ -23,7 +24,7 @@ pub const Config = struct {
     output: BashOutput.Options = .{},
     maximum_retained_spills: usize = 16,
     maximum_retained_spill_bytes: usize = 256 * 1024 * 1024,
-    /// Borrowed. The owner must shut down the registry after Bash is deinitialized.
+    /// Borrowed. The owner must shut down and deinitialize the registry before Bash.
     task_registry: ?*TaskRegistryModule.TaskRegistry = null,
     background_yield_ms: u64 = 1000,
 };
@@ -40,7 +41,8 @@ pub const Bash = struct {
     maximum_timeout_ms: u64,
     termination_grace_ms: u64,
     output_options: BashOutput.Options,
-    temp_directory: []u8,
+    temp_directory: []const u8,
+    spool_store: *SpoolStore,
     kept_outputs: std.ArrayList(BashOutput.BashOutput) = .empty,
     retained_spill_bytes: usize = 0,
     maximum_retained_spills: usize,
@@ -87,8 +89,9 @@ pub const Bash = struct {
             deleteTempDirectory(io, temp_directory);
             allocator.free(temp_directory);
         }
+        const spool_store = try SpoolStore.create(allocator, io, temp_directory);
         var output_options = config.output;
-        output_options.temp_directory = temp_directory;
+        output_options.temp_directory = spool_store.trusted_log_root;
         return .{
             .allocator = allocator,
             .io = io,
@@ -99,7 +102,8 @@ pub const Bash = struct {
             .maximum_timeout_ms = config.maximum_timeout_ms,
             .termination_grace_ms = config.termination_grace_ms,
             .output_options = output_options,
-            .temp_directory = temp_directory,
+            .temp_directory = spool_store.trusted_log_root,
+            .spool_store = spool_store,
             .maximum_retained_spills = config.maximum_retained_spills,
             .maximum_retained_spill_bytes = config.maximum_retained_spill_bytes,
             .task_registry = config.task_registry,
@@ -113,8 +117,7 @@ pub const Bash = struct {
         self.environment.deinit(self.allocator);
         self.allocator.free(self.shell);
         if (self.home) |home| self.allocator.free(home);
-        deleteTempDirectory(self.io, self.temp_directory);
-        self.allocator.free(self.temp_directory);
+        self.spool_store.releaseOwner();
         self.* = undefined;
     }
 
@@ -280,7 +283,7 @@ pub const Bash = struct {
         defer allocator.free(command_z);
         const argv0 = shellArgv0(self.shell);
         var argv: [4:null]?[*:0]const u8 = .{ argv0, "-c", command_z.ptr, null };
-        var spool_factory: DirectorySpoolFactory = .{ .directory = self.temp_directory };
+        var spool_factory: StoreSpoolFactory = .{ .store = self.spool_store };
         const task = BashTaskJob.create(
             allocator,
             self.io,
@@ -317,6 +320,7 @@ pub const Bash = struct {
         var sink: CaptureSink = .{ .output = &capture, .display = run_context.display };
         var captured_cursor: usize = 0;
         const wait_ms = if (background) self.background_yield_ms else timeout_ms;
+        var stop_reason: BashOutput.StopReason = .none;
         const deadline: ?i128 = if (!background and timeout_ms == 0)
             null
         else
@@ -336,6 +340,7 @@ pub const Bash = struct {
                     background,
                     name,
                     task.killedLaunchOrphans(),
+                    stop_reason,
                 ),
                 .signaled => |signal| return self.finishManaged(
                     allocator,
@@ -347,9 +352,11 @@ pub const Bash = struct {
                     background,
                     name,
                     task.killedLaunchOrphans(),
+                    stop_reason,
                 ),
             }
-            if (run_context.cancel) |cancel| if (cancel.isRequested()) {
+            if (!background) if (run_context.cancel) |cancel| if (cancel.isRequested()) {
+                stop_reason = .interrupt;
                 task.terminate(.force);
                 continue;
             };
@@ -453,8 +460,11 @@ pub const Bash = struct {
         background: bool,
         name: ?[]const u8,
         orphaned: bool,
+        stop_reason: BashOutput.StopReason,
     ) ToolContract.RunError!ToolContract.Result {
-        const options: BashOutput.FinishOptions = if (orphaned)
+        const options: BashOutput.FinishOptions = if (stop_reason == .interrupt)
+            .{ .status = status, .reason = .interrupt }
+        else if (orphaned)
             .{ .status = status, .reason = .orphaned, .timeout_ms = @intCast(timeout_ms) }
         else
             .{ .status = status };
@@ -1242,6 +1252,40 @@ const RealTaskHarness = struct {
     }
 };
 
+const RequestedCancellation = struct {
+    pub fn isRequested(_: *const RequestedCancellation) bool {
+        return true;
+    }
+};
+
+test "managed foreground cancellation reports interrupt exactly" {
+    var harness: RealTaskHarness = .{ .io = std.testing.io };
+    var registry = try TaskRegistryModule.TaskRegistry.init(
+        std.testing.allocator,
+        TaskRegistryModule.Clock.from(&harness),
+        TaskRegistryModule.Poller.from(&harness),
+        .{},
+    );
+    var bash = try Bash.init(std.testing.allocator, std.testing.io, .{
+        .environment = std.testing.environ,
+        .task_registry = &registry,
+        .timeout_ms = 10_000,
+    });
+    defer {
+        registry.deinit();
+        bash.deinit();
+    }
+    const requested: RequestedCancellation = .{};
+    var result = try bash.tool().run(
+        std.testing.allocator,
+        std.testing.io,
+        "{\"command\":\"sleep 10\"}",
+        .{ .cancel = ToolContract.Cancellation.from(&requested) },
+    );
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("\n[interrupted]", result.output);
+}
+
 test "background fast finish stays synchronous and slow command is adopted" {
     var harness: RealTaskHarness = .{ .io = std.testing.io };
     var registry = try TaskRegistryModule.TaskRegistry.init(
@@ -1250,14 +1294,16 @@ test "background fast finish stays synchronous and slow command is adopted" {
         TaskRegistryModule.Poller.from(&harness),
         .{},
     );
-    defer registry.deinit();
     var bash = try Bash.init(std.testing.allocator, std.testing.io, .{
         .environment = std.testing.environ,
         .task_registry = &registry,
         .background_yield_ms = 1000,
         .timeout_ms = 20,
     });
-    defer bash.deinit();
+    defer {
+        registry.deinit();
+        bash.deinit();
+    }
 
     var fast = try bash.tool().run(
         std.testing.allocator,
