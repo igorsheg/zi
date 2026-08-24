@@ -135,6 +135,65 @@ pub const RefreshResult = struct {
 
 pub const Error = error{OutOfMemory};
 
+pub const PlannedFetchOptions = struct {
+    url: []const u8,
+    nonce_source: persistence.PrivateFileStore.NonceSource,
+    commit_ops: persistence.PrivateFileStore.CommitOps = .standard,
+    warning_days: ?u64 = null,
+};
+
+pub const PlannedFetchResult = struct {
+    outcome: RefreshOutcome,
+    warning_days: ?u64,
+};
+
+/// Executes one already-decided fetch. It does not inspect or retain the old catalog.
+pub fn executePlannedFetch(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cache: *persistence.CatalogCache.CatalogCache,
+    fetcher: Fetcher,
+    options: PlannedFetchOptions,
+) Error!PlannedFetchResult {
+    var fetched = try fetcher.fetch(allocator, io, .{
+        .url = options.url,
+        .timeout_ms = request_timeout_ms,
+        .max_response_bytes = maximum_response_bytes,
+    });
+    defer fetched.deinit(allocator);
+    switch (fetched) {
+        .transport => |failure| return .{
+            .outcome = .{ .fetch_failed = .{ .transport = failure } },
+            .warning_days = options.warning_days,
+        },
+        .response => |response| {
+            if (response.status < 200 or response.status >= 300) return .{
+                .outcome = .{ .fetch_failed = .{ .status = response.status } },
+                .warning_days = options.warning_days,
+            };
+            if (response.body.len > maximum_response_bytes) return .{
+                .outcome = .{ .fetch_failed = .too_large },
+                .warning_days = options.warning_days,
+            };
+            if (!(try validCandidate(allocator, response.body))) return .{
+                .outcome = .{ .fetch_failed = .malformed },
+                .warning_days = options.warning_days,
+            };
+            return switch (cache.replaceWithOps(response.body, options.nonce_source, options.commit_ops)) {
+                .published => .{ .outcome = .replaced, .warning_days = null },
+                .not_published => |failure| .{
+                    .outcome = .{ .not_published = failure },
+                    .warning_days = options.warning_days,
+                },
+                .uncertain => |failure| .{
+                    .outcome = .{ .publication_uncertain = failure },
+                    .warning_days = options.warning_days,
+                },
+            };
+        },
+    }
+}
+
 pub fn refresh(
     allocator: std.mem.Allocator,
     io: std.Io,

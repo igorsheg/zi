@@ -1,10 +1,12 @@
 //! Process-owned background lifecycle for the on-disk model catalog.
 //!
 //! `Owner` is heap allocated so erased callbacks and the worker always point at
-//! a stable address. The allocator used by `create` does not need to be thread
-//! safe: the worker uses a private arena and `deinit` touches the owner
-//! allocator only after joining it. Transport, clock, nonce, commit, and wakeup
-//! callback contexts are borrowed and must outlive `cancelAndDrain`.
+//! a stable address. The allocator and `std.Io` passed to `create` are explicit
+//! process resources and must support use from the caller and worker threads.
+//! Caller lookups and the worker use separate cache handles over the same atomic
+//! file. Borrowed callback contexts must outlive `Owner.deinit`; transport,
+//! nonce, and commit operations remain valid through join. The clock supports
+//! concurrent lookup and worker use. Wakeup supports concurrent transport use.
 
 const std = @import("std");
 const ai = @import("ai/root.zig");
@@ -90,17 +92,18 @@ pub const StartError = error{
 const JsonFetcher = struct {
     owner: *Owner,
 
-    fn poll(self: *JsonFetcher) ai.Provider.DeliveryError!void {
+    pub fn poll(self: *JsonFetcher) ai.Provider.DeliveryError!void {
         return self.owner.pollCancellation();
     }
 
-    fn fetch(
+    pub fn fetch(
         self: *JsonFetcher,
         allocator: std.mem.Allocator,
         io: std.Io,
         descriptor: CatalogManager.GetDescriptor,
     ) CatalogManager.FetchError!CatalogManager.FetchResult {
         std.debug.assert(descriptor.method == .get);
+        self.owner.pollCancellation() catch return .{ .transport = .canceled };
         var response = self.owner.json_transport.request(allocator, io, .{
             .method = .get,
             .url = descriptor.url,
@@ -111,8 +114,8 @@ const JsonFetcher = struct {
                 .max_response_body_bytes = descriptor.max_response_bytes,
                 .max_header_bytes = ai.JsonTransport.maximum_header_bytes,
                 .header_buffer_bytes = ai.JsonTransport.maximum_header_bytes,
-                .connect_timeout_ms = descriptor.timeout_ms,
-                .idle_timeout_ms = descriptor.timeout_ms,
+                .connect_timeout_ms = 2_000,
+                .idle_timeout_ms = 0,
                 .total_timeout_ms = descriptor.timeout_ms,
             },
         }) catch |err| return switch (err) {
@@ -134,18 +137,23 @@ pub const Owner = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     cache: persistence.CatalogCache.CatalogCache,
+    worker_cache: persistence.CatalogCache.CatalogCache,
     url: []u8,
-    refresh_ms: u64,
-    now_seconds: i64,
-    json_transport: ai.JsonTransport.Transport,
+    refresh_ms_value: u64,
     nonce_source: persistence.PrivateFileStore.NonceSource,
     commit_ops: persistence.PrivateFileStore.CommitOps,
     wakeup: ?Wakeup,
+    json_transport: ai.JsonTransport.Transport,
     fetch_adapter: JsonFetcher,
+
     canceled: std.atomic.Value(bool) = .init(false),
     attempted: std.atomic.Value(bool) = .init(false),
-    mutex: std.atomic.Mutex = .unlocked,
+    lifecycle_mutex: std.Io.Mutex = .init,
+    lifecycle_condition: std.Io.Condition = .init,
+    result_mutex: std.Io.Mutex = .init,
     thread: ?std.Thread = null,
+    joining: bool = false,
+    joined: bool = false,
     started: bool = false,
     running: bool = false,
     completion: ?Completion = null,
@@ -168,13 +176,20 @@ pub const Owner = struct {
             options.clock,
         );
         errdefer cache.deinit();
+        var worker_cache = try persistence.CatalogCache.CatalogCache.init(
+            allocator,
+            io,
+            options.cache_root,
+            options.clock,
+        );
+        errdefer worker_cache.deinit();
         self.* = .{
             .allocator = allocator,
             .io = io,
             .cache = cache,
+            .worker_cache = worker_cache,
             .url = url,
-            .refresh_ms = options.refresh_ms,
-            .now_seconds = options.now_seconds,
+            .refresh_ms_value = options.refresh_ms,
             .json_transport = json_transport,
             .nonce_source = options.nonce_source,
             .commit_ops = options.commit_ops,
@@ -185,62 +200,98 @@ pub const Owner = struct {
         return self;
     }
 
-    /// Inspects freshness on the caller thread. Like hax, the one-attempt latch
-    /// is consumed before disabled/fresh checks and is not reset on failures.
+    /// Consumes the one-attempt latch before planning freshness. Concurrent
+    /// calls are serialized with thread publication.
     pub fn start(self: *Owner) StartError!StartResult {
+        self.lifecycle_mutex.lockUncancelable(self.io);
+        defer self.lifecycle_mutex.unlock(self.io);
         if (self.attempted.swap(true, .acq_rel)) return .already_attempted;
 
-        var inspection = self.cache.inspect(self.allocator, .{
+        const plan = self.cache.planRefresh(.{
             .url = self.url,
-            .refresh_ms = self.refresh_ms,
-        }) catch |err| {
-            self.setStartFailure(.out_of_memory);
-            return err;
-        };
-        defer inspection.deinit(self.allocator);
-        switch (inspection.refresh) {
+            .refresh_ms = self.refreshMs(),
+        });
+        switch (plan.decision) {
             .disabled => {
-                self.setCompletion(.disabled, null);
+                self.setCompletion(.disabled, plan.stale_days, false, false);
+                self.joined = true;
                 return .disabled;
             },
             .fresh => {
-                self.setCompletion(.fresh, null);
+                self.setCompletion(.fresh, plan.stale_days, false, false);
+                self.joined = true;
                 return .fresh;
             },
             .fetch => {},
         }
 
-        self.mutex.lock();
-        self.started = true;
-        self.running = true;
-        self.mutex.unlock();
+        self.setCompletion(null, plan.stale_days, true, true);
         self.thread = std.Thread.spawn(.{}, workerMain, .{self}) catch |err| {
-            self.mutex.lock();
-            self.started = false;
-            self.running = false;
-            self.completion = .{ .start_failed = startFailure(err) };
-            self.mutex.unlock();
+            self.setCompletion(.{ .start_failed = startFailure(err) }, plan.stale_days, false, false);
+            self.joined = true;
             return err;
         };
         return .started;
     }
 
-    /// Requests cancellation, wakes a transport that supports it, and joins.
-    /// This is idempotent after the sole worker has been joined.
-    pub fn cancelAndDrain(self: *Owner) Summary {
-        self.canceled.store(true, .release);
-        if (self.wakeup) |hook| hook.wake();
-        if (self.thread) |thread| {
-            thread.join();
-            self.thread = null;
+    /// Waits up to `max_wait_ms` for completion without requesting cancellation.
+    pub fn wait(self: *Owner, max_wait_ms: u64) bool {
+        if (!self.poll().running) return true;
+        if (max_wait_ms == 0) return false;
+        const start_ns = std.Io.Clock.awake.now(self.io).nanoseconds;
+        const wait_ns = @as(i128, max_wait_ms) * std.time.ns_per_ms;
+        while (self.poll().running) {
+            const now_ns = std.Io.Clock.awake.now(self.io).nanoseconds;
+            if (@as(i128, now_ns) - @as(i128, start_ns) >= wait_ns) return false;
+            std.Io.sleep(self.io, .fromMilliseconds(1), .awake) catch
+                std.Thread.yield() catch std.atomic.spinLoopHint();
         }
+        return true;
+    }
+
+    /// Gives the worker a grace period, cancels and wakes it only if unfinished,
+    /// then performs the sole join. Concurrent drains wait for that join.
+    pub fn drain(self: *Owner, max_wait_ms: u64) Summary {
+        _ = self.wait(max_wait_ms);
+        self.lifecycle_mutex.lockUncancelable(self.io);
+        while (self.joining) self.lifecycle_condition.waitUncancelable(
+            self.io,
+            &self.lifecycle_mutex,
+        );
+        if (self.joined) {
+            self.lifecycle_mutex.unlock(self.io);
+            return self.poll();
+        }
+        const thread = self.thread orelse {
+            _ = self.attempted.swap(true, .acq_rel);
+            self.joined = true;
+            self.lifecycle_mutex.unlock(self.io);
+            return self.poll();
+        };
+        self.joining = true;
+        const unfinished = self.poll().running;
+        if (unfinished) self.canceled.store(true, .release);
+        self.lifecycle_mutex.unlock(self.io);
+
+        if (unfinished) if (self.wakeup) |hook| hook.wake();
+        thread.join();
+
+        self.lifecycle_mutex.lockUncancelable(self.io);
+        self.thread = null;
+        self.joining = false;
+        self.joined = true;
+        self.lifecycle_condition.broadcast(self.io);
+        self.lifecycle_mutex.unlock(self.io);
         return self.poll();
     }
 
-    /// Returns the current bounded observation without invoking user code.
+    pub fn cancelAndDrain(self: *Owner) Summary {
+        return self.drain(0);
+    }
+
     pub fn poll(self: *Owner) Summary {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.result_mutex.lockUncancelable(self.io);
+        defer self.result_mutex.unlock(self.io);
         return .{
             .attempted = self.attempted.load(.acquire),
             .started = self.started,
@@ -250,8 +301,6 @@ pub const Owner = struct {
         };
     }
 
-    /// Reads the atomic cache file each time. The caller allocator owns all
-    /// returned contribution fields according to ModelCatalog's value contract.
     pub fn lookup(
         self: *Owner,
         allocator: std.mem.Allocator,
@@ -262,9 +311,12 @@ pub const Owner = struct {
         return CatalogManager.lookup(allocator, &self.cache, override_json, provider_id, model_id);
     }
 
+    /// Requires exclusive ownership: no other method call may overlap deinit.
+    /// Borrowed callback contexts must remain valid through this call.
     pub fn deinit(self: *Owner) void { // ziglint-ignore: Z030
-        _ = self.cancelAndDrain();
+        _ = self.drain(0);
         const allocator = self.allocator;
+        self.worker_cache.deinit();
         self.cache.deinit();
         allocator.free(self.url);
         self.* = undefined;
@@ -278,51 +330,356 @@ pub const Owner = struct {
     fn workerMain(self: *Owner) void {
         var arena: std.heap.ArenaAllocator = .init(self.allocator);
         defer arena.deinit();
-        var result = CatalogManager.refresh(
+        const warning_days = self.poll().warning_days;
+        const result = CatalogManager.executePlannedFetch(
             arena.allocator(),
             self.io,
-            &self.cache,
+            &self.worker_cache,
             .from(&self.fetch_adapter),
             .{
-                .now_seconds = self.now_seconds,
                 .url = self.url,
-                .refresh_ms = self.refresh_ms,
                 .nonce_source = self.nonce_source,
                 .commit_ops = self.commit_ops,
+                .warning_days = warning_days,
             },
         ) catch {
-            self.mutex.lock();
-            self.running = false;
-            self.completion = .worker_out_of_memory;
-            self.warning_days = null;
-            self.mutex.unlock();
+            self.setCompletion(.worker_out_of_memory, warning_days, true, false);
+            self.lifecycle_condition.broadcast(self.io);
             return;
         };
-        defer result.deinit(arena.allocator());
-        self.mutex.lock();
-        self.running = false;
-        self.completion = .{ .refresh = result.outcome };
-        self.warning_days = result.warning_days;
-        self.mutex.unlock();
+        self.setCompletion(.{ .refresh = result.outcome }, result.warning_days, true, false);
+        self.lifecycle_condition.broadcast(self.io);
     }
 
-    fn setCompletion(self: *Owner, completion: Completion, warning_days: ?u64) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+    fn setCompletion(
+        self: *Owner,
+        completion: ?Completion,
+        warning_days: ?u64,
+        started: bool,
+        running: bool,
+    ) void {
+        self.result_mutex.lockUncancelable(self.io);
+        defer self.result_mutex.unlock(self.io);
+        self.started = started;
+        self.running = running;
         self.completion = completion;
         self.warning_days = warning_days;
     }
 
-    fn setStartFailure(self: *Owner, failure: StartFailure) void {
-        self.setCompletion(.{ .start_failed = failure }, null);
+    fn refreshMs(self: *const Owner) u64 {
+        return self.refresh_ms_value;
     }
 };
 
 fn startFailure(err: std.Thread.SpawnError) StartFailure {
     return switch (err) {
+        error.OutOfMemory => .out_of_memory,
         error.SystemResources => .system_resources,
         error.ThreadQuotaExceeded => .thread_quota_exceeded,
         error.LockedMemoryLimitExceeded => .locked_memory_limit_exceeded,
         error.Unexpected => .unexpected,
     };
+}
+
+fn testNonce() persistence.PrivateFileStore.NonceSource {
+    const Source = struct {
+        fn fill(_: *anyopaque, bytes: []u8) persistence.PrivateFileStore.Error!void {
+            @memset(bytes, 9);
+        }
+    };
+    return .{ .context = undefined, .fill_fn = Source.fill };
+}
+
+const BlockingTransport = struct {
+    entered: std.atomic.Value(bool) = .init(false),
+    woken: std.atomic.Value(bool) = .init(false),
+    calls: std.atomic.Value(usize) = .init(0),
+    exact_request: std.atomic.Value(bool) = .init(false),
+
+    pub fn request(
+        _: std.mem.Allocator,
+        _: std.Io,
+        self: *BlockingTransport,
+        value: ai.JsonTransport.Request,
+    ) ai.JsonTransport.Error!ai.JsonTransport.Response {
+        _ = self.calls.fetchAdd(1, .acq_rel);
+        self.exact_request.store(value.method == .get and
+            std.mem.eql(u8, value.url, "https://catalog.test/models.json") and
+            value.headers.len == 0 and value.json_body == null and
+            value.limits.max_response_body_bytes == 32 * 1024 * 1024 and
+            value.limits.connect_timeout_ms == 2_000 and
+            value.limits.idle_timeout_ms == 0 and
+            value.limits.total_timeout_ms == 30_000 and value.tick != null, .release);
+        self.entered.store(true, .release);
+        while (!self.woken.load(.acquire)) {
+            if (value.tick) |tick| try tick.poll();
+            std.Thread.yield() catch std.atomic.spinLoopHint();
+        }
+        if (value.tick) |tick| try tick.poll();
+        return error.Cancelled;
+    }
+
+    fn wake(self: *BlockingTransport) void {
+        self.woken.store(true, .release);
+    }
+};
+
+const ImmediateTransport = struct {
+    calls: std.atomic.Value(usize) = .init(0),
+    wakes: std.atomic.Value(usize) = .init(0),
+    status: u16 = 503,
+    body: []const u8 = "",
+
+    pub fn request(
+        allocator: std.mem.Allocator,
+        _: std.Io,
+        self: *ImmediateTransport,
+        _: ai.JsonTransport.Request,
+    ) ai.JsonTransport.Error!ai.JsonTransport.Response {
+        _ = self.calls.fetchAdd(1, .acq_rel);
+        return .{
+            .status = self.status,
+            .body = allocator.dupe(u8, self.body) catch return error.OutOfMemory,
+        };
+    }
+
+    fn wake(self: *ImmediateTransport) void {
+        _ = self.wakes.fetchAdd(1, .acq_rel);
+    }
+};
+
+const StartCall = struct {
+    owner: *Owner,
+    result: ?StartResult = null,
+    failed: bool = false,
+
+    fn run(self: *StartCall) void {
+        self.result = self.owner.start() catch {
+            self.failed = true;
+            return;
+        };
+    }
+};
+
+const DrainCall = struct {
+    owner: *Owner,
+    summary: ?Summary = null,
+
+    fn run(self: *DrainCall) void {
+        self.summary = self.owner.drain(0);
+    }
+};
+
+fn waitFor(value: *std.atomic.Value(bool)) void {
+    while (!value.load(.acquire)) std.Thread.yield() catch std.atomic.spinLoopHint();
+}
+
+fn waitUntilStopped(owner: *Owner) void {
+    while (owner.poll().running) std.Thread.yield() catch std.atomic.spinLoopHint();
+}
+
+fn fixedClock(seconds: *i64) persistence.CatalogCache.Clock {
+    const Fixed = struct {
+        fn now(_: std.Io, context: ?*anyopaque) i64 {
+            const value: *i64 = @ptrCast(@alignCast(context.?));
+            return value.*;
+        }
+    };
+    return .{ .context = seconds, .now_fn = Fixed.now };
+}
+
+const CountingClock = struct {
+    seconds: i64,
+    calls: std.atomic.Value(usize) = .init(0),
+
+    fn now(_: std.Io, context: ?*anyopaque) i64 {
+        const self: *CountingClock = @ptrCast(@alignCast(context.?));
+        _ = self.calls.fetchAdd(1, .acq_rel);
+        return self.seconds;
+    }
+
+    fn clock(self: *CountingClock) persistence.CatalogCache.Clock {
+        return .{ .context = self, .now_fn = now };
+    }
+};
+
+test "freshness latch is consumed by a disabled attempt" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const root = try temporary.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    var transport: ImmediateTransport = .{};
+    const owner = try Owner.create(allocator, io, .from(&transport), .{
+        .cache_root = root,
+        .url = "",
+        .refresh_ms = 1,
+        .now_seconds = 0,
+        .nonce_source = testNonce(),
+    });
+    defer owner.deinit();
+
+    try std.testing.expect(try owner.start() == .disabled);
+    try std.testing.expect(try owner.start() == .already_attempted);
+    const summary = owner.cancelAndDrain();
+    try std.testing.expect(summary.attempted);
+    try std.testing.expect(!summary.started);
+    try std.testing.expect(!summary.running);
+    try std.testing.expect(summary.completion.? == .disabled);
+    try std.testing.expectEqual(@as(usize, 0), transport.calls.load(.acquire));
+
+    var cache = try persistence.CatalogCache.CatalogCache.init(allocator, io, root, .system);
+    defer cache.deinit();
+    try std.testing.expect(cache.replace(
+        \\{"p":{"models":{}}}
+    , testNonce()) == .published);
+    const fresh_owner = try Owner.create(allocator, io, .from(&transport), .{
+        .cache_root = root,
+        .url = "https://catalog.test/models.json",
+        .refresh_ms = std.math.maxInt(u64),
+        .now_seconds = 0,
+        .nonce_source = testNonce(),
+    });
+    defer fresh_owner.deinit();
+    try std.testing.expect(try fresh_owner.start() == .fresh);
+    try std.testing.expect(try fresh_owner.start() == .already_attempted);
+    try std.testing.expect(fresh_owner.poll().completion.? == .fresh);
+    try std.testing.expectEqual(@as(usize, 0), transport.calls.load(.acquire));
+
+    var stale_now: i64 = std.math.maxInt(i64);
+    const canceled_owner = try Owner.create(allocator, io, .from(&transport), .{
+        .cache_root = root,
+        .clock = fixedClock(&stale_now),
+        .url = "https://catalog.test/models.json",
+        .refresh_ms = 1,
+        .now_seconds = stale_now,
+        .nonce_source = testNonce(),
+    });
+    defer canceled_owner.deinit();
+    canceled_owner.canceled.store(true, .release);
+    try std.testing.expect(try canceled_owner.start() == .started);
+    const canceled_summary = canceled_owner.drain(100);
+    try std.testing.expect(canceled_summary.completion.?.refresh.fetch_failed.transport == .canceled);
+    try std.testing.expectEqual(@as(usize, 0), transport.calls.load(.acquire));
+}
+
+test "concurrent start and drain serialize thread publication" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const root = try temporary.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    var transport: BlockingTransport = .{};
+    const owner = try Owner.create(allocator, io, .from(&transport), .{
+        .cache_root = root,
+        .url = "https://catalog.test/models.json",
+        .refresh_ms = 1,
+        .now_seconds = 0,
+        .nonce_source = testNonce(),
+        .wakeup = .from(&transport),
+    });
+    defer owner.deinit();
+    var start_call: StartCall = .{ .owner = owner };
+    var drain_call: DrainCall = .{ .owner = owner };
+    const start_thread = try std.Thread.spawn(.{}, StartCall.run, .{&start_call});
+    const drain_thread = try std.Thread.spawn(.{}, DrainCall.run, .{&drain_call});
+    start_thread.join();
+    drain_thread.join();
+    try std.testing.expect(!start_call.failed);
+    try std.testing.expect(start_call.result.? == .started or
+        start_call.result.? == .already_attempted);
+    try std.testing.expect(!drain_call.summary.?.running);
+    try std.testing.expect(owner.thread == null);
+}
+
+test "background request is exact, lookup is concurrent, and shutdown cancels and joins" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const root = try temporary.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    var transport: BlockingTransport = .{};
+    const owner = try Owner.create(allocator, io, .from(&transport), .{
+        .cache_root = root,
+        .url = "https://catalog.test/models.json",
+        .refresh_ms = 1,
+        .now_seconds = 0,
+        .nonce_source = testNonce(),
+        .wakeup = .from(&transport),
+    });
+    defer owner.deinit();
+
+    try std.testing.expect(try owner.start() == .started);
+    waitFor(&transport.entered);
+    const contribution = try owner.lookup(allocator,
+        \\{"p":{"m":{"limit":{"output":17}}}}
+    , "p", "m");
+    try std.testing.expectEqual(@as(u64, 17), contribution.metadata.max_output);
+
+    var drain_a: DrainCall = .{ .owner = owner };
+    var drain_b: DrainCall = .{ .owner = owner };
+    const thread_a = try std.Thread.spawn(.{}, DrainCall.run, .{&drain_a});
+    const thread_b = try std.Thread.spawn(.{}, DrainCall.run, .{&drain_b});
+    thread_a.join();
+    thread_b.join();
+    const summary = drain_a.summary.?;
+    try std.testing.expect(drain_b.summary.?.completion.?.refresh.fetch_failed.transport == .canceled);
+    try std.testing.expect(summary.started);
+    try std.testing.expect(!summary.running);
+    try std.testing.expect(summary.completion.?.refresh.fetch_failed.transport == .canceled);
+    try std.testing.expect(summary.warning_days == null);
+    try std.testing.expect(transport.woken.load(.acquire));
+    try std.testing.expect(transport.exact_request.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), transport.calls.load(.acquire));
+    try std.testing.expect(owner.thread == null);
+}
+
+test "drain reports stale warning without retaining catalog bytes" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const root = try temporary.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    var now_seconds: i64 = 0;
+    var cache = try persistence.CatalogCache.CatalogCache.init(
+        allocator,
+        io,
+        root,
+        fixedClock(&now_seconds),
+    );
+    defer cache.deinit();
+    try std.testing.expect(cache.replace(
+        \\{"p":{"models":{"m":{"limit":{"context":41}}}}}
+    , testNonce()) == .published);
+    var disk = try cache.read(allocator);
+    const modified_seconds = disk.cached.modified_seconds;
+    disk.deinit(allocator);
+    const day: i64 = @intCast(persistence.CatalogCache.seconds_per_day);
+    now_seconds = modified_seconds + 40 * day;
+
+    var transport: ImmediateTransport = .{};
+    var counting_clock: CountingClock = .{ .seconds = now_seconds };
+    const owner = try Owner.create(allocator, io, .from(&transport), .{
+        .cache_root = root,
+        .clock = counting_clock.clock(),
+        .url = "https://catalog.test/models.json",
+        .refresh_ms = 1,
+        .now_seconds = now_seconds,
+        .nonce_source = testNonce(),
+        .wakeup = .from(&transport),
+    });
+    defer owner.deinit();
+    try std.testing.expect(try owner.start() == .started);
+    const summary = owner.drain(100);
+    try std.testing.expectEqual(@as(usize, 0), transport.wakes.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 40), summary.warning_days.?);
+    try std.testing.expectEqual(@as(u16, 503), summary.completion.?.refresh.fetch_failed.status);
+    try std.testing.expectEqual(@as(usize, 1), counting_clock.calls.load(.acquire));
+
+    const contribution = try owner.lookup(allocator, "", "p", "m");
+    try std.testing.expectEqual(@as(u64, 41), contribution.metadata.context_window);
 }

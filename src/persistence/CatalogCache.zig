@@ -72,7 +72,7 @@ pub const Inspection = struct {
     }
 };
 
-const Freshness = struct {
+pub const RefreshPlan = struct {
     decision: RefreshDecision,
     stale_days: ?u64 = null,
 };
@@ -177,7 +177,12 @@ pub const CatalogCache = struct {
         };
     }
 
-    fn statFreshness(cache: CatalogCache, policy: RefreshPolicy) Freshness {
+    /// Uses metadata only. It never opens or allocates the catalog body.
+    pub fn planRefresh(cache: CatalogCache, policy: RefreshPolicy) RefreshPlan {
+        return cache.statFreshness(policy);
+    }
+
+    fn statFreshness(cache: CatalogCache, policy: RefreshPolicy) RefreshPlan {
         if (policy.url.len == 0 or policy.refresh_ms == 0) return .{ .decision = .disabled };
         const root = openRoot(cache.io, cache.cache_root) catch return .{ .decision = .fetch };
         defer root.close(cache.io);
