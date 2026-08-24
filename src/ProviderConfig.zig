@@ -10,6 +10,51 @@ const Registry = ai.ProviderRegistry;
 const ProviderDefinitions = config.ProviderDefinitions;
 const Definition = ProviderDefinitions.Definition;
 
+/// Borrowed synchronous access to an already available model catalog snapshot.
+/// Implementations must not start or wait for network work. The returned value
+/// owns all of its variable data inline.
+pub const ModelHintsSource = struct {
+    context: *anyopaque,
+    lookup_fn: *const fn (
+        std.mem.Allocator,
+        *anyopaque,
+        []const u8,
+        []const u8,
+    ) error{OutOfMemory}!ai.ModelCatalog.Contribution,
+
+    pub fn from(implementation: anytype) ModelHintsSource {
+        const Pointer = @TypeOf(implementation);
+        const pointer_info = @typeInfo(Pointer);
+        if (pointer_info != .pointer or pointer_info.pointer.size != .one or
+            pointer_info.pointer.is_const)
+        {
+            @compileError("ModelHintsSource.from expects a mutable single-item pointer");
+        }
+        const Implementation = pointer_info.pointer.child;
+        const Adapter = struct {
+            fn lookupFn(
+                allocator: std.mem.Allocator,
+                context: *anyopaque,
+                provider_id: []const u8,
+                model_id: []const u8,
+            ) error{OutOfMemory}!ai.ModelCatalog.Contribution {
+                const self: *Implementation = @ptrCast(@alignCast(context));
+                return self.lookup(allocator, provider_id, model_id);
+            }
+        };
+        return .{ .context = implementation, .lookup_fn = Adapter.lookupFn };
+    }
+
+    pub fn lookup(
+        self: ModelHintsSource,
+        allocator: std.mem.Allocator,
+        provider_id: []const u8,
+        model_id: []const u8,
+    ) error{OutOfMemory}!ai.ModelCatalog.Contribution {
+        return self.lookup_fn(allocator, self.context, provider_id, model_id);
+    }
+};
+
 pub const Inputs = struct {
     allocator: std.mem.Allocator,
     store: Store,
@@ -29,6 +74,14 @@ pub const Inputs = struct {
     default_effort: ?[]const u8 = null,
     llama_discovered_model: ?[]const u8 = null,
     ollama_discovered_model: ?[]const u8 = null,
+    /// Optional cache-only catalog lookup. It is called once, after provider
+    /// and model selection, with the effective catalog provider ID (or the
+    /// selected provider ID when catalog metadata is disabled). `hints.reported`
+    /// is never sourced here. Explicit
+    /// catalog metadata wins source metadata field by field. An explicit
+    /// non-unknown `catalog_wire` wins as one tagged value; otherwise an
+    /// explicit catalog metadata `.wire` wins before the source wire may fill.
+    hints_source: ?ModelHintsSource = null,
     hints: Registry.ModelHints = .{},
     rules: Registry.Rules = .{},
 };
@@ -173,6 +226,28 @@ pub fn resolve(inputs: Inputs) ResolveError!*Owned {
         !selection.explicit,
     );
     const model = try selectModel(allocator, inputs.store, descriptor.id, inputs);
+
+    // Keep both by-value contributions in this frame until resolveDescriptor
+    // has copied the effective metadata into its owned plan.
+    var source_contribution: ai.ModelCatalog.Contribution = undefined;
+    var explicit_contribution: ai.ModelCatalog.Contribution = undefined;
+    var merged_contribution: ai.ModelCatalog.Contribution = undefined;
+    var effective_hints = inputs.hints;
+    if (inputs.hints_source) |source| {
+        const lookup_provider_id = if (overrides.catalog_id) |value|
+            if (value.len == 0) descriptor.id else value
+        else
+            descriptor.catalog_id orelse descriptor.id;
+        source_contribution = try source.lookup(allocator, lookup_provider_id, model);
+        explicit_contribution = .{
+            .metadata = if (inputs.hints.catalog) |value| value.* else .{},
+            .wire = explicitCatalogWireHint(inputs.hints),
+        };
+        merged_contribution = ai.ModelCatalog.merge(&explicit_contribution, &source_contribution);
+        effective_hints.catalog = &merged_contribution.metadata;
+        effective_hints.catalog_wire = registryWireHint(merged_contribution.wire);
+    }
+
     const rules = if (dynamic or descriptor.kind == .recipe) blk: {
         try validateCombinedRules(descriptor.id, definition, inputs.rules, model);
         break :blk try mergeRules(allocator, descriptor.id, definition, inputs.rules);
@@ -187,13 +262,32 @@ pub fn resolve(inputs: Inputs) ResolveError!*Owned {
         model,
         auth,
         overrides,
-        inputs.hints,
+        effective_hints,
         rules,
     );
     owned.model = owned.resolved.metadata.model_id;
     owned.effort = try selectEffort(allocator, inputs.store, descriptor.id, inputs, &owned.resolved);
     owned.keep_model_order = !(if (definition) |value| value.sort_models orelse true else true);
     return owned;
+}
+
+fn explicitCatalogWireHint(hints: Registry.ModelHints) ai.ModelCatalog.WireHint {
+    return switch (hints.catalog_wire) {
+        .unknown => if (hints.catalog) |catalog|
+            if (catalog.wire) |wire| .{ .wire = wire } else .unknown
+        else
+            .unknown,
+        .unsupported => .unsupported,
+        .wire => |wire| .{ .wire = wire },
+    };
+}
+
+fn registryWireHint(hint: ai.ModelCatalog.WireHint) Registry.WireHint {
+    return switch (hint) {
+        .unknown => .unknown,
+        .unsupported => .unsupported,
+        .wire => |wire| .{ .wire = wire },
+    };
 }
 
 const ProviderSelection = struct { id: []const u8, explicit: bool };
@@ -1626,10 +1720,12 @@ fn exerciseAllocationFailures(allocator: std.mem.Allocator) !void {
         .{},
     );
     defer opencode_document.deinit();
+    var catalog_source: AllocatingModelHintsSource = .{};
     var opencode = try resolve(.{
         .allocator = allocator,
         .store = testStore(&opencode_document, &opencode_environment),
         .api_key_environment = .from(&opencode_environment),
+        .hints_source = .from(&catalog_source),
     });
     opencode.deinit();
 
@@ -1996,10 +2092,12 @@ fn resolveSecretWithAllocator(allocator: std.mem.Allocator) ResolveError!*Owned 
     ) catch unreachable;
     defer document.deinit();
     const environment: TestEnvironment = .{};
+    var catalog_source: AllocatingModelHintsSource = .{};
     return resolve(.{
         .allocator = allocator,
         .store = testStore(&document, &environment),
         .api_key_environment = .from(&environment),
+        .hints_source = .from(&catalog_source),
     });
 }
 
@@ -2368,4 +2466,181 @@ test "combined rules reject excess before retained pattern copies" {
         .provider_definitions = &.{definition},
         .rules = .{ .values = &injected },
     }));
+}
+
+const AllocatingModelHintsSource = struct {
+    pub fn lookup(
+        _: *AllocatingModelHintsSource,
+        allocator: std.mem.Allocator,
+        _: []const u8,
+        _: []const u8,
+    ) error{OutOfMemory}!ai.ModelCatalog.Contribution {
+        _ = try allocator.dupe(u8, "super-secret catalog lookup allocation");
+        return .{ .metadata = .{ .context_window = 64 } };
+    }
+};
+
+const TestModelHintsSource = struct {
+    calls: usize = 0,
+    expected_provider: []const u8,
+    expected_model: []const u8,
+    contribution: ai.ModelCatalog.Contribution = .{},
+
+    pub fn lookup(
+        self: *TestModelHintsSource,
+        _: std.mem.Allocator,
+        provider_id: []const u8,
+        model_id: []const u8,
+    ) error{OutOfMemory}!ai.ModelCatalog.Contribution {
+        self.calls += 1;
+        std.debug.assert(std.mem.eql(u8, self.expected_provider, provider_id));
+        std.debug.assert(std.mem.eql(u8, self.expected_model, model_id));
+        return self.contribution;
+    }
+};
+
+test "cached model hints lookup uses catalog identity once for compiled and dynamic providers" {
+    const environment: TestEnvironment = .{
+        .entries = &.{.{ .name = "OPENCODE_API_KEY", .value = "key" }},
+    };
+    var compiled_document = try Document.parse(
+        std.testing.allocator,
+        "{\"provider\":\"opencode-zen\",\"model\":\"compiled-model\"}",
+        .{},
+    );
+    defer compiled_document.deinit();
+    var compiled_source: TestModelHintsSource = .{
+        .expected_provider = "opencode",
+        .expected_model = "compiled-model",
+    };
+    var compiled = try resolve(.{
+        .allocator = std.testing.allocator,
+        .store = testStore(&compiled_document, &environment),
+        .api_key_environment = .from(&environment),
+        .hints_source = .from(&compiled_source),
+    });
+    compiled.deinit();
+    try std.testing.expectEqual(@as(usize, 1), compiled_source.calls);
+
+    var dynamic_document = try Document.parse(
+        std.testing.allocator,
+        "{\"provider\":\"custom\",\"model\":\"dynamic-model\"}",
+        .{},
+    );
+    defer dynamic_document.deinit();
+    const definition: Definition = .{
+        .id = @constCast("custom"),
+        .api = .catalog,
+        .base_url = @constCast("https://custom.test/v1"),
+        .catalog_id = @constCast("models-dev-custom"),
+    };
+    var dynamic_source: TestModelHintsSource = .{
+        .expected_provider = "models-dev-custom",
+        .expected_model = "dynamic-model",
+    };
+    var dynamic = try resolve(.{
+        .allocator = std.testing.allocator,
+        .store = testStore(&dynamic_document, &environment),
+        .api_key_environment = .from(&environment),
+        .provider_definitions = &.{definition},
+        .hints_source = .from(&dynamic_source),
+    });
+    dynamic.deinit();
+    try std.testing.expectEqual(@as(usize, 1), dynamic_source.calls);
+}
+
+test "explicit catalog hints merge over cached metadata and wire" {
+    const environment: TestEnvironment = .{
+        .entries = &.{.{ .name = "OPENCODE_API_KEY", .value = "key" }},
+    };
+    var document = try Document.parse(
+        std.testing.allocator,
+        "{\"provider\":\"opencode-zen\",\"model\":\"model\"}",
+        .{},
+    );
+    defer document.deinit();
+    var source: TestModelHintsSource = .{
+        .expected_provider = "opencode",
+        .expected_model = "model",
+        .contribution = .{
+            .metadata = .{ .context_window = 100, .max_output = 200 },
+            .wire = .{ .wire = .openai_responses },
+        },
+    };
+    const explicit_catalog: ai.ModelMeta.Metadata = .{
+        .context_window = 300,
+        .wire = .openai_chat,
+    };
+    var result = try resolve(.{
+        .allocator = std.testing.allocator,
+        .store = testStore(&document, &environment),
+        .api_key_environment = .from(&environment),
+        .hints_source = .from(&source),
+        .hints = .{ .catalog = &explicit_catalog },
+    });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), source.calls);
+    try std.testing.expectEqual(@as(u64, 300), result.resolved.metadata.model.context_window);
+    try std.testing.expectEqual(@as(u64, 200), result.resolved.metadata.model.max_output);
+    try std.testing.expect(result.resolved.metadata.wire == .openai_chat);
+
+    try std.testing.expectError(error.UnsupportedWire, resolve(.{
+        .allocator = std.testing.allocator,
+        .store = testStore(&document, &environment),
+        .api_key_environment = .from(&environment),
+        .hints_source = .from(&source),
+        .hints = .{ .catalog_wire = .unsupported },
+    }));
+
+    const conflicting_catalog: ai.ModelMeta.Metadata = .{ .wire = .openai_responses };
+    var wire_override = try resolve(.{
+        .allocator = std.testing.allocator,
+        .store = testStore(&document, &environment),
+        .api_key_environment = .from(&environment),
+        .hints_source = .from(&source),
+        .hints = .{
+            .catalog = &conflicting_catalog,
+            .catalog_wire = .{ .wire = .openai_chat },
+        },
+    });
+    defer wire_override.deinit();
+    try std.testing.expect(wire_override.resolved.metadata.wire == .openai_chat);
+    try std.testing.expectEqual(@as(usize, 3), source.calls);
+}
+
+test "empty cached contribution preserves descriptor defaults and unsupported wire maps exactly" {
+    const environment: TestEnvironment = .{
+        .entries = &.{.{ .name = "OPENCODE_API_KEY", .value = "key" }},
+    };
+    var document = try Document.parse(
+        std.testing.allocator,
+        "{\"provider\":\"opencode-zen\",\"model\":\"model\"}",
+        .{},
+    );
+    defer document.deinit();
+    var empty_source: TestModelHintsSource = .{
+        .expected_provider = "opencode",
+        .expected_model = "model",
+    };
+    var result = try resolve(.{
+        .allocator = std.testing.allocator,
+        .store = testStore(&document, &environment),
+        .api_key_environment = .from(&environment),
+        .hints_source = .from(&empty_source),
+    });
+    try std.testing.expect(result.resolved.metadata.wire == .openai_chat);
+    result.deinit();
+
+    var unsupported_source: TestModelHintsSource = .{
+        .expected_provider = "opencode",
+        .expected_model = "model",
+        .contribution = .{ .wire = .unsupported },
+    };
+    try std.testing.expectError(error.UnsupportedWire, resolve(.{
+        .allocator = std.testing.allocator,
+        .store = testStore(&document, &environment),
+        .api_key_environment = .from(&environment),
+        .hints_source = .from(&unsupported_source),
+    }));
+    try std.testing.expectEqual(@as(usize, 1), unsupported_source.calls);
 }
