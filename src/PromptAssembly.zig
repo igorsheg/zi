@@ -66,24 +66,29 @@ pub fn build(
 ) Error!?OwnedPrompt {
     if (inputs.raw or inputs.base == .none) return null;
 
+    const needs_discovery = inputs.features.environment or inputs.features.project or inputs.features.skills;
+    const cwd = if (needs_discovery)
+        try normalizedCwd(inputs.environment.cwd)
+    else
+        inputs.environment.cwd;
+
     var project_root: ?[]u8 = null;
     defer if (project_root) |root_path| allocator.free(root_path);
     if (inputs.features.environment or inputs.features.project) {
-        if (inputs.environment.cwd.len == 0 or inputs.environment.cwd[0] != '/' or
-            std.mem.indexOfScalar(u8, inputs.environment.cwd, 0) != null)
-        {
-            return error.InvalidCwd;
-        }
-        project_root = try GuidanceDiscovery.findProjectRoot(allocator, io, inputs.environment.cwd);
+        project_root = try GuidanceDiscovery.findProjectRoot(allocator, io, cwd);
     }
     const root_snapshot: Context.ProjectRoot = if (project_root) |root_path|
         .{ .found = root_path }
     else
         .missing;
     var environment_inputs = inputs.environment;
+    environment_inputs.cwd = cwd;
     environment_inputs.project_root = root_snapshot;
     var guidance_inputs = inputs.guidance;
+    guidance_inputs.cwd = cwd;
     guidance_inputs.project_root = root_snapshot;
+    var skill_inputs = inputs.skills;
+    skill_inputs.cwd = cwd;
 
     var environment: ?EnvironmentDiscovery.OwnedFacts = null;
     defer if (environment) |*owned| owned.deinit(allocator);
@@ -105,7 +110,7 @@ pub fn build(
         guidance = try GuidanceDiscovery.discover(allocator, io, guidance_inputs);
     }
     if (inputs.features.skills) {
-        skills = try SkillDiscovery.discover(allocator, io, inputs.skills);
+        skills = try SkillDiscovery.discover(allocator, io, skill_inputs);
     }
 
     var suffix = try Context.build(allocator, .{
@@ -126,14 +131,24 @@ pub fn build(
     });
 }
 
+fn normalizedCwd(path: []const u8) Error![]const u8 {
+    if (path.len == 0 or path[0] != '/' or std.mem.indexOfScalar(u8, path, 0) != null) {
+        return error.InvalidCwd;
+    }
+    var end = path.len;
+    while (end > 1 and path[end - 1] == '/') end -= 1;
+    return path[0..end];
+}
+
 fn testingSecureOpen() agent.SecureOpen.Capability {
     const Adapter = struct {
         fn openFile(
-            _: *anyopaque,
             _: std.Io,
+            context: *anyopaque,
             directory: std.Io.Dir,
             name: []const u8,
         ) anyerror!std.Io.File {
+            _ = context;
             const handle = try std.posix.openat(directory.handle, name, .{
                 .ACCMODE = .RDONLY,
                 .NONBLOCK = true,
@@ -267,6 +282,46 @@ test "missing optional roots are accepted" {
     try std.testing.expect(std.mem.indexOf(u8, result.bytes, "# Environment") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.bytes, "# Project Context") == null);
     try std.testing.expect(std.mem.indexOf(u8, result.bytes, "# Skills") == null);
+}
+
+test "assembler canonicalizes cwd and owns every discovery cwd copy" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    try tmp.dir.createDirPath(io, "repo/.git");
+    try tmp.dir.createDirPath(io, "repo/.agents/skills/inside");
+    try tmp.dir.createDirPath(io, ".agents/skills/outside");
+    try writeRelative(tmp.dir, "AGENTS.md", "outside guidance must not leak");
+    try writeRelative(tmp.dir, "repo/AGENTS.md", "inside guidance");
+    try writeRelative(tmp.dir, ".agents/skills/outside/SKILL.md", "---\ndescription: outside\n---\n");
+    try writeRelative(tmp.dir, "repo/.agents/skills/inside/SKILL.md", "---\ndescription: inside\n---\n");
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const outer = try temporaryRoot(&tmp, &path_buffer);
+    const repo = try std.fmt.allocPrint(std.testing.allocator, "{s}/repo", .{outer});
+    defer std.testing.allocator.free(repo);
+    const trailing_cwd = try std.fmt.allocPrint(std.testing.allocator, "{s}///", .{repo});
+    defer std.testing.allocator.free(trailing_cwd);
+
+    var result = (try build(std.testing.allocator, io, .{
+        .base = .empty,
+        .features = .{ .tasks = false, .subagents = false },
+        .environment = .{ .cwd = trailing_cwd, .os_description = "OS", .command_shell = "sh" },
+        .guidance = .{ .secure_open = testingSecureOpen(), .cwd = outer },
+        .skills = .{ .secure_open = testingSecureOpen(), .cwd = outer, .home = outer },
+    })).?;
+    defer result.deinit(std.testing.allocator);
+
+    const cwd_fact = try std.fmt.allocPrint(std.testing.allocator, "Working directory: {s}\n", .{repo});
+    defer std.testing.allocator.free(cwd_fact);
+    try std.testing.expect(std.mem.indexOf(u8, result.bytes, cwd_fact) != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.bytes, "inside guidance") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.bytes, "outside guidance") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.bytes, "- inside: inside") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.bytes, "- outside: outside") == null);
+}
+
+test "root cwd remains canonical" {
+    try std.testing.expectEqualStrings("/", try normalizedCwd("////"));
 }
 
 fn exerciseAllocationFailures(allocator: std.mem.Allocator) !void {

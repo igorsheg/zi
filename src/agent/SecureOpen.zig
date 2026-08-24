@@ -3,10 +3,12 @@ const std = @import("std");
 /// Injected secure regular-file opener. Implementations must open `name`
 /// relative to `directory`, reject a final symlink, set close-on-exec, and use
 /// nonblocking mode so special files cannot stall discovery. The returned file
-/// transfers to the caller.
+/// transfers to the caller. `OutOfMemory` is a resource failure and must be
+/// propagated. Other errors are ordinary candidate-open failures that discovery
+/// may ignore (missing, denied, changed, symlinked, or resource-limited files).
 pub const Capability = struct {
     context: *anyopaque,
-    open_fn: *const fn (*anyopaque, std.Io, std.Io.Dir, []const u8) anyerror!std.Io.File,
+    open_fn: *const fn (std.Io, *anyopaque, std.Io.Dir, []const u8) anyerror!std.Io.File,
 
     pub fn openFile(
         self: Capability,
@@ -14,7 +16,7 @@ pub const Capability = struct {
         directory: std.Io.Dir,
         name: []const u8,
     ) anyerror!std.Io.File {
-        return self.open_fn(self.context, io, directory, name);
+        return self.open_fn(io, self.context, directory, name);
     }
 
     pub fn from(implementation: anytype) Capability {
@@ -26,8 +28,8 @@ pub const Capability = struct {
         const Implementation = pointer_info.pointer.child;
         const Adapter = struct {
             fn openFile(
-                context: *anyopaque,
                 io: std.Io,
+                context: *anyopaque,
                 directory: std.Io.Dir,
                 name: []const u8,
             ) anyerror!std.Io.File {

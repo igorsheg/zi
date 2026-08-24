@@ -69,7 +69,10 @@ const Collector = struct {
         // opened handle is checked again before read.
         const named_stat = std.Io.Dir.cwd().statFile(self.io, path, .{ .follow_symlinks = false }) catch return;
         if (named_stat.kind != .file) return;
-        var file = self.secure_open.openFile(self.io, .cwd(), path) catch return;
+        var file = self.secure_open.openFile(self.io, .cwd(), path) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return,
+        };
         defer file.close(self.io);
         const opened_stat = file.stat(self.io) catch return;
         if (opened_stat.kind != .file) return;
@@ -155,7 +158,11 @@ pub fn discover(
     const project_root: ?[]const u8 = switch (inputs.project_root) {
         .discover => discovered_root,
         .missing => null,
-        .found => |root| root,
+        .found => |root| blk: {
+            const normalized_root = try normalizedAbsolute(root, error.InvalidPath);
+            if (!isAncestorOrEqual(normalized_root, cwd)) return error.InvalidPath;
+            break :blk normalized_root;
+        },
     };
     if (project_root) |root| {
         var directories: [maximum_levels][]const u8 = undefined;
@@ -220,6 +227,11 @@ fn normalizedAbsolute(path: []const u8, invalid: Error) Error![]const u8 {
     return path[0..end];
 }
 
+fn isAncestorOrEqual(ancestor: []const u8, path: []const u8) bool {
+    if (std.mem.eql(u8, ancestor, path) or std.mem.eql(u8, ancestor, "/")) return true;
+    return std.mem.startsWith(u8, path, ancestor) and path.len > ancestor.len and path[ancestor.len] == '/';
+}
+
 fn parentPath(path: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, path, "/")) return null;
     const slash = std.mem.lastIndexOfScalar(u8, path, '/') orelse return null;
@@ -254,11 +266,12 @@ pub fn collapseHome(
 fn testingSecureOpen() SecureOpen.Capability {
     const Adapter = struct {
         fn openFile(
-            _: *anyopaque,
             _: std.Io,
+            context: *anyopaque,
             directory: std.Io.Dir,
             name: []const u8,
         ) anyerror!std.Io.File {
+            _ = context;
             const handle = try std.posix.openat(directory.handle, name, .{
                 .ACCMODE = .RDONLY,
                 .NONBLOCK = true,
@@ -266,6 +279,21 @@ fn testingSecureOpen() SecureOpen.Capability {
                 .NOFOLLOW = true,
             }, 0);
             return .{ .handle = handle, .flags = .{ .nonblocking = true } };
+        }
+    };
+    return .{ .context = undefined, .open_fn = Adapter.openFile };
+}
+
+fn outOfMemorySecureOpen() SecureOpen.Capability {
+    const Adapter = struct {
+        fn openFile(
+            _: std.Io,
+            context: *anyopaque,
+            _: std.Io.Dir,
+            _: []const u8,
+        ) anyerror!std.Io.File {
+            _ = context;
+            return error.OutOfMemory;
         }
     };
     return .{ .context = undefined, .open_fn = Adapter.openFile };
@@ -414,6 +442,37 @@ test "content cap probe and sanitizer preserve exact cap semantics" {
     try std.testing.expect(!exact.files[0].truncated);
 }
 
+test "supplied project root must be a component-boundary ancestor" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "repo", .default_dir);
+    try writeRelative(tmp.dir, "AGENTS.md", "must not leak");
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try temporaryRoot(&tmp, &path_buffer);
+    const cwd = try joinLeaf(std.testing.allocator, root, "repo");
+    defer std.testing.allocator.free(cwd);
+    const malicious = root[0 .. root.len - 1];
+
+    try std.testing.expectError(error.InvalidPath, discover(std.testing.allocator, std.testing.io, .{
+        .secure_open = testingSecureOpen(),
+        .cwd = cwd,
+        .project_root = .{ .found = malicious },
+    }));
+}
+
+test "secure opener out of memory is propagated" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeRelative(tmp.dir, "AGENTS.md", "rules");
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try temporaryRoot(&tmp, &path_buffer);
+    try std.testing.expectError(error.OutOfMemory, discover(std.testing.allocator, std.testing.io, .{
+        .secure_open = outOfMemorySecureOpen(),
+        .cwd = root,
+        .project_root = .missing,
+    }));
+}
+
 fn exerciseDiscoveryAllocations(allocator: std.mem.Allocator) !void {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -422,7 +481,12 @@ fn exerciseDiscoveryAllocations(allocator: std.mem.Allocator) !void {
     try writeRelative(tmp.dir, "AGENTS.md", "rules");
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root = try temporaryRoot(&tmp, &path_buffer);
-    var result = try discover(allocator, io, .{ .secure_open = testingSecureOpen(), .cwd = root, .home = root, .config_root = root });
+    var result = try discover(allocator, io, .{
+        .secure_open = testingSecureOpen(),
+        .cwd = root,
+        .home = root,
+        .config_root = root,
+    });
     result.deinit(allocator);
 }
 

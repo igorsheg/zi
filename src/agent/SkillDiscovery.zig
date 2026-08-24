@@ -228,7 +228,10 @@ fn readCandidate(
     // symlink. O_NONBLOCK and O_NOFOLLOW close replacement races.
     const named_stat = directory.statFile(io, "SKILL.md", .{ .follow_symlinks = false }) catch return null;
     if (named_stat.kind != .file) return null;
-    var file = secure_open.openFile(io, directory, "SKILL.md") catch return null;
+    var file = secure_open.openFile(io, directory, "SKILL.md") catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
     defer file.close(io);
     const opened_stat = file.stat(io) catch return null;
     if (opened_stat.kind != .file) return null;
@@ -311,11 +314,12 @@ fn collapseHome(
 fn testingSecureOpen() SecureOpen.Capability {
     const Adapter = struct {
         fn openFile(
-            _: *anyopaque,
             _: std.Io,
+            context: *anyopaque,
             directory: std.Io.Dir,
             name: []const u8,
         ) anyerror!std.Io.File {
+            _ = context;
             const handle = try std.posix.openat(directory.handle, name, .{
                 .ACCMODE = .RDONLY,
                 .NONBLOCK = true,
@@ -323,6 +327,21 @@ fn testingSecureOpen() SecureOpen.Capability {
                 .NOFOLLOW = true,
             }, 0);
             return .{ .handle = handle, .flags = .{ .nonblocking = true } };
+        }
+    };
+    return .{ .context = undefined, .open_fn = Adapter.openFile };
+}
+
+fn outOfMemorySecureOpen() SecureOpen.Capability {
+    const Adapter = struct {
+        fn openFile(
+            _: std.Io,
+            context: *anyopaque,
+            _: std.Io.Dir,
+            _: []const u8,
+        ) anyerror!std.Io.File {
+            _ = context;
+            return error.OutOfMemory;
         }
     };
     return .{ .context = undefined, .open_fn = Adapter.openFile };
@@ -412,6 +431,18 @@ test "project shadows global and result sorts while candidates are filtered" {
     try std.testing.expect(result.skills[2].description == null);
 }
 
+test "secure opener out of memory is propagated" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeSkill(tmp.dir, ".agents/skills", "one", "---\ndescription: one\n---\n");
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try temporaryRoot(&tmp, &path_buffer);
+    try std.testing.expectError(error.OutOfMemory, discover(std.testing.allocator, std.testing.io, .{
+        .secure_open = outOfMemorySecureOpen(),
+        .cwd = root,
+    }));
+}
+
 test "skill count and aggregate retained bytes are bounded" {
     try checkBounds(Context.max_skills - 1, Context.max_prompt_bytes - 1, 1);
     try std.testing.expectError(
@@ -430,7 +461,11 @@ fn exerciseDiscoveryAllocations(allocator: std.mem.Allocator) !void {
     try writeSkill(tmp.dir, ".agents/skills", "one", "---\ndescription: one\n---\n");
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root = try temporaryRoot(&tmp, &path_buffer);
-    var result = try discover(allocator, std.testing.io, .{ .secure_open = testingSecureOpen(), .cwd = root, .home = root });
+    var result = try discover(allocator, std.testing.io, .{
+        .secure_open = testingSecureOpen(),
+        .cwd = root,
+        .home = root,
+    });
     result.deinit(allocator);
 }
 
@@ -460,7 +495,11 @@ test "symlinked candidate directory and SKILL file are rejected" {
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root = try temporaryRoot(&tmp, &path_buffer);
 
-    var result = try discover(std.testing.allocator, io, .{ .secure_open = testingSecureOpen(), .cwd = root, .home = root });
+    var result = try discover(std.testing.allocator, io, .{
+        .secure_open = testingSecureOpen(),
+        .cwd = root,
+        .home = root,
+    });
     defer result.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), result.skills.len);
     try std.testing.expectEqualStrings("regular", result.skills[0].name);
@@ -480,7 +519,11 @@ test "only the first frontmatter head bytes are read" {
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root = try temporaryRoot(&tmp, &path_buffer);
 
-    var result = try discover(std.testing.allocator, std.testing.io, .{ .secure_open = testingSecureOpen(), .cwd = root, .home = root });
+    var result = try discover(std.testing.allocator, std.testing.io, .{
+        .secure_open = testingSecureOpen(),
+        .cwd = root,
+        .home = root,
+    });
     defer result.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), result.skills.len);
     try std.testing.expect(result.skills[0].description == null);
