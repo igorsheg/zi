@@ -1,56 +1,68 @@
 # Third-party notices
 
-Zi depends on and adapts behavior from the projects listed below. The complete
-license texts are retained under `third_party/licenses/`.
+## hax
 
-## Build dependency
+Zi follows the architecture and observable behavior of hax v0.4.0, revision
+`189816fb8b02956a6913d7638e6d2cc90a91d61a`, by Oleksandr Chekhovskyi and contributors.
+Provider-independent item, turn, session, abort-repair, tool, read/image, output-cap,
+UTF-8 sanitation, unified-diff, atomic-write, write, edit, synchronous bash, background task registry/wait,
+agent-context discovery and rendering, prompt-file expansion, Codex CLI credential behavior,
+and libcurl HTTP, CA discovery, SSE, and retry behavior is adapted from hax sources at that revision.
 
-- uucode 0.2.0, revision `8ad04b756f85a5ba1ac8d2b8cb48d0946f06b630`
-  - Source: https://github.com/jacobsandlund/uucode
-  - License: MIT
-  - Its generated tables use Unicode data under the Unicode License v3.
-  - Its UTF-8 implementation includes work by Bjoern Hoehrmann under the MIT
-    license.
+hax is licensed under the MIT License. Its license text is reproduced below.
 
-## Adapted source behavior
+```text
+MIT License
 
-- fx, revision `5ed3be1b67e59b6607f09f69581107d70fa6d243`
-  - Source: https://github.com/vercel-labs/fx
-  - License: Apache-2.0
-  - `src/tui/markdown/` adapts the incremental Markdown presentation processor
-    and its parser and renderer leaf modules. `src/tui/transcript/Store.zig`
-    adapts the bounded ordered semantic-entry store design. `src/tui/terminal/`
-    adapts the normal-buffer cursor admission behavior.
-    `src/coding_agent/interactive/SlashCommands.zig`,
-    `src/tui/assistant/user_message_card.zig`,
-    `src/tui/footer/presentation.zig`, `src/tui/footer/surface_frame.zig`,
-    `src/tui/input/SlashMenu.zig`, `src/tui/tools/tool_presentation.zig`,
-    `src/tui/transcript/Runtime.zig`,
-    `src/tui/transcript/painter.zig`,
-    `src/tui/transcript/tool_group_projection.zig`,
-    `src/tui/render_engine/transcript_blocks.zig`,
-    `src/tui/render_engine/FooterLayout.zig`,
-    `src/tui/render_engine/frame_builder.zig`,
-    `src/tui/render_engine/frame_plan.zig`,
-    `src/tui/render_engine/TerminalRenderer.zig`, and `src/tui/Screen.zig` adapt
-    semantic transcript ownership, connected user-turn rails, grouped and
-    action-oriented tool status, slash command catalog and picker state,
-    paint-time reflow, rail-free composer and width-bounded status projection,
-    footer surface assembly, compact-until-full frame
-    composition, owned-band synchronized publication, physical-scroll shadow
-    update, and normal-buffer transcript finality from
-    fx's corresponding presentation, transcript, footer, frame-builder, and
-    terminal-diff owners.
+Copyright (c) 2026 Oleksandr Chekhovskyi
 
-- OpenTUI, revision `6f7833d09773b88cf5984b2a4e7bc428e1f8ffcb`
-  - Source: https://github.com/anomalyco/opentui
-  - License: MIT
-  - `src/terminal_render/Text.zig` adapts terminal grapheme segmentation and
-    display-width behavior from `packages/native/src/utf8.zig`.
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
 
-## Design references only
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
 
-Pi and ZigAI remain design references. Zi does not bundle their source.
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
 
-- Pi: https://github.com/earendil-works/pi
-- ZigAI: https://github.com/Kludex/zigai
+
+## curl
+
+Zi links against libcurl for HTTP transport. curl is Copyright (c) 1996-2026,
+Daniel Stenberg, <daniel@haxx.se>, and many contributors. curl uses the curl
+license (SPDX: curl). Source and contributor details are at <https://curl.se/>.
+
+```text
+COPYRIGHT AND PERMISSION NOTICE
+
+Copyright (c) 1996 - 2026, Daniel Stenberg, <daniel@haxx.se>, and many
+contributors, see the THANKS file.
+
+All rights reserved.
+
+Permission to use, copy, modify, and distribute this software for any purpose
+with or without fee is hereby granted, provided that the above copyright
+notice and this permission notice appear in all copies.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT OF THIRD PARTY RIGHTS. IN
+NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
+DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
+OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE
+OR OTHER DEALINGS IN THE SOFTWARE.
+
+Except as contained in this notice, the name of a copyright holder shall not
+be used in advertising or otherwise to promote the sale, use or other dealings
+in this Software without prior written authorization of the copyright holder.
+```

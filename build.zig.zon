@@ -1,20 +1,14 @@
 .{
     .name = .zi,
-    .version = "0.0.1-dev",
+    .version = "0.1.0-dev",
     .fingerprint = 0xa0675a7f422db5ee,
     .minimum_zig_version = "0.16.0",
-    .dependencies = .{
-        .uucode = .{
-            .url = "https://github.com/jacobsandlund/uucode/archive/8ad04b756f85a5ba1ac8d2b8cb48d0946f06b630.tar.gz",
-            .hash = "uucode-0.2.0-ZZjBPuS4VABmt0lQ-jDiKB4afmuZVvZpbX09FP5JrR8N",
-        },
-    },
+    .dependencies = .{},
     .paths = .{
         "build.zig",
         "build.zig.zon",
         ".ziglint.zon",
         "src",
-        "third_party",
         "LICENSE",
         "README.md",
         "THIRD_PARTY_NOTICES.md",

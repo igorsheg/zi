@@ -1,13 +1,33 @@
+pub const cli = @import("cli/root.zig");
+pub const config = @import("config/root.zig");
 pub const ai = @import("ai/root.zig");
 pub const agent = @import("agent/root.zig");
-pub const coding_agent = @import("coding_agent/root.zig");
-pub const terminal_render = @import("terminal_render/root.zig");
-pub const tui = @import("tui/root.zig");
+pub const tool = @import("tool/root.zig");
+pub const text = @import("text/root.zig");
+pub const persistence = @import("persistence/root.zig");
+pub const ProviderConfig = @import("ProviderConfig.zig");
+pub const ProviderRuntime = @import("ProviderRuntime.zig");
+pub const CodexAuth = @import("CodexAuth.zig");
+pub const CatalogManager = @import("CatalogManager.zig");
+pub const CatalogService = @import("CatalogService.zig");
+pub const PromptAssembly = @import("PromptAssembly.zig");
+pub const SecureOpen = @import("SecureOpen.zig");
+const ProcessSpawn = @import("ProcessSpawn.zig");
 
 test {
+    _ = cli;
+    _ = config;
     _ = ai;
     _ = agent;
-    _ = coding_agent;
-    _ = terminal_render;
-    _ = tui;
+    _ = tool;
+    _ = text;
+    _ = persistence;
+    _ = ProviderConfig;
+    _ = ProviderRuntime;
+    _ = CodexAuth;
+    _ = CatalogManager;
+    _ = CatalogService;
+    _ = PromptAssembly;
+    _ = SecureOpen;
+    _ = ProcessSpawn;
 }

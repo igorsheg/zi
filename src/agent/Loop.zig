@@ -1,0 +1,1953 @@
+const std = @import("std");
+const ai = @import("../ai/root.zig");
+const tool = @import("../tool/root.zig");
+const TurnModule = @import("Turn.zig");
+const SessionModule = @import("Session.zig");
+const AbortRepair = @import("AbortRepair.zig");
+
+const Item = ai.Item.Item;
+const Turn = TurnModule.Turn;
+const Session = SessionModule.Session;
+
+pub const default_max_turns: usize = 64;
+pub const maximum_max_turns: usize = 1024;
+pub const maximum_diagnostic_bytes: usize = 8 * 1024;
+pub const default_maximum_request_images: usize = 20;
+pub const default_maximum_request_image_base64_bytes: usize = 20 * 1024 * 1024;
+
+pub const Signal = enum {
+    none,
+    pause,
+    abort,
+};
+
+pub const Checkpoint = struct {
+    context: *anyopaque,
+    sample_fn: *const fn (*anyopaque) Signal,
+
+    pub fn sample(self: Checkpoint) Signal {
+        return self.sample_fn(self.context);
+    }
+
+    pub fn from(implementation: anytype) Checkpoint {
+        const Pointer = @TypeOf(implementation);
+        const pointer_info = @typeInfo(Pointer);
+        if (pointer_info != .pointer or pointer_info.pointer.size != .one) {
+            @compileError("Checkpoint.from expects a single-item pointer");
+        }
+        const Implementation = pointer_info.pointer.child;
+        const Adapter = struct {
+            fn sample(context: *anyopaque) Signal {
+                const self: *Implementation = @ptrCast(@alignCast(context));
+                return self.sample();
+            }
+        };
+        return .{ .context = implementation, .sample_fn = Adapter.sample };
+    }
+};
+
+pub const Observer = struct {
+    context: *anyopaque,
+    emit_fn: *const fn (*anyopaque, ai.StreamEvent.StreamEvent) void,
+
+    pub fn emit(self: Observer, event: ai.StreamEvent.StreamEvent) void {
+        self.emit_fn(self.context, event);
+    }
+
+    pub fn from(implementation: anytype) Observer {
+        const Pointer = @TypeOf(implementation);
+        const pointer_info = @typeInfo(Pointer);
+        if (pointer_info != .pointer or pointer_info.pointer.size != .one) {
+            @compileError("Observer.from expects a single-item pointer");
+        }
+        const Implementation = pointer_info.pointer.child;
+        const Adapter = struct {
+            fn emit(context: *anyopaque, event: ai.StreamEvent.StreamEvent) void {
+                const self: *Implementation = @ptrCast(@alignCast(context));
+                self.emit(event);
+            }
+        };
+        return .{ .context = implementation, .emit_fn = Adapter.emit };
+    }
+};
+
+pub const HookError = error{
+    OutOfMemory,
+    Failed,
+    Indeterminate,
+};
+
+pub const SeamKind = enum {
+    provider_failure,
+    completion,
+    tool_batch,
+    compaction,
+};
+
+/// Synchronous durability callback. The session and all of its contents are
+/// borrowed only for the duration of `call`.
+pub const SeamHook = struct {
+    context: *anyopaque,
+    call_fn: *const fn (*anyopaque, *const Session, SeamKind, bool) HookError!void,
+
+    pub fn call(
+        self: SeamHook,
+        session: *const Session,
+        kind: SeamKind,
+        next_action: bool,
+    ) HookError!void {
+        return self.call_fn(self.context, session, kind, next_action);
+    }
+
+    pub fn from(implementation: anytype) SeamHook {
+        const Pointer = @TypeOf(implementation);
+        const pointer_info = @typeInfo(Pointer);
+        if (pointer_info != .pointer or pointer_info.pointer.size != .one) {
+            @compileError("SeamHook.from expects a single-item pointer");
+        }
+        const Implementation = pointer_info.pointer.child;
+        const Adapter = struct {
+            fn call(
+                context: *anyopaque,
+                session: *const Session,
+                kind: SeamKind,
+                next_action: bool,
+            ) HookError!void {
+                const self: *Implementation = @ptrCast(@alignCast(context));
+                return self.call(session, kind, next_action);
+            }
+        };
+        return .{ .context = implementation, .call_fn = Adapter.call };
+    }
+};
+
+/// Receives each usage footer immediately after the footer is admitted to the
+/// session. The value is borrowed only for the synchronous call.
+pub const UsageObserver = struct {
+    context: *anyopaque,
+    observe_fn: *const fn (*anyopaque, ai.Usage.TurnUsage) HookError!void,
+
+    pub fn observe(self: UsageObserver, usage: ai.Usage.TurnUsage) HookError!void {
+        return self.observe_fn(self.context, usage);
+    }
+
+    pub fn from(implementation: anytype) UsageObserver {
+        const Pointer = @TypeOf(implementation);
+        const pointer_info = @typeInfo(Pointer);
+        if (pointer_info != .pointer or pointer_info.pointer.size != .one) {
+            @compileError("UsageObserver.from expects a single-item pointer");
+        }
+        const Implementation = pointer_info.pointer.child;
+        const Adapter = struct {
+            fn observe(context: *anyopaque, usage: ai.Usage.TurnUsage) HookError!void {
+                const self: *Implementation = @ptrCast(@alignCast(context));
+                return self.observe(usage);
+            }
+        };
+        return .{ .context = implementation, .observe_fn = Adapter.observe };
+    }
+};
+
+pub const ContinuationResult = enum {
+    unchanged,
+    changed,
+    paused,
+};
+
+/// Runs only at a tool continuation point. `.changed` promises that the hook
+/// left a valid mutated session; Loop then emits a `.compaction` durability seam.
+pub const ContinuationHook = struct {
+    context: *anyopaque,
+    call_fn: *const fn (*anyopaque, *Session) HookError!ContinuationResult,
+
+    pub fn call(self: ContinuationHook, session: *Session) HookError!ContinuationResult {
+        return self.call_fn(self.context, session);
+    }
+
+    pub fn from(implementation: anytype) ContinuationHook {
+        const Pointer = @TypeOf(implementation);
+        const pointer_info = @typeInfo(Pointer);
+        if (pointer_info != .pointer or pointer_info.pointer.size != .one) {
+            @compileError("ContinuationHook.from expects a single-item pointer");
+        }
+        const Implementation = pointer_info.pointer.child;
+        const Adapter = struct {
+            fn call(context: *anyopaque, session: *Session) HookError!ContinuationResult {
+                const self: *Implementation = @ptrCast(@alignCast(context));
+                return self.call(session);
+            }
+        };
+        return .{ .context = implementation, .call_fn = Adapter.call };
+    }
+};
+
+pub const Params = struct {
+    session: *Session,
+    provider: ai.Provider.Provider,
+    model: []const u8,
+    system_prompt: []const u8,
+    tools: []const tool.Tool.Tool = &.{},
+    effort: ?[]const u8 = null,
+    image_input: ai.Provider.ImageInput = .unknown,
+    max_turns: usize = default_max_turns,
+    continued: bool = false,
+    checkpoint: ?Checkpoint = null,
+    observer: ?Observer = null,
+    seam_hook: ?SeamHook = null,
+    usage_observer: ?UsageObserver = null,
+    continuation_hook: ?ContinuationHook = null,
+    maximum_request_images: usize = default_maximum_request_images,
+    maximum_request_image_base64_bytes: usize = default_maximum_request_image_base64_bytes,
+};
+
+pub const Outcome = enum {
+    complete,
+    provider_error,
+    interrupted,
+    paused,
+    max_turns,
+};
+
+pub const Result = struct {
+    outcome: Outcome,
+    diagnostic: ?[]u8 = null,
+    turns: usize = 0,
+    last_context_tokens: ?u64 = null,
+    final_items_from: usize = 0,
+    final_items_to: usize = 0,
+    abort_marker_placed: bool = false,
+
+    pub fn deinit(self: *Result, allocator: std.mem.Allocator) void {
+        if (self.diagnostic) |diagnostic| allocator.free(diagnostic);
+        self.* = undefined;
+    }
+};
+
+pub const Error = error{
+    OutOfMemory,
+    TooManyItems,
+    TooManyPendingToolCalls,
+    TextTooLarge,
+    ReasoningTooLarge,
+    ToolArgumentsTooLarge,
+    ToolIdTooLarge,
+    ToolNameTooLarge,
+    ReasoningOpaqueTooLarge,
+    UserTextTooLarge,
+    ProviderIdTooLarge,
+    ModelIdTooLarge,
+    LabelTooLarge,
+    EffortTooLarge,
+    PresetTooLarge,
+    RetainedDataTooLarge,
+    TooManyImages,
+    ImageDataTooLarge,
+    ProvenanceTooLarge,
+    TurnStillStreaming,
+    TurnNeedsRepair,
+    InvalidRegistry,
+    InvalidResult,
+    InvalidMaxTurns,
+    RequestImageBudgetExceeded,
+    InvalidItem,
+    InvalidItemIndex,
+    InvalidUsage,
+    SessionBusy,
+    HookFailed,
+    HookIndeterminate,
+};
+
+const SignalState = struct {
+    checkpoint: ?Checkpoint,
+    signal: Signal = .none,
+
+    fn record(self: *SignalState, signal: Signal) void {
+        if (signal == .abort or (signal == .pause and self.signal == .none)) self.signal = signal;
+    }
+
+    fn sample(self: *SignalState) Signal {
+        const checkpoint = self.checkpoint orelse return self.signal;
+        self.record(checkpoint.sample());
+        return self.signal;
+    }
+
+    pub fn poll(self: *SignalState) ai.Provider.DeliveryError!void {
+        if (self.sample() != .none) return error.Cancelled;
+    }
+};
+
+const ToolCancellation = struct {
+    state: *SignalState,
+
+    pub fn isRequested(self: *const ToolCancellation) bool {
+        const checkpoint = self.state.checkpoint orelse return self.state.signal == .abort;
+        self.state.record(checkpoint.sample());
+        return self.state.signal == .abort;
+    }
+};
+
+const Captured = struct {
+    allocator: std.mem.Allocator,
+    diagnostic: ?[]u8 = null,
+    response: ai.StreamEvent.ResponseIdentity = .{},
+    has_response: bool = false,
+
+    fn deinit(self: *Captured) void {
+        if (self.diagnostic) |value| self.allocator.free(value);
+        if (self.response.id) |value| self.allocator.free(value);
+        if (self.response.model) |value| self.allocator.free(value);
+        if (self.response.route) |value| self.allocator.free(value);
+        self.* = undefined;
+    }
+
+    fn takeDiagnostic(self: *Captured) ?[]u8 {
+        const value = self.diagnostic;
+        self.diagnostic = null;
+        return value;
+    }
+
+    fn copyDiagnostic(self: *Captured, message: []const u8) error{OutOfMemory}!void {
+        if (self.diagnostic != null) return;
+        self.diagnostic = try self.allocator.dupe(u8, message[0..@min(message.len, maximum_diagnostic_bytes)]);
+    }
+
+    fn copyResponse(self: *Captured, response: ai.StreamEvent.ResponseIdentity) error{OutOfMemory}!void {
+        if (self.has_response) return;
+        self.has_response = true;
+        self.response.id = try duplicateBounded(self.allocator, response.id);
+        errdefer if (self.response.id) |value| {
+            self.allocator.free(value);
+            self.response.id = null;
+        };
+        self.response.model = try duplicateBounded(self.allocator, response.model);
+        errdefer if (self.response.model) |value| {
+            self.allocator.free(value);
+            self.response.model = null;
+        };
+        self.response.route = try duplicateBounded(self.allocator, response.route);
+    }
+};
+
+fn duplicateBounded(
+    allocator: std.mem.Allocator,
+    value: ?[]const u8,
+) error{OutOfMemory}!?[]u8 {
+    const bytes = value orelse return null;
+    const owned = try allocator.dupe(u8, bytes[0..@min(bytes.len, maximum_diagnostic_bytes)]);
+    return owned;
+}
+
+const Sink = struct {
+    turn: *Turn,
+    observer: ?Observer,
+    captured: *Captured,
+    assembly_error: ?Error = null,
+
+    pub fn emit(self: *Sink, event: ai.StreamEvent.StreamEvent) ai.Provider.DeliveryError!void {
+        if (self.observer) |observer| observer.emit(event);
+        switch (event) {
+            .done => |done| self.captured.copyResponse(done.response) catch |err| {
+                self.assembly_error = err;
+                return error.Cancelled;
+            },
+            .failure => |failure| {
+                self.captured.copyDiagnostic(failure.message) catch |err| {
+                    self.assembly_error = err;
+                    return error.Cancelled;
+                };
+                if (failure.response) |response| self.captured.copyResponse(response) catch |err| {
+                    self.assembly_error = err;
+                    return error.Cancelled;
+                };
+            },
+            else => {},
+        }
+        self.turn.consume(event) catch |err| {
+            self.assembly_error = err;
+            return error.Cancelled;
+        };
+    }
+};
+
+fn mapHookError(err: HookError) Error {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.Failed => error.HookFailed,
+        error.Indeterminate => error.HookIndeterminate,
+    };
+}
+
+fn callSeam(params: Params, kind: SeamKind, next_action: bool) Error!void {
+    const hook = params.seam_hook orelse return;
+    hook.call(params.session, kind, next_action) catch |err| return mapHookError(err);
+}
+
+fn absorbItems(params: Params, items: []const Item) Error!SessionModule.AbsorbResult {
+    params.session.beginHookMutation();
+    defer params.session.endHookMutation();
+    return params.session.absorbItemsCopy(items);
+}
+
+fn replaceToolResultOwned(params: Params, index: usize, item: *Item) Error!void {
+    params.session.beginHookMutation();
+    defer params.session.endHookMutation();
+    return params.session.replaceToolResultOwned(index, item);
+}
+
+fn markInterrupt(params: Params) Error!bool {
+    params.session.beginHookMutation();
+    defer params.session.endHookMutation();
+    return params.session.markInterrupt();
+}
+
+fn repairTurn(
+    allocator: std.mem.Allocator,
+    params: Params,
+    turn: *Turn,
+    reason: AbortRepair.Reason,
+    prepend_boundary: bool,
+) Error!AbortRepair.Outcome {
+    params.session.beginHookMutation();
+    defer params.session.endHookMutation();
+    return AbortRepair.repairAndAbsorbWithBoundary(
+        allocator,
+        params.session,
+        turn,
+        reason,
+        prepend_boundary,
+    );
+}
+
+fn appendUsage(
+    params: Params,
+    input: SessionModule.UsageInput,
+    prepend_boundary: bool,
+) Error!void {
+    var attributed = input;
+    attributed.source_provider = params.provider.id;
+    attributed.source_model = params.model;
+    params.session.beginHookMutation();
+    const admitted = params.session.addTurnUsageWithBoundary(attributed, prepend_boundary) catch |err| {
+        params.session.endHookMutation();
+        return err;
+    };
+    params.session.endHookMutation();
+    if (!admitted) return;
+    const observer = params.usage_observer orelse return;
+    const item = &params.session.items()[params.session.items().len - 1];
+    std.debug.assert(item.* == .turn_usage);
+    observer.observe(item.turn_usage.value) catch |err| return mapHookError(err);
+}
+
+pub fn run(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    params: Params,
+) Error!Result {
+    try params.session.beginRun();
+    defer params.session.endRun();
+    if (params.max_turns == 0 or params.max_turns > maximum_max_turns) return error.InvalidMaxTurns;
+    if (params.maximum_request_images == 0 or params.maximum_request_image_base64_bytes == 0) {
+        return error.InvalidResult;
+    }
+    const dispatch = try tool.Dispatch.Dispatch.init(params.tools, .{});
+    const definitions = try dispatch.advertisedDefinitions(allocator);
+    defer allocator.free(definitions);
+
+    var result: Result = .{
+        .outcome = .max_turns,
+        .final_items_from = params.session.items().len,
+        .final_items_to = params.session.items().len,
+    };
+    errdefer result.deinit(allocator);
+    var signals: SignalState = .{ .checkpoint = params.checkpoint };
+    var turn = Turn.init(allocator, .{});
+    defer turn.deinit();
+
+    while (result.turns < params.max_turns) {
+        turn.reset();
+        var captured: Captured = .{ .allocator = allocator };
+        defer captured.deinit();
+        var sink: Sink = .{
+            .turn = &turn,
+            .observer = params.observer,
+            .captured = &captured,
+        };
+        const session_items = params.session.items();
+        const floor = ai.Item.contextFloor(session_items);
+        const request_items = session_items[floor..];
+        const request_image_count = ai.Item.imageCount(request_items);
+        const request_image_bytes = ai.Item.imageBase64Bytes(request_items);
+        if (request_image_count > params.maximum_request_images or
+            request_image_bytes > params.maximum_request_image_base64_bytes)
+        {
+            return error.RequestImageBudgetExceeded;
+        }
+        const owes_boundary = result.turns > 0 or params.continued;
+        result.turns += 1;
+        const started_ns: i128 = @intCast(std.Io.Clock.awake.now(io).nanoseconds);
+        const stream_failure = params.provider.stream(allocator, io, .{
+            .model = params.model,
+            .context = .{
+                .system_prompt = params.system_prompt,
+                .items = request_items,
+                .tools = definitions,
+                .effort = params.effort,
+                .image_input = params.image_input,
+            },
+            .tick = ai.Provider.Tick.from(&signals),
+        }, ai.Provider.EventSink.from(&sink));
+
+        const finished_ns: i128 = @intCast(std.Io.Clock.awake.now(io).nanoseconds);
+        const elapsed_ms: u64 = @intCast(@max(0, finished_ns - started_ns) / std.time.ns_per_ms);
+        if (sink.assembly_error) |assembly_error| return assembly_error;
+        if (turn.last_context_tokens) |tokens| result.last_context_tokens = tokens;
+
+        if (turn.state == .failed) {
+            const total_usage = turn.totalUsage();
+            const usage_reported = ai.Usage.usageReported(total_usage);
+            const has_response_content = turn.hasAssistantText();
+            const prepend_boundary = owes_boundary and has_response_content;
+            const usage_boundary = owes_boundary and !has_response_content and usage_reported;
+            const repaired = try repairTurn(
+                allocator,
+                params,
+                &turn,
+                .provider_error,
+                prepend_boundary,
+            );
+            result.final_items_from = repaired.items_from;
+            result.final_items_to = repaired.items_to;
+            try appendUsage(params, .{
+                .stream = total_usage,
+                .elapsed_ms = if (ai.Usage.usageReported(total_usage)) elapsed_ms else null,
+                .response = captured.response,
+            }, usage_boundary);
+            result.outcome = .provider_error;
+            result.diagnostic = captured.takeDiagnostic();
+            try callSeam(params, .provider_failure, false);
+            return result;
+        }
+
+        var pause_preempted = false;
+        if (stream_failure) |_| {} else |stream_error| {
+            if (stream_error == error.OutOfMemory) return error.OutOfMemory;
+            if (stream_error == error.Cancelled and signals.signal == .abort) {
+                const total_usage = turn.totalUsage();
+                const usage_reported = ai.Usage.usageReported(total_usage);
+                const has_response_content = turn.survivesCancel();
+                const prepend_boundary = owes_boundary and has_response_content;
+                const usage_boundary = owes_boundary and !has_response_content and usage_reported;
+                const repaired = try repairTurn(
+                    allocator,
+                    params,
+                    &turn,
+                    .user_cancel,
+                    prepend_boundary,
+                );
+                result.final_items_from = repaired.items_from;
+                result.final_items_to = repaired.items_to;
+                try appendUsage(params, .{
+                    .stream = total_usage,
+                    .elapsed_ms = if (ai.Usage.usageReported(total_usage)) elapsed_ms else null,
+                    .response = captured.response,
+                }, usage_boundary);
+                result.outcome = .interrupted;
+                result.abort_marker_placed = repaired.marker_placed;
+                return result;
+            }
+            if (stream_error == error.Cancelled and signals.signal == .pause) {
+                const total_usage = turn.totalUsage();
+                const paused_empty = turn.items.items.len == 0;
+                if (paused_empty) {
+                    const usage_reported = ai.Usage.usageReported(total_usage);
+                    const usage_boundary = owes_boundary and usage_reported;
+                    const initial_count = params.session.items().len;
+                    try appendUsage(params, .{
+                        .stream = total_usage,
+                        .elapsed_ms = if (usage_reported) elapsed_ms else null,
+                        .response = captured.response,
+                    }, usage_boundary);
+                    turn.reset();
+                    result.final_items_from = initial_count + @as(usize, @intFromBool(usage_boundary));
+                    result.final_items_to = result.final_items_from;
+                    result.outcome = .paused;
+                    return result;
+                }
+                pause_preempted = true;
+                try turn.consume(.{ .done = .{} });
+            } else {
+                turn.state = .failed;
+                const total_usage = turn.totalUsage();
+                const usage_reported = ai.Usage.usageReported(total_usage);
+                const has_response_content = turn.hasAssistantText();
+                const prepend_boundary = owes_boundary and has_response_content;
+                const usage_boundary = owes_boundary and !has_response_content and usage_reported;
+                const repaired = try repairTurn(
+                    allocator,
+                    params,
+                    &turn,
+                    .provider_error,
+                    prepend_boundary,
+                );
+                result.final_items_from = repaired.items_from;
+                result.final_items_to = repaired.items_to;
+                try appendUsage(params, .{
+                    .stream = total_usage,
+                    .elapsed_ms = if (ai.Usage.usageReported(total_usage)) elapsed_ms else null,
+                    .response = captured.response,
+                }, usage_boundary);
+                result.outcome = .provider_error;
+                try captured.copyDiagnostic(@errorName(stream_error));
+                result.diagnostic = captured.takeDiagnostic();
+                try callSeam(params, .provider_failure, false);
+                return result;
+            }
+        }
+
+        if (turn.state != .done) {
+            turn.state = .failed;
+            const total_usage = turn.totalUsage();
+            const usage_reported = ai.Usage.usageReported(total_usage);
+            const has_response_content = turn.hasAssistantText();
+            const prepend_boundary = owes_boundary and has_response_content;
+            const usage_boundary = owes_boundary and !has_response_content and usage_reported;
+            const repaired = try repairTurn(
+                allocator,
+                params,
+                &turn,
+                .provider_error,
+                prepend_boundary,
+            );
+            result.final_items_from = repaired.items_from;
+            result.final_items_to = repaired.items_to;
+            try appendUsage(params, .{
+                .stream = total_usage,
+                .elapsed_ms = if (ai.Usage.usageReported(total_usage)) elapsed_ms else null,
+                .response = captured.response,
+            }, usage_boundary);
+            result.outcome = .provider_error;
+            try captured.copyDiagnostic(@errorName(error.InvalidProviderResponse));
+            result.diagnostic = captured.takeDiagnostic();
+            try callSeam(params, .provider_failure, false);
+            return result;
+        }
+
+        signals.record(if (params.checkpoint) |checkpoint| checkpoint.sample() else .none);
+        if (signals.signal == .abort) {
+            const total_usage = turn.totalUsage();
+            const usage_reported = ai.Usage.usageReported(total_usage);
+            const has_response_content = turn.survivesCancel();
+            const prepend_boundary = owes_boundary and has_response_content;
+            const usage_boundary = owes_boundary and !has_response_content and usage_reported;
+            const repaired = try repairTurn(
+                allocator,
+                params,
+                &turn,
+                .user_cancel,
+                prepend_boundary,
+            );
+            result.final_items_from = repaired.items_from;
+            result.final_items_to = repaired.items_to;
+            try appendUsage(params, .{
+                .stream = total_usage,
+                .elapsed_ms = if (ai.Usage.usageReported(total_usage)) elapsed_ms else null,
+                .response = captured.response,
+            }, usage_boundary);
+            result.outcome = .interrupted;
+            result.abort_marker_placed = repaired.marker_placed;
+            return result;
+        }
+        const pause_pending = pause_preempted or signals.signal == .pause;
+
+        var placeholders: std.ArrayList(Item) = .empty;
+        defer {
+            for (placeholders.items) |*item| item.deinit(allocator);
+            placeholders.deinit(allocator);
+        }
+        var had_calls = false;
+        for (turn.items.items) |*item| {
+            if (item.* != .tool_call) continue;
+            had_calls = true;
+            var placeholder = try pendingToolResult(allocator, &item.tool_call);
+            errdefer placeholder.deinit(allocator);
+            try placeholders.append(allocator, placeholder);
+        }
+
+        const add_boundary = owes_boundary;
+        var staged: std.ArrayList(Item) = .empty;
+        defer staged.deinit(allocator);
+        const staged_count = @as(usize, @intFromBool(add_boundary)) +
+            turn.items.items.len + placeholders.items.len;
+        try staged.ensureTotalCapacity(allocator, staged_count);
+        if (add_boundary) staged.appendAssumeCapacity(.turn_boundary);
+        staged.appendSliceAssumeCapacity(turn.items.items);
+        staged.appendSliceAssumeCapacity(placeholders.items);
+        const absorbed = try absorbItems(params, staged.items);
+        result.final_items_from = absorbed.items_from + @as(usize, @intFromBool(add_boundary));
+        result.final_items_to = result.final_items_from + turn.items.items.len;
+        const result_items_from = result.final_items_to;
+
+        // Pre-admit the terminal usage footer before any tool side effect. This
+        // makes every later settlement allocation-infallible at the record seam.
+        const total_usage = turn.totalUsage();
+        appendUsage(params, .{
+            .stream = total_usage,
+            .elapsed_ms = elapsed_ms,
+            .response = captured.response,
+        }, false) catch |err| {
+            turn.reset();
+            callSeam(params, if (had_calls) .tool_batch else .completion, false) catch |hook_error| {
+                if (hook_error == error.HookIndeterminate) return error.HookIndeterminate;
+            };
+            return err;
+        };
+
+        // Every call is durably paired before a tool can produce a side effect.
+        // A later failure leaves its placeholder instead of making the call retryable.
+        var abort_skipped = false;
+        var cancellation: ToolCancellation = .{ .state = &signals };
+        var window_image_count = request_image_count +| ai.Item.imageCount(turn.items.items);
+        var window_image_bytes = request_image_bytes +| ai.Item.imageBase64Bytes(turn.items.items);
+        var result_index: usize = 0;
+        for (turn.items.items) |*item| {
+            if (item.* != .tool_call) continue;
+            const call = &item.tool_call;
+            const tool_signal = signals.sample();
+            var tool_result = (if (definitions.len == 0)
+                dispatch.refused(params.session.allocator, call)
+            else if (tool_signal == .abort) skipped: {
+                abort_skipped = true;
+                break :skipped dispatch.skipped(params.session.allocator, call);
+            } else dispatch.run(params.session.allocator, io, call, .{
+                .image_input = params.image_input,
+                .cancel = tool.Tool.Cancellation.from(&cancellation),
+            })) catch |err| return settleToolFailure(params, &turn, err);
+            var result_owned = true;
+            defer if (result_owned) tool_result.deinit(params.session.allocator);
+            enforceImageBudget(
+                params.session.allocator,
+                &tool_result.tool_result,
+                window_image_count,
+                window_image_bytes,
+                params.maximum_request_images,
+                params.maximum_request_image_base64_bytes,
+            );
+            const result_image_count = tool_result.tool_result.images.len;
+            var result_image_bytes: usize = 0;
+            for (tool_result.tool_result.images) |image| result_image_bytes +|= image.data_base64.len;
+            replaceToolResultOwned(params, result_items_from + result_index, &tool_result) catch |err| {
+                return settleToolFailure(params, &turn, err);
+            };
+            result_owned = false;
+            window_image_count +|= result_image_count;
+            window_image_bytes +|= result_image_bytes;
+            result_index += 1;
+        }
+
+        turn.reset();
+
+        if (abort_skipped or signals.signal == .abort) {
+            result.outcome = .interrupted;
+            result.abort_marker_placed = abort_skipped;
+            if (!abort_skipped) result.abort_marker_placed = try markInterrupt(params);
+            try callSeam(params, .tool_batch, false);
+            return result;
+        }
+        signals.record(if (params.checkpoint) |checkpoint| checkpoint.sample() else .none);
+        if (signals.signal == .abort) {
+            result.outcome = .interrupted;
+            result.abort_marker_placed = try markInterrupt(params);
+            if (had_calls) try callSeam(params, .tool_batch, false);
+            return result;
+        }
+        if (!had_calls) {
+            result.outcome = .complete;
+            try callSeam(params, .completion, false);
+            return result;
+        }
+        if (pause_pending or signals.signal == .pause) {
+            result.outcome = .paused;
+            try callSeam(params, .tool_batch, false);
+            return result;
+        }
+        if (result.turns == params.max_turns) {
+            result.outcome = .max_turns;
+            try callSeam(params, .tool_batch, false);
+            return result;
+        }
+
+        try callSeam(params, .tool_batch, true);
+        if (params.continuation_hook) |hook| {
+            params.session.beginHookMutation();
+            const continuation = hook.call(params.session) catch |err| {
+                params.session.endHookMutation();
+                return mapHookError(err);
+            };
+            params.session.endHookMutation();
+            switch (continuation) {
+                .unchanged => {},
+                .changed => try callSeam(params, .compaction, true),
+                .paused => {
+                    result.outcome = .paused;
+                    return result;
+                },
+            }
+        }
+    }
+    return result;
+}
+
+fn settleToolFailure(params: Params, turn: *Turn, original_error: Error) Error {
+    turn.reset();
+    callSeam(params, .tool_batch, false) catch |hook_error| {
+        if (hook_error == error.HookIndeterminate) return error.HookIndeterminate;
+    };
+    return original_error;
+}
+
+fn pendingToolResult(
+    allocator: std.mem.Allocator,
+    call: *const ai.Item.ToolCall,
+) error{OutOfMemory}!Item {
+    const call_id = try allocator.dupe(u8, call.id);
+    errdefer allocator.free(call_id);
+    const output = try allocator.dupe(u8, "error: tool execution did not complete");
+    return .{ .tool_result = .{
+        .call_id = call_id,
+        .output = output,
+        .origin = .skipped,
+    } };
+}
+
+fn enforceImageBudget(
+    allocator: std.mem.Allocator,
+    result: *ai.Item.ToolResult,
+    existing_count: usize,
+    existing_bytes: usize,
+    maximum_count: usize,
+    maximum_bytes: usize,
+) void {
+    if (result.images.len == 0) return;
+    var incoming_bytes: usize = 0;
+    for (result.images) |image| incoming_bytes +|= image.data_base64.len;
+    const exceeds_count = result.images.len > maximum_count -| existing_count;
+    const exceeds_bytes = incoming_bytes > maximum_bytes -| existing_bytes;
+    if (!exceeds_count and !exceeds_bytes) return;
+
+    for (result.images) |*image| image.deinit(allocator);
+    allocator.free(result.images);
+    result.images = &.{};
+}
+
+const test_definition: tool.Tool.Definition = .{
+    .name = "echo",
+    .description = "echo arguments",
+    .parameters = &.{},
+};
+
+test "loop commits a tool batch before requesting the final response" {
+    const FakeProvider = struct {
+        const Self = @This();
+        round: usize = 0,
+
+        pub fn stream(
+            _: std.mem.Allocator,
+            _: std.Io,
+            self: *Self,
+            request: ai.Provider.Request,
+            sink: ai.Provider.EventSink,
+        ) ai.Provider.StreamError!void {
+            self.round += 1;
+            if (self.round == 1) {
+                if (request.context.items.len != 0 or request.context.tools.len != 1)
+                    return error.InvalidRequest;
+                try sink.emit(.{ .tool_call_start = .{ .id = "one", .name = "echo" } });
+                try sink.emit(.{ .tool_call_delta = .{ .id = "one", .arguments_delta = "{}" } });
+                try sink.emit(.{ .tool_call_end = "one" });
+                try sink.emit(.{ .done = .{ .usage = .{ .input_tokens = 2, .output_tokens = 1 } } });
+                return;
+            }
+            if (request.context.items.len != 3 or
+                request.context.items[0] != .tool_call or
+                request.context.items[1] != .tool_result or
+                request.context.items[2] != .turn_usage)
+            {
+                return error.InvalidRequest;
+            }
+            try sink.emit(.{ .text_delta = "finished" });
+            try sink.emit(.{ .done = .{ .usage = .{ .input_tokens = 4, .output_tokens = 2 } } });
+        }
+    };
+    const FakeTool = struct {
+        const Self = @This();
+        runs: usize = 0,
+
+        pub fn runTool(
+            allocator: std.mem.Allocator,
+            _: std.Io,
+            self: *Self,
+            args_json: ?[]const u8,
+            _: tool.Tool.RunContext,
+        ) tool.Tool.RunError!tool.Tool.Result {
+            self.runs += 1;
+            if (!std.mem.eql(u8, "{}", args_json.?)) return error.InvalidResult;
+            return .{ .output = try allocator.dupe(u8, "ok") };
+        }
+
+        pub const run = runTool;
+    };
+
+    var provider_impl: FakeProvider = .{};
+    var tool_impl: FakeTool = .{};
+    var tools = [_]tool.Tool.Tool{tool.Tool.Tool.from(&tool_impl, test_definition, .{})};
+    var session = try Session.init(std.testing.allocator, .{
+        .provider_id = "configured-provider",
+        .model = "configured-model",
+    });
+    defer session.deinit();
+    var loop_result = try run(std.testing.allocator, std.testing.io, .{
+        .session = &session,
+        .provider = ai.Provider.Provider.from(&provider_impl, "fake"),
+        .model = "model",
+        .system_prompt = "system",
+        .tools = &tools,
+    });
+    defer loop_result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(Outcome.complete, loop_result.outcome);
+    try std.testing.expectEqual(@as(usize, 2), loop_result.turns);
+    try std.testing.expectEqual(@as(?u64, 6), loop_result.last_context_tokens);
+    try std.testing.expectEqual(@as(usize, 1), tool_impl.runs);
+    try std.testing.expectEqualStrings(
+        "finished",
+        session.items()[loop_result.final_items_from].assistant_message.text,
+    );
+    var usage_count: usize = 0;
+    for (session.items()) |item| if (item == .turn_usage) {
+        usage_count += 1;
+        try std.testing.expectEqualStrings("fake", item.turn_usage.source.?.provider.?);
+        try std.testing.expectEqualStrings("model", item.turn_usage.source.?.model.?);
+    };
+    try std.testing.expectEqual(@as(usize, 2), usage_count);
+}
+
+test "loop provider failure copies diagnostics and keeps reported usage" {
+    const Fake = struct {
+        const Self = @This();
+        pub fn stream(
+            _: std.mem.Allocator,
+            _: std.Io,
+            _: *Self,
+            _: ai.Provider.Request,
+            sink: ai.Provider.EventSink,
+        ) ai.Provider.StreamError!void {
+            try sink.emit(.{ .text_delta = "partial" });
+            var message = [_]u8{ 'b', 'o', 'o', 'm' };
+            try sink.emit(.{ .failure = .{
+                .message = &message,
+                .usage = .{ .input_tokens = 7, .output_tokens = 1 },
+                .response = .{ .id = "response" },
+            } });
+            message = @splat('x');
+        }
+    };
+    var fake: Fake = .{};
+    var session = try Session.init(std.testing.allocator, .{});
+    defer session.deinit();
+    var loop_result = try run(std.testing.allocator, std.testing.io, .{
+        .session = &session,
+        .provider = ai.Provider.Provider.from(&fake, "fake"),
+        .model = "model",
+        .system_prompt = "system",
+    });
+    defer loop_result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(Outcome.provider_error, loop_result.outcome);
+    try std.testing.expectEqualStrings("boom", loop_result.diagnostic.?);
+    try std.testing.expectEqual(@as(?u64, 8), loop_result.last_context_tokens);
+    try std.testing.expect(session.items().len >= 2);
+    try std.testing.expect(session.items()[session.items().len - 1] == .turn_usage);
+    try std.testing.expectEqualStrings(
+        "response",
+        session.items()[session.items().len - 1].turn_usage.value.provenance.response_id.?,
+    );
+    const source = session.items()[session.items().len - 1].turn_usage.source.?;
+    try std.testing.expectEqualStrings("fake", source.provider.?);
+    try std.testing.expectEqualStrings("model", source.model.?);
+}
+
+test "loop recovers the typed assembly error hidden behind sink cancellation" {
+    const Fake = struct {
+        const Self = @This();
+        pub fn stream(
+            _: std.mem.Allocator,
+            _: std.Io,
+            _: *Self,
+            _: ai.Provider.Request,
+            sink: ai.Provider.EventSink,
+        ) ai.Provider.StreamError!void {
+            const too_long = "x" ** 513;
+            try sink.emit(.{ .tool_call_start = .{ .id = "id", .name = too_long } });
+        }
+    };
+    var fake: Fake = .{};
+    var session = try Session.init(std.testing.allocator, .{});
+    defer session.deinit();
+    try std.testing.expectError(error.ToolNameTooLarge, run(
+        std.testing.allocator,
+        std.testing.io,
+        .{
+            .session = &session,
+            .provider = ai.Provider.Provider.from(&fake, "fake"),
+            .model = "model",
+            .system_prompt = "system",
+        },
+    ));
+    try std.testing.expectEqual(@as(usize, 0), session.items().len);
+}
+
+test "loop pause preempts an empty provider without leaving history" {
+    const Pause = struct {
+        const Self = @This();
+        pub fn sample(_: *Self) Signal {
+            return .pause;
+        }
+    };
+    const Fake = struct {
+        const Self = @This();
+        pub fn stream(
+            _: std.mem.Allocator,
+            _: std.Io,
+            _: *Self,
+            request: ai.Provider.Request,
+            _: ai.Provider.EventSink,
+        ) ai.Provider.StreamError!void {
+            try request.tick.?.poll();
+        }
+    };
+    var pause: Pause = .{};
+    var fake: Fake = .{};
+    var session = try Session.init(std.testing.allocator, .{});
+    defer session.deinit();
+    var loop_result = try run(std.testing.allocator, std.testing.io, .{
+        .session = &session,
+        .provider = ai.Provider.Provider.from(&fake, "fake"),
+        .model = "model",
+        .system_prompt = "system",
+        .checkpoint = Checkpoint.from(&pause),
+    });
+    defer loop_result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(Outcome.paused, loop_result.outcome);
+    try std.testing.expectEqual(@as(usize, 0), session.items().len);
+    try std.testing.expect(!loop_result.abort_marker_placed);
+}
+
+test "loop refuses disabled tools before an abort and pairs the call" {
+    const Abort = struct {
+        const Self = @This();
+        samples: usize = 0,
+        pub fn sample(self: *Self) Signal {
+            self.samples += 1;
+            return if (self.samples == 1) .none else .abort;
+        }
+    };
+    const Fake = struct {
+        const Self = @This();
+        pub fn stream(
+            _: std.mem.Allocator,
+            _: std.Io,
+            _: *Self,
+            _: ai.Provider.Request,
+            sink: ai.Provider.EventSink,
+        ) ai.Provider.StreamError!void {
+            try sink.emit(.{ .tool_call_start = .{ .id = "one", .name = "missing" } });
+            try sink.emit(.{ .tool_call_delta = .{ .id = "one", .arguments_delta = "{}" } });
+            try sink.emit(.{ .tool_call_end = "one" });
+            try sink.emit(.{ .done = .{} });
+        }
+    };
+    var abort: Abort = .{};
+    var fake: Fake = .{};
+    var session = try Session.init(std.testing.allocator, .{});
+    defer session.deinit();
+    var loop_result = try run(std.testing.allocator, std.testing.io, .{
+        .session = &session,
+        .provider = ai.Provider.Provider.from(&fake, "fake"),
+        .model = "model",
+        .system_prompt = "system",
+        .checkpoint = Checkpoint.from(&abort),
+    });
+    defer loop_result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(Outcome.interrupted, loop_result.outcome);
+    try std.testing.expect(session.items()[0] == .tool_call);
+    try std.testing.expectEqual(ai.Item.ToolResultOrigin.refused, session.items()[1].tool_result.origin);
+    try std.testing.expectEqualStrings(
+        "error: tool calls are disabled in this session",
+        session.items()[1].tool_result.output,
+    );
+}
+
+test "loop max turn still commits a paired accepted tool batch" {
+    const Fake = struct {
+        const Self = @This();
+        pub fn stream(
+            _: std.mem.Allocator,
+            _: std.Io,
+            _: *Self,
+            _: ai.Provider.Request,
+            sink: ai.Provider.EventSink,
+        ) ai.Provider.StreamError!void {
+            try sink.emit(.{ .tool_call_start = .{ .id = "one", .name = "echo" } });
+            try sink.emit(.{ .tool_call_delta = .{ .id = "one", .arguments_delta = "{}" } });
+            try sink.emit(.{ .tool_call_end = "one" });
+            try sink.emit(.{ .done = .{} });
+        }
+    };
+    const FakeTool = struct {
+        const Self = @This();
+        pub fn run(
+            allocator: std.mem.Allocator,
+            _: std.Io,
+            _: *Self,
+            _: ?[]const u8,
+            _: tool.Tool.RunContext,
+        ) tool.Tool.RunError!tool.Tool.Result {
+            return .{ .output = try allocator.dupe(u8, "ok") };
+        }
+    };
+    var fake: Fake = .{};
+    var fake_tool: FakeTool = .{};
+    var tools = [_]tool.Tool.Tool{tool.Tool.Tool.from(&fake_tool, test_definition, .{})};
+    var session = try Session.init(std.testing.allocator, .{});
+    defer session.deinit();
+    var loop_result = try run(std.testing.allocator, std.testing.io, .{
+        .session = &session,
+        .provider = ai.Provider.Provider.from(&fake, "fake"),
+        .model = "model",
+        .system_prompt = "system",
+        .tools = &tools,
+        .max_turns = 1,
+    });
+    defer loop_result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(Outcome.max_turns, loop_result.outcome);
+    try std.testing.expect(session.items()[0] == .tool_call);
+    try std.testing.expect(session.items()[1] == .tool_result);
+}
+
+fn exerciseLoopAllocations(allocator: std.mem.Allocator) !void {
+    const Fake = struct {
+        const Self = @This();
+        pub fn stream(
+            _: std.mem.Allocator,
+            _: std.Io,
+            _: *Self,
+            _: ai.Provider.Request,
+            sink: ai.Provider.EventSink,
+        ) ai.Provider.StreamError!void {
+            try sink.emit(.{ .text_delta = "done" });
+            try sink.emit(.{ .done = .{} });
+        }
+    };
+    var fake: Fake = .{};
+    var session = try Session.init(allocator, .{});
+    defer session.deinit();
+    var loop_result = try run(allocator, std.testing.io, .{
+        .session = &session,
+        .provider = ai.Provider.Provider.from(&fake, "fake"),
+        .model = "model",
+        .system_prompt = "system",
+    });
+    loop_result.deinit(allocator);
+}
+
+test "loop releases every partial allocation" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        exerciseLoopAllocations,
+        .{},
+    );
+}
+
+test "image budget drops new result images without allocating a note" {
+    const images = try std.testing.allocator.alloc(ai.Item.Image, 1);
+    images[0] = .{
+        .mime = try std.testing.allocator.dupe(u8, "image/png"),
+        .data_base64 = try std.testing.allocator.dupe(u8, "AAAA"),
+    };
+    var result: ai.Item.ToolResult = .{
+        .call_id = try std.testing.allocator.dupe(u8, "call"),
+        .output = try std.testing.allocator.dupe(u8, "attached"),
+        .images = images,
+    };
+    defer {
+        std.testing.allocator.free(result.call_id);
+        std.testing.allocator.free(result.output);
+        for (result.images) |*image| image.deinit(std.testing.allocator);
+        if (result.images.len != 0) std.testing.allocator.free(result.images);
+    }
+    enforceImageBudget(
+        std.testing.allocator,
+        &result,
+        default_maximum_request_images,
+        0,
+        default_maximum_request_images,
+        default_maximum_request_image_base64_bytes,
+    );
+    try std.testing.expectEqual(@as(usize, 0), result.images.len);
+    try std.testing.expectEqualStrings("attached", result.output);
+    try std.testing.expectEqual(@as(usize, 0), result.hidden_tail_bytes);
+}
+
+test "loop leaves durable placeholders when a post-side-effect result is invalid" {
+    const FakeProvider = struct {
+        const Self = @This();
+        pub fn stream(
+            _: std.mem.Allocator,
+            _: std.Io,
+            _: *Self,
+            _: ai.Provider.Request,
+            sink: ai.Provider.EventSink,
+        ) ai.Provider.StreamError!void {
+            try sink.emit(.{ .tool_call_start = .{ .id = "one", .name = "echo" } });
+            try sink.emit(.{ .tool_call_delta = .{ .id = "one", .arguments_delta = "{}" } });
+            try sink.emit(.{ .tool_call_end = "one" });
+            try sink.emit(.{ .done = .{} });
+        }
+    };
+    const InvalidTool = struct {
+        const Self = @This();
+        runs: usize = 0,
+        pub fn run(
+            allocator: std.mem.Allocator,
+            _: std.Io,
+            self: *Self,
+            _: ?[]const u8,
+            _: tool.Tool.RunContext,
+        ) tool.Tool.RunError!tool.Tool.Result {
+            self.runs += 1;
+            const images = try allocator.alloc(ai.Item.Image, 1);
+            images[0] = .{
+                .mime = try allocator.dupe(u8, ""),
+                .data_base64 = try allocator.dupe(u8, "AAAA"),
+            };
+            return .{ .output = try allocator.dupe(u8, "side effect happened"), .images = images };
+        }
+    };
+    var provider: FakeProvider = .{};
+    var implementation: InvalidTool = .{};
+    var tools = [_]tool.Tool.Tool{tool.Tool.Tool.from(&implementation, test_definition, .{})};
+    var session = try Session.init(std.testing.allocator, .{});
+    defer session.deinit();
+    try std.testing.expectError(error.InvalidItem, run(
+        std.testing.allocator,
+        std.testing.io,
+        .{
+            .session = &session,
+            .provider = ai.Provider.Provider.from(&provider, "fake"),
+            .model = "model",
+            .system_prompt = "system",
+            .tools = &tools,
+        },
+    ));
+    try std.testing.expectEqual(@as(usize, 1), implementation.runs);
+    try std.testing.expectEqual(@as(usize, 3), session.items().len);
+    try std.testing.expect(session.items()[0] == .tool_call);
+    try std.testing.expect(session.items()[1] == .tool_result);
+    try std.testing.expectEqualStrings(
+        "error: tool execution did not complete",
+        session.items()[1].tool_result.output,
+    );
+}
+
+test "continued provider failure with only usage keeps its boundary" {
+    const Fake = struct {
+        const Self = @This();
+        pub fn stream(
+            _: std.mem.Allocator,
+            _: std.Io,
+            _: *Self,
+            _: ai.Provider.Request,
+            sink: ai.Provider.EventSink,
+        ) ai.Provider.StreamError!void {
+            try sink.emit(.{ .failure = .{
+                .message = "failed",
+                .usage = .{ .input_tokens = 3 },
+            } });
+        }
+    };
+    var fake: Fake = .{};
+    var session = try Session.init(std.testing.allocator, .{});
+    defer session.deinit();
+    var result = try run(std.testing.allocator, std.testing.io, .{
+        .session = &session,
+        .provider = ai.Provider.Provider.from(&fake, "fake"),
+        .model = "model",
+        .system_prompt = "system",
+        .continued = true,
+    });
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(Outcome.provider_error, result.outcome);
+    try std.testing.expectEqual(@as(usize, 2), session.items().len);
+    try std.testing.expect(session.items()[0] == .turn_boundary);
+    try std.testing.expect(session.items()[1] == .turn_usage);
+}
+
+test "pause sampled with a final tool-free response still completes" {
+    const Pause = struct {
+        const Self = @This();
+        pub fn sample(_: *Self) Signal {
+            return .pause;
+        }
+    };
+    const Fake = struct {
+        const Self = @This();
+        pub fn stream(
+            _: std.mem.Allocator,
+            _: std.Io,
+            _: *Self,
+            _: ai.Provider.Request,
+            sink: ai.Provider.EventSink,
+        ) ai.Provider.StreamError!void {
+            try sink.emit(.{ .text_delta = "complete" });
+            try sink.emit(.{ .done = .{} });
+        }
+    };
+    var pause: Pause = .{};
+    var fake: Fake = .{};
+    var session = try Session.init(std.testing.allocator, .{});
+    defer session.deinit();
+    var result = try run(std.testing.allocator, std.testing.io, .{
+        .session = &session,
+        .provider = ai.Provider.Provider.from(&fake, "fake"),
+        .model = "model",
+        .system_prompt = "system",
+        .checkpoint = Checkpoint.from(&pause),
+    });
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(Outcome.complete, result.outcome);
+    try std.testing.expectEqualStrings("complete", session.items()[0].assistant_message.text);
+}
+
+test "post-stream abort repairs the assistant before absorption" {
+    const Abort = struct {
+        const Self = @This();
+        pub fn sample(_: *Self) Signal {
+            return .abort;
+        }
+    };
+    const Fake = struct {
+        const Self = @This();
+        pub fn stream(
+            _: std.mem.Allocator,
+            _: std.Io,
+            _: *Self,
+            _: ai.Provider.Request,
+            sink: ai.Provider.EventSink,
+        ) ai.Provider.StreamError!void {
+            try sink.emit(.{ .text_delta = "answer" });
+            try sink.emit(.{ .done = .{} });
+        }
+    };
+    var abort: Abort = .{};
+    var fake: Fake = .{};
+    var session = try Session.init(std.testing.allocator, .{});
+    defer session.deinit();
+    var result = try run(std.testing.allocator, std.testing.io, .{
+        .session = &session,
+        .provider = ai.Provider.Provider.from(&fake, "fake"),
+        .model = "model",
+        .system_prompt = "system",
+        .checkpoint = Checkpoint.from(&abort),
+    });
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(Outcome.interrupted, result.outcome);
+    try std.testing.expect(result.abort_marker_placed);
+    try std.testing.expectEqual(ai.Item.AssistantOrigin.interrupted, session.items()[0].assistant_message.origin);
+    try std.testing.expect(std.mem.endsWith(u8, session.items()[0].assistant_message.text, "[interrupted]"));
+}
+
+test "one-shot pause sampled before a tool is retained until the seam" {
+    const Pause = struct {
+        const Self = @This();
+        samples: usize = 0,
+        pub fn sample(self: *Self) Signal {
+            self.samples += 1;
+            return if (self.samples == 2) .pause else .none;
+        }
+    };
+    const Fake = struct {
+        const Self = @This();
+        pub fn stream(
+            _: std.mem.Allocator,
+            _: std.Io,
+            _: *Self,
+            _: ai.Provider.Request,
+            sink: ai.Provider.EventSink,
+        ) ai.Provider.StreamError!void {
+            try sink.emit(.{ .tool_call_start = .{ .id = "one", .name = "echo" } });
+            try sink.emit(.{ .tool_call_delta = .{ .id = "one", .arguments_delta = "{}" } });
+            try sink.emit(.{ .tool_call_end = "one" });
+            try sink.emit(.{ .done = .{} });
+        }
+    };
+    const FakeTool = struct {
+        const Self = @This();
+        runs: usize = 0,
+        pub fn run(
+            allocator: std.mem.Allocator,
+            _: std.Io,
+            self: *Self,
+            _: ?[]const u8,
+            _: tool.Tool.RunContext,
+        ) tool.Tool.RunError!tool.Tool.Result {
+            self.runs += 1;
+            return .{ .output = try allocator.dupe(u8, "ok") };
+        }
+    };
+    var pause: Pause = .{};
+    var fake: Fake = .{};
+    var fake_tool: FakeTool = .{};
+    var tools = [_]tool.Tool.Tool{tool.Tool.Tool.from(&fake_tool, test_definition, .{})};
+    var session = try Session.init(std.testing.allocator, .{});
+    defer session.deinit();
+    var result = try run(std.testing.allocator, std.testing.io, .{
+        .session = &session,
+        .provider = ai.Provider.Provider.from(&fake, "fake"),
+        .model = "model",
+        .system_prompt = "system",
+        .checkpoint = Checkpoint.from(&pause),
+        .tools = &tools,
+    });
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(Outcome.paused, result.outcome);
+    try std.testing.expectEqual(@as(usize, 1), fake_tool.runs);
+    try std.testing.expect(session.items()[1] == .tool_result);
+}
+
+test "loop refuses a request window already over its image count budget" {
+    const Never = struct {
+        const Self = @This();
+        called: bool = false,
+        pub fn stream(
+            _: std.mem.Allocator,
+            _: std.Io,
+            self: *Self,
+            _: ai.Provider.Request,
+            _: ai.Provider.EventSink,
+        ) ai.Provider.StreamError!void {
+            self.called = true;
+        }
+    };
+    var images: [21]ai.Item.Image = undefined;
+    for (&images) |*image| image.* = .{
+        .mime = @constCast("image/png"),
+        .data_base64 = @constCast("AAAA"),
+    };
+    const borrowed: Item = .{ .user_message = .{
+        .text = @constCast("images"),
+        .images = &images,
+    } };
+    var session = try Session.init(std.testing.allocator, .{});
+    defer session.deinit();
+    try session.appendCopy(&borrowed);
+    var never: Never = .{};
+    try std.testing.expectError(error.RequestImageBudgetExceeded, run(
+        std.testing.allocator,
+        std.testing.io,
+        .{
+            .session = &session,
+            .provider = ai.Provider.Provider.from(&never, "fake"),
+            .model = "model",
+            .system_prompt = "system",
+        },
+    ));
+    try std.testing.expect(!never.called);
+}
+
+test "lifecycle hooks order durable tool continuation and final completion" {
+    const Log = struct {
+        const Self = @This();
+        bytes: [32]u8 = undefined,
+        len: usize = 0,
+
+        fn push(self: *Self, byte: u8) void {
+            self.bytes[self.len] = byte;
+            self.len += 1;
+        }
+    };
+    const Provider = struct {
+        const Self = @This();
+        log: *Log,
+        round: usize = 0,
+
+        pub fn stream(
+            _: std.mem.Allocator,
+            _: std.Io,
+            self: *Self,
+            request: ai.Provider.Request,
+            sink: ai.Provider.EventSink,
+        ) ai.Provider.StreamError!void {
+            self.log.push('P');
+            self.round += 1;
+            if (self.round == 1) {
+                try sink.emit(.{ .tool_call_start = .{ .id = "one", .name = "echo" } });
+                try sink.emit(.{ .tool_call_delta = .{ .id = "one", .arguments_delta = "{}" } });
+                try sink.emit(.{ .tool_call_end = "one" });
+                try sink.emit(.{ .tool_call_start = .{ .id = "two", .name = "echo" } });
+                try sink.emit(.{ .tool_call_delta = .{ .id = "two", .arguments_delta = "{}" } });
+                try sink.emit(.{ .tool_call_end = "two" });
+                try sink.emit(.{ .done = .{ .usage = .{ .input_tokens = 1 } } });
+                return;
+            }
+            if (request.context.items[request.context.items.len - 1] != .user_message) {
+                return error.InvalidRequest;
+            }
+            try sink.emit(.{ .text_delta = "done" });
+            try sink.emit(.{ .done = .{ .usage = .{ .output_tokens = 1 } } });
+        }
+    };
+    const Echo = struct {
+        const Self = @This();
+        pub fn run(
+            allocator: std.mem.Allocator,
+            _: std.Io,
+            _: *Self,
+            _: ?[]const u8,
+            _: tool.Tool.RunContext,
+        ) tool.Tool.RunError!tool.Tool.Result {
+            return .{ .output = try allocator.dupe(u8, "ok") };
+        }
+    };
+    const Seam = struct {
+        const Self = @This();
+        log: *Log,
+
+        pub fn call(
+            self: *Self,
+            session: *const Session,
+            kind: SeamKind,
+            next_action: bool,
+        ) HookError!void {
+            switch (kind) {
+                .tool_batch => {
+                    if (session.items()[session.items().len - 1] != .turn_usage) return error.Failed;
+                    if (!next_action) return error.Failed;
+                    self.log.push('T');
+                },
+                .compaction => {
+                    if (session.items()[session.items().len - 1] != .user_message) return error.Failed;
+                    if (!next_action) return error.Failed;
+                    self.log.push('D');
+                },
+                .completion => {
+                    if (session.items()[session.items().len - 1] != .turn_usage) return error.Failed;
+                    if (next_action) return error.Failed;
+                    self.log.push('F');
+                },
+                .provider_failure => return error.Failed,
+            }
+        }
+    };
+    const Usage = struct {
+        const Self = @This();
+        log: *Log,
+
+        pub fn observe(self: *Self, usage: ai.Usage.TurnUsage) HookError!void {
+            if (usage.elapsed_ms == null) return error.Failed;
+            self.log.push('U');
+        }
+    };
+    const Continuation = struct {
+        const Self = @This();
+        log: *Log,
+
+        pub fn call(self: *Self, session: *Session) HookError!ContinuationResult {
+            session.addContinuation() catch |err| return switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                else => error.Failed,
+            };
+            self.log.push('C');
+            return .changed;
+        }
+    };
+
+    var log: Log = .{};
+    var provider: Provider = .{ .log = &log };
+    var echo: Echo = .{};
+    var seam: Seam = .{ .log = &log };
+    var usage: Usage = .{ .log = &log };
+    var continuation: Continuation = .{ .log = &log };
+    var tools = [_]tool.Tool.Tool{tool.Tool.Tool.from(&echo, test_definition, .{})};
+    var session = try Session.init(std.testing.allocator, .{});
+    defer session.deinit();
+    try session.addUser("prompt outside Loop");
+    try std.testing.expectEqual(@as(usize, 0), log.len);
+
+    var loop_result = try run(std.testing.allocator, std.testing.io, .{
+        .session = &session,
+        .provider = ai.Provider.Provider.from(&provider, "fake"),
+        .model = "model",
+        .system_prompt = "system",
+        .tools = &tools,
+        .seam_hook = SeamHook.from(&seam),
+        .usage_observer = UsageObserver.from(&usage),
+        .continuation_hook = ContinuationHook.from(&continuation),
+    });
+    defer loop_result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("PUTCDPUF", log.bytes[0..log.len]);
+    try std.testing.expectEqual(@as(usize, 2), provider.round);
+}
+
+test "failed tool seam prevents the next provider stream" {
+    const Provider = struct {
+        const Self = @This();
+        rounds: usize = 0,
+
+        pub fn stream(
+            _: std.mem.Allocator,
+            _: std.Io,
+            self: *Self,
+            _: ai.Provider.Request,
+            sink: ai.Provider.EventSink,
+        ) ai.Provider.StreamError!void {
+            self.rounds += 1;
+            try sink.emit(.{ .tool_call_start = .{ .id = "one", .name = "missing" } });
+            try sink.emit(.{ .tool_call_delta = .{ .id = "one", .arguments_delta = "{}" } });
+            try sink.emit(.{ .tool_call_end = "one" });
+            try sink.emit(.{ .done = .{} });
+        }
+    };
+    const FailingSeam = struct {
+        const Self = @This();
+        pub fn call(
+            _: *Self,
+            _: *const Session,
+            kind: SeamKind,
+            _: bool,
+        ) HookError!void {
+            if (kind == .tool_batch) return error.Failed;
+        }
+    };
+
+    var provider: Provider = .{};
+    var seam: FailingSeam = .{};
+    var session = try Session.init(std.testing.allocator, .{});
+    defer session.deinit();
+    try std.testing.expectError(error.HookFailed, run(std.testing.allocator, std.testing.io, .{
+        .session = &session,
+        .provider = ai.Provider.Provider.from(&provider, "fake"),
+        .model = "model",
+        .system_prompt = "system",
+        .seam_hook = SeamHook.from(&seam),
+    }));
+    try std.testing.expectEqual(@as(usize, 1), provider.rounds);
+    try std.testing.expect(session.items()[0] == .tool_call);
+    try std.testing.expect(session.items()[1] == .tool_result);
+    try std.testing.expect(session.items()[2] == .turn_usage);
+}
+
+test "usage observer sees admitted provider failure and preserves out of memory" {
+    const Provider = struct {
+        const Self = @This();
+        pub fn stream(
+            _: std.mem.Allocator,
+            _: std.Io,
+            _: *Self,
+            _: ai.Provider.Request,
+            sink: ai.Provider.EventSink,
+        ) ai.Provider.StreamError!void {
+            try sink.emit(.{ .failure = .{
+                .message = "failed",
+                .usage = .{ .input_tokens = 3 },
+            } });
+        }
+    };
+    const Usage = struct {
+        const Self = @This();
+        calls: usize = 0,
+        detailed_cause: ?[]const u8 = null,
+
+        pub fn observe(self: *Self, usage: ai.Usage.TurnUsage) HookError!void {
+            self.calls += 1;
+            if (usage.stream.input_tokens != 3) return error.Failed;
+            self.detailed_cause = "observer allocation failed";
+            return error.OutOfMemory;
+        }
+    };
+
+    var provider: Provider = .{};
+    var usage: Usage = .{};
+    var session = try Session.init(std.testing.allocator, .{});
+    defer session.deinit();
+    try std.testing.expectError(error.OutOfMemory, run(std.testing.allocator, std.testing.io, .{
+        .session = &session,
+        .provider = ai.Provider.Provider.from(&provider, "fake"),
+        .model = "model",
+        .system_prompt = "system",
+        .usage_observer = UsageObserver.from(&usage),
+    }));
+    try std.testing.expectEqual(@as(usize, 1), usage.calls);
+    try std.testing.expectEqualStrings("observer allocation failed", usage.detailed_cause.?);
+    try std.testing.expect(session.items()[session.items().len - 1] == .turn_usage);
+}
+
+test "continuation hook runs without a seam hook before the next stream" {
+    const Provider = struct {
+        const Self = @This();
+        rounds: usize = 0,
+
+        pub fn stream(
+            _: std.mem.Allocator,
+            _: std.Io,
+            self: *Self,
+            request: ai.Provider.Request,
+            sink: ai.Provider.EventSink,
+        ) ai.Provider.StreamError!void {
+            self.rounds += 1;
+            if (self.rounds == 1) {
+                try sink.emit(.{ .tool_call_start = .{ .id = "one", .name = "missing" } });
+                try sink.emit(.{ .tool_call_delta = .{ .id = "one", .arguments_delta = "{}" } });
+                try sink.emit(.{ .tool_call_end = "one" });
+                try sink.emit(.{ .done = .{} });
+                return;
+            }
+            const last = request.context.items[request.context.items.len - 1];
+            if (last != .user_message or last.user_message.origin != .continuation) {
+                return error.InvalidRequest;
+            }
+            try sink.emit(.{ .text_delta = "done" });
+            try sink.emit(.{ .done = .{} });
+        }
+    };
+    const Continuation = struct {
+        const Self = @This();
+        calls: usize = 0,
+
+        pub fn call(self: *Self, session: *Session) HookError!ContinuationResult {
+            self.calls += 1;
+            session.addContinuation() catch |err| return switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                else => error.Failed,
+            };
+            return .changed;
+        }
+    };
+
+    var provider: Provider = .{};
+    var continuation: Continuation = .{};
+    var session = try Session.init(std.testing.allocator, .{});
+    defer session.deinit();
+    var loop_result = try run(std.testing.allocator, std.testing.io, .{
+        .session = &session,
+        .provider = ai.Provider.Provider.from(&provider, "fake"),
+        .model = "model",
+        .system_prompt = "system",
+        .continuation_hook = ContinuationHook.from(&continuation),
+    });
+    defer loop_result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(Outcome.complete, loop_result.outcome);
+    try std.testing.expectEqual(@as(usize, 2), provider.rounds);
+    try std.testing.expectEqual(@as(usize, 1), continuation.calls);
+}
+
+test "run lease rejects nested runs and provider or observer mutations" {
+    const NestedProvider = struct {
+        const Self = @This();
+        pub fn stream(
+            _: std.mem.Allocator,
+            _: std.Io,
+            _: *Self,
+            _: ai.Provider.Request,
+            sink: ai.Provider.EventSink,
+        ) ai.Provider.StreamError!void {
+            try sink.emit(.{ .done = .{} });
+        }
+    };
+    const Provider = struct {
+        const Self = @This();
+        session: *Session,
+        mutation_busy: bool = false,
+        nested_busy: bool = false,
+
+        pub fn stream(
+            _: std.mem.Allocator,
+            _: std.Io,
+            self: *Self,
+            _: ai.Provider.Request,
+            sink: ai.Provider.EventSink,
+        ) ai.Provider.StreamError!void {
+            self.session.addUser("forbidden") catch |err| {
+                self.mutation_busy = err == error.SessionBusy;
+            };
+            var nested_provider: NestedProvider = .{};
+            if (run(std.testing.allocator, std.testing.io, .{
+                .session = self.session,
+                .provider = ai.Provider.Provider.from(&nested_provider, "nested"),
+                .model = "model",
+                .system_prompt = "system",
+            })) |nested_result_value| {
+                var nested_result = nested_result_value;
+                nested_result.deinit(std.testing.allocator);
+            } else |err| {
+                self.nested_busy = err == error.SessionBusy;
+            }
+            try sink.emit(.{ .text_delta = "done" });
+            try sink.emit(.{ .done = .{} });
+        }
+    };
+    const StreamObserver = struct {
+        const Self = @This();
+        session: *Session,
+        mutation_busy: bool = false,
+
+        pub fn emit(self: *Self, _: ai.StreamEvent.StreamEvent) void {
+            self.session.addUser("forbidden") catch |err| {
+                self.mutation_busy = err == error.SessionBusy;
+            };
+        }
+    };
+    const Usage = struct {
+        const Self = @This();
+        session: *Session,
+        mutation_busy: bool = false,
+
+        pub fn observe(self: *Self, _: ai.Usage.TurnUsage) HookError!void {
+            self.session.addUser("forbidden") catch |err| {
+                self.mutation_busy = err == error.SessionBusy;
+                return;
+            };
+            return error.Failed;
+        }
+    };
+    const Seam = struct {
+        const Self = @This();
+        session: *Session,
+        mutation_busy: bool = false,
+
+        pub fn call(self: *Self, _: *const Session, _: SeamKind, _: bool) HookError!void {
+            self.session.addUser("forbidden") catch |err| {
+                self.mutation_busy = err == error.SessionBusy;
+                return;
+            };
+            return error.Failed;
+        }
+    };
+
+    var session = try Session.init(std.testing.allocator, .{});
+    defer session.deinit();
+    var provider: Provider = .{ .session = &session };
+    var stream_observer: StreamObserver = .{ .session = &session };
+    var usage: Usage = .{ .session = &session };
+    var seam: Seam = .{ .session = &session };
+    var loop_result = try run(std.testing.allocator, std.testing.io, .{
+        .session = &session,
+        .provider = ai.Provider.Provider.from(&provider, "fake"),
+        .model = "model",
+        .system_prompt = "system",
+        .observer = Observer.from(&stream_observer),
+        .usage_observer = UsageObserver.from(&usage),
+        .seam_hook = SeamHook.from(&seam),
+    });
+    defer loop_result.deinit(std.testing.allocator);
+
+    try std.testing.expect(provider.mutation_busy);
+    try std.testing.expect(provider.nested_busy);
+    try std.testing.expect(stream_observer.mutation_busy);
+    try std.testing.expect(usage.mutation_busy);
+    try std.testing.expect(seam.mutation_busy);
+}
+
+fn exerciseToolSettlementAllocations(allocator: std.mem.Allocator) !void {
+    const Provider = struct {
+        const Self = @This();
+        rounds: usize = 0,
+
+        pub fn stream(
+            _: std.mem.Allocator,
+            _: std.Io,
+            self: *Self,
+            _: ai.Provider.Request,
+            sink: ai.Provider.EventSink,
+        ) ai.Provider.StreamError!void {
+            self.rounds += 1;
+            if (self.rounds == 1) {
+                inline for (.{ "one", "two" }) |id| {
+                    try sink.emit(.{ .tool_call_start = .{ .id = id, .name = "echo" } });
+                    try sink.emit(.{ .tool_call_delta = .{ .id = id, .arguments_delta = "{}" } });
+                    try sink.emit(.{ .tool_call_end = id });
+                }
+                try sink.emit(.{ .done = .{ .usage = .{ .input_tokens = 1 } } });
+                return;
+            }
+            try sink.emit(.{ .text_delta = "done" });
+            try sink.emit(.{ .done = .{} });
+        }
+    };
+    const SideEffectTool = struct {
+        const Self = @This();
+        side_effects: usize = 0,
+
+        pub fn run(
+            alloc: std.mem.Allocator,
+            _: std.Io,
+            self: *Self,
+            _: ?[]const u8,
+            _: tool.Tool.RunContext,
+        ) tool.Tool.RunError!tool.Tool.Result {
+            self.side_effects += 1;
+            return .{ .output = try alloc.dupe(u8, "ok") };
+        }
+    };
+    const Seam = struct {
+        const Self = @This();
+        calls: usize = 0,
+
+        pub fn call(self: *Self, _: *const Session, kind: SeamKind, _: bool) HookError!void {
+            if (kind == .tool_batch) self.calls += 1;
+        }
+    };
+
+    var provider: Provider = .{};
+    var implementation: SideEffectTool = .{};
+    var seam: Seam = .{};
+    var tools = [_]tool.Tool.Tool{tool.Tool.Tool.from(&implementation, test_definition, .{})};
+    var session = try Session.init(allocator, .{});
+    defer session.deinit();
+    var loop_result = run(allocator, std.testing.io, .{
+        .session = &session,
+        .provider = ai.Provider.Provider.from(&provider, "fake"),
+        .model = "model",
+        .system_prompt = "system",
+        .tools = &tools,
+        .seam_hook = SeamHook.from(&seam),
+    }) catch |err| {
+        if (session.items().len == 0) {
+            try std.testing.expectEqual(@as(usize, 0), implementation.side_effects);
+        } else {
+            var call_count: usize = 0;
+            var result_count: usize = 0;
+            for (session.items()) |item| switch (item) {
+                .tool_call => call_count += 1,
+                .tool_result => result_count += 1,
+                else => {},
+            };
+            try std.testing.expectEqual(@as(usize, 2), call_count);
+            try std.testing.expectEqual(call_count, result_count);
+            try std.testing.expectEqual(@as(usize, 1), seam.calls);
+        }
+        return err;
+    };
+    loop_result.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 2), implementation.side_effects);
+    try std.testing.expectEqual(@as(usize, 1), seam.calls);
+}
+
+test "multi-tool allocation failures settle every accepted call before returning" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        exerciseToolSettlementAllocations,
+        .{},
+    );
+}

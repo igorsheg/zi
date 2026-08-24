@@ -18,9 +18,35 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - run: sudo apt-get update && sudo apt-get install -y pkg-config libcurl4-openssl-dev
       - uses: mlugg/setup-zig@e7d1537c378b83b8049f65dda471d87a2f7b2df2 # v2.2.0
         with:
           version: "0.16.0"
-      - run: zig fmt --check src/ tools/
+      - run: zig fmt --check src/
       - run: zig build
       - run: zig build test
+      - run: ./zig-out/bin/zi --help
+      - run: ./zig-out/bin/zi --version
+      - run: if ./zig-out/bin/zi >/tmp/zi.out 2>/tmp/zi.err; then exit 1; else test $? -eq 1; fi
+      - run: if ./zig-out/bin/zi --invalid >/tmp/zi.out 2>/tmp/zi.err; then exit 1; else test $? -eq 2; fi
+
+  macos-system-curl:
+    runs-on: macos-14
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: mlugg/setup-zig@e7d1537c378b83b8049f65dda471d87a2f7b2df2 # v2.2.0
+        with:
+          version: "0.16.0"
+      # Exercise Zig's -lcurl fallback against the macOS SDK without pkg-config.
+      - run: zig fmt --check src/
+        env:
+          PKG_CONFIG: /usr/bin/false
+      - run: zig build
+        env:
+          PKG_CONFIG: /usr/bin/false
+      - run: zig build test
+        env:
+          PKG_CONFIG: /usr/bin/false
+      - run: ./zig-out/bin/zi --help
+      - run: ./zig-out/bin/zi --version

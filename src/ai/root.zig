@@ -1,67 +1,118 @@
-pub const auth = @import("auth.zig");
-pub const credential = @import("credential.zig");
-pub const failure = @import("failure.zig");
-pub const message = @import("message.zig");
-pub const model = @import("model.zig");
-pub const model_catalog = @import("model_catalog.zig");
-pub const model_catalog_snapshot = @import("model_catalog_snapshot.zig");
-pub const models = @import("Models.zig");
-pub const oauth = @import("oauth.zig");
-pub const settings = @import("settings.zig");
-pub const stream = @import("stream.zig");
-pub const usage = @import("usage.zig");
-pub const transport = @import("transport.zig");
-pub const provider = @import("provider.zig");
-pub const protocol_api = @import("protocol.zig");
-pub const adapters = @import("adapters/root.zig");
-pub const providers = @import("providers/root.zig");
-const openai_chat_wire = @import("wire/openai_chat.zig");
-const openai_responses_wire = @import("wire/openai_responses.zig");
-const sse_wire = @import("wire/sse.zig");
-/// Stateless wire codecs. Transport-bound composition lives in adapters.
-pub const wire = struct {
-    pub const openai_chat = openai_chat_wire;
-    pub const openai_responses = openai_responses_wire;
-    pub const sse = sse_wire;
-};
-pub const transport_testing = @import("transport/fake.zig");
-pub const testing = @import("testing.zig");
+const std = @import("std");
 
-pub const Credential = credential.Credential;
-pub const ModelAuth = auth.ModelAuth;
-pub const Protocol = protocol_api.Protocol;
-pub const Models = models;
-pub const Model = model.Model;
-pub const ModelError = model.ModelError;
-pub const ModelRequest = model.ModelRequest;
-pub const ModelIdentity = model.ModelIdentity;
-pub const ModelProfile = model.ModelProfile;
-pub const ModelSettings = settings.ModelSettings;
-pub const ThinkingLevel = settings.ThinkingLevel;
-pub const Message = message.Message;
-pub const ResponseMessage = message.ResponseMessage;
-pub const ResponsePart = message.ResponsePart;
-pub const ToolDefinition = message.ToolDefinition;
-pub const StreamSink = stream.StreamSink;
-pub const StreamEvent = stream.StreamEvent;
-pub const OwnedResponse = model.OwnedResponse;
-pub const Usage = usage.Usage;
+pub const Item = @import("Item.zig");
+pub const StreamEvent = @import("StreamEvent.zig");
+pub const Provider = @import("Provider.zig");
+pub const Usage = @import("Usage.zig");
+pub const Transport = @import("Transport.zig");
+pub const JsonTransport = @import("JsonTransport.zig");
+pub const HttpTransport = @import("HttpTransport.zig");
+pub const OpenAiResponses = @import("OpenAiResponses.zig").OpenAiResponses;
+pub const OpenAiChat = @import("OpenAiChat.zig").OpenAiChat;
+pub const AnthropicMessages = @import("AnthropicMessages.zig").AnthropicMessages;
+pub const Wire = @import("Wire.zig").Wire;
+pub const Effort = @import("Effort.zig");
+pub const ModelMeta = @import("ModelMeta.zig");
+pub const ModelCatalog = @import("ModelCatalog.zig");
+pub const ProviderRegistry = @import("ProviderRegistry.zig");
+pub const ProviderFactory = @import("ProviderFactory.zig");
+pub const Codex = @import("Codex.zig").Codex;
+pub const CodexConfig = @import("Codex.zig").Config;
+pub const CodexCredential = @import("Codex.zig").Credential;
+pub const CodexOwnedCredential = @import("Codex.zig").OwnedCredential;
+pub const CodexCredentialSource = @import("Codex.zig").CredentialSource;
+pub const CodexAcquirePurpose = @import("Codex.zig").AcquirePurpose;
+pub const CodexAcquireDecision = @import("Codex.zig").AcquireDecision;
+pub const CodexUnauthorizedDecision = @import("Codex.zig").UnauthorizedDecision;
+pub const CodexCredentials = @import("CodexCredentials.zig");
+pub const CodexRefresh = @import("CodexRefresh.zig");
+pub const CodexModels = @import("CodexModels.zig");
+pub const CodexOperations = @import("CodexOperations.zig");
+pub const CodexUsage = @import("CodexUsage.zig");
+const Sse = @import("Sse.zig");
+const Retry = @import("Retry.zig");
+const ApiError = @import("ApiError.zig");
+const StreamRetry = @import("StreamRetry.zig");
+const SecureAllocator = @import("SecureAllocator.zig");
+const OpenAiResponsesBody = @import("OpenAiResponsesBody.zig");
+const OpenAiResponsesEvents = @import("OpenAiResponsesEvents.zig");
+const OpenAiChatBody = @import("OpenAiChatBody.zig");
+const OpenAiChatEvents = @import("OpenAiChatEvents.zig");
+const AnthropicMessagesBody = @import("AnthropicMessagesBody.zig");
+const AnthropicMessagesEvents = @import("AnthropicMessagesEvents.zig");
 
 test {
-    _ = auth;
-    _ = credential;
-    _ = wire.openai_chat;
-    _ = wire.openai_responses;
-    _ = wire.sse;
-    _ = model_catalog;
-    _ = model_catalog_snapshot;
-    _ = models;
-    _ = oauth;
-    _ = provider;
-    _ = protocol_api;
-    _ = adapters;
-    _ = providers;
-    _ = transport;
-    _ = transport_testing;
-    _ = testing;
+    _ = Item;
+    _ = StreamEvent;
+    _ = Provider;
+    _ = Usage;
+    _ = Transport;
+    _ = Sse;
+    _ = Retry;
+    _ = ApiError;
+    _ = StreamRetry;
+    _ = SecureAllocator;
+    _ = OpenAiResponses;
+    _ = OpenAiResponsesBody;
+    _ = OpenAiResponsesEvents;
+    _ = OpenAiChat;
+    _ = OpenAiChatBody;
+    _ = OpenAiChatEvents;
+    _ = AnthropicMessages;
+    _ = AnthropicMessagesBody;
+    _ = AnthropicMessagesEvents;
+    _ = Wire;
+    _ = Effort;
+    _ = JsonTransport;
+    _ = HttpTransport;
+    _ = ModelMeta;
+    _ = ModelCatalog;
+    _ = ProviderRegistry;
+    _ = ProviderFactory;
+    _ = Codex;
+    _ = CodexConfig;
+    _ = CodexCredential;
+    _ = CodexCredentialSource;
+    _ = CodexAcquirePurpose;
+    _ = CodexAcquireDecision;
+    _ = CodexUnauthorizedDecision;
+    _ = CodexCredentials;
+    _ = CodexRefresh;
+    _ = CodexModels;
+    _ = CodexOperations;
+    _ = CodexUsage;
+}
+
+test "Codex credential source is implementable through the public seam" {
+    const Source = struct {
+        const Self = @This();
+
+        pub fn acquire(
+            _: *Self,
+            allocator: std.mem.Allocator,
+            _: std.Io,
+            _: ?Provider.Tick,
+            purpose: CodexAcquirePurpose,
+        ) CodexCredentialSource.CallbackError!CodexAcquireDecision {
+            std.debug.assert(purpose == .request);
+            return .{ .ready = try CodexOwnedCredential.init(allocator, .{
+                .access_token = "token",
+                .account_id = "account",
+            }) };
+        }
+
+        pub fn recoverUnauthorized(
+            _: *Self,
+            _: std.mem.Allocator,
+            _: std.Io,
+            _: ?Provider.Tick,
+            _: CodexCredential,
+        ) CodexCredentialSource.CallbackError!CodexUnauthorizedDecision {
+            return .use_response;
+        }
+
+        pub fn noteUnauthorized(_: *Self, _: CodexCredential) void {}
+    };
+    var source: Source = .{};
+    _ = CodexCredentialSource.from(&source);
 }
