@@ -1252,6 +1252,17 @@ const RealTaskHarness = struct {
     }
 };
 
+fn shellQuoteAlloc(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
+    const escaped = try std.mem.replaceOwned(u8, allocator, value, "'", "'\"'\"'");
+    defer allocator.free(escaped);
+    return std.fmt.allocPrint(allocator, "'{s}'", .{escaped});
+}
+
+fn touchTestMarker(tmp: *std.testing.TmpDir, name: []const u8) !void {
+    const file = try tmp.dir.createFile(std.testing.io, name, .{});
+    file.close(std.testing.io);
+}
+
 const RequestedCancellation = struct {
     pub fn isRequested(_: *const RequestedCancellation) bool {
         return true;
@@ -1287,6 +1298,25 @@ test "managed foreground cancellation reports interrupt exactly" {
 }
 
 test "background fast finish stays synchronous and slow command is adopted" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const slow_marker_name = "release-slow";
+    const timed_marker_name = "release-timed";
+    const slow_marker_path = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ ".zig-cache", "tmp", &tmp.sub_path, slow_marker_name },
+    );
+    defer std.testing.allocator.free(slow_marker_path);
+    const timed_marker_path = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ ".zig-cache", "tmp", &tmp.sub_path, timed_marker_name },
+    );
+    defer std.testing.allocator.free(timed_marker_path);
+    const quoted_slow_marker = try shellQuoteAlloc(std.testing.allocator, slow_marker_path);
+    defer std.testing.allocator.free(quoted_slow_marker);
+    const quoted_timed_marker = try shellQuoteAlloc(std.testing.allocator, timed_marker_path);
+    defer std.testing.allocator.free(quoted_timed_marker);
+
     var harness: RealTaskHarness = .{ .io = std.testing.io };
     var registry = try TaskRegistryModule.TaskRegistry.init(
         std.testing.allocator,
@@ -1304,6 +1334,10 @@ test "background fast finish stays synchronous and slow command is adopted" {
         registry.deinit();
         bash.deinit();
     }
+    defer {
+        touchTestMarker(&tmp, slow_marker_name) catch {};
+        touchTestMarker(&tmp, timed_marker_name) catch {};
+    }
 
     var fast = try bash.tool().run(
         std.testing.allocator,
@@ -1319,29 +1353,71 @@ test "background fast finish stays synchronous and slow command is adopted" {
     // window for the fast-finish assertion above.
     bash.background_yield_ms = 20;
 
+    const detached_command = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "printf one; while [ ! -e {s} ]; do :; done; printf two",
+        .{quoted_slow_marker},
+    );
+    defer std.testing.allocator.free(detached_command);
+    const detached_command_json = try std.json.Stringify.valueAlloc(
+        std.testing.allocator,
+        detached_command,
+        .{},
+    );
+    defer std.testing.allocator.free(detached_command_json);
+    const detached_input = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"command\":{s},\"background\":true,\"name\":\"slow\"}}",
+        .{detached_command_json},
+    );
+    defer std.testing.allocator.free(detached_input);
     var detached = try bash.tool().run(
         std.testing.allocator,
         std.testing.io,
-        "{\"command\":\"printf one; sleep 0.1; printf two\",\"background\":true,\"name\":\"slow\"}",
+        detached_input,
         .{},
     );
     defer detached.deinit(std.testing.allocator);
     try std.testing.expect(std.mem.indexOf(u8, detached.output, "one") != null);
+    try std.testing.expect(std.mem.indexOf(u8, detached.output, "two") == null);
     try std.testing.expect(std.mem.endsWith(u8, detached.output, "[detached as task slow]"));
+    try std.testing.expectEqual(@as(usize, 1), try registry.runningCount());
+    try touchTestMarker(&tmp, slow_marker_name);
     const waited = try registry.wait(std.testing.allocator, "slow", .{ .timeout_ms = 2000 });
     defer std.testing.allocator.free(waited);
     try std.testing.expect(std.mem.indexOf(u8, waited, "two") != null);
     try std.testing.expect(std.mem.indexOf(u8, waited, "finished (exit 0)") != null);
 
+    const timed_command = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "printf timeout-start; while [ ! -e {s} ]; do :; done; printf timeout-end",
+        .{quoted_timed_marker},
+    );
+    defer std.testing.allocator.free(timed_command);
+    const timed_command_json = try std.json.Stringify.valueAlloc(
+        std.testing.allocator,
+        timed_command,
+        .{},
+    );
+    defer std.testing.allocator.free(timed_command_json);
+    const timed_input = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"command\":{s}}}",
+        .{timed_command_json},
+    );
+    defer std.testing.allocator.free(timed_input);
     var timed = try bash.tool().run(
         std.testing.allocator,
         std.testing.io,
-        "{\"command\":\"printf timeout-start; sleep 0.1; printf timeout-end\"}",
+        timed_input,
         .{},
     );
     defer timed.deinit(std.testing.allocator);
     try std.testing.expect(std.mem.indexOf(u8, timed.output, "timeout-start") != null);
+    try std.testing.expect(std.mem.indexOf(u8, timed.output, "timeout-end") == null);
     try std.testing.expect(std.mem.endsWith(u8, timed.output, "[detached as task t2 after 0s timeout]"));
+    try std.testing.expectEqual(@as(usize, 1), try registry.runningCount());
+    try touchTestMarker(&tmp, timed_marker_name);
     const timed_wait = try registry.wait(std.testing.allocator, "t2", .{ .timeout_ms = 2000 });
     defer std.testing.allocator.free(timed_wait);
     try std.testing.expect(std.mem.indexOf(u8, timed_wait, "timeout-end") != null);
