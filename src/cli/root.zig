@@ -3,6 +3,7 @@ const std = @import("std");
 const version = "0.1.0-dev";
 
 pub const Args = @import("Args.zig");
+pub const ProcessAdapters = @import("ProcessAdapters.zig");
 
 pub const Command = union(enum) {
     help,
@@ -88,6 +89,7 @@ fn writeHelp(writer: *std.Io.Writer) !void {
 
 test {
     _ = Args;
+    _ = ProcessAdapters;
 }
 
 test "CLI parser admits only the bootstrap command surface" {
