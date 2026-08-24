@@ -7,14 +7,14 @@ const transport = @import("transport.zig");
 
 pub const Invocation = struct {
     transport: transport.Transport,
+    profile: settings.ModelProfile,
     base_url: []const u8,
     headers: []const transport.Header = &.{},
     auth: auth.ModelAuth = .{},
 };
 
 pub const ProfileHints = struct {
-    reasoning: bool = false,
-    reasoning_efforts: std.EnumSet(settings.ReasoningEffort) = .initEmpty(),
+    thinking: ?settings.ThinkingProfile = null,
 };
 
 pub const Protocol = struct {

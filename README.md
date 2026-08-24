@@ -33,15 +33,23 @@ Markdown blocks in model response order. Settled lines appear progressively as
 the response streams, and the visible transcript reflows after a resize. The UI
 uses a compact inline region in the normal terminal buffer. It preserves shell
 rows above that region, grows through native scrollback, and leaves the
-transcript visible when Zi exits. Running tools appear in the footer with a
-bounded action and target, such as `Reading src/main.zig`. Consecutive completed
+transcript visible when Zi exits. The composer has no horizontal borders. Its
+single dim status row shows the active model, effective thinking level for
+reasoning models, and session working directory. Running tool and cancellation
+activity takes priority on that row, with a
+bounded action and target such as `Reading src/main.zig`. Consecutive completed
 tools form one compact group without dumping tool output.
 
 When no authenticated model is available, interactive mode still opens a durable
-session. Drafts remain intact until a model is available. Use
-`/login PROVIDER [--device]` to log in without leaving the TUI. Use
-`/model PROVIDER/MODEL` while idle to switch the same durable session and save
-the selected model as the global default.
+session. Drafts remain intact until a model is available. Type `/` to browse
+interactive commands, use the arrow keys to select one, then press Enter or Tab
+to complete it. Use `/login PROVIDER [--device]` to log in without leaving the
+TUI. Use `/model PROVIDER/MODEL` while idle to switch the same durable session
+and save the selected model as the global default. Use `/thinking LEVEL` to set
+a level supported by the active model, or Ctrl-T to cycle supported levels, for
+subsequent requests. Explicit unsupported levels are rejected. Zi clamps saved
+or restored defaults to the active model and records the effective level in the
+session journal.
 
 Run one or more prompts in print mode:
 

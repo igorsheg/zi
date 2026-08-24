@@ -2,6 +2,7 @@ const std = @import("std");
 const ai_failure = @import("../ai/failure.zig");
 const ai_message = @import("../ai/message.zig");
 const ai_model = @import("../ai/model.zig");
+const ai_settings = @import("../ai/settings.zig");
 const ai_stream = @import("../ai/stream.zig");
 const ai_usage = @import("../ai/usage.zig");
 const commit_api = @import("Commit.zig");
@@ -82,6 +83,7 @@ const TurnError = error{
 allocator: std.mem.Allocator,
 io: std.Io,
 model: ai_model.Model,
+thinking_level: ai_settings.ThinkingLevel = .off,
 /// Borrowed immutable policy; its storage must outlive the agent.
 instructions: []const []const u8,
 catalog: tool_api.Catalog,
@@ -97,7 +99,7 @@ provider_failure: ?ai_failure.ProviderFailure = null,
 context: context_projection.State = .{},
 next_run_id: u64 = 0,
 
-pub fn init(
+fn initBase(
     allocator: std.mem.Allocator,
     io: std.Io,
     model: ai_model.Model,
@@ -122,6 +124,22 @@ pub fn init(
     };
 }
 
+pub fn init(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    model: ai_model.Model,
+    instructions: []const []const u8,
+    tools: []const tool_api.Tool,
+    limits: limit_api.RunLimits,
+    events: ?EventSink,
+    thinking_level: ai_settings.ThinkingLevel,
+) (tool_api.Error || error{UnsupportedSetting})!Agent {
+    var agent = try initBase(allocator, io, model, instructions, tools, limits, events);
+    errdefer agent.deinit();
+    try agent.setThinkingLevel(thinking_level);
+    return agent;
+}
+
 pub fn deinit(self: *Agent) void {
     self.result_arena.deinit();
     self.history.deinit();
@@ -139,6 +157,17 @@ pub fn messages(self: *const Agent) []const ai_message.Message {
 
 pub fn modelRequests(self: *const Agent) usize {
     return self.model_request_count;
+}
+
+pub fn thinkingLevel(self: *const Agent) ai_settings.ThinkingLevel {
+    return self.thinking_level;
+}
+
+fn setThinkingLevel(self: *Agent, level: ai_settings.ThinkingLevel) error{UnsupportedSetting}!void {
+    std.debug.assert(self.run_state == .ready);
+    const settings: ai_settings.ModelSettings = .{ .thinking_level = level };
+    try settings.validate(self.model.profile);
+    self.thinking_level = level;
 }
 
 pub fn toolCalls(self: *const Agent) usize {
@@ -680,6 +709,7 @@ fn invokeModel(
         .messages = self.history.messages(),
         .instructions = self.instructions,
         .tools = tools,
+        .settings = .{ .thinking_level = self.thinking_level },
         .failure_sink = .{ .context = self, .observeFn = observeProviderFailure },
         .deadline = control.deadline,
         .cancellation = control.cancellation,
@@ -905,9 +935,11 @@ const EventRecorder = struct {
 
 const SecondRequestRecorder = struct {
     valid: bool = false,
+    high_thinking_requests: usize = 0,
 
     fn observe(context: *anyopaque, index: usize, request: ai_model.ModelRequest) void {
         const self: *SecondRequestRecorder = @ptrCast(@alignCast(context));
+        if (request.settings.thinking_level == .high) self.high_thinking_requests += 1;
         if (index != 1 or request.messages.len != 3) return;
         const result = request.messages[2].request.parts[0].tool_result;
         self.valid = result.outcome == .success and
@@ -916,6 +948,32 @@ const SecondRequestRecorder = struct {
             std.mem.eql(u8, result.content[0].text, "file contents");
     }
 };
+
+test "agent construction rejects an unsupported initial thinking level" {
+    var scripted_model: ai_testing.ScriptedModel = .{
+        .identity = .{ .provider = "script", .model = "agent" },
+        .steps = &.{.{ .text = "unused" }},
+    };
+    var model = scripted_model.asModel();
+    model.profile.thinking = .{ .level_map = .{
+        .off = .unsupported,
+        .minimal = .unsupported,
+        .low = .unsupported,
+        .medium = .unsupported,
+        .xhigh = .unsupported,
+        .max = .unsupported,
+    } };
+    try std.testing.expectError(error.UnsupportedSetting, Agent.init(
+        std.testing.allocator,
+        std.testing.io,
+        model,
+        &.{},
+        &.{},
+        .{},
+        null,
+        .off,
+    ));
+}
 
 test "agent retains only bounded safe provider failure details" {
     var scripted_model: ai_testing.ScriptedModel = .{
@@ -930,6 +988,7 @@ test "agent retains only bounded safe provider failure details" {
         &.{},
         .{},
         null,
+        .off,
     );
     defer agent.deinit();
 
@@ -980,14 +1039,17 @@ test "agent executes a tool and returns final text with owned canonical history"
     const tool = tool_api.Tool.from(&scripted_tool, definition);
     var recorder: EventRecorder = .{};
     var cancellation: ai_model.CancellationToken = .{};
+    var reasoning_model = scripted_model.asModel();
+    reasoning_model.profile.thinking = .{};
     var agent = try Agent.init(
         std.testing.allocator,
         std.testing.io,
-        scripted_model.asModel(),
+        reasoning_model,
         &.{},
         &.{tool},
         .{},
         .{ .context = &recorder, .emitFn = EventRecorder.emit },
+        .high,
     );
     defer agent.deinit();
 
@@ -998,6 +1060,7 @@ test "agent executes a tool and returns final text with owned canonical history"
     try std.testing.expectEqual(@as(usize, 1), agent.toolCalls());
     try std.testing.expectEqual(@as(usize, 1), scripted_tool.calls);
     try std.testing.expect(request_recorder.valid);
+    try std.testing.expectEqual(@as(usize, 2), request_recorder.high_thinking_requests);
     try std.testing.expectEqual(@as(usize, 4), agent.messages().len);
     try std.testing.expectEqualStrings("read the file.", agent.messages()[0].request.parts[0].user.text);
     try std.testing.expectEqualStrings("read", agent.messages()[1].response.parts[0].tool_call.name);
@@ -1047,6 +1110,7 @@ test "pre-cancelled runs close their message and turn lifecycle" {
         &.{},
         .{},
         .{ .context = &recorder, .emitFn = EventRecorder.emit },
+        .off,
     );
     defer agent.deinit();
     var cancellation: ai_model.CancellationToken = .{};
@@ -1090,6 +1154,7 @@ test "agent enforces model request and tool call limits before excess work" {
         &.{tool},
         .{ .max_tool_calls = 0 },
         null,
+        .off,
     );
     defer agent.deinit();
     try std.testing.expectError(error.MaxToolCallsExceeded, agent.run("go"));
@@ -1119,6 +1184,7 @@ test "recoverable tool failure is returned to the model" {
         &.{tool},
         .{},
         null,
+        .off,
     );
     defer agent.deinit();
     try std.testing.expectEqualStrings("recovered", try agent.run("go"));
@@ -1154,6 +1220,7 @@ test "length-truncated tool calls are returned as failures without execution" {
         &.{tool},
         .{},
         null,
+        .off,
     );
     defer agent.deinit();
     try std.testing.expectEqualStrings("reissued", try agent.run("go"));
@@ -1183,6 +1250,7 @@ test "model request limit stops before another model operation" {
         &.{tool},
         .{ .max_model_requests = 1 },
         null,
+        .off,
     );
     defer agent.deinit();
     try std.testing.expectError(error.MaxModelRequestsExceeded, agent.run("go"));
@@ -1210,6 +1278,7 @@ test "oversized tool result removes its incomplete exchange from provider contex
         &.{tool},
         .{ .max_tool_result_bytes = 4 },
         null,
+        .off,
     );
     defer agent.deinit();
     try std.testing.expectError(error.ToolResultTooLarge, agent.run("go"));
@@ -1236,6 +1305,7 @@ test "fatal tool cancellation is terminal cancellation" {
         &.{tool},
         .{},
         null,
+        .off,
     );
     defer agent.deinit();
     try std.testing.expectError(error.Cancelled, agent.run("go"));
@@ -1262,6 +1332,7 @@ test "fatal tool timeout and allocation failure are terminal failures" {
             &.{tool},
             .{},
             null,
+            .off,
         );
         defer agent.deinit();
         try std.testing.expectError(fatal, agent.run("go"));
@@ -1302,6 +1373,7 @@ test "agent completes one turn with owned canonical messages" {
         &.{},
         .{},
         null,
+        .off,
     );
     defer agent.deinit();
 
@@ -1340,6 +1412,7 @@ test "agent reuses completed turns and resets run limits" {
         &.{tool},
         .{ .max_model_requests = 2 },
         null,
+        .off,
     );
     defer agent.deinit();
 
@@ -1387,6 +1460,7 @@ test "completed turns accept fresh run cancellation control" {
         &.{},
         .{},
         null,
+        .off,
     );
     defer agent.deinit();
 
@@ -1423,6 +1497,7 @@ test "agent accepts a fresh run after settled cancellation and failure" {
             &.{fatal_tool.asTool(.{ .name = "read", .description = "", .parameters_json_schema = "{}" })},
             .{},
             null,
+            .off,
         );
         defer agent.deinit();
         try std.testing.expectError(error.Cancelled, agent.run("stop me"));
@@ -1451,6 +1526,7 @@ test "agent accepts a fresh run after settled cancellation and failure" {
             &.{quiet_tool.asTool(.{ .name = "read", .description = "", .parameters_json_schema = "{}" })},
             .{ .max_tool_calls = 0 },
             null,
+            .off,
         );
         defer agent.deinit();
         try std.testing.expectError(error.MaxToolCallsExceeded, agent.run("limit me"));
@@ -1476,6 +1552,7 @@ test "agent rejects reentrant runs until terminal events settle" {
         &.{},
         .{},
         null,
+        .off,
     );
     defer agent.deinit();
 
@@ -1560,6 +1637,7 @@ test "agent streams a tool loop with owned canonical history" {
         &.{tool},
         .{},
         .{ .context = &collector, .emitFn = StreamCollector.emit },
+        .off,
     );
     defer agent.deinit();
 
@@ -1623,6 +1701,7 @@ test "final tool end delivery failure retains the fully committed exchange" {
         &.{tool},
         .{},
         .{ .context = &sink_state, .emitFn = FinalToolEndFailSink.emit },
+        .off,
     );
     defer agent.deinit();
 
@@ -1670,6 +1749,7 @@ fn expectEventFailureDoesNotCommit(
         &.{},
         .{},
         null,
+        .off,
     );
     defer agent.deinit();
     var sink_state: EventFailSink = .{ .failure = failure };
@@ -1709,6 +1789,7 @@ fn expectFatalFinishDoesNotCommit(
         &.{},
         .{},
         null,
+        .off,
     );
     defer agent.deinit();
     var collector: StreamCollector = .{};
@@ -1760,6 +1841,7 @@ test "indeterminate message publication poisons the live agent" {
         &.{},
         .{},
         null,
+        .off,
     );
     defer agent.deinit();
     try agent.bindCommits(&.{}, .{
@@ -1803,6 +1885,7 @@ fn expectNonToolFinishRejectsToolCalls(finish: ai_usage.FinishCategory) !void {
         &.{tool},
         .{},
         null,
+        .off,
     );
     defer agent.deinit();
 
@@ -1830,6 +1913,7 @@ test "only tool-call finishes authorize local tool execution" {
         &.{},
         .{},
         null,
+        .off,
     );
     defer agent.deinit();
 
@@ -1857,6 +1941,7 @@ fn expectInvalidToolIdentities(calls: []const ai_testing.ScriptedStep.ToolCall) 
         &.{tool},
         .{},
         null,
+        .off,
     );
     defer agent.deinit();
 
@@ -1905,6 +1990,7 @@ test "failed tool batches are removed from provider context" {
         &tools,
         .{},
         null,
+        .off,
     );
     defer agent.deinit();
 
@@ -1947,6 +2033,7 @@ test "late cancellation preserves a completed tool result" {
         &.{tool},
         .{},
         .{ .context = &events, .emitFn = CancelOnToolCompletion.emit },
+        .off,
     );
     defer agent.deinit();
 
@@ -1973,6 +2060,7 @@ test "agent falls back to buffered models and preflights tool capabilities" {
         &.{},
         .{},
         null,
+        .off,
     );
     defer no_stream_agent.deinit();
 
@@ -1999,6 +2087,7 @@ test "agent falls back to buffered models and preflights tool capabilities" {
         &.{tool},
         .{},
         null,
+        .off,
     );
     defer no_tools_agent.deinit();
 
@@ -2036,6 +2125,7 @@ test "streamed completed turns preserve history across fresh runs" {
         &.{},
         .{},
         null,
+        .off,
     );
     defer agent.deinit();
     var first_collector: StreamCollector = .{};

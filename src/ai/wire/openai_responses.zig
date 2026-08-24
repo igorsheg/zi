@@ -2,6 +2,7 @@ const std = @import("std");
 const failure = @import("../failure.zig");
 const message = @import("../message.zig");
 const model = @import("../model.zig");
+const settings = @import("../settings.zig");
 const sse = @import("sse.zig");
 const stream = @import("../stream.zig");
 const transport = @import("../transport.zig");
@@ -13,24 +14,34 @@ const max_tool_arguments_bytes = 1024 * 1024;
 pub fn encodeRequest(
     allocator: std.mem.Allocator,
     identity: message.ModelIdentity,
+    profile: settings.ModelProfile,
     request: model.ModelRequest,
 ) failure.ModelError![]const u8 {
-    return encode(allocator, identity, request, .openai);
+    return encode(allocator, identity, profile, request, .openai);
 }
 
 pub fn encodeCodexRequest(
     allocator: std.mem.Allocator,
     identity: message.ModelIdentity,
+    profile: settings.ModelProfile,
     request: model.ModelRequest,
 ) failure.ModelError![]const u8 {
-    return encode(allocator, identity, request, .codex);
+    return encode(allocator, identity, profile, request, .codex);
 }
 
-const Flavor = enum { openai, codex };
+const Flavor = enum {
+    openai,
+    codex,
+
+    fn inheritedThinkingOffValue(_: Flavor) []const u8 {
+        return "none";
+    }
+};
 
 fn encode(
     allocator: std.mem.Allocator,
     identity: message.ModelIdentity,
+    profile: settings.ModelProfile,
     request: model.ModelRequest,
     flavor: Flavor,
 ) failure.ModelError![]const u8 {
@@ -103,15 +114,18 @@ fn encode(
     if (flavor == .openai) if (request.settings.max_output_tokens) |value| {
         writer.print(",\"max_output_tokens\":{}", .{@max(value, 16)}) catch return error.OutOfMemory;
     };
-    if (request.settings.reasoning_effort) |effort| {
+    if (profile.thinking != null) if (profile.thinkingWireValue(
+        request.settings.thinking_level,
+        flavor.inheritedThinkingOffValue(),
+    )) |effort| {
         writer.writeAll(",\"reasoning\":{\"effort\":") catch return error.OutOfMemory;
-        writeJson(writer, @tagName(effort)) catch return error.OutOfMemory;
+        writeJson(writer, effort) catch return error.OutOfMemory;
         writer.writeAll(",\"summary\":\"auto\"}") catch return error.OutOfMemory;
         if (flavor == .openai) {
             writer.writeAll(",\"include\":[\"reasoning.encrypted_content\"]") catch
                 return error.OutOfMemory;
         }
-    }
+    };
     if (request.tools.len > 0) {
         writer.writeAll(",\"tools\":[") catch return error.OutOfMemory;
         for (request.tools, 0..) |tool, index| {

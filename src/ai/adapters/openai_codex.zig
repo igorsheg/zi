@@ -15,11 +15,7 @@ pub const OpenAiCodex = struct {
     pub fn profile(_: *const OpenAiCodex, hints: protocol_api.ProfileHints) settings.ModelProfile {
         var value: settings.ModelProfile = .{};
         value.capabilities = .initMany(&.{ .streaming, .tools, .parallel_tool_calls });
-        if (hints.reasoning) {
-            value.capabilities.insert(.thinking);
-            value.settings.insert(.reasoning_effort);
-            value.reasoning_efforts = hints.reasoning_efforts;
-        }
+        value.thinking = hints.thinking;
         return value;
     }
 
@@ -57,7 +53,12 @@ pub const OpenAiCodex = struct {
             std.crypto.secureZero(u8, authorization);
             scratch_allocator.free(authorization);
         }
-        const body = try openai_responses.encodeCodexRequest(scratch_allocator, identity, request);
+        const body = try openai_responses.encodeCodexRequest(
+            scratch_allocator,
+            identity,
+            invocation.profile,
+            request,
+        );
         defer {
             std.crypto.secureZero(u8, @constCast(body));
             scratch_allocator.free(body);

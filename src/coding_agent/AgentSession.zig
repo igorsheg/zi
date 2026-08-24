@@ -519,6 +519,7 @@ pub const AgentSession = struct {
         limits: agent_limits.RunLimits = .{},
         events: ?EventSink = null,
         prompt: SystemPrompt.Config = .{},
+        thinking_level: ai.ThinkingLevel = .off,
     };
 
     pub const InitError = error{
@@ -529,6 +530,7 @@ pub const AgentSession = struct {
         InvalidToolDefinition,
         UnknownTool,
         InvalidToolArguments,
+        UnsupportedSetting,
     };
 
     const Tools = struct {
@@ -589,6 +591,7 @@ pub const AgentSession = struct {
                     .context = tools,
                     .emitFn = Tools.emitAgentEvent,
                 },
+                options.thinking_level,
             ),
         };
     }
@@ -675,6 +678,10 @@ pub const AgentSession = struct {
 
     pub fn state(self: *const AgentSession) Agent.State {
         return self.agent.state();
+    }
+
+    pub fn thinkingLevel(self: *const AgentSession) ai.ThinkingLevel {
+        return self.agent.thinkingLevel();
     }
 
     pub fn systemPrompt(self: *const AgentSession) []const u8 {

@@ -19,6 +19,10 @@ pub const FrameView = struct {
     composer: render.FrameBuilder.ComposerView,
     phase: interactive.Phase,
     queued_count: usize,
+    active_model: ?ai.ModelIdentity = null,
+    thinking_level: ?ai.ThinkingLevel = null,
+    cwd: []const u8 = "",
+    slash_menu: ?render.FrameBuilder.SlashMenuProjection = null,
 };
 
 allocator: std.mem.Allocator,
@@ -136,6 +140,10 @@ fn buildFrame(self: *Screen, arena: std.mem.Allocator, view: FrameView) !BuiltFr
             .phase = view.phase,
             .queued_count = view.queued_count,
             .active_tool = self.transcript_runtime.activeToolLabel(),
+            .active_model = view.active_model,
+            .thinking_level = view.thinking_level,
+            .cwd = view.cwd,
+            .slash_menu = view.slash_menu,
         },
         &self.terminal_renderer,
     );
@@ -181,10 +189,14 @@ test "screen stages facts and publishes one fx-style footer frame" {
         .composer = .{ .text = "next", .cursor_byte = 4 },
         .phase = .{ .turn = .{ .running = @enumFromInt(1) } },
         .queued_count = 2,
+        .active_model = .{ .provider = "openai", .model = "gpt-test" },
+        .cwd = "/work/zi",
     });
     try std.testing.expect(std.mem.find(u8, output.written(), "hello") != null);
     try std.testing.expect(std.mem.find(u8, output.written(), "working · esc cancel") != null);
     try std.testing.expect(std.mem.find(u8, output.written(), "2 queued") != null);
+    try std.testing.expect(std.mem.find(u8, output.written(), "openai/gpt-test") != null);
+    try std.testing.expect(std.mem.find(u8, output.written(), "/work/zi") != null);
     try std.testing.expect(std.mem.find(u8, output.written(), "next") != null);
 }
 
@@ -204,7 +216,7 @@ test "screen paints compact absolute bands from the launch row" {
 
     const layout = screen.terminal_renderer.committed_layout.?;
     const expected_transcript: FramePlan.Band = .{ .top = 6, .bottom = 7 };
-    const expected_footer: FramePlan.Band = .{ .top = 8, .bottom = 11 };
+    const expected_footer: FramePlan.Band = .{ .top = 8, .bottom = 9 };
     try std.testing.expectEqual(expected_transcript, layout.transcript_band);
     try std.testing.expectEqual(expected_footer, layout.footer_band);
     for (1..6) |row| {

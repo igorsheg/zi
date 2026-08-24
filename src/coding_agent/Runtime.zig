@@ -653,6 +653,7 @@ pub const SessionRuntime = struct {
         InvalidToolDefinition,
         UnknownTool,
         InvalidToolArguments,
+        UnsupportedSetting,
     };
 
     pub const DurableCreateError = error{
@@ -664,6 +665,7 @@ pub const SessionRuntime = struct {
         InvalidToolDefinition,
         UnknownTool,
         InvalidToolArguments,
+        UnsupportedSetting,
         PersistenceFailed,
         CommitIndeterminate,
         SessionTooLarge,
@@ -863,6 +865,7 @@ pub const SessionRuntime = struct {
             opened,
             sources,
             self.model_runtime.model().identity,
+            options.thinking_level,
             faults,
         );
         opened_owned = false;
@@ -880,22 +883,21 @@ pub const SessionRuntime = struct {
 
     const test_compatible_profile = profile: {
         var value: ai_settings.ModelProfile = .{};
-        value.capabilities = .initMany(&.{ .streaming, .tools, .parallel_tool_calls, .thinking });
+        value.capabilities = .initMany(&.{ .streaming, .tools, .parallel_tool_calls });
         value.settings = .initMany(&.{ .temperature, .top_p, .max_output_tokens, .stop_sequences, .seed });
         break :profile value;
     };
     const test_responses_profile = profile: {
         var value: ai_settings.ModelProfile = .{};
-        value.capabilities = .initMany(&.{ .streaming, .tools, .parallel_tool_calls, .thinking });
-        value.settings = .initMany(&.{ .max_output_tokens, .reasoning_effort });
-        value.reasoning_efforts = .initMany(&.{ .low, .medium, .high });
+        value.capabilities = .initMany(&.{ .streaming, .tools, .parallel_tool_calls });
+        value.settings = .initOne(.max_output_tokens);
+        value.thinking = .{ .level_map = .{ .minimal = .unsupported } };
         break :profile value;
     };
     const test_codex_profile = profile: {
         var value: ai_settings.ModelProfile = .{};
-        value.capabilities = .initMany(&.{ .streaming, .tools, .parallel_tool_calls, .thinking });
-        value.settings = .initMany(&.{.reasoning_effort});
-        value.reasoning_efforts = .initMany(&.{ .minimal, .low, .medium, .high });
+        value.capabilities = .initMany(&.{ .streaming, .tools, .parallel_tool_calls });
+        value.thinking = .{};
         break :profile value;
     };
     const test_catalog_entries = [_]ai_catalog.Entry{
@@ -971,6 +973,7 @@ pub const SessionRuntime = struct {
                 return error.Rejected;
             }
             if (!hasHeader(request, "authorization", "Bearer runtime-secret")) return error.Rejected;
+            if (std.mem.find(u8, request.body, "\"effort\":\"medium\"") == null) return error.Rejected;
             switch (self.calls) {
                 0 => {
                     if (std.mem.indexOf(u8, request.body, "read note.txt") == null) {
@@ -1200,7 +1203,7 @@ pub const SessionRuntime = struct {
             try testSessionCwd(temporary.dir),
             fake.transport(),
             resolved.runtimeConfig(),
-            .{},
+            .{ .thinking_level = .medium },
         );
         defer runtime.deinit();
         resolved.deinit();
@@ -1284,13 +1287,14 @@ pub const SessionRuntime = struct {
         );
         defer restored.deinit();
         const entries = restored.restore_candidate.entries;
-        try std.testing.expectEqual(@as(usize, 6), entries.len);
+        try std.testing.expectEqual(@as(usize, 7), entries.len);
         try std.testing.expect(entries[0] == .model_change);
-        try std.testing.expect(entries[1] == .message);
+        try std.testing.expect(entries[1] == .thinking_level_change);
         try std.testing.expect(entries[2] == .message);
         try std.testing.expect(entries[3] == .message);
         try std.testing.expect(entries[4] == .message);
-        try std.testing.expect(entries[5].turn_end.outcome == .completed);
+        try std.testing.expect(entries[5] == .message);
+        try std.testing.expect(entries[6].turn_end.outcome == .completed);
         try std.testing.expectEqual(@as(usize, 4), restored.restore_candidate.context_messages.len);
         try std.testing.expectEqualStrings(
             "durable evidence",
@@ -1321,7 +1325,7 @@ pub const SessionRuntime = struct {
         } }};
         var fake = fake_api.FakeTransport.init(&exchanges);
         var sources: DurableSources = .{};
-        var fault: AppendFault = .{ .fail_on_record = 3 };
+        var fault: AppendFault = .{ .fail_on_record = 4 };
         var events: DurableEventRecorder = .{};
         const credentials = [_]Credential{apiKeyCredential("openai", "responses-secret")};
         var runtime = try createDurableWithTransport(
@@ -1355,12 +1359,13 @@ pub const SessionRuntime = struct {
         );
         defer restored.deinit();
         const entries = restored.restore_candidate.entries;
-        try std.testing.expectEqual(@as(usize, 3), entries.len);
+        try std.testing.expectEqual(@as(usize, 4), entries.len);
         try std.testing.expect(entries[0] == .model_change);
-        try std.testing.expect(entries[1].message.message == .request);
+        try std.testing.expect(entries[1] == .thinking_level_change);
+        try std.testing.expect(entries[2].message.message == .request);
         try std.testing.expectEqual(
             SessionFormat.FailureCategory.persistence_failed,
-            entries[2].turn_end.outcome.failed,
+            entries[3].turn_end.outcome.failed,
         );
         try std.testing.expectEqual(@as(usize, 1), restored.restore_candidate.context_messages.len);
     }
@@ -1391,7 +1396,7 @@ pub const SessionRuntime = struct {
         } }};
         var fake = fake_api.FakeTransport.init(&exchanges);
         var sources: DurableSources = .{};
-        var fault: AppendFault = .{ .fail_on_record = 4 };
+        var fault: AppendFault = .{ .fail_on_record = 5 };
         var events: DurableEventRecorder = .{};
         const credentials = [_]Credential{apiKeyCredential("openai", "responses-secret")};
         var runtime = try createDurableWithTransport(
@@ -1433,11 +1438,12 @@ pub const SessionRuntime = struct {
         );
         defer restored.deinit();
         const entries = restored.restore_candidate.entries;
-        try std.testing.expectEqual(@as(usize, 4), entries.len);
-        try std.testing.expect(entries[2].message.message == .response);
+        try std.testing.expectEqual(@as(usize, 5), entries.len);
+        try std.testing.expect(entries[1] == .thinking_level_change);
+        try std.testing.expect(entries[3].message.message == .response);
         try std.testing.expectEqual(
             SessionFormat.FailureCategory.persistence_failed,
-            entries[3].turn_end.outcome.failed,
+            entries[4].turn_end.outcome.failed,
         );
         try std.testing.expectEqual(@as(usize, 1), restored.restore_candidate.context_messages.len);
     }
@@ -1516,10 +1522,11 @@ pub const SessionRuntime = struct {
         );
         defer restored.deinit();
         const entries = restored.restore_candidate.entries;
-        try std.testing.expectEqual(@as(usize, 5), entries.len);
+        try std.testing.expectEqual(@as(usize, 6), entries.len);
         try std.testing.expect(entries[2].turn_end.outcome == .interrupted);
-        try std.testing.expect(entries[3].message.message == .request);
-        try std.testing.expect(entries[4].turn_end.outcome == .cancelled);
+        try std.testing.expect(entries[3] == .thinking_level_change);
+        try std.testing.expect(entries[4].message.message == .request);
+        try std.testing.expect(entries[5].turn_end.outcome == .cancelled);
         try std.testing.expect(restored.restore_candidate.recovery == .clean);
     }
 
@@ -1973,6 +1980,7 @@ pub const Services = struct {
         InvalidToolDefinition,
         UnknownTool,
         InvalidToolArguments,
+        UnsupportedSetting,
         PersistenceFailed,
     };
 
@@ -1983,6 +1991,7 @@ pub const Services = struct {
         sources: SessionFormat.Sources,
         requested_provider: ?[]const u8 = null,
         requested_model: ?[]const u8 = null,
+        requested_thinking_level: ?ai.ThinkingLevel = null,
         cli_api_key: ?[]const u8 = null,
         project_trust: ProjectTrust.Intent = .automatic,
         environment: ai.auth.Environment = .{},
@@ -2026,6 +2035,27 @@ pub const Services = struct {
             };
         }
 
+        pub fn cwd(self: Lifecycle) []const u8 {
+            return switch (self) {
+                .model_less => |value| value.selection.pathsView().cwd,
+                .runnable => |value| value.paths().cwd,
+            };
+        }
+
+        pub fn thinkingLevel(self: Lifecycle) ?ai.ThinkingLevel {
+            return switch (self) {
+                .model_less => null,
+                .runnable => |value| value.thinkingLevel(),
+            };
+        }
+
+        pub fn thinkingLevels(self: Lifecycle) std.EnumSet(ai.ThinkingLevel) {
+            return switch (self) {
+                .model_less => .initOne(.off),
+                .runnable => |value| value.thinkingLevels(),
+            };
+        }
+
         pub fn deinit(self: Lifecycle) void {
             switch (self) {
                 .model_less => |value| value.deinit(),
@@ -2048,6 +2078,14 @@ pub const Services = struct {
 
         pub fn activeModel(self: *const Interactive) ?ai.ModelIdentity {
             return self.lifecycle.activeModel();
+        }
+
+        pub fn cwd(self: *const Interactive) []const u8 {
+            return self.lifecycle.cwd();
+        }
+
+        pub fn thinkingLevel(self: *const Interactive) ?ai.ThinkingLevel {
+            return self.lifecycle.thinkingLevel();
         }
 
         pub fn deinit(self: *Interactive) void {
@@ -2139,6 +2177,17 @@ pub const Services = struct {
 
     fn modelIdentity(self: *const Services) ai.ModelIdentity {
         return self.resolved.selection;
+    }
+
+    fn thinkingLevel(self: *const Services) ?ai.ThinkingLevel {
+        const profile = self.resolved.model_config.catalog.resolve(self.resolved.selection).?.entry.profile;
+        if (profile.thinking == null) return null;
+        return self.runtime.session().thinkingLevel();
+    }
+
+    fn thinkingLevels(self: *const Services) std.EnumSet(ai.ThinkingLevel) {
+        const profile = self.resolved.model_config.catalog.resolve(self.resolved.selection).?.entry.profile;
+        return profile.supportedThinkingLevels();
     }
 
     fn modelDiagnostic(self: *const Services) ?ModelConfigSnapshot.Diagnostic {
@@ -2315,6 +2364,16 @@ pub const Services = struct {
         };
         errdefer resolved.deinit();
 
+        const model_profile = resolved.model_config.catalog.resolve(resolved.selection).?.entry.profile;
+        runtime_options.thinking_level = if (inputs.requested_thinking_level) |level|
+            ai.settings.clampThinkingLevel(model_profile, level)
+        else
+            effectiveThinkingLevel(
+                selection.restoredView(),
+                &settings,
+                resolved.selection,
+                model_profile,
+            );
         const credential_resolver = CredentialManager.PersistentResolver.init(
             allocator,
             selection.pathsView().cwd,
@@ -2402,6 +2461,72 @@ pub const Services = struct {
         return if (inputs.requested_model != null) .model_only else .absent;
     }
 
+    fn sameModelIdentity(left: ai.ModelIdentity, right: ai.ModelIdentity) bool {
+        return std.mem.eql(u8, left.provider, right.provider) and
+            std.mem.eql(u8, left.model, right.model);
+    }
+
+    fn effectiveThinkingLevel(
+        restored: *const SessionFormat.Restored,
+        settings: *const SettingsStore.Snapshot,
+        model: ai.ModelIdentity,
+        profile: ai.ModelProfile,
+    ) ai.ThinkingLevel {
+        const continuing_same_model = if (restored.active_model) |active_model|
+            sameModelIdentity(active_model, model)
+        else
+            false;
+        const restored_level = if (continuing_same_model) restoredThinkingLevel(restored) else null;
+        const requested = selectThinkingLevel(.{
+            .restored = restored_level,
+            .continuing_same_model = continuing_same_model,
+            .model_default = modelThinkingLevel(settings, model),
+            .default = settings.default_thinking_level,
+        });
+        return ai.settings.clampThinkingLevel(profile, requested);
+    }
+
+    const ThinkingSelection = struct {
+        restored: ?ai.ThinkingLevel,
+        continuing_same_model: bool,
+        model_default: ?ai.ThinkingLevel,
+        default: ?ai.ThinkingLevel,
+    };
+
+    fn selectThinkingLevel(selection: ThinkingSelection) ai.ThinkingLevel {
+        if (selection.restored) |level| return level;
+        if (!selection.continuing_same_model) {
+            if (selection.model_default) |level| return level;
+        }
+        return selection.default orelse .medium;
+    }
+
+    fn restoredThinkingLevel(restored: *const SessionFormat.Restored) ?ai.ThinkingLevel {
+        var index = restored.active_entries.len;
+        while (index > 0) {
+            index -= 1;
+            switch (restored.active_entries[index]) {
+                .thinking_level_change => |change| return change.level,
+                .model_change => return null,
+                else => {},
+            }
+        }
+        return null;
+    }
+
+    fn modelThinkingLevel(
+        settings: *const SettingsStore.Snapshot,
+        model: ai.ModelIdentity,
+    ) ?ai.ThinkingLevel {
+        for (settings.model_thinking_levels) |entry| {
+            if (entry.model.len != model.provider.len + 1 + model.model.len) continue;
+            if (!std.mem.startsWith(u8, entry.model, model.provider)) continue;
+            if (entry.model[model.provider.len] != '/') continue;
+            if (std.mem.eql(u8, entry.model[model.provider.len + 1 ..], model.model)) return entry.level;
+        }
+        return null;
+    }
+
     fn settingsDefault(settings: *const SettingsStore.Snapshot) ?ai.ModelIdentity {
         const provider = settings.default_provider orelse return null;
         const model = settings.default_model orelse return null;
@@ -2419,6 +2544,33 @@ pub const Services = struct {
             error.WriteFailed => error.CredentialWriteFailed,
             error.CommitIndeterminate => error.CredentialCommitIndeterminate,
         };
+    }
+
+    test "thinking selection preserves legacy session default precedence" {
+        try std.testing.expectEqual(ai.ThinkingLevel.high, selectThinkingLevel(.{
+            .restored = .high,
+            .continuing_same_model = true,
+            .model_default = .low,
+            .default = .minimal,
+        }));
+        try std.testing.expectEqual(ai.ThinkingLevel.minimal, selectThinkingLevel(.{
+            .restored = null,
+            .continuing_same_model = true,
+            .model_default = .low,
+            .default = .minimal,
+        }));
+        try std.testing.expectEqual(ai.ThinkingLevel.low, selectThinkingLevel(.{
+            .restored = null,
+            .continuing_same_model = false,
+            .model_default = .low,
+            .default = .minimal,
+        }));
+        try std.testing.expectEqual(ai.ThinkingLevel.medium, selectThinkingLevel(.{
+            .restored = null,
+            .continuing_same_model = false,
+            .model_default = null,
+            .default = null,
+        }));
     }
 
     const fake_api = ai.transport_testing;
@@ -2630,28 +2782,30 @@ pub const Services = struct {
             .sources = sources.view(),
         }, resume_fake.transport());
         const transcript_view = resumed.transcript();
-        try std.testing.expectEqual(@as(usize, 3), transcript_view.items.len);
+        try std.testing.expectEqual(@as(usize, 4), transcript_view.items.len);
         try std.testing.expectEqualStrings(
             "model-a",
             transcript_view.items[0].content.model_change.model,
         );
+        try std.testing.expect(transcript_view.items[1].content == .thinking_level_change);
         try std.testing.expectEqualStrings(
             "hello",
-            transcript_view.items[1].content.user.parts[0].text,
+            transcript_view.items[2].content.user.parts[0].text,
         );
         try std.testing.expectEqualStrings(
             "composed",
-            transcript_view.items[2].content.assistant.parts[0].text.text,
+            transcript_view.items[3].content.assistant.parts[0].text.text,
         );
         resumed.deinit();
 
         var opened = try openJournal(std.testing.allocator, journal_path);
         defer opened.deinit();
         const entries = opened.restore_candidate.entries;
-        try std.testing.expectEqual(@as(usize, 4), entries.len);
+        try std.testing.expectEqual(@as(usize, 5), entries.len);
         try std.testing.expectEqualStrings("custom-openai", entries[0].model_change.selection.provider);
         try std.testing.expectEqualStrings("model-a", entries[0].model_change.selection.model);
-        try std.testing.expect(entries[3].turn_end.outcome == .completed);
+        try std.testing.expect(entries[1] == .thinking_level_change);
+        try std.testing.expect(entries[4].turn_end.outcome == .completed);
         try std.testing.expectEqual(@as(usize, 1), fake.next_index);
     }
 
@@ -3149,6 +3303,7 @@ pub const Services = struct {
         }, fake.transport());
         defer resumed.deinit();
         try std.testing.expectEqualStrings(stored_cwd, resumed.paths().cwd);
+        try std.testing.expectEqualStrings(stored_cwd, (Lifecycle{ .runnable = resumed }).cwd());
         try std.testing.expect(std.mem.startsWith(u8, resumed.session().systemPrompt(), "Stored project base."));
         try std.testing.expect(std.mem.find(u8, resumed.session().systemPrompt(), "Launch project base.") == null);
         try std.testing.expect(std.mem.find(
@@ -3205,16 +3360,17 @@ pub const Services = struct {
             .cli_api_key = "custom-secret",
         }, fake.transport());
         const transcript_view = resumed.transcript();
-        try std.testing.expectEqual(@as(usize, 3), transcript_view.items.len);
+        try std.testing.expectEqual(@as(usize, 4), transcript_view.items.len);
+        try std.testing.expect(transcript_view.items[1].content == .thinking_level_change);
         try std.testing.expectEqualStrings(
             "unfinished",
-            transcript_view.items[1].content.user.parts[0].text,
+            transcript_view.items[2].content.user.parts[0].text,
         );
-        try std.testing.expect(transcript_view.items[2].content == .interrupted);
-        try std.testing.expect(transcript_view.items[2].metadata == .recovered_open_turn);
+        try std.testing.expect(transcript_view.items[3].content == .interrupted);
+        try std.testing.expect(transcript_view.items[3].metadata == .recovered_open_turn);
         try std.testing.expectEqualStrings(
             "open-user",
-            transcript_view.items[2].content.interrupted.turn_id,
+            transcript_view.items[3].content.interrupted.turn_id,
         );
         resumed.deinit();
     }
@@ -3264,9 +3420,13 @@ pub const Services = struct {
         var opened = try openJournal(std.testing.allocator, journal_path);
         defer opened.deinit();
         const entries = opened.restore_candidate.entries;
-        try std.testing.expectEqual(@as(usize, 2), entries.len);
+        try std.testing.expectEqual(@as(usize, 4), entries.len);
         try std.testing.expectEqualStrings("model-a", entries[0].model_change.selection.model);
-        try std.testing.expectEqualStrings("model-b", entries[1].model_change.selection.model);
+        try std.testing.expect(entries[1] == .thinking_level_change);
+        try std.testing.expectEqual(ai.ThinkingLevel.off, entries[1].thinking_level_change.level);
+        try std.testing.expectEqualStrings("model-b", entries[2].model_change.selection.model);
+        try std.testing.expect(entries[3] == .thinking_level_change);
+        try std.testing.expectEqual(ai.ThinkingLevel.off, entries[3].thinking_level_change.level);
     }
 
     test "runtime services fall back from an invalid restored model and append one model change" {
@@ -3308,7 +3468,7 @@ pub const Services = struct {
             fake.transport(),
         ));
         var unchanged = try openJournal(std.testing.allocator, journal_path);
-        try std.testing.expectEqual(@as(usize, 1), unchanged.restore_candidate.entries.len);
+        try std.testing.expectEqual(@as(usize, 2), unchanged.restore_candidate.entries.len);
         unchanged.deinit();
 
         try temporary.dir.deleteFile(std.testing.io, ".zi/agent/models.json");
@@ -3328,10 +3488,12 @@ pub const Services = struct {
 
         var opened = try openJournal(std.testing.allocator, journal_path);
         defer opened.deinit();
-        try std.testing.expectEqual(@as(usize, 2), opened.restore_candidate.entries.len);
+        try std.testing.expectEqual(@as(usize, 4), opened.restore_candidate.entries.len);
         try std.testing.expectEqualStrings("model-a", opened.restore_candidate.entries[0].model_change.selection.model);
+        try std.testing.expect(opened.restore_candidate.entries[1] == .thinking_level_change);
         // ziglint-ignore: Z024
-        try std.testing.expectEqualStrings("openai", opened.restore_candidate.entries[1].model_change.selection.provider);
+        try std.testing.expectEqualStrings("openai", opened.restore_candidate.entries[2].model_change.selection.provider);
+        try std.testing.expect(opened.restore_candidate.entries[3] == .thinking_level_change);
         try std.testing.expectEqualStrings("gpt-5.6-sol", opened.restore_candidate.active_model.?.model);
     }
 
@@ -3640,6 +3802,7 @@ pub const ReopenInputs = struct {
     pub const Selection = struct {
         provider: ?[]const u8 = null,
         model: ?[]const u8 = null,
+        thinking_level: ?ai.ThinkingLevel = null,
     };
 
     allocator: std.mem.Allocator,
@@ -3690,6 +3853,7 @@ pub const ReopenInputs = struct {
             .sources = source.sources,
             .requested_provider = if (source.requested_provider) |value| try owned.dupe(u8, value) else null,
             .requested_model = if (source.requested_model) |value| try owned.dupe(u8, value) else null,
+            .requested_thinking_level = source.requested_thinking_level,
             .cli_api_key = cli_api_key,
             .project_trust = source.project_trust,
             .environment = .{ .entries = environment_entries },
@@ -3711,6 +3875,7 @@ pub const ReopenInputs = struct {
         result.session = .{ .open = journal_path };
         result.requested_provider = selection.provider;
         result.requested_model = selection.model;
+        result.requested_thinking_level = selection.thinking_level;
         return result;
     }
 

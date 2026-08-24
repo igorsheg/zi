@@ -195,7 +195,7 @@ pub const Snapshot = struct {
         protocol: ?[]const u8 = null,
         baseUrl: ?[]const u8 = null,
         reasoning: bool = false,
-        thinkingLevelMap: ?ThinkingLevelMap = null,
+        thinkingLevelMap: ?ai_settings.ThinkingLevelMap = null,
         input: []const Input = &.{.text},
         cost: ?Cost = null,
         contextWindow: u64 = 128_000,
@@ -206,36 +206,6 @@ pub const Snapshot = struct {
     const Input = enum {
         text,
         image,
-    };
-
-    const ThinkingLevelMap = struct {
-        off: ThinkingMapping = .inherited,
-        minimal: ThinkingMapping = .inherited,
-        low: ThinkingMapping = .inherited,
-        medium: ThinkingMapping = .inherited,
-        high: ThinkingMapping = .inherited,
-        xhigh: ThinkingMapping = .inherited,
-        max: ThinkingMapping = .inherited,
-    };
-
-    const ThinkingMapping = union(enum) {
-        inherited,
-        unsupported,
-        mapped: []const u8,
-
-        // ziglint-ignore: Z012 -- std.json requires a public hook on this private wire type.
-        pub fn jsonParse(
-            allocator: std.mem.Allocator,
-            source: anytype,
-            options: std.json.ParseOptions,
-        ) !ThinkingMapping {
-            const token = try source.nextAlloc(allocator, options.allocate.?);
-            return switch (token) {
-                .null => .unsupported,
-                inline .string, .allocated_string => |value| .{ .mapped = value },
-                else => error.UnexpectedToken,
-            };
-        }
     };
 
     const Cost = struct {
@@ -427,16 +397,10 @@ pub const Snapshot = struct {
         }
         if (!inputs.contains(.text)) return error.InvalidModelsFile;
 
-        if (model.thinkingLevelMap) |thinking_map| {
-            if (!model.reasoning) return error.InvalidModelsFile;
-            try validateThinkingMapping(thinking_map.off, null);
-            try validateThinkingMapping(thinking_map.minimal, "minimal");
-            try validateThinkingMapping(thinking_map.low, "low");
-            try validateThinkingMapping(thinking_map.medium, "medium");
-            try validateThinkingMapping(thinking_map.high, "high");
-            try validateThinkingMapping(thinking_map.xhigh, null);
-            try validateThinkingMapping(thinking_map.max, null);
-        }
+        _ = ai_settings.compileThinking(.{
+            .reasoning = model.reasoning,
+            .level_map = model.thinkingLevelMap,
+        }) catch return error.InvalidModelsFile;
         if (model.cost) |cost| try validateCost(cost);
     }
 
@@ -446,39 +410,14 @@ pub const Snapshot = struct {
 
     fn profile(protocol_id: []const u8, model: SourceModel) error{InvalidModelsFile}!ai_settings.ModelProfile {
         const protocol = protocolRegistry().find(protocol_id) orelse return error.InvalidModelsFile;
-        var efforts: std.EnumSet(ai_settings.ReasoningEffort) = .initEmpty();
-        if (model.reasoning) {
-            if (model.thinkingLevelMap) |thinking_map| {
-                if (thinking_map.minimal != .unsupported) efforts.insert(.minimal);
-                if (thinking_map.low != .unsupported) efforts.insert(.low);
-                if (thinking_map.medium != .unsupported) efforts.insert(.medium);
-                if (thinking_map.high != .unsupported) efforts.insert(.high);
-            } else {
-                efforts = .initFull();
-            }
-        }
-        var value = protocol.profile(.{
+        const thinking = ai_settings.compileThinking(.{
             .reasoning = model.reasoning,
-            .reasoning_efforts = efforts,
-        });
+            .level_map = model.thinkingLevelMap,
+        }) catch return error.InvalidModelsFile;
+        var value = protocol.profile(.{ .thinking = thinking });
         value.context_window = model.contextWindow;
         value.max_output_tokens = model.maxTokens;
         return value;
-    }
-
-    fn validateThinkingMapping(
-        mapping: ThinkingMapping,
-        identity: ?[]const u8,
-    ) error{InvalidModelsFile}!void {
-        switch (mapping) {
-            .inherited, .unsupported => {},
-            .mapped => |value| {
-                try validateText(value, max_value_bytes);
-                if (identity) |expected| {
-                    if (!std.mem.eql(u8, value, expected)) return error.InvalidModelsFile;
-                }
-            },
-        }
     }
 
     fn validateCost(cost: Cost) error{InvalidModelsFile}!void {
@@ -611,6 +550,24 @@ pub const Snapshot = struct {
         \\}
     ;
 
+    const builtin_parity_source =
+        \\{
+        \\  "providers": {
+        \\    "parity": {
+        \\      "baseUrl": "https://example.test/v1",
+        \\      "protocol": "openai-responses",
+        \\      "models": [{
+        \\        "id": "gpt-5.6-sol-shape",
+        \\        "reasoning": true,
+        \\        "thinkingLevelMap": {"minimal": null},
+        \\        "contextWindow": 1050000,
+        \\        "maxTokens": 128000
+        \\      }]
+        \\    }
+        \\  }
+        \\}
+    ;
+
     const sparse_thinking_source =
         \\{
         \\  "providers": {
@@ -620,7 +577,7 @@ pub const Snapshot = struct {
         \\      "models": [{
         \\        "id": "reasoner",
         \\        "reasoning": true,
-        \\        "thinkingLevelMap": {"off": null}
+        \\        "thinkingLevelMap": {"off": null, "high": "maximum"}
         \\      }]
         \\    }
         \\  }
@@ -679,12 +636,40 @@ pub const Snapshot = struct {
         }).?;
         try std.testing.expect(resolved.entry.profile.supports(.streaming));
         try std.testing.expect(resolved.entry.profile.supports(.tools));
-        try std.testing.expect(resolved.entry.profile.supports(.thinking));
+        try std.testing.expect(resolved.entry.profile.thinking != null);
         try std.testing.expect(!resolved.entry.profile.supports(.image_input));
-        try std.testing.expect(!resolved.entry.profile.reasoning_efforts.contains(.minimal));
-        try std.testing.expect(resolved.entry.profile.reasoning_efforts.contains(.low));
+        try std.testing.expect(!resolved.entry.profile.supportsThinkingLevel(.minimal));
+        try std.testing.expect(resolved.entry.profile.supportsThinkingLevel(.low));
         try std.testing.expectEqual(@as(?u64, 272_000), resolved.entry.profile.context_window);
         try std.testing.expectEqual(@as(?u64, 128_000), resolved.entry.profile.max_output_tokens);
+    }
+
+    test "built-in and custom thinking sources share one normalization contract" {
+        var temporary = std.testing.tmpDir(.{});
+        defer temporary.cleanup();
+        try writeModels(&temporary, builtin_parity_source);
+        var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        var paths = try testPaths(&temporary, &path_buffer);
+        defer paths.deinit();
+        var snapshot = try load(std.testing.allocator, std.testing.io, &paths);
+        defer snapshot.deinit();
+
+        const config = snapshot.view();
+        const builtin = config.resolve(.{ .provider = "openai", .model = "gpt-5.6-sol" }).?.entry.profile;
+        const custom = config.resolve(.{ .provider = "parity", .model = "gpt-5.6-sol-shape" }).?.entry.profile;
+        for (std.enums.values(ai_settings.ThinkingLevel)) |level| {
+            try std.testing.expectEqual(
+                builtin.supportsThinkingLevel(level),
+                custom.supportsThinkingLevel(level),
+            );
+            const builtin_wire = builtin.thinkingWireValue(level, "none");
+            const custom_wire = custom.thinkingWireValue(level, "none");
+            if (builtin_wire) |wire| {
+                try std.testing.expectEqualStrings(wire, custom_wire.?);
+            } else {
+                try std.testing.expect(custom_wire == null);
+            }
+        }
     }
 
     test "Pi defaults project into a custom Chat Completions profile" {
@@ -702,12 +687,12 @@ pub const Snapshot = struct {
         try std.testing.expectEqualStrings("Local Models", provider.name);
         const resolved = config.resolve(.{ .provider = "local", .model = "qwen-coder" }).?;
         try std.testing.expect(resolved.entry.profile.supportsSetting(.temperature));
-        try std.testing.expect(!resolved.entry.profile.supports(.thinking));
+        try std.testing.expect(resolved.entry.profile.thinking == null);
         try std.testing.expectEqual(@as(?u64, 128_000), resolved.entry.profile.context_window);
         try std.testing.expectEqual(@as(?u64, 16_384), resolved.entry.profile.max_output_tokens);
     }
 
-    test "omitted thinking mappings inherit while explicit null remains unsupported" {
+    test "thinking mappings retain inheritance support and bounded wire aliases" {
         var temporary = std.testing.tmpDir(.{});
         defer temporary.cleanup();
         try writeModels(&temporary, sparse_thinking_source);
@@ -718,11 +703,18 @@ pub const Snapshot = struct {
         defer snapshot.deinit();
 
         const resolved = snapshot.view().resolve(.{ .provider = "sparse", .model = "reasoner" }).?;
-        try std.testing.expect(resolved.entry.profile.supportsSetting(.reasoning_effort));
-        try std.testing.expect(resolved.entry.profile.reasoning_efforts.contains(.minimal));
-        try std.testing.expect(resolved.entry.profile.reasoning_efforts.contains(.low));
-        try std.testing.expect(resolved.entry.profile.reasoning_efforts.contains(.medium));
-        try std.testing.expect(resolved.entry.profile.reasoning_efforts.contains(.high));
+        try std.testing.expect(resolved.entry.profile.thinking != null);
+        try std.testing.expect(resolved.entry.profile.supportsThinkingLevel(.minimal));
+        try std.testing.expect(resolved.entry.profile.supportsThinkingLevel(.low));
+        try std.testing.expect(resolved.entry.profile.supportsThinkingLevel(.medium));
+        try std.testing.expect(resolved.entry.profile.supportsThinkingLevel(.high));
+        try std.testing.expect(!resolved.entry.profile.supportsThinkingLevel(.off));
+        try std.testing.expect(!resolved.entry.profile.supportsThinkingLevel(.xhigh));
+        try std.testing.expect(!resolved.entry.profile.supportsThinkingLevel(.max));
+        try std.testing.expectEqualStrings(
+            "maximum",
+            resolved.entry.profile.thinkingWireValue(.high, "none").?,
+        );
     }
 
     test "invalid global models files retain built-ins with one diagnostic" {
@@ -757,9 +749,6 @@ pub const Snapshot = struct {
             ,
             // ziglint-ignore: Z024 -- compact invalid JSON fixture
             \\{"providers":{"bad":{"baseUrl":"https://example.test/v1","protocol":"openai-responses","models":[{"id":"model"},{"id":"model"}]}}}
-            ,
-            // ziglint-ignore: Z024 -- compact invalid JSON fixture
-            \\{"providers":{"bad":{"baseUrl":"https://example.test/v1","protocol":"openai-responses","models":[{"id":"model","reasoning":true,"thinkingLevelMap":{"high":"maximum"}}]}}}
             ,
         };
         for (cases) |contents| {

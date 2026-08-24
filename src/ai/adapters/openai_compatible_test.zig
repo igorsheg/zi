@@ -11,7 +11,7 @@ const settings = @import("../settings.zig");
 
 const profile = profile: {
     var value: settings.ModelProfile = .{};
-    value.capabilities = .initMany(&.{ .streaming, .tools, .parallel_tool_calls, .thinking });
+    value.capabilities = .initMany(&.{ .streaming, .tools, .parallel_tool_calls });
     value.settings = .initMany(&.{ .temperature, .top_p, .max_output_tokens, .stop_sequences, .seed });
     break :profile value;
 };

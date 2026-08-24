@@ -92,6 +92,48 @@ pub fn replace(self: *LineEditor, replacement: []const u8) Error!void {
     self.cursor = replacement.len;
 }
 
+pub fn replaceRange(
+    self: *LineEditor,
+    start: usize,
+    end: usize,
+    replacement: []const u8,
+) Error!void {
+    return self.replaceRangeWithSuffix(start, end, replacement, "");
+}
+
+pub fn replaceRangeWithSuffix(
+    self: *LineEditor,
+    start: usize,
+    end: usize,
+    replacement: []const u8,
+    appended: []const u8,
+) Error!void {
+    std.debug.assert(start <= end);
+    std.debug.assert(end <= self.bytes.items.len);
+    if (replacement.len > self.max_bytes or appended.len > self.max_bytes - replacement.len) {
+        return error.InputTooLarge;
+    }
+    const inserted_len = replacement.len + appended.len;
+    const removed_len = end - start;
+    const retained_len = self.bytes.items.len - removed_len;
+    if (retained_len > self.max_bytes or inserted_len > self.max_bytes - retained_len) {
+        return error.InputTooLarge;
+    }
+    const final_len = retained_len + inserted_len;
+    try self.bytes.ensureTotalCapacity(self.allocator, final_len);
+    const old_len = self.bytes.items.len;
+    const suffix_len = old_len - end;
+    self.bytes.items.len = @max(old_len, final_len);
+    @memmove(
+        self.bytes.items[start + inserted_len ..][0..suffix_len],
+        self.bytes.items[end..][0..suffix_len],
+    );
+    @memcpy(self.bytes.items[start..][0..replacement.len], replacement);
+    @memcpy(self.bytes.items[start + replacement.len ..][0..appended.len], appended);
+    self.bytes.items.len = final_len;
+    self.cursor = start + inserted_len;
+}
+
 pub fn validUtf8(self: *const LineEditor) bool {
     return std.unicode.utf8ValidateSlice(self.bytes.items);
 }
@@ -206,4 +248,18 @@ test "line editor replacement is transactional at its bound" {
     try std.testing.expectEqualStrings("keep", editor.text());
     try std.testing.expectError(error.InputTooLarge, editor.insertByte('!'));
     try std.testing.expectEqualStrings("keep", editor.text());
+}
+
+test "line editor replaces a token while preserving its suffix" {
+    var editor = LineEditor.init(std.testing.allocator, 32);
+    defer editor.deinit();
+    try editor.replace("  /mo tail");
+    try editor.replaceRangeWithSuffix(2, 5, "/model", " ");
+    try std.testing.expectEqualStrings("  /model  tail", editor.text());
+    try std.testing.expectEqual(@as(usize, 9), editor.cursorByte());
+
+    try editor.replace("abcdef");
+    try editor.replaceRange(1, 5, "x");
+    try std.testing.expectEqualStrings("axf", editor.text());
+    try std.testing.expectEqual(@as(usize, 2), editor.cursorByte());
 }

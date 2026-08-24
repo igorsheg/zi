@@ -12,9 +12,9 @@ const transport = @import("../transport.zig");
 
 const profile = profile: {
     var value: settings.ModelProfile = .{};
-    value.capabilities = .initMany(&.{ .streaming, .tools, .parallel_tool_calls, .thinking });
-    value.settings = .initMany(&.{ .temperature, .reasoning_effort });
-    value.reasoning_efforts = .initMany(&.{ .minimal, .low, .medium, .high });
+    value.capabilities = .initMany(&.{ .streaming, .tools, .parallel_tool_calls });
+    value.settings = .initOne(.temperature);
+    value.thinking = .{};
     break :profile value;
 };
 const catalog_entries = [_]model_catalog.Entry{.{
@@ -129,7 +129,7 @@ test "Codex Responses derives account identity and normalizes SSE" {
     var result = try provider.model("gpt-5.1-codex").?.complete(std.testing.allocator, std.testing.io, .{
         .messages = &messages,
         .instructions = &.{ "You are concise.", "Use read." },
-        .settings = .{ .reasoning_effort = .medium },
+        .settings = .{ .thinking_level = .medium },
     });
     defer result.deinit();
 
@@ -143,6 +143,7 @@ test "Codex Responses derives account identity and normalizes SSE" {
     const replay_body = try openai_responses.encodeCodexRequest(
         std.testing.allocator,
         .{ .provider = "openai-codex", .model = "gpt-5.1-codex" },
+        profile,
         .{ .messages = &replay_messages },
     );
     defer std.testing.allocator.free(replay_body);
@@ -150,6 +151,17 @@ test "Codex Responses derives account identity and normalizes SSE" {
     try std.testing.expectEqual(@as(u64, 3), result.value.usage.input_tokens);
     try std.testing.expectEqual(@as(u64, 2), result.value.usage.cached_input_tokens);
     try std.testing.expectEqual(.stop, result.value.finish.category);
+}
+
+test "Codex encoder emits inherited off as the protocol disable value" {
+    const body = try openai_responses.encodeCodexRequest(
+        std.testing.allocator,
+        .{ .provider = "openai-codex", .model = "gpt-5.1-codex" },
+        profile,
+        .{ .messages = &.{}, .settings = .{ .thinking_level = .off } },
+    );
+    defer std.testing.allocator.free(body);
+    try std.testing.expect(std.mem.find(u8, body, "\"effort\":\"none\"") != null);
 }
 
 test "Codex account ID parser rejects tokens without the auth claim" {
@@ -216,6 +228,7 @@ test "Codex Responses accumulates streamed tool arguments" {
     const replay_body = try openai_responses.encodeCodexRequest(
         std.testing.allocator,
         .{ .provider = "openai-codex", .model = "gpt-5.1-codex" },
+        profile,
         .{ .messages = &replay_messages },
     );
     defer std.testing.allocator.free(replay_body);

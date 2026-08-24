@@ -1589,6 +1589,7 @@ pub const Commit = struct {
         opened: *journal_api.Opened,
         sources: format.Sources,
         selection: ai_message.ModelIdentity,
+        thinking_level: ai.ThinkingLevel,
         faults: journal_api.Faults,
     ) Error!*Commit {
         var owned = opened.*;
@@ -1611,8 +1612,12 @@ pub const Commit = struct {
             .clean => {},
             .interrupted => |interrupted| try self.appendTerminal(interrupted.turn_id, .interrupted),
         }
-        if (restored.active_model == null or !sameModel(restored.active_model.?, selection)) {
-            try self.appendModelChange(selection);
+        const model_changed = restored.active_model == null or !sameModel(restored.active_model.?, selection);
+        if (model_changed) try self.appendModelChange(selection);
+        if (model_changed or restored.active_thinking_level == null or
+            restored.active_thinking_level.? != thinking_level)
+        {
+            try self.appendThinkingLevelChange(thinking_level);
         }
         return self;
     }
@@ -1671,6 +1676,15 @@ pub const Commit = struct {
         };
         try self.appendTerminal(turn_id, mapOutcome(outcome));
         self.turn = .idle;
+    }
+
+    pub fn appendThinkingLevelChange(self: *Commit, level: ai.ThinkingLevel) Error!void {
+        if (self.turn != .idle) unreachable;
+        const stamp = self.sources.next() catch return error.PersistenceFailed;
+        self.journal.append(.{ .thinking_level_change = .{
+            .base = stamp.base(self.journal.activeLeafId()),
+            .level = level,
+        } }, self.faults) catch |failure| return mapJournalError(failure);
     }
 
     fn appendModelChange(self: *Commit, selection: ai_message.ModelIdentity) Error!void {
@@ -1763,6 +1777,7 @@ pub const Transcript = struct {
 
     pub const Content = union(enum) {
         model_change: ai.message.ModelIdentity,
+        thinking_level_change: ai.ThinkingLevel,
         user: UserTurn,
         assistant: ai.message.ResponseMessage,
         tool_results: ToolResults,
@@ -1805,6 +1820,7 @@ pub const Transcript = struct {
                     memory,
                     change.selection,
                 ) },
+                .thinking_level_change => |change| .{ .thinking_level_change = change.level },
                 .message => |message_entry| switch (message_entry.message) {
                     .response => |response| .{
                         .assistant = try ai.message.copyResponseLeaky(memory, response),
@@ -1927,6 +1943,7 @@ pub const Transcript = struct {
             .active_leaf_id = active_leaf_id,
             .active_entries = active_entries,
             .active_model = null,
+            .active_thinking_level = null,
             .context_messages = &.{},
             .recovery = recovery,
         };

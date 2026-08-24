@@ -5,6 +5,7 @@ const Decoder = @import("input/Decoder.zig");
 const EventLoop = @import("event_loop.zig");
 const Screen = @import("Screen.zig");
 const LineEditor = @import("input/LineEditor.zig");
+const SlashMenu = @import("input/SlashMenu.zig");
 const TerminalSession = @import("terminal/Session.zig");
 
 const App = @This();
@@ -25,6 +26,7 @@ io: std.Io,
 host: *interactive.InteractiveSessionHost,
 decoder: Decoder = .{},
 editor: LineEditor,
+slash_menu: SlashMenu = .{},
 screen: Screen,
 escape_timeout_ms: i64,
 should_exit: bool = false,
@@ -136,6 +138,7 @@ fn collectFacts(context: *anyopaque) !void {
     defer result.deinit();
     if (result.restored) |restored| {
         try self.editor.replace(restored.text);
+        self.slash_menu.reconcileAfterEdit(&self.editor);
         self.screen.editorChanged();
     }
 }
@@ -159,11 +162,16 @@ fn settleInput(context: *anyopaque) !void {
 
 fn handleAction(self: *App, action: Decoder.Action) !void {
     switch (action) {
-        .text_byte => |byte| self.editor.insertByte(byte) catch |failure| {
-            try self.screen.notice(@errorName(failure));
+        .text_byte => |byte| {
+            self.editor.insertByte(byte) catch |failure| {
+                try self.screen.notice(@errorName(failure));
+                return;
+            };
+            self.slash_menu.reconcileAfterEdit(&self.editor);
         },
-        .submit, .follow_up => try self.submitDraft(),
-        .escape => try self.cancelAndRestore(),
+        .submit, .follow_up => if (!(try self.completeSlashCommand())) try self.submitDraft(),
+        .escape => if (!self.slashMenuEnabled() or !self.slash_menu.dismiss(&self.editor))
+            try self.cancelAndRestore(),
         .interrupt => {
             if (self.editor.isEmpty() and self.host.canExit()) {
                 self.should_exit = true;
@@ -172,9 +180,16 @@ fn handleAction(self: *App, action: Decoder.Action) !void {
                 self.should_exit = true;
             } else if (self.host.canExit()) {
                 self.editor.clear();
+                self.slash_menu.reconcileAfterEdit(&self.editor);
             } else {
                 try self.cancelAndRestore();
             }
+        },
+        .thinking_cycle => {
+            self.host.cycleThinkingLevel() catch |failure| {
+                try self.screen.notice(@errorName(failure));
+                return;
+            };
         },
         .end_of_input => if (self.editor.isEmpty()) {
             if (self.host.canExit()) {
@@ -184,18 +199,42 @@ fn handleAction(self: *App, action: Decoder.Action) !void {
                 self.should_exit = true;
             }
         },
-        .backspace => self.editor.deleteBackward(),
-        .delete => self.editor.deleteForward(),
-        .tab => self.editor.insertByte('\t') catch |failure| {
-            try self.screen.notice(@errorName(failure));
+        .backspace => {
+            self.editor.deleteBackward();
+            self.slash_menu.reconcileAfterEdit(&self.editor);
+        },
+        .delete => {
+            self.editor.deleteForward();
+            self.slash_menu.reconcileAfterEdit(&self.editor);
+        },
+        .tab => if (!(try self.completeSlashCommand())) {
+            self.editor.insertByte('\t') catch |failure| {
+                try self.screen.notice(@errorName(failure));
+                return;
+            };
+            self.slash_menu.reconcileAfterEdit(&self.editor);
         },
         .cursor_left => self.editor.moveLeft(),
         .cursor_right => self.editor.moveRight(),
         .home => self.editor.moveHome(),
         .end => self.editor.moveEnd(),
-        .cursor_up, .cursor_down, .ignored => {},
+        .cursor_up => {
+            if (self.slashMenuEnabled()) _ = self.slash_menu.move(&self.editor, -1);
+        },
+        .cursor_down => {
+            if (self.slashMenuEnabled()) _ = self.slash_menu.move(&self.editor, 1);
+        },
+        .ignored => {},
     }
     if (!self.should_exit) self.screen.editorChanged();
+}
+
+fn completeSlashCommand(self: *App) !bool {
+    if (!self.slashMenuEnabled()) return false;
+    return self.slash_menu.complete(&self.editor) catch |failure| {
+        try self.screen.notice(@errorName(failure));
+        return true;
+    };
 }
 
 fn handleResize(context: *anyopaque, size: TerminalSession.Size) !void {
@@ -222,7 +261,18 @@ fn frameView(self: *App) Screen.FrameView {
         },
         .phase = host_snapshot.phase,
         .queued_count = host_snapshot.queued_follow_ups,
+        .active_model = host_snapshot.active_model,
+        .thinking_level = host_snapshot.thinking_level,
+        .cwd = host_snapshot.cwd,
+        .slash_menu = if (host_snapshot.mask_composer)
+            null
+        else
+            self.slash_menu.projection(&self.editor),
     };
+}
+
+fn slashMenuEnabled(self: *App) bool {
+    return !self.host.snapshot().mask_composer;
 }
 
 fn shouldExit(context: *anyopaque) bool {
@@ -243,12 +293,15 @@ fn submitDraft(self: *App) !void {
     const disposition = self.submitPrompt(self.editor.text()) catch |failure| {
         if (failure == error.ModelSelectionRequired) {
             try self.screen.notice("No model selected. Use /login PROVIDER or /model PROVIDER/MODEL.");
+        } else if (failure == error.UnsupportedThinkingLevel) {
+            try self.screen.notice("That thinking level is not supported by the current model.");
         } else if (failure != error.EmptyPrompt) {
             try self.screen.notice(@errorName(failure));
         }
         return;
     };
     if (disposition == .oauth_answer) self.editor.secureClear() else self.editor.clear();
+    self.slash_menu.reconcileAfterEdit(&self.editor);
 }
 
 fn submitPrompt(self: *App, prompt: []const u8) !interactive.SubmitDisposition {
@@ -265,6 +318,7 @@ fn cancelAndRestore(self: *App) !void {
     defer result.deinit();
     if (result.wipe_draft) self.editor.secureClear();
     if (result.restored) |restored| try self.editor.replace(restored.text);
+    self.slash_menu.reconcileAfterEdit(&self.editor);
 }
 
 test "app prepares exact inline geometry before screen publication" {

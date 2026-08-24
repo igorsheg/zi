@@ -9,6 +9,7 @@ pub const Action = union(enum) {
     escape,
     interrupt,
     end_of_input,
+    thinking_cycle,
     backspace,
     delete,
     tab,
@@ -78,10 +79,11 @@ fn feedIdle(self: *Decoder, byte: u8, now_ms: i64) ?Action {
         },
         3 => .interrupt,
         4 => .end_of_input,
+        20 => .thinking_cycle,
         8, 127 => .backspace,
         '\r', '\n' => .submit,
         '\t' => .tab,
-        0...2, 5...7, 11, 12, 14...26, 28...31 => .ignored,
+        0...2, 5...7, 11, 12, 14...19, 21...26, 28...31 => .ignored,
         else => .{ .text_byte = byte },
     };
 }
@@ -204,6 +206,7 @@ test "decoder preserves text bytes and control actions" {
     try std.testing.expect(decoder.feed(127, 0).? == .backspace);
     try std.testing.expect(decoder.feed(3, 0).? == .interrupt);
     try std.testing.expect(decoder.feed(4, 0).? == .end_of_input);
+    try std.testing.expect(decoder.feed(20, 0).? == .thinking_cycle);
 }
 
 test "decoder discards incomplete and bounded unknown sequences" {

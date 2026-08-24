@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const ai = @import("../ai/root.zig");
 const BoundedJson = @import("../BoundedJson.zig");
 const Prompt = @import("Prompt.zig");
 const PrivateFileStore = @import("PrivateFileStore.zig");
@@ -38,15 +39,7 @@ pub const Diagnostic = struct {
     kind: DiagnosticKind,
 };
 
-pub const ThinkingLevel = enum {
-    off,
-    minimal,
-    low,
-    medium,
-    high,
-    xhigh,
-    max,
-};
+pub const ThinkingLevel = ai.settings.ThinkingLevel;
 
 pub const ModelThinkingLevel = struct {
     model: []const u8,

@@ -21,9 +21,11 @@ license texts are retained under `third_party/licenses/`.
     and its parser and renderer leaf modules. `src/tui/transcript/Store.zig`
     adapts the bounded ordered semantic-entry store design. `src/tui/terminal/`
     adapts the normal-buffer cursor admission behavior.
+    `src/coding_agent/interactive/SlashCommands.zig`,
     `src/tui/assistant/user_message_card.zig`,
     `src/tui/footer/presentation.zig`, `src/tui/footer/surface_frame.zig`,
-    `src/tui/tools/tool_presentation.zig`, `src/tui/transcript/Runtime.zig`,
+    `src/tui/input/SlashMenu.zig`, `src/tui/tools/tool_presentation.zig`,
+    `src/tui/transcript/Runtime.zig`,
     `src/tui/transcript/painter.zig`,
     `src/tui/transcript/tool_group_projection.zig`,
     `src/tui/render_engine/transcript_blocks.zig`,
@@ -32,9 +34,11 @@ license texts are retained under `third_party/licenses/`.
     `src/tui/render_engine/frame_plan.zig`,
     `src/tui/render_engine/TerminalRenderer.zig`, and `src/tui/Screen.zig` adapt
     semantic transcript ownership, connected user-turn rails, grouped and
-    action-oriented tool status, paint-time reflow, footer surface assembly,
-    compact-until-full frame composition, owned-band synchronized publication,
-    physical-scroll shadow update, and normal-buffer transcript finality from
+    action-oriented tool status, slash command catalog and picker state,
+    paint-time reflow, rail-free composer and width-bounded status projection,
+    footer surface assembly, compact-until-full frame
+    composition, owned-band synchronized publication, physical-scroll shadow
+    update, and normal-buffer transcript finality from
     fx's corresponding presentation, transcript, footer, frame-builder, and
     terminal-diff owners.
 

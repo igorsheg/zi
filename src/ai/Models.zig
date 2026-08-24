@@ -5,6 +5,7 @@ const model_api = @import("model.zig");
 const model_catalog = @import("model_catalog.zig");
 const protocol_api = @import("protocol.zig");
 const provider_api = @import("provider.zig");
+const settings = @import("settings.zig");
 const transport_api = @import("transport.zig");
 
 const Models = @This();
@@ -168,6 +169,10 @@ fn copyCatalog(allocator: std.mem.Allocator, source: model_catalog.Catalog) erro
     for (source.entries, entries) |entry, *destination| {
         const aliases = try allocator.alloc([]const u8, entry.aliases.len);
         for (entry.aliases, aliases) |alias, *copied| copied.* = try allocator.dupe(u8, alias);
+        var profile = entry.profile;
+        if (entry.profile.thinking) |thinking| profile.thinking = .{
+            .level_map = try copyThinkingLevelMap(allocator, thinking.level_map),
+        };
         destination.* = .{
             .identity = .{
                 .provider = try allocator.dupe(u8, entry.identity.provider),
@@ -176,10 +181,25 @@ fn copyCatalog(allocator: std.mem.Allocator, source: model_catalog.Catalog) erro
             .protocol_id = try allocator.dupe(u8, entry.protocol_id),
             .aliases = aliases,
             .source_url = if (entry.source_url) |url| try allocator.dupe(u8, url) else null,
-            .profile = entry.profile,
+            .profile = profile,
         };
     }
     return .{ .entries = entries };
+}
+
+fn copyThinkingLevelMap(
+    allocator: std.mem.Allocator,
+    source: settings.ThinkingLevelMap,
+) error{OutOfMemory}!settings.ThinkingLevelMap {
+    var result = source;
+    inline for (std.meta.fields(settings.ThinkingLevel)) |field| {
+        @field(result, field.name) = switch (@field(source, field.name)) {
+            .inherited => .inherited,
+            .unsupported => .unsupported,
+            .mapped => |value| .{ .mapped = try allocator.dupe(u8, value) },
+        };
+    }
+    return result;
 }
 
 fn validate(protocols: protocol_api.Registry, config: Config) Error!void {
@@ -231,4 +251,23 @@ fn findProvider(providers: []const provider_api.Definition, id: []const u8) ?*co
         if (std.mem.eql(u8, provider.id, id)) return provider;
     }
     return null;
+}
+
+test "owned catalog copies model-specific thinking wire mappings" {
+    var wire_value = [_]u8{ 'm', 'a', 'x', 'i', 'm', 'u', 'm' };
+    const entries = [_]model_catalog.Entry{.{
+        .identity = .{ .provider = "provider", .model = "model" },
+        .protocol_id = "protocol",
+        .profile = .{ .thinking = .{ .level_map = .{
+            .high = .{ .mapped = &wire_value },
+        } } },
+    }};
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const copied = try copyCatalog(arena.allocator(), .{ .entries = &entries });
+    @memset(&wire_value, 'x');
+    try std.testing.expectEqualStrings(
+        "maximum",
+        copied.entries[0].profile.thinking.?.level_map.high.mapped,
+    );
 }

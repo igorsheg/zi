@@ -11,6 +11,7 @@ const TerminalRenderer = @import("TerminalRenderer.zig");
 const min_transcript_rows: u16 = 3;
 
 pub const ComposerView = FooterSurface.ComposerView;
+pub const SlashMenuProjection = FooterSurface.SlashMenuProjection;
 
 pub const BuiltFrame = struct {
     surface: terminal_render.Surface,

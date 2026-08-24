@@ -226,10 +226,13 @@ fn writeCliHelp(writer: *std.Io.Writer) !void {
         \\  auth login           Start the provider-owned OAuth login ceremony
         \\
         \\Interactive commands:
+        \\  Type / to browse, then press Enter or Tab to complete a command
         \\  /login PROVIDER [--device]  Log in without leaving the TUI
         \\  /model PROVIDER/MODEL       Switch models while idle
+        \\  /thinking LEVEL              Set thinking while idle (Ctrl-T cycles)
         \\  Without an authenticated model, Zi opens a model-less session
         \\  Assistant prose and thinking render as ordered Markdown blocks
+        \\  Footer status shows model, effective thinking level, and session working directory
         \\  Running tools use the footer; completed tools append compact results
         \\
         \\Persistent project trust:

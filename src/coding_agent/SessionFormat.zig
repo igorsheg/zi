@@ -153,6 +153,7 @@ pub const TurnOutcome = union(enum) {
 pub const Entry = union(enum) {
     message: MessageEntry,
     model_change: ModelChangeEntry,
+    thinking_level_change: ThinkingLevelChangeEntry,
     turn_end: TurnEndEntry,
 
     pub fn base(self: Entry) EntryBase {
@@ -170,6 +171,11 @@ pub const MessageEntry = struct {
 pub const ModelChangeEntry = struct {
     base: EntryBase,
     selection: ai_message.ModelIdentity,
+};
+
+pub const ThinkingLevelChangeEntry = struct {
+    base: EntryBase,
+    level: ai.ThinkingLevel,
 };
 
 pub const TurnEndEntry = struct {
@@ -190,6 +196,7 @@ pub const Restored = struct {
     active_leaf_id: ?[]const u8,
     active_entries: []const Entry,
     active_model: ?ai_message.ModelIdentity,
+    active_thinking_level: ?ai.ThinkingLevel,
     context_messages: []const ai_message.Message,
     recovery: Recovery,
 
@@ -271,6 +278,7 @@ pub const Restorer = struct {
                 self.entries.items[self.entries.items.len - 1].base().id,
             .active_entries = projection.active_entries,
             .active_model = projection.active_model,
+            .active_thinking_level = projection.active_thinking_level,
             .context_messages = projection.context_messages,
             .recovery = projection.recovery,
         };
@@ -312,6 +320,14 @@ const WireModelChangeEntry = struct {
     timestamp: []const u8,
     provider: []const u8,
     modelId: []const u8,
+};
+
+const WireThinkingLevelChangeEntry = struct {
+    type: []const u8,
+    id: []const u8,
+    parentId: ?[]const u8,
+    timestamp: []const u8,
+    level: ai.ThinkingLevel,
 };
 
 const WireTurnEndEntry = struct {
@@ -481,6 +497,18 @@ fn decodeEntry(
                 .timestamp = wire.timestamp,
             }),
             .selection = .{ .provider = wire.provider, .model = wire.modelId },
+        } };
+    }
+    if (std.mem.eql(u8, kind.value.type, "thinking_level_change")) {
+        const wire = try parseWire(WireThinkingLevelChangeEntry, allocator, encoded);
+        if (!std.mem.eql(u8, wire.type, "thinking_level_change")) return error.InvalidRecord;
+        return .{ .thinking_level_change = .{
+            .base = try decodeBase(.{
+                .id = wire.id,
+                .parentId = wire.parentId,
+                .timestamp = wire.timestamp,
+            }),
+            .level = wire.level,
         } };
     }
     if (std.mem.eql(u8, kind.value.type, "turn_end")) {
@@ -781,6 +809,7 @@ fn formatTimestamp(buffer: *[24]u8, unix_ms: u64) Error!void {
 
 const Projection = struct {
     active_model: ?ai_message.ModelIdentity,
+    active_thinking_level: ?ai.ThinkingLevel,
     active_entries: []const Entry,
     context_messages: []const ai_message.Message,
     recovery: Recovery,
@@ -829,9 +858,14 @@ fn project(
 
     var context: std.ArrayList(ai_message.Message) = .empty;
     var active_model: ?ai_message.ModelIdentity = null;
+    var active_thinking_level: ?ai.ThinkingLevel = null;
     var turn: ProjectionTurn = .idle;
     for (path.items) |index| switch (entries[index]) {
-        .model_change => |change| active_model = change.selection,
+        .model_change => |change| {
+            active_model = change.selection;
+            active_thinking_level = null;
+        },
+        .thinking_level_change => |change| active_thinking_level = change.level,
         .message => |message_entry| {
             switch (message_entry.message) {
                 .request => |request| switch (try classifyRequest(request)) {
@@ -863,6 +897,7 @@ fn project(
     };
     return .{
         .active_model = active_model,
+        .active_thinking_level = active_thinking_level,
         .active_entries = active_entries,
         .context_messages = context.items,
         .recovery = recovery,
@@ -884,6 +919,9 @@ fn validateBranches(
             .model_change => |change| {
                 if (state.turn_id != null) return error.InvalidRecord;
                 state.model = change.selection;
+            },
+            .thinking_level_change => {
+                if (state.turn_id != null) return error.InvalidRecord;
             },
             .message => |message_entry| switch (message_entry.message) {
                 .request => |request| switch (try classifyRequest(request)) {
@@ -1068,6 +1106,11 @@ pub fn encodeEntry(allocator: std.mem.Allocator, entry: Entry) Error![]u8 {
             try writeBase(&json, change.base);
             try writeField(&json, "provider", change.selection.provider);
             try writeField(&json, "modelId", change.selection.model);
+        },
+        .thinking_level_change => |change| {
+            try writeField(&json, "type", "thinking_level_change");
+            try writeBase(&json, change.base);
+            try writeField(&json, "level", @tagName(change.level));
         },
         .turn_end => |terminal| {
             try validateIdentifier(error.InvalidRecord, terminal.turn_id, max_id_bytes);
@@ -1287,6 +1330,43 @@ fn testRestorer() !Restorer {
     });
     defer std.testing.allocator.free(encoded);
     return Restorer.init(std.testing.allocator, encoded);
+}
+
+test "session format restores the active thinking level" {
+    var restorer = try testRestorer();
+    errdefer restorer.deinit();
+    try appendEncoded(&restorer, .{ .model_change = .{
+        .base = testBase("model", null),
+        .selection = .{ .provider = "openai", .model = "gpt" },
+    } });
+    try appendEncoded(&restorer, .{ .thinking_level_change = .{
+        .base = testBase("thinking", "model"),
+        .level = .high,
+    } });
+    var restored = try restorer.finish();
+    defer restored.deinit();
+    try std.testing.expectEqual(ai.ThinkingLevel.high, restored.active_thinking_level.?);
+    try std.testing.expect(restored.active_entries[1] == .thinking_level_change);
+}
+
+test "session format resets thinking at a model boundary" {
+    var restorer = try testRestorer();
+    errdefer restorer.deinit();
+    try appendEncoded(&restorer, .{ .model_change = .{
+        .base = testBase("model-a", null),
+        .selection = .{ .provider = "openai", .model = "a" },
+    } });
+    try appendEncoded(&restorer, .{ .thinking_level_change = .{
+        .base = testBase("thinking-a", "model-a"),
+        .level = .high,
+    } });
+    try appendEncoded(&restorer, .{ .model_change = .{
+        .base = testBase("model-b", "thinking-a"),
+        .selection = .{ .provider = "openai", .model = "b" },
+    } });
+    var restored = try restorer.finish();
+    defer restored.deinit();
+    try std.testing.expect(restored.active_thinking_level == null);
 }
 
 test "session format round trips a completed tool turn" {

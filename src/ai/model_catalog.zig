@@ -84,6 +84,12 @@ fn validateEntry(entry: Entry) Error!void {
             return error.InvalidSource;
         }
     }
+    if (entry.profile.thinking) |thinking| {
+        _ = settings.compileThinking(.{
+            .reasoning = true,
+            .level_map = thinking.level_map,
+        }) catch return error.InvalidProfile;
+    }
     if (entry.profile.context_window == 0 or entry.profile.max_output_tokens == 0) {
         return error.InvalidProfile;
     }
@@ -178,6 +184,20 @@ test "catalog rejects invalid identity aliases source and profile" {
     try std.testing.expectError(error.InvalidSource, Catalog.init(&.{entry}));
     entry = valid;
     entry.profile = .{ .context_window = 10, .max_output_tokens = 11 };
+    try std.testing.expectError(error.InvalidProfile, Catalog.init(&.{entry}));
+    entry = valid;
+    entry.profile.thinking = .{ .level_map = .{
+        .off = .unsupported,
+        .minimal = .unsupported,
+        .low = .unsupported,
+        .medium = .unsupported,
+        .high = .unsupported,
+    } };
+    try std.testing.expectError(error.InvalidProfile, Catalog.init(&.{entry}));
+    entry = valid;
+    entry.profile.thinking = .{ .level_map = .{
+        .high = .{ .mapped = "unsafe\nvalue" },
+    } };
     try std.testing.expectError(error.InvalidProfile, Catalog.init(&.{entry}));
 
     const duplicate = [_]Entry{

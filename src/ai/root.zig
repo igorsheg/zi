@@ -37,6 +37,7 @@ pub const ModelRequest = model.ModelRequest;
 pub const ModelIdentity = model.ModelIdentity;
 pub const ModelProfile = model.ModelProfile;
 pub const ModelSettings = settings.ModelSettings;
+pub const ThinkingLevel = settings.ThinkingLevel;
 pub const Message = message.Message;
 pub const ResponseMessage = message.ResponseMessage;
 pub const ResponsePart = message.ResponsePart;

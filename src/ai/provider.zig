@@ -188,6 +188,7 @@ pub const Configured = struct {
             .base_url = resolved_auth.base_url orelse self.definition.base_url,
             .headers = self.definition.headers,
             .auth = resolved_auth,
+            .profile = entry.entry.profile,
         }, identity, request, delivery);
     }
 };

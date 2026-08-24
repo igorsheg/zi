@@ -11,6 +11,7 @@ const ReopenInputs = Runtime.ReopenInputs;
 const RuntimeServices = Runtime.Services;
 const SessionFormat = @import("../SessionFormat.zig");
 const SessionPolicy = @import("SessionPolicy.zig");
+const SlashCommands = @import("SlashCommands.zig");
 const session_event = agent_session_mod;
 const SettingsStore = @import("../SettingsStore.zig");
 const TurnWorker = @import("../TurnWorker.zig");
@@ -21,6 +22,20 @@ pub const SessionTranscript = Session.Transcript;
 pub const Event = session_event.Event;
 pub const Limits = SessionPolicy.Limits;
 pub const default_limits: Limits = SessionPolicy.default_limits;
+
+pub const SlashCommandSpec = SlashCommands.Spec;
+
+pub fn slashCommandCompletionPrefix(input: []const u8, cursor: usize) ?[]const u8 {
+    return SlashCommands.completionPrefix(input, cursor);
+}
+
+pub fn slashCommandCompletionCount(prefix: []const u8) usize {
+    return SlashCommands.completionCount(prefix);
+}
+
+pub fn slashCommandCompletionAt(prefix: []const u8, index: usize) ?*const SlashCommandSpec {
+    return SlashCommands.completionAt(prefix, index);
+}
 
 // Frontend contract -------------------------------------------------------
 
@@ -56,7 +71,7 @@ pub const Frontend = struct {
 // Session host ------------------------------------------------------------
 
 pub const InteractiveSessionHost = struct {
-    const max_identifier_bytes = 512;
+    const max_identifier_bytes = SlashCommands.max_identifier_bytes;
 
     pub const Options = struct {
         worker_limits: TurnWorker.Limits = .{},
@@ -91,6 +106,7 @@ pub const InteractiveSessionHost = struct {
         ModelSelectionRequired,
         SessionTransitioning,
         IdentifierTooLong,
+        UnsupportedThinkingLevel,
     };
 
     pub const SubmitDisposition = union(enum) {
@@ -108,10 +124,15 @@ pub const InteractiveSessionHost = struct {
         turn: SessionController.Phase,
     };
 
+    /// Borrows model and cwd text from the host. Callers must not retain those
+    /// slices across a mutating host call.
     pub const Snapshot = struct {
         phase: InteractiveSessionHost.Phase,
         queued_follow_ups: usize,
         mask_composer: bool,
+        active_model: ?ai.ModelIdentity,
+        thinking_level: ?ai.ThinkingLevel,
+        cwd: []const u8,
     };
 
     pub const CancelResult = struct {
@@ -138,6 +159,12 @@ pub const InteractiveSessionHost = struct {
             failure: AuthOperation.Failure,
         },
         model_changed: ai.ModelIdentity,
+        thinking_level_changed: ai.ThinkingLevel,
+        thinking_switch_failed: struct {
+            requested: ai.ThinkingLevel,
+            reason: []const u8,
+        },
+        thinking_switch_commit_indeterminate: ai.ThinkingLevel,
         model_less,
         model_switch_failed: struct {
             requested: ai.ModelIdentity,
@@ -175,6 +202,8 @@ pub const InteractiveSessionHost = struct {
         worker: *TurnWorker,
         controller: SessionController,
         active_model: FixedModel,
+        thinking_level: ?ai.ThinkingLevel,
+        thinking_levels: std.EnumSet(ai.ThinkingLevel),
     };
 
     const Backend = union(enum) {
@@ -228,6 +257,12 @@ pub const InteractiveSessionHost = struct {
             failure: AuthOperation.Failure,
         },
         model_changed: FixedModel,
+        thinking_level_changed: ai.ThinkingLevel,
+        thinking_switch_failed: struct {
+            requested: ai.ThinkingLevel,
+            reason: []const u8,
+        },
+        thinking_switch_commit_indeterminate: ai.ThinkingLevel,
         model_less,
         model_switch_failed: struct {
             requested: FixedModel,
@@ -258,6 +293,14 @@ pub const InteractiveSessionHost = struct {
                     .failure = value.failure,
                 } },
                 .model_changed => |*selection| .{ .model_changed = selection.view() },
+                .thinking_level_changed => |level| .{ .thinking_level_changed = level },
+                .thinking_switch_failed => |value| .{ .thinking_switch_failed = .{
+                    .requested = value.requested,
+                    .reason = value.reason,
+                } },
+                .thinking_switch_commit_indeterminate => |level| .{
+                    .thinking_switch_commit_indeterminate = level,
+                },
                 .model_less => .model_less,
                 .model_switch_failed => |*value| .{ .model_switch_failed = .{
                     .requested = value.requested.view(),
@@ -280,11 +323,9 @@ pub const InteractiveSessionHost = struct {
 
     const ParsedCommand = union(enum) {
         ordinary,
-        login: struct {
-            provider: []const u8,
-            method: ai.oauth.LoginMethod,
-        },
+        login: SlashCommands.Login,
         model: ai.ModelIdentity,
+        thinking: ai.ThinkingLevel,
     };
 
     allocator: std.mem.Allocator,
@@ -321,7 +362,7 @@ pub const InteractiveSessionHost = struct {
         errdefer allocator.free(journal_path);
         var settings_paths = try ZiPaths.init(
             allocator,
-            owned_inputs.initial().startup_cwd,
+            owned_lifecycle.cwd(),
             owned_inputs.initial().home,
         );
         errdefer settings_paths.deinit();
@@ -350,20 +391,50 @@ pub const InteractiveSessionHost = struct {
     }
 
     pub fn snapshot(self: *InteractiveSessionHost) Snapshot {
+        const active_model = self.activeModel();
+        const thinking_level = self.activeThinkingLevel();
+        const cwd = self.settings_paths.cwd;
         if (self.auth) |operation| return .{
             .phase = .authenticating,
             .queued_follow_ups = self.queuedFollowUps(),
             .mask_composer = operation.isAwaitingAnswer(),
+            .active_model = active_model,
+            .thinking_level = thinking_level,
+            .cwd = cwd,
         };
         return switch (self.backend) {
-            .model_less => .{ .phase = .model_less, .queued_follow_ups = 0, .mask_composer = false },
+            .model_less => .{
+                .phase = .model_less,
+                .queued_follow_ups = 0,
+                .mask_composer = false,
+                .active_model = active_model,
+                .thinking_level = thinking_level,
+                .cwd = cwd,
+            },
             .runnable => |*runnable| .{
                 .phase = .{ .turn = runnable.controller.phase() },
                 .queued_follow_ups = runnable.controller.queuedFollowUpCount(),
                 .mask_composer = false,
+                .active_model = active_model,
+                .thinking_level = thinking_level,
+                .cwd = cwd,
             },
-            .transitioning => .{ .phase = .transitioning, .queued_follow_ups = 0, .mask_composer = false },
-            .unavailable => .{ .phase = .unavailable, .queued_follow_ups = 0, .mask_composer = false },
+            .transitioning => .{
+                .phase = .transitioning,
+                .queued_follow_ups = 0,
+                .mask_composer = false,
+                .active_model = active_model,
+                .thinking_level = thinking_level,
+                .cwd = cwd,
+            },
+            .unavailable => .{
+                .phase = .unavailable,
+                .queued_follow_ups = 0,
+                .mask_composer = false,
+                .active_model = active_model,
+                .thinking_level = thinking_level,
+                .cwd = cwd,
+            },
         };
     }
 
@@ -395,7 +466,7 @@ pub const InteractiveSessionHost = struct {
         if (text.len == 0) return error.EmptyPrompt;
         const parsed = try parseCommand(text);
         switch (parsed) {
-            .login, .model => if (self.hasUndrainedControlFacts()) return error.CommandBusy,
+            .login, .model, .thinking => if (self.hasUndrainedControlFacts()) return error.CommandBusy,
             .ordinary => {},
         }
         if (self.auth) |operation| {
@@ -447,6 +518,11 @@ pub const InteractiveSessionHost = struct {
             .model => |selection| {
                 if (!self.isQuiescent()) return error.CommandBusy;
                 try self.switchModel(selection);
+                return .command;
+            },
+            .thinking => |requested| {
+                if (!self.isQuiescent()) return error.CommandBusy;
+                try self.switchThinkingLevel(requested);
                 return .command;
             },
         }
@@ -597,6 +673,108 @@ pub const InteractiveSessionHost = struct {
         }
     }
 
+    pub fn cycleThinkingLevel(self: *InteractiveSessionHost) SubmitError!void {
+        if (self.hasUndrainedControlFacts() or !self.isQuiescent()) return error.CommandBusy;
+        const runnable = switch (self.backend) {
+            .runnable => |*value| value,
+            .model_less => return error.ModelSelectionRequired,
+            .transitioning => return error.SessionTransitioning,
+            .unavailable => return error.SessionUnavailable,
+        };
+        const current = runnable.thinking_level orelse return error.InvalidCommand;
+        return self.switchThinkingLevel(nextThinkingLevel(runnable.thinking_levels, current));
+    }
+
+    fn switchThinkingLevel(
+        self: *InteractiveSessionHost,
+        requested: ai.ThinkingLevel,
+    ) SubmitError!void {
+        const runnable = switch (self.backend) {
+            .runnable => |*value| value,
+            .model_less => return error.ModelSelectionRequired,
+            .transitioning => return error.SessionTransitioning,
+            .unavailable => return error.SessionUnavailable,
+        };
+        _ = runnable.thinking_level orelse return error.InvalidCommand;
+        if (!runnable.thinking_levels.contains(requested)) return error.UnsupportedThinkingLevel;
+        try self.pending.ensureUnusedCapacity(self.allocator, 2);
+        self.closeForTransition();
+        const lifecycle = RuntimeServices.reopenInteractive(
+            self.allocator,
+            self.io,
+            self.inputs.reopen(self.journal_path, .{ .thinking_level = requested }),
+        ) catch |failure| {
+            self.recoverAfterThinkingFailure(requested, failure);
+            return;
+        };
+        self.installLifecycle(lifecycle) catch |failure| {
+            self.recoverAfterThinkingFailure(requested, failure);
+            return;
+        };
+        self.appendPendingAssumeCapacity(.{
+            .thinking_level_changed = self.activeThinkingLevel().?,
+        });
+    }
+
+    fn nextThinkingLevel(
+        levels: std.EnumSet(ai.ThinkingLevel),
+        current: ai.ThinkingLevel,
+    ) ai.ThinkingLevel {
+        const values = std.enums.values(ai.ThinkingLevel);
+        var offset: usize = 1;
+        while (offset <= values.len) : (offset += 1) {
+            const level = values[(@intFromEnum(current) + offset) % values.len];
+            if (levels.contains(level)) return level;
+        }
+        return .off;
+    }
+
+    fn recoverAfterThinkingFailure(
+        self: *InteractiveSessionHost,
+        requested: ai.ThinkingLevel,
+        failure: anyerror,
+    ) void {
+        const lifecycle = RuntimeServices.reopenInteractive(
+            self.allocator,
+            self.io,
+            self.inputs.reopen(self.journal_path, .{}),
+        ) catch |recovery_failure| {
+            self.backend = .unavailable;
+            self.appendThinkingFailure(requested, failure);
+            self.appendPendingAssumeCapacity(.{
+                .session_unavailable = .{ .reason = @errorName(recovery_failure) },
+            });
+            return;
+        };
+        self.installLifecycle(lifecycle) catch |recovery_failure| {
+            self.backend = .unavailable;
+            self.appendThinkingFailure(requested, failure);
+            self.appendPendingAssumeCapacity(.{
+                .session_unavailable = .{ .reason = @errorName(recovery_failure) },
+            });
+            return;
+        };
+        self.appendThinkingFailure(requested, failure);
+    }
+
+    fn appendThinkingFailure(
+        self: *InteractiveSessionHost,
+        requested: ai.ThinkingLevel,
+        failure: anyerror,
+    ) void {
+        self.appendPendingAssumeCapacity(thinkingFailureFact(requested, failure));
+    }
+
+    fn thinkingFailureFact(requested: ai.ThinkingLevel, failure: anyerror) PendingFact {
+        return if (failure == error.CommitIndeterminate)
+            .{ .thinking_switch_commit_indeterminate = requested }
+        else
+            .{ .thinking_switch_failed = .{
+                .requested = requested,
+                .reason = @errorName(failure),
+            } };
+    }
+
     fn switchModel(self: *InteractiveSessionHost, requested: ai.ModelIdentity) !void {
         const requested_copy = try FixedModel.init(requested);
         try self.pending.ensureUnusedCapacity(self.allocator, 3);
@@ -683,6 +861,8 @@ pub const InteractiveSessionHost = struct {
 
     fn installLifecycle(self: *InteractiveSessionHost, lifecycle: RuntimeServices.Lifecycle) !void {
         std.debug.assert(self.backend == .transitioning);
+        const thinking_level = lifecycle.thinkingLevel();
+        const thinking_levels = lifecycle.thinkingLevels();
         const active_model = if (lifecycle.activeModel()) |model|
             FixedModel.init(model) catch |failure| {
                 lifecycle.deinit();
@@ -719,9 +899,18 @@ pub const InteractiveSessionHost = struct {
                     .worker = worker,
                     .controller = controller,
                     .active_model = active_model orelse unreachable,
+                    .thinking_level = thinking_level,
+                    .thinking_levels = thinking_levels,
                 } };
             },
         }
+    }
+
+    fn activeThinkingLevel(self: *InteractiveSessionHost) ?ai.ThinkingLevel {
+        return switch (self.backend) {
+            .runnable => |*runnable| runnable.thinking_level,
+            .model_less, .transitioning, .unavailable => null,
+        };
     }
 
     fn activeModel(self: *InteractiveSessionHost) ?ai.ModelIdentity {
@@ -792,33 +981,15 @@ pub const InteractiveSessionHost = struct {
         self.pending.appendAssumeCapacity(fact);
     }
 
-    fn parseCommand(text: []const u8) error{ InvalidCommand, IdentifierTooLong }!ParsedCommand {
-        var words = std.mem.tokenizeAny(u8, text, " \t\r\n");
-        const command = words.next() orelse return .ordinary;
-        if (std.mem.eql(u8, command, "/login")) {
-            const provider = words.next() orelse return error.InvalidCommand;
-            _ = try FixedText.init(provider);
-            const option = words.next();
-            if (words.next() != null) return error.InvalidCommand;
-            const method: ai.oauth.LoginMethod = if (option) |value| method: {
-                if (!std.mem.eql(u8, value, "--device")) return error.InvalidCommand;
-                break :method .device_code;
-            } else .browser;
-            return .{ .login = .{ .provider = provider, .method = method } };
-        }
-        if (std.mem.eql(u8, command, "/model")) {
-            const target = words.next() orelse return error.InvalidCommand;
-            if (words.next() != null) return error.InvalidCommand;
-            const slash = std.mem.findScalar(u8, target, '/') orelse return error.InvalidCommand;
-            if (slash == 0 or slash + 1 == target.len) return error.InvalidCommand;
-            const selection: ai.ModelIdentity = .{
-                .provider = target[0..slash],
-                .model = target[slash + 1 ..],
-            };
-            _ = try FixedModel.init(selection);
-            return .{ .model = selection };
-        }
-        return .ordinary;
+    fn parseCommand(text: []const u8) SlashCommands.ParseError!ParsedCommand {
+        return switch (SlashCommands.parse(text)) {
+            .ordinary => .ordinary,
+            .command => |invocation| switch (invocation.spec.kind) {
+                .login => .{ .login = try SlashCommands.Login.parse(invocation.arguments) },
+                .model => .{ .model = (try SlashCommands.Model.parse(invocation.arguments)).selection },
+                .thinking => .{ .thinking = (try SlashCommands.Thinking.parse(invocation.arguments)).level },
+            },
+        };
     }
 
     fn emitTurnFact(context: *anyopaque, fact: SessionController.Fact) !void {
@@ -1210,6 +1381,9 @@ const RetryAuthRecorder = struct {
             },
             .model_changed => self.model_order = self.nextOrder(),
             .turn,
+            .thinking_level_changed,
+            .thinking_switch_failed,
+            .thinking_switch_commit_indeterminate,
             .auth_cancelled,
             .login_failed,
             .model_less,
@@ -1255,6 +1429,9 @@ const DeviceRetryRecorder = struct {
             .login_succeeded,
             .login_failed,
             .model_changed,
+            .thinking_level_changed,
+            .thinking_switch_failed,
+            .thinking_switch_commit_indeterminate,
             .model_less,
             .model_switch_failed,
             .model_switch_commit_indeterminate,
@@ -1279,6 +1456,7 @@ const HostTestRecorder = struct {
     saw_model_less: bool = false,
     saw_switch_failure: bool = false,
     saw_auth_cancelled: bool = false,
+    saw_unavailable: bool = false,
 
     fn emit(context: *anyopaque, fact: InteractiveSessionHost.Fact) !void {
         const self: *HostTestRecorder = @ptrCast(@alignCast(context));
@@ -1318,6 +1496,10 @@ const HostTestRecorder = struct {
                 try self.expectSafe(value.model);
                 self.saw_model_change = true;
             },
+            .thinking_level_changed => {},
+            .thinking_switch_failed, .thinking_switch_commit_indeterminate => {
+                self.saw_switch_failure = true;
+            },
             .model_less => self.saw_model_less = true,
             .model_switch_failed => |value| {
                 try self.expectSafe(value.requested.provider);
@@ -1337,7 +1519,7 @@ const HostTestRecorder = struct {
                 try self.expectSafe(value.provider);
                 try self.expectSafe(value.model);
             },
-            .session_unavailable => {},
+            .session_unavailable => self.saw_unavailable = true,
         }
     }
 
@@ -1349,6 +1531,14 @@ const HostTestRecorder = struct {
         return .{ .context = self, .emit_fn = emit };
     }
 };
+
+test "thinking switch failures retain deterministic and indeterminate types" {
+    const deterministic = InteractiveSessionHost.thinkingFailureFact(.high, error.PersistenceFailed);
+    try std.testing.expect(deterministic == .thinking_switch_failed);
+    try std.testing.expectEqualStrings("PersistenceFailed", deterministic.thinking_switch_failed.reason);
+    const indeterminate = InteractiveSessionHost.thinkingFailureFact(.low, error.CommitIndeterminate);
+    try std.testing.expect(indeterminate == .thinking_switch_commit_indeterminate);
+}
 
 fn hostTestRoot(temporary: *std.testing.TmpDir, buffer: []u8) ![]const u8 {
     const length = try temporary.dir.realPath(std.testing.io, buffer);
@@ -1391,6 +1581,46 @@ fn createHostForTest(
     );
 }
 
+test "interactive host snapshot uses the resumed session cwd" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try temporary.dir.createDir(std.testing.io, "launch", .default_dir);
+    try temporary.dir.createDir(std.testing.io, "stored", .default_dir);
+    var root_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root = try hostTestRoot(&temporary, &root_buffer);
+    const launch_cwd = try std.fs.path.resolve(std.testing.allocator, &.{ root, "launch" });
+    defer std.testing.allocator.free(launch_cwd);
+    const stored_cwd = try std.fs.path.resolve(std.testing.allocator, &.{ root, "stored" });
+    defer std.testing.allocator.free(stored_cwd);
+    var sources: HostTestSources = .{};
+
+    const created = try createHostForTest(stored_cwd, sources.view(), null, .{});
+    const journal_path = try std.testing.allocator.dupe(u8, created.journal_path);
+    created.deinit();
+    defer std.testing.allocator.free(journal_path);
+
+    var inputs = try ReopenInputs.init(std.testing.allocator, .{
+        .startup_cwd = launch_cwd,
+        .home = root,
+        .session = .{ .open = journal_path },
+        .sources = sources.view(),
+    });
+    var lifecycle = try RuntimeServices.createInteractive(
+        std.testing.allocator,
+        std.testing.io,
+        inputs.initial(),
+    );
+    const resumed = try InteractiveSessionHost.init(
+        std.testing.allocator,
+        std.testing.io,
+        &inputs,
+        &lifecycle,
+        .{},
+    );
+    defer resumed.deinit();
+    try std.testing.expectEqualStrings(stored_cwd, resumed.snapshot().cwd);
+}
+
 test "model switch reopens the exact journal and persists the canonical default" {
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();
@@ -1413,6 +1643,10 @@ test "model switch reopens the exact journal and persists the canonical default"
         .model = "gpt-5.6-terra",
     }, .{});
     defer host.deinit();
+    const initial_snapshot = host.snapshot();
+    try std.testing.expectEqualStrings(root, initial_snapshot.cwd);
+    try std.testing.expectEqualStrings("openai-codex", initial_snapshot.active_model.?.provider);
+    try std.testing.expectEqualStrings("gpt-5.6-terra", initial_snapshot.active_model.?.model);
     const journal_path = try std.testing.allocator.dupe(u8, host.journal_path);
     defer std.testing.allocator.free(journal_path);
 
@@ -1422,6 +1656,27 @@ test "model switch reopens the exact journal and persists the canonical default"
     update.deinit();
     try std.testing.expect(recorder.saw_model_change);
     try std.testing.expectEqualStrings(journal_path, host.journal_path);
+    const switched_snapshot = host.snapshot();
+    try std.testing.expectEqualStrings("openai-codex", switched_snapshot.active_model.?.provider);
+    try std.testing.expectEqualStrings("gpt-5.6-luna", switched_snapshot.active_model.?.model);
+    try std.testing.expectEqual(ai.ThinkingLevel.medium, switched_snapshot.thinking_level.?);
+
+    try temporary.dir.writeFile(std.testing.io, .{
+        .sub_path = ".zi/agent/settings.json",
+        .data = "{\"defaultThinkingLevel\":\"low\"}",
+    });
+    try std.testing.expect((try host.submit("/model openai-codex/gpt-5.6-luna")) == .command);
+    var stable_update = try host.drain("", recorder.sink());
+    stable_update.deinit();
+    try std.testing.expectEqual(ai.ThinkingLevel.medium, host.snapshot().thinking_level.?);
+
+    try std.testing.expectError(error.UnsupportedThinkingLevel, host.submit("/thinking max"));
+    try std.testing.expectEqual(ai.ThinkingLevel.medium, host.snapshot().thinking_level.?);
+
+    try std.testing.expect((try host.submit("/thinking high")) == .command);
+    var thinking_update = try host.drain("", recorder.sink());
+    thinking_update.deinit();
+    try std.testing.expectEqual(ai.ThinkingLevel.high, host.snapshot().thinking_level.?);
 
     const journal = try std.Io.Dir.readFileAlloc(
         .cwd(),
@@ -1432,6 +1687,7 @@ test "model switch reopens the exact journal and persists the canonical default"
     );
     defer std.testing.allocator.free(journal);
     try std.testing.expect(std.mem.count(u8, journal, "model_change") == 2);
+    try std.testing.expect(std.mem.count(u8, journal, "thinking_level_change") == 3);
     try std.testing.expect(std.mem.find(u8, journal, "gpt-5.6-terra") != null);
     try std.testing.expect(std.mem.find(u8, journal, "gpt-5.6-luna") != null);
 
@@ -1449,6 +1705,15 @@ test "model switch reopens the exact journal and persists the canonical default"
     );
     defer std.testing.allocator.free(settings);
     try std.testing.expect(std.mem.find(u8, settings, "gpt-5.6-luna") != null);
+
+    const last_path_byte = &host.journal_path[host.journal_path.len - 1];
+    last_path_byte.* = if (last_path_byte.* == 'x') 'y' else 'x';
+    try std.testing.expect((try host.submit("/thinking low")) == .command);
+    var failed_update = try host.drain("", recorder.sink());
+    failed_update.deinit();
+    try std.testing.expect(recorder.saw_switch_failure);
+    try std.testing.expect(recorder.saw_unavailable);
+    try std.testing.expect(host.snapshot().phase == .unavailable);
 }
 
 test "host transcript remains valid after replacing its initial backend" {
@@ -1539,7 +1804,10 @@ test "undrained control facts reject more than sixteen commands without growing 
     var recorder: HostTestRecorder = .{};
     var update = try host.drain("", recorder.sink());
     update.deinit();
-    try std.testing.expect(host.snapshot().phase == .model_less);
+    const snapshot = host.snapshot();
+    try std.testing.expect(snapshot.phase == .model_less);
+    try std.testing.expect(snapshot.active_model == null);
+    try std.testing.expectEqualStrings(root, snapshot.cwd);
 }
 
 test "failed model switch recovers model-less state from the same journal" {
@@ -1763,7 +2031,7 @@ test "background login activates the original journal without exposing the answe
     try std.testing.expect(std.mem.find(u8, auth_source, answer) == null);
 }
 
-test "interactive command parser admits exact login and model commands" {
+test "interactive host decodes matched login and model commands" {
     try std.testing.expect((try InteractiveSessionHost.parseCommand("/login openai-codex")) == .login);
     try std.testing.expectEqual(
         ai.oauth.LoginMethod.device_code,

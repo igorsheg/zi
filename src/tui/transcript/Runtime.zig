@@ -85,6 +85,7 @@ pub fn start(
 fn restoreTranscript(self: *Runtime, value: *const interactive.SessionTranscript) !void {
     for (value.items) |item| switch (item.content) {
         .model_change => |identity| try self.addModel(identity),
+        .thinking_level_change => {},
         .user => |user| try self.addUser(user.parts),
         .assistant => |response| for (response.parts) |part|
             try self.renderPartSource(part),
@@ -145,6 +146,25 @@ pub fn apply(self: *Runtime, fact: interactive.HostFact) !void {
             try self.addNotice(label);
         },
         .model_changed => |selection| try self.addModel(selection),
+        .thinking_level_changed => {},
+        .thinking_switch_failed => |value| {
+            var buffer: [256]u8 = undefined;
+            const label = try std.fmt.bufPrint(
+                &buffer,
+                "Thinking switch to {s} failed: {s}",
+                .{ @tagName(value.requested), value.reason },
+            );
+            try self.addNotice(label);
+        },
+        .thinking_switch_commit_indeterminate => |level| {
+            var buffer: [160]u8 = undefined;
+            const label = try std.fmt.bufPrint(
+                &buffer,
+                "Thinking switch to {s} had an indeterminate journal commit",
+                .{@tagName(level)},
+            );
+            try self.addNotice(label);
+        },
         .model_less => try self.addNotice("No model is available"),
         .model_switch_failed => |value| {
             var buffer: [1200]u8 = undefined;

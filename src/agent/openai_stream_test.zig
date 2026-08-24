@@ -14,15 +14,15 @@ const transport = @import("../ai/transport.zig");
 
 const compatible_profile = profile: {
     var value: settings.ModelProfile = .{};
-    value.capabilities = .initMany(&.{ .streaming, .tools, .parallel_tool_calls, .thinking });
+    value.capabilities = .initMany(&.{ .streaming, .tools, .parallel_tool_calls });
     value.settings = .initMany(&.{ .temperature, .top_p, .max_output_tokens, .stop_sequences, .seed });
     break :profile value;
 };
 const codex_profile = profile: {
     var value: settings.ModelProfile = .{};
-    value.capabilities = .initMany(&.{ .streaming, .tools, .parallel_tool_calls, .thinking });
-    value.settings = .initMany(&.{ .temperature, .reasoning_effort });
-    value.reasoning_efforts = .initMany(&.{ .minimal, .low, .medium, .high });
+    value.capabilities = .initMany(&.{ .streaming, .tools, .parallel_tool_calls });
+    value.settings = .initOne(.temperature);
+    value.thinking = .{};
     break :profile value;
 };
 const catalog_entries = [_]model_catalog.Entry{
@@ -231,6 +231,7 @@ test "Agent streams an OpenAI Chat tool loop through the production provider sea
         &.{tool},
         .{},
         .{ .context = &recorder, .emitFn = StreamRecorder.emit },
+        .off,
     );
     defer agent.deinit();
 
@@ -318,6 +319,7 @@ test "Agent streams an OpenAI Codex Responses tool loop through the production p
         &.{tool},
         .{},
         .{ .context = &recorder, .emitFn = StreamRecorder.emit },
+        .off,
     );
     defer agent.deinit();
 

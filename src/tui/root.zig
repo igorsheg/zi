@@ -13,6 +13,7 @@ const render = @import("render_engine/root.zig");
 const markdown = @import("markdown/root.zig");
 const decoder = @import("input/Decoder.zig");
 const line_editor = @import("input/LineEditor.zig");
+const slash_menu = @import("input/SlashMenu.zig");
 const cursor_position_parser = @import("terminal/cursor_position_parser.zig");
 const terminal_session = @import("terminal/Session.zig");
 
@@ -59,6 +60,7 @@ test {
     _ = markdown;
     _ = decoder;
     _ = line_editor;
+    _ = slash_menu;
     _ = cursor_position_parser;
     _ = terminal_session;
 }

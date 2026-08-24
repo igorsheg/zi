@@ -22,7 +22,8 @@ const SourceEntry = struct {
 const SourceProfile = struct {
     capabilities: []const settings.Capability = &.{},
     settings: []const settings.Setting = &.{},
-    reasoning_efforts: []const settings.ReasoningEffort = &.{},
+    reasoning: bool = false,
+    thinking_level_map: ?settings.ThinkingLevelMap = null,
     context_window: ?u64 = null,
     max_output_tokens: ?u64 = null,
 };
@@ -134,13 +135,13 @@ fn validateSource(allocator: std.mem.Allocator, source: Source) !void {
         try validateOrderedStrings(entry.aliases);
         try validateOrderedEnums(settings.Capability, entry.profile.capabilities);
         try validateOrderedEnums(settings.Setting, entry.profile.settings);
-        try validateOrderedEnums(settings.ReasoningEffort, entry.profile.reasoning_efforts);
+        try validateThinkingSource(entry.profile);
         entries[index] = .{
             .identity = .{ .provider = entry.provider_id, .model = entry.model_id },
             .protocol_id = entry.protocol_id,
             .aliases = entry.aliases,
             .source_url = entry.source_url,
-            .profile = profileFromSource(entry.profile),
+            .profile = profileFromSource(entry.profile) catch return error.InvalidModelCatalogSource,
         };
     }
     _ = catalog.Catalog.init(entries) catch return error.InvalidModelCatalogSource;
@@ -169,11 +170,21 @@ fn validateOrderedEnums(comptime T: type, values: []const T) !void {
     }
 }
 
-fn profileFromSource(source: SourceProfile) settings.ModelProfile {
+fn validateThinkingSource(source: SourceProfile) !void {
+    _ = settings.compileThinking(.{
+        .reasoning = source.reasoning,
+        .level_map = source.thinking_level_map,
+    }) catch return error.InvalidModelCatalogSource;
+}
+
+fn profileFromSource(source: SourceProfile) settings.ThinkingSourceError!settings.ModelProfile {
     return .{
         .capabilities = .initMany(source.capabilities),
         .settings = .initMany(source.settings),
-        .reasoning_efforts = .initMany(source.reasoning_efforts),
+        .thinking = try settings.compileThinking(.{
+            .reasoning = source.reasoning,
+            .level_map = source.thinking_level_map,
+        }),
         .context_window = source.context_window,
         .max_output_tokens = source.max_output_tokens,
     };
@@ -194,15 +205,35 @@ fn writeEntry(writer: *std.Io.Writer, entry: SourceEntry) !void {
     if (entry.aliases.len > 1) try writer.writeByte(' ');
     try writer.writeAll("},\n");
     try writer.print("        .source_url = \"{f}\",\n", .{std.zig.fmtString(entry.source_url)});
+    const profile = try profileFromSource(entry.profile);
     try writer.writeAll("        .profile = .{\n");
     try writeEnumSet(writer, "capabilities", entry.profile.capabilities);
     try writeEnumSet(writer, "settings", entry.profile.settings);
-    try writeEnumSet(writer, "reasoning_efforts", entry.profile.reasoning_efforts);
+    try writeThinkingProfile(writer, profile.thinking);
     try writer.writeAll("            .context_window = ");
     try writeOptionalInteger(writer, entry.profile.context_window);
     try writer.writeAll(",\n            .max_output_tokens = ");
     try writeOptionalInteger(writer, entry.profile.max_output_tokens);
     try writer.writeAll(",\n        },\n    },\n");
+}
+
+fn writeThinkingProfile(writer: *std.Io.Writer, thinking: ?settings.ThinkingProfile) !void {
+    try writer.writeAll("            .thinking = ");
+    const profile = thinking orelse {
+        try writer.writeAll("null,\n");
+        return;
+    };
+    try writer.writeAll(".{ .level_map = .{\n");
+    inline for (std.meta.fields(settings.ThinkingLevel)) |field| {
+        try writer.print("                .{s} = ", .{field.name});
+        switch (@field(profile.level_map, field.name)) {
+            .inherited => try writer.writeAll(".inherited"),
+            .unsupported => try writer.writeAll(".unsupported"),
+            .mapped => |value| try writer.print(".{{ .mapped = \"{f}\" }}", .{std.zig.fmtString(value)}),
+        }
+        try writer.writeAll(",\n");
+    }
+    try writer.writeAll("            } },\n");
 }
 
 fn writeEnumSet(writer: *std.Io.Writer, name: []const u8, values: anytype) !void {
@@ -289,6 +320,54 @@ test "generator is deterministic and validates source ordering" {
     try std.testing.expectError(
         error.InvalidModelCatalogSource,
         generate(std.testing.allocator, unsorted),
+    );
+}
+
+test "generator normalizes semantic thinking mappings" {
+    const fixture =
+        \\{
+        \\  "version": 1,
+        \\  "updated_at": "2026-08-16",
+        \\  "entries": [{
+        \\    "provider_id": "test",
+        \\    "model_id": "model",
+        \\    "protocol_id": "test-protocol",
+        \\    "source_url": "https://example.test/model",
+        \\    "profile": {
+        \\      "reasoning": true,
+        \\      "thinking_level_map": {"off": null, "high": "maximum", "xhigh": "extreme"}
+        \\    }
+        \\  }]
+        \\}
+    ;
+    const generated = try generate(std.testing.allocator, fixture);
+    defer std.testing.allocator.free(generated);
+    try std.testing.expect(std.mem.indexOf(u8, generated, ".off = .unsupported") != null);
+    try std.testing.expect(std.mem.indexOf(u8, generated, ".minimal = .inherited") != null);
+    try std.testing.expect(std.mem.indexOf(u8, generated, ".high = .{ .mapped = \"maximum\" }") != null);
+    try std.testing.expect(std.mem.indexOf(u8, generated, ".xhigh = .{ .mapped = \"extreme\" }") != null);
+    try std.testing.expect(std.mem.indexOf(u8, generated, ".max = .unsupported") != null);
+
+    const map_without_reasoning =
+        \\{"version":1,"updated_at":"2026-08-16","entries":[{
+        \\  "provider_id":"test","model_id":"model","protocol_id":"protocol",
+        \\  "source_url":"https://example.test/model","profile":{"thinking_level_map":{}}
+        \\}]}
+    ;
+    try std.testing.expectError(
+        error.InvalidModelCatalogSource,
+        generate(std.testing.allocator, map_without_reasoning),
+    );
+    const all_unsupported =
+        \\{"version":1,"updated_at":"2026-08-16","entries":[{
+        \\  "provider_id":"test","model_id":"model","protocol_id":"protocol",
+        \\  "source_url":"https://example.test/model","profile":{"reasoning":true,
+        \\  "thinking_level_map":{"off":null,"minimal":null,"low":null,"medium":null,"high":null}}
+        \\}]}
+    ;
+    try std.testing.expectError(
+        error.InvalidModelCatalogSource,
+        generate(std.testing.allocator, all_unsupported),
     );
 }
 

@@ -6,12 +6,23 @@
       "provider_id": "openai",
       "model_id": "gpt-5.6-sol",
       "protocol_id": "openai-responses",
-      "aliases": ["gpt-5.6"],
+      "aliases": [
+        "gpt-5.6"
+      ],
       "source_url": "https://developers.openai.com/api/docs/models/gpt-5.6-sol",
       "profile": {
-        "capabilities": ["streaming", "tools", "parallel_tool_calls", "thinking"],
-        "settings": ["max_output_tokens", "reasoning_effort"],
-        "reasoning_efforts": ["low", "medium", "high"],
+        "capabilities": [
+          "streaming",
+          "tools",
+          "parallel_tool_calls"
+        ],
+        "settings": [
+          "max_output_tokens"
+        ],
+        "reasoning": true,
+        "thinking_level_map": {
+          "minimal": null
+        },
         "context_window": 1050000,
         "max_output_tokens": 128000
       }
@@ -22,9 +33,12 @@
       "protocol_id": "openai-codex-responses",
       "source_url": "https://github.com/badlogic/pi-mono/commit/73414d08b94d7db46d3fa66582c8fe3b02dabf72",
       "profile": {
-        "capabilities": ["streaming", "tools", "parallel_tool_calls", "thinking"],
-        "settings": ["reasoning_effort"],
-        "reasoning_efforts": ["minimal", "low", "medium", "high"],
+        "capabilities": [
+          "streaming",
+          "tools",
+          "parallel_tool_calls"
+        ],
+        "reasoning": true,
         "context_window": 128000,
         "max_output_tokens": 128000
       }
@@ -35,9 +49,12 @@
       "protocol_id": "openai-codex-responses",
       "source_url": "https://github.com/badlogic/pi-mono/commit/73414d08b94d7db46d3fa66582c8fe3b02dabf72",
       "profile": {
-        "capabilities": ["streaming", "tools", "parallel_tool_calls", "thinking"],
-        "settings": ["reasoning_effort"],
-        "reasoning_efforts": ["minimal", "low", "medium", "high"],
+        "capabilities": [
+          "streaming",
+          "tools",
+          "parallel_tool_calls"
+        ],
+        "reasoning": true,
         "context_window": 272000,
         "max_output_tokens": 128000
       }
@@ -48,9 +65,12 @@
       "protocol_id": "openai-codex-responses",
       "source_url": "https://github.com/badlogic/pi-mono/commit/73414d08b94d7db46d3fa66582c8fe3b02dabf72",
       "profile": {
-        "capabilities": ["streaming", "tools", "parallel_tool_calls", "thinking"],
-        "settings": ["reasoning_effort"],
-        "reasoning_efforts": ["minimal", "low", "medium", "high"],
+        "capabilities": [
+          "streaming",
+          "tools",
+          "parallel_tool_calls"
+        ],
+        "reasoning": true,
         "context_window": 272000,
         "max_output_tokens": 128000
       }
@@ -61,9 +81,12 @@
       "protocol_id": "openai-codex-responses",
       "source_url": "https://github.com/badlogic/pi-mono/commit/73414d08b94d7db46d3fa66582c8fe3b02dabf72",
       "profile": {
-        "capabilities": ["streaming", "tools", "parallel_tool_calls", "thinking"],
-        "settings": ["reasoning_effort"],
-        "reasoning_efforts": ["minimal", "low", "medium", "high"],
+        "capabilities": [
+          "streaming",
+          "tools",
+          "parallel_tool_calls"
+        ],
+        "reasoning": true,
         "context_window": 272000,
         "max_output_tokens": 128000
       }
@@ -74,9 +97,12 @@
       "protocol_id": "openai-codex-responses",
       "source_url": "https://github.com/badlogic/pi-mono/commit/73414d08b94d7db46d3fa66582c8fe3b02dabf72",
       "profile": {
-        "capabilities": ["streaming", "tools", "parallel_tool_calls", "thinking"],
-        "settings": ["reasoning_effort"],
-        "reasoning_efforts": ["minimal", "low", "medium", "high"],
+        "capabilities": [
+          "streaming",
+          "tools",
+          "parallel_tool_calls"
+        ],
+        "reasoning": true,
         "context_window": 272000,
         "max_output_tokens": 128000
       }
@@ -87,9 +113,12 @@
       "protocol_id": "openai-codex-responses",
       "source_url": "https://github.com/badlogic/pi-mono/commit/73414d08b94d7db46d3fa66582c8fe3b02dabf72",
       "profile": {
-        "capabilities": ["streaming", "tools", "parallel_tool_calls", "thinking"],
-        "settings": ["reasoning_effort"],
-        "reasoning_efforts": ["minimal", "low", "medium", "high"],
+        "capabilities": [
+          "streaming",
+          "tools",
+          "parallel_tool_calls"
+        ],
+        "reasoning": true,
         "context_window": 272000,
         "max_output_tokens": 128000
       }
@@ -100,9 +129,12 @@
       "protocol_id": "openai-codex-responses",
       "source_url": "https://github.com/badlogic/pi-mono/commit/73414d08b94d7db46d3fa66582c8fe3b02dabf72",
       "profile": {
-        "capabilities": ["streaming", "tools", "parallel_tool_calls", "thinking"],
-        "settings": ["reasoning_effort"],
-        "reasoning_efforts": ["minimal", "low", "medium", "high"],
+        "capabilities": [
+          "streaming",
+          "tools",
+          "parallel_tool_calls"
+        ],
+        "reasoning": true,
         "context_window": 272000,
         "max_output_tokens": 128000
       }

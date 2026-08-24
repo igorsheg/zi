@@ -16,9 +16,9 @@ const profile = profile: {
         .context_window = 128_000,
         .max_output_tokens = 16_000,
     };
-    value.capabilities = .initMany(&.{ .streaming, .tools, .parallel_tool_calls, .thinking });
-    value.settings = .initMany(&.{ .max_output_tokens, .reasoning_effort });
-    value.reasoning_efforts = .initMany(&.{ .low, .medium, .high });
+    value.capabilities = .initMany(&.{ .streaming, .tools, .parallel_tool_calls });
+    value.settings = .initOne(.max_output_tokens);
+    value.thinking = .{ .level_map = .{ .minimal = .unsupported } };
     break :profile value;
 };
 const catalog_entries = [_]model_catalog.Entry{.{
@@ -114,7 +114,7 @@ test "OpenAI Responses crosses catalog model protocol and transport seams" {
         .messages = &messages,
         .instructions = &.{"Be concise."},
         .tools = &tools,
-        .settings = .{ .max_output_tokens = 1, .reasoning_effort = .medium },
+        .settings = .{ .max_output_tokens = 1, .thinking_level = .medium },
     });
     defer result.deinit();
 
@@ -132,6 +132,7 @@ test "OpenAI Responses crosses catalog model protocol and transport seams" {
     const replay_body = try openai_responses.encodeRequest(
         std.testing.allocator,
         model.identity,
+        model.profile,
         .{ .messages = &replay_messages },
     );
     defer std.testing.allocator.free(replay_body);
@@ -142,6 +143,7 @@ test "OpenAI Responses crosses catalog model protocol and transport seams" {
     const handoff_body = try openai_responses.encodeRequest(
         std.testing.allocator,
         .{ .provider = "openai", .model = "other-model" },
+        model.profile,
         .{ .messages = &replay_messages },
     );
     defer std.testing.allocator.free(handoff_body);
@@ -160,10 +162,35 @@ test "Responses encoder gives empty tool results explicit output" {
     const body = try openai_responses.encodeRequest(
         std.testing.allocator,
         .{ .provider = "openai", .model = "gpt-test" },
+        profile,
         .{ .messages = &messages },
     );
     defer std.testing.allocator.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"output\":\"(no tool output)\"") != null);
+}
+
+test "Responses encoder emits inherited off as the protocol disable value" {
+    const body = try openai_responses.encodeRequest(
+        std.testing.allocator,
+        .{ .provider = "openai", .model = "gpt-test" },
+        profile,
+        .{ .messages = &.{}, .settings = .{ .thinking_level = .off } },
+    );
+    defer std.testing.allocator.free(body);
+    try std.testing.expect(std.mem.find(u8, body, "\"effort\":\"none\"") != null);
+}
+
+test "Responses encoder applies the retained model thinking-level mapping" {
+    var mapped_profile = profile;
+    mapped_profile.thinking.?.level_map.xhigh = .{ .mapped = "maximum" };
+    const body = try openai_responses.encodeRequest(
+        std.testing.allocator,
+        .{ .provider = "openai", .model = "gpt-test" },
+        mapped_profile,
+        .{ .messages = &.{}, .settings = .{ .thinking_level = .xhigh } },
+    );
+    defer std.testing.allocator.free(body);
+    try std.testing.expect(std.mem.find(u8, body, "\"effort\":\"maximum\"") != null);
 }
 
 test "Responses decoder accepts response done without misdirecting index-less deltas" {

@@ -15,11 +15,7 @@ pub const OpenAiResponses = struct {
         var value: settings.ModelProfile = .{};
         value.capabilities = .initMany(&.{ .streaming, .tools, .parallel_tool_calls });
         value.settings = .initOne(.max_output_tokens);
-        if (hints.reasoning) {
-            value.capabilities.insert(.thinking);
-            value.settings.insert(.reasoning_effort);
-            value.reasoning_efforts = hints.reasoning_efforts;
-        }
+        value.thinking = hints.thinking;
         return value;
     }
 
@@ -38,7 +34,12 @@ pub const OpenAiResponses = struct {
         delivery: model_api.Delivery,
     ) failure.ModelError!message.ResponseMessage {
         try request.validateHandoff(identity, "openai-responses");
-        const body = try openai_responses.encodeRequest(scratch_allocator, identity, request);
+        const body = try openai_responses.encodeRequest(
+            scratch_allocator,
+            identity,
+            invocation.profile,
+            request,
+        );
         defer {
             std.crypto.secureZero(u8, @constCast(body));
             scratch_allocator.free(body);
