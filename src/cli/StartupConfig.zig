@@ -14,20 +14,35 @@ pub const FileAccess = struct {
     cwd: ?[]const u8 = null,
 };
 
-pub const Inputs = struct {
+pub const PrepareInputs = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     path_inputs: config.Loader.PathInputs,
     /// Explicit file access. The config prompt root is derived from the
     /// Loader-owned config path and cannot be supplied independently.
     file_access: FileAccess,
-    /// Must remain alive, immutable, and address-stable until Owner.deinit.
+    /// Must remain alive, immutable, and address-stable until the final
+    /// Owner.deinit. Environment values borrowed during prepare must not be
+    /// mutated before finish.
+    environment: *const ProcessAdapters.Environment,
+    /// String fields are borrowed through finish. The resulting overlays own
+    /// the bytes they retain.
+    selection: Args.Selection = .{},
+    strict_one_shot: bool = false,
+    /// Its erased context must remain alive, immutable, and address-stable
+    /// until Owner.deinit and across every Store call.
+    provider_canonicalizer: ?config.Store.ProviderCanonicalizer = null,
+};
+
+pub const Inputs = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path_inputs: config.Loader.PathInputs,
+    file_access: FileAccess,
     environment: *const ProcessAdapters.Environment,
     selection: Args.Selection = .{},
     resumed: ?config.Selection.RestoreMetadata = null,
     strict_one_shot: bool = false,
-    /// Its erased context must remain alive, immutable, and address-stable
-    /// until Owner.deinit and across every Store call.
     provider_canonicalizer: ?config.Store.ProviderCanonicalizer = null,
 };
 
@@ -96,13 +111,55 @@ pub const Warning = struct {
     }
 };
 
+const StartupFacts = struct {
+    cli: Args.Selection,
+    env_provider: ?[]const u8,
+    env_model: ?[]const u8,
+    env_effort: ?[]const u8,
+    env_preset: ?[]const u8,
+    env_system_prompt: ?[]const u8,
+    strict_one_shot: bool,
+};
+
 const State = struct {
     allocator: std.mem.Allocator,
     tiers: config.Loader.InitialTiers,
+    base: config.Store.Options,
+    facts: StartupFacts,
     selection: config.Selection,
     presets: config.Preset.Enumeration,
     providers: config.ProviderDefinitions.Enumeration,
     warnings: []Warning,
+};
+
+fn deinitState(state: *State) void {
+    const allocator = state.allocator;
+    for (state.warnings) |*warning| warning.deinit(allocator);
+    allocator.free(state.warnings);
+    state.providers.deinit();
+    state.presets.deinit(allocator);
+    state.selection.deinit();
+    deinitTiersSecure(allocator, &state.tiers);
+    state.* = undefined;
+    allocator.destroy(state);
+}
+
+/// Move-only, heap-stable snapshot produced by prepare. Copying this handle is
+/// invalid. On finish success (including a fatal result) it is consumed. On an
+/// error it remains owned by the caller and must be deinitialized.
+pub const Prepared = struct {
+    state: *State,
+
+    pub fn deinit(self: *Prepared) void {
+        deinitState(self.state);
+        self.* = undefined;
+    }
+
+    /// Borrows Prepared. The Store and every view returned from it are valid
+    /// only until finish, deinit, or another mutation of this Prepared.
+    pub fn storeBeforeResume(self: *const Prepared) config.Store {
+        return self.state.selection.store();
+    }
 };
 
 /// Move-only handle to heap-stable startup state. Copying the handle and
@@ -111,16 +168,7 @@ pub const Owner = struct {
     state: *State,
 
     pub fn deinit(self: *Owner) void {
-        const state = self.state;
-        const allocator = state.allocator;
-        for (state.warnings) |*warning| warning.deinit(allocator);
-        allocator.free(state.warnings);
-        state.providers.deinit();
-        state.presets.deinit(allocator);
-        state.selection.deinit();
-        deinitTiersSecure(allocator, &state.tiers);
-        state.* = undefined;
-        allocator.destroy(state);
+        deinitState(self.state);
         self.* = undefined;
     }
 
@@ -231,9 +279,10 @@ const WarningBuilder = struct {
     }
 };
 
-/// Loads persistent tiers and applies the complete startup selection policy.
-/// All returned views borrow Owner and remain valid until its deinit.
-pub fn init(inputs: Inputs) Error!InitResult {
+/// Loads the persistent files, presets, and provider definitions exactly once.
+/// The returned snapshot owns all loaded data. Input strings remain borrowed
+/// through finish; Store collaborators retain the lifetimes documented above.
+pub fn prepare(inputs: PrepareInputs) Error!Prepared {
     const state = try inputs.allocator.create(State);
     errdefer inputs.allocator.destroy(state);
 
@@ -269,6 +318,14 @@ pub fn init(inputs: Inputs) Error!InitResult {
         .home = inputs.file_access.home,
         .cwd = inputs.file_access.cwd,
     };
+    var presets = try config.Preset.enumerate(inputs.allocator, inputs.io, documents, prompt_roots);
+    errdefer presets.deinit(inputs.allocator);
+    var providers = try config.ProviderDefinitions.enumerate(inputs.allocator, .{
+        .config = documents.config,
+        .state = documents.state,
+    });
+    errdefer providers.deinit();
+
     const base: config.Store.Options = .{
         .file = documents.config,
         .state = documents.state,
@@ -276,127 +333,22 @@ pub fn init(inputs: Inputs) Error!InitResult {
         .environment = inputs.environment.store(),
         .provider_canonicalizer = inputs.provider_canonicalizer,
     };
+    const facts: StartupFacts = .{
+        .cli = inputs.selection,
+        .env_provider = inputs.environment.get("HAX_PROVIDER"),
+        .env_model = inputs.environment.get("HAX_MODEL"),
+        .env_effort = inputs.environment.get("HAX_EFFORT"),
+        .env_preset = inputs.environment.get("HAX_PRESET"),
+        .env_system_prompt = inputs.environment.get("HAX_SYSTEM_PROMPT"),
+        .strict_one_shot = inputs.strict_one_shot,
+    };
     var selection = config.Selection.init(inputs.allocator, base);
     errdefer selection.deinit();
-
-    const cli = inputs.selection;
-    const env_provider = inputs.environment.get("HAX_PROVIDER");
-    const env_model = inputs.environment.get("HAX_MODEL");
-    const env_effort = inputs.environment.get("HAX_EFFORT");
-    const env_preset = inputs.environment.get("HAX_PRESET");
-    const env_system_prompt = inputs.environment.get("HAX_SYSTEM_PROMPT");
-
-    const initial_decision = config.Selection.startupDecision(.{
-        .cli_provider = cli.provider,
-        .cli_model = cli.model,
-        .cli_effort = cli.effort,
-        .cli_preset = cli.preset,
-        .env_provider = env_provider,
-        .env_model = env_model,
-        .env_effort = env_effort,
-        .env_preset = env_preset,
-        .env_system_prompt = env_system_prompt,
-    });
-
-    if (inputs.resumed) |metadata| {
-        var lookup: ?config.Preset.Lookup = null;
-        defer if (lookup) |*value| value.deinit(inputs.allocator);
-        var restored_metadata = metadata;
-        if (!initial_decision.restore_resumed_preset) restored_metadata.preset = null;
-        if (restored_metadata.preset) |name| if (name.len != 0) {
-            lookup = try config.Preset.lookup(inputs.allocator, inputs.io, documents, prompt_roots, name);
-        };
-        const outcome = try selection.restoreConversation(
-            restored_metadata,
-            if (lookup) |*value| value else null,
-        );
-        if (try handleRestoreOutcome(
-            inputs,
-            &warning_builder,
-            restored_metadata.preset,
-            outcome,
-            if (lookup) |*value| value else null,
-        )) |diagnostic| return abortWithDiagnostic(
-            inputs,
-            state,
-            &selection,
-            &tiers_owned,
-            diagnostic,
-        );
-    }
-
-    var effective = try selection.store().read(inputs.allocator, "preset");
-    defer effective.deinit(inputs.allocator);
-    const decision = config.Selection.startupDecision(.{
-        .cli_provider = cli.provider,
-        .cli_model = cli.model,
-        .cli_effort = cli.effort,
-        .cli_preset = cli.preset,
-        .env_provider = env_provider,
-        .env_model = env_model,
-        .env_effort = env_effort,
-        .env_preset = env_preset,
-        .env_system_prompt = env_system_prompt,
-        .effective_preset = effective.value,
-        .effective_preset_from_conversation = effective.source == .conversation,
-    });
-
-    if (decision.run_preset) |name| {
-        if (name.len != 0) if (try applyNamedPreset(
-            inputs,
-            documents,
-            prompt_roots,
-            &selection,
-            name,
-            true,
-            &warning_builder,
-        )) |diagnostic| return abortWithDiagnostic(
-            inputs,
-            state,
-            &selection,
-            &tiers_owned,
-            diagnostic,
-        );
-    } else if (effective.value) |name| {
-        if (name.len != 0 and effective.source != .conversation) {
-            if (decision.suppress_lower_preset) {
-                try selection.exitPreset(.run);
-            } else if (try applyNamedPreset(
-                inputs,
-                documents,
-                prompt_roots,
-                &selection,
-                name,
-                false,
-                &warning_builder,
-            )) |diagnostic| return abortWithDiagnostic(
-                inputs,
-                state,
-                &selection,
-                &tiers_owned,
-                diagnostic,
-            );
-        }
-    }
-
-    // CLI fields are run-tier overrides. Environment fields remain in the
-    // environment tier and therefore do not split an atomic preset.
-    try selection.setRun(.{
-        .provider = cli.provider,
-        .model = cli.model,
-        .effort = cli.effort,
-    });
-
-    var presets = try config.Preset.enumerate(inputs.allocator, inputs.io, documents, prompt_roots);
-    errdefer presets.deinit(inputs.allocator);
-    try filterReportedInvalid(inputs.allocator, &presets, warning_builder.items.items);
-    var providers = try config.ProviderDefinitions.enumerate(inputs.allocator, .{
-        .config = documents.config,
-        .state = documents.state,
-    });
-    errdefer providers.deinit();
+    try composeProvisional(inputs.allocator, facts, &presets, &selection);
     const warnings = try warning_builder.items.toOwnedSlice(inputs.allocator);
 
+    state.base = base;
+    state.facts = facts;
     state.selection = selection;
     state.presets = presets;
     state.providers = providers;
@@ -406,7 +358,304 @@ pub fn init(inputs: Inputs) Error!InitResult {
     selection = undefined;
     presets = undefined;
     providers = undefined;
+    return .{ .state = state };
+}
+
+/// Consumes Prepared on either successful Owner construction or a fatal preset
+/// result. If an error is returned, Prepared is unchanged and remains owned by
+/// the caller. No files or environment values are read by this function.
+pub fn finish(
+    prepared: *Prepared,
+    resumed: ?config.Selection.RestoreMetadata,
+) Error!InitResult {
+    const state = prepared.state;
+    const allocator = state.allocator;
+    var selection = config.Selection.init(allocator, state.base);
+    errdefer selection.deinit();
+    var warnings: WarningBuilder = .{};
+    defer warnings.deinit(allocator);
+    try cloneWarnings(allocator, &warnings, state.warnings);
+
+    if (try composeFinal(allocator, state.facts, &state.presets, resumed, &selection, &warnings)) |diagnostic| {
+        selection.deinit();
+        deinitState(state);
+        prepared.* = undefined;
+        return .{ .fatal = diagnostic };
+    }
+    const owned_warnings = try warnings.items.toOwnedSlice(allocator);
+    errdefer {
+        for (owned_warnings) |*warning| warning.deinit(allocator);
+        allocator.free(owned_warnings);
+    }
+    // filterReportedInvalid allocates before it mutates, and cannot fail after
+    // publishing the replacement slice.
+    try filterReportedInvalid(allocator, &state.presets, owned_warnings);
+
+    state.selection.deinit();
+    for (state.warnings) |*warning| warning.deinit(allocator);
+    allocator.free(state.warnings);
+    state.selection = selection;
+    state.warnings = owned_warnings;
+    warnings = .{};
+    selection = undefined;
+    prepared.* = undefined;
     return .{ .owner = .{ .state = state } };
+}
+
+/// Compatibility wrapper around the two-phase API.
+pub fn init(inputs: Inputs) Error!InitResult {
+    var prepared = try prepare(.{
+        .allocator = inputs.allocator,
+        .io = inputs.io,
+        .path_inputs = inputs.path_inputs,
+        .file_access = inputs.file_access,
+        .environment = inputs.environment,
+        .selection = inputs.selection,
+        .strict_one_shot = inputs.strict_one_shot,
+        .provider_canonicalizer = inputs.provider_canonicalizer,
+    });
+    return finish(&prepared, inputs.resumed) catch |err| {
+        prepared.deinit();
+        return err;
+    };
+}
+
+fn startupDecision(facts: StartupFacts, effective: ?config.Store.Result) config.Selection.Decision {
+    return config.Selection.startupDecision(.{
+        .cli_provider = facts.cli.provider,
+        .cli_model = facts.cli.model,
+        .cli_effort = facts.cli.effort,
+        .cli_preset = facts.cli.preset,
+        .env_provider = facts.env_provider,
+        .env_model = facts.env_model,
+        .env_effort = facts.env_effort,
+        .env_preset = facts.env_preset,
+        .env_system_prompt = facts.env_system_prompt,
+        .effective_preset = if (effective) |value| value.value else null,
+        .effective_preset_from_conversation = if (effective) |value| value.source == .conversation else false,
+    });
+}
+
+fn composeProvisional(
+    allocator: std.mem.Allocator,
+    facts: StartupFacts,
+    presets: *const config.Preset.Enumeration,
+    selection: *config.Selection,
+) Error!void {
+    var effective = try selection.store().read(allocator, "preset");
+    defer effective.deinit(allocator);
+    const decision = startupDecision(facts, effective);
+    if (decision.run_preset) |name| {
+        if (name.len != 0) try applyCachedProvisional(selection, presets, name, true);
+    } else if (effective.value) |name| {
+        if (name.len != 0) {
+            if (decision.suppress_lower_preset) {
+                try selection.exitPreset(.run);
+            } else {
+                try applyCachedProvisional(selection, presets, name, false);
+            }
+        }
+    }
+    try selection.setRun(.{
+        .provider = facts.cli.provider,
+        .model = facts.cli.model,
+        .effort = facts.cli.effort,
+    });
+}
+
+fn composeFinal(
+    allocator: std.mem.Allocator,
+    facts: StartupFacts,
+    presets: *const config.Preset.Enumeration,
+    resumed: ?config.Selection.RestoreMetadata,
+    selection: *config.Selection,
+    warnings: *WarningBuilder,
+) Error!?PresetDiagnostic {
+    const initial_decision = startupDecision(facts, null);
+    if (resumed) |metadata| {
+        var restored_metadata = metadata;
+        if (!initial_decision.restore_resumed_preset) restored_metadata.preset = null;
+        var lookup_value: config.Preset.Lookup = cachedLookup(presets, restored_metadata.preset orelse "");
+        const lookup = if (restored_metadata.preset) |name| if (name.len != 0) &lookup_value else null else null;
+        const outcome = try selection.restoreConversation(restored_metadata, lookup);
+        if (try handleRestoreOutcomeFacts(
+            allocator,
+            facts.strict_one_shot,
+            warnings,
+            restored_metadata.preset,
+            outcome,
+            lookup,
+        )) |diagnostic| return diagnostic;
+    }
+
+    var effective = try selection.store().read(allocator, "preset");
+    defer effective.deinit(allocator);
+    const decision = startupDecision(facts, effective);
+    if (decision.run_preset) |name| {
+        if (name.len != 0) if (try applyCachedPreset(
+            allocator,
+            presets,
+            selection,
+            name,
+            true,
+            warnings,
+        )) |diagnostic| return diagnostic;
+    } else if (effective.value) |name| {
+        if (name.len != 0 and effective.source != .conversation) {
+            if (decision.suppress_lower_preset) {
+                try selection.exitPreset(.run);
+            } else if (try applyCachedPreset(
+                allocator,
+                presets,
+                selection,
+                name,
+                false,
+                warnings,
+            )) |diagnostic| return diagnostic;
+        }
+    }
+    try selection.setRun(.{
+        .provider = facts.cli.provider,
+        .model = facts.cli.model,
+        .effort = facts.cli.effort,
+    });
+    return null;
+}
+
+fn cloneWarnings(
+    allocator: std.mem.Allocator,
+    destination: *WarningBuilder,
+    source: []const Warning,
+) Error!void {
+    for (source) |warning| switch (warning.kind) {
+        .config_unusable, .state_unusable => try destination.append(
+            allocator,
+            warning.kind,
+            warning.subject,
+            warning.tier_outcome,
+        ),
+        else => try destination.appendPreset(
+            allocator,
+            warning.kind,
+            warning.subject,
+            warning.preset_reason,
+            warning.field,
+            warning.actual,
+        ),
+    };
+}
+
+/// Returns a borrowed lookup view. It must never be deinitialized.
+fn cachedLookup(
+    presets: *const config.Preset.Enumeration,
+    name: []const u8,
+) config.Preset.Lookup {
+    for (presets.plans) |plan| {
+        if (std.mem.eql(u8, plan.name, name)) return .{ .plan = plan };
+    }
+    for (presets.invalid) |invalid| {
+        if (std.mem.eql(u8, invalid.name, name)) return .{ .invalid = invalid };
+    }
+    return .missing;
+}
+
+fn applyCachedProvisional(
+    selection: *config.Selection,
+    presets: *const config.Preset.Enumeration,
+    name: []const u8,
+    explicit: bool,
+) Error!void {
+    var lookup = cachedLookup(presets, name);
+    switch (lookup) {
+        .plan => |*plan| try selection.applyPreset(.run, plan),
+        .missing, .invalid => if (!explicit) try selection.exitPreset(.run),
+    }
+}
+
+fn applyCachedPreset(
+    allocator: std.mem.Allocator,
+    presets: *const config.Preset.Enumeration,
+    selection: *config.Selection,
+    name: []const u8,
+    explicit: bool,
+    warnings: *WarningBuilder,
+) Error!?PresetDiagnostic {
+    var lookup = cachedLookup(presets, name);
+    switch (lookup) {
+        .plan => |*plan| {
+            try selection.applyPreset(.run, plan);
+            return null;
+        },
+        .missing => if (explicit) {
+            return makeOptionalDiagnostic(allocator, .explicit, name, .missing, null, null, false);
+        } else {
+            try warnings.appendPreset(allocator, .implicit_preset_missing, name, null, null, null);
+            try selection.exitPreset(.run);
+            return null;
+        },
+        .invalid => |invalid| if (explicit) {
+            return makeOptionalDiagnostic(
+                allocator,
+                .explicit,
+                name,
+                .{ .invalid = invalid.reason },
+                invalid.field,
+                null,
+                false,
+            );
+        } else {
+            try warnings.appendPreset(
+                allocator,
+                .implicit_preset_invalid,
+                name,
+                invalid.reason,
+                invalid.field,
+                null,
+            );
+            try selection.exitPreset(.run);
+            return null;
+        },
+    }
+}
+
+fn handleRestoreOutcomeFacts(
+    allocator: std.mem.Allocator,
+    strict_one_shot: bool,
+    warnings: *WarningBuilder,
+    recorded: ?[]const u8,
+    outcome: config.Selection.RestoreOutcome,
+    lookup: ?*const config.Preset.Lookup,
+) Error!?PresetDiagnostic {
+    const name = recorded orelse "";
+    if (outcome == .restored or outcome == .no_preset) return null;
+    const details = presetDetails(outcome, lookup);
+    if (strict_one_shot) return makeOptionalDiagnostic(
+        allocator,
+        .recorded,
+        name,
+        details.issue,
+        details.field,
+        details.actual,
+        true,
+    );
+    const kind: WarningKind = switch (outcome) {
+        .missing_preset => .recorded_preset_missing,
+        .invalid_preset => .recorded_preset_invalid,
+        .mismatched_preset => .recorded_preset_mismatched,
+        else => unreachable,
+    };
+    try warnings.appendPreset(
+        allocator,
+        kind,
+        name,
+        switch (details.issue) {
+            .invalid => |reason| reason,
+            else => null,
+        },
+        details.field,
+        details.actual,
+    );
+    return null;
 }
 
 fn deinitTiersSecure(allocator: std.mem.Allocator, tiers: *config.Loader.InitialTiers) void {
@@ -432,45 +681,6 @@ fn persistentDocuments(tiers: *const config.Loader.InitialTiers) config.Preset.D
         .config = if (tiers.config) |*result| if (result.document) |*document| document else null else null,
         .state = if (tiers.state) |*result| if (result.document) |*document| document else null else null,
     };
-}
-
-fn handleRestoreOutcome(
-    inputs: Inputs,
-    warnings: *WarningBuilder,
-    recorded: ?[]const u8,
-    outcome: config.Selection.RestoreOutcome,
-    lookup: ?*const config.Preset.Lookup,
-) Error!?PresetDiagnostic {
-    const name = recorded orelse "";
-    if (outcome == .restored or outcome == .no_preset) return null;
-    const details = presetDetails(outcome, lookup);
-    if (inputs.strict_one_shot) return makeOptionalDiagnostic(
-        inputs.allocator,
-        .recorded,
-        name,
-        details.issue,
-        details.field,
-        details.actual,
-        true,
-    );
-    const kind: WarningKind = switch (outcome) {
-        .missing_preset => .recorded_preset_missing,
-        .invalid_preset => .recorded_preset_invalid,
-        .mismatched_preset => .recorded_preset_mismatched,
-        else => unreachable,
-    };
-    try warnings.appendPreset(
-        inputs.allocator,
-        kind,
-        name,
-        switch (details.issue) {
-            .invalid => |reason| reason,
-            else => null,
-        },
-        details.field,
-        details.actual,
-    );
-    return null;
 }
 
 const PresetDetails = struct {
@@ -545,70 +755,6 @@ fn makeDiagnostic(
     };
 }
 
-fn abortWithDiagnostic(
-    inputs: Inputs,
-    state: *State,
-    selection: *config.Selection,
-    tiers_owned: *bool,
-    diagnostic: PresetDiagnostic,
-) InitResult {
-    selection.deinit();
-    deinitTiersSecure(inputs.allocator, &state.tiers);
-    tiers_owned.* = false;
-    state.* = undefined;
-    inputs.allocator.destroy(state);
-    selection.* = undefined;
-    return .{ .fatal = diagnostic };
-}
-
-fn applyNamedPreset(
-    inputs: Inputs,
-    documents: config.Preset.Documents,
-    roots: config.Preset.PromptRoots,
-    selection: *config.Selection,
-    name: []const u8,
-    explicit: bool,
-    warnings: *WarningBuilder,
-) Error!?PresetDiagnostic {
-    var lookup = try config.Preset.lookup(inputs.allocator, inputs.io, documents, roots, name);
-    defer lookup.deinit(inputs.allocator);
-    switch (lookup) {
-        .plan => |*plan| {
-            try selection.applyPreset(.run, plan);
-            return null;
-        },
-        .missing => if (explicit) {
-            return makeOptionalDiagnostic(inputs.allocator, .explicit, name, .missing, null, null, false);
-        } else {
-            try warnings.appendPreset(inputs.allocator, .implicit_preset_missing, name, null, null, null);
-            try selection.exitPreset(.run);
-            return null;
-        },
-        .invalid => |invalid| if (explicit) {
-            return makeOptionalDiagnostic(
-                inputs.allocator,
-                .explicit,
-                name,
-                .{ .invalid = invalid.reason },
-                invalid.field,
-                null,
-                false,
-            );
-        } else {
-            try warnings.appendPreset(
-                inputs.allocator,
-                .implicit_preset_invalid,
-                name,
-                invalid.reason,
-                invalid.field,
-                null,
-            );
-            try selection.exitPreset(.run);
-            return null;
-        },
-    }
-}
-
 fn filterReportedInvalid(
     allocator: std.mem.Allocator,
     presets: *config.Preset.Enumeration,
@@ -667,6 +813,7 @@ const TestSecureOpen = struct {
     directory: std.Io.Dir,
     base: []const u8,
     deny_path: ?[]const u8 = null,
+    open_count: usize = 0,
 
     fn relative(self: *TestSecureOpen, path: []const u8) config.SecureOpen.Error![]const u8 {
         if (!std.mem.startsWith(u8, path, self.base) or path.len <= self.base.len or
@@ -696,6 +843,7 @@ const TestSecureOpen = struct {
         io: std.Io,
         path: []const u8,
     ) config.SecureOpen.Error!std.Io.File {
+        self.open_count += 1;
         return self.directory.openFile(io, try self.relative(path), .{}) catch |err| switch (err) {
             error.FileNotFound => error.FileNotFound,
             else => error.Unreadable,
@@ -1016,4 +1164,98 @@ test "owned diagnostic construction releases every allocation on OOM" {
         exerciseDiagnosticAllocationFailures,
         .{ base, &access, &environment },
     );
+}
+
+test "prepare store applies environment retention with a run preset" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTiers(&tmp,
+        \\{"session_retention_days":7,"presets":{"work":{"provider":"preset-p"}}}
+    , "{}");
+    const base = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(base);
+    var access: TestSecureOpen = .{ .directory = tmp.dir, .base = base };
+    const entries = [_][*:0]const u8{"HAX_SESSION_RETENTION_DAYS=14"};
+    var environment = ProcessAdapters.Environment.init(testEnviron(&entries));
+    var inputs = testInputs(std.testing.allocator, base, config.SecureOpen.Capability.from(&access), &environment);
+    inputs.selection.preset = "work";
+    var prepared = try prepare(.{
+        .allocator = inputs.allocator,
+        .io = inputs.io,
+        .path_inputs = inputs.path_inputs,
+        .file_access = inputs.file_access,
+        .environment = inputs.environment,
+        .selection = inputs.selection,
+    });
+    defer prepared.deinit();
+    var retention = try prepared.storeBeforeResume().read(std.testing.allocator, "session_retention_days");
+    defer retention.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("14", retention.value.?);
+    try std.testing.expectEqual(config.Store.Source.env, retention.source);
+    var provider = try prepared.storeBeforeResume().read(std.testing.allocator, "provider");
+    defer provider.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("preset-p", provider.value.?);
+    try std.testing.expectEqual(config.Store.Source.run, provider.source);
+}
+
+test "finish uses the prepared file snapshot after files change" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTiers(&tmp,
+        \\{"preset":"saved","presets":{"saved":{"provider":"old-p"}}}
+    , "{}");
+    const base = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(base);
+    var access: TestSecureOpen = .{ .directory = tmp.dir, .base = base };
+    var environment = ProcessAdapters.Environment.init(testEnviron(&.{}));
+    const inputs = testInputs(std.testing.allocator, base, config.SecureOpen.Capability.from(&access), &environment);
+    var prepared = try prepare(.{
+        .allocator = inputs.allocator,
+        .io = inputs.io,
+        .path_inputs = inputs.path_inputs,
+        .file_access = inputs.file_access,
+        .environment = inputs.environment,
+    });
+    var prepared_owned = true;
+    defer if (prepared_owned) prepared.deinit();
+    const reads_after_prepare = access.open_count;
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "zi/config.json",
+        .data = "{\"preset\":\"saved\",\"presets\":{\"saved\":{\"provider\":\"new-p\"}}}",
+    });
+    const result = try finish(&prepared, .{ .provider = "recorded", .preset = "saved" });
+    prepared_owned = false;
+    var owner = result.owner;
+    defer owner.deinit();
+    try std.testing.expectEqual(reads_after_prepare, access.open_count);
+    try expectSetting(&owner, "provider", "old-p", .conversation);
+    try expectSetting(&owner, "preset", "saved", .conversation);
+}
+
+test "recorded preset replaces provisional persisted preset in final store" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTiers(&tmp,
+        \\{"preset":"work","presets":{"work":{"provider":"work-p"},"saved":{"provider":"saved-p"}}}
+    , "{}");
+    const base = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(base);
+    var access: TestSecureOpen = .{ .directory = tmp.dir, .base = base };
+    var environment = ProcessAdapters.Environment.init(testEnviron(&.{}));
+    const inputs = testInputs(std.testing.allocator, base, config.SecureOpen.Capability.from(&access), &environment);
+    var prepared = try prepare(.{
+        .allocator = inputs.allocator,
+        .io = inputs.io,
+        .path_inputs = inputs.path_inputs,
+        .file_access = inputs.file_access,
+        .environment = inputs.environment,
+    });
+    var provisional_provider = try prepared.storeBeforeResume().read(std.testing.allocator, "provider");
+    defer provisional_provider.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("work-p", provisional_provider.value.?);
+    const result = try finish(&prepared, .{ .provider = "recorded-p", .preset = "saved" });
+    var owner = result.owner;
+    defer owner.deinit();
+    try expectSetting(&owner, "provider", "saved-p", .conversation);
+    try expectSetting(&owner, "preset", "saved", .conversation);
 }
