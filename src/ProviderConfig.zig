@@ -55,6 +55,14 @@ pub const ModelHintsSource = struct {
     }
 };
 
+pub const HttpPolicy = struct {
+    /// Additional attempts after the initial request.
+    max_retries: u16 = 4,
+    retry_base_ms: u64 = 1_000,
+    /// Zero disables the streaming idle timeout.
+    idle_timeout_ms: u64 = 10 * 60 * 1_000,
+};
+
 pub const Inputs = struct {
     allocator: std.mem.Allocator,
     store: Store,
@@ -84,6 +92,7 @@ pub const Inputs = struct {
     hints_source: ?ModelHintsSource = null,
     hints: Registry.ModelHints = .{},
     rules: Registry.Rules = .{},
+    http_policy: HttpPolicy = .{},
 };
 
 pub const ResolveError = error{
@@ -171,6 +180,24 @@ pub const Owned = struct {
     model: []const u8,
     effort: ?[]const u8,
     keep_model_order: bool,
+    provider_autoselected: bool,
+    /// Inline copies retained so a late catalog refresh never borrows input data.
+    reported_metadata: ai.ModelMeta.Metadata,
+    explicit_catalog_metadata: ai.ModelCatalog.Contribution,
+
+    /// Replaces stale cached catalog facts with a refreshed contribution. Explicit
+    /// configuration still wins the refresh, then provider-reported facts win both.
+    pub fn mergeRefreshedCatalog(
+        self: *Owned,
+        contribution: ai.ModelCatalog.Contribution,
+    ) void {
+        if (self.resolved.metadata.catalog_id == null) {
+            self.resolved.metadata.model = self.reported_metadata;
+            return;
+        }
+        const catalog = ai.ModelCatalog.merge(&self.explicit_catalog_metadata, &contribution);
+        self.resolved.metadata.model = ai.ModelMeta.merge(&self.reported_metadata, &catalog.metadata);
+    }
 
     pub fn deinit(self: *Owned) void { // ziglint-ignore: Z030
         const parent = self.parent_allocator;
@@ -182,6 +209,7 @@ pub const Owned = struct {
 };
 
 pub fn resolve(inputs: Inputs) ResolveError!*Owned {
+    try validateHttpPolicy(inputs.http_policy);
     const owned = try inputs.allocator.create(Owned);
     errdefer inputs.allocator.destroy(owned);
     owned.parent_allocator = inputs.allocator;
@@ -227,10 +255,14 @@ pub fn resolve(inputs: Inputs) ResolveError!*Owned {
     );
     const model = try selectModel(allocator, inputs.store, descriptor.id, inputs);
 
-    // Keep both by-value contributions in this frame until resolveDescriptor
-    // has copied the effective metadata into its owned plan.
+    // Retain the two higher-precedence sources by value. The cached contribution
+    // is only an initial fallback and can be replaced by a late refresh.
+    owned.reported_metadata = if (inputs.hints.reported) |value| value.* else .{};
+    owned.explicit_catalog_metadata = .{
+        .metadata = if (inputs.hints.catalog) |value| value.* else .{},
+        .wire = explicitCatalogWireHint(inputs.hints),
+    };
     var source_contribution: ai.ModelCatalog.Contribution = undefined;
-    var explicit_contribution: ai.ModelCatalog.Contribution = undefined;
     var merged_contribution: ai.ModelCatalog.Contribution = undefined;
     var effective_hints = inputs.hints;
     if (inputs.hints_source) |source| {
@@ -239,11 +271,10 @@ pub fn resolve(inputs: Inputs) ResolveError!*Owned {
         else
             descriptor.catalog_id orelse descriptor.id;
         source_contribution = try source.lookup(allocator, lookup_provider_id, model);
-        explicit_contribution = .{
-            .metadata = if (inputs.hints.catalog) |value| value.* else .{},
-            .wire = explicitCatalogWireHint(inputs.hints),
-        };
-        merged_contribution = ai.ModelCatalog.merge(&explicit_contribution, &source_contribution);
+        merged_contribution = ai.ModelCatalog.merge(
+            &owned.explicit_catalog_metadata,
+            &source_contribution,
+        );
         effective_hints.catalog = &merged_contribution.metadata;
         effective_hints.catalog_wire = registryWireHint(merged_contribution.wire);
     }
@@ -265,10 +296,31 @@ pub fn resolve(inputs: Inputs) ResolveError!*Owned {
         effective_hints,
         rules,
     );
+    applyHttpPolicy(&owned.resolved.adapter, inputs.http_policy);
     owned.model = owned.resolved.metadata.model_id;
     owned.effort = try selectEffort(allocator, inputs.store, descriptor.id, inputs, &owned.resolved);
     owned.keep_model_order = !(if (definition) |value| value.sort_models orelse true else true);
+    owned.provider_autoselected = !selection.explicit;
     return owned;
+}
+
+fn validateHttpPolicy(policy: HttpPolicy) ResolveError!void {
+    if (policy.max_retries > 100 or
+        policy.retry_base_ms > 2 * 60 * 1_000 or
+        policy.idle_timeout_ms > 24 * 60 * 60 * 1_000)
+    {
+        return error.InvalidSetting;
+    }
+}
+
+fn applyHttpPolicy(adapter: *Registry.AdapterPlan, policy: HttpPolicy) void {
+    switch (adapter.*) {
+        inline else => |*plan| {
+            plan.retry.policy.max_attempts = policy.max_retries + 1;
+            plan.retry.policy.base_delay_ms = policy.retry_base_ms;
+            plan.limits.idle_timeout_ms = policy.idle_timeout_ms;
+        },
+    }
 }
 
 fn explicitCatalogWireHint(hints: Registry.ModelHints) ai.ModelCatalog.WireHint {
@@ -1249,6 +1301,23 @@ fn testStore(document: *const Document, environment: *const TestEnvironment) Sto
     });
 }
 
+fn expectHttpPolicy(
+    adapter: Registry.AdapterPlan,
+    max_attempts: u16,
+    base_delay_ms: u64,
+    idle_timeout_ms: u64,
+) !void {
+    switch (adapter) {
+        inline else => |plan| {
+            try std.testing.expectEqual(max_attempts, plan.retry.policy.max_attempts);
+            try std.testing.expectEqual(base_delay_ms, plan.retry.policy.base_delay_ms);
+            try std.testing.expectEqual(idle_timeout_ms, plan.limits.idle_timeout_ms);
+            // Provider-wide policy must not replace each adapter's connect limit.
+            try std.testing.expectEqual(@as(u64, 10_000), plan.limits.connect_timeout_ms);
+        },
+    }
+}
+
 test "the seven explicit plans resolve without probing" {
     const cases = [_]struct { json: []const u8, provider: []const u8 }{
         .{ .json = "{\"provider\":\"llamacpp\",\"model\":\"local\"}", .provider = "llamacpp" },
@@ -1279,9 +1348,12 @@ test "the seven explicit plans resolve without probing" {
             .store = testStore(&document, &environment),
             .api_key_environment = .from(&environment),
             .session_cache_key = "12345678-1234-4234-8234-123456789abc",
+            .http_policy = .{ .max_retries = 100, .retry_base_ms = 17, .idle_timeout_ms = 0 },
         });
         defer result.deinit();
         try std.testing.expectEqualStrings(case.provider, result.resolved.metadata.provider_id);
+        try expectHttpPolicy(result.resolved.adapter, 101, 17, 0);
+        try std.testing.expect(!result.provider_autoselected);
     }
 
     var codex_document = try Document.parse(std.testing.allocator, "{}", .{});
@@ -1296,10 +1368,13 @@ test "the seven explicit plans resolve without probing" {
         .codex_available = true,
         .default_model = "codex-default",
         .default_effort = "high",
+        .http_policy = .{ .max_retries = 100, .retry_base_ms = 17, .idle_timeout_ms = 0 },
     });
     defer codex.deinit();
     try std.testing.expectEqualStrings("codex", codex.resolved.metadata.provider_id);
     try std.testing.expectEqualStrings("high", codex.effort.?);
+    try expectHttpPolicy(codex.resolved.adapter, 101, 17, 0);
+    try std.testing.expect(codex.provider_autoselected);
 }
 
 test "the three remaining compiled recipe plans resolve explicitly" {
@@ -1334,16 +1409,52 @@ test "the three remaining compiled recipe plans resolve explicitly" {
             .ollama_available = true,
             .ollama_discovered_model = "discovered-local",
             .default_model = "not-a-recipe-fallback",
+            .http_policy = .{ .max_retries = 100, .retry_base_ms = 17, .idle_timeout_ms = 0 },
         });
         defer result.deinit();
         try std.testing.expectEqualStrings(case.provider, result.resolved.metadata.provider_id);
         try std.testing.expectEqualStrings(case.endpoint, result.resolved.adapter.openai_chat.endpoint);
+        try expectHttpPolicy(result.resolved.adapter, 101, 17, 0);
         if (std.mem.eql(u8, case.provider, "ollama")) {
             try std.testing.expectEqualStrings("discovered-local", result.model);
             try std.testing.expect(result.resolved.adapter.openai_chat.api_key == null);
         } else {
             try std.testing.expectEqualStrings("opencode-key", result.resolved.adapter.openai_chat.api_key.?);
         }
+    }
+}
+
+test "HTTP policy applies to dynamic plans and rejects out-of-range inputs" {
+    const environment: TestEnvironment = .{};
+    var document = try Document.parse(std.testing.allocator, "{\"model\":\"m\"}", .{});
+    defer document.deinit();
+    const definition: Definition = .{
+        .id = @constCast("dynamic-http"),
+        .api = .openai_responses,
+        .base_url = @constCast("https://example.test/v1"),
+    };
+    var result = try resolve(.{
+        .allocator = std.testing.allocator,
+        .store = testStore(&document, &environment),
+        .api_key_environment = .from(&environment),
+        .provider_override = "dynamic-http",
+        .provider_definitions = &.{definition},
+        .http_policy = .{ .max_retries = 0, .retry_base_ms = 0, .idle_timeout_ms = 0 },
+    });
+    defer result.deinit();
+    try expectHttpPolicy(result.resolved.adapter, 1, 0, 0);
+
+    inline for (.{
+        HttpPolicy{ .max_retries = 101 },
+        HttpPolicy{ .retry_base_ms = 2 * 60 * 1_000 + 1 },
+        HttpPolicy{ .idle_timeout_ms = 24 * 60 * 60 * 1_000 + 1 },
+    }) |invalid| {
+        try std.testing.expectError(error.InvalidSetting, resolve(.{
+            .allocator = std.testing.allocator,
+            .store = testStore(&document, &environment),
+            .api_key_environment = .from(&environment),
+            .http_policy = invalid,
+        }));
     }
 }
 
@@ -2606,6 +2717,59 @@ test "explicit catalog hints merge over cached metadata and wire" {
     defer wire_override.deinit();
     try std.testing.expect(wire_override.resolved.metadata.wire == .openai_chat);
     try std.testing.expectEqual(@as(usize, 3), source.calls);
+}
+
+test "late catalog refresh preserves explicit and reported metadata precedence" {
+    const environment: TestEnvironment = .{
+        .entries = &.{.{ .name = "OPENCODE_API_KEY", .value = "key" }},
+    };
+    var document = try Document.parse(
+        std.testing.allocator,
+        "{\"provider\":\"opencode-zen\",\"model\":\"model\"}",
+        .{},
+    );
+    defer document.deinit();
+    var source: TestModelHintsSource = .{
+        .expected_provider = "opencode",
+        .expected_model = "model",
+        .contribution = .{ .metadata = .{
+            .context_window = 100,
+            .max_output = 200,
+            .rates = .{ .input = 1, .output = 1, .cache_read = 1 },
+        } },
+    };
+    var explicit: ai.ModelMeta.Metadata = .{
+        .context_window = 300,
+        .rates = .{ .output = 2 },
+    };
+    var reported: ai.ModelMeta.Metadata = .{
+        .max_output = 900,
+        .rates = .{ .input = 9 },
+    };
+    var result = try resolve(.{
+        .allocator = std.testing.allocator,
+        .store = testStore(&document, &environment),
+        .api_key_environment = .from(&environment),
+        .hints_source = .from(&source),
+        .hints = .{ .reported = &reported, .catalog = &explicit },
+    });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(?f64, 1), result.resolved.metadata.model.rates.cache_read);
+
+    // The owner retained the higher-precedence sources inline.
+    explicit.context_window = 999;
+    reported.max_output = 999;
+    result.mergeRefreshedCatalog(.{ .metadata = .{
+        .context_window = 500,
+        .max_output = 700,
+        .rates = .{ .input = 4, .output = 5, .cache_read = 7 },
+    } });
+    const metadata = result.resolved.metadata.model;
+    try std.testing.expectEqual(@as(u64, 300), metadata.context_window);
+    try std.testing.expectEqual(@as(u64, 900), metadata.max_output);
+    try std.testing.expectEqual(@as(?f64, 9), metadata.rates.input);
+    try std.testing.expectEqual(@as(?f64, 2), metadata.rates.output);
+    try std.testing.expectEqual(@as(?f64, 7), metadata.rates.cache_read);
 }
 
 test "empty cached contribution preserves descriptor defaults and unsupported wire maps exactly" {

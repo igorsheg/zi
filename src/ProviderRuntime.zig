@@ -27,6 +27,7 @@ pub const Owned = struct {
     effort: ?[]const u8,
     metadata: *const Registry.StableMetadata,
     keep_model_order: bool,
+    provider_autoselected: bool,
 
     /// Returns a borrowed erased handle tied to this composition's factory.
     pub fn provider(self: *Owned) Provider.Provider {
@@ -35,6 +36,14 @@ pub const Owned = struct {
 
     pub fn setInputTokens(self: *Owned, input_tokens: u64) void {
         self.factory.setInputTokens(input_tokens);
+    }
+
+    /// Installs fresh catalog facts without changing provider or wire selection.
+    pub fn mergeRefreshedCatalog(
+        self: *Owned,
+        contribution: ai.ModelCatalog.Contribution,
+    ) void {
+        self.config.mergeRefreshedCatalog(contribution);
     }
 
     /// Destroys the factory before wiping and destroying resolved configuration.
@@ -72,6 +81,7 @@ pub fn init(
         .effort = config.effort,
         .metadata = &config.resolved.metadata,
         .keep_model_order = config.keep_model_order,
+        .provider_autoselected = config.provider_autoselected,
     };
 }
 
@@ -208,6 +218,7 @@ test "composition streams every wire family and remains stable when its handle m
         try std.testing.expectEqualStrings("model", moved.model);
         try std.testing.expectEqualStrings(case.id, moved.metadata.provider_id);
         try std.testing.expect(moved.keep_model_order);
+        try std.testing.expect(!moved.provider_autoselected);
         moved.setInputTokens(12);
         try streamRuntime(&moved, &collector);
         moved.deinit();
@@ -228,6 +239,7 @@ test "composition streams every wire family and remains stable when its handle m
     }, Transport.Transport.from(&fake), 0);
     defer codex.deinit();
     try std.testing.expectEqualStrings("high", codex.effort.?);
+    try std.testing.expect(codex.provider_autoselected);
     try streamRuntime(&codex, &collector);
     try std.testing.expectEqual(@as(usize, 4), fake.calls);
     try std.testing.expectEqual(@as(usize, 4), collector.done);
